@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/vscode-1.133-custom-agent-frontmatter.json",
+  "title": "Autoprompt custom agent frontmatter accepted by VS Code 1.133",
+  "description": "A minimal acceptance subset derived from the VS Code 1.133 parser, editor metadata, parser tests, and bundled Copilot reference.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "description",
+    "tools",
+    "agents",
+    "user-invocable",
+    "disable-model-invocation"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tools": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      ]
+    },
+    "agents": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "model": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      ]
+    },
+    "user-invocable": {
+      "type": "boolean"
+    },
+    "disable-model-invocation": {
+      "type": "boolean"
+    }
+  },
+  "x-vscode-release": {
+    "version": "1.133.0",
+    "commit": "a5b500951314efd502d07465bd138dfbd714a960",
+    "bundledCopilotVersion": "0.61.0"
+  },
+  "x-recursive-subagent-tool": "agent",
+  "x-model-omission-behavior": "Use the currently selected model and inherit it through subagent invocation.",
+  "x-sources": [
+    "https://github.com/microsoft/vscode/blob/a5b500951314efd502d07465bd138dfbd714a960/src/vs/workbench/contrib/chat/common/promptSyntax/promptFileParser.ts#L65-L85",
+    "https://github.com/microsoft/vscode/blob/a5b500951314efd502d07465bd138dfbd714a960/src/vs/workbench/contrib/chat/common/promptSyntax/languageProviders/promptFileAttributes.ts#L106-L155",
+    "https://github.com/microsoft/vscode/blob/a5b500951314efd502d07465bd138dfbd714a960/src/vs/workbench/contrib/chat/common/tools/languageModelToolsService.ts#L725-L737",
+    "https://github.com/microsoft/vscode/blob/a5b500951314efd502d07465bd138dfbd714a960/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptFileParser.test.ts#L445-L490",
+    "https://github.com/microsoft/vscode/blob/a5b500951314efd502d07465bd138dfbd714a960/extensions/copilot/assets/prompts/skills/agent-customization/references/agents.md#L12-L68",
+    "https://github.com/microsoft/vscode-docs/blob/d5cf10999259064912a02cb7be177d0abcc56093/docs/agent-customization/custom-agents.md#L107-L114",
+    "https://github.com/microsoft/vscode-docs/blob/d5cf10999259064912a02cb7be177d0abcc56093/docs/agents/run/subagents.md#L189-L193",
+    "https://github.com/microsoft/vscode-docs/blob/d5cf10999259064912a02cb7be177d0abcc56093/docs/agents/run/subagents.md#L252-L258",
+    "https://github.com/microsoft/vscode-docs/blob/d5cf10999259064912a02cb7be177d0abcc56093/docs/agents/run/subagents.md#L274-L284"
+  ]
+}

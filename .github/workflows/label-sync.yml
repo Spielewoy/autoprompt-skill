@@ -1,0 +1,76 @@
+name: Label catalog
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/labels.json"
+      - ".github/workflows/label-sync.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: label-catalog
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: Create and update labels
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Sync label catalog
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('node:fs')
+            const catalog = JSON.parse(fs.readFileSync('.github/labels.json', 'utf8'))
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const current = await github.paginate(github.rest.issues.listLabelsForRepo, {
+              owner,
+              repo,
+              per_page: 100,
+            })
+            const byName = new Map(current.map((label) => [label.name, label]))
+            let created = 0
+            let updated = 0
+
+            for (const label of catalog) {
+              const existing = byName.get(label.name)
+              if (!existing) {
+                await github.rest.issues.createLabel({ owner, repo, ...label })
+                created += 1
+                continue
+              }
+              if (
+                existing.color.toUpperCase() !== label.color ||
+                (existing.description || '') !== label.description
+              ) {
+                await github.rest.issues.updateLabel({
+                  owner,
+                  repo,
+                  name: existing.name,
+                  new_name: label.name,
+                  color: label.color,
+                  description: label.description,
+                })
+                updated += 1
+              }
+            }
+
+            await core.summary
+              .addHeading('Label catalog')
+              .addTable([
+                [{ data: 'Catalog', header: true }, { data: 'Created', header: true }, { data: 'Updated', header: true }],
+                [String(catalog.length), String(created), String(updated)],
+              ])
+              .write()

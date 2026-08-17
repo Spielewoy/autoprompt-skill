@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" role="img" aria-labelledby="title desc">
+  <title id="title">Terminal-Bench 2.1 leaderboard</title>
+  <desc id="desc">18 current reference models, plus our measured DeepSeek V4 Flash 0731 run with and without Autoprompt. Reference scores: Artificial Analysis, 17 Aug 2026. Harness: OpenCode 1.18.7. Autoprompt v1.0.0.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10.5" refY="6" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L12 6L0 12Z" fill="#384649"/></marker>
+    <style>text{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans","Microsoft YaHei","Malgun Gothic","Noto Sans Arabic",sans-serif}.grid{stroke:#dce3e3;stroke-width:1}.tick{fill:#667477;font-size:18px}.model{fill:#253336;font-size:14px;font-weight:550}.value{fill:#253336;font-size:16px;font-weight:700}.measured-value{fill:#08787b;font-size:17px;font-weight:750}.measured-inside{fill:#ffffff;font-size:17px;font-weight:750}.legend{fill:#435154;font-size:18px}.source{fill:#738083;font-size:15px}.title{fill:#152427;font-size:42px;font-weight:720}.subtitle{fill:#5f6d70;font-size:20px}</style>
+  </defs>
+  <rect width="1920" height="1080" fill="#ffffff"/>
+  <text x="92" y="72" class="title">Terminal-Bench 2.1 leaderboard</text>
+  <text x="92" y="108" class="subtitle">18 current reference models, plus our measured DeepSeek V4 Flash 0731 run</text>
+  <circle cx="1516" cy="72" r="8" fill="#596466"/><text x="1536" y="79" class="legend">Autoprompt v1.0.0</text>
+  <circle cx="1516" cy="108" r="8" fill="#08787b"/><text x="1536" y="115" class="legend">OpenCode 1.18.7</text>
+  <line x1="92" y1="730" x2="1840" y2="730" class="grid"/>
+  <text x="76" y="736" text-anchor="end" class="tick">0%</text>
+  <line x1="92" y1="634" x2="1840" y2="634" class="grid"/>
+  <text x="76" y="640" text-anchor="end" class="tick">20%</text>
+  <line x1="92" y1="538" x2="1840" y2="538" class="grid"/>
+  <text x="76" y="544" text-anchor="end" class="tick">40%</text>
+  <line x1="92" y1="442" x2="1840" y2="442" class="grid"/>
+  <text x="76" y="448" text-anchor="end" class="tick">60%</text>
+  <line x1="92" y1="346" x2="1840" y2="346" class="grid"/>
+  <text x="76" y="352" text-anchor="end" class="tick">80%</text>
+  <line x1="92" y1="250" x2="1840" y2="250" class="grid"/>
+  <text x="76" y="256" text-anchor="end" class="tick">100%</text>
+  <rect x="99.02" y="300.40" width="66.69" height="429.60" fill="#1f1f1f"/>
+  <text x="132.37" y="288.40" text-anchor="middle" class="value">89.5%</text>
+  <text transform="translate(136.37 764) rotate(55)" class="model">GPT-5.6 Sol (xhigh)</text>
+  <rect x="186.77" y="302.32" width="66.69" height="427.68" fill="#cc785c"/>
+  <text x="220.12" y="290.32" text-anchor="middle" class="value">89.1%</text>
+  <text transform="translate(224.12 764) rotate(55)" class="model">Claude Opus 5 (max)</text>
+  <rect x="274.52" y="305.68" width="66.69" height="424.32" fill="#736cd3"/>
+  <text x="307.87" y="293.68" text-anchor="middle" class="value">88.4%</text>
+  <text transform="translate(311.87 764) rotate(55)" class="model">Grok 4.6 (high)</text>
+  <rect x="362.27" y="307.60" width="66.69" height="422.40" fill="#cc785c"/>
+  <text x="395.62" y="295.60" text-anchor="middle" class="value">88.0%</text>
+  <text transform="translate(399.62 764) rotate(55)" class="model">Claude Opus 5 (xhigh)</text>
+  <rect x="450.02" y="307.60" width="66.69" height="422.40" fill="#1f1f1f"/>
+  <text x="483.37" y="295.60" text-anchor="middle" class="value">88.0%</text>
+  <text transform="translate(487.37 764) rotate(55)" class="model">GPT-5.6 Sol (max)</text>
+  <rect x="537.78" y="307.60" width="66.69" height="422.40" fill="#1f1f1f"/>
+  <text x="571.12" y="295.60" text-anchor="middle" class="value">88.0%</text>
+  <text transform="translate(575.12 764) rotate(55)" class="model">GPT-5.6 Terra (max)</text>
+  <rect x="625.53" y="318.16" width="66.69" height="411.84" fill="#34a853"/>
+  <text x="658.87" y="306.16" text-anchor="middle" class="value">85.8%</text>
+  <text transform="translate(662.87 764) rotate(55)" class="model">Gemini 3.7 Flash (high)</text>
+  <rect x="713.28" y="322.00" width="66.69" height="408.00" fill="#047afe"/>
+  <text x="746.62" y="310.00" text-anchor="middle" class="value">85.0%</text>
+  <text transform="translate(750.62 764) rotate(55)" class="model">Kimi K3 (max)</text>
+  <rect x="801.03" y="323.92" width="66.69" height="406.08" fill="#cc785c"/>
+  <text x="834.37" y="311.92" text-anchor="middle" class="value">84.6%</text>
+  <text transform="translate(838.37 764) rotate(55)" class="model">Claude Fable 5 (fallback)</text>
+  <rect x="888.78" y="336.30" width="66.69" height="393.70" fill="#08787b" stroke="#075e61" stroke-width="2"/>
+  <text transform="translate(926.12 764) rotate(55)" class="model">DeepSeek V4 Flash 0731 + Autoprompt</text>
+  <rect x="976.53" y="339.76" width="66.69" height="390.24" fill="#ff7018"/>
+  <text x="1009.88" y="327.76" text-anchor="middle" class="value">81.3%</text>
+  <text transform="translate(1013.88 764) rotate(55)" class="model">Qwen3.8 Max</text>
+  <rect x="1064.28" y="341.68" width="66.69" height="388.32" fill="#1f1f1f"/>
+  <text x="1097.63" y="329.68" text-anchor="middle" class="value">80.9%</text>
+  <text transform="translate(1101.63 764) rotate(55)" class="model">GPT-5.6 Luna (max)</text>
+  <rect x="1152.03" y="345.52" width="66.69" height="384.48" fill="#0089f4"/>
+  <text x="1185.38" y="333.52" text-anchor="middle" class="value">80.1%</text>
+  <text transform="translate(1189.38 764) rotate(55)" class="model">Muse Spark 1.2 (xhigh)</text>
+  <rect x="1239.78" y="352.24" width="66.69" height="377.76" fill="#2243e6"/>
+  <text x="1273.13" y="340.24" text-anchor="middle" class="value">78.7%</text>
+  <text transform="translate(1277.13 764) rotate(55)" class="model">DeepSeek V4 Pro (max)</text>
+  <rect x="1327.53" y="356.08" width="66.69" height="373.92" fill="#1c7ff8"/>
+  <text x="1360.88" y="344.08" text-anchor="middle" class="value">77.9%</text>
+  <text transform="translate(1364.88 764) rotate(55)" class="model">GLM-5.2 (max)</text>
+  <rect x="1415.29" y="370.48" width="66.69" height="359.52" fill="#6a93eb"/>
+  <text x="1448.63" y="358.48" text-anchor="middle" class="value">74.9%</text>
+  <text transform="translate(1452.63 764) rotate(55)" class="model">Motif 3</text>
+  <rect x="1503.04" y="406.38" width="66.69" height="323.62" fill="#08787b" stroke="#075e61" stroke-width="2"/>
+  <text transform="translate(1540.38 764) rotate(55)" class="model">DeepSeek V4 Flash 0731</text>
+  <rect x="1590.79" y="417.04" width="66.69" height="312.96" fill="#eb3568"/>
+  <text x="1624.13" y="405.04" text-anchor="middle" class="value">65.2%</text>
+  <text transform="translate(1628.13 764) rotate(55)" class="model">MiniMax-M3</text>
+  <rect x="1678.54" y="465.52" width="66.69" height="264.48" fill="#676767"/>
+  <text x="1711.88" y="453.52" text-anchor="middle" class="value">55.1%</text>
+  <text transform="translate(1715.88 764) rotate(55)" class="model">Inkling</text>
+  <rect x="1766.29" y="471.28" width="66.69" height="258.72" fill="#76b900"/>
+  <text x="1799.63" y="459.28" text-anchor="middle" class="value">53.9%</text>
+  <text transform="translate(1803.63 764) rotate(55)" class="model">Nemotron 3 Ultra</text>
+  <path d="M922.12 286 H1536.38" fill="none" stroke="#384649" stroke-width="3"/>
+  <path d="M922.12 286 V334" fill="none" stroke="#384649" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M1536.38 286 V404" fill="none" stroke="#384649" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="1229.25" y="270" text-anchor="middle" class="value">+14.61 points</text>
+  <rect x="886" y="299" width="72" height="28" fill="#ffffff"/>
+  <text x="922.12" y="320.30" text-anchor="middle" class="measured-value">82.02%</text>
+  <rect x="1500" y="369" width="73" height="28" fill="#ffffff"/>
+  <text x="1536.38" y="390.38" text-anchor="middle" class="measured-value">67.42%</text>
+</svg>

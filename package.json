@@ -1,0 +1,87 @@
+{
+  "name": "autoprompt-skill",
+  "version": "1.0.0",
+  "description": "Autoprompt is a coding-agent skill that cuts failures by 45% on agentic coding tasks.",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "type": "commonjs",
+  "bin": {
+    "autoprompt": "bin/autoprompt.cjs"
+  },
+  "files": [
+    "bin/",
+    "scripts/codex-configure.cjs",
+    "scripts/install/",
+    "scripts/runtime-payload.cjs",
+    "agents/claude/",
+    "agents/codex/",
+    "agents/opencode/",
+    "agents/kilo/",
+    "agents/vscode/",
+    "agents/prime/",
+    "agents/manifests/claude-runtime.json",
+    "agents/manifests/codex-runtime.json",
+    "agents/manifests/opencode-runtime.json",
+    "agents/manifests/kilo-runtime.json",
+    "agents/manifests/vscode-runtime.json",
+    "agents/manifests/prime-runtime.json",
+    "assets/anatomy.svg",
+    "assets/banner.svg",
+    "assets/how-it-works-hierarchy.svg",
+    "assets/how-it-works-loop.svg",
+    "assets/terminal-bench-2.1.svg",
+    "assets/terminal-bench-2.1-leaderboard.svg",
+    "docs/CODE_OF_CONDUCT.md",
+    "docs/CONTRIBUTING.md",
+    "docs/SECURITY.md",
+    "docs/SUPPORT.md",
+    "docs/benchmarks/terminal-bench-2.1.md",
+    "docs/faq/does-autoprompt-mean-i-do-not-have-to-prompt.md",
+    "docs/faq/how-autonomous-is-autoprompt.md",
+    "docs/faq/how-to-add-custom-models.md",
+    "docs/faq/tokensaver-vs-wide-vs-custom.md",
+    "docs/faq/what-are-the-layers-for.md",
+    "docs/faq/which-coding-agents-are-supported.md",
+    "docs/guides/9router-multi-provider-setup.md",
+    "docs/guides/9router-routing.png",
+    "docs/guides/custom-agent-compatibility.md"
+  ],
+  "scripts": {
+    "normalize:shell": "node scripts/normalize-shell-line-endings.cjs",
+    "pretest": "npm run normalize:shell",
+    "test": "npm run test:cli && npm run test:providers",
+    "test:cli": "node --test tests/source/autoprompt-cli.test.cjs tests/source/codex-configure.test.cjs tests/source/npm-package.test.cjs tests/source/public-provider-boundary.test.cjs",
+    "test:providers": "node scripts/generate-provider-contracts.cjs --check && node scripts/runtime-payload.cjs --check && node --test tests/source/provider-generation.test.cjs tests/source/runtime-payload.test.cjs tests/source/vscode-custom-agent-fixture.test.cjs tests/source/provider-compatibility-registry.test.cjs tests/source/codex-current-parity.test.cjs tests/source/prime-provider.test.cjs tests/source/provider-entry-contract.test.cjs tests/source/supervisor-mode-contract.test.cjs tests/source/custom-claude-formatter.test.cjs tests/source/powershell-hash-fallback.test.cjs",
+    "test:lifecycle": "node --test --test-concurrency=1 tests/source/claude-lifecycle.test.cjs tests/source/kilo-provider.test.cjs tests/source/opencode-lifecycle.test.cjs tests/source/vscode-lifecycle.test.cjs tests/source/prime-lifecycle.test.cjs tests/source/install-custom-root.test.cjs tests/source/codex-version-probe-isolation.test.cjs tests/source/install-extras-runtime-path.test.cjs tests/source/opencode-launch-wrapper.test.cjs tests/source/powershell-home-precedence.test.cjs tests/source/posix-shell-performance.test.cjs",
+    "verify": "npm test && npm run test:lifecycle",
+    "prepack": "npm test",
+    "prepublishOnly": "npm run verify"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Spielewoy/autoprompt-skill.git"
+  },
+  "homepage": "https://github.com/Spielewoy/autoprompt-skill#readme",
+  "bugs": {
+    "url": "https://github.com/Spielewoy/autoprompt-skill/issues"
+  },
+  "keywords": [
+    "agentic-coding",
+    "ai-agents",
+    "autoprompt",
+    "claude-code",
+    "codex",
+    "coding-agent",
+    "developer-tools",
+    "multi-agent",
+    "opencode",
+    "orchestration",
+    "vscode"
+  ]
+}

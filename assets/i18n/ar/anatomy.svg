@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="590" viewBox="0 0 1800 590" role="img" aria-labelledby="title desc">
+  <title id="title">بنية استدعاء Autoprompt</title>
+  <desc id="desc">ينقسم أمر Autoprompt إلى التفعيل والتوازي وحد الوكلاء وتوجيه النماذج والهدف.</desc>
+  <defs>
+    <pattern id="grid" width="56" height="56" patternUnits="userSpaceOnUse">
+      <path d="M56 0H0V56" fill="none" stroke="#e2e2e4" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="1800" height="590" fill="#fbfbfa"/>
+  <rect width="1800" height="590" fill="url(#grid)" opacity=".78"/>
+
+  <g transform="translate(0 -244)">
+
+  <!-- Single flat anatomy panel -->
+  <rect x="80" y="304" width="1640" height="470" rx="14" fill="#ffffff" stroke="#c9c9ce" stroke-width="1.5"/>
+  <line x1="80" y1="412" x2="1720" y2="412" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="408" y1="304" x2="408" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="736" y1="304" x2="736" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="1064" y1="304" x2="1064" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="1392" y1="304" x2="1392" y2="774" stroke="#d6d6da" stroke-width="1"/>
+
+  <!-- Command row -->
+  <g font-family="Nimbus Mono PS, monospace" font-size="22">
+    <text x="112" y="372" fill="#255C60" font-weight="700">/autoprompt</text>
+    <text x="440" y="372" fill="#0d0d0f">mode=wide</text>
+    <text x="768" y="372" fill="#0d0d0f">max_subs=100</text>
+    <text x="1096" y="372" fill="#0d0d0f">agents=auto</text>
+    <text x="1424" y="357" fill="#56565e" font-size="17" font-style="italic">
+      <tspan x="1424" dy="0" direction="rtl" unicode-bidi="isolate" text-anchor="end">&lt;هدفك،</tspan>
+      <tspan x="1424" dy="25" direction="rtl" unicode-bidi="isolate" text-anchor="end">بكلمات واضحة&gt;</tspan>
+    </text>
+  </g>
+  <rect x="112" y="397" width="54" height="3" fill="#255C60"/>
+
+  <!-- Column 01 -->
+  <text x="112" y="462" fill="#67676e" font-family="Nimbus Mono PS, monospace" font-size="14">01</text>
+  <text x="112" y="515" fill="#111113" font-family="Nimbus Sans, Arial, sans-serif" font-size="27" font-weight="600" direction="rtl" unicode-bidi="isolate" text-anchor="end">التفعيل</text>
+  <text x="112" y="566" fill="#56565d" font-family="Nimbus Sans, Arial, sans-serif" font-size="18">
+    <tspan x="112" dy="0" direction="rtl" unicode-bidi="isolate" text-anchor="end">يحمّل Autoprompt</tspan>
+    <tspan x="112" dy="30" direction="rtl" unicode-bidi="isolate" text-anchor="end">ويبدأ التشغيل.</tspan>
+  </text>
+
+  <!-- Column 02 -->
+  <text x="440" y="462" fill="#67676e" font-family="Nimbus Mono PS, monospace" font-size="14">02</text>
+  <text x="440" y="515" fill="#111113" font-family="Nimbus Sans, Arial, sans-serif" font-size="27" font-weight="600" direction="rtl" unicode-bidi="isolate" text-anchor="end">التوازي</text>
+  <text x="440" y="566" fill="#56565d" font-family="Nimbus Sans, Arial, sans-serif" font-size="18">
+    <tspan x="440" dy="0" direction="rtl" unicode-bidi="isolate" text-anchor="end">عدد الوكلاء</tspan>
+    <tspan x="440" dy="30" direction="rtl" unicode-bidi="isolate" text-anchor="end">الذين يعملون معا.</tspan>
+  </text>
+  <text x="440" y="694" fill="#75757c" font-family="Nimbus Mono PS, monospace" font-size="13">
+    <tspan x="440" dy="0">tokensaver / wide</tspan>
+    <tspan x="440" dy="24">/ custom</tspan>
+  </text>
+
+  <!-- Column 03 -->
+  <text x="768" y="462" fill="#67676e" font-family="Nimbus Mono PS, monospace" font-size="14">03</text>
+  <text x="768" y="515" fill="#111113" font-family="Nimbus Sans, Arial, sans-serif" font-size="27" font-weight="600" direction="rtl" unicode-bidi="isolate" text-anchor="end">حد الوكلاء</text>
+  <text x="768" y="566" fill="#56565d" font-family="Nimbus Sans, Arial, sans-serif" font-size="18">
+    <tspan x="768" dy="0" direction="rtl" unicode-bidi="isolate" text-anchor="end">أقصى عدد من الوكلاء</tspan>
+    <tspan x="768" dy="30" direction="rtl" unicode-bidi="isolate" text-anchor="end">النشطين معا.</tspan>
+  </text>
+  <text x="768" y="694" fill="#75757c" font-family="Nimbus Mono PS, monospace" font-size="13" direction="rtl" unicode-bidi="isolate" text-anchor="end">يختلف حسب المضيف</text>
+
+  <!-- Column 04 -->
+  <text x="1096" y="462" fill="#67676e" font-family="Nimbus Mono PS, monospace" font-size="14">04</text>
+  <text x="1096" y="515" fill="#111113" font-family="Nimbus Sans, Arial, sans-serif" font-size="27" font-weight="600" direction="rtl" unicode-bidi="isolate" text-anchor="end">النماذج</text>
+  <text x="1096" y="566" fill="#56565d" font-family="Nimbus Sans, Arial, sans-serif" font-size="18">
+    <tspan x="1096" dy="0" direction="rtl" unicode-bidi="isolate" text-anchor="end">يحدد مجموعة</tspan>
+    <tspan x="1096" dy="30" direction="rtl" unicode-bidi="isolate" text-anchor="end">الوكلاء.</tspan>
+  </text>
+  <text x="1096" y="694" fill="#75757c" font-family="Nimbus Mono PS, monospace" font-size="13">
+    <tspan x="1096" dy="0">off / auto</tspan>
+    <tspan x="1096" dy="24" direction="rtl" unicode-bidi="isolate" text-anchor="end">/ قائمة محددة</tspan>
+  </text>
+
+  <!-- Column 05 -->
+  <text x="1424" y="462" fill="#67676e" font-family="Nimbus Mono PS, monospace" font-size="14">05</text>
+  <text x="1424" y="515" fill="#111113" font-family="Nimbus Sans, Arial, sans-serif" font-size="27" font-weight="600" direction="rtl" unicode-bidi="isolate" text-anchor="end">الهدف</text>
+  <text x="1424" y="566" fill="#56565d" font-family="Nimbus Sans, Arial, sans-serif" font-size="18">
+    <tspan x="1424" dy="0" direction="rtl" unicode-bidi="isolate" text-anchor="end">تكفي</tspan>
+    <tspan x="1424" dy="30" direction="rtl" unicode-bidi="isolate" text-anchor="end">كلمات واضحة.</tspan>
+  </text>
+  <text x="1424" y="694" fill="#75757c" font-family="Nimbus Sans, Arial, sans-serif" font-size="15">
+    <tspan x="1424" dy="0" direction="rtl" unicode-bidi="isolate" text-anchor="end">صف النتيجة</tspan>
+    <tspan x="1424" dy="24" direction="rtl" unicode-bidi="isolate" text-anchor="end">التي تريدها.</tspan>
+  </text>
+
+  </g>
+</svg>

@@ -1,0 +1,67 @@
+[
+  { "name": "type: bug", "color": "D73A4A", "description": "Verified defect or incorrect behavior" },
+  { "name": "type: feature", "color": "A2EEEF", "description": "New capability or user-facing improvement" },
+  { "name": "type: documentation", "color": "0075CA", "description": "Documentation-only change" },
+  { "name": "type: benchmark", "color": "255C60", "description": "New or rerun reproducible benchmark" },
+  { "name": "type: question", "color": "D876E3", "description": "Usage, setup, or compatibility question" },
+  { "name": "type: maintenance", "color": "6E7781", "description": "Refactor, cleanup, tooling, or upkeep" },
+  { "name": "type: security", "color": "B60205", "description": "Security hardening or private vulnerability follow-up" },
+  { "name": "type: performance", "color": "F9D0C4", "description": "Speed, memory, startup, or package-size work" },
+
+  { "name": "area: cli", "color": "1D76DB", "description": "Command-line interface and user prompts" },
+  { "name": "area: installers", "color": "0E8A16", "description": "Install, doctor, repair, and uninstall lifecycle" },
+  { "name": "area: providers", "color": "5319E7", "description": "Provider adapters, manifests, and generated payloads" },
+  { "name": "area: docs", "color": "0075CA", "description": "README, guides, FAQs, and community documents" },
+  { "name": "area: visuals", "color": "C5DEF5", "description": "Images, diagrams, and rendered assets" },
+  { "name": "area: translations", "color": "BFDADC", "description": "Localized documentation and visual assets" },
+  { "name": "area: tests", "color": "C2E0C6", "description": "Automated tests, fixtures, and verification" },
+  { "name": "area: automation", "color": "FEF2C0", "description": "GitHub Actions, issue templates, and repository automation" },
+  { "name": "area: packaging", "color": "D4C5F9", "description": "npm metadata, tarball contents, and release readiness" },
+  { "name": "area: security", "color": "B60205", "description": "Containment, permissions, secrets, and supply chain" },
+
+  { "name": "provider: claude", "color": "D97757", "description": "Claude Code adapter" },
+  { "name": "provider: codex", "color": "10A37F", "description": "Codex adapter" },
+  { "name": "provider: opencode", "color": "1F6FEB", "description": "OpenCode adapter" },
+  { "name": "provider: kilo", "color": "8B5CF6", "description": "Kilo Code adapter" },
+  { "name": "provider: vscode", "color": "007ACC", "description": "VS Code and GitHub Copilot adapter" },
+  { "name": "provider: prime", "color": "F59E0B", "description": "Prime Agent adapter" },
+
+  { "name": "status: needs triage", "color": "FBCA04", "description": "Awaiting initial maintainer review" },
+  { "name": "status: needs info", "color": "D876E3", "description": "More details or a reproduction are required" },
+  { "name": "status: ready", "color": "0E8A16", "description": "Scoped and ready to be worked on" },
+  { "name": "status: in progress", "color": "1D76DB", "description": "Actively being worked on" },
+  { "name": "status: needs review", "color": "7057FF", "description": "Implementation is ready for review" },
+  { "name": "status: blocked", "color": "B60205", "description": "Cannot proceed until a named blocker is cleared" },
+  { "name": "status: waiting upstream", "color": "D4C5F9", "description": "Waiting on a provider, dependency, or platform change" },
+
+  { "name": "priority: critical", "color": "B60205", "description": "Release blocker, data-loss risk, or severe security impact" },
+  { "name": "priority: high", "color": "D93F0B", "description": "Important defect or capability with broad impact" },
+  { "name": "priority: medium", "color": "FBCA04", "description": "Normal priority work" },
+  { "name": "priority: low", "color": "C2E0C6", "description": "Useful but not time-sensitive" },
+
+  { "name": "effort: small", "color": "BFE5BF", "description": "Focused change with limited surface area" },
+  { "name": "effort: medium", "color": "FEF2C0", "description": "Multi-file change with moderate verification" },
+  { "name": "effort: large", "color": "F9D0C4", "description": "Cross-cutting change requiring broad verification" },
+
+  { "name": "platform: windows", "color": "0078D4", "description": "Windows-specific behavior" },
+  { "name": "platform: linux", "color": "FCC624", "description": "Linux-specific behavior" },
+  { "name": "platform: macos", "color": "A2AAAD", "description": "macOS-specific behavior" },
+
+  { "name": "locale: arabic", "color": "C5DEF5", "description": "Arabic translation or localized asset" },
+  { "name": "locale: chinese", "color": "C5DEF5", "description": "Chinese translation or localized asset" },
+  { "name": "locale: korean", "color": "C5DEF5", "description": "Korean translation or localized asset" },
+  { "name": "locale: spanish", "color": "C5DEF5", "description": "Spanish translation or localized asset" },
+
+  { "name": "resolution: duplicate", "color": "CFD3D7", "description": "Already tracked elsewhere" },
+  { "name": "resolution: invalid", "color": "E4E669", "description": "Not actionable or outside the repository contract" },
+  { "name": "resolution: wontfix", "color": "FFFFFF", "description": "Closed without a planned change" },
+  { "name": "resolution: completed", "color": "0E8A16", "description": "Requested outcome is complete" },
+
+  { "name": "good first issue", "color": "7057FF", "description": "Small, well-scoped work for a first contribution" },
+  { "name": "help wanted", "color": "008672", "description": "Maintainers welcome an external contribution" },
+  { "name": "dependencies", "color": "0366D6", "description": "Dependency or GitHub Action update" },
+  { "name": "breaking change", "color": "B60205", "description": "Requires user migration or changes a public contract" },
+  { "name": "semver: major", "color": "B60205", "description": "Next release requires a major version bump" },
+  { "name": "semver: minor", "color": "1D76DB", "description": "Next release requires a minor version bump" },
+  { "name": "semver: patch", "color": "0E8A16", "description": "Next release requires a patch version bump" }
+]

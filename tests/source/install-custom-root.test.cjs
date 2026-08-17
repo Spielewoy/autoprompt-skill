@@ -1,0 +1,692 @@
+#!/usr/bin/env node
+'use strict'
+
+const assert = require('node:assert/strict')
+const childProcess = require('node:child_process')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const test = require('node:test')
+
+const ROOT = path.resolve(__dirname, '..', '..')
+const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
+const GIT_BASH = process.platform === 'win32'
+  ? 'C:\\Program Files\\Git\\bin\\bash.exe'
+  : 'bash'
+const PUBLIC_CLIENTS = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']
+const SHARED_LIFECYCLE_CLIENTS = PUBLIC_CLIENTS.filter(client => client !== 'prime')
+const CLIENT_COMMANDS = {
+  claude: ['claude', 'Claude Code 2.1.232'],
+  codex: ['codex', 'codex-cli 0.101.0'],
+  opencode: ['opencode', 'opencode 1.18.18'],
+  kilo: ['kilo', 'kilo 7.4.22'],
+  vscode: ['code', '1.133.0']
+}
+const MANIFESTS = Object.fromEntries(SHARED_LIFECYCLE_CLIENTS.map(client => [
+  client,
+  JSON.parse(fs.readFileSync(
+    path.join(ROOT, 'agents', 'manifests', `${client}-runtime.json`),
+    'utf8'
+  ))
+]))
+
+function run (command, args, options = {}) {
+  return childProcess.spawnSync(command, args, {
+    cwd: ROOT,
+    encoding: 'utf8',
+    timeout: 180000,
+    ...options
+  })
+}
+
+function psLiteral (value) {
+  return `'${value.replaceAll("'", "''")}'`
+}
+
+function bashPath (value) {
+  return value.replaceAll('\\', '/').replace(
+    /^([A-Za-z]):/,
+    (_, drive) => `/${drive.toLowerCase()}`
+  )
+}
+
+function shellLiteral (value) {
+  return `'${value.replaceAll("'", '\'"\'"\'')}'`
+}
+
+function cleanEnvironment (extra = {}) {
+  const env = { ...process.env, ...extra }
+  delete env.CODEX_HOME
+  delete env.AUTOPROMPT_VSCODE_SETTINGS_PATH
+  return env
+}
+
+function powershellEntry (name, target, strict = false) {
+  const entry = path.join(ROOT, 'scripts', 'install', `${name}.ps1`)
+  const argument = target === null ? '' : ` ${psLiteral(target)}`
+  const strictArgument = strict ? ' -Strict' : ''
+  return `& ${psLiteral(entry)}${argument}${strictArgument}; exit $LASTEXITCODE`
+}
+
+function assertRejected (completed, reason) {
+  assert.notEqual(completed.status, 0, `${completed.stdout}\n${completed.stderr}`)
+  assert.match(`${completed.stdout}\n${completed.stderr}`, /invalid-install-root/)
+  if (reason) assert.match(`${completed.stdout}\n${completed.stderr}`, reason)
+}
+
+function writeFakeClients (binDirectory) {
+  fs.mkdirSync(binDirectory, { recursive: true })
+  for (const [command, version] of Object.values(CLIENT_COMMANDS)) {
+    if (process.platform === 'win32') {
+      fs.writeFileSync(
+        path.join(binDirectory, `${command}.cmd`),
+        `@echo off\r\necho ${version}\r\n`
+      )
+    }
+    const shellTarget = path.join(binDirectory, command)
+    fs.writeFileSync(shellTarget, `#!/bin/sh\nprintf '%s\\n' '${version}'\n`)
+    fs.chmodSync(shellTarget, 0o755)
+  }
+}
+
+function makeLifecycleContext (sandbox, client) {
+  const home = path.join(sandbox, 'home')
+  const xdg = path.join(sandbox, 'xdg')
+  const appData = path.join(sandbox, 'appdata')
+  const bin = path.join(sandbox, 'bin')
+  const customRoot = path.join(sandbox, `${client}-root`)
+  const settings = path.join(appData, 'Code', 'User', 'settings.json')
+  fs.mkdirSync(home, { recursive: true })
+  fs.mkdirSync(xdg, { recursive: true })
+  fs.mkdirSync(customRoot, { recursive: true })
+  writeFakeClients(bin)
+  return {
+    appData,
+    bin,
+    customRoot,
+    home,
+    settings,
+    xdg,
+    env: cleanEnvironment({
+      APPDATA: appData,
+      AUTOPROMPT_INSTALL_ROOT: customRoot,
+      HOME: home,
+      USERPROFILE: home,
+      XDG_CONFIG_HOME: xdg,
+      PATH: `${bin}${path.delimiter}${process.env.PATH || ''}`
+    })
+  }
+}
+
+function assertManifestInstalled (client, customRoot) {
+  const runtimeRoot = path.join(customRoot, 'skills', 'autoprompt')
+  for (const relative of MANIFESTS[client].files) {
+    assert.equal(
+      fs.existsSync(path.join(runtimeRoot, ...relative.split('/'))),
+      true,
+      `${client}: ${relative}`
+    )
+  }
+}
+
+function matchingFiles (directory, expression) {
+  return fs.readdirSync(directory).filter(name => expression.test(name)).sort()
+}
+
+function physicalPath (filePath) {
+  let cursor = path.resolve(filePath)
+  const suffix = []
+  while (!fs.existsSync(cursor)) {
+    const parent = path.dirname(cursor)
+    if (parent === cursor) break
+    suffix.unshift(path.basename(cursor))
+    cursor = parent
+  }
+  try {
+    cursor = fs.realpathSync.native(cursor)
+  } catch {}
+  return path.join(cursor, ...suffix)
+}
+
+function assertCustomLayout (client, customRoot) {
+  const skill = path.join(customRoot, 'skills', 'autoprompt')
+  assert.equal(fs.existsSync(path.join(skill, 'SKILL.md')), true)
+  assertManifestInstalled(client, customRoot)
+  switch (client) {
+    case 'claude':
+      assert.equal(matchingFiles(path.join(customRoot, 'agents'), /^ap-.*\.md$/).length, 25)
+      break
+    case 'codex':
+      assert.equal(
+        matchingFiles(path.join(skill, 'agents-runtime'), /^ap-.*\.toml$/).length,
+        25
+      )
+      assert.equal(fs.existsSync(path.join(customRoot, 'autoprompt.config.toml')), true)
+      break
+    case 'opencode':
+      assert.equal(matchingFiles(path.join(customRoot, 'agents'), /^ap-.*\.md$/).length, 25)
+      assert.equal(fs.existsSync(path.join(customRoot, 'autoprompt.opencode.json')), true)
+      assert.equal(fs.existsSync(path.join(skill, 'workflow', 'launch-opencode.sh')), true)
+      assert.equal(fs.existsSync(path.join(skill, 'workflow', 'launch-opencode.ps1')), true)
+      break
+    case 'kilo':
+      assert.equal(matchingFiles(path.join(customRoot, 'agents'), /^ap-.*\.md$/).length, 25)
+      assert.equal(fs.existsSync(path.join(customRoot, 'autoprompt.kilo.json')), true)
+      break
+    case 'vscode':
+      assert.equal(
+        matchingFiles(path.join(customRoot, 'agents'), /^ap-.*\.agent\.md$/).length,
+        25
+      )
+      break
+  }
+}
+
+function isSameOrWithin (root, candidate) {
+  const relative = path.relative(physicalPath(root), physicalPath(candidate))
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) &&
+    relative !== '..' && !path.isAbsolute(relative))
+}
+
+function assertReceiptScoped (client, customRoot, settings) {
+  const receiptFile = path.join(customRoot, '.autoprompt-install-receipt.json')
+  const receipt = JSON.parse(fs.readFileSync(receiptFile, 'utf8'))
+  const receiptPaths = [
+    ...(receipt.files || []),
+    ...(receipt.createdDirectories || []),
+    ...(receipt.configEdits || []).map(edit => edit.file)
+  ]
+  if (receipt.backup && receipt.backup !== 'none') receiptPaths.push(receipt.backup)
+  for (const receiptPath of receiptPaths) {
+    if (isSameOrWithin(customRoot, receiptPath)) continue
+    assert.equal(client, 'vscode', receiptPath)
+    assert.ok(
+      path.resolve(receiptPath) === path.resolve(settings) ||
+      path.resolve(receiptPath) === path.resolve(`${settings}.autoprompt.bak`),
+      receiptPath
+    )
+  }
+  return { receipt, receiptFile }
+}
+
+function defaultProviderPaths (context, client) {
+  switch (client) {
+    case 'claude': return [path.join(context.home, '.claude')]
+    case 'codex': return [path.join(context.home, '.codex')]
+    case 'opencode': return [path.join(context.xdg, 'opencode')]
+    case 'kilo': return [path.join(context.home, '.kilo'), path.join(context.xdg, 'kilo')]
+    case 'vscode': return [path.join(context.home, '.copilot')]
+    default: return []
+  }
+}
+
+function customTamperTarget (client, customRoot) {
+  const skill = path.join(customRoot, 'skills', 'autoprompt')
+  switch (client) {
+    case 'claude': return path.join(customRoot, 'agents', 'ap-manager.md')
+    case 'codex': return path.join(skill, 'agents', 'ap-manager.toml')
+    case 'opencode': return path.join(customRoot, 'agents', 'ap-manager.md')
+    case 'kilo': return path.join(customRoot, 'agents', 'ap-manager.md')
+    case 'vscode': return path.join(customRoot, 'agents', 'ap-manager.agent.md')
+    default: throw new Error(`unknown client: ${client}`)
+  }
+}
+
+test('PowerShell resolver treats AUTOPROMPT_INSTALL_ROOT as the exact provider root', {
+  skip: process.platform !== 'win32'
+}, () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-root-resolve-ps-'))
+  const customRoot = path.join(sandbox, 'provider-root')
+  const library = path.join(ROOT, 'scripts', 'install', 'lib', 'install-lib.ps1')
+  const script = [
+    `. ${psLiteral(library)}`,
+    ...PUBLIC_CLIENTS.map(client =>
+      `if (-not (Test-AutopromptInstallRootContract -Target '${client}')) { exit 90 }`),
+    ...SHARED_LIFECYCLE_CLIENTS.map(client => [
+      `$resolveCode = Resolve-Destination -Name '${client}'`,
+      'if ([int]$resolveCode -ne 0) { exit ([int]$resolveCode) }'
+    ].join('; '))
+  ].join('; ')
+  try {
+    const completed = run(POWERSHELL, [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script
+    ], {
+      env: cleanEnvironment({
+        HOME: path.join(sandbox, 'home'),
+        USERPROFILE: path.join(sandbox, 'profile'),
+        XDG_CONFIG_HOME: path.join(sandbox, 'xdg'),
+        AUTOPROMPT_INSTALL_ROOT: customRoot
+      })
+    })
+    assert.equal(completed.status, 0, `${completed.stdout}\n${completed.stderr}`)
+    const destinations = completed.stdout.match(/dest=([^\r\n]+?) format=/g) || []
+    assert.equal(destinations.length, SHARED_LIFECYCLE_CLIENTS.length, completed.stdout)
+    const physicalRoot = physicalPath(customRoot)
+    for (const record of destinations) {
+      assert.match(record, new RegExp(
+        `dest=${physicalRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}` +
+        '[\\\\/]skills[\\\\/]autoprompt[\\\\/]SKILL\\.md format=',
+        'i'
+      ))
+    }
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+  }
+})
+
+test('Git Bash resolver uses the same exact-root contract', {
+  skip: !fs.existsSync(GIT_BASH)
+}, () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-root-resolve-sh-'))
+  const customRoot = path.join(sandbox, 'provider-root')
+  const shellRoot = bashPath(customRoot)
+  const probe = [
+    'set -u',
+    '. scripts/install/lib/install-lib.sh',
+    ...PUBLIC_CLIENTS.map(client => `test_autoprompt_install_root_contract '${client}'`),
+    ...SHARED_LIFECYCLE_CLIENTS.map(client => [
+      `resolve_destination '${client}'`
+    ].join('\n'))
+  ].join('\n')
+  try {
+    const completed = run(GIT_BASH, ['-lc', probe], {
+      env: cleanEnvironment({
+        HOME: bashPath(path.join(sandbox, 'home')),
+        USERPROFILE: path.join(sandbox, 'profile'),
+        XDG_CONFIG_HOME: bashPath(path.join(sandbox, 'xdg')),
+        AUTOPROMPT_INSTALL_ROOT: shellRoot
+      })
+    })
+    assert.equal(completed.status, 0, `${completed.stdout}\n${completed.stderr}`)
+    const lines = completed.stdout.trim().split(/\r?\n/)
+    assert.equal(lines.length, SHARED_LIFECYCLE_CLIENTS.length, completed.stdout)
+    for (const line of lines) {
+      assert.match(line, new RegExp(
+        `dest=${shellRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}` +
+        '/skills/autoprompt/SKILL\\.md format='
+      ))
+    }
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+  }
+})
+
+test('PowerShell lifecycle entrypoints fail closed for invalid root contracts', {
+  skip: process.platform !== 'win32'
+}, () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-root-reject-ps-'))
+  const safeRoot = path.join(sandbox, 'provider-root')
+  const home = path.join(sandbox, 'home')
+  const bin = path.join(sandbox, 'bin')
+  writeFakeClients(bin)
+  const baseEnv = cleanEnvironment({
+    HOME: home,
+    USERPROFILE: home,
+    XDG_CONFIG_HOME: path.join(sandbox, 'xdg'),
+    PATH: `${bin}${path.delimiter}${process.env.PATH || ''}`
+  })
+  const cases = [
+    ['install', 'all', safeRoot, /explicit-client-required/],
+    ['doctor', null, safeRoot, /explicit-client-required/],
+    ['uninstall', 'all', safeRoot, /explicit-client-required/],
+    ['install', 'cursor', safeRoot, /client-not-installable/],
+    // Windows cannot preserve a zero-length process environment value: it is
+    // exposed to the child as unset. Whitespace is the representable empty
+    // contract value and exercises the same validation branch.
+    ['install', 'claude', ' ', /reason=empty/],
+    ['install', 'claude', 'relative/provider-root', /not-absolute/],
+    ['install', 'claude', `${sandbox}${path.sep}safe${path.sep}..${path.sep}escape`, /traversal/],
+    ['install', 'claude', path.parse(sandbox).root, /filesystem-root-refused/]
+  ]
+  const sibling = path.join(sandbox, 'keep.txt')
+  fs.writeFileSync(sibling, 'keep\n')
+  try {
+    for (const [entry, target, root, reason] of cases) {
+      const completed = run(POWERSHELL, [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-Command', powershellEntry(entry, target)
+      ], { env: { ...baseEnv, AUTOPROMPT_INSTALL_ROOT: root } })
+      assertRejected(completed, reason)
+      assert.equal(fs.readFileSync(sibling, 'utf8'), 'keep\n')
+    }
+
+    const fileRoot = path.join(sandbox, 'not-a-directory')
+    fs.writeFileSync(fileRoot, 'user-owned\n')
+    const fileRejected = run(POWERSHELL, [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-Command', powershellEntry('install', 'claude')
+    ], { env: { ...baseEnv, AUTOPROMPT_INSTALL_ROOT: fileRoot } })
+    assertRejected(fileRejected, /not-directory/)
+    assert.equal(fs.readFileSync(fileRoot, 'utf8'), 'user-owned\n')
+
+    const junctionTarget = path.join(sandbox, 'junction-target')
+    const junctionRoot = path.join(sandbox, 'junction-root')
+    fs.mkdirSync(junctionTarget)
+    fs.symlinkSync(junctionTarget, junctionRoot, 'junction')
+    const junctionRejected = run(POWERSHELL, [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-Command', powershellEntry('install', 'claude')
+    ], { env: { ...baseEnv, AUTOPROMPT_INSTALL_ROOT: junctionRoot } })
+    assertRejected(junctionRejected, /reparse-root-refused/)
+
+    fs.mkdirSync(safeRoot, { recursive: true })
+    const escapedSkills = path.join(sandbox, 'escaped-skills')
+    fs.mkdirSync(escapedSkills)
+    fs.symlinkSync(escapedSkills, path.join(safeRoot, 'skills'), 'junction')
+    const nestedJunctionRejected = run(POWERSHELL, [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-Command', powershellEntry('install', 'claude')
+    ], { env: { ...baseEnv, AUTOPROMPT_INSTALL_ROOT: safeRoot } })
+    assert.notEqual(
+      nestedJunctionRejected.status,
+      0,
+      `${nestedJunctionRejected.stdout}\n${nestedJunctionRejected.stderr}`
+    )
+    assert.match(
+      `${nestedJunctionRejected.stdout}\n${nestedJunctionRejected.stderr}`,
+      /target preflight failed|stage=target-preflight/
+    )
+    assert.equal(fs.existsSync(path.join(escapedSkills, 'autoprompt')), false)
+    assert.equal(fs.readFileSync(sibling, 'utf8'), 'keep\n')
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+  }
+})
+
+test('Git Bash lifecycle entrypoints reject all, blocked, empty, relative, and root paths', {
+  skip: !fs.existsSync(GIT_BASH)
+}, () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-root-reject-sh-'))
+  const safeRoot = bashPath(path.join(sandbox, 'provider-root'))
+  const bin = path.join(sandbox, 'bin')
+  writeFakeClients(bin)
+  const baseEnv = cleanEnvironment({
+    HOME: bashPath(path.join(sandbox, 'home')),
+    XDG_CONFIG_HOME: bashPath(path.join(sandbox, 'xdg')),
+    PATH: `${bashPath(bin)}:/usr/bin:${process.env.PATH || ''}`
+  })
+  const cases = [
+    ['scripts/install/install.sh all', safeRoot, /explicit-client-required/],
+    ['scripts/install/doctor.sh', safeRoot, /explicit-client-required/],
+    ['scripts/install/uninstall.sh all', safeRoot, /explicit-client-required/],
+    ['scripts/install/install.sh cursor', safeRoot, /client-not-installable/],
+    ['scripts/install/install.sh claude', '', /reason=empty/],
+    ['scripts/install/install.sh claude', 'relative/provider-root', /not-absolute/],
+    ['scripts/install/install.sh claude', `${safeRoot}/../escape`, /traversal/],
+    ['scripts/install/install.sh claude', '/', /filesystem-root-refused/]
+  ]
+  try {
+    for (const [command, root, reason] of cases) {
+      const completed = run(GIT_BASH, ['-lc', `/usr/bin/bash ${command}`], {
+        env: { ...baseEnv, AUTOPROMPT_INSTALL_ROOT: root }
+      })
+      assertRejected(completed, reason)
+    }
+
+    const fileRoot = path.join(sandbox, 'not-a-directory')
+    fs.writeFileSync(fileRoot, 'user-owned\n')
+    const fileRejected = run(GIT_BASH, [
+      '-lc', '/usr/bin/bash scripts/install/install.sh claude'
+    ], {
+      env: {
+        ...baseEnv,
+        AUTOPROMPT_INSTALL_ROOT: bashPath(fileRoot)
+      }
+    })
+    assertRejected(fileRejected, /not-directory/)
+    assert.equal(fs.readFileSync(fileRoot, 'utf8'), 'user-owned\n')
+
+    const junctionTarget = path.join(sandbox, 'junction-target')
+    const junctionRoot = path.join(sandbox, 'junction-root')
+    fs.mkdirSync(junctionTarget)
+    fs.symlinkSync(
+      junctionTarget,
+      junctionRoot,
+      process.platform === 'win32' ? 'junction' : 'dir'
+    )
+    const junctionRejected = run(GIT_BASH, [
+      '-lc', '/usr/bin/bash scripts/install/install.sh claude'
+    ], {
+      env: {
+        ...baseEnv,
+        AUTOPROMPT_INSTALL_ROOT: bashPath(junctionRoot)
+      }
+    })
+    assertRejected(junctionRejected, /symlink-root-refused/)
+
+    const nativeSafeRoot = path.join(sandbox, 'nested-provider-root')
+    const escapedSkills = path.join(sandbox, 'escaped-skills')
+    fs.mkdirSync(nativeSafeRoot)
+    fs.mkdirSync(escapedSkills)
+    fs.symlinkSync(
+      escapedSkills,
+      path.join(nativeSafeRoot, 'skills'),
+      process.platform === 'win32' ? 'junction' : 'dir'
+    )
+    const nestedJunctionRejected = run(GIT_BASH, [
+      '-lc', '/usr/bin/bash scripts/install/install.sh claude'
+    ], {
+      env: {
+        ...baseEnv,
+        AUTOPROMPT_INSTALL_ROOT: bashPath(nativeSafeRoot)
+      }
+    })
+    assert.notEqual(
+      nestedJunctionRejected.status,
+      0,
+      `${nestedJunctionRejected.stdout}\n${nestedJunctionRejected.stderr}`
+    )
+    assert.match(
+      `${nestedJunctionRejected.stdout}\n${nestedJunctionRejected.stderr}`,
+      /target preflight failed|stage=preflight/
+    )
+    assert.equal(fs.existsSync(path.join(escapedSkills, 'autoprompt')), false)
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+  }
+})
+
+test('PowerShell custom roots complete install, doctor, repair, and uninstall for every provider', {
+  skip: process.platform !== 'win32',
+  timeout: 600000
+}, () => {
+  const clients = process.env.AUTOPROMPT_TEST_CUSTOM_ROOT_CLIENT
+    ? [process.env.AUTOPROMPT_TEST_CUSTOM_ROOT_CLIENT]
+    : SHARED_LIFECYCLE_CLIENTS
+  for (const client of clients) {
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), `autoprompt-root-${client}-ps-`))
+    const context = makeLifecycleContext(sandbox, client)
+    const rootSentinel = path.join(context.customRoot, 'keep-user.txt')
+    const siblingSentinel = path.join(sandbox, 'keep-sibling.txt')
+    const originalSettings = Buffer.from(
+      '{\n  "editor.fontSize": 15,\n' +
+      '  "chat.subagents.allowInvocationsFromSubagents": false\n}\n'
+    )
+    fs.writeFileSync(rootSentinel, 'keep root\n')
+    fs.writeFileSync(siblingSentinel, 'keep sibling\n')
+    if (client === 'vscode') {
+      fs.mkdirSync(path.dirname(context.settings), { recursive: true })
+      fs.writeFileSync(context.settings, originalSettings)
+    }
+
+    try {
+      const installed = run(POWERSHELL, [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-Command', powershellEntry('install', client)
+      ], { env: context.env })
+      assert.equal(
+        installed.status,
+        0,
+        `${client} install:\n${installed.stdout}\n${installed.stderr}`
+      )
+      assertCustomLayout(client, context.customRoot)
+      const { receipt, receiptFile } = assertReceiptScoped(
+        client,
+        context.customRoot,
+        context.settings
+      )
+      assert.equal(fs.existsSync(path.join(
+        context.customRoot,
+        '.autoprompt-install-hashes.json'
+      )), true)
+      for (const defaultPath of defaultProviderPaths(context, client)) {
+        assert.equal(fs.existsSync(defaultPath), false, `${client}: ${defaultPath}`)
+      }
+
+      if (client === 'vscode') {
+        assert.match(
+          fs.readFileSync(context.settings, 'utf8'),
+          /"chat\.subagents\.allowInvocationsFromSubagents": true/
+        )
+        assert.deepEqual(
+          fs.readFileSync(`${context.settings}.autoprompt.bak`),
+          originalSettings
+        )
+      }
+
+      const healthy = run(POWERSHELL, [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-Command', powershellEntry('doctor', client, true)
+      ], { env: context.env })
+      assert.equal(
+        healthy.status,
+        0,
+        `${client} doctor:\n${healthy.stdout}\n${healthy.stderr}`
+      )
+      assert.match(healthy.stdout, new RegExp(`^${client}\\s+yes\\s+yes\\s+yes\\s+`, 'm'))
+
+      const tamperTarget = customTamperTarget(client, context.customRoot)
+      fs.appendFileSync(tamperTarget, '\ncustom-root-tamper\n')
+      const broken = run(POWERSHELL, [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-Command', powershellEntry('doctor', client, true)
+      ], { env: context.env })
+      assert.notEqual(
+        broken.status,
+        0,
+        `${client} tamper doctor:\n${broken.stdout}\n${broken.stderr}`
+      )
+
+      const repaired = run(POWERSHELL, [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-Command', powershellEntry('install', client)
+      ], { env: context.env })
+      assert.equal(
+        repaired.status,
+        0,
+        `${client} repair:\n${repaired.stdout}\n${repaired.stderr}`
+      )
+      const repairedDoctor = run(POWERSHELL, [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-Command', powershellEntry('doctor', client, true)
+      ], { env: context.env })
+      assert.equal(
+        repairedDoctor.status,
+        0,
+        `${client} repaired doctor:\n${repairedDoctor.stdout}\n${repairedDoctor.stderr}`
+      )
+
+      const removed = run(POWERSHELL, [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-Command', powershellEntry('uninstall', client)
+      ], { env: context.env })
+      assert.equal(
+        removed.status,
+        0,
+        `${client} uninstall:\n${removed.stdout}\n${removed.stderr}`
+      )
+      for (const managedFile of receipt.files || []) {
+        if (client === 'vscode' && path.resolve(managedFile) === path.resolve(context.settings)) {
+          continue
+        }
+        assert.equal(fs.existsSync(managedFile), false, `${client}: ${managedFile}`)
+      }
+      assert.equal(fs.existsSync(receiptFile), false)
+      assert.equal(fs.existsSync(path.join(
+        context.customRoot,
+        '.autoprompt-install-hashes.json'
+      )), false)
+      assert.equal(fs.readFileSync(rootSentinel, 'utf8'), 'keep root\n')
+      assert.equal(fs.readFileSync(siblingSentinel, 'utf8'), 'keep sibling\n')
+      if (client === 'vscode') {
+        assert.deepEqual(fs.readFileSync(context.settings), originalSettings)
+        assert.equal(fs.existsSync(`${context.settings}.autoprompt.bak`), false)
+      }
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true })
+    }
+  }
+})
+
+test('Git Bash custom Kilo root completes install, doctor, repair, and uninstall', {
+  skip: !fs.existsSync(GIT_BASH),
+  timeout: 720000
+}, () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-root-kilo-sh-'))
+  const context = makeLifecycleContext(sandbox, 'kilo')
+  const shellRoot = bashPath(context.customRoot)
+  const rootSentinel = path.join(context.customRoot, 'keep-user.txt')
+  const siblingSentinel = path.join(sandbox, 'keep-sibling.txt')
+  fs.writeFileSync(rootSentinel, 'keep root\n')
+  fs.writeFileSync(siblingSentinel, 'keep sibling\n')
+  const env = cleanEnvironment({
+    AUTOPROMPT_INSTALL_ROOT: shellRoot,
+    HOME: bashPath(context.home),
+    USERPROFILE: context.home,
+    XDG_CONFIG_HOME: bashPath(context.xdg),
+    PATH: `${bashPath(context.bin)}:/usr/bin:${process.env.PATH || ''}`
+  })
+  const shellEntry = (name, strict = false) => [
+    `export PATH=${shellLiteral(bashPath(context.bin))}:"$PATH";`,
+    '/usr/bin/bash',
+    shellLiteral(`scripts/install/${name}.sh`),
+    strict ? '--strict' : '',
+    'kilo'
+  ].filter(Boolean).join(' ')
+
+  try {
+    const installed = run(GIT_BASH, ['-lc', shellEntry('install')], { env })
+    assert.equal(installed.status, 0, `${installed.stdout}\n${installed.stderr}`)
+    assertCustomLayout('kilo', context.customRoot)
+    assert.equal(fs.existsSync(path.join(context.home, '.kilo')), false)
+    assert.equal(fs.existsSync(path.join(context.xdg, 'kilo')), false)
+
+    const healthy = run(GIT_BASH, ['-lc', shellEntry('doctor', true)], { env })
+    assert.equal(healthy.status, 0, `${healthy.stdout}\n${healthy.stderr}`)
+    assert.match(healthy.stdout, /^kilo\s+yes\s+yes\s+yes\s+/m)
+
+    const mainSkill = path.join(context.customRoot, 'skills', 'autoprompt', 'SKILL.md')
+    fs.appendFileSync(
+      customTamperTarget('kilo', context.customRoot),
+      '\nshell-custom-root-tamper\n'
+    )
+    const broken = run(GIT_BASH, ['-lc', shellEntry('doctor', true)], { env })
+    assert.notEqual(broken.status, 0, `${broken.stdout}\n${broken.stderr}`)
+
+    const repaired = run(GIT_BASH, ['-lc', shellEntry('install')], {
+      env,
+      timeout: 360000
+    })
+    assert.equal(repaired.status, 0, `${repaired.stdout}\n${repaired.stderr}`)
+    const repairedDoctor = run(GIT_BASH, ['-lc', shellEntry('doctor', true)], { env })
+    assert.equal(
+      repairedDoctor.status,
+      0,
+      `${repairedDoctor.stdout}\n${repairedDoctor.stderr}`
+    )
+
+    const removed = run(GIT_BASH, ['-lc', shellEntry('uninstall')], { env })
+    assert.equal(removed.status, 0, `${removed.stdout}\n${removed.stderr}`)
+    assert.equal(fs.existsSync(mainSkill), false)
+    assert.equal(fs.existsSync(path.join(context.customRoot, 'agents')), false)
+    assert.equal(fs.existsSync(path.join(context.customRoot, 'autoprompt.kilo.json')), false)
+    assert.equal(fs.existsSync(path.join(
+      context.customRoot,
+      '.autoprompt-install-receipt.json'
+    )), false)
+    assert.equal(fs.readFileSync(rootSentinel, 'utf8'), 'keep root\n')
+    assert.equal(fs.readFileSync(siblingSentinel, 'utf8'), 'keep sibling\n')
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+  }
+})

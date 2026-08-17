@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1672 941" role="img" aria-labelledby="title desc">
+  <title id="title">Terminal-Bench 2.1의 OpenCode 1.18.7</title>
+  <desc id="desc">Autoprompt 벤치마크에서 기준선은 89개 작업 중 60개, Autoprompt 사용 시 73개를 해결했습니다.</desc>
+  <defs>
+    <style>
+      text { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "Malgun Gothic", "Noto Sans Arabic", sans-serif; }
+      .eyebrow { fill: #617073; font-size: 17px; font-weight: 650; letter-spacing: .5px; }
+      .title { fill: #17262a; font-size: 46px; font-weight: 700; }
+      .tick { fill: #5b686b; font-size: 21px; font-weight: 450; }
+      .axis-label { fill: #17262a; font-size: 25px; font-weight: 600; }
+      .category { fill: #5b686b; font-size: 23px; font-weight: 500; }
+      .value-dark { fill: #34343c; font-size: 34px; font-weight: 700; }
+      .value-light { fill: #ffffff; font-size: 34px; font-weight: 700; }
+      .bar-copy-dark { fill: #45454e; font-size: 21px; font-weight: 450; }
+      .bar-copy-light { fill: #ffffff; font-size: 21px; font-weight: 450; }
+      .axis { stroke: #17262a; stroke-width: 2; }
+      .grid { stroke: #d7dede; stroke-width: 1; }
+    </style>
+  </defs>
+  <rect width="1672" height="941" fill="#ffffff"/>
+  <text x="78" y="66" class="eyebrow">Autoprompt 벤치마크</text>
+  <text x="78" y="126" class="title">Terminal-Bench 2.1의 OpenCode 1.18.7</text>
+  <g class="grid">
+    <line x1="170" y1="250" x2="1590" y2="250"/><line x1="170" y1="362" x2="1590" y2="362"/>
+    <line x1="170" y1="474" x2="1590" y2="474"/><line x1="170" y1="586" x2="1590" y2="586"/>
+    <line x1="170" y1="698" x2="1590" y2="698"/><line x1="170" y1="810" x2="1590" y2="810"/>
+  </g>
+  <line x1="168" y1="250" x2="168" y2="810" class="axis"/>
+  <line x1="168" y1="810" x2="1590" y2="810" class="axis"/>
+  <g class="tick" text-anchor="end">
+    <text x="138" y="817">0</text><text x="138" y="705">20</text><text x="138" y="593">40</text>
+    <text x="138" y="481">60</text><text x="138" y="369">80</text><text x="138" y="257">100</text>
+  </g>
+  <rect x="350" y="432.448" width="360" height="377.552" fill="#c9c9ce"/>
+  <rect x="962" y="350.688" width="360" height="459.312" fill="#255c60"/>
+  <text x="530" y="490.448" class="value-dark" text-anchor="middle">67.42%</text>
+  <text x="530" y="526.448" class="bar-copy-dark" text-anchor="middle">60/89 해결</text>
+  <text x="530" y="858" class="category" text-anchor="middle">OpenCode 기준선</text>
+  <text x="1142" y="408.688" class="value-light" text-anchor="middle">82.02%</text>
+  <text x="1142" y="444.688" class="bar-copy-light" text-anchor="middle">73/89 해결</text>
+  <text x="1142" y="858" class="category" text-anchor="middle">OpenCode + Autoprompt</text>
+  <text x="62" y="560" class="axis-label" text-anchor="middle" transform="rotate(-90 62 560)">작업 해결률 (%)</text>
+</svg>

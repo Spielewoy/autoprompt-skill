@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-release:
+    name: Verify and publish release assets
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          check-latest: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          check-latest: false
+      - name: Install validation parser
+        run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3
+      - name: Match tag to package version
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match package version $version."
+          }
+      - name: Run the complete release gate
+        run: npm run prepublishOnly
+      - name: Build release assets
+        shell: pwsh
+        run: ./scripts/build-release-assets.ps1
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $assets = Get-ChildItem dist -File | Where-Object Name -ne 'RELEASE_NOTES.md' | ForEach-Object FullName
+          $repositoryName = $env:GITHUB_REPOSITORY.Split('/', 2)[1]
+          $query = 'query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){databaseId}}}'
+          $releaseId = gh api graphql -f query=$query -F owner=$env:GITHUB_REPOSITORY_OWNER -F name=$repositoryName -F tag="v$version" --jq '.data.repository.release.databaseId // empty'
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not query the existing GitHub release.'
+          }
+          if ($releaseId) {
+            gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/releases/$releaseId"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not replace existing release v$version."
+            }
+          }
+          gh release create "v$version" @assets --verify-tag --title "Autoprompt Skill $version" --notes-file dist/RELEASE_NOTES.md

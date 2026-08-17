@@ -1,0 +1,728 @@
+{
+  "schemaVersion": 1,
+  "personas": [
+    {
+      "id": "ap-arbiter",
+      "tier": "R2",
+      "description": "L4 terminal leaf - ARBITER. Independent decision-maker for forks the loop cannot resolve on its own. Under UNATTENDED mode it ALWAYS rules and continues, NEVER escalates to the user. Output is a binding ruling logged to the ledger.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-arbiter.md"
+    },
+    {
+      "id": "ap-depth-prober",
+      "tier": "R2",
+      "description": "L4 terminal leaf - G3.5 DEPTH-LOCK. Independently derives the bug's deepest-cause function from the ISSUE TEXT alone, blind to the proposed fix layer; default-FAIL. Emits D1-D5. depth-miss REJECTs to G1.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-depth-prober.md"
+    },
+    {
+      "id": "ap-execharness-resolver",
+      "tier": "R3",
+      "description": "L3 executor - EXECHARNESS RESOLVE. Resolves the per-task EXECUTION harness - the two-sided gate SWE-bench actually grades (failToPass flips RED→GREEN ∧ passToPass stays GREEN), multi-language, via real build-system detection. Ingests shipped FAIL_TO_PASS/PASS_TO_PASS, else derives failToPass from the mission's behavioral acceptance asks. An unresolvable environment is BLOCKED, never a stand-in.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-execharness-resolver.md"
+    },
+    {
+      "id": "ap-feature-coordinator",
+      "tier": "R1",
+      "description": "L1 feature coordinator - drives approved ROADMAP.md lanes through their required build/review/verification gates and owns the run-wide feature frontier.",
+      "capabilities": [
+        "Agent"
+      ],
+      "allowedChildren": [
+        "ap-arbiter",
+        "ap-depth-prober",
+        "ap-execharness-resolver",
+        "ap-framework-generator",
+        "ap-framework-validator",
+        "ap-fresh-verifier",
+        "ap-goal-checker",
+        "ap-implementer",
+        "ap-intake",
+        "ap-janitor",
+        "ap-juror",
+        "ap-manager",
+        "ap-planner",
+        "ap-preflight-probe",
+        "ap-re-anchor",
+        "ap-researcher",
+        "ap-reviewer",
+        "ap-scoper",
+        "ap-scribe",
+        "ap-sweeper",
+        "ap-synthesizer",
+        "ap-verifier"
+      ],
+      "source": "agents/contracts/personas/ap-feature-coordinator.md"
+    },
+    {
+      "id": "ap-framework-generator",
+      "tier": "R3",
+      "description": "L3 executor - FRAMEWORK GENERATE. When the SELECTOR returns MISS, generates a one-off custom framework for the exact task shape - classifies the orthogonal axes, composes the gate sequence from the GATE-LIBRARY with the correct axis-specific gate, emits the gen-<axis-signature> leaf with the BLOCKED invariant verbatim, binds an execharness, and hands it to the validator before any gate runs.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-framework-generator.md"
+    },
+    {
+      "id": "ap-framework-validator",
+      "tier": "R2",
+      "description": "L4 terminal leaf - FRAMEWORK VALIDATE (HRN-5). A fresh, default-FAIL juror that proves a GENERATED framework is SOUND before any gate runs. Checks the HRN-5 default-FAIL checklist - every gate mapped, exactly one terminal DONE with negatives looping UP, the BLOCKED invariant verbatim, a non-empty acceptance set. PASS lets the leaf be driven; FAIL with numbered reasons returns it to the generator.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-framework-validator.md"
+    },
+    {
+      "id": "ap-fresh-verifier",
+      "tier": "R2",
+      "description": "L4 blind fresh verifier - independently checks a candidate roadmap or plan against the exact mission and repository; APPROVE/REJECT, default-FAIL.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-fresh-verifier.md"
+    },
+    {
+      "id": "ap-goal-checker",
+      "tier": "R2",
+      "description": "L4 terminal leaf - GOAL-CHECK. Independent, adversarial, default-FAIL. Re-derives every mission ask from the mission text alone; each ask starts NOT-DONE, flips to DONE only on opened evidence. DONE only if zero open findings at ANY severity AND user-usable AND coverage >=95% AND a tri-axis end-to-end run (scope + original prompt + potential flaws) is on record.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-goal-checker.md"
+    },
+    {
+      "id": "ap-implementer",
+      "tier": "R3",
+      "description": "L3 executor - G4 IMPLEMENT. Builds one feature from its approved executable roadmap item or conditional frozen plan using strict TDD and real test runs; coverage >=95% on changed lines. Reports PLAN-CONFLICT rather than improvising.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep",
+        "Agent"
+      ],
+      "allowedChildren": [
+        "ap-arbiter",
+        "ap-depth-prober",
+        "ap-framework-validator",
+        "ap-fresh-verifier",
+        "ap-goal-checker",
+        "ap-janitor",
+        "ap-juror",
+        "ap-preflight-probe",
+        "ap-re-anchor",
+        "ap-scribe"
+      ],
+      "source": "agents/contracts/personas/ap-implementer.md"
+    },
+    {
+      "id": "ap-intake",
+      "tier": "R4",
+      "description": "L3 legacy-resume compatibility reader - reconstructs old intake artifacts when explicitly resuming them; new runs use the useful-first roadmap author instead.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep",
+        "Agent"
+      ],
+      "allowedChildren": [
+        "ap-arbiter",
+        "ap-depth-prober",
+        "ap-framework-validator",
+        "ap-fresh-verifier",
+        "ap-goal-checker",
+        "ap-janitor",
+        "ap-juror",
+        "ap-preflight-probe",
+        "ap-re-anchor",
+        "ap-scribe"
+      ],
+      "source": "agents/contracts/personas/ap-intake.md"
+    },
+    {
+      "id": "ap-janitor",
+      "tier": "R5",
+      "description": "L4 terminal leaf - JANITOR. Writes the DONE sentinel atomically and removes only scratch artifacts after the three-file governance state and substantive evidence pass validation.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-janitor.md"
+    },
+    {
+      "id": "ap-juror",
+      "tier": "R2",
+      "description": "L4 terminal leaf - G7 SIGN-OFF. One independent sign-off panel seat that saw none of the intermediate work. Binary PASS/FAIL on opened evidence; default-FAIL. A FAIL naming a P0/P1 blocker is NOT arbitrable into PASS.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-juror.md"
+    },
+    {
+      "id": "ap-manager",
+      "tier": "R1",
+      "description": "L2 optional manager - coordinates a multi-lane slice, builds compact pointer envelopes, and dispatches disjoint L3 work without executing it.",
+      "capabilities": [
+        "Agent",
+        "Read",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [
+        "ap-arbiter",
+        "ap-depth-prober",
+        "ap-execharness-resolver",
+        "ap-framework-generator",
+        "ap-framework-validator",
+        "ap-fresh-verifier",
+        "ap-goal-checker",
+        "ap-implementer",
+        "ap-intake",
+        "ap-janitor",
+        "ap-juror",
+        "ap-planner",
+        "ap-preflight-probe",
+        "ap-re-anchor",
+        "ap-researcher",
+        "ap-reviewer",
+        "ap-scoper",
+        "ap-scribe",
+        "ap-sweeper",
+        "ap-synthesizer",
+        "ap-verifier"
+      ],
+      "source": "agents/contracts/personas/ap-manager.md"
+    },
+    {
+      "id": "ap-planner",
+      "tier": "R3",
+      "description": "L3 conditional G1 planner - adds detail only when a roadmap item explicitly requires it, including debug depth-lock and unresolved design forks.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-planner.md"
+    },
+    {
+      "id": "ap-preflight-probe",
+      "tier": "R4",
+      "description": "L4 diagnostic/recovery probe - on an explicit cache miss, proves RUN/READ/WRITE and reports model/effort bindings; never the mandatory first spawn.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep",
+        "Agent"
+      ],
+      "allowedChildren": [
+        "ap-preflight-probe"
+      ],
+      "source": "agents/contracts/personas/ap-preflight-probe.md"
+    },
+    {
+      "id": "ap-re-anchor",
+      "tier": "R2",
+      "description": "L4 terminal leaf - RE-ANCHOR. Confirms mission and roadmap frontier alignment after resume or compaction using the three-file governance state.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-re-anchor.md"
+    },
+    {
+      "id": "ap-researcher",
+      "tier": "R3",
+      "description": "L3 executor - bounded research that materializes a usable output with reconciled receipts. Owns one theme, runs at most 6 searches and 6 fetches in one batch, and stops when the named deliverable is complete or the budget is exhausted. Does not spawn.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep",
+        "WebSearch",
+        "WebFetch"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-researcher.md"
+    },
+    {
+      "id": "ap-reviewer",
+      "tier": "R2",
+      "description": "L3 independent G2/G5 or roadmap reviewer - checks mission coverage, reality, tests, boundaries, and claim-vs-diff; returns binary SMASH or PASS.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-reviewer.md"
+    },
+    {
+      "id": "ap-scope-coordinator",
+      "tier": "R1",
+      "description": "L1 scope coordinator - drives the useful-first adaptive roadmap flow and returns one independently approved executable ROADMAP.md before build.",
+      "capabilities": [
+        "Agent"
+      ],
+      "allowedChildren": [
+        "ap-arbiter",
+        "ap-depth-prober",
+        "ap-execharness-resolver",
+        "ap-framework-generator",
+        "ap-framework-validator",
+        "ap-fresh-verifier",
+        "ap-goal-checker",
+        "ap-implementer",
+        "ap-intake",
+        "ap-janitor",
+        "ap-juror",
+        "ap-manager",
+        "ap-planner",
+        "ap-preflight-probe",
+        "ap-re-anchor",
+        "ap-researcher",
+        "ap-reviewer",
+        "ap-scoper",
+        "ap-scribe",
+        "ap-sweeper",
+        "ap-synthesizer",
+        "ap-verifier"
+      ],
+      "source": "agents/contracts/personas/ap-scope-coordinator.md"
+    },
+    {
+      "id": "ap-scoper",
+      "tier": "R3",
+      "description": "L3 useful-first roadmap author or complementary scout - proves capability when needed, inspects the real repository, and contributes to one executable ROADMAP.md without spawning.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep",
+        "WebSearch",
+        "WebFetch"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-scoper.md"
+    },
+    {
+      "id": "ap-scribe",
+      "tier": "R4",
+      "description": "L4 terminal scribe - records new-run governance in PROMPTS.txt, ROADMAP.md, and append-only GATELOG.md; preserves legacy ledgers read-only.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-scribe.md"
+    },
+    {
+      "id": "ap-sweep-coordinator",
+      "tier": "R1",
+      "description": "L1 sweep coordinator - drives independent convergence, goal checking, and cleanup from the three-file ledger plus substantive evidence.",
+      "capabilities": [
+        "Agent"
+      ],
+      "allowedChildren": [
+        "ap-arbiter",
+        "ap-depth-prober",
+        "ap-execharness-resolver",
+        "ap-framework-generator",
+        "ap-framework-validator",
+        "ap-fresh-verifier",
+        "ap-goal-checker",
+        "ap-implementer",
+        "ap-intake",
+        "ap-janitor",
+        "ap-juror",
+        "ap-manager",
+        "ap-planner",
+        "ap-preflight-probe",
+        "ap-re-anchor",
+        "ap-researcher",
+        "ap-reviewer",
+        "ap-scoper",
+        "ap-scribe",
+        "ap-sweeper",
+        "ap-synthesizer",
+        "ap-verifier"
+      ],
+      "source": "agents/contracts/personas/ap-sweep-coordinator.md"
+    },
+    {
+      "id": "ap-sweeper",
+      "tier": "R5",
+      "description": "L3 executor - SWEEP. Fresh production-readiness sweeper that re-derives mission coverage, inspects the changed neighborhood, checks GATELOG provenance, and returns evidence-backed P0..P3 findings.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-sweeper.md"
+    },
+    {
+      "id": "ap-synthesizer",
+      "tier": "R3",
+      "description": "L3 roadmap synthesizer/repair author - merges retained scout evidence into the one canonical executable ROADMAP.md and repairs only rejected items; does not spawn.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-synthesizer.md"
+    },
+    {
+      "id": "ap-verifier",
+      "tier": "R2",
+      "description": "L3 independent G6 verifier - proves behavior with real before/after runs, regression checks, adversarial inputs, and >=95% changed-line coverage.",
+      "capabilities": [
+        "Read",
+        "Write",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep"
+      ],
+      "allowedChildren": [],
+      "source": "agents/contracts/personas/ap-verifier.md"
+    }
+  ],
+  "frameworks": [
+    {
+      "id": "apply",
+      "source": "agents/contracts/frameworks/apply.md"
+    },
+    {
+      "id": "backend-build",
+      "source": "agents/contracts/frameworks/backend-build.md"
+    },
+    {
+      "id": "backend-fix",
+      "source": "agents/contracts/frameworks/backend-fix.md"
+    },
+    {
+      "id": "backend-implement",
+      "source": "agents/contracts/frameworks/backend-implement.md"
+    },
+    {
+      "id": "composition",
+      "source": "agents/contracts/frameworks/composition.md"
+    },
+    {
+      "id": "docs",
+      "source": "agents/contracts/frameworks/docs.md"
+    },
+    {
+      "id": "frontend-build",
+      "source": "agents/contracts/frameworks/frontend-build.md"
+    },
+    {
+      "id": "frontend-fix",
+      "source": "agents/contracts/frameworks/frontend-fix.md"
+    },
+    {
+      "id": "frontend-implement",
+      "source": "agents/contracts/frameworks/frontend-implement.md"
+    },
+    {
+      "id": "frontend-review",
+      "source": "agents/contracts/frameworks/frontend-review.md"
+    },
+    {
+      "id": "generation",
+      "source": "agents/contracts/frameworks/generation.md"
+    },
+    {
+      "id": "plan-design",
+      "source": "agents/contracts/frameworks/plan-design.md"
+    },
+    {
+      "id": "plan-research",
+      "source": "agents/contracts/frameworks/plan-research.md"
+    },
+    {
+      "id": "plan-scope",
+      "source": "agents/contracts/frameworks/plan-scope.md"
+    },
+    {
+      "id": "polish",
+      "source": "agents/contracts/frameworks/polish.md"
+    },
+    {
+      "id": "QUICKSTART",
+      "source": "agents/contracts/frameworks/QUICKSTART.md"
+    },
+    {
+      "id": "README",
+      "source": "agents/contracts/frameworks/README.md"
+    },
+    {
+      "id": "refactor",
+      "source": "agents/contracts/frameworks/refactor.md"
+    }
+  ],
+  "providers": {
+    "claude": {
+      "frontmatter": {
+        "required": [
+          "name",
+          "description",
+          "tools",
+          "model"
+        ],
+        "model": "inherit"
+      },
+      "capabilities": [
+        "activation-scoped-agents",
+        "model-alias-casting",
+        "recursive-subagents"
+      ],
+      "allowedDeltas": [
+        "skill-frontmatter",
+        "agent-tools",
+        "model-alias-routing",
+        "supervisor-launch-envelope"
+      ]
+    },
+    "codex": {
+      "frontmatter": {
+        "required": [
+          "description"
+        ]
+      },
+      "capabilities": [
+        "activation-profile",
+        "direct-model-casting",
+        "recursive-subagents"
+      ],
+      "allowedDeltas": [
+        "skill-frontmatter",
+        "toml-agent-export",
+        "direct-model-routing",
+        "profile-activation"
+      ]
+    },
+    "opencode": {
+      "frontmatter": {
+        "required": [
+          "description",
+          "mode"
+        ],
+        "mode": "subagent"
+      },
+      "capabilities": [
+        "activation-profile",
+        "native-markdown-subagents",
+        "recursive-subagents"
+      ],
+      "allowedDeltas": [
+        "skill-frontmatter",
+        "markdown-agent-export",
+        "permission-mapping",
+        "profile-activation"
+      ]
+    },
+    "prime": {
+      "status": "supported",
+      "target": "0.7.2",
+      "packagePeerRange": "*",
+      "official": {
+        "repository": "https://github.com/PrimeIntellect-ai/prime-agent.git",
+        "tag": "v0.7.2",
+        "commit": "83a0f9f9566219551fcb6ffaf7f519a815749a58"
+      },
+      "profile": {
+        "dispatch": "python-backed-skill",
+        "personas": "extension-system-prompts",
+        "model": "inherit"
+      },
+      "capabilities": [
+        "native-agent-skill",
+        "python-backed-dispatch",
+        "extension-system-prompts",
+        "native-rlm-subagents",
+        "recursive-subagents",
+        "selected-model-inheritance",
+        "daemon-derived-family-identity",
+        "explicit-child-allowlists",
+        "sealed-envelope-persona-admission"
+      ],
+      "runtimePrerequisites": {
+        "rlmMaxDepth": 4,
+        "agentMessageRoster": true
+      },
+      "allowedDeltas": [
+        "skill-frontmatter",
+        "python-backed-dispatch",
+        "extension-system-prompts",
+        "sealed-envelope-persona-admission",
+        "prompt-template-frameworks",
+        "selected-model-inheritance"
+      ]
+    },
+    "kilo": {
+      "frontmatter": {
+        "required": [
+          "description",
+          "mode"
+        ],
+        "mode": "subagent"
+      },
+      "capabilities": [
+        "activation-profile",
+        "native-markdown-subagents",
+        "recursive-subagents"
+      ],
+      "allowedDeltas": [
+        "skill-frontmatter",
+        "markdown-agent-export",
+        "permission-mapping",
+        "profile-activation"
+      ]
+    },
+    "vscode": {
+      "frontmatter": {
+        "required": [
+          "name",
+          "description",
+          "tools",
+          "agents",
+          "user-invocable",
+          "disable-model-invocation"
+        ],
+        "model": "omit"
+      },
+      "capabilities": [
+        "native-markdown-subagents",
+        "recursive-subagents",
+        "selected-model-inheritance"
+      ],
+      "runtimePrerequisites": {
+        "chat.subagents.allowInvocationsFromSubagents": true
+      },
+      "settingsLifecycle": {
+        "edit": "transactional",
+        "backup": "byte-exact",
+        "restore": [
+          "rollback",
+          "uninstall"
+        ],
+        "unsafeJsonc": "refuse",
+        "conflicts": "refuse"
+      },
+      "allowedDeltas": [
+        "skill-frontmatter",
+        "markdown-agent-export",
+        "agent-tool-alias",
+        "explicit-agent-allowlists",
+        "selected-model-inheritance"
+      ]
+    }
+  },
+  "generated": {
+    "claudeAgents": "agents/claude/agents",
+    "claudeFrameworks": "agents/claude/frameworks",
+    "codexFrameworks": "agents/codex/frameworks",
+    "opencodeAgents": "agents/opencode/agents",
+    "opencodeFrameworks": "agents/opencode/frameworks",
+    "primePackage": "agents/prime/package.json",
+    "primePersonas": "agents/prime/personas",
+    "primeFrameworks": "agents/prime/prompts/frameworks",
+    "primeSkill": "agents/prime/skills/autoprompt/SKILL.md",
+    "primeExtension": "agents/prime/extensions/autoprompt.ts",
+    "kiloAgents": "agents/kilo/agents",
+    "kiloFrameworks": "agents/kilo/frameworks",
+    "vscodeAgents": "agents/vscode/agents",
+    "vscodeFrameworks": "agents/vscode/frameworks"
+  }
+}

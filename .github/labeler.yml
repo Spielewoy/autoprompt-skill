@@ -1,0 +1,111 @@
+"area: cli":
+  - changed-files:
+      - any-glob-to-any-file: "bin/**"
+
+"area: installers":
+  - changed-files:
+      - any-glob-to-any-file: "scripts/install/**"
+
+"area: providers":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "agents/**"
+          - "scripts/generate-provider-contracts.cjs"
+          - "scripts/runtime-payload.cjs"
+
+"area: docs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "README.md"
+          - "docs/**"
+          - "LICENSE"
+
+"area: visuals":
+  - changed-files:
+      - any-glob-to-any-file: "assets/**"
+
+"area: translations":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/translations/**"
+          - "assets/i18n/**"
+          - "assets/diagram-sources/i18n/**"
+
+"area: tests":
+  - changed-files:
+      - any-glob-to-any-file: "tests/**"
+
+"area: automation":
+  - changed-files:
+      - any-glob-to-any-file: ".github/**"
+
+"area: packaging":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "package.json"
+          - "package-lock.json"
+          - ".npmignore"
+
+"area: security":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/SECURITY.md"
+          - "tests/source/*security*.test.cjs"
+
+"provider: claude":
+  - changed-files:
+      - any-glob-to-any-file: "agents/claude/**"
+
+"provider: codex":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "agents/codex/**"
+          - "scripts/codex-configure.cjs"
+
+"provider: opencode":
+  - changed-files:
+      - any-glob-to-any-file: "agents/opencode/**"
+
+"provider: kilo":
+  - changed-files:
+      - any-glob-to-any-file: "agents/kilo/**"
+
+"provider: vscode":
+  - changed-files:
+      - any-glob-to-any-file: "agents/vscode/**"
+
+"provider: prime":
+  - changed-files:
+      - any-glob-to-any-file: "agents/prime/**"
+
+"platform: windows":
+  - changed-files:
+      - any-glob-to-any-file: "**/*.ps1"
+
+"platform: linux":
+  - changed-files:
+      - any-glob-to-any-file: "**/*.sh"
+
+"locale: arabic":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/translations/ar.md"
+          - "assets/i18n/ar/**"
+
+"locale: chinese":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/translations/zh.md"
+          - "assets/i18n/zh/**"
+
+"locale: korean":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/translations/ko.md"
+          - "assets/i18n/ko/**"
+
+"locale: spanish":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/translations/es.md"
+          - "assets/i18n/es/**"

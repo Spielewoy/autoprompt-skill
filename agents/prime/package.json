@@ -1,0 +1,25 @@
+{
+  "name": "autoprompt-prime-agent-adapter",
+  "version": "1.0.0",
+  "description": "Native Autoprompt package for Prime Agent.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "prime-agent",
+    "autoprompt"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/autoprompt.ts"
+    ],
+    "skills": [
+      "./skills/autoprompt"
+    ],
+    "prompts": [
+      "./prompts/frameworks"
+    ]
+  }
+}

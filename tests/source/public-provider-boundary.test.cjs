@@ -1,0 +1,134 @@
+#!/usr/bin/env node
+'use strict'
+
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
+const test = require('node:test')
+
+const ROOT = path.resolve(__dirname, '..', '..')
+const PUBLIC_PROVIDERS = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']
+const LEGACY_PROVIDERS = ['vibe', 'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose']
+const LEGACY_PROVIDER_PATTERN = new RegExp(`\\b(?:${LEGACY_PROVIDERS.join('|')})\\b`, 'i')
+const { HELP_TEXT, PROVIDERS, parseArgs } = require('../../bin/autoprompt.cjs')
+const { renderManifests } = require('../../scripts/runtime-payload.cjs')
+
+function read(relativePath) {
+  return fs.readFileSync(path.join(ROOT, ...relativePath.split('/')), 'utf8')
+    .replace(/\r\n/g, '\n')
+}
+
+function listFiles(relativePath) {
+  const root = path.join(ROOT, ...relativePath.split('/'))
+  if (!fs.existsSync(root)) return []
+  const files = []
+  function visit(directory) {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name)
+      if (entry.isDirectory()) visit(absolute)
+      else files.push(path.relative(ROOT, absolute).replaceAll('\\', '/'))
+    }
+  }
+  visit(root)
+  return files.sort()
+}
+
+test('the public CLI exposes exactly six providers and rejects legacy provider commands', () => {
+  assert.deepEqual(PROVIDERS.map(provider => provider.id), PUBLIC_PROVIDERS)
+  assert.doesNotMatch(HELP_TEXT, LEGACY_PROVIDER_PATTERN)
+
+  for (const provider of LEGACY_PROVIDERS) {
+    for (const command of ['install', 'doctor', 'uninstall']) {
+      assert.throws(
+        () => parseArgs([command, provider]),
+        /Unsupported provider/,
+        `${command} ${provider}`,
+      )
+    }
+  }
+})
+
+test('public lifecycle entry points advertise only the six supported providers', () => {
+  for (const relativePath of [
+    'scripts/install/install.ps1',
+    'scripts/install/install.sh',
+    'scripts/install/doctor.ps1',
+    'scripts/install/doctor.sh',
+  ]) {
+    const source = read(relativePath)
+    const declaration = source.match(/(?:\$ClientsAll\s*=\s*@\(|CLIENTS_ALL=\()([\s\S]*?)\)/)?.[1] ?? ''
+    for (const provider of PUBLIC_PROVIDERS) assert.match(declaration, new RegExp(`\\b${provider}\\b`))
+    assert.doesNotMatch(declaration, LEGACY_PROVIDER_PATTERN)
+  }
+})
+
+test('runtime manifests and npm allowlist contain only public provider packages', () => {
+  const manifestPaths = [...renderManifests(ROOT).keys()].sort()
+  assert.deepEqual(
+    manifestPaths,
+    PUBLIC_PROVIDERS.map(provider => `agents/manifests/${provider}-runtime.json`).sort(),
+  )
+
+  const packageJson = JSON.parse(read('package.json'))
+  for (const provider of PUBLIC_PROVIDERS) {
+    assert.ok(packageJson.files.includes(`agents/${provider}/`), provider)
+    assert.ok(packageJson.files.includes(`agents/manifests/${provider}-runtime.json`), provider)
+  }
+  assert.equal(packageJson.files.includes('agents/manifests/'), false)
+  assert.equal(packageJson.files.includes('agents/vibe/'), false)
+  assert.doesNotMatch(packageJson.scripts['test:providers'], /vibe|cursor/i)
+  assert.doesNotMatch(packageJson.scripts['test:lifecycle'], /vibe|cursor/i)
+})
+
+test('public agent source contains only the six supported provider packages', () => {
+  const index = read('agents/README.md')
+  assert.match(index, /\[Prime Agent\]\(prime\/\)/)
+  assert.doesNotMatch(index, /Vibe|vibe\//i)
+  assert.deepEqual(listFiles('agents/vibe'), [])
+  assert.deepEqual(listFiles('agents/other'), [])
+  assert.equal(fs.existsSync(path.join(ROOT, 'agents', 'manifests', 'vibe-runtime.json')), false)
+
+  const contract = JSON.parse(read('agents/contracts/autoprompt.contract.json'))
+  assert.deepEqual(Object.keys(contract.providers).sort(), [...PUBLIC_PROVIDERS].sort())
+  assert.doesNotMatch(JSON.stringify(contract), /vibe|agents\/other/i)
+})
+
+test('README is npm-first and public-release ready', () => {
+  const readme = read('README.md')
+  const install = readme.match(/## Install\n([\s\S]*?)\n## Examples/)?.[1] ?? ''
+  assert.ok(install.indexOf('npm install -g autoprompt-skill') >= 0)
+  assert.ok(install.indexOf('npm install -g autoprompt-skill') < install.indexOf('git clone https://github.com/Spielewoy/autoprompt-skill'))
+  assert.doesNotMatch(install, /not published|after npm publication/i)
+  assert.match(readme, /href="https:\/\/github\.com\/Spielewoy\/autoprompt-skill\/releases\/latest"[^>]*>\s*<img[^>]+img\.shields\.io\/github\/v\/release\/Spielewoy\/autoprompt-skill[^>]+alt="Version 1\.0\.0"/)
+
+  for (const relativePath of [
+    'docs/translations/zh.md',
+    'docs/translations/ko.md',
+    'docs/translations/es.md',
+    'docs/translations/ar.md',
+  ]) {
+    const translated = read(relativePath)
+    assert.ok(translated.indexOf('npm install -g autoprompt-skill') >= 0)
+    assert.ok(
+      translated.indexOf('npm install -g autoprompt-skill') <
+      translated.indexOf('git clone https://github.com/Spielewoy/autoprompt-skill'),
+      relativePath,
+    )
+  }
+})
+
+test('unsupported model routing is stated plainly in every language', () => {
+  const expectations = new Map([
+    ['README.md', 'Not available - inherits'],
+    ['docs/translations/zh.md', '不支持 - 沿用'],
+    ['docs/translations/ko.md', '미지원 -'],
+    ['docs/translations/es.md', 'No disponible - hereda'],
+    ['docs/translations/ar.md', 'غير متاح - يرث'],
+  ])
+  for (const [relativePath, wording] of expectations) {
+    const source = read(relativePath)
+    const row = source.split('\n').find(line => line.includes('|') && line.includes('`agents=`')) ?? ''
+    assert.equal((row.match(/✕/g) ?? []).length, 4, relativePath)
+    assert.equal(row.split(wording).length - 1, 4, relativePath)
+  }
+})

@@ -1,0 +1,51 @@
+{
+  "repository": "https://github.com/PrimeIntellect-ai/prime-agent.git",
+  "tag": "v0.7.2",
+  "commit": "83a0f9f9566219551fcb6ffaf7f519a815749a58",
+  "packageVersion": "0.7.2",
+  "extensionPeerRange": "*",
+  "packageManifestKey": "pi",
+  "resources": [
+    "extensions",
+    "skills",
+    "prompts"
+  ],
+  "pythonSkill": {
+    "skillFile": "SKILL.md",
+    "projectFile": "pyproject.toml",
+    "importName": "autoprompt",
+    "call": "await rlm(prompt, name=name)"
+  },
+  "rlm": {
+    "callable": "rlm",
+    "supportedKwargs": [
+      "model",
+      "name"
+    ],
+    "inheritModelByOmission": true,
+    "depthEnvironment": "RLM_DEPTH",
+    "maxDepthSetting": "rlmMaxDepth",
+    "defaultMaxDepth": 1
+  },
+  "identity": {
+    "hostRequest": "agent_message.list_agents",
+    "currentFields": [
+      "depth",
+      "id",
+      "name"
+    ],
+    "parentRelationship": "parent"
+  },
+  "extension": {
+    "factoryType": "ExtensionFactory",
+    "sessionNameApi": "getSessionName",
+    "systemPromptEvent": "before_agent_start",
+    "beforeAgentStartFields": [
+      "prompt",
+      "images",
+      "systemPrompt",
+      "systemPromptOptions"
+    ],
+    "handlerSessionIdentity": "ctx.sessionManager.getSessionName"
+  }
+}

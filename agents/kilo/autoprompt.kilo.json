@@ -1,0 +1,11 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "subagent_depth": 4,
+  "share": "disabled",
+  "permission": {
+    "task": {
+      "*": "deny",
+      "ap-*": "allow"
+    }
+  }
+}
