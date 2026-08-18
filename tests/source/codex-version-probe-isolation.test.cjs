@@ -13,15 +13,16 @@ const ROOT = path.resolve(__dirname, '..', '..')
 const INSTALL_DIR = path.join(ROOT, 'scripts', 'install')
 const PS_LIB = path.join(INSTALL_DIR, 'lib', 'install-lib.ps1')
 const SH_LIB = path.join(INSTALL_DIR, 'lib', 'install-lib.sh')
+const SH_PROBE_HARNESS = path.join(ROOT, 'tests', 'fixtures', 'codex-version-probe-isolation.sh')
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
 const PROBE_PREFIX = 'autoprompt-codex-probe-'
 
 function run(command, args, options = {}) {
   return childProcess.spawnSync(command, args, {
-    cwd: ROOT,
     encoding: 'utf8',
     timeout: 30000,
     ...options,
+    shell: false,
   })
 }
 
@@ -48,10 +49,6 @@ function findBash() {
 
 function quotePowerShell(value) {
   return `'${value.replaceAll("'", "''")}'`
-}
-
-function quoteShell(value) {
-  return `'${value.replaceAll("'", `'"'"'`)}'`
 }
 
 function toShellPath(value) {
@@ -221,15 +218,13 @@ function runPowerShellDetector(context, timeoutSeconds = 3, commandTimeout = 300
 }
 
 function runShellDetector(bash, context, timeoutSeconds = 3, commandTimeout = 30000) {
-  const command = [
-    `source ${quoteShell(toShellPath(SH_LIB))}`,
-    `AUTOPROMPT_PROBE_TIMEOUT=${timeoutSeconds}`,
-    'record=$(detect_client codex)',
-    'code=$?',
-    'printf "RESULT_CODE=%s\\nRESULT_RECORD=%s\\n" "$code" "$record"',
-    'exit 0',
-  ].join('\n')
-  return run(bash, ['--noprofile', '--norc', '-c', command], {
+  return run(bash, [
+    '--noprofile',
+    '--norc',
+    toShellPath(SH_PROBE_HARNESS),
+    toShellPath(SH_LIB),
+    String(timeoutSeconds),
+  ], {
     env: context.shEnv,
     timeout: commandTimeout,
   })
