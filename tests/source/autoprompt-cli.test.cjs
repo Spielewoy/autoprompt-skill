@@ -285,7 +285,7 @@ test('interactive no-argument launch numbers every install provider plus the cus
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /Checking for updates\.\.\.\r?\nAutoprompt 1\.0\.1 is current\./)
+  assert.match(result.stdout, /Checking for updates\.\.\.\r?\nAutoprompt 1\.0\.2 is current\./)
   assert.doesNotMatch(result.stdout, /\[[#.-]{10}\]/)
   assert.ok(result.stdout.indexOf('Checking for updates...') < result.stdout.indexOf('Pick a coding agent:'))
   assert.match(result.stdout, /Pick a coding agent:/)
@@ -327,13 +327,13 @@ test('interactive no-argument launch numbers every install provider plus the cus
 
 test('interactive launch offers a newer CLI release before provider selection', () => {
   const result = invoke([], {
-    checkLatestVersion: () => '1.0.2',
+    checkLatestVersion: () => '1.0.3',
     interactive: true,
     responses: [{ status: 0 }, { status: 0 }],
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /New Autoprompt version available: 1\.0\.2 \(installed 1\.0\.1\)\. Updating\.\.\./)
+  assert.match(result.stdout, /New Autoprompt version available: 1\.0\.3 \(installed 1\.0\.2\)\. Updating\.\.\./)
   assert.match(result.stdout, /Autoprompt updated\. Restarting the installer\./)
   assert.doesNotMatch(result.stdout, /Pick a coding agent:/)
   assert.deepEqual(result.calls.map(call => [call.command, call.args]), [
@@ -353,7 +353,7 @@ test('interactive launch auto-updates a packaged install when GitHub main differ
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /New Autoprompt build available on GitHub main \(installed 1\.0\.1\)\. Updating\.\.\./)
+  assert.match(result.stdout, /New Autoprompt build available on GitHub main \(installed 1\.0\.2\)\. Updating\.\.\./)
   assert.match(result.stdout, /Autoprompt updated\. Restarting the installer\./)
   assert.doesNotMatch(result.stdout, /Pick a coding agent:/)
   assert.deepEqual(result.calls.map(call => [call.command, call.args]), [
@@ -394,7 +394,7 @@ test('successful startup update records the GitHub revision and does not reinsta
 
   assert.equal(first.calls.length, 2)
   assert.equal(second.calls.length, 0)
-  assert.match(second.stdout, /Autoprompt 1\.0\.1 is current\./)
+  assert.match(second.stdout, /Autoprompt 1\.0\.2 is current\./)
   assert.match(second.stdout, /Pick a coding agent:/)
 })
 
@@ -522,7 +522,7 @@ test('interactive launch offers a GitHub main build when the version stays the s
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /New Autoprompt build available on GitHub main \(installed 1\.0\.1\)\. Updating\.\.\./)
+  assert.match(result.stdout, /New Autoprompt build available on GitHub main \(installed 1\.0\.2\)\. Updating\.\.\./)
   assert.match(result.stdout, /Autoprompt updated\. Restarting the installer\./)
   assert.doesNotMatch(result.stdout, /Pick a coding agent:/)
   assert.deepEqual(result.calls.map(call => [call.command, call.args]), [
@@ -549,7 +549,7 @@ test('updated installer handoff skips a second update check', () => {
 
 test('updated installer handoff forwards the refreshed CLI exit status', () => {
   const result = invoke([], {
-    checkLatestVersion: () => '1.0.2',
+    checkLatestVersion: () => '1.0.3',
     interactive: true,
     responses: [{ status: 0 }, { status: 77 }],
   })
@@ -583,7 +583,7 @@ test('interactive launch from a repo checkout does not self-install a same-versi
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /Repository checkout 1\.0\.1 is not auto-updated\./)
+  assert.match(result.stdout, /Repository checkout 1\.0\.2 is not auto-updated\./)
   assert.match(result.stdout, /Pick a coding agent:/)
   assert.match(result.stdout, /Autoprompt installer closed\./)
   assert.deepEqual(result.calls, [])
@@ -593,7 +593,7 @@ test('interactive launch from a repo checkout does not self-install a newer regi
   const result = invoke([], {
     answers: ['\u001b'],
     checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
-    checkLatestVersion: () => '1.0.2',
+    checkLatestVersion: () => '1.0.3',
     interactive: true,
     packageRoot: ROOT,
   })
@@ -601,7 +601,7 @@ test('interactive launch from a repo checkout does not self-install a newer regi
   assert.equal(result.status, 0)
   assert.match(
     result.stdout,
-    /Repository checkout 1\.0\.1 is not auto-updated\. Latest release: 1\.0\.2\./,
+    /Repository checkout 1\.0\.2 is not auto-updated\. Latest release: 1\.0\.3\./,
   )
   assert.match(result.stdout, /Pick a coding agent:/)
   assert.deepEqual(result.calls, [])
@@ -1119,7 +1119,7 @@ test('update uses the installed npm CLI without a shell and pins its GitHub fall
   ]])
 
   const posixFallback = invoke(['update'], {
-    checkLatestVersion: () => '1.0.2',
+    checkLatestVersion: () => '1.0.3',
     checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     platform: 'linux',
     responses: [{ status: 73 }, { status: 0 }],
@@ -1136,7 +1136,7 @@ test('update uses the installed npm CLI without a shell and pins its GitHub fall
   )
 
   const missingNpmFallback = invoke(['update'], {
-    checkLatestVersion: () => '1.0.2',
+    checkLatestVersion: () => '1.0.3',
     checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     platform: 'linux',
     responses: [
@@ -1152,7 +1152,7 @@ test('update uses the installed npm CLI without a shell and pins its GitHub fall
   assert.match(missingNpmFallback.stdout, /trying the verified GitHub revision/)
 
   const thrownNpmFallback = invoke(['update'], {
-    checkLatestVersion: () => '1.0.2',
+    checkLatestVersion: () => '1.0.3',
     checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     platform: 'linux',
     responses: [
@@ -1167,7 +1167,7 @@ test('update uses the installed npm CLI without a shell and pins its GitHub fall
   ])
 
   const bothLaunchesThrow = invoke(['update'], {
-    checkLatestVersion: () => '1.0.2',
+    checkLatestVersion: () => '1.0.3',
     checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     platform: 'linux',
     responses: [
@@ -1233,7 +1233,7 @@ test('help, version, repo, and support are non-mutating local commands', () => {
 
   const version = invoke(['--version'])
   assert.equal(version.status, 0)
-  assert.equal(version.stdout, '1.0.1\n')
+  assert.equal(version.stdout, '1.0.2\n')
   assert.deepEqual(version.calls, [])
 
   const repo = invoke(['repo'])
@@ -1603,8 +1603,8 @@ test('interactive install reports detected state and confirms update or repair b
       platform: 'win32',
       responses: [{ status: 0 }],
     })
-    assert.match(update.stdout, /Claude Code \(installed 0\.9\.0, update available: 1\.0\.1\)/)
-    assert.match(update.stdout, /Update Autoprompt 0\.9\.0 to 1\.0\.1\? \[Y\/N\]: /)
+    assert.match(update.stdout, /Claude Code \(installed 0\.9\.0, update available: 1\.0\.2\)/)
+    assert.match(update.stdout, /Update Autoprompt 0\.9\.0 to 1\.0\.2\? \[Y\/N\]: /)
     assert.equal(update.calls.length, 1)
 
     writeText(path.join(root, 'skills', 'autoprompt', 'VERSION'), `${PACKAGE_VERSION}\n`)
@@ -1614,8 +1614,8 @@ test('interactive install reports detected state and confirms update or repair b
       interactive: true,
       platform: 'win32',
     })
-    assert.match(repair.stdout, /Claude Code \(installed 1\.0\.1, current\)/)
-    assert.match(repair.stdout, /Autoprompt 1\.0\.1 is current\. Reinstall or repair it\? \[Y\/N\]: /)
+    assert.match(repair.stdout, /Claude Code \(installed 1\.0\.2, current\)/)
+    assert.match(repair.stdout, /Autoprompt 1\.0\.2 is current\. Reinstall or repair it\? \[Y\/N\]: /)
     assert.equal(repair.calls.length, 0)
 
     const codex = path.join(sandbox, '.codex')
@@ -1629,8 +1629,8 @@ test('interactive install reports detected state and confirms update or repair b
       platform: 'win32',
       responses: [{ status: 0 }],
     })
-    assert.match(legacy.stdout, /Codex \(legacy install detected, update available: 1\.0\.1\)/)
-    assert.match(legacy.stdout, /Legacy Autoprompt install detected\. Update it to 1\.0\.1\? \[Y\/N\]: /)
+    assert.match(legacy.stdout, /Codex \(legacy install detected, update available: 1\.0\.2\)/)
+    assert.match(legacy.stdout, /Legacy Autoprompt install detected\. Update it to 1\.0\.2\? \[Y\/N\]: /)
     assert.equal(legacy.calls.length, 1)
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true })
@@ -1651,7 +1651,7 @@ test('interactive uninstall selects a detected installation and custom roots sta
       responses: [{ status: 0 }],
     })
     assert.match(removed.stdout, /Autoprompt uninstaller/)
-    assert.match(removed.stdout, /Claude Code \(installed 1\.0\.1, current\)/)
+    assert.match(removed.stdout, /Claude Code \(installed 1\.0\.2, current\)/)
     assert.match(removed.stdout, /Uninstall Autoprompt from Claude Code\? \[Y\/N\]: /)
     assert.equal(removed.calls.length, 1)
     assert.equal(removed.calls[0].args.at(-1), 'claude')

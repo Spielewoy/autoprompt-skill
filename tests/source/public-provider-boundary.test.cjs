@@ -99,7 +99,7 @@ test('README is npm-first and public-release ready', () => {
   assert.ok(install.indexOf('npm install -g autoprompt-skill') >= 0)
   assert.ok(install.indexOf('npm install -g autoprompt-skill') < install.indexOf('git clone https://github.com/Spielewoy/autoprompt-skill'))
   assert.doesNotMatch(install, /not published|after npm publication/i)
-  assert.match(readme, /href="https:\/\/github\.com\/Spielewoy\/autoprompt-skill\/releases\/latest"[^>]*>\s*<img[^>]+img\.shields\.io\/github\/v\/release\/Spielewoy\/autoprompt-skill[^>]+alt="Version 1\.0\.1"/)
+  assert.match(readme, /href="https:\/\/github\.com\/Spielewoy\/autoprompt-skill\/releases\/latest"[^>]*>\s*<img[^>]+img\.shields\.io\/github\/v\/release\/Spielewoy\/autoprompt-skill[^>]+alt="Version 1\.0\.2"/)
 
   for (const relativePath of [
     'docs/translations/zh.md',
