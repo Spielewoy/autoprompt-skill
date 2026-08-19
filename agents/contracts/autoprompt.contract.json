@@ -670,6 +670,52 @@
         "profile-activation"
       ]
     },
+    "grok": {
+      "status": "supported",
+      "target": "1.0.5",
+      "official": {
+        "repository": "https://github.com/xai-org/grok-build.git",
+        "sourceRevision": "9dccd1f00ec13332134a37750b64c047b14dc120"
+      },
+      "frontmatter": {
+        "required": [
+          "name",
+          "description",
+          "tools",
+          "disallowedTools",
+          "capabilityMode",
+          "permissionMode",
+          "model"
+        ],
+        "model": "inherit"
+      },
+      "profile": {
+        "dispatch": "sealed-headless-reentry",
+        "personas": "native-agent-definitions",
+        "model": "inherit"
+      },
+      "capabilities": [
+        "native-markdown-agent-definitions",
+        "claude-compatible-tool-aliases",
+        "sealed-headless-dispatch",
+        "process-level-recursion",
+        "explicit-child-allowlists",
+        "selected-model-inheritance"
+      ],
+      "runtimePrerequisites": {
+        "headlessSingleTurn": true,
+        "mcpStdioServers": true,
+        "maxDepth": 4
+      },
+      "allowedDeltas": [
+        "skill-frontmatter",
+        "markdown-agent-export",
+        "claude-compatible-tool-aliases",
+        "sealed-headless-dispatch",
+        "mcp-dispatch-registration",
+        "selected-model-inheritance"
+      ]
+    },
     "vscode": {
       "frontmatter": {
         "required": [
@@ -723,6 +769,9 @@
     "kiloAgents": "agents/kilo/agents",
     "kiloFrameworks": "agents/kilo/frameworks",
     "vscodeAgents": "agents/vscode/agents",
-    "vscodeFrameworks": "agents/vscode/frameworks"
+    "vscodeFrameworks": "agents/vscode/frameworks",
+    "grokAgents": "agents/grok/agents",
+    "grokFrameworks": "agents/grok/frameworks",
+    "grokTopology": "agents/grok/workflow/autoprompt-topology.json"
   }
 }

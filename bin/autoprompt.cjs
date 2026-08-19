@@ -24,6 +24,7 @@ const PROVIDERS = Object.freeze([
   Object.freeze({ id: 'codex', label: 'Codex' }),
   Object.freeze({ id: 'opencode', label: 'OpenCode' }),
   Object.freeze({ id: 'kilo', label: 'Kilo Code' }),
+  Object.freeze({ id: 'grok', label: 'Grok Build' }),
   Object.freeze({ id: 'vscode', label: 'VS Code' }),
   Object.freeze({ id: 'prime', label: 'Prime Agent' }),
 ])
@@ -55,7 +56,7 @@ const HELP_TEXT = [
   '  -h, --help       Show this help.',
   '  -v, --version    Print the package version.',
   '',
-  'Interactive providers: claude, codex, opencode, kilo, vscode, prime.',
+  'Interactive providers: claude, codex, opencode, kilo, grok, vscode, prime.',
   '',
   'Launch `autoprompt` to check for CLI updates and open the installer.',
   'It scans detected roots and lets you install, update, or repair a provider.',
@@ -210,6 +211,7 @@ function providerInstallLocations(client, locationOptions = {}) {
   if (client === 'claude') return singleRoot(path.join(home, '.claude'))
   if (client === 'codex') return singleRoot(env.CODEX_HOME || path.join(home, '.codex'))
   if (client === 'opencode') return singleRoot(path.join(xdg, 'opencode'))
+  if (client === 'grok') return singleRoot(env.GROK_HOME || path.join(home, '.grok'))
   if (client === 'prime') {
     return singleRoot(env.PRIME_AGENT_CODING_AGENT_DIR || path.join(home, '.prime', 'agent'))
   }

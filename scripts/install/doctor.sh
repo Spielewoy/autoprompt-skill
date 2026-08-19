@@ -24,7 +24,7 @@ fi
 # shellcheck source=/dev/null
 . "$LIB"
 
-CLIENTS_ALL=(claude codex opencode kilo vscode prime)
+CLIENTS_ALL=(claude codex opencode kilo grok vscode prime)
 
 config_root() {
   local client="$1"
@@ -202,6 +202,35 @@ kilo_activation_status() {
   [ "$agents" -eq 25 ] && printf 'complete' || printf 'missing:agents'
 }
 
+# grok_activation_status: the activation state beyond the hash-bound payload -
+# the harness profile beside config.toml, the sealed dispatcher, and the one MCP
+# registration Autoprompt owns inside the user's Grok Build configuration.
+grok_activation_status() {
+  local skill profile runtime status rc reason
+  skill="$(autoprompt_runtime_root grok)"
+  profile="$(autoprompt_profile_file grok)"
+  [ -f "$profile" ] || { printf 'missing:autoprompt.grok.toml'; return 0; }
+  validate_grok_profile "$profile" || { printf 'invalid:profile-policy'; return 0; }
+  runtime="$skill/workflow"
+  if [ ! -f "$runtime/grok-dispatch.js" ] || [ ! -f "$runtime/grok-dispatch-server.js" ] ||
+     [ ! -f "$runtime/autoprompt-topology.json" ]; then
+    printf 'missing:dispatcher'
+    return 0
+  fi
+  local source_agent agents=0
+  for source_agent in "$skill/agents"/ap-*.md; do
+    [ -f "$source_agent" ] && agents=$((agents + 1))
+  done
+  [ "$agents" -eq 25 ] || { printf 'missing:agents'; return 0; }
+  status="$(grok_config_status 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    reason="${status#*reason=}"
+    printf 'activation-missing:%s' "${reason// /-}"
+    return 0
+  fi
+  printf 'complete'
+}
+
 vscode_activation_status() {
   local skill agents_dir
   skill="$(autoprompt_runtime_root vscode)"
@@ -231,7 +260,7 @@ vscode_activation_status() {
 check_extras() {
   local client="$1" skill tool="$SCRIPT_DIR/../runtime-payload.cjs"
   case "$client" in
-    claude|codex|opencode|kilo|vscode)
+    claude|codex|opencode|kilo|grok|vscode)
       skill="$(autoprompt_runtime_root "$client")"
       ;;
     *)        printf 'na'; return 0 ;;
@@ -252,6 +281,8 @@ check_extras() {
       opencode_activation_status
     elif [ "$client" = "kilo" ]; then
       kilo_activation_status
+    elif [ "$client" = "grok" ]; then
+      grok_activation_status
     elif [ "$client" = "vscode" ]; then
       vscode_activation_status
     else

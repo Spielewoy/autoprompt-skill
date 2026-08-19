@@ -10,6 +10,7 @@ This folder contains the complete Autoprompt product. The prompts, custom agents
 | [Codex](codex/) | [`SKILL.md`](codex/SKILL.md) | [25 TOML agents](codex/agents/) | [18 workflows](codex/frameworks/) | Recursive, with a [runtime harness](codex/workflow/) |
 | [OpenCode](opencode/) | [`SKILL.md`](opencode/SKILL.md) | [25 Markdown agents](opencode/agents/) | [18 workflows](opencode/frameworks/) | Recursive, with a guarded activation profile |
 | [Kilo](kilo/) | [`SKILL.md`](kilo/SKILL.md) | [25 Markdown agents](kilo/agents/) | [18 workflows](kilo/frameworks/) | Kilo uses recursive dispatch with a guarded profile |
+| [Grok Build](grok/) | [`SKILL.md`](grok/SKILL.md) | [25 agent definitions](grok/agents/) | [18 workflows](grok/frameworks/) | Sealed headless re-entry through the [dispatcher](grok/workflow/) |
 | [VS Code](vscode/) | [`SKILL.md`](vscode/SKILL.md) | [25 `.agent.md` agents](vscode/agents/) | [18 workflows](vscode/frameworks/) | VS Code uses recursive dispatch when its required setting is enabled |
 | [Prime Agent](prime/) | [Package adapter](prime/package.json) and [skill](prime/skills/autoprompt/SKILL.md) | [25 persona prompts](prime/personas/) | [18 workflows](prime/prompts/frameworks/) | Recursive through the native package adapter |
 
@@ -21,13 +22,13 @@ L0 is the active provider skill. L1 to L4 are named custom agents generated from
 
 | Level | Roles | Source |
 |---|---|---|
-| L0 | Conductor | [Claude](claude/SKILL.md), [Codex](codex/SKILL.md), [OpenCode](opencode/SKILL.md), [Kilo](kilo/SKILL.md), [VS Code](vscode/SKILL.md), [Prime Agent](prime/skills/autoprompt/SKILL.md) |
+| L0 | Conductor | [Claude](claude/SKILL.md), [Codex](codex/SKILL.md), [OpenCode](opencode/SKILL.md), [Kilo](kilo/SKILL.md), [Grok Build](grok/SKILL.md), [VS Code](vscode/SKILL.md), [Prime Agent](prime/skills/autoprompt/SKILL.md) |
 | L1 | Scope, feature, and sweep coordinators | [`ap-scope-coordinator`](contracts/personas/ap-scope-coordinator.md), [`ap-feature-coordinator`](contracts/personas/ap-feature-coordinator.md), [`ap-sweep-coordinator`](contracts/personas/ap-sweep-coordinator.md) |
 | L2 | Optional manager for multi-lane work | [`ap-manager`](contracts/personas/ap-manager.md) |
 | L3 | Scope, research, planning, build, review, verification, and sweep executors | [Persona directory](contracts/personas/) |
 | L4 | Fresh verification, jury, goal check, arbitration, recording, and cleanup leaves | [Persona directory](contracts/personas/) |
 
-All six public packages use the same logical roles, gates, and recursive level links.
+All seven public packages use the same logical roles, gates, and recursive level links.
 
 ## Source of truth
 

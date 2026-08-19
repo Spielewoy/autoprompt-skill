@@ -292,11 +292,11 @@ test('interactive no-argument launch numbers every install provider plus the cus
   for (const [index, provider] of PROVIDERS.entries()) {
     assert.match(result.stdout, new RegExp(`${index + 1}\\) ${provider.label}`))
   }
-  assert.match(result.stdout, /7\) Custom coding agent/)
-  assert.match(result.stdout, /Provider \[1-7, Esc\]: /)
+  assert.match(result.stdout, /8\) Custom coding agent/)
+  assert.match(result.stdout, /Provider \[1-8, Esc\]: /)
   assert.deepEqual(
     PROVIDERS.map(provider => provider.id),
-    ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime'],
+    ['claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime'],
   )
   assert.equal(PROVIDERS.some(provider => provider.id === 'vibe'), false)
   assert.match(result.stdout, new RegExp(`Detected path: ${codexHome.replaceAll('\\', '\\\\')}`))
@@ -609,7 +609,7 @@ test('interactive launch from a repo checkout does not self-install a newer regi
 
 test('interactive custom coding agent option exits safely with the compatibility guide URL', () => {
   const result = invoke([], {
-    answers: ['7'],
+    answers: ['8'],
     interactive: true,
   })
 
@@ -735,14 +735,14 @@ test('interactive strong custom-root match reuses the lifecycle installer throug
 
 test('interactive prompts reject invalid choices and closed input without mutating', () => {
   const retried = invoke([], {
-    answers: ['0', 'codex', '5', 'maybe', 'Y'],
+    answers: ['0', 'codex', '6', 'maybe', 'Y'],
     env: { HOME: path.join('test home', 'person') },
     interactive: true,
     platform: 'win32',
     responses: [{ status: 0 }],
   })
   assert.equal(retried.status, 0)
-  assert.match(retried.stdout, /Enter a number from 1 to 7\./)
+  assert.match(retried.stdout, /Enter a number from 1 to 8\./)
   assert.match(retried.stdout, /Please answer Y or N\./)
   assert.equal(retried.calls[0].args.at(-1), 'vscode')
 
@@ -797,6 +797,9 @@ test('provider install locations match default config roots and external VS Code
           { label: 'Native root', path: path.join(env.XDG_CONFIG_HOME, 'kilo') },
         ],
       },
+      grok: {
+        roots: [{ label: 'Install directory', path: path.join(home, '.grok') }],
+      },
       vscode: {
         roots: [{ label: 'Install directory', path: path.join(home, '.copilot') }],
         settings: path.join(home, 'AppData', 'Roaming', 'Code', 'User', 'settings.json'),
@@ -838,6 +841,13 @@ test('provider install locations match default config roots and external VS Code
     providerInstallLocations('prime', { env: { HOME: home }, platform: 'linux' }).roots[0].path,
     path.join(home, '.prime', 'agent'),
   )
+  assert.equal(
+    providerInstallLocations('grok', {
+      env: { HOME: home, GROK_HOME: path.join('sandbox', 'grok state') },
+      platform: 'linux',
+    }).roots[0].path,
+    path.join('sandbox', 'grok state'),
+  )
 })
 
 test('interactive chooser explains Kilo split roots and external VS Code settings', () => {
@@ -855,7 +865,7 @@ test('interactive chooser explains Kilo split roots and external VS Code setting
   assert.match(kilo.stdout, new RegExp(`Native root: ${path.join(xdg, 'kilo').replaceAll('\\', '\\\\')}`))
 
   const vscode = invoke([], {
-    answers: ['5', 'y'],
+    answers: ['6', 'y'],
     env: { HOME: home, APPDATA: path.join(home, 'roaming') },
     interactive: true,
     platform: 'win32',
@@ -868,7 +878,7 @@ test('interactive chooser explains Kilo split roots and external VS Code setting
 test('interactive chooser installs Prime through its detected native config root', () => {
   const primeRoot = path.join('test home', 'prime agent root')
   const result = invoke([], {
-    answers: ['6', 'y'],
+    answers: ['7', 'y'],
     env: { HOME: path.join('test home', 'person'), PRIME_AGENT_CODING_AGENT_DIR: primeRoot },
     interactive: true,
     platform: 'win32',
@@ -887,7 +897,7 @@ test('interactive strong Prime custom root reuses the lifecycle installer withou
   try {
     writeStrongCustomRoot(customRoot, 'prime')
     const result = invoke([], {
-      answers: ['6', 'n', customRoot],
+      answers: ['7', 'n', customRoot],
       env: { HOME: sandbox, PRIME_AGENT_CODING_AGENT_DIR: path.join(sandbox, 'detected-prime-root') },
       interactive: true,
       platform: 'win32',
@@ -910,7 +920,7 @@ test('interactive VS Code custom root requires confirmation because external act
   try {
     writeStrongCustomRoot(customRoot, 'vscode')
     const result = invoke([], {
-      answers: ['5', 'n', customRoot, 'yes'],
+      answers: ['6', 'n', customRoot, 'yes'],
       env: { HOME: sandbox },
       interactive: true,
       platform: 'win32',
@@ -1072,8 +1082,8 @@ test('interactive custom root warns on mismatched strong markers, re-prompts on 
   }
 })
 
-test('help stays lean and names only the six public providers', () => {
-  assert.match(HELP_TEXT, /Interactive providers: claude, codex, opencode, kilo, vscode, prime\./)
+test('help stays lean and names only the seven public providers', () => {
+  assert.match(HELP_TEXT, /Interactive providers: claude, codex, opencode, kilo, grok, vscode, prime\./)
   assert.doesNotMatch(HELP_TEXT, /\b(?:vibe|cursor|dcode|roo|gemini|cline|goose)\b/i)
   assert.match(HELP_TEXT, /^  autoprompt update$/m)
 })

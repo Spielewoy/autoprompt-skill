@@ -33,7 +33,7 @@ if (-not (Test-Path -LiteralPath $Lib -PathType Leaf)) {
 }
 . $Lib
 
-$ClientsAll = @('claude','codex','opencode','kilo','vscode','prime')
+$ClientsAll = @('claude','codex','opencode','kilo','grok','vscode','prime')
 $script:ResultRows = @()
 $script:AnyFail = 0
 $script:IsRecoveryRetained = $false
@@ -66,6 +66,7 @@ function Get-PayloadFile {
         'codex'    { return (Join-Path $RepoRoot 'agents/codex/SKILL.md') }
         'opencode' { return (Join-Path $RepoRoot 'agents/opencode/SKILL.md') }
         'kilo'     { return (Join-Path $RepoRoot 'agents/kilo/SKILL.md') }
+        'grok'     { return (Join-Path $RepoRoot 'agents/grok/SKILL.md') }
         'vscode'   { return (Join-Path $RepoRoot 'agents/vscode/SKILL.md') }
         default    { return $null }
     }
@@ -516,6 +517,7 @@ function Get-ExtrasSrcDir {
         'codex'    { return (Join-Path $RepoRoot 'agents/codex') }
         'opencode' { return (Join-Path $RepoRoot 'agents/opencode') }
         'kilo'     { return (Join-Path $RepoRoot 'agents/kilo') }
+        'grok'     { return (Join-Path $RepoRoot 'agents/grok') }
         'vscode'   { return (Join-Path $RepoRoot 'agents/vscode') }
         default    { return '' }
     }
@@ -685,6 +687,158 @@ function Install-VscodeActivation {
     } finally {
         Remove-Item -LiteralPath $stage -Recurse -Force `
             -ErrorAction SilentlyContinue
+    }
+    return 0
+}
+
+function Test-GrokActivation {
+    $runtimeRoot = Get-GrokRuntimeRoot
+    $source = Join-Path (Get-ExtrasSkillDir -Client 'grok') 'agents'
+    $personas = @(Get-ChildItem -LiteralPath $source `
+        -Filter 'ap-*.md' -File -ErrorAction SilentlyContinue)
+    if ($personas.Count -ne 25) {
+        [Console]::Error.WriteLine(
+            "client=grok verify=fail reason=agent-count " +
+            "found=$($personas.Count) expected=25"
+        )
+        return 1
+    }
+    foreach ($persona in $personas) {
+        $landed = Join-Path (Join-Path $runtimeRoot 'agents') $persona.Name
+        if (-not (Test-Path -LiteralPath $landed -PathType Leaf) -or
+            (Get-IdemSha256 -Path $persona.FullName) -ne
+            (Get-IdemSha256 -Path $landed)) {
+            [Console]::Error.WriteLine(
+                "client=grok verify=fail reason=agent-mismatch " +
+                "agent=$($persona.Name)"
+            )
+            return 1
+        }
+    }
+    foreach ($runtimeFile in @('grok-dispatch.js', 'grok-dispatch-server.js',
+        'autoprompt-topology.json')) {
+        $candidate = Join-Path (Join-Path $runtimeRoot 'workflow') $runtimeFile
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            [Console]::Error.WriteLine(
+                'client=grok verify=fail reason=dispatcher-missing')
+            return 1
+        }
+    }
+    if (-not (Test-GrokProfilePolicy -Path (Get-AutopromptProfileFile -Name 'grok'))) {
+        [Console]::Error.WriteLine('client=grok verify=fail reason=profile-invalid')
+        return 1
+    }
+    $output = @(& node (Get-GrokConfigHelper) inspect `
+        --file (Get-GrokConfigFile) --server (Get-GrokDispatchServer) 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        [Console]::Error.WriteLine(
+            "client=grok verify=fail reason=activation-missing " +
+            "detail=$(($output -join '-') -replace '\s+', '-')"
+        )
+        return 1
+    }
+    return 0
+}
+
+function Install-GrokActivation {
+    $root = Get-ConfigRoot -Client 'grok'
+    $config = Get-GrokConfigFile
+    $backup = "$config$AutopromptConfigEditBackupSuffix"
+    $helper = Get-GrokConfigHelper
+    $server = Get-GrokDispatchServer
+    $profileTarget = Get-AutopromptProfileFile -Name 'grok'
+    $sourceProfile = Join-Path (Get-ExtrasSkillDir -Client 'grok') `
+        'autoprompt.grok.toml'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf) -or
+        -not (Get-Command node -ErrorAction SilentlyContinue)) {
+        [Console]::Error.WriteLine(
+            'client=grok error=activation-missing reason=config-helper-unavailable')
+        return 98
+    }
+    if (-not (Test-GrokProfilePolicy -Path $sourceProfile)) {
+        [Console]::Error.WriteLine(
+            "Autoprompt install (grok): activation profile is invalid under $sourceProfile.")
+        return 96
+    }
+
+    $stage = Join-Path ([System.IO.Path]::GetTempPath()) `
+        ('autoprompt-grok_' + [guid]::NewGuid().ToString('N'))
+    $desired = Join-Path $stage 'config.toml'
+    $original = Join-Path $stage 'config.original.toml'
+    $journalStart = $script:AutopromptManagedUndoJournal.Count
+    try {
+        New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null
+        $output = @(& node $helper stage --file $config --output $desired `
+            --original $original --server $server 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "config-stage-failed detail=$(($output -join '-') -replace '\s+', '-')"
+        }
+        $record = $output -join ' '
+        $mappings = @(@{ Source = $sourceProfile; Target = $profileTarget })
+        if ($record -like 'status=applied*') {
+            $priorMatch = [regex]::Match($record, '(?:^| )prior=(\S+)')
+            if (-not $priorMatch.Success -or
+                $priorMatch.Groups[1].Value -notin @('absent', 'present')) {
+                throw 'config-stage-invalid-prior'
+            }
+            if (Test-Path -LiteralPath $original -PathType Leaf) {
+                $mappings += @{
+                    Source = $original
+                    Target = $backup
+                    TrackManaged = $false
+                }
+            }
+            $mappings += @{
+                Source = $desired
+                Target = $config
+                TrackManaged = $false
+                AllowUnownedTarget = $true
+            }
+        } elseif ($record -notlike 'status=noop*') {
+            throw 'config-stage-invalid-result'
+        }
+        $managedCode = Install-IdemManagedFiles -ConfigRoot $root `
+            -Mappings $mappings -RefuseUnownedTarget
+        if ($managedCode -ne 0) {
+            throw "activation-batch-failed code=$managedCode"
+        }
+        if ($record -like 'status=applied*') {
+            $prior = if ($priorMatch.Groups[1].Value -eq 'absent') {
+                $null
+            } else {
+                'present'
+            }
+            $existing = @($script:AutopromptReceiptEdits | Where-Object {
+                (Test-IdemPathEqual -Left $_.File -Right $config) -and
+                $_.Key -ceq $AutopromptGrokActivationKey
+            })
+            if ($existing.Count -gt 1) {
+                throw 'duplicate-config-receipt-edit'
+            }
+            if ($existing.Count -eq 0) {
+                $script:AutopromptReceiptEdits += @{
+                    File = $config
+                    Key = $AutopromptGrokActivationKey
+                    Value = 'true'
+                    PriorValue = $prior
+                }
+            }
+            if (Test-Path -LiteralPath $backup -PathType Leaf) {
+                $script:AutopromptConfigEditLastBackup = $backup
+            }
+        }
+        if ((Test-GrokActivation) -ne 0) {
+            throw 'post-install activation verification failed'
+        }
+    } catch {
+        Invoke-ManagedRollback -FromIndex $journalStart -Context '(grok)' | Out-Null
+        [Console]::Error.WriteLine(
+            "client=grok error=activation-missing detail=" +
+            ($_.Exception.Message -replace '\s+', '-')
+        )
+        return 98
+    } finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     }
     return 0
 }
@@ -977,6 +1131,12 @@ function Install-LandingActivation {
         Set-LandingFailure -Client $Client -Stage 'agents'
         return 1
     }
+    if ($Client -eq 'grok') {
+        if ((Install-GrokActivation) -eq 0) { return 0 }
+        Set-LandingFailure -Client $Client -Stage 'activation-missing' `
+            -Message 'Autoprompt install (grok): activation-missing; config.toml was not changed.'
+        return 1
+    }
     if ($Client -eq 'vscode') {
         if ((Install-VscodeActivation) -eq 0) { return 0 }
         Set-LandingFailure -Client $Client -Stage 'activation-missing' `
@@ -1129,6 +1289,10 @@ function Get-KiloActivationTargetPlan {
     return $targets
 }
 
+function Get-GrokActivationTargetPlan {
+    return @(Get-AutopromptProfileFile -Name 'grok')
+}
+
 function Get-VscodeActivationTargetPlan {
     $agentsDirectory = Get-ExtrasAgentsDir -Client 'vscode'
     return @(Get-RuntimeInventory -Client 'vscode' |
@@ -1145,6 +1309,7 @@ function Get-ClientInstallTargetPlan {
         'codex' { $targets += @(Get-CodexActivationTargetPlan) }
         'opencode' { $targets += @(Get-OpencodeActivationTargetPlan) }
         'kilo' { $targets += @(Get-KiloActivationTargetPlan) }
+        'grok' { $targets += @(Get-GrokActivationTargetPlan) }
         'vscode' { $targets += @(Get-VscodeActivationTargetPlan) }
     }
     return $targets

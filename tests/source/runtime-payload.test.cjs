@@ -32,7 +32,7 @@ test('committed runtime manifests match every provider source file', () => {
   assert.match(completed.stdout, /runtime manifests are current/)
 })
 
-test('all six public provider payloads contain the complete product', () => {
+test('all seven public provider payloads contain the complete product', () => {
   const contract = require('../../agents/contracts/autoprompt.contract.json')
   assert.equal(contract.personas.length, 25)
   assert.equal(contract.frameworks.length, 18)
@@ -77,7 +77,7 @@ test('all six public provider payloads contain the complete product', () => {
 })
 
 test('each provider installs and verifies as a complete isolated payload', () => {
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']) {
+  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime']) {
     const destination = temporaryDirectory(`autoprompt-${provider}-`)
     try {
       const installed = installPayload(provider, destination, ROOT)

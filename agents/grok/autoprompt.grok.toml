@@ -1,0 +1,11 @@
+# Autoprompt activation profile for Grok Build.
+# The launcher and the sealed dispatcher read this file. Grok Build does not:
+# its own configuration stays in config.toml and is never rewritten wholesale.
+[autoprompt]
+runtime = "grok-build-adapter-v1"
+max_depth = 4
+dispatch = "sealed-headless-reentry"
+mcp_server = "autoprompt"
+native_subagent_spawn = "denied"
+personas = 25
+frameworks = 18

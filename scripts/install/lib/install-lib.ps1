@@ -30,17 +30,19 @@ $AutopromptInstallRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../..'))
 $AutopromptClientBin = @{
     claude = 'claude'; codex = 'codex'; cursor = 'cursor-agent'; roo = 'roo';
     opencode = 'opencode'; kilo = 'kilo'; vscode = 'code';
+    grok = 'grok';
     prime = 'prime-agent';
     dcode = 'dcode'; gemini = 'gemini'; cline = 'cline'; goose = 'goose'
 }
 $AutopromptVersionFlag = '--version'
 $AutopromptProbeTimeout = 30
 
-# Public install compatibility is a closed six-provider registry. Historical
+# Public install compatibility is a closed seven-provider registry. Historical
 # path resolvers remain below only for receipt-owned cleanup of earlier installs.
 $AutopromptProviderStatus = @{
     claude = 'supported'; codex = 'supported'; opencode = 'supported';
-    kilo = 'supported'; vscode = 'supported'; prime = 'supported'
+    kilo = 'supported'; vscode = 'supported'; grok = 'supported';
+    prime = 'supported'
 }
 $AutopromptProviderBlockReason = @{}
 
@@ -387,7 +389,7 @@ function Detect-Client {
 # error record via [Console]::Error.WriteLine; VERDICT via scalar `return` int
 # (0 resolved, 2 unknown-client / no-such-variant, 3 no-home) as the ONLY value
 # on the return pipeline. Each value is a packed spec RELKIND|RELPATH|FORMAT where
-# RELKIND in {HOME,XDG,CODEX} selects the base; RELPATH uses '/' separators here and is
+# RELKIND in {HOME,XDG,CODEX,GROK} selects the base; RELPATH uses '/' separators here and is
 # rebuilt with Join-Path so the record carries Windows '\' separators.
 $AutopromptClientDest = @{
     claude   = 'HOME|.claude/skills/autoprompt/SKILL.md|md-claude'
@@ -399,6 +401,7 @@ $AutopromptClientDest = @{
     goose    = 'HOME|.config/goose/recipes/autoprompt.yaml|goose-recipe'
     opencode = 'XDG|opencode/skills/autoprompt/SKILL.md|md-yaml'
     kilo     = 'HOME|.kilo/skills/autoprompt/SKILL.md|md-yaml'
+    grok     = 'GROK|skills/autoprompt/SKILL.md|md-claude'
     vscode   = 'HOME|.copilot/skills/autoprompt/SKILL.md|md-yaml'
 }
 
@@ -446,6 +449,10 @@ function Get-AutopromptConfigRoot {
         }
         'opencode' { return (Resolve-Xdg -UserHome $userHome) }
         'kilo' { return (Resolve-Xdg -UserHome $userHome) }
+        'grok' {
+            if ($env:GROK_HOME) { return $env:GROK_HOME }
+            return (Join-Path $userHome '.grok')
+        }
         'vibe' {
             if ($env:VIBE_HOME) { return $env:VIBE_HOME }
             return (Join-Path $userHome '.vibe')
@@ -478,6 +485,10 @@ function Get-AutopromptSkillRoot {
                 'opencode/skills/autoprompt')
         }
         'kilo' { return (Join-Path $userHome '.kilo/skills/autoprompt') }
+        'grok' {
+            return (Join-Path (Get-AutopromptConfigRoot -Name 'grok') `
+                'skills/autoprompt')
+        }
         'vscode' { return (Join-Path $userHome '.copilot/skills/autoprompt') }
         default { return '' }
     }
@@ -512,6 +523,9 @@ function Get-AutopromptNativeAgentsRoot {
             return (Join-Path (Get-AutopromptConfigRoot -Name 'kilo') `
                 'kilo/agents')
         }
+        'grok' {
+            return (Join-Path (Get-AutopromptSkillRoot -Name 'grok') 'agents')
+        }
         'vscode' { return (Join-Path $userHome '.copilot/agents') }
         default { return '' }
     }
@@ -534,6 +548,7 @@ function Get-AutopromptProfileFile {
             }
             return (Join-Path $root 'kilo/autoprompt.kilo.json')
         }
+        'grok' { return (Join-Path $root 'autoprompt.grok.toml') }
         default { return '' }
     }
 }
@@ -599,6 +614,8 @@ function Resolve-Destination {
         Resolve-Xdg -UserHome $userHome
     } elseif ($relKind -eq 'CODEX') {
         if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $userHome '.codex' }
+    } elseif ($relKind -eq 'GROK') {
+        if ($env:GROK_HOME) { $env:GROK_HOME } else { Join-Path $userHome '.grok' }
     } else {
         $userHome
     }
@@ -810,7 +827,7 @@ function Format-Skill {
 # The other clients have no numeric gate.
 $AutopromptVersionFloor = @{
     claude = '2.1.219'; cursor = '2.5'; cline = '3.58'; opencode = '1.18.7';
-    kilo = '7.4.22';
+    kilo = '7.4.22'; grok = '1.0.0';
     vscode = '1.133.0'; prime = '0.7.2'
 }
 $AutopromptPrecheckMarkerPrefix = '.autoprompt-precheck'
@@ -3913,6 +3930,24 @@ function Restore-UninstallConfigFile {
     param([string]$File, [hashtable[]]$Edits)
     $backup = "$File$AutopromptConfigEditBackupSuffix"
     if ($Edits.Count -eq 1 -and
+        $Edits[0].Key -ceq $AutopromptGrokActivationKey) {
+        $grokPrior = if ($null -eq $Edits[0].PriorValue) {
+            'absent'
+        } else {
+            [string]$Edits[0].PriorValue
+        }
+        $grokServer = Join-Path (Split-Path -Parent $File) `
+            'skills/autoprompt/workflow/grok-dispatch-server.js'
+        $grokOutput = @(& node (Get-GrokConfigHelper) restore --file $File `
+            --backup $backup --prior $grokPrior --server $grokServer 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            [Console]::Error.WriteLine(($grokOutput -join [Environment]::NewLine))
+            return 75
+        }
+        [Console]::Out.WriteLine(($grokOutput -join [Environment]::NewLine))
+        return 0
+    }
+    if ($Edits.Count -eq 1 -and
         $Edits[0].Key -ceq $AutopromptVscodeActivationKey) {
         $prior = if ($null -eq $Edits[0].PriorValue) {
             'absent'
@@ -4077,6 +4112,15 @@ function Test-AutopromptCustomProviderPath {
                 (Test-IdemPathEqual -Left $normalizedPath -Right `
                     (Join-Path $ConfigRoot 'autoprompt.kilo.json'))
         }
+        'grok' {
+            return (Test-IdemPathEqual -Left $normalizedPath -Right `
+                    (Join-Path $ConfigRoot 'autoprompt.grok.toml')) -or
+                (Test-IdemPathEqual -Left $normalizedPath -Right `
+                    (Join-Path $ConfigRoot 'config.toml')) -or
+                (Test-IdemPathEqual -Left $normalizedPath -Right `
+                    ((Join-Path $ConfigRoot 'config.toml') +
+                        $AutopromptConfigEditBackupSuffix))
+        }
         'vscode' {
             if ((Test-IdemPathEqual -Left $parent -Right $agents) -and
                 $leaf -clike 'ap-*.agent.md') { return $true }
@@ -4092,7 +4136,7 @@ function Test-AutopromptCustomProviderPath {
 function Test-UninstallProviderPath {
     param([string]$Name, [string]$ConfigRoot, [string]$Path)
     $scopedNames = @(
-        'claude', 'codex', 'opencode', 'kilo', 'vscode', 'vibe',
+        'claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'vibe',
         'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose'
     )
     if ($Name -cnotin $scopedNames) { return $true }
@@ -4101,7 +4145,7 @@ function Test-UninstallProviderPath {
     if ([string]::IsNullOrEmpty($normalizedPath)) { return $false }
     if ($Name -ceq 'dcode') { return $false }
     if ((Test-AutopromptInstallRootOverridePresent) -and
-        $Name -in @('claude', 'opencode', 'kilo', 'vscode')) {
+        $Name -in @('claude', 'opencode', 'kilo', 'grok', 'vscode')) {
         return Test-AutopromptCustomProviderPath -Name $Name `
             -ConfigRoot $ConfigRoot -Path $normalizedPath
     }
@@ -4130,6 +4174,21 @@ function Test-UninstallProviderPath {
             (Test-IdemPathUnderRoot -Path $normalizedPath -Root $skill) -or
             (Test-IdemPathEqual -Left $normalizedPath `
                 -Right (Join-Path $ConfigRoot 'autoprompt.config.toml')) -or
+            (Test-IdemPathEqual -Left $normalizedPath `
+                -Right (Join-Path $ConfigRoot 'config.toml')) -or
+            (Test-IdemPathEqual -Left $normalizedPath `
+                -Right ((Join-Path $ConfigRoot 'config.toml') +
+                    $AutopromptConfigEditBackupSuffix))
+    }
+    if ($Name -ceq 'grok') {
+        $skills = Join-Path $ConfigRoot 'skills'
+        $skill = Join-Path $skills 'autoprompt'
+        return (Test-IdemPathEqual -Left $normalizedPath -Right $ConfigRoot) -or
+            (Test-IdemPathEqual -Left $normalizedPath -Right $skills) -or
+            (Test-IdemPathEqual -Left $normalizedPath -Right $skill) -or
+            (Test-IdemPathUnderRoot -Path $normalizedPath -Root $skill) -or
+            (Test-IdemPathEqual -Left $normalizedPath `
+                -Right (Join-Path $ConfigRoot 'autoprompt.grok.toml')) -or
             (Test-IdemPathEqual -Left $normalizedPath `
                 -Right (Join-Path $ConfigRoot 'config.toml')) -or
             (Test-IdemPathEqual -Left $normalizedPath `
@@ -4310,7 +4369,7 @@ function Test-UninstallOtherProviderPath {
 function Test-UninstallSharedProviderState {
     param([string]$Name, [string]$ConfigRoot, [hashtable]$Receipt)
     if ($Name -cnotin @(
-        'claude', 'codex', 'opencode', 'kilo', 'vscode', 'vibe',
+        'claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'vibe',
         'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose'
     )) { return $false }
     foreach ($file in @($Receipt.Files)) {
@@ -5111,6 +5170,66 @@ function Get-VscodeSettingsFile {
 function Get-VscodeSettingsHelper {
     return (Join-Path $AutopromptInstallRepoRoot `
         'scripts/install/vscode-settings.cjs')
+}
+
+$AutopromptGrokActivationKey = 'mcp_servers.autoprompt'
+
+function Get-GrokRuntimeRoot {
+    return (Get-AutopromptSkillRoot -Name 'grok')
+}
+
+function Get-GrokConfigFile {
+    return (Join-Path (Get-AutopromptConfigRoot -Name 'grok') 'config.toml')
+}
+
+function Get-GrokDispatchServer {
+    return (Join-Path (Get-GrokRuntimeRoot) 'workflow/grok-dispatch-server.js')
+}
+
+function Get-GrokConfigHelper {
+    return (Join-Path $AutopromptInstallRepoRoot `
+        'scripts/install/grok-config.cjs')
+}
+
+# The MCP registration is the only Grok Build configuration Autoprompt owns, so
+# its status is reported the same way the VS Code activation setting is.
+function Get-GrokConfigStatus {
+    $helper = Get-GrokConfigHelper
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        [Console]::Out.WriteLine(
+            'status=activation-missing reason=config-helper-unavailable')
+        return 3
+    }
+    $output = @(& node $helper inspect --file (Get-GrokConfigFile) `
+        --server (Get-GrokDispatchServer) 2>&1)
+    $code = $LASTEXITCODE
+    [Console]::Out.WriteLine(($output -join [Environment]::NewLine))
+    return $code
+}
+
+# The activation profile is Autoprompt's own harness contract: every pinned line
+# must be present exactly once and nothing unexpected may appear beside them.
+function Test-GrokProfilePolicy {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $lines = @(Get-Content -LiteralPath $Path | ForEach-Object { $_.TrimEnd("`r") })
+    $required = @(
+        'runtime = "grok-build-adapter-v1"',
+        'max_depth = 4',
+        'dispatch = "sealed-headless-reentry"',
+        'mcp_server = "autoprompt"',
+        'native_subagent_spawn = "denied"'
+    )
+    foreach ($line in $required) {
+        if (@($lines | Where-Object { $_ -ceq $line }).Count -ne 1) { return $false }
+    }
+    foreach ($line in $lines) {
+        if ($line -match '^\s*$' -or $line.StartsWith('#')) { continue }
+        if ($line -match '^\[[a-z_.]+\]$') { continue }
+        if ($line -match '^[a-z_]+ = ') { continue }
+        return $false
+    }
+    return $true
 }
 
 # Install-Extras delegates the package boundary to scripts/runtime-payload.cjs. Its

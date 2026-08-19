@@ -7,7 +7,7 @@ const path = require('node:path')
 const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
-const PUBLIC_PROVIDERS = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']
+const PUBLIC_PROVIDERS = ['claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime']
 const LEGACY_PROVIDERS = ['vibe', 'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose']
 const LEGACY_PROVIDER_PATTERN = new RegExp(`\\b(?:${LEGACY_PROVIDERS.join('|')})\\b`, 'i')
 const { HELP_TEXT, PROVIDERS, parseArgs } = require('../../bin/autoprompt.cjs')
@@ -33,7 +33,7 @@ function listFiles(relativePath) {
   return files.sort()
 }
 
-test('the public CLI exposes exactly six providers and rejects legacy provider commands', () => {
+test('the public CLI exposes exactly seven providers and rejects legacy provider commands', () => {
   assert.deepEqual(PROVIDERS.map(provider => provider.id), PUBLIC_PROVIDERS)
   assert.doesNotMatch(HELP_TEXT, LEGACY_PROVIDER_PATTERN)
 
@@ -48,7 +48,7 @@ test('the public CLI exposes exactly six providers and rejects legacy provider c
   }
 })
 
-test('public lifecycle entry points advertise only the six supported providers', () => {
+test('public lifecycle entry points advertise only the seven supported providers', () => {
   for (const relativePath of [
     'scripts/install/install.ps1',
     'scripts/install/install.sh',
@@ -80,7 +80,7 @@ test('runtime manifests and npm allowlist contain only public provider packages'
   assert.doesNotMatch(packageJson.scripts['test:lifecycle'], /vibe|cursor/i)
 })
 
-test('public agent source contains only the six supported provider packages', () => {
+test('public agent source contains only the seven supported provider packages', () => {
   const index = read('agents/README.md')
   assert.match(index, /\[Prime Agent\]\(prime\/\)/)
   assert.doesNotMatch(index, /Vibe|vibe\//i)
@@ -128,7 +128,7 @@ test('unsupported model routing is stated plainly in every language', () => {
   for (const [relativePath, wording] of expectations) {
     const source = read(relativePath)
     const row = source.split('\n').find(line => line.includes('|') && line.includes('`agents=`')) ?? ''
-    assert.equal((row.match(/✕/g) ?? []).length, 4, relativePath)
-    assert.equal(row.split(wording).length - 1, 4, relativePath)
+    assert.equal((row.match(/✕/g) ?? []).length, 5, relativePath)
+    assert.equal(row.split(wording).length - 1, 5, relativePath)
   }
 })

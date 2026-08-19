@@ -23,6 +23,7 @@
   { "name": "provider: codex", "color": "10A37F", "description": "Codex adapter" },
   { "name": "provider: opencode", "color": "1F6FEB", "description": "OpenCode adapter" },
   { "name": "provider: kilo", "color": "8B5CF6", "description": "Kilo Code adapter" },
+  { "name": "provider: grok", "color": "111827", "description": "Grok Build adapter" },
   { "name": "provider: vscode", "color": "007ACC", "description": "VS Code and GitHub Copilot adapter" },
   { "name": "provider: prime", "color": "F59E0B", "description": "Prime Agent adapter" },
 

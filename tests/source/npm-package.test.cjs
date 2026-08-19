@@ -10,7 +10,7 @@ const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const PACKAGE_PATH = path.join(ROOT, 'package.json')
-const PROVIDERS = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']
+const PROVIDERS = ['claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime']
 
 function filesBelow(directory) {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
@@ -179,6 +179,7 @@ test('package metadata is public-ready under the exact available name and remain
     'provider-compatibility-registry',
     'codex-current-parity',
     'prime-provider',
+    'grok-provider',
   ]) {
     assert.match(packageJson.scripts['test:providers'], new RegExp(`${suite}\\.test\\.cjs`), suite)
   }
@@ -189,6 +190,7 @@ test('package metadata is public-ready under the exact available name and remain
     'vscode-lifecycle',
     'install-custom-root',
     'prime-lifecycle',
+    'grok-lifecycle',
   ]) {
     assert.match(packageJson.scripts['test:lifecycle'], new RegExp(`${suite}\\.test\\.cjs`), suite)
   }
@@ -210,12 +212,14 @@ test('package metadata is public-ready under the exact available name and remain
     'agents/codex/',
     'agents/opencode/',
     'agents/kilo/',
+    'agents/grok/',
     'agents/vscode/',
     'agents/prime/',
     'agents/manifests/claude-runtime.json',
     'agents/manifests/codex-runtime.json',
     'agents/manifests/opencode-runtime.json',
     'agents/manifests/kilo-runtime.json',
+    'agents/manifests/grok-runtime.json',
     'agents/manifests/vscode-runtime.json',
     'agents/manifests/prime-runtime.json',
     'assets/anatomy.svg',

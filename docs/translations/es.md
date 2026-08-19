@@ -72,6 +72,7 @@ autoprompt
 | Operativo | [Codex](https://github.com/openai/codex) | Versión con subagentes; auditado con 0.147.0 | `codex` |
 | Operativo | [OpenCode](https://opencode.ai/docs/agents) | 1.18.7+; auditado con 1.18.18 | `opencode` |
 | Operativo | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; auditado con 7.4.22 | `kilo` |
+| Operativo | [Grok Build](https://github.com/xai-org/grok-build) | 1.0.0+; verificado sobre el código 1.0.5; adaptador de despacho sellado | `grok` |
 | Operativo | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; auditado con 1.133.0 y Copilot 0.61.0 | `vscode` |
 | Operativo | [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 0.7.2; auditado con 0.7.2; adaptador de paquete nativo | `prime` |
 
@@ -128,10 +129,10 @@ No se conservaron registros de tiempo ni de tokens. Por tanto, son estimaciones 
 
 Usa `mode=` para definir la concurrencia. Usa `agents=` para dirigir modelos cuando el agente lo admita.
 
-| Control | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Enrutamiento personalizado con `agents=` | ✓ | ✓ | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo padre seleccionado |
+| Control | Claude Code | Codex | OpenCode | Kilo | Grok Build | VS Code | Prime Agent |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Enrutamiento personalizado con `agents=` | ✓ | ✓ | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo de la ejecución | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo padre seleccionado |
 
 ## Cómo funciona
 

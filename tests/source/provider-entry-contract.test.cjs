@@ -7,7 +7,7 @@ const path = require('node:path')
 const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
-const PROVIDERS = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']
+const PROVIDERS = ['claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime']
 const SKILLS = new Map(PROVIDERS.map(provider => [
   provider,
   provider === 'prime'
@@ -25,7 +25,7 @@ function chooserBlock(source) {
   return match[1]
 }
 
-test('all six public skills are explicit-only and a bare invocation always stops', () => {
+test('all seven public skills are explicit-only and a bare invocation always stops', () => {
   for (const [provider, relativePath] of SKILLS) {
     const source = read(relativePath)
     assert.match(source, /explicit(?:-only| invocation|ly invokes)|Use only when the user explicitly/i, `${provider} explicit trigger`)

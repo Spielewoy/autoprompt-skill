@@ -24,7 +24,7 @@ if (-not (Test-Path -LiteralPath $Lib -PathType Leaf)) {
 }
 . $Lib
 
-$ClientsAll = @('prime','vscode','claude','codex','opencode','kilo')
+$ClientsAll = @('prime','vscode','claude','codex','opencode','kilo','grok')
 $LegacyCleanupClients = @('vibe','cursor','roo','gemini','cline','goose','dcode')
 $script:ResultRows = @()
 $script:UninstallExitCode = 0

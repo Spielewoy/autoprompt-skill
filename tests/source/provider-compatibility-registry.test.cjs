@@ -12,7 +12,7 @@ const test = require('node:test')
 const ROOT = path.resolve(__dirname, '..', '..')
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
 const INSTALL_DIR = path.join(ROOT, 'scripts', 'install')
-const PUBLIC = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']
+const PUBLIC = ['claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime']
 const LEGACY = ['vibe', 'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose']
 const BINARIES = Object.freeze({
   cursor: 'cursor-agent',
@@ -158,7 +158,7 @@ function writeLegacySharedReceipt(home, flavor) {
   return { claude, cursor, receiptPath }
 }
 
-test('both ports declare exactly six public install providers and no generic payload fallback', () => {
+test('both ports declare exactly seven public install providers and no generic payload fallback', () => {
   const shellLib = fs.readFileSync(path.join(INSTALL_DIR, 'lib', 'install-lib.sh'), 'utf8')
   const psLib = fs.readFileSync(path.join(INSTALL_DIR, 'lib', 'install-lib.ps1'), 'utf8')
   const shellInstall = fs.readFileSync(path.join(INSTALL_DIR, 'install.sh'), 'utf8')
@@ -178,7 +178,7 @@ test('both ports declare exactly six public install providers and no generic pay
   }
   const shellPayload = shellInstall.match(/payload_file\(\) \{[\s\S]*?^\}/m)?.[0] || ''
   const psPayload = psInstall.match(/function Get-PayloadFile \{[\s\S]*?^\}/m)?.[0] || ''
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode']) {
+  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode']) {
     assert.match(shellPayload, new RegExp(`\\b${provider}\\b`))
     assert.match(psPayload, new RegExp(`'${provider}'`))
   }
@@ -211,7 +211,7 @@ test('legacy providers fail as unknown before install writes in both ports', {
   }
 })
 
-test('install all reports only the six public providers in both ports', {
+test('install all reports only the seven public providers in both ports', {
   skip: process.platform !== 'win32',
 }, () => {
   const bash = findBash()

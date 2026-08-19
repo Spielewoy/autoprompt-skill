@@ -126,14 +126,14 @@ test('provider-native prompts are deterministic generated views', () => {
 
   const contract = JSON.parse(fs.readFileSync(CONTRACT_PATH, 'utf8'))
   const outputs = renderOutputs(ROOT)
-  assert.equal(outputs.size, contract.personas.length * 6 + contract.frameworks.length * 6 + 20)
+  assert.equal(outputs.size, contract.personas.length * 7 + contract.frameworks.length * 7 + 28)
   const version = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode']) {
+  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode']) {
     assert.equal(outputs.get(`agents/${provider}/VERSION`), `${version}\n`, provider)
   }
 })
 
-test('every canonical persona has complete forms for all six public providers', () => {
+test('every canonical persona has complete forms for all seven public providers', () => {
   const contract = JSON.parse(fs.readFileSync(CONTRACT_PATH, 'utf8'))
 
   for (const persona of contract.personas) {
@@ -144,6 +144,7 @@ test('every canonical persona has complete forms for all six public providers', 
     const opencode = read(`agents/opencode/agents/${persona.id}.md`)
     const kilo = read(`agents/kilo/agents/${persona.id}.md`)
     const vscode = read(`agents/vscode/agents/${persona.id}.agent.md`)
+    const grok = read(`agents/grok/agents/${persona.id}.md`)
     const prime = read(`agents/prime/personas/${persona.id}.md`)
 
     assert.equal(claude, canonical, `${persona.id} Claude source`)
@@ -170,6 +171,10 @@ test('every canonical persona has complete forms for all six public providers', 
     assert.equal(Object.hasOwn(parsed.header, 'model'), false, `${persona.id} inherits the selected model`)
     assert.doesNotMatch(vscode, /[\u2013\u2014]/, `${persona.id} must use ASCII punctuation`)
 
+    assert.match(grok, /^model: inherit$/m)
+    assert.match(grok, /^disallowedTools: "Agent/m)
+    assert.equal(grok.includes(body.trim()), true, `${persona.id} Grok Build body`)
+
     assert.equal(prime.trim(), body.trim(), `${persona.id} Prime body`)
   }
 })
@@ -178,7 +183,7 @@ test('all providers expose the same framework set', () => {
   const contract = JSON.parse(fs.readFileSync(CONTRACT_PATH, 'utf8'))
   const expected = contract.frameworks.map(framework => `${framework.id}.md`).sort()
 
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode']) {
+  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode']) {
     const actual = fs.readdirSync(path.join(ROOT, 'agents', provider, 'frameworks'))
       .filter(name => name.endsWith('.md'))
       .sort()
