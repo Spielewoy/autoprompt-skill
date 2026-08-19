@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20puntos-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1: 14.61 puntos más"/></a>
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=versi%C3%B3n&color=255C60&labelColor=14101F" alt="Versión 1.0.0"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=versi%C3%B3n&color=255C60&labelColor=14101F" alt="Versión 1.0.1"/></a>
   <a href="#instalar"><img src="https://img.shields.io/badge/soporte-6%20proveedores%20compatibles-255C60?style=flat-square&labelColor=14101F" alt="Seis proveedores compatibles"/></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-255C60?style=flat-square&labelColor=14101F" alt="Licencia MIT"/></a>
 </p>
@@ -25,7 +25,7 @@
 
 ## Instalar
 
-Usa la CLI siguiente o descarga un instalador desde [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.0).
+Usa la CLI siguiente o descarga un instalador desde [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.1).
 
 ### 1. Instala la CLI
 

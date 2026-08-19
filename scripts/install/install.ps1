@@ -37,6 +37,7 @@ $ClientsAll = @('claude','codex','opencode','kilo','vscode','prime')
 $script:ResultRows = @()
 $script:AnyFail = 0
 $script:IsRecoveryRetained = $false
+$LegacyCodexRecoveryName = '.autoprompt-legacy-codex-recovery.clixml'
 
 function Get-InstallExitCode {
     if ($script:IsRecoveryRetained) { return 77 }
@@ -713,6 +714,23 @@ function Read-LegacyActivationReceipt {
     }
 }
 
+function Get-LegacyCodexOwnershipState {
+    param([string]$Root)
+    if (-not (Test-IdemPathEqual -Left $Root -Right (Get-ConfigRoot -Client 'codex'))) {
+        return $null
+    }
+    $helper = Join-Path $RepoRoot 'scripts/install/legacy-compat.cjs'
+    $files = @(& node $helper files codex $Root 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $files.Count -eq 0) { return $null }
+    return @{
+        Legacy = $true
+        Files = @($files)
+        CreatedDirectories = @()
+        Edits = @()
+        Backup = 'none'
+    }
+}
+
 function Restore-LegacyCodexEdits {
     param([hashtable]$Receipt)
     if (@($Receipt.Edits).Count -eq 0) { return 0 }
@@ -750,18 +768,41 @@ function Remove-LegacyCodexRoles {
     return 0
 }
 
+function Remove-LegacyCodexSkillPayload {
+    param([string]$Root)
+    $skillRoot = Join-Path $Root 'skills/autoprompt'
+    if (-not (Test-Path -LiteralPath $skillRoot -PathType Container)) { return 0 }
+    $legacyFiles = @($script:AutopromptReceiptFiles)
+    foreach ($file in $legacyFiles) {
+        if (-not (Test-IdemPathUnderRoot -Path $file -Root $skillRoot)) {
+            continue
+        }
+        if (-not (Remove-IdemManagedFile -ConfigRoot $Root -Path $file)) {
+            [Console]::Error.WriteLine(
+                "Autoprompt install (codex): could not migrate older skill file $file."
+            )
+            return 93
+        }
+    }
+    return 0
+}
+
 function Invoke-LegacyActivationMigration {
     param([string]$Client, [string]$Root)
     if ($Client -ne 'codex') { return 0 }
     $receiptPath = Join-Path $Root $AutopromptReceiptName
-    if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) { return 0 }
-    $receipt = Read-LegacyActivationReceipt -Client $Client -Root $Root `
-        -ReceiptPath $receiptPath
-    if ($receipt -is [int]) { return [int]$receipt }
-    if ($receipt -isnot [hashtable]) { return 72 }
-    $restoreCode = Restore-LegacyCodexEdits -Receipt $receipt
-    if ($restoreCode -ne 0) { return $restoreCode }
-    return Remove-LegacyCodexRoles
+    if (Test-Path -LiteralPath $receiptPath -PathType Leaf) {
+        $receipt = Read-LegacyActivationReceipt -Client $Client -Root $Root `
+            -ReceiptPath $receiptPath
+        if ($receipt -is [int]) { return [int]$receipt }
+        if ($receipt -isnot [hashtable]) { return 72 }
+        $restoreCode = Restore-LegacyCodexEdits -Receipt $receipt
+        if ($restoreCode -ne 0) { return $restoreCode }
+        return Remove-LegacyCodexRoles
+    } elseif (-not $script:AutopromptLegacyCodexMigration) {
+        return 0
+    }
+    return Remove-LegacyCodexSkillPayload -Root $Root
 }
 
 # Remove-StaleClaudePersonas: remove receipt-owned ap-*.md personas that no longer
@@ -1212,18 +1253,39 @@ function Set-RootReceiptAccumulators {
     $script:AutopromptConfigEditLastBackup = $backup
     $script:AutopromptManagedUndoJournal = @()
     $script:AutopromptRootReceiptState = $Receipt
-    return @{ Files = $files; Edits = $edits }
+    $legacy = $null -ne $Receipt -and $Receipt.ContainsKey('Legacy') -and
+        [bool]$Receipt.Legacy
+    $script:AutopromptLegacyCodexMigration = $legacy
+    return @{ Files = $files; Edits = $edits; Legacy = $legacy }
 }
 
 function Initialize-RootOwnershipState {
     param([string]$Root)
-    return Set-RootReceiptAccumulators `
-        -Receipt (Read-RootReceiptState -Root $Root)
+    $receipt = Read-RootReceiptState -Root $Root
+    if ($null -eq $receipt) {
+        $receipt = Get-LegacyCodexOwnershipState -Root $Root
+    }
+    return Set-RootReceiptAccumulators -Receipt $receipt
 }
 
 function Start-RootTransaction {
-    param([string]$Root, [hashtable]$State)
-    $snapshotPaths = @($State.Files)
+    param([string]$Root, [hashtable]$State, [string[]]$Targets)
+    $snapshotPaths = @($State.Files) + @($Targets)
+    $artifactBases = @($Targets) + @(
+        (Join-Path $Root $AutopromptHashManifestName),
+        (Join-Path $Root $AutopromptReceiptName)
+    )
+    foreach ($artifactBase in $artifactBases) {
+        foreach ($suffix in @(
+            '.tmp',
+            '.autoprompt.tmp',
+            '.autoprompt.replace.bak',
+            '.autoprompt.restore.tmp',
+            '.autoprompt.restore.bak'
+        )) {
+            $snapshotPaths += "$artifactBase$suffix"
+        }
+    }
     foreach ($edit in @($State.Edits)) {
         $snapshotPaths += $edit.File
         $snapshotPaths += "$($edit.File)$AutopromptConfigEditBackupSuffix"
@@ -1232,7 +1294,238 @@ function Start-RootTransaction {
     if ($null -eq $snapshot) {
         throw "could not create root transaction state under $Root"
     }
+    if ($State.Legacy) {
+        $recoveryPath = Join-Path $Root $LegacyCodexRecoveryName
+        if (Test-Path -LiteralPath $recoveryPath) {
+            Remove-IdemManagedRecovery -Snapshot $snapshot | Out-Null
+            throw "unfinished older Codex recovery already exists at $recoveryPath"
+        }
+        try {
+            Move-Item -LiteralPath $snapshot.RecoveryPath `
+                -Destination $recoveryPath -ErrorAction Stop
+        } catch {
+            Remove-IdemManagedRecovery -Snapshot $snapshot | Out-Null
+            throw "could not preserve older Codex recovery at $recoveryPath"
+        }
+        $snapshot.RecoveryPath = $recoveryPath
+        $snapshot.InMemoryRestoreToken = $script:AutopromptInMemoryRestoreToken
+    }
     Add-IdemManagedUndo -Snapshot $snapshot
+}
+
+function Test-LegacyCodexRecoverySnapshot {
+    param([object]$Snapshot, [string]$Root)
+    if ($null -eq $Snapshot -or
+        -not (Test-IdemPathEqual -Left ([string]$Snapshot.ConfigRoot) -Right $Root) -or
+        -not [bool]$Snapshot.ConfigRootExisted -or
+        @($Snapshot.ReceiptEdits).Count -ne 0 -or
+        @($Snapshot.ReceiptCreatedDirectories).Count -ne 0 -or
+        [string]$Snapshot.ConfigEditLastBackup -cne 'none') {
+        return $false
+    }
+    try {
+        $compat = Get-Content (Join-Path $RepoRoot 'scripts/install/legacy-codex-compat.json') `
+            -Raw | ConvertFrom-Json
+    } catch {
+        return $false
+    }
+    $legacyPaths = @($compat.files | ForEach-Object {
+        Join-Path (Join-Path $Root 'skills/autoprompt') ([string]$_)
+    })
+    $currentTargets = @(Get-ClientInstallTargetPlan -Client 'codex')
+    $expectedPaths = @($legacyPaths)
+    $expectedPaths += $currentTargets
+    $expectedPaths += Join-Path $Root $AutopromptHashManifestName
+    $expectedPaths += Join-Path $Root $AutopromptReceiptName
+    $artifactBases = @($currentTargets) + @(
+        (Join-Path $Root $AutopromptHashManifestName),
+        (Join-Path $Root $AutopromptReceiptName)
+    )
+    foreach ($artifactBase in $artifactBases) {
+        foreach ($suffix in @(
+            '.tmp',
+            '.autoprompt.tmp',
+            '.autoprompt.replace.bak',
+            '.autoprompt.restore.tmp',
+            '.autoprompt.restore.bak'
+        )) {
+            $expectedPaths += "$artifactBase$suffix"
+        }
+    }
+    $expectedPaths = @(Get-UniqueReceiptPaths -Paths $expectedPaths)
+    if (@($Snapshot.Files).Count -ne $expectedPaths.Count) { return $false }
+    $recordsByPath = New-Object `
+        'System.Collections.Generic.Dictionary[string,object]' `
+        (Get-IdemPathComparer)
+    foreach ($record in @($Snapshot.Files)) {
+        $recordPath = [string]$record.Path
+        if ([string]::IsNullOrEmpty($recordPath) -or
+            $recordsByPath.ContainsKey($recordPath)) {
+            return $false
+        }
+        $recordsByPath.Add($recordPath, $record)
+    }
+    foreach ($expectedPath in $expectedPaths) {
+        if (-not $recordsByPath.ContainsKey($expectedPath)) { return $false }
+    }
+    $legacyPathSet = New-Object 'System.Collections.Generic.HashSet[string]' `
+        (Get-IdemPathComparer)
+    foreach ($legacyPath in $legacyPaths) { [void]$legacyPathSet.Add($legacyPath) }
+    foreach ($relativePath in @($compat.files)) {
+        $expectedPath = Join-Path (Join-Path $Root 'skills/autoprompt') `
+            ([string]$relativePath)
+        $record = $recordsByPath[$expectedPath]
+        $expectedSize = [long]$compat.sizes.PSObject.Properties[
+            [string]$relativePath
+        ].Value
+        $expectedHash = [string]$compat.sha256.PSObject.Properties[
+            [string]$relativePath
+        ].Value
+        if (-not [bool]$record.Exists -or
+            @($record.Bytes).Count -ne $expectedSize) {
+            return $false
+        }
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try {
+            $hashBytes = $hasher.ComputeHash([byte[]]$record.Bytes)
+        } finally {
+            $hasher.Dispose()
+        }
+        $hash = ([BitConverter]::ToString($hashBytes) -replace '-', '').ToLowerInvariant()
+        if ($hash -cne $expectedHash) { return $false }
+    }
+    foreach ($currentOnlyPath in @($expectedPaths | Where-Object {
+        -not $legacyPathSet.Contains([string]$_) -and
+        -not (Test-IdemPathEqual -Left $_ `
+            -Right (Join-Path $Root $AutopromptHashManifestName)) -and
+        -not (Test-IdemPathEqual -Left $_ `
+            -Right (Join-Path $Root $AutopromptReceiptName))
+    })) {
+        $record = $recordsByPath[$currentOnlyPath]
+        if ([bool]$record.Exists) { return $false }
+    }
+    foreach ($absentPath in @(
+        (Join-Path $Root $AutopromptHashManifestName),
+        (Join-Path $Root $AutopromptReceiptName)
+    )) {
+        $record = $recordsByPath[$absentPath]
+        if ([bool]$record.Exists) { return $false }
+    }
+    if (@($Snapshot.ReceiptFiles).Count -ne $legacyPaths.Count) { return $false }
+    $receiptPathSet = New-Object 'System.Collections.Generic.HashSet[string]' `
+        (Get-IdemPathComparer)
+    foreach ($receiptPath in @($Snapshot.ReceiptFiles)) {
+        if (-not $receiptPathSet.Add([string]$receiptPath)) { return $false }
+    }
+    foreach ($legacyPath in $legacyPaths) {
+        if (-not $receiptPathSet.Contains($legacyPath)) { return $false }
+    }
+    $expectedDirectories = New-Object 'System.Collections.Generic.HashSet[string]' `
+        (Get-IdemPathComparer)
+    foreach ($expectedPath in $expectedPaths) {
+        $directory = Split-Path -Parent $expectedPath
+        while (-not [string]::IsNullOrEmpty($directory) -and
+            -not (Test-IdemPathEqual -Left $directory -Right $Root)) {
+            [void]$expectedDirectories.Add($directory)
+            $parent = Split-Path -Parent $directory
+            if ($parent -ceq $directory) { break }
+            $directory = $parent
+        }
+    }
+    $actualDirectories = @($Snapshot.Directories.Keys)
+    if ($actualDirectories.Count -ne $expectedDirectories.Count) { return $false }
+    $skillRoot = Join-Path $Root 'skills/autoprompt'
+    $legacyDirectories = New-Object 'System.Collections.Generic.HashSet[string]' `
+        (Get-IdemPathComparer)
+    [void]$legacyDirectories.Add((Join-Path $Root 'skills'))
+    [void]$legacyDirectories.Add($skillRoot)
+    foreach ($relativeDirectory in @($compat.directories)) {
+        [void]$legacyDirectories.Add((Join-Path $skillRoot ([string]$relativeDirectory)))
+    }
+    foreach ($directory in $actualDirectories) {
+        if (-not $expectedDirectories.Contains([string]$directory)) { return $false }
+        $value = $Snapshot.Directories[$directory]
+        if ($value -isnot [bool] -or
+            [bool]$value -ne $legacyDirectories.Contains([string]$directory)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Restore-InterruptedLegacyCodexMigration {
+    param([string]$Root)
+    $recoveryPath = Join-Path $Root $LegacyCodexRecoveryName
+    if (-not (Test-Path -LiteralPath $recoveryPath -PathType Leaf)) {
+        return $true
+    }
+    try {
+        $snapshot = Import-Clixml -LiteralPath $recoveryPath -ErrorAction Stop
+    } catch {
+        $snapshot = $null
+    }
+    if (-not (Test-LegacyCodexRecoverySnapshot -Snapshot $snapshot -Root $Root)) {
+        [Console]::Error.WriteLine(
+            "Autoprompt install: older Codex recovery is invalid at $recoveryPath."
+        )
+        return $false
+    }
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction SilentlyContinue
+    if ($null -eq $rootItem -or $rootItem -isnot [System.IO.DirectoryInfo] -or
+        $rootItem.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)) {
+        return $false
+    }
+    foreach ($directory in @($snapshot.Directories.Keys)) {
+        $path = [string]$directory
+        if (-not (Test-IdemReceiptPathUnderRoot -Path $path -Root $Root)) {
+            [Console]::Error.WriteLine(
+                "Autoprompt install: older Codex recovery path escapes $Root`: $path."
+            )
+            return $false
+        }
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item -and $item.Attributes.HasFlag(
+            [System.IO.FileAttributes]::ReparsePoint
+        )) {
+            [Console]::Error.WriteLine(
+                "Autoprompt install: older Codex recovery found a reparse path at $path."
+            )
+            return $false
+        }
+    }
+    foreach ($record in @($snapshot.Files)) {
+        $path = [string]$record.Path
+        if (-not (Test-IdemPathUnderRoot -Path $path -Root $Root)) {
+            [Console]::Error.WriteLine(
+                "Autoprompt install: older Codex recovery path escapes $Root`: $path."
+            )
+            return $false
+        }
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item -and $item.Attributes.HasFlag(
+            [System.IO.FileAttributes]::ReparsePoint
+        )) {
+            [Console]::Error.WriteLine(
+                "Autoprompt install: older Codex recovery found a reparse path at $path."
+            )
+            return $false
+        }
+    }
+    # Restore only the snapshot that passed validation above. Leaving the durable
+    # path attached would make the shared helper import the file a second time.
+    $snapshot.RecoveryPath = ''
+    if (-not (Restore-IdemManagedSnapshot -Snapshot $snapshot `
+            -UseInMemorySnapshot) -or
+        -not (Remove-IdemRecoveryPath -Path $recoveryPath)) {
+        [Console]::Error.WriteLine(
+            "Autoprompt install: could not restore older Codex recovery at $recoveryPath."
+        )
+        return $false
+    }
+    [Console]::Error.WriteLine(
+        "Autoprompt install: restored an interrupted older Codex upgrade under $Root."
+    )
+    return $true
 }
 
 function Initialize-RootAccumulators {
@@ -1414,6 +1707,13 @@ function Get-RootPreflightState {
 
 function Start-ValidatedRootTransaction {
     param([string]$Root, [string[]]$Clients)
+    if (@(Get-ClientsForRoot -Root $Root -Clients $Clients) -contains 'codex') {
+        if (-not (Restore-InterruptedLegacyCodexMigration -Root $Root)) {
+            Set-RootInitializationFailed -Root $Root -Clients $Clients `
+                -Message 'older Codex recovery could not be restored'
+            return $false
+        }
+    }
     try {
         $state = Get-RootPreflightState -Root $Root -Clients $Clients
     } catch {
@@ -1434,7 +1734,8 @@ function Start-ValidatedRootTransaction {
         return $false
     }
     try {
-        Start-RootTransaction -Root $Root -State $state.Ownership
+        Start-RootTransaction -Root $Root -State $state.Ownership `
+            -Targets $state.Targets
         return $true
     } catch {
         Set-RootInitializationFailed -Root $Root -Clients $Clients `

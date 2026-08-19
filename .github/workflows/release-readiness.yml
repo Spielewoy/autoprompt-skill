@@ -8,9 +8,11 @@ on:
       - "agents/**"
       - "bin/**"
       - "scripts/install/**"
+      - "scripts/build-release-assets.ps1"
       - "scripts/codex-configure.cjs"
       - "package.json"
       - "tests/source/**"
+      - ".github/workflows/release.yml"
       - ".github/workflows/release-readiness.yml"
   schedule:
     - cron: "17 4 * * 1"

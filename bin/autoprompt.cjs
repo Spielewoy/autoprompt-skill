@@ -5,17 +5,19 @@ const childProcess = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { detectLegacyCodexInstall } = require('../scripts/install/legacy-compat.cjs')
 const { createProviderRootCompat } = require('./provider-root-compat.cjs')
 
 const REAL_CLI_PATH = fs.realpathSync(__filename)
 const PACKAGE_ROOT = path.resolve(path.dirname(REAL_CLI_PATH), '..')
 const PACKAGE_JSON = require(path.join(PACKAGE_ROOT, 'package.json'))
 const REGISTRY_PACKAGE_SPEC = 'autoprompt-skill@latest'
-const GITHUB_PACKAGE_SPEC = 'github:Spielewoy/autoprompt-skill#main'
+const GITHUB_PACKAGE_ROOT = 'github:Spielewoy/autoprompt-skill'
 const GITHUB_PACKAGE_JSON_URL = 'https://raw.githubusercontent.com/Spielewoy/autoprompt-skill/main/package.json'
 const GITHUB_COMMIT_API_URL = 'https://api.github.com/repos/Spielewoy/autoprompt-skill/commits/main'
 const UPDATE_STATE_DIRECTORY = '.autoprompt'
 const UPDATE_STATE_BASENAME = 'cli-update.json'
+const UPDATE_HANDOFF_ENV = 'AUTOPROMPT_UPDATED_HANDOFF'
 const CLIENT_TOKEN = /^[a-z][a-z0-9-]*$/
 const PROVIDERS = Object.freeze([
   Object.freeze({ id: 'claude', label: 'Claude Code' }),
@@ -287,12 +289,31 @@ function answer(options, prompt) {
   return normalized
 }
 
-function providerInstallState(client, root, currentVersion = PACKAGE_JSON.version) {
+function providerInstallState(
+  client,
+  root,
+  currentVersion = PACKAGE_JSON.version,
+  packageRoot = PACKAGE_ROOT,
+) {
   const receipt = path.join(
     root,
     client === 'prime' ? '.autoprompt-prime-install.json' : '.autoprompt-install-receipt.json',
   )
-  if (!fs.existsSync(receipt)) return { installed: false, version: '', current: false }
+  if (!fs.existsSync(receipt)) {
+    let legacy = false
+    try {
+      legacy = client === 'codex' && detectLegacyCodexInstall(root, { packageRoot }).matched
+    } catch {}
+    if (legacy) {
+      return {
+        installed: true,
+        version: '',
+        current: false,
+        legacy: true,
+      }
+    }
+    return { installed: false, version: '', current: false }
+  }
 
   const marker = client === 'prime'
     ? path.join(root, 'autoprompt', 'packages', 'prime', 'package.json')
@@ -306,6 +327,7 @@ function providerInstallState(client, root, currentVersion = PACKAGE_JSON.versio
 }
 
 function stateLabel(state) {
+  if (state.legacy) return `legacy install detected, update available: ${PACKAGE_JSON.version}`
   if (!state.installed) return 'not installed'
   if (state.current) return `installed ${state.version}, current`
   if (state.version) return `installed ${state.version}, update available: ${PACKAGE_JSON.version}`
@@ -366,8 +388,16 @@ function chooseProvider(options, settings = {}) {
   const choices = providers.map(provider => {
     if (provider.id === CUSTOM_PROVIDER_OPTION.id) return { provider, state: null, locations: null }
     const locations = providerInstallLocations(provider.id, options)
-    const state = providerInstallState(provider.id, locations.roots[0].path)
-    return { provider, state, locations }
+    const state = providerInstallState(
+      provider.id,
+      locations.roots[0].path,
+      PACKAGE_JSON.version,
+      options.packageRoot,
+    )
+    const visibleState = action === 'uninstall' && state.legacy
+      ? { installed: false, version: '', current: false }
+      : state
+    return { provider, state: visibleState, locations }
   })
   choices.forEach(({ provider, state }, index) => {
     const suffix = state ? ` (${stateLabel(state)})` : ''
@@ -635,7 +665,7 @@ function resolveInteractiveUpdateStatus(options, latestVersion, latestGitHubRevi
   const state = readUpdateState(options)
   const comparison = latest ? compareVersions(latest, PACKAGE_JSON.version) : 0
   const packagedInstall = isPackagedInstall(options.packageRoot)
-  if (comparison > 0) {
+  if (packagedInstall && comparison > 0) {
     return {
       action: 'registry-first',
       message: `New Autoprompt version available: ${latest} (installed ${PACKAGE_JSON.version}). Updating...`,
@@ -656,10 +686,22 @@ function resolveInteractiveUpdateStatus(options, latestVersion, latestGitHubRevi
     }
   }
 
-  if (latest && comparison < 0) {
+  if (packagedInstall && latest && comparison < 0) {
     return {
       action: 'registry-first',
       message: `Installed Autoprompt ${PACKAGE_JSON.version} does not match current release ${latest}. Updating...`,
+      latestGitHubRevision: revision,
+      latestVersion: latest,
+    }
+  }
+
+  if (!packagedInstall && (revision || (latest && comparison !== 0))) {
+    const releaseDetail = latest && comparison !== 0
+      ? ` Latest release: ${latest}.`
+      : ''
+    return {
+      action: 'none',
+      message: `Repository checkout ${PACKAGE_JSON.version} is not auto-updated.${releaseDetail}`,
       latestGitHubRevision: revision,
       latestVersion: latest,
     }
@@ -830,7 +872,12 @@ function runScript(command, options) {
   return status
 }
 
-function runRegistryUpdate(options) {
+function githubPackageSpec(revision) {
+  const normalized = normalizeGitHubRevision(revision)
+  return normalized ? `${GITHUB_PACKAGE_ROOT}#${normalized}` : ''
+}
+
+function runRegistryUpdate(options, latestGitHubRevision = '') {
   const primary = npmInvocation(options.platform, ['install', '-g', REGISTRY_PACKAGE_SPEC])
   let result
   try {
@@ -840,12 +887,17 @@ function runRegistryUpdate(options) {
   }
   let status = childStatus(result, options.stderr, 'npm')
   if (status !== 0) {
-    options.stdout.write('npm registry update failed; trying GitHub main.\n')
+    const fallbackSpec = githubPackageSpec(latestGitHubRevision)
+    if (!fallbackSpec) {
+      options.stdout.write('npm registry update failed; GitHub revision unavailable.\n')
+      return { installedGitHubRevision: '', status }
+    }
+    options.stdout.write('npm registry update failed; trying the verified GitHub revision.\n')
     const fallback = npmInvocation(options.platform, [
       'install',
       '-g',
       '--install-links=true',
-      GITHUB_PACKAGE_SPEC,
+      fallbackSpec,
     ])
     let fallbackResult
     try {
@@ -858,16 +910,27 @@ function runRegistryUpdate(options) {
       fallbackResult = { error }
     }
     status = childStatus(fallbackResult, options.stderr, 'npm GitHub fallback')
+    return {
+      installedGitHubRevision: status === 0
+        ? normalizeGitHubRevision(latestGitHubRevision)
+        : '',
+      status,
+    }
   }
-  return status
+  return { installedGitHubRevision: '', status }
 }
 
-function runGitHubUpdate(options) {
+function runGitHubUpdate(options, latestGitHubRevision = '') {
+  const spec = githubPackageSpec(latestGitHubRevision)
+  if (!spec) {
+    options.stderr.write('Autoprompt update: GitHub revision unavailable.\n')
+    return { installedGitHubRevision: '', status: 1 }
+  }
   const fallback = npmInvocation(options.platform, [
     'install',
     '-g',
     '--install-links=true',
-    GITHUB_PACKAGE_SPEC,
+    spec,
   ])
   let result
   try {
@@ -875,7 +938,13 @@ function runGitHubUpdate(options) {
   } catch (error) {
     result = { error }
   }
-  return childStatus(result, options.stderr, 'npm GitHub install')
+  const status = childStatus(result, options.stderr, 'npm GitHub install')
+  return {
+    installedGitHubRevision: status === 0
+      ? normalizeGitHubRevision(latestGitHubRevision)
+      : '',
+    status,
+  }
 }
 
 function resolveUpdateIntent(options, updateInfo = {}) {
@@ -901,20 +970,22 @@ function runUpdate(options, updateInfo = {}) {
     latestGitHubRevision,
     latestVersion,
   })
-  const status = intent.strategy === 'github-main'
-    ? runGitHubUpdate(options)
-    : runRegistryUpdate(options)
-  if (status === 0) {
-    persistUpdateState(options, {
-      installedGitHubRevision: intent.latestGitHubRevision,
-    })
+  const result = intent.strategy === 'github-main'
+    ? runGitHubUpdate(options, intent.latestGitHubRevision)
+    : runRegistryUpdate(options, intent.latestGitHubRevision)
+  if (result.status === 0) {
+    if (result.installedGitHubRevision) {
+      persistUpdateState(options, {
+        installedGitHubRevision: result.installedGitHubRevision,
+      })
+    }
     options.stdout.write(
       updateInfo.continueInteractive
-        ? 'Autoprompt updated. Continuing with the installer.\n'
+        ? 'Autoprompt updated. Restarting the installer.\n'
         : 'Autoprompt updated. Rerun `autoprompt` to refresh provider files.\n',
     )
   }
-  return status
+  return result.status
 }
 
 function checkInteractiveUpdate(options) {
@@ -942,11 +1013,20 @@ function checkInteractiveUpdate(options) {
       continueInteractive: true,
     })
     if (status !== 0) return status
-    return null
+    return 'restart'
   }
 
   options.stdout.write(`${resolved.message}\n`)
   return null
+}
+
+function runUpdatedInstaller(options) {
+  const cli = path.join(options.packageRoot, 'bin', 'autoprompt.cjs')
+  const result = options.spawnSync(process.execPath, [cli], {
+    ...spawnOptions(options),
+    env: { ...options.env, [UPDATE_HANDOFF_ENV]: '1' },
+  })
+  return childStatus(result, options.stderr, 'updated Autoprompt installer')
 }
 
 function runSelectedInstall(options, selected) {
@@ -962,9 +1042,11 @@ function runSelectedInstall(options, selected) {
       ? confirm(options, `Autoprompt ${state.version} is current. Reinstall or repair it? [Y/N]: `)
       : confirm(
           options,
-          state.version
-            ? `Update Autoprompt ${state.version} to ${PACKAGE_JSON.version}? [Y/N]: `
-            : `Installed version is unknown. Update to ${PACKAGE_JSON.version}? [Y/N]: `,
+          state.legacy
+            ? `Legacy Autoprompt install detected. Update it to ${PACKAGE_JSON.version}? [Y/N]: `
+            : state.version
+                ? `Update Autoprompt ${state.version} to ${PACKAGE_JSON.version}? [Y/N]: `
+                : `Installed version is unknown. Update to ${PACKAGE_JSON.version}? [Y/N]: `,
         )
     if (!proceed) return 0
   }
@@ -1000,16 +1082,19 @@ function runSelectedInstall(options, selected) {
 function runInteractive(options) {
   try {
     let updateStatus
-    try {
-      updateStatus = checkInteractiveUpdate(options)
-    } catch (error) {
-      if (error instanceof BackNavigationError) {
-        options.stdout.write('\nAutoprompt installer closed.\n')
-        return 0
+    if (options.env[UPDATE_HANDOFF_ENV] !== '1') {
+      try {
+        updateStatus = checkInteractiveUpdate(options)
+      } catch (error) {
+        if (error instanceof BackNavigationError) {
+          options.stdout.write('\nAutoprompt installer closed.\n')
+          return 0
+        }
+        throw error
       }
-      throw error
     }
     if (Number.isInteger(updateStatus)) return updateStatus
+    if (updateStatus === 'restart') return runUpdatedInstaller(options)
     return runInteractiveProviderLoop(options, {
       action: 'install',
       includeCustom: true,

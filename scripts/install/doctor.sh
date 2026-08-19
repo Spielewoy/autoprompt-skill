@@ -277,6 +277,14 @@ receipt_owns_client() {
   return 1
 }
 
+legacy_codex_installed() {
+  local root="$1" helper
+  _idem_paths_equal "$root" "$(config_root codex)" || return 1
+  command -v node >/dev/null 2>&1 || return 1
+  helper="$REPO_ROOT/scripts/install/legacy-compat.cjs"
+  node "$helper" match codex "$root" >/dev/null 2>&1
+}
+
 # probe_client <client>: echo "<detected> <installed> <verifies> <detail>" where each
 # of the first three is yes/no and detail carries the version, verify reason, and the
 # extras completeness (full runtime set for claude/codex).
@@ -332,8 +340,12 @@ probe_client() {
     version="${det_rec##*version=}"
   fi
 
-  local installed="no"
+  local installed="no" legacy=0
   receipt_owns_client "$client" "$root" && installed="yes"
+  if [ "$installed" = no ] && [ "$client" = codex ] && legacy_codex_installed "$root"; then
+    installed="yes"
+    legacy=1
+  fi
 
   local verifies="no"
   reason="-"
@@ -345,6 +357,11 @@ probe_client() {
       return 0
       ;;
   esac
+  if [ "$legacy" -eq 1 ]; then
+    printf '%s %s no version=%s reason=%s extras=%s' \
+      "$detected" "$installed" "$version" older-install older-install
+    return 0
+  fi
   if verify_install "$client" >/dev/null 2>&1; then
     verifies="yes"
   else

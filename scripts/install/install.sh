@@ -45,6 +45,8 @@ CLIENTS_ALL=(claude codex opencode kilo vscode prime)
 RESULT_ROWS=()
 ANY_FAIL=0
 RETAINED_RECOVERY=0
+LEGACY_CODEX_RECOVERY_NAME='.autoprompt-legacy-codex-recovery'
+AUTOPROMPT_LEGACY_CODEX_RECOVERY=''
 
 install_exit_code() {
   if [ "$RETAINED_RECOVERY" -eq 1 ]; then
@@ -577,6 +579,18 @@ _migrate_restore_codex_config() {
   AUTOPROMPT_CONFIGEDIT_LAST_BACKUP=none
 }
 
+legacy_codex_ownership_state() {
+  local root="$1" output_name="$2" helper
+  local -n out="$output_name"
+  local -a owned=()
+  out=()
+  _idem_paths_equal "$root" "$(config_root codex)" || return 1
+  helper="$REPO_ROOT/scripts/install/legacy-compat.cjs"
+  mapfile -d '' -t owned < <(node "$helper" files0 codex "$root" 2>/dev/null)
+  [ "${#owned[@]}" -gt 0 ] || return 1
+  out=("${owned[@]}")
+}
+
 _migrate_legacy_roles() {
   local client="$1" root="$2" expected_parent file native_file canonical_file
   local canonical_parent basename is_legacy
@@ -607,13 +621,180 @@ _migrate_legacy_roles() {
   AUTOPROMPT_RECEIPT_FILES=("${retained[@]}")
 }
 
+remove_legacy_codex_skill_payload() {
+  local root="$1" skill_root="$root/skills/autoprompt" file
+  local recovery="$root/$LEGACY_CODEX_RECOVERY_NAME"
+  [ -d "$skill_root" ] || return 0
+  if [ -e "$recovery" ]; then
+    printf 'Autoprompt install (codex): older upgrade recovery already exists at %s.\n' \
+      "$recovery" >&2
+    return 93
+  fi
+  mkdir -p -- "$recovery/skills" || return 93
+  if ! mv -- "$skill_root" "$recovery/skills/autoprompt"; then
+    rmdir -- "$recovery/skills" "$recovery" 2>/dev/null || true
+    printf 'Autoprompt install (codex): could not preserve older skill recovery at %s.\n' \
+      "$recovery" >&2
+    return 93
+  fi
+  AUTOPROMPT_LEGACY_CODEX_RECOVERY="$recovery"
+  local -a kept=()
+  for file in "${AUTOPROMPT_RECEIPT_FILES[@]:-}"; do
+    _idem_path_under_root "$file" "$skill_root" || kept+=("$file")
+  done
+  AUTOPROMPT_RECEIPT_FILES=("${kept[@]}")
+}
+
+legacy_codex_partial_is_safe() {
+  local root="$1" skill_root="$root/skills/autoprompt" target identity file directory parent suffix
+  AUTOPROMPT_LEGACY_PARTIAL_FILES=()
+  AUTOPROMPT_LEGACY_PARTIAL_DIRECTORIES=()
+  [ ! -e "$skill_root" ] && return 0
+  [ -d "$skill_root" ] && [ ! -L "$skill_root" ] || return 1
+  local -a targets=()
+  _preflight_client_targets codex targets || return 1
+  declare -A allowed_files=() allowed_directories=()
+  allowed_directories["$(_idem_comparable_path "$skill_root")"]=1
+  for target in "${targets[@]}"; do
+    _idem_path_under_root "$target" "$skill_root" || continue
+    identity="$(_idem_comparable_path "$target")" || return 1
+    allowed_files["$identity"]=1
+    for suffix in \
+      '.tmp' \
+      '.autoprompt.tmp' \
+      '.autoprompt.replace.bak' \
+      '.autoprompt.restore.tmp' \
+      '.autoprompt.restore.bak'; do
+      identity="$(_idem_comparable_path "$target$suffix")" || return 1
+      allowed_files["$identity"]=1
+    done
+    directory="${target%/*}"
+    while _idem_path_under_root "$directory" "$skill_root"; do
+      identity="$(_idem_comparable_path "$directory")" || return 1
+      allowed_directories["$identity"]=1
+      _idem_paths_equal "$directory" "$skill_root" && break
+      parent="${directory%/*}"
+      [ "$parent" != "$directory" ] || break
+      directory="$parent"
+    done
+  done
+  while IFS= read -r -d '' file; do
+    [ ! -L "$file" ] || return 1
+    [ -f "$file" ] || [ -d "$file" ] || return 1
+  done < <(find "$skill_root" -mindepth 1 -print0)
+  while IFS= read -r -d '' file; do
+    identity="$(_idem_comparable_path "$file")" || return 1
+    [ -n "${allowed_files[$identity]+set}" ] || return 1
+    AUTOPROMPT_LEGACY_PARTIAL_FILES+=("$file")
+  done < <(find "$skill_root" -type f -print0)
+  while IFS= read -r -d '' directory; do
+    identity="$(_idem_comparable_path "$directory")" || return 1
+    [ -n "${allowed_directories[$identity]+set}" ] || return 1
+    AUTOPROMPT_LEGACY_PARTIAL_DIRECTORIES+=("$directory")
+  done < <(find "$skill_root" -depth -type d -print0)
+}
+
+remove_legacy_codex_partial_tree() {
+  local root="$1" file directory
+  for file in "${AUTOPROMPT_LEGACY_PARTIAL_FILES[@]}"; do
+    _uninstall_receipt_path_under_root "$root" "$file" || return 1
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    rm -- "$file" || return 1
+  done
+  for directory in "${AUTOPROMPT_LEGACY_PARTIAL_DIRECTORIES[@]}"; do
+    _uninstall_receipt_path_under_root "$root" "$directory" || return 1
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+    rmdir -- "$directory" || return 1
+  done
+}
+
+remove_exact_legacy_codex_recovery() {
+  local root="$1" recovery="$1/$LEGACY_CODEX_RECOVERY_NAME"
+  local helper file directory skill_root
+  local -a files=() directories=()
+  helper="$REPO_ROOT/scripts/install/legacy-compat.cjs"
+  skill_root="$recovery/skills/autoprompt"
+  [ -d "$root" ] && [ ! -L "$root" ] || return 1
+  [ -d "$recovery" ] && [ ! -L "$recovery" ] || return 1
+  [ -d "$recovery/skills" ] && [ ! -L "$recovery/skills" ] || return 1
+  [ -d "$skill_root" ] && [ ! -L "$skill_root" ] || return 1
+  _uninstall_receipt_path_under_root "$root" "$skill_root" || return 1
+  node "$helper" match codex "$recovery" >/dev/null 2>&1 || return 1
+  mapfile -d '' -t files < <(node "$helper" files0 codex "$recovery" 2>/dev/null)
+  mapfile -d '' -t directories < <(
+    node "$helper" directories0 codex "$recovery" 2>/dev/null
+  )
+  [ "${#files[@]}" -gt 0 ] || return 1
+  for file in "${files[@]}"; do
+    _idem_path_under_root "$file" "$skill_root" || return 1
+    _uninstall_receipt_path_under_root "$root" "$file" || return 1
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    rm -- "$file" || return 1
+  done
+  for directory in "${directories[@]}"; do
+    _idem_path_under_root "$directory" "$skill_root" || return 1
+    _uninstall_receipt_path_under_root "$root" "$directory" || return 1
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+    rmdir -- "$directory" || return 1
+  done
+  rmdir -- "$skill_root" "$recovery/skills" "$recovery" || return 1
+}
+
+restore_interrupted_legacy_codex_migration() {
+  local root="$1" recovery="$root/$LEGACY_CODEX_RECOVERY_NAME"
+  local skill_root="$root/skills/autoprompt" helper
+  [ -e "$recovery" ] || return 0
+  [ -d "$root" ] && [ ! -L "$root" ] || return 1
+  [ -d "$recovery" ] && [ ! -L "$recovery" ] || return 1
+  _uninstall_receipt_path_under_root "$root" "$recovery" || return 1
+  _uninstall_receipt_path_under_root "$root" "$skill_root" || return 1
+  helper="$REPO_ROOT/scripts/install/legacy-compat.cjs"
+  if ! node "$helper" match codex "$recovery" >/dev/null 2>&1; then
+    printf 'Autoprompt install: older Codex recovery is invalid at %s.\n' \
+      "$recovery" >&2
+    return 1
+  fi
+  if [ -f "$root/$AUTOPROMPT_RECEIPT_NAME" ]; then
+    remove_exact_legacy_codex_recovery "$root" || return 1
+    AUTOPROMPT_LEGACY_CODEX_RECOVERY=''
+    return 0
+  fi
+  if ! legacy_codex_partial_is_safe "$root"; then
+    printf 'Autoprompt install: interrupted Codex upgrade has unrecognized files under %s.\n' \
+      "$skill_root" >&2
+    return 1
+  fi
+  remove_legacy_codex_partial_tree "$root" || return 1
+  mkdir -p -- "${skill_root%/*}" || return 1
+  mv -- "$recovery/skills/autoprompt" "$skill_root" || return 1
+  rmdir -- "$recovery/skills" "$recovery" 2>/dev/null || return 1
+  AUTOPROMPT_LEGACY_CODEX_RECOVERY=''
+  printf 'Autoprompt install: restored an interrupted older Codex upgrade under %s.\n' \
+    "$root" >&2
+}
+
+discard_legacy_codex_recovery() {
+  local root="$1" recovery="$root/$LEGACY_CODEX_RECOVERY_NAME"
+  [ -e "$recovery" ] || { AUTOPROMPT_LEGACY_CODEX_RECOVERY=''; return 0; }
+  [ "$AUTOPROMPT_LEGACY_CODEX_RECOVERY" = "$recovery" ] || return 1
+  remove_exact_legacy_codex_recovery "$root" || return 1
+  AUTOPROMPT_LEGACY_CODEX_RECOVERY=''
+}
+
 migrate_legacy_activation() {
-  local client="$1" root="$2"
-  [ -f "$root/$AUTOPROMPT_RECEIPT_NAME" ] || return 0
-  _uninstall_read_receipt "$root" || return $?
+  local client="$1"
   [ "$client" = codex ] || return 0
-  _migrate_restore_codex_config || return $?
-  _migrate_legacy_roles "$client" "$root"
+  local root="$2"
+  if [ -f "$root/$AUTOPROMPT_RECEIPT_NAME" ]; then
+    _uninstall_read_receipt "$root" || return $?
+    _migrate_restore_codex_config || return $?
+    _migrate_legacy_roles "$client" "$root"
+    return $?
+  else
+    local -a legacy_owned=()
+    legacy_codex_ownership_state "$root" legacy_owned || return 0
+  fi
+  remove_legacy_codex_skill_payload "$root"
 }
 
 prune_stale_claude_personas() {
@@ -960,8 +1141,14 @@ preseed_root() {
   AUTOPROMPT_RECEIPT_FILES=(); AUTOPROMPT_RECEIPT_EDITS=()
   AUTOPROMPT_RECEIPT_CREATED_DIRECTORIES=()
   AUTOPROMPT_CONFIGEDIT_LAST_BACKUP="none"
-  [ -f "$root/$AUTOPROMPT_RECEIPT_NAME" ] || return 0
-  _uninstall_read_receipt "$root" || return $?
+  if [ -f "$root/$AUTOPROMPT_RECEIPT_NAME" ]; then
+    _uninstall_read_receipt "$root" || return $?
+  else
+    local -a legacy_owned=()
+    legacy_codex_ownership_state "$root" legacy_owned || return 0
+    AUTOPROMPT_RECEIPT_FILES=("${legacy_owned[@]}")
+    return 0
+  fi
   local f i us=$'\037'
   for f in "${UNINSTALL_RC_FILES[@]:-}"; do
     [ -n "$f" ] && AUTOPROMPT_RECEIPT_FILES+=("$f")
@@ -988,7 +1175,9 @@ seal_root() {
 rollback_root() {
   local root="$1"
   if _idem_rollback_root_transaction; then
-    return 0
+    if restore_interrupted_legacy_codex_migration "$root"; then
+      return 0
+    fi
   fi
   printf 'Autoprompt install: rollback failed under %s; recovery state retained at %s.\n' \
     "$root" "$AUTOPROMPT_ROOT_TRANSACTION_DIR" >&2
@@ -1123,6 +1312,13 @@ validate_root_kilo_payload() {
 install_root_clients() {
   local root="$1" result_start root_failed=0 client collision_client collision_target
   shift
+  if ! restore_interrupted_legacy_codex_migration "$root"; then
+    printf 'Autoprompt install: could not restore older Codex recovery under %s.\n' \
+      "$root" >&2
+    ANY_FAIL=1
+    RETAINED_RECOVERY=1
+    return 1
+  fi
   if ! preseed_root "$root"; then
     printf 'Autoprompt install: existing receipt under %s is corrupt.\n' "$root" >&2
     ANY_FAIL=1
@@ -1162,6 +1358,13 @@ install_root_clients() {
     printf 'Autoprompt install: could not release transaction state under %s.\n' "$root" >&2
     mark_root_failed "$result_start" commit
     rollback_root "$root" || true
+    return 1
+  fi
+  if ! discard_legacy_codex_recovery "$root"; then
+    printf 'Autoprompt install: could not clear older Codex recovery under %s.\n' \
+      "$root" >&2
+    mark_root_failed "$result_start" recovery
+    RETAINED_RECOVERY=1
     return 1
   fi
   report_root_success "$result_start"
