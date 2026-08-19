@@ -44,6 +44,18 @@ mcp_registration_is_present() {
   '
 }
 
+# The activation capability. Grok Build serves user-scoped MCP servers to every
+# session, so the dispatch tool alone cannot prove a run was started here. This
+# token is minted per launch, lives only in this process tree, and is what the
+# dispatcher requires before it will admit a depth-0 conductor.
+mint_activation() {
+  token=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  if [ ${#token} -ne 32 ]; then
+    fail 'could not mint an Autoprompt activation token'
+  fi
+  printf 'ap%s' "$token"
+}
+
 version_is_supported() {
   candidate=$1
   major=${candidate%%.*}
@@ -105,16 +117,30 @@ version=$(printf '%s\n' "$version_output" |
 version_is_supported "$version" || fail "Grok Build $version is older than required 1.0.0"
 
 # Scoped to this wrapper process and the Grok Build session it starts. The
-# dispatcher reads them to resolve the installed runtime and to seal depth 0.
+# dispatcher reads them to resolve the installed runtime, to prove activation, and
+# to seal depth 0. Model and effort are run-wide: every process hop reapplies them,
+# so they are validated once here and then travel with the run.
 AUTOPROMPT_GROK_RUNTIME_ROOT=$runtime_root
 AUTOPROMPT_GROK_BIN=$grok_bin
 AUTOPROMPT_GROK_DEPTH=0
+AUTOPROMPT_GROK_ACTIVATION=$(mint_activation)
 GROK_DISABLE_AUTOUPDATER=1
-export AUTOPROMPT_GROK_RUNTIME_ROOT AUTOPROMPT_GROK_BIN AUTOPROMPT_GROK_DEPTH GROK_DISABLE_AUTOUPDATER
+export AUTOPROMPT_GROK_RUNTIME_ROOT AUTOPROMPT_GROK_BIN AUTOPROMPT_GROK_DEPTH
+export AUTOPROMPT_GROK_ACTIVATION GROK_DISABLE_AUTOUPDATER
 unset AUTOPROMPT_GROK_PERSONA AUTOPROMPT_GROK_BINDING AUTOPROMPT_GROK_NONCE 2>/dev/null || true
 
+case "${AUTOPROMPT_GROK_MODEL-}" in
+  '') ;;
+  *[!A-Za-z0-9._:/-]*) fail 'AUTOPROMPT_GROK_MODEL is not a safe model identifier' ;;
+  *) export AUTOPROMPT_GROK_MODEL ;;
+esac
+case "${AUTOPROMPT_GROK_EFFORT-}" in
+  ''|low|medium|high|xhigh) [ -z "${AUTOPROMPT_GROK_EFFORT-}" ] || export AUTOPROMPT_GROK_EFFORT ;;
+  *) fail 'AUTOPROMPT_GROK_EFFORT must be low, medium, high, or xhigh' ;;
+esac
+
 if [ "$check_only" -eq 1 ]; then
-  printf 'grok activation policy: ok profile=%s runtime=%s version=%s\n' \
+  printf 'grok activation policy: ok profile=%s runtime=%s version=%s activation=minted\n' \
     "$profile" "$runtime_root" "$version"
   exit 0
 fi

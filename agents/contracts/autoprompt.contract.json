@@ -675,7 +675,8 @@
       "target": "1.0.5",
       "official": {
         "repository": "https://github.com/xai-org/grok-build.git",
-        "sourceRevision": "9dccd1f00ec13332134a37750b64c047b14dc120"
+        "commit": "d92c5b0b8582fda358de1f97446aa74af44a464f",
+        "upstreamSourceRev": "9dccd1f00ec13332134a37750b64c047b14dc120"
       },
       "frontmatter": {
         "required": [

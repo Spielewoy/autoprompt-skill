@@ -6,7 +6,7 @@
 // Grok Build caps native subagent nesting at one level: a subagent cannot call
 // `spawn_subagent`. Autoprompt needs the full L0..L4 topology, so every child is
 // started as its own top-level Grok Build process bound to one canonical persona
-// definition through `grok -p --agent <definition>`.
+// definition through `grok --prompt-file <envelope> --agent <definition>`.
 //
 // This module owns the whole admission decision. It validates the daemon-free
 // caller identity carried in the environment, the canonical child allowlist, the
@@ -26,6 +26,9 @@ const INSTANCE_PATTERN = /^[a-z0-9][a-z0-9-]{0,23}$/
 const NONCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/
 const SHA256_PATTERN = /^[0-9a-f]{64}$/
 const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,127}$/
+const ACTIVATION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{15,127}$/
+const DEFAULT_MAX_CONCURRENT = 6
+const MAX_CONCURRENT_CEILING = 64
 const EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh'])
 const PERMISSION_MODES = Object.freeze(['default', 'acceptEdits', 'auto', 'dontAsk', 'plan'])
 const BYPASS_PERMISSION_MODE = 'bypassPermissions'
@@ -97,6 +100,21 @@ function canonicalRole(identity, topology) {
     }
   }
   throw denied(`caller identity is not an allowlisted Autoprompt persona: ${identity}`)
+}
+
+// The activation capability. Grok Build serves `~/.grok/config.toml` MCP servers to
+// every session in every project, so the dispatch tool is reachable from sessions
+// Autoprompt never started. The launcher mints this token, so an unnamed caller
+// without it is an ordinary Grok session, never the conductor.
+function activationToken(env) {
+  const token = env.AUTOPROMPT_GROK_ACTIVATION
+  if (typeof token !== 'string' || token === '') {
+    throw denied('no Autoprompt activation is present; start the run through launch-grok')
+  }
+  if (!ACTIVATION_PATTERN.test(token)) {
+    throw denied('the Autoprompt activation token is malformed')
+  }
+  return token
 }
 
 function parsedDepth(value) {
@@ -273,6 +291,7 @@ function admitDispatch(request, context) {
     throw denied('instance must be 1-24 lowercase letters, digits, or hyphens')
   }
 
+  const activation = activationToken(env)
   const parentDepth = parsedDepth(env.AUTOPROMPT_GROK_DEPTH)
   const callerRole = canonicalRole(env.AUTOPROMPT_GROK_PERSONA, topology)
   if (callerRole === null && parentDepth !== 0) {
@@ -314,6 +333,7 @@ function admitDispatch(request, context) {
     parentDepth,
     callerRole,
     binding,
+    activation,
   })
 }
 
@@ -330,8 +350,9 @@ function childCommand(admission, context) {
     frameworkBody: frameworkText(runtimeRoot, admission.framework),
   })
   const promptFile = context.writePrompt(envelope)
+  // `-p/--single` conflicts with `--prompt-file` in Grok Build's own argument
+  // parser, and a prompt file alone already selects headless mode.
   const args = [
-    '-p',
     '--prompt-file', promptFile,
     '--verbatim',
     '--agent', definition,
@@ -340,6 +361,8 @@ function childCommand(admission, context) {
     '--no-auto-update',
     '--permission-mode', permissionMode(env),
   ]
+  // Each hop is a fresh top-level process, so the run model and effort have to be
+  // reapplied on the command line and carried forward in the sealed environment.
   const model = optionalModel(context.request.model || env.AUTOPROMPT_GROK_MODEL, 'model')
   if (model !== null) args.push('--model', model)
   const effort = optionalEffort(context.request.effort || env.AUTOPROMPT_GROK_EFFORT)
@@ -362,8 +385,10 @@ function childCommand(admission, context) {
     AUTOPROMPT_GROK_FRAMEWORK: admission.framework === null ? 'none' : admission.framework,
     GROK_DISABLE_AUTOUPDATER: '1',
   }
-  delete childEnv.AUTOPROMPT_GROK_MODEL
-  delete childEnv.AUTOPROMPT_GROK_EFFORT
+  if (model === null) delete childEnv.AUTOPROMPT_GROK_MODEL
+  else childEnv.AUTOPROMPT_GROK_MODEL = model
+  if (effort === null) delete childEnv.AUTOPROMPT_GROK_EFFORT
+  else childEnv.AUTOPROMPT_GROK_EFFORT = effort
 
   return Object.freeze({
     command: env.AUTOPROMPT_GROK_BIN || 'grok',
@@ -386,8 +411,74 @@ function writePromptFile(envelope) {
   return promptFile
 }
 
-// Public entry point: admit, seal, and run one child Grok Build process.
-function dispatch(request, options = {}) {
+// Remove the envelope, then the directory only when it is left empty. A recursive
+// delete of the parent would destroy a caller-supplied directory that holds more
+// than this one prompt.
+function cleanupPrompt(promptFile) {
+  try {
+    fs.rmSync(promptFile, { force: true })
+  } catch {}
+  try {
+    fs.rmdirSync(path.dirname(promptFile))
+  } catch {}
+}
+
+// The live-child ceiling. `tokensaver` is the doctrine default of six; `wide` and
+// `custom max_subs=N` raise it through the environment. It bounds concurrency, it
+// never serializes a ready group down to one child at a time.
+function maxConcurrent(env) {
+  const requested = env.AUTOPROMPT_GROK_MAX_SUBS
+  if (requested === undefined || requested === '') return DEFAULT_MAX_CONCURRENT
+  if (!/^[1-9][0-9]*$/.test(String(requested))) {
+    throw denied('AUTOPROMPT_GROK_MAX_SUBS must be a positive integer')
+  }
+  const value = Number(requested)
+  if (value > MAX_CONCURRENT_CEILING) {
+    throw denied(`AUTOPROMPT_GROK_MAX_SUBS may not exceed ${MAX_CONCURRENT_CEILING}`)
+  }
+  return value
+}
+
+// One child, started without blocking: several ready siblings must be able to run
+// at the same time, which a synchronous spawn could never allow.
+function startChild(plan, options = {}) {
+  const spawn = options.spawn || childProcess.spawn
+  return new Promise((resolve, reject) => {
+    let child
+    try {
+      child = spawn(plan.command, [...plan.args], {
+        cwd: options.cwd || process.cwd(),
+        env: plan.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (error) {
+      cleanupPrompt(plan.promptFile)
+      reject(new DispatchError('AUTOPROMPT_DISPATCH_LAUNCH', `could not start ${plan.command}: ${error.message}`))
+      return
+    }
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.setEncoding('utf8')
+    child.stderr?.setEncoding('utf8')
+    child.stdout?.on('data', chunk => { stdout += chunk })
+    child.stderr?.on('data', chunk => { stderr += chunk })
+    child.on('error', error => {
+      cleanupPrompt(plan.promptFile)
+      reject(new DispatchError('AUTOPROMPT_DISPATCH_LAUNCH', `could not start ${plan.command}: ${error.message}`))
+    })
+    child.on('close', (code, signal) => {
+      cleanupPrompt(plan.promptFile)
+      resolve({
+        status: code === null || code === undefined ? (signal ? 1 : 0) : code,
+        signal: signal || null,
+        stdout,
+        stderr,
+      })
+    })
+  })
+}
+
+function planDispatch(request, options = {}) {
   const env = options.env || process.env
   const runtimeRoot = options.runtimeRoot || defaultRuntimeRoot(env)
   const topology = options.topology || readTopology(path.join(runtimeRoot, 'workflow'))
@@ -398,27 +489,67 @@ function dispatch(request, options = {}) {
     request,
     writePrompt: options.writePrompt || writePromptFile,
   })
-  if (options.dryRun) return { admission, plan, status: null, stdout: '', stderr: '' }
-  const spawn = options.spawn || childProcess.spawnSync
-  const result = spawn(plan.command, [...plan.args], {
-    cwd: options.cwd || process.cwd(),
-    env: plan.env,
-    encoding: 'utf8',
-    maxBuffer: 64 * 1024 * 1024,
-  })
-  if (result.error) {
-    throw new DispatchError('AUTOPROMPT_DISPATCH_LAUNCH', `could not start ${plan.command}: ${result.error.message}`)
+  return { admission, plan }
+}
+
+// Public entry point: admit, seal, and run one child Grok Build process.
+async function dispatch(request, options = {}) {
+  const { admission, plan } = planDispatch(request, options)
+  if (options.dryRun) {
+    return { admission, plan, status: null, signal: null, stdout: '', stderr: '' }
   }
-  try {
-    fs.rmSync(path.dirname(plan.promptFile), { recursive: true, force: true })
-  } catch {}
-  return {
-    admission,
-    plan,
-    status: result.status === null || result.status === undefined ? 1 : result.status,
-    stdout: result.stdout || '',
-    stderr: result.stderr || '',
+  const result = await startChild(plan, options)
+  return { admission, plan, ...result }
+}
+
+// Spawn-all-then-collect for one ready group: every job is admitted before any
+// child starts, so a denied edge in the group cancels the whole group instead of
+// leaving half a fleet running.
+async function dispatchBatch(requests, options = {}) {
+  if (!Array.isArray(requests) || requests.length === 0) {
+    throw usage('a dispatch group needs at least one job')
   }
+  const env = options.env || process.env
+  const limit = maxConcurrent(env)
+  const planned = requests.map(request => ({ request, ...planDispatch(request, options) }))
+  if (options.dryRun) {
+    return planned.map(entry => ({
+      admission: entry.admission,
+      plan: entry.plan,
+      status: null,
+      signal: null,
+      stdout: '',
+      stderr: '',
+    }))
+  }
+
+  const results = new Array(planned.length)
+  let next = 0
+  const worker = async () => {
+    while (next < planned.length) {
+      const index = next
+      next += 1
+      const entry = planned[index]
+      try {
+        const result = await startChild(entry.plan, options)
+        results[index] = { admission: entry.admission, plan: entry.plan, ...result }
+      } catch (error) {
+        results[index] = {
+          admission: entry.admission,
+          plan: entry.plan,
+          status: 1,
+          signal: null,
+          stdout: '',
+          stderr: error.message,
+          error,
+        }
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(limit, planned.length) }, () => worker()),
+  )
+  return results
 }
 
 const FLAGS = Object.freeze({
@@ -465,7 +596,7 @@ function parseArgs(argv) {
   return parsed
 }
 
-function run(argv, io = process, env = process.env) {
+async function run(argv, io = process, env = process.env) {
   let parsed
   try {
     parsed = parseArgs(argv)
@@ -474,7 +605,7 @@ function run(argv, io = process, env = process.env) {
     return 2
   }
   try {
-    const result = dispatch(parsed, {
+    const result = await dispatch(parsed, {
       env,
       runtimeRoot: parsed.runtimeRoot || defaultRuntimeRoot(env),
       dryRun: parsed.dryRun,
@@ -487,9 +618,7 @@ function run(argv, io = process, env = process.env) {
         command: result.plan.command,
         args: result.plan.args,
       })}\n`)
-      try {
-        fs.rmSync(path.dirname(result.plan.promptFile), { recursive: true, force: true })
-      } catch {}
+      cleanupPrompt(result.plan.promptFile)
       return 0
     }
     if (result.stdout) io.stdout.write(result.stdout)
@@ -504,7 +633,9 @@ function run(argv, io = process, env = process.env) {
   }
 }
 
-if (require.main === module) process.exitCode = run(process.argv.slice(2))
+if (require.main === module) {
+  run(process.argv.slice(2)).then(code => { process.exitCode = code })
+}
 
 module.exports = {
   DispatchError,
@@ -514,6 +645,10 @@ module.exports = {
   buildEnvelope,
   childCommand,
   dispatch,
+  dispatchBatch,
+  maxConcurrent,
+  planDispatch,
+  startChild,
   missionBinding,
   parseArgs,
   readTopology,

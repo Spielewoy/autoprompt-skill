@@ -23,6 +23,7 @@ const server = require(path.join(RUNTIME_ROOT, 'workflow', 'grok-dispatch-server
 const grokConfig = require(path.join(ROOT, 'scripts', 'install', 'grok-config.cjs'))
 
 const NONCE = 'RUN-GROK-0001'
+const ACTIVATION = 'ap0123456789abcdef0123456789abcdef'
 
 function read(relativePath) {
   return fs.readFileSync(path.join(ROOT, relativePath), 'utf8').replace(/\r\n/g, '\n')
@@ -49,26 +50,35 @@ function sandbox(prefix = 'autoprompt-grok-dispatch-') {
 }
 
 function baseEnv(overrides = {}) {
-  return { AUTOPROMPT_GROK_BIN: 'grok-under-test', ...overrides }
+  return {
+    AUTOPROMPT_GROK_BIN: 'grok-under-test',
+    AUTOPROMPT_GROK_ACTIVATION: ACTIVATION,
+    ...overrides,
+  }
 }
 
-function dispatch(request, env, options = {}) {
-  return dispatcher.dispatch(request, {
+function dispatchOptions(env, options = {}) {
+  return {
     env,
     runtimeRoot: RUNTIME_ROOT,
     dryRun: true,
     writePrompt: envelope => {
-      const target = path.join(options.promptRoot || os.tmpdir(), `envelope-${crypto.randomUUID()}.md`)
+      const directory = fs.mkdtempSync(path.join(options.promptRoot || os.tmpdir(), 'autoprompt-envelope-'))
+      const target = path.join(directory, 'dispatch-envelope.md')
       fs.writeFileSync(target, envelope)
       return target
     },
     ...options,
-  })
+  }
 }
 
-function denial(request, env, options = {}) {
+function dispatch(request, env, options = {}) {
+  return dispatcher.dispatch(request, dispatchOptions(env, options))
+}
+
+async function denial(request, env, options = {}) {
   try {
-    dispatch(request, env, options)
+    await dispatch(request, env, options)
   } catch (error) {
     assert.ok(error instanceof dispatcher.DispatchError, `unexpected error type: ${error}`)
     return error
@@ -81,7 +91,18 @@ test('the Grok Build contract records the source-checked runtime it targets', ()
   assert.equal(provider.status, 'supported')
   assert.equal(provider.target, '1.0.5')
   assert.equal(provider.official.repository, 'https://github.com/xai-org/grok-build.git')
-  assert.match(provider.official.sourceRevision, /^[0-9a-f]{40}$/)
+  // The pinned commit must be the upstream mirror's own commit, not the internal
+  // revision the mirror declares in SOURCE_REV: only the former can be fetched.
+  assert.match(provider.official.commit, /^[0-9a-f]{40}$/)
+  assert.match(provider.official.upstreamSourceRev, /^[0-9a-f]{40}$/)
+  assert.notEqual(provider.official.commit, provider.official.upstreamSourceRev)
+  assert.equal(Object.hasOwn(provider.official, 'sourceRevision'), false)
+  const readme = read('agents/grok/README.md')
+  assert.ok(readme.includes(provider.official.commit.slice(0, 12)), 'the package names its pinned commit')
+  assert.ok(
+    read('docs/faq/which-coding-agents-are-supported.md').includes(provider.official.commit.slice(0, 12)),
+    'the support notes name the same pinned commit',
+  )
   assert.equal(provider.profile.model, 'inherit')
   assert.equal(provider.runtimePrerequisites.maxDepth, 4)
   assert.ok(provider.capabilities.includes('sealed-headless-dispatch'))
@@ -180,17 +201,22 @@ test('the activation profile pins exactly what the launcher and doctor verify', 
   assert.match(profile, /^frameworks = 18$/m)
 })
 
-test('root dispatch is limited to the canonical entry roles', () => {
+test('root dispatch requires a launcher activation and the canonical entry roles', async () => {
   const { mission } = sandbox()
-  const plan = dispatch(
+  const plan = await dispatch(
     { persona: 'ap-scope-coordinator', task: 'produce the roadmap', framework: 'plan-scope', mission, nonce: NONCE },
     baseEnv(),
   )
   assert.equal(plan.admission.parentDepth, 0)
   assert.equal(plan.plan.command, 'grok-under-test')
-  assert.deepEqual(plan.plan.args.slice(0, 3), ['-p', '--prompt-file', plan.plan.promptFile])
+  // `-p/--single` conflicts with `--prompt-file` in Grok Build's argument parser,
+  // so the prompt file has to stand alone or the child dies before it starts.
+  assert.deepEqual(plan.plan.args.slice(0, 2), ['--prompt-file', plan.plan.promptFile])
+  assert.equal(plan.plan.args.includes('-p'), false)
+  assert.equal(plan.plan.args.includes('--single'), false)
   assert.ok(plan.plan.args.includes('--no-subagents'))
   assert.ok(plan.plan.args.includes('--verbatim'))
+  assert.equal(plan.plan.env.AUTOPROMPT_GROK_ACTIVATION, ACTIVATION)
   assert.deepEqual(
     plan.plan.args.slice(plan.plan.args.indexOf('--permission-mode')),
     ['--permission-mode', 'default'],
@@ -200,25 +226,55 @@ test('root dispatch is limited to the canonical entry roles', () => {
   assert.equal(plan.plan.env.GROK_DISABLE_AUTOUPDATER, '1')
 
   assert.equal(
-    denial({ persona: 'ap-implementer', task: 'build', mission, nonce: NONCE }, baseEnv()).code,
+    (await denial({ persona: 'ap-implementer', task: 'build', mission, nonce: NONCE }, baseEnv())).code,
     'AUTOPROMPT_DISPATCH_DENIED',
   )
   assert.match(
-    denial({ persona: 'ap-not-a-role', task: 'build', mission, nonce: NONCE }, baseEnv()).message,
+    (await denial({ persona: 'ap-not-a-role', task: 'build', mission, nonce: NONCE }, baseEnv())).message,
     /unknown Autoprompt persona/,
   )
   assert.match(
-    denial(
+    (await denial(
       { persona: 'ap-scope-coordinator', task: 'build', framework: 'not-a-framework', mission, nonce: NONCE },
       baseEnv(),
-    ).message,
+    )).message,
     /unknown Autoprompt framework/,
   )
 })
 
-test('child edges, terminal roles, and the depth ceiling are enforced against the caller identity', () => {
+// Grok Build serves user-scoped MCP servers to every session in every project, so
+// an unnamed caller with no activation is an ordinary session, never the conductor.
+test('an unactivated session cannot enter the run as the conductor', async () => {
   const { mission } = sandbox()
-  const admitted = dispatch(
+  const request = { persona: 'ap-scope-coordinator', task: 'scope it', mission, nonce: NONCE }
+  const unactivated = { AUTOPROMPT_GROK_BIN: 'grok-under-test' }
+  assert.match(
+    (await denial(request, unactivated)).message,
+    /no Autoprompt activation is present/,
+  )
+  assert.match(
+    (await denial(request, baseEnv({ AUTOPROMPT_GROK_ACTIVATION: 'too-short' }))).message,
+    /activation token is malformed/,
+  )
+  assert.match(
+    (await denial({ persona: 'ap-planner', task: 'plan', mission, nonce: NONCE }, {
+      AUTOPROMPT_GROK_BIN: 'grok-under-test',
+      AUTOPROMPT_GROK_PERSONA: 'ap-manager',
+      AUTOPROMPT_GROK_DEPTH: '2',
+    })).message,
+    /no Autoprompt activation is present/,
+    'a persona identity alone is not an activation',
+  )
+
+  const launcher = read('agents/grok/workflow/launch-grok.sh')
+  assert.match(launcher, /AUTOPROMPT_GROK_ACTIVATION=\$\(mint_activation\)/)
+  assert.match(launcher, /export AUTOPROMPT_GROK_ACTIVATION/)
+  assert.match(read('agents/grok/workflow/launch-grok.ps1'), /New-ActivationToken/)
+})
+
+test('child edges, terminal roles, and the depth ceiling are enforced against the caller identity', async () => {
+  const { mission } = sandbox()
+  const admitted = await dispatch(
     { persona: 'ap-planner', task: 'plan the lane', mission, nonce: NONCE },
     baseEnv({
       AUTOPROMPT_GROK_PERSONA: 'ap-manager--lane-one',
@@ -229,50 +285,50 @@ test('child edges, terminal roles, and the depth ceiling are enforced against th
   assert.equal(admitted.plan.env.AUTOPROMPT_GROK_DEPTH, '3')
 
   assert.match(
-    denial({ persona: 'ap-planner', task: 'plan', mission, nonce: NONCE }, baseEnv({
+    (await denial({ persona: 'ap-planner', task: 'plan', mission, nonce: NONCE }, baseEnv({
       AUTOPROMPT_GROK_PERSONA: 'ap-juror',
       AUTOPROMPT_GROK_DEPTH: '3',
-    })).message,
+    }))).message,
     /terminal role ap-juror cannot dispatch children/,
   )
   assert.match(
-    denial({ persona: 'ap-scope-coordinator', task: 'scope', mission, nonce: NONCE }, baseEnv({
+    (await denial({ persona: 'ap-scope-coordinator', task: 'scope', mission, nonce: NONCE }, baseEnv({
       AUTOPROMPT_GROK_PERSONA: 'ap-scope-coordinator',
       AUTOPROMPT_GROK_DEPTH: '1',
-    })).message,
+    }))).message,
     /is not allowlisted/,
   )
   assert.match(
-    denial({ persona: 'ap-juror', task: 'judge', mission, nonce: NONCE }, baseEnv({
+    (await denial({ persona: 'ap-juror', task: 'judge', mission, nonce: NONCE }, baseEnv({
       AUTOPROMPT_GROK_PERSONA: 'ap-implementer',
       AUTOPROMPT_GROK_DEPTH: '4',
-    })).message,
+    }))).message,
     /depth limit reached at depth 4/,
   )
   assert.match(
-    denial({ persona: 'ap-planner', task: 'plan', mission, nonce: NONCE }, baseEnv({
+    (await denial({ persona: 'ap-planner', task: 'plan', mission, nonce: NONCE }, baseEnv({
       AUTOPROMPT_GROK_PERSONA: 'not-an-autoprompt-role',
       AUTOPROMPT_GROK_DEPTH: '1',
-    })).message,
+    }))).message,
     /not an allowlisted Autoprompt persona/,
   )
   assert.match(
-    denial({ persona: 'ap-planner', task: 'plan', mission, nonce: NONCE }, baseEnv({
+    (await denial({ persona: 'ap-planner', task: 'plan', mission, nonce: NONCE }, baseEnv({
       AUTOPROMPT_GROK_PERSONA: 'ap-manager',
       AUTOPROMPT_GROK_DEPTH: '0',
-    })).message,
+    }))).message,
     /reserved for the conductor/,
   )
   assert.match(
-    denial({ persona: 'ap-planner', task: 'plan', mission, nonce: NONCE, instance: 'Not Valid' }, baseEnv({
+    (await denial({ persona: 'ap-planner', task: 'plan', mission, nonce: NONCE, instance: 'Not Valid' }, baseEnv({
       AUTOPROMPT_GROK_PERSONA: 'ap-manager',
       AUTOPROMPT_GROK_DEPTH: '2',
-    })).message,
+    }))).message,
     /instance must be/,
   )
 })
 
-test('the sealed envelope binds the exact prompt ledger and refuses drift', () => {
+test('the sealed envelope binds the exact prompt ledger and refuses drift', async () => {
   const { mission } = sandbox()
   const binding = dispatcher.missionBinding(mission, NONCE)
   const inherited = JSON.stringify({
@@ -281,7 +337,7 @@ test('the sealed envelope binds the exact prompt ledger and refuses drift', () =
     path: binding.path,
     sha256: binding.sha256,
   })
-  const plan = dispatch(
+  const plan = await dispatch(
     { persona: 'ap-implementer', task: 'build the lane', framework: 'backend-build' },
     baseEnv({
       AUTOPROMPT_GROK_PERSONA: 'ap-feature-coordinator',
@@ -302,79 +358,174 @@ test('the sealed envelope binds the exact prompt ledger and refuses drift', () =
 
   fs.appendFileSync(mission, 'a later edit\n')
   assert.match(
-    denial({ persona: 'ap-implementer', task: 'build' }, baseEnv({
+    (await denial({ persona: 'ap-implementer', task: 'build' }, baseEnv({
       AUTOPROMPT_GROK_PERSONA: 'ap-feature-coordinator',
       AUTOPROMPT_GROK_DEPTH: '1',
       AUTOPROMPT_GROK_BINDING: inherited,
-    })).message,
+    }))).message,
     /no longer matches the exact prompt ledger/,
   )
 })
 
-test('permission mode, model, and effort are operator inputs with fail-closed defaults', () => {
+test('permission mode is an operator input with fail-closed defaults', async () => {
   const { mission } = sandbox()
   const request = { persona: 'ap-scope-coordinator', task: 'scope it', mission, nonce: NONCE }
-  const relaxed = dispatch(request, baseEnv({ AUTOPROMPT_GROK_PERMISSION_MODE: 'acceptEdits' }))
+  const relaxed = await dispatch(request, baseEnv({ AUTOPROMPT_GROK_PERMISSION_MODE: 'acceptEdits' }))
   assert.ok(relaxed.plan.args.includes('acceptEdits'))
 
   assert.match(
-    denial(request, baseEnv({ AUTOPROMPT_GROK_PERMISSION_MODE: 'bypassPermissions' })).message,
+    (await denial(request, baseEnv({ AUTOPROMPT_GROK_PERMISSION_MODE: 'bypassPermissions' }))).message,
     /AUTOPROMPT_GROK_ALLOW_BYPASS=1/,
   )
-  const bypass = dispatch(request, baseEnv({
+  const bypass = await dispatch(request, baseEnv({
     AUTOPROMPT_GROK_PERMISSION_MODE: 'bypassPermissions',
     AUTOPROMPT_GROK_ALLOW_BYPASS: '1',
   }))
   assert.ok(bypass.plan.args.includes('bypassPermissions'))
   assert.match(
-    denial(request, baseEnv({ AUTOPROMPT_GROK_PERMISSION_MODE: 'anything-else' })).message,
+    (await denial(request, baseEnv({ AUTOPROMPT_GROK_PERMISSION_MODE: 'anything-else' }))).message,
     /unsupported permission mode/,
   )
+})
 
-  const routed = dispatch(request, baseEnv({
+// Each hop is a fresh top-level process: nothing is inherited unless the dispatcher
+// reapplies it on the command line and carries it forward in the sealed environment.
+test('the run model and effort survive every process hop', async () => {
+  const { mission } = sandbox()
+  const request = { persona: 'ap-scope-coordinator', task: 'scope it', mission, nonce: NONCE }
+  const routed = await dispatch(request, baseEnv({
     AUTOPROMPT_GROK_MODEL: 'grok-build',
     AUTOPROMPT_GROK_EFFORT: 'high',
   }))
   assert.deepEqual(routed.plan.args.slice(-4), ['--model', 'grok-build', '--reasoning-effort', 'high'])
-  assert.equal(routed.plan.env.AUTOPROMPT_GROK_MODEL, undefined, 'a child never re-applies the run model twice')
+  assert.equal(routed.plan.env.AUTOPROMPT_GROK_MODEL, 'grok-build')
+  assert.equal(routed.plan.env.AUTOPROMPT_GROK_EFFORT, 'high')
+
+  // The grandchild hop reads the child environment, so the same model must reappear.
+  const grandchild = await dispatch(
+    { persona: 'ap-scoper', task: 'scout the surface', mission, nonce: NONCE },
+    { ...routed.plan.env, AUTOPROMPT_GROK_BIN: 'grok-under-test' },
+  )
+  assert.deepEqual(grandchild.plan.args.slice(-4), ['--model', 'grok-build', '--reasoning-effort', 'high'])
+  assert.equal(grandchild.plan.env.AUTOPROMPT_GROK_MODEL, 'grok-build')
+
+  const plain = await dispatch(request, baseEnv())
+  assert.equal(plain.plan.args.includes('--model'), false)
+  assert.equal(plain.plan.env.AUTOPROMPT_GROK_MODEL, undefined)
   assert.match(
-    denial(request, baseEnv({ AUTOPROMPT_GROK_EFFORT: 'maximum' })).message,
+    (await denial(request, baseEnv({ AUTOPROMPT_GROK_EFFORT: 'maximum' }))).message,
     /reasoning effort must be one of/,
   )
   assert.match(
-    denial(request, baseEnv({ AUTOPROMPT_GROK_MODEL: 'grok build; rm -rf /' })).message,
+    (await denial(request, baseEnv({ AUTOPROMPT_GROK_MODEL: 'grok build; rm -rf /' }))).message,
     /not a safe model identifier/,
   )
 })
 
-test('the MCP server exposes one dispatch tool and reports denials as tool errors', () => {
+// The doctrine is spawn-all-then-collect: a ready group must start together, and a
+// blocking dispatcher would silently serialize reviewers, verifiers, and lanes.
+test('a ready group is admitted together, runs concurrently, and is collected together', async () => {
   const { mission } = sandbox()
-  const initialize = server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
+  const env = baseEnv({
+    AUTOPROMPT_GROK_PERSONA: 'ap-feature-coordinator',
+    AUTOPROMPT_GROK_DEPTH: '1',
+  })
+  const jobs = ['ap-implementer', 'ap-reviewer', 'ap-verifier'].map(persona => ({
+    persona,
+    task: `run ${persona}`,
+    mission,
+    nonce: NONCE,
+  }))
+
+  let live = 0
+  let peak = 0
+  const spawn = () => {
+    live += 1
+    peak = Math.max(peak, live)
+    const listeners = {}
+    const stream = { setEncoding() {}, on() {} }
+    setTimeout(() => {
+      live -= 1
+      listeners.close?.(0, null)
+    }, 20)
+    return {
+      stdout: stream,
+      stderr: stream,
+      on(event, handler) { listeners[event] = handler },
+    }
+  }
+
+  const started = Date.now()
+  const results = await dispatcher.dispatchBatch(jobs, dispatchOptions(env, { dryRun: false, spawn }))
+  assert.equal(results.length, 3)
+  assert.deepEqual(results.map(result => result.admission.persona), [
+    'ap-implementer', 'ap-reviewer', 'ap-verifier',
+  ])
+  assert.equal(peak, 3, 'the ready group ran concurrently rather than one child at a time')
+  assert.ok(Date.now() - started < 60, 'a serialized group would take at least three intervals')
+
+  let attempted = 0
+  const countingSpawn = (...args) => {
+    attempted += 1
+    return spawn(...args)
+  }
+  await assert.rejects(
+    dispatcher.dispatchBatch(
+      [...jobs, { persona: 'ap-scope-coordinator', task: 'not allowlisted here', mission, nonce: NONCE }],
+      dispatchOptions(env, { dryRun: false, spawn: countingSpawn }),
+    ),
+    /is not allowlisted/,
+  )
+  assert.equal(attempted, 0, 'one denied job cancels the whole group before anything starts')
+
+  assert.equal(dispatcher.maxConcurrent({}), 6, 'tokensaver is the default live-child ceiling')
+  assert.equal(dispatcher.maxConcurrent({ AUTOPROMPT_GROK_MAX_SUBS: '12' }), 12)
+  assert.throws(() => dispatcher.maxConcurrent({ AUTOPROMPT_GROK_MAX_SUBS: '0' }), /positive integer/)
+  assert.throws(() => dispatcher.maxConcurrent({ AUTOPROMPT_GROK_MAX_SUBS: '999' }), /may not exceed/)
+})
+
+test('the MCP server exposes one dispatch tool and reports denials as tool errors', async () => {
+  const { mission } = sandbox()
+  const initialize = await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
   assert.equal(initialize.result.serverInfo.name, 'autoprompt')
   assert.equal(initialize.result.protocolVersion, server.PROTOCOL_VERSION)
 
-  const tools = server.handle({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
+  const tools = await server.handle({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
   assert.equal(tools.result.tools.length, 1)
+  const schema = tools.result.tools[0].inputSchema
   assert.equal(tools.result.tools[0].name, 'dispatch')
-  assert.deepEqual(tools.result.tools[0].inputSchema.required, ['persona', 'task'])
+  assert.deepEqual(schema.properties.jobs.items.required, ['persona', 'task'])
+  // Casting is inherited-only, so there is deliberately no per-role model selector.
+  assert.equal(Object.hasOwn(schema.properties, 'model'), false)
+  assert.equal(Object.hasOwn(schema.properties, 'effort'), false)
 
-  assert.equal(server.handle({ jsonrpc: '2.0', method: 'notifications/initialized' }), null)
+  assert.equal(await server.handle({ jsonrpc: '2.0', method: 'notifications/initialized' }), null)
   assert.match(
-    server.handle({
+    (await server.handle({
       jsonrpc: '2.0',
       id: 4,
       method: 'tools/call',
       params: { name: 'not-dispatch', arguments: {} },
-    }).error.message,
+    })).error.message,
     /unknown tool/,
   )
 
   const calls = []
   const spawn = (command, args, options) => {
     calls.push({ command, args, env: options.env })
-    return { status: 0, stdout: '{"result":"ok"}\n', stderr: '' }
+    const listeners = {}
+    const stream = { setEncoding() {}, on(event, handler) { listeners[`out:${event}`] = handler } }
+    setImmediate(() => {
+      listeners['out:data']?.('{"result":"ok"}\n')
+      listeners.close?.(0, null)
+    })
+    return {
+      stdout: stream,
+      stderr: { setEncoding() {}, on() {} },
+      on(event, handler) { listeners[event] = handler },
+    }
   }
-  const accepted = server.callDispatch(
+  const accepted = await server.callDispatch(
     { persona: 'ap-sweep-coordinator', task: 'converge the run', mission, nonce: NONCE },
     { env: baseEnv(), runtimeRoot: RUNTIME_ROOT, spawn },
   )
@@ -382,14 +533,28 @@ test('the MCP server exposes one dispatch tool and reports denials as tool error
   assert.match(accepted.content[0].text, /^persona=ap-sweep-coordinator framework=none depth=1 exit=0/)
   assert.equal(calls.length, 1)
   assert.equal(calls[0].env.AUTOPROMPT_GROK_PERSONA, 'ap-sweep-coordinator')
+  assert.equal(calls[0].args.includes('-p'), false)
 
-  const refused = server.callDispatch(
+  const group = await server.callDispatch(
+    {
+      jobs: [
+        { persona: 'ap-scope-coordinator', task: 'scope', mission, nonce: NONCE },
+        { persona: 'ap-feature-coordinator', task: 'build', mission, nonce: NONCE },
+      ],
+    },
+    { env: baseEnv(), runtimeRoot: RUNTIME_ROOT, spawn },
+  )
+  assert.equal(group.isError, false)
+  assert.match(group.content[0].text, /persona=ap-scope-coordinator[\s\S]*persona=ap-feature-coordinator/)
+  assert.equal(calls.length, 3)
+
+  const refused = await server.callDispatch(
     { persona: 'ap-janitor', task: 'clean up', mission, nonce: NONCE },
     { env: baseEnv(), runtimeRoot: RUNTIME_ROOT, spawn },
   )
   assert.equal(refused.isError, true)
   assert.match(refused.content[0].text, /AUTOPROMPT_DISPATCH_DENIED/)
-  assert.equal(calls.length, 1, 'a denied dispatch never starts a child process')
+  assert.equal(calls.length, 3, 'a denied dispatch never starts a child process')
 })
 
 test('the MCP registration edit is additive, idempotent, and refuses foreign sections', () => {

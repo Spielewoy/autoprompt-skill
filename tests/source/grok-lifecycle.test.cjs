@@ -188,6 +188,34 @@ test('POSIX Grok lifecycle installs, verifies, repairs, and uninstalls without t
     })
     assert.equal(launcher.status, 0, `${launcher.stdout}\n${launcher.stderr}`)
     assert.match(launcher.stdout, /grok activation policy: ok/)
+    assert.match(launcher.stdout, /activation=minted/)
+
+    // The installed dispatcher is reachable from any Grok session, so it must refuse
+    // an unactivated caller and admit only a launcher-minted one.
+    const dispatcher = path.join(target.runtime, 'workflow', 'grok-dispatch.js')
+    const mission = path.join(sandbox, 'PROMPTS.txt')
+    fs.writeFileSync(mission, 'the exact mission ledger\n')
+    const dispatchArgs = [
+      dispatcher,
+      '--persona', 'ap-scope-coordinator',
+      '--task', 'produce the roadmap',
+      '--mission', mission,
+      '--nonce', 'RUN-GROK-LIFECYCLE',
+      '--dry-run',
+    ]
+    const unactivated = run(process.execPath, dispatchArgs, { env: context.env })
+    assert.equal(unactivated.status, 3, unactivated.stdout)
+    assert.match(unactivated.stderr, /no Autoprompt activation is present/)
+
+    const activated = run(process.execPath, dispatchArgs, {
+      env: { ...context.env, AUTOPROMPT_GROK_ACTIVATION: 'ap0123456789abcdef0123456789abcdef' },
+    })
+    assert.equal(activated.status, 0, `${activated.stdout}\n${activated.stderr}`)
+    const plan = JSON.parse(activated.stdout)
+    assert.equal(plan.persona, 'ap-scope-coordinator')
+    assert.equal(plan.depth, 1)
+    assert.equal(plan.args.includes('-p'), false, 'the retired -p flag conflicts with --prompt-file')
+    assert.equal(plan.args[0], '--prompt-file')
 
     const configBefore = fs.readFileSync(target.config)
     const again = lifecycle(bash, 'install', 'grok', context)

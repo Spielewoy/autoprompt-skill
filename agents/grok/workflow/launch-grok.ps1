@@ -52,6 +52,16 @@ function Test-McpRegistration {
     return ($hasCommand -and $hasArgument)
 }
 
+# The activation capability. Grok Build serves user-scoped MCP servers to every
+# session, so the dispatch tool alone cannot prove a run was started here. This
+# token is minted per launch, lives only in this process tree, and is what the
+# dispatcher requires before it will admit a depth-0 conductor.
+function New-ActivationToken {
+    $bytes = [byte[]]::new(16)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    return ('ap' + -join ($bytes | ForEach-Object { $_.ToString('x2') }))
+}
+
 function Test-SupportedVersion {
     param([string]$Version)
     if ($Version -notmatch '^(\d+)\.(\d+)\.(\d+)$') { return $false }
@@ -127,17 +137,29 @@ if (-not (Test-SupportedVersion -Version $version)) {
 }
 
 # Scoped to this wrapper process and the Grok Build session it starts. The
-# dispatcher reads them to resolve the installed runtime and to seal depth 0.
+# dispatcher reads them to resolve the installed runtime, to prove activation, and
+# to seal depth 0. Model and effort are run-wide: every process hop reapplies them,
+# so they are validated once here and then travel with the run.
 $env:AUTOPROMPT_GROK_RUNTIME_ROOT = $runtimeRoot
 $env:AUTOPROMPT_GROK_BIN = $grokPath
 $env:AUTOPROMPT_GROK_DEPTH = '0'
+$env:AUTOPROMPT_GROK_ACTIVATION = New-ActivationToken
 $env:GROK_DISABLE_AUTOUPDATER = '1'
 Remove-Item Env:AUTOPROMPT_GROK_PERSONA -ErrorAction SilentlyContinue
 Remove-Item Env:AUTOPROMPT_GROK_BINDING -ErrorAction SilentlyContinue
 Remove-Item Env:AUTOPROMPT_GROK_NONCE -ErrorAction SilentlyContinue
 
+if ($env:AUTOPROMPT_GROK_MODEL -and
+    $env:AUTOPROMPT_GROK_MODEL -notmatch '^[A-Za-z0-9][A-Za-z0-9._:/-]*$') {
+    Stop-Activation 'AUTOPROMPT_GROK_MODEL is not a safe model identifier'
+}
+if ($env:AUTOPROMPT_GROK_EFFORT -and
+    $env:AUTOPROMPT_GROK_EFFORT -cnotin @('low', 'medium', 'high', 'xhigh')) {
+    Stop-Activation 'AUTOPROMPT_GROK_EFFORT must be low, medium, high, or xhigh'
+}
+
 if ($checkOnly) {
-    [Console]::Out.WriteLine("grok activation policy: ok profile=$profilePath runtime=$runtimeRoot version=$version")
+    [Console]::Out.WriteLine("grok activation policy: ok profile=$profilePath runtime=$runtimeRoot version=$version activation=minted")
     exit 0
 }
 

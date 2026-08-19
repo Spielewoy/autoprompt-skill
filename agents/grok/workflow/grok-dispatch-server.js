@@ -30,56 +30,66 @@ function serverVersion() {
   }
 }
 
+const JOB_PROPERTIES = Object.freeze({
+  persona: {
+    type: 'string',
+    description: 'Canonical ap-* persona to run, for example ap-scope-coordinator.',
+  },
+  task: {
+    type: 'string',
+    description: 'The bounded task brief. Pointers and acceptance criteria only, never the mission text.',
+  },
+  framework: {
+    type: 'string',
+    description: 'Optional allowlisted framework id sealed into the child brief.',
+  },
+  instance: {
+    type: 'string',
+    description: 'Optional sibling instance suffix: 1-24 lowercase letters, digits, or hyphens.',
+  },
+  mission: {
+    type: 'string',
+    description: 'Absolute path to PROMPTS.txt. Optional once the run binding is inherited.',
+  },
+  nonce: {
+    type: 'string',
+    description: 'Run nonce. Optional once the run binding is inherited.',
+  },
+  maxTurns: {
+    type: 'integer',
+    minimum: 1,
+    description: 'Optional turn ceiling for the child process.',
+  },
+})
+
+// One tool, two shapes: a single job, or a ready group dispatched spawn-all-then-collect.
+// Model and effort are deliberately absent - Grok Build casting is inherited-only, so
+// the run-wide model and effort travel in the sealed environment, never per role.
 const DISPATCH_TOOL = Object.freeze({
   name: 'dispatch',
   description: [
-    'Dispatch one Autoprompt persona as a sealed Grok Build child process.',
-    'The dispatcher enforces the canonical child allowlist, the depth ceiling of 4,',
-    'the framework registry, and the exact bytes of the run prompt ledger.',
-    'Terminal roles and non-allowlisted edges are refused.',
+    'Dispatch one Autoprompt persona, or a whole ready group, as sealed Grok Build',
+    'child processes. Pass `jobs` to start a group: every job is admitted before any',
+    'child starts, the group runs concurrently up to the live-child ceiling, and all',
+    'reports are collected together. The dispatcher enforces the canonical child',
+    'allowlist, the depth ceiling of 4, the framework registry, and the exact bytes of',
+    'the run prompt ledger. Terminal roles and non-allowlisted edges are refused.',
   ].join(' '),
   inputSchema: {
     type: 'object',
     additionalProperties: false,
-    required: ['persona', 'task'],
     properties: {
-      persona: {
-        type: 'string',
-        description: 'Canonical ap-* persona to run, for example ap-scope-coordinator.',
-      },
-      task: {
-        type: 'string',
-        description: 'The bounded task brief. Pointers and acceptance criteria only, never the mission text.',
-      },
-      framework: {
-        type: 'string',
-        description: 'Optional allowlisted framework id sealed into the child brief.',
-      },
-      instance: {
-        type: 'string',
-        description: 'Optional sibling instance suffix: 1-24 lowercase letters, digits, or hyphens.',
-      },
-      mission: {
-        type: 'string',
-        description: 'Absolute path to PROMPTS.txt. Optional once the run binding is inherited.',
-      },
-      nonce: {
-        type: 'string',
-        description: 'Run nonce. Optional once the run binding is inherited.',
-      },
-      model: {
-        type: 'string',
-        description: 'Optional model id for the child process. Omit to inherit the run model.',
-      },
-      effort: {
-        type: 'string',
-        enum: ['low', 'medium', 'high', 'xhigh'],
-        description: 'Optional reasoning effort for the child process.',
-      },
-      maxTurns: {
-        type: 'integer',
-        minimum: 1,
-        description: 'Optional turn ceiling for the child process.',
+      ...JOB_PROPERTIES,
+      jobs: {
+        type: 'array',
+        minItems: 1,
+        description: 'A ready group to dispatch together instead of one job.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['persona', 'task'],
+          properties: { ...JOB_PROPERTIES },
+        },
       },
     },
   },
@@ -89,37 +99,48 @@ function textResult(text, isError = false) {
   return { content: [{ type: 'text', text }], isError }
 }
 
-function callDispatch(argumentsValue, options = {}) {
-  const request = argumentsValue && typeof argumentsValue === 'object' && !Array.isArray(argumentsValue)
-    ? argumentsValue
-    : {}
-  let result
-  try {
-    result = dispatcher.dispatch(request, {
-      env: options.env || process.env,
-      runtimeRoot: options.runtimeRoot || RUNTIME_ROOT,
-      spawn: options.spawn,
-      cwd: options.cwd,
-    })
-  } catch (error) {
-    if (error instanceof dispatcher.DispatchError) {
-      return textResult(`${error.code}: ${error.message}`, true)
-    }
-    return textResult(`AUTOPROMPT_DISPATCH_FAILED: ${error.message}`, true)
-  }
+function reportOf(result) {
   const header = [
     `persona=${result.admission.persona}`,
     `framework=${result.admission.framework === null ? 'none' : result.admission.framework}`,
     `depth=${result.admission.parentDepth + 1}`,
     `exit=${result.status}`,
   ].join(' ')
-  const body = [header, result.stdout.trim(), result.status === 0 ? '' : result.stderr.trim()]
+  return [header, result.stdout.trim(), result.status === 0 ? '' : result.stderr.trim()]
     .filter(part => part !== '')
     .join('\n\n')
-  return textResult(body, result.status !== 0)
 }
 
-function handle(message, options = {}) {
+async function callDispatch(argumentsValue, options = {}) {
+  const request = argumentsValue && typeof argumentsValue === 'object' && !Array.isArray(argumentsValue)
+    ? argumentsValue
+    : {}
+  const dispatchOptions = {
+    env: options.env || process.env,
+    runtimeRoot: options.runtimeRoot || RUNTIME_ROOT,
+    spawn: options.spawn,
+    cwd: options.cwd,
+  }
+  const group = Array.isArray(request.jobs) ? request.jobs : null
+  try {
+    if (group === null) {
+      const result = await dispatcher.dispatch(request, dispatchOptions)
+      return textResult(reportOf(result), result.status !== 0)
+    }
+    const results = await dispatcher.dispatchBatch(group, dispatchOptions)
+    return textResult(
+      results.map(reportOf).join('\n\n---\n\n'),
+      results.some(result => result.status !== 0),
+    )
+  } catch (error) {
+    if (error instanceof dispatcher.DispatchError) {
+      return textResult(`${error.code}: ${error.message}`, true)
+    }
+    return textResult(`AUTOPROMPT_DISPATCH_FAILED: ${error.message}`, true)
+  }
+}
+
+async function handle(message, options = {}) {
   const id = message && Object.prototype.hasOwnProperty.call(message, 'id') ? message.id : null
   const method = message && message.method
   if (id === null && typeof method === 'string') return null
@@ -147,7 +168,7 @@ function handle(message, options = {}) {
         error: { code: -32602, message: `unknown tool: ${String(params.name)}` },
       }
     }
-    return { jsonrpc: '2.0', id, result: callDispatch(params.arguments, options) }
+    return { jsonrpc: '2.0', id, result: await callDispatch(params.arguments, options) }
   }
   return {
     jsonrpc: '2.0',
@@ -172,8 +193,9 @@ function serve(input = process.stdin, output = process.stdout, options = {}) {
       })}\n`)
       return
     }
-    const response = handle(message, options)
-    if (response !== null) output.write(`${JSON.stringify(response)}\n`)
+    Promise.resolve(handle(message, options)).then(response => {
+      if (response !== null) output.write(`${JSON.stringify(response)}\n`)
+    })
   })
   return lines
 }
