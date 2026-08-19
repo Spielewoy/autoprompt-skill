@@ -71,3 +71,5 @@ jobs:
         run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3
       - name: Run package and provider tests
         run: npm test
+      - name: Run older Codex upgrade lifecycle
+        run: node --test --test-name-pattern="receiptless legacy" tests/source/install-custom-root.test.cjs

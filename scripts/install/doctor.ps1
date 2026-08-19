@@ -295,6 +295,19 @@ function Test-ClientReceiptInstalled {
     return $false
 }
 
+function Test-ClientLegacyCodexInstalled {
+    param([string]$Root)
+    if (-not (Test-IdemPathEqual -Left $Root -Right (Get-ConfigRoot -Client 'codex'))) {
+        return $false
+    }
+    $nodeCommand = Get-Command node -CommandType Application `
+        -ErrorAction SilentlyContinue
+    if ($null -eq $nodeCommand) { return $false }
+    $helper = Join-Path $RepoRoot 'scripts/install/legacy-compat.cjs'
+    & $nodeCommand.Source $helper match codex $Root *> $null
+    return $LASTEXITCODE -eq 0
+}
+
 # Invoke-LibCapture: run a library function capturing BOTH its [Console]::Out RECORD and
 # its [Console]::Error text, returning @{ Code; Record; Err }. Used read-only here.
 function Invoke-LibCapture {
@@ -368,8 +381,12 @@ function Get-ClientStatus {
     }
 
     $installed = 'no'
+    $legacy = $false
     if (Test-ClientReceiptInstalled -Client $Client -Root $root) {
         $installed = 'yes'
+    } elseif ($Client -ceq 'codex' -and (Test-ClientLegacyCodexInstalled -Root $root)) {
+        $installed = 'yes'
+        $legacy = $true
     }
 
     if ($support -in @('blocked', 'retired', 'unverified')) {
@@ -380,6 +397,19 @@ function Get-ClientStatus {
             Version = $version
             Reason = (Get-ProviderBlockReason -Name $Client)
             Extras = $support
+            Mode = '-'
+            Support = $support
+        }
+    }
+
+    if ($legacy) {
+        return @{
+            Detected = $detected
+            Installed = $installed
+            Verifies = 'no'
+            Version = $version
+            Reason = 'older-install'
+            Extras = 'older-install'
             Mode = '-'
             Support = $support
         }

@@ -3,6 +3,7 @@
 
 const assert = require('node:assert/strict')
 const childProcess = require('node:child_process')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -29,6 +30,52 @@ const MANIFESTS = Object.fromEntries(SHARED_LIFECYCLE_CLIENTS.map(client => [
     'utf8'
   ))
 ]))
+
+function sha256 (value) {
+  return crypto.createHash('sha256').update(value).digest('hex')
+}
+
+function makeSyntheticLegacyPackage (sandbox) {
+  const packageRoot = path.join(sandbox, 'package')
+  for (const directory of ['agents', 'bin', 'scripts']) {
+    fs.cpSync(path.join(ROOT, directory), path.join(packageRoot, directory), {
+      recursive: true
+    })
+  }
+  fs.copyFileSync(path.join(ROOT, 'package.json'), path.join(packageRoot, 'package.json'))
+
+  const files = new Map([
+    ['SKILL.md', Buffer.from('older Codex skill\n')],
+    ['frameworks/README.md', Buffer.from('older framework\n')],
+    ['workflow/supervisor.sh', Buffer.from('#!/bin/sh\nexit 0\n')]
+  ])
+  const names = [...files.keys()].sort()
+  const metadata = {
+    schemaVersion: 1,
+    provider: 'codex',
+    directories: ['frameworks', 'workflow'],
+    optionalDirectories: [],
+    files: names,
+    sizes: Object.fromEntries(names.map(name => [name, files.get(name).length])),
+    sha256: Object.fromEntries(names.map(name => [name, sha256(files.get(name))]))
+  }
+  fs.writeFileSync(
+    path.join(packageRoot, 'scripts', 'install', 'legacy-codex-compat.json'),
+    `${JSON.stringify(metadata, null, 2)}\n`
+  )
+
+  return {
+    packageRoot,
+    writeRoot (root) {
+      const skill = path.join(root, 'skills', 'autoprompt')
+      for (const [relative, content] of files) {
+        const target = path.join(skill, ...relative.split('/'))
+        fs.mkdirSync(path.dirname(target), { recursive: true })
+        fs.writeFileSync(target, content)
+      }
+    }
+  }
+}
 
 function run (command, args, options = {}) {
   return childProcess.spawnSync(command, args, {
@@ -615,6 +662,140 @@ test('PowerShell custom roots complete install, doctor, repair, and uninstall fo
     } finally {
       fs.rmSync(sandbox, { recursive: true, force: true })
     }
+  }
+})
+
+test('PowerShell upgrades a synthetic receiptless legacy Codex install end to end', {
+  skip: process.platform !== 'win32',
+  timeout: 360000
+}, () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-root-codex-legacy-ps-'))
+  const context = makeLifecycleContext(sandbox, 'codex')
+  const legacy = makeSyntheticLegacyPackage(sandbox)
+  const cli = path.join(legacy.packageRoot, 'bin', 'autoprompt.cjs')
+  const rootSentinel = path.join(context.customRoot, 'keep-user.txt')
+  const peerFile = path.join(context.customRoot, 'agents', 'a.md')
+  try {
+    legacy.writeRoot(context.customRoot)
+    fs.mkdirSync(path.dirname(peerFile), { recursive: true })
+    fs.writeFileSync(rootSentinel, 'keep root\n')
+    fs.writeFileSync(peerFile, 'keep peer\n')
+
+    const before = run(process.execPath, [
+      cli, 'doctor', 'codex', '--strict', '--root', context.customRoot
+    ], { env: context.env })
+    assert.notEqual(before.status, 0, `${before.stdout}\n${before.stderr}`)
+    assert.match(before.stdout, /reason=older-install extras=older-install/)
+
+    const installed = run(process.execPath, [
+      cli, 'install', 'codex', '--root', context.customRoot
+    ], { env: context.env })
+    assert.equal(installed.status, 0, `${installed.stdout}\n${installed.stderr}`)
+    assertCustomLayout('codex', context.customRoot)
+    assert.equal(fs.readFileSync(rootSentinel, 'utf8'), 'keep root\n')
+    assert.equal(fs.readFileSync(peerFile, 'utf8'), 'keep peer\n')
+    assert.equal(
+      fs.readFileSync(path.join(
+        context.customRoot,
+        'skills',
+        'autoprompt',
+        'VERSION'
+      ), 'utf8').trim(),
+      '1.0.1'
+    )
+
+    const healthy = run(process.execPath, [
+      cli, 'doctor', 'codex', '--strict', '--root', context.customRoot
+    ], { env: context.env })
+    assert.equal(healthy.status, 0, `${healthy.stdout}\n${healthy.stderr}`)
+    assert.match(healthy.stdout, /^codex\s+yes\s+yes\s+yes\s+/m)
+
+    const driftRoot = path.join(sandbox, 'codex-drift-root')
+    legacy.writeRoot(driftRoot)
+    const driftFile = path.join(driftRoot, 'skills', 'autoprompt', 'SKILL.md')
+    fs.appendFileSync(driftFile, 'local edit\n')
+    const refused = run(process.execPath, [
+      cli, 'install', 'codex', '--root', driftRoot
+    ], { env: context.env })
+    assert.notEqual(refused.status, 0, `${refused.stdout}\n${refused.stderr}`)
+    assert.match(`${refused.stdout}\n${refused.stderr}`, /unowned-skill-refused/)
+    assert.match(fs.readFileSync(driftFile, 'utf8'), /local edit/)
+    assert.equal(
+      fs.existsSync(path.join(driftRoot, '.autoprompt-install-receipt.json')),
+      false
+    )
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+  }
+})
+
+test('Git Bash upgrades and rolls back a synthetic receiptless legacy Codex install', {
+  skip: !fs.existsSync(GIT_BASH),
+  timeout: 480000
+}, () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-root-codex-legacy-sh-'))
+  const context = makeLifecycleContext(sandbox, 'codex')
+  const legacy = makeSyntheticLegacyPackage(sandbox)
+  const install = bashPath(path.join(legacy.packageRoot, 'scripts', 'install', 'install.sh'))
+  const shellEntry = shellRoot => [
+    `export AUTOPROMPT_INSTALL_ROOT=${shellLiteral(shellRoot)};`,
+    `export PATH=${shellLiteral(bashPath(context.bin))}:"$PATH";`,
+    '/usr/bin/bash',
+    shellLiteral(install),
+    'codex'
+  ].join(' ')
+  const env = cleanEnvironment({
+    HOME: bashPath(context.home),
+    USERPROFILE: context.home,
+    XDG_CONFIG_HOME: bashPath(context.xdg),
+    PATH: `${bashPath(context.bin)}:/usr/bin:${process.env.PATH || ''}`
+  })
+  try {
+    legacy.writeRoot(context.customRoot)
+    const installed = run(GIT_BASH, [
+      '-lc', shellEntry(bashPath(context.customRoot))
+    ], { env })
+    assert.equal(installed.status, 0, `${installed.stdout}\n${installed.stderr}`)
+    assertCustomLayout('codex', context.customRoot)
+
+    const rollbackRoot = path.join(sandbox, 'codex-rollback-root')
+    const rollbackSkill = path.join(rollbackRoot, 'skills', 'autoprompt', 'SKILL.md')
+    legacy.writeRoot(rollbackRoot)
+    const original = fs.readFileSync(rollbackSkill)
+    const fakeNode = path.join(context.bin, 'node')
+    fs.writeFileSync(fakeNode, [
+      '#!/bin/sh',
+      'case "$1" in',
+      '  *codex-agent-casting.js|*codex-agent-profile.js) exit 91 ;;',
+      'esac',
+      `exec ${shellLiteral(bashPath(process.execPath))} "$@"`,
+      ''
+    ].join('\n'))
+    fs.chmodSync(fakeNode, 0o755)
+
+    const failed = run(GIT_BASH, [
+      '-lc', shellEntry(bashPath(rollbackRoot))
+    ], { env })
+    assert.notEqual(failed.status, 0, `${failed.stdout}\n${failed.stderr}`)
+    assert.match(
+      `${failed.stdout}\n${failed.stderr}`,
+      /custom-agent profile export failed|stage=agents/
+    )
+    assert.deepEqual(fs.readFileSync(rollbackSkill), original)
+    assert.equal(
+      fs.existsSync(path.join(rollbackRoot, '.autoprompt-install-receipt.json')),
+      false
+    )
+
+    const matched = run(process.execPath, [
+      path.join(legacy.packageRoot, 'scripts', 'install', 'legacy-compat.cjs'),
+      'match',
+      'codex',
+      rollbackRoot
+    ])
+    assert.equal(matched.status, 0, `${matched.stdout}\n${matched.stderr}`)
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
   }
 })
 

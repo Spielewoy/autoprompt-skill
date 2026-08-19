@@ -2036,9 +2036,10 @@ function Restore-IdemAbsentConfigRoot {
 }
 
 function Restore-IdemManagedSnapshot {
-    param([hashtable]$Snapshot)
+    param([hashtable]$Snapshot, [switch]$UseInMemorySnapshot)
     $recoveryPath = $Snapshot.RecoveryPath
-    if (-not [string]::IsNullOrEmpty($recoveryPath) -and
+    if (-not $UseInMemorySnapshot -and
+        -not [string]::IsNullOrEmpty($recoveryPath) -and
         (Test-Path -LiteralPath $recoveryPath -PathType Leaf)) {
         try {
             $durableSnapshot = Import-Clixml -LiteralPath $recoveryPath `
@@ -2082,6 +2083,9 @@ function Restore-IdemManagedSnapshot {
 }
 
 if ($null -eq $script:AutopromptManagedUndoJournal) { $script:AutopromptManagedUndoJournal = @() }
+if ($null -eq $script:AutopromptInMemoryRestoreToken) {
+    $script:AutopromptInMemoryRestoreToken = New-Object object
+}
 
 function Add-IdemManagedUndo {
     param([hashtable]$Snapshot)
@@ -2174,11 +2178,18 @@ function Undo-IdemManagedChanges {
     for ($index = $pending.Count - 1; $index -ge 0; $index--) {
         $snapshot = $pending[$index]
         $restoreSnapshot = $snapshot
-        if (-not (Test-Path -LiteralPath $snapshot.RecoveryPath -PathType Leaf)) {
+        $useInMemorySnapshot = $snapshot.ContainsKey('InMemoryRestoreToken') -and
+            [object]::ReferenceEquals(
+                $snapshot.InMemoryRestoreToken,
+                $script:AutopromptInMemoryRestoreToken
+            )
+        if (-not $useInMemorySnapshot -and
+            -not (Test-Path -LiteralPath $snapshot.RecoveryPath -PathType Leaf)) {
             $restoreSnapshot = Get-IdemCommitRecoverySnapshot -Snapshot $snapshot
         }
         $didRestore = $null -ne $restoreSnapshot -and
-            (Restore-IdemManagedSnapshot -Snapshot $restoreSnapshot)
+            (Restore-IdemManagedSnapshot -Snapshot $restoreSnapshot `
+                -UseInMemorySnapshot:$useInMemorySnapshot)
         $didRemoveRecovery = $false
         if ($didRestore) {
             $didRemoveRecovery = Remove-IdemManagedRecovery -Snapshot $snapshot

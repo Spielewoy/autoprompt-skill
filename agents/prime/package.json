@@ -1,6 +1,6 @@
 {
   "name": "autoprompt-prime-agent-adapter",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Native Autoprompt package for Prime Agent.",
   "type": "module",
   "keywords": [

@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="#基准测试"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20%E5%88%86-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1：提高 14.61 分"/></a>
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%E7%89%88%E6%9C%AC&color=255C60&labelColor=14101F" alt="版本：v1.0.0"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%E7%89%88%E6%9C%AC&color=255C60&labelColor=14101F" alt="版本：v1.0.1"/></a>
   <a href="#安装"><img src="https://img.shields.io/badge/%E6%94%AF%E6%8C%81-6-255C60?style=flat-square&labelColor=14101F" alt="支持：6"/></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF%E8%AF%81-MIT-255C60?style=flat-square&labelColor=14101F" alt="许可证：MIT"/></a>
 </p>
@@ -25,7 +25,7 @@
 
 ## 安装
 
-使用下面的 CLI，或从 [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.0) 下载安装程序。
+使用下面的 CLI，或从 [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.1) 下载安装程序。
 
 ### 1. 安装 CLI
 

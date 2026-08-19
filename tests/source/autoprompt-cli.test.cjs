@@ -3,6 +3,7 @@
 
 const assert = require('node:assert/strict')
 const childProcess = require('node:child_process')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -10,6 +11,7 @@ const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const CLI_PATH = path.join(ROOT, 'bin', 'autoprompt.cjs')
+const PACKAGE_VERSION = require('../../package.json').version
 const CUSTOM_GUIDE_URL = 'https://github.com/Spielewoy/autoprompt-skill/blob/main/docs/guides/custom-agent-compatibility.md'
 const {
   HELP_TEXT,
@@ -52,11 +54,16 @@ function invoke(argv, overrides = {}) {
     cwd: overrides.cwd || path.join('caller', 'working directory'),
     env,
     nodeVersion: overrides.nodeVersion || '24.11.0',
-    packageRoot: overrides.packageRoot || path.join('package root', 'with spaces'),
+    packageRoot: overrides.packageRoot || path.join(
+      'package root',
+      'with spaces',
+      'node_modules',
+      'autoprompt-skill',
+    ),
     platform: overrides.platform || 'linux',
     readLine: overrides.readLine || (() => answers.length ? answers.shift() : null),
     checkLatestGitHubRevision: overrides.checkLatestGitHubRevision || (() => ''),
-    checkLatestVersion: overrides.checkLatestVersion || (() => '1.0.0'),
+    checkLatestVersion: overrides.checkLatestVersion || (() => PACKAGE_VERSION),
     spawnSync,
     stderr: stderr.stream,
     stdout: stdout.stream,
@@ -74,6 +81,48 @@ function writeJson(file, value) {
 function writeText(file, text = 'marker\n') {
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, text)
+}
+
+function makeLegacyCodexFixture (sandbox) {
+  const packageRoot = path.join(sandbox, 'legacy-package')
+  const files = new Map([
+    ['SKILL.md', Buffer.from('older Codex skill\n')],
+    ['frameworks/README.md', Buffer.from('older framework\n')],
+    ['workflow/supervisor.sh', Buffer.from('#!/bin/sh\nexit 0\n')]
+  ])
+  const names = [...files.keys()].sort()
+  const sha256 = value => crypto.createHash('sha256').update(value).digest('hex')
+  writeJson(path.join(
+    packageRoot,
+    'scripts',
+    'install',
+    'legacy-codex-compat.json'
+  ), {
+    schemaVersion: 1,
+    provider: 'codex',
+    directories: ['frameworks', 'workflow'],
+    optionalDirectories: ['workflow/closed-loop'],
+    files: names,
+    sizes: Object.fromEntries(names.map(name => [name, files.get(name).length])),
+    sha256: Object.fromEntries(names.map(name => [name, sha256(files.get(name))]))
+  })
+  return {
+    packageRoot,
+    writeRoot (root) {
+      for (const [relative, content] of files) {
+        const target = path.join(root, 'skills', 'autoprompt', ...relative.split('/'))
+        fs.mkdirSync(path.dirname(target), { recursive: true })
+        fs.writeFileSync(target, content)
+      }
+      fs.mkdirSync(path.join(
+        root,
+        'skills',
+        'autoprompt',
+        'workflow',
+        'closed-loop'
+      ))
+    }
+  }
 }
 
 function writeRoles(directory, extension, count = 25) {
@@ -236,7 +285,7 @@ test('interactive no-argument launch numbers every install provider plus the cus
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /Checking for updates\.\.\.\r?\nAutoprompt 1\.0\.0 is current\./)
+  assert.match(result.stdout, /Checking for updates\.\.\.\r?\nAutoprompt 1\.0\.1 is current\./)
   assert.doesNotMatch(result.stdout, /\[[#.-]{10}\]/)
   assert.ok(result.stdout.indexOf('Checking for updates...') < result.stdout.indexOf('Pick a coding agent:'))
   assert.match(result.stdout, /Pick a coding agent:/)
@@ -278,42 +327,39 @@ test('interactive no-argument launch numbers every install provider plus the cus
 
 test('interactive launch offers a newer CLI release before provider selection', () => {
   const result = invoke([], {
-    answers: ['\u001b'],
-    checkLatestVersion: () => '1.0.1',
+    checkLatestVersion: () => '1.0.2',
     interactive: true,
-    responses: [{ status: 0 }],
+    responses: [{ status: 0 }, { status: 0 }],
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /New Autoprompt version available: 1\.0\.1 \(installed 1\.0\.0\)\. Updating\.\.\./)
-  assert.match(result.stdout, /Autoprompt updated\. Continuing with the installer\./)
-  assert.match(result.stdout, /Pick a coding agent:/)
-  assert.match(result.stdout, /Autoprompt installer closed\./)
-  assert.deepEqual(result.calls.map(call => [call.command, call.args]), [[
-    'npm',
-    ['install', '-g', 'autoprompt-skill@latest'],
-  ]])
+  assert.match(result.stdout, /New Autoprompt version available: 1\.0\.2 \(installed 1\.0\.1\)\. Updating\.\.\./)
+  assert.match(result.stdout, /Autoprompt updated\. Restarting the installer\./)
+  assert.doesNotMatch(result.stdout, /Pick a coding agent:/)
+  assert.deepEqual(result.calls.map(call => [call.command, call.args]), [
+    ['npm', ['install', '-g', 'autoprompt-skill@latest']],
+    [process.execPath, [path.join(result.options.packageRoot, 'bin', 'autoprompt.cjs')]],
+  ])
+  assert.equal(result.calls[1].options.env.AUTOPROMPT_UPDATED_HANDOFF, '1')
 })
 
 test('interactive launch auto-updates a packaged install when GitHub main differs even if semver does not', () => {
   const result = invoke([], {
-    answers: ['\u001b'],
     checkLatestGitHubRevision: () => '0123456789abcdef0123456789abcdef01234567',
-    checkLatestVersion: () => '1.0.0',
+    checkLatestVersion: () => PACKAGE_VERSION,
     interactive: true,
     packageRoot: path.join('C:', 'Users', 'person', 'AppData', 'Roaming', 'npm', 'node_modules', 'autoprompt-skill'),
-    responses: [{ status: 0 }],
+    responses: [{ status: 0 }, { status: 0 }],
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /New Autoprompt build available on GitHub main \(installed 1\.0\.0\)\. Updating\.\.\./)
-  assert.match(result.stdout, /Autoprompt updated\. Continuing with the installer\./)
-  assert.match(result.stdout, /Pick a coding agent:/)
-  assert.match(result.stdout, /Autoprompt installer closed\./)
-  assert.deepEqual(result.calls.map(call => [call.command, call.args]), [[
-    'npm',
-    ['install', '-g', '--install-links=true', 'github:Spielewoy/autoprompt-skill#main'],
-  ]])
+  assert.match(result.stdout, /New Autoprompt build available on GitHub main \(installed 1\.0\.1\)\. Updating\.\.\./)
+  assert.match(result.stdout, /Autoprompt updated\. Restarting the installer\./)
+  assert.doesNotMatch(result.stdout, /Pick a coding agent:/)
+  assert.deepEqual(result.calls.map(call => [call.command, call.args]), [
+    ['npm', ['install', '-g', '--install-links=true', 'github:Spielewoy/autoprompt-skill#0123456789abcdef0123456789abcdef01234567']],
+    [process.execPath, [path.join(result.options.packageRoot, 'bin', 'autoprompt.cjs')]],
+  ])
 })
 
 test('successful startup update records the GitHub revision and does not reinstall it next launch', () => {
@@ -336,7 +382,7 @@ test('successful startup update records the GitHub revision and does not reinsta
     env,
     interactive: true,
     packageRoot,
-    responses: [{ status: 0 }],
+    responses: [{ status: 0 }, { status: 0 }],
   })
   const second = invoke([], {
     answers: ['\u001b'],
@@ -346,9 +392,9 @@ test('successful startup update records the GitHub revision and does not reinsta
     packageRoot,
   })
 
-  assert.equal(first.calls.length, 1)
+  assert.equal(first.calls.length, 2)
   assert.equal(second.calls.length, 0)
-  assert.match(second.stdout, /Autoprompt 1\.0\.0 is current\./)
+  assert.match(second.stdout, /Autoprompt 1\.0\.1 is current\./)
   assert.match(second.stdout, /Pick a coding agent:/)
 })
 
@@ -469,22 +515,48 @@ test('GitHub revision discovery falls back to authenticated gh for a private rep
 
 test('interactive launch offers a GitHub main build when the version stays the same', () => {
   const result = invoke([], {
-    answers: ['\u001b'],
     checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     interactive: true,
     packageRoot: path.join('C:', 'Users', 'person', 'AppData', 'Roaming', 'npm', 'node_modules', 'autoprompt-skill'),
-    responses: [{ status: 0 }],
+    responses: [{ status: 0 }, { status: 0 }],
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /New Autoprompt build available on GitHub main \(installed 1\.0\.0\)\. Updating\.\.\./)
-  assert.match(result.stdout, /Autoprompt updated\. Continuing with the installer\./)
+  assert.match(result.stdout, /New Autoprompt build available on GitHub main \(installed 1\.0\.1\)\. Updating\.\.\./)
+  assert.match(result.stdout, /Autoprompt updated\. Restarting the installer\./)
+  assert.doesNotMatch(result.stdout, /Pick a coding agent:/)
+  assert.deepEqual(result.calls.map(call => [call.command, call.args]), [
+    ['npm', ['install', '-g', '--install-links=true', 'github:Spielewoy/autoprompt-skill#abcdefabcdefabcdefabcdefabcdefabcdefabcd']],
+    [process.execPath, [path.join(result.options.packageRoot, 'bin', 'autoprompt.cjs')]],
+  ])
+})
+
+test('updated installer handoff skips a second update check', () => {
+  const result = invoke([], {
+    answers: ['\u001b'],
+    checkLatestGitHubRevision: () => { throw new Error('must not run') },
+    checkLatestVersion: () => { throw new Error('must not run') },
+    env: { AUTOPROMPT_UPDATED_HANDOFF: '1', HOME: path.resolve('handoff-home') },
+    interactive: true,
+  })
+
+  assert.equal(result.status, 0)
+  assert.doesNotMatch(result.stdout, /Checking for updates/)
   assert.match(result.stdout, /Pick a coding agent:/)
   assert.match(result.stdout, /Autoprompt installer closed\./)
-  assert.deepEqual(result.calls.map(call => [call.command, call.args]), [[
-    'npm',
-    ['install', '-g', '--install-links=true', 'github:Spielewoy/autoprompt-skill#main'],
-  ]])
+  assert.deepEqual(result.calls, [])
+})
+
+test('updated installer handoff forwards the refreshed CLI exit status', () => {
+  const result = invoke([], {
+    checkLatestVersion: () => '1.0.2',
+    interactive: true,
+    responses: [{ status: 0 }, { status: 77 }],
+  })
+
+  assert.equal(result.status, 77)
+  assert.equal(result.calls.length, 2)
+  assert.doesNotMatch(result.stdout, /Pick a coding agent:/)
 })
 
 test('interactive update resolver refreshes a mismatched installed version', () => {
@@ -493,7 +565,7 @@ test('interactive update resolver refreshes a mismatched installed version', () 
     const resolved = resolveInteractiveUpdateStatus({
       env: { HOME: home },
       homeDirectory: home,
-      packageRoot: path.join(home, 'not-packaged-install'),
+      packageRoot: path.join(home, 'node_modules', 'autoprompt-skill'),
     }, '0.9.9', '')
     assert.equal(resolved.action, 'registry-first')
     assert.match(resolved.message, /does not match current release 0\.9\.9\. Updating\.\.\./)
@@ -511,9 +583,27 @@ test('interactive launch from a repo checkout does not self-install a same-versi
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /Autoprompt 1\.0\.0 is current\./)
+  assert.match(result.stdout, /Repository checkout 1\.0\.1 is not auto-updated\./)
   assert.match(result.stdout, /Pick a coding agent:/)
   assert.match(result.stdout, /Autoprompt installer closed\./)
+  assert.deepEqual(result.calls, [])
+})
+
+test('interactive launch from a repo checkout does not self-install a newer registry release', () => {
+  const result = invoke([], {
+    answers: ['\u001b'],
+    checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
+    checkLatestVersion: () => '1.0.2',
+    interactive: true,
+    packageRoot: ROOT,
+  })
+
+  assert.equal(result.status, 0)
+  assert.match(
+    result.stdout,
+    /Repository checkout 1\.0\.1 is not auto-updated\. Latest release: 1\.0\.2\./,
+  )
+  assert.match(result.stdout, /Pick a coding agent:/)
   assert.deepEqual(result.calls, [])
 })
 
@@ -551,7 +641,7 @@ test('real synchronous TTY reader drives the no-argument chooser without an inje
       packageRoot: ROOT,
       platform: 'win32',
       checkLatestGitHubRevision: () => '',
-      checkLatestVersion: () => '1.0.0',
+      checkLatestVersion: () => PACKAGE_VERSION,
       spawnSync(command, args, options) {
         calls.push({ command, args, options })
         return { status: 0 }
@@ -590,7 +680,7 @@ test('a raw Escape key closes provider selection without waiting for Enter', () 
 
   try {
     const status = run([], {
-      checkLatestVersion: () => '1.0.0',
+      checkLatestVersion: () => PACKAGE_VERSION,
       cwd: temporaryRoot,
       env: { HOME: temporaryRoot },
       nodeVersion: '24.11.0',
@@ -988,7 +1078,7 @@ test('help stays lean and names only the six public providers', () => {
   assert.match(HELP_TEXT, /^  autoprompt update$/m)
 })
 
-test('update uses the installed npm CLI without a shell and falls back to GitHub main', () => {
+test('update uses the installed npm CLI without a shell and pins its GitHub fallback', () => {
   const windows = invoke(['update'], {
     platform: 'win32',
     responses: [{ status: 0 }],
@@ -1018,32 +1108,36 @@ test('update uses the installed npm CLI without a shell and falls back to GitHub
   assert.equal(windows.stderr, '')
 
   const githubBuild = invoke(['update'], {
-    checkLatestGitHubRevision: () => 'fedcbafedcbafedcbafedcbafedcbafedcbafed',
+    checkLatestGitHubRevision: () => 'fedcbafedcbafedcbafedcbafedcbafedcbafed0',
     platform: 'linux',
     responses: [{ status: 0 }],
   })
   assert.equal(githubBuild.status, 0)
   assert.deepEqual(githubBuild.calls.map(call => [call.command, call.args]), [[
     'npm',
-    ['install', '-g', '--install-links=true', 'github:Spielewoy/autoprompt-skill#main'],
+    ['install', '-g', '--install-links=true', 'github:Spielewoy/autoprompt-skill#fedcbafedcbafedcbafedcbafedcbafedcbafed0'],
   ]])
 
   const posixFallback = invoke(['update'], {
+    checkLatestVersion: () => '1.0.2',
+    checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     platform: 'linux',
     responses: [{ status: 73 }, { status: 0 }],
   })
   assert.equal(posixFallback.status, 0)
   assert.deepEqual(posixFallback.calls.map(call => [call.command, call.args]), [
     ['npm', ['install', '-g', 'autoprompt-skill@latest']],
-    ['npm', ['install', '-g', '--install-links=true', 'github:Spielewoy/autoprompt-skill#main']],
+    ['npm', ['install', '-g', '--install-links=true', 'github:Spielewoy/autoprompt-skill#abcdefabcdefabcdefabcdefabcdefabcdefabcd']],
   ])
   assert.equal(
     posixFallback.stdout,
-    'npm registry update failed; trying GitHub main.\n' +
+    'npm registry update failed; trying the verified GitHub revision.\n' +
     'Autoprompt updated. Rerun `autoprompt` to refresh provider files.\n',
   )
 
   const missingNpmFallback = invoke(['update'], {
+    checkLatestVersion: () => '1.0.2',
+    checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     platform: 'linux',
     responses: [
       { error: Object.assign(new Error('missing npm'), { code: 'ENOENT' }) },
@@ -1053,11 +1147,13 @@ test('update uses the installed npm CLI without a shell and falls back to GitHub
   assert.equal(missingNpmFallback.status, 0)
   assert.deepEqual(missingNpmFallback.calls.map(call => [call.command, call.args]), [
     ['npm', ['install', '-g', 'autoprompt-skill@latest']],
-    ['npm', ['install', '-g', '--install-links=true', 'github:Spielewoy/autoprompt-skill#main']],
+    ['npm', ['install', '-g', '--install-links=true', 'github:Spielewoy/autoprompt-skill#abcdefabcdefabcdefabcdefabcdefabcdefabcd']],
   ])
-  assert.match(missingNpmFallback.stdout, /trying GitHub main/)
+  assert.match(missingNpmFallback.stdout, /trying the verified GitHub revision/)
 
   const thrownNpmFallback = invoke(['update'], {
+    checkLatestVersion: () => '1.0.2',
+    checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     platform: 'linux',
     responses: [
       Object.assign(new Error('npm launch threw'), { code: 'EACCES' }),
@@ -1067,10 +1163,12 @@ test('update uses the installed npm CLI without a shell and falls back to GitHub
   assert.equal(thrownNpmFallback.status, 0)
   assert.deepEqual(thrownNpmFallback.calls.map(call => [call.command, call.args]), [
     ['npm', ['install', '-g', 'autoprompt-skill@latest']],
-    ['npm', ['install', '-g', '--install-links=true', 'github:Spielewoy/autoprompt-skill#main']],
+    ['npm', ['install', '-g', '--install-links=true', 'github:Spielewoy/autoprompt-skill#abcdefabcdefabcdefabcdefabcdefabcdefabcd']],
   ])
 
   const bothLaunchesThrow = invoke(['update'], {
+    checkLatestVersion: () => '1.0.2',
+    checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     platform: 'linux',
     responses: [
       Object.assign(new Error('npm launch threw'), { code: 'EACCES' }),
@@ -1080,6 +1178,14 @@ test('update uses the installed npm CLI without a shell and falls back to GitHub
   assert.equal(bothLaunchesThrow.status, 1)
   assert.match(bothLaunchesThrow.stderr, /could not start npm: npm launch threw/)
   assert.match(bothLaunchesThrow.stderr, /could not start npm GitHub fallback: GitHub launch threw/)
+
+  const unavailableRevision = invoke(['update'], {
+    platform: 'linux',
+    responses: [{ status: 73 }],
+  })
+  assert.equal(unavailableRevision.status, 73)
+  assert.equal(unavailableRevision.calls.length, 1)
+  assert.match(unavailableRevision.stdout, /GitHub revision unavailable/)
 })
 
 test('real Windows update reaches npm without EINVAL and cannot mutate the real global prefix', {
@@ -1127,7 +1233,7 @@ test('help, version, repo, and support are non-mutating local commands', () => {
 
   const version = invoke(['--version'])
   assert.equal(version.status, 0)
-  assert.equal(version.stdout, '1.0.0\n')
+  assert.equal(version.stdout, '1.0.1\n')
   assert.deepEqual(version.calls, [])
 
   const repo = invoke(['repo'])
@@ -1445,11 +1551,40 @@ test('provider state reads receipt-owned version markers without guessing from d
 
     const prime = path.join(sandbox, '.prime', 'agent')
     writeJson(path.join(prime, '.autoprompt-prime-install.json'), { provider: 'prime' })
-    writeJson(path.join(prime, 'autoprompt', 'packages', 'prime', 'package.json'), { version: '1.0.0' })
-    assert.equal(providerInstallState('prime', prime).version, '1.0.0')
+    writeJson(path.join(prime, 'autoprompt', 'packages', 'prime', 'package.json'), { version: PACKAGE_VERSION })
+    assert.equal(providerInstallState('prime', prime).version, PACKAGE_VERSION)
 
     fs.rmSync(path.join(claude, '.autoprompt-install-receipt.json'))
     assert.equal(providerInstallState('claude', claude).installed, false)
+
+    const codex = path.join(sandbox, '.codex')
+    const legacyFixture = makeLegacyCodexFixture(sandbox)
+    legacyFixture.writeRoot(codex)
+    assert.deepEqual(providerInstallState(
+      'codex',
+      codex,
+      PACKAGE_VERSION,
+      legacyFixture.packageRoot
+    ), {
+      installed: true,
+      version: '',
+      current: false,
+      legacy: true,
+    })
+    fs.rmdirSync(path.join(codex, 'skills', 'autoprompt', 'workflow', 'closed-loop'))
+    assert.equal(providerInstallState(
+      'codex',
+      codex,
+      PACKAGE_VERSION,
+      legacyFixture.packageRoot
+    ).installed, true)
+    fs.mkdirSync(path.join(codex, 'skills', 'autoprompt', 'local-empty'))
+    assert.equal(providerInstallState(
+      'codex',
+      codex,
+      PACKAGE_VERSION,
+      legacyFixture.packageRoot
+    ).installed, false)
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true })
   }
@@ -1468,20 +1603,35 @@ test('interactive install reports detected state and confirms update or repair b
       platform: 'win32',
       responses: [{ status: 0 }],
     })
-    assert.match(update.stdout, /Claude Code \(installed 0\.9\.0, update available: 1\.0\.0\)/)
-    assert.match(update.stdout, /Update Autoprompt 0\.9\.0 to 1\.0\.0\? \[Y\/N\]: /)
+    assert.match(update.stdout, /Claude Code \(installed 0\.9\.0, update available: 1\.0\.1\)/)
+    assert.match(update.stdout, /Update Autoprompt 0\.9\.0 to 1\.0\.1\? \[Y\/N\]: /)
     assert.equal(update.calls.length, 1)
 
-    writeText(path.join(root, 'skills', 'autoprompt', 'VERSION'), '1.0.0\n')
+    writeText(path.join(root, 'skills', 'autoprompt', 'VERSION'), `${PACKAGE_VERSION}\n`)
     const repair = invoke([], {
       answers: ['1', 'no'],
       env: { HOME: sandbox },
       interactive: true,
       platform: 'win32',
     })
-    assert.match(repair.stdout, /Claude Code \(installed 1\.0\.0, current\)/)
-    assert.match(repair.stdout, /Autoprompt 1\.0\.0 is current\. Reinstall or repair it\? \[Y\/N\]: /)
+    assert.match(repair.stdout, /Claude Code \(installed 1\.0\.1, current\)/)
+    assert.match(repair.stdout, /Autoprompt 1\.0\.1 is current\. Reinstall or repair it\? \[Y\/N\]: /)
     assert.equal(repair.calls.length, 0)
+
+    const codex = path.join(sandbox, '.codex')
+    const legacyFixture = makeLegacyCodexFixture(sandbox)
+    legacyFixture.writeRoot(codex)
+    const legacy = invoke([], {
+      answers: ['2', 'yes', 'yes'],
+      env: { HOME: sandbox },
+      interactive: true,
+      packageRoot: legacyFixture.packageRoot,
+      platform: 'win32',
+      responses: [{ status: 0 }],
+    })
+    assert.match(legacy.stdout, /Codex \(legacy install detected, update available: 1\.0\.1\)/)
+    assert.match(legacy.stdout, /Legacy Autoprompt install detected\. Update it to 1\.0\.1\? \[Y\/N\]: /)
+    assert.equal(legacy.calls.length, 1)
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true })
   }
@@ -1492,7 +1642,7 @@ test('interactive uninstall selects a detected installation and custom roots sta
   const root = path.join(sandbox, '.claude')
   try {
     writeJson(path.join(root, '.autoprompt-install-receipt.json'), { files: [] })
-    writeText(path.join(root, 'skills', 'autoprompt', 'VERSION'), '1.0.0\n')
+    writeText(path.join(root, 'skills', 'autoprompt', 'VERSION'), `${PACKAGE_VERSION}\n`)
     const removed = invoke(['uninstall'], {
       answers: ['1', 'yes', 'yes'],
       env: { HOME: sandbox },
@@ -1501,7 +1651,7 @@ test('interactive uninstall selects a detected installation and custom roots sta
       responses: [{ status: 0 }],
     })
     assert.match(removed.stdout, /Autoprompt uninstaller/)
-    assert.match(removed.stdout, /Claude Code \(installed 1\.0\.0, current\)/)
+    assert.match(removed.stdout, /Claude Code \(installed 1\.0\.1, current\)/)
     assert.match(removed.stdout, /Uninstall Autoprompt from Claude Code\? \[Y\/N\]: /)
     assert.equal(removed.calls.length, 1)
     assert.equal(removed.calls[0].args.at(-1), 'claude')
@@ -1510,6 +1660,25 @@ test('interactive uninstall selects a detected installation and custom roots sta
       answers: ['2', 'yes'],
       env: { HOME: sandbox },
       interactive: true,
+      platform: 'win32',
+    })
+    assert.match(missing.stdout, /No Autoprompt installation was found at the detected Codex root\./)
+    assert.equal(missing.calls.length, 0)
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+  }
+})
+
+test('interactive uninstall keeps a receiptless legacy Codex install on the upgrade path', () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-cli-uninstall-legacy-'))
+  try {
+    const legacyFixture = makeLegacyCodexFixture(sandbox)
+    legacyFixture.writeRoot(path.join(sandbox, '.codex'))
+    const missing = invoke(['uninstall'], {
+      answers: ['2', 'yes'],
+      env: { HOME: sandbox },
+      interactive: true,
+      packageRoot: legacyFixture.packageRoot,
       platform: 'win32',
     })
     assert.match(missing.stdout, /No Autoprompt installation was found at the detected Codex root\./)
