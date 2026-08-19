@@ -1,6 +1,6 @@
 # Check another coding agent or IDE
 
-Paste this into your preferred coding agent or LLM to check compatibility with https://github.com/Spielewoy/autoprompt-skill/. Replace `[TOOL NAME]` and `[TOOL DOCS]` first.
+Paste this into your preferred coding agent or LLM to check compatibility with https://github.com/Spielewoy/autoprompt-skill/. Replace [TOOL NAME] with the coding agent, CLI, IDE, or harness you want to check. For common tools, the name alone is enough. For niche tools, replace [TOOL DOCS] with its official documentation or repository. Example: [TOOL NAME] = Claude Code, [TOOL DOCS] = Claude Code documentation link.
 
 ## Paste-ready prompt
 
