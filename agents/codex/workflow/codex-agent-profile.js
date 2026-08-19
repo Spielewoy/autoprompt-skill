@@ -128,10 +128,28 @@ function projectConfigDirectories(workspacePath) {
   }
 }
 
+function globalCodexAgentsDirectory(environment = process.env) {
+  const configured = (environment.CODEX_HOME || '').trim()
+  if (configured) return path.join(path.resolve(configured), 'agents')
+  const home = (environment.USERPROFILE || environment.HOME || '').trim()
+  return home ? path.join(path.resolve(home), '.codex', 'agents') : ''
+}
+
+function comparableDirectory(directory) {
+  let resolved = path.resolve(directory)
+  try {
+    resolved = fs.realpathSync.native(resolved)
+  } catch {}
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+}
+
 function rejectProjectRoleCollisions(options, agents) {
   const privateAgents = new Set(agents)
+  const globalAgents = globalCodexAgentsDirectory()
+  const globalIdentity = globalAgents ? comparableDirectory(globalAgents) : ''
   for (const directory of projectConfigDirectories(options.workspacePath)) {
     if (!fs.existsSync(directory) || !fs.statSync(directory).isDirectory()) continue
+    if (globalIdentity && comparableDirectory(directory) === globalIdentity) continue
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       if (entry.isFile() && privateAgents.has(entry.name)) {
         fail(`project role shadows the private Autoprompt cast: ${entry.name}`)
@@ -188,6 +206,7 @@ module.exports = {
   main,
   parseArgs,
   parseProfile,
+  globalCodexAgentsDirectory,
   projectConfigDirectories,
   relativeConfigPath,
   renderProfile,

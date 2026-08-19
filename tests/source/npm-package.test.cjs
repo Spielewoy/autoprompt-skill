@@ -151,7 +151,7 @@ function dryRunPackResult() {
 test('package metadata is public-ready under the exact available name and remains dependency-free', () => {
   const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'))
   assert.equal(packageJson.name, 'autoprompt-skill')
-  assert.equal(packageJson.version, '1.0.1')
+  assert.equal(packageJson.version, '1.0.2')
   assert.equal(
     packageJson.description,
     'Autoprompt is a coding-agent skill that cuts failures by 45% on agentic coding tasks.',
@@ -162,7 +162,10 @@ test('package metadata is public-ready under the exact available name and remain
     registry: 'https://registry.npmjs.org/',
   })
   assert.deepEqual(packageJson.engines, { node: '>=20.0.0' })
-  assert.deepEqual(packageJson.bin, { autoprompt: 'bin/autoprompt.cjs' })
+  assert.deepEqual(packageJson.bin, {
+    autoprompt: 'bin/autoprompt.cjs',
+    'autoprompt-skill': 'bin/autoprompt.cjs',
+  })
   assert.equal(packageJson.dependencies, undefined)
   assert.equal(packageJson.devDependencies, undefined)
   assert.equal(packageJson.optionalDependencies, undefined)
@@ -246,7 +249,7 @@ test('package metadata is public-ready under the exact available name and remain
 test('npm dry-run inventory is an exact allowlist and excludes repository-only material', () => {
   const result = dryRunPackResult()
   assert.equal(result.name, 'autoprompt-skill')
-  assert.equal(result.version, '1.0.1')
+  assert.equal(result.version, '1.0.2')
   const actual = result.files.map(file => file.path).sort()
   assert.deepEqual(actual, packageFilesOnDisk())
   assert.ok(result.size > 0)
@@ -346,31 +349,33 @@ test('packed tarball installs into an isolated temporary global prefix and its s
     ], { env })
     assert.equal(installed.status, 0, installed.stderr)
 
-    const shim = process.platform === 'win32'
-      ? path.join(prefix, 'autoprompt.cmd')
-      : path.join(prefix, 'bin', 'autoprompt')
-    assert.equal(fs.existsSync(shim), true, shim)
+    for (const command of ['autoprompt', 'autoprompt-skill']) {
+      const shim = process.platform === 'win32'
+        ? path.join(prefix, `${command}.cmd`)
+        : path.join(prefix, 'bin', command)
+      assert.equal(fs.existsSync(shim), true, shim)
 
-    const invoked = process.platform === 'win32'
-      ? childProcess.spawnSync(
-        process.env.ComSpec || 'cmd.exe',
-        ['/d', '/s', '/c', `call "${shim}" version`],
-        {
+      const invoked = process.platform === 'win32'
+        ? childProcess.spawnSync(
+          process.env.ComSpec || 'cmd.exe',
+          ['/d', '/s', '/c', `call "${shim}" version`],
+          {
+            cwd: temporaryRoot,
+            encoding: 'utf8',
+            env,
+            shell: false,
+            windowsVerbatimArguments: true,
+          },
+        )
+        : childProcess.spawnSync(shim, ['version'], {
           cwd: temporaryRoot,
           encoding: 'utf8',
           env,
           shell: false,
-          windowsVerbatimArguments: true,
-        },
-      )
-      : childProcess.spawnSync(shim, ['version'], {
-        cwd: temporaryRoot,
-        encoding: 'utf8',
-        env,
-        shell: false,
-      })
-    assert.equal(invoked.status, 0, invoked.stderr)
-    assert.equal(invoked.stdout, '1.0.1\n')
+        })
+      assert.equal(invoked.status, 0, invoked.stderr)
+      assert.equal(invoked.stdout, '1.0.2\n')
+    }
   } finally {
     fs.rmSync(temporaryRoot, { recursive: true, force: true })
   }

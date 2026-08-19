@@ -2167,6 +2167,9 @@ function Remove-IdemCommitRecoveries {
 
 function Undo-IdemManagedChanges {
     param([int]$FromIndex = 0)
+    if ($FromIndex -ge $script:AutopromptManagedUndoJournal.Count) {
+        return $true
+    }
     $retained = @()
     if ($FromIndex -gt 0) {
         $retained = @($script:AutopromptManagedUndoJournal[0..($FromIndex - 1)])

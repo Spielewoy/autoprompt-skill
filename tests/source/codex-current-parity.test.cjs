@@ -11,11 +11,12 @@ const root = path.resolve(__dirname, '..', '..')
 const castingTool = path.join(root, 'agents', 'codex', 'workflow', 'codex-agent-casting.js')
 const profileTool = path.join(root, 'agents', 'codex', 'workflow', 'codex-agent-profile.js')
 
-function runNode(script, args) {
+function runNode(script, args, options = {}) {
   return spawnSync(process.execPath, [script, ...args], {
     cwd: root,
     encoding: 'utf8',
     env: { ...process.env, CODEX_AGENTS_DIR: os.tmpdir() },
+    ...options,
   })
 }
 
@@ -113,4 +114,49 @@ test('profile writes only the canonical concurrency key and verifies determinist
   const legacyVerify = runNode(profileTool, verifyArgs)
   assert.notEqual(legacyVerify.status, 0)
   assert.match(legacyVerify.stderr, /profile .* casting manifest|concurrency/i)
+})
+
+test('profile ignores the global Codex cast but still rejects project role collisions', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-profile-scope-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const home = path.join(directory, 'home')
+  const codexHome = path.join(home, '.codex')
+  const globalAgents = path.join(codexHome, 'agents')
+  const stageAgents = path.join(directory, 'stage', 'agents-runtime')
+  const profilePath = path.join(directory, 'stage', 'autoprompt.config.toml')
+  fs.mkdirSync(globalAgents, { recursive: true })
+  fs.mkdirSync(stageAgents, { recursive: true })
+  writeAgent(globalAgents, 'ap-test', 'max')
+  writeAgent(stageAgents, 'ap-test', 'max')
+  fs.writeFileSync(path.join(stageAgents, '.autoprompt-casting.json'), JSON.stringify({
+    agents: ['ap-test.toml'],
+  }))
+  const env = {
+    ...process.env,
+    CODEX_AGENTS_DIR: stageAgents,
+    CODEX_HOME: codexHome,
+    HOME: home,
+    USERPROFILE: home,
+  }
+
+  const globalResult = runNode(profileTool, [
+    '--write',
+    '--agents-dir', stageAgents,
+    '--profile', profilePath,
+  ], { cwd: home, env })
+  assert.equal(globalResult.status, 0, globalResult.stderr)
+
+  const project = path.join(directory, 'project')
+  const projectAgents = path.join(project, '.codex', 'agents')
+  fs.mkdirSync(path.join(project, '.git'), { recursive: true })
+  fs.mkdirSync(projectAgents, { recursive: true })
+  writeAgent(projectAgents, 'ap-test', 'max')
+  const projectResult = runNode(profileTool, [
+    '--verify',
+    '--agents-dir', stageAgents,
+    '--profile', profilePath,
+    '--workspace', project,
+  ], { env })
+  assert.notEqual(projectResult.status, 0)
+  assert.match(projectResult.stderr, /project role shadows the private Autoprompt cast: ap-test\.toml/)
 })
