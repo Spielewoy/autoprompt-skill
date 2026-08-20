@@ -39,7 +39,7 @@ fi
 # shellcheck source=/dev/null
 . "$LIB"
 
-CLIENTS_ALL=(claude codex opencode kilo vscode prime)
+CLIENTS_ALL=(claude codex opencode kilo vscode prime omp)
 
 # Per-run result rows for the matrix (RESULT=/SKIP= lines), filled in this shell.
 RESULT_ROWS=()
@@ -137,6 +137,42 @@ install_prime_lifecycle() {
   printf 'Autoprompt install (prime): PASS - landed %s (48 files, rlmMaxDepth=4).\n' \
     "$destination" >&2
   RESULT_ROWS+=("RESULT=PASS client=prime dest=$destination format=prime-package detail=files=48")
+}
+
+install_omp_lifecycle() {
+  local helper="$SCRIPT_DIR/omp-lifecycle.cjs" output rc destination omp_cli
+  omp_cli="$(type -P -- "${AUTOPROMPT_CLIENT_BIN[omp]}" 2>/dev/null)" || omp_cli=""
+  if ! command -v node >/dev/null 2>&1 || [ ! -f "$helper" ]; then
+    printf '%s\n' \
+      'Autoprompt install (omp): node or the omp lifecycle helper is missing.' >&2
+    RESULT_ROWS+=("RESULT=FAIL client=omp stage=runtime")
+    ANY_FAIL=1
+    return 1
+  fi
+  if [ -n "$omp_cli" ]; then
+    output="$(node "$helper" install --repo-root "$REPO_ROOT" --omp-cli "$omp_cli")"
+  else
+    output="$(node "$helper" install --repo-root "$REPO_ROOT")"
+  fi
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$output" ]; then
+    printf 'Autoprompt install (omp): failed (code %s).\n' "$rc" >&2
+    RESULT_ROWS+=("RESULT=FAIL client=omp stage=lifecycle")
+    ANY_FAIL=1
+    return 1
+  fi
+  destination="$(node -e \
+    'const value=JSON.parse(process.argv[1]); process.stdout.write(value.health.packageRoot)' \
+    "$output" 2>/dev/null)" || destination=""
+  if [ -z "$destination" ]; then
+    printf '%s\n' 'Autoprompt install (omp): invalid lifecycle result.' >&2
+    RESULT_ROWS+=("RESULT=FAIL client=omp stage=lifecycle-output")
+    ANY_FAIL=1
+    return 1
+  fi
+  printf 'Autoprompt install (omp): PASS - landed %s (skills, 25 agents, command, maxRecursionDepth>=4).\n' \
+    "$destination" >&2
+  RESULT_ROWS+=("RESULT=PASS client=omp dest=$destination format=omp-package detail=files=51")
 }
 
 # codex_config_file, extras source + destination helpers.
@@ -1417,11 +1453,45 @@ main() {
     done
     local -a ordinary=()
     for c in "${present[@]}"; do
-      if [ "$c" = prime ]; then install_prime_lifecycle || true
+      if [ "$c" = prime ] || [ "$c" = omp ]; then
+        if [ "$c" = prime ]; then install_prime_lifecycle || true; else install_omp_lifecycle || true; fi
       else ordinary+=("$c")
       fi
     done
     [ "${#ordinary[@]}" -gt 0 ] && install_batch "${ordinary[@]}"
+    print_matrix
+    exit "$(install_exit_code)"
+  fi
+
+  # Single client.
+  local status reason
+  status="$(provider_status "$target")" || status=""
+  if [ -z "$status" ]; then
+    printf 'Autoprompt install: unknown client %s.\n' "$target" >&2
+    usage; exit 2
+  fi
+  case "$status" in
+    blocked|retired|unverified)
+      reason="$(provider_block_reason "$target")"
+      printf 'Autoprompt install (%s): REFUSED - status=%s reason=%s.\n' \
+        "$target" "$status" "$reason" >&2
+      RESULT_ROWS+=("RESULT=FAIL client=$target stage=compatibility reason=$reason")
+      print_matrix
+      exit 3
+      ;;
+  esac
+  if ! detect_client "$target" >/dev/null 2>&1; then
+    printf 'Autoprompt install (%s): SKIP - CLI not detected on PATH. Install it and re-run.\n' "$target" >&2
+    RESULT_ROWS+=("SKIP=skip client=$target reason=not-detected")
+    print_matrix; exit 0
+  fi
+  if [ "$target" = prime ]; then
+    install_prime_lifecycle || true
+    print_matrix
+    exit "$(install_exit_code)"
+  fi
+  if [ "$target" = omp ]; then
+    install_omp_lifecycle || true
     print_matrix
     exit "$(install_exit_code)"
   fi

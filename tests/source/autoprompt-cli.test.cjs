@@ -290,13 +290,13 @@ test('interactive no-argument launch numbers every install provider plus the cus
   assert.ok(result.stdout.indexOf('Checking for updates...') < result.stdout.indexOf('Pick a coding agent:'))
   assert.match(result.stdout, /Pick a coding agent:/)
   for (const [index, provider] of PROVIDERS.entries()) {
-    assert.match(result.stdout, new RegExp(`${index + 1}\\) ${provider.label}`))
+    assert.ok(result.stdout.includes(`${index + 1}) ${provider.label}`))
   }
-  assert.match(result.stdout, /7\) Custom coding agent/)
-  assert.match(result.stdout, /Provider \[1-7, Esc\]: /)
+  assert.match(result.stdout, /8\) Custom coding agent/)
+  assert.match(result.stdout, /Provider \[1-8, Esc\]: /)
   assert.deepEqual(
     PROVIDERS.map(provider => provider.id),
-    ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime'],
+    ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime', 'omp'],
   )
   assert.equal(PROVIDERS.some(provider => provider.id === 'vibe'), false)
   assert.match(result.stdout, new RegExp(`Detected path: ${codexHome.replaceAll('\\', '\\\\')}`))
@@ -609,7 +609,7 @@ test('interactive launch from a repo checkout does not self-install a newer regi
 
 test('interactive custom coding agent option exits safely with the compatibility guide URL', () => {
   const result = invoke([], {
-    answers: ['7'],
+    answers: ['8'],
     interactive: true,
   })
 
@@ -742,7 +742,7 @@ test('interactive prompts reject invalid choices and closed input without mutati
     responses: [{ status: 0 }],
   })
   assert.equal(retried.status, 0)
-  assert.match(retried.stdout, /Enter a number from 1 to 7\./)
+  assert.match(retried.stdout, /Enter a number from 1 to 8\./)
   assert.match(retried.stdout, /Please answer Y or N\./)
   assert.equal(retried.calls[0].args.at(-1), 'vscode')
 
@@ -803,6 +803,9 @@ test('provider install locations match default config roots and external VS Code
       },
       prime: {
         roots: [{ label: 'Install directory', path: env.PRIME_AGENT_CODING_AGENT_DIR }],
+      },
+      omp: {
+        roots: [{ label: 'Install directory', path: path.join(home, '.omp', 'agent') }],
       },
     },
   )
@@ -1072,8 +1075,8 @@ test('interactive custom root warns on mismatched strong markers, re-prompts on 
   }
 })
 
-test('help stays lean and names only the six public providers', () => {
-  assert.match(HELP_TEXT, /Interactive providers: claude, codex, opencode, kilo, vscode, prime\./)
+test('help stays lean and names only the seven public providers', () => {
+  assert.match(HELP_TEXT, /Interactive providers: claude, codex, opencode, kilo, vscode, prime, omp./)
   assert.doesNotMatch(HELP_TEXT, /\b(?:vibe|cursor|dcode|roo|gemini|cline|goose)\b/i)
   assert.match(HELP_TEXT, /^  autoprompt update$/m)
 })

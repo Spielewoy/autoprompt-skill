@@ -19,7 +19,7 @@ fi
 # shellcheck source=/dev/null
 . "$LIB"
 
-CLIENTS_ALL=(prime vscode claude codex opencode kilo)
+CLIENTS_ALL=(prime omp vscode claude codex opencode kilo)
 LEGACY_CLEANUP_CLIENTS=(vibe cursor roo gemini cline goose dcode)
 RESULT_ROWS=()
 UNINSTALL_EXIT_CODE=0
@@ -97,6 +97,36 @@ uninstall_prime_lifecycle() {
   RESULT_ROWS+=("RESULT=OK client=prime removed=48")
 }
 
+uninstall_omp_lifecycle() {
+  local root helper output rc
+  root="$(config_root omp)"
+  if [ ! -f "$root/.autoprompt-omp-install.json" ]; then
+    printf 'Autoprompt uninstall (omp): SKIP - no install receipt under %s.\n' \
+      "$root" >&2
+    RESULT_ROWS+=("SKIP=skip client=omp reason=no-receipt")
+    return 0
+  fi
+  helper="$SCRIPT_DIR/omp-lifecycle.cjs"
+  if ! command -v node >/dev/null 2>&1 || [ ! -f "$helper" ]; then
+    printf '%s\n' \
+      'Autoprompt uninstall (omp): node or the omp lifecycle helper is missing.' >&2
+    RESULT_ROWS+=("RESULT=FAIL client=omp code=3")
+    UNINSTALL_EXIT_CODE=1
+    return 0
+  fi
+  output="$(node "$helper" uninstall --repo-root "$REPO_ROOT")"
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$output" ]; then
+    printf 'Autoprompt uninstall (omp): failed (code %s).\n' "$rc" >&2
+    RESULT_ROWS+=("RESULT=FAIL client=omp code=$rc")
+    UNINSTALL_EXIT_CODE=1
+    return 0
+  fi
+  printf '%s\n' \
+    'Autoprompt uninstall (omp): OK - removed 59 files and owned config.' >&2
+  RESULT_ROWS+=("RESULT=OK client=omp removed=59")
+}
+
 print_matrix() {
   local line client detail
   printf '\n==== Autoprompt uninstall matrix ====\n'
@@ -120,6 +150,7 @@ main() {
     local c root
     for c in "${CLIENTS_ALL[@]}"; do
       if [ "$c" = prime ]; then uninstall_prime_lifecycle
+      elif [ "$c" = omp ]; then uninstall_omp_lifecycle
       else
         root="$(config_root "$c")"
         uninstall_root "$root" "$c"
@@ -137,6 +168,7 @@ main() {
     usage; exit 2
   fi
   if [ "$target" = prime ]; then uninstall_prime_lifecycle
+  elif [ "$target" = omp ]; then uninstall_omp_lifecycle
   else uninstall_root "$(config_root "$target")" "$target"
   fi
   print_matrix

@@ -30,7 +30,7 @@ $AutopromptInstallRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../..'))
 $AutopromptClientBin = @{
     claude = 'claude'; codex = 'codex'; cursor = 'cursor-agent'; roo = 'roo';
     opencode = 'opencode'; kilo = 'kilo'; vscode = 'code';
-    prime = 'prime-agent';
+    prime = 'prime-agent'; omp = 'omp';
     dcode = 'dcode'; gemini = 'gemini'; cline = 'cline'; goose = 'goose'
 }
 $AutopromptVersionFlag = '--version'
@@ -40,7 +40,7 @@ $AutopromptProbeTimeout = 30
 # path resolvers remain below only for receipt-owned cleanup of earlier installs.
 $AutopromptProviderStatus = @{
     claude = 'supported'; codex = 'supported'; opencode = 'supported';
-    kilo = 'supported'; vscode = 'supported'; prime = 'supported'
+    kilo = 'supported'; vscode = 'supported'; prime = 'supported'; omp = 'supported'
 }
 $AutopromptProviderBlockReason = @{}
 
@@ -456,6 +456,12 @@ function Get-AutopromptConfigRoot {
             }
             return (Join-Path $userHome '.prime/agent')
         }
+        'omp' {
+            if ($env:PI_CODING_AGENT_DIR) {
+                return $env:PI_CODING_AGENT_DIR
+            }
+            return (Join-Path $userHome '.omp/agent')
+        }
         default { return $userHome }
     }
 }
@@ -811,7 +817,7 @@ function Format-Skill {
 $AutopromptVersionFloor = @{
     claude = '2.1.219'; cursor = '2.5'; cline = '3.58'; opencode = '1.18.7';
     kilo = '7.4.22';
-    vscode = '1.133.0'; prime = '0.7.2'
+    vscode = '1.133.0'; prime = '0.7.2'; omp = '17.3.8'
 }
 $AutopromptPrecheckMarkerPrefix = '.autoprompt-precheck'
 

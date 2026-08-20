@@ -49,6 +49,7 @@ A copied `SKILL.md` is not enough. The host needs a native adapter and a safe li
 | Kilo | 7.4.22+; checked on 7.4.22 | Skill, Markdown subagents, activation profile | Inherits active model |
 | VS Code | 1.133+ with Copilot 0.61.0 | Copilot skill, `.agent.md` roles, recursive setting | Inherits active model |
 | Prime Agent | 0.7.2; checked on 0.7.2 | Native package, personas, framework prompts, guarded recursion | Inherits selected parent model |
+| oh-my-pi (omp) | 17.3.8+; checked on 17.4.0 | Skill, Markdown agents (`task` dispatch), frameworks, recursive runtime | Inherits active model |
 
 See the [support notes](../faq/which-coding-agents-are-supported.md).
 

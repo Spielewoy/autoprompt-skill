@@ -35,10 +35,17 @@ function run(command, args, options = {}) {
 function findBash() {
   const candidates = process.platform === 'win32'
     ? [
-        path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe'),
+        process.env.ProgramFiles ? `${process.env.ProgramFiles}\\Git\\bin\\bash.exe` : null,
+        process.env['ProgramFiles(x86)'] ? `${process.env['ProgramFiles(x86)']}\\Git\\bin\\bash.exe` : null,
+        process.env.ProgramW6432 ? `${process.env.ProgramW6432}\\Git\\bin\\bash.exe` : null,
+        'D:\\Program Files\\Git\\bin\\bash.exe',
+        'C:\\Program Files\\Git\\bin\\bash.exe',
+        process.env.ProgramFiles ? `${process.env.ProgramFiles}\\Git\\usr\\bin\\bash.exe` : null,
+        'D:\\Program Files\\Git\\usr\\bin\\bash.exe',
+        'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
         path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Git', 'bin', 'bash.exe'),
         'bash',
-      ]
+      ].filter(Boolean)
     : ['bash']
   for (const candidate of candidates) {
     if (run(candidate, ['--version']).status === 0) return candidate

@@ -10,7 +10,7 @@ const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const PACKAGE_PATH = path.join(ROOT, 'package.json')
-const PROVIDERS = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']
+const PROVIDERS = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime', 'omp']
 
 function filesBelow(directory) {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
@@ -215,12 +215,14 @@ test('package metadata is public-ready under the exact available name and remain
     'agents/kilo/',
     'agents/vscode/',
     'agents/prime/',
+    'agents/omp/',
     'agents/manifests/claude-runtime.json',
     'agents/manifests/codex-runtime.json',
     'agents/manifests/opencode-runtime.json',
     'agents/manifests/kilo-runtime.json',
     'agents/manifests/vscode-runtime.json',
     'agents/manifests/prime-runtime.json',
+    'agents/manifests/omp-runtime.json',
     'assets/anatomy.svg',
     'assets/banner.svg',
     'assets/how-it-works-hierarchy.svg',

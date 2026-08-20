@@ -24,7 +24,7 @@ fi
 # shellcheck source=/dev/null
 . "$LIB"
 
-CLIENTS_ALL=(claude codex opencode kilo vscode prime)
+CLIENTS_ALL=(claude codex opencode kilo vscode prime omp)
 
 config_root() {
   local client="$1"

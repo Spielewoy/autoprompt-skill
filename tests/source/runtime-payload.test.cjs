@@ -32,13 +32,13 @@ test('committed runtime manifests match every provider source file', () => {
   assert.match(completed.stdout, /runtime manifests are current/)
 })
 
-test('all six public provider payloads contain the complete product', () => {
+test('all seven public provider payloads contain the complete product', () => {
   const contract = require('../../agents/contracts/autoprompt.contract.json')
   assert.equal(contract.personas.length, 25)
   assert.equal(contract.frameworks.length, 18)
 
   const manifests = renderManifests(ROOT)
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode']) {
+  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'omp']) {
     const manifest = manifests.get(`agents/manifests/${provider}-runtime.json`)
     assert.ok(manifest.files.includes('GATES.md'))
     assert.ok(manifest.files.includes('MODES.md'))
@@ -52,12 +52,14 @@ test('all six public provider payloads contain the complete product', () => {
   const opencode = manifests.get('agents/manifests/opencode-runtime.json')
   const kilo = manifests.get('agents/manifests/kilo-runtime.json')
   const vscode = manifests.get('agents/manifests/vscode-runtime.json')
+  const omp = manifests.get('agents/manifests/omp-runtime.json')
   const prime = manifests.get('agents/manifests/prime-runtime.json')
   assert.equal(claude.files.filter(file => /^agents\/ap-.*\.md$/.test(file)).length, 25)
   assert.equal(codex.files.filter(file => /^agents\/ap-.*\.toml$/.test(file)).length, 25)
   assert.equal(opencode.files.filter(file => /^agents\/ap-.*\.md$/.test(file)).length, 25)
   assert.equal(kilo.files.filter(file => /^agents\/ap-.*\.md$/.test(file)).length, 25)
   assert.equal(vscode.files.filter(file => /^agents\/ap-.*\.agent\.md$/.test(file)).length, 25)
+  assert.equal(omp.files.filter(file => /^agents\/ap-.*\.md$/.test(file)).length, 25)
   assert.equal(prime.files.filter(file => /^personas\/ap-.*\.md$/.test(file)).length, 25)
   assert.equal(prime.files.filter(file => /^prompts\/frameworks\/.*\.md$/.test(file)).length, 18)
   assert.ok(claude.files.includes('workflow/autoprompt-gate.js'))
@@ -68,6 +70,10 @@ test('all six public provider payloads contain the complete product', () => {
   assert.ok(kilo.files.includes('autoprompt.kilo.json'))
   assert.ok(vscode.files.includes('SKILL.md'))
   assert.ok(vscode.files.includes('README.md'))
+  assert.ok(omp.files.includes('autoprompt-models.schema.md'))
+  assert.ok(omp.files.includes('workflow/supervisor.sh'))
+  assert.ok(omp.files.includes('workflow/model-casting.js'))
+  assert.equal(omp.files.length, 57)
   assert.ok(prime.files.includes('package.json'))
   assert.ok(prime.files.includes('extensions/autoprompt.ts'))
   assert.ok(prime.files.includes('skills/autoprompt/SKILL.md'))
@@ -77,7 +83,7 @@ test('all six public provider payloads contain the complete product', () => {
 })
 
 test('each provider installs and verifies as a complete isolated payload', () => {
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']) {
+  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime', 'omp']) {
     const destination = temporaryDirectory(`autoprompt-${provider}-`)
     try {
       const installed = installPayload(provider, destination, ROOT)

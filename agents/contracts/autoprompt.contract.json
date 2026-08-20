@@ -707,6 +707,45 @@
         "explicit-agent-allowlists",
         "selected-model-inheritance"
       ]
+    },
+    "omp": {
+      "frontmatter": {
+        "required": [
+          "name",
+          "description",
+          "tools",
+          "spawns"
+        ],
+        "model": "omit"
+      },
+      "capabilities": [
+        "native-markdown-subagents",
+        "task-tool-dispatch",
+        "recursive-subagents",
+        "selected-model-inheritance",
+        "explicit-child-allowlists"
+      ],
+      "runtimePrerequisites": {
+        "task.maxRecursionDepth": 4
+      },
+      "settingsLifecycle": {
+        "edit": "transactional",
+        "backup": "byte-exact",
+        "restore": [
+          "rollback",
+          "uninstall"
+        ],
+        "unsafeJsonc": "refuse",
+        "conflicts": "refuse"
+      },
+      "allowedDeltas": [
+        "skill-frontmatter",
+        "markdown-agent-export",
+        "agent-tool-alias",
+        "explicit-agent-allowlists",
+        "selected-model-inheritance",
+        "task-dispatch-mapping"
+      ]
     }
   },
   "generated": {
@@ -723,6 +762,8 @@
     "kiloAgents": "agents/kilo/agents",
     "kiloFrameworks": "agents/kilo/frameworks",
     "vscodeAgents": "agents/vscode/agents",
-    "vscodeFrameworks": "agents/vscode/frameworks"
+    "vscodeFrameworks": "agents/vscode/frameworks",
+    "ompAgents": "agents/omp/agents",
+    "ompFrameworks": "agents/omp/frameworks"
   }
 }

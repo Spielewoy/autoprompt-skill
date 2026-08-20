@@ -60,6 +60,19 @@ const PROVIDERS = {
     agents: 'vscode-personas',
     workflow: [],
   },
+  omp: {
+    topLevel: ['GATES.md', 'MODES.md', 'PLAYBOOKS.md', 'README.md', 'SKILL.md', 'VERSION', 'autoprompt-models.schema.md'],
+    agents: 'personas',
+    workflow: [
+      'agent-definitions-cli.js',
+      'autoprompt-gate.js',
+      'autoprompt-ledger-check.js',
+      'model-casting.js',
+      'phase-budget.js',
+      'supervisor.ps1',
+      'supervisor.sh',
+    ],
+  },
 }
 
 function canonicalBytes(filePath) {

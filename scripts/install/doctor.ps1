@@ -23,7 +23,7 @@ if (-not (Test-Path -LiteralPath $Lib -PathType Leaf)) {
 }
 . $Lib
 
-$ClientsAll = @('claude','codex','opencode','kilo','vscode','prime')
+$ClientsAll = @('claude','codex','opencode','kilo','vscode','prime','omp')
 
 function Get-HomeDir {
     if ($env:HOME) { return $env:HOME }
@@ -363,6 +363,50 @@ function Get-ClientStatus {
             $verifies = 'no'
             $reason = 'version-mismatch'
             $extras = 'invalid:version-mismatch'
+        }
+        return @{
+            Detected = $detected; Installed = $installed; Verifies = $verifies
+            Version = $version; Reason = $reason; Extras = $extras
+            Mode = '-'; Support = 'supported'
+        }
+    }
+    if ($Client -ceq 'omp') {
+        $root = Get-ConfigRoot -Client 'omp'
+        $det = Invoke-LibCapture -Call { Detect-Client -Name 'omp' }
+        $detected = if ($det.Code -eq 0) { 'yes' } else { 'no' }
+        $version = if ($det.Code -eq 0) {
+            $det.Record -replace '^.*version=', ''
+        } else { '-' }
+        $installed = if (Test-Path -LiteralPath (
+            Join-Path $root '.autoprompt-omp-install.json'
+        ) -PathType Leaf) { 'yes' } else { 'no' }
+        $verifies = 'no'
+        $reason = '-'
+        $extras = 'invalid:omp-lifecycle'
+        $helper = Join-Path $ScriptDir 'omp-lifecycle.cjs'
+        $ompCommand = if ($detected -ceq 'yes') {
+            Get-Command $AutopromptClientBin['omp'] -CommandType Application `
+                -ErrorAction SilentlyContinue | Select-Object -First 1
+        } else { $null }
+        $ompCli = if ($ompCommand) { [string]$ompCommand.Source } else { '' }
+        if (-not (Get-Command node -ErrorAction SilentlyContinue) -or
+            -not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+            $reason = 'runtime-unavailable'
+        } else {
+            $arguments = @($helper, 'doctor', '--repo-root', $RepoRoot)
+            if ($detected -ceq 'yes' -and -not [string]::IsNullOrEmpty($ompCli)) {
+                $arguments += @('--omp-cli', $ompCli)
+            }
+            $output = @(& node @arguments 2>&1)
+            $code = $LASTEXITCODE
+            if ($code -eq 0) {
+                $verifies = 'yes'
+                $extras = 'complete'
+            } else {
+                $match = [regex]::Match(($output -join "`n"), '"reason":"([^"]+)"')
+                if ($match.Success) { $reason = $match.Groups[1].Value }
+                else { $reason = 'omp-lifecycle-invalid' }
+            }
         }
         return @{
             Detected = $detected; Installed = $installed; Verifies = $verifies

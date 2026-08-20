@@ -30,7 +30,7 @@ AUTOPROMPT_INSTALL_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && 
 declare -A AUTOPROMPT_CLIENT_BIN=(
   [claude]=claude [codex]=codex [cursor]=cursor-agent [roo]=roo
   [opencode]=opencode [kilo]=kilo [vscode]=code
-  [prime]=prime-agent
+  [prime]=prime-agent [omp]=omp
   [dcode]=dcode [gemini]=gemini [cline]=cline [goose]=goose
 )
 AUTOPROMPT_VERSION_FLAG="--version"
@@ -40,7 +40,7 @@ AUTOPROMPT_PROBE_TIMEOUT=10
 # path resolvers remain below only for receipt-owned cleanup of earlier installs.
 declare -A AUTOPROMPT_PROVIDER_STATUS=(
   [claude]=supported [codex]=supported [opencode]=supported
-  [kilo]=supported [vscode]=supported [prime]=supported
+  [kilo]=supported [vscode]=supported [prime]=supported [omp]=supported
 )
 declare -A AUTOPROMPT_PROVIDER_BLOCK_REASON=()
 
@@ -146,6 +146,7 @@ autoprompt_config_root() {
     opencode|kilo) resolve_xdg "$home" ;;
     vibe) printf '%s' "${VIBE_HOME:-$home/.vibe}" ;;
     prime) printf '%s' "${PRIME_AGENT_CODING_AGENT_DIR:-$home/.prime/agent}" ;;
+    omp) printf '%s' "${PI_CODING_AGENT_DIR:-$home/.omp/agent}" ;;
     *) printf '%s' "$home" ;;
   esac
 }

@@ -14,7 +14,7 @@ const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
 const GIT_BASH = process.platform === 'win32'
   ? 'C:\\Program Files\\Git\\bin\\bash.exe'
   : 'bash'
-const PUBLIC_CLIENTS = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']
+const PUBLIC_CLIENTS = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime', 'omp']
 const SHARED_LIFECYCLE_CLIENTS = PUBLIC_CLIENTS.filter(client => client !== 'prime')
 const CLIENT_COMMANDS = {
   claude: ['claude', 'Claude Code 2.1.232'],

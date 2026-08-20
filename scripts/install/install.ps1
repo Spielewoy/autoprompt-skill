@@ -33,7 +33,7 @@ if (-not (Test-Path -LiteralPath $Lib -PathType Leaf)) {
 }
 . $Lib
 
-$ClientsAll = @('claude','codex','opencode','kilo','vscode','prime')
+$ClientsAll = @('claude','codex','opencode','kilo','vscode','prime','omp')
 $script:ResultRows = @()
 $script:AnyFail = 0
 $script:IsRecoveryRetained = $false
@@ -155,6 +155,51 @@ function Install-PrimeLifecycle {
             "Autoprompt install (prime): invalid lifecycle result: $($_.Exception.Message)"
         )
         $script:ResultRows += 'RESULT=FAIL client=prime stage=lifecycle-output'
+        $script:AnyFail = 1
+    }
+}
+
+function Install-OmpLifecycle {
+    $helper = Join-Path $ScriptDir 'omp-lifecycle.cjs'
+    if (-not (Get-Command node -ErrorAction SilentlyContinue) -or
+        -not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        [Console]::Error.WriteLine(
+            'Autoprompt install (omp): node or the omp lifecycle helper is missing.'
+        )
+        $script:ResultRows += 'RESULT=FAIL client=omp stage=runtime'
+        $script:AnyFail = 1
+        return
+    }
+    $ompCommand = Get-Command $AutopromptClientBin['omp'] `
+        -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $ompCli = if ($ompCommand) { [string]$ompCommand.Source } else { '' }
+    if (-not [string]::IsNullOrEmpty($ompCli)) {
+        $output = @(& node $helper install --repo-root $RepoRoot --omp-cli $ompCli)
+    } else {
+        $output = @(& node $helper install --repo-root $RepoRoot)
+    }
+    $code = $LASTEXITCODE
+    if ($code -ne 0 -or $output.Count -eq 0) {
+        [Console]::Error.WriteLine(
+            "Autoprompt install (omp): failed (code $code)."
+        )
+        $script:ResultRows += 'RESULT=FAIL client=omp stage=lifecycle'
+        $script:AnyFail = 1
+        return
+    }
+    try {
+        $result = $output[-1] | ConvertFrom-Json
+        $destination = [string]$result.health.packageRoot
+        if ([string]::IsNullOrEmpty($destination)) { throw 'missing package root' }
+        [Console]::Error.WriteLine(
+            "Autoprompt install (omp): PASS -- landed $destination (skills, 25 agents, command, maxRecursionDepth>=4)."
+        )
+        $script:ResultRows += "RESULT=PASS client=omp dest=$destination format=omp-package detail=files=51"
+    } catch {
+        [Console]::Error.WriteLine(
+            "Autoprompt install (omp): invalid lifecycle result: $($_.Exception.Message)"
+        )
+        $script:ResultRows += 'RESULT=FAIL client=omp stage=lifecycle-output'
         $script:AnyFail = 1
     }
 }
@@ -1834,6 +1879,10 @@ if ($Target -eq 'all') {
         Install-PrimeLifecycle
         $present = @($present | Where-Object { $_ -cne 'prime' })
     }
+    if ($present -contains 'omp') {
+        Install-OmpLifecycle
+        $present = @($present | Where-Object { $_ -cne 'omp' })
+    }
     if ($present.Count -gt 0) { Install-Batch -Clients $present }
     Write-Matrix
     exit (Get-InstallExitCode)
@@ -1861,6 +1910,11 @@ if ($det.Code -ne 0) {
 }
 if ($Target -ceq 'prime') {
     Install-PrimeLifecycle
+    Write-Matrix
+    exit (Get-InstallExitCode)
+}
+if ($Target -ceq 'omp') {
+    Install-OmpLifecycle
     Write-Matrix
     exit (Get-InstallExitCode)
 }

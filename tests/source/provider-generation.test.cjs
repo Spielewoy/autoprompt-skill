@@ -133,7 +133,7 @@ test('provider-native prompts are deterministic generated views', () => {
   }
 })
 
-test('every canonical persona has complete forms for all six public providers', () => {
+test('every canonical persona has complete forms for all seven public providers', () => {
   const contract = JSON.parse(fs.readFileSync(CONTRACT_PATH, 'utf8'))
 
   for (const persona of contract.personas) {
@@ -145,6 +145,7 @@ test('every canonical persona has complete forms for all six public providers', 
     const kilo = read(`agents/kilo/agents/${persona.id}.md`)
     const vscode = read(`agents/vscode/agents/${persona.id}.agent.md`)
     const prime = read(`agents/prime/personas/${persona.id}.md`)
+    const omp = read(`agents/omp/agents/${persona.id}.md`)
 
     assert.equal(claude, canonical, `${persona.id} Claude source`)
     assert.match(codex, new RegExp(`^name = "${persona.id}"$`, 'm'))
@@ -171,6 +172,10 @@ test('every canonical persona has complete forms for all six public providers', 
     assert.doesNotMatch(vscode, /[\u2013\u2014]/, `${persona.id} must use ASCII punctuation`)
 
     assert.equal(prime.trim(), body.trim(), `${persona.id} Prime body`)
+    const ompBody = stripFrontmatter(omp).trim().replace(/\r\n/g, '\n')
+    assert.ok(ompBody.includes(`You are **${persona.id}**`), `${persona.id} OMP body identity`)
+    assert.ok(ompBody.length > 800, `${persona.id} OMP body substantial`)
+    assert.match(omp, new RegExp(`^name: ${persona.id}$`, 'm'))
   }
 })
 
@@ -178,7 +183,7 @@ test('all providers expose the same framework set', () => {
   const contract = JSON.parse(fs.readFileSync(CONTRACT_PATH, 'utf8'))
   const expected = contract.frameworks.map(framework => `${framework.id}.md`).sort()
 
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode']) {
+  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'omp']) {
     const actual = fs.readdirSync(path.join(ROOT, 'agents', provider, 'frameworks'))
       .filter(name => name.endsWith('.md'))
       .sort()

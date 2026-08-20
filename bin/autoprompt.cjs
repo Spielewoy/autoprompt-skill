@@ -26,6 +26,7 @@ const PROVIDERS = Object.freeze([
   Object.freeze({ id: 'kilo', label: 'Kilo Code' }),
   Object.freeze({ id: 'vscode', label: 'VS Code' }),
   Object.freeze({ id: 'prime', label: 'Prime Agent' }),
+  Object.freeze({ id: 'omp', label: 'oh-my-pi (omp)' }),
 ])
 const PUBLIC_PROVIDER_IDS = new Set(PROVIDERS.map(provider => provider.id))
 const CUSTOM_PROVIDER_OPTION = Object.freeze({ id: 'custom', label: 'Custom coding agent' })
@@ -55,7 +56,7 @@ const HELP_TEXT = [
   '  -h, --help       Show this help.',
   '  -v, --version    Print the package version.',
   '',
-  'Interactive providers: claude, codex, opencode, kilo, vscode, prime.',
+  'Interactive providers: claude, codex, opencode, kilo, vscode, prime, omp.',
   '',
   'Launch `autoprompt` to check for CLI updates and open the installer.',
   'It scans detected roots and lets you install, update, or repair a provider.',
@@ -213,6 +214,9 @@ function providerInstallLocations(client, locationOptions = {}) {
   if (client === 'prime') {
     return singleRoot(env.PRIME_AGENT_CODING_AGENT_DIR || path.join(home, '.prime', 'agent'))
   }
+  if (client === 'omp') {
+    return singleRoot(env.PI_CODING_AGENT_DIR || path.join(home, '.omp', 'agent'))
+  }
   if (client === 'kilo') {
     return {
       roots: [
@@ -297,7 +301,9 @@ function providerInstallState(
 ) {
   const receipt = path.join(
     root,
-    client === 'prime' ? '.autoprompt-prime-install.json' : '.autoprompt-install-receipt.json',
+    client === 'prime' ? '.autoprompt-prime-install.json'
+      : client === 'omp' ? '.autoprompt-omp-install.json'
+        : '.autoprompt-install-receipt.json',
   )
   if (!fs.existsSync(receipt)) {
     let legacy = false

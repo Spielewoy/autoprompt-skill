@@ -174,6 +174,50 @@ function createProviderRootCompat(providerLabels) {
         }),
       ]),
     }),
+    omp: Object.freeze({
+      markers: Object.freeze([
+        Object.freeze({
+          label: '.autoprompt-omp-install.json',
+          check(root) {
+            return matchAnchoredFile(root, ['.autoprompt-omp-install.json'])
+          },
+        }),
+        Object.freeze({
+          label: 'skills/autoprompt/SKILL.md',
+          check(root) {
+            return matchAnchoredFile(root, ['skills', 'autoprompt', 'SKILL.md'])
+          },
+        }),
+        Object.freeze({
+          label: 'agents/ap-*.md (25 files)',
+          shared: true,
+          check(root) {
+            return matchAnchoredPatternCount(root, ['agents'], /^ap-.*\.md$/, 25)
+          },
+        }),
+        Object.freeze({
+          label: 'commands/autoprompt.md',
+          check(root) {
+            return matchAnchoredFile(root, ['commands', 'autoprompt.md'])
+          },
+        }),
+        Object.freeze({
+          label: 'config.yml maxRecursionDepth>=4',
+          check(root) {
+            const file = matchAnchoredFile(root, ['config.yml']);
+            const fallback = file.status === 'match' ? file : matchAnchoredFile(root, ['config.yaml']);
+            const target = fallback.status === 'match' ? fallback : file;
+            if (target.status !== 'match') return target;
+            try {
+              const content = require('node:fs').readFileSync(target.absolutePath, 'utf8');
+              const match = content.match(/maxRecursionDepth\s*:\s*(\d+)/);
+              if (match && parseInt(match[1], 10) >= 4) return target;
+              return { status: 'partial', absolutePath: target.absolutePath };
+            } catch { return { status: 'partial', absolutePath: target.absolutePath }; }
+          },
+        }),
+      ]),
+    }),
   })
 
   return Object.freeze({

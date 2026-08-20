@@ -7,9 +7,16 @@ const path = require('node:path')
 const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
-const BASH = process.platform === 'win32'
-  ? 'C:\\Program Files\\Git\\bin\\bash.exe'
-  : 'bash'
+function resolveBash() {
+  if (process.platform !== 'win32') return 'bash'
+  for (const p of [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.ProgramW6432, 'C:\\Program Files', 'D:\\Program Files']) {
+    if (!p) continue
+    try { const c = `${p}\\Git\\bin\\bash.exe`; if (childProcess.spawnSync(c, ['--version'], { timeout: 2000 }).status === 0) return c } catch {}
+    try { const c = `${p}\\Git\\usr\\bin\\bash.exe`; if (childProcess.spawnSync(c, ['--version'], { timeout: 2000 }).status === 0) return c } catch {}
+  }
+  return 'bash'
+}
+const BASH = resolveBash()
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
 const BASH_LIBRARY = path.join(ROOT, 'scripts', 'install', 'lib', 'install-lib.sh')
 const POWERSHELL_LIBRARY = path.join(ROOT, 'scripts', 'install', 'lib', 'install-lib.ps1')

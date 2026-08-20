@@ -7,7 +7,7 @@
 <p align="center">
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20points-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1: plus 14.61 points"/></a>
   <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=version&color=255C60&labelColor=14101F" alt="Version 1.0.3"/></a>
-  <a href="#install"><img src="https://img.shields.io/badge/support-6%20supported%20providers-255C60?style=flat-square&labelColor=14101F" alt="Six supported providers"/></a>
+  <a href="#support"><img src="https://img.shields.io/badge/support-7%20supported%20providers-255C60?style=flat-square&labelColor=14101F" alt="Seven supported providers"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-255C60?style=flat-square&labelColor=14101F" alt="License MIT"/></a>
 </p>
 
@@ -74,6 +74,7 @@ autoprompt
 | Working | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; audited 7.4.22 | `kilo` |
 | Working | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; audited 1.133.0 with Copilot 0.61.0 | `vscode` |
 | Working | [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 0.7.2; audited 0.7.2; native package adapter | `prime` |
+| Working | [oh-my-pi (omp)](https://github.com/can1357/oh-my-pi) | 17.3.8+; audited 17.4.0 | `omp` |
 
 See [support and audit notes](docs/faq/which-coding-agents-are-supported.md).
 

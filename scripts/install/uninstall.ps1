@@ -24,7 +24,7 @@ if (-not (Test-Path -LiteralPath $Lib -PathType Leaf)) {
 }
 . $Lib
 
-$ClientsAll = @('prime','vscode','claude','codex','opencode','kilo')
+$ClientsAll = @('prime','omp','vscode','claude','codex','opencode','kilo')
 $LegacyCleanupClients = @('vibe','cursor','roo','gemini','cline','goose','dcode')
 $script:ResultRows = @()
 $script:UninstallExitCode = 0
@@ -109,6 +109,40 @@ function Uninstall-PrimeLifecycle {
     $script:ResultRows += 'RESULT=OK client=prime removed=48'
 }
 
+function Uninstall-OmpLifecycle {
+    $root = Get-ConfigRoot -Client 'omp'
+    $receipt = Join-Path $root '.autoprompt-omp-install.json'
+    if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) {
+        [Console]::Error.WriteLine(
+            "Autoprompt uninstall (omp): SKIP -- no install receipt under $root."
+        )
+        $script:ResultRows += 'SKIP=skip client=omp reason=no-receipt'
+        return
+    }
+    $helper = Join-Path $ScriptDir 'omp-lifecycle.cjs'
+    if (-not (Get-Command node -ErrorAction SilentlyContinue) -or
+        -not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        [Console]::Error.WriteLine(
+            'Autoprompt uninstall (omp): node or the omp lifecycle helper is missing.'
+        )
+        $script:ResultRows += 'RESULT=FAIL client=omp code=3'
+        $script:UninstallExitCode = 1
+        return
+    }
+    $output = @(& node $helper uninstall --repo-root $RepoRoot)
+    $code = $LASTEXITCODE
+    if ($code -ne 0 -or $output.Count -eq 0) {
+        [Console]::Error.WriteLine("Autoprompt uninstall (omp): failed (code $code).")
+        $script:ResultRows += "RESULT=FAIL client=omp code=$code"
+        $script:UninstallExitCode = 1
+        return
+    }
+    [Console]::Error.WriteLine(
+        'Autoprompt uninstall (omp): OK -- removed owned skill, personas, command, and settings.'
+    )
+    $script:ResultRows += 'RESULT=OK client=omp removed=51'
+}
+
 function Write-Matrix {
     [Console]::Out.WriteLine("")
     [Console]::Out.WriteLine("==== Autoprompt uninstall matrix ====")
@@ -135,6 +169,7 @@ if (-not (Test-AutopromptInstallRootContract -Target $Target)) { exit 2 }
 if ($Target -eq 'all') {
     foreach ($c in $ClientsAll) {
         if ($c -ceq 'prime') { Uninstall-PrimeLifecycle }
+        elseif ($c -ceq 'omp') { Uninstall-OmpLifecycle }
         else {
             $root = Get-ConfigRoot -Client $c
             Uninstall-Root -Root $root -Label $c
@@ -149,6 +184,7 @@ if ($ClientsAll -notcontains $Target -and $LegacyCleanupClients -notcontains $Ta
     Write-Usage; exit 2
 }
 if ($Target -ceq 'prime') { Uninstall-PrimeLifecycle }
+elseif ($Target -ceq 'omp') { Uninstall-OmpLifecycle }
 else { Uninstall-Root -Root (Get-ConfigRoot -Client $Target) -Label $Target }
 Write-Matrix
 exit $script:UninstallExitCode

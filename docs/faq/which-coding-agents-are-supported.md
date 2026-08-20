@@ -1,6 +1,6 @@
 # Which coding agents are supported?
 
-The current public support set contains six working providers:
+The current public support set contains seven working providers:
 
 | Coding agent | Audited requirement | Package |
 |---|---|---|
@@ -10,6 +10,7 @@ The current public support set contains six working providers:
 | [Kilo](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; audited 7.4.22 | [Source](../../agents/kilo/) |
 | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; audited 1.133.0 with Copilot 0.61.0 | [Source](../../agents/vscode/) |
 | [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 0.7.2; audited 0.7.2 | [Native package adapter](../../agents/prime/) |
+| [oh-my-pi (omp)](https://github.com/can1357/oh-my-pi) | 17.3.8+; audited 17.4.0 | [Source](../../agents/omp/) |
 
 The installer shows only this audited set. A provider is added here after its package, install path, recursive behavior, and cleanup flow have been verified together. Use the [custom coding agent compatibility guide](../guides/custom-agent-compatibility.md) to assess another CLI or IDE and define the adapter proof it still needs.
 
