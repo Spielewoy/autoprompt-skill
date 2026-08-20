@@ -519,24 +519,68 @@ function claimSlotFile(slotPath) {
   // oversubscribes the run.
   const held = readSlotRecord(slotPath)
   if (held === null || held.pids.some(holderIsAlive)) return null
-  fs.rmSync(slotPath, { force: true })
+  reclaimDeadSlot(slotPath, held.leaseId)
   return null
+}
+
+// Reading a record and then unlinking the path is not a compare-and-delete: two
+// reclaimers can both judge the same dead lease, one deletes it, a fresh holder
+// claims the index, and the second deletes that live holder instead. So the right
+// to delete a given dead generation is itself claimed atomically - `link` admits
+// exactly one reclaimer per lease id, and only that reclaimer touches the slot.
+// The current file can then change only through its own holder (dead, by
+// definition here) or through this single reclaimer, so the re-read below is
+// racing nobody.
+function reclaimDeadSlot(slotPath, deadLeaseId) {
+  if (typeof deadLeaseId !== 'string' || deadLeaseId === '') return false
+  const token = `${slotPath}.reclaim-${deadLeaseId}`
+  const staging = `${slotPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`
+  fs.writeFileSync(staging, JSON.stringify({ reclaimedBy: process.pid, at: Date.now() }))
+  try {
+    fs.linkSync(staging, token)
+  } catch (error) {
+    if (error.code === 'EEXIST') return false
+    throw error
+  } finally {
+    fs.rmSync(staging, { force: true })
+  }
+  try {
+    const current = readSlotRecord(slotPath)
+    if (current === null || current.leaseId !== deadLeaseId) return false
+    fs.rmSync(slotPath, { force: true })
+    return true
+  } finally {
+    fs.rmSync(token, { force: true })
+  }
 }
 
 // The lease is taken before the child exists, so the child's own pid is recorded
 // once it does. Liveness then follows the worker, not just the dispatcher that
 // started it: a dispatcher that dies while its worker runs must not free the slot.
-function bindChildToSlot(lease, childPid) {
-  if (!lease || !Number.isSafeInteger(childPid) || childPid <= 0) return
+//
+// The replace is safe for the same reason the reclaim re-read is: while this
+// process is alive it is a recorded holder, so no reclaimer may act on the lease,
+// and the only other writer would be the holder itself.
+function bindHoldersToSlot(lease, pids) {
+  const holders = (Array.isArray(pids) ? pids : [pids])
+    .filter(pid => Number.isSafeInteger(pid) && pid > 0)
+  if (!lease || holders.length === 0) return false
   const held = readSlotRecord(lease.path)
-  if (held === null || held.leaseId !== lease.id) return
+  if (held === null || held.leaseId !== lease.id) return false
+  const merged = [...new Set([...held.pids, ...holders])]
   const staging = `${lease.path}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`
   try {
-    fs.writeFileSync(staging, JSON.stringify({ ...held, pids: [...held.pids, childPid] }))
+    fs.writeFileSync(staging, JSON.stringify({ ...held, pids: merged }))
     fs.renameSync(staging, lease.path)
+    return true
   } catch {
     fs.rmSync(staging, { force: true })
+    return false
   }
+}
+
+function bindChildToSlot(lease, childPid) {
+  return bindHoldersToSlot(lease, [childPid])
 }
 
 function tryAcquireSlot(env, limit) {
@@ -583,6 +627,10 @@ async function acquireSlot(env, limit, options = {}) {
 // under a fresh lease, so the yielded index belongs to whoever claimed it next.
 async function withYieldedSlot(env, limit, options, work) {
   const inherited = parseSlotHandle(env.AUTOPROMPT_GROK_SLOT)
+  // The worker this slot was tracking does not change when the lease does, so its
+  // pids are carried into the new generation. Otherwise the reacquired lease would
+  // only record this dispatcher, and a dispatcher death would free a live worker.
+  const holders = inherited ? (readSlotRecord(inherited.path)?.pids ?? []) : []
   if (inherited) {
     releaseSlot(inherited)
     delete env.AUTOPROMPT_GROK_SLOT
@@ -591,7 +639,9 @@ async function withYieldedSlot(env, limit, options, work) {
     return await work()
   } finally {
     if (inherited) {
-      env.AUTOPROMPT_GROK_SLOT = formatSlotHandle(await acquireSlot(env, limit, options))
+      const reacquired = await acquireSlot(env, limit, options)
+      bindHoldersToSlot(reacquired, holders)
+      env.AUTOPROMPT_GROK_SLOT = formatSlotHandle(reacquired)
     }
   }
 }
@@ -844,15 +894,18 @@ module.exports = {
   childCommand,
   acquireSlot,
   bindChildToSlot,
+  bindHoldersToSlot,
   dispatch,
   dispatchBatch,
   maxConcurrent,
   planDispatch,
   formatSlotHandle,
   parseSlotHandle,
+  reclaimDeadSlot,
   releaseSlot,
   slotRoot,
   startChild,
+  withYieldedSlot,
   missionBinding,
   parseArgs,
   readTopology,

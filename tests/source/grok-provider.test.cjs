@@ -612,6 +612,45 @@ test('a stale holder cannot evict the worker that took its yielded slot', async 
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+// Reading a record and then unlinking is not a compare-and-delete. Two reclaimers
+// can both judge the same dead lease, one deletes it, a successor claims the index,
+// and the second deletes the successor. The right to delete one dead generation is
+// therefore claimed atomically, so only one reclaimer ever touches the slot.
+test('two reclaimers of one dead lease cannot delete the successor between them', async () => {
+  const { root } = sandbox('autoprompt-grok-reclaim-')
+  const env = baseEnv({ AUTOPROMPT_GROK_SLOT_ROOT: root, AUTOPROMPT_GROK_MAX_SUBS: '1' })
+  const slotRoot = dispatcher.slotRoot(env)
+  const slotPath = path.join(slotRoot, 'slot-0')
+  const deadLease = 'd'.repeat(24)
+  fs.mkdirSync(slotRoot, { recursive: true })
+  fs.writeFileSync(slotPath, JSON.stringify({ leaseId: deadLease, pids: [2 ** 30], at: 0 }))
+
+  // Both reclaimers read the same dead record; only one may act on it.
+  assert.equal(dispatcher.reclaimDeadSlot(slotPath, deadLease), true, 'the first reclaimer wins')
+  assert.equal(fs.existsSync(slotPath), false)
+
+  // The successor takes the freed index while the second reclaimer is still
+  // holding its stale decision about the dead lease.
+  const successor = await dispatcher.acquireSlot(env, 1)
+  assert.equal(successor.path, slotPath)
+
+  assert.equal(
+    dispatcher.reclaimDeadSlot(slotPath, deadLease),
+    false,
+    'the second reclaimer of the same dead lease deletes nothing',
+  )
+  const stillHeld = JSON.parse(fs.readFileSync(slotPath, 'utf8'))
+  assert.equal(stillHeld.leaseId, successor.id, 'the successor still holds the slot')
+  assert.deepEqual(
+    fs.readdirSync(slotRoot).filter(entry => entry.includes('reclaim-')),
+    [],
+    'reclaim tokens do not linger',
+  )
+
+  dispatcher.releaseSlot(successor)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
 // Liveness has to follow the worker: a dispatcher can die while the Grok Build
 // child it started keeps running, and reclaiming then oversubscribes the run.
 test('a slot follows the spawned child, not only the dispatcher that started it', async () => {
@@ -629,7 +668,19 @@ test('a slot follows the spawned child, not only the dispatcher that started it'
   // A foreign lease may not rewrite the record.
   dispatcher.bindChildToSlot({ path: lease.path, id: 'b'.repeat(24) }, 5353)
   assert.deepEqual(JSON.parse(fs.readFileSync(lease.path, 'utf8')).pids, [process.pid, 4242])
-  dispatcher.releaseSlot(lease)
+
+  // Yielding changes the lease, not the worker it was tracking: the reacquired
+  // generation must still record the worker, or a dispatcher death frees it.
+  const yielding = { ...env, AUTOPROMPT_GROK_SLOT: dispatcher.formatSlotHandle(lease) }
+  await dispatcher.withYieldedSlot(yielding, 1, {}, async () => {
+    assert.equal(fs.existsSync(lease.path), false, 'the slot was yielded for the wait')
+  })
+  const reacquired = dispatcher.parseSlotHandle(yielding.AUTOPROMPT_GROK_SLOT)
+  assert.notEqual(reacquired.id, lease.id, 'the slot came back under a fresh lease')
+  const carried = JSON.parse(fs.readFileSync(reacquired.path, 'utf8'))
+  assert.ok(carried.pids.includes(4242), 'the worker pid survived the generation change')
+
+  dispatcher.releaseSlot(reacquired)
   fs.rmSync(root, { recursive: true, force: true })
 })
 

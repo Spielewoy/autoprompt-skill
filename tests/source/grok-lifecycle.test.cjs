@@ -370,6 +370,78 @@ test('separate dispatcher processes share one run-global live-child ceiling', {
   }
 })
 
+// The reclaim path is where separate processes race hardest: a crashed run leaves a
+// dead lease, every dispatcher sees it at once, and exactly one may free it.
+test('concurrent dispatcher processes reclaim one dead lease without oversubscribing', {
+  timeout: 180000,
+}, () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-grok-reclaim-'))
+  const mission = path.join(sandbox, 'PROMPTS.txt')
+  const events = path.join(sandbox, 'events.log')
+  const fakeGrok = path.join(sandbox, 'grok-stub.sh')
+  fs.writeFileSync(mission, 'the exact mission ledger\n')
+  fs.writeFileSync(fakeGrok, [
+    '#!/bin/sh',
+    `printf 'start %s\\n' "$(date +%s%N)" >> ${JSON.stringify(events)}`,
+    'sleep 0.3',
+    `printf 'end %s\\n' "$(date +%s%N)" >> ${JSON.stringify(events)}`,
+    'printf "{}\\n"',
+    '',
+  ].join('\n'))
+  fs.chmodSync(fakeGrok, 0o755)
+
+  const slotBase = path.join(sandbox, 'slots')
+  const env = {
+    ...process.env,
+    AUTOPROMPT_GROK_ACTIVATION: 'ap0123456789abcdef0123456789abcdef',
+    AUTOPROMPT_GROK_BIN: fakeGrok,
+    AUTOPROMPT_GROK_SLOT_ROOT: slotBase,
+    AUTOPROMPT_GROK_MAX_SUBS: '1',
+  }
+
+  // A crashed run's slot: the only slot in the ceiling, held by a lease whose
+  // holders are all gone. Every dispatcher below sees it and races to reclaim.
+  const dispatcherModule = require(path.join(ROOT, 'agents', 'grok', 'workflow', 'grok-dispatch.js'))
+  const slotRoot = dispatcherModule.slotRoot(env)
+  fs.mkdirSync(slotRoot, { recursive: true })
+  fs.writeFileSync(
+    path.join(slotRoot, 'slot-0'),
+    JSON.stringify({ leaseId: 'd'.repeat(24), pids: [2 ** 30], at: 0 }),
+  )
+
+  try {
+    const running = ['ap-scope-coordinator', 'ap-feature-coordinator', 'ap-sweep-coordinator']
+      .map(persona => childProcess.spawn(process.execPath, [
+        path.join(ROOT, 'agents', 'grok', 'workflow', 'grok-dispatch.js'),
+        '--persona', persona,
+        '--task', 'bounded task',
+        '--mission', mission,
+        '--nonce', 'RUN-GROK-RECLAIM',
+      ], { env, stdio: 'ignore' }))
+
+    return Promise.all(running.map(child => new Promise(resolve => child.on('close', resolve))))
+      .then(codes => {
+        assert.deepEqual(codes, [0, 0, 0], 'every dispatcher reclaimed and ran')
+        const timeline = fs.readFileSync(events, 'utf8').trim().split('\n')
+          .map(line => line.split(' '))
+          .map(([kind, at]) => [Number(at), kind === 'start' ? 1 : -1])
+          .sort((left, right) => left[0] - right[0])
+        let live = 0
+        let peak = 0
+        for (const [, delta] of timeline) {
+          live += delta
+          peak = Math.max(peak, live)
+        }
+        assert.equal(timeline.filter(([, delta]) => delta === 1).length, 3, 'all three children ran')
+        assert.equal(peak, 1, `the dead lease was reclaimed once, not once per racer: peak ${peak}`)
+        fs.rmSync(sandbox, { recursive: true, force: true })
+      })
+  } catch (error) {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+    throw error
+  }
+})
+
 test('a foreign autoprompt MCP section blocks activation instead of being overwritten', {
   timeout: 120000,
 }, () => {
