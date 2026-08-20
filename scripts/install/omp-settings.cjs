@@ -137,35 +137,53 @@ function currentDepth(configPath) {
   return Number.isFinite(value) ? value : null
 }
 
-// install: return { changed, previous, applied } where previous/applied are
-// byte buffers (or null when unchanged). Never throws for a missing file.
+// install: return { changed, created, previous, applied } where previous/applied
+// are byte buffers (or null when unchanged). `created` is true only when this
+// call brought the config file into existence (no file was there before), so
+// uninstall knows to delete it rather than leave a stray empty file behind.
+// Never throws for a missing file.
 function install(configPath) {
   const decoded = readConfig(configPath)
   if (decoded === null) {
     const applied = encodeConfig(`task:\n  maxRecursionDepth: ${REQUIRED_DEPTH}\n`, false)
     fs.writeFileSync(configPath, applied)
-    return { changed: true, previous: null, applied }
+    return { changed: true, created: true, previous: null, applied }
   }
   const edited = applyDepthEdit(decoded.text)
-  if (edited === null) return { changed: false, previous: null, applied: null }
+  if (edited === null) return { changed: false, created: false, previous: null, applied: null }
   const applied = encodeConfig(edited, decoded.hasBom)
   fs.writeFileSync(configPath, applied)
-  return { changed: true, previous: Buffer.concat([UTF8_BOM, Buffer.from(decoded.text, 'utf8')]), applied }
+  return {
+    changed: true,
+    created: false,
+    // Reconstruct the exact prior bytes, honoring the original BOM state so a
+    // BOM-less config is not restored with a spurious BOM.
+    previous: encodeConfig(decoded.text, decoded.hasBom),
+    applied,
+  }
 }
 
-// uninstall: restore the previous bytes only when the current file still matches
-// the applied bytes (the user may have edited it since). Returns { restored }.
-function uninstall(configPath, previous, applied) {
-  if (!previous) return { restored: false }
+// uninstall: reverse the install edit.
+//   - created install (no prior file): delete the file we created, but only when
+//     it still matches the bytes we wrote (the user may have edited it since).
+//   - edited install: restore the previous bytes, again only when the current
+//     file still matches what we applied.
+// Returns { restored, removed }.
+function uninstall(configPath, previous, applied, created = false) {
   let current
   try {
     current = fs.readFileSync(configPath)
   } catch {
-    return { restored: false }
+    return { restored: false, removed: false }
   }
-  if (applied && !current.equals(applied)) return { restored: false }
+  if (applied && !current.equals(applied)) return { restored: false, removed: false }
+  if (created) {
+    fs.unlinkSync(configPath)
+    return { restored: false, removed: true }
+  }
+  if (!previous) return { restored: false, removed: false }
   fs.writeFileSync(configPath, previous)
-  return { restored: true }
+  return { restored: true, removed: false }
 }
 
 function runCli(argv) {
@@ -179,6 +197,7 @@ function runCli(argv) {
     const result = install(configPath)
     process.stdout.write(`${JSON.stringify({
       changed: result.changed,
+      created: result.created,
       previous: result.previous ? result.previous.toString('base64') : null,
       applied: result.applied ? result.applied.toString('base64') : null,
     })}\n`)
@@ -187,7 +206,8 @@ function runCli(argv) {
   if (op === 'uninstall') {
     const previous = Buffer.from(argv[2] || '', 'base64')
     const applied = Buffer.from(argv[3] || '', 'base64')
-    const result = uninstall(configPath, previous, applied)
+    const created = argv[4] === 'created'
+    const result = uninstall(configPath, previous, applied, created)
     process.stdout.write(`${JSON.stringify(result)}\n`)
     return 0
   }

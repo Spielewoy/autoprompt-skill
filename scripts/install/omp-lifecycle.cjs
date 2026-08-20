@@ -384,11 +384,18 @@ function install(root, repoRoot, ompCli) {
   if (settingsApplied && settingsApplied.changed) {
     configEdit = {
       file: configPath,
+      created: settingsApplied.created === true,
       previous: settingsApplied.previous ? settingsApplied.previous.toString('base64') : null,
       applied: settingsApplied.applied ? settingsApplied.applied.toString('base64') : null,
       backup: `${configPath}.autoprompt.backup`,
     }
-    fs.writeFileSync(configEdit.backup, settingsApplied.previous || Buffer.alloc(0))
+    // Only back up a pre-existing config's bytes; a freshly created config has
+    // no prior content and is deleted (not restored) on uninstall.
+    if (!configEdit.created) {
+      fs.writeFileSync(configEdit.backup, settingsApplied.previous || Buffer.alloc(0))
+    } else {
+      configEdit.backup = null
+    }
   }
 
   const versionInfo = detectCliVersion(ompCli)
@@ -458,13 +465,16 @@ function uninstall(root) {
     removed += 1
   }
 
-  // Restore the config edit only when the current file still matches applied.
+  // Reverse the config edit only when the current file still matches applied:
+  // a created config is deleted, an edited config is restored to its prior bytes.
   if (receipt.configEdit) {
     const previous = Buffer.from(receipt.configEdit.previous || '', 'base64')
     const applied = Buffer.from(receipt.configEdit.applied || '', 'base64')
-    ompSettings.uninstall(receipt.configEdit.file, previous, applied)
+    ompSettings.uninstall(receipt.configEdit.file, previous, applied, receipt.configEdit.created === true)
     try {
-      if (fs.existsSync(receipt.configEdit.backup)) fs.unlinkSync(receipt.configEdit.backup)
+      if (receipt.configEdit.backup && fs.existsSync(receipt.configEdit.backup)) {
+        fs.unlinkSync(receipt.configEdit.backup)
+      }
     } catch {
       // best-effort
     }
@@ -626,4 +636,5 @@ module.exports = {
   doctor,
   ompAgentDir,
   resolveRoot,
+  RECEIPT_NAME,
 }

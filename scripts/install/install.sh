@@ -1495,34 +1495,6 @@ main() {
     print_matrix
     exit "$(install_exit_code)"
   fi
-
-  # Single client.
-  local status reason
-  status="$(provider_status "$target")" || status=""
-  if [ -z "$status" ]; then
-    printf 'Autoprompt install: unknown client %s.\n' "$target" >&2
-    usage; exit 2
-  fi
-  case "$status" in
-    blocked|retired|unverified)
-      reason="$(provider_block_reason "$target")"
-      printf 'Autoprompt install (%s): REFUSED - status=%s reason=%s.\n' \
-        "$target" "$status" "$reason" >&2
-      RESULT_ROWS+=("RESULT=FAIL client=$target stage=compatibility reason=$reason")
-      print_matrix
-      exit 3
-      ;;
-  esac
-  if ! detect_client "$target" >/dev/null 2>&1; then
-    printf 'Autoprompt install (%s): SKIP - CLI not detected on PATH. Install it and re-run.\n' "$target" >&2
-    RESULT_ROWS+=("SKIP=skip client=$target reason=not-detected")
-    print_matrix; exit 0
-  fi
-  if [ "$target" = prime ]; then
-    install_prime_lifecycle || true
-    print_matrix
-    exit "$(install_exit_code)"
-  fi
   install_batch "$target"
   print_matrix
   exit "$(install_exit_code)"
