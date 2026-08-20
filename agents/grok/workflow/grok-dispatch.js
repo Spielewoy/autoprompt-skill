@@ -34,6 +34,9 @@ const CANONICAL_EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max'
 const PERMISSION_MODES = Object.freeze(['default', 'acceptEdits', 'auto', 'dontAsk', 'plan'])
 const BYPASS_PERMISSION_MODE = 'bypassPermissions'
 const TOPOLOGY_FILE = 'autoprompt-topology.json'
+// Lease ids name files under the slot root, so the shape is enforced wherever one
+// arrives from disk or from the environment rather than from this process.
+const LEASE_ID_PATTERN = /^[0-9a-f]{16,}$/
 
 class DispatchError extends Error {
   constructor(code, message) {
@@ -464,6 +467,80 @@ function slotRoot(env) {
   return path.join(base, `autoprompt-grok-slots-${digest}`)
 }
 
+// Windows is why these exist. Hard links, replace-renames, and unlinks are all
+// available and atomic there (NTFS, one volume), but a scanner, an indexer, or a
+// backup agent holding a handle for a moment turns any of them into a transient
+// EBUSY/EPERM/EACCES. Retrying briefly keeps a sharing violation from crashing a
+// dispatcher; failing loudly afterwards keeps a slot root that cannot support the
+// primitives at all - a FAT, UDF, or network path handed to
+// AUTOPROMPT_GROK_SLOT_ROOT - from silently degrading the ceiling instead.
+const TRANSIENT_FS_CODES = Object.freeze(['EBUSY', 'EPERM', 'EACCES', 'EMFILE'])
+const FS_RETRY_ATTEMPTS = 5
+
+function pauseBriefly(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds)
+}
+
+function retryTransientFs(operation) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return operation()
+    } catch (error) {
+      if (attempt >= FS_RETRY_ATTEMPTS || !TRANSIENT_FS_CODES.includes(error.code)) throw error
+      pauseBriefly(attempt * 4)
+    }
+  }
+}
+
+function removeSlotFile(target) {
+  try {
+    retryTransientFs(() => fs.rmSync(target, { force: true }))
+    return true
+  } catch {
+    return false
+  }
+}
+
+// The one primitive both the slot and the reclaim token are built on: publish a
+// fully written file at a path only if nobody has published there yet. A partial
+// file must never be visible, so the payload is written elsewhere and linked into
+// place. `false` means someone else got there first; anything else is a slot root
+// that cannot do exclusive creation, which is a configuration error, not a race.
+function claimExclusive(target, payload) {
+  const staging = `${target}.staging-${process.pid}-${crypto.randomBytes(6).toString('hex')}`
+  try {
+    fs.writeFileSync(staging, JSON.stringify(payload))
+    retryTransientFs(() => fs.linkSync(staging, target))
+    return true
+  } catch (error) {
+    if (error.code === 'EEXIST') return false
+    throw denied(
+      `run slot storage at ${path.dirname(target)} cannot hold exclusive claims ` +
+        `(${error.code || error.message}); point AUTOPROMPT_GROK_SLOT_ROOT at a local ` +
+        'filesystem that supports hard links',
+    )
+  } finally {
+    removeSlotFile(staging)
+  }
+}
+
+// Staging and collected files are named after the process that made them, so a
+// dispatcher killed mid-claim leaves litter that anyone can identify as dead and
+// nobody can mistake for a slot. Swept once per acquire, never during the poll.
+function sweepAbandonedSlotFiles(root) {
+  let entries
+  try {
+    entries = fs.readdirSync(root)
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    const litter = /\.(?:staging|collected)-(\d+)-[0-9a-f]+$/.exec(entry)
+    if (litter === null || holderIsAlive(Number(litter[1]))) continue
+    removeSlotFile(path.join(root, entry))
+  }
+}
+
 function holderIsAlive(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false
   try {
@@ -486,7 +563,7 @@ function parseSlotHandle(value) {
   const separator = value.lastIndexOf('#')
   if (separator <= 0) return null
   const lease = { path: value.slice(0, separator), id: value.slice(separator + 1) }
-  return /^[0-9a-f]{16,}$/.test(lease.id) ? lease : null
+  return LEASE_ID_PATTERN.test(lease.id) ? lease : null
 }
 
 function readSlotRecord(slotPath) {
@@ -504,15 +581,8 @@ function readSlotRecord(slotPath) {
 // an empty file, judge it corrupt, and hand the same slot to a second holder.
 function claimSlotFile(slotPath) {
   const lease = { path: slotPath, id: crypto.randomBytes(12).toString('hex') }
-  const staging = `${slotPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`
-  fs.writeFileSync(staging, JSON.stringify({ leaseId: lease.id, pids: [process.pid], at: Date.now() }))
-  try {
-    fs.linkSync(staging, slotPath)
+  if (claimExclusive(slotPath, { leaseId: lease.id, pids: [process.pid], at: Date.now() })) {
     return lease
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error
-  } finally {
-    fs.rmSync(staging, { force: true })
   }
   // The slot is taken. Reclaim it only when every recorded holder is provably
   // gone; anything unreadable counts as held, because guessing wrong
@@ -523,34 +593,70 @@ function claimSlotFile(slotPath) {
   return null
 }
 
+function reclaimTokenPath(slotPath, leaseId) {
+  return `${slotPath}.reclaim-${leaseId}`
+}
+
+function readReclaimToken(tokenPath) {
+  try {
+    const record = JSON.parse(fs.readFileSync(tokenPath, 'utf8'))
+    return Number.isSafeInteger(record.reclaimedBy) ? record : null
+  } catch {
+    return null
+  }
+}
+
+// The token must not outlive the reclaim it guards. A reclaimer killed between
+// taking the token and finishing its delete would otherwise strand the slot for
+// the rest of the run: the token admits nobody else, and the dead lease it guards
+// can never release itself. So a token whose own reclaimer is gone is collectable,
+// and collecting it has exactly one winner for the same reason the token does -
+// `rename` moves the file once and every other caller gets ENOENT. A token whose
+// reclaimer is still alive is left alone, exactly like a live slot holder.
+function collectAbandonedReclaimToken(tokenPath) {
+  const record = readReclaimToken(tokenPath)
+  if (record !== null && holderIsAlive(record.reclaimedBy)) return false
+  const collected = `${tokenPath}.collected-${process.pid}-${crypto.randomBytes(6).toString('hex')}`
+  try {
+    retryTransientFs(() => fs.renameSync(tokenPath, collected))
+  } catch (error) {
+    // Gone already means the generation is free to claim again, which is the same
+    // answer collecting it would have given. Anything else is a live competitor.
+    return error.code === 'ENOENT'
+  }
+  removeSlotFile(collected)
+  return true
+}
+
+function takeReclaimToken(tokenPath) {
+  // Two rounds at most: take the token, or collect one abandoned generation and
+  // take it. A third round would mean a live competitor, which is a loss, not a
+  // retry.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (claimExclusive(tokenPath, { reclaimedBy: process.pid, at: Date.now() })) return true
+    if (!collectAbandonedReclaimToken(tokenPath)) return false
+  }
+  return false
+}
+
 // Reading a record and then unlinking the path is not a compare-and-delete: two
 // reclaimers can both judge the same dead lease, one deletes it, a fresh holder
 // claims the index, and the second deletes that live holder instead. So the right
-// to delete a given dead generation is itself claimed atomically - `link` admits
-// exactly one reclaimer per lease id, and only that reclaimer touches the slot.
-// The current file can then change only through its own holder (dead, by
-// definition here) or through this single reclaimer, so the re-read below is
-// racing nobody.
+// to delete a given dead generation is itself claimed atomically - the token above
+// admits exactly one reclaimer per lease id, and only that reclaimer touches the
+// slot. The current file can then change only through its own holder (dead, by
+// definition here) or through this single reclaimer, so the re-read below is racing
+// nobody. The lease id names a file, so its shape is checked before it is used.
 function reclaimDeadSlot(slotPath, deadLeaseId) {
-  if (typeof deadLeaseId !== 'string' || deadLeaseId === '') return false
-  const token = `${slotPath}.reclaim-${deadLeaseId}`
-  const staging = `${slotPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`
-  fs.writeFileSync(staging, JSON.stringify({ reclaimedBy: process.pid, at: Date.now() }))
-  try {
-    fs.linkSync(staging, token)
-  } catch (error) {
-    if (error.code === 'EEXIST') return false
-    throw error
-  } finally {
-    fs.rmSync(staging, { force: true })
-  }
+  if (typeof deadLeaseId !== 'string' || !LEASE_ID_PATTERN.test(deadLeaseId)) return false
+  const token = reclaimTokenPath(slotPath, deadLeaseId)
+  if (!takeReclaimToken(token)) return false
   try {
     const current = readSlotRecord(slotPath)
     if (current === null || current.leaseId !== deadLeaseId) return false
-    fs.rmSync(slotPath, { force: true })
-    return true
+    return removeSlotFile(slotPath)
   } finally {
-    fs.rmSync(token, { force: true })
+    removeSlotFile(token)
   }
 }
 
@@ -568,13 +674,13 @@ function bindHoldersToSlot(lease, pids) {
   const held = readSlotRecord(lease.path)
   if (held === null || held.leaseId !== lease.id) return false
   const merged = [...new Set([...held.pids, ...holders])]
-  const staging = `${lease.path}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`
+  const staging = `${lease.path}.staging-${process.pid}-${crypto.randomBytes(6).toString('hex')}`
   try {
     fs.writeFileSync(staging, JSON.stringify({ ...held, pids: merged }))
-    fs.renameSync(staging, lease.path)
+    retryTransientFs(() => fs.renameSync(staging, lease.path))
     return true
   } catch {
-    fs.rmSync(staging, { force: true })
+    removeSlotFile(staging)
     return false
   }
 }
@@ -583,9 +689,10 @@ function bindChildToSlot(lease, childPid) {
   return bindHoldersToSlot(lease, [childPid])
 }
 
-function tryAcquireSlot(env, limit) {
+function tryAcquireSlot(env, limit, options = {}) {
   const root = slotRoot(env)
   fs.mkdirSync(root, { recursive: true })
+  if (options.sweep !== false) sweepAbandonedSlotFiles(root)
   for (let index = 0; index < limit; index += 1) {
     const lease = claimSlotFile(path.join(root, `slot-${index}`))
     if (lease !== null) return lease
@@ -601,21 +708,29 @@ function releaseSlot(lease) {
   if (!held || !held.path) return false
   const record = readSlotRecord(held.path)
   if (record === null || record.leaseId !== held.id) return false
-  try {
-    fs.rmSync(held.path, { force: true })
-  } catch {}
+  const removed = removeSlotFile(held.path)
+  // A reclaim token naming this lease can only be an abandoned one - some
+  // reclaimer judged this lease dead while it was not - and once the lease is
+  // gone it guards nothing, because lease ids are never reused. Removing it here
+  // is what keeps the run's slot directory empty enough to disappear at the end.
+  removeSlotFile(reclaimTokenPath(held.path, held.id))
   try {
     fs.rmdirSync(path.dirname(held.path))
   } catch {}
-  return true
+  return removed
 }
 
 async function acquireSlot(env, limit, options = {}) {
   const wait = options.wait || (ms => new Promise(resolve => setTimeout(resolve, ms)))
   let delay = 25
+  let sweep = true
   for (;;) {
-    const lease = tryAcquireSlot(env, limit)
+    const lease = tryAcquireSlot(env, limit, { sweep })
     if (lease !== null) return lease
+    // Litter left by dead processes is collected once per acquire, not on every
+    // poll: it cannot appear while this caller waits without a competitor dying,
+    // and the polling loop is the contended path.
+    sweep = false
     await wait(delay)
     delay = Math.min(delay * 2, 250)
   }
@@ -902,6 +1017,7 @@ module.exports = {
   formatSlotHandle,
   parseSlotHandle,
   reclaimDeadSlot,
+  reclaimTokenPath,
   releaseSlot,
   slotRoot,
   startChild,

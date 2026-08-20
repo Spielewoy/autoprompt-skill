@@ -305,6 +305,9 @@ test('an explicit install root keeps the whole Grok Build lifecycle inside that 
 // has: separate dispatchers, each in its own Grok Build session, sharing one run.
 test('separate dispatcher processes share one run-global live-child ceiling', {
   timeout: 180000,
+  skip: process.platform === 'win32'
+    ? 'the fake grok here is a POSIX shell script; the shell-free slot race covers Windows'
+    : false,
 }, () => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-grok-ceiling-'))
   const mission = path.join(sandbox, 'PROMPTS.txt')
@@ -374,6 +377,9 @@ test('separate dispatcher processes share one run-global live-child ceiling', {
 // dead lease, every dispatcher sees it at once, and exactly one may free it.
 test('concurrent dispatcher processes reclaim one dead lease without oversubscribing', {
   timeout: 180000,
+  skip: process.platform === 'win32'
+    ? 'the fake grok here is a POSIX shell script; the shell-free slot race covers Windows'
+    : false,
 }, () => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-grok-reclaim-'))
   const mission = path.join(sandbox, 'PROMPTS.txt')
@@ -434,6 +440,83 @@ test('concurrent dispatcher processes reclaim one dead lease without oversubscri
         }
         assert.equal(timeline.filter(([, delta]) => delta === 1).length, 3, 'all three children ran')
         assert.equal(peak, 1, `the dead lease was reclaimed once, not once per racer: peak ${peak}`)
+        fs.rmSync(sandbox, { recursive: true, force: true })
+      })
+  } catch (error) {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+    throw error
+  }
+})
+
+// The slot primitives - a hard-linked claim, a replace-rename bind, an
+// ownership-checked unlink - are the filesystem-specific part of this adapter, so
+// the race that exercises them must not be POSIX-only. This one drives real
+// processes through the dispatcher's own slot API with no shell stub, so it runs
+// wherever Node does: on Windows it is the check that `CreateHardLinkW`,
+// replace-rename, and delete-while-shared behave as the ceiling assumes.
+test('the slot primitives hold across real processes without a shell', {
+  timeout: 180000,
+}, () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-grok-slot-race-'))
+  const events = path.join(sandbox, 'events.log')
+  const dispatcherPath = path.join(ROOT, 'agents', 'grok', 'workflow', 'grok-dispatch.js')
+  const env = {
+    ...process.env,
+    AUTOPROMPT_GROK_ACTIVATION: 'ap0123456789abcdef0123456789abcdef',
+    AUTOPROMPT_GROK_SLOT_ROOT: path.join(sandbox, 'slots'),
+    RACE_DISPATCHER: dispatcherPath,
+    RACE_EVENTS: events,
+    RACE_LIMIT: '2',
+  }
+
+  // A crashed run's leftovers: one of the two slots is held by a lease whose
+  // holders are all gone, so every racer below has to reclaim before it can run.
+  const dispatcherModule = require(dispatcherPath)
+  const slotRoot = dispatcherModule.slotRoot(env)
+  fs.mkdirSync(slotRoot, { recursive: true })
+  fs.writeFileSync(
+    path.join(slotRoot, 'slot-0'),
+    JSON.stringify({ leaseId: 'e'.repeat(24), pids: [2 ** 30], at: 0 }),
+  )
+
+  const racer = [
+    'const fs = require("node:fs");',
+    'const dispatcher = require(process.env.RACE_DISPATCHER);',
+    'const env = {',
+    '  AUTOPROMPT_GROK_ACTIVATION: process.env.AUTOPROMPT_GROK_ACTIVATION,',
+    '  AUTOPROMPT_GROK_SLOT_ROOT: process.env.AUTOPROMPT_GROK_SLOT_ROOT,',
+    '};',
+    'dispatcher.acquireSlot(env, Number(process.env.RACE_LIMIT)).then(async lease => {',
+    '  fs.appendFileSync(process.env.RACE_EVENTS, `start ${process.hrtime.bigint()}\\n`);',
+    '  dispatcher.bindChildToSlot(lease, process.pid);',
+    '  await new Promise(resolve => setTimeout(resolve, 250));',
+    '  fs.appendFileSync(process.env.RACE_EVENTS, `end ${process.hrtime.bigint()}\\n`);',
+    '  if (dispatcher.releaseSlot(lease) !== true) process.exit(3);',
+    '}).catch(error => { console.error(error); process.exit(4); });',
+  ].join('\n')
+
+  try {
+    const running = [0, 1, 2, 3].map(() =>
+      childProcess.spawn(process.execPath, ['-e', racer], { env, stdio: 'ignore' }))
+
+    return Promise.all(running.map(child => new Promise(resolve => child.on('close', resolve))))
+      .then(codes => {
+        assert.deepEqual(codes, [0, 0, 0, 0], 'every racer claimed and released a slot')
+        const timeline = fs.readFileSync(events, 'utf8').trim().split('\n')
+          .map(line => line.split(' '))
+          .map(([kind, at]) => [Number(at), kind === 'start' ? 1 : -1])
+          // Ties resolve as start-before-end, so a measurement error can only ever
+          // report the ceiling as exceeded, never as held.
+          .sort((left, right) => left[0] - right[0] || right[1] - left[1])
+        let live = 0
+        let peak = 0
+        for (const [, delta] of timeline) {
+          live += delta
+          peak = Math.max(peak, live)
+        }
+        assert.equal(timeline.filter(([, delta]) => delta === 1).length, 4, 'all four racers ran')
+        assert.equal(peak, 2, `the ceiling of 2 held across processes: peak ${peak}`)
+        assert.equal(fs.existsSync(slotRoot), false, 'the last release removed the run slot root')
         fs.rmSync(sandbox, { recursive: true, force: true })
       })
   } catch (error) {

@@ -651,6 +651,58 @@ test('two reclaimers of one dead lease cannot delete the successor between them'
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+// The reclaim token is a lock, and a lock that outlives its holder is a leak: a
+// reclaimer killed between taking the token and deleting the dead slot would strand
+// that slot for the rest of the run, because nobody else may act on the lease and
+// the dead holder can never release it. So a token lives exactly as long as the
+// reclaim it guards - across success, refusal, and the crash in between.
+test('a reclaim token never outlives the reclaim it guards', async () => {
+  const { root } = sandbox('autoprompt-grok-token-')
+  const env = baseEnv({ AUTOPROMPT_GROK_SLOT_ROOT: root, AUTOPROMPT_GROK_MAX_SUBS: '1' })
+  const slotRoot = dispatcher.slotRoot(env)
+  const slotPath = path.join(slotRoot, 'slot-0')
+  const deadLease = 'c'.repeat(24)
+  const token = dispatcher.reclaimTokenPath(slotPath, deadLease)
+  const seedDeadSlot = () => {
+    fs.mkdirSync(slotRoot, { recursive: true })
+    fs.writeFileSync(slotPath, JSON.stringify({ leaseId: deadLease, pids: [2 ** 30], at: 0 }))
+  }
+  const bookkeeping = () => fs.readdirSync(slotRoot).filter(entry => entry !== 'slot-0')
+
+  // A live reclaimer owns the decision for that generation, so nobody else acts.
+  seedDeadSlot()
+  fs.writeFileSync(token, JSON.stringify({ reclaimedBy: process.pid, at: Date.now() }))
+  assert.equal(dispatcher.reclaimDeadSlot(slotPath, deadLease), false, 'a live reclaimer holds it')
+  assert.equal(fs.existsSync(slotPath), true, 'so the slot is left alone')
+  assert.equal(fs.existsSync(token), true, 'and a live token is never collected')
+
+  // The same token, left behind by a reclaimer that died, must not block the slot
+  // forever: it is collected, and the reclaim proceeds.
+  fs.writeFileSync(token, JSON.stringify({ reclaimedBy: 2 ** 30, at: 0 }))
+  assert.equal(dispatcher.reclaimDeadSlot(slotPath, deadLease), true, 'an abandoned token is collected')
+  assert.equal(fs.existsSync(slotPath), false, 'and the dead slot is reclaimed')
+  assert.deepEqual(bookkeeping(), [], 'collecting leaves nothing behind')
+
+  // An unreadable token counts as abandoned too: the payload is written before the
+  // link, so a token without one can only come from a writer that never finished.
+  seedDeadSlot()
+  fs.writeFileSync(token, '')
+  assert.equal(dispatcher.reclaimDeadSlot(slotPath, deadLease), true)
+  assert.deepEqual(bookkeeping(), [], 'and the reclaim that follows cleans up after itself')
+
+  // Litter named after a dead process is swept by the next dispatcher that wants a
+  // slot, so a claim killed halfway cannot keep the run's slot directory alive.
+  fs.mkdirSync(slotRoot, { recursive: true })
+  const litter = path.join(slotRoot, `slot-0.staging-${2 ** 30}-abcdef123456`)
+  fs.writeFileSync(litter, '{}')
+  const lease = await dispatcher.acquireSlot(env, 1)
+  assert.equal(fs.existsSync(litter), false, 'a dead process leaves no staging file behind')
+  assert.equal(dispatcher.releaseSlot(lease), true)
+  assert.equal(fs.existsSync(slotRoot), false, 'and the last release removes the run slot directory')
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
 // Liveness has to follow the worker: a dispatcher can die while the Grok Build
 // child it started keeps running, and reclaiming then oversubscribes the run.
 test('a slot follows the spawned child, not only the dispatcher that started it', async () => {
