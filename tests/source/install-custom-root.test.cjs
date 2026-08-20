@@ -180,6 +180,35 @@ function matchingFiles (directory, expression) {
   return fs.readdirSync(directory).filter(name => expression.test(name)).sort()
 }
 
+function writeLegacyGlobalCodexCast (packageRoot, home) {
+  const source = path.join(packageRoot, 'agents', 'codex', 'agents')
+  const destination = path.join(home, '.codex', 'agents')
+  fs.mkdirSync(destination, { recursive: true })
+  for (const name of matchingFiles(source, /^ap-.*\.toml$/)) {
+    fs.copyFileSync(path.join(source, name), path.join(destination, name))
+  }
+  const casting = path.join(
+    packageRoot,
+    'agents',
+    'codex',
+    'workflow',
+    'codex-agent-casting.js'
+  )
+  const generated = run(process.execPath, [
+    casting,
+    '--write-manifest',
+    '--agents-dir', destination,
+    '--selector', 'off'
+  ], {
+    env: { ...process.env, CODEX_AGENTS_DIR: destination }
+  })
+  assert.equal(generated.status, 0, `${generated.stdout}\n${generated.stderr}`)
+  return new Map(fs.readdirSync(destination).sort().map(name => [
+    name,
+    fs.readFileSync(path.join(destination, name))
+  ]))
+}
+
 function physicalPath (filePath) {
   let cursor = path.resolve(filePath)
   const suffix = []
@@ -665,6 +694,39 @@ test('PowerShell custom roots complete install, doctor, repair, and uninstall fo
   }
 })
 
+test('PowerShell leaves an earlier managed snapshot untouched when rollback has no new entries', {
+  skip: process.platform !== 'win32'
+}, () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-empty-rollback-'))
+  const root = path.join(sandbox, 'root')
+  const recovery = path.join(sandbox, 'recovery.clixml')
+  const library = path.join(ROOT, 'scripts', 'install', 'lib', 'install-lib.ps1')
+  fs.mkdirSync(root, { recursive: true })
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `. ${psLiteral(library)}`,
+    `$root = ${psLiteral(root)}`,
+    `$recovery = ${psLiteral(recovery)}`,
+    "$snapshot = @{ ConfigRoot = $root; ConfigRootExisted = $true; Files = @(); Directories = @{}; ReceiptFiles = @(); ReceiptCreatedDirectories = @(); ReceiptEdits = @(); ConfigEditLastBackup = 'none' }",
+    '$snapshot | Export-Clixml -LiteralPath $recovery -Depth 12',
+    '$snapshot.RecoveryPath = $recovery',
+    '$script:AutopromptManagedUndoJournal = @($snapshot)',
+    '$from = $script:AutopromptManagedUndoJournal.Count',
+    '$ok = Undo-IdemManagedChanges -FromIndex $from',
+    'if (-not $ok -or $script:AutopromptManagedUndoJournal.Count -ne 1 -or -not (Test-Path -LiteralPath $recovery -PathType Leaf)) { exit 1 }'
+  ].join('; ')
+  try {
+    const completed = run(POWERSHELL, [
+      '-NoProfile',
+      '-ExecutionPolicy', 'Bypass',
+      '-Command', script
+    ])
+    assert.equal(completed.status, 0, `${completed.stdout}\n${completed.stderr}`)
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+  }
+})
+
 test('PowerShell upgrades a synthetic receiptless legacy Codex install end to end', {
   skip: process.platform !== 'win32',
   timeout: 360000
@@ -673,6 +735,10 @@ test('PowerShell upgrades a synthetic receiptless legacy Codex install end to en
   const context = makeLifecycleContext(sandbox, 'codex')
   const legacy = makeSyntheticLegacyPackage(sandbox)
   const cli = path.join(legacy.packageRoot, 'bin', 'autoprompt.cjs')
+  const legacyGlobalCast = writeLegacyGlobalCodexCast(
+    legacy.packageRoot,
+    context.home
+  )
   const rootSentinel = path.join(context.customRoot, 'keep-user.txt')
   const peerFile = path.join(context.customRoot, 'agents', 'a.md')
   try {
@@ -689,9 +755,16 @@ test('PowerShell upgrades a synthetic receiptless legacy Codex install end to en
 
     const installed = run(process.execPath, [
       cli, 'install', 'codex', '--root', context.customRoot
-    ], { env: context.env })
+    ], { cwd: context.home, env: context.env })
     assert.equal(installed.status, 0, `${installed.stdout}\n${installed.stderr}`)
     assertCustomLayout('codex', context.customRoot)
+    for (const [name, bytes] of legacyGlobalCast) {
+      assert.deepEqual(
+        fs.readFileSync(path.join(context.home, '.codex', 'agents', name)),
+        bytes,
+        name
+      )
+    }
     assert.equal(fs.readFileSync(rootSentinel, 'utf8'), 'keep root\n')
     assert.equal(fs.readFileSync(peerFile, 'utf8'), 'keep peer\n')
     assert.equal(
@@ -701,7 +774,7 @@ test('PowerShell upgrades a synthetic receiptless legacy Codex install end to en
         'autoprompt',
         'VERSION'
       ), 'utf8').trim(),
-      '1.0.1'
+      '1.0.2'
     )
 
     const healthy = run(process.execPath, [
@@ -724,6 +797,47 @@ test('PowerShell upgrades a synthetic receiptless legacy Codex install end to en
       fs.existsSync(path.join(driftRoot, '.autoprompt-install-receipt.json')),
       false
     )
+
+    const rollbackRoot = path.join(sandbox, 'codex-rollback-root')
+    const rollbackSkill = path.join(
+      rollbackRoot,
+      'skills',
+      'autoprompt',
+      'SKILL.md'
+    )
+    legacy.writeRoot(rollbackRoot)
+    const original = fs.readFileSync(rollbackSkill)
+    fs.writeFileSync(path.join(context.bin, 'node.cmd'), [
+      '@echo off',
+      'echo %~1 | findstr /i /c:"codex-agent-profile.js" >nul',
+      'if not errorlevel 1 exit /b 91',
+      `"${process.execPath}" %*`,
+      ''
+    ].join('\r\n'))
+    const failed = run(process.execPath, [
+      cli, 'install', 'codex', '--root', rollbackRoot
+    ], { cwd: context.home, env: context.env })
+    assert.notEqual(failed.status, 0, `${failed.stdout}\n${failed.stderr}`)
+    assert.match(`${failed.stdout}\n${failed.stderr}`, /stage=agents/)
+    assert.doesNotMatch(
+      `${failed.stdout}\n${failed.stderr}`,
+      /managed-rollback-retained|rollback incomplete/
+    )
+    assert.deepEqual(fs.readFileSync(rollbackSkill), original)
+    assert.equal(
+      fs.existsSync(path.join(
+        rollbackRoot,
+        '.autoprompt-legacy-codex-recovery.clixml'
+      )),
+      false
+    )
+    const matched = run(process.execPath, [
+      path.join(legacy.packageRoot, 'scripts', 'install', 'legacy-compat.cjs'),
+      'match',
+      'codex',
+      rollbackRoot
+    ])
+    assert.equal(matched.status, 0, `${matched.stdout}\n${matched.stderr}`)
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true })
   }
