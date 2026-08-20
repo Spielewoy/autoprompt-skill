@@ -15,7 +15,8 @@ concurrency:
 jobs:
   publish-release:
     name: Verify and publish release assets
-    runs-on: windows-latest
+    # npm pack must run where Git's executable bits are representable.
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - name: Check out repository

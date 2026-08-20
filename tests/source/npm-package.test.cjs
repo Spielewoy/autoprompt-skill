@@ -325,8 +325,12 @@ test('every npm-packaged bin entrypoint has an LF shebang, no carriage returns, 
   for (const relativePath of binPaths) {
     const packedFile = result.files.find(file => file.path === relativePath)
     assert.ok(packedFile, `${relativePath}: not present in npm package`)
-    // eslint-disable-next-line no-bitwise
-    assert.equal(packedFile.mode & 0o111, 0o111, `${relativePath}: packed without the executable bit`)
+    // Windows filesystems do not represent POSIX executable bits. The release
+    // workflow packs on Linux, where this assertion verifies the published mode.
+    if (process.platform !== 'win32') {
+      // eslint-disable-next-line no-bitwise
+      assert.equal(packedFile.mode & 0o111, 0o111, `${relativePath}: packed without the executable bit`)
+    }
 
     const bytes = fs.readFileSync(path.join(ROOT, ...relativePath.split('/')))
     const firstLineEnd = bytes.indexOf(0x0a)

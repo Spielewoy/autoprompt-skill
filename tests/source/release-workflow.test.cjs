@@ -18,6 +18,7 @@ test('1.0.2 release publishes the verified archive through npm trusted publishin
   const notes = read('scripts/build-release-assets.ps1')
 
   assert.equal(packageJson.version, '1.0.2')
+  assert.match(workflow, /runs-on: ubuntu-latest/)
   assert.match(workflow, /^\s+fetch-depth: 0$/m)
   assert.match(workflow, /^\s+id-token: write$/m)
   assert.match(workflow, /^\s+registry-url: "https:\/\/registry\.npmjs\.org"$/m)
