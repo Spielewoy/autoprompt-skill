@@ -474,56 +474,104 @@ function holderIsAlive(pid) {
   }
 }
 
+// A slot is held by a lease, never by a bare path. A path alone cannot say who
+// holds the slot now, so a stale holder releasing "its" path would evict whoever
+// took that index in the meantime. Every unlink checks the lease id on disk first.
+function formatSlotHandle(lease) {
+  return `${lease.path}#${lease.id}`
+}
+
+function parseSlotHandle(value) {
+  if (typeof value !== 'string' || value === '') return null
+  const separator = value.lastIndexOf('#')
+  if (separator <= 0) return null
+  const lease = { path: value.slice(0, separator), id: value.slice(separator + 1) }
+  return /^[0-9a-f]{16,}$/.test(lease.id) ? lease : null
+}
+
+function readSlotRecord(slotPath) {
+  try {
+    const record = JSON.parse(fs.readFileSync(slotPath, 'utf8'))
+    if (typeof record.leaseId !== 'string' || !Array.isArray(record.pids)) return null
+    return record
+  } catch {
+    return null
+  }
+}
+
 // Claiming is a hard link from a fully written temp file, so a slot is never
 // visible half-written: a competitor that opened it mid-write would otherwise read
 // an empty file, judge it corrupt, and hand the same slot to a second holder.
 function claimSlotFile(slotPath) {
+  const lease = { path: slotPath, id: crypto.randomBytes(12).toString('hex') }
   const staging = `${slotPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`
-  fs.writeFileSync(staging, JSON.stringify({ pid: process.pid, at: Date.now() }))
+  fs.writeFileSync(staging, JSON.stringify({ leaseId: lease.id, pids: [process.pid], at: Date.now() }))
   try {
     fs.linkSync(staging, slotPath)
-    return true
+    return lease
   } catch (error) {
     if (error.code !== 'EEXIST') throw error
   } finally {
     fs.rmSync(staging, { force: true })
   }
-  // The slot is taken. Reclaim it only when its holder is provably gone; anything
-  // unreadable counts as held, because guessing wrong oversubscribes the run.
+  // The slot is taken. Reclaim it only when every recorded holder is provably
+  // gone; anything unreadable counts as held, because guessing wrong
+  // oversubscribes the run.
+  const held = readSlotRecord(slotPath)
+  if (held === null || held.pids.some(holderIsAlive)) return null
+  fs.rmSync(slotPath, { force: true })
+  return null
+}
+
+// The lease is taken before the child exists, so the child's own pid is recorded
+// once it does. Liveness then follows the worker, not just the dispatcher that
+// started it: a dispatcher that dies while its worker runs must not free the slot.
+function bindChildToSlot(lease, childPid) {
+  if (!lease || !Number.isSafeInteger(childPid) || childPid <= 0) return
+  const held = readSlotRecord(lease.path)
+  if (held === null || held.leaseId !== lease.id) return
+  const staging = `${lease.path}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`
   try {
-    const held = JSON.parse(fs.readFileSync(slotPath, 'utf8'))
-    if (!Number.isSafeInteger(held.pid) || holderIsAlive(held.pid)) return false
-    fs.rmSync(slotPath, { force: true })
-  } catch {}
-  return false
+    fs.writeFileSync(staging, JSON.stringify({ ...held, pids: [...held.pids, childPid] }))
+    fs.renameSync(staging, lease.path)
+  } catch {
+    fs.rmSync(staging, { force: true })
+  }
 }
 
 function tryAcquireSlot(env, limit) {
   const root = slotRoot(env)
   fs.mkdirSync(root, { recursive: true })
   for (let index = 0; index < limit; index += 1) {
-    const slotPath = path.join(root, `slot-${index}`)
-    if (claimSlotFile(slotPath)) return slotPath
+    const lease = claimSlotFile(path.join(root, `slot-${index}`))
+    if (lease !== null) return lease
   }
   return null
 }
 
-function releaseSlot(slotPath) {
-  if (!slotPath) return
+// Releasing is ownership-checked: a lease that no longer matches the slot on disk
+// has already been yielded or reclaimed, and its holder must not evict the
+// successor that legitimately took the index.
+function releaseSlot(lease) {
+  const held = typeof lease === 'string' ? parseSlotHandle(lease) : lease
+  if (!held || !held.path) return false
+  const record = readSlotRecord(held.path)
+  if (record === null || record.leaseId !== held.id) return false
   try {
-    fs.rmSync(slotPath, { force: true })
+    fs.rmSync(held.path, { force: true })
   } catch {}
   try {
-    fs.rmdirSync(path.dirname(slotPath))
+    fs.rmdirSync(path.dirname(held.path))
   } catch {}
+  return true
 }
 
 async function acquireSlot(env, limit, options = {}) {
   const wait = options.wait || (ms => new Promise(resolve => setTimeout(resolve, ms)))
   let delay = 25
   for (;;) {
-    const slotPath = tryAcquireSlot(env, limit)
-    if (slotPath !== null) return slotPath
+    const lease = tryAcquireSlot(env, limit)
+    if (lease !== null) return lease
     await wait(delay)
     delay = Math.min(delay * 2, 250)
   }
@@ -531,17 +579,20 @@ async function acquireSlot(env, limit, options = {}) {
 
 // A dispatcher that already holds a slot must not keep it while it waits for its
 // own children: six live coordinators each waiting on a worker would otherwise
-// deadlock the run. It yields its slot for the wait and takes one back after.
+// deadlock the run. It yields its slot for the wait and takes one back after,
+// under a fresh lease, so the yielded index belongs to whoever claimed it next.
 async function withYieldedSlot(env, limit, options, work) {
-  const held = env.AUTOPROMPT_GROK_SLOT
-  if (held) {
-    releaseSlot(held)
+  const inherited = parseSlotHandle(env.AUTOPROMPT_GROK_SLOT)
+  if (inherited) {
+    releaseSlot(inherited)
     delete env.AUTOPROMPT_GROK_SLOT
   }
   try {
     return await work()
   } finally {
-    if (held) env.AUTOPROMPT_GROK_SLOT = await acquireSlot(env, limit, options)
+    if (inherited) {
+      env.AUTOPROMPT_GROK_SLOT = formatSlotHandle(await acquireSlot(env, limit, options))
+    }
   }
 }
 
@@ -562,6 +613,7 @@ function startChild(plan, options = {}) {
       reject(new DispatchError('AUTOPROMPT_DISPATCH_LAUNCH', `could not start ${plan.command}: ${error.message}`))
       return
     }
+    if (typeof options.onSpawn === 'function') options.onSpawn(child)
     let stdout = ''
     let stderr = ''
     child.stdout?.setEncoding('utf8')
@@ -602,12 +654,18 @@ function planDispatch(request, options = {}) {
 // starts and released the moment it exits, so the ceiling counts live workers
 // across the whole run rather than per dispatcher.
 async function runInSlot(plan, env, limit, options) {
-  const slot = await acquireSlot(env, limit, options)
-  const held = { ...plan, env: { ...plan.env, AUTOPROMPT_GROK_SLOT: slot } }
+  const lease = await acquireSlot(env, limit, options)
+  const held = { ...plan, env: { ...plan.env, AUTOPROMPT_GROK_SLOT: formatSlotHandle(lease) } }
   try {
-    return await startChild(held, options)
+    return await startChild(held, {
+      ...options,
+      onSpawn: child => {
+        bindChildToSlot(lease, child?.pid)
+        if (typeof options.onSpawn === 'function') options.onSpawn(child)
+      },
+    })
   } finally {
-    releaseSlot(slot)
+    releaseSlot(lease)
   }
 }
 
@@ -785,10 +843,13 @@ module.exports = {
   buildEnvelope,
   childCommand,
   acquireSlot,
+  bindChildToSlot,
   dispatch,
   dispatchBatch,
   maxConcurrent,
   planDispatch,
+  formatSlotHandle,
+  parseSlotHandle,
   releaseSlot,
   slotRoot,
   startChild,

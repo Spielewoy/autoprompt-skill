@@ -558,10 +558,78 @@ test('the live-child ceiling holds across independent dispatchers in the same ru
   // A dead holder's slot is reclaimed rather than shrinking the run forever.
   const slotRoot = dispatcher.slotRoot(env)
   fs.mkdirSync(slotRoot, { recursive: true })
-  fs.writeFileSync(path.join(slotRoot, 'slot-0'), JSON.stringify({ pid: 2 ** 30, at: 0 }))
+  fs.writeFileSync(
+    path.join(slotRoot, 'slot-0'),
+    JSON.stringify({ leaseId: 'a'.repeat(24), pids: [2 ** 30], at: 0 }),
+  )
   const reclaimed = await dispatcher.acquireSlot(env, 1)
-  assert.equal(reclaimed, path.join(slotRoot, 'slot-0'))
+  assert.equal(reclaimed.path, path.join(slotRoot, 'slot-0'))
   dispatcher.releaseSlot(reclaimed)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+// A slot is held by a lease, never by a path. Without that, this sequence evicts a
+// live worker: an ancestor's dispatcher still remembers the path it handed down,
+// the descendant yields that path while it waits, someone else claims the index,
+// and the ancestor's later release unlinks a slot it no longer owns.
+test('a stale holder cannot evict the worker that took its yielded slot', async () => {
+  const { root } = sandbox('autoprompt-grok-lease-')
+  const env = baseEnv({ AUTOPROMPT_GROK_SLOT_ROOT: root, AUTOPROMPT_GROK_MAX_SUBS: '1' })
+
+  // The ancestor takes the run's only slot for a child, and the child's own
+  // dispatcher inherits it as a handle.
+  const ancestor = await dispatcher.acquireSlot(env, 1)
+  const handle = dispatcher.formatSlotHandle(ancestor)
+  assert.deepEqual(dispatcher.parseSlotHandle(handle), { path: ancestor.path, id: ancestor.id })
+
+  // The descendant yields the inherited slot while it waits on its own children.
+  const descendantEnv = { ...env, AUTOPROMPT_GROK_SLOT: handle }
+  let successor = null
+  await (async () => {
+    const inherited = dispatcher.parseSlotHandle(descendantEnv.AUTOPROMPT_GROK_SLOT)
+    assert.equal(dispatcher.releaseSlot(inherited), true, 'the descendant yields its inherited slot')
+    // Another worker legitimately claims the freed index.
+    successor = await dispatcher.acquireSlot(env, 1)
+    assert.equal(successor.path, ancestor.path, 'the same index was reused')
+    assert.notEqual(successor.id, ancestor.id, 'under a new lease')
+  })()
+
+  // The ancestor now finishes and releases the path it has remembered all along.
+  assert.equal(dispatcher.releaseSlot(ancestor), false, 'a stale lease releases nothing')
+  const stillHeld = JSON.parse(fs.readFileSync(successor.path, 'utf8'))
+  assert.equal(stillHeld.leaseId, successor.id, 'the live worker still holds the slot')
+
+  // With the slot still held, the run stays at its ceiling of one.
+  let acquired = false
+  const race = dispatcher.acquireSlot(env, 1).then(lease => {
+    acquired = true
+    return lease
+  })
+  await new Promise(resolve => setTimeout(resolve, 120))
+  assert.equal(acquired, false, 'the ceiling held while the successor was live')
+  dispatcher.releaseSlot(successor)
+  dispatcher.releaseSlot(await race)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+// Liveness has to follow the worker: a dispatcher can die while the Grok Build
+// child it started keeps running, and reclaiming then oversubscribes the run.
+test('a slot follows the spawned child, not only the dispatcher that started it', async () => {
+  const { root } = sandbox('autoprompt-grok-lease-pid-')
+  const env = baseEnv({ AUTOPROMPT_GROK_SLOT_ROOT: root, AUTOPROMPT_GROK_MAX_SUBS: '1' })
+  const lease = await dispatcher.acquireSlot(env, 1)
+  const before = JSON.parse(fs.readFileSync(lease.path, 'utf8'))
+  assert.deepEqual(before.pids, [process.pid])
+
+  dispatcher.bindChildToSlot(lease, 4242)
+  const bound = JSON.parse(fs.readFileSync(lease.path, 'utf8'))
+  assert.deepEqual(bound.pids, [process.pid, 4242], 'the child pid joins the holders')
+  assert.equal(bound.leaseId, lease.id)
+
+  // A foreign lease may not rewrite the record.
+  dispatcher.bindChildToSlot({ path: lease.path, id: 'b'.repeat(24) }, 5353)
+  assert.deepEqual(JSON.parse(fs.readFileSync(lease.path, 'utf8')).pids, [process.pid, 4242])
+  dispatcher.releaseSlot(lease)
   fs.rmSync(root, { recursive: true, force: true })
 })
 

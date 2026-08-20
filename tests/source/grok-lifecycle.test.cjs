@@ -301,6 +301,75 @@ test('an explicit install root keeps the whole Grok Build lifecycle inside that 
   }
 })
 
+// The ceiling only means something across processes, which is the shape a real run
+// has: separate dispatchers, each in its own Grok Build session, sharing one run.
+test('separate dispatcher processes share one run-global live-child ceiling', {
+  timeout: 180000,
+}, () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-grok-ceiling-'))
+  const mission = path.join(sandbox, 'PROMPTS.txt')
+  const events = path.join(sandbox, 'events.log')
+  const fakeGrok = path.join(sandbox, 'grok-stub.sh')
+  fs.writeFileSync(mission, 'the exact mission ledger\n')
+  fs.writeFileSync(fakeGrok, [
+    '#!/bin/sh',
+    `printf 'start %s\\n' "$(date +%s%N)" >> ${JSON.stringify(events)}`,
+    'sleep 0.4',
+    `printf 'end %s\\n' "$(date +%s%N)" >> ${JSON.stringify(events)}`,
+    'printf "{}\\n"',
+    '',
+  ].join('\n'))
+  fs.chmodSync(fakeGrok, 0o755)
+
+  const dispatcherPath = path.join(ROOT, 'agents', 'grok', 'workflow', 'grok-dispatch.js')
+  const env = {
+    ...process.env,
+    AUTOPROMPT_GROK_ACTIVATION: 'ap0123456789abcdef0123456789abcdef',
+    AUTOPROMPT_GROK_BIN: fakeGrok,
+    AUTOPROMPT_GROK_SLOT_ROOT: path.join(sandbox, 'slots'),
+    AUTOPROMPT_GROK_MAX_SUBS: '2',
+  }
+
+  try {
+    const running = ['ap-scope-coordinator', 'ap-feature-coordinator', 'ap-sweep-coordinator',
+      'ap-intake', 'ap-preflight-probe'].map(persona =>
+      childProcess.spawn(process.execPath, [
+        dispatcherPath,
+        '--persona', persona,
+        '--task', 'bounded task',
+        '--mission', mission,
+        '--nonce', 'RUN-GROK-CEILING',
+      ], { env, stdio: 'ignore' }))
+
+    const exits = running.map(child => new Promise(resolve => child.on('close', resolve)))
+    return Promise.all(exits).then(codes => {
+      assert.deepEqual(codes, [0, 0, 0, 0, 0], 'every dispatcher process completed')
+      const timeline = fs.readFileSync(events, 'utf8').trim().split('\n')
+        .map(line => line.split(' '))
+        .map(([kind, at]) => [Number(at), kind === 'start' ? 1 : -1])
+        .sort((left, right) => left[0] - right[0])
+      let live = 0
+      let peak = 0
+      for (const [, delta] of timeline) {
+        live += delta
+        peak = Math.max(peak, live)
+      }
+      assert.equal(timeline.filter(([, delta]) => delta === 1).length, 5, 'all five children ran')
+      assert.ok(peak <= 2, `the run-global ceiling of 2 was exceeded: peak ${peak}`)
+      assert.equal(peak, 2, 'and the run still used its whole ceiling')
+      const slotsLeft = fs.existsSync(env.AUTOPROMPT_GROK_SLOT_ROOT)
+        ? fs.readdirSync(env.AUTOPROMPT_GROK_SLOT_ROOT, { recursive: true })
+          .filter(entry => String(entry).includes('slot-'))
+        : []
+      assert.deepEqual(slotsLeft, [], 'no slot outlives its worker')
+      fs.rmSync(sandbox, { recursive: true, force: true })
+    })
+  } catch (error) {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+    throw error
+  }
+})
+
 test('a foreign autoprompt MCP section blocks activation instead of being overwritten', {
   timeout: 120000,
 }, () => {

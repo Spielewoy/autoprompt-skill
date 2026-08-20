@@ -163,17 +163,26 @@ capture_run_routing "$@"
 [ -z "$captured_model" ] || AUTOPROMPT_GROK_MODEL=$captured_model
 [ -z "$captured_effort" ] || AUTOPROMPT_GROK_EFFORT=$captured_effort
 
+# The same shapes the dispatcher enforces, checked once here so a bad value fails
+# at the launch instead of at every hop: model ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$
+# and effort ^[a-z][a-z0-9-]{0,31}$.
 case "${AUTOPROMPT_GROK_MODEL-}" in
   '') ;;
-  *[!A-Za-z0-9._:/-]*) fail 'model must be a safe model identifier' ;;
-  *) export AUTOPROMPT_GROK_MODEL ;;
+  [!A-Za-z0-9]*|*[!A-Za-z0-9._:/-]*) fail 'model must be a safe model identifier' ;;
+  *)
+    [ ${#AUTOPROMPT_GROK_MODEL} -le 128 ] || fail 'model identifier is too long'
+    export AUTOPROMPT_GROK_MODEL
+    ;;
 esac
 # Grok Build remaps effort aliases itself and is the authority on the set, so this
 # checks the shape only. Canonical ids are low, medium, high, xhigh, and max.
 case "${AUTOPROMPT_GROK_EFFORT-}" in
   '') ;;
-  *[!a-z0-9-]*) fail 'reasoning effort must be a lowercase host effort id' ;;
-  *) export AUTOPROMPT_GROK_EFFORT ;;
+  [!a-z]*|*[!a-z0-9-]*) fail 'reasoning effort must be a lowercase host effort id' ;;
+  *)
+    [ ${#AUTOPROMPT_GROK_EFFORT} -le 32 ] || fail 'reasoning effort id is too long'
+    export AUTOPROMPT_GROK_EFFORT
+    ;;
 esac
 
 if [ "$check_only" -eq 1 ]; then

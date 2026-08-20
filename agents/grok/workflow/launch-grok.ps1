@@ -176,14 +176,16 @@ $routing = Get-RunRouting -Arguments $forwardArguments
 if ($routing.Model) { $env:AUTOPROMPT_GROK_MODEL = $routing.Model }
 if ($routing.Effort) { $env:AUTOPROMPT_GROK_EFFORT = $routing.Effort }
 
+# The same shapes the dispatcher enforces, checked once here so a bad value fails
+# at the launch instead of at every hop.
 if ($env:AUTOPROMPT_GROK_MODEL -and
-    $env:AUTOPROMPT_GROK_MODEL -notmatch '^[A-Za-z0-9][A-Za-z0-9._:/-]*$') {
+    $env:AUTOPROMPT_GROK_MODEL -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$') {
     Stop-Activation 'model must be a safe model identifier'
 }
 # Grok Build remaps effort aliases itself and is the authority on the set, so this
 # checks the shape only. Canonical ids are low, medium, high, xhigh, and max.
 if ($env:AUTOPROMPT_GROK_EFFORT -and
-    $env:AUTOPROMPT_GROK_EFFORT -cnotmatch '^[a-z][a-z0-9-]*$') {
+    $env:AUTOPROMPT_GROK_EFFORT -cnotmatch '^[a-z][a-z0-9-]{0,31}$') {
     Stop-Activation 'reasoning effort must be a lowercase host effort id'
 }
 

@@ -110,8 +110,8 @@
     "frameworks/refactor.md": "c1a938ba1c2859918f255c914ce23eac73233bec3d92ce9924cf658854083fd4",
     "workflow/autoprompt-topology.json": "75e9e918777b6546275c5a6127de3c41ebc704e14e3fcc488d9cc59a97e2e09a",
     "workflow/grok-dispatch-server.js": "18dd4f5a1a04cf2498538ec821870fe47750cbaa68fc72fba9dd4aaf24c7f37e",
-    "workflow/grok-dispatch.js": "1d49ad2cdfcdccc6e46119d63f4999f53a204d48b09edf4a70839e01da57ca3c",
-    "workflow/launch-grok.ps1": "8cb7d464035575431b5fe0f0c763132bf3e640636a49247594f61df210c18595",
-    "workflow/launch-grok.sh": "0b0de1e416b47d5a89332bd41e5138c16ff3347e3e53d1a44a74cd76f584d2cd"
+    "workflow/grok-dispatch.js": "9df1ccc3398b76c2f1b5eaadb35bc562f971194cf457f81fc1a07b36a8b062c1",
+    "workflow/launch-grok.ps1": "3970c66aa717290fbda8106772d874c01cd4af51ece40e385ae780da0722712c",
+    "workflow/launch-grok.sh": "ff5d20fd1f3bc83bda1104a61d2bcf84d08c236ab43d915930dee3d7d8477615"
   }
 }
