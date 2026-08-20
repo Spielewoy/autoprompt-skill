@@ -373,12 +373,30 @@ function grokDispatchDisclosure() {
 function grokConcurrencyDisclosure() {
   return [
     'Dispatch a ready group in one call by passing `jobs`: every job is admitted before',
-    'any child starts, the group then runs concurrently up to the live-child ceiling, and',
-    'all reports are collected together. That is the spawn-all-then-collect shape, so',
-    'reviewers, verifiers, and disjoint lanes really do run in parallel. The ceiling is',
-    '`AUTOPROMPT_GROK_MAX_SUBS`, defaulting to the six live children `tokensaver` allows;',
-    'raise it for `wide` or `custom max_subs=N`. A denied job cancels its whole group',
-    'rather than leaving half a fleet running.',
+    'any child starts, the group then runs concurrently, and all reports are collected',
+    'together. That is the spawn-all-then-collect shape, so reviewers, verifiers, and',
+    'disjoint lanes really do run in parallel. The live-child ceiling is run-global, not',
+    'per group: because every hop is its own process, the dispatchers of a run share',
+    'file-backed slots keyed to the run activation, so the conductor, each coordinator,',
+    'and each manager all draw from the same set. A dispatcher waiting on its own',
+    'children yields its slot for that wait, which is what keeps a full run from',
+    'deadlocking. The ceiling is `AUTOPROMPT_GROK_MAX_SUBS`, defaulting to the six live',
+    'children `tokensaver` allows; raise it for `wide` or `custom max_subs=N`. A denied',
+    'job cancels its whole group rather than leaving half a fleet running.',
+  ].join(' ')
+}
+
+// The identity a dispatcher trusts is process environment, so the boundary is worth
+// stating plainly rather than implying more than it enforces.
+function grokThreatModelDisclosure() {
+  return [
+    'Scope of the seal: the activation token, persona, and depth travel in the child',
+    'process environment. That stops an ordinary Grok Build session from entering a run',
+    'and keeps a cooperating cast inside the canonical topology, and it is not a sandbox',
+    'against a worker that goes out of contract: a role holding `Bash` can read its own',
+    'environment and re-run the dispatcher with different values. Treat the allowlist as',
+    'run correctness, and rely on Grok Build permission modes and the persona tool',
+    'allowlists for containment.',
   ].join(' ')
 }
 
@@ -387,11 +405,13 @@ function renderGrokSkill(source) {
   output = replaceSection(output, '## 8\\. Grok Build model and effort', '## 9\\.', [
     '## 8. Grok Build model and effort',
     '',
-    'Grok Build `ap-*` roles are native agent definitions installed with the skill. Each one pins `model: inherit`, so a child uses the run model the launcher resolved; casting is `inherited-only` and no per-role model selector is available. Because every hop is a fresh top-level process, the dispatcher reapplies the run-wide model and reasoning effort on each child and carries both forward in the sealed environment, so depth 4 runs the same model as depth 1. Record effort as exactly `inherited-only` unless the operator set one run-wide reasoning effort.',
+    'Grok Build `ap-*` roles are native agent definitions installed with the skill. Each one pins `model: inherit`, so a child uses the run model the launcher resolved; casting is `inherited-only` and no per-role model selector is available. Because every hop is a fresh top-level process, the dispatcher reapplies the run-wide model and reasoning effort on each child and carries both forward in the sealed environment, so depth 4 runs the same model as depth 1. The launcher resolves them from either `AUTOPROMPT_GROK_MODEL` and `AUTOPROMPT_GROK_EFFORT` or the `--model`, `-m`, `--reasoning-effort`, and `--effort` flags typed on its own command line, whichever the operator used. Record effort as exactly `inherited-only` unless the operator set one run-wide reasoning effort.',
     '',
     grokDispatchDisclosure(),
     '',
     grokConcurrencyDisclosure(),
+    '',
+    grokThreatModelDisclosure(),
     '',
     'Each definition carries an explicit `tools` allowlist built from the persona\'s canonical capabilities, using the Claude-compatible tool names Grok Build resolves natively. Unattended runs need an explicit permission mode: set `AUTOPROMPT_GROK_PERMISSION_MODE` to a Grok Build mode such as `acceptEdits` or `dontAsk`. The default is `default`, and `bypassPermissions` additionally requires `AUTOPROMPT_GROK_ALLOW_BYPASS=1`.',
   ].join('\n'))
@@ -436,6 +456,8 @@ function renderGrokModes(source) {
     grokDispatchDisclosure(),
     '',
     grokConcurrencyDisclosure(),
+    '',
+    grokThreatModelDisclosure(),
   ].join('\n'))
 }
 
@@ -447,7 +469,7 @@ function renderGrokGates(source) {
   )
   output = output.replace(
     /The activation profile pins `subagent_depth = 4`[\s\S]*?These are ceilings, never spawn targets\./,
-    `${grokDispatchDisclosure()} ${grokConcurrencyDisclosure()} The activation profile pins that contract, and the depth ceiling of 4 is a ceiling, never a spawn target.`,
+    `${grokDispatchDisclosure()} ${grokConcurrencyDisclosure()} ${grokThreatModelDisclosure()} The activation profile pins that contract, and the depth ceiling of 4 is a ceiling, never a spawn target.`,
   )
   return output
 }

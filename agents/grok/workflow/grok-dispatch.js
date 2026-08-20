@@ -29,7 +29,8 @@ const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,127}$/
 const ACTIVATION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{15,127}$/
 const DEFAULT_MAX_CONCURRENT = 6
 const MAX_CONCURRENT_CEILING = 64
-const EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh'])
+const EFFORT_PATTERN = /^[a-z][a-z0-9-]{0,31}$/
+const CANONICAL_EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max'])
 const PERMISSION_MODES = Object.freeze(['default', 'acceptEdits', 'auto', 'dontAsk', 'plan'])
 const BYPASS_PERMISSION_MODE = 'bypassPermissions'
 const TOPOLOGY_FILE = 'autoprompt-topology.json'
@@ -259,9 +260,14 @@ function optionalModel(value, label) {
   return value
 }
 
+// Grok Build takes `--reasoning-effort` as a free string and remaps host aliases
+// itself, so this checks the shape and lets the host reject an unknown id at
+// depth 0 rather than pinning a copy of an enum that can drift.
 function optionalEffort(value) {
   if (value === undefined || value === '') return null
-  if (!EFFORTS.includes(value)) throw denied(`reasoning effort must be one of ${EFFORTS.join(', ')}`)
+  if (!EFFORT_PATTERN.test(value)) {
+    throw denied(`reasoning effort must be a lowercase host effort id (canonical: ${CANONICAL_EFFORTS.join(', ')})`)
+  }
   return value
 }
 
@@ -341,6 +347,16 @@ function childCommand(admission, context) {
   const runtimeRoot = context.runtimeRoot
   const env = context.env
   const definition = personaDefinition(runtimeRoot, admission.persona)
+  // Everything that can be refused is resolved before the envelope is written, so
+  // a rejected plan never leaves a task brief behind in the temp directory.
+  const mode = permissionMode(env)
+  const model = optionalModel(context.request.model || env.AUTOPROMPT_GROK_MODEL, 'model')
+  const effort = optionalEffort(context.request.effort || env.AUTOPROMPT_GROK_EFFORT)
+  let turns = null
+  if (context.request.maxTurns !== undefined && context.request.maxTurns !== null) {
+    turns = Number(context.request.maxTurns)
+    if (!Number.isSafeInteger(turns) || turns < 1) throw denied('maxTurns must be a positive integer')
+  }
   const envelope = buildEnvelope({
     persona: admission.persona,
     task: admission.task,
@@ -359,19 +375,13 @@ function childCommand(admission, context) {
     '--output-format', 'json',
     '--no-subagents',
     '--no-auto-update',
-    '--permission-mode', permissionMode(env),
+    '--permission-mode', mode,
   ]
   // Each hop is a fresh top-level process, so the run model and effort have to be
   // reapplied on the command line and carried forward in the sealed environment.
-  const model = optionalModel(context.request.model || env.AUTOPROMPT_GROK_MODEL, 'model')
   if (model !== null) args.push('--model', model)
-  const effort = optionalEffort(context.request.effort || env.AUTOPROMPT_GROK_EFFORT)
   if (effort !== null) args.push('--reasoning-effort', effort)
-  if (context.request.maxTurns !== undefined && context.request.maxTurns !== null) {
-    const turns = Number(context.request.maxTurns)
-    if (!Number.isSafeInteger(turns) || turns < 1) throw denied('maxTurns must be a positive integer')
-    args.push('--max-turns', String(turns))
-  }
+  if (turns !== null) args.push('--max-turns', String(turns))
 
   const childEnv = {
     ...env,
@@ -423,9 +433,8 @@ function cleanupPrompt(promptFile) {
   } catch {}
 }
 
-// The live-child ceiling. `tokensaver` is the doctrine default of six; `wide` and
-// `custom max_subs=N` raise it through the environment. It bounds concurrency, it
-// never serializes a ready group down to one child at a time.
+// The live-child ceiling for the whole run. `tokensaver` is the doctrine default
+// of six; `wide` and `custom max_subs=N` raise it through the environment.
 function maxConcurrent(env) {
   const requested = env.AUTOPROMPT_GROK_MAX_SUBS
   if (requested === undefined || requested === '') return DEFAULT_MAX_CONCURRENT
@@ -437,6 +446,103 @@ function maxConcurrent(env) {
     throw denied(`AUTOPROMPT_GROK_MAX_SUBS may not exceed ${MAX_CONCURRENT_CEILING}`)
   }
   return value
+}
+
+// ---------------------------------------------------------------------------
+// The run-global live-child ceiling.
+//
+// Every hop is a separate process, so a counter inside one dispatcher can only
+// ever bound one group. The ceiling the modes contract promises is run-global, so
+// the slots live on disk under a directory derived from the run's activation
+// token: every dispatcher in the run - the conductor, each coordinator, each
+// manager - competes for the same set. Slots carry the holder's pid, so a crashed
+// worker's slot is reclaimed instead of shrinking the run forever.
+// ---------------------------------------------------------------------------
+function slotRoot(env) {
+  const digest = crypto.createHash('sha256').update(activationToken(env)).digest('hex').slice(0, 16)
+  const base = env.AUTOPROMPT_GROK_SLOT_ROOT || os.tmpdir()
+  return path.join(base, `autoprompt-grok-slots-${digest}`)
+}
+
+function holderIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
+}
+
+// Claiming is a hard link from a fully written temp file, so a slot is never
+// visible half-written: a competitor that opened it mid-write would otherwise read
+// an empty file, judge it corrupt, and hand the same slot to a second holder.
+function claimSlotFile(slotPath) {
+  const staging = `${slotPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`
+  fs.writeFileSync(staging, JSON.stringify({ pid: process.pid, at: Date.now() }))
+  try {
+    fs.linkSync(staging, slotPath)
+    return true
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error
+  } finally {
+    fs.rmSync(staging, { force: true })
+  }
+  // The slot is taken. Reclaim it only when its holder is provably gone; anything
+  // unreadable counts as held, because guessing wrong oversubscribes the run.
+  try {
+    const held = JSON.parse(fs.readFileSync(slotPath, 'utf8'))
+    if (!Number.isSafeInteger(held.pid) || holderIsAlive(held.pid)) return false
+    fs.rmSync(slotPath, { force: true })
+  } catch {}
+  return false
+}
+
+function tryAcquireSlot(env, limit) {
+  const root = slotRoot(env)
+  fs.mkdirSync(root, { recursive: true })
+  for (let index = 0; index < limit; index += 1) {
+    const slotPath = path.join(root, `slot-${index}`)
+    if (claimSlotFile(slotPath)) return slotPath
+  }
+  return null
+}
+
+function releaseSlot(slotPath) {
+  if (!slotPath) return
+  try {
+    fs.rmSync(slotPath, { force: true })
+  } catch {}
+  try {
+    fs.rmdirSync(path.dirname(slotPath))
+  } catch {}
+}
+
+async function acquireSlot(env, limit, options = {}) {
+  const wait = options.wait || (ms => new Promise(resolve => setTimeout(resolve, ms)))
+  let delay = 25
+  for (;;) {
+    const slotPath = tryAcquireSlot(env, limit)
+    if (slotPath !== null) return slotPath
+    await wait(delay)
+    delay = Math.min(delay * 2, 250)
+  }
+}
+
+// A dispatcher that already holds a slot must not keep it while it waits for its
+// own children: six live coordinators each waiting on a worker would otherwise
+// deadlock the run. It yields its slot for the wait and takes one back after.
+async function withYieldedSlot(env, limit, options, work) {
+  const held = env.AUTOPROMPT_GROK_SLOT
+  if (held) {
+    releaseSlot(held)
+    delete env.AUTOPROMPT_GROK_SLOT
+  }
+  try {
+    return await work()
+  } finally {
+    if (held) env.AUTOPROMPT_GROK_SLOT = await acquireSlot(env, limit, options)
+  }
 }
 
 // One child, started without blocking: several ready siblings must be able to run
@@ -492,13 +598,33 @@ function planDispatch(request, options = {}) {
   return { admission, plan }
 }
 
+// One live child inside one run-global slot. The slot is taken before the process
+// starts and released the moment it exits, so the ceiling counts live workers
+// across the whole run rather than per dispatcher.
+async function runInSlot(plan, env, limit, options) {
+  const slot = await acquireSlot(env, limit, options)
+  const held = { ...plan, env: { ...plan.env, AUTOPROMPT_GROK_SLOT: slot } }
+  try {
+    return await startChild(held, options)
+  } finally {
+    releaseSlot(slot)
+  }
+}
+
 // Public entry point: admit, seal, and run one child Grok Build process.
 async function dispatch(request, options = {}) {
+  const env = options.env || process.env
   const { admission, plan } = planDispatch(request, options)
   if (options.dryRun) {
     return { admission, plan, status: null, signal: null, stdout: '', stderr: '' }
   }
-  const result = await startChild(plan, options)
+  const limit = maxConcurrent(env)
+  const result = await withYieldedSlot(
+    env,
+    limit,
+    options,
+    () => runInSlot(plan, env, limit, options),
+  )
   return { admission, plan, ...result }
 }
 
@@ -511,7 +637,30 @@ async function dispatchBatch(requests, options = {}) {
   }
   const env = options.env || process.env
   const limit = maxConcurrent(env)
-  const planned = requests.map(request => ({ request, ...planDispatch(request, options) }))
+  const runtimeRoot = options.runtimeRoot || defaultRuntimeRoot(env)
+  const topology = options.topology || readTopology(path.join(runtimeRoot, 'workflow'))
+
+  // Phase one admits every job and writes nothing; phase two seals the envelopes.
+  // Splitting them keeps a refused group from leaving task briefs on disk.
+  const admissions = requests.map(request => admitDispatch(request, { topology, env }))
+  const planned = []
+  try {
+    admissions.forEach((admission, index) => {
+      planned.push({
+        admission,
+        plan: childCommand(admission, {
+          runtimeRoot,
+          env,
+          request: requests[index],
+          writePrompt: options.writePrompt || writePromptFile,
+        }),
+      })
+    })
+  } catch (error) {
+    for (const entry of planned) cleanupPrompt(entry.plan.promptFile)
+    throw error
+  }
+
   if (options.dryRun) {
     return planned.map(entry => ({
       admission: entry.admission,
@@ -523,33 +672,24 @@ async function dispatchBatch(requests, options = {}) {
     }))
   }
 
-  const results = new Array(planned.length)
-  let next = 0
-  const worker = async () => {
-    while (next < planned.length) {
-      const index = next
-      next += 1
-      const entry = planned[index]
-      try {
-        const result = await startChild(entry.plan, options)
-        results[index] = { admission: entry.admission, plan: entry.plan, ...result }
-      } catch (error) {
-        results[index] = {
-          admission: entry.admission,
-          plan: entry.plan,
-          status: 1,
-          signal: null,
-          stdout: '',
-          stderr: error.message,
-          error,
-        }
+  // Every job is queued at once and each starts as soon as the run has a free
+  // live-child slot, so the group is spawn-all-then-collect under one ceiling.
+  return withYieldedSlot(env, limit, options, () => Promise.all(planned.map(async entry => {
+    try {
+      const result = await runInSlot(entry.plan, env, limit, options)
+      return { admission: entry.admission, plan: entry.plan, ...result }
+    } catch (error) {
+      return {
+        admission: entry.admission,
+        plan: entry.plan,
+        status: 1,
+        signal: null,
+        stdout: '',
+        stderr: error.message,
+        error,
       }
     }
-  }
-  await Promise.all(
-    Array.from({ length: Math.min(limit, planned.length) }, () => worker()),
-  )
-  return results
+  })))
 }
 
 const FLAGS = Object.freeze({
@@ -644,10 +784,13 @@ module.exports = {
   admitDispatch,
   buildEnvelope,
   childCommand,
+  acquireSlot,
   dispatch,
   dispatchBatch,
   maxConcurrent,
   planDispatch,
+  releaseSlot,
+  slotRoot,
   startChild,
   missionBinding,
   parseArgs,

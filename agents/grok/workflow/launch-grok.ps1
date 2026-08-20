@@ -62,6 +62,29 @@ function New-ActivationToken {
     return ('ap' + -join ($bytes | ForEach-Object { $_.ToString('x2') }))
 }
 
+# Model and effort chosen on this command line belong to the whole run, not just
+# the depth-0 session: every deeper hop is a fresh top-level process that inherits
+# nothing. Capture them here so the dispatcher can reapply them on each hop. Last
+# occurrence wins, which is how Grok Build resolves repeated flags.
+function Get-RunRouting {
+    param([string[]]$Arguments)
+
+    $routing = @{ Model = ''; Effort = '' }
+    for ($index = 0; $index -lt $Arguments.Count; $index++) {
+        $argument = $Arguments[$index]
+        $next = if ($index + 1 -lt $Arguments.Count) { $Arguments[$index + 1] } else { $null }
+        switch -CaseSensitive -Regex ($argument) {
+            '^(--model|-m)$' { if ($null -ne $next) { $routing.Model = $next; $index++ } }
+            '^--model=' { $routing.Model = $argument.Substring(8) }
+            '^-m.+' { $routing.Model = $argument.Substring(2) }
+            '^(--reasoning-effort|--effort)$' { if ($null -ne $next) { $routing.Effort = $next; $index++ } }
+            '^--reasoning-effort=' { $routing.Effort = $argument.Substring(19) }
+            '^--effort=' { $routing.Effort = $argument.Substring(9) }
+        }
+    }
+    return $routing
+}
+
 function Test-SupportedVersion {
     param([string]$Version)
     if ($Version -notmatch '^(\d+)\.(\d+)\.(\d+)$') { return $false }
@@ -149,13 +172,19 @@ Remove-Item Env:AUTOPROMPT_GROK_PERSONA -ErrorAction SilentlyContinue
 Remove-Item Env:AUTOPROMPT_GROK_BINDING -ErrorAction SilentlyContinue
 Remove-Item Env:AUTOPROMPT_GROK_NONCE -ErrorAction SilentlyContinue
 
+$routing = Get-RunRouting -Arguments $forwardArguments
+if ($routing.Model) { $env:AUTOPROMPT_GROK_MODEL = $routing.Model }
+if ($routing.Effort) { $env:AUTOPROMPT_GROK_EFFORT = $routing.Effort }
+
 if ($env:AUTOPROMPT_GROK_MODEL -and
     $env:AUTOPROMPT_GROK_MODEL -notmatch '^[A-Za-z0-9][A-Za-z0-9._:/-]*$') {
-    Stop-Activation 'AUTOPROMPT_GROK_MODEL is not a safe model identifier'
+    Stop-Activation 'model must be a safe model identifier'
 }
+# Grok Build remaps effort aliases itself and is the authority on the set, so this
+# checks the shape only. Canonical ids are low, medium, high, xhigh, and max.
 if ($env:AUTOPROMPT_GROK_EFFORT -and
-    $env:AUTOPROMPT_GROK_EFFORT -cnotin @('low', 'medium', 'high', 'xhigh')) {
-    Stop-Activation 'AUTOPROMPT_GROK_EFFORT must be low, medium, high, or xhigh'
+    $env:AUTOPROMPT_GROK_EFFORT -cnotmatch '^[a-z][a-z0-9-]*$') {
+    Stop-Activation 'reasoning effort must be a lowercase host effort id'
 }
 
 if ($checkOnly) {

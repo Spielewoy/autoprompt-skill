@@ -207,6 +207,30 @@ test('POSIX Grok lifecycle installs, verifies, repairs, and uninstalls without t
     assert.equal(unactivated.status, 3, unactivated.stdout)
     assert.match(unactivated.stderr, /no Autoprompt activation is present/)
 
+    // `launch-grok --model X` chooses the model for the whole run, so the launcher
+    // has to seal it where deeper hops can still read it.
+    const routingProbe = path.join(sandbox, 'routing.txt')
+    const probeBin = path.join(context.bin, 'grok')
+    const realGrok = fs.readFileSync(probeBin, 'utf8')
+    fs.writeFileSync(probeBin, [
+      '#!/bin/sh',
+      'if [ "$1" = "--version" ]; then printf "grok 1.0.5\\n"; exit 0; fi',
+      `printf 'model=%s effort=%s activation=%s\\n' "$AUTOPROMPT_GROK_MODEL" "$AUTOPROMPT_GROK_EFFORT" "${'${AUTOPROMPT_GROK_ACTIVATION:+set}'}" > ${JSON.stringify(routingProbe)}`,
+      '',
+    ].join('\n'))
+    fs.chmodSync(probeBin, 0o755)
+    const routed = run(bash, [
+      path.join(target.runtime, 'workflow', 'launch-grok.sh'),
+      '--model', 'grok-build', '--effort', 'max', '-p', 'noop',
+    ], { env: context.env })
+    assert.equal(routed.status, 0, `${routed.stdout}\n${routed.stderr}`)
+    assert.equal(
+      fs.readFileSync(routingProbe, 'utf8').trim(),
+      'model=grok-build effort=max activation=set',
+    )
+    fs.writeFileSync(probeBin, realGrok)
+    fs.chmodSync(probeBin, 0o755)
+
     const activated = run(process.execPath, dispatchArgs, {
       env: { ...context.env, AUTOPROMPT_GROK_ACTIVATION: 'ap0123456789abcdef0123456789abcdef' },
     })

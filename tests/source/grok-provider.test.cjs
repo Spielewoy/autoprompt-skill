@@ -272,6 +272,25 @@ test('an unactivated session cannot enter the run as the conductor', async () =>
   assert.match(read('agents/grok/workflow/launch-grok.ps1'), /New-ActivationToken/)
 })
 
+// `launch-grok --model X` selects the model for the whole run, not just depth 0:
+// deeper hops are fresh processes, so the launcher has to seal what it was given
+// instead of letting the flag stop at the session it starts.
+test('the launcher seals model and effort chosen on its own command line', () => {
+  const shell = read('agents/grok/workflow/launch-grok.sh')
+  assert.match(shell, /capture_run_routing "\$@"/)
+  for (const form of ['--model|-m)', '--model=*)', '-m?*)', '--reasoning-effort|--effort)', '--effort=*)']) {
+    assert.ok(shell.includes(form), `the launcher must capture ${form}`)
+  }
+  assert.match(shell, /AUTOPROMPT_GROK_MODEL=\$captured_model/)
+  assert.match(shell, /AUTOPROMPT_GROK_EFFORT=\$captured_effort/)
+
+  const powershell = read('agents/grok/workflow/launch-grok.ps1')
+  assert.match(powershell, /function Get-RunRouting/)
+  assert.match(powershell, /Get-RunRouting -Arguments \$forwardArguments/)
+  assert.match(powershell, /\$env:AUTOPROMPT_GROK_MODEL = \$routing\.Model/)
+  assert.match(powershell, /\$env:AUTOPROMPT_GROK_EFFORT = \$routing\.Effort/)
+})
+
 test('child edges, terminal roles, and the depth ceiling are enforced against the caller identity', async () => {
   const { mission } = sandbox()
   const admitted = await dispatch(
@@ -412,9 +431,12 @@ test('the run model and effort survive every process hop', async () => {
   const plain = await dispatch(request, baseEnv())
   assert.equal(plain.plan.args.includes('--model'), false)
   assert.equal(plain.plan.env.AUTOPROMPT_GROK_MODEL, undefined)
+  const maxEffort = await dispatch(request, baseEnv({ AUTOPROMPT_GROK_EFFORT: 'max' }))
+  assert.deepEqual(maxEffort.plan.args.slice(-2), ['--reasoning-effort', 'max'],
+    'max is a canonical Grok Build effort and must not be refused')
   assert.match(
-    (await denial(request, baseEnv({ AUTOPROMPT_GROK_EFFORT: 'maximum' }))).message,
-    /reasoning effort must be one of/,
+    (await denial(request, baseEnv({ AUTOPROMPT_GROK_EFFORT: 'MAX; rm -rf /' }))).message,
+    /lowercase host effort id/,
   )
   assert.match(
     (await denial(request, baseEnv({ AUTOPROMPT_GROK_MODEL: 'grok build; rm -rf /' }))).message,
@@ -482,6 +504,89 @@ test('a ready group is admitted together, runs concurrently, and is collected to
   assert.equal(dispatcher.maxConcurrent({ AUTOPROMPT_GROK_MAX_SUBS: '12' }), 12)
   assert.throws(() => dispatcher.maxConcurrent({ AUTOPROMPT_GROK_MAX_SUBS: '0' }), /positive integer/)
   assert.throws(() => dispatcher.maxConcurrent({ AUTOPROMPT_GROK_MAX_SUBS: '999' }), /may not exceed/)
+})
+
+// Every hop is its own process, so a counter inside one dispatcher can only bound
+// one group. The ceiling the modes contract promises is run-global, so it lives in
+// slots on disk that every dispatcher in the run competes for.
+test('the live-child ceiling holds across independent dispatchers in the same run', async () => {
+  const { root, mission } = sandbox('autoprompt-grok-slots-test-')
+  const env = baseEnv({
+    AUTOPROMPT_GROK_PERSONA: 'ap-feature-coordinator',
+    AUTOPROMPT_GROK_DEPTH: '1',
+    AUTOPROMPT_GROK_SLOT_ROOT: root,
+    AUTOPROMPT_GROK_MAX_SUBS: '2',
+  })
+  const job = persona => ({ persona, task: `run ${persona}`, mission, nonce: NONCE })
+
+  let live = 0
+  let peak = 0
+  const slots = []
+  const spawn = (command, args, options) => {
+    live += 1
+    peak = Math.max(peak, live)
+    slots.push(options.env.AUTOPROMPT_GROK_SLOT)
+    const listeners = {}
+    const stream = { setEncoding() {}, on() {} }
+    setTimeout(() => {
+      live -= 1
+      listeners.close?.(0, null)
+    }, 30)
+    return {
+      stdout: stream,
+      stderr: stream,
+      on(event, handler) { listeners[event] = handler },
+    }
+  }
+  const options = dispatchOptions(env, { dryRun: false, spawn, promptRoot: root })
+
+  // Two dispatchers that know nothing about each other, exactly as two coordinator
+  // processes in one run would be.
+  await Promise.all([
+    dispatcher.dispatchBatch([job('ap-implementer'), job('ap-reviewer')], options),
+    dispatcher.dispatchBatch([job('ap-verifier'), job('ap-planner')], options),
+  ])
+  assert.equal(live, 0)
+  assert.ok(peak <= 2, `run-global ceiling of 2 was exceeded: peak ${peak}`)
+  assert.equal(peak, 2, 'the run still used its whole ceiling')
+  assert.equal(slots.filter(Boolean).length, 4, 'every child ran inside a run slot')
+  const held = fs.existsSync(dispatcher.slotRoot(env))
+    ? fs.readdirSync(dispatcher.slotRoot(env))
+    : []
+  assert.deepEqual(held, [], 'slots are released when children exit')
+
+  // A dead holder's slot is reclaimed rather than shrinking the run forever.
+  const slotRoot = dispatcher.slotRoot(env)
+  fs.mkdirSync(slotRoot, { recursive: true })
+  fs.writeFileSync(path.join(slotRoot, 'slot-0'), JSON.stringify({ pid: 2 ** 30, at: 0 }))
+  const reclaimed = await dispatcher.acquireSlot(env, 1)
+  assert.equal(reclaimed, path.join(slotRoot, 'slot-0'))
+  dispatcher.releaseSlot(reclaimed)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+// A refused plan must not leave the task brief it had already sealed on disk.
+test('a group that fails while sealing leaves no envelopes behind', async () => {
+  const { root, mission } = sandbox('autoprompt-grok-leak-')
+  const promptRoot = path.join(root, 'envelopes')
+  fs.mkdirSync(promptRoot)
+  const env = baseEnv({
+    AUTOPROMPT_GROK_PERSONA: 'ap-feature-coordinator',
+    AUTOPROMPT_GROK_DEPTH: '1',
+  })
+
+  await assert.rejects(
+    dispatcher.dispatchBatch(
+      [
+        { persona: 'ap-implementer', task: 'first', mission, nonce: NONCE },
+        { persona: 'ap-reviewer', task: 'second', mission, nonce: NONCE, maxTurns: 0 },
+      ],
+      dispatchOptions(env, { dryRun: true, promptRoot }),
+    ),
+    /maxTurns must be a positive integer/,
+  )
+  assert.deepEqual(fs.readdirSync(promptRoot), [], 'the sealed envelope of job one was cleaned up')
+  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('the MCP server exposes one dispatch tool and reports denials as tool errors', async () => {

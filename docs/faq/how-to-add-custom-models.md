@@ -1,6 +1,6 @@
 # How do I add custom models?
 
-Custom `agents=` routing is available in Claude Code and Codex. OpenCode, Kilo, and VS Code inherit the active model. Prime Agent inherits the selected parent model. Grok Build children inherit the run model the launcher resolved; set `AUTOPROMPT_GROK_MODEL` or `AUTOPROMPT_GROK_EFFORT` once for the whole run instead of per role.
+Custom `agents=` routing is available in Claude Code and Codex. OpenCode, Kilo, and VS Code inherit the active model. Prime Agent inherits the selected parent model. Grok Build children inherit the run model the launcher resolved: pass `--model`, `-m`, `--reasoning-effort`, or `--effort` to `launch-grok`, or set `AUTOPROMPT_GROK_MODEL` and `AUTOPROMPT_GROK_EFFORT` before it. Either way the launcher seals them for the run and the dispatcher reapplies them on every process hop, so there is no per-role selector.
 
 Create a registry whose names match the values used in `agents=`:
 

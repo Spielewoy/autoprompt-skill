@@ -56,6 +56,36 @@ mint_activation() {
   printf 'ap%s' "$token"
 }
 
+# Model and effort chosen on this command line belong to the whole run, not just
+# the depth-0 session: every deeper hop is a fresh top-level process that inherits
+# nothing. Capture them here so the dispatcher can reapply them on each hop. Last
+# occurrence wins, which is how Grok Build resolves repeated flags.
+captured_model=''
+captured_effort=''
+capture_run_routing() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --model|-m)
+        if [ "$#" -ge 2 ]; then
+          captured_model=$2
+          shift
+        fi
+        ;;
+      --model=*) captured_model=${1#--model=} ;;
+      -m?*) captured_model=${1#-m} ;;
+      --reasoning-effort|--effort)
+        if [ "$#" -ge 2 ]; then
+          captured_effort=$2
+          shift
+        fi
+        ;;
+      --reasoning-effort=*) captured_effort=${1#--reasoning-effort=} ;;
+      --effort=*) captured_effort=${1#--effort=} ;;
+    esac
+    shift
+  done
+}
+
 version_is_supported() {
   candidate=$1
   major=${candidate%%.*}
@@ -129,14 +159,21 @@ export AUTOPROMPT_GROK_RUNTIME_ROOT AUTOPROMPT_GROK_BIN AUTOPROMPT_GROK_DEPTH
 export AUTOPROMPT_GROK_ACTIVATION GROK_DISABLE_AUTOUPDATER
 unset AUTOPROMPT_GROK_PERSONA AUTOPROMPT_GROK_BINDING AUTOPROMPT_GROK_NONCE 2>/dev/null || true
 
+capture_run_routing "$@"
+[ -z "$captured_model" ] || AUTOPROMPT_GROK_MODEL=$captured_model
+[ -z "$captured_effort" ] || AUTOPROMPT_GROK_EFFORT=$captured_effort
+
 case "${AUTOPROMPT_GROK_MODEL-}" in
   '') ;;
-  *[!A-Za-z0-9._:/-]*) fail 'AUTOPROMPT_GROK_MODEL is not a safe model identifier' ;;
+  *[!A-Za-z0-9._:/-]*) fail 'model must be a safe model identifier' ;;
   *) export AUTOPROMPT_GROK_MODEL ;;
 esac
+# Grok Build remaps effort aliases itself and is the authority on the set, so this
+# checks the shape only. Canonical ids are low, medium, high, xhigh, and max.
 case "${AUTOPROMPT_GROK_EFFORT-}" in
-  ''|low|medium|high|xhigh) [ -z "${AUTOPROMPT_GROK_EFFORT-}" ] || export AUTOPROMPT_GROK_EFFORT ;;
-  *) fail 'AUTOPROMPT_GROK_EFFORT must be low, medium, high, or xhigh' ;;
+  '') ;;
+  *[!a-z0-9-]*) fail 'reasoning effort must be a lowercase host effort id' ;;
+  *) export AUTOPROMPT_GROK_EFFORT ;;
 esac
 
 if [ "$check_only" -eq 1 ]; then

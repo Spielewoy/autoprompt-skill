@@ -59,10 +59,10 @@
     "workflow/launch-grok.sh"
   ],
   "sha256": {
-    "GATES.md": "90e10209c2d6abea35110493567dcff5db2c4cd2a488a29fd26677e38892825b",
-    "MODES.md": "cb20d8f00a5d12e71e19fc5598288b926c2585116556a0d5a386bfe1c0271e61",
+    "GATES.md": "aa1879282f57d81a33707b30d07aab8c7b8522510c3daf76b40202a79ab29ae0",
+    "MODES.md": "7011e1705640c48e7bdb7ac0d76852f7654d71bedf8b4641377b9482cc07551e",
     "PLAYBOOKS.md": "448d779d63eed528e1e9b0631d81af38d35944807e63f28ac26c0b2d0ff6b597",
-    "README.md": "e2d3919dd745465c1f48cc46a166465b6ad9c51a304b3e7f57271b80c0b42d6c",
+    "README.md": "833d9fa0cc6a1fbae75af1b88a5117835e33ae2c012cc3fe3ef052ebe05fd555",
     "VERSION": "44e161e4495cac2cf7858043e9e6418e9579f0ddcfae826f9a372622968ce066",
     "agents/ap-arbiter.md": "9bfb291b6c574188bec9c3cfcaeeca44094b7505a46fb6dc34e8b102da20bb85",
     "agents/ap-depth-prober.md": "328b6c06bc12b8e29ad51305817f782cde9960caf29d73f084c3624d9387e0b2",
@@ -110,8 +110,8 @@
     "frameworks/refactor.md": "c1a938ba1c2859918f255c914ce23eac73233bec3d92ce9924cf658854083fd4",
     "workflow/autoprompt-topology.json": "75e9e918777b6546275c5a6127de3c41ebc704e14e3fcc488d9cc59a97e2e09a",
     "workflow/grok-dispatch-server.js": "18dd4f5a1a04cf2498538ec821870fe47750cbaa68fc72fba9dd4aaf24c7f37e",
-    "workflow/grok-dispatch.js": "2b7dcc06985e957a7fd2412d95dc6675f4fa0be611ae6ac467978fcdd41549af",
-    "workflow/launch-grok.ps1": "5bc2b3e325ea9f676e38b258b1c39de7803c57653727110049476a31f77efd0b",
-    "workflow/launch-grok.sh": "97176c511ecaf76a162df26c1dd6179638f85b97846e5346f3b3deb7672102b1"
+    "workflow/grok-dispatch.js": "1d49ad2cdfcdccc6e46119d63f4999f53a204d48b09edf4a70839e01da57ca3c",
+    "workflow/launch-grok.ps1": "8cb7d464035575431b5fe0f0c763132bf3e640636a49247594f61df210c18595",
+    "workflow/launch-grok.sh": "0b0de1e416b47d5a89332bd41e5138c16ff3347e3e53d1a44a74cd76f584d2cd"
   }
 }
