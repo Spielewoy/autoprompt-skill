@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="#벤치마크"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%EC%A0%90-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1: 14.61점 향상"/></a>
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%EB%B2%84%EC%A0%84&color=255C60&labelColor=14101F" alt="버전: v1.0.2"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%EB%B2%84%EC%A0%84&color=255C60&labelColor=14101F" alt="버전: v1.0.3"/></a>
   <a href="#설치"><img src="https://img.shields.io/badge/%EC%A7%80%EC%9B%90-6-255C60?style=flat-square&labelColor=14101F" alt="지원: 6"/></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/%EB%9D%BC%EC%9D%B4%EC%84%A0%EC%8A%A4-MIT-255C60?style=flat-square&labelColor=14101F" alt="라이선스: MIT"/></a>
 </p>
@@ -25,7 +25,7 @@
 
 ## 설치
 
-아래 CLI를 사용하거나 [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.2)에서 설치 프로그램을 받으세요.
+아래 CLI를 사용하거나 [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.3)에서 설치 프로그램을 받으세요.
 
 ### 1. CLI 설치
 

@@ -12,18 +12,22 @@ function read(relative) {
   return fs.readFileSync(path.join(ROOT, relative), 'utf8')
 }
 
-test('1.0.2 release publishes the verified archive through npm trusted publishing', () => {
+test('1.0.3 release publishes the verified archive through npm trusted publishing', () => {
   const packageJson = JSON.parse(read('package.json'))
   const workflow = read('.github/workflows/release.yml')
   const notes = read('scripts/build-release-assets.ps1')
 
-  assert.equal(packageJson.version, '1.0.2')
+  assert.equal(packageJson.version, '1.0.3')
+  assert.match(workflow, /verify-release:[\s\S]+?runs-on: windows-latest/)
+  assert.match(workflow, /publish-release:[\s\S]+?needs: verify-release[\s\S]+?runs-on: ubuntu-latest/)
+  assert.match(workflow, /Verify Linux package metadata/)
   assert.match(workflow, /^\s+fetch-depth: 0$/m)
   assert.match(workflow, /^\s+id-token: write$/m)
   assert.match(workflow, /^\s+registry-url: "https:\/\/registry\.npmjs\.org"$/m)
   assert.match(workflow, /npm install --global npm@11\.6\.3 --ignore-scripts --no-audit --no-fund/)
   assert.match(workflow, /if: github\.repository == 'Spielewoy\/autoprompt-skill'/)
   assert.match(workflow, /npm view "\$\(\$package\.name\)@\$\(\$package\.version\)" version --json/)
+  assert.match(workflow, /\$archive = \[IO\.Path\]::GetFullPath\(\(Join-Path dist/)
   assert.match(workflow, /npm publish \$archive --ignore-scripts --provenance --access public/)
   assert.doesNotMatch(workflow, /NPM_TOKEN|NODE_AUTH_TOKEN/)
   assert.match(workflow, /git merge-base --is-ancestor \$env:GITHUB_SHA refs\/remotes\/origin\/main/)

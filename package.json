@@ -1,6 +1,6 @@
 {
   "name": "autoprompt-skill",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Autoprompt is a coding-agent skill that cuts failures by 45% on agentic coding tasks.",
   "license": "MIT",
   "publishConfig": {

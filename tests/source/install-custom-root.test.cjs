@@ -774,7 +774,7 @@ test('PowerShell upgrades a synthetic receiptless legacy Codex install end to en
         'autoprompt',
         'VERSION'
       ), 'utf8').trim(),
-      '1.0.2'
+      '1.0.3'
     )
 
     const healthy = run(process.execPath, [

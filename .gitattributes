@@ -1,9 +1,5 @@
-# Force LF line endings on checkout regardless of platform/core.autocrlf.
-# Without this, the windows-latest release runner (release.yml) checks these
-# files out with CRLF, which npm then packs verbatim — corrupting the
-# `#!/usr/bin/env node` shebang in published CLI entrypoints to `node\r`.
-* text=auto eol=lf
-
+# Preserve POSIX script line endings for Windows contributors and any
+# cross-platform checkout, so `#!/usr/bin/env node` cannot become `node\r`.
 *.cjs text eol=lf
 *.sh text eol=lf
-bin/* text eol=lf
+bin/** text eol=lf

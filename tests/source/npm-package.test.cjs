@@ -151,7 +151,7 @@ function dryRunPackResult() {
 test('package metadata is public-ready under the exact available name and remains dependency-free', () => {
   const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'))
   assert.equal(packageJson.name, 'autoprompt-skill')
-  assert.equal(packageJson.version, '1.0.2')
+  assert.equal(packageJson.version, '1.0.3')
   assert.equal(
     packageJson.description,
     'Autoprompt is a coding-agent skill that cuts failures by 45% on agentic coding tasks.',
@@ -249,7 +249,7 @@ test('package metadata is public-ready under the exact available name and remain
 test('npm dry-run inventory is an exact allowlist and excludes repository-only material', () => {
   const result = dryRunPackResult()
   assert.equal(result.name, 'autoprompt-skill')
-  assert.equal(result.version, '1.0.2')
+  assert.equal(result.version, '1.0.3')
   const actual = result.files.map(file => file.path).sort()
   assert.deepEqual(actual, packageFilesOnDisk())
   assert.ok(result.size > 0)
@@ -325,8 +325,12 @@ test('every npm-packaged bin entrypoint has an LF shebang, no carriage returns, 
   for (const relativePath of binPaths) {
     const packedFile = result.files.find(file => file.path === relativePath)
     assert.ok(packedFile, `${relativePath}: not present in npm package`)
-    // eslint-disable-next-line no-bitwise
-    assert.equal(packedFile.mode & 0o111, 0o111, `${relativePath}: packed without the executable bit`)
+    // Windows filesystems do not represent POSIX executable bits. The release
+    // workflow packs on Linux, where this assertion verifies the published mode.
+    if (process.platform !== 'win32') {
+      // eslint-disable-next-line no-bitwise
+      assert.equal(packedFile.mode & 0o111, 0o111, `${relativePath}: packed without the executable bit`)
+    }
 
     const bytes = fs.readFileSync(path.join(ROOT, ...relativePath.split('/')))
     const firstLineEnd = bytes.indexOf(0x0a)
@@ -398,7 +402,7 @@ test('packed tarball installs into an isolated temporary global prefix and its s
           shell: false,
         })
       assert.equal(invoked.status, 0, invoked.stderr)
-      assert.equal(invoked.stdout, '1.0.2\n')
+      assert.equal(invoked.stdout, '1.0.3\n')
     }
   } finally {
     fs.rmSync(temporaryRoot, { recursive: true, force: true })
