@@ -316,6 +316,30 @@ test('every npm-packaged POSIX shell script has an LF shebang and no carriage re
   }
 })
 
+test('every npm-packaged bin entrypoint has an LF shebang, no carriage returns, and the executable bit', () => {
+  const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'))
+  const binPaths = [...new Set(Object.values(packageJson.bin))].sort()
+  assert.ok(binPaths.length > 0, 'package.json must declare bin entrypoints')
+
+  const result = dryRunPackResult()
+  for (const relativePath of binPaths) {
+    const packedFile = result.files.find(file => file.path === relativePath)
+    assert.ok(packedFile, `${relativePath}: not present in npm package`)
+    // eslint-disable-next-line no-bitwise
+    assert.equal(packedFile.mode & 0o111, 0o111, `${relativePath}: packed without the executable bit`)
+
+    const bytes = fs.readFileSync(path.join(ROOT, ...relativePath.split('/')))
+    const firstLineEnd = bytes.indexOf(0x0a)
+    assert.ok(firstLineEnd > 2, `${relativePath}: missing LF-terminated shebang`)
+    assert.equal(
+      bytes.subarray(0, firstLineEnd).toString('utf8').startsWith('#!'),
+      true,
+      `${relativePath}: first line is not a shebang`,
+    )
+    assert.equal(bytes.includes(0x0d), false, `${relativePath}: contains CR bytes`)
+  }
+})
+
 test('packed tarball installs into an isolated temporary global prefix and its shim runs', () => {
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt npm package '))
   const packDirectory = path.join(temporaryRoot, 'tarball output')
