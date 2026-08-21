@@ -6,8 +6,8 @@
 
 <p align="center">
   <a href="#벤치마크"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%EC%A0%90-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1: 14.61점 향상"/></a>
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%EB%B2%84%EC%A0%84&color=255C60&labelColor=14101F" alt="버전: v1.0.3"/></a>
-  <a href="#설치"><img src="https://img.shields.io/badge/%EC%A7%80%EC%9B%90-6-255C60?style=flat-square&labelColor=14101F" alt="지원: 6"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%EB%B2%84%EC%A0%84&color=255C60&labelColor=14101F" alt="버전: v1.0.4"/></a>
+  <a href="#설치"><img src="https://img.shields.io/badge/%EC%A7%80%EC%9B%90-9-255C60?style=flat-square&labelColor=14101F" alt="지원: 9"/></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/%EB%9D%BC%EC%9D%B4%EC%84%A0%EC%8A%A4-MIT-255C60?style=flat-square&labelColor=14101F" alt="라이선스: MIT"/></a>
 </p>
 
@@ -25,7 +25,7 @@
 
 ## 설치
 
-아래 CLI를 사용하거나 [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.3)에서 설치 프로그램을 받으세요.
+아래 CLI를 사용하거나 [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.4)에서 설치 프로그램을 받으세요.
 
 ### 1. CLI 설치
 
@@ -74,6 +74,9 @@ autoprompt
 | 지원 | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; 7.4.22 검증 완료 | `kilo` |
 | 지원 | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; VS Code 1.133.0 및 Copilot 0.61.0 검증 완료 | `vscode` |
 | 지원 | [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 0.7.2; 0.7.2 검증 완료; 네이티브 패키지 어댑터 | `prime` |
+| 지원 | [Oh My Pi](https://omp.sh/) | 17.4.0+; 17.4.0에서 어댑터 계약, 설치 수명주기, 네이티브 역할 페이로드 검증 완료 | `omp` |
+| 지원 | [DeepSeek Harness](https://deepseek.com/harness/en/) | 0.1.0-rc.7+; 0.1.0-rc.7에서 어댑터 계약, 설치 수명주기, 네이티브 역할 페이로드 검증 완료 | `deepseek` |
+| 지원 | [Reasonix](https://reasonix.io/docs/) | 1.30.0+; 1.30.0에서 어댑터 계약, 설치 수명주기, 네이티브 역할 페이로드 검증 완료 | `reasonix` |
 
 [지원 및 검증 정보](../faq/which-coding-agents-are-supported.md)를 참고하세요.
 
@@ -128,10 +131,10 @@ DeepSeek의 82.7%는 자체 테스트 설정에서 나온 결과이므로 직접
 
 `mode=`로 동시 실행을 설정하고, 호스트가 지원하면 `agents=`로 모델을 라우팅하세요.
 
-| 제어 | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| 사용자 지정 `agents=` 라우팅 | ✓ | ✓ | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 |
+| 제어 | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 사용자 지정 `agents=` 라우팅 | ✓ | ✓ | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 |
 
 ## 작동 방식
 
@@ -154,7 +157,7 @@ DeepSeek의 82.7%는 자체 테스트 설정에서 나온 결과이므로 직접
 | 조사 | `/autoprompt 이 코드베이스에 맞는 작업 큐를 비교하고 하나를 추천해 줘` |
 | 동시 실행 제한 | `/autoprompt mode=custom max_subs=4 모든 모델을 마이그레이션해 줘` |
 
-Codex에서는 `/autoprompt` 대신 `$autoprompt`를 사용하세요.
+Codex에서는 `/autoprompt` 대신 `$autoprompt`를 사용하세요. Oh My Pi에서는 `/skill:autoprompt`를 사용하세요.
 
 ## 자주 묻는 질문
 

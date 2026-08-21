@@ -6,8 +6,8 @@
 
 <p align="center">
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20puntos-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1: 14.61 puntos más"/></a>
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=versi%C3%B3n&color=255C60&labelColor=14101F" alt="Versión 1.0.3"/></a>
-  <a href="#instalar"><img src="https://img.shields.io/badge/soporte-6%20proveedores%20compatibles-255C60?style=flat-square&labelColor=14101F" alt="Seis proveedores compatibles"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=versi%C3%B3n&color=255C60&labelColor=14101F" alt="Versión 1.0.4"/></a>
+  <a href="#instalar"><img src="https://img.shields.io/badge/soporte-9%20proveedores%20compatibles-255C60?style=flat-square&labelColor=14101F" alt="Nueve proveedores compatibles"/></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-255C60?style=flat-square&labelColor=14101F" alt="Licencia MIT"/></a>
 </p>
 
@@ -25,7 +25,7 @@
 
 ## Instalar
 
-Usa la CLI siguiente o descarga un instalador desde [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.3).
+Usa la CLI siguiente o descarga un instalador desde [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.4).
 
 ### 1. Instala la CLI
 
@@ -74,6 +74,9 @@ autoprompt
 | Operativo | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; auditado con 7.4.22 | `kilo` |
 | Operativo | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; auditado con 1.133.0 y Copilot 0.61.0 | `vscode` |
 | Operativo | [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 0.7.2; auditado con 0.7.2; adaptador de paquete nativo | `prime` |
+| Operativo | [Oh My Pi](https://omp.sh/) | 17.4.0+; contrato del adaptador, ciclo de instalación y carga de roles nativos verificados con 17.4.0 | `omp` |
+| Operativo | [DeepSeek Harness](https://deepseek.com/harness/en/) | 0.1.0-rc.7+; contrato del adaptador, ciclo de instalación y carga de roles nativos verificados con 0.1.0-rc.7 | `deepseek` |
+| Operativo | [Reasonix](https://reasonix.io/docs/) | 1.30.0+; contrato del adaptador, ciclo de instalación y carga de roles nativos verificados con 1.30.0 | `reasonix` |
 
 Consulta las [notas de soporte y auditoría](../faq/which-coding-agents-are-supported.md).
 
@@ -128,10 +131,10 @@ No se conservaron registros de tiempo ni de tokens. Por tanto, son estimaciones 
 
 Usa `mode=` para definir la concurrencia. Usa `agents=` para dirigir modelos cuando el agente lo admita.
 
-| Control | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Enrutamiento personalizado con `agents=` | ✓ | ✓ | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo padre seleccionado |
+| Control | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Enrutamiento personalizado con `agents=` | ✓ | ✓ | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo padre seleccionado | ✕ No disponible - hereda el modelo padre seleccionado | ✕ No disponible - hereda el modelo padre seleccionado | ✕ No disponible - hereda el modelo padre seleccionado |
 
 ## Cómo funciona
 
@@ -154,7 +157,7 @@ Usa `mode=` para definir la concurrencia. Usa `agents=` para dirigir modelos cua
 | Investigar | `/autoprompt compara colas de trabajos para este repositorio y recomienda una` |
 | Limitar trabajo paralelo | `/autoprompt mode=custom max_subs=4 migra todos los modelos` |
 
-En Codex, usa `$autoprompt` en lugar de `/autoprompt`.
+En Codex, usa `$autoprompt` en lugar de `/autoprompt`. En Oh My Pi, usa `/skill:autoprompt`.
 
 ## Preguntas frecuentes
 

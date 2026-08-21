@@ -12,7 +12,10 @@ const test = require('node:test')
 const ROOT = path.resolve(__dirname, '..', '..')
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
 const INSTALL_DIR = path.join(ROOT, 'scripts', 'install')
-const PUBLIC = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']
+const PUBLIC = [
+  'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime',
+  'omp', 'deepseek', 'reasonix',
+]
 const LEGACY = ['vibe', 'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose']
 const BINARIES = Object.freeze({
   cursor: 'cursor-agent',
@@ -158,7 +161,7 @@ function writeLegacySharedReceipt(home, flavor) {
   return { claude, cursor, receiptPath }
 }
 
-test('both ports declare exactly six public install providers and no generic payload fallback', () => {
+test('both ports declare exactly nine public install providers and no generic payload fallback', () => {
   const shellLib = fs.readFileSync(path.join(INSTALL_DIR, 'lib', 'install-lib.sh'), 'utf8')
   const psLib = fs.readFileSync(path.join(INSTALL_DIR, 'lib', 'install-lib.ps1'), 'utf8')
   const shellInstall = fs.readFileSync(path.join(INSTALL_DIR, 'install.sh'), 'utf8')
@@ -178,7 +181,7 @@ test('both ports declare exactly six public install providers and no generic pay
   }
   const shellPayload = shellInstall.match(/payload_file\(\) \{[\s\S]*?^\}/m)?.[0] || ''
   const psPayload = psInstall.match(/function Get-PayloadFile \{[\s\S]*?^\}/m)?.[0] || ''
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode']) {
+  for (const provider of PUBLIC.filter(provider => provider !== 'prime')) {
     assert.match(shellPayload, new RegExp(`\\b${provider}\\b`))
     assert.match(psPayload, new RegExp(`'${provider}'`))
   }
@@ -186,6 +189,101 @@ test('both ports declare exactly six public install providers and no generic pay
   assert.doesNotMatch(shellPayload, /else[\s\S]*agents\/claude\/SKILL\.md/)
   assert.match(psPayload, /default\s+\{\s*return \$null\s*\}/)
   assert.doesNotMatch(psPayload, /return \(Join-Path \$RepoRoot 'agents\/claude\/SKILL\.md'\)\s*$/m)
+})
+
+test('DeepSeek prerelease detection and its rc.7 floor agree in both installer ports', {
+  skip: process.platform !== 'win32',
+}, () => {
+  const bash = findBash()
+  assert.ok(bash, 'Git Bash is required for lifecycle port parity')
+  const context = makeSandbox()
+  const version = '0.1.0-rc.6+local.1'
+  fs.writeFileSync(
+    path.join(context.bin, 'dsh.cmd'),
+    `@echo off\r\necho DeepSeek Harness ${version}\r\n`,
+  )
+  const shellBinary = path.join(context.bin, 'dsh')
+  fs.writeFileSync(shellBinary, `#!/bin/sh\nprintf '%s\\n' '${version}'\n`)
+  fs.chmodSync(shellBinary, 0o755)
+  try {
+    const shellLibrary = toBash(path.join(INSTALL_DIR, 'lib', 'install-lib.sh'))
+    const shell = run(bash, ['--noprofile', '--norc', '-c', [
+      `export PATH='${toBash(context.bin)}:/usr/bin:/bin'`,
+      `. '${shellLibrary}'`,
+      `test "$(detect_client deepseek)" = 'client=deepseek present=true version=${version}'`,
+      `test "${'${AUTOPROMPT_VERSION_FLOOR[deepseek]}'}" = '0.1.0-rc.7'`,
+      `! _precheck_version_ge '${version}' "${'${AUTOPROMPT_VERSION_FLOOR[deepseek]}'}"`,
+      `_precheck_version_ge '0.1.0-rc.7' "${'${AUTOPROMPT_VERSION_FLOOR[deepseek]}'}"`,
+      `_precheck_version_ge '0.1.0-rc.8' "${'${AUTOPROMPT_VERSION_FLOOR[deepseek]}'}"`,
+      `_precheck_version_ge '0.1.0' "${'${AUTOPROMPT_VERSION_FLOOR[deepseek]}'}"`,
+      `! _precheck_version_ge '0.1.0-alpha' "${'${AUTOPROMPT_VERSION_FLOOR[deepseek]}'}"`,
+    ].join('; ')])
+    assert.equal(shell.status, 0, combined(shell))
+
+    const psLibrary = path.join(INSTALL_DIR, 'lib', 'install-lib.ps1')
+    const psScript = [
+      "$ErrorActionPreference = 'Stop'",
+      `. ${powershellLiteral(psLibrary)}`,
+      '$writer = [IO.StringWriter]::new()',
+      '$prior = [Console]::Out',
+      'try { [Console]::SetOut($writer); $code = Detect-Client -Name deepseek } finally { [Console]::SetOut($prior) }',
+      'if ($code -ne 0) { exit 10 }',
+      `if ($writer.ToString().Trim() -cne 'client=deepseek present=true version=${version}') { exit 11 }`,
+      "if ($AutopromptVersionFloor.deepseek -cne '0.1.0-rc.7') { exit 12 }",
+      `if (Test-PrecheckVersionGe -Found '${version}' -Floor $AutopromptVersionFloor.deepseek) { exit 13 }`,
+      "if (-not (Test-PrecheckVersionGe -Found '0.1.0-rc.7' -Floor $AutopromptVersionFloor.deepseek)) { exit 14 }",
+      "if (-not (Test-PrecheckVersionGe -Found '0.1.0-rc.8' -Floor $AutopromptVersionFloor.deepseek)) { exit 15 }",
+      "if (-not (Test-PrecheckVersionGe -Found '0.1.0' -Floor $AutopromptVersionFloor.deepseek)) { exit 16 }",
+      "if (Test-PrecheckVersionGe -Found '0.1.0-alpha' -Floor $AutopromptVersionFloor.deepseek) { exit 17 }",
+      'exit 0',
+    ].join('; ')
+    const powershell = run(POWERSHELL, [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psScript,
+    ], { env: context.psEnv })
+    assert.equal(powershell.status, 0, combined(powershell))
+  } finally {
+    fs.rmSync(context.root, { recursive: true, force: true })
+  }
+})
+
+test('PowerShell Reasonix roots follow Windows and Unix host contracts', (t) => {
+  const probe = run(POWERSHELL, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', 'exit 0',
+  ])
+  if (probe.error?.code === 'ENOENT') {
+    t.skip(`${POWERSHELL} is not available on this runner`)
+    return
+  }
+  assert.equal(probe.status, 0, combined(probe))
+
+  const context = makeSandbox()
+  const appData = path.join(context.root, 'roaming')
+  fs.mkdirSync(appData, { recursive: true })
+  const env = { ...context.psEnv, APPDATA: appData }
+  if (process.platform !== 'win32') env.PATH = process.env.PATH
+  delete env.AUTOPROMPT_INSTALL_ROOT
+  delete env.REASONIX_HOME
+  try {
+    const psLibrary = path.join(INSTALL_DIR, 'lib', 'install-lib.ps1')
+    const expectedUnix = path.join(context.home, '.reasonix')
+    const expectedWindows = path.join(appData, 'reasonix')
+    const script = [
+      `. ${powershellLiteral(psLibrary)}`,
+      'function Test-AutopromptWindowsHost { return $false }',
+      '$unix = Get-AutopromptConfigRoot -Name reasonix',
+      `if ($unix -cne ${powershellLiteral(expectedUnix)}) { exit 20 }`,
+      'function Test-AutopromptWindowsHost { return $true }',
+      '$windows = Get-AutopromptConfigRoot -Name reasonix',
+      `if ($windows -cne ${powershellLiteral(expectedWindows)}) { exit 21 }`,
+      'exit 0',
+    ].join('; ')
+    const result = run(POWERSHELL, [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+    ], { env })
+    assert.equal(result.status, 0, combined(result))
+  } finally {
+    fs.rmSync(context.root, { recursive: true, force: true })
+  }
 })
 
 test('legacy providers fail as unknown before install writes in both ports', {
@@ -211,7 +309,7 @@ test('legacy providers fail as unknown before install writes in both ports', {
   }
 })
 
-test('install all reports only the six public providers in both ports', {
+test('install all reports only the nine public providers in both ports', {
   skip: process.platform !== 'win32',
 }, () => {
   const bash = findBash()
@@ -233,7 +331,7 @@ test('install all reports only the six public providers in both ports', {
   }
 })
 
-test('default doctor reports only the six public providers', {
+test('default doctor reports only the nine public providers', {
   skip: process.platform !== 'win32',
 }, () => {
   const bash = findBash()

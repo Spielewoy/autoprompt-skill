@@ -707,6 +707,80 @@
         "explicit-agent-allowlists",
         "selected-model-inheritance"
       ]
+    },
+    "omp": {
+      "status": "supported",
+      "target": "17.4.0",
+      "profile": {
+        "agents": "native-markdown",
+        "skills": "agent-skills",
+        "model": "inherit"
+      },
+      "capabilities": [
+        "native-markdown-subagents",
+        "recursive-subagents",
+        "explicit-child-allowlists",
+        "selected-model-inheritance"
+      ],
+      "runtimePrerequisites": {
+        "task.maxRecursionDepth": 4
+      },
+      "allowedDeltas": [
+        "skill-frontmatter",
+        "markdown-agent-export",
+        "omp-tool-mapping",
+        "explicit-agent-allowlists",
+        "selected-model-inheritance"
+      ]
+    },
+    "deepseek": {
+      "status": "supported",
+      "target": "0.1.0-rc.7",
+      "profile": {
+        "dispatch": "fixed-persona-subagent-tools",
+        "activation": "user-agent-preset-or-headless-patch",
+        "model": "inherit"
+      },
+      "capabilities": [
+        "native-agent-preset",
+        "fixed-persona-subagent-tools",
+        "recursive-subagents",
+        "explicit-child-denylists",
+        "selected-model-inheritance"
+      ],
+      "runtimePrerequisites": {
+        "maxDepth": 4,
+        "profile": "standard-compatible"
+      },
+      "allowedDeltas": [
+        "skill-frontmatter",
+        "agent-preset-export",
+        "fixed-persona-subagent-tools",
+        "explicit-agent-denylists",
+        "selected-model-inheritance"
+      ]
+    },
+    "reasonix": {
+      "status": "supported",
+      "target": "1.30.0",
+      "profile": {
+        "agents": "native-subagent-skills",
+        "skills": "reasonix-skills",
+        "model": "inherit"
+      },
+      "capabilities": [
+        "native-subagent-skills",
+        "recursive-subagents",
+        "selected-model-inheritance"
+      ],
+      "runtimePrerequisites": {
+        "agent.max_subagent_depth": 4
+      },
+      "allowedDeltas": [
+        "skill-frontmatter",
+        "subagent-skill-export",
+        "selected-model-inheritance"
+      ]
     }
   },
   "generated": {
@@ -723,6 +797,14 @@
     "kiloAgents": "agents/kilo/agents",
     "kiloFrameworks": "agents/kilo/frameworks",
     "vscodeAgents": "agents/vscode/agents",
-    "vscodeFrameworks": "agents/vscode/frameworks"
+    "vscodeFrameworks": "agents/vscode/frameworks",
+    "ompAgents": "agents/omp/agents",
+    "ompFrameworks": "agents/omp/frameworks",
+    "deepseekAgents": "agents/deepseek/agents",
+    "deepseekFrameworks": "agents/deepseek/frameworks",
+    "deepseekPreset": "agents/deepseek/agent-preset/agent.cordis.yml",
+    "deepseekHeadlessPatch": "agents/deepseek/headless.patch.yml",
+    "reasonixAgents": "agents/reasonix/skills",
+    "reasonixFrameworks": "agents/reasonix/frameworks"
   }
 }

@@ -1,8 +1,8 @@
 # Check another coding agent or IDE
 
-Paste this into your preferred coding agent or LLM to check compatibility with https://github.com/Spielewoy/autoprompt-skill/. Replace [TOOL NAME] with the coding agent, CLI, IDE, or harness you want to check. For common tools, the name alone is enough. For niche tools, replace [TOOL DOCS] with its official documentation or repository. Example: [TOOL NAME] = Claude Code, [TOOL DOCS] = Claude Code documentation link.
+Use this prompt to check compatibility with https://github.com/Spielewoy/autoprompt-skill/. Replace [TOOL NAME] with the coding agent, CLI, IDE, or harness you want to check. For common tools, the name alone is enough. For niche tools, replace [TOOL DOCS] with its official documentation or repository. Example: [TOOL NAME] = Claude Code, [TOOL DOCS] = Claude Code documentation link.
 
-## Paste-ready prompt
+## Compatibility prompt
 
 ```text
 We are checking compatibility for Autoprompt Skill:
@@ -49,6 +49,9 @@ A copied `SKILL.md` is not enough. The host needs a native adapter and a safe li
 | Kilo | 7.4.22+; checked on 7.4.22 | Skill, Markdown subagents, activation profile | Inherits active model |
 | VS Code | 1.133+ with Copilot 0.61.0 | Copilot skill, `.agent.md` roles, recursive setting | Inherits active model |
 | Prime Agent | 0.7.2; checked on 0.7.2 | Native package, personas, framework prompts, guarded recursion | Inherits selected parent model |
+| Oh My Pi | 17.4.0+; adapter contract, install lifecycle, and native role payload verified for 17.4.0 | Skill, Markdown agents, native `spawns` allowlists | Inherits selected parent model |
+| DeepSeek Harness | 0.1.0-rc.7+; adapter contract, install lifecycle, and native role payload verified for 0.1.0-rc.7 | Skill, user preset, fixed-persona tools, headless patch | Inherits selected parent model |
+| Reasonix | 1.30.0+; adapter contract, install lifecycle, and native role payload verified for 1.30.0 | Skill and 25 manual native subagent profiles | Inherits selected parent model |
 
 See the [support notes](../faq/which-coding-agents-are-supported.md).
 

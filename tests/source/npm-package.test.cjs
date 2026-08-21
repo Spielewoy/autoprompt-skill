@@ -10,7 +10,11 @@ const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const PACKAGE_PATH = path.join(ROOT, 'package.json')
-const PROVIDERS = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']
+const PACKAGE_VERSION = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8')).version
+const PROVIDERS = [
+  'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime',
+  'omp', 'deepseek', 'reasonix',
+]
 
 function filesBelow(directory) {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
@@ -107,6 +111,7 @@ function packageFilesOnDisk() {
     path.join(ROOT, 'LICENSE'),
     ...filesBelow(path.join(ROOT, 'bin')),
     path.join(ROOT, 'scripts', 'codex-configure.cjs'),
+    path.join(ROOT, 'scripts', 'harness-provider-config.cjs'),
     path.join(ROOT, 'scripts', 'runtime-payload.cjs'),
     ...filesBelow(path.join(ROOT, 'scripts', 'install')),
     ...PROVIDERS.map(provider => path.join(ROOT, 'agents', 'manifests', `${provider}-runtime.json`)),
@@ -151,7 +156,7 @@ function dryRunPackResult() {
 test('package metadata is public-ready under the exact available name and remains dependency-free', () => {
   const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'))
   assert.equal(packageJson.name, 'autoprompt-skill')
-  assert.equal(packageJson.version, '1.0.3')
+  assert.equal(packageJson.version, PACKAGE_VERSION)
   assert.equal(
     packageJson.description,
     'Autoprompt is a coding-agent skill that cuts failures by 45% on agentic coding tasks.',
@@ -182,6 +187,7 @@ test('package metadata is public-ready under the exact available name and remain
     'provider-compatibility-registry',
     'codex-current-parity',
     'prime-provider',
+    'harness-provider-config',
   ]) {
     assert.match(packageJson.scripts['test:providers'], new RegExp(`${suite}\\.test\\.cjs`), suite)
   }
@@ -192,6 +198,8 @@ test('package metadata is public-ready under the exact available name and remain
     'vscode-lifecycle',
     'install-custom-root',
     'prime-lifecycle',
+    'new-harness-lifecycle',
+    'packed-new-harness-lifecycle',
   ]) {
     assert.match(packageJson.scripts['test:lifecycle'], new RegExp(`${suite}\\.test\\.cjs`), suite)
   }
@@ -207,6 +215,7 @@ test('package metadata is public-ready under the exact available name and remain
   assert.deepEqual(packageJson.files, [
     'bin/',
     'scripts/codex-configure.cjs',
+    'scripts/harness-provider-config.cjs',
     'scripts/install/',
     'scripts/runtime-payload.cjs',
     'agents/claude/',
@@ -215,12 +224,18 @@ test('package metadata is public-ready under the exact available name and remain
     'agents/kilo/',
     'agents/vscode/',
     'agents/prime/',
+    'agents/omp/',
+    'agents/deepseek/',
+    'agents/reasonix/',
     'agents/manifests/claude-runtime.json',
     'agents/manifests/codex-runtime.json',
     'agents/manifests/opencode-runtime.json',
     'agents/manifests/kilo-runtime.json',
     'agents/manifests/vscode-runtime.json',
     'agents/manifests/prime-runtime.json',
+    'agents/manifests/omp-runtime.json',
+    'agents/manifests/deepseek-runtime.json',
+    'agents/manifests/reasonix-runtime.json',
     'assets/anatomy.svg',
     'assets/banner.svg',
     'assets/how-it-works-hierarchy.svg',
@@ -249,7 +264,7 @@ test('package metadata is public-ready under the exact available name and remain
 test('npm dry-run inventory is an exact allowlist and excludes repository-only material', () => {
   const result = dryRunPackResult()
   assert.equal(result.name, 'autoprompt-skill')
-  assert.equal(result.version, '1.0.3')
+  assert.equal(result.version, PACKAGE_VERSION)
   const actual = result.files.map(file => file.path).sort()
   assert.deepEqual(actual, packageFilesOnDisk())
   assert.ok(result.size > 0)
@@ -402,7 +417,7 @@ test('packed tarball installs into an isolated temporary global prefix and its s
           shell: false,
         })
       assert.equal(invoked.status, 0, invoked.stderr)
-      assert.equal(invoked.stdout, '1.0.3\n')
+      assert.equal(invoked.stdout, `${PACKAGE_VERSION}\n`)
     }
   } finally {
     fs.rmSync(temporaryRoot, { recursive: true, force: true })

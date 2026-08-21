@@ -19,6 +19,8 @@ const UPDATE_STATE_DIRECTORY = '.autoprompt'
 const UPDATE_STATE_BASENAME = 'cli-update.json'
 const UPDATE_HANDOFF_ENV = 'AUTOPROMPT_UPDATED_HANDOFF'
 const CLIENT_TOKEN = /^[a-z][a-z0-9-]*$/
+const OMP_PROFILE_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/
+const OMP_WINDOWS_RESERVED_BASENAME = /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\..*)?$/i
 const PROVIDERS = Object.freeze([
   Object.freeze({ id: 'claude', label: 'Claude Code' }),
   Object.freeze({ id: 'codex', label: 'Codex' }),
@@ -26,6 +28,9 @@ const PROVIDERS = Object.freeze([
   Object.freeze({ id: 'kilo', label: 'Kilo Code' }),
   Object.freeze({ id: 'vscode', label: 'VS Code' }),
   Object.freeze({ id: 'prime', label: 'Prime Agent' }),
+  Object.freeze({ id: 'omp', label: 'Oh My Pi' }),
+  Object.freeze({ id: 'deepseek', label: 'DeepSeek Harness' }),
+  Object.freeze({ id: 'reasonix', label: 'Reasonix' }),
 ])
 const PUBLIC_PROVIDER_IDS = new Set(PROVIDERS.map(provider => provider.id))
 const CUSTOM_PROVIDER_OPTION = Object.freeze({ id: 'custom', label: 'Custom coding agent' })
@@ -55,7 +60,7 @@ const HELP_TEXT = [
   '  -h, --help       Show this help.',
   '  -v, --version    Print the package version.',
   '',
-  'Interactive providers: claude, codex, opencode, kilo, vscode, prime.',
+  'Interactive providers: claude, codex, opencode, kilo, vscode, prime, omp, deepseek, reasonix.',
   '',
   'Launch `autoprompt` to check for CLI updates and open the installer.',
   'It scans detected roots and lets you install, update, or repair a provider.',
@@ -198,6 +203,40 @@ function configuredHome(env, fallback = os.homedir()) {
   return env.HOME || env.USERPROFILE || fallback
 }
 
+function ompProfile(env) {
+  const raw = Object.prototype.hasOwnProperty.call(env, 'OMP_PROFILE')
+    ? env.OMP_PROFILE
+    : env.PI_PROFILE
+  const profile = String(raw || '').trim()
+  if (!profile || profile === 'default') return ''
+  if (profile.endsWith('.') || !OMP_PROFILE_NAME.test(profile) ||
+      OMP_WINDOWS_RESERVED_BASENAME.test(profile)) {
+    throw new Error(`Invalid OMP profile "${String(raw)}".`)
+  }
+  return profile
+}
+
+function ompDefaultAgentRoot(env, home) {
+  return path.join(home, env.PI_CONFIG_DIR || '.omp', 'agent')
+}
+
+function ompInstallRoot(env, home) {
+  const profile = ompProfile(env)
+  if (profile) {
+    return path.join(home, env.PI_CONFIG_DIR || '.omp', 'profiles', profile, 'agent')
+  }
+  return env.PI_CODING_AGENT_DIR || ompDefaultAgentRoot(env, home)
+}
+
+function ompNativeTaskAgentRoot(env, home) {
+  const profile = ompProfile(env)
+  if (profile) return ompInstallRoot(env, home)
+  // OMP 17.4.0 relocates skills and settings with PI_CODING_AGENT_DIR, but its
+  // task-agent discovery still resolves the default native user root through
+  // PI_CONFIG_DIR. Keep the role files where that runtime actually reads them.
+  return env.PI_CODING_AGENT_DIR ? ompDefaultAgentRoot(env, home) : ompInstallRoot(env, home)
+}
+
 function providerInstallLocations(client, locationOptions = {}) {
   const env = locationOptions.env || process.env
   const platform = locationOptions.platform || process.platform
@@ -212,6 +251,26 @@ function providerInstallLocations(client, locationOptions = {}) {
   if (client === 'opencode') return singleRoot(path.join(xdg, 'opencode'))
   if (client === 'prime') {
     return singleRoot(env.PRIME_AGENT_CODING_AGENT_DIR || path.join(home, '.prime', 'agent'))
+  }
+  if (client === 'omp') {
+    const installRoot = ompInstallRoot(env, home)
+    const nativeRoot = ompNativeTaskAgentRoot(env, home)
+    if (nativeRoot === installRoot) return singleRoot(installRoot)
+    return {
+      roots: [
+        { label: 'Install directory', path: installRoot },
+        { label: 'Native task-agent root', path: nativeRoot },
+      ],
+    }
+  }
+  if (client === 'deepseek') {
+    return singleRoot(env.DSH_HOME || path.join(home, '.dsh'))
+  }
+  if (client === 'reasonix') {
+    const root = env.REASONIX_HOME || (platform === 'win32'
+      ? path.join(env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'reasonix')
+      : path.join(home, '.reasonix'))
+    return singleRoot(root)
   }
   if (client === 'kilo') {
     return {

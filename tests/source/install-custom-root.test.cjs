@@ -10,18 +10,25 @@ const path = require('node:path')
 const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
+const PACKAGE_VERSION = require('../../package.json').version
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
 const GIT_BASH = process.platform === 'win32'
   ? 'C:\\Program Files\\Git\\bin\\bash.exe'
   : 'bash'
-const PUBLIC_CLIENTS = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']
+const PUBLIC_CLIENTS = [
+  'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime',
+  'omp', 'deepseek', 'reasonix',
+]
 const SHARED_LIFECYCLE_CLIENTS = PUBLIC_CLIENTS.filter(client => client !== 'prime')
 const CLIENT_COMMANDS = {
   claude: ['claude', 'Claude Code 2.1.232'],
   codex: ['codex', 'codex-cli 0.101.0'],
   opencode: ['opencode', 'opencode 1.18.18'],
   kilo: ['kilo', 'kilo 7.4.22'],
-  vscode: ['code', '1.133.0']
+  vscode: ['code', '1.133.0'],
+  omp: ['omp', 'omp/17.4.0'],
+  deepseek: ['dsh', '0.1.0-rc.7'],
+  reasonix: ['reasonix', 'reasonix v1.30.0']
 }
 const MANIFESTS = Object.fromEntries(SHARED_LIFECYCLE_CLIENTS.map(client => [
   client,
@@ -255,6 +262,29 @@ function assertCustomLayout (client, customRoot) {
         25
       )
       break
+    case 'omp':
+      assert.equal(matchingFiles(path.join(customRoot, 'agents'), /^ap-.*\.md$/).length, 25)
+      break
+    case 'deepseek':
+      assert.equal(fs.existsSync(path.join(
+        customRoot,
+        '.agent-presets',
+        'autoprompt',
+        'agent.cordis.yml'
+      )), true)
+      assert.equal(fs.existsSync(path.join(
+        customRoot,
+        '.agent-presets',
+        'autoprompt',
+        'preset.yml'
+      )), true)
+      break
+    case 'reasonix':
+      assert.equal(matchingFiles(path.join(customRoot, 'skills'), /^ap-.*$/).length, 25)
+      for (const name of matchingFiles(path.join(customRoot, 'skills'), /^ap-.*$/)) {
+        assert.equal(fs.existsSync(path.join(customRoot, 'skills', name, 'SKILL.md')), true)
+      }
+      break
   }
 }
 
@@ -292,6 +322,9 @@ function defaultProviderPaths (context, client) {
     case 'opencode': return [path.join(context.xdg, 'opencode')]
     case 'kilo': return [path.join(context.home, '.kilo'), path.join(context.xdg, 'kilo')]
     case 'vscode': return [path.join(context.home, '.copilot')]
+    case 'omp': return [path.join(context.home, '.omp', 'agent')]
+    case 'deepseek': return [path.join(context.home, '.dsh')]
+    case 'reasonix': return [path.join(context.appData, 'reasonix')]
     default: return []
   }
 }
@@ -304,6 +337,14 @@ function customTamperTarget (client, customRoot) {
     case 'opencode': return path.join(customRoot, 'agents', 'ap-manager.md')
     case 'kilo': return path.join(customRoot, 'agents', 'ap-manager.md')
     case 'vscode': return path.join(customRoot, 'agents', 'ap-manager.agent.md')
+    case 'omp': return path.join(customRoot, 'agents', 'ap-manager.md')
+    case 'deepseek': return path.join(
+      customRoot,
+      '.agent-presets',
+      'autoprompt',
+      'agent.cordis.yml'
+    )
+    case 'reasonix': return path.join(customRoot, 'skills', 'ap-manager', 'SKILL.md')
     default: throw new Error(`unknown client: ${client}`)
   }
 }
@@ -774,7 +815,7 @@ test('PowerShell upgrades a synthetic receiptless legacy Codex install end to en
         'autoprompt',
         'VERSION'
       ), 'utf8').trim(),
-      '1.0.3'
+      PACKAGE_VERSION
     )
 
     const healthy = run(process.execPath, [

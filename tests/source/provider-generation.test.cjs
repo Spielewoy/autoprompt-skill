@@ -126,14 +126,16 @@ test('provider-native prompts are deterministic generated views', () => {
 
   const contract = JSON.parse(fs.readFileSync(CONTRACT_PATH, 'utf8'))
   const outputs = renderOutputs(ROOT)
-  assert.equal(outputs.size, contract.personas.length * 6 + contract.frameworks.length * 6 + 20)
+  assert.equal(outputs.size, contract.personas.length * 9 + contract.frameworks.length * 9 + 41)
   const version = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode']) {
+  for (const provider of [
+    'claude', 'codex', 'opencode', 'kilo', 'vscode', 'omp', 'deepseek', 'reasonix',
+  ]) {
     assert.equal(outputs.get(`agents/${provider}/VERSION`), `${version}\n`, provider)
   }
 })
 
-test('every canonical persona has complete forms for all six public providers', () => {
+test('every canonical persona has complete forms for all nine public providers', () => {
   const contract = JSON.parse(fs.readFileSync(CONTRACT_PATH, 'utf8'))
 
   for (const persona of contract.personas) {
@@ -145,6 +147,9 @@ test('every canonical persona has complete forms for all six public providers', 
     const kilo = read(`agents/kilo/agents/${persona.id}.md`)
     const vscode = read(`agents/vscode/agents/${persona.id}.agent.md`)
     const prime = read(`agents/prime/personas/${persona.id}.md`)
+    const omp = read(`agents/omp/agents/${persona.id}.md`)
+    const deepseek = read(`agents/deepseek/agents/${persona.id}.md`)
+    const reasonix = read(`agents/reasonix/skills/${persona.id}/SKILL.md`)
 
     assert.equal(claude, canonical, `${persona.id} Claude source`)
     assert.match(codex, new RegExp(`^name = "${persona.id}"$`, 'm'))
@@ -171,6 +176,22 @@ test('every canonical persona has complete forms for all six public providers', 
     assert.doesNotMatch(vscode, /[\u2013\u2014]/, `${persona.id} must use ASCII punctuation`)
 
     assert.equal(prime.trim(), body.trim(), `${persona.id} Prime body`)
+
+    assert.match(omp, new RegExp(`^name: ${persona.id}$`, 'm'))
+    assert.equal(omp.includes(body.trim()), true, `${persona.id} OMP body`)
+    assert.deepEqual(
+      [...omp.matchAll(/^  - (ap-[a-z0-9-]+)$/gm)].map(match => match[1]),
+      persona.allowedChildren,
+      `${persona.id} OMP child allowlist`,
+    )
+
+    assert.match(deepseek, new RegExp(`^name: ${persona.id}$`, 'm'))
+    assert.equal(deepseek.includes(body.trim()), true, `${persona.id} DeepSeek body`)
+
+    assert.match(reasonix, new RegExp(`^name: ${persona.id}$`, 'm'))
+    assert.match(reasonix, /^invocation: manual$/m)
+    assert.match(reasonix, /^runAs: subagent$/m)
+    assert.equal(reasonix.includes(body.trim()), true, `${persona.id} Reasonix body`)
   }
 })
 
@@ -178,7 +199,9 @@ test('all providers expose the same framework set', () => {
   const contract = JSON.parse(fs.readFileSync(CONTRACT_PATH, 'utf8'))
   const expected = contract.frameworks.map(framework => `${framework.id}.md`).sort()
 
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode']) {
+  for (const provider of [
+    'claude', 'codex', 'opencode', 'kilo', 'vscode', 'omp', 'deepseek', 'reasonix',
+  ]) {
     const actual = fs.readdirSync(path.join(ROOT, 'agents', provider, 'frameworks'))
       .filter(name => name.endsWith('.md'))
       .sort()
@@ -188,6 +211,32 @@ test('all providers expose the same framework set', () => {
     .filter(name => name.endsWith('.md'))
     .sort()
   assert.deepEqual(prime, expected, 'prime')
+})
+
+test('new harness adapters encode their audited native contracts', () => {
+  const contract = JSON.parse(fs.readFileSync(CONTRACT_PATH, 'utf8'))
+
+  assert.equal(contract.providers.omp.target, '17.4.0')
+  assert.equal(contract.providers.omp.profile.agents, 'native-markdown')
+  assert.equal(contract.providers.omp.profile.model, 'inherit')
+
+  assert.equal(contract.providers.deepseek.target, '0.1.0-rc.7')
+  assert.equal(contract.providers.deepseek.profile.dispatch, 'fixed-persona-subagent-tools')
+  assert.equal(contract.providers.deepseek.profile.model, 'inherit')
+  const preset = read('agents/deepseek/agent-preset/agent.cordis.yml')
+  assert.equal((preset.match(/name: '@deepseek-ai\/dsh-tool-subagent'/g) ?? []).length, 25)
+  assert.equal((preset.match(/^\s+toolName: ap_[a-z0-9_]+$/gm) ?? []).length, 25)
+  assert.doesNotMatch(preset, /^\s+toolName: subagent(?:_fork)?$/m)
+  assert.equal((preset.match(/^\s+persona: \|-$/gm) ?? []).length, 25)
+  assert.equal((preset.match(/^        - subagent$/gm) ?? []).length, 25)
+  assert.equal((preset.match(/^        - subagent_fork$/gm) ?? []).length, 25)
+  const headlessPatch = read('agents/deepseek/headless.patch.yml')
+  assert.doesNotMatch(preset, /[ \t]+$/m)
+  assert.doesNotMatch(headlessPatch, /[ \t]+$/m)
+
+  assert.equal(contract.providers.reasonix.target, '1.30.0')
+  assert.equal(contract.providers.reasonix.profile.agents, 'native-subagent-skills')
+  assert.equal(contract.providers.reasonix.profile.model, 'inherit')
 })
 
 test('the VS Code package records its proven runtime contract and has valid links', () => {

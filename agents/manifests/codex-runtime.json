@@ -61,7 +61,7 @@
     "GATES.md": "de5270f58b447b9713d3da844ce379546b392c8d069801c6eef941ebfc2c0e9e",
     "MODES.md": "b7a3482584bdf4549d282034f6ce0aa3d4d9735e1e8441ee010cd779125b2b2f",
     "PLAYBOOKS.md": "448d779d63eed528e1e9b0631d81af38d35944807e63f28ac26c0b2d0ff6b597",
-    "VERSION": "f5e5c9534532840fcd45bb002e69ed85c61dba2753450e26b448b7df1481e24d",
+    "VERSION": "d1b77b88f4b9f675a900e4143ac768a21218623cfe1703ca43162388c3271bd6",
     "agents/ap-arbiter.toml": "e8e94ed46ece6f25d8f6159e3e41c764544aa716cd763647d693308361c52155",
     "agents/ap-depth-prober.toml": "a6ea005492c5c7f9c55c17fe7f3c66b9d405c17fb27eda1113cf0ddcc0045d1c",
     "agents/ap-execharness-resolver.toml": "3ebd97fe986aa996b8261f7f9f118756f6975928d530749f5459102bff47abc1",

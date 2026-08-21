@@ -12,6 +12,7 @@ const test = require('node:test')
 const ROOT = path.resolve(__dirname, '..', '..')
 const CLI_PATH = path.join(ROOT, 'bin', 'autoprompt.cjs')
 const PACKAGE_VERSION = require('../../package.json').version
+const NEXT_PACKAGE_VERSION = nextPatchVersion(PACKAGE_VERSION)
 const CUSTOM_GUIDE_URL = 'https://github.com/Spielewoy/autoprompt-skill/blob/main/docs/guides/custom-agent-compatibility.md'
 const {
   HELP_TEXT,
@@ -25,6 +26,7 @@ const {
   resolveInteractiveUpdateStatus,
   run,
 } = require('../../bin/autoprompt.cjs')
+const { createProviderRootCompat } = require('../../bin/provider-root-compat.cjs')
 
 function capture() {
   let value = ''
@@ -81,6 +83,16 @@ function writeJson(file, value) {
 function writeText(file, text = 'marker\n') {
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, text)
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function nextPatchVersion(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(version))
+  assert.ok(match, `expected simple semver, got ${version}`)
+  return `${match[1]}.${match[2]}.${Number(match[3]) + 1}`
 }
 
 function makeLegacyCodexFixture (sandbox) {
@@ -186,6 +198,34 @@ function writeStrongCustomRoot(root, provider) {
         '__init__.py',
       ))
       return
+    case 'omp':
+      writeRoles(path.join(root, 'agents'), '.md')
+      writeText(
+        path.join(root, 'skills', 'autoprompt', 'SKILL.md'),
+        [
+          '---',
+          'name: autoprompt',
+          'description: "Invoke /skill:autoprompt to run Autoprompt."',
+          'user-invocable: true',
+          '---',
+          '',
+        ].join('\n')
+      )
+      return
+    case 'deepseek':
+      writeText(path.join(root, '.agent-presets', 'autoprompt', 'agent.cordis.yml'))
+      writeText(path.join(root, '.agent-presets', 'autoprompt', 'preset.yml'))
+      return
+    case 'reasonix':
+      for (let index = 1; index <= 25; index += 1) {
+        writeText(path.join(
+          root,
+          'skills',
+          `ap-test-${String(index).padStart(2, '0')}`,
+          'SKILL.md',
+        ))
+      }
+      return
     default:
       throw new Error(`unknown provider: ${provider}`)
   }
@@ -285,18 +325,24 @@ test('interactive no-argument launch numbers every install provider plus the cus
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /Checking for updates\.\.\.\r?\nAutoprompt 1\.0\.3 is current\./)
+  assert.match(
+    result.stdout,
+    new RegExp(`Checking for updates\\.\\.\\.\\r?\\nAutoprompt ${escapeRegExp(PACKAGE_VERSION)} is current\\.`),
+  )
   assert.doesNotMatch(result.stdout, /\[[#.-]{10}\]/)
   assert.ok(result.stdout.indexOf('Checking for updates...') < result.stdout.indexOf('Pick a coding agent:'))
   assert.match(result.stdout, /Pick a coding agent:/)
   for (const [index, provider] of PROVIDERS.entries()) {
     assert.match(result.stdout, new RegExp(`${index + 1}\\) ${provider.label}`))
   }
-  assert.match(result.stdout, /7\) Custom coding agent/)
-  assert.match(result.stdout, /Provider \[1-7, Esc\]: /)
+  assert.match(result.stdout, /10\) Custom coding agent/)
+  assert.match(result.stdout, /Provider \[1-10, Esc\]: /)
   assert.deepEqual(
     PROVIDERS.map(provider => provider.id),
-    ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime'],
+    [
+      'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime',
+      'omp', 'deepseek', 'reasonix',
+    ],
   )
   assert.equal(PROVIDERS.some(provider => provider.id === 'vibe'), false)
   assert.match(result.stdout, new RegExp(`Detected path: ${codexHome.replaceAll('\\', '\\\\')}`))
@@ -327,13 +373,19 @@ test('interactive no-argument launch numbers every install provider plus the cus
 
 test('interactive launch offers a newer CLI release before provider selection', () => {
   const result = invoke([], {
-    checkLatestVersion: () => '1.0.4',
+    checkLatestVersion: () => NEXT_PACKAGE_VERSION,
     interactive: true,
     responses: [{ status: 0 }, { status: 0 }],
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /New Autoprompt version available: 1\.0\.4 \(installed 1\.0\.3\)\. Updating\.\.\./)
+  assert.match(
+    result.stdout,
+    new RegExp(
+      `New Autoprompt version available: ${escapeRegExp(NEXT_PACKAGE_VERSION)} ` +
+      `\\(installed ${escapeRegExp(PACKAGE_VERSION)}\\)\\. Updating\\.\\.\\.`,
+    ),
+  )
   assert.match(result.stdout, /Autoprompt updated\. Restarting the installer\./)
   assert.doesNotMatch(result.stdout, /Pick a coding agent:/)
   assert.deepEqual(result.calls.map(call => [call.command, call.args]), [
@@ -353,7 +405,13 @@ test('interactive launch auto-updates a packaged install when GitHub main differ
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /New Autoprompt build available on GitHub main \(installed 1\.0\.3\)\. Updating\.\.\./)
+  assert.match(
+    result.stdout,
+    new RegExp(
+      `New Autoprompt build available on GitHub main ` +
+      `\\(installed ${escapeRegExp(PACKAGE_VERSION)}\\)\\. Updating\\.\\.\\.`,
+    ),
+  )
   assert.match(result.stdout, /Autoprompt updated\. Restarting the installer\./)
   assert.doesNotMatch(result.stdout, /Pick a coding agent:/)
   assert.deepEqual(result.calls.map(call => [call.command, call.args]), [
@@ -394,7 +452,7 @@ test('successful startup update records the GitHub revision and does not reinsta
 
   assert.equal(first.calls.length, 2)
   assert.equal(second.calls.length, 0)
-  assert.match(second.stdout, /Autoprompt 1\.0\.3 is current\./)
+  assert.match(second.stdout, new RegExp(`Autoprompt ${escapeRegExp(PACKAGE_VERSION)} is current\\.`))
   assert.match(second.stdout, /Pick a coding agent:/)
 })
 
@@ -522,7 +580,13 @@ test('interactive launch offers a GitHub main build when the version stays the s
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /New Autoprompt build available on GitHub main \(installed 1\.0\.3\)\. Updating\.\.\./)
+  assert.match(
+    result.stdout,
+    new RegExp(
+      `New Autoprompt build available on GitHub main ` +
+      `\\(installed ${escapeRegExp(PACKAGE_VERSION)}\\)\\. Updating\\.\\.\\.`,
+    ),
+  )
   assert.match(result.stdout, /Autoprompt updated\. Restarting the installer\./)
   assert.doesNotMatch(result.stdout, /Pick a coding agent:/)
   assert.deepEqual(result.calls.map(call => [call.command, call.args]), [
@@ -549,7 +613,7 @@ test('updated installer handoff skips a second update check', () => {
 
 test('updated installer handoff forwards the refreshed CLI exit status', () => {
   const result = invoke([], {
-    checkLatestVersion: () => '1.0.4',
+    checkLatestVersion: () => NEXT_PACKAGE_VERSION,
     interactive: true,
     responses: [{ status: 0 }, { status: 77 }],
   })
@@ -583,7 +647,10 @@ test('interactive launch from a repo checkout does not self-install a same-versi
   })
 
   assert.equal(result.status, 0)
-  assert.match(result.stdout, /Repository checkout 1\.0\.3 is not auto-updated\./)
+  assert.match(
+    result.stdout,
+    new RegExp(`Repository checkout ${escapeRegExp(PACKAGE_VERSION)} is not auto-updated\\.`),
+  )
   assert.match(result.stdout, /Pick a coding agent:/)
   assert.match(result.stdout, /Autoprompt installer closed\./)
   assert.deepEqual(result.calls, [])
@@ -593,7 +660,7 @@ test('interactive launch from a repo checkout does not self-install a newer regi
   const result = invoke([], {
     answers: ['\u001b'],
     checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
-    checkLatestVersion: () => '1.0.4',
+    checkLatestVersion: () => NEXT_PACKAGE_VERSION,
     interactive: true,
     packageRoot: ROOT,
   })
@@ -601,7 +668,10 @@ test('interactive launch from a repo checkout does not self-install a newer regi
   assert.equal(result.status, 0)
   assert.match(
     result.stdout,
-    /Repository checkout 1\.0\.3 is not auto-updated\. Latest release: 1\.0\.4\./,
+    new RegExp(
+      `Repository checkout ${escapeRegExp(PACKAGE_VERSION)} is not auto-updated\\. ` +
+      `Latest release: ${escapeRegExp(NEXT_PACKAGE_VERSION)}\\.`,
+    ),
   )
   assert.match(result.stdout, /Pick a coding agent:/)
   assert.deepEqual(result.calls, [])
@@ -609,7 +679,7 @@ test('interactive launch from a repo checkout does not self-install a newer regi
 
 test('interactive custom coding agent option exits safely with the compatibility guide URL', () => {
   const result = invoke([], {
-    answers: ['7'],
+    answers: ['10'],
     interactive: true,
   })
 
@@ -733,6 +803,99 @@ test('interactive strong custom-root match reuses the lifecycle installer throug
   }
 })
 
+test('every supported provider has an unambiguous strong custom-root layout', () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-cli-provider-layouts-'))
+  const compat = createProviderRootCompat(Object.fromEntries(
+    PROVIDERS.map(provider => [provider.id, provider.label]),
+  ))
+  try {
+    for (const provider of PROVIDERS) {
+      const root = path.join(sandbox, provider.id)
+      writeStrongCustomRoot(root, provider.id)
+      const result = compat.inspect(root, provider.id)
+      if (provider.id === 'vscode') {
+        assert.equal(result.status, 'warn', provider.id)
+        assert.match(result.headline, /subagent setting cannot be verified/)
+      } else {
+        assert.deepEqual(result, { status: 'accept' }, provider.id)
+      }
+    }
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+  }
+})
+
+test('OMP custom-root evidence is the real invocable skill plus native agents, without README', () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-cli-omp-layout-'))
+  const compat = createProviderRootCompat(Object.fromEntries(
+    PROVIDERS.map(provider => [provider.id, provider.label]),
+  ))
+  try {
+    const healthy = path.join(sandbox, 'healthy')
+    fs.mkdirSync(path.join(healthy, 'skills', 'autoprompt'), { recursive: true })
+    fs.cpSync(
+      path.join(ROOT, 'agents', 'omp', 'SKILL.md'),
+      path.join(healthy, 'skills', 'autoprompt', 'SKILL.md'),
+    )
+    fs.cpSync(
+      path.join(ROOT, 'agents', 'omp', 'agents'),
+      path.join(healthy, 'agents'),
+      { recursive: true },
+    )
+
+    assert.equal(fs.existsSync(path.join(healthy, 'skills', 'autoprompt', 'README.md')), false)
+    assert.deepEqual(compat.inspect(healthy, 'omp'), { status: 'accept' })
+
+    const descriptionOnly = path.join(sandbox, 'description-only')
+    writeRoles(path.join(descriptionOnly, 'agents'), '.md')
+    writeText(
+      path.join(descriptionOnly, 'skills', 'autoprompt', 'SKILL.md'),
+      'description: "Invoke /skill:autoprompt to run Autoprompt."\n',
+    )
+    const result = compat.inspect(descriptionOnly, 'omp')
+    assert.equal(result.status, 'warn')
+    assert.match(result.headline, /does not show a strong Oh My Pi layout/)
+
+    for (const [name, description] of [
+      ['punctuation', 'description: Invoke /skill:autoprompt.'],
+      ['end-of-line', 'description: Invoke /skill:autoprompt'],
+    ]) {
+      const root = path.join(sandbox, name)
+      writeRoles(path.join(root, 'agents'), '.md')
+      writeText(
+        path.join(root, 'skills', 'autoprompt', 'SKILL.md'),
+        `---\nname: autoprompt\n${description}\nuser-invocable: true\n---\n`,
+      )
+      assert.deepEqual(compat.inspect(root, 'omp'), { status: 'accept' }, name)
+    }
+
+    for (const [name, suffix] of [
+      ['letters', 'plus'],
+      ['hyphen', '-plus'],
+      ['underscore', '_plus'],
+      ['slash', '/plus'],
+      ['colon', ':plus'],
+    ]) {
+      const suffixed = path.join(sandbox, `suffixed-${name}`)
+      writeRoles(path.join(suffixed, 'agents'), '.md')
+      writeText(
+        path.join(suffixed, 'skills', 'autoprompt', 'SKILL.md'),
+        [
+          '---',
+          'name: autoprompt',
+          `description: Invoke /skill:autoprompt${suffix}.`,
+          'user-invocable: true',
+          '---',
+          '',
+        ].join('\n'),
+      )
+      assert.equal(compat.inspect(suffixed, 'omp').status, 'warn', name)
+    }
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+  }
+})
+
 test('interactive prompts reject invalid choices and closed input without mutating', () => {
   const retried = invoke([], {
     answers: ['0', 'codex', '5', 'maybe', 'Y'],
@@ -742,7 +905,7 @@ test('interactive prompts reject invalid choices and closed input without mutati
     responses: [{ status: 0 }],
   })
   assert.equal(retried.status, 0)
-  assert.match(retried.stdout, /Enter a number from 1 to 7\./)
+  assert.match(retried.stdout, /Enter a number from 1 to 10\./)
   assert.match(retried.stdout, /Please answer Y or N\./)
   assert.equal(retried.calls[0].args.at(-1), 'vscode')
 
@@ -804,6 +967,18 @@ test('provider install locations match default config roots and external VS Code
       prime: {
         roots: [{ label: 'Install directory', path: env.PRIME_AGENT_CODING_AGENT_DIR }],
       },
+      omp: {
+        roots: [{ label: 'Install directory', path: path.join(home, '.omp', 'agent') }],
+      },
+      deepseek: {
+        roots: [{ label: 'Install directory', path: path.join(home, '.dsh') }],
+      },
+      reasonix: {
+        roots: [{
+          label: 'Install directory',
+          path: path.join(home, 'AppData', 'Roaming', 'reasonix'),
+        }],
+      },
     },
   )
   assert.throws(
@@ -837,6 +1012,74 @@ test('provider install locations match default config roots and external VS Code
   assert.equal(
     providerInstallLocations('prime', { env: { HOME: home }, platform: 'linux' }).roots[0].path,
     path.join(home, '.prime', 'agent'),
+  )
+  for (const [provider, variable] of [
+    ['omp', 'PI_CODING_AGENT_DIR'],
+    ['deepseek', 'DSH_HOME'],
+    ['reasonix', 'REASONIX_HOME'],
+  ]) {
+    const override = path.join('custom', provider)
+    assert.equal(
+      providerInstallLocations(provider, {
+        env: { HOME: home, [variable]: override },
+        platform: 'linux',
+      }).roots[0].path,
+      override,
+      provider,
+    )
+  }
+  const ompOverride = path.join('custom', 'omp')
+  assert.deepEqual(
+    providerInstallLocations('omp', {
+      env: {
+        HOME: home,
+        PI_CODING_AGENT_DIR: ompOverride,
+        PI_CONFIG_DIR: '.omp-audit',
+      },
+      platform: 'linux',
+    }),
+    {
+      roots: [
+        { label: 'Install directory', path: ompOverride },
+        {
+          label: 'Native task-agent root',
+          path: path.join(home, '.omp-audit', 'agent'),
+        },
+      ],
+    },
+  )
+  assert.deepEqual(
+    providerInstallLocations('omp', {
+      env: {
+        HOME: home,
+        OMP_PROFILE: 'work',
+        PI_CODING_AGENT_DIR: ompOverride,
+        PI_CONFIG_DIR: '.omp-audit',
+        PI_PROFILE: 'legacy',
+      },
+      platform: 'linux',
+    }),
+    {
+      roots: [{
+        label: 'Install directory',
+        path: path.join(home, '.omp-audit', 'profiles', 'work', 'agent'),
+      }],
+    },
+  )
+  for (const invalidProfile of ['..', '../escape', 'UPPER', 'con', 'name.']) {
+    assert.throws(
+      () => providerInstallLocations('omp', {
+        env: { HOME: home, OMP_PROFILE: invalidProfile },
+        platform: 'linux',
+      }),
+      /Invalid OMP profile/,
+      invalidProfile,
+    )
+  }
+  assert.equal(
+    providerInstallLocations('reasonix', { env: { HOME: home }, platform: 'linux' })
+      .roots[0].path,
+    path.join(home, '.reasonix'),
   )
 })
 
@@ -1072,8 +1315,11 @@ test('interactive custom root warns on mismatched strong markers, re-prompts on 
   }
 })
 
-test('help stays lean and names only the six public providers', () => {
-  assert.match(HELP_TEXT, /Interactive providers: claude, codex, opencode, kilo, vscode, prime\./)
+test('help stays lean and names only the nine public providers', () => {
+  assert.match(
+    HELP_TEXT,
+    /Interactive providers: claude, codex, opencode, kilo, vscode, prime, omp, deepseek, reasonix\./,
+  )
   assert.doesNotMatch(HELP_TEXT, /\b(?:vibe|cursor|dcode|roo|gemini|cline|goose)\b/i)
   assert.match(HELP_TEXT, /^  autoprompt update$/m)
 })
@@ -1119,7 +1365,7 @@ test('update uses the installed npm CLI without a shell and pins its GitHub fall
   ]])
 
   const posixFallback = invoke(['update'], {
-    checkLatestVersion: () => '1.0.4',
+    checkLatestVersion: () => NEXT_PACKAGE_VERSION,
     checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     platform: 'linux',
     responses: [{ status: 73 }, { status: 0 }],
@@ -1136,7 +1382,7 @@ test('update uses the installed npm CLI without a shell and pins its GitHub fall
   )
 
   const missingNpmFallback = invoke(['update'], {
-    checkLatestVersion: () => '1.0.4',
+    checkLatestVersion: () => NEXT_PACKAGE_VERSION,
     checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     platform: 'linux',
     responses: [
@@ -1152,7 +1398,7 @@ test('update uses the installed npm CLI without a shell and pins its GitHub fall
   assert.match(missingNpmFallback.stdout, /trying the verified GitHub revision/)
 
   const thrownNpmFallback = invoke(['update'], {
-    checkLatestVersion: () => '1.0.4',
+    checkLatestVersion: () => NEXT_PACKAGE_VERSION,
     checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     platform: 'linux',
     responses: [
@@ -1167,7 +1413,7 @@ test('update uses the installed npm CLI without a shell and pins its GitHub fall
   ])
 
   const bothLaunchesThrow = invoke(['update'], {
-    checkLatestVersion: () => '1.0.4',
+    checkLatestVersion: () => NEXT_PACKAGE_VERSION,
     checkLatestGitHubRevision: () => 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     platform: 'linux',
     responses: [
@@ -1233,7 +1479,7 @@ test('help, version, repo, and support are non-mutating local commands', () => {
 
   const version = invoke(['--version'])
   assert.equal(version.status, 0)
-  assert.equal(version.stdout, '1.0.3\n')
+  assert.equal(version.stdout, `${PACKAGE_VERSION}\n`)
   assert.deepEqual(version.calls, [])
 
   const repo = invoke(['repo'])
@@ -1603,8 +1849,16 @@ test('interactive install reports detected state and confirms update or repair b
       platform: 'win32',
       responses: [{ status: 0 }],
     })
-    assert.match(update.stdout, /Claude Code \(installed 0\.9\.0, update available: 1\.0\.3\)/)
-    assert.match(update.stdout, /Update Autoprompt 0\.9\.0 to 1\.0\.3\? \[Y\/N\]: /)
+    assert.match(
+      update.stdout,
+      new RegExp(
+        `Claude Code \\(installed 0\\.9\\.0, update available: ${escapeRegExp(PACKAGE_VERSION)}\\)`,
+      ),
+    )
+    assert.match(
+      update.stdout,
+      new RegExp(`Update Autoprompt 0\\.9\\.0 to ${escapeRegExp(PACKAGE_VERSION)}\\? \\[Y/N\\]: `),
+    )
     assert.equal(update.calls.length, 1)
 
     writeText(path.join(root, 'skills', 'autoprompt', 'VERSION'), `${PACKAGE_VERSION}\n`)
@@ -1614,8 +1868,16 @@ test('interactive install reports detected state and confirms update or repair b
       interactive: true,
       platform: 'win32',
     })
-    assert.match(repair.stdout, /Claude Code \(installed 1\.0\.3, current\)/)
-    assert.match(repair.stdout, /Autoprompt 1\.0\.3 is current\. Reinstall or repair it\? \[Y\/N\]: /)
+    assert.match(
+      repair.stdout,
+      new RegExp(`Claude Code \\(installed ${escapeRegExp(PACKAGE_VERSION)}, current\\)`),
+    )
+    assert.match(
+      repair.stdout,
+      new RegExp(
+        `Autoprompt ${escapeRegExp(PACKAGE_VERSION)} is current\\. Reinstall or repair it\\? \\[Y/N\\]: `,
+      ),
+    )
     assert.equal(repair.calls.length, 0)
 
     const codex = path.join(sandbox, '.codex')
@@ -1629,8 +1891,18 @@ test('interactive install reports detected state and confirms update or repair b
       platform: 'win32',
       responses: [{ status: 0 }],
     })
-    assert.match(legacy.stdout, /Codex \(legacy install detected, update available: 1\.0\.3\)/)
-    assert.match(legacy.stdout, /Legacy Autoprompt install detected\. Update it to 1\.0\.3\? \[Y\/N\]: /)
+    assert.match(
+      legacy.stdout,
+      new RegExp(
+        `Codex \\(legacy install detected, update available: ${escapeRegExp(PACKAGE_VERSION)}\\)`,
+      ),
+    )
+    assert.match(
+      legacy.stdout,
+      new RegExp(
+        `Legacy Autoprompt install detected\\. Update it to ${escapeRegExp(PACKAGE_VERSION)}\\? \\[Y/N\\]: `,
+      ),
+    )
     assert.equal(legacy.calls.length, 1)
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true })
@@ -1651,7 +1923,10 @@ test('interactive uninstall selects a detected installation and custom roots sta
       responses: [{ status: 0 }],
     })
     assert.match(removed.stdout, /Autoprompt uninstaller/)
-    assert.match(removed.stdout, /Claude Code \(installed 1\.0\.3, current\)/)
+    assert.match(
+      removed.stdout,
+      new RegExp(`Claude Code \\(installed ${escapeRegExp(PACKAGE_VERSION)}, current\\)`),
+    )
     assert.match(removed.stdout, /Uninstall Autoprompt from Claude Code\? \[Y\/N\]: /)
     assert.equal(removed.calls.length, 1)
     assert.equal(removed.calls[0].args.at(-1), 'claude')

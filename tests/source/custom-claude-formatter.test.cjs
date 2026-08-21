@@ -37,6 +37,12 @@ function assertExplicitUserOnly (completed) {
   assert.doesNotMatch(completed.stdout, /^disable-model-invocation: false$/m)
 }
 
+function assertManualInvocation (completed) {
+  assert.equal(completed.status, 0, `${completed.stdout}\n${completed.stderr}`)
+  assert.match(completed.stdout, /^invocation: manual$/m)
+  assert.doesNotMatch(completed.stdout, /^invocation: automatic$/m)
+}
+
 test('Bash md-claude formatter emits an explicit-user-only skill', () => {
   const command = [
     `source ${shellLiteral(BASH_LIBRARY)}`,
@@ -53,6 +59,26 @@ test('PowerShell md-claude formatter emits an explicit-user-only skill', {
     `[Console]::Out.Write((Format-MdYaml -Token 'md-claude' -Name 'autoprompt' -Description 'Explicit orchestration' -Body 'Run the goal.'))`
   ].join('; ')
   assertExplicitUserOnly(run(POWERSHELL, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command
+  ]))
+})
+
+test('Bash md-reasonix formatter emits a manual-only skill', () => {
+  const command = [
+    `source ${shellLiteral(BASH_LIBRARY)}`,
+    `_format_md_yaml md-reasonix autoprompt 'Explicit orchestration' 'Run the goal.'`
+  ].join('; ')
+  assertManualInvocation(run(BASH, ['-lc', command]))
+})
+
+test('PowerShell md-reasonix formatter emits a manual-only skill', {
+  skip: process.platform !== 'win32' && !process.env.CI
+}, () => {
+  const command = [
+    `. ${psLiteral(POWERSHELL_LIBRARY)}`,
+    `[Console]::Out.Write((Format-MdYaml -Token 'md-reasonix' -Name 'autoprompt' -Description 'Explicit orchestration' -Body 'Run the goal.'))`
+  ].join('; ')
+  assertManualInvocation(run(POWERSHELL, [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command
   ]))
 })

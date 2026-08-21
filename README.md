@@ -6,8 +6,8 @@
 
 <p align="center">
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20points-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1: plus 14.61 points"/></a>
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=version&color=255C60&labelColor=14101F" alt="Version 1.0.3"/></a>
-  <a href="#install"><img src="https://img.shields.io/badge/support-6%20supported%20providers-255C60?style=flat-square&labelColor=14101F" alt="Six supported providers"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=version&color=255C60&labelColor=14101F" alt="Version 1.0.4"/></a>
+  <a href="#install"><img src="https://img.shields.io/badge/support-9%20supported%20providers-255C60?style=flat-square&labelColor=14101F" alt="Nine supported providers"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-255C60?style=flat-square&labelColor=14101F" alt="License MIT"/></a>
 </p>
 
@@ -25,7 +25,7 @@
 
 ## Install
 
-Use the CLI below, or download an installer from [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.3).
+Use the CLI below, or download an installer from [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.4).
 
 ### 1. Install the CLI
 
@@ -74,6 +74,9 @@ autoprompt
 | Working | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; audited 7.4.22 | `kilo` |
 | Working | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; audited 1.133.0 with Copilot 0.61.0 | `vscode` |
 | Working | [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 0.7.2; audited 0.7.2; native package adapter | `prime` |
+| Working | [Oh My Pi](https://omp.sh/) | 17.4.0+; adapter contract, install lifecycle, and native role payload verified for 17.4.0 | `omp` |
+| Working | [DeepSeek Harness](https://deepseek.com/harness/en/) | 0.1.0-rc.7+; adapter contract, install lifecycle, and native role payload verified for 0.1.0-rc.7 | `deepseek` |
+| Working | [Reasonix](https://reasonix.io/docs/) | 1.30.0+; adapter contract, install lifecycle, and native role payload verified for 1.30.0 | `reasonix` |
 
 See [support and audit notes](docs/faq/which-coding-agents-are-supported.md).
 
@@ -128,10 +131,10 @@ Timing and token logs were not retained, so these are planning estimates based o
 
 Use `mode=` to set concurrency. Use `agents=` to route models where the host supports it. [Custom model setup](docs/faq/how-to-add-custom-models.md)
 
-| Control | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Custom `agents=` routing | ✓ | ✓ | ✕ Not available - inherits active model | ✕ Not available - inherits active model | ✕ Not available - inherits active model | ✕ Not available - inherits selected parent model |
+| Control | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Custom `agents=` routing | ✓ | ✓ | ✕ Not available - inherits active model | ✕ Not available - inherits active model | ✕ Not available - inherits active model | ✕ Not available - inherits selected parent model | ✕ Not available - inherits selected parent model | ✕ Not available - inherits selected parent model | ✕ Not available - inherits selected parent model |
 
 ## How it works
 
@@ -154,7 +157,7 @@ Use `mode=` to set concurrency. Use `agents=` to route models where the host sup
 | Research | `/autoprompt compare job queues against this codebase and recommend one` |
 | Limit parallel work | `/autoprompt mode=custom max_subs=4 migrate every model` |
 
-Use `$autoprompt` instead of `/autoprompt` in Codex.
+Use `$autoprompt` instead of `/autoprompt` in Codex. In Oh My Pi, use `/skill:autoprompt`.
 
 ## FAQ
 

@@ -1,6 +1,6 @@
 # Which coding agents are supported?
 
-The current public support set contains six working providers:
+The current public support set contains nine working providers:
 
 | Coding agent | Audited requirement | Package |
 |---|---|---|
@@ -10,7 +10,12 @@ The current public support set contains six working providers:
 | [Kilo](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; audited 7.4.22 | [Source](../../agents/kilo/) |
 | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; audited 1.133.0 with Copilot 0.61.0 | [Source](../../agents/vscode/) |
 | [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 0.7.2; audited 0.7.2 | [Native package adapter](../../agents/prime/) |
+| [Oh My Pi](https://omp.sh/) | 17.4.0+; adapter contract, install lifecycle, and native role payload verified for 17.4.0 | [Source](../../agents/omp/) |
+| [DeepSeek Harness](https://deepseek.com/harness/en/) | 0.1.0-rc.7+; adapter contract, install lifecycle, and native role payload verified for 0.1.0-rc.7 | [Source](../../agents/deepseek/) |
+| [Reasonix](https://reasonix.io/docs/) | 1.30.0+; adapter contract, install lifecycle, and native role payload verified for 1.30.0 | [Source](../../agents/reasonix/) |
 
-The installer shows only this audited set. A provider is added here after its package, install path, recursive behavior, and cleanup flow have been verified together. Use the [custom coding agent compatibility guide](../guides/custom-agent-compatibility.md) to assess another CLI or IDE and define the adapter proof it still needs.
+The installer shows only this vetted set. OMP, DeepSeek Harness, and Reasonix are listed because their adapter contracts, install targets, root resolution, recursive wiring, reversible lifecycle, and native `ap-fresh-verifier` payloads are covered by local tests. Use the [custom coding agent compatibility guide](../guides/custom-agent-compatibility.md) to assess another CLI or IDE and define the adapter proof it still needs.
 
 Prime uses a sealed adapter for Autoprompt dispatch. Raw host `rlm` remains available outside Autoprompt, so this is not a global sandbox boundary. The CLI uses `PRIME_AGENT_CODING_AGENT_DIR` when set, otherwise `~/.prime/agent`.
+
+Oh My Pi loads the skill and settings from `PI_CODING_AGENT_DIR` when that override is set, while default-profile task agents remain under `${HOME}/${PI_CONFIG_DIR:-.omp}/agent/agents`; a named `OMP_PROFILE` (or legacy `PI_PROFILE`) instead keeps the skill and all 25 roles together under that profile's `agent` directory. Invoke the skill with `/skill:autoprompt`. DeepSeek Harness installs an `Autoprompt` user preset under `DSH_HOME/.agent-presets/autoprompt`; headless sessions use the installed `headless.patch.yml`. Reasonix installs 25 manual subagent profiles under `REASONIX_HOME/skills`. On Windows, Reasonix defaults to `%APPDATA%/reasonix`; elsewhere it defaults to `~/.reasonix`.
