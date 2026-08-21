@@ -274,8 +274,14 @@ function writeFakeClaude(context) {
 }
 
 function receiptPathKey(value) {
-  const normalized = value.replaceAll('\\', '/')
+  let candidate = value.replaceAll('\\', '/')
     .replace(/^\/([A-Za-z])\//, '$1:/')
+  if (process.platform === 'win32') {
+    try {
+      candidate = fs.realpathSync.native(candidate)
+    } catch {}
+  }
+  const normalized = candidate.replaceAll('\\', '/')
     .replace(/\/$/, '')
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized
 }

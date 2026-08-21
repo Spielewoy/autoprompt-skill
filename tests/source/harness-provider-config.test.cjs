@@ -15,6 +15,17 @@ const BASH = process.platform === 'win32'
   : 'bash'
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
 
+function toBashPath (value) {
+  return value.replaceAll('\\', '/').replace(
+    /^([A-Za-z]):/,
+    (_, drive) => `/${drive.toLowerCase()}`
+  )
+}
+
+function shellLiteral (value) {
+  return `'${value.replaceAll("'", `'"'"'`)}'`
+}
+
 function runHelper (args) {
   return childProcess.spawnSync(process.execPath, [HELPER, ...args], {
     cwd: ROOT,
@@ -357,6 +368,50 @@ test('new harness uninstall ownership is provider-scoped in both shell ports', {
       ], { cwd: ROOT, encoding: 'utf8', timeout: 30000 })
       assert.equal(powershell.status, 0, `${provider}: ${powershell.stdout}\n${powershell.stderr}`)
     }
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true })
+  }
+})
+
+test('Git Bash path identity collapses Windows short aliases and keeps root bounds', {
+  skip: process.platform !== 'win32'
+}, (t) => {
+  const sandbox = fs.mkdtempSync(path.join(
+    os.tmpdir(),
+    'autoprompt-windows-long-path-alias-regression-'
+  ))
+  const root = path.join(sandbox, 'managed-root')
+  const owned = path.join(root, 'agents', 'ap-manager.md')
+  const missing = path.join(root, 'agents', 'missing', 'leaf.md')
+  const foreign = path.join(sandbox, 'outside.md')
+  try {
+    fs.mkdirSync(path.dirname(owned), { recursive: true })
+    fs.writeFileSync(owned, 'owned\n')
+    fs.writeFileSync(foreign, 'foreign\n')
+    const short = childProcess.spawnSync('cmd.exe', [
+      '/d', '/c', `for %I in ("${sandbox}") do @echo %~sI`
+    ], { encoding: 'utf8', timeout: 30000 })
+    assert.equal(short.status, 0, short.stderr)
+    const shortSandbox = short.stdout.trim()
+    if (!shortSandbox || shortSandbox.toLowerCase() === sandbox.toLowerCase()) {
+      t.skip('Windows short aliases are unavailable on this volume')
+      return
+    }
+    const shortRoot = path.join(shortSandbox, 'managed-root')
+    const library = path.join(ROOT, 'scripts', 'install', 'lib', 'install-lib.sh')
+    const command = [
+      `. ${shellLiteral(toBashPath(library))}`,
+      `_uninstall_receipt_path_under_root ${shellLiteral(toBashPath(shortRoot))} ` +
+        `${shellLiteral(toBashPath(owned))}`,
+      `_uninstall_receipt_path_under_root ${shellLiteral(toBashPath(shortRoot))} ` +
+        `${shellLiteral(toBashPath(missing))}`,
+      `! _uninstall_receipt_path_under_root ${shellLiteral(toBashPath(shortRoot))} ` +
+        `${shellLiteral(toBashPath(foreign))}`
+    ].join('; ')
+    const result = childProcess.spawnSync(BASH, [
+      '--noprofile', '--norc', '-c', command
+    ], { cwd: ROOT, encoding: 'utf8', timeout: 30000 })
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true })
   }
