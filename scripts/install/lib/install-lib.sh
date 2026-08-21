@@ -3929,6 +3929,23 @@ _uninstall_remove_empty_dirs() {
 [ -n "${AUTOPROMPT_COMPARABLE_PATH_CACHE+set}" ] ||
   declare -A AUTOPROMPT_COMPARABLE_PATH_CACHE=()
 
+_idem_windows_long_path() {
+  local input_path="${1//\\//}" output_name="$2"
+  local filesystem_path directory parent component suffix="" long_directory
+  filesystem_path="$(cygpath -au -- "$input_path" 2>/dev/null)" || return 1
+  directory="$filesystem_path"
+  while [ ! -e "$directory" ] && [ ! -L "$directory" ]; do
+    component="${directory##*/}"
+    parent="${directory%/*}"
+    [ "$parent" != "$directory" ] || return 1
+    [ -n "$parent" ] || parent="/"
+    suffix="/$component$suffix"
+    directory="$parent"
+  done
+  long_directory="$(cygpath -alm -- "$directory" 2>/dev/null)" || return 1
+  printf -v "$output_name" '%s' "${long_directory%/}$suffix"
+}
+
 _idem_comparable_path() {
   local input_path="$1" output_name="${2:-}" result_value windows_path=0
   input_path="${input_path//\\//}"
@@ -3936,18 +3953,16 @@ _idem_comparable_path() {
     msys*:*|cygwin*:*|mingw*:*|*:MSYS*|*:MINGW*) windows_path=1 ;;
   esac
   if [ "$windows_path" -eq 1 ]; then
-    case "$input_path" in
-      [A-Za-z]:/*) result_value="$input_path" ;;
-      /[A-Za-z]/*) result_value="${input_path:1:1}:${input_path:2}" ;;
-      /[A-Za-z]) result_value="${input_path:1:1}:" ;;
-      *)
-        if command -v cygpath >/dev/null 2>&1; then
-          result_value="$(cygpath -am -- "$input_path" 2>/dev/null)" || return 1
-        else
-          result_value="$input_path"
-        fi
-        ;;
-    esac
+    if command -v cygpath >/dev/null 2>&1; then
+      _idem_windows_long_path "$input_path" result_value || return 1
+    else
+      case "$input_path" in
+        [A-Za-z]:/*) result_value="$input_path" ;;
+        /[A-Za-z]/*) result_value="${input_path:1:1}:${input_path:2}" ;;
+        /[A-Za-z]) result_value="${input_path:1:1}:" ;;
+        *) result_value="$input_path" ;;
+      esac
+    fi
     result_value="${result_value,,}"
   else
     result_value="$input_path"

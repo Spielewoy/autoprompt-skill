@@ -662,7 +662,7 @@ install_opencode_activation() {
 canonical_legacy_path() {
   local value="$1"
   if command -v cygpath >/dev/null 2>&1; then
-    cygpath -am -- "$value" 2>/dev/null | tr '[:upper:]' '[:lower:]'
+    cygpath -alm -- "$value" 2>/dev/null | tr '[:upper:]' '[:lower:]'
     return ${PIPESTATUS[0]}
   fi
   value="${value//\\//}"
