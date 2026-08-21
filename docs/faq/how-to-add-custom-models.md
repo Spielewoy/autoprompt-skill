@@ -1,6 +1,6 @@
 # How do I add custom models?
 
-Custom `agents=` routing is available in Claude Code and Codex. OpenCode, Kilo, and VS Code inherit the active model. Prime Agent inherits the selected parent model.
+Custom `agents=` routing is available in Claude Code and Codex. OpenCode, Kilo, and VS Code inherit the active model. Prime Agent, Oh My Pi, DeepSeek Harness, and Reasonix inherit the selected parent model.
 
 Create a registry whose names match the values used in `agents=`:
 

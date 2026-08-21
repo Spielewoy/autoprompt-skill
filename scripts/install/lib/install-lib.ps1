@@ -10,7 +10,7 @@
 #   client=<name> present=<true|false> version=<VERSION>
 #
 #   VERSION in {
-#     SEMVER    a token matching exactly  ^[0-9]+\.[0-9]+\.[0-9]+$
+#     SEMVER    a SemVer token, including optional prerelease/build suffixes
 #     "unknown" present binary, version unparseable (probe failed/hung/no token)
 #     "-"       absent client (no version by definition)
 #   }
@@ -31,16 +31,18 @@ $AutopromptClientBin = @{
     claude = 'claude'; codex = 'codex'; cursor = 'cursor-agent'; roo = 'roo';
     opencode = 'opencode'; kilo = 'kilo'; vscode = 'code';
     prime = 'prime-agent';
+    omp = 'omp'; deepseek = 'dsh'; reasonix = 'reasonix';
     dcode = 'dcode'; gemini = 'gemini'; cline = 'cline'; goose = 'goose'
 }
 $AutopromptVersionFlag = '--version'
 $AutopromptProbeTimeout = 30
 
-# Public install compatibility is a closed six-provider registry. Historical
+# Public install compatibility is a closed nine-provider registry. Historical
 # path resolvers remain below only for receipt-owned cleanup of earlier installs.
 $AutopromptProviderStatus = @{
     claude = 'supported'; codex = 'supported'; opencode = 'supported';
     kilo = 'supported'; vscode = 'supported'; prime = 'supported'
+    omp = 'supported'; deepseek = 'supported'; reasonix = 'supported'
 }
 $AutopromptProviderBlockReason = @{}
 
@@ -363,7 +365,10 @@ function Detect-Client {
     }
 
     $line1 = ($raw -split "`n")[0]
-    $match = [regex]::Match($line1, '[0-9]+\.[0-9]+\.[0-9]+')
+    $match = [regex]::Match(
+        $line1,
+        '[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?'
+    )
     if ($rc -ne 0 -or -not $match.Success) { $version = 'unknown' } else { $version = $match.Value }
 
     # WHY [Console]::Out.WriteLine: record stays off the return pipeline; only the
@@ -380,8 +385,8 @@ function Detect-Client {
 #
 #   client=<name> dest=<ABSOLUTE-PATH> format=<FORMAT-TOKEN>
 #
-#   FORMAT-TOKEN in { md-yaml, md-codex, mdc, roomodes, gemini-toml,
-#                     md-rules, goose-recipe, md-agents }
+#   FORMAT-TOKEN in { md-yaml, md-claude, md-codex, md-reasonix, mdc,
+#                     roomodes, gemini-toml, md-rules, goose-recipe, md-agents }
 #
 # Channel discipline (mirrors Detect-Client): RECORD via [Console]::Out.WriteLine;
 # error record via [Console]::Error.WriteLine; VERDICT via scalar `return` int
@@ -400,6 +405,9 @@ $AutopromptClientDest = @{
     opencode = 'XDG|opencode/skills/autoprompt/SKILL.md|md-yaml'
     kilo     = 'HOME|.kilo/skills/autoprompt/SKILL.md|md-yaml'
     vscode   = 'HOME|.copilot/skills/autoprompt/SKILL.md|md-yaml'
+    omp      = 'OMP|skills/autoprompt/SKILL.md|md-claude'
+    deepseek = 'DSH|skills/autoprompt/SKILL.md|md-claude'
+    reasonix = 'REASONIX|skills/autoprompt/SKILL.md|md-reasonix'
 }
 
 # Per-client OPTIONAL variants (cursor secondary, goose fallback). A variant
@@ -433,6 +441,45 @@ function Resolve-Xdg {
     return (Join-Path $UserHome '.config')
 }
 
+function Test-AutopromptWindowsHost {
+    return [Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+        [Runtime.InteropServices.OSPlatform]::Windows
+    )
+}
+
+function Get-AutopromptOmpProfile {
+    $raw = if (Test-Path Env:OMP_PROFILE) { $env:OMP_PROFILE } else { $env:PI_PROFILE }
+    $profile = ([string]$raw).Trim()
+    if ([string]::IsNullOrEmpty($profile) -or
+        $profile -ceq 'default') {
+        return ''
+    }
+    if ($profile.EndsWith('.') -or
+        $profile -cnotmatch '^[a-z0-9][a-z0-9._-]{0,63}$' -or
+        $profile -match '^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\..*)?$') {
+        throw "Invalid OMP profile `"$raw`"."
+    }
+    return $profile
+}
+
+function Get-AutopromptOmpDefaultAgentRoot {
+    $userHome = Get-ConfiguredHome
+    $configDirectory = if ($env:PI_CONFIG_DIR) { $env:PI_CONFIG_DIR } else { '.omp' }
+    return (Join-Path (Join-Path $userHome $configDirectory) 'agent')
+}
+
+function Get-AutopromptOmpInstallRoot {
+    $profile = Get-AutopromptOmpProfile
+    if (-not [string]::IsNullOrEmpty($profile)) {
+        $userHome = Get-ConfiguredHome
+        $configDirectory = if ($env:PI_CONFIG_DIR) { $env:PI_CONFIG_DIR } else { '.omp' }
+        return (Join-Path (Join-Path (Join-Path $userHome $configDirectory) `
+            'profiles') (Join-Path $profile 'agent'))
+    }
+    if ($env:PI_CODING_AGENT_DIR) { return $env:PI_CODING_AGENT_DIR }
+    return (Get-AutopromptOmpDefaultAgentRoot)
+}
+
 function Get-AutopromptConfigRoot {
     param([string]$Name)
     if (Test-AutopromptInstallRootOverridePresent) {
@@ -455,6 +502,23 @@ function Get-AutopromptConfigRoot {
                 return $env:PRIME_AGENT_CODING_AGENT_DIR
             }
             return (Join-Path $userHome '.prime/agent')
+        }
+        'omp' {
+            return (Get-AutopromptOmpInstallRoot)
+        }
+        'deepseek' {
+            if ($env:DSH_HOME) { return $env:DSH_HOME }
+            return (Join-Path $userHome '.dsh')
+        }
+        'reasonix' {
+            if ($env:REASONIX_HOME) { return $env:REASONIX_HOME }
+            if (Test-AutopromptWindowsHost) {
+                $appData = if ($env:APPDATA) { $env:APPDATA } else {
+                    Join-Path $userHome 'AppData/Roaming'
+                }
+                return (Join-Path $appData 'reasonix')
+            }
+            return (Join-Path $userHome '.reasonix')
         }
         default { return $userHome }
     }
@@ -479,6 +543,10 @@ function Get-AutopromptSkillRoot {
         }
         'kilo' { return (Join-Path $userHome '.kilo/skills/autoprompt') }
         'vscode' { return (Join-Path $userHome '.copilot/skills/autoprompt') }
+        { $_ -in @('omp', 'deepseek', 'reasonix') } {
+            return (Join-Path (Get-AutopromptConfigRoot -Name $Name) `
+                'skills/autoprompt')
+        }
         default { return '' }
     }
 }
@@ -513,6 +581,18 @@ function Get-AutopromptNativeAgentsRoot {
                 'kilo/agents')
         }
         'vscode' { return (Join-Path $userHome '.copilot/agents') }
+        'omp' {
+            $profile = Get-AutopromptOmpProfile
+            if (-not [string]::IsNullOrEmpty($profile)) {
+                return (Join-Path (Get-AutopromptConfigRoot -Name 'omp') 'agents')
+            }
+            if ($env:PI_CODING_AGENT_DIR) {
+                # OMP 17.4.0 still discovers native task agents through
+                # PI_CONFIG_DIR when PI_CODING_AGENT_DIR relocates other state.
+                return (Join-Path (Get-AutopromptOmpDefaultAgentRoot) 'agents')
+            }
+            return (Join-Path (Get-AutopromptConfigRoot -Name 'omp') 'agents')
+        }
         default { return '' }
     }
 }
@@ -599,6 +679,12 @@ function Resolve-Destination {
         Resolve-Xdg -UserHome $userHome
     } elseif ($relKind -eq 'CODEX') {
         if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $userHome '.codex' }
+    } elseif ($relKind -eq 'OMP') {
+        Get-AutopromptConfigRoot -Name 'omp'
+    } elseif ($relKind -eq 'DSH') {
+        if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $userHome '.dsh' }
+    } elseif ($relKind -eq 'REASONIX') {
+        Get-AutopromptConfigRoot -Name 'reasonix'
     } else {
         $userHome
     }
@@ -659,6 +745,17 @@ function Format-MdYaml {
             $descLine,
             'disable-model-invocation: true',
             'user-invocable: true',
+            '---',
+            '',
+            $Body
+        ))
+    }
+    if ($Token -eq 'md-reasonix') {
+        return (Format-JoinLines @(
+            '---',
+            "name: $Name",
+            $descLine,
+            'invocation: manual',
             '---',
             '',
             $Body
@@ -759,7 +856,7 @@ function Format-Skill {
     param([string]$Format, [string]$Name, [string]$Description, [string]$Body)
 
     switch ($Format) {
-        { $_ -in @('md-yaml', 'md-claude', 'md-codex', 'mdc', 'md-rules', 'md-agents', 'gemini-toml', 'roomodes', 'goose-recipe') } { break }
+        { $_ -in @('md-yaml', 'md-claude', 'md-codex', 'md-reasonix', 'mdc', 'md-rules', 'md-agents', 'gemini-toml', 'roomodes', 'goose-recipe') } { break }
         default {
             [Console]::Error.WriteLine("format=$Format error=unknown-format")
             return 2
@@ -777,7 +874,7 @@ function Format-Skill {
     }
 
     switch ($Format) {
-        { $_ -in @('md-yaml', 'md-claude', 'md-codex', 'md-rules', 'md-agents') } {
+        { $_ -in @('md-yaml', 'md-claude', 'md-codex', 'md-reasonix', 'md-rules', 'md-agents') } {
             [Console]::Out.Write((Format-MdYaml -Token $Format -Name $Name -Description $Description -Body $Body))
         }
         'mdc' { [Console]::Out.Write((Format-Mdc -Description $Description -Body $Body)) }
@@ -806,32 +903,78 @@ function Format-Skill {
 # value on the return pipeline. Codes: 0 ok, 10 binary-missing, 11 dir-unwritable,
 # 12 version-below-floor, 13 version-unknown-on-floored, plus delegated 2/3.
 #
-# Version-floor map: Claude >=2.1.219, Cursor >=2.5, and Cline >=3.58.
-# The other clients have no numeric gate.
+# Version floors are compatibility claims, so prerelease suffixes are significant.
 $AutopromptVersionFloor = @{
     claude = '2.1.219'; cursor = '2.5'; cline = '3.58'; opencode = '1.18.7';
     kilo = '7.4.22';
     vscode = '1.133.0'; prime = '0.7.2'
+    omp = '17.4.0'; deepseek = '0.1.0-rc.7'; reasonix = '1.30.0'
 }
 $AutopromptPrecheckMarkerPrefix = '.autoprompt-precheck'
 
-# Test-PrecheckVersionGe: $true iff $Found >= $Floor by NUMERIC per-segment
-# compare (never lexical: 2.10 >= 2.9). Missing segments zero-pad so a two-segment
-# floor (2.5 => 2.5.0) compares cleanly. 'unknown' is never >= a floor.
+# Compare arbitrarily long numeric identifiers without integer overflow.
+function Compare-PrecheckNumericIdentifier {
+    param([string]$Left, [string]$Right)
+    if ($Left -cnotmatch '^[0-9]+$' -or $Right -cnotmatch '^[0-9]+$') {
+        throw 'invalid numeric version identifier'
+    }
+    $normalizedLeft = $Left.TrimStart([char]'0')
+    $normalizedRight = $Right.TrimStart([char]'0')
+    if ($normalizedLeft.Length -eq 0) { $normalizedLeft = '0' }
+    if ($normalizedRight.Length -eq 0) { $normalizedRight = '0' }
+    if ($normalizedLeft.Length -lt $normalizedRight.Length) { return -1 }
+    if ($normalizedLeft.Length -gt $normalizedRight.Length) { return 1 }
+    return [Math]::Sign([string]::CompareOrdinal($normalizedLeft, $normalizedRight))
+}
+
+# Test-PrecheckVersionGe: SemVer precedence with numeric core segments and
+# standard prerelease identifier ordering. Missing core segments zero-pad so
+# historical two-segment floors still compare cleanly. Build metadata is ignored.
 function Test-PrecheckVersionGe {
     param([string]$Found, [string]$Floor)
     if ($Found -eq 'unknown') { return $false }
 
-    $fseg = $Found.Split('.')
-    $lseg = $Floor.Split('.')
+    $pattern = '^(?<core>[0-9]+(?:\.[0-9]+)*)(?:-(?<pre>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$'
+    $foundMatch = [regex]::Match($Found, $pattern)
+    $floorMatch = [regex]::Match($Floor, $pattern)
+    if (-not $foundMatch.Success -or -not $floorMatch.Success) { return $false }
+    $fseg = $foundMatch.Groups['core'].Value.Split('.')
+    $lseg = $floorMatch.Groups['core'].Value.Split('.')
     $count = [math]::Max($fseg.Count, $lseg.Count)
     for ($i = 0; $i -lt $count; $i++) {
-        $f = if ($i -lt $fseg.Count) { [int]$fseg[$i] } else { 0 }
-        $l = if ($i -lt $lseg.Count) { [int]$lseg[$i] } else { 0 }
-        if ($f -gt $l) { return $true }
-        if ($f -lt $l) { return $false }
+        $f = if ($i -lt $fseg.Count) { $fseg[$i] } else { '0' }
+        $l = if ($i -lt $lseg.Count) { $lseg[$i] } else { '0' }
+        $comparison = Compare-PrecheckNumericIdentifier -Left $f -Right $l
+        if ($comparison -gt 0) { return $true }
+        if ($comparison -lt 0) { return $false }
     }
-    return $true
+    $foundPre = $foundMatch.Groups['pre'].Value
+    $floorPre = $floorMatch.Groups['pre'].Value
+    if ($foundPre.Length -eq 0 -and $floorPre.Length -eq 0) { return $true }
+    if ($foundPre.Length -eq 0) { return $true }
+    if ($floorPre.Length -eq 0) { return $false }
+    $fpre = $foundPre.Split('.')
+    $lpre = $floorPre.Split('.')
+    $count = [math]::Min($fpre.Count, $lpre.Count)
+    for ($i = 0; $i -lt $count; $i++) {
+        $foundNumeric = $fpre[$i] -cmatch '^[0-9]+$'
+        $floorNumeric = $lpre[$i] -cmatch '^[0-9]+$'
+        if ($foundNumeric -and $floorNumeric) {
+            $comparison = Compare-PrecheckNumericIdentifier `
+                -Left $fpre[$i] -Right $lpre[$i]
+            if ($comparison -gt 0) { return $true }
+            if ($comparison -lt 0) { return $false }
+        } elseif ($foundNumeric) {
+            return $false
+        } elseif ($floorNumeric) {
+            return $true
+        } else {
+            $comparison = [string]::CompareOrdinal($fpre[$i], $lpre[$i])
+            if ($comparison -gt 0) { return $true }
+            if ($comparison -lt 0) { return $false }
+        }
+    }
+    return $fpre.Count -ge $lpre.Count
 }
 
 # Test-PrecheckDirWritable: $true iff $Dir is writable OR creatable. Walks up to
@@ -962,7 +1105,9 @@ function Test-Precheck {
 # retains the backup as actionable recovery material, and returns 24.
 #
 # Byte-parity (F-OP-DUALPARITY): the document is built with a FIXED key order
-# (nonce, backup, files, createdDirectories, configEdits), a FIXED 2-space indent, explicit "`n"
+# (nonce, backup, files, createdDirectories, ompManaged, ompDetachedRoot,
+# configEdits), a
+# FIXED 2-space indent, explicit "`n"
 # joins, exactly one trailing "`n", and WriteAllText with UTF8Encoding($false)
 # (NO BOM) - byte-identical to the .sh printf '%s\n' output. ConvertTo-Json is
 # NOT used for the WRITE (its spacing/escaping/line-endings are not byte-stable
@@ -1082,12 +1227,19 @@ function New-ReceiptDocument {
         [string]$Backup,
         [string[]]$Files,
         [string[]]$CreatedDirectories,
+        [bool]$OmpManaged,
+        [string]$OmpDetachedRoot,
         [hashtable[]]$Edits
     )
     $backupJson = if ([string]::IsNullOrEmpty($Backup)) {
         'null'
     } else {
         '"' + (Format-ReceiptJsonEscape -Value $Backup) + '"'
+    }
+    $detachedJson = if ([string]::IsNullOrEmpty($OmpDetachedRoot)) {
+        'null'
+    } else {
+        '"' + (Format-ReceiptJsonEscape -Value $OmpDetachedRoot) + '"'
     }
     return '{' + "`n" +
         '  "nonce": "' + (Format-ReceiptJsonEscape -Value $Nonce) + '",' + "`n" +
@@ -1096,6 +1248,8 @@ function New-ReceiptDocument {
         '  "createdDirectories": ' + (
             Format-ReceiptFilesArray -Files $CreatedDirectories
         ) + ',' + "`n" +
+        '  "ompManaged": ' + $OmpManaged.ToString().ToLowerInvariant() + ',' + "`n" +
+        '  "ompDetachedRoot": ' + $detachedJson + ',' + "`n" +
         '  "configEdits": ' + (Format-ReceiptEditsArray -Edits $Edits) + "`n" +
         '}' + "`n"
 }
@@ -1135,6 +1289,8 @@ function Write-Receipt {
         [string]$Backup = '',
         [string[]]$Files = @(),
         [string[]]$CreatedDirectories = @(),
+        [bool]$OmpManaged = $false,
+        [string]$OmpDetachedRoot = '',
         [hashtable[]]$Edits = @()
     )
     if ([string]::IsNullOrEmpty($ConfigRoot)) {
@@ -1150,7 +1306,8 @@ function Write-Receipt {
         }
     }
     $document = New-ReceiptDocument -Nonce $Nonce -Backup $Backup `
-        -Files $Files -CreatedDirectories $CreatedDirectories -Edits $Edits
+        -Files $Files -CreatedDirectories $CreatedDirectories `
+        -OmpManaged $OmpManaged -OmpDetachedRoot $OmpDetachedRoot -Edits $Edits
     $final = Join-Path $ConfigRoot $AutopromptReceiptName
     $writeCode = Write-ReceiptDocument -Path $final -Document $document
     if ($writeCode -ne 0) { return $writeCode }
@@ -1201,6 +1358,12 @@ if ($null -eq $script:AutopromptReceiptFiles) {
 }
 if ($null -eq $script:AutopromptReceiptCreatedDirectories) {
     $script:AutopromptReceiptCreatedDirectories = @()
+}
+if ($null -eq $script:AutopromptReceiptOmpManaged) {
+    $script:AutopromptReceiptOmpManaged = $false
+}
+if ($null -eq $script:AutopromptReceiptOmpDetachedRoot) {
+    $script:AutopromptReceiptOmpDetachedRoot = ''
 }
 
 # Capture Format-Skill's rendered bytes EXACTLY (NO .Trim()): the render carries a
@@ -1903,6 +2066,8 @@ function New-IdemManagedSnapshot {
             $script:AutopromptReceiptCreatedDirectories
         )
         ReceiptEdits = @($script:AutopromptReceiptEdits)
+        ReceiptOmpManaged = $script:AutopromptReceiptOmpManaged
+        ReceiptOmpDetachedRoot = $script:AutopromptReceiptOmpDetachedRoot
         ConfigEditLastBackup = $script:AutopromptConfigEditLastBackup
     }
     $recoveryPath = Join-Path ([System.IO.Path]::GetTempPath()) `
@@ -2075,6 +2240,14 @@ function Restore-IdemManagedSnapshot {
     }
     if ($Snapshot.ContainsKey('ReceiptEdits')) {
         $script:AutopromptReceiptEdits = @($Snapshot.ReceiptEdits)
+    }
+    if ($Snapshot.ContainsKey('ReceiptOmpManaged')) {
+        $script:AutopromptReceiptOmpManaged =
+            [bool]$Snapshot.ReceiptOmpManaged
+    }
+    if ($Snapshot.ContainsKey('ReceiptOmpDetachedRoot')) {
+        $script:AutopromptReceiptOmpDetachedRoot =
+            [string]$Snapshot.ReceiptOmpDetachedRoot
     }
     if ($Snapshot.ContainsKey('ConfigEditLastBackup')) {
         $script:AutopromptConfigEditLastBackup = $Snapshot.ConfigEditLastBackup
@@ -2327,7 +2500,7 @@ function Get-IdemManagedPendingMappings {
             return @{ Code = 39; Pending = @() }
         }
         if ([string]::IsNullOrEmpty($identity) -or
-            -not (Test-UninstallReceiptPathAllowed -Path $identity `
+            -not (Test-AutopromptManagedInstallPathAllowed -Path $identity `
                 -Root $ConfigRoot) -or
             -not $targets.Add($identity)) {
             return @{ Code = 44; Pending = @() }
@@ -2415,7 +2588,7 @@ function Install-IdemManagedFiles {
     foreach ($directory in @($snapshot.Directories.Keys)) {
         if (-not $snapshot.Directories[$directory] -and
             (Test-Path -LiteralPath $directory -PathType Container) -and
-            (Test-UninstallReceiptPathAllowed -Path $directory `
+            (Test-AutopromptManagedInstallPathAllowed -Path $directory `
                 -Root $ConfigRoot)) {
             Add-IdemReceiptCreatedDirectory -Path $directory
         }
@@ -3592,6 +3765,10 @@ function Format-UninstallReceiptDocument {
         [string[]]$Files,
         [string[]]$CreatedDirectories,
         [bool]$HasCreatedDirectories,
+        [bool]$OmpManaged,
+        [bool]$HasOmpManaged,
+        [string]$OmpDetachedRoot,
+        [bool]$HasOmpDetachedRoot,
         [hashtable[]]$Edits
     )
     $backupJson = if ($IsBackupNull) {
@@ -3607,6 +3784,18 @@ function Format-UninstallReceiptDocument {
         $document += '  "createdDirectories": ' + (
             Format-ReceiptFilesArray -Files $CreatedDirectories
         ) + ',' + "`n"
+    }
+    if ($HasOmpManaged) {
+        $document += '  "ompManaged": ' +
+            $OmpManaged.ToString().ToLowerInvariant() + ',' + "`n"
+    }
+    if ($HasOmpDetachedRoot) {
+        $detachedJson = if ([string]::IsNullOrEmpty($OmpDetachedRoot)) {
+            'null'
+        } else {
+            '"' + (Format-ReceiptJsonEscape -Value $OmpDetachedRoot) + '"'
+        }
+        $document += '  "ompDetachedRoot": ' + $detachedJson + ',' + "`n"
     }
     return $document + '  "configEdits": ' +
         (Format-ReceiptEditsArray -Edits $Edits) + "`n" + '}' + "`n"
@@ -3655,10 +3844,35 @@ function Read-UninstallReceiptMembers {
         $directories = [string[]]@($parsedDirectories.Values)
         $index = $parsedDirectories.Index
     }
+    $hasOmpManaged = $Lines[$index] -ceq '  "ompManaged": true,' -or
+        $Lines[$index] -ceq '  "ompManaged": false,'
+    $ompManaged = $false
+    if ($hasOmpManaged) {
+        $ompManaged = $Lines[$index] -ceq '  "ompManaged": true,'
+        $index++
+    }
+    $hasOmpDetachedRoot = $Lines[$index] -ceq `
+        '  "ompDetachedRoot": null,' -or $Lines[$index].StartsWith(
+            '  "ompDetachedRoot": "',
+            [StringComparison]::Ordinal
+        )
+    $ompDetachedRoot = ''
+    if ($hasOmpDetachedRoot) {
+        if ($Lines[$index] -cne '  "ompDetachedRoot": null,' -and
+            -not (ConvertFrom-ReceiptStringMember -Line $Lines[$index] `
+                -Prefix '  "ompDetachedRoot": "' -Suffix '",' `
+                -Value ([ref]$ompDetachedRoot))) {
+            throw 'invalid receipt OMP detached root'
+        }
+        $index++
+    }
     $parsedEdits = Read-ReceiptEditsArray -Lines $Lines -Index $index
     return @{ Nonce = $nonce; Backup = $backup
         IsBackupNull = $isBackupNull; Files = [string[]]@($parsedFiles.Values)
         CreatedDirectories = $directories; HasCreatedDirectories = $hasDirectories
+        OmpManaged = $ompManaged; HasOmpManaged = $hasOmpManaged
+        OmpDetachedRoot = $ompDetachedRoot
+        HasOmpDetachedRoot = $hasOmpDetachedRoot
         Edits = [hashtable[]]@($parsedEdits.Edits); Index = $parsedEdits.Index }
 }
 
@@ -3683,7 +3897,11 @@ function Read-UninstallReceipt {
         $canonical = Format-UninstallReceiptDocument -Nonce $state.Nonce `
             -Backup $state.Backup -IsBackupNull $state.IsBackupNull `
             -Files $state.Files -CreatedDirectories $state.CreatedDirectories `
-            -HasCreatedDirectories $state.HasCreatedDirectories -Edits $state.Edits
+            -HasCreatedDirectories $state.HasCreatedDirectories `
+            -OmpManaged $state.OmpManaged `
+            -HasOmpManaged $state.HasOmpManaged `
+            -OmpDetachedRoot $state.OmpDetachedRoot `
+            -HasOmpDetachedRoot $state.HasOmpDetachedRoot -Edits $state.Edits
         if ($canonical -cne $parsedDocument.Document) {
             throw 'noncanonical receipt'
         }
@@ -3693,16 +3911,64 @@ function Read-UninstallReceipt {
         )
         return 72
     }
+    $state.Files = [string[]]@($state.Files | ForEach-Object {
+        ConvertTo-AutopromptNativePath -Path $_
+    })
+    $state.CreatedDirectories = [string[]]@(
+        $state.CreatedDirectories | ForEach-Object {
+            ConvertTo-AutopromptNativePath -Path $_
+        }
+    )
+    if (-not [string]::IsNullOrEmpty($state.Backup) -and
+        $state.Backup -cne 'none') {
+        $state.Backup = ConvertTo-AutopromptNativePath -Path $state.Backup
+    }
+    $state.OmpDetachedRoot = ConvertTo-AutopromptNativePath `
+        -Path $state.OmpDetachedRoot
+    foreach ($edit in @($state.Edits)) {
+        $edit.File = ConvertTo-AutopromptNativePath -Path $edit.File
+    }
+    if (-not $state.HasOmpDetachedRoot) {
+        $state.OmpDetachedRoot = Get-AutopromptLegacyOmpDetachedRoot `
+            -ConfigRoot $ConfigRoot -Files $state.Files
+    }
+    if (-not $state.HasOmpManaged) {
+        $state.OmpManaged = -not [string]::IsNullOrEmpty(
+            $state.OmpDetachedRoot
+        ) -or (Test-AutopromptLegacySelfContainedOmpAuthority `
+            -ConfigRoot $ConfigRoot -Files $state.Files -Edits $state.Edits)
+    }
+    if (-not $state.OmpManaged -and
+        -not [string]::IsNullOrEmpty($state.OmpDetachedRoot)) {
+        [Console]::Error.WriteLine(
+            "error=corrupt-receipt path=$receipt detail=omp-provider-state"
+        )
+        return 72
+    }
+    $needsOmpManagedMigration = -not $state.HasOmpManaged -and
+        $state.OmpManaged
+    $needsOmpDetachedRootMigration = -not $state.HasOmpDetachedRoot -and
+        -not [string]::IsNullOrEmpty($state.OmpDetachedRoot)
     if (-not (Test-UninstallReceiptPaths -ConfigRoot $ConfigRoot `
         -Backup $state.Backup -Files $state.Files `
-        -CreatedDirectories $state.CreatedDirectories -Edits $state.Edits)) {
+        -CreatedDirectories $state.CreatedDirectories `
+        -OmpDetachedRoot $state.OmpDetachedRoot -Edits $state.Edits)) {
         [Console]::Error.WriteLine(
             "error=corrupt-receipt path=$receipt detail=path-outside-root"
         )
         return 72
     }
+    $script:AutopromptReceiptOmpManaged = $state.OmpManaged
+    $script:AutopromptReceiptOmpDetachedRoot = $state.OmpDetachedRoot
     return @{ Nonce = $state.Nonce; Backup = $state.Backup; Files = $state.Files
-        CreatedDirectories = $state.CreatedDirectories; Edits = $state.Edits }
+        CreatedDirectories = $state.CreatedDirectories
+        OmpManaged = $state.OmpManaged
+        HasOmpManaged = $state.HasOmpManaged
+        NeedsOmpManagedMigration = $needsOmpManagedMigration
+        OmpDetachedRoot = $state.OmpDetachedRoot
+        HasOmpDetachedRoot = $state.HasOmpDetachedRoot
+        NeedsOmpDetachedRootMigration = $needsOmpDetachedRootMigration
+        Edits = $state.Edits }
 }
 
 # Get-UninstallKeyValue <file> <dotted-key>: hand-parse <file> for the raw value
@@ -3932,6 +4198,30 @@ function Restore-UninstallConfigFile {
         [Console]::Out.WriteLine(($output -join [Environment]::NewLine))
         return 0
     }
+    if ($Edits.Count -eq 1 -and $Edits[0].Key -in @(
+        'task.maxRecursionDepth', 'agent.max_subagent_depth'
+    )) {
+        $provider = if ($Edits[0].Key -ceq 'task.maxRecursionDepth') {
+            'omp'
+        } else {
+            'reasonix'
+        }
+        $prior = if ($null -eq $Edits[0].PriorValue) {
+            'absent-key'
+        } else {
+            [string]$Edits[0].PriorValue
+        }
+        $helper = Join-Path $AutopromptInstallRepoRoot `
+            'scripts/harness-provider-config.cjs'
+        $output = @(& node $helper restore --provider $provider --file $File `
+            --backup $backup --prior $prior --expected 4 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            [Console]::Error.WriteLine(($output -join [Environment]::NewLine))
+            return 75
+        }
+        [Console]::Out.WriteLine(($output -join [Environment]::NewLine))
+        return 0
+    }
     if (-not (Test-Path -LiteralPath $File -PathType Leaf)) {
         if (-not (Remove-UninstallConfigBackup -File $File -Backup $backup)) {
             return 75
@@ -4062,31 +4352,92 @@ function Test-AutopromptCustomProviderPath {
     $agents = Join-Path $ConfigRoot 'agents'
     $parent = Split-Path -Parent $normalizedPath
     $leaf = Split-Path -Leaf $normalizedPath
-    if (Test-IdemPathEqual -Left $normalizedPath -Right $agents) { return $true }
     switch ($Name) {
         'claude' {
-            return (Test-IdemPathEqual -Left $parent -Right $agents) -and
-                $leaf -clike 'ap-*.md'
+            return (Test-IdemPathEqual -Left $normalizedPath -Right $agents) -or
+                ((Test-IdemPathEqual -Left $parent -Right $agents) -and
+                    $leaf -clike 'ap-*.md')
         }
         'opencode' {
-            return ((Test-IdemPathEqual -Left $parent -Right $agents) -and
+            return (Test-IdemPathEqual -Left $normalizedPath -Right $agents) -or
+                ((Test-IdemPathEqual -Left $parent -Right $agents) -and
                 $leaf -clike 'ap-*.md') -or
                 (Test-IdemPathEqual -Left $normalizedPath -Right `
                     (Join-Path $ConfigRoot 'autoprompt.opencode.json'))
         }
         'kilo' {
-            return ((Test-IdemPathEqual -Left $parent -Right $agents) -and
+            return (Test-IdemPathEqual -Left $normalizedPath -Right $agents) -or
+                ((Test-IdemPathEqual -Left $parent -Right $agents) -and
                 $leaf -clike 'ap-*.md') -or
                 (Test-IdemPathEqual -Left $normalizedPath -Right `
                     (Join-Path $ConfigRoot 'autoprompt.kilo.json'))
         }
         'vscode' {
+            if (Test-IdemPathEqual -Left $normalizedPath -Right $agents) {
+                return $true
+            }
             if ((Test-IdemPathEqual -Left $parent -Right $agents) -and
                 $leaf -clike 'ap-*.agent.md') { return $true }
             $settings = Get-IdemNormalizedPath -Path (Get-VscodeSettingsFile)
             return (Test-IdemPathEqual -Left $normalizedPath -Right $settings) -or
                 (Test-IdemPathEqual -Left $normalizedPath `
                     -Right "$settings$AutopromptConfigEditBackupSuffix")
+        }
+        'omp' {
+            $isOwned = $false
+            $defaultAgentRoot = Get-IdemNormalizedPath `
+                -Path $script:AutopromptReceiptOmpDetachedRoot
+            if ([string]::IsNullOrEmpty($defaultAgentRoot) -and
+                $script:AutopromptReceiptOmpManaged) {
+                $isOwned = (Test-IdemPathEqual `
+                    -Left $normalizedPath -Right $agents) -or
+                    ((Test-IdemPathEqual -Left $parent -Right $agents) -and
+                        $leaf -clike 'ap-*.md')
+            } elseif (-not [string]::IsNullOrEmpty($defaultAgentRoot)) {
+                $configDirectory = Split-Path -Parent $defaultAgentRoot
+                $nativeAgents = Join-Path $defaultAgentRoot 'agents'
+                $isDetachedPath = Test-AutopromptOmpDetachedReceiptPath `
+                    -Path $normalizedPath `
+                    -DefaultAgentRoot $defaultAgentRoot
+                $isOwned = $isOwned -or ($isDetachedPath -and (
+                    (Test-IdemPathEqual -Left $normalizedPath `
+                        -Right $configDirectory) -or
+                    (Test-IdemPathEqual -Left $normalizedPath `
+                        -Right $defaultAgentRoot) -or
+                    (Test-IdemPathEqual -Left $normalizedPath `
+                        -Right $nativeAgents) -or
+                    ((Test-IdemPathEqual -Left $parent -Right $nativeAgents) -and
+                        $leaf -clike 'ap-*.md')))
+            }
+            return $isOwned -or
+                (Test-IdemPathEqual -Left $normalizedPath -Right `
+                    (Join-Path $ConfigRoot 'config.yml')) -or
+                (Test-IdemPathEqual -Left $normalizedPath -Right `
+                    ((Join-Path $ConfigRoot 'config.yml') +
+                        $AutopromptConfigEditBackupSuffix))
+        }
+        'deepseek' {
+            $presets = Join-Path $ConfigRoot '.agent-presets'
+            $preset = Join-Path $presets 'autoprompt'
+            return (Test-IdemPathEqual -Left $normalizedPath -Right $presets) -or
+                (Test-IdemPathEqual -Left $normalizedPath -Right $preset) -or
+                ((Test-IdemPathEqual -Left $parent -Right $preset) -and
+                    $leaf -in @('agent.cordis.yml', 'preset.yml'))
+        }
+        'reasonix' {
+            $config = Join-Path $ConfigRoot 'config.toml'
+            if ((Test-IdemPathEqual -Left $normalizedPath -Right $config) -or
+                (Test-IdemPathEqual -Left $normalizedPath -Right `
+                    "$config$AutopromptConfigEditBackupSuffix")) {
+                return $true
+            }
+            if ((Test-IdemPathEqual -Left $parent -Right $skills) -and
+                $leaf -clike 'ap-*') { return $true }
+            if ($leaf -cne 'SKILL.md') { return $false }
+            $profile = Split-Path -Parent $normalizedPath
+            return (Split-Path -Leaf $profile) -clike 'ap-*' -and
+                (Test-IdemPathEqual -Left (Split-Path -Parent $profile) `
+                    -Right $skills)
         }
         default { return $false }
     }
@@ -4096,7 +4447,8 @@ function Test-UninstallProviderPath {
     param([string]$Name, [string]$ConfigRoot, [string]$Path)
     $scopedNames = @(
         'claude', 'codex', 'opencode', 'kilo', 'vscode', 'vibe',
-        'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose'
+        'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose',
+        'omp', 'deepseek', 'reasonix'
     )
     if ($Name -cnotin $scopedNames) { return $true }
 
@@ -4104,7 +4456,14 @@ function Test-UninstallProviderPath {
     if ([string]::IsNullOrEmpty($normalizedPath)) { return $false }
     if ($Name -ceq 'dcode') { return $false }
     if ((Test-AutopromptInstallRootOverridePresent) -and
-        $Name -in @('claude', 'opencode', 'kilo', 'vscode')) {
+        $Name -in @(
+            'claude', 'opencode', 'kilo', 'vscode',
+            'omp', 'deepseek', 'reasonix'
+        )) {
+        return Test-AutopromptCustomProviderPath -Name $Name `
+            -ConfigRoot $ConfigRoot -Path $normalizedPath
+    }
+    if ($Name -in @('omp', 'deepseek', 'reasonix')) {
         return Test-AutopromptCustomProviderPath -Name $Name `
             -ConfigRoot $ConfigRoot -Path $normalizedPath
     }
@@ -4314,7 +4673,8 @@ function Test-UninstallSharedProviderState {
     param([string]$Name, [string]$ConfigRoot, [hashtable]$Receipt)
     if ($Name -cnotin @(
         'claude', 'codex', 'opencode', 'kilo', 'vscode', 'vibe',
-        'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose'
+        'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose',
+        'omp', 'deepseek', 'reasonix'
     )) { return $false }
     foreach ($file in @($Receipt.Files)) {
         if (-not [string]::IsNullOrEmpty($file) -and
@@ -4361,6 +4721,8 @@ function Set-UninstallProviderReceipt {
         [hashtable]$Receipt,
         [string[]]$Files,
         [string[]]$CreatedDirectories = @(),
+        [bool]$OmpManaged = $false,
+        [string]$OmpDetachedRoot = '',
         [hashtable[]]$Edits
     )
     $nonce = if ([string]::IsNullOrEmpty($Receipt.Nonce)) {
@@ -4386,7 +4748,8 @@ function Set-UninstallProviderReceipt {
         }
     }
     return (Write-Receipt -ConfigRoot $ConfigRoot -Nonce $nonce -Backup $backup `
-        -Files $Files -CreatedDirectories $CreatedDirectories -Edits $Edits)
+        -Files $Files -CreatedDirectories $CreatedDirectories `
+        -OmpManaged $OmpManaged -OmpDetachedRoot $OmpDetachedRoot -Edits $Edits)
 }
 
 function Get-UninstallProviderPlan {
@@ -4399,7 +4762,9 @@ function Get-UninstallProviderPlan {
             ProviderEdits = [hashtable[]]@($Receipt.Edits)
             ProviderDirectories = [string[]]@($Receipt.CreatedDirectories)
             RetainedDirectories = [string[]]@(); RetainedEdits = [hashtable[]]@()
-            RetainedFiles = [string[]]@() }
+            RetainedFiles = [string[]]@()
+            RetainedOmpManaged = $false
+            RetainedOmpDetachedRoot = '' }
     }
     $providerEdits = Get-UninstallProviderEdits -Name $Name `
         -ConfigRoot $ConfigRoot -Edits ([hashtable[]]$Receipt.Edits)
@@ -4432,11 +4797,22 @@ function Get-UninstallProviderPlan {
         ProviderDirectories = [string[]]@($providerDirectories)
         RetainedDirectories = [string[]]@($retainedDirectories)
         RetainedEdits = [hashtable[]]@($retainedEdits)
-        RetainedFiles = $retainedFiles }
+        RetainedFiles = $retainedFiles
+        RetainedOmpManaged = if ($Name -ceq 'omp') {
+            $false
+        } else {
+            [bool]$Receipt.OmpManaged
+        }
+        RetainedOmpDetachedRoot = if ($Name -ceq 'omp') {
+            ''
+        } else {
+            [string]$Receipt.OmpDetachedRoot
+        } }
 }
 
 function New-UninstallSnapshot {
     param([string]$ConfigRoot, [hashtable]$Receipt)
+    $script:AutopromptReceiptOmpManaged = [bool]$Receipt.OmpManaged
     $script:AutopromptReceiptCreatedDirectories = @($Receipt.CreatedDirectories)
     $script:AutopromptReceiptEdits = @($Receipt.Edits)
     $script:AutopromptConfigEditLastBackup = $Receipt.Backup
@@ -4499,6 +4875,8 @@ function Set-UninstallFinalReceipt {
         $code = Set-UninstallProviderReceipt -ConfigRoot $ConfigRoot `
             -Receipt $Receipt -Files $Plan.RetainedFiles `
             -CreatedDirectories $Plan.RetainedDirectories `
+            -OmpManaged $Plan.RetainedOmpManaged `
+            -OmpDetachedRoot $Plan.RetainedOmpDetachedRoot `
             -Edits ([hashtable[]]$Plan.RetainedEdits)
         return $code -eq 0
     }
@@ -4560,11 +4938,28 @@ function Uninstall-Client {
     return 0
 }
 
+function ConvertTo-AutopromptNativePath {
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($Path) -or
+        -not (Test-AutopromptWindowsHost)) {
+        return $Path
+    }
+    $match = [regex]::Match($Path, '^/([A-Za-z])(?:/(.*))?$')
+    if (-not $match.Success) { return $Path }
+    $native = $match.Groups[1].Value.ToUpperInvariant() + ':\'
+    $tail = $match.Groups[2].Value
+    if (-not [string]::IsNullOrEmpty($tail)) {
+        $native += $tail.Replace('/', '\')
+    }
+    return $native
+}
+
 function Get-IdemNormalizedPath {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
     try {
-        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $nativePath = ConvertTo-AutopromptNativePath -Path $Path
+        $fullPath = [System.IO.Path]::GetFullPath($nativePath)
         $pathRoot = [System.IO.Path]::GetPathRoot($fullPath)
         if ($fullPath.Length -eq $pathRoot.Length) { return $pathRoot }
         return $fullPath.TrimEnd([char]92, [char]47)
@@ -4652,30 +5047,260 @@ function Test-UninstallReceiptPaths {
         [string]$Backup,
         [string[]]$Files,
         [string[]]$CreatedDirectories,
+        [string]$OmpDetachedRoot,
         [hashtable[]]$Edits
     )
     $paths = @($Files) + @($CreatedDirectories) + @($Edits | ForEach-Object {
         $_.File
     })
+    if (-not [string]::IsNullOrEmpty($OmpDetachedRoot) -and
+        -not (Test-AutopromptOmpDetachedManifestAuthority `
+            -ConfigRoot $ConfigRoot -OmpDetachedRoot $OmpDetachedRoot `
+            -Files $Files)) {
+        return $false
+    }
+    if (-not [string]::IsNullOrEmpty($OmpDetachedRoot)) {
+        foreach ($directory in @($CreatedDirectories)) {
+            if ((Test-IdemReceiptPathUnderRoot `
+                    -Path $directory -Root $ConfigRoot) -or
+                -not (Test-AutopromptOmpDetachedReceiptPath `
+                    -Path $directory -DefaultAgentRoot $OmpDetachedRoot)) {
+                continue
+            }
+            if (-not (Test-AutopromptOmpDetachedDirectory `
+                -Path $directory -DefaultAgentRoot $OmpDetachedRoot)) {
+                return $false
+            }
+        }
+        foreach ($edit in @($Edits)) {
+            if (-not (Test-IdemReceiptPathUnderRoot `
+                    -Path $edit.File -Root $ConfigRoot) -and
+                (Test-AutopromptOmpDetachedReceiptPath `
+                    -Path $edit.File -DefaultAgentRoot $OmpDetachedRoot)) {
+                return $false
+            }
+        }
+        if (-not [string]::IsNullOrEmpty($Backup) -and $Backup -cne 'none' -and
+            -not (Test-IdemReceiptPathUnderRoot `
+                -Path $Backup -Root $ConfigRoot) -and
+            (Test-AutopromptOmpDetachedReceiptPath `
+                -Path $Backup -DefaultAgentRoot $OmpDetachedRoot)) {
+            return $false
+        }
+    }
     foreach ($path in $paths) {
         if (-not (Test-UninstallReceiptPathAllowed -Path $path `
-            -Root $ConfigRoot)) {
+            -Root $ConfigRoot -OmpDetachedRoot $OmpDetachedRoot)) {
             return $false
         }
     }
     return [string]::IsNullOrEmpty($Backup) -or $Backup -ceq 'none' -or
-        (Test-UninstallReceiptPathAllowed -Path $Backup -Root $ConfigRoot)
+        (Test-UninstallReceiptPathAllowed -Path $Backup -Root $ConfigRoot `
+            -OmpDetachedRoot $OmpDetachedRoot)
+}
+
+function Test-AutopromptOmpDetachedNativePath {
+    param([string]$Path, [string]$DefaultAgentRoot)
+    $defaultAgentRoot = Get-IdemNormalizedPath -Path $DefaultAgentRoot
+    $normalizedPath = Get-IdemNormalizedPath -Path $Path
+    if ([string]::IsNullOrEmpty($defaultAgentRoot) -or
+        [string]::IsNullOrEmpty($normalizedPath)) {
+        return $false
+    }
+    $nativeAgents = Join-Path $defaultAgentRoot 'agents'
+    if (-not (Test-IdemPathEqual -Left $normalizedPath -Right $nativeAgents) -and
+        -not (Test-IdemPathUnderRoot `
+            -Path $normalizedPath -Root $nativeAgents)) {
+        return $false
+    }
+    $physicalPath = Get-IdemPhysicalPath -Path $normalizedPath
+    $physicalRoot = Get-IdemPhysicalPath -Path $defaultAgentRoot
+    return -not [string]::IsNullOrEmpty($physicalPath) -and
+        -not [string]::IsNullOrEmpty($physicalRoot) -and
+        (Test-IdemPathUnderRoot -Path $physicalPath -Root $physicalRoot)
+}
+
+function Test-AutopromptOmpDetachedReceiptPath {
+    param([string]$Path, [string]$DefaultAgentRoot)
+    $defaultAgentRoot = Get-IdemNormalizedPath -Path $DefaultAgentRoot
+    $normalizedPath = Get-IdemNormalizedPath -Path $Path
+    if ([string]::IsNullOrEmpty($defaultAgentRoot) -or
+        [string]::IsNullOrEmpty($normalizedPath) -or
+        (Split-Path -Leaf $defaultAgentRoot) -cne 'agent') {
+        return $false
+    }
+    $homeDir = Get-ConfiguredHome
+    if ([string]::IsNullOrEmpty($homeDir) -or
+        (Test-IdemPathEqual -Left (Split-Path -Parent $defaultAgentRoot) `
+            -Right $homeDir) -or
+        -not (Test-IdemReceiptPathUnderRoot `
+            -Path $defaultAgentRoot -Root $homeDir)) {
+        return $false
+    }
+    $configDirectory = Split-Path -Parent $defaultAgentRoot
+    return (Test-IdemPathEqual -Left $normalizedPath -Right $configDirectory) -or
+        (Test-IdemPathEqual -Left $normalizedPath -Right $defaultAgentRoot) -or
+        (Test-AutopromptOmpDetachedNativePath `
+            -Path $normalizedPath -DefaultAgentRoot $defaultAgentRoot)
+}
+
+function Test-AutopromptOmpDetachedManifestAuthority {
+    param(
+        [string]$ConfigRoot,
+        [string]$OmpDetachedRoot,
+        [string[]]$Files
+    )
+    $ompDetachedRoot = Get-IdemNormalizedPath -Path $OmpDetachedRoot
+    if ([string]::IsNullOrEmpty($ompDetachedRoot) -or
+        -not (Test-AutopromptOmpDetachedReceiptPath `
+            -Path $ompDetachedRoot -DefaultAgentRoot $ompDetachedRoot)) {
+        return $false
+    }
+    try {
+        $entries = Read-IdemManifestEntries -ConfigRoot $ConfigRoot
+    } catch {
+        return $false
+    }
+    $nativeAgents = Join-Path $ompDetachedRoot 'agents'
+    $nativeEntries = @($entries.Keys | Where-Object {
+        $entryPath = Get-IdemNormalizedPath -Path ([string]$_)
+        -not [string]::IsNullOrEmpty($entryPath) -and
+            (Test-AutopromptOmpDetachedNativePath `
+                -Path $entryPath -DefaultAgentRoot $ompDetachedRoot) -and
+            (Test-IdemPathEqual -Left (Split-Path -Parent $entryPath) `
+                -Right $nativeAgents) -and
+            (Split-Path -Leaf $entryPath) -clike 'ap-*.md'
+    })
+    if ($nativeEntries.Count -ne 25) { return $false }
+    foreach ($entry in $nativeEntries) {
+        $receiptMatches = @($Files | Where-Object {
+            Test-IdemPathEqual -Left $_ -Right ([string]$entry)
+        })
+        if ($receiptMatches.Count -ne 1) { return $false }
+    }
+    foreach ($file in @($Files)) {
+        if (Test-IdemReceiptPathUnderRoot -Path $file -Root $ConfigRoot) {
+            continue
+        }
+        if (-not (Test-AutopromptOmpDetachedReceiptPath -Path $file `
+            -DefaultAgentRoot $ompDetachedRoot)) {
+            continue
+        }
+        $matches = @(Get-IdemManifestMatchingKeys -Entries $entries -Key $file)
+        if ($matches.Count -ne 1 -or
+            [string]::IsNullOrEmpty([string]$entries[$matches[0]])) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-AutopromptLegacySelfContainedOmpAuthority {
+    param([string]$ConfigRoot, [string[]]$Files, [hashtable[]]$Edits)
+    $config = Join-Path $ConfigRoot 'config.yml'
+    foreach ($edit in @($Edits)) {
+        if ($edit.Key -ceq 'task.maxRecursionDepth' -and
+            (Test-IdemPathEqual -Left $edit.File -Right $config)) {
+            return $true
+        }
+    }
+    $agents = Join-Path $ConfigRoot 'agents'
+    foreach ($file in @($Files)) {
+        if (-not (Test-IdemPathEqual -Left (Split-Path -Parent $file) `
+                -Right $agents) -or
+            (Split-Path -Leaf $file) -cnotlike 'ap-*.md') {
+            continue
+        }
+        $source = Join-Path (Join-Path $AutopromptInstallRepoRoot `
+            'agents/omp/agents') (Split-Path -Leaf $file)
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
+        try {
+            $recordedHash = Get-IdemManifestHash `
+                -ConfigRoot $ConfigRoot -Key $file
+        } catch {
+            continue
+        }
+        $sourceHash = Get-IdemSha256 -Path $source
+        if ($sourceHash -is [string] -and $recordedHash -ceq $sourceHash) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-AutopromptLegacyOmpDetachedRoot {
+    param([string]$ConfigRoot, [string[]]$Files)
+    try {
+        $entries = Read-IdemManifestEntries -ConfigRoot $ConfigRoot
+    } catch {
+        return ''
+    }
+    $candidate = ''
+    $count = 0
+    foreach ($entry in $entries.Keys) {
+        $path = Get-IdemNormalizedPath -Path ([string]$entry)
+        if ([string]::IsNullOrEmpty($path) -or
+            (Split-Path -Leaf $path) -cnotlike 'ap-*.md') {
+            continue
+        }
+        $nativeAgents = Split-Path -Parent $path
+        $defaultAgentRoot = Split-Path -Parent $nativeAgents
+        if ((Split-Path -Leaf $nativeAgents) -cne 'agents' -or
+            (Split-Path -Leaf $defaultAgentRoot) -cne 'agent' -or
+            -not (Test-AutopromptOmpDetachedReceiptPath `
+                -Path $defaultAgentRoot -DefaultAgentRoot $defaultAgentRoot)) {
+            continue
+        }
+        if (-not [string]::IsNullOrEmpty($candidate) -and
+            -not (Test-IdemPathEqual -Left $candidate -Right $defaultAgentRoot)) {
+            return ''
+        }
+        $candidate = $defaultAgentRoot
+        $count++
+    }
+    if ([string]::IsNullOrEmpty($candidate) -or $count -ne 25 -or
+        -not (Test-AutopromptOmpDetachedManifestAuthority `
+            -ConfigRoot $ConfigRoot -OmpDetachedRoot $candidate -Files $Files)) {
+        return ''
+    }
+    return $candidate
+}
+
+function Test-AutopromptOmpDetachedDirectory {
+    param([string]$Path, [string]$DefaultAgentRoot)
+    $defaultAgentRoot = Get-IdemNormalizedPath -Path $DefaultAgentRoot
+    $normalizedPath = Get-IdemNormalizedPath -Path $Path
+    if ([string]::IsNullOrEmpty($defaultAgentRoot) -or
+        [string]::IsNullOrEmpty($normalizedPath)) {
+        return $false
+    }
+    $configDirectory = Split-Path -Parent $defaultAgentRoot
+    $nativeAgents = Join-Path $defaultAgentRoot 'agents'
+    $isKnownDirectory = (Test-IdemPathEqual `
+            -Left $normalizedPath -Right $configDirectory) -or
+        (Test-IdemPathEqual -Left $normalizedPath -Right $defaultAgentRoot) -or
+        (Test-IdemPathEqual -Left $normalizedPath -Right $nativeAgents)
+    return $isKnownDirectory -and
+        (Test-AutopromptOmpDetachedReceiptPath `
+            -Path $normalizedPath -DefaultAgentRoot $defaultAgentRoot)
 }
 
 function Test-UninstallReceiptPathAllowed {
-    param([string]$Path, [string]$Root)
+    param([string]$Path, [string]$Root, [string]$OmpDetachedRoot = '')
     if (Test-IdemReceiptPathUnderRoot -Path $Path -Root $Root) { return $true }
+    if (-not [string]::IsNullOrEmpty($OmpDetachedRoot) -and
+        (Test-AutopromptOmpDetachedReceiptPath -Path $Path `
+            -DefaultAgentRoot $OmpDetachedRoot)) {
+        return $true
+    }
     if (Test-AutopromptInstallRootOverridePresent) {
-        if ($script:AutopromptInstallRootClient -cne 'vscode') { return $false }
-        $settings = Get-VscodeSettingsFile
-        return (Test-IdemPathEqual -Left $Path -Right $settings) -or
-            (Test-IdemPathEqual -Left $Path `
-                -Right "$settings$AutopromptConfigEditBackupSuffix")
+        if ($script:AutopromptInstallRootClient -ceq 'vscode') {
+            $settings = Get-VscodeSettingsFile
+            return (Test-IdemPathEqual -Left $Path -Right $settings) -or
+                (Test-IdemPathEqual -Left $Path `
+                    -Right "$settings$AutopromptConfigEditBackupSuffix")
+        }
+        return $false
     }
     $homeDir = Get-ConfiguredHome
     if ([string]::IsNullOrEmpty($homeDir)) { return $false }
@@ -4694,6 +5319,38 @@ function Test-UninstallReceiptPathAllowed {
     return (Test-IdemPathEqual -Left $Path -Right $settings) -or
         (Test-IdemPathEqual -Left $Path `
             -Right "$settings$AutopromptConfigEditBackupSuffix")
+}
+
+function Test-AutopromptManagedInstallPathAllowed {
+    param([string]$Path, [string]$Root)
+    if (Test-UninstallReceiptPathAllowed -Path $Path -Root $Root `
+        -OmpDetachedRoot $script:AutopromptReceiptOmpDetachedRoot) {
+        return $true
+    }
+    if (-not $env:PI_CODING_AGENT_DIR -or
+        (Test-AutopromptInstallRootOverridePresent)) {
+        return $false
+    }
+    $profile = Get-AutopromptOmpProfile
+    if (-not [string]::IsNullOrEmpty($profile) -or
+        -not (Test-IdemPathEqual -Left $Root `
+            -Right (Get-AutopromptConfigRoot -Name 'omp'))) {
+        return $false
+    }
+    $currentRoot = Get-AutopromptOmpDefaultAgentRoot
+    if (-not [string]::IsNullOrEmpty(
+        $script:AutopromptReceiptOmpDetachedRoot
+    ) -and -not (Test-IdemPathEqual `
+        -Left $script:AutopromptReceiptOmpDetachedRoot -Right $currentRoot)) {
+        [Console]::Error.WriteLine(
+            'error=omp-detached-root-drift ' +
+            "recorded=$script:AutopromptReceiptOmpDetachedRoot " +
+            "current=$currentRoot action=uninstall-first"
+        )
+        return $false
+    }
+    return Test-AutopromptOmpDetachedReceiptPath -Path $Path `
+        -DefaultAgentRoot $currentRoot
 }
 
 function Test-RepairProviderPath {
@@ -4755,6 +5412,36 @@ function Add-RepairPersonaCandidates {
     }
 }
 
+function Add-DeepSeekRepairCandidates {
+    param([hashtable]$Candidates, [string]$ConfigRoot, [string]$StageSkill)
+    $sourceRoot = Join-Path $StageSkill 'agent-preset'
+    $targetRoot = Join-Path $ConfigRoot '.agent-presets/autoprompt'
+    foreach ($name in @('agent.cordis.yml', 'preset.yml')) {
+        $source = Join-Path $sourceRoot $name
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "DeepSeek preset stage missing: $name"
+        }
+        $Candidates[(Join-Path $targetRoot $name)] = $source
+    }
+}
+
+function Add-ReasonixRepairCandidates {
+    param([hashtable]$Candidates, [string]$ConfigRoot, [string]$StageSkill)
+    $sourceRoot = Join-Path $StageSkill 'skills'
+    $personas = @(Get-ChildItem -LiteralPath $sourceRoot -Directory |
+        Where-Object { $_.Name -clike 'ap-*' } |
+        ForEach-Object {
+            Get-Item -LiteralPath (Join-Path $_.FullName 'SKILL.md') `
+                -ErrorAction Stop
+        })
+    if ($personas.Count -ne 25) { throw 'Reasonix skill inventory incomplete' }
+    foreach ($persona in $personas) {
+        $target = Join-Path (Join-Path $ConfigRoot 'skills') `
+            (Join-Path $persona.Directory.Name 'SKILL.md')
+        $Candidates[$target] = $persona.FullName
+    }
+}
+
 function Add-CodexRepairCandidates {
     param([hashtable]$Candidates, [string]$ConfigRoot, [string]$LiveSkill,
         [string]$StageSkill, [string]$StageRoot)
@@ -4802,7 +5489,10 @@ function New-RepairManagedPayload {
     param([string]$Name, [string]$ConfigRoot, [string]$Landed,
         [string]$StageRoot)
     $candidates = @{}
-    if ($Name -notin @('claude', 'codex', 'opencode', 'kilo')) {
+    if ($Name -notin @(
+        'claude', 'codex', 'opencode', 'kilo',
+        'omp', 'deepseek', 'reasonix'
+    )) {
         return ConvertTo-OrderedRepairCandidates -Candidates $candidates
     }
     $runtime = New-RepairRuntimeCandidates -Name $Name -Landed $Landed `
@@ -4810,8 +5500,8 @@ function New-RepairManagedPayload {
     $candidates = $runtime.Candidates
     $personas = @(Get-OpencodeAgentFiles `
         -SourceDir (Join-Path $runtime.StageSkill 'agents'))
-    if ($Name -in @('opencode', 'kilo') -and $personas.Count -eq 0) {
-        throw "$Name agent inventory empty"
+    if ($Name -in @('opencode', 'kilo', 'omp') -and $personas.Count -ne 25) {
+        throw "$Name agent inventory incomplete"
     }
     if ($Name -eq 'claude') {
         Add-RepairPersonaCandidates -Candidates $candidates `
@@ -4835,10 +5525,32 @@ function New-RepairManagedPayload {
         if (-not $profileWritten) { throw "$Name profile stage failed" }
         $profile = Get-AutopromptProfileFile -Name $Name
         $candidates[$profile] = $stageProfile
-    } else {
+    } elseif ($Name -eq 'codex') {
         Add-CodexRepairCandidates -Candidates $candidates `
             -ConfigRoot $ConfigRoot -LiveSkill $runtime.LiveSkill `
             -StageSkill $runtime.StageSkill -StageRoot $StageRoot
+    } elseif ($Name -eq 'omp') {
+        $detachedRoot = Get-IdemNormalizedPath `
+            -Path $script:AutopromptReceiptOmpDetachedRoot
+        $nativeAgents = if (-not [string]::IsNullOrEmpty($detachedRoot)) {
+            $candidate = Join-Path $detachedRoot 'agents'
+            if (-not (Test-AutopromptOmpDetachedNativePath `
+                -Path $candidate -DefaultAgentRoot $detachedRoot)) {
+                throw 'OMP detached agents root failed physical containment'
+            }
+            $candidate
+        } else {
+            Get-AutopromptNativeAgentsRoot -Name 'omp'
+        }
+        Add-RepairPersonaCandidates -Candidates $candidates `
+            -Personas $personas `
+            -Target $nativeAgents
+    } elseif ($Name -eq 'deepseek') {
+        Add-DeepSeekRepairCandidates -Candidates $candidates `
+            -ConfigRoot $ConfigRoot -StageSkill $runtime.StageSkill
+    } else {
+        Add-ReasonixRepairCandidates -Candidates $candidates `
+            -ConfigRoot $ConfigRoot -StageSkill $runtime.StageSkill
     }
     return ConvertTo-OrderedRepairCandidates -Candidates $candidates
 }
@@ -4848,6 +5560,8 @@ function Set-RepairReceiptState {
     $script:AutopromptReceiptFiles = @($Receipt.Files)
     $script:AutopromptReceiptCreatedDirectories = @($Receipt.CreatedDirectories)
     $script:AutopromptReceiptEdits = @($Receipt.Edits)
+    $script:AutopromptReceiptOmpManaged = [bool]$Receipt.OmpManaged
+    $script:AutopromptReceiptOmpDetachedRoot = $Receipt.OmpDetachedRoot
     $script:AutopromptConfigEditLastBackup = $Receipt.Backup
 }
 
@@ -5035,6 +5749,23 @@ function Write-RepairSummary {
     )
 }
 
+function Complete-RepairReceiptMigration {
+    param([string]$ConfigRoot, [hashtable]$Receipt)
+    if (-not $Receipt.NeedsOmpManagedMigration -and
+        -not $Receipt.NeedsOmpDetachedRootMigration) { return 0 }
+    $code = Write-Receipt -ConfigRoot $ConfigRoot -Nonce $Receipt.Nonce `
+        -Backup $Receipt.Backup -Files ([string[]]@($Receipt.Files)) `
+        -CreatedDirectories ([string[]]@($Receipt.CreatedDirectories)) `
+        -OmpManaged ([bool]$Receipt.OmpManaged) `
+        -OmpDetachedRoot $Receipt.OmpDetachedRoot `
+        -Edits ([hashtable[]]@($Receipt.Edits))
+    if ($code -eq 0) { return 0 }
+    [Console]::Error.WriteLine(
+        "repair=failed reason=receipt-migration code=$code action=retry-repair"
+    )
+    return 73
+}
+
 function Repair-Install {
     param([string]$ConfigRoot, [string]$Name, [string]$SkillName,
         [string]$Description, [string]$Body, [string]$Variant = '')
@@ -5068,6 +5799,9 @@ function Repair-Install {
             if ($code -ne 0) { return $code }
             $counts.restored++
         }
+        $migrationCode = Complete-RepairReceiptMigration `
+            -ConfigRoot $ConfigRoot -Receipt $receipt
+        if ($migrationCode -ne 0) { return $migrationCode }
         Write-RepairSummary -Name $Name -Counts $counts
         return 0
     } finally {

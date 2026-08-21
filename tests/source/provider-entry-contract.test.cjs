@@ -7,7 +7,9 @@ const path = require('node:path')
 const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
-const PROVIDERS = ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime']
+const PROVIDERS = [
+  'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime', 'omp', 'deepseek', 'reasonix',
+]
 const SKILLS = new Map(PROVIDERS.map(provider => [
   provider,
   provider === 'prime'
@@ -25,7 +27,7 @@ function chooserBlock(source) {
   return match[1]
 }
 
-test('all six public skills are explicit-only and a bare invocation always stops', () => {
+test('all nine public skills are explicit-only and a bare invocation always stops', () => {
   for (const [provider, relativePath] of SKILLS) {
     const source = read(relativePath)
     assert.match(source, /explicit(?:-only| invocation|ly invokes)|Use only when the user explicitly/i, `${provider} explicit trigger`)
@@ -39,6 +41,16 @@ test('Claude top-level skill is user-only and cannot be selected by the model', 
   const source = read(SKILLS.get('claude'))
   assert.match(source, /^user-invocable: true$/m)
   assert.match(source, /^disable-model-invocation: true$/m)
+})
+
+test('OMP and DeepSeek expose the top-level skill only to explicit user invocation', () => {
+  for (const provider of ['omp', 'deepseek']) {
+    const source = read(SKILLS.get(provider))
+    assert.match(source, /^user-invocable: true$/m, provider)
+    assert.match(source, /^disable-model-invocation: true$/m, provider)
+  }
+  assert.match(read(SKILLS.get('omp')), /Invoke \/skill:autoprompt to turn a mission/)
+  assert.match(read(SKILLS.get('reasonix')), /^invocation: manual$/m)
 })
 
 test('every attended provider resolves missing knobs once before repository work', () => {
@@ -56,7 +68,7 @@ test('chooser model options match each provider capability', () => {
     assert.match(block, /Agent selection:[^\n]*`off`\/inherit[^\n]*`auto`[^\n]*explicit model list/i, provider)
   }
 
-  for (const provider of ['opencode', 'kilo', 'vscode']) {
+  for (const provider of ['opencode', 'kilo', 'vscode', 'omp', 'deepseek', 'reasonix']) {
     const block = chooserBlock(read(SKILLS.get(provider)))
     assert.match(block, /Agent selection:[^\n]*`off`\/inherit/i, `${provider} inherit choice`)
     assert.match(block, /inherited-only/i, `${provider} truthful capability`)
@@ -69,7 +81,7 @@ test('chooser model options match each provider capability', () => {
   assert.match(prime, /no per-child model routing selector is available/i)
   assert.doesNotMatch(prime, /`agents=auto`|Auto-tier|Custom (?:model )?(?:set|models)/i)
 
-  for (const provider of ['opencode', 'kilo', 'vscode']) {
+  for (const provider of ['opencode', 'kilo', 'vscode', 'omp', 'deepseek', 'reasonix']) {
     const modes = read(`agents/${provider}/MODES.md`)
     const chooser = /### Chooser and attendance([\s\S]*?)### [^\n]+ agent selection and effort/.exec(modes)
     assert.ok(chooser, `${provider} modes chooser`)
@@ -82,7 +94,7 @@ test('chooser model options match each provider capability', () => {
 test('provider routing statements match the real adapters', () => {
   assert.match(read(SKILLS.get('claude')), /Claude Code routing uses `opus`, `sonnet`, and `haiku`/)
   assert.match(read(SKILLS.get('codex')), /actual custom-agent TOML `model` and `model_reasoning_effort` capabilities/)
-  for (const provider of ['opencode', 'kilo', 'vscode']) {
+  for (const provider of ['opencode', 'kilo', 'vscode', 'omp', 'deepseek', 'reasonix']) {
     const source = read(SKILLS.get(provider))
     assert.match(source, /inherit(?:s|ed)[^\n]*model/i, provider)
     assert.match(source, /inherited-only/i, provider)

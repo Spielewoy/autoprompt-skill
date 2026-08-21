@@ -106,10 +106,10 @@ Autoprompt turns one explicit goal into a closed plan, build, test, review, repa
 ## Highlights
 
 - 45% fewer failures in the published Terminal-Bench 2.1 run: 29 failures fell to 16
-- State-aware CLI scans six coding agents, reports installed versions, and offers install, update, repair, doctor, and uninstall flows
+- State-aware CLI scans nine coding agents, reports installed versions, and offers install, update, repair, doctor, and uninstall flows
 - Older Codex installs are detected and updated in place
 - Explicit invocation keeps the orchestration loop isolated from ordinary coding requests
-- Native provider packages for Claude Code, Codex, OpenCode, Kilo Code, VS Code, and Prime Agent
+- Native provider packages for Claude Code, Codex, OpenCode, Kilo Code, VS Code, Prime Agent, Oh My Pi, DeepSeek Harness, and Reasonix
 - Deterministic English, Chinese, Korean, Spanish, and Arabic documentation visuals
 
 ## Install
@@ -127,6 +127,9 @@ autoprompt
 - Kilo Code
 - VS Code
 - Prime Agent
+- Oh My Pi
+- DeepSeek Harness
+- Reasonix
 
 ## Release assets
 

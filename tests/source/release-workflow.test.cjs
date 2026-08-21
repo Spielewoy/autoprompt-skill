@@ -12,12 +12,12 @@ function read(relative) {
   return fs.readFileSync(path.join(ROOT, relative), 'utf8')
 }
 
-test('1.0.3 release publishes the verified archive through npm trusted publishing', () => {
+test('release publishes the verified archive through npm trusted publishing', () => {
   const packageJson = JSON.parse(read('package.json'))
   const workflow = read('.github/workflows/release.yml')
   const notes = read('scripts/build-release-assets.ps1')
 
-  assert.equal(packageJson.version, '1.0.3')
+  assert.match(packageJson.version, /^\d+\.\d+\.\d+$/)
   assert.match(workflow, /verify-release:[\s\S]+?runs-on: windows-latest/)
   assert.match(workflow, /publish-release:[\s\S]+?needs: verify-release[\s\S]+?runs-on: ubuntu-latest/)
   assert.match(workflow, /Verify Linux package metadata/)
