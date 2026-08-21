@@ -10,7 +10,8 @@ const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
-const GIT_BASH = 'C:\\Program Files\\Git\\bin\\bash.exe'
+const { resolveBash } = require('../helpers/resolve-bash.cjs')
+const GIT_BASH = resolveBash()
 const ACTIVATION_KEY = 'chat.subagents.allowInvocationsFromSubagents'
 const manifest = JSON.parse(fs.readFileSync(
   path.join(ROOT, 'agents', 'manifests', 'vscode-runtime.json'),

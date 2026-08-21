@@ -11,7 +11,8 @@ const test = require('node:test')
 const ROOT = path.resolve(__dirname, '..', '..')
 const CONTRACT = path.join(ROOT, 'agents', 'contracts', 'autoprompt.contract.json')
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
-const GIT_BASH = 'C:\\Program Files\\Git\\bin\\bash.exe'
+const { resolveBash } = require('../helpers/resolve-bash.cjs')
+const GIT_BASH = resolveBash()
 
 function read(relativePath) {
   return fs.readFileSync(path.join(ROOT, relativePath), 'utf8').replace(/\r\n/g, '\n')

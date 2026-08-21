@@ -7,6 +7,7 @@
     "MODES.md",
     "PLAYBOOKS.md",
     "README.md",
+    "SKILL.md",
     "VERSION",
     "agents/ap-arbiter.md",
     "agents/ap-depth-prober.md",
@@ -33,6 +34,7 @@
     "agents/ap-sweeper.md",
     "agents/ap-synthesizer.md",
     "agents/ap-verifier.md",
+    "autoprompt-models.schema.md",
     "frameworks/QUICKSTART.md",
     "frameworks/README.md",
     "frameworks/apply.md",
@@ -50,13 +52,21 @@
     "frameworks/plan-research.md",
     "frameworks/plan-scope.md",
     "frameworks/polish.md",
-    "frameworks/refactor.md"
+    "frameworks/refactor.md",
+    "workflow/agent-definitions-cli.js",
+    "workflow/autoprompt-gate.js",
+    "workflow/autoprompt-ledger-check.js",
+    "workflow/model-casting.js",
+    "workflow/phase-budget.js",
+    "workflow/supervisor.ps1",
+    "workflow/supervisor.sh"
   ],
   "sha256": {
     "GATES.md": "3832ebad454d715bd65d8a2643cbad09508b3248c72cde2ee234930642bc333c",
     "MODES.md": "2e1e76bfd609b3660427d5988bdaa0ef8831a153c3c686b35159d178d34475e7",
     "PLAYBOOKS.md": "448d779d63eed528e1e9b0631d81af38d35944807e63f28ac26c0b2d0ff6b597",
     "README.md": "1383f55681c4b08134690a779723a6f05d2d9d1f970ca2b577ae63387cb053f7",
+    "SKILL.md": "3f5d2536d13c9ced5fe274e6a909fcd41707583d75d6c7a899a516d36d01bcb7",
     "VERSION": "d1b77b88f4b9f675a900e4143ac768a21218623cfe1703ca43162388c3271bd6",
     "agents/ap-arbiter.md": "18ede91afaa6eda00e408507d9801ee52983aee2a62e1e04547ad46e0f5feee5",
     "agents/ap-depth-prober.md": "8e4db06908166ac0c173e0a1f8d0f03c6f91ee5c7d6f2691e85460fe216f2662",
@@ -83,6 +93,7 @@
     "agents/ap-sweeper.md": "f59cadc649c1b17e23619061bfc05a48617c2707515b6b1a05a3333a73240bd5",
     "agents/ap-synthesizer.md": "bb58e7bdc61cee55a35f860d27ece2dc34fa62aefab542cbe57ed7156da949bd",
     "agents/ap-verifier.md": "5c6ac1095af4aaac7490b0055434931528103d3c446a1f54882ee653d8714e66",
+    "autoprompt-models.schema.md": "9eb59bd59fde7e70ebf338927dc1d745ae36b1327714e96c70f3b4a94896e06f",
     "frameworks/QUICKSTART.md": "cca9c0cca44a1399597e884b9ca0089759175a485de3bdb914c5d341ffa4a734",
     "frameworks/README.md": "e9a95984ad18d815d3ce7348d3b184214f115eca661ecd4386c4e25d12515435",
     "frameworks/apply.md": "81b421b02bb3cb71fe54a297011b744b3b4cee0dde636b84e078cc4c62fc7f1b",
@@ -100,6 +111,13 @@
     "frameworks/plan-research.md": "750bc9bbcb1bf1ff5821ffc64947dd07bb8a5af2cc226ee10bdfd0ed6590b3fe",
     "frameworks/plan-scope.md": "62fc4a29a3bd8376248480b43edbdd196afde49c83320dd5c472eb20776cbf18",
     "frameworks/polish.md": "1771c799d56efccc63048103c7391a0b92b7ab4fd74a59163656f68dbfa99e01",
-    "frameworks/refactor.md": "c1a938ba1c2859918f255c914ce23eac73233bec3d92ce9924cf658854083fd4"
+    "frameworks/refactor.md": "c1a938ba1c2859918f255c914ce23eac73233bec3d92ce9924cf658854083fd4",
+    "workflow/agent-definitions-cli.js": "24fe3ab637799f62ed6dcd385eed61976c6266ccbb5615013714b524df11634c",
+    "workflow/autoprompt-gate.js": "69ef58436d351e3b749e587525b5fb87858dda5d776e3bd30584fe6dd9135e38",
+    "workflow/autoprompt-ledger-check.js": "2282331501e8eb97de8d3640b04f10941e5fe1ac57ce7c7f52de7dc40038a419",
+    "workflow/model-casting.js": "5bc431be1c4710eb37cbf39bbff4b1a799fb33229e0dc20bcaeede57a164809c",
+    "workflow/phase-budget.js": "2805c86b27bc3c36224a34bac2ec19c00dff6a10fb05e3d9f30cb6e5f33c6cf1",
+    "workflow/supervisor.ps1": "a2bab9720f4bbf76567d933da1c50e4773e078b28dc28ba524dddd6b34fa1d7a",
+    "workflow/supervisor.sh": "89c15fa1b4854f99eeafdcc303427faf7c68b9efebef51660e33a5a1898cf145"
   }
 }

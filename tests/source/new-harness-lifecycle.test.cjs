@@ -9,9 +9,8 @@ const path = require('node:path')
 const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
-const BASH = process.platform === 'win32'
-  ? 'C:\\Program Files\\Git\\bin\\bash.exe'
-  : 'bash'
+const { resolveBash } = require('../helpers/resolve-bash.cjs')
+const BASH = resolveBash()
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
 const NODE_DIRECTORY = path.dirname(process.execPath)
 const PYTHON_DIRECTORY = path.dirname(childProcess.spawnSync(

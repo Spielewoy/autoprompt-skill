@@ -9,7 +9,8 @@ const path = require('node:path')
 const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
-const GIT_BASH = 'C:\\Program Files\\Git\\bin\\bash.exe'
+const { resolveBash } = require('../helpers/resolve-bash.cjs')
+const GIT_BASH = resolveBash()
 
 function bashPath(value) {
   return value.replaceAll('\\', '/').replace(

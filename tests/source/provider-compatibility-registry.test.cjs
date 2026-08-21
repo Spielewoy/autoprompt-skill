@@ -35,18 +35,14 @@ function run(command, args, options = {}) {
   })
 }
 
+const { resolveBash } = require('../helpers/resolve-bash.cjs')
 function findBash() {
-  const candidates = process.platform === 'win32'
-    ? [
-        path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe'),
-        path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Git', 'bin', 'bash.exe'),
-        'bash',
-      ]
-    : ['bash']
-  for (const candidate of candidates) {
-    if (run(candidate, ['--version']).status === 0) return candidate
-  }
-  return null
+  // resolveBash probes Program Files (including D:) and returns a real Git Bash
+  // path on Windows; it never returns the WSL stub 'C:\Windows\system32\bash.exe'.
+  const resolved = resolveBash()
+  return resolved === 'bash' && process.platform === 'win32'
+    ? null
+    : resolved
 }
 
 function powershellLiteral(value) {
