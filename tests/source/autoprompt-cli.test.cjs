@@ -23,6 +23,7 @@ const {
   providerInstallState,
   queryLatestGitHubRevision,
   queryLatestVersion,
+  readLineSync,
   resolveInteractiveUpdateStatus,
   run,
 } = require('../../bin/autoprompt.cjs')
@@ -1975,4 +1976,48 @@ test('Escape returns to provider selection, then exits the interactive uninstall
   assert.match(result.stdout, /Back to provider selection\./)
   assert.match(result.stdout, /Autoprompt uninstaller closed\./)
   assert.deepEqual(result.calls, [])
+})
+
+test('readLineSync retries a non-blocking stdin instead of failing with EAGAIN', () => {
+  const child = childProcess.spawn(
+    process.execPath,
+    ['-e', "setTimeout(() => process.stdout.write('x\\n'), 150); setInterval(() => {}, 1000)"],
+    { stdio: ['ignore', 'pipe', 'ignore'] },
+  )
+  child.on('error', (error) => {
+    throw error
+  })
+  const descriptor = child.stdout._handle.fd
+  const stdout = capture()
+  const stderr = capture()
+  const rawModes = []
+  const stdin = {
+    fd: descriptor,
+    isRaw: false,
+    isTTY: true,
+    setRawMode(value) {
+      rawModes.push(value)
+      this.isRaw = value
+    },
+  }
+  stdout.stream.isTTY = true
+
+  try {
+    const fcntl = childProcess.spawnSync(
+      'python3',
+      ['-c', 'import fcntl,sys; fcntl.fcntl(3, fcntl.F_SETFL, fcntl.fcntl(3, fcntl.F_GETFL) | __import__("os").O_NONBLOCK)'],
+      { stdio: ['ignore', 'pipe', 'pipe', descriptor] },
+    )
+    assert.equal(fcntl.status, 0, fcntl.stderr.toString())
+
+    const started = Date.now()
+    const value = readLineSync(stdin, stdout.stream)
+    const elapsed = Date.now() - started
+
+    assert.equal(value, 'x')
+    assert.ok(elapsed >= 100, `expected to block for the delayed byte, took ${elapsed}ms`)
+    assert.deepEqual(rawModes, [true, false])
+  } finally {
+    child.kill()
+  }
 })

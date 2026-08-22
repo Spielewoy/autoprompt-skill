@@ -300,6 +300,13 @@ function providerInstallLocations(client, locationOptions = {}) {
 class InputClosedError extends Error {}
 class BackNavigationError extends Error {}
 
+const SLEEP_SAB = new SharedArrayBuffer(4)
+const SLEEP_SLOT = new Int32Array(SLEEP_SAB)
+
+function sleepSync(milliseconds) {
+  Atomics.wait(SLEEP_SLOT, 0, 0, milliseconds)
+}
+
 function readLineSync(stdin, stdout) {
   const descriptor = Number.isInteger(stdin.fd) ? stdin.fd : 0
   const byte = Buffer.allocUnsafe(1)
@@ -313,7 +320,10 @@ function readLineSync(stdin, stdout) {
       try {
         count = fs.readSync(descriptor, byte, 0, 1, null)
       } catch (error) {
-        if (error && error.code === 'EINTR') continue
+        if (error && (error.code === 'EINTR' || error.code === 'EAGAIN' || error.code === 'EWOULDBLOCK')) {
+          sleepSync(10)
+          continue
+        }
         throw error
       }
       if (count === 0) return bytes.length === 0 ? null : Buffer.from(bytes).toString('utf8')
@@ -1314,6 +1324,7 @@ module.exports = {
   providerInstallState,
   queryLatestVersion,
   queryLatestGitHubRevision,
+  readLineSync,
   resolveInteractiveUpdateStatus,
   run,
 }
