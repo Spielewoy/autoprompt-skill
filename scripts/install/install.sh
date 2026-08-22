@@ -83,7 +83,9 @@ payload_file() {
 # payload_body <file>: the skill body with its source frontmatter STRIPPED (format_skill
 # refuses a body that still carries a --- fence, code 6). Raw UTF-8 so glyphs survive.
 payload_body() {
-  python - "$1" <<'PY'
+  local py
+  py="$(autoprompt_python)" || return 1
+  "$py" - "$1" <<'PY'
 import sys
 text = open(sys.argv[1], encoding="utf-8").read()
 parts = text.split("---\n")
@@ -95,7 +97,9 @@ PY
 # payload_field <file> <key>: a top-level frontmatter scalar via the real YAML parser, so
 # a single-quoted multi-line description round-trips exactly into what we hand the library.
 payload_field() {
-  python - "$1" "$2" <<'PY'
+  local py
+  py="$(autoprompt_python)" || return 1
+  "$py" - "$1" "$2" <<'PY'
 import sys, yaml
 text = open(sys.argv[1], encoding="utf-8").read()
 fm = yaml.safe_load(text.split("---\n")[1])
@@ -581,7 +585,9 @@ install_kilo_activation() {
 }
 
 validate_opencode_profile() {
-  python - "$1" <<'PY' >/dev/null 2>&1
+  local py
+  py="$(autoprompt_python)" || return 1
+  "$py" - "$1" <<'PY' >/dev/null 2>&1
 import json, sys
 try:
     profile = json.load(open(sys.argv[1], encoding='utf-8'))

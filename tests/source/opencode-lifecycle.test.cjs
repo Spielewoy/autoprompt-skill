@@ -35,6 +35,22 @@ function findBash() {
   return null
 }
 
+function findOnPath(command) {
+  const sep = process.platform === 'win32' ? ';' : ':'
+  const pathEntries = String(process.env.PATH || '').split(sep)
+  for (const dir of pathEntries) {
+    if (!dir) continue
+    const candidate = path.join(dir, command + (process.platform === 'win32' ? '.exe' : ''))
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK)
+      return candidate
+    } catch {
+      // continue searching
+    }
+  }
+  return null
+}
+
 function powershellLiteral(value) {
   return `'${value.replaceAll("'", "''")}'`
 }
@@ -149,7 +165,8 @@ test('POSIX OpenCode lifecycle syntax, version boundary, profile schema, and wra
     '[ "${AUTOPROMPT_VERSION_FLOOR[opencode]}" = 1.18.7 ]',
     '! _precheck_version_ge 1.18.6 "${AUTOPROMPT_VERSION_FLOOR[opencode]}"',
     '_precheck_version_ge 1.18.7 "${AUTOPROMPT_VERSION_FLOOR[opencode]}"',
-    `python - ${powershellLiteral(path.join(ROOT, 'agents', 'opencode', 'autoprompt.opencode.json'))} <<'PY'`,
+    `py="$(autoprompt_python)" || { printf 'no-python\n' >&2; exit 1; }`,
+    `"$py" - ${powershellLiteral(path.join(ROOT, 'agents', 'opencode', 'autoprompt.opencode.json'))} <<'PY'`,
     'import json, sys',
     'profile = json.load(open(sys.argv[1], encoding="utf-8"))',
     'assert profile == {',
@@ -303,4 +320,45 @@ test('PowerShell OpenCode 1.18.18 lifecycle detects tamper, repairs, stays idemp
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true })
   }
+})
+
+test('POSIX OpenCode profile validation resolves python3 when no bare python exists', {
+  skip: process.platform === 'win32',
+}, () => {
+  const bash = findBash()
+  assert.ok(bash, 'bash is required for the POSIX python-resolver checks')
+
+  const python3 = findOnPath('python3')
+  assert.ok(python3, 'python3 is required for the python3-only PATH regression test')
+  const python = findOnPath('python')
+  assert.equal(python, null, 'this test needs a system without bare `python` on PATH')
+
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-python3-only-'))
+  const bin = path.join(sandbox, 'bin')
+  fs.mkdirSync(bin, { recursive: true })
+  fs.symlinkSync(python3, path.join(bin, 'python3'))
+
+  const script = [
+    'set -u',
+    `. scripts/install/lib/install-lib.sh`,
+    `py="$(autoprompt_python)" || { printf 'no-python-resolved\n' >&2; exit 1; }`,
+    `"$py" - ${powershellLiteral(path.join(ROOT, 'agents', 'opencode', 'autoprompt.opencode.json'))} <<'PY'`,
+    'import json, sys',
+    'profile = json.load(open(sys.argv[1], encoding="utf-8"))',
+    'assert profile == {',
+    '  "$schema": "https://opencode.ai/config.json",',
+    '  "subagent_depth": 4,',
+    '  "share": "disabled",',
+    '  "permission": {"task": {"*": "deny", "ap-*": "allow"}},',
+    '}',
+    'PY',
+    'printf "resolved=$py\\n"',
+  ].join('\n')
+  const completed = run(bash, ['-c', script], {
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ''}` },
+  })
+  assert.equal(completed.status, 0, completed.stderr)
+  assert.match(completed.stdout, /resolved=python3/)
+
+  fs.rmSync(sandbox, { recursive: true, force: true })
 })
