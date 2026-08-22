@@ -42,8 +42,9 @@ opencode_activation_status() {
     printf 'missing:autoprompt.opencode.json'
     return 0
   fi
-  local status
-  status="$(python - "$skill" "$base" <<'PY' 2>/dev/null
+  local status py
+  py="$(autoprompt_python)" || { printf 'invalid:python-unavailable'; return 0; }
+  status="$("$py" - "$skill" "$base" <<'PY' 2>/dev/null
 import hashlib
 import json
 import pathlib

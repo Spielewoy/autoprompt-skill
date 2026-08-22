@@ -37,6 +37,51 @@ declare -A AUTOPROMPT_CLIENT_BIN=(
 AUTOPROMPT_VERSION_FLAG="--version"
 AUTOPROMPT_PROBE_TIMEOUT=10
 
+# Resolved Python interpreter used by every verify/parse path. Cached on first
+# resolution; AUTOPROMPT_PYTHON is an explicit operator override. Many POSIX
+# systems (notably macOS) ship `python3` but no bare `python`, so we resolve
+# `python3` before `python` rather than hardcoding one name - mirroring the
+# Resolve-VerifyPython helper in the .ps1 port.
+AUTOPROMPT_PYTHON="${AUTOPROMPT_PYTHON:-}"
+
+# _autoprompt_python_probe <candidate>: true iff <candidate> is a runnable Python.
+_autoprompt_python_probe() {
+  [ -n "${1:-}" ] || return 1
+  command -v "$1" >/dev/null 2>&1 || return 1
+  "$1" -c 'pass' >/dev/null 2>&1
+}
+
+# resolve_autoprompt_python: print the resolved interpreter (caching it) or print
+# a loud diagnostic and return non-zero when none is available. Failures here are
+# never silent so an operator sees why a verify/parse step could not run.
+resolve_autoprompt_python() {
+  local candidate
+  if [ -n "$AUTOPROMPT_PYTHON" ] && _autoprompt_python_probe "$AUTOPROMPT_PYTHON"; then
+    printf '%s' "$AUTOPROMPT_PYTHON"
+    return 0
+  fi
+  for candidate in python3 python; do
+    if _autoprompt_python_probe "$candidate"; then
+      AUTOPROMPT_PYTHON="$candidate"
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  printf 'Autoprompt needs a python interpreter (python3 or python) on PATH.\n' >&2
+  return 1
+}
+
+# autoprompt_python: print the resolved interpreter, resolving lazily on first
+# call. Call sites use "$(autoprompt_python)" so the value resolves at call time
+# and the cache mutates in the calling shell.
+autoprompt_python() {
+  if [ -n "$AUTOPROMPT_PYTHON" ]; then
+    printf '%s' "$AUTOPROMPT_PYTHON"
+    return 0
+  fi
+  resolve_autoprompt_python
+}
+
 # Public install compatibility is a closed nine-provider registry. Historical
 # path resolvers remain below only for receipt-owned cleanup of earlier installs.
 declare -A AUTOPROMPT_PROVIDER_STATUS=(
@@ -2741,11 +2786,12 @@ AUTOPROMPT_CODEX_DESCRIPTION_MAX=1024
 # absent), or 65 (no python+yaml tool). Probes the parser first so a missing tool
 # is a loud distinct code, never a silent FAIL.
 _verify_parse_yaml_frontmatter() {
-  local file="$1" required="$2"
-  if ! python -c "import yaml" >/dev/null 2>&1; then
+  local file="$1" required="$2" py
+  py="$(autoprompt_python)" || return 65
+  if ! "$py" -c "import yaml" >/dev/null 2>&1; then
     return 65
   fi
-  python - "$file" "$required" <<'PY' >/dev/null 2>&1
+  "$py" - "$file" "$required" <<'PY' >/dev/null 2>&1
 import sys, yaml
 text = open(sys.argv[1], encoding="utf-8").read()
 parts = text.split("---")
@@ -2766,12 +2812,13 @@ PY
 # Returns 0 (length printed to stdout), 61 (no parseable description), or 65 (no
 # python+yaml). Reuses the same parser-probe discipline as the parse helpers.
 _verify_codex_description_len() {
-  local file="$1"
-  if ! python -c "import yaml" >/dev/null 2>&1; then
+  local file="$1" py
+  py="$(autoprompt_python)" || return 65
+  if ! "$py" -c "import yaml" >/dev/null 2>&1; then
     return 65
   fi
   local out
-  out="$(python - "$file" <<'PY' 2>/dev/null
+  out="$("$py" - "$file" <<'PY' 2>/dev/null
 import sys, yaml
 text = open(sys.argv[1], encoding="utf-8").read()
 parts = text.split("---")
@@ -2789,11 +2836,12 @@ PY
   return 0
 }
 _verify_parse_toml() {
-  local file="$1"
-  if ! python -c "import tomllib" >/dev/null 2>&1; then
+  local file="$1" py
+  py="$(autoprompt_python)" || return 65
+  if ! "$py" -c "import tomllib" >/dev/null 2>&1; then
     return 65
   fi
-  python - "$file" <<'PY' >/dev/null 2>&1
+  "$py" - "$file" <<'PY' >/dev/null 2>&1
 import sys, tomllib
 d = tomllib.load(open(sys.argv[1], "rb"))
 if "prompt" not in d:
@@ -2809,11 +2857,12 @@ PY
 # a non-empty customInstructions. Returns 0 / 61 (parse error / shape wrong / mode
 # absent) / 65 (no python+yaml tool).
 _verify_parse_roomodes() {
-  local file="$1"
-  if ! python -c "import yaml" >/dev/null 2>&1; then
+  local file="$1" py
+  py="$(autoprompt_python)" || return 65
+  if ! "$py" -c "import yaml" >/dev/null 2>&1; then
     return 65
   fi
-  python - "$file" <<'PY' >/dev/null 2>&1
+  "$py" - "$file" <<'PY' >/dev/null 2>&1
 import sys, yaml
 doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8").read())
 if not isinstance(doc, dict):
@@ -2834,11 +2883,12 @@ PY
 # require a mapping with a non-empty `instructions` OR `prompt` (Goose's
 # validate_prompt_or_instructions rule). Returns 0 / 61 / 65, same discipline.
 _verify_parse_goose_recipe() {
-  local file="$1"
-  if ! python -c "import yaml" >/dev/null 2>&1; then
+  local file="$1" py
+  py="$(autoprompt_python)" || return 65
+  if ! "$py" -c "import yaml" >/dev/null 2>&1; then
     return 65
   fi
-  python - "$file" <<'PY' >/dev/null 2>&1
+  "$py" - "$file" <<'PY' >/dev/null 2>&1
 import sys, yaml
 doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8").read())
 if not isinstance(doc, dict):
@@ -5015,7 +5065,9 @@ vscode_settings_status() {
 }
 
 validate_kilo_profile() {
-  python - "$1" <<'PY' >/dev/null 2>&1
+  local py
+  py="$(autoprompt_python)" || return 1
+  "$py" - "$1" <<'PY' >/dev/null 2>&1
 import json, sys
 try:
     profile = json.load(open(sys.argv[1], encoding='utf-8'))
