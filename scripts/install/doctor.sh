@@ -24,7 +24,7 @@ fi
 # shellcheck source=/dev/null
 . "$LIB"
 
-CLIENTS_ALL=(claude codex opencode kilo grok vscode prime)
+CLIENTS_ALL=(claude codex opencode kilo grok vscode prime omp deepseek reasonix)
 
 config_root() {
   local client="$1"
@@ -255,12 +255,79 @@ vscode_activation_status() {
   printf 'complete'
 }
 
+omp_activation_status() {
+  local skill agents_dir source_agent landed agents=0 helper config
+  skill="$(autoprompt_runtime_root omp)"
+  agents_dir="$(autoprompt_native_agents_root omp)"
+  for source_agent in "$skill/agents"/ap-*.md; do
+    [ -f "$source_agent" ] || continue
+    agents=$((agents + 1))
+    landed="$agents_dir/${source_agent##*/}"
+    if [ ! -f "$landed" ] || ! cmp -s "$source_agent" "$landed"; then
+      printf 'invalid:agent-mismatch'
+      return 0
+    fi
+  done
+  [ "$agents" -eq 25 ] || { printf 'missing:agents'; return 0; }
+  helper="$SCRIPT_DIR/../harness-provider-config.cjs"
+  config="$(autoprompt_config_root omp)/config.yml"
+  if ! command -v node >/dev/null 2>&1 || [ ! -f "$helper" ] ||
+     ! node "$helper" inspect --provider omp --file "$config" \
+       --minimum 4 >/dev/null 2>&1; then
+    printf 'activation-missing:recursion-depth'
+    return 0
+  fi
+  printf 'complete'
+}
+
+deepseek_activation_status() {
+  local root skill source target file
+  root="$(autoprompt_config_root deepseek)"
+  skill="$(autoprompt_runtime_root deepseek)"
+  source="$skill/agent-preset"
+  target="$root/.agent-presets/autoprompt"
+  for file in agent.cordis.yml preset.yml; do
+    if [ ! -f "$source/$file" ] || [ ! -f "$target/$file" ] ||
+       ! cmp -s "$source/$file" "$target/$file"; then
+      printf 'invalid:preset-mismatch'
+      return 0
+    fi
+  done
+  printf 'complete'
+}
+
+reasonix_activation_status() {
+  local root skill profile name target count=0 helper config
+  root="$(autoprompt_config_root reasonix)"
+  skill="$(autoprompt_runtime_root reasonix)"
+  for profile in "$skill/skills"/ap-*/SKILL.md; do
+    [ -f "$profile" ] || continue
+    count=$((count + 1))
+    name="${profile%/SKILL.md}"; name="${name##*/}"
+    target="$root/skills/$name/SKILL.md"
+    if [ ! -f "$target" ] || ! cmp -s "$profile" "$target"; then
+      printf 'invalid:profile-mismatch'
+      return 0
+    fi
+  done
+  [ "$count" -eq 25 ] || { printf 'missing:profiles'; return 0; }
+  helper="$SCRIPT_DIR/../harness-provider-config.cjs"
+  config="$root/config.toml"
+  if ! command -v node >/dev/null 2>&1 || [ ! -f "$helper" ] ||
+     ! node "$helper" inspect --provider reasonix --file "$config" \
+       --minimum 4 >/dev/null 2>&1; then
+    printf 'activation-missing:recursion-depth'
+    return 0
+  fi
+  printf 'complete'
+}
+
 # check_extras <client>: verify the exact hash-bound runtime inventory through the
-# same manifest tool used by install and deployment. Single-file clients return na.
+# same manifest tool used by install and deployment. Prime returns na.
 check_extras() {
   local client="$1" skill tool="$SCRIPT_DIR/../runtime-payload.cjs"
   case "$client" in
-    claude|codex|opencode|kilo|grok|vscode)
+    claude|codex|opencode|kilo|grok|vscode|omp|deepseek|reasonix)
       skill="$(autoprompt_runtime_root "$client")"
       ;;
     *)        printf 'na'; return 0 ;;
@@ -285,6 +352,12 @@ check_extras() {
       grok_activation_status
     elif [ "$client" = "vscode" ]; then
       vscode_activation_status
+    elif [ "$client" = "omp" ]; then
+      omp_activation_status
+    elif [ "$client" = "deepseek" ]; then
+      deepseek_activation_status
+    elif [ "$client" = "reasonix" ]; then
+      reasonix_activation_status
     else
       printf 'complete'
     fi

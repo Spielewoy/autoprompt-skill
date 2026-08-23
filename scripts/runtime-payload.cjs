@@ -71,6 +71,31 @@ const PROVIDERS = {
     agents: 'vscode-personas',
     workflow: [],
   },
+  omp: {
+    topLevel: ['GATES.md', 'MODES.md', 'PLAYBOOKS.md', 'README.md', 'VERSION'],
+    agents: 'personas',
+    workflow: [],
+  },
+  deepseek: {
+    topLevel: [
+      'GATES.md',
+      'MODES.md',
+      'PLAYBOOKS.md',
+      'README.md',
+      'VERSION',
+      'agent-preset/agent.cordis.yml',
+      'agent-preset/preset.yml',
+      'headless.patch.yml',
+    ],
+    agents: 'personas',
+    workflow: [],
+  },
+  reasonix: {
+    topLevel: ['GATES.md', 'MODES.md', 'PLAYBOOKS.md', 'README.md', 'VERSION'],
+    agents: 'reasonix-personas',
+    agentRoot: 'skills',
+    workflow: [],
+  },
 }
 
 function canonicalBytes(filePath) {
@@ -95,7 +120,9 @@ function runtimeFiles(provider, root = ROOT) {
       : definition.agents === 'vscode-personas'
         ? contract.personas.map(persona => `${persona.id}.agent.md`)
         : definition.agents === 'prime-personas'
-            ? contract.personas.map(persona => `${persona.id}.md`)
+          ? contract.personas.map(persona => `${persona.id}.md`)
+          : definition.agents === 'reasonix-personas'
+            ? contract.personas.map(persona => `${persona.id}/SKILL.md`)
             : definition.agents
   const agentRoot = definition.agentRoot || 'agents'
   files.push(...agents.map(agent => `${agentRoot}/${agent}`))

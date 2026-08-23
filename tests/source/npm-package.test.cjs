@@ -10,7 +10,11 @@ const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const PACKAGE_PATH = path.join(ROOT, 'package.json')
-const PROVIDERS = ['claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime']
+const PACKAGE_VERSION = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8')).version
+const PROVIDERS = [
+  'claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime',
+  'omp', 'deepseek', 'reasonix',
+]
 
 function filesBelow(directory) {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
@@ -107,6 +111,7 @@ function packageFilesOnDisk() {
     path.join(ROOT, 'LICENSE'),
     ...filesBelow(path.join(ROOT, 'bin')),
     path.join(ROOT, 'scripts', 'codex-configure.cjs'),
+    path.join(ROOT, 'scripts', 'harness-provider-config.cjs'),
     path.join(ROOT, 'scripts', 'runtime-payload.cjs'),
     ...filesBelow(path.join(ROOT, 'scripts', 'install')),
     ...PROVIDERS.map(provider => path.join(ROOT, 'agents', 'manifests', `${provider}-runtime.json`)),
@@ -151,7 +156,7 @@ function dryRunPackResult() {
 test('package metadata is public-ready under the exact available name and remains dependency-free', () => {
   const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'))
   assert.equal(packageJson.name, 'autoprompt-skill')
-  assert.equal(packageJson.version, '1.0.2')
+  assert.equal(packageJson.version, PACKAGE_VERSION)
   assert.equal(
     packageJson.description,
     'Autoprompt is a coding-agent skill that cuts failures by 45% on agentic coding tasks.',
@@ -183,6 +188,7 @@ test('package metadata is public-ready under the exact available name and remain
     'codex-current-parity',
     'prime-provider',
     'grok-provider',
+    'harness-provider-config',
   ]) {
     assert.match(packageJson.scripts['test:providers'], new RegExp(`${suite}\\.test\\.cjs`), suite)
   }
@@ -194,6 +200,8 @@ test('package metadata is public-ready under the exact available name and remain
     'install-custom-root',
     'prime-lifecycle',
     'grok-lifecycle',
+    'new-harness-lifecycle',
+    'packed-new-harness-lifecycle',
   ]) {
     assert.match(packageJson.scripts['test:lifecycle'], new RegExp(`${suite}\\.test\\.cjs`), suite)
   }
@@ -209,6 +217,7 @@ test('package metadata is public-ready under the exact available name and remain
   assert.deepEqual(packageJson.files, [
     'bin/',
     'scripts/codex-configure.cjs',
+    'scripts/harness-provider-config.cjs',
     'scripts/install/',
     'scripts/runtime-payload.cjs',
     'agents/claude/',
@@ -218,6 +227,9 @@ test('package metadata is public-ready under the exact available name and remain
     'agents/grok/',
     'agents/vscode/',
     'agents/prime/',
+    'agents/omp/',
+    'agents/deepseek/',
+    'agents/reasonix/',
     'agents/manifests/claude-runtime.json',
     'agents/manifests/codex-runtime.json',
     'agents/manifests/opencode-runtime.json',
@@ -225,6 +237,9 @@ test('package metadata is public-ready under the exact available name and remain
     'agents/manifests/grok-runtime.json',
     'agents/manifests/vscode-runtime.json',
     'agents/manifests/prime-runtime.json',
+    'agents/manifests/omp-runtime.json',
+    'agents/manifests/deepseek-runtime.json',
+    'agents/manifests/reasonix-runtime.json',
     'assets/anatomy.svg',
     'assets/banner.svg',
     'assets/how-it-works-hierarchy.svg',
@@ -253,7 +268,7 @@ test('package metadata is public-ready under the exact available name and remain
 test('npm dry-run inventory is an exact allowlist and excludes repository-only material', () => {
   const result = dryRunPackResult()
   assert.equal(result.name, 'autoprompt-skill')
-  assert.equal(result.version, '1.0.2')
+  assert.equal(result.version, PACKAGE_VERSION)
   const actual = result.files.map(file => file.path).sort()
   assert.deepEqual(actual, packageFilesOnDisk())
   assert.ok(result.size > 0)
@@ -308,6 +323,34 @@ test('every npm-packaged POSIX shell script has an LF shebang and no carriage re
 
   assert.ok(shellScripts.length > 0, 'npm package must contain POSIX shell scripts')
   for (const relativePath of shellScripts) {
+    const bytes = fs.readFileSync(path.join(ROOT, ...relativePath.split('/')))
+    const firstLineEnd = bytes.indexOf(0x0a)
+    assert.ok(firstLineEnd > 2, `${relativePath}: missing LF-terminated shebang`)
+    assert.equal(
+      bytes.subarray(0, firstLineEnd).toString('utf8').startsWith('#!'),
+      true,
+      `${relativePath}: first line is not a shebang`,
+    )
+    assert.equal(bytes.includes(0x0d), false, `${relativePath}: contains CR bytes`)
+  }
+})
+
+test('every npm-packaged bin entrypoint has an LF shebang, no carriage returns, and the executable bit', () => {
+  const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'))
+  const binPaths = [...new Set(Object.values(packageJson.bin))].sort()
+  assert.ok(binPaths.length > 0, 'package.json must declare bin entrypoints')
+
+  const result = dryRunPackResult()
+  for (const relativePath of binPaths) {
+    const packedFile = result.files.find(file => file.path === relativePath)
+    assert.ok(packedFile, `${relativePath}: not present in npm package`)
+    // Windows filesystems do not represent POSIX executable bits. The release
+    // workflow packs on Linux, where this assertion verifies the published mode.
+    if (process.platform !== 'win32') {
+      // eslint-disable-next-line no-bitwise
+      assert.equal(packedFile.mode & 0o111, 0o111, `${relativePath}: packed without the executable bit`)
+    }
+
     const bytes = fs.readFileSync(path.join(ROOT, ...relativePath.split('/')))
     const firstLineEnd = bytes.indexOf(0x0a)
     assert.ok(firstLineEnd > 2, `${relativePath}: missing LF-terminated shebang`)
@@ -378,7 +421,7 @@ test('packed tarball installs into an isolated temporary global prefix and its s
           shell: false,
         })
       assert.equal(invoked.status, 0, invoked.stderr)
-      assert.equal(invoked.stdout, '1.0.2\n')
+      assert.equal(invoked.stdout, `${PACKAGE_VERSION}\n`)
     }
   } finally {
     fs.rmSync(temporaryRoot, { recursive: true, force: true })

@@ -6,8 +6,8 @@
 
 <p align="center">
   <a href="#基准测试"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20%E5%88%86-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1：提高 14.61 分"/></a>
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%E7%89%88%E6%9C%AC&color=255C60&labelColor=14101F" alt="版本：v1.0.2"/></a>
-  <a href="#安装"><img src="https://img.shields.io/badge/%E6%94%AF%E6%8C%81-6-255C60?style=flat-square&labelColor=14101F" alt="支持：6"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%E7%89%88%E6%9C%AC&color=255C60&labelColor=14101F" alt="版本：v1.0.4"/></a>
+  <a href="#安装"><img src="https://img.shields.io/badge/%E6%94%AF%E6%8C%81-9-255C60?style=flat-square&labelColor=14101F" alt="支持：9"/></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF%E8%AF%81-MIT-255C60?style=flat-square&labelColor=14101F" alt="许可证：MIT"/></a>
 </p>
 
@@ -25,7 +25,7 @@
 
 ## 安装
 
-使用下面的 CLI，或从 [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.2) 下载安装程序。
+使用下面的 CLI，或从 [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.4) 下载安装程序。
 
 ### 1. 安装 CLI
 
@@ -75,6 +75,9 @@ autoprompt
 | 可用 | [Grok Build](https://github.com/xai-org/grok-build) | 1.0.0+；已按 1.0.5 源码核对；密封派发适配器 | `grok` |
 | 可用 | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+；已验证 VS Code 1.133.0 和 Copilot 0.61.0 | `vscode` |
 | 可用 | [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 0.7.2；已验证 0.7.2；原生包适配器 | `prime` |
+| 可用 | [Oh My Pi](https://omp.sh/) | 17.4.0+；已在 17.4.0 上验证适配器契约、安装生命周期和原生角色载荷 | `omp` |
+| 可用 | [DeepSeek Harness](https://deepseek.com/harness/en/) | 0.1.0-rc.7+；已在 0.1.0-rc.7 上验证适配器契约、安装生命周期和原生角色载荷 | `deepseek` |
+| 可用 | [Reasonix](https://reasonix.io/docs/) | 1.30.0+；已在 1.30.0 上验证适配器契约、安装生命周期和原生角色载荷 | `reasonix` |
 
 更多信息见[支持与验证说明](../faq/which-coding-agents-are-supported.md)。
 
@@ -129,10 +132,10 @@ DeepSeek 的 82.7% 来自它自己的测试设置，不能当作可直接比较�
 
 使用 `mode=` 设置并发；编码工具支持时，可用 `agents=` 路由模型。
 
-| 控制项 | Claude Code | Codex | OpenCode | Kilo | Grok Build | VS Code | Prime Agent |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| 自定义 `agents=` 路由 | ✓ | ✓ | ✕ 不支持 - 沿用当前模型 | ✕ 不支持 - 沿用当前模型 | ✕ 不支持 - 沿用本次运行模型 | ✕ 不支持 - 沿用当前模型 | ✕ 不支持 - 沿用所选父模型 |
+| 控制项 | Claude Code | Codex | OpenCode | Kilo | Grok Build | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 自定义 `agents=` 路由 | ✓ | ✓ | ✕ 不支持 - 沿用当前模型 | ✕ 不支持 - 沿用当前模型 | ✕ 不支持 - 沿用本次运行模型 | ✕ 不支持 - 沿用当前模型 | ✕ 不支持 - 沿用所选父模型 | ✕ 不支持 - 沿用所选父模型 | ✕ 不支持 - 沿用所选父模型 | ✕ 不支持 - 沿用所选父模型 |
 
 ## 工作方式
 
@@ -155,7 +158,7 @@ DeepSeek 的 82.7% 来自它自己的测试设置，不能当作可直接比较�
 | 研究 | `/autoprompt 对照此代码库比较任务队列并推荐一个方案` |
 | 限制并发 | `/autoprompt mode=custom max_subs=4 迁移所有模型` |
 
-在 Codex 中请使用 `$autoprompt`，不要使用 `/autoprompt`。
+在 Codex 中请使用 `$autoprompt`，不要使用 `/autoprompt`。在 Oh My Pi 中请使用 `/skill:autoprompt`。
 
 ## 常见问题
 

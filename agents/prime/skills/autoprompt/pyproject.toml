@@ -1,6 +1,6 @@
 [project]
 name = "autoprompt-prime-dispatch"
-version = "1.0.2"
+version = "1.0.4"
 description = "Topology-enforcing Autoprompt dispatcher for Prime Agent"
 requires-python = ">=3.10"
 dependencies = []

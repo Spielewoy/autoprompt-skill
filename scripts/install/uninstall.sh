@@ -19,7 +19,7 @@ fi
 # shellcheck source=/dev/null
 . "$LIB"
 
-CLIENTS_ALL=(prime vscode claude codex opencode kilo grok)
+CLIENTS_ALL=(prime vscode claude codex opencode kilo grok omp deepseek reasonix)
 LEGACY_CLEANUP_CLIENTS=(vibe cursor roo gemini cline goose dcode)
 RESULT_ROWS=()
 UNINSTALL_EXIT_CODE=0

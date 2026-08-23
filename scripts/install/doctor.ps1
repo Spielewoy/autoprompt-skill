@@ -23,7 +23,10 @@ if (-not (Test-Path -LiteralPath $Lib -PathType Leaf)) {
 }
 . $Lib
 
-$ClientsAll = @('claude','codex','opencode','kilo','grok','vscode','prime')
+$ClientsAll = @(
+    'claude','codex','opencode','kilo','grok','vscode','prime',
+    'omp','deepseek','reasonix'
+)
 
 function Get-HomeDir {
     if ($env:HOME) { return $env:HOME }
@@ -267,8 +270,78 @@ function Get-VscodeActivationStatus {
     return 'complete'
 }
 
+function Get-OmpActivationStatus {
+    param([string]$Skill)
+    $sourceAgents = @(Get-ChildItem -LiteralPath (Join-Path $Skill 'agents') `
+        -Filter 'ap-*.md' -File -ErrorAction SilentlyContinue)
+    if ($sourceAgents.Count -ne 25) { return 'missing:agents' }
+    $agentsDir = Get-AutopromptNativeAgentsRoot -Name 'omp'
+    foreach ($sourceAgent in $sourceAgents) {
+        $landed = Join-Path $agentsDir $sourceAgent.Name
+        if (-not (Test-Path -LiteralPath $landed -PathType Leaf) -or
+            (Get-IdemSha256 -Path $sourceAgent.FullName) -ne
+            (Get-IdemSha256 -Path $landed)) {
+            return 'invalid:agent-mismatch'
+        }
+    }
+    $helper = Join-Path $ScriptDir '../harness-provider-config.cjs'
+    $config = Join-Path (Get-AutopromptConfigRoot -Name 'omp') 'config.yml'
+    if (-not (Get-Command node -ErrorAction SilentlyContinue) -or
+        -not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        return 'activation-missing:recursion-depth'
+    }
+    & node $helper inspect --provider omp --file $config --minimum 4 *> $null
+    if ($LASTEXITCODE -ne 0) { return 'activation-missing:recursion-depth' }
+    return 'complete'
+}
+
+function Get-DeepseekActivationStatus {
+    param([string]$Skill)
+    $source = Join-Path $Skill 'agent-preset'
+    $target = Join-Path (Get-AutopromptConfigRoot -Name 'deepseek') `
+        '.agent-presets/autoprompt'
+    foreach ($file in @('agent.cordis.yml', 'preset.yml')) {
+        $sourceFile = Join-Path $source $file
+        $targetFile = Join-Path $target $file
+        if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $targetFile -PathType Leaf) -or
+            (Get-IdemSha256 -Path $sourceFile) -ne
+            (Get-IdemSha256 -Path $targetFile)) {
+            return 'invalid:preset-mismatch'
+        }
+    }
+    return 'complete'
+}
+
+function Get-ReasonixActivationStatus {
+    param([string]$Skill)
+    $profiles = @(Get-ChildItem -LiteralPath (Join-Path $Skill 'skills') `
+        -Filter 'SKILL.md' -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.Directory.Name -like 'ap-*' })
+    if ($profiles.Count -ne 25) { return 'missing:profiles' }
+    $targetRoot = Join-Path (Get-AutopromptConfigRoot -Name 'reasonix') 'skills'
+    foreach ($profile in $profiles) {
+        $target = Join-Path (Join-Path $targetRoot $profile.Directory.Name) `
+            'SKILL.md'
+        if (-not (Test-Path -LiteralPath $target -PathType Leaf) -or
+            (Get-IdemSha256 -Path $profile.FullName) -ne
+            (Get-IdemSha256 -Path $target)) {
+            return 'invalid:profile-mismatch'
+        }
+    }
+    $helper = Join-Path $ScriptDir '../harness-provider-config.cjs'
+    $config = Join-Path (Get-AutopromptConfigRoot -Name 'reasonix') 'config.toml'
+    if (-not (Get-Command node -ErrorAction SilentlyContinue) -or
+        -not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        return 'activation-missing:recursion-depth'
+    }
+    & node $helper inspect --provider reasonix --file $config --minimum 4 *> $null
+    if ($LASTEXITCODE -ne 0) { return 'activation-missing:recursion-depth' }
+    return 'complete'
+}
+
 # Get-ExtrasStatus verifies the exact hash-bound runtime inventory through the
-# same manifest tool used by install and deployment. Single-file clients return na.
+# same manifest tool used by install and deployment. Prime returns na.
 function Get-ExtrasStatus {
     param([string]$Client)
     $opencodeBase = $null
@@ -290,6 +363,9 @@ function Get-ExtrasStatus {
         }
         'grok' { $skill = Get-AutopromptRuntimeRoot -Name 'grok' }
         'vscode' { $skill = Get-AutopromptRuntimeRoot -Name 'vscode' }
+        'omp' { $skill = Get-AutopromptRuntimeRoot -Name 'omp' }
+        'deepseek' { $skill = Get-AutopromptRuntimeRoot -Name 'deepseek' }
+        'reasonix' { $skill = Get-AutopromptRuntimeRoot -Name 'reasonix' }
         default { return 'na' }
     }
     $tool = Join-Path $ScriptDir '../runtime-payload.cjs'
@@ -315,6 +391,15 @@ function Get-ExtrasStatus {
         }
         if ($Client -eq 'vscode') {
             return (Get-VscodeActivationStatus -Skill $skill)
+        }
+        if ($Client -eq 'omp') {
+            return (Get-OmpActivationStatus -Skill $skill)
+        }
+        if ($Client -eq 'deepseek') {
+            return (Get-DeepseekActivationStatus -Skill $skill)
+        }
+        if ($Client -eq 'reasonix') {
+            return (Get-ReasonixActivationStatus -Skill $skill)
         }
         return 'complete'
     }

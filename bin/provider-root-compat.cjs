@@ -214,6 +214,58 @@ function createProviderRootCompat(providerLabels) {
         }),
       ]),
     }),
+    omp: Object.freeze({
+      markers: Object.freeze([
+        Object.freeze({
+          label: 'skills/autoprompt/SKILL.md (OMP invocation)',
+          check(root) {
+            return matchAnchoredOmpSkill(root, ['skills', 'autoprompt', 'SKILL.md'])
+          },
+        }),
+        Object.freeze({
+          label: 'agents/ap-*.md (25 files)',
+          shared: true,
+          check(root) {
+            return matchAnchoredPatternCount(root, ['agents'], /^ap-.*\.md$/, 25)
+          },
+        }),
+      ]),
+    }),
+    deepseek: Object.freeze({
+      markers: Object.freeze([
+        Object.freeze({
+          label: '.agent-presets/autoprompt/agent.cordis.yml',
+          check(root) {
+            return matchAnchoredFile(
+              root,
+              ['.agent-presets', 'autoprompt', 'agent.cordis.yml'],
+            )
+          },
+        }),
+        Object.freeze({
+          label: '.agent-presets/autoprompt/preset.yml',
+          check(root) {
+            return matchAnchoredFile(root, ['.agent-presets', 'autoprompt', 'preset.yml'])
+          },
+        }),
+      ]),
+    }),
+    reasonix: Object.freeze({
+      markers: Object.freeze([
+        Object.freeze({
+          label: 'skills/ap-*/SKILL.md (25 files)',
+          check(root) {
+            return matchAnchoredNestedFileCount(
+              root,
+              ['skills'],
+              /^ap-.*$/,
+              'SKILL.md',
+              25,
+            )
+          },
+        }),
+      ]),
+    }),
   })
 
   return Object.freeze({
@@ -383,6 +435,49 @@ function matchAnchoredProfileLine(root, segments, line) {
   } catch {
     return { status: 'partial', absolutePath: target.absolutePath }
   }
+}
+
+function matchAnchoredOmpSkill(root, segments) {
+  const target = matchAnchoredFile(root, segments)
+  if (target.status !== 'match') return target
+  try {
+    const text = fs.readFileSync(target.absolutePath, 'utf8')
+    const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text)
+    if (!frontmatter) return { status: 'partial', absolutePath: target.absolutePath }
+    const metadata = frontmatter[1]
+    const isAutoprompt = /^name:\s*["']?autoprompt["']?\s*$/m.test(metadata)
+    const hasInvocation = /^description:\s*[^\r\n]*\/skill:autoprompt(?![A-Za-z0-9_:/-])/m.test(metadata)
+    const isUserInvocable = /^user-invocable:\s*true\s*$/m.test(metadata)
+    return isAutoprompt && hasInvocation && isUserInvocable
+      ? target
+      : { status: 'partial', absolutePath: target.absolutePath }
+  } catch {
+    return { status: 'partial', absolutePath: target.absolutePath }
+  }
+}
+
+function matchAnchoredNestedFileCount(root, segments, directoryPattern, filename, expectedCount) {
+  const target = anchoredTarget(root, segments)
+  if (target.status !== 'match') return target
+  if (!target.stats.isDirectory()) {
+    return { status: 'missing', absolutePath: target.absolutePath }
+  }
+  let matches = 0
+  for (const entry of fs.readdirSync(target.absolutePath, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !directoryPattern.test(entry.name)) continue
+    const directory = path.join(target.absolutePath, entry.name)
+    const directoryInfo = tryLstat(directory)
+    if (!directoryInfo.found) continue
+    if (directoryInfo.stats.isSymbolicLink()) {
+      return { status: 'unsafe', absolutePath: directory }
+    }
+    const child = matchAnchoredFile(directory, [filename])
+    if (child.status === 'unsafe') return child
+    if (child.status === 'match') matches += 1
+  }
+  if (matches === 0) return { status: 'missing', absolutePath: target.absolutePath }
+  if (matches === expectedCount) return { status: 'match', absolutePath: target.absolutePath }
+  return { status: 'partial', absolutePath: target.absolutePath }
 }
 
 function matchAnchoredPrimePackage(root, segments) {

@@ -39,7 +39,7 @@ fi
 # shellcheck source=/dev/null
 . "$LIB"
 
-CLIENTS_ALL=(claude codex opencode kilo grok vscode prime)
+CLIENTS_ALL=(claude codex opencode kilo grok vscode prime omp deepseek reasonix)
 
 # Per-run result rows for the matrix (RESULT=/SKIP= lines), filled in this shell.
 RESULT_ROWS=()
@@ -74,6 +74,9 @@ payload_file() {
     kilo)     printf '%s' "$REPO_ROOT/agents/kilo/SKILL.md" ;;
     grok)     printf '%s' "$REPO_ROOT/agents/grok/SKILL.md" ;;
     vscode)   printf '%s' "$REPO_ROOT/agents/vscode/SKILL.md" ;;
+    omp)      printf '%s' "$REPO_ROOT/agents/omp/SKILL.md" ;;
+    deepseek) printf '%s' "$REPO_ROOT/agents/deepseek/SKILL.md" ;;
+    reasonix) printf '%s' "$REPO_ROOT/agents/reasonix/SKILL.md" ;;
     *) return 1 ;;
   esac
 }
@@ -225,6 +228,9 @@ extras_src_dir() {
     kilo)     printf '%s' "$REPO_ROOT/agents/kilo" ;;
     grok)     printf '%s' "$REPO_ROOT/agents/grok" ;;
     vscode)   printf '%s' "$REPO_ROOT/agents/vscode" ;;
+    omp)      printf '%s' "$REPO_ROOT/agents/omp" ;;
+    deepseek) printf '%s' "$REPO_ROOT/agents/deepseek" ;;
+    reasonix) printf '%s' "$REPO_ROOT/agents/reasonix" ;;
     *)        printf '%s' "" ;;
   esac
 }
@@ -242,9 +248,165 @@ extras_skill_dir() {
 extras_agents_dir() {
   local client="$1"
   case "$client" in
-    claude|vscode) autoprompt_native_agents_root "$client" ;;
+    claude|vscode|omp) autoprompt_native_agents_root "$client" ;;
     *)      printf '%s' "" ;;
   esac
+}
+
+verify_deepseek_activation() {
+  local root source target file
+  root="$(config_root deepseek)"
+  source="$(extras_skill_dir deepseek)/agent-preset"
+  target="$root/.agent-presets/autoprompt"
+  for file in agent.cordis.yml preset.yml; do
+    [ -f "$source/$file" ] && [ -f "$target/$file" ] &&
+      cmp -s "$source/$file" "$target/$file" || return 1
+  done
+}
+
+install_deepseek_activation() {
+  local root source target file code
+  root="$(config_root deepseek)"
+  source="$(extras_skill_dir deepseek)/agent-preset"
+  target="$root/.agent-presets/autoprompt"
+  for file in agent.cordis.yml preset.yml; do
+    [ -f "$source/$file" ] || return 1
+    _idem_install_managed_file "$root" "$source/$file" "$target/$file" 1
+    code=$?; [ "$code" -eq 0 ] || return "$code"
+  done
+  verify_deepseek_activation
+}
+
+harness_provider_config_helper() {
+  printf '%s' "$REPO_ROOT/scripts/harness-provider-config.cjs"
+}
+
+harness_provider_config_file() {
+  local provider="$1" root
+  root="$(config_root "$provider")"
+  case "$provider" in
+    omp) printf '%s' "$root/config.yml" ;;
+    reasonix) printf '%s' "$root/config.toml" ;;
+    *) return 1 ;;
+  esac
+}
+
+harness_provider_config_key() {
+  case "$1" in
+    omp) printf '%s' 'task.maxRecursionDepth' ;;
+    reasonix) printf '%s' 'agent.max_subagent_depth' ;;
+    *) return 1 ;;
+  esac
+}
+
+verify_harness_provider_depth() {
+  local provider="$1" helper file
+  helper="$(harness_provider_config_helper)"
+  file="$(harness_provider_config_file "$provider")" || return 1
+  command -v node >/dev/null 2>&1 && [ -f "$helper" ] &&
+    node "$helper" inspect --provider "$provider" --file "$file" \
+      --minimum 4 >/dev/null
+}
+
+install_harness_provider_depth() {
+  local provider="$1" root helper file key backup stage desired original record code
+  local prior packed edit_file rest edit_key edit_prior existing=0 separator=$'\037'
+  root="$(config_root "$provider")"
+  helper="$(harness_provider_config_helper)"
+  file="$(harness_provider_config_file "$provider")" || return 98
+  key="$(harness_provider_config_key "$provider")" || return 98
+  backup="$file$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX"
+  command -v node >/dev/null 2>&1 && [ -f "$helper" ] || return 98
+  stage="$(mktemp -d 2>/dev/null)" || return 98
+  desired="$stage/desired"; original="$stage/original"
+  record="$(node "$helper" plan --provider "$provider" --file "$file" \
+    --desired "$desired" --original "$original" --minimum 4)"
+  code=$?
+  if [ "$code" -ne 0 ]; then
+    rm -rf -- "$stage" 2>/dev/null
+    return 98
+  fi
+  case "$record" in
+    status=noop*)
+      rm -rf -- "$stage" 2>/dev/null
+      verify_harness_provider_depth "$provider"
+      return $?
+      ;;
+    status=applied*)
+      prior="${record#* prior=}"; prior="${prior%% *}"
+      ;;
+    *)
+      rm -rf -- "$stage" 2>/dev/null
+      return 98
+      ;;
+  esac
+  for packed in "${AUTOPROMPT_RECEIPT_EDITS[@]:-}"; do
+    [ -n "$packed" ] || continue
+    edit_file="${packed%%$separator*}"; rest="${packed#*$separator}"
+    edit_key="${rest%%$separator*}"; rest="${rest#*$separator}"
+    edit_prior="${rest#*$separator}"
+    if _idem_paths_equal "$edit_file" "$file" && [ "$edit_key" = "$key" ]; then
+      existing=$((existing + 1))
+      [ "$edit_prior" = "$AUTOPROMPT_RECEIPT_ABSENT" ] || prior="$edit_prior"
+    fi
+  done
+  if [ "$existing" -gt 1 ] ||
+     { [ "$existing" -eq 1 ] && [ "$prior" != absent-file ] && [ ! -f "$backup" ]; }; then
+    rm -rf -- "$stage" 2>/dev/null
+    return 98
+  fi
+  if [ ! -f "$backup" ] && [ -f "$original" ]; then
+    _idem_install_managed_file "$root" "$original" "$backup" 1 0 0
+    code=$?
+    if [ "$code" -ne 0 ]; then
+      rm -rf -- "$stage" 2>/dev/null
+      return "$code"
+    fi
+  fi
+  _idem_install_managed_file "$root" "$desired" "$file" 1 0 1
+  code=$?
+  if [ "$code" -ne 0 ]; then
+    rm -rf -- "$stage" 2>/dev/null
+    return "$code"
+  fi
+  if [ "$existing" -eq 0 ]; then
+    AUTOPROMPT_RECEIPT_EDITS+=(
+      "$file$separator$key${separator}4$separator$prior"
+    )
+  fi
+  [ ! -f "$backup" ] || AUTOPROMPT_CONFIGEDIT_LAST_BACKUP="$backup"
+  rm -rf -- "$stage" 2>/dev/null
+  verify_harness_provider_depth "$provider"
+}
+
+verify_reasonix_activation() {
+  local root source profile name target count=0
+  root="$(config_root reasonix)"
+  source="$(extras_skill_dir reasonix)/skills"
+  for profile in "$source"/ap-*/SKILL.md; do
+    [ -f "$profile" ] || continue
+    count=$((count + 1))
+    name="${profile%/SKILL.md}"; name="${name##*/}"
+    target="$root/skills/$name/SKILL.md"
+    [ -f "$target" ] && cmp -s "$profile" "$target" || return 1
+  done
+  [ "$count" -eq 25 ]
+}
+
+install_reasonix_activation() {
+  local root source profile name target count=0 code
+  root="$(config_root reasonix)"
+  source="$(extras_skill_dir reasonix)/skills"
+  for profile in "$source"/ap-*/SKILL.md; do
+    [ -f "$profile" ] || continue
+    count=$((count + 1))
+    name="${profile%/SKILL.md}"; name="${name##*/}"
+    target="$root/skills/$name/SKILL.md"
+    _idem_install_managed_file "$root" "$profile" "$target" 1
+    code=$?; [ "$code" -eq 0 ] || return "$code"
+  done
+  [ "$count" -eq 25 ] && verify_reasonix_activation &&
+    install_harness_provider_depth reasonix
 }
 
 verify_vscode_activation() {
@@ -604,7 +766,7 @@ install_opencode_activation() {
 canonical_legacy_path() {
   local value="$1"
   if command -v cygpath >/dev/null 2>&1; then
-    cygpath -am -- "$value" 2>/dev/null | tr '[:upper:]' '[:lower:]'
+    cygpath -alm -- "$value" 2>/dev/null | tr '[:upper:]' '[:lower:]'
     return ${PIPESTATUS[0]}
   fi
   value="${value//\\//}"
@@ -1056,6 +1218,21 @@ _landing_activate_client() {
       "Autoprompt install ($client): activation-missing; settings were not changed."
     return 1
   fi
+  if [ "$client" = omp ] && ! install_harness_provider_depth omp; then
+    _landing_fail "$client" activation-missing \
+      "Autoprompt install ($client): required task recursion depth could not be configured."
+    return 1
+  fi
+  if [ "$client" = deepseek ] && ! install_deepseek_activation; then
+    _landing_fail "$client" agents \
+      "Autoprompt install ($client): native agent preset landing failed."
+    return 1
+  fi
+  if [ "$client" = reasonix ] && ! install_reasonix_activation; then
+    _landing_fail "$client" agents \
+      "Autoprompt install ($client): native subagent profile landing failed."
+    return 1
+  fi
 }
 
 _landing_verify() {
@@ -1097,6 +1274,18 @@ install_landing() {
   _landing_install_extras "$client" "$root" "$extras_source" || return 1
   _landing_activate_client "$client" || return 1
   _landing_verify "$client" verify_record || return 1
+  if [ "$client" = omp ]; then
+    AUTOPROMPT_RECEIPT_OMP_MANAGED=1
+  fi
+  if [ "$client" = omp ] && [ -n "${PI_CODING_AGENT_DIR:-}" ] &&
+     ! autoprompt_install_root_override_present; then
+    autoprompt_omp_profile >/dev/null
+    local omp_profile_status=$?
+    if [ "$omp_profile_status" -eq 1 ]; then
+      AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT="$(autoprompt_omp_default_agent_root)" ||
+        return 1
+    fi
+  fi
   _landing_publish_success "$client" "$install_record" "$verify_record"
 }
 
@@ -1143,7 +1332,7 @@ _preflight_client_targets() {
   _preflight_main_target "$client" main_target || return $?
   targets_ref+=("$main_target")
   case "$client" in
-    claude|codex|opencode|kilo|vscode)
+    claude|codex|opencode|kilo|vscode|omp|deepseek|reasonix)
       _preflight_runtime_inventory "$client" inventory || return $?
       private_dir="$(extras_skill_dir "$client")"
       for relative in "${inventory[@]}"; do
@@ -1170,6 +1359,22 @@ _preflight_client_targets() {
     vscode)
       _preflight_append_agent_targets '.md' "$(extras_agents_dir vscode)" inventory "$output_name"
       ;;
+    omp)
+      _preflight_append_agent_targets '.md' "$(extras_agents_dir omp)" inventory "$output_name"
+      ;;
+    deepseek)
+      targets_ref+=(
+        "$(config_root deepseek)/.agent-presets/autoprompt/agent.cordis.yml"
+        "$(config_root deepseek)/.agent-presets/autoprompt/preset.yml"
+      )
+      ;;
+    reasonix)
+      for relative in "${inventory[@]}"; do
+        case "$relative" in
+          skills/ap-*/SKILL.md) targets_ref+=("$(config_root reasonix)/$relative") ;;
+        esac
+      done
+      ;;
   esac
 }
 
@@ -1184,11 +1389,121 @@ _preflight_same_root() {
 
 _preflight_target_identity() {
   local root="$1" target="$2" output_name="$3" normalized comparable_identity
+  local omp_root omp_detached_root omp_profile_status
   _uninstall_lexical_path "$target" normalized || return 1
-  _uninstall_receipt_path_allowed "$root" "$normalized" || return 1
+  if ! _uninstall_receipt_path_allowed \
+      "$root" "$normalized" "${AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT:-}"; then
+    [ -n "${PI_CODING_AGENT_DIR:-}" ] || return 1
+    autoprompt_omp_profile >/dev/null; omp_profile_status=$?
+    [ "$omp_profile_status" -eq 1 ] || return 1
+    omp_root="$(autoprompt_config_root omp)" || return 1
+    _idem_paths_equal "$root" "$omp_root" || return 1
+    omp_detached_root="$(autoprompt_omp_default_agent_root)" || return 1
+    if [ -n "${AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT:-}" ] &&
+       ! _idem_paths_equal \
+         "$AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT" "$omp_detached_root"; then
+      printf '%s\n' \
+        "error=omp-detached-root-drift recorded=$AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT current=$omp_detached_root action=uninstall-first" >&2
+      return 1
+    fi
+    _uninstall_omp_detached_receipt_path_allowed \
+      "$omp_detached_root" "$normalized" || return 1
+  fi
   comparable_identity="$(_idem_comparable_path "$normalized")" || return 1
   [ -n "$comparable_identity" ] || return 1
   printf -v "$output_name" '%s' "$comparable_identity"
+}
+
+# Refuse to reinterpret an existing OMP receipt in either layout direction.
+# Switching between self-contained and detached native agents would broaden or
+# strand receipt authority and leave the old layout's live files behind.
+_preflight_receipt_owns_self_contained_omp_agents() {
+  local root="$1" owned normalized parent basename packed edit_file rest edit_key
+  local recorded_hash expected_hash source separator=$'\037'
+  local -a root_agents=()
+  for owned in "${AUTOPROMPT_RECEIPT_FILES[@]:-}"; do
+    normalized="${owned//\\//}"
+    parent="${normalized%/*}"
+    basename="${normalized##*/}"
+    _idem_paths_equal "$parent" "$root/agents" || continue
+    case "$basename" in ap-*.md) root_agents+=("$owned") ;; esac
+  done
+  [ "${#root_agents[@]}" -gt 0 ] || return 1
+
+  # The same root-local agent names can be owned by Claude.  An OMP activation
+  # edit is provider-specific receipt evidence even when the agent payload was
+  # later refreshed by another client sharing the root.
+  for packed in "${AUTOPROMPT_RECEIPT_EDITS[@]:-}"; do
+    [ -n "$packed" ] || continue
+    edit_file="${packed%%$separator*}"
+    rest="${packed#*$separator}"
+    edit_key="${rest%%$separator*}"
+    if _idem_paths_equal "$edit_file" "$root/config.yml" &&
+       [ "$edit_key" = task.maxRecursionDepth ]; then
+      return 0
+    fi
+  done
+
+  # A pre-existing desired depth is a no-op and therefore has no config edit.
+  # In that case, require the receipt manifest to fingerprint a root-local file
+  # as the OMP payload rather than treating every client's ap-*.md as OMP-owned.
+  for owned in "${root_agents[@]}"; do
+    normalized="${owned//\\//}"
+    basename="${normalized##*/}"
+    source="$REPO_ROOT/agents/omp/agents/$basename"
+    [ -f "$source" ] || continue
+    recorded_hash=""
+    _idem_read_manifest_hash "$root" "$owned" recorded_hash || continue
+    [ -n "$recorded_hash" ] || continue
+    expected_hash="$(_idem_sha256 "$source")" || continue
+    [ "$recorded_hash" = "$expected_hash" ] && return 0
+  done
+  return 1
+}
+
+_preflight_omp_detached_layout() {
+  local root="$1" client profile_status current_detached_root=""
+  shift
+  for client in "$@"; do
+    [ "$client" = omp ] || continue
+    _preflight_same_root "$(config_root omp)" "$root" || continue
+    if [ -n "${PI_CODING_AGENT_DIR:-}" ] &&
+       ! autoprompt_install_root_override_present; then
+      autoprompt_omp_profile >/dev/null
+      profile_status=$?
+      case "$profile_status" in
+        1)
+          current_detached_root="$(autoprompt_omp_default_agent_root)" ||
+            return 1
+          ;;
+        0) current_detached_root="" ;;
+        *) return "$profile_status" ;;
+      esac
+    fi
+    if [ -n "${AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT:-}" ] &&
+       { [ -z "$current_detached_root" ] ||
+         ! _idem_paths_equal \
+           "$AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT" "$current_detached_root"; }; then
+      printf '%s\n' \
+        "error=omp-detached-root-layout-transition recorded=$AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT current=${current_detached_root:-self-contained} action=uninstall-first" >&2
+      return 1
+    fi
+    if [ -z "${AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT:-}" ] &&
+       [ -n "$current_detached_root" ]; then
+      if [ "${AUTOPROMPT_RECEIPT_OMP_MANAGED:-0}" -eq 1 ]; then
+        :
+      elif [ "${AUTOPROMPT_RECEIPT_HAS_OMP_MANAGED:-0}" -eq 1 ]; then
+        return 0
+      elif ! _preflight_receipt_owns_self_contained_omp_agents "$root"; then
+        return 0
+      fi
+      printf '%s\n' \
+        "error=omp-detached-root-layout-transition recorded=<self-contained> current=$current_detached_root action=uninstall-first" >&2
+      return 1
+    fi
+    return 0
+  done
+  return 0
 }
 
 preflight_root_exact_targets() {
@@ -1201,6 +1516,7 @@ preflight_root_exact_targets() {
   collision_client_ref=""
   collision_target_ref=""
   shift 3
+  _preflight_omp_detached_layout "$root" "$@" || return 44
   for client in "$@"; do
     _preflight_same_root "$(config_root "$client")" "$root" || continue
     _preflight_client_targets "$client" client_targets
@@ -1249,6 +1565,9 @@ preseed_root() {
   local root="$1"
   AUTOPROMPT_RECEIPT_FILES=(); AUTOPROMPT_RECEIPT_EDITS=()
   AUTOPROMPT_RECEIPT_CREATED_DIRECTORIES=()
+  AUTOPROMPT_RECEIPT_OMP_MANAGED=0
+  AUTOPROMPT_RECEIPT_HAS_OMP_MANAGED=0
+  AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT=""
   AUTOPROMPT_CONFIGEDIT_LAST_BACKUP="none"
   if [ -f "$root/$AUTOPROMPT_RECEIPT_NAME" ]; then
     _uninstall_read_receipt "$root" || return $?
@@ -1270,6 +1589,9 @@ preseed_root() {
     [ "${UNINSTALL_RC_EDIT_PRIOR_ISNULL[i]}" -eq 1 ] && prior="$AUTOPROMPT_RECEIPT_ABSENT"
     AUTOPROMPT_RECEIPT_EDITS+=("${UNINSTALL_RC_EDIT_FILE[i]}$us${UNINSTALL_RC_EDIT_KEY[i]}$us${UNINSTALL_RC_EDIT_VALUE[i]}$us$prior")
   done
+  AUTOPROMPT_RECEIPT_OMP_MANAGED="${UNINSTALL_RC_OMP_MANAGED:-0}"
+  AUTOPROMPT_RECEIPT_HAS_OMP_MANAGED="${UNINSTALL_RC_HAS_OMP_MANAGED:-0}"
+  AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT="${UNINSTALL_RC_OMP_DETACHED_ROOT:-}"
   [ -n "${UNINSTALL_RC_BACKUP:-}" ] && AUTOPROMPT_CONFIGEDIT_LAST_BACKUP="$UNINSTALL_RC_BACKUP"
   return 0
 }

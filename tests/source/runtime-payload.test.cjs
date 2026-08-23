@@ -32,13 +32,15 @@ test('committed runtime manifests match every provider source file', () => {
   assert.match(completed.stdout, /runtime manifests are current/)
 })
 
-test('all seven public provider payloads contain the complete product', () => {
+test('all ten public provider payloads contain the complete product', () => {
   const contract = require('../../agents/contracts/autoprompt.contract.json')
   assert.equal(contract.personas.length, 25)
   assert.equal(contract.frameworks.length, 18)
 
   const manifests = renderManifests(ROOT)
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode']) {
+  for (const provider of [
+    'claude', 'codex', 'opencode', 'kilo', 'vscode', 'omp', 'deepseek', 'reasonix',
+  ]) {
     const manifest = manifests.get(`agents/manifests/${provider}-runtime.json`)
     assert.ok(manifest.files.includes('GATES.md'))
     assert.ok(manifest.files.includes('MODES.md'))
@@ -53,6 +55,9 @@ test('all seven public provider payloads contain the complete product', () => {
   const kilo = manifests.get('agents/manifests/kilo-runtime.json')
   const vscode = manifests.get('agents/manifests/vscode-runtime.json')
   const prime = manifests.get('agents/manifests/prime-runtime.json')
+  const omp = manifests.get('agents/manifests/omp-runtime.json')
+  const deepseek = manifests.get('agents/manifests/deepseek-runtime.json')
+  const reasonix = manifests.get('agents/manifests/reasonix-runtime.json')
   assert.equal(claude.files.filter(file => /^agents\/ap-.*\.md$/.test(file)).length, 25)
   assert.equal(codex.files.filter(file => /^agents\/ap-.*\.toml$/.test(file)).length, 25)
   assert.equal(opencode.files.filter(file => /^agents\/ap-.*\.md$/.test(file)).length, 25)
@@ -60,6 +65,9 @@ test('all seven public provider payloads contain the complete product', () => {
   assert.equal(vscode.files.filter(file => /^agents\/ap-.*\.agent\.md$/.test(file)).length, 25)
   assert.equal(prime.files.filter(file => /^personas\/ap-.*\.md$/.test(file)).length, 25)
   assert.equal(prime.files.filter(file => /^prompts\/frameworks\/.*\.md$/.test(file)).length, 18)
+  assert.equal(omp.files.filter(file => /^agents\/ap-.*\.md$/.test(file)).length, 25)
+  assert.equal(deepseek.files.filter(file => /^agents\/ap-.*\.md$/.test(file)).length, 25)
+  assert.equal(reasonix.files.filter(file => /^skills\/ap-.*\/SKILL\.md$/.test(file)).length, 25)
   assert.ok(claude.files.includes('workflow/autoprompt-gate.js'))
   assert.ok(codex.files.includes('workflow/codex-agent-casting.js'))
   assert.ok(opencode.files.includes('autoprompt.opencode.json'))
@@ -73,11 +81,18 @@ test('all seven public provider payloads contain the complete product', () => {
   assert.ok(prime.files.includes('skills/autoprompt/SKILL.md'))
   assert.ok(prime.files.includes('skills/autoprompt/pyproject.toml'))
   assert.ok(prime.files.includes('skills/autoprompt/src/autoprompt/__init__.py'))
+  assert.ok(omp.files.includes('README.md'))
+  assert.ok(deepseek.files.includes('agent-preset/agent.cordis.yml'))
+  assert.ok(deepseek.files.includes('agent-preset/preset.yml'))
+  assert.ok(reasonix.files.includes('README.md'))
   assert.equal(prime.files.length, 48)
 })
 
 test('each provider installs and verifies as a complete isolated payload', () => {
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime']) {
+  for (const provider of [
+    'claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime',
+    'omp', 'deepseek', 'reasonix',
+  ]) {
     const destination = temporaryDirectory(`autoprompt-${provider}-`)
     try {
       const installed = installPayload(provider, destination, ROOT)

@@ -8,8 +8,8 @@
 
 <p align="center">
   <a href="#نتائج-الاختبار-المعياري"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20%D9%86%D9%82%D8%B7%D8%A9-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1: تحسن 14.61 نقطة"/></a>
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%D8%A7%D9%84%D8%A5%D8%B5%D8%AF%D8%A7%D8%B1&color=255C60&labelColor=14101F" alt="الإصدار v1.0.2"/></a>
-  <a href="#التثبيت"><img src="https://img.shields.io/badge/%D8%A7%D9%84%D8%AF%D8%B9%D9%85-6%20%D9%85%D8%B6%D9%8A%D9%81%D9%8A%D9%86%20%D9%85%D8%AF%D8%B9%D9%88%D9%85%D9%8A%D9%86-255C60?style=flat-square&labelColor=14101F" alt="دعم ستة مضيفين"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%D8%A7%D9%84%D8%A5%D8%B5%D8%AF%D8%A7%D8%B1&color=255C60&labelColor=14101F" alt="الإصدار v1.0.4"/></a>
+  <a href="#التثبيت"><img src="https://img.shields.io/badge/%D8%A7%D9%84%D8%AF%D8%B9%D9%85-9%20%D9%85%D8%B6%D9%8A%D9%81%D9%8A%D9%86%20%D9%85%D8%AF%D8%B9%D9%88%D9%85%D9%8A%D9%86-255C60?style=flat-square&labelColor=14101F" alt="دعم تسعة مضيفين"/></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/%D8%A7%D9%84%D8%AA%D8%B1%D8%AE%D9%8A%D8%B5-MIT-255C60?style=flat-square&labelColor=14101F" alt="ترخيص MIT"/></a>
 </p>
 
@@ -27,7 +27,7 @@
 
 ## التثبيت
 
-استخدم CLI أدناه أو نزل أحد المثبتات من [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.2).
+استخدم CLI أدناه أو نزل أحد المثبتات من [GitHub Releases](https://github.com/Spielewoy/autoprompt-skill/releases/tag/v1.0.4).
 
 ### 1. تثبيت CLI
 
@@ -77,6 +77,9 @@ autoprompt
 | يعمل | [Grok Build](https://github.com/xai-org/grok-build) | 1.0.0+؛ تم التحقق من المصدر 1.0.5؛ محول إرسال مختوم | `grok` |
 | يعمل | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+؛ تم تدقيق 1.133.0 مع Copilot 0.61.0 | `vscode` |
 | يعمل | [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 0.7.2؛ تم تدقيق 0.7.2؛ محول حزمة أصلي | `prime` |
+| يعمل | [Oh My Pi](https://omp.sh/) | 17.4.0+؛ تم التحقق من عقد الموائم ودورة التثبيت وحمولة الدور الأصلية على 17.4.0 | `omp` |
+| يعمل | [DeepSeek Harness](https://deepseek.com/harness/en/) | 0.1.0-rc.7+؛ تم التحقق من عقد الموائم ودورة التثبيت وحمولة الدور الأصلية على 0.1.0-rc.7 | `deepseek` |
+| يعمل | [Reasonix](https://reasonix.io/docs/) | 1.30.0+؛ تم التحقق من عقد الموائم ودورة التثبيت وحمولة الدور الأصلية على 1.30.0 | `reasonix` |
 
 راجع [ملاحظات الدعم والتدقيق](../faq/which-coding-agents-are-supported.md).
 
@@ -131,10 +134,10 @@ autoprompt
 
 استخدم `mode=` لتحديد التوازي. واستخدم `agents=` لتوجيه النماذج عندما يدعم المضيف ذلك.
 
-| التحكم | Claude Code | Codex | OpenCode | Kilo | Grok Build | VS Code | Prime Agent |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| التوجيه المخصص عبر `agents=` | ✓ | ✓ | ✕ غير متاح - يرث النموذج النشط | ✕ غير متاح - يرث النموذج النشط | ✕ غير متاح - يرث نموذج التشغيل | ✕ غير متاح - يرث النموذج النشط | ✕ غير متاح - يرث النموذج الأب المحدد |
+| التحكم | Claude Code | Codex | OpenCode | Kilo | Grok Build | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| التوجيه المخصص عبر `agents=` | ✓ | ✓ | ✕ غير متاح - يرث النموذج النشط | ✕ غير متاح - يرث النموذج النشط | ✕ غير متاح - يرث نموذج التشغيل | ✕ غير متاح - يرث النموذج النشط | ✕ غير متاح - يرث النموذج الأب المحدد | ✕ غير متاح - يرث النموذج الأب المحدد | ✕ غير متاح - يرث النموذج الأب المحدد | ✕ غير متاح - يرث النموذج الأب المحدد |
 
 ## كيف يعمل
 
@@ -157,7 +160,7 @@ autoprompt
 | بحث | `/autoprompt قارن قوائم انتظار المهام لهذا المستودع وأوص بواحدة` |
 | تقييد العمل المتوازي | `/autoprompt mode=custom max_subs=4 انقل جميع النماذج` |
 
-استخدم `$autoprompt` بدلا من `/autoprompt` في Codex.
+استخدم `$autoprompt` بدلا من `/autoprompt` في Codex. في Oh My Pi، استخدم `/skill:autoprompt`.
 
 ## الأسئلة الشائعة
 

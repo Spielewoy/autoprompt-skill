@@ -325,6 +325,49 @@ function renderGrokAgent(persona, source, personaIds) {
   ].join('\n'))
 }
 
+const OMP_TOOL_ALIASES = [
+  ['read', ['Read']],
+  ['write', ['Write']],
+  ['edit', ['Edit']],
+  ['glob', ['Glob']],
+  ['grep', ['Grep']],
+  ['bash', ['Bash']],
+  ['task', ['Agent']],
+  ['web_search', ['WebSearch']],
+  ['browser', ['WebFetch']],
+]
+
+function ompTools(capabilities) {
+  return OMP_TOOL_ALIASES
+    .filter(([, sources]) => sources.some(source => capabilities.includes(source)))
+    .map(([name]) => name)
+}
+
+function renderOmpAgent(persona, source) {
+  const lines = [
+    '---',
+    `name: ${persona.id}`,
+    `description: ${yamlDoubleQuoted(persona.description)}`,
+    'tools:',
+    ...ompTools(persona.capabilities).map(tool => `  - ${tool}`),
+  ]
+  if (persona.allowedChildren.length > 0) {
+    lines.push('spawns:', ...persona.allowedChildren.map(child => `  - ${child}`))
+  }
+  lines.push('---', stripFrontmatter(source))
+  return asciiDashes(lines.join('\n'))
+}
+
+function renderDeepSeekAgent(persona, source) {
+  return asciiDashes([
+    '---',
+    `name: ${persona.id}`,
+    `description: ${yamlDoubleQuoted(persona.description)}`,
+    '---',
+    stripFrontmatter(source),
+  ].join('\n'))
+}
+
 function renderGrokTopology(personas, frameworks) {
   return `${JSON.stringify({
     schemaVersion: 1,
@@ -512,6 +555,227 @@ function renderGrokReadme(provider) {
     'The slot primitives are available on Windows and behave the same way: `link` maps to `CreateHardLinkW`, which needs no elevation on one NTFS volume; `rename` replaces an existing file; and Node opens files with delete sharing, so a concurrent reader does not block either. What Windows adds is transient contention - a scanner or indexer holding a handle surfaces as `EBUSY`, `EPERM`, or `EACCES` - so slot mutations retry briefly before failing, and a root that cannot do exclusive creation at all is refused with a message naming `AUTOPROMPT_GROK_SLOT_ROOT` rather than silently losing the ceiling.',
     '',
     'The slot race is covered by a test that drives real dispatcher processes through the primitives with no shell stub, so it runs wherever Node does, Windows included; the two stub-driven ceiling tests beside it are POSIX-only and say so where they skip. The installer\'s own Windows port is exercised only by the PowerShell lifecycle tests, which run on a Windows host and skip everywhere else, so nothing here reports an untested pass.',
+    '',
+  ].join('\n')
+}
+
+function renderReasonixAgent(persona, source) {
+  return asciiDashes([
+    '---',
+    `name: ${persona.id}`,
+    `description: ${yamlDoubleQuoted(persona.description)}`,
+    'invocation: manual',
+    'runAs: subagent',
+    '---',
+    stripFrontmatter(source),
+  ].join('\n'))
+}
+
+function indentBlock(value, spaces) {
+  const prefix = ' '.repeat(spaces)
+  return value.split('\n').map(line => line ? `${prefix}${line}` : '').join('\n')
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function deepSeekRoleTool(persona, source) {
+  const toolName = persona.id.replaceAll('-', '_')
+  const allowed = new Set(persona.allowedChildren.map(child => child.replaceAll('-', '_')))
+  const allRoleNames = deepSeekRoleTool.personaIds
+  const deniedRoles = allRoleNames.filter(candidate => !allowed.has(candidate))
+  const lines = [
+    `- id: autoprompt-${persona.id}`,
+    "  name: '@deepseek-ai/dsh-tool-subagent'",
+    '  config:',
+    '    provider: spawn',
+    `    toolName: ${toolName}`,
+    '    backgroundMode: continuable',
+    '    maxDepth: 4',
+    '    persona: |-',
+    indentBlock(stripFrontmatter(source).trimEnd(), 6),
+    '    toolFilter:',
+    '      deny:',
+    '        - subagent',
+    '        - subagent_fork',
+    ...deniedRoles.map(role => `        - ${role}`),
+  ]
+  return lines.join('\n')
+}
+deepSeekRoleTool.personaIds = []
+
+function renderDeepSeekPreset(personas, sources) {
+  deepSeekRoleTool.personaIds = personas.map(persona => persona.id.replaceAll('-', '_'))
+  const base = [
+    '# Autoprompt agent preset for DeepSeek Harness 0.1.0-rc.7.',
+    '- id: persona',
+    "  name: '@deepseek-ai/dsh-persona'",
+    '  config:',
+    '    text: >-',
+    '      You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}.',
+    '- id: agent-instructions',
+    "  name: '@deepseek-ai/dsh-agent-instructions'",
+    '  config:',
+    '    maxBytes: 65536',
+    '- id: tool-bash',
+    "  name: '@deepseek-ai/dsh-tool-bash'",
+    "  disabled: !!js process.platform === 'win32'",
+    '- id: tool-pwsh',
+    "  name: '@deepseek-ai/dsh-tool-pwsh'",
+    "  disabled: !!js process.platform !== 'win32'",
+    '- id: tool-fs',
+    "  name: '@deepseek-ai/dsh-tool-fs'",
+    '- id: tool-fs-search',
+    "  name: '@deepseek-ai/dsh-tool-fs-search'",
+    '  config:',
+    '    sampleOverCapGlobResults: false',
+    '- id: tool-jobs',
+    "  name: '@deepseek-ai/dsh-tool-jobs'",
+    '- id: skill-filesystem',
+    "  name: '@deepseek-ai/dsh-skill-filesystem'",
+    '- id: tool-skill',
+    "  name: '@deepseek-ai/dsh-tool-skill'",
+    '- id: tool-goal',
+    "  name: '@deepseek-ai/dsh-tool-goal'",
+    '- id: tool-subagent-control',
+    "  name: '@deepseek-ai/dsh-tool-subagent-control'",
+    '- id: tool-subagent-list-agents',
+    "  name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'",
+    '- id: tool-ask-user',
+    "  name: '@deepseek-ai/dsh-tool-ask-user'",
+    '- id: tool-todo',
+    "  name: '@deepseek-ai/dsh-tool-todo'",
+    '  config:',
+    '    allowParallelInProgress: true',
+    '- id: tool-web',
+    "  name: '@deepseek-ai/dsh-tool-web'",
+    '  config:',
+    '    fetch: false',
+    '    searchTimeoutMs: 60000',
+  ]
+  for (let index = 0; index < personas.length; index += 1) {
+    base.push(deepSeekRoleTool(personas[index], sources[index]))
+  }
+  return `${base.join('\n')}\n`
+}
+
+function renderDeepSeekHeadlessPatch(personas, sources) {
+  deepSeekRoleTool.personaIds = personas.map(persona => persona.id.replaceAll('-', '_'))
+  const entries = personas.map((persona, index) => (
+    indentBlock(deepSeekRoleTool(persona, sources[index]), 2)
+  ))
+  return `# Load with: dsh --profile headless --patch <this-file> <task>\n- insert:\n${entries.join('\n')}\n`
+}
+
+const INHERITED_PROVIDER_TEXT = Object.freeze({
+  omp: Object.freeze({
+    display: 'OMP',
+    invocation: '/skill:autoprompt <mission>',
+    version: '17.4.0',
+    mechanism: 'native markdown subagents with explicit `spawns` allowlists',
+    activation: 'OMP discovers the installed skill and `ap-*` agent files from its agent directory. The native `spawns` lists enforce canonical child edges and OMP enforces the recursion ceiling.',
+    frontmatter: ['user-invocable: true', 'disable-model-invocation: true'],
+  }),
+  deepseek: Object.freeze({
+    display: 'DeepSeek Harness',
+    invocation: '/autoprompt <mission>',
+    version: '0.1.0-rc.7',
+    mechanism: 'fixed-persona `dsh-tool-subagent` instances in the Autoprompt agent preset',
+    activation: 'Select the Autoprompt agent preset for Web sessions. For headless runs, pass the installed `headless.patch.yml` with `--patch`. Each role tool denies non-allowlisted role tools and uses a depth ceiling of four.',
+    frontmatter: ['user-invocable: true', 'disable-model-invocation: true'],
+  }),
+  reasonix: Object.freeze({
+    display: 'Reasonix',
+    invocation: '/autoprompt <mission>',
+    version: '1.30.0',
+    mechanism: 'native manual `runAs: subagent` skill profiles',
+    activation: 'Reasonix discovers the installed top-level skill and `ap-*` subagent profiles from its skill directory. Canonical role prompts define the recursive child edges.',
+    frontmatter: ['invocation: manual'],
+  }),
+})
+
+function inheritedProviderFrontmatter(source, provider) {
+  const settings = INHERITED_PROVIDER_TEXT[provider]
+  return source.replace(
+    /^(---\nname: autoprompt\ndescription: [^\n]+)\n---/,
+    `$1\n${settings.frontmatter.join('\n')}\n---`,
+  )
+}
+
+function renderInheritedProviderText(file, source, provider) {
+  const settings = INHERITED_PROVIDER_TEXT[provider]
+  let output = asciiDashes(source)
+    .replaceAll('OpenCode', settings.display)
+    .replaceAll('opencode', provider)
+    .replaceAll('OPENCODE_CONFIG', `${provider.toUpperCase()}_CONFIG`)
+  if (file === 'SKILL.md') {
+    output = inheritedProviderFrontmatter(output, provider)
+    output = output.replace(
+      'Invoke /autoprompt to turn a mission',
+      `Invoke ${settings.invocation.split(' ')[0]} to turn a mission`,
+    )
+    output = replaceSection(output, `## 8\\. ${escapeRegExp(settings.display)} model and effort`, '## 9\\.', [
+      `## 8. ${settings.display} model and effort`,
+      '',
+      `${settings.display} uses ${settings.mechanism}. Generated roles omit a model override and inherit the selected parent model. Casting and effort are therefore \`inherited-only\`; \`agents=auto\` and explicit model lists are not routable through this adapter.`,
+      '',
+      settings.activation,
+    ].join('\n'))
+    output = replaceSection(output, '## 11\\. Run', '$', [
+      '## 11. Run',
+      '',
+      `Use ${settings.display} ${settings.version} or later and explicitly invoke:`,
+      '',
+      '```text',
+      settings.invocation,
+      '```',
+      '',
+      settings.activation,
+    ].join('\n'))
+  } else if (file === 'MODES.md') {
+    output = replaceSection(output, `### ${escapeRegExp(settings.display)} agent selection and effort`, '## Steering', [
+      `### ${settings.display} agent selection and effort`,
+      '',
+      `${settings.display} casting is \`inherited-only\`: ${settings.mechanism} omit model overrides and inherit the selected parent model.`,
+      '',
+      '- `agents=off` or omitted: the only routable mode; every role inherits the selected model.',
+      '- `agents=auto`, `agents=<comma-list>`, and `agents=auto:<comma-list>`: not routable; record `inherited-only` and never claim a selection applied.',
+      '',
+      'Record effort as exactly `inherited-only`: omit any effort field and never claim a requested or maximum effort was applied.',
+      '',
+      settings.activation,
+    ].join('\n'))
+  } else if (file === 'GATES.md') {
+    output = output.replace(
+      new RegExp(`${escapeRegExp(settings.display)} agent selection is \`inherited-only\`:[\\s\\S]*?Model and effort never change gates or concurrency\\.`),
+      `${settings.display} agent selection is \`inherited-only\`: generated roles omit model overrides and inherit the selected parent model. Model and effort never change gates or concurrency.`,
+    )
+    output = output.replace(
+      /The activation profile pins `subagent_depth = 4`[\s\S]*?These are ceilings, never spawn targets\./,
+      `${settings.activation} Runtime nesting limits are ceilings, never spawn targets.`,
+    )
+  }
+  return output.replace(/\n+$/, '\n')
+}
+
+function renderInheritedProviderReadme(provider) {
+  const settings = INHERITED_PROVIDER_TEXT[provider]
+  return [
+    `# ${settings.display} package`,
+    '',
+    `This package targets ${settings.display} ${settings.version}.`,
+    '',
+    '- [`SKILL.md`](SKILL.md): L0 conductor prompt',
+    provider === 'reasonix'
+      ? '- [`skills`](skills/): 25 native subagent profiles'
+      : '- [`agents`](agents/): 25 generated role definitions',
+    '- [`frameworks`](frameworks/): 18 task and gate workflows',
+    '- [`GATES.md`](GATES.md), [`MODES.md`](MODES.md), and [`PLAYBOOKS.md`](PLAYBOOKS.md): execution contracts',
+    '',
+    settings.activation,
+    '',
+    'Every role inherits the selected parent model. Custom `agents=` model routing is not available.',
     '',
   ].join('\n')
 }
@@ -1113,9 +1377,11 @@ function renderOutputs(root = ROOT) {
   const contract = JSON.parse(read('agents/contracts/autoprompt.contract.json', root))
   const outputs = new Map()
   const personaIds = new Set(contract.personas.map(persona => persona.id))
+  const personaSources = contract.personas.map(persona => read(persona.source, root))
 
-  for (const persona of contract.personas) {
-    const source = read(persona.source, root)
+  for (let index = 0; index < contract.personas.length; index += 1) {
+    const persona = contract.personas[index]
+    const source = personaSources[index]
     outputs.set(`agents/claude/agents/${persona.id}.md`, source)
     outputs.set(`agents/codex/agents/${persona.id}.toml`, renderCodexAgent(persona, source))
     outputs.set(`agents/opencode/agents/${persona.id}.md`, renderOpencodeAgent(persona, source))
@@ -1126,6 +1392,12 @@ function renderOutputs(root = ROOT) {
     )
     outputs.set(`agents/grok/agents/${persona.id}.md`, renderGrokAgent(persona, source, personaIds))
     outputs.set(`agents/prime/personas/${persona.id}.md`, stripFrontmatter(source))
+    outputs.set(`agents/omp/agents/${persona.id}.md`, renderOmpAgent(persona, source))
+    outputs.set(`agents/deepseek/agents/${persona.id}.md`, renderDeepSeekAgent(persona, source))
+    outputs.set(
+      `agents/reasonix/skills/${persona.id}/SKILL.md`,
+      renderReasonixAgent(persona, source),
+    )
   }
   for (const framework of contract.frameworks) {
     const body = read(framework.source, root).replace(/^RUN-NONCE:.*\n+/, '')
@@ -1141,6 +1413,9 @@ function renderOutputs(root = ROOT) {
       '---',
       body,
     ].join('\n'))
+    outputs.set(`agents/omp/frameworks/${framework.id}.md`, asciiDashes(body))
+    outputs.set(`agents/deepseek/frameworks/${framework.id}.md`, asciiDashes(body))
+    outputs.set(`agents/reasonix/frameworks/${framework.id}.md`, asciiDashes(body))
   }
 
   for (const file of ['SKILL.md', 'GATES.md', 'MODES.md', 'PLAYBOOKS.md']) {
@@ -1172,8 +1447,33 @@ function renderOutputs(root = ROOT) {
     renderGrokTopology(contract.personas, contract.frameworks),
   )
 
+  for (const provider of ['omp', 'deepseek', 'reasonix']) {
+    for (const file of ['SKILL.md', 'GATES.md', 'MODES.md', 'PLAYBOOKS.md']) {
+      outputs.set(
+        `agents/${provider}/${file}`,
+        renderInheritedProviderText(file, read(`agents/opencode/${file}`, root), provider),
+      )
+    }
+    outputs.set(`agents/${provider}/README.md`, renderInheritedProviderReadme(provider))
+  }
+  outputs.set(
+    'agents/deepseek/agent-preset/agent.cordis.yml',
+    renderDeepSeekPreset(contract.personas, personaSources),
+  )
+  outputs.set('agents/deepseek/agent-preset/preset.yml', [
+    'name: Autoprompt',
+    'description: Useful-first orchestration with 25 fixed-persona subagent tools.',
+    '',
+  ].join('\n'))
+  outputs.set(
+    'agents/deepseek/headless.patch.yml',
+    renderDeepSeekHeadlessPatch(contract.personas, personaSources),
+  )
+
   const packageVersion = JSON.parse(read('package.json', root)).version
-  for (const provider of ['claude', 'codex', 'opencode', 'kilo', 'vscode', 'grok']) {
+  for (const provider of [
+    'claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'omp', 'deepseek', 'reasonix',
+  ]) {
     outputs.set(`agents/${provider}/VERSION`, `${packageVersion}\n`)
   }
   outputs.set('agents/prime/package.json', renderPrimePackage(contract.providers.prime, packageVersion))
@@ -1236,6 +1536,12 @@ module.exports = {
   renderGrokTopology,
   renderKiloProfile,
   renderKiloProviderText,
+  renderDeepSeekAgent,
+  renderDeepSeekHeadlessPatch,
+  renderDeepSeekPreset,
+  renderInheritedProviderReadme,
+  renderInheritedProviderText,
+  renderOmpAgent,
   renderOpencodeAgent,
   renderOutputs,
   renderPrimeDispatcher,
@@ -1243,6 +1549,7 @@ module.exports = {
   renderPrimePackage,
   renderPrimePyproject,
   renderPrimeSkill,
+  renderReasonixAgent,
   renderVsCodeAgent,
   renderVsCodeProviderText,
   renderVsCodeReadme,

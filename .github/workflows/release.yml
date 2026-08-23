@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish-release:
-    name: Verify and publish release assets
+  verify-release:
+    name: Verify release
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -61,6 +61,30 @@ jobs:
           }
       - name: Run the complete release gate
         run: npm run prepublishOnly
+
+  publish-release:
+    name: Build and publish release assets
+    needs: verify-release
+    # npm pack must run where Git's executable bits are representable.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          check-latest: false
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Set up npm trusted publishing
+        run: npm install --global npm@11.6.3 --ignore-scripts --no-audit --no-fund
+      - name: Verify Linux package metadata
+        run: node --test --test-name-pattern="every npm-packaged bin entrypoint" tests/source/npm-package.test.cjs
       - name: Build release assets
         shell: pwsh
         run: ./scripts/build-release-assets.ps1
@@ -76,7 +100,7 @@ jobs:
             }
             Write-Host "$($package.name)@$($package.version) is already published."
           } else {
-            $archive = Join-Path dist "$($package.name)-$($package.version).tgz"
+            $archive = [IO.Path]::GetFullPath((Join-Path dist "$($package.name)-$($package.version).tgz"))
             & npm publish $archive --ignore-scripts --provenance --access public
             if ($LASTEXITCODE -ne 0) {
               throw "npm publish failed with exit code $LASTEXITCODE."

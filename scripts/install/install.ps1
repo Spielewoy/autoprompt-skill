@@ -33,7 +33,10 @@ if (-not (Test-Path -LiteralPath $Lib -PathType Leaf)) {
 }
 . $Lib
 
-$ClientsAll = @('claude','codex','opencode','kilo','grok','vscode','prime')
+$ClientsAll = @(
+    'claude','codex','opencode','kilo','grok','vscode','prime',
+    'omp','deepseek','reasonix'
+)
 $script:ResultRows = @()
 $script:AnyFail = 0
 $script:IsRecoveryRetained = $false
@@ -68,6 +71,9 @@ function Get-PayloadFile {
         'kilo'     { return (Join-Path $RepoRoot 'agents/kilo/SKILL.md') }
         'grok'     { return (Join-Path $RepoRoot 'agents/grok/SKILL.md') }
         'vscode'   { return (Join-Path $RepoRoot 'agents/vscode/SKILL.md') }
+        'omp'      { return (Join-Path $RepoRoot 'agents/omp/SKILL.md') }
+        'deepseek' { return (Join-Path $RepoRoot 'agents/deepseek/SKILL.md') }
+        'reasonix' { return (Join-Path $RepoRoot 'agents/reasonix/SKILL.md') }
         default    { return $null }
     }
 }
@@ -519,6 +525,9 @@ function Get-ExtrasSrcDir {
         'kilo'     { return (Join-Path $RepoRoot 'agents/kilo') }
         'grok'     { return (Join-Path $RepoRoot 'agents/grok') }
         'vscode'   { return (Join-Path $RepoRoot 'agents/vscode') }
+        'omp'      { return (Join-Path $RepoRoot 'agents/omp') }
+        'deepseek' { return (Join-Path $RepoRoot 'agents/deepseek') }
+        'reasonix' { return (Join-Path $RepoRoot 'agents/reasonix') }
         default    { return '' }
     }
 }
@@ -534,8 +543,228 @@ function Get-ExtrasSkillDir {
 # agents). Empty for codex (its cast stays profile-private).
 function Get-ExtrasAgentsDir {
     param([string]$Client)
-    if ($Client -notin @('claude', 'vscode')) { return '' }
+    if ($Client -notin @('claude', 'vscode', 'omp')) { return '' }
     return (Get-AutopromptNativeAgentsRoot -Name $Client)
+}
+
+function Test-DeepseekActivation {
+    $source = Join-Path (Get-ExtrasSkillDir -Client 'deepseek') 'agent-preset'
+    $target = Join-Path (Get-ConfigRoot -Client 'deepseek') `
+        '.agent-presets/autoprompt'
+    foreach ($file in @('agent.cordis.yml', 'preset.yml')) {
+        $sourceFile = Join-Path $source $file
+        $targetFile = Join-Path $target $file
+        if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $targetFile -PathType Leaf) -or
+            (Get-IdemSha256 -Path $sourceFile) -ne
+            (Get-IdemSha256 -Path $targetFile)) {
+            [Console]::Error.WriteLine(
+                "client=deepseek verify=fail reason=preset-mismatch file=$file"
+            )
+            return 1
+        }
+    }
+    return 0
+}
+
+function Install-DeepseekActivation {
+    $root = Get-ConfigRoot -Client 'deepseek'
+    $source = Join-Path (Get-ExtrasSkillDir -Client 'deepseek') 'agent-preset'
+    $target = Join-Path $root '.agent-presets/autoprompt'
+    $mappings = @('agent.cordis.yml', 'preset.yml') | ForEach-Object {
+        @{
+            Source = Join-Path $source $_
+            Target = Join-Path $target $_
+        }
+    }
+    $journalStart = $script:AutopromptManagedUndoJournal.Count
+    $managedCode = Install-IdemManagedFiles -ConfigRoot $root `
+        -Mappings $mappings -RefuseUnownedTarget
+    if ($managedCode -eq 0 -and (Test-DeepseekActivation) -eq 0) {
+        return 0
+    }
+    Invoke-ManagedRollback -FromIndex $journalStart `
+        -Context '(deepseek)' | Out-Null
+    [Console]::Error.WriteLine(
+        "Autoprompt install (deepseek): native preset landing failed: code=$managedCode"
+    )
+    return 98
+}
+
+function Get-HarnessProviderConfigFile {
+    param([string]$Provider)
+    $root = Get-ConfigRoot -Client $Provider
+    if ($Provider -eq 'omp') { return (Join-Path $root 'config.yml') }
+    if ($Provider -eq 'reasonix') { return (Join-Path $root 'config.toml') }
+    return ''
+}
+
+function Get-HarnessProviderConfigKey {
+    param([string]$Provider)
+    if ($Provider -eq 'omp') { return 'task.maxRecursionDepth' }
+    if ($Provider -eq 'reasonix') { return 'agent.max_subagent_depth' }
+    return ''
+}
+
+function Test-HarnessProviderDepth {
+    param([string]$Provider)
+    $helper = Join-Path $RepoRoot 'scripts/harness-provider-config.cjs'
+    $file = Get-HarnessProviderConfigFile -Provider $Provider
+    if ([string]::IsNullOrEmpty($file) -or
+        -not (Test-Path -LiteralPath $helper -PathType Leaf) -or
+        -not (Get-Command node -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+    & node $helper inspect --provider $Provider --file $file `
+        --minimum 4 *> $null
+    return $LASTEXITCODE -eq 0
+}
+
+function Install-HarnessProviderDepth {
+    param([string]$Provider)
+    $root = Get-ConfigRoot -Client $Provider
+    $file = Get-HarnessProviderConfigFile -Provider $Provider
+    $key = Get-HarnessProviderConfigKey -Provider $Provider
+    $helper = Join-Path $RepoRoot 'scripts/harness-provider-config.cjs'
+    if ([string]::IsNullOrEmpty($file) -or [string]::IsNullOrEmpty($key) -or
+        -not (Test-Path -LiteralPath $helper -PathType Leaf) -or
+        -not (Get-Command node -ErrorAction SilentlyContinue)) {
+        return 98
+    }
+    $stage = Join-Path ([System.IO.Path]::GetTempPath()) `
+        ("autoprompt-harness-config_" + [guid]::NewGuid().ToString('N'))
+    $desired = Join-Path $stage 'desired'
+    $original = Join-Path $stage 'original'
+    try {
+        New-Item -ItemType Directory -Path $stage -Force -ErrorAction Stop | Out-Null
+        $output = @(& node $helper plan --provider $Provider --file $file `
+            --desired $desired --original $original --minimum 4 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            [Console]::Error.WriteLine(($output -join [Environment]::NewLine))
+            return 98
+        }
+        $record = $output -join ' '
+        if ($record -like 'status=noop*') {
+            return $(if (Test-HarnessProviderDepth -Provider $Provider) { 0 } else { 98 })
+        }
+        $priorMatch = [regex]::Match($record, '(?:^| )prior=(\S+)')
+        if ($record -notlike 'status=applied*' -or -not $priorMatch.Success) {
+            return 98
+        }
+        $prior = $priorMatch.Groups[1].Value
+        $existing = @($script:AutopromptReceiptEdits | Where-Object {
+            (Test-IdemPathEqual -Left $_.File -Right $file) -and
+            $_.Key -ceq $key
+        })
+        if ($existing.Count -gt 1) { return 98 }
+        if ($existing.Count -eq 1) {
+            $prior = [string]$existing[0].PriorValue
+        }
+        $backup = "$file$AutopromptConfigEditBackupSuffix"
+        if ($existing.Count -eq 1 -and $prior -cne 'absent-file' -and
+            -not (Test-Path -LiteralPath $backup -PathType Leaf)) {
+            return 98
+        }
+        $mappings = @()
+        if (-not (Test-Path -LiteralPath $backup -PathType Leaf) -and
+            (Test-Path -LiteralPath $original -PathType Leaf)) {
+            $mappings += @{
+                Source = $original; Target = $backup; TrackManaged = $false
+            }
+        }
+        $mappings += @{
+            Source = $desired; Target = $file; TrackManaged = $false
+            AllowUnownedTarget = $true
+        }
+        $managedCode = Install-IdemManagedFiles -ConfigRoot $root `
+            -Mappings $mappings -RefuseUnownedTarget
+        if ($managedCode -ne 0) { return $managedCode }
+        if ($existing.Count -eq 0) {
+            $script:AutopromptReceiptEdits += @{
+                File = $file; Key = $key; Value = '4'; PriorValue = $prior
+            }
+        }
+        if (Test-Path -LiteralPath $backup -PathType Leaf) {
+            $script:AutopromptConfigEditLastBackup = $backup
+        }
+        return $(if (Test-HarnessProviderDepth -Provider $Provider) { 0 } else { 98 })
+    } catch {
+        [Console]::Error.WriteLine(
+            "Autoprompt install ($Provider): recursion configuration failed: " +
+            $_.Exception.Message
+        )
+        return 98
+    } finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force `
+            -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-ReasonixPrivateProfiles {
+    $source = Join-Path (Get-ExtrasSkillDir -Client 'reasonix') 'skills'
+    return @(Get-ChildItem -LiteralPath $source -Filter 'SKILL.md' `
+        -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
+            $_.Directory.Name -like 'ap-*'
+        })
+}
+
+function Test-ReasonixActivation {
+    $profiles = @(Get-ReasonixPrivateProfiles)
+    if ($profiles.Count -ne 25) {
+        [Console]::Error.WriteLine(
+            "client=reasonix verify=fail reason=profile-count " +
+            "found=$($profiles.Count) expected=25"
+        )
+        return 1
+    }
+    $targetRoot = Join-Path (Get-ConfigRoot -Client 'reasonix') 'skills'
+    foreach ($profile in $profiles) {
+        $target = Join-Path (Join-Path $targetRoot $profile.Directory.Name) `
+            'SKILL.md'
+        if (-not (Test-Path -LiteralPath $target -PathType Leaf) -or
+            (Get-IdemSha256 -Path $profile.FullName) -ne
+            (Get-IdemSha256 -Path $target)) {
+            [Console]::Error.WriteLine(
+                "client=reasonix verify=fail reason=profile-mismatch " +
+                "profile=$($profile.Directory.Name)"
+            )
+            return 1
+        }
+    }
+    return 0
+}
+
+function Install-ReasonixActivation {
+    $root = Get-ConfigRoot -Client 'reasonix'
+    $profiles = @(Get-ReasonixPrivateProfiles)
+    if ($profiles.Count -ne 25) {
+        [Console]::Error.WriteLine(
+            "Autoprompt install (reasonix): expected 25 native profiles, " +
+            "found $($profiles.Count)."
+        )
+        return 98
+    }
+    $targetRoot = Join-Path $root 'skills'
+    $mappings = @($profiles | ForEach-Object {
+        @{
+            Source = $_.FullName
+            Target = Join-Path (Join-Path $targetRoot $_.Directory.Name) `
+                'SKILL.md'
+        }
+    })
+    $journalStart = $script:AutopromptManagedUndoJournal.Count
+    $managedCode = Install-IdemManagedFiles -ConfigRoot $root `
+        -Mappings $mappings -RefuseUnownedTarget
+    if ($managedCode -eq 0 -and (Test-ReasonixActivation) -eq 0 -and
+        (Install-HarnessProviderDepth -Provider 'reasonix') -eq 0) {
+        return 0
+    }
+    Invoke-ManagedRollback -FromIndex $journalStart `
+        -Context '(reasonix)' | Out-Null
+    [Console]::Error.WriteLine(
+        "Autoprompt install (reasonix): native profile landing failed: code=$managedCode"
+    )
+    return 98
 }
 
 function Test-VscodeActivation {
@@ -1143,6 +1372,22 @@ function Install-LandingActivation {
             -Message 'Autoprompt install (vscode): activation-missing; settings were not changed.'
         return 1
     }
+    if ($Client -eq 'omp') {
+        if ((Install-HarnessProviderDepth -Provider 'omp') -eq 0) { return 0 }
+        Set-LandingFailure -Client $Client -Stage 'activation-missing' `
+            -Message 'Autoprompt install (omp): required task recursion depth could not be configured.'
+        return 1
+    }
+    if ($Client -eq 'deepseek') {
+        if ((Install-DeepseekActivation) -eq 0) { return 0 }
+        Set-LandingFailure -Client $Client -Stage 'agents'
+        return 1
+    }
+    if ($Client -eq 'reasonix') {
+        if ((Install-ReasonixActivation) -eq 0) { return 0 }
+        Set-LandingFailure -Client $Client -Stage 'agents'
+        return 1
+    }
     if ($Client -notin @('opencode', 'kilo')) { return 0 }
     $pruneCode = if ($Client -eq 'kilo') {
         Remove-StaleKiloAgents
@@ -1188,6 +1433,15 @@ function Install-Landing {
         Set-LandingFailure -Client $Client -Stage 'verify' -Message `
             "Autoprompt install ($Client): post-install verify failed (see above)."
         return
+    }
+    if ($Client -ceq 'omp') {
+        $script:AutopromptReceiptOmpManaged = $true
+    }
+    if ($Client -ceq 'omp' -and $env:PI_CODING_AGENT_DIR -and
+        -not (Test-AutopromptInstallRootOverridePresent) -and
+        [string]::IsNullOrEmpty((Get-AutopromptOmpProfile))) {
+        $script:AutopromptReceiptOmpDetachedRoot =
+            Get-AutopromptOmpDefaultAgentRoot
     }
     $landed = ($verify.Record -replace '^client=\S+ verify=pass dest=', '') `
         -replace ' format=\S+$', ''
@@ -1300,6 +1554,31 @@ function Get-VscodeActivationTargetPlan {
         ForEach-Object { Join-Path $agentsDirectory (Split-Path -Leaf $_) })
 }
 
+function Get-OmpActivationTargetPlan {
+    $agentsDirectory = Get-ExtrasAgentsDir -Client 'omp'
+    return @(Get-RuntimeInventory -Client 'omp' |
+        Where-Object { $_ -clike 'agents/ap-*.md' } |
+        ForEach-Object { Join-Path $agentsDirectory (Split-Path -Leaf $_) })
+}
+
+function Get-DeepseekActivationTargetPlan {
+    $directory = Join-Path (Get-ConfigRoot -Client 'deepseek') `
+        '.agent-presets/autoprompt'
+    return @(
+        Join-Path $directory 'agent.cordis.yml'
+        Join-Path $directory 'preset.yml'
+    )
+}
+
+function Get-ReasonixActivationTargetPlan {
+    $root = Get-ConfigRoot -Client 'reasonix'
+    return @(Get-RuntimeInventory -Client 'reasonix' |
+        Where-Object { $_ -clike 'skills/ap-*/SKILL.md' } |
+        ForEach-Object {
+            Join-Path $root ($_ -replace '/', [IO.Path]::DirectorySeparatorChar)
+        })
+}
+
 function Get-ClientInstallTargetPlan {
     param([string]$Client)
     $targets = @(Get-ResolvedInstallTarget -Client $Client)
@@ -1311,6 +1590,9 @@ function Get-ClientInstallTargetPlan {
         'kilo' { $targets += @(Get-KiloActivationTargetPlan) }
         'grok' { $targets += @(Get-GrokActivationTargetPlan) }
         'vscode' { $targets += @(Get-VscodeActivationTargetPlan) }
+        'omp' { $targets += @(Get-OmpActivationTargetPlan) }
+        'deepseek' { $targets += @(Get-DeepseekActivationTargetPlan) }
+        'reasonix' { $targets += @(Get-ReasonixActivationTargetPlan) }
     }
     return $targets
 }
@@ -1352,7 +1634,8 @@ function Test-RootInstallTargetEntries {
     foreach ($entry in $Entries) {
         $identity = Get-IdemNormalizedPath -Path $entry.Target
         if ([string]::IsNullOrEmpty($identity) -or
-            -not (Test-UninstallReceiptPathAllowed -Path $identity -Root $Root) -or
+            -not (Test-AutopromptManagedInstallPathAllowed `
+                -Path $identity -Root $Root) -or
             -not $identities.Add($identity)) {
             return @{ Code = 44; Client = ''; Target = '' }
         }
@@ -1415,6 +1698,15 @@ function Set-RootReceiptAccumulators {
     $script:AutopromptReceiptFiles = @($files)
     $script:AutopromptReceiptCreatedDirectories = @($directories)
     $script:AutopromptReceiptEdits = @($edits)
+    $script:AutopromptReceiptOmpManaged = $null -ne $Receipt -and
+        [bool]$Receipt.OmpManaged
+    $script:AutopromptReceiptHasOmpManaged = $null -ne $Receipt -and
+        [bool]$Receipt.HasOmpManaged
+    $script:AutopromptReceiptOmpDetachedRoot = if ($null -eq $Receipt) {
+        ''
+    } else {
+        [string]$Receipt.OmpDetachedRoot
+    }
     $script:AutopromptConfigEditLastBackup = $backup
     $script:AutopromptManagedUndoJournal = @()
     $script:AutopromptRootReceiptState = $Receipt
@@ -1431,6 +1723,94 @@ function Initialize-RootOwnershipState {
         $receipt = Get-LegacyCodexOwnershipState -Root $Root
     }
     return Set-RootReceiptAccumulators -Receipt $receipt
+}
+
+function Test-RootReceiptOwnsSelfContainedOmp {
+    param([string]$Root, [string[]]$LocalAgentFiles)
+    $config = Join-Path $Root 'config.yml'
+    foreach ($edit in @($script:AutopromptReceiptEdits)) {
+        if ($edit.Key -ceq 'task.maxRecursionDepth' -and
+            (Test-IdemPathEqual -Left $edit.File -Right $config)) {
+            return $true
+        }
+    }
+    foreach ($file in @($LocalAgentFiles)) {
+        $source = Join-Path (Join-Path $RepoRoot 'agents/omp/agents') `
+            (Split-Path -Leaf $file)
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
+        try {
+            $recordedHash = Get-IdemManifestHash -ConfigRoot $Root -Key $file
+        } catch {
+            continue
+        }
+        $sourceHash = Get-IdemSha256 -Path $source
+        if ($sourceHash -is [string] -and $recordedHash -ceq $sourceHash) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-RootOmpDetachedLayoutCompatible {
+    param([string]$Root, [string[]]$Clients)
+    if (@(Get-ClientsForRoot -Root $Root -Clients $Clients) -notcontains 'omp') {
+        return $true
+    }
+
+    $usesDetachedRoot = $env:PI_CODING_AGENT_DIR -and
+        -not (Test-AutopromptInstallRootOverridePresent) -and
+        [string]::IsNullOrEmpty((Get-AutopromptOmpProfile))
+    $currentDetachedRoot = if ($usesDetachedRoot) {
+        Get-AutopromptOmpDefaultAgentRoot
+    } else {
+        ''
+    }
+    if ([string]::IsNullOrEmpty($script:AutopromptReceiptOmpDetachedRoot)) {
+        if ([string]::IsNullOrEmpty($currentDetachedRoot)) { return $true }
+        if ($script:AutopromptReceiptOmpManaged) {
+            $ownsSelfContainedOmp = $true
+        } elseif ($script:AutopromptReceiptHasOmpManaged) {
+            return $true
+        } else {
+            $ownsSelfContainedOmp = $false
+        }
+        $localAgents = Join-Path $Root 'agents'
+        $localAgentFiles = @($script:AutopromptReceiptFiles | Where-Object {
+            (Split-Path -Leaf $_) -clike 'ap-*.md' -and
+            (Test-IdemPathEqual -Left (Split-Path -Parent $_) `
+                -Right $localAgents)
+        })
+        if (-not $ownsSelfContainedOmp -and $localAgentFiles.Count -gt 0) {
+            $ownsSelfContainedOmp = Test-RootReceiptOwnsSelfContainedOmp `
+                -Root $Root -LocalAgentFiles $localAgentFiles
+        }
+        if (-not $ownsSelfContainedOmp) {
+            return $true
+        }
+        [Console]::Error.WriteLine(
+            'error=omp-detached-root-layout-transition ' +
+            'recorded=<self-contained> ' +
+            "current=$currentDetachedRoot action=uninstall-first"
+        )
+        return $false
+    }
+    if (-not [string]::IsNullOrEmpty($currentDetachedRoot) -and
+        (Test-IdemPathEqual -Left $script:AutopromptReceiptOmpDetachedRoot `
+            -Right $currentDetachedRoot)) {
+        return $true
+    }
+
+    $current = if ([string]::IsNullOrEmpty($currentDetachedRoot)) {
+        '<self-contained>'
+    } else {
+        $currentDetachedRoot
+    }
+    [Console]::Error.WriteLine(
+        'error=omp-detached-root-layout-transition ' +
+        "recorded=$script:AutopromptReceiptOmpDetachedRoot " +
+        "current=$current action=uninstall-first"
+    )
+    return $false
 }
 
 function Start-RootTransaction {
@@ -1705,9 +2085,19 @@ function Test-RootReceiptState {
         [string]$Backup,
         [string[]]$Files,
         [string[]]$CreatedDirectories,
+        [bool]$OmpManaged,
+        [string]$OmpDetachedRoot,
         [hashtable[]]$Edits
     )
     if ($null -eq $Prior -or $Prior.Backup -cne $Backup) {
+        return $false
+    }
+    if (-not [bool]$Prior.HasOmpManaged -or
+        -not [bool]$Prior.HasOmpDetachedRoot) {
+        return $false
+    }
+    if ([bool]$Prior.OmpManaged -ne $OmpManaged) { return $false }
+    if ([string]$Prior.OmpDetachedRoot -cne $OmpDetachedRoot) {
         return $false
     }
     if ((Format-ReceiptFilesArray -Files ([string[]]@($Prior.Files))) -cne
@@ -1745,12 +2135,16 @@ function Write-RootReceiptFile {
         (Test-RootReceiptState -Prior $script:AutopromptRootReceiptState `
             -Backup $script:AutopromptConfigEditLastBackup -Files $Files `
             -CreatedDirectories $Directories `
+            -OmpManaged $script:AutopromptReceiptOmpManaged `
+            -OmpDetachedRoot $script:AutopromptReceiptOmpDetachedRoot `
             -Edits ([hashtable[]]$script:AutopromptReceiptEdits))
     if ($isNoop) { return $true }
     $result = Invoke-LibRecord -Call {
         Write-Receipt -ConfigRoot $Root -Nonce (Get-Nonce) `
             -Backup $script:AutopromptConfigEditLastBackup -Files $Files `
             -CreatedDirectories $Directories `
+            -OmpManaged $script:AutopromptReceiptOmpManaged `
+            -OmpDetachedRoot $script:AutopromptReceiptOmpDetachedRoot `
             -Edits $script:AutopromptReceiptEdits
     }
     if ($result.Code -eq 0) { return $true }
@@ -1859,6 +2253,16 @@ function Set-RootTargetPreflightFailed {
 function Get-RootPreflightState {
     param([string]$Root, [string[]]$Clients)
     $ownership = Initialize-RootOwnershipState -Root $Root
+    if (-not (Test-RootOmpDetachedLayoutCompatible -Root $Root `
+        -Clients $Clients)) {
+        return @{
+            Code = 44
+            CollisionClient = ''
+            CollisionTarget = ''
+            Ownership = $ownership
+            Targets = @()
+        }
+    }
     $entries = @(Get-RootInstallTargetEntries -Root $Root -Clients $Clients)
     $plan = Test-RootInstallTargetEntries -Root $Root -Entries $entries
     return @{

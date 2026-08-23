@@ -11,7 +11,7 @@
 #   client=<name> present=<true|false> version=<VERSION>
 #
 #   VERSION in {
-#     SEMVER    a token matching exactly  ^[0-9]+\.[0-9]+\.[0-9]+$
+#     SEMVER    a SemVer token, including optional prerelease/build suffixes
 #     "unknown" present binary, version unparseable (probe failed/hung/no token)
 #     "-"       absent client (no version by definition)
 #   }
@@ -32,16 +32,18 @@ declare -A AUTOPROMPT_CLIENT_BIN=(
   [opencode]=opencode [kilo]=kilo [vscode]=code
   [grok]=grok
   [prime]=prime-agent
+  [omp]=omp [deepseek]=dsh [reasonix]=reasonix
   [dcode]=dcode [gemini]=gemini [cline]=cline [goose]=goose
 )
 AUTOPROMPT_VERSION_FLAG="--version"
 AUTOPROMPT_PROBE_TIMEOUT=10
 
-# Public install compatibility is a closed seven-provider registry. Historical
+# Public install compatibility is a closed ten-provider registry. Historical
 # path resolvers remain below only for receipt-owned cleanup of earlier installs.
 declare -A AUTOPROMPT_PROVIDER_STATUS=(
   [claude]=supported [codex]=supported [opencode]=supported
   [kilo]=supported [vscode]=supported [grok]=supported [prime]=supported
+  [omp]=supported [deepseek]=supported [reasonix]=supported
 )
 declare -A AUTOPROMPT_PROVIDER_BLOCK_REASON=()
 
@@ -135,6 +137,53 @@ test_autoprompt_install_root_contract() {
   AUTOPROMPT_INSTALL_ROOT_CLIENT="$target"
 }
 
+autoprompt_omp_profile() {
+  local raw profile upper
+  if [ "${OMP_PROFILE+x}" = x ]; then
+    raw="$OMP_PROFILE"
+  else
+    raw="${PI_PROFILE-}"
+  fi
+  profile="${raw#"${raw%%[![:space:]]*}"}"
+  profile="${profile%"${profile##*[![:space:]]}"}"
+  [ -n "$profile" ] || return 1
+  [ "$profile" != default ] || return 1
+  if [ "${profile: -1}" = . ] ||
+     ! [[ "$profile" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
+    printf 'error=invalid-omp-profile value=%q\n' "$raw" >&2
+    return 2
+  fi
+  upper="${profile^^}"
+  case "$upper" in
+    CON|CON.*|PRN|PRN.*|AUX|AUX.*|NUL|NUL.*|COM[0-9]|COM[0-9].*|LPT[0-9]|LPT[0-9].*)
+      printf 'error=invalid-omp-profile value=%q\n' "$raw" >&2
+      return 2
+      ;;
+  esac
+  printf '%s' "$profile"
+}
+
+autoprompt_omp_default_agent_root() {
+  local home
+  home="$(resolve_home omp)" || return $?
+  printf '%s/%s/agent' "$home" "${PI_CONFIG_DIR:-.omp}"
+}
+
+autoprompt_omp_install_root() {
+  local home profile profile_status
+  home="$(resolve_home omp)" || return $?
+  profile="$(autoprompt_omp_profile)"; profile_status=$?
+  case "$profile_status" in
+    0)
+      printf '%s/%s/profiles/%s/agent' "$home" "${PI_CONFIG_DIR:-.omp}" "$profile"
+      return
+      ;;
+    1) ;;
+    *) return "$profile_status" ;;
+  esac
+  printf '%s' "${PI_CODING_AGENT_DIR:-$(autoprompt_omp_default_agent_root)}"
+}
+
 autoprompt_config_root() {
   local name="$1" home
   if autoprompt_install_root_override_present; then
@@ -148,6 +197,17 @@ autoprompt_config_root() {
     opencode|kilo) resolve_xdg "$home" ;;
     vibe) printf '%s' "${VIBE_HOME:-$home/.vibe}" ;;
     prime) printf '%s' "${PRIME_AGENT_CODING_AGENT_DIR:-$home/.prime/agent}" ;;
+    omp) autoprompt_omp_install_root ;;
+    deepseek) printf '%s' "${DSH_HOME:-$home/.dsh}" ;;
+    reasonix)
+      if [ -n "${REASONIX_HOME:-}" ]; then
+        printf '%s' "$REASONIX_HOME"
+      elif [ "${OS:-}" = Windows_NT ] || [ -n "${MSYSTEM:-}" ]; then
+        printf '%s/reasonix' "${APPDATA:-$home/AppData/Roaming}"
+      else
+        printf '%s/.reasonix' "$home"
+      fi
+      ;;
     *) printf '%s' "$home" ;;
   esac
 }
@@ -167,6 +227,7 @@ autoprompt_skill_root() {
     kilo) printf '%s/.kilo/skills/autoprompt' "$home" ;;
     grok) printf '%s/skills/autoprompt' "$(autoprompt_config_root grok)" ;;
     vscode) printf '%s/.copilot/skills/autoprompt' "$home" ;;
+    omp|deepseek|reasonix) printf '%s/skills/autoprompt' "$(autoprompt_config_root "$name")" ;;
     *) return 1 ;;
   esac
 }
@@ -176,7 +237,7 @@ autoprompt_runtime_root() {
 }
 
 autoprompt_native_agents_root() {
-  local name="$1" home root
+  local name="$1" home root omp_profile_status
   if autoprompt_install_root_override_present; then
     root="$(_autoprompt_normalized_install_root)" || return 1
     if [ "$name" = codex ]; then
@@ -194,6 +255,22 @@ autoprompt_native_agents_root() {
     kilo) printf '%s/kilo/agents' "$(autoprompt_config_root kilo)" ;;
     grok) printf '%s/agents' "$(autoprompt_skill_root grok)" ;;
     vscode) printf '%s/.copilot/agents' "$home" ;;
+    omp)
+      autoprompt_omp_profile >/dev/null; omp_profile_status=$?
+      case "$omp_profile_status" in
+        0) printf '%s/agents' "$(autoprompt_config_root omp)" ;;
+        1)
+          if [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+            # OMP 17.4.0 still discovers native task agents through PI_CONFIG_DIR
+            # even when PI_CODING_AGENT_DIR relocates skills, settings, and state.
+            printf '%s/agents' "$(autoprompt_omp_default_agent_root)"
+          else
+            printf '%s/agents' "$(autoprompt_config_root omp)"
+          fi
+          ;;
+        *) return "$omp_profile_status" ;;
+      esac
+      ;;
     *) return 1 ;;
   esac
 }
@@ -321,7 +398,8 @@ detect_client() {
   fi
 
   local token
-  token=$(printf '%s\n' "$raw" | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+  token=$(printf '%s\n' "$raw" | head -n 1 | grep -oE \
+    '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?' | head -n 1)
 
   local version
   if [ "$rc" -ne 0 ] || [ -z "$token" ]; then
@@ -342,8 +420,8 @@ detect_client() {
 #
 #   client=<name> dest=<ABSOLUTE-PATH> format=<FORMAT-TOKEN>
 #
-#   FORMAT-TOKEN in { md-yaml, md-codex, mdc, roomodes, gemini-toml,
-#                     md-rules, goose-recipe, md-agents }
+#   FORMAT-TOKEN in { md-yaml, md-claude, md-codex, md-reasonix, mdc,
+#                     roomodes, gemini-toml, md-rules, goose-recipe, md-agents }
 #
 # Channel discipline (mirrors detect_client): RECORD -> stdout; VERDICT -> the
 # integer return (0 resolved, 2 unknown-client / no-such-variant, 3 no-home).
@@ -364,6 +442,9 @@ declare -A AUTOPROMPT_CLIENT_DEST=(
   [kilo]='HOME|.kilo/skills/autoprompt/SKILL.md|md-yaml'
   [grok]='GROK|skills/autoprompt/SKILL.md|md-claude'
   [vscode]='HOME|.copilot/skills/autoprompt/SKILL.md|md-yaml'
+  [omp]='OMP|skills/autoprompt/SKILL.md|md-claude'
+  [deepseek]='DSH|skills/autoprompt/SKILL.md|md-claude'
+  [reasonix]='REASONIX|skills/autoprompt/SKILL.md|md-reasonix'
 )
 
 # Per-client OPTIONAL variants (cursor secondary, goose fallback). Same packed
@@ -442,6 +523,12 @@ resolve_destination() {
     base="${CODEX_HOME:-$home/.codex}"
   elif [ "$relkind" = "GROK" ]; then
     base="${GROK_HOME:-$home/.grok}"
+  elif [ "$relkind" = "OMP" ]; then
+    base="$(autoprompt_config_root omp)"
+  elif [ "$relkind" = "DSH" ]; then
+    base="${DSH_HOME:-$home/.dsh}"
+  elif [ "$relkind" = "REASONIX" ]; then
+    base="$(autoprompt_config_root reasonix)"
   else
     base="$home"
   fi
@@ -500,6 +587,11 @@ _format_md_yaml() {
   if [ "$token" = "md-claude" ]; then
     printf '%s\n' "---" "name: $name" "description: \"$double\"" \
       "disable-model-invocation: true" "user-invocable: true" "---" "" "$body"
+    return
+  fi
+  if [ "$token" = "md-reasonix" ]; then
+    printf '%s\n' "---" "name: $name" "description: \"$double\"" \
+      "invocation: manual" "---" "" "$body"
     return
   fi
   printf '%s\n' "---" "name: $name" "description: \"$double\"" "---" "" "$body"
@@ -614,7 +706,7 @@ format_skill() {
   local format="$1" name="$2" description="$3" body="$4"
 
   case "$format" in
-    md-yaml|md-claude|md-codex|mdc|md-rules|md-agents|gemini-toml|roomodes|goose-recipe) ;;
+    md-yaml|md-claude|md-codex|md-reasonix|mdc|md-rules|md-agents|gemini-toml|roomodes|goose-recipe) ;;
     *)
       printf '%s\n' "format=$format error=unknown-format" >&2
       return 2
@@ -632,7 +724,7 @@ format_skill() {
   fi
 
   case "$format" in
-    md-yaml|md-claude|md-codex|md-rules|md-agents) _format_md_yaml "$format" "$name" "$description" "$body" ;;
+    md-yaml|md-claude|md-codex|md-reasonix|md-rules|md-agents) _format_md_yaml "$format" "$name" "$description" "$body" ;;
     mdc) _format_mdc "$description" "$body" ;;
     gemini-toml) _format_gemini_toml "$description" "$body" ;;
     roomodes) _format_roomodes "$name" "$description" "$body" ;;
@@ -659,32 +751,79 @@ format_skill() {
 # 12 version-below-floor, 13 version-unknown-on-floored, plus delegated
 # 2 unknown-client and 3 no-home. No path returns 0 without all three proven.
 #
-# Version-floor map: Claude >=2.1.219, Cursor >=2.5, and Cline >=3.58.
-# The other clients have no numeric gate.
+# Version floors are compatibility claims, so prerelease suffixes are significant.
 declare -A AUTOPROMPT_VERSION_FLOOR=(
   [claude]=2.1.219 [cursor]=2.5 [cline]=3.58 [opencode]=1.18.7 [kilo]=7.4.22
   [vscode]=1.133.0 [grok]=1.0.0 [prime]=0.7.2
+  [omp]=17.4.0 [deepseek]=0.1.0-rc.7 [reasonix]=1.30.0
 )
 AUTOPROMPT_PRECHECK_MARKER_PREFIX=".autoprompt-precheck"
 
-# _precheck_version_ge <found> <floor>: 0 (true) iff found >= floor by NUMERIC
-# per-segment compare (never lexical: 2.10 >= 2.9). Missing segments zero-pad so a
-# two-segment floor (2.5 => 2.5.0) compares cleanly. "unknown" is never >= a floor.
+# Compare arbitrarily long numeric identifiers without shell-integer overflow.
+# Prints -1, 0, or 1 when left is below, equal to, or above right.
+_precheck_numeric_compare() {
+  local left="$1" right="$2"
+  [[ "$left" =~ ^[0-9]+$ ]] && [[ "$right" =~ ^[0-9]+$ ]] || return 1
+  while [ "${#left}" -gt 1 ] && [ "${left#0}" != "$left" ]; do left="${left#0}"; done
+  while [ "${#right}" -gt 1 ] && [ "${right#0}" != "$right" ]; do right="${right#0}"; done
+  if [ "${#left}" -lt "${#right}" ]; then printf '%s' -1; return 0; fi
+  if [ "${#left}" -gt "${#right}" ]; then printf '%s' 1; return 0; fi
+  if [[ "$left" < "$right" ]]; then printf '%s' -1; return 0; fi
+  if [[ "$left" > "$right" ]]; then printf '%s' 1; return 0; fi
+  printf '%s' 0
+}
+
+# _precheck_version_ge <found> <floor>: SemVer precedence with numeric core
+# segments and standard prerelease identifier ordering. Missing core segments
+# zero-pad so historical two-segment floors still compare cleanly. Build metadata
+# is ignored for precedence. "unknown" and malformed versions never meet a floor.
 _precheck_version_ge() {
   local found="$1" floor="$2"
   [ "$found" = "unknown" ] && return 1
 
+  local found_precedence="${found%%+*}" floor_precedence="${floor%%+*}"
+  local found_core="${found_precedence%%-*}" floor_core="${floor_precedence%%-*}"
+  local found_pre="" floor_pre="" comparison
+  [[ "$found_precedence" == *-* ]] && found_pre="${found_precedence#*-}"
+  [[ "$floor_precedence" == *-* ]] && floor_pre="${floor_precedence#*-}"
+  [[ "$found_core" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+  [[ "$floor_core" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+  [ -z "$found_pre" ] || [[ "$found_pre" =~ ^[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*$ ]] || return 1
+  [ -z "$floor_pre" ] || [[ "$floor_pre" =~ ^[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*$ ]] || return 1
+
   local IFS=.
-  local -a fseg=($found) lseg=($floor)
+  local -a fseg=($found_core) lseg=($floor_core)
   local i count=${#fseg[@]}
   [ "${#lseg[@]}" -gt "$count" ] && count=${#lseg[@]}
-
   for ((i = 0; i < count; i++)); do
-    local f="${fseg[i]:-0}" l="${lseg[i]:-0}"
-    if [ "$f" -gt "$l" ]; then return 0; fi
-    if [ "$f" -lt "$l" ]; then return 1; fi
+    comparison="$(_precheck_numeric_compare "${fseg[i]:-0}" "${lseg[i]:-0}")" || return 1
+    [ "$comparison" -gt 0 ] && return 0
+    [ "$comparison" -lt 0 ] && return 1
   done
-  return 0
+
+  [ -z "$found_pre" ] && [ -z "$floor_pre" ] && return 0
+  [ -z "$found_pre" ] && return 0
+  [ -z "$floor_pre" ] && return 1
+
+  local -a fpre=($found_pre) lpre=($floor_pre)
+  count=${#fpre[@]}
+  [ "${#lpre[@]}" -lt "$count" ] && count=${#lpre[@]}
+  for ((i = 0; i < count; i++)); do
+    if [[ "${fpre[i]}" =~ ^[0-9]+$ ]] && [[ "${lpre[i]}" =~ ^[0-9]+$ ]]; then
+      comparison="$(_precheck_numeric_compare "${fpre[i]}" "${lpre[i]}")" || return 1
+      [ "$comparison" -gt 0 ] && return 0
+      [ "$comparison" -lt 0 ] && return 1
+    elif [[ "${fpre[i]}" =~ ^[0-9]+$ ]]; then
+      return 1
+    elif [[ "${lpre[i]}" =~ ^[0-9]+$ ]]; then
+      return 0
+    elif [[ "${fpre[i]}" < "${lpre[i]}" ]]; then
+      return 1
+    elif [[ "${fpre[i]}" > "${lpre[i]}" ]]; then
+      return 0
+    fi
+  done
+  [ "${#fpre[@]}" -ge "${#lpre[@]}" ]
 }
 
 # _precheck_dir_writable <dir>: 0 iff <dir> is writable OR creatable. Walks up to
@@ -788,7 +927,8 @@ precheck_install() {
 # is written LAST by the orchestrator, so its presence signals install completion.
 #
 # Byte-parity (F-OP-DUALPARITY): the document is built with a FIXED key order
-# (nonce, backup, files, createdDirectories, configEdits), a FIXED 2-space indent,
+# (nonce, backup, files, createdDirectories, ompManaged, ompDetachedRoot,
+# configEdits), a FIXED 2-space indent,
 # '\n'-only newlines, and exactly one trailing '\n'. The .ps1 twin hand-rolls the
 # same serializer so the receipt bytes are byte-identical.
 AUTOPROMPT_RECEIPT_NAME=".autoprompt-install-receipt.json"
@@ -796,6 +936,10 @@ AUTOPROMPT_RECEIPT_NAME=".autoprompt-install-receipt.json"
 AUTOPROMPT_RECEIPT_ABSENT=$'\037__CL_ABSENT__\037'
 [ -n "${AUTOPROMPT_RECEIPT_CREATED_DIRECTORIES+set}" ] ||
   declare -a AUTOPROMPT_RECEIPT_CREATED_DIRECTORIES=()
+[ -n "${AUTOPROMPT_RECEIPT_OMP_MANAGED+set}" ] ||
+  AUTOPROMPT_RECEIPT_OMP_MANAGED=0
+[ -n "${AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT+set}" ] ||
+  AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT=""
 
 # _receipt_json_escape <s> [output-name]: emit or assign the JSON string body
 # (without surrounding quotes), escaping special characters for parser round-trips.
@@ -927,12 +1071,19 @@ write_receipt() {
     [ "$manifest_code" -eq 0 ] || return "$manifest_code"
   fi
 
-  local backupJson escaped_backup escaped_nonce files_json directories_json edits_json
+  local backupJson detachedJson escaped_backup escaped_detached escaped_nonce
+  local files_json directories_json edits_json
   if [ -z "$backup" ] || [ "$backup" = "none" ]; then
     backupJson='null'
   else
     _receipt_json_escape "$backup" escaped_backup
     backupJson="\"$escaped_backup\""
+  fi
+  if [ -z "$AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT" ]; then
+    detachedJson='null'
+  else
+    _receipt_json_escape "$AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT" escaped_detached
+    detachedJson="\"$escaped_detached\""
   fi
 
   local json
@@ -940,8 +1091,11 @@ write_receipt() {
   _receipt_path_array AUTOPROMPT_RECEIPT_FILES files_json
   _receipt_path_array AUTOPROMPT_RECEIPT_CREATED_DIRECTORIES directories_json
   _receipt_edits_array AUTOPROMPT_RECEIPT_EDITS edits_json
-  printf -v json '{\n  "nonce": "%s",\n  "backup": %s,\n  "files": %s,\n  "createdDirectories": %s,\n  "configEdits": %s\n}' \
-    "$escaped_nonce" "$backupJson" "$files_json" "$directories_json" "$edits_json"
+  local omp_managed_json=false
+  [ "$AUTOPROMPT_RECEIPT_OMP_MANAGED" -eq 0 ] || omp_managed_json=true
+  printf -v json '{\n  "nonce": "%s",\n  "backup": %s,\n  "files": %s,\n  "createdDirectories": %s,\n  "ompManaged": %s,\n  "ompDetachedRoot": %s,\n  "configEdits": %s\n}' \
+    "$escaped_nonce" "$backupJson" "$files_json" "$directories_json" \
+    "$omp_managed_json" "$detachedJson" "$edits_json"
 
   local final="$root/$AUTOPROMPT_RECEIPT_NAME"
   local tmp="$final.tmp"
@@ -1618,6 +1772,8 @@ _idem_begin_root_transaction() {
     > "$state/receipt-created-directories"
   printf '%s\0' "${AUTOPROMPT_RECEIPT_EDITS[@]:-}" > "$state/receipt-edits"
   printf '%s' "$AUTOPROMPT_CONFIGEDIT_LAST_BACKUP" > "$state/last-backup"
+  printf '%s' "$AUTOPROMPT_RECEIPT_OMP_MANAGED" > "$state/omp-managed"
+  printf '%s' "$AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT" > "$state/omp-detached-root"
 
   _idem_snapshot_root_path "$root/$AUTOPROMPT_HASH_MANIFEST_NAME" &&
     _idem_snapshot_root_path "$root/$AUTOPROMPT_RECEIPT_NAME" &&
@@ -1672,6 +1828,17 @@ _idem_restore_root_accumulators() {
     [ -n "$owned" ] && AUTOPROMPT_RECEIPT_EDITS+=("$owned")
   done < "$state/receipt-edits"
   AUTOPROMPT_CONFIGEDIT_LAST_BACKUP="$(cat "$state/last-backup")" || return 1
+  if [ -f "$state/omp-managed" ]; then
+    AUTOPROMPT_RECEIPT_OMP_MANAGED="$(cat "$state/omp-managed")" || return 1
+  else
+    AUTOPROMPT_RECEIPT_OMP_MANAGED=0
+  fi
+  if [ -f "$state/omp-detached-root" ]; then
+    AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT="$(cat "$state/omp-detached-root")" ||
+      return 1
+  else
+    AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT=""
+  fi
 }
 
 _idem_clear_root_transaction() {
@@ -1756,6 +1923,8 @@ _idem_new_managed_snapshot() {
     > "$snapshot/receipt-created-directories"
   printf '%s\0' "${AUTOPROMPT_RECEIPT_EDITS[@]:-}" > "$snapshot/receipt-edits"
   printf '%s' "$AUTOPROMPT_CONFIGEDIT_LAST_BACKUP" > "$snapshot/last-backup"
+  printf '%s' "$AUTOPROMPT_RECEIPT_OMP_MANAGED" > "$snapshot/omp-managed"
+  printf '%s' "$AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT" > "$snapshot/omp-detached-root"
   printf '%s' "$snapshot"
 }
 
@@ -1799,6 +1968,16 @@ _idem_restore_managed_snapshot() {
   AUTOPROMPT_RECEIPT_EDITS=()
   while IFS= read -r -d '' owned; do [ -n "$owned" ] && AUTOPROMPT_RECEIPT_EDITS+=("$owned"); done < "$snapshot/receipt-edits"
   AUTOPROMPT_CONFIGEDIT_LAST_BACKUP="$(cat "$snapshot/last-backup")"
+  if [ -f "$snapshot/omp-managed" ]; then
+    AUTOPROMPT_RECEIPT_OMP_MANAGED="$(cat "$snapshot/omp-managed")"
+  else
+    AUTOPROMPT_RECEIPT_OMP_MANAGED=0
+  fi
+  if [ -f "$snapshot/omp-detached-root" ]; then
+    AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT="$(cat "$snapshot/omp-detached-root")"
+  else
+    AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT=""
+  fi
   rm -rf -- "$snapshot"
 }
 
@@ -2946,10 +3125,15 @@ _uninstall_corrupt_receipt() {
 _uninstall_publish_receipt() {
   UNINSTALL_RC_NONCE="$1"
   UNINSTALL_RC_BACKUP="$2"
-  local -n published_files="$3" published_directories="$4"
-  local -n published_edit_files="$5" published_edit_keys="$6"
-  local -n published_edit_values="$7" published_edit_priors="$8"
-  local -n published_edit_nulls="$9"
+  UNINSTALL_RC_OMP_MANAGED="$3"
+  UNINSTALL_RC_HAS_OMP_MANAGED="$4"
+  UNINSTALL_RC_OMP_DETACHED_ROOT="$5"
+  UNINSTALL_RC_OMP_MANAGED_INFERRED="${13:-0}"
+  UNINSTALL_RC_OMP_DETACHED_ROOT_INFERRED="${14:-0}"
+  local -n published_files="$6" published_directories="$7"
+  local -n published_edit_files="$8" published_edit_keys="$9"
+  local -n published_edit_values="${10}" published_edit_priors="${11}"
+  local -n published_edit_nulls="${12}"
   UNINSTALL_RC_FILES=("${published_files[@]}")
   UNINSTALL_RC_CREATED_DIRECTORIES=("${published_directories[@]}")
   UNINSTALL_RC_EDIT_FILE=("${published_edit_files[@]}")
@@ -2961,8 +3145,12 @@ _uninstall_publish_receipt() {
 
 _uninstall_canonical_receipt() {
   local nonce="$1" backup="$2" has_directories="$3"
-  local files_name="$4" directories_name="$5" edits_name="$6" output_name="${7:-}"
-  local backup_json escaped_backup escaped_nonce files_json directories_json edits_json document
+  local has_omp_managed="$4" omp_managed="$5"
+  local has_detached_root="$6" detached_root="$7"
+  local files_name="$8" directories_name="$9" edits_name="${10}"
+  local output_name="${11:-}"
+  local backup_json detached_json escaped_backup escaped_detached escaped_nonce
+  local files_json directories_json edits_json document
   if [ -z "$backup" ]; then
     backup_json=null
   else
@@ -2972,14 +3160,29 @@ _uninstall_canonical_receipt() {
   _receipt_json_escape "$nonce" escaped_nonce
   _receipt_path_array "$files_name" files_json
   _receipt_edits_array "$edits_name" edits_json
+  printf -v document '{\n  "nonce": "%s",\n  "backup": %s,\n  "files": %s,\n' \
+    "$escaped_nonce" "$backup_json" "$files_json"
   if [ "$has_directories" -eq 1 ]; then
     _receipt_path_array "$directories_name" directories_json
-    printf -v document '{\n  "nonce": "%s",\n  "backup": %s,\n  "files": %s,\n  "createdDirectories": %s,\n  "configEdits": %s\n}' \
-      "$escaped_nonce" "$backup_json" "$files_json" "$directories_json" "$edits_json"
-  else
-    printf -v document '{\n  "nonce": "%s",\n  "backup": %s,\n  "files": %s,\n  "configEdits": %s\n}' \
-      "$escaped_nonce" "$backup_json" "$files_json" "$edits_json"
+    document+="  \"createdDirectories\": $directories_json,"$'\n'
   fi
+  if [ "$has_omp_managed" -eq 1 ]; then
+    if [ "$omp_managed" -eq 1 ]; then
+      document+='  "ompManaged": true,'$'\n'
+    else
+      document+='  "ompManaged": false,'$'\n'
+    fi
+  fi
+  if [ "$has_detached_root" -eq 1 ]; then
+    if [ -z "$detached_root" ]; then
+      detached_json=null
+    else
+      _receipt_json_escape "$detached_root" escaped_detached
+      detached_json="\"$escaped_detached\""
+    fi
+    document+="  \"ompDetachedRoot\": $detached_json,"$'\n'
+  fi
+  document+="  \"configEdits\": $edits_json"$'\n}'
   if [ -n "$output_name" ]; then
     printf -v "$output_name" '%s' "$document"
   else
@@ -3061,15 +3264,152 @@ _uninstall_receipt_path_under_root() {
   [ "$path_identity" = "$root_identity" ] || [[ "$path_identity" == "$root_identity"/* ]]
 }
 
+_uninstall_omp_detached_root_valid() {
+  # PowerShell receipts use native Windows separators.  Normalize the receipt
+  # value before suffix slicing so the same sealed receipt is authoritative
+  # when Git Bash performs the later repair or uninstall.
+  local omp_default_root="${1//\\//}" home
+  [ -n "$omp_default_root" ] || return 1
+  case "$omp_default_root" in */agent) ;; *) return 1 ;; esac
+  home="$(resolve_home omp)" || return 1
+  _idem_paths_equal "$home" "${omp_default_root%/agent}" && return 1
+  _uninstall_receipt_path_under_root "$home" "$omp_default_root"
+}
+
+_uninstall_omp_detached_receipt_path_allowed() {
+  local omp_default_root="${1//\\//}" path="$2" omp_config_dir omp_native_root
+  _uninstall_omp_detached_root_valid "$omp_default_root" || return 1
+  omp_config_dir="${omp_default_root%/agent}"
+  omp_native_root="$omp_default_root/agents"
+  _idem_paths_equal "$path" "$omp_config_dir" && return 0
+  _idem_paths_equal "$path" "$omp_default_root" && return 0
+  # The native path must be spelled beneath `agents` while also resolving
+  # beneath the detached root.  Using `agents` as the sole physical root would
+  # authorize its outside target when that directory is replaced by a symlink.
+  _uninstall_receipt_path_under_root "$omp_native_root" "$path" || return 1
+  _uninstall_receipt_path_under_root "$omp_default_root" "$path"
+}
+
+_uninstall_omp_detached_manifest_valid() {
+  local root="$1" omp_default_root="${2//\\//}" files_name="$3"
+  local manifest="$root/$AUTOPROMPT_HASH_MANIFEST_NAME" native_root
+  local path parent basename recorded_hash="" index native_count=0
+  local receipt_path receipt_matches
+  local -a spellings=() identities=() hashes=()
+  local -n receipt_files="$files_name"
+  _uninstall_omp_detached_root_valid "$omp_default_root" || return 1
+  _idem_parse_manifest "$manifest" spellings identities hashes || return 1
+  native_root="$omp_default_root/agents"
+  for ((index = 0; index < ${#spellings[@]}; index++)); do
+    path="${spellings[index]//\\//}"
+    parent="${path%/*}"; basename="${path##*/}"
+    if _idem_paths_equal "$parent" "$native_root"; then
+      case "$basename" in
+        ap-*.md)
+          _uninstall_omp_detached_receipt_path_allowed \
+            "$omp_default_root" "${spellings[index]}" || return 1
+          native_count=$((native_count + 1))
+          receipt_matches=0
+          for receipt_path in "${receipt_files[@]}"; do
+            _idem_paths_equal "$receipt_path" "${spellings[index]}" &&
+              receipt_matches=$((receipt_matches + 1))
+          done
+          [ "$receipt_matches" -eq 1 ] || return 1
+          ;;
+      esac
+    fi
+  done
+  [ "$native_count" -eq 25 ] || return 1
+  for path in "${receipt_files[@]}"; do
+    _uninstall_receipt_path_under_root "$root" "$path" && continue
+    _uninstall_omp_detached_receipt_path_allowed \
+      "$omp_default_root" "$path" || continue
+    _idem_read_manifest_hash "$root" "$path" recorded_hash || return 1
+    [ -n "$recorded_hash" ] || return 1
+  done
+}
+
+_uninstall_infer_legacy_omp_detached_root() {
+  local root="$1" files_name="$2" output_name="$3"
+  local manifest="$root/$AUTOPROMPT_HASH_MANIFEST_NAME"
+  local path parent candidate="" candidate_identity="" identity="" index count=0
+  local -a spellings=() identities=() hashes=()
+  _idem_parse_manifest "$manifest" spellings identities hashes || return 1
+  for ((index = 0; index < ${#spellings[@]}; index++)); do
+    path="${spellings[index]//\\//}"
+    case "${path##*/}" in ap-*.md) ;; *) continue ;; esac
+    parent="${path%/*}"
+    case "$parent" in */agent/agents) ;; *) continue ;; esac
+    candidate="${parent%/agents}"
+    _uninstall_omp_detached_root_valid "$candidate" || return 1
+    _idem_cached_comparable_path "$candidate" identity || return 1
+    if [ -n "$candidate_identity" ] && [ "$candidate_identity" != "$identity" ]; then
+      return 1
+    fi
+    candidate_identity="$identity"
+    count=$((count + 1))
+  done
+  [ -n "$candidate" ] && [ "$count" -eq 25 ] || return 1
+  _uninstall_omp_detached_manifest_valid "$root" "$candidate" "$files_name" ||
+    return 1
+  printf -v "$output_name" '%s' "$candidate"
+}
+
+_uninstall_legacy_self_contained_omp_authority() {
+  local root="$1" files_name="$2" edit_files_name="$3" edit_keys_name="$4"
+  local index path normalized parent basename source recorded_hash expected_hash
+  local -n receipt_files="$files_name" receipt_edit_files="$edit_files_name"
+  local -n receipt_edit_keys="$edit_keys_name"
+  for ((index = 0; index < ${#receipt_edit_files[@]}; index++)); do
+    if [ "${receipt_edit_keys[index]}" = task.maxRecursionDepth ] &&
+       _idem_paths_equal "${receipt_edit_files[index]}" "$root/config.yml"; then
+      return 0
+    fi
+  done
+  for path in "${receipt_files[@]}"; do
+    normalized="${path//\\//}"
+    parent="${normalized%/*}"; basename="${normalized##*/}"
+    _idem_paths_equal "$parent" "$root/agents" || continue
+    case "$basename" in ap-*.md) ;; *) continue ;; esac
+    source="$AUTOPROMPT_INSTALL_REPO_ROOT/agents/omp/agents/$basename"
+    [ -f "$source" ] || continue
+    recorded_hash=""
+    _idem_read_manifest_hash "$root" "$path" recorded_hash || continue
+    [ -n "$recorded_hash" ] || continue
+    expected_hash="$(_idem_sha256 "$source")" || continue
+    [ "$recorded_hash" = "$expected_hash" ] && return 0
+  done
+  return 1
+}
+
+_uninstall_omp_detached_directory_allowed() {
+  local omp_default_root="${1//\\//}" path="$2"
+  local omp_config_dir="${omp_default_root%/agent}"
+  _uninstall_omp_detached_receipt_path_allowed \
+    "$omp_default_root" "$path" || return 1
+  _idem_paths_equal "$path" "$omp_config_dir" && return 0
+  _idem_paths_equal "$path" "$omp_default_root" && return 0
+  _idem_paths_equal "$path" "$omp_default_root/agents"
+}
+
 _uninstall_receipt_path_allowed() {
-  local root="$1" path="$2" kilo_home="$HOME/.kilo" vscode_settings
+  local root="$1" path="$2" omp_detached_root="${3:-}"
+  local kilo_home="$HOME/.kilo" vscode_settings
   _uninstall_receipt_path_under_root "$root" "$path" && return 0
+  if [ -n "$omp_detached_root" ] &&
+     _uninstall_omp_detached_receipt_path_allowed "$omp_detached_root" "$path"; then
+    return 0
+  fi
   if autoprompt_install_root_override_present; then
-    [ "$AUTOPROMPT_INSTALL_ROOT_CLIENT" = vscode ] || return 1
-    vscode_settings="$(vscode_settings_file)"
-    _idem_paths_equal "$path" "$vscode_settings" && return 0
-    _idem_paths_equal "$path" "$vscode_settings$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX"
-    return $?
+    case "$AUTOPROMPT_INSTALL_ROOT_CLIENT" in
+      vscode)
+        vscode_settings="$(vscode_settings_file)"
+        _idem_paths_equal "$path" "$vscode_settings" && return 0
+        _idem_paths_equal "$path" "$vscode_settings$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX"
+        return $?
+        ;;
+      *) return 1 ;;
+    esac
   fi
   _idem_paths_equal "$path" "$kilo_home" && return 0
   _idem_paths_equal "$path" "$kilo_home/skills" && return 0
@@ -3080,21 +3420,51 @@ _uninstall_receipt_path_allowed() {
 }
 
 _uninstall_validate_receipt_paths() {
-  local root="$1" backup="$2" files_name="$3" directories_name="$4"
-  local edit_files_name="$5" path
+  local root="$1" backup="$2" omp_detached_root="$3"
+  local files_name="$4" directories_name="$5" edit_files_name="$6" path
   local -n receipt_files="$files_name" receipt_directories="$directories_name"
   local -n receipt_edit_files="$edit_files_name"
+  if [ -n "$omp_detached_root" ]; then
+    _uninstall_omp_detached_manifest_valid \
+      "$root" "$omp_detached_root" "$files_name" || return 1
+    for path in "${receipt_directories[@]}"; do
+      _uninstall_receipt_path_under_root "$root" "$path" && continue
+      if _uninstall_omp_detached_receipt_path_allowed \
+           "$omp_detached_root" "$path" &&
+         ! _uninstall_omp_detached_directory_allowed \
+           "$omp_detached_root" "$path"; then
+        return 1
+      fi
+    done
+    for path in "${receipt_edit_files[@]}"; do
+      _uninstall_receipt_path_under_root "$root" "$path" && continue
+      _uninstall_omp_detached_receipt_path_allowed \
+        "$omp_detached_root" "$path" && return 1
+    done
+    if [ -n "$backup" ] && [ "$backup" != "none" ] &&
+       ! _uninstall_receipt_path_under_root "$root" "$backup" &&
+       _uninstall_omp_detached_receipt_path_allowed \
+         "$omp_detached_root" "$backup"; then
+      return 1
+    fi
+  fi
   for path in "${receipt_files[@]}" "${receipt_directories[@]}" \
     "${receipt_edit_files[@]}"; do
     [ -n "$path" ] || return 1
-    _uninstall_receipt_path_allowed "$root" "$path" || return 1
+    if ! _uninstall_receipt_path_allowed "$root" "$path" "$omp_detached_root"; then
+      printf '%s\n' "error=receipt-path-not-allowed path=$path" >&2
+      return 1
+    fi
   done
   [ -z "$backup" ] || [ "$backup" = "none" ] ||
-    _uninstall_receipt_path_allowed "$root" "$backup"
+    _uninstall_receipt_path_allowed "$root" "$backup" "$omp_detached_root"
 }
 
 _uninstall_parse_receipt_document() {
-  local root="$1" receipt="$2" document="$3" index=0 nonce backup="" has_directories=0 canonical
+  local root="$1" receipt="$2" document="$3" index=0 nonce backup=""
+  local has_directories=0 has_omp_managed=0 omp_managed=0
+  local has_detached_root=0 detached_root="" canonical
+  local omp_managed_inferred=0 detached_root_inferred=0
   local -a lines=() files=() directories=() packed_edits=()
   local -a edit_files=() edit_keys=() edit_values=() edit_priors=() edit_nulls=()
   mapfile -t lines < <(printf '%s' "$document")
@@ -3112,19 +3482,57 @@ _uninstall_parse_receipt_document() {
     has_directories=1
     _uninstall_parse_string_array lines index createdDirectories ',' directories || return 1
   fi
+  case "${lines[index]:-}" in
+    '  "ompManaged": true,')
+      has_omp_managed=1; omp_managed=1; index=$((index + 1))
+      ;;
+    '  "ompManaged": false,')
+      has_omp_managed=1; omp_managed=0; index=$((index + 1))
+      ;;
+  esac
+  if [ "${lines[index]:-}" = '  "ompDetachedRoot": null,' ]; then
+    has_detached_root=1
+    index=$((index + 1))
+  elif [[ "${lines[index]:-}" == '  "ompDetachedRoot": '* ]]; then
+    has_detached_root=1
+    _uninstall_parse_string_member "${lines[index]:-}" \
+      '  "ompDetachedRoot": ' ',' detached_root || return 1
+    index=$((index + 1))
+  fi
   _uninstall_parse_edits_array lines index packed_edits edit_files edit_keys \
     edit_values edit_priors edit_nulls || return 1
   [ "${lines[index]:-}" = '}' ] && [ $((index + 1)) -eq "${#lines[@]}" ] || return 1
   _uninstall_canonical_receipt "$nonce" "$backup" "$has_directories" \
+    "$has_omp_managed" "$omp_managed" "$has_detached_root" "$detached_root" \
     files directories packed_edits canonical || return 1
   [ "$document" = "$canonical"$'\n' ] || return 1
-  _uninstall_validate_receipt_paths "$root" "$backup" files directories edit_files || return 2
-  _uninstall_publish_receipt "$nonce" "$backup" files directories edit_files \
-    edit_keys edit_values edit_priors edit_nulls
+  if [ "$has_detached_root" -eq 0 ]; then
+    if _uninstall_infer_legacy_omp_detached_root \
+         "$root" files detached_root; then
+      detached_root_inferred=1
+    else
+      detached_root=""
+    fi
+  fi
+  if [ "$has_omp_managed" -eq 0 ] &&
+     { [ -n "$detached_root" ] ||
+       _uninstall_legacy_self_contained_omp_authority \
+         "$root" files edit_files edit_keys; }; then
+    omp_managed=1
+    omp_managed_inferred=1
+  fi
+  [ "$omp_managed" -eq 1 ] || [ -z "$detached_root" ] || return 1
+  _uninstall_validate_receipt_paths "$root" "$backup" "$detached_root" \
+    files directories edit_files || return 2
+  _uninstall_publish_receipt "$nonce" "$backup" "$omp_managed" \
+    "$has_omp_managed" "$detached_root" files directories edit_files \
+    edit_keys edit_values edit_priors edit_nulls \
+    "$omp_managed_inferred" "$detached_root_inferred"
 }
 
 # _uninstall_read_receipt validates the complete canonical document before it
-# publishes parser globals. Legacy receipts may omit only createdDirectories.
+# publishes parser globals. Legacy receipts may omit createdDirectories and
+# ompManaged and ompDetachedRoot.
 _uninstall_read_receipt() {
   local root="$1" receipt="$1/$AUTOPROMPT_RECEIPT_NAME" document="" read_code
   if [ ! -f "$receipt" ]; then
@@ -3403,6 +3811,21 @@ _uninstall_restore_one_configfile() {
       --backup "$backup" --prior "$prior" || return 75
     return 0
   fi
+  if [ "${#indices[@]}" -eq 1 ]; then
+    local harness_provider="" harness_key="${UNINSTALL_RC_EDIT_KEY[indices[0]]}"
+    case "$harness_key" in
+      task.maxRecursionDepth) harness_provider=omp ;;
+      agent.max_subagent_depth) harness_provider=reasonix ;;
+    esac
+    if [ -n "$harness_provider" ]; then
+      local harness_prior="${UNINSTALL_RC_EDIT_PRIOR[indices[0]]}"
+      [ "${UNINSTALL_RC_EDIT_PRIOR_ISNULL[indices[0]]}" -eq 0 ] || harness_prior=absent-key
+      node "$AUTOPROMPT_INSTALL_REPO_ROOT/scripts/harness-provider-config.cjs" \
+        restore --provider "$harness_provider" --file "$file" \
+        --backup "$backup" --prior "$harness_prior" --expected 4 || return 75
+      return 0
+    fi
+  fi
   if [ ! -f "$file" ]; then
     _uninstall_remove_config_backup "$file" "$backup" || return $?
     printf '%s\n' "configrestore=$file note=config-absent"
@@ -3523,6 +3946,23 @@ _uninstall_remove_empty_dirs() {
 [ -n "${AUTOPROMPT_COMPARABLE_PATH_CACHE+set}" ] ||
   declare -A AUTOPROMPT_COMPARABLE_PATH_CACHE=()
 
+_idem_windows_long_path() {
+  local input_path="${1//\\//}" output_name="$2"
+  local filesystem_path directory parent component suffix="" long_directory
+  filesystem_path="$(cygpath -au -- "$input_path" 2>/dev/null)" || return 1
+  directory="$filesystem_path"
+  while [ ! -e "$directory" ] && [ ! -L "$directory" ]; do
+    component="${directory##*/}"
+    parent="${directory%/*}"
+    [ "$parent" != "$directory" ] || return 1
+    [ -n "$parent" ] || parent="/"
+    suffix="/$component$suffix"
+    directory="$parent"
+  done
+  long_directory="$(cygpath -alm -- "$directory" 2>/dev/null)" || return 1
+  printf -v "$output_name" '%s' "${long_directory%/}$suffix"
+}
+
 _idem_comparable_path() {
   local input_path="$1" output_name="${2:-}" result_value windows_path=0
   input_path="${input_path//\\//}"
@@ -3530,18 +3970,16 @@ _idem_comparable_path() {
     msys*:*|cygwin*:*|mingw*:*|*:MSYS*|*:MINGW*) windows_path=1 ;;
   esac
   if [ "$windows_path" -eq 1 ]; then
-    case "$input_path" in
-      [A-Za-z]:/*) result_value="$input_path" ;;
-      /[A-Za-z]/*) result_value="${input_path:1:1}:${input_path:2}" ;;
-      /[A-Za-z]) result_value="${input_path:1:1}:" ;;
-      *)
-        if command -v cygpath >/dev/null 2>&1; then
-          result_value="$(cygpath -am -- "$input_path" 2>/dev/null)" || return 1
-        else
-          result_value="$input_path"
-        fi
-        ;;
-    esac
+    if command -v cygpath >/dev/null 2>&1; then
+      _idem_windows_long_path "$input_path" result_value || return 1
+    else
+      case "$input_path" in
+        [A-Za-z]:/*) result_value="$input_path" ;;
+        /[A-Za-z]/*) result_value="${input_path:1:1}:${input_path:2}" ;;
+        /[A-Za-z]) result_value="${input_path:1:1}:" ;;
+        *) result_value="$input_path" ;;
+      esac
+    fi
     result_value="${result_value,,}"
   else
     result_value="$input_path"
@@ -3615,8 +4053,13 @@ _opencode_owned_path() {
 }
 
 _custom_install_root_owned_path() {
-  local root="$1" provider="$2" path="$3" skills="$1/skills"
+  # Receipts sealed by the PowerShell port carry native Windows separators.
+  # Authorization comparisons already canonicalize them, but provider-specific
+  # parent/basename slicing must use slash form as well or detached OMP files are
+  # incorrectly retained before they ever reach the filesystem removal path.
+  local root="$1" provider="$2" path="${3//\\//}" skills="$1/skills"
   local skill="$1/skills/autoprompt" agents="$1/agents" parent basename settings
+  local omp_config_dir omp_default_root omp_native_agents
   if [ -n "$AUTOPROMPT_INSTALL_ROOT_CLIENT" ] &&
      [ "$provider" != "$AUTOPROMPT_INSTALL_ROOT_CLIENT" ]; then
     return 1
@@ -3637,25 +4080,73 @@ _custom_install_root_owned_path() {
     _idem_paths_equal "$path" "$root/config.toml$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX"
     return $?
   }
-  _idem_paths_equal "$path" "$agents" && return 0
   parent="${path%/*}"; basename="${path##*/}"
   case "$provider" in
     claude)
+      _idem_paths_equal "$path" "$agents" && return 0
       _idem_paths_equal "$parent" "$agents" && case "$basename" in ap-*.md) return 0 ;; esac
       ;;
     opencode)
+      _idem_paths_equal "$path" "$agents" && return 0
       _idem_paths_equal "$path" "$root/autoprompt.opencode.json" && return 0
       _idem_paths_equal "$parent" "$agents" && case "$basename" in ap-*.md) return 0 ;; esac
       ;;
     kilo)
+      _idem_paths_equal "$path" "$agents" && return 0
       _idem_paths_equal "$path" "$root/autoprompt.kilo.json" && return 0
       _idem_paths_equal "$parent" "$agents" && case "$basename" in ap-*.md) return 0 ;; esac
       ;;
     vscode)
+      _idem_paths_equal "$path" "$agents" && return 0
       _idem_paths_equal "$parent" "$agents" && case "$basename" in ap-*.agent.md) return 0 ;; esac
       settings="$(vscode_settings_file)"
       _idem_paths_equal "$path" "$settings" && return 0
       _idem_paths_equal "$path" "$settings$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX" && return 0
+      ;;
+    omp)
+      omp_default_root="${UNINSTALL_RC_OMP_DETACHED_ROOT:-}"
+      omp_default_root="${omp_default_root//\\//}"
+      if [ -n "$omp_default_root" ]; then
+        omp_config_dir="${omp_default_root%/agent}"
+        omp_native_agents="$omp_default_root/agents"
+        _idem_paths_equal "$path" "$omp_config_dir" && return 0
+        _idem_paths_equal "$path" "$omp_default_root" && return 0
+        if _idem_paths_equal "$path" "$omp_native_agents"; then
+          _uninstall_omp_detached_receipt_path_allowed \
+            "$omp_default_root" "$path"
+          return $?
+        fi
+        if _idem_paths_equal "$parent" "$omp_native_agents"; then
+          _uninstall_omp_detached_receipt_path_allowed \
+            "$omp_default_root" "$path" || return 1
+          case "$basename" in ap-*.md) return 0 ;; esac
+        fi
+      elif [ "${UNINSTALL_RC_OMP_MANAGED:-0}" -eq 1 ]; then
+        _idem_paths_equal "$path" "$agents" && return 0
+        _idem_paths_equal "$parent" "$agents" &&
+          case "$basename" in ap-*.md) return 0 ;; esac
+      fi
+      _idem_paths_equal "$path" "$root/config.yml" && return 0
+      _idem_paths_equal "$path" "$root/config.yml$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX" && return 0
+      ;;
+    deepseek)
+      _idem_paths_equal "$path" "$root/.agent-presets" && return 0
+      _idem_paths_equal "$path" "$root/.agent-presets/autoprompt" && return 0
+      _idem_paths_equal "$parent" "$root/.agent-presets/autoprompt" &&
+        case "$basename" in agent.cordis.yml|preset.yml) return 0 ;; esac
+      ;;
+    reasonix)
+      _idem_paths_equal "$path" "$root/config.toml" && return 0
+      _idem_paths_equal "$path" "$root/config.toml$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX" && return 0
+      if _idem_paths_equal "$parent" "$skills"; then
+        case "$basename" in ap-*) return 0 ;; esac
+      fi
+      if [ "$basename" = SKILL.md ]; then
+        local profile_dir="${path%/*}" profile_parent profile_name
+        profile_parent="${profile_dir%/*}"; profile_name="${profile_dir##*/}"
+        _idem_paths_equal "$profile_parent" "$skills" &&
+          case "$profile_name" in ap-*) return 0 ;; esac
+      fi
       ;;
   esac
   return 1
@@ -3778,6 +4269,9 @@ _uninstall_provider_owns_path() {
     grok) _grok_owned_path "$root" "$path" ;;
     vscode) _vscode_owned_path "$root" "$path" ;;
     vibe) _vibe_owned_path "$root" "$path" ;;
+    omp|deepseek|reasonix)
+      _custom_install_root_owned_path "$root" "$provider" "$path"
+      ;;
     claude|codex|cursor|roo|gemini|cline|goose)
       _legacy_provider_owned_path "$root" "$provider" "$path"
       ;;
@@ -3796,6 +4290,8 @@ _uninstall_provider_owns_config_path() {
       kilo) _idem_paths_equal "$path" "$root/autoprompt.kilo.json" ;;
       vscode) _idem_paths_equal "$path" "$(vscode_settings_file)" ;;
       codex|grok) _idem_paths_equal "$path" "$root/config.toml" ;;
+      omp) _idem_paths_equal "$path" "$root/config.yml" ;;
+      reasonix) _idem_paths_equal "$path" "$root/config.toml" ;;
       *) return 1 ;;
     esac
     return $?
@@ -3806,6 +4302,8 @@ _uninstall_provider_owns_config_path() {
     grok) _grok_owned_config_path "$root" "$path" ;;
     vscode) _vscode_owned_config_path "$root" "$path" ;;
     codex) _idem_paths_equal "$path" "$root/config.toml" ;;
+    omp) _idem_paths_equal "$path" "$root/config.yml" ;;
+    reasonix) _idem_paths_equal "$path" "$root/config.toml" ;;
     vibe) return 1 ;;
     *) return 1 ;;
   esac
@@ -3932,6 +4430,8 @@ _uninstall_load_receipt_accumulators() {
     )
   done
   AUTOPROMPT_CONFIGEDIT_LAST_BACKUP="${UNINSTALL_RC_BACKUP:-none}"
+  AUTOPROMPT_RECEIPT_OMP_MANAGED="${UNINSTALL_RC_OMP_MANAGED:-0}"
+  AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT="${UNINSTALL_RC_OMP_DETACHED_ROOT:-}"
 }
 
 _uninstall_select_provider_edits() {
@@ -4132,6 +4632,10 @@ _uninstall_shared_provider() {
     return $?
   }
   AUTOPROMPT_RECEIPT_CREATED_DIRECTORIES=("${retained_directories[@]}")
+  if [ "$provider" = omp ]; then
+    AUTOPROMPT_RECEIPT_OMP_MANAGED=0
+    AUTOPROMPT_RECEIPT_OMP_DETACHED_ROOT=""
+  fi
   _uninstall_seal_provider_receipt "$root" "$manifest" "$receipt" || {
     _uninstall_rollback_provider 74
     return $?
@@ -4152,7 +4656,7 @@ uninstall_client() {
   fi
   _uninstall_read_receipt "$root" || return $?
   case "$client" in
-    claude|codex|opencode|kilo|vscode|vibe|cursor|dcode|roo|gemini|cline|goose)
+    claude|codex|opencode|kilo|vscode|vibe|cursor|dcode|roo|gemini|cline|goose|omp|deepseek|reasonix)
       _uninstall_shared_provider "$root" "$client"
       return $?
       ;;
@@ -4180,7 +4684,8 @@ _repair_stage_runtime_inventory() {
 }
 
 _repair_add_native_candidates() {
-  local client="$1" root="$2" stage_skill="$3" generated had_nullglob
+  local client="$1" root="$2" stage_skill="$3" generated profile had_nullglob
+  local native_agents
   case "$(shopt nullglob)" in *on) had_nullglob=1 ;; *) had_nullglob=0 ;; esac
   shopt -s nullglob
   if [ "$client" = "claude" ]; then
@@ -4200,6 +4705,30 @@ _repair_add_native_candidates() {
       AUTOPROMPT_REPAIR_LIVE_PATHS+=("$(autoprompt_profile_file opencode)")
       AUTOPROMPT_REPAIR_STAGE_PATHS+=("$stage_skill/autoprompt.opencode.json")
     fi
+  elif [ "$client" = "omp" ]; then
+    if [ -n "${UNINSTALL_RC_OMP_DETACHED_ROOT:-}" ]; then
+      native_agents="${UNINSTALL_RC_OMP_DETACHED_ROOT//\\//}/agents"
+    else
+      native_agents="$(autoprompt_native_agents_root omp)" || return 1
+    fi
+    for generated in "$stage_skill"/agents/ap-*.md; do
+      AUTOPROMPT_REPAIR_LIVE_PATHS+=("$native_agents/${generated##*/}")
+      AUTOPROMPT_REPAIR_STAGE_PATHS+=("$generated")
+    done
+  elif [ "$client" = "deepseek" ]; then
+    for generated in "$stage_skill"/agent-preset/agent.cordis.yml \
+                     "$stage_skill"/agent-preset/preset.yml; do
+      [ -f "$generated" ] || continue
+      AUTOPROMPT_REPAIR_LIVE_PATHS+=("$root/.agent-presets/autoprompt/${generated##*/}")
+      AUTOPROMPT_REPAIR_STAGE_PATHS+=("$generated")
+    done
+  elif [ "$client" = "reasonix" ]; then
+    for generated in "$stage_skill"/skills/ap-*/SKILL.md; do
+      profile="${generated%/*}"
+      profile="${profile##*/}"
+      AUTOPROMPT_REPAIR_LIVE_PATHS+=("$root/skills/$profile/SKILL.md")
+      AUTOPROMPT_REPAIR_STAGE_PATHS+=("$generated")
+    done
   fi
   [ "$had_nullglob" -eq 0 ] && shopt -u nullglob
 }
@@ -4237,13 +4766,51 @@ _repair_stage_managed_payload() {
   local stage_skill="$stage/skills/autoprompt" live_skill="${landed%/*}"
   AUTOPROMPT_REPAIR_LIVE_PATHS=()
   AUTOPROMPT_REPAIR_STAGE_PATHS=()
-  case "$client" in claude|codex|opencode|kilo) ;; *) return 0 ;; esac
+  case "$client" in
+    claude|codex|opencode|kilo|omp|deepseek|reasonix) ;;
+    *) return 0 ;;
+  esac
   _repair_stage_runtime_inventory \
     "$client" "$stage_skill" "$live_skill" || return 1
   _repair_add_native_candidates "$client" "$root" "$stage_skill"
   [ "$client" = "codex" ] || return 0
   _repair_stage_codex_candidates \
     "$root" "$live_skill" "$stage" "$stage_skill"
+}
+
+_repair_new_provider_owns_path() {
+  local root="$1" client="$2" file="$3" parent leaf profile
+  if _idem_path_under_root "$file" "$root/skills/autoprompt"; then
+    return 0
+  fi
+  parent="${file%/*}"
+  leaf="${file##*/}"
+  case "$client" in
+    omp)
+      if [ -n "${UNINSTALL_RC_OMP_DETACHED_ROOT:-}" ]; then
+        local detached_root="${UNINSTALL_RC_OMP_DETACHED_ROOT//\\//}"
+        _uninstall_omp_detached_receipt_path_allowed \
+          "$detached_root" "$file" || return 1
+        _idem_paths_equal \
+          "$parent" "$detached_root/agents" || return 1
+      else
+        [ "${UNINSTALL_RC_OMP_MANAGED:-0}" -eq 1 ] || return 1
+        _idem_paths_equal "$parent" "$root/agents" || return 1
+      fi
+      case "$leaf" in ap-*.md) return 0 ;; *) return 1 ;; esac
+      ;;
+    deepseek)
+      _idem_paths_equal "$parent" "$root/.agent-presets/autoprompt" || return 1
+      case "$leaf" in agent.cordis.yml|preset.yml) return 0 ;; *) return 1 ;; esac
+      ;;
+    reasonix)
+      [ "$leaf" = "SKILL.md" ] || return 1
+      profile="${parent##*/}"
+      case "$profile" in ap-*) ;; *) return 1 ;; esac
+      _idem_paths_equal "$parent" "$root/skills/$profile"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 _repair_candidate_source() {
@@ -4292,10 +4859,14 @@ _repair_prepare_request() {
 _repair_should_process_file() {
   local root="$1" client="$2" file="$3"
   _idem_paths_equal "$file" "$root/$AUTOPROMPT_HASH_MANIFEST_NAME" && return 1
-  if ! _uninstall_provider_owns_path "$root" "$client" "$file"; then
-    return 1
-  fi
-  return 0
+  case "$client" in
+    omp|deepseek|reasonix)
+      _repair_new_provider_owns_path "$root" "$client" "$file"
+      ;;
+    *)
+      _uninstall_provider_owns_path "$root" "$client" "$file"
+      ;;
+  esac
 }
 
 _repair_read_file_state() {
@@ -4409,6 +4980,26 @@ _repair_process_file() {
   restored_ref=$((restored_ref + 1))
 }
 
+_repair_persist_inferred_omp_receipt() {
+  local root="$1" client="$2"
+  [ "$client" = omp ] || return 0
+  if [ "${UNINSTALL_RC_OMP_MANAGED_INFERRED:-0}" -ne 1 ] &&
+     [ "${UNINSTALL_RC_OMP_DETACHED_ROOT_INFERRED:-0}" -ne 1 ]; then
+    return 0
+  fi
+  [ "${UNINSTALL_RC_OMP_MANAGED:-0}" -eq 1 ] || return 73
+  # Rebuild the receipt from the fully validated parser state.  This preserves
+  # every recorded path/edit spelling and manifest-owned file while adding only
+  # the OMP provider/layout authority inferred from legacy ownership evidence.
+  _uninstall_load_receipt_accumulators
+  if ! write_receipt "$root" "${UNINSTALL_RC_NONCE:-repair-migrated}" \
+       "${UNINSTALL_RC_BACKUP:-}" >/dev/null; then
+    printf '%s\n' \
+      "client=$client repair=failed reason=omp-receipt-migration-failed" >&2
+    return 73
+  fi
+}
+
 uninstall_repair() {
   local root="$1" client="$2" name="$3" description="$4" body="$5" variant="${6:-}"
   local landed payload_hash candidate_stage="" restored=0 ok=0 unfingerprinted=0
@@ -4427,6 +5018,7 @@ uninstall_repair() {
     fi
   done
   [ -z "$candidate_stage" ] || rm -rf -- "$candidate_stage" 2>/dev/null
+  _repair_persist_inferred_omp_receipt "$root" "$client" || return $?
   printf '%s\n' "client=$client repair=done restored=$restored ok=$ok unfingerprinted=$unfingerprinted"
 }
 # --- F-LIB-UNINSTALL (end) ---
@@ -4623,7 +5215,7 @@ _extras_resolve_native_destination() {
   local -n native_destination_ref="$output_name"
   [ -n "$agentsdest" ] || return 0
   case "$client" in
-    claude|vscode)
+    claude|vscode|omp)
       native_destination_ref="$(autoprompt_native_agents_root "$client")" || return 3
       ;;
     *) native_destination_ref="" ;;

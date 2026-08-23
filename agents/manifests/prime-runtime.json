@@ -54,7 +54,7 @@
   ],
   "sha256": {
     "extensions/autoprompt.ts": "7d743d7feac80297486809d26158952bc9cd6a9335d4a1e4529d6a300ed34984",
-    "package.json": "4fc062a81a9caec79eaf4e92b4c16c6c0efc258778e79bc8efb47fc8103bc3c8",
+    "package.json": "5409473fb69d77f81afef5b7eb104a5752aed44f4672d3e9baf407d9280a4c45",
     "personas/ap-arbiter.md": "b163cf8e538c7b339be2fac25286de455e95f6aa496a1a73704cc0024d958f54",
     "personas/ap-depth-prober.md": "0ce7746223c1dfd944b78ca0cf2abd9cebbd2efae2ae680979371934daa88dd3",
     "personas/ap-execharness-resolver.md": "0ce9c2d6cd14fc7db2655542a6d6b48fc4d5113acbfcb16a105602b038c7ea4d",
@@ -99,7 +99,7 @@
     "prompts/frameworks/polish.md": "9200ac2f74283d3c7a6472986ef1ca412655f89e2c8906f3abf5a1826efedf28",
     "prompts/frameworks/refactor.md": "7d3f30d4c627cba9179c4a7223dceb587f1e6d9105cbb2c3210d962c219bcfd4",
     "skills/autoprompt/SKILL.md": "6f956b4cb10f9fa41ff9c87ad85229ac6659fc554598aa364e88fd8f3415c81b",
-    "skills/autoprompt/pyproject.toml": "4d347c6b3648e35a502357b99512f8de8001cc7e6965e7fbd3adb2e14cd94ed3",
+    "skills/autoprompt/pyproject.toml": "586bb0c594b3e34afe82fccfe9cb990de174ed662da8c5942c13938125431128",
     "skills/autoprompt/src/autoprompt/__init__.py": "7ee6bfb26582500a32e9d60329e790564cb51fd8515f2dfa7f6f9f40d4a35004"
   }
 }
