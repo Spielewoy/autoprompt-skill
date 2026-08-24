@@ -31,6 +31,7 @@ const PROVIDERS = Object.freeze([
   Object.freeze({ id: 'omp', label: 'Oh My Pi' }),
   Object.freeze({ id: 'deepseek', label: 'DeepSeek Harness' }),
   Object.freeze({ id: 'reasonix', label: 'Reasonix' }),
+  Object.freeze({ id: 'hermes', label: 'Hermes Agent' }),
 ])
 const PUBLIC_PROVIDER_IDS = new Set(PROVIDERS.map(provider => provider.id))
 const CUSTOM_PROVIDER_OPTION = Object.freeze({ id: 'custom', label: 'Custom coding agent' })
@@ -60,7 +61,7 @@ const HELP_TEXT = [
   '  -h, --help       Show this help.',
   '  -v, --version    Print the package version.',
   '',
-  'Interactive providers: claude, codex, opencode, kilo, vscode, prime, omp, deepseek, reasonix.',
+  'Interactive providers: claude, codex, opencode, kilo, vscode, prime, omp, deepseek, reasonix, hermes.',
   '',
   'Launch `autoprompt` to check for CLI updates and open the installer.',
   'It scans detected roots and lets you install, update, or repair a provider.',
@@ -271,6 +272,9 @@ function providerInstallLocations(client, locationOptions = {}) {
       ? path.join(env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'reasonix')
       : path.join(home, '.reasonix'))
     return singleRoot(root)
+  }
+  if (client === 'hermes') {
+    return singleRoot(env.HERMES_HOME || path.join(home, '.hermes'))
   }
   if (client === 'kilo') {
     return {

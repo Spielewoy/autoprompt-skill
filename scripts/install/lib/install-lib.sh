@@ -31,7 +31,7 @@ declare -A AUTOPROMPT_CLIENT_BIN=(
   [claude]=claude [codex]=codex [cursor]=cursor-agent [roo]=roo
   [opencode]=opencode [kilo]=kilo [vscode]=code
   [prime]=prime-agent
-  [omp]=omp [deepseek]=dsh [reasonix]=reasonix
+  [omp]=omp [deepseek]=dsh [reasonix]=reasonix [hermes]=hermes
   [dcode]=dcode [gemini]=gemini [cline]=cline [goose]=goose
 )
 AUTOPROMPT_VERSION_FLAG="--version"
@@ -42,7 +42,7 @@ AUTOPROMPT_PROBE_TIMEOUT=10
 declare -A AUTOPROMPT_PROVIDER_STATUS=(
   [claude]=supported [codex]=supported [opencode]=supported
   [kilo]=supported [vscode]=supported [prime]=supported
-  [omp]=supported [deepseek]=supported [reasonix]=supported
+  [omp]=supported [deepseek]=supported [reasonix]=supported [hermes]=supported
 )
 declare -A AUTOPROMPT_PROVIDER_BLOCK_REASON=()
 
@@ -206,6 +206,9 @@ autoprompt_config_root() {
         printf '%s/.reasonix' "$home"
       fi
       ;;
+    hermes)
+      printf '%s' "${HERMES_HOME:-$home/.hermes}"
+      ;;
     *) printf '%s' "$home" ;;
   esac
 }
@@ -224,7 +227,7 @@ autoprompt_skill_root() {
     opencode) printf '%s/opencode/skills/autoprompt' "$(autoprompt_config_root opencode)" ;;
     kilo) printf '%s/.kilo/skills/autoprompt' "$home" ;;
     vscode) printf '%s/.copilot/skills/autoprompt' "$home" ;;
-    omp|deepseek|reasonix) printf '%s/skills/autoprompt' "$(autoprompt_config_root "$name")" ;;
+    omp|deepseek|reasonix|hermes) printf '%s/skills/autoprompt' "$(autoprompt_config_root "$name")" ;;
     *) return 1 ;;
   esac
 }
@@ -439,6 +442,7 @@ declare -A AUTOPROMPT_CLIENT_DEST=(
   [omp]='OMP|skills/autoprompt/SKILL.md|md-claude'
   [deepseek]='DSH|skills/autoprompt/SKILL.md|md-claude'
   [reasonix]='REASONIX|skills/autoprompt/SKILL.md|md-reasonix'
+  [hermes]='HERMES|autoprompt/SKILL.md|md-hermes'
 )
 
 # Per-client OPTIONAL variants (cursor secondary, goose fallback). Same packed
@@ -521,6 +525,8 @@ resolve_destination() {
     base="${DSH_HOME:-$home/.dsh}"
   elif [ "$relkind" = "REASONIX" ]; then
     base="$(autoprompt_config_root reasonix)"
+  elif [ "$relkind" = "HERMES" ]; then
+    base="$(autoprompt_config_root hermes)"
   else
     base="$home"
   fi
@@ -582,6 +588,11 @@ _format_md_yaml() {
     return
   fi
   if [ "$token" = "md-reasonix" ]; then
+    printf '%s\n' "---" "name: $name" "description: \"$double\"" \
+      "invocation: manual" "---" "" "$body"
+    return
+  fi
+  if [ "$token" = "md-hermes" ]; then
     printf '%s\n' "---" "name: $name" "description: \"$double\"" \
       "invocation: manual" "---" "" "$body"
     return
@@ -698,7 +709,7 @@ format_skill() {
   local format="$1" name="$2" description="$3" body="$4"
 
   case "$format" in
-    md-yaml|md-claude|md-codex|md-reasonix|mdc|md-rules|md-agents|gemini-toml|roomodes|goose-recipe) ;;
+    md-yaml|md-claude|md-codex|md-reasonix|md-hermes|mdc|md-rules|md-agents|gemini-toml|roomodes|goose-recipe) ;;
     *)
       printf '%s\n' "format=$format error=unknown-format" >&2
       return 2
@@ -716,7 +727,7 @@ format_skill() {
   fi
 
   case "$format" in
-    md-yaml|md-claude|md-codex|md-reasonix|md-rules|md-agents) _format_md_yaml "$format" "$name" "$description" "$body" ;;
+    md-yaml|md-claude|md-codex|md-reasonix|md-hermes|md-rules|md-agents) _format_md_yaml "$format" "$name" "$description" "$body" ;;
     mdc) _format_mdc "$description" "$body" ;;
     gemini-toml) _format_gemini_toml "$description" "$body" ;;
     roomodes) _format_roomodes "$name" "$description" "$body" ;;

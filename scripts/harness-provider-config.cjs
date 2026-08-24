@@ -4,7 +4,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 
-const PROVIDERS = new Set(['omp', 'reasonix'])
+const PROVIDERS = new Set(['omp', 'reasonix', 'hermes'])
 
 function fail (message, code = 2) {
   process.stderr.write(`error=harness-provider-config detail=${message}\n`)
@@ -238,24 +238,40 @@ function restoreReasonixPrior (text, prior, preserveSection = false) {
   return serialize(found.doc)
 }
 
+function locateHermes (text) {
+  return locateReasonix(text)
+}
+
+function ensureHermes (text, minimum) {
+  return ensureReasonix(text, minimum)
+}
+
+function restoreHermesPrior (text, prior, preserveSection = false) {
+  return restoreReasonixPrior(text, prior, preserveSection)
+}
+
 function ensureProvider (provider, text, minimum) {
-  return provider === 'omp'
-    ? ensureOmp(text, minimum)
-    : ensureReasonix(text, minimum)
+  if (provider === 'omp') return ensureOmp(text, minimum)
+  if (provider === 'reasonix') return ensureReasonix(text, minimum)
+  return ensureHermes(text, minimum)
 }
 
 function restoreProviderPrior (provider, text, prior, preserveSection = false) {
-  return provider === 'omp'
-    ? restoreOmpPrior(text, prior, preserveSection)
-    : restoreReasonixPrior(text, prior, preserveSection)
+  if (provider === 'omp') return restoreOmpPrior(text, prior, preserveSection)
+  if (provider === 'reasonix') return restoreReasonixPrior(text, prior, preserveSection)
+  return restoreHermesPrior(text, prior, preserveSection)
 }
 
 function providerValue (provider, text) {
-  return provider === 'omp' ? locateOmp(text).value : locateReasonix(text).value
+  if (provider === 'omp') return locateOmp(text).value
+  if (provider === 'reasonix') return locateReasonix(text).value
+  return locateHermes(text).value
 }
 
 function providerHasSection (provider, text) {
-  return (provider === 'omp' ? locateOmp(text) : locateReasonix(text)).header >= 0
+  if (provider === 'omp') return locateOmp(text).header >= 0
+  if (provider === 'reasonix') return locateReasonix(text).header >= 0
+  return locateHermes(text).header >= 0
 }
 
 function writeOutput (file, text) {

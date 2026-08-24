@@ -34,7 +34,7 @@ if (-not (Test-Path -LiteralPath $Lib -PathType Leaf)) {
 . $Lib
 
 $ClientsAll = @(
-    'claude','codex','opencode','kilo','vscode','prime','omp','deepseek','reasonix'
+    'claude','codex','opencode','kilo','vscode','prime','omp','deepseek','reasonix','hermes'
 )
 $script:ResultRows = @()
 $script:AnyFail = 0
@@ -72,6 +72,7 @@ function Get-PayloadFile {
         'omp'      { return (Join-Path $RepoRoot 'agents/omp/SKILL.md') }
         'deepseek' { return (Join-Path $RepoRoot 'agents/deepseek/SKILL.md') }
         'reasonix' { return (Join-Path $RepoRoot 'agents/reasonix/SKILL.md') }
+        'hermes'   { return (Join-Path $RepoRoot 'agents/hermes/SKILL.md') }
         default    { return $null }
     }
 }
@@ -525,6 +526,7 @@ function Get-ExtrasSrcDir {
         'omp'      { return (Join-Path $RepoRoot 'agents/omp') }
         'deepseek' { return (Join-Path $RepoRoot 'agents/deepseek') }
         'reasonix' { return (Join-Path $RepoRoot 'agents/reasonix') }
+        'hermes'   { return (Join-Path $RepoRoot 'agents/hermes') }
         default    { return '' }
     }
 }
@@ -705,6 +707,15 @@ function Get-ReasonixPrivateProfiles {
         })
 }
 
+function Get-HermesActivationTargetPlan {
+    $root = Get-ConfigRoot -Client 'hermes'
+    return @(Get-RuntimeInventory -Client 'hermes' |
+        Where-Object { $_ -clike 'skills/ap-*/SKILL.md' } |
+        ForEach-Object {
+            Join-Path $root ($_ -replace '/', [IO.Path]::DirectorySeparatorChar)
+        })
+}
+
 function Test-ReasonixActivation {
     $profiles = @(Get-ReasonixPrivateProfiles)
     if ($profiles.Count -ne 25) {
@@ -760,6 +771,72 @@ function Install-ReasonixActivation {
         -Context '(reasonix)' | Out-Null
     [Console]::Error.WriteLine(
         "Autoprompt install (reasonix): native profile landing failed: code=$managedCode"
+    )
+    return 98
+}
+
+function Get-HermesPrivateProfiles {
+    $source = Join-Path (Get-ExtrasSkillDir -Client 'hermes') 'skills'
+    return @(Get-ChildItem -LiteralPath $source -Filter 'SKILL.md' `
+        -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
+            $_.Directory.Name -like 'ap-*'
+        })
+}
+
+function Test-HermesActivation {
+    $profiles = @(Get-HermesPrivateProfiles)
+    if ($profiles.Count -ne 25) {
+        [Console]::Error.WriteLine(
+            "client=hermes verify=fail reason=profile-count " +
+            "found=$($profiles.Count) expected=25"
+        )
+        return 1
+    }
+    $targetRoot = Join-Path (Get-ConfigRoot -Client 'hermes') 'skills'
+    foreach ($profile in $profiles) {
+        $target = Join-Path (Join-Path $targetRoot $profile.Directory.Name) `
+            'SKILL.md'
+        if (-not (Test-Path -LiteralPath $target -PathType Leaf) -or
+            (Get-IdemSha256 -Path $profile.FullName) -ne
+            (Get-IdemSha256 -Path $target)) {
+            [Console]::Error.WriteLine(
+                "client=hermes verify=fail reason=profile-mismatch " +
+                "profile=$($profile.Directory.Name)"
+            )
+            return 1
+        }
+    }
+    return 0
+}
+
+function Install-HermesActivation {
+    $root = Get-ConfigRoot -Client 'hermes'
+    $profiles = @(Get-HermesPrivateProfiles)
+    if ($profiles.Count -ne 25) {
+        [Console]::Error.WriteLine(
+            "Autoprompt install (hermes): expected 25 native profiles, " +
+            "found $($profiles.Count)."
+        )
+        return 98
+    }
+    $targetRoot = Join-Path $root 'skills'
+    $mappings = @($profiles | ForEach-Object {
+        @{
+            Source = $_.FullName
+            Target = Join-Path (Join-Path $targetRoot $_.Directory.Name) `
+                'SKILL.md'
+        }
+    })
+    $journalStart = $script:AutopromptManagedUndoJournal.Count
+    $managedCode = Install-IdemManagedFiles -ConfigRoot $root `
+        -Mappings $mappings -RefuseUnownedTarget
+    if ($managedCode -eq 0 -and (Test-HermesActivation) -eq 0) {
+        return 0
+    }
+    Invoke-ManagedRollback -FromIndex $journalStart `
+        -Context '(hermes)' | Out-Null
+    [Console]::Error.WriteLine(
+        "Autoprompt install (hermes): native profile landing failed: code=$managedCode"
     )
     return 98
 }
@@ -1227,6 +1304,11 @@ function Install-LandingActivation {
         Set-LandingFailure -Client $Client -Stage 'agents'
         return 1
     }
+    if ($Client -eq 'hermes') {
+        if ((Install-HermesActivation) -eq 0) { return 0 }
+        Set-LandingFailure -Client $Client -Stage 'agents'
+        return 1
+    }
     if ($Client -notin @('opencode', 'kilo')) { return 0 }
     $pruneCode = if ($Client -eq 'kilo') {
         Remove-StaleKiloAgents
@@ -1414,6 +1496,15 @@ function Get-ReasonixActivationTargetPlan {
         })
 }
 
+function Get-HermesActivationTargetPlan {
+    $root = Get-ConfigRoot -Client 'hermes'
+    return @(Get-RuntimeInventory -Client 'hermes' |
+        Where-Object { $_ -clike 'skills/ap-*/SKILL.md' } |
+        ForEach-Object {
+            Join-Path $root ($_ -replace '/', [IO.Path]::DirectorySeparatorChar)
+        })
+}
+
 function Get-ClientInstallTargetPlan {
     param([string]$Client)
     $targets = @(Get-ResolvedInstallTarget -Client $Client)
@@ -1427,6 +1518,7 @@ function Get-ClientInstallTargetPlan {
         'omp' { $targets += @(Get-OmpActivationTargetPlan) }
         'deepseek' { $targets += @(Get-DeepseekActivationTargetPlan) }
         'reasonix' { $targets += @(Get-ReasonixActivationTargetPlan) }
+        'hermes' { $targets += @(Get-HermesActivationTargetPlan) }
     }
     return $targets
 }

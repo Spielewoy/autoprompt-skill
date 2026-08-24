@@ -12,7 +12,7 @@ const PACKAGE_VERSION = JSON.parse(fs.readFileSync(
   'utf8',
 )).version
 const PUBLIC_PROVIDERS = [
-  'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime', 'omp', 'deepseek', 'reasonix',
+  'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime', 'omp', 'deepseek', 'reasonix', 'hermes',
 ]
 const LEGACY_PROVIDERS = ['vibe', 'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose']
 const LEGACY_PROVIDER_PATTERN = new RegExp(`\\b(?:${LEGACY_PROVIDERS.join('|')})\\b`, 'i')
@@ -102,6 +102,7 @@ test('public agent source contains only the nine supported provider packages', (
   assert.match(index, /\[Oh My Pi\]\(omp\/\)/)
   assert.match(index, /\[DeepSeek Harness\]\(deepseek\/\)/)
   assert.match(index, /\[Reasonix\]\(reasonix\/\)/)
+  assert.match(index, /\[Hermes Agent\]\(hermes\/\)/)
   assert.doesNotMatch(index, /Vibe|vibe\//i)
   assert.deepEqual(listFiles('agents/vibe'), [])
   assert.deepEqual(listFiles('agents/other'), [])

@@ -13,7 +13,7 @@ const PACKAGE_PATH = path.join(ROOT, 'package.json')
 const PACKAGE_VERSION = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8')).version
 const PROVIDERS = [
   'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime',
-  'omp', 'deepseek', 'reasonix',
+  'omp', 'deepseek', 'reasonix', 'hermes',
 ]
 
 function filesBelow(directory) {
@@ -227,6 +227,7 @@ test('package metadata is public-ready under the exact available name and remain
     'agents/omp/',
     'agents/deepseek/',
     'agents/reasonix/',
+    'agents/hermes/',
     'agents/manifests/claude-runtime.json',
     'agents/manifests/codex-runtime.json',
     'agents/manifests/opencode-runtime.json',
@@ -236,6 +237,7 @@ test('package metadata is public-ready under the exact available name and remain
     'agents/manifests/omp-runtime.json',
     'agents/manifests/deepseek-runtime.json',
     'agents/manifests/reasonix-runtime.json',
+    'agents/manifests/hermes-runtime.json',
     'assets/anatomy.svg',
     'assets/banner.svg',
     'assets/how-it-works-hierarchy.svg',

@@ -31,7 +31,7 @@ $AutopromptClientBin = @{
     claude = 'claude'; codex = 'codex'; cursor = 'cursor-agent'; roo = 'roo';
     opencode = 'opencode'; kilo = 'kilo'; vscode = 'code';
     prime = 'prime-agent';
-    omp = 'omp'; deepseek = 'dsh'; reasonix = 'reasonix';
+    omp = 'omp'; deepseek = 'dsh'; reasonix = 'reasonix'; hermes = 'hermes';
     dcode = 'dcode'; gemini = 'gemini'; cline = 'cline'; goose = 'goose'
 }
 $AutopromptVersionFlag = '--version'
@@ -42,7 +42,7 @@ $AutopromptProbeTimeout = 30
 $AutopromptProviderStatus = @{
     claude = 'supported'; codex = 'supported'; opencode = 'supported';
     kilo = 'supported'; vscode = 'supported'; prime = 'supported'
-    omp = 'supported'; deepseek = 'supported'; reasonix = 'supported'
+    omp = 'supported'; deepseek = 'supported'; reasonix = 'supported'; hermes = 'supported'
 }
 $AutopromptProviderBlockReason = @{}
 
@@ -408,6 +408,7 @@ $AutopromptClientDest = @{
     omp      = 'OMP|skills/autoprompt/SKILL.md|md-claude'
     deepseek = 'DSH|skills/autoprompt/SKILL.md|md-claude'
     reasonix = 'REASONIX|skills/autoprompt/SKILL.md|md-reasonix'
+    hermes   = 'HERMES|skills/autoprompt/SKILL.md|md-hermes'
 }
 
 # Per-client OPTIONAL variants (cursor secondary, goose fallback). A variant
@@ -520,6 +521,10 @@ function Get-AutopromptConfigRoot {
             }
             return (Join-Path $userHome '.reasonix')
         }
+        'hermes' {
+            if ($env:HERMES_HOME) { return $env:HERMES_HOME }
+            return (Join-Path $userHome '.hermes')
+        }
         default { return $userHome }
     }
 }
@@ -543,7 +548,7 @@ function Get-AutopromptSkillRoot {
         }
         'kilo' { return (Join-Path $userHome '.kilo/skills/autoprompt') }
         'vscode' { return (Join-Path $userHome '.copilot/skills/autoprompt') }
-        { $_ -in @('omp', 'deepseek', 'reasonix') } {
+        { $_ -in @('omp', 'deepseek', 'reasonix', 'hermes') } {
             return (Join-Path (Get-AutopromptConfigRoot -Name $Name) `
                 'skills/autoprompt')
         }
@@ -856,7 +861,7 @@ function Format-Skill {
     param([string]$Format, [string]$Name, [string]$Description, [string]$Body)
 
     switch ($Format) {
-        { $_ -in @('md-yaml', 'md-claude', 'md-codex', 'md-reasonix', 'mdc', 'md-rules', 'md-agents', 'gemini-toml', 'roomodes', 'goose-recipe') } { break }
+        { $_ -in @('md-yaml', 'md-claude', 'md-codex', 'md-reasonix', 'md-hermes', 'mdc', 'md-rules', 'md-agents', 'gemini-toml', 'roomodes', 'goose-recipe') } { break }
         default {
             [Console]::Error.WriteLine("format=$Format error=unknown-format")
             return 2
@@ -874,7 +879,7 @@ function Format-Skill {
     }
 
     switch ($Format) {
-        { $_ -in @('md-yaml', 'md-claude', 'md-codex', 'md-reasonix', 'md-rules', 'md-agents') } {
+        { $_ -in @('md-yaml', 'md-claude', 'md-codex', 'md-reasonix', 'md-hermes', 'md-rules', 'md-agents') } {
             [Console]::Out.Write((Format-MdYaml -Token $Format -Name $Name -Description $Description -Body $Body))
         }
         'mdc' { [Console]::Out.Write((Format-Mdc -Description $Description -Body $Body)) }

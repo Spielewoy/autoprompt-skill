@@ -85,6 +85,12 @@ const PROVIDERS = {
     agentRoot: 'skills',
     workflow: [],
   },
+  hermes: {
+    topLevel: ['GATES.md', 'MODES.md', 'PLAYBOOKS.md', 'README.md', 'VERSION'],
+    agents: 'hermes-personas',
+    agentRoot: 'skills',
+    workflow: [],
+  },
 }
 
 function canonicalBytes(filePath) {
@@ -112,7 +118,9 @@ function runtimeFiles(provider, root = ROOT) {
           ? contract.personas.map(persona => `${persona.id}.md`)
           : definition.agents === 'reasonix-personas'
             ? contract.personas.map(persona => `${persona.id}/SKILL.md`)
-            : definition.agents
+            : definition.agents === 'hermes-personas'
+              ? contract.personas.map(persona => `${persona.id}/SKILL.md`)
+              : definition.agents
   const agentRoot = definition.agentRoot || 'agents'
   files.push(...agents.map(agent => `${agentRoot}/${agent}`))
   files.push(...definition.workflow.map(file => `workflow/${file}`))

@@ -214,6 +214,24 @@ function createProviderRootCompat(providerLabels) {
       markers: Object.freeze([
         Object.freeze({
           label: 'skills/ap-*/SKILL.md (25 files)',
+          shared: true,
+          check(root) {
+            return matchAnchoredNestedFileCount(
+              root,
+              ['skills'],
+              /^ap-.*$/,
+              'SKILL.md',
+              25,
+            )
+          },
+        }),
+      ]),
+    }),
+    hermes: Object.freeze({
+      markers: Object.freeze([
+        Object.freeze({
+          label: 'skills/ap-*/SKILL.md (25 files)',
+          shared: true,
           check(root) {
             return matchAnchoredNestedFileCount(
               root,
@@ -237,7 +255,7 @@ function createProviderRootCompat(providerLabels) {
       const selectedLayout = providerLayouts[providerId]
       const hasOtherMarkers = Object.entries(evidence.providers).some(
         ([id, layout]) => id !== providerId && (
-          layout.complete || layout.uniqueMatches.length > 0 || layout.uniquePartial.length > 0
+          layout.uniqueMatches.length > 0 || layout.uniquePartial.length > 0
         ),
       )
       if (selected.complete && !hasOtherMarkers && !selectedLayout.externalWarning) {

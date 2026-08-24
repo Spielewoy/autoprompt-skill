@@ -217,6 +217,7 @@ function writeStrongCustomRoot(root, provider) {
       writeText(path.join(root, '.agent-presets', 'autoprompt', 'preset.yml'))
       return
     case 'reasonix':
+    case 'hermes':
       for (let index = 1; index <= 25; index += 1) {
         writeText(path.join(
           root,
@@ -230,6 +231,7 @@ function writeStrongCustomRoot(root, provider) {
       throw new Error(`unknown provider: ${provider}`)
   }
 }
+
 
 test('parser accepts command aliases and canonicalizes doctor arguments', () => {
   assert.deepEqual(parseArgs([]), { command: 'help' })
@@ -335,13 +337,13 @@ test('interactive no-argument launch numbers every install provider plus the cus
   for (const [index, provider] of PROVIDERS.entries()) {
     assert.match(result.stdout, new RegExp(`${index + 1}\\) ${provider.label}`))
   }
-  assert.match(result.stdout, /10\) Custom coding agent/)
-  assert.match(result.stdout, /Provider \[1-10, Esc\]: /)
+  assert.match(result.stdout, /11\) Custom coding agent/)
+  assert.match(result.stdout, /Provider \[1-11, Esc\]: /)
   assert.deepEqual(
     PROVIDERS.map(provider => provider.id),
     [
       'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime',
-      'omp', 'deepseek', 'reasonix',
+      'omp', 'deepseek', 'reasonix', 'hermes',
     ],
   )
   assert.equal(PROVIDERS.some(provider => provider.id === 'vibe'), false)
@@ -679,7 +681,7 @@ test('interactive launch from a repo checkout does not self-install a newer regi
 
 test('interactive custom coding agent option exits safely with the compatibility guide URL', () => {
   const result = invoke([], {
-    answers: ['10'],
+    answers: ['11'],
     interactive: true,
   })
 
@@ -905,7 +907,7 @@ test('interactive prompts reject invalid choices and closed input without mutati
     responses: [{ status: 0 }],
   })
   assert.equal(retried.status, 0)
-  assert.match(retried.stdout, /Enter a number from 1 to 10\./)
+  assert.match(retried.stdout, /Enter a number from 1 to 11\./)
   assert.match(retried.stdout, /Please answer Y or N\./)
   assert.equal(retried.calls[0].args.at(-1), 'vscode')
 
@@ -979,6 +981,12 @@ test('provider install locations match default config roots and external VS Code
           path: path.join(home, 'AppData', 'Roaming', 'reasonix'),
         }],
       },
+      hermes: {
+        roots: [{
+          label: 'Install directory',
+          path: path.join(home, '.hermes'),
+        }],
+      },
     },
   )
   assert.throws(
@@ -1017,6 +1025,7 @@ test('provider install locations match default config roots and external VS Code
     ['omp', 'PI_CODING_AGENT_DIR'],
     ['deepseek', 'DSH_HOME'],
     ['reasonix', 'REASONIX_HOME'],
+    ['hermes', 'HERMES_HOME'],
   ]) {
     const override = path.join('custom', provider)
     assert.equal(
@@ -1080,6 +1089,12 @@ test('provider install locations match default config roots and external VS Code
     providerInstallLocations('reasonix', { env: { HOME: home }, platform: 'linux' })
       .roots[0].path,
     path.join(home, '.reasonix'),
+  )
+  assert.deepEqual(
+    providerInstallLocations('hermes', { env: { HOME: home }, platform: 'linux' }),
+    {
+      roots: [{ label: 'Install directory', path: path.join(home, '.hermes') }],
+    },
   )
 })
 
@@ -1315,10 +1330,10 @@ test('interactive custom root warns on mismatched strong markers, re-prompts on 
   }
 })
 
-test('help stays lean and names only the nine public providers', () => {
+test('help stays lean and names only the ten public providers', () => {
   assert.match(
     HELP_TEXT,
-    /Interactive providers: claude, codex, opencode, kilo, vscode, prime, omp, deepseek, reasonix\./,
+    /Interactive providers: claude, codex, opencode, kilo, vscode, prime, omp, deepseek, reasonix, hermes./,
   )
   assert.doesNotMatch(HELP_TEXT, /\b(?:vibe|cursor|dcode|roo|gemini|cline|goose)\b/i)
   assert.match(HELP_TEXT, /^  autoprompt update$/m)
