@@ -34,7 +34,7 @@ if (-not (Test-Path -LiteralPath $Lib -PathType Leaf)) {
 . $Lib
 
 $ClientsAll = @(
-    'claude','codex','opencode','kilo','vscode','prime','omp','deepseek','reasonix'
+    'claude','codex','opencode','kilo','vscode','prime','omp','deepseek','reasonix','hermes'
 )
 $script:ResultRows = @()
 $script:AnyFail = 0
@@ -72,6 +72,7 @@ function Get-PayloadFile {
         'omp'      { return (Join-Path $RepoRoot 'agents/omp/SKILL.md') }
         'deepseek' { return (Join-Path $RepoRoot 'agents/deepseek/SKILL.md') }
         'reasonix' { return (Join-Path $RepoRoot 'agents/reasonix/SKILL.md') }
+        'hermes'   { return (Join-Path $RepoRoot 'agents/hermes/SKILL.md') }
         default    { return $null }
     }
 }
@@ -525,6 +526,7 @@ function Get-ExtrasSrcDir {
         'omp'      { return (Join-Path $RepoRoot 'agents/omp') }
         'deepseek' { return (Join-Path $RepoRoot 'agents/deepseek') }
         'reasonix' { return (Join-Path $RepoRoot 'agents/reasonix') }
+        'hermes'   { return (Join-Path $RepoRoot 'agents/hermes') }
         default    { return '' }
     }
 }

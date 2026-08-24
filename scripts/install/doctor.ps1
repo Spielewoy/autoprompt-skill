@@ -25,7 +25,7 @@ if (-not (Test-Path -LiteralPath $Lib -PathType Leaf)) {
 
 $ClientsAll = @(
     'claude','codex','opencode','kilo','vscode','prime',
-    'omp','deepseek','reasonix'
+    'omp','deepseek','reasonix','hermes'
 )
 
 function Get-HomeDir {

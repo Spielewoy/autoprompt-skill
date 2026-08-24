@@ -15,6 +15,7 @@ This folder contains the complete Autoprompt product. The prompts, custom agents
 | [Oh My Pi](omp/) | [`SKILL.md`](omp/SKILL.md) | [25 Markdown agents](omp/agents/) | [18 workflows](omp/frameworks/) | Recursive through native `task` dispatch and `spawns` allowlists |
 | [DeepSeek Harness](deepseek/) | [`SKILL.md`](deepseek/SKILL.md) | [25 fixed-persona tools](deepseek/agents/) | [18 workflows](deepseek/frameworks/) | Recursive through the user preset or headless patch |
 | [Reasonix](reasonix/) | [`SKILL.md`](reasonix/SKILL.md) | [25 native profiles](reasonix/skills/) | [18 workflows](reasonix/frameworks/) | Recursive through native subagent profiles |
+| [Hermes Agent](hermes/) | [`SKILL.md`](hermes/SKILL.md) | [25 native skills](hermes/skills/) | [18 frameworks](hermes/frameworks/) | Recursive through Hermes `delegate_task` native subagents |
 
 Installer floors and audited releases are tracked in the [support matrix](../docs/faq/which-coding-agents-are-supported.md). Every shipped package above is pinned by a runtime manifest and generated from the same 25-persona, 18-framework contract.
 
@@ -24,7 +25,7 @@ L0 is the active provider skill. L1 to L4 are named custom agents generated from
 
 | Level | Roles | Source |
 |---|---|---|
-| L0 | Conductor | [Claude](claude/SKILL.md), [Codex](codex/SKILL.md), [OpenCode](opencode/SKILL.md), [Kilo](kilo/SKILL.md), [VS Code](vscode/SKILL.md), [Prime Agent](prime/skills/autoprompt/SKILL.md), [Oh My Pi](omp/SKILL.md), [DeepSeek Harness](deepseek/SKILL.md), [Reasonix](reasonix/SKILL.md) |
+| L0 | Conductor | [Claude](claude/SKILL.md), [Codex](codex/SKILL.md), [OpenCode](opencode/SKILL.md), [Kilo](kilo/SKILL.md), [VS Code](vscode/SKILL.md), [Prime Agent](prime/skills/autoprompt/SKILL.md), [Oh My Pi](omp/SKILL.md), [DeepSeek Harness](deepseek/SKILL.md), [Reasonix](reasonix/SKILL.md), [Hermes Agent](hermes/SKILL.md) |
 | L1 | Scope, feature, and sweep coordinators | [`ap-scope-coordinator`](contracts/personas/ap-scope-coordinator.md), [`ap-feature-coordinator`](contracts/personas/ap-feature-coordinator.md), [`ap-sweep-coordinator`](contracts/personas/ap-sweep-coordinator.md) |
 | L2 | Optional manager for multi-lane work | [`ap-manager`](contracts/personas/ap-manager.md) |
 | L3 | Scope, research, planning, build, review, verification, and sweep executors | [Persona directory](contracts/personas/) |

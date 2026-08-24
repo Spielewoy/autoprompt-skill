@@ -8,7 +8,7 @@ const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const PROVIDERS = [
-  'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime', 'omp', 'deepseek', 'reasonix',
+  'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime', 'omp', 'deepseek', 'reasonix', 'hermes',
 ]
 const SKILLS = new Map(PROVIDERS.map(provider => [
   provider,

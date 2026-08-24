@@ -39,7 +39,7 @@ fi
 # shellcheck source=/dev/null
 . "$LIB"
 
-CLIENTS_ALL=(claude codex opencode kilo vscode prime omp deepseek reasonix)
+CLIENTS_ALL=(claude codex opencode kilo vscode prime omp deepseek reasonix hermes)
 
 # Per-run result rows for the matrix (RESULT=/SKIP= lines), filled in this shell.
 RESULT_ROWS=()
@@ -76,6 +76,7 @@ payload_file() {
     omp)      printf '%s' "$REPO_ROOT/agents/omp/SKILL.md" ;;
     deepseek) printf '%s' "$REPO_ROOT/agents/deepseek/SKILL.md" ;;
     reasonix) printf '%s' "$REPO_ROOT/agents/reasonix/SKILL.md" ;;
+    hermes)   printf '%s' "$REPO_ROOT/agents/hermes/SKILL.md" ;;
     *) return 1 ;;
   esac
 }
@@ -229,6 +230,7 @@ extras_src_dir() {
     omp)      printf '%s' "$REPO_ROOT/agents/omp" ;;
     deepseek) printf '%s' "$REPO_ROOT/agents/deepseek" ;;
     reasonix) printf '%s' "$REPO_ROOT/agents/reasonix" ;;
+    hermes)   printf '%s' "$REPO_ROOT/agents/hermes" ;;
     *)        printf '%s' "" ;;
   esac
 }
@@ -391,7 +393,21 @@ verify_reasonix_activation() {
   [ "$count" -eq 25 ]
 }
 
-install_reasonix_activation() {
+verify_hermes_activation() {
+  local root source profile name target count=0
+  root="$(config_root hermes)"
+  source="$(extras_skill_dir hermes)/skills"
+  for profile in "$source"/ap-*/SKILL.md; do
+    [ -f "$profile" ] || continue
+    count=$((count + 1))
+    name="${profile%/SKILL.md}"; name="${name##*/}"
+    target="$root/$name/SKILL.md"
+    [ -f "$target" ] && cmp -s "$profile" "$target" || return 1
+  done
+  [ "$count" -eq 25 ]
+}
+
+function install_reasonix_activation() {
   local root source profile name target count=0 code
   root="$(config_root reasonix)"
   source="$(extras_skill_dir reasonix)/skills"
@@ -405,6 +421,21 @@ install_reasonix_activation() {
   done
   [ "$count" -eq 25 ] && verify_reasonix_activation &&
     install_harness_provider_depth reasonix
+}
+
+function install_hermes_activation() {
+  local root source profile name target count=0 code
+  root="$(config_root hermes)"
+  source="$(extras_skill_dir hermes)/skills"
+  for profile in "$source"/ap-*/SKILL.md; do
+    [ -f "$profile" ] || continue
+    count=$((count + 1))
+    name="${profile%/SKILL.md}"; name="${name##*/}"
+    target="$root/$name/SKILL.md"
+    _idem_install_managed_file "$root" "$profile" "$target" 1
+    code=$?; [ "$code" -eq 0 ] || return "$code"
+  done
+  [ "$count" -eq 25 ] && verify_hermes_activation
 }
 
 verify_vscode_activation() {
@@ -1120,6 +1151,11 @@ _landing_activate_client() {
     return 1
   fi
   if [ "$client" = reasonix ] && ! install_reasonix_activation; then
+    _landing_fail "$client" agents \
+      "Autoprompt install ($client): native subagent profile landing failed."
+    return 1
+  fi
+  if [ "$client" = hermes ] && ! install_hermes_activation; then
     _landing_fail "$client" agents \
       "Autoprompt install ($client): native subagent profile landing failed."
     return 1

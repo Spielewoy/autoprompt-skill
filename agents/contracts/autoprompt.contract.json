@@ -33,7 +33,7 @@
     {
       "id": "ap-execharness-resolver",
       "tier": "R3",
-      "description": "L3 executor - EXECHARNESS RESOLVE. Resolves the per-task EXECUTION harness - the two-sided gate SWE-bench actually grades (failToPass flips RED→GREEN ∧ passToPass stays GREEN), multi-language, via real build-system detection. Ingests shipped FAIL_TO_PASS/PASS_TO_PASS, else derives failToPass from the mission's behavioral acceptance asks. An unresolvable environment is BLOCKED, never a stand-in.",
+      "description": "L3 executor - EXECHARNESS RESOLVE. Resolves the per-task EXECUTION harness - the two-sided gate SWE-bench actually grades (failToPass flips RED\u2192GREEN \u2227 passToPass stays GREEN), multi-language, via real build-system detection. Ingests shipped FAIL_TO_PASS/PASS_TO_PASS, else derives failToPass from the mission's behavioral acceptance asks. An unresolvable environment is BLOCKED, never a stand-in.",
       "capabilities": [
         "Read",
         "Write",
@@ -781,6 +781,28 @@
         "subagent-skill-export",
         "selected-model-inheritance"
       ]
+    },
+    "hermes": {
+      "status": "supported",
+      "target": "1.0.0",
+      "profile": {
+        "agents": "native-subagent-skills",
+        "skills": "hermes-skills",
+        "model": "inherit"
+      },
+      "capabilities": [
+        "native-subagent-skills",
+        "recursive-subagents",
+        "selected-model-inheritance"
+      ],
+      "runtimePrerequisites": {
+        "delegation.max_spawn_depth": 4
+      },
+      "allowedDeltas": [
+        "skill-frontmatter",
+        "subagent-skill-export",
+        "selected-model-inheritance"
+      ]
     }
   },
   "generated": {
@@ -805,6 +827,8 @@
     "deepseekPreset": "agents/deepseek/agent-preset/agent.cordis.yml",
     "deepseekHeadlessPatch": "agents/deepseek/headless.patch.yml",
     "reasonixAgents": "agents/reasonix/skills",
-    "reasonixFrameworks": "agents/reasonix/frameworks"
+    "reasonixFrameworks": "agents/reasonix/frameworks",
+    "hermesAgents": "agents/hermes/skills",
+    "hermesFrameworks": "agents/hermes/frameworks"
   }
 }
