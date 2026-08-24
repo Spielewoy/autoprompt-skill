@@ -1,0 +1,318 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/product.schema.json",
+  "title": "Autoprompt v2 product contract",
+  "type": "object",
+  "required": [
+    "kind",
+    "contractVersion",
+    "schemaDialect",
+    "product",
+    "canonicalSources",
+    "runtimeSchemas",
+    "runtimeAccountingPolicy",
+    "runtimeRecoveryCheckpointPolicy",
+    "compatibility",
+    "generationPolicy",
+    "invariants",
+    "authority",
+    "trustBoundary"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "kind": {
+      "const": "autoprompt-product-contract"
+    },
+    "contractVersion": {
+      "const": "2.0.0"
+    },
+    "schemaDialect": {
+      "const": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "product": {
+      "type": "object",
+      "required": [
+        "id",
+        "activation",
+        "routeNames",
+        "defaultRoute",
+        "controller",
+        "humanDescription"
+      ],
+      "properties": {
+        "id": {
+          "const": "autoprompt"
+        },
+        "activation": {
+          "const": "explicit-only"
+        },
+        "routeNames": {
+          "const": [
+            "DIRECT",
+            "LIGHT",
+            "ROADMAP"
+          ]
+        },
+        "defaultRoute": {
+          "type": "null"
+        },
+        "controller": {
+          "const": "deterministic-control-plane"
+        },
+        "humanDescription": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "canonicalSources": {
+      "type": "array",
+      "minItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    },
+    "runtimeSchemas": {
+      "type": "object",
+      "minProperties": 9,
+      "required": [
+        "settings", "requestEnvelopeEntry", "routeRecommendation", "routeDecision", "evidence",
+        "stateEvent", "outcome", "runRecord", "roleReport", "accountingRecord", "accountingSnapshot",
+        "recoveryCheckpointRecord", "recoveryCheckpointSnapshot", "outcomeQualityGate"
+      ],
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^agents/contracts/schemas/[a-z0-9-]+\\.schema\\.json$"
+      }
+    },
+    "runtimeAccountingPolicy": {
+      "type": "object",
+      "required": [
+        "recordPath",
+        "snapshotPath",
+        "schemaVersion",
+        "requiredCeilingFields",
+        "tokenCategories",
+        "implicitUnlimitedAllowed",
+        "hashChainRequired",
+        "snapshotMustBindLastRecord"
+      ],
+      "properties": {
+        "recordPath": {
+          "const": "runtime/accounting.jsonl"
+        },
+        "snapshotPath": {
+          "const": "runtime/budget.json"
+        },
+        "schemaVersion": {
+          "const": "2.0.0"
+        },
+        "requiredCeilingFields": {
+          "const": [
+            "wallMilliseconds",
+            "totalTokens",
+            "sessions",
+            "launches",
+            "retries",
+            "costMicrounits",
+            "finalizationReserveMilliseconds"
+          ]
+        },
+        "tokenCategories": {
+          "const": [
+            "noncachedInput",
+            "cachedInput",
+            "output",
+            "reasoning"
+          ]
+        },
+        "implicitUnlimitedAllowed": {
+          "const": false
+        },
+        "hashChainRequired": {
+          "const": true
+        },
+        "snapshotMustBindLastRecord": {
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "runtimeRecoveryCheckpointPolicy": {
+      "type": "object",
+      "required": [
+        "recordPath", "snapshotPath", "schemaVersion", "authorityScope", "hashChainRequired",
+        "snapshotMustBindLastRecord", "oneResumeCheckpoint", "commitOrder", "staleAccountingAction"
+      ],
+      "properties": {
+        "recordPath": { "const": "runtime/recovery-checkpoints.jsonl" },
+        "snapshotPath": { "const": "runtime/recovery-checkpoint.json" },
+        "schemaVersion": { "const": "2.0.0" },
+        "authorityScope": { "const": "one-run-activation-lineage" },
+        "hashChainRequired": { "const": true },
+        "snapshotMustBindLastRecord": { "const": true },
+        "oneResumeCheckpoint": { "const": true },
+        "commitOrder": {
+          "const": [
+            "append-complete-record-and-newline",
+            "sync-record-log",
+            "write-and-sync-temporary-snapshot",
+            "atomically-replace-snapshot",
+            "sync-containing-directory"
+          ]
+        },
+        "staleAccountingAction": { "const": "reject-resume-and-require-authorized-roll-forward" }
+      },
+      "additionalProperties": false
+    },
+    "compatibility": {
+      "type": "object",
+      "required": [
+        "readVersions",
+        "writeVersion",
+        "policy",
+        "legacySource",
+        "legacySourceIsAuthoritative",
+        "aliasTelemetryRequired"
+      ],
+      "properties": {
+        "readVersions": {
+          "type": "array",
+          "contains": {
+            "const": "1"
+          }
+        },
+        "writeVersion": {
+          "const": "2.0.0"
+        },
+        "policy": {
+          "const": "dual-read-v2-write"
+        },
+        "legacySource": {
+          "const": "agents/contracts/autoprompt.contract.json"
+        },
+        "legacySourceIsAuthoritative": {
+          "const": false
+        },
+        "aliasTelemetryRequired": {
+          "const": true
+        },
+        "removeAliasesAfter": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "generationPolicy": {
+      "type": "object",
+      "required": [
+        "authoritativeInputs",
+        "authoritativePromptSources",
+        "requireEveryCompatibilityAliasPrompt",
+        "legacyInputAllowedForProviderGeneration",
+        "providerOutputMustEmbedContractVersion",
+        "providerOutputMustPassPlainLanguageLint",
+        "providerOutputMustPassSemanticProjection",
+        "failWhenCanonicalInputIsMissing"
+      ],
+      "properties": {
+        "authoritativeInputs": {
+          "type": "array",
+          "minItems": 7,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^agents/contracts/[a-z0-9-]+\\.json$"
+          }
+        },
+        "authoritativePromptSources": {
+          "type": "array",
+          "minItems": 27,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^agents/contracts/(generic|frameworks/composition|personas/ap-[a-z0-9-]+)\\.md$"
+          }
+        },
+        "requireEveryCompatibilityAliasPrompt": {
+          "const": true
+        },
+        "legacyInputAllowedForProviderGeneration": {
+          "const": false
+        },
+        "providerOutputMustEmbedContractVersion": {
+          "const": "2.0.0"
+        },
+        "providerOutputMustPassPlainLanguageLint": {
+          "const": true
+        },
+        "providerOutputMustPassSemanticProjection": {
+          "const": true
+        },
+        "failWhenCanonicalInputIsMissing": {
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "invariants": {
+      "type": "array",
+      "minItems": 8,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "humanDescription"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]+$"
+          },
+          "humanDescription": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "authority": {
+      "type": "object"
+    },
+    "trustBoundary": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "source": {
+      "type": "object",
+      "required": [
+        "id",
+        "contract",
+        "schema"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]+$"
+        },
+        "contract": {
+          "type": "string",
+          "pattern": "^agents/contracts/[a-z0-9-]+\\.json$"
+        },
+        "schema": {
+          "type": "string",
+          "pattern": "^agents/contracts/schemas/[a-z0-9-]+\\.schema\\.json$"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

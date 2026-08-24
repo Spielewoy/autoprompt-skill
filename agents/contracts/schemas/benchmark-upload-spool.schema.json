@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.dev/schemas/benchmark-upload-spool.v2.json",
+  "title": "Autoprompt durable benchmark upload spool",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "spoolId", "manifestDigest", "objects", "maxAttempts", "attempts", "baseBackoffMs", "maxBackoffMs", "state", "claim", "nextAttemptAt", "lastError", "receipt", "updatedAt", "checksum"],
+  "properties": {
+    "schemaVersion": { "const": "benchmark-upload-spool.v2" },
+    "spoolId": { "$ref": "#/$defs/nonEmpty" },
+    "manifestDigest": { "$ref": "#/$defs/sha256" },
+    "objects": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/object" } },
+    "maxAttempts": { "type": "integer", "minimum": 1 },
+    "attempts": { "type": "integer", "minimum": 0 },
+    "baseBackoffMs": { "type": "integer", "minimum": 1 },
+    "maxBackoffMs": { "type": "integer", "minimum": 1 },
+    "state": { "enum": ["PENDING", "UPLOADING", "RETRY_WAIT", "UPLOADED", "EVIDENCE_INCOMPLETE"] },
+    "claim": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/claim" }] },
+    "nextAttemptAt": { "oneOf": [{ "type": "null" }, { "type": "string", "format": "date-time" }] },
+    "lastError": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/error" }] },
+    "receipt": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/receipt" }] },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "checksum": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "portablePath": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*\\\\)(?!.*[\\u0000-\\u001F\\u007F:])(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*(?:^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Ll][Oo][Cc][Kk]\\$|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.[^/]*)?(?:/|$))(?!.*(?:^|/)[^/]*[. ](?:/|$))[^/]+(?:/[^/]+)*$" },
+    "object": { "type": "object", "additionalProperties": false, "required": ["digest", "relativePath"], "properties": { "digest": { "$ref": "#/$defs/sha256" }, "relativePath": { "$ref": "#/$defs/portablePath" } } },
+    "claim": { "type": "object", "additionalProperties": false, "required": ["claimId", "ownerPid", "claimedAt"], "properties": { "claimId": { "$ref": "#/$defs/nonEmpty" }, "ownerPid": { "type": "integer", "minimum": 1 }, "claimedAt": { "type": "string", "format": "date-time" } } },
+    "error": { "type": "object", "additionalProperties": false, "required": ["code", "at"], "properties": { "code": { "$ref": "#/$defs/nonEmpty" }, "at": { "type": "string", "format": "date-time" } } },
+    "receipt": { "type": "object", "additionalProperties": false, "required": ["provider", "objectVersion", "manifestDigest", "objectsDigest", "uploadedAt", "algorithm", "issuer", "keyId", "signature"], "properties": { "provider": { "$ref": "#/$defs/nonEmpty" }, "objectVersion": { "$ref": "#/$defs/nonEmpty" }, "manifestDigest": { "$ref": "#/$defs/sha256" }, "objectsDigest": { "$ref": "#/$defs/sha256" }, "uploadedAt": { "type": "string", "format": "date-time" }, "algorithm": { "const": "ed25519" }, "issuer": { "$ref": "#/$defs/nonEmpty" }, "keyId": { "$ref": "#/$defs/nonEmpty" }, "signature": { "type": "string", "pattern": "^[A-Za-z0-9+/]{86}==$" } } }
+  }
+}

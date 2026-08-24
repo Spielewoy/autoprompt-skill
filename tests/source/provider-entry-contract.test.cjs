@@ -5,11 +5,15 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const test = require('node:test')
+const { parseArgs } = require('../../bin/autoprompt.cjs')
+const codexConfigure = require('../../scripts/codex-configure.cjs')
+const codexCasting = require('../../agents/codex/workflow/codex-agent-casting.js')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const PROVIDERS = [
   'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime', 'omp', 'deepseek', 'reasonix',
 ]
+const TEXT_CONTRACT_PROVIDERS = PROVIDERS.filter(provider => provider !== 'codex')
 const SKILLS = new Map(PROVIDERS.map(provider => [
   provider,
   provider === 'prime'
@@ -27,8 +31,9 @@ function chooserBlock(source) {
   return match[1]
 }
 
-test('all nine public skills are explicit-only and a bare invocation always stops', () => {
-  for (const [provider, relativePath] of SKILLS) {
+test('non-Codex public skills retain their existing explicit-only text contract', () => {
+  for (const provider of TEXT_CONTRACT_PROVIDERS) {
+    const relativePath = SKILLS.get(provider)
     const source = read(relativePath)
     assert.match(source, /explicit(?:-only| invocation|ly invokes)|Use only when the user explicitly/i, `${provider} explicit trigger`)
     assert.match(source, /bare invocation[^.]*stops?(?:[;.]|\s)/i, `${provider} bare stop`)
@@ -53,8 +58,8 @@ test('OMP and DeepSeek expose the top-level skill only to explicit user invocati
   assert.match(read(SKILLS.get('reasonix')), /^invocation: manual$/m)
 })
 
-test('every attended provider resolves missing knobs once before repository work', () => {
-  for (const provider of PROVIDERS) {
+test('non-Codex attended providers retain one pre-work chooser declaration', () => {
+  for (const provider of TEXT_CONTRACT_PROVIDERS) {
     const relativePath = SKILLS.get(provider)
     const source = read(relativePath)
     const occurrences = source.match(/In an attended session, ask all undefined knobs in one (?:`AskUserQuestion` call|question) before (?:any )?repository(?:\/tool)? work\./g) || []
@@ -63,7 +68,7 @@ test('every attended provider resolves missing knobs once before repository work
 })
 
 test('chooser model options match each provider capability', () => {
-  for (const provider of ['claude', 'codex']) {
+  for (const provider of ['claude']) {
     const block = chooserBlock(read(SKILLS.get(provider)))
     assert.match(block, /Agent selection:[^\n]*`off`\/inherit[^\n]*`auto`[^\n]*explicit model list/i, provider)
   }
@@ -93,7 +98,6 @@ test('chooser model options match each provider capability', () => {
 
 test('provider routing statements match the real adapters', () => {
   assert.match(read(SKILLS.get('claude')), /Claude Code routing uses `opus`, `sonnet`, and `haiku`/)
-  assert.match(read(SKILLS.get('codex')), /actual custom-agent TOML `model` and `model_reasoning_effort` capabilities/)
   for (const provider of ['opencode', 'kilo', 'vscode', 'omp', 'deepseek', 'reasonix']) {
     const source = read(SKILLS.get(provider))
     assert.match(source, /inherit(?:s|ed)[^\n]*model/i, provider)
@@ -102,6 +106,41 @@ test('provider routing statements match the real adapters', () => {
   }
   const prime = read(SKILLS.get('prime'))
   assert.match(prime, /never passes `model`[^.]*inherits the selected parent model/i)
+})
+
+test('Codex entry behavior requires an explicit activation mission and never resumes from a bare invocation', () => {
+  assert.deepEqual(parseArgs([]), { command: 'help' })
+  assert.throws(() => parseArgs(['activate', 'codex']))
+  assert.throws(() => parseArgs(['activate', 'codex', '--']))
+  assert.deepEqual(parseArgs(['activate', 'codex', '--', 'fix', 'the', 'bug']), {
+    command: 'activate', provider: 'codex', missionArgs: ['fix', 'the', 'bug'], compatibilityAlias: false,
+  })
+})
+
+test('Codex chooser and casting behavior enforce real selector, model, and effort capabilities', () => {
+  assert.throws(() => codexConfigure.resolveSelector('', ''), /invalid model identifier/i)
+  assert.deepEqual(codexConfigure.resolveSelector('off', ''), { selector: 'off', models: [], registry: '' })
+  assert.deepEqual(codexConfigure.resolveSelector('gpt-5.6-sol,gpt-5.6-terra', ''), {
+    selector: 'gpt-5.6-sol,gpt-5.6-terra', models: ['gpt-5.6-sol', 'gpt-5.6-terra'], registry: '',
+  })
+  assert.throws(() => codexConfigure.resolveSelector('auto', ''), /absolute readable --model-map/i)
+
+  assert.deepEqual(codexCasting.validateAgentCast([
+    { file: 'ap-worker.toml', model: null, effort: null },
+  ], 'off', ''), {
+    enabled: false, models: [], effort: { status: 'inherited-only', source: 'session-inheritance' },
+  })
+  assert.deepEqual(codexCasting.validateAgentCast([
+    { file: 'ap-worker.toml', model: 'gpt-5.6-sol', effort: 'xhigh' },
+    { file: 'ap-reviewer.toml', model: 'gpt-5.6-terra', effort: 'high' },
+  ], 'gpt-5.6-sol,gpt-5.6-terra', ''), {
+    enabled: true,
+    models: ['gpt-5.6-sol', 'gpt-5.6-terra'],
+    effort: { status: 'selectable', source: 'codex-custom-agent-toml' },
+  })
+  assert.throws(() => codexCasting.validateAgentCast([
+    { file: 'ap-worker.toml', model: 'gpt-5.6-sol', effort: null },
+  ], 'gpt-5.6-sol', ''), /requires model_reasoning_effort/i)
 })
 
 test('an attended conductor cannot dispatch Agent or Task before the chooser', () => {

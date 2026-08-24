@@ -1,0 +1,185 @@
+{
+  "schemaVersion": "2.0.0",
+  "evidenceClass": "sealed-semantic-conformance-corpus",
+  "missions": [
+    {
+      "id": "typo-one-file",
+      "domain": "typo",
+      "expectedRoute": "DIRECT",
+      "overrides": {
+        "requestedEffect": "mutate",
+        "mutableResources": [
+          { "kind": "file", "identity": "src/label.txt", "shared": false, "ownershipMode": "single-owner" }
+        ],
+        "sideEffects": ["deliverable-write"]
+      }
+    },
+    {
+      "id": "bounded-one-file-bug",
+      "domain": "bug",
+      "expectedRoute": "DIRECT",
+      "overrides": {
+        "requestedEffect": "mutate",
+        "mutableResources": [
+          { "kind": "file", "identity": "src/parser.js", "shared": false, "ownershipMode": "single-owner" }
+        ],
+        "sideEffects": ["deliverable-write"]
+      }
+    },
+    {
+      "id": "bounded-docs-correction",
+      "domain": "docs",
+      "expectedRoute": "DIRECT",
+      "overrides": {
+        "requestedEffect": "mutate",
+        "mutableResources": [
+          { "kind": "file", "identity": "docs/usage.md", "shared": false, "ownershipMode": "single-owner" }
+        ],
+        "sideEffects": ["deliverable-write"],
+        "checkAndBaseline": {
+          "checkQuality": "public",
+          "availableCheckKinds": ["rendered-doc-check"],
+          "baselineStatus": "recorded",
+          "hiddenExternalCheck": false
+        }
+      }
+    },
+    {
+      "id": "bounded-current-research",
+      "domain": "research",
+      "expectedRoute": "DIRECT",
+      "overrides": {
+        "requestedEffect": "research",
+        "checkAndBaseline": {
+          "checkQuality": "observable",
+          "availableCheckKinds": ["source-receipts"],
+          "baselineStatus": "not-applicable",
+          "hiddenExternalCheck": false
+        }
+      }
+    },
+    {
+      "id": "xss-bounded-security-fix",
+      "domain": "xss",
+      "expectedRoute": "LIGHT",
+      "overrides": {
+        "requestedEffect": "mutate",
+        "uncertainty": "reversible-technical",
+        "approachNeedsShortPlanning": true,
+        "mutableResources": [
+          { "kind": "file", "identity": "src/render.js", "shared": false, "ownershipMode": "single-owner" }
+        ],
+        "sideEffects": ["deliverable-write"],
+        "riskAndIndependentCheckFloor": {
+          "level": "elevated",
+          "minimumCheckerCount": 2,
+          "namedDistinctResponsibilities": ["output encoding review", "browser behavior test"]
+        }
+      }
+    },
+    {
+      "id": "database-writeback-staged",
+      "domain": "database-writeback",
+      "expectedRoute": "ROADMAP",
+      "overrides": {
+        "requestedEffect": "external-operation",
+        "reversibility": "staged-rollback-required",
+        "externality": "external-write",
+        "thirdPartyImpact": "material",
+        "targetAuthorization": {
+          "targetIdentities": ["database:customer-primary"],
+          "authorizedTargetIdentities": ["database:customer-primary"],
+          "authorizationEvidenceHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "mutableResources": [
+          { "kind": "database", "identity": "customer-primary", "shared": true, "ownershipMode": "exclusive-lease" }
+        ],
+        "sideEffects": ["database-write", "external-write"],
+        "riskAndIndependentCheckFloor": {
+          "level": "staged-high-impact",
+          "minimumCheckerCount": 2,
+          "namedDistinctResponsibilities": ["migration safety", "data reconciliation"]
+        }
+      }
+    },
+    {
+      "id": "cad-bounded-change",
+      "domain": "cad",
+      "expectedRoute": "LIGHT",
+      "overrides": {
+        "requestedEffect": "mutate",
+        "uncertainty": "reversible-technical",
+        "checkAndBaseline": {
+          "checkQuality": "short-plan",
+          "availableCheckKinds": ["geometric-validation", "rendered-inspection"],
+          "baselineStatus": "recorded",
+          "hiddenExternalCheck": false
+        },
+        "mutableResources": [
+          { "kind": "file", "identity": "cad/bracket.step", "shared": false, "ownershipMode": "single-owner" }
+        ],
+        "sideEffects": ["deliverable-write"]
+      }
+    },
+    {
+      "id": "local-checkpoint",
+      "domain": "checkpoint",
+      "expectedRoute": "DIRECT",
+      "overrides": {
+        "requestedEffect": "mutate",
+        "mutableResources": [
+          { "kind": "output", "identity": "local-checkpoint", "shared": false, "ownershipMode": "single-owner" }
+        ],
+        "sideEffects": ["deliverable-write"]
+      }
+    },
+    {
+      "id": "binary-format-repair",
+      "domain": "binary",
+      "expectedRoute": "LIGHT",
+      "overrides": {
+        "requestedEffect": "mutate",
+        "uncertainty": "reversible-technical",
+        "shortOrderUnclear": true,
+        "mutableResources": [
+          { "kind": "file", "identity": "fixtures/sample.bin", "shared": false, "ownershipMode": "single-owner" }
+        ],
+        "sideEffects": ["deliverable-write"],
+        "checkAndBaseline": {
+          "checkQuality": "short-plan",
+          "availableCheckKinds": ["binary-comparison"],
+          "baselineStatus": "recorded",
+          "hiddenExternalCheck": false
+        }
+      }
+    },
+    {
+      "id": "soc-multi-lane-build",
+      "domain": "soc",
+      "expectedRoute": "ROADMAP",
+      "overrides": {
+        "requestedEffect": "mutate",
+        "architectureImpact": "multi-system",
+        "dependency": {
+          "shape": "dependent-groups",
+          "dependentWorkGroupCount": 3,
+          "integrationOwnerRequired": true,
+          "separateDependentBodies": 3
+        },
+        "fitsLightPlan": false,
+        "mutableResources": [
+          { "kind": "directory", "identity": "rtl", "shared": true, "ownershipMode": "ordered-transfer" },
+          { "kind": "directory", "identity": "firmware", "shared": true, "ownershipMode": "ordered-transfer" },
+          { "kind": "directory", "identity": "verification", "shared": true, "ownershipMode": "ordered-transfer" }
+        ],
+        "sideEffects": ["deliverable-write", "build-cache-write"],
+        "checkAndBaseline": {
+          "checkQuality": "coordinated-design",
+          "availableCheckKinds": ["simulation", "integration"],
+          "baselineStatus": "recorded",
+          "hiddenExternalCheck": false
+        }
+      }
+    }
+  ]
+}

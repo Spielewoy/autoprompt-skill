@@ -1,0 +1,39 @@
+{
+  "schemaVersion": "codex-mechanism-canary.v1",
+  "evidenceClass": "harness-mechanics-only",
+  "provider": "codex",
+  "repetitions": 1,
+  "task": {
+    "taskId": "normalize-tags-direct",
+    "route": "DIRECT",
+    "fixtureDir": "tests/fixtures/codex-low-compute-v1/task",
+    "focusedCheck": {
+      "argv": ["{node}", "--test", "test.cjs"],
+      "timeoutMs": 30000
+    }
+  },
+  "arms": [
+    {
+      "armId": "base",
+      "role": "single-agent-base",
+      "runner": "tests/fixtures/codex-low-compute-v1/deterministic-arm.cjs"
+    },
+    {
+      "armId": "current",
+      "role": "frozen-current-autoprompt",
+      "runner": "tests/fixtures/codex-low-compute-v1/deterministic-arm.cjs"
+    },
+    {
+      "armId": "redesign",
+      "role": "codex-redesign",
+      "runner": "tests/fixtures/codex-low-compute-v1/deterministic-arm.cjs"
+    }
+  ],
+  "realCodex": {
+    "status": "BLOCKED",
+    "phase": "pre-route",
+    "code": "PROVIDER_UNSUPPORTED",
+    "reason": "codex-command-sandbox-network-open",
+    "evidencePath": "docs/benchmarks/codex-canary-2026-08-22.md"
+  }
+}

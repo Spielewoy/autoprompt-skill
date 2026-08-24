@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.dev/schemas/benchmark-route-holdout.v1.json",
+  "title": "Autoprompt route-holdout provenance",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "holdoutId", "createdAt", "sealedAt", "purpose", "developmentExamplesSeparated", "fixture", "labels", "tuningFreeze"],
+  "properties": {
+    "schemaVersion": { "const": "benchmark-route-holdout.v1" },
+    "holdoutId": { "$ref": "#/$defs/nonEmpty" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "sealedAt": { "type": "string", "format": "date-time" },
+    "purpose": { "$ref": "#/$defs/nonEmpty" },
+    "developmentExamplesSeparated": { "type": "boolean" },
+    "fixture": { "$ref": "#/$defs/fixture" },
+    "labels": { "$ref": "#/$defs/labels" },
+    "tuningFreeze": { "$ref": "#/$defs/tuningFreeze" }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "nullableSha256": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }] },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relativePath", "sha256", "rowCount"],
+      "properties": {
+        "relativePath": { "$ref": "#/$defs/nonEmpty" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "rowCount": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "agreement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "value", "evidenceSha256"],
+      "properties": {
+        "metric": { "oneOf": [{ "type": "null" }, { "enum": ["cohen-kappa", "fleiss-kappa", "krippendorff-alpha"] }] },
+        "value": { "oneOf": [{ "type": "null" }, { "type": "number", "minimum": -1, "maximum": 1 }] },
+        "evidenceSha256": { "$ref": "#/$defs/nullableSha256" }
+      },
+      "oneOf": [
+        { "properties": { "metric": { "type": "null" }, "value": { "type": "null" }, "evidenceSha256": { "type": "null" } } },
+        { "properties": { "metric": { "enum": ["cohen-kappa", "fleiss-kappa", "krippendorff-alpha"] }, "value": { "type": "number", "minimum": -1, "maximum": 1 }, "evidenceSha256": { "$ref": "#/$defs/sha256" } } }
+      ]
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceKind", "independentlyHumanLabeled", "raterCount", "agreement", "adjudicationEvidenceSha256"],
+      "properties": {
+        "sourceKind": { "enum": ["synthetic-design-fixture", "independent-human"] },
+        "independentlyHumanLabeled": { "type": "boolean" },
+        "raterCount": { "type": "integer", "minimum": 0 },
+        "agreement": { "$ref": "#/$defs/agreement" },
+        "adjudicationEvidenceSha256": { "$ref": "#/$defs/nullableSha256" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "sourceKind": { "const": "independent-human" } }, "required": ["sourceKind"] },
+          "then": {
+            "properties": {
+              "independentlyHumanLabeled": { "const": true },
+              "raterCount": { "minimum": 2 },
+              "agreement": {
+                "properties": {
+                  "metric": { "enum": ["cohen-kappa", "fleiss-kappa", "krippendorff-alpha"] },
+                  "value": { "type": "number", "minimum": -1, "maximum": 1 },
+                  "evidenceSha256": { "$ref": "#/$defs/sha256" }
+                }
+              },
+              "adjudicationEvidenceSha256": { "$ref": "#/$defs/sha256" }
+            }
+          },
+          "else": {
+            "properties": {
+              "independentlyHumanLabeled": { "const": false },
+              "raterCount": { "const": 0 },
+              "agreement": {
+                "properties": {
+                  "metric": { "type": "null" },
+                  "value": { "type": "null" },
+                  "evidenceSha256": { "type": "null" }
+                }
+              },
+              "adjudicationEvidenceSha256": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "tuningFreeze": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["frozenBeforePromptTuning", "implementationFingerprint", "evidenceSha256"],
+      "properties": {
+        "frozenBeforePromptTuning": { "type": "boolean" },
+        "implementationFingerprint": { "$ref": "#/$defs/nullableSha256" },
+        "evidenceSha256": { "$ref": "#/$defs/nullableSha256" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "frozenBeforePromptTuning": { "const": true } }, "required": ["frozenBeforePromptTuning"] },
+          "then": { "properties": { "implementationFingerprint": { "$ref": "#/$defs/sha256" }, "evidenceSha256": { "$ref": "#/$defs/sha256" } } },
+          "else": { "properties": { "implementationFingerprint": { "type": "null" }, "evidenceSha256": { "type": "null" } } }
+        }
+      ]
+    }
+  }
+}

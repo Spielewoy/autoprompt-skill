@@ -34,12 +34,38 @@ config_root() {
   autoprompt_config_root "$client"
 }
 
+codex_maintenance() {
+  local root="$1" action="$2" helper output rc
+  [ -d "$root" ] || return 0
+  helper="$REPO_ROOT/scripts/codex-configure.cjs"
+  if ! command -v node >/dev/null 2>&1 || [ ! -f "$helper" ]; then
+    printf '%s\n' \
+      'Autoprompt uninstall (codex): unresolved activation state; node/helper unavailable.' >&2
+    return 1
+  fi
+  output="$(AUTOPROMPT_INSTALL_ROOT="$root" node "$helper" "$action" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then printf '%s\n' "$output" >&2; fi
+  return "$rc"
+}
+
 # uninstall_root <root> <label>: drive uninstall_client for one config-root. The <label>
 # is the client name passed to the library (used only in its summary line). Emits a
 # RESULT=/SKIP= row. The no-receipt case (library code 71) is a SKIP, not a failure.
 uninstall_root() {
   local root="$1" label="$2"
+  if [ "$label" = codex ] && ! codex_maintenance "$root" --revoke-all; then
+    RESULT_ROWS+=("RESULT=FAIL client=$label code=1")
+    UNINSTALL_EXIT_CODE=1
+    return 0
+  fi
   if [ ! -f "$root/$AUTOPROMPT_RECEIPT_NAME" ]; then
+    if [ "$label" = codex ] && ! codex_maintenance "$root" --has-known-residue; then
+      printf 'Autoprompt uninstall (codex): unresolved residue remains under %s categories=managed,known-legacy,unresolved-collision.\n' \
+        "$root" >&2
+      RESULT_ROWS+=("RESULT=FAIL client=$label code=3")
+      UNINSTALL_EXIT_CODE=1
+      return 0
+    fi
     printf 'Autoprompt uninstall (%s): SKIP - no install receipt under %s.\n' "$label" "$root" >&2
     RESULT_ROWS+=("SKIP=skip client=$label reason=no-receipt")
     return 0
@@ -61,6 +87,13 @@ uninstall_root() {
     return 0
   fi
   rm -f "$output" "$errors"
+  if [ "$label" = codex ] && ! codex_maintenance "$root" --has-known-residue; then
+    printf 'Autoprompt uninstall (codex): unresolved residue remains under %s categories=managed,known-legacy,unresolved-collision.\n' \
+      "$root" >&2
+    RESULT_ROWS+=("RESULT=FAIL client=$label code=3")
+    UNINSTALL_EXIT_CODE=1
+    return 0
+  fi
   local removed="${rec#*uninstall=ok removed=}"; removed="${removed%% *}"
   printf 'Autoprompt uninstall (%s): OK - %s\n' "$label" "$rec" >&2
   RESULT_ROWS+=("RESULT=OK client=$label removed=$removed")

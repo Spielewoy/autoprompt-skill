@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "name": "@autoprompt-skill/codex-runtime",
+  "algorithm": "sha256-chain-v1",
+  "releases": [
+    {
+      "version": "1.0.5",
+      "payloadGeneration": "codex-v2.0.0-e77127a56dae2e4f",
+      "payloadDigest": "e77127a56dae2e4f33851678b4baf4d945fe1f6af7aba9441d05dbc48a1712d7",
+      "previousRecordDigest": null,
+      "recordDigest": "d5c4d97bf557e513680dd7d2dcd14ed6ac0769f89b538297b4103221ff0a74ab"
+    },
+    {
+      "version": "1.0.6",
+      "payloadGeneration": "codex-v2.0.0-74c1ebf88a720ab2",
+      "payloadDigest": "74c1ebf88a720ab2c032f2d62bbe7cc40e15f5135b672fdc1ee4567bb588c502",
+      "previousRecordDigest": "d5c4d97bf557e513680dd7d2dcd14ed6ac0769f89b538297b4103221ff0a74ab",
+      "recordDigest": "2be1b27b66a4bd264cbb432e1e7e03534d7c98dcf20033e937677aea8a149a19"
+    },
+    {
+      "version": "1.0.7",
+      "payloadGeneration": "codex-v2.0.0-1e398a597a547574",
+      "payloadDigest": "1e398a597a54757405c2b04a61721454d9b2d18f7a8efbee23f29c1002084681",
+      "previousRecordDigest": "2be1b27b66a4bd264cbb432e1e7e03534d7c98dcf20033e937677aea8a149a19",
+      "recordDigest": "9a2ea32a061980c01c4319b2705f27e663009d0d1a1d10ed9954e5f502f10d21"
+    },
+    {
+      "version": "1.0.8",
+      "payloadGeneration": "codex-v2.0.0-e48ad822f54fc3b0",
+      "payloadDigest": "e48ad822f54fc3b06c533801b82c01d595bc5b8ee8d55c43dc2f554cf70f6f5c",
+      "previousRecordDigest": "9a2ea32a061980c01c4319b2705f27e663009d0d1a1d10ed9954e5f502f10d21",
+      "recordDigest": "ced4ec1d48cfd4ae2c8dfd26c96355b4442722244899ff8d6e8db6f4abe87158"
+    },
+    {
+      "version": "1.0.9",
+      "payloadGeneration": "codex-v2.0.0-576e13a743a0a74e",
+      "payloadDigest": "576e13a743a0a74e7916b69b6ab184058c641f1c60e77bb3092a62fb6e8175e3",
+      "previousRecordDigest": "ced4ec1d48cfd4ae2c8dfd26c96355b4442722244899ff8d6e8db6f4abe87158",
+      "recordDigest": "71f703ec61b16ad273c4895c2631bf7bcd863b7a9d17cd5fa16692dcc33fc069"
+    }
+  ]
+}

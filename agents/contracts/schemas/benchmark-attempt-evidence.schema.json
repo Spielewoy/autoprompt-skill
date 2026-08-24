@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.dev/schemas/benchmark-attempt-evidence.v2.json",
+  "title": "Autoprompt content-addressed benchmark attempt evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "manifestDigest", "attempt", "resources", "startedAt", "endedAt", "system", "harbor", "result", "authority", "artifacts", "sessions", "sessionLog", "costs", "provenance", "canary", "checksum"],
+  "properties": {
+    "schemaVersion": { "const": "benchmark-attempt-evidence.v2" },
+    "manifestDigest": { "$ref": "#/$defs/sha256" },
+    "attempt": { "oneOf": [{ "$ref": "#/$defs/scored" }, { "$ref": "#/$defs/repair" }, { "$ref": "#/$defs/canary" }] },
+    "resources": { "$ref": "#/$defs/resources" },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "endedAt": { "oneOf": [{ "type": "null" }, { "type": "string", "format": "date-time" }] },
+    "system": { "$ref": "#/$defs/system" },
+    "harbor": { "$ref": "#/$defs/harbor" },
+    "result": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/blob" }] },
+    "authority": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/blob" }] },
+    "artifacts": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/blob" } },
+    "sessions": { "type": "array", "minItems": 1, "items": { "$ref": "https://autoprompt.dev/schemas/benchmark-session.v2.json" } },
+    "sessionLog": { "$ref": "#/$defs/blob" },
+    "costs": { "$ref": "#/$defs/costs" },
+    "provenance": { "oneOf": [{ "$ref": "#/$defs/snapshotProvenance" }, { "$ref": "#/$defs/liveProvenance" }] },
+    "canary": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/canaryResult" }] },
+    "checksum": { "$ref": "#/$defs/sha256" }
+  },
+  "allOf": [
+    { "if": { "properties": { "attempt": { "properties": { "attemptClass": { "const": "canary" } }, "required": ["attemptClass"] } } }, "then": { "properties": { "canary": { "$ref": "#/$defs/canaryResult" } } }, "else": { "properties": { "canary": { "type": "null" } } } },
+    { "if": { "properties": { "attempt": { "properties": { "attemptClass": { "const": "scored" } }, "required": ["attemptClass"] }, "harbor": { "properties": { "status": { "const": "completed" } }, "required": ["status"] } } }, "then": { "properties": { "result": { "$ref": "#/$defs/blob" }, "authority": { "$ref": "#/$defs/blob" } } } }
+  ],
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "scored": { "type": "object", "additionalProperties": false, "required": ["attemptId", "attemptClass", "taskId", "armId", "repetition", "pairedOrder", "execution"], "properties": { "attemptId": { "$ref": "#/$defs/nonEmpty" }, "attemptClass": { "const": "scored" }, "taskId": { "$ref": "#/$defs/nonEmpty" }, "armId": { "$ref": "#/$defs/nonEmpty" }, "repetition": { "type": "integer", "minimum": 1 }, "pairedOrder": { "type": "integer", "minimum": 1 }, "execution": { "$ref": "#/$defs/scoredExecution" } } },
+    "repair": { "type": "object", "additionalProperties": false, "required": ["attemptId", "attemptClass", "repairOfAttemptId", "taskId", "armId", "repetition"], "properties": { "attemptId": { "$ref": "#/$defs/nonEmpty" }, "attemptClass": { "const": "repair" }, "repairOfAttemptId": { "$ref": "#/$defs/nonEmpty" }, "taskId": { "$ref": "#/$defs/nonEmpty" }, "armId": { "$ref": "#/$defs/nonEmpty" }, "repetition": { "type": "integer", "minimum": 1 } } },
+    "canary": { "type": "object", "additionalProperties": false, "required": ["attemptId", "attemptClass", "canaryId", "stage", "polarity", "armId", "repetition", "checks", "execution"], "properties": { "attemptId": { "$ref": "#/$defs/nonEmpty" }, "attemptClass": { "const": "canary" }, "canaryId": { "$ref": "#/$defs/nonEmpty" }, "stage": { "enum": ["pre", "mid", "post"] }, "polarity": { "enum": ["positive", "negative"] }, "armId": { "$ref": "#/$defs/nonEmpty" }, "repetition": { "const": 0 }, "checks": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } }, "expectedDiagnosis": { "enum": ["WRONG_MODEL", "MISSING_SUBAGENT_TRACE", "BROKEN_VERIFIER", "UPLOAD_DENIED"] }, "execution": { "$ref": "#/$defs/canaryExecution" } }, "allOf": [{ "if": { "properties": { "polarity": { "const": "negative" } }, "required": ["polarity"] }, "then": { "required": ["expectedDiagnosis"] }, "else": { "not": { "required": ["expectedDiagnosis"] } } }] },
+    "scoredExecution": { "type": "object", "additionalProperties": false, "required": ["argv", "input", "environment", "toolchain"], "properties": { "argv": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/nonEmpty" } }, "input": { "$ref": "#/$defs/blob" }, "environment": { "$ref": "#/$defs/blob" }, "toolchain": { "$ref": "#/$defs/blob" } } },
+    "canaryExecution": { "type": "object", "additionalProperties": false, "required": ["argv", "input", "fixture", "environment", "toolchain", "faultInjector"], "properties": { "argv": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/nonEmpty" } }, "input": { "$ref": "#/$defs/blob" }, "fixture": { "$ref": "#/$defs/blob" }, "environment": { "$ref": "#/$defs/blob" }, "toolchain": { "$ref": "#/$defs/blob" }, "faultInjector": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/faultInjector" }] } } },
+    "faultInjector": { "type": "object", "additionalProperties": false, "required": ["name", "argv", "artifact"], "properties": { "name": { "enum": ["wrong-model", "missing-subagent-trace", "broken-verifier", "upload-denied"] }, "argv": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/nonEmpty" } }, "artifact": { "$ref": "#/$defs/blob" } } },
+    "resources": { "type": "object", "additionalProperties": false, "required": ["instanceId", "bucket", "runRoot", "containerNamespace", "trialPrefix", "evidence"], "properties": { "instanceId": { "$ref": "#/$defs/nonEmpty" }, "bucket": { "$ref": "#/$defs/nonEmpty" }, "runRoot": { "$ref": "#/$defs/nonEmpty" }, "containerNamespace": { "$ref": "#/$defs/nonEmpty" }, "trialPrefix": { "$ref": "#/$defs/nonEmpty" }, "evidence": { "$ref": "#/$defs/blob" } } },
+    "portablePath": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*\\\\)(?!.*[\\u0000-\\u001F\\u007F:])(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*(?:^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Ll][Oo][Cc][Kk]\\$|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.[^/]*)?(?:/|$))(?!.*(?:^|/)[^/]*[. ](?:/|$))[^/]+(?:/[^/]+)*$" },
+    "blob": { "type": "object", "additionalProperties": false, "required": ["relativePath", "sha256", "bytes"], "properties": { "relativePath": { "$ref": "#/$defs/portablePath" }, "sha256": { "$ref": "#/$defs/sha256" }, "bytes": { "type": "integer", "minimum": 0 } } },
+    "hostKill": { "type": "object", "additionalProperties": false, "required": ["enforcer", "deadlineAt", "triggeredAt", "evidence"], "properties": { "enforcer": { "const": "external-process" }, "deadlineAt": { "type": "string", "format": "date-time" }, "triggeredAt": { "oneOf": [{ "type": "null" }, { "type": "string", "format": "date-time" }] }, "evidence": { "$ref": "#/$defs/blob" } } },
+    "system": { "type": "object", "additionalProperties": false, "required": ["containerState", "exitCode", "signal", "hostKillTriggered", "cancelled", "hostKill", "evidence"], "properties": { "containerState": { "enum": ["running", "exited", "absent"] }, "exitCode": { "oneOf": [{ "type": "null" }, { "type": "integer" }] }, "signal": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/nonEmpty" }] }, "hostKillTriggered": { "type": "boolean" }, "cancelled": { "type": "boolean" }, "hostKill": { "$ref": "#/$defs/hostKill" }, "evidence": { "$ref": "#/$defs/blob" } } },
+    "grader": { "type": "object", "additionalProperties": false, "required": ["verdict", "score", "details"], "properties": { "verdict": { "enum": ["pass", "fail"] }, "score": { "type": "number" }, "details": { "$ref": "#/$defs/blob" } } },
+    "harbor": { "oneOf": [
+      { "type": "object", "additionalProperties": false, "required": ["status", "result", "reward", "grader", "evidence"], "properties": { "status": { "const": "completed" }, "result": { "enum": ["pass", "fail"] }, "reward": { "type": "number" }, "grader": { "$ref": "#/$defs/grader" }, "evidence": { "$ref": "#/$defs/blob" } } },
+      { "type": "object", "additionalProperties": false, "required": ["status", "result", "reward", "grader", "evidence"], "properties": { "status": { "enum": ["running", "absent"] }, "result": { "type": "null" }, "reward": { "type": "null" }, "grader": { "type": "null" }, "evidence": { "$ref": "#/$defs/blob" } } }
+    ] },
+    "costs": { "type": "object", "additionalProperties": false, "required": ["hostSeconds", "storageByteMonths", "setupUnits"], "properties": { "hostSeconds": { "type": "number", "minimum": 0 }, "storageByteMonths": { "type": "number", "minimum": 0 }, "setupUnits": { "type": "number", "minimum": 0 } } },
+    "snapshotProvenance": { "type": "object", "additionalProperties": false, "required": ["kind", "snapshotId", "snapshotDigest", "snapshotRelativePath", "observedAt"], "properties": { "kind": { "const": "immutable-snapshot" }, "snapshotId": { "$ref": "#/$defs/nonEmpty" }, "snapshotDigest": { "$ref": "#/$defs/sha256" }, "snapshotRelativePath": { "$ref": "#/$defs/nonEmpty" }, "observedAt": { "type": "string", "format": "date-time" } } },
+    "liveProvenance": { "type": "object", "additionalProperties": false, "required": ["kind", "sourceRunId", "sourceRelativePath", "observedAt"], "properties": { "kind": { "const": "live-partial" }, "sourceRunId": { "$ref": "#/$defs/nonEmpty" }, "sourceRelativePath": { "$ref": "#/$defs/portablePath" }, "observedAt": { "type": "string", "format": "date-time" } } },
+    "canaryResult": { "type": "object", "additionalProperties": false, "required": ["passed", "diagnosis", "evidence", "controllerEvidence"], "properties": { "passed": { "const": true }, "diagnosis": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/nonEmpty" }] }, "evidence": { "$ref": "#/$defs/blob" }, "controllerEvidence": { "$ref": "#/$defs/blob" } } }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "provider": "codex",
+  "algorithm": "sha256",
+  "records": [
+    {
+      "releaseVersion": "1.0.5",
+      "roles": [
+        { "name": "ap-arbiter.toml", "sha256": "bc82eee918e41ba284338c499a229bddf781ce65cfa7fa94e5c4f9a0cfe94106" },
+        { "name": "ap-depth-prober.toml", "sha256": "efa6c2c40ad84ea58c9219e59d62bdd1794a3a5a37124cb410ae486db4da4e09" },
+        { "name": "ap-execharness-resolver.toml", "sha256": "90acec0f1d6f9d83c313684367210138d35fdeab38a97cdd49fc40588e5e0da9" },
+        { "name": "ap-feature-coordinator.toml", "sha256": "82dc0f86404e4792ca64683a481bb09635bda3414de8c5da9ad528560b5d680f" },
+        { "name": "ap-framework-generator.toml", "sha256": "273b683377a128cc84796b45c648ea993fa3b4d7fac53ec630cf15e565c7a703" },
+        { "name": "ap-framework-validator.toml", "sha256": "e4d8e5825827b9eadbbc24b50191061e2b25b3b1a483116ac7f1e7cf9e873609" },
+        { "name": "ap-fresh-verifier.toml", "sha256": "4f5223f0e3057e2fdd15d0ed6a7c1ce85c41e67e366ebf39e68c9dc310517fb4" },
+        { "name": "ap-goal-checker.toml", "sha256": "60b45568b414a6aacf72e2f51ce4adef19b24440cec741a934754dd608bbac7f" },
+        { "name": "ap-implementer.toml", "sha256": "277028ef4955503f5630c5e5d0e903e2d288491dc43d37b56287306cf6213676" },
+        { "name": "ap-independent-checker.toml", "sha256": "dcd154cf2cf3d80958b9b66b11b8ba25d2ebc8568fb0524e1800a8e9bafacea6" },
+        { "name": "ap-intake.toml", "sha256": "0c6b19f1d36360daf6796e8439c3cfe91bd522c1f7b260660bdfe949a5198f42" },
+        { "name": "ap-janitor.toml", "sha256": "0f10dbff1f6d6d3154cf3aa57c2177c1852e734632d89d03008445bf3997dbbe" },
+        { "name": "ap-juror.toml", "sha256": "ba66a4acac1dfee506d175d637fa9b76a08edb20d8065814cbf949fc909dd5b0" },
+        { "name": "ap-manager.toml", "sha256": "72c47eb2c527111cc370bf0a3d1248524d9f5e0e09465b1fc6bfec99e94682ac" },
+        { "name": "ap-planner.toml", "sha256": "4bc4ea7dd8633a360e004674b6a701fb942e4ed98514f6763b18f5f687ae6df8" },
+        { "name": "ap-preflight-probe.toml", "sha256": "4652949f328bbb6b7f1cb4a0bef731c99f4ddabf6c385327d47e235e90aef941" },
+        { "name": "ap-re-anchor.toml", "sha256": "eb1a4a1b0a632fe75a667c8265cbe864700964bf7d0574cca0e3001d347c962b" },
+        { "name": "ap-researcher.toml", "sha256": "25cc28d5676db3037f45a80eea47b4279641300830c4ca66abe97e14f1d1488d" },
+        { "name": "ap-reviewer.toml", "sha256": "b8aa97ce0da399493a6410a5ac6a2175b814c2a365ed9b1cb5dbcc08ea5b565e" },
+        { "name": "ap-roadmap-author.toml", "sha256": "7c967d885d66f5410355b311772a36d28317e4e1973047a7ea8899328876856f" },
+        { "name": "ap-roadmap-scout.toml", "sha256": "01ae5879b15f17ad9a1e43060ee92b2bcbafe345c680732a6368e770527b550c" },
+        { "name": "ap-route-analyst.toml", "sha256": "4c11de4f0f9858d38945bbc32a4781b9920b1ce14bb66485a7019d3cb590a336" },
+        { "name": "ap-run-coordinator.toml", "sha256": "ac54b7c66a9c43b2332aa0573f58869eff7141ae5d8eea3eecf2983ee0a1767e" },
+        { "name": "ap-scope-coordinator.toml", "sha256": "14c9f005613b9c548d045fe590880e16ce7ade5126cd46565caf78a1513f3ce3" },
+        { "name": "ap-scoper.toml", "sha256": "042252d71d36cd4c741ada9577181868cfa08757e4d425b2c5851a8fb9066041" },
+        { "name": "ap-scribe.toml", "sha256": "85c42d4e8969dc9065104bfd5747b9a1c3995e5278c793a6c0b4b5fcadd5d102" },
+        { "name": "ap-sweep-coordinator.toml", "sha256": "c751d44edde56b1fc91ce9715e4d2082219446fae2e78abfea19ac2089519675" },
+        { "name": "ap-sweeper.toml", "sha256": "e8390a49e12b5b8c687331c560d50f6d3c13113998d86b6a787261f4e276152e" },
+        { "name": "ap-synthesizer.toml", "sha256": "96db2be4ab1bcdfadf97d4fc9af54e366081ceae7fdeeed80f57e397f662a9ce" },
+        { "name": "ap-verifier.toml", "sha256": "3f234e6e6b279896cf199c9163ddfe44c8a5ce31bd70ea44c48656d05fb4427e" },
+        { "name": "ap-work-group-manager.toml", "sha256": "17562346eafce3250f788444f46aac505c205ea8b839a0aaa04e36f7b311e94c" },
+        { "name": "ap-worker.toml", "sha256": "dccc81f3239942f2242c211eb6645dafeeb44da72813ce604e9be60f7577993d" }
+      ]
+    }
+  ]
+}

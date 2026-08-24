@@ -1,0 +1,404 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/run-record.schema.json",
+  "title": "Autoprompt v2 run record",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "runId",
+    "activationNonce",
+    "generation",
+    "target",
+    "runRoot",
+    "lease",
+    "contracts",
+    "requestEnvelopeHash",
+    "paths",
+    "currentState",
+    "retention",
+    "privacy",
+    "sourceControlProtection",
+    "createdAt",
+    "updatedAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "2.0.0"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$"
+    },
+    "activationNonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16,128}$"
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "target": {
+      "type": "object",
+      "required": [
+        "kind",
+        "canonicalIdentity",
+        "identityHash",
+        "mutationAllowed",
+        "exactTreeRequired"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "filesystem-project",
+            "filesystem-nonproject",
+            "archive",
+            "non-filesystem"
+          ]
+        },
+        "canonicalIdentity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "identityHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "mutationAllowed": {
+          "type": "boolean"
+        },
+        "exactTreeRequired": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "runRoot": {
+      "type": "object",
+      "required": [
+        "locationKind",
+        "canonicalPath",
+        "openedDirectoryIdentity",
+        "containmentProofHash",
+        "noFollowChecked",
+        "reparsePointsRejected",
+        "foreignOwnershipRejected",
+        "pathSwapMonitoring"
+      ],
+      "properties": {
+        "locationKind": {
+          "enum": [
+            "project-local",
+            "provider-private-sidecar"
+          ]
+        },
+        "canonicalPath": {
+          "type": "string",
+          "minLength": 1
+        },
+        "openedDirectoryIdentity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "containmentProofHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "noFollowChecked": {
+          "const": true
+        },
+        "reparsePointsRejected": {
+          "const": true
+        },
+        "foreignOwnershipRejected": {
+          "const": true
+        },
+        "pathSwapMonitoring": {
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "lease": {
+      "type": "object",
+      "required": [
+        "leaseId",
+        "targetIdentityHash",
+        "controllerIdentity",
+        "acquiredAt",
+        "status"
+      ],
+      "properties": {
+        "leaseId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "targetIdentityHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "controllerIdentity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "acquiredAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "status": {
+          "enum": [
+            "held",
+            "released"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "contracts": {
+      "type": "object",
+      "required": [
+        "productVersion",
+        "productDigest",
+        "promptDigest",
+        "providerDigest",
+        "toolDigest"
+      ],
+      "properties": {
+        "productVersion": {
+          "const": "2.0.0"
+        },
+        "productDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "promptDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "providerDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "toolDigest": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "additionalProperties": false
+    },
+    "requestEnvelopeHash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "paths": {
+      "type": "object",
+      "required": [
+        "requestEnvelope",
+        "requestEnvelopeDigest",
+        "requestObjects",
+        "settings",
+        "routeTranscript",
+        "routeTranscriptReadable",
+        "routeObjects",
+        "routeRecommendation",
+        "routeDecision",
+        "routeDecisionReadable",
+        "directPlan",
+        "lightPlan",
+        "roadmapPlan",
+        "assignments",
+        "results",
+        "ownership",
+        "reviewResults",
+        "testResults",
+        "commands",
+        "events",
+        "state",
+        "accountingRecords",
+        "accountingSnapshot",
+        "recoveryCheckpointRecords",
+        "recoveryCheckpointSnapshot",
+        "aliasTelemetry",
+        "finalSummary"
+      ],
+      "properties": {
+        "requestEnvelope": {
+          "const": "request/envelope.jsonl"
+        },
+        "requestEnvelopeDigest": {
+          "const": "request/envelope.sha256"
+        },
+        "requestObjects": {
+          "const": "request/objects/sha256"
+        },
+        "originalRequestReadable": {
+          "const": "request/original-request.txt"
+        },
+        "settings": {
+          "const": "settings.json"
+        },
+        "routeTranscript": {
+          "const": "route/transcript.jsonl"
+        },
+        "routeTranscriptReadable": {
+          "const": "route/transcript.md"
+        },
+        "routeObjects": {
+          "const": "route/objects/sha256"
+        },
+        "routeRecommendation": {
+          "const": "route/recommendation.json"
+        },
+        "routeDecision": {
+          "const": "route/decision.json"
+        },
+        "routeDecisionReadable": {
+          "const": "route/decision.md"
+        },
+        "directPlan": {
+          "const": "plan/success-card.md"
+        },
+        "lightPlan": {
+          "const": "plan/light-plan.md"
+        },
+        "roadmapPlan": {
+          "const": "plan/ROADMAP.md"
+        },
+        "assignments": {
+          "const": "work/assignments"
+        },
+        "results": {
+          "const": "work/results"
+        },
+        "ownership": {
+          "const": "work/ownership.json"
+        },
+        "reviewResults": {
+          "const": "checks/review-results"
+        },
+        "testResults": {
+          "const": "checks/test-results"
+        },
+        "commands": {
+          "const": "checks/commands.jsonl"
+        },
+        "events": {
+          "const": "events.jsonl"
+        },
+        "state": {
+          "const": "state.json"
+        },
+        "accountingRecords": {
+          "const": "runtime/accounting.jsonl"
+        },
+        "accountingSnapshot": {
+          "const": "runtime/budget.json"
+        },
+        "recoveryCheckpointRecords": {
+          "const": "runtime/recovery-checkpoints.jsonl"
+        },
+        "recoveryCheckpointSnapshot": {
+          "const": "runtime/recovery-checkpoint.json"
+        },
+        "aliasTelemetry": {
+          "const": "compatibility/alias-telemetry.jsonl"
+        },
+        "finalSummary": {
+          "const": "final-summary.md"
+        }
+      },
+      "additionalProperties": false
+    },
+    "currentState": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]+$"
+    },
+    "retention": {
+      "type": "object",
+      "required": [
+        "policyId",
+        "automaticDeletionAllowed",
+        "expiresAt"
+      ],
+      "properties": {
+        "policyId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "automaticDeletionAllowed": {
+          "const": false
+        },
+        "expiresAt": {
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "privacy": {
+      "type": "object",
+      "required": [
+        "localOnly",
+        "automaticUpload",
+        "exportRequiresExplicitAuthority",
+        "secretMarkers"
+      ],
+      "properties": {
+        "localOnly": {
+          "const": true
+        },
+        "automaticUpload": {
+          "const": false
+        },
+        "exportRequiresExplicitAuthority": {
+          "const": true
+        },
+        "secretMarkers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "sourceControlProtection": {
+      "type": "object",
+      "required": [
+        "infoExcludeWhenGit",
+        "trackedFiles",
+        "stagedFiles",
+        "packageIncluded"
+      ],
+      "properties": {
+        "infoExcludeWhenGit": {
+          "const": ".autoprompt/"
+        },
+        "trackedFiles": {
+          "const": 0
+        },
+        "stagedFiles": {
+          "const": 0
+        },
+        "packageIncluded": {
+          "const": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

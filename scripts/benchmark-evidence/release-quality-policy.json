@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "benchmark-release-quality-policy.v1",
+  "policyId": "autoprompt-release-quality-2026-08-24",
+  "thresholds": {
+    "minimumAcceptanceRatio": 0.98,
+    "minimumRewardRatio": 0.98,
+    "maximumCostPerSolveRatio": 1.1
+  }
+}

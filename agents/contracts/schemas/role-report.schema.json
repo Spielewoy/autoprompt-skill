@@ -1,0 +1,540 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/role-report.schema.json",
+  "title": "Autoprompt v2 assignment or role result",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/assignment"
+    },
+    {
+      "$ref": "#/$defs/result"
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "resource": {
+      "type": "object",
+      "required": [
+        "kind",
+        "identity",
+        "access",
+        "expectedPreimageHash",
+        "owner",
+        "ownershipMode"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "file",
+            "directory",
+            "service",
+            "database",
+            "output",
+            "cache",
+            "port",
+            "evidence-root",
+            "external-system"
+          ]
+        },
+        "identity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "access": {
+          "enum": [
+            "read",
+            "write",
+            "exclusive"
+          ]
+        },
+        "expectedPreimageHash": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ownershipMode": {
+          "enum": [
+            "single-owner",
+            "exclusive-lease",
+            "ordered-transfer",
+            "isolated-copy"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "workGroupAdmission": {
+      "type": "object",
+      "required": [
+        "route",
+        "parentRoleId",
+        "managerRoleId",
+        "usefulWorkerCount",
+        "disjointMutableResourceOwnershipRequired",
+        "workerAssignments"
+      ],
+      "properties": {
+        "route": {
+          "const": "ROADMAP"
+        },
+        "parentRoleId": {
+          "const": "mission-coordinator"
+        },
+        "managerRoleId": {
+          "const": "ap-work-group-manager"
+        },
+        "usefulWorkerCount": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "disjointMutableResourceOwnershipRequired": {
+          "const": true
+        },
+        "workerAssignments": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "required": [
+              "workerAssignmentId",
+              "workerLogicalRoleId",
+              "workerMode",
+              "mutableResourceIdentities"
+            ],
+            "properties": {
+              "workerAssignmentId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "workerLogicalRoleId": {
+                "const": "worker"
+              },
+              "workerMode": {
+                "enum": [
+                  "general",
+                  "implementation",
+                  "research",
+                  "check-resolver"
+                ]
+              },
+              "mutableResourceIdentities": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "base": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "reportType",
+        "reportId",
+        "runId",
+        "assignmentId",
+        "logicalRoleId",
+        "physicalRoleId",
+        "requestEnvelopeHash",
+        "findingIds"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "2.0.0"
+        },
+        "reportType": {
+          "enum": [
+            "assignment",
+            "result"
+          ]
+        },
+        "reportId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runId": {
+          "type": "string",
+          "minLength": 8
+        },
+        "assignmentId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "logicalRoleId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "physicalRoleId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requestEnvelopeHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "findingIds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^AP-[A-Z]+-[0-9]{3}$"
+          }
+        }
+      }
+    },
+    "assignment": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "requestedResult",
+            "planReference",
+            "resources",
+            "allowedReads",
+            "forbiddenChanges",
+            "successChecklist",
+            "checks",
+            "resultLocation",
+            "assignedAt"
+          ],
+          "properties": {
+            "reportType": {
+              "const": "assignment"
+            },
+            "requestedResult": {
+              "type": "string",
+              "minLength": 1
+            },
+            "planReference": {
+              "type": "object",
+              "required": [
+                "planPath",
+                "sectionId",
+                "sectionHash",
+                "workItemId",
+                "workItemHash"
+              ],
+              "properties": {
+                "planPath": {
+                  "enum": [
+                    "plan/success-card.md",
+                    "plan/light-plan.md",
+                    "plan/ROADMAP.md"
+                  ]
+                },
+                "sectionId": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+                },
+                "sectionHash": {
+                  "$ref": "#/$defs/sha256"
+                },
+                "workItemId": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+                },
+                "workItemHash": {
+                  "$ref": "#/$defs/sha256"
+                }
+              },
+              "additionalProperties": false
+            },
+            "resources": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/resource"
+              }
+            },
+            "allowedReads": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "forbiddenChanges": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "successChecklist": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "description"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "checks": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "resultLocation": {
+              "type": "string",
+              "minLength": 1
+            },
+            "assignedAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "workGroupAdmission": {
+              "$ref": "#/$defs/workGroupAdmission"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "logicalRoleId": {
+                    "const": "ap-work-group-manager"
+                  }
+                },
+                "required": [
+                  "logicalRoleId"
+                ]
+              },
+              "then": {
+                "required": [
+                  "workGroupAdmission"
+                ],
+                "properties": {
+                  "physicalRoleId": {
+                    "const": "autoprompt.v2.ap-work-group-manager"
+                  },
+                  "planReference": {
+                    "properties": {
+                      "planPath": {
+                        "const": "plan/ROADMAP.md"
+                      }
+                    },
+                    "required": [
+                      "planPath"
+                    ]
+                  }
+                }
+              },
+              "else": {
+                "not": {
+                  "required": [
+                    "workGroupAdmission"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "result": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "startedAt",
+            "endedAt",
+            "filesChanged",
+            "resourcesChanged",
+            "behaviorChanged",
+            "commands",
+            "successItems",
+            "remainingConcerns",
+            "allAssignedItemsPass",
+            "requestedTransition"
+          ],
+          "properties": {
+            "reportType": {
+              "const": "result"
+            },
+            "startedAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "endedAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "filesChanged": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "resourcesChanged": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/resource"
+              }
+            },
+            "behaviorChanged": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "commands": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "command",
+                  "exitCode",
+                  "result"
+                ],
+                "properties": {
+                  "command": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "exitCode": {
+                    "type": "integer"
+                  },
+                  "result": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "successItems": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "status",
+                  "evidenceIds"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "status": {
+                    "enum": [
+                      "pass",
+                      "fail",
+                      "blocked"
+                    ]
+                  },
+                  "evidenceIds": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "remainingConcerns": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "allAssignedItemsPass": {
+              "type": "boolean"
+            },
+            "requestedTransition": {
+              "type": "object",
+              "required": [
+                "event",
+                "reason",
+                "invalidateEvidenceIds"
+              ],
+              "properties": {
+                "event": {
+                  "type": "string",
+                  "pattern": "^[A-Z][A-Z0-9_]+$"
+                },
+                "reason": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "invalidateEvidenceIds": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "reopenWorkerId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "replacementWorkerId": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

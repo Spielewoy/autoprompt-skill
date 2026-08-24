@@ -1,0 +1,70 @@
+{
+  "schemaVersion": "2.0.0",
+  "evidenceClass": "deterministic-failure-replay",
+  "entries": [
+    {
+      "id": "spawn-crash",
+      "apiReplay": "route-analyst-crash",
+      "expectedStatus": "ROUTE_ANALYST_CRASH",
+      "expectedBoundary": "DONE",
+      "maxTransitions": 9,
+      "transitionIds": ["T016", "T017", "T018", "T023", "T026", "T052", "T054", "T055", "T068"]
+    },
+    {
+      "id": "non-return",
+      "apiReplay": "l0-timeout",
+      "expectedStatus": "ROUTE_DECISION_TIMEOUT",
+      "expectedBoundary": "FAILED",
+      "maxTransitions": 2,
+      "transitionIds": ["T022", "T072"]
+    },
+    {
+      "id": "policy-denial",
+      "apiReplay": "provider-policy-denial",
+      "expectedStatus": "PROVIDER_UNSUPPORTED",
+      "expectedBoundary": "BLOCKED",
+      "maxTransitions": 2,
+      "transitionIds": ["T014", "T070"]
+    },
+    {
+      "id": "deadline-timeout",
+      "apiReplay": "deadline-budget-insufficient",
+      "expectedStatus": "ROUTE_BUDGET_INSUFFICIENT",
+      "expectedBoundary": "PAUSED",
+      "maxTransitions": 1,
+      "transitionIds": ["T058"]
+    },
+    {
+      "id": "malformed-brief",
+      "apiReplay": "malformed-context-brief",
+      "expectedStatus": "INHERITED_CONTEXT_FORBIDDEN",
+      "expectedBoundary": "PRE_SPAWN_REFUSAL",
+      "maxTransitions": 0,
+      "transitionIds": []
+    },
+    {
+      "id": "flaky-test",
+      "apiReplay": "flaky-check",
+      "expectedStatus": "CHECK_INCONCLUSIVE",
+      "expectedBoundary": "PARTIAL",
+      "maxTransitions": 3,
+      "transitionIds": ["T033", "T035", "T069"]
+    },
+    {
+      "id": "missing-credential",
+      "apiReplay": "missing-user-credential",
+      "expectedStatus": "WAITING_USER",
+      "expectedBoundary": "WAITING_USER",
+      "maxTransitions": 1,
+      "transitionIds": ["T050"]
+    },
+    {
+      "id": "unavailable-oracle",
+      "apiReplay": "oracle-unavailable",
+      "expectedStatus": "CHECK_INCONCLUSIVE",
+      "expectedBoundary": "BLOCKED",
+      "maxTransitions": 3,
+      "transitionIds": ["T075", "T049", "T070"]
+    }
+  ]
+}

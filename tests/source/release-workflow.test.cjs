@@ -2,7 +2,9 @@
 'use strict'
 
 const assert = require('node:assert/strict')
+const childProcess = require('node:child_process')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 
@@ -18,6 +20,11 @@ test('release publishes the verified archive through npm trusted publishing', ()
   const notes = read('scripts/build-release-assets.ps1')
 
   assert.match(packageJson.version, /^\d+\.\d+\.\d+$/)
+  assert.equal(
+    packageJson.scripts['benchmark:release-quality-gate'],
+    'node scripts/benchmark-evidence/quality-gate.cjs --policy scripts/benchmark-evidence/release-quality-policy.json --if-supplied',
+  )
+  assert.match(packageJson.scripts.prepublishOnly, /npm run benchmark:release-quality-gate/)
   assert.match(workflow, /verify-release:[\s\S]+?runs-on: windows-latest/)
   assert.match(workflow, /publish-release:[\s\S]+?needs: verify-release[\s\S]+?runs-on: ubuntu-latest/)
   assert.match(workflow, /Verify Linux package metadata/)
@@ -40,6 +47,20 @@ test('release publishes the verified archive through npm trusted publishing', ()
   assert.match(workflow, /gh release upload "v\$version" @assets --clobber/)
   assert.doesNotMatch(workflow, /gh api --method DELETE/)
   assert.match(notes, /Older Codex installs are detected and updated in place/)
+  assert.doesNotMatch(notes, /45% fewer|29 failures fell to 16|\+14\.61|cuts failures by/i)
+})
+
+test('generated release notes contain no unsupported numeric benchmark claim', t => {
+  const output = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-release-notes-'))
+  t.after(() => fs.rmSync(output, { recursive: true, force: true }))
+  const shell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
+  const result = childProcess.spawnSync(shell, ['-NoProfile', '-NonInteractive', '-File', path.join(ROOT, 'scripts', 'build-release-assets.ps1'), '-OutputDirectory', output], {
+    cwd: ROOT, encoding: 'utf8', timeout: 120000, windowsHide: true,
+  })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const notes = fs.readFileSync(path.join(output, 'RELEASE_NOTES.md'), 'utf8')
+  assert.match(notes, /Benchmark claims remain withheld until a preregistered run has complete independently verifiable evidence/)
+  assert.doesNotMatch(notes, /45% fewer|29 failures fell to 16|\+14\.61|cuts failures by/i)
 })
 
 test('Windows pull-request CI runs the older Codex upgrade lifecycle', () => {
@@ -53,7 +74,41 @@ test('Windows pull-request CI runs the older Codex upgrade lifecycle', () => {
 test('release automation changes trigger the full publication gate on main', () => {
   const workflow = read('.github/workflows/release-readiness.yml')
 
-  assert.match(workflow, /- "\.github\/workflows\/release\.yml"/)
-  assert.match(workflow, /- "scripts\/build-release-assets\.ps1"/)
-  assert.match(workflow, /- "tests\/source\/\*\*"/)
+  for (const requiredPath of [
+    'AUTOPROMPT-TOTAL-FIX-MAP.md',
+    'AUTOPROMPT-IMPLEMENTATION-COVERAGE.json',
+    'CODEX-IMPLEMENTATION-EVIDENCE.json',
+    'agents/codex/**',
+    'agents/contracts/**',
+    'agents/manifests/codex-runtime.json',
+    'evidence/codex-*/**',
+    'packages/codex/**',
+    'scripts/benchmark-evidence/**',
+    'scripts/build-release-assets.ps1',
+    'scripts/codex-artifact.cjs',
+    'scripts/codex-configure.cjs',
+    'scripts/codex-evidence-bundle.cjs',
+    'scripts/codex-evidence/**',
+    'scripts/codex-runtime-identity.cjs',
+    'tests/benchmarks/**',
+    'tests/fixtures/codex-*/**',
+    'tests/source/**',
+    '.github/workflows/ci.yml',
+    '.github/workflows/release.yml',
+    '.github/workflows/release-readiness.yml',
+  ]) assert.match(workflow, new RegExp(`- "${requiredPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`), requiredPath)
+})
+
+test('release readiness and tag verification inherit the conditional signed quality gate from prepublish', () => {
+  const packageJson = JSON.parse(read('package.json'))
+  const readiness = read('.github/workflows/release-readiness.yml')
+  const release = read('.github/workflows/release.yml')
+
+  assert.match(packageJson.scripts.prepublishOnly, /npm run verify && npm run benchmark:release-quality-gate/)
+  assert.match(readiness, /run: npm run prepublishOnly/)
+  assert.match(release, /run: npm run prepublishOnly/)
+  assert.match(readiness, /AUTOPROMPT_RELEASE_QUALITY_EVIDENCE_PATH:/)
+  assert.match(readiness, /AUTOPROMPT_RELEASE_QUALITY_TRUST_REGISTRY_PATH:/)
+  assert.match(release, /AUTOPROMPT_RELEASE_QUALITY_EVIDENCE_PATH:/)
+  assert.match(release, /AUTOPROMPT_RELEASE_QUALITY_TRUST_REGISTRY_PATH:/)
 })

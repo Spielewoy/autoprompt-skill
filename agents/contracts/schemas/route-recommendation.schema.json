@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/route-recommendation.schema.json",
+  "title": "Autoprompt v2 route analyst recommendation",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "preWorkResult",
+    "recommendedRoute",
+    "confidence",
+    "whatTheUserWants",
+    "likelyAreas",
+    "howSuccessCanBeChecked",
+    "unknowns",
+    "risks",
+    "independentWorkItems",
+    "dependencies",
+    "reasonsForDirect",
+    "reasonsForLight",
+    "reasonsForRoadmap",
+    "userInputNeeded",
+    "evidenceIndex"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "2.0.0"
+    },
+    "preWorkResult": {
+      "enum": [
+        "CONTINUE",
+        "NEEDS_USER"
+      ]
+    },
+    "recommendedRoute": {
+      "oneOf": [
+        {
+          "enum": [
+            "DIRECT",
+            "LIGHT",
+            "ROADMAP"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "confidence": {
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "whatTheUserWants": {
+      "$ref": "#/$defs/nonEmptyStrings"
+    },
+    "likelyAreas": {
+      "$ref": "#/$defs/strings"
+    },
+    "howSuccessCanBeChecked": {
+      "$ref": "#/$defs/nonEmptyStrings"
+    },
+    "unknowns": {
+      "$ref": "#/$defs/strings"
+    },
+    "risks": {
+      "$ref": "#/$defs/strings"
+    },
+    "independentWorkItems": {
+      "$ref": "#/$defs/strings"
+    },
+    "dependencies": {
+      "$ref": "#/$defs/strings"
+    },
+    "reasonsForDirect": {
+      "$ref": "#/$defs/nonEmptyStrings"
+    },
+    "reasonsForLight": {
+      "$ref": "#/$defs/nonEmptyStrings"
+    },
+    "reasonsForRoadmap": {
+      "$ref": "#/$defs/nonEmptyStrings"
+    },
+    "userInputNeeded": {
+      "$ref": "#/$defs/strings"
+    },
+    "evidenceIndex": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "eventId",
+          "reason",
+          "byteLength",
+          "sha256",
+          "truncated"
+        ],
+        "properties": {
+          "eventId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "byteLength": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "preWorkResult": {
+            "const": "NEEDS_USER"
+          }
+        },
+        "required": [
+          "preWorkResult"
+        ]
+      },
+      "then": {
+        "properties": {
+          "recommendedRoute": {
+            "type": "null"
+          },
+          "userInputNeeded": {
+            "minItems": 1
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "recommendedRoute": {
+            "enum": [
+              "DIRECT",
+              "LIGHT",
+              "ROADMAP"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "strings": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "nonEmptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

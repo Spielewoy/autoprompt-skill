@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.dev/schemas/benchmark-snapshot.v2.json",
+  "title": "Autoprompt immutable evidence snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "snapshotId", "manifestDigest", "observedAt", "sourceState", "sourcePreHash", "sourcePostHash", "provenance", "files", "digest"],
+  "properties": {
+    "schemaVersion": { "const": "benchmark-snapshot.v2" },
+    "snapshotId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$" },
+    "manifestDigest": { "$ref": "#/$defs/sha256" },
+    "observedAt": { "type": "string", "format": "date-time" },
+    "sourceState": { "enum": ["TERMINAL", "PAUSED"] },
+    "sourcePreHash": { "$ref": "#/$defs/sha256" },
+    "sourcePostHash": { "$ref": "#/$defs/sha256" },
+    "provenance": { "const": "immutable-snapshot" },
+    "files": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/file" } },
+    "digest": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "file": { "type": "object", "additionalProperties": false, "required": ["path", "sha256", "bytes"], "properties": { "path": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*\\\\)(?!.*[\\u0000-\\u001F\\u007F:])(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*(?:^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Ll][Oo][Cc][Kk]\\$|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.[^/]*)?(?:/|$))(?!.*(?:^|/)[^/]*[. ](?:/|$))[^/]+(?:/[^/]+)*$" }, "sha256": { "$ref": "#/$defs/sha256" }, "bytes": { "type": "integer", "minimum": 0 } } }
+  }
+}

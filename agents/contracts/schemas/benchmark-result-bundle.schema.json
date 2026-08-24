@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.dev/schemas/benchmark-result-bundle.v2.json",
+  "title": "Autoprompt canonical benchmark result bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "manifestDigest", "taskId", "attemptId", "verdict", "reward", "grader", "producer", "rawHarborSha256", "verifierSha256", "resourceEvidenceSha256", "authorityAttestationSha256", "authoritySignatureSha256"],
+  "properties": {
+    "schemaVersion": { "const": "benchmark-result-bundle.v2" },
+    "manifestDigest": { "$ref": "#/$defs/sha256" },
+    "taskId": { "$ref": "#/$defs/nonEmpty" },
+    "attemptId": { "$ref": "#/$defs/nonEmpty" },
+    "verdict": { "enum": ["pass", "fail"] },
+    "reward": { "type": "number" },
+    "grader": { "$ref": "#/$defs/grader" },
+    "producer": { "$ref": "#/$defs/producer" },
+    "rawHarborSha256": { "$ref": "#/$defs/sha256" },
+    "verifierSha256": { "$ref": "#/$defs/sha256" },
+    "resourceEvidenceSha256": { "$ref": "#/$defs/sha256" },
+    "authorityAttestationSha256": { "$ref": "#/$defs/sha256" },
+    "authoritySignatureSha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "grader": { "type": "object", "additionalProperties": false, "required": ["verdict", "score"], "properties": { "verdict": { "enum": ["pass", "fail"] }, "score": { "type": "number" } } },
+    "producer": { "type": "object", "additionalProperties": false, "required": ["name", "version", "buildDigest"], "properties": { "name": { "$ref": "#/$defs/nonEmpty" }, "version": { "$ref": "#/$defs/nonEmpty" }, "buildDigest": { "$ref": "#/$defs/sha256" } } }
+  }
+}

@@ -57,10 +57,72 @@ function Invoke-LibRecord {
     return @{ Code = [int]$code; Record = $sw.ToString().Trim() }
 }
 
+function Invoke-CodexActivationRevocation {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return $true }
+    $helper = Join-Path $RepoRoot 'scripts/codex-configure.cjs'
+    if (-not (Get-Command node -ErrorAction SilentlyContinue) -or
+        -not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        [Console]::Error.WriteLine(
+            'Autoprompt uninstall (codex): unresolved activation state; node/helper unavailable.'
+        )
+        return $false
+    }
+    $hadOverride = Test-Path Env:AUTOPROMPT_INSTALL_ROOT
+    $previousOverride = $env:AUTOPROMPT_INSTALL_ROOT
+    try {
+        $env:AUTOPROMPT_INSTALL_ROOT = $Root
+        $output = @(& node $helper --revoke-all 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            foreach ($line in $output) { [Console]::Error.WriteLine($line) }
+            return $false
+        }
+        return $true
+    } finally {
+        if ($hadOverride) { $env:AUTOPROMPT_INSTALL_ROOT = $previousOverride }
+        else { Remove-Item Env:AUTOPROMPT_INSTALL_ROOT -ErrorAction SilentlyContinue }
+    }
+}
+
+function Test-CodexKnownResidue {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return $false }
+    $helper = Join-Path $RepoRoot 'scripts/codex-configure.cjs'
+    if (-not (Get-Command node -ErrorAction SilentlyContinue) -or
+        -not (Test-Path -LiteralPath $helper -PathType Leaf)) { return $true }
+    $hadOverride = Test-Path Env:AUTOPROMPT_INSTALL_ROOT
+    $previousOverride = $env:AUTOPROMPT_INSTALL_ROOT
+    try {
+        $env:AUTOPROMPT_INSTALL_ROOT = $Root
+        $output = @(& node $helper --has-known-residue 2>&1)
+        $code = $LASTEXITCODE
+        if ($code -ne 0) {
+            foreach ($line in $output) { [Console]::Error.WriteLine($line) }
+        }
+        return ($code -ne 0)
+    } finally {
+        if ($hadOverride) { $env:AUTOPROMPT_INSTALL_ROOT = $previousOverride }
+        else { Remove-Item Env:AUTOPROMPT_INSTALL_ROOT -ErrorAction SilentlyContinue }
+    }
+}
+
 function Uninstall-Root {
     param([string]$Root, [string]$Label)
+    if ($Label -ceq 'codex' -and -not (Invoke-CodexActivationRevocation -Root $Root)) {
+        $script:ResultRows += "RESULT=FAIL client=$Label code=1"
+        $script:UninstallExitCode = 1
+        return
+    }
     $receipt = Join-Path $Root $AutopromptReceiptName
     if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) {
+        if ($Label -ceq 'codex' -and (Test-CodexKnownResidue -Root $Root)) {
+            [Console]::Error.WriteLine(
+                "Autoprompt uninstall (codex): unresolved residue remains under $Root categories=managed,known-legacy,unresolved-collision."
+            )
+            $script:ResultRows += "RESULT=FAIL client=$Label code=3"
+            $script:UninstallExitCode = 1
+            return
+        }
         [Console]::Error.WriteLine("Autoprompt uninstall ($Label): SKIP -- no install receipt under $Root.")
         $script:ResultRows += "SKIP=skip client=$Label reason=no-receipt"
         return
@@ -71,6 +133,14 @@ function Uninstall-Root {
         $script:ResultRows += "RESULT=FAIL client=$Label code=$($r.Code)"
         if ($r.Code -eq 77) { $script:UninstallExitCode = 77 }
         elseif ($script:UninstallExitCode -ne 77) { $script:UninstallExitCode = 1 }
+        return
+    }
+    if ($Label -ceq 'codex' -and (Test-CodexKnownResidue -Root $Root)) {
+        [Console]::Error.WriteLine(
+            "Autoprompt uninstall (codex): unresolved residue remains under $Root categories=managed,known-legacy,unresolved-collision."
+        )
+        $script:ResultRows += "RESULT=FAIL client=$Label code=3"
+        $script:UninstallExitCode = 1
         return
     }
     $removed = ($r.Record -replace '^.*uninstall=ok removed=', '') -replace ' .*$', ''

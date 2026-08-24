@@ -39,6 +39,8 @@ $ClientsAll = @(
 $script:ResultRows = @()
 $script:AnyFail = 0
 $script:IsRecoveryRetained = $false
+$script:CodexPendingRuntimePlan = $null
+$script:CodexValidatedTargetPlan = $null
 $LegacyCodexRecoveryName = '.autoprompt-legacy-codex-recovery.clixml'
 
 function Get-InstallExitCode {
@@ -65,7 +67,7 @@ function Get-PayloadFile {
     param([string]$Client)
     switch ($Client) {
         'claude'   { return (Join-Path $RepoRoot 'agents/claude/SKILL.md') }
-        'codex'    { return (Join-Path $RepoRoot 'agents/codex/SKILL.md') }
+        'codex'    { return (Join-Path $RepoRoot 'scripts/install/codex-discovery-shim.md') }
         'opencode' { return (Join-Path $RepoRoot 'agents/opencode/SKILL.md') }
         'kilo'     { return (Join-Path $RepoRoot 'agents/kilo/SKILL.md') }
         'vscode'   { return (Join-Path $RepoRoot 'agents/vscode/SKILL.md') }
@@ -84,8 +86,16 @@ function Get-PayloadBody {
     $marker = "---`n"
     $norm = $text -replace "`r`n", "`n"
     $parts = $norm -split [regex]::Escape($marker)
-    if ($parts.Count -ge 3) { return ($parts[2..($parts.Count - 1)] -join $marker) }
-    return $norm
+    $body = if ($parts.Count -ge 3) {
+        $parts[2..($parts.Count - 1)] -join $marker
+    } else { $norm }
+    if ($File -match '[\\/]scripts[\\/]install[\\/]codex-discovery-shim\.md$') {
+        if ($body.StartsWith("`n")) { $body = $body.Substring(1) }
+        if ($body.EndsWith("`n")) {
+            $body = $body.Substring(0, $body.Length - 1)
+        }
+    }
+    return $body
 }
 
 # Get-PayloadField: read the name/description scalars used by the shipped manifests.
@@ -428,13 +438,32 @@ function Remove-StaleKiloAgents {
 
 function New-CodexAgentStage {
     param([string]$StageAgents, [string]$StageProfile)
-    $sourceAgents = Join-Path $RepoRoot 'agents/claude/agents'
-    $castingTool = Join-Path $RepoRoot 'agents/codex/workflow/codex-agent-casting.js'
-    $profileTool = Join-Path $RepoRoot 'agents/codex/workflow/codex-agent-profile.js'
-    & node $castingTool --export-inheritance --source-agents $sourceAgents `
-        --agents-dir $StageAgents --selector off | Out-Null
+    $skillRoot = Get-AutopromptCodexBundleSkillRoot
+    if ([string]::IsNullOrEmpty($skillRoot)) {
+        throw 'Codex private bundle root is unavailable'
+    }
+    $sourceAgents = Join-Path $skillRoot 'agents'
+    $castingTool = Join-Path $skillRoot 'workflow/codex-agent-casting.js'
+    $profileTool = Join-Path $skillRoot 'workflow/codex-agent-profile.js'
+    New-Item -ItemType Directory -Path $StageAgents -Force | Out-Null
+    $sourceRoles = @(Get-ChildItem -LiteralPath $sourceAgents `
+        -Filter 'ap-*.toml' -File)
+    try {
+        $policy = Get-Content -LiteralPath (Join-Path $sourceAgents `
+            'role-policy.json') -Raw | ConvertFrom-Json
+        $expectedRoles = @($policy.physical_roles.psobject.Properties).Count
+    } catch { throw 'canonical Codex role policy is unreadable' }
+    if ($expectedRoles -le 0 -or $sourceRoles.Count -ne $expectedRoles) {
+        throw "canonical Codex role inventory is incomplete (found=$($sourceRoles.Count) expected=$expectedRoles)"
+    }
+    foreach ($sourceRole in $sourceRoles) {
+        Copy-Item -LiteralPath $sourceRole.FullName `
+            -Destination (Join-Path $StageAgents $sourceRole.Name) -ErrorAction Stop
+    }
+    & node $castingTool --write-manifest --agents-dir $StageAgents `
+        --selector off | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "agent export failed with code $LASTEXITCODE"
+        throw "agent manifest failed with code $LASTEXITCODE"
     }
     & node $profileTool --write --agents-dir $StageAgents `
         --profile $StageProfile | Out-Null
@@ -462,18 +491,18 @@ function Install-CodexAgentStage {
         -Filter 'ap-*.toml' -File) + @(
         Get-Item -LiteralPath (Join-Path $StageAgents '.autoprompt-casting.json')
     )
-    foreach ($file in $generated) {
-        $target = Join-Path $AgentsDir $file.Name
-        $managedCode = Install-IdemManagedFile -ConfigRoot $Root `
-            -Source $file.FullName -Target $target -RefuseUnownedTarget
-        if ($managedCode -ne 0) {
-            throw "managed registration failed: $target code=$managedCode"
+    $mappings = @($generated | ForEach-Object {
+        @{
+            Source = $_.FullName
+            Target = Join-Path $AgentsDir $_.Name
         }
-    }
-    $managedCode = Install-IdemManagedFile -ConfigRoot $Root `
-        -Source $StageProfile -Target $Profile -RefuseUnownedTarget
+    }) + @(
+        @{ Source = $StageProfile; Target = $Profile }
+    )
+    $managedCode = Install-IdemManagedFiles -ConfigRoot $Root `
+        -Mappings $mappings -RefuseUnownedTarget -UseCodexBatchIndex
     if ($managedCode -ne 0) {
-        throw "managed registration failed: $Profile code=$managedCode"
+        throw "managed registration failed: Codex agent stage code=$managedCode"
     }
 }
 
@@ -1033,6 +1062,80 @@ function Invoke-LegacyActivationMigration {
     return Remove-LegacyCodexSkillPayload -Root $Root
 }
 
+function Remove-RetiredCodexFiles {
+    param([string]$Root)
+    $currentTargets = @(Get-ValidatedCodexTargetPlan -Root $Root)
+    if ($currentTargets.Count -eq 0) {
+        [Console]::Error.WriteLine(
+            'client=codex error=validated-target-plan-invalidated'
+        )
+        return 94
+    }
+    return Invoke-IdemRetiredCodexReconciliation `
+        -ConfigRoot $Root -CurrentTargets $currentTargets
+}
+
+function Get-CodexRootIdentity {
+    param([string]$Root)
+    $helper = Join-Path $RepoRoot 'scripts/install/root-identity.cjs'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf) -or
+        -not (Get-Command node -ErrorAction SilentlyContinue)) { return '' }
+    $output = @(& node $helper $Root)
+    if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { return '' }
+    try { $identity = $output[0] | ConvertFrom-Json } catch { return '' }
+    if ($identity.schemaVersion -ne 1 -or
+        [string]::IsNullOrEmpty([string]$identity.realPath) -or
+        [string]::IsNullOrEmpty([string]$identity.statIdentity)) { return '' }
+    return [string]$output[0]
+}
+
+function Clear-ValidatedCodexTargetPlan {
+    $script:CodexPendingRuntimePlan = $null
+    $script:CodexValidatedTargetPlan = $null
+}
+
+function Set-ValidatedCodexTargetPlan {
+    param([string]$Root, [string[]]$Targets, [hashtable]$RuntimePlan)
+    if ($null -eq $RuntimePlan -or $Targets.Count -eq 0) { return $false }
+    $rootIdentity = Get-CodexRootIdentity -Root $Root
+    if ([string]::IsNullOrEmpty($rootIdentity)) { return $false }
+    $script:CodexValidatedTargetPlan = @{
+        Root = Get-IdemNormalizedPath -Path $Root
+        RootIdentity = $rootIdentity
+        PayloadGeneration = [string]$RuntimePlan.PayloadGeneration
+        PayloadDigest = [string]$RuntimePlan.PayloadDigest
+        ManifestHash = [string]$RuntimePlan.ManifestHash
+        Targets = [string[]]@($Targets)
+    }
+    return $true
+}
+
+function Get-ValidatedCodexTargetPlan {
+    param([string]$Root)
+    $cached = $script:CodexValidatedTargetPlan
+    if ($null -eq $cached -or
+        (Get-IdemNormalizedPath -Path $Root) -cne $cached.Root -or
+        (Get-CodexRootIdentity -Root $Root) -cne $cached.RootIdentity) {
+        Clear-ValidatedCodexTargetPlan
+        return @()
+    }
+    $manifestPath = Join-Path $RepoRoot 'agents/manifests/codex-runtime.json'
+    try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json }
+    catch {
+        Clear-ValidatedCodexTargetPlan
+        return @()
+    }
+    $manifestHash = Get-IdemSha256 -Path $manifestPath
+    if ($manifestHash -is [int] -or
+        [string]$manifest.payloadGeneration -cne $cached.PayloadGeneration -or
+        [string]$manifest.payloadDigest -cne $cached.PayloadDigest -or
+        [string]$manifestHash -cne $cached.ManifestHash) {
+        Clear-ValidatedCodexTargetPlan
+        return @()
+    }
+    return [string[]]@($cached.Targets)
+}
+
 # Remove-StaleClaudePersonas: remove receipt-owned ap-*.md personas that no longer
 # exist in the source - under BOTH the skill-private payload agents dir and the
 # native ~/.claude/agents load path. Unowned files are never matched.
@@ -1150,10 +1253,28 @@ function Get-LandingPayload {
 
 function Invoke-LandingMigration {
     param([string]$Client, [string]$Root)
+    if ($Client -eq 'codex') {
+        $codexMode = if ([string]::IsNullOrEmpty($env:AUTOPROMPT_CODEX_INSTALL_MODE)) {
+            'standalone'
+        } else { $env:AUTOPROMPT_CODEX_INSTALL_MODE }
+        & node (Join-Path $RepoRoot 'scripts/runtime-payload.cjs') `
+            --capability codex --mode $codexMode | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Set-LandingFailure -Client $Client -Stage 'capability' -Message `
+                "Autoprompt install (codex): unsupported or unknown install mode '$codexMode'."
+            return 1
+        }
+    }
     $migrationCode = Invoke-LegacyActivationMigration -Client $Client -Root $Root
     if ($migrationCode -ne 0) {
         Set-LandingFailure -Client $Client -Stage 'migration' -Message `
             "Autoprompt install ($Client): receipt-owned legacy activation migration failed."
+        return 1
+    }
+    if ($Client -eq 'codex' -and
+        (Remove-RetiredCodexFiles -Root $Root) -ne 0) {
+        Set-LandingFailure -Client $Client -Stage 'migration' -Message `
+            'Autoprompt install (codex): prior receipt reconciliation failed.'
         return 1
     }
     if ($Client -ne 'claude' -or (Remove-StaleClaudePersonas) -eq 0) {
@@ -1201,9 +1322,18 @@ function Install-LandingPayload {
 
 function Install-LandingActivation {
     param([string]$Client)
-    if ($Client -eq 'codex' -and (Install-CodexAgents) -ne 0) {
-        Set-LandingFailure -Client $Client -Stage 'agents'
-        return 1
+    if ($Client -eq 'codex') {
+        $activationHelper = Join-Path $RepoRoot 'scripts/codex-configure.cjs'
+        $quarantine = @(& node $activationHelper --quarantine-known-legacy 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            Set-LandingFailure -Client $Client -Stage 'migration' -Message `
+                "Autoprompt install (codex): known-legacy quarantine failed: $($quarantine -join ' ')"
+            return 1
+        }
+        if ((Install-CodexAgents) -ne 0) {
+            Set-LandingFailure -Client $Client -Stage 'agents'
+            return 1
+        }
     }
     if ($Client -eq 'vscode') {
         if ((Install-VscodeActivation) -eq 0) { return 0 }
@@ -1330,6 +1460,40 @@ function Get-ExtrasInstallTargetPlan {
         return @()
     }
     $skillDestination = Get-ExtrasSkillDir -Client $Client
+    if ($Client -eq 'codex') {
+        $tool = Join-Path $RepoRoot 'scripts/runtime-payload.cjs'
+        if (-not (Test-Path -LiteralPath $tool -PathType Leaf) -or
+            -not (Get-Command node -ErrorAction SilentlyContinue)) {
+            throw (New-TargetPreflightException `
+                -Message 'Codex runtime target planner is unavailable' -Code 82)
+        }
+        $json = @(& node $tool --plan codex --destination $skillDestination)
+        if ($LASTEXITCODE -ne 0 -or $json.Count -eq 0) {
+            throw (New-TargetPreflightException `
+                -Message 'Codex runtime target plan failed' -Code 82)
+        }
+        try { $plan = (($json -join "`n") | ConvertFrom-Json) }
+        catch {
+            throw (New-TargetPreflightException `
+                -Message 'Codex runtime target plan is invalid' -Code 82)
+        }
+        $manifestPath = Join-Path $RepoRoot 'agents/manifests/codex-runtime.json'
+        $manifestHash = Get-IdemSha256 -Path $manifestPath
+        if ($manifestHash -is [int] -or
+            [string]::IsNullOrEmpty([string]$plan.payloadGeneration) -or
+            [string]$plan.payloadDigest -cnotmatch '^[a-f0-9]{64}$') {
+            throw (New-TargetPreflightException `
+                -Message 'Codex runtime target plan identity is invalid' -Code 82)
+        }
+        $script:CodexPendingRuntimePlan = @{
+            PayloadGeneration = [string]$plan.payloadGeneration
+            PayloadDigest = [string]$plan.payloadDigest
+            ManifestHash = [string]$manifestHash
+        }
+        return @($plan.files | Where-Object {
+            $_.kind -cne 'discovery-shim'
+        } | ForEach-Object { [IO.Path]::GetFullPath($_.target) })
+    }
     return @(Get-RuntimeInventory -Client $Client | Where-Object {
         $Client -ne 'vscode' -or $_ -cne 'SKILL.md'
     } | ForEach-Object {
@@ -1354,8 +1518,9 @@ function Get-ClaudeNativeTargetPlan {
 
 function Get-CodexActivationTargetPlan {
     $agentsDirectory = Get-CodexAgentsDir
-    $targets = @(Get-RuntimeAgentNames -Client 'claude' | ForEach-Object {
-        Join-Path $agentsDirectory ([IO.Path]::ChangeExtension($_, '.toml'))
+    $targets = @(Get-RuntimeInventory -Client 'codex' |
+        Where-Object { $_ -clike 'agents/ap-*.toml' } | ForEach-Object {
+        Join-Path $agentsDirectory (Split-Path -Leaf $_)
     })
     $targets += Join-Path $agentsDirectory '.autoprompt-casting.json'
     $targets += Get-CodexProfileFile
@@ -1514,6 +1679,73 @@ function Read-RootReceiptState {
     return $receipt
 }
 
+function Invoke-CodexRootManifestFinalization {
+    param([string]$Root, [int]$ResultStart = 0)
+    $script:AutopromptRootFailureStage = 'manifest'
+    $fail = {
+        param([string]$Message)
+        [Console]::Error.WriteLine(
+            "Autoprompt install: Codex manifest finalization failed under $Root ($Message)."
+        )
+        $script:AnyFail = 1
+        Invoke-FinalManagedRollback -Context "manifest finalization under $Root" |
+            Out-Null
+        if (Get-Command Set-RootResultsFailed -ErrorAction SilentlyContinue) {
+            Set-RootResultsFailed -FromIndex $ResultStart -Stage 'manifest'
+        } else {
+            for ($index = $ResultStart;
+                $index -lt $script:ResultRows.Count; $index++) {
+                if ($script:ResultRows[$index] -notlike 'RESULT=PASS*') {
+                    continue
+                }
+                $client = ($script:ResultRows[$index] -replace '^.* client=', '') `
+                    -replace ' .*$', ''
+                $script:ResultRows[$index] =
+                    "RESULT=FAIL client=$client stage=manifest"
+            }
+        }
+        throw "Codex manifest finalization failed: $Message"
+    }
+    $rootIdentity = Get-IdemNormalizedPath -Path $Root
+    if ([string]::IsNullOrEmpty($rootIdentity)) { & $fail 'invalid root' }
+    $manifest = Join-Path $Root $AutopromptHashManifestName
+    $manifestIdentity = Get-IdemNormalizedPath -Path $manifest
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' `
+        (Get-IdemPathComparer)
+    $hashes = @()
+    foreach ($ownedPath in @($script:AutopromptReceiptFiles)) {
+        $path = [string]$ownedPath
+        $identity = Get-IdemNormalizedPath -Path $path
+        if ([string]::IsNullOrEmpty($identity) -or
+            -not (Test-IdemAbsolutePath -Path $path) -or
+            -not (Test-IdemPathUnderRoot -Path $identity -Root $rootIdentity)) {
+            & $fail "invalid or outside receipt path: $path"
+        }
+        if (-not $seen.Add($identity)) { continue }
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if ($null -eq $item -or $item -isnot [System.IO.FileInfo] -or
+            $item.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)) {
+            & $fail "non-regular receipt path: $path"
+        }
+        if ($identity.Equals($manifestIdentity, (Get-IdemPathComparison))) {
+            continue
+        }
+        $hash = Get-IdemSha256 -Path $path
+        if ($hash -isnot [string] -or -not (Test-IdemSha256 -Hash $hash)) {
+            & $fail "unreadable receipt path: $path"
+        }
+        $hashes += @{ Key = $path; Hash = $hash }
+    }
+    $snapshot = New-IdemManagedSnapshot -ConfigRoot $Root -Paths @()
+    if ($null -eq $snapshot) { & $fail 'snapshot failed' }
+    Add-IdemManagedUndo -Snapshot $snapshot
+    if (-not (Set-IdemManifestHashes -ConfigRoot $Root -Hashes $hashes `
+        -UseIdentityIndex)) {
+        & $fail 'indexed rewrite rejected'
+    }
+    return $true
+}
+
 function Set-RootReceiptAccumulators {
     param([AllowNull()][hashtable]$Receipt)
     $files = if ($null -eq $Receipt) { @() } else {
@@ -1552,6 +1784,10 @@ function Set-RootReceiptAccumulators {
 
 function Initialize-RootOwnershipState {
     param([string]$Root)
+    $manifest = Join-Path $Root $AutopromptHashManifestName
+    $script:AutopromptReceiptPriorManifestSha256 = if (
+        Test-Path -LiteralPath $manifest -PathType Leaf
+    ) { Get-IdemSha256 -Path $manifest } else { $null }
     $receipt = Read-RootReceiptState -Root $Root
     if ($null -eq $receipt) {
         $receipt = Get-LegacyCodexOwnershipState -Root $Root
@@ -2086,6 +2322,7 @@ function Set-RootTargetPreflightFailed {
 
 function Get-RootPreflightState {
     param([string]$Root, [string[]]$Clients)
+    $script:CodexPendingRuntimePlan = $null
     $ownership = Initialize-RootOwnershipState -Root $Root
     if (-not (Test-RootOmpDetachedLayoutCompatible -Root $Root `
         -Clients $Clients)) {
@@ -2099,12 +2336,17 @@ function Get-RootPreflightState {
     }
     $entries = @(Get-RootInstallTargetEntries -Root $Root -Clients $Clients)
     $plan = Test-RootInstallTargetEntries -Root $Root -Entries $entries
+    $codexTargets = [string[]]@($entries | Where-Object {
+        $_.Client -ceq 'codex'
+    } | ForEach-Object { $_.Target })
     return @{
         Code = $plan.Code
         CollisionClient = $plan.Client
         CollisionTarget = $plan.Target
         Ownership = $ownership
         Targets = @($entries | ForEach-Object { $_.Target })
+        CodexTargets = $codexTargets
+        CodexRuntimePlan = $script:CodexPendingRuntimePlan
     }
 }
 
@@ -2139,6 +2381,12 @@ function Start-ValidatedRootTransaction {
     try {
         Start-RootTransaction -Root $Root -State $state.Ownership `
             -Targets $state.Targets
+        if ($state.CodexTargets.Count -gt 0 -and
+            -not (Set-ValidatedCodexTargetPlan -Root $Root `
+                -Targets $state.CodexTargets `
+                -RuntimePlan $state.CodexRuntimePlan)) {
+            throw 'could not bind validated Codex target plan to root identity'
+        }
         return $true
     } catch {
         Set-RootInitializationFailed -Root $Root -Clients $Clients `
@@ -2150,25 +2398,34 @@ function Start-ValidatedRootTransaction {
 function Install-RootBatch {
     param([string]$Root, [string[]]$Clients)
     $resultStart = $script:ResultRows.Count
-    if (-not (Start-ValidatedRootTransaction -Root $Root -Clients $Clients)) {
-        return
+    try {
+        if (-not (Start-ValidatedRootTransaction -Root $Root -Clients $Clients)) {
+            return
+        }
+        $failureCount = Get-InstallFailureCount
+        $rootClients = @(Get-ClientsForRoot -Root $Root -Clients $Clients)
+        foreach ($client in $rootClients) {
+            Install-Landing -Client $client
+            if ((Get-InstallFailureCount) -gt $failureCount) { break }
+        }
+        if ((Get-InstallFailureCount) -gt $failureCount) {
+            Set-RootResultsFailed -FromIndex $resultStart -Stage 'landing'
+            Invoke-FinalManagedRollback -Context "root $Root" | Out-Null
+            return
+        }
+        if ($rootClients -contains 'codex') {
+            Invoke-CodexRootManifestFinalization -Root $Root `
+                -ResultStart $resultStart | Out-Null
+        }
+        if (-not (Set-RootReceipt -Root $Root)) {
+            Set-RootResultsFailed -FromIndex $resultStart `
+                -Stage $script:AutopromptRootFailureStage
+            return
+        }
+        Write-RootSuccess -FromIndex $resultStart
+    } finally {
+        Clear-ValidatedCodexTargetPlan
     }
-    $failureCount = Get-InstallFailureCount
-    foreach ($client in @(Get-ClientsForRoot -Root $Root -Clients $Clients)) {
-        Install-Landing -Client $client
-        if ((Get-InstallFailureCount) -gt $failureCount) { break }
-    }
-    if ((Get-InstallFailureCount) -gt $failureCount) {
-        Set-RootResultsFailed -FromIndex $resultStart -Stage 'landing'
-        Invoke-FinalManagedRollback -Context "root $Root" | Out-Null
-        return
-    }
-    if (-not (Set-RootReceipt -Root $Root)) {
-        Set-RootResultsFailed -FromIndex $resultStart `
-            -Stage $script:AutopromptRootFailureStage
-        return
-    }
-    Write-RootSuccess -FromIndex $resultStart
 }
 
 function Install-Batch {

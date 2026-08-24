@@ -1,0 +1,1848 @@
+{
+  "$schema": "./schemas/gates.schema.json",
+  "kind": "autoprompt-check-registry",
+  "contractVersion": "2.0.0",
+  "outcomeSchema": "agents/contracts/schemas/outcome.schema.json",
+  "definitions": {
+    "success-definition": {
+      "owner": "run-owner",
+      "inputs": [
+        "request-envelope",
+        "route-decision"
+      ],
+      "outputs": [
+        "success-checklist",
+        "planned-checks"
+      ],
+      "sideEffects": [
+        "run-record-write"
+      ],
+      "independent": false,
+      "failureOwner": "run-owner",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 2,
+        "retryableFailures": [
+          "SCHEMA_INVALID"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "FAILED",
+          "outcomeCode": "FAILED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "compile-success-definition",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "success-definition"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 300,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "json-schema-validation",
+            "effect-specific-acceptance"
+          ]
+        },
+        "oracle": {
+          "kind": "schema-and-effect-acceptance",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "json-schema-validation",
+            "effect-specific-acceptance",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of success-definition exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "FAILED",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "short-plan": {
+      "owner": "run-owner",
+      "inputs": [
+        "route-decision",
+        "success-checklist"
+      ],
+      "outputs": [
+        "light-plan"
+      ],
+      "sideEffects": [
+        "run-record-write"
+      ],
+      "independent": false,
+      "failureOwner": "run-owner",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 2,
+        "retryableFailures": [
+          "SCHEMA_INVALID"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "FAILED",
+          "outcomeCode": "FAILED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "compile-light-plan",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "short-plan"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 300,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "json-schema-validation",
+            "dependency-analysis"
+          ]
+        },
+        "oracle": {
+          "kind": "schema-and-dependency",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "json-schema-validation",
+            "dependency-analysis",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of short-plan exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "FAILED",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "roadmap-authoring": {
+      "owner": "roadmap-author",
+      "inputs": [
+        "request-envelope",
+        "route-decision",
+        "named-scout-results"
+      ],
+      "outputs": [
+        "ROADMAP.md"
+      ],
+      "sideEffects": [
+        "plan-write"
+      ],
+      "independent": false,
+      "failureOwner": "roadmap-author",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 3,
+        "retryableFailures": [
+          "SCHEMA_INVALID",
+          "INPUT_FINGERPRINT_CHANGED",
+          "EVIDENCE_FINGERPRINT_CHANGED"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "FAILED",
+          "outcomeCode": "FAILED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "author-roadmap",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "roadmap-authoring"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 900,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "roadmap-authoring",
+            "dependency-analysis"
+          ]
+        },
+        "oracle": {
+          "kind": "roadmap-coverage-and-order",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "roadmap-authoring",
+            "dependency-analysis",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of roadmap-authoring exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "FAILED",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "plan-check": {
+      "owner": "plan-checker",
+      "inputs": [
+        "request-envelope",
+        "route-decision",
+        "ROADMAP.md"
+      ],
+      "outputs": [
+        "plan-check-result"
+      ],
+      "sideEffects": [
+        "result-return-only"
+      ],
+      "independent": true,
+      "failureOwner": "roadmap-author",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 2,
+        "retryableFailures": [
+          "INPUT_FINGERPRINT_CHANGED",
+          "TRANSIENT_TOOL_FAILURE"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "BLOCKED",
+          "outcomeCode": "BLOCKED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "check-roadmap",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "plan-check"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 300,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "independent-checking",
+            "roadmap-validation"
+          ]
+        },
+        "oracle": {
+          "kind": "independent-roadmap-check",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "independent-checking",
+            "roadmap-validation",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of plan-check exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "CHECK_INCONCLUSIVE",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "coordinate-work": {
+      "owner": "mission-coordinator",
+      "inputs": [
+        "request-envelope",
+        "accepted-roadmap",
+        "ownership-record"
+      ],
+      "outputs": [
+        "ready-assignments",
+        "joined-work-status"
+      ],
+      "sideEffects": [
+        "assignment-dispatch"
+      ],
+      "independent": false,
+      "failureOwner": "mission-coordinator",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 2,
+        "retryableFailures": [
+          "DEPENDENCY_CHANGED",
+          "OWNERSHIP_CHANGED"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "BLOCKED",
+          "outcomeCode": "BLOCKED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "coordinate-ready-work",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "coordinate-work"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 300,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "task-dispatch",
+            "ownership-enforcement"
+          ]
+        },
+        "oracle": {
+          "kind": "ownership-and-readiness",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "task-dispatch",
+            "ownership-enforcement",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of coordinate-work exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "FAILED",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "produce-work": {
+      "owner": "worker",
+      "inputs": [
+        "assignment",
+        "expected-preimage",
+        "success-items"
+      ],
+      "outputs": [
+        "work-result",
+        "changed-resource-manifest"
+      ],
+      "sideEffects": [
+        "declared-deliverable-write"
+      ],
+      "independent": false,
+      "failureOwner": "same-worker-or-named-replacement",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 3,
+        "retryableFailures": [
+          "INPUT_FINGERPRINT_CHANGED",
+          "EVIDENCE_FINGERPRINT_CHANGED",
+          "TRANSIENT_TOOL_FAILURE"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "FAILED",
+          "outcomeCode": "FAILED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "produce-assigned-result",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "produce-work"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 900,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "artifact-mutation",
+            "effect-specific-acceptance"
+          ]
+        },
+        "oracle": {
+          "kind": "effect-specific-result",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "artifact-mutation",
+            "effect-specific-acceptance",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of produce-work exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "FAILED",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "integration": {
+      "owner": "mission-coordinator",
+      "inputs": [
+        "verified-work-items",
+        "ownership-record"
+      ],
+      "outputs": [
+        "integrated-version"
+      ],
+      "sideEffects": [
+        "ordered-ownership-transfer"
+      ],
+      "independent": false,
+      "failureOwner": "integration-owner",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 2,
+        "retryableFailures": [
+          "CONFLICT_RESOLVED",
+          "INPUT_FINGERPRINT_CHANGED"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "BLOCKED",
+          "outcomeCode": "BLOCKED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "integrate-owned-results",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "integration"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 300,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "artifact-mutation",
+            "ownership-enforcement"
+          ]
+        },
+        "oracle": {
+          "kind": "preimage-and-conflict",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "artifact-mutation",
+            "ownership-enforcement",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of integration exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "FAILED",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "freeze-version": {
+      "owner": "deterministic-control-plane",
+      "inputs": [
+        "request-envelope-hash",
+        "deliverable-manifest",
+        "environment-hash",
+        "check-definition-hashes"
+      ],
+      "outputs": [
+        "frozen-version-id"
+      ],
+      "sideEffects": [
+        "state-record-write"
+      ],
+      "independent": false,
+      "failureOwner": "deterministic-control-plane",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 2,
+        "retryableFailures": [
+          "INPUT_FINGERPRINT_CHANGED"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "BLOCKED",
+          "outcomeCode": "BLOCKED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "freeze-candidate-version",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "freeze-version"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 300,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "cryptographic-hashing",
+            "candidate-freeze"
+          ]
+        },
+        "oracle": {
+          "kind": "hash-and-manifest",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "cryptographic-hashing",
+            "candidate-freeze",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of freeze-version exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "FAILED",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "independent-check": {
+      "owner": "independent-checker",
+      "inputs": [
+        "request-envelope",
+        "success-checklist",
+        "frozen-version-id",
+        "available-checks",
+        "isolated-check-resources"
+      ],
+      "outputs": [
+        "static-review-result",
+        "behavior-test-result"
+      ],
+      "sideEffects": [
+        "isolated-test-resource-write",
+        "result-return-only"
+      ],
+      "independent": true,
+      "failureOwner": "same-worker-or-check-resolver",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 2,
+        "retryableFailures": [
+          "INPUT_FINGERPRINT_CHANGED",
+          "TRANSIENT_TOOL_FAILURE"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "BLOCKED",
+          "outcomeCode": "BLOCKED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "check-frozen-version",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "independent-check"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 300,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "independent-checking",
+            "isolated-execution"
+          ]
+        },
+        "oracle": {
+          "kind": "static-and-behavior-oracle",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "independent-checking",
+            "isolated-execution",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of independent-check exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "CHECK_INCONCLUSIVE",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "static-review": {
+      "owner": "independent-reviewer",
+      "inputs": [
+        "request-envelope",
+        "success-checklist",
+        "frozen-version-id"
+      ],
+      "outputs": [
+        "static-review-result"
+      ],
+      "sideEffects": [
+        "result-return-only"
+      ],
+      "independent": true,
+      "failureOwner": "same-worker-or-named-replacement",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 2,
+        "retryableFailures": [
+          "INPUT_FINGERPRINT_CHANGED"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "BLOCKED",
+          "outcomeCode": "BLOCKED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "review-frozen-version",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "static-review"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 300,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "independent-checking",
+            "static-analysis"
+          ]
+        },
+        "oracle": {
+          "kind": "static-review-oracle",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "independent-checking",
+            "static-analysis",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of static-review exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "FAILED",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "behavior-test": {
+      "owner": "independent-tester",
+      "inputs": [
+        "request-envelope",
+        "success-checklist",
+        "frozen-version-id",
+        "isolated-check-resources"
+      ],
+      "outputs": [
+        "behavior-test-result"
+      ],
+      "sideEffects": [
+        "isolated-test-resource-write",
+        "result-return-only"
+      ],
+      "independent": true,
+      "failureOwner": "same-worker-or-check-resolver",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 2,
+        "retryableFailures": [
+          "INPUT_FINGERPRINT_CHANGED",
+          "TRANSIENT_TOOL_FAILURE"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "BLOCKED",
+          "outcomeCode": "BLOCKED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "test-frozen-version",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "behavior-test"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 300,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "independent-checking",
+            "isolated-execution"
+          ]
+        },
+        "oracle": {
+          "kind": "behavior-test-oracle",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "independent-checking",
+            "isolated-execution",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of behavior-test exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "FAILED",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "named-risk-check": {
+      "owner": "independent-reviewer-or-tester",
+      "inputs": [
+        "named-risk",
+        "request-envelope",
+        "frozen-version-id"
+      ],
+      "outputs": [
+        "risk-check-result"
+      ],
+      "sideEffects": [
+        "isolated-check-resource-write",
+        "result-return-only"
+      ],
+      "independent": true,
+      "failureOwner": "same-worker-or-user",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 2,
+        "retryableFailures": [
+          "INPUT_FINGERPRINT_CHANGED",
+          "TRANSIENT_TOOL_FAILURE"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "BLOCKED",
+          "outcomeCode": "BLOCKED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "check-named-risk",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "named-risk-check"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 300,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "independent-checking",
+            "risk-specific-validation"
+          ]
+        },
+        "oracle": {
+          "kind": "risk-specific-oracle",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "independent-checking",
+            "risk-specific-validation",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of named-risk-check exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "CHECK_INCONCLUSIVE",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "join-check-results": {
+      "owner": "deterministic-control-plane",
+      "inputs": [
+        "frozen-version-id",
+        "required-check-results"
+      ],
+      "outputs": [
+        "joined-check-result"
+      ],
+      "sideEffects": [
+        "state-record-write"
+      ],
+      "independent": false,
+      "failureOwner": "run-owner",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 2,
+        "retryableFailures": [
+          "INPUT_FINGERPRINT_CHANGED"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "FAILED",
+          "outcomeCode": "FAILED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "join-check-results",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "join-check-results"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 300,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "deterministic-control-plane",
+            "json-schema-validation"
+          ]
+        },
+        "oracle": {
+          "kind": "deterministic-result-join",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "deterministic-control-plane",
+            "json-schema-validation",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of join-check-results exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "CHECK_INCONCLUSIVE",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    },
+    "final-record": {
+      "owner": "deterministic-control-plane",
+      "inputs": [
+        "joined-check-result",
+        "current-version-id",
+        "quiescence-proof"
+      ],
+      "outputs": [
+        "terminal-outcome"
+      ],
+      "sideEffects": [
+        "terminal-state-write"
+      ],
+      "independent": false,
+      "failureOwner": "deterministic-control-plane",
+      "retryPolicy": {
+        "kind": "bounded-progress",
+        "maxAttempts": 2,
+        "retryableFailures": [
+          "TRANSIENT_STATE_STORE_FAILURE"
+        ],
+        "requiresProgressAfterFailure": true,
+        "progressFingerprintFields": [
+          "inputHashes",
+          "candidateVersionHash",
+          "oracleEvidenceHash"
+        ],
+        "maxUnchangedFailures": 1,
+        "onExhaustion": {
+          "state": "FAILED",
+          "outcomeCode": "FAILED"
+        }
+      },
+      "execution": {
+        "command": {
+          "kind": "contract-operation",
+          "name": "write-final-record",
+          "argv": [
+            "autoprompt-gate-runner",
+            "--check",
+            "final-record"
+          ],
+          "workingDirectory": "declared-workspace",
+          "timeoutSeconds": 300,
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "durable-state-write",
+            "read-after-write-verification"
+          ]
+        },
+        "oracle": {
+          "kind": "terminal-record-readback",
+          "availability": "required-preflight",
+          "requiredCapabilities": [
+            "durable-state-write",
+            "read-after-write-verification",
+            "evidence-capture"
+          ],
+          "successCondition": "Every declared output of final-record exists, is bound to the frozen inputs, and satisfies its effect-specific acceptance."
+        },
+        "negativePaths": [
+          {
+            "id": "command-unavailable",
+            "condition": "The command or a required capability is unavailable at preflight or execution time.",
+            "expectedOutcome": "PROVIDER_UNSUPPORTED",
+            "requiredEvidence": [
+              "capability-attestation",
+              "availability-probe"
+            ]
+          },
+          {
+            "id": "oracle-rejected",
+            "condition": "The command returns but the observable check rejects an output or required negative-path check.",
+            "expectedOutcome": "FAILED",
+            "requiredEvidence": [
+              "command-receipt",
+              "oracle-result",
+              "negative-path-result"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "routeGraphs": {
+    "DIRECT": {
+      "required": {
+        "success-definition": [],
+        "produce-work": [
+          "success-definition"
+        ],
+        "freeze-version": [
+          "produce-work"
+        ],
+        "independent-check": [
+          "freeze-version"
+        ],
+        "join-check-results": [
+          "independent-check"
+        ],
+        "final-record": [
+          "join-check-results"
+        ]
+      },
+      "terminal": "final-record",
+      "leaves": [
+        "final-record",
+        "freeze-version",
+        "independent-check",
+        "join-check-results",
+        "produce-work",
+        "success-definition"
+      ],
+      "edges": [
+        {
+          "before": "freeze-version",
+          "after": "independent-check"
+        },
+        {
+          "before": "independent-check",
+          "after": "join-check-results"
+        },
+        {
+          "before": "join-check-results",
+          "after": "final-record"
+        },
+        {
+          "before": "produce-work",
+          "after": "freeze-version"
+        },
+        {
+          "before": "success-definition",
+          "after": "produce-work"
+        }
+      ],
+      "order": [
+        "success-definition",
+        "produce-work",
+        "freeze-version",
+        "independent-check",
+        "join-check-results",
+        "final-record"
+      ],
+      "maxTransitions": 14
+    },
+    "LIGHT": {
+      "required": {
+        "success-definition": [],
+        "short-plan": [
+          "success-definition"
+        ],
+        "produce-work": [
+          "short-plan"
+        ],
+        "freeze-version": [
+          "produce-work"
+        ],
+        "independent-check": [
+          "freeze-version"
+        ],
+        "join-check-results": [
+          "independent-check"
+        ],
+        "final-record": [
+          "join-check-results"
+        ]
+      },
+      "terminal": "final-record",
+      "leaves": [
+        "final-record",
+        "freeze-version",
+        "independent-check",
+        "join-check-results",
+        "produce-work",
+        "short-plan",
+        "success-definition"
+      ],
+      "edges": [
+        {
+          "before": "freeze-version",
+          "after": "independent-check"
+        },
+        {
+          "before": "independent-check",
+          "after": "join-check-results"
+        },
+        {
+          "before": "join-check-results",
+          "after": "final-record"
+        },
+        {
+          "before": "produce-work",
+          "after": "freeze-version"
+        },
+        {
+          "before": "short-plan",
+          "after": "produce-work"
+        },
+        {
+          "before": "success-definition",
+          "after": "short-plan"
+        }
+      ],
+      "order": [
+        "success-definition",
+        "short-plan",
+        "produce-work",
+        "freeze-version",
+        "independent-check",
+        "join-check-results",
+        "final-record"
+      ],
+      "maxTransitions": 16
+    },
+    "ROADMAP": {
+      "required": {
+        "success-definition": [],
+        "roadmap-authoring": [
+          "success-definition"
+        ],
+        "plan-check": [
+          "roadmap-authoring"
+        ],
+        "coordinate-work": [
+          "plan-check"
+        ],
+        "produce-work": [
+          "coordinate-work"
+        ],
+        "integration": [
+          "produce-work"
+        ],
+        "freeze-version": [
+          "integration"
+        ],
+        "independent-check": [
+          "freeze-version"
+        ],
+        "join-check-results": [
+          "independent-check"
+        ],
+        "final-record": [
+          "join-check-results"
+        ]
+      },
+      "terminal": "final-record",
+      "leaves": [
+        "coordinate-work",
+        "final-record",
+        "freeze-version",
+        "independent-check",
+        "integration",
+        "join-check-results",
+        "plan-check",
+        "produce-work",
+        "roadmap-authoring",
+        "success-definition"
+      ],
+      "edges": [
+        {
+          "before": "coordinate-work",
+          "after": "produce-work"
+        },
+        {
+          "before": "freeze-version",
+          "after": "independent-check"
+        },
+        {
+          "before": "independent-check",
+          "after": "join-check-results"
+        },
+        {
+          "before": "integration",
+          "after": "freeze-version"
+        },
+        {
+          "before": "join-check-results",
+          "after": "final-record"
+        },
+        {
+          "before": "plan-check",
+          "after": "coordinate-work"
+        },
+        {
+          "before": "produce-work",
+          "after": "integration"
+        },
+        {
+          "before": "roadmap-authoring",
+          "after": "plan-check"
+        },
+        {
+          "before": "success-definition",
+          "after": "roadmap-authoring"
+        }
+      ],
+      "order": [
+        "success-definition",
+        "roadmap-authoring",
+        "plan-check",
+        "coordinate-work",
+        "produce-work",
+        "integration",
+        "freeze-version",
+        "independent-check",
+        "join-check-results",
+        "final-record"
+      ],
+      "maxTransitions": 23
+    }
+  },
+  "checkerSelection": {
+    "default": {
+      "checkerCount": 1,
+      "check": "independent-check",
+      "covers": [
+        "static-review",
+        "behavior-test"
+      ]
+    },
+    "secondChecker": {
+      "requiresNamedDistinctResponsibility": true,
+      "allowedReasons": [
+        "different-access",
+        "different-expertise",
+        "security-or-authorization",
+        "privacy",
+        "destructive-change",
+        "concurrency-or-shared-state",
+        "external-effect",
+        "visual-behavior",
+        "broad-regression"
+      ],
+      "duplicateEvidenceConsumptionForbidden": true
+    }
+  },
+  "composition": {
+    "baseWorkTypes": {
+      "inspect-report": {
+        "humanDescription": "Inspect existing material and report findings without changing the requested result."
+      },
+      "research-decide": {
+        "humanDescription": "Collect current facts or compare alternatives and return a supported decision."
+      },
+      "mechanical-change": {
+        "humanDescription": "Apply a clear decision-free transformation with known checks."
+      },
+      "debug-fix": {
+        "humanDescription": "Reproduce a failure, correct it, and prove the failing behavior now passes."
+      },
+      "implement-build": {
+        "humanDescription": "Build a specified behavior and prove it works."
+      },
+      "refactor": {
+        "humanDescription": "Reshape existing work while preserving its recorded behavior."
+      },
+      "review-polish": {
+        "humanDescription": "Review or improve an existing result within the requested boundaries."
+      },
+      "external-operation": {
+        "humanDescription": "Perform an authorized action outside the local deliverable and verify its effects."
+      }
+    },
+    "artifactOverlays": {
+      "read-only-result": {
+        "requiredCheckKinds": [
+          "source-receipts",
+          "requirement-coverage"
+        ]
+      },
+      "executable-code": {
+        "requiredCheckKinds": [
+          "build-or-run",
+          "behavior",
+          "regression"
+        ]
+      },
+      "documentation": {
+        "requiredCheckKinds": [
+          "source-accuracy",
+          "example-or-render"
+        ]
+      },
+      "web-visual": {
+        "requiredCheckKinds": [
+          "rendered-journey",
+          "interaction"
+        ]
+      },
+      "data": {
+        "requiredCheckKinds": [
+          "data-rules",
+          "boundary-cases"
+        ]
+      },
+      "geometry": {
+        "requiredCheckKinds": [
+          "geometric-validation",
+          "rendered-inspection"
+        ]
+      },
+      "hdl": {
+        "requiredCheckKinds": [
+          "simulation",
+          "synthesis-when-available"
+        ]
+      },
+      "binary": {
+        "requiredCheckKinds": [
+          "binary-comparison",
+          "site-or-format-coverage"
+        ]
+      },
+      "ml": {
+        "requiredCheckKinds": [
+          "metric-threshold",
+          "data-split-integrity"
+        ]
+      },
+      "external-system": {
+        "requiredCheckKinds": [
+          "dry-run-when-supported",
+          "receipts",
+          "idempotency-or-rollback"
+        ]
+      }
+    },
+    "acceptanceOverlays": [
+      "exact-diff",
+      "failing-to-passing-behavior",
+      "behavior-preservation",
+      "rendered-journey",
+      "documentation-example",
+      "receipts",
+      "data-rules",
+      "geometric-validation",
+      "hdl-simulation-or-synthesis",
+      "binary-comparison-or-site-coverage",
+      "ml-metric-threshold",
+      "dry-run-or-idempotency",
+      "characterization-to-passing-behavior",
+      "external-prepare",
+      "external-commit",
+      "external-reconcile",
+      "external-rollback",
+      "external-idempotency"
+    ],
+    "selectionSchema": {
+      "type": "object",
+      "required": [
+        "baseWorkType",
+        "resultFormat",
+        "artifactOverlays",
+        "acceptanceOverlays",
+        "riskOverlays",
+        "riskEvidence"
+      ],
+      "properties": {
+        "baseWorkType": {
+          "enum": [
+            "inspect-report",
+            "research-decide",
+            "mechanical-change",
+            "debug-fix",
+            "implement-build",
+            "refactor",
+            "review-polish",
+            "external-operation"
+          ]
+        },
+        "resultFormat": {
+          "enum": [
+            "read-only-findings",
+            "decision-record",
+            "changed-files",
+            "new-build",
+            "external-receipt"
+          ]
+        },
+        "artifactOverlays": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "read-only-result",
+              "executable-code",
+              "documentation",
+              "web-visual",
+              "data",
+              "geometry",
+              "hdl",
+              "binary",
+              "ml",
+              "external-system"
+            ]
+          }
+        },
+        "acceptanceOverlays": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "exact-diff",
+              "failing-to-passing-behavior",
+              "behavior-preservation",
+              "rendered-journey",
+              "documentation-example",
+              "receipts",
+              "data-rules",
+              "geometric-validation",
+              "hdl-simulation-or-synthesis",
+              "binary-comparison-or-site-coverage",
+              "ml-metric-threshold",
+            "dry-run-or-idempotency"
+            ,"characterization-to-passing-behavior"
+            ,"external-prepare"
+            ,"external-commit"
+            ,"external-reconcile"
+            ,"external-rollback"
+            ,"external-idempotency"
+            ]
+          }
+        },
+        "riskOverlays": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "authorization-security-privacy",
+              "destructive-migration",
+              "external-write-or-cost",
+              "irreversible-action",
+              "concurrency-or-shared-state",
+              "performance-or-service-level",
+              "safety-or-compliance"
+            ]
+          }
+        },
+        "riskEvidence": {
+          "type": "object",
+          "propertyNames": {
+            "enum": [
+              "authorization-security-privacy",
+              "destructive-migration",
+              "external-write-or-cost",
+              "irreversible-action",
+              "concurrency-or-shared-state",
+              "performance-or-service-level",
+              "safety-or-compliance"
+            ]
+          },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "validation": {
+      "exactlyOneBaseWorkType": true,
+      "atLeastOneArtifactOverlay": true,
+      "multipleRiskOverlaysAllowed": true,
+      "rejectUnknownValues": true,
+      "rejectDuplicateOverlays": true,
+      "riskTriggerEvidenceRequired": true,
+      "compoundRules": [
+        {
+          "id": "debug-fix-executable-needs-behavior-proof",
+          "when": {
+            "baseWorkType": "debug-fix",
+            "artifactOverlaysAny": [
+              "executable-code"
+            ]
+          },
+          "require": {
+            "resultFormats": [
+              "changed-files"
+            ],
+            "acceptanceOverlaysAny": [
+              "failing-to-passing-behavior",
+              "characterization-to-passing-behavior"
+            ]
+          }
+        },
+        {
+          "id": "external-operation-needs-transaction-and-receipts",
+          "when": {
+            "baseWorkType": "external-operation"
+          },
+          "require": {
+            "resultFormats": [
+              "external-receipt"
+            ],
+            "artifactOverlaysAll": [
+              "external-system"
+            ],
+            "riskOverlaysAll": [
+              "external-write-or-cost"
+            ],
+            "acceptanceOverlaysAll": [
+              "receipts",
+              "external-prepare",
+              "external-commit",
+              "external-reconcile",
+              "external-rollback",
+              "external-idempotency"
+            ]
+          }
+        },
+        {
+          "id": "inspect-report-is-read-only",
+          "when": {
+            "baseWorkType": "inspect-report"
+          },
+          "require": {
+            "resultFormats": [
+              "read-only-findings"
+            ],
+            "artifactOverlaysAny": [
+              "read-only-result",
+              "documentation"
+            ]
+          },
+          "forbid": {
+            "acceptanceOverlaysAny": [
+              "exact-diff",
+              "failing-to-passing-behavior",
+              "characterization-to-passing-behavior",
+              "external-commit"
+            ]
+          }
+        }
+      ],
+      "incompatibleCombinations": [
+        {
+          "baseWorkType": "inspect-report",
+          "riskOverlay": "destructive-migration",
+          "reason": "A read-only inspection cannot itself perform a destructive migration."
+        },
+        {
+          "baseWorkType": "inspect-report",
+          "riskOverlay": "irreversible-action",
+          "reason": "A read-only inspection cannot itself perform an irreversible action."
+        },
+        {
+          "baseWorkType": "research-decide",
+          "riskOverlay": "destructive-migration",
+          "reason": "Research can study a migration but cannot execute it under this base work type."
+        }
+      ]
+    }
+  },
+  "riskOverlays": {
+    "authorization-security-privacy": {
+      "check": "named-risk-check",
+      "triggerDimensions": [
+        "authorization",
+        "security",
+        "privacy"
+      ]
+    },
+    "destructive-migration": {
+      "check": "named-risk-check",
+      "triggerDimensions": [
+        "destructive-change",
+        "rollback"
+      ]
+    },
+    "external-write-or-cost": {
+      "check": "named-risk-check",
+      "triggerDimensions": [
+        "external-write",
+        "money",
+        "quota"
+      ]
+    },
+    "irreversible-action": {
+      "check": "named-risk-check",
+      "triggerDimensions": [
+        "irreversibility"
+      ]
+    },
+    "concurrency-or-shared-state": {
+      "check": "named-risk-check",
+      "triggerDimensions": [
+        "concurrency",
+        "shared-state"
+      ]
+    },
+    "performance-or-service-level": {
+      "check": "named-risk-check",
+      "triggerDimensions": [
+        "performance",
+        "service-level"
+      ]
+    },
+    "safety-or-compliance": {
+      "check": "named-risk-check",
+      "triggerDimensions": [
+        "safety",
+        "compliance"
+      ]
+    }
+  },
+  "terminationPolicy": {
+    "proofModel": "universal-bounded-state-exploration",
+    "rankingFunction": [
+      "remainingOrderedLeaves",
+      "remainingAttemptsForCurrentLeaf"
+    ],
+    "retryProgressRule": "Every failed attempt consumes one maxAttempts unit; a retry also requires a changed declared fingerprint after maxUnchangedFailures.",
+    "terminalBoundaries": [
+      {
+        "state": "DONE",
+        "outcomeCode": "DONE"
+      },
+      {
+        "state": "PARTIAL",
+        "outcomeCode": "PARTIAL"
+      },
+      {
+        "state": "BLOCKED",
+        "outcomeCode": "BLOCKED"
+      },
+      {
+        "state": "FAILED",
+        "outcomeCode": "FAILED"
+      }
+    ],
+    "requirements": {
+      "allOutgoingBranchesChecked": true,
+      "unboundedCyclesForbidden": true,
+      "terminalOutgoingEdgesForbidden": true,
+      "exhaustedRetryMustReachTypedBoundary": true
+    }
+  },
+  "findingClosure": {
+    "blocking": "repair or evidence-backed non-defect closure is required",
+    "advisory": "recorded residual risk may remain when the user request still passes",
+    "severityDowngradeAllowed": false,
+    "userResidualRiskAcceptanceRequiresAuthority": true
+  }
+}

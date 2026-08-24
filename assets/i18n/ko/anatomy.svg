@@ -1,36 +1,29 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="590" viewBox="0 0 1800 590" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="2128" height="590" viewBox="0 0 2128 590" role="img" aria-labelledby="title desc" data-release-status="local-v1.0.9-build-not-published">
   <title id="title">Autoprompt 호출 구조</title>
-  <desc id="desc">Autoprompt 명령을 트리거, 동시 실행, 에이전트 상한, 모델 라우팅, 목표로 나눈 구조입니다.</desc>
+  <desc id="desc">path를 지원하지 않는 슬래시 명령 제공자 형식과, 따옴표로 묶은 요청 맨 앞에 path를 두는 미게시 로컬 Codex v1.0.9 실행기 형식을 분리해 복사할 수 있게 보여 줍니다.</desc>
   <defs>
     <pattern id="grid" width="56" height="56" patternUnits="userSpaceOnUse">
       <path d="M56 0H0V56" fill="none" stroke="#e2e2e4" stroke-width="1"/>
     </pattern>
   </defs>
 
-  <rect width="1800" height="590" fill="#fbfbfa"/>
-  <rect width="1800" height="590" fill="url(#grid)" opacity=".78"/>
+  <rect width="2128" height="590" fill="#fbfbfa"/>
+  <rect width="2128" height="590" fill="url(#grid)" opacity=".78"/>
 
   <!-- Single flat anatomy panel -->
   <g transform="translate(0 -244)">
-  <rect x="80" y="304" width="1640" height="470" rx="14" fill="#ffffff" stroke="#c9c9ce" stroke-width="1.5"/>
-  <line x1="80" y1="412" x2="1720" y2="412" stroke="#d6d6da" stroke-width="1"/>
-  <line x1="408" y1="304" x2="408" y2="774" stroke="#d6d6da" stroke-width="1"/>
-  <line x1="736" y1="304" x2="736" y2="774" stroke="#d6d6da" stroke-width="1"/>
-  <line x1="1064" y1="304" x2="1064" y2="774" stroke="#d6d6da" stroke-width="1"/>
-  <line x1="1392" y1="304" x2="1392" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <rect x="80" y="304" width="1968" height="470" rx="14" fill="#ffffff" stroke="#c9c9ce" stroke-width="1.5"/>
+  <line x1="80" y1="440" x2="2048" y2="440" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="408" y1="440" x2="408" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="736" y1="440" x2="736" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="1064" y1="440" x2="1064" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="1392" y1="440" x2="1392" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="1720" y1="440" x2="1720" y2="774" stroke="#d6d6da" stroke-width="1"/>
 
-  <!-- Command row -->
-  <g font-family="Nimbus Mono PS, monospace" font-size="22">
-    <text x="112" y="372" fill="#255C60" font-weight="700">/autoprompt</text>
-    <text x="440" y="372" fill="#0d0d0f">mode=wide</text>
-    <text x="768" y="372" fill="#0d0d0f">max_subs=100</text>
-    <text x="1096" y="372" fill="#0d0d0f">agents=auto</text>
-    <text x="1424" y="357" fill="#56565e" font-size="17" font-style="italic">
-      <tspan x="1424" dy="0">&lt;원하는 목표,</tspan>
-      <tspan x="1424" dy="25">자연어로&gt;</tspan>
-    </text>
-  </g>
-  <rect x="112" y="397" width="54" height="3" fill="#255C60"/>
+  <text x="112" y="329" fill="#255C60" font-family="Nimbus Sans, Arial, sans-serif" font-size="14" font-weight="700">슬래시 명령 제공자 (CODEX V2 제외)</text>
+  <text x="112" y="360" fill="#0d0d0f" font-family="Nimbus Mono PS, monospace" font-size="20">/autoprompt mode=wide max_subs=100 agents=auto &lt;원하는 목표&gt;</text>
+  <text x="112" y="389" fill="#255C60" font-family="Nimbus Sans, Arial, sans-serif" font-size="14" font-weight="700">CODEX V2 · 로컬 V1.0.9 빌드 · 미게시</text>
+  <text x="112" y="420" fill="#0d0d0f" font-family="Nimbus Mono PS, monospace" font-size="20">autoprompt activate codex -- "path=auto mode=wide max_subs=100 agents=auto &lt;원하는 목표&gt;"</text>
 
   <!-- Column 01 -->
   <text x="112" y="462" fill="#67676e" font-family="Nimbus Mono PS, monospace" font-size="14">01</text>
@@ -83,6 +76,18 @@
   <text x="1424" y="694" fill="#75757c" font-family="Nimbus Sans, Arial, sans-serif" font-size="15">
     <tspan x="1424" dy="0">원하는 결과를</tspan>
     <tspan x="1424" dy="24">설명하세요.</tspan>
+  </text>
+
+  <!-- Column 06: local Codex v1.0.9 build, not published -->
+  <text x="1752" y="462" fill="#67676e" font-family="Nimbus Mono PS, monospace" font-size="14">06</text>
+  <text x="1752" y="515" fill="#111113" font-family="Nimbus Sans, Arial, sans-serif" font-size="24" font-weight="600">경로 — Codex v2 전용</text>
+  <text x="1752" y="566" fill="#56565d" font-family="Nimbus Sans, Arial, sans-serif" font-size="18">
+    <tspan x="1752" dy="0">따옴표로 묶은 요청의</tspan>
+    <tspan x="1752" dy="30">맨 앞. 로컬 전용.</tspan>
+  </text>
+  <text x="1752" y="694" fill="#75757c" font-family="Nimbus Mono PS, monospace" font-size="13">
+    <tspan x="1752" dy="0">auto / direct / light</tspan>
+    <tspan x="1752" dy="24">/ roadmap</tspan>
   </text>
 
   </g>

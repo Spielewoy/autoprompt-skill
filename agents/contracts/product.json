@@ -1,0 +1,244 @@
+{
+  "$schema": "./schemas/product.schema.json",
+  "kind": "autoprompt-product-contract",
+  "contractVersion": "2.0.0",
+  "schemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "product": {
+    "id": "autoprompt",
+    "activation": "explicit-only",
+    "routeNames": [
+      "DIRECT",
+      "LIGHT",
+      "ROADMAP"
+    ],
+    "defaultRoute": null,
+    "controller": "deterministic-control-plane",
+    "humanDescription": "Autoprompt records the exact request, recommends the smallest suitable work structure, completes the requested work, checks it independently, and then stops."
+  },
+  "canonicalSources": [
+    {
+      "id": "routes",
+      "contract": "agents/contracts/routes.json",
+      "schema": "agents/contracts/schemas/routes.schema.json"
+    },
+    {
+      "id": "states",
+      "contract": "agents/contracts/state-machine.json",
+      "schema": "agents/contracts/schemas/state-machine.schema.json"
+    },
+    {
+      "id": "checks",
+      "contract": "agents/contracts/gates.json",
+      "schema": "agents/contracts/schemas/gates.schema.json"
+    },
+    {
+      "id": "roles",
+      "contract": "agents/contracts/roles.json",
+      "schema": "agents/contracts/schemas/roles.schema.json"
+    },
+    {
+      "id": "providers",
+      "contract": "agents/contracts/providers.json",
+      "schema": "agents/contracts/schemas/providers.schema.json"
+    },
+    {
+      "id": "plain-language",
+      "contract": "agents/contracts/plain-language.json",
+      "schema": "agents/contracts/schemas/plain-language.schema.json"
+    }
+  ],
+  "runtimeSchemas": {
+    "settings": "agents/contracts/schemas/settings.schema.json",
+    "requestEnvelopeEntry": "agents/contracts/schemas/request-envelope-entry.schema.json",
+    "routeRecommendation": "agents/contracts/schemas/route-recommendation.schema.json",
+    "routeDecision": "agents/contracts/schemas/route-decision.schema.json",
+    "evidence": "agents/contracts/schemas/evidence.schema.json",
+    "stateEvent": "agents/contracts/schemas/state-event.schema.json",
+    "outcome": "agents/contracts/schemas/outcome.schema.json",
+    "runRecord": "agents/contracts/schemas/run-record.schema.json",
+    "roleReport": "agents/contracts/schemas/role-report.schema.json",
+    "accountingRecord": "agents/contracts/schemas/accounting-record.schema.json",
+    "accountingSnapshot": "agents/contracts/schemas/accounting-snapshot.schema.json",
+    "recoveryCheckpointRecord": "agents/contracts/schemas/recovery-checkpoint-record.schema.json",
+    "recoveryCheckpointSnapshot": "agents/contracts/schemas/recovery-checkpoint-snapshot.schema.json",
+    "outcomeQualityGate": "agents/contracts/schemas/outcome-quality-gate.schema.json"
+  },
+  "runtimeAccountingPolicy": {
+    "recordPath": "runtime/accounting.jsonl",
+    "snapshotPath": "runtime/budget.json",
+    "schemaVersion": "2.0.0",
+    "requiredCeilingFields": [
+      "wallMilliseconds",
+      "totalTokens",
+      "sessions",
+      "launches",
+      "retries",
+      "costMicrounits",
+      "finalizationReserveMilliseconds"
+    ],
+    "tokenCategories": [
+      "noncachedInput",
+      "cachedInput",
+      "output",
+      "reasoning"
+    ],
+    "implicitUnlimitedAllowed": false,
+    "hashChainRequired": true,
+    "snapshotMustBindLastRecord": true
+  },
+  "runtimeRecoveryCheckpointPolicy": {
+    "recordPath": "runtime/recovery-checkpoints.jsonl",
+    "snapshotPath": "runtime/recovery-checkpoint.json",
+    "schemaVersion": "2.0.0",
+    "authorityScope": "one-run-activation-lineage",
+    "hashChainRequired": true,
+    "snapshotMustBindLastRecord": true,
+    "oneResumeCheckpoint": true,
+    "commitOrder": [
+      "append-complete-record-and-newline",
+      "sync-record-log",
+      "write-and-sync-temporary-snapshot",
+      "atomically-replace-snapshot",
+      "sync-containing-directory"
+    ],
+    "staleAccountingAction": "reject-resume-and-require-authorized-roll-forward"
+  },
+  "compatibility": {
+    "readVersions": [
+      "1",
+      "2.0.0"
+    ],
+    "writeVersion": "2.0.0",
+    "policy": "dual-read-v2-write",
+    "legacySource": "agents/contracts/autoprompt.contract.json",
+    "legacySourceIsAuthoritative": false,
+    "aliasTelemetryRequired": true,
+    "removeAliasesAfter": "one verified compatibility release"
+  },
+  "generationPolicy": {
+    "authoritativeInputs": [
+      "agents/contracts/product.json",
+      "agents/contracts/routes.json",
+      "agents/contracts/state-machine.json",
+      "agents/contracts/gates.json",
+      "agents/contracts/roles.json",
+      "agents/contracts/providers.json",
+      "agents/contracts/plain-language.json"
+    ],
+    "authoritativePromptSources": [
+      "agents/contracts/generic.md",
+      "agents/contracts/frameworks/composition.md",
+      "agents/contracts/personas/ap-arbiter.md",
+      "agents/contracts/personas/ap-depth-prober.md",
+      "agents/contracts/personas/ap-execharness-resolver.md",
+      "agents/contracts/personas/ap-feature-coordinator.md",
+      "agents/contracts/personas/ap-framework-generator.md",
+      "agents/contracts/personas/ap-framework-validator.md",
+      "agents/contracts/personas/ap-fresh-verifier.md",
+      "agents/contracts/personas/ap-goal-checker.md",
+      "agents/contracts/personas/ap-implementer.md",
+      "agents/contracts/personas/ap-intake.md",
+      "agents/contracts/personas/ap-janitor.md",
+      "agents/contracts/personas/ap-juror.md",
+      "agents/contracts/personas/ap-manager.md",
+      "agents/contracts/personas/ap-planner.md",
+      "agents/contracts/personas/ap-preflight-probe.md",
+      "agents/contracts/personas/ap-re-anchor.md",
+      "agents/contracts/personas/ap-researcher.md",
+      "agents/contracts/personas/ap-reviewer.md",
+      "agents/contracts/personas/ap-scope-coordinator.md",
+      "agents/contracts/personas/ap-scoper.md",
+      "agents/contracts/personas/ap-scribe.md",
+      "agents/contracts/personas/ap-sweep-coordinator.md",
+      "agents/contracts/personas/ap-sweeper.md",
+      "agents/contracts/personas/ap-synthesizer.md",
+      "agents/contracts/personas/ap-verifier.md"
+    ],
+    "requireEveryCompatibilityAliasPrompt": true,
+    "legacyInputAllowedForProviderGeneration": false,
+    "providerOutputMustEmbedContractVersion": "2.0.0",
+    "providerOutputMustPassPlainLanguageLint": true,
+    "providerOutputMustPassSemanticProjection": true,
+    "failWhenCanonicalInputIsMissing": true
+  },
+  "invariants": [
+    {
+      "id": "EXPLICIT_ACTIVATION",
+      "humanDescription": "No Autoprompt role or helper may start outside one explicit, active invocation."
+    },
+    {
+      "id": "EXACT_REQUEST",
+      "humanDescription": "The ordered request record is immutable and its content hashes must match whenever it is loaded."
+    },
+    {
+      "id": "NO_DEFAULT_ROUTE",
+      "humanDescription": "DIRECT, LIGHT, and ROADMAP are selected from recorded facts; none is a fallback choice."
+    },
+    {
+      "id": "ONE_WRITER",
+      "humanDescription": "One active controller owns one writable target version, and every mutable resource has one owner at a time."
+    },
+    {
+      "id": "INDEPENDENT_CHECKS",
+      "humanDescription": "The people or agents who check a result did not write the exact version they inspect."
+    },
+    {
+      "id": "EVIDENCE_INVALIDATION",
+      "humanDescription": "Changing an input invalidates every dependent check result before completion can be recorded."
+    },
+    {
+      "id": "BOUNDS_DO_NOT_RESET",
+      "humanDescription": "Run-wide time, cost, launch, and retry limits survive progress, restart, and continuation."
+    },
+    {
+      "id": "RECOVERY_CHECKPOINT_AUTHORITY",
+      "humanDescription": "Scheduler changes are recovered only from the latest hash-chained checkpoint whose atomic snapshot matches the current state, accounting record, capability, target, and immutable request inputs."
+    },
+    {
+      "id": "USER_AUTHORITY",
+      "humanDescription": "Product meaning, consequential external action, destructive action, credentials, money, and missing permission remain user-owned choices."
+    },
+    {
+      "id": "LOCAL_RUN_HISTORY",
+      "humanDescription": "Private run history stays local, never enters the requested result, source control, a package, or an automatic upload."
+    },
+    {
+      "id": "TERMINAL_LAST",
+      "humanDescription": "The controller records the final run state only after required work is joined, checks are current, and other working agents are stopped."
+    }
+  ],
+  "authority": {
+    "dimensions": [
+      "reversibility",
+      "externality",
+      "confidentiality",
+      "thirdPartyImpact",
+      "cost",
+      "explicitTargetAuthorization"
+    ],
+    "decisionClasses": {
+      "FACTUAL": "evidence-owner",
+      "REVERSIBLE_TECHNICAL": "run-owner-or-technical-reviewer",
+      "PRODUCT_SEMANTIC": "user",
+      "CONSEQUENTIAL_EXTERNAL": "user",
+      "MISSION_CONTRADICTION": "user"
+    },
+    "redundantApprovalForbidden": true,
+    "necessaryClarificationRequired": true
+  },
+  "trustBoundary": {
+    "instructionOrder": [
+      "system",
+      "operator",
+      "user-request-envelope",
+      "explicitly-loaded-autoprompt-contract"
+    ],
+    "untrustedInputs": [
+      "repository-content",
+      "generated-text",
+      "web-content",
+      "test-output",
+      "tool-output"
+    ]
+  }
+}

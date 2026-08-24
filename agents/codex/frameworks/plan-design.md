@@ -2,21 +2,20 @@
 # Framework: plan-design  (category plan × subsection design · no tag · tier T2)
 
 **You are the L1 SUPERVISOR.** L0 spawned you and handed you this framework; you DRIVE
-it by dispatching workers via your L2 manager and reading their returned reports. The gate
+it by dispatching workers via your L2 manager and reading their returned reports. The required check
 path itself is opened/extracted for you by a reader-capable role - your L2 manager
 (managers retain Read), or a reader-leaf you spawn on a direct L1→L3 hop; you dispatch
 gates and read the reports they return, but never open the corpus yourself. You never
 decide the design yourself. Goal: produce an architecture/design DECISION for a
 KNOWN target - the buildable blueprint a build framework consumes. Owns no production code.
 
-GATE PATH (T2): FRAME the decision → ENUMERATE options → DECIDE + write the BLUEPRINT → FRESH-VERIFY(default-FAIL) → DONE.
 
 ## Layer flow
 - **You (L1):** dispatch the design (L3) then its fresh-verify (L4); never decide it yourself.
 - **L3 executor:** an architect/planner - states options, picks one with tradeoffs,
   writes the blueprint.
 - **L4 leaf:** fresh-verify the blueprint (default-FAIL).
-- **INDEPENDENCE:** the fresh-verify gate MUST be a different agent-instance than the one that produced the work under review - never a reused context.
+- **INDEPENDENCE:** the fresh-verify required check MUST be a different agent-instance than the one that produced the work under review - never a reused context.
 - Negative verdicts loop UP to you.
 
 ## THE END-TO-END WORKFLOW
@@ -45,9 +44,9 @@ and is buildable as written → **S5** DONE.
 ## THE BLOCKED INVARIANT (non-negotiable)
 Verification runs the REAL check in its REAL environment - NEVER fake a pass, NEVER
 fabricate evidence, NEVER declare DONE over a red or un-runnable check. On ANY blocker,
-STOP and report the attempt + the concrete unblock path, then loop that verdict UP to
-your dispatcher (never sideways) - stay in the closed loop and resolve every open
-question through a subagent, NEVER yielding to the user.
+After bounded diagnosis, a repairable defect returns to its owner. An external,
+authority, environment, or policy blocker terminates with the attempted check, observed
+evidence, and concrete unblock requirement; never fabricate a pass or retry forever.
 
 ## Closed decision scenarios (each ends at ONE verdict)
 - **S1 - the target is actually UNKNOWN** → hand to `plan-research`; never invent a
@@ -60,4 +59,29 @@ question through a subagent, NEVER yielding to the user.
 
 ## Stacking
 ONE L3 track. Typical flow: `plan-design` produces the blueprint, then a build
-framework consumes it as a sequenced track - `frameworks/composition.md`.
+framework consumes it as a sequenced track - `composition.md`.
+
+<!-- AUTOPROMPT-FRAMEWORK-GATES:BEGIN v2 sha256=b41cfc5bbf3088c61389449ea26a55f47cdbac2bb5c670ea684bd05d615526e1 -->
+## Generated route checks
+
+This compact section is generated from the versioned check registry.
+
+### Applicable route `DIRECT`
+- Leaves: `["final-record","freeze-version","independent-check","join-check-results","produce-work","success-definition"]`
+- Edges: `[{"before":"freeze-version","after":"independent-check"},{"before":"independent-check","after":"join-check-results"},{"before":"join-check-results","after":"final-record"},{"before":"produce-work","after":"freeze-version"},{"before":"success-definition","after":"produce-work"}]`
+- Order: `["success-definition","produce-work","freeze-version","independent-check","join-check-results","final-record"]`
+- Maximum transitions: `14`
+
+### Applicable route `LIGHT`
+- Leaves: `["final-record","freeze-version","independent-check","join-check-results","produce-work","short-plan","success-definition"]`
+- Edges: `[{"before":"freeze-version","after":"independent-check"},{"before":"independent-check","after":"join-check-results"},{"before":"join-check-results","after":"final-record"},{"before":"produce-work","after":"freeze-version"},{"before":"short-plan","after":"produce-work"},{"before":"success-definition","after":"short-plan"}]`
+- Order: `["success-definition","short-plan","produce-work","freeze-version","independent-check","join-check-results","final-record"]`
+- Maximum transitions: `16`
+
+### Applicable route `ROADMAP`
+- Leaves: `["coordinate-work","final-record","freeze-version","independent-check","integration","join-check-results","plan-check","produce-work","roadmap-authoring","success-definition"]`
+- Edges: `[{"before":"coordinate-work","after":"produce-work"},{"before":"freeze-version","after":"independent-check"},{"before":"independent-check","after":"join-check-results"},{"before":"integration","after":"freeze-version"},{"before":"join-check-results","after":"final-record"},{"before":"plan-check","after":"coordinate-work"},{"before":"produce-work","after":"integration"},{"before":"roadmap-authoring","after":"plan-check"},{"before":"success-definition","after":"roadmap-authoring"}]`
+- Order: `["success-definition","roadmap-authoring","plan-check","coordinate-work","produce-work","integration","freeze-version","independent-check","join-check-results","final-record"]`
+- Maximum transitions: `23`
+
+<!-- AUTOPROMPT-FRAMEWORK-GATES:END -->

@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "codex-local-empirical-preregistration.v1",
+  "evidenceClass": "deterministic-local-execution",
+  "corpusPath": "tests/fixtures/codex-v2-conformance/semantic-route-corpus.json",
+  "corpusSha256": "0e4bf80c0eccfcf8fe272b6e622454e4f336a5c3f0badadf3113d42b11c34b80",
+  "currentCommit": "4003101383cbca254dc8532ff6cfa7fffb0c3747",
+  "cohort": {
+    "expectedTaskCount": 10,
+    "taskIds": [
+      "typo-one-file",
+      "bounded-one-file-bug",
+      "bounded-docs-correction",
+      "bounded-current-research",
+      "xss-bounded-security-fix",
+      "database-writeback-staged",
+      "cad-bounded-change",
+      "local-checkpoint",
+      "binary-format-repair",
+      "soc-multi-lane-build"
+    ],
+    "exclusions": []
+  },
+  "repetitions": 3,
+  "arms": [
+    { "armId": "base", "role": "single-agent-base", "sourceKind": "single-agent-no-router" },
+    { "armId": "current", "role": "frozen-current-autoprompt", "sourceKind": "git-commit" },
+    { "armId": "redesign", "role": "codex-redesign", "sourceKind": "worktree-files" }
+  ],
+  "pairedOrders": [
+    ["base", "current", "redesign"],
+    ["current", "redesign", "base"],
+    ["redesign", "base", "current"]
+  ],
+  "analystAblation": {
+    "withoutAnalystPolicy": "effect-only-local-proxy-v1",
+    "withAnalystPolicy": "candidate-route-recommendation-v1",
+    "analystMayBeRemoved": false,
+    "limits": {
+      "maxP50DurationMs": 100,
+      "maxP95DurationMs": 250,
+      "maxP50WeightedCost": 100,
+      "maxP95WeightedCost": 250
+    }
+  }
+}

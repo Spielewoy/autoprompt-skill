@@ -3,14 +3,29 @@
 
 const assert = require('node:assert/strict')
 const childProcess = require('node:child_process')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
+const { TextDecoder } = require('node:util')
+const zlib = require('node:zlib')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const PACKAGE_PATH = path.join(ROOT, 'package.json')
+const COVERAGE_PATH = path.join(ROOT, 'AUTOPROMPT-IMPLEMENTATION-COVERAGE.json')
+const CI_PATH = path.join(ROOT, '.github', 'workflows', 'ci.yml')
 const PACKAGE_VERSION = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8')).version
+const CODEX_PUBLIC_EVIDENCE_PATH = 'agents/contracts/codex-live-conformance-evidence.json'
+const CODEX_RUNTIME_IDENTITY_HASH = '4f2bd92306b2f87156e7a9b3c5db169b8865a4f13ab6ba9d0d1c9df0c5c83a5e'
+const CODEX_RAW_EVIDENCE_SHA256 = '2e24eda37043240b3cf3a008e6a3c628d87653741b21e38d4947d54955e01c59'
+const EXPECTED_BENCHMARK_SCRIPT = 'node --test tests/source/benchmark-evidence-v2.test.cjs tests/source/benchmark-evidence-test-closures.test.cjs tests/benchmarks/autoprompt-benchmark.test.cjs'
+const EXPECTED_CODEX_CORE_SCRIPT = 'node --test --test-concurrency=1 tests/source/codex-activation-preflight-v2.test.cjs tests/source/codex-explicit-activation-v2.test.cjs tests/source/codex-recovery-checkpoint-v2.test.cjs tests/source/codex-router-v2.test.cjs tests/source/codex-run-record-v2.test.cjs tests/source/codex-runtime-evidence-gates-r5.test.cjs tests/source/codex-runtime-state-v2.test.cjs tests/source/codex-scheduler-v2.test.cjs tests/source/codex-supervisor-integration-v2.test.cjs tests/source/codex-v2-conformance.test.cjs tests/source/codex-v2-contracts.test.cjs'
+const PRIVACY_SCHEMA_VOCABULARY_ALLOWLIST = new Set([
+  'apiKey', 'argv', 'credential', 'password', 'pid', 'pids', 'processId',
+  'secret', 'sessionId', 'sessionIds', 'stderr', 'stdout', 'telemetry',
+  'threadId', 'threadIds', 'token', 'transcript',
+])
 const PROVIDERS = [
   'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime',
   'omp', 'deepseek', 'reasonix',
@@ -111,16 +126,27 @@ function packageFilesOnDisk() {
     path.join(ROOT, 'LICENSE'),
     ...filesBelow(path.join(ROOT, 'bin')),
     path.join(ROOT, 'scripts', 'codex-configure.cjs'),
+    path.join(ROOT, 'scripts', 'codex-runtime-identity.cjs'),
+    path.join(ROOT, 'scripts', 'local-only-safety.cjs'),
     path.join(ROOT, 'scripts', 'harness-provider-config.cjs'),
     path.join(ROOT, 'scripts', 'runtime-payload.cjs'),
+    path.join(ROOT, 'scripts', 'codex-artifact.cjs'),
+    path.join(ROOT, 'scripts', 'codex-evidence-bundle.cjs'),
+    ...filesBelow(path.join(ROOT, 'scripts', 'codex-evidence')),
+    ...filesBelow(path.join(ROOT, 'scripts', 'benchmark-evidence')),
     ...filesBelow(path.join(ROOT, 'scripts', 'install')),
+    ...filesBelow(path.join(ROOT, 'agents', 'contracts')),
     ...PROVIDERS.map(provider => path.join(ROOT, 'agents', 'manifests', `${provider}-runtime.json`)),
     ...PROVIDERS.flatMap(provider => filesBelow(path.join(ROOT, 'agents', provider))),
+    ...filesBelow(path.join(ROOT, 'packages', 'codex')),
     ...readmeReferenceClosure()
       .filter(reference => !reference.directory)
       .map(reference => path.join(ROOT, ...reference.target.split('/'))),
   ]
-  return [...new Set(explicit.map(file => path.relative(ROOT, file).split(path.sep).join('/')))].sort()
+  return [...new Set(explicit.map(file => path.relative(ROOT, file).split(path.sep).join('/')))]
+    // npm never packs .gitignore control files, even below an allowed directory.
+    .filter(file => path.posix.basename(file) !== '.gitignore')
+    .sort()
 }
 
 function isolatedEnvironment(root) {
@@ -153,13 +179,123 @@ function dryRunPackResult() {
   }
 }
 
+function tarballEntries(tarballBytes) {
+  const archive = zlib.gunzipSync(tarballBytes)
+  const entries = new Map()
+  for (let offset = 0; offset + 512 <= archive.length;) {
+    const header = archive.subarray(offset, offset + 512)
+    if (header.every(byte => byte === 0)) break
+    const field = (start, length) => header.subarray(start, start + length)
+      .toString('utf8').replace(/\0.*$/s, '')
+    const name = [field(345, 155), field(0, 100)].filter(Boolean).join('/')
+    const size = Number.parseInt(field(124, 12).trim() || '0', 8)
+    assert.equal(Number.isSafeInteger(size), true, `${name}: invalid tar size`)
+    const type = field(156, 1) || '0'
+    const dataStart = offset + 512
+    if (type === '0') {
+      assert.equal(entries.has(name), false, `${name}: duplicate tar entry`)
+      entries.set(name, archive.subarray(dataStart, dataStart + size))
+    }
+    offset = dataStart + Math.ceil(size / 512) * 512
+  }
+  return entries
+}
+
+function decodeTextualEntry(bytes) {
+  if (bytes.includes(0)) return null
+  let text
+  try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes) } catch { return null }
+  return /[\u0001-\u0008\u000b\u000c\u000e-\u001f]/u.test(text) ? null : text
+}
+
+function isEmptyPrivateValue(value) {
+  if (value === null || value === false || value === '') return true
+  if (Array.isArray(value)) return value.length === 0
+  return value && typeof value === 'object' && Object.keys(value).length === 0
+}
+
+function assertNoPrivateJsonValues(value, entryPath, ancestors = []) {
+  if (!value || typeof value !== 'object') return
+  for (const [key, child] of Object.entries(value)) {
+    const schemaVocabulary = ['properties', '$defs', 'definitions'].some(container => ancestors.includes(container))
+    if (PRIVACY_SCHEMA_VOCABULARY_ALLOWLIST.has(key) && !schemaVocabulary && !isEmptyPrivateValue(child)) {
+      assert.fail(`${entryPath}: populated private runtime field ${[...ancestors, key].join('.')}`)
+    }
+    assertNoPrivateJsonValues(child, entryPath, [...ancestors, key])
+  }
+}
+
+function assertPrivacySafeText(entryPath, text) {
+  const genericPrivatePatterns = [
+    { label: 'Windows user-home path', pattern: /\b[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/](?!<|%|\$|\{)(?!(?:x|user|username|example|test|tester)(?:[\\/\s"'`]|$))[^\\/\s"'`]+/iu },
+    { label: 'POSIX user-home path', pattern: /\/(?:Users|home)\/(?!<|\$|\{)(?!(?:x|user|username|example|test|tester)(?:[\/\s"'`]|$))[^/\s"'`]+/u },
+    { label: 'runtime UUID', pattern: /\b(?!00000000-0000-0000-0000-000000000000)[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu },
+    { label: 'private key material', pattern: /-----BEGIN (?:OPENSSH |RSA |EC )?PRIVATE KEY-----/u },
+    { label: 'credential-bearing URL', pattern: /https?:\/\/[^\s/@:"']+:[^\s/@"']+@/iu },
+    { label: 'assigned literal secret', pattern: /\b(?:authorization|api[_-]?key|access[_-]?token|password|secret)["']?\s*[:=]\s*["'](?!redacted\b|<)[A-Za-z0-9/+_.-]{16,}["']/iu },
+  ]
+  for (const { label, pattern } of genericPrivatePatterns) assert.doesNotMatch(text, pattern, `${entryPath}: ${label}`)
+
+  if (entryPath.endsWith('.json')) {
+    let parsed
+    try { parsed = JSON.parse(text) } catch { return }
+    assertNoPrivateJsonValues(parsed, entryPath)
+  }
+}
+
+function expectedPublicCodexEvidence() {
+  return {
+    evidence: {
+      canaryResult: 'FAIL',
+      canarySchema: 'codex-live-canary.v1',
+      providerAdmission: {
+        verifiedCapabilities: [],
+        verifiedCapabilitiesExact: false,
+      },
+      providerId: 'codex',
+      result: 'FAIL',
+      schemaVersion: 'codex-live-conformance-observation.v1',
+    },
+    fixtureOnly: false,
+    publicProjection: {
+      policy: 'codex-public-fail-evidence.v1',
+      sourceEvidenceSha256: CODEX_RAW_EVIDENCE_SHA256,
+    },
+    result: 'FAIL',
+    runtimeIdentityHash: CODEX_RUNTIME_IDENTITY_HASH,
+    schemaVersion: 'codex-live-conformance-evidence.v1',
+  }
+}
+
+test('AP-TEST-018 benchmark consequence suites remain continuously enforced and mapped', () => {
+  const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'))
+  const coverage = JSON.parse(fs.readFileSync(COVERAGE_PATH, 'utf8'))
+  const findings = new Map(coverage.findings.map(finding => [finding.id, finding]))
+  const ci = fs.readFileSync(CI_PATH, 'utf8')
+
+  assert.match(packageJson.scripts.test, /npm run test:benchmark/)
+  assert.equal(packageJson.scripts['test:benchmark'], EXPECTED_BENCHMARK_SCRIPT)
+  assert.equal(packageJson.scripts['test:codex-core'], EXPECTED_CODEX_CORE_SCRIPT)
+  assert.equal(packageJson.scripts.verify.match(/npm run test:codex-core/g)?.length, 1)
+  assert.doesNotMatch(ci, /run: npm run test:codex-runtime-evidence/)
+  assert.match(ci, /run: npm test/)
+  assert.ok(findings.get('AP-TEST-018')?.test_refs.includes('tests/source/npm-package.test.cjs'))
+
+  for (const id of ['AP-TEST-010', 'AP-TEST-020', 'AP-TEST-022']) {
+    assert.ok(findings.get(id)?.test_refs.includes('tests/source/benchmark-evidence-test-closures.test.cjs'), id)
+  }
+  for (const id of ['AP-TEST-025', 'AP-TEST-026', 'AP-TEST-027']) {
+    assert.ok(findings.get(id)?.test_refs.includes('tests/source/codex-runtime-evidence-gates-r5.test.cjs'), id)
+  }
+})
+
 test('package metadata is public-ready under the exact available name and remains dependency-free', () => {
   const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'))
   assert.equal(packageJson.name, 'autoprompt-skill')
   assert.equal(packageJson.version, PACKAGE_VERSION)
   assert.equal(
     packageJson.description,
-    'Autoprompt is a coding-agent skill that cuts failures by 45% on agentic coding tasks.',
+    'Autoprompt is a coding-agent skill for explicit routing, bounded delegation, and evidence-backed checks.',
   )
   assert.equal(packageJson.private, undefined)
   assert.deepEqual(packageJson.publishConfig, {
@@ -200,24 +336,55 @@ test('package metadata is public-ready under the exact available name and remain
     'prime-lifecycle',
     'new-harness-lifecycle',
     'packed-new-harness-lifecycle',
+    'codex-receipt-lifecycle',
+    'packed-codex-lifecycle',
+    'codex-artifact',
   ]) {
     assert.match(packageJson.scripts['test:lifecycle'], new RegExp(`${suite}\\.test\\.cjs`), suite)
   }
   assert.match(packageJson.scripts['test:lifecycle'], /^node --test --test-concurrency=1\b/)
   assert.match(packageJson.scripts.test, /npm run test:cli/)
   assert.match(packageJson.scripts.test, /npm run test:providers/)
+  assert.match(packageJson.scripts.test, /npm run test:benchmark/)
+  assert.equal(
+    packageJson.scripts['test:benchmark'],
+    EXPECTED_BENCHMARK_SCRIPT,
+  )
+  assert.equal(packageJson.scripts['test:codex-core'], EXPECTED_CODEX_CORE_SCRIPT)
+  assert.equal(
+    packageJson.scripts['test:codex-lifecycle'],
+    'node --test --test-concurrency=1 tests/source/codex-receipt-lifecycle.test.cjs tests/source/packed-codex-lifecycle.test.cjs tests/source/codex-artifact.test.cjs',
+  )
+  assert.equal(
+    packageJson.scripts['test:codex-artifact'],
+    'node --test --test-concurrency=1 tests/source/codex-artifact.test.cjs',
+  )
+  assert.equal(packageJson.scripts['benchmark:run'], 'node scripts/benchmark-evidence/runner.cjs')
+  assert.equal(packageJson.scripts['artifact:codex:check'], 'node scripts/codex-artifact.cjs --check')
+  assert.equal(
+    packageJson.scripts['artifact:codex:pack'],
+    'node scripts/codex-artifact.cjs --pack --destination dist/codex',
+  )
   assert.doesNotMatch(packageJson.scripts.test, /npm run test:lifecycle/)
   assert.match(packageJson.scripts.prepack, /npm test/)
   assert.doesNotMatch(packageJson.scripts.prepack, /npm run test:lifecycle/)
   assert.match(packageJson.scripts.verify, /npm test/)
+  assert.match(packageJson.scripts.verify, /npm run test:codex-core/)
   assert.match(packageJson.scripts.verify, /npm run test:lifecycle/)
-  assert.equal(packageJson.scripts.prepublishOnly, 'npm run verify')
+  assert.equal(packageJson.scripts.prepublishOnly, 'npm run verify && npm run benchmark:release-quality-gate')
   assert.deepEqual(packageJson.files, [
     'bin/',
     'scripts/codex-configure.cjs',
+    'scripts/codex-runtime-identity.cjs',
+    'scripts/local-only-safety.cjs',
     'scripts/harness-provider-config.cjs',
     'scripts/install/',
+    'scripts/codex-artifact.cjs',
+    'scripts/codex-evidence-bundle.cjs',
+    'scripts/codex-evidence/',
     'scripts/runtime-payload.cjs',
+    'scripts/benchmark-evidence/',
+    'agents/contracts/',
     'agents/claude/',
     'agents/codex/',
     'agents/opencode/',
@@ -236,16 +403,15 @@ test('package metadata is public-ready under the exact available name and remain
     'agents/manifests/omp-runtime.json',
     'agents/manifests/deepseek-runtime.json',
     'agents/manifests/reasonix-runtime.json',
+    'packages/codex/',
     'assets/anatomy.svg',
-    'assets/banner.svg',
     'assets/how-it-works-hierarchy.svg',
     'assets/how-it-works-loop.svg',
-    'assets/terminal-bench-2.1.svg',
-    'assets/terminal-bench-2.1-leaderboard.svg',
     'docs/CODE_OF_CONDUCT.md',
     'docs/CONTRIBUTING.md',
     'docs/SECURITY.md',
     'docs/SUPPORT.md',
+    'docs/benchmarks/codex-canary-2026-08-22.md',
     'docs/benchmarks/terminal-bench-2.1.md',
     'docs/faq/does-autoprompt-mean-i-do-not-have-to-prompt.md',
     'docs/faq/how-autonomous-is-autoprompt.md',
@@ -255,6 +421,7 @@ test('package metadata is public-ready under the exact available name and remain
     'docs/faq/which-coding-agents-are-supported.md',
     'docs/guides/9router-multi-provider-setup.md',
     'docs/guides/9router-routing.png',
+    'docs/guides/codex-v2-local-records.md',
     'docs/guides/custom-agent-compatibility.md',
   ])
   assert.equal(fs.existsSync(path.join(ROOT, 'package-lock.json')), false)
@@ -276,8 +443,6 @@ test('npm dry-run inventory is an exact allowlist and excludes repository-only m
     'coverage/',
     'node_modules/',
     'tests/',
-    'agents/contracts/frameworks/',
-    'agents/contracts/personas/',
     'agents/other/',
     'agents/vibe/',
     'agents/manifests/vibe-runtime.json',
@@ -290,6 +455,95 @@ test('npm dry-run inventory is an exact allowlist and excludes repository-only m
       file,
     )
   }
+})
+
+test('npm tarball generically scans every textual entry and ships only the deterministic privacy-safe Codex FAIL projection', t => {
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt npm privacy '))
+  t.after(() => fs.rmSync(temporaryRoot, { recursive: true, force: true }))
+  const completed = runNpm([
+    'pack', '--json', '--ignore-scripts', '--pack-destination', temporaryRoot,
+  ], { env: isolatedEnvironment(temporaryRoot) })
+  assert.equal(completed.status, 0, completed.stderr)
+  const [packResult] = JSON.parse(completed.stdout)
+  const entries = tarballEntries(fs.readFileSync(path.join(temporaryRoot, packResult.filename)))
+  const packedPath = `package/${CODEX_PUBLIC_EVIDENCE_PATH}`
+  const evidenceBytes = entries.get(packedPath)
+  assert.ok(evidenceBytes, `${packedPath}: missing from npm tarball`)
+
+  let textualEntries = 0
+  for (const [entryPath, entryBytes] of entries) {
+    const packedText = decodeTextualEntry(entryBytes)
+    if (packedText === null) continue
+    textualEntries += 1
+    assertPrivacySafeText(entryPath, packedText)
+  }
+  assert.ok(textualEntries > 0, 'npm tarball contained no recognized textual entries')
+
+  const expected = expectedPublicCodexEvidence()
+  assert.deepEqual(JSON.parse(evidenceBytes), expected)
+  assert.equal(evidenceBytes.toString('utf8'), JSON.stringify(expected),
+    'public evidence must be the exact canonical projection')
+
+  const serialized = evidenceBytes.toString('utf8')
+  for (const forbidden of [
+    /[A-Za-z]:[\\/]/,
+    /\/(?:Users|home)\/[^/\s"']+/i,
+    /braschki/i,
+    /\b(?:pid|pids|sessionId|sessionIds|threadId|threadIds|argv|credential|transcript|telemetry|stdout|stderr)\b/i,
+    /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i,
+  ]) assert.doesNotMatch(serialized, forbidden)
+
+  const registry = JSON.parse(entries.get('package/agents/contracts/providers.json'))
+  const codex = registry.providers.find(provider => provider.id === 'codex')
+  assert.equal(codex.verificationAttestation, null,
+    'redaction must never fabricate or upgrade an attestation')
+
+  const manifest = JSON.parse(entries.get('package/agents/manifests/codex-runtime.json'))
+  const dependency = manifest.externalDependencies.find(candidate =>
+    candidate.source === CODEX_PUBLIC_EVIDENCE_PATH)
+  assert.equal(dependency.sha256,
+    crypto.createHash('sha256').update(evidenceBytes).digest('hex'),
+  'Codex manifest must independently bind the public projection bytes')
+})
+
+test('generic tarball privacy scanner permits only explicit schema vocabulary, not populated private values', () => {
+  assert.doesNotThrow(() => assertPrivacySafeText('package/schema.json', JSON.stringify({
+    properties: { pid: { type: 'integer' }, argv: { type: 'array' } },
+  })))
+  assert.throws(() => assertPrivacySafeText('package/evidence.json', JSON.stringify({ pid: 41922 })), /populated private runtime field pid/)
+  assert.throws(() => assertPrivacySafeText('package/readme.md', 'local root C:\\Users\\private-person\\workspace'), /Windows user-home path/)
+  assert.throws(() => assertPrivacySafeText('package/evidence.txt', 'thread 01a030c0-7c51-7f42-956d-82dcd94e463c'), /runtime UUID/)
+})
+
+test('Codex public FAIL projection strips sensitive raw telemetry deterministically', () => {
+  const { projectPublicFailEvidence } = require(
+    '../../scripts/benchmark-evidence/codex-public-conformance.cjs')
+  const raw = Buffer.from(JSON.stringify({
+    evidence: {
+      canaryResult: 'FAIL', canarySchema: 'codex-live-canary.v1',
+      codexExecutable: { realpath: 'C:\\Users\\private-user\\codex.exe' },
+      execution: { launchedPids: [12345], argv: ['--secret', 'credential-value'] },
+      providerAdmission: { verifiedCapabilities: [], verifiedCapabilitiesExact: false },
+      providerId: 'codex', result: 'FAIL',
+      schemaVersion: 'codex-live-conformance-observation.v1',
+      transcript: { threadIds: ['01a030c0-7c51-7f42-956d-82dcd94e463c'] },
+    },
+    fixtureOnly: false, result: 'FAIL',
+    runtimeIdentityHash: CODEX_RUNTIME_IDENTITY_HASH,
+    schemaVersion: 'codex-live-conformance-evidence.v1',
+  }))
+  const first = projectPublicFailEvidence(raw)
+  const second = projectPublicFailEvidence(Buffer.from(raw))
+  assert.equal(first.canonicalJson, second.canonicalJson)
+  assert.equal(first.sourceEvidenceSha256,
+    crypto.createHash('sha256').update(raw).digest('hex'))
+  for (const forbidden of [
+    /private-user/i, /12345/, /credential-value/i, /01a030c0-7c51/i,
+    /\b(?:pid|pids|sessionId|threadIds|argv|credential|transcript|telemetry)\b/i,
+  ]) assert.doesNotMatch(first.canonicalJson, forbidden)
+  assert.deepEqual(first.envelope.evidence.providerAdmission, {
+    verifiedCapabilities: [], verifiedCapabilitiesExact: false,
+  })
 })
 
 test('every local file and directory linked from npm README docs is packed', () => {

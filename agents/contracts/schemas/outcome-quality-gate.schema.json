@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/outcome-quality-gate.schema.json",
+  "title": "Autoprompt v2 outcome quality and cost release gate",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "gateId",
+    "evidenceClass",
+    "cohortId",
+    "baseline",
+    "treatment",
+    "thresholds",
+    "verdict",
+    "provenance"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "2.0.0"
+    },
+    "gateId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
+    },
+    "evidenceClass": {
+      "enum": [
+        "synthetic-conformance",
+        "sealed-holdout",
+        "real-provider-canary"
+      ]
+    },
+    "cohortId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 127
+    },
+    "baseline": {
+      "$ref": "#/$defs/arm"
+    },
+    "treatment": {
+      "$ref": "#/$defs/arm"
+    },
+    "thresholds": {
+      "type": "object",
+      "required": [
+        "minimumAcceptanceRatio",
+        "minimumRewardRatio",
+        "maximumCostPerSolveRatio"
+      ],
+      "properties": {
+        "minimumAcceptanceRatio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "minimumRewardRatio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "maximumCostPerSolveRatio": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "verdict": {
+      "type": "object",
+      "required": [
+        "acceptanceNonInferior",
+        "rewardNonInferior",
+        "costPerSolveWithinGuardrail",
+        "releaseEligible"
+      ],
+      "properties": {
+        "acceptanceNonInferior": {
+          "type": "boolean"
+        },
+        "rewardNonInferior": {
+          "type": "boolean"
+        },
+        "costPerSolveWithinGuardrail": {
+          "type": "boolean"
+        },
+        "releaseEligible": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "required": [
+        "runManifestHash",
+        "baselineSnapshotHash",
+        "treatmentSnapshotHash"
+      ],
+      "properties": {
+        "runManifestHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "baselineSnapshotHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "treatmentSnapshotHash": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "arm": {
+      "type": "object",
+      "required": [
+        "armId",
+        "completedCount",
+        "acceptedCount",
+        "rewardSum",
+        "totalCost",
+        "terminalResultsComplete",
+        "scorable",
+        "observationIds"
+      ],
+      "properties": {
+        "armId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "completedCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "acceptedCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rewardSum": {
+          "type": "number",
+          "minimum": 0
+        },
+        "totalCost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "terminalResultsComplete": {
+          "const": true
+        },
+        "scorable": {
+          "const": true
+        },
+        "observationIds": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

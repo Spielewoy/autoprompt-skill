@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/state-machine.schema.json",
+  "title": "Autoprompt v2 state machine",
+  "type": "object",
+  "required": [
+    "kind",
+    "contractVersion",
+    "initialState",
+    "terminalStates",
+    "resumableStates",
+    "states",
+    "outcomeSchema",
+    "eventSchema",
+    "eventRecordRequiredFields",
+    "transitions",
+    "crashRecoveryPolicy",
+    "completionRules"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "kind": {
+      "const": "autoprompt-state-machine"
+    },
+    "contractVersion": {
+      "const": "2.0.0"
+    },
+    "initialState": {
+      "const": "BOOT"
+    },
+    "terminalStates": {
+      "const": [
+        "DONE",
+        "PARTIAL",
+        "BLOCKED",
+        "CANCELLED",
+        "FAILED"
+      ]
+    },
+    "resumableStates": {
+      "const": [
+        "CONFIG_REQUIRED",
+        "PAUSED",
+        "WAITING_USER"
+      ]
+    },
+    "states": {
+      "type": "array",
+      "minItems": 30,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z][A-Z0-9_]+$"
+      }
+    },
+    "outcomeSchema": {
+      "type": "string"
+    },
+    "eventSchema": {
+      "type": "string"
+    },
+    "eventRecordRequiredFields": {
+      "type": "array",
+      "minItems": 15,
+      "uniqueItems": true
+    },
+    "transitions": {
+      "type": "array",
+      "minItems": 60,
+      "items": {
+        "$ref": "#/$defs/transition"
+      }
+    },
+    "crashRecoveryPolicy": {
+      "type": "object",
+      "required": [
+        "crashTransitionId",
+        "capabilitiesAcceptedTransitionId",
+        "restoreTransitionId",
+        "recoverableActiveStates",
+        "excludedCrashStates",
+        "externalInFlightResumeState",
+        "externalInFlightAction",
+        "routeAnalysisAndDecisionReuse",
+        "releasingLockCrashAction",
+        "blindExternalRepeatAllowed",
+        "routeSourceBinding",
+        "checkpointDigest"
+      ],
+      "properties": {
+        "crashTransitionId": { "const": "T077" },
+        "capabilitiesAcceptedTransitionId": { "const": "T078" },
+        "restoreTransitionId": { "const": "T066" },
+        "recoverableActiveStates": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "type": "string" }
+        },
+        "excludedCrashStates": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "type": "string" }
+        },
+        "externalInFlightResumeState": { "const": "CHECK_WORK" },
+        "externalInFlightAction": { "const": "reconcile-before-any-repeat" },
+        "routeAnalysisAndDecisionReuse": { "const": "reuse-hash-bound-records-when-listed-as-completed-milestones" },
+        "releasingLockCrashAction": { "const": "deterministic-finalizer-reconciles-existing-release-intent" },
+        "blindExternalRepeatAllowed": { "const": false },
+        "routeSourceBinding": { "const": "persist-decision-and-scheduler-source-reject-mismatch-never-infer-from-route-name" },
+        "checkpointDigest": {
+          "type": "object",
+          "required": ["algorithm", "canonicalization", "frontierHashFormula", "checkpointHashFields", "checkpointHashFormula"],
+          "properties": {
+            "algorithm": { "const": "sha256" },
+            "canonicalization": { "const": "stable-json-v1" },
+            "frontierHashFormula": { "const": "sha256(stable-json-v1(frontier))" },
+            "checkpointHashFields": {
+              "const": ["savedState", "resumeState", "frontierHash", "completedMilestones", "priorOwner", "externalRecovery", "releaseIntentHash", "accountingCheckpoint"]
+            },
+            "checkpointHashFormula": { "const": "sha256(stable-json-v1(exact checkpointHashFields object))" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "completionRules": {
+      "type": "object",
+      "required": [
+        "itemTerminal",
+        "runTerminalAfter",
+        "quiescenceExcludes",
+        "terminalOutgoingEvents",
+        "mutationAfterVerification"
+      ],
+      "properties": {
+        "itemTerminal": {
+          "const": "ITEM_VERIFIED"
+        },
+        "runTerminalAfter": {
+          "type": "array",
+          "minItems": 5,
+          "uniqueItems": true
+        },
+        "quiescenceExcludes": {
+          "const": [
+            "current-control-action",
+            "deterministic-finalizer"
+          ]
+        },
+        "terminalOutgoingEvents": {
+          "const": []
+        },
+        "mutationAfterVerification": {
+          "const": "invalidate-dependent-results"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "transition": {
+      "type": "object",
+      "required": [
+        "id",
+        "event",
+        "from",
+        "to",
+        "guard",
+        "effect"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^T[0-9]{3}$"
+        },
+        "event": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]+$"
+        },
+        "from": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1
+        },
+        "guard": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effect": {
+          "type": "string",
+          "minLength": 1
+        },
+        "boundedBy": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -5,13 +5,29 @@ on:
     branches:
       - main
     paths:
+      - "AUTOPROMPT-TOTAL-FIX-MAP.md"
+      - "AUTOPROMPT-IMPLEMENTATION-COVERAGE.json"
+      - "CODEX-IMPLEMENTATION-EVIDENCE.json"
       - "agents/**"
+      - "agents/codex/**"
+      - "agents/contracts/**"
+      - "agents/manifests/codex-runtime.json"
       - "bin/**"
+      - "evidence/codex-*/**"
+      - "packages/codex/**"
       - "scripts/install/**"
       - "scripts/build-release-assets.ps1"
+      - "scripts/codex-artifact.cjs"
       - "scripts/codex-configure.cjs"
+      - "scripts/codex-evidence-bundle.cjs"
+      - "scripts/codex-evidence/**"
+      - "scripts/codex-runtime-identity.cjs"
+      - "scripts/benchmark-evidence/**"
       - "package.json"
+      - "tests/benchmarks/**"
+      - "tests/fixtures/codex-*/**"
       - "tests/source/**"
+      - ".github/workflows/ci.yml"
       - ".github/workflows/release.yml"
       - ".github/workflows/release-readiness.yml"
   schedule:
@@ -45,7 +61,10 @@ jobs:
         with:
           python-version: "3.12"
           check-latest: false
-      - name: Install validation parser
-        run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3
+      - name: Install validation parsers
+        run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0
       - name: Run the full publication gate
+        env:
+          AUTOPROMPT_RELEASE_QUALITY_EVIDENCE_PATH: ${{ vars.AUTOPROMPT_RELEASE_QUALITY_EVIDENCE_PATH }}
+          AUTOPROMPT_RELEASE_QUALITY_TRUST_REGISTRY_PATH: ${{ vars.AUTOPROMPT_RELEASE_QUALITY_TRUST_REGISTRY_PATH }}
         run: npm run prepublishOnly

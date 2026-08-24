@@ -4,6 +4,7 @@
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
+const { selectModelAssignment } = require('./effort-policy.js')
 
 const MANIFEST_NAME = '.autoprompt-casting.json'
 const HASH_PATTERN = /^sha256:[a-f0-9]{64}$/
@@ -14,9 +15,16 @@ const MAX_EFFORT_MODELS = new Set([
   'gpt-5.6-luna',
 ])
 
+class CastingError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'CastingError'
+    this.code = 'CASTING_INVALID'
+  }
+}
+
 function fail(message) {
-  process.stderr.write(`codex-agent-casting: ${message}\n`)
-  process.exit(2)
+  throw new CastingError(message)
 }
 
 function sha256(parts) {
@@ -85,9 +93,13 @@ function parseArgs(argv) {
     sourceAgents: '',
     selector: process.env.AUTOPROMPT_AGENTS || 'off',
     registry: process.env.AUTOPROMPT_MODEL_REGISTRY || '',
+    role: '',
+    difficulty: 'ordinary',
+    risk: 'ordinary',
+    settings: '',
   }
-  const actions = ['--resolve', '--write-manifest', '--export-inheritance']
-  const valueFlags = ['--agents-dir', '--source-agents', '--selector', '--registry']
+  const actions = ['--resolve', '--write-manifest', '--export-inheritance', '--resolve-assignment']
+  const valueFlags = ['--agents-dir', '--source-agents', '--selector', '--registry', '--role', '--difficulty', '--risk', '--settings']
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]
     if (actions.includes(argument)) {
@@ -103,6 +115,10 @@ function parseArgs(argv) {
     if (argument === '--source-agents') options.sourceAgents = value
     if (argument === '--selector') options.selector = value
     if (argument === '--registry') options.registry = value
+    if (argument === '--role') options.role = value
+    if (argument === '--difficulty') options.difficulty = value
+    if (argument === '--risk') options.risk = value
+    if (argument === '--settings') options.settings = value
   }
   if (!options.action) fail('choose an action')
   return options
@@ -122,6 +138,69 @@ function readRegistry(registryPath) {
   const parsed = JSON.parse(fs.readFileSync(registryPath, 'utf8'))
   if (!Array.isArray(parsed)) fail('model registry must be a JSON array')
   return new Map(parsed.map(entry => [entry.name, entry.modelString]))
+}
+
+function readRegistryEntries(registryPath) {
+  if (!registryPath) return []
+  const parsed = JSON.parse(fs.readFileSync(registryPath, 'utf8'))
+  if (!Array.isArray(parsed)) fail('model registry must be a JSON array')
+  return parsed.map(entry => ({
+    ...entry,
+    id: entry.id || entry.modelString || entry.name,
+  }))
+}
+
+function readResolvedSettings(settings) {
+  if (!settings) return null
+  if (typeof settings === 'object') return settings
+  try { return JSON.parse(fs.readFileSync(path.resolve(settings), 'utf8')) } catch {
+    fail(`resolved settings are unreadable: ${settings}`)
+  }
+}
+
+/**
+ * Resolve one role assignment from role difficulty/risk and explicit user pins.
+ * Route is deliberately absent: route size is not a reasoning-effort proxy.
+ */
+function resolveAgentAssignment(options = {}) {
+  const requestedRole = String(options.role || '').trim()
+  const role = requestedRole === 'ap-work-group-manager'
+    ? requestedRole
+    : requestedRole.replace(/^ap-/, '')
+  if (!role) fail('role is required for assignment resolution')
+  const settings = readResolvedSettings(options.settings)
+  const routing = settings && settings.modelRouting || {}
+  const registry = options.registryEntries || readRegistryEntries(options.registry)
+  const policyBasis = Object.freeze({
+    logicalRole: role,
+    reasoningClass: String(options.reasoningClass || 'unspecified'),
+    riskClass: String(options.riskClass || 'unspecified'),
+    difficulty: String(options.difficulty || 'ordinary'),
+    risk: String(options.risk || 'ordinary'),
+  })
+  const assignment = selectModelAssignment({
+    role,
+    difficulty: options.difficulty,
+    risk: options.risk,
+    explicitPin: {
+      model: routing.explicitUserModelPin || null,
+      effort: routing.explicitUserEffortPin || null,
+    },
+    registry,
+    requiredCapabilities: options.requiredCapabilities || [],
+    workload: options.workload || {},
+  })
+  return Object.freeze({
+    schemaVersion: 2,
+    provider: 'codex',
+    role,
+    routeIndependent: true,
+    policyBasis,
+    policyBasisHash: sha256([Buffer.from(JSON.stringify(policyBasis), 'utf8')]),
+    topologyInputsUsed: Object.freeze([]),
+    selector: normalizeSelector(options.selector || 'off'),
+    ...assignment,
+  })
 }
 
 function selectedModels(selector, registryPath) {
@@ -382,10 +461,43 @@ function resolve(options) {
   process.stdout.write(`${JSON.stringify(current)}\n`)
 }
 
-const options = parseArgs(process.argv.slice(2))
-if (options.registry && (!fs.existsSync(options.registry) || !fs.statSync(options.registry).isFile())) {
-  fail(`model registry is not readable: ${options.registry}`)
+function main(argv = process.argv.slice(2)) {
+  const options = parseArgs(argv)
+  if (options.registry && (!fs.existsSync(options.registry) || !fs.statSync(options.registry).isFile())) {
+    fail(`model registry is not readable: ${options.registry}`)
+  }
+  if (options.settings && (!fs.existsSync(options.settings) || !fs.statSync(options.settings).isFile())) {
+    fail(`resolved settings are not readable: ${options.settings}`)
+  }
+  if (options.action === 'write-manifest') writeManifest(options)
+  else if (options.action === 'export-inheritance') exportInheritance(options)
+  else if (options.action === 'resolve-assignment') {
+    process.stdout.write(`${JSON.stringify(resolveAgentAssignment(options))}\n`)
+  } else resolve(options)
 }
-if (options.action === 'write-manifest') writeManifest(options)
-else if (options.action === 'export-inheritance') exportInheritance(options)
-else resolve(options)
+
+if (require.main === module) {
+  try { main() } catch (error) {
+    process.stderr.write(`codex-agent-casting: ${error.message}\n`)
+    process.exitCode = 2
+  }
+}
+
+module.exports = {
+  CastingError,
+  MAX_EFFORT_MODELS,
+  defaultAgentsDirectory,
+  hashAgentDefinitions,
+  listAgentFiles,
+  main,
+  makeState,
+  normalizeSelector,
+  parseArgs,
+  readAgents,
+  readRegistry,
+  readRegistryEntries,
+  resolveAgentAssignment,
+  selectorIsOff,
+  selectedModels,
+  validateAgentCast,
+}

@@ -1,0 +1,1013 @@
+{
+  "$schema": "./schemas/roles.schema.json",
+  "kind": "autoprompt-role-contract",
+  "contractVersion": "2.0.0",
+  "orchestratorContract": {
+    "id": "run-owner",
+    "physicalId": "autoprompt.v2.run-owner",
+    "layer": "L0",
+    "phases": [
+      "route-decision",
+      "planning",
+      "execution-control",
+      "independent-checking",
+      "completion"
+    ],
+    "reasoningClass": "decision-and-synthesis",
+    "riskClass": "route-independent",
+    "legalParents": [
+      "deterministic-control-plane"
+    ],
+    "legalChildren": [
+      "roadmap-author",
+      "scout",
+      "plan-checker",
+      "mission-coordinator",
+      "worker",
+      "independent-checker",
+      "independent-reviewer",
+      "independent-tester",
+      "technical-decision-reviewer",
+      "diagnostic-probe",
+      "legacy-intake"
+    ],
+    "permissions": {
+      "read": [
+        "request-envelope",
+        "run-record",
+        "target",
+        "returned-results"
+      ],
+      "write": [
+        "route-decision",
+        "success-card",
+        "light-plan",
+        "final-summary"
+      ],
+      "execute": [
+        "focused-diagnostic-command"
+      ],
+      "network": "only-when-request-or-current-facts-require-it",
+      "dispatch": "phase-adjacency-only"
+    },
+    "writes": [
+      "run:route/decision.json",
+      "run:plan/success-card.md",
+      "run:plan/light-plan.md",
+      "run:final-summary.md"
+    ],
+    "inputSchema": "agents/contracts/schemas/run-record.schema.json",
+    "outputSchema": "agents/contracts/schemas/outcome.schema.json",
+    "decisionRights": [
+      "route-choice",
+      "success-checklist",
+      "worker-selection",
+      "checker-selection",
+      "route-change",
+      "final-user-response"
+    ],
+    "humanDescription": "Own the route decision, the success checklist, useful assignments, independent checking, and the final response to the user."
+  },
+  "roles": [
+    {
+      "id": "route-analyst",
+      "physicalId": "autoprompt.v2.route-analyst",
+      "layer": "L3",
+      "phase": "route-analysis",
+      "reasoningClass": "focused-analysis",
+      "riskClass": "read-only",
+      "allowedRoutes": [
+        "PRE_ROUTE"
+      ],
+      "legalParents": [
+        "deterministic-control-plane"
+      ],
+      "legalChildren": [],
+      "permissions": {
+        "read": [
+          "request-envelope",
+          "target",
+          "build-and-test-configuration"
+        ],
+        "write": [],
+        "execute": [
+          "list",
+          "read",
+          "search"
+        ],
+        "network": "none",
+        "dispatch": "none"
+      },
+      "writes": [],
+      "inputSchema": "agents/contracts/schemas/request-envelope-entry.schema.json",
+      "outputSchema": "agents/contracts/schemas/route-recommendation.schema.json",
+      "decisionRights": [
+        "route-recommendation"
+      ],
+      "humanDescription": "Inspect only enough read-only project information to recommend a route and list the facts behind that recommendation."
+    },
+    {
+      "id": "roadmap-author",
+      "physicalId": "autoprompt.v2.roadmap-author",
+      "layer": "L3",
+      "phase": "roadmap-planning",
+      "reasoningClass": "dependency-planning",
+      "riskClass": "plan-write-only",
+      "allowedRoutes": [
+        "ROADMAP"
+      ],
+      "legalParents": [
+        "run-owner"
+      ],
+      "legalChildren": [],
+      "permissions": {
+        "read": [
+          "request-envelope",
+          "route-decision",
+          "target",
+          "named-scout-results"
+        ],
+        "write": [
+          "ROADMAP.md"
+        ],
+        "execute": [
+          "focused-diagnostic-command"
+        ],
+        "network": "only-when-assigned",
+        "dispatch": "none"
+      },
+      "writes": [
+        "run:plan/ROADMAP.md"
+      ],
+      "inputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "outputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "decisionRights": [
+        "roadmap-content"
+      ],
+      "humanDescription": "Write one dependency-ordered roadmap with owners, integration points, success items, and real checks."
+    },
+    {
+      "id": "scout",
+      "physicalId": "autoprompt.v2.scout",
+      "layer": "L3",
+      "phase": "roadmap-planning",
+      "reasoningClass": "focused-analysis",
+      "riskClass": "read-only",
+      "allowedRoutes": [
+        "ROADMAP"
+      ],
+      "legalParents": [
+        "run-owner"
+      ],
+      "legalChildren": [],
+      "permissions": {
+        "read": [
+          "named-unknown",
+          "target"
+        ],
+        "write": [],
+        "execute": [
+          "focused-diagnostic-command"
+        ],
+        "network": "only-when-named-unknown-requires-current-facts",
+        "dispatch": "none"
+      },
+      "writes": [],
+      "inputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "outputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "decisionRights": [
+        "scout-observation"
+      ],
+      "humanDescription": "Answer one named planning question with immutable observations; do not write or coordinate the roadmap."
+    },
+    {
+      "id": "plan-checker",
+      "physicalId": "autoprompt.v2.plan-checker",
+      "layer": "L4",
+      "phase": "roadmap-planning",
+      "reasoningClass": "independent-plan-review",
+      "riskClass": "read-only",
+      "allowedRoutes": [
+        "ROADMAP"
+      ],
+      "legalParents": [
+        "run-owner"
+      ],
+      "legalChildren": [],
+      "permissions": {
+        "read": [
+          "request-envelope",
+          "route-decision",
+          "ROADMAP.md",
+          "target"
+        ],
+        "write": [],
+        "execute": [
+          "focused-diagnostic-command"
+        ],
+        "network": "none",
+        "dispatch": "none"
+      },
+      "writes": [],
+      "inputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "outputSchema": "agents/contracts/schemas/outcome.schema.json",
+      "decisionRights": [
+        "roadmap-acceptance"
+      ],
+      "humanDescription": "Independently check request coverage, dependency order, ownership, integration, and planned checks; return findings without editing the plan."
+    },
+    {
+      "id": "mission-coordinator",
+      "physicalId": "autoprompt.v2.mission-coordinator",
+      "layer": "L1",
+      "phase": "roadmap-execution",
+      "reasoningClass": "dependency-coordination",
+      "riskClass": "no-production-write",
+      "allowedRoutes": [
+        "ROADMAP"
+      ],
+      "legalParents": [
+        "run-owner"
+      ],
+      "legalChildren": [
+        "ap-work-group-manager",
+        "worker"
+      ],
+      "permissions": {
+        "read": [
+          "request-envelope",
+          "accepted-roadmap",
+          "assigned-target-resources",
+          "run-state",
+          "ownership-record",
+          "worker-results"
+        ],
+        "write": [],
+        "execute": [],
+        "network": "none",
+        "dispatch": "phase-adjacency-only"
+      },
+      "writes": [],
+      "inputSchema": "agents/contracts/schemas/run-record.schema.json",
+      "outputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "decisionRights": [
+        "work-readiness",
+        "integration-order"
+      ],
+      "humanDescription": "Start only ready, non-overlapping roadmap work and combine returned status at the written integration points."
+    },
+    {
+      "id": "ap-work-group-manager",
+      "physicalId": "autoprompt.v2.ap-work-group-manager",
+      "layer": "L2",
+      "phase": "roadmap-execution",
+      "reasoningClass": "work-group-coordination",
+      "riskClass": "no-production-write",
+      "allowedRoutes": [
+        "ROADMAP"
+      ],
+      "legalParents": [
+        "mission-coordinator"
+      ],
+      "legalChildren": [
+        "worker"
+      ],
+      "permissions": {
+        "read": [
+          "assigned-work-group",
+          "assigned-target-resources",
+          "ownership-record",
+          "worker-results"
+        ],
+        "write": [],
+        "execute": [],
+        "network": "none",
+        "dispatch": "phase-adjacency-only"
+      },
+      "writes": [],
+      "inputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "outputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "decisionRights": [
+        "work-group-readiness"
+      ],
+      "admissionPolicy": {
+        "route": "ROADMAP",
+        "planPath": "plan/ROADMAP.md",
+        "minimumUsefulWorkers": 2,
+        "disjointMutableResourceOwnershipRequired": true,
+        "singleWorkerGroupsMustStayWithParent": true
+      },
+      "humanDescription": "Divide one accepted work group only when at least two useful workers can have non-overlapping ownership."
+    },
+    {
+      "id": "worker",
+      "physicalId": "autoprompt.v2.worker",
+      "layer": "L3",
+      "phases": [
+        "production",
+        "roadmap-execution"
+      ],
+      "reasoningClass": "task-specific",
+      "riskClass": "assignment-bounded-write",
+      "allowedRoutes": [
+        "DIRECT",
+        "LIGHT",
+        "ROADMAP"
+      ],
+      "legalParents": [
+        "run-owner",
+        "mission-coordinator",
+        "ap-work-group-manager"
+      ],
+      "legalChildren": [],
+      "permissions": {
+        "read": [
+          "assignment",
+          "assigned-target-resources",
+          "named-checks"
+        ],
+        "write": [
+          "assignment-declared-resources"
+        ],
+        "execute": [
+          "assignment-declared-commands"
+        ],
+        "network": "only-when-assigned-and-authorized",
+        "dispatch": "none"
+      },
+      "writes": [
+        "assignment:declared-files-services-databases-outputs-and-caches"
+      ],
+      "inputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "outputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "decisionRights": [
+        "reversible-implementation-detail-within-assignment"
+      ],
+      "humanDescription": "Produce only the assigned result, protect other owners' work, run the listed checks, and report an exact conflict instead of expanding scope."
+    },
+    {
+      "id": "independent-checker",
+      "physicalId": "autoprompt.v2.independent-checker",
+      "layer": "L4",
+      "phase": "independent-checking",
+      "reasoningClass": "combined-review-and-testing",
+      "riskClass": "read-only-target",
+      "allowedRoutes": [
+        "DIRECT",
+        "LIGHT",
+        "ROADMAP"
+      ],
+      "legalParents": [
+        "run-owner"
+      ],
+      "legalChildren": [],
+      "permissions": {
+        "read": [
+          "request-envelope",
+          "success-checklist",
+          "frozen-version",
+          "available-checks"
+        ],
+        "write": [],
+        "execute": [
+          "read-only-inspection",
+          "declared-build-test-run-commands"
+        ],
+        "network": "only-when-a-declared-check-requires-it",
+        "dispatch": "none"
+      },
+      "writes": [],
+      "inputSchema": "agents/contracts/schemas/evidence.schema.json",
+      "outputSchema": "agents/contracts/schemas/outcome.schema.json",
+      "decisionRights": [
+        "combined-independent-check-result"
+      ],
+      "humanDescription": "Independently review the exact result and run its real checks in one context, using isolated resources and without changing the deliverable."
+    },
+    {
+      "id": "independent-reviewer",
+      "physicalId": "autoprompt.v2.independent-reviewer",
+      "layer": "L4",
+      "phase": "independent-checking",
+      "reasoningClass": "static-review",
+      "riskClass": "read-only-target",
+      "allowedRoutes": [
+        "DIRECT",
+        "LIGHT",
+        "ROADMAP"
+      ],
+      "legalParents": [
+        "run-owner"
+      ],
+      "legalChildren": [],
+      "permissions": {
+        "read": [
+          "request-envelope",
+          "success-checklist",
+          "frozen-version",
+          "prior-check-results"
+        ],
+        "write": [],
+        "execute": [
+          "read-only-inspection"
+        ],
+        "network": "only-for-named-current-fact-check",
+        "dispatch": "none"
+      },
+      "writes": [],
+      "inputSchema": "agents/contracts/schemas/evidence.schema.json",
+      "outputSchema": "agents/contracts/schemas/outcome.schema.json",
+      "decisionRights": [
+        "static-correctness-result"
+      ],
+      "humanDescription": "Independently inspect request coverage, correctness, security, maintainability, and documentation without changing the exact version under review."
+    },
+    {
+      "id": "independent-tester",
+      "physicalId": "autoprompt.v2.independent-tester",
+      "layer": "L4",
+      "phase": "independent-checking",
+      "reasoningClass": "runtime-testing",
+      "riskClass": "isolated-check-resources",
+      "allowedRoutes": [
+        "DIRECT",
+        "LIGHT",
+        "ROADMAP"
+      ],
+      "legalParents": [
+        "run-owner"
+      ],
+      "legalChildren": [],
+      "permissions": {
+        "read": [
+          "request-envelope",
+          "success-checklist",
+          "frozen-version",
+          "available-checks"
+        ],
+        "write": [
+          "isolated-check-resources"
+        ],
+        "execute": [
+          "declared-build-test-run-commands"
+        ],
+        "network": "only-when-a-declared-check-requires-it",
+        "dispatch": "none"
+      },
+      "writes": [
+        "isolated:registered-caches-databases-services-ports-and-generated-output"
+      ],
+      "inputSchema": "agents/contracts/schemas/evidence.schema.json",
+      "outputSchema": "agents/contracts/schemas/outcome.schema.json",
+      "decisionRights": [
+        "runtime-acceptance-result"
+      ],
+      "humanDescription": "Independently compile, build, test, run, and check regressions using isolated resources; do not change the deliverable."
+    },
+    {
+      "id": "technical-decision-reviewer",
+      "physicalId": "autoprompt.v2.technical-decision-reviewer",
+      "layer": "L4",
+      "phases": [
+        "production",
+        "roadmap-planning"
+      ],
+      "reasoningClass": "technical-choice",
+      "riskClass": "reversible-only",
+      "allowedRoutes": [
+        "LIGHT",
+        "ROADMAP"
+      ],
+      "legalParents": [
+        "run-owner"
+      ],
+      "legalChildren": [],
+      "permissions": {
+        "read": [
+          "request-envelope",
+          "named-alternatives",
+          "target"
+        ],
+        "write": [],
+        "execute": [
+          "focused-diagnostic-command"
+        ],
+        "network": "only-when-current-facts-are-required",
+        "dispatch": "none"
+      },
+      "writes": [],
+      "inputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "outputSchema": "agents/contracts/schemas/outcome.schema.json",
+      "decisionRights": [
+        "reversible-technical-choice"
+      ],
+      "humanDescription": "Choose only between reversible technical alternatives that can be decided from evidence; return user-owned choices without deciding them."
+    },
+    {
+      "id": "diagnostic-probe",
+      "physicalId": "autoprompt.v2.diagnostic-probe",
+      "layer": "L4",
+      "phase": "diagnostic-or-recovery",
+      "reasoningClass": "capability-diagnostic",
+      "riskClass": "non-production",
+      "allowedRoutes": [
+        "PRE_ROUTE",
+        "DIRECT",
+        "LIGHT",
+        "ROADMAP"
+      ],
+      "legalParents": [
+        "run-owner"
+      ],
+      "legalChildren": [],
+      "permissions": {
+        "read": [
+          "named-diagnostic-input"
+        ],
+        "write": [
+          "isolated-diagnostic-location"
+        ],
+        "execute": [
+          "one-representative-probe"
+        ],
+        "network": "only-when-the-probe-requires-it",
+        "dispatch": "none"
+      },
+      "writes": [
+        "isolated:diagnostic-location"
+      ],
+      "inputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "outputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "decisionRights": [
+        "diagnostic-observation"
+      ],
+      "humanDescription": "Run one explicitly requested capability or recovery diagnostic and return the observed facts without touching production work."
+    },
+    {
+      "id": "legacy-intake",
+      "physicalId": "autoprompt.v2.legacy-intake",
+      "layer": "L3",
+      "phase": "compatibility-migration",
+      "reasoningClass": "legacy-translation",
+      "riskClass": "run-record-write-only",
+      "allowedRoutes": [
+        "LEGACY_RESUME"
+      ],
+      "legalParents": [
+        "run-owner"
+      ],
+      "legalChildren": [],
+      "permissions": {
+        "read": [
+          "legacy-run-record"
+        ],
+        "write": [
+          "new-run-record-migration-output"
+        ],
+        "execute": [],
+        "network": "none",
+        "dispatch": "none"
+      },
+      "writes": [
+        "run:migration-output"
+      ],
+      "inputSchema": "agents/contracts/schemas/run-record.schema.json",
+      "outputSchema": "agents/contracts/schemas/role-report.schema.json",
+      "decisionRights": [
+        "legacy-field-translation"
+      ],
+      "humanDescription": "Translate a recognized older run record once; normal new runs never start this role."
+    }
+  ],
+  "phaseAdjacency": [
+    {
+      "route": "PRE_ROUTE",
+      "phase": "route-analysis",
+      "parent": "deterministic-control-plane",
+      "children": [
+        "route-analyst"
+      ]
+    },
+    {
+      "route": "DIRECT",
+      "phase": "production",
+      "parent": "run-owner",
+      "children": [
+        "worker"
+      ]
+    },
+    {
+      "route": "LIGHT",
+      "phase": "production",
+      "parent": "run-owner",
+      "children": [
+        "worker",
+        "technical-decision-reviewer"
+      ]
+    },
+    {
+      "route": "ROADMAP",
+      "phase": "roadmap-planning",
+      "parent": "run-owner",
+      "children": [
+        "roadmap-author",
+        "scout",
+        "plan-checker",
+        "technical-decision-reviewer"
+      ]
+    },
+    {
+      "route": "ROADMAP",
+      "phase": "roadmap-execution",
+      "parent": "run-owner",
+      "children": [
+        "mission-coordinator"
+      ]
+    },
+    {
+      "route": "ROADMAP",
+      "phase": "roadmap-execution",
+      "parent": "mission-coordinator",
+      "children": [
+        "ap-work-group-manager",
+        "worker"
+      ]
+    },
+    {
+      "route": "ROADMAP",
+      "phase": "roadmap-execution",
+      "parent": "ap-work-group-manager",
+      "children": [
+        "worker"
+      ]
+    },
+    {
+      "route": "ANY",
+      "phase": "independent-checking",
+      "parent": "run-owner",
+      "children": [
+        "independent-checker",
+        "independent-reviewer",
+        "independent-tester"
+      ]
+    },
+    {
+      "route": "ANY",
+      "phase": "diagnostic-or-recovery",
+      "parent": "run-owner",
+      "children": [
+        "diagnostic-probe"
+      ]
+    },
+    {
+      "route": "ANY",
+      "phase": "compatibility-migration",
+      "parent": "run-owner",
+      "children": [
+        "legacy-intake"
+      ]
+    }
+  ],
+  "decisionAuthority": {
+    "routeRecommendation": "route-analyst",
+    "routeChoice": "run-owner",
+    "roadmapContent": "roadmap-author",
+    "roadmapAcceptance": "plan-checker",
+    "workReadiness": "mission-coordinator",
+    "workGroupReadiness": "ap-work-group-manager",
+    "combinedIndependentCheck": "independent-checker",
+    "staticCorrectness": "independent-reviewer",
+    "runtimeAcceptance": "independent-tester",
+    "reversibleTechnicalChoice": "technical-decision-reviewer",
+    "productSemanticChoice": "user",
+    "consequentialExternalChoice": "user",
+    "terminalStateWrite": "deterministic-control-plane"
+  },
+  "codexPhysicalRoleProjection": [
+    {
+      "physicalId": "ap-route-analyst",
+      "logicalId": "route-analyst",
+      "layer": "L3",
+      "modes": [
+        "route-analysis"
+      ]
+    },
+    {
+      "physicalId": "ap-run-coordinator",
+      "logicalId": "mission-coordinator",
+      "layer": "L1",
+      "modes": [
+        "roadmap-integration"
+      ]
+    },
+    {
+      "physicalId": "ap-work-group-manager",
+      "logicalId": "ap-work-group-manager",
+      "layer": "L2",
+      "modes": [
+        "roadmap-work-group"
+      ]
+    },
+    {
+      "physicalId": "ap-roadmap-author",
+      "logicalId": "roadmap-author",
+      "layer": "L3",
+      "modes": [
+        "author",
+        "repair"
+      ]
+    },
+    {
+      "physicalId": "ap-roadmap-scout",
+      "logicalId": "scout",
+      "layer": "L3",
+      "modes": [
+        "named-unknown"
+      ]
+    },
+    {
+      "physicalId": "ap-worker",
+      "logicalId": "worker",
+      "layer": "L3",
+      "modes": [
+        "general",
+        "implementation",
+        "research",
+        "check-resolver"
+      ]
+    },
+    {
+      "physicalId": "ap-independent-checker",
+      "logicalId": "independent-checker",
+      "layer": "L4",
+      "modes": [
+        "combined",
+        "review",
+        "behavior-test",
+        "technical-decision",
+        "named-distinct-risk"
+      ]
+    }
+  ],
+  "compatibilityAliases": [
+    {
+      "legacyId": "ap-arbiter",
+      "logicalId": "technical-decision-reviewer",
+      "mode": "reversible-technical-only"
+    },
+    {
+      "legacyId": "ap-depth-prober",
+      "logicalId": "worker",
+      "mode": "root-cause"
+    },
+    {
+      "legacyId": "ap-execharness-resolver",
+      "logicalId": "worker",
+      "mode": "check-resolver"
+    },
+    {
+      "legacyId": "ap-feature-coordinator",
+      "logicalId": "mission-coordinator",
+      "mode": "compatibility"
+    },
+    {
+      "legacyId": "ap-framework-generator",
+      "logicalId": "worker",
+      "mode": "compatibility-compiler"
+    },
+    {
+      "legacyId": "ap-framework-validator",
+      "logicalId": "plan-checker",
+      "mode": "compatibility"
+    },
+    {
+      "legacyId": "ap-fresh-verifier",
+      "logicalId": "independent-reviewer",
+      "mode": "roadmap-blind"
+    },
+    {
+      "legacyId": "ap-goal-checker",
+      "logicalId": "independent-reviewer",
+      "mode": "request-completeness"
+    },
+    {
+      "legacyId": "ap-implementer",
+      "logicalId": "worker",
+      "mode": "implementation"
+    },
+    {
+      "legacyId": "ap-intake",
+      "logicalId": "legacy-intake",
+      "mode": "legacy-resume-only"
+    },
+    {
+      "legacyId": "ap-janitor",
+      "logicalId": "deterministic-control-plane",
+      "mode": "finalizer"
+    },
+    {
+      "legacyId": "ap-juror",
+      "logicalId": "independent-reviewer",
+      "mode": "named-risk-only"
+    },
+    {
+      "legacyId": "ap-manager",
+      "logicalId": "ap-work-group-manager",
+      "mode": "roadmap-only"
+    },
+    {
+      "legacyId": "ap-planner",
+      "logicalId": "roadmap-author",
+      "mode": "planning"
+    },
+    {
+      "legacyId": "ap-preflight-probe",
+      "logicalId": "diagnostic-probe",
+      "mode": "explicit-diagnostic"
+    },
+    {
+      "legacyId": "ap-re-anchor",
+      "logicalId": "diagnostic-probe",
+      "mode": "canonical-state-check"
+    },
+    {
+      "legacyId": "ap-researcher",
+      "logicalId": "worker",
+      "mode": "research"
+    },
+    {
+      "legacyId": "ap-reviewer",
+      "logicalId": "independent-reviewer",
+      "mode": "static-review"
+    },
+    {
+      "legacyId": "ap-scope-coordinator",
+      "logicalId": "mission-coordinator",
+      "mode": "compatibility"
+    },
+    {
+      "legacyId": "ap-scoper",
+      "logicalId": "roadmap-author",
+      "mode": "author-or-scout-request"
+    },
+    {
+      "legacyId": "ap-scribe",
+      "logicalId": "deterministic-control-plane",
+      "mode": "event-recording"
+    },
+    {
+      "legacyId": "ap-sweep-coordinator",
+      "logicalId": "mission-coordinator",
+      "mode": "compatibility"
+    },
+    {
+      "legacyId": "ap-sweeper",
+      "logicalId": "independent-reviewer",
+      "mode": "residual-risk"
+    },
+    {
+      "legacyId": "ap-synthesizer",
+      "logicalId": "roadmap-author",
+      "mode": "roadmap-repair"
+    },
+    {
+      "legacyId": "ap-verifier",
+      "logicalId": "independent-tester",
+      "mode": "runtime-testing"
+    }
+  ],
+  "compatibilityAliasPolicy": {
+    "status": "closed-read-only",
+    "activationAllowed": false,
+    "writeAllowed": false,
+    "telemetryRequired": true,
+    "legacyPhysicalIds": [
+      "ap-arbiter",
+      "ap-depth-prober",
+      "ap-execharness-resolver",
+      "ap-feature-coordinator",
+      "ap-framework-generator",
+      "ap-framework-validator",
+      "ap-fresh-verifier",
+      "ap-goal-checker",
+      "ap-implementer",
+      "ap-intake",
+      "ap-janitor",
+      "ap-juror",
+      "ap-manager",
+      "ap-planner",
+      "ap-preflight-probe",
+      "ap-re-anchor",
+      "ap-researcher",
+      "ap-reviewer",
+      "ap-scope-coordinator",
+      "ap-scoper",
+      "ap-scribe",
+      "ap-sweep-coordinator",
+      "ap-sweeper",
+      "ap-synthesizer",
+      "ap-verifier"
+    ]
+  },
+  "aliasTelemetrySchema": {
+    "format": "jsonl",
+    "appendPath": "compatibility/alias-telemetry.jsonl",
+    "counterField": "aliasUseCount",
+    "enforcer": "deterministic-control-plane",
+    "legacyReadVersion": "1",
+    "canonicalWriteVersion": "2.0.0",
+    "hashChain": {
+      "algorithm": "sha256",
+      "canonicalization": "stable-json-v1",
+      "scope": "append-file",
+      "genesisPreviousHash": null,
+      "entryHashInputFields": [
+        "runId",
+        "activationId",
+        "generation",
+        "legacyId",
+        "logicalId",
+        "physicalId",
+        "legacyReadVersion",
+        "canonicalWriteVersion",
+        "aliasUseCount",
+        "occurredAt",
+        "previousHash"
+      ],
+      "crashTailPolicy": "Preserve and report one unterminated final line as a crash tail; never accept it as a record and never skip a malformed complete line."
+    },
+    "recordSchema": {
+      "type": "object",
+      "required": [
+        "runId",
+        "activationId",
+        "generation",
+        "legacyId",
+        "logicalId",
+        "physicalId",
+        "legacyReadVersion",
+        "canonicalWriteVersion",
+        "aliasUseCount",
+        "occurredAt",
+        "previousHash",
+        "entryHash"
+      ],
+      "properties": {
+        "runId": {
+          "type": "string",
+          "minLength": 8
+        },
+        "activationId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "legacyId": {
+          "type": "string",
+          "pattern": "^ap-[a-z0-9-]+$"
+        },
+        "logicalId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "physicalId": {
+          "type": "string",
+          "pattern": "^autoprompt\\.v2\\.[a-z][a-z0-9-]+$"
+        },
+        "legacyReadVersion": {
+          "const": "1"
+        },
+        "canonicalWriteVersion": {
+          "const": "2.0.0"
+        },
+        "aliasUseCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "occurredAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "previousHash": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "entryHash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

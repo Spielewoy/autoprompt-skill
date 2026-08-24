@@ -1,1 +1,6 @@
 /Microsoft/Windows/PowerShell/ModuleAnalysisCache
+/Python/
+/evidence/
+/.tmp-ap-r10-trace-live-01/
+/dist/
+/*.tgz

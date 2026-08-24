@@ -1,0 +1,98 @@
+{
+  "schemaVersion": "2.0.0",
+  "evidenceClass": "synthetic-gate-conformance-not-provider-canary",
+  "cases": [
+    {
+      "id": "non-inferior-and-cheaper",
+      "expectedReleaseEligible": true,
+      "record": {
+        "schemaVersion": "2.0.0",
+        "gateId": "quality-gate-001",
+        "evidenceClass": "synthetic-conformance",
+        "cohortId": "cohort-a",
+        "baseline": {
+          "armId": "frozen-current",
+          "completedCount": 20,
+          "acceptedCount": 16,
+          "rewardSum": 15,
+          "totalCost": 160,
+          "terminalResultsComplete": true,
+          "scorable": true,
+          "observationIds": ["b01", "b02"]
+        },
+        "treatment": {
+          "armId": "redesign",
+          "completedCount": 20,
+          "acceptedCount": 17,
+          "rewardSum": 16,
+          "totalCost": 150,
+          "terminalResultsComplete": true,
+          "scorable": true,
+          "observationIds": ["t01", "t02"]
+        },
+        "thresholds": {
+          "minimumAcceptanceRatio": 0.98,
+          "minimumRewardRatio": 0.98,
+          "maximumCostPerSolveRatio": 1.1
+        },
+        "verdict": {
+          "acceptanceNonInferior": true,
+          "rewardNonInferior": true,
+          "costPerSolveWithinGuardrail": true,
+          "releaseEligible": true
+        },
+        "provenance": {
+          "runManifestHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "baselineSnapshotHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "treatmentSnapshotHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        }
+      }
+    },
+    {
+      "id": "cheaper-but-quality-regressed",
+      "expectedReleaseEligible": false,
+      "record": {
+        "schemaVersion": "2.0.0",
+        "gateId": "quality-gate-002",
+        "evidenceClass": "synthetic-conformance",
+        "cohortId": "cohort-b",
+        "baseline": {
+          "armId": "frozen-current",
+          "completedCount": 20,
+          "acceptedCount": 18,
+          "rewardSum": 18,
+          "totalCost": 180,
+          "terminalResultsComplete": true,
+          "scorable": true,
+          "observationIds": ["b11", "b12"]
+        },
+        "treatment": {
+          "armId": "redesign",
+          "completedCount": 20,
+          "acceptedCount": 12,
+          "rewardSum": 11,
+          "totalCost": 90,
+          "terminalResultsComplete": true,
+          "scorable": true,
+          "observationIds": ["t11", "t12"]
+        },
+        "thresholds": {
+          "minimumAcceptanceRatio": 0.98,
+          "minimumRewardRatio": 0.98,
+          "maximumCostPerSolveRatio": 1.1
+        },
+        "verdict": {
+          "acceptanceNonInferior": false,
+          "rewardNonInferior": false,
+          "costPerSolveWithinGuardrail": true,
+          "releaseEligible": false
+        },
+        "provenance": {
+          "runManifestHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "baselineSnapshotHash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "treatmentSnapshotHash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      }
+    }
+  ]
+}

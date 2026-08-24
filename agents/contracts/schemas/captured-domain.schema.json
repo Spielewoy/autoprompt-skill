@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/captured-domain.schema.json",
+  "title": "Captured incident-domain contract and outcome",
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "nullableSha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+    "base": {
+      "type": "object",
+      "required": ["schemaVersion", "kind"],
+      "properties": {
+        "schemaVersion": { "const": "1.0.0" },
+        "kind": {
+          "enum": [
+            "MISSION_SOURCE_CONFLICT", "SIGNATURE_SEARCH", "FIXTURE_PROVENANCE",
+            "HIDDEN_EXTERNAL_ORACLE", "IMAGE_DATUM", "DONE_RETRY_PROMOTION"
+          ]
+        }
+      }
+    },
+    "contract": {
+      "oneOf": [
+        {
+          "allOf": [{ "$ref": "#/$defs/base" }, {
+            "type": "object", "additionalProperties": false,
+            "required": ["schemaVersion", "kind", "certificateHash", "sourceDataHash", "priorCertificateHash", "priorSourceDataHash", "retryAuthority"],
+            "properties": {
+              "schemaVersion": { "const": "1.0.0" }, "kind": { "const": "MISSION_SOURCE_CONFLICT" },
+              "certificateHash": { "$ref": "#/$defs/sha256" }, "sourceDataHash": { "$ref": "#/$defs/sha256" },
+              "priorCertificateHash": { "$ref": "#/$defs/sha256" }, "priorSourceDataHash": { "$ref": "#/$defs/sha256" },
+              "retryAuthority": { "oneOf": [
+                {
+                  "type": "object", "additionalProperties": false,
+                  "required": ["mode", "immutableRetryBindingHash"],
+                  "properties": {
+                    "mode": { "const": "UNCHANGED_CERTIFICATE" },
+                    "immutableRetryBindingHash": { "$ref": "#/$defs/sha256" }
+                  }
+                },
+                {
+                  "type": "object", "additionalProperties": false,
+                  "required": ["mode", "sourceTransitionCertificateHash"],
+                  "properties": {
+                    "mode": { "const": "NEW_SOURCE_DATA" },
+                    "sourceTransitionCertificateHash": { "$ref": "#/$defs/sha256" }
+                  }
+                },
+                {
+                  "type": "object", "additionalProperties": false,
+                  "required": ["mode", "userAuthorityCertificateHash"],
+                  "properties": {
+                    "mode": { "const": "EXPLICIT_USER_AUTHORITY" },
+                    "userAuthorityCertificateHash": { "$ref": "#/$defs/sha256" }
+                  }
+                }
+              ] }
+            }
+          }]
+        },
+        {
+          "allOf": [{ "$ref": "#/$defs/base" }, {
+            "type": "object", "additionalProperties": false,
+            "required": ["schemaVersion", "kind", "strongestInvariantInventoryHash", "secondCandidateFamily", "identifiabilityProofHash"],
+            "properties": {
+              "schemaVersion": { "const": "1.0.0" }, "kind": { "const": "SIGNATURE_SEARCH" },
+              "strongestInvariantInventoryHash": { "$ref": "#/$defs/sha256" }, "secondCandidateFamily": { "type": "boolean" },
+              "identifiabilityProofHash": { "$ref": "#/$defs/nullableSha256" }
+            },
+            "allOf": [{
+              "if": {
+                "properties": { "secondCandidateFamily": { "const": true } },
+                "required": ["secondCandidateFamily"]
+              },
+              "then": { "properties": { "identifiabilityProofHash": { "$ref": "#/$defs/sha256" } } }
+            }]
+          }]
+        },
+        {
+          "allOf": [{ "$ref": "#/$defs/base" }, {
+            "type": "object", "additionalProperties": false,
+            "required": ["schemaVersion", "kind", "fixtureProvenanceHash", "mutationReplayHash", "initialStatus", "executablePrebuildValidationRequired", "executablePrebuildValidationHash"],
+            "properties": {
+              "schemaVersion": { "const": "1.0.0" }, "kind": { "const": "FIXTURE_PROVENANCE" },
+              "fixtureProvenanceHash": { "$ref": "#/$defs/sha256" }, "mutationReplayHash": { "$ref": "#/$defs/sha256" },
+              "initialStatus": { "const": "RED" }, "executablePrebuildValidationRequired": { "const": true },
+              "executablePrebuildValidationHash": { "$ref": "#/$defs/sha256" }
+            }
+          }]
+        },
+        {
+          "allOf": [{ "$ref": "#/$defs/base" }, {
+            "type": "object", "additionalProperties": false,
+            "required": ["schemaVersion", "kind", "externalOracleId", "verificationRoute", "maxProvisionalWorkerLaunches", "localDoneAllowed"],
+            "properties": {
+              "schemaVersion": { "const": "1.0.0" }, "kind": { "const": "HIDDEN_EXTERNAL_ORACLE" },
+              "externalOracleId": { "type": "string", "minLength": 1 }, "verificationRoute": { "const": "EXTERNALLY_VERIFIABLE_ONLY" },
+              "maxProvisionalWorkerLaunches": { "const": 1 }, "localDoneAllowed": { "const": false }
+            }
+          }]
+        },
+        {
+          "allOf": [{ "$ref": "#/$defs/base" }, {
+            "type": "object", "additionalProperties": false,
+            "required": ["schemaVersion", "kind", "imageEvidenceHash", "selectedInterpretation", "alternativeInterpretations", "rulingHash", "certificateHash"],
+            "properties": {
+              "schemaVersion": { "const": "1.0.0" }, "kind": { "const": "IMAGE_DATUM" },
+              "imageEvidenceHash": { "$ref": "#/$defs/sha256" },
+              "selectedInterpretation": {
+                "type": "object", "additionalProperties": false, "required": ["id", "interpretation"],
+                "properties": { "id": { "type": "string", "minLength": 1 }, "interpretation": { "type": "string", "minLength": 1 } }
+              },
+              "alternativeInterpretations": {
+                "type": "array", "minItems": 1, "uniqueItems": true,
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "rulingHash": { "$ref": "#/$defs/sha256" },
+              "certificateHash": { "$ref": "#/$defs/sha256" }
+            }
+          }]
+        },
+        {
+          "allOf": [{ "$ref": "#/$defs/base" }, {
+            "type": "object", "additionalProperties": false,
+            "required": ["schemaVersion", "kind", "priorDoneCandidateHash", "isolationCertificateHash", "requiredAcceptanceIds"],
+            "properties": {
+              "schemaVersion": { "const": "1.0.0" }, "kind": { "const": "DONE_RETRY_PROMOTION" },
+              "priorDoneCandidateHash": { "$ref": "#/$defs/sha256" },
+              "isolationCertificateHash": { "$ref": "#/$defs/sha256" },
+              "requiredAcceptanceIds": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+            }
+          }]
+        }
+      ]
+    }
+  },
+  "$ref": "#/$defs/contract"
+}

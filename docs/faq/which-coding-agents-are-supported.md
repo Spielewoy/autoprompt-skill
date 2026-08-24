@@ -5,7 +5,7 @@ The current public support set contains nine working providers:
 | Coding agent | Audited requirement | Package |
 |---|---|---|
 | [Claude Code](https://code.claude.com/docs/en/setup) | 2.1.219+; audited 2.1.233 | [Source](../../agents/claude/) |
-| [Codex](https://github.com/openai/codex) | Subagent-capable build; audited 0.147.0 | [Source](../../agents/codex/) |
+| [Codex](https://github.com/openai/codex) | Subagent-capable build; current v2 work audited with 0.148.0 | [Source](../../agents/codex/) |
 | [OpenCode](https://opencode.ai/docs/agents) | 1.18.7+; audited 1.18.18 | [Source](../../agents/opencode/) |
 | [Kilo](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; audited 7.4.22 | [Source](../../agents/kilo/) |
 | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; audited 1.133.0 with Copilot 0.61.0 | [Source](../../agents/vscode/) |
@@ -15,6 +15,11 @@ The current public support set contains nine working providers:
 | [Reasonix](https://reasonix.io/docs/) | 1.30.0+; adapter contract, install lifecycle, and native role payload verified for 1.30.0 | [Source](../../agents/reasonix/) |
 
 The installer shows only this vetted set. OMP, DeepSeek Harness, and Reasonix are listed because their adapter contracts, install targets, root resolution, recursive wiring, reversible lifecycle, and native `ap-fresh-verifier` payloads are covered by local tests. Use the [custom coding agent compatibility guide](../guides/custom-agent-compatibility.md) to assess another CLI or IDE and define the adapter proof it still needs.
+
+The current redesign is Codex-first. The other eight provider entries describe their
+existing released adapters, not v2 hierarchy/runtime parity. Codex v2 must be started
+with `autoprompt activate codex -- <mission>`; the launcher injects the private
+`$autoprompt` envelope and performs a dynamic sandbox preflight before any model call.
 
 Prime uses a sealed adapter for Autoprompt dispatch. Raw host `rlm` remains available outside Autoprompt, so this is not a global sandbox boundary. The CLI uses `PRIME_AGENT_CODING_AGENT_DIR` when set, otherwise `~/.prime/agent`.
 

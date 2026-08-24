@@ -35,8 +35,8 @@ jobs:
         with:
           python-version: "3.12"
           check-latest: false
-      - name: Install validation parser
-        run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3
+      - name: Install validation parsers
+        run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0
       - name: Set up npm trusted publishing
         run: npm install --global npm@11.6.3 --ignore-scripts --no-audit --no-fund
       - name: Match tag to package version
@@ -60,6 +60,9 @@ jobs:
             throw "Tagged commit $env:GITHUB_SHA is not on main."
           }
       - name: Run the complete release gate
+        env:
+          AUTOPROMPT_RELEASE_QUALITY_EVIDENCE_PATH: ${{ vars.AUTOPROMPT_RELEASE_QUALITY_EVIDENCE_PATH }}
+          AUTOPROMPT_RELEASE_QUALITY_TRUST_REGISTRY_PATH: ${{ vars.AUTOPROMPT_RELEASE_QUALITY_TRUST_REGISTRY_PATH }}
         run: npm run prepublishOnly
 
   publish-release:

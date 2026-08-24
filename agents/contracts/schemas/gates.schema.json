@@ -1,0 +1,682 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/gates.schema.json",
+  "title": "Autoprompt v2 required-check registry",
+  "type": "object",
+  "required": [
+    "kind",
+    "contractVersion",
+    "outcomeSchema",
+    "definitions",
+    "routeGraphs",
+    "checkerSelection",
+    "composition",
+    "riskOverlays",
+    "terminationPolicy",
+    "findingClosure"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "kind": {
+      "const": "autoprompt-check-registry"
+    },
+    "contractVersion": {
+      "const": "2.0.0"
+    },
+    "outcomeSchema": {
+      "type": "string"
+    },
+    "definitions": {
+      "type": "object",
+      "minProperties": 10,
+      "additionalProperties": {
+        "$ref": "#/$defs/check"
+      }
+    },
+    "routeGraphs": {
+      "type": "object",
+      "required": [
+        "DIRECT",
+        "LIGHT",
+        "ROADMAP"
+      ],
+      "properties": {
+        "DIRECT": {
+          "$ref": "#/$defs/graph"
+        },
+        "LIGHT": {
+          "$ref": "#/$defs/graph"
+        },
+        "ROADMAP": {
+          "$ref": "#/$defs/graph"
+        }
+      },
+      "additionalProperties": false
+    },
+    "checkerSelection": {
+      "type": "object",
+      "required": [
+        "default",
+        "secondChecker"
+      ],
+      "properties": {
+        "default": {
+          "type": "object",
+          "required": [
+            "checkerCount",
+            "check",
+            "covers"
+          ],
+          "properties": {
+            "checkerCount": {
+              "const": 1
+            },
+            "check": {
+              "const": "independent-check"
+            },
+            "covers": {
+              "const": [
+                "static-review",
+                "behavior-test"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "secondChecker": {
+          "type": "object",
+          "required": [
+            "requiresNamedDistinctResponsibility",
+            "allowedReasons",
+            "duplicateEvidenceConsumptionForbidden"
+          ],
+          "properties": {
+            "requiresNamedDistinctResponsibility": {
+              "const": true
+            },
+            "allowedReasons": {
+              "type": "array",
+              "minItems": 8,
+              "uniqueItems": true
+            },
+            "duplicateEvidenceConsumptionForbidden": {
+              "const": true
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "composition": {
+      "type": "object",
+      "required": [
+        "baseWorkTypes",
+        "artifactOverlays",
+        "acceptanceOverlays",
+        "selectionSchema",
+        "validation"
+      ],
+      "properties": {
+        "baseWorkTypes": {
+          "type": "object",
+          "minProperties": 8
+        },
+        "artifactOverlays": {
+          "type": "object",
+          "minProperties": 10
+        },
+        "acceptanceOverlays": {
+          "type": "array",
+          "minItems": 10,
+          "uniqueItems": true
+        },
+        "selectionSchema": {
+          "type": "object"
+        },
+        "validation": {
+          "type": "object",
+          "required": [
+            "exactlyOneBaseWorkType",
+            "atLeastOneArtifactOverlay",
+            "multipleRiskOverlaysAllowed",
+            "rejectUnknownValues",
+            "rejectDuplicateOverlays",
+            "riskTriggerEvidenceRequired",
+            "compoundRules",
+            "incompatibleCombinations"
+          ],
+          "properties": {
+            "compoundRules": {
+              "type": "array",
+              "minItems": 3,
+              "uniqueItems": true,
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "when",
+                  "require"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "when": {
+                    "type": "object",
+                    "minProperties": 1
+                  },
+                  "require": {
+                    "type": "object",
+                    "minProperties": 1
+                  },
+                  "forbid": {
+                    "type": "object",
+                    "minProperties": 1
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "incompatibleCombinations": {
+              "type": "array"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "riskOverlays": {
+      "type": "object",
+      "minProperties": 7,
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "check",
+          "triggerDimensions"
+        ],
+        "properties": {
+          "check": {
+            "const": "named-risk-check"
+          },
+          "triggerDimensions": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "terminationPolicy": {
+      "$ref": "#/$defs/terminationPolicy"
+    },
+    "findingClosure": {
+      "type": "object",
+      "required": [
+        "blocking",
+        "advisory",
+        "severityDowngradeAllowed",
+        "userResidualRiskAcceptanceRequiresAuthority"
+      ],
+      "properties": {
+        "blocking": {
+          "type": "string",
+          "minLength": 1
+        },
+        "advisory": {
+          "type": "string",
+          "minLength": 1
+        },
+        "severityDowngradeAllowed": {
+          "const": false
+        },
+        "userResidualRiskAcceptanceRequiresAuthority": {
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "check": {
+      "type": "object",
+      "required": [
+        "owner",
+        "inputs",
+        "outputs",
+        "sideEffects",
+        "independent",
+        "failureOwner",
+        "execution",
+        "retryPolicy"
+      ],
+      "properties": {
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "outputs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "sideEffects": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "independent": {
+          "type": "boolean"
+        },
+        "failureOwner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "execution": {
+          "$ref": "#/$defs/execution"
+        },
+        "retryPolicy": {
+          "$ref": "#/$defs/retryPolicy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "execution": {
+      "type": "object",
+      "required": [
+        "command",
+        "oracle",
+        "negativePaths"
+      ],
+      "properties": {
+        "command": {
+          "type": "object",
+          "required": [
+            "kind",
+            "name",
+            "argv",
+            "workingDirectory",
+            "timeoutSeconds",
+            "availability",
+            "requiredCapabilities"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "contract-operation",
+                "process",
+                "provider-operation"
+              ]
+            },
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]+$"
+            },
+            "argv": {
+              "type": "array",
+              "minItems": 2,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "workingDirectory": {
+              "enum": [
+                "declared-workspace",
+                "isolated-check-workspace",
+                "run-record-root"
+              ]
+            },
+            "timeoutSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1800
+            },
+            "availability": {
+              "const": "required-preflight"
+            },
+            "requiredCapabilities": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]+$"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "oracle": {
+          "type": "object",
+          "required": [
+            "kind",
+            "availability",
+            "requiredCapabilities",
+            "successCondition"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]+$"
+            },
+            "availability": {
+              "const": "required-preflight"
+            },
+            "requiredCapabilities": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]+$"
+              }
+            },
+            "successCondition": {
+              "type": "string",
+              "minLength": 20
+            }
+          },
+          "additionalProperties": false
+        },
+        "negativePaths": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "condition",
+              "expectedOutcome",
+              "requiredEvidence"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]+$"
+              },
+              "condition": {
+                "type": "string",
+                "minLength": 10
+              },
+              "expectedOutcome": {
+                "enum": [
+                  "PROVIDER_UNSUPPORTED",
+                  "CHECK_INCONCLUSIVE",
+                  "BLOCKED",
+                  "FAILED"
+                ]
+              },
+              "requiredEvidence": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]+$"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "retryPolicy": {
+      "type": "object",
+      "required": [
+        "kind",
+        "maxAttempts",
+        "retryableFailures",
+        "requiresProgressAfterFailure",
+        "progressFingerprintFields",
+        "maxUnchangedFailures",
+        "onExhaustion"
+      ],
+      "properties": {
+        "kind": {
+          "const": "bounded-progress"
+        },
+        "maxAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3
+        },
+        "retryableFailures": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "SCHEMA_INVALID",
+              "INPUT_FINGERPRINT_CHANGED",
+              "EVIDENCE_FINGERPRINT_CHANGED",
+              "TRANSIENT_TOOL_FAILURE",
+              "DEPENDENCY_CHANGED",
+              "OWNERSHIP_CHANGED",
+              "CONFLICT_RESOLVED",
+              "TRANSIENT_STATE_STORE_FAILURE"
+            ]
+          }
+        },
+        "requiresProgressAfterFailure": {
+          "const": true
+        },
+        "progressFingerprintFields": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "inputHashes",
+              "candidateVersionHash",
+              "oracleEvidenceHash"
+            ]
+          }
+        },
+        "maxUnchangedFailures": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "onExhaustion": {
+          "type": "object",
+          "required": [
+            "state",
+            "outcomeCode"
+          ],
+          "properties": {
+            "state": {
+              "enum": [
+                "BLOCKED",
+                "FAILED"
+              ]
+            },
+            "outcomeCode": {
+              "enum": [
+                "BLOCKED",
+                "FAILED"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "graph": {
+      "type": "object",
+      "required": [
+        "required",
+        "terminal",
+        "leaves",
+        "edges",
+        "order",
+        "maxTransitions"
+      ],
+      "properties": {
+        "required": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "terminal": {
+          "const": "final-record"
+        },
+        "leaves": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]+$"
+          }
+        },
+        "edges": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "required": [
+              "before",
+              "after"
+            ],
+            "properties": {
+              "before": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]+$"
+              },
+              "after": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]+$"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "order": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]+$"
+          }
+        },
+        "maxTransitions": {
+          "type": "integer",
+          "minimum": 2
+        }
+      },
+      "additionalProperties": false
+    },
+    "terminationPolicy": {
+      "type": "object",
+      "required": [
+        "proofModel",
+        "rankingFunction",
+        "retryProgressRule",
+        "terminalBoundaries",
+        "requirements"
+      ],
+      "properties": {
+        "proofModel": {
+          "const": "universal-bounded-state-exploration"
+        },
+        "rankingFunction": {
+          "const": [
+            "remainingOrderedLeaves",
+            "remainingAttemptsForCurrentLeaf"
+          ]
+        },
+        "retryProgressRule": {
+          "type": "string",
+          "minLength": 20
+        },
+        "terminalBoundaries": {
+          "type": "array",
+          "minItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "required": [
+              "state",
+              "outcomeCode"
+            ],
+            "properties": {
+              "state": {
+                "enum": [
+                  "DONE",
+                  "PARTIAL",
+                  "BLOCKED",
+                  "FAILED"
+                ]
+              },
+              "outcomeCode": {
+                "enum": [
+                  "DONE",
+                  "PARTIAL",
+                  "BLOCKED",
+                  "FAILED"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "requirements": {
+          "type": "object",
+          "required": [
+            "allOutgoingBranchesChecked",
+            "unboundedCyclesForbidden",
+            "terminalOutgoingEdgesForbidden",
+            "exhaustedRetryMustReachTypedBoundary"
+          ],
+          "properties": {
+            "allOutgoingBranchesChecked": {
+              "const": true
+            },
+            "unboundedCyclesForbidden": {
+              "const": true
+            },
+            "terminalOutgoingEdgesForbidden": {
+              "const": true
+            },
+            "exhaustedRetryMustReachTypedBoundary": {
+              "const": true
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

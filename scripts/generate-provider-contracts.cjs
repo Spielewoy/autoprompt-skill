@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 'use strict'
 
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 
 const ROOT = path.resolve(__dirname, '..')
+const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/
+const CODEX_PACKAGE_REGISTRY = 'scripts/install/codex-package-registry.json'
 
 function read(relativePath, root = ROOT) {
   return fs.readFileSync(path.join(root, relativePath), 'utf8').replace(/\r\n/g, '\n')
@@ -16,6 +19,96 @@ function writeAtomic(relativePath, content, root = ROOT) {
   fs.mkdirSync(path.dirname(target), { recursive: true })
   fs.writeFileSync(temporary, content, 'utf8')
   fs.renameSync(temporary, target)
+}
+
+function readCodexPackageVersion(root = ROOT) {
+  const relativePath = 'packages/codex/package.json'
+  if (!fs.existsSync(path.join(root, relativePath))) {
+    throw new Error(`Codex package metadata is missing: ${relativePath}`)
+  }
+  const version = readJson(relativePath, root).version
+  if (typeof version !== 'string' || !SEMVER_PATTERN.test(version)) {
+    throw new Error(`${relativePath} must declare a valid semantic version`)
+  }
+  return version
+}
+
+function loadCodexPackageRegistry(root = ROOT) {
+  const registry = readJson(CODEX_PACKAGE_REGISTRY, root)
+  requireCondition(registry.schemaVersion === 1 && registry.provider === 'codex', 'Codex package registry identity is invalid')
+  const inputs = registry.canonicalInputs || {}
+  const outputs = registry.generatedOutputs || {}
+  for (const key of ['conductor', 'gates', 'playbooks', 'frameworks', 'rolePolicy', 'personas']) {
+    requireCondition(
+      typeof inputs[key] === 'string' && (
+        inputs[key].startsWith('agents/contracts/') ||
+        key === 'rolePolicy' && inputs[key] === 'agents/codex/agents/role-policy.json'
+      ),
+    `Codex package registry canonical input ${key} is invalid`)
+  }
+  requireCondition(Array.isArray(inputs.modes) && inputs.modes.length > 0, 'Codex package registry mode inputs are invalid')
+  for (const key of CODEX_DOCTRINE_FILES) {
+    requireCondition(outputs[key] === `agents/codex/${key}`, `Codex package registry output ${key} is invalid`)
+  }
+  requireCondition(outputs.frameworks === 'agents/codex/frameworks', 'Codex package registry framework output is invalid')
+  requireCondition(outputs.agents === 'agents/codex/agents', 'Codex package registry agent output is invalid')
+  requireCondition(outputs.version === 'agents/codex/VERSION', 'Codex package registry version output is invalid')
+  const frameworkRoutes = registry.frameworkRoutes || {}
+  requireCondition(Object.keys(frameworkRoutes).length > 0, 'Codex package registry framework route map is missing')
+  for (const [file, routes] of Object.entries(frameworkRoutes)) {
+    requireCondition(/^[A-Za-z0-9][A-Za-z0-9-]*\.md$/u.test(file), `Codex framework route file is invalid: ${file}`)
+    requireCondition(Array.isArray(routes) && routes.length > 0 &&
+      new Set(routes).size === routes.length && routes.every(route => ALL_CODEX_ROUTES.includes(route)),
+    `Codex framework route mapping is invalid: ${file}`)
+  }
+  requireCondition(ALL_CODEX_ROUTES.every(route =>
+    Object.values(frameworkRoutes).some(routes => routes.includes(route))),
+  'Codex framework route map does not cover every route')
+
+  const requiredRoleCapabilities = registry.requiredRoleCapabilities || []
+  requireCondition(requiredRoleCapabilities.length > 0, 'Codex required role capabilities are missing')
+  const capabilityIds = new Set()
+  for (const requirement of requiredRoleCapabilities) {
+    requireCondition(requirement && /^[a-z][a-z0-9-]*$/u.test(requirement.id) &&
+      /^[a-z][a-z0-9-]*$/u.test(requirement.logicalRole) &&
+      Array.isArray(requirement.requiredModes) && requirement.requiredModes.length > 0 &&
+      new Set(requirement.requiredModes).size === requirement.requiredModes.length &&
+      requirement.requiredModes.every(mode => typeof mode === 'string' && mode.length > 0),
+    `Codex required role capability is invalid: ${requirement?.id || 'unknown'}`)
+    requireCondition(!capabilityIds.has(requirement.id), `Codex required role capability repeats ${requirement.id}`)
+    capabilityIds.add(requirement.id)
+  }
+
+  const migrationSources = new Set(registry.migrationSources || [])
+  const requiredMigrations = registry.requiredMigrations || []
+  requireCondition(requiredMigrations.length > 0, 'Codex required migrations are missing')
+  const migrationIds = new Set()
+  for (const migration of requiredMigrations) {
+    requireCondition(migration && /^[a-z][a-z0-9-]*$/u.test(migration.id) &&
+      typeof migration.source === 'string' && migration.source.length > 0,
+    `Codex required migration is invalid: ${migration?.id || 'unknown'}`)
+    requireCondition(!migrationIds.has(migration.id), `Codex required migration repeats ${migration.id}`)
+    requireCondition(migrationSources.has(migration.source), `Codex required migration ${migration.id} is missing`)
+    migrationIds.add(migration.id)
+  }
+  for (const [physicalId, requirements] of Object.entries(registry.promptRequirements || {})) {
+    requireCondition(/^ap-[a-z0-9-]+$/u.test(physicalId) && Array.isArray(requirements) &&
+      requirements.length > 0 && requirements.every(value => typeof value === 'string' && value.trim()),
+    `Codex package registry prompt requirements for ${physicalId} are invalid`)
+  }
+  const exceptionPaths = new Set()
+  for (const exception of registry.plainLanguageAuditedExceptions || []) {
+    requireCondition(exception && typeof exception.path === 'string' &&
+      (/^agents\/codex\/workflow\/[^/]+\.(?:js|sh|ps1)$/u.test(exception.path) ||
+        /^assets\/(?:[^/]+\/)*[^/]+\.svg$/u.test(exception.path)) &&
+      /^[a-f0-9]{64}$/u.test(exception.sha256) && Array.isArray(exception.terms) &&
+      exception.terms.length > 0 && exception.terms.every(term => typeof term === 'string') &&
+      typeof exception.reason === 'string' && exception.reason.trim().length > 20,
+    `Codex plain-language audited exception is invalid: ${exception?.path || 'unknown'}`)
+    requireCondition(!exceptionPaths.has(exception.path), `Codex plain-language audited exception repeats ${exception.path}`)
+    exceptionPaths.add(exception.path)
+  }
+  return Object.freeze(registry)
 }
 
 function stripFrontmatter(text) {
@@ -59,6 +152,1598 @@ function renderCodexAgent(persona, source) {
     '"""',
     '',
   ].join('\n')
+}
+
+const CODEX_V2_INPUTS = Object.freeze([
+  'agents/contracts/product.json',
+  'agents/contracts/routes.json',
+  'agents/contracts/state-machine.json',
+  'agents/contracts/roles.json',
+  'agents/contracts/gates.json',
+  'agents/contracts/providers.json',
+  'agents/contracts/plain-language.json',
+])
+
+const CODEX_ALIAS_TARGET_BY_LOGICAL_ROLE = Object.freeze({
+  'mission-coordinator': 'ap-run-coordinator',
+  'ap-work-group-manager': 'ap-work-group-manager',
+  'roadmap-author': 'ap-roadmap-author',
+  scout: 'ap-roadmap-scout',
+  worker: 'ap-worker',
+  'independent-checker': 'ap-independent-checker',
+  'independent-reviewer': 'ap-independent-checker',
+  'independent-tester': 'ap-independent-checker',
+  'plan-checker': 'ap-independent-checker',
+  'technical-decision-reviewer': 'ap-independent-checker',
+  'diagnostic-probe': 'C0',
+  'legacy-intake': 'C0',
+  'deterministic-control-plane': 'C0',
+})
+
+const CODEX_DOCTRINE_FILES = Object.freeze([
+  'GATES.md',
+  'MODES.md',
+  'PLAYBOOKS.md',
+  'SKILL.md',
+])
+
+const CODEX_ACTIVATION_SYNTAX = Object.freeze({
+  externalCommand: 'autoprompt activate codex ... -- <mission>',
+  internalSkillEnvelope: '$autoprompt',
+  unsupportedSlashCommand: '/autoprompt',
+  unsupportedCode: 'INVALID_INPUT',
+})
+
+const CODEX_ALIAS_TELEMETRY_INSTRUCTION = 'When this compatibility id is used, deterministic control code records the alias use in the registered compatibility telemetry log. This read-only role must not write that log.'
+
+const ALL_CODEX_ROUTES = Object.freeze(['DIRECT', 'LIGHT', 'ROADMAP'])
+
+function codexFrameworkRoutes(root = ROOT) {
+  const configured = loadCodexPackageRegistry(root).frameworkRoutes
+  return Object.freeze(Object.fromEntries(Object.entries(configured)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([file, routes]) => [file, Object.freeze([...routes])])))
+}
+
+function codexFrameworkFiles(root = ROOT) {
+  return Object.freeze(Object.keys(codexFrameworkRoutes(root)))
+}
+
+const COMPILED_GATES_BEGIN = '<!-- AUTOPROMPT-COMPILED-GATES:BEGIN v2'
+const COMPILED_GATES_END = '<!-- AUTOPROMPT-COMPILED-GATES:END -->'
+const FRAMEWORK_GATES_BEGIN = '<!-- AUTOPROMPT-FRAMEWORK-GATES:BEGIN v2'
+const FRAMEWORK_GATES_END = '<!-- AUTOPROMPT-FRAMEWORK-GATES:END -->'
+const ROUTE_EXAMPLES_BEGIN = '<!-- AUTOPROMPT-COMPILED-ROUTE-EXAMPLES:BEGIN v2'
+const ROUTE_EXAMPLES_END = '<!-- AUTOPROMPT-COMPILED-ROUTE-EXAMPLES:END -->'
+
+const PUBLIC_PROVIDER_IDS = Object.freeze([
+  'claude',
+  'codex',
+  'deepseek',
+  'kilo',
+  'omp',
+  'opencode',
+  'prime',
+  'reasonix',
+  'vscode',
+])
+
+const PROVIDER_CAPABILITY_FIELDS = Object.freeze([
+  'isolation',
+  'topologyEnforcement',
+  'privateSkillRoot',
+  'eventStreaming',
+  'toolOutputCapture',
+  'stableChildIdentity',
+  'sameContextContinuation',
+  'cancellation',
+  'isolatedChecking',
+  'processOwnership',
+  'modelRouting',
+])
+
+const SAFE_WRITE_SETS = Object.freeze({
+  'route-analyst': Object.freeze([]),
+  'mission-coordinator': Object.freeze([]),
+  'ap-work-group-manager': Object.freeze([]),
+  'roadmap-author': Object.freeze(['plan.roadmap.write']),
+  scout: Object.freeze([]),
+  worker: Object.freeze(['target.owned.write', 'report.owned.write', 'harness.owned.write']),
+  'independent-checker': Object.freeze(['isolated-check.write']),
+  'independent-reviewer': Object.freeze([]),
+  'independent-tester': Object.freeze([]),
+  'plan-checker': Object.freeze([]),
+  'technical-decision-reviewer': Object.freeze([]),
+  'diagnostic-probe': Object.freeze([]),
+  'legacy-intake': Object.freeze([]),
+  'deterministic-control-plane': Object.freeze([]),
+})
+
+const SAFE_EXCLUSIVE_SETS = Object.freeze({
+  'route-analyst': Object.freeze([]),
+  'mission-coordinator': Object.freeze([]),
+  'ap-work-group-manager': Object.freeze([]),
+  'roadmap-author': Object.freeze(['plan.roadmap.write']),
+  scout: Object.freeze([]),
+  worker: Object.freeze(['target.owned.write', 'report.owned.write', 'harness.owned.write']),
+  'independent-checker': Object.freeze(['check-resources.exclusive']),
+  'independent-reviewer': Object.freeze([]),
+  'independent-tester': Object.freeze([]),
+  'plan-checker': Object.freeze([]),
+  'technical-decision-reviewer': Object.freeze([]),
+  'diagnostic-probe': Object.freeze([]),
+  'legacy-intake': Object.freeze([]),
+  'deterministic-control-plane': Object.freeze([]),
+})
+
+const COORDINATOR_TARGET_READ_POLICIES = Object.freeze({
+  'ap-run-coordinator': Object.freeze({
+    logicalRole: 'mission-coordinator',
+    logicalReads: Object.freeze([
+      'request-envelope',
+      'accepted-roadmap',
+      'assigned-target-resources',
+      'run-state',
+      'ownership-record',
+      'worker-results',
+    ]),
+  }),
+  'ap-work-group-manager': Object.freeze({
+    logicalRole: 'ap-work-group-manager',
+    logicalReads: Object.freeze([
+      'assigned-work-group',
+      'assigned-target-resources',
+      'ownership-record',
+      'worker-results',
+    ]),
+  }),
+})
+
+const COORDINATOR_TARGET_READ_RESOURCES = Object.freeze([
+  'request-envelope.read',
+  'plan.roadmap.read',
+  'target.named.read',
+  'prior-results.read',
+])
+
+function readJson(relativePath, root = ROOT) {
+  let value
+  try {
+    value = JSON.parse(read(relativePath, root))
+  } catch (error) {
+    throw new Error(`invalid JSON ${relativePath}: ${error.message}`)
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${relativePath} must contain an object`)
+  }
+  return value
+}
+
+function sameMembers(actual, expected) {
+  return JSON.stringify([...actual].sort()) === JSON.stringify([...expected].sort())
+}
+
+function requireCondition(condition, message) {
+  if (!condition) throw new Error(`Codex v2 generation denied: ${message}`)
+}
+
+function sha256Text(text) {
+  return crypto.createHash('sha256').update(String(text).replace(/\r\n/g, '\n'), 'utf8').digest('hex')
+}
+
+function replaceCompiledSection(source, begin, end, rendered) {
+  const escapedBegin = escapeRegExp(begin)
+  const escapedEnd = escapeRegExp(end)
+  const section = new RegExp(`\\n?${escapedBegin}[^\\n]*\\n[\\s\\S]*?${escapedEnd}\\n?`, 'g')
+  return `${String(source).replace(section, '\n').replace(/\s+$/, '')}\n\n${rendered}\n`
+}
+
+function sortedGateEdges(edges) {
+  return [...edges].sort((left, right) =>
+    left.before.localeCompare(right.before) || left.after.localeCompare(right.after))
+}
+
+function gateGraphProjection(graph, route) {
+  requireCondition(graph && typeof graph === 'object' && !Array.isArray(graph), `${route} check graph is missing`)
+  const leaves = graph.leaves || []
+  const edges = graph.edges || []
+  const order = graph.order || []
+  requireCondition(leaves.length > 0 && new Set(leaves).size === leaves.length, `${route} check leaves are empty or repeated`)
+  requireCondition(JSON.stringify(leaves) === JSON.stringify([...leaves].sort()), `${route} check leaves are not sorted`)
+  requireCondition(JSON.stringify(edges) === JSON.stringify(sortedGateEdges(edges)), `${route} check edges are not sorted`)
+  requireCondition(order.length === leaves.length && sameMembers(order, leaves), `${route} check order does not cover its leaves`)
+  const position = new Map(order.map((leaf, index) => [leaf, index]))
+  const required = Object.fromEntries(order.map(leaf => [leaf, []]))
+  for (const edge of edges) {
+    requireCondition(position.has(edge.before) && position.has(edge.after), `${route} check edge names an unknown leaf`)
+    requireCondition(position.get(edge.before) < position.get(edge.after), `${route} check edge contradicts its order`)
+    required[edge.after].push(edge.before)
+  }
+  for (const dependencies of Object.values(required)) dependencies.sort()
+  const expectedRequired = Object.fromEntries(order.map(leaf => [leaf, [...(graph.required && graph.required[leaf] || [])].sort()]))
+  requireCondition(JSON.stringify(required) === JSON.stringify(expectedRequired), `${route} required adjacency disagrees with its edges`)
+  requireCondition(graph.terminal === order.at(-1), `${route} terminal is not the final ordered leaf`)
+  requireCondition(Number.isInteger(graph.maxTransitions) && graph.maxTransitions > 0, `${route} maximum transitions are invalid`)
+  return Object.freeze({
+    required,
+    terminal: graph.terminal,
+    leaves: Object.freeze([...leaves]),
+    edges: Object.freeze(edges.map(edge => Object.freeze({ before: edge.before, after: edge.after }))),
+    order: Object.freeze([...order]),
+    maxTransitions: graph.maxTransitions,
+  })
+}
+
+function compiledGateGraphs(gates, routeNames = ALL_CODEX_ROUTES) {
+  return Object.freeze(Object.fromEntries(routeNames.map(route => [
+    route,
+    gateGraphProjection(gates.routeGraphs && gates.routeGraphs[route], route),
+  ])))
+}
+
+function gateDefinitionProjection(definition, checkId) {
+  requireCondition(definition && typeof definition === 'object', `check ${checkId} is missing`)
+  const execution = definition.execution || {}
+  const command = execution.command || {}
+  const oracle = execution.oracle || {}
+  const retry = definition.retryPolicy || {}
+  requireCondition(typeof definition.owner === 'string' && definition.owner, `check ${checkId} owner is missing`)
+  requireCondition(typeof command.name === 'string' && Array.isArray(command.argv), `check ${checkId} command is incomplete`)
+  requireCondition(Array.isArray(command.requiredCapabilities) && command.availability, `check ${checkId} command capability proof is incomplete`)
+  requireCondition(Array.isArray(oracle.requiredCapabilities) && oracle.availability, `check ${checkId} oracle capability proof is incomplete`)
+  requireCondition(Array.isArray(execution.negativePaths) && execution.negativePaths.length > 0, `check ${checkId} negative paths are missing`)
+  requireCondition(Number.isInteger(retry.maxAttempts) && retry.maxAttempts > 0, `check ${checkId} retry maximum is invalid`)
+  requireCondition(Number.isInteger(retry.maxUnchangedFailures) && retry.maxUnchangedFailures >= 0, `check ${checkId} unchanged-failure maximum is invalid`)
+  requireCondition(retry.onExhaustion && retry.onExhaustion.state && retry.onExhaustion.outcomeCode, `check ${checkId} exhaustion result is incomplete`)
+  return Object.freeze({
+    owner: definition.owner,
+    execution: Object.freeze({
+      command: Object.freeze({
+        kind: command.kind,
+        name: command.name,
+        argv: Object.freeze([...command.argv]),
+        workingDirectory: command.workingDirectory,
+        timeoutSeconds: command.timeoutSeconds,
+        availability: command.availability,
+        requiredCapabilities: Object.freeze([...command.requiredCapabilities]),
+      }),
+      oracle: Object.freeze({
+        kind: oracle.kind,
+        availability: oracle.availability,
+        requiredCapabilities: Object.freeze([...oracle.requiredCapabilities]),
+        successCondition: oracle.successCondition,
+      }),
+      negativePaths: Object.freeze(execution.negativePaths.map(pathRecord => Object.freeze(JSON.parse(JSON.stringify(pathRecord))))),
+    }),
+    retryPolicy: Object.freeze({
+      kind: retry.kind,
+      maxAttempts: retry.maxAttempts,
+      retryableFailures: Object.freeze([...retry.retryableFailures]),
+      requiresProgressAfterFailure: retry.requiresProgressAfterFailure,
+      progressFingerprintFields: Object.freeze([...retry.progressFingerprintFields]),
+      maxUnchangedFailures: retry.maxUnchangedFailures,
+      onExhaustion: Object.freeze({
+        state: retry.onExhaustion.state,
+        outcomeCode: retry.onExhaustion.outcomeCode,
+      }),
+    }),
+  })
+}
+
+function compiledGateDefinitions(gates) {
+  return Object.freeze(Object.fromEntries(Object.keys(gates.definitions || {}).sort().map(checkId => [
+    checkId,
+    gateDefinitionProjection(gates.definitions[checkId], checkId),
+  ])))
+}
+
+function inlineJson(value) {
+  return JSON.stringify(value).replace(/`/g, '\\u0060')
+}
+
+function renderFullCompiledGates(gates, gatesSha256) {
+  requireCondition(/^[a-f0-9]{64}$/.test(gatesSha256), 'compiled check registry hash is invalid')
+  const graphs = compiledGateGraphs(gates)
+  const definitions = compiledGateDefinitions(gates)
+  const lines = [
+    `${COMPILED_GATES_BEGIN} sha256=${gatesSha256} -->`,
+    '## Compiled required-check registry',
+    '',
+    'This section is generated from the versioned check registry. Edit the registry, not this projection.',
+    'Technical identifiers keep their exact contract spelling: `oracle-rejected` means the observable check rejected a result, `mission-coordinator` means the run coordinator, and `candidateVersionHash` or names containing `-candidate-` refer to the exact version being checked.',
+  ]
+  for (const route of ALL_CODEX_ROUTES) {
+    const graph = graphs[route]
+    lines.push('', `### Route \`${route}\``)
+    for (const leaf of graph.leaves) lines.push(`- Leaf: \`${leaf}\``)
+    for (const edge of graph.edges) lines.push(`- Edge: \`${edge.before}\` -> \`${edge.after}\``)
+    lines.push('', '#### Order')
+    graph.order.forEach((leaf, index) => lines.push(`${index + 1}. \`${leaf}\``))
+    lines.push(`- Maximum transitions: ${graph.maxTransitions}`)
+  }
+  for (const [checkId, definition] of Object.entries(definitions)) {
+    const command = definition.execution.command
+    const oracle = definition.execution.oracle
+    const retry = definition.retryPolicy
+    lines.push(
+      '',
+      `### Check \`${checkId}\``,
+      `- Owner: \`${inlineJson(definition.owner)}\``,
+      `- Command kind: \`${inlineJson(command.kind)}\``,
+      `- Operation: \`${inlineJson(command.name)}\``,
+      `- Arguments: \`${inlineJson(command.argv)}\``,
+      `- Working directory: \`${inlineJson(command.workingDirectory)}\``,
+      `- Command timeout seconds: \`${inlineJson(command.timeoutSeconds)}\``,
+      `- Command availability: \`${inlineJson(command.availability)}\``,
+      `- Command required capabilities: \`${inlineJson(command.requiredCapabilities)}\``,
+      `- Observable check kind: \`${inlineJson(oracle.kind)}\``,
+      `- Observable check availability: \`${inlineJson(oracle.availability)}\``,
+      `- Observable check required capabilities: \`${inlineJson(oracle.requiredCapabilities)}\``,
+      `- Observable check success condition: \`${inlineJson(oracle.successCondition)}\``,
+    )
+    for (const negativePath of definition.execution.negativePaths) {
+      lines.push(`- Negative path: \`${inlineJson(negativePath)}\``)
+    }
+    lines.push(
+      `- Retry kind: \`${inlineJson(retry.kind)}\``,
+      `- Maximum attempts: \`${inlineJson(retry.maxAttempts)}\``,
+      `- Retryable failures: \`${inlineJson(retry.retryableFailures)}\``,
+      `- Requires progress after failure: \`${inlineJson(retry.requiresProgressAfterFailure)}\``,
+      `- Progress fingerprint fields: \`${inlineJson(retry.progressFingerprintFields)}\``,
+      `- Maximum unchanged failures: \`${inlineJson(retry.maxUnchangedFailures)}\``,
+      `- Exhaustion state: \`${inlineJson(retry.onExhaustion.state)}\``,
+      `- Exhaustion outcome code: \`${inlineJson(retry.onExhaustion.outcomeCode)}\``,
+    )
+  }
+  lines.push('', COMPILED_GATES_END)
+  return lines.join('\n')
+}
+
+function parseJsonBullet(line, label) {
+  const match = line.match(new RegExp('^- ' + escapeRegExp(label) + ': `([\\s\\S]*)`$'))
+  if (!match) return undefined
+  try {
+    return JSON.parse(match[1])
+  } catch (error) {
+    throw new Error(`Codex v2 generation denied: compiled check ${label} is not valid JSON: ${error.message}`)
+  }
+}
+
+function parseFullCompiledGates(markdown) {
+  const pattern = /<!-- AUTOPROMPT-COMPILED-GATES:BEGIN v2 sha256=([a-f0-9]{64}) -->\n([\s\S]*?)\n<!-- AUTOPROMPT-COMPILED-GATES:END -->/g
+  const matches = [...String(markdown).matchAll(pattern)]
+  requireCondition(matches.length === 1, 'compiled check registry projection must occur exactly once')
+  const routeParts = Object.fromEntries(ALL_CODEX_ROUTES.map(route => [route, { leaves: [], edges: [], order: [], maxTransitions: null }]))
+  const definitions = {}
+  let currentRoute = null
+  let currentCheck = null
+  let readingOrder = false
+  for (const line of matches[0][2].split('\n')) {
+    const routeHeading = line.match(/^### Route `([^`]+)`$/)
+    if (routeHeading) {
+      requireCondition(ALL_CODEX_ROUTES.includes(routeHeading[1]), `compiled projection names unknown route ${routeHeading[1]}`)
+      currentRoute = routeHeading[1]
+      currentCheck = null
+      readingOrder = false
+      continue
+    }
+    const checkHeading = line.match(/^### Check `([^`]+)`$/)
+    if (checkHeading) {
+      requireCondition(!definitions[checkHeading[1]], `compiled projection repeats check ${checkHeading[1]}`)
+      currentRoute = null
+      currentCheck = checkHeading[1]
+      readingOrder = false
+      definitions[currentCheck] = { execution: { command: {}, oracle: {}, negativePaths: [] }, retryPolicy: { onExhaustion: {} } }
+      continue
+    }
+    if (currentRoute) {
+      if (line === '#### Order') {
+        readingOrder = true
+        continue
+      }
+      const leaf = line.match(/^- Leaf: `([^`]+)`$/)
+      if (leaf) routeParts[currentRoute].leaves.push(leaf[1])
+      const edge = line.match(/^- Edge: `([^`]+)` -> `([^`]+)`$/)
+      if (edge) routeParts[currentRoute].edges.push({ before: edge[1], after: edge[2] })
+      const ordered = readingOrder && line.match(/^(\d+)\. `([^`]+)`$/)
+      if (ordered) {
+        requireCondition(Number(ordered[1]) === routeParts[currentRoute].order.length + 1, `${currentRoute} compiled check order numbering is not canonical`)
+        routeParts[currentRoute].order.push(ordered[2])
+      }
+      const transitions = line.match(/^- Maximum transitions: (\d+)$/)
+      if (transitions) routeParts[currentRoute].maxTransitions = Number(transitions[1])
+      continue
+    }
+    if (!currentCheck || !line.startsWith('- ')) continue
+    const target = definitions[currentCheck]
+    const labels = [
+      ['Owner', target, 'owner'],
+      ['Command kind', target.execution.command, 'kind'],
+      ['Operation', target.execution.command, 'name'],
+      ['Arguments', target.execution.command, 'argv'],
+      ['Working directory', target.execution.command, 'workingDirectory'],
+      ['Command timeout seconds', target.execution.command, 'timeoutSeconds'],
+      ['Command availability', target.execution.command, 'availability'],
+      ['Command required capabilities', target.execution.command, 'requiredCapabilities'],
+      ['Observable check kind', target.execution.oracle, 'kind'],
+      ['Observable check availability', target.execution.oracle, 'availability'],
+      ['Observable check required capabilities', target.execution.oracle, 'requiredCapabilities'],
+      ['Observable check success condition', target.execution.oracle, 'successCondition'],
+      ['Retry kind', target.retryPolicy, 'kind'],
+      ['Maximum attempts', target.retryPolicy, 'maxAttempts'],
+      ['Retryable failures', target.retryPolicy, 'retryableFailures'],
+      ['Requires progress after failure', target.retryPolicy, 'requiresProgressAfterFailure'],
+      ['Progress fingerprint fields', target.retryPolicy, 'progressFingerprintFields'],
+      ['Maximum unchanged failures', target.retryPolicy, 'maxUnchangedFailures'],
+      ['Exhaustion state', target.retryPolicy.onExhaustion, 'state'],
+      ['Exhaustion outcome code', target.retryPolicy.onExhaustion, 'outcomeCode'],
+    ]
+    let recognized = false
+    for (const [label, object, field] of labels) {
+      const value = parseJsonBullet(line, label)
+      if (value === undefined) continue
+      requireCondition(!Object.hasOwn(object, field), `compiled projection repeats ${currentCheck} ${label}`)
+      object[field] = value
+      recognized = true
+      break
+    }
+    if (!recognized) {
+      const negativePath = parseJsonBullet(line, 'Negative path')
+      if (negativePath !== undefined) target.execution.negativePaths.push(negativePath)
+    }
+  }
+  const routeGraphs = Object.fromEntries(ALL_CODEX_ROUTES.map(route => {
+    const part = routeParts[route]
+    const required = Object.fromEntries(part.order.map(leaf => [leaf, []]))
+    for (const edge of part.edges) {
+      if (required[edge.after]) required[edge.after].push(edge.before)
+    }
+    for (const dependencies of Object.values(required)) dependencies.sort()
+    return [route, {
+      required,
+      terminal: part.order.at(-1),
+      leaves: part.leaves,
+      edges: part.edges,
+      order: part.order,
+      maxTransitions: part.maxTransitions,
+    }]
+  }))
+  return Object.freeze({ sha256: matches[0][1], routeGraphs, definitions })
+}
+
+function validateFullCompiledGates(markdown, gates, gatesSha256) {
+  const parsed = parseFullCompiledGates(markdown)
+  const parsedGraphs = Object.freeze(Object.fromEntries(ALL_CODEX_ROUTES.map(route => [
+    route,
+    gateGraphProjection(parsed.routeGraphs[route], route),
+  ])))
+  const parsedDefinitions = Object.freeze(Object.fromEntries(Object.keys(parsed.definitions).sort().map(checkId => [
+    checkId,
+    gateDefinitionProjection(parsed.definitions[checkId], checkId),
+  ])))
+  requireCondition(parsed.sha256 === gatesSha256, 'compiled check registry hash is stale')
+  requireCondition(JSON.stringify(parsedGraphs) === JSON.stringify(compiledGateGraphs(gates)), 'compiled route graph projection is not canonical')
+  requireCondition(JSON.stringify(parsedDefinitions) === JSON.stringify(compiledGateDefinitions(gates)), 'compiled check execution/retry projection is not canonical')
+  return true
+}
+
+function renderFrameworkCompiledGates(gates, gatesSha256, routes) {
+  requireCondition(Array.isArray(routes) && routes.length > 0, 'framework check projection has no applicable route')
+  requireCondition(routes.every(route => ALL_CODEX_ROUTES.includes(route)), 'framework check projection names an unknown route')
+  const graphs = compiledGateGraphs(gates, routes)
+  const lines = [
+    `${FRAMEWORK_GATES_BEGIN} sha256=${gatesSha256} -->`,
+    '## Generated route checks',
+    '',
+    'This compact section is generated from the versioned check registry.',
+  ]
+  for (const route of routes) {
+    const graph = graphs[route]
+    lines.push(
+      '',
+      `### Applicable route \`${route}\``,
+      `- Leaves: \`${inlineJson(graph.leaves)}\``,
+      `- Edges: \`${inlineJson(graph.edges)}\``,
+      `- Order: \`${inlineJson(graph.order)}\``,
+      `- Maximum transitions: \`${inlineJson(graph.maxTransitions)}\``,
+    )
+  }
+  lines.push('', FRAMEWORK_GATES_END)
+  return lines.join('\n')
+}
+
+function parseFrameworkCompiledGates(markdown) {
+  const pattern = /<!-- AUTOPROMPT-FRAMEWORK-GATES:BEGIN v2 sha256=([a-f0-9]{64}) -->\n([\s\S]*?)\n<!-- AUTOPROMPT-FRAMEWORK-GATES:END -->/g
+  const matches = [...String(markdown).matchAll(pattern)]
+  requireCondition(matches.length === 1, 'framework check projection must occur exactly once')
+  const routeParts = {}
+  let currentRoute = null
+  for (const line of matches[0][2].split('\n')) {
+    const heading = line.match(/^### Applicable route `([^`]+)`$/)
+    if (heading) {
+      requireCondition(ALL_CODEX_ROUTES.includes(heading[1]), `framework projection names unknown route ${heading[1]}`)
+      requireCondition(!routeParts[heading[1]], `framework projection repeats route ${heading[1]}`)
+      currentRoute = heading[1]
+      routeParts[currentRoute] = {}
+      continue
+    }
+    if (!currentRoute || !line.startsWith('- ')) continue
+    const fields = [
+      ['Leaves', 'leaves'],
+      ['Edges', 'edges'],
+      ['Order', 'order'],
+      ['Maximum transitions', 'maxTransitions'],
+    ]
+    for (const [label, field] of fields) {
+      const value = parseJsonBullet(line, label)
+      if (value === undefined) continue
+      requireCondition(!Object.hasOwn(routeParts[currentRoute], field), `framework projection repeats ${currentRoute} ${label}`)
+      routeParts[currentRoute][field] = value
+      break
+    }
+  }
+  const routeGraphs = Object.fromEntries(Object.entries(routeParts).map(([route, part]) => {
+    const required = Object.fromEntries((part.order || []).map(leaf => [leaf, []]))
+    for (const edge of part.edges || []) {
+      if (required[edge.after]) required[edge.after].push(edge.before)
+    }
+    for (const dependencies of Object.values(required)) dependencies.sort()
+    return [route, {
+      required,
+      terminal: part.order && part.order.at(-1),
+      leaves: part.leaves,
+      edges: part.edges,
+      order: part.order,
+      maxTransitions: part.maxTransitions,
+    }]
+  }))
+  return Object.freeze({ sha256: matches[0][1], routeGraphs })
+}
+
+function validateFrameworkGateProjections(
+  outputs,
+  gates,
+  gatesSha256,
+  frameworkRoutes = codexFrameworkRoutes(ROOT),
+) {
+  const coverage = Object.fromEntries(ALL_CODEX_ROUTES.map(route => [route, {
+    leaves: new Set(),
+    edges: new Set(),
+    order: new Set(),
+  }]))
+  for (const file of Object.keys(frameworkRoutes)) {
+    const relativePath = `agents/codex/frameworks/${file}`
+    const parsed = parseFrameworkCompiledGates(outputs.get(relativePath))
+    const routes = frameworkRoutes[file]
+    const parsedGraphs = Object.freeze(Object.fromEntries(routes.map(route => [
+      route,
+      gateGraphProjection(parsed.routeGraphs[route], route),
+    ])))
+    requireCondition(parsed.sha256 === gatesSha256, `${relativePath} check registry hash is stale`)
+    requireCondition(
+      JSON.stringify(parsedGraphs) === JSON.stringify(compiledGateGraphs(gates, routes)),
+      `${relativePath} check graph projection is not canonical`,
+    )
+    for (const [route, graph] of Object.entries(parsedGraphs)) {
+      graph.leaves.forEach(leaf => coverage[route].leaves.add(leaf))
+      graph.edges.forEach(edge => coverage[route].edges.add(`${edge.before}\u0000${edge.after}`))
+      graph.order.forEach((leaf, index) => coverage[route].order.add(`${index}\u0000${leaf}`))
+    }
+  }
+  for (const [route, graph] of Object.entries(compiledGateGraphs(gates))) {
+    requireCondition(sameMembers(coverage[route].leaves, graph.leaves), `${route} framework projections do not cover every check leaf`)
+    requireCondition(
+      sameMembers(coverage[route].edges, graph.edges.map(edge => `${edge.before}\u0000${edge.after}`)),
+      `${route} framework projections do not cover every check edge`,
+    )
+    requireCondition(
+      sameMembers(coverage[route].order, graph.order.map((leaf, index) => `${index}\u0000${leaf}`)),
+      `${route} framework projections do not cover the complete check order`,
+    )
+  }
+  return true
+}
+
+function renderCompiledRouteExamples(routes, routesSha256) {
+  requireCondition(/^[a-f0-9]{64}$/.test(routesSha256), 'compiled route example hash is invalid')
+  requireCondition(Array.isArray(routes.examples) && routes.examples.length > 0, 'canonical route examples are missing')
+  const lines = [
+    `${ROUTE_EXAMPLES_BEGIN} sha256=${routesSha256} -->`,
+    '## Canonical route examples',
+    '',
+    'Classify these examples exactly as recorded before handling paraphrases or nearby cases.',
+    ...routes.examples.map(example => `- Example: \`${inlineJson(example)}\``),
+    '',
+    ROUTE_EXAMPLES_END,
+  ]
+  return lines.join('\n')
+}
+
+function parseCompiledRouteExamples(markdown) {
+  const pattern = /<!-- AUTOPROMPT-COMPILED-ROUTE-EXAMPLES:BEGIN v2 sha256=([a-f0-9]{64}) -->\n([\s\S]*?)\n<!-- AUTOPROMPT-COMPILED-ROUTE-EXAMPLES:END -->/g
+  const matches = [...String(markdown).matchAll(pattern)]
+  requireCondition(matches.length === 1, 'compiled route examples must occur exactly once')
+  const examples = []
+  for (const line of matches[0][2].split('\n')) {
+    const example = parseJsonBullet(line, 'Example')
+    if (example !== undefined) examples.push(example)
+  }
+  return Object.freeze({ sha256: matches[0][1], examples: Object.freeze(examples) })
+}
+
+function validateCompiledRouteExamples(markdown, routes, routesSha256, label) {
+  const parsed = parseCompiledRouteExamples(markdown)
+  requireCondition(parsed.sha256 === routesSha256, `${label} route example hash is stale`)
+  requireCondition(JSON.stringify(parsed.examples) === JSON.stringify(routes.examples), `${label} route examples are not canonical`)
+  return true
+}
+
+function providerProjectionPlan(contracts, openedProviders = ['codex']) {
+  const records = contracts.providers.providers || []
+  requireCondition(sameMembers(records.map(provider => provider.id), PUBLIC_PROVIDER_IDS), 'provider projection consumer mismatch')
+  const opened = new Set(openedProviders)
+  const decisions = records.map(provider => {
+    requireCondition(provider.capabilities && typeof provider.capabilities === 'object', `${provider.id} capability record is missing`)
+    requireCondition(
+      PROVIDER_CAPABILITY_FIELDS.every(field => typeof provider.capabilities[field] === 'string'),
+      `${provider.id} capability record is incomplete`,
+    )
+    const capabilityValues = PROVIDER_CAPABILITY_FIELDS.map(field => provider.capabilities[field])
+    const codexCapabilityState = {
+      isolation: 'supported',
+      topologyEnforcement: 'degraded',
+      privateSkillRoot: 'supported',
+      eventStreaming: 'unknown',
+      toolOutputCapture: 'unknown',
+      stableChildIdentity: 'unknown',
+      sameContextContinuation: 'unknown',
+      cancellation: 'unknown',
+      isolatedChecking: 'unknown',
+      processOwnership: 'supported',
+      modelRouting: 'unknown',
+    }
+    const codexSupportedCapabilities = Object.entries(codexCapabilityState)
+      .filter(([, value]) => value === 'supported')
+      .map(([capability]) => capability)
+      .sort()
+    const codexAdmissionCore = provider.id === 'codex' &&
+      provider.implementationStatus === 'verified' &&
+      provider.currentIsolationClass === 'strict' &&
+      provider.defaultAdmission === 'allow-verified-required-capabilities' &&
+      provider.attestationRequired === true &&
+      PROVIDER_CAPABILITY_FIELDS.every(field =>
+        provider.capabilities[field] === codexCapabilityState[field])
+    const attestedCapabilities = Array.isArray(provider.verificationAttestation?.verifiedCapabilities)
+      ? [...provider.verificationAttestation.verifiedCapabilities].sort()
+      : []
+    const codexAttestationCoversPolicy = Boolean(provider.verificationAttestation) &&
+      JSON.stringify(attestedCapabilities) === JSON.stringify(codexSupportedCapabilities) &&
+      /^[a-f0-9]{64}$/.test(provider.verificationAttestation.providerAdmissionSha256 || '') &&
+      provider.verificationAttestation.verificationMethod === 'live-conformance-suite' &&
+      provider.verificationAttestation.result === 'supported'
+    const codexPendingAttestation = codexAdmissionCore && !provider.verificationAttestation
+    const verified = provider.id === 'codex'
+      ? codexAdmissionCore && codexAttestationCoversPolicy
+      : provider.implementationStatus === 'verified' && provider.verificationAttestation &&
+        capabilityValues.every(value => value === 'supported' || value === 'verified')
+    requireCondition(
+      provider.id === 'codex' || !Object.hasOwn(provider, 'attestationRequired'),
+      `${provider.id} cannot declare the Codex pre-canary attestation policy`,
+    )
+    requireCondition(
+      !capabilityValues.some(value => value === 'supported' || value === 'verified') ||
+        provider.verificationAttestation || codexPendingAttestation,
+      `${provider.id} claims verified capability without an attestation`,
+    )
+    const portOpen = opened.has(provider.id)
+    return Object.freeze({
+      provider: provider.id,
+      portOpen,
+      runtimeAdmitted: Boolean(verified),
+      projectionMode: portOpen ? (verified ? 'VERIFIED' : 'SAFE_DEGRADED') : 'PORT_CLOSED',
+      claimsRealBehavior: Boolean(verified),
+      reason: portOpen
+        ? (verified
+            ? 'verified-provider-capability-contract'
+            : (codexPendingAttestation
+                ? 'attestation-required-before-runtime-admission'
+                : provider.defaultAdmission))
+        : 'provider-port-phase-not-open',
+    })
+  }).sort((left, right) => left.provider.localeCompare(right.provider))
+  return Object.freeze(decisions)
+}
+
+function validateCompatibilityAliasContract(rolesContract) {
+  const telemetry = rolesContract.aliasTelemetrySchema || {}
+  requireCondition(telemetry.format === 'jsonl', 'compatibility alias telemetry format is unknown')
+  requireCondition(telemetry.appendPath === 'compatibility/alias-telemetry.jsonl', 'compatibility alias telemetry path is not canonical')
+  requireCondition(telemetry.enforcer === 'deterministic-control-plane', 'compatibility alias telemetry has the wrong writer')
+  requireCondition(telemetry.counterField === 'aliasUseCount', 'compatibility alias telemetry counter is not canonical')
+  requireCondition(telemetry.legacyReadVersion === '1' && telemetry.canonicalWriteVersion === '2.0.0', 'compatibility alias telemetry version mismatch')
+  const hashChain = telemetry.hashChain || {}
+  requireCondition(
+    hashChain.algorithm === 'sha256' && hashChain.canonicalization === 'stable-json-v1' &&
+      hashChain.scope === 'append-file' && hashChain.genesisPreviousHash === null &&
+      Array.isArray(hashChain.entryHashInputFields) && hashChain.entryHashInputFields.includes('previousHash') &&
+      typeof hashChain.crashTailPolicy === 'string' && hashChain.crashTailPolicy.length > 0,
+    'compatibility alias telemetry hash chain is incomplete',
+  )
+  const schema = telemetry.recordSchema || {}
+  const required = [
+    'runId', 'activationId', 'generation', 'legacyId', 'logicalId', 'physicalId', 'legacyReadVersion',
+    'canonicalWriteVersion', 'aliasUseCount', 'occurredAt', 'previousHash', 'entryHash',
+  ]
+  requireCondition(schema.type === 'object' && schema.additionalProperties === false, 'compatibility alias telemetry schema is open')
+  requireCondition(sameMembers(schema.required || [], required), 'compatibility alias telemetry fields mismatch')
+  requireCondition(required.every(field => schema.properties && schema.properties[field]), 'compatibility alias telemetry property is missing')
+  return telemetry
+}
+
+function plainLanguageViolations(text, plainLanguage, label = 'generated text') {
+  const avoid = plainLanguage.avoid || {}
+  const scrubbed = String(text)
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/`[^`\r\n]*`/g, '')
+    .replace(/^\s*Legacy\b.*$/gmi, '')
+    .replace(/\bap-[a-z0-9-]+\b/gi, '')
+    .replace(/\b(?:https?:\/\/|[A-Za-z]:\\)\S+/g, '')
+  const violations = []
+  for (const [term, replacement] of Object.entries(avoid)) {
+    const pattern = new RegExp(`\\b${escapeRegExp(term).replace(/\\ /g, '\\s+')}\\b`, 'gi')
+    for (const match of scrubbed.matchAll(pattern)) {
+      const before = scrubbed.slice(0, match.index)
+      violations.push(Object.freeze({
+        label,
+        line: before.split(/\r?\n/).length,
+        term,
+        replacement,
+      }))
+    }
+  }
+  return Object.freeze(violations)
+}
+
+function validateGeneratedPlainLanguage(outputs, plainLanguage) {
+  const violations = []
+  for (const [relativePath, content] of outputs) {
+    if (!/\.(?:md|toml|ya?ml)$/i.test(relativePath)) continue
+    violations.push(...plainLanguageViolations(content, plainLanguage, relativePath))
+  }
+  requireCondition(
+    violations.length === 0,
+    violations.length
+      ? `${violations[0].label}:${violations[0].line} uses forbidden prompt term ${violations[0].term}; use ${violations[0].replacement}`
+      : 'generated plain-language validation failed',
+  )
+  return true
+}
+
+function plainReplacement(term, configuredReplacement) {
+  const concise = {
+    artifact: 'deliverable',
+    oracle: 'observable check',
+    candidate: 'exact version',
+    assurance: 'independent checking',
+    lane: 'work item',
+    fleet: 'group of workers',
+    frontier: 'next ready work',
+    gate: 'required check',
+    sweep: 'final review',
+    convergence: 'reaching a passing result',
+    handoff: 'assignment',
+    juror: 'independent reviewer',
+    arbiter: 'technical decision reviewer',
+    'fresh eyes': 'independent reviewer',
+  }
+  return concise[term] || configuredReplacement
+}
+
+function matchCase(replacement, matched) {
+  if (matched === matched.toUpperCase()) return replacement.toUpperCase()
+  if (matched[0] === matched[0].toUpperCase()) return replacement[0].toUpperCase() + replacement.slice(1)
+  return replacement
+}
+
+function normalizePlainLanguageMarkdown(text, plainLanguage) {
+  let fenced = false
+  return String(text).split('\n').map(line => {
+    if (/^\s*```/.test(line)) {
+      fenced = !fenced
+      return line
+    }
+    if (fenced || /^\s*Legacy\b/i.test(line)) return line
+    return line.split(/(`[^`\r\n]*`)/g).map((part, index) => {
+      if (index % 2 === 1) return part
+      let normalized = part
+      for (const [term, configuredReplacement] of Object.entries(plainLanguage.avoid || {})) {
+        const pattern = new RegExp(`\\b${escapeRegExp(term).replace(/\\ /g, '\\s+')}\\b`, 'gi')
+        const replacement = plainReplacement(term, configuredReplacement)
+        normalized = normalized.replace(pattern, matched => matchCase(replacement, matched))
+      }
+      return normalized
+    }).join('')
+  }).join('\n')
+}
+
+function markdownAnchorIds(text) {
+  return new Set(String(text).split('\n').flatMap(line => {
+    const heading = /^#{1,6}\s+(.+?)\s*$/.exec(line)
+    if (!heading) return []
+    const id = heading[1].toLowerCase()
+      .replace(/`/g, '')
+      .replace(/[^\p{L}\p{N}\s-]/gu, '')
+      .trim()
+      .replace(/\s+/g, '-')
+    return id ? [id] : []
+  }))
+}
+
+function validateFrameworkReferences(outputs, root = ROOT, frameworkFiles = codexFrameworkFiles(root)) {
+  const staleCapacity = /\b(?:200[- ]agents?|exactly\s+\d+\s+(?:agents?|workers?|scouts?|reviewers?))\b/iu
+  for (const [relativePath, content] of outputs) {
+    requireCondition(!staleCapacity.test(content), `${relativePath} contains a stale numeric capacity claim`)
+    requireCondition(!/\bGATES\.md\s+(?:§|ESCALATION|TIER\s+CONTRACTS)/iu.test(content), `${relativePath} cites a dead GATES.md section`)
+    const references = [
+      ...content.matchAll(/`([^`\r\n]+\.md(?:#[a-z0-9_-]+)?)`/giu),
+      ...content.matchAll(/\[[^\]\r\n]*\]\(([^)\s]+\.md(?:#[a-z0-9_-]+)?)\)/giu),
+    ].map(match => match[1])
+    for (const reference of references) {
+      const [filePart, anchor] = reference.split('#', 2)
+      const frameworkReference = frameworkFiles.includes(filePart) ||
+        filePart.startsWith('agents/contracts/frameworks/') ||
+        filePart.startsWith('frameworks/') && !filePart.includes('<')
+      if (!frameworkReference) continue
+      const target = filePart.startsWith('agents/')
+        ? path.join(root, filePart)
+        : path.resolve(root, path.dirname(relativePath), filePart)
+      requireCondition(fs.existsSync(target) && fs.statSync(target).isFile(), `${relativePath} has dead reference ${reference}`)
+      if (anchor) {
+        requireCondition(markdownAnchorIds(fs.readFileSync(target, 'utf8')).has(anchor), `${relativePath} has dead anchor ${reference}`)
+      }
+    }
+  }
+  return true
+}
+
+function renderSharedFrameworkOutputs(root = ROOT, plainLanguage = readJson('agents/contracts/plain-language.json', root)) {
+  const directory = path.join(root, 'agents', 'contracts', 'frameworks')
+  const files = fs.readdirSync(directory, { withFileTypes: true })
+    .filter(entry => entry.isFile() && entry.name.endsWith('.md'))
+    .map(entry => entry.name)
+    .sort()
+  const frameworkFiles = codexFrameworkFiles(root)
+  requireCondition(sameMembers(files, frameworkFiles), 'shared framework consumer mismatch')
+  const outputs = new Map(files.map(file => {
+    const relativePath = `agents/contracts/frameworks/${file}`
+    const normalized = normalizePlainLanguageMarkdown(read(relativePath, root), plainLanguage)
+    return [relativePath, normalized.endsWith('\n') ? normalized : `${normalized}\n`]
+  }))
+  validateFrameworkReferences(outputs, root, frameworkFiles)
+  validateGeneratedPlainLanguage(outputs, plainLanguage)
+  return outputs
+}
+
+function validateCanonicalAndSharedPlainLanguage(contracts, root = ROOT) {
+  const violations = []
+  const humanFields = new Set(contracts.plainLanguage.humanFacingFields || [])
+  function inspectHumanFields(value, label, key = '') {
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => inspectHumanFields(item, `${label}[${index}]`, key))
+      return
+    }
+    if (value && typeof value === 'object') {
+      for (const [childKey, child] of Object.entries(value)) {
+        inspectHumanFields(child, `${label}.${childKey}`, childKey)
+      }
+      return
+    }
+    // Stable identifiers, schema fields, source paths, hashes, and provider terms
+    // are single tokens. Every sentence-like canonical string is prose and must
+    // therefore satisfy the plain-language contract, even when its field was not
+    // anticipated by the original human-facing-field list.
+    if (typeof value === 'string' && (humanFields.has(key) || /\s/u.test(value))) {
+      violations.push(...plainLanguageViolations(value, contracts.plainLanguage, label))
+    }
+  }
+  for (const [name, document] of Object.entries(contracts)) {
+    if (!CODEX_V2_INPUTS.some(input => input.endsWith(`/${name === 'stateMachine' ? 'state-machine' : name}.json`))) continue
+    inspectHumanFields(document, `agents/contracts/${name}`)
+  }
+  for (const [index, example] of (contracts.routes.examples || []).entries()) {
+    violations.push(...plainLanguageViolations(example.facts, contracts.plainLanguage, `agents/contracts/routes.json.examples[${index}].facts`))
+  }
+  for (const [index, code] of (contracts.plainLanguage.userVisibleCodes || []).entries()) {
+    violations.push(...plainLanguageViolations(code.description, contracts.plainLanguage, `agents/contracts/plain-language.json.userVisibleCodes[${index}].description`))
+  }
+  for (const [index, state] of (contracts.stateMachine.stateRecords || []).entries()) {
+    if (typeof state.description === 'string') {
+      violations.push(...plainLanguageViolations(state.description, contracts.plainLanguage, `agents/contracts/state-machine.json.stateRecords[${index}].description`))
+    }
+  }
+  const sharedSources = [...new Set([
+    ...(contracts.product.generationPolicy.authoritativePromptSources || []),
+    ...codexFrameworkFiles(root).map(file => `agents/contracts/frameworks/${file}`),
+  ])]
+  requireCondition(sharedSources.length > 0, 'authoritative shared prompt sources are missing')
+  for (const relativePath of sharedSources) {
+    requireCondition(relativePath.startsWith('agents/contracts/') && /\.md$/.test(relativePath), `shared prompt source is outside the canonical contract tree: ${relativePath}`)
+    violations.push(...plainLanguageViolations(read(relativePath, root), contracts.plainLanguage, relativePath))
+  }
+  requireCondition(
+    violations.length === 0,
+    violations.length
+      ? `${violations[0].label}:${violations[0].line} uses forbidden prompt term ${violations[0].term}; use ${violations[0].replacement}`
+      : 'canonical/shared plain-language validation failed',
+  )
+  return true
+}
+
+function runtimeMessageLiterals(source) {
+  const messages = []
+  for (const line of String(source).split('\n')) {
+    for (const pattern of [/"((?:\\.|[^"\\])*)"/gu, /'((?:\\.|[^'\\])*)'/gu, /`((?:\\.|[^`\\])*)`/gu]) {
+      for (const match of line.matchAll(pattern)) {
+        const value = match[1].replace(/\\([\\'"`])/g, '$1')
+        // Conservatively treat every prose-like runtime literal as potentially
+        // user-visible. This covers logging and status/report fields as well as
+        // errors, instead of relying on a brittle allowlist of output functions.
+        if (/\s/u.test(value)) messages.push(value)
+      }
+    }
+  }
+  return messages
+}
+
+function diagramVisibleText(source) {
+  return [...String(source).matchAll(/<(?:title|desc|text)\b[^>]*>([\s\S]*?)<\/(?:title|desc|text)>/giu)]
+    .map(match => match[1].replace(/<[^>]+>/g, ' ').replace(/&#?\w+;/g, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+}
+
+function filesUnder(directory) {
+  return fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+    const target = path.join(directory, entry.name)
+    return entry.isDirectory() ? filesUnder(target) : [target]
+  })
+}
+
+function codexUserFacingLanguageViolations(plainLanguage, root = ROOT, overrides = new Map()) {
+  const violations = []
+  const runtimeFiles = filesUnder(path.join(root, 'agents', 'codex', 'workflow'))
+    .filter(file => /\.(?:js|sh|ps1)$/iu.test(file))
+    .map(file => path.relative(root, file).replace(/\\/g, '/'))
+  for (const relativePath of runtimeFiles) {
+    const source = overrides.has(relativePath) ? overrides.get(relativePath) : read(relativePath, root)
+    for (const [index, message] of runtimeMessageLiterals(source).entries()) {
+      violations.push(...plainLanguageViolations(message, plainLanguage, `${relativePath}:message[${index}]`))
+    }
+  }
+
+  const diagramFiles = filesUnder(path.join(root, 'assets'))
+    .filter(file => file.toLowerCase().endsWith('.svg'))
+    .map(file => path.relative(root, file).replace(/\\/g, '/'))
+  for (const relativePath of diagramFiles) {
+    const source = overrides.has(relativePath) ? overrides.get(relativePath) : read(relativePath, root)
+    for (const [index, message] of diagramVisibleText(source).entries()) {
+      violations.push(...plainLanguageViolations(message, plainLanguage, `${relativePath}:text[${index}]`))
+    }
+  }
+  return Object.freeze(violations)
+}
+
+function validateCodexUserFacingLanguage(plainLanguage, root = ROOT, overrides = new Map(), auditedExceptions = []) {
+  const violations = codexUserFacingLanguageViolations(plainLanguage, root, overrides)
+  const exceptionByPath = new Map(auditedExceptions.map(exception => [exception.path, exception]))
+  const usedExceptions = new Set()
+  const unapproved = violations.filter(violation => {
+    const relativePath = violation.label.replace(/:(?:message|text)\[\d+\]$/u, '')
+    const exception = exceptionByPath.get(relativePath)
+    if (!exception || !exception.terms.includes(violation.term)) return true
+    const source = overrides.has(relativePath) ? overrides.get(relativePath) : read(relativePath, root)
+    if (sha256Text(source) !== exception.sha256) return true
+    usedExceptions.add(relativePath)
+    return false
+  })
+  requireCondition(
+    unapproved.length === 0,
+    unapproved.length
+      ? `${unapproved[0].label}:${unapproved[0].line} uses forbidden prompt term ${unapproved[0].term}; use ${unapproved[0].replacement}`
+      : 'Codex runtime/diagram plain-language validation failed',
+  )
+  for (const exception of auditedExceptions) {
+    requireCondition(usedExceptions.has(exception.path), `Codex plain-language audited exception is stale or unused: ${exception.path}`)
+    for (const term of exception.terms) {
+      requireCondition(violations.some(violation =>
+        violation.term === term && violation.label.startsWith(`${exception.path}:`)),
+      `Codex plain-language audited term is stale or unused: ${exception.path}:${term}`)
+    }
+  }
+  return true
+}
+
+function loadCodexV2Contracts(root = ROOT) {
+  const documents = {
+    product: readJson(CODEX_V2_INPUTS[0], root),
+    routes: readJson(CODEX_V2_INPUTS[1], root),
+    stateMachine: readJson(CODEX_V2_INPUTS[2], root),
+    roles: readJson(CODEX_V2_INPUTS[3], root),
+    gates: readJson(CODEX_V2_INPUTS[4], root),
+    providers: readJson(CODEX_V2_INPUTS[5], root),
+    plainLanguage: readJson(CODEX_V2_INPUTS[6], root),
+  }
+  const expectedKinds = {
+    product: 'autoprompt-product-contract',
+    routes: 'autoprompt-route-contract',
+    stateMachine: 'autoprompt-state-machine',
+    roles: 'autoprompt-role-contract',
+    gates: 'autoprompt-check-registry',
+    providers: 'autoprompt-provider-capability-contract',
+    plainLanguage: 'autoprompt-plain-language-contract',
+  }
+  for (const [name, document] of Object.entries(documents)) {
+    requireCondition(document.kind === expectedKinds[name], `${name} has an unknown kind`)
+    requireCondition(document.contractVersion === '2.0.0', `${name} has a stale contract version`)
+    const schemaName = name === 'stateMachine'
+      ? 'state-machine'
+      : name === 'plainLanguage'
+        ? 'plain-language'
+        : name
+    const expectedSchemaReference = `./schemas/${schemaName}.schema.json`
+    requireCondition(document.$schema === expectedSchemaReference, `${name} has an unknown schema id`)
+    const schemaPath = path.join('agents', 'contracts', document.$schema.slice(2))
+    const schema = readJson(schemaPath, root)
+    requireCondition(schema.$schema === 'https://json-schema.org/draft/2020-12/schema', `${name} schema has an unsupported dialect`)
+    requireCondition(
+      schema.$id === `https://autoprompt.local/schemas/v2/${schemaName}.schema.json`,
+      `${name} schema has a stale or mismatched id`,
+    )
+    for (const required of schema.required || []) {
+      requireCondition(Object.hasOwn(document, required), `${name} is missing schema field ${required}`)
+    }
+  }
+
+  const authoritative = documents.product.generationPolicy.authoritativeInputs
+  requireCondition(sameMembers(authoritative, CODEX_V2_INPUTS), 'product authoritative inputs do not match the seven v2 contracts')
+  requireCondition(documents.product.generationPolicy.legacyInputAllowedForProviderGeneration === false, 'legacy provider input is still authoritative')
+  requireCondition(documents.product.compatibility.legacySourceIsAuthoritative === false, 'legacy contract is still authoritative')
+  requireCondition(documents.product.product.defaultRoute === null && documents.routes.defaultRoute === null, 'a default route was introduced')
+
+  const routeNames = documents.product.product.routeNames
+  requireCondition(sameMembers(Object.keys(documents.routes.routes), routeNames), 'route consumer mismatch')
+  requireCondition(sameMembers(Object.keys(documents.gates.routeGraphs), routeNames), 'check graph consumer mismatch')
+  requireCondition(documents.stateMachine.states.includes(documents.stateMachine.initialState), 'initial state is unknown')
+  requireCondition(documents.stateMachine.terminalStates.every(state => documents.stateMachine.states.includes(state)), 'terminal state is unknown')
+  requireCondition(documents.providers.providers.some(provider => provider.id === 'codex'), 'Codex provider capability record is missing')
+  requireCondition(Array.isArray(documents.plainLanguage.instructionRules), 'plain-language instruction rules are missing')
+  validateCompatibilityAliasContract(documents.roles)
+
+  const rolePolicy = readJson('agents/codex/agents/role-policy.json', root)
+  const rolePolicySchema = readJson('agents/codex/agents/role-policy.schema.json', root)
+  for (const required of rolePolicySchema.required || []) {
+    requireCondition(Object.hasOwn(rolePolicy, required), `role policy is missing schema field ${required}`)
+  }
+  const packageRegistry = loadCodexPackageRegistry(root)
+  validateCodexRolePolicy(rolePolicy, documents.roles, packageRegistry, root)
+  const contracts = { ...documents, rolePolicy, rolePolicySchema }
+  validateCanonicalAndSharedPlainLanguage(contracts, root)
+  validateCodexUserFacingLanguage(
+    contracts.plainLanguage,
+    root,
+    new Map(),
+    packageRegistry.plainLanguageAuditedExceptions || [],
+  )
+  const projectionPlan = providerProjectionPlan(contracts)
+  return Object.freeze({ ...contracts, projectionPlan })
+}
+
+function validateCodexRolePolicy(policy, rolesContract, packageRegistry = null, root = ROOT) {
+  requireCondition(policy.$schema === './role-policy.schema.json', 'role policy schema id is stale or unknown')
+  requireCondition(policy.policy_id === 'autoprompt.codex.role-policy', 'role policy id is unknown')
+  requireCondition(policy.policy_version === rolesContract.contractVersion, 'role policy version does not match roles contract')
+  requireCondition(policy.enforcement && policy.enforcement.required === true, 'role policy enforcement is optional')
+  requireCondition((policy.enforcement.enforcers || []).includes('provider-generator'), 'provider generator is not a policy enforcer')
+
+  const physical = policy.physical_roles || {}
+  const compatibilityAliases = rolesContract.compatibilityAliases || []
+  const legacyIds = compatibilityAliases.map(alias => alias.legacyId)
+  const canonicalProjection = rolesContract.codexPhysicalRoleProjection || []
+  const canonicalIds = canonicalProjection.map(role => role.physicalId)
+  const expectedPhysical = [...canonicalIds, ...legacyIds]
+  requireCondition(legacyIds.length > 0 && new Set(legacyIds).size === legacyIds.length, 'roles contract compatibility ids must be non-empty and unique')
+  requireCondition(
+    canonicalProjection.length > 0 && new Set(canonicalIds).size === canonicalProjection.length,
+    'roles contract Codex physical projection must be non-empty and unique',
+  )
+  requireCondition(new Set(expectedPhysical).size === expectedPhysical.length, 'canonical and compatibility physical roles overlap')
+  requireCondition(sameMembers(Object.keys(physical), expectedPhysical), 'physical role consumer mismatch')
+
+  if (packageRegistry) {
+    for (const requirement of packageRegistry.requiredRoleCapabilities || []) {
+      const matches = canonicalProjection.filter(projection =>
+        projection.logicalId === requirement.logicalRole &&
+        requirement.requiredModes.every(mode => projection.modes.includes(mode)))
+      requireCondition(matches.length > 0,
+        `required Codex role capability ${requirement.id} is missing`)
+      requireCondition(matches.some(projection => {
+        const role = physical[projection.physicalId]
+        return role && role.compatibility_alias && role.compatibility_alias.enabled === false
+      }), `required Codex role capability ${requirement.id} has no active physical role`)
+    }
+    const migrationSources = new Set(packageRegistry.migrationSources || [])
+    for (const migration of packageRegistry.requiredMigrations || []) {
+      requireCondition(migrationSources.has(migration.source),
+        `required Codex migration ${migration.id} is missing`)
+      const [relativePath, fragment] = migration.source.split('#', 2)
+      if (fragment) {
+        const document = relativePath === 'agents/contracts/roles.json'
+          ? rolesContract
+          : readJson(relativePath, root)
+        requireCondition(Array.isArray(document[fragment]) && document[fragment].length > 0,
+          `required Codex migration ${migration.id} has no entries`)
+      } else {
+        requireCondition(fs.existsSync(path.join(root, relativePath)),
+          `required Codex migration ${migration.id} source is missing`)
+      }
+    }
+  }
+
+  const aliasPolicy = rolesContract.compatibilityAliasPolicy || {}
+  requireCondition(
+    aliasPolicy.status === 'closed-read-only' && aliasPolicy.activationAllowed === false &&
+      aliasPolicy.writeAllowed === false && aliasPolicy.telemetryRequired === true &&
+      sameMembers(aliasPolicy.legacyPhysicalIds || [], legacyIds),
+    'roles contract compatibility policy is not closed, read-only, and telemetry-bound',
+  )
+
+  const logicalRoles = policy.logical_roles || {}
+  const resources = policy.resource_set_definitions || {}
+  const groups = policy.mutual_exclusion_groups || {}
+  const schemas = policy.schemas || {}
+  const namedTargetRead = resources['target.named.read'] || {}
+  requireCondition(
+    namedTargetRead.kind === 'assignment-resolved' && namedTargetRead.resolved_by === 'supervisor' &&
+      sameMembers(namedTargetRead.rules || [], ['explicit-path-list', 'read-only', 'no-follow']),
+    'named target read/search resource is not scoped and read-only',
+  )
+  for (const coordinatorPolicy of Object.values(COORDINATOR_TARGET_READ_POLICIES)) {
+    const logicalContract = (rolesContract.roles || [])
+      .find(role => role.id === coordinatorPolicy.logicalRole)
+    requireCondition(
+      logicalContract && sameMembers(logicalContract.permissions?.read || [], coordinatorPolicy.logicalReads) &&
+        (logicalContract.permissions?.write || []).length === 0 &&
+        (logicalContract.permissions?.execute || []).length === 0 &&
+        (logicalContract.writes || []).length === 0,
+      `${coordinatorPolicy.logicalRole} logical coordinator target read/search policy is not least privilege`,
+    )
+  }
+  for (const [schemaId, schema] of Object.entries(schemas)) {
+    requireCondition(schema.$id === `ap://schemas/${schemaId}`, `schema ${schemaId} has a stale or mismatched id`)
+    requireCondition(schema.$schema === 'https://json-schema.org/draft/2020-12/schema', `schema ${schemaId} has an unsupported dialect`)
+  }
+
+  for (const [physicalId, role] of Object.entries(physical)) {
+    requireCondition(/^ap-[a-z0-9-]+$/.test(physicalId), `invalid physical id ${physicalId}`)
+    const logical = logicalRoles[role.logical_role]
+    requireCondition(Boolean(logical), `${physicalId} maps to unknown logical role ${role.logical_role}`)
+    requireCondition(role.logical_version === logical.version, `${physicalId} logical version mismatch`)
+    requireCondition(role.layer === logical.layer, `${physicalId} logical layer mismatch`)
+    requireCondition(Array.isArray(role.supported_modes) && role.supported_modes.length > 0, `${physicalId} has no supported modes`)
+    requireCondition(new Set(role.supported_modes).size === role.supported_modes.length, `${physicalId} repeats a supported mode`)
+    requireCondition(role.supported_modes.includes(role.mode), `${physicalId} primary mode is not supported`)
+    requireCondition(typeof role.activation_allowed === 'boolean', `${physicalId} has no activation policy`)
+    requireCondition(typeof role.telemetry_required === 'boolean', `${physicalId} has no telemetry policy`)
+    requireCondition(['read-only', 'workspace-write'].includes(role.sandbox_mode), `${physicalId} has an unsafe sandbox mode`)
+    requireCondition(Array.isArray(role.allowed_parents) && role.allowed_parents.length > 0, `${physicalId} has no legal parent`)
+    requireCondition(Array.isArray(role.allowed_children), `${physicalId} has no child policy`)
+    requireCondition(new Set(role.allowed_parents).size === role.allowed_parents.length, `${physicalId} repeats a parent`)
+    requireCondition(new Set(role.allowed_children).size === role.allowed_children.length, `${physicalId} repeats a child`)
+    requireCondition(role.can_dispatch === (role.allowed_children.length > 0), `${physicalId} dispatch flag and children disagree`)
+    requireCondition(role.mutual_exclusion_group in groups, `${physicalId} has an unknown seat`)
+    requireCondition(role.input_schema_id in schemas, `${physicalId} has unknown input schema ${role.input_schema_id}`)
+    requireCondition(role.output_schema_id in schemas, `${physicalId} has unknown output schema ${role.output_schema_id}`)
+
+    for (const access of ['read', 'write', 'exclusive']) {
+      const values = role.resource_sets && role.resource_sets[access]
+      requireCondition(Array.isArray(values), `${physicalId} has malformed ${access} resources`)
+      requireCondition(new Set(values).size === values.length, `${physicalId} repeats a ${access} resource`)
+      for (const resource of values) requireCondition(resource in resources, `${physicalId} uses unknown ${access} resource ${resource}`)
+    }
+
+    const exactResourceSet = (actual, expected) =>
+      actual.length === expected.length && expected.every(resource => actual.includes(resource))
+    const exactReadOnlyChecker = physicalId === 'ap-independent-checker' &&
+      role.logical_role === 'independent-checker' && role.sandbox_mode === 'read-only' &&
+      role.activation_allowed === true && role.can_dispatch === false &&
+      role.allowed_parents.length === 1 && role.allowed_parents[0] === 'L0' &&
+      role.compatibility_alias && role.compatibility_alias.enabled === false &&
+      exactResourceSet(role.resource_sets.read, [
+        'request-envelope.read', 'target.named.read', 'prior-results.read',
+      ]) &&
+      exactResourceSet(role.resource_sets.write, []) &&
+      exactResourceSet(role.resource_sets.exclusive, [])
+    const coordinatorTargetPolicy = COORDINATOR_TARGET_READ_POLICIES[physicalId]
+    if (coordinatorTargetPolicy) {
+      requireCondition(
+        role.logical_role === coordinatorTargetPolicy.logicalRole && role.sandbox_mode === 'read-only' &&
+          exactResourceSet(role.resource_sets.read, COORDINATOR_TARGET_READ_RESOURCES) &&
+          exactResourceSet(role.resource_sets.write, []) &&
+          exactResourceSet(role.resource_sets.exclusive, []),
+        `${physicalId} coordinator target read/search policy is not least privilege`,
+      )
+    }
+
+    const allowedWrites = new Set(SAFE_WRITE_SETS[role.logical_role] || [])
+    const allowedExclusive = new Set(SAFE_EXCLUSIVE_SETS[role.logical_role] || [])
+    requireCondition(role.resource_sets.write.every(resource => allowedWrites.has(resource)), `${physicalId} widens writable resources`)
+    requireCondition(role.resource_sets.exclusive.every(resource => allowedExclusive.has(resource)), `${physicalId} widens exclusive resources`)
+    if (role.sandbox_mode === 'workspace-write') {
+      requireCondition(
+        role.resource_sets.write.length > 0 && role.logical_role !== 'independent-checker',
+        `${physicalId} has broad workspace-write authority`,
+      )
+    }
+
+    if (!role.can_dispatch) requireCondition(role.allowed_children.length === 0, `${physicalId} is not closed`)
+    for (const childId of role.allowed_children) {
+      const child = physical[childId]
+      requireCondition(Boolean(child), `${physicalId} has unknown child ${childId}`)
+      requireCondition(child.allowed_parents.includes(physicalId), `${physicalId} -> ${childId} is not reciprocal`)
+    }
+    for (const parentId of role.allowed_parents) {
+      if (parentId === 'L0') continue
+      const parent = physical[parentId]
+      requireCondition(Boolean(parent), `${physicalId} has unknown parent ${parentId}`)
+      requireCondition(parent.allowed_children.includes(physicalId), `${parentId} -> ${physicalId} consumer mismatch`)
+    }
+
+    const alias = role.compatibility_alias || {}
+    if (alias.enabled) {
+      requireCondition(alias.alias_of === 'C0' || alias.alias_of in physical, `${physicalId} has an unknown compatibility target`)
+      requireCondition(Boolean(alias.remove_after), `${physicalId} has no compatibility retirement version`)
+      requireCondition(
+        role.activation_allowed === false && role.telemetry_required === true && role.sandbox_mode === 'read-only' &&
+          !role.can_dispatch && role.allowed_children.length === 0 && role.resource_sets.write.length === 0 &&
+          role.resource_sets.exclusive.length === 0,
+        `${physicalId} compatibility id is not inactive, telemetry-bound, read-only, and closed`,
+      )
+    }
+
+    if (role.logical_role === 'independent-checker') {
+      requireCondition(role.allowed_parents.length === 1 && role.allowed_parents[0] === 'L0', `${physicalId} checker assignment is not L0-owned`)
+      requireCondition(exactReadOnlyChecker, `${physicalId} checker lacks the exact read-only policy`)
+      requireCondition(!role.resource_sets.write.includes('target.owned.write') && !role.resource_sets.write.includes('plan.roadmap.write'), `${physicalId} checker can write the checked result`)
+    }
+  }
+
+  for (const id of canonicalIds) {
+    requireCondition(
+      physical[id].compatibility_alias.enabled === false && physical[id].activation_allowed === true &&
+        physical[id].telemetry_required === false,
+      `${id} is incorrectly marked as a compatibility id`,
+    )
+  }
+  for (const projection of canonicalProjection) {
+    const role = physical[projection.physicalId]
+    requireCondition(role.logical_role === projection.logicalId, `${projection.physicalId} canonical logical id mismatch`)
+    requireCondition(role.layer === projection.layer, `${projection.physicalId} canonical layer mismatch`)
+    requireCondition(
+      JSON.stringify(role.supported_modes) === JSON.stringify(projection.modes),
+      `${projection.physicalId} canonical mode projection mismatch`,
+    )
+  }
+  for (const compatibility of compatibilityAliases) {
+    const role = physical[compatibility.legacyId]
+    requireCondition(role.logical_role === compatibility.logicalId, `${compatibility.legacyId} compatibility logical id mismatch`)
+    requireCondition(
+      role.mode === compatibility.mode && JSON.stringify(role.supported_modes) === JSON.stringify([compatibility.mode]),
+      `${compatibility.legacyId} compatibility mode mismatch`,
+    )
+    requireCondition(
+      role.compatibility_alias.alias_of === CODEX_ALIAS_TARGET_BY_LOGICAL_ROLE[compatibility.logicalId],
+      `${compatibility.legacyId} compatibility target mismatch`,
+    )
+  }
+  const retired = physical['ap-framework-generator']
+  requireCondition(
+    retired.mode === 'compatibility-compiler' && retired.compatibility_alias.enabled === true &&
+      retired.activation_allowed === false && retired.sandbox_mode === 'read-only' && !retired.can_dispatch &&
+      retired.resource_sets.write.length === 0,
+    'runtime framework generation was restored',
+  )
+
+  const managerAdmission = policy.manager_admission || {}
+  const manager = physical['ap-work-group-manager']
+  const rootChildren = canonicalIds.filter(id => id !== 'ap-work-group-manager')
+  requireCondition(
+    policy.control_plane && policy.control_plane.logical_role === 'run-owner' &&
+      sameMembers(policy.control_plane.allowed_children || [], rootChildren) &&
+      !Object.hasOwn(physical, 'ap-run-owner'),
+    'L0 run owner is not bound to the exact provider-root child set',
+  )
+  requireCondition(
+    managerAdmission.selected_role === 'ap-work-group-manager' && managerAdmission.route === 'ROADMAP' &&
+      managerAdmission.plan_path === 'plan/ROADMAP.md' && managerAdmission.parent_role === 'ap-run-coordinator' &&
+      managerAdmission.predicate && managerAdmission.predicate.minimum_useful_workers === 2 &&
+      managerAdmission.predicate.require_pairwise_disjoint_resources === true &&
+      managerAdmission.predicate.reject_single_worker === true &&
+      manager.allowed_parents.length === 1 && manager.allowed_parents[0] === 'ap-run-coordinator' &&
+      manager.allowed_children.length === 1 && manager.allowed_children[0] === 'ap-worker' && manager.can_dispatch === true,
+    'work-group manager admission or topology mismatch',
+  )
+
+  const selection = policy.checker_selection || {}
+  requireCondition(selection.selected_by === 'L0' && selection.unique_mode_per_version === true, 'checker selection is unsafe')
+  requireCondition(selection.combined_mode === 'combined' && Array.isArray(selection.combined_conflicts_with), 'checker combined mode is incomplete')
+  requireCondition(selection.selection_schema_id in schemas, 'checker selection schema is unknown')
+  requireCondition(sameMembers(selection.bound_to || [], ['run_id', 'version_hash']), 'checker selection is not version-bound')
+  requireCondition(sameMembers(selection.combined_conflicts_with, selection.split_modes || []), 'checker split modes and conflicts disagree')
+  requireCondition(sameMembers(selection.split_modes || [], ['review', 'behavior-test']), 'checker split modes are not canonical')
+  requireCondition(
+    sameMembers(selection.separate_named_modes || [], ['technical-decision', 'named-distinct-risk']),
+    'checker named modes are not canonical',
+  )
+  const checker = physical['ap-independent-checker']
+  const modeContracts = selection.mode_contracts || {}
+  requireCondition(sameMembers(Object.keys(modeContracts), checker.supported_modes), 'checker mode contracts do not cover the canonical physical role')
+  const checkerRights = new Set()
+  for (const [mode, contract] of Object.entries(modeContracts)) {
+    requireCondition(Array.isArray(contract.decision_authority) && contract.decision_authority.length > 0, `checker ${mode} has no decision authority`)
+    requireCondition(contract.mutual_exclusion_group in groups, `checker ${mode} has an unknown seat`)
+    for (const right of contract.decision_authority) {
+      requireCondition(!checkerRights.has(right), `checker ${mode} repeats decision authority ${right}`)
+      checkerRights.add(right)
+    }
+  }
+  requireCondition(sameMembers(checker.decision_rights, checkerRights), 'checker physical role decision rights do not match its modes')
+  const checkerAssignment = schemas['assignment.checker.v2'] || {}
+  requireCondition(
+    checkerAssignment.properties && checkerAssignment.properties.role_id &&
+      checkerAssignment.properties.role_id.const === 'ap-independent-checker' &&
+      sameMembers(checkerAssignment.properties.mode.enum || [], checker.supported_modes) &&
+      (checkerAssignment.oneOf || []).every(branch => branch.properties &&
+        branch.properties.role_id && branch.properties.role_id.const === 'ap-independent-checker'),
+    'checker assignment schema restores a compatibility physical id',
+  )
+  const checkerSelection = schemas['assignment.checker-selection.v2'] || {}
+  const checkerItems = checkerSelection.properties && checkerSelection.properties.assignments &&
+    checkerSelection.properties.assignments.items
+  requireCondition(
+    checkerItems && checkerItems.properties && checkerItems.properties.role_id &&
+      checkerItems.properties.role_id.const === 'ap-independent-checker' &&
+      (checkerItems.oneOf || []).every(branch => branch.properties &&
+        branch.properties.role_id && branch.properties.role_id.const === 'ap-independent-checker'),
+    'checker selection schema restores a compatibility physical id',
+  )
+  const managerAssignment = schemas['assignment.manager.v2'] || {}
+  requireCondition(
+    managerAssignment.properties && managerAssignment.properties.role_id &&
+      managerAssignment.properties.role_id.const === 'ap-work-group-manager' &&
+      managerAssignment.properties.logical_role && managerAssignment.properties.logical_role.const === 'ap-work-group-manager',
+    'manager assignment schema restores the legacy manager id',
+  )
+  return policy
+}
+
+function renderCodexPolicyAgent(physicalId, role, rolesContract, policy, plainLanguage, overlays = {}) {
+  const logical = (rolesContract.roles || []).find(entry => entry.id === role.logical_role)
+  const compatibility = (rolesContract.compatibilityAliases || []).find(entry => entry.legacyId === physicalId)
+  requireCondition(Boolean(logical || compatibility), `${physicalId} has no canonical logical role source`)
+  const guard = policy.instruction_guards.untrusted_input.required_prompt_text
+  const description = normalizePlainLanguageMarkdown(
+    logical?.humanDescription || `Provide the registered read-only compatibility behavior for mode ${compatibility.mode}.`,
+    plainLanguage,
+  ).trim()
+  const readResources = role.resource_sets.read.length ? role.resource_sets.read.map(value => `\`${value}\``).join(', ') : 'none'
+  const writeResources = role.resource_sets.write.length ? role.resource_sets.write.map(value => `\`${value}\``).join(', ') : 'none'
+  const exclusiveResources = role.resource_sets.exclusive.length ? role.resource_sets.exclusive.map(value => `\`${value}\``).join(', ') : 'none'
+  const instructions = [
+    '# Codex role instructions',
+    '',
+    description,
+    '',
+    guard,
+    '',
+    `Policy layer: \`${role.layer}\`. Allowed parents: ${role.allowed_parents.map(value => `\`${value}\``).join(', ')}.`,
+    `Decision rights: ${role.decision_rights.map(value => `\`${value}\``).join(', ')}.`,
+    `Accept only a validated \`${role.input_schema_id}\` assignment from an allowed parent. Return the exact \`${role.output_schema_id}\` result.`,
+    `Read resources: ${readResources}. Write resources: ${writeResources}. Exclusive resources: ${exclusiveResources}. Do not use any unlisted resource.`,
+  ]
+  if (role.can_dispatch) {
+    instructions.push(`You may start only these registered child roles: ${role.allowed_children.map(value => `\`${value}\``).join(', ')}.`)
+  } else if (role.compatibility_alias && role.compatibility_alias.enabled) {
+    instructions.push('You cannot start another agent or write files. Do not edit or change the requested result.')
+  } else {
+    instructions.push('Do not start another agent. Stay within the assignment-owned resources above.')
+  }
+  if (role.compatibility_alias && role.compatibility_alias.enabled) {
+    instructions.push('This compatibility identifier is read-only and cannot be activated as a new version 2 role.')
+  }
+  if (overlays.routeExamples) instructions.push('', overlays.routeExamples)
+  for (const requirement of overlays.promptRequirements || []) {
+    instructions.push('', normalizePlainLanguageMarkdown(requirement, plainLanguage).trim())
+  }
+  let developerInstructions = instructions.join('\n').replace(/\n+$/, '')
+  if (role.compatibility_alias && role.compatibility_alias.enabled &&
+      !developerInstructions.includes(CODEX_ALIAS_TELEMETRY_INSTRUCTION)) {
+    developerInstructions = `${developerInstructions.replace(/\n+$/, '')}\n\n${CODEX_ALIAS_TELEMETRY_INSTRUCTION}`
+  }
+  if (!role.compatibility_alias.enabled) {
+    const modeInstruction = `Canonical policy modes: ${role.supported_modes.map(mode => `\`${mode}\``).join(', ')}.`
+    if (!developerInstructions.includes(modeInstruction)) {
+      developerInstructions = `${developerInstructions.replace(/\n+$/, '')}\n\n${modeInstruction}`
+    }
+  }
+
+  return [
+    `sandbox_mode = ${tomlBasicString(role.sandbox_mode)}`,
+    `name = ${tomlBasicString(physicalId)}`,
+    `description = ${tomlBasicString(description)}`,
+    '',
+    'developer_instructions = """',
+    developerInstructions,
+    '"""',
+    '',
+  ].join('\n')
+}
+
+function appendCompiledSection(source, rendered) {
+  return `${source.replace(/\n+$/, '')}\n\n${rendered.replace(/\n+$/, '')}\n`
+}
+
+function renderCodexSkill(contracts, canonical, routeExamples) {
+  const body = normalizePlainLanguageMarkdown(canonical, contracts.plainLanguage).trim()
+  return [
+    '---',
+    'name: autoprompt',
+    "description: 'Explicit-only Codex runtime projection of the Autoprompt contracts.'",
+    'activation: explicit-only',
+    'allow-implicit-invocation: false',
+    '---',
+    '',
+    '# Autoprompt for Codex',
+    '',
+    `Start only through \`${CODEX_ACTIVATION_SYNTAX.externalCommand}\` or the exact internal skill envelope \`${CODEX_ACTIVATION_SYNTAX.internalSkillEnvelope}\`.`,
+    `\`${CODEX_ACTIVATION_SYNTAX.unsupportedSlashCommand}\` is not a supported Codex command. Return \`${CODEX_ACTIVATION_SYNTAX.unsupportedCode}\`. Do not treat the slash form as activation.`,
+    'There is no default route.',
+    '',
+    body,
+    '',
+    routeExamples.replace(/\n+$/, ''),
+    '',
+  ].join('\n')
+}
+
+function renderCodexModes(contracts, registry) {
+  const lines = [
+    '# Codex work structures',
+    '',
+    `Generated from ${registry.canonicalInputs.modes.map(value => `\`${value}\``).join(', ')}. There is no default route.`,
+  ]
+  for (const route of contracts.product.product.routeNames) {
+    const definition = contracts.routes.routes[route]
+    lines.push(
+      '',
+      `## ${route}`,
+      '',
+      `- Planning record: \`${definition.planningFile}\`.`,
+      `- Coordinator allowed: \`${Boolean(definition.coordinatorAllowed)}\`.`,
+      `- Manager allowed: \`${Boolean(definition.managerAllowed || definition.managerAdmission)}\`.`,
+      `- Independent checker minimum: \`${definition.checkerRange.min}\`.`,
+    )
+  }
+  return `${lines.join('\n')}\n`
+}
+
+function validateCodexViews(contracts, root = ROOT) {
+  const registry = loadCodexPackageRegistry(root)
+  const sources = [
+    registry.canonicalInputs.conductor,
+    registry.canonicalInputs.gates,
+    registry.canonicalInputs.playbooks,
+    registry.canonicalInputs.rolePolicy,
+    registry.canonicalInputs.personas,
+    ...registry.canonicalInputs.modes,
+  ]
+  for (const relativePath of sources) {
+    requireCondition(fs.existsSync(path.join(root, relativePath)), `Codex canonical source is missing: ${relativePath}`)
+  }
+  requireCondition(registry.canonicalInputs.conductor === 'agents/contracts/generic.md', 'Codex conductor source is not canonical')
+  requireCondition(registry.canonicalInputs.frameworks === 'agents/contracts/frameworks', 'Codex framework source is not canonical')
+  requireCondition(registry.canonicalInputs.personas === 'agents/contracts/personas', 'Codex role source is not canonical')
+  const frameworkDirectory = path.join(root, registry.canonicalInputs.frameworks)
+  const frameworks = fs.readdirSync(frameworkDirectory)
+    .filter(name => name.endsWith('.md'))
+    .sort()
+  const frameworkRoutes = codexFrameworkRoutes(root)
+  requireCondition(sameMembers(frameworks, Object.keys(frameworkRoutes)), 'Codex canonical framework source mismatch')
+  return Object.freeze({ registry, frameworks, frameworkRoutes })
+}
+
+function renderCodexReadme(contracts, frameworkCount) {
+  const physicalRoleCount = Object.keys(contracts.rolePolicy.physical_roles).length
+  return [
+    '# Codex package',
+    '',
+    '- [`SKILL.md`](SKILL.md): L0 coordinator prompt',
+    `- [\`agents\`](agents/): ${physicalRoleCount} physical Codex TOML roles`,
+    `- [\`frameworks\`](frameworks/): ${frameworkCount} task and check workflows`,
+    '- [`workflow`](workflow/): role casting, profile binding, budgeting, and supervisors',
+    '- [`GATES.md`](GATES.md), [`MODES.md`](MODES.md), [`PLAYBOOKS.md`](PLAYBOOKS.md): execution contracts',
+    '',
+    'The committed TOMLs inherit the session model. Installation can recast the same roles with the selected model and effort configuration.',
+    '',
+    'Internal roles remain inside one immutable generation-qualified private bundle. Ordinary review and merge requests do not load Autoprompt or any companion review skill. Start work only through exact explicit activation:',
+    '',
+    '```bash',
+    'autoprompt activate codex --target <absolute-project-path> -- <request>',
+    '```',
+    '',
+    'The launcher verifies the exact installed payload, request envelope, role projection, workspace-write profile, and separate read-only checker profile before starting the supervisor.',
+    '',
+  ].join('\n')
+}
+
+function renderCodexOutputs(root = ROOT) {
+  const contracts = loadCodexV2Contracts(root)
+  const views = validateCodexViews(contracts, root)
+  const registry = views.registry
+  const outputs = new Map()
+  const gatesSha256 = sha256Text(read(registry.canonicalInputs.gates, root))
+  const routesSha256 = sha256Text(read('agents/contracts/routes.json', root))
+  const routeExamples = renderCompiledRouteExamples(contracts.routes, routesSha256)
+  const physicalIds = Object.keys(contracts.rolePolicy.physical_roles).sort()
+  for (const physicalId of physicalIds) {
+    const relativePath = `${registry.generatedOutputs.agents}/${physicalId}.toml`
+    outputs.set(relativePath, renderCodexPolicyAgent(
+      physicalId,
+      contracts.rolePolicy.physical_roles[physicalId],
+      contracts.roles,
+      contracts.rolePolicy,
+      contracts.plainLanguage,
+      {
+        ...(physicalId === 'ap-route-analyst' ? { routeExamples } : {}),
+        promptRequirements: registry.promptRequirements?.[physicalId] || [],
+      },
+    ))
+  }
+  outputs.set(registry.generatedOutputs['SKILL.md'], renderCodexSkill(
+    contracts,
+    read(registry.canonicalInputs.conductor, root),
+    routeExamples,
+  ))
+  outputs.set(registry.generatedOutputs['GATES.md'], [
+    '# Canonical checks for Codex',
+    '',
+    `Generated from \`${registry.canonicalInputs.gates}\`.`,
+    '',
+    renderFullCompiledGates(contracts.gates, gatesSha256).replace(/\n+$/, ''),
+    '',
+  ].join('\n'))
+  outputs.set(registry.generatedOutputs['MODES.md'], renderCodexModes(contracts, registry))
+  outputs.set(registry.generatedOutputs['PLAYBOOKS.md'], normalizePlainLanguageMarkdown(
+    read(registry.canonicalInputs.playbooks, root),
+    contracts.plainLanguage,
+  ))
+  outputs.set(registry.generatedOutputs['README.md'], normalizePlainLanguageMarkdown(
+    renderCodexReadme(contracts, views.frameworks.length), contracts.plainLanguage,
+  ))
+  const sharedFrameworks = renderSharedFrameworkOutputs(root, contracts.plainLanguage)
+  for (const file of views.frameworks) {
+    const relativePath = `${registry.generatedOutputs.frameworks}/${file}`
+    outputs.set(relativePath, appendCompiledSection(
+      sharedFrameworks.get(`${registry.canonicalInputs.frameworks}/${file}`),
+      renderFrameworkCompiledGates(contracts.gates, gatesSha256, views.frameworkRoutes[file]),
+    ))
+  }
+  const packageVersion = readCodexPackageVersion(root)
+  outputs.set(registry.generatedOutputs.version, `${packageVersion}\n`)
+  validateFullCompiledGates(outputs.get(registry.generatedOutputs['GATES.md']), contracts.gates, gatesSha256)
+  validateFrameworkGateProjections(outputs, contracts.gates, gatesSha256, views.frameworkRoutes)
+  validateCompiledRouteExamples(outputs.get(registry.generatedOutputs['SKILL.md']), contracts.routes, routesSha256, 'Codex L0 prompt')
+  validateCompiledRouteExamples(outputs.get(`${registry.generatedOutputs.agents}/ap-route-analyst.toml`), contracts.routes, routesSha256, 'Codex route analyst prompt')
+  validateGeneratedPlainLanguage(outputs, contracts.plainLanguage)
+  return outputs
 }
 
 function opencodePermissionLines(capabilities) {
@@ -221,15 +1906,15 @@ function renderVsCodeProviderText(file, source, provider) {
   return asciiDashes(source)
 }
 
-function renderVsCodeReadme(provider) {
+function renderVsCodeReadme(provider, inventory) {
   return [
     '# VS Code package',
     '',
     'This deterministic adapter targets VS Code 1.133 custom agents with the bundled GitHub Copilot 0.61 contract.',
     '',
     '- [`SKILL.md`](SKILL.md): L0 conductor prompt',
-    '- [`agents`](agents/): 25 native `.agent.md` internal roles',
-    '- [`frameworks`](frameworks/): 18 task and gate workflows',
+    `- [\`agents\`](agents/): ${inventory.personaCount} native \`.agent.md\` internal roles`,
+    `- [\`frameworks\`](frameworks/): ${inventory.frameworkCount} task and gate workflows`,
     '- [`GATES.md`](GATES.md), [`MODES.md`](MODES.md), and [`PLAYBOOKS.md`](PLAYBOOKS.md): execution contracts',
     '',
     renderVsCodeSettingsDisclosure(provider),
@@ -499,7 +2184,7 @@ function renderInheritedProviderText(file, source, provider) {
   return output.replace(/\n+$/, '\n')
 }
 
-function renderInheritedProviderReadme(provider) {
+function renderInheritedProviderReadme(provider, inventory) {
   const settings = INHERITED_PROVIDER_TEXT[provider]
   return [
     `# ${settings.display} package`,
@@ -508,9 +2193,9 @@ function renderInheritedProviderReadme(provider) {
     '',
     '- [`SKILL.md`](SKILL.md): L0 conductor prompt',
     provider === 'reasonix'
-      ? '- [`skills`](skills/): 25 native subagent profiles'
-      : '- [`agents`](agents/): 25 generated role definitions',
-    '- [`frameworks`](frameworks/): 18 task and gate workflows',
+      ? `- [\`skills\`](skills/): ${inventory.personaCount} native subagent profiles`
+      : `- [\`agents\`](agents/): ${inventory.personaCount} generated role definitions`,
+    `- [\`frameworks\`](frameworks/): ${inventory.frameworkCount} task and gate workflows`,
     '- [`GATES.md`](GATES.md), [`MODES.md`](MODES.md), and [`PLAYBOOKS.md`](PLAYBOOKS.md): execution contracts',
     '',
     settings.activation,
@@ -765,10 +2450,10 @@ function renderPrimeSkill(frameworks, canonicalProtocol) {
     '',
     'Before spawning, resolve only undefined operator knobs:',
     '',
-    '- **Concurrency:** `tokensaver`, `wide`, or `custom max_subs=N`.',
+    '- **Concurrency:** `tokensaver` (width-only compatibility preset, at most 6), `wide`, or `custom max_subs=N`.',
     '- **Agent selection:** `off`/inherit only. Confirm that every child inherits the already-selected parent model; no per-child model routing selector is available.',
     '',
-    'In an attended session, ask all undefined knobs in one question before repository/tool work. In an unattended supervisor run, default missing concurrency to `tokensaver` and agent selection to `off`, then record both assumptions.',
+    'Resolve settings in this order: explicit invocation, active run, then saved settings. In an attended session, ask once for any required value still missing. In an unattended run, or when the attended answer is still incomplete, return `CONFIG_REQUIRED` before repository or tool work. Do not silently choose a concurrency, model, or effort value.',
     '',
     'After the chooser, use the native dispatcher to start `ap-scope-coordinator`.',
     '',
@@ -1113,8 +2798,12 @@ async def run(
 `
 }
 
-function renderOutputs(root = ROOT) {
+function renderLegacyOutputs(root = ROOT) {
   const contract = JSON.parse(read('agents/contracts/autoprompt.contract.json', root))
+  const inventory = Object.freeze({
+    frameworkCount: contract.frameworks.length,
+    personaCount: contract.personas.length,
+  })
   const outputs = new Map()
   const personaIds = new Set(contract.personas.map(persona => persona.id))
   const personaSources = contract.personas.map(persona => read(persona.source, root))
@@ -1170,7 +2859,7 @@ function renderOutputs(root = ROOT) {
       renderVsCodeProviderText(file, read(`agents/opencode/${file}`, root), contract.providers.vscode),
     )
   }
-  outputs.set('agents/vscode/README.md', renderVsCodeReadme(contract.providers.vscode))
+  outputs.set('agents/vscode/README.md', renderVsCodeReadme(contract.providers.vscode, inventory))
 
   for (const provider of ['omp', 'deepseek', 'reasonix']) {
     for (const file of ['SKILL.md', 'GATES.md', 'MODES.md', 'PLAYBOOKS.md']) {
@@ -1179,7 +2868,7 @@ function renderOutputs(root = ROOT) {
         renderInheritedProviderText(file, read(`agents/opencode/${file}`, root), provider),
       )
     }
-    outputs.set(`agents/${provider}/README.md`, renderInheritedProviderReadme(provider))
+    outputs.set(`agents/${provider}/README.md`, renderInheritedProviderReadme(provider, inventory))
   }
   outputs.set(
     'agents/deepseek/agent-preset/agent.cordis.yml',
@@ -1187,7 +2876,7 @@ function renderOutputs(root = ROOT) {
   )
   outputs.set('agents/deepseek/agent-preset/preset.yml', [
     'name: Autoprompt',
-    'description: Useful-first orchestration with 25 fixed-persona subagent tools.',
+    `description: Useful-first orchestration with ${inventory.personaCount} fixed-persona subagent tools.`,
     '',
   ].join('\n'))
   outputs.set(
@@ -1216,6 +2905,15 @@ function renderOutputs(root = ROOT) {
   return outputs
 }
 
+function renderOutputs(root = ROOT) {
+  const outputs = renderLegacyOutputs(root)
+  for (const relativePath of [...outputs.keys()]) {
+    if (relativePath.startsWith('agents/codex/')) outputs.delete(relativePath)
+  }
+  for (const [relativePath, content] of renderCodexOutputs(root)) outputs.set(relativePath, content)
+  return outputs
+}
+
 function differingOutputs(outputs, root = ROOT) {
   const differing = []
   for (const [relativePath, expected] of outputs) {
@@ -1230,11 +2928,17 @@ function differingOutputs(outputs, root = ROOT) {
 
 function run(argv, root = ROOT, io = process) {
   const check = argv.includes('--check')
-  if (argv.some(argument => argument !== '--check')) {
-    io.stderr.write('generate-provider-contracts: only --check is supported\n')
+  const codexOnly = argv.includes('--codex-only')
+  if (argv.some(argument => !['--check', '--codex-only'].includes(argument))) {
+    io.stderr.write('generate-provider-contracts: only --check and --codex-only are supported\n')
     return 2
   }
-  const outputs = renderOutputs(root)
+  // Codex-first v2 phase: only the validated Codex projection is active. The
+  // legacy renderer remains an API for the eight unchanged provider trees.
+  const outputs = renderCodexOutputs(root)
+  if (!codexOnly) {
+    for (const [relativePath, content] of renderSharedFrameworkOutputs(root)) outputs.set(relativePath, content)
+  }
   const differing = differingOutputs(outputs, root)
   if (check) {
     if (differing.length) {
@@ -1252,8 +2956,25 @@ function run(argv, root = ROOT, io = process) {
 if (require.main === module) process.exitCode = run(process.argv.slice(2))
 
 module.exports = {
+  CODEX_ACTIVATION_SYNTAX,
+  codexFrameworkRoutes,
+  codexUserFacingLanguageViolations,
+  compiledGateDefinitions,
+  compiledGateGraphs,
   differingOutputs,
+  loadCodexPackageRegistry,
+  loadCodexV2Contracts,
+  plainLanguageViolations,
+  parseCompiledRouteExamples,
+  parseFrameworkCompiledGates,
+  parseFullCompiledGates,
+  providerProjectionPlan,
   renderCodexAgent,
+  renderCodexOutputs,
+  renderCodexPolicyAgent,
+  renderCompiledRouteExamples,
+  renderFrameworkCompiledGates,
+  renderFullCompiledGates,
   renderKiloProfile,
   renderKiloProviderText,
   renderDeepSeekAgent,
@@ -1264,15 +2985,28 @@ module.exports = {
   renderOmpAgent,
   renderOpencodeAgent,
   renderOutputs,
+  renderLegacyOutputs,
   renderPrimeDispatcher,
   renderPrimeExtension,
   renderPrimePackage,
   renderPrimePyproject,
   renderPrimeSkill,
   renderReasonixAgent,
+  renderSharedFrameworkOutputs,
   renderVsCodeAgent,
   renderVsCodeProviderText,
   renderVsCodeReadme,
   run,
+  validateCodexRolePolicy,
+  validateCodexUserFacingLanguage,
+  validateCodexViews,
+  validateFrameworkReferences,
+  validateCanonicalAndSharedPlainLanguage,
+  validateCompatibilityAliasContract,
+  validateCompiledRouteExamples,
+  validateFrameworkGateProjections,
+  validateFullCompiledGates,
+  validateGeneratedPlainLanguage,
+  normalizePlainLanguageMarkdown,
   writeAtomic,
 }

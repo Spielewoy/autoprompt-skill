@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.dev/schemas/benchmark-mechanism-evidence.v1.json",
+  "title": "Codex low-compute mechanism evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "generatedAt", "evidenceClass", "provider", "qualityClaimEligible", "comparisonClaimEligible", "reason", "source", "task", "attempts", "mechanismVerified", "realCodex", "checksum"],
+  "properties": {
+    "schemaVersion": { "const": "codex-mechanism-evidence.v1" },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "evidenceClass": { "const": "harness-mechanics-only" },
+    "provider": { "const": "codex" },
+    "qualityClaimEligible": { "const": false },
+    "comparisonClaimEligible": { "const": false },
+    "reason": { "$ref": "#/$defs/nonEmpty" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baselineSha", "candidateSha"],
+      "properties": { "baselineSha": { "$ref": "#/$defs/commit" }, "candidateSha": { "$ref": "#/$defs/commit" } }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["taskId", "route", "repetitions", "fixture", "baselineFocusedCheck"],
+      "properties": {
+        "taskId": { "$ref": "#/$defs/nonEmpty" },
+        "route": { "const": "DIRECT" },
+        "repetitions": { "const": 1 },
+        "fixture": { "$ref": "#/$defs/tree" },
+        "baselineFocusedCheck": { "$ref": "#/$defs/focusedCheck" }
+      }
+    },
+    "attempts": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "$ref": "#/$defs/attempt" } },
+    "mechanismVerified": { "type": "boolean" },
+    "realCodex": { "$ref": "#/$defs/realCodex" },
+    "checksum": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "commit": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "nullableString": { "oneOf": [{ "type": "null" }, { "type": "string", "minLength": 1 }] },
+    "nullableInteger": { "oneOf": [{ "type": "null" }, { "type": "integer" }] },
+    "processResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exitCode", "signal", "errorCode", "stdoutObserved", "stderrObserved"],
+      "properties": {
+        "exitCode": { "$ref": "#/$defs/nullableInteger" },
+        "signal": { "$ref": "#/$defs/nullableString" },
+        "errorCode": { "$ref": "#/$defs/nullableString" },
+        "stdoutObserved": { "type": "boolean" },
+        "stderrObserved": { "type": "boolean" }
+      }
+    },
+    "focusedCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv", "exitCode", "signal", "errorCode", "stdoutObserved", "stderrObserved"],
+      "properties": {
+        "argv": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/nonEmpty" } },
+        "exitCode": { "$ref": "#/$defs/nullableInteger" },
+        "signal": { "$ref": "#/$defs/nullableString" },
+        "errorCode": { "$ref": "#/$defs/nullableString" },
+        "stdoutObserved": { "type": "boolean" },
+        "stderrObserved": { "type": "boolean" }
+      }
+    },
+    "tree": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "files"],
+      "properties": { "sha256": { "$ref": "#/$defs/sha256" }, "files": { "type": "integer", "minimum": 1 } }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["armId", "role", "sourceSha", "sourceBinding", "executionKind", "terminalState", "producer", "focusedCheck", "outputTree"],
+      "properties": {
+        "armId": { "enum": ["base", "current", "redesign"] },
+        "role": { "enum": ["single-agent-base", "frozen-current-autoprompt", "codex-redesign"] },
+        "sourceSha": { "$ref": "#/$defs/commit" },
+        "sourceBinding": { "const": "declared-existing-commit-not-executed" },
+        "executionKind": { "const": "deterministic-fixture-runner" },
+        "terminalState": { "enum": ["PASS", "FAIL"] },
+        "producer": { "$ref": "#/$defs/processResult" },
+        "focusedCheck": { "$ref": "#/$defs/focusedCheck" },
+        "outputTree": { "$ref": "#/$defs/tree" }
+      }
+    },
+    "realCodex": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "phase", "code", "reason", "evidencePath", "evidenceSha256", "observationKind"],
+      "properties": {
+        "status": { "const": "BLOCKED" },
+        "phase": { "const": "pre-route" },
+        "code": { "const": "PROVIDER_UNSUPPORTED" },
+        "reason": { "$ref": "#/$defs/nonEmpty" },
+        "evidencePath": { "$ref": "#/$defs/nonEmpty" },
+        "evidenceSha256": { "$ref": "#/$defs/sha256" },
+        "observationKind": { "const": "carried-forward-not-rerun" }
+      }
+    }
+  }
+}

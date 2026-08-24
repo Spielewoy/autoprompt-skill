@@ -1,11 +1,8 @@
-<p align="center">
-  <img src="../../assets/i18n/ko/banner.svg" alt="Autoprompt Skill: 에이전트 코딩 작업 실패 45% 감소" width="760"/>
-</p>
+<h1 align="center">Autoprompt</h1>
 
-<p align="center">Autoprompt는 에이전트 코딩 작업의 실패를 45% 줄인 코딩 에이전트 스킬입니다.</p>
+<p align="center">Autoprompt는 명시적 라우팅, 제한된 위임, 근거 기반 검사를 제공하는 코딩 에이전트 스킬입니다.</p>
 
 <p align="center">
-  <a href="#벤치마크"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%EC%A0%90-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1: 14.61점 향상"/></a>
   <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%EB%B2%84%EC%A0%84&color=255C60&labelColor=14101F" alt="버전: v1.0.4"/></a>
   <a href="#설치"><img src="https://img.shields.io/badge/%EC%A7%80%EC%9B%90-9-255C60?style=flat-square&labelColor=14101F" alt="지원: 9"/></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/%EB%9D%BC%EC%9D%B4%EC%84%A0%EC%8A%A4-MIT-255C60?style=flat-square&labelColor=14101F" alt="라이선스: MIT"/></a>
@@ -69,7 +66,7 @@ autoprompt
 | 상태 | 코딩 도구 | 검증 기준 | 키 |
 |---|---|---|---|
 | 지원 | [Claude Code](https://code.claude.com/docs/en/setup) | 2.1.219+; 2.1.233 검증 완료 | `claude` |
-| 지원 | [Codex](https://github.com/openai/codex) | 서브에이전트 지원 빌드; 0.147.0 검증 완료 | `codex` |
+| 지원 | [Codex](https://github.com/openai/codex) | 서브에이전트 지원 빌드; 현재 v2 작업은 0.148.0에서 검증 | `codex` |
 | 지원 | [OpenCode](https://opencode.ai/docs/agents) | 1.18.7+; 1.18.18 검증 완료 | `opencode` |
 | 지원 | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; 7.4.22 검증 완료 | `kilo` |
 | 지원 | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; VS Code 1.133.0 및 Copilot 0.61.0 검증 완료 | `vscode` |
@@ -93,48 +90,28 @@ autoprompt
 
 ## 벤치마크
 
-<p align="center">
-  <img src="../../assets/i18n/ko/terminal-bench-2.1-leaderboard.svg" width="1000" alt="Terminal-Bench 2.1 순위표: Artificial Analysis 참조 점수 18개와 Autoprompt 사용 전후의 DeepSeek V4 Flash 0731 실측 점수."/>
-</p>
-
-<details>
-<summary><strong>직접 측정한 OpenCode 비교</strong></summary>
-
-<p align="center">
-  <img src="../../assets/i18n/ko/terminal-bench-2.1.svg" width="900" alt="Terminal-Bench 2.1의 OpenCode 1.18.7 결과: OpenCode는 89개 중 60개, Autoprompt를 사용한 OpenCode는 73개를 해결했습니다."/>
-</p>
-
-| 실행 | 해결 수 | 점수 | 실패 수 |
-|---|---:|---:|---:|
-| OpenCode | 60/89 | 67.42% | 29 |
-| **OpenCode + Autoprompt** | **73/89** | **82.02%** | **16** |
-| **변화** | **+13개 해결** | **+14.61점** | **45% 감소** |
-
-</details>
-
-DeepSeek의 82.7%는 자체 테스트 설정에서 나온 결과이므로 직접 비교할 수 있는 세 번째 실행이 아닙니다. [테스트 설정과 근거 범위](../benchmarks/terminal-bench-2.1.md)를 확인하거나 [새 벤치마크를 요청](https://github.com/Spielewoy/autoprompt-skill/issues/new?template=benchmark_request.md)하세요.
-
-<details>
-<summary><strong>예상 비용:</strong> 시간은 약 3x, 토큰은 약 2x입니다.</summary>
-
-시간과 토큰 로그를 남기지 않았으므로, 이 수치는 실측 벤치마크가 아니라 사용자 경험을 바탕으로 한 계획용 추정치입니다. 실제 측정에서는 실패가 29개에서 16개로 줄었고(45% 감소), 실수가 약 절반으로 줄어든 셈입니다(약 2x 개선). 아주 작은 작업에서는 결과가 크게 다를 수 있습니다.
-
-</details>
+Autoprompt는 현재 재현 가능한 성능 또는 비용 주장을 하지 않습니다. 과거 비교에는 재구성에 필요한 아티팩트와 텔레메트리가 보존되지 않았습니다. [보관된 근거의 한계](../benchmarks/terminal-bench-2.1.md)를 참고하세요. 향후 주장은 서명된 벤치마크 근거 파이프라인에서 생성되어야 합니다.
 
 ## 호출 구조
 
 <p align="center">
-  <a href="../../assets/i18n/ko/anatomy.svg"><img src="../../assets/i18n/ko/anatomy.svg" alt="Autoprompt 호출 구조: 트리거, 동시 실행 모드, 에이전트 상한, 모델 라우팅, 목표" width="1000"/></a>
+  <a href="../../assets/i18n/ko/anatomy.svg"><img src="../../assets/i18n/ko/anatomy.svg" alt="Autoprompt 호출 구조: 트리거, 동시 실행 모드, 에이전트 상한, 모델 라우팅, 목표, 개발 중인 Codex v2 path 제어" width="1000"/></a>
 </p>
 
 ## 실행 제어
 
-`mode=`로 동시 실행을 설정하고, 호스트가 지원하면 `agents=`로 모델을 라우팅하세요.
+<!-- codex-v2-release-status: local-v1.0.9-build-not-published -->
+> Codex v2 `path=` 상태: 로컬 v1.0.9 빌드이며 아직 게시되지 않았습니다.
+
+`mode=`로 동시 실행을 설정하고, 호스트가 지원하면 `agents=`로 모델을 라우팅하세요. 로컬 Codex v2 빌드에서는 선택 사항인 `path=` 제어도 사용할 수 있습니다.
 
 | 제어 | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 사용자 지정 `agents=` 라우팅 | ✓ | ✓ | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 |
+| `path=` 작업 경로 | - | 로컬 v1.0.9 빌드; 미게시 | - | - | - | - | - | - | - |
+
+Codex v2에서는 요청 맨 앞에 `path=auto|direct|light|roadmap`을 넣으세요. 예: `autoprompt activate codex -- path=direct <목표>`. `path=`를 생략하면 `path=auto`와 같으며 자동 선택을 유지합니다. 명시적 경로는 경로 분석 및 선택을 위한 모델 작업을 건너뛰지만 안전·권한 검사, 경로별 결과물, 실행, 독립 검증은 건너뛰지 않습니다. 잘못되거나 충돌하거나 사용할 수 없는 선택은 다른 경로로 조용히 바꾸지 않고 안전하게 실패합니다.
 
 ## 작동 방식
 
@@ -156,8 +133,9 @@ DeepSeek의 82.7%는 자체 테스트 설정에서 나온 결과이므로 직접
 | 구축 | `/autoprompt mode=wide API부터 결제까지 예약 흐름을 구축해 줘` |
 | 조사 | `/autoprompt 이 코드베이스에 맞는 작업 큐를 비교하고 하나를 추천해 줘` |
 | 동시 실행 제한 | `/autoprompt mode=custom max_subs=4 모든 모델을 마이그레이션해 줘` |
+| 개발 중인 Codex v2 경로 테스트 | `autoprompt activate codex -- path=light 재시도 동작을 추가하고 경계 사례를 검사해 줘` |
 
-Codex에서는 `/autoprompt` 대신 `$autoprompt`를 사용하세요. Oh My Pi에서는 `/skill:autoprompt`를 사용하세요.
+Codex v2에서는 `autoprompt activate codex -- <목표>`를 실행하세요. 런처가 비공개 `$autoprompt` 봉투를 내부에서 주입합니다. Oh My Pi에서는 `/skill:autoprompt`를 사용하세요.
 
 ## 자주 묻는 질문
 
@@ -183,16 +161,16 @@ Codex에서는 `/autoprompt` 대신 `$autoprompt`를 사용하세요. Oh My Pi�
 </details>
 
 <details>
-<summary><strong>`mode`, `max_subs`, `agents`는 무엇을 제어하나요?</strong></summary>
+<summary><strong>`mode`, `max_subs`, `agents`, `path`는 무엇을 제어하나요?</strong></summary>
 
-`mode=tokensaver`는 활성 서브에이전트를 6개로 제한하고, `mode=wide`는 준비된 모든 작업을 엽니다. `mode=custom max_subs=N`은 사용자 지정 상한을 정하며, `agents`는 호스트가 지원할 때 모델 라우팅을 제어합니다. [자세히 보기](../faq/tokensaver-vs-wide-vs-custom.md)
+`mode=tokensaver`는 활성 서브에이전트를 6개로 제한하고, `mode=wide`는 준비된 모든 작업을 엽니다. `mode=custom max_subs=N`은 사용자 지정 상한을 정하며, `agents`는 호스트가 지원할 때 모델 라우팅을 제어합니다. 개발 중인 Codex v2의 `path`는 작업 경로를 선택 사항으로 고정하며, 생략하면 자동 선택이 유지됩니다. [자세히 보기](../faq/tokensaver-vs-wide-vs-custom.md)
 
 </details>
 
 <details>
 <summary><strong>Autoprompt가 백그라운드에서 시작되지 않는 이유는 무엇인가요?</strong></summary>
 
-비용, 시간, 작업 흐름이 달라지기 때문입니다. `/autoprompt <목표>`로 명시적으로 시작하고, Codex에서는 `$autoprompt`를 사용하세요.
+비용, 시간, 작업 흐름이 달라지기 때문입니다. 호환 호스트에서는 `/autoprompt <목표>`로, Codex v2에서는 `autoprompt activate codex -- <목표>`로 명시적으로 시작하세요.
 
 </details>
 

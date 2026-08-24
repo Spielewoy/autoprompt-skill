@@ -43,9 +43,9 @@ jobs:
         with:
           python-version: "3.12"
           check-latest: false
-      - name: Install validation parser
-        run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3
-      - name: Run package and provider tests
+      - name: Install validation parsers
+        run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0
+      - name: Run package, provider, and benchmark tests
         run: npm test
 
   windows-provider-contracts:
@@ -67,9 +67,42 @@ jobs:
         with:
           python-version: "3.12"
           check-latest: false
-      - name: Install validation parser
-        run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3
-      - name: Run package and provider tests
+      - name: Install validation parsers
+        run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0
+      - name: Run package, provider, and benchmark tests
         run: npm test
       - name: Run older Codex upgrade lifecycle
         run: node --test --test-name-pattern="receiptless legacy" tests/source/install-custom-root.test.cjs
+
+  pull-request-lifecycle:
+    name: Pull request lifecycle (${{ matrix.os }})
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          check-latest: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          check-latest: false
+      - name: Install validation parsers
+        run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0
+      - name: Check pull request lifecycle contract
+        run: node --test tests/source/ci-codex-packed-pr-contract.test.cjs
+      - name: Run full verification, including packed Codex lifecycle
+        run: npm run verify

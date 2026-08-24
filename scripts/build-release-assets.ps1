@@ -105,7 +105,7 @@ Autoprompt turns one explicit goal into a closed plan, build, test, review, repa
 
 ## Highlights
 
-- 45% fewer failures in the published Terminal-Bench 2.1 run: 29 failures fell to 16
+- Benchmark claims remain withheld until a preregistered run has complete independently verifiable evidence
 - State-aware CLI scans nine coding agents, reports installed versions, and offers install, update, repair, doctor, and uninstall flows
 - Older Codex installs are detected and updated in place
 - Explicit invocation keeps the orchestration loop isolated from ordinary coding requests

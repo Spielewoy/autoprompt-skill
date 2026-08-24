@@ -1,0 +1,914 @@
+{
+  "$schema": "./schemas/state-machine.schema.json",
+  "kind": "autoprompt-state-machine",
+  "contractVersion": "2.0.0",
+  "initialState": "BOOT",
+  "terminalStates": [
+    "DONE",
+    "PARTIAL",
+    "BLOCKED",
+    "CANCELLED",
+    "FAILED"
+  ],
+  "resumableStates": [
+    "CONFIG_REQUIRED",
+    "PAUSED",
+    "WAITING_USER"
+  ],
+  "states": [
+    "BOOT",
+    "LOAD_SKILL",
+    "STORE_REQUEST_ENVELOPE",
+    "RESOLVE_SETTINGS",
+    "CONFIG_REQUIRED",
+    "ACQUIRE_TARGET_LOCK",
+    "SELECT_SAFE_RUN_ROOT",
+    "CREATE_RUN_RECORD",
+    "CHECK_PROVIDER_CAPABILITIES",
+    "START_ROUTE_ANALYST",
+    "SAVE_ROUTE_ANALYSIS",
+    "L0_ROUTE_DECISION",
+    "WAITING_USER",
+    "PREPARE_WORK",
+    "RUN_WORK",
+    "ITEM_VERIFIED",
+    "CHECK_WORK",
+    "REPAIRING",
+    "CHECK_INCONCLUSIVE",
+    "WORKER_CONTEXT_LOST",
+    "INTEGRATION_CONFLICT",
+    "REASSESS_STRATEGY",
+    "CHANGING_ROUTE",
+    "APPEND_REQUEST_STEERING",
+    "INVALIDATE_AFFECTED_RESULTS",
+    "MIGRATING_CONTRACT",
+    "RESUME_EXACT_STATE",
+    "FINAL_CHECK",
+    "FINALIZING",
+    "RELEASING_LOCK",
+    "PAUSED",
+    "DONE",
+    "PARTIAL",
+    "BLOCKED",
+    "CANCELLED",
+    "FAILED"
+  ],
+  "outcomeSchema": "agents/contracts/schemas/outcome.schema.json",
+  "eventSchema": "agents/contracts/schemas/state-event.schema.json",
+  "eventRecordRequiredFields": [
+    "contractVersion",
+    "transitionId",
+    "eventId",
+    "runId",
+    "activationNonce",
+    "sequence",
+    "fromState",
+    "toState",
+    "requestEnvelopeHash",
+    "targetIdentityHash",
+    "candidateHash",
+    "evidenceHashes",
+    "openIds",
+    "attempt",
+    "causalParent",
+    "occurredAt",
+    "humanDescription"
+  ],
+  "transitions": [
+    {
+      "id": "T001",
+      "event": "BOOTSTRAP",
+      "from": "BOOT",
+      "to": "LOAD_SKILL",
+      "guard": "explicit activation capability is present",
+      "effect": "load the pinned product contract"
+    },
+    {
+      "id": "T002",
+      "event": "SKILL_LOADED",
+      "from": "LOAD_SKILL",
+      "to": "STORE_REQUEST_ENVELOPE",
+      "guard": "product contract digest matches the activation",
+      "effect": "prepare immutable request storage"
+    },
+    {
+      "id": "T003",
+      "event": "REQUEST_ENVELOPE_STORED",
+      "from": "STORE_REQUEST_ENVELOPE",
+      "to": "RESOLVE_SETTINGS",
+      "guard": "ordered entries and object hashes validate",
+      "effect": "resolve supported settings by precedence"
+    },
+    {
+      "id": "T004",
+      "event": "SETTINGS_MISSING",
+      "from": "RESOLVE_SETTINGS",
+      "to": "CONFIG_REQUIRED",
+      "guard": "a required supported setting has no allowed source",
+      "effect": "start no inspection or worker"
+    },
+    {
+      "id": "T005",
+      "event": "SETTINGS_SUPPLIED",
+      "from": "CONFIG_REQUIRED",
+      "to": "RESOLVE_SETTINGS",
+      "guard": "the new value is appended to the exact request record",
+      "effect": "revalidate all settings"
+    },
+    {
+      "id": "T006",
+      "event": "SETTINGS_RESOLVED",
+      "from": "RESOLVE_SETTINGS",
+      "to": "ACQUIRE_TARGET_LOCK",
+      "guard": "effective numeric limits and user pins validate",
+      "effect": "attempt one target lease"
+    },
+    {
+      "id": "T007",
+      "event": "TARGET_LOCK_ACQUIRED",
+      "from": "ACQUIRE_TARGET_LOCK",
+      "to": "SELECT_SAFE_RUN_ROOT",
+      "guard": "lease identity is bound to activation and target",
+      "effect": "select project history or a private side location"
+    },
+    {
+      "id": "T008",
+      "event": "TARGET_LOCK_CONFLICT",
+      "from": "ACQUIRE_TARGET_LOCK",
+      "to": "BLOCKED",
+      "guard": "another live owner holds the target lease",
+      "effect": "touch no target or run file"
+    },
+    {
+      "id": "T009",
+      "event": "RUN_ROOT_SELECTED",
+      "from": "SELECT_SAFE_RUN_ROOT",
+      "to": "CREATE_RUN_RECORD",
+      "guard": "no-follow containment and target-effect checks pass",
+      "effect": "create one run directory atomically"
+    },
+    {
+      "id": "T010",
+      "event": "RUN_RECORD_UNSAFE",
+      "from": "SELECT_SAFE_RUN_ROOT",
+      "to": "RELEASING_LOCK",
+      "guard": "neither project history nor a private side location is proven safe",
+      "effect": "prepare BLOCKED outcome"
+    },
+    {
+      "id": "T011",
+      "event": "RUN_RECORD_CREATED",
+      "from": "CREATE_RUN_RECORD",
+      "to": "CHECK_PROVIDER_CAPABILITIES",
+      "guard": "required files are atomic and the opened directory identity is bound",
+      "effect": "compare required effects to verified provider support"
+    },
+    {
+      "id": "T012",
+      "event": "RUN_RECORD_FAILURE",
+      "from": "CREATE_RUN_RECORD",
+      "to": "RELEASING_LOCK",
+      "guard": "an atomic write, sync, hash, or state write failed",
+      "effect": "preserve last valid state and prepare FAILED outcome"
+    },
+    {
+      "id": "T013",
+      "event": "PROVIDER_CAPABILITIES_ACCEPTED",
+      "from": "CHECK_PROVIDER_CAPABILITIES",
+      "to": "START_ROUTE_ANALYST",
+      "guard": "every required feature is verified or has an accepted safe reduced behavior",
+      "effect": "start exactly one read-only analyst"
+    },
+    {
+      "id": "T079",
+      "event": "EXACT_PATH_ACCEPTED",
+      "from": "CHECK_PROVIDER_CAPABILITIES",
+      "to": "PREPARE_WORK",
+      "guard": "the optional user path is exact, schema-valid, capability-safe, and immutable",
+      "effect": "persist the exact route decision and bypass route-analysis and route-selection model work"
+    },
+    {
+      "id": "T014",
+      "event": "PROVIDER_UNSUPPORTED",
+      "from": "CHECK_PROVIDER_CAPABILITIES",
+      "to": "RELEASING_LOCK",
+      "guard": "a required feature is unsupported or unverified without safe reduced behavior",
+      "effect": "prepare BLOCKED outcome before production work"
+    },
+    {
+      "id": "T015",
+      "event": "ROUTE_ANALYST_STARTED",
+      "from": "START_ROUTE_ANALYST",
+      "to": "SAVE_ROUTE_ANALYSIS",
+      "guard": "analyst count is one and its target is read-only",
+      "effect": "stream raw events into the transcript"
+    },
+    {
+      "id": "T016",
+      "event": "ROUTE_ANALYST_FAILED_TO_START",
+      "from": "START_ROUTE_ANALYST",
+      "to": "SAVE_ROUTE_ANALYSIS",
+      "guard": "failure details are available",
+      "effect": "save the failure and continue with lower confidence"
+    },
+    {
+      "id": "T017",
+      "event": "ROUTE_ANALYSIS_SAVED",
+      "from": "SAVE_ROUTE_ANALYSIS",
+      "to": "L0_ROUTE_DECISION",
+      "guard": "raw events or a typed failure and bounded index are durable",
+      "effect": "give the run owner the recommendation and bounded index"
+    },
+    {
+      "id": "T018",
+      "event": "ROUTE_DECISION_VALID",
+      "from": "L0_ROUTE_DECISION",
+      "to": "PREPARE_WORK",
+      "guard": "decision schema, route reasons, success list, and planned checks validate",
+      "effect": "prepare only the selected route"
+    },
+    {
+      "id": "T019",
+      "event": "ROUTE_DECISION_NEEDS_USER",
+      "from": "L0_ROUTE_DECISION",
+      "to": "WAITING_USER",
+      "guard": "one indispensable user-owned choice is named and route is null",
+      "effect": "start no worker"
+    },
+    {
+      "id": "T020",
+      "event": "ROUTE_DECISION_INVALID_FIRST",
+      "from": "L0_ROUTE_DECISION",
+      "to": "L0_ROUTE_DECISION",
+      "guard": "no earlier correction was attempted",
+      "effect": "allow one same-owner schema correction",
+      "boundedBy": "invalidCorrectionLimit == 1"
+    },
+    {
+      "id": "T021",
+      "event": "ROUTE_DECISION_INVALID_FINAL",
+      "from": "L0_ROUTE_DECISION",
+      "to": "RELEASING_LOCK",
+      "guard": "the one correction was used",
+      "effect": "prepare FAILED outcome without production work"
+    },
+    {
+      "id": "T022",
+      "event": "ROUTE_DECISION_TIMEOUT",
+      "from": "L0_ROUTE_DECISION",
+      "to": "RELEASING_LOCK",
+      "guard": "the four-minute ceiling ended without a valid decision",
+      "effect": "save unresolved facts and prepare FAILED outcome"
+    },
+    {
+      "id": "T023",
+      "event": "WORK_PREPARED",
+      "from": "PREPARE_WORK",
+      "to": "RUN_WORK",
+      "guard": "ownership, success items, checks, and route limits validate",
+      "effect": "start only ready work"
+    },
+    {
+      "id": "T024",
+      "event": "WORK_ITEM_VERIFIED",
+      "from": "RUN_WORK",
+      "to": "ITEM_VERIFIED",
+      "guard": "the item result and its item-level checks share one version id",
+      "effect": "record item completion without ending the run"
+    },
+    {
+      "id": "T025",
+      "event": "MORE_WORK_READY",
+      "from": "ITEM_VERIFIED",
+      "to": "RUN_WORK",
+      "guard": "another accepted item is ready and ownership is free",
+      "effect": "continue selected-route work"
+    },
+    {
+      "id": "T026",
+      "event": "ALL_WORK_JOINED",
+      "from": [
+        "RUN_WORK",
+        "ITEM_VERIFIED"
+      ],
+      "to": "CHECK_WORK",
+      "guard": "all required items are joined and one exact version is frozen",
+      "effect": "start independent checks"
+    },
+    {
+      "id": "T027",
+      "event": "IMPLEMENTATION_DEFECT",
+      "from": "CHECK_WORK",
+      "to": "REPAIRING",
+      "guard": "a failing assertion, changed behavior, or exact diff fault identifies production work",
+      "effect": "return affected work to the same useful worker"
+    },
+    {
+      "id": "T028",
+      "event": "MISSING_EDGE_CASE",
+      "from": "CHECK_WORK",
+      "to": "REPAIRING",
+      "guard": "the missing boundary follows from the exact request",
+      "effect": "add a regression check and repair the affected work"
+    },
+    {
+      "id": "T029",
+      "event": "REGRESSION",
+      "from": "CHECK_WORK",
+      "to": "REPAIRING",
+      "guard": "a recorded pre-change passing check is now failing",
+      "effect": "repair or revert the affected change"
+    },
+    {
+      "id": "T030",
+      "event": "CHECK_DEFECT",
+      "from": "CHECK_WORK",
+      "to": "REPAIRING",
+      "guard": "the check cannot run or measures the wrong target",
+      "effect": "assign a check resolver without changing route"
+    },
+    {
+      "id": "T031",
+      "event": "REPAIR_READY",
+      "from": "REPAIRING",
+      "to": "CHECK_WORK",
+      "guard": "the version or affected check evidence changed",
+      "effect": "repeat only invalidated checks"
+    },
+    {
+      "id": "T032",
+      "event": "TRANSIENT_RUNTIME",
+      "from": [
+        "RUN_WORK",
+        "CHECK_WORK"
+      ],
+      "to": "$same",
+      "guard": "failure matches the declared retryable class and allowance remains",
+      "effect": "retry the same step without route change",
+      "boundedBy": "per-step transient retry cap"
+    },
+    {
+      "id": "T033",
+      "event": "CHECK_INCONCLUSIVE",
+      "from": "CHECK_WORK",
+      "to": "CHECK_INCONCLUSIVE",
+      "guard": "the result is flaky, contradictory, partial, or non-authoritative",
+      "effect": "isolate the check and use only its declared transient allowance"
+    },
+    {
+      "id": "T034",
+      "event": "CHECK_BECAME_CONCLUSIVE",
+      "from": "CHECK_INCONCLUSIVE",
+      "to": "CHECK_WORK",
+      "guard": "the check produced a classified result tied to the same version",
+      "effect": "continue the affected checking path"
+    },
+    {
+      "id": "T035",
+      "event": "CHECK_REMAINS_INCONCLUSIVE",
+      "from": "CHECK_INCONCLUSIVE",
+      "to": "RELEASING_LOCK",
+      "guard": "the declared allowance ended without an authoritative result",
+      "effect": "prepare PARTIAL outcome and record uncertainty"
+    },
+    {
+      "id": "T036",
+      "event": "WORKER_CONTEXT_LOST",
+      "from": [
+        "RUN_WORK",
+        "REPAIRING"
+      ],
+      "to": "WORKER_CONTEXT_LOST",
+      "guard": "same-context continuation is unavailable",
+      "effect": "check provider-safe resume from saved assignment and exact version"
+    },
+    {
+      "id": "T037",
+      "event": "WORKER_CONTEXT_RESTORED",
+      "from": "WORKER_CONTEXT_LOST",
+      "to": "RUN_WORK",
+      "guard": "provider contract permits exact saved-assignment resume",
+      "effect": "resume without cloning full history"
+    },
+    {
+      "id": "T038",
+      "event": "WORKER_CONTEXT_UNRECOVERABLE",
+      "from": "WORKER_CONTEXT_LOST",
+      "to": "RELEASING_LOCK",
+      "guard": "no safe continuation or named replacement is available and no accepted requested result survives",
+      "effect": "prepare the FAILED outcome"
+    },
+    {
+      "id": "T076",
+      "event": "WORKER_CONTEXT_UNRECOVERABLE_AFTER_PARTIAL_RESULT",
+      "from": "WORKER_CONTEXT_LOST",
+      "to": "RELEASING_LOCK",
+      "guard": "no safe continuation or named replacement is available and at least one accepted requested result survives",
+      "effect": "prepare the PARTIAL outcome with the surviving completed result evidence"
+    },
+    {
+      "id": "T039",
+      "event": "INTEGRATION_CONFLICT",
+      "from": "RUN_WORK",
+      "to": "INTEGRATION_CONFLICT",
+      "guard": "two valid owned results cannot be combined under the accepted plan",
+      "effect": "return the conflict to the integration owner"
+    },
+    {
+      "id": "T040",
+      "event": "INTEGRATION_CONFLICT_RESOLVED",
+      "from": "INTEGRATION_CONFLICT",
+      "to": "RUN_WORK",
+      "guard": "the accepted plan still covers the resolved ownership order",
+      "effect": "continue integration"
+    },
+    {
+      "id": "T041",
+      "event": "INTEGRATION_REVEALS_NEW_DEPENDENCY",
+      "from": "INTEGRATION_CONFLICT",
+      "to": "CHANGING_ROUTE",
+      "guard": "a new dependency or design fact is recorded",
+      "effect": "re-evaluate the smallest sufficient route"
+    },
+    {
+      "id": "T042",
+      "event": "SPEC_MISUNDERSTOOD",
+      "from": "CHECK_WORK",
+      "to": "CHANGING_ROUTE",
+      "guard": "checking contradicts the recorded request interpretation",
+      "effect": "consider DIRECT to LIGHT"
+    },
+    {
+      "id": "T043",
+      "event": "MULTI_SURFACE_DISCOVERED",
+      "from": [
+        "RUN_WORK",
+        "CHECK_WORK"
+      ],
+      "to": "CHANGING_ROUTE",
+      "guard": "at least two dependent writable groups and an integration need are recorded",
+      "effect": "consider LIGHT to ROADMAP"
+    },
+    {
+      "id": "T044",
+      "event": "ARCHITECTURE_FORK_DISCOVERED",
+      "from": [
+        "RUN_WORK",
+        "CHECK_WORK"
+      ],
+      "to": "CHANGING_ROUTE",
+      "guard": "a recorded architectural choice affects several systems or public contracts",
+      "effect": "consider ROADMAP or user input"
+    },
+    {
+      "id": "T045",
+      "event": "CAPABILITY_LOST",
+      "from": [
+        "RUN_WORK",
+        "CHECK_WORK"
+      ],
+      "to": "REASSESS_STRATEGY",
+      "guard": "a previously admitted required provider feature is unavailable",
+      "effect": "use a declared safe alternative or stop"
+    },
+    {
+      "id": "T046",
+      "event": "RISK_DISCOVERED",
+      "from": [
+        "RUN_WORK",
+        "CHECK_WORK"
+      ],
+      "to": "REASSESS_STRATEGY",
+      "guard": "a named risk dimension and its affected work or check are recorded",
+      "effect": "add the named control without enlarging route unless its predicate is proven"
+    },
+    {
+      "id": "T073",
+      "event": "SIDE_EFFECT_DISCOVERED",
+      "from": [
+        "RUN_WORK",
+        "CHECK_WORK"
+      ],
+      "to": "REASSESS_STRATEGY",
+      "guard": "the new side effect and its authority and reversibility impact are recorded",
+      "effect": "re-evaluate authority, isolation, and staged-change controls"
+    },
+    {
+      "id": "T074",
+      "event": "SHARED_RESOURCE_DISCOVERED",
+      "from": [
+        "RUN_WORK",
+        "CHECK_WORK"
+      ],
+      "to": "REASSESS_STRATEGY",
+      "guard": "the shared resource identity and competing owners are recorded",
+      "effect": "serialize ownership or change route only when dependent integration is proven"
+    },
+    {
+      "id": "T075",
+      "event": "ORACLE_FAILURE",
+      "from": "CHECK_WORK",
+      "to": "REASSESS_STRATEGY",
+      "guard": "the exact failed check, its authority, and its failure classification are recorded",
+      "effect": "resolve the check or record an inconclusive result without inventing a pass"
+    },
+    {
+      "id": "T047",
+      "event": "NO_PROGRESS",
+      "from": [
+        "RUN_WORK",
+        "REPAIRING",
+        "CHECK_WORK"
+      ],
+      "to": "REASSESS_STRATEGY",
+      "guard": "failure fingerprint repeats with unchanged version and check evidence",
+      "effect": "change approach once rather than starting equivalent workers"
+    },
+    {
+      "id": "T048",
+      "event": "STRATEGY_REVISED",
+      "from": "REASSESS_STRATEGY",
+      "to": "RUN_WORK",
+      "guard": "a materially different bounded approach is recorded",
+      "effect": "continue within the same route unless a route-change fact exists"
+    },
+    {
+      "id": "T049",
+      "event": "STRATEGY_BLOCKED",
+      "from": "REASSESS_STRATEGY",
+      "to": "RELEASING_LOCK",
+      "guard": "the reassessment proves an environment, policy, or capability blocker",
+      "effect": "prepare BLOCKED outcome"
+    },
+    {
+      "id": "T050",
+      "event": "AUTHORITY_REQUIRED",
+      "from": [
+        "L0_ROUTE_DECISION",
+        "PREPARE_WORK",
+        "RUN_WORK",
+        "CHECK_WORK",
+        "REASSESS_STRATEGY",
+        "CHANGING_ROUTE"
+      ],
+      "to": "WAITING_USER",
+      "guard": "the choice is product-semantic, consequential, destructive, credentialed, costly, contradictory, or lacks permission",
+      "effect": "ask only for the required user-owned choice"
+    },
+    {
+      "id": "T051",
+      "event": "ROUTE_CHANGE_DECIDED",
+      "from": "CHANGING_ROUTE",
+      "to": "PREPARE_WORK",
+      "guard": "a new fact and matching route rule are recorded",
+      "effect": "invalidate only affected plans, work, and checks"
+    },
+    {
+      "id": "T052",
+      "event": "ACCEPTANCE_GREEN",
+      "from": "CHECK_WORK",
+      "to": "FINAL_CHECK",
+      "guard": "real checks pass the exact request with no relevant regression",
+      "effect": "perform the final version-bound recheck"
+    },
+    {
+      "id": "T053",
+      "event": "SMALL_REFINEMENT_SELECTED",
+      "from": "FINAL_CHECK",
+      "to": "RUN_WORK",
+      "guard": "the refinement remains within the success list and available budget",
+      "effect": "invalidate dependent check results before mutation"
+    },
+    {
+      "id": "T054",
+      "event": "VERIFIED",
+      "from": "FINAL_CHECK",
+      "to": "FINALIZING",
+      "guard": "final results bind the current version, request, environment, and checks",
+      "effect": "stop other working agents and prepare deterministic completion"
+    },
+    {
+      "id": "T055",
+      "event": "FINAL_RECORD_READY",
+      "from": "FINALIZING",
+      "to": "RELEASING_LOCK",
+      "guard": "quiescence excludes only the current control action and deterministic finalizers",
+      "effect": "prepare DONE outcome and release owned resources"
+    },
+    {
+      "id": "T056",
+      "event": "ENVIRONMENT_BLOCKED",
+      "from": [
+        "PREPARE_WORK",
+        "RUN_WORK",
+        "CHECK_WORK",
+        "REPAIRING"
+      ],
+      "to": "RELEASING_LOCK",
+      "guard": "the exact failed command and unavailable dependency are recorded",
+      "effect": "prepare BLOCKED outcome with an unblock path"
+    },
+    {
+      "id": "T057",
+      "event": "CANCEL_REQUESTED",
+      "from": [
+        "LOAD_SKILL",
+        "STORE_REQUEST_ENVELOPE",
+        "RESOLVE_SETTINGS",
+        "SELECT_SAFE_RUN_ROOT",
+        "CREATE_RUN_RECORD",
+        "CHECK_PROVIDER_CAPABILITIES",
+        "START_ROUTE_ANALYST",
+        "SAVE_ROUTE_ANALYSIS",
+        "L0_ROUTE_DECISION",
+        "PREPARE_WORK",
+        "RUN_WORK",
+        "ITEM_VERIFIED",
+        "CHECK_WORK",
+        "REPAIRING",
+        "CHECK_INCONCLUSIVE",
+        "WORKER_CONTEXT_LOST",
+        "INTEGRATION_CONFLICT",
+        "REASSESS_STRATEGY",
+        "CHANGING_ROUTE",
+        "FINAL_CHECK"
+      ],
+      "to": "RELEASING_LOCK",
+      "guard": "cancellation is authorized or immediate safety stop is required",
+      "effect": "stop or quarantine harmful activity before best-effort checkpoint"
+    },
+    {
+      "id": "T058",
+      "event": "BUDGET_EXHAUSTED_RESUMABLE",
+      "from": [
+        "PREPARE_WORK",
+        "RUN_WORK",
+        "CHECK_WORK",
+        "REPAIRING"
+      ],
+      "to": "PAUSED",
+      "guard": "safe exact continuation is possible and no harmful action continues",
+      "effect": "save the exact next ready work and stop all children"
+    },
+    {
+      "id": "T059",
+      "event": "BUDGET_EXHAUSTED_FINAL",
+      "from": [
+        "PREPARE_WORK",
+        "RUN_WORK",
+        "CHECK_WORK",
+        "REPAIRING"
+      ],
+      "to": "RELEASING_LOCK",
+      "guard": "continuation is unavailable or not authorized",
+      "effect": "prepare PARTIAL outcome"
+    },
+    {
+      "id": "T060",
+      "event": "RESUME_REQUESTED",
+      "from": "PAUSED",
+      "to": "CHECK_PROVIDER_CAPABILITIES",
+      "guard": "activation, contract, request, target, and saved state validate",
+      "effect": "reacquire required provider support before exact continuation"
+    },
+    {
+      "id": "T077",
+      "event": "CRASH_DETECTED",
+      "from": [
+        "SELECT_SAFE_RUN_ROOT",
+        "CREATE_RUN_RECORD",
+        "CHECK_PROVIDER_CAPABILITIES",
+        "START_ROUTE_ANALYST",
+        "SAVE_ROUTE_ANALYSIS",
+        "L0_ROUTE_DECISION",
+        "PREPARE_WORK",
+        "RUN_WORK",
+        "ITEM_VERIFIED",
+        "CHECK_WORK",
+        "REPAIRING",
+        "CHECK_INCONCLUSIVE",
+        "WORKER_CONTEXT_LOST",
+        "INTEGRATION_CONFLICT",
+        "REASSESS_STRATEGY",
+        "CHANGING_ROUTE",
+        "APPEND_REQUEST_STEERING",
+        "INVALIDATE_AFFECTED_RESULTS",
+        "MIGRATING_CONTRACT",
+        "RESUME_EXACT_STATE",
+        "FINAL_CHECK",
+        "FINALIZING"
+      ],
+      "to": "PAUSED",
+      "guard": "the prior owner is proven stale, every owned process is proven drained, and the exact checkpoint and next ready work validate",
+      "effect": "save the crashed state and exact next ready work; any prepared, uncertain, or committed external effect changes the safe resume state to CHECK_WORK for reconciliation and is never blindly repeated"
+    },
+    {
+      "id": "T078",
+      "event": "PROVIDER_CAPABILITIES_ACCEPTED_FOR_RESUME",
+      "from": "CHECK_PROVIDER_CAPABILITIES",
+      "to": "RESUME_EXACT_STATE",
+      "guard": "the required capabilities are freshly verified for the saved route, effect, activation, runtime identity, and exact next ready work",
+      "effect": "restore the saved checkpoint without starting a route analyst or repeating the L0 route decision"
+    },
+    {
+      "id": "T061",
+      "event": "USER_UPDATE",
+      "from": [
+        "L0_ROUTE_DECISION",
+        "WAITING_USER",
+        "PREPARE_WORK",
+        "RUN_WORK",
+        "ITEM_VERIFIED",
+        "CHECK_WORK",
+        "REPAIRING",
+        "CHECK_INCONCLUSIVE",
+        "WORKER_CONTEXT_LOST",
+        "INTEGRATION_CONFLICT",
+        "REASSESS_STRATEGY",
+        "CHANGING_ROUTE",
+        "FINAL_CHECK",
+        "PAUSED",
+        "CONFIG_REQUIRED"
+      ],
+      "to": "APPEND_REQUEST_STEERING",
+      "guard": "the message adds to or replaces recorded instructions",
+      "effect": "append an immutable steering edge"
+    },
+    {
+      "id": "T062",
+      "event": "REQUEST_STEERING_APPENDED",
+      "from": "APPEND_REQUEST_STEERING",
+      "to": "INVALIDATE_AFFECTED_RESULTS",
+      "guard": "new entries and object hashes validate",
+      "effect": "walk the dependency invalidation graph"
+    },
+    {
+      "id": "T063",
+      "event": "AFFECTED_RESULTS_INVALIDATED",
+      "from": "INVALIDATE_AFFECTED_RESULTS",
+      "to": "L0_ROUTE_DECISION",
+      "guard": "unaffected results remain bound to their exact input set",
+      "effect": "re-evaluate only the smallest necessary part"
+    },
+    {
+      "id": "T064",
+      "event": "CONTRACT_UPGRADE_REQUIRED",
+      "from": [
+        "LOAD_SKILL",
+        "CHECK_PROVIDER_CAPABILITIES",
+        "PAUSED"
+      ],
+      "to": "MIGRATING_CONTRACT",
+      "guard": "saved state cannot be interpreted by the pinned contract",
+      "effect": "run only a named tested migration"
+    },
+    {
+      "id": "T065",
+      "event": "CONTRACT_MIGRATION_PASSED",
+      "from": "MIGRATING_CONTRACT",
+      "to": "RESUME_EXACT_STATE",
+      "guard": "migration output validates and preserves immutable inputs",
+      "effect": "restore the saved state named in the migration record"
+    },
+    {
+      "id": "T066",
+      "event": "EXACT_STATE_RESTORED",
+      "from": "RESUME_EXACT_STATE",
+      "to": "$savedResumeState",
+      "guard": "the restored state is nonterminal and legal under this contract",
+      "effect": "continue without silently reinterpreting progress"
+    },
+    {
+      "id": "T067",
+      "event": "CONTRACT_MIGRATION_REFUSED",
+      "from": "MIGRATING_CONTRACT",
+      "to": "FAILED",
+      "guard": "no tested compatible migration exists and no target lock is held",
+      "effect": "report exact incompatible versions"
+    },
+    {
+      "id": "T068",
+      "event": "LOCK_RELEASED_DONE",
+      "from": "RELEASING_LOCK",
+      "to": "DONE",
+      "guard": "pending outcome is DONE and owned processes and resources are stopped",
+      "effect": "record the terminal state last"
+    },
+    {
+      "id": "T069",
+      "event": "LOCK_RELEASED_PARTIAL",
+      "from": "RELEASING_LOCK",
+      "to": "PARTIAL",
+      "guard": "pending outcome is PARTIAL and exact completed work and next work are recorded",
+      "effect": "record the terminal state last"
+    },
+    {
+      "id": "T070",
+      "event": "LOCK_RELEASED_BLOCKED",
+      "from": "RELEASING_LOCK",
+      "to": "BLOCKED",
+      "guard": "pending outcome is BLOCKED with cause and unblock path",
+      "effect": "record the terminal state last"
+    },
+    {
+      "id": "T071",
+      "event": "LOCK_RELEASED_CANCELLED",
+      "from": "RELEASING_LOCK",
+      "to": "CANCELLED",
+      "guard": "pending outcome is CANCELLED and no harmful action continues",
+      "effect": "record the terminal state last"
+    },
+    {
+      "id": "T072",
+      "event": "LOCK_RELEASED_FAILED",
+      "from": "RELEASING_LOCK",
+      "to": "FAILED",
+      "guard": "pending outcome is FAILED with recovery details",
+      "effect": "record the terminal state last"
+    }
+  ],
+  "crashRecoveryPolicy": {
+    "crashTransitionId": "T077",
+    "capabilitiesAcceptedTransitionId": "T078",
+    "restoreTransitionId": "T066",
+    "recoverableActiveStates": [
+      "SELECT_SAFE_RUN_ROOT",
+      "CREATE_RUN_RECORD",
+      "CHECK_PROVIDER_CAPABILITIES",
+      "START_ROUTE_ANALYST",
+      "SAVE_ROUTE_ANALYSIS",
+      "L0_ROUTE_DECISION",
+      "PREPARE_WORK",
+      "RUN_WORK",
+      "ITEM_VERIFIED",
+      "CHECK_WORK",
+      "REPAIRING",
+      "CHECK_INCONCLUSIVE",
+      "WORKER_CONTEXT_LOST",
+      "INTEGRATION_CONFLICT",
+      "REASSESS_STRATEGY",
+      "CHANGING_ROUTE",
+      "APPEND_REQUEST_STEERING",
+      "INVALIDATE_AFFECTED_RESULTS",
+      "MIGRATING_CONTRACT",
+      "RESUME_EXACT_STATE",
+      "FINAL_CHECK",
+      "FINALIZING"
+    ],
+    "excludedCrashStates": [
+      "BOOT",
+      "LOAD_SKILL",
+      "STORE_REQUEST_ENVELOPE",
+      "RESOLVE_SETTINGS",
+      "CONFIG_REQUIRED",
+      "ACQUIRE_TARGET_LOCK",
+      "WAITING_USER",
+      "PAUSED",
+      "RELEASING_LOCK",
+      "DONE",
+      "PARTIAL",
+      "BLOCKED",
+      "CANCELLED",
+      "FAILED"
+    ],
+    "externalInFlightResumeState": "CHECK_WORK",
+    "externalInFlightAction": "reconcile-before-any-repeat",
+    "routeAnalysisAndDecisionReuse": "reuse-hash-bound-records-when-listed-as-completed-milestones",
+    "releasingLockCrashAction": "deterministic-finalizer-reconciles-existing-release-intent",
+    "blindExternalRepeatAllowed": false,
+    "routeSourceBinding": "persist-decision-and-scheduler-source-reject-mismatch-never-infer-from-route-name",
+    "checkpointDigest": {
+      "algorithm": "sha256",
+      "canonicalization": "stable-json-v1",
+      "frontierHashFormula": "sha256(stable-json-v1(frontier))",
+      "checkpointHashFields": [
+        "savedState",
+        "resumeState",
+        "frontierHash",
+        "completedMilestones",
+        "priorOwner",
+        "externalRecovery",
+        "releaseIntentHash",
+        "accountingCheckpoint"
+      ],
+      "checkpointHashFormula": "sha256(stable-json-v1(exact checkpointHashFields object))"
+    }
+  },
+  "completionRules": {
+    "itemTerminal": "ITEM_VERIFIED",
+    "runTerminalAfter": [
+      "work-join",
+      "integration-when-required",
+      "named-risk-checks",
+      "final-version-bound-check",
+      "quiescence",
+      "lock-release"
+    ],
+    "quiescenceExcludes": [
+      "current-control-action",
+      "deterministic-finalizer"
+    ],
+    "terminalOutgoingEvents": [],
+    "mutationAfterVerification": "invalidate-dependent-results"
+  }
+}

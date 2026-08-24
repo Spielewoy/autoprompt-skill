@@ -1,0 +1,530 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/recovery-checkpoint-record.schema.json",
+  "title": "Autoprompt v2 append-only recovery checkpoint record",
+  "type": "object",
+  "required": [
+    "schemaVersion", "authority", "checkpoint", "checkpointPayloadHash", "cause",
+    "sequence", "previousHash", "entryHash", "occurredAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "2.0.0" },
+    "authority": { "$ref": "#/$defs/authority" },
+    "checkpoint": { "$ref": "#/$defs/checkpoint" },
+    "checkpointPayloadHash": { "$ref": "#/$defs/sha256" },
+    "cause": { "$ref": "#/$defs/cause" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "previousHash": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/sha256" }
+      ]
+    },
+    "entryHash": { "$ref": "#/$defs/sha256" },
+    "occurredAt": { "$ref": "#/$defs/dateTime" }
+  },
+  "additionalProperties": false,
+  "x-autopromptAuthorityBinding": {
+    "algorithm": "sha256",
+    "canonicalization": "stable-json-v1",
+    "targetIdentityHashFormula": "sha256(utf8(authority.targetIdentity))",
+    "capabilityBindingHashFormula": "sha256(utf8(stable-json-v1(authority excluding capabilityBindingHash)))",
+    "generationPolicy": "runId, activationId, activationNonce, missionHash, and target identity never change. Generation may stay equal or increase by exactly one only on a CRASH_RECOVERY record; capability and provider-capability hashes may change only with that increase."
+  },
+  "x-autopromptCheckpointHash": {
+    "algorithm": "sha256",
+    "canonicalization": "stable-json-v1",
+    "checkpointPayloadHashFormula": "sha256(utf8(stable-json-v1(checkpoint)))",
+    "schedulerStateHashFormula": "sha256(decoded scheduler.stateBytesBase64)",
+    "schedulerFrontierHashFormula": "sha256(utf8(stable-json-v1({route,phase,candidate,completedWorkIds,completedCheckIds,openCheckIds,nextReadyWorkIds,leases,usage,reserves})))",
+    "recoveryBindingHashFormula": "sha256(utf8(stable-json-v1(recovery excluding bindingHash)))",
+    "t077Mapping": "checkpointPayloadHash is the durable recovery-authority payload hash. It is not state-event recoveryContext.checkpointHash; T077 derives that separate hash after adding stale-owner and accounting evidence. checkpoint.recovery.bindingHash is the pre-crash recovery-base hash."
+  },
+  "x-autopromptHashChain": {
+    "algorithm": "sha256",
+    "canonicalization": "stable-json-v1",
+    "scope": "runtime/recovery-checkpoints.jsonl",
+    "genesisPreviousHash": null,
+    "entryHashFormula": "sha256(utf8(stable-json-v1(record excluding entryHash)))",
+    "crashTailPolicy": "One unterminated final line is an incomplete crash tail and is never a record. Every complete malformed line, sequence gap, hash mismatch, binding change, or rollback fails replay."
+  },
+    "x-autopromptDurability": {
+    "visibilityBarrier": "A scheduler mutation, admission, thread.started signal, continuation, usage change, or external-operation change is not resumable until its complete record and matching snapshot are durable.",
+    "staleAccountingPolicy": "The accounting reference must equal the latest complete runtime/accounting.jsonl record and runtime/budget.json snapshot. If accounting advances without a matching recovery checkpoint, resume is rejected until authorized roll-forward writes a new checkpoint; accounting is never rolled back.",
+    "appendSnapshotOrder": [
+      "append complete record and newline",
+      "sync runtime/recovery-checkpoints.jsonl",
+      "write and sync a complete temporary runtime/recovery-checkpoint.json",
+      "atomically replace runtime/recovery-checkpoint.json",
+      "sync the containing directory"
+    ]
+  },
+  "x-autopromptResultCommit": {
+    "durabilityOrder": "Write and sync the immutable terminal receipt first, then append RESULT_COMMITTED, then atomically replace the recovery snapshot. The scheduler lease is not released before all three are durable.",
+    "assignmentHashFormula": "For work/check assignments: sha256(utf8(JSON.stringify(the exact persisted canonicalAssignment object))). For the pre-route analyst: sha256(utf8(stable-json-v1(the full exact canonical dispatch context envelope))).",
+    "bindingRule": "resultCommit fields must equal the durable terminal receipt. assignmentId, leaseId, sessionId, and continuationId must equal the still-open scheduler lease; candidateHash must equal checkpoint immutable/scheduler candidate; receiptHash must occur in recovery.frontier.acceptedResultIds; resultHash must equal the receipt result hash."
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "dateTime": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]+)?(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$"
+    },
+    "id": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "nullableId": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/id" }
+      ]
+    },
+    "nullableHash": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/sha256" }
+      ]
+    },
+    "idList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/id" }
+    },
+    "hashList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/sha256" }
+    },
+    "authority": {
+      "type": "object",
+      "required": [
+        "runId", "activationId", "activationNonce", "generation", "missionHash",
+        "targetIdentity", "targetIdentityHash", "providerCapabilitiesHash", "capabilityBindingHash"
+      ],
+      "properties": {
+        "runId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$" },
+        "activationId": { "$ref": "#/$defs/id" },
+        "activationNonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$" },
+        "generation": { "type": "integer", "minimum": 1 },
+        "missionHash": { "$ref": "#/$defs/sha256" },
+        "targetIdentity": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "targetIdentityHash": { "$ref": "#/$defs/sha256" },
+        "providerCapabilitiesHash": { "$ref": "#/$defs/sha256" },
+        "capabilityBindingHash": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    },
+    "resultCommit": {
+      "type": "object",
+      "required": [
+        "assignmentId", "assignmentHash", "leaseId", "sessionId", "continuationId",
+        "resultHash", "receiptHash", "candidateHash"
+      ],
+      "properties": {
+        "assignmentId": { "$ref": "#/$defs/id" },
+        "assignmentHash": { "$ref": "#/$defs/sha256" },
+        "leaseId": { "$ref": "#/$defs/id" },
+        "sessionId": { "$ref": "#/$defs/id" },
+        "continuationId": { "$ref": "#/$defs/id" },
+        "resultHash": { "$ref": "#/$defs/sha256" },
+        "receiptHash": { "$ref": "#/$defs/sha256" },
+        "candidateHash": { "$ref": "#/$defs/nullableHash" }
+      },
+      "additionalProperties": false
+    },
+    "cause": {
+      "type": "object",
+      "required": ["kind", "causeId", "humanDescription"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "CHECKPOINT", "ADMISSION", "LEASE_STARTED", "THREAD_STARTED", "CONTINUATION_BOUND",
+            "USAGE_RECORDED", "LEASE_COMPLETED", "CHECK_COMPLETED", "CANDIDATE_FROZEN",
+            "EXTERNAL_OPERATION", "FRONTIER_CHANGED", "RESULT_COMMITTED", "CRASH_RECOVERY"
+          ]
+        },
+        "causeId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$" },
+        "humanDescription": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "resultCommit": { "$ref": "#/$defs/resultCommit" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "RESULT_COMMITTED" } }, "required": ["kind"] },
+          "then": { "required": ["resultCommit"] },
+          "else": { "not": { "required": ["resultCommit"] } }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "stateEvent": {
+      "type": "object",
+      "required": ["sequence", "eventHash", "state", "stateChecksum"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "eventHash": { "$ref": "#/$defs/sha256" },
+        "state": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+        "stateChecksum": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    },
+    "accounting": {
+      "type": "object",
+      "required": ["lastAccountingSequence", "lastAccountingHash", "snapshotHash"],
+      "properties": {
+        "lastAccountingSequence": { "type": "integer", "minimum": 1 },
+        "lastAccountingHash": { "$ref": "#/$defs/sha256" },
+        "snapshotHash": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    },
+    "usage": {
+      "type": "object",
+      "required": [
+        "noncachedInput", "cachedInput", "output", "reasoning", "weightedCost", "latencyMs", "workMs"
+      ],
+      "properties": {
+        "noncachedInput": { "type": "number", "minimum": 0 },
+        "cachedInput": { "type": "number", "minimum": 0 },
+        "output": { "type": "number", "minimum": 0 },
+        "reasoning": { "type": "number", "minimum": 0 },
+        "weightedCost": { "type": "number", "minimum": 0 },
+        "latencyMs": { "type": "number", "minimum": 0 },
+        "workMs": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "resource": {
+      "type": "object",
+      "required": ["id", "kind", "mode", "isolationId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["workspace", "cache", "generated", "temporary", "database", "service", "port", "generic"] },
+        "mode": { "enum": ["read", "exclusive"] },
+        "isolationId": { "$ref": "#/$defs/nullableId" }
+      },
+      "additionalProperties": false
+    },
+    "thread": {
+      "type": "object",
+      "required": ["started", "startedEventHash", "startedAt"],
+      "properties": {
+        "started": { "type": "boolean" },
+        "startedEventHash": { "$ref": "#/$defs/nullableHash" },
+        "startedAt": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/dateTime" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "started": { "const": true } }, "required": ["started"] },
+          "then": {
+            "properties": {
+              "startedEventHash": { "$ref": "#/$defs/sha256" },
+              "startedAt": { "$ref": "#/$defs/dateTime" }
+            }
+          },
+          "else": {
+            "properties": {
+              "startedEventHash": { "type": "null" },
+              "startedAt": { "type": "null" }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "lease": {
+      "type": "object",
+      "required": [
+        "leaseId", "workItemId", "roleId", "status", "parentLeaseId", "reservationId",
+        "sessionId", "continuationId", "crashBindingHash", "resources", "usage", "reserves", "thread"
+      ],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "workItemId": { "$ref": "#/$defs/id" },
+        "roleId": { "$ref": "#/$defs/id" },
+        "status": { "enum": ["ADMITTED", "OPEN"] },
+        "parentLeaseId": { "$ref": "#/$defs/nullableId" },
+        "reservationId": { "$ref": "#/$defs/nullableId" },
+        "sessionId": { "$ref": "#/$defs/nullableId" },
+        "continuationId": { "$ref": "#/$defs/nullableId" },
+        "crashBindingHash": { "$ref": "#/$defs/nullableHash" },
+        "resources": { "type": "array", "items": { "$ref": "#/$defs/resource" } },
+        "usage": { "$ref": "#/$defs/usage" },
+        "reserves": { "$ref": "#/$defs/usage" },
+        "thread": { "$ref": "#/$defs/thread" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "OPEN" } }, "required": ["status"] },
+          "then": {
+            "properties": {
+              "reservationId": { "$ref": "#/$defs/id" },
+              "sessionId": { "$ref": "#/$defs/id" },
+              "crashBindingHash": { "$ref": "#/$defs/sha256" },
+              "thread": { "properties": { "started": { "const": true } }, "required": ["started"] }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "candidate": {
+      "type": "object",
+      "required": ["candidateId", "candidateHash", "frozen"],
+      "properties": {
+        "candidateId": { "$ref": "#/$defs/nullableId" },
+        "candidateHash": { "$ref": "#/$defs/nullableHash" },
+        "frozen": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "candidateHash": { "type": "null" } }, "required": ["candidateHash"] },
+          "then": {
+            "properties": { "candidateId": { "type": "null" }, "frozen": { "const": false } }
+          }
+        },
+        {
+          "if": { "properties": { "frozen": { "const": true } }, "required": ["frozen"] },
+          "then": {
+            "properties": {
+              "candidateId": { "$ref": "#/$defs/id" },
+              "candidateHash": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "scheduler": {
+      "type": "object",
+      "required": [
+        "encoding", "stateBytesBase64", "stateByteLength", "stateHash", "frontierHash", "ownerSessionId", "route", "phase",
+        "candidate", "completedWorkIds", "completedCheckIds", "openCheckIds", "nextReadyWorkIds",
+        "leases", "usage", "reserves"
+      ],
+      "properties": {
+        "encoding": { "const": "stable-json-v1-without-stateHash+base64" },
+        "stateBytesBase64": { "type": "string", "contentEncoding": "base64", "minLength": 4 },
+        "stateByteLength": { "type": "integer", "minimum": 2 },
+        "stateHash": { "$ref": "#/$defs/sha256" },
+        "frontierHash": { "$ref": "#/$defs/sha256" },
+        "ownerSessionId": { "$ref": "#/$defs/id" },
+        "route": { "enum": ["PENDING", "DIRECT", "LIGHT", "ROADMAP"] },
+        "phase": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+        "candidate": { "$ref": "#/$defs/candidate" },
+        "completedWorkIds": { "$ref": "#/$defs/idList" },
+        "completedCheckIds": { "$ref": "#/$defs/idList" },
+        "openCheckIds": { "$ref": "#/$defs/idList" },
+        "nextReadyWorkIds": { "$ref": "#/$defs/idList" },
+        "leases": { "type": "array", "items": { "$ref": "#/$defs/lease" } },
+        "usage": { "$ref": "#/$defs/usage" },
+        "reserves": { "$ref": "#/$defs/usage" }
+      },
+      "additionalProperties": false
+    },
+    "externalRecovery": {
+      "type": "object",
+      "required": ["status", "operationIds", "idempotencyKeys", "receiptHashes"],
+      "properties": {
+        "status": { "enum": ["none", "reconciliation-required"] },
+        "operationIds": { "$ref": "#/$defs/idList" },
+        "idempotencyKeys": { "$ref": "#/$defs/idList" },
+        "receiptHashes": { "$ref": "#/$defs/hashList" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "none" } }, "required": ["status"] },
+          "then": {
+            "properties": {
+              "operationIds": { "maxItems": 0 },
+              "idempotencyKeys": { "maxItems": 0 },
+              "receiptHashes": { "maxItems": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "operationIds": { "minItems": 1 },
+              "idempotencyKeys": { "minItems": 1 }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "recovery": {
+      "type": "object",
+      "required": [
+        "savedState", "resumeState", "frontier", "completedMilestones", "externalRecovery",
+        "releaseIntentHash", "bindingHash"
+      ],
+      "properties": {
+        "savedState": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+        "resumeState": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+        "frontier": {
+          "type": "object",
+          "required": ["nextReadyWorkIds", "openCheckIds", "acceptedResultIds"],
+          "properties": {
+            "nextReadyWorkIds": { "$ref": "#/$defs/idList" },
+            "openCheckIds": { "$ref": "#/$defs/idList" },
+            "acceptedResultIds": { "$ref": "#/$defs/idList" }
+          },
+          "additionalProperties": false
+        },
+        "completedMilestones": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "route-analysis", "route-decision", "work-preparation", "external-prepare",
+              "external-commit", "external-reconcile", "final-check"
+            ]
+          }
+        },
+        "externalRecovery": { "$ref": "#/$defs/externalRecovery" },
+        "releaseIntentHash": { "$ref": "#/$defs/nullableHash" },
+        "bindingHash": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    },
+    "externalOperation": {
+      "type": "object",
+      "required": [
+        "operationId", "status", "idempotencyKey", "prepareReceiptHash", "commitReceiptHash",
+        "reconcileReceiptHash", "rollbackReceiptHash", "nextAction"
+      ],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/id" },
+        "status": { "enum": ["PREPARED", "COMMITTING", "COMMITTED_UNRECONCILED", "RECONCILED", "ROLLED_BACK"] },
+        "idempotencyKey": { "$ref": "#/$defs/id" },
+        "prepareReceiptHash": { "$ref": "#/$defs/nullableHash" },
+        "commitReceiptHash": { "$ref": "#/$defs/nullableHash" },
+        "reconcileReceiptHash": { "$ref": "#/$defs/nullableHash" },
+        "rollbackReceiptHash": { "$ref": "#/$defs/nullableHash" },
+        "nextAction": { "enum": ["COMMIT", "RECONCILE", "ROLLBACK", "NONE"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "PREPARED" } }, "required": ["status"] },
+          "then": {
+            "properties": {
+              "prepareReceiptHash": { "$ref": "#/$defs/sha256" },
+              "nextAction": { "enum": ["COMMIT", "ROLLBACK"] }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "enum": ["COMMITTING", "COMMITTED_UNRECONCILED"] } }, "required": ["status"] },
+          "then": {
+            "properties": {
+              "prepareReceiptHash": { "$ref": "#/$defs/sha256" },
+              "nextAction": { "enum": ["RECONCILE", "ROLLBACK"] }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "COMMITTED_UNRECONCILED" } }, "required": ["status"] },
+          "then": { "properties": { "commitReceiptHash": { "$ref": "#/$defs/sha256" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "RECONCILED" } }, "required": ["status"] },
+          "then": {
+            "properties": {
+              "commitReceiptHash": { "$ref": "#/$defs/sha256" },
+              "reconcileReceiptHash": { "$ref": "#/$defs/sha256" },
+              "nextAction": { "const": "NONE" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "ROLLED_BACK" } }, "required": ["status"] },
+          "then": {
+            "properties": {
+              "rollbackReceiptHash": { "$ref": "#/$defs/sha256" },
+              "nextAction": { "const": "NONE" }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "immutableHashes": {
+      "type": "object",
+      "required": ["requestEnvelopeHash", "routeDecisionHash", "planHash", "candidateHash"],
+      "properties": {
+        "requestEnvelopeHash": { "$ref": "#/$defs/sha256" },
+        "routeDecisionHash": { "$ref": "#/$defs/nullableHash" },
+        "planHash": { "$ref": "#/$defs/nullableHash" },
+        "candidateHash": { "$ref": "#/$defs/nullableHash" }
+      },
+      "additionalProperties": false
+    },
+    "checkpoint": {
+      "type": "object",
+      "required": [
+        "stateEvent", "accounting", "scheduler", "recovery", "immutableHashes",
+        "externalOperations", "humanDescription"
+      ],
+      "properties": {
+        "stateEvent": { "$ref": "#/$defs/stateEvent" },
+        "accounting": { "$ref": "#/$defs/accounting" },
+        "scheduler": { "$ref": "#/$defs/scheduler" },
+        "recovery": { "$ref": "#/$defs/recovery" },
+        "immutableHashes": { "$ref": "#/$defs/immutableHashes" },
+        "externalOperations": { "type": "array", "items": { "$ref": "#/$defs/externalOperation" } },
+        "humanDescription": { "type": "string", "minLength": 1, "maxLength": 500 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "scheduler": {
+                "properties": { "route": { "const": "PENDING" } },
+                "required": ["route"]
+              }
+            },
+            "required": ["scheduler"]
+          },
+          "then": {
+            "properties": {
+              "scheduler": {
+                "properties": {
+                  "phase": { "enum": ["START_ROUTE_ANALYST", "SAVE_ROUTE_ANALYSIS", "L0_ROUTE_DECISION"] },
+                  "candidate": {
+                    "properties": {
+                      "candidateId": { "type": "null" },
+                      "candidateHash": { "type": "null" },
+                      "frozen": { "const": false }
+                    }
+                  }
+                }
+              },
+              "immutableHashes": {
+                "properties": {
+                  "routeDecisionHash": { "type": "null" },
+                  "planHash": { "type": "null" },
+                  "candidateHash": { "type": "null" }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "scheduler": {
+                "properties": {
+                  "phase": { "not": { "enum": ["START_ROUTE_ANALYST", "SAVE_ROUTE_ANALYSIS", "L0_ROUTE_DECISION"] } }
+                }
+              },
+              "immutableHashes": {
+                "properties": { "routeDecisionHash": { "$ref": "#/$defs/sha256" } }
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    }
+  }
+}

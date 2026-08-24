@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.dev/schemas/codex-model-routing-registry.v1.json",
+  "title": "Receipt-bound Codex model routing registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "issuer", "observedAt", "expiresAt", "evidenceSha256", "entries", "bindingSha256"],
+  "properties": {
+    "schemaVersion": { "const": "codex-model-registry.v1" },
+    "issuer": { "type": "string", "minLength": 1 },
+    "observedAt": { "type": "string", "format": "date-time" },
+    "expiresAt": { "type": "string", "format": "date-time" },
+    "evidenceSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "bindingSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "verified", "efforts", "capabilities", "price", "latency", "yield"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "verified": { "const": true },
+          "efforts": { "type": "array", "minItems": 1, "items": { "enum": ["low", "medium", "high", "xhigh", "max"] } },
+          "capabilities": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "boolean" } },
+          "price": {
+            "type": "object",
+            "required": ["perTokens", "noncachedInput", "cachedInput", "output"],
+            "properties": {
+              "perTokens": { "type": "number", "exclusiveMinimum": 0 },
+              "noncachedInput": { "type": "number", "exclusiveMinimum": 0 },
+              "cachedInput": { "type": "number", "exclusiveMinimum": 0 },
+              "output": { "type": "number", "exclusiveMinimum": 0 }
+            }
+          },
+          "latency": {
+            "type": "object",
+            "required": ["p50Ms", "sampleSize"],
+            "properties": {
+              "p50Ms": { "type": "number", "exclusiveMinimum": 0 },
+              "sampleSize": { "type": "integer", "minimum": 1 }
+            }
+          },
+          "yield": {
+            "type": "object",
+            "required": ["successRate", "sampleSize"],
+            "properties": {
+              "successRate": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+              "sampleSize": { "type": "integer", "minimum": 1 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

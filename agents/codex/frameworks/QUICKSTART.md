@@ -1,67 +1,37 @@
-RUN-DATE: 2026-06-20 (cosmetic only - NOT part of the matched nonce)
+# Procedure quickstart
 
-# QUICKSTART - the framework on-ramp
+1. Select the route from the exact request and shallow target facts before creating a
+   plan or roadmap.
+2. In `README.md`, choose the procedure by the requested action. Evidence availability
+   changes the evidence mode, not the requested action.
+3. Open the named procedure page. Follow its purpose, evidence rules, ownership rules,
+   and typed outcomes. Use only the compiled route graph appended to that page for the
+   check sequence.
 
-You have a task. This framework ecosystem routes that task to exactly ONE named
-workflow, and you follow that workflow step by step. You do not design the
-process - you pick the right framework, open its file, and obey its numbered
-steps. This page is the on-ramp; it gets you from "I have a task" to "I am
-following the right framework" in three moves.
+If no named procedure fits, return `FRAMEWORK: MISS` and use `generation.md`. Do not
+default to implementation, invent a route, or copy a sequence from surrounding prose.
 
----
+<!-- AUTOPROMPT-FRAMEWORK-GATES:BEGIN v2 sha256=b41cfc5bbf3088c61389449ea26a55f47cdbac2bb5c670ea684bd05d615526e1 -->
+## Generated route checks
 
-## The 3-step on-ramp
+This compact section is generated from the versioned check registry.
 
-1. **SELECT.** Run the SELECTOR RUBRIC in `frameworks/README.md` §3. Walk
-   it top to bottom, FIRST MATCH WINS. It hands you exactly ONE framework name.
-2. **OPEN.** Open `frameworks/<that-framework>.md` (e.g. `backend-fix.md`).
-3. **FOLLOW.** Do its numbered steps top to bottom, obeying every if/else
-   scenario it lists. That's it.
+### Applicable route `DIRECT`
+- Leaves: `["final-record","freeze-version","independent-check","join-check-results","produce-work","success-definition"]`
+- Edges: `[{"before":"freeze-version","after":"independent-check"},{"before":"independent-check","after":"join-check-results"},{"before":"join-check-results","after":"final-record"},{"before":"produce-work","after":"freeze-version"},{"before":"success-definition","after":"produce-work"}]`
+- Order: `["success-definition","produce-work","freeze-version","independent-check","join-check-results","final-record"]`
+- Maximum transitions: `14`
 
----
+### Applicable route `LIGHT`
+- Leaves: `["final-record","freeze-version","independent-check","join-check-results","produce-work","short-plan","success-definition"]`
+- Edges: `[{"before":"freeze-version","after":"independent-check"},{"before":"independent-check","after":"join-check-results"},{"before":"join-check-results","after":"final-record"},{"before":"produce-work","after":"freeze-version"},{"before":"short-plan","after":"produce-work"},{"before":"success-definition","after":"short-plan"}]`
+- Order: `["success-definition","short-plan","produce-work","freeze-version","independent-check","join-check-results","final-record"]`
+- Maximum transitions: `16`
 
-## Worked example
+### Applicable route `ROADMAP`
+- Leaves: `["coordinate-work","final-record","freeze-version","independent-check","integration","join-check-results","plan-check","produce-work","roadmap-authoring","success-definition"]`
+- Edges: `[{"before":"coordinate-work","after":"produce-work"},{"before":"freeze-version","after":"independent-check"},{"before":"independent-check","after":"join-check-results"},{"before":"integration","after":"freeze-version"},{"before":"join-check-results","after":"final-record"},{"before":"plan-check","after":"coordinate-work"},{"before":"produce-work","after":"integration"},{"before":"roadmap-authoring","after":"plan-check"},{"before":"success-definition","after":"roadmap-authoring"}]`
+- Order: `["success-definition","roadmap-authoring","plan-check","coordinate-work","produce-work","integration","freeze-version","independent-check","join-check-results","final-record"]`
+- Maximum transitions: `23`
 
-Task: "fix a crash in the API." Run the §3 selector → STEP 1c (server logic →
-`backend`) → STEP 2d (something is broken) → framework name **`backend-fix`**.
-Open `frameworks/backend-fix.md`. Follow its steps: reproduce the crash
-red, root-cause it, fix it, prove green. Done when its workflow says done.
-
----
-
-## The 14-leaf map at a glance (name → when)
-
-- **`apply`** - the WHAT is fully specified (frozen spec, "rename X to Y everywhere", scaffold, config, dep bump): apply it, diff-review, prove green. No plan gate.
-- **`backend-fix`** - a backend behavior is broken: reproduce red, root-cause, fix, prove green.
-- **`backend-implement`** - add/change ONE bounded backend capability (endpoint, rule, job) with tests.
-- **`backend-build`** - build a whole NEW backend component/surface from scratch, incl. wiring.
-- **`frontend-fix`** - a UI/client behavior is broken: reproduce red, root-cause, prove green.
-- **`frontend-implement`** - add/change ONE bounded UI/client piece with tests + a usability check.
-- **`frontend-build`** - build a whole NEW UI surface/flow from scratch.
-- **`frontend-review`** - multi-persona live-site review: N real-user personas visit the RUNNING app, screenshot each step, report bugs/visual/UX/copy/customer-engagement findings into one deduped artifact; P0/P1s route back as fix lanes. Degrades to a marked static walkthrough when no browser.
-- **`polish`** - visual/copy/detail polish pass over an existing working surface (spacing, states, microcopy, responsiveness); pairs with `frontend-review` findings.
-- **`refactor`** - behavior-preserving restructuring: characterization tests first, then reshape + dead-code removal, PROVEN zero behavior change.
-- **`plan-scope`** - turn a mission into a scoped, dependency-ordered feature breakdown/roadmap.
-- **`plan-research`** - find/define an UNKNOWN target via real research-with-receipts (thesis + shortlist).
-- **`plan-design`** - produce an architecture/design decision for a KNOWN target (the blueprint a build framework consumes).
-- **`docs`** - a documentation deliverable (README/API docs/guide): audience analysis, accuracy-against-code verification, an example that runs.
-
----
-
-## TWO hard rules you must NEVER violate
-
-1. **FOLLOW LITERALLY.** Do the chosen framework's numbered steps and its if/else
-   scenarios exactly as written. Do not improvise, reorder, or skip. The framework
-   is the contract - no more, no less.
-2. **THE BLOCKED INVARIANT.** On ANY blocker, STOP: report the attempt + the concrete
-   unblock path and loop the verdict UP to your dispatcher - never fake a pass, never
-   fabricate evidence, never declare DONE over a red or un-runnable check, and NEVER
-   yield to the user. Each leaf carries this ~5-line invariant verbatim; obey it.
-
----
-
-## Multi-part / stacked tasks
-
-If your task spans more than one framework (e.g. fix a backend bug AND build a
-new page), see `frameworks/composition.md` for how frameworks stack and
-run simultaneously.
+<!-- AUTOPROMPT-FRAMEWORK-GATES:END -->

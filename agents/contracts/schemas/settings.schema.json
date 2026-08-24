@@ -1,0 +1,411 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/settings.schema.json",
+  "title": "Autoprompt v2 resolved settings",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "status",
+    "ready",
+    "inspectionAllowed",
+    "providerId",
+    "interactionMode",
+    "concurrency",
+    "modelRouting",
+    "resolvedAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "2.0.0"
+    },
+    "status": {
+      "const": "READY"
+    },
+    "ready": {
+      "const": true
+    },
+    "inspectionAllowed": {
+      "const": true
+    },
+    "providerId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "interactionMode": {
+      "enum": [
+        "interactive",
+        "headless"
+      ]
+    },
+    "concurrency": {
+      "type": "object",
+      "required": [
+        "friendlyMode",
+        "effectiveMaxSubs",
+        "providerMaximum",
+        "resolvedFrom"
+      ],
+      "properties": {
+        "friendlyMode": {
+          "enum": [
+            "tokensaver",
+            "wide",
+            "custom"
+          ]
+        },
+        "requestedMaxSubs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "providerWideMax": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "effectiveMaxSubs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "providerMaximum": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "resolvedFrom": {
+          "enum": [
+            "explicit-invocation",
+            "resumable-run-manifest",
+            "saved-user-preference"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "friendlyMode": {
+                "const": "tokensaver"
+              }
+            },
+            "required": [
+              "friendlyMode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "effectiveMaxSubs": {
+                "maximum": 6
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "friendlyMode": {
+                "const": "wide"
+              }
+            },
+            "required": [
+              "friendlyMode"
+            ]
+          },
+          "then": {
+            "required": [
+              "providerWideMax"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "friendlyMode": {
+                "const": "custom"
+              }
+            },
+            "required": [
+              "friendlyMode"
+            ]
+          },
+          "then": {
+            "required": [
+              "requestedMaxSubs"
+            ]
+          }
+        },
+        {
+          "if": { "properties": { "providerMaximum": { "const": 1 } }, "required": ["providerMaximum"] },
+          "then": { "properties": { "effectiveMaxSubs": { "maximum": 1 } } }
+        },
+        {
+          "if": { "properties": { "providerMaximum": { "const": 2 } }, "required": ["providerMaximum"] },
+          "then": { "properties": { "effectiveMaxSubs": { "maximum": 2 } } }
+        },
+        {
+          "if": { "properties": { "providerMaximum": { "const": 3 } }, "required": ["providerMaximum"] },
+          "then": { "properties": { "effectiveMaxSubs": { "maximum": 3 } } }
+        },
+        {
+          "if": { "properties": { "providerMaximum": { "const": 4 } }, "required": ["providerMaximum"] },
+          "then": { "properties": { "effectiveMaxSubs": { "maximum": 4 } } }
+        },
+        {
+          "if": { "properties": { "providerMaximum": { "const": 5 } }, "required": ["providerMaximum"] },
+          "then": { "properties": { "effectiveMaxSubs": { "maximum": 5 } } }
+        },
+        {
+          "if": { "properties": { "providerMaximum": { "const": 6 } }, "required": ["providerMaximum"] },
+          "then": { "properties": { "effectiveMaxSubs": { "maximum": 6 } } }
+        },
+        {
+          "if": { "properties": { "providerMaximum": { "const": 7 } }, "required": ["providerMaximum"] },
+          "then": { "properties": { "effectiveMaxSubs": { "maximum": 7 } } }
+        },
+        {
+          "if": { "properties": { "providerMaximum": { "const": 8 } }, "required": ["providerMaximum"] },
+          "then": { "properties": { "effectiveMaxSubs": { "maximum": 8 } } }
+        },
+        {
+          "if": { "properties": { "providerMaximum": { "const": 9 } }, "required": ["providerMaximum"] },
+          "then": { "properties": { "effectiveMaxSubs": { "maximum": 9 } } }
+        },
+        {
+          "if": { "properties": { "providerMaximum": { "const": 10 } }, "required": ["providerMaximum"] },
+          "then": { "properties": { "effectiveMaxSubs": { "maximum": 10 } } }
+        }
+      ]
+    },
+    "modelRouting": {
+      "type": "object",
+      "required": [
+        "supported",
+        "selectedBy"
+      ],
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "explicitUserModelPin": {
+          "type": "string",
+          "minLength": 1
+        },
+        "explicitUserEffortPin": {
+          "type": "string",
+          "minLength": 1
+        },
+        "selectedBy": {
+          "enum": [
+            "user-pin",
+            "explicit-invocation",
+            "resumable-run-manifest",
+            "saved-user-preference",
+            "automatic",
+            "provider-unsupported"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "required": [
+                  "explicitUserModelPin"
+                ]
+              },
+              {
+                "required": [
+                  "explicitUserEffortPin"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "selectedBy": {
+                "const": "user-pin"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "explicitUserModelPin"
+            ]
+          },
+          "then": {
+            "required": [
+              "model"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "explicitUserEffortPin"
+            ]
+          },
+          "then": {
+            "required": [
+              "effort"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "supported": {
+                "const": false
+              }
+            },
+            "required": [
+              "supported"
+            ]
+          },
+          "then": {
+            "properties": {
+              "selectedBy": {
+                "const": "provider-unsupported"
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "model"
+                  ]
+                },
+                {
+                  "required": [
+                    "effort"
+                  ]
+                },
+                {
+                  "required": [
+                    "explicitUserModelPin"
+                  ]
+                },
+                {
+                  "required": [
+                    "explicitUserEffortPin"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "path": {
+      "type": "object",
+      "required": [
+        "requested",
+        "mode",
+        "exactRoute",
+        "resolvedFrom"
+      ],
+      "properties": {
+        "requested": {
+          "enum": ["auto", "direct", "light", "roadmap"]
+        },
+        "mode": {
+          "enum": ["automatic", "exact"]
+        },
+        "exactRoute": {
+          "oneOf": [
+            { "enum": ["DIRECT", "LIGHT", "ROADMAP"] },
+            { "type": "null" }
+          ]
+        },
+        "resolvedFrom": {
+          "enum": [
+            "automatic",
+            "explicit-invocation",
+            "resumable-run-manifest",
+            "saved-user-preference"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "requested": { "const": "auto" } }, "required": ["requested"] },
+          "then": {
+            "properties": {
+              "mode": { "const": "automatic" },
+              "exactRoute": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": {
+              "mode": { "const": "exact" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "requested": { "const": "direct" } }, "required": ["requested"] },
+          "then": { "properties": { "exactRoute": { "const": "DIRECT" } } }
+        },
+        {
+          "if": { "properties": { "requested": { "const": "light" } }, "required": ["requested"] },
+          "then": { "properties": { "exactRoute": { "const": "LIGHT" } } }
+        },
+        {
+          "if": { "properties": { "requested": { "const": "roadmap" } }, "required": ["requested"] },
+          "then": { "properties": { "exactRoute": { "const": "ROADMAP" } } }
+        }
+      ]
+    },
+    "deadline": {
+      "type": "object",
+      "required": [
+        "absoluteDeadline",
+        "source",
+        "verificationReservePercent",
+        "recoveryAndFinalizationReservePercent"
+      ],
+      "properties": {
+        "absoluteDeadline": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "source": {
+          "enum": [
+            "explicit-invocation",
+            "task-host",
+            "product-maximum"
+          ]
+        },
+        "verificationReservePercent": {
+          "type": "integer",
+          "minimum": 25,
+          "maximum": 100
+        },
+        "recoveryAndFinalizationReservePercent": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 100
+        }
+      },
+      "additionalProperties": false
+    },
+    "resolvedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

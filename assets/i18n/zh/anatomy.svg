@@ -1,36 +1,29 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="590" viewBox="0 0 1800 590" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="2128" height="590" viewBox="0 0 2128 590" role="img" aria-labelledby="title desc" data-release-status="local-v1.0.9-build-not-published">
   <title id="title">Autoprompt 调用结构</title>
-  <desc id="desc">Autoprompt 命令分为触发、并发、智能体上限、模型路由和目标五个部分。</desc>
+  <desc id="desc">两种彼此分离、可复制的 Autoprompt 调用形式：不支持 path 的斜杠命令提供方，以及把 path 放在引号内请求首位的未发布本地 Codex v1.0.9 启动器。</desc>
   <defs>
     <pattern id="grid" width="56" height="56" patternUnits="userSpaceOnUse">
       <path d="M56 0H0V56" fill="none" stroke="#e2e2e4" stroke-width="1"/>
     </pattern>
   </defs>
 
-  <rect width="1800" height="590" fill="#fbfbfa"/>
-  <rect width="1800" height="590" fill="url(#grid)" opacity=".78"/>
+  <rect width="2128" height="590" fill="#fbfbfa"/>
+  <rect width="2128" height="590" fill="url(#grid)" opacity=".78"/>
 
   <!-- Single flat anatomy panel -->
   <g transform="translate(0 -244)">
-  <rect x="80" y="304" width="1640" height="470" rx="14" fill="#ffffff" stroke="#c9c9ce" stroke-width="1.5"/>
-  <line x1="80" y1="412" x2="1720" y2="412" stroke="#d6d6da" stroke-width="1"/>
-  <line x1="408" y1="304" x2="408" y2="774" stroke="#d6d6da" stroke-width="1"/>
-  <line x1="736" y1="304" x2="736" y2="774" stroke="#d6d6da" stroke-width="1"/>
-  <line x1="1064" y1="304" x2="1064" y2="774" stroke="#d6d6da" stroke-width="1"/>
-  <line x1="1392" y1="304" x2="1392" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <rect x="80" y="304" width="1968" height="470" rx="14" fill="#ffffff" stroke="#c9c9ce" stroke-width="1.5"/>
+  <line x1="80" y1="440" x2="2048" y2="440" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="408" y1="440" x2="408" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="736" y1="440" x2="736" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="1064" y1="440" x2="1064" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="1392" y1="440" x2="1392" y2="774" stroke="#d6d6da" stroke-width="1"/>
+  <line x1="1720" y1="440" x2="1720" y2="774" stroke="#d6d6da" stroke-width="1"/>
 
-  <!-- Command row -->
-  <g font-family="Nimbus Mono PS, monospace" font-size="22">
-    <text x="112" y="372" fill="#255C60" font-weight="700">/autoprompt</text>
-    <text x="440" y="372" fill="#0d0d0f">mode=wide</text>
-    <text x="768" y="372" fill="#0d0d0f">max_subs=100</text>
-    <text x="1096" y="372" fill="#0d0d0f">agents=auto</text>
-    <text x="1424" y="357" fill="#56565e" font-size="17" font-style="italic">
-      <tspan x="1424" dy="0">&lt;你的目标，</tspan>
-      <tspan x="1424" dy="25">用自然语言&gt;</tspan>
-    </text>
-  </g>
-  <rect x="112" y="397" width="54" height="3" fill="#255C60"/>
+  <text x="112" y="329" fill="#255C60" font-family="Nimbus Sans, Arial, sans-serif" font-size="14" font-weight="700">斜杠命令提供方（不含 CODEX V2）</text>
+  <text x="112" y="360" fill="#0d0d0f" font-family="Nimbus Mono PS, monospace" font-size="20">/autoprompt mode=wide max_subs=100 agents=auto &lt;你的目标&gt;</text>
+  <text x="112" y="389" fill="#255C60" font-family="Nimbus Sans, Arial, sans-serif" font-size="14" font-weight="700">CODEX V2 · 本地 V1.0.9 构建 · 尚未发布</text>
+  <text x="112" y="420" fill="#0d0d0f" font-family="Nimbus Mono PS, monospace" font-size="20">autoprompt activate codex -- "path=auto mode=wide max_subs=100 agents=auto &lt;你的目标&gt;"</text>
 
   <!-- Column 01 -->
   <text x="112" y="462" fill="#67676e" font-family="Nimbus Mono PS, monospace" font-size="14">01</text>
@@ -83,6 +76,18 @@
   <text x="1424" y="694" fill="#75757c" font-family="Nimbus Sans, Arial, sans-serif" font-size="15">
     <tspan x="1424" dy="0">描述你想要的</tspan>
     <tspan x="1424" dy="24">最终结果。</tspan>
+  </text>
+
+  <!-- Column 06: local Codex v1.0.9 build, not published -->
+  <text x="1752" y="462" fill="#67676e" font-family="Nimbus Mono PS, monospace" font-size="14">06</text>
+  <text x="1752" y="515" fill="#111113" font-family="Nimbus Sans, Arial, sans-serif" font-size="24" font-weight="600">路径 — 仅限 Codex v2</text>
+  <text x="1752" y="566" fill="#56565d" font-family="Nimbus Sans, Arial, sans-serif" font-size="18">
+    <tspan x="1752" dy="0">置于引号内请求首位。</tspan>
+    <tspan x="1752" dy="30">仅限本地构建。</tspan>
+  </text>
+  <text x="1752" y="694" fill="#75757c" font-family="Nimbus Mono PS, monospace" font-size="13">
+    <tspan x="1752" dy="0">auto / direct / light</tspan>
+    <tspan x="1752" dy="24">/ roadmap</tspan>
   </text>
 
   </g>

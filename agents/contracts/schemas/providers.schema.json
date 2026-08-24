@@ -1,0 +1,571 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/providers.schema.json",
+  "title": "Autoprompt v2 provider capability contract",
+  "type": "object",
+  "required": [
+    "kind",
+    "contractVersion",
+    "safeSupportValues",
+    "capabilityDefinitions",
+    "admissionPolicy",
+    "attestationVerificationPolicy",
+    "verificationAttestationSchema",
+    "providers"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "kind": {
+      "const": "autoprompt-provider-capability-contract"
+    },
+    "contractVersion": {
+      "const": "2.0.0"
+    },
+    "safeSupportValues": {
+      "const": [
+        "supported",
+        "degraded",
+        "unsupported",
+        "unknown"
+      ]
+    },
+    "capabilityDefinitions": {
+      "type": "object",
+      "minProperties": 11,
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "requiredFor",
+          "supportedMeans"
+        ],
+        "properties": {
+          "requiredFor": {
+            "type": "array",
+            "uniqueItems": true
+          },
+          "supportedMeans": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "admissionPolicy": {
+      "type": "object",
+      "required": [
+        "unknown",
+        "unsupported",
+        "degraded",
+        "supported"
+      ],
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "attestationVerificationPolicy": {
+      "type": "object",
+      "required": [
+        "canonicalization",
+        "excludedSignedPaths",
+        "trustedKeySource",
+        "acceptedAlgorithms",
+        "freshness",
+        "requiredBindings",
+        "requiredCapabilityRule",
+        "acceptedResult",
+        "failureStatus"
+      ],
+      "properties": {
+        "canonicalization": { "const": "stable-json-v1" },
+        "excludedSignedPaths": { "const": ["signature.value"] },
+        "trustedKeySource": { "const": "runtime-trusted-key-ring" },
+        "acceptedAlgorithms": { "const": ["ed25519", "ecdsa-p256-sha256"] },
+        "freshness": {
+          "type": "object",
+          "required": ["issuedAtNotAfterVerificationTime", "expiresAtAfterVerificationTime"],
+          "properties": {
+            "issuedAtNotAfterVerificationTime": { "const": true },
+            "expiresAtAfterVerificationTime": { "const": true }
+          },
+          "additionalProperties": false
+        },
+        "requiredBindings": { "const": ["providerId", "runtimeIdentityHash", "activationNonce"] },
+        "requiredCapabilityRule": { "const": "every-required-capability-must-be-attested" },
+        "acceptedResult": { "const": "supported" },
+        "failureStatus": { "const": "PROVIDER_UNSUPPORTED" }
+      },
+      "additionalProperties": false
+    },
+    "verificationAttestationSchema": {
+      "type": "object",
+      "required": [
+        "type",
+        "required",
+        "properties",
+        "additionalProperties"
+      ],
+      "properties": {
+        "type": {
+          "const": "object"
+        },
+        "required": {
+          "const": [
+            "schemaVersion",
+            "attestationId",
+            "providerId",
+            "issuer",
+            "issuedAt",
+            "expiresAt",
+            "signature",
+            "runtimeIdentityHash",
+            "activationNonce",
+            "verificationMethod",
+            "verifiedCapabilities",
+            "result"
+          ]
+        },
+        "properties": {
+          "type": "object",
+          "required": [
+            "schemaVersion",
+            "attestationId",
+            "providerId",
+            "issuer",
+            "issuedAt",
+            "expiresAt",
+            "signature",
+            "runtimeIdentityHash",
+            "activationNonce",
+            "verificationMethod",
+            "verifiedCapabilities",
+            "result"
+          ]
+        },
+        "additionalProperties": {
+          "const": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "providers": {
+      "type": "array",
+      "minItems": 9,
+      "maxItems": 9,
+      "items": {
+        "$ref": "#/$defs/provider"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "support": {
+      "enum": [
+        "supported",
+        "degraded",
+        "unsupported",
+        "unknown"
+      ]
+    },
+    "attestation": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "attestationId",
+        "providerId",
+        "issuer",
+        "issuedAt",
+        "expiresAt",
+        "signature",
+        "runtimeIdentityHash",
+        "activationNonce",
+        "verificationMethod",
+        "verifiedCapabilities",
+        "result"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "2.0.0"
+        },
+        "attestationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
+        },
+        "providerId": {
+          "enum": [
+            "codex",
+            "claude",
+            "opencode",
+            "kilo",
+            "vscode",
+            "prime",
+            "omp",
+            "deepseek",
+            "reasonix"
+          ]
+        },
+        "issuer": {
+          "type": "string",
+          "minLength": 3
+        },
+        "issuedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "signature": {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "keyId",
+            "value"
+          ],
+          "properties": {
+            "algorithm": {
+              "enum": [
+                "ed25519",
+                "ecdsa-p256-sha256"
+              ]
+            },
+            "keyId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "value": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43,512}$"
+            }
+          },
+          "additionalProperties": false
+        },
+        "runtimeIdentityHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "activationNonce": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{16,128}$"
+        },
+        "providerAdmissionSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "supportedEnvironment": {
+          "type": "object",
+          "required": [
+            "platform",
+            "arch",
+            "codexExecutableBasename",
+            "codexExecutableSha256",
+            "codexExecutableVersion"
+          ],
+          "properties": {
+            "platform": {
+              "type": "string",
+              "minLength": 2
+            },
+            "arch": {
+              "type": "string",
+              "minLength": 2
+            },
+            "codexExecutableBasename": {
+              "type": "string",
+              "minLength": 1
+            },
+            "codexExecutableSha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "codexExecutableVersion": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "verificationMethod": {
+          "enum": [
+            "live-conformance-suite",
+            "provider-signed-capability-probe"
+          ]
+        },
+        "verifiedCapabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "isolation",
+              "topologyEnforcement",
+              "privateSkillRoot",
+              "eventStreaming",
+              "toolOutputCapture",
+              "stableChildIdentity",
+              "sameContextContinuation",
+              "cancellation",
+              "isolatedChecking",
+              "processOwnership",
+              "modelRouting"
+            ]
+          }
+        },
+        "result": {
+          "enum": [
+            "supported",
+            "degraded",
+            "unsupported"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "codexAttestation": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/attestation"
+        },
+        {
+          "required": [
+            "providerAdmissionSha256",
+            "supportedEnvironment"
+          ],
+          "properties": {
+            "providerId": {
+              "const": "codex"
+            },
+            "signature": {
+              "properties": {
+                "algorithm": {
+                  "const": "ed25519"
+                },
+                "keyId": {
+                  "pattern": "^[a-f0-9]{64}$"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "provider": {
+      "type": "object",
+      "required": [
+        "id",
+        "priority",
+        "implementationStatus",
+        "currentIsolationClass",
+        "defaultAdmission",
+        "capabilities",
+        "safeDegradedBehavior",
+        "verificationRequired",
+        "verificationAttestation"
+      ],
+      "properties": {
+        "id": {
+          "enum": [
+            "codex",
+            "claude",
+            "opencode",
+            "kilo",
+            "vscode",
+            "prime",
+            "omp",
+            "deepseek",
+            "reasonix"
+          ]
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9
+        },
+        "implementationStatus": {
+          "enum": [
+            "declared-unverified",
+            "verified"
+          ]
+        },
+        "currentIsolationClass": {
+          "enum": [
+            "strict",
+            "prompt-guarded",
+            "unsupported"
+          ]
+        },
+        "defaultAdmission": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attestationRequired": {
+          "type": "boolean"
+        },
+        "capabilities": {
+          "type": "object",
+          "required": [
+            "isolation",
+            "topologyEnforcement",
+            "privateSkillRoot",
+            "eventStreaming",
+            "toolOutputCapture",
+            "stableChildIdentity",
+            "sameContextContinuation",
+            "cancellation",
+            "isolatedChecking",
+            "processOwnership",
+            "modelRouting"
+          ],
+          "properties": {
+            "isolation": {
+              "$ref": "#/$defs/support"
+            },
+            "topologyEnforcement": {
+              "$ref": "#/$defs/support"
+            },
+            "privateSkillRoot": {
+              "$ref": "#/$defs/support"
+            },
+            "eventStreaming": {
+              "$ref": "#/$defs/support"
+            },
+            "toolOutputCapture": {
+              "$ref": "#/$defs/support"
+            },
+            "stableChildIdentity": {
+              "$ref": "#/$defs/support"
+            },
+            "sameContextContinuation": {
+              "$ref": "#/$defs/support"
+            },
+            "cancellation": {
+              "$ref": "#/$defs/support"
+            },
+            "isolatedChecking": {
+              "$ref": "#/$defs/support"
+            },
+            "processOwnership": {
+              "$ref": "#/$defs/support"
+            },
+            "modelRouting": {
+              "$ref": "#/$defs/support"
+            }
+          },
+          "additionalProperties": false
+        },
+        "safeDegradedBehavior": {
+          "type": "string",
+          "minLength": 1
+        },
+        "verificationRequired": {
+          "type": "string",
+          "minLength": 1
+        },
+        "verificationAttestation": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/attestation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "implementationStatus": {
+                "const": "declared-unverified"
+              }
+            },
+            "required": [
+              "implementationStatus"
+            ]
+          },
+          "then": {
+            "properties": {
+              "verificationAttestation": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "id": {
+                "not": {
+                  "const": "codex"
+                }
+              },
+              "implementationStatus": {
+                "const": "verified"
+              }
+            },
+            "required": [
+              "id",
+              "implementationStatus"
+            ]
+          },
+          "then": {
+            "properties": {
+              "verificationAttestation": {
+                "$ref": "#/$defs/attestation"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "id": {
+                "const": "codex"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          },
+          "then": {
+            "required": [
+              "attestationRequired"
+            ],
+            "properties": {
+              "attestationRequired": {
+                "const": true
+              },
+              "defaultAdmission": {
+                "const": "allow-verified-required-capabilities"
+              },
+              "verificationAttestation": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/codexAttestation"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "attestationRequired"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}
