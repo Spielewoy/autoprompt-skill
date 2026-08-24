@@ -14,7 +14,7 @@ Scope produces one canonical `ROADMAP.md`:
 - **Multi-surface:** **exactly 5 agents, 3 rounds**; retain the first author's complete roadmap, add exactly two complementary scouts concurrently, then run reviewer and fresh verifier concurrently. No redundant ordinary synthesis dispatch.
 - **Unusually large:** may exceed the 6-agent ordinary budget only when the roadmap records a concrete escalation reason. Extra scouts own disjoint themes.
 
-Assurance failures repair only named roadmap items while preserving accepted evidence. Structural failures-empty roadmap, invalid dependencies, overlapping ownership, missing frameworks/tests, or failed capability-fail closed.
+Assurance failures repair only named roadmap items while preserving accepted evidence. Structural failures - empty roadmap, invalid dependencies, overlapping ownership, missing frameworks/tests, or failed capability - fail closed.
 
 ## Executable roadmap
 
