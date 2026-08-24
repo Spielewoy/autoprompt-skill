@@ -274,8 +274,7 @@ function providerInstallLocations(client, locationOptions = {}) {
     return singleRoot(root)
   }
   if (client === 'hermes') {
-    const hermesHome = env.HERMES_HOME || path.join(home, '.hermes')
-    return singleRoot(env.HERMES_HOME ? hermesHome : path.join(hermesHome, 'skills'))
+    return singleRoot(env.HERMES_HOME || path.join(home, '.hermes'))
   }
   if (client === 'kilo') {
     return {

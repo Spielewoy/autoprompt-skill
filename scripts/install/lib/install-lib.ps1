@@ -523,7 +523,7 @@ function Get-AutopromptConfigRoot {
         }
         'hermes' {
             if ($env:HERMES_HOME) { return $env:HERMES_HOME }
-            return (Join-Path $userHome '.hermes/skills')
+            return (Join-Path $userHome '.hermes')
         }
         default { return $userHome }
     }

@@ -379,10 +379,10 @@ install_harness_provider_depth() {
   verify_harness_provider_depth "$provider"
 }
 
-verify_reasonix_activation() {
+verify_hermes_activation() {
   local root source profile name target count=0
-  root="$(config_root reasonix)"
-  source="$(extras_skill_dir reasonix)/skills"
+  root="$(config_root hermes)"
+  source="$(extras_skill_dir hermes)/skills"
   for profile in "$source"/ap-*/SKILL.md; do
     [ -f "$profile" ] || continue
     count=$((count + 1))
@@ -393,15 +393,15 @@ verify_reasonix_activation() {
   [ "$count" -eq 25 ]
 }
 
-verify_hermes_activation() {
+verify_reasonix_activation() {
   local root source profile name target count=0
-  root="$(config_root hermes)"
-  source="$(extras_skill_dir hermes)/skills"
+  root="$(config_root reasonix)"
+  source="$(extras_skill_dir reasonix)/skills"
   for profile in "$source"/ap-*/SKILL.md; do
     [ -f "$profile" ] || continue
     count=$((count + 1))
     name="${profile%/SKILL.md}"; name="${name##*/}"
-    target="$root/$name/SKILL.md"
+    target="$root/skills/$name/SKILL.md"
     [ -f "$target" ] && cmp -s "$profile" "$target" || return 1
   done
   [ "$count" -eq 25 ]
@@ -431,7 +431,7 @@ function install_hermes_activation() {
     [ -f "$profile" ] || continue
     count=$((count + 1))
     name="${profile%/SKILL.md}"; name="${name##*/}"
-    target="$root/$name/SKILL.md"
+    target="$root/skills/$name/SKILL.md"
     _idem_install_managed_file "$root" "$profile" "$target" 1
     code=$?; [ "$code" -eq 0 ] || return "$code"
   done

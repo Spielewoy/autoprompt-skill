@@ -984,7 +984,7 @@ test('provider install locations match default config roots and external VS Code
       hermes: {
         roots: [{
           label: 'Install directory',
-          path: path.join(home, '.hermes', 'skills'),
+          path: path.join(home, '.hermes'),
         }],
       },
     },
@@ -1093,7 +1093,7 @@ test('provider install locations match default config roots and external VS Code
   assert.deepEqual(
     providerInstallLocations('hermes', { env: { HOME: home }, platform: 'linux' }),
     {
-      roots: [{ label: 'Install directory', path: path.join(home, '.hermes', 'skills') }],
+      roots: [{ label: 'Install directory', path: path.join(home, '.hermes') }],
     },
   )
 })

@@ -207,7 +207,7 @@ autoprompt_config_root() {
       fi
       ;;
     hermes)
-      printf '%s' "${HERMES_HOME:-$home/.hermes}/skills"
+      printf '%s' "${HERMES_HOME:-$home/.hermes}"
       ;;
     *) printf '%s' "$home" ;;
   esac
@@ -227,7 +227,7 @@ autoprompt_skill_root() {
     opencode) printf '%s/opencode/skills/autoprompt' "$(autoprompt_config_root opencode)" ;;
     kilo) printf '%s/.kilo/skills/autoprompt' "$home" ;;
     vscode) printf '%s/.copilot/skills/autoprompt' "$home" ;;
-    omp|deepseek|reasonix) printf '%s/skills/autoprompt' "$(autoprompt_config_root "$name")" ;;
+    omp|deepseek|reasonix|hermes) printf '%s/skills/autoprompt' "$(autoprompt_config_root "$name")" ;;
     *) return 1 ;;
   esac
 }
