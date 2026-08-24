@@ -65,7 +65,7 @@ Multi-surface scope uses **exactly 5 agents, 3 rounds**:
 
 Unusually-large scope may exceed the 6-agent ordinary budget only when `ROADMAP.md` records a concrete escalation reason. Additional scouts own disjoint themes. External research runs only when current external facts are required; repository-only work does not pay a research round trip.
 
-On assurance failure, retain accepted evidence and repair only named roadmap items. Never rerun the whole scope wave by default. Structural failures-empty roadmap, invalid dependency DAG, overlapping ownership, missing frameworks/tests, or failed capability-remain fail-closed.
+On assurance failure, retain accepted evidence and repair only named roadmap items. Never rerun the whole scope wave by default. Structural failures - empty roadmap, invalid dependency DAG, overlapping ownership, missing frameworks/tests, or failed capability - remain fail-closed.
 
 ## 4. Executable roadmap contract
 
