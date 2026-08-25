@@ -12,6 +12,7 @@ const { auditPrivatePermissions, ensureWindowsPrivateAcl } = require('./safe-run
 const LEASE_SCHEMA_VERSION = 3
 const TOKEN_PATTERN = /^[a-f0-9]{32,64}$/
 const HASH_PATTERN = /^[a-f0-9]{64}$/
+const ACTIVATION_NONCE_PATTERN = /^[A-Za-z0-9_-]{16,128}$/
 const MISSION_CAPABILITY_BINDING_FIELDS = Object.freeze([
   'runId', 'activationId', 'missionHash', 'nonce', 'generation', 'targetIdentity',
 ])
@@ -172,7 +173,7 @@ function validateOwner(owner) {
       typeof owner.runId !== 'string' || !owner.runId ||
       typeof owner.activationId !== 'string' || !owner.activationId ||
       !HASH_PATTERN.test(owner.missionHash || '') ||
-      typeof owner.nonce !== 'string' || !owner.nonce ||
+      typeof owner.nonce !== 'string' || !ACTIVATION_NONCE_PATTERN.test(owner.nonce) ||
       !Number.isSafeInteger(owner.generation) || owner.generation < 1 ||
       !Number.isSafeInteger(owner.pid) || owner.pid < 1 ||
       typeof owner.processIdentity !== 'string' || !owner.processIdentity ||
@@ -242,7 +243,8 @@ function validateTakeoverReceipt(receipt) {
       typeof receipt.priorProcessIdentity !== 'string' || !receipt.priorProcessIdentity ||
       typeof receipt.runId !== 'string' || !receipt.runId ||
       typeof receipt.activationId !== 'string' || !receipt.activationId ||
-      !HASH_PATTERN.test(receipt.missionHash || '') || typeof receipt.nonce !== 'string' || !receipt.nonce ||
+      !HASH_PATTERN.test(receipt.missionHash || '') || typeof receipt.nonce !== 'string' ||
+      !ACTIVATION_NONCE_PATTERN.test(receipt.nonce) ||
       !Number.isSafeInteger(receipt.generation) || receipt.generation < 1 ||
       !HASH_PATTERN.test(receipt.targetIdentity || '') ||
       !Array.isArray(receipt.persistedOwnedProcessIdentities) ||
@@ -277,7 +279,8 @@ function validatePredecessorRelease(receipt) {
       !HASH_PATTERN.test(receipt.priorOwnerChecksum || '') ||
       typeof receipt.runId !== 'string' || !receipt.runId ||
       typeof receipt.activationId !== 'string' || !receipt.activationId ||
-      !HASH_PATTERN.test(receipt.missionHash || '') || typeof receipt.nonce !== 'string' || !receipt.nonce ||
+      !HASH_PATTERN.test(receipt.missionHash || '') || typeof receipt.nonce !== 'string' ||
+      !ACTIVATION_NONCE_PATTERN.test(receipt.nonce) ||
       !Number.isSafeInteger(receipt.generation) || receipt.generation < 1 ||
       !HASH_PATTERN.test(receipt.targetIdentity || '') || !HASH_PATTERN.test(receipt.releaseIntentHash || '') ||
       !HASH_PATTERN.test(receipt.stateChecksum || '') || !Number.isSafeInteger(receipt.stateEventSequence) ||
@@ -337,7 +340,7 @@ class MissionLock {
         typeof options.runId !== 'string' || !options.runId ||
         typeof options.activationId !== 'string' || !options.activationId ||
         !HASH_PATTERN.test(options.missionHash || '') ||
-        typeof options.nonce !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{15,63}$/.test(options.nonce) ||
+        typeof options.nonce !== 'string' || !ACTIVATION_NONCE_PATTERN.test(options.nonce) ||
         !Number.isSafeInteger(options.generation) || options.generation < 1) {
       fail('LEASE_INPUT_INVALID', 'lease identity, activation, or process arguments are invalid')
     }
@@ -829,6 +832,7 @@ class MissionLock {
 }
 
 module.exports = {
+  ACTIVATION_NONCE_PATTERN,
   LEASE_SCHEMA_VERSION,
   MISSION_CAPABILITY_BINDING_FIELDS,
   TAKEOVER_RECEIPT_VERSION,

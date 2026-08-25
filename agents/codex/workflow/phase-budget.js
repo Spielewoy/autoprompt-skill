@@ -103,6 +103,7 @@ const CHECKER_ROLES = new Set([
   'plan-checker', 'independent-checker', 'independent-reviewer',
   'independent-tester', 'technical-decision-reviewer',
 ])
+const CANONICAL_CHECKER_CODES = new Set(['PASS', 'FAIL', 'CHECK_INCONCLUSIVE'])
 
 function resolveTerminalReceiptCandidateHash({
   logicalRole,
@@ -2393,7 +2394,7 @@ function typedChildOutputReady(output, record) {
     return output.schemaVersion === '2.0.0' && ['DECIDED', 'WAITING_USER'].includes(output.status)
   }
   if (CHECKER_ROLES.has(record.logicalRole)) {
-    return output.schemaVersion === '2.0.0' && ['PASS', 'FAIL'].includes(output.code)
+    return output.schemaVersion === '2.0.0' && CANONICAL_CHECKER_CODES.has(output.code)
   }
   return output.schemaVersion === '2.0.0' && output.reportType === 'result'
 }
@@ -4653,6 +4654,18 @@ class CodexSupervisorRuntime {
       acceptedResultIds: [],
     }
     let rootContinuationId = adoptedRoot && adoptedRoot.binding.continuationId || null
+    let rootCrashBinding = adoptedRoot && adoptedRoot.binding || null
+    let committedRootResultReceiptHash = null
+    let rootResultCommitAuthority = null
+    let adoptedContinuationPending = Boolean(adoptedRoot)
+    const armRootCorrectionRotation = receiptHash => {
+      if (rootResultCommitAuthority && committedRootResultReceiptHash === receiptHash) return
+      committedRootResultReceiptHash = receiptHash
+      rootResultCommitAuthority = this.scheduler.authorizeRootCrashContinuationRotationAfterResult(rootLease, {
+        priorBindingHash: rootCrashBinding && rootCrashBinding.bindingHash,
+        priorResultReceiptHash: receiptHash,
+      })
+    }
     const persistRootCheckpoint = (causeKind, evidence = null, causeDetails = {}, checkpointHints = {}) => {
       if (evidence) {
         this.recoveryThreads.set(rootLease.id, {
@@ -4671,16 +4684,36 @@ class CodexSupervisorRuntime {
       })
     }
     const onLaunchPrepared = binding => {
-      if (adoptedRoot) {
-        this.scheduler.rebindAdoptedContinuation(rootLease, {
-          priorBindingHash: adoptedRoot.binding.bindingHash,
+      if (committedRootResultReceiptHash) {
+        rootCrashBinding = this.scheduler.rotateRootCrashContinuationAfterResult(rootLease, {
+          priorBindingHash: rootCrashBinding && rootCrashBinding.bindingHash,
+          priorResultReceiptHash: committedRootResultReceiptHash,
+          resultCommitAuthority: rootResultCommitAuthority,
+          reservationId: binding.reservationId,
+          sessionId: binding.sessionId,
+          continuationId: binding.continuationId || null,
+          frontier: {
+            ...(rootCrashBinding && rootCrashBinding.frontier || recoveryFrontier),
+            acceptedResultIds: [
+              ...(rootCrashBinding && rootCrashBinding.frontier.acceptedResultIds || []),
+              committedRootResultReceiptHash,
+            ],
+          },
+        })
+        committedRootResultReceiptHash = null
+        rootResultCommitAuthority = null
+        adoptedContinuationPending = false
+      } else if (adoptedContinuationPending) {
+        rootCrashBinding = this.scheduler.rebindAdoptedContinuation(rootLease, {
+          priorBindingHash: rootCrashBinding.bindingHash,
           reservationId: binding.reservationId,
           sessionId: binding.sessionId,
           continuationId: rootContinuationId,
-          frontier: adoptedRoot.binding.frontier,
+          frontier: rootCrashBinding.frontier,
         })
+        adoptedContinuationPending = false
       } else {
-        this.scheduler.bindRootCrashContinuation(rootLease, {
+        rootCrashBinding = this.scheduler.bindRootCrashContinuation(rootLease, {
           reservationId: binding.reservationId,
           sessionId: binding.sessionId,
           continuationId: binding.continuationId || null,
@@ -4691,11 +4724,11 @@ class CodexSupervisorRuntime {
     }
     const onSessionIdentified = (continuationId, evidence) => {
       rootContinuationId = continuationId
-      this.scheduler.bindRootCrashContinuation(rootLease, {
+      rootCrashBinding = this.scheduler.bindRootCrashContinuation(rootLease, {
         reservationId: evidence.reservationId,
         sessionId: evidence.sessionId,
         continuationId,
-        frontier: recoveryFrontier,
+        frontier: rootCrashBinding && rootCrashBinding.frontier || recoveryFrontier,
       })
       persistRootCheckpoint('THREAD_STARTED', evidence)
     }
@@ -4815,6 +4848,7 @@ class CodexSupervisorRuntime {
       // remain OPEN in the same durable scheduler checkpoint.  Remove the
       // thread only after the record and atomic snapshot are both durable.
       this.recoveryThreads.delete(rootLease.id)
+      armRootCorrectionRotation(receipt.receiptHash)
       return receipt
     }
     const finish = result => {
@@ -4846,11 +4880,23 @@ class CodexSupervisorRuntime {
         () => this.processOwner.cancelAll({ reason: 'route decision timeout' }),
       )
     }
-    let correctionAttempts = 0
+    const adoptedAcceptedRootResults = adoptedRoot && adoptedRoot.binding &&
+      adoptedRoot.binding.frontier && adoptedRoot.binding.frontier.acceptedResultIds || []
+    if (adoptedAcceptedRootResults.length > 1) {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'root L0 recovery state contains more committed correction results than the one-correction contract permits',
+      )
+    }
+    // A rotated binding has already consumed attempt 0's durable receipt.
+    // Resume directly at the physical correction attempt instead of trying to
+    // authorize or replay the already-consumed result a second time.
+    let correctionAttempts = adoptedAcceptedRootResults.length
     while (true) {
       let submitted
       try {
         const committed = adoptedRoot && readRootReceipt(correctionAttempts)
+        if (committed) armRootCorrectionRotation(committed.receiptHash)
         submitted = committed ? committed.submitted : await decide(correctionAttempts)
       } catch (error) {
         if (error.code === 'ROUTE_DECISION_TIMEOUT') {
@@ -4886,6 +4932,7 @@ class CodexSupervisorRuntime {
       if (result.status === 'ROUTE_DECISION_INVALID' && result.correction_allowed) {
         await this._runtimeTransition('ROUTE_DECISION_INVALID_FIRST', 'L0_ROUTE_DECISION')
         correctionAttempts += 1
+        rootContinuationId = null
         continue
       }
       if (result.decision && this.record.write) {
@@ -6513,6 +6560,7 @@ class CodexSupervisorRuntime {
         }
       : null
     const launchRecord = {
+      runId: this.options.runId,
       workItemId: request.workItemId,
       schedulerLeaseId: lease.id,
       schedulerAttempt: lease.attempt,
@@ -6990,8 +7038,11 @@ class CodexSupervisorRuntime {
         }
         this.record.write(`checks/review-results/${checkKey}.json`, `${JSON.stringify(proof, null, 2)}\n`)
       }
-      if (canonicalAssignment && !CHECKER_ROLES.has(policy.child) &&
-          this.record && typeof this.record.write === 'function') {
+      // Persist every canonical child result at its assignment-bound location.
+      // Checker proofs remain separately recorded under checks/, while this
+      // immutable result artifact is the bounded evidence-pointer target used
+      // by same-author ROADMAP repair and crash-safe resume.
+      if (canonicalAssignment && this.record && typeof this.record.write === 'function') {
         this.record.write(canonicalAssignment.resultLocation, `${JSON.stringify(result, null, 2)}\n`)
       }
       if (policy.child !== 'route-analyst') {
@@ -8137,12 +8188,48 @@ function resourceStateEntry(repository, resource) {
   throw new SupervisorIntegrationError('PREIMAGE_UNSAFE', `owned resource has an unsupported physical type: ${absolute}`)
 }
 
+function assertNoLinkedPathPrefix(root, absolute, displayPath) {
+  const relative = path.relative(root, absolute)
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new SupervisorIntegrationError(
+      'MISSION_PATH_INVALID',
+      `path named in the canonical child brief is missing, unsafe, or outside the target: ${displayPath}`,
+    )
+  }
+  let cursor = root
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, part)
+    let stat
+    try { stat = fs.lstatSync(cursor) } catch (error) {
+      if (error && error.code === 'ENOENT') break
+      throw error
+    }
+    if (stat.isSymbolicLink()) {
+      throw new SupervisorIntegrationError(
+        'MISSION_PATH_INVALID',
+        `path named in the canonical child brief traverses a linked path: ${displayPath}`,
+      )
+    }
+  }
+}
+
 function canonicalAssignmentResources(input) {
   const targetRoot = path.resolve(input.targetPath)
   const canonicalTargetRoot = path.resolve(input.canonicalTargetPath || input.targetPath)
   const ownership = Array.isArray(input.request.ownership) && input.request.ownership.length
     ? input.request.ownership : ['workspace']
   const manifests = Array.isArray(input.request.manifests) ? input.request.manifests : []
+  const declaredFuturePaths = new Set(manifests.flatMap(item => {
+    if (!item || !LOCAL_MUTATION_RESOURCE_KINDS.has(String(item.kind || '').toLowerCase())) return []
+    const identity = String(item.identity || '').replace(/\\/g, '/')
+    if (!identity) return []
+    const canonicalAbsolute = path.isAbsolute(identity)
+      ? path.resolve(identity)
+      : path.resolve(canonicalTargetRoot, ...identity.split('/'))
+    if (canonicalAbsolute !== canonicalTargetRoot &&
+        !canonicalAbsolute.startsWith(`${canonicalTargetRoot}${path.sep}`)) return []
+    return [path.resolve(targetRoot, path.relative(canonicalTargetRoot, canonicalAbsolute))]
+  }))
   const rows = ownership.map(rawIdentity => {
     const identity = String(rawIdentity && rawIdentity.identity || rawIdentity)
     const declared = manifests.find(item => item && String(item.identity || '') === identity) ||
@@ -8235,17 +8322,23 @@ function canonicalAssignmentResources(input) {
     const boundResource = rows.find(resource => resolveOwnedResourcePath(input.targetPath, resource) === absolute)
     const authorizedCreation = Boolean(boundResource && boundResource.access === 'write' &&
       input.enforcePreimages === true && boundResource.expectedPreimageHash === MISSING_RESOURCE_PREIMAGE_HASH)
+    const declaredFutureReference = input.logicalRole === 'roadmap-author' && !input.readOnly &&
+      declaredFuturePaths.has(absolute)
     if (absolute !== targetRoot && !absolute.startsWith(`${targetRoot}${path.sep}`)) {
       throw new SupervisorIntegrationError(
         'MISSION_PATH_INVALID',
         `path named in the canonical child brief is missing, unsafe, or outside the target: ${prosePath}`,
       )
     }
+    assertNoLinkedPathPrefix(targetRoot, absolute, prosePath)
+    if (canonicalRelative !== null) {
+      assertNoLinkedPathPrefix(canonicalTargetRoot, canonicalAbsolute, prosePath)
+    }
     // Natural prose can contain slash-separated terms such as
     // `JavaScript/XSS`. Treat a missing bare term as prose unless it is bound
     // by the resource manifest. Explicit absolute/dot-relative paths remain
     // fail-closed, as do every existing symlink and declared resource.
-    if (!fs.existsSync(absolute) && !authorizedCreation) {
+    if (!fs.existsSync(absolute) && !authorizedCreation && !declaredFutureReference) {
       if (!explicitPathSyntax && !boundResource) continue
       throw new SupervisorIntegrationError(
         'MISSION_PATH_INVALID',
@@ -8462,7 +8555,7 @@ function validateCanonicalChildResult(record, result, runId, requestEnvelopeHash
   }
   if (record.logicalRole === 'route-analyst' || record.logicalRole === 'run-owner') return result
   if (CHECKER_ROLES.has(record.logicalRole)) {
-    if (result.schemaVersion !== '2.0.0' || !['PASS', 'FAIL'].includes(result.code) ||
+    if (result.schemaVersion !== '2.0.0' || !CANONICAL_CHECKER_CODES.has(result.code) ||
         result.runId !== runId || result.requestEnvelopeHash !== requestEnvelopeHash ||
         result.currentVersionHash !== record.candidateHash) {
       throw new SupervisorIntegrationError('CHECK_REPORT_INVALID', 'checker result is not bound to the admitted run, request, and exact version')
@@ -8893,9 +8986,46 @@ function validReadOnlyFinalResponse(response) {
   return /^[a-f0-9]{64}$/.test(responseHash || '') && responseHash === hashText(stableStringify(body))
 }
 
+function validateDurableResultEvidencePointer(pointer, expectedName) {
+  try {
+    if (!pointer || pointer.name !== expectedName || typeof pointer.path !== 'string' || !pointer.path ||
+        !/^[a-f0-9]{64}$/.test(pointer.hash || '') ||
+        !Number.isSafeInteger(pointer.bytes) || pointer.bytes < 1) {
+      throw new Error('resolved pointer is malformed')
+    }
+    const pointerPath = path.resolve(pointer.path)
+    const stat = fs.lstatSync(pointerPath)
+    if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.nlink) !== 1 || stat.size !== pointer.bytes) {
+      throw new Error('resolved pointer is not one exact regular result file')
+    }
+    if (sha256Bytes(fs.readFileSync(pointerPath)) !== pointer.hash) {
+      throw new Error('resolved pointer hash does not match its durable result')
+    }
+    return Object.freeze({ ...pointer, path: pointerPath })
+  } catch (error) {
+    throw new SupervisorIntegrationError(
+      'PLAN_CHECK_EVIDENCE_MISSING',
+      'ROADMAP plan repair requires the durable exact plan-check result pointer',
+      { cause: error && (error.code || error.message) || 'unknown' },
+    )
+  }
+}
+
 function executionMutableResourceOwnership(decision, route, workerCount) {
   const ownership = Array.isArray(decision && decision.mutableResourceOwnership)
     ? decision.mutableResourceOwnership : []
+  const canonicalOwners = new Set(ownership.flatMap(item => {
+    const match = item && /^worker-(\d+)$/u.exec(String(item.owner || ''))
+    return match && Number(match[1]) <= workerCount ? [String(item.owner)] : []
+  }))
+  const freeOwners = Array.from({ length: workerCount }, (_, index) => `worker-${index + 1}`)
+    .filter(owner => !canonicalOwners.has(owner))
+  const semanticOwners = route === 'ROADMAP' ? [...new Set(ownership.flatMap(item => {
+    const owner = String(item && item.owner || '')
+    return owner && /worker/iu.test(owner) && !/^worker-\d+$/u.test(owner) ? [owner] : []
+  }))] : []
+  const semanticOwnerMap = new Map(semanticOwners.slice(0, freeOwners.length)
+    .map((owner, index) => [owner, freeOwners[index]]))
   return ownership.map(item => {
     // The route decision describes logical ownership and may use a semantic
     // single-worker label (for example `geometry-worker`). Execution uses
@@ -8906,6 +9036,9 @@ function executionMutableResourceOwnership(decision, route, workerCount) {
     // `worker-N` assignments so disjoint ownership can be proven.
     if (item && workerCount === 1 && ['DIRECT', 'LIGHT', 'ROADMAP'].includes(route)) {
       return Object.freeze({ ...item, owner: 'worker-1' })
+    }
+    if (item && semanticOwnerMap.has(String(item.owner || ''))) {
+      return Object.freeze({ ...item, owner: semanticOwnerMap.get(String(item.owner)) })
     }
     return item
   })
@@ -9044,7 +9177,7 @@ function createDefaultRouteExecutor(options) {
         success: ['Executable fixture provenance and mutation replay remain RED until the pre-build validation passes.'],
         checks: ['Read and execute the declared pre-build validation only; do not edit the target.'],
         isolation: 'snapshot', writeProducing: false,
-        manifests: decision.mutableResourceOwnership || [], bounded: true,
+        manifests: executionOwnership, bounded: true,
         fetchedEvidence: { capturedDomainAdmission: capturedDomainPreWork },
         harnessAttestation: options.harnessAttestation(prebuildCandidateHash, oracle),
         nextReadyAfter: route === 'ROADMAP' ? ['roadmap-author'] : ['work-1'],
@@ -9115,6 +9248,7 @@ function createDefaultRouteExecutor(options) {
         workItemId: 'roadmap-author', logicalRole: 'roadmap-author', parent: 'run-owner',
         purpose: 'planning', assignment: `Create the dependency-ordered roadmap for: ${decision.requestedResult}. Return each concrete ordered step in behaviorChanged.`,
         ownership: [{ kind: 'output', identity: 'plan/ROADMAP.md', owner: 'roadmap-author' }], success: successes, checks,
+        manifests: executionOwnership,
         fetchedEvidence: capturedDomainWorkEvidence,
         nextReadyAfter: scoutCount > 0
           ? Array.from({ length: scoutCount }, (_, index) => `roadmap-scout-${index + 1}`)
@@ -9194,6 +9328,7 @@ function createDefaultRouteExecutor(options) {
           purpose: 'planning', repairOf: 'roadmap-author', executorKey: 'roadmap-author',
           assignment: 'Revise the same ROADMAP after consuming every named scout result; preserve one plan owner and return each correction verbatim in behaviorChanged.',
           ownership: [{ kind: 'output', identity: 'plan/ROADMAP.md', owner: 'roadmap-author' }], success: successes, checks,
+          manifests: executionOwnership,
           evidencePointers: scoutEvidence,
           fetchedEvidence: {
             scoutCorrections: concreteScoutCorrections,
@@ -9230,22 +9365,43 @@ function createDefaultRouteExecutor(options) {
         evidencePointers: scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
         fetchedEvidence: roadmapResult && Array.isArray(roadmapResult.scoutCorrections)
           ? { scoutCorrections: roadmapResult.scoutCorrections } : null,
-        manifests: decision.mutableResourceOwnership || [],
+        manifests: executionOwnership,
         harnessAttestation: options.harnessAttestation(planningCandidate, 'roadmap-plan-oracle'),
         nextReadyAfter: ['mission-coordination'],
       })
       if (planCheck.code && planCheck.code !== 'PASS') {
+        if (planCheck.code === 'CHECK_INCONCLUSIVE') {
+          return { outcome: 'BLOCKED', terminalEnvelope: planCheck }
+        }
+        let planCheckEvidence
+        try {
+          if (typeof options.resultPointer !== 'function') throw new Error('result pointer resolver is unavailable')
+          planCheckEvidence = validateDurableResultEvidencePointer(
+            options.resultPointer('roadmap-plan-check'),
+            'roadmap-plan-check',
+          )
+        } catch (error) {
+          if (error && error.code === 'PLAN_CHECK_EVIDENCE_MISSING') throw error
+          throw new SupervisorIntegrationError(
+            'PLAN_CHECK_EVIDENCE_MISSING',
+            'ROADMAP plan repair requires the durable exact plan-check result pointer',
+            { cause: error && (error.code || error.message) || 'unknown' },
+          )
+        }
         const repaired = await launch({
           workItemId: 'roadmap-author-plan-repair', logicalRole: 'roadmap-author', parent: 'run-owner',
           purpose: 'planning', repairOf: latestAuthorWorkItemId, executorKey: 'roadmap-author',
-          assignment: 'Repair only the concrete independent plan-check findings in the same author context.',
+          assignment: 'Repair only the concrete independent plan-check findings in the same author context. Read the exact roadmap-plan-check result through its evidence pointer.',
           ownership: [{ kind: 'output', identity: 'plan/ROADMAP.md', owner: 'roadmap-author' }], success: successes, checks,
+          manifests: executionOwnership,
           fetchedEvidence: {
-            planCheck,
             scoutCorrections: roadmapResult && roadmapResult.scoutCorrections || [],
             ...(capturedDomainWorkEvidence || {}),
           },
-          evidencePointers: scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
+          evidencePointers: [
+            ...scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
+            planCheckEvidence,
+          ],
           nextReadyAfter: ['roadmap-plan-recheck'],
         })
         roadmapResult = roadmapAuthorArtifact(
@@ -9262,12 +9418,15 @@ function createDefaultRouteExecutor(options) {
           candidateHash: repairedCandidate, oracle: 'roadmap-plan-oracle-recheck', success: successes, checks,
           isolation: 'snapshot', writeProducing: true, roadmapSlice: planPointer,
           evidencePointers: scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
-          manifests: decision.mutableResourceOwnership || [],
+          manifests: executionOwnership,
           harnessAttestation: options.harnessAttestation(repairedCandidate, 'roadmap-plan-oracle-recheck'),
           nextReadyAfter: ['mission-coordination'],
         })
         if (recheck.code && recheck.code !== 'PASS') {
-          return { outcome: 'FAILED', terminalEnvelope: recheck }
+          return {
+            outcome: recheck.code === 'CHECK_INCONCLUSIVE' ? 'BLOCKED' : 'FAILED',
+            terminalEnvelope: recheck,
+          }
         }
       }
       completedBeforeResume.add('roadmap-plan-check')
@@ -9301,7 +9460,7 @@ function createDefaultRouteExecutor(options) {
         purpose: 'planning', retainLease: true,
         assignment: 'Own dependency ordering and integration for the accepted roadmap.',
         ownership: likelyAreas.length ? likelyAreas : ['workspace'], success: successes, checks,
-        roadmapSlice: planPointer, manifests: decision.mutableResourceOwnership || [],
+        roadmapSlice: planPointer, manifests: executionOwnership,
         nextReadyAfter: workerCount >= 2 ? ['roadmap-work-group'] : ['work-1'],
       })
       retainedCoordinator = coordinator.retainedLease
@@ -9314,9 +9473,7 @@ function createDefaultRouteExecutor(options) {
           'ROADMAP work group lacks its retained run coordinator in the next ready work',
         )
       }
-        const ownership = Array.isArray(decision.mutableResourceOwnership)
-          ? decision.mutableResourceOwnership
-          : []
+        const ownership = executionOwnership
         const workerOwnership = Array.from({ length: workerCount }, (_, index) => ownership
           .filter(item => item && item.owner === `worker-${index + 1}`)
           .map(item => item.identity))
@@ -9334,7 +9491,7 @@ function createDefaultRouteExecutor(options) {
           assignment: decision.workerOwnershipReason ||
             'Admit the accepted ROADMAP work group with disjoint worker ownership.',
           ownership: workerOwnership.flat(), success: successes, checks,
-          roadmapSlice: planPointer, manifests: decision.mutableResourceOwnership || [],
+          roadmapSlice: planPointer, manifests: executionOwnership,
           workGroupAdmission: {
             route: 'ROADMAP',
             parentRoleId: 'mission-coordinator',
@@ -9459,7 +9616,7 @@ function createDefaultRouteExecutor(options) {
               purpose: 'work', assignment: part.assignment,
               ownership: namedOwnership.length ? namedOwnership : likelyAreas.length ? likelyAreas : ['workspace'],
               success: successes, checks, roadmapSlice: planPointer,
-              manifests: decision.mutableResourceOwnership || [], fetchedEvidence: capturedDomainWorkEvidence,
+              manifests: executionOwnership, fetchedEvidence: capturedDomainWorkEvidence,
               difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
               risk: (decision.risks || []).length ? 'high' : 'ordinary', nextReadyAfter: [],
             })
@@ -9640,7 +9797,7 @@ function createDefaultRouteExecutor(options) {
         candidateHash, oracle, success: successes, checks,
         isolation: 'snapshot',
         writeProducing: true,
-        roadmapSlice: planPointer, manifests: decision.mutableResourceOwnership || [],
+        roadmapSlice: planPointer, manifests: executionOwnership,
         risks: decision.risks || [],
         firstResponsibility: checking.responsibilities[0],
         secondResponsibility: checking.responsibilities[1],
@@ -9650,9 +9807,19 @@ function createDefaultRouteExecutor(options) {
         deferredPromotionToken: deferredPromotion && deferredPromotion.token || null,
         harnessAttestation: options.harnessAttestation(candidateHash, oracle),
       })
-      if (result.code && result.code !== 'PASS') {
-        if (deferredPromotion) await deferredPromotion.abort('independent checker failed')
-        return { outcome: 'FAILED', terminalEnvelope: result, checkHashes }
+      if (!CANONICAL_CHECKER_CODES.has(result && result.code)) {
+        throw new SupervisorIntegrationError(
+          'CHECK_REPORT_INVALID',
+          'independent checker returned an unknown canonical verdict code',
+        )
+      }
+      if (result.code !== 'PASS') {
+        if (deferredPromotion) await deferredPromotion.abort('independent checker did not pass')
+        return {
+          outcome: result.code === 'CHECK_INCONCLUSIVE' ? 'BLOCKED' : 'FAILED',
+          terminalEnvelope: result,
+          checkHashes,
+        }
       }
       if (result && result.payload && Array.isArray(result.payload.capturedDomainOutcomes)) {
         capturedDomainOutcomes.push(...result.payload.capturedDomainOutcomes)
@@ -12297,10 +12464,12 @@ module.exports = {
   selectRuntimeGateTriggers,
   validateLiveCheckingPlan,
   validateGeneratedFramework,
+  validateDurableResultEvidencePointer,
   validateWorkerRequestedTransition,
   validateCanonicalChildResult,
   requiredCompletionGates,
   reconstructTypedExitZeroResult,
+  typedChildOutputReady,
   reconcileExternalOperationTimeout,
   roadmapAuthorArtifact,
   resolveTerminalReceiptCandidateHash,

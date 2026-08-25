@@ -89,6 +89,60 @@ test('AP-TRACE-014 every path named in brief prose must exist inside the target'
   })
   assert.equal(creation[0].identity, 'output/new-file.txt')
   assert.match(creation[0].expectedPreimageHash, /^[a-f0-9]{64}$/)
+
+  const futureSql = path.join(target, 'output', 'future.sql')
+  const plannedDeliverable = canonicalAssignmentResources({
+    targetPath: target, canonicalTargetPath: target,
+    logicalRole: 'roadmap-author', readOnly: false, enforcePreimages: true,
+    request: {
+      workItemId: 'roadmap-author', assignment: `Plan creation of ${futureSql}.`,
+      ownership: [{ kind: 'output', identity: 'plan/ROADMAP.md', owner: 'roadmap-author' }],
+      manifests: [{ kind: 'file', identity: futureSql, owner: 'worker-sql' }],
+    },
+  })
+  assert.equal(plannedDeliverable.some(resource => resource.identity === 'plan/ROADMAP.md'), true)
+  assert.equal(plannedDeliverable.some(resource => resource.identity.endsWith('future.sql')), false)
+
+  for (const denied of [
+    { logicalRole: 'independent-checker', readOnly: true, workItemId: 'check-1' },
+    { logicalRole: 'worker', readOnly: false, workItemId: 'work-1' },
+  ]) {
+    assert.throws(() => canonicalAssignmentResources({
+      targetPath: target, canonicalTargetPath: target,
+      logicalRole: denied.logicalRole, readOnly: denied.readOnly, enforcePreimages: true,
+      request: {
+        workItemId: denied.workItemId, assignment: `Inspect ${futureSql}.`,
+        ownership: [{ kind: 'directory', identity: 'workspace', owner: denied.workItemId }],
+        manifests: [{ kind: 'file', identity: futureSql, owner: 'worker-sql' }],
+      },
+    }), error => ['MISSION_PATH_INVALID', 'OWNERSHIP_AUTHORIZATION_DENIED'].includes(error.code))
+  }
+
+  assert.throws(() => canonicalAssignmentResources({
+    targetPath: target, canonicalTargetPath: target,
+    logicalRole: 'roadmap-author', readOnly: false, enforcePreimages: true,
+    request: {
+      workItemId: 'roadmap-author', assignment: 'Plan creation of /outside/future.sql.',
+      ownership: [{ kind: 'output', identity: 'plan/ROADMAP.md', owner: 'roadmap-author' }],
+      manifests: [{ kind: 'file', identity: '/outside/future.sql', owner: 'worker-sql' }],
+    },
+  }), error => error.code === 'MISSION_PATH_INVALID')
+
+  if (process.platform !== 'win32') {
+    const foreign = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-r10-foreign-'))
+    t.after(() => fs.rmSync(foreign, { recursive: true, force: true }))
+    fs.symlinkSync(foreign, path.join(target, 'linked-output'), 'dir')
+    const linkedFuture = path.join(target, 'linked-output', 'future.sql')
+    assert.throws(() => canonicalAssignmentResources({
+      targetPath: target, canonicalTargetPath: target,
+      logicalRole: 'roadmap-author', readOnly: false, enforcePreimages: true,
+      request: {
+        workItemId: 'roadmap-author', assignment: `Plan creation of ${linkedFuture}.`,
+        ownership: [{ kind: 'output', identity: 'plan/ROADMAP.md', owner: 'roadmap-author' }],
+        manifests: [{ kind: 'file', identity: linkedFuture, owner: 'worker-sql' }],
+      },
+    }), error => error.code === 'MISSION_PATH_INVALID')
+  }
 })
 
 test('AP-COST-009 production admission rejects unproved expansion and persists exact marginal value', () => {

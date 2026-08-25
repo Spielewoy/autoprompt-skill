@@ -193,11 +193,12 @@ function stateHarness(t, options = {}) {
   const issued = new WeakSet()
   const capability = options.capability || Object.freeze({ type: 'test-opaque-capability' })
   if (!options.capabilityVerifier) issued.add(capability)
+  const activationNonce = options.activationNonce || 'nonce_123456789012'
   const capabilityBinding = {
     runId: eventBinding.runId,
     activationId: 'activation-001',
     missionHash: digest('mission'),
-    nonce: 'nonce_123456789012',
+    nonce: activationNonce,
     generation: 1,
     targetIdentity: eventBinding.targetIdentity,
   }
@@ -223,7 +224,7 @@ function stateHarness(t, options = {}) {
       ...eventBinding,
       activation: {
         id: 'activation-001',
-        nonce: 'nonce_123456789012',
+        nonce: activationNonce,
         missionHash: digest('mission'),
         sessionToken: 'session-token-001',
         generation: 1,
@@ -3342,6 +3343,13 @@ test('finalizer retries a crash after deterministic direct release-intent bindin
   assert.equal(leaseStatus, 'RELEASED')
 })
 
+test('AP-CODEX-V2-036 runtime-state admission accepts signed Base64URL nonce prefixes and boundaries', t => {
+  for (const nonce of [`-${'a'.repeat(15)}`, `_${'a'.repeat(15)}`, `-${'a'.repeat(127)}`]) {
+    const harness = stateHarness(t, { activationNonce: nonce })
+    assert.equal(harness.store.load().activation.nonce, nonce)
+  }
+})
+
 test('AP-RUN-007 delegated POSIX runtime admission rejects every hostile nonce suffix', (t) => {
   const invalidNonces = [
     '',
@@ -3352,7 +3360,7 @@ test('AP-RUN-007 delegated POSIX runtime admission rejects every hostile nonce s
     `${'a'.repeat(16)}*suffix`,
     `${'a'.repeat(16)}\nsuffix`,
     `${'a'.repeat(16)}а`,
-    'a'.repeat(65),
+    'a'.repeat(129),
   ]
 
   for (const nonce of invalidNonces) {

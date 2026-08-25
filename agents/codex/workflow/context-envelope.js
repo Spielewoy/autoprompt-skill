@@ -24,6 +24,12 @@ const DISPATCH_REQUIRED_CAPABILITIES = Object.freeze([
 ])
 const NORMAL_AUTOPROMPT_ROLE = /^ap-(?!arbiter$|re-anchor$)/
 const RECOVERY_AUTOPROMPT_ROLE = /^ap-(?:re-anchor|recovery(?:-|$))/
+const L4_EXACT_REQUEST_ROLES = new Set([
+  'ap-arbiter', 'ap-framework-validator', 'ap-fresh-verifier', 'ap-goal-checker',
+  'ap-independent-checker', 'ap-intake', 'ap-juror', 'ap-preflight-probe',
+  'ap-re-anchor', 'ap-reviewer', 'ap-sweeper', 'ap-verifier',
+])
+const REQUIRED_EXACT_REQUEST_ROLES = new Set(['ap-independent-checker'])
 const CONTEXT_ROUTE_CAPS = Object.freeze({
   PENDING: Object.freeze({ briefBytes: 2048, roadmapSliceBytes: 2048, manifestBytes: 2048, fetchedEvidenceBytes: 4096, totalEnvelopeBytes: 8192 }),
   DIRECT: Object.freeze({ briefBytes: 2048, roadmapSliceBytes: 2048, manifestBytes: 2048, fetchedEvidenceBytes: 4096, totalEnvelopeBytes: 8192 }),
@@ -426,9 +432,13 @@ function buildContextFreeBrief(input, options = {}) {
 
 function buildCheckerContext(input, options = {}) {
   const item = input || {}
+  const role = item.role || 'ap-independent-checker'
+  if (!L4_EXACT_REQUEST_ROLES.has(role)) {
+    throw new ContextEnvelopeError('INVALID_CHECKER_ROLE', 'only a canonical L4 role may receive the exact request')
+  }
   const dispatch = buildContextFreeBrief({
     ...item,
-    role: item.role || 'ap-checker',
+    role,
     assignment: item.assignment || 'Independently review and test the exact version.',
   }, options)
   const exactRequest = loadRequestEnvelope(dispatch.requestPointer, {
@@ -798,7 +808,35 @@ function auditDispatch(dispatch, options = {}) {
     assertContextComponent('roadmapSlice', dispatch && (dispatch.roadmapSlice ?? dispatch.roadmap_slice), caps.roadmapSliceBytes)
     assertContextComponent('manifests', dispatch && (dispatch.manifests ?? dispatch.manifestPointers ?? dispatch.manifest_pointers), caps.manifestBytes)
     assertContextComponent('fetchedEvidence', dispatch && (dispatch.fetchedEvidence ?? dispatch.fetched_evidence), caps.fetchedEvidenceBytes)
-    if (Buffer.byteLength(stableStringify(dispatch || {}), 'utf8') > caps.totalEnvelopeBytes) {
+    const boundedDispatch = { ...(dispatch || {}) }
+    const exactRequestRole = L4_EXACT_REQUEST_ROLES.has(role)
+    const exactRequestRequired = REQUIRED_EXACT_REQUEST_ROLES.has(role)
+    const carriesExactRequest = Object.hasOwn(boundedDispatch, 'exactRequest')
+    if (exactRequestRequired && !carriesExactRequest) {
+      violations.push('L4 checker dispatch is missing its exact immutable request')
+    } else if (!exactRequestRole && carriesExactRequest) {
+      violations.push('non-L4 dispatch cannot carry the exact request')
+    }
+    if (exactRequestRole && carriesExactRequest) {
+      const exactRequestBytes = toRequestBuffer(boundedDispatch.exactRequest)
+      const exactRequestHash = sha256Bytes(exactRequestBytes)
+      const pointer = normalizePointer(boundedDispatch.requestPointer)
+      let pointerBytes = null
+      try {
+        pointerBytes = loadRequestEnvelope(pointer, { expectedHash: exactRequestHash, asBuffer: true })
+      } catch {}
+      if (boundedDispatch.exactRequestHash !== exactRequestHash || pointer.hash !== exactRequestHash ||
+          !Number.isSafeInteger(pointer.bytes) || pointer.bytes < 0 ||
+          pointer.bytes !== exactRequestBytes.length || !pointerBytes || !pointerBytes.equals(exactRequestBytes)) {
+        violations.push('checker exact request does not match its immutable request pointer')
+      }
+      // L4 receives the byte-identical canonical request. The request is
+      // already independently size- and hash-bound by requestPointer, so it
+      // is not inherited context and must not be charged a second time as
+      // auxiliary dispatch data.
+      delete boundedDispatch.exactRequest
+    }
+    if (Buffer.byteLength(stableStringify(boundedDispatch), 'utf8') > caps.totalEnvelopeBytes) {
       violations.push('dispatch exceeds the route total context ceiling')
     }
   } catch (error) { violations.push(error.message) }

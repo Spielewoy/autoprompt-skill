@@ -41,6 +41,16 @@ const EXECUTION_POLICY = Object.freeze({
   policyId: 'autoprompt.codex.role-policy',
   policyVersion: '2.0.0',
 })
+const CHECKER_EXECUTION_POLICY = Object.freeze({
+  logicalRole: 'independent-reviewer',
+  physicalRole: 'autoprompt.v2.independent-reviewer',
+  providerRole: 'ap-independent-checker',
+  sandboxMode: 'read-only',
+  canDispatch: false,
+  resourceSets: Object.freeze({ read: Object.freeze(['target.snapshot.read']), write: Object.freeze([]), exclusive: Object.freeze([]) }),
+  policyId: 'autoprompt.codex.role-policy',
+  policyVersion: '2.0.0',
+})
 
 function temporaryDirectory(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-schema-'))
@@ -188,6 +198,53 @@ test('Codex adapter sends the compatibility schema and restores canonical output
   assert.deepEqual(observedUsage, { noncachedInput: 4, cachedInput: 7, output: 1, reasoning: 0 })
   assert.equal(result.outcome, 'DONE')
   assert.equal(Object.hasOwn(result, 'canonicalJson'), false)
+})
+
+test('Codex adapter preserves a final CHECK_INCONCLUSIVE instead of reconstructing FAIL', async t => {
+  const directory = temporaryDirectory(t)
+  const canonicalOutput = {
+    schemaVersion: '2.0.0', code: 'CHECK_INCONCLUSIVE',
+    runId: 'run-inconclusive', requestEnvelopeHash: 'a'.repeat(64),
+    currentVersionHash: 'b'.repeat(64), payload: { unblockPath: 'provide isolated scratch storage' },
+  }
+  let stopReason = null
+  let terminal = null
+  const runner = {
+    async run(spec) {
+      spec.onStdoutLine(JSON.stringify({
+        type: 'thread.started', thread_id: '44444444-4444-4444-8444-444444444444',
+      }))
+      spec.onStdoutLine(JSON.stringify({
+        type: 'item.completed',
+        item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(canonicalOutput) }) },
+      }))
+      spec.onStdoutLine(JSON.stringify({
+        type: 'turn.completed',
+        usage: { input_tokens: 3, cached_input_tokens: 1, output_tokens: 1, reasoning_output_tokens: 0 },
+      }))
+      return { status: 0, stdout: '', stderr: '', processOwned: true, exactArgv: true, drained: true }
+    },
+    async stop(spec) { stopReason = spec.reason; return { drained: true } },
+  }
+  const adapter = new CodexExecAdapter({
+    runner, targetPath: ROOT,
+    profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'outcome.schema.json'),
+    providerSchemaRoot: path.join(directory, 'provider-schemas'),
+  })
+  const result = await adapter.launch({
+    ...CHECKER_EXECUTION_POLICY,
+    physicalExecutionPolicy: CHECKER_EXECUTION_POLICY,
+    entryPrompt: '$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\nrequest_sha256=bound',
+    dispatch: { brief: 'Check the bounded candidate.', requestPointer: { path: 'request', hash: 'hash' } },
+    environment: {}, sessionId: 'run:DIRECT:check-inconclusive', reservationId: 'reservation-inconclusive',
+    onUsageDelta() { return { continue: true } },
+    onTerminalResult(value) { terminal = value },
+  })
+  assert.equal(stopReason, 'typed terminal CHECK_INCONCLUSIVE')
+  assert.equal(result.code, 'CHECK_INCONCLUSIVE')
+  assert.equal(terminal.code, 'CHECK_INCONCLUSIVE')
+  assert.equal(Object.hasOwn(result, 'reconstructedTerminal'), false)
 })
 
 test('Codex adapter ignores an early progress agent message until the final structured turn result', async t => {
@@ -496,7 +553,28 @@ test('canonical worker authorization accepts only its matching implementation-wo
   }, 'ROADMAP', 1)[0].owner, 'worker-1')
   assert.equal(executionMutableResourceOwnership({
     mutableResourceOwnership: semanticOwnership,
-  }, 'ROADMAP', 2)[0].owner, 'geometry-worker')
+  }, 'ROADMAP', 2)[0].owner, 'worker-1')
+
+  const multiWorkerOwnership = [
+    { kind: 'external-system', identity: 'ERP', owner: 'mission-coordinator' },
+    { kind: 'file', identity: '/app/output/erp.sql', owner: 'worker-erp' },
+    { kind: 'file', identity: '/app/output/mes.sql', owner: 'worker-mes' },
+    { kind: 'file', identity: '/app/output/wms.sql', owner: 'worker-wms' },
+  ]
+  assert.deepEqual(executionMutableResourceOwnership({
+    mutableResourceOwnership: multiWorkerOwnership,
+  }, 'ROADMAP', 3).map(item => item.owner), [
+    'mission-coordinator', 'worker-1', 'worker-2', 'worker-3',
+  ])
+
+  const reserved = [
+    { kind: 'file', identity: '/app/output/core.sql', owner: 'worker-2' },
+    { kind: 'file', identity: '/app/output/erp.sql', owner: 'worker-erp' },
+    { kind: 'file', identity: '/app/output/wms.sql', owner: 'worker-wms' },
+  ]
+  assert.deepEqual(executionMutableResourceOwnership({
+    mutableResourceOwnership: reserved,
+  }, 'ROADMAP', 3).map(item => item.owner), ['worker-2', 'worker-1', 'worker-3'])
 })
 
 test('canonical brief path validation distinguishes slash-separated prose from explicit paths', t => {

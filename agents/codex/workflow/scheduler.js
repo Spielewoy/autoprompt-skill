@@ -1847,6 +1847,81 @@ class CentralScheduler {
     return record.crashBinding
   }
 
+  authorizeRootCrashContinuationRotationAfterResult(lease, binding = {}) {
+    const record = this._rootRecordForLease(lease)
+    const prior = record.crashBinding
+    if (!prior || binding.priorBindingHash !== prior.bindingHash ||
+        !/^[a-f0-9]{64}$/.test(binding.priorResultReceiptHash || '') ||
+        prior.frontier.acceptedResultIds.includes(binding.priorResultReceiptHash) ||
+        record.pendingRootCorrectionRotation) {
+      throw this._error(
+        'CRASH_BINDING_ROTATION_INVALID',
+        'root correction rotation authority requires one new committed result bound to the exact current root process',
+      )
+    }
+    const authority = Object.freeze({
+      schemaVersion: 1,
+      leaseId: record.id,
+      priorBindingHash: prior.bindingHash,
+      priorResultReceiptHash: binding.priorResultReceiptHash,
+    })
+    record.pendingRootCorrectionRotation = authority
+    return authority
+  }
+
+  rotateRootCrashContinuationAfterResult(lease, binding = {}) {
+    const record = this._rootRecordForLease(lease)
+    const prior = record.crashBinding
+    const authority = binding.resultCommitAuthority
+    if (!prior || authority !== record.pendingRootCorrectionRotation ||
+        !authority || authority.leaseId !== record.id ||
+        authority.priorBindingHash !== prior.bindingHash ||
+        authority.priorResultReceiptHash !== binding.priorResultReceiptHash ||
+        !nonEmpty(binding.reservationId) || !nonEmpty(binding.sessionId) ||
+        !(binding.continuationId === null || binding.continuationId === undefined || nonEmpty(binding.continuationId))) {
+      throw this._error(
+        'CRASH_BINDING_ROTATION_INVALID',
+        'root correction rotation requires the exact prior binding, committed result receipt, and replacement transport identities',
+      )
+    }
+    const reservationId = binding.reservationId.trim()
+    const sessionId = binding.sessionId.trim()
+    if (reservationId === prior.reservationId || sessionId === prior.sessionId ||
+        (binding.continuationId != null && binding.continuationId.trim() === prior.continuationId)) {
+      throw this._error(
+        'CRASH_BINDING_ROTATION_INVALID',
+        'root correction rotation requires fresh physical provider identities',
+      )
+    }
+    const frontier = normalizeCrashFrontier(binding.frontier)
+    const priorFrontier = normalizeCrashFrontier(prior.frontier)
+    const expectedAcceptedResultIds = [
+      ...priorFrontier.acceptedResultIds,
+      binding.priorResultReceiptHash,
+    ]
+    if (frontier.resumeState !== priorFrontier.resumeState ||
+        stableStringify(frontier.nextReadyWorkIds) !== stableStringify(priorFrontier.nextReadyWorkIds) ||
+        stableStringify(frontier.openCheckIds) !== stableStringify(priorFrontier.openCheckIds) ||
+        stableStringify(frontier.acceptedResultIds) !== stableStringify(expectedAcceptedResultIds)) {
+      throw this._error(
+        'CRASH_BINDING_ROTATION_INVALID',
+        'root correction rotation must preserve the logical frontier and add exactly the committed prior result receipt',
+      )
+    }
+    const normalized = {
+      schemaVersion: 1,
+      reservationId,
+      sessionId,
+      continuationId: binding.continuationId == null ? null : binding.continuationId.trim(),
+      frontier,
+    }
+    normalized.bindingHash = sha256(Buffer.from(stableStringify(normalized), 'utf8'))
+    record.crashBinding = Object.freeze(normalized)
+    record.pendingRootCorrectionRotation = null
+    record.adoptedFromCrash = false
+    return record.crashBinding
+  }
+
   rebindAdoptedContinuation(lease, binding = {}) {
     let record
     if (this._issuedLeases.has(lease)) record = this._recordForLease(lease)

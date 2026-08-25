@@ -44,6 +44,20 @@
       "payloadDigest": "dc4a59806b3347ab69efc6858b7665690dcfbcbf8ae082c1890085809c923a1c",
       "previousRecordDigest": "71f703ec61b16ad273c4895c2631bf7bcd863b7a9d17cd5fa16692dcc33fc069",
       "recordDigest": "a5de16dc1b062e47a450239e86f93addcbbec455416056d7fec936b1ca52d386"
+    },
+    {
+      "version": "1.0.11",
+      "payloadGeneration": "codex-v2.0.0-133d45ae22011557",
+      "payloadDigest": "133d45ae22011557a7b54fcc2ef2003c042a32a90e726b40f670bcfd06a3d90b",
+      "previousRecordDigest": "a5de16dc1b062e47a450239e86f93addcbbec455416056d7fec936b1ca52d386",
+      "recordDigest": "1e401185affe64557434b5857a912c32fa01d55d7c5907002b1a427135ba3106"
+    },
+    {
+      "version": "1.0.12",
+      "payloadGeneration": "codex-v2.0.0-2f3b7a044bfd7c17",
+      "payloadDigest": "2f3b7a044bfd7c17d587a3a7dfd82a849736a19c368df168e4cd6f1bf9b13f54",
+      "previousRecordDigest": "1e401185affe64557434b5857a912c32fa01d55d7c5907002b1a427135ba3106",
+      "recordDigest": "977af485c3f0a97f5d409872d99901f3427a9991df1a4b7ba48345d4a0356b1d"
     }
   ]
 }

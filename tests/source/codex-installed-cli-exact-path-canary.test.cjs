@@ -873,7 +873,7 @@ test('packed installed DIRECT normalizeTags RED-to-GREEN canary', {
         },
         supervisorEntry: { promptSha256: '2'.repeat(64) },
         providerAttestation: {
-          attestation: { activationNonce: 'installed-direct-canary-nonce' },
+          attestation: { activationNonce: '_Nun56FgLGR7mAQLNyqoNUrtGc7NNbCR' },
         },
         activationBoundary: {
           gitConfig: configIsolationPath,

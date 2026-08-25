@@ -839,6 +839,32 @@ test('route context caps reject oversized slices and total fetched evidence', t 
   }), (error) => ['CONTEXT_COMPONENT_TOO_LARGE', 'CONTEXT_ENVELOPE_TOO_LARGE'].includes(error.code))
 })
 
+test('L4 excludes only its exact hash-bound request from the auxiliary envelope ceiling', t => {
+  const directory = tempDirectory(t, 'autoprompt-checker-exact-request-cap-')
+  const exactRequest = 'x'.repeat(CONTEXT_ROUTE_CAPS.DIRECT.totalEnvelopeBytes)
+  const pointer = writeRequestEnvelope(directory, exactRequest)
+  const checker = buildCheckerContext({
+    role: 'ap-independent-checker', assignment: 'Check the exact candidate.', route: 'DIRECT',
+    requestPointer: pointer, expectedRequestHash: pointer.hash, candidateHash: 'candidate-sha256',
+    providerCapabilities: PROVIDER_CAPABILITIES,
+  })
+  assert.deepEqual(auditDispatch(checker).violations, [])
+
+  assert.deepEqual(auditDispatch({ ...checker, exactRequest: `${exactRequest}!` }).violations,
+    ['checker exact request does not match its immutable request pointer'])
+  assert.deepEqual(auditDispatch({ ...checker, requestPointer: { ...pointer, bytes: undefined } }).violations,
+    ['checker exact request does not match its immutable request pointer'])
+  assert.ok(auditDispatch({ ...checker, role: 'ap-worker' }).violations.includes(
+    'non-L4 dispatch cannot carry the exact request'))
+  assert.ok(auditDispatch({ ...checker, fetchedEvidence: 'y'.repeat(5000) }).violations.some(
+    violation => violation.includes('fetchedEvidence exceeds')))
+
+  const missing = { ...checker }
+  delete missing.exactRequest
+  assert.deepEqual(auditDispatch(missing).violations,
+    ['L4 checker dispatch is missing its exact immutable request'])
+})
+
 test('hash-bound harness attestations and signed proof cache survive validated resume', () => {
   const digest = (value) => require('node:crypto').createHash('sha256').update(value).digest('hex')
   const scheduler = createTestScheduler()
@@ -1256,8 +1282,70 @@ test('crash adoption restores the root L0 session without creating a child launc
     sessionId: 'second-transport',
     continuationId: rebound.continuationId,
   }), error => error.code === 'CRASH_ADOPTION_CONFLICT')
+  const receiptHash = crypto.createHash('sha256').update('adopted-invalid-root-result').digest('hex')
+  const rotationAuthority = resumed.authorizeRootCrashContinuationRotationAfterResult(
+    adopted.rootAccountingLease,
+    { priorBindingHash: rebound.bindingHash, priorResultReceiptHash: receiptHash },
+  )
+  const rotated = resumed.rotateRootCrashContinuationAfterResult(adopted.rootAccountingLease, {
+    priorResultReceiptHash: receiptHash,
+    resultCommitAuthority: rotationAuthority,
+    reservationId: 'correction-root-reservation',
+    sessionId: 'correction-root-transport',
+    continuationId: null,
+    frontier: { ...rebound.frontier, acceptedResultIds: [receiptHash] },
+  })
+  assert.equal(rotated.reservationId, 'correction-root-reservation')
+  assert.throws(() => resumed.rotateRootCrashContinuationAfterResult(adopted.rootAccountingLease, {
+    priorResultReceiptHash: receiptHash,
+    resultCommitAuthority: rotationAuthority,
+    reservationId: 'another-root-reservation',
+    sessionId: 'another-root-transport',
+    continuationId: null,
+    frontier: rotated.frontier,
+  }), error => error.code === 'CRASH_BINDING_ROTATION_INVALID')
   adopted.rootAccountingLease.reportUsage({ noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 })
   adopted.rootAccountingLease.complete({})
   assert.equal(resumed.getMetrics().rootAccounting.status, 'completed')
   assert.equal(resumed.getMetrics().counters.totalLaunches, 1)
+})
+
+test('committed root correction rotation is one-shot, fresh, and exact-frontier bound', async () => {
+  const scheduler = new CentralScheduler({ route: 'PENDING', runIdentity: TEST_RUN })
+  const analyst = await scheduler.acquireWithAuthority(authority(scheduler), {
+    workItemId: 'route-analyst-for-root-rotation', role: 'ap-route-analyst',
+    logicalRole: 'route-analyst', purpose: 'planning', lane: 'routeAnalyst',
+  })
+  finish(analyst)
+  const rootLease = scheduler.beginRootAccounting({ phase: 'routeDecision', sessionId: 'root-owner' })
+  const first = scheduler.bindRootCrashContinuation(rootLease, {
+    reservationId: 'root-reservation-1', sessionId: 'root-transport-1',
+    continuationId: '11111111-1111-4111-8111-111111111111',
+    frontier: {
+      resumeState: 'L0_ROUTE_DECISION', nextReadyWorkIds: ['root-route-decision'],
+      openCheckIds: [], acceptedResultIds: [],
+    },
+  })
+  const receiptHash = crypto.createHash('sha256').update('first-invalid-root-result').digest('hex')
+  assert.throws(() => scheduler.rotateRootCrashContinuationAfterResult(rootLease, {
+    priorResultReceiptHash: receiptHash, reservationId: 'root-reservation-2',
+    sessionId: 'root-transport-2', continuationId: null,
+    frontier: { ...first.frontier, acceptedResultIds: [receiptHash] },
+  }), error => error.code === 'CRASH_BINDING_ROTATION_INVALID')
+  const commitAuthority = scheduler.authorizeRootCrashContinuationRotationAfterResult(rootLease, {
+    priorBindingHash: first.bindingHash, priorResultReceiptHash: receiptHash,
+  })
+  const rotate = overrides => scheduler.rotateRootCrashContinuationAfterResult(rootLease, {
+    priorResultReceiptHash: receiptHash, resultCommitAuthority: commitAuthority,
+    reservationId: 'root-reservation-2', sessionId: 'root-transport-2', continuationId: null,
+    frontier: { ...first.frontier, acceptedResultIds: [receiptHash] }, ...overrides,
+  })
+  assert.throws(() => rotate({ reservationId: first.reservationId }), error => error.code === 'CRASH_BINDING_ROTATION_INVALID')
+  assert.throws(() => rotate({ sessionId: first.sessionId }), error => error.code === 'CRASH_BINDING_ROTATION_INVALID')
+  assert.throws(() => rotate({ frontier: { ...first.frontier, acceptedResultIds: [receiptHash, 'extra'] } }),
+    error => error.code === 'CRASH_BINDING_ROTATION_INVALID')
+  const rotated = rotate({})
+  assert.deepEqual(rotated.frontier.acceptedResultIds, [receiptHash])
+  assert.throws(() => rotate({ reservationId: 'root-reservation-3', sessionId: 'root-transport-3' }),
+    error => error.code === 'CRASH_BINDING_ROTATION_INVALID')
 })

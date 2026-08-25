@@ -494,6 +494,17 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
   const routeDecision = decision('ROADMAP', {
     scoutCount: 2,
     missingInformation: ['Which service owns session migration?', 'Which client ships after the API?'],
+    mutableResourceOwnership: [
+      { kind: 'external-system', identity: 'ERP', owner: 'mission-coordinator', ownershipMode: 'single-owner' },
+      { kind: 'file', identity: 'output/erp.sql', owner: 'worker-erp', ownershipMode: 'single-owner' },
+      { kind: 'file', identity: 'output/mes.sql', owner: 'worker-mes', ownershipMode: 'single-owner' },
+      { kind: 'file', identity: 'output/wms.sql', owner: 'worker-wms', ownershipMode: 'single-owner' },
+    ],
+    workers: {
+      count: 3,
+      responsibilities: ['Implement ERP writeback.', 'Implement MES writeback.', 'Implement WMS writeback.'],
+      non_overlap_reason: 'Each worker owns one disjoint SQL deliverable.',
+    },
   })
   const roadmapCandidate = 'd'.repeat(64)
   assert.equal(routeDecision.topology.coordination.scouts.count, 2)
@@ -513,7 +524,11 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
       ? crypto.createHash('sha256').update(fs.readFileSync(usableDeliverable)).digest('hex')
       : null
     const result = request.workItemId === 'roadmap-plan-check'
-      ? { code: 'FAIL', payload: { findings: ['dependency edge is missing'] } }
+      ? {
+          code: 'FAIL',
+          events: [{ output: 'x'.repeat(512 * 1024) }],
+          payload: { findings: ['dependency edge is missing'] },
+        }
       : request.logicalRole === 'plan-checker'
         ? { code: 'PASS' }
         : request.logicalRole.startsWith('independent-')
@@ -569,10 +584,15 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
     planExists: () => plan !== null,
     planPointer: () => ({ path: path.join(directory, 'ROADMAP.md'), sha256: roadmapCandidate, bytes: 1 }),
     readResult: workItemId => results.get(workItemId) || null,
-    resultPointer: workItemId => ({
-      name: workItemId, path: path.join(directory, `${workItemId}.json`),
-      hash: crypto.createHash('sha256').update(workItemId).digest('hex'), bytes: 1,
-    }),
+    resultPointer: workItemId => {
+      const resultPath = path.join(directory, `${workItemId}.json`)
+      const bytes = Buffer.from(JSON.stringify(results.get(workItemId)))
+      fs.writeFileSync(resultPath, bytes)
+      return {
+        name: workItemId, path: resultPath,
+        hash: crypto.createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length,
+      }
+    },
   })
   const completedRetained = []
   const outcome = await executor({
@@ -588,12 +608,22 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
   assert.equal(revision.repairOf, 'roadmap-author')
   assert.equal(revision.executorKey, 'roadmap-author')
   assert.deepEqual(revision.evidencePointers.map(pointer => pointer.name), ['roadmap-scout-1', 'roadmap-scout-2'])
+  assert.deepEqual(revision.manifests.map(item => item.owner), [
+    'mission-coordinator', 'worker-1', 'worker-2', 'worker-3',
+  ])
+  assert.deepEqual(launches.find(item => item.workItemId === 'roadmap-author').manifests, revision.manifests)
   const planCheck = launches.find(item => item.workItemId === 'roadmap-plan-check')
   assert.equal(planCheck.candidateHash, roadmapCandidate)
   assert.deepEqual(planCheck.evidencePointers.map(pointer => pointer.name), ['roadmap-scout-1', 'roadmap-scout-2'])
   const planRepair = launches.find(item => item.workItemId === 'roadmap-author-plan-repair')
   assert.equal(planRepair.repairOf, 'roadmap-author-revise')
   assert.equal(planRepair.executorKey, 'roadmap-author')
+  assert.deepEqual(planRepair.evidencePointers.map(pointer => pointer.name), [
+    'roadmap-scout-1', 'roadmap-scout-2', 'roadmap-plan-check',
+  ])
+  assert.equal(Object.hasOwn(planRepair.fetchedEvidence, 'planCheck'), false)
+  assert.ok(Buffer.byteLength(JSON.stringify(planRepair.fetchedEvidence), 'utf8') < 16 * 1024)
+  assert.deepEqual(planRepair.manifests, revision.manifests)
   const planRecheck = launches.find(item => item.workItemId === 'roadmap-plan-recheck')
   assert.equal(planRecheck.candidateHash, roadmapCandidate)
   assert.equal(planRecheck.repairOf, 'roadmap-plan-check')
@@ -602,7 +632,41 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
   assert.match(plan, /Place session migration before API rollout\./)
   assert.match(plan, /Ship the API before the dependent client\./)
   assert.ok(plan.indexOf('Place session migration') < plan.indexOf('Ship the API'))
-  assert.deepEqual(completedRetained, ['mission-coordination'])
+  const manager = launches.find(item => item.workItemId === 'roadmap-work-group')
+  assert.deepEqual(manager.workGroupAdmission.workerAssignments.map(item => item.mutableResourceIdentities), [
+    ['output/erp.sql'], ['output/mes.sql'], ['output/wms.sql'],
+  ])
+  assert.deepEqual(completedRetained, ['roadmap-work-group', 'mission-coordination'])
+})
+
+test('ROADMAP CHECK_INCONCLUSIVE blocks without fabricating author-repair findings', async t => {
+  const directory = tempDirectory(t, 'autoprompt-roadmap-inconclusive-')
+  const targetPath = createTempGitTarget(directory)
+  const launches = []
+  let planExists = false
+  const executor = createDefaultRouteExecutor({
+    targetPath,
+    gitEnvironment: () => process.env,
+    transition: async () => {},
+    harnessAttestation: () => ({ repoHash: CANDIDATE_A, buildHash: 'b'.repeat(64), oracleHash: 'c'.repeat(64) }),
+    writePlan: () => { planExists = true },
+    planExists: () => planExists,
+    planPointer: () => ({ path: path.join(directory, 'ROADMAP.md'), sha256: 'd'.repeat(64), bytes: 1 }),
+    resultPointer: () => assert.fail('inconclusive plan check must not resolve repair evidence'),
+  })
+  const outcome = await executor({
+    route: 'ROADMAP', decision: decision('ROADMAP'),
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'roadmap-plan-check') {
+        return { code: 'CHECK_INCONCLUSIVE', payload: { unblockPath: 'provide checker scratch storage' } }
+      }
+      return { reportId: request.workItemId, behaviorChanged: ['Prepare the bounded roadmap.'] }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(outcome.outcome, 'BLOCKED')
+  assert.deepEqual(launches, ['roadmap-author', 'roadmap-plan-check'])
 })
 
 test('ROADMAP resume consumes completed scout frontier and starts at same-author join without relaunching discovery', async t => {
@@ -1116,6 +1180,23 @@ test('DONE retry keeps its isolated candidate unpromoted until the final accepta
   })
   assert.equal(failed.outcome, 'FAILED')
   assert.deepEqual(failedEvents, ['aborted'])
+
+  const inconclusiveEvents = []
+  const inconclusiveHandle = {
+    token: 'inconclusive-token', candidateHash: H2, workspacePath: failedPrivateCandidate,
+    async commit() { inconclusiveEvents.push('promoted') },
+    async abort(reason) { inconclusiveEvents.push(`aborted:${reason}`) },
+  }
+  const inconclusive = await executor({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => request.logicalRole === 'worker'
+      ? { deferredPromotion: inconclusiveHandle }
+      : { code: 'CHECK_INCONCLUSIVE', payload: { unblockPath: 'provide checker scratch storage' } },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(inconclusive.outcome, 'BLOCKED')
+  assert.equal(inconclusive.terminalEnvelope.code, 'CHECK_INCONCLUSIVE')
+  assert.deepEqual(inconclusiveEvents, ['aborted:independent checker did not pass'])
 })
 
 test('deferred DONE promotion survives separate-process restarts at every CAS/state/finalize window exactly once', t => {
@@ -1939,6 +2020,69 @@ test('the single L0 correction receives only the remainder of the monotonic four
   ])
   assert.deepEqual(timerDurations.filter(milliseconds => milliseconds <= 240_000).slice(-2), [240_000, 50])
   assert.equal(harness.processOwner.cancelled > 0, true)
+})
+
+test('AP-CODEX-V2-035 committed invalid L0 result rotates to a fresh correction process', async t => {
+  const attempts = []
+  const harness = makeHarness(t, {
+    executeRoute: async () => usableDoneFixture(harness, 'root-correction-rotation-result'),
+    runtimeOptions: {
+      safeEnvFactory: (_repository, baseEnvironment) => ({
+        environment: { ...baseEnvironment, GIT_ALLOW_PROTOCOL: 'file' },
+        attestation: {
+          gitEnforced: true,
+          mechanicallyEnforced: true,
+          channels: Object.fromEntries([
+            'repositoryGitBarrier',
+            'gitCommandNetworkBarrier',
+            'githubCliCredentialIsolation',
+            'shellOutboundNetworkSandbox',
+            'providerConnectorApiWriteToolDenial',
+          ].map(name => [name, {
+            applicable: true, enforced: true,
+            evidence: { fixture: 'AP-CODEX-V2-035' }, residuals: [],
+          }])),
+        },
+      }),
+    },
+  })
+  harness.runtimeOptions.decideRoute = async callbacks => {
+    harness.record.resolve = relative => path.join(harness.directory, relative)
+    const attempt = callbacks.correctionAttempts
+    const reservationId = `root-reservation-${attempt}`
+    const transportSessionId = `root-transport-${attempt}`
+    const continuationId = `${attempt + 1}1111111-1111-4111-8111-111111111111`
+    attempts.push({ attempt, reservationId, transportSessionId, continuationId })
+    callbacks.onLaunchPrepared({ reservationId, sessionId: transportSessionId, continuationId: null })
+    callbacks.onSessionIdentified(continuationId, {
+      reservationId, sessionId: transportSessionId,
+      raw: `thread.started:${continuationId}`,
+      event: { type: 'thread.started', thread_id: continuationId },
+      occurredAt: new Date(0).toISOString(),
+    })
+    const terminal = {
+      decision: attempt === 0 ? {} : decision('DIRECT'),
+      usage: ZERO_USAGE,
+      usageStreamed: true,
+    }
+    callbacks.onUsageDelta(ZERO_USAGE)
+    callbacks.onTerminalResult(terminal, {
+      assignmentHash: crypto.createHash('sha256').update(`root-assignment-${attempt}`).digest('hex'),
+      sessionId: continuationId,
+      controlSessionId: transportSessionId,
+      rawOutputHash: crypto.createHash('sha256').update(`root-output-${attempt}`).digest('hex'),
+      eventStreamHash: crypto.createHash('sha256').update(`root-events-${attempt}`).digest('hex'),
+    })
+    return terminal
+  }
+
+  const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
+
+  assert.equal(result.outcome, 'DONE', JSON.stringify({ result, events: harness.record.events }))
+  assert.deepEqual(attempts.map(item => item.attempt), [0, 1])
+  assert.notEqual(attempts[0].reservationId, attempts[1].reservationId)
+  assert.notEqual(attempts[0].transportSessionId, attempts[1].transportSessionId)
+  assert.equal(result.scheduler.rootAccounting.status, 'completed')
 })
 
 test('one mission lock rejects a second root before record creation or child launch', async t => {
@@ -4144,7 +4288,7 @@ test('per-child terminal receipts do not globally drain a legal live sibling or 
     'terminal-boundary drain reported success while a helper/proxy/child process remained live')
 })
 
-test('concrete default factory runs a clean local fake-CLI route through real record, accounting, ownership, checking, and finalization', async t => {
+test('AP-CODEX-V2-036 concrete default factory accepts the signed dash-prefixed nonce through lease, state, checking, and finalization', async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-concrete-runtime-'))
   const pidTreeControlRoot = path.join(directory, 'pid-tree-control')
   t.after(() => {
@@ -4278,7 +4422,7 @@ test('concrete default factory runs a clean local fake-CLI route through real re
         providerCapabilities: '2.0.0', activationRequest: '1.0.0',
       },
       supervisorEntry: { promptSha256: '2'.repeat(64) },
-      providerAttestation: { attestation: { activationNonce: 'concrete-activation-nonce' } },
+      providerAttestation: { attestation: { activationNonce: '-Nun56FgLGR7mAQLNyqoNUrtGc7NNbCR' } },
       activationBoundary: {
         gitConfig: configIsolationPath, ghConfigDir,
         enforcementProof: { path: enforcementProofPath },
@@ -4698,7 +4842,7 @@ test('concrete route capability matrix separates pre-route, production, coordina
   }
 })
 
-test('self-adapter probes only the executable identity admitted by signed provider trust', t => {
+test('AP-CODEX-V2-036 signed provider trust accepts the observed dash-prefixed Base64URL activation nonce', t => {
   const activationRoot = tempDirectory(t, 'autoprompt-receipt-')
   const adapterPath = path.join(activationRoot, 'skills', 'autoprompt', 'workflow', 'phase-budget.js')
   fs.mkdirSync(path.dirname(adapterPath), { recursive: true })
@@ -4931,7 +5075,7 @@ test('self-adapter probes only the executable identity admitted by signed provid
     issuedAt: new Date(Date.now() - 1000).toISOString(),
     expiresAt,
     runtimeIdentityHash: providerRuntimeIdentityHash(record),
-    activationNonce: 'signed-activation-nonce',
+    activationNonce: '-Nun56FgLGR7mAQLNyqoNUrtGc7NNbCR',
     verificationMethod: 'live-conformance-suite',
     verifiedCapabilities: ['isolation', 'privateSkillRoot', 'processOwnership'],
     canonicalProviderTrustSha256: record.providerTrust.sha256,

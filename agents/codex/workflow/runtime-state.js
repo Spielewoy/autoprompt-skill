@@ -11,14 +11,17 @@ const {
   sha256,
   stableStringify,
 } = require('./event-log.js')
-const { validatePredecessorRelease, validateTakeoverReceipt } = require('./mission-lock.js')
+const {
+  ACTIVATION_NONCE_PATTERN: NONCE_PATTERN,
+  validatePredecessorRelease,
+  validateTakeoverReceipt,
+} = require('./mission-lock.js')
 
 const STATE_MACHINE = require('../../contracts/state-machine.json')
 const STATE_EVENT_SCHEMA = require('../../contracts/schemas/state-event.schema.json')
 const PLAIN_LANGUAGE = require('../../contracts/plain-language.json')
 
 const STATE_SCHEMA_VERSION = STATE_MACHINE.contractVersion
-const NONCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{15,63}$/
 const HASH_PATTERN = /^[a-f0-9]{64}$/
 const INTERNAL = Symbol('runtime-state-internal')
 

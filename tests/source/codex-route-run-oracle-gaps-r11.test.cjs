@@ -18,7 +18,9 @@ const {
   createSupervisorOptions,
   productionPhaseBudgets,
   reconstructTypedExitZeroResult,
+  typedChildOutputReady,
   validateCanonicalChildResult,
+  validateDurableResultEvidencePointer,
 } = require(path.join(WORKFLOW, 'phase-budget.js'))
 const { RuntimeStateStore } = require(path.join(WORKFLOW, 'runtime-state.js'))
 
@@ -167,6 +169,59 @@ test('AP-RUN-026 reconstructed failed work cannot join, emit WORK_ITEM_VERIFIED,
     () => validateCanonicalChildResult(record, reconstructed, record.runId, requestEnvelopeHash),
     error => error.code === 'WORK_ITEM_RESULT_FAILED' && error.details.workItemId === 'work-1',
   )
+})
+
+test('AP-CHECK-034 a bound CHECK_INCONCLUSIVE report is terminal and remains canonical', () => {
+  const requestEnvelopeHash = sha256('inconclusive checker request')
+  const record = {
+    logicalRole: 'independent-reviewer',
+    candidateHash: sha256('candidate version'),
+  }
+  const report = {
+    schemaVersion: '2.0.0',
+    code: 'CHECK_INCONCLUSIVE',
+    runId: 'run-check-inconclusive',
+    requestEnvelopeHash,
+    currentVersionHash: record.candidateHash,
+    payload: { reason: 'read-only checker could not create required scratch state' },
+  }
+
+  assert.equal(typedChildOutputReady(report, record), true)
+  assert.equal(
+    validateCanonicalChildResult(record, report, report.runId, requestEnvelopeHash),
+    report,
+  )
+})
+
+test('AP-CODEX-V2-033 plan repair accepts only one exact durable result file', t => {
+  const directory = temporary(t, 'autoprompt-plan-check-pointer-')
+  const resultPath = path.join(directory, 'plan-check.json')
+  const bytes = Buffer.from('{"code":"FAIL"}\n')
+  fs.writeFileSync(resultPath, bytes)
+  const pointer = {
+    name: 'roadmap-plan-check', path: resultPath,
+    hash: sha256(bytes), bytes: bytes.length,
+  }
+  assert.equal(validateDurableResultEvidencePointer(pointer, 'roadmap-plan-check').path, resultPath)
+  for (const invalid of [
+    { ...pointer, hash: '0'.repeat(64) },
+    { ...pointer, bytes: bytes.length + 1 },
+    { ...pointer, path: path.join(directory, 'missing.json') },
+    { ...pointer, name: 'foreign-result' },
+  ]) {
+    assert.throws(
+      () => validateDurableResultEvidencePointer(invalid, 'roadmap-plan-check'),
+      error => error.code === 'PLAN_CHECK_EVIDENCE_MISSING',
+    )
+  }
+  if (process.platform !== 'win32') {
+    const linked = path.join(directory, 'linked.json')
+    fs.symlinkSync(resultPath, linked)
+    assert.throws(
+      () => validateDurableResultEvidencePointer({ ...pointer, path: linked }, 'roadmap-plan-check'),
+      error => error.code === 'PLAN_CHECK_EVIDENCE_MISSING',
+    )
+  }
 })
 
 test('AP-RUN-005 stale RUN-ENDED cannot be observed by or launch a new-generation child', (t) => {

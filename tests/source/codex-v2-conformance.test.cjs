@@ -14,7 +14,10 @@ const router = require('../../agents/codex/workflow/router.js')
 const decisions = require('../../agents/codex/workflow/route-decision.js')
 const settings = require('../../agents/codex/workflow/settings.js')
 const runtimeState = require('../../agents/codex/workflow/runtime-state.js')
-const { MissionLock } = require('../../agents/codex/workflow/mission-lock.js')
+const {
+  ACTIVATION_NONCE_PATTERN,
+  MissionLock,
+} = require('../../agents/codex/workflow/mission-lock.js')
 const { BudgetController, resolveCeilings, validatePhases } = require('../../agents/codex/workflow/budget-controller.js')
 const {
   MAX_L3_BRIEF_BYTES,
@@ -339,6 +342,58 @@ test('AP-TEST-026 duplicate target lease admits one owner, writes no second-owne
   assert.equal(staleLock.describe(replacement).owner.activationId, 'activation-two')
   assert.equal(fs.readdirSync(leaseRoot).filter(name => name.includes('.stale.lease-one.')).length, 1)
   staleLock.release(replacement)
+})
+
+test('AP-CODEX-V2-036 mission lease accepts the complete signed Base64URL activation nonce language', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-v2-lease-nonce-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const target = path.join(root, 'target')
+  fs.mkdirSync(target)
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+  const admitted = [...alphabet].map((prefix) => `${prefix}${'a'.repeat(15)}`)
+  admitted.push(`-${'a'.repeat(127)}`, `_${'a'.repeat(127)}`)
+
+  for (const [index, nonce] of admitted.entries()) {
+    assert.equal(ACTIVATION_NONCE_PATTERN.test(nonce), true)
+    const processIdentity = `pid-${index + 101}-start-a`
+    const lock = new MissionLock({
+      leaseRoot: path.join(root, `leases-${index}`),
+      processIdentityObserver: (_pid, requestedIdentity) => requestedIdentity,
+    })
+    const lease = lock.acquire({
+      targetPath: target,
+      ledgerPath: path.join(target, '.autoprompt'),
+      runId: `run-owner-${index}`,
+      activationId: `activation-${index}`,
+      missionHash: H,
+      nonce,
+      generation: 1,
+      pid: index + 101,
+      processIdentity,
+      token: String((index % 9) + 1).repeat(48),
+    })
+    assert.equal(lock.describe(lease).owner.nonce, nonce)
+    lock.release(lease)
+  }
+
+  const lock = new MissionLock({
+    leaseRoot: path.join(root, 'invalid-nonces'),
+    processIdentityObserver: (_pid, requestedIdentity) => requestedIdentity,
+  })
+  for (const nonce of ['', 'a'.repeat(15), 'a'.repeat(129), `${'a'.repeat(16)}/`, `${'a'.repeat(16)}+`]) {
+    assert.throws(() => lock.acquire({
+      targetPath: target,
+      ledgerPath: path.join(target, '.autoprompt'),
+      runId: 'run-owner-invalid',
+      activationId: 'activation-invalid',
+      missionHash: H,
+      nonce,
+      generation: 1,
+      pid: 999,
+      processIdentity: 'pid-999-start-a',
+      token: 'a'.repeat(48),
+    }), error => error.code === 'LEASE_INPUT_INVALID', JSON.stringify(nonce))
+  }
 })
 
 test('AP-TEST-027 synthetic economic simulations stay within route envelopes and keep effort independent', () => {
