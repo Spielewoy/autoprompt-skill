@@ -221,6 +221,7 @@ class Finalizer {
         reason: options.reason || 'deterministic finalization',
         graceMs: options.graceMs,
         killMs: options.killMs,
+        terminalStatus: options.outcome,
       })
     }
     const leaseDescription = this.missionLock.describe(this.capability)

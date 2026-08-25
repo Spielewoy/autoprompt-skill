@@ -106,6 +106,42 @@ const CHECKER_ROLES = new Set([
 ])
 const CANONICAL_CHECKER_CODES = new Set(['PASS', 'FAIL', 'CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'])
 
+function checkerVerdictPassed(logicalRole, result) {
+  return CHECKER_ROLES.has(logicalRole) && Boolean(result) && result.code === 'PASS'
+}
+
+function roadmapPlanOracleForWorkItem(workItemId) {
+  return /^roadmap-plan-recheck(?:-runtime-retry)?$/u.test(String(workItemId || ''))
+    ? 'roadmap-plan-oracle-recheck'
+    : 'roadmap-plan-oracle'
+}
+
+function durableNextReadyAfter(logicalRole, result, nextReady, fallback = []) {
+  if (CHECKER_ROLES.has(logicalRole) && !checkerVerdictPassed(logicalRole, result)) return []
+  return nextReady || fallback || []
+}
+
+function adoptedLeaseMatchesStage(route, logicalRole, stage) {
+  const checker = CHECKER_ROLES.has(logicalRole)
+  const roadmapWorkStageChecker = route === 'ROADMAP' && logicalRole === 'plan-checker'
+  if (stage === 'work') return !checker || roadmapWorkStageChecker
+  if (stage === 'check') return checker && !roadmapWorkStageChecker
+  return stage === 'route' ? logicalRole === 'route-analyst' : false
+}
+
+function terminalFinalizationDiagnostics(result = {}) {
+  const terminalEnvelope = result.terminalEnvelope || null
+  const terminalCause = terminalEnvelope && terminalEnvelope.cause || null
+  return Object.freeze({
+    terminalEnvelope,
+    reason: result.reason || terminalEnvelope && terminalEnvelope.reason ||
+      terminalCause && terminalCause.reason || 'typed runtime outcome',
+    unblockPath: result.unblockPath || terminalEnvelope && terminalEnvelope.unblockPath ||
+      terminalCause && terminalCause.unblockPath ||
+      terminalEnvelope && terminalEnvelope.payload && terminalEnvelope.payload.unblockPath || null,
+  })
+}
+
 function resolveTerminalReceiptCandidateHash({
   logicalRole,
   runtimeStateProvider,
@@ -277,6 +313,7 @@ function diagnosticDenialDisposition(workerCount) {
 function normalizeTaskDeadline(declared, options = {}) {
   const nowMs = Number(options.nowMs)
   const productHardMaximumMs = Number(options.productHardMaximumMs ?? DEFAULT_PRODUCT_HARD_MAXIMUM_MS)
+  const wallTimeUnbounded = options.wallTimeUnbounded === true
   if (!Number.isFinite(nowMs) || !Number.isSafeInteger(productHardMaximumMs) || productHardMaximumMs <= 0) {
     return { valid: false, code: 'TASK_DEADLINE_INVALID', reason: 'deadline admission requires an injected wall clock and positive product maximum' }
   }
@@ -297,9 +334,11 @@ function normalizeTaskDeadline(declared, options = {}) {
       deadline.recoveryAndFinalizationReservePercent > 100) {
     return { valid: false, code: 'TASK_DEADLINE_INVALID', reason: 'task deadline is malformed' }
   }
-  if (absoluteMs <= nowMs) return { valid: false, code: 'TASK_DEADLINE_EXPIRED', reason: 'task deadline has expired' }
-  const wallMs = absoluteMs - nowMs
-  if (declared && wallMs > productHardMaximumMs) {
+  if (!wallTimeUnbounded && absoluteMs <= nowMs) {
+    return { valid: false, code: 'TASK_DEADLINE_EXPIRED', reason: 'task deadline has expired' }
+  }
+  const wallMs = wallTimeUnbounded ? productHardMaximumMs : absoluteMs - nowMs
+  if (!wallTimeUnbounded && declared && wallMs > productHardMaximumMs) {
     return { valid: false, code: 'TASK_DEADLINE_EXCEEDS_PRODUCT_MAXIMUM', reason: 'task deadline exceeds the product hard maximum' }
   }
   const verificationReserveMs = Math.floor(wallMs * deadline.verificationReservePercent / 100)
@@ -608,6 +647,7 @@ class RuntimeCapabilityAuthority {
       provider: 'codex',
     })
     this.now = options.now || Date.now
+    this.environment = options.environment || process.env
     this.key = options.key || crypto.randomBytes(32)
     if (!Buffer.isBuffer(this.key) || this.key.length < 32) {
       throw new SupervisorIntegrationError('RUNTIME_CAPABILITY_INVALID', 'runtime capability signing key is invalid')
@@ -636,7 +676,7 @@ class RuntimeCapabilityAuthority {
       throw new SupervisorIntegrationError('RUNTIME_CAPABILITY_INVALID', 'runtime probes require versioned evidence, routes, and effects')
     }
     const issuedAtMs = Number(this.now())
-    const expiresAtMs = runtimeCapabilityExpiryMs(input.expiresAtMs, issuedAtMs)
+    const expiresAtMs = runtimeCapabilityExpiryMs(input.expiresAtMs, issuedAtMs, this.environment)
     if (!Number.isFinite(issuedAtMs) || !Number.isFinite(expiresAtMs) || expiresAtMs <= issuedAtMs) {
       throw new SupervisorIntegrationError('RUNTIME_CAPABILITY_INVALID', 'runtime capability expiry is invalid')
     }
@@ -2622,9 +2662,13 @@ function applyBenchmarkEffortPin(assignment, environment = process.env) {
 }
 
 function benchmarkPhaseTimeoutMs(defaultMs, environment = process.env) {
-  return environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
+  return benchmarkNoTimeoutEnabled(environment)
     ? Number.POSITIVE_INFINITY
     : defaultMs
+}
+
+function benchmarkNoTimeoutEnabled(environment = process.env) {
+  return Boolean(environment && environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1')
 }
 
 function benchmarkFirstProductSignalDeadlineEnabled(ceilingMs, environment = process.env) {
@@ -2709,10 +2753,8 @@ function appendSupervisorRecordedCapturedDomainOutcomes(contracts, outcomes) {
 }
 
 function runtimeCapabilityExpiryMs(requestedExpiryMs, issuedAtMs, environment = process.env) {
-  const maximumLifetimeMs = environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
-    ? Number.POSITIVE_INFINITY
-    : 5 * 60 * 1000
-  return Math.min(Number(requestedExpiryMs), issuedAtMs + maximumLifetimeMs)
+  if (benchmarkNoTimeoutEnabled(environment)) return Date.UTC(9999, 11, 31, 23, 59, 59, 999)
+  return Math.min(Number(requestedExpiryMs), issuedAtMs + 5 * 60 * 1000)
 }
 
 function codexPrivateWorkspaceProjection(record, canonicalTargetPath, workingDirectory) {
@@ -3050,9 +3092,9 @@ class CodexExecAdapter {
         completionRequested,
       }
     }
-    const stop = reason => {
+    const stop = (reason, terminalStatus = 'FAILED') => {
       if (!stopPromise && typeof this.runner.stop === 'function') {
-        stopPromise = Promise.resolve(this.runner.stop({ reason, sessionId: record.sessionId }))
+        stopPromise = Promise.resolve(this.runner.stop({ reason, terminalStatus, sessionId: record.sessionId }))
       }
     }
     const commitTerminal = (output, snapshot) => {
@@ -3066,7 +3108,7 @@ class CodexExecAdapter {
         })
         terminalReceiptPersisted = true
       }
-      stop(`typed terminal ${typedTerminal}`)
+      stop(`typed terminal ${typedTerminal}`, 'DONE')
     }
     const onStdoutLine = line => {
       const normalizedLine = `${String(line).replace(/\r?\n$/, '')}\n`
@@ -3426,6 +3468,7 @@ class OwnedCodexProxyRunner {
         reason: options.reason || 'Codex proxy stop',
         graceMs: 500,
         killMs: 1000,
+        terminalStatus: options.terminalStatus || 'FAILED',
       })
       if (!terminal || terminal.ownershipId !== session.ownershipId ||
           terminal.groupIdentity !== session.groupIdentity) {
@@ -3864,11 +3907,38 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
       verdictId: details.verdictId, verdictHash: details.verdictHash,
     })
   }
+  const current = stateStore.load()
+  const retryState = { ...(current.retryState || {}) }
+  if (eventId === 'CHECK_INCONCLUSIVE') {
+    if (!['RUN_WORK', 'CHECK_WORK'].includes(current.state)) {
+      throw new SupervisorIntegrationError(
+        'CHECK_RETRY_STATE_INVALID',
+        'inconclusive checker retry must originate from RUN_WORK or CHECK_WORK',
+      )
+    }
+    retryState.inconclusiveChecker = {
+      checkerId: details.checkerId,
+      candidateHash: details.candidateHash,
+      retryAttempt: details.retryAttempt,
+      returnState: current.state,
+    }
+  } else if (eventId === 'CHECK_BECAME_CONCLUSIVE') {
+    const pending = retryState.inconclusiveChecker
+    if (!pending || pending.returnState !== nextState ||
+        pending.candidateHash !== details.candidateHash) {
+      throw new SupervisorIntegrationError(
+        'CHECK_RETRY_STATE_INVALID',
+        'conclusive checker retry must return to its durable originating phase and exact version being checked',
+      )
+    }
+    delete retryState.inconclusiveChecker
+  }
   return stateStore.transition(nextState, {
     capability, cause: 'deterministic external supervisor progression', eventId,
     statePatch: {
       budgets: budgetController.snapshot(),
       ...(details.candidateHash ? { candidateHash: details.candidateHash } : {}),
+      retryState,
     },
     ...(details.frontier ? { frontier: details.frontier } : {}),
     workHashes: details.candidateHash ? [details.candidateHash] : [],
@@ -3997,7 +4067,10 @@ class CodexSupervisorRuntime {
     this.launches = []
     this.recoveryThreads = new Map()
     this.recoveryCompletedWorkIds = new Set(options.resumeState && options.resumeState.completedWorkIds || [])
-    this.recoveryCompletedCheckIds = new Set(options.resumeState && options.resumeState.completedCheckIds || [])
+    this.recoveryCompletedCheckIds = new Set()
+    for (const id of options.resumeState && options.resumeState.completedCheckIds || []) {
+      addCanonicalCompletedChecker(this.recoveryCompletedCheckIds, id)
+    }
     this.recoveryAcceptedResultIds = new Set(options.resumeState && options.resumeState.acceptedResultIds || [])
     this.recoveryExternalOperations = new Map((options.resumeState && options.resumeState.externalOperations || [])
       .map(operation => [operation.operationId, operation]))
@@ -4044,6 +4117,9 @@ class CodexSupervisorRuntime {
 
   _enforceBudgetPhase(name, evidence = {}) {
     if (!name || !this.budget || !this.budget.phases || !this.budget.phases[name]) return null
+    if ((this.options.baseEnvironment || process.env).AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1') {
+      return Object.freeze({ action: 'CONTINUE', reason: 'authenticated benchmark time policy is unbounded' })
+    }
     const snapshot = this.budget.snapshot()
     const started = snapshot.phaseStartedAtElapsedMs &&
       snapshot.phaseStartedAtElapsedMs[name] !== undefined
@@ -4201,6 +4277,7 @@ class CodexSupervisorRuntime {
     const resumeDeadline = this.options.resumeState && this.options.resumeState.deadline
     const previousDeadline = previous && previous.deadline
     const declared = this.settings.deadline
+    const wallTimeUnbounded = benchmarkNoTimeoutEnabled(this.options.baseEnvironment || process.env)
     // Synthetic/legacy v2 resume fixtures which predate deadline persistence
     // remain readable. Every newly admitted generation-one run is bound below,
     // so no new resumable state can enter this compatibility branch.
@@ -4214,7 +4291,7 @@ class CodexSupervisorRuntime {
         return { valid: false, code: 'RESUME_DEADLINE_INVALID', reason: 'resume deadline differs from its declared or persisted binding' }
       }
       if (!Number.isFinite(Date.parse(resumeDeadline.absoluteDeadline)) ||
-          Date.parse(resumeDeadline.absoluteDeadline) <= nowMs) {
+          (!wallTimeUnbounded && Date.parse(resumeDeadline.absoluteDeadline) <= nowMs)) {
         return { valid: false, code: 'RESUME_DEADLINE_EXPIRED', reason: 'persisted resume deadline has expired' }
       }
       if (previousDeadline) {
@@ -4238,6 +4315,7 @@ class CodexSupervisorRuntime {
     const admitted = normalizeTaskDeadline(declared, {
       nowMs,
       productHardMaximumMs: this.options.productHardMaximumMs ?? configuredWallMaximum,
+      wallTimeUnbounded,
     })
     if (!admitted.valid) return admitted
     this.budget.bindDeadline({ ...admitted, admittedAtMs: nowMs })
@@ -4301,7 +4379,9 @@ class CodexSupervisorRuntime {
       this.providerCapabilities = validateProviderCapabilities(this.providerCapabilities)
       if (this.options.resumeState) {
         for (const id of this.options.resumeState.completedWorkIds || []) this.recoveryCompletedWorkIds.add(id)
-        for (const id of this.options.resumeState.completedCheckIds || []) this.recoveryCompletedCheckIds.add(id)
+        for (const id of this.options.resumeState.completedCheckIds || []) {
+          addCanonicalCompletedChecker(this.recoveryCompletedCheckIds, id)
+        }
         for (const [id, evidence] of Object.entries(this.options.resumeState.threadEvidence || {})) {
           this.recoveryThreads.set(id, evidence)
         }
@@ -4506,7 +4586,7 @@ class CodexSupervisorRuntime {
               benchmarkPhaseTimeoutMs(LIGHT_PLAN_MAX_DURATION_MS),
               this.timerApi,
               'LIGHT_PLAN_TIMEOUT',
-              () => this.processOwner.cancelAll({ reason: 'light planning timeout' }),
+              () => this.processOwner.cancelAll({ reason: 'light planning timeout', terminalStatus: 'FAILED' }),
             )
           } else {
             await prepare()
@@ -4556,11 +4636,17 @@ class CodexSupervisorRuntime {
       let terminalOutcome = result.outcome
       if (terminalOutcome !== 'DONE') {
         const terminalError = new SupervisorIntegrationError(
-          result.terminalEnvelope && result.terminalEnvelope.status || terminalOutcome,
-          result.terminalEnvelope && result.terminalEnvelope.reason || 'route executor returned a typed non-DONE outcome',
+          result.terminalEnvelope && (result.terminalEnvelope.code || result.terminalEnvelope.status) || terminalOutcome,
+          result.terminalEnvelope && (result.terminalEnvelope.reason ||
+            result.terminalEnvelope.cause && result.terminalEnvelope.cause.reason) ||
+            'route executor returned a typed non-DONE outcome',
           result.terminalEnvelope || {},
         )
-        terminalOutcome = await this._enterTerminalRelease(terminalOutcome, terminalError)
+        terminalOutcome = await this._enterTerminalRelease(
+          terminalOutcome,
+          terminalError,
+          result.terminalEnvelope || null,
+        )
       }
       return this._finish(terminalOutcome, result)
     } catch (error) {
@@ -4655,7 +4741,7 @@ class CodexSupervisorRuntime {
         benchmarkPhaseTimeoutMs(ROUTE_ANALYST_MAX_DURATION_MS),
         this.timerApi,
         'ROUTE_ANALYST_TIMEOUT',
-        () => this.processOwner.cancelAll({ reason: 'route analyst timeout' }),
+        () => this.processOwner.cancelAll({ reason: 'route analyst timeout', terminalStatus: 'FAILED' }),
       )
       streamedRouteEventCount = Number(result && result[STREAMED_ROUTE_EVENT_COUNT] || 0)
     } catch (error) {
@@ -4674,6 +4760,7 @@ class CodexSupervisorRuntime {
       elapsedMs: result.elapsedMs === undefined ? Math.max(0, this.now() - startedAt) : result.elapsedMs,
       outcome: result.outcome,
       recommendation: result.recommendation,
+      environment: this.options.baseEnvironment || process.env,
     })
     if (evaluated.recommendation_state) {
       if (!this.record || typeof this.record.writeRouteAnalystFallbackState !== 'function' ||
@@ -5064,7 +5151,7 @@ class CodexSupervisorRuntime {
         remainingMs,
         this.timerApi,
         'ROUTE_DECISION_TIMEOUT',
-        () => this.processOwner.cancelAll({ reason: 'route decision timeout' }),
+        () => this.processOwner.cancelAll({ reason: 'route decision timeout', terminalStatus: 'FAILED' }),
       )
     }
     const adoptedAcceptedRootResults = adoptedRoot && adoptedRoot.binding &&
@@ -5675,7 +5762,7 @@ class CodexSupervisorRuntime {
         )
       }
       const checker = CHECKER_ROLES.has(saved.logicalRole)
-      if ((stage === 'work' && checker) || (stage === 'check' && !checker)) continue
+      if (!adoptedLeaseMatchesStage(this.route, saved.logicalRole, stage)) continue
       const committed = this._readTerminalReceipt(saved, candidateHash)
       const retainedParent = !checker && (liveParentIds.has(leaseId) || committed && committed.retainLease === true)
       if (committed) {
@@ -5696,14 +5783,23 @@ class CodexSupervisorRuntime {
           }
         } else {
           lease.complete({})
-          if (checker) this.recoveryCompletedCheckIds.add(saved.workItemId)
-          else this.recoveryCompletedWorkIds.add(saved.workItemId)
+          const checkerPassed = checkerVerdictPassed(saved.logicalRole, committed.result)
+          if (checkerPassed) addCanonicalCompletedChecker(this.recoveryCompletedCheckIds, saved.workItemId)
+          else if (!checker) this.recoveryCompletedWorkIds.add(saved.workItemId)
           this.recoveryThreads.delete(lease.id)
           this._persistRecoveryCheckpoint({
-            kind: checker ? 'CHECK_COMPLETED' : 'LEASE_COMPLETED',
+            kind: checker ? (checkerPassed ? 'CHECK_COMPLETED' : 'FRONTIER_CHANGED') : 'LEASE_COMPLETED',
             causeId: `adopted-result:${this.activation.generation}:${lease.id}`,
             humanDescription: 'Complete an adopted lease from its exact durable terminal receipt without a second model turn.',
-          }, { candidateHash: committed.candidateHash })
+          }, {
+            candidateHash: committed.candidateHash,
+            nextReadyWorkIds: durableNextReadyAfter(
+              saved.logicalRole,
+              committed.result,
+              resumeState.nextReadyWorkIds || [],
+            ),
+            openCheckIds: [],
+          })
           results[saved.workItemId] = committed.result
         }
         continue
@@ -5760,6 +5856,18 @@ class CodexSupervisorRuntime {
         ? decision.capturedDomainContracts : []
       const assignedDomainContracts = index === 0 ? capturedDomainContracts : []
       const replayChecks = deterministicChecksForDecision(decision, this.route)
+      const resumedPlanPointer = saved.logicalRole === 'plan-checker' && typeof this.options.planPointer === 'function'
+        ? this.options.planPointer('ROADMAP') : null
+      if (resumedPlanPointer && saved.inspectedCandidateHash !== resumedPlanPointer.sha256) {
+        throw new SupervisorIntegrationError(
+          'CRASH_ADOPTION_CONFLICT',
+          'resumed plan checker differs from its admitted ROADMAP pointer',
+        )
+      }
+      const resumedCandidateHash = resumedPlanPointer ? resumedPlanPointer.sha256 : candidateHash
+      const resumedOracle = resumedPlanPointer
+        ? roadmapPlanOracleForWorkItem(saved.workItemId)
+        : `independent-check-${index + 1}`
       const resumedCheckerAssignment = (decision.independentCheckingPlan &&
         decision.independentCheckingPlan.responsibilities[index]) ||
         'Resume the exact interrupted independent check.'
@@ -5797,8 +5905,8 @@ class CodexSupervisorRuntime {
         assignment: assignedDomainContracts.length > 0
           ? `${resumedCheckerAssignment} Return every declared captured-domain result in payload.capturedDomainOutcomes.`
           : resumedCheckerAssignment,
-        candidateHash,
-        oracle: `independent-check-${index + 1}`,
+        candidateHash: resumedCandidateHash,
+        oracle: resumedOracle,
         isolation: 'snapshot',
         writeProducing: true,
         success: decision.successChecklist || [],
@@ -5806,10 +5914,19 @@ class CodexSupervisorRuntime {
         risks: decision.risks || [],
         fetchedEvidence: assignedDomainContracts.length > 0
           ? { capturedDomainContracts: assignedDomainContracts } : null,
+        ...(resumedPlanPointer ? { roadmapSlice: resumedPlanPointer } : {}),
+        ...(resumedPlanPointer ? {
+          adoptedProjectionIdentity: {
+            runId: this.options.runId,
+            generation: Number(resumeState.schedulerCrashCheckpoint.runIdentity &&
+              resumeState.schedulerCrashCheckpoint.runIdentity.generation),
+            checkerId: resumedOracle,
+          },
+        } : {}),
         firstResponsibility: decision.independentCheckingPlan && decision.independentCheckingPlan.responsibilities[0],
         secondResponsibility: decision.independentCheckingPlan && decision.independentCheckingPlan.responsibilities[1],
         harnessAttestation: this.options.harnessAttestation
-          ? this.options.harnessAttestation(candidateHash, `independent-check-${index + 1}`)
+          ? this.options.harnessAttestation(resumedCandidateHash, resumedOracle)
           : undefined,
         adoptedSandboxResources: saved.resources,
       } : roadmapPlanning ? {
@@ -6321,6 +6438,7 @@ class CodexSupervisorRuntime {
     let checkerPolicy = null
     let sandboxAssignment = null
     if (CHECKER_ROLES.has(policy.child)) {
+      const projection = planCheckerProjection(request)
       const deferredCandidate = request.deferredPromotionToken
         ? this.deferredPromotions.get(request.deferredPromotionToken) : null
       if (request.deferredPromotionToken && (!deferredCandidate ||
@@ -6369,7 +6487,9 @@ class CodexSupervisorRuntime {
           ? this.options.validateCheckerSnapshot(untrustedSnapshotPath)
           : null
         const restoredCandidateHash = snapshotPath && fs.existsSync(snapshotPath)
-          ? hashWorkspaceCandidate(snapshotPath, this.options.gitEnvironment(snapshotPath))
+          ? (projection
+              ? validatePlanCheckerSnapshot(snapshotPath, request)
+              : hashWorkspaceCandidate(snapshotPath, this.options.gitEnvironment(snapshotPath)))
           : null
         if (!snapshotPath || !fs.existsSync(snapshotPath) || restoredCandidateHash !== request.candidateHash) {
           throw new SupervisorIntegrationError(
@@ -6383,9 +6503,33 @@ class CodexSupervisorRuntime {
             },
           )
         }
+        const projectionIdentity = {
+          runId: this.options.runId,
+          generation: this.activation.generation,
+          checkerId,
+        }
+        let priorProjectionReceipt = null
+        if (projection) {
+          priorProjectionReceipt = request.snapshotProjection || null
+          if (!priorProjectionReceipt || !request.adoptedProjectionIdentity) {
+            throw new SupervisorIntegrationError(
+              'CRASH_ADOPTION_CONFLICT',
+              'adopted plan checker lacks its exact persisted projection receipt identity',
+            )
+          }
+          validatePlanCheckerSnapshot(
+            snapshotPath,
+            request,
+            priorProjectionReceipt,
+            request.adoptedProjectionIdentity,
+          )
+          projectionIdentity.adoptedFromReceiptHash = priorProjectionReceipt.receiptHash
+        }
         sandboxAssignment = {
           checkerId,
           snapshotPath,
+          projectionReceipt: projection ? planProjectionReceipt(projection, snapshotPath, projectionIdentity) : null,
+          priorProjectionReceipt,
           schedulerResources: request.adoptedSandboxResources.map(resource => ({
             id: resource.id,
             kind: resource.kind,
@@ -6393,16 +6537,25 @@ class CodexSupervisorRuntime {
             isolationId: resource.isolationId || null,
           })),
         }
+        if (projection) {
+          validatePlanCheckerSnapshot(snapshotPath, request, sandboxAssignment.projectionReceipt, projectionIdentity)
+        }
       } else {
-        const snapshotFactory = deferredCandidate
-          ? (checkerId, resources) => this.options.checkerSnapshotFactory(
-              checkerId,
-              resources,
-              deferredCandidate.workerWorkspace.workspacePath,
-            )
-          : this.options.checkerSnapshotFactory
+        const snapshotFactory = (materializedCheckerId, resources) => this.options.checkerSnapshotFactory(
+          materializedCheckerId,
+          resources,
+          deferredCandidate ? deferredCandidate.workerWorkspace.workspacePath : this.options.targetPath,
+          { projection },
+        )
         const materialized = materializeCheckerSandboxes(sandboxPlan, snapshotFactory)
         sandboxAssignment = materialized.find(item => item.checkerId === checkerId) || materialized[0]
+        if (projection) {
+          validatePlanCheckerSnapshot(sandboxAssignment.snapshotPath, request, sandboxAssignment.projectionReceipt, {
+            runId: this.options.runId,
+            generation: this.activation.generation,
+            checkerId,
+          })
+        }
       }
       if (!sandboxAssignment || !sandboxAssignment.snapshotPath || typeof this.options.checkerScratchFactory !== 'function') {
         throw new SupervisorIntegrationError(
@@ -6488,6 +6641,28 @@ class CodexSupervisorRuntime {
       mission: this.options.mission,
       now: this.now,
     })
+    if (policy.child === 'plan-checker') {
+      canonicalAssignment = Object.freeze({
+        ...canonicalAssignment,
+        snapshotProjection: sandboxAssignment && sandboxAssignment.projectionReceipt || null,
+        priorSnapshotProjection: sandboxAssignment && sandboxAssignment.priorProjectionReceipt || null,
+      })
+      const harnessRepoHash = request.harnessAttestation && request.harnessAttestation.repoHash
+      if (harnessRepoHash !== request.candidateHash) {
+        throw new SupervisorIntegrationError(
+          'HARNESS_CANDIDATE_MISMATCH',
+          'checker harness repository hash must equal the exact admitted version hash before launch',
+        )
+      }
+      if (!canonicalAssignment || canonicalAssignment.planReference.sectionHash !== request.candidateHash ||
+           !sandboxAssignment || !sandboxAssignment.projectionReceipt ||
+           sandboxAssignment.projectionReceipt.sha256 !== request.candidateHash) {
+        throw new SupervisorIntegrationError(
+          'PLAN_PROJECTION_MISMATCH',
+          'plan checker assignment, projection, and exact-version hashes did not join before launch',
+        )
+      }
+    }
     if (canonicalAssignment && !CHECKER_ROLES.has(policy.child)) {
       const derivedResources = schedulerResourcesForAssignment(canonicalAssignment, targetWorkingDirectory)
       const callerResources = request.resources ?? request.schedulerResources ?? request.scheduler_resources
@@ -6548,6 +6723,17 @@ class CodexSupervisorRuntime {
           AUTOPROMPT_CHECKER_SCRATCH_ROOT: sandboxAssignment.checkerScratchBoundary.writableScratchRoot,
           AUTOPROMPT_CHECKER_OUTPUT_ROOT: sandboxAssignment.checkerScratchBoundary.outputRoot,
         }
+      : workerWorkspace
+        ? {
+            ...launchBaseEnvironment,
+            TMPDIR: workerWorkspace.cacheRoot,
+            TMP: workerWorkspace.cacheRoot,
+            TEMP: workerWorkspace.cacheRoot,
+            XDG_CACHE_HOME: workerWorkspace.cacheRoot,
+            PYTHONPYCACHEPREFIX: workerWorkspace.cacheRoot,
+            PYTHONDONTWRITEBYTECODE: '1',
+            AUTOPROMPT_WORKER_CACHE_ROOT: workerWorkspace.cacheRoot,
+          }
       : launchBaseEnvironment
     const safetyEnvironmentTarget = sandboxAssignment && sandboxAssignment.checkerScratchBoundary
       ? targetWorkingDirectory : workingDirectory
@@ -6582,6 +6768,7 @@ class CodexSupervisorRuntime {
             dependencies: request.dependencies || [],
             evidencePointers: request.evidencePointers ?? request.evidence_pointers ?? [],
             roadmapSlice: request.roadmapSlice ?? request.roadmap_slice ?? null,
+            snapshotProjection: sandboxAssignment && sandboxAssignment.projectionReceipt || null,
           },
         })
       : null
@@ -7029,7 +7216,12 @@ class CodexSupervisorRuntime {
             ...recoveryFrontier,
             acceptedResultIds: [receipt.receiptHash],
           },
-          nextReadyWorkIds: request.nextReadyAfter || recoveryFrontier.nextReadyWorkIds,
+          nextReadyWorkIds: durableNextReadyAfter(
+            policy.child,
+            terminalResult,
+            request.nextReadyAfter,
+            recoveryFrontier.nextReadyWorkIds,
+          ),
           openCheckIds: recoveryFrontier.openCheckIds,
           candidateHash: request.candidateHash || null,
         })
@@ -7352,16 +7544,20 @@ class CodexSupervisorRuntime {
       if (!request.retainLease) {
         lease.complete({})
         leaseSettled = true
-        if (CHECKER_ROLES.has(policy.child)) this.recoveryCompletedCheckIds.add(request.workItemId)
-        else this.recoveryCompletedWorkIds.add(request.workItemId)
+        const checkerPassed = checkerVerdictPassed(policy.child, result)
+        if (checkerPassed) addCanonicalCompletedChecker(this.recoveryCompletedCheckIds, request.workItemId)
+        else if (!CHECKER_ROLES.has(policy.child)) this.recoveryCompletedWorkIds.add(request.workItemId)
         this.recoveryThreads.delete(lease.id)
         this._persistRecoveryCheckpoint({
-          kind: CHECKER_ROLES.has(policy.child) ? 'CHECK_COMPLETED' : 'LEASE_COMPLETED',
+          kind: CHECKER_ROLES.has(policy.child)
+            ? (checkerPassed ? 'CHECK_COMPLETED' : 'FRONTIER_CHANGED')
+            : 'LEASE_COMPLETED',
           causeId: `scheduler:${this.activation.generation}:${lease.id}:completed`,
           humanDescription: 'Persist the completed model result and released scheduler lease as one recovery point.',
         }, {
           candidateHash: request.candidateHash || null,
-          nextReadyWorkIds: request.nextReadyAfter || [],
+          nextReadyWorkIds: checkerPassed || !CHECKER_ROLES.has(policy.child)
+            ? request.nextReadyAfter || [] : [],
         })
       } else {
         this.recoveryThreads.delete(lease.id)
@@ -7468,18 +7664,23 @@ class CodexSupervisorRuntime {
         }
       }
       persistTerminalSession(this.budget, sessionId, {
-        status: error.code === 'MISSION_TIMEOUT' ? 'CANCELLED' : 'FAILED', evidenceHashes: [],
+        status: error.code === 'MISSION_TIMEOUT' ? 'PARTIAL' : 'FAILED', evidenceHashes: [],
       }, error)
       throw error
     }
   }
 
   _withinMissionDeadline(operation) {
+    if ((this.options.baseEnvironment || process.env).AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1') {
+      return Promise.resolve().then(operation)
+    }
     const status = this.budget.assertAvailable({ forWork: true })
     return withTimeout(operation, status.remaining.wallMs, this.timerApi, 'MISSION_TIMEOUT', async () => {
-      this.cancelled = true
       if (this.scheduler) this.scheduler.dispose('original-request deadline elapsed')
-      await this.processOwner.cancelAll({ reason: 'original-request deadline elapsed' })
+      await this.processOwner.cancelAll({
+        reason: 'original-request deadline elapsed',
+        terminalStatus: 'PARTIAL',
+      })
       await this.processOwner.assertDrained()
     })
   }
@@ -7511,7 +7712,10 @@ class CodexSupervisorRuntime {
         if (settled) return
         if (scheduler.getMetrics().economics.firstProductSignal) return
         settled = true
-        Promise.resolve(this.processOwner.cancelAll({ reason: 'first RED/product-edit ceiling elapsed' })).catch(() => {})
+        Promise.resolve(this.processOwner.cancelAll({
+          reason: 'first RED/product-edit ceiling elapsed',
+          terminalStatus: 'FAILED',
+        })).catch(() => {})
         try {
           scheduler.assertFirstProductSignalDue({ elapsedMs: ceilingMs + 1 })
         } catch (error) {
@@ -7555,7 +7759,7 @@ class CodexSupervisorRuntime {
     if (this.finished) throw new SupervisorIntegrationError('TERMINAL_DUPLICATE', 'runtime already stopped')
     this.finished = true
     if (this.scheduler) this.scheduler.dispose(`resumable ${outcome}`)
-    await this.processOwner.cancelAll({ reason: `resumable ${outcome}` })
+    await this.processOwner.cancelAll({ reason: `resumable ${outcome}`, terminalStatus: 'PARTIAL' })
     await this.processOwner.assertDrained()
     if (result.transition) {
       await this._runtimeTransition(result.transition.eventId, 'PAUSED', { frontier: result.transition.frontier })
@@ -7605,7 +7809,7 @@ class CodexSupervisorRuntime {
     return transitioned
   }
 
-  async _enterTerminalRelease(outcome, error) {
+  async _enterTerminalRelease(outcome, error, terminalEnvelope = null) {
     if (!this.finalizer || typeof this.options.runtimeStateProvider !== 'function') return outcome
     const opened = this.options.runtimeStateProvider()
     let state = opened && opened.state
@@ -7615,6 +7819,14 @@ class CodexSupervisorRuntime {
       return 'CANCELLED'
     }
     if (outcome === 'PARTIAL') {
+      if (terminalEnvelope && terminalEnvelope.status === 'CHECK_REMAINS_INCONCLUSIVE' &&
+          state === 'CHECK_INCONCLUSIVE') {
+        await this._runtimeTransition('CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK', {
+          candidateHash: terminalEnvelope.currentVersionHash || terminalEnvelope.candidateHash || null,
+          checkerResultHash: hashText(JSON.stringify(terminalEnvelope)),
+        })
+        return 'PARTIAL'
+      }
       await this._runtimeTransition('BUDGET_EXHAUSTED_FINAL', 'RELEASING_LOCK')
       return 'PARTIAL'
     }
@@ -7683,7 +7895,7 @@ class CodexSupervisorRuntime {
   async cancel(reason = 'cancel requested') {
     this.cancelled = true
     if (this.scheduler) this.scheduler.dispose(reason)
-    await this.processOwner.cancelAll({ reason })
+    await this.processOwner.cancelAll({ reason, terminalStatus: 'CANCELLED' })
     await this.processOwner.assertDrained()
     const postDrainCheckpoint = await this._bestEffortPostDrainCheckpoint(reason)
     if (this.lease && !this.finished) {
@@ -7717,7 +7929,7 @@ class CodexSupervisorRuntime {
     this.finished = true
     if (result.processTreeDrained !== true) {
       if (this.scheduler) this.scheduler.dispose('terminal finalization')
-      await this.processOwner.cancelAll({ reason: 'terminal finalization' })
+      await this.processOwner.cancelAll({ reason: 'terminal finalization', terminalStatus: outcome })
       await this.processOwner.assertDrained()
     }
     const finalizationBudget = this._enforceBudgetPhase(
@@ -7726,12 +7938,14 @@ class CodexSupervisorRuntime {
     )
     let finalized
     if (this.finalizer && typeof this.finalizer.finalize === 'function') {
+      const diagnostics = terminalFinalizationDiagnostics(result)
       finalized = await this.finalizer.finalize({
         outcome,
-        reason: result.reason || 'typed runtime outcome',
+        reason: diagnostics.reason,
+        unblockPath: diagnostics.unblockPath,
         deliverables: result.deliverables || [],
         checkHashes: result.checkHashes || [],
-        terminalEnvelope: result.terminalEnvelope || null,
+        terminalEnvelope: diagnostics.terminalEnvelope,
         expectedEpoch: result.expectedEpoch,
       })
     } else {
@@ -7827,6 +8041,8 @@ function replayRequestFromPersistedAssignment(assignment) {
     findingIds: [...assignment.findingIds],
     ownership: resources,
     manifests: resources,
+    snapshotProjection: assignment.snapshotProjection
+      ? Object.freeze(JSON.parse(JSON.stringify(assignment.snapshotProjection))) : null,
     replayedAssignmentPath: `work/assignments/${hashText(assignment.assignmentId)}.json`,
   })
 }
@@ -8426,6 +8642,108 @@ function hashWorkspaceCandidate(repository, environment) {
     digest.update(Buffer.from('\0'))
   }
   return digest.digest('hex')
+}
+
+function planCheckerProjection(request) {
+  if (!request || request.logicalRole !== 'plan-checker') return null
+  const pointer = request.roadmapSlice ?? request.roadmap_slice
+  if (!pointer || typeof pointer.path !== 'string' || !path.isAbsolute(pointer.path) ||
+      !/^[a-f0-9]{64}$/u.test(pointer.sha256 || '') ||
+      !Number.isSafeInteger(pointer.bytes) || pointer.bytes < 0) {
+    throw new SupervisorIntegrationError(
+      'PLAN_PROJECTION_INVALID',
+      'plan checker requires one exact authenticated ROADMAP projection pointer',
+    )
+  }
+  if (request.candidateHash !== pointer.sha256) {
+    throw new SupervisorIntegrationError(
+      'PLAN_PROJECTION_INVALID',
+      'plan checker exact-version hash differs from its admitted ROADMAP bytes',
+    )
+  }
+  return Object.freeze({
+    relativePath: 'plan/ROADMAP.md',
+    sourcePath: path.resolve(pointer.path),
+    sha256: pointer.sha256,
+    bytes: pointer.bytes,
+  })
+}
+
+function canonicalCompletedCheckerId(workItemId) {
+  const value = String(workItemId || '')
+  if (/^roadmap-plan-(?:check|recheck)-runtime-retry$/u.test(value)) {
+    return value.replace(/-runtime-retry$/u, '')
+  }
+  const independent = /^(independent-check-\d+)(?:-repair-\d+)?(?:-runtime-retry-\d+)?$/u.exec(value)
+  if (independent) return independent[1]
+  return value
+}
+
+function addCanonicalCompletedChecker(completed, workItemId) {
+  if (!(completed instanceof Set) || typeof workItemId !== 'string' || !workItemId) return
+  completed.add(workItemId)
+}
+
+function planProjectionReceipt(projection, snapshotPath, identity = {}) {
+  const body = {
+    schemaVersion: 1,
+    runId: typeof identity.runId === 'string' ? identity.runId : null,
+    generation: Number.isSafeInteger(identity.generation) ? identity.generation : null,
+    checkerId: typeof identity.checkerId === 'string' ? identity.checkerId : null,
+    relativePath: projection.relativePath,
+    sourcePath: path.resolve(projection.sourcePath),
+    sha256: projection.sha256,
+    bytes: projection.bytes,
+    snapshotPath: fs.realpathSync.native(path.resolve(snapshotPath)),
+    adoptedFromReceiptHash: typeof identity.adoptedFromReceiptHash === 'string'
+      ? identity.adoptedFromReceiptHash : null,
+  }
+  return Object.freeze({ ...body, receiptHash: hashText(stableStringify(body)) })
+}
+
+function validatePlanCheckerSnapshot(snapshotPath, request, receipt = null, expectedIdentity = null) {
+  const projection = planCheckerProjection(request)
+  if (!projection) return hashWorkspaceCandidate(snapshotPath, process.env)
+  const destination = path.resolve(snapshotPath, ...projection.relativePath.split('/'))
+  if (!pathIsInside(snapshotPath, destination)) {
+    throw new SupervisorIntegrationError('PLAN_PROJECTION_INVALID', 'projected ROADMAP escaped the checker snapshot')
+  }
+  let bytes
+  try { bytes = readFileNoFollow(destination) } catch (error) {
+    throw new SupervisorIntegrationError('PLAN_PROJECTION_INVALID', 'projected ROADMAP is not one safe regular file', {
+      cause: error.code || error.message,
+    })
+  }
+  const actualHash = bytes && sha256Bytes(bytes)
+  if (!bytes || bytes.length !== projection.bytes || actualHash !== projection.sha256) {
+    throw new SupervisorIntegrationError(
+      'PLAN_PROJECTION_MISMATCH',
+      'checker snapshot does not contain the exact admitted ROADMAP bytes',
+      { expectedHash: projection.sha256, actualHash: actualHash || null },
+    )
+  }
+  if (receipt) {
+    if (!expectedIdentity || typeof expectedIdentity.runId !== 'string' || !expectedIdentity.runId ||
+        !Number.isSafeInteger(expectedIdentity.generation) ||
+        typeof expectedIdentity.checkerId !== 'string' || !expectedIdentity.checkerId) {
+      throw new SupervisorIntegrationError(
+        'PLAN_PROJECTION_MISMATCH',
+        'checker projection receipt validation requires the exact run, generation, and checker identity',
+      )
+    }
+    const body = { ...receipt }
+    delete body.receiptHash
+    if (receipt.runId !== expectedIdentity.runId || receipt.generation !== expectedIdentity.generation ||
+        receipt.checkerId !== expectedIdentity.checkerId ||
+        receipt.relativePath !== projection.relativePath || receipt.sourcePath !== projection.sourcePath ||
+        receipt.sha256 !== projection.sha256 || receipt.bytes !== projection.bytes ||
+        receipt.snapshotPath !== fs.realpathSync.native(path.resolve(snapshotPath)) ||
+        receipt.adoptedFromReceiptHash !== (expectedIdentity.adoptedFromReceiptHash || null) ||
+        receipt.receiptHash !== hashText(stableStringify(body))) {
+      throw new SupervisorIntegrationError('PLAN_PROJECTION_MISMATCH', 'checker projection receipt is foreign or corrupt')
+    }
+  }
+  return actualHash
 }
 
 function changedDeliverables(repository, environment) {
@@ -9623,15 +9941,50 @@ function createDefaultRouteExecutor(options) {
       recipe, launch, ownership: admittedReadOwnership,
       fetchedEvidence: withDescriptiveLikelyAreas(null),
     })
-    const resumeAtChecking = resumeState && resumeState.resumeState === 'CHECK_WORK'
-    const resumeInWork = resumeState && resumeState.resumeState === 'RUN_WORK'
+    const durableInconclusiveChecker = resumeState && resumeState.retryState &&
+      resumeState.retryState.inconclusiveChecker || null
+    const durablePlanningCheckerId = durableInconclusiveChecker &&
+      canonicalCompletedCheckerId(durableInconclusiveChecker.checkerId)
+    const resumePlanningRetry = Boolean(route === 'ROADMAP' && resumeState &&
+      resumeState.resumeState === 'CHECK_INCONCLUSIVE' &&
+      ['roadmap-plan-check', 'roadmap-plan-recheck'].includes(durablePlanningCheckerId) &&
+      durableInconclusiveChecker.returnState === 'RUN_WORK')
+    if (route === 'ROADMAP' && resumeState && resumeState.resumeState === 'CHECK_INCONCLUSIVE' &&
+        ['roadmap-plan-check', 'roadmap-plan-recheck'].includes(durablePlanningCheckerId) &&
+        !resumePlanningRetry) {
+      throw new SupervisorIntegrationError(
+        'CHECK_RETRY_STATE_INVALID',
+        'durable ROADMAP plan retry does not return to its canonical RUN_WORK origin',
+      )
+    }
+    const resumeAtChecking = Boolean(resumeState &&
+      (resumeState.resumeState === 'CHECK_WORK' ||
+       (resumeState.resumeState === 'CHECK_INCONCLUSIVE' && !resumePlanningRetry)))
+    const resumeInWork = Boolean(resumeState &&
+      (resumeState.resumeState === 'RUN_WORK' || resumePlanningRetry))
     const completedBeforeResume = new Set(resumeState && resumeState.completedWorkIds || [])
+    for (const checkId of resumeState && resumeState.completedCheckIds || []) {
+      completedBeforeResume.add(canonicalCompletedCheckerId(checkId))
+    }
+    if (resumePlanningRetry && completedBeforeResume.has('roadmap-plan-check')) {
+      throw new SupervisorIntegrationError(
+        'CHECK_RETRY_STATE_INVALID',
+        'durable ROADMAP retry conflicts with already accepted plan-check next ready work',
+      )
+    }
     const adoptedWorkResults = resumeInWork && typeof resumeAdoptedLaunches === 'function'
       ? await resumeAdoptedLaunches({ resumeState, candidateHash: null, decision, stage: 'work' })
       : {}
     const acceptedWorkResults = new Map(Object.entries(adoptedWorkResults)
       .filter(([workItemId]) => /^work-\d+$/.test(workItemId)))
-    for (const workItemId of Object.keys(adoptedWorkResults)) completedBeforeResume.add(workItemId)
+    for (const [workItemId, adoptedResult] of Object.entries(adoptedWorkResults)) {
+      if (!CHECKER_ROLES.has(adoptedResult && adoptedResult.logicalRoleId) &&
+          !/^roadmap-plan-(?:check|recheck)(?:-runtime-retry)?$/u.test(workItemId)) {
+        completedBeforeResume.add(workItemId)
+      } else if (adoptedResult && adoptedResult.code === 'PASS') {
+        completedBeforeResume.add(canonicalCompletedCheckerId(workItemId))
+      }
+    }
     let retainedCoordinator = adoptedWorkResults['mission-coordination'] &&
       adoptedWorkResults['mission-coordination'].retainedLease || null
     let retainedManager = adoptedWorkResults['roadmap-work-group'] &&
@@ -9761,38 +10114,144 @@ function createDefaultRouteExecutor(options) {
       roadmapResult = roadmapAuthorArtifact(revisedResult, concreteScoutCorrections)
       options.writePlan('ROADMAP', decision, roadmapResult)
     }
+    const isNonAuthoritativePlanResult = result =>
+      ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(result && result.code)
+    const inconclusivePlanOutcome = result => ({
+      outcome: 'PARTIAL',
+      terminalEnvelope: {
+        ...result,
+        status: 'CHECK_REMAINS_INCONCLUSIVE',
+        reason: result && result.cause && result.cause.reason ||
+          'the isolated runtime retry remained non-authoritative',
+      },
+    })
+    const runRoadmapPlanCheck = async ({ baseId, retryId, candidateHash, requestFor }) => {
+      const markerMatches = resumePlanningRetry && durablePlanningCheckerId === baseId
+      if (markerMatches && (durableInconclusiveChecker.retryAttempt !== 1 ||
+          durableInconclusiveChecker.candidateHash !== candidateHash)) {
+        throw new SupervisorIntegrationError(
+          'CHECK_RETRY_STATE_INVALID',
+          `durable ${baseId} retry differs from the exact admitted plan version being checked`,
+        )
+      }
+      if (adoptedWorkResults[retryId] && !markerMatches) {
+        throw new SupervisorIntegrationError(
+          'CHECK_RETRY_STATE_INVALID',
+          `adopted ${retryId} lacks its durable inconclusive retry marker`,
+        )
+      }
+      let retryStateEntered = markerMatches
+      let activeId = markerMatches ? retryId : baseId
+      let result = adoptedWorkResults[activeId] || await launch(requestFor(activeId))
+      if (isNonAuthoritativePlanResult(result) && activeId === baseId) {
+        await options.transition('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
+          candidateHash,
+          checkerId: baseId,
+          checkerResultHash: hashText(JSON.stringify(result)),
+          retryAttempt: 1,
+        })
+        retryStateEntered = true
+        activeId = retryId
+        result = adoptedWorkResults[retryId] || await launch(requestFor(retryId))
+      }
+      if (isNonAuthoritativePlanResult(result)) {
+        await options.transition('CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK', {
+          candidateHash,
+          checkerId: activeId,
+          checkerResultHash: hashText(JSON.stringify(result)),
+          retryAttempt: 1,
+        })
+        return { activeId, result, terminal: inconclusivePlanOutcome(result) }
+      }
+      if (retryStateEntered) {
+        await options.transition('CHECK_BECAME_CONCLUSIVE', 'RUN_WORK', {
+          candidateHash,
+          checkerId: activeId,
+          checkerResultHash: hashText(JSON.stringify(result)),
+          retryAttempt: 1,
+        })
+      }
+      return { activeId, result, terminal: null }
+    }
+    const planCheckRequest = (workItemId, candidateHash, pointer) => {
+      const retry = workItemId === 'roadmap-plan-check-runtime-retry'
+      return {
+        workItemId, logicalRole: 'plan-checker', parent: 'run-owner',
+        purpose: retry ? 'recovery' : 'verification',
+        ...(retry ? { executorKey: 'roadmap-plan-check' } : {}),
+        assignment: retry
+          ? 'Retry the same admitted roadmap check in a newly materialized exact-byte snapshot. Do not reinterpret a runtime transport or snapshot defect as a plan defect.'
+          : 'Independently check the roadmap against the exact request and dependency facts.',
+        candidateHash, oracle: 'roadmap-plan-oracle', success: successes, checks,
+        isolation: 'snapshot', writeProducing: true, roadmapSlice: pointer,
+        evidencePointers: scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
+        ...(retry ? {} : {
+          fetchedEvidence: withDescriptiveLikelyAreas(
+            roadmapResult && Array.isArray(roadmapResult.scoutCorrections)
+              ? { scoutCorrections: roadmapResult.scoutCorrections } : null,
+          ),
+        }),
+        manifests: executionOwnership,
+        harnessAttestation: options.harnessAttestation(candidateHash, 'roadmap-plan-oracle'),
+        nextReadyAfter: ['mission-coordination'],
+      }
+    }
+    const planRecheckRequest = (workItemId, candidateHash, pointer) => {
+      const retry = workItemId === 'roadmap-plan-recheck-runtime-retry'
+      return {
+        workItemId, logicalRole: 'plan-checker', parent: 'run-owner',
+        purpose: retry ? 'recovery' : 'verification',
+        repairOf: 'roadmap-plan-check', executorKey: 'roadmap-plan-check',
+        assignment: retry
+          ? 'Retry the repaired roadmap check in a newly materialized exact-byte snapshot without changing the admitted plan.'
+          : 'Recheck only the repaired roadmap findings in the same independent checker context.',
+        candidateHash, oracle: 'roadmap-plan-oracle-recheck', success: successes, checks,
+        isolation: 'snapshot', writeProducing: true, roadmapSlice: pointer,
+        evidencePointers: scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
+        manifests: executionOwnership,
+        harnessAttestation: options.harnessAttestation(candidateHash, 'roadmap-plan-oracle-recheck'),
+        nextReadyAfter: ['mission-coordination'],
+      }
+    }
+    const resumeAtPlanRecheck = route === 'ROADMAP' && !resumeAtChecking &&
+      !completedBeforeResume.has('roadmap-plan-check') &&
+      (resumePlanningRetry
+        ? durablePlanningCheckerId === 'roadmap-plan-recheck'
+        : completedBeforeResume.has('roadmap-author-plan-repair') ||
+          Boolean(adoptedWorkResults['roadmap-plan-recheck']))
+    if (resumeAtPlanRecheck) {
+      planPointer = options.planPointer('ROADMAP')
+      const recheckAttempt = await runRoadmapPlanCheck({
+        baseId: 'roadmap-plan-recheck',
+        retryId: 'roadmap-plan-recheck-runtime-retry',
+        candidateHash: planPointer.sha256,
+        requestFor: workItemId => planRecheckRequest(workItemId, planPointer.sha256, planPointer),
+      })
+      if (recheckAttempt.terminal) return recheckAttempt.terminal
+      if (recheckAttempt.result.code && recheckAttempt.result.code !== 'PASS') {
+        return { outcome: 'FAILED', terminalEnvelope: recheckAttempt.result }
+      }
+      completedBeforeResume.add('roadmap-plan-check')
+    }
     if (route === 'ROADMAP' && !resumeAtChecking && !completedBeforeResume.has('roadmap-plan-check')) {
       planPointer = options.planPointer('ROADMAP')
       // The plan checker verifies the frozen roadmap artifact, not the target
       // workspace. Bind its canonical verdict to the exact roadmap bytes it is
       // instructed to inspect so a valid PASS or FAIL can enter the repair loop.
-      const planningCandidate = planPointer.sha256
-      const planCheck = await launch({
-        workItemId: 'roadmap-plan-check', logicalRole: 'plan-checker', parent: 'run-owner',
-        purpose: 'verification', assignment: 'Independently check the roadmap against the exact request and dependency facts.',
-        candidateHash: planningCandidate, oracle: 'roadmap-plan-oracle', success: successes, checks,
-        isolation: 'snapshot',
-        writeProducing: true,
-        roadmapSlice: planPointer,
-        evidencePointers: scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
-        fetchedEvidence: withDescriptiveLikelyAreas(
-          roadmapResult && Array.isArray(roadmapResult.scoutCorrections)
-            ? { scoutCorrections: roadmapResult.scoutCorrections } : null,
-        ),
-        manifests: executionOwnership,
-        harnessAttestation: options.harnessAttestation(planningCandidate, 'roadmap-plan-oracle'),
-        nextReadyAfter: ['mission-coordination'],
+      const planAttempt = await runRoadmapPlanCheck({
+        baseId: 'roadmap-plan-check',
+        retryId: 'roadmap-plan-check-runtime-retry',
+        candidateHash: planPointer.sha256,
+        requestFor: workItemId => planCheckRequest(workItemId, planPointer.sha256, planPointer),
       })
-      if (planCheck.code && planCheck.code !== 'PASS') {
-        if (['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(planCheck.code)) {
-          return { outcome: 'BLOCKED', terminalEnvelope: planCheck }
-        }
+      if (planAttempt.terminal) return planAttempt.terminal
+      if (planAttempt.result.code && planAttempt.result.code !== 'PASS') {
         let planCheckEvidence
         try {
           if (typeof options.resultPointer !== 'function') throw new Error('result pointer resolver is unavailable')
           planCheckEvidence = validateDurableResultEvidencePointer(
-            options.resultPointer('roadmap-plan-check'),
-            'roadmap-plan-check',
+            options.resultPointer(planAttempt.activeId),
+            planAttempt.activeId,
           )
         } catch (error) {
           if (error && error.code === 'PLAN_CHECK_EVIDENCE_MISSING') throw error
@@ -9819,29 +10278,22 @@ function createDefaultRouteExecutor(options) {
           ],
           nextReadyAfter: ['roadmap-plan-recheck'],
         })
+        completedBeforeResume.add('roadmap-author-plan-repair')
         roadmapResult = roadmapAuthorArtifact(
           repaired,
           roadmapResult && roadmapResult.scoutCorrections || [],
         )
         options.writePlan('ROADMAP', decision, roadmapResult)
         planPointer = options.planPointer('ROADMAP')
-        const repairedCandidate = planPointer.sha256
-        const recheck = await launch({
-          workItemId: 'roadmap-plan-recheck', logicalRole: 'plan-checker', parent: 'run-owner',
-          purpose: 'verification', repairOf: 'roadmap-plan-check', executorKey: 'roadmap-plan-check',
-          assignment: 'Recheck only the repaired roadmap findings in the same independent checker context.',
-          candidateHash: repairedCandidate, oracle: 'roadmap-plan-oracle-recheck', success: successes, checks,
-          isolation: 'snapshot', writeProducing: true, roadmapSlice: planPointer,
-          evidencePointers: scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
-          manifests: executionOwnership,
-          harnessAttestation: options.harnessAttestation(repairedCandidate, 'roadmap-plan-oracle-recheck'),
-          nextReadyAfter: ['mission-coordination'],
+        const recheckAttempt = await runRoadmapPlanCheck({
+          baseId: 'roadmap-plan-recheck',
+          retryId: 'roadmap-plan-recheck-runtime-retry',
+          candidateHash: planPointer.sha256,
+          requestFor: workItemId => planRecheckRequest(workItemId, planPointer.sha256, planPointer),
         })
-        if (recheck.code && recheck.code !== 'PASS') {
-          return {
-            outcome: ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(recheck.code) ? 'BLOCKED' : 'FAILED',
-            terminalEnvelope: recheck,
-          }
+        if (recheckAttempt.terminal) return recheckAttempt.terminal
+        if (recheckAttempt.result.code && recheckAttempt.result.code !== 'PASS') {
+          return { outcome: 'FAILED', terminalEnvelope: recheckAttempt.result }
         }
       }
       completedBeforeResume.add('roadmap-plan-check')
@@ -10199,7 +10651,36 @@ function createDefaultRouteExecutor(options) {
     const checkerDomainContracts = fixturePrebuildOutcome
       ? capturedDomainContracts.filter(contract => contract.kind !== 'FIXTURE_PROVENANCE')
       : capturedDomainContracts
+    const completedCheckResults = new Map()
+    for (const completedId of resumeState && resumeState.completedCheckIds || []) {
+      if (!/^independent-check-\d+/u.test(completedId)) continue
+      if (typeof options.readResult !== 'function') continue
+      const persisted = options.readResult(completedId)
+      if (!persisted || persisted.code !== 'PASS') {
+        throw new SupervisorIntegrationError(
+          'CRASH_ADOPTION_CONFLICT',
+          `completed checker ${completedId} lacks its exact durable PASS result`,
+        )
+      }
+      completedCheckResults.set(canonicalCompletedCheckerId(completedId), persisted)
+    }
     let checkerRepairAttempt = 0
+    let checkerRuntimeRetries = Array.from({ length: checkerCount }, () => 0)
+    const resumedInconclusive = resumeState && resumeState.retryState &&
+      resumeState.retryState.inconclusiveChecker
+    if (resumedInconclusive && resumedInconclusive.candidateHash === candidateHash) {
+      const resumedIndex = /^independent-check-(\d+)/u.exec(String(resumedInconclusive.checkerId || ''))
+      if (resumedIndex && Number(resumedIndex[1]) >= 1 && Number(resumedIndex[1]) <= checkerCount) {
+        checkerRuntimeRetries[Number(resumedIndex[1]) - 1] = Math.max(
+          1,
+          Number(resumedInconclusive.retryAttempt || 1),
+        )
+      }
+    }
+    for (let index = 0; index < checkerCount; index += 1) {
+      const adoptedRetryId = `independent-check-${index + 1}-runtime-retry-1`
+      if (adoptedCheckResults[adoptedRetryId]) checkerRuntimeRetries[index] = 1
+    }
     checkerAttempts: while (true) {
       checkHashes.length = 0
       checkerEvidenceConsumptions.length = 0
@@ -10212,11 +10693,19 @@ function createDefaultRouteExecutor(options) {
       for (let index = 0; index < checkerCount; index += 1) {
       const oracle = `independent-check-${index + 1}`
       const canonicalCheckerId = `independent-check-${index + 1}`
-      const workItemId = checkerRepairAttempt === 0
-        ? canonicalCheckerId : `${canonicalCheckerId}-repair-${checkerRepairAttempt}`
       const checkerAssignment = checking.responsibilities[index] || checking.responsibilities[0]
       const assignedDomainContracts = index === 0 ? checkerDomainContracts : []
-      const result = checkerRepairAttempt === 0 && adoptedCheckResults && adoptedCheckResults[workItemId] || await launch({
+      let workItemId
+      let result
+      while (true) {
+        const checkerAttemptId = checkerRepairAttempt > 0
+          ? `${canonicalCheckerId}-repair-${checkerRepairAttempt}` : canonicalCheckerId
+        const retryAttempt = checkerRuntimeRetries[index]
+        workItemId = retryAttempt > 0
+          ? `${checkerAttemptId}-runtime-retry-${retryAttempt}` : checkerAttemptId
+        result = adoptedCheckResults && adoptedCheckResults[workItemId] ||
+          (checkerRepairAttempt === 0 && retryAttempt === 0
+            ? completedCheckResults.get(canonicalCheckerId) : null) || await launch({
         workItemId,
         logicalRole: index === 0 ? 'independent-reviewer' : 'independent-tester',
         parent: 'run-owner', purpose: 'verification',
@@ -10236,12 +10725,51 @@ function createDefaultRouteExecutor(options) {
           ? { capturedDomainContracts: assignedDomainContracts } : null,
         deferredPromotionToken: deferredPromotion && deferredPromotion.token || null,
         harnessAttestation: options.harnessAttestation(candidateHash, oracle),
-      })
-      if (!CANONICAL_CHECKER_CODES.has(result && result.code)) {
-        throw new SupervisorIntegrationError(
-          'CHECK_REPORT_INVALID',
-          'independent checker returned an unknown canonical verdict code',
-        )
+        })
+        if (!CANONICAL_CHECKER_CODES.has(result && result.code)) {
+          throw new SupervisorIntegrationError(
+            'CHECK_REPORT_INVALID',
+            'independent checker returned an unknown canonical verdict code',
+          )
+        }
+        const nonAuthoritative = ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(result.code)
+        if (nonAuthoritative && retryAttempt === 0) {
+          await options.transition('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
+            candidateHash,
+            checkerId: workItemId,
+            checkerResultHash: hashText(JSON.stringify(result)),
+            retryAttempt: 1,
+          })
+          checkerRuntimeRetries[index] = 1
+          continue
+        }
+        if (nonAuthoritative) {
+          await options.transition('CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK', {
+            candidateHash,
+            checkerId: workItemId,
+            checkerResultHash: hashText(JSON.stringify(result)),
+            retryAttempt,
+          })
+          if (deferredPromotion) await deferredPromotion.abort('independent checker did not pass')
+          return {
+            outcome: 'PARTIAL',
+            terminalEnvelope: {
+              ...result, status: 'CHECK_REMAINS_INCONCLUSIVE',
+              reason: result.cause && result.cause.reason ||
+                'the isolated runtime retry remained non-authoritative',
+            },
+            checkHashes,
+          }
+        }
+        if (retryAttempt > 0) {
+          await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
+            candidateHash,
+            checkerId: workItemId,
+            checkerResultHash: hashText(JSON.stringify(result)),
+            retryAttempt,
+          })
+        }
+        break
       }
       if (result.code !== 'PASS') {
         const canRepairImplementation = result.code === 'FAIL' && checkerRepairAttempt === 0 &&
@@ -10301,6 +10829,7 @@ function createDefaultRouteExecutor(options) {
           usableDeliverables = changedDeliverables(options.targetPath, options.gitEnvironment())
           acceptedWorkResults.set(repairWorkItemId, repairResult)
           checkerRepairAttempt += 1
+          checkerRuntimeRetries = Array.from({ length: checkerCount }, () => 0)
           await options.transition('REPAIR_READY', 'CHECK_WORK', {
             ...checkerFreezeBinding,
             priorCandidateHash: rejectedCandidateHash,
@@ -10319,11 +10848,7 @@ function createDefaultRouteExecutor(options) {
           continue checkerAttempts
         }
         if (deferredPromotion) await deferredPromotion.abort('independent checker did not pass')
-        return {
-          outcome: ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(result.code) ? 'BLOCKED' : 'FAILED',
-          terminalEnvelope: result,
-          checkHashes,
-        }
+        return { outcome: 'FAILED', terminalEnvelope: result, checkHashes }
       }
       if (result && result.payload && Array.isArray(result.payload.capturedDomainOutcomes)) {
         capturedDomainOutcomes.push(...result.payload.capturedDomainOutcomes)
@@ -10518,8 +11043,34 @@ function createDefaultRouteExecutor(options) {
 
 function createCheckerSnapshotFactory(options) {
   fs.mkdirSync(options.snapshotRoot, { recursive: true, mode: 0o700 })
-  return (checkerId, _resources, candidateSourcePath = options.targetPath) => {
+  return (checkerId, _resources, candidateSourcePath = options.targetPath, context = {}) => {
     const sourcePath = path.resolve(candidateSourcePath)
+    const projection = context && context.projection || null
+    let projectedBytes = null
+    let projectedMode = 0o600
+    if (projection) {
+      if (projection.relativePath !== 'plan/ROADMAP.md' ||
+          typeof projection.sourcePath !== 'string' || !path.isAbsolute(projection.sourcePath) ||
+          !/^[a-f0-9]{64}$/u.test(projection.sha256 || '') ||
+          !Number.isSafeInteger(projection.bytes) || projection.bytes < 0) {
+        throw new SupervisorIntegrationError('PLAN_PROJECTION_INVALID', 'checker snapshot projection contract is invalid')
+      }
+      try {
+        projectedBytes = readFileNoFollow(projection.sourcePath)
+        projectedMode = fs.lstatSync(projection.sourcePath).mode & 0o777
+      } catch (error) {
+        throw new SupervisorIntegrationError('PLAN_PROJECTION_INVALID', 'admitted ROADMAP projection source is unsafe or missing', {
+          cause: error.code || error.message,
+        })
+      }
+      if (!projectedBytes || projectedBytes.length !== projection.bytes ||
+          sha256Bytes(projectedBytes) !== projection.sha256) {
+        throw new SupervisorIntegrationError(
+          'PLAN_PROJECTION_SOURCE_CHANGED',
+          'admitted ROADMAP bytes changed before checker snapshot materialization',
+        )
+      }
+    }
     const snapshotPath = path.join(options.snapshotRoot, `${hashText(checkerId)}-${crypto.randomBytes(8).toString('hex')}`)
     const sourceEnvironment = options.gitEnvironment(sourcePath)
     const clone = childProcess.spawnSync('git', ['clone', '--no-local', '--no-hardlinks', '--', sourcePath, snapshotPath], {
@@ -10616,8 +11167,39 @@ function createCheckerSnapshotFactory(options) {
       fs.copyFileSync(source, destination)
       fs.chmodSync(destination, stat.mode & 0o777)
     }
+    let projectionReceipt = null
+    if (projection) {
+      const destination = path.resolve(snapshotPath, ...projection.relativePath.split('/'))
+      if (!pathIsInside(snapshotPath, destination)) {
+        throw new SupervisorIntegrationError('PLAN_PROJECTION_INVALID', 'ROADMAP projection destination escaped the checker snapshot')
+      }
+      fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 })
+      const snapshotReal = fs.realpathSync.native(snapshotPath)
+      const parentReal = fs.realpathSync.native(path.dirname(destination))
+      if (!pathIsInside(snapshotReal, parentReal)) {
+        throw new SupervisorIntegrationError('PLAN_PROJECTION_INVALID', 'ROADMAP projection parent escaped through a link')
+      }
+      if (fs.existsSync(destination)) {
+        const destinationStat = fs.lstatSync(destination)
+        if (!destinationStat.isFile() || destinationStat.isSymbolicLink() || Number(destinationStat.nlink) !== 1) {
+          throw new SupervisorIntegrationError('PLAN_PROJECTION_INVALID', 'ROADMAP projection destination is unsafe')
+        }
+        fs.unlinkSync(destination)
+      }
+      fs.writeFileSync(destination, projectedBytes, { flag: 'wx', mode: projectedMode })
+      fs.chmodSync(destination, projectedMode & 0o555 || 0o400)
+      const reopened = readFileNoFollow(destination)
+      if (!reopened || reopened.length !== projection.bytes || sha256Bytes(reopened) !== projection.sha256) {
+        throw new SupervisorIntegrationError('PLAN_PROJECTION_MISMATCH', 'ROADMAP projection changed after materialization')
+      }
+      projectionReceipt = planProjectionReceipt(projection, snapshotReal, {
+        runId: options.runId,
+        generation: options.generation,
+        checkerId,
+      })
+    }
     options.cleanupRegistry.register({ path: snapshotPath, kind: 'checker-snapshot', owner: checkerId })
-    return snapshotPath
+    return projectionReceipt ? Object.freeze({ snapshotPath, projectionReceipt }) : snapshotPath
   }
 }
 
@@ -10741,6 +11323,7 @@ function createRuntimeCapabilityBinding(input) {
     generation: input.activation.record.capability.generation,
     targetIdentity: input.targetIdentity,
     now: input.now,
+    environment: input.environment,
   })
   const allowedRoutes = Object.keys(ROUTE_CAPABILITY_EFFECTS)
   const allowedEffects = [...new Set(Object.values(ROUTE_CAPABILITY_EFFECTS).flat())].sort()
@@ -11284,6 +11867,7 @@ function createSupervisorOptions(args = {}, context = {}) {
 function createDefaultRuntimeOptions(input) {
   const { activation, probe, context = {} } = input
   const environment = context.environment || process.env
+  const wallTimeUnbounded = benchmarkNoTimeoutEnabled(environment)
   const activationRecord = activation.record
   const targetPath = activationRecord.target.realpath
   const generation = activationRecord.capability.generation
@@ -11602,12 +12186,17 @@ function createDefaultRuntimeOptions(input) {
             await processOwner.observeRootExit(owned.ownershipId, {
               code: null,
               signal: 'SUPERVISOR_CRASH',
-              terminalEnvelope: { status: 'CANCELLED' },
+              terminalEnvelope: { status: 'LOST' },
               killMs: 0,
             })
           }
         }
-        await processOwner.cancelAll({ reason: 'crash-generation stale descendant drain', graceMs: 0, killMs: 2000 })
+        await processOwner.cancelAll({
+          reason: 'crash-generation stale descendant drain',
+          graceMs: 0,
+          killMs: 2000,
+          terminalStatus: 'LOST',
+        })
         await processOwner.assertDrained()
         const targetKey = missionLock.identify(targetPath, activation.supervisorRuntime.runPath).key
         await processOwner.assertTargetDrained(targetKey)
@@ -11772,6 +12361,7 @@ function createDefaultRuntimeOptions(input) {
           wallNowMs: context.wallNowMs,
           wallClock: context.clock,
           bootId: context.bootId,
+          wallTimeUnbounded,
         })
         runtimeOptions.previousBudgetSnapshot = budget.snapshot()
         runtimeOptions.budgetController = budget
@@ -11841,6 +12431,7 @@ function createDefaultRuntimeOptions(input) {
           wallNowMs: context.wallNowMs,
           wallClock: context.clock,
           bootId: context.bootId,
+          wallTimeUnbounded,
         })
         runtimeOptions.previousBudgetSnapshot = hydratedSnapshot
         runtimeOptions.budgetController = budget
@@ -11990,6 +12581,7 @@ function createDefaultRuntimeOptions(input) {
             wallNowMs: context.wallNowMs,
             wallClock: context.clock,
             bootId: context.bootId,
+            wallTimeUnbounded,
           })
           runtimeOptions.previousBudgetSnapshot = budget.snapshot()
           runtimeOptions.budgetController = budget
@@ -12023,12 +12615,19 @@ function createDefaultRuntimeOptions(input) {
         targetKey,
         forWork: false,
       })
-      await processOwner.cancelGroup(processProbe.ownershipId, { reason: 'runtime ownership probe', graceMs: 0, killMs: 1000 })
+      await processOwner.cancelGroup(processProbe.ownershipId, {
+        reason: 'runtime ownership probe',
+        graceMs: 0,
+        killMs: 1000,
+        terminalStatus: 'DONE',
+      })
       await processOwner.assertTargetDrained(targetKey)
       const snapshotRoot = path.join(activation.activationRoot, 'checker-snapshots')
       runtimeOptions.checkerSnapshotFactory = createCheckerSnapshotFactory({
         targetPath,
         snapshotRoot,
+        runId: activation.runId,
+        generation,
         cleanupRegistry,
         gitEnvironment,
         expectedBranch,
@@ -12095,6 +12694,7 @@ function createDefaultRuntimeOptions(input) {
         snapshotEvidenceHash,
         targetIdentity: activation.supervisorRuntime.targetIdentity,
         now: Date.now,
+        environment,
         routeProvider: () => currentRoute,
       })
       const receiptBytes = Buffer.from(`${JSON.stringify(capabilityBinding.receipt)}\n`, 'utf8')
@@ -12172,6 +12772,7 @@ function createDefaultRuntimeOptions(input) {
           canonicalCrashAdopted: true,
           stage: resumeStage,
           resumeState: restored.state,
+          retryState: restored.retryState || {},
           recommendation,
           decision,
           schedulerState: savedScheduler,
@@ -12572,7 +13173,7 @@ function createDefaultRuntimeOptions(input) {
                 sessionId,
                 reservationId,
               }),
-              120_000,
+              benchmarkPhaseTimeoutMs(120_000, environment),
               { setTimeout, clearTimeout },
               'EXISTING_TEST_BASELINE_TIMEOUT',
               () => trustedTestRunner.stop({ sessionId, reason: 'trusted existing-test timeout' }),
@@ -12617,6 +13218,7 @@ function createDefaultRuntimeOptions(input) {
   const wallMs = Math.max(1000, Date.parse(activationRecord.capability.expiresAt) - Date.now())
   runtimeOptions.budgetController = new BudgetController({
     requireSessionBindings: true,
+    wallTimeUnbounded,
     terminalSessionWriter(terminal) {
       if (!recordRef || typeof recordRef.write !== 'function' || typeof recordRef.resolve !== 'function') {
         throw new SupervisorIntegrationError(
@@ -13001,6 +13603,14 @@ module.exports = {
   createConcreteSupervisor,
   createCheckerScratchFactory,
   createCheckerSnapshotFactory,
+  planCheckerProjection,
+  validatePlanCheckerSnapshot,
+  canonicalCompletedCheckerId,
+  roadmapPlanOracleForWorkItem,
+  checkerVerdictPassed,
+  durableNextReadyAfter,
+  adoptedLeaseMatchesStage,
+  terminalFinalizationDiagnostics,
   createCodexEntrySemanticTrace,
   runCodexTopLevelEntryAdapter,
   runCodexSupervisorEntryAdapter,

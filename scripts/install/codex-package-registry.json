@@ -168,12 +168,6 @@
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     },
     {
-      "path": "agents/codex/workflow/runtime-state.js",
-      "sha256": "d41f1a810b1ed683606c176ebb1018de9e0539f184275e0f2916fea27af15b32",
-      "terms": ["artifact", "candidate", "frontier"],
-      "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
-    },
-    {
       "path": "agents/codex/workflow/scheduler.js",
       "sha256": "45fd4805653a56e80791ac4b15e7c3b5b944cfb6f74d547175775c063df70e21",
       "terms": ["candidate", "frontier", "lane"],

@@ -479,6 +479,11 @@ test('one read-only route analyst has a two-minute ceiling, zero children, and n
   assert.equal(timeout.status, 'ROUTE_ANALYST_TIMEOUT')
   assert.equal(timeout.relaunch, false)
   assert.equal(timeout.l0_may_decide, true)
+  const benchmarkLate = decisions.evaluateRouteAnalystResult({
+    admission, elapsed_ms: 120001, recommendation: recommendation(),
+    environment: { AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' },
+  })
+  assert.equal(benchmarkLate.status, 'ROUTE_ANALYST_COMPLETE')
 })
 
 test('route recommendation remains advisory and NEEDS_USER is pre-work, never a route', () => {

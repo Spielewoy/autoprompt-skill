@@ -25,6 +25,12 @@ function l0DecisionMaxDurationMs(environment = process.env) {
     : L0_DECISION_MAX_DURATION_MS
 }
 
+function routeAnalystMaxDurationMs(environment = process.env) {
+  return environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
+    ? Number.POSITIVE_INFINITY
+    : ROUTE_ANALYST_MAX_DURATION_MS
+}
+
 const RECOMMENDATION_ARRAY_FIELDS = Object.freeze([
   'whatTheUserWants',
   'likelyAreas',
@@ -545,7 +551,7 @@ function evaluateRouteAnalystResult(input = {}) {
   if (!Number.isFinite(elapsed) || elapsed < 0) {
     return fallbackAnalystResult(input, 'ROUTE_ANALYST_RESULT_INVALID', 'MALFORMED', ['elapsed_ms must be non-negative'])
   }
-  if (input.outcome === 'TIMEOUT' || elapsed > ROUTE_ANALYST_MAX_DURATION_MS) {
+  if (input.outcome === 'TIMEOUT' || elapsed > routeAnalystMaxDurationMs(input.environment || process.env)) {
     return fallbackAnalystResult(input, 'ROUTE_ANALYST_TIMEOUT', 'TIMEOUT')
   }
   if (input.outcome === 'CRASH' || input.outcome === 'PROVIDER_UNSUPPORTED') {

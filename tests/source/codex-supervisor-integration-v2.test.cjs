@@ -22,6 +22,13 @@ const {
   ROUTE_CAPABILITY_EFFECTS,
   activationRuntimeSettings,
   createCheckerSnapshotFactory,
+  validatePlanCheckerSnapshot,
+  canonicalCompletedCheckerId,
+  roadmapPlanOracleForWorkItem,
+  checkerVerdictPassed,
+  durableNextReadyAfter,
+  adoptedLeaseMatchesStage,
+  terminalFinalizationDiagnostics,
   createConcreteSupervisor,
   createDefaultRouteExecutor,
   createDefaultRuntimeOptions,
@@ -666,7 +673,7 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
   assert.deepEqual(completedRetained, ['roadmap-work-group', 'mission-coordination'])
 })
 
-test('ROADMAP CHECK_INCONCLUSIVE blocks without fabricating author-repair findings', async t => {
+test('ROADMAP CHECK_INCONCLUSIVE retries the isolated runtime then returns PARTIAL without author repair', async t => {
   const directory = tempDirectory(t, 'autoprompt-roadmap-inconclusive-')
   const targetPath = createTempGitTarget(directory)
   const launches = []
@@ -685,15 +692,244 @@ test('ROADMAP CHECK_INCONCLUSIVE blocks without fabricating author-repair findin
     route: 'ROADMAP', decision: decision('ROADMAP'),
     launch: async request => {
       launches.push(request.workItemId)
-      if (request.workItemId === 'roadmap-plan-check') {
+      if (request.workItemId.startsWith('roadmap-plan-check')) {
         return { code: 'CHECK_INCONCLUSIVE', payload: { unblockPath: 'provide checker scratch storage' } }
       }
       return { reportId: request.workItemId, behaviorChanged: ['Prepare the bounded roadmap.'] }
     },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
   })
-  assert.equal(outcome.outcome, 'BLOCKED')
-  assert.deepEqual(launches, ['roadmap-author', 'roadmap-plan-check'])
+  assert.equal(outcome.outcome, 'PARTIAL')
+  assert.equal(outcome.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
+  assert.deepEqual(launches, ['roadmap-author', 'roadmap-plan-check', 'roadmap-plan-check-runtime-retry'])
+})
+
+test('ROADMAP conclusive retry FAIL binds repair to the retry receipt, not the original inconclusive result', async t => {
+  const directory = tempDirectory(t, 'autoprompt-roadmap-retry-fail-')
+  const targetPath = createTempGitTarget(directory)
+  const results = new Map()
+  const launches = []
+  const retryHash = 'f'.repeat(64)
+  const executor = createDefaultRouteExecutor({
+    targetPath, gitEnvironment: () => process.env, transition: async () => {},
+    harnessAttestation: candidateHash => ({ repoHash: candidateHash, buildHash: 'b'.repeat(64), oracleHash: 'c'.repeat(64) }),
+    writePlan: () => {}, planExists: () => true,
+    planPointer: () => ({ path: path.join(directory, 'ROADMAP.md'), sha256: retryHash, bytes: 1 }),
+    resultPointer(workItemId) {
+      assert.equal(workItemId, 'roadmap-plan-check-runtime-retry')
+      const resultPath = path.join(directory, `${workItemId}.json`)
+      const bytes = Buffer.from(JSON.stringify(results.get(workItemId)))
+      fs.writeFileSync(resultPath, bytes)
+      return {
+        name: workItemId, path: resultPath,
+        hash: crypto.createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length,
+      }
+    },
+  })
+  await assert.rejects(executor({
+    route: 'ROADMAP', decision: decision('ROADMAP'),
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'roadmap-author') return { behaviorChanged: ['Prepare the bounded roadmap.'] }
+      if (request.workItemId === 'roadmap-plan-check') {
+        const result = { code: 'CHECK_INCONCLUSIVE', cause: { reason: 'transport lost' } }
+        results.set(request.workItemId, result)
+        return result
+      }
+      if (request.workItemId === 'roadmap-plan-check-runtime-retry') {
+        const result = { code: 'FAIL', payload: { findings: ['missing dependency edge'] } }
+        results.set(request.workItemId, result)
+        return result
+      }
+      if (request.workItemId === 'roadmap-author-plan-repair') {
+        assert.equal(request.evidencePointers.at(-1).name, 'roadmap-plan-check-runtime-retry')
+        throw Object.assign(new Error('repair receipt verified'), { code: 'TEST_STOP' })
+      }
+      return { reportId: request.workItemId }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  }), error => error.code === 'TEST_STOP')
+  assert.deepEqual(launches.slice(0, 4), [
+    'roadmap-author', 'roadmap-plan-check', 'roadmap-plan-check-runtime-retry',
+    'roadmap-author-plan-repair',
+  ])
+})
+
+test('ROADMAP resume consumes canonical PASS checkpoint and an adopted retry verdict without duplicate plan launches', async t => {
+  const directory = tempDirectory(t, 'autoprompt-roadmap-plan-resume-')
+  const targetPath = createTempGitTarget(directory)
+  const planHash = 'd'.repeat(64)
+  const baseOptions = {
+    targetPath, gitEnvironment: () => process.env, transition: async () => {},
+    harnessAttestation: candidateHash => ({ repoHash: candidateHash, buildHash: 'b'.repeat(64), oracleHash: 'c'.repeat(64) }),
+    writePlan: () => {}, planExists: () => true,
+    planPointer: () => ({ path: path.join(directory, 'ROADMAP.md'), sha256: planHash, bytes: 1 }),
+    readResult: workItemId => workItemId === 'roadmap-author'
+      ? { behaviorChanged: ['Prepare the bounded roadmap.'] } : null,
+  }
+  const checkpointLaunches = []
+  await assert.rejects(createDefaultRouteExecutor(baseOptions)({
+    route: 'ROADMAP', decision: decision('ROADMAP'),
+    launch: async request => {
+      checkpointLaunches.push(request.workItemId)
+      assert.notEqual(request.logicalRole, 'plan-checker')
+      throw Object.assign(new Error('checkpoint consumed'), { code: 'TEST_STOP' })
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
+    resumeState: {
+      resumeState: 'RUN_WORK', completedWorkIds: ['roadmap-author'],
+      completedCheckIds: ['roadmap-plan-check-runtime-retry'], acceptedResultIds: [],
+    },
+  }), error => error.code === 'TEST_STOP')
+  assert.equal(checkpointLaunches[0], 'mission-coordination')
+
+  const adoptedLaunches = []
+  const adoptedOutcome = await createDefaultRouteExecutor(baseOptions)({
+    route: 'ROADMAP', decision: decision('ROADMAP'),
+    launch: async request => { adoptedLaunches.push(request.workItemId); return { reportId: request.workItemId } },
+    completeRetainedLease: () => {},
+    resumeAdoptedLaunches: async ({ stage }) => stage === 'work' ? {
+      'roadmap-plan-check-runtime-retry': {
+        code: 'CHECK_INCONCLUSIVE', cause: { reason: 'retry transport remained unavailable' },
+      },
+    } : {},
+    resumeState: {
+      resumeState: 'CHECK_INCONCLUSIVE', completedWorkIds: ['roadmap-author'],
+      completedCheckIds: [], acceptedResultIds: [],
+      retryState: { inconclusiveChecker: {
+        checkerId: 'roadmap-plan-check', candidateHash: planHash,
+        retryAttempt: 1, returnState: 'RUN_WORK',
+      } },
+    },
+  })
+  assert.equal(adoptedOutcome.outcome, 'PARTIAL')
+  assert.equal(adoptedOutcome.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
+  assert.equal(adoptedLaunches.some(id => id.startsWith('roadmap-plan-check')), false)
+})
+
+test('checker recovery helpers enforce plan-stage adoption, canonical retry completion, PASS-only frontier, and diagnostics', () => {
+  assert.equal(adoptedLeaseMatchesStage('ROADMAP', 'plan-checker', 'work'), true)
+  assert.equal(adoptedLeaseMatchesStage('ROADMAP', 'plan-checker', 'check'), false)
+  assert.equal(adoptedLeaseMatchesStage('DIRECT', 'independent-reviewer', 'check'), true)
+  assert.equal(canonicalCompletedCheckerId('roadmap-plan-check-runtime-retry'), 'roadmap-plan-check')
+  assert.equal(roadmapPlanOracleForWorkItem('roadmap-plan-recheck'), 'roadmap-plan-oracle-recheck')
+  assert.equal(roadmapPlanOracleForWorkItem('roadmap-plan-recheck-runtime-retry'), 'roadmap-plan-oracle-recheck')
+  assert.equal(canonicalCompletedCheckerId('independent-check-2-runtime-retry-1'), 'independent-check-2')
+  assert.equal(canonicalCompletedCheckerId('independent-check-2-repair-1-runtime-retry-1'), 'independent-check-2')
+  assert.equal(checkerVerdictPassed('plan-checker', { code: 'PASS' }), true)
+  for (const code of ['FAIL', 'CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE']) {
+    assert.deepEqual(durableNextReadyAfter('plan-checker', { code }, ['mission-coordination']), [])
+  }
+  assert.deepEqual(durableNextReadyAfter('plan-checker', { code: 'PASS' }, ['mission-coordination']),
+    ['mission-coordination'])
+  assert.deepEqual(terminalFinalizationDiagnostics({
+    terminalEnvelope: {
+      status: 'CHECK_REMAINS_INCONCLUSIVE',
+      cause: { reason: 'checker runtime unavailable', unblockPath: 'restore checker storage' },
+    },
+  }), {
+    terminalEnvelope: {
+      status: 'CHECK_REMAINS_INCONCLUSIVE',
+      cause: { reason: 'checker runtime unavailable', unblockPath: 'restore checker storage' },
+    },
+    reason: 'checker runtime unavailable', unblockPath: 'restore checker storage',
+  })
+})
+
+test('ROADMAP resume consumes adopted repaired-plan base and retry verdicts before any fresh plan check', async t => {
+  for (const adoptedId of ['roadmap-plan-recheck', 'roadmap-plan-recheck-runtime-retry']) {
+    const directory = tempDirectory(t, `autoprompt-roadmap-adopted-${adoptedId}-`)
+    const targetPath = createTempGitTarget(directory)
+    const planHash = crypto.createHash('sha256').update(adoptedId).digest('hex')
+    const launches = []
+    const transitions = []
+    const retry = adoptedId.endsWith('-runtime-retry')
+    const executor = createDefaultRouteExecutor({
+      targetPath, gitEnvironment: () => process.env,
+      transition: async (event, state, details) => transitions.push([event, state, details && details.checkerId]),
+      harnessAttestation: candidateHash => ({
+        repoHash: candidateHash, buildHash: 'b'.repeat(64), oracleHash: 'c'.repeat(64),
+      }),
+      writePlan: () => {}, planExists: () => true,
+      planPointer: () => ({ path: path.join(directory, 'ROADMAP.md'), sha256: planHash, bytes: 1 }),
+      readResult: workItemId => workItemId === 'roadmap-author'
+        ? { behaviorChanged: ['Prepare the bounded roadmap.'] } : null,
+    })
+    await assert.rejects(executor({
+      route: 'ROADMAP', decision: decision('ROADMAP'),
+      launch: async request => {
+        launches.push(request.workItemId)
+        assert.equal(request.logicalRole === 'plan-checker', false,
+          `adopted ${adoptedId} must suppress every fresh plan check`)
+        throw Object.assign(new Error('recheck consumed'), { code: 'TEST_STOP' })
+      },
+      completeRetainedLease: () => {},
+      resumeAdoptedLaunches: async ({ stage }) => stage === 'work'
+        ? { [adoptedId]: { code: 'PASS', currentVersionHash: planHash } } : {},
+      resumeState: retry ? {
+        resumeState: 'CHECK_INCONCLUSIVE',
+        completedWorkIds: ['roadmap-author', 'roadmap-author-plan-repair'],
+        completedCheckIds: [], acceptedResultIds: [],
+        retryState: { inconclusiveChecker: {
+          checkerId: 'roadmap-plan-recheck', candidateHash: planHash,
+          retryAttempt: 1, returnState: 'RUN_WORK',
+        } },
+      } : {
+        resumeState: 'RUN_WORK',
+        completedWorkIds: ['roadmap-author', 'roadmap-author-plan-repair'],
+        completedCheckIds: [], acceptedResultIds: [], retryState: {},
+      },
+    }), error => error.code === 'TEST_STOP')
+    assert.equal(launches[0], 'mission-coordination')
+    assert.deepEqual(transitions.filter(([event]) => event === 'CHECK_BECAME_CONCLUSIVE'),
+      retry ? [['CHECK_BECAME_CONCLUSIVE', 'RUN_WORK', adoptedId]] : [])
+  }
+})
+
+test('ROADMAP crash after first inconclusive plan result resumes only the durable retry allowance', async t => {
+  const directory = tempDirectory(t, 'autoprompt-roadmap-inconclusive-crash-')
+  const targetPath = createTempGitTarget(directory)
+  const planHash = 'e'.repeat(64)
+  const launches = []
+  const transitions = []
+  const executor = createDefaultRouteExecutor({
+    targetPath, gitEnvironment: () => process.env,
+    transition: async (event, state, details) => transitions.push([event, state, details && details.checkerId]),
+    harnessAttestation: candidateHash => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64), oracleHash: 'c'.repeat(64),
+    }),
+    writePlan: () => {}, planExists: () => true,
+    planPointer: () => ({ path: path.join(directory, 'ROADMAP.md'), sha256: planHash, bytes: 1 }),
+    readResult: workItemId => workItemId === 'roadmap-author'
+      ? { behaviorChanged: ['Prepare the bounded roadmap.'] } : null,
+  })
+  await assert.rejects(executor({
+    route: 'ROADMAP', decision: decision('ROADMAP'),
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'roadmap-plan-check-runtime-retry') {
+        return { code: 'PASS', currentVersionHash: planHash }
+      }
+      assert.notEqual(request.logicalRole, 'plan-checker')
+      throw Object.assign(new Error('durable retry consumed'), { code: 'TEST_STOP' })
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
+    resumeState: {
+      resumeState: 'CHECK_INCONCLUSIVE', completedWorkIds: ['roadmap-author'],
+      completedCheckIds: [], acceptedResultIds: [],
+      retryState: { inconclusiveChecker: {
+        checkerId: 'roadmap-plan-check', candidateHash: planHash,
+        retryAttempt: 1, returnState: 'RUN_WORK',
+      } },
+    },
+  }), error => error.code === 'TEST_STOP')
+  assert.deepEqual(launches.slice(0, 2), [
+    'roadmap-plan-check-runtime-retry', 'mission-coordination',
+  ])
+  assert.equal(launches.includes('roadmap-plan-check'), false)
+  assert.deepEqual(transitions.filter(([event]) => event === 'CHECK_BECAME_CONCLUSIVE'), [[
+    'CHECK_BECAME_CONCLUSIVE', 'RUN_WORK', 'roadmap-plan-check-runtime-retry',
+  ]])
 })
 
 test('ROADMAP resume consumes completed scout frontier and starts at same-author join without relaunching discovery', async t => {
@@ -1221,7 +1457,8 @@ test('DONE retry keeps its isolated candidate unpromoted until the final accepta
       : { code: 'CHECK_INCONCLUSIVE', payload: { unblockPath: 'provide checker scratch storage' } },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
   })
-  assert.equal(inconclusive.outcome, 'BLOCKED')
+  assert.equal(inconclusive.outcome, 'PARTIAL')
+  assert.equal(inconclusive.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
   assert.equal(inconclusive.terminalEnvelope.code, 'CHECK_INCONCLUSIVE')
   assert.deepEqual(inconclusiveEvents, ['aborted:independent checker did not pass'])
 })
@@ -3186,6 +3423,13 @@ test('live worker admission binds physical role, typed ownership, scheduler clai
     if (launch.logicalRole === 'diagnostic-probe') {
       return representativeProbeResult(launch)
     }
+    assert.equal(launch.environment.PYTHONDONTWRITEBYTECODE, '1')
+    assert.equal(launch.environment.PYTHONPYCACHEPREFIX, launch.environment.AUTOPROMPT_WORKER_CACHE_ROOT)
+    assert.equal(launch.environment.TMPDIR, launch.environment.AUTOPROMPT_WORKER_CACHE_ROOT)
+    assert.equal(launch.environment.TMP, launch.environment.AUTOPROMPT_WORKER_CACHE_ROOT)
+    assert.equal(launch.environment.TEMP, launch.environment.AUTOPROMPT_WORKER_CACHE_ROOT)
+    assert.equal(path.resolve(launch.environment.AUTOPROMPT_WORKER_CACHE_ROOT).startsWith(
+      `${path.resolve(launch.workingDirectory)}${path.sep}`), false)
     const changed = launch.workItemId === 'owned-work' ? 'src/example.js' : 'src/outside.js'
     fs.writeFileSync(path.join(launch.workingDirectory, ...changed.split('/')), `module.exports = '${launch.workItemId}'\n`)
     assert.notEqual(path.resolve(launch.workingDirectory), path.resolve(target))
@@ -3535,8 +3779,11 @@ test('inconclusive and runtime checker outcomes never enter the implementation r
   for (const code of ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE']) {
     const target = createTempGitTarget(tempDirectory(t, `autoprompt-checker-${code.toLowerCase()}-`))
     let repairLaunches = 0
+    let checkerLaunches = 0
+    const checkerTransitions = []
     const executor = createDefaultRouteExecutor({
-      targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+      targetPath: target, gitEnvironment: () => process.env,
+      transition: async (event, state) => { checkerTransitions.push([event, state]) },
       resultPointer: () => assert.fail(`${code} must not resolve an implementation-repair receipt`),
       harnessAttestation: (candidateHash, oracle) => ({
         repoHash: candidateHash, buildHash: 'b'.repeat(64),
@@ -3551,6 +3798,7 @@ test('inconclusive and runtime checker outcomes never enter the implementation r
           fs.writeFileSync(path.join(target, 'src', 'example.js'), `module.exports = '${code}'\n`)
           return { allAssignedItemsPass: true }
         }
+        checkerLaunches += 1
         return {
           code,
           cause: { event: code, reason: 'the independent check did not complete conclusively', unblockPath: 'restore the checker environment' },
@@ -3559,9 +3807,83 @@ test('inconclusive and runtime checker outcomes never enter the implementation r
       },
       completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
     })
-    assert.equal(result.outcome, 'BLOCKED')
+    assert.equal(result.outcome, 'PARTIAL')
+    assert.equal(result.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
     assert.equal(repairLaunches, 0)
+    assert.equal(checkerLaunches, 2)
+    assert.deepEqual(checkerTransitions.filter(([event]) => [
+      'CHECK_INCONCLUSIVE', 'CHECK_REMAINS_INCONCLUSIVE',
+    ].includes(event)), [
+      ['CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE'],
+      ['CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK'],
+    ])
   }
+})
+
+test('each independent checker gets one same-version inconclusive retry with canonical state transitions', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-per-checker-retry-'))
+  const transitions = []
+  const checkerLaunches = []
+  const attempts = new Map()
+  const twoCheckerDecision = decision('DIRECT', {
+    independentChecks: {
+      checker_count: 2,
+      responsibilities: ['Independently review behavior.', 'Independently test boundaries.'],
+      separate_second_checker_reason: 'Review and black-box boundary testing use distinct methods.',
+    },
+  })
+  const executor = createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env,
+    transition: async (event, state, details) => { transitions.push([event, state, details && details.checkerId]) },
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })
+  const outcome = await executor({
+    route: 'DIRECT', decision: twoCheckerDecision,
+    launch: async request => {
+      if (request.logicalRole === 'worker') {
+        fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'per-checker-retry'\n")
+        return { allAssignedItemsPass: true }
+      }
+      checkerLaunches.push(request.workItemId)
+      const canonicalId = request.workItemId.replace(/-runtime-retry-\d+$/u, '')
+      const attempt = (attempts.get(canonicalId) || 0) + 1
+      attempts.set(canonicalId, attempt)
+      if (attempt === 1) {
+        return {
+          code: 'CHECK_INCONCLUSIVE', currentVersionHash: request.candidateHash,
+          cause: { reason: 'one transient isolated runtime failure', unblockPath: 'retry once' },
+          payload: {},
+        }
+      }
+      return {
+        code: 'PASS', currentVersionHash: request.candidateHash,
+        payload: {
+          evidenceIds: [`evidence:${canonicalId}`],
+          referenceMethod: checkerReferenceMethod(
+            canonicalId.endsWith('-1') ? 'requirements-review' : 'black-box-boundary',
+            canonicalId,
+          ),
+        },
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.deepEqual(checkerLaunches, [
+    'independent-check-1', 'independent-check-1-runtime-retry-1',
+    'independent-check-2', 'independent-check-2-runtime-retry-1',
+  ])
+  assert.deepEqual(transitions.filter(([event]) => [
+    'CHECK_INCONCLUSIVE', 'CHECK_BECAME_CONCLUSIVE',
+  ].includes(event)).map(([event, state, checkerId]) => [event, state, checkerId]), [
+    ['CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', 'independent-check-1'],
+    ['CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', 'independent-check-1-runtime-retry-1'],
+    ['CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', 'independent-check-2'],
+    ['CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', 'independent-check-2-runtime-retry-1'],
+  ])
 })
 
 test('live checker keeps target read-only while owning isolated workspace cache database service port and outputs', async t => {
@@ -3719,6 +4041,8 @@ test('AP-RUN-037 checker snapshot repair ignores ambient Git command overrides a
   const snapshotFactory = createCheckerSnapshotFactory({
     targetPath: target,
     snapshotRoot: path.join(directory, 'snapshots'),
+    runId: 'snapshot-projection-run',
+    generation: 1,
     cleanupRegistry: { register: entry => registrations.push(entry) },
     gitEnvironment: () => process.env,
     expectedBranch: 'main',
@@ -3749,6 +4073,308 @@ test('AP-RUN-037 checker snapshot repair ignores ambient Git command overrides a
   const safety = JSON.parse(checked.stdout)
   assert.equal(safety.networkContactAttempted, false)
   assert.equal(safety.repositoryOk, true, checked.stderr || checked.stdout)
+
+  fs.mkdirSync(path.join(target, 'plan'), { recursive: true })
+  fs.writeFileSync(path.join(target, 'plan', 'ROADMAP.md'), '# unrelated target roadmap\n')
+  const admittedPath = path.join(directory, 'admitted-ROADMAP.md')
+  const admittedBytes = Buffer.from('# exact admitted roadmap\n', 'utf8')
+  fs.writeFileSync(admittedPath, admittedBytes)
+  const projection = {
+    relativePath: 'plan/ROADMAP.md', sourcePath: admittedPath,
+    sha256: crypto.createHash('sha256').update(admittedBytes).digest('hex'), bytes: admittedBytes.length,
+  }
+  const projected = snapshotFactory('roadmap-plan-check', [], target, { projection })
+  assert.equal(fs.readFileSync(path.join(projected.snapshotPath, 'plan', 'ROADMAP.md'), 'utf8'),
+    admittedBytes.toString('utf8'))
+  assert.equal(projected.projectionReceipt.sha256, projection.sha256)
+  const request = { logicalRole: 'plan-checker', candidateHash: projection.sha256, roadmapSlice: {
+    path: admittedPath, sha256: projection.sha256, bytes: projection.bytes,
+  } }
+  const projectionIdentity = {
+    runId: 'snapshot-projection-run', generation: 1, checkerId: 'roadmap-plan-check',
+  }
+  assert.equal(validatePlanCheckerSnapshot(
+    projected.snapshotPath, request, projected.projectionReceipt, projectionIdentity,
+  ), projection.sha256)
+  for (const foreignIdentity of [
+    { ...projectionIdentity, runId: 'foreign-run' },
+    { ...projectionIdentity, generation: 2 },
+    { ...projectionIdentity, checkerId: 'foreign-checker' },
+  ]) {
+    assert.throws(
+      () => validatePlanCheckerSnapshot(
+        projected.snapshotPath, request, projected.projectionReceipt, foreignIdentity,
+      ),
+      error => error.code === 'PLAN_PROJECTION_MISMATCH',
+    )
+  }
+  fs.chmodSync(path.join(projected.snapshotPath, 'plan', 'ROADMAP.md'), 0o600)
+  fs.writeFileSync(path.join(projected.snapshotPath, 'plan', 'ROADMAP.md'), '# substituted\n')
+  assert.throws(
+    () => validatePlanCheckerSnapshot(
+      projected.snapshotPath, request, projected.projectionReceipt, projectionIdentity,
+    ),
+    error => error.code === 'PLAN_PROJECTION_MISMATCH',
+  )
+  fs.writeFileSync(admittedPath, '# changed after admission\n')
+  assert.throws(
+    () => snapshotFactory('roadmap-plan-check-changed', [], target, { projection }),
+    error => error.code === 'PLAN_PROJECTION_SOURCE_CHANGED',
+  )
+})
+
+test('private worker removes only new unowned Python bytecode caches and journals the cleanup', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-python-cache-target-'))
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target,
+    privateRoot: tempDirectory(t, 'autoprompt-python-cache-private-'),
+    environment: process.env,
+    runId: 'python-cache-run',
+    activationId: 'python-cache-activation',
+  })
+  const assignment = { resources: [
+    { kind: 'file', identity: 'anon.py', access: 'write' },
+    { kind: 'directory', identity: 'output', access: 'write' },
+  ] }
+  const session = manager.prepare({ assignment, workItemId: 'data-anonymization' })
+  fs.writeFileSync(path.join(session.workspacePath, 'anon.py'), 'print("ready")\n')
+  const compiled = spawnSync('python3', ['-m', 'py_compile', 'anon.py'], {
+    cwd: session.workspacePath, encoding: 'utf8', windowsHide: true,
+  })
+  assert.equal(compiled.status, 0, compiled.stderr || compiled.stdout)
+  const cacheName = fs.readdirSync(path.join(session.workspacePath, '__pycache__'))
+    .find(name => /^anon\..*\.pyc$/u.test(name))
+  assert.ok(cacheName)
+  const cache = path.join(session.workspacePath, '__pycache__', cacheName)
+  const admission = manager.inspect(session, { filesChanged: ['anon.py'] })
+  assert.deepEqual(admission.actualFilesChanged, ['anon.py'])
+  assert.deepEqual(admission.transientArtifactsRemoved.map(item => item.path),
+    [`__pycache__/${cacheName}`])
+  assert.equal(fs.existsSync(cache), false)
+  const journal = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  assert.equal(journal.transientArtifactsRemoved[0].kind, 'python-bytecode-cache')
+  assert.match(journal.transientCleanupHash, /^[a-f0-9]{64}$/)
+  const repeated = manager.inspect(session, { filesChanged: ['anon.py'] })
+  assert.deepEqual(repeated.transientArtifactsRemoved, admission.transientArtifactsRemoved)
+  const reopened = manager.reopen({ assignment, workItemId: 'data-anonymization', recordPath: session.recordPath })
+  const recovered = manager.inspect(reopened, { filesChanged: ['anon.py'] })
+  assert.deepEqual(recovered, repeated)
+  const promoted = manager.promote(reopened, recovered)
+  assert.deepEqual(promoted.map(item => path.basename(item.path)), ['anon.py'])
+  assert.equal(fs.readFileSync(path.join(target, 'anon.py'), 'utf8'), 'print("ready")\n')
+  assert.equal(fs.existsSync(path.join(target, '__pycache__', cacheName)), false)
+  manager.finalize(reopened)
+})
+
+test('worker Python environment redirects explicit compilation into an evidenced private cache root', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-python-private-cache-target-'))
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target,
+    privateRoot: tempDirectory(t, 'autoprompt-python-private-cache-root-'),
+    environment: process.env,
+    runId: 'python-private-cache-run',
+    activationId: 'python-private-cache-activation',
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'anon.py', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'data-anonymization-private-cache' })
+  fs.writeFileSync(path.join(session.workspacePath, 'anon.py'), 'print("ready")\n')
+  const environment = {
+    ...process.env,
+    TMPDIR: session.cacheRoot,
+    TMP: session.cacheRoot,
+    TEMP: session.cacheRoot,
+    XDG_CACHE_HOME: session.cacheRoot,
+    PYTHONPYCACHEPREFIX: session.cacheRoot,
+    PYTHONDONTWRITEBYTECODE: '1',
+    AUTOPROMPT_WORKER_CACHE_ROOT: session.cacheRoot,
+  }
+  const compiled = spawnSync('python3', ['-m', 'py_compile', 'anon.py'], {
+    cwd: session.workspacePath, env: environment, encoding: 'utf8', windowsHide: true,
+  })
+  assert.equal(compiled.status, 0, compiled.stderr || compiled.stdout)
+  assert.equal(fs.existsSync(path.join(session.workspacePath, '__pycache__')), false)
+  const cacheFiles = fs.readdirSync(session.cacheRoot, { recursive: true }).map(String)
+    .filter(name => /anon\..*\.pyc$/u.test(name))
+  assert.equal(cacheFiles.length, 1)
+  const expectedCacheHash = crypto.createHash('sha256')
+    .update(fs.readFileSync(path.join(session.cacheRoot, cacheFiles[0]))).digest('hex')
+  const admission = manager.inspect(session, { filesChanged: ['anon.py'] })
+  assert.deepEqual(admission.actualFilesChanged, ['anon.py'])
+  const cacheEvidence = admission.transientArtifactsRemoved.find(item =>
+    item.scope === 'configured-cache-root' && item.kind === 'private-worker-cache' &&
+      /anon\..*\.pyc$/u.test(item.path))
+  assert.ok(cacheEvidence)
+  assert.equal(cacheEvidence.hash, expectedCacheHash)
+  assert.deepEqual(fs.readdirSync(session.cacheRoot), [])
+  const journal = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  assert.equal(journal.transientCleanup, null)
+  assert.match(journal.transientCleanupHash, /^[a-f0-9]{64}$/)
+  assert.deepEqual(journal.transientArtifactsRemoved, admission.transientArtifactsRemoved)
+  const promoted = manager.promote(session, admission)
+  assert.deepEqual(promoted.map(item => path.basename(item.path)), ['anon.py'])
+  manager.finalize(session)
+  assert.equal(fs.existsSync(session.cacheRoot), false)
+})
+
+test('ignored Python caches are removed and evidenced without broadening ignored-file admission', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-python-ignored-cache-target-'))
+  fs.writeFileSync(path.join(target, '.gitignore'), '__pycache__/\n*.pyc\n')
+  for (const argv of [
+    ['-C', target, 'add', '--', '.gitignore'],
+    ['-C', target, 'commit', '-m', 'ignore Python cache fixture'],
+  ]) {
+    const result = spawnSync('git', argv, { encoding: 'utf8', windowsHide: true })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target,
+    privateRoot: tempDirectory(t, 'autoprompt-python-ignored-cache-private-'),
+    environment: process.env,
+    runId: 'python-ignored-cache-run',
+    activationId: 'python-ignored-cache-activation',
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'anon.py', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'data-anonymization-ignored-cache' })
+  fs.writeFileSync(path.join(session.workspacePath, 'anon.py'), 'print("ready")\n')
+  const compiled = spawnSync('python3', ['-m', 'py_compile', 'anon.py'], {
+    cwd: session.workspacePath, encoding: 'utf8', windowsHide: true,
+  })
+  assert.equal(compiled.status, 0, compiled.stderr || compiled.stdout)
+  const cacheDirectory = path.join(session.workspacePath, '__pycache__')
+  assert.equal(fs.existsSync(cacheDirectory), true)
+  const admission = manager.inspect(session, { filesChanged: ['anon.py'] })
+  assert.equal(fs.existsSync(cacheDirectory), false)
+  assert.equal(admission.transientArtifactsRemoved.some(item =>
+    item.scope === 'workspace' && item.kind === 'python-bytecode-cache' &&
+      /^__pycache__\/anon\..*\.pyc$/u.test(item.path)), true)
+  assert.deepEqual(admission.actualFilesChanged, ['anon.py'])
+  manager.abort(session)
+})
+
+test('transient cleanup intent survives a crash after unlink and reconciles exact evidence on reopen', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-python-cleanup-crash-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-python-cleanup-crash-private-')
+  let recordPath = null
+  let recordRenameCount = 0
+  let injectFailure = false
+  const fsImpl = Object.create(fs)
+  fsImpl.renameSync = (source, destination) => {
+    if (injectFailure && recordPath && path.resolve(destination) === path.resolve(recordPath)) {
+      recordRenameCount += 1
+      if (recordRenameCount === 2) {
+        const error = new Error('simulated crash before cleanup evidence commit')
+        error.code = 'SIMULATED_CRASH'
+        throw error
+      }
+    }
+    return fs.renameSync(source, destination)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'python-cleanup-crash-run', activationId: 'python-cleanup-crash-activation', fsImpl,
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'anon.py', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'data-anonymization-cleanup-crash' })
+  recordPath = session.recordPath
+  fs.writeFileSync(path.join(session.workspacePath, 'anon.py'), 'print("ready")\n')
+  fs.mkdirSync(path.join(session.workspacePath, '__pycache__'))
+  const cachePath = path.join(session.workspacePath, '__pycache__', 'anon.cpython-312.pyc')
+  fs.writeFileSync(cachePath, 'cache')
+  fs.mkdirSync(path.join(session.cacheRoot, 'nested'))
+  const privateCachePath = path.join(session.cacheRoot, 'nested', 'anon.cpython-312.pyc')
+  fs.writeFileSync(privateCachePath, 'private cache')
+  injectFailure = true
+  assert.throws(() => manager.inspect(session, { filesChanged: ['anon.py'] }),
+    error => error.code === 'SIMULATED_CRASH')
+  assert.equal(fs.existsSync(cachePath), false)
+  assert.equal(fs.existsSync(privateCachePath), false)
+  const interrupted = JSON.parse(fs.readFileSync(recordPath, 'utf8'))
+  assert.equal(interrupted.transientCleanup.status, 'PREPARED')
+  assert.deepEqual(interrupted.transientArtifactsRemoved, [])
+  injectFailure = false
+  const reopened = manager.reopen({
+    assignment, workItemId: 'data-anonymization-cleanup-crash', recordPath,
+  })
+  const reconciled = manager.inspect(reopened, { filesChanged: ['anon.py'] })
+  assert.equal(reconciled.transientArtifactsRemoved.some(item =>
+    item.scope === 'workspace' && item.path === '__pycache__/anon.cpython-312.pyc'), true)
+  assert.equal(reconciled.transientArtifactsRemoved.some(item =>
+    item.scope === 'configured-cache-root' && item.path === 'nested/anon.cpython-312.pyc'), true)
+  const recoveredJournal = JSON.parse(fs.readFileSync(recordPath, 'utf8'))
+  assert.equal(recoveredJournal.transientCleanup, null)
+  assert.match(recoveredJournal.transientCleanupHash, /^[a-f0-9]{64}$/)
+  manager.abort(reopened)
+})
+
+test('private worker never hides similar files, tracked caches, or owned cache deliverables', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-python-cache-deny-target-'))
+  fs.mkdirSync(path.join(target, '__pycache__'))
+  fs.writeFileSync(path.join(target, '__pycache__', 'tracked.pyc'), 'baseline')
+  for (const argv of [['-C', target, 'add', '--', '__pycache__/tracked.pyc'],
+    ['-C', target, 'commit', '-m', 'tracked cache fixture']]) {
+    const result = spawnSync('git', argv, { encoding: 'utf8', windowsHide: true })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot: tempDirectory(t, 'autoprompt-python-cache-deny-private-'),
+    environment: process.env, runId: 'python-cache-deny-run', activationId: 'python-cache-deny-activation',
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'anon.py', access: 'write' }] }
+  const similar = manager.prepare({ assignment, workItemId: 'similar-file' })
+  fs.writeFileSync(path.join(similar.workspacePath, 'cache.pyz'), 'not bytecode')
+  assert.throws(() => manager.inspect(similar, { filesChanged: [] }),
+    error => error.code === 'OWNERSHIP_SCOPE_VIOLATION')
+  manager.abort(similar)
+
+  const cacheDirectoryNonBytecode = manager.prepare({ assignment, workItemId: 'cache-directory-non-bytecode' })
+  fs.mkdirSync(path.join(cacheDirectoryNonBytecode.workspacePath, '__pycache__'), { recursive: true })
+  fs.writeFileSync(path.join(cacheDirectoryNonBytecode.workspacePath, '__pycache__', 'notes.txt'), 'not bytecode')
+  assert.throws(() => manager.inspect(cacheDirectoryNonBytecode, { filesChanged: [] }),
+    error => error.code === 'OWNERSHIP_SCOPE_VIOLATION')
+  manager.abort(cacheDirectoryNonBytecode)
+
+  const tracked = manager.prepare({ assignment, workItemId: 'tracked-cache' })
+  fs.writeFileSync(path.join(tracked.workspacePath, '__pycache__', 'tracked.pyc'), 'changed')
+  assert.throws(() => manager.inspect(tracked, { filesChanged: [] }),
+    error => error.code === 'OWNERSHIP_SCOPE_VIOLATION')
+  manager.abort(tracked)
+
+  const broadAssignment = { resources: [{ kind: 'directory', identity: '.', access: 'write' }] }
+  const broad = manager.prepare({ assignment: broadAssignment, workItemId: 'broad-owned-tracked-cache' })
+  fs.writeFileSync(path.join(broad.workspacePath, '__pycache__', 'tracked.pyc'), 'changed under broad ownership')
+  assert.throws(() => manager.inspect(broad, { filesChanged: [] }),
+    error => error.code === 'MUTATION_REPORT_MISMATCH')
+  manager.abort(broad)
+
+  const ownedAssignment = { resources: [{ kind: 'file', identity: '__pycache__/deliverable.pyc', access: 'write' }] }
+  const owned = manager.prepare({ assignment: ownedAssignment, workItemId: 'owned-cache' })
+  fs.writeFileSync(path.join(owned.workspacePath, '__pycache__', 'deliverable.pyc'), 'requested')
+  assert.throws(() => manager.inspect(owned, { filesChanged: ['__pycache__/deliverable.pyc'] }),
+    error => error.code === 'OWNERSHIP_SCOPE_VIOLATION')
+  manager.abort(owned)
+
+  if (process.platform !== 'win32') {
+    const linked = manager.prepare({ assignment, workItemId: 'linked-cache' })
+    fs.symlinkSync(path.join(linked.workspacePath, 'src', 'example.js'),
+      path.join(linked.workspacePath, '__pycache__', 'linked.pyc'))
+    assert.throws(() => manager.inspect(linked, { filesChanged: [] }),
+      error => error.code === 'WORKER_WORKSPACE_UNSAFE_ENTRY')
+    manager.abort(linked)
+
+    const privateLinked = manager.prepare({ assignment, workItemId: 'private-linked-cache' })
+    const outside = path.join(target, 'outside-cache-target')
+    fs.writeFileSync(outside, 'outside remains unchanged')
+    fs.symlinkSync(outside, path.join(privateLinked.cacheRoot, 'linked.pyc'))
+    assert.throws(() => manager.inspect(privateLinked, { filesChanged: [] }),
+      error => error.code === 'WORKER_WORKSPACE_UNSAFE_ENTRY')
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'outside remains unchanged')
+
+    const privateHardlinked = manager.prepare({ assignment, workItemId: 'private-hardlinked-cache' })
+    fs.linkSync(outside, path.join(privateHardlinked.cacheRoot, 'hardlinked.pyc'))
+    assert.throws(() => manager.inspect(privateHardlinked, { filesChanged: [] }),
+      error => error.code === 'WORKER_WORKSPACE_UNSAFE_ENTRY')
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'outside remains unchanged')
+  }
 })
 
 test('private worker workspace keeps real target immutable and rejects stale owned preimages', t => {
@@ -4573,7 +5199,8 @@ test('per-child terminal receipts do not globally drain a legal live sibling or 
     assert.ok((await processAdapter.listOwned(sibling.groupIdentity)).length > 0,
       'a legal sibling must remain live until the terminal cancellation/finalization boundary')
   }
-  assert.equal(owner.listRecords().filter(record => record.status === 'CANCELLED').length, 3)
+  assert.equal(owner.listRecords().filter(record => record.status === 'DONE').length, 3)
+  assert.equal(owner.listRecords().filter(record => record.status === 'CANCELLED').length, 0)
   await owner.cancelAll({ reason: 'terminal-boundary sibling drain', graceMs: 0, killMs: 2000 })
   await owner.assertDrained()
   assert.equal((await processAdapter.listOwned(sibling.groupIdentity)).length, 0)
@@ -4651,7 +5278,7 @@ test('AP-CODEX-V2-036 concrete runtime repairs a checker FAIL in the same Codex 
     "  const priorTrace = traceFs.existsSync(tracePath) ? traceFs.readFileSync(tracePath,'utf8').trim().split('\\n').filter(Boolean).map(JSON.parse) : []",
     "  const roleAttempt = priorTrace.filter(item => item.role === role).length + 1",
     "  const checkerAttempt = priorTrace.filter(item => /checker|reviewer|tester/.test(item.role)).length + 1",
-    "  traceFs.appendFileSync(tracePath, JSON.stringify({role,roleAttempt,argv:process.argv.slice(2)})+'\\n')",
+    "  traceFs.appendFileSync(tracePath, JSON.stringify({role,roleAttempt,argv:process.argv.slice(2),cwd:process.cwd(),cacheEnvironment:{TMPDIR:process.env.TMPDIR,TMP:process.env.TMP,TEMP:process.env.TEMP,XDG_CACHE_HOME:process.env.XDG_CACHE_HOME,PYTHONPYCACHEPREFIX:process.env.PYTHONPYCACHEPREFIX,PYTHONDONTWRITEBYTECODE:process.env.PYTHONDONTWRITEBYTECODE,AUTOPROMPT_WORKER_CACHE_ROOT:process.env.AUTOPROMPT_WORKER_CACHE_ROOT}})+'\\n')",
     "  const assignmentMatch = /^Canonical assignment: (.+)$/m.exec(input)",
     "  const contextMatch = /^Canonical context envelope: (.+)$/m.exec(input)",
     "  const assignment = assignmentMatch ? JSON.parse(assignmentMatch[1]) : null",
@@ -4785,6 +5412,16 @@ test('AP-CODEX-V2-036 concrete runtime repairs a checker FAIL in the same Codex 
   const repairWorker = traced.find(item => item.role === 'worker' && item.roleAttempt === 2)
   assert.ok(repairWorker.argv.includes('resume'))
   assert.ok(repairWorker.argv.indexOf('--sandbox') < repairWorker.argv.indexOf('resume'))
+  for (const worker of traced.filter(item => item.role === 'worker')) {
+    const cacheRoot = worker.cacheEnvironment.AUTOPROMPT_WORKER_CACHE_ROOT
+    assert.equal(worker.cacheEnvironment.PYTHONDONTWRITEBYTECODE, '1')
+    assert.equal(worker.cacheEnvironment.PYTHONPYCACHEPREFIX, cacheRoot)
+    assert.equal(worker.cacheEnvironment.XDG_CACHE_HOME, cacheRoot)
+    assert.equal(worker.cacheEnvironment.TMPDIR, cacheRoot)
+    assert.equal(worker.cacheEnvironment.TMP, cacheRoot)
+    assert.equal(worker.cacheEnvironment.TEMP, cacheRoot)
+    assert.equal(path.resolve(cacheRoot).startsWith(`${path.resolve(worker.cwd)}${path.sep}`), false)
+  }
   const stateEvents = fs.readFileSync(record.paths.eventLog.logPath, 'utf8')
   assert.doesNotMatch(stateEvents, /CRASH_DETECTED|RESUME_REQUESTED|EXACT_STATE_RESTORED/)
   assert.match(stateEvents, /IMPLEMENTATION_DEFECT/)

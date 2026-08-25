@@ -91,6 +91,7 @@ class BudgetController {
     this.terminalSessionWriter = typeof options.terminalSessionWriter === 'function'
       ? options.terminalSessionWriter : null
     this.requireSessionBindings = options.requireSessionBindings === true
+    this.wallTimeUnbounded = options.wallTimeUnbounded === true
     this.wallNowMs = options.wallNowMs || Date.now
     this.bootId = options.bootId === undefined ? detectBootId(options.fsImpl) : options.bootId
     this.monotonicClockId = options.monotonicClockId === undefined ? null : options.monotonicClockId
@@ -166,13 +167,15 @@ class BudgetController {
         ? this.state.limits.wallMs - this.state.finalizationReserveMs
         : this.state.limits.wallMs
     const remaining = {
-      wallMs: Math.max(0, wallLimit - elapsedMs),
+      wallMs: this.wallTimeUnbounded ? Number.MAX_SAFE_INTEGER : Math.max(0, wallLimit - elapsedMs),
       tokens: Math.max(0, this.state.limits.tokens - this.state.tokensUsed),
       sessions: Math.max(0, this.state.limits.sessions - this.state.sessionsStarted),
       launches: Math.max(0, this.state.limits.launches - this.state.launches),
     }
     const exhausted = []
-    if (elapsedMs >= wallLimit) exhausted.push(options.forExecution ? 'EXECUTION_WALL' : options.forWork ? 'WORK_WALL' : 'WALL')
+    if (!this.wallTimeUnbounded && elapsedMs >= wallLimit) {
+      exhausted.push(options.forExecution ? 'EXECUTION_WALL' : options.forWork ? 'WORK_WALL' : 'WALL')
+    }
     if (this.state.tokensUsed >= this.state.limits.tokens) exhausted.push('TOKENS')
     if (this.state.sessionsStarted >= this.state.limits.sessions) exhausted.push('SESSIONS')
     if (this.state.launches >= this.state.limits.launches) exhausted.push('LAUNCHES')
@@ -185,6 +188,7 @@ class BudgetController {
       generation: this.state.generation,
       reserveMs: this.state.finalizationReserveMs,
       verificationReserveMs: this.state.verificationReserveMs || 0,
+      wallTimeUnbounded: this.wallTimeUnbounded,
     }
   }
 
@@ -206,7 +210,7 @@ class BudgetController {
     if (!Number.isFinite(deadline)) {
       fail('EXTERNAL_WRITE_DEADLINE_REQUIRED', 'external writes require a bound absolute task deadline')
     }
-    if (nowMs >= deadline) {
+    if (!this.wallTimeUnbounded && nowMs >= deadline) {
       fail('EXTERNAL_WRITE_DEADLINE_EXPIRED', 'external write denied at or after the hard task deadline', {
         deadline: this.state.deadline.absoluteDeadline,
         observedAt: new Date(nowMs).toISOString(),
@@ -215,7 +219,12 @@ class BudgetController {
           ? details.reconciledPartialStateHash : null,
       })
     }
-    return Object.freeze({ allowed: true, deadline: this.state.deadline.absoluteDeadline, observedAtMs: nowMs })
+    return Object.freeze({
+      allowed: true,
+      deadline: this.state.deadline.absoluteDeadline,
+      observedAtMs: nowMs,
+      wallTimeUnbounded: this.wallTimeUnbounded,
+    })
   }
 
   bindDeadline(input = {}) {
@@ -486,7 +495,7 @@ class BudgetController {
     const retries = positiveLimit(additional.retries, 'accountingCeilings.retries')
     const costMicrounits = positiveLimit(additional.costMicrounits, 'accountingCeilings.costMicrounits')
     return Object.freeze({
-      wallMilliseconds: this.state.limits.wallMs,
+      wallMilliseconds: this.wallTimeUnbounded ? Number.MAX_SAFE_INTEGER : this.state.limits.wallMs,
       totalTokens: this.state.limits.tokens,
       sessions: this.state.limits.sessions,
       launches: this.state.limits.launches,

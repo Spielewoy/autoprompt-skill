@@ -65,6 +65,7 @@ const CRASH_PRECONDITION_FIELDS = Object.freeze([
   'stateChecksum', 'stateEventSequence', 'stateEventHash', 'resourceStateHash', 'retryStateHash', 'budgetsHash',
 ])
 const RESTORABLE_STATES = [...CRASH_RECOVERY_POLICY.recoverableActiveStates]
+const CHECK_ORIGIN_STATES = Object.freeze(['RUN_WORK', 'CHECK_WORK'])
 const EVIDENCE_INPUT_IDS = Object.freeze([
   'mission', 'plan', 'candidate', 'environment', 'oracle', 'assumptions',
 ])
@@ -74,7 +75,9 @@ const CANONICAL_TRANSITIONS = Object.freeze(STATE_MACHINE.transitions.flatMap((t
   return fromStates.flatMap((fromState) => {
     const toStates = transition.to === '$same'
       ? [fromState]
-      : transition.to === '$savedResumeState' ? RESTORABLE_STATES : [transition.to]
+      : transition.to === '$savedResumeState'
+        ? RESTORABLE_STATES
+        : transition.to === '$savedCheckOrigin' ? CHECK_ORIGIN_STATES : [transition.to]
     return toStates.map((toState) => Object.freeze({
       id: transition.id,
       event: transition.event,
@@ -204,7 +207,7 @@ function normalizeExternalRecovery(value) {
 
 function normalizeRecoveryFrontier(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    fail('CRASH_CHECKPOINT_INVALID', 'recovery frontier is required')
+    fail('CRASH_CHECKPOINT_INVALID', 'recovery next ready work is required')
   }
   return canonicalize({
     nextReadyWorkIds: uniqueStringArray(value.nextReadyWorkIds, 'frontier.nextReadyWorkIds'),
@@ -302,7 +305,7 @@ function normalizeRecoveryContext(input) {
   })
   if (normalized.frontierHash !== recoveryFrontierHash(normalized.frontier) ||
       normalized.checkpointHash !== recoveryCheckpointHash(normalized)) {
-    fail('CRASH_CHECKPOINT_INVALID', 'recovery context digest does not bind its exact frontier and checkpoint')
+    fail('CRASH_CHECKPOINT_INVALID', 'recovery context digest does not bind its exact next ready work and checkpoint')
   }
   return normalized
 }
@@ -388,7 +391,7 @@ function normalizeFrontier(frontier, currentState) {
       frontier.nextReadyWorkIds.some((id) => typeof id !== 'string' || !id) ||
       typeof frontier.remainingBudgetSeconds !== 'number' || !Number.isFinite(frontier.remainingBudgetSeconds) ||
       frontier.remainingBudgetSeconds < 0 || !HASH_PATTERN.test(frontier.continuationBindingHash || '')) {
-    fail('PAUSED_FRONTIER_INVALID', 'PAUSED requires one exact, non-empty canonical continuation frontier')
+    fail('PAUSED_FRONTIER_INVALID', 'PAUSED requires one exact, non-empty canonical continuation next ready work record')
   }
   return canonicalize(frontier)
 }
@@ -656,10 +659,10 @@ class RuntimeStateStore {
     const terminalPath = path.resolve(requireString(registered.terminalPath, 'paths.terminalPath'))
     const transactionPath = path.resolve(registered.transactionPath || `${statePath}.transaction`)
     const paths = [statePath, eventPath, terminalPath, transactionPath]
-    for (const candidate of paths) {
-      const relative = path.relative(runRecordRoot, candidate)
+    for (const registeredPath of paths) {
+      const relative = path.relative(runRecordRoot, registeredPath)
       if (!relative || path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`)) {
-        fail('STATE_STORE_CONFIG_INVALID', `registered runtime path escapes run record: ${candidate}`)
+        fail('STATE_STORE_CONFIG_INVALID', `registered runtime path escapes run record: ${registeredPath}`)
       }
     }
     if (new Set(paths).size !== paths.length || path.resolve(options.eventLog.logPath) !== eventPath) {
@@ -856,20 +859,20 @@ class RuntimeStateStore {
 
   freezeCandidateForChecks(options = {}) {
     const current = this.load()
-    this._authorize(options.capability, 'freeze candidate for independent checks', capabilityExpectation(current))
+    this._authorize(options.capability, 'freeze exact version for independent checks', capabilityExpectation(current))
     if (!['RUN_WORK', 'ITEM_VERIFIED', 'REPAIRING'].includes(current.state)) {
-      fail('CANDIDATE_FREEZE_INVALID', 'candidate freeze requires joined work or a committed repair')
+      fail('CANDIDATE_FREEZE_INVALID', 'exact-version freeze requires joined work or a committed repair')
     }
     if (!HASH_PATTERN.test(options.candidateHash || '') || !HASH_PATTERN.test(options.environmentHash || '') ||
         !HASH_PATTERN.test(options.dependencyHash || '')) {
-      fail('CANDIDATE_FREEZE_INVALID', 'candidate, environment, and dependency hashes are required')
+      fail('CANDIDATE_FREEZE_INVALID', 'exact-version, environment, and dependency hashes are required')
     }
     if (current.state === 'REPAIRING') {
       const priorCandidate = current.assurance && current.assurance.evidenceGraph &&
         current.assurance.evidenceGraph.nodes.find(node => node.id === 'candidate')
       if (current.activeMutation || !priorCandidate || priorCandidate.hash === options.candidateHash ||
           !current.assurance.lastInvalidation) {
-        fail('CANDIDATE_FREEZE_INVALID', 'repaired candidate freeze requires a committed changed version and prior evidence invalidation')
+        fail('CANDIDATE_FREEZE_INVALID', 'repaired exact-version freeze requires a committed changed version and prior evidence invalidation')
       }
     }
     const graph = options.evidenceGraph
@@ -880,7 +883,7 @@ class RuntimeStateStore {
     if (![1, 2].includes(requiredVerdictIds.length) ||
         requiredVerdictIds.some(id => !INDEPENDENT_VERDICT_IDS.includes(id)) ||
         new Set(requiredVerdictIds).size !== requiredVerdictIds.length) {
-      fail('CANDIDATE_FREEZE_INVALID', 'candidate freeze requires one or two canonical independent verdict ids')
+      fail('CANDIDATE_FREEZE_INVALID', 'exact-version freeze requires one or two canonical independent verdict ids')
     }
     const candidateNode = graph.nodes.find(node => node.id === 'candidate')
     if (!candidateNode || candidateNode.hash !== options.candidateHash ||
@@ -888,7 +891,7 @@ class RuntimeStateStore {
           const node = graph.nodes.find(candidate => candidate.id === id)
           return !node || node.kind !== 'verdict' || !verdictDependsOnCandidate(graph, id)
         })) {
-      fail('CANDIDATE_FREEZE_INVALID', 'every required independent verdict must transitively depend on the exact frozen candidate')
+      fail('CANDIDATE_FREEZE_INVALID', 'every required independent verdict must transitively depend on the exact frozen version being checked')
     }
     const candidateFreeze = canonicalize({
       candidateHash: options.candidateHash,
@@ -899,7 +902,7 @@ class RuntimeStateStore {
     candidateFreeze.freezeHash = sha256(stableStringify(candidateFreeze))
     return this.transition('CHECK_WORK', {
       capability: options.capability,
-      cause: requireString(options.cause, 'candidate freeze cause'),
+      cause: requireString(options.cause, 'exact-version freeze cause'),
       eventId: current.state === 'REPAIRING' ? 'REPAIR_READY' : 'ALL_WORK_JOINED',
       statePatch: {
         candidateHash: options.candidateHash,
@@ -924,7 +927,7 @@ class RuntimeStateStore {
     if (current.state !== 'CHECK_WORK' || !requiredVerdictIds.includes(options.verdictId) ||
         !HASH_PATTERN.test(options.verdictHash || '') || !current.assurance.candidateFreeze ||
         !current.assurance.evidenceGraph) {
-      fail('VERDICT_BINDING_INVALID', 'verdict requires CHECK_WORK and one frozen graph-bound candidate')
+      fail('VERDICT_BINDING_INVALID', 'verdict requires CHECK_WORK and one frozen graph-bound exact version being checked')
     }
     const verdicts = { ...current.assurance.verdicts, [options.verdictId]: {
       status: 'valid', hash: options.verdictHash,
@@ -957,7 +960,7 @@ class RuntimeStateStore {
     this._authorize(options.capability, 'wait for indispensable user input', capabilityExpectation(current))
     const choice = requireString(options.choice, 'user choice')
     if (!HASH_PATTERN.test(options.artifactHash || '')) {
-      fail('WAITING_USER_INVALID', 'WAITING_USER requires a hash-bound saved artifact/frontier')
+      fail('WAITING_USER_INVALID', 'WAITING_USER requires a hash-bound saved result and next ready work record')
     }
     const waitingUser = canonicalize({
       choice,
@@ -995,7 +998,7 @@ class RuntimeStateStore {
     for (const entry of preimages) {
       const actual = hashFileStrict(entry.path, this.fs)
       if (actual !== entry.hash) {
-        fail('CONCURRENT_MUTATION', `candidate preimage changed: ${entry.path}`, { expected: entry.hash, actual })
+        fail('CONCURRENT_MUTATION', `exact-version preimage changed: ${entry.path}`, { expected: entry.hash, actual })
       }
     }
     const permit = {
@@ -1077,7 +1080,7 @@ class RuntimeStateStore {
     for (const entry of postimages) {
       const actual = hashFileStrict(entry.path, this.fs)
       if (actual !== entry.hash) {
-        fail('MUTATION_RESULT_MISMATCH', `candidate result hash mismatch: ${entry.path}`, {
+        fail('MUTATION_RESULT_MISMATCH', `exact-version result hash mismatch: ${entry.path}`, {
           expected: entry.hash,
           actual,
         })
@@ -1089,7 +1092,7 @@ class RuntimeStateStore {
     }
     for (const filePath of deletions) {
       if (this.fs.existsSync(filePath)) {
-        fail('MUTATION_RESULT_MISMATCH', `candidate deletion was not promoted: ${filePath}`)
+        fail('MUTATION_RESULT_MISMATCH', `exact-version deletion was not promoted: ${filePath}`)
       }
     }
     return this.record('TRANSIENT_RUNTIME', {
@@ -1399,7 +1402,7 @@ class RuntimeStateStore {
         journalCheckpoint.immutableHashes.requestEnvelopeHash !== current.requestEnvelopeHash ||
         journalCheckpoint.immutableHashes.candidateHash !== (current.candidateHash || null) ||
         !journalCheckpoint.recovery.frontier.acceptedResultIds.includes(journalCheckpoint.scheduler.stateHash)) {
-      fail('CRASH_CHECKPOINT_MISMATCH', 'latest recovery checkpoint is foreign, stale, or does not bind the exact runtime and scheduler frontier')
+      fail('CRASH_CHECKPOINT_MISMATCH', 'latest recovery checkpoint is foreign, stale, or does not bind the exact runtime and scheduler next ready work')
     }
     let checkpoint
     try { checkpoint = prepareCrashCheckpoint(journalCheckpoint.recovery) } catch (error) {
@@ -1520,7 +1523,7 @@ class RuntimeStateStore {
     if (unchangedFields.some((field) => stableStringify(written[field]) !== stableStringify(current[field])) ||
         written.state !== 'RELEASING_LOCK' || written.sequence !== current.sequence ||
         written.lastEventHash !== current.lastEventHash) {
-      fail('RUN_RECORD_FAILURE', 'release reconciliation changed canonical work, frontier, terminal, or event authority')
+      fail('RUN_RECORD_FAILURE', 'release reconciliation changed canonical work, next ready work, terminal, or event authority')
     }
     return written
   }

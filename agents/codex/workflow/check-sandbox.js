@@ -320,8 +320,15 @@ function materializeCheckerSandboxes(plan, snapshotFactory) {
   }
   const materialized = plan.assignments.map((assignment) => {
     let snapshotPath = assignment.snapshotPath
+    let projectionReceipt = assignment.projectionReceipt || null
     if (assignment.snapshotRequired) {
-      snapshotPath = snapshotFactory(assignment.checkerId, assignment.resources)
+      const snapshot = snapshotFactory(assignment.checkerId, assignment.resources)
+      if (snapshot && typeof snapshot === 'object') {
+        snapshotPath = snapshot.snapshotPath
+        projectionReceipt = snapshot.projectionReceipt || null
+      } else {
+        snapshotPath = snapshot
+      }
       if (!nonEmpty(snapshotPath)) {
         throw new CheckSandboxError('SNAPSHOT_CREATION_FAILED', `snapshot factory failed for ${assignment.checkerId}`)
       }
@@ -360,7 +367,7 @@ function materializeCheckerSandboxes(plan, snapshotFactory) {
       // across checker plans launched at different times.
       schedulerResources.push({ id: `workspace:${snapshotPath}`, mode: 'exclusive' })
     }
-    return { ...assignment, snapshotRequired: false, snapshotPath, schedulerResources }
+    return { ...assignment, snapshotRequired: false, snapshotPath, projectionReceipt, schedulerResources }
   })
   const isolated = materialized.filter((assignment) => assignment.mode === 'isolated')
   for (let left = 0; left < isolated.length; left++) {

@@ -68,6 +68,7 @@ const CONTRACT_VERSION = '2.0.0'
 const ACTIVATION_ID_PATTERN = /^apv2-[a-f0-9]{32}$/
 const DEFAULT_ACTIVATION_TTL_SECONDS = 4 * 60 * 60
 const MAX_ACTIVATION_TTL_SECONDS = 24 * 60 * 60
+const BENCHMARK_UNBOUNDED_EXPIRY_MS = Date.UTC(9999, 11, 31, 23, 59, 59, 999)
 const ROOT_LEGAL_CHILDREN = Object.freeze(['ap-route-analyst'])
 const PROVIDER_CAPABILITIES = Object.freeze({
   provider: 'codex',
@@ -2658,6 +2659,11 @@ function issueCapability(record, recordPath, now, ttlSeconds) {
   return token
 }
 
+function activationCapabilityTtlSeconds(ttlSeconds, now, environment = process.env) {
+  if (!environment || environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT !== '1') return ttlSeconds
+  return Math.floor((BENCHMARK_UNBOUNDED_EXPIRY_MS - now.getTime()) / 1000)
+}
+
 function consumeCapability(recordPath, token, context, now = new Date()) {
   assertRegularUnlinked(recordPath, 'activation-capability-record')
   const opened = fs.openSync(
@@ -3201,7 +3207,12 @@ function prepareActivation(options = {}) {
       auditedPaths: finalPrivacy.auditedPaths,
       mechanism: finalPrivacy.mechanism,
     }
-    const token = issueCapability(record, recordPath, now, ttlSeconds)
+    const token = issueCapability(
+      record,
+      recordPath,
+      now,
+      activationCapabilityTtlSeconds(ttlSeconds, now, env),
+    )
     const activationNonce = options.resume
       ? record.providerAttestation.attestation.activationNonce
       : null
@@ -3314,13 +3325,14 @@ function launchActivation(options = {}) {
       record.providerAttestation.attestationSha256
     childEnv.AUTOPROMPT_SUPERVISOR_RUN_PATH = runtime.binding.runPath
     childEnv.AUTOPROMPT_SUPERVISOR_RUN_METADATA_SHA256 = runtime.binding.metadataSha256
+    const benchmarkNoTimeout = childEnv.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
     result = spawn(process.execPath, args, {
       cwd: target.realpath,
       env: childEnv,
       shell: false,
       stdio: options.stdio || 'inherit',
       encoding: options.encoding,
-      timeout,
+      ...(benchmarkNoTimeout ? {} : { timeout }),
     })
   } finally {
     revokeActivation(recordPath, record, 'launcher-exited', options.now instanceof Date ? options.now : new Date())
@@ -3755,6 +3767,7 @@ module.exports = {
   PROVIDER_CAPABILITIES,
   ProviderUnsupportedError,
   canonicalCodexVerifiedCapabilities,
+  activationCapabilityTtlSeconds,
   activationEnvelope,
   configureCodex,
   controlledNetworkProbeAddress,

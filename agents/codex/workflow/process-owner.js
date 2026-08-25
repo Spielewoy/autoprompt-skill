@@ -603,7 +603,7 @@ class ProcessOwner {
   }
 
   _statusFromExit(exit) {
-    if (exit.terminalEnvelope && ['DONE', 'PARTIAL', 'BLOCKED', 'CANCELLED', 'FAILED'].includes(exit.terminalEnvelope.status)) {
+    if (exit.terminalEnvelope && ['DONE', 'PARTIAL', 'BLOCKED', 'CANCELLED', 'FAILED', 'LOST'].includes(exit.terminalEnvelope.status)) {
       return exit.terminalEnvelope.status
     }
     return exit.code === 0 ? 'DONE' : 'FAILED'

@@ -280,6 +280,8 @@ test('runtime state admits every named admission/evolution case and rejects ille
   assert.equal(isLegalTransition('L0_ROUTE_DECISION', 'L0_ROUTE_DECISION', 'ROUTE_DECISION_INVALID_FIRST'), true)
   assert.equal(isLegalTransition('L0_ROUTE_DECISION', 'WAITING_USER'), true)
   assert.equal(isLegalTransition('CHECK_WORK', 'CHECK_INCONCLUSIVE'), true)
+  assert.equal(isLegalTransition('RUN_WORK', 'CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE'), true)
+  assert.equal(isLegalTransition('CHECK_INCONCLUSIVE', 'RUN_WORK', 'CHECK_BECAME_CONCLUSIVE'), true)
   assert.equal(isLegalTransition('RUN_WORK', 'WORKER_CONTEXT_LOST'), true)
   assert.equal(isLegalTransition('RUN_WORK', 'INTEGRATION_CONFLICT'), true)
   assert.equal(isLegalTransition('LOAD_SKILL', 'MIGRATING_CONTRACT', 'CONTRACT_UPGRADE_REQUIRED'), true)
@@ -291,6 +293,34 @@ test('runtime state admits every named admission/evolution case and rejects ille
     () => transition(store, 'DONE'),
     (error) => error.code === 'ILLEGAL_STATE_TRANSITION' && /BOOT -> DONE/.test(error.message),
   )
+})
+
+test('planning inconclusive retry durably records and returns to its RUN_WORK origin', t => {
+  const { capability, store } = stateHarness(t)
+  const candidateHash = digest('roadmap-plan-candidate')
+  const transitionProduction = (eventId, nextState, checkerId) => applyProductionRuntimeTransition({
+    stateStore: store, capability, budgetController: { snapshot: () => null },
+  }, {
+    eventId, nextState,
+    details: {
+      checkerId, candidateHash, retryAttempt: 1,
+      checkerResultHash: digest(`${eventId}:${checkerId}`),
+    },
+  })
+  advanceToWork(store)
+  transitionProduction('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', 'roadmap-plan-check')
+  assert.equal(store.load().state, 'CHECK_INCONCLUSIVE')
+  assert.deepEqual(store.load().retryState.inconclusiveChecker, {
+    checkerId: 'roadmap-plan-check', candidateHash,
+    retryAttempt: 1, returnState: 'RUN_WORK',
+  })
+  assert.throws(
+    () => transitionProduction('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', 'roadmap-plan-check-runtime-retry'),
+    error => error.code === 'CHECK_RETRY_STATE_INVALID',
+  )
+  transitionProduction('CHECK_BECAME_CONCLUSIVE', 'RUN_WORK', 'roadmap-plan-check-runtime-retry')
+  assert.equal(store.load().state, 'RUN_WORK')
+  assert.equal(Object.hasOwn(store.load().retryState, 'inconclusiveChecker'), false)
 })
 
 test('runtime mutation authority is opaque and activation identity cannot be patched from state.json values', (t) => {

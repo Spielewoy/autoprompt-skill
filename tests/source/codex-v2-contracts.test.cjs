@@ -331,7 +331,8 @@ function assertStateSemantics(inputMachine) {
   const pairs = new Set()
   for (const transition of expanded) {
     assert.ok(states.has(transition.from), `known source state: ${transition.id}`)
-    assert.ok(states.has(transition.to) || ['$same', '$savedResumeState'].includes(transition.to),
+    assert.ok(states.has(transition.to) ||
+      ['$same', '$savedResumeState', '$savedCheckOrigin'].includes(transition.to),
       `known destination state: ${transition.id}`)
     const key = `${transition.from}\0${transition.event}`
     assert.ok(!pairs.has(key), `one result for ${transition.from} + ${transition.event}`)
@@ -375,6 +376,8 @@ function assertStateSemantics(inputMachine) {
       const to = transition.to === '$same' ? transition.from : transition.to
       const destinationCanFinish = to === '$savedResumeState'
         ? [...states].some((state) => !terminals.has(state) && canReachTerminal.has(state))
+        : to === '$savedCheckOrigin'
+          ? ['RUN_WORK', 'CHECK_WORK'].some(state => canReachTerminal.has(state))
         : !to.startsWith('$') && canReachTerminal.has(to)
       if (!destinationCanFinish || canReachTerminal.has(transition.from)) continue
       canReachTerminal.add(transition.from)
@@ -1159,7 +1162,9 @@ test('Codex runtime transitions are a lossless executable projection of the one 
     return fromStates.flatMap((from) => {
       const toStates = transition.to === '$same'
         ? [from]
-        : transition.to === '$savedResumeState' ? restorable : [transition.to]
+        : transition.to === '$savedResumeState'
+          ? restorable
+          : transition.to === '$savedCheckOrigin' ? ['RUN_WORK', 'CHECK_WORK'] : [transition.to]
       return toStates.map(to => ({
         id: transition.id,
         event: transition.event,
@@ -1687,7 +1692,9 @@ test('runtime schemas reject malformed settings, recommendations, decisions, evi
       fromState: transition.from,
       toState: transition.to === '$same'
         ? transition.from
-        : transition.to === '$savedResumeState' ? 'PREPARE_WORK' : transition.to,
+        : transition.to === '$savedResumeState'
+          ? 'PREPARE_WORK'
+          : transition.to === '$savedCheckOrigin' ? 'RUN_WORK' : transition.to,
     }
     if (['T066', 'T077', 'T078'].includes(transition.id)) {
       canonicalEvent.recoveryContext = clone(recoveryContext)

@@ -351,7 +351,10 @@
     {
       "id": "T033",
       "event": "CHECK_INCONCLUSIVE",
-      "from": "CHECK_WORK",
+      "from": [
+        "RUN_WORK",
+        "CHECK_WORK"
+      ],
       "to": "CHECK_INCONCLUSIVE",
       "guard": "the result is flaky, contradictory, partial, or non-authoritative",
       "effect": "isolate the check and use only its declared transient allowance"
@@ -360,7 +363,7 @@
       "id": "T034",
       "event": "CHECK_BECAME_CONCLUSIVE",
       "from": "CHECK_INCONCLUSIVE",
-      "to": "CHECK_WORK",
+      "to": "$savedCheckOrigin",
       "guard": "the check produced a classified result tied to the same version",
       "effect": "continue the affected checking path"
     },

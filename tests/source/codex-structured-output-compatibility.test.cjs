@@ -706,7 +706,7 @@ test('benchmark no-limit overrides cover tokens and admission time for every sch
     issuedAtMs + 5 * 60 * 1000)
   assert.equal(runtimeCapabilityExpiryMs(requestedExpiryMs, issuedAtMs, {
     AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1',
-  }), requestedExpiryMs)
+  }), Date.parse('9999-12-31T23:59:59.999Z'))
 })
 
 test('benchmark xhigh pin overrides every resolved role effort and rejects ambiguous values', () => {

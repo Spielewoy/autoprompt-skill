@@ -77,7 +77,7 @@ function resolveInside(root, relative) {
 
 function fileState(absolute, fsImpl = fs) {
   let inspected
-  try { inspected = inspectPathNoFollow(absolute, { mustBeDirectory: false }) } catch (error) {
+  try { inspected = inspectPathNoFollow(absolute, { mustBeDirectory: false, fsImpl }) } catch (error) {
     fail('WORKER_WORKSPACE_UNSAFE_ENTRY', `workspace path crosses a link, junction, or reparse point: ${absolute}`, {
       cause: error.code || error.message,
     })
@@ -122,12 +122,114 @@ function repositorySnapshot(repository, environment, fsImpl = fs) {
   return Object.freeze(rows)
 }
 
+function ignoredPythonTransientSnapshot(repository, environment, fsImpl = fs) {
+  const root = path.resolve(repository)
+  const raw = Buffer.from(runGit(root, [
+    'ls-files', '--others', '--ignored', '--exclude-standard', '-z',
+  ], {
+    encoding: null,
+    environment,
+  }))
+  const names = raw.toString('utf8').split('\0').filter(Boolean)
+    .map(normalizeRelative).filter(isPythonTransient).sort()
+  return Object.freeze(names.map(relative => {
+    const state = fileState(resolveInside(root, relative), fsImpl)
+    if (!state) {
+      fail('WORKER_WORKSPACE_UNSAFE_ENTRY', `ignored interpreter cache changed during admission: ${relative}`)
+    }
+    return Object.freeze({ path: relative, hash: state.hash, mode: state.mode })
+  }))
+}
+
+function configuredCacheSnapshot(cacheRoot, privateRoot, fsImpl = fs) {
+  const root = path.resolve(cacheRoot)
+  if (!pathIsInside(privateRoot, root)) {
+    fail('WORKER_WORKSPACE_INVALID', 'configured worker cache escaped its private boundary')
+  }
+  let rootInspection
+  try { rootInspection = inspectPathNoFollow(root, { fsImpl }) } catch (error) {
+    fail('WORKER_WORKSPACE_UNSAFE_ENTRY', 'configured worker cache crosses a link, junction, or reparse point', {
+      cause: error.code || error.message,
+    })
+  }
+  if (!rootInspection.exists) return Object.freeze([])
+  const rows = []
+  const visit = directory => {
+    let names
+    try { names = fsImpl.readdirSync(directory).sort() } catch (error) {
+      fail('WORKER_WORKSPACE_UNSAFE_ENTRY', `configured worker cache is not readable: ${directory}`, {
+        cause: error.code || error.message,
+      })
+    }
+    for (const name of names) {
+      const absolute = path.join(directory, name)
+      let inspection
+      try { inspection = inspectPathNoFollow(absolute, { mustBeDirectory: false, fsImpl }) } catch (error) {
+        fail('WORKER_WORKSPACE_UNSAFE_ENTRY', `configured worker cache crosses a link, junction, or reparse point: ${absolute}`, {
+          cause: error.code || error.message,
+        })
+      }
+      if (!inspection.exists) {
+        fail('WORKER_WORKSPACE_UNSAFE_ENTRY', `configured worker cache changed during admission: ${absolute}`)
+      }
+      const stat = fsImpl.lstatSync(absolute)
+      if (stat.isSymbolicLink()) {
+        fail('WORKER_WORKSPACE_UNSAFE_ENTRY', `configured worker cache contains a symbolic link: ${absolute}`)
+      }
+      if (stat.isDirectory()) {
+        visit(absolute)
+        continue
+      }
+      const state = fileState(absolute, fsImpl)
+      if (!state) {
+        fail('WORKER_WORKSPACE_UNSAFE_ENTRY', `configured worker cache changed during admission: ${absolute}`)
+      }
+      const relative = normalizeRelative(path.relative(root, absolute).replace(/\\/g, '/'))
+      rows.push(Object.freeze({ path: relative, hash: state.hash, mode: state.mode }))
+    }
+  }
+  visit(root)
+  return Object.freeze(rows.sort((left, right) => left.path.localeCompare(right.path)))
+}
+
 function snapshotMap(snapshot) {
   return new Map(snapshot.map(entry => [entry.path, entry]))
 }
 
 function snapshotsEqual(left, right) {
   return stableStringify(left) === stableStringify(right)
+}
+
+function isPythonTransient(relative) {
+  const normalized = normalizeRelative(relative)
+  const parts = normalized.split('/')
+  const filename = parts.at(-1)
+  return (parts.includes('__pycache__') && /\.py[cod]$/u.test(filename)) || /\.py[co]$/u.test(filename)
+}
+
+function transientEvidenceEntry(entry) {
+  return Object.freeze({
+    scope: entry.scope,
+    path: entry.path,
+    hash: entry.hash,
+    kind: entry.kind,
+  })
+}
+
+function validTransientEntry(entry) {
+  if (!entry || !['workspace', 'configured-cache-root'].includes(entry.scope) ||
+      typeof entry.path !== 'string' || !HASH_PATTERN.test(entry.hash || '') ||
+      !['python-bytecode-cache', 'private-worker-cache'].includes(entry.kind)) return false
+  try { return normalizeRelative(entry.path) === entry.path } catch { return false }
+}
+
+function validTransientCleanup(cleanup) {
+  if (!cleanup || cleanup.schemaVersion !== 1 || cleanup.status !== 'PREPARED' ||
+      !Array.isArray(cleanup.entries) || cleanup.entries.length === 0 ||
+      cleanup.entries.some(entry => !validTransientEntry(entry))) return false
+  const identities = cleanup.entries.map(entry => `${entry.scope}:${entry.path}`)
+  return new Set(identities).size === identities.length &&
+    cleanup.cleanupHash === sha256(stableStringify(cleanup.entries))
 }
 
 function assignmentHash(assignment) {
@@ -188,9 +290,30 @@ function removeEmptyParents(start, boundary, fsImpl = fs) {
   let cursor = path.resolve(start)
   while (cursor !== root && cursor.startsWith(`${root}${path.sep}`)) {
     if (!fsImpl.existsSync(cursor) || fsImpl.readdirSync(cursor).length !== 0) break
+    const parent = path.dirname(cursor)
     fsImpl.rmdirSync(cursor)
-    cursor = path.dirname(cursor)
+    fsyncDirectory(parent, fsImpl)
+    cursor = parent
   }
+}
+
+function removeEmptyTree(rootDirectory, boundary, fsImpl = fs) {
+  const root = path.resolve(rootDirectory)
+  if (!pathIsInside(boundary, root) || !fsImpl.existsSync(root)) return
+  configuredCacheSnapshot(root, boundary, fsImpl)
+  const remove = directory => {
+    for (const name of fsImpl.readdirSync(directory).sort()) {
+      const absolute = path.join(directory, name)
+      const stat = fsImpl.lstatSync(absolute)
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        fail('WORKER_WORKSPACE_UNSAFE_ENTRY', `configured worker cache was not empty during cleanup: ${absolute}`)
+      }
+      remove(absolute)
+    }
+    fsImpl.rmdirSync(directory)
+    fsyncDirectory(path.dirname(directory), fsImpl)
+  }
+  remove(root)
 }
 
 function fsyncFile(filename, fsImpl = fs) {
@@ -255,6 +378,7 @@ class WorkerWorkspaceManager {
     ensurePhysicalDirectory(path.join(this.privateRoot, 'workspaces'), this.privateRoot, this.fs)
     ensurePhysicalDirectory(path.join(this.privateRoot, 'records'), this.privateRoot, this.fs)
     ensurePhysicalDirectory(path.join(this.privateRoot, 'transactions'), this.privateRoot, this.fs)
+    ensurePhysicalDirectory(path.join(this.privateRoot, 'caches'), this.privateRoot, this.fs)
   }
 
   prepare(options = {}) {
@@ -270,6 +394,7 @@ class WorkerWorkspaceManager {
       assignmentHash: boundAssignmentHash,
     })).slice(0, 40)
     const workspacePath = path.join(this.privateRoot, 'workspaces', workspaceId)
+    const cacheRoot = path.join(this.privateRoot, 'caches', workspaceId)
     const recordPath = path.join(this.privateRoot, 'records', `${workspaceId}.json`)
     if (this.fs.existsSync(recordPath)) {
       const existing = readChecksummedJson(recordPath, { fsImpl: this.fs })
@@ -282,12 +407,14 @@ class WorkerWorkspaceManager {
       if (!this.fs.existsSync(workspacePath)) {
         fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'prepared worker workspace disappeared before reuse')
       }
+      ensurePhysicalDirectory(cacheRoot, this.privateRoot, this.fs)
       return this._session(recovered, assignment)
     }
 
     const baseline = repositorySnapshot(this.targetRoot, this.environment, this.fs)
     const parent = path.dirname(workspacePath)
     ensurePhysicalDirectory(parent, this.privateRoot, this.fs)
+    ensurePhysicalDirectory(cacheRoot, this.privateRoot, this.fs)
     const clone = childProcess.spawnSync('git', [
       'clone', '--no-local', '--no-hardlinks', '--', this.targetRoot, workspacePath,
     ], {
@@ -349,6 +476,8 @@ class WorkerWorkspaceManager {
       status: 'PREPARED',
       baseline,
       actualFilesChanged: [],
+      transientArtifactsRemoved: [],
+      transientCleanup: null,
       transaction: null,
       binding,
     }
@@ -369,6 +498,7 @@ class WorkerWorkspaceManager {
       assignmentHash: boundAssignmentHash,
     })).slice(0, 40)
     const workspacePath = path.join(this.privateRoot, 'workspaces', workspaceId)
+    const cacheRoot = path.join(this.privateRoot, 'caches', workspaceId)
     const recordPath = path.join(this.privateRoot, 'records', `${workspaceId}.json`)
     if (options.recordPath && path.resolve(options.recordPath) !== path.resolve(recordPath)) {
       fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'deferred promotion record points to a foreign workspace journal')
@@ -381,14 +511,57 @@ class WorkerWorkspaceManager {
     if (!['COMMITTED', 'FINALIZED'].includes(existing.status)) this.recover(existing)
     const recovered = readChecksummedJson(recordPath, { fsImpl: this.fs })
     this._validateRecord(recovered, { workspaceId, boundAssignmentHash, workspacePath })
+    ensurePhysicalDirectory(cacheRoot, this.privateRoot, this.fs)
     return this._session(recovered, assignment)
   }
 
   inspect(session, result) {
-    const record = this._readSession(session)
-    const after = repositorySnapshot(record.workspacePath, this.environment, this.fs)
+    let record = this._readSession(session)
+    if (record.transientCleanup) {
+      this.recover(record)
+      record = this._readSession(session)
+    }
+    let after = repositorySnapshot(record.workspacePath, this.environment, this.fs)
     const beforeMap = snapshotMap(record.baseline)
-    const afterMap = snapshotMap(after)
+    let afterMap = snapshotMap(after)
+    const workspaceTransientMap = new Map()
+    for (const entry of [...after, ...ignoredPythonTransientSnapshot(
+      record.workspacePath,
+      this.environment,
+      this.fs,
+    )]) {
+      if (beforeMap.has(entry.path) || !isPythonTransient(entry.path)) continue
+      workspaceTransientMap.set(entry.path, entry)
+    }
+    const transientArtifacts = []
+    for (const entry of [...workspaceTransientMap.values()].sort((left, right) => left.path.localeCompare(right.path))) {
+      if (ownsRelative(this.targetRoot, session.assignment.resources, entry.path)) {
+        fail('OWNERSHIP_SCOPE_VIOLATION', 'an explicitly owned deliverable cannot be discarded as an interpreter cache', {
+          transientCandidate: entry.path,
+        })
+      }
+      transientArtifacts.push(transientEvidenceEntry({
+        scope: 'workspace',
+        path: entry.path,
+        hash: entry.hash,
+        kind: 'python-bytecode-cache',
+      }))
+    }
+    const cacheRoot = path.join(this.privateRoot, 'caches', record.workspaceId)
+    for (const entry of configuredCacheSnapshot(cacheRoot, this.privateRoot, this.fs)) {
+      transientArtifacts.push(transientEvidenceEntry({
+        scope: 'configured-cache-root',
+        path: entry.path,
+        hash: entry.hash,
+        kind: 'private-worker-cache',
+      }))
+    }
+    if (transientArtifacts.length > 0) {
+      record = this._prepareTransientCleanup(record, transientArtifacts)
+      record = this._reconcileTransientCleanup(record)
+      after = repositorySnapshot(record.workspacePath, this.environment, this.fs)
+      afterMap = snapshotMap(after)
+    }
     const names = [...new Set([...beforeMap.keys(), ...afterMap.keys()])].sort()
     const actual = names.filter(relative =>
       (beforeMap.get(relative) && beforeMap.get(relative).hash || null) !==
@@ -401,8 +574,13 @@ class WorkerWorkspaceManager {
           .map(resource => `${resource.kind}:${resource.identity}`),
       })
     }
+    const recordedTransientArtifacts = Array.isArray(record.transientArtifactsRemoved)
+      ? record.transientArtifactsRemoved : []
+    const transientPaths = new Set(recordedTransientArtifacts
+      .filter(item => !item.scope || item.scope === 'workspace').map(item => item.path))
     const reported = Array.isArray(result && result.filesChanged)
-      ? [...new Set(result.filesChanged.map(value => normalizeReportedPath(value, this.targetRoot)))].sort() : []
+      ? [...new Set(result.filesChanged.map(value => normalizeReportedPath(value, this.targetRoot)))]
+          .filter(relative => !transientPaths.has(relative)).sort() : []
     if (stableStringify(reported) !== stableStringify(actual)) {
       fail('MUTATION_REPORT_MISMATCH', 'worker file report does not match the isolated physical diff', {
         reported, actual,
@@ -411,6 +589,7 @@ class WorkerWorkspaceManager {
     return Object.freeze({
       actualFilesChanged: Object.freeze(actual),
       after: Object.freeze(after),
+      transientArtifactsRemoved: Object.freeze(recordedTransientArtifacts.map(item => Object.freeze({ ...item }))),
       postimages: Object.freeze(actual.map(relative => {
         const entry = afterMap.get(relative)
         return Object.freeze({ path: resolveInside(this.targetRoot, relative), hash: entry && entry.hash || null })
@@ -599,11 +778,81 @@ class WorkerWorkspaceManager {
     }
   }
 
+  _prepareTransientCleanup(record, entries) {
+    if (!Array.isArray(entries) || entries.length === 0 || entries.some(entry => !validTransientEntry(entry))) {
+      fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'transient cleanup intent is invalid')
+    }
+    const sorted = entries.map(entry => transientEvidenceEntry(entry))
+      .sort((left, right) => `${left.scope}:${left.path}`.localeCompare(`${right.scope}:${right.path}`))
+    const identities = sorted.map(entry => `${entry.scope}:${entry.path}`)
+    if (new Set(identities).size !== identities.length) {
+      fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'transient cleanup intent contains duplicate paths')
+    }
+    const prepared = {
+      ...record,
+      transientCleanup: {
+        schemaVersion: 1,
+        status: 'PREPARED',
+        entries: sorted,
+        cleanupHash: sha256(stableStringify(sorted)),
+      },
+    }
+    atomicWriteJson(record.recordPath, prepared, { fsImpl: this.fs })
+    return prepared
+  }
+
+  _reconcileTransientCleanup(record) {
+    const cleanup = record && record.transientCleanup
+    if (!cleanup) return record
+    if (!validTransientCleanup(cleanup)) {
+      fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'transient cleanup journal is foreign or corrupt')
+    }
+    for (const entry of cleanup.entries) {
+      const boundary = entry.scope === 'workspace'
+        ? record.workspacePath
+        : path.join(this.privateRoot, 'caches', record.workspaceId)
+      const absolute = resolveInside(boundary, entry.path)
+      const state = fileState(absolute, this.fs)
+      if (state && state.hash !== entry.hash) {
+        fail('WORKER_WORKSPACE_UNSAFE_ENTRY', `transient changed before cleanup reconciliation: ${entry.path}`)
+      }
+      if (state) {
+        this.fs.unlinkSync(absolute)
+        fsyncDirectory(path.dirname(absolute), this.fs)
+        removeEmptyParents(path.dirname(absolute), boundary, this.fs)
+      }
+    }
+    const existing = Array.isArray(record.transientArtifactsRemoved) ? record.transientArtifactsRemoved : []
+    const combined = [...existing, ...cleanup.entries.map(entry => transientEvidenceEntry(entry))]
+    const reconciled = {
+      ...record,
+      transientArtifactsRemoved: combined,
+      transientCleanupHash: sha256(stableStringify(combined)),
+      transientCleanup: null,
+    }
+    atomicWriteJson(record.recordPath, reconciled, { fsImpl: this.fs })
+    return reconciled
+  }
+
+  _cleanupConfiguredCache(record) {
+    const cacheRoot = path.join(this.privateRoot, 'caches', record.workspaceId)
+    const entries = configuredCacheSnapshot(cacheRoot, this.privateRoot, this.fs).map(entry =>
+      transientEvidenceEntry({
+        scope: 'configured-cache-root',
+        path: entry.path,
+        hash: entry.hash,
+        kind: 'private-worker-cache',
+      }))
+    if (entries.length === 0) return record
+    return this._reconcileTransientCleanup(this._prepareTransientCleanup(record, entries))
+  }
+
   recover(recordOrSession) {
-    const record = recordOrSession && recordOrSession.recordPath
+    let record = recordOrSession && recordOrSession.recordPath
       ? readChecksummedJson(recordOrSession.recordPath, { fsImpl: this.fs })
       : recordOrSession
     if (!record || typeof record.status !== 'string') fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'workspace recovery record is invalid')
+    if (record.transientCleanup) record = this._reconcileTransientCleanup(record)
     if (['PREPARED_PROMOTION', 'PROMOTING'].includes(record.status)) return this._rollback(record)
     if (record.status === 'COMMITTED') {
       this._committedPostimages(record)
@@ -614,10 +863,14 @@ class WorkerWorkspaceManager {
 
   finalize(session) {
     let record = this._readSession(session)
+    if (record.transientCleanup) record = this.recover(record)
     if (record.status !== 'COMMITTED') fail('WORKER_PROMOTION_INVALID', 'only a committed workspace can be finalized')
+    record = this._cleanupConfiguredCache(record)
     this._disarmRollbackGuardian(record)
     this._cleanupTransaction(record)
     if (this.fs.existsSync(record.workspacePath)) this.fs.rmSync(record.workspacePath, { recursive: true, force: false })
+    const cacheRoot = path.join(this.privateRoot, 'caches', record.workspaceId)
+    removeEmptyTree(cacheRoot, this.privateRoot, this.fs)
     record = { ...record, status: 'FINALIZED', transaction: null }
     atomicWriteJson(record.recordPath, record, { fsImpl: this.fs })
     return record
@@ -625,10 +878,14 @@ class WorkerWorkspaceManager {
 
   abort(session) {
     let record = this._readSession(session)
+    if (record.transientCleanup) record = this.recover(record)
     if (['PREPARED_PROMOTION', 'PROMOTING'].includes(record.status)) record = this._rollback(record)
     if (record.status === 'COMMITTED') record = this._rollbackCommitted(record)
+    record = this._cleanupConfiguredCache(record)
     this._disarmRollbackGuardian(record)
     if (this.fs.existsSync(record.workspacePath)) this.fs.rmSync(record.workspacePath, { recursive: true, force: false })
+    const cacheRoot = path.join(this.privateRoot, 'caches', record.workspaceId)
+    removeEmptyTree(cacheRoot, this.privateRoot, this.fs)
     this._cleanupTransaction(record)
     record = { ...record, status: 'ABORTED', transaction: null }
     atomicWriteJson(record.recordPath, record, { fsImpl: this.fs })
@@ -727,6 +984,7 @@ class WorkerWorkspaceManager {
       workspaceId: record.workspaceId,
       workspacePath: record.workspacePath,
       recordPath: record.recordPath,
+      cacheRoot: path.join(this.privateRoot, 'caches', record.workspaceId),
       binding: Object.freeze({ ...record.binding }),
       assignment,
       manager: this,
@@ -747,11 +1005,22 @@ class WorkerWorkspaceManager {
   }
 
   _validateRecord(record, expected) {
+    const transientArtifacts = record && Array.isArray(record.transientArtifactsRemoved)
+      ? record.transientArtifactsRemoved
+      : record && record.transientArtifactsRemoved === undefined ? [] : null
+    const transientEvidenceValid = transientArtifacts &&
+      transientArtifacts.every(entry => validTransientEntry({ ...entry, scope: entry.scope || 'workspace' })) &&
+      (transientArtifacts.length === 0
+        ? record.transientCleanupHash === undefined || record.transientCleanupHash === null
+        : record.transientCleanupHash === sha256(stableStringify(transientArtifacts)))
+    const transientCleanupValid = !record || record.transientCleanup === undefined ||
+      record.transientCleanup === null || validTransientCleanup(record.transientCleanup)
     if (!record || record.schemaVersion !== 1 || record.workspaceId !== expected.workspaceId ||
         record.runId !== this.runId || record.activationId !== this.activationId ||
         record.assignmentHash !== expected.boundAssignmentHash ||
         record.targetRootHash !== sha256(this.targetRoot) ||
         path.resolve(record.workspacePath) !== path.resolve(expected.workspacePath) ||
+        !transientEvidenceValid || !transientCleanupValid ||
         !record.binding || !HASH_PATTERN.test(record.binding.bindingHash || '') ||
         record.binding.bindingHash !== sha256(stableStringify({
           schemaVersion: record.binding.schemaVersion,
