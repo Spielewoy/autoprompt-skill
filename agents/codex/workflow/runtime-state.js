@@ -47,6 +47,7 @@ const RELEASE_INTENT_OUTCOMES = Object.freeze({
   T038: 'FAILED',
   T049: 'BLOCKED',
   T056: 'BLOCKED',
+  T080: 'FAILED',
   T057: 'CANCELLED',
   T059: 'PARTIAL',
   T076: 'PARTIAL',
@@ -856,12 +857,20 @@ class RuntimeStateStore {
   freezeCandidateForChecks(options = {}) {
     const current = this.load()
     this._authorize(options.capability, 'freeze candidate for independent checks', capabilityExpectation(current))
-    if (!['RUN_WORK', 'ITEM_VERIFIED'].includes(current.state)) {
-      fail('CANDIDATE_FREEZE_INVALID', 'candidate freeze requires joined work in RUN_WORK or ITEM_VERIFIED')
+    if (!['RUN_WORK', 'ITEM_VERIFIED', 'REPAIRING'].includes(current.state)) {
+      fail('CANDIDATE_FREEZE_INVALID', 'candidate freeze requires joined work or a committed repair')
     }
     if (!HASH_PATTERN.test(options.candidateHash || '') || !HASH_PATTERN.test(options.environmentHash || '') ||
         !HASH_PATTERN.test(options.dependencyHash || '')) {
       fail('CANDIDATE_FREEZE_INVALID', 'candidate, environment, and dependency hashes are required')
+    }
+    if (current.state === 'REPAIRING') {
+      const priorCandidate = current.assurance && current.assurance.evidenceGraph &&
+        current.assurance.evidenceGraph.nodes.find(node => node.id === 'candidate')
+      if (current.activeMutation || !priorCandidate || priorCandidate.hash === options.candidateHash ||
+          !current.assurance.lastInvalidation) {
+        fail('CANDIDATE_FREEZE_INVALID', 'repaired candidate freeze requires a committed changed version and prior evidence invalidation')
+      }
     }
     const graph = options.evidenceGraph
     const validation = validateEvidenceInvalidationGraph(graph)
@@ -891,7 +900,7 @@ class RuntimeStateStore {
     return this.transition('CHECK_WORK', {
       capability: options.capability,
       cause: requireString(options.cause, 'candidate freeze cause'),
-      eventId: 'ALL_WORK_JOINED',
+      eventId: current.state === 'REPAIRING' ? 'REPAIR_READY' : 'ALL_WORK_JOINED',
       statePatch: {
         candidateHash: options.candidateHash,
         assurance: {
@@ -1003,11 +1012,11 @@ class RuntimeStateStore {
     if (options.requireIsolation === true && !permit.isolationBindingHash) {
       fail('MUTATION_ISOLATION_REQUIRED', 'authorized worker mutation requires a hash-bound private workspace')
     }
-    if (!['RUN_WORK', 'CHECK_WORK', 'FINAL_CHECK'].includes(current.state)) {
+    if (!['RUN_WORK', 'CHECK_WORK', 'REPAIRING', 'FINAL_CHECK'].includes(current.state)) {
       fail('MUTATION_STATE_INVALID', `authorized mutation is not canonical from ${current.state}`)
     }
     const nextState = current.state === 'FINAL_CHECK' ? 'RUN_WORK' : current.state
-    const invalidationRequired = ['CHECK_WORK', 'FINAL_CHECK'].includes(current.state)
+    const invalidationRequired = ['CHECK_WORK', 'REPAIRING', 'FINAL_CHECK'].includes(current.state)
     const assurance = current.assurance || {
       candidateFreeze: null, evidenceGraph: null,
       verdicts: Object.fromEntries(INDEPENDENT_VERDICT_IDS.map(id => [id, { status: 'missing', hash: null }])),
@@ -1022,10 +1031,13 @@ class RuntimeStateStore {
             rerunIds: Object.freeze([...INDEPENDENT_VERDICT_IDS]), unaffectedIds: Object.freeze([]),
           })
       : assurance.lastInvalidation
+    const requiredVerdictIds = Array.isArray(assurance.requiredVerdictIds)
+      ? assurance.requiredVerdictIds : [...INDEPENDENT_VERDICT_IDS]
     const nextAssurance = invalidationRequired ? {
       candidateFreeze: null,
       evidenceGraph: assurance.evidenceGraph,
-      verdicts: Object.fromEntries(INDEPENDENT_VERDICT_IDS.map(id => [id, {
+      requiredVerdictIds,
+      verdicts: Object.fromEntries(requiredVerdictIds.map(id => [id, {
         status: 'invalidated', hash: null,
       }])),
       lastInvalidation,

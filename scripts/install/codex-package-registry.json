@@ -157,7 +157,7 @@
     },
     {
       "path": "agents/codex/workflow/recovery-checkpoint.js",
-      "sha256": "cf1eeeecf0842b871180f42796e435dca1c2b93f43fb103d187099eeedea41a4",
+      "sha256": "dd39449e777f6c0abed182c359510572aad345f229fda950b680dc8c54ca5722",
       "terms": ["candidate", "frontier"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     },
@@ -169,13 +169,13 @@
     },
     {
       "path": "agents/codex/workflow/runtime-state.js",
-      "sha256": "60541d949efc2601abeac2843e6a687ad2cbbc0028b74cf72296b2c6762f838b",
+      "sha256": "d41f1a810b1ed683606c176ebb1018de9e0539f184275e0f2916fea27af15b32",
       "terms": ["artifact", "candidate", "frontier"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     },
     {
       "path": "agents/codex/workflow/scheduler.js",
-      "sha256": "63ff78c535cbb4d75f76c87e18b8891ea43fde615a9fe355b81efaf86c629267",
+      "sha256": "45fd4805653a56e80791ac4b15e7c3b5b944cfb6f74d547175775c063df70e21",
       "terms": ["candidate", "frontier", "lane"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     }

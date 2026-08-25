@@ -91,7 +91,8 @@ const {
   validateContracts: validateCapturedDomainContracts,
 } = require('./captured-domain.js')
 const { WorkerWorkspaceManager } = require('./worker-workspace.js')
-const { pathIsInside, readFileNoFollow } = require('./safe-run-root.js')
+const { auditPrivatePermissions, pathIsInside, readFileNoFollow } = require('./safe-run-root.js')
+const { validateJsonSchema } = require('./json-schema-validator.js')
 
 const SCOPE_SOFT_SEC = 60
 const SCOPE_HARD_SEC = 300
@@ -103,7 +104,7 @@ const CHECKER_ROLES = new Set([
   'plan-checker', 'independent-checker', 'independent-reviewer',
   'independent-tester', 'technical-decision-reviewer',
 ])
-const CANONICAL_CHECKER_CODES = new Set(['PASS', 'FAIL', 'CHECK_INCONCLUSIVE'])
+const CANONICAL_CHECKER_CODES = new Set(['PASS', 'FAIL', 'CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'])
 
 function resolveTerminalReceiptCandidateHash({
   logicalRole,
@@ -1308,6 +1309,20 @@ function hashEnvironment(environment) {
   return hashText(JSON.stringify(fields))
 }
 
+const CHECKER_EPHEMERAL_ENVIRONMENT_FIELDS = new Set([
+  'TMPDIR', 'TMP', 'TEMP', 'SQLITE_TMPDIR', 'XDG_CACHE_HOME', 'PYTHONPYCACHEPREFIX',
+  'AUTOPROMPT_CHECKER_CANDIDATE_ROOT', 'AUTOPROMPT_CHECKER_SCRATCH_ROOT',
+  'AUTOPROMPT_CHECKER_OUTPUT_ROOT',
+])
+
+function hashCheckerEnvironment(environment) {
+  const canonical = Object.fromEntries(Object.entries(environment || {}).map(([key, value]) => [
+    key,
+    CHECKER_EPHEMERAL_ENVIRONMENT_FIELDS.has(key) ? `<authenticated-checker-${key.toLowerCase()}>` : value,
+  ]))
+  return hashEnvironment(canonical)
+}
+
 function normalizeRole(role) {
   const value = String(role || '').trim()
   return value === 'ap-work-group-manager' ? value : value.replace(/^ap-/, '')
@@ -1733,14 +1748,15 @@ async function executePreProductionRuntimeGates(input = {}) {
   if (typeof input.launch !== 'function') {
     throw new SupervisorIntegrationError('DEPTH_PROBE_REQUIRED', 'depth specialist launcher is unavailable')
   }
-  const likelyAreas = Array.isArray(input.likelyAreas) ? input.likelyAreas : []
+  const ownership = Array.isArray(input.ownership) && input.ownership.length ? input.ownership : ['workspace']
   const depthResult = await input.launch({
     workItemId: 'conditional-depth-prober', logicalRole: 'diagnostic-probe', parent: 'run-owner',
     purpose: 'diagnostic',
     assignment: `Probe the deepest-cause layer before production because: ${depthTrigger.reasons.join(', ')}. Read and run focused diagnostics only.`,
-    ownership: likelyAreas.length ? likelyAreas : ['workspace'],
+    ownership,
     success: ['Return a concrete deepest-cause layer with evidence.'],
     checks: ['No production mutation; bind every claimed path and result.'],
+    fetchedEvidence: input.fetchedEvidence || null,
     bounded: true, nextReadyAfter: ['work-1'],
   })
   if (!depthResult || depthResult.code !== 'PASS') {
@@ -2358,9 +2374,20 @@ function reconstructTypedExitZeroResult(record, parsed) {
   }
   if (CHECKER_ROLES.has(record.logicalRole)) {
     return {
-      ...common, code: 'FAIL', runId: record.runId,
+      schemaVersion: '2.0.0', code: 'RUNTIME_FAILURE',
+      description: 'A tool or execution environment failed before the requested check could finish.',
+      stateClass: 'terminal', runId: record.runId,
       requestEnvelopeHash: record.dispatch.requestPointer.hash,
       currentVersionHash: record.candidateHash,
+      completedResults: [], nextReadyWork: [],
+      cause: {
+        event: 'TYPED_TERMINAL_MISSING',
+        reason: 'The owned child exited zero with complete usage but no canonical typed terminal record.',
+        unblockPath: null,
+      },
+      payloadSchemaId: 'autoprompt.checker-reconstruction.v2',
+      payload: { reconstructedTerminal: true, terminalEnvelope: common.terminalEnvelope },
+      recordedAt: new Date().toISOString(),
     }
   }
   if (record.logicalRole === 'route-analyst' || record.logicalRole === 'run-owner') return common
@@ -2373,7 +2400,10 @@ function reconstructTypedExitZeroResult(record, parsed) {
     successItems: [{ id: 'typed-terminal-record', status: 'fail', evidenceIds: [] }],
     remainingConcerns: ['The child exited without its required typed terminal record.'],
     findingIds: Array.isArray(record.findingIds) && record.findingIds.length
-      ? [...record.findingIds] : ['RUNTIME-TERMINAL-RESULT-MISSING'],
+      ? [...record.findingIds]
+      : Array.isArray(record.canonicalAssignment && record.canonicalAssignment.findingIds) &&
+          record.canonicalAssignment.findingIds.length
+        ? [...record.canonicalAssignment.findingIds] : ['RUNTIME-TERMINAL-RESULT-MISSING'],
     requestedTransition: {
       event: 'WORK_ITEM_VERIFIED',
       reason: 'Persist the deterministic failed reconstruction without relaunching the model.',
@@ -2734,6 +2764,98 @@ function codexPrivateWorkspaceProjection(record, canonicalTargetPath, workingDir
   ]
 }
 
+function checkerScratchReceiptBody(boundary) {
+  return {
+    schemaVersion: boundary.schemaVersion,
+    runId: boundary.runId,
+    checkerId: boundary.checkerId,
+    candidateHash: boundary.candidateHash,
+    frozenCandidateRoot: boundary.frozenCandidateRoot,
+    writableScratchRoot: boundary.writableScratchRoot,
+    temporaryRoot: boundary.temporaryRoot,
+    outputRoot: boundary.outputRoot,
+    cacheRoot: boundary.cacheRoot,
+  }
+}
+
+function validateCheckerScratchDirectories(boundary, expected = {}) {
+  if (!boundary || boundary.schemaVersion !== 1 || typeof boundary.capability !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(boundary.capability)) {
+    throw new SupervisorIntegrationError('CHECKER_SCRATCH_BOUNDARY_INVALID', 'checker scratch lacks its authenticated boundary record')
+  }
+  const roots = {}
+  for (const name of ['frozenCandidateRoot', 'writableScratchRoot', 'temporaryRoot', 'outputRoot', 'cacheRoot']) {
+    if (typeof boundary[name] !== 'string' || !path.isAbsolute(boundary[name])) {
+      throw new SupervisorIntegrationError('CHECKER_SCRATCH_BOUNDARY_INVALID', `checker scratch ${name} is not an absolute directory`)
+    }
+    const lexical = path.resolve(boundary[name])
+    const item = fs.lstatSync(lexical)
+    const real = fs.realpathSync.native(lexical)
+    if (!item.isDirectory() || item.isSymbolicLink() || real !== lexical) {
+      throw new SupervisorIntegrationError('CHECKER_SCRATCH_BOUNDARY_INVALID', `checker scratch ${name} is not one physical directory`)
+    }
+    roots[name] = real
+  }
+  if (expected.runId !== undefined && boundary.runId !== expected.runId ||
+      expected.checkerId !== undefined && boundary.checkerId !== expected.checkerId ||
+      expected.candidateHash !== undefined && boundary.candidateHash !== expected.candidateHash ||
+      expected.frozenCandidateRoot !== undefined && roots.frozenCandidateRoot !== fs.realpathSync.native(path.resolve(expected.frozenCandidateRoot))) {
+    throw new SupervisorIntegrationError('CHECKER_SCRATCH_BOUNDARY_INVALID', 'checker scratch authority is bound to a different run, checker, exact version, or snapshot')
+  }
+  const scratch = roots.writableScratchRoot
+  if (roots.temporaryRoot !== path.join(scratch, 'tmp') ||
+      roots.outputRoot !== path.join(scratch, 'output') ||
+      roots.cacheRoot !== path.join(scratch, 'cache')) {
+    throw new SupervisorIntegrationError('CHECKER_SCRATCH_BOUNDARY_INVALID', 'checker temporary, output, and cache roots must be exact direct scratch children')
+  }
+  for (const other of [roots.frozenCandidateRoot, expected.realTargetPath && fs.realpathSync.native(path.resolve(expected.realTargetPath))].filter(Boolean)) {
+    if (scratch === other || pathIsInside(scratch, other) || pathIsInside(other, scratch)) {
+      throw new SupervisorIntegrationError('CHECKER_SCRATCH_BOUNDARY_INVALID', 'checker scratch must be disjoint from the frozen exact version and real target')
+    }
+  }
+  if (expected.scratchRoot !== undefined) {
+    const trustedRoot = fs.realpathSync.native(path.resolve(expected.scratchRoot))
+    if (!pathIsInside(trustedRoot, scratch)) {
+      throw new SupervisorIntegrationError('CHECKER_SCRATCH_BOUNDARY_INVALID', 'checker scratch escapes the trusted activation-private root')
+    }
+  }
+  try { auditPrivatePermissions(scratch) } catch (error) {
+    throw new SupervisorIntegrationError('CHECKER_SCRATCH_BOUNDARY_INVALID', 'checker scratch is not private and owner-only', { cause: error.message })
+  }
+  return Object.freeze(roots)
+}
+
+function codexCheckerScratchProjection(record, canonicalTargetPath, workingDirectory, verifiedBoundary) {
+  if (!CHECKER_ROLES.has(record.logicalRole) || !record.checkerScratchBoundary) return []
+  const boundary = verifiedBoundary || record.checkerScratchBoundary
+  const frozenCandidateRoot = path.resolve(canonicalTargetPath)
+  const writableScratchRoot = path.resolve(workingDirectory)
+  if (path.resolve(boundary.frozenCandidateRoot) !== frozenCandidateRoot ||
+      path.resolve(boundary.writableScratchRoot) !== writableScratchRoot) {
+    throw new SupervisorIntegrationError(
+      'CHECKER_SCRATCH_BOUNDARY_INVALID',
+      'checker scratch projection differs from its authenticated launch roots',
+    )
+  }
+  return [
+    'AUTOPROMPT_CHECKER_SCRATCH_PROJECTION_V2',
+    `Checker filesystem projection: ${JSON.stringify({
+      schemaVersion: 2,
+      frozenCandidateRoot,
+      writableScratchRoot,
+      temporaryRoot: boundary.temporaryRoot,
+      outputRoot: boundary.outputRoot,
+      cacheRoot: boundary.cacheRoot,
+      currentVersionHash: record.candidateHash,
+    })}`,
+    'The frozen exact-version root is readable/executable and outside the writable sandbox. Never modify it.',
+    'Use only the writable scratch tmp, cache, and output roots for temporary files, databases, bytecode, generated files, and test output.',
+    'Execute the exact named acceptance commands and authoritative verifier when available; do not replace them with a weaker approximate check.',
+    'Redirect output destinations into writableScratchRoot while reading and executing the exact frozen version.',
+    'Scratch files are neither exact-version changes nor deliverables.',
+  ]
+}
+
 class CodexExecAdapter {
   constructor(options = {}) {
     if (!options.runner || typeof options.runner.run !== 'function') {
@@ -2758,6 +2880,8 @@ class CodexExecAdapter {
     this.providerSchemaRoot = options.providerSchemaRoot
       ? path.resolve(options.providerSchemaRoot)
       : null
+    this.checkerScratchVerifier = typeof options.checkerScratchVerifier === 'function'
+      ? options.checkerScratchVerifier : null
   }
 
   async launch(record) {
@@ -2769,9 +2893,15 @@ class CodexExecAdapter {
       )
     }
     const canonicalSchemaPath = path.resolve(this.outputSchemaResolver(record))
-    const canonicalSchemaBytes = this.providerSchemaRoot
-      ? fs.readFileSync(canonicalSchemaPath)
-      : null
+    const canonicalSchemaBytes = fs.readFileSync(canonicalSchemaPath)
+    let canonicalSchema
+    try { canonicalSchema = JSON.parse(canonicalSchemaBytes.toString('utf8')) } catch (error) {
+      throw new SupervisorIntegrationError(
+        'CANONICAL_OUTPUT_SCHEMA_INVALID',
+        'resolved canonical child output schema is not valid JSON',
+        { path: canonicalSchemaPath, cause: error.message },
+      )
+    }
     const schemaPath = this.providerSchemaRoot
       ? materializeCodexProviderEnvelopeSchema(this.providerSchemaRoot)
       : canonicalSchemaPath
@@ -2794,11 +2924,29 @@ class CodexExecAdapter {
         'external checker launch requires a real read-only, non-dispatch Codex policy',
       )
     }
+    let verifiedCheckerScratch = null
+    if (CHECKER_ROLES.has(record.logicalRole) && record.checkerScratchBoundary) {
+      if (!this.checkerScratchVerifier) {
+        throw new SupervisorIntegrationError('CHECKER_SCRATCH_BOUNDARY_INVALID', 'checker transport elevation lacks its runtime authority verifier')
+      }
+      verifiedCheckerScratch = this.checkerScratchVerifier(record)
+    }
+    const checkerScratchBoundary = verifiedCheckerScratch
+    const transportSandboxMode = checkerScratchBoundary ? 'workspace-write' : executionPolicy.sandboxMode
     const common = [
       '--json', '--output-schema', schemaPath, '--strict-config',
       '--disable', 'multi_agent', '--disable', 'multi_agent_v2',
-      '--sandbox', executionPolicy.sandboxMode,
+      '--sandbox', transportSandboxMode,
     ]
+    if (checkerScratchBoundary) {
+      common.push(
+        '--skip-git-repo-check',
+        '-c', 'sandbox_workspace_write.network_access=false',
+        '-c', 'sandbox_workspace_write.exclude_slash_tmp=true',
+        '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true',
+        '-c', 'sandbox_workspace_write.writable_roots=[]',
+      )
+    }
     if (record.assignment && record.assignment.model) common.push('-m', String(record.assignment.model))
     if (record.assignment && record.assignment.effort) {
       if (!['low', 'medium', 'high', 'xhigh', 'max'].includes(record.assignment.effort)) {
@@ -2831,7 +2979,7 @@ class CodexExecAdapter {
       : null
     const selectedProfile = CHECKER_ROLES.has(record.logicalRole) ? this.checkerProfile : this.profile
     const argv = record.continuationId
-      ? [...this.executableArgs, 'exec', 'resume', ...common, record.continuationId, '-']
+      ? [...this.executableArgs, 'exec', ...common, 'resume', record.continuationId, '-']
       : [...this.executableArgs, 'exec', ...common, '-p', selectedProfile, '-C', workingDirectory, '-']
     const providerTransport = this.providerSchemaRoot
       ? [
@@ -2846,6 +2994,12 @@ class CodexExecAdapter {
       record,
       record.canonicalTargetPath || this.targetPath,
       workingDirectory,
+    )
+    const checkerScratchProjection = codexCheckerScratchProjection(
+      record,
+      record.canonicalTargetPath || this.targetPath,
+      workingDirectory,
+      checkerScratchBoundary,
     )
     const workerCompletionBoundary = record.logicalRole === 'worker'
       ? [
@@ -2869,6 +3023,7 @@ class CodexExecAdapter {
       `Request pointer: ${JSON.stringify(record.dispatch.requestPointer)}`,
       ...workerCompletionBoundary,
       ...workspaceProjection,
+      ...checkerScratchProjection,
       '',
     ].join('\n')
     let sawStreamedOutput = false
@@ -2879,6 +3034,7 @@ class CodexExecAdapter {
     let streamError = null
     let streamedUsage = { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 }
     let terminalReceiptPersisted = false
+    let committedTerminalResult = null
     let firstProductSignalPersisted = false
     const assembledResult = (parsed, completionRequested, decodedOutput = null) => {
       const output = decodedOutput || parsed.output || {}
@@ -2898,6 +3054,19 @@ class CodexExecAdapter {
       if (!stopPromise && typeof this.runner.stop === 'function') {
         stopPromise = Promise.resolve(this.runner.stop({ reason, sessionId: record.sessionId }))
       }
+    }
+    const commitTerminal = (output, snapshot) => {
+      typedTerminal = output.outcome || output.code || output.reportType
+      committedTerminalResult = Object.freeze(assembledResult(snapshot, true, output))
+      if (typeof record.onTerminalResult === 'function') {
+        record.onTerminalResult(committedTerminalResult, {
+          rawOutputHash: rawOutputHash.copy().digest('hex'),
+          eventStreamHash: snapshot.eventStreamHash,
+          sessionId: record.continuationId || snapshot.sessionId,
+        })
+        terminalReceiptPersisted = true
+      }
+      stop(`typed terminal ${typedTerminal}`)
     }
     const onStdoutLine = line => {
       const normalizedLine = `${String(line).replace(/\r?\n$/, '')}\n`
@@ -3008,24 +3177,35 @@ class CodexExecAdapter {
           return
         }
       }
-      if (!typedTerminal && current.usage && typedChildOutputReady(currentOutput, record)) {
+      const schemaValidation = current.usage && currentOutput
+        ? validateJsonSchema(canonicalSchema, currentOutput) : { valid: false }
+      if (!typedTerminal && current.usage && schemaValidation.valid && typedChildOutputReady(currentOutput, record)) {
         const terminalSnapshot = streamAccumulator.snapshot()
-        typedTerminal = currentOutput.outcome || currentOutput.code || currentOutput.reportType
-        if (typeof record.onTerminalResult === 'function') {
-          try {
-            record.onTerminalResult(assembledResult(terminalSnapshot, true, currentOutput), {
-              rawOutputHash: rawOutputHash.copy().digest('hex'),
-              eventStreamHash: terminalSnapshot.eventStreamHash,
-              sessionId: record.continuationId || current.sessionId,
-            })
-            terminalReceiptPersisted = true
-          } catch (error) {
-            streamError = error
-            stop(error.code || 'TERMINAL_RECEIPT_FAILED')
-            return
-          }
+        try { commitTerminal(currentOutput, terminalSnapshot) } catch (error) {
+          streamError = error
+          stop(error.code || 'TERMINAL_RECEIPT_FAILED')
         }
-        stop(`typed terminal ${typedTerminal}`)
+        return
+      }
+      // A completed Codex turn is a hard transport boundary.  Waiting for the
+      // process to exit after a malformed structured result can deadlock when
+      // the CLI (or one of its descendants) stays alive.  Persist a canonical
+      // runtime failure and drain immediately; PRE_ROUTE retains its one
+      // correction opportunity, but its completed child is drained as well.
+      if (!typedTerminal && current.usage) {
+        const schemaInvalidCanEnterCorrection = Boolean(currentOutput) &&
+          (record.logicalRole === 'route-analyst' ||
+            (record.logicalRole === 'run-owner' && record.route === 'PRE_ROUTE'))
+        if (schemaInvalidCanEnterCorrection) {
+          stop('completed turn requires canonical correction')
+          return
+        }
+        const terminalSnapshot = streamAccumulator.snapshot()
+        const reconstructed = reconstructTypedExitZeroResult(record, terminalSnapshot)
+        try { commitTerminal(reconstructed, terminalSnapshot) } catch (error) {
+          streamError = error
+          stop(error.code || 'TERMINAL_RECEIPT_FAILED')
+        }
       }
     }
     const execution = await this.runner.run({
@@ -3068,8 +3248,13 @@ class CodexExecAdapter {
     if (!parsed.usage) {
       throw new SupervisorIntegrationError('CODEX_USAGE_INCOMPLETE', 'Codex child ended without all four usage categories')
     }
+    if (committedTerminalResult) return committedTerminalResult
     if (this.providerSchemaRoot) parsed.output = decodeCodexProviderEnvelope(parsed.output)
-    if (!typedChildOutputReady(parsed.output, record)) {
+    const finalSchemaValidation = validateJsonSchema(canonicalSchema, parsed.output)
+    const schemaInvalidCanEnterCorrection = record.logicalRole === 'route-analyst' ||
+      (record.logicalRole === 'run-owner' && record.route === 'PRE_ROUTE')
+    if ((!finalSchemaValidation.valid && !schemaInvalidCanEnterCorrection) ||
+        !typedChildOutputReady(parsed.output, record)) {
       parsed.output = reconstructTypedExitZeroResult(record, parsed)
     }
     const returned = assembledResult(parsed, Boolean(typedTerminal))
@@ -3638,7 +3823,7 @@ function reconcileExternalOperationTimeout(operation, operations) {
 function applyProductionRuntimeTransition(authority, payload = {}) {
   const { stateStore, capability, budgetController } = authority
   const { eventId, nextState, details = {} } = payload
-  if (eventId === 'ALL_WORK_JOINED') {
+  if (eventId === 'ALL_WORK_JOINED' || eventId === 'REPAIR_READY') {
     const candidateEvidenceId = 'frozen-candidate-evidence'
     const requiredVerdictIds = Array.isArray(details.requiredVerdictIds) && details.requiredVerdictIds.length
       ? [...details.requiredVerdictIds] : ['reviewer-verdict', 'tester-verdict']
@@ -3666,7 +3851,9 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
       })),
     })
     return stateStore.freezeCandidateForChecks({
-      capability, cause: 'freeze graph-bound exact version for independent checks',
+      capability, cause: eventId === 'REPAIR_READY'
+        ? 'freeze graph-bound repaired version for fresh independent checks'
+        : 'freeze graph-bound exact version for independent checks',
       candidateHash: details.candidateHash, environmentHash: details.environmentHash,
       dependencyHash: details.dependencyHash, evidenceGraph: graph, requiredVerdictIds,
     })
@@ -5394,7 +5581,7 @@ class CodexSupervisorRuntime {
     return completedContext
   }
 
-  _readTerminalReceipt(saved) {
+  _readTerminalReceipt(saved, runtimeCandidateHash) {
     if (!this.record || typeof this.record.resolve !== 'function') return null
     const relative = this._terminalReceiptLocation(saved.id, saved.workItemId)
     const absolute = this.record.resolve(relative)
@@ -5415,6 +5602,10 @@ class CodexSupervisorRuntime {
         receipt.continuationId !== binding.continuationId ||
         receipt.requestEnvelopeHash !== this.requestPointer.hash ||
         receipt.resultHash !== hashText(JSON.stringify(receipt.result)) ||
+        (CHECKER_ROLES.has(saved.logicalRole) &&
+          (saved.inspectedCandidateHash !== receipt.result.candidateHash ||
+           saved.inspectedCandidateHash !== receipt.result.currentVersionHash ||
+           receipt.candidateHash !== (runtimeCandidateHash || null))) ||
         (!CHECKER_ROLES.has(saved.logicalRole) &&
           receipt.candidateHash !== (receipt.result && receipt.result.candidateHash || null)) ||
         (saved.logicalRole !== 'route-analyst' &&
@@ -5430,7 +5621,7 @@ class CodexSupervisorRuntime {
       logicalRole: saved.logicalRole,
       physicalRole: receipt.physicalRole,
       candidateHash: CHECKER_ROLES.has(saved.logicalRole)
-        ? receipt.result && receipt.result.candidateHash || null
+        ? saved.inspectedCandidateHash
         : receipt.candidateHash,
     }, receipt.result, this.options.runId, this.requestPointer.hash)
     if (saved.logicalRole !== 'route-analyst') {
@@ -5485,7 +5676,7 @@ class CodexSupervisorRuntime {
       }
       const checker = CHECKER_ROLES.has(saved.logicalRole)
       if ((stage === 'work' && checker) || (stage === 'check' && !checker)) continue
-      const committed = this._readTerminalReceipt(saved)
+      const committed = this._readTerminalReceipt(saved, candidateHash)
       const retainedParent = !checker && (liveParentIds.has(leaseId) || committed && committed.retainLease === true)
       if (committed) {
         if (saved.logicalRole !== 'route-analyst') {
@@ -5577,6 +5768,18 @@ class CodexSupervisorRuntime {
         requestEnvelopeHash: this.requestPointer.hash,
         logicalRoleId: saved.logicalRole,
       })
+      const resumedWorkerMatch = /^work-(\d+)$/u.exec(String(saved.workItemId || ''))
+      const resumedWorkerOwner = resumedWorkerMatch ? `worker-${resumedWorkerMatch[1]}` : null
+      const resumedExecutionOwnership = executionMutableResourceOwnership(
+        decision,
+        this.route,
+        Math.max(1, Number(decision.usefulWorkerCount || 1)),
+      )
+      const resumedWorkerOwnership = resumedWorkerOwner
+        ? resumedExecutionOwnership
+            .filter(item => item && item.owner === resumedWorkerOwner)
+            .map(item => ({ ...item }))
+        : []
       const request = routeAnalyst ? {
         workItemId: 'route-analyst',
         logicalRole: 'route-analyst',
@@ -5623,7 +5826,7 @@ class CodexSupervisorRuntime {
               : `Resume the dependency-ordered roadmap for: ${decision.requestedResult}`,
         ownership: saved.logicalRole === 'roadmap-author'
           ? [{ kind: 'output', identity: 'plan/ROADMAP.md', owner: saved.workItemId }]
-          : decision.likelyAreas && decision.likelyAreas.length ? decision.likelyAreas : ['workspace'],
+          : ['workspace'],
         success: decision.successChecklist || [],
         checks: replayChecks,
       } : {
@@ -5632,14 +5835,31 @@ class CodexSupervisorRuntime {
         parent: parentLogicalRole,
         purpose: saved.purpose || 'work',
         assignment: decision.workerResponsibilities && decision.workerResponsibilities[index] || decision.requestedResult,
-        ownership: decision.likelyAreas && decision.likelyAreas.length ? decision.likelyAreas : ['workspace'],
+        ownership: resumedWorkerOwnership.length ? resumedWorkerOwnership : ['workspace'],
         success: decision.successChecklist || [],
         checks: replayChecks,
         retainLease: retainedParent,
       }
+      const replayRequest = replayedAssignment ? replayRequestFromPersistedAssignment(replayedAssignment) : null
+      if (replayRequest && resumedWorkerOwner) {
+        const authorityTuple = item => stableStringify({
+          kind: item && item.kind,
+          identity: item && item.identity,
+          owner: item && item.owner,
+          ownershipMode: item && (item.ownershipMode || item.ownership_mode || 'single-owner'),
+        })
+        const expectedAuthority = resumedWorkerOwnership.map(authorityTuple).sort()
+        const replayedAuthority = replayRequest.ownership.map(authorityTuple).sort()
+        if (stableStringify(expectedAuthority) !== stableStringify(replayedAuthority)) {
+          throw new SupervisorIntegrationError(
+            'ASSIGNMENT_REPLAY_INVALID',
+            `persisted worker assignment authority differs from the current immutable route decision: ${saved.workItemId}`,
+          )
+        }
+      }
       results[saved.workItemId] = await this._launchThroughScheduler(this.scheduler, {
         ...request,
-        ...(replayedAssignment ? replayRequestFromPersistedAssignment(replayedAssignment) : {}),
+        ...(replayRequest || {}),
         route: routeAnalyst ? 'PRE_ROUTE' : this.route,
         parent: parentLogicalRole,
         caller,
@@ -6127,7 +6347,11 @@ class CodexSupervisorRuntime {
       const sandboxPlan = planCheckerSandboxes(request.checkers || [{
         id: checkerId,
         commands: request.commands || [],
-        writeProducing: request.writeProducing,
+        // Every checker may need temp/cache/database/output writes even when
+        // the declared acceptance command appears read-only. Always isolate
+        // the exact candidate and provide scratch; never discover this need
+        // only after the checker has started.
+        writeProducing: true,
         writeResources: request.writeResources ?? request.write_resources,
         workspace: this.options.targetPath,
         isolation: request.isolation,
@@ -6179,6 +6403,38 @@ class CodexSupervisorRuntime {
           : this.options.checkerSnapshotFactory
         const materialized = materializeCheckerSandboxes(sandboxPlan, snapshotFactory)
         sandboxAssignment = materialized.find(item => item.checkerId === checkerId) || materialized[0]
+      }
+      if (!sandboxAssignment || !sandboxAssignment.snapshotPath || typeof this.options.checkerScratchFactory !== 'function') {
+        throw new SupervisorIntegrationError(
+          'CHECKER_SCRATCH_UNAVAILABLE',
+          'every checker requires both its frozen exact-version snapshot and authenticated writable scratch',
+        )
+      }
+      const adoptedScratchRoots = adoptedLease
+        ? (request.adoptedSandboxResources || []).flatMap(resource => {
+            if (!resource || String(resource.kind || '').toLowerCase() !== 'temporary') return []
+            const encoded = String(resource.physicalId || resource.id || '').replace(/^temporary:/iu, '')
+            return encoded ? [encoded] : []
+          })
+        : []
+      const checkerScratchBoundary = this.options.checkerScratchFactory(
+        checkerId,
+        sandboxAssignment.snapshotPath,
+        { candidateHash: request.candidateHash, adoptedScratchRoots },
+      )
+      sandboxAssignment = {
+        ...sandboxAssignment,
+        checkerScratchBoundary,
+        schedulerResources: [
+          ...(sandboxAssignment.schedulerResources || []),
+          {
+            id: `temporary:${checkerScratchBoundary.writableScratchRoot}`,
+            kind: 'temporary',
+            physicalId: checkerScratchBoundary.writableScratchRoot,
+            mode: 'exclusive',
+            isolationId: checkerId,
+          },
+        ],
       }
       // The sandbox planner may express the concrete snapshot both as the
       // mapped source workspace and as its explicit snapshot ownership.  They
@@ -6244,7 +6500,9 @@ class CodexSupervisorRuntime {
       schedulerRequest.resources = derivedResources
     }
     let workerWorkspace = null
-    let workingDirectory = targetWorkingDirectory
+    let workingDirectory = sandboxAssignment && sandboxAssignment.checkerScratchBoundary
+      ? path.resolve(sandboxAssignment.checkerScratchBoundary.writableScratchRoot)
+      : targetWorkingDirectory
     if (TARGET_MUTATOR_ROLES.has(policy.child) && canonicalAssignment && this.options.mutationEnforcer) {
       workerWorkspace = await this.options.workerWorkspaceFactory({
         activation: this.activation,
@@ -6276,9 +6534,26 @@ class CodexSupervisorRuntime {
           this.options.baseEnvironment || process.env,
         )
       : this.options.baseEnvironment || process.env
+    const checkerEnvironment = sandboxAssignment && sandboxAssignment.checkerScratchBoundary
+      ? {
+          ...launchBaseEnvironment,
+          TMPDIR: sandboxAssignment.checkerScratchBoundary.temporaryRoot,
+          TMP: sandboxAssignment.checkerScratchBoundary.temporaryRoot,
+          TEMP: sandboxAssignment.checkerScratchBoundary.temporaryRoot,
+          SQLITE_TMPDIR: sandboxAssignment.checkerScratchBoundary.temporaryRoot,
+          XDG_CACHE_HOME: sandboxAssignment.checkerScratchBoundary.cacheRoot,
+          PYTHONPYCACHEPREFIX: sandboxAssignment.checkerScratchBoundary.cacheRoot,
+          PYTHONDONTWRITEBYTECODE: '1',
+          AUTOPROMPT_CHECKER_CANDIDATE_ROOT: sandboxAssignment.checkerScratchBoundary.frozenCandidateRoot,
+          AUTOPROMPT_CHECKER_SCRATCH_ROOT: sandboxAssignment.checkerScratchBoundary.writableScratchRoot,
+          AUTOPROMPT_CHECKER_OUTPUT_ROOT: sandboxAssignment.checkerScratchBoundary.outputRoot,
+        }
+      : launchBaseEnvironment
+    const safetyEnvironmentTarget = sandboxAssignment && sandboxAssignment.checkerScratchBoundary
+      ? targetWorkingDirectory : workingDirectory
     const safetyBoundary = ensureSafeEnvironment(this.safeEnvFactory(
-      workingDirectory,
-      launchBaseEnvironment,
+      safetyEnvironmentTarget,
+      checkerEnvironment,
       {
         configIsolationPath: this.options.configIsolationPath,
         ghConfigDir: this.options.ghConfigDir,
@@ -6287,7 +6562,9 @@ class CodexSupervisorRuntime {
       },
     ))
     const env = safetyBoundary.environment
-    const environmentHash = hashEnvironment(env)
+    const environmentHash = CHECKER_ROLES.has(policy.child)
+      ? hashCheckerEnvironment(env)
+      : hashEnvironment(env)
     const evidenceBinding = CHECKER_ROLES.has(policy.child)
       ? canonicalEvidenceBinding({
           missionHash: this.activation.missionHash,
@@ -6592,6 +6869,7 @@ class CodexSupervisorRuntime {
       profileLimits: this.profileLimits,
       checkerPolicy,
       sandboxAssignment,
+      checkerScratchBoundary: sandboxAssignment && sandboxAssignment.checkerScratchBoundary || null,
       workerWorkspace: workerWorkspace ? Object.freeze({
         workspaceId: workerWorkspace.workspaceId,
         binding: workerWorkspace.binding,
@@ -6805,6 +7083,9 @@ class CodexSupervisorRuntime {
     const realTargetBefore = enforceRealTargetDenial
       ? workspaceFileSnapshot(this.options.targetPath, this.options.gitEnvironment(this.options.targetPath))
       : null
+    const checkerSnapshotBefore = CHECKER_ROLES.has(policy.child)
+      ? hashWorkspaceCandidate(targetWorkingDirectory, this.options.gitEnvironment(targetWorkingDirectory))
+      : null
     try {
       if (TARGET_MUTATOR_ROLES.has(policy.child) && canonicalAssignment && this.options.mutationEnforcer) {
         if (!this.record || typeof this.record.writePreMutationBaseline !== 'function' ||
@@ -6881,6 +7162,16 @@ class CodexSupervisorRuntime {
       const result = await this._withinFirstProductSignalDeadline(
         () => this.options.launcher(launchRecord), scheduler, request,
       )
+      if (checkerSnapshotBefore && hashWorkspaceCandidate(
+        targetWorkingDirectory,
+        this.options.gitEnvironment(targetWorkingDirectory),
+      ) !== checkerSnapshotBefore) {
+        throw new SupervisorIntegrationError(
+          'CHECKER_SNAPSHOT_MUTATED',
+          'checker changed the frozen exact-version snapshot',
+          { expectedCandidateHash: checkerSnapshotBefore },
+        )
+      }
       if (externalOperation && !externalWriteBoundaryReceipt) {
         throw new SupervisorIntegrationError(
           'EXTERNAL_WRITE_BOUNDARY_REQUIRED',
@@ -7116,6 +7407,22 @@ class CodexSupervisorRuntime {
       }
       return returned
     } catch (error) {
+      if (checkerSnapshotBefore) {
+        try {
+          const after = hashWorkspaceCandidate(targetWorkingDirectory, this.options.gitEnvironment(targetWorkingDirectory))
+          if (after !== checkerSnapshotBefore) {
+            const drift = new SupervisorIntegrationError(
+              'CHECKER_SNAPSHOT_MUTATED',
+              'checker changed the frozen exact-version snapshot before failing',
+              { expectedCandidateHash: checkerSnapshotBefore, actualCandidateHash: after, priorError: serializeError(error) },
+            )
+            error = drift
+          }
+        } catch (snapshotError) {
+          if (snapshotError.code === 'CHECKER_SNAPSHOT_MUTATED') error = snapshotError
+          else error.snapshotVerificationFailure = serializeError(snapshotError)
+        }
+      }
       if (error && (typeof error === 'object' || typeof error === 'function') && Object.isExtensible(error)) {
         Object.defineProperty(error, STREAMED_ROUTE_EVENT_COUNT, { value: streamedRouteEventCount, configurable: true })
       }
@@ -7323,6 +7630,12 @@ class CodexSupervisorRuntime {
       })
       return 'BLOCKED'
     }
+    if (outcome === 'FAILED' && ['PREPARE_WORK', 'CHECK_WORK', 'REPAIRING'].includes(state)) {
+      await this._runtimeTransition('CHECK_FAILED_FINAL', 'RELEASING_LOCK', {
+        errorCode: error && error.code || 'FAILED',
+      })
+      return 'FAILED'
+    }
     if (['RUN_WORK', 'REPAIRING'].includes(state)) {
       await this._runtimeTransition('WORKER_CONTEXT_LOST', 'WORKER_CONTEXT_LOST', {
         errorCode: error && error.code || 'FAILED',
@@ -7498,12 +7811,22 @@ function replayRequestFromPersistedAssignment(assignment) {
   if (!assignment || assignment.reportType !== 'assignment') {
     throw new SupervisorIntegrationError('ASSIGNMENT_REPLAY_INVALID', 'canonical assignment is required for fresh replay')
   }
+  const hasWriteResources = assignment.resources.some(resource => resource && resource.access === 'write')
+  const resources = assignment.resources
+    .filter(resource => !hasWriteResources || resource.access === 'write')
+    .map(resource => Object.freeze({
+    kind: resource.kind,
+    identity: resource.identity,
+    owner: resource.owner,
+    ownershipMode: resource.ownershipMode || 'single-owner',
+    }))
   return Object.freeze({
     assignment: assignment.requestedResult,
     successChecklist: assignment.successChecklist.map(item => item.description),
     success: assignment.successChecklist.map(item => item.description),
     findingIds: [...assignment.findingIds],
-    ownership: assignment.resources.map(resource => resource.identity),
+    ownership: resources,
+    manifests: resources,
     replayedAssignmentPath: `work/assignments/${hashText(assignment.assignmentId)}.json`,
   })
 }
@@ -8232,6 +8555,14 @@ function canonicalAssignmentResources(input) {
   }))
   const rows = ownership.map(rawIdentity => {
     const identity = String(rawIdentity && rawIdentity.identity || rawIdentity)
+    if (typeof rawIdentity === 'string' && identity !== 'workspace' && /\s/u.test(identity) &&
+        !path.isAbsolute(identity) && !/^\.{1,2}[\\/]/u.test(identity)) {
+      throw new SupervisorIntegrationError(
+        'OWNERSHIP_RESOURCE_INVALID',
+        'untyped descriptive prose cannot become canonical filesystem or service authority',
+        { identity },
+      )
+    }
     const declared = manifests.find(item => item && String(item.identity || '') === identity) ||
       (rawIdentity && typeof rawIdentity === 'object' ? rawIdentity : null)
     let kind = String(declared && declared.kind || '').toLowerCase()
@@ -8246,11 +8577,16 @@ function canonicalAssignmentResources(input) {
     const authorizedOwners = new Set([
       input.request.workItemId, input.request.repairOf, input.request.executorKey, input.request.equivalenceKey,
     ].filter(Boolean).map(String))
-    const canonicalWorkerOwner = /^work-(\d+)$/.exec(String(input.request.workItemId || ''))
-    if (canonicalWorkerOwner) {
-      authorizedOwners.add(`worker-${canonicalWorkerOwner[1]}`)
-      authorizedOwners.add(`implementation-worker-${canonicalWorkerOwner[1]}`)
-      authorizedOwners.add(`ap-worker-${canonicalWorkerOwner[1]}`)
+    const canonicalWorkerOwners = [
+      input.request.workItemId, input.request.repairOf, input.request.executorKey,
+    ].flatMap(value => {
+      const match = /^work-(\d+)(?:-repair-\d+)?$/u.exec(String(value || ''))
+      return match ? [match[1]] : []
+    })
+    for (const workerNumber of canonicalWorkerOwners) {
+      authorizedOwners.add(`worker-${workerNumber}`)
+      authorizedOwners.add(`implementation-worker-${workerNumber}`)
+      authorizedOwners.add(`ap-worker-${workerNumber}`)
     }
     if (!input.readOnly && !authorizedOwners.has(owner)) {
       throw new SupervisorIntegrationError(
@@ -8555,10 +8891,28 @@ function validateCanonicalChildResult(record, result, runId, requestEnvelopeHash
   }
   if (record.logicalRole === 'route-analyst' || record.logicalRole === 'run-owner') return result
   if (CHECKER_ROLES.has(record.logicalRole)) {
-    if (result.schemaVersion !== '2.0.0' || !CANONICAL_CHECKER_CODES.has(result.code) ||
-        result.runId !== runId || result.requestEnvelopeHash !== requestEnvelopeHash ||
-        result.currentVersionHash !== record.candidateHash) {
-      throw new SupervisorIntegrationError('CHECK_REPORT_INVALID', 'checker result is not bound to the admitted run, request, and exact version')
+    const expected = {
+      schemaVersion: '2.0.0', runId, requestEnvelopeHash,
+      currentVersionHash: record.candidateHash,
+    }
+    const actual = {
+      schemaVersion: result.schemaVersion, code: result.code, runId: result.runId,
+      requestEnvelopeHash: result.requestEnvelopeHash,
+      currentVersionHash: result.currentVersionHash,
+    }
+    const mismatches = [
+      ...(actual.schemaVersion !== expected.schemaVersion ? ['schemaVersion'] : []),
+      ...(!CANONICAL_CHECKER_CODES.has(actual.code) ? ['code'] : []),
+      ...(actual.runId !== expected.runId ? ['runId'] : []),
+      ...(actual.requestEnvelopeHash !== expected.requestEnvelopeHash ? ['requestEnvelopeHash'] : []),
+      ...(actual.currentVersionHash !== expected.currentVersionHash ? ['currentVersionHash'] : []),
+    ]
+    if (mismatches.length) {
+      throw new SupervisorIntegrationError(
+        'CHECK_REPORT_INVALID',
+        'checker result is not bound to the admitted run, request, and exact version',
+        { mismatches, expected, actual },
+      )
     }
     return result
   }
@@ -9044,6 +9398,51 @@ function executionMutableResourceOwnership(decision, route, workerCount) {
   })
 }
 
+function decisionReadOnlyOwnership(decision, targetPath) {
+  // Some control-plane admission tests intentionally construct the executor
+  // before a physical target is bound.  Descriptive route hints cannot become
+  // authority in that state, so retain the explicit workspace sentinel.
+  if (typeof targetPath !== 'string' || !targetPath.trim()) return ['workspace']
+  const targetRoot = path.resolve(targetPath)
+  const typed = Array.isArray(decision && decision.mutableResourceOwnership)
+    ? decision.mutableResourceOwnership : []
+  const candidates = typed.filter(resource => {
+    if (!resource || !['file', 'directory', 'evidence-root'].includes(String(resource.kind || '').toLowerCase())) return false
+    const absolute = resolveOwnedResourcePath(targetRoot, resource)
+    if (!absolute || !fs.existsSync(absolute)) return false
+    const stat = fs.lstatSync(absolute)
+    return !stat.isSymbolicLink() && (stat.isFile() || stat.isDirectory())
+  }).map(resource => ({ ...resource }))
+  const exactLikelyAreaTokens = (Array.isArray(decision && decision.likelyAreas) ? decision.likelyAreas : [])
+    .flatMap(value => typeof value === 'string' ? value.split(/[;,]/u) : [])
+    .map(value => value.trim()).filter(Boolean)
+  for (const likelyArea of exactLikelyAreaTokens) {
+    if (!(path.isAbsolute(likelyArea) || /^\.{1,2}[\\/]/u.test(likelyArea)) || /\s/u.test(likelyArea)) continue
+    let normalizedArea = likelyArea.replace(/\\/g, '/')
+    if (/[*?[]/u.test(normalizedArea)) {
+      const wildcardIndex = normalizedArea.search(/[*?[]/u)
+      const slashIndex = normalizedArea.lastIndexOf('/', wildcardIndex)
+      if (slashIndex < 1) continue
+      normalizedArea = normalizedArea.slice(0, slashIndex)
+    }
+    const absolute = path.isAbsolute(normalizedArea)
+      ? path.resolve(normalizedArea)
+      : path.resolve(targetRoot, ...normalizedArea.split('/'))
+    if (absolute !== targetRoot && !absolute.startsWith(`${targetRoot}${path.sep}`)) continue
+    if (!fs.existsSync(absolute)) continue
+    const stat = fs.lstatSync(absolute)
+    if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) continue
+    if (candidates.some(resource => resolveOwnedResourcePath(targetRoot, resource) === absolute)) continue
+    candidates.push({
+      kind: stat.isDirectory() ? 'directory' : 'file',
+      identity: normalizedArea,
+      owner: 'read-only-planning',
+      ownershipMode: 'single-owner',
+    })
+  }
+  return candidates.length ? candidates : ['workspace']
+}
+
 function createDefaultRouteExecutor(options) {
   return async ({ route, decision, launch, completeRetainedLease, resumeAdoptedLaunches, resumeState }) => {
     if (typeof options.verifyL1RequestPointer === 'function') options.verifyL1RequestPointer()
@@ -9108,6 +9507,15 @@ function createDefaultRouteExecutor(options) {
     const likelyAreas = decision.likelyAreas || []
     const workerCount = Math.max(1, Number(decision.usefulWorkerCount || 1))
     const executionOwnership = executionMutableResourceOwnership(decision, route, workerCount)
+    // likelyAreas is descriptive routing prose, not resource authority. Only
+    // the typed mutable ownership contract may become a child filesystem
+    // identity; absent that contract, use the explicit workspace sentinel.
+    const admittedReadOwnership = decisionReadOnlyOwnership(decision, options.targetPath)
+    const withDescriptiveLikelyAreas = evidence => {
+      const base = evidence && typeof evidence === 'object' && !Array.isArray(evidence) ? evidence : {}
+      return likelyAreas.length ? { ...base, descriptiveLikelyAreas: [...likelyAreas] }
+        : Object.keys(base).length ? base : null
+    }
     const capturedDomainContracts = Array.isArray(decision.capturedDomainContracts)
       ? decision.capturedDomainContracts : []
     const capturedDomainAdmission = validateCapturedDomainContracts(
@@ -9173,12 +9581,12 @@ function createDefaultRouteExecutor(options) {
         purpose: 'verification',
         assignment: 'Execute the authoritative fixture-provenance and mutation-replay validation. Return its bound FIXTURE_PROVENANCE outcome; do not build or write the target.',
         candidateHash: prebuildCandidateHash, oracle,
-        ownership: likelyAreas.length ? likelyAreas : ['workspace'],
+        ownership: admittedReadOwnership,
         success: ['Executable fixture provenance and mutation replay remain RED until the pre-build validation passes.'],
         checks: ['Read and execute the declared pre-build validation only; do not edit the target.'],
         isolation: 'snapshot', writeProducing: false,
         manifests: executionOwnership, bounded: true,
-        fetchedEvidence: { capturedDomainAdmission: capturedDomainPreWork },
+        fetchedEvidence: withDescriptiveLikelyAreas({ capturedDomainAdmission: capturedDomainPreWork }),
         harnessAttestation: options.harnessAttestation(prebuildCandidateHash, oracle),
         nextReadyAfter: route === 'ROADMAP' ? ['roadmap-author'] : ['work-1'],
       })
@@ -9211,7 +9619,10 @@ function createDefaultRouteExecutor(options) {
           ...(fixturePrebuildEvidence ? { fixturePrebuildValidation: fixturePrebuildEvidence } : {}),
         })
       : null
-    let depthGateOutcome = await executePreProductionRuntimeGates({ recipe, launch, likelyAreas })
+    let depthGateOutcome = await executePreProductionRuntimeGates({
+      recipe, launch, ownership: admittedReadOwnership,
+      fetchedEvidence: withDescriptiveLikelyAreas(null),
+    })
     const resumeAtChecking = resumeState && resumeState.resumeState === 'CHECK_WORK'
     const resumeInWork = resumeState && resumeState.resumeState === 'RUN_WORK'
     const completedBeforeResume = new Set(resumeState && resumeState.completedWorkIds || [])
@@ -9249,7 +9660,7 @@ function createDefaultRouteExecutor(options) {
         purpose: 'planning', assignment: `Create the dependency-ordered roadmap for: ${decision.requestedResult}. Return each concrete ordered step in behaviorChanged.`,
         ownership: [{ kind: 'output', identity: 'plan/ROADMAP.md', owner: 'roadmap-author' }], success: successes, checks,
         manifests: executionOwnership,
-        fetchedEvidence: capturedDomainWorkEvidence,
+        fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
         nextReadyAfter: scoutCount > 0
           ? Array.from({ length: scoutCount }, (_, index) => `roadmap-scout-${index + 1}`)
           : ['roadmap-plan-check'],
@@ -9282,10 +9693,10 @@ function createDefaultRouteExecutor(options) {
         const result = await launch({
           workItemId, logicalRole: 'scout', parent: 'run-owner', purpose: 'scouting',
           assignment: `Resolve only this named ROADMAP unknown: ${namedUnknowns[index]}. Return the concrete correction in behaviorChanged.`,
-          ownership: likelyAreas.length ? likelyAreas : ['workspace'],
+          ownership: admittedReadOwnership,
           success: [`Return evidence for the named unknown: ${namedUnknowns[index]}`],
           checks: ['Read/list/search only; do not edit the target or the roadmap.'],
-          fetchedEvidence: capturedDomainWorkEvidence,
+          fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
           nextReadyAfter: index === scoutCount - 1 ? ['roadmap-author-revise'] : [],
         })
         scoutResults.set(workItemId, result)
@@ -9333,6 +9744,7 @@ function createDefaultRouteExecutor(options) {
           fetchedEvidence: {
             scoutCorrections: concreteScoutCorrections,
             ...(capturedDomainWorkEvidence || {}),
+            ...(withDescriptiveLikelyAreas(null) || {}),
           },
           dependencies: scoutWorkIds,
           nextReadyAfter: ['roadmap-plan-check'],
@@ -9363,14 +9775,16 @@ function createDefaultRouteExecutor(options) {
         writeProducing: true,
         roadmapSlice: planPointer,
         evidencePointers: scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
-        fetchedEvidence: roadmapResult && Array.isArray(roadmapResult.scoutCorrections)
-          ? { scoutCorrections: roadmapResult.scoutCorrections } : null,
+        fetchedEvidence: withDescriptiveLikelyAreas(
+          roadmapResult && Array.isArray(roadmapResult.scoutCorrections)
+            ? { scoutCorrections: roadmapResult.scoutCorrections } : null,
+        ),
         manifests: executionOwnership,
         harnessAttestation: options.harnessAttestation(planningCandidate, 'roadmap-plan-oracle'),
         nextReadyAfter: ['mission-coordination'],
       })
       if (planCheck.code && planCheck.code !== 'PASS') {
-        if (planCheck.code === 'CHECK_INCONCLUSIVE') {
+        if (['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(planCheck.code)) {
           return { outcome: 'BLOCKED', terminalEnvelope: planCheck }
         }
         let planCheckEvidence
@@ -9397,6 +9811,7 @@ function createDefaultRouteExecutor(options) {
           fetchedEvidence: {
             scoutCorrections: roadmapResult && roadmapResult.scoutCorrections || [],
             ...(capturedDomainWorkEvidence || {}),
+            ...(withDescriptiveLikelyAreas(null) || {}),
           },
           evidencePointers: [
             ...scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
@@ -9424,7 +9839,7 @@ function createDefaultRouteExecutor(options) {
         })
         if (recheck.code && recheck.code !== 'PASS') {
           return {
-            outcome: recheck.code === 'CHECK_INCONCLUSIVE' ? 'BLOCKED' : 'FAILED',
+            outcome: ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(recheck.code) ? 'BLOCKED' : 'FAILED',
             terminalEnvelope: recheck,
           }
         }
@@ -9459,8 +9874,9 @@ function createDefaultRouteExecutor(options) {
         workItemId: 'mission-coordination', logicalRole: 'mission-coordinator', parent: 'run-owner',
         purpose: 'planning', retainLease: true,
         assignment: 'Own dependency ordering and integration for the accepted roadmap.',
-        ownership: likelyAreas.length ? likelyAreas : ['workspace'], success: successes, checks,
+        ownership: admittedReadOwnership, success: successes, checks,
         roadmapSlice: planPointer, manifests: executionOwnership,
+        fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
         nextReadyAfter: workerCount >= 2 ? ['roadmap-work-group'] : ['work-1'],
       })
       retainedCoordinator = coordinator.retainedLease
@@ -9490,8 +9906,9 @@ function createDefaultRouteExecutor(options) {
           parentLease: retainedCoordinator.schedulerLease, purpose: 'planning', retainLease: true,
           assignment: decision.workerOwnershipReason ||
             'Admit the accepted ROADMAP work group with disjoint worker ownership.',
-          ownership: workerOwnership.flat(), success: successes, checks,
+          ownership: admittedReadOwnership, success: successes, checks,
           roadmapSlice: planPointer, manifests: executionOwnership,
+          fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
           workGroupAdmission: {
             route: 'ROADMAP',
             parentRoleId: 'mission-coordinator',
@@ -9571,10 +9988,10 @@ function createDefaultRouteExecutor(options) {
             : retainedCoordinator && retainedCoordinator.schedulerLease,
           purpose: 'work', assignment: responsibility || decision.requestedResult,
           routeDecisionHash: hashText(stableStringify(decision)),
-          ownership: namedOwnership.length ? namedOwnership : likelyAreas.length ? likelyAreas : ['workspace'],
+          ownership: namedOwnership.length ? namedOwnership : ['workspace'],
           success: successes, checks,
           roadmapSlice: planPointer, manifests: executionOwnership,
-          fetchedEvidence: capturedDomainWorkEvidence,
+          fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
           deferPromotion: Boolean(doneRetryBoundary),
           difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
           risk: (decision.risks || []).length ? 'high' : 'ordinary',
@@ -9590,7 +10007,8 @@ function createDefaultRouteExecutor(options) {
                 runtimeGatePlan: { ...recipe.runtimeGatePlan, triggers: liveTriggers },
               },
               launch,
-              likelyAreas,
+              ownership: admittedReadOwnership,
+              fetchedEvidence: withDescriptiveLikelyAreas(null),
             })
           }
         }
@@ -9614,9 +10032,10 @@ function createDefaultRouteExecutor(options) {
                 ? retainedManager.schedulerLease
                 : retainedCoordinator && retainedCoordinator.schedulerLease,
               purpose: 'work', assignment: part.assignment,
-              ownership: namedOwnership.length ? namedOwnership : likelyAreas.length ? likelyAreas : ['workspace'],
+              ownership: namedOwnership.length ? namedOwnership : ['workspace'],
               success: successes, checks, roadmapSlice: planPointer,
-              manifests: executionOwnership, fetchedEvidence: capturedDomainWorkEvidence,
+              manifests: executionOwnership,
+              fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
               difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
               risk: (decision.risks || []).length ? 'high' : 'ordinary', nextReadyAfter: [],
             })
@@ -9674,7 +10093,7 @@ function createDefaultRouteExecutor(options) {
         )
       }
     }
-    const candidateHash = deferredPromotion && deferredPromotion.candidateHash ||
+    let candidateHash = deferredPromotion && deferredPromotion.candidateHash ||
       resumeState && resumeState.candidateHash ||
       hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
     const dependencyHash = hashText(stableStringify({
@@ -9687,10 +10106,7 @@ function createDefaultRouteExecutor(options) {
     const checkerCount = checking.checkerCount
     const requiredVerdictIds = checkerCount === 1
       ? ['reviewer-verdict'] : ['reviewer-verdict', 'tester-verdict']
-    if (!resumeAtChecking) await options.transition('ALL_WORK_JOINED', 'CHECK_WORK', {
-      candidateHash,
-      dependencyHash,
-      environmentHash,
+    const checkerFreezeBinding = {
       missionHash: options.missionHash,
       planHash: planPointer && planPointer.sha256 || hashText(stableStringify(decision)),
       oracleHash: hashText(stableStringify(checks)),
@@ -9699,6 +10115,9 @@ function createDefaultRouteExecutor(options) {
       })),
       checkerCount,
       requiredVerdictIds,
+    }
+    if (!resumeAtChecking) await options.transition('ALL_WORK_JOINED', 'CHECK_WORK', {
+      ...checkerFreezeBinding, candidateHash, dependencyHash, environmentHash,
     })
     if (resumeAtChecking && deferredPromotion && deferredPromotion.status === 'PROMOTED') {
       const accepted = deferredPromotion.acceptedJoin
@@ -9737,7 +10156,7 @@ function createDefaultRouteExecutor(options) {
       }
     }
     const usableCandidatePath = deferredPromotion && deferredPromotion.workspacePath || options.targetPath
-    const usableDeliverables = changedDeliverables(usableCandidatePath, options.gitEnvironment(usableCandidatePath))
+    let usableDeliverables = changedDeliverables(usableCandidatePath, options.gitEnvironment(usableCandidatePath))
     let finalResponse = null
     if (readOnlyRequestedEffect(decision)) {
       for (const workItemId of requiredWorkIds) {
@@ -9776,17 +10195,28 @@ function createDefaultRouteExecutor(options) {
     const independentVerdicts = []
     const finalFindings = []
     const regressionOutcomes = []
-    const capturedDomainOutcomes = fixturePrebuildOutcome ? [fixturePrebuildOutcome] : []
+    const capturedDomainOutcomes = []
     const checkerDomainContracts = fixturePrebuildOutcome
       ? capturedDomainContracts.filter(contract => contract.kind !== 'FIXTURE_PROVENANCE')
       : capturedDomainContracts
+    let checkerRepairAttempt = 0
+    checkerAttempts: while (true) {
+      checkHashes.length = 0
+      checkerEvidenceConsumptions.length = 0
+      independentVerdicts.length = 0
+      finalFindings.length = 0
+      regressionOutcomes.length = 0
+      capturedDomainOutcomes.length = 0
+      if (fixturePrebuildOutcome) capturedDomainOutcomes.push(fixturePrebuildOutcome)
     try {
       for (let index = 0; index < checkerCount; index += 1) {
       const oracle = `independent-check-${index + 1}`
-      const workItemId = `independent-check-${index + 1}`
+      const canonicalCheckerId = `independent-check-${index + 1}`
+      const workItemId = checkerRepairAttempt === 0
+        ? canonicalCheckerId : `${canonicalCheckerId}-repair-${checkerRepairAttempt}`
       const checkerAssignment = checking.responsibilities[index] || checking.responsibilities[0]
       const assignedDomainContracts = index === 0 ? checkerDomainContracts : []
-      const result = adoptedCheckResults && adoptedCheckResults[workItemId] || await launch({
+      const result = checkerRepairAttempt === 0 && adoptedCheckResults && adoptedCheckResults[workItemId] || await launch({
         workItemId,
         logicalRole: index === 0 ? 'independent-reviewer' : 'independent-tester',
         parent: 'run-owner', purpose: 'verification',
@@ -9814,9 +10244,83 @@ function createDefaultRouteExecutor(options) {
         )
       }
       if (result.code !== 'PASS') {
+        const canRepairImplementation = result.code === 'FAIL' && checkerRepairAttempt === 0 &&
+          workerCount === 1 && !doneRetryBoundary && typeof options.resultPointer === 'function'
+        if (canRepairImplementation) {
+          const rejectedCandidateHash = candidateHash
+          const checkerReceiptPointer = options.resultPointer(workItemId)
+          const checkerResultHash = hashText(JSON.stringify(result))
+          await options.transition('IMPLEMENTATION_DEFECT', 'REPAIRING', {
+            candidateHash: rejectedCandidateHash,
+            checkerId: workItemId,
+            checkerResultHash,
+            checkerReceiptPointer,
+            repairAttempt: checkerRepairAttempt + 1,
+          })
+          const repairWorkItemId = `work-1-repair-${checkerRepairAttempt + 1}`
+          const repairResult = await launch({
+            workItemId: repairWorkItemId,
+            logicalRole: 'worker', parent: 'run-owner', purpose: 'work',
+            repairOf: 'work-1', executorKey: 'work-1',
+            assignment: 'Repair only the implementation defects in the bound independent-check receipt. Preserve passing behavior, execute the authoritative acceptance commands, and return a newly verified exact version.',
+            ownership: executionOwnership.length
+              ? executionOwnership.filter(item => item && item.owner === 'worker-1').map(item => ({ ...item }))
+              : ['workspace'],
+            success: successes, checks, roadmapSlice: planPointer, manifests: executionOwnership,
+            fetchedEvidence: withDescriptiveLikelyAreas({
+              ...(capturedDomainWorkEvidence || {}),
+              rejectedCheckerReceipt: checkerReceiptPointer,
+              rejectedCandidateHash,
+              checkerResultHash,
+            }),
+            findingIds: exactFindingIds(result, result.payload, result.cause),
+            strategyFingerprint: checkerResultHash,
+            difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
+            risk: 'high', nextReadyAfter: ['independent-check-1'],
+          })
+          if (!repairResult || repairResult.allAssignedItemsPass === false) {
+            throw new SupervisorIntegrationError(
+              'WORK_ITEM_RESULT_FAILED',
+              'same-worker checker repair did not return a verified work result',
+              { repairWorkItemId, checkerResultHash },
+            )
+          }
+          const repairedCandidateHash = hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
+          if (repairedCandidateHash === rejectedCandidateHash) {
+            return {
+              outcome: 'FAILED', checkHashes: [],
+              terminalEnvelope: {
+                status: 'REPAIR_NO_PROGRESS',
+                reason: 'the bounded same-worker repair did not produce a changed exact version',
+                candidateHash: rejectedCandidateHash,
+                checkerResultHash,
+              },
+            }
+          }
+          candidateHash = repairedCandidateHash
+          usableDeliverables = changedDeliverables(options.targetPath, options.gitEnvironment())
+          acceptedWorkResults.set(repairWorkItemId, repairResult)
+          checkerRepairAttempt += 1
+          await options.transition('REPAIR_READY', 'CHECK_WORK', {
+            ...checkerFreezeBinding,
+            priorCandidateHash: rejectedCandidateHash,
+            candidateHash,
+            dependencyHash: hashText(stableStringify({
+              priorDependencyHash: dependencyHash,
+              repairWorkItemId,
+              checkerResultHash,
+              candidateHash,
+            })),
+            environmentHash: hashEnvironment(options.gitEnvironment()),
+            checkerResultHash,
+            repairWorkItemId,
+            repairAttempt: checkerRepairAttempt,
+          })
+          continue checkerAttempts
+        }
         if (deferredPromotion) await deferredPromotion.abort('independent checker did not pass')
         return {
-          outcome: result.code === 'CHECK_INCONCLUSIVE' ? 'BLOCKED' : 'FAILED',
+          outcome: ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(result.code) ? 'BLOCKED' : 'FAILED',
           terminalEnvelope: result,
           checkHashes,
         }
@@ -9863,6 +10367,8 @@ function createDefaultRouteExecutor(options) {
     } catch (error) {
       if (deferredPromotion) await deferredPromotion.abort(error.code || 'checker launch failed')
       throw error
+    }
+      break
     }
     assertDistinctEvidenceConsumption(checkerEvidenceConsumptions)
     if (typeof options.writeAllWorkJoinedReceipt === 'function') {
@@ -10113,6 +10619,96 @@ function createCheckerSnapshotFactory(options) {
     options.cleanupRegistry.register({ path: snapshotPath, kind: 'checker-snapshot', owner: checkerId })
     return snapshotPath
   }
+}
+
+function createCheckerScratchFactory(options) {
+  if (!options || typeof options.scratchRoot !== 'string' ||
+      !options.cleanupRegistry || typeof options.cleanupRegistry.register !== 'function' ||
+      typeof options.runId !== 'string' || typeof options.targetPath !== 'string') {
+    throw new SupervisorIntegrationError('CHECKER_SCRATCH_UNAVAILABLE', 'checker scratch factory requires its run, target, cleanup authority, and private root')
+  }
+  const secret = crypto.randomBytes(32)
+  const scratchRoot = path.resolve(options.scratchRoot)
+  fs.mkdirSync(scratchRoot, { recursive: true, mode: 0o700 })
+  if (process.platform !== 'win32') fs.chmodSync(scratchRoot, 0o700)
+  try { auditPrivatePermissions(scratchRoot, { recurse: false }) } catch (error) {
+    throw new SupervisorIntegrationError('CHECKER_SCRATCH_UNAVAILABLE', 'checker scratch authority root is not private and owner-only', { cause: error.message })
+  }
+  const sign = body => crypto.createHmac('sha256', secret).update(stableStringify(body)).digest('hex')
+  const factory = (checkerId, frozenCandidateRoot, context = {}) => {
+    if (typeof checkerId !== 'string' || !checkerId || !/^[a-f0-9]{64}$/u.test(context.candidateHash || '')) {
+      throw new SupervisorIntegrationError('CHECKER_SCRATCH_BOUNDARY_INVALID', 'checker scratch requires an exact checker identity and exact-version hash')
+    }
+    const frozen = fs.realpathSync.native(path.resolve(frozenCandidateRoot))
+    let scratch = context.adoptedScratchRoot ? path.resolve(context.adoptedScratchRoot) : null
+    if (!scratch && Array.isArray(context.adoptedScratchRoots) && context.adoptedScratchRoots.length > 0) {
+      const registeredPaths = new Set(options.cleanupRegistry.load().entries
+        .filter(entry => entry.status === 'REGISTERED' && entry.kind === 'checker-scratch' && entry.owner === checkerId)
+        .map(entry => path.resolve(entry.path)))
+      scratch = context.adoptedScratchRoots.map(candidate => path.resolve(candidate)).find(candidate => registeredPaths.has(candidate)) || null
+      if (!scratch) throw new SupervisorIntegrationError('CRASH_ADOPTION_CONFLICT', 'adopted checker lease has no registered scratch resource')
+    }
+    if (scratch) {
+      const registered = options.cleanupRegistry.load().entries.some(entry =>
+        entry.status === 'REGISTERED' && entry.kind === 'checker-scratch' &&
+        entry.owner === checkerId && path.resolve(entry.path) === scratch)
+      if (!registered) {
+        throw new SupervisorIntegrationError('CRASH_ADOPTION_CONFLICT', 'adopted checker scratch is not the exact registered checker boundary')
+      }
+    } else {
+      scratch = path.join(scratchRoot, `${hashText(checkerId)}-${crypto.randomBytes(8).toString('hex')}`)
+      fs.mkdirSync(scratch, { recursive: false, mode: 0o700 })
+      for (const child of ['tmp', 'output', 'cache']) fs.mkdirSync(path.join(scratch, child), { mode: 0o700 })
+      options.cleanupRegistry.register({ path: scratch, kind: 'checker-scratch', owner: checkerId })
+    }
+    const body = {
+      schemaVersion: 1,
+      runId: options.runId,
+      checkerId,
+      candidateHash: context.candidateHash,
+      frozenCandidateRoot: frozen,
+      writableScratchRoot: fs.realpathSync.native(scratch),
+      temporaryRoot: fs.realpathSync.native(path.join(scratch, 'tmp')),
+      outputRoot: fs.realpathSync.native(path.join(scratch, 'output')),
+      cacheRoot: fs.realpathSync.native(path.join(scratch, 'cache')),
+    }
+    const boundary = Object.freeze({ ...body, capability: sign(body) })
+    validateCheckerScratchDirectories(boundary, {
+      runId: options.runId,
+      checkerId,
+      candidateHash: context.candidateHash,
+      frozenCandidateRoot: frozen,
+      realTargetPath: options.targetPath,
+      scratchRoot,
+    })
+    return boundary
+  }
+  Object.defineProperty(factory, 'verify', {
+    value(record) {
+      const boundary = record && record.checkerScratchBoundary
+      const roots = validateCheckerScratchDirectories(boundary, {
+        runId: options.runId,
+        checkerId: record && record.sandboxAssignment && record.sandboxAssignment.checkerId,
+        candidateHash: record && record.candidateHash,
+        frozenCandidateRoot: record && record.canonicalTargetPath,
+        realTargetPath: options.targetPath,
+        scratchRoot,
+      })
+      const expected = sign(checkerScratchReceiptBody(boundary))
+      const actualBytes = Buffer.from(boundary.capability, 'hex')
+      const expectedBytes = Buffer.from(expected, 'hex')
+      if (actualBytes.length !== expectedBytes.length || !crypto.timingSafeEqual(actualBytes, expectedBytes) ||
+          roots.writableScratchRoot !== path.resolve(record.workingDirectory)) {
+        throw new SupervisorIntegrationError('CHECKER_SCRATCH_BOUNDARY_INVALID', 'checker scratch capability is foreign, tampered, or bound to another CWD')
+      }
+      const registered = options.cleanupRegistry.load().entries.some(entry =>
+        entry.status === 'REGISTERED' && entry.kind === 'checker-scratch' &&
+        entry.owner === boundary.checkerId && path.resolve(entry.path) === roots.writableScratchRoot)
+      if (!registered) throw new SupervisorIntegrationError('CHECKER_SCRATCH_BOUNDARY_INVALID', 'checker scratch capability lacks its live cleanup lease')
+      return boundary
+    },
+  })
+  return factory
 }
 
 function outputSchemaForRole(roleContract, record) {
@@ -11440,6 +12036,12 @@ function createDefaultRuntimeOptions(input) {
         repairEnvironment: environment,
         safetyScriptPath: path.resolve(__dirname, '..', '..', '..', 'scripts', 'local-only-safety.cjs'),
       })
+      runtimeOptions.checkerScratchFactory = createCheckerScratchFactory({
+        scratchRoot: path.join(activation.activationRoot, 'checker-scratch'),
+        cleanupRegistry,
+        runId: activation.runId,
+        targetPath,
+      })
       runtimeOptions.validateCheckerSnapshot = candidate => {
         const resolved = path.resolve(candidate)
         const root = fs.realpathSync.native(snapshotRoot)
@@ -11515,6 +12117,7 @@ function createDefaultRuntimeOptions(input) {
         checkerProfilePath: activation.checkerProfilePath,
         outputSchemaResolver: launch => outputSchemaForRole(roleContract, launch),
         providerSchemaRoot: path.join(activation.activationRoot, 'provider-output-schemas'),
+        checkerScratchVerifier: runtimeOptions.checkerScratchFactory.verify,
       })
       if (pendingCrashResume) {
         stateStore.acceptResumeCapabilities({
@@ -12396,6 +12999,7 @@ module.exports = {
   assertReadOnlyCheckerOperation,
   clampNonNegInt,
   createConcreteSupervisor,
+  createCheckerScratchFactory,
   createCheckerSnapshotFactory,
   createCodexEntrySemanticTrace,
   runCodexTopLevelEntryAdapter,
@@ -12422,6 +13026,7 @@ module.exports = {
   ensureSafeEnvironment,
   executeExistingTestBaseline,
   executionMutableResourceOwnership,
+  decisionReadOnlyOwnership,
   resolveTrustedTestDeclarations,
   executePreProductionRuntimeGates,
   emitItemVerifiedTransition,
@@ -12467,6 +13072,7 @@ module.exports = {
   validateDurableResultEvidencePointer,
   validateWorkerRequestedTransition,
   validateCanonicalChildResult,
+  validateCheckerScratchDirectories,
   requiredCompletionGates,
   reconstructTypedExitZeroResult,
   typedChildOutputReady,

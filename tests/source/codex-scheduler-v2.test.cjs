@@ -111,7 +111,7 @@ test('P7 route ceilings are exact ceilings, not launch quotas', () => {
       budget.tokens.output,
     ]])),
     {
-      DIRECT: [6, 4, 2, 220000, 900000, 40000],
+      DIRECT: [8, 4, 2, 220000, 900000, 40000],
       LIGHT: [8, 4, 3, 500000, 2200000, 70000],
       ROADMAP: [18, 6, 4, 1200000, 5000000, 160000],
     },
@@ -1168,6 +1168,52 @@ test('crash adoption restores one persisted live lease without double-counting o
   }).adoptCrashCheckpoint(checkpoint, {
     recoveryContext: { ...recoveryContext, priorOwner: { ownerId: 'old-control-owner', processesDrained: false } },
   }), error => error.code === 'CRASH_OWNER_UNVERIFIED')
+})
+
+test('checker crash adoption preserves its admitted inspected candidate and rejects missing or substituted bindings', async () => {
+  const candidateHash = 'a'.repeat(64)
+  const scheduler = createTestScheduler()
+  const lease = await scheduler.acquireWithAuthority(authority(scheduler), {
+    workItemId: 'crash-live-checker', role: 'ap-independent-checker',
+    logicalRole: 'independent-reviewer', purpose: 'verification', candidateHash,
+    resources: [{ id: 'workspace:/frozen-checker', mode: 'exclusive' }],
+  })
+  scheduler.bindCrashContinuation(lease, {
+    reservationId: 'reservation-crash-checker', sessionId: 'control-session-crash-checker',
+    continuationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    frontier: {
+      resumeState: 'CHECK_WORK', nextReadyWorkIds: ['crash-live-checker'],
+      openCheckIds: ['crash-live-checker'], acceptedResultIds: [],
+    },
+  })
+  const checkpoint = scheduler.exportCrashCheckpoint({ ownerSessionId: 'checker-owner' })
+  assert.equal(checkpoint.liveRecords[0].inspectedCandidateHash, candidateHash)
+  const recoveryContextFor = value => ({
+    priorOwner: { ownerId: 'checker-owner', processesDrained: true },
+    frontier: { acceptedResultIds: [value.stateHash] },
+  })
+  const adoptedScheduler = new CentralScheduler({
+    settings: checkpoint.schedulerState.settings,
+    runIdentity: { runId: TEST_RUN.runId, generation: 2 },
+  })
+  adoptedScheduler.adoptCrashCheckpoint(checkpoint, { recoveryContext: recoveryContextFor(checkpoint) })
+  assert.equal(adoptedScheduler.exportCrashCheckpoint({ ownerSessionId: 'replacement-checker-owner' })
+    .liveRecords[0].inspectedCandidateHash, candidateHash)
+
+  for (const replacement of [null, 'b'.repeat(64)]) {
+    const forged = JSON.parse(JSON.stringify(checkpoint))
+    forged.liveRecords[0].inspectedCandidateHash = replacement
+    const unsigned = { ...forged }
+    delete unsigned.stateHash
+    forged.stateHash = crypto.createHash('sha256').update(stableStringify(unsigned)).digest('hex')
+    assert.throws(() => new CentralScheduler({
+      settings: checkpoint.schedulerState.settings,
+      runIdentity: { runId: TEST_RUN.runId, generation: 2 },
+    }).adoptCrashCheckpoint(forged, { recoveryContext: recoveryContextFor(forged) }),
+    error => replacement === null
+      ? error.code === 'CRASH_CHECKPOINT_INVALID'
+      : error.code === 'CRASH_CHECKPOINT_INVALID' || error.code === 'CRASH_ADOPTION_CONFLICT')
+  }
 })
 
 test('crash adoption restores live parent hierarchy and rejects forged accounting classes', async () => {

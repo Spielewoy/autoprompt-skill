@@ -22,7 +22,7 @@ const benchmarkTimeCeiling = defaultMs => BENCHMARK_NO_TIMEOUT_LIMIT
 
 const ROUTE_BUDGETS = deepFreeze({
   DIRECT: {
-    maxChildLaunches: 6,
+    maxChildLaunches: 8,
     normalChildLaunchRange: [3, 5],
     maxLiveIncludingRoot: 4,
     maxDepth: 2,
@@ -1800,6 +1800,7 @@ class CentralScheduler {
       reservationId: binding.reservationId.trim(),
       sessionId: binding.sessionId.trim(),
       continuationId: binding.continuationId == null ? null : binding.continuationId.trim(),
+      inspectedCandidateHash: record.candidateHash || null,
       frontier: normalizeCrashFrontier(binding.frontier),
     }
     normalized.bindingHash = sha256(Buffer.from(stableStringify(normalized), 'utf8'))
@@ -1938,6 +1939,8 @@ class CentralScheduler {
       reservationId: binding.reservationId.trim(),
       sessionId: binding.sessionId.trim(),
       continuationId: binding.continuationId.trim(),
+      ...(Object.hasOwn(prior, 'inspectedCandidateHash')
+        ? { inspectedCandidateHash: prior.inspectedCandidateHash } : {}),
       frontier: normalizeCrashFrontier(binding.frontier || prior.frontier),
     }
     if (stableStringify(normalized.frontier) !== stableStringify(prior.frontier)) {
@@ -1971,6 +1974,7 @@ class CentralScheduler {
           caller: record.caller,
           providerCapabilities: record.providerCapabilities,
           equivalenceKey: record.equivalenceKey,
+          inspectedCandidateHash: record.candidateHash || null,
           progressFingerprint: record.progressFingerprint || null,
           depth: record.depth,
           lane: record.lane,
@@ -2088,6 +2092,15 @@ class CentralScheduler {
       }
       const resources = normalizeResources(saved.resources)
       const crashBinding = this._validateSavedCrashBinding(saved.crashBinding)
+      const inspectedCandidateHash = saved.inspectedCandidateHash === null || saved.inspectedCandidateHash === undefined
+        ? null : requireDigest(saved.inspectedCandidateHash, 'inspectedCandidateHash')
+      if (saved.logicalRole && /checker|reviewer|tester/u.test(saved.logicalRole) && inspectedCandidateHash === null) {
+        throw this._error('CRASH_CHECKPOINT_INVALID', 'saved checker lease lacks its admitted inspected candidate hash')
+      }
+      if (!Object.hasOwn(crashBinding, 'inspectedCandidateHash') ||
+          crashBinding.inspectedCandidateHash !== inspectedCandidateHash) {
+        throw this._error('CRASH_CHECKPOINT_INVALID', 'saved live lease candidate differs from its immutable continuation binding')
+      }
       const record = {
         id: saved.id,
         workItemId: saved.workItemId,
@@ -2097,6 +2110,7 @@ class CentralScheduler {
         caller: saved.caller,
         providerCapabilities,
         equivalenceKey: saved.equivalenceKey,
+        candidateHash: inspectedCandidateHash,
         progressFingerprint: saved.progressFingerprint,
         depth: saved.depth,
         lane: saved.lane,

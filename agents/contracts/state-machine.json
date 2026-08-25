@@ -340,7 +340,8 @@
       "event": "TRANSIENT_RUNTIME",
       "from": [
         "RUN_WORK",
-        "CHECK_WORK"
+        "CHECK_WORK",
+        "REPAIRING"
       ],
       "to": "$same",
       "guard": "failure matches the declared retryable class and allowance remains",
@@ -607,6 +608,18 @@
       "to": "RELEASING_LOCK",
       "guard": "the exact failed command and unavailable dependency are recorded",
       "effect": "prepare BLOCKED outcome with an unblock path"
+    },
+    {
+      "id": "T080",
+      "event": "CHECK_FAILED_FINAL",
+      "from": [
+        "PREPARE_WORK",
+        "CHECK_WORK",
+        "REPAIRING"
+      ],
+      "to": "RELEASING_LOCK",
+      "guard": "an authoritative failure remains after its bounded repair allowance or repair made no progress",
+      "effect": "prepare FAILED outcome with the exact rejected result and repair evidence"
     },
     {
       "id": "T057",

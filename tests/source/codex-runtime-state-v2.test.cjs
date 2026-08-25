@@ -54,7 +54,7 @@ const {
   recoveryCheckpointEntryHash,
   recoveryCheckpointSnapshotHash,
 } = require(path.join(WORKFLOW, 'recovery-checkpoint.js'))
-const { OwnedCodexProxyRunner } = require(path.join(WORKFLOW, 'phase-budget.js'))
+const { OwnedCodexProxyRunner, applyProductionRuntimeTransition } = require(path.join(WORKFLOW, 'phase-budget.js'))
 const TEST_CAPABILITIES = new WeakMap()
 
 function temporary(t) {
@@ -509,6 +509,63 @@ test('failed workers close the exact live mutation permit without reopening the 
   )
 })
 
+test('checker repair mutates in REPAIRING, invalidates C1, and freezes a fresh C2 before verdicts', (t) => {
+  const { capability, directory, store } = stateHarness(t)
+  const deliverable = path.join(directory, 'repair-target.txt')
+  fs.writeFileSync(deliverable, 'candidate one\n')
+  const candidateOne = digest('candidate-one')
+  const candidateTwo = digest('candidate-two')
+  const environmentHash = digest('environment')
+  const dependencyHash = digest('dependency-one')
+  const transitionProduction = (eventId, nextState, candidateHash, nextDependencyHash) =>
+    applyProductionRuntimeTransition({
+      stateStore: store, capability, budgetController: { snapshot: () => null },
+    }, {
+      eventId, nextState,
+      details: {
+        candidateHash, dependencyHash: nextDependencyHash, environmentHash,
+      missionHash: digest('mission-binding'), planHash: digest('plan-binding'),
+        oracleHash: digest('oracle-binding'), assumptionsHash: digest('assumptions-binding'),
+        checkerCount: 1, requiredVerdictIds: ['reviewer-verdict'],
+      },
+    })
+  advanceToWork(store)
+  transitionProduction('ALL_WORK_JOINED', 'CHECK_WORK', candidateOne, dependencyHash)
+  store.recordIndependentVerdict({
+    capability, cause: 'record rejected C1 verdict', verdictId: 'reviewer-verdict',
+    verdictHash: digest('rejected-verdict'),
+  })
+  transitionProduction('IMPLEMENTATION_DEFECT', 'REPAIRING', candidateOne, dependencyHash)
+  const permit = store.beginAuthorizedMutation({
+    capability, expectedEpoch: 0, cause: 'admit checker-bound repair',
+    authority: { runId: 'run-0001', activationId: 'activation-001', nonce: 'nonce_123456789012', generation: 1 },
+    preimages: [{ path: deliverable, hash: sha256(fs.readFileSync(deliverable)) }],
+  })
+  assert.equal(store.load().state, 'REPAIRING')
+  assert.equal(store.load().workspaceEpoch, 1)
+  assert.equal(store.load().assurance.candidateFreeze, null)
+  assert.deepEqual(store.load().assurance.requiredVerdictIds, ['reviewer-verdict'])
+  assert.equal(store.load().assurance.verdicts['reviewer-verdict'].status, 'invalidated')
+  fs.writeFileSync(deliverable, 'candidate two\n')
+  store.commitAuthorizedMutation(permit, {
+    capability, cause: 'commit C2',
+    postimages: [{ path: deliverable, hash: sha256(fs.readFileSync(deliverable)) }],
+  })
+  assert.throws(
+    () => transitionProduction('REPAIR_READY', 'CHECK_WORK', candidateOne, digest('unchanged-dependency')),
+    error => error.code === 'CANDIDATE_FREEZE_INVALID',
+  )
+  transitionProduction('REPAIR_READY', 'CHECK_WORK', candidateTwo, digest('dependency-two'))
+  const repaired = store.load()
+  assert.equal(repaired.state, 'CHECK_WORK')
+  assert.equal(repaired.candidateHash, candidateTwo)
+  assert.equal(repaired.assurance.candidateFreeze.candidateHash, candidateTwo)
+  assert.equal(repaired.assurance.verdicts['reviewer-verdict'].status, 'pending')
+  assert.deepEqual(store.eventLog.readAll().slice(-4).map(event => event.details.stateEvent.transitionId), [
+    'T027', 'T032', 'T032', 'T031',
+  ])
+})
+
 test('worker mutation permits fail closed unless commit and abort bind the admitted private workspace', (t) => {
   const { capability, directory, store } = stateHarness(t)
   const deliverable = path.join(directory, 'isolated-worker.txt')
@@ -662,6 +719,28 @@ test('canonical release intents deterministically bind every T068-T072 outcome a
     capability: tampered.capability,
     cause: 'tampered source must fail',
   }), (error) => error.code === 'RUN_RECORD_FAILURE')
+})
+
+test('exhausted checker repair binds FAILED directly without pretending an environment or worker-context block', t => {
+  for (const sourceState of ['CHECK_WORK', 'REPAIRING']) {
+    const { capability, store } = stateHarness(t)
+    advanceToWork(store)
+    transition(store, 'CHECK_WORK')
+    if (sourceState === 'REPAIRING') {
+      transition(store, 'REPAIRING', 'authoritative checker rejected C1', 'IMPLEMENTATION_DEFECT')
+    }
+    transition(store, 'RELEASING_LOCK', 'bounded checker repair is exhausted', 'CHECK_FAILED_FINAL')
+    const bound = store.bindTerminal('FAILED', {
+      capability, cause: 'exact checker receipt remains red after bounded recovery',
+      terminalEnvelope: { status: 'REPAIR_EXHAUSTED' }, deliverables: [],
+    })
+    assert.equal(bound.terminal.releaseIntent.transitionId, 'T080')
+    assert.equal(bound.terminal.outcome, 'FAILED')
+    store.completeReleasedTerminal('FAILED', { capability, cause: 'release proven' })
+    const eventIds = store.eventLog.readAll().map(event => event.details.stateEvent.eventId)
+    assert.equal(eventIds.includes('ENVIRONMENT_BLOCKED'), false)
+    assert.equal(eventIds.includes('WORKER_CONTEXT_LOST'), false)
+  }
 })
 
 test('target lease conflicts touch no owner bytes and verified stale owners are quarantined', (t) => {
@@ -1610,12 +1689,12 @@ test('recovery checkpoint authority binds scheduler, accounting, state, and cras
     "const authority=new RecoveryCheckpointAuthority({paths:input.paths,eventLog,stateProvider:()=>readChecksummedJson(input.statePath),capabilityVerifier:(candidate)=>{if(!candidate||candidate.secret!=='cap')throw new Error('foreign');return input.capabilityBinding},accountingCheckpointVerifier:(evidence)=>{if(stableStringify(evidence)!==stableStringify(input.accounting))throw new Error('stale');return input.accounting},accountingCheckpointProvider:()=>input.accounting,clock:()=>input.occurredAt})",
     'authority.appendCheckpoint(input.checkpointInput)',
   ].join(';')
-  const launchWriter = (causeId, secondOffset) => new Promise((resolve, reject) => {
+  const launchWriter = (causeId) => new Promise((resolve, reject) => {
     const childInput = {
       eventModule: path.join(WORKFLOW, 'event-log.js'), recoveryModule: path.join(WORKFLOW, 'recovery-checkpoint.js'),
       eventPath: path.join(directory, 'runtime', 'events.jsonl'), blobPath: path.join(directory, 'blobs'),
       statePath: harness.store.statePath, binding: binding(), paths, capabilityBinding,
-      accounting: accounting.resumeCheckpoint(), occurredAt: new Date(Date.UTC(2026, 7, 22, 3, 1, secondOffset)).toISOString(),
+      accounting: accounting.resumeCheckpoint(), occurredAt: new Date(Date.UTC(2026, 7, 22, 3, 1, 0)).toISOString(),
       checkpointInput: {
         ...checkpointInput, capability: { secret: 'cap' }, accountingCheckpoint: accounting.resumeCheckpoint(),
         scheduler: secondScheduler,
@@ -1631,7 +1710,7 @@ test('recovery checkpoint authority binds scheduler, accounting, state, and cras
     child.on('error', reject)
     child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`writer ${causeId} exited ${code}: ${stderr}`)))
   })
-  await Promise.all([launchWriter('race:writer-a', 1), launchWriter('race:writer-b', 2)])
+  await Promise.all([launchWriter('race:writer-a'), launchWriter('race:writer-b')])
   const raced = authority.replay()
   assert.equal(raced.records.length, 6)
   assert.deepEqual(raced.records.map((record) => record.sequence), [1, 2, 3, 4, 5, 6])

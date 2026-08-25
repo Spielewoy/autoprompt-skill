@@ -88,6 +88,22 @@ const MODEL_REGISTRY = Object.freeze([Object.freeze({
 })])
 const ZERO_USAGE = Object.freeze({ noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 })
 
+function adapterWorkerResult(overrides = {}) {
+  return {
+    schemaVersion: '2.0.0', reportType: 'result', reportId: 'adapter-result',
+    runId: 'run-adapter', assignmentId: 'work-adapter', logicalRoleId: 'worker',
+    physicalRoleId: 'autoprompt.v2.worker', requestEnvelopeHash: 'a'.repeat(64),
+    findingIds: ['AP-RUN-026'], startedAt: '2026-08-25T12:00:00.000Z',
+    endedAt: '2026-08-25T12:00:01.000Z', filesChanged: [], resourcesChanged: [],
+    behaviorChanged: ['Adapter fixture completed.'],
+    commands: [{ command: 'true', exitCode: 0, result: 'passed' }],
+    successItems: [{ id: 'adapter', status: 'pass', evidenceIds: ['command:true'] }],
+    remainingConcerns: [], allAssignedItemsPass: true,
+    requestedTransition: { event: 'WORK_ITEM_VERIFIED', reason: 'Fixture passed.', invalidateEvidenceIds: [] },
+    ...overrides,
+  }
+}
+
 function checkerReferenceMethod(methodClass, label) {
   return {
     methodClass,
@@ -491,6 +507,7 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
   const launches = []
   const results = new Map()
   let plan = null
+  const descriptiveLikelyArea = 'ERP planning, demand, engineering-release, routing, qualification, and WIP data exposed by the gateway'
   const routeDecision = decision('ROADMAP', {
     scoutCount: 2,
     missingInformation: ['Which service owns session migration?', 'Which client ships after the API?'],
@@ -500,6 +517,7 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
       { kind: 'file', identity: 'output/mes.sql', owner: 'worker-mes', ownershipMode: 'single-owner' },
       { kind: 'file', identity: 'output/wms.sql', owner: 'worker-wms', ownershipMode: 'single-owner' },
     ],
+    likelyAreas: [descriptiveLikelyArea],
     workers: {
       count: 3,
       responsibilities: ['Implement ERP writeback.', 'Implement MES writeback.', 'Implement WMS writeback.'],
@@ -612,6 +630,13 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
     'mission-coordinator', 'worker-1', 'worker-2', 'worker-3',
   ])
   assert.deepEqual(launches.find(item => item.workItemId === 'roadmap-author').manifests, revision.manifests)
+  assert.deepEqual(launches.find(item => item.workItemId === 'roadmap-author')
+    .fetchedEvidence.descriptiveLikelyAreas, [descriptiveLikelyArea])
+  for (const planningId of ['roadmap-scout-1', 'roadmap-scout-2']) {
+    const planningLaunch = launches.find(item => item.workItemId === planningId)
+    assert.deepEqual(planningLaunch.ownership, ['workspace'])
+    assert.deepEqual(planningLaunch.fetchedEvidence.descriptiveLikelyAreas, [descriptiveLikelyArea])
+  }
   const planCheck = launches.find(item => item.workItemId === 'roadmap-plan-check')
   assert.equal(planCheck.candidateHash, roadmapCandidate)
   assert.deepEqual(planCheck.evidencePointers.map(pointer => pointer.name), ['roadmap-scout-1', 'roadmap-scout-2'])
@@ -633,6 +658,8 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
   assert.match(plan, /Ship the API before the dependent client\./)
   assert.ok(plan.indexOf('Place session migration') < plan.indexOf('Ship the API'))
   const manager = launches.find(item => item.workItemId === 'roadmap-work-group')
+  assert.deepEqual(manager.ownership, ['workspace'])
+  assert.deepEqual(manager.fetchedEvidence.descriptiveLikelyAreas, [descriptiveLikelyArea])
   assert.deepEqual(manager.workGroupAdmission.workerAssignments.map(item => item.mutableResourceIdentities), [
     ['output/erp.sql'], ['output/mes.sql'], ['output/wms.sql'],
   ])
@@ -1434,6 +1461,33 @@ function makeHarness(t, overrides = {}) {
       capabilityChecks.push(binding)
       return { verified: true, source: 'signed-test-dispatcher' }
     },
+    checkerSnapshotFactory(checkerId) {
+      const snapshot = path.join(directory, `${checkerId}-snapshot-${crypto.randomBytes(4).toString('hex')}`)
+      const snapshotSource = overrides.runtimeOptions && overrides.runtimeOptions.targetPath || ROOT
+      const clone = spawnSync('git', ['clone', '--quiet', '--no-local', '--no-hardlinks', '--', snapshotSource, snapshot], { encoding: 'utf8' })
+      assert.equal(clone.status, 0, clone.stderr)
+      const snapshotBranch = overrides.runtimeOptions && overrides.runtimeOptions.expectedBranch || expectedBranch
+      const hardenedSnapshot = spawnSync(process.execPath, [
+        path.join(ROOT, 'scripts', 'local-only-safety.cjs'),
+        '--repo', snapshot, '--expected-branch', snapshotBranch, '--repair', '--json',
+      ], { encoding: 'utf8', windowsHide: true })
+      assert.equal([0, 3].includes(hardenedSnapshot.status), true, hardenedSnapshot.stderr || hardenedSnapshot.stdout)
+      return snapshot
+    },
+    checkerScratchFactory(checkerId, frozenCandidateRoot, context = {}) {
+      const writableScratchRoot = fs.mkdtempSync(path.join(directory, `${checkerId}-scratch-`))
+      const temporaryRoot = path.join(writableScratchRoot, 'tmp')
+      const outputRoot = path.join(writableScratchRoot, 'output')
+      const cacheRoot = path.join(writableScratchRoot, 'cache')
+      for (const child of [temporaryRoot, outputRoot, cacheRoot]) fs.mkdirSync(child, { mode: 0o700 })
+      return Object.freeze({
+        schemaVersion: 1, runId: overrides.runId || 'run-1', checkerId,
+        candidateHash: context.candidateHash,
+        frozenCandidateRoot: path.resolve(frozenCandidateRoot),
+        writableScratchRoot, temporaryRoot, outputRoot, cacheRoot,
+        capability: 'a'.repeat(64),
+      })
+    },
     decideRoute: overrides.decideRoute || (async () => ({
       decision: decision('DIRECT'), submittedAtMs: monotonic, usage: ZERO_USAGE,
     })),
@@ -1905,7 +1959,7 @@ test('activation path controls preserve ordinary mission text and fail closed on
 
 test('explicit direct, light, and roadmap paths bypass analyst and root route-selection model work exactly', async t => {
   const expectedBudget = {
-    direct: { launches: 6, depth: 2 },
+    direct: { launches: 8, depth: 2 },
     light: { launches: 8, depth: 3 },
     roadmap: { launches: 18, depth: 4 },
   }
@@ -2159,7 +2213,16 @@ test('all worker and checker launches use scheduler leases, context-free briefs,
       if (launch.continuationId) assert.equal(launch.continuationId, 'executor-context')
       return { contextId: 'executor-context', usage: ZERO_USAGE }
     }
-    return { candidateHash: CANDIDATE_A, evidenceHashes: [], usage: ZERO_USAGE }
+    return {
+      schemaVersion: '2.0.0', code: 'PASS', runId: 'run-1',
+      requestEnvelopeHash: launch.canonicalAssignment.requestEnvelopeHash,
+      candidateHash: CANDIDATE_A, currentVersionHash: CANDIDATE_A,
+      payload: {
+        evidenceIds: ['evidence:focused-oracle'],
+        referenceMethod: checkerReferenceMethod('black-box-boundary', 'focused oracle'),
+      },
+      evidenceHashes: [], usage: ZERO_USAGE,
+    }
   }
   harness.runtimeOptions.executeRoute = async ({ launch }) => {
     await launch({
@@ -2195,14 +2258,16 @@ test('all worker and checker launches use scheduler leases, context-free briefs,
 
   const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
   assert.equal(result.outcome, 'DONE', JSON.stringify(result))
-  assert.equal(duplicateCode, 'CHECK_ALREADY_CONSUMED')
+  assert.equal(duplicateCode, 'RETRY_REASSESSMENT_REQUIRED')
   assert.deepEqual(harness.launches.map(item => item.logicalRole), [
     'route-analyst', 'diagnostic-probe', 'worker', 'worker', 'independent-reviewer',
   ])
   assert.equal(result.scheduler.counters.totalLaunches, 5)
   assert.equal(result.budget.launches, 5)
   assert.equal(harness.launches.some(item => item.dispatch.fork_turns === 'all'), false)
-  assert.equal(harness.capabilityChecks.length, harness.launches.length)
+  // The duplicate checker reaches capability verification, then the retry
+  // reassessment gate rejects it before a scheduler launch is consumed.
+  assert.equal(harness.capabilityChecks.length, harness.launches.length + 1)
   for (const binding of harness.capabilityChecks) {
     assert.equal(binding.runId, 'run-1')
     assert.equal(binding.generation, 1)
@@ -3272,6 +3337,233 @@ test('canonical mission paths fail before worker creation', async t => {
   assert.equal(harness.record.writes.has(missingAssignment), false)
 })
 
+test('production planning prose remains descriptive and never becomes filesystem ownership', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-production-planning-prose-'))
+  const descriptiveArea = 'ERP planning, demand, engineering-release, routing, qualification, and WIP data exposed by the gateway'
+  const routeDecision = decision('DIRECT', { likelyAreas: ['/app/data/dbgw.py', descriptiveArea] })
+  const executor = createDefaultRouteExecutor({
+    targetPath: target,
+    gitEnvironment: () => process.env,
+    transition: async () => {},
+    harnessAttestation: () => ({
+      repoHash: CANDIDATE_A,
+      buildHash: 'b'.repeat(64),
+      oracleHash: 'c'.repeat(64),
+    }),
+  })
+  let workerReached = false
+  await assert.rejects(() => executor({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      assert.equal(JSON.stringify(request.ownership || []).includes(descriptiveArea), false)
+      if (request.logicalRole === 'worker') {
+        workerReached = true
+        assert.deepEqual(request.ownership, ['src/example.js'])
+        assert.deepEqual(request.fetchedEvidence.descriptiveLikelyAreas, ['/app/data/dbgw.py', descriptiveArea])
+        const error = new Error('typed ownership reached production worker')
+        error.code = 'TYPED_OWNERSHIP_PROVED'
+        throw error
+      }
+      return { code: 'PASS', payload: {} }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  }), error => error.code === 'TYPED_OWNERSHIP_PROVED')
+  assert.equal(workerReached, true)
+})
+
+test('one actionable checker FAIL returns to the same worker, freezes a new candidate, and rechecks once', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-checker-repair-'))
+  const transitions = []
+  const checkerCandidates = []
+  const receiptPath = path.join(target, 'checker-fail-receipt.json')
+  fs.writeFileSync(receiptPath, '{}\n')
+  const receiptHash = crypto.createHash('sha256').update(fs.readFileSync(receiptPath)).digest('hex')
+  const executor = createDefaultRouteExecutor({
+    targetPath: target,
+    gitEnvironment: () => process.env,
+    transition: async (eventId, nextState, details) => transitions.push({ eventId, nextState, details }),
+    resultPointer(workItemId) {
+      assert.equal(workItemId, 'independent-check-1')
+      return { name: workItemId, path: receiptPath, hash: receiptHash, bytes: fs.statSync(receiptPath).size }
+    },
+    harnessAttestation(candidateHash, oracle) {
+      return { repoHash: candidateHash, buildHash: 'b'.repeat(64), oracleHash: crypto.createHash('sha256').update(oracle).digest('hex') }
+    },
+  })
+  let checkerAttempt = 0
+  let repairLaunches = 0
+  const result = await executor({
+    route: 'DIRECT', decision: decision('DIRECT'),
+    launch: async request => {
+      if (request.logicalRole === 'worker' && request.workItemId === 'work-1') {
+        fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'rejected'\n")
+        return { allAssignedItemsPass: true }
+      }
+      if (request.logicalRole === 'worker' && request.repairOf === 'work-1') {
+        repairLaunches += 1
+        assert.equal(request.executorKey, 'work-1')
+        assert.equal(request.fetchedEvidence.rejectedCheckerReceipt.path, receiptPath)
+        assert.match(request.strategyFingerprint, /^[a-f0-9]{64}$/)
+        fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'accepted'\n")
+        return { allAssignedItemsPass: true }
+      }
+      if (['independent-reviewer', 'independent-tester'].includes(request.logicalRole)) {
+        checkerAttempt += 1
+        checkerCandidates.push(request.candidateHash)
+        if (checkerAttempt === 1) return {
+          code: 'FAIL', cause: { event: 'ASSERTION_FAILED', reason: 'exact behavior mismatch', unblockPath: 'repair implementation' },
+          payload: { findingIds: ['AP-RUN-026'] },
+        }
+        return {
+          code: 'PASS',
+          payload: {
+            evidenceIds: [`command:authoritative-check:${request.workItemId}`],
+            referenceMethod: checkerReferenceMethod(
+              request.logicalRole === 'independent-reviewer' ? 'requirements-review' : 'black-box-boundary',
+              request.workItemId,
+            ),
+          },
+        }
+      }
+      return { code: 'PASS', payload: {} }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.equal(repairLaunches, 1)
+  assert.ok(checkerAttempt >= 2)
+  assert.notEqual(checkerCandidates[0], checkerCandidates[1])
+  assert.deepEqual(transitions.filter(item => ['IMPLEMENTATION_DEFECT', 'REPAIR_READY'].includes(item.eventId))
+    .map(item => [item.eventId, item.nextState]), [
+    ['IMPLEMENTATION_DEFECT', 'REPAIRING'],
+    ['REPAIR_READY', 'CHECK_WORK'],
+  ])
+})
+
+test('an equivalent post-repair checker failure stops after the single bounded repair', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-checker-repair-bound-'))
+  const receiptPath = path.join(target, 'checker-fail-receipt.json')
+  fs.writeFileSync(receiptPath, '{}\n')
+  let checkerLaunches = 0
+  let repairLaunches = 0
+  const executor = createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    resultPointer: workItemId => ({
+      name: workItemId, path: receiptPath,
+      hash: crypto.createHash('sha256').update(fs.readFileSync(receiptPath)).digest('hex'),
+      bytes: fs.statSync(receiptPath).size,
+    }),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })
+  const result = await executor({
+    route: 'DIRECT', decision: decision('DIRECT'),
+    launch: async request => {
+      if (request.logicalRole === 'worker') {
+        if (request.repairOf) repairLaunches += 1
+        fs.writeFileSync(path.join(target, 'src', 'example.js'),
+          `module.exports = 'still-rejected-${repairLaunches}'\n`)
+        return { allAssignedItemsPass: true }
+      }
+      if (['independent-reviewer', 'independent-tester'].includes(request.logicalRole)) {
+        checkerLaunches += 1
+        return {
+          code: 'FAIL',
+          cause: { event: 'ASSERTION_FAILED', reason: 'same exact defect remains', unblockPath: 'manual intervention' },
+          payload: { findingIds: ['AP-RUN-026'] },
+        }
+      }
+      return { code: 'PASS', payload: {} }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(result.outcome, 'FAILED')
+  assert.equal(result.terminalEnvelope.code, 'FAIL')
+  assert.equal(repairLaunches, 1)
+  assert.equal(checkerLaunches, 2)
+})
+
+test('a no-op checker repair fails directly without stale recheck or a second repair', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-checker-repair-no-progress-'))
+  const receiptPath = path.join(target, 'checker-fail-receipt.json')
+  fs.writeFileSync(receiptPath, '{}\n')
+  let checkerLaunches = 0
+  let repairLaunches = 0
+  const transitions = []
+  const executor = createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env,
+    transition: async (eventId, nextState) => transitions.push([eventId, nextState]),
+    resultPointer: workItemId => ({
+      name: workItemId, path: receiptPath,
+      hash: crypto.createHash('sha256').update(fs.readFileSync(receiptPath)).digest('hex'),
+      bytes: fs.statSync(receiptPath).size,
+    }),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })
+  const result = await executor({
+    route: 'DIRECT', decision: decision('DIRECT'),
+    launch: async request => {
+      if (request.logicalRole === 'worker') {
+        if (request.repairOf) repairLaunches += 1
+        else fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'rejected'\n")
+        return { allAssignedItemsPass: true }
+      }
+      checkerLaunches += 1
+      return {
+        code: 'FAIL',
+        cause: { event: 'ASSERTION_FAILED', reason: 'bound behavior mismatch', unblockPath: 'repair implementation' },
+        payload: { findingIds: ['AP-RUN-026'] },
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(result.outcome, 'FAILED')
+  assert.equal(result.terminalEnvelope.status, 'REPAIR_NO_PROGRESS')
+  assert.equal(repairLaunches, 1)
+  assert.equal(checkerLaunches, 1)
+  assert.deepEqual(transitions.filter(([event]) => ['IMPLEMENTATION_DEFECT', 'REPAIR_READY'].includes(event)), [
+    ['IMPLEMENTATION_DEFECT', 'REPAIRING'],
+  ])
+})
+
+test('inconclusive and runtime checker outcomes never enter the implementation repair path', async t => {
+  for (const code of ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE']) {
+    const target = createTempGitTarget(tempDirectory(t, `autoprompt-checker-${code.toLowerCase()}-`))
+    let repairLaunches = 0
+    const executor = createDefaultRouteExecutor({
+      targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+      resultPointer: () => assert.fail(`${code} must not resolve an implementation-repair receipt`),
+      harnessAttestation: (candidateHash, oracle) => ({
+        repoHash: candidateHash, buildHash: 'b'.repeat(64),
+        oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+      }),
+    })
+    const result = await executor({
+      route: 'DIRECT', decision: decision('DIRECT'),
+      launch: async request => {
+        if (request.logicalRole === 'worker') {
+          if (request.repairOf) repairLaunches += 1
+          fs.writeFileSync(path.join(target, 'src', 'example.js'), `module.exports = '${code}'\n`)
+          return { allAssignedItemsPass: true }
+        }
+        return {
+          code,
+          cause: { event: code, reason: 'the independent check did not complete conclusively', unblockPath: 'restore the checker environment' },
+          payload: {},
+        }
+      },
+      completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+    })
+    assert.equal(result.outcome, 'BLOCKED')
+    assert.equal(repairLaunches, 0)
+  }
+})
+
 test('live checker keeps target read-only while owning isolated workspace cache database service port and outputs', async t => {
   const target = createTempGitTarget(tempDirectory(t, 'autoprompt-checker-target-'))
   fs.mkdirSync(path.join(target, 'evidence'))
@@ -3787,7 +4079,7 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
       spec.onStdoutLine(JSON.stringify({ type: 'thread.started', thread_id: '11111111-1111-4111-8111-111111111111' }))
       spec.onStdoutLine(JSON.stringify({
         type: 'item.completed',
-        item: { type: 'agent_message', text: JSON.stringify({ outcome: 'DONE', evidenceHashes: [CANDIDATE_A] }) },
+        item: { type: 'agent_message', text: JSON.stringify(adapterWorkerResult()) },
       }))
       spec.onStdoutLine(JSON.stringify({
         type: 'turn.completed',
@@ -3806,7 +4098,7 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
     runner,
     targetPath: ROOT,
     profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
-    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'outcome.schema.json'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
   })
   const base = {
     ...WORKER_EXECUTION_POLICY,
@@ -3824,14 +4116,14 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
       return { continue: true }
     },
     onTerminalResult(result, evidence) {
-      assert.equal(result.outcome, 'DONE')
+      assert.equal(result.reportType, 'result')
       assert.equal(evidence.sessionId, '11111111-1111-4111-8111-111111111111')
       assert.match(evidence.rawOutputHash, /^[a-f0-9]{64}$/)
       terminalPersistedBeforeDrain = true
     },
   }
   const fresh = await adapter.launch(base)
-  assert.equal(fresh.outcome, 'DONE')
+  assert.equal(fresh.reportType, 'result')
   assert.equal(fresh.completionRequested, true)
   assert.equal(fresh.recommendation, null)
   assert.deepEqual(calls[0].argv.slice(0, 2), ['exec', '--json'])
@@ -3852,7 +4144,7 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
       return {
         status: 0, processOwned: true, exactArgv: true, drained: true,
         stdout: [
-          JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ outcome: 'DONE' }) } }),
+          JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(adapterWorkerResult({ reportId: 'adapter-resume' })) } }),
           JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, reasoning_tokens: 0 } }),
           '',
         ].join('\n'),
@@ -3863,10 +4155,12 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
     runner: resumeRunner,
     targetPath: ROOT,
     profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
-    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'outcome.schema.json'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
   })
   await resumeAdapter.launch({ ...base, continuationId: '11111111-1111-4111-8111-111111111111' })
-  assert.deepEqual(calls[1].argv.slice(0, 3), ['exec', 'resume', '--json'])
+  assert.deepEqual(calls[1].argv.slice(0, 2), ['exec', '--json'])
+  assert.ok(calls[1].argv.indexOf('--sandbox') < calls[1].argv.indexOf('resume'))
+  assert.equal(calls[1].argv[calls[1].argv.indexOf('resume') + 1], '11111111-1111-4111-8111-111111111111')
   assert.equal(calls[1].argv.includes('-p'), false)
   assert.equal(calls[1].argv.at(-2), '11111111-1111-4111-8111-111111111111')
   assert.equal(calls[1].argv.at(-1), '-')
@@ -3891,7 +4185,10 @@ test('AP-RUN-013 two interleaved Codex sessions in one CWD bind only their own t
         for (const event of events) {
           event.spec.onStdoutLine(JSON.stringify({
             type: 'item.completed',
-            item: { type: 'agent_message', text: JSON.stringify({ outcome: 'DONE', marker: event.marker }) },
+            item: {
+              type: 'agent_message',
+              text: JSON.stringify(adapterWorkerResult({ reportId: event.marker })),
+            },
           }))
         }
         for (const event of events) {
@@ -3911,7 +4208,7 @@ test('AP-RUN-013 two interleaved Codex sessions in one CWD bind only their own t
     runner,
     targetPath: ROOT,
     profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
-    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'outcome.schema.json'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
   })
   const identified = { one: [], two: [] }
   const makeRecord = id => ({
@@ -3935,8 +4232,8 @@ test('AP-RUN-013 two interleaved Codex sessions in one CWD bind only their own t
   })
   assert.equal(one.contextId, identified.one[0])
   assert.equal(two.contextId, identified.two[0])
-  assert.equal(one.marker, 'session-1')
-  assert.equal(two.marker, 'session-2')
+  assert.equal(one.reportId, 'session-1')
+  assert.equal(two.reportId, 'session-2')
   assert.deepEqual(seenStops.sort(), ['run:DIRECT:one', 'run:DIRECT:two'])
 })
 
@@ -4017,7 +4314,7 @@ test('owned external adapter incrementally stops a real fake CLI process tree af
     'const tracePath = process.argv[2]',
     "fs.writeFileSync(tracePath, JSON.stringify(process.argv.slice(3)))",
     "process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'22222222-2222-4222-8222-222222222222'})+'\\n')",
-    "process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify({schemaVersion:'2.0.0',reportType:'result',outcome:'DONE',evidenceHashes:[]})}})+'\\n')",
+    `process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify(${JSON.stringify(adapterWorkerResult({ reportId: 'owned-fake' }))})}})+'\\n')`,
     "process.stdout.write(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,cached_input_tokens:0,output_tokens:1,reasoning_tokens:0}})+'\\n')",
     'setInterval(() => {}, 1000)',
     '',
@@ -4056,7 +4353,7 @@ test('owned external adapter incrementally stops a real fake CLI process tree af
     reservationId,
     onUsageDelta(delta) { usage.push(delta); return { continue: true } },
   })
-  assert.equal(result.outcome, 'DONE')
+  assert.equal(result.reportType, 'result')
   assert.equal(result.completionRequested, true)
   assert.deepEqual(usage, [{ noncachedInput: 1, cachedInput: 0, output: 1, reasoning: 0 }])
   const argv = JSON.parse(fs.readFileSync(tracePath, 'utf8'))
@@ -4077,7 +4374,7 @@ test('successive owned resume generations persist terminal-before-stop and drain
     "process.stdin.resume()",
     "process.stdin.on('end', () => {",
     "  process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'44444444-4444-4444-8444-444444444444'})+'\\n')",
-    "  process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify({schemaVersion:'2.0.0',reportType:'result',outcome:'DONE',evidenceHashes:[]})}})+'\\n')",
+    `  process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify(${JSON.stringify(adapterWorkerResult({ reportId: 'owned-resume' }))})}})+'\\n')`,
     "  process.stdout.write(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,cached_input_tokens:0,output_tokens:1,reasoning_tokens:0}})+'\\n')",
     '  setInterval(() => {}, 1000)',
     '})',
@@ -4165,7 +4462,7 @@ test('successive owned resume generations persist terminal-before-stop and drain
           })), 60_000)
         }),
       ])
-      assert.equal(result.outcome, 'DONE')
+      assert.equal(result.reportType, 'result')
     } catch (error) {
       await owner.cancelAll({ reason: 'bounded owned-resume test cleanup', graceMs: 0, killMs: 2000 }).catch(() => {})
       const registryPath = path.join(directory, `process-registry-${generation}.json`)
@@ -4212,7 +4509,7 @@ test('per-child terminal receipts do not globally drain a legal live sibling or 
     "process.stdin.resume()",
     "process.stdin.on('end', () => {",
     "  process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'55555555-5555-4555-8555-555555555555'})+'\\n')",
-    "  process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify({schemaVersion:'2.0.0',reportType:'result',outcome:'DONE',evidenceHashes:[]})}})+'\\n')",
+    `  process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify(${JSON.stringify(adapterWorkerResult({ reportId: 'owned-sibling' }))})}})+'\\n')`,
     "  process.stdout.write(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,cached_input_tokens:0,output_tokens:1,reasoning_tokens:0}})+'\\n')",
     '  setInterval(() => {}, 1000)',
     '})',
@@ -4271,7 +4568,7 @@ test('per-child terminal receipts do not globally drain a legal live sibling or 
       reservationId,
       onUsageDelta() { return { continue: true } },
     })
-    assert.equal(result.outcome, 'DONE')
+    assert.equal(result.reportType, 'result')
     assert.equal(globalDrainCalls, 0, 'per-child completion must not perform a global historical drain scan')
     assert.ok((await processAdapter.listOwned(sibling.groupIdentity)).length > 0,
       'a legal sibling must remain live until the terminal cancellation/finalization boundary')
@@ -4288,7 +4585,7 @@ test('per-child terminal receipts do not globally drain a legal live sibling or 
     'terminal-boundary drain reported success while a helper/proxy/child process remained live')
 })
 
-test('AP-CODEX-V2-036 concrete default factory accepts the signed dash-prefixed nonce through lease, state, checking, and finalization', async t => {
+test('AP-CODEX-V2-036 concrete runtime repairs a checker FAIL in the same Codex worker, freezes C2, and rechecks', async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-concrete-runtime-'))
   const pidTreeControlRoot = path.join(directory, 'pid-tree-control')
   t.after(() => {
@@ -4349,7 +4646,12 @@ test('AP-CODEX-V2-036 concrete default factory accepts the signed dash-prefixed 
     "process.stdin.on('data', chunk => { input += chunk })",
     "process.stdin.on('end', () => {",
     "  const role = (/^role=(.+)$/m.exec(input) || [,'unknown'])[1]",
-    `  require('node:fs').appendFileSync(${JSON.stringify(roleTracePath)}, JSON.stringify({role,argv:process.argv.slice(2)})+'\\n')`,
+    `  const tracePath = ${JSON.stringify(roleTracePath)}`,
+    "  const traceFs = require('node:fs')",
+    "  const priorTrace = traceFs.existsSync(tracePath) ? traceFs.readFileSync(tracePath,'utf8').trim().split('\\n').filter(Boolean).map(JSON.parse) : []",
+    "  const roleAttempt = priorTrace.filter(item => item.role === role).length + 1",
+    "  const checkerAttempt = priorTrace.filter(item => /checker|reviewer|tester/.test(item.role)).length + 1",
+    "  traceFs.appendFileSync(tracePath, JSON.stringify({role,roleAttempt,argv:process.argv.slice(2)})+'\\n')",
     "  const assignmentMatch = /^Canonical assignment: (.+)$/m.exec(input)",
     "  const contextMatch = /^Canonical context envelope: (.+)$/m.exec(input)",
     "  const assignment = assignmentMatch ? JSON.parse(assignmentMatch[1]) : null",
@@ -4357,17 +4659,17 @@ test('AP-CODEX-V2-036 concrete default factory accepts the signed dash-prefixed 
     `  const recommendation = ${JSON.stringify(recommendationValue)}`,
     `  const decision = ${JSON.stringify(decisionValue)}`,
     "  const now = new Date().toISOString()",
-    "  if (role === 'worker') require('node:fs').writeFileSync(require('node:path').join(process.cwd(),'src','example.js'), \"module.exports = 'complete'\\n\")",
+    "  if (role === 'worker') traceFs.writeFileSync(require('node:path').join(process.cwd(),'src','example.js'), `module.exports = '${roleAttempt === 1 ? 'rejected' : 'complete'}'\\n`)",
     "  let output",
     "  if (role === 'route-analyst') output = recommendation",
     "  else if (role === 'run-owner') output = decision",
     "  else if (/checker|reviewer|tester/.test(role)) output = {",
-    "    schemaVersion:'2.0.0', code:'PASS',",
-    "    description:'The checked result satisfies every requirement assigned to this check.',",
+    "    schemaVersion:'2.0.0', code:checkerAttempt === 1 ? 'FAIL' : 'PASS',",
+    "    description:checkerAttempt === 1 ? 'The checked result does not satisfy one or more named requirements.' : 'The checked result satisfies every requirement assigned to this check.',",
     "    stateClass:'terminal', runId:assignment.runId, requestEnvelopeHash:assignment.requestEnvelopeHash,",
     "    currentVersionHash:context.candidateHash, completedResults:[], nextReadyWork:[],",
-    "    cause:{event:'CHECK_COMPLETE',reason:'Fake local checker accepted the exact candidate.',unblockPath:null},",
-    "    payloadSchemaId:'autoprompt.check.fake.v2', payload:{evidenceIds:[`fake-cli-underlying-evidence:${assignment.assignmentId}`],referenceMethod:{methodClass:/tester/.test(role)?'black-box-boundary':'requirements-review',source:`${role} independent source`,procedure:`${role} independently derives and executes expected observations`,expectedOutputDerivedFromSubjectCode:false,subjectLogicReimplemented:false,positiveInvariants:[`${role} accepted behavior`],negativeInvariants:[`${role} rejected behavior`],boundaryInvariants:[`${role} edge behavior`]},testOutcomes:[{id:'planned-check-1',status:'PASS',fingerprint:'fake-post-green'}]}, recordedAt:now",
+    "    cause:{event:checkerAttempt === 1 ? 'ASSERTION_FAILED' : 'CHECK_COMPLETE',reason:checkerAttempt === 1 ? 'Exact candidate still contains the injected behavior defect.' : 'Fake local checker accepted the exact repaired candidate.',unblockPath:checkerAttempt === 1 ? 'repair the receipt-bound implementation defect' : null},",
+    "    payloadSchemaId:'autoprompt.check.fake.v2', payload:checkerAttempt === 1 ? {findingIds:['AP-RUN-026']} : {evidenceIds:[`fake-cli-underlying-evidence:${assignment.assignmentId}`],referenceMethod:{methodClass:/tester/.test(role)?'black-box-boundary':'requirements-review',source:`${role} independent source`,procedure:`${role} independently derives and executes expected observations`,expectedOutputDerivedFromSubjectCode:false,subjectLogicReimplemented:false,positiveInvariants:[`${role} accepted behavior`],negativeInvariants:[`${role} rejected behavior`],boundaryInvariants:[`${role} edge behavior`]},testOutcomes:[{id:'planned-check-1',status:'PASS',fingerprint:'fake-post-green'}]}, recordedAt:now",
     "  }",
     "  else output = {",
     "    schemaVersion:'2.0.0', reportType:'result', reportId:`result:${assignment.assignmentId}` ,",
@@ -4378,7 +4680,7 @@ test('AP-CODEX-V2-036 concrete default factory accepts the signed dash-prefixed 
     "    remainingConcerns:[], allAssignedItemsPass:true,",
     "    requestedTransition:{event:'WORK_ITEM_VERIFIED',reason:'Every assigned fake result passed.',invalidateEvidenceIds:[]}",
     "  }",
-    "  if (role === 'diagnostic-probe') { output.code = 'PASS'; output.commands = [{command:'read-only representative capability probe',exitCode:0}] }",
+    "  if (role === 'diagnostic-probe') output.commands = [{command:'read-only representative capability probe',exitCode:0,result:'PASS'}]",
     "  process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'33333333-3333-4333-8333-333333333333'})+'\\n')",
     "  process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify({canonicalJson:JSON.stringify(output)})}})+'\\n')",
     "  process.stdout.write(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,cached_input_tokens:0,output_tokens:1,reasoning_tokens:0}})+'\\n')",
@@ -4462,7 +4764,7 @@ test('AP-CODEX-V2-036 concrete default factory accepts the signed dash-prefixed 
   } }))
   assert.equal(result.route, 'DIRECT')
   assert.equal(result.scheduler.counters.totalLaunches,
-    3 + result.terminalEnvelope.checkCount)
+    5 + result.terminalEnvelope.checkCount)
   assert.equal(result.scheduler.rootAccounting.status, 'completed')
   assert.deepEqual(livePersistentPidTrees(pidTreeControlRoot), [])
   assert.equal(fs.existsSync(record.paths.accounting.logPath), true)
@@ -4474,11 +4776,20 @@ test('AP-CODEX-V2-036 concrete default factory accepts the signed dash-prefixed 
   const terminal = JSON.parse(fs.readFileSync(record.paths.terminalPath, 'utf8'))
   assert.equal(terminal.outcome, 'DONE')
   assert.equal(terminal.terminalEnvelope.code, 'DONE')
-  const tracedRoles = fs.readFileSync(roleTracePath, 'utf8').trim().split('\n').map(line => JSON.parse(line).role)
+  const traced = fs.readFileSync(roleTracePath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+  const tracedRoles = traced.map(item => item.role)
   assert.equal(tracedRoles.filter(role => role === 'route-analyst').length, 1)
   assert.equal(tracedRoles.filter(role => role === 'run-owner').length, 1)
+  assert.equal(tracedRoles.filter(role => role === 'worker').length, 2)
+  assert.equal(tracedRoles.filter(role => /checker|reviewer|tester/.test(role)).length, 3)
+  const repairWorker = traced.find(item => item.role === 'worker' && item.roleAttempt === 2)
+  assert.ok(repairWorker.argv.includes('resume'))
+  assert.ok(repairWorker.argv.indexOf('--sandbox') < repairWorker.argv.indexOf('resume'))
   const stateEvents = fs.readFileSync(record.paths.eventLog.logPath, 'utf8')
   assert.doesNotMatch(stateEvents, /CRASH_DETECTED|RESUME_REQUESTED|EXACT_STATE_RESTORED/)
+  assert.match(stateEvents, /IMPLEMENTATION_DEFECT/)
+  assert.match(stateEvents, /REPAIR_READY/)
+  assert.doesNotMatch(stateEvents, /ENVIRONMENT_BLOCKED|WORKER_CONTEXT_LOST/)
   await assertNoOsProcessesReferencingPath(directory,
     'the clean concrete runtime reached DONE while a proxy/child process remained live')
 })
@@ -4550,7 +4861,7 @@ test('AP-RUN-037 production supervisor resumes a crashed worker with a fresh gen
     "  if (role === 'route-analyst') output = recommendation",
     "  else if (role === 'run-owner') output = decision",
     "  else if (/checker|reviewer|tester/.test(role)) output = {",
-    "    schemaVersion:'2.0.0', code:'PASS', description:'The resumed candidate passed the independent check.',",
+    "    schemaVersion:'2.0.0', code:'PASS', description:'The checked result satisfies every requirement assigned to this check.',",
     "    stateClass:'terminal', runId:assignment.runId, requestEnvelopeHash:assignment.requestEnvelopeHash,",
     "    currentVersionHash:context.candidateHash, completedResults:[], nextReadyWork:[],",
     "    cause:{event:'CHECK_COMPLETE',reason:'Fake checker accepted the resumed candidate.',unblockPath:null},",
@@ -4566,7 +4877,7 @@ test('AP-RUN-037 production supervisor resumes a crashed worker with a fresh gen
     "    remainingConcerns:[], allAssignedItemsPass:true,",
     "    requestedTransition:{event:'WORK_ITEM_VERIFIED',reason:'Every resumed fake result passed.',invalidateEvidenceIds:[]}",
     "  }",
-    "  if (role === 'diagnostic-probe') { output.code = 'PASS'; output.commands = [{command:'read-only representative capability probe',exitCode:0}] }",
+    "  if (role === 'diagnostic-probe') output.commands = [{command:'read-only representative capability probe',exitCode:0,result:'PASS'}]",
     "  process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'77777777-7777-4777-8777-777777777777'})+'\\n')",
     "  process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify({canonicalJson:JSON.stringify(output)})}})+'\\n')",
     "  process.stdout.write(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,cached_input_tokens:0,output_tokens:1,reasoning_tokens:0}})+'\\n')",

@@ -401,6 +401,28 @@ function validateCheckpointPayload(checkpoint) {
   return checkpoint
 }
 
+function candidateAdvanceIsCanonical(previous, record, events) {
+  let candidateHash = previous.checkpoint.immutableHashes.candidateHash
+  const stateEvents = events
+    .slice(previous.checkpoint.stateEvent.sequence, record.checkpoint.stateEvent.sequence)
+    .map(event => event && event.details && event.details.stateEvent)
+    .filter(Boolean)
+  for (const event of stateEvents) {
+    if (event.candidateHash === candidateHash) continue
+    const invalidatedForRepair = candidateHash !== null && event.candidateHash === null &&
+      event.transitionId === 'T032' && event.eventId === 'TRANSIENT_RUNTIME' &&
+      event.fromState === 'REPAIRING' && event.toState === 'REPAIRING'
+    const frozeCandidate = candidateHash === null && HASH_PATTERN.test(event.candidateHash || '') && (
+      event.transitionId === 'T024' && event.eventId === 'WORK_ITEM_VERIFIED' && event.toState === 'ITEM_VERIFIED' ||
+      ['T026', 'T031'].includes(event.transitionId) &&
+        ['ALL_WORK_JOINED', 'REPAIR_READY'].includes(event.eventId) && event.toState === 'CHECK_WORK'
+    )
+    if (!invalidatedForRepair && !frozeCandidate) return false
+    candidateHash = event.candidateHash
+  }
+  return candidateHash === record.checkpoint.immutableHashes.candidateHash
+}
+
 class RecoveryCheckpointAuthority {
   constructor(options = {}) {
     if (!options.paths || typeof options.paths.runRecordRoot !== 'string' || typeof options.paths.logPath !== 'string' ||
@@ -887,11 +909,15 @@ class RecoveryCheckpointAuthority {
           fail('RECOVERY_CHECKPOINT_ROLLBACK', `checkpoint changed immutable ${field}`)
         }
       }
-      for (const field of ['routeDecisionHash', 'planHash', 'candidateHash']) {
+      for (const field of ['routeDecisionHash', 'planHash']) {
         const prior = previous.checkpoint.immutableHashes[field]
         if (prior !== null && record.checkpoint.immutableHashes[field] !== prior) {
           fail('RECOVERY_CHECKPOINT_ROLLBACK', `checkpoint changed bound ${field}`)
         }
+      }
+      if (record.checkpoint.immutableHashes.candidateHash !== previous.checkpoint.immutableHashes.candidateHash &&
+          !candidateAdvanceIsCanonical(previous, record, events)) {
+        fail('RECOVERY_CHECKPOINT_ROLLBACK', 'checkpoint changed bound candidateHash')
       }
       for (const field of ['completedWorkIds', 'completedCheckIds']) {
         if (previous.checkpoint.scheduler[field].some((id) => !record.checkpoint.scheduler[field].includes(id))) {

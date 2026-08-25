@@ -337,7 +337,16 @@ test('AP-DESIGN-023 fresh replay is derived only from the persisted assignment',
     schemaVersion: '2.0.0', reportType: 'assignment', assignmentId: workItemId,
     runId: 'persisted-run', requestEnvelopeHash: 'f'.repeat(64), logicalRoleId: 'worker',
     findingIds: ['AP-DESIGN-023'], requestedResult: 'Replay this exact bounded assignment.',
-    resources: [{ identity: 'src/owned.js' }],
+    resources: [
+      {
+        kind: 'file', identity: 'src/owned.js', owner: 'worker-1',
+        ownershipMode: 'single-owner', access: 'write',
+      },
+      {
+        kind: 'file', identity: 'request/input.json', owner: 'worker-1',
+        ownershipMode: 'single-owner', access: 'read',
+      },
+    ],
     successChecklist: [{ id: 'success-1', description: 'Owned behavior passes.' }],
     checks: ['node --test focused.test.cjs'], forbiddenChanges: ['Do not touch other files.'],
     resultLocation: 'work/results/result.json',
@@ -350,7 +359,13 @@ test('AP-DESIGN-023 fresh replay is derived only from the persisted assignment',
   assert.deepEqual(replayRequestFromPersistedAssignment(opened), {
     assignment: assignment.requestedResult,
     successChecklist: ['Owned behavior passes.'], success: ['Owned behavior passes.'],
-    findingIds: assignment.findingIds, ownership: ['src/owned.js'],
+    findingIds: assignment.findingIds,
+    ownership: [{
+      kind: 'file', identity: 'src/owned.js', owner: 'worker-1', ownershipMode: 'single-owner',
+    }],
+    manifests: [{
+      kind: 'file', identity: 'src/owned.js', owner: 'worker-1', ownershipMode: 'single-owner',
+    }],
     replayedAssignmentPath: relative,
   })
 })
