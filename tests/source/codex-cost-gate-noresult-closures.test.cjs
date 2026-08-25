@@ -205,7 +205,7 @@ test('AP-GATE-013 generated validation has one independent validator and rejects
   duplicated.gateGraph.edges.push(['independent-check', 'fresh-verify'])
   const rejected = validateGeneratedFramework(duplicated, { route: 'DIRECT' })
   assert.equal(rejected.valid, false)
-  assert.ok(rejected.errors.some(error => /fresh-verify cannot duplicate/i.test(error)))
+  assert.ok(rejected.errors.some(error => /independent recheck cannot duplicate/i.test(error)))
 })
 
 test('AP-GATE-022 decision-free mechanical work is DIRECT without an explicit edit list; uncertainty is LIGHT', () => {

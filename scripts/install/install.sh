@@ -217,7 +217,9 @@ install_codex_agents() {
   stage="$(mktemp -d 2>/dev/null)" || return 90
   target="$(codex_agents_dir)"
   profile="$(codex_profile_file)"
-  stage_agents="$stage/root/skills/autoprompt/agents-runtime"
+  # Mirror the final private-bundle path under the staging root so the
+  # generated profile's relative config_file entries remain valid after land.
+  stage_agents="$stage/root/${target#"$root"/}"
   stage_profile="$stage/root/autoprompt.config.toml"
   if ! command -v node >/dev/null 2>&1; then
     rm -rf -- "$stage"

@@ -225,6 +225,34 @@ function eventEvidence(event) {
   }))
 }
 
+test('route decision preserves indexed and flag literals from the exact request', () => {
+  const exactRequest = 'Read the input path from argv[1] and keep --safe-mode enabled.'
+  const valid = decision(routeFacts(), {
+    requested_result: exactRequest,
+    success_checklist: ['The implementation reads argv[1] and retains --safe-mode.'],
+  })
+  assert.equal(decisions.evaluateL0Decision({
+    startedAtMs: 1,
+    submittedAtMs: 2,
+    nowMs: 2,
+    decision: valid,
+    requestText: exactRequest,
+  }).status, 'ROUTE_DECIDED')
+
+  const corrupted = clone(valid)
+  corrupted.requestedResult = corrupted.requestedResult.replace('argv[1]', 'argv[0]')
+  corrupted.successChecklist = corrupted.successChecklist.map(item =>
+    item.replace('argv[1]', 'argv[0]'))
+  assert.equal(decisions.evaluateL0Decision({
+    startedAtMs: 1,
+    submittedAtMs: 2,
+    nowMs: 2,
+    decision: corrupted,
+    requestText: exactRequest,
+    correctionAttempts: 1,
+  }).status, 'ROUTE_DECISION_INVALID')
+})
+
 test('captured incident domains enforce exact certificates, ordering, provenance, hidden boundaries, datum rulings, and isolated promotion joins', () => {
   const H4 = 'd'.repeat(64)
   const H5 = 'e'.repeat(64)

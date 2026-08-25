@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="2128" height="590" viewBox="0 0 2128 590" role="img" aria-labelledby="title desc" data-release-status="local-v1.0.9-build-not-published">
+<svg xmlns="http://www.w3.org/2000/svg" width="2128" height="590" viewBox="0 0 2128 590" role="img" aria-labelledby="title desc" data-release-status="local-v1.0.10-build-not-published">
   <title id="title">Autoprompt 호출 구조</title>
-  <desc id="desc">path를 지원하지 않는 슬래시 명령 제공자 형식과, 따옴표로 묶은 요청 맨 앞에 path를 두는 미게시 로컬 Codex v1.0.9 실행기 형식을 분리해 복사할 수 있게 보여 줍니다.</desc>
+  <desc id="desc">path를 지원하지 않는 슬래시 명령 제공자 형식과, 따옴표로 묶은 요청 맨 앞에 path를 두는 미게시 로컬 Codex v1.0.10 실행기 형식을 분리해 복사할 수 있게 보여 줍니다.</desc>
   <defs>
     <pattern id="grid" width="56" height="56" patternUnits="userSpaceOnUse">
       <path d="M56 0H0V56" fill="none" stroke="#e2e2e4" stroke-width="1"/>
@@ -22,7 +22,7 @@
 
   <text x="112" y="329" fill="#255C60" font-family="Nimbus Sans, Arial, sans-serif" font-size="14" font-weight="700">슬래시 명령 제공자 (CODEX V2 제외)</text>
   <text x="112" y="360" fill="#0d0d0f" font-family="Nimbus Mono PS, monospace" font-size="20">/autoprompt mode=wide max_subs=100 agents=auto &lt;원하는 목표&gt;</text>
-  <text x="112" y="389" fill="#255C60" font-family="Nimbus Sans, Arial, sans-serif" font-size="14" font-weight="700">CODEX V2 · 로컬 V1.0.9 빌드 · 미게시</text>
+  <text x="112" y="389" fill="#255C60" font-family="Nimbus Sans, Arial, sans-serif" font-size="14" font-weight="700">CODEX V2 · 로컬 V1.0.10 빌드 · 미게시</text>
   <text x="112" y="420" fill="#0d0d0f" font-family="Nimbus Mono PS, monospace" font-size="20">autoprompt activate codex -- "path=auto mode=wide max_subs=100 agents=auto &lt;원하는 목표&gt;"</text>
 
   <!-- Column 01 -->
@@ -78,7 +78,7 @@
     <tspan x="1424" dy="24">설명하세요.</tspan>
   </text>
 
-  <!-- Column 06: local Codex v1.0.9 build, not published -->
+  <!-- Column 06: local Codex v1.0.10 build, not published -->
   <text x="1752" y="462" fill="#67676e" font-family="Nimbus Mono PS, monospace" font-size="14">06</text>
   <text x="1752" y="515" fill="#111113" font-family="Nimbus Sans, Arial, sans-serif" font-size="24" font-weight="600">경로 — Codex v2 전용</text>
   <text x="1752" y="566" fill="#56565d" font-family="Nimbus Sans, Arial, sans-serif" font-size="18">

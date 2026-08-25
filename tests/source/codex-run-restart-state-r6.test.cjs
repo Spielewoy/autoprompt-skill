@@ -11,6 +11,11 @@ const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const WORKFLOW = path.join(ROOT, 'agents', 'codex', 'workflow')
+const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
+const POWERSHELL_AVAILABLE = spawnSync(
+  POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()'],
+  { encoding: 'utf8', timeout: 10_000 },
+).status === 0
 const { BudgetController } = require(path.join(WORKFLOW, 'budget-controller.js'))
 const {
   assertDistinctEvidenceConsumption,
@@ -86,7 +91,7 @@ test('RUN-023/026 JSONL is accumulated once and exit-zero missing results recons
   }
   consume({ type: 'thread.started', thread_id: 'thread-1' })
   consume({ type: 'turn.completed', usage: {
-    input_tokens: 1, cached_input_tokens: 2, output_tokens: 3, reasoning_tokens: 4,
+    input_tokens: 3, cached_input_tokens: 2, output_tokens: 3, reasoning_tokens: 4,
   } })
   const snapshot = accumulator.snapshot()
   assert.equal(logicalEventCount, 10_002)
@@ -148,7 +153,9 @@ test('LAYER transition, evidence, residual, completion, and split mechanisms fai
   }), error => error.code === 'SPLIT_DECOMPOSITION_INVALID')
 })
 
-test('RUN-016 PowerShell adapter rejects alternate, corrupt, and wrong-version controllers', t => {
+test('RUN-016 PowerShell adapter rejects alternate, corrupt, and wrong-version controllers', {
+  skip: !POWERSHELL_AVAILABLE,
+}, t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-runtime-controller-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const adapter = path.join(directory, 'supervisor.ps1')
@@ -156,7 +163,7 @@ test('RUN-016 PowerShell adapter rejects alternate, corrupt, and wrong-version c
   const alternate = path.join(directory, 'alternate.js')
   fs.copyFileSync(path.join(WORKFLOW, 'supervisor.ps1'), adapter)
   fs.writeFileSync(alternate, 'process.exit(0)\n')
-  const invoke = env => spawnSync('powershell.exe', [
+  const invoke = env => spawnSync(POWERSHELL, [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', adapter, '--capabilities',
   ], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, ...env } })
 

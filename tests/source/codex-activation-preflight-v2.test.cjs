@@ -23,6 +23,7 @@ function sandboxProbeSpawn(mode) {
     const address = args[nodeIndex + 4]
     assert.doesNotMatch(address, /^(?:127\.|0\.0\.0\.0$)/)
     if (mode === 'denied') {
+      fs.writeFileSync(args[nodeIndex + 6], 'DENIED', { flag: 'wx', mode: 0o600 })
       return { status: 0, stdout: 'AUTOPROMPT_NETWORK_DENIED', stderr: '' }
     }
     return childProcess.spawnSync(process.execPath, args.slice(nodeIndex + 1), options)

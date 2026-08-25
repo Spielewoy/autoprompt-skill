@@ -19,6 +19,12 @@ const L0_DECISION_MAX_DURATION_MS = 4 * 60 * 1000
 const LIGHT_PLAN_MAX_DURATION_MS = 5 * 60 * 1000
 const MAX_LIGHT_PLAN_BULLETS = 15
 
+function l0DecisionMaxDurationMs(environment = process.env) {
+  return environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
+    ? Number.POSITIVE_INFINITY
+    : L0_DECISION_MAX_DURATION_MS
+}
+
 const RECOMMENDATION_ARRAY_FIELDS = Object.freeze([
   'whatTheUserWants',
   'likelyAreas',
@@ -1069,7 +1075,7 @@ function validateRouteDecision(decision) {
     const gateSelectionValidation = validateGateSelection(decision.gateSelection, facts)
     if (!gateSelectionValidation.valid) errors.push(...gateSelectionValidation.errors)
     const expectedFreeze = candidateFreezeContract(facts)
-    if (!sameValue(decision.candidateFreeze, expectedFreeze)) errors.push('candidateFreeze must match route facts and be required before checking')
+    if (!sameValue(decision.candidateFreeze, expectedFreeze)) errors.push('versionFreeze must match route facts and be required before checking')
     const ownership = validateOwnership(decision.mutableResourceOwnership, facts)
     errors.push(...ownership.errors)
     const expectedChecks = selectIndependentChecking({ facts })
@@ -1077,7 +1083,7 @@ function validateRouteDecision(decision) {
     if (!isObject(decision.assurancePreconditions) || decision.assurancePreconditions.mutableResourceOwnershipValid !== true ||
         decision.assurancePreconditions.candidateFreezeBeforeCheck !== true ||
         decision.assurancePreconditions.frozenVersionIdRequired !== facts.candidateFreeze.required) {
-      errors.push('assurancePreconditions must require ownership and candidate freeze before checking')
+      errors.push('checking preconditions must require ownership and a frozen version before checking')
     }
   }
   if (!concrete(decision.chosenRouteReason)) errors.push('chosenRouteReason must be concrete')
@@ -1271,7 +1277,7 @@ function evaluateExactPathPreflight(input = {}) {
   if (facts.transportCapability.taskCapabilityPreserved !== true ||
       (facts.candidateFreeze.required &&
         (!facts.candidateFreeze.available || !facts.candidateFreeze.environmentCanBeBound))) {
-    return exactPathFailure('EXACT_PATH_PROVIDER_UNSUPPORTED', ['exact-path safety facts require preserved transport and candidate isolation'])
+    return exactPathFailure('EXACT_PATH_PROVIDER_UNSUPPORTED', ['exact-path safety facts require preserved transport and exact-version isolation'])
   }
   const budgetParts = facts.deadlineBudget
   const requiredSeconds = budgetParts.admissionSeconds + budgetParts.executionReserveSeconds +
@@ -1283,7 +1289,7 @@ function evaluateExactPathPreflight(input = {}) {
   // floor, but it cannot waive that floor. In particular, irreversible or
   // otherwise staged work never becomes DIRECT merely because the user chose
   // the direct control path.
-  const routeFloor = router.classifyRoute(facts)
+  const routeFloor = router.classifyRoute(facts, { safetyFloorOnly: true })
   if (routeFloor.status !== 'DECIDED' || !ROUTES.includes(routeFloor.route) ||
       EXACT_PATH_ROUTE_RANK[route] < EXACT_PATH_ROUTE_RANK[routeFloor.route]) {
     return exactPathFailure('EXACT_PATH_ROUTE_FLOOR_UNSATISFIED', [
@@ -1377,9 +1383,9 @@ function createExactPathDecision(input = {}) {
     silentRouteChangesAllowed: false,
     conflictPolicy: 'fail-closed',
   }
-  const rejectedRouteReasons = Object.fromEntries(ROUTES.filter(candidate => candidate !== route).map(candidate => [
-    candidate,
-    `The user selected exact path ${route}; ${candidate} cannot be substituted silently.`,
+  const rejectedRouteReasons = Object.fromEntries(ROUTES.filter(otherRoute => otherRoute !== route).map(otherRoute => [
+    otherRoute,
+    `The user selected exact path ${route}; ${otherRoute} cannot be substituted silently.`,
   ]))
   const recommendationHash = crypto.createHash('sha256').update(JSON.stringify(pathSelection)).digest('hex')
   return createRouteDecision({
@@ -1404,7 +1410,7 @@ function createExactPathDecision(input = {}) {
     rejectedRouteReasons,
     routeChangeTrigger: {
       event: 'EXACT_PATH_CONFLICT',
-      factRequired: 'A hard safety, provider capability, ownership, or budget gate proves the selected path unsatisfiable.',
+      factRequired: 'A hard safety, provider capability, ownership, or budget check proves the selected path unsatisfiable.',
     },
     gateSelection: exactPathGateSelection(facts),
     requestEnvelopeHash: input.requestEnvelopeHash,
@@ -1421,7 +1427,32 @@ function remainingL0DecisionBudgetMs(input = {}) {
     error.code = 'ROUTE_DECISION_CLOCK_INVALID'
     throw error
   }
-  return Math.max(0, L0_DECISION_MAX_DURATION_MS - Math.floor(now - started))
+  return Math.max(0, l0DecisionMaxDurationMs(input.environment) - Math.floor(now - started))
+}
+
+function protectedRequestLiterals(requestText) {
+  const source = String(requestText || '')
+  const literals = new Set()
+  for (const match of source.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*(?:\[[^\]\r\n]+\])+/gu)) {
+    literals.add(match[0])
+  }
+  for (const match of source.matchAll(/(?:^|\s)(--?[A-Za-z][A-Za-z0-9-]*)(?=\s|$)/gu)) {
+    literals.add(match[1])
+  }
+  return [...literals].sort()
+}
+
+function validateRequestLiteralPreservation(requestText, decision) {
+  const required = protectedRequestLiterals(requestText)
+  if (required.length === 0) return { valid: true, required, missing: [] }
+  const projected = [
+    decision && decision.requestedResult,
+    ...(Array.isArray(decision && decision.successChecklist) ? decision.successChecklist : []),
+    ...(Array.isArray(decision && decision.plannedChecks) ? decision.plannedChecks : []),
+    ...(Array.isArray(decision && decision.workerResponsibilities) ? decision.workerResponsibilities : []),
+  ].filter(value => typeof value === 'string').join('\n')
+  const missing = required.filter(literal => !projected.includes(literal))
+  return { valid: missing.length === 0, required, missing }
 }
 
 function evaluateL0Decision(input = {}) {
@@ -1438,10 +1469,21 @@ function evaluateL0Decision(input = {}) {
     }
   }
   const validation = validateRouteDecision(input.decision)
+  const literalValidation = validateRequestLiteralPreservation(
+    input.requestText ?? input.request_text,
+    input.decision,
+  )
+  if (!literalValidation.valid) {
+    validation.valid = false
+    validation.errors.push(...literalValidation.missing.map(
+      literal => `route decision omitted or changed protected request literal: ${literal}`,
+    ))
+  }
   const submittedElapsed = submitted - started
   const elapsed = now - started
-  const remainingMs = Math.max(0, L0_DECISION_MAX_DURATION_MS - Math.floor(elapsed))
-  if (validation.valid && submittedElapsed <= L0_DECISION_MAX_DURATION_MS) {
+  const maximumDurationMs = l0DecisionMaxDurationMs(input.environment)
+  const remainingMs = Math.max(0, maximumDurationMs - Math.floor(elapsed))
+  if (validation.valid && submittedElapsed <= maximumDurationMs) {
     const waiting = input.decision.status === 'WAITING_USER'
     return {
       status: waiting ? 'WAITING_USER' : 'ROUTE_DECIDED',
@@ -1452,7 +1494,7 @@ function evaluateL0Decision(input = {}) {
       decision: input.decision,
     }
   }
-  if (submittedElapsed > L0_DECISION_MAX_DURATION_MS || elapsed >= L0_DECISION_MAX_DURATION_MS) {
+  if (submittedElapsed > maximumDurationMs || elapsed >= maximumDurationMs) {
     return {
       status: 'ROUTE_DECISION_TIMEOUT',
       route: null,
@@ -1496,7 +1538,7 @@ function noProgressFingerprint(input) {
 function evaluateNoProgress(input = {}) {
   const current = noProgressFingerprint(input)
   if (!current) {
-    return { status: 'NO_PROGRESS_INVALID', same_executor: false, errors: ['candidate, evidence, and failure fingerprints must be SHA-256'] }
+    return { status: 'NO_PROGRESS_INVALID', same_executor: false, errors: ['version, evidence, and failure fingerprints must be SHA-256'] }
   }
   const history = Array.isArray(input.history) ? input.history : []
   const priorMatches = history.filter(item => noProgressFingerprint(item) === current).length
@@ -1728,6 +1770,7 @@ module.exports = {
   validateRoadmapTopology,
   validateRouteAnalystAdmission,
   validateRouteAnalystFallbackState,
+  validateRequestLiteralPreservation,
   validateAnalystAdmission: validateRouteAnalystAdmission,
   validateGateSelection,
   validateRouteDecision,

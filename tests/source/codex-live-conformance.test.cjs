@@ -501,7 +501,7 @@ test('isolated profile binds every real Codex role to its installed private file
     /private agent configuration is unavailable/)
   write(path.join(root, 'escape.toml'), 'sandbox_mode = "read-only"\n')
   assert.throws(() => harness.privateAgentConfigPath(
-    profilePath, agentsRoot, '..\\..\\..\\escape.toml'), /escapes the private agents root/)
+    profilePath, agentsRoot, path.join('..', '..', '..', 'escape.toml')), /escapes the private agents root/)
   assert.throws(() => harness.privateAgentConfigPath(
     profilePath, path.join(root, '..', 'foreign'), 'missing.toml'),
   /private agents must be descendants|private agent configuration is unavailable/)

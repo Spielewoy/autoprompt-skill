@@ -78,7 +78,8 @@ function toRequestBuffer(request) {
 }
 
 function atomicWrite(file, bytes) {
-  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  if (process.platform !== 'win32') fs.chmodSync(path.dirname(file), 0o700)
   if (fs.existsSync(file)) {
     const existing = fs.readFileSync(file)
     if (!existing.equals(bytes)) {
@@ -87,7 +88,7 @@ function atomicWrite(file, bytes) {
     return false
   }
   const temporary = `${file}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`
-  fs.writeFileSync(temporary, bytes, { flag: 'wx' })
+  fs.writeFileSync(temporary, bytes, { flag: 'wx', mode: 0o600 })
   try {
     fs.renameSync(temporary, file)
   } catch (error) {
@@ -279,10 +280,46 @@ function compactLines(label, value) {
   return [`${label}: ${String(value)}`]
 }
 
+function losslessAuxiliaryBriefSlice(item) {
+  const fields = {}
+  const add = (key, label, value) => {
+    if (compactLines(label, value).length > 0) fields[key] = value
+  }
+  if (item.successChecklist !== undefined) {
+    add('successChecklist', 'Success', item.successChecklist)
+  } else {
+    add('success', 'Success', item.success)
+  }
+  add('ownership', 'Ownership', item.ownership)
+  add('checks', 'Checks', item.checks)
+  add('dependencies', 'Dependencies', item.dependencies)
+  add('returnShape', 'Return', item.returnShape)
+  return Object.freeze({
+    schemaVersion: 1,
+    kind: 'context-brief-slice',
+    fields: Object.freeze(fields),
+  })
+}
+
+function mergeFetchedEvidenceWithBriefSlice(fetchedEvidence, briefSlice) {
+  if (fetchedEvidence === undefined || fetchedEvidence === null) return { briefSlice }
+  if (
+    typeof fetchedEvidence === 'object' &&
+    !Array.isArray(fetchedEvidence) &&
+    !Buffer.isBuffer(fetchedEvidence) &&
+    !Object.hasOwn(fetchedEvidence, 'briefSlice')
+  ) {
+    return { ...fetchedEvidence, briefSlice }
+  }
+  return { provided: fetchedEvidence, briefSlice }
+}
+
 /**
  * Build a normal L3 bootstrap.  The byte ceiling applies to `brief`; the named
  * request/evidence pointers are deliberately separate, matching the P7 rule.
- * Oversized work is rejected for slicing and is never silently truncated.
+ * Auxiliary brief fields that cross the ceiling are moved losslessly into the
+ * route-bounded fetched-evidence component. Oversized core assignments are
+ * rejected and no field is silently truncated.
  */
 function buildContextFreeBrief(input, options = {}) {
   const item = input || {}
@@ -323,19 +360,32 @@ function buildContextFreeBrief(input, options = {}) {
     ...compactLines('Dependencies', item.dependencies),
     ...compactLines('Return', item.returnShape),
   ]
-  const brief = `${lines.join('\n')}\n`
-  const bytes = Buffer.byteLength(brief, 'utf8')
+  let brief = `${lines.join('\n')}\n`
+  let bytes = Buffer.byteLength(brief, 'utf8')
+  let fetchedEvidence = firstContextField(inputFields, ['fetchedEvidence']) ?? null
   if (bytes > maxBytes) {
-    throw new ContextEnvelopeError('BRIEF_TOO_LARGE', 'assignment must be sliced before dispatch', {
-      bytes,
-      maxBytes,
-      overflowBytes: bytes - maxBytes,
-    })
+    const unslicedBytes = bytes
+    const briefSlice = losslessAuxiliaryBriefSlice(item)
+    brief = [
+      `Role: ${item.role.trim()}`,
+      `Assignment: ${item.assignment.trim()}`,
+      'Details: Read fetchedEvidence.briefSlice for the exact Success, Ownership, Checks, Dependencies, and Return fields.',
+      '',
+    ].join('\n')
+    bytes = Buffer.byteLength(brief, 'utf8')
+    if (bytes > maxBytes) {
+      throw new ContextEnvelopeError('BRIEF_TOO_LARGE', 'core assignment exceeds the dispatch brief ceiling', {
+        bytes,
+        maxBytes,
+        overflowBytes: bytes - maxBytes,
+        unslicedBytes,
+      })
+    }
+    fetchedEvidence = mergeFetchedEvidenceWithBriefSlice(fetchedEvidence, briefSlice)
   }
   const evidencePointers = normalizeEvidencePointers(item.evidencePointers || [])
   const roadmapSlice = firstContextField(inputFields, ['roadmapSlice']) ?? null
   const manifests = firstContextField(inputFields, ['manifests', 'manifestPointers']) ?? null
-  const fetchedEvidence = firstContextField(inputFields, ['fetchedEvidence']) ?? null
   const componentBytes = {
     brief: bytes,
     roadmapSlice: assertContextComponent('roadmapSlice', roadmapSlice, caps.roadmapSliceBytes),
@@ -434,8 +484,10 @@ class TranscriptStore {
     this.largeOutputBytes = positiveByteLimit(options.largeOutputBytes, DEFAULT_LARGE_OUTPUT_BYTES)
     this._sequence = 0
     this._headHash = null
-    fs.mkdirSync(this.eventsDirectory, { recursive: true })
-    fs.mkdirSync(this.blobsDirectory, { recursive: true })
+    for (const directory of [path.dirname(this.root), this.root, this.eventsDirectory, this.blobsDirectory]) {
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
+      if (process.platform !== 'win32') fs.chmodSync(directory, 0o700)
+    }
     const events = this._loadAndValidate()
     if (events.length > 0) {
       this._sequence = events.at(-1).sequence

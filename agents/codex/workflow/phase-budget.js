@@ -103,6 +103,22 @@ const CHECKER_ROLES = new Set([
   'plan-checker', 'independent-checker', 'independent-reviewer',
   'independent-tester', 'technical-decision-reviewer',
 ])
+
+function resolveTerminalReceiptCandidateHash({
+  logicalRole,
+  runtimeStateProvider,
+  requestCandidateHash,
+  resultCandidateHash,
+}) {
+  if (!CHECKER_ROLES.has(logicalRole)) return resultCandidateHash || null
+  // The runtime provider is authoritative even when its canonical candidate is
+  // deliberately null during pre-mutation ROADMAP checking. Fall back to the
+  // inspected artifact only when no runtime provider exists at all.
+  if (typeof runtimeStateProvider === 'function') {
+    return runtimeStateProvider().candidateHash || null
+  }
+  return requestCandidateHash || null
+}
 const TARGET_MUTATOR_ROLES = new Set(['worker', 'roadmap-author'])
 const FORBIDDEN_RUNTIME_ROLES = new Set([
   'framework-generator', 'framework-validator', 'scribe', 'janitor',
@@ -477,6 +493,7 @@ function activationAttestationPayload(attestation) {
     activationNonce: attestation.activationNonce,
     verificationMethod: attestation.verificationMethod,
     verifiedCapabilities: attestation.verifiedCapabilities,
+    canonicalProviderTrustSha256: attestation.canonicalProviderTrustSha256,
     result: attestation.result,
   }), 'utf8')
 }
@@ -528,7 +545,10 @@ function verifyActivationProviderAttestation(record, environment = process.env, 
       attestation.runtimeIdentityHash !== providerRuntimeIdentityHash(record) ||
       !/^[A-Za-z0-9_-]{16,128}$/.test(attestation.activationNonce || '') ||
       attestation.verificationMethod !== 'live-conformance-suite' ||
-      JSON.stringify(attestation.verifiedCapabilities) !== JSON.stringify(['isolation', 'privateSkillRoot']) ||
+      JSON.stringify(attestation.verifiedCapabilities) !==
+        JSON.stringify(['isolation', 'privateSkillRoot', 'processOwnership']) ||
+      !record.providerTrust ||
+      attestation.canonicalProviderTrustSha256 !== record.providerTrust.sha256 ||
       attestation.result !== 'supported' || !signature || signature.algorithm !== 'ed25519' ||
       signature.keyId !== publicKey.keyId || record.capability.providerAttestationKeyId !== publicKey.keyId ||
       typeof signature.value !== 'string' ||
@@ -614,7 +634,7 @@ class RuntimeCapabilityAuthority {
       throw new SupervisorIntegrationError('RUNTIME_CAPABILITY_INVALID', 'runtime probes require versioned evidence, routes, and effects')
     }
     const issuedAtMs = Number(this.now())
-    const expiresAtMs = Math.min(Number(input.expiresAtMs), issuedAtMs + 5 * 60 * 1000)
+    const expiresAtMs = runtimeCapabilityExpiryMs(input.expiresAtMs, issuedAtMs)
     if (!Number.isFinite(issuedAtMs) || !Number.isFinite(expiresAtMs) || expiresAtMs <= issuedAtMs) {
       throw new SupervisorIntegrationError('RUNTIME_CAPABILITY_INVALID', 'runtime capability expiry is invalid')
     }
@@ -829,11 +849,11 @@ function frameworkCandidateErrors(candidate, route) {
     'gateRegistry', 'gateOrder', 'commandBindings', 'oracleBindings', 'riskTriggers',
     'negativePaths', 'coverageContract', 'assurance',
   ])
-  if (Object.keys(candidate).some(key => !allowed.has(key))) errors.push('candidate contains non-framework output')
+  if (Object.keys(candidate).some(key => !allowed.has(key))) errors.push('exact version being checked contains non-framework output')
   if (candidate.schemaVersion !== 1 || typeof candidate.frameworkId !== 'string' || !candidate.frameworkId) {
-    errors.push('candidate identity is invalid')
+    errors.push('exact version identity is invalid')
   }
-  if (candidate.route !== route) errors.push('candidate route is foreign')
+  if (candidate.route !== route) errors.push('exact version route is foreign')
   for (const field of ['checks', 'riskChecks']) {
     if (!uniqueStrings(candidate[field]) || (field === 'checks' && candidate[field].length === 0)) {
       errors.push(`${field} must be a unique${field === 'checks' ? ' non-empty' : ''} string array`)
@@ -844,30 +864,30 @@ function frameworkCandidateErrors(candidate, route) {
       typeof graph.graphId !== 'string' || !graph.graphId || !uniqueStrings(graph.nodes) || graph.nodes.length < 2 ||
       !Array.isArray(graph.edges) || graph.edges.length === 0 || graph.edges.some(edge =>
         !Array.isArray(edge) || edge.length !== 2 || edge.some(node => !graph.nodes.includes(node)))) {
-    errors.push('candidate gate graph is invalid')
+    errors.push('exact version required-check graph is invalid')
   } else {
     const order = topologicalGateOrder(graph)
-    if (order.length !== graph.nodes.length) errors.push('candidate gate graph is cyclic or has invalid order')
+    if (order.length !== graph.nodes.length) errors.push('exact version required-check graph is cyclic or has invalid order')
     const registry = candidate.gateRegistry
     if (!registry || !uniqueStrings(registry.gateIds) ||
         stableStringify([...registry.gateIds].sort()) !== stableStringify([...graph.nodes].sort())) {
-      errors.push('gate registry must exactly register every graph node')
+      errors.push('required-check registry must exactly register every graph node')
     }
     const outgoing = new Map(graph.nodes.map(node => [node, 0]))
     for (const [from] of graph.edges) outgoing.set(from, outgoing.get(from) + 1)
     const terminals = [...outgoing].filter(([, count]) => count === 0).map(([node]) => node)
     if (terminals.length !== 1 || !registry || registry.terminalGateId !== terminals[0]) {
-      errors.push('terminal registry must name exactly one reachable terminal gate')
+      errors.push('terminal registry must name exactly one reachable terminal required check')
     }
     if (!uniqueStrings(candidate.gateOrder) || stableStringify(candidate.gateOrder) !== stableStringify(order)) {
-      errors.push('gate order must be the exact dependency order')
+      errors.push('required-check order must be the exact dependency order')
     }
   }
   const validatorNode = candidate.assurance && candidate.assurance.independentValidatorGateId
   if (!candidate.assurance || candidate.assurance.generatedFreshVerifyAfterValidator !== false ||
       !graph || !graph.nodes || !graph.nodes.includes(validatorNode) ||
       graph.nodes.some(node => /fresh[-_ ]?verify/i.test(node))) {
-    errors.push('fresh-verify cannot duplicate the independent validator')
+    errors.push('independent recheck cannot duplicate the independent validator')
   }
   if (!Array.isArray(candidate.commandBindings) || candidate.commandBindings.length === 0 ||
       (candidate.checks || []).some(check => !candidate.commandBindings.some(binding =>
@@ -924,7 +944,7 @@ class FrameworkOrchestrationAuthority {
       throw new SupervisorIntegrationError('FRAMEWORK_VALIDATOR_REQUIRED', 'independent framework validation is unavailable')
     }
     if (typeof options.readState !== 'function' || typeof options.writeState !== 'function') {
-      throw new SupervisorIntegrationError('FRAMEWORK_STATE_REQUIRED', 'framework handoff requires durable state read/write functions')
+      throw new SupervisorIntegrationError('FRAMEWORK_STATE_REQUIRED', 'framework result report requires durable state read/write functions')
     }
     const maxAttempts = options.maxAttempts === undefined ? 3 : Number(options.maxAttempts)
     if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 3) {
@@ -1052,7 +1072,7 @@ class FrameworkOrchestrationAuthority {
         !/^[a-f0-9]{64}$/.test(state.candidateHash || '') ||
         hashText(stableStringify(state.candidate)) !== state.candidateHash ||
         frameworkCandidateErrors(state.candidate, this.binding.route).length > 0) {
-      throw new SupervisorIntegrationError('FRAMEWORK_STATE_INVALID', 'durable framework handoff is malformed or foreign')
+      throw new SupervisorIntegrationError('FRAMEWORK_STATE_INVALID', 'durable framework result report is malformed or foreign')
     }
     const receipt = state.validatorReceipt
     if (state.cacheAdmissionReceipt) {
@@ -1072,7 +1092,7 @@ class FrameworkOrchestrationAuthority {
       return state
     }
     if (state.status === 'CANDIDATE_READY' && receipt !== null) {
-      throw new SupervisorIntegrationError('FRAMEWORK_VALIDATOR_BYPASS', 'unvalidated framework candidate cannot be admitted')
+      throw new SupervisorIntegrationError('FRAMEWORK_VALIDATOR_BYPASS', 'unvalidated framework version cannot be admitted')
     }
     if (state.status !== 'CANDIDATE_READY') {
       if (!receipt || receipt.candidateHash !== state.candidateHash ||
@@ -1112,7 +1132,7 @@ class FrameworkOrchestrationAuthority {
         typeof result.generatorIdentity !== 'string' || !result.generatorIdentity ||
         result.generation !== receipt.generation || result.assignmentId !== receipt.assignmentId ||
         stableStringify(result.findingIds) !== stableStringify(receipt.findingIds)) {
-      throw new SupervisorIntegrationError('FRAMEWORK_HANDOFF_STALE', 'generator output is foreign, stale, or not candidate-only')
+      throw new SupervisorIntegrationError('FRAMEWORK_HANDOFF_STALE', 'generator output is foreign, stale, or not limited to the exact version')
     }
     if (priorState && result.generatorIdentity !== priorState.generatorIdentity) {
       throw new SupervisorIntegrationError(
@@ -1123,7 +1143,7 @@ class FrameworkOrchestrationAuthority {
     const semantic = validateGeneratedFramework(result.candidate, { route: this.binding.route })
     const errors = semantic.errors
     if (errors.length) {
-      throw new SupervisorIntegrationError('FRAMEWORK_CANDIDATE_INVALID', 'generated framework candidate is invalid', { errors })
+      throw new SupervisorIntegrationError('FRAMEWORK_CANDIDATE_INVALID', 'generated framework version is invalid', { errors })
     }
     return {
       generatorIdentity: result.generatorIdentity,
@@ -1351,7 +1371,7 @@ class RolePolicy {
       )
     }
     if (!alias && FORBIDDEN_RUNTIME_ROLES.has(child)) {
-      throw new SupervisorIntegrationError('ROLE_POLICY_DENIED', `legacy fixed-fleet role is not launchable: ${child}`)
+      throw new SupervisorIntegrationError('ROLE_POLICY_DENIED', `legacy fixed-group role is not launchable: ${child}`)
     }
     if (route === 'PRE_ROUTE' && parent === 'deterministic-control-plane' && child === 'run-owner') {
       const definition = this.contract.orchestratorContract
@@ -1605,7 +1625,7 @@ function loadGateContract(contractPath) {
   const target = contractPath || path.resolve(__dirname, '..', '..', 'contracts', 'gates.json')
   let contract
   try { contract = JSON.parse(fs.readFileSync(target, 'utf8')) } catch (error) {
-    throw new SupervisorIntegrationError('GATE_CONTRACT_INVALID', `gate contract is unreadable: ${target}`, {
+    throw new SupervisorIntegrationError('GATE_CONTRACT_INVALID', `required-check contract is unreadable: ${target}`, {
       cause: error.message,
     })
   }
@@ -1614,7 +1634,7 @@ function loadGateContract(contractPath) {
   if (contract.contractVersion !== '2.0.0' || !composition || !composition.selectionSchema ||
       !validation || !Array.isArray(validation.compoundRules) ||
       !Array.isArray(validation.incompatibleCombinations) || !contract.riskOverlays) {
-    throw new SupervisorIntegrationError('GATE_CONTRACT_INVALID', 'gate contract lacks canonical v2 composition rules')
+    throw new SupervisorIntegrationError('GATE_CONTRACT_INVALID', 'required-check contract lacks canonical v2 composition rules')
   }
   return contract
 }
@@ -1817,6 +1837,8 @@ function evaluateRegressionDelta(baseline = [], after = []) {
 
 function assertDistinctEvidenceConsumption(checks = []) {
   const consumed = new Map()
+  const methods = new Map()
+  const methodClasses = new Map()
   for (const check of checks) {
     const evidenceIds = Array.isArray(check && check.evidenceIds)
       ? check.evidenceIds.map(value => typeof value === 'string' ? value.trim() : value)
@@ -1837,8 +1859,64 @@ function assertDistinctEvidenceConsumption(checks = []) {
       }
       consumed.set(evidenceId, { checkerId: check.checkerId, oracleId: check.oracleId })
     }
+    if (check.requireReferenceMethod === true) {
+      const supplied = check.referenceMethod
+      const stringList = value => Array.isArray(value) && value.length > 0 && uniqueStrings(value) &&
+        value.every(item => typeof item === 'string' && item.trim() && item.length <= 512)
+      const allowedClasses = new Set([
+        'requirements-review', 'authoritative-suite', 'black-box-boundary',
+        'metamorphic-property', 'independent-model',
+      ])
+      if (!supplied || typeof supplied !== 'object' || Array.isArray(supplied) ||
+          !allowedClasses.has(supplied.methodClass) ||
+          typeof supplied.source !== 'string' || !supplied.source.trim() || supplied.source.length > 512 ||
+          typeof supplied.procedure !== 'string' || !supplied.procedure.trim() || supplied.procedure.length > 2048 ||
+          supplied.expectedOutputDerivedFromSubjectCode !== false ||
+          supplied.subjectLogicReimplemented !== false ||
+          !stringList(supplied.positiveInvariants) || !stringList(supplied.negativeInvariants) ||
+          !stringList(supplied.boundaryInvariants)) {
+        throw new SupervisorIntegrationError(
+          'REFERENCE_METHOD_INVALID',
+          'independent checking requires a non-circular method with positive, negative, and edge-case observations',
+          { checkerId: check.checkerId },
+        )
+      }
+      const normalized = {
+        methodClass: supplied.methodClass,
+        source: supplied.source.trim().toLowerCase().replace(/\s+/gu, ' '),
+        procedure: supplied.procedure.trim().toLowerCase().replace(/\s+/gu, ' '),
+        expectedOutputDerivedFromSubjectCode: false,
+        subjectLogicReimplemented: false,
+        positiveInvariants: supplied.positiveInvariants.map(value => value.trim().toLowerCase().replace(/\s+/gu, ' ')).sort(),
+        negativeInvariants: supplied.negativeInvariants.map(value => value.trim().toLowerCase().replace(/\s+/gu, ' ')).sort(),
+        boundaryInvariants: supplied.boundaryInvariants.map(value => value.trim().toLowerCase().replace(/\s+/gu, ' ')).sort(),
+      }
+      const methodHash = hashText(stableStringify(normalized))
+      const priorMethod = methods.get(methodHash)
+      const priorClass = methodClasses.get(normalized.methodClass)
+      if (priorMethod && priorMethod !== check.checkerId) {
+        throw new SupervisorIntegrationError(
+          'DUPLICATE_REFERENCE_METHOD',
+          'independent checkers used the same normalized reference method',
+          { firstCheckerId: priorMethod, secondCheckerId: check.checkerId, methodHash },
+        )
+      }
+      if (priorClass && priorClass !== check.checkerId) {
+        throw new SupervisorIntegrationError(
+          'DUPLICATE_REFERENCE_METHOD_CLASS',
+          'separate independent checkers must use different reference-method classes',
+          { firstCheckerId: priorClass, secondCheckerId: check.checkerId, methodClass: normalized.methodClass },
+        )
+      }
+      methods.set(methodHash, check.checkerId)
+      methodClasses.set(normalized.methodClass, check.checkerId)
+    }
   }
-  return Object.freeze({ valid: true, consumedEvidenceIds: Object.freeze([...consumed.keys()].sort()) })
+  return Object.freeze({
+    valid: true,
+    consumedEvidenceIds: Object.freeze([...consumed.keys()].sort()),
+    referenceMethodHashes: Object.freeze([...methods.keys()].sort()),
+  })
 }
 
 function createResidualRiskDisposition(input = {}) {
@@ -2054,7 +2132,7 @@ function selectWorkRecipe(input = {}) {
     if (!uniqueStrings(selection[field])) errors.push(`${field} must contain unique known strings`)
     else if (selection[field].some(value => !allowed(field).has(value))) errors.push(`${field} contains an unknown value`)
   }
-  if (!selection.artifactOverlays || selection.artifactOverlays.length === 0) errors.push('at least one artifact overlay is required')
+  if (!selection.artifactOverlays || selection.artifactOverlays.length === 0) errors.push('at least one deliverable overlay is required')
   if (!selection.acceptanceOverlays || selection.acceptanceOverlays.length === 0) errors.push('at least one acceptance overlay is required')
   if (!selection.riskEvidence || typeof selection.riskEvidence !== 'object' || Array.isArray(selection.riskEvidence)) {
     errors.push('riskEvidence must be an object')
@@ -2323,10 +2401,13 @@ function typedChildOutputReady(output, record) {
 function codexUsageFromEvent(event) {
   if (!event || event.type !== 'turn.completed' || !event.usage) return null
   const aliases = {
-    noncachedInput: ['input_tokens', 'inputTokens'],
+    totalInput: ['input_tokens', 'inputTokens'],
     cachedInput: ['cached_input_tokens', 'cachedInputTokens'],
     output: ['output_tokens', 'outputTokens'],
-    reasoning: ['reasoning_tokens', 'reasoningTokens'],
+    // Codex CLI 0.148 emits the OpenAI usage spelling
+    // `reasoning_output_tokens`. Keep the older spellings for replaying
+    // already-captured fixtures and compatible provider projections.
+    reasoning: ['reasoning_output_tokens', 'reasoning_tokens', 'reasoningTokens'],
   }
   const result = {}
   const missing = []
@@ -2342,6 +2423,18 @@ function codexUsageFromEvent(event) {
       { missing },
     )
   }
+  if (result.cachedInput > result.totalInput) {
+    throw new SupervisorIntegrationError(
+      'CODEX_USAGE_INCOMPLETE',
+      'Codex cached input usage exceeds total input usage',
+      { totalInput: result.totalInput, cachedInput: result.cachedInput },
+    )
+  }
+  // Codex reports input_tokens as the total input, including cached input.
+  // Scheduler accounting keeps those dimensions disjoint so cached tokens
+  // must be subtracted exactly once before enforcing either ceiling.
+  result.noncachedInput = result.totalInput - result.cachedInput
+  delete result.totalInput
   return result
 }
 
@@ -2399,6 +2492,247 @@ function probeCodexExecCapabilities(options = {}) {
   }
 }
 
+const CODEX_PROVIDER_ENVELOPE_SCHEMA = Object.freeze({
+  type: 'object',
+  properties: Object.freeze({
+    canonicalJson: Object.freeze({
+      type: 'string',
+      description: 'JSON-serialized canonical AutoPrompt output. The runtime decodes and validates it against the original role schema.',
+    }),
+  }),
+  required: Object.freeze(['canonicalJson']),
+  additionalProperties: false,
+})
+
+function materializeCodexProviderEnvelopeSchema(providerSchemaRoot) {
+  const root = path.resolve(providerSchemaRoot)
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+  fs.chmodSync(root, 0o700)
+  const rootStat = fs.lstatSync(root)
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink() ||
+      (typeof process.geteuid === 'function' && rootStat.uid !== process.geteuid())) {
+    throw new SupervisorIntegrationError(
+      'PROVIDER_SCHEMA_TRANSPORT_UNSAFE',
+      'Codex provider-schema transport root must be a private owned directory',
+    )
+  }
+  const bytes = Buffer.from(`${JSON.stringify(CODEX_PROVIDER_ENVELOPE_SCHEMA, null, 2)}\n`, 'utf8')
+  const filename = path.join(root, `canonical-json-envelope-${hashText(bytes)}.schema.json`)
+  try {
+    fs.writeFileSync(filename, bytes, { encoding: null, flag: 'wx', mode: 0o600 })
+  } catch (error) {
+    if (!error || error.code !== 'EEXIST') throw error
+    const existing = fs.readFileSync(filename)
+    if (!existing.equals(bytes)) {
+      throw new SupervisorIntegrationError(
+        'PROVIDER_SCHEMA_TRANSPORT_UNSAFE',
+        'existing Codex provider-schema transport differs from its content-addressed bytes',
+      )
+    }
+  }
+  const stat = fs.lstatSync(filename)
+  if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.nlink) !== 1 ||
+      (stat.mode & 0o077) !== 0 ||
+      (typeof process.geteuid === 'function' && stat.uid !== process.geteuid())) {
+    throw new SupervisorIntegrationError(
+      'PROVIDER_SCHEMA_TRANSPORT_UNSAFE',
+      'Codex provider-schema transport must be one private owned regular file',
+    )
+  }
+  return filename
+}
+
+function decodeCodexProviderEnvelope(output) {
+  if (!output || typeof output !== 'object' || Array.isArray(output) ||
+      Object.keys(output).length !== 1 || typeof output.canonicalJson !== 'string') {
+    throw new SupervisorIntegrationError(
+      'CODEX_OUTPUT_TRANSPORT_INVALID',
+      'Codex child did not return the required canonicalJson provider envelope',
+    )
+  }
+  let decoded
+  try { decoded = JSON.parse(output.canonicalJson) } catch (error) {
+    throw new SupervisorIntegrationError(
+      'CODEX_OUTPUT_TRANSPORT_INVALID',
+      'Codex child canonicalJson is not valid JSON',
+      { cause: error.message },
+    )
+  }
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+    throw new SupervisorIntegrationError(
+      'CODEX_OUTPUT_TRANSPORT_INVALID',
+      'Codex child canonicalJson must decode to one canonical output object',
+    )
+  }
+  return decoded
+}
+
+function applyBenchmarkEffortPin(assignment, environment = process.env) {
+  const requested = environment.AUTOPROMPT_BENCHMARK_FORCE_EFFORT
+  if (requested === undefined) return assignment
+  if (requested !== 'xhigh') {
+    throw new SupervisorIntegrationError(
+      'INVALID_EFFORT',
+      'AUTOPROMPT_BENCHMARK_FORCE_EFFORT supports only the audited xhigh benchmark pin',
+    )
+  }
+  if (!assignment || typeof assignment !== 'object') {
+    throw new SupervisorIntegrationError(
+      'MODEL_ASSIGNMENT_INVALID',
+      'benchmark xhigh pin requires a resolved provider assignment',
+    )
+  }
+  return Object.freeze({
+    ...assignment,
+    effort: 'xhigh',
+    source: 'benchmark-explicit-xhigh-pin',
+    routeIndependent: true,
+  })
+}
+
+function benchmarkPhaseTimeoutMs(defaultMs, environment = process.env) {
+  return environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
+    ? Number.POSITIVE_INFINITY
+    : defaultMs
+}
+
+function benchmarkFirstProductSignalDeadlineEnabled(ceilingMs, environment = process.env) {
+  return environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT !== '1' &&
+    Number.isSafeInteger(ceilingMs) && ceilingMs > 0 && ceilingMs < Number.MAX_SAFE_INTEGER
+}
+
+function resolvePreMutationRouteDecisionHash(request, exactFileHash) {
+  const requested = request && request.routeDecisionHash
+  if (/^[a-f0-9]{64}$/u.test(requested || '')) return requested
+  const persisted = typeof exactFileHash === 'function' ? exactFileHash('route/decision.json') : null
+  if (!/^[a-f0-9]{64}$/u.test(persisted || '')) {
+    throw new SupervisorIntegrationError(
+      'PRE_MUTATION_BASELINE_INVALID',
+      'pre-mutation baseline requires the durable route-decision hash',
+    )
+  }
+  return persisted
+}
+
+function productionRoadmapExpansionAuthority(input = {}) {
+  const admittedAskCount = Number(input.admittedAskCount)
+  const missionScopeHash = input.missionScopeHash
+  const planSha256 = input.planSha256
+  if (!Number.isSafeInteger(admittedAskCount) || admittedAskCount < 1 ||
+      !/^[a-f0-9]{64}$/u.test(missionScopeHash || '') ||
+      !/^[a-f0-9]{64}$/u.test(planSha256 || '')) {
+    throw new SupervisorIntegrationError(
+      'ROADMAP_EXPANSION_NOT_ADMITTED',
+      'production roadmap authority requires an exact expansion count and immutable request/plan hashes',
+    )
+  }
+  const requestVersionPointerHash = hashText(stableStringify(input.requestVersionPointer || null))
+  const necessityEvidenceHash = hashText(stableStringify({
+    schemaVersion: 1,
+    kind: 'roadmap-decomposition-necessity',
+    admittedAskCount,
+    missionScopeHash,
+    planSha256,
+    requestVersionPointerHash,
+  }))
+  const marginalValueEvidenceHash = hashText(stableStringify({
+    schemaVersion: 1,
+    kind: 'roadmap-decomposition-marginal-value',
+    admittedAskCount,
+    missionScopeHash,
+    planSha256,
+    requestVersionPointerHash,
+  }))
+  const receipt = {
+    schemaVersion: 1,
+    authorityId: 'production-supervisor-roadmap-expansion',
+    accepted: true,
+    admittedAskCount,
+    missionScopeHash,
+    planSha256,
+    requestVersionPointerHash,
+    necessityEvidenceHash,
+    marginalValueEvidenceHash,
+  }
+  return Object.freeze({
+    ...receipt,
+    authorityReceiptHash: hashText(stableStringify(receipt)),
+  })
+}
+
+function appendSupervisorRecordedCapturedDomainOutcomes(contracts, outcomes) {
+  const target = Array.isArray(outcomes) ? outcomes : []
+  for (const contract of Array.isArray(contracts) ? contracts : []) {
+    if (!contract || contract.kind !== 'IMAGE_DATUM' ||
+        target.some(outcome => outcome && outcome.kind === 'IMAGE_DATUM')) continue
+    target.push(Object.freeze({
+      schemaVersion: '1.0.0',
+      kind: 'IMAGE_DATUM',
+      certificateHash: contract.certificateHash,
+      rulingHash: contract.rulingHash,
+      selectedInterpretationId: contract.selectedInterpretation && contract.selectedInterpretation.id,
+      certificateRecordedBeforeGeometryWrites: true,
+    }))
+  }
+  return target
+}
+
+function runtimeCapabilityExpiryMs(requestedExpiryMs, issuedAtMs, environment = process.env) {
+  const maximumLifetimeMs = environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
+    ? Number.POSITIVE_INFINITY
+    : 5 * 60 * 1000
+  return Math.min(Number(requestedExpiryMs), issuedAtMs + maximumLifetimeMs)
+}
+
+function codexPrivateWorkspaceProjection(record, canonicalTargetPath, workingDirectory) {
+  if (!record.workerWorkspace) return []
+  const canonicalTargetRoot = path.resolve(canonicalTargetPath)
+  const writableWorkspaceRoot = path.resolve(workingDirectory)
+  if (canonicalTargetRoot === writableWorkspaceRoot ||
+      writableWorkspaceRoot.startsWith(`${canonicalTargetRoot}${path.sep}`) ||
+      canonicalTargetRoot.startsWith(`${writableWorkspaceRoot}${path.sep}`)) {
+    throw new SupervisorIntegrationError(
+      'WORKER_ISOLATION_UNSUPPORTED',
+      'Codex private-workspace projection requires disjoint canonical and writable roots',
+    )
+  }
+  if (!record.canonicalAssignment || !Array.isArray(record.canonicalAssignment.resources)) {
+    throw new SupervisorIntegrationError(
+      'WORKER_ISOLATION_UNSUPPORTED',
+      'Codex private-workspace projection requires the bound canonical assignment',
+    )
+  }
+  const resources = record.canonicalAssignment.resources.flatMap(resource => {
+    if (!resource || !LOCAL_MUTATION_RESOURCE_KINDS.has(resource.kind)) return []
+    const canonicalPath = resolveOwnedResourcePath(canonicalTargetRoot, resource)
+    if (!canonicalPath) return []
+    const relativePath = path.relative(canonicalTargetRoot, canonicalPath)
+    return [Object.freeze({
+      kind: resource.kind,
+      access: resource.access,
+      canonicalPath,
+      workspacePath: relativePath
+        ? path.resolve(writableWorkspaceRoot, relativePath)
+        : writableWorkspaceRoot,
+      reportPath: relativePath ? relativePath.replace(/\\/g, '/') : '.',
+    })]
+  })
+  const projection = Object.freeze({
+    schemaVersion: 1,
+    canonicalTargetRoot,
+    writableWorkspaceRoot,
+    resources: Object.freeze(resources),
+  })
+  return [
+    'AUTOPROMPT_PRIVATE_WORKSPACE_PROJECTION_V1',
+    `Private workspace projection: ${JSON.stringify(projection)}`,
+    'You are running inside an isolated physical clone. The canonical target root is intentionally not writable.',
+    'For every read, write, command, or path named at or below canonicalTargetRoot, use the identical relative path below writableWorkspaceRoot instead.',
+    'Do not attempt to write canonicalTargetRoot directly. Make all requested mutations in writableWorkspaceRoot.',
+    'Report filesChanged as normalized paths relative to canonicalTargetRoot (the reportPath values), never as private absolute paths.',
+  ]
+}
+
 class CodexExecAdapter {
   constructor(options = {}) {
     if (!options.runner || typeof options.runner.run !== 'function') {
@@ -2420,6 +2754,9 @@ class CodexExecAdapter {
     this.checkerProfilePath = path.resolve(options.checkerProfilePath || options.profilePath)
     this.checkerProfile = options.checkerProfile || 'autoprompt-checker'
     this.outputSchemaResolver = options.outputSchemaResolver
+    this.providerSchemaRoot = options.providerSchemaRoot
+      ? path.resolve(options.providerSchemaRoot)
+      : null
   }
 
   async launch(record) {
@@ -2430,7 +2767,13 @@ class CodexExecAdapter {
         'external Codex launch requires the hash-verified structural $autoprompt envelope',
       )
     }
-    const schemaPath = path.resolve(this.outputSchemaResolver(record))
+    const canonicalSchemaPath = path.resolve(this.outputSchemaResolver(record))
+    const canonicalSchemaBytes = this.providerSchemaRoot
+      ? fs.readFileSync(canonicalSchemaPath)
+      : null
+    const schemaPath = this.providerSchemaRoot
+      ? materializeCodexProviderEnvelopeSchema(this.providerSchemaRoot)
+      : canonicalSchemaPath
     const executionPolicy = record.physicalExecutionPolicy
     if (!executionPolicy || executionPolicy.logicalRole !== record.logicalRole ||
         executionPolicy.physicalRole !== record.physicalRole ||
@@ -2489,6 +2832,28 @@ class CodexExecAdapter {
     const argv = record.continuationId
       ? [...this.executableArgs, 'exec', 'resume', ...common, record.continuationId, '-']
       : [...this.executableArgs, 'exec', ...common, '-p', selectedProfile, '-C', workingDirectory, '-']
+    const providerTransport = this.providerSchemaRoot
+      ? [
+          'AUTOPROMPT_CODEX_PROVIDER_TRANSPORT_V1',
+          'Return exactly one provider envelope object. Its only field is canonicalJson.',
+          'canonicalJson must be a JSON string which decodes to the complete canonical output object.',
+          'The decoded object remains subject to all canonical AutoPrompt validation after transport decoding.',
+          `Canonical output schema: ${canonicalSchemaBytes.toString('utf8')}`,
+        ]
+      : []
+    const workspaceProjection = codexPrivateWorkspaceProjection(
+      record,
+      record.canonicalTargetPath || this.targetPath,
+      workingDirectory,
+    )
+    const workerCompletionBoundary = record.logicalRole === 'worker'
+      ? [
+          'AUTOPROMPT_WORKER_COMPLETION_BOUNDARY_V1',
+          'Judge allAssignedItemsPass and every successItems status only against this worker assignment and its author-side checks.',
+          'A later independent reviewer check is owned by the supervisor, is not a blocked worker success item, and must not make allAssignedItemsPass false.',
+          'When the owned implementation and author-side checks pass, report allAssignedItemsPass=true so the supervisor can freeze and dispatch the separate checker.',
+        ]
+      : []
     const input = [
       record.entryPrompt,
       'AUTOPROMPT_EXTERNAL_CHILD_V1',
@@ -2496,10 +2861,13 @@ class CodexExecAdapter {
       `physical_role=${record.physicalRole}`,
       `provider_role=${record.providerRole}`,
       `physical_role_policy=${executionPolicy.policyId}@${executionPolicy.policyVersion}`,
+      ...providerTransport,
       record.dispatch.brief,
       `Canonical context envelope: ${JSON.stringify(record.dispatch)}`,
       record.canonicalAssignment ? `Canonical assignment: ${JSON.stringify(record.canonicalAssignment)}` : '',
       `Request pointer: ${JSON.stringify(record.dispatch.requestPointer)}`,
+      ...workerCompletionBoundary,
+      ...workspaceProjection,
       '',
     ].join('\n')
     let sawStreamedOutput = false
@@ -2511,8 +2879,8 @@ class CodexExecAdapter {
     let streamedUsage = { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 }
     let terminalReceiptPersisted = false
     let firstProductSignalPersisted = false
-    const assembledResult = (parsed, completionRequested) => {
-      const output = parsed.output || {}
+    const assembledResult = (parsed, completionRequested, decodedOutput = null) => {
+      const output = decodedOutput || parsed.output || {}
       return {
         ...output,
         candidateHash: record.candidateHash || output.candidateHash || null,
@@ -2624,12 +2992,27 @@ class CodexExecAdapter {
         }
       }
       const current = streamAccumulator.watermark()
-      if (!typedTerminal && current.usage && typedChildOutputReady(current.output, record)) {
+      let currentOutput = current.output
+      // Codex may emit commentary/progress as earlier agent_message items even
+      // when --output-schema is active.  Only the last agent message is the
+      // structured terminal value, and it is terminal only after the matching
+      // turn.completed event supplies complete usage.  Decoding an earlier
+      // progress envelope here would cancel a healthy turn as a transport
+      // failure before Codex can emit its actual structured result.
+      if (current.usage && this.providerSchemaRoot && currentOutput &&
+          typeof currentOutput.canonicalJson === 'string') {
+        try { currentOutput = decodeCodexProviderEnvelope(currentOutput) } catch (error) {
+          streamError = error
+          stop(error.code)
+          return
+        }
+      }
+      if (!typedTerminal && current.usage && typedChildOutputReady(currentOutput, record)) {
         const terminalSnapshot = streamAccumulator.snapshot()
-        typedTerminal = current.output.outcome || current.output.code || current.output.reportType
+        typedTerminal = currentOutput.outcome || currentOutput.code || currentOutput.reportType
         if (typeof record.onTerminalResult === 'function') {
           try {
-            record.onTerminalResult(assembledResult(terminalSnapshot, true), {
+            record.onTerminalResult(assembledResult(terminalSnapshot, true, currentOutput), {
               rawOutputHash: rawOutputHash.copy().digest('hex'),
               eventStreamHash: terminalSnapshot.eventStreamHash,
               sessionId: record.continuationId || current.sessionId,
@@ -2684,6 +3067,7 @@ class CodexExecAdapter {
     if (!parsed.usage) {
       throw new SupervisorIntegrationError('CODEX_USAGE_INCOMPLETE', 'Codex child ended without all four usage categories')
     }
+    if (this.providerSchemaRoot) parsed.output = decodeCodexProviderEnvelope(parsed.output)
     if (!typedChildOutputReady(parsed.output, record)) {
       parsed.output = reconstructTypedExitZeroResult(record, parsed)
     }
@@ -2926,6 +3310,9 @@ function runOwnedCodexProxy(requestPath) {
 }
 
 async function withTimeout(operation, milliseconds, timerApi, code, onTimeout) {
+  if (milliseconds === Number.POSITIVE_INFINITY) {
+    return Promise.resolve().then(operation)
+  }
   if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
     throw new SupervisorIntegrationError(code, `${code} elapsed`)
   }
@@ -2992,7 +3379,7 @@ function validateRuntimeDependencies(options) {
     }
   }
   if (!options.missionLock || typeof options.missionLock.acquire !== 'function') {
-    throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'a canonical mission lock is required')
+    throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'a canonical original-request lock is required')
   }
   if (!options.budgetController || typeof options.budgetController.assertAvailable !== 'function') {
     throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'a run-global budget controller is required')
@@ -3260,7 +3647,7 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
         new Set(requiredVerdictIds).size !== requiredVerdictIds.length) {
       throw new SupervisorIntegrationError(
         'ALL_WORK_JOINED_INVALID',
-        'candidate freeze requires the exact one-or-two-seat verdict plan',
+        'exact-version freeze requires the exact one-or-two-seat verdict plan',
       )
     }
     const graph = createEvidenceInvalidationGraph({
@@ -3278,7 +3665,7 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
       })),
     })
     return stateStore.freezeCandidateForChecks({
-      capability, cause: 'freeze graph-bound candidate for independent checks',
+      capability, cause: 'freeze graph-bound exact version for independent checks',
       candidateHash: details.candidateHash, environmentHash: details.environmentHash,
       dependencyHash: details.dependencyHash, evidenceGraph: graph, requiredVerdictIds,
     })
@@ -3871,7 +4258,7 @@ class CodexSupervisorRuntime {
         this._persistRecoveryCheckpoint({
           kind: 'CHECKPOINT',
           causeId: `route-start:${this.activation.generation}`,
-          humanDescription: 'Persist the pre-launch route-analysis frontier before admitting the sole analyst.',
+          humanDescription: 'Persist the pre-launch route-analysis next ready work before admitting the sole analyst.',
         }, { nextReadyWorkIds: ['route-analyst'] })
         const analysis = await this._runRouteAnalyst()
         decisionResult = await this._runL0Decision(analysis)
@@ -3928,7 +4315,7 @@ class CodexSupervisorRuntime {
           if (this.route === 'LIGHT') {
             await withTimeout(
               prepare,
-              LIGHT_PLAN_MAX_DURATION_MS,
+              benchmarkPhaseTimeoutMs(LIGHT_PLAN_MAX_DURATION_MS),
               this.timerApi,
               'LIGHT_PLAN_TIMEOUT',
               () => this.processOwner.cancelAll({ reason: 'light planning timeout' }),
@@ -3989,6 +4376,21 @@ class CodexSupervisorRuntime {
       }
       return this._finish(terminalOutcome, result)
     } catch (error) {
+      const benchmarkDiagnostic = this.options.baseEnvironment &&
+        this.options.baseEnvironment.AUTOPROMPT_BENCHMARK_DIAGNOSTICS
+      if (benchmarkDiagnostic) {
+        try {
+          fs.appendFileSync(benchmarkDiagnostic, `${JSON.stringify({
+            label: 'supervisor-runtime-error',
+            state: typeof this.options.runtimeStateProvider === 'function'
+              ? this.options.runtimeStateProvider()?.state || null
+              : null,
+            route: this.route,
+            error: serializeError(error),
+            stack: error && error.stack || null,
+          })}\n`, { mode: 0o600 })
+        } catch {}
+      }
       if (error && error.code === 'WORKSPACE_LEASE_CONFLICT') {
         return this._preLeaseOutcome('WORKSPACE_LEASE_CONFLICT', { error: serializeError(error) })
       }
@@ -4062,7 +4464,7 @@ class CodexSupervisorRuntime {
           checks: ['Read/list/search only; do not mutate or dispatch.'],
           admission,
         }),
-        ROUTE_ANALYST_MAX_DURATION_MS,
+        benchmarkPhaseTimeoutMs(ROUTE_ANALYST_MAX_DURATION_MS),
         this.timerApi,
         'ROUTE_ANALYST_TIMEOUT',
         () => this.processOwner.cancelAll({ reason: 'route analyst timeout' }),
@@ -4478,6 +4880,7 @@ class CodexSupervisorRuntime {
         submittedAtMs: submittedAtMonotonic,
         nowMs: submittedAtMonotonic,
         decision: submitted.decision,
+        requestText: this.options.mission,
         correctionAttempts,
       })
       if (result.status === 'ROUTE_DECISION_INVALID' && result.correction_allowed) {
@@ -4668,7 +5071,7 @@ class CodexSupervisorRuntime {
           receipt.workItemId !== workItemId || receipt.logicalRole !== 'diagnostic-probe' ||
           receipt.physicalRole !== physicalRole || receipt.providerRole !== providerRole ||
           receipt.requestEnvelopeHash !== (this.requestPointer && this.requestPointer.hash) ||
-          !receipt.result || receipt.result.code !== 'PASS' ||
+          !representativePolicyProbePassed(receipt.result) ||
           receipt.resultHash !== hashText(stableStringify(receipt.result))) {
         throw new SupervisorIntegrationError(
           'CRASH_ADOPTION_CONFLICT',
@@ -4698,10 +5101,10 @@ class CodexSupervisorRuntime {
       checks: ['No mutation, dispatch, or external operation is permitted.'],
       bounded: true, nextReadyAfter: [],
     })
-    if (!result || result.code !== 'PASS') {
+    if (!representativePolicyProbePassed(result)) {
       throw new SupervisorIntegrationError(
         'DIAGNOSTIC_DENIAL_BLOCKED',
-        'the mandatory representative role/policy probe was denied before fleet launch',
+        'the mandatory representative role/policy probe was denied before the worker group launched',
         { workerCount: Math.max(1, this.diagnosticWorkerLaunches), logicalRole: 'diagnostic-probe', physicalRole, providerRole },
       )
     }
@@ -4965,7 +5368,8 @@ class CodexSupervisorRuntime {
         receipt.continuationId !== binding.continuationId ||
         receipt.requestEnvelopeHash !== this.requestPointer.hash ||
         receipt.resultHash !== hashText(JSON.stringify(receipt.result)) ||
-        receipt.candidateHash !== (receipt.result && receipt.result.candidateHash || null) ||
+        (!CHECKER_ROLES.has(saved.logicalRole) &&
+          receipt.candidateHash !== (receipt.result && receipt.result.candidateHash || null)) ||
         (saved.logicalRole !== 'route-analyst' &&
           (!/^[a-f0-9]{64}$/.test(receipt.workerContextBindingHash || '') ||
            !receipt.result || receipt.result.contextId !== receipt.continuationId))) {
@@ -4978,7 +5382,9 @@ class CodexSupervisorRuntime {
       workItemId: saved.workItemId,
       logicalRole: saved.logicalRole,
       physicalRole: receipt.physicalRole,
-      candidateHash: receipt.candidateHash,
+      candidateHash: CHECKER_ROLES.has(saved.logicalRole)
+        ? receipt.result && receipt.result.candidateHash || null
+        : receipt.candidateHash,
     }, receipt.result, this.options.runId, this.requestPointer.hash)
     if (saved.logicalRole !== 'route-analyst') {
       const assignmentPath = this.record.resolve(`work/assignments/${hashText(saved.workItemId)}.json`)
@@ -5142,7 +5548,7 @@ class CodexSupervisorRuntime {
           ? `${resumedCheckerAssignment} Return every declared captured-domain result in payload.capturedDomainOutcomes.`
           : resumedCheckerAssignment,
         candidateHash,
-        oracle: `independent-oracle-${index + 1}`,
+        oracle: `independent-check-${index + 1}`,
         isolation: 'snapshot',
         writeProducing: true,
         success: decision.successChecklist || [],
@@ -5153,7 +5559,7 @@ class CodexSupervisorRuntime {
         firstResponsibility: decision.independentCheckingPlan && decision.independentCheckingPlan.responsibilities[0],
         secondResponsibility: decision.independentCheckingPlan && decision.independentCheckingPlan.responsibilities[1],
         harnessAttestation: this.options.harnessAttestation
-          ? this.options.harnessAttestation(candidateHash, `independent-oracle-${index + 1}`)
+          ? this.options.harnessAttestation(candidateHash, `independent-check-${index + 1}`)
           : undefined,
         adoptedSandboxResources: saved.resources,
       } : roadmapPlanning ? {
@@ -5294,7 +5700,7 @@ class CodexSupervisorRuntime {
       if (targetCandidateHash !== state.candidateHash) {
         throw new SupervisorIntegrationError(
           'CONCURRENT_MUTATION',
-          'committed deferred-promotion journal does not match the target candidate',
+          'committed deferred-promotion journal does not match the target exact version',
         )
       }
       for (const postimage of state.postimages) {
@@ -5329,7 +5735,7 @@ class CodexSupervisorRuntime {
             this.options.gitEnvironment(workerWorkspace.workspacePath)) !== state.candidateHash) {
         throw new SupervisorIntegrationError(
           'DONE_RETRY_RECOVERY_INVALID',
-          'private DONE retry candidate changed before resumed acceptance',
+          'private DONE retry version changed before resumed acceptance',
         )
       }
       const preimages = state.canonicalAssignment.resources
@@ -5457,7 +5863,7 @@ class CodexSupervisorRuntime {
     if (pending.alreadyPromoted || pending.state.status === 'PROMOTED') {
       throw new SupervisorIntegrationError(
         'DONE_RETRY_ALREADY_PROMOTED',
-        'a journal-proven committed candidate cannot be aborted during restart reconciliation',
+        'a journal-proven committed version cannot be aborted during restart reconciliation',
       )
     }
     try { pending.workerWorkspace.manager.abort(pending.workerWorkspace) } finally {
@@ -5548,7 +5954,7 @@ class CodexSupervisorRuntime {
       findingIds,
     }
     if (CHECKER_ROLES.has(policy.child) && !/^[a-f0-9]{64}$/.test(request.candidateHash || '')) {
-      throw new SupervisorIntegrationError('CANDIDATE_HASH_REQUIRED', `${policy.child} requires an exact sha256 candidate hash`)
+      throw new SupervisorIntegrationError('CANDIDATE_HASH_REQUIRED', `${policy.child} requires an exact sha256 version hash`)
     }
     const oracle = request.oracle || policy.child
     const dispatch = CHECKER_ROLES.has(policy.child)
@@ -5616,6 +6022,7 @@ class CodexSupervisorRuntime {
         workload: request.estimate || {},
       })
     }
+    assignment = applyBenchmarkEffortPin(assignment)
     const schedulerRequest = {
       workItemId: request.workItemId,
       equivalenceKey: executorKey,
@@ -5653,7 +6060,7 @@ class CodexSupervisorRuntime {
           deferredCandidate.candidateHash !== request.candidateHash)) {
         throw new SupervisorIntegrationError(
           'DONE_RETRY_ISOLATION_REQUIRED',
-          'checker request does not bind the exact live deferred DONE retry candidate',
+          'checker request does not bind the exact live deferred DONE retry version',
         )
       }
       const checkerPlanInput = {
@@ -5696,7 +6103,7 @@ class CodexSupervisorRuntime {
         if (!snapshotPath || !fs.existsSync(snapshotPath) || restoredCandidateHash !== request.candidateHash) {
           throw new SupervisorIntegrationError(
             'CRASH_ADOPTION_CONFLICT',
-            'adopted checker snapshot is absent or differs from its frozen candidate',
+            'adopted checker snapshot is absent or differs from its frozen exact version',
             {
               snapshotPath: snapshotPath || null,
               expectedCandidateHash: request.candidateHash,
@@ -5771,6 +6178,7 @@ class CodexSupervisorRuntime {
         policy.definition.permissions.write.length === 0,
       requestEnvelopeHash: this.requestPointer.hash,
       targetPath: targetWorkingDirectory,
+      canonicalTargetPath: this.options.targetPath,
       enforcePreimages: TARGET_MUTATOR_ROLES.has(policy.child) && Boolean(this.options.mutationEnforcer),
       additionalResources: CHECKER_ROLES.has(policy.child)
         ? checkerAssignmentResources(sandboxAssignment, request.workItemId) : [],
@@ -6121,6 +6529,7 @@ class CodexSupervisorRuntime {
       environment: env,
       environmentHash,
       workingDirectory,
+      canonicalTargetPath: targetWorkingDirectory,
       assignment,
       canonicalAssignment,
       schedulerResources: Object.freeze([...(schedulerRequest.resources || [])].map(resource => Object.freeze({ ...resource }))),
@@ -6197,6 +6606,17 @@ class CodexSupervisorRuntime {
           executorKey,
           contextId: terminalContextId,
         }
+        // Checker reports are bound to the exact artifact they inspected. A
+        // ROADMAP plan checker therefore returns the plan-file hash, while the
+        // recovery journal is intentionally bound to the runtime's immutable
+        // workspace candidate. Keep both bindings instead of reusing the
+        // checker artifact hash as the scheduler candidate.
+        const receiptCandidateHash = resolveTerminalReceiptCandidateHash({
+          logicalRole: policy.child,
+          runtimeStateProvider: this.options.runtimeStateProvider,
+          requestCandidateHash: request.candidateHash,
+          resultCandidateHash: terminalResult.candidateHash,
+        })
         const body = {
           schemaVersion: 1,
           runId: this.options.runId,
@@ -6216,7 +6636,7 @@ class CodexSupervisorRuntime {
           workerContextBindingHash: workerContextIdentity
             ? hashText(stableStringify(workerContextIdentity)) : null,
           requestEnvelopeHash: this.requestPointer.hash,
-          candidateHash: terminalResult.candidateHash || null,
+          candidateHash: receiptCandidateHash,
           resultHash: hashText(JSON.stringify(terminalResult)),
           rawOutputHash: terminalEvidence.rawOutputHash,
           eventStreamHash: terminalEvidence.eventStreamHash,
@@ -6499,7 +6919,7 @@ class CodexSupervisorRuntime {
       if (checkKey && (!result || result.candidateHash !== request.candidateHash)) {
         throw new SupervisorIntegrationError(
           'CHECK_RESULT_CANDIDATE_MISMATCH',
-          'checker result must bind the exact admitted candidate hash',
+          'checker result must bind the exact admitted version hash',
         )
       }
       if (!result || result.usageStreamed !== true) {
@@ -6596,7 +7016,7 @@ class CodexSupervisorRuntime {
         this._persistRecoveryCheckpoint({
           kind: CHECKER_ROLES.has(policy.child) ? 'CHECK_COMPLETED' : 'LEASE_COMPLETED',
           causeId: `scheduler:${this.activation.generation}:${lease.id}:completed`,
-          humanDescription: 'Persist the completed model result and released scheduler lease as one recovery frontier.',
+          humanDescription: 'Persist the completed model result and released scheduler lease as one recovery point.',
         }, {
           candidateHash: request.candidateHash || null,
           nextReadyWorkIds: request.nextReadyAfter || [],
@@ -6700,8 +7120,8 @@ class CodexSupervisorRuntime {
     const status = this.budget.assertAvailable({ forWork: true })
     return withTimeout(operation, status.remaining.wallMs, this.timerApi, 'MISSION_TIMEOUT', async () => {
       this.cancelled = true
-      if (this.scheduler) this.scheduler.dispose('mission deadline elapsed')
-      await this.processOwner.cancelAll({ reason: 'mission deadline elapsed' })
+      if (this.scheduler) this.scheduler.dispose('original-request deadline elapsed')
+      await this.processOwner.cancelAll({ reason: 'original-request deadline elapsed' })
       await this.processOwner.assertDrained()
     })
   }
@@ -6717,7 +7137,10 @@ class CodexSupervisorRuntime {
         ? ADMISSION_COMPONENT_CEILINGS_MS.routeAnalyst + ADMISSION_COMPONENT_CEILINGS_MS.routeDecision +
           ADMISSION_COMPONENT_CEILINGS_MS.lightPlanning
         : scheduler.budget.admissionHardMs
-    if (!Number.isSafeInteger(ceilingMs) || ceilingMs <= 0) return missionOperation()
+    if (!benchmarkFirstProductSignalDeadlineEnabled(
+      ceilingMs,
+      this.options.baseEnvironment || process.env,
+    )) return missionOperation()
     const elapsedMs = Math.max(0, this.monotonicNow() - this.admissionStartedAt)
     const remainingMs = ceilingMs - elapsedMs
     if (remainingMs <= 0) {
@@ -6814,7 +7237,7 @@ class CodexSupervisorRuntime {
       this._persistRecoveryCheckpoint({
         kind: details.candidateHash ? 'CANDIDATE_FROZEN' : 'FRONTIER_CHANGED',
         causeId: `state:${this.activation.generation}:${nextState}:${transitioned && transitioned.sequence || 0}`,
-        humanDescription: `Persist the exact scheduler frontier after canonical state ${nextState}.`,
+        humanDescription: `Persist the exact scheduler next ready work after canonical state ${nextState}.`,
       }, {
         candidateHash: details.candidateHash,
         openCheckIds: details.openCheckIds || [],
@@ -6825,7 +7248,7 @@ class CodexSupervisorRuntime {
   }
 
   async _enterTerminalRelease(outcome, error) {
-    if (typeof this.options.runtimeStateProvider !== 'function') return outcome
+    if (!this.finalizer || typeof this.options.runtimeStateProvider !== 'function') return outcome
     const opened = this.options.runtimeStateProvider()
     let state = opened && opened.state
     if (state === 'RELEASING_LOCK') return outcome
@@ -6836,6 +7259,12 @@ class CodexSupervisorRuntime {
     if (outcome === 'PARTIAL') {
       await this._runtimeTransition('BUDGET_EXHAUSTED_FINAL', 'RELEASING_LOCK')
       return 'PARTIAL'
+    }
+    if (state === 'L0_ROUTE_DECISION') {
+      await this._runtimeTransition('ROUTE_DECISION_INVALID_FINAL', 'RELEASING_LOCK', {
+        errorCode: error && error.code || 'FAILED',
+      })
+      return 'FAILED'
     }
     if (outcome === 'BLOCKED' && ['PREPARE_WORK', 'RUN_WORK', 'CHECK_WORK', 'REPAIRING'].includes(state)) {
       await this._runtimeTransition('ENVIRONMENT_BLOCKED', 'RELEASING_LOCK', {
@@ -6911,13 +7340,13 @@ class CodexSupervisorRuntime {
       if (deliverables.length === 0 && !validReadOnlyFinalResponse(result.finalResponse)) {
         throw new SupervisorIntegrationError(
           'USER_USABLE_BUILD_REQUIRED',
-          'DONE short-circuits before terminal fleet work when no current user-usable deliverable exists',
+          'DONE short-circuits before terminal worker-group checks when no current user-usable deliverable exists',
         )
       }
       if (checkHashes.length === 0 || checkHashes.some(hash => !/^[a-f0-9]{64}$/.test(hash))) {
         throw new SupervisorIntegrationError(
           'BUILD_ACCEPTANCE_REQUIRED',
-          'DONE requires completed hash-bound build acceptance before terminal assurance',
+          'DONE requires completed hash-bound build acceptance before terminal independent review and testing',
         )
       }
     }
@@ -7299,12 +7728,17 @@ function validateActivationInputs(args = {}, environment = process.env, adapterP
   }
   const roleProjection = validateActivationRoleProjection(record, canonicalProfile, activationRoot)
   const modelSelection = record.modelSelection || {}
+  const explicitEffort = modelSelection.effort
+  const explicitEffortValid = ['low', 'medium', 'high', 'xhigh', 'max'].includes(explicitEffort) ||
+    Boolean(explicitEffort && typeof explicitEffort === 'object' && !Array.isArray(explicitEffort) &&
+      explicitEffort.status === 'selectable' && typeof explicitEffort.source === 'string' &&
+      explicitEffort.source.length > 0)
   if (modelSelection.schemaVersion !== 1 || !['provider-default', 'auto', 'explicit'].includes(modelSelection.mode) ||
       typeof modelSelection.selector !== 'string' || !Array.isArray(modelSelection.models) ||
       modelSelection.models.some(model => typeof model !== 'string' || !model) ||
       (modelSelection.mode === 'explicit' && (
         modelSelection.models.length !== 1 ||
-        !['low', 'medium', 'high', 'xhigh', 'max'].includes(modelSelection.effort) ||
+        !explicitEffortValid ||
         modelSelection.probeAcceptance &&
           modelSelection.probeAcceptance.explicitModelAndEffortAssignments !== true
       )) ||
@@ -7480,9 +7914,11 @@ function activationRuntimeSettings(activation, context = {}) {
   }
   const modelSelection = activation.modelSelection
   const modelRouting = { selector: modelSelection.selector }
-  if (modelSelection.mode === 'explicit' && modelSelection.models.length === 1 && modelSelection.effort) {
+  if (modelSelection.mode === 'explicit' && modelSelection.models.length === 1) {
     modelRouting.explicitUserModelPin = modelSelection.models[0]
-    modelRouting.explicitUserEffortPin = modelSelection.effort
+    if (typeof modelSelection.effort === 'string') {
+      modelRouting.explicitUserEffortPin = modelSelection.effort
+    }
   }
   explicit.modelRouting = modelRouting
   const available = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length
@@ -7498,33 +7934,36 @@ function activationRuntimeSettings(activation, context = {}) {
   }
 }
 
-function readPrivateAgentAssignment(activation, providerRole, logicalRole) {
+function readPrivateAgentAssignment(activation, providerRole, logicalRole, environment = process.env) {
   if (activation.modelSelection.mode === 'provider-default') {
     const effort = selectEffort({ role: logicalRole || providerRole.replace(/^ap-/, '') })
-    return Object.freeze({
+    return applyBenchmarkEffortPin(Object.freeze({
       model: null,
       effort: effort.effort,
       source: 'role-effort-policy',
       registryMatched: false,
       routeIndependent: true,
-    })
+    }), environment)
   }
   if (providerRole === 'ap-run-owner') {
     if (activation.modelSelection.mode === 'explicit') {
-      return Object.freeze({
+      const policyEffort = selectEffort({ role: logicalRole || 'run-owner' }).effort
+      return applyBenchmarkEffortPin(Object.freeze({
         model: activation.modelSelection.models[0],
-        effort: activation.modelSelection.effort,
+        effort: typeof activation.modelSelection.effort === 'string'
+          ? activation.modelSelection.effort
+          : policyEffort,
         source: 'explicit',
         registryMatched: false,
-      })
+      }), environment)
     }
-    return Object.freeze(selectModelAssignment({
+    return applyBenchmarkEffortPin(Object.freeze(selectModelAssignment({
       role: logicalRole || 'run-owner',
       difficulty: 'hard',
       risk: 'high',
       registry: activation.modelRegistry || [],
       requiredCapabilities: ['contextFreeDispatch'],
-    }))
+    })), environment)
   }
   const profileSource = fs.readFileSync(activation.profilePath, 'utf8')
   const physicalProviderRole = activation.roleProjection?.logicalToPhysicalProviderRole?.[providerRole]
@@ -7562,14 +8001,15 @@ function readPrivateAgentAssignment(activation, providerRole, logicalRole) {
   const model = /^model\s*=\s*"([^"]+)"\s*$/m.exec(source)
   const effort = /^model_reasoning_effort\s*=\s*"([^"]+)"\s*$/m.exec(source)
   if (!model || !effort || !activation.modelSelection.models.includes(model[1]) ||
-      (activation.modelSelection.mode === 'explicit' && effort[1] !== activation.modelSelection.effort) ||
+      (activation.modelSelection.mode === 'explicit' && typeof activation.modelSelection.effort === 'string' &&
+        effort[1] !== activation.modelSelection.effort) ||
       !['low', 'medium', 'high', 'xhigh', 'max'].includes(effort[1])) {
     throw new SupervisorIntegrationError('MODEL_ASSIGNMENT_INVALID', `private Codex role assignment is not receipt-compatible: ${providerRole}`)
   }
-  return Object.freeze({
+  return applyBenchmarkEffortPin(Object.freeze({
     model: model[1], effort: effort[1], source: activation.modelSelection.mode,
     registryMatched: activation.modelSelection.mode === 'auto',
-  })
+  }), environment)
 }
 
 function runGit(repository, argv, options = {}) {
@@ -7605,7 +8045,7 @@ function hashWorkspaceCandidate(repository, environment) {
     }
     const stat = fs.lstatSync(absolute)
     if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.nlink) !== 1) {
-      throw new SupervisorIntegrationError('CANDIDATE_UNSAFE', `candidate contains a non-regular tracked input: ${name}`)
+      throw new SupervisorIntegrationError('CANDIDATE_UNSAFE', `exact version contains a non-regular tracked input: ${name}`)
     }
     digest.update(Buffer.from(`${stat.mode & 0o777}\0${stat.size}\0`, 'utf8'))
     digest.update(fs.readFileSync(absolute))
@@ -7633,6 +8073,7 @@ const ASSIGNMENT_RESOURCE_KINDS = new Set([
   'file', 'directory', 'service', 'database', 'output', 'cache', 'port', 'evidence-root', 'external-system',
 ])
 const LOCAL_MUTATION_RESOURCE_KINDS = new Set(['file', 'directory', 'output', 'cache', 'evidence-root'])
+const MISSING_RESOURCE_PREIMAGE_HASH = hashText('autoprompt-resource-missing-v1')
 
 function resolveOwnedResourcePath(repository, resource) {
   if (!resource || !LOCAL_MUTATION_RESOURCE_KINDS.has(resource.kind)) return null
@@ -7681,10 +8122,14 @@ function resourceStateEntry(repository, resource) {
   const absolute = resolveOwnedResourcePath(repository, resource)
   if (!absolute) return null
   if (!fs.existsSync(absolute)) {
-    return Object.freeze({ path: absolute, hash: hashText('autoprompt-resource-missing-v1'), type: 'missing' })
+    return Object.freeze({ path: absolute, hash: MISSING_RESOURCE_PREIMAGE_HASH, type: 'missing' })
   }
   const stat = fs.lstatSync(absolute)
-  if (stat.isSymbolicLink() || Number(stat.nlink) !== 1) {
+  // A regular file must have one physical link. A directory's link count is
+  // expected to exceed one as soon as it contains subdirectories (`.`/`..`),
+  // so applying the file invariant to checker snapshot roots rejects every
+  // non-empty snapshot before independent checking can start.
+  if (stat.isSymbolicLink() || (stat.isFile() && Number(stat.nlink) !== 1)) {
     throw new SupervisorIntegrationError('PREIMAGE_UNSAFE', `owned resource is not one physical target: ${absolute}`)
   }
   if (stat.isFile()) return Object.freeze({ path: absolute, hash: sha256Bytes(fs.readFileSync(absolute)), type: 'file' })
@@ -7693,6 +8138,8 @@ function resourceStateEntry(repository, resource) {
 }
 
 function canonicalAssignmentResources(input) {
+  const targetRoot = path.resolve(input.targetPath)
+  const canonicalTargetRoot = path.resolve(input.canonicalTargetPath || input.targetPath)
   const ownership = Array.isArray(input.request.ownership) && input.request.ownership.length
     ? input.request.ownership : ['workspace']
   const manifests = Array.isArray(input.request.manifests) ? input.request.manifests : []
@@ -7713,7 +8160,11 @@ function canonicalAssignmentResources(input) {
       input.request.workItemId, input.request.repairOf, input.request.executorKey, input.request.equivalenceKey,
     ].filter(Boolean).map(String))
     const canonicalWorkerOwner = /^work-(\d+)$/.exec(String(input.request.workItemId || ''))
-    if (canonicalWorkerOwner) authorizedOwners.add(`worker-${canonicalWorkerOwner[1]}`)
+    if (canonicalWorkerOwner) {
+      authorizedOwners.add(`worker-${canonicalWorkerOwner[1]}`)
+      authorizedOwners.add(`implementation-worker-${canonicalWorkerOwner[1]}`)
+      authorizedOwners.add(`ap-worker-${canonicalWorkerOwner[1]}`)
+    }
     if (!input.readOnly && !authorizedOwners.has(owner)) {
       throw new SupervisorIntegrationError(
         'OWNERSHIP_AUTHORIZATION_DENIED',
@@ -7739,25 +8190,29 @@ function canonicalAssignmentResources(input) {
     }
     if (['file', 'directory', 'evidence-root'].includes(kind)) {
       const absolute = resolveOwnedResourcePath(input.targetPath, resource)
-      if (!absolute || !fs.existsSync(absolute)) {
+      const exists = Boolean(absolute && fs.existsSync(absolute))
+      const authorizedCreation = !input.readOnly && input.enforcePreimages === true &&
+        resource.access === 'write' && resource.expectedPreimageHash === MISSING_RESOURCE_PREIMAGE_HASH
+      if (!absolute || (!exists && !authorizedCreation)) {
         throw new SupervisorIntegrationError(
           'MISSION_PATH_INVALID',
-          `canonical mission resource does not exist before child creation: ${kind}:${identity}`,
+          `canonical original-request resource does not exist before child creation: ${kind}:${identity}`,
         )
       }
+      if (!exists) return resource
       const stat = fs.lstatSync(absolute)
       const validType = kind === 'file' ? stat.isFile() : stat.isDirectory()
       if (stat.isSymbolicLink() || !validType) {
         throw new SupervisorIntegrationError(
           'MISSION_PATH_INVALID',
-          `canonical mission resource has the wrong physical type: ${kind}:${identity}`,
+          `canonical original-request resource has the wrong physical type: ${kind}:${identity}`,
         )
       }
     }
     return resource
   })
   const prosePaths = typeof input.request.assignment === 'string'
-    ? [...input.request.assignment.matchAll(/(?:^|[\s`'"(])((?:[A-Za-z]:[\\/]|\.{0,2}[\\/])?[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+)(?=$|[\s`'"),.;:])/gu)]
+    ? [...input.request.assignment.matchAll(/(?:^|[\s`'"(])((?:[A-Za-z]:[\\/]|\.{0,2}[\\/])?[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]*[A-Za-z0-9_-])+)(?=$|[\s`'"),.;:])/gu)]
         .map(match => match[1])
     : []
   const declaredOutputs = new Set(rows.filter(resource => ['output', 'cache'].includes(resource.kind))
@@ -7765,18 +8220,46 @@ function canonicalAssignmentResources(input) {
   for (const prosePath of [...new Set(prosePaths)]) {
     const normalized = prosePath.replace(/\\/g, '/')
     if (declaredOutputs.has(normalized)) continue
-    const absolute = path.isAbsolute(prosePath)
-      ? path.resolve(prosePath)
-      : path.resolve(input.targetPath, ...normalized.replace(/^\.\//u, '').split('/'))
-    const targetRoot = path.resolve(input.targetPath)
-    if ((absolute !== targetRoot && !absolute.startsWith(`${targetRoot}${path.sep}`)) ||
-        !fs.existsSync(absolute) || fs.lstatSync(absolute).isSymbolicLink()) {
+    const explicitPathSyntax = path.isAbsolute(prosePath) ||
+      /^[A-Za-z]:[\\/]/u.test(prosePath) || /^\.{1,2}[\\/]/u.test(prosePath) ||
+      /\.[A-Za-z0-9_-]+$/u.test(normalized)
+    const canonicalAbsolute = path.isAbsolute(prosePath) ? path.resolve(prosePath) : null
+    const canonicalRelative = canonicalAbsolute && (canonicalAbsolute === canonicalTargetRoot ||
+      canonicalAbsolute.startsWith(`${canonicalTargetRoot}${path.sep}`))
+      ? path.relative(canonicalTargetRoot, canonicalAbsolute) : null
+    const absolute = canonicalRelative !== null
+      ? path.resolve(targetRoot, canonicalRelative)
+      : path.isAbsolute(prosePath)
+        ? canonicalAbsolute
+        : path.resolve(input.targetPath, ...normalized.replace(/^\.\//u, '').split('/'))
+    const boundResource = rows.find(resource => resolveOwnedResourcePath(input.targetPath, resource) === absolute)
+    const authorizedCreation = Boolean(boundResource && boundResource.access === 'write' &&
+      input.enforcePreimages === true && boundResource.expectedPreimageHash === MISSING_RESOURCE_PREIMAGE_HASH)
+    if (absolute !== targetRoot && !absolute.startsWith(`${targetRoot}${path.sep}`)) {
       throw new SupervisorIntegrationError(
         'MISSION_PATH_INVALID',
         `path named in the canonical child brief is missing, unsafe, or outside the target: ${prosePath}`,
       )
     }
-    const alreadyBound = rows.some(resource => resolveOwnedResourcePath(input.targetPath, resource) === absolute)
+    // Natural prose can contain slash-separated terms such as
+    // `JavaScript/XSS`. Treat a missing bare term as prose unless it is bound
+    // by the resource manifest. Explicit absolute/dot-relative paths remain
+    // fail-closed, as do every existing symlink and declared resource.
+    if (!fs.existsSync(absolute) && !authorizedCreation) {
+      if (!explicitPathSyntax && !boundResource) continue
+      throw new SupervisorIntegrationError(
+        'MISSION_PATH_INVALID',
+        `path named in the canonical child brief is missing, unsafe, or outside the target: ${prosePath}`,
+      )
+    }
+    if (fs.existsSync(absolute) && fs.lstatSync(absolute).isSymbolicLink()) {
+      throw new SupervisorIntegrationError(
+        'MISSION_PATH_INVALID',
+        `path named in the canonical child brief is missing, unsafe, or outside the target: ${prosePath}`,
+      )
+    }
+    if (!fs.existsSync(absolute)) continue
+    const alreadyBound = Boolean(boundResource)
     if (!alreadyBound) {
       const stat = fs.lstatSync(absolute)
       if ((!stat.isFile() && !stat.isDirectory()) || (stat.isFile() && Number(stat.nlink) !== 1)) {
@@ -7982,7 +8465,7 @@ function validateCanonicalChildResult(record, result, runId, requestEnvelopeHash
     if (result.schemaVersion !== '2.0.0' || !['PASS', 'FAIL'].includes(result.code) ||
         result.runId !== runId || result.requestEnvelopeHash !== requestEnvelopeHash ||
         result.currentVersionHash !== record.candidateHash) {
-      throw new SupervisorIntegrationError('CHECK_REPORT_INVALID', 'checker result is not bound to the admitted run, request, and candidate')
+      throw new SupervisorIntegrationError('CHECK_REPORT_INVALID', 'checker result is not bound to the admitted run, request, and exact version')
     }
     return result
   }
@@ -8030,11 +8513,19 @@ function validateCanonicalChildResult(record, result, runId, requestEnvelopeHash
   return result
 }
 
+function representativePolicyProbePassed(result) {
+  return Boolean(result && result.allAssignedItemsPass === true &&
+    Array.isArray(result.successItems) && result.successItems.length > 0 &&
+    result.successItems.every(item => item && item.status === 'pass') &&
+    Array.isArray(result.commands) &&
+    result.commands.some(command => command && Number(command.exitCode) === 0))
+}
+
 async function emitItemVerifiedTransition(transition, item) {
   if (typeof transition !== 'function' || !item || typeof item.workItemId !== 'string' || !item.workItemId ||
       !/^[a-f0-9]{64}$/.test(item.resultHash || '') || !/^[a-f0-9]{64}$/.test(item.candidateHash || '') ||
       !Array.isArray(item.nextReadyWorkIds)) {
-    throw new SupervisorIntegrationError('ITEM_VERIFIED_INVALID', 'item verification requires its exact result, version, and remaining frontier')
+    throw new SupervisorIntegrationError('ITEM_VERIFIED_INVALID', 'item verification requires its exact result, version, and remaining ready work')
   }
   await transition('WORK_ITEM_VERIFIED', 'ITEM_VERIFIED', {
     workItemId: item.workItemId,
@@ -8402,6 +8893,24 @@ function validReadOnlyFinalResponse(response) {
   return /^[a-f0-9]{64}$/.test(responseHash || '') && responseHash === hashText(stableStringify(body))
 }
 
+function executionMutableResourceOwnership(decision, route, workerCount) {
+  const ownership = Array.isArray(decision && decision.mutableResourceOwnership)
+    ? decision.mutableResourceOwnership : []
+  return ownership.map(item => {
+    // The route decision describes logical ownership and may use a semantic
+    // single-worker label (for example `geometry-worker`). Execution uses
+    // canonical scheduler work-item identities. Once topology has selected
+    // exactly one worker there is no ownership ambiguity, so bind every
+    // mutable resource to that concrete worker before authorization. Keep
+    // multi-worker labels untouched: those must already be explicit
+    // `worker-N` assignments so disjoint ownership can be proven.
+    if (item && workerCount === 1 && ['DIRECT', 'LIGHT', 'ROADMAP'].includes(route)) {
+      return Object.freeze({ ...item, owner: 'worker-1' })
+    }
+    return item
+  })
+}
+
 function createDefaultRouteExecutor(options) {
   return async ({ route, decision, launch, completeRetainedLease, resumeAdoptedLaunches, resumeState }) => {
     if (typeof options.verifyL1RequestPointer === 'function') options.verifyL1RequestPointer()
@@ -8410,7 +8919,7 @@ function createDefaultRouteExecutor(options) {
     if (!decision.gateSelection || typeof decision.gateSelection !== 'object') {
       throw new SupervisorIntegrationError(
         'GATE_SELECTION_REQUIRED',
-        'production execution requires the canonical L0 gate selection compiled from gates.json',
+        'production execution requires the canonical L0 required-check selection compiled from gates.json',
       )
     }
     let recipe = selectWorkRecipe({
@@ -8424,7 +8933,7 @@ function createDefaultRouteExecutor(options) {
       if (typeof options.frameworkAuthorityFactory !== 'function') {
         throw new SupervisorIntegrationError(
           'GATE_SELECTION_INVALID',
-          'the canonical L0 gate selection is incompatible and no C0 framework authority is configured',
+          'the canonical L0 required-check selection is incompatible and no C0 framework authority is configured',
           { recipe },
         )
       }
@@ -8465,6 +8974,7 @@ function createDefaultRouteExecutor(options) {
     const checks = deterministicChecksForDecision(decision, route)
     const likelyAreas = decision.likelyAreas || []
     const workerCount = Math.max(1, Number(decision.usefulWorkerCount || 1))
+    const executionOwnership = executionMutableResourceOwnership(decision, route, workerCount)
     const capturedDomainContracts = Array.isArray(decision.capturedDomainContracts)
       ? decision.capturedDomainContracts : []
     const capturedDomainAdmission = validateCapturedDomainContracts(
@@ -8511,7 +9021,7 @@ function createDefaultRouteExecutor(options) {
     if (doneRetryBoundary && workerCount !== 1) {
       throw new SupervisorIntegrationError(
         'DONE_RETRY_ISOLATION_REQUIRED',
-        'a DONE retry is one isolated candidate/worktree and cannot be split across promoted workers',
+        'a DONE retry is one isolated version/worktree and cannot be split across promoted workers',
       )
     }
     if (hiddenExternalBoundary && workerCount > hiddenExternalBoundary.maxProvisionalWorkerLaunches) {
@@ -8706,7 +9216,10 @@ function createDefaultRouteExecutor(options) {
     }
     if (route === 'ROADMAP' && !resumeAtChecking && !completedBeforeResume.has('roadmap-plan-check')) {
       planPointer = options.planPointer('ROADMAP')
-      const planningCandidate = hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
+      // The plan checker verifies the frozen roadmap artifact, not the target
+      // workspace. Bind its canonical verdict to the exact roadmap bytes it is
+      // instructed to inspect so a valid PASS or FAIL can enter the repair loop.
+      const planningCandidate = planPointer.sha256
       const planCheck = await launch({
         workItemId: 'roadmap-plan-check', logicalRole: 'plan-checker', parent: 'run-owner',
         purpose: 'verification', assignment: 'Independently check the roadmap against the exact request and dependency facts.',
@@ -8741,7 +9254,7 @@ function createDefaultRouteExecutor(options) {
         )
         options.writePlan('ROADMAP', decision, roadmapResult)
         planPointer = options.planPointer('ROADMAP')
-        const repairedCandidate = hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
+        const repairedCandidate = planPointer.sha256
         const recheck = await launch({
           workItemId: 'roadmap-plan-recheck', logicalRole: 'plan-checker', parent: 'run-owner',
           purpose: 'verification', repairOf: 'roadmap-plan-check', executorKey: 'roadmap-plan-check',
@@ -8763,7 +9276,7 @@ function createDefaultRouteExecutor(options) {
       if (typeof options.planExists !== 'function' || !options.planExists('ROADMAP')) {
         throw new SupervisorIntegrationError(
           'ROADMAP_RESULT_MISSING',
-          'ROADMAP resume requires the frozen accepted plan artifact',
+          'ROADMAP resume requires the frozen accepted plan document',
         )
       }
       planPointer = options.planPointer('ROADMAP')
@@ -8798,7 +9311,7 @@ function createDefaultRouteExecutor(options) {
       if (!retainedCoordinator) {
         throw new SupervisorIntegrationError(
           'CRASH_ADOPTION_CONFLICT',
-          'ROADMAP work-group frontier lacks its retained mission coordinator',
+          'ROADMAP work group lacks its retained run coordinator in the next ready work',
         )
       }
         const ownership = Array.isArray(decision.mutableResourceOwnership)
@@ -8846,7 +9359,7 @@ function createDefaultRouteExecutor(options) {
       if (typeof options.restoreDeferredPromotion !== 'function') {
         throw new SupervisorIntegrationError(
           'DONE_RETRY_RECOVERY_REQUIRED',
-          'CHECK_WORK resume requires the durable isolated DONE retry candidate',
+          'CHECK_WORK resume requires the durable isolated DONE retry version',
         )
       }
       deferredPromotion = await options.restoreDeferredPromotion('work-1')
@@ -8855,7 +9368,7 @@ function createDefaultRouteExecutor(options) {
           !/^[a-f0-9]{64}$/.test(deferredPromotion.candidateHash || '')) {
         throw new SupervisorIntegrationError(
           'DONE_RETRY_RECOVERY_INVALID',
-          'restored deferred promotion handle is not candidate-bound',
+          'restored deferred promotion handle is not bound to the exact version',
         )
       }
     }
@@ -8864,7 +9377,7 @@ function createDefaultRouteExecutor(options) {
         if (adoptedWorkResults[workItemId].allAssignedItemsPass === false) {
           throw new SupervisorIntegrationError(
             'WORK_ITEM_RESULT_FAILED',
-            'an adopted failed work result cannot enter the satisfied work frontier',
+            'an adopted failed work result cannot enter the satisfied work set',
             { workItemId, reconstructedTerminal: adoptedWorkResults[workItemId].reconstructedTerminal === true },
           )
         }
@@ -8883,12 +9396,12 @@ function createDefaultRouteExecutor(options) {
             !(retainedManager || retainedCoordinator)) {
           throw new SupervisorIntegrationError(
             'CRASH_ADOPTION_CONFLICT',
-            `persisted ROADMAP frontier lacks the retained parent topology for ${workItemId}`,
+          `persisted ROADMAP next ready work lacks the retained parent topology for ${workItemId}`,
           )
         }
         const responsibility = decision.workerResponsibilities && decision.workerResponsibilities[index]
-        const namedOwnership = Array.isArray(decision.mutableResourceOwnership)
-          ? decision.mutableResourceOwnership
+        const namedOwnership = executionOwnership.length
+          ? executionOwnership
               .filter(item => item && item.owner === `worker-${index + 1}`)
               .map(item => item.identity)
           : []
@@ -8903,7 +9416,7 @@ function createDefaultRouteExecutor(options) {
           routeDecisionHash: hashText(stableStringify(decision)),
           ownership: namedOwnership.length ? namedOwnership : likelyAreas.length ? likelyAreas : ['workspace'],
           success: successes, checks,
-          roadmapSlice: planPointer, manifests: decision.mutableResourceOwnership || [],
+          roadmapSlice: planPointer, manifests: executionOwnership,
           fetchedEvidence: capturedDomainWorkEvidence,
           deferPromotion: Boolean(doneRetryBoundary),
           difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
@@ -8928,7 +9441,7 @@ function createDefaultRouteExecutor(options) {
           if (doneRetryBoundary) {
             throw new SupervisorIntegrationError(
               'SPLIT_DECOMPOSITION_INVALID',
-              'a DONE retry candidate cannot branch into parent decomposition',
+              'a DONE retry version cannot branch into parent decomposition',
             )
           }
           const split = consumeSplitRequired(workResult, {
@@ -8966,7 +9479,7 @@ function createDefaultRouteExecutor(options) {
               !/^[a-f0-9]{64}$/.test(workResult.deferredPromotion.candidateHash || '')) {
             throw new SupervisorIntegrationError(
               'DONE_RETRY_ISOLATION_REQUIRED',
-              'DONE retry worker did not retain an isolated candidate until acceptance join',
+              'DONE retry worker did not retain an isolated version until acceptance join',
             )
           }
           deferredPromotion = workResult.deferredPromotion
@@ -8974,7 +9487,7 @@ function createDefaultRouteExecutor(options) {
         if (workResult && workResult.allAssignedItemsPass === false) {
           throw new SupervisorIntegrationError(
             'WORK_ITEM_RESULT_FAILED',
-            'a failed work result cannot be verified or enter the satisfied work frontier',
+            'a failed work result cannot be verified or enter the satisfied work set',
             { workItemId, reconstructedTerminal: workResult.reconstructedTerminal === true },
           )
         }
@@ -8999,7 +9512,7 @@ function createDefaultRouteExecutor(options) {
       if (missingWorkIds.length) {
         throw new SupervisorIntegrationError(
           'CRASH_ADOPTION_CONFLICT',
-          'persisted work frontier cannot join until every required work item has an accepted result',
+          'persisted work cannot join until every required work item has an accepted result',
           { missingWorkIds },
         )
       }
@@ -9084,14 +9597,14 @@ function createDefaultRouteExecutor(options) {
     const mutatingEffect = decision.normalizedRouteFacts &&
       decision.normalizedRouteFacts.requestedEffect === 'mutate'
     if (!resumeAtChecking && mutatingEffect && usableDeliverables.length === 0) {
-      if (deferredPromotion) await deferredPromotion.abort('candidate has no user-usable deliverable')
+      if (deferredPromotion) await deferredPromotion.abort('exact version has no user-usable deliverable')
       return {
         outcome: 'FAILED',
         checkHashes: [],
         deliverables: [],
         terminalEnvelope: {
           status: 'USER_USABLE_BUILD_REQUIRED',
-          reason: 'missing user-usable deliverable short-circuited before the independent checker fleet',
+          reason: 'missing user-usable deliverable short-circuited before the independent checker group',
           candidateHash,
         },
       }
@@ -9101,6 +9614,8 @@ function createDefaultRouteExecutor(options) {
       : {}
     const checkHashes = []
     const checkerEvidenceConsumptions = []
+    const requireIndependentReferenceMethod = checkerCount > 1 ||
+      (Array.isArray(recipe.riskChecks) && recipe.riskChecks.length > 0)
     const independentVerdicts = []
     const finalFindings = []
     const regressionOutcomes = []
@@ -9110,7 +9625,7 @@ function createDefaultRouteExecutor(options) {
       : capturedDomainContracts
     try {
       for (let index = 0; index < checkerCount; index += 1) {
-      const oracle = `independent-oracle-${index + 1}`
+      const oracle = `independent-check-${index + 1}`
       const workItemId = `independent-check-${index + 1}`
       const checkerAssignment = checking.responsibilities[index] || checking.responsibilities[0]
       const assignedDomainContracts = index === 0 ? checkerDomainContracts : []
@@ -9120,7 +9635,8 @@ function createDefaultRouteExecutor(options) {
         parent: 'run-owner', purpose: 'verification',
         assignment: `${checkerAssignment}${assignedDomainContracts.length > 0
           ? ' Return every declared captured-domain result in payload.capturedDomainOutcomes.' : ''}` +
-          ' Return the immutable underlying evidence identifiers you actually consumed in payload.evidenceIds; acceptance-check labels are not evidence identifiers.',
+          ' Return the immutable underlying evidence identifiers you actually consumed in payload.evidenceIds; acceptance-check labels are not evidence identifiers.' +
+          ' Return payload.referenceMethod with methodClass, source, procedure, expectedOutputDerivedFromSubjectCode=false, subjectLogicReimplemented=false, and non-empty positiveInvariants, negativeInvariants, and boundaryInvariants. Expected results must come from an independent source or property.',
         candidateHash, oracle, success: successes, checks,
         isolation: 'snapshot',
         writeProducing: true,
@@ -9156,6 +9672,8 @@ function createDefaultRouteExecutor(options) {
         checkerId: workItemId,
         oracleId: oracle,
         evidenceIds: consumedEvidenceIds,
+        requireReferenceMethod: requireIndependentReferenceMethod,
+        referenceMethod: result && result.payload && result.payload.referenceMethod,
       })
       independentVerdicts.push({
         kind: index === 0 ? 'independent-review' : 'independent-verification',
@@ -9251,6 +9769,7 @@ function createDefaultRouteExecutor(options) {
         localDoneRequested: false,
       })
     }
+    appendSupervisorRecordedCapturedDomainOutcomes(capturedDomainContracts, capturedDomainOutcomes)
     const domainEvaluation = evaluateCapturedDomainOutcomes(capturedDomainContracts, capturedDomainOutcomes)
     if (!domainEvaluation.valid) {
       if (deferredPromotion) await deferredPromotion.abort('captured-domain acceptance join failed')
@@ -9334,7 +9853,7 @@ function createCheckerSnapshotFactory(options) {
       env: sourceEnvironment, encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 * 1024,
     })
     if (clone.status !== 0) {
-      throw new SupervisorIntegrationError('SNAPSHOT_CREATION_FAILED', 'local candidate clone failed', {
+      throw new SupervisorIntegrationError('SNAPSHOT_CREATION_FAILED', 'local exact-version clone failed', {
         status: clone.status, stderr: String(clone.stderr || '').slice(-4096),
       })
     }
@@ -9991,11 +10510,12 @@ function createSupervisorOptions(args = {}, context = {}) {
   if (!options || typeof options !== 'object') {
     throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'runtimeOptionsFactory must return supervisor options')
   }
-  return {
-    ...options,
-    activationReceipt: activation,
-    entryPrompt: activation.entryPrompt,
-  }
+  // Runtime callbacks close over the exact options object produced above.
+  // Preserve that identity so CodexSupervisorRuntime's runtimeInstance binding
+  // is visible to recordFactory and every later callback.
+  options.activationReceipt = activation
+  options.entryPrompt = activation.entryPrompt
+  return options
 }
 
 function createDefaultRuntimeOptions(input) {
@@ -10527,7 +11047,7 @@ function createDefaultRuntimeOptions(input) {
           cause: {
             kind: 'CHECKPOINT',
             causeId: `accounting-initial:${generation}`,
-            humanDescription: 'Create the initial zero-delta accounting authority before any recovery frontier is exposed.',
+            humanDescription: 'Create the initial zero-delta accounting authority before any recovery point is exposed.',
           },
           delta: accountingDelta(),
         })
@@ -10660,7 +11180,7 @@ function createDefaultRuntimeOptions(input) {
           precondition: runtimeCrashPrecondition(crashedState),
           recoveryCheckpoint: priorEvidence,
           expectedCheckpointPayloadHash: priorEvidence.record.checkpointPayloadHash,
-          cause: 'Adopt the exact durable crash frontier after proving the old owner and descendants are drained.',
+          cause: 'Adopt the exact durable crash continuation after proving the old owner and descendants are drained.',
         })
         accountingAuthority.checkpoint({
           capability: lease,
@@ -10827,6 +11347,7 @@ function createDefaultRuntimeOptions(input) {
         profilePath: activation.profilePath,
         checkerProfilePath: activation.checkerProfilePath,
         outputSchemaResolver: launch => outputSchemaForRole(roleContract, launch),
+        providerSchemaRoot: path.join(activation.activationRoot, 'provider-output-schemas'),
       })
       if (pendingCrashResume) {
         stateStore.acceptResumeCapabilities({
@@ -10835,7 +11356,7 @@ function createDefaultRuntimeOptions(input) {
         })
         const restored = stateStore.restoreExactState({
           capability: lease,
-          cause: 'Restore the exact saved runtime state and scheduler frontier without relaunching completed work.',
+          cause: 'Restore the exact saved runtime state and scheduler next ready work without relaunching completed work.',
         })
         const checkpoint = pendingCrashResume.checkpointEvidence.record.checkpoint
         const decoded = pendingCrashResume.decodedScheduler
@@ -11291,11 +11812,12 @@ function createDefaultRuntimeOptions(input) {
         runner: runExistingTest,
         environment: testEnvironment,
       })
+      const baselineRouteDecisionHash = resolvePreMutationRouteDecisionHash(request, exactFileHash)
       return createProductionPreMutationBaseline({
         capturedBeforeMutation: true,
         targetStateHash,
         environmentHash: hashEnvironment(baselineEnvironment),
-        routeDecisionHash: request && request.routeDecisionHash,
+        routeDecisionHash: baselineRouteDecisionHash,
         dirtyTarget: {
           status: dirtyPaths.length ? 'DIRTY' : 'CLEAN',
           paths: dirtyPaths,
@@ -11346,7 +11868,9 @@ function createDefaultRuntimeOptions(input) {
     },
     limits: {
       wallMs,
-      tokens: clampNonNegInt(context.tokenLimit, 1_000_000),
+      tokens: environment.AUTOPROMPT_BENCHMARK_NO_TOKEN_LIMIT === '1'
+        ? Number.MAX_SAFE_INTEGER
+        : clampNonNegInt(context.tokenLimit, 1_000_000),
       sessions: clampNonNegInt(context.sessionLimit, 128),
       launches: clampNonNegInt(context.launchLimit, 128),
     },
@@ -11493,13 +12017,10 @@ function createDefaultRuntimeOptions(input) {
         const expansionCount = Math.max(0, roadmap.behaviorChanged.length - userAskCount)
         let expansionAdmission = null
         if (expansionCount > 0) {
-          if (typeof context.roadmapExpansionAuthority !== 'function') {
-            throw new SupervisorIntegrationError(
-              'ROADMAP_EXPANSION_NOT_ADMITTED',
-              'roadmap expansion requires the production supervisor expansion authority; author-supplied hashes are not authority',
-            )
-          }
-          const authority = context.roadmapExpansionAuthority(Object.freeze({
+          const expansionAuthority = typeof context.roadmapExpansionAuthority === 'function'
+            ? context.roadmapExpansionAuthority
+            : productionRoadmapExpansionAuthority
+          const authority = expansionAuthority(Object.freeze({
             admittedAskCount: expansionCount,
             missionScopeHash,
             planSha256,
@@ -11677,6 +12198,13 @@ if (require.main === module) {
 
 module.exports = {
   CodexExecAdapter,
+  appendSupervisorRecordedCapturedDomainOutcomes,
+  applyBenchmarkEffortPin,
+  benchmarkFirstProductSignalDeadlineEnabled,
+  benchmarkPhaseTimeoutMs,
+  productionRoadmapExpansionAuthority,
+  resolvePreMutationRouteDecisionHash,
+  runtimeCapabilityExpiryMs,
   CodexSupervisorRuntime,
   CompatibilityRecoveryAuthority,
   FrameworkOrchestrationAuthority,
@@ -11722,9 +12250,11 @@ module.exports = {
   createMinimalTestEnvironment,
   consumeSplitRequired,
   createCodexJsonlAccumulator,
+  decodeCodexProviderEnvelope,
   createSupervisorOptions,
   ensureSafeEnvironment,
   executeExistingTestBaseline,
+  executionMutableResourceOwnership,
   resolveTrustedTestDeclarations,
   executePreProductionRuntimeGates,
   emitItemVerifiedTransition,
@@ -11749,6 +12279,7 @@ module.exports = {
   serializeError,
   supervisorCapabilities,
   probeCodexExecCapabilities,
+  materializeCodexProviderEnvelopeSchema,
   validateActivationInputs,
   validateActivationRoleProjection,
   verifyActivationProviderAttestation,
@@ -11772,5 +12303,6 @@ module.exports = {
   reconstructTypedExitZeroResult,
   reconcileExternalOperationTimeout,
   roadmapAuthorArtifact,
+  resolveTerminalReceiptCandidateHash,
   immutableSemanticUserAskCount,
 }

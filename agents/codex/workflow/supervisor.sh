@@ -8,6 +8,7 @@
 # as one argv element and must implement owned process groups or return the
 # runtime's typed PROVIDER_UNSUPPORTED result.
 set -eu
+umask 077
 
 if [ "${SENTINEL+x}" = x ]; then
   printf '%s\n' 'supervisor: LEGACY_SENTINEL_UNSUPPORTED: modern Codex does not accept SENTINEL overrides' >&2

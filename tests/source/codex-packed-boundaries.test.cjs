@@ -17,6 +17,10 @@ const RUNTIME_TOOL = path.join(ROOT, 'scripts', 'runtime-payload.cjs')
 const POSIX_INSTALLER = path.join(ROOT, 'scripts', 'install', 'install.sh')
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
 const GIT_BASH = 'C:\\Program Files\\Git\\bin\\bash.exe'
+const POWERSHELL_AVAILABLE = childProcess.spawnSync(
+  POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()'],
+  { encoding: 'utf8', timeout: 10_000 },
+).status === 0
 
 function ps(value) { return `'${String(value).replaceAll("'", "''")}'` }
 function runPowerShell(command, timeout = 60_000) {
@@ -26,7 +30,9 @@ function runPowerShell(command, timeout = 60_000) {
   ], { cwd: ROOT, encoding: 'utf8', timeout })
 }
 
-test('PowerShell test harness preserves exact UTF-8 JSON path output', () => {
+test('PowerShell test harness preserves exact UTF-8 JSON path output', {
+  skip: !POWERSHELL_AVAILABLE,
+}, () => {
   const expected = 'C:\\share with spaces\\ü\\SKILL.md'
   const result = runPowerShell(`@{path=${ps(expected)}}|ConvertTo-Json -Compress`)
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
@@ -243,7 +249,9 @@ function batchResult(root, source, useIndex) {
   return JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1))
 }
 
-test('Codex indexed registration preserves legacy manifest bytes and receipt order', () => {
+test('Codex indexed registration preserves legacy manifest bytes and receipt order', {
+  skip: !POWERSHELL_AVAILABLE,
+}, () => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-index-'))
   const source = path.join(sandbox, 'source')
   fs.mkdirSync(source)
@@ -1065,7 +1073,9 @@ test('Codex md-codex renderer contract is byte-identical and git-clean', {
   assert.equal(gitClean.status, 0, gitClean.stdout || gitClean.stderr)
 })
 
-test('Codex indexed registration rejects a source mutation before publish or receipt', () => {
+test('Codex indexed registration rejects a source mutation before publish or receipt', {
+  skip: !POWERSHELL_AVAILABLE,
+}, () => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-source-race-'))
   const root = path.join(sandbox, 'root')
   const source = path.join(sandbox, 'source.txt')
@@ -1118,7 +1128,9 @@ test('Git Bash Codex single and inventory flows bind receipt hashes to exact cop
   }
 })
 
-test('validated Codex target cache invalidates generation, digest, and replaced root identity', () => {
+test('validated Codex target cache invalidates generation, digest, and replaced root identity', {
+  skip: !POWERSHELL_AVAILABLE,
+}, () => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-cache-'))
   const root = path.join(sandbox, 'root')
   fs.mkdirSync(root)

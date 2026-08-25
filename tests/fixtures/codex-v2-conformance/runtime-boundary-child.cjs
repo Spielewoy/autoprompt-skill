@@ -10,16 +10,14 @@ const argument = name => {
 
 const mode = argument('--mode')
 if (mode === 'crash') process.exit(19)
-if (mode === 'non-return') setInterval(() => {}, 1000)
-
-if (mode === 'flaky-check') {
+if (mode === 'non-return') {
+  setInterval(() => {}, 1000)
+} else if (mode === 'flaky-check') {
   const attempt = Number(argument('--attempt'))
   if (![1, 2].includes(attempt)) throw new Error('flaky-check requires attempt 1 or 2')
   process.stdout.write(`${JSON.stringify({ schemaVersion: 1, kind: 'check-observation', attempt, status: attempt === 1 ? 'PASS' : 'FAIL' })}\n`)
   process.exit(0)
-}
-
-if (mode === 'unavailable-oracle') {
+} else if (mode === 'unavailable-oracle') {
   try {
     require.resolve('./deliberately-absent-oracle.cjs')
   } catch (error) {
@@ -27,9 +25,7 @@ if (mode === 'unavailable-oracle') {
     process.exit(44)
   }
   process.exit(0)
-}
-
-if (mode === 'usage') {
+} else if (mode === 'usage') {
   const input = fs.readFileSync(0)
   const request = JSON.parse(input.toString('utf8'))
   const output = Buffer.from(JSON.stringify({
@@ -47,6 +43,6 @@ if (mode === 'usage') {
   }
   process.stdout.write(`${JSON.stringify({ schemaVersion: 1, kind: 'model-boundary-record', usage, output: JSON.parse(output) })}\n`)
   process.exit(0)
+} else {
+  throw new Error(`unknown runtime boundary mode: ${mode}`)
 }
-
-throw new Error(`unknown runtime boundary mode: ${mode}`)

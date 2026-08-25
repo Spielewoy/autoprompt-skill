@@ -321,10 +321,9 @@ test('inline, quoted, and later path text remains ordinary mission content and s
   }
 })
 
-test('mutating and ambiguous exact-path missions retain mutation safety classification', () => {
+test('mutating exact-path missions retain safety classification and ambiguity cannot downshift to DIRECT', () => {
   for (const argv of [
     ['path=direct', 'Implement', 'the', 'bounded', 'contained', 'local', 'change.'],
-    ['path=direct', 'Consider', 'the', 'contained', 'local', 'source', 'files.'],
     ['path=direct', 'Review', 'and', 'change', 'the', 'contained', 'local', 'source', 'files.'],
   ]) {
     const admitted = preflight(argv)
@@ -333,6 +332,9 @@ test('mutating and ambiguous exact-path missions retain mutation safety classifi
     assert.equal(admitted.routeFacts.checkAndBaseline.baselineStatus, 'required-before-production')
     assert.deepEqual(admitted.routeFacts.sideEffects, ['deliverable-write'])
   }
+  const ambiguous = ['path=direct', 'Consider', 'the', 'contained', 'local', 'source', 'files.']
+  assert.throws(() => preflight(ambiguous), error =>
+    error.code === 'EXACT_PATH_ROUTE_FLOOR_UNSATISFIED' && /LIGHT safety floor/.test(error.message))
 })
 
 test('documented CLI argv reaches the real supervisor exact-path preflight as mutating work', () => {

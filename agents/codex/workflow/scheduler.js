@@ -6,6 +6,15 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { validateProviderCapabilities } = require('./context-envelope.js')
 
+const BENCHMARK_NO_TOKEN_LIMIT = process.env.AUTOPROMPT_BENCHMARK_NO_TOKEN_LIMIT === '1'
+const BENCHMARK_NO_TIMEOUT_LIMIT = process.env.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
+const benchmarkTokenCeilings = defaults => BENCHMARK_NO_TOKEN_LIMIT
+  ? { noncachedInput: Number.MAX_SAFE_INTEGER, cachedInput: Number.MAX_SAFE_INTEGER, output: Number.MAX_SAFE_INTEGER }
+  : defaults
+const benchmarkTimeCeiling = defaultMs => BENCHMARK_NO_TIMEOUT_LIMIT
+  ? Number.MAX_SAFE_INTEGER
+  : defaultMs
+
 // C0's scheduling policy is deliberately kept in a require()-able module.  A
 // provider adapter may implement the actual child launch, but it must obtain a
 // lease here first.  Consequently a nested worker cannot turn a provider's
@@ -18,18 +27,18 @@ const ROUTE_BUDGETS = deepFreeze({
     maxLiveIncludingRoot: 4,
     maxDepth: 2,
     noProgressMs: 8 * 60 * 1000,
-    admissionHardMs: 7 * 60 * 1000,
+    admissionHardMs: benchmarkTimeCeiling(7 * 60 * 1000),
     admissionP95Ms: 5 * 60 * 1000,
-    tokens: { noncachedInput: 220000, cachedInput: 900000, output: 40000 },
+    tokens: benchmarkTokenCeilings({ noncachedInput: 220000, cachedInput: 900000, output: 40000 }),
   },
   LIGHT: {
     maxChildLaunches: 8,
     maxLiveIncludingRoot: 4,
     maxDepth: 3,
     noProgressMs: 20 * 60 * 1000,
-    admissionHardMs: 12 * 60 * 1000,
+    admissionHardMs: benchmarkTimeCeiling(12 * 60 * 1000),
     admissionP95Ms: 10 * 60 * 1000,
-    tokens: { noncachedInput: 500000, cachedInput: 2200000, output: 70000 },
+    tokens: benchmarkTokenCeilings({ noncachedInput: 500000, cachedInput: 2200000, output: 70000 }),
   },
   ROADMAP: {
     maxChildLaunches: 18,
@@ -37,9 +46,9 @@ const ROUTE_BUDGETS = deepFreeze({
     absoluteUserLiveCeiling: 10,
     maxDepth: 4,
     noProgressMs: 45 * 60 * 1000,
-    admissionHardMs: 22 * 60 * 1000,
+    admissionHardMs: benchmarkTimeCeiling(22 * 60 * 1000),
     admissionP95Ms: 18 * 60 * 1000,
-    tokens: { noncachedInput: 1200000, cachedInput: 5000000, output: 160000 },
+    tokens: benchmarkTokenCeilings({ noncachedInput: 1200000, cachedInput: 5000000, output: 160000 }),
   },
 })
 const PENDING_ROUTE = 'PENDING'
@@ -90,11 +99,11 @@ const PHASE_BUDGET_CONTRACT = deepFreeze({
   noProgressCode: 'NO_PROGRESS_INVARIANT',
 })
 const ADMISSION_COMPONENT_CEILINGS_MS = deepFreeze({
-  bootstrap: 60 * 1000,
-  routeAnalyst: 2 * 60 * 1000,
-  routeDecision: 4 * 60 * 1000,
-  lightPlanning: 5 * 60 * 1000,
-  roadmapPlanning: 15 * 60 * 1000,
+  bootstrap: benchmarkTimeCeiling(60 * 1000),
+  routeAnalyst: benchmarkTimeCeiling(2 * 60 * 1000),
+  routeDecision: benchmarkTimeCeiling(4 * 60 * 1000),
+  lightPlanning: benchmarkTimeCeiling(5 * 60 * 1000),
+  roadmapPlanning: benchmarkTimeCeiling(15 * 60 * 1000),
 })
 
 class SchedulerAdmissionError extends Error {

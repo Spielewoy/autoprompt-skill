@@ -79,6 +79,16 @@ test('AP-TRACE-014 every path named in brief prose must exist inside the target'
       ownership: ['workspace'], manifests: [],
     },
   }).some(resource => resource.identity === 'workspace'), true)
+
+  const creation = canonicalAssignmentResources({
+    targetPath: target, logicalRole: 'worker', readOnly: false, enforcePreimages: true,
+    request: {
+      workItemId: 'work-1', assignment: 'Create `output/new-file.txt`.',
+      ownership: [{ kind: 'file', identity: 'output/new-file.txt', owner: 'work-1' }], manifests: [],
+    },
+  })
+  assert.equal(creation[0].identity, 'output/new-file.txt')
+  assert.match(creation[0].expectedPreimageHash, /^[a-f0-9]{64}$/)
 })
 
 test('AP-COST-009 production admission rejects unproved expansion and persists exact marginal value', () => {

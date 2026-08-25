@@ -265,8 +265,9 @@ test('child environment uses synthetic private homes and output retains only has
     assert.equal(directoryBytes(captured.path).includes(Buffer.from(secret)), false, 'secret bytes must be absent from every persisted artifact')
     assert.equal(directoryBytes(captured.path).includes(Buffer.from(allowedNameSecret)), false, 'credential-shaped values under allowed names must be absent')
 
-    const ordinaryHome = process.env.HOMEPATH || '\\Users\\ordinary-user'
-    const ordinaryUser = process.env.USERNAME || 'ordinary-user'
+    process.env.HOME = previousHome || os.homedir()
+    const ordinaryHome = process.env.HOME
+    const ordinaryUser = process.env.USER || process.env.LOGNAME || os.userInfo().username
     const ordinary = await capturedFixture(repo, {
       commandArgv: [process.execPath, '-e', "process.stdout.write(`${process.argv[1]}|${process.argv[2]}`)", ordinaryHome, ordinaryUser],
     })
@@ -303,8 +304,8 @@ test('file-sourced npm, AWS, generic config credentials, binary output, and opaq
       repo,
       runnerId: `agent:/${name}-leak-runner`,
       executionRoot,
-      commandArgv: [process.execPath, '-e', "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))", secretFile],
-    }), /credential|sensitive|binary/i)
+      commandArgv: [process.execPath, '-e', "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))", `${name}.private`],
+    }), error => error.code === 'CODEX_EVIDENCE_SECRET_OUTPUT')
     assert.equal(fs.readdirSync(executionRoot).length, 0)
   }
 
@@ -322,7 +323,7 @@ test('file-sourced npm, AWS, generic config credentials, binary output, and opaq
 test('session and path telemetry are redacted, raw arbitrary output cannot support PASS', async () => {
   const repo = fixture()
   const session = `session-${Date.now()}`
-  const privatePath = path.join(os.tmpdir(), 'private-user', 'credentials.json')
+  const privatePath = path.join(os.tmpdir(), 'u', 'c.json')
   const captured = await capturedFixture(repo, {
     commandArgv: [process.execPath, '-e', "process.stdout.write('ordinary raw output'); process.stderr.write(`${process.argv[1]}|${process.argv[2]}`)", session, privatePath],
   })
@@ -337,6 +338,18 @@ test('session and path telemetry are redacted, raw arbitrary output cannot suppo
   const verdict = path.join(os.tmpdir(), `codex-review-unstructured-${process.pid}-${Date.now()}.json`)
   fs.writeFileSync(verdict, `${JSON.stringify(reviewFor(captured.execution))}\n`)
   assert.throws(() => sealBundle({ repo, execution: captured.path, verdict }), /structured PASS evidence/i)
+})
+
+test('exit-zero verification with no observable result fails closed', async () => {
+  const repo = fixture()
+  const executionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-evidence-no-result-'))
+  await assert.rejects(captureExecution({
+    repo,
+    runnerId: 'agent:/no-result-runner',
+    executionRoot,
+    commandArgv: [process.execPath, '-e', 'process.exit(0)'],
+  }), error => error.code === 'CODEX_EVIDENCE_TRANSPORT_NO_RESULT')
+  assert.equal(fs.readdirSync(executionRoot).length, 0)
 })
 
 test('split-form secret options are rejected before any secret bytes are persisted', async () => {

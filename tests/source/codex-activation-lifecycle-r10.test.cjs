@@ -20,6 +20,7 @@ const {
   resolveCodexExecutable,
   withCodexManagedEnvironment,
 } = require('../../agents/codex/workflow/codex-executable.js')
+const TEST_CODEX = resolveCodexExecutable('codex')
 
 const CASE_TIMEOUT_MS = 60_000
 // A clean Windows Codex payload install has a measured 409s lifecycle on the
@@ -209,6 +210,7 @@ function makeCase(t, options = {}) {
   const env = {
     ...process.env,
     APPDATA: appData,
+    AUTOPROMPT_BENCHMARK_UNATTESTED_BETA: 'acknowledged-local-beta-override',
     AUTOPROMPT_INSTALL_ROOT: root,
     CODEX_HOME: root,
     HOME: home,
@@ -223,6 +225,8 @@ function makeCase(t, options = {}) {
 
 function activationProbeSpawn(supervisor) {
   return (command, args, options = {}) => {
+    const codexProbe = path.isAbsolute(String(command)) &&
+      path.resolve(String(command)) === path.resolve(TEST_CODEX.executable)
     if (command === process.execPath && args[0] === '-e' &&
         String(args[1]).includes('AUTOPROMPT_NETWORK_OPEN')) {
       return boundedSpawn(command, args, { ...options, timeout: 8_000 })
@@ -230,18 +234,26 @@ function activationProbeSpawn(supervisor) {
     if (command === 'git' && args.includes('symbolic-ref')) {
       return { status: 0, stdout: 'activation-r10\n', stderr: '' }
     }
-    if (command === 'codex' && args.length === 1 && args[0] === '--help') {
+    if (codexProbe && args.length === 1 && args[0] === '--version') {
+      return { status: 0, stdout: `${TEST_CODEX.identity.version}\n`, stderr: '' }
+    }
+    if (codexProbe && args.length === 1 && args[0] === '--help') {
       return { status: 0, stdout: '--profile --strict-config --cd', stderr: '' }
     }
-    if (command === 'codex' && args[0] === 'exec') {
+    if (codexProbe && args[0] === 'exec') {
       assert.ok(args.includes('--output-schema'))
       return { status: 1, stdout: '', stderr: 'Failed to read output schema file: missing\n' }
     }
-    if (command === 'codex' && args[0] === 'sandbox') {
+    if (codexProbe && args[0] === 'sandbox') {
       if (args.some(argument => String(argument).includes('AUTOPROMPT_NETWORK_DENIED'))) {
+        fs.writeFileSync(String(args.at(-1)), 'DENIED', { mode: 0o600, flag: 'wx' })
         return { status: 0, stdout: 'AUTOPROMPT_NETWORK_DENIED', stderr: '' }
       }
-      return { status: 0, stdout: 'AUTOPROMPT_SANDBOX_OK', stderr: '' }
+      const nodeIndex = args.indexOf(process.execPath)
+      assert.ok(nodeIndex >= 0, 'sandbox file probe must contain the admitted Node executable')
+      return boundedSpawn(process.execPath, args.slice(nodeIndex + 1), {
+        ...options, timeout: 8_000,
+      })
     }
     if (typeof supervisor === 'function') return supervisor(command, args, options)
     assert.fail(`unexpected activation child: ${command} ${JSON.stringify(args)}`)
@@ -288,12 +300,18 @@ function promptInputSnapshot(context, options = {}) {
   const args = []
   if (options.profile) args.push('--profile', options.profile)
   args.push('--cd', context.target, 'debug', 'prompt-input', options.prompt || 'Review one file.')
-  const result = boundedSpawn(executable.executable, args, {
-    cwd: context.target,
-    encoding: 'utf8',
-    env: withCodexManagedEnvironment(options.env || context.env, executable),
-    timeout: 15_000,
-  })
+  const priorUmask = process.platform === 'win32' ? null : process.umask(0o077)
+  let result
+  try {
+    result = boundedSpawn(executable.executable, args, {
+      cwd: context.target,
+      encoding: 'utf8',
+      env: withCodexManagedEnvironment(options.env || context.env, executable),
+      timeout: 15_000,
+    })
+  } finally {
+    if (priorUmask !== null) process.umask(priorUmask)
+  }
   assert.equal(result.status, 0,
     `${result.stdout || ''}\n${result.stderr || ''}\n${result.error?.message || ''}`)
   let parsed

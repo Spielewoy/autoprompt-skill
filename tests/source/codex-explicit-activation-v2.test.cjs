@@ -147,6 +147,7 @@ function makeCleanInstall() {
     env: {
       ...process.env,
       APPDATA: ambientAppData,
+      AUTOPROMPT_BENCHMARK_UNATTESTED_BETA: 'acknowledged-local-beta-override',
       AUTOPROMPT_INSTALL_ROOT: root,
       CODEX_HOME: root,
       GITHUB_TOKEN: 'synthetic-token-must-not-reach-child',
@@ -182,13 +183,19 @@ function codexPromptInputSnapshot(options) {
   const args = []
   if (options.profile) args.push('--profile', options.profile)
   args.push('--cd', options.target, 'debug', 'prompt-input', options.prompt)
-  const result = childProcess.spawnSync(REAL_CODEX_COMMAND, args, {
-    cwd: options.target,
-    encoding: 'utf8',
-    env: realCodexEnvironment(options.env),
-    shell: false,
-    timeout: 15_000,
-  })
+  const priorUmask = process.platform === 'win32' ? null : process.umask(0o077)
+  let result
+  try {
+    result = childProcess.spawnSync(REAL_CODEX_COMMAND, args, {
+      cwd: options.target,
+      encoding: 'utf8',
+      env: realCodexEnvironment(options.env),
+      shell: false,
+      timeout: 15_000,
+    })
+  } finally {
+    if (priorUmask !== null) process.umask(priorUmask)
+  }
   assert.equal(result.status, 0,
     `${result.stdout || ''}\n${result.stderr || ''}\n${result.error?.stack || ''}`)
   let promptInput
@@ -210,7 +217,7 @@ function codexPromptInputSnapshot(options) {
     physicalRoleIds: [...new Set(
       visible.match(/\bautoprompt\.v2\.ap-[a-z0-9-]+(?:\.v[0-9_]+)?\b/g) || [],
     )].sort(),
-    privateSkillPathVisible: /skills[\\/]autoprompt[\\/]SKILL\.md/i.test(visible),
+    privateSkillPathVisible: /\.autoprompt-private[\\/].*skills[\\/]autoprompt[\\/]SKILL\.md/i.test(visible),
     requestEnvelopeVisible: visible.includes('AUTOPROMPT_REQUEST_ENVELOPE_V2'),
   }
 }
@@ -235,26 +242,46 @@ function privateActivationDiscoverySnapshot(activationRoot) {
   }
 }
 
+function isCodexProbeCommand(command) {
+  return command === 'codex' ||
+    path.resolve(String(command)) === path.resolve(REAL_CODEX.executable)
+}
+
+function isNetworkBaselineProbe(command, args) {
+  return command === process.execPath && args[0] === '-e' &&
+    String(args[1]).includes('AUTOPROMPT_NETWORK_OPEN')
+}
+
+function executeSandboxMarker(args, options) {
+  const nodeIndex = args.indexOf(process.execPath)
+  assert.ok(nodeIndex >= 0, 'sandbox file probe must contain the admitted Node executable')
+  return childProcess.spawnSync(process.execPath, args.slice(nodeIndex + 1), options)
+}
+
 function probeOnlySpawn(command, args, options) {
-  if (command === process.execPath && args[0] === '-e' &&
-      String(args[1]).includes('AUTOPROMPT_NETWORK_OPEN')) {
+  const codexProbe = isCodexProbeCommand(command)
+  if (isNetworkBaselineProbe(command, args)) {
     return childProcess.spawnSync(command, args, options)
   }
   if (command === 'git' && args.includes('symbolic-ref')) {
     return { status: 0, stdout: 'activation-test\n', stderr: '' }
   }
-  if (command === 'codex' && args.length === 1 && args[0] === '--help') {
+  if (codexProbe && args.length === 1 && args[0] === '--version') {
+    return { status: 0, stdout: `${REAL_CODEX.identity.version}\n`, stderr: '' }
+  }
+  if (codexProbe && args.length === 1 && args[0] === '--help') {
     return { status: 0, stdout: '--profile --strict-config --cd', stderr: '' }
   }
-  if (command === 'codex' && args[0] === 'exec') {
+  if (codexProbe && args[0] === 'exec') {
     assert.ok(args.includes('--output-schema'))
     return { status: 1, stdout: '', stderr: 'Failed to read output schema file: missing\n' }
   }
-  if (command === 'codex' && args[0] === 'sandbox') {
+  if (codexProbe && args[0] === 'sandbox') {
     if (args.some(argument => String(argument).includes('AUTOPROMPT_NETWORK_DENIED'))) {
+      fs.writeFileSync(String(args.at(-1)), 'DENIED', { mode: 0o600, flag: 'wx' })
       return { status: 0, stdout: 'AUTOPROMPT_NETWORK_DENIED', stderr: '' }
     }
-    return { status: 0, stdout: 'AUTOPROMPT_SANDBOX_OK', stderr: '' }
+    return executeSandboxMarker(args, options)
   }
   assert.fail(`unexpected activation probe: ${command} ${JSON.stringify(args)} cwd=${options?.cwd}`)
 }
@@ -531,9 +558,10 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
         '--sandbox-state-disable-network', '--profile', 'autoprompt',
       ])
       if (args.some(argument => String(argument).includes('AUTOPROMPT_NETWORK_DENIED'))) {
+        fs.writeFileSync(String(args.at(-1)), 'DENIED', { mode: 0o600, flag: 'wx' })
         return { status: 0, stdout: 'AUTOPROMPT_NETWORK_DENIED', stderr: '' }
       }
-      return { status: 0, stdout: 'AUTOPROMPT_SANDBOX_OK', stderr: '' }
+      return executeSandboxMarker(args, options)
     }
     const activationRoot = options.env.CODEX_HOME
     const recordPath = options.env.AUTOPROMPT_ACTIVATION_RECORD
@@ -620,7 +648,7 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
     assert.equal(record.modelSelection.probeAcceptance.explicitModelAndEffortAssignments, false)
     assert.equal(record.providerAttestation.attestation.result, 'supported')
     assert.deepEqual(record.providerAttestation.attestation.verifiedCapabilities,
-      ['isolation', 'privateSkillRoot'])
+      ['isolation', 'privateSkillRoot', 'processOwnership'])
     assert.doesNotMatch(JSON.stringify(record.providerAttestation), /privateKey|BEGIN PRIVATE KEY/)
     assert.equal(activation.verifyProviderAttestation(record, {
       requireFresh: true,
@@ -761,6 +789,7 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
   assert.doesNotMatch(modelVisible, /ambient-noise/)
   assert.doesNotMatch(modelVisible, /problem-finder/)
 
+  const sandboxEnvironmentPath = path.join(context.target, '.autoprompt-sandbox-environment.json')
   const sandboxEnvironment = childProcess.spawnSync(REAL_CODEX_COMMAND, [
     'sandbox',
     '--permission-profile', ':workspace',
@@ -768,13 +797,13 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
     '--profile', 'autoprompt',
     '--cd', context.target,
     process.execPath, '-e', [
-      'process.stdout.write(JSON.stringify({',
+      'require("node:fs").writeFileSync(process.argv[1],JSON.stringify({',
       'git:process.env.GIT_ALLOW_PROTOCOL,',
       'gh:process.env.GH_CONFIG_DIR,',
       'token:Object.hasOwn(process.env,"GITHUB_TOKEN"),',
       'modelKey:Object.hasOwn(process.env,"OPENAI_API_KEY")',
-      '}))',
-    ].join(''),
+      '}),{flag:"wx",mode:0o600})',
+    ].join(''), sandboxEnvironmentPath,
   ], {
     cwd: context.target,
     encoding: 'utf8',
@@ -784,7 +813,8 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
   })
   assert.equal(sandboxEnvironment.status, 0,
     `${sandboxEnvironment.stderr || ''}\n${sandboxEnvironment.error?.stack || ''}`)
-  const sandboxObserved = JSON.parse(sandboxEnvironment.stdout)
+  const sandboxObserved = JSON.parse(fs.readFileSync(sandboxEnvironmentPath, 'utf8'))
+  fs.unlinkSync(sandboxEnvironmentPath)
   assert.equal(sandboxObserved.git, 'file')
   assert.equal(sandboxObserved.gh, path.join(launchObservation.activationRoot, 'gh-config'))
   assert.equal(sandboxObserved.token, false)
@@ -1188,10 +1218,12 @@ test('a pre-spawn failure revokes capability state and removes activation auth m
     ttlSeconds: 60,
   })
   const privateAuth = path.join(prepared.activationRoot, 'auth.json')
-  fs.writeFileSync(privateAuth, '{"stale":true}\n')
+  fs.writeFileSync(privateAuth, '{"stale":true}\n', { mode: 0o600 })
   let supervisorLaunches = 0
   const probesOnly = (command, args, options) => {
-    if (command === 'git' || command === 'codex') return probeOnlySpawn(command, args, options)
+    if (command === 'git' || isCodexProbeCommand(command) || isNetworkBaselineProbe(command, args)) {
+      return probeOnlySpawn(command, args, options)
+    }
     supervisorLaunches += 1
     return { status: 0 }
   }
@@ -1217,7 +1249,9 @@ test('resume reuses one immutable supervisor run and rejects request, target, an
   t.after(() => fs.rmSync(context.sandbox, { recursive: true, force: true }))
   const launches = []
   const spawnSync = (command, args, options) => {
-    if (command === 'git' || command === 'codex') return probeOnlySpawn(command, args, options)
+    if (command === 'git' || isCodexProbeCommand(command) || isNetworkBaselineProbe(command, args)) {
+      return probeOnlySpawn(command, args, options)
+    }
     const record = JSON.parse(fs.readFileSync(options.env.AUTOPROMPT_ACTIVATION_RECORD, 'utf8'))
     launches.push(record)
     return { status: 0 }

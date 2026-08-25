@@ -156,27 +156,9 @@
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     },
     {
-      "path": "agents/codex/workflow/phase-budget.js",
-      "sha256": "74dc720736d376bb1789b295850867b168eb9cc60336d0d48b05a83fe16897fd",
-      "terms": ["artifact", "assurance", "candidate", "fleet", "frontier", "gate", "handoff", "mission", "oracle"],
-      "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
-    },
-    {
       "path": "agents/codex/workflow/recovery-checkpoint.js",
       "sha256": "cf1eeeecf0842b871180f42796e435dca1c2b93f43fb103d187099eeedea41a4",
       "terms": ["candidate", "frontier"],
-      "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
-    },
-    {
-      "path": "agents/codex/workflow/route-decision.js",
-      "sha256": "ba34d209164c41972d952ee85eb1e40da8aea568e8c4d16944737c45aef9f68b",
-      "terms": ["candidate", "gate"],
-      "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
-    },
-    {
-      "path": "agents/codex/workflow/router.js",
-      "sha256": "50e5f6365ab373183c8a025b2bacdc7e786cba99fb1c7dc8e67dcd5c5748a081",
-      "terms": ["artifact"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     },
     {
@@ -192,14 +174,8 @@
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     },
     {
-      "path": "agents/codex/workflow/safe-run-root.js",
-      "sha256": "d4db56a753964aab6ac322eac32a049868b53ea3a87efc71d7fd8f6e934baf09",
-      "terms": ["candidate"],
-      "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
-    },
-    {
       "path": "agents/codex/workflow/scheduler.js",
-      "sha256": "91d873e4d5d9fb5889311e1e277c0ef4aff78f774bd5650218269676520175a3",
+      "sha256": "e0c20747a3b050af7da8dfc3eeab30dcd8cb6b8a04635eaa166c76f818cc1b6d",
       "terms": ["candidate", "frontier", "lane"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     }

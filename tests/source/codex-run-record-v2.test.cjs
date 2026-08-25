@@ -696,15 +696,15 @@ test('open audits the exact tree, runtime integration paths, aliases, hard links
   assert.equal(runRecord.openRunRecord(aligned.runPath).auditTree().valid, true)
 
   const foreign = make('audit-foreign')
-  fs.writeFileSync(path.join(foreign.runPath, 'foreign.txt'), 'no')
+  fs.writeFileSync(path.join(foreign.runPath, 'foreign.txt'), 'no', { mode: 0o600 })
   assert.throws(() => runRecord.openRunRecord(foreign.runPath), /Unregistered run-record file/i)
 
   const alias = make('audit-alias')
-  fs.writeFileSync(path.join(alias.runPath, 'plan', 'roadmap.md'), 'wrong case')
+  fs.writeFileSync(path.join(alias.runPath, 'plan', 'roadmap.md'), 'wrong case', { mode: 0o600 })
   assert.throws(() => runRecord.openRunRecord(alias.runPath), /only ROADMAP|Unregistered/i)
 
   const residue = make('audit-residue')
-  fs.writeFileSync(path.join(residue.runPath, 'runtime', '.state.json.123.tmp'), 'partial')
+  fs.writeFileSync(path.join(residue.runPath, 'runtime', '.state.json.123.tmp'), 'partial', { mode: 0o600 })
   assert.throws(() => runRecord.openRunRecord(residue.runPath), error => error.code === 'RUN_RECORD_RECOVERY_REQUIRED' || error.code === 'RUN_RECORD_UNSAFE')
 })
 

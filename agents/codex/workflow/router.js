@@ -71,7 +71,7 @@ function resolveRepositoryInstructionAuthority(input = {}) {
   })
   if (typeof artifact.repositoryPath !== 'string' || !artifact.repositoryPath ||
       !HASH_PATTERN.test(artifact.contentHash || '')) {
-    return untrusted(['repository artifact requires an exact path and SHA-256 content hash'])
+    return untrusted(['repository file requires an exact path and SHA-256 content hash'])
   }
   if (designation === null) return untrusted([])
   const errors = []
@@ -486,6 +486,10 @@ function validateProbeEvidence(evidence, reason) {
 }
 
 function probeDecision(facts, options = {}) {
+  // Exact-path admission needs the deterministic route floor, while the
+  // baseline probe remains a later mandatory production gate. Do not turn
+  // that floor calculation into a second admission probe.
+  if (options.safetyFloorOnly === true) return null
   const baselineRequired = facts.requestedEffect === 'mutate' &&
     facts.checkAndBaseline.baselineStatus === 'required-before-production'
   const reason = options.probeReason ?? options.probe_reason ?? (baselineRequired ? 'debug-red' : null)

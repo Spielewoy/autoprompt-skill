@@ -1429,7 +1429,7 @@ _idem_register_created_directories() {
 _idem_parse_manifest_entry() {
   local entry="$1" expects_comma="$2"
   local spelling_name="$3" identity_name="$4" hash_name="$5" line_name="$6"
-  local escaped canonical_escape comma
+  local escaped canonical_escape comma indent indent_width
   local -n parsed_spelling="$spelling_name" parsed_identity="$identity_name"
   local -n parsed_hash="$hash_name" canonical_line="$line_name"
   if [ "$expects_comma" -eq 1 ]; then
@@ -1440,20 +1440,26 @@ _idem_parse_manifest_entry() {
     [ "${entry: -1}" != ',' ] || return 1
     comma=''
   fi
-  [ "${#entry}" -ge 74 ] && [ "${entry:0:5}" = '    "' ] || return 1
+  case "$entry" in
+    '    "'*) indent='    ' ;;
+    '  "'*) indent='  ' ;;
+    *) return 1 ;;
+  esac
+  indent_width="${#indent}"
+  [ "${#entry}" -ge $((indent_width + 70)) ] || return 1
   [ "${entry: -1}" = '"' ] || return 1
   parsed_hash="${entry: -65:64}"
   [[ "$parsed_hash" =~ ^[a-f0-9]{64}$ ]] || return 1
   entry="${entry:0:${#entry}-65}"
   [ "${entry: -4}" = '": "' ] || return 1
-  escaped="${entry:5:${#entry}-9}"
+  escaped="${entry:$((indent_width + 1)):${#entry}-$((indent_width + 5))}"
   _uninstall_json_unescape "$escaped" parsed_spelling || return 1
   [ -n "$parsed_spelling" ] || return 1
   _receipt_json_escape "$parsed_spelling" canonical_escape
   [ "$canonical_escape" = "$escaped" ] || return 1
   _idem_cached_comparable_path "$parsed_spelling" parsed_identity || return 1
   [ -n "$parsed_identity" ] || return 1
-  canonical_line="    \"$canonical_escape\": \"$parsed_hash\"$comma"
+  canonical_line="$indent\"$canonical_escape\": \"$parsed_hash\"$comma"
 }
 
 _idem_parse_manifest() {

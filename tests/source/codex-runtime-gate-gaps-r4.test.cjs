@@ -153,7 +153,7 @@ test('generated validator enforces registry, terminal, order, command, oracle, r
   for (const fragment of ['registry', 'terminal', 'order', 'command', 'acceptance-check', 'bounded negative']) {
     assert.ok(verdict.errors.some(error => error.includes(fragment)), fragment)
   }
-  assert.ok(verdict.errors.some(error => /fresh.verify/i.test(error)))
+  assert.ok(verdict.errors.some(error => /independent recheck cannot duplicate/i.test(error)))
 })
 
 test('runtime gate plan has executable coverage, no-new-regression, conditional depth/docs/performance, and same-file handoff', () => {

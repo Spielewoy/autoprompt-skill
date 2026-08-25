@@ -25,6 +25,7 @@ const DEFAULT_GOVERNANCE_ROOT = 'evidence/codex-verification-indexes'
 const COMMAND_OUTPUT_SCHEMA = 'codex-verification-command-output.v1'
 const OUTPUT_SUMMARY_SCHEMA = 'codex-verification-output-summary.v1'
 const MAX_CAPTURE_BYTES = 1024 * 1024
+const MAX_CAPTURE_DURATION_MS = 120 * 1000
 const MAX_DIAGNOSTIC_LINES = 8
 const MAX_DIAGNOSTIC_CHARS = 240
 const GOVERNANCE_OUTPUTS = new Set([
@@ -463,14 +464,15 @@ function tokenEntropy(value) {
   return entropy
 }
 
-function assertNoCredentialOutput(bytes, text, sensitiveValues, stream) {
+function assertNoCredentialOutput(bytes, text, sensitiveValues, telemetryValues, stream) {
   if (sensitiveValues.some(secret => bytes.includes(secret))) {
     fail('CODEX_EVIDENCE_SECRET_OUTPUT', 'command output contains a sensitive inherited value; no evidence was persisted', { stream })
   }
-  if (SENSITIVE_OUTPUT_PATTERNS.some(pattern => pattern.test(text))) {
+  const inspected = sanitizeDiagnostic(text, telemetryValues)
+  if (SENSITIVE_OUTPUT_PATTERNS.some(pattern => pattern.test(inspected))) {
     fail('CODEX_EVIDENCE_SECRET_OUTPUT', 'command output resembles a credential; no evidence was persisted', { stream })
   }
-  for (const match of text.matchAll(/[A-Za-z0-9_+\/=.-]{24,}/g)) {
+  for (const match of inspected.matchAll(/[A-Za-z0-9_+\/=.-]{24,}/g)) {
     const token = match[0]
     if (ALLOWED_LONG_OUTPUT_TOKENS.has(token) || /^[a-f0-9]{64}$/i.test(token)) continue
     const classes = [/[a-z]/.test(token), /[A-Z]/.test(token), /\d/.test(token), /[_+\/=.-]/.test(token)]
@@ -492,7 +494,8 @@ function sanitizeDiagnostic(value, telemetryValues) {
     .replace(/\b(?:session|thread|trace|request)-[A-Za-z0-9._-]{8,}/ig, '<redacted-session>')
     .replace(/file:\/\/\/[^\s|"']+/ig, '<redacted-path>')
     .replace(/[A-Za-z]:\\[^\r\n|"']+/g, '<redacted-path>')
-    .replace(/(?:^|\s)\/(?:Users|home|tmp|private\/tmp|var\/folders)\/[^\s|"']+/g, match => `${match.startsWith(' ') ? ' ' : ''}<redacted-path>`)
+    .replace(/(^|[\s|])\/(?:Users|home|tmp|private\/tmp|var\/folders)\/[^\s|"']+/g,
+      (_match, prefix) => `${prefix}<redacted-path>`)
   if (text.length > MAX_DIAGNOSTIC_CHARS) text = `${text.slice(0, MAX_DIAGNOSTIC_CHARS - 14)}<truncated>`
   return text
 }
@@ -538,7 +541,7 @@ function structuredEvidence(text, telemetryValues) {
 
 function outputSummary(bytes, stream, sensitiveValues, telemetryValues) {
   const text = decodedOutput(bytes, stream)
-  assertNoCredentialOutput(bytes, text, sensitiveValues, stream)
+  assertNoCredentialOutput(bytes, text, sensitiveValues, telemetryValues, stream)
   const evidence = stream === 'stdout' && text.trim() ? structuredEvidence(text.trim(), telemetryValues) : null
   const diagnostics = evidence ? [] : text.split(/\r?\n/)
     .map(line => sanitizeDiagnostic(line, telemetryValues).trim())
@@ -671,44 +674,67 @@ function codexSandboxLauncher(environment = process.env) {
 
 async function runBounded(command, args, options) {
   return new Promise((resolve, reject) => {
-    let stdoutBytes = 0
-    let stderrBytes = 0
+    const captureRoot = path.resolve(options.captureRoot)
+    const stdoutPath = path.join(captureRoot, 'stdout.raw')
+    const stderrPath = path.join(captureRoot, 'stderr.raw')
+    const stdoutFd = fs.openSync(stdoutPath, 'wx', 0o600)
+    const stderrFd = fs.openSync(stderrPath, 'wx', 0o600)
     let exceeded = null
-    const stdoutChunks = []
-    const stderrChunks = []
+    let timedOut = false
+    let settled = false
+    const closeDescriptors = () => {
+      for (const descriptor of [stdoutFd, stderrFd]) {
+        try { fs.closeSync(descriptor) } catch {}
+      }
+    }
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env,
       shell: false,
       windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      // Codex sandbox 0.149 does not reliably relay an inner process through
+      // Node-created pipe streams. Inheritable private file descriptors keep
+      // the exact stdout/stderr bytes across that process boundary.
+      stdio: ['ignore', stdoutFd, stderrFd],
     })
-    child.once('error', error => reject(Object.assign(error, { evidenceSandboxLaunch: true })))
-    child.stdout.on('data', chunk => {
-      stdoutBytes += chunk.length
-      if (stdoutBytes > MAX_CAPTURE_BYTES) {
-        exceeded = exceeded || 'stdout'
-        child.kill()
-        return
+    const monitor = setInterval(() => {
+      for (const [stream, descriptor] of [['stdout', stdoutFd], ['stderr', stderrFd]]) {
+        try {
+          if (fs.fstatSync(descriptor).size > MAX_CAPTURE_BYTES) {
+            exceeded = exceeded || stream
+            child.kill('SIGKILL')
+          }
+        } catch {}
       }
-      stdoutChunks.push(chunk)
+    }, 25)
+    monitor.unref()
+    const timeout = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGKILL')
+    }, options.timeoutMs || MAX_CAPTURE_DURATION_MS)
+    timeout.unref()
+    const clearBounds = () => {
+      clearInterval(monitor)
+      clearTimeout(timeout)
+    }
+    child.once('error', error => {
+      if (settled) return
+      settled = true
+      clearBounds()
+      closeDescriptors()
+      reject(Object.assign(error, { evidenceSandboxLaunch: true }))
     })
-    child.stderr.on('data', chunk => {
-      stderrBytes += chunk.length
-      if (stderrBytes > MAX_CAPTURE_BYTES) {
-        exceeded = exceeded || 'stderr'
-        child.kill()
-        return
-      }
-      stderrChunks.push(chunk)
+    child.once('close', (code, signal) => {
+      if (settled) return
+      settled = true
+      clearBounds()
+      closeDescriptors()
+      const stdout = fs.readFileSync(stdoutPath)
+      const stderr = fs.readFileSync(stderrPath)
+      if (stdout.length > MAX_CAPTURE_BYTES) exceeded = exceeded || 'stdout'
+      if (stderr.length > MAX_CAPTURE_BYTES) exceeded = exceeded || 'stderr'
+      resolve({ code, signal, exceeded, timedOut, stdout, stderr })
     })
-    child.once('close', (code, signal) => resolve({
-      code,
-      signal,
-      exceeded,
-      stdout: Buffer.concat(stdoutChunks),
-      stderr: Buffer.concat(stderrChunks),
-    }))
   })
 }
 
@@ -745,6 +771,7 @@ async function captureExecution(options) {
     try {
       outcome = await runBounded(launcher.command, sandboxArgs, {
         cwd: cwd.absolute,
+        captureRoot: temporary,
         env: environment.childEnvironment,
       })
     } catch (error) {
@@ -754,6 +781,12 @@ async function captureExecution(options) {
     }
     if (outcome.exceeded) {
       fail('CODEX_EVIDENCE_OUTPUT_LIMIT', `command ${outcome.exceeded} exceeded the fail-closed ${MAX_CAPTURE_BYTES}-byte capture limit`)
+    }
+    if (outcome.timedOut) {
+      fail('CODEX_EVIDENCE_EXECUTION_TIMEOUT', `command exceeded the fail-closed ${MAX_CAPTURE_DURATION_MS}ms execution limit`)
+    }
+    if (outcome.code === 0 && outcome.stdout.length === 0 && outcome.stderr.length === 0) {
+      fail('CODEX_EVIDENCE_TRANSPORT_NO_RESULT', 'exit-zero verification produced no observable stdout or stderr evidence')
     }
     const stdoutBytes = outputSummary(outcome.stdout, 'stdout', environment.sensitiveValues, environment.telemetryValues)
     const stderrBytes = outputSummary(outcome.stderr, 'stderr', environment.sensitiveValues, environment.telemetryValues)
@@ -851,7 +884,13 @@ function validateOutputSummary(directory, name, expectedStream) {
       fail('CODEX_EVIDENCE_OUTPUT_INVALID', 'structured evidence is not canonical or contains telemetry')
     }
   }
-  assertNoCredentialOutput(fs.readFileSync(filename), canonicalStringify(summary), [], expectedStream)
+  for (const diagnostic of summary.diagnostics) {
+    assertNoCredentialOutput(Buffer.from(diagnostic), diagnostic, [], [], expectedStream)
+  }
+  if (summary.structured_evidence !== null) {
+    const structuredBytes = Buffer.from(canonicalStringify(summary.structured_evidence))
+    assertNoCredentialOutput(structuredBytes, structuredBytes.toString('utf8'), [], [], expectedStream)
+  }
   return summary
 }
 

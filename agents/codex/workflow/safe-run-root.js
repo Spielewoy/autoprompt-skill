@@ -221,19 +221,25 @@ function auditPrivatePermissions(runPath, options = {}) {
   const recurse = options.recurse !== false
   if (process.platform !== 'win32') {
     const paths = [absolute, ...additional]
-    const visit = (candidate, recurse) => {
-      const stats = fs.lstatSync(candidate)
-      if (stats.isSymbolicLink()) throw new RunRecordError('PRIVACY_VIOLATION', `Private path is linked: ${candidate}`)
+    const allowedOwnerReadableFiles = new Set((options.allowedOwnerReadableFiles || [])
+      .map(item => path.resolve(item)))
+    const visit = (privatePath, recurse) => {
+      const stats = fs.lstatSync(privatePath)
+      if (stats.isSymbolicLink()) throw new RunRecordError('PRIVACY_VIOLATION', `Private path is linked: ${privatePath}`)
       if (typeof process.getuid === 'function' && Number(stats.uid) !== process.getuid()) {
-        throw new RunRecordError('PRIVACY_VIOLATION', `Private path has a foreign POSIX owner: ${candidate}`, { uid: Number(stats.uid) })
+        throw new RunRecordError('PRIVACY_VIOLATION', `Private path has a foreign POSIX owner: ${privatePath}`, { uid: Number(stats.uid) })
       }
-      const expected = stats.isDirectory() ? 0o700 : 0o600
+      const expected = stats.isDirectory()
+        ? [0o700]
+        : allowedOwnerReadableFiles.has(path.resolve(privatePath))
+          ? [0o600, 0o644, 0o700]
+          : [0o600, 0o700]
       const actual = stats.mode & 0o777
-      if (actual !== expected) throw new RunRecordError('PRIVACY_VIOLATION', `Private path mode is broader or incompatible: ${candidate}`, { expected, actual })
-      if (stats.isDirectory() && recurse) for (const name of fs.readdirSync(candidate)) visit(path.join(candidate, name), true)
+      if (!expected.includes(actual)) throw new RunRecordError('PRIVACY_VIOLATION', `Private path mode is broader or incompatible: ${privatePath}`, { path: privatePath, expected, actual })
+      if (stats.isDirectory() && recurse) for (const name of fs.readdirSync(privatePath)) visit(path.join(privatePath, name), true)
     }
     visit(absolute, recurse)
-    for (const candidate of additional) visit(candidate, false)
+    for (const privatePath of additional) visit(privatePath, false)
     return { valid: true, mechanism: 'posix-mode' }
   }
   const script = [

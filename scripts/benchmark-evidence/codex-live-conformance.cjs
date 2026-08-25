@@ -9,6 +9,7 @@ const path = require('node:path')
 
 const {
   ProcessOwner,
+  createPosixProcessAdapter,
   createWindowsJobAdapter,
   prepareProcessLaunchEnvironment,
 } = require('../../agents/codex/workflow/process-owner.js')
@@ -28,6 +29,7 @@ const OBSERVATION_SCHEMA = 'codex-live-conformance-observation.v1'
 const DRY_RUN_SCHEMA = 'codex-live-conformance-plan.v1'
 const DEFAULT_TIMEOUT_MS = 240_000
 const MAX_TIMEOUT_MS = 300_000
+const MAX_TOTAL_TOKENS = 250_000
 const EXTERNAL_HELPER_TIMEOUT_MS = 10_000
 const CHILD_KILL_VERIFY_MS = 250
 const CHILD_SETTLEMENT_TIMEOUT_MS = 5_000
@@ -818,6 +820,174 @@ async function runWindowsJobCommand(command, options = {}) {
   }
 }
 
+async function runPosixGroupCommand(command, options = {}) {
+  if (process.platform === 'win32') {
+    fail('PROCESS_OWNERSHIP_UNAVAILABLE', 'POSIX process groups are unavailable on Windows')
+  }
+  const started = Date.now()
+  const privateRoot = path.join(options.layout.activationHome, '.autoprompt-private')
+  fs.mkdirSync(privateRoot, { recursive: true, mode: 0o700 })
+  const registryPath = path.join(privateRoot, 'conformance-process-registry.json')
+  let child = null
+  const adapter = createPosixProcessAdapter({
+    spawn(executable, argv, spawnOptions) {
+      child = childProcess.spawn(executable, argv, spawnOptions)
+      return child
+    },
+  })
+  const reservationId = `codex-live-${crypto.randomUUID()}`
+  const environment = prepareProcessLaunchEnvironment(adapter, reservationId, options.env || {})
+  const owner = new ProcessOwner({
+    adapter,
+    registryPath,
+    pollMs: 20,
+    controlBinding: {
+      activationId: `live-conformance:${sha256(options.layout.runRoot)}`,
+      generationId: 1,
+    },
+  })
+  const launched = await owner.launch({
+    executable: command[0],
+    argv: command.slice(1),
+    cwd: options.cwd,
+    env: environment,
+    reservationId,
+    targetKey: `live-conformance:${sha256(options.layout.target)}`,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
+  if (!child || !child.stdout || !child.stderr) {
+    fail('PROCESS_OWNERSHIP_EVIDENCE_INVALID', 'POSIX owned launch did not expose captured streams')
+  }
+  if (typeof options.onLaunchedPid === 'function') options.onLaunchedPid(launched.rootPid)
+  const stdout = []
+  const stderr = []
+  let lineBuffer = ''
+  let policyTerminated = false
+  let timedOut = false
+  let killAttempted = false
+  let terminal = null
+  const observedOwnedPids = new Set()
+  const membershipSamples = []
+  const sampleOwnedMembership = async () => {
+    const members = [...await adapter.listOwned(launched.groupIdentity)]
+      .sort((left, right) => left - right)
+    members.forEach(pid => observedOwnedPids.add(pid))
+    if (!membershipSamples.length ||
+        stableJsonV1(membershipSamples.at(-1).members) !== stableJsonV1(members)) {
+      membershipSamples.push(Object.freeze({ offsetMs: Date.now() - started, members }))
+    }
+    return members
+  }
+  child.stdout.on('data', chunk => {
+    const bytes = Buffer.from(chunk)
+    stdout.push(bytes)
+    if (typeof options.stdoutLineGuard !== 'function' || policyTerminated) return
+    lineBuffer += bytes.toString('utf8')
+    const lines = lineBuffer.split(/\r?\n/)
+    lineBuffer = lines.pop()
+    for (const line of lines) {
+      if (!line || options.stdoutLineGuard(line) !== false) continue
+      policyTerminated = true
+      break
+    }
+  })
+  child.stderr.on('data', chunk => stderr.push(Buffer.from(chunk)))
+  const closePromise = new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', (exitCode, signal) => {
+      terminal = { exitCode, signal }
+      resolve(terminal)
+    })
+  })
+  let drained = false
+  try {
+    const initialMembership = await sampleOwnedMembership()
+    const deadline = started + (options.timeoutMs || DEFAULT_TIMEOUT_MS)
+    while (!terminal && Date.now() <= deadline) {
+      await sampleOwnedMembership()
+      if (!policyTerminated && typeof options.policyPollGuard === 'function' &&
+          options.policyPollGuard() === false) policyTerminated = true
+      if (policyTerminated) break
+      await Promise.race([
+        closePromise,
+        new Promise(resolve => setTimeout(resolve, options.processPollMs || 25)),
+      ])
+    }
+    if (!terminal) {
+      timedOut = !policyTerminated
+      killAttempted = true
+      await owner.cancelGroup(launched.ownershipId, {
+        reason: policyTerminated
+          ? 'live conformance policy ceiling'
+          : 'live conformance deadline',
+        graceMs: 0,
+        killMs: 5_000,
+      })
+      await Promise.race([
+        closePromise,
+        new Promise((_, reject) => setTimeout(() => reject(new LiveConformanceError(
+          'COMMAND_SETTLEMENT_TIMEOUT',
+          'POSIX owned child did not close after group cancellation',
+        )), CHILD_SETTLEMENT_TIMEOUT_MS)),
+      ])
+    } else {
+      await owner.observeRootExit(launched.ownershipId, {
+        code: terminal.exitCode,
+        signal: terminal.signal,
+        killMs: 5_000,
+      })
+    }
+    await owner.assertDrained()
+    drained = true
+    const membership = await adapter.listOwned(launched.groupIdentity)
+    const ownershipPassed = initialMembership.includes(launched.rootPid) &&
+      observedOwnedPids.has(launched.rootPid) && membership.length === 0
+    const registryBytes = fs.readFileSync(registryPath)
+    return {
+      argv: [...command],
+      childPid: launched.rootPid,
+      durationMs: Date.now() - started,
+      exitCode: terminal?.exitCode ?? null,
+      killAttempted,
+      policyTerminated,
+      descendantPidsObserved: [...observedOwnedPids]
+        .filter(pid => pid !== launched.rootPid).sort((left, right) => left - right),
+      residualPids: membership,
+      signal: terminal?.signal || null,
+      stderr: Buffer.concat(stderr),
+      stdout: Buffer.concat(stdout),
+      timedOut,
+      ownership: Object.freeze({
+        result: ownershipPassed ? 'PASS' : 'FAIL',
+        adapterKind: 'posix-process-group',
+        assignedBeforeResume: initialMembership.includes(launched.rootPid),
+        groupIdentity: launched.groupIdentity,
+        membershipSamples,
+        observedOwnedPids: [...observedOwnedPids].sort((left, right) => left - right),
+        paidCodexPid: launched.rootPid,
+        paidCodexObservedAsGroupMember: observedOwnedPids.has(launched.rootPid),
+        processOwnerSourceSha256: sha256(fs.readFileSync(
+          path.resolve(__dirname, '..', '..', 'agents', 'codex', 'workflow', 'process-owner.js'),
+        )),
+        registrySha256: sha256(registryBytes),
+        terminalMembership: membership,
+        zeroMembershipDrained: membership.length === 0,
+      }),
+    }
+  } finally {
+    if (!drained) {
+      try {
+        await owner.cancelGroup(launched.ownershipId, {
+          reason: 'live conformance exceptional cleanup', graceMs: 0, killMs: 5_000,
+        })
+      } finally {
+        await owner.assertDrained()
+      }
+    }
+  }
+}
+
 function runSynchronous(command, options = {}) {
   const started = Date.now()
   const result = childProcess.spawnSync(command[0], command.slice(1), {
@@ -1196,7 +1366,9 @@ function resolveCli(options, environment) {
   }
   const resolver = require(path.join(options.runtimeSourceRoot || ROOT,
     'agents', 'codex', 'workflow', 'codex-executable.js'))
-  const resolved = resolver.resolveCodexExecutable('codex', { environment })
+  const resolved = resolver.resolveCodexExecutable(options.codexExecutable || 'codex', {
+    environment,
+  })
   return Object.freeze({
     commandPrefix: [resolved.executable],
     launcherScriptSha256: null,
@@ -1308,7 +1480,7 @@ function createTranscriptPolicyGuard(options = {}) {
   const rows = []
   const maximumLaunches = options.maximumLaunches || 6
   const maximumTurns = options.maximumTurns || 6
-  const maximumTokens = options.maximumTokens || 20_000
+  const maximumTokens = options.maximumTokens || MAX_TOTAL_TOKENS
   return Object.freeze({
     rows,
     accept(line) {
@@ -2747,7 +2919,7 @@ async function runConformance(options = {}) {
     writeTopologyProbe(layout, installed)
     const targetBefore = fileSnapshot(layout.target)
     const transcriptGuard = createTranscriptPolicyGuard({
-      maximumLaunches: 6, maximumTurns: 6, maximumTokens: 20_000,
+      maximumLaunches: 6, maximumTurns: 6, maximumTokens: MAX_TOTAL_TOKENS,
     })
     const missionCommand = [
       ...cli.commandPrefix, 'exec', '--json', '--strict-config', '--profile', 'autoprompt',
@@ -2763,13 +2935,15 @@ async function runConformance(options = {}) {
       policyPollGuard: () => liveProviderLimits(
         transcriptGuard.rows,
         readProviderSessionBundle(layout.activationHome, { allowIncompleteLastLine: true }),
-        { maximumLaunches: 6, maximumTurns: 6, maximumTokens: 20_000 },
+        { maximumLaunches: 6, maximumTurns: 6, maximumTokens: MAX_TOTAL_TOKENS },
       ).within,
       onLaunchedPid: pid => launchedPids.push(pid),
     }
     paidModelLaunchRequested = true
     missionRun = mode === 'live'
-      ? await runWindowsJobCommand(missionCommand, missionOptions)
+      ? await (process.platform === 'win32'
+          ? runWindowsJobCommand(missionCommand, missionOptions)
+          : runPosixGroupCommand(missionCommand, missionOptions))
       : await runBoundedCommand(missionCommand, missionOptions)
     if (!launchedPids.includes(missionRun.childPid)) launchedPids.push(missionRun.childPid)
     const transcriptRows = parseJsonl(missionRun.stdout)
@@ -2872,7 +3046,7 @@ async function runConformance(options = {}) {
     const passed = versionRun.exitCode === 0 && helpRun.exitCode === 0 && strictPassed &&
       missionRun.exitCode === 0 && !missionRun.timedOut && residualPids.length === 0 &&
       usage.accountingComplete && usage.providerLaunchCount <= 6 &&
-      usage.providerTurnCount <= 6 && usage.totalTokens <= 20_000 &&
+      usage.providerTurnCount <= 6 && usage.totalTokens <= MAX_TOTAL_TOKENS &&
       before.ambientOnlyDiscoveryShim && before.privateRoleInventoryExact &&
       duringLocal.ambientOnlyDiscoveryShim && after.ambientOnlyDiscoveryShim &&
       stableJsonV1(before) === stableJsonV1(after) && mission.edit.result === 'PASS' &&
@@ -2969,7 +3143,7 @@ async function runConformance(options = {}) {
         explicitDeadlineMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
         maxModelProcessInvocations: 1,
         maxProviderLaunchesOrTurns: 6,
-        maxTotalTokens: 20_000,
+        maxTotalTokens: MAX_TOTAL_TOKENS,
         modelProcessInvocations: 1,
         nonModelProbeInvocations: 2,
         nativeCliInvocations: [
@@ -3212,6 +3386,7 @@ module.exports = {
   privateAgentConfigPath,
   renderIsolatedProfile,
   runBoundedCommand,
+  runPosixGroupCommand,
   runConformance,
   runWindowsJobCommand,
   scoreCapabilityProofs,

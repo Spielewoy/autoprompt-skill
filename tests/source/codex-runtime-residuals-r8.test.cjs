@@ -113,8 +113,16 @@ test('TRACE-013 mandatory representative role/policy probe runs before fleet adm
       assert.equal(request.logicalRole, 'diagnostic-probe')
       assert.equal(request.purpose, 'diagnostic')
       return verified
-        ? { code: 'PASS', commands: [{ command: 'inspect representative policy', exitCode: 0 }] }
-        : { code: 'DENIED' }
+        ? {
+            allAssignedItemsPass: true,
+            successItems: [{ id: 'policy-inspection', status: 'pass', evidenceIds: ['evidence-1'] }],
+            commands: [{ command: 'inspect representative policy', exitCode: 0 }],
+          }
+        : {
+            allAssignedItemsPass: false,
+            successItems: [{ id: 'policy-inspection', status: 'blocked', evidenceIds: [] }],
+            commands: [],
+          }
     }
     return runtime
   }
@@ -151,7 +159,7 @@ test('RUN-037 resume reopens the exact durable representative probe instead of r
   fresh.launchChild = async request => {
     launches += 1
     return {
-      schemaVersion: '2.0.0', reportType: 'result', code: 'PASS', runId,
+      schemaVersion: '2.0.0', reportType: 'result', runId,
       assignmentId: request.workItemId, logicalRoleId: 'diagnostic-probe', physicalRoleId: physicalRole,
       requestEnvelopeHash: requestHash, allAssignedItemsPass: true,
       filesChanged: [], resourcesChanged: [], behaviorChanged: ['Representative policy is usable.'],

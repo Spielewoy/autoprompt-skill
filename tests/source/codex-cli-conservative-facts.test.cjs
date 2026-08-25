@@ -427,7 +427,7 @@ test('missing, unauthenticated, or contradicted capability evidence denies with 
   assert.equal(admitted, 0)
 })
 
-test('production classification validates facts and capabilities without re-running automatic route choice', () => {
+test('production classification validates facts, capabilities, and the deterministic route safety floor', () => {
   const originals = {
     validateRouteFacts: router.validateRouteFacts,
     classifyRoute: router.classifyRoute,
@@ -448,18 +448,19 @@ test('production classification validates facts and capabilities without re-runn
     Object.assign(router, originals)
   }
 
-  assert.equal(calls.some(call => call.name === 'classifyRoute'), false)
   assert.deepEqual(calls.map(call => call.name), [
     'validateRouteFacts',
     'requiredCapabilitiesForFacts',
     'validateRouteFacts',
+    'classifyRoute',
     'requiredCapabilitiesForFacts',
     'requiredCapabilitiesForFacts',
   ])
   const normalized = originals.validateRouteFacts(receipt.routeFacts).facts
-  for (const offset of [0, 2]) {
-    assert.deepEqual(calls[offset].args[0], receipt.routeFacts)
-    assert.deepEqual(calls[offset + 1].args, [normalized, 'LIGHT'])
-  }
+  assert.deepEqual(calls[0].args[0], receipt.routeFacts)
+  assert.deepEqual(calls[1].args, [normalized, 'LIGHT'])
+  assert.deepEqual(calls[2].args[0], receipt.routeFacts)
+  assert.deepEqual(calls[3].args, [normalized, { safetyFloorOnly: true }])
   assert.deepEqual(calls[4].args, [normalized, 'LIGHT'])
+  assert.deepEqual(calls[5].args, [normalized, 'LIGHT'])
 })

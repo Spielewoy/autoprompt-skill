@@ -384,7 +384,9 @@ test('AP-TEST-029 nine-provider parity table fails closed without real signed ca
   for (const provider of providers.providers) {
     assert.deepEqual(Object.keys(provider.capabilities).sort(), axes)
     assert.equal(provider.verificationAttestation, null)
-    assert.equal(provider.defaultAdmission, 'refuse-until-p8-verification')
+    assert.equal(provider.defaultAdmission, provider.id === 'codex'
+      ? 'allow-verified-required-capabilities'
+      : 'refuse-until-p8-verification')
     for (const value of Object.values(provider.capabilities)) assert.ok(providers.safeSupportValues.includes(value))
   }
   assert.deepEqual(providerParity.behavioralCases, ['route', 'edge', 'permission', 'resume', 'terminal'])

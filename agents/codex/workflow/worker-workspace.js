@@ -49,6 +49,23 @@ function normalizeRelative(value) {
   return relative
 }
 
+function normalizeReportedPath(value, targetRoot) {
+  if (typeof value !== 'string' || !value || value.includes('\0')) {
+    fail('WORKER_WORKSPACE_INVALID', 'workspace paths must be non-empty strings without NUL bytes')
+  }
+  if (!path.isAbsolute(value)) return normalizeRelative(value)
+  if (value.split(/[\\/]/).some(part => part === '.' || part === '..')) {
+    fail('WORKER_WORKSPACE_INVALID', `workspace absolute path is not canonical text: ${value}`)
+  }
+  const root = path.resolve(targetRoot)
+  const absolute = path.resolve(value)
+  const relative = path.relative(root, absolute)
+  if (!relative || path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`)) {
+    fail('WORKER_WORKSPACE_INVALID', `workspace absolute path is outside its canonical target root: ${value}`)
+  }
+  return normalizeRelative(relative)
+}
+
 function resolveInside(root, relative) {
   const resolvedRoot = path.resolve(root)
   const resolved = path.resolve(resolvedRoot, ...normalizeRelative(relative).split('/'))
@@ -119,9 +136,9 @@ function assignmentHash(assignment) {
 
 function resourcePath(targetRoot, resource) {
   if (!resource || !['file', 'directory', 'output', 'cache', 'evidence-root'].includes(resource.kind)) return null
-  const identity = String(resource.identity || '').replace(/\\/g, '/')
+  const identity = String(resource.identity || '')
   if (identity === 'workspace' || identity === '.') return path.resolve(targetRoot)
-  return resolveInside(targetRoot, identity)
+  return resolveInside(targetRoot, normalizeReportedPath(identity, targetRoot))
 }
 
 function ownsRelative(targetRoot, resources, relative) {
@@ -385,7 +402,7 @@ class WorkerWorkspaceManager {
       })
     }
     const reported = Array.isArray(result && result.filesChanged)
-      ? [...new Set(result.filesChanged.map(normalizeRelative))].sort() : []
+      ? [...new Set(result.filesChanged.map(value => normalizeReportedPath(value, this.targetRoot)))].sort() : []
     if (stableStringify(reported) !== stableStringify(actual)) {
       fail('MUTATION_REPORT_MISMATCH', 'worker file report does not match the isolated physical diff', {
         reported, actual,

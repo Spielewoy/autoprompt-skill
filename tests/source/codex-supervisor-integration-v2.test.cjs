@@ -27,11 +27,13 @@ const {
   createDefaultRuntimeOptions,
   createSupervisorOptions,
   canonicalEvidenceBinding,
+  assertDistinctEvidenceConsumption,
   evidenceInvalidationSet,
   ensureSafeEnvironment,
   phaseBudgetVerdict,
   providerRuntimeIdentityHash,
   renderPlanArtifact,
+  resolveTerminalReceiptCandidateHash,
   safeEnvironmentFactory,
   selectWorkRecipe,
   verifyActivationProviderAttestation,
@@ -85,6 +87,98 @@ const MODEL_REGISTRY = Object.freeze([Object.freeze({
   yield: { successRate: 1, sampleSize: 100 },
 })])
 const ZERO_USAGE = Object.freeze({ noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 })
+
+function checkerReferenceMethod(methodClass, label) {
+  return {
+    methodClass,
+    source: `${label} independent source`,
+    procedure: `${label} independently derives expected observations and executes the frozen result`,
+    expectedOutputDerivedFromSubjectCode: false,
+    subjectLogicReimplemented: false,
+    positiveInvariants: [`${label} accepted behavior remains observable`],
+    negativeInvariants: [`${label} forbidden behavior is rejected`],
+    boundaryInvariants: [`${label} edge case remains within the requested behavior`],
+  }
+}
+
+test('independent checks reject circular or common-mode reference methods despite distinct evidence ids', () => {
+  const first = {
+    checkerId: 'review', oracleId: 'requirements', evidenceIds: ['review-output'],
+    requireReferenceMethod: true,
+    referenceMethod: checkerReferenceMethod('independent-model', 'shared model'),
+  }
+  assert.throws(() => assertDistinctEvidenceConsumption([
+    first,
+    { ...first, checkerId: 'test', oracleId: 'behavior', evidenceIds: ['test-output'] },
+  ]), error => error.code === 'DUPLICATE_REFERENCE_METHOD')
+  assert.throws(() => assertDistinctEvidenceConsumption([{
+    ...first,
+    referenceMethod: {
+      ...first.referenceMethod,
+      expectedOutputDerivedFromSubjectCode: true,
+    },
+  }]), error => error.code === 'REFERENCE_METHOD_INVALID')
+  assert.equal(assertDistinctEvidenceConsumption([
+    first,
+    {
+      checkerId: 'test', oracleId: 'behavior', evidenceIds: ['test-output'],
+      requireReferenceMethod: true,
+      referenceMethod: checkerReferenceMethod('black-box-boundary', 'edge corpus'),
+    },
+  ]).referenceMethodHashes.length, 2)
+})
+
+function representativeProbeResult(launch) {
+  const assignment = launch.canonicalAssignment
+  return {
+    schemaVersion: '2.0.0', reportType: 'result', code: 'PASS',
+    runId: assignment.runId, assignmentId: launch.workItemId,
+    logicalRoleId: launch.logicalRole, physicalRoleId: launch.physicalRole,
+    requestEnvelopeHash: assignment.requestEnvelopeHash,
+    allAssignedItemsPass: true, filesChanged: [],
+    commands: [{ command: 'read-only representative capability probe', exitCode: 0 }],
+    successItems: [{
+      id: 'representative-policy-probe', description: 'Read-only probe passed.', status: 'pass',
+    }],
+    findingIds: assignment.findingIds,
+    requestedTransition: {
+      event: 'WORK_ITEM_VERIFIED', reason: 'Representative policy probe passed.', invalidateEvidenceIds: [],
+    },
+    contextId: 'context:diagnostic-probe', usage: ZERO_USAGE, evidenceHashes: [CANDIDATE_A],
+  }
+}
+
+function usableDoneFixture(harness, id) {
+  const deliverable = path.join(harness.directory, `${id}.txt`)
+  fs.writeFileSync(deliverable, `${id}\n`)
+  return {
+    outcome: 'DONE',
+    deliverables: [deliverable],
+    checkHashes: [crypto.createHash('sha256').update(fs.readFileSync(deliverable)).digest('hex')],
+  }
+}
+
+test('ROADMAP checker terminal receipt preserves an authoritative null runtime candidate', () => {
+  const planHash = 'd'.repeat(64)
+  assert.equal(resolveTerminalReceiptCandidateHash({
+    logicalRole: 'plan-checker',
+    runtimeStateProvider: () => ({ candidateHash: null }),
+    requestCandidateHash: planHash,
+    resultCandidateHash: planHash,
+  }), null)
+  assert.equal(resolveTerminalReceiptCandidateHash({
+    logicalRole: 'plan-checker',
+    runtimeStateProvider: null,
+    requestCandidateHash: planHash,
+    resultCandidateHash: planHash,
+  }), planHash)
+  assert.equal(resolveTerminalReceiptCandidateHash({
+    logicalRole: 'worker',
+    runtimeStateProvider: () => ({ candidateHash: null }),
+    requestCandidateHash: planHash,
+    resultCandidateHash: planHash,
+  }), planHash)
+})
 
 function tempDirectory(t, prefix) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
@@ -401,6 +495,7 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
     scoutCount: 2,
     missingInformation: ['Which service owns session migration?', 'Which client ships after the API?'],
   })
+  const roadmapCandidate = 'd'.repeat(64)
   assert.equal(routeDecision.topology.coordination.scouts.count, 2)
   assert.deepEqual(routeDecision.topology.coordination.scouts.namedUnknowns,
     ['Which service owns session migration?', 'Which client ships after the API?'])
@@ -426,6 +521,12 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
               code: 'PASS',
               payload: {
                 evidenceIds: [`build-acceptance:${request.workItemId}`],
+                referenceMethod: checkerReferenceMethod(
+                  request.logicalRole === 'independent-reviewer'
+                    ? 'requirements-review'
+                    : 'black-box-boundary',
+                  request.workItemId,
+                ),
                 buildAcceptance: {
                   status: 'PASS', deliverable: usableDeliverable, sha256: deliverableHash,
                 },
@@ -466,7 +567,7 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
     harnessAttestation: () => ({ repoHash: CANDIDATE_A, buildHash: 'b'.repeat(64), oracleHash: 'c'.repeat(64) }),
     writePlan: (_route, _decision, authorResult) => { plan = renderPlanArtifact('ROADMAP', routeDecision, authorResult) },
     planExists: () => plan !== null,
-    planPointer: () => ({ path: path.join(directory, 'ROADMAP.md'), sha256: CANDIDATE_A, bytes: 1 }),
+    planPointer: () => ({ path: path.join(directory, 'ROADMAP.md'), sha256: roadmapCandidate, bytes: 1 }),
     readResult: workItemId => results.get(workItemId) || null,
     resultPointer: workItemId => ({
       name: workItemId, path: path.join(directory, `${workItemId}.json`),
@@ -488,11 +589,13 @@ test('ROADMAP executes every named scout, joins durable evidence into same-autho
   assert.equal(revision.executorKey, 'roadmap-author')
   assert.deepEqual(revision.evidencePointers.map(pointer => pointer.name), ['roadmap-scout-1', 'roadmap-scout-2'])
   const planCheck = launches.find(item => item.workItemId === 'roadmap-plan-check')
+  assert.equal(planCheck.candidateHash, roadmapCandidate)
   assert.deepEqual(planCheck.evidencePointers.map(pointer => pointer.name), ['roadmap-scout-1', 'roadmap-scout-2'])
   const planRepair = launches.find(item => item.workItemId === 'roadmap-author-plan-repair')
   assert.equal(planRepair.repairOf, 'roadmap-author-revise')
   assert.equal(planRepair.executorKey, 'roadmap-author')
   const planRecheck = launches.find(item => item.workItemId === 'roadmap-plan-recheck')
+  assert.equal(planRecheck.candidateHash, roadmapCandidate)
   assert.equal(planRecheck.repairOf, 'roadmap-plan-check')
   assert.equal(planRecheck.executorKey, 'roadmap-plan-check')
   assert.match(plan, /1\. Prepare the migration owner boundary\./)
@@ -535,7 +638,13 @@ test('ROADMAP resume consumes completed scout frontier and starts at same-author
   const launch = async request => {
     launches.push(request)
     if (request.logicalRole === 'plan-checker' || request.logicalRole.startsWith('independent-')) {
-      return { code: 'PASS', payload: { evidenceIds: [`evidence:${request.workItemId}`] } }
+      return { code: 'PASS', payload: {
+        evidenceIds: [`evidence:${request.workItemId}`],
+        referenceMethod: checkerReferenceMethod(
+          request.workItemId.endsWith('-2') ? 'black-box-boundary' : 'requirements-review',
+          request.workItemId,
+        ),
+      } }
     }
     if (request.retainLease) return {
       retainedLease: { schedulerLease: {}, completed: false, workItemId: request.workItemId, caller: {} },
@@ -599,7 +708,13 @@ test('ROADMAP CHECK_WORK restart reloads the frozen accepted plan pointer for do
       launches.push(request)
       return {
         code: 'PASS',
-        payload: { evidenceIds: [`resume-evidence:${request.workItemId}`] },
+        payload: {
+          evidenceIds: [`resume-evidence:${request.workItemId}`],
+          referenceMethod: checkerReferenceMethod(
+            request.workItemId.endsWith('-2') ? 'black-box-boundary' : 'requirements-review',
+            request.workItemId,
+          ),
+        },
       }
     },
     completeRetainedLease: () => {},
@@ -725,7 +840,13 @@ test('hidden external verification caps provisional work and cannot terminate as
         fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'provisional'\n")
       }
       return request.logicalRole.startsWith('independent-')
-        ? { code: 'PASS', payload: { evidenceIds: [`evidence:${request.workItemId}`] } }
+        ? { code: 'PASS', payload: {
+            evidenceIds: [`evidence:${request.workItemId}`],
+            referenceMethod: checkerReferenceMethod(
+              request.workItemId.endsWith('-2') ? 'black-box-boundary' : 'requirements-review',
+              request.workItemId,
+            ),
+          } }
         : { reportId: request.workItemId }
     },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
@@ -952,17 +1073,24 @@ test('DONE retry keeps its isolated candidate unpromoted until the final accepta
       assert.equal(events.includes('promoted'), false)
       events.push(`${request.workItemId}-passed`)
       if (request.workItemId === 'independent-check-2') {
-        return { code: 'PASS', payload: { evidenceIds: ['evidence:independent-check-2'] } }
+        return { code: 'PASS', payload: {
+          evidenceIds: ['evidence:independent-check-2'],
+          referenceMethod: checkerReferenceMethod('black-box-boundary', 'retry boundary'),
+        } }
       }
       return {
         code: 'PASS',
-        payload: { evidenceIds: ['evidence:independent-check-1'], capturedDomainOutcomes: [{
+        payload: {
+          evidenceIds: ['evidence:independent-check-1'],
+          referenceMethod: checkerReferenceMethod('requirements-review', 'retry contract'),
+          capturedDomainOutcomes: [{
           schemaVersion: '1.0.0', kind: 'DONE_RETRY_PROMOTION', priorDoneCandidateHash: H,
           isolationCertificateHash: H3, retryCandidateHash: H2, isolatedWorktreeHash: H4,
           isolationVerified: true,
           acceptanceResults: [{ id: 'focused', status: 'PASS', evidenceHash: H4 }],
           acceptanceJoinHash: H5, promotionCandidateHash: H2,
-        }] },
+          }],
+        },
       }
     },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
@@ -1095,14 +1223,20 @@ test('DONE retry CHECK_WORK restart restores the durable private candidate befor
       assert.equal(request.deferredPromotionToken, handle.token)
       return {
         code: 'PASS',
-        payload: { evidenceIds: [`evidence:${request.workItemId}`], capturedDomainOutcomes: request.workItemId === 'independent-check-1' ? [{
+        payload: {
+          evidenceIds: [`evidence:${request.workItemId}`],
+          referenceMethod: checkerReferenceMethod(
+            request.workItemId.endsWith('-2') ? 'black-box-boundary' : 'requirements-review',
+            request.workItemId,
+          ),
+          capturedDomainOutcomes: request.workItemId === 'independent-check-1' ? [{
           schemaVersion: '1.0.0', kind: 'DONE_RETRY_PROMOTION', priorDoneCandidateHash: H,
           isolationCertificateHash: H3, retryCandidateHash: H2, isolatedWorktreeHash: H4,
           isolationVerified: true,
           acceptanceResults: [{ id: 'focused', status: 'PASS', evidenceHash: H4 }],
           acceptanceJoinHash: H5, promotionCandidateHash: H2,
-        }] : [],
-      }
+          }] : [],
+        },
       }
     },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
@@ -1163,11 +1297,13 @@ function makeHarness(t, overrides = {}) {
     'in_app_browser = false',
     'computer_use = false',
     'image_generation = false',
+    'multi_agent = false',
+    'multi_agent_v2 = false',
     '',
   ].join('\n')
-  fs.writeFileSync(configIsolationPath, '')
-  fs.mkdirSync(ghConfigDir)
-  fs.writeFileSync(profilePath, profile)
+  fs.writeFileSync(configIsolationPath, '', { mode: 0o600 })
+  fs.mkdirSync(ghConfigDir, { mode: 0o700 })
+  fs.writeFileSync(profilePath, profile, { mode: 0o600 })
   const enforcementProof = {
     schemaVersion: 1,
     provider: 'codex',
@@ -1237,20 +1373,7 @@ function makeHarness(t, overrides = {}) {
         return { decision: decision('DIRECT'), submittedAtMs: monotonic, usage: ZERO_USAGE }
       }
       if (launch.logicalRole === 'diagnostic-probe') {
-        return {
-          schemaVersion: '2.0.0', reportType: 'result', code: 'PASS',
-          runId: overrides.runId || 'run-1', assignmentId: launch.workItemId,
-          logicalRoleId: launch.logicalRole, physicalRoleId: launch.physicalRole,
-          requestEnvelopeHash: requestPointer.hash,
-          allAssignedItemsPass: true, filesChanged: [], commands: [],
-          successItems: [{ id: 'representative-policy-probe', description: 'Read-only probe passed.' }],
-          findingIds: launch.canonicalAssignment && launch.canonicalAssignment.findingIds || ['AP-DESIGN-023'],
-          requestedTransition: {
-            event: 'WORK_ITEM_VERIFIED', reason: 'Representative policy probe passed.', invalidateEvidenceIds: [],
-          },
-          contextId: 'context:diagnostic-probe',
-          usage: ZERO_USAGE, evidenceHashes: [CANDIDATE_A],
-        }
+        return representativeProbeResult(launch)
       }
       return { contextId: `context:${launch.logicalRole}`, usage: ZERO_USAGE, evidenceHashes: [] }
     },
@@ -1734,10 +1857,10 @@ test('explicit direct, light, and roadmap paths bypass analyst and root route-se
     assert.equal(observed[0].route, requested.toUpperCase())
     assert.equal(observed[0].decision.pathSelection.automaticSelectionBypassed, true)
     assert.equal(observed[0].decision.topology.counts.routeAnalysts, 0)
-    assert.deepEqual(harness.launches, [])
+    assert.deepEqual(harness.launches.map(item => item.logicalRole), ['diagnostic-probe'])
     assert.equal(harness.record.writes.has('route/recommendation.json'), false)
     assert.equal(harness.record.writes.has('route/decision.json'), true)
-    assert.equal(result.scheduler.counters.totalLaunches, 0)
+    assert.equal(result.scheduler.counters.totalLaunches, 1)
     assert.equal(result.scheduler.limits.maxChildLaunches, expectedBudget[requested].launches)
     assert.equal(result.scheduler.limits.maxDepth, expectedBudget[requested].depth)
   }
@@ -1802,9 +1925,9 @@ test('the single L0 correction receives only the remainder of the monotonic four
   harness.runtimeOptions.timerApi = {
     setTimeout(callback, milliseconds) {
       timerDurations.push(milliseconds)
-      return setTimeout(callback, 0)
+      return { handle: setTimeout(callback, 0) }
     },
-    clearTimeout,
+    clearTimeout(timer) { clearTimeout(timer.handle) },
   }
 
   const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
@@ -1834,7 +1957,7 @@ test('one mission lock rejects a second root before record creation or child lau
     }
     if (launch.logicalRole === 'run-owner') return { decision: decision('DIRECT'), usage: ZERO_USAGE }
     if (launch.logicalRole === 'diagnostic-probe') {
-      return { code: 'PASS', contextId: 'diagnostic-probe', usage: ZERO_USAGE }
+      return representativeProbeResult(launch)
     }
     return { contextId: 'worker', usage: ZERO_USAGE }
   }
@@ -1886,7 +2009,7 @@ test('all worker and checker launches use scheduler leases, context-free briefs,
     }
     if (launch.logicalRole === 'run-owner') return { decision: decision('DIRECT'), usage: ZERO_USAGE }
     if (launch.logicalRole === 'diagnostic-probe') {
-      return { code: 'PASS', contextId: 'diagnostic-probe', usage: ZERO_USAGE }
+      return representativeProbeResult(launch)
     }
     if (launch.logicalRole === 'worker') {
       if (launch.continuationId) assert.equal(launch.continuationId, 'executor-context')
@@ -1993,7 +2116,7 @@ test('run-global hard budget does not reset on progress and drains descendants b
       purpose: 'work', assignment: 'Continue producing work.', success: ['work advances'],
       checks: ['focused check'],
     })
-    return { outcome: 'DONE' }
+    return usableDoneFixture(harness, 'budget-overrun-result')
   }
   const baseLauncher = harness.runtimeOptions.launcher
   harness.runtimeOptions.launcher = async launch => {
@@ -2029,14 +2152,14 @@ test('root, child launch, and all four usage categories cross the canonical acco
       purpose: 'work', assignment: 'Perform one accounted work item.',
       success: ['The accounting seam is complete.'], checks: ['focused check'],
     })
-    return { outcome: 'DONE' }
+    return usableDoneFixture(harness, 'accounted-work-result')
   }
   const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
   assert.equal(result.outcome, 'DONE', JSON.stringify(result))
-  assert.equal(checkpoints.filter(item => item.delta.launches === 1).length, 2)
+  assert.equal(checkpoints.filter(item => item.delta.launches === 1).length, 3)
   assert.equal(checkpoints.some(item => item.cause.causeId.startsWith('root-route-decision:') &&
     item.delta.sessions === 1 && item.delta.launches === 0), true)
-  assert.equal(checkpoints.filter(item => item.cause.kind === 'TOKEN_USAGE_RECORDED').length, 3)
+  assert.equal(checkpoints.filter(item => item.cause.kind === 'TOKEN_USAGE_RECORDED').length, 4)
   assert.equal(checkpoints.every(item => item.delta.elapsedMilliseconds === 0 && item.delta.costMicrounits === 0), true)
 })
 
@@ -2045,7 +2168,7 @@ test('monotonic attended user wait is recorded separately and excluded from the 
   let runtime
   harness.runtimeOptions.executeRoute = async () => {
     runtime.recordUserWait(300000)
-    return { outcome: 'DONE' }
+    return usableDoneFixture(harness, 'user-wait-result')
   }
   runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
   const result = await runtime.start()
@@ -2087,7 +2210,7 @@ test('camel and snake optional scope flags cannot bypass marginal-value admissio
           [optionalField]: true,
         })
       } catch (error) { code = error.code }
-      return { outcome: 'DONE' }
+      return usableDoneFixture(harness, `optional-${optionalField}-result`)
     }
     const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
     assert.equal(result.outcome, 'DONE', JSON.stringify(result))
@@ -2122,7 +2245,7 @@ test('snake context fields are delivered while checker resources remain manifest
         oracle: 'override-oracle', scheduler_resources: [{ id: 'workspace:caller-owned', mode: 'shared' }],
       })
     } catch (error) { checkerOverrideCode = error.code }
-    return { outcome: 'DONE' }
+    return usableDoneFixture(harness, 'snake-context-result')
   }
 
   const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
@@ -2138,7 +2261,7 @@ test('snake context fields are delivered while checker resources remain manifest
 
 test('tokensaver remains concurrency-width-only after route freeze', async t => {
   const harness = makeHarness(t)
-  harness.runtimeOptions.executeRoute = async () => ({ outcome: 'DONE' })
+  harness.runtimeOptions.executeRoute = async () => usableDoneFixture(harness, 'tokensaver-result')
   const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
   assert.equal(result.outcome, 'DONE', JSON.stringify(result))
   assert.equal(result.schedulerState.settings.concurrencyPreset, 'tokensaver')
@@ -2146,7 +2269,7 @@ test('tokensaver remains concurrency-width-only after route freeze', async t => 
   assert.equal(result.schedulerState.settings.economicPolicySource, 'route')
 })
 
-test('scheduler-rejected launch cannot consume the first-child startup marker', async t => {
+test('mandatory diagnostic owns the startup marker and a rejected optional launch cannot replace it', async t => {
   const harness = makeHarness(t)
   let rejectedCode = null
   harness.runtimeOptions.executeRoute = async ({ launch }) => {
@@ -2162,16 +2285,15 @@ test('scheduler-rejected launch cannot consume the first-child startup marker', 
       workItemId: 'late-valid-work', logicalRole: 'worker', parent: 'run-owner', purpose: 'work',
       assignment: 'This valid launch is beyond the startup ceiling.', success: ['never starts'], checks: ['focused check'],
     })
-    return { outcome: 'DONE' }
+    return usableDoneFixture(harness, 'scheduler-admission-result')
   }
 
   const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
   assert.equal(rejectedCode, 'MARGINAL_VALUE_REQUIRED')
-  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
-  assert.equal(result.terminalEnvelope.status, 'ADMISSION_COMPONENT_TIMEOUT')
-  assert.deepEqual(result.scheduler.admission.breaches, ['bootstrap'])
-  assert.equal(result.scheduler.admission.components.firstChildStartup, 130001)
-  assert.equal(harness.launches.some(item => item.workItemId === 'late-valid-work'), false)
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.deepEqual(result.scheduler.admission.breaches, [])
+  assert.equal(result.scheduler.admission.components.firstChildStartup, 0)
+  assert.equal(harness.launches.some(item => item.workItemId === 'late-valid-work'), true)
 })
 
 test('AP-RUN-010 same activation resume restores protected reserves and cumulative counters', async t => {
@@ -2324,7 +2446,7 @@ test('resume rejects missing or invalid persisted deadline before any production
     }
     second.runtimeOptions.executeRoute = async () => assert.fail('invalid resume deadline must not start production')
     const result = await new CodexSupervisorRuntime(second.runtimeOptions).start()
-    assert.equal(result.outcome, 'FAILED')
+    assert.equal(result.outcome, 'PARTIAL')
     assert.equal(result.terminalEnvelope.status, 'RESUME_DEADLINE_INVALID')
     assert.deepEqual(second.launches, [])
   }
@@ -2375,8 +2497,8 @@ test('resume after the saved analyst runs root L0 once and never launches a seco
   const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
   assert.equal(result.outcome, 'DONE', JSON.stringify(result))
   assert.equal(l0Calls, 1)
-  assert.equal(harness.launches.length, 0)
-  assert.equal(result.scheduler.counters.totalLaunches, 1)
+  assert.deepEqual(harness.launches.map(launch => launch.logicalRole), ['diagnostic-probe'])
+  assert.equal(result.scheduler.counters.totalLaunches, 2)
   assert.equal(result.scheduler.rootAccounting.status, 'completed')
 })
 
@@ -2408,7 +2530,10 @@ test('resume without a child cannot bypass a recorded bootstrap admission breach
     snapshot: firstResult.budget,
   })
   second.runtimeOptions.previousBudgetSnapshot = firstResult.budget
-  second.runtimeOptions.resumeState = { decision: decision('DIRECT'), schedulerState: firstResult.schedulerState }
+  second.runtimeOptions.resumeState = {
+    decision: decision('DIRECT'), schedulerState: firstResult.schedulerState,
+    deadline: firstResult.budget.deadline,
+  }
   second.runtimeOptions.executeRoute = async () => ({ outcome: 'DONE' })
 
   const result = await new CodexSupervisorRuntime(second.runtimeOptions).start()
@@ -2850,7 +2975,7 @@ test('live worker admission binds physical role, typed ownership, scheduler clai
       return { recommendation: recommendation(), events: [], elapsedMs: 1, usage: ZERO_USAGE }
     }
     if (launch.logicalRole === 'diagnostic-probe') {
-      return { code: 'PASS', contextId: 'diagnostic-probe', usage: ZERO_USAGE }
+      return representativeProbeResult(launch)
     }
     const changed = launch.workItemId === 'owned-work' ? 'src/example.js' : 'src/outside.js'
     fs.writeFileSync(path.join(launch.workingDirectory, ...changed.split('/')), `module.exports = '${launch.workItemId}'\n`)
@@ -2974,10 +3099,7 @@ test('canonical mission paths fail before worker creation', async t => {
   let pathError = null
   harness.runtimeOptions.launcher = async launch => {
     if (launch.logicalRole === 'diagnostic-probe') {
-      return {
-        code: 'PASS', contextId: 'context:diagnostic-probe',
-        usage: ZERO_USAGE, evidenceHashes: [CANDIDATE_A],
-      }
+      return representativeProbeResult(launch)
     }
     if (launch.logicalRole === 'worker') workerCreations++
     return { contextId: 'unexpected-worker', usage: ZERO_USAGE, evidenceHashes: [] }
@@ -3037,7 +3159,7 @@ test('live checker keeps target read-only while owning isolated workspace cache 
   harness.runtimeOptions.launcher = async launch => {
     harness.launches.push(launch)
     if (launch.logicalRole === 'diagnostic-probe') {
-      return { code: 'PASS', contextId: 'diagnostic-probe', usage: ZERO_USAGE }
+      return representativeProbeResult(launch)
     }
     assert.equal(launch.logicalRole, 'independent-reviewer')
     assert.notEqual(path.resolve(launch.workingDirectory), path.resolve(target))
@@ -3056,7 +3178,7 @@ test('live checker keeps target read-only while owning isolated workspace cache 
     const oracleHash = '9'.repeat(64)
     await launch({
       workItemId: 'checker-resources', logicalRole: 'independent-reviewer', parent: 'run-owner',
-      purpose: 'verification', assignment: 'Check AP-LAYER-025 and AP-DESIGN-037.',
+      purpose: 'verification', assignment: `Check AP-LAYER-025 and AP-DESIGN-037 using ${path.join(target, 'evidence', 'baseline.txt')}.`,
       findingIds: ['AP-LAYER-025', 'AP-DESIGN-037'], candidateHash: CANDIDATE_A,
       oracle: 'hostile-resource-oracle', ownership: [
         { kind: 'evidence-root', identity: 'evidence', owner: 'target-owner' },
@@ -3106,8 +3228,12 @@ test('live checker keeps target read-only while owning isolated workspace cache 
     assert.equal(byKind.has(kind), true, `missing checker ${kind} assignment resource`)
   }
   for (const resource of checker.canonicalAssignment.resources.filter(resource => resource.identity !== 'evidence')) {
-    assert.equal(resource.access, 'exclusive')
-    assert.equal(resource.owner, 'checker-resources')
+    if (resource.access === 'read') {
+      assert.match(resource.expectedPreimageHash, /^[a-f0-9]{64}$/)
+    } else {
+      assert.equal(resource.access, 'exclusive')
+      assert.equal(resource.owner, 'checker-resources')
+    }
   }
   assert.equal(checker.schedulerResources.some(resource => String(resource.id).startsWith('cache:')), true)
   assert.equal(checker.schedulerResources.some(resource => String(resource.id) === 'database:checker-db'), true)
@@ -3129,7 +3255,7 @@ test('AP-RUN-037 checker snapshot repair ignores ambient Git command overrides a
   }
   const profilePath = path.join(directory, 'autoprompt.config.toml')
   const profile = strictLocalProfile()
-  fs.writeFileSync(profilePath, profile)
+  fs.writeFileSync(profilePath, profile, { mode: 0o600 })
   const enforcementProofPath = path.join(directory, 'enforcement-proof.json')
   fs.writeFileSync(enforcementProofPath, `${JSON.stringify({
     schemaVersion: 1,
@@ -3199,7 +3325,7 @@ test('private worker workspace keeps real target immutable and rejects stale own
     activationId: 'isolated-cas-activation',
   })
   const assignment = {
-    resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }],
+    resources: [{ kind: 'file', identity: path.join(target, 'src', 'example.js'), access: 'write' }],
   }
   const session = manager.prepare({ assignment, workItemId: 'isolated-cas-work' })
   const writer = spawnSync(process.execPath, [
@@ -3210,6 +3336,18 @@ test('private worker workspace keeps real target immutable and rejects stale own
   assert.equal(writer.status, 0, writer.stderr)
   assert.equal(fs.readFileSync(path.join(target, 'src', 'example.js'), 'utf8'), "module.exports = 'ready'\n")
   const admission = manager.inspect(session, { filesChanged: ['src/example.js'] })
+  assert.deepEqual(
+    manager.inspect(session, { filesChanged: [path.join(target, 'src', 'example.js')] }).actualFilesChanged,
+    ['src/example.js'],
+  )
+  assert.throws(
+    () => manager.inspect(session, { filesChanged: [path.join(path.dirname(target), 'foreign.js')] }),
+    error => error.code === 'WORKER_WORKSPACE_INVALID',
+  )
+  assert.throws(
+    () => manager.inspect(session, { filesChanged: [session.workspacePath + '/src/example.js'] }),
+    error => error.code === 'WORKER_WORKSPACE_INVALID',
+  )
   fs.writeFileSync(path.join(target, 'src', 'example.js'), 'independent target change\n')
   assert.throws(
     () => manager.promote(session, admission),
@@ -3232,6 +3370,17 @@ test('private worker workspace keeps real target immutable and rejects stale own
   const authorAdmission = manager.inspect(authorSession, { filesChanged: ['plan/ROADMAP.md'] })
   manager.promote(authorSession, authorAdmission)
   assert.equal(fs.readFileSync(path.join(target, 'plan', 'ROADMAP.md'), 'utf8'), '# isolated roadmap\n')
+
+  const foreignAssignment = {
+    resources: [{ kind: 'file', identity: path.join(path.dirname(target), 'foreign.js'), access: 'write' }],
+  }
+  const foreignSession = manager.prepare({ assignment: foreignAssignment, workItemId: 'foreign-owner' })
+  fs.writeFileSync(path.join(foreignSession.workspacePath, 'src', 'example.js'), 'foreign ownership attempt\n')
+  assert.throws(
+    () => manager.inspect(foreignSession, { filesChanged: ['src/example.js'] }),
+    error => error.code === 'WORKER_WORKSPACE_INVALID',
+  )
+  manager.abort(foreignSession)
 })
 
 test('worker workspace rejects intermediate symlink and Windows junction escapes before creating leaves', t => {
@@ -3442,11 +3591,12 @@ test('default child environment is emitted and rechecked by the canonical local-
     '[sandbox_workspace_write]', 'network_access = false', '', '[features]',
     'apps = false', 'enable_mcp_apps = false', 'plugins = false',
     'remote_plugin = false', 'browser_use = false', 'browser_use_external = false',
-    'in_app_browser = false', 'computer_use = false', 'image_generation = false', '',
+    'in_app_browser = false', 'computer_use = false', 'image_generation = false',
+    'multi_agent = false', 'multi_agent_v2 = false', '',
   ].join('\n')
-  fs.writeFileSync(isolation, '')
-  fs.mkdirSync(ghConfigDir)
-  fs.writeFileSync(profilePath, profile)
+  fs.writeFileSync(isolation, '', { mode: 0o600 })
+  fs.mkdirSync(ghConfigDir, { mode: 0o700 })
+  fs.writeFileSync(profilePath, profile, { mode: 0o600 })
   const branch = spawnSync('git', ['-C', ROOT, 'branch', '--show-current'], { encoding: 'utf8' }).stdout.trim()
   const boundary = safeEnvironmentFactory()(ROOT, process.env, {
     configIsolationPath: isolation,
@@ -3497,7 +3647,7 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
       }))
       spec.onStdoutLine(JSON.stringify({
         type: 'turn.completed',
-        usage: { input_tokens: 1, cached_input_tokens: 2, output_tokens: 3, reasoning_tokens: 4 },
+        usage: { input_tokens: 3, cached_input_tokens: 2, output_tokens: 3, reasoning_tokens: 4 },
       }))
       return sleeping
     },
@@ -4018,11 +4168,11 @@ test('concrete default factory runs a clean local fake-CLI route through real re
   })
   const profilePath = path.join(activationRoot, 'autoprompt.config.toml')
   const profile = strictLocalProfile()
-  fs.writeFileSync(profilePath, profile)
+  fs.writeFileSync(profilePath, profile, { mode: 0o600 })
   const configIsolationPath = path.join(activationRoot, 'empty.gitconfig')
   const ghConfigDir = path.join(activationRoot, 'gh-config')
-  fs.writeFileSync(configIsolationPath, '')
-  fs.mkdirSync(ghConfigDir)
+  fs.writeFileSync(configIsolationPath, '', { mode: 0o600 })
+  fs.mkdirSync(ghConfigDir, { mode: 0o700 })
   const enforcementProof = {
     schemaVersion: 1, provider: 'codex', profilePath,
     profileSha256: crypto.createHash('sha256').update(profile).digest('hex'),
@@ -4073,7 +4223,7 @@ test('concrete default factory runs a clean local fake-CLI route through real re
     "    stateClass:'terminal', runId:assignment.runId, requestEnvelopeHash:assignment.requestEnvelopeHash,",
     "    currentVersionHash:context.candidateHash, completedResults:[], nextReadyWork:[],",
     "    cause:{event:'CHECK_COMPLETE',reason:'Fake local checker accepted the exact candidate.',unblockPath:null},",
-    "    payloadSchemaId:'autoprompt.check.fake.v2', payload:{evidenceIds:[`fake-cli-underlying-evidence:${assignment.assignmentId}`],testOutcomes:[{id:'planned-check-1',status:'PASS',fingerprint:'fake-post-green'}]}, recordedAt:now",
+    "    payloadSchemaId:'autoprompt.check.fake.v2', payload:{evidenceIds:[`fake-cli-underlying-evidence:${assignment.assignmentId}`],referenceMethod:{methodClass:/tester/.test(role)?'black-box-boundary':'requirements-review',source:`${role} independent source`,procedure:`${role} independently derives and executes expected observations`,expectedOutputDerivedFromSubjectCode:false,subjectLogicReimplemented:false,positiveInvariants:[`${role} accepted behavior`],negativeInvariants:[`${role} rejected behavior`],boundaryInvariants:[`${role} edge behavior`]},testOutcomes:[{id:'planned-check-1',status:'PASS',fingerprint:'fake-post-green'}]}, recordedAt:now",
     "  }",
     "  else output = {",
     "    schemaVersion:'2.0.0', reportType:'result', reportId:`result:${assignment.assignmentId}` ,",
@@ -4084,9 +4234,9 @@ test('concrete default factory runs a clean local fake-CLI route through real re
     "    remainingConcerns:[], allAssignedItemsPass:true,",
     "    requestedTransition:{event:'WORK_ITEM_VERIFIED',reason:'Every assigned fake result passed.',invalidateEvidenceIds:[]}",
     "  }",
-    "  if (role === 'diagnostic-probe') output.code = 'PASS'",
+    "  if (role === 'diagnostic-probe') { output.code = 'PASS'; output.commands = [{command:'read-only representative capability probe',exitCode:0}] }",
     "  process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'33333333-3333-4333-8333-333333333333'})+'\\n')",
-    "  process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify(output)}})+'\\n')",
+    "  process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify({canonicalJson:JSON.stringify(output)})}})+'\\n')",
     "  process.stdout.write(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,cached_input_tokens:0,output_tokens:1,reasoning_tokens:0}})+'\\n')",
     "  setInterval(() => {}, 1000)",
     "})",
@@ -4215,11 +4365,11 @@ test('AP-RUN-037 production supervisor resumes a crashed worker with a fresh gen
   })
   const profilePath = path.join(activationRoot, 'autoprompt.config.toml')
   const profile = strictLocalProfile()
-  fs.writeFileSync(profilePath, profile)
+  fs.writeFileSync(profilePath, profile, { mode: 0o600 })
   const configIsolationPath = path.join(activationRoot, 'empty.gitconfig')
   const ghConfigDir = path.join(activationRoot, 'gh-config')
-  fs.writeFileSync(configIsolationPath, '')
-  fs.mkdirSync(ghConfigDir)
+  fs.writeFileSync(configIsolationPath, '', { mode: 0o600 })
+  fs.mkdirSync(ghConfigDir, { mode: 0o700 })
   const enforcementProof = {
     schemaVersion: 1, provider: 'codex', profilePath,
     profileSha256: crypto.createHash('sha256').update(profile).digest('hex'),
@@ -4260,7 +4410,7 @@ test('AP-RUN-037 production supervisor resumes a crashed worker with a fresh gen
     "    stateClass:'terminal', runId:assignment.runId, requestEnvelopeHash:assignment.requestEnvelopeHash,",
     "    currentVersionHash:context.candidateHash, completedResults:[], nextReadyWork:[],",
     "    cause:{event:'CHECK_COMPLETE',reason:'Fake checker accepted the resumed candidate.',unblockPath:null},",
-    "    payloadSchemaId:'autoprompt.check.fake.v2', payload:{evidenceIds:[`fake-cli-underlying-evidence:${assignment.assignmentId}`],testOutcomes:[{id:'planned-check-1',status:'PASS',fingerprint:'fake-post-green'}]}, recordedAt:now",
+    "    payloadSchemaId:'autoprompt.check.fake.v2', payload:{evidenceIds:[`fake-cli-underlying-evidence:${assignment.assignmentId}`],referenceMethod:{methodClass:/tester/.test(role)?'black-box-boundary':'requirements-review',source:`${role} independent source`,procedure:`${role} independently derives and executes expected observations`,expectedOutputDerivedFromSubjectCode:false,subjectLogicReimplemented:false,positiveInvariants:[`${role} accepted behavior`],negativeInvariants:[`${role} rejected behavior`],boundaryInvariants:[`${role} edge behavior`]},testOutcomes:[{id:'planned-check-1',status:'PASS',fingerprint:'fake-post-green'}]}, recordedAt:now",
     "  }",
     "  else output = {",
     "    schemaVersion:'2.0.0', reportType:'result', reportId:`result:${assignment.assignmentId}` ,",
@@ -4272,9 +4422,9 @@ test('AP-RUN-037 production supervisor resumes a crashed worker with a fresh gen
     "    remainingConcerns:[], allAssignedItemsPass:true,",
     "    requestedTransition:{event:'WORK_ITEM_VERIFIED',reason:'Every resumed fake result passed.',invalidateEvidenceIds:[]}",
     "  }",
-    "  if (role === 'diagnostic-probe') output.code = 'PASS'",
+    "  if (role === 'diagnostic-probe') { output.code = 'PASS'; output.commands = [{command:'read-only representative capability probe',exitCode:0}] }",
     "  process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'77777777-7777-4777-8777-777777777777'})+'\\n')",
-    "  process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify(output)}})+'\\n')",
+    "  process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify({canonicalJson:JSON.stringify(output)})}})+'\\n')",
     "  process.stdout.write(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,cached_input_tokens:0,output_tokens:1,reasoning_tokens:0}})+'\\n')",
     "  setInterval(() => {}, 1000)",
     "})",
@@ -4340,11 +4490,10 @@ test('AP-RUN-037 production supervisor resumes a crashed worker with a fresh gen
     `const { CodexSupervisorRuntime, createDefaultRuntimeOptions } = require(${JSON.stringify(path.join(WORKFLOW, 'phase-budget.js'))})`,
     `const { createPersistentPidTreeAdapter } = require(${JSON.stringify(path.join(ROOT, 'tests', 'fixtures', 'codex-persistent-pid-tree-adapter.cjs'))})`,
     "const input = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))",
-    'let monotonic = 0',
     'const options = createDefaultRuntimeOptions({',
     '  activation: input.activation,',
     "  probe: {supported:true,executable:process.execPath,cliVersion:'fake-codex 1.0.0',evidenceHashes:['5'.repeat(64)]},",
-    "  context: {executableArgs:[input.fakeCliPath],expectedBranch:'main',providerMaximum:2,tokenLimit:1000,sessionLimit:16,launchLimit:16,monotonicNow:()=>++monotonic,processAdapter:createPersistentPidTreeAdapter({controlRoot:input.pidTreeControlRoot})},",
+    "  context: {executableArgs:[input.fakeCliPath],expectedBranch:'main',providerMaximum:2,tokenLimit:1000,sessionLimit:16,launchLimit:16,processAdapter:createPersistentPidTreeAdapter({controlRoot:input.pidTreeControlRoot})},",
     '})',
     'const originalRecordFactory = options.recordFactory',
     'options.recordFactory = async request => {',
@@ -4391,7 +4540,6 @@ test('AP-RUN-037 production supervisor resumes a crashed worker with a fresh gen
   assert.match(crashedWorkerRecord.groupIdentity, /^persistent-pid-tree:v1:\d+$/)
 
   activation.record.capability.generation = 2
-  let resumedMonotonic = 0
   const options = createDefaultRuntimeOptions({
     activation,
     probe: {
@@ -4401,7 +4549,6 @@ test('AP-RUN-037 production supervisor resumes a crashed worker with a fresh gen
     context: {
       executableArgs: [fakeCliPath], expectedBranch: 'main', providerMaximum: 2,
       tokenLimit: 1000, sessionLimit: 16, launchLimit: 16,
-      monotonicNow: () => ++resumedMonotonic,
       processAdapter: createPersistentPidTreeAdapter({ controlRoot: pidTreeControlRoot }),
     },
   })
@@ -4786,7 +4933,8 @@ test('self-adapter probes only the executable identity admitted by signed provid
     runtimeIdentityHash: providerRuntimeIdentityHash(record),
     activationNonce: 'signed-activation-nonce',
     verificationMethod: 'live-conformance-suite',
-    verifiedCapabilities: ['isolation', 'privateSkillRoot'],
+    verifiedCapabilities: ['isolation', 'privateSkillRoot', 'processOwnership'],
+    canonicalProviderTrustSha256: record.providerTrust.sha256,
     result: 'supported',
   }
   attestation.signature = {
@@ -4882,12 +5030,21 @@ test('shell adapters expose identical supported contract and concrete factory fa
   assert.equal(expectedJson.defaultRoute, null)
   assert.equal(expectedJson.forkTurns, 'none')
 
-  const ps = spawnSync('powershell', [
-    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
-    path.join(WORKFLOW, 'supervisor.ps1'), '--capabilities',
-  ], { cwd: ROOT, encoding: 'utf8' })
-  assert.equal(ps.status, 0, ps.stderr)
-  assert.deepEqual(JSON.parse(ps.stdout), expectedJson)
+  const powerShellExecutable = [process.platform === 'win32' ? 'powershell.exe' : 'pwsh', 'powershell']
+    .find(executable => {
+      const probe = spawnSync(executable, ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'], {
+        cwd: ROOT, encoding: 'utf8', windowsHide: true,
+      })
+      return !probe.error && probe.status === 0
+    })
+  if (powerShellExecutable) {
+    const ps = spawnSync(powerShellExecutable, [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+      path.join(WORKFLOW, 'supervisor.ps1'), '--capabilities',
+    ], { cwd: ROOT, encoding: 'utf8' })
+    assert.equal(ps.status, 0, ps.stderr)
+    assert.deepEqual(JSON.parse(ps.stdout), expectedJson)
+  }
 
   const shellSource = fs.readFileSync(path.join(WORKFLOW, 'supervisor.sh'), 'utf8')
   assert.match(shellSource, /exec node "\$RUNTIME" --supervisor "\$@"/)

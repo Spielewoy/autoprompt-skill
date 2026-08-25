@@ -505,8 +505,7 @@
               ],
               "properties": {
                 "event": {
-                  "type": "string",
-                  "pattern": "^[A-Z][A-Z0-9_]+$"
+                  "const": "WORK_ITEM_VERIFIED"
                 },
                 "reason": {
                   "type": "string",
