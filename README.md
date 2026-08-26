@@ -117,7 +117,7 @@ DeepSeek's 82.7% used its own test setup, so it is a reference point, not a comp
 <details>
 <summary><strong>Expected trade-off:</strong> about 3x the time and 2x the tokens.</summary>
 
-Timing and token logs were not retained, so these are planning estimates based on user experience reports, not measured benchmark results. The measured result was 29 to 16 failures (45% fewer) in this run, which translates to about 2x fewer mistakes. Note: for very small tasks, this may differ heavily.
+Timing and token logs were not retained, so these are planning estimates based on user experience reports, not measured benchmark results. The measured result was 29 to 16 failures (45% fewer) in this run, which translates to about 2x fewer mistakes. Note: for very small tasks, this may differ significantly.
 
 </details>
 
