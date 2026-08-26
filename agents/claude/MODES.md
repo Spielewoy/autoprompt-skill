@@ -167,7 +167,7 @@ personas, hierarchy, concurrency, roadmap, or gates.
 For Claude Code, enabled casting is a pre-launch supervisor responsibility.
 Claude exposes only `opus`, `sonnet`, and `haiku` aliases: one selected model
 fills all three; two map the stronger model to `opus`/`sonnet` and the weaker to
-`haiku`; three map strongest/middle/weakest; more than three fails explicitly.
+`haiku`; three map strongest/middle/weakest; more than three fail explicitly.
 An already-running process may use casting only when trusted metadata and live
 alias bindings match. Codex uses its actual per-agent model and reasoning-effort
 configuration; do not copy Claude alias claims into Codex routing.
