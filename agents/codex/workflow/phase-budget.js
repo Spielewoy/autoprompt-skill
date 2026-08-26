@@ -119,7 +119,7 @@ const CHECKER_FALSIFICATION_DOCTRINE = Object.freeze([
   'Derive expected behavior from the request, durable inputs, or an independent source; never from the subject implementation.',
   'For mappings, joins, references, identity, or deduplication, exercise at least three distinct entities and prove both forward consistency and reverse non-collision.',
   'For dates, versions, revocations, merges, migrations, or state transitions, test before, exactly at, between, and after each boundary, including a chained transition.',
-  'For generated or serialized artifacts, reopen the saved deliverable through the actual downstream consumer/export path and prove non-empty requested topology and measurements. A custom or relationship-only parser is never a substitute; if the consumer cannot run, return CHECK_INCONCLUSIVE.',
+  'For generated or serialized artifacts, reopen the saved deliverable through the actual downstream consumer/export path and prove non-empty requested topology and measurements. A custom or relationship-only parser is never a substitute. A transient consumer runtime failure is RUNTIME_FAILURE. If the exact version being checked lacks a portable downstream-consumer reopen receipt required by acceptance, return FAIL with an implementation unblock path; use CHECK_INCONCLUSIVE only when supplied external evidence is genuinely insufficient and no implementation repair can make the result verifiable.',
   'For parsers, sanitizers, interpreters, or security boundaries, test the actual shipped runtime plus encoded, namespaced, malformed, mutation, and interaction-triggered cases. A self-authored substitute parser cannot authorize PASS; if the actual runtime cannot run, return CHECK_INCONCLUSIVE.',
   'A missing positive, negative, or boundary witness is CHECK_INCONCLUSIVE, never PASS.',
 ])
@@ -133,7 +133,7 @@ const CONTROLLER_FAILURE_RELEASE_STATES = new Set([
   'FINAL_CHECK', 'FINALIZING',
 ])
 const WORKER_CONTEXT_FAILURE_CODES = new Set([
-  'CODEX_CHILD_FAILED', 'CODEX_OUTPUT_TRANSPORT_INVALID', 'WORK_ITEM_RESULT_FAILED',
+  'CODEX_CHILD_FAILED', 'CODEX_OUTPUT_TRANSPORT_INVALID', 'CODEX_TYPED_TERMINAL_MISSING',
   'CODEX_SESSION_ID_MISSING', 'CODEX_USAGE_INCOMPLETE', 'CODEX_EVENT_STREAM_INVALID',
   'PROCESS_DRAIN_TIMEOUT', 'INCOMPLETE_USAGE_ACCOUNTING',
   'WORKER_CONTEXT_INVALID', 'WORKER_CONTEXT_REQUIRED', 'WORKER_RESULT_INVALID',
@@ -226,6 +226,16 @@ function canonicalCheckerReassessment(input, expected = {}) {
 
 function checkerVerdictPassed(logicalRole, result) {
   return CHECKER_ROLES.has(logicalRole) && Boolean(result) && result.code === 'PASS'
+}
+
+function checkerImplementationFailureFingerprint(result) {
+  if (!result || result.code !== 'FAIL') return null
+  return hashText(stableStringify({
+    code: result.code,
+    cause: result.cause || null,
+    findingIds: exactFindingIds(result, result.payload, result.cause),
+    findings: result.payload && result.payload.findings || [],
+  }))
 }
 
 function roadmapPlanOracleForWorkItem(workItemId) {
@@ -2583,6 +2593,7 @@ function createCodexJsonlAccumulator() {
   const state = {
     events: [], eventCount: 0, sessionId: null, finalText: null, output: null, usage: null,
     turnCompleted: false, terminalMessageEligible: false, terminalBoundary: null,
+    knownTodoItemIds: new Set(), terminalKnownTodoItemIds: new Set(),
     eventHash: crypto.createHash('sha256'),
     rawOutputHash: crypto.createHash('sha256'),
   }
@@ -2622,13 +2633,26 @@ function createCodexJsonlAccumulator() {
             state.output = { outcome: 'FAILED', terminalEnvelope: { status: 'OUTPUT_SCHEMA_INVALID' }, text: state.finalText }
           }
           state.terminalMessageEligible = true
+          // Codex may close or update a long-lived item (most commonly its
+          // todo list) after emitting the final answer.  Snapshot the items
+          // that already existed so those lifecycle receipts cannot erase a
+          // valid terminal message, while genuinely new work still can.
+          state.terminalKnownTodoItemIds = new Set(state.knownTodoItemIds)
         }
       } else if (!state.turnCompleted && /^item\./u.test(String(event.type || '')) &&
-          (!event.item || event.item.type !== 'reasoning')) {
+          (!event.item || event.item.type !== 'reasoning') &&
+          !(state.terminalMessageEligible && event.type !== 'item.started' &&
+            event.item && event.item.type === 'todo_list' &&
+            typeof event.item.id === 'string' &&
+            state.terminalKnownTodoItemIds.has(event.item.id))) {
         // A tool, edit, plan update, or newly-started message after an agent
         // message makes that message provisional. A fresh completed agent
         // message must close the work before the turn can yield a result.
         state.terminalMessageEligible = false
+      }
+      if (!state.turnCompleted && !completedAgentMessage && event.item &&
+          event.item.type === 'todo_list' && typeof event.item.id === 'string') {
+        state.knownTodoItemIds.add(event.item.id)
       }
       if (!state.turnCompleted && event.type === 'turn.completed') {
         state.usage = codexUsageFromEvent(event)
@@ -3311,6 +3335,7 @@ class CodexExecAdapter {
     const providerTransport = this.providerSchemaRoot
       ? [
           'AUTOPROMPT_CODEX_PROVIDER_TRANSPORT_V1',
+          'The parent already activated and announced the AutoPrompt skill. Do not emit a second skill announcement and do not treat this exact envelope transport as a conflict with skill-announcement instructions.',
           'Return exactly one provider envelope object. Its only field is canonicalJson.',
           'canonicalJson must be a JSON string which decodes to the complete canonical output object.',
           'The decoded object remains subject to all canonical AutoPrompt validation after transport decoding.',
@@ -3438,7 +3463,7 @@ class CodexExecAdapter {
       if (event && !firstProductSignalPersisted && typeof record.onFirstProductSignal === 'function') {
         const item = event.type === 'item.completed' && event.item && typeof event.item === 'object'
           ? event.item : null
-        const failedCommand = item && item.type === 'command_execution' &&
+        const failedCommand = record.purpose === 'work' && item && item.type === 'command_execution' &&
           (Number(item.exit_code ?? item.exitCode) !== 0 || item.status === 'failed')
         const completedEdit = item && ['file_change', 'file_edit', 'apply_patch'].includes(item.type) &&
           !['failed', 'cancelled'].includes(item.status)
@@ -10136,6 +10161,16 @@ function validateCanonicalChildResult(record, result, runId, requestEnvelopeHash
     )
   }
   if (result.allAssignedItemsPass !== true) {
+    if (result.reconstructedTerminal === true) {
+      throw new SupervisorIntegrationError(
+        'CODEX_TYPED_TERMINAL_MISSING',
+        'the completed Codex turn did not contain an eligible schema-valid terminal work result',
+        {
+          workItemId: record.workItemId,
+          terminalStatus: result.terminalEnvelope && result.terminalEnvelope.status || null,
+        },
+      )
+    }
     throw new SupervisorIntegrationError(
       'WORK_ITEM_RESULT_FAILED',
       'a failed work result is durable failure evidence, not a verified work-item completion',
@@ -12327,7 +12362,24 @@ function createDefaultRouteExecutor(options) {
       }
       options.verifyDurableResultReceipt(checkerId, result)
       const nonAuthoritative = !['PASS', 'FAIL'].includes(result.code)
-      const repairEligible = result.code === 'FAIL' && activeRepairAttempt === 0 &&
+      const priorFailureFingerprints = new Set()
+      if (activeRepairAttempt > 0 && typeof options.readResult === 'function') {
+        for (let priorAttempt = 0; priorAttempt < activeRepairAttempt; priorAttempt += 1) {
+          const priorBaseId = `independent-check-${checkerIndex + 1}` +
+            (priorAttempt > 0 ? `-repair-${priorAttempt}` : '')
+          for (const priorId of [priorBaseId, `${priorBaseId}-runtime-retry-1`]) {
+            const priorResult = options.readResult(priorId)
+            const priorFingerprint = checkerImplementationFailureFingerprint(priorResult)
+            if (priorFingerprint) priorFailureFingerprints.add(priorFingerprint)
+          }
+        }
+      }
+      const repeatedFailure = priorFailureFingerprints.has(
+        checkerImplementationFailureFingerprint(result),
+      )
+      const repairEligible = (result.code === 'FAIL' ||
+          (result.code === 'CHECK_INCONCLUSIVE' && sourceKind === 'retry-result')) &&
+        !repeatedFailure &&
         workerCount === 1 && !doneRetryBoundary
       const expectedNext = sourceKind === 'retry'
         ? [`${checkerId}-runtime-retry-1`]
@@ -12336,7 +12388,7 @@ function createDefaultRouteExecutor(options) {
             ? [`independent-check-${checkerIndex + 2}` +
               (activeRepairAttempt > 0 ? `-repair-${activeRepairAttempt}` : '')]
             : []
-          : repairEligible ? ['work-1-repair-1'] : []
+          : repairEligible ? [`work-1-repair-${activeRepairAttempt + 1}`] : []
       if (stableStringify(resumeState.nextReadyWorkIds) !== stableStringify(expectedNext)) {
         throw new SupervisorIntegrationError(
           'CHECK_RETRY_STATE_INVALID',
@@ -12348,7 +12400,7 @@ function createDefaultRouteExecutor(options) {
           : result.code === 'PASS' ? 'accepted'
           : repairEligible ? 'repair' : 'terminal',
         fromRetryState: Boolean(pendingRetry), nextReadyId, checkerId, checkerIndex,
-        repairAttempt: repairEligible ? 1 : activeRepairAttempt || repairAttempt, result, pointer,
+        repairAttempt: repairEligible ? activeRepairAttempt + 1 : activeRepairAttempt || repairAttempt, result, pointer,
         checkerResultHash: hashText(JSON.stringify(result)), nonAuthoritative,
       })
     })()
@@ -12366,7 +12418,8 @@ function createDefaultRouteExecutor(options) {
                 ? `-repair-${durableIndependentFrontier.repairAttempt}` : '')]
             : []
           : durableIndependentFrontier.kind === 'repair'
-            ? [durableIndependentFrontier.nextReadyId || 'work-1-repair-1'] : [],
+            ? [durableIndependentFrontier.nextReadyId ||
+              `work-1-repair-${durableIndependentFrontier.repairAttempt}`] : [],
       })
     }
     if (durableIndependentFrontier && durableIndependentFrontier.kind === 'terminal') {
@@ -12484,6 +12537,7 @@ function createDefaultRouteExecutor(options) {
     let checkerRuntimeProgressHashes = Array.from({ length: checkerCount }, () => null)
     let checkerRuntimeReasons = Array.from({ length: checkerCount }, () => null)
     let checkerControllerAcceptedResults = Array.from({ length: checkerCount }, () => null)
+    const rejectedImplementationFingerprints = new Set()
     const pendingRepairRecovery = resumeRepairing
       ? resumeState && resumeState.retryState && resumeState.retryState.pendingImplementationRepair
       : durableIndependentFrontier && durableIndependentFrontier.kind === 'repair'
@@ -12536,7 +12590,9 @@ function createDefaultRouteExecutor(options) {
           workItemId: pending.repairWorkItemId,
           logicalRole: 'worker', parent: 'run-owner', purpose: 'work',
           repairOf: 'work-1', executorKey: 'work-1',
-          assignment: 'Repair only the implementation defects in the bound independent-check receipt. Preserve passing behavior, execute the authoritative acceptance commands, and return a newly verified exact version.',
+          assignment: checkerResult.code === 'CHECK_INCONCLUSIVE'
+            ? 'Remediate the verification blocker in the bound independent-check receipt. Preserve passing behavior, replace non-portable or self-verified output when necessary, execute the authoritative acceptance commands, and return a changed independently verifiable exact version.'
+            : 'Repair only the implementation defects in the bound independent-check receipt. Preserve passing behavior, execute the authoritative acceptance commands, and return a newly verified exact version.',
           ownership: executionOwnership.length
             ? executionOwnership.filter(item => item && item.owner === 'worker-1').map(item => ({ ...item }))
             : ['workspace'],
@@ -12547,7 +12603,8 @@ function createDefaultRouteExecutor(options) {
             rejectedCandidateHash: pending.rejectedCandidateHash,
             checkerResultHash: pending.checkerResultHash,
           }),
-          findingIds: exactFindingIds(checkerResult, checkerResult.payload, checkerResult.cause),
+          findingIds: exactFindingIds(checkerResult, checkerResult.payload, checkerResult.cause).length > 0
+            ? exactFindingIds(checkerResult, checkerResult.payload, checkerResult.cause) : ['AP-RUN-026'],
           strategyFingerprint: pending.checkerResultHash,
           difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
           risk: 'high', nextReadyAfter: [`independent-check-1-repair-${pending.repairAttempt}`],
@@ -12664,6 +12721,8 @@ function createDefaultRouteExecutor(options) {
       let workItemId
       let result
       let reusedControllerResult = false
+      let repairNonAuthoritativeCheck = false
+      let repairNonAuthoritativeFingerprint = null
       if (checkerControllerAcceptedResults[index]) {
         ({ workItemId, result } = checkerControllerAcceptedResults[index])
         reusedControllerResult = true
@@ -12687,7 +12746,7 @@ function createDefaultRouteExecutor(options) {
         checkerRecoveryDisposition: {
           nonAuthoritativeRetryId: retryAttempt === 0
             ? `${checkerAttemptId}-runtime-retry-1` : null,
-          failureRepairId: checkerRepairAttempt === 0 && workerCount === 1 &&
+          failureRepairId: workerCount === 1 &&
             !doneRetryBoundary && typeof options.resultPointer === 'function'
             ? `work-1-repair-${checkerRepairAttempt + 1}` : null,
         },
@@ -12709,7 +12768,8 @@ function createDefaultRouteExecutor(options) {
             : ''}` +
           ' Return the immutable underlying evidence identifiers you actually consumed in payload.evidenceIds; acceptance-check labels are not evidence identifiers.' +
           ' Return payload.referenceMethod with methodClass exactly equal to one of requirements-review, authoritative-suite, black-box-boundary, metamorphic-property, or independent-model; also return source, procedure, expectedOutputDerivedFromSubjectCode=false, subjectLogicReimplemented=false, and non-empty positiveInvariants, negativeInvariants, and boundaryInvariants. Execute every accessible pre-existing test and acceptance command; do not substitute only self-authored examples. Expected results must come from an independent source or property. Follow fetchedEvidence.verificationDoctrine exactly; treat PASS as an attempted falsification, not a plausibility review.' +
-          ' Return payload.testOutcomes with one entry for every named check: command must exactly equal the named check, status must be PASS or FAIL, and fingerprint must be the lowercase SHA-256 digest of the observed output.',
+          ' Named checks are acceptance obligations and may be descriptive labels, not shell commands. Never report a missing executable merely because a named check is prose. Choose and execute a suitable independent procedure for each obligation; do not repeat an unavailable procedure on retry.' +
+          ' Return payload.testOutcomes with one entry for every named check: command must preserve the named check as its stable identifier, status must be PASS or FAIL, and fingerprint must be the lowercase SHA-256 digest of the independent observation.',
         candidateHash, oracle, success: successes, checks: checkerNamedChecks,
         isolation: 'snapshot',
         writeProducing: true,
@@ -12776,7 +12836,28 @@ function createDefaultRouteExecutor(options) {
           checkerRuntimeRetries[index] = 1
           continue
         }
-        if (nonAuthoritative) {
+        const nonAuthoritativeRepairFingerprint = result && result.code === 'CHECK_INCONCLUSIVE'
+          ? hashText(stableStringify({
+              code: result.code,
+              cause: result.cause || null,
+              findings: result.payload && result.payload.findings || [],
+            }))
+          : null
+        const canRemediateNonAuthoritativeCheck = nonAuthoritativeRepairFingerprint &&
+          !rejectedImplementationFingerprints.has(nonAuthoritativeRepairFingerprint) &&
+          workerCount === 1 && !doneRetryBoundary && typeof options.resultPointer === 'function'
+        if (nonAuthoritative && canRemediateNonAuthoritativeCheck) {
+          await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
+            candidateHash,
+            checkerId: workItemId,
+            checkerResultHash: rawCheckerResultHash,
+            retryAttempt,
+            controllerReason: 'CHECK_REQUIRES_IMPLEMENTATION_REMEDIATION',
+            nextReadyWorkIds: [`work-1-repair-${checkerRepairAttempt + 1}`],
+          })
+          repairNonAuthoritativeCheck = true
+          repairNonAuthoritativeFingerprint = nonAuthoritativeRepairFingerprint
+        } else if (nonAuthoritative) {
           await options.transition('CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK', {
             candidateHash,
             checkerId: workItemId,
@@ -12796,8 +12877,9 @@ function createDefaultRouteExecutor(options) {
             checkHashes,
           }
         }
-        if (retryAttempt > 0) {
-          const repairEligible = result.code === 'FAIL' && checkerRepairAttempt === 0 &&
+        if (retryAttempt > 0 && !repairNonAuthoritativeCheck) {
+          const repairEligible = result.code === 'FAIL' &&
+            !rejectedImplementationFingerprints.has(checkerImplementationFailureFingerprint(result)) &&
             workerCount === 1 && !doneRetryBoundary && typeof options.resultPointer === 'function'
           await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
             candidateHash,
@@ -12812,12 +12894,19 @@ function createDefaultRouteExecutor(options) {
               : repairEligible ? [`work-1-repair-${checkerRepairAttempt + 1}`] : [],
           })
         }
+        if (!repairNonAuthoritativeCheck) break
         break
       }
       if (result.code !== 'PASS') {
-        const canRepairImplementation = result.code === 'FAIL' && checkerRepairAttempt === 0 &&
+        const implementationFailureFingerprint = repairNonAuthoritativeFingerprint ||
+          checkerImplementationFailureFingerprint(result)
+        const repeatedImplementationFailure = implementationFailureFingerprint &&
+          rejectedImplementationFingerprints.has(implementationFailureFingerprint)
+        const canRepairImplementation = (result.code === 'FAIL' || repairNonAuthoritativeCheck) &&
+          !repeatedImplementationFailure &&
           workerCount === 1 && !doneRetryBoundary && typeof options.resultPointer === 'function'
         if (canRepairImplementation) {
+          rejectedImplementationFingerprints.add(implementationFailureFingerprint)
           const rejectedCandidateHash = candidateHash
           const checkerReceiptPointer = options.resultPointer(workItemId)
           const checkerResultHash = hashText(JSON.stringify(result))
@@ -12835,7 +12924,9 @@ function createDefaultRouteExecutor(options) {
             workItemId: repairWorkItemId,
             logicalRole: 'worker', parent: 'run-owner', purpose: 'work',
             repairOf: 'work-1', executorKey: 'work-1',
-            assignment: 'Repair only the implementation defects in the bound independent-check receipt. Preserve passing behavior, execute the authoritative acceptance commands, and return a newly verified exact version.',
+            assignment: repairNonAuthoritativeCheck
+              ? 'Remediate the verification blocker in the bound independent-check receipt. Preserve passing behavior, replace non-portable or self-verified output when necessary, execute the authoritative acceptance commands, and return a changed independently verifiable exact version.'
+              : 'Repair only the implementation defects in the bound independent-check receipt. Preserve passing behavior, execute the authoritative acceptance commands, and return a newly verified exact version.',
             ownership: executionOwnership.length
               ? executionOwnership.filter(item => item && item.owner === 'worker-1').map(item => ({ ...item }))
               : ['workspace'],
@@ -12846,7 +12937,8 @@ function createDefaultRouteExecutor(options) {
               rejectedCandidateHash,
               checkerResultHash,
             }),
-            findingIds: exactFindingIds(result, result.payload, result.cause),
+            findingIds: exactFindingIds(result, result.payload, result.cause).length > 0
+              ? exactFindingIds(result, result.payload, result.cause) : ['AP-RUN-026'],
             strategyFingerprint: checkerResultHash,
             difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
             risk: 'high', nextReadyAfter: [`independent-check-1-repair-${checkerRepairAttempt + 1}`],

@@ -1048,11 +1048,11 @@ test('post-result independent checker frontiers resume the recorded retry or rep
   }
 })
 
-test('post-result recovery binds second-checker repair and terminal failures to exact receipts', async t => {
+test('post-result recovery binds every eligible checker failure to the next exact repair', async t => {
   for (const scenario of [
     { name: 'second-checker-repair', checkerId: 'independent-check-2', nextReady: ['work-1-repair-1'], checkerCount: 2, workerCount: 1, expect: 'DONE' },
     { name: 'ineligible-multi-worker-fail', checkerId: 'independent-check-1', nextReady: [], checkerCount: 1, workerCount: 2, expect: 'FAILED' },
-    { name: 'post-repair-terminal-fail', checkerId: 'independent-check-1-repair-1', nextReady: [], checkerCount: 1, workerCount: 1, expect: 'FAILED' },
+    { name: 'post-repair-next-fix', checkerId: 'independent-check-1-repair-1', nextReady: ['work-1-repair-2'], checkerCount: 1, workerCount: 1, expect: 'DONE' },
   ]) {
     const directory = tempDirectory(t, `autoprompt-checker-${scenario.name}-`)
     const targetPath = createTempGitTarget(directory)
@@ -1121,8 +1121,8 @@ test('post-result recovery binds second-checker repair and terminal failures to 
       route: 'DIRECT', decision: routeDecision,
       launch: async request => {
         launches.push(request.workItemId)
-        if (request.workItemId === 'work-1-repair-1') {
-          fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'repaired'\n")
+        if (/^work-1-repair-\d+$/u.test(request.workItemId)) {
+          fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), `module.exports = '${request.workItemId}'\n`)
           return { allAssignedItemsPass: true }
         }
         const second = /(?:check-2|tester)/u.test(`${request.workItemId}:${request.logicalRole}`)
@@ -1139,7 +1139,7 @@ test('post-result recovery binds second-checker repair and terminal failures to 
       resumeState: {
         resumeState: 'CHECK_WORK', completedWorkIds: [
           ...Array.from({ length: scenario.workerCount }, (_, index) => `work-${index + 1}`),
-          ...(scenario.name === 'post-repair-terminal-fail' ? ['work-1-repair-1'] : []),
+          ...(scenario.name === 'post-repair-next-fix' ? ['work-1-repair-1'] : []),
         ],
         completedCheckIds: scenario.checkerCount === 2 ? ['independent-check-1'] : [],
         acceptedResultIds: [], nextReadyWorkIds: scenario.nextReady, retryState: {},
@@ -1148,7 +1148,7 @@ test('post-result recovery binds second-checker repair and terminal failures to 
     assert.equal(outcome.outcome, scenario.expect, JSON.stringify(outcome))
     assert.deepEqual(verified, [scenario.checkerId])
     if (scenario.expect === 'DONE') {
-      assert.equal(launches[0], 'work-1-repair-1')
+      assert.equal(launches[0], scenario.nextReady[0])
       assert.equal(launches.includes('independent-check-2'), false)
     } else {
       assert.deepEqual(launches, [])
@@ -1267,7 +1267,7 @@ test('CHECK_INCONCLUSIVE crash before retry launch authenticates the base receip
   assert.equal(transitions.filter(event => event === 'CHECK_INCONCLUSIVE').length, 0)
 })
 
-test('post-repair checker retry FAIL is terminal and cannot admit a second repair', async t => {
+test('post-repair checker retry FAIL resumes into the next exact repair', async t => {
   const directory = tempDirectory(t, 'autoprompt-checker-post-repair-retry-fail-')
   const targetPath = createTempGitTarget(directory)
   fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'repaired-but-invalid'\n")
@@ -1304,12 +1304,26 @@ test('post-repair checker retry FAIL is terminal and cannot admit a second repai
     }),
   })({
     route: 'DIRECT', decision: routeDecision,
-    launch: async request => { launches.push(request.workItemId); return { code: 'PASS' } },
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'work-1-repair-2') {
+        fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'repair-two'\n")
+        return { allAssignedItemsPass: true }
+      }
+      return {
+        code: 'PASS',
+        payload: {
+          evidenceIds: [`evidence:${request.workItemId}`],
+          referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
+          testOutcomes: checkerTestOutcomes(request),
+        },
+      }
+    },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
     resumeState: {
       resumeState: 'CHECK_INCONCLUSIVE',
       completedWorkIds: ['work-1', 'work-1-repair-1'], completedCheckIds: [],
-      acceptedResultIds: [], nextReadyWorkIds: [],
+      acceptedResultIds: [], nextReadyWorkIds: ['work-1-repair-2'],
       retryState: { inconclusiveChecker: {
         checkerId: baseId,
         candidateHash: testWorkspaceCandidateHash(targetPath),
@@ -1318,8 +1332,61 @@ test('post-repair checker retry FAIL is terminal and cannot admit a second repai
       } },
     },
   })
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.deepEqual(launches, ['work-1-repair-2', 'independent-check-1-repair-2'])
+})
+
+test('crash recovery preserves an identical prior checker-failure stop across repair generations', async t => {
+  const directory = tempDirectory(t, 'autoprompt-repeated-failure-recovery-')
+  const targetPath = createTempGitTarget(directory)
+  fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'repair-one'\n")
+  const failure = {
+    code: 'FAIL',
+    payload: { findingIds: ['AP-RUN-026'] },
+    cause: { event: 'ASSERTION_FAILED', reason: 'the identical defect remains', unblockPath: 'change strategy' },
+  }
+  const records = {
+    'independent-check-1': failure,
+    'independent-check-1-repair-1': structuredClone(failure),
+  }
+  const pointers = new Map()
+  for (const [workItemId, result] of Object.entries(records)) {
+    const resultPath = path.join(directory, `${workItemId}.json`)
+    fs.writeFileSync(resultPath, `${JSON.stringify(result)}\n`)
+    const bytes = fs.readFileSync(resultPath)
+    pointers.set(workItemId, {
+      name: workItemId, path: resultPath,
+      hash: crypto.createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length,
+    })
+  }
+  const routeDecision = structuredClone(decision('DIRECT'))
+  routeDecision.independentCheckingPlan = {
+    checkerCount: 1,
+    responsibilities: ['Independently verify the repaired result.'],
+    nonOverlapReason: null,
+  }
+  const launches = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath, gitEnvironment: () => process.env, transition: async () => {},
+    readResult: workItemId => records[workItemId] || null,
+    resultPointer: workItemId => pointers.get(workItemId),
+    verifyDurableResultReceipt: (workItemId, result) => {
+      assert.deepEqual(result, records[workItemId]); return true
+    },
+    harnessAttestation: (versionHash, oracle) => ({
+      repoHash: versionHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => { launches.push(request.workItemId); return { allAssignedItemsPass: true } },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
+    resumeState: {
+      resumeState: 'CHECK_WORK', completedWorkIds: ['work-1', 'work-1-repair-1'],
+      completedCheckIds: [], acceptedResultIds: [], nextReadyWorkIds: [], retryState: {},
+    },
+  })
   assert.equal(outcome.outcome, 'FAILED', JSON.stringify(outcome))
-  assert.equal(outcome.terminalEnvelope.code, 'FAIL')
   assert.deepEqual(launches, [])
 })
 
@@ -5151,6 +5218,12 @@ test('terminal release preserves worker, environment, controller, and authoritat
   assert.deepEqual(await exercise('RUN_WORK', 'CODEX_SESSION_ID_MISSING'), {
     events: ['WORKER_CONTEXT_LOST', 'WORKER_CONTEXT_UNRECOVERABLE'], outcome: 'FAILED',
   })
+  assert.deepEqual(await exercise('RUN_WORK', 'CODEX_TYPED_TERMINAL_MISSING'), {
+    events: ['WORKER_CONTEXT_LOST', 'WORKER_CONTEXT_UNRECOVERABLE'], outcome: 'FAILED',
+  })
+  assert.deepEqual(await exercise('RUN_WORK', 'WORK_ITEM_RESULT_FAILED'), {
+    events: ['CONTROLLER_FAILED_FINAL'], outcome: 'FAILED',
+  })
   assert.deepEqual(await exercise('CHECK_WORK', 'PROVIDER_UNSUPPORTED'), {
     events: ['ENVIRONMENT_BLOCKED'], outcome: 'BLOCKED',
   })
@@ -6251,6 +6324,82 @@ test('one actionable checker FAIL returns to the same worker, freezes a new cand
   ])
 })
 
+test('changed implementation repairs continue until the independent checker passes', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-progressive-checker-repair-'))
+  const routeDecision = structuredClone(decision('DIRECT'))
+  routeDecision.independentCheckingPlan = {
+    checkerCount: 1,
+    responsibilities: ['Independently reject each remaining defect, then verify the final candidate.'],
+    nonOverlapReason: null,
+  }
+  const receiptPath = path.join(target, 'checker-fail-receipt.json')
+  fs.writeFileSync(receiptPath, '{}\n')
+  const launches = []
+  let repairAttempt = 0
+  let checkerAttempt = 0
+  const executor = createDefaultRouteExecutor({
+    targetPath: target,
+    gitEnvironment: () => process.env,
+    transition: async () => {},
+    resultPointer: workItemId => ({
+      name: workItemId,
+      path: receiptPath,
+      hash: crypto.createHash('sha256').update(fs.readFileSync(receiptPath)).digest('hex'),
+      bytes: fs.statSync(receiptPath).size,
+    }),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash,
+      buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })
+  const result = await executor({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.logicalRole === 'worker') {
+        if (request.repairOf) repairAttempt += 1
+        fs.writeFileSync(
+          path.join(target, 'src', 'example.js'),
+          `module.exports = 'candidate-${repairAttempt}'\n`,
+        )
+        return { allAssignedItemsPass: true }
+      }
+      checkerAttempt += 1
+      if (checkerAttempt < 3) {
+        return {
+          code: 'FAIL',
+          cause: {
+            event: 'ASSERTION_FAILED',
+            reason: `independent defect ${checkerAttempt}`,
+            unblockPath: 'repair the implementation again',
+          },
+          payload: { findingIds: [`AP-REPAIR-${checkerAttempt}`] },
+        }
+      }
+      return {
+        code: 'PASS',
+        payload: {
+          evidenceIds: ['evidence:progressive-repair-pass'],
+          referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
+          testOutcomes: checkerTestOutcomes(request),
+        },
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.equal(repairAttempt, 2)
+  assert.deepEqual(launches.slice(0, 6), [
+    'work-1',
+    'independent-check-1',
+    'work-1-repair-1',
+    'independent-check-1-repair-1',
+    'work-1-repair-2',
+    'independent-check-1-repair-2',
+  ])
+})
+
 test('REPAIRING resume launches the exact pending worker repair before any fresh checker', async t => {
   const target = createTempGitTarget(tempDirectory(t, 'autoprompt-checker-repair-resume-'))
   const routeDecision = structuredClone(decision('DIRECT'))
@@ -6475,7 +6624,7 @@ test('post-repair checker-one PASS recovery consumes it and launches only repair
   assert.deepEqual(launches, ['independent-check-2-repair-1'])
 })
 
-test('controller-invalid final repaired PASS retries the repaired checker and cannot admit repair two', async t => {
+test('controller-invalid repaired PASS retries, then routes a real defect into repair two', async t => {
   const directory = tempDirectory(t, 'autoprompt-repair-invalid-final-pass-')
   const targetPath = createTempGitTarget(directory)
   fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'repaired-invalid'\n")
@@ -6498,7 +6647,7 @@ test('controller-invalid final repaired PASS retries the repaired checker and ca
   const outcome = await createDefaultRouteExecutor({
     targetPath, gitEnvironment: () => process.env, transition: async () => {},
     readResult: workItemId => workItemId === completedId ? completedResult : null,
-    resultPointer: workItemId => { assert.equal(workItemId, completedId); return pointer },
+    resultPointer: workItemId => ({ ...pointer, name: workItemId }),
     verifyDurableResultReceipt: (workItemId, result) => {
       assert.equal(workItemId, completedId); assert.equal(result, completedResult); return true
     },
@@ -6510,9 +6659,20 @@ test('controller-invalid final repaired PASS retries the repaired checker and ca
     route: 'DIRECT', decision: routeDecision,
     launch: async request => {
       launches.push(request.workItemId)
-      assert.equal(request.workItemId, `${completedId}-runtime-retry-1`)
-      return { code: 'FAIL', payload: { findingIds: ['AP-RUN-026'] },
-        cause: { event: 'ASSERTION_FAILED', reason: 'repaired version still fails', unblockPath: 'terminal' } }
+      if (request.workItemId === `${completedId}-runtime-retry-1`) {
+        return { code: 'FAIL', payload: { findingIds: ['AP-RUN-026'] },
+          cause: { event: 'ASSERTION_FAILED', reason: 'repaired version still fails', unblockPath: 'repair again' } }
+      }
+      if (request.workItemId === 'work-1-repair-2') {
+        fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'repair-two'\n")
+        return { allAssignedItemsPass: true }
+      }
+      assert.equal(request.workItemId, 'independent-check-1-repair-2')
+      return { code: 'PASS', payload: {
+        evidenceIds: [`evidence:${request.workItemId}`],
+        referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
+        testOutcomes: checkerTestOutcomes(request),
+      } }
     },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
     resumeState: {
@@ -6521,8 +6681,10 @@ test('controller-invalid final repaired PASS retries the repaired checker and ca
       acceptedResultIds: [], nextReadyWorkIds: [], retryState: {},
     },
   })
-  assert.equal(outcome.outcome, 'FAILED', JSON.stringify(outcome))
-  assert.deepEqual(launches, [`${completedId}-runtime-retry-1`])
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.deepEqual(launches, [
+    `${completedId}-runtime-retry-1`, 'work-1-repair-2', 'independent-check-1-repair-2',
+  ])
 })
 
 test('completed repaired checker group rejects every contradictory nonempty recovery continuation', async t => {
@@ -6582,7 +6744,7 @@ test('completed repaired checker group rejects every contradictory nonempty reco
   }
 })
 
-test('repaired checker retry PASS preserves repair generation for the remaining checker seat', async t => {
+test('repaired checker retry PASS preserves the seat, then a later defect starts the next repair generation', async t => {
   const directory = tempDirectory(t, 'autoprompt-repaired-retry-seat-')
   const targetPath = createTempGitTarget(directory)
   fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'repaired-retry'\n")
@@ -6638,9 +6800,20 @@ test('repaired checker retry PASS preserves repair generation for the remaining 
     route: 'DIRECT', decision: routeDecision,
     launch: async request => {
       launches.push(request.workItemId)
-      assert.equal(request.workItemId, 'independent-check-2-repair-1')
-      return { code: 'FAIL', payload: { findingIds: ['AP-RUN-026'] },
-        cause: { event: 'ASSERTION_FAILED', reason: 'repaired boundary still fails', unblockPath: 'terminal' } }
+      if (request.workItemId === 'independent-check-2-repair-1') {
+        return { code: 'FAIL', payload: { findingIds: ['AP-RUN-026'] },
+          cause: { event: 'ASSERTION_FAILED', reason: 'repaired boundary still fails', unblockPath: 'repair again' } }
+      }
+      if (request.workItemId === 'work-1-repair-2') {
+        fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'repair-two'\n")
+        return { allAssignedItemsPass: true }
+      }
+      const second = request.workItemId.includes('check-2')
+      return { code: 'PASS', payload: {
+        evidenceIds: [`evidence:${request.workItemId}`],
+        referenceMethod: checkerReferenceMethod(second ? 'black-box-boundary' : 'requirements-review', request.workItemId),
+        testOutcomes: checkerTestOutcomes(request),
+      } }
     },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
     resumeState: {
@@ -6654,8 +6827,11 @@ test('repaired checker retry PASS preserves repair generation for the remaining 
       } },
     },
   })
-  assert.equal(outcome.outcome, 'FAILED', JSON.stringify(outcome))
-  assert.deepEqual(launches, ['independent-check-2-repair-1'])
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.deepEqual(launches, [
+    'independent-check-2-repair-1', 'work-1-repair-2',
+    'independent-check-1-repair-2', 'independent-check-2-repair-2',
+  ])
   assert.deepEqual(transitions.filter(item => item.eventId === 'CHECK_BECAME_CONCLUSIVE')[0]
     .details.nextReadyWorkIds, ['independent-check-2-repair-1'])
 })
@@ -6751,30 +6927,51 @@ test('a no-op checker repair fails directly without stale recheck or a second re
   ])
 })
 
-test('inconclusive and runtime checker outcomes never enter the implementation repair path', async t => {
+test('persistent inconclusive checks remediate a changed version while runtime failures remain transport retries', async t => {
   for (const code of ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE']) {
     const target = createTempGitTarget(tempDirectory(t, `autoprompt-checker-${code.toLowerCase()}-`))
+    const receiptPath = path.join(target, 'checker-inconclusive-receipt.json')
+    fs.writeFileSync(receiptPath, '{}\n')
+    const routeDecision = structuredClone(decision('DIRECT'))
+    routeDecision.independentCheckingPlan = {
+      checkerCount: 1,
+      responsibilities: ['Independently resolve the exact verification obligation.'],
+      nonOverlapReason: null,
+    }
     let repairLaunches = 0
     let checkerLaunches = 0
     const checkerTransitions = []
     const executor = createDefaultRouteExecutor({
       targetPath: target, gitEnvironment: () => process.env,
       transition: async (event, state) => { checkerTransitions.push([event, state]) },
-      resultPointer: () => assert.fail(`${code} must not resolve an implementation-repair receipt`),
+      resultPointer: workItemId => ({
+        name: workItemId,
+        path: receiptPath,
+        hash: crypto.createHash('sha256').update(fs.readFileSync(receiptPath)).digest('hex'),
+        bytes: fs.statSync(receiptPath).size,
+      }),
       harnessAttestation: (candidateHash, oracle) => ({
         repoHash: candidateHash, buildHash: 'b'.repeat(64),
         oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
       }),
     })
     const result = await executor({
-      route: 'DIRECT', decision: decision('DIRECT'),
+      route: 'DIRECT', decision: routeDecision,
       launch: async request => {
         if (request.logicalRole === 'worker') {
           if (request.repairOf) repairLaunches += 1
-          fs.writeFileSync(path.join(target, 'src', 'example.js'), `module.exports = '${code}'\n`)
+          fs.writeFileSync(path.join(target, 'src', 'example.js'),
+            `module.exports = '${code}-${repairLaunches}'\n`)
           return { allAssignedItemsPass: true }
         }
         checkerLaunches += 1
+        if (code === 'CHECK_INCONCLUSIVE' && repairLaunches > 0) {
+          return { code: 'PASS', payload: {
+            evidenceIds: [`evidence:${request.workItemId}`],
+            referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
+            testOutcomes: checkerTestOutcomes(request),
+          } }
+        }
         return {
           code,
           cause: { event: code, reason: 'the independent check did not complete conclusively', unblockPath: 'restore the checker environment' },
@@ -6783,16 +6980,27 @@ test('inconclusive and runtime checker outcomes never enter the implementation r
       },
       completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
     })
-    assert.equal(result.outcome, 'PARTIAL')
-    assert.equal(result.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
-    assert.equal(repairLaunches, 0)
-    assert.equal(checkerLaunches, 2)
-    assert.deepEqual(checkerTransitions.filter(([event]) => [
-      'CHECK_INCONCLUSIVE', 'CHECK_REMAINS_INCONCLUSIVE',
-    ].includes(event)), [
-      ['CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE'],
-      ['CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK'],
-    ])
+    if (code === 'CHECK_INCONCLUSIVE') {
+      assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+      assert.equal(repairLaunches, 1)
+      assert.equal(checkerLaunches, 3)
+      assert.deepEqual(checkerTransitions.filter(([event]) => [
+        'CHECK_INCONCLUSIVE', 'CHECK_BECAME_CONCLUSIVE', 'IMPLEMENTATION_DEFECT', 'REPAIR_READY',
+      ].includes(event)).map(([event]) => event), [
+        'CHECK_INCONCLUSIVE', 'CHECK_BECAME_CONCLUSIVE', 'IMPLEMENTATION_DEFECT', 'REPAIR_READY',
+      ])
+    } else {
+      assert.equal(result.outcome, 'PARTIAL')
+      assert.equal(result.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
+      assert.equal(repairLaunches, 0)
+      assert.equal(checkerLaunches, 2)
+      assert.deepEqual(checkerTransitions.filter(([event]) => [
+        'CHECK_INCONCLUSIVE', 'CHECK_REMAINS_INCONCLUSIVE',
+      ].includes(event)), [
+        ['CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE'],
+        ['CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK'],
+      ])
+    }
   }
 })
 

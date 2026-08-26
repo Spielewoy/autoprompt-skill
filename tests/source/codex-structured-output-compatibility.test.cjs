@@ -16,12 +16,14 @@ const {
   benchmarkFirstProductSignalDeadlineEnabled,
   benchmarkPhaseTimeoutMs,
   canonicalAssignmentResources,
+  createCodexJsonlAccumulator,
   createCheckerScratchFactory,
   validateCheckerScratchDirectories,
   decisionReadOnlyOwnership,
   executionMutableResourceOwnership,
   decodeCodexProviderEnvelope,
   materializeCodexProviderEnvelopeSchema,
+  parseCodexJsonl,
   productionRoadmapExpansionAuthority,
   readPrivateAgentAssignment,
   resolvePreMutationRouteDecisionHash,
@@ -307,11 +309,73 @@ test('Codex adapter sends the compatibility schema and restores canonical output
   const providerSchema = observed.argv[observed.argv.indexOf('--output-schema') + 1]
   assert.notEqual(providerSchema, canonicalSchema)
   assert.match(observed.stdin, /AUTOPROMPT_CODEX_PROVIDER_TRANSPORT_V1/)
+  assert.match(observed.stdin, /parent already activated and announced the AutoPrompt skill/)
   assert.match(observed.stdin, /Canonical output schema:/)
   assert.deepEqual(terminal.behaviorChanged, canonicalOutput.behaviorChanged)
   assert.deepEqual(observedUsage, { noncachedInput: 4, cachedInput: 7, output: 1, reasoning: 0 })
   assert.equal(result.reportType, 'result')
   assert.equal(Object.hasOwn(result, 'canonicalJson'), false)
+})
+
+test('Codex terminal boundary accepts closure of pre-final items but rejects newly-started work', () => {
+  const output = { canonicalJson: JSON.stringify(canonicalWorkerResult({ reportId: 'lifecycle-final' })) }
+  const thread = { type: 'thread.started', thread_id: '14141414-1414-4414-8414-141414141414' }
+  const priorTodo = {
+    type: 'item.updated',
+    item: { id: 'item_1', type: 'todo_list', items: [{ text: 'Finish work', completed: true }] },
+  }
+  const final = {
+    type: 'item.completed',
+    item: { id: 'item_27', type: 'agent_message', text: JSON.stringify(output) },
+  }
+  const closeTodo = {
+    type: 'item.completed',
+    item: { id: 'item_1', type: 'todo_list', items: [{ text: 'Finish work', completed: true }] },
+  }
+  const completed = {
+    type: 'turn.completed',
+    usage: { input_tokens: 4, cached_input_tokens: 1, output_tokens: 2, reasoning_output_tokens: 1 },
+  }
+  const acceptedEvents = [thread, priorTodo, final, closeTodo, completed]
+  const buffered = parseCodexJsonl(`${acceptedEvents.map(JSON.stringify).join('\n')}\n`)
+  assert.equal(JSON.parse(buffered.output.canonicalJson).reportId, 'lifecycle-final')
+
+  const streamed = createCodexJsonlAccumulator()
+  acceptedEvents.forEach((event, index) => streamed.push(JSON.stringify(event), index + 1))
+  assert.deepEqual(streamed.snapshot().output, buffered.output)
+
+  for (const postFinalEvent of [
+    { type: 'item.started', item: { id: 'item_1', type: 'command_execution', command: 'true' } },
+    { type: 'item.completed', item: { id: 'item_new', type: 'command_execution', command: 'true' } },
+  ]) {
+    const rejected = parseCodexJsonl([
+      thread, priorTodo, final, postFinalEvent, completed,
+    ].map(JSON.stringify).join('\n'))
+    assert.equal(rejected.output, null)
+  }
+
+  const inFlightCommand = {
+    type: 'item.started',
+    item: { id: 'item_command', type: 'command_execution', command: 'long-running-check' },
+  }
+  const commandClosureAfterFinal = {
+    type: 'item.completed',
+    item: {
+      id: 'item_command', type: 'command_execution', command: 'long-running-check',
+      status: 'completed', exit_code: 0,
+    },
+  }
+  const premature = parseCodexJsonl([
+    thread, priorTodo, inFlightCommand, final, commandClosureAfterFinal, completed,
+  ].map(JSON.stringify).join('\n'))
+  assert.equal(premature.output, null)
+
+  const typeChangedClosure = parseCodexJsonl([
+    thread, inFlightCommand, final,
+    { type: 'item.completed', item: { id: 'item_command', type: 'todo_list', items: [] } },
+    completed,
+  ].map(JSON.stringify).join('\n'))
+  assert.equal(typeChangedClosure.output, null)
 })
 
 test('Codex adapter preserves a final CHECK_INCONCLUSIVE instead of reconstructing FAIL', async t => {

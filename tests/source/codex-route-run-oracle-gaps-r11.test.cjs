@@ -167,7 +167,17 @@ test('AP-RUN-026 reconstructed failed work cannot join, emit WORK_ITEM_VERIFIED,
   assert.equal(reconstructed.allAssignedItemsPass, false)
   assert.throws(
     () => validateCanonicalChildResult(record, reconstructed, record.runId, requestEnvelopeHash),
-    error => error.code === 'WORK_ITEM_RESULT_FAILED' && error.details.workItemId === 'work-1',
+    error => error.code === 'CODEX_TYPED_TERMINAL_MISSING' && error.details.workItemId === 'work-1',
+  )
+
+  const explicitFailure = { ...reconstructed }
+  delete explicitFailure.reconstructedTerminal
+  delete explicitFailure.terminalEnvelope
+  delete explicitFailure.outcome
+  assert.throws(
+    () => validateCanonicalChildResult(record, explicitFailure, record.runId, requestEnvelopeHash),
+    error => error.code === 'WORK_ITEM_RESULT_FAILED' && error.details.workItemId === 'work-1' &&
+      error.details.reconstructedTerminal === false,
   )
 })
 

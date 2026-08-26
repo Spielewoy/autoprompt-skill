@@ -1631,7 +1631,9 @@ class CentralScheduler {
       components: { ...this._admissionComponents, bootstrap },
       combinedHardMs: this.budget.admissionHardMs || null,
       p95TargetMs: this.budget.admissionP95Ms || null,
-      withinP95: benchmarkNoTimeout || !this.budget.admissionP95Ms || included <= this.budget.admissionP95Ms,
+      // Disabling benchmark enforcement must not falsify the measurement.
+      // Callers still need to see whether the observed admission met P95.
+      withinP95: !this.budget.admissionP95Ms || included <= this.budget.admissionP95Ms,
     }
   }
 

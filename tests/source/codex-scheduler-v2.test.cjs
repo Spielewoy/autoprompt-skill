@@ -113,7 +113,9 @@ test('benchmark scheduler policy removes premature runtime ceilings while retain
   clock.now = 48 * 60 * 60 * 1000
   scheduler.recordAdmissionComponent('configuration', 25 * 60 * 60 * 1000)
   scheduler.recordAdmissionComponent('routeAnalyst', 23 * 60 * 60 * 1000)
-  assert.deepEqual(scheduler.checkAdmissionTime().breaches, [])
+  const unboundedAdmission = scheduler.checkAdmissionTime()
+  assert.deepEqual(unboundedAdmission.breaches, [])
+  assert.equal(unboundedAdmission.withinP95, false)
 
   const ordinary = createTestScheduler()
   ordinary.recordAdmissionComponent('routeAnalyst', 25 * 60 * 60 * 1000)

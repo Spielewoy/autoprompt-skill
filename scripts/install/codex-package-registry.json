@@ -157,7 +157,7 @@
     },
     {
       "path": "agents/codex/workflow/scheduler.js",
-      "sha256": "d9cb916dc7a1b90681bead822b72489276059f980c993cf2679d5a38217397bc",
+      "sha256": "5e2273f27b30c6e8d0f96e95941ccaf19af0bbe7e0e99541d61eef05b38e55be",
       "terms": ["candidate", "frontier"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     }
