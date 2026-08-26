@@ -2569,6 +2569,10 @@ function parseCodexJsonl(source) {
   const accumulator = createCodexJsonlAccumulator()
   for (const [index, line] of String(source || '').split(/\r?\n/).entries()) {
     if (!line.trim()) continue
+    // The first completed turn is the immutable protocol boundary. A stopped
+    // CLI can leave a truncated drain fragment after it; buffered decoding
+    // must not let those non-authoritative bytes reopen a committed result.
+    if (accumulator.boundaryReached()) break
     accumulator.push(line, index + 1)
   }
   return accumulator.snapshot()
@@ -2578,12 +2582,19 @@ function createCodexJsonlAccumulator() {
   const maximumRetainedEvents = 256
   const state = {
     events: [], eventCount: 0, sessionId: null, finalText: null, output: null, usage: null,
-    messageOutputs: [], messageOutputsOverflow: false,
+    turnCompleted: false, terminalMessageEligible: false, terminalBoundary: null,
     eventHash: crypto.createHash('sha256'),
+    rawOutputHash: crypto.createHash('sha256'),
   }
   state.eventHash.update('[')
   const eventStreamHash = () => state.eventHash.copy().update(']').digest('hex')
+  const projection = () => state.terminalBoundary || {
+    events: state.events, eventCount: state.eventCount, retainedEventCount: state.events.length,
+    eventStreamHash: eventStreamHash(), rawOutputHash: state.rawOutputHash.copy().digest('hex'),
+    finalText: state.finalText, output: state.output, sessionId: state.sessionId, usage: state.usage,
+  }
   return Object.freeze({
+    boundaryReached() { return state.turnCompleted },
     push(line, lineNumber = state.eventCount + 1) {
       let event
       try { event = JSON.parse(String(line)) } catch (error) {
@@ -2591,44 +2602,63 @@ function createCodexJsonlAccumulator() {
           cause: error.message,
         })
       }
+      state.rawOutputHash.update(`${String(line).replace(/\r?\n$/u, '')}\n`)
       state.eventHash.update(state.eventCount === 0 ? '' : ',').update(JSON.stringify(event))
       state.eventCount += 1
       state.events.push(event)
       if (state.events.length > maximumRetainedEvents) state.events.shift()
-      if (event.type === 'thread.started') state.sessionId = event.thread_id || event.threadId || state.sessionId
-      if (event.type === 'item.completed' && event.item && event.item.type === 'agent_message') {
-        state.finalText = event.item.text || event.item.content || state.finalText
+      if (!state.turnCompleted && !state.sessionId && event.type === 'thread.started') {
+        state.sessionId = event.thread_id || event.threadId || state.sessionId
+      }
+      const completedAgentMessage = !state.turnCompleted && event.type === 'item.completed' &&
+        event.item && event.item.type === 'agent_message'
+      if (completedAgentMessage) {
+        state.finalText = typeof event.item.text === 'string'
+          ? event.item.text : typeof event.item.content === 'string' ? event.item.content : null
+        state.output = null
+        state.terminalMessageEligible = false
         if (typeof state.finalText === 'string' && state.finalText.trim()) {
           try { state.output = JSON.parse(state.finalText) } catch {
             state.output = { outcome: 'FAILED', terminalEnvelope: { status: 'OUTPUT_SCHEMA_INVALID' }, text: state.finalText }
           }
-          if (state.messageOutputs.length < maximumRetainedEvents) state.messageOutputs.push(state.output)
-          else state.messageOutputsOverflow = true
+          state.terminalMessageEligible = true
         }
+      } else if (!state.turnCompleted && /^item\./u.test(String(event.type || '')) &&
+          (!event.item || event.item.type !== 'reasoning')) {
+        // A tool, edit, plan update, or newly-started message after an agent
+        // message makes that message provisional. A fresh completed agent
+        // message must close the work before the turn can yield a result.
+        state.terminalMessageEligible = false
       }
-      if (event.type === 'turn.completed') state.usage = codexUsageFromEvent(event)
+      if (!state.turnCompleted && event.type === 'turn.completed') {
+        state.usage = codexUsageFromEvent(event)
+        if (!state.terminalMessageEligible) state.output = null
+        state.turnCompleted = true
+        state.terminalBoundary = Object.freeze({
+          events: Object.freeze([...state.events]), eventCount: state.eventCount,
+          retainedEventCount: state.events.length, eventStreamHash: eventStreamHash(),
+          rawOutputHash: state.rawOutputHash.copy().digest('hex'), finalText: state.finalText,
+          output: state.output, sessionId: state.sessionId, usage: state.usage,
+        })
+      }
       return event
     },
     watermark() {
+      const current = projection()
       return {
-        eventCount: state.eventCount,
-        retainedEventCount: state.events.length,
-        eventStreamHash: eventStreamHash(),
-        finalText: state.finalText,
-        output: state.output,
-        messageOutputs: state.messageOutputs.slice(),
-        messageOutputsOverflow: state.messageOutputsOverflow,
-        sessionId: state.sessionId,
-        usage: state.usage,
+        eventCount: current.eventCount, retainedEventCount: current.retainedEventCount,
+        eventStreamHash: current.eventStreamHash, rawOutputHash: current.rawOutputHash,
+        finalText: current.finalText, output: current.output,
+        sessionId: current.sessionId, usage: current.usage,
       }
     },
     snapshot() {
+      const current = projection()
       return {
-        events: [...state.events], eventCount: state.eventCount, retainedEventCount: state.events.length,
-        eventStreamHash: eventStreamHash(), finalText: state.finalText, output: state.output,
-        messageOutputs: state.messageOutputs.slice(),
-        messageOutputsOverflow: state.messageOutputsOverflow,
-        sessionId: state.sessionId, usage: state.usage,
+        events: [...current.events], eventCount: current.eventCount,
+        retainedEventCount: current.retainedEventCount, eventStreamHash: current.eventStreamHash,
+        rawOutputHash: current.rawOutputHash, finalText: current.finalText, output: current.output,
+        sessionId: current.sessionId, usage: current.usage,
       }
     },
   })
@@ -3333,21 +3363,7 @@ class CodexExecAdapter {
     let terminalReceiptPersisted = false
     let committedTerminalResult = null
     let firstProductSignalPersisted = false
-    const distinctTerminalCandidates = parsed => {
-      const candidates = new Map()
-      const outputs = Array.isArray(parsed && parsed.messageOutputs)
-        ? parsed.messageOutputs : [parsed && parsed.output]
-      for (const rawOutput of outputs) {
-        if (!rawOutput || typeof rawOutput !== 'object') continue
-        let output = rawOutput
-        if (this.providerSchemaRoot && typeof output.canonicalJson === 'string') {
-          try { output = decodeCodexProviderEnvelope(output) } catch { continue }
-        }
-        if (!validateJsonSchema(canonicalSchema, output).valid) continue
-        candidates.set(hashText(stableStringify(output)), output)
-      }
-      return candidates
-    }
+    let reportedSessionId = null
     const assembledResult = (parsed, completionRequested, decodedOutput = null) => {
       const output = decodedOutput || parsed.output || {}
       return {
@@ -3368,11 +3384,16 @@ class CodexExecAdapter {
       }
     }
     const commitTerminal = (output, snapshot) => {
-      typedTerminal = output.outcome || output.code || output.reportType
+      // Route analysis and L0 decisions have their own terminal discriminants;
+      // they intentionally do not carry worker/checker fields. Keep a truthy
+      // transport marker after any role-valid result so it cannot fall through
+      // into the missing-terminal reconstruction path.
+      typedTerminal = output.outcome || output.code || output.reportType ||
+        output.preWorkResult || output.status || 'STRUCTURED_RESULT'
       committedTerminalResult = Object.freeze(assembledResult(snapshot, true, output))
       if (typeof record.onTerminalResult === 'function') {
         record.onTerminalResult(committedTerminalResult, {
-          rawOutputHash: rawOutputHash.copy().digest('hex'),
+          rawOutputHash: snapshot.rawOutputHash || rawOutputHash.copy().digest('hex'),
           eventStreamHash: snapshot.eventStreamHash,
           sessionId: record.continuationId || snapshot.sessionId,
         })
@@ -3381,11 +3402,24 @@ class CodexExecAdapter {
       stop(`typed terminal ${typedTerminal}`, 'DONE')
     }
     const onStdoutLine = line => {
-      const normalizedLine = `${String(line).replace(/\r?\n$/, '')}\n`
+      const eventLine = String(line).replace(/\r?\n$/u, '')
+      if (!eventLine.trim()) return
+      const normalizedLine = `${eventLine}\n`
       sawStreamedOutput = true
       rawOutputHash.update(normalizedLine)
+      const boundaryReachedBeforeEvent = streamAccumulator.boundaryReached()
+      if (boundaryReachedBeforeEvent) {
+        // Late drain is audit-only. Parse complete events for the transcript,
+        // but tolerate a partial final write produced while stopping Codex.
+        let auditEvent
+        try { auditEvent = JSON.parse(eventLine) } catch { return }
+        if (auditEvent && typeof record.onEvent === 'function') {
+          try { record.onEvent(auditEvent, String(line)) } catch { /* committed result stays authoritative */ }
+        }
+        return
+      }
       let event
-      try { event = streamAccumulator.push(String(line).trim()) } catch (error) {
+      try { event = streamAccumulator.push(eventLine) } catch (error) {
         streamError = error
         stop(error.code)
         return
@@ -3397,6 +3431,10 @@ class CodexExecAdapter {
           return
         }
       }
+      // The committed receipt is immutable. Keep hashing/persisting drain
+      // noise through onEvent, but never let a late event rebind the session,
+      // create a product signal, charge usage, or reopen terminal selection.
+      if (typedTerminal) return
       if (event && !firstProductSignalPersisted && typeof record.onFirstProductSignal === 'function') {
         const item = event.type === 'item.completed' && event.item && typeof event.item === 'object'
           ? event.item : null
@@ -3420,13 +3458,15 @@ class CodexExecAdapter {
       }
       if (event && event.type === 'thread.started' && typeof record.onSessionIdentified === 'function') {
         const identified = event.thread_id || event.threadId
-        if (identified) {
+        const authoritativeSessionId = streamAccumulator.watermark().sessionId
+        if (identified && identified === authoritativeSessionId && !reportedSessionId) {
           try {
             record.onSessionIdentified(String(identified), {
               event,
               raw: String(line),
               occurredAt: new Date().toISOString(),
             })
+            reportedSessionId = String(identified)
           } catch (error) {
             streamError = error
             stop(error.code || 'SESSION_CHECKPOINT_FAILED')
@@ -3474,29 +3514,13 @@ class CodexExecAdapter {
         }
       }
       const current = streamAccumulator.watermark()
-      if (typedTerminal) return
       let currentOutput = current.output
+      // A Codex turn may emit multiple agent_message items while it works,
+      // including schema-valid provisional results. The protocol's terminal
+      // boundary is turn.completed, and the last agent_message before that
+      // boundary is the authoritative structured result for the turn.
       if (current.usage) {
-        if (current.messageOutputsOverflow) {
-          streamError = new SupervisorIntegrationError(
-            'CODEX_TERMINAL_CANDIDATE_OVERFLOW',
-            'one Codex turn exceeded the bounded terminal-output history',
-          )
-          stop(streamError.code)
-          return
-        }
-        const candidates = distinctTerminalCandidates(current)
-        if (candidates.size > 1) {
-          streamError = new SupervisorIntegrationError(
-            'CODEX_MULTIPLE_TERMINAL_OUTPUTS',
-            'one Codex turn emitted conflicting schema-valid terminal outputs',
-            { candidateHashes: [...candidates.keys()].sort() },
-          )
-          stop(streamError.code)
-          return
-        }
-        if (candidates.size === 1) currentOutput = candidates.values().next().value
-        else if (this.providerSchemaRoot && currentOutput &&
+        if (this.providerSchemaRoot && currentOutput &&
             typeof currentOutput.canonicalJson === 'string') {
           try { currentOutput = decodeCodexProviderEnvelope(currentOutput) } catch (error) {
             streamError = error
@@ -3577,22 +3601,9 @@ class CodexExecAdapter {
       throw new SupervisorIntegrationError('CODEX_USAGE_INCOMPLETE', 'Codex child ended without all four usage categories')
     }
     if (committedTerminalResult) return committedTerminalResult
-    if (parsed.messageOutputsOverflow) {
-      throw new SupervisorIntegrationError(
-        'CODEX_TERMINAL_CANDIDATE_OVERFLOW',
-        'one Codex turn exceeded the bounded terminal-output history',
-      )
+    if (this.providerSchemaRoot && parsed.output) {
+      parsed.output = decodeCodexProviderEnvelope(parsed.output)
     }
-    const terminalCandidates = distinctTerminalCandidates(parsed)
-    if (terminalCandidates.size > 1) {
-      throw new SupervisorIntegrationError(
-        'CODEX_MULTIPLE_TERMINAL_OUTPUTS',
-        'one Codex turn emitted conflicting schema-valid terminal outputs',
-        { candidateHashes: [...terminalCandidates.keys()].sort() },
-      )
-    }
-    if (terminalCandidates.size === 1) parsed.output = terminalCandidates.values().next().value
-    else if (this.providerSchemaRoot) parsed.output = decodeCodexProviderEnvelope(parsed.output)
     const finalSchemaValidation = validateJsonSchema(canonicalSchema, parsed.output)
     const schemaInvalidCanEnterCorrection = record.logicalRole === 'route-analyst' ||
       (record.logicalRole === 'run-owner' && record.route === 'PRE_ROUTE')
@@ -3600,11 +3611,10 @@ class CodexExecAdapter {
         !typedChildOutputReady(parsed.output, record)) {
       parsed.output = reconstructTypedExitZeroResult(record, parsed)
     }
-    const returned = assembledResult(parsed, Boolean(typedTerminal))
+    const returned = assembledResult(parsed, Boolean(typedTerminal) || Boolean(parsed.usage))
     if (typeof record.onTerminalResult === 'function' && !terminalReceiptPersisted) {
       record.onTerminalResult(returned, {
-        rawOutputHash: String(execution.stdout || '').trim()
-          ? hashText(execution.stdout) : rawOutputHash.copy().digest('hex'),
+        rawOutputHash: parsed.rawOutputHash || rawOutputHash.copy().digest('hex'),
         eventStreamHash: parsed.eventStreamHash,
         sessionId: record.continuationId || parsed.sessionId,
       })

@@ -31,9 +31,10 @@ const { CleanupRegistry } = require(path.join(ROOT, 'agents', 'codex', 'workflow
 const { validateJsonSchema } = require(
   path.join(ROOT, 'agents', 'codex', 'workflow', 'json-schema-validator.js'),
 )
-const { remainingL0DecisionBudgetMs } = require(
+const { createRouteDecision, remainingL0DecisionBudgetMs } = require(
   path.join(ROOT, 'agents', 'codex', 'workflow', 'route-decision.js'),
 )
+const routeRouter = require(path.join(ROOT, 'agents', 'codex', 'workflow', 'router.js'))
 const {
   CONTEXT_ROUTE_CAPS,
   buildContextFreeBrief,
@@ -106,6 +107,75 @@ function canonicalWorkerResult(overrides = {}) {
     requestedTransition: { event: 'WORK_ITEM_VERIFIED', reason: 'Fixture passed.', invalidateEvidenceIds: [] },
     ...overrides,
   }
+}
+
+function canonicalDirectRouteDecision() {
+  const requestEnvelopeHash = 'a'.repeat(64)
+  const recommendationHash = 'b'.repeat(64)
+  const facts = routeRouter.normalizeFacts({
+    schemaVersion: '2.0.0', requestedEffect: 'inspect', successCriteria: 'ready',
+    dependency: {
+      shape: 'bounded', dependentWorkGroupCount: 0,
+      integrationOwnerRequired: false, separateDependentBodies: 0,
+    },
+    uncertainty: 'none', reversibility: 'fully-reversible', mutableResources: [],
+    sideEffects: [], externality: 'local-only', confidentiality: 'internal', thirdPartyImpact: 'none',
+    targetAuthorization: {
+      targetIdentities: [], authorizedTargetIdentities: [], authorizationEvidenceHash: null,
+    },
+    costAuthority: {
+      mayIncurCost: false, estimatedCostMicrounits: 0, limitMicrounits: 0,
+      approvalRequired: false, approvalGranted: false, approvalEvidenceHash: null,
+    },
+    riskAndIndependentCheckFloor: {
+      level: 'ordinary', minimumCheckerCount: 1, namedDistinctResponsibilities: [],
+    },
+    checkAndBaseline: {
+      checkQuality: 'observable', availableCheckKinds: ['receipt'],
+      baselineStatus: 'recorded', hiddenExternalCheck: false,
+    },
+    deadlineBudget: {
+      remainingSeconds: 600, admissionSeconds: 240, executionReserveSeconds: 180,
+      verificationReserveSeconds: 120, recoveryAndFinalizationReserveSeconds: 60,
+    },
+    operatorMinimumRoute: null,
+    transportCapability: { mode: 'sequential-isolated', taskCapabilityPreserved: true },
+    candidateFreeze: { required: false, available: true, environmentCanBeBound: true },
+    missingUserInput: [], architectureImpact: 'local', fitsLightPlan: true,
+    approachNeedsShortPlanning: false, shortOrderUnclear: false,
+  })
+  const classified = routeRouter.classifyRoute(facts)
+  return createRouteDecision({
+    route: 'DIRECT', routeFacts: facts,
+    requestedResult: 'Inspect the bounded target and report the result.',
+    successChecklist: ['The report is backed by an observable receipt.'],
+    checks: ['Review the structured report and its evidence receipt.'],
+    likelyAreas: ['/app'], risks: [], missingInformation: [],
+    workers: {
+      count: 1, responsibilities: ['Inspect the bounded target and return a structured result.'],
+      nonOverlapReason: 'One read-only worker owns the bounded inspection.',
+    },
+    mutableResourceOwnership: [],
+    chosenRouteReason: 'The read-only request is bounded and has a known check.',
+    rejectedRouteReasons: {
+      LIGHT: 'No reversible technical decision requires planning.',
+      ROADMAP: 'No dependent work groups require coordination.',
+    },
+    analystComparison: {
+      recommendedRoute: 'DIRECT', reason: 'The analyst and L0 classifier agree.',
+      analystFactsFingerprint: classified.facts_fingerprint,
+      analystClassifierFingerprint: classified.classifier_fingerprint,
+    },
+    routeChangeTrigger: {
+      event: 'NEW_ROUTE_FACT', factRequired: 'A recorded fact changes route precedence.',
+    },
+    requestEnvelopeHash, recommendationHash,
+    gateSelection: {
+      baseWorkType: 'inspect-report', resultFormat: 'read-only-findings',
+      artifactOverlays: ['read-only-result'], acceptanceOverlays: ['receipts'],
+      riskOverlays: [], riskEvidence: {},
+    },
+  })
 }
 
 test('oversized auxiliary brief fields are sliced losslessly into fetched evidence', t => {
@@ -289,7 +359,7 @@ test('Codex adapter preserves a final CHECK_INCONCLUSIVE instead of reconstructi
   assert.equal(Object.hasOwn(result, 'reconstructedTerminal'), false)
 })
 
-test('Codex adapter rejects conflicting schema-valid terminals and accepts identical duplicates', async t => {
+test('Codex adapter uses the last agent message at turn.completed even when earlier messages are schema-valid', async t => {
   const directory = temporaryDirectory(t)
   const invalid = canonicalOutcome('INVALID_INPUT', {
     description: 'The supplied input does not match the required format or facts.',
@@ -334,18 +404,213 @@ test('Codex adapter rejects conflicting schema-valid terminals and accepts ident
     })
   }
 
-  await assert.rejects(() => launchWith([invalid, pass], '1'),
-    error => error.code === 'CODEX_MULTIPLE_TERMINAL_OUTPUTS')
-  await assert.rejects(() => launchWith([pass, invalid], '2'),
-    error => error.code === 'CODEX_MULTIPLE_TERMINAL_OUTPUTS')
+  assert.equal((await launchWith([invalid, pass], '1')).code, 'PASS')
+  assert.equal((await launchWith([pass, invalid], '2')).code, 'RUNTIME_FAILURE')
   assert.equal((await launchWith([pass, pass], '3')).code, 'PASS')
-  await assert.rejects(() => launchWith([invalid, pass], '4', true),
-    error => error.code === 'CODEX_MULTIPLE_TERMINAL_OUTPUTS')
-  await assert.rejects(() => launchWith([pass, invalid], '5', true),
-    error => error.code === 'CODEX_MULTIPLE_TERMINAL_OUTPUTS')
+  assert.equal((await launchWith([invalid, pass], '4', true)).code, 'PASS')
+  assert.equal((await launchWith([pass, invalid], '5', true)).code, 'RUNTIME_FAILURE')
   assert.equal((await launchWith([pass, pass], '6', true)).code, 'PASS')
-  await assert.rejects(() => launchWith([invalid, ...Array(256).fill(pass)], '7', true),
-    error => error.code === 'CODEX_TERMINAL_CANDIDATE_OVERFLOW')
+  assert.equal((await launchWith([invalid, ...Array(256).fill(pass)], '7', true)).code, 'PASS')
+})
+
+test('Codex route analyst may revise a schema-valid provisional recommendation before turn.completed', async t => {
+  const directory = temporaryDirectory(t)
+  const recommendation = (route, confidence, reason) => ({
+    schemaVersion: '2.0.0', preWorkResult: 'CONTINUE', recommendedRoute: route, confidence,
+    whatTheUserWants: ['Complete the requested benchmark deliverable.'],
+    likelyAreas: ['/app'],
+    howSuccessCanBeChecked: ['Run the authoritative verifier.'],
+    unknowns: [], risks: [], independentWorkItems: [], dependencies: [],
+    reasonsForDirect: [reason], reasonsForLight: [reason], reasonsForRoadmap: [reason],
+    userInputNeeded: [], evidenceIndex: [],
+  })
+  const provisional = recommendation('LIGHT', 'low', 'Evidence inspection is still in progress.')
+  const final = recommendation('ROADMAP', 'high', 'Observed dependent work groups require an integration owner.')
+  let stopReason = null
+  const runner = {
+    async run(spec) {
+      const events = [
+        { type: 'thread.started', thread_id: '77777777-7777-4777-8777-777777777777' },
+        { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(provisional) }) } },
+        { type: 'item.started', item: { type: 'command_execution', command: 'find /app -maxdepth 2 -type f', status: 'in_progress' } },
+        { type: 'item.completed', item: { type: 'command_execution', command: 'find /app -maxdepth 2 -type f', status: 'completed', exit_code: 0 } },
+        { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(final) }) } },
+        { type: 'turn.completed', usage: { input_tokens: 3, cached_input_tokens: 1, output_tokens: 2, reasoning_output_tokens: 1 } },
+      ]
+      for (const event of events) spec.onStdoutLine(JSON.stringify(event))
+      return { status: 0, stdout: '', stderr: '', processOwned: true, exactArgv: true, drained: true }
+    },
+    async stop(spec) { stopReason = spec.reason; return { drained: true } },
+  }
+  const adapter = new CodexExecAdapter({
+    runner, targetPath: ROOT,
+    profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'route-recommendation.schema.json'),
+    providerSchemaRoot: path.join(directory, 'provider-schemas'),
+  })
+  const result = await adapter.launch({
+    logicalRole: 'route-analyst', physicalRole: 'autoprompt.v2.route-analyst',
+    providerRole: 'ap-route-analyst', sandboxMode: 'read-only',
+    policyId: 'autoprompt.codex.role-policy', policyVersion: '2.0.0',
+    route: 'PRE_ROUTE', physicalExecutionPolicy: {
+      logicalRole: 'route-analyst', physicalRole: 'autoprompt.v2.route-analyst',
+      providerRole: 'ap-route-analyst', sandboxMode: 'read-only',
+      policyId: 'autoprompt.codex.role-policy', policyVersion: '2.0.0',
+    },
+    entryPrompt: '$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\nrequest_sha256=bound',
+    dispatch: { brief: 'Recommend the route.', requestPointer: { path: 'request', hash: 'a'.repeat(64) } },
+    environment: {}, sessionId: 'route-revision', reservationId: 'route-revision-reservation',
+    onUsageDelta() { return { continue: true } },
+  })
+  assert.equal(stopReason, 'typed terminal CONTINUE')
+  assert.equal(result.recommendedRoute, 'ROADMAP')
+  assert.equal(result.recommendation.recommendedRoute, 'ROADMAP')
+  assert.equal(result.reconstructedTerminal, undefined)
+})
+
+test('Codex correction boundary suppresses late session and usage callbacks without a valid terminal', async t => {
+  const directory = temporaryDirectory(t)
+  const sessions = []
+  const usage = []
+  const invalid = { canonicalJson: JSON.stringify({ schemaVersion: '2.0.0', preWorkResult: 'CONTINUE' }) }
+  const runner = {
+    async run(spec) {
+      for (const event of [
+        { type: 'thread.started', thread_id: '22222222-3333-4222-8222-222222222222' },
+        { type: 'thread.started', thread_id: '00000000-3333-4000-8000-000000000000' },
+        { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(invalid) } },
+        { type: 'turn.completed', usage: { input_tokens: 2, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 } },
+        { type: 'thread.started', thread_id: '11111111-3333-4111-8111-111111111111' },
+        { type: 'turn.completed', usage: { input_tokens: 9, cached_input_tokens: 0, output_tokens: 9, reasoning_output_tokens: 0 } },
+      ]) spec.onStdoutLine(JSON.stringify(event))
+      return { status: 0, stdout: '', stderr: '', processOwned: true, exactArgv: true, drained: true }
+    },
+    async stop() { return { drained: true } },
+  }
+  const adapter = new CodexExecAdapter({
+    runner, targetPath: ROOT,
+    profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'route-recommendation.schema.json'),
+    providerSchemaRoot: path.join(directory, 'provider-schemas'),
+  })
+  const executionPolicy = {
+    logicalRole: 'route-analyst', physicalRole: 'autoprompt.v2.route-analyst',
+    providerRole: 'ap-route-analyst', sandboxMode: 'read-only',
+    policyId: 'autoprompt.codex.role-policy', policyVersion: '2.0.0',
+  }
+  const result = await adapter.launch({
+    ...executionPolicy, route: 'PRE_ROUTE', physicalExecutionPolicy: executionPolicy,
+    entryPrompt: '$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\nrequest_sha256=bound',
+    dispatch: { brief: 'Recommend the route.', requestPointer: { path: 'request', hash: 'a'.repeat(64) } },
+    environment: {}, sessionId: 'route-correction-boundary', reservationId: 'route-correction-boundary-reservation',
+    onSessionIdentified(value) { sessions.push(value) },
+    onUsageDelta(delta) { usage.push(delta); return { continue: true } },
+  })
+  assert.deepEqual(sessions, ['22222222-3333-4222-8222-222222222222'])
+  assert.equal(usage.length, 1)
+  assert.equal(result.contextId, '22222222-3333-4222-8222-222222222222')
+  assert.equal(result.reconstructedTerminal, true)
+})
+
+test('Codex L0 owner may replace an internal WAITING_USER progress message with its final decision', async t => {
+  const directory = temporaryDirectory(t)
+  const provisional = {
+    schemaVersion: '2.0.0', status: 'WAITING_USER', route: null, routeSource: 'automatic',
+    requestEnvelopeHash: 'a'.repeat(64), recommendationHash: 'b'.repeat(64),
+    decidedAt: '2026-08-26T14:45:42.638Z',
+    userInputNeeded: ['Internal route inspection is still in progress.'],
+  }
+  const final = canonicalDirectRouteDecision()
+  let stopReason = null
+  const runner = {
+    async run(spec) {
+      for (const event of [
+        { type: 'thread.started', thread_id: '33333333-4444-4333-8333-333333333333' },
+        { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(provisional) }) } },
+        { type: 'item.started', item: { type: 'command_execution', command: 'inspect-route-evidence', status: 'in_progress' } },
+        { type: 'item.completed', item: { type: 'command_execution', command: 'inspect-route-evidence', status: 'completed', exit_code: 0 } },
+        { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(final) }) } },
+        { type: 'turn.completed', usage: { input_tokens: 3, cached_input_tokens: 1, output_tokens: 2, reasoning_output_tokens: 1 } },
+      ]) spec.onStdoutLine(JSON.stringify(event))
+      return { status: 0, stdout: '', stderr: '', processOwned: true, exactArgv: true, drained: true }
+    },
+    async stop(spec) { stopReason = spec.reason; return { drained: true } },
+  }
+  const executionPolicy = {
+    logicalRole: 'run-owner', physicalRole: 'autoprompt.v2.run-owner',
+    providerRole: 'ap-run-owner', sandboxMode: 'read-only',
+    policyId: 'autoprompt.codex.role-policy', policyVersion: '2.0.0',
+  }
+  const adapter = new CodexExecAdapter({
+    runner, targetPath: ROOT,
+    profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'route-decision.schema.json'),
+    providerSchemaRoot: path.join(directory, 'provider-schemas'),
+  })
+  const result = await adapter.launch({
+    ...executionPolicy, route: 'PRE_ROUTE', physicalExecutionPolicy: executionPolicy,
+    entryPrompt: '$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\nrequest_sha256=bound',
+    dispatch: { brief: 'Decide the route.', requestPointer: { path: 'request', hash: 'a'.repeat(64) } },
+    environment: {}, sessionId: 'l0-revision', reservationId: 'l0-revision-reservation',
+    onUsageDelta() { return { continue: true } },
+  })
+  assert.equal(stopReason, 'typed terminal DECIDED')
+  assert.equal(result.status, 'DECIDED')
+  assert.equal(result.route, 'DIRECT')
+  assert.equal(result.reconstructedTerminal, undefined)
+})
+
+test('Codex adapter never promotes a schema-valid message followed by unfinished turn work', async t => {
+  const directory = temporaryDirectory(t)
+  const provisional = canonicalOutcome('PASS')
+  let activeEvents = [
+    { type: 'thread.started', thread_id: '44444444-4444-4444-8444-444444444444' },
+    { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(provisional) }) } },
+    { type: 'item.started', item: { type: 'command_execution', command: 'true', status: 'in_progress' } },
+    { type: 'item.completed', item: { type: 'command_execution', command: 'true', status: 'completed', exit_code: 0 } },
+    { type: 'turn.completed', usage: { input_tokens: 2, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 } },
+  ]
+  const adapter = new CodexExecAdapter({
+    runner: {
+      async run() {
+        return {
+          status: 0, stdout: `${activeEvents.map(JSON.stringify).join('\n')}\n`, stderr: '',
+          processOwned: true, exactArgv: true, drained: true,
+        }
+      },
+      async stop() { return { drained: true } },
+    },
+    targetPath: ROOT,
+    profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'outcome.schema.json'),
+    providerSchemaRoot: path.join(directory, 'provider-schemas'),
+  })
+  const launch = suffix => adapter.launch({
+    ...CHECKER_EXECUTION_POLICY, physicalExecutionPolicy: CHECKER_EXECUTION_POLICY,
+    runId: `run-stale-terminal-${suffix}`, candidateHash: 'b'.repeat(64),
+    entryPrompt: '$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\nrequest_sha256=bound',
+    dispatch: { brief: 'Run the exact check.', requestPointer: { path: 'request', hash: 'a'.repeat(64) } },
+    environment: {}, sessionId: `stale-terminal-${suffix}`, reservationId: `stale-terminal-reservation-${suffix}`,
+  })
+  const result = await launch('missing')
+  assert.equal(result.code, 'RUNTIME_FAILURE')
+  assert.equal(result.payload.reconstructedTerminal, true)
+  activeEvents = [
+    ...activeEvents.slice(0, -1),
+    { type: 'item.completed', item: { type: 'agent_message', text: '' } },
+    activeEvents.at(-1),
+  ]
+  const emptyResult = await launch('empty')
+  assert.equal(emptyResult.code, 'RUNTIME_FAILURE')
+  assert.equal(emptyResult.payload.reconstructedTerminal, true)
+  activeEvents = [
+    activeEvents[0], activeEvents[1],
+    { type: 'item.started' },
+    activeEvents.at(-1),
+  ]
+  const malformedWorkResult = await launch('malformed-work')
+  assert.equal(malformedWorkResult.code, 'RUNTIME_FAILURE')
+  assert.equal(malformedWorkResult.payload.reconstructedTerminal, true)
 })
 
 test('bundled canonical schemas reject every missing required field and unknown top-level fields', () => {
@@ -464,6 +729,7 @@ test('Codex adapter returns the exact committed terminal receipt despite a late 
   const late = canonicalWorkerResult({ reportId: 'late-result', behaviorChanged: ['Late buffered text.'] })
   let terminal = null
   let terminalCount = 0
+  const identifiedSessions = []
   const runner = {
     async run(spec) {
       spec.onStdoutLine(JSON.stringify({ type: 'thread.started', thread_id: '88888888-8888-4888-8888-888888888888' }))
@@ -474,6 +740,9 @@ test('Codex adapter returns the exact committed terminal receipt despite a late 
       spec.onStdoutLine(JSON.stringify({
         type: 'turn.completed',
         usage: { input_tokens: 2, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+      }))
+      spec.onStdoutLine(JSON.stringify({
+        type: 'thread.started', thread_id: '99999999-8888-4888-8888-888888888888',
       }))
       spec.onStdoutLine(JSON.stringify({
         type: 'item.completed',
@@ -494,12 +763,101 @@ test('Codex adapter returns the exact committed terminal receipt despite a late 
     entryPrompt: '$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\nrequest_sha256=bound',
     dispatch: { brief: 'Do the bounded work.', requestPointer: { path: 'request', hash: 'hash' } },
     environment: {}, sessionId: 'committed-race', reservationId: 'committed-race-reservation',
+    onSessionIdentified(value) { identifiedSessions.push(value) },
     onTerminalResult(value) { terminal = value; terminalCount += 1 },
   })
   assert.equal(terminalCount, 1)
   assert.equal(result.reportId, 'committed-result')
+  assert.equal(result.contextId, '88888888-8888-4888-8888-888888888888')
+  assert.deepEqual(identifiedSessions, ['88888888-8888-4888-8888-888888888888'])
   assert.deepEqual(result, terminal)
   assert.notEqual(result.reportId, late.reportId)
+})
+
+test('Codex buffered parser freezes the final message at the first turn.completed boundary', async t => {
+  const directory = temporaryDirectory(t)
+  const committed = canonicalWorkerResult({ reportId: 'buffered-committed-result' })
+  const late = canonicalWorkerResult({ reportId: 'buffered-late-result' })
+  const events = [
+    { type: 'thread.started', thread_id: '66666666-6666-4666-8666-666666666666' },
+    { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(committed) }) } },
+    { type: 'turn.completed', usage: { input_tokens: 2, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 } },
+    { type: 'thread.started', thread_id: '55555555-5555-4555-8555-555555555555' },
+    { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(late) }) } },
+  ]
+  const runner = {
+    async run() {
+      return {
+        status: 0, stdout: `${events.map(JSON.stringify).join('\n')}\n`, stderr: '',
+        processOwned: true, exactArgv: true, drained: true,
+      }
+    },
+    async stop() { return { drained: true } },
+  }
+  const adapter = new CodexExecAdapter({
+    runner, targetPath: ROOT,
+    profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
+    providerSchemaRoot: path.join(directory, 'provider-schemas'),
+  })
+  const result = await adapter.launch({
+    ...EXECUTION_POLICY, physicalExecutionPolicy: EXECUTION_POLICY,
+    entryPrompt: '$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\nrequest_sha256=bound',
+    dispatch: { brief: 'Do the bounded work.', requestPointer: { path: 'request', hash: 'hash' } },
+    environment: {}, sessionId: 'buffered-boundary', reservationId: 'buffered-boundary-reservation',
+  })
+  assert.equal(result.reportId, committed.reportId)
+  assert.equal(result.contextId, '66666666-6666-4666-8666-666666666666')
+  assert.notEqual(result.reportId, late.reportId)
+  assert.equal(result.events.length, 3)
+})
+
+test('Codex streamed and buffered delivery commit identical boundary results and evidence hashes', async t => {
+  const directory = temporaryDirectory(t)
+  const output = canonicalWorkerResult({ reportId: 'delivery-parity-result' })
+  const events = [
+    { type: 'thread.started', thread_id: '12121212-1212-4212-8212-121212121212' },
+    { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(output) }) } },
+    { type: 'turn.completed', usage: { input_tokens: 4, cached_input_tokens: 1, output_tokens: 2, reasoning_output_tokens: 1 } },
+    { type: 'thread.started', thread_id: '13131313-1313-4313-8313-131313131313' },
+  ]
+  // A stopped JSONL writer may leave a truncated late fragment. It is outside
+  // the completed turn boundary and cannot invalidate the committed result.
+  const lines = [...events.map(event => `  ${JSON.stringify(event)}  `), '{']
+  const launchWith = async (buffered, suffix) => {
+    let terminalEvidence = null
+    const adapter = new CodexExecAdapter({
+      runner: {
+        async run(spec) {
+          if (!buffered) for (const line of lines) spec.onStdoutLine(line)
+          return {
+            status: 0, stdout: buffered ? `${lines.join('\n')}\n` : '', stderr: '',
+            processOwned: true, exactArgv: true, drained: true,
+          }
+        },
+        async stop() { return { drained: true } },
+      },
+      targetPath: ROOT,
+      profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+      outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
+      providerSchemaRoot: path.join(directory, `provider-schemas-${suffix}`),
+    })
+    const result = await adapter.launch({
+      ...EXECUTION_POLICY, physicalExecutionPolicy: EXECUTION_POLICY,
+      entryPrompt: '$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\nrequest_sha256=bound',
+      dispatch: { brief: 'Do the bounded work.', requestPointer: { path: 'request', hash: 'hash' } },
+      environment: {}, sessionId: `delivery-parity-${suffix}`, reservationId: `delivery-parity-reservation-${suffix}`,
+      onTerminalResult(_value, evidence) { terminalEvidence = evidence },
+    })
+    return { result, terminalEvidence }
+  }
+  const streamed = await launchWith(false, 'streamed')
+  const buffered = await launchWith(true, 'buffered')
+  assert.deepEqual(streamed.result, buffered.result)
+  assert.equal(streamed.terminalEvidence.eventStreamHash, buffered.terminalEvidence.eventStreamHash)
+  assert.equal(streamed.terminalEvidence.rawOutputHash, buffered.terminalEvidence.rawOutputHash)
+  assert.equal(streamed.result.contextId, '12121212-1212-4212-8212-121212121212')
+  assert.equal(streamed.result.events.length, 3)
 })
 
 test('checker scratch authority creates private temp roots, enables non-Git Codex admission, and rejects target forgery', async t => {
