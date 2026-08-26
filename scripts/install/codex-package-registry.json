@@ -150,18 +150,6 @@
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     },
     {
-      "path": "agents/codex/workflow/mission-lock.js",
-      "sha256": "87b2f939b6efc11e1c04c0750bd858b5977d70d7163eb092c5fc2f3b4c13eaa9",
-      "terms": ["mission"],
-      "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
-    },
-    {
-      "path": "agents/codex/workflow/recovery-checkpoint.js",
-      "sha256": "dd39449e777f6c0abed182c359510572aad345f229fda950b680dc8c54ca5722",
-      "terms": ["candidate", "frontier"],
-      "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
-    },
-    {
       "path": "agents/codex/workflow/run-record.js",
       "sha256": "f7f9cddf996666b39637374e1207084abb1f6a1ae41e6ec756250b8c6b87837d",
       "terms": ["candidate"],
@@ -169,8 +157,8 @@
     },
     {
       "path": "agents/codex/workflow/scheduler.js",
-      "sha256": "45fd4805653a56e80791ac4b15e7c3b5b944cfb6f74d547175775c063df70e21",
-      "terms": ["candidate", "frontier", "lane"],
+      "sha256": "d50c3405f727fd0d44e37b6352e8517c09ca98891b06c867dcbd4a9ba40547a5",
+      "terms": ["candidate", "frontier"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     }
   ],

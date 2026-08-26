@@ -100,6 +100,25 @@ function optionalValue(overrides = {}) {
   }
 }
 
+test('benchmark scheduler policy is injected per runtime without disabling finite token or launch ceilings', () => {
+  const environment = { AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' }
+  const clock = { now: 0 }
+  const scheduler = new CentralScheduler({
+    route: 'DIRECT', runIdentity: TEST_RUN, environment, now: () => clock.now,
+  })
+  assert.equal(scheduler.budget.admissionHardMs, Number.MAX_SAFE_INTEGER)
+  assert.equal(scheduler.budget.tokens.noncachedInput, ROUTE_BUDGETS.DIRECT.tokens.noncachedInput)
+  assert.equal(scheduler.budget.maxChildLaunches, ROUTE_BUDGETS.DIRECT.maxChildLaunches)
+  clock.now = 48 * 60 * 60 * 1000
+  scheduler.recordAdmissionComponent('configuration', 25 * 60 * 60 * 1000)
+  scheduler.recordAdmissionComponent('routeAnalyst', 23 * 60 * 60 * 1000)
+  assert.deepEqual(scheduler.checkAdmissionTime().breaches, [])
+
+  const ordinary = createTestScheduler()
+  ordinary.recordAdmissionComponent('routeAnalyst', 25 * 60 * 60 * 1000)
+  assert.ok(ordinary.checkAdmissionTime().breaches.includes('routeAnalyst'))
+})
+
 test('P7 route ceilings are exact ceilings, not launch quotas', () => {
   assert.deepEqual(
     Object.fromEntries(Object.entries(ROUTE_BUDGETS).map(([route, budget]) => [route, [
@@ -169,12 +188,18 @@ test('launch, depth, and progress-aware retry state survive relaunch', async () 
   finish(child)
   finish(parent)
 
-  const first = await admit(scheduler, { workItemId: 'attempt-1', equivalenceKey: 'same-fix', candidateHash: 'candidate-a' })
+  const first = await admit(scheduler, {
+    workItemId: 'attempt-1', equivalenceKey: 'same-fix', candidateHash: 'a'.repeat(64),
+  })
   first.fail(new Error('red'), ZERO_USAGE)
-  const retry = await admit(scheduler, { workItemId: 'attempt-2', equivalenceKey: 'same-fix', attempt: 2, candidateHash: 'candidate-b' })
+  const retry = await admit(scheduler, {
+    workItemId: 'attempt-2', equivalenceKey: 'same-fix', attempt: 2, candidateHash: 'b'.repeat(64),
+  })
   finish(retry, { noncachedInput: 100, output: 10 })
   await assert.rejects(
-    admit(scheduler, { workItemId: 'attempt-3', equivalenceKey: 'same-fix', candidateHash: 'candidate-b' }),
+    admit(scheduler, {
+      workItemId: 'attempt-3', equivalenceKey: 'same-fix', candidateHash: 'b'.repeat(64),
+    }),
     (error) => error.code === 'RETRY_REASSESSMENT_REQUIRED',
   )
 
@@ -909,20 +934,72 @@ test('marginal admission normalizes snake/camel fields and optional role or purp
 
 test('changed retry fingerprints continue beyond fixed retry settings while identical work reassesses', async () => {
   const scheduler = createTestScheduler({ maxRetriesPerWorkItem: 0 })
-  const first = await admit(scheduler, { workItemId: 'progress-1', equivalenceKey: 'progress-loop', candidateHash: 'a' })
+  const first = await admit(scheduler, {
+    workItemId: 'progress-1', equivalenceKey: 'progress-loop', candidateHash: 'a'.repeat(64),
+  })
   first.fail(new Error('red'), ZERO_USAGE)
   await assert.rejects(admit(scheduler, { workItemId: 'progress-missing', equivalenceKey: 'progress-loop' }),
     (error) => error.code === 'RETRY_PROGRESS_EVIDENCE_REQUIRED')
-  const second = await admit(scheduler, { workItemId: 'progress-2', equivalenceKey: 'progress-loop', candidateHash: 'b' })
+  const second = await admit(scheduler, {
+    workItemId: 'progress-2', equivalenceKey: 'progress-loop', candidateHash: 'b'.repeat(64),
+  })
   second.fail(new Error('still red'), ZERO_USAGE)
-  await assert.rejects(admit(scheduler, { workItemId: 'progress-identical', equivalenceKey: 'progress-loop', candidateHash: 'b' }),
+  await assert.rejects(admit(scheduler, {
+    workItemId: 'progress-identical', equivalenceKey: 'progress-loop', candidateHash: 'b'.repeat(64),
+  }),
     (error) => error.code === 'RETRY_REASSESSMENT_REQUIRED')
   const third = await admit(scheduler, {
-    workItemId: 'progress-3', equivalenceKey: 'progress-loop', candidateHash: 'b', strategy_fingerprint: 'new-strategy',
+    workItemId: 'progress-3', equivalenceKey: 'progress-loop',
+    candidateHash: 'b'.repeat(64), strategy_fingerprint: 'c'.repeat(64),
   })
   finish(third)
   assert.equal(scheduler.getMetrics().counters.retriesStarted, 2)
   assert.equal(scheduler.getMetrics().counters.retryReassessments, 1)
+})
+
+test('retry progress accepts only canonical digests and deduplicates evidence before comparison', async () => {
+  const scheduler = createTestScheduler()
+  const candidate = 'a'.repeat(64)
+  const evidenceA = 'b'.repeat(64)
+  const evidenceB = 'c'.repeat(64)
+  const first = await admit(scheduler, {
+    workItemId: 'digest-1', equivalenceKey: 'digest-loop', candidateHash: candidate,
+  })
+  first.fail(new Error('retry'), ZERO_USAGE)
+  await assert.rejects(admit(scheduler, {
+    workItemId: 'digest-invalid', equivalenceKey: 'digest-loop',
+    candidateHash: candidate, evidenceHashes: ['arbitrary-variable'],
+  }), error => error.code === 'RETRY_PROGRESS_EVIDENCE_INVALID')
+  await assert.rejects(admit(scheduler, {
+    workItemId: 'strategy-invalid', equivalenceKey: 'digest-loop',
+    candidateHash: candidate, strategyFingerprint: 'changed-label',
+  }), error => error.code === 'RETRY_PROGRESS_EVIDENCE_INVALID')
+  const retry = await admit(scheduler, {
+    workItemId: 'digest-2', equivalenceKey: 'digest-loop', candidateHash: candidate,
+    evidenceHashes: [evidenceB, evidenceA, evidenceA],
+  })
+  retry.fail(new Error('same evidence'), ZERO_USAGE)
+  await assert.rejects(admit(scheduler, {
+    workItemId: 'digest-3', equivalenceKey: 'digest-loop', candidateHash: candidate,
+    evidenceHashes: [evidenceA, evidenceB],
+  }), error => error.code === 'RETRY_REASSESSMENT_REQUIRED')
+})
+
+test('retry preflight is side-effect free and rejects missing progress before resource materialization', async () => {
+  const scheduler = createTestScheduler()
+  const first = await admit(scheduler, {
+    workItemId: 'preflight-1', equivalenceKey: 'preflight-loop', candidateHash: 'a'.repeat(64),
+  })
+  finish(first)
+  const before = scheduler.getMetrics().counters
+  assert.throws(() => scheduler.assertRetryProgress({
+    workItemId: 'preflight-2', equivalenceKey: 'preflight-loop',
+  }), error => error.code === 'RETRY_PROGRESS_EVIDENCE_REQUIRED')
+  assert.deepEqual(scheduler.getMetrics().counters, before)
+  assert.equal(scheduler.assertRetryProgress({
+    workItemId: 'preflight-2', equivalenceKey: 'preflight-loop',
+    evidenceHashes: ['b'.repeat(64)],
+  }).priorAttempts, 1)
 })
 
 test('cache provenance migrates generations but rejects cross-run, changed inputs, and result-hash mismatch', () => {

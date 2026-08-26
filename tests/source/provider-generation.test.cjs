@@ -559,6 +559,10 @@ test('Codex generation ignores the legacy contract and fails closed on a stale v
     path.join(ROOT, 'scripts', 'install', 'codex-package-registry.json'),
     path.join(sandbox, 'scripts', 'install', 'codex-package-registry.json'),
   )
+  fs.copyFileSync(
+    path.join(ROOT, 'scripts', 'install', 'legacy-codex-compat.json'),
+    path.join(sandbox, 'scripts', 'install', 'legacy-codex-compat.json'),
+  )
   fs.copyFileSync(path.join(ROOT, 'package.json'), path.join(sandbox, 'package.json'))
   fs.mkdirSync(path.join(sandbox, 'packages', 'codex'), { recursive: true })
   const codexPackagePath = path.join(sandbox, 'packages', 'codex', 'package.json')

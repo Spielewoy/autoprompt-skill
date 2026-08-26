@@ -164,7 +164,7 @@ function validateCandidate(value) {
       !(value.candidateHash === null || HASH_PATTERN.test(value.candidateHash || '')) || typeof value.frozen !== 'boolean' ||
       (value.candidateHash === null && (value.candidateId !== null || value.frozen)) ||
       (value.frozen && (!value.candidateId || !value.candidateHash))) {
-    fail('RECOVERY_CHECKPOINT_INVALID', 'scheduler candidate is invalid')
+    fail('RECOVERY_CHECKPOINT_INVALID', 'scheduler exact-version binding is invalid')
   }
 }
 
@@ -274,7 +274,7 @@ function validateScheduler(scheduler) {
   try { parsed = JSON.parse(bytes.toString('utf8')) } catch { fail('RECOVERY_CHECKPOINT_INVALID', 'scheduler state bytes are not JSON') }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.hasOwn(parsed, 'stateHash') ||
       stableStringify(parsed) !== bytes.toString('utf8') || scheduler.frontierHash !== schedulerFrontierHash(scheduler)) {
-    fail('RECOVERY_CHECKPOINT_INVALID', 'scheduler state or frontier is not canonical')
+    fail('RECOVERY_CHECKPOINT_INVALID', 'scheduler state or next ready work is not canonical')
   }
   for (const field of ['ownerSessionId', ...SCHEDULER_FRONTIER_FIELDS]) {
     if (stableStringify(parsed[field]) !== stableStringify(scheduler[field])) {
@@ -340,7 +340,7 @@ function validateCheckpointPayload(checkpoint) {
       checkpoint.immutableHashes.candidateHash !== checkpoint.scheduler.candidate.candidateHash ||
       stableStringify(checkpoint.recovery.frontier.nextReadyWorkIds) !== stableStringify(checkpoint.scheduler.nextReadyWorkIds) ||
       stableStringify(checkpoint.recovery.frontier.openCheckIds) !== stableStringify(checkpoint.scheduler.openCheckIds)) {
-    fail('RECOVERY_CHECKPOINT_INVALID', 'checkpoint state, candidate, or recovery frontier aliases disagree')
+    fail('RECOVERY_CHECKPOINT_INVALID', 'checkpoint state, exact version, or recovery next-ready aliases disagree')
   }
   if (checkpoint.scheduler.route === 'PENDING') {
     if (checkpoint.immutableHashes.routeDecisionHash !== null || checkpoint.immutableHashes.planHash !== null ||
@@ -534,13 +534,27 @@ class RecoveryCheckpointAuthority {
     const state = this.stateProvider()
     const stateEvent = latest.record.checkpoint.stateEvent
     const authority = latest.record.authority
+    const lastEvent = this.eventLog.readAll().at(-1)
+    const advancedEvent = lastEvent && lastEvent.details && lastEvent.details.stateEvent
+    const exactlyOneTransitionAhead = Boolean(
+      state.sequence === stateEvent.sequence + 1 && lastEvent && lastEvent.sequence === state.sequence &&
+      lastEvent.hash === state.lastEventHash && advancedEvent &&
+      advancedEvent.sequence === state.sequence && advancedEvent.causalParent === stateEvent.eventHash &&
+      advancedEvent.fromState === stateEvent.state && advancedEvent.toState === state.state &&
+      advancedEvent.candidateHash === (state.candidateHash || null) &&
+      stableStringify(advancedEvent.retryState) === stableStringify(state.retryState) &&
+      stableStringify(advancedEvent.resourceState) === stableStringify(state.resourceState) &&
+      stableStringify([...advancedEvent.openIds].sort()) ===
+        stableStringify([...latest.record.checkpoint.scheduler.nextReadyWorkIds].sort()),
+    )
+    const exactState = stateEvent.sequence === state.sequence && stateEvent.eventHash === state.lastEventHash &&
+      stateEvent.state === state.state && stateEvent.stateChecksum === state.checksum &&
+      latest.record.checkpoint.immutableHashes.candidateHash === (state.candidateHash || null)
     if (authority.runId !== state.runId || authority.activationId !== state.activation.id ||
         authority.activationNonce !== state.activation.nonce || authority.missionHash !== state.activation.missionHash ||
         authority.targetIdentity !== state.targetIdentity || authority.generation !== state.activation.generation ||
-        stateEvent.sequence !== state.sequence || stateEvent.eventHash !== state.lastEventHash ||
-        stateEvent.state !== state.state || stateEvent.stateChecksum !== state.checksum ||
         latest.record.checkpoint.immutableHashes.requestEnvelopeHash !== state.requestEnvelopeHash ||
-        latest.record.checkpoint.immutableHashes.candidateHash !== (state.candidateHash || null)) {
+        (!exactState && !exactlyOneTransitionAhead)) {
       fail('RECOVERY_CHECKPOINT_STATE_STALE', 'latest recovery checkpoint does not equal the current canonical runtime state')
     }
     let currentAccounting
@@ -557,10 +571,54 @@ class RecoveryCheckpointAuthority {
     }))
   }
 
+  resumePausedCheckpoint() {
+    const replayed = this.replay()
+    if (replayed.recoveryRequired || !replayed.latest) {
+      fail('RECOVERY_CHECKPOINT_RECOVERY_REQUIRED', 'paused resume requires one matching durable checkpoint log record and snapshot')
+    }
+    const latest = replayed.latest
+    const state = this.stateProvider()
+    const lastEvent = this.eventLog.readAll().at(-1)
+    const pauseEvent = lastEvent && lastEvent.details && lastEvent.details.stateEvent
+    const stateEvent = latest.record.checkpoint.stateEvent
+    const authority = latest.record.authority
+    if (!state || state.state !== 'PAUSED' || !lastEvent || lastEvent.sequence !== state.sequence ||
+        lastEvent.hash !== state.lastEventHash || !pauseEvent || pauseEvent.transitionId !== 'T058' ||
+        pauseEvent.eventId !== 'BUDGET_EXHAUSTED_RESUMABLE' || pauseEvent.toState !== 'PAUSED' ||
+        pauseEvent.causalParent !== stateEvent.eventHash || stateEvent.sequence !== state.sequence - 1 ||
+        stateEvent.state !== pauseEvent.fromState ||
+        state.frontier.resumeState !== stateEvent.state ||
+        state.frontier.continuationBindingHash !== latest.record.checkpointPayloadHash ||
+        authority.runId !== state.runId || authority.activationId !== state.activation.id ||
+        authority.activationNonce !== state.activation.nonce || authority.missionHash !== state.activation.missionHash ||
+        authority.targetIdentity !== state.targetIdentity || authority.generation !== state.activation.generation ||
+        latest.record.checkpoint.immutableHashes.requestEnvelopeHash !== state.requestEnvelopeHash ||
+        latest.record.checkpoint.immutableHashes.candidateHash !== (state.candidateHash || null)) {
+      fail('RECOVERY_CHECKPOINT_STATE_STALE', 'latest recovery checkpoint is not the exact causal parent bound by PAUSED')
+    }
+    let currentAccounting
+    try { currentAccounting = this.accountingCheckpointProvider() } catch (error) {
+      fail('RECOVERY_CHECKPOINT_ACCOUNTING_INVALID', 'paused accounting evidence is unavailable', { cause: error.message })
+    }
+    const accounting = this._verifyAccounting(currentAccounting, state)
+    if (stableStringify(this._accountingProjection(accounting)) !== stableStringify(latest.record.checkpoint.accounting)) {
+      fail('RECOVERY_CHECKPOINT_ACCOUNTING_STALE', 'PAUSED recovery checkpoint does not bind the latest accounting snapshot')
+    }
+    return Object.freeze(canonicalize({ record: latest.record, snapshot: latest.snapshot }))
+  }
+
   verifyResumeCheckpoint(evidence) {
     const expected = this.resumeCheckpoint()
     if (!evidence || stableStringify(evidence) !== stableStringify(expected)) {
       fail('RECOVERY_CHECKPOINT_EVIDENCE_INVALID', 'resume evidence does not equal the latest durable recovery checkpoint')
+    }
+    return expected
+  }
+
+  verifyPausedResumeCheckpoint(evidence) {
+    const expected = this.resumePausedCheckpoint()
+    if (!evidence || stableStringify(evidence) !== stableStringify(expected)) {
+      fail('RECOVERY_CHECKPOINT_EVIDENCE_INVALID', 'paused resume evidence does not equal the bound durable checkpoint')
     }
     return expected
   }
@@ -690,10 +748,10 @@ class RecoveryCheckpointAuthority {
     }
     if (binding.candidateHash !== checkpoint.immutableHashes.candidateHash ||
         binding.candidateHash !== checkpoint.scheduler.candidate.candidateHash) {
-      fail('RECOVERY_CHECKPOINT_RESULT_INVALID', 'RESULT_COMMITTED candidate differs from the immutable scheduler candidate')
+      fail('RECOVERY_CHECKPOINT_RESULT_INVALID', 'RESULT_COMMITTED exact version differs from the immutable scheduler version')
     }
     if (!checkpoint.recovery.frontier.acceptedResultIds.includes(binding.receiptHash)) {
-      fail('RECOVERY_CHECKPOINT_RESULT_INVALID', 'RESULT_COMMITTED terminal receipt is absent from the accepted recovery frontier')
+      fail('RECOVERY_CHECKPOINT_RESULT_INVALID', 'RESULT_COMMITTED terminal receipt is absent from accepted recovery work')
     }
     if (typeof this.resultCommitVerifier !== 'function') {
       fail('RECOVERY_CHECKPOINT_RESULT_UNVERIFIED', 'RESULT_COMMITTED requires a durable terminal receipt verifier')
@@ -704,14 +762,19 @@ class RecoveryCheckpointAuthority {
         runId: authority.runId,
         activationId: authority.activationId,
         generation: authority.generation,
+        allowPredecessorGeneration: /^adopted-result:\d+:.+:result:[a-f0-9]{24}$/u.test(cause.causeId),
         checkpointPayloadHash: recoveryCheckpointPayloadHash(checkpoint),
       }))
     } catch (error) {
       fail('RECOVERY_CHECKPOINT_RESULT_UNVERIFIED', 'durable terminal receipt verification failed', { cause: error.message })
     }
     const verificationFields = ['runId', 'activationId', 'generation', ...RESULT_COMMIT_FIELDS]
+    const verifiedGeneration = verified && verified.generation
+    const generationAccepted = verifiedGeneration === authority.generation ||
+      (/^adopted-result:\d+:.+:result:[a-f0-9]{24}$/u.test(cause.causeId) &&
+       verifiedGeneration + 1 === authority.generation)
     if (!exactKeys(verified, verificationFields) || verified.runId !== authority.runId ||
-        verified.activationId !== authority.activationId || verified.generation !== authority.generation ||
+        verified.activationId !== authority.activationId || !generationAccepted ||
         RESULT_COMMIT_FIELDS.some((field) => verified[field] !== binding[field])) {
       fail('RECOVERY_CHECKPOINT_RESULT_UNVERIFIED', 'durable terminal receipt differs from RESULT_COMMITTED or its activation generation')
     }
@@ -791,7 +854,7 @@ class RecoveryCheckpointAuthority {
     validateScheduler(scheduler)
     const recovery = prepareRecovery(input.recovery)
     if (recovery.savedState !== state.state || !recovery.frontier.acceptedResultIds.includes(scheduler.stateHash)) {
-      fail('RECOVERY_CHECKPOINT_FRONTIER_MISMATCH', 'recovery state/frontier must bind the persisted scheduler state hash')
+      fail('RECOVERY_CHECKPOINT_FRONTIER_MISMATCH', 'recovery state and next ready work must bind the persisted scheduler state hash')
     }
     if (recovery.bindingHash !== recoveryBindingHash(recovery)) fail('RECOVERY_CHECKPOINT_INVALID', 'recovery binding hash changed')
     const immutable = input.immutableHashes
@@ -808,7 +871,7 @@ class RecoveryCheckpointAuthority {
       fail('RECOVERY_CHECKPOINT_INVALID', 'checkpoint human description is required')
     }
     if (scheduler.route === 'PENDING' && (immutable.routeDecisionHash !== null || immutable.planHash !== null || immutable.candidateHash !== null)) {
-      fail('RECOVERY_CHECKPOINT_IMMUTABLE_MISMATCH', 'pre-route checkpoint cannot invent decision, plan, or candidate hashes')
+      fail('RECOVERY_CHECKPOINT_IMMUTABLE_MISMATCH', 'pre-route checkpoint cannot invent decision, plan, or exact-version hashes')
     }
     if (scheduler.route !== 'PENDING' && !HASH_PATTERN.test(immutable.routeDecisionHash || '')) {
       fail('RECOVERY_CHECKPOINT_IMMUTABLE_MISMATCH', 'decided-route checkpoint requires its route decision hash')
@@ -917,7 +980,7 @@ class RecoveryCheckpointAuthority {
       }
       if (record.checkpoint.immutableHashes.candidateHash !== previous.checkpoint.immutableHashes.candidateHash &&
           !candidateAdvanceIsCanonical(previous, record, events)) {
-        fail('RECOVERY_CHECKPOINT_ROLLBACK', 'checkpoint changed bound candidateHash')
+        fail('RECOVERY_CHECKPOINT_ROLLBACK', 'checkpoint changed the bound exact-version hash')
       }
       for (const field of ['completedWorkIds', 'completedCheckIds']) {
         if (previous.checkpoint.scheduler[field].some((id) => !record.checkpoint.scheduler[field].includes(id))) {

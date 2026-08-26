@@ -6,12 +6,12 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { validateProviderCapabilities } = require('./context-envelope.js')
 
-const BENCHMARK_NO_TOKEN_LIMIT = process.env.AUTOPROMPT_BENCHMARK_NO_TOKEN_LIMIT === '1'
-const BENCHMARK_NO_TIMEOUT_LIMIT = process.env.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
-const benchmarkTokenCeilings = defaults => BENCHMARK_NO_TOKEN_LIMIT
+const benchmarkTokenCeilings = (defaults, environment = process.env) =>
+  environment.AUTOPROMPT_BENCHMARK_NO_TOKEN_LIMIT === '1'
   ? { noncachedInput: Number.MAX_SAFE_INTEGER, cachedInput: Number.MAX_SAFE_INTEGER, output: Number.MAX_SAFE_INTEGER }
   : defaults
-const benchmarkTimeCeiling = defaultMs => BENCHMARK_NO_TIMEOUT_LIMIT
+const benchmarkTimeCeiling = (defaultMs, environment = process.env) =>
+  environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
   ? Number.MAX_SAFE_INTEGER
   : defaultMs
 
@@ -27,18 +27,18 @@ const ROUTE_BUDGETS = deepFreeze({
     maxLiveIncludingRoot: 4,
     maxDepth: 2,
     noProgressMs: 8 * 60 * 1000,
-    admissionHardMs: benchmarkTimeCeiling(7 * 60 * 1000),
+    admissionHardMs: 7 * 60 * 1000,
     admissionP95Ms: 5 * 60 * 1000,
-    tokens: benchmarkTokenCeilings({ noncachedInput: 220000, cachedInput: 900000, output: 40000 }),
+    tokens: { noncachedInput: 220000, cachedInput: 900000, output: 40000 },
   },
   LIGHT: {
     maxChildLaunches: 8,
     maxLiveIncludingRoot: 4,
     maxDepth: 3,
     noProgressMs: 20 * 60 * 1000,
-    admissionHardMs: benchmarkTimeCeiling(12 * 60 * 1000),
+    admissionHardMs: 12 * 60 * 1000,
     admissionP95Ms: 10 * 60 * 1000,
-    tokens: benchmarkTokenCeilings({ noncachedInput: 500000, cachedInput: 2200000, output: 70000 }),
+    tokens: { noncachedInput: 500000, cachedInput: 2200000, output: 70000 },
   },
   ROADMAP: {
     maxChildLaunches: 18,
@@ -46,9 +46,9 @@ const ROUTE_BUDGETS = deepFreeze({
     absoluteUserLiveCeiling: 10,
     maxDepth: 4,
     noProgressMs: 45 * 60 * 1000,
-    admissionHardMs: benchmarkTimeCeiling(22 * 60 * 1000),
+    admissionHardMs: 22 * 60 * 1000,
     admissionP95Ms: 18 * 60 * 1000,
-    tokens: benchmarkTokenCeilings({ noncachedInput: 1200000, cachedInput: 5000000, output: 160000 }),
+    tokens: { noncachedInput: 1200000, cachedInput: 5000000, output: 160000 },
   },
 })
 const PENDING_ROUTE = 'PENDING'
@@ -78,6 +78,23 @@ const PENDING_ROUTE_SETTINGS = deepFreeze({
     },
   },
 })
+
+function benchmarkAdjustedSettings(settings, environment = process.env) {
+  if (environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT !== '1' &&
+      environment.AUTOPROMPT_BENCHMARK_NO_TOKEN_LIMIT !== '1') return settings
+  return deepFreeze({
+    ...settings,
+    budget: {
+      ...settings.budget,
+      admissionHardMs: benchmarkTimeCeiling(settings.budget.admissionHardMs, environment),
+      tokens: benchmarkTokenCeilings({ ...settings.budget.tokens }, environment),
+    },
+    lanes: Object.fromEntries(Object.entries(settings.lanes).map(([name, lane]) => [name, {
+      ...lane,
+      tokens: benchmarkTokenCeilings({ ...lane.tokens }, environment),
+    }])),
+  })
+}
 
 const TOKEN_DIMENSIONS = ['noncachedInput', 'cachedInput', 'output']
 const ACCOUNTING_DIMENSIONS = [
@@ -244,6 +261,9 @@ function resolveRouteBudget(route, options = {}) {
       positiveInteger(options.maxChildLaunches, budget.maxChildLaunches),
     )
   }
+  const environment = options.environment || options.baseEnvironment || process.env
+  budget.admissionHardMs = benchmarkTimeCeiling(budget.admissionHardMs, environment)
+  budget.tokens = benchmarkTokenCeilings(budget.tokens, environment)
   return deepFreeze(budget)
 }
 
@@ -259,11 +279,11 @@ function resolveSchedulerSettings(options = {}) {
   }
   const rawLanes = options.lanes || options.laneLimits || { main: {} }
   if (!rawLanes || typeof rawLanes !== 'object' || Array.isArray(rawLanes) || Object.keys(rawLanes).length === 0) {
-    throw new SchedulerAdmissionError('INVALID_LANE_SETTINGS', 'at least one named lane is required')
+    throw new SchedulerAdmissionError('INVALID_LANE_SETTINGS', 'at least one named work item stream is required')
   }
   const lanes = {}
   for (const name of Object.keys(rawLanes).sort()) {
-    if (!nonEmpty(name)) throw new SchedulerAdmissionError('INVALID_LANE_SETTINGS', 'lane names must be non-empty')
+    if (!nonEmpty(name)) throw new SchedulerAdmissionError('INVALID_LANE_SETTINGS', 'work item stream names must be non-empty')
     const lane = rawLanes[name] || {}
     lanes[name] = {
       maxLaunches: Math.min(budget.maxChildLaunches, positiveInteger(lane.maxLaunches, budget.maxChildLaunches)),
@@ -289,7 +309,7 @@ function resolveSchedulerSettings(options = {}) {
   })
 }
 
-function validateResolvedSchedulerSettings(settings) {
+function validateResolvedSchedulerSettings(settings, environment = process.env) {
   if (!settings || settings.schemaVersion !== 1 || !settings.budget || !settings.lanes) {
     throw new SchedulerAdmissionError('INVALID_SCHEDULER_SETTINGS', 'settings must come from resolveSchedulerSettings()')
   }
@@ -299,7 +319,10 @@ function validateResolvedSchedulerSettings(settings) {
     throw new SchedulerAdmissionError('INVALID_SCHEDULER_SETTINGS', 'scheduler economics must come from route; tokensaver is concurrency-width-only')
   }
   const route = normalizeRoute(settings.route)
-  const map = ROUTE_BUDGETS[route]
+  const map = {
+    ...ROUTE_BUDGETS[route],
+    tokens: benchmarkTokenCeilings(ROUTE_BUDGETS[route].tokens, environment),
+  }
   const maximumLive = route === 'ROADMAP' ? map.absoluteUserLiveCeiling : map.maxLiveIncludingRoot
   const budget = settings.budget
   if (!(Number.isInteger(budget.maxChildLaunches) && budget.maxChildLaunches > 0 && budget.maxChildLaunches <= map.maxChildLaunches) ||
@@ -313,17 +336,17 @@ function validateResolvedSchedulerSettings(settings) {
     }
   }
   const laneNames = Object.keys(settings.lanes)
-  if (laneNames.length === 0) throw new SchedulerAdmissionError('INVALID_LANE_SETTINGS', 'at least one lane is required')
+  if (laneNames.length === 0) throw new SchedulerAdmissionError('INVALID_LANE_SETTINGS', 'at least one work item stream is required')
   for (const lane of laneNames) {
     const value = settings.lanes[lane]
     if (!nonEmpty(lane) || !value || !Number.isInteger(value.maxLaunches) || value.maxLaunches < 1 ||
         value.maxLaunches > budget.maxChildLaunches || !Number.isInteger(value.maxLive) || value.maxLive < 0 ||
         value.maxLive > budget.maxLiveIncludingRoot - 1) {
-      throw new SchedulerAdmissionError('INVALID_LANE_SETTINGS', `invalid lane limits: ${lane}`)
+      throw new SchedulerAdmissionError('INVALID_LANE_SETTINGS', 'invalid work item stream limits')
     }
     for (const dimension of TOKEN_DIMENSIONS) {
       if (!(Number(value.tokens && value.tokens[dimension]) > 0) || value.tokens[dimension] > budget.tokens[dimension]) {
-        throw new SchedulerAdmissionError('INVALID_LANE_SETTINGS', `invalid ${lane} token ceiling: ${dimension}`)
+        throw new SchedulerAdmissionError('INVALID_LANE_SETTINGS', `invalid work item stream token ceiling: ${dimension}`)
       }
     }
   }
@@ -590,9 +613,31 @@ function progressFingerprintFor(request = {}) {
   const candidate = firstNormalizedField(fields, ['candidateHash', 'candidateDigest'])
   const evidence = firstNormalizedField(fields, ['evidenceHashes', 'evidenceHash', 'evidenceDigest'])
   const strategy = firstNormalizedField(fields, ['strategyHash', 'strategyFingerprint', 'reassessmentHash'])
-  const evidenceList = Array.isArray(evidence) ? evidence.map(String).sort() : evidence == null ? [] : [String(evidence)]
-  if (!nonEmpty(String(candidate || '')) && evidenceList.length === 0 && !nonEmpty(String(strategy || ''))) return null
-  return sha256(Buffer.from(stableStringify({ candidate: candidate || null, evidence: evidenceList, strategy: strategy || null }), 'utf8'))
+  const digest = (value, field) => {
+    if (value === undefined || value === null || value === '') return null
+    const normalized = String(value)
+    if (!/^[a-f0-9]{64}$/u.test(normalized)) {
+      throw new SchedulerAdmissionError(
+        'RETRY_PROGRESS_EVIDENCE_INVALID',
+        `retry ${field} must be one canonical sha256 digest`,
+        { field },
+      )
+    }
+    return normalized
+  }
+  const candidateDigest = digest(candidate, 'candidate')
+  const evidenceList = [...new Set(
+    (Array.isArray(evidence) ? evidence : evidence == null ? [] : [evidence])
+      .map(value => digest(value, 'evidence'))
+      .filter(Boolean),
+  )].sort()
+  const strategyDigest = digest(strategy, 'strategy')
+  if (!candidateDigest && evidenceList.length === 0 && !strategyDigest) return null
+  return sha256(Buffer.from(stableStringify({
+    candidate: candidateDigest,
+    evidence: evidenceList,
+    strategy: strategyDigest,
+  }), 'utf8'))
 }
 
 function emptyUsage() {
@@ -738,6 +783,7 @@ class RootAccountingLease {
 
 class CentralScheduler {
   constructor(options = {}) {
+    this.environment = options.environment || options.baseEnvironment || process.env
     const identity = options.runIdentity
     if (!identity || !nonEmpty(identity.runId) || !Number.isInteger(Number(identity.generation)) || Number(identity.generation) < 0) {
       throw new SchedulerAdmissionError('RUN_IDENTITY_REQUIRED', 'scheduler requires runIdentity { runId, generation }')
@@ -752,13 +798,17 @@ class CentralScheduler {
       { allowPending: true },
     )
     if (requestedRoute === PENDING_ROUTE) {
-      if (options.settings && stableStringify(options.settings) !== stableStringify(PENDING_ROUTE_SETTINGS)) {
+      const pendingSettings = benchmarkAdjustedSettings(PENDING_ROUTE_SETTINGS, this.environment)
+      if (options.settings && stableStringify(options.settings) !== stableStringify(pendingSettings)) {
         throw new SchedulerAdmissionError('INVALID_PENDING_SETTINGS', 'pending admission uses the canonical one-analyst settings')
       }
-      this.settings = PENDING_ROUTE_SETTINGS
+      this.settings = pendingSettings
       this.route = PENDING_ROUTE
     } else {
-      this.settings = validateResolvedSchedulerSettings(options.settings || (options.state && options.state.settings) || resolveSchedulerSettings(options))
+      this.settings = validateResolvedSchedulerSettings(
+        options.settings || (options.state && options.state.settings) || resolveSchedulerSettings({ ...options, environment: this.environment }),
+        this.environment,
+      )
       this.route = normalizeRoute(this.settings.route)
     }
     this.budget = this.settings.budget
@@ -873,7 +923,10 @@ class CentralScheduler {
       throw this._error('ROUTE_DECISION_INCOMPLETE', 'route freeze requires one completed analyst child and one completed root-accounted L0 decision')
     }
     const targetRoute = normalizeRoute(route)
-    const target = validateResolvedSchedulerSettings(resolvedSettings || resolveSchedulerSettings({ route: targetRoute }))
+    const target = validateResolvedSchedulerSettings(
+      resolvedSettings || resolveSchedulerSettings({ route: targetRoute, environment: this.environment }),
+      this.environment,
+    )
     if (target.route !== targetRoute) {
       throw this._error('INVALID_SCHEDULER_SETTINGS', 'resolved settings route does not match the frozen route')
     }
@@ -884,8 +937,8 @@ class CentralScheduler {
       economicPolicySource: target.economicPolicySource,
       concurrencyPreset: target.concurrencyPreset,
       budget: target.budget,
-      lanes: { ...target.lanes, ...PENDING_ROUTE_SETTINGS.lanes },
-    }))
+      lanes: { ...target.lanes, ...benchmarkAdjustedSettings(PENDING_ROUTE_SETTINGS, this.environment).lanes },
+    }), this.environment)
     this._assertUsageWithinSettings(merged)
     const prior = this._laneCounters
     this.settings = merged
@@ -1292,6 +1345,27 @@ class CentralScheduler {
     })
   }
 
+  assertRetryProgress(request = {}) {
+    const workItemId = nonEmpty(request.workItemId) ? request.workItemId.trim() : null
+    const equivalenceKey = nonEmpty(request.equivalenceKey)
+      ? request.equivalenceKey.trim()
+      : (nonEmpty(request.retryOf) ? request.retryOf.trim() : workItemId)
+    if (!workItemId || !equivalenceKey) {
+      throw this._error('INVALID_WORK_ITEM', 'retry progress preflight requires a work item and equivalence key')
+    }
+    this._assertCanAttempt({
+      ...request,
+      workItemId,
+      equivalenceKey,
+      progressFingerprint: progressFingerprintFor(request),
+    })
+    return Object.freeze({
+      equivalenceKey,
+      priorAttempts: this._attempts.get(equivalenceKey) || 0,
+      admitted: true,
+    })
+  }
+
   issueLaunchAuthority(binding = {}) {
     if (!nonEmpty(binding.callerRole) || !nonEmpty(binding.sessionId)) {
       throw this._error('INVALID_LAUNCH_AUTHORITY', 'callerRole and physical sessionId are required')
@@ -1497,18 +1571,21 @@ class CentralScheduler {
       this._admissionComponents.routeDecision +
       (this.route === 'LIGHT' ? this._admissionComponents.lightPlanning : 0) +
       (this.route === 'ROADMAP' ? this._admissionComponents.roadmapPlanning : 0)
+    const benchmarkNoTimeout = this.environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
     const breaches = []
-    if (bootstrap > ADMISSION_COMPONENT_CEILINGS_MS.bootstrap) breaches.push('bootstrap')
-    for (const name of ['routeAnalyst', 'routeDecision']) {
-      if (this._admissionComponents[name] > ADMISSION_COMPONENT_CEILINGS_MS[name]) breaches.push(name)
+    if (!benchmarkNoTimeout) {
+      if (bootstrap > ADMISSION_COMPONENT_CEILINGS_MS.bootstrap) breaches.push('bootstrap')
+      for (const name of ['routeAnalyst', 'routeDecision']) {
+        if (this._admissionComponents[name] > ADMISSION_COMPONENT_CEILINGS_MS[name]) breaches.push(name)
+      }
+      if (this.route === 'LIGHT' && this._admissionComponents.lightPlanning > ADMISSION_COMPONENT_CEILINGS_MS.lightPlanning) {
+        breaches.push('lightPlanning')
+      }
+      if (this.route === 'ROADMAP' && this._admissionComponents.roadmapPlanning > ADMISSION_COMPONENT_CEILINGS_MS.roadmapPlanning) {
+        breaches.push('roadmapPlanning')
+      }
+      if (this.budget.admissionHardMs && included > this.budget.admissionHardMs) breaches.push('combined')
     }
-    if (this.route === 'LIGHT' && this._admissionComponents.lightPlanning > ADMISSION_COMPONENT_CEILINGS_MS.lightPlanning) {
-      breaches.push('lightPlanning')
-    }
-    if (this.route === 'ROADMAP' && this._admissionComponents.roadmapPlanning > ADMISSION_COMPONENT_CEILINGS_MS.roadmapPlanning) {
-      breaches.push('roadmapPlanning')
-    }
-    if (this.budget.admissionHardMs && included > this.budget.admissionHardMs) breaches.push('combined')
     return {
       withinCeiling: breaches.length === 0,
       code: breaches.length === 0 ? 'ADMISSION_TIME_OK' : 'ADMISSION_COMPONENT_TIMEOUT',
@@ -1518,7 +1595,7 @@ class CentralScheduler {
       components: { ...this._admissionComponents, bootstrap },
       combinedHardMs: this.budget.admissionHardMs || null,
       p95TargetMs: this.budget.admissionP95Ms || null,
-      withinP95: !this.budget.admissionP95Ms || included <= this.budget.admissionP95Ms,
+      withinP95: benchmarkNoTimeout || !this.budget.admissionP95Ms || included <= this.budget.admissionP95Ms,
     }
   }
 
@@ -2163,7 +2240,7 @@ class CentralScheduler {
           stableStringify(this._laneCounters[lane].reserved) !==
             stableStringify(checkpoint.schedulerState.laneCounters[lane].reserved) ||
           this._laneCounters[lane].live !== checkpoint.schedulerState.laneCounters[lane].live)) {
-      throw this._error('CRASH_CHECKPOINT_INVALID', 'saved live reservations or lane ownership do not balance')
+      throw this._error('CRASH_CHECKPOINT_INVALID', 'saved live reservations or work item stream ownership do not balance')
     }
     const predecessorRootContextId = this._rootContextId
     this._rootContextId = replacementRootContextId
@@ -2280,9 +2357,9 @@ class CentralScheduler {
     const lane = nonEmpty(request.lane)
       ? request.lane.trim()
       : parentRecord ? parentRecord.lane : laneNames.length === 1 ? laneNames[0] : null
-    if (!lane) throw this._error('LANE_REQUIRED', 'a named lane is required when multiple lanes are configured')
+    if (!lane) throw this._error('LANE_REQUIRED', 'a named work item stream is required when multiple streams are configured')
     if (!Object.hasOwn(this.settings.lanes, lane)) {
-      throw this._error('UNKNOWN_LANE', `lane is not present in resolved settings: ${lane}`)
+      throw this._error('UNKNOWN_LANE', 'work item stream is not present in resolved settings')
     }
     const equivalenceKey = nonEmpty(request.equivalenceKey)
       ? request.equivalenceKey.trim()
@@ -2331,11 +2408,11 @@ class CentralScheduler {
     const laneState = this._laneCounters[request.lane]
     const laneLimit = this.settings.lanes[request.lane]
     if (laneState.launches >= laneLimit.maxLaunches) {
-      throw this._error('LANE_LAUNCH_LIMIT', `lane child-launch ceiling exhausted: ${request.lane}`)
+      throw this._error('LANE_LAUNCH_LIMIT', 'work item stream child-launch ceiling exhausted')
     }
     const boundLane = this._equivalenceLanes.get(request.equivalenceKey)
     if (boundLane && boundLane !== request.lane) {
-      throw this._error('RETRY_LANE_MISMATCH', 'equivalent work cannot evade a lane counter', {
+      throw this._error('RETRY_LANE_MISMATCH', 'equivalent work cannot evade its work item stream counter', {
         equivalenceKey: request.equivalenceKey, expectedLane: boundLane, receivedLane: request.lane,
       })
     }
@@ -2416,7 +2493,7 @@ class CentralScheduler {
       throw this._error('LAUNCH_LIMIT', 'activation child-launch ceiling exhausted')
     }
     if (this._laneCounters[request.lane].launches >= this.settings.lanes[request.lane].maxLaunches) {
-      throw this._error('LANE_LAUNCH_LIMIT', `lane child-launch ceiling exhausted: ${request.lane}`)
+      throw this._error('LANE_LAUNCH_LIMIT', 'work item stream child-launch ceiling exhausted')
     }
     const attempt = (this._attempts.get(request.equivalenceKey) || 0) + 1
     this._attempts.set(request.equivalenceKey, attempt)
@@ -2587,7 +2664,7 @@ class CentralScheduler {
     const finalOutcome = outcome === 'completed' && budgetExhausted ? 'failed' : outcome
     this._finalizeRecord(record, finalOutcome, error)
     if (outcome === 'completed' && budgetExhausted) {
-      throw this._error('BUDGET_EXHAUSTED', 'lease usage exhausted a hard route, lane, or session ceiling', {
+      throw this._error('BUDGET_EXHAUSTED', 'lease usage exhausted a hard route, work item stream, or session ceiling', {
         hardCeilings: record.budgetExhaustion.hardCeilings,
         leaseId: id,
         workItemId: record.workItemId,
@@ -2740,7 +2817,7 @@ class CentralScheduler {
         ? laneProjected.output + laneProjected.reasoning
         : laneProjected[dimension]
       if (projected > laneLimit.tokens[dimension]) {
-        throw this._error('LANE_TOKEN_BUDGET', `${request.lane} lane ${dimension} ceiling would be exceeded`, {
+        throw this._error('LANE_TOKEN_BUDGET', `work item stream ${dimension} ceiling would be exceeded`, {
           lane: request.lane, dimension, projected, limit: laneLimit.tokens[dimension],
         })
       }
@@ -2825,7 +2902,7 @@ class CentralScheduler {
       throw this._error('INVALID_SCHEDULER_STATE', 'saved state belongs to a different run generation')
     }
     if (state.settings && stableStringify(state.settings) !== stableStringify(this.settings)) {
-      throw this._error('INVALID_SCHEDULER_STATE', 'saved route/lane settings do not match resolved settings')
+      throw this._error('INVALID_SCHEDULER_STATE', 'saved route and work item stream settings do not match resolved settings')
     }
     this._sequence = positiveInteger(state.sequence, 0)
     this._attempts = new Map(Object.entries(state.attempts || {}).map(([key, value]) => [key, Number(value)]))

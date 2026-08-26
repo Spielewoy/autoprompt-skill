@@ -19,6 +19,7 @@ const {
 } = require(path.join(WORKFLOW, 'event-log.js'))
 const {
   RuntimeStateStore,
+  RESUMABLE_FRONTIER_STATES,
   isLegalTransition,
   prepareCrashCheckpoint,
   runtimeCrashPrecondition,
@@ -98,6 +99,24 @@ function assertDraft202012Valid(schemaPath, records) {
   })
   assert.equal(result.status, 0, result.stdout || result.stderr)
 }
+
+test('controller failure and explicit cancellation cover every leased active control state', () => {
+  const shared = [
+    'LOAD_SKILL', 'STORE_REQUEST_ENVELOPE', 'RESOLVE_SETTINGS', 'SELECT_SAFE_RUN_ROOT',
+    'CREATE_RUN_RECORD', 'CHECK_PROVIDER_CAPABILITIES', 'START_ROUTE_ANALYST',
+    'SAVE_ROUTE_ANALYSIS', 'L0_ROUTE_DECISION', 'PREPARE_WORK', 'RUN_WORK', 'ITEM_VERIFIED',
+    'CHECK_WORK', 'REPAIRING', 'CHECK_INCONCLUSIVE', 'WORKER_CONTEXT_LOST',
+    'INTEGRATION_CONFLICT', 'REASSESS_STRATEGY', 'CHANGING_ROUTE',
+    'APPEND_REQUEST_STEERING', 'INVALIDATE_AFFECTED_RESULTS', 'MIGRATING_CONTRACT',
+    'RESUME_EXACT_STATE', 'FINAL_CHECK',
+  ]
+  for (const state of shared) {
+    assert.equal(isLegalTransition(state, 'RELEASING_LOCK', 'CONTROLLER_FAILED_FINAL'), true, `T081 ${state}`)
+    assert.equal(isLegalTransition(state, 'RELEASING_LOCK', 'CANCEL_REQUESTED'), true, `T057 ${state}`)
+  }
+  assert.equal(isLegalTransition('FINALIZING', 'RELEASING_LOCK', 'CONTROLLER_FAILED_FINAL'), true)
+  assert.equal(isLegalTransition('FINALIZING', 'RELEASING_LOCK', 'CANCEL_REQUESTED'), false)
+})
 
 async function waitFor(predicate, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs
@@ -214,6 +233,7 @@ function stateHarness(t, options = {}) {
       issued.has(candidate) ? { ...capabilityBinding } : null
     )),
     recoveryCheckpointVerifier: options.recoveryCheckpointVerifier,
+    pausedRecoveryCheckpointVerifier: options.pausedRecoveryCheckpointVerifier,
     clock: now,
     randomId: () => 'mutation-permit-001',
     beforeCommit: options.beforeCommit,
@@ -296,31 +316,90 @@ test('runtime state admits every named admission/evolution case and rejects ille
 })
 
 test('planning inconclusive retry durably records and returns to its RUN_WORK origin', t => {
-  const { capability, store } = stateHarness(t)
+  const harness = stateHarness(t)
+  const { capability, store } = harness
   const candidateHash = digest('roadmap-plan-candidate')
-  const transitionProduction = (eventId, nextState, checkerId) => applyProductionRuntimeTransition({
+  const transitionProduction = (eventId, nextState, checkerId, nextReadyWorkIds = []) => applyProductionRuntimeTransition({
     stateStore: store, capability, budgetController: { snapshot: () => null },
   }, {
     eventId, nextState,
     details: {
       checkerId, candidateHash, retryAttempt: 1,
       checkerResultHash: digest(`${eventId}:${checkerId}`),
+      nextReadyWorkIds,
     },
   })
   advanceToWork(store)
-  transitionProduction('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', 'roadmap-plan-check')
+  transitionProduction('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', 'roadmap-plan-check',
+    ['roadmap-plan-check-runtime-retry'])
   assert.equal(store.load().state, 'CHECK_INCONCLUSIVE')
   assert.deepEqual(store.load().retryState.inconclusiveChecker, {
     checkerId: 'roadmap-plan-check', candidateHash,
+    checkerResultHash: digest('CHECK_INCONCLUSIVE:roadmap-plan-check'),
     retryAttempt: 1, returnState: 'RUN_WORK',
+    controllerReassessment: {
+      code: 'CHECK_INCONCLUSIVE',
+      priorResultEvidenceHash: digest('CHECK_INCONCLUSIVE:roadmap-plan-check'),
+    },
   })
+  assert.deepEqual(harness.eventLog.readAll().at(-1).details.stateEvent.openIds,
+    ['roadmap-plan-check-runtime-retry'])
   assert.throws(
     () => transitionProduction('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', 'roadmap-plan-check-runtime-retry'),
     error => error.code === 'CHECK_RETRY_STATE_INVALID',
   )
-  transitionProduction('CHECK_BECAME_CONCLUSIVE', 'RUN_WORK', 'roadmap-plan-check-runtime-retry')
+  transitionProduction('CHECK_BECAME_CONCLUSIVE', 'RUN_WORK', 'roadmap-plan-check-runtime-retry',
+    ['mission-coordination'])
   assert.equal(store.load().state, 'RUN_WORK')
   assert.equal(Object.hasOwn(store.load().retryState, 'inconclusiveChecker'), false)
+  assert.deepEqual(harness.eventLog.readAll().at(-1).details.stateEvent.openIds,
+    ['mission-coordination'])
+})
+
+test('every canonical T058 source admits an exact resumable frontier, including CHECK_INCONCLUSIVE', t => {
+  const machine = require(path.join(ROOT, 'agents', 'contracts', 'state-machine.json'))
+  const t058 = machine.transitions.find(item => item.id === 'T058')
+  assert.deepEqual(RESUMABLE_FRONTIER_STATES, t058.from)
+  assert.equal(RESUMABLE_FRONTIER_STATES.includes('ITEM_VERIFIED'), true)
+  assert.equal(RESUMABLE_FRONTIER_STATES.includes('CHECK_INCONCLUSIVE'), true)
+
+  const harness = stateHarness(t)
+  const { capability, store } = harness
+  const candidateHash = digest('paused-roadmap-plan-candidate')
+  advanceToWork(store)
+  applyProductionRuntimeTransition({
+    stateStore: store,
+    capability,
+    budgetController: { snapshot: () => null },
+  }, {
+    eventId: 'CHECK_INCONCLUSIVE',
+    nextState: 'CHECK_INCONCLUSIVE',
+    details: {
+      checkerId: 'roadmap-plan-check',
+      candidateHash,
+      retryAttempt: 1,
+      checkerResultHash: digest('paused-roadmap-plan-result'),
+    },
+  })
+  const retryState = structuredClone(store.load().retryState)
+  const frontier = {
+    resumeState: 'CHECK_INCONCLUSIVE',
+    nextReadyWorkIds: ['roadmap-plan-check-runtime-retry'],
+    remainingBudgetSeconds: 17,
+    continuationBindingHash: digest('paused-roadmap-plan-continuation'),
+  }
+  transition(store, 'PAUSED', 'persist the exact inconclusive checker retry', 'BUDGET_EXHAUSTED_RESUMABLE', frontier)
+  assert.deepEqual(store.load().frontier, frontier)
+  assert.deepEqual(store.load().retryState, retryState)
+  harness.advanceCapabilityGeneration()
+  const resumed = store.resumeGeneration({
+    capability,
+    expectedGeneration: 1,
+    cause: 'resume the exact inconclusive checker retry',
+  })
+  assert.deepEqual(resumed.frontier, frontier)
+  assert.deepEqual(resumed.retryState.inconclusiveChecker, retryState.inconclusiveChecker)
+  assert.equal(resumed.retryState.generationResumedFrom, 1)
 })
 
 test('runtime mutation authority is opaque and activation identity cannot be patched from state.json values', (t) => {
@@ -361,6 +440,150 @@ test('runtime mutation authority is opaque and activation identity cannot be pat
   assert.equal(resumed.activation.generation, 2)
   assert.equal(resumed.activation.id, 'activation-001')
   assert.equal(resumed.activation.nonce, 'nonce_123456789012')
+})
+
+test('clean PAUSED release resumes through the exact drained checkpoint and never enters crash adoption', t => {
+  const directory = temporary(t)
+  const target = path.join(directory, 'target')
+  fs.mkdirSync(target)
+  let leaseNumber = 0
+  const lock = new MissionLock({
+    leaseRoot: path.join(directory, 'leases'),
+    processIdentityObserver: leaseProcessObserver(),
+    identityProbe: () => ({ alive: true, verified: true }),
+    randomId: () => `clean-pause-lease-${++leaseNumber}`,
+  })
+  const leaseInput = {
+    targetPath: target,
+    ledgerPath: path.join(target, '.autoprompt'),
+    runId: 'run-0001',
+    activationId: 'activation-001',
+    missionHash: digest('mission'),
+    nonce: 'nonce_123456789012',
+    generation: 1,
+    pid: 601,
+    processIdentity: 'clean-pause-owner-one',
+    token: 'a'.repeat(48),
+  }
+  const firstCapability = lock.acquire(leaseInput)
+  let recoveryEvidence
+  let recoveryAuthority
+  const harness = stateHarness(t, {
+    directory: path.join(directory, 'run-record'),
+    capability: firstCapability,
+    binding: { ...binding(), targetIdentity: lock.verifyCapability(firstCapability).targetIdentity },
+    capabilityVerifier: candidate => lock.verifyCapability(candidate),
+    recoveryCheckpointVerifier: candidate => recoveryAuthority.verifyResumeCheckpoint(candidate),
+    pausedRecoveryCheckpointVerifier: candidate => recoveryAuthority.verifyPausedResumeCheckpoint(candidate),
+  })
+  advanceToWork(harness.store)
+  const prior = harness.store.load()
+  const accountingEvidence = {
+    runId: prior.runId,
+    activationId: prior.activation.id,
+    activationNonce: prior.activation.nonce,
+    generation: 1,
+    lastAccountingSequence: 1,
+    lastAccountingHash: digest('clean-pause-accounting-entry'),
+    snapshotHash: digest('clean-pause-accounting-snapshot'),
+  }
+  recoveryAuthority = new RecoveryCheckpointAuthority({
+    paths: {
+      runRecordRoot: harness.directory,
+      logPath: path.join(harness.directory, 'runtime', 'pause-recovery.jsonl'),
+      snapshotPath: path.join(harness.directory, 'runtime', 'pause-recovery-latest.json'),
+    },
+    eventLog: harness.eventLog,
+    stateProvider: () => harness.store.load(),
+    capabilityVerifier: candidate => lock.verifyCapability(candidate),
+    accountingCheckpointVerifier: candidate => {
+      if (candidate !== accountingEvidence) throw new Error('foreign accounting evidence')
+      return candidate
+    },
+    accountingCheckpointProvider: () => accountingEvidence,
+  })
+  const scheduler = schedulerCheckpointFixture({
+    route: 'LIGHT', phase: 'RUN_WORK', nextReadyWorkIds: ['work-2'],
+  })
+  const appended = recoveryAuthority.appendCheckpoint({
+    capability: firstCapability,
+    providerCapabilitiesHash: digest('clean-pause-provider-capabilities'),
+    accountingCheckpoint: accountingEvidence,
+    scheduler,
+    recovery: {
+      savedState: 'RUN_WORK',
+      resumeState: 'RUN_WORK',
+      frontier: {
+        nextReadyWorkIds: ['work-2'],
+        openCheckIds: [],
+        acceptedResultIds: [scheduler.stateHash],
+      },
+      completedMilestones: ['route-analysis', 'route-decision', 'work-preparation'],
+      externalRecovery: { status: 'none', operationIds: [], idempotencyKeys: [], receiptHashes: [] },
+      releaseIntentHash: null,
+    },
+    immutableHashes: {
+      requestEnvelopeHash: prior.requestEnvelopeHash,
+      routeDecisionHash: digest('clean-pause-route'),
+      planHash: digest('clean-pause-plan'),
+      candidateHash: null,
+    },
+    externalOperations: [],
+    humanDescription: 'Persist the exact clean pause predecessor checkpoint.',
+    cause: {
+      kind: 'CHECKPOINT',
+      causeId: 'clean-pause-post-drain',
+      humanDescription: 'Persist the exact clean pause predecessor checkpoint.',
+    },
+  })
+  const checkpointPayloadHash = appended.record.checkpointPayloadHash
+  transition(harness.store, 'PAUSED', 'clean post-drain pause', 'BUDGET_EXHAUSTED_RESUMABLE', {
+    resumeState: 'RUN_WORK',
+    nextReadyWorkIds: ['work-2'],
+    remainingBudgetSeconds: 30,
+    continuationBindingHash: checkpointPayloadHash,
+  })
+  recoveryEvidence = recoveryAuthority.resumePausedCheckpoint()
+  assert.equal(recoveryEvidence.record.entryHash, appended.record.entryHash)
+  const pauseRelease = harness.store.preparePausedRelease()
+  lock.release(firstCapability, { releaseEvidence: pauseRelease, ownedIdentityEvidence: [] })
+  const secondCapability = lock.acquire({
+    ...leaseInput,
+    generation: 2,
+    pid: 602,
+    processIdentity: 'clean-pause-owner-two',
+    token: 'b'.repeat(48),
+  })
+  TEST_CAPABILITIES.set(harness.store, secondCapability)
+  assert.throws(() => harness.store.resumePausedGeneration({
+    capability: secondCapability,
+    expectedGeneration: 1,
+    recoveryCheckpoint: {
+      ...recoveryEvidence,
+      snapshot: { ...recoveryEvidence.snapshot, checkpointPayloadHash: digest('tampered-pause') },
+    },
+    expectedCheckpointPayloadHash: checkpointPayloadHash,
+    cause: 'reject tampered clean pause evidence',
+  }), error => error.code === 'CRASH_CHECKPOINT_MISMATCH')
+  const resumed = harness.store.resumePausedGeneration({
+    capability: secondCapability,
+    expectedGeneration: 1,
+    recoveryCheckpoint: recoveryEvidence,
+    expectedCheckpointPayloadHash: checkpointPayloadHash,
+    cause: 'resume exact clean pause',
+  })
+  assert.equal(resumed.state, 'CHECK_PROVIDER_CAPABILITIES')
+  assert.equal(resumed.activation.generation, 2)
+  assert.equal(resumed.frontier.resumeState, 'RUN_WORK')
+  assert.deepEqual(resumed.frontier.frontier.nextReadyWorkIds, ['work-2'])
+  assert.equal(harness.store.acceptResumeCapabilities({
+    capability: secondCapability,
+    cause: 'clean pause capabilities reverified',
+  }).state, 'RESUME_EXACT_STATE')
+  assert.equal(harness.store.restoreExactState({
+    capability: secondCapability,
+    cause: 'restore clean paused state',
+  }).state, 'RUN_WORK')
 })
 
 test('checksummed state and hash-chained events survive restart and fail closed on tamper', (t) => {
@@ -554,9 +777,22 @@ test('checker repair mutates in REPAIRING, invalidates C1, and freezes a fresh C
       eventId, nextState,
       details: {
         candidateHash, dependencyHash: nextDependencyHash, environmentHash,
-      missionHash: digest('mission-binding'), planHash: digest('plan-binding'),
+        missionHash: digest('mission-binding'), planHash: digest('plan-binding'),
         oracleHash: digest('oracle-binding'), assumptionsHash: digest('assumptions-binding'),
         checkerCount: 1, requiredVerdictIds: ['reviewer-verdict'],
+        ...(eventId === 'IMPLEMENTATION_DEFECT' ? {
+          checkerId: 'independent-check-1',
+          checkerResultHash: digest('rejected-checker-result'),
+          checkerReceiptPointer: { name: 'independent-check-1', hash: digest('checker-receipt') },
+          repairAttempt: 1,
+          repairWorkItemId: 'work-1-repair-1',
+        } : {}),
+        ...(eventId === 'REPAIR_READY' ? {
+          priorCandidateHash: candidateOne,
+          checkerResultHash: digest('rejected-checker-result'),
+          repairAttempt: 1,
+          repairWorkItemId: 'work-1-repair-1',
+        } : {}),
       },
     })
   advanceToWork(store)
@@ -751,11 +987,11 @@ test('canonical release intents deterministically bind every T068-T072 outcome a
   }), (error) => error.code === 'RUN_RECORD_FAILURE')
 })
 
-test('exhausted checker repair binds FAILED directly without pretending an environment or worker-context block', t => {
-  for (const sourceState of ['CHECK_WORK', 'REPAIRING']) {
+test('controller and exhausted checker failures bind FAILED without pretending an environment or worker-context block', t => {
+  for (const sourceState of ['RUN_WORK', 'CHECK_WORK', 'REPAIRING']) {
     const { capability, store } = stateHarness(t)
     advanceToWork(store)
-    transition(store, 'CHECK_WORK')
+    if (sourceState !== 'RUN_WORK') transition(store, 'CHECK_WORK')
     if (sourceState === 'REPAIRING') {
       transition(store, 'REPAIRING', 'authoritative checker rejected C1', 'IMPLEMENTATION_DEFECT')
     }
@@ -769,6 +1005,44 @@ test('exhausted checker repair binds FAILED directly without pretending an envir
     store.completeReleasedTerminal('FAILED', { capability, cause: 'release proven' })
     const eventIds = store.eventLog.readAll().map(event => event.details.stateEvent.eventId)
     assert.equal(eventIds.includes('ENVIRONMENT_BLOCKED'), false)
+    assert.equal(eventIds.includes('WORKER_CONTEXT_LOST'), false)
+  }
+})
+
+test('typed RUN_WORK controller failure has its own truthful FAILED release intent', t => {
+  for (const sourceState of ['RUN_WORK', 'CHECK_INCONCLUSIVE', 'FINALIZING']) {
+    const { capability, store } = stateHarness(t)
+    advanceToWork(store)
+    if (sourceState === 'CHECK_INCONCLUSIVE') {
+      applyProductionRuntimeTransition({
+        stateStore: store, capability, budgetController: { snapshot: () => null },
+      }, {
+        eventId: 'CHECK_INCONCLUSIVE', nextState: 'CHECK_INCONCLUSIVE',
+        details: {
+          checkerId: 'independent-check-1', candidateHash: digest('controller-candidate'),
+          checkerResultHash: digest('controller-inconclusive'), retryAttempt: 1,
+          controllerReassessment: {
+            code: 'REFERENCE_METHOD_INVALID',
+            priorResultEvidenceHash: digest('controller-inconclusive'),
+          },
+        },
+      })
+    } else if (sourceState === 'FINALIZING') {
+      transition(store, 'CHECK_WORK')
+      transition(store, 'FINAL_CHECK', 'acceptance checks green', 'ACCEPTANCE_GREEN')
+      transition(store, 'FINALIZING', 'final verification accepted', 'VERIFIED')
+    }
+    transition(store, 'RELEASING_LOCK', 'retry receipt invariant rejected', 'CONTROLLER_FAILED_FINAL')
+    const bound = store.bindTerminal('FAILED', {
+      capability,
+      cause: 'the typed controller invariant prevents safe continuation',
+      terminalEnvelope: { status: 'CHECK_RETRY_STATE_INVALID' },
+      deliverables: [],
+    })
+    assert.equal(bound.terminal.releaseIntent.transitionId, 'T081')
+    assert.equal(bound.terminal.outcome, 'FAILED')
+    const eventIds = store.eventLog.readAll().map(event => event.details.stateEvent.eventId)
+    assert.equal(eventIds.includes('CHECK_FAILED_FINAL'), false)
     assert.equal(eventIds.includes('WORKER_CONTEXT_LOST'), false)
   }
 })
@@ -1820,6 +2094,14 @@ test('recovery checkpoint authority binds scheduler, accounting, state, and cras
   assertCommitMutationRejected('receiptHash', digest('wrong-receipt'))
   assertCommitMutationRejected('assignmentHash', digest('wrong-assignment-hash'))
   assertCommitMutationRejected('generation', 2, true)
+  harness.store.transition('RUN_WORK', {
+    capability,
+    cause: 'commit the controller disposition before its matching recovery checkpoint',
+    eventId: 'TRANSIENT_RUNTIME',
+    openIds: ['work-2'],
+  })
+  assert.equal(authority.resumeCheckpoint().record.entryHash, committed.record.entryHash,
+    'one authenticated controller transition ahead of its checkpoint remains crash-resumable')
   transition(harness.store, 'CHECK_WORK')
   assert.throws(() => authority.resumeCheckpoint(), (error) => error.code === 'RECOVERY_CHECKPOINT_STATE_STALE')
 })

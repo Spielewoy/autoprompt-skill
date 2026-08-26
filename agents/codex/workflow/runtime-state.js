@@ -32,6 +32,9 @@ if (STATE_MACHINE.contractVersion !== '2.0.0' || STATE_EVENT_SCHEMA.properties.c
 const STATES = Object.freeze([...STATE_MACHINE.states])
 const FINAL_OUTCOMES = Object.freeze([...STATE_MACHINE.terminalStates])
 const RESUMABLE_STATES = Object.freeze([...STATE_MACHINE.resumableStates])
+const RESUMABLE_FRONTIER_STATES = Object.freeze([
+  ...STATE_MACHINE.transitions.find(transition => transition.id === 'T058').from,
+])
 const HALTED_BEFORE_LEASE = RESUMABLE_STATES
 const TERMINAL_STATES = FINAL_OUTCOMES
 const OUTCOME_DESCRIPTIONS = Object.freeze(Object.fromEntries(
@@ -48,6 +51,7 @@ const RELEASE_INTENT_OUTCOMES = Object.freeze({
   T049: 'BLOCKED',
   T056: 'BLOCKED',
   T080: 'FAILED',
+  T081: 'FAILED',
   T057: 'CANCELLED',
   T059: 'PARTIAL',
   T076: 'PARTIAL',
@@ -178,6 +182,21 @@ function recoveryCheckpointHash(recoveryContext) {
   const input = {}
   for (const field of CRASH_RECOVERY_POLICY.checkpointDigest.checkpointHashFields) input[field] = recoveryContext[field]
   return sha256(stableStringify(input))
+}
+
+function checkpointExactlyOneTransitionBehind(current, checkpoint, eventLog) {
+  const parent = checkpoint && checkpoint.stateEvent
+  const lastEvent = eventLog && eventLog.readAll().at(-1)
+  const event = lastEvent && lastEvent.details && lastEvent.details.stateEvent
+  return Boolean(parent && lastEvent && event && current.sequence === parent.sequence + 1 &&
+    lastEvent.sequence === current.sequence && lastEvent.hash === current.lastEventHash &&
+    event.sequence === current.sequence && event.causalParent === parent.eventHash &&
+    event.fromState === parent.state && event.toState === current.state &&
+    event.candidateHash === (current.candidateHash || null) &&
+    stableStringify(event.retryState) === stableStringify(current.retryState) &&
+    stableStringify(event.resourceState) === stableStringify(current.resourceState) &&
+    stableStringify([...event.openIds].sort()) ===
+      stableStringify([...(checkpoint.scheduler && checkpoint.scheduler.nextReadyWorkIds || [])].sort()))
 }
 
 function normalizeExternalRecovery(value) {
@@ -383,15 +402,58 @@ function releaseReconciliationEvidence(state, eventLog) {
   }))
 }
 
+function pausedReleaseEvidence(state, eventLog) {
+  if (!state || state.state !== 'PAUSED') {
+    fail('PAUSED_RELEASE_REQUIRED', 'resumable release requires the exact persisted PAUSED state')
+  }
+  const sourceEvent = eventLog.readAll().at(-1)
+  const stateEvent = sourceEvent && sourceEvent.details && sourceEvent.details.stateEvent
+  if (!sourceEvent || sourceEvent.sequence !== state.sequence || sourceEvent.hash !== state.lastEventHash ||
+      !validateCanonicalStateEvent(stateEvent) || stateEvent.transitionId !== 'T058' ||
+      stateEvent.eventId !== 'BUDGET_EXHAUSTED_RESUMABLE' || stateEvent.toState !== 'PAUSED' ||
+      stateEvent.causalParent === null || !state.frontier ||
+      !HASH_PATTERN.test(state.frontier.continuationBindingHash || '')) {
+    fail('PAUSED_RELEASE_INVALID', 'resumable release cannot bind the canonical pause event and continuation')
+  }
+  const releaseIntent = canonicalize({
+    transitionId: stateEvent.transitionId,
+    eventId: stateEvent.eventId,
+    eventSequence: sourceEvent.sequence,
+    eventHash: sourceEvent.hash,
+    outcome: 'PAUSED',
+    frontierHash: sha256(stableStringify(state.frontier)),
+    continuationBindingHash: state.frontier.continuationBindingHash,
+  })
+  return Object.freeze(canonicalize({
+    runId: state.runId,
+    activationId: state.activation.id,
+    missionHash: state.activation.missionHash,
+    activationNonce: state.activation.nonce,
+    generation: state.activation.generation,
+    targetIdentity: state.targetIdentity,
+    state: state.state,
+    stateChecksum: state.checksum,
+    stateEventSequence: state.sequence,
+    stateEventHash: state.lastEventHash,
+    transitionId: stateEvent.transitionId,
+    eventId: stateEvent.eventId,
+    outcome: 'PAUSED',
+    releaseIntentHash: sha256(stableStringify(releaseIntent)),
+    terminalHash: null,
+    candidateHash: state.candidateHash,
+    frontierHash: sha256(stableStringify(state.frontier)),
+  }))
+}
+
 function normalizeFrontier(frontier, currentState) {
   if (!frontier || typeof frontier !== 'object' ||
-      !['PREPARE_WORK', 'RUN_WORK', 'CHECK_WORK', 'REPAIRING'].includes(frontier.resumeState) ||
+      !RESUMABLE_FRONTIER_STATES.includes(frontier.resumeState) ||
       frontier.resumeState !== currentState || !Array.isArray(frontier.nextReadyWorkIds) ||
-      !frontier.nextReadyWorkIds.length || new Set(frontier.nextReadyWorkIds).size !== frontier.nextReadyWorkIds.length ||
+      new Set(frontier.nextReadyWorkIds).size !== frontier.nextReadyWorkIds.length ||
       frontier.nextReadyWorkIds.some((id) => typeof id !== 'string' || !id) ||
       typeof frontier.remainingBudgetSeconds !== 'number' || !Number.isFinite(frontier.remainingBudgetSeconds) ||
       frontier.remainingBudgetSeconds < 0 || !HASH_PATTERN.test(frontier.continuationBindingHash || '')) {
-    fail('PAUSED_FRONTIER_INVALID', 'PAUSED requires one exact, non-empty canonical continuation next ready work record')
+    fail('PAUSED_FRONTIER_INVALID', 'PAUSED requires the exact canonical physical next-ready work list, including an empty list at a controller-only boundary')
   }
   return canonicalize(frontier)
 }
@@ -673,6 +735,8 @@ class RuntimeStateStore {
     this.eventLog = options.eventLog
     this.capabilityVerifier = options.capabilityVerifier
     this.recoveryCheckpointVerifier = options.recoveryCheckpointVerifier || null
+    this.pausedRecoveryCheckpointVerifier = options.pausedRecoveryCheckpointVerifier ||
+      options.recoveryCheckpointVerifier || null
     this.fs = options.fsImpl || fs
     this.clock = options.clock || (() => new Date().toISOString())
     this.randomId = options.randomId || (() => crypto.randomBytes(16).toString('hex'))
@@ -906,6 +970,7 @@ class RuntimeStateStore {
       eventId: current.state === 'REPAIRING' ? 'REPAIR_READY' : 'ALL_WORK_JOINED',
       statePatch: {
         candidateHash: options.candidateHash,
+        retryState: options.retryState === undefined ? current.retryState : options.retryState,
         assurance: {
           candidateFreeze,
           evidenceGraph: graph,
@@ -915,6 +980,7 @@ class RuntimeStateStore {
         },
       },
       workHashes: [options.candidateHash, options.dependencyHash],
+      openIds: options.openIds || [],
       details: { candidateFreeze },
     })
   }
@@ -937,6 +1003,7 @@ class RuntimeStateStore {
       cause: requireString(options.cause, 'verdict cause'),
       checkHashes: [options.verdictHash],
       statePatch: { assurance: { ...current.assurance, verdicts } },
+      openIds: options.openIds || [],
       details: {
         verdictId: options.verdictId,
         verdictHash: options.verdictHash,
@@ -1389,6 +1456,13 @@ class RuntimeStateStore {
     const record = recoveryEvidence.record
     const journalCheckpoint = record.checkpoint
     const authority = record.authority
+    const transitionAhead = checkpointExactlyOneTransitionBehind(current, journalCheckpoint, this.eventLog)
+    const exactCheckpointState = Boolean(journalCheckpoint &&
+      journalCheckpoint.stateEvent.sequence === current.sequence &&
+      journalCheckpoint.stateEvent.eventHash === current.lastEventHash &&
+      journalCheckpoint.stateEvent.state === current.state &&
+      journalCheckpoint.stateEvent.stateChecksum === current.checksum &&
+      journalCheckpoint.immutableHashes.candidateHash === (current.candidateHash || null))
     if (!journalCheckpoint || !authority || record.checkpointPayloadHash !== options.expectedCheckpointPayloadHash ||
         recoveryEvidence.snapshot.checkpointPayloadHash !== record.checkpointPayloadHash ||
         recoveryEvidence.snapshot.lastCheckpointSequence !== record.sequence ||
@@ -1396,21 +1470,29 @@ class RuntimeStateStore {
         authority.runId !== current.runId || authority.activationId !== current.activation.id ||
         authority.activationNonce !== current.activation.nonce || authority.missionHash !== current.activation.missionHash ||
         authority.targetIdentity !== current.targetIdentity || authority.generation !== current.activation.generation ||
-        journalCheckpoint.stateEvent.sequence !== current.sequence ||
-        journalCheckpoint.stateEvent.eventHash !== current.lastEventHash ||
-        journalCheckpoint.stateEvent.state !== current.state || journalCheckpoint.stateEvent.stateChecksum !== current.checksum ||
         journalCheckpoint.immutableHashes.requestEnvelopeHash !== current.requestEnvelopeHash ||
-        journalCheckpoint.immutableHashes.candidateHash !== (current.candidateHash || null) ||
+        (!exactCheckpointState && !transitionAhead) ||
         !journalCheckpoint.recovery.frontier.acceptedResultIds.includes(journalCheckpoint.scheduler.stateHash)) {
       fail('CRASH_CHECKPOINT_MISMATCH', 'latest recovery checkpoint is foreign, stale, or does not bind the exact runtime and scheduler next ready work')
     }
+    const projectedRecovery = transitionAhead ? {
+      ...journalCheckpoint.recovery,
+      savedState: current.state,
+      resumeState: current.state === 'FINAL_CHECK' ? 'FINALIZING' : current.state,
+      frontier: {
+        ...journalCheckpoint.recovery.frontier,
+        nextReadyWorkIds: [...journalCheckpoint.scheduler.nextReadyWorkIds],
+        openCheckIds: [...journalCheckpoint.scheduler.openCheckIds],
+      },
+    } : journalCheckpoint.recovery
     let checkpoint
-    try { checkpoint = prepareCrashCheckpoint(journalCheckpoint.recovery) } catch (error) {
+    try { checkpoint = prepareCrashCheckpoint(projectedRecovery) } catch (error) {
       fail('CRASH_CHECKPOINT_MISMATCH', 'journal recovery projection is invalid', { cause: error.message })
     }
     const checkpointProjection = { ...checkpoint }
     delete checkpointProjection.schemaVersion
-    if (stableStringify(checkpointProjection) !== stableStringify(journalCheckpoint.recovery) || checkpoint.savedState !== current.state) {
+    if ((!transitionAhead && stableStringify(checkpointProjection) !== stableStringify(journalCheckpoint.recovery)) ||
+        checkpoint.savedState !== current.state) {
       fail('CRASH_CHECKPOINT_MISMATCH', 'journal recovery binding or saved state changed')
     }
     const accounting = journalCheckpoint.accounting
@@ -1474,6 +1556,123 @@ class RuntimeStateStore {
       }
     }
     return evidence
+  }
+
+  preparePausedRelease() {
+    return pausedReleaseEvidence(this.load(), this.eventLog)
+  }
+
+  resumePausedGeneration(options = {}) {
+    const current = this.load()
+    if (current.state !== 'PAUSED' || !Number.isSafeInteger(options.expectedGeneration) ||
+        current.activation.generation !== options.expectedGeneration) {
+      fail('GENERATION_CONFLICT', 'clean pause resume requires the exact persisted predecessor generation')
+    }
+    const pausedFrontier = normalizeFrontier(current.frontier, current.frontier && current.frontier.resumeState)
+    if (typeof this.pausedRecoveryCheckpointVerifier !== 'function') {
+      fail('RECOVERY_CHECKPOINT_CONFIG_INVALID', 'clean pause resume requires the persisted recovery-checkpoint authority')
+    }
+    let recoveryEvidence
+    try { recoveryEvidence = this.pausedRecoveryCheckpointVerifier(options.recoveryCheckpoint) } catch (error) {
+      fail('CRASH_CHECKPOINT_MISMATCH', 'paused recovery checkpoint evidence failed verification', { cause: error.message })
+    }
+    const record = recoveryEvidence && recoveryEvidence.record
+    const snapshot = recoveryEvidence && recoveryEvidence.snapshot
+    if (!recoveryEvidence || stableStringify(recoveryEvidence) !== stableStringify(options.recoveryCheckpoint) ||
+        !record || !snapshot || record.checkpointPayloadHash !== options.expectedCheckpointPayloadHash ||
+        record.checkpointPayloadHash !== pausedFrontier.continuationBindingHash ||
+        snapshot.checkpointPayloadHash !== record.checkpointPayloadHash ||
+        snapshot.lastCheckpointSequence !== record.sequence || snapshot.lastCheckpointHash !== record.entryHash) {
+      fail('CRASH_CHECKPOINT_MISMATCH', 'PAUSED continuation does not bind the exact latest recovery checkpoint')
+    }
+    const binding = this._authorize(
+      options.capability,
+      'resume clean paused generation',
+      capabilityExpectation(current, current.activation.generation + 1),
+    )
+    const pauseEvidence = pausedReleaseEvidence(current, this.eventLog)
+    const priorOwner = binding.takeover
+      ? this._crashPriorOwner(binding.takeover, current)
+      : this._releasedPriorOwner(binding.predecessorRelease, current, pauseEvidence)
+    const journalCheckpoint = record.checkpoint
+    const authority = record.authority
+    const pauseEvent = this.eventLog.readAll().at(-1).details.stateEvent
+    if (!journalCheckpoint || !authority ||
+        authority.runId !== current.runId || authority.activationId !== current.activation.id ||
+        authority.activationNonce !== current.activation.nonce || authority.missionHash !== current.activation.missionHash ||
+        authority.targetIdentity !== current.targetIdentity || authority.generation !== current.activation.generation ||
+        journalCheckpoint.stateEvent.sequence !== current.sequence - 1 ||
+        journalCheckpoint.stateEvent.eventHash !== pauseEvent.causalParent ||
+        journalCheckpoint.stateEvent.state !== pauseEvent.fromState ||
+        journalCheckpoint.immutableHashes.requestEnvelopeHash !== current.requestEnvelopeHash ||
+        journalCheckpoint.immutableHashes.candidateHash !== (current.candidateHash || null) ||
+        stableStringify(journalCheckpoint.scheduler.nextReadyWorkIds) !==
+          stableStringify([...pausedFrontier.nextReadyWorkIds].sort()) ||
+        journalCheckpoint.scheduler.leases.some(item => item.status === 'OPEN') ||
+        !journalCheckpoint.recovery.frontier.acceptedResultIds.includes(journalCheckpoint.scheduler.stateHash)) {
+      fail('CRASH_CHECKPOINT_MISMATCH', 'PAUSED checkpoint is stale, foreign, live, or differs from its exact next ready work')
+    }
+    let checkpoint
+    try { checkpoint = prepareCrashCheckpoint(journalCheckpoint.recovery) } catch (error) {
+      fail('CRASH_CHECKPOINT_MISMATCH', 'PAUSED recovery projection is invalid', { cause: error.message })
+    }
+    const checkpointProjection = { ...checkpoint }
+    delete checkpointProjection.schemaVersion
+    if (stableStringify(checkpointProjection) !== stableStringify(journalCheckpoint.recovery) ||
+        checkpoint.savedState !== pauseEvent.fromState || checkpoint.resumeState !== pausedFrontier.resumeState ||
+        stableStringify(checkpoint.frontier.nextReadyWorkIds) !==
+          stableStringify([...pausedFrontier.nextReadyWorkIds].sort())) {
+      fail('CRASH_CHECKPOINT_MISMATCH', 'PAUSED recovery state or next-ready work changed before resume')
+    }
+    const accounting = journalCheckpoint.accounting
+    if (!accounting || !HASH_PATTERN.test(accounting.snapshotHash || '') ||
+        !Number.isSafeInteger(accounting.lastAccountingSequence) || accounting.lastAccountingSequence < 1 ||
+        !HASH_PATTERN.test(accounting.lastAccountingHash || '')) {
+      fail('ACCOUNTING_CHECKPOINT_INVALID', 'PAUSED checkpoint lacks exact persisted accounting evidence')
+    }
+    const recoveryContext = {
+      savedState: checkpoint.savedState,
+      resumeState: checkpoint.resumeState,
+      checkpointHash: '0'.repeat(64),
+      frontierHash: recoveryFrontierHash(checkpoint.frontier),
+      frontier: checkpoint.frontier,
+      completedMilestones: checkpoint.completedMilestones,
+      priorOwner,
+      externalRecovery: checkpoint.externalRecovery,
+      releaseIntentHash: checkpoint.releaseIntentHash,
+      accountingCheckpoint: {
+        snapshotHash: accounting.snapshotHash,
+        lastAccountingSequence: accounting.lastAccountingSequence,
+        lastAccountingHash: accounting.lastAccountingHash,
+      },
+    }
+    recoveryContext.checkpointHash = recoveryCheckpointHash(recoveryContext)
+    const normalizedRecovery = normalizeRecoveryContext(recoveryContext)
+    const retryState = {
+      ...current.retryState,
+      pendingRequest: null,
+      generationResumedFrom: current.activation.generation,
+    }
+    return this.transition('CHECK_PROVIDER_CAPABILITIES', {
+      capability: options.capability,
+      cause: requireString(options.cause, 'resume cause'),
+      eventId: 'RESUME_REQUESTED',
+      expectedCapabilityGeneration: current.activation.generation + 1,
+      statePatch: {
+        activation: { ...current.activation, generation: current.activation.generation + 1, status: 'RESUMING' },
+        frontier: normalizedRecovery,
+        retryState,
+      },
+      [INTERNAL]: true,
+      openIds: [...new Set([...checkpoint.frontier.nextReadyWorkIds, ...checkpoint.frontier.openCheckIds])],
+      details: {
+        previousGeneration: current.activation.generation,
+        resumedGeneration: current.activation.generation + 1,
+        pauseReleaseReceiptHash: priorOwner.staleOwnerEvidenceHash,
+        checkpointPayloadHash: record.checkpointPayloadHash,
+        recoveryContext: normalizedRecovery,
+      },
+    })
   }
 
   adoptReleaseReconciliation(options = {}) {
@@ -1832,6 +2031,7 @@ module.exports = {
   HALTED_BEFORE_LEASE,
   LEGAL_TRANSITIONS,
   NONCE_PATTERN,
+  RESUMABLE_FRONTIER_STATES,
   RESUMABLE_STATES,
   RELEASE_INTENT_OUTCOMES,
   EVIDENCE_INPUT_IDS,
@@ -1854,6 +2054,7 @@ module.exports = {
   resolveCanonicalTransition,
   runtimeCrashPrecondition,
   releaseReconciliationEvidence,
+  pausedReleaseEvidence,
   validateCapabilityBinding,
   validateCanonicalStateEvent,
   validateCanonicalTerminalOutcome,

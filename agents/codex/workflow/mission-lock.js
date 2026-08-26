@@ -285,7 +285,7 @@ function validatePredecessorRelease(receipt) {
       !HASH_PATTERN.test(receipt.targetIdentity || '') || !HASH_PATTERN.test(receipt.releaseIntentHash || '') ||
       !HASH_PATTERN.test(receipt.stateChecksum || '') || !Number.isSafeInteger(receipt.stateEventSequence) ||
       receipt.stateEventSequence < 1 || !HASH_PATTERN.test(receipt.stateEventHash || '') ||
-      !['DONE', 'PARTIAL', 'BLOCKED', 'CANCELLED', 'FAILED'].includes(receipt.outcome) ||
+      !['PAUSED', 'DONE', 'PARTIAL', 'BLOCKED', 'CANCELLED', 'FAILED'].includes(receipt.outcome) ||
       !Array.isArray(receipt.persistedOwnedProcessIdentities) ||
       !validateOwnedIdentityEvidence(receipt.ownedIdentityEvidence, receipt.persistedOwnedProcessIdentities) ||
       receipt.ownedIdentityEvidence.some((entry) => entry.alive !== false) ||
@@ -300,7 +300,7 @@ class MissionLock {
   constructor(options) {
     if (!options || typeof options.leaseRoot !== 'string' || !options.leaseRoot.trim() ||
         !path.isAbsolute(options.leaseRoot) || path.parse(options.leaseRoot).root === path.resolve(options.leaseRoot)) {
-      fail('LEASE_CONFIG_INVALID', 'mission lock requires a non-root absolute private leaseRoot')
+      fail('LEASE_CONFIG_INVALID', 'target lock requires a non-root absolute private leaseRoot')
     }
     this.leaseRoot = path.resolve(options.leaseRoot)
     this.fs = options.fsImpl || fs
@@ -583,10 +583,12 @@ class MissionLock {
     if (!evidence || evidence.runId !== owner.runId || evidence.activationId !== owner.activationId ||
         evidence.missionHash !== owner.missionHash || evidence.activationNonce !== owner.nonce ||
         evidence.generation !== owner.generation || evidence.targetIdentity !== owner.targetKey ||
-        evidence.state !== 'RELEASING_LOCK' || !HASH_PATTERN.test(evidence.stateChecksum || '') ||
+        !HASH_PATTERN.test(evidence.stateChecksum || '') ||
         !Number.isSafeInteger(evidence.stateEventSequence) || evidence.stateEventSequence < 1 ||
         !HASH_PATTERN.test(evidence.stateEventHash || '') || !HASH_PATTERN.test(evidence.releaseIntentHash || '') ||
-        !['DONE', 'PARTIAL', 'BLOCKED', 'CANCELLED', 'FAILED'].includes(evidence.outcome) ||
+        !((evidence.state === 'PAUSED' && evidence.outcome === 'PAUSED') ||
+          (evidence.state === 'RELEASING_LOCK' &&
+            ['DONE', 'PARTIAL', 'BLOCKED', 'CANCELLED', 'FAILED'].includes(evidence.outcome))) ||
         !validateOwnedIdentityEvidence(ownedIdentityEvidence, owner.ownedProcessHistory) ||
         ownedIdentityEvidence.some((entry) => entry.alive !== false)) {
       fail('LEASE_RELEASE_EVIDENCE_INVALID', 'lease release requires exact runtime intent and per-identity drain evidence')

@@ -551,6 +551,7 @@
         "L0_ROUTE_DECISION",
         "PREPARE_WORK",
         "RUN_WORK",
+        "ITEM_VERIFIED",
         "CHECK_WORK",
         "REASSESS_STRATEGY",
         "CHANGING_ROUTE"
@@ -605,6 +606,7 @@
       "from": [
         "PREPARE_WORK",
         "RUN_WORK",
+        "ITEM_VERIFIED",
         "CHECK_WORK",
         "REPAIRING"
       ],
@@ -617,12 +619,47 @@
       "event": "CHECK_FAILED_FINAL",
       "from": [
         "PREPARE_WORK",
+        "RUN_WORK",
         "CHECK_WORK",
         "REPAIRING"
       ],
       "to": "RELEASING_LOCK",
       "guard": "an authoritative failure remains after its bounded repair allowance or repair made no progress",
       "effect": "prepare FAILED outcome with the exact rejected result and repair evidence"
+    },
+    {
+      "id": "T081",
+      "event": "CONTROLLER_FAILED_FINAL",
+      "from": [
+        "LOAD_SKILL",
+        "STORE_REQUEST_ENVELOPE",
+        "RESOLVE_SETTINGS",
+        "SELECT_SAFE_RUN_ROOT",
+        "CREATE_RUN_RECORD",
+        "CHECK_PROVIDER_CAPABILITIES",
+        "START_ROUTE_ANALYST",
+        "SAVE_ROUTE_ANALYSIS",
+        "L0_ROUTE_DECISION",
+        "PREPARE_WORK",
+        "RUN_WORK",
+        "ITEM_VERIFIED",
+        "CHECK_WORK",
+        "REPAIRING",
+        "CHECK_INCONCLUSIVE",
+        "WORKER_CONTEXT_LOST",
+        "INTEGRATION_CONFLICT",
+        "REASSESS_STRATEGY",
+        "CHANGING_ROUTE",
+        "APPEND_REQUEST_STEERING",
+        "INVALIDATE_AFFECTED_RESULTS",
+        "MIGRATING_CONTRACT",
+        "RESUME_EXACT_STATE",
+        "FINAL_CHECK",
+        "FINALIZING"
+      ],
+      "to": "RELEASING_LOCK",
+      "guard": "a typed internal control failure prevents safe continuation and is not a worker, environment, or authoritative check failure",
+      "effect": "prepare FAILED outcome with the exact internal failure code and retained recovery evidence"
     },
     {
       "id": "T057",
@@ -647,6 +684,10 @@
         "INTEGRATION_CONFLICT",
         "REASSESS_STRATEGY",
         "CHANGING_ROUTE",
+        "APPEND_REQUEST_STEERING",
+        "INVALIDATE_AFFECTED_RESULTS",
+        "MIGRATING_CONTRACT",
+        "RESUME_EXACT_STATE",
         "FINAL_CHECK"
       ],
       "to": "RELEASING_LOCK",
@@ -659,8 +700,10 @@
       "from": [
         "PREPARE_WORK",
         "RUN_WORK",
+        "ITEM_VERIFIED",
         "CHECK_WORK",
-        "REPAIRING"
+        "REPAIRING",
+        "CHECK_INCONCLUSIVE"
       ],
       "to": "PAUSED",
       "guard": "safe exact continuation is possible and no harmful action continues",
@@ -670,10 +713,17 @@
       "id": "T059",
       "event": "BUDGET_EXHAUSTED_FINAL",
       "from": [
+        "START_ROUTE_ANALYST",
+        "SAVE_ROUTE_ANALYSIS",
+        "L0_ROUTE_DECISION",
         "PREPARE_WORK",
         "RUN_WORK",
+        "ITEM_VERIFIED",
         "CHECK_WORK",
-        "REPAIRING"
+        "REPAIRING",
+        "CHECK_INCONCLUSIVE",
+        "FINAL_CHECK",
+        "FINALIZING"
       ],
       "to": "RELEASING_LOCK",
       "guard": "continuation is unavailable or not authorized",
