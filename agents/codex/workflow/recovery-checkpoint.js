@@ -423,6 +423,46 @@ function candidateAdvanceIsCanonical(previous, record, events) {
   return candidateHash === record.checkpoint.immutableHashes.candidateHash
 }
 
+function roadmapRepairPlanAdvanceIsCanonical(previous, record) {
+  const before = previous.checkpoint
+  const after = record.checkpoint
+  const repairId = 'roadmap-author-plan-repair'
+  const recheckId = 'roadmap-plan-recheck'
+  const beforePlanHash = before.immutableHashes.planHash
+  const afterPlanHash = after.immutableHashes.planHash
+  const lease = after.scheduler.leases.length === 1 ? after.scheduler.leases[0] : null
+  const exact = (actual, expected) => stableStringify(actual) === stableStringify(expected)
+
+  const common = before.scheduler.route === 'ROADMAP' && after.scheduler.route === 'ROADMAP' &&
+    before.scheduler.phase === 'RUN_WORK' && after.scheduler.phase === 'RUN_WORK' &&
+    HASH_PATTERN.test(beforePlanHash || '') && HASH_PATTERN.test(afterPlanHash || '') &&
+    beforePlanHash !== afterPlanHash &&
+    before.immutableHashes.routeDecisionHash === after.immutableHashes.routeDecisionHash &&
+    before.immutableHashes.candidateHash === null && after.immutableHashes.candidateHash === null &&
+    before.scheduler.candidate.candidateHash === null && after.scheduler.candidate.candidateHash === null &&
+    before.scheduler.completedWorkIds.includes(repairId) &&
+    !before.scheduler.completedCheckIds.includes(recheckId) &&
+    exact(before.scheduler.openCheckIds, []) &&
+    exact(before.scheduler.nextReadyWorkIds, [recheckId]) &&
+    exact(before.scheduler.leases, [])
+  if (!common) return false
+
+  const admittedRecheck = before.stateEvent.sequence === after.stateEvent.sequence &&
+    before.stateEvent.eventHash === after.stateEvent.eventHash &&
+    exact(after.scheduler.completedWorkIds, before.scheduler.completedWorkIds) &&
+    exact(after.scheduler.completedCheckIds, before.scheduler.completedCheckIds) &&
+    exact(after.scheduler.openCheckIds, [recheckId]) &&
+    exact(after.scheduler.nextReadyWorkIds, [`reconcile:${recheckId}`]) &&
+    record.cause.kind === 'LEASE_STARTED' && lease !== null &&
+    lease.workItemId === recheckId && lease.roleId === 'ap-independent-checker' &&
+    lease.status === 'ADMITTED' && Boolean(lease.reservationId) && Boolean(lease.sessionId) &&
+    Boolean(lease.continuationId) && HASH_PATTERN.test(lease.crashBindingHash || '') &&
+    lease.thread.started === false
+  const crashProjectionAdoption = record.cause.kind === 'CRASH_RECOVERY' &&
+    exact(after.scheduler, before.scheduler)
+  return admittedRecheck || crashProjectionAdoption
+}
+
 class RecoveryCheckpointAuthority {
   constructor(options = {}) {
     if (!options.paths || typeof options.paths.runRecordRoot !== 'string' || typeof options.paths.logPath !== 'string' ||
@@ -443,6 +483,8 @@ class RecoveryCheckpointAuthority {
     this.stateProvider = options.stateProvider
     this.accountingCheckpointVerifier = options.accountingCheckpointVerifier
     this.accountingCheckpointProvider = options.accountingCheckpointProvider
+    this.roadmapPlanAdvanceVerifier = typeof options.roadmapPlanAdvanceVerifier === 'function'
+      ? options.roadmapPlanAdvanceVerifier : null
     this.resultCommitVerifier = options.resultCommitVerifier || null
     this.eventLog = options.eventLog
     this.fs = options.fsImpl || fs
@@ -972,10 +1014,22 @@ class RecoveryCheckpointAuthority {
           fail('RECOVERY_CHECKPOINT_ROLLBACK', `checkpoint changed immutable ${field}`)
         }
       }
-      for (const field of ['routeDecisionHash', 'planHash']) {
-        const prior = previous.checkpoint.immutableHashes[field]
-        if (prior !== null && record.checkpoint.immutableHashes[field] !== prior) {
-          fail('RECOVERY_CHECKPOINT_ROLLBACK', `checkpoint changed bound ${field}`)
+      const priorRouteDecisionHash = previous.checkpoint.immutableHashes.routeDecisionHash
+      if (priorRouteDecisionHash !== null && record.checkpoint.immutableHashes.routeDecisionHash !== priorRouteDecisionHash) {
+        fail('RECOVERY_CHECKPOINT_ROLLBACK', 'checkpoint changed bound routeDecisionHash')
+      }
+      const priorPlanHash = previous.checkpoint.immutableHashes.planHash
+      if (priorPlanHash !== null && record.checkpoint.immutableHashes.planHash !== priorPlanHash) {
+        let verifiedAdvance = false
+        if (roadmapRepairPlanAdvanceIsCanonical(previous, record) && this.roadmapPlanAdvanceVerifier) {
+          try {
+            verifiedAdvance = this.roadmapPlanAdvanceVerifier(previous, record) === true
+          } catch {
+            verifiedAdvance = false
+          }
+        }
+        if (!verifiedAdvance) {
+          fail('RECOVERY_CHECKPOINT_ROLLBACK', 'checkpoint changed bound planHash')
         }
       }
       if (record.checkpoint.immutableHashes.candidateHash !== previous.checkpoint.immutableHashes.candidateHash &&

@@ -156,7 +156,7 @@ test('AP-ROUTE-029 safety cancellation drains before a best-effort checkpoint an
   assert.match(failedCheckpoint.postDrainCheckpoint.error.message, /injected checkpoint failure/)
 })
 
-test('AP-RUN-026 reconstructed failed work cannot join, emit WORK_ITEM_VERIFIED, or reach assurance', () => {
+test('AP-RUN-026 reconstructed failure stays transport-invalid while explicit failed work reaches route handling', () => {
   const requestEnvelopeHash = sha256('reconstructed request')
   const record = {
     logicalRole: 'worker', physicalRole: 'autoprompt.v2.ap-worker',
@@ -174,10 +174,9 @@ test('AP-RUN-026 reconstructed failed work cannot join, emit WORK_ITEM_VERIFIED,
   delete explicitFailure.reconstructedTerminal
   delete explicitFailure.terminalEnvelope
   delete explicitFailure.outcome
-  assert.throws(
-    () => validateCanonicalChildResult(record, explicitFailure, record.runId, requestEnvelopeHash),
-    error => error.code === 'WORK_ITEM_RESULT_FAILED' && error.details.workItemId === 'work-1' &&
-      error.details.reconstructedTerminal === false,
+  assert.equal(
+    validateCanonicalChildResult(record, explicitFailure, record.runId, requestEnvelopeHash),
+    explicitFailure,
   )
 })
 

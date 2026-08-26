@@ -119,9 +119,17 @@ const CHECKER_FALSIFICATION_DOCTRINE = Object.freeze([
   'Derive expected behavior from the request, durable inputs, or an independent source; never from the subject implementation.',
   'For mappings, joins, references, identity, or deduplication, exercise at least three distinct entities and prove both forward consistency and reverse non-collision.',
   'For dates, versions, revocations, merges, migrations, or state transitions, test before, exactly at, between, and after each boundary, including a chained transition.',
-  'For generated or serialized artifacts, reopen the saved deliverable through the actual downstream consumer/export path and prove non-empty requested topology and measurements. A custom or relationship-only parser is never a substitute. A transient consumer runtime failure is RUNTIME_FAILURE. If the exact version being checked lacks a portable downstream-consumer reopen receipt required by acceptance, return FAIL with an implementation unblock path; use CHECK_INCONCLUSIVE only when supplied external evidence is genuinely insufficient and no implementation repair can make the result verifiable.',
+  'For generated or serialized deliverables, use the strongest available independent method and, when available, reopen the saved deliverable through the actual downstream consumer/export path to prove non-empty requested topology and measurements. An unavailable external consumer, tool, library, or portable reopen receipt is a verification limitation: return CHECK_INCONCLUSIVE or RUNTIME_FAILURE, never implementation FAIL, unless that consumer, tool, or receipt is itself an explicitly required user deliverable. A custom or relationship-only parser cannot authorize claims that require the unavailable consumer, but it may still provide bounded independent evidence for every property it can actually establish.',
   'For parsers, sanitizers, interpreters, or security boundaries, test the actual shipped runtime plus encoded, namespaced, malformed, mutation, and interaction-triggered cases. A self-authored substitute parser cannot authorize PASS; if the actual runtime cannot run, return CHECK_INCONCLUSIVE.',
   'A missing positive, negative, or boundary witness is CHECK_INCONCLUSIVE, never PASS.',
+])
+const VERIFICATION_LIMITATION_CODES = new Set([
+  'DEPENDENCY_UNAVAILABLE',
+  'DOWNSTREAM_CONSUMER_RECEIPT_MISSING',
+  'EXTERNAL_CONSUMER_UNAVAILABLE',
+  'EXTERNAL_LIBRARY_UNAVAILABLE',
+  'EXTERNAL_TOOL_UNAVAILABLE',
+  'REQUIRED_CHECK_RUNTIME_UNAVAILABLE',
 ])
 const CONTROLLER_FAILURE_RELEASE_STATES = new Set([
   'LOAD_SKILL', 'STORE_REQUEST_ENVELOPE', 'RESOLVE_SETTINGS', 'SELECT_SAFE_RUN_ROOT',
@@ -230,12 +238,140 @@ function checkerVerdictPassed(logicalRole, result) {
 
 function checkerImplementationFailureFingerprint(result) {
   if (!result || result.code !== 'FAIL') return null
+  const failedObligationIds = result.payload && Array.isArray(result.payload.testOutcomes)
+    ? result.payload.testOutcomes
+        .filter(item => item && item.status === 'FAIL')
+        .map(item => item.command)
+        .filter(value => typeof value === 'string' && value.length > 0)
+        .sort()
+    : []
   return hashText(stableStringify({
     code: result.code,
-    cause: result.cause || null,
-    findingIds: exactFindingIds(result, result.payload, result.cause),
-    findings: result.payload && result.payload.findings || [],
+    causeEvent: result.cause && result.cause.event || null,
+    findingIds: exactFindingIds(result, result.payload, result.cause).sort(),
+    failedObligationIds,
   }))
+}
+
+function checkerFailureIsVerificationLimitation(result) {
+  if (!result || result.code !== 'FAIL') return false
+  const cause = result.cause && typeof result.cause === 'object' ? result.cause : {}
+  const payload = result.payload && typeof result.payload === 'object' ? result.payload : {}
+  const limitation = payload.verificationLimitation &&
+    typeof payload.verificationLimitation === 'object' &&
+    !Array.isArray(payload.verificationLimitation)
+    ? payload.verificationLimitation : null
+  const limitationKeys = limitation ? Object.keys(limitation).sort() : []
+  if (!limitation || stableStringify(limitationKeys) !== stableStringify([
+    'capabilityId', 'explicitUserDeliverable', 'kind', 'observedVersionDefectIds',
+  ]) || limitation.kind !== 'CAPABILITY_UNAVAILABLE' ||
+      typeof limitation.capabilityId !== 'string' ||
+      !/^[a-z0-9][a-z0-9._:-]{0,127}$/u.test(limitation.capabilityId) ||
+      typeof limitation.explicitUserDeliverable !== 'boolean' ||
+      !uniqueStrings(limitation.observedVersionDefectIds) ||
+      limitation.observedVersionDefectIds.some(id => id.length > 256)) return false
+  if (limitation.explicitUserDeliverable || limitation.observedVersionDefectIds.length > 0) return false
+  const codes = [cause.code, cause.event, cause.status, payload.code, payload.status]
+    .filter(value => typeof value === 'string')
+    .map(value => value.trim().toUpperCase())
+  return codes.some(code => VERIFICATION_LIMITATION_CODES.has(code))
+}
+
+function canonicalizeCheckerVerificationLimitation(result) {
+  if (!checkerFailureIsVerificationLimitation(result)) return result
+  const cause = result.cause && typeof result.cause === 'object' ? result.cause : {}
+  return {
+    ...result,
+    code: 'CHECK_INCONCLUSIVE',
+    description: 'A required check could not determine whether the exact result passes.',
+    stateClass: 'intermediate',
+    cause: {
+      event: typeof cause.event === 'string' && /^[A-Z][A-Z0-9_]+$/u.test(cause.event)
+        ? cause.event : 'DEPENDENCY_UNAVAILABLE',
+      reason: typeof cause.reason === 'string' && cause.reason.length > 0
+        ? cause.reason : 'the checker reported an unavailable external verification capability',
+      unblockPath: typeof cause.unblockPath === 'string' && cause.unblockPath.length > 0
+        ? cause.unblockPath : null,
+    },
+  }
+}
+
+function unsuccessfulWorkTerminal(workItemId, result) {
+  const failedSuccessItemIds = Array.isArray(result && result.successItems)
+    ? result.successItems
+        .filter(item => !item || item.status !== 'pass')
+        .map(item => item && (item.id || item.successItemId))
+        .filter(value => typeof value === 'string' && value.length > 0)
+        .slice(0, 32)
+    : []
+  return Object.freeze({
+    outcome: 'FAILED',
+    terminalEnvelope: Object.freeze({
+      code: 'IMPLEMENTATION_WORK_UNSUCCESSFUL',
+      status: 'IMPLEMENTATION_WORK_UNSUCCESSFUL',
+      reason: 'the implementation worker explicitly reported that its assigned implementation and author-side checks did not pass',
+      workItemId,
+      workResultHash: hashText(stableStringify(result)),
+      failedSuccessItemIds: Object.freeze(failedSuccessItemIds),
+    }),
+  })
+}
+
+function canonicalRejectedCheckerReceipts(value, options = {}) {
+  const allowEmpty = options.allowEmpty !== false
+  const receipts = value === undefined || value === null ? [] : value
+  if (!Array.isArray(receipts) || (!allowEmpty && receipts.length === 0)) {
+    throw new SupervisorIntegrationError(
+      'REPAIR_RECOVERY_INVALID',
+      `cumulative checker receipt evidence must contain ${allowEmpty ? 'zero or more' : 'one or more'} bounded pointers`,
+    )
+  }
+  const expectedKeys = ['bytes', 'hash', 'name', 'path', 'resultHash']
+  const seen = new Set()
+  const canonical = receipts.map(receipt => {
+    const keys = receipt && typeof receipt === 'object' && !Array.isArray(receipt)
+      ? Object.keys(receipt).sort() : []
+    if (stableStringify(keys) !== stableStringify(expectedKeys) ||
+        !/^independent-check-\d+(?:-repair-\d+)?(?:-runtime-retry-1)?$/u.test(receipt && receipt.name || '') ||
+        typeof receipt.path !== 'string' || !path.isAbsolute(receipt.path) || receipt.path.length > 4096 ||
+        !/^[a-f0-9]{64}$/u.test(receipt.hash || '') ||
+        !/^[a-f0-9]{64}$/u.test(receipt.resultHash || '') ||
+        !Number.isSafeInteger(receipt.bytes) || receipt.bytes < 1) {
+      throw new SupervisorIntegrationError(
+        'REPAIR_RECOVERY_INVALID',
+        'cumulative checker receipt evidence contains a malformed or unbounded pointer',
+      )
+    }
+    const identity = stableStringify([receipt.name, receipt.hash, receipt.resultHash])
+    if (seen.has(identity)) {
+      throw new SupervisorIntegrationError(
+        'REPAIR_RECOVERY_INVALID',
+        'cumulative checker receipt evidence contains a duplicate pointer',
+      )
+    }
+    seen.add(identity)
+    return Object.freeze({
+      name: receipt.name, path: receipt.path, hash: receipt.hash,
+      bytes: receipt.bytes, resultHash: receipt.resultHash,
+    })
+  })
+  return Object.freeze(canonical)
+}
+
+function appendRejectedCheckerReceipt(receipts, pointer, resultHash) {
+  const prior = canonicalRejectedCheckerReceipts(receipts)
+  const next = {
+    name: pointer && pointer.name,
+    path: pointer && pointer.path,
+    hash: pointer && pointer.hash,
+    bytes: pointer && pointer.bytes,
+    resultHash,
+  }
+  const identity = stableStringify([next.name, next.hash, next.resultHash])
+  const appended = prior.filter(item =>
+    stableStringify([item.name, item.hash, item.resultHash]) !== identity)
+  appended.push(next)
+  return canonicalRejectedCheckerReceipts(appended, { allowEmpty: false })
 }
 
 function roadmapPlanOracleForWorkItem(workItemId) {
@@ -3415,7 +3551,10 @@ class CodexExecAdapter {
       // into the missing-terminal reconstruction path.
       typedTerminal = output.outcome || output.code || output.reportType ||
         output.preWorkResult || output.status || 'STRUCTURED_RESULT'
-      committedTerminalResult = Object.freeze(assembledResult(snapshot, true, output))
+      const assembled = assembledResult(snapshot, true, output)
+      committedTerminalResult = Object.freeze(typeof record.normalizeTerminalResult === 'function'
+        ? record.normalizeTerminalResult(assembled)
+        : assembled)
       if (typeof record.onTerminalResult === 'function') {
         record.onTerminalResult(committedTerminalResult, {
           rawOutputHash: snapshot.rawOutputHash || rawOutputHash.copy().digest('hex'),
@@ -3636,7 +3775,10 @@ class CodexExecAdapter {
         !typedChildOutputReady(parsed.output, record)) {
       parsed.output = reconstructTypedExitZeroResult(record, parsed)
     }
-    const returned = assembledResult(parsed, Boolean(typedTerminal) || Boolean(parsed.usage))
+    const assembled = assembledResult(parsed, Boolean(typedTerminal) || Boolean(parsed.usage))
+    const returned = typeof record.normalizeTerminalResult === 'function'
+      ? record.normalizeTerminalResult(assembled)
+      : assembled
     if (typeof record.onTerminalResult === 'function' && !terminalReceiptPersisted) {
       record.onTerminalResult(returned, {
         rawOutputHash: parsed.rawOutputHash || rawOutputHash.copy().digest('hex'),
@@ -3907,7 +4049,8 @@ async function withTimeout(operation, milliseconds, timerApi, code, onTimeout) {
   })
 }
 
-function persistTerminalSession(controller, sessionId, details, primaryError = null) {
+function persistTerminalSession(controller, sessionId, details, primaryError) {
+  const hasPrimaryError = arguments.length >= 4
   const persistenceFailures = []
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
@@ -3916,11 +4059,14 @@ function persistTerminalSession(controller, sessionId, details, primaryError = n
       persistenceFailures.push({ attempt, ...serializeError(error) })
     }
   }
-  if (primaryError && (typeof primaryError === 'object' || typeof primaryError === 'function')) {
-    primaryError.terminalPersistenceFailure = Object.freeze({
-      code: 'SESSION_TERMINAL_PERSIST_FAILED',
-      attempts: Object.freeze(persistenceFailures.map(item => Object.freeze(item))),
-    })
+  if (hasPrimaryError) {
+    if ((typeof primaryError === 'object' || typeof primaryError === 'function') &&
+        Object.isExtensible(primaryError)) {
+      primaryError.terminalPersistenceFailure = Object.freeze({
+        code: 'SESSION_TERMINAL_PERSIST_FAILED',
+        attempts: Object.freeze(persistenceFailures.map(item => Object.freeze(item))),
+      })
+    }
     throw primaryError
   }
   throw new SupervisorIntegrationError(
@@ -3928,6 +4074,18 @@ function persistTerminalSession(controller, sessionId, details, primaryError = n
     'terminal session persistence failed after its bounded retry',
     { sessionId, persistenceFailures },
   )
+}
+
+function failSchedulerLease(lease, error) {
+  try {
+    lease.fail(error, error && error.usage ? error.usage : {})
+  } catch (accountingError) {
+    // Never let a secondary incomplete-usage finding erase the primary
+    // launch/checkpoint failure. The scheduler has already released the lease.
+    if (error && (typeof error === 'object' || typeof error === 'function') && Object.isExtensible(error)) {
+      error.accountingFailure = serializeError(accountingError)
+    }
+  }
 }
 
 function validateRuntimeDependencies(options) {
@@ -4207,9 +4365,15 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
     let retryState = currentState.retryState || {}
     if (eventId === 'REPAIR_READY') {
       const pending = retryState.pendingImplementationRepair
+      const cumulativeReceipts = canonicalRejectedCheckerReceipts(
+        retryState.cumulativeRejectedCheckerReceipts,
+        { allowEmpty: false },
+      )
       if (!pending || pending.repairWorkItemId !== details.repairWorkItemId ||
           pending.repairAttempt !== details.repairAttempt ||
-          pending.rejectedCandidateHash !== details.priorCandidateHash) {
+          pending.rejectedCandidateHash !== details.priorCandidateHash ||
+          stableStringify(pending.rejectedCheckerReceipts) !== stableStringify(cumulativeReceipts) ||
+          stableStringify(details.rejectedCheckerReceipts) !== stableStringify(cumulativeReceipts)) {
         throw new SupervisorIntegrationError(
           'REPAIR_RECOVERY_INVALID',
           'repaired exact version does not close its exact durable pending repair',
@@ -4274,10 +4438,30 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
         'implementation repair requires its exact rejected version, checker result, receipt, and physical repair identity',
       )
     }
+    const priorReceipts = canonicalRejectedCheckerReceipts(
+      retryState.cumulativeRejectedCheckerReceipts,
+    )
+    const expectedReceipts = appendRejectedCheckerReceipt(
+      priorReceipts,
+      details.checkerReceiptPointer,
+      details.checkerResultHash,
+    )
+    const rejectedCheckerReceipts = canonicalRejectedCheckerReceipts(
+      details.rejectedCheckerReceipts,
+      { allowEmpty: false },
+    )
+    if (stableStringify(rejectedCheckerReceipts) !== stableStringify(expectedReceipts)) {
+      throw new SupervisorIntegrationError(
+        'REPAIR_RECOVERY_INVALID',
+        'implementation repair cumulative checker receipts do not extend the durable bounded ledger',
+      )
+    }
+    retryState.cumulativeRejectedCheckerReceipts = rejectedCheckerReceipts
     retryState.pendingImplementationRepair = {
       checkerId: details.checkerId,
       checkerResultHash: details.checkerResultHash,
       checkerReceiptPointer: details.checkerReceiptPointer,
+      rejectedCheckerReceipts,
       rejectedCandidateHash: details.candidateHash,
       repairAttempt: details.repairAttempt,
       repairWorkItemId: details.repairWorkItemId,
@@ -5664,7 +5848,7 @@ class CodexSupervisorRuntime {
         if (committed) armRootCorrectionRotation(committed.receiptHash)
         submitted = committed ? committed.submitted : await decide(correctionAttempts)
       } catch (error) {
-        if (error.code === 'ROUTE_DECISION_TIMEOUT') {
+        if (error && error.code === 'ROUTE_DECISION_TIMEOUT') {
           try { rootLease.fail(error, {}) } catch {}
           persistTerminalSession(this.budget, rootSessionId, { status: 'FAILED', evidenceHashes: [] }, error)
           await this._runtimeTransition('ROUTE_DECISION_TIMEOUT', 'RELEASING_LOCK')
@@ -7549,6 +7733,18 @@ class CodexSupervisorRuntime {
       })
       lease = await scheduler.acquireWithAuthority(authority, schedulerRequest)
     }
+    const sessionId = `${this.activation.id}:${request.route}:${lease.id}`
+    let budgetSessionStarted = Boolean(adoptedLease)
+    let externalOperation = null
+    let streamedRouteEventCount = 0
+    let leaseSettled = false
+    let mutationPermit = null
+    let mutationBefore = null
+    let mutationAdmission = null
+    let pendingDeferredPromotion = null
+    let deferredPromotionHandle = null
+    let checkerSnapshotBefore = null
+    try {
     if (!adoptedLease && request.route !== 'PRE_ROUTE' && !this.firstChildStartupRecorded) {
       const startupAdmission = scheduler.recordAdmissionComponent(
         'firstChildStartup',
@@ -7562,12 +7758,10 @@ class CodexSupervisorRuntime {
           'first admitted child startup exceeded the canonical admission ceiling',
           startupAdmission || {},
         )
-        lease.fail(error, { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 })
         throw error
       }
     }
-    const sessionId = `${this.activation.id}:${request.route}:${lease.id}`
-    const externalOperation = this._defaultExternalOperation(request, canonicalAssignment)
+    externalOperation = this._defaultExternalOperation(request, canonicalAssignment)
     const recoveryFrontier = adoptedBinding ? adoptedBinding.frontier : {
       resumeState: request.route === 'PRE_ROUTE' ? 'SAVE_ROUTE_ANALYSIS' : 'CHECK_WORK',
       nextReadyWorkIds: request.route === 'PRE_ROUTE'
@@ -7588,7 +7782,6 @@ class CodexSupervisorRuntime {
         'PROVIDER_UNSUPPORTED',
         'central scheduler lacks canonical live crash adoption',
       )
-      lease.fail(error, { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 })
       throw error
     }
     let identifiedContinuationId = continuationId
@@ -7668,11 +7861,11 @@ class CodexSupervisorRuntime {
         forWork: request.purpose !== 'recovery',
         forExecution: !protectedDeadlinePurpose(request.purpose),
       })
+      budgetSessionStarted = true
     }
     persistSchedulerCheckpoint(continuationId, 'LEASE_STARTED')
     if (externalOperation) persistSchedulerCheckpoint(continuationId, 'EXTERNAL_OPERATION')
     const transcriptReferences = []
-    let streamedRouteEventCount = 0
     let transcriptStore = null
     if (typeof this.options.transcriptStoreFactory === 'function') {
       transcriptStore = this.options.transcriptStoreFactory({ request, sessionId, record: this.record })
@@ -7760,6 +7953,8 @@ class CodexSupervisorRuntime {
               ? signal.elapsedMs : Math.max(0, this.monotonicNow() - this.admissionStartedAt),
           }),
       onSessionIdentified: (identified, evidence) => persistSchedulerCheckpoint(identified, 'THREAD_STARTED', evidence),
+      normalizeTerminalResult: CHECKER_ROLES.has(policy.child)
+        ? canonicalizeCheckerVerificationLimitation : null,
       onTerminalResult: (terminalResult, terminalEvidence) => {
         try {
           validateCanonicalChildResult({
@@ -7964,21 +8159,14 @@ class CodexSupervisorRuntime {
       environment: { GIT_ALLOW_PROTOCOL: env.GIT_ALLOW_PROTOCOL },
       onUsageDelta: '[scheduler-bound]',
     })
-    let leaseSettled = false
-    let mutationPermit = null
-    let mutationBefore = null
-    let mutationAdmission = null
-    let pendingDeferredPromotion = null
-    let deferredPromotionHandle = null
     const enforceRealTargetDenial = path.resolve(workingDirectory) !== path.resolve(this.options.targetPath) ||
       Boolean(canonicalAssignment && canonicalAssignment.resources.every(resource => resource.access === 'read'))
     const realTargetBefore = enforceRealTargetDenial
       ? workspaceFileSnapshot(this.options.targetPath, this.options.gitEnvironment(this.options.targetPath))
       : null
-    const checkerSnapshotBefore = CHECKER_ROLES.has(policy.child)
+    checkerSnapshotBefore = CHECKER_ROLES.has(policy.child)
       ? hashWorkspaceCandidate(targetWorkingDirectory, this.options.gitEnvironment(targetWorkingDirectory))
       : null
-    try {
       if (TARGET_MUTATOR_ROLES.has(policy.child) && canonicalAssignment && this.options.mutationEnforcer) {
         if (!this.record || typeof this.record.writePreMutationBaseline !== 'function' ||
             typeof this.record.readPreMutationBaseline !== 'function' ||
@@ -8300,6 +8488,7 @@ class CodexSupervisorRuntime {
         })
       }
       this.budget.endSession(sessionId, { status: 'DONE', evidenceHashes: result && result.evidenceHashes || [] })
+      budgetSessionStarted = false
       this.budget.assertAvailable({ forWork: request.purpose !== 'recovery' })
       const returned = { ...result, transcriptEvidence: transcriptReferences }
       Object.defineProperty(returned, STREAMED_ROUTE_EVENT_COUNT, { value: streamedRouteEventCount })
@@ -8384,17 +8573,13 @@ class CodexSupervisorRuntime {
         }
       }
       if (!leaseSettled) {
-        try { lease.fail(error, error && error.usage ? error.usage : {}) } catch (accountingError) {
-          // Never let a secondary incomplete-usage finding erase the primary
-          // physical-role, ownership, or CAS rejection.  The scheduler is
-          // disposed during terminal release and the missing usage remains
-          // attached as explicit evidence rather than being fabricated.
-          error.accountingFailure = serializeError(accountingError)
-        }
+        failSchedulerLease(lease, error)
       }
-      persistTerminalSession(this.budget, sessionId, {
-        status: error.code === 'MISSION_TIMEOUT' ? 'PARTIAL' : 'FAILED', evidenceHashes: [],
-      }, error)
+      if (budgetSessionStarted) {
+        persistTerminalSession(this.budget, sessionId, {
+          status: error && error.code === 'MISSION_TIMEOUT' ? 'PARTIAL' : 'FAILED', evidenceHashes: [],
+        }, error)
+      }
       throw error
     }
   }
@@ -10160,23 +10345,12 @@ function validateCanonicalChildResult(record, result, runId, requestEnvelopeHash
       },
     )
   }
-  if (result.allAssignedItemsPass !== true) {
-    if (result.reconstructedTerminal === true) {
-      throw new SupervisorIntegrationError(
-        'CODEX_TYPED_TERMINAL_MISSING',
-        'the completed Codex turn did not contain an eligible schema-valid terminal work result',
-        {
-          workItemId: record.workItemId,
-          terminalStatus: result.terminalEnvelope && result.terminalEnvelope.status || null,
-        },
-      )
-    }
+  if (result.allAssignedItemsPass === false && result.reconstructedTerminal === true) {
     throw new SupervisorIntegrationError(
-      'WORK_ITEM_RESULT_FAILED',
-      'a failed work result is durable failure evidence, not a verified work-item completion',
+      'CODEX_TYPED_TERMINAL_MISSING',
+      'the completed Codex turn did not contain an eligible schema-valid terminal work result',
       {
         workItemId: record.workItemId,
-        reconstructedTerminal: result.reconstructedTerminal === true,
         terminalStatus: result.terminalEnvelope && result.terminalEnvelope.status || null,
       },
     )
@@ -10775,7 +10949,7 @@ function createDefaultRouteExecutor(options) {
     const executionOwnership = executionMutableResourceOwnership(decision, route, workerCount)
     const launchChecker = async request => {
       try {
-        return await launch(request)
+        return canonicalizeCheckerVerificationLimitation(await launch(request))
       } catch (error) {
         if (!CHECKER_LAUNCH_REASSESSMENT_CODES.has(error && error.code)) throw error
         return checkerLaunchRuntimeFailure(request, decision, options.runId, error)
@@ -11884,6 +12058,7 @@ function createDefaultRouteExecutor(options) {
     const requiredWorkIds = Array.from({ length: workerCount }, (_, index) => `work-${index + 1}`)
     const satisfiedWorkIds = new Set(completedBeforeResume)
     let deferredPromotion = null
+    let adoptedUnsuccessfulWork = null
     if (doneRetryBoundary && resumeAtChecking) {
       if (typeof options.restoreDeferredPromotion !== 'function') {
         throw new SupervisorIntegrationError(
@@ -11904,14 +12079,24 @@ function createDefaultRouteExecutor(options) {
     for (const workItemId of requiredWorkIds) {
       if (adoptedWorkResults[workItemId]) {
         if (adoptedWorkResults[workItemId].allAssignedItemsPass === false) {
-          throw new SupervisorIntegrationError(
-            'WORK_ITEM_RESULT_FAILED',
-            'an adopted failed work result cannot enter the satisfied work set',
-            { workItemId, reconstructedTerminal: adoptedWorkResults[workItemId].reconstructedTerminal === true },
-          )
+          if (adoptedWorkResults[workItemId].reconstructedTerminal === true) {
+            throw new SupervisorIntegrationError(
+              'CODEX_TYPED_TERMINAL_MISSING',
+              'an adopted completed Codex turn lacks an eligible schema-valid terminal work result',
+              { workItemId },
+            )
+          }
+          adoptedUnsuccessfulWork = unsuccessfulWorkTerminal(workItemId, adoptedWorkResults[workItemId])
+          continue
         }
         satisfiedWorkIds.add(workItemId)
       }
+    }
+    if (adoptedUnsuccessfulWork) {
+      if (deferredPromotion) await deferredPromotion.abort('implementation worker reported an unsuccessful assignment')
+      if (retainedManager && retainedManager.completed !== true) completeRetainedLease(retainedManager)
+      if (retainedCoordinator && retainedCoordinator.completed !== true) completeRetainedLease(retainedCoordinator)
+      return adoptedUnsuccessfulWork
     }
     try {
       if (resumeAtChecking) {
@@ -12076,11 +12261,8 @@ function createDefaultRouteExecutor(options) {
           deferredPromotion = workResult.deferredPromotion
         }
         if (workResult && workResult.allAssignedItemsPass === false) {
-          throw new SupervisorIntegrationError(
-            'WORK_ITEM_RESULT_FAILED',
-            'a failed work result cannot be verified or enter the satisfied work set',
-            { workItemId, reconstructedTerminal: workResult.reconstructedTerminal === true },
-          )
+          if (deferredPromotion) await deferredPromotion.abort('implementation worker reported an unsuccessful assignment')
+          return unsuccessfulWorkTerminal(workItemId, workResult)
         }
         acceptedWorkResults.set(workItemId, workResult)
         satisfiedWorkIds.add(workItemId)
@@ -12377,8 +12559,7 @@ function createDefaultRouteExecutor(options) {
       const repeatedFailure = priorFailureFingerprints.has(
         checkerImplementationFailureFingerprint(result),
       )
-      const repairEligible = (result.code === 'FAIL' ||
-          (result.code === 'CHECK_INCONCLUSIVE' && sourceKind === 'retry-result')) &&
+      const repairEligible = result.code === 'FAIL' &&
         !repeatedFailure &&
         workerCount === 1 && !doneRetryBoundary
       const expectedNext = sourceKind === 'retry'
@@ -12538,6 +12719,46 @@ function createDefaultRouteExecutor(options) {
     let checkerRuntimeReasons = Array.from({ length: checkerCount }, () => null)
     let checkerControllerAcceptedResults = Array.from({ length: checkerCount }, () => null)
     const rejectedImplementationFingerprints = new Set()
+    const cumulativeRejectedCheckerReceipts = [...canonicalRejectedCheckerReceipts(
+      resumeState && resumeState.retryState &&
+        resumeState.retryState.cumulativeRejectedCheckerReceipts,
+    )]
+    if (cumulativeRejectedCheckerReceipts.length > 0) {
+      if (typeof options.resultPointer !== 'function' || typeof options.readResult !== 'function') {
+        throw new SupervisorIntegrationError(
+          'REPAIR_RECOVERY_INVALID',
+          'durable cumulative checker receipts require exact result readers on resume',
+        )
+      }
+      for (const receipt of cumulativeRejectedCheckerReceipts) {
+        const pointer = options.resultPointer(receipt.name)
+        const result = options.readResult(receipt.name)
+        const actualPointer = pointer && {
+          name: pointer.name, path: pointer.path, hash: pointer.hash, bytes: pointer.bytes,
+        }
+        const expectedPointer = {
+          name: receipt.name, path: receipt.path, hash: receipt.hash, bytes: receipt.bytes,
+        }
+        if (!result || hashText(JSON.stringify(result)) !== receipt.resultHash ||
+            stableStringify(actualPointer) !== stableStringify(expectedPointer)) {
+          throw new SupervisorIntegrationError(
+            'REPAIR_RECOVERY_INVALID',
+            `durable cumulative checker receipt ${receipt.name} differs from its exact result bytes`,
+          )
+        }
+      }
+    }
+    const rememberRejectedCheckerReceipt = (pointer, resultHash) => {
+      const next = appendRejectedCheckerReceipt(
+        cumulativeRejectedCheckerReceipts,
+        pointer,
+        resultHash,
+      )
+      cumulativeRejectedCheckerReceipts.splice(0, cumulativeRejectedCheckerReceipts.length, ...next)
+      return cumulativeRejectedCheckerReceipts.map(item => ({ ...item }))
+    }
+    const cumulativeRepairAssignment =
+      'Repair the full cumulative union of independently reproduced implementation defects referenced by fetchedEvidence.rejectedCheckerReceipts; do not assume the latest receipt is exhaustive. Generalize each fix beyond the reported examples, preserve all passing behavior, and run the complete named and pre-existing regression matrix before returning one changed independently verifiable version. Read large evidence through its authenticated pointer and use only bounded previews; never paste or dump full deliverables, logs, or transcripts.'
     const pendingRepairRecovery = resumeRepairing
       ? resumeState && resumeState.retryState && resumeState.retryState.pendingImplementationRepair
       : durableIndependentFrontier && durableIndependentFrontier.kind === 'repair'
@@ -12545,6 +12766,11 @@ function createDefaultRouteExecutor(options) {
             checkerId: durableIndependentFrontier.checkerId,
             checkerResultHash: durableIndependentFrontier.checkerResultHash,
             checkerReceiptPointer: durableIndependentFrontier.pointer,
+            rejectedCheckerReceipts: appendRejectedCheckerReceipt(
+              cumulativeRejectedCheckerReceipts,
+              durableIndependentFrontier.pointer,
+              durableIndependentFrontier.checkerResultHash,
+            ),
             rejectedCandidateHash: candidateHash,
             repairAttempt: durableIndependentFrontier.repairAttempt,
             repairWorkItemId: durableIndependentFrontier.nextReadyId,
@@ -12559,6 +12785,12 @@ function createDefaultRouteExecutor(options) {
           stableStringify(resumeState && resumeState.nextReadyWorkIds) !==
             stableStringify([pending.repairWorkItemId]) ||
           !/^[a-f0-9]{64}$/u.test(pending.checkerResultHash || '') ||
+          stableStringify(pending.rejectedCheckerReceipts) !==
+            stableStringify(appendRejectedCheckerReceipt(
+              cumulativeRejectedCheckerReceipts,
+              pending.checkerReceiptPointer,
+              pending.checkerResultHash,
+            )) ||
           typeof options.resultPointer !== 'function' || typeof options.readResult !== 'function') {
         throw new SupervisorIntegrationError(
           'REPAIR_RECOVERY_INVALID',
@@ -12574,12 +12806,29 @@ function createDefaultRouteExecutor(options) {
           'REPAIRING resume checker result or receipt differs from the durable repair binding',
         )
       }
+      if (checkerResult.code !== 'FAIL') {
+        if (deferredPromotion) await deferredPromotion.abort('non-authoritative checker evidence cannot authorize implementation repair')
+        return {
+          outcome: 'PARTIAL', checkHashes: [],
+          terminalEnvelope: {
+            ...checkerResult,
+            status: 'CHECK_REMAINS_INCONCLUSIVE',
+            reason: checkerResult.cause && checkerResult.cause.reason ||
+              'the durable checker evidence is non-authoritative and cannot authorize implementation repair',
+          },
+        }
+      }
+      const rejectedCheckerReceipts = rememberRejectedCheckerReceipt(
+        checkerReceiptPointer,
+        pending.checkerResultHash,
+      )
       if (!resumeRepairing) {
         await options.transition('IMPLEMENTATION_DEFECT', 'REPAIRING', {
           candidateHash: pending.rejectedCandidateHash,
           checkerId: pending.checkerId,
           checkerResultHash: pending.checkerResultHash,
           checkerReceiptPointer,
+          rejectedCheckerReceipts,
           repairAttempt: pending.repairAttempt,
           repairWorkItemId: pending.repairWorkItemId,
           nextReadyWorkIds: [pending.repairWorkItemId],
@@ -12589,10 +12838,9 @@ function createDefaultRouteExecutor(options) {
         options.readResult(pending.repairWorkItemId) || await launch({
           workItemId: pending.repairWorkItemId,
           logicalRole: 'worker', parent: 'run-owner', purpose: 'work',
-          repairOf: 'work-1', executorKey: 'work-1',
-          assignment: checkerResult.code === 'CHECK_INCONCLUSIVE'
-            ? 'Remediate the verification blocker in the bound independent-check receipt. Preserve passing behavior, replace non-portable or self-verified output when necessary, execute the authoritative acceptance commands, and return a changed independently verifiable exact version.'
-            : 'Repair only the implementation defects in the bound independent-check receipt. Preserve passing behavior, execute the authoritative acceptance commands, and return a newly verified exact version.',
+          executorKey: pending.repairWorkItemId,
+          forkTurns: 'none',
+          assignment: cumulativeRepairAssignment,
           ownership: executionOwnership.length
             ? executionOwnership.filter(item => item && item.owner === 'worker-1').map(item => ({ ...item }))
             : ['workspace'],
@@ -12600,6 +12848,7 @@ function createDefaultRouteExecutor(options) {
           fetchedEvidence: withDescriptiveLikelyAreas({
             ...(capturedDomainWorkEvidence || {}),
             rejectedCheckerReceipt: checkerReceiptPointer,
+            rejectedCheckerReceipts,
             rejectedCandidateHash: pending.rejectedCandidateHash,
             checkerResultHash: pending.checkerResultHash,
           }),
@@ -12609,12 +12858,25 @@ function createDefaultRouteExecutor(options) {
           difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
           risk: 'high', nextReadyAfter: [`independent-check-1-repair-${pending.repairAttempt}`],
         })
-      if (!repairResult || repairResult.allAssignedItemsPass === false) {
+      if (!repairResult) {
         throw new SupervisorIntegrationError(
-          'WORK_ITEM_RESULT_FAILED',
-          'resumed same-worker checker repair did not return a verified work result',
+          'WORK_ITEM_RESULT_MISSING',
+          'resumed checker repair did not return a durable work result',
           { repairWorkItemId: pending.repairWorkItemId, checkerResultHash: pending.checkerResultHash },
         )
+      }
+      if (repairResult.allAssignedItemsPass === false) {
+        return {
+          outcome: 'FAILED', checkHashes: [],
+          terminalEnvelope: {
+            code: 'IMPLEMENTATION_REPAIR_UNSUCCESSFUL',
+            status: 'IMPLEMENTATION_REPAIR_UNSUCCESSFUL',
+            reason: 'the fresh full-set repair worker could not repair the cumulative checker defect set',
+            repairWorkItemId: pending.repairWorkItemId,
+            checkerIds: rejectedCheckerReceipts.map(item => item.name),
+            checkerResultHashes: rejectedCheckerReceipts.map(item => item.resultHash),
+          },
+        }
       }
       const repairedCandidateHash = hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
       if (repairedCandidateHash === pending.rejectedCandidateHash) {
@@ -12622,7 +12884,7 @@ function createDefaultRouteExecutor(options) {
           outcome: 'FAILED', checkHashes: [],
           terminalEnvelope: {
             status: 'REPAIR_NO_PROGRESS',
-            reason: 'the resumed bounded same-worker repair did not produce a changed exact version',
+            reason: 'the resumed bounded fresh-context repair did not produce a changed exact version',
             candidateHash: pending.rejectedCandidateHash,
             checkerResultHash: pending.checkerResultHash,
           },
@@ -12644,6 +12906,7 @@ function createDefaultRouteExecutor(options) {
         })),
         environmentHash: hashEnvironment(options.gitEnvironment()),
         checkerResultHash: pending.checkerResultHash,
+        rejectedCheckerReceipts,
         repairWorkItemId: pending.repairWorkItemId,
         repairAttempt: checkerRepairAttempt,
         nextReadyWorkIds: [`independent-check-1-repair-${checkerRepairAttempt}`],
@@ -12721,8 +12984,6 @@ function createDefaultRouteExecutor(options) {
       let workItemId
       let result
       let reusedControllerResult = false
-      let repairNonAuthoritativeCheck = false
-      let repairNonAuthoritativeFingerprint = null
       if (checkerControllerAcceptedResults[index]) {
         ({ workItemId, result } = checkerControllerAcceptedResults[index])
         reusedControllerResult = true
@@ -12769,6 +13030,9 @@ function createDefaultRouteExecutor(options) {
           ' Return the immutable underlying evidence identifiers you actually consumed in payload.evidenceIds; acceptance-check labels are not evidence identifiers.' +
           ' Return payload.referenceMethod with methodClass exactly equal to one of requirements-review, authoritative-suite, black-box-boundary, metamorphic-property, or independent-model; also return source, procedure, expectedOutputDerivedFromSubjectCode=false, subjectLogicReimplemented=false, and non-empty positiveInvariants, negativeInvariants, and boundaryInvariants. Execute every accessible pre-existing test and acceptance command; do not substitute only self-authored examples. Expected results must come from an independent source or property. Follow fetchedEvidence.verificationDoctrine exactly; treat PASS as an attempted falsification, not a plausibility review.' +
           ' Named checks are acceptance obligations and may be descriptive labels, not shell commands. Never report a missing executable merely because a named check is prose. Choose and execute a suitable independent procedure for each obligation; do not repeat an unavailable procedure on retry.' +
+          ' When an external verification capability is unavailable, set payload.verificationLimitation to {kind:"CAPABILITY_UNAVAILABLE", capabilityId, explicitUserDeliverable, observedVersionDefectIds}; set explicitUserDeliverable=true when that capability or receipt is itself requested, and list every independently observed exact-version defect ID. Never describe an observed exact-version defect as a capability limitation.' +
+          ' Execute the complete applicable test matrix and continue falsification after the first failure. Enumerate every reproducible defect you can establish across positive, negative, boundary, interaction, and regression cases; never report only the first example.' +
+          ' For large deliverables, logs, command output, or transcripts, return only hashes, authenticated pointers, and bounded diagnostic previews. Never paste or dump a full large deliverable, log, or transcript into the report.' +
           ' Return payload.testOutcomes with one entry for every named check: command must preserve the named check as its stable identifier, status must be PASS or FAIL, and fingerprint must be the lowercase SHA-256 digest of the independent observation.',
         candidateHash, oracle, success: successes, checks: checkerNamedChecks,
         isolation: 'snapshot',
@@ -12836,28 +13100,7 @@ function createDefaultRouteExecutor(options) {
           checkerRuntimeRetries[index] = 1
           continue
         }
-        const nonAuthoritativeRepairFingerprint = result && result.code === 'CHECK_INCONCLUSIVE'
-          ? hashText(stableStringify({
-              code: result.code,
-              cause: result.cause || null,
-              findings: result.payload && result.payload.findings || [],
-            }))
-          : null
-        const canRemediateNonAuthoritativeCheck = nonAuthoritativeRepairFingerprint &&
-          !rejectedImplementationFingerprints.has(nonAuthoritativeRepairFingerprint) &&
-          workerCount === 1 && !doneRetryBoundary && typeof options.resultPointer === 'function'
-        if (nonAuthoritative && canRemediateNonAuthoritativeCheck) {
-          await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
-            candidateHash,
-            checkerId: workItemId,
-            checkerResultHash: rawCheckerResultHash,
-            retryAttempt,
-            controllerReason: 'CHECK_REQUIRES_IMPLEMENTATION_REMEDIATION',
-            nextReadyWorkIds: [`work-1-repair-${checkerRepairAttempt + 1}`],
-          })
-          repairNonAuthoritativeCheck = true
-          repairNonAuthoritativeFingerprint = nonAuthoritativeRepairFingerprint
-        } else if (nonAuthoritative) {
+        if (nonAuthoritative) {
           await options.transition('CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK', {
             candidateHash,
             checkerId: workItemId,
@@ -12877,7 +13120,7 @@ function createDefaultRouteExecutor(options) {
             checkHashes,
           }
         }
-        if (retryAttempt > 0 && !repairNonAuthoritativeCheck) {
+        if (retryAttempt > 0) {
           const repairEligible = result.code === 'FAIL' &&
             !rejectedImplementationFingerprints.has(checkerImplementationFailureFingerprint(result)) &&
             workerCount === 1 && !doneRetryBoundary && typeof options.resultPointer === 'function'
@@ -12894,15 +13137,13 @@ function createDefaultRouteExecutor(options) {
               : repairEligible ? [`work-1-repair-${checkerRepairAttempt + 1}`] : [],
           })
         }
-        if (!repairNonAuthoritativeCheck) break
         break
       }
       if (result.code !== 'PASS') {
-        const implementationFailureFingerprint = repairNonAuthoritativeFingerprint ||
-          checkerImplementationFailureFingerprint(result)
+        const implementationFailureFingerprint = checkerImplementationFailureFingerprint(result)
         const repeatedImplementationFailure = implementationFailureFingerprint &&
           rejectedImplementationFingerprints.has(implementationFailureFingerprint)
-        const canRepairImplementation = (result.code === 'FAIL' || repairNonAuthoritativeCheck) &&
+        const canRepairImplementation = result.code === 'FAIL' &&
           !repeatedImplementationFailure &&
           workerCount === 1 && !doneRetryBoundary && typeof options.resultPointer === 'function'
         if (canRepairImplementation) {
@@ -12910,11 +13151,16 @@ function createDefaultRouteExecutor(options) {
           const rejectedCandidateHash = candidateHash
           const checkerReceiptPointer = options.resultPointer(workItemId)
           const checkerResultHash = hashText(JSON.stringify(result))
+          const rejectedCheckerReceipts = rememberRejectedCheckerReceipt(
+            checkerReceiptPointer,
+            checkerResultHash,
+          )
           await options.transition('IMPLEMENTATION_DEFECT', 'REPAIRING', {
             candidateHash: rejectedCandidateHash,
             checkerId: workItemId,
             checkerResultHash,
             checkerReceiptPointer,
+            rejectedCheckerReceipts,
             repairAttempt: checkerRepairAttempt + 1,
             repairWorkItemId: `work-1-repair-${checkerRepairAttempt + 1}`,
             nextReadyWorkIds: [`work-1-repair-${checkerRepairAttempt + 1}`],
@@ -12923,10 +13169,9 @@ function createDefaultRouteExecutor(options) {
           const repairResult = await launch({
             workItemId: repairWorkItemId,
             logicalRole: 'worker', parent: 'run-owner', purpose: 'work',
-            repairOf: 'work-1', executorKey: 'work-1',
-            assignment: repairNonAuthoritativeCheck
-              ? 'Remediate the verification blocker in the bound independent-check receipt. Preserve passing behavior, replace non-portable or self-verified output when necessary, execute the authoritative acceptance commands, and return a changed independently verifiable exact version.'
-              : 'Repair only the implementation defects in the bound independent-check receipt. Preserve passing behavior, execute the authoritative acceptance commands, and return a newly verified exact version.',
+            executorKey: repairWorkItemId,
+            forkTurns: 'none',
+            assignment: cumulativeRepairAssignment,
             ownership: executionOwnership.length
               ? executionOwnership.filter(item => item && item.owner === 'worker-1').map(item => ({ ...item }))
               : ['workspace'],
@@ -12934,6 +13179,7 @@ function createDefaultRouteExecutor(options) {
             fetchedEvidence: withDescriptiveLikelyAreas({
               ...(capturedDomainWorkEvidence || {}),
               rejectedCheckerReceipt: checkerReceiptPointer,
+              rejectedCheckerReceipts,
               rejectedCandidateHash,
               checkerResultHash,
             }),
@@ -12943,12 +13189,25 @@ function createDefaultRouteExecutor(options) {
             difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
             risk: 'high', nextReadyAfter: [`independent-check-1-repair-${checkerRepairAttempt + 1}`],
           })
-          if (!repairResult || repairResult.allAssignedItemsPass === false) {
+          if (!repairResult) {
             throw new SupervisorIntegrationError(
-              'WORK_ITEM_RESULT_FAILED',
-              'same-worker checker repair did not return a verified work result',
+              'WORK_ITEM_RESULT_MISSING',
+              'checker repair did not return a durable work result',
               { repairWorkItemId, checkerResultHash },
             )
+          }
+          if (repairResult.allAssignedItemsPass === false) {
+            return {
+              outcome: 'FAILED', checkHashes: [],
+              terminalEnvelope: {
+                code: 'IMPLEMENTATION_REPAIR_UNSUCCESSFUL',
+                status: 'IMPLEMENTATION_REPAIR_UNSUCCESSFUL',
+                reason: 'the fresh full-set repair worker could not repair the cumulative checker defect set',
+                repairWorkItemId,
+                checkerIds: rejectedCheckerReceipts.map(item => item.name),
+                checkerResultHashes: rejectedCheckerReceipts.map(item => item.resultHash),
+              },
+            }
           }
           const repairedCandidateHash = hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
           if (repairedCandidateHash === rejectedCandidateHash) {
@@ -12956,7 +13215,7 @@ function createDefaultRouteExecutor(options) {
               outcome: 'FAILED', checkHashes: [],
               terminalEnvelope: {
                 status: 'REPAIR_NO_PROGRESS',
-                reason: 'the bounded same-worker repair did not produce a changed exact version',
+                reason: 'the bounded fresh-context repair did not produce a changed exact version',
                 candidateHash: rejectedCandidateHash,
                 checkerResultHash,
               },
@@ -12982,6 +13241,7 @@ function createDefaultRouteExecutor(options) {
             })),
             environmentHash: hashEnvironment(options.gitEnvironment()),
             checkerResultHash,
+            rejectedCheckerReceipts,
             repairWorkItemId,
             repairAttempt: checkerRepairAttempt,
             nextReadyWorkIds: [`independent-check-1-repair-${checkerRepairAttempt}`],
@@ -14330,8 +14590,10 @@ function createDefaultRuntimeOptions(input) {
     const absolute = recordRef.resolve(`work/results/${hashText(workItemId)}.json`)
     return fs.existsSync(absolute) ? readRegularJson(absolute, `result ${workItemId}`).parsed : null
   }
-  const durableResultMatchesRecoveryReceipt = (workItemId, expectedResult) => {
-    if (!recordRef || !pendingCrashResume) return false
+  const durableResultMatchesRecoveryReceipt = (workItemId, expectedResult, checkpointOverride = null) => {
+    const checkpoint = checkpointOverride ||
+      pendingCrashResume && pendingCrashResume.checkpointEvidence.record.checkpoint
+    if (!recordRef || !checkpoint) return false
     const pointerPath = recordRef.resolve(`work/results/context-${hashText(workItemId)}.json`)
     if (!fs.existsSync(pointerPath)) return false
     const pointer = readRegularJson(pointerPath, 'recovery result continuation pointer').parsed
@@ -14345,14 +14607,13 @@ function createDefaultRuntimeOptions(input) {
     if (!saved || contentHash !== pointer.contentHash || contentHash !== hashText(stableStringify(contentBody)) ||
         saved.workItemId !== workItemId || saved.runId !== activation.runId ||
         saved.activationId !== activation.runId ||
-        saved.requestEnvelopeHash !== pendingCrashResume.checkpointEvidence.record.checkpoint.immutableHashes.requestEnvelopeHash ||
+        saved.requestEnvelopeHash !== checkpoint.immutableHashes.requestEnvelopeHash ||
         saved.missionHash !== missionHash || !/^[a-f0-9]{64}$/u.test(saved.terminalReceiptHash || '') ||
         typeof saved.terminalReceiptPath !== 'string') return false
     const receiptPath = recordRef.resolve(saved.terminalReceiptPath)
     if (!fs.existsSync(receiptPath)) return false
     const receipt = readRegularJson(receiptPath, 'recovery result terminal receipt').parsed
     const { receiptHash, ...receiptBody } = receipt || {}
-    const checkpoint = pendingCrashResume.checkpointEvidence.record.checkpoint
     const accepted = new Set(checkpoint.recovery.frontier.acceptedResultIds || [])
     const resultHash = hashText(JSON.stringify(expectedResult))
     return Boolean(receipt && receiptHash === saved.terminalReceiptHash &&
@@ -14396,7 +14657,12 @@ function createDefaultRuntimeOptions(input) {
     }
     return receipt
   }
-  const validateRoadmapProjectionReceipt = (decision, planSha256) => {
+  const validateRoadmapProjectionReceipt = (
+    decision,
+    planSha256,
+    checkpointOverride = null,
+    requiredAuthorWorkItemId = null,
+  ) => {
     if (!recordRef || !/^[a-f0-9]{64}$/u.test(planSha256 || '')) return false
     const absolute = recordRef.resolve(roadmapProjectionReceiptPath(planSha256))
     if (!fs.existsSync(absolute)) return false
@@ -14406,16 +14672,21 @@ function createDefaultRuntimeOptions(input) {
         receipt.planSha256 !== planSha256 || receiptHash !== hashText(stableStringify(body)) ||
         receipt.decisionHash !== hashText(stableStringify(decision)) ||
         !['roadmap-author', 'roadmap-author-revise', 'roadmap-author-plan-repair'].includes(receipt.authorWorkItemId) ||
+        (requiredAuthorWorkItemId !== null && receipt.authorWorkItemId !== requiredAuthorWorkItemId) ||
         receipt.sourceResultHash !== exactFileHash(`work/results/${hashText(receipt.authorWorkItemId)}.json`)) return false
     const sourceResult = readDurableResult(receipt.authorWorkItemId)
-    if (!sourceResult || !durableResultMatchesRecoveryReceipt(receipt.authorWorkItemId, sourceResult)) return false
+    if (!sourceResult || !durableResultMatchesRecoveryReceipt(
+      receipt.authorWorkItemId,
+      sourceResult,
+      checkpointOverride,
+    )) return false
     let corrections
     try {
       corrections = (receipt.authorResult && receipt.authorResult.scoutCorrections || []).map(saved => {
         const scoutResult = readDurableResult(saved.workItemId)
         const resultHash = exactFileHash(`work/results/${hashText(saved.workItemId)}.json`)
         if (!scoutResult || !resultHash ||
-            !durableResultMatchesRecoveryReceipt(saved.workItemId, scoutResult)) {
+            !durableResultMatchesRecoveryReceipt(saved.workItemId, scoutResult, checkpointOverride)) {
           throw new Error('scout result missing')
         }
         return scoutCorrection(
@@ -14832,6 +15103,24 @@ function createDefaultRuntimeOptions(input) {
         accountingCheckpointVerifier: evidence => accountingAuthority.verifyResumeCheckpoint(evidence),
         accountingCheckpointProvider: () => accountingAuthority.resumeCheckpoint(),
         resultCommitVerifier,
+        roadmapPlanAdvanceVerifier: (previous, current) => {
+          if (!recordRef) return false
+          const decisionPath = recordRef.resolve('route/decision.json')
+          const planPath = recordRef.resolve('plan/ROADMAP.md')
+          if (!fs.existsSync(decisionPath) || !fs.existsSync(planPath)) return false
+          const decisionBytesHash = sha256Bytes(fs.readFileSync(decisionPath))
+          const planBytesHash = sha256Bytes(fs.readFileSync(planPath))
+          const currentHashes = current.checkpoint.immutableHashes
+          if (decisionBytesHash !== currentHashes.routeDecisionHash ||
+              planBytesHash !== currentHashes.planHash) return false
+          const decision = readRegularJson(decisionPath, 'ROADMAP repair route decision').parsed
+          return validateRoadmapProjectionReceipt(
+            decision,
+            currentHashes.planHash,
+            previous.checkpoint,
+            'roadmap-author-plan-repair',
+          )
+        },
         clock: context.clock,
       })
       runtimeOptions.recoveryCheckpointAuthority = recoveryCheckpointAuthorityRef
@@ -15957,6 +16246,7 @@ module.exports = {
   planCheckerProjection,
   validatePlanCheckerSnapshot,
   canonicalCompletedCheckerId,
+  canonicalizeCheckerVerificationLimitation,
   roadmapPlanOracleForWorkItem,
   checkerVerdictPassed,
   durableNextReadyAfter,

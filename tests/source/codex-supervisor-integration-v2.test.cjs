@@ -24,6 +24,7 @@ const {
   createCheckerSnapshotFactory,
   validatePlanCheckerSnapshot,
   canonicalCompletedCheckerId,
+  canonicalizeCheckerVerificationLimitation,
   roadmapPlanOracleForWorkItem,
   checkerVerdictPassed,
   durableNextReadyAfter,
@@ -796,6 +797,18 @@ test('recovered checker retry reports remain provisional until controller valida
     {
       name: 'invalid-pass-payload',
       result: { code: 'PASS', payload: { evidenceIds: ['evidence:invalid-retry'] } },
+      completed: true,
+    },
+    {
+      name: 'persistent-inconclusive',
+      result: {
+        code: 'CHECK_INCONCLUSIVE',
+        cause: {
+          event: 'CHECK_INCONCLUSIVE', reason: 'retry remained inconclusive',
+          unblockPath: 'repair implementation',
+        },
+        payload: {},
+      },
       completed: true,
     },
     { name: 'unknown-code', result: { code: 'UNRECOGNIZED_CHECKER_REPORT' }, completed: false },
@@ -4721,6 +4734,98 @@ test('root, child launch, and all four usage categories cross the canonical acco
   assert.equal(checkpoints.every(item => item.delta.elapsedMilliseconds === 0 && item.delta.costMicrounits === 0), true)
 })
 
+test('every post-acquire pre-spawn failure releases its lease and only closes a session that actually started', async t => {
+  const cases = [
+    { id: 'pre-session-operation', expectedFailedSessions: 0 },
+    { id: 'post-session-transcript', expectedFailedSessions: 1 },
+    { id: 'post-session-null', expectedFailedSessions: 1, primary: null },
+    { id: 'post-session-undefined', expectedFailedSessions: 1, primary: undefined },
+    {
+      id: 'post-session-frozen', expectedFailedSessions: 1,
+      primary: Object.freeze(Object.assign(new Error('frozen primary'), { code: 'FROZEN_PRIMARY' })),
+      failTerminalPersistenceOnce: true,
+    },
+  ]
+  for (const entry of cases) {
+    const workItemId = `cleanup-${entry.id}`
+    const primary = Object.hasOwn(entry, 'primary')
+      ? entry.primary
+      : Object.assign(new Error(`injected ${entry.id} failure`), {
+          code: `INJECTED_${entry.id.toUpperCase().replaceAll('-', '_')}`,
+        })
+    let runtime
+    let observed = null
+    let failTerminalPersistenceArmed = false
+    const harness = makeHarness(t, {
+      activationId: `activation-${entry.id}`,
+      runId: `run-${entry.id}`,
+      runtimeOptions: {
+        ...(entry.id.startsWith('post-session-')
+          ? {
+              transcriptStoreFactory({ request }) {
+                if (request.workItemId === workItemId) {
+                  failTerminalPersistenceArmed = entry.failTerminalPersistenceOnce === true
+                  throw primary
+                }
+                return null
+              },
+            }
+          : {}),
+        executeRoute: async ({ launch }) => {
+          try {
+            await launch({
+              workItemId, logicalRole: 'worker', parent: 'run-owner', purpose: 'work',
+              assignment: 'Exercise the post-acquire cleanup boundary.',
+              success: ['No scheduler lease or budget session remains live.'],
+              checks: ['post-acquire cleanup'],
+            })
+            assert.fail(`${entry.id} must fail before launcher exposure`)
+          } catch (error) {
+            const budget = harness.budget.snapshot()
+            observed = {
+              primaryPreserved: error === primary,
+              currentLiveChildren: runtime.scheduler.getMetrics().counters.currentLiveChildren,
+              failedSessions: Object.values(budget.sessions).filter(session => session.status === 'FAILED').length,
+              runningSessions: Object.values(budget.sessions).filter(session => session.status === 'RUNNING').length,
+              launcherExposed: harness.launches.some(launchRecord => launchRecord.workItemId === workItemId),
+            }
+          }
+          return usableDoneFixture(harness, `${entry.id}-result`)
+        },
+      },
+    })
+    if (entry.failTerminalPersistenceOnce) {
+      const endSession = harness.budget.endSession.bind(harness.budget)
+      let failedOnce = false
+      harness.budget.endSession = (...args) => {
+        if (failTerminalPersistenceArmed && !failedOnce) {
+          failedOnce = true
+          throw new Error('injected first terminal persistence failure')
+        }
+        return endSession(...args)
+      }
+    }
+    runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+    if (entry.id === 'pre-session-operation') {
+      const defaultExternalOperation = runtime._defaultExternalOperation.bind(runtime)
+      runtime._defaultExternalOperation = (request, assignment) => {
+        if (request.workItemId === workItemId) throw primary
+        return defaultExternalOperation(request, assignment)
+      }
+    }
+
+    const result = await runtime.start()
+    assert.equal(result.outcome, 'DONE', `${entry.id}: ${JSON.stringify(result)}`)
+    assert.deepEqual(observed, {
+      primaryPreserved: true,
+      currentLiveChildren: 0,
+      failedSessions: entry.expectedFailedSessions,
+      runningSessions: 0,
+      launcherExposed: false,
+    })
+  }
+})
+
 test('monotonic attended user wait is recorded separately and excluded from the admission hard sum', async t => {
   const harness = makeHarness(t)
   let runtime
@@ -6254,7 +6359,7 @@ test('production planning prose remains descriptive and never becomes filesystem
   assert.equal(workerReached, true)
 })
 
-test('one actionable checker FAIL returns to the same worker, freezes a new candidate, and rechecks once', async t => {
+test('one actionable checker FAIL launches a fresh bounded full-set repair and rechecks once', async t => {
   const target = createTempGitTarget(tempDirectory(t, 'autoprompt-checker-repair-'))
   const transitions = []
   const checkerCandidates = []
@@ -6282,10 +6387,19 @@ test('one actionable checker FAIL returns to the same worker, freezes a new cand
         fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'rejected'\n")
         return { allAssignedItemsPass: true }
       }
-      if (request.logicalRole === 'worker' && request.repairOf === 'work-1') {
+      if (request.logicalRole === 'worker' && /^work-1-repair-\d+$/u.test(request.workItemId)) {
         repairLaunches += 1
-        assert.equal(request.executorKey, 'work-1')
+        assert.equal(request.repairOf, undefined)
+        assert.equal(request.executorKey, request.workItemId)
+        assert.equal(request.forkTurns, 'none')
         assert.equal(request.fetchedEvidence.rejectedCheckerReceipt.path, receiptPath)
+        assert.equal(request.fetchedEvidence.rejectedCheckerReceipts.length, 1)
+        assert.deepEqual(Object.keys(request.fetchedEvidence.rejectedCheckerReceipts[0]).sort(),
+          ['bytes', 'hash', 'name', 'path', 'resultHash'])
+        assert.match(request.assignment, /full cumulative union/u)
+        assert.match(request.assignment, /Generalize each fix/u)
+        assert.match(request.assignment, /complete named and pre-existing regression matrix/u)
+        assert.match(request.assignment, /bounded previews; never paste or dump full deliverables, logs, or transcripts/u)
         assert.match(request.strategyFingerprint, /^[a-f0-9]{64}$/)
         fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'accepted'\n")
         return { allAssignedItemsPass: true }
@@ -6293,6 +6407,12 @@ test('one actionable checker FAIL returns to the same worker, freezes a new cand
       if (['independent-reviewer', 'independent-tester'].includes(request.logicalRole)) {
         checkerAttempt += 1
         checkerCandidates.push(request.candidateHash)
+        assert.match(request.assignment, /complete applicable test matrix/u)
+        assert.match(request.assignment, /Enumerate every reproducible defect/u)
+        assert.match(request.assignment, /Never paste or dump a full large deliverable, log, or transcript/u)
+        assert.match(request.fetchedEvidence.verificationDoctrine.join(' '),
+          /unavailable external consumer, tool, library, or portable reopen receipt is a verification limitation/u)
+        assert.match(request.fetchedEvidence.verificationDoctrine.join(' '), /strongest available independent method/u)
         if (checkerAttempt === 1) return {
           code: 'FAIL', cause: { event: 'ASSERTION_FAILED', reason: 'exact behavior mismatch', unblockPath: 'repair implementation' },
           payload: { findingIds: ['AP-RUN-026'] },
@@ -6324,6 +6444,207 @@ test('one actionable checker FAIL returns to the same worker, freezes a new cand
   ])
 })
 
+test('an unsuccessful checker repair returns a bound task terminal instead of an internal controller failure', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-checker-repair-unsuccessful-'))
+  const routeDecision = structuredClone(decision('DIRECT'))
+  routeDecision.independentCheckingPlan = {
+    checkerCount: 1,
+    responsibilities: ['Independently verify the candidate.'],
+    nonOverlapReason: null,
+  }
+  const receiptPath = path.join(target, 'checker-fail-receipt.json')
+  fs.writeFileSync(receiptPath, '{}\n')
+  const executor = createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    resultPointer: workItemId => ({
+      name: workItemId, path: receiptPath,
+      hash: crypto.createHash('sha256').update(fs.readFileSync(receiptPath)).digest('hex'),
+      bytes: fs.statSync(receiptPath).size,
+    }),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })
+  const result = await executor({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      if (request.workItemId === 'work-1') {
+        fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'rejected'\n")
+        return { allAssignedItemsPass: true }
+      }
+      if (request.workItemId === 'work-1-repair-1') return { allAssignedItemsPass: false }
+      return {
+        code: 'FAIL',
+        cause: { event: 'ASSERTION_FAILED', reason: 'reproduced defect', unblockPath: 'repair implementation' },
+        payload: { findingIds: ['AP-RUN-026'] },
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(result.outcome, 'FAILED')
+  assert.deepEqual(result.terminalEnvelope, {
+    code: 'IMPLEMENTATION_REPAIR_UNSUCCESSFUL',
+    status: 'IMPLEMENTATION_REPAIR_UNSUCCESSFUL',
+    reason: 'the fresh full-set repair worker could not repair the cumulative checker defect set',
+    repairWorkItemId: 'work-1-repair-1',
+    checkerIds: ['independent-check-1'],
+    checkerResultHashes: [result.terminalEnvelope.checkerResultHashes[0]],
+  })
+  assert.match(result.terminalEnvelope.checkerResultHashes[0], /^[a-f0-9]{64}$/u)
+})
+
+test('a checker capability-only FAIL is controller-classified as inconclusive and never launches implementation repair', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-checker-capability-fail-'))
+  const routeDecision = structuredClone(decision('DIRECT'))
+  routeDecision.independentCheckingPlan = {
+    checkerCount: 1,
+    responsibilities: ['Verify with the strongest available independent method.'],
+    nonOverlapReason: null,
+  }
+  const launches = []
+  const receiptPath = path.join(target, 'capability-checker-receipt.json')
+  fs.writeFileSync(receiptPath, '{}\n')
+  const executor = createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    resultPointer: workItemId => ({
+      name: workItemId,
+      path: receiptPath,
+      hash: crypto.createHash('sha256').update(fs.readFileSync(receiptPath)).digest('hex'),
+      bytes: fs.statSync(receiptPath).size,
+    }),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })
+  const result = await executor({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'work-1') {
+        fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'candidate'\n")
+        return { allAssignedItemsPass: true }
+      }
+      return {
+        code: 'FAIL',
+        cause: {
+          event: 'DOWNSTREAM_CONSUMER_RECEIPT_MISSING',
+          reason: 'the external CAD consumer is not installed in this environment',
+          unblockPath: null,
+        },
+        payload: {
+          findingIds: ['AP-CHECK-CAPABILITY'],
+          verificationLimitation: {
+            kind: 'CAPABILITY_UNAVAILABLE',
+            capabilityId: 'external.cad-consumer',
+            explicitUserDeliverable: false,
+            observedVersionDefectIds: [],
+          },
+        },
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(result.outcome, 'PARTIAL')
+  assert.equal(result.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
+  assert.equal(result.terminalEnvelope.code, 'CHECK_INCONCLUSIVE')
+  assert.equal(result.terminalEnvelope.cause.event, 'DOWNSTREAM_CONSUMER_RECEIPT_MISSING')
+  assert.deepEqual(launches, ['work-1', 'independent-check-1', 'independent-check-1-runtime-retry-1'])
+  assert.equal(launches.some(id => /^work-1-repair-/u.test(id)), false)
+})
+
+test('capability classification never hides an explicit user deliverable or an observed exact-version defect', () => {
+  const base = {
+    code: 'FAIL',
+    description: 'The checked result does not satisfy one or more named requirements.',
+    stateClass: 'terminal',
+    cause: {
+      event: 'DOWNSTREAM_CONSUMER_RECEIPT_MISSING',
+      reason: 'the external consumer receipt is absent',
+      unblockPath: 'produce the required receipt',
+    },
+    payload: {
+      verificationLimitation: {
+        kind: 'CAPABILITY_UNAVAILABLE',
+        capabilityId: 'external.cad-consumer',
+        explicitUserDeliverable: false,
+        observedVersionDefectIds: [],
+      },
+    },
+  }
+  assert.equal(canonicalizeCheckerVerificationLimitation(base).code, 'CHECK_INCONCLUSIVE')
+  assert.equal(canonicalizeCheckerVerificationLimitation({
+    ...base,
+    payload: { verificationLimitation: {
+      ...base.payload.verificationLimitation,
+      explicitUserDeliverable: true,
+    } },
+  }).code, 'FAIL')
+  assert.equal(canonicalizeCheckerVerificationLimitation({
+    ...base,
+    payload: { verificationLimitation: {
+      ...base.payload.verificationLimitation,
+      observedVersionDefectIds: ['CAD-EMPTY-GEOMETRY'],
+    } },
+  }).code, 'FAIL')
+  assert.equal(canonicalizeCheckerVerificationLimitation({
+    ...base,
+    payload: { verificationLimitation: { kind: 'CAPABILITY_UNAVAILABLE' } },
+  }).code, 'FAIL')
+})
+
+test('an explicit unsuccessful implementation result returns a bound task terminal instead of an internal controller failure', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-worker-unsuccessful-'))
+  const executor = createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })
+  const failedResult = {
+    allAssignedItemsPass: false,
+    successItems: [
+      { id: 'implemented', status: 'pass', evidenceIds: ['evidence:implementation'] },
+      { id: 'author-checks', status: 'fail', evidenceIds: ['evidence:author-checks'] },
+      { id: 'remaining-boundary', status: 'blocked', evidenceIds: ['evidence:boundary'] },
+    ],
+  }
+  const result = await executor({
+    route: 'DIRECT', decision: decision('DIRECT'),
+    launch: async request => request.workItemId === 'work-1'
+      ? failedResult
+      : { code: 'PASS', payload: {} },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(result.outcome, 'FAILED')
+  assert.deepEqual(result.terminalEnvelope, {
+    code: 'IMPLEMENTATION_WORK_UNSUCCESSFUL',
+    status: 'IMPLEMENTATION_WORK_UNSUCCESSFUL',
+    reason: 'the implementation worker explicitly reported that its assigned implementation and author-side checks did not pass',
+    workItemId: 'work-1',
+    workResultHash: result.terminalEnvelope.workResultHash,
+    failedSuccessItemIds: ['author-checks', 'remaining-boundary'],
+  })
+  assert.match(result.terminalEnvelope.workResultHash, /^[a-f0-9]{64}$/u)
+
+  const adoptedResult = await executor({
+    route: 'DIRECT', decision: decision('DIRECT'),
+    launch: async () => assert.fail('an adopted explicit result must not relaunch its worker'),
+    completeRetainedLease: () => {},
+    resumeAdoptedLaunches: async () => ({ 'work-1': failedResult }),
+    resumeState: {
+      resumeState: 'RUN_WORK',
+      completedWorkIds: ['work-1'],
+      completedCheckIds: [],
+      nextReadyWorkIds: [],
+      candidateHash: null,
+    },
+  })
+  assert.deepEqual(adoptedResult, result)
+})
+
 test('changed implementation repairs continue until the independent checker passes', async t => {
   const target = createTempGitTarget(tempDirectory(t, 'autoprompt-progressive-checker-repair-'))
   const routeDecision = structuredClone(decision('DIRECT'))
@@ -6335,6 +6656,7 @@ test('changed implementation repairs continue until the independent checker pass
   const receiptPath = path.join(target, 'checker-fail-receipt.json')
   fs.writeFileSync(receiptPath, '{}\n')
   const launches = []
+  const repairRequests = []
   let repairAttempt = 0
   let checkerAttempt = 0
   const executor = createDefaultRouteExecutor({
@@ -6358,7 +6680,10 @@ test('changed implementation repairs continue until the independent checker pass
     launch: async request => {
       launches.push(request.workItemId)
       if (request.logicalRole === 'worker') {
-        if (request.repairOf) repairAttempt += 1
+        if (/^work-1-repair-\d+$/u.test(request.workItemId)) {
+          repairAttempt += 1
+          repairRequests.push(request)
+        }
         fs.writeFileSync(
           path.join(target, 'src', 'example.js'),
           `module.exports = 'candidate-${repairAttempt}'\n`,
@@ -6374,7 +6699,7 @@ test('changed implementation repairs continue until the independent checker pass
             reason: `independent defect ${checkerAttempt}`,
             unblockPath: 'repair the implementation again',
           },
-          payload: { findingIds: [`AP-REPAIR-${checkerAttempt}`] },
+          payload: { findingIds: [`AP-REPAIR-${String(checkerAttempt).padStart(3, '0')}`] },
         }
       }
       return {
@@ -6390,6 +6715,22 @@ test('changed implementation repairs continue until the independent checker pass
   })
   assert.equal(result.outcome, 'DONE', JSON.stringify(result))
   assert.equal(repairAttempt, 2)
+  assert.deepEqual(repairRequests.map(request => ({
+    repairOf: request.repairOf,
+    executorKey: request.executorKey,
+    forkTurns: request.forkTurns,
+    receiptCount: request.fetchedEvidence.rejectedCheckerReceipts.length,
+    receiptNames: request.fetchedEvidence.rejectedCheckerReceipts.map(item => item.name),
+  })), [
+    {
+      repairOf: undefined, executorKey: 'work-1-repair-1', forkTurns: 'none', receiptCount: 1,
+      receiptNames: ['independent-check-1'],
+    },
+    {
+      repairOf: undefined, executorKey: 'work-1-repair-2', forkTurns: 'none', receiptCount: 2,
+      receiptNames: ['independent-check-1', 'independent-check-1-repair-1'],
+    },
+  ])
   assert.deepEqual(launches.slice(0, 6), [
     'work-1',
     'independent-check-1',
@@ -6464,10 +6805,12 @@ test('REPAIRING resume launches the exact pending worker repair before any fresh
     completedWorkIds: ['work-1'],
     completedCheckIds: [],
     retryState: {
+      cumulativeRejectedCheckerReceipts: pending.rejectedCheckerReceipts,
       pendingImplementationRepair: {
         checkerId: pending.checkerId,
         checkerResultHash: pending.checkerResultHash,
         checkerReceiptPointer: pending.checkerReceiptPointer,
+        rejectedCheckerReceipts: pending.rejectedCheckerReceipts,
         rejectedCandidateHash: pending.candidateHash,
         repairAttempt: pending.repairAttempt,
         repairWorkItemId: pending.repairWorkItemId,
@@ -6489,6 +6832,10 @@ test('REPAIRING resume launches the exact pending worker repair before any fresh
     launch: async request => {
       launches.push(request.workItemId)
       if (request.workItemId === 'work-1-repair-1') {
+        assert.equal(request.repairOf, undefined)
+        assert.equal(request.executorKey, 'work-1-repair-1')
+        assert.equal(request.forkTurns, 'none')
+        assert.equal(request.fetchedEvidence.rejectedCheckerReceipts.length, 1)
         fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'repaired-after-resume'\n")
         return { allAssignedItemsPass: true }
       }
@@ -6508,6 +6855,97 @@ test('REPAIRING resume launches the exact pending worker repair before any fresh
   assert.equal(launches[0], 'work-1-repair-1')
   assert.equal(launches.filter(id => id === 'work-1-repair-1').length, 1)
   assert.equal(launches.includes('independent-check-1-repair-1'), true)
+})
+
+test('REPAIRING crash resume preserves the cumulative checker-receipt prefix for repair two', async t => {
+  const directory = tempDirectory(t, 'autoprompt-cumulative-repair-resume-')
+  const target = createTempGitTarget(directory)
+  fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'repair-one-rejected'\n")
+  const candidateHash = testWorkspaceCandidateHash(target)
+  const routeDecision = structuredClone(decision('DIRECT'))
+  routeDecision.independentCheckingPlan = {
+    checkerCount: 1,
+    responsibilities: ['Independently verify the cumulative repair.'],
+    nonOverlapReason: null,
+  }
+  const results = {
+    'independent-check-1': {
+      code: 'FAIL', cause: { event: 'ASSERTION_FAILED', reason: 'first defect', unblockPath: 'repair' },
+      payload: { findingIds: ['AP-RUN-026'] },
+    },
+    'independent-check-1-repair-1': {
+      code: 'FAIL', cause: { event: 'ASSERTION_FAILED', reason: 'second defect', unblockPath: 'repair' },
+      payload: { findingIds: ['AP-RUN-027'] },
+    },
+  }
+  const pointers = new Map()
+  const ledger = []
+  for (const [workItemId, result] of Object.entries(results)) {
+    const resultPath = path.join(directory, `${workItemId}.json`)
+    fs.writeFileSync(resultPath, `${JSON.stringify(result)}\n`)
+    const bytes = fs.readFileSync(resultPath)
+    const pointer = {
+      name: workItemId, path: resultPath,
+      hash: crypto.createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length,
+    }
+    pointers.set(workItemId, pointer)
+    ledger.push({
+      ...pointer,
+      resultHash: crypto.createHash('sha256').update(JSON.stringify(result)).digest('hex'),
+    })
+  }
+  const latest = ledger[1]
+  const launches = []
+  let repairCapsule = null
+  const executor = createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    readResult: workItemId => results[workItemId] || null,
+    resultPointer: workItemId => pointers.get(workItemId),
+    harnessAttestation: (versionHash, oracle) => ({
+      repoHash: versionHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })
+  const outcome = await executor({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'work-1-repair-2') {
+        repairCapsule = request.fetchedEvidence.rejectedCheckerReceipts
+        fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'repair-two-complete'\n")
+        return { allAssignedItemsPass: true }
+      }
+      return {
+        code: 'PASS', payload: {
+          evidenceIds: [`evidence:${request.workItemId}`],
+          referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
+          testOutcomes: checkerTestOutcomes(request),
+        },
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
+    resumeState: {
+      resumeState: 'REPAIRING', candidateHash,
+      completedWorkIds: ['work-1', 'work-1-repair-1'], completedCheckIds: [],
+      acceptedResultIds: [], nextReadyWorkIds: ['work-1-repair-2'],
+      retryState: {
+        cumulativeRejectedCheckerReceipts: ledger,
+        pendingImplementationRepair: {
+          checkerId: latest.name,
+          checkerResultHash: latest.resultHash,
+          checkerReceiptPointer: pointers.get(latest.name),
+          rejectedCheckerReceipts: ledger,
+          rejectedCandidateHash: candidateHash,
+          repairAttempt: 2,
+          repairWorkItemId: 'work-1-repair-2',
+        },
+      },
+    },
+  })
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.deepEqual(launches, ['work-1-repair-2', 'independent-check-1-repair-2'])
+  assert.deepEqual(repairCapsule, ledger)
+  assert.deepEqual(repairCapsule.slice(0, 1), ledger.slice(0, 1))
 })
 
 test('REPAIR_READY recovery invalidates prior-version checker seats and launches repaired checker one', async t => {
@@ -6801,8 +7239,17 @@ test('repaired checker retry PASS preserves the seat, then a later defect starts
     launch: async request => {
       launches.push(request.workItemId)
       if (request.workItemId === 'independent-check-2-repair-1') {
-        return { code: 'FAIL', payload: { findingIds: ['AP-RUN-026'] },
+        const failure = { code: 'FAIL', payload: { findingIds: ['AP-RUN-026'] },
           cause: { event: 'ASSERTION_FAILED', reason: 'repaired boundary still fails', unblockPath: 'repair again' } }
+        records[request.workItemId] = failure
+        const resultPath = path.join(directory, `${request.workItemId}.json`)
+        fs.writeFileSync(resultPath, `${JSON.stringify(failure)}\n`)
+        const bytes = fs.readFileSync(resultPath)
+        pointers.set(request.workItemId, {
+          name: request.workItemId, path: resultPath,
+          hash: crypto.createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length,
+        })
+        return failure
       }
       if (request.workItemId === 'work-1-repair-2') {
         fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'repair-two'\n")
@@ -6858,7 +7305,7 @@ test('an equivalent post-repair checker failure stops after the single bounded r
     route: 'DIRECT', decision: decision('DIRECT'),
     launch: async request => {
       if (request.logicalRole === 'worker') {
-        if (request.repairOf) repairLaunches += 1
+        if (/^work-1-repair-\d+$/u.test(request.workItemId)) repairLaunches += 1
         fs.writeFileSync(path.join(target, 'src', 'example.js'),
           `module.exports = 'still-rejected-${repairLaunches}'\n`)
         return { allAssignedItemsPass: true }
@@ -6905,7 +7352,7 @@ test('a no-op checker repair fails directly without stale recheck or a second re
     route: 'DIRECT', decision: decision('DIRECT'),
     launch: async request => {
       if (request.logicalRole === 'worker') {
-        if (request.repairOf) repairLaunches += 1
+        if (/^work-1-repair-\d+$/u.test(request.workItemId)) repairLaunches += 1
         else fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'rejected'\n")
         return { allAssignedItemsPass: true }
       }
@@ -6927,7 +7374,7 @@ test('a no-op checker repair fails directly without stale recheck or a second re
   ])
 })
 
-test('persistent inconclusive checks remediate a changed version while runtime failures remain transport retries', async t => {
+test('persistent inconclusive checks remain verification limitations and never launch implementation repair', async t => {
   for (const code of ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE']) {
     const target = createTempGitTarget(tempDirectory(t, `autoprompt-checker-${code.toLowerCase()}-`))
     const receiptPath = path.join(target, 'checker-inconclusive-receipt.json')
@@ -6940,6 +7387,7 @@ test('persistent inconclusive checks remediate a changed version while runtime f
     }
     let repairLaunches = 0
     let checkerLaunches = 0
+    const workItemIds = []
     const checkerTransitions = []
     const executor = createDefaultRouteExecutor({
       targetPath: target, gitEnvironment: () => process.env,
@@ -6958,49 +7406,36 @@ test('persistent inconclusive checks remediate a changed version while runtime f
     const result = await executor({
       route: 'DIRECT', decision: routeDecision,
       launch: async request => {
+        workItemIds.push(request.workItemId)
         if (request.logicalRole === 'worker') {
-          if (request.repairOf) repairLaunches += 1
+          if (/^work-1-repair-\d+$/u.test(request.workItemId)) repairLaunches += 1
           fs.writeFileSync(path.join(target, 'src', 'example.js'),
             `module.exports = '${code}-${repairLaunches}'\n`)
           return { allAssignedItemsPass: true }
         }
         checkerLaunches += 1
-        if (code === 'CHECK_INCONCLUSIVE' && repairLaunches > 0) {
-          return { code: 'PASS', payload: {
-            evidenceIds: [`evidence:${request.workItemId}`],
-            referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
-            testOutcomes: checkerTestOutcomes(request),
-          } }
-        }
         return {
           code,
-          cause: { event: code, reason: 'the independent check did not complete conclusively', unblockPath: 'restore the checker environment' },
+          cause: { event: code, reason: 'the independent check did not complete conclusively', unblockPath: 'repair implementation' },
           payload: {},
         }
       },
       completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
     })
-    if (code === 'CHECK_INCONCLUSIVE') {
-      assert.equal(result.outcome, 'DONE', JSON.stringify(result))
-      assert.equal(repairLaunches, 1)
-      assert.equal(checkerLaunches, 3)
-      assert.deepEqual(checkerTransitions.filter(([event]) => [
-        'CHECK_INCONCLUSIVE', 'CHECK_BECAME_CONCLUSIVE', 'IMPLEMENTATION_DEFECT', 'REPAIR_READY',
-      ].includes(event)).map(([event]) => event), [
-        'CHECK_INCONCLUSIVE', 'CHECK_BECAME_CONCLUSIVE', 'IMPLEMENTATION_DEFECT', 'REPAIR_READY',
-      ])
-    } else {
-      assert.equal(result.outcome, 'PARTIAL')
-      assert.equal(result.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
-      assert.equal(repairLaunches, 0)
-      assert.equal(checkerLaunches, 2)
-      assert.deepEqual(checkerTransitions.filter(([event]) => [
-        'CHECK_INCONCLUSIVE', 'CHECK_REMAINS_INCONCLUSIVE',
-      ].includes(event)), [
-        ['CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE'],
-        ['CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK'],
-      ])
-    }
+    assert.equal(result.outcome, 'PARTIAL')
+    assert.equal(result.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
+    assert.equal(repairLaunches, 0)
+    assert.equal(checkerLaunches, 2)
+    assert.deepEqual(workItemIds.filter(id => /^work-/u.test(id)), ['work-1'])
+    assert.deepEqual(checkerTransitions.filter(([event]) => [
+      'CHECK_BECAME_CONCLUSIVE', 'IMPLEMENTATION_DEFECT', 'REPAIR_READY',
+    ].includes(event)), [])
+    assert.deepEqual(checkerTransitions.filter(([event]) => [
+      'CHECK_INCONCLUSIVE', 'CHECK_REMAINS_INCONCLUSIVE',
+    ].includes(event)), [
+      ['CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE'],
+      ['CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK'],
+    ])
   }
 })
 
@@ -8399,7 +8834,7 @@ test('per-child terminal receipts do not globally drain a legal live sibling or 
     'terminal-boundary drain reported success while a helper/proxy/child process remained live')
 })
 
-test('AP-CODEX-V2-036 concrete runtime repairs a checker FAIL in the same Codex worker, freezes C2, and rechecks', async t => {
+test('AP-CODEX-V2-036 concrete runtime repairs a checker FAIL in a fresh Codex worker, freezes C2, and rechecks', async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-concrete-runtime-'))
   const pidTreeControlRoot = path.join(directory, 'pid-tree-control')
   t.after(() => {
@@ -8465,11 +8900,11 @@ test('AP-CODEX-V2-036 concrete runtime repairs a checker FAIL in the same Codex 
     "  const priorTrace = traceFs.existsSync(tracePath) ? traceFs.readFileSync(tracePath,'utf8').trim().split('\\n').filter(Boolean).map(JSON.parse) : []",
     "  const roleAttempt = priorTrace.filter(item => item.role === role).length + 1",
     "  const checkerAttempt = priorTrace.filter(item => /checker|reviewer|tester/.test(item.role)).length + 1",
-    "  traceFs.appendFileSync(tracePath, JSON.stringify({role,roleAttempt,argv:process.argv.slice(2),cwd:process.cwd(),cacheEnvironment:{TMPDIR:process.env.TMPDIR,TMP:process.env.TMP,TEMP:process.env.TEMP,XDG_CACHE_HOME:process.env.XDG_CACHE_HOME,PYTHONPYCACHEPREFIX:process.env.PYTHONPYCACHEPREFIX,PYTHONDONTWRITEBYTECODE:process.env.PYTHONDONTWRITEBYTECODE,AUTOPROMPT_WORKER_CACHE_ROOT:process.env.AUTOPROMPT_WORKER_CACHE_ROOT}})+'\\n')",
     "  const assignmentMatch = /^Canonical assignment: (.+)$/m.exec(input)",
     "  const contextMatch = /^Canonical context envelope: (.+)$/m.exec(input)",
     "  const assignment = assignmentMatch ? JSON.parse(assignmentMatch[1]) : null",
     "  const context = contextMatch ? JSON.parse(contextMatch[1]) : null",
+    "  traceFs.appendFileSync(tracePath, JSON.stringify({role,roleAttempt,assignmentId:assignment&&assignment.assignmentId,forkTurns:context&&context.fork_turns,argv:process.argv.slice(2),cwd:process.cwd(),cacheEnvironment:{TMPDIR:process.env.TMPDIR,TMP:process.env.TMP,TEMP:process.env.TEMP,XDG_CACHE_HOME:process.env.XDG_CACHE_HOME,PYTHONPYCACHEPREFIX:process.env.PYTHONPYCACHEPREFIX,PYTHONDONTWRITEBYTECODE:process.env.PYTHONDONTWRITEBYTECODE,AUTOPROMPT_WORKER_CACHE_ROOT:process.env.AUTOPROMPT_WORKER_CACHE_ROOT}})+'\\n')",
     `  const recommendation = ${JSON.stringify(recommendationValue)}`,
     `  const decision = ${JSON.stringify(decisionValue)}`,
     "  const now = new Date().toISOString()",
@@ -8597,8 +9032,9 @@ test('AP-CODEX-V2-036 concrete runtime repairs a checker FAIL in the same Codex 
   assert.equal(tracedRoles.filter(role => role === 'worker').length, 2)
   assert.equal(tracedRoles.filter(role => /checker|reviewer|tester/.test(role)).length, 3)
   const repairWorker = traced.find(item => item.role === 'worker' && item.roleAttempt === 2)
-  assert.ok(repairWorker.argv.includes('resume'))
-  assert.ok(repairWorker.argv.indexOf('--sandbox') < repairWorker.argv.indexOf('resume'))
+  assert.equal(repairWorker.assignmentId, 'work-1-repair-1')
+  assert.equal(repairWorker.forkTurns, 'none')
+  assert.equal(repairWorker.argv.includes('resume'), false)
   for (const worker of traced.filter(item => item.role === 'worker')) {
     const cacheRoot = worker.cacheEnvironment.AUTOPROMPT_WORKER_CACHE_ROOT
     assert.equal(worker.cacheEnvironment.PYTHONDONTWRITEBYTECODE, '1')

@@ -10,6 +10,9 @@ const { execFileSync } = require('node:child_process')
 const { isDeepStrictEqual } = require('node:util')
 
 const ROOT = path.resolve(__dirname, '..', '..')
+const { RecoveryCheckpointAuthority } = require(path.join(
+  ROOT, 'agents', 'codex', 'workflow', 'recovery-checkpoint.js',
+))
 const RECORD_SCHEMA_PATH = path.join(ROOT, 'agents', 'contracts', 'schemas', 'recovery-checkpoint-record.schema.json')
 const SNAPSHOT_SCHEMA_PATH = path.join(ROOT, 'agents', 'contracts', 'schemas', 'recovery-checkpoint-snapshot.schema.json')
 const H = label => crypto.createHash('sha256').update(label).digest('hex')
@@ -538,6 +541,159 @@ test('recovery checkpoint schemas are official Draft 2020-12 and reject structur
   const invalidSnapshotCheckpoint = clone(latestSnapshot)
   invalidSnapshotCheckpoint.checkpoint.scheduler.leases = [{ arbitrary: true }]
   assertDraftInvalid(SNAPSHOT_SCHEMA_PATH, [missingLastHash, extraSnapshotField, invalidSnapshotCheckpoint])
+})
+
+test('ROADMAP repair advances plan hash exactly once at the authenticated plan-recheck lease boundary', () => {
+  const nullCandidate = { candidateId: null, candidateHash: null, frozen: false }
+  const repairId = 'roadmap-author-plan-repair'
+  const recheckId = 'roadmap-plan-recheck'
+  const priorScheduler = scheduler({
+    route: 'ROADMAP', phase: 'RUN_WORK', candidate: nullCandidate,
+    completedWorkIds: ['roadmap-author', repairId], completedCheckIds: [],
+    openCheckIds: [], nextReadyWorkIds: [recheckId], leases: [],
+  })
+  const priorRecovery = recovery({
+    frontier: {
+      nextReadyWorkIds: [recheckId], openCheckIds: [],
+      acceptedResultIds: [priorScheduler.stateHash, H('repair-result-receipt')],
+    },
+  })
+  const priorCheckpoint = checkpoint({
+    scheduler: priorScheduler, recovery: priorRecovery,
+    immutableHashes: {
+      requestEnvelopeHash: H('request'), routeDecisionHash: H('decision'),
+      planHash: H('plan-before-repair'), candidateHash: null,
+    },
+  })
+  const prior = record({
+    checkpoint: priorCheckpoint,
+    cause: {
+      kind: 'LEASE_COMPLETED', causeId: 'scheduler:1:repair:completed',
+      humanDescription: 'Persist the completed authenticated ROADMAP repair.',
+    },
+  })
+
+  const recheckLease = lease({
+    leaseId: 'lease-roadmap-recheck', workItemId: recheckId,
+    roleId: 'ap-independent-checker', status: 'ADMITTED',
+    reservationId: 'reservation-roadmap-recheck', sessionId: 'session-roadmap-recheck',
+    continuationId: 'continuation-roadmap-recheck', crashBindingHash: H('recheck-crash-binding'),
+    resources: [{ id: 'workspace:C:/exact-target/plan/ROADMAP.md', kind: 'workspace', mode: 'read', isolationId: null }],
+    usage: usage({ noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0, weightedCost: 0, latencyMs: 0, workMs: 0 }),
+    reserves: usage({ noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0, weightedCost: 0, latencyMs: 0, workMs: 0 }),
+    thread: { started: false, startedEventHash: null, startedAt: null },
+  })
+  const recheckScheduler = scheduler({
+    route: 'ROADMAP', phase: 'RUN_WORK', candidate: nullCandidate,
+    completedWorkIds: [...priorScheduler.completedWorkIds], completedCheckIds: [],
+    openCheckIds: [recheckId], nextReadyWorkIds: [`reconcile:${recheckId}`], leases: [recheckLease],
+  })
+  const recheckRecovery = recovery({
+    frontier: {
+      nextReadyWorkIds: [`reconcile:${recheckId}`], openCheckIds: [recheckId],
+      acceptedResultIds: [priorScheduler.stateHash, H('repair-result-receipt'), recheckScheduler.stateHash],
+    },
+  })
+  const current = record({
+    checkpoint: checkpoint({
+      scheduler: recheckScheduler, recovery: recheckRecovery,
+      immutableHashes: {
+        requestEnvelopeHash: H('request'), routeDecisionHash: H('decision'),
+        planHash: H('plan-after-repair'), candidateHash: null,
+      },
+    }),
+    cause: {
+      kind: 'LEASE_STARTED', causeId: 'scheduler:1:recheck:lease-started',
+      humanDescription: 'Persist the repaired-plan recheck lease before spawning it.',
+    },
+    sequence: 2, previousHash: prior.entryHash, occurredAt: '2026-08-22T01:00:02.000Z',
+  })
+  const events = Array.from({ length: 20 })
+  events[19] = {
+    hash: H('event-20'), stateAfter: 'RUN_WORK',
+    details: { stateEvent: { runId: current.authority.runId, activationNonce: current.authority.activationNonce } },
+  }
+  const checkpointAuthority = new RecoveryCheckpointAuthority({
+    paths: {
+      runRecordRoot: ROOT,
+      logPath: path.join(ROOT, '.test-recovery-checkpoints', 'records.jsonl'),
+      snapshotPath: path.join(ROOT, '.test-recovery-checkpoints', 'snapshot.json'),
+    },
+    capabilityVerifier: () => ({}), stateProvider: () => ({}),
+    accountingCheckpointVerifier: value => value, accountingCheckpointProvider: () => ({}),
+    roadmapPlanAdvanceVerifier: () => true,
+    eventLog: { readAll: () => events },
+  })
+  const rehash = value => {
+    value.checkpointPayloadHash = stableHash(value.checkpoint)
+    value.entryHash = stableHash(without(value, 'entryHash'))
+    return value
+  }
+
+  assert.equal(checkpointAuthority._validateRecord(current, prior), true)
+
+  const unverifiedAuthority = new RecoveryCheckpointAuthority({
+    paths: {
+      runRecordRoot: ROOT,
+      logPath: path.join(ROOT, '.test-recovery-checkpoints', 'unverified-records.jsonl'),
+      snapshotPath: path.join(ROOT, '.test-recovery-checkpoints', 'unverified-snapshot.json'),
+    },
+    capabilityVerifier: () => ({}), stateProvider: () => ({}),
+    accountingCheckpointVerifier: value => value, accountingCheckpointProvider: () => ({}),
+    roadmapPlanAdvanceVerifier: () => false,
+    eventLog: { readAll: () => events },
+  })
+  assert.throws(
+    () => unverifiedAuthority._validateRecord(current, prior),
+    error => error.code === 'RECOVERY_CHECKPOINT_ROLLBACK' && /planHash/.test(error.message),
+  )
+
+  const crashProjection = clone(current)
+  crashProjection.checkpoint.scheduler = clone(prior.checkpoint.scheduler)
+  crashProjection.checkpoint.recovery = clone(prior.checkpoint.recovery)
+  crashProjection.checkpoint.stateEvent = clone(prior.checkpoint.stateEvent)
+  crashProjection.cause = {
+    kind: 'CRASH_RECOVERY', causeId: 'crash-restored:2',
+    humanDescription: 'Persist the authenticated repaired plan projection after crash adoption.',
+  }
+  rehash(crashProjection)
+  assert.equal(checkpointAuthority._validateRecord(crashProjection, prior), true)
+
+  const crashWithChangedScheduler = clone(crashProjection)
+  crashWithChangedScheduler.checkpoint.scheduler.nextReadyWorkIds = ['foreign-work']
+  rehash(crashWithChangedScheduler)
+  assert.throws(
+    () => checkpointAuthority._validateRecord(crashWithChangedScheduler, prior),
+    error => ['RECOVERY_CHECKPOINT_INVALID', 'RECOVERY_CHECKPOINT_ROLLBACK'].includes(error.code),
+  )
+
+  const arbitrary = clone(current)
+  arbitrary.cause = { ...arbitrary.cause, kind: 'CHECKPOINT', causeId: 'arbitrary-plan-change' }
+  rehash(arbitrary)
+  assert.throws(
+    () => checkpointAuthority._validateRecord(arbitrary, prior),
+    error => error.code === 'RECOVERY_CHECKPOINT_ROLLBACK' && /planHash/.test(error.message),
+  )
+
+  const changedRouteDecision = clone(current)
+  changedRouteDecision.checkpoint.immutableHashes.routeDecisionHash = H('changed-decision')
+  rehash(changedRouteDecision)
+  assert.throws(
+    () => checkpointAuthority._validateRecord(changedRouteDecision, prior),
+    error => error.code === 'RECOVERY_CHECKPOINT_ROLLBACK' && /routeDecisionHash/.test(error.message),
+  )
+
+  const repeated = clone(current)
+  repeated.sequence = 3
+  repeated.previousHash = current.entryHash
+  repeated.occurredAt = '2026-08-22T01:00:03.000Z'
+  repeated.checkpoint.immutableHashes.planHash = H('second-plan-advance')
+  repeated.cause.causeId = 'scheduler:1:recheck:repeated-lease-started'
+  rehash(repeated)
+  assert.throws(
+    () => checkpointAuthority._validateRecord(repeated, current),
+    error => error.code === 'RECOVERY_CHECKPOINT_ROLLBACK' && /planHash/.test(error.message),
+  )
 })
 
 test('replay accepts one exact checkpoint and rejects gaps, tamper, rollback, cross-run, and stale accounting', () => {

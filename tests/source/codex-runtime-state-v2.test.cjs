@@ -770,6 +770,15 @@ test('checker repair mutates in REPAIRING, invalidates C1, and freezes a fresh C
   const candidateTwo = digest('candidate-two')
   const environmentHash = digest('environment')
   const dependencyHash = digest('dependency-one')
+  const checkerResultHash = digest('rejected-checker-result')
+  const checkerReceiptPath = path.join(directory, 'independent-check-1.json')
+  fs.writeFileSync(checkerReceiptPath, '{"code":"FAIL"}\n')
+  const checkerReceiptBytes = fs.readFileSync(checkerReceiptPath)
+  const checkerReceiptPointer = {
+    name: 'independent-check-1', path: checkerReceiptPath,
+    hash: sha256(checkerReceiptBytes), bytes: checkerReceiptBytes.length,
+  }
+  const rejectedCheckerReceipts = [{ ...checkerReceiptPointer, resultHash: checkerResultHash }]
   const transitionProduction = (eventId, nextState, candidateHash, nextDependencyHash) =>
     applyProductionRuntimeTransition({
       stateStore: store, capability, budgetController: { snapshot: () => null },
@@ -782,14 +791,16 @@ test('checker repair mutates in REPAIRING, invalidates C1, and freezes a fresh C
         checkerCount: 1, requiredVerdictIds: ['reviewer-verdict'],
         ...(eventId === 'IMPLEMENTATION_DEFECT' ? {
           checkerId: 'independent-check-1',
-          checkerResultHash: digest('rejected-checker-result'),
-          checkerReceiptPointer: { name: 'independent-check-1', hash: digest('checker-receipt') },
+          checkerResultHash,
+          checkerReceiptPointer,
+          rejectedCheckerReceipts,
           repairAttempt: 1,
           repairWorkItemId: 'work-1-repair-1',
         } : {}),
         ...(eventId === 'REPAIR_READY' ? {
           priorCandidateHash: candidateOne,
-          checkerResultHash: digest('rejected-checker-result'),
+          checkerResultHash,
+          rejectedCheckerReceipts,
           repairAttempt: 1,
           repairWorkItemId: 'work-1-repair-1',
         } : {}),
@@ -812,6 +823,7 @@ test('checker repair mutates in REPAIRING, invalidates C1, and freezes a fresh C
   assert.equal(store.load().assurance.candidateFreeze, null)
   assert.deepEqual(store.load().assurance.requiredVerdictIds, ['reviewer-verdict'])
   assert.equal(store.load().assurance.verdicts['reviewer-verdict'].status, 'invalidated')
+  assert.deepEqual(store.load().retryState.cumulativeRejectedCheckerReceipts, rejectedCheckerReceipts)
   fs.writeFileSync(deliverable, 'candidate two\n')
   store.commitAuthorizedMutation(permit, {
     capability, cause: 'commit C2',
@@ -827,6 +839,7 @@ test('checker repair mutates in REPAIRING, invalidates C1, and freezes a fresh C
   assert.equal(repaired.candidateHash, candidateTwo)
   assert.equal(repaired.assurance.candidateFreeze.candidateHash, candidateTwo)
   assert.equal(repaired.assurance.verdicts['reviewer-verdict'].status, 'pending')
+  assert.deepEqual(repaired.retryState.cumulativeRejectedCheckerReceipts, rejectedCheckerReceipts)
   assert.deepEqual(store.eventLog.readAll().slice(-4).map(event => event.details.stateEvent.transitionId), [
     'T027', 'T032', 'T032', 'T031',
   ])
