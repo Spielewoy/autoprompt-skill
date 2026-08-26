@@ -134,7 +134,7 @@ Agent selection changes only model/effort routing, not gates or concurrency.
 
 ### Claude Code
 
-Claude Code routing uses `opus`, `sonnet`, and `haiku`. One selected model fills all three aliases. Therefore `agents=claude-fable-5` routes every role to canonical `claude-fable-5`. Two models map stronger to `opus`/`sonnet` and weaker to `haiku`; three map strongest/middle/weakest. More than three fails explicitly.
+Claude Code routing uses `opus`, `sonnet`, and `haiku`. One selected model fills all three aliases. Therefore `agents=claude-fable-5` routes every role to canonical `claude-fable-5`. Two models map stronger to `opus`/`sonnet` and weaker to `haiku`; three map strongest/middle/weakest. More than three fail explicitly.
 
 ### Codex
 
