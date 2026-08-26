@@ -139,7 +139,7 @@
   "plainLanguageAuditedExceptions": [
     {
       "path": "agents/codex/workflow/captured-domain.js",
-      "sha256": "6226f6c08a310e7c4361ddf7b74cb6c9488cda4782a08326481e3b205e297db4",
+      "sha256": "c216728edfb1a2b6622e78f8e0eda043154e0b027abb8f8913330c398e3d02ec",
       "terms": ["candidate", "mission"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     },
@@ -151,13 +151,13 @@
     },
     {
       "path": "agents/codex/workflow/run-record.js",
-      "sha256": "f7f9cddf996666b39637374e1207084abb1f6a1ae41e6ec756250b8c6b87837d",
+      "sha256": "0f6990c7bfd16dab7928208653537bf03c1efcee0aaccc24d78b970298f049f1",
       "terms": ["candidate"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     },
     {
       "path": "agents/codex/workflow/scheduler.js",
-      "sha256": "d50c3405f727fd0d44e37b6352e8517c09ca98891b06c867dcbd4a9ba40547a5",
+      "sha256": "d9cb916dc7a1b90681bead822b72489276059f980c993cf2679d5a38217397bc",
       "terms": ["candidate", "frontier"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     }

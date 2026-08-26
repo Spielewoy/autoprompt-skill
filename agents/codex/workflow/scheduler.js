@@ -14,6 +14,12 @@ const benchmarkTimeCeiling = (defaultMs, environment = process.env) =>
   environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
   ? Number.MAX_SAFE_INTEGER
   : defaultMs
+const BENCHMARK_MAX_CHILD_LAUNCHES = 128
+const benchmarkLaunchCeiling = (defaultLaunches, environment = process.env) =>
+  environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1' ||
+    environment.AUTOPROMPT_BENCHMARK_NO_TOKEN_LIMIT === '1'
+    ? Math.max(defaultLaunches, BENCHMARK_MAX_CHILD_LAUNCHES)
+    : defaultLaunches
 
 // C0's scheduling policy is deliberately kept in a require()-able module.  A
 // provider adapter may implement the actual child launch, but it must obtain a
@@ -79,18 +85,28 @@ const PENDING_ROUTE_SETTINGS = deepFreeze({
   },
 })
 
-function benchmarkAdjustedSettings(settings, environment = process.env) {
+function benchmarkAdjustedSettings(settings, environment = process.env, options = {}) {
   if (environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT !== '1' &&
       environment.AUTOPROMPT_BENCHMARK_NO_TOKEN_LIMIT !== '1') return settings
+  const routeBudget = ROUTE_BUDGETS[settings.route]
+  const migrateLegacyLaunchDefaults = options.migrateLegacyLaunchDefaults === true &&
+    routeBudget && settings.budget.maxChildLaunches === routeBudget.maxChildLaunches
   return deepFreeze({
     ...settings,
     budget: {
       ...settings.budget,
+      maxChildLaunches: migrateLegacyLaunchDefaults
+        ? benchmarkLaunchCeiling(settings.budget.maxChildLaunches, environment)
+        : settings.budget.maxChildLaunches,
       admissionHardMs: benchmarkTimeCeiling(settings.budget.admissionHardMs, environment),
       tokens: benchmarkTokenCeilings({ ...settings.budget.tokens }, environment),
     },
     lanes: Object.fromEntries(Object.entries(settings.lanes).map(([name, lane]) => [name, {
       ...lane,
+      maxLaunches: migrateLegacyLaunchDefaults && name !== 'routeAnalyst' &&
+          lane.maxLaunches === routeBudget.maxChildLaunches
+        ? benchmarkLaunchCeiling(lane.maxLaunches, environment)
+        : lane.maxLaunches,
       tokens: benchmarkTokenCeilings({ ...lane.tokens }, environment),
     }])),
   })
@@ -229,8 +245,10 @@ function nonNegativeInteger(value, fallback) {
 function resolveRouteBudget(route, options = {}) {
   const normalized = normalizeRoute(route)
   const base = ROUTE_BUDGETS[normalized]
+  const environment = options.environment || options.baseEnvironment || process.env
   const budget = {
     ...base,
+    maxChildLaunches: benchmarkLaunchCeiling(base.maxChildLaunches, environment),
     tokens: { ...base.tokens },
     verificationReserve: VERIFICATION_RESERVE,
     recoveryReserve: RECOVERY_RESERVE,
@@ -250,7 +268,8 @@ function resolveRouteBudget(route, options = {}) {
 
   // 5 + 3/work-group is itself a ceiling, capped by the activation-wide 18.
   // It never creates a minimum or a spawn quota.
-  if (normalized === 'ROADMAP' && options.workGroups !== undefined) {
+  if (normalized === 'ROADMAP' && options.workGroups !== undefined &&
+      budget.maxChildLaunches === base.maxChildLaunches) {
     const groups = positiveInteger(options.workGroups, 1)
     budget.maxChildLaunches = Math.min(base.maxChildLaunches, 5 + (3 * groups))
   }
@@ -261,7 +280,6 @@ function resolveRouteBudget(route, options = {}) {
       positiveInteger(options.maxChildLaunches, budget.maxChildLaunches),
     )
   }
-  const environment = options.environment || options.baseEnvironment || process.env
   budget.admissionHardMs = benchmarkTimeCeiling(budget.admissionHardMs, environment)
   budget.tokens = benchmarkTokenCeilings(budget.tokens, environment)
   return deepFreeze(budget)
@@ -321,6 +339,7 @@ function validateResolvedSchedulerSettings(settings, environment = process.env) 
   const route = normalizeRoute(settings.route)
   const map = {
     ...ROUTE_BUDGETS[route],
+    maxChildLaunches: benchmarkLaunchCeiling(ROUTE_BUDGETS[route].maxChildLaunches, environment),
     tokens: benchmarkTokenCeilings(ROUTE_BUDGETS[route].tokens, environment),
   }
   const maximumLive = route === 'ROADMAP' ? map.absoluteUserLiveCeiling : map.maxLiveIncludingRoot
@@ -805,8 +824,22 @@ class CentralScheduler {
       this.settings = pendingSettings
       this.route = PENDING_ROUTE
     } else {
+      if (options.state && options.settings &&
+          stableStringify(options.settings) !== stableStringify(options.state.settings)) {
+        throw new SchedulerAdmissionError(
+          'INVALID_SCHEDULER_STATE',
+          'supplied resume settings do not match the persisted scheduler settings',
+        )
+      }
+      const rawSettings = options.settings || (options.state && options.state.settings) ||
+        resolveSchedulerSettings({ ...options, environment: this.environment })
+      const suppliedSettings = options.state
+        ? benchmarkAdjustedSettings(rawSettings, this.environment, {
+          migrateLegacyLaunchDefaults: true,
+        })
+        : rawSettings
       this.settings = validateResolvedSchedulerSettings(
-        options.settings || (options.state && options.state.settings) || resolveSchedulerSettings({ ...options, environment: this.environment }),
+        benchmarkAdjustedSettings(suppliedSettings, this.environment),
         this.environment,
       )
       this.route = normalizeRoute(this.settings.route)
@@ -909,7 +942,10 @@ class CentralScheduler {
       proofCacheMisses: 0,
     }
 
-    if (options.state) this._restore(options.state)
+    if (options.state) this._restore({
+      ...options.state,
+      settings: this.settings,
+    })
   }
 
   freezeRoute(route, resolvedSettings) {

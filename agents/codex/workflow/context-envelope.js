@@ -24,6 +24,19 @@ const DISPATCH_REQUIRED_CAPABILITIES = Object.freeze([
 ])
 const NORMAL_AUTOPROMPT_ROLE = /^ap-(?!arbiter$|re-anchor$)/
 const RECOVERY_AUTOPROMPT_ROLE = /^ap-(?:re-anchor|recovery(?:-|$))/
+const PURPOSE_RECOVERY_ROLES = new Set(['ap-worker'])
+const CHECKER_REASSESSMENT_ROLES = new Set([
+  'ap-independent-checker', 'ap-reviewer', 'ap-verifier', 'ap-fresh-verifier',
+])
+const CHECKER_REASSESSMENT_CODES = new Set([
+  'CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE', 'INDEPENDENT_CHECK_RUNTIME_RETRY',
+  'CHECK_REPORT_INVALID', 'EVIDENCE_CONSUMPTION_INVALID', 'REFERENCE_METHOD_INVALID',
+  'TEST_OUTCOMES_INVALID', 'DUPLICATE_UNDERLYING_EVIDENCE',
+  'DUPLICATE_REFERENCE_METHOD', 'DUPLICATE_REFERENCE_METHOD_CLASS',
+])
+const PLAN_CHECKER_RECOVERY_CODES = new Set([
+  'PLAN_CHECK_RUNTIME_RETRY', 'PLAN_RECHECK_RUNTIME_RETRY',
+])
 const L4_EXACT_REQUEST_ROLES = new Set([
   'ap-arbiter', 'ap-framework-validator', 'ap-fresh-verifier', 'ap-goal-checker',
   'ap-independent-checker', 'ap-intake', 'ap-juror', 'ap-preflight-probe',
@@ -32,9 +45,9 @@ const L4_EXACT_REQUEST_ROLES = new Set([
 const REQUIRED_EXACT_REQUEST_ROLES = new Set(['ap-independent-checker'])
 const CONTEXT_ROUTE_CAPS = Object.freeze({
   PENDING: Object.freeze({ briefBytes: 2048, roadmapSliceBytes: 2048, manifestBytes: 2048, fetchedEvidenceBytes: 4096, totalEnvelopeBytes: 8192 }),
-  DIRECT: Object.freeze({ briefBytes: 2048, roadmapSliceBytes: 2048, manifestBytes: 2048, fetchedEvidenceBytes: 4096, totalEnvelopeBytes: 8192 }),
-  LIGHT: Object.freeze({ briefBytes: 2048, roadmapSliceBytes: 4096, manifestBytes: 4096, fetchedEvidenceBytes: 8192, totalEnvelopeBytes: 16384 }),
-  ROADMAP: Object.freeze({ briefBytes: 2048, roadmapSliceBytes: 8192, manifestBytes: 8192, fetchedEvidenceBytes: 16384, totalEnvelopeBytes: 32768 }),
+  DIRECT: Object.freeze({ briefBytes: 2048, roadmapSliceBytes: 4096, manifestBytes: 4096, fetchedEvidenceBytes: 16384, totalEnvelopeBytes: 24576 }),
+  LIGHT: Object.freeze({ briefBytes: 2048, roadmapSliceBytes: 8192, manifestBytes: 8192, fetchedEvidenceBytes: 16384, totalEnvelopeBytes: 32768 }),
+  ROADMAP: Object.freeze({ briefBytes: 2048, roadmapSliceBytes: 16384, manifestBytes: 16384, fetchedEvidenceBytes: 32768, totalEnvelopeBytes: 65536 }),
 })
 const FORBIDDEN_BRIEF_KEYS = new Set([
   'conversation',
@@ -235,15 +248,29 @@ function firstContextField(fields, names) {
   return undefined
 }
 
-function typedRecoveryFork(role, purpose, forkTurns, recoveryContext) {
+function typedRecoveryAuthority(role, purpose, recoveryContext) {
   // Recovery may be executed by the settled physical ap-worker role.  Its
   // bounded history authority therefore comes from an explicit purpose and
-  // typed context, not solely from the provider role name.
-  const recovery = RECOVERY_AUTOPROMPT_ROLE.test(role) || String(purpose || '').toLowerCase() === 'recovery'
-  if (!recovery) return { valid: forkTurns === 'none', forkTurns: 'none', recovery: false }
-  const count = Number(forkTurns)
+  // typed context, not solely from the provider role name. Checker
+  // reassessment retains its verification accounting purpose, so admit only
+  // canonical checker roles and controller-issued reassessment codes there.
   const typed = recoveryContext && typeof recoveryContext === 'object' && !Array.isArray(recoveryContext) &&
     recoveryContext.type === 'bounded-recovery' && nonEmpty(recoveryContext.code)
+  const declaredRecovery = RECOVERY_AUTOPROMPT_ROLE.test(role) ||
+    String(purpose || '').toLowerCase() === 'recovery' && PURPOSE_RECOVERY_ROLES.has(role)
+  const normalizedPurpose = String(purpose || '').toLowerCase()
+  const checkerReassessment = typed && normalizedPurpose === 'verification' &&
+    CHECKER_REASSESSMENT_ROLES.has(role) && CHECKER_REASSESSMENT_CODES.has(recoveryContext.code)
+  const planCheckerRecovery = typed && normalizedPurpose === 'recovery' &&
+    role === 'ap-independent-checker' && PLAN_CHECKER_RECOVERY_CODES.has(recoveryContext.code)
+  return { typed, recovery: declaredRecovery || checkerReassessment || planCheckerRecovery }
+}
+
+function typedRecoveryFork(role, purpose, forkTurns, recoveryContext) {
+  const authority = typedRecoveryAuthority(role, purpose, recoveryContext)
+  const { typed, recovery } = authority
+  if (!recovery) return { valid: forkTurns === 'none', forkTurns: 'none', recovery: false }
+  const count = Number(forkTurns)
   return {
     valid: Number.isInteger(count) && count >= 1 && count <= 3 && typed,
     forkTurns: Number.isInteger(count) ? String(count) : forkTurns,
@@ -291,6 +318,7 @@ function losslessAuxiliaryBriefSlice(item) {
   const add = (key, label, value) => {
     if (compactLines(label, value).length > 0) fields[key] = value
   }
+  add('assignment', 'Assignment', item.assignment)
   if (item.successChecklist !== undefined) {
     add('successChecklist', 'Success', item.successChecklist)
   } else {
@@ -323,9 +351,8 @@ function mergeFetchedEvidenceWithBriefSlice(fetchedEvidence, briefSlice) {
 /**
  * Build a normal L3 bootstrap.  The byte ceiling applies to `brief`; the named
  * request/evidence pointers are deliberately separate, matching the P7 rule.
- * Auxiliary brief fields that cross the ceiling are moved losslessly into the
- * route-bounded fetched-evidence component. Oversized core assignments are
- * rejected and no field is silently truncated.
+ * Brief fields that cross the ceiling are moved losslessly into the
+ * route-bounded fetched-evidence component. No field is silently truncated.
  */
 function buildContextFreeBrief(input, options = {}) {
   const item = input || {}
@@ -341,7 +368,9 @@ function buildContextFreeBrief(input, options = {}) {
   const purpose = firstContextField(inputFields, ['purpose', 'workPurpose'])
   const requestedForkTurns = firstContextField(inputFields, ['forkTurns'])
   const recoveryContext = firstContextField(inputFields, ['recoveryContext'])
-  const recoveryDispatch = RECOVERY_AUTOPROMPT_ROLE.test(item.role.trim()) || String(purpose || '').toLowerCase() === 'recovery'
+  const recoveryDispatch = typedRecoveryAuthority(
+    item.role.trim(), purpose, recoveryContext,
+  ).recovery
   const forkPolicy = typedRecoveryFork(
     item.role.trim(), purpose,
     requestedForkTurns === undefined ? (recoveryDispatch ? null : 'none') : requestedForkTurns,
@@ -374,7 +403,7 @@ function buildContextFreeBrief(input, options = {}) {
     const briefSlice = losslessAuxiliaryBriefSlice(item)
     brief = [
       `Role: ${item.role.trim()}`,
-      `Assignment: ${item.assignment.trim()}`,
+      'Assignment: Read fetchedEvidence.briefSlice.fields.assignment for the exact assignment.',
       'Details: Read fetchedEvidence.briefSlice for the exact Success, Ownership, Checks, Dependencies, and Return fields.',
       '',
     ].join('\n')
@@ -789,11 +818,10 @@ function auditDispatch(dispatch, options = {}) {
   const forkTurns = dispatch && (dispatch.fork_turns ?? dispatch.forkTurns)
   const violations = []
   const purpose = dispatch && (dispatch.purpose ?? dispatch.workPurpose ?? dispatch.work_purpose) || options.purpose
-  const recovery = RECOVERY_AUTOPROMPT_ROLE.test(role) || String(purpose || '').toLowerCase() === 'recovery'
   const recoveryContext = dispatch && (dispatch.recoveryContext ?? dispatch.recovery_context)
   const forkPolicy = typedRecoveryFork(role, purpose, forkTurns, recoveryContext)
   if (!forkPolicy.valid) {
-    violations.push(recovery
+    violations.push(forkPolicy.recovery
       ? 'recovery role requires typed recoveryContext and fork_turns between 1 and 3'
       : 'non-recovery role must set fork_turns=none explicitly')
   }

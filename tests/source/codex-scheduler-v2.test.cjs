@@ -100,7 +100,7 @@ function optionalValue(overrides = {}) {
   }
 }
 
-test('benchmark scheduler policy is injected per runtime without disabling finite token or launch ceilings', () => {
+test('benchmark scheduler policy removes premature runtime ceilings while retaining a finite launch guard', () => {
   const environment = { AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' }
   const clock = { now: 0 }
   const scheduler = new CentralScheduler({
@@ -108,7 +108,8 @@ test('benchmark scheduler policy is injected per runtime without disabling finit
   })
   assert.equal(scheduler.budget.admissionHardMs, Number.MAX_SAFE_INTEGER)
   assert.equal(scheduler.budget.tokens.noncachedInput, ROUTE_BUDGETS.DIRECT.tokens.noncachedInput)
-  assert.equal(scheduler.budget.maxChildLaunches, ROUTE_BUDGETS.DIRECT.maxChildLaunches)
+  assert.equal(scheduler.budget.maxChildLaunches, 128)
+  assert.equal(scheduler.settings.lanes.main.maxLaunches, 128)
   clock.now = 48 * 60 * 60 * 1000
   scheduler.recordAdmissionComponent('configuration', 25 * 60 * 60 * 1000)
   scheduler.recordAdmissionComponent('routeAnalyst', 23 * 60 * 60 * 1000)
@@ -117,6 +118,64 @@ test('benchmark scheduler policy is injected per runtime without disabling finit
   const ordinary = createTestScheduler()
   ordinary.recordAdmissionComponent('routeAnalyst', 25 * 60 * 60 * 1000)
   assert.ok(ordinary.checkAdmissionTime().breaches.includes('routeAnalyst'))
+})
+
+test('benchmark repair and reassessment paths retain launch capacity beyond the old eight-launch stop', async () => {
+  const scheduler = new CentralScheduler({
+    route: 'DIRECT', runIdentity: TEST_RUN,
+    environment: { AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' },
+  })
+  for (let index = 1; index <= 9; index += 1) {
+    finish(await admit(scheduler, { workItemId: `required-stage-${index}` }))
+  }
+  assert.equal(scheduler.getMetrics().counters.totalLaunches, 9)
+  assert.equal(scheduler.budget.maxChildLaunches, 128)
+})
+
+test('benchmark resume widens a legacy eight-launch checkpoint without resetting its counters', async () => {
+  const legacy = createTestScheduler()
+  for (let index = 1; index <= 7; index += 1) {
+    finish(await admit(legacy, { workItemId: `legacy-stage-${index}` }))
+  }
+  const state = structuredClone(legacy.exportState())
+  const resumed = new CentralScheduler({
+    route: 'DIRECT', settings: state.settings, state,
+    runIdentity: TEST_RUN,
+    environment: { AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' },
+  })
+  assert.equal(resumed.getMetrics().counters.totalLaunches, 7)
+  assert.equal(resumed.budget.maxChildLaunches, 128)
+  assert.equal(resumed.settings.lanes.main.maxLaunches, 128)
+  finish(await admit(resumed, { workItemId: 'legacy-stage-8' }))
+  finish(await admit(resumed, { workItemId: 'legacy-stage-9' }))
+  assert.equal(resumed.getMetrics().counters.totalLaunches, 9)
+})
+
+test('benchmark launch migration preserves explicit activation and lane ceilings', () => {
+  const environment = { AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' }
+  const activationCapped = new CentralScheduler({
+    route: 'DIRECT', runIdentity: TEST_RUN, environment, maxChildLaunches: 5,
+  })
+  assert.equal(activationCapped.budget.maxChildLaunches, 5)
+  assert.equal(activationCapped.settings.lanes.main.maxLaunches, 5)
+
+  const laneCapped = new CentralScheduler({
+    route: 'DIRECT', runIdentity: TEST_RUN, environment,
+    lanes: { main: { maxLaunches: 2 } },
+  })
+  assert.equal(laneCapped.budget.maxChildLaunches, 128)
+  assert.equal(laneCapped.settings.lanes.main.maxLaunches, 2)
+})
+
+test('resume authenticates supplied settings before any benchmark migration', () => {
+  const saved = new CentralScheduler({
+    route: 'DIRECT', runIdentity: TEST_RUN, maxChildLaunches: 5,
+    lanes: { main: { maxLaunches: 2 } },
+  }).exportState()
+  assert.throws(() => new CentralScheduler({
+    route: 'DIRECT', runIdentity: TEST_RUN, state: saved,
+    settings: resolveSchedulerSettings({ route: 'DIRECT' }),
+  }), error => error.code === 'INVALID_SCHEDULER_STATE')
 })
 
 test('P7 route ceilings are exact ceilings, not launch quotas', () => {
@@ -356,13 +415,78 @@ test('context-free L3 brief stays under 2KB and L4 loads byte-identical request'
     providerCapabilities: PROVIDER_CAPABILITIES,
     fullHistory: ['unrelated turn'],
   }), (error) => error.code === 'INHERITED_CONTEXT_FORBIDDEN')
-  assert.throws(() => buildContextFreeBrief({
+  const oversizedAssignment = buildContextFreeBrief({
     role: 'ap-implementer',
     assignment: 'x'.repeat(MAX_L3_BRIEF_BYTES),
     requestPointer: pointer,
     providerCapabilities: PROVIDER_CAPABILITIES,
-  }), (error) => error.code === 'BRIEF_TOO_LARGE')
+  })
+  assert.ok(oversizedAssignment.briefBytes <= MAX_L3_BRIEF_BYTES)
+  assert.equal(oversizedAssignment.brief.includes('x'.repeat(64)), false)
+  assert.equal(oversizedAssignment.fetchedEvidence.briefSlice.fields.assignment,
+    'x'.repeat(MAX_L3_BRIEF_BYTES))
+  assert.equal(auditDispatch(oversizedAssignment).conformant, true)
+  const realisticCheckerAssignment = buildCheckerContext({
+    role: 'ap-independent-checker', purpose: 'verification',
+    assignment: 'Execute every exact route-planned acceptance check. '.repeat(120),
+    checks: Array.from({ length: 8 }, (_, index) =>
+      `Run downstream acceptance check ${index + 1} with positive, negative, and boundary cases.`),
+    requestPointer: pointer, providerCapabilities: PROVIDER_CAPABILITIES,
+    fetchedEvidence: {
+      verificationDoctrine: Array.from({ length: 6 }, (_, index) =>
+        `Independent verification obligation ${index + 1}: bind observed output to the saved deliverable.`),
+    },
+  })
+  assert.ok(realisticCheckerAssignment.briefBytes <= MAX_L3_BRIEF_BYTES)
+  assert.ok(realisticCheckerAssignment.contextBudget.componentBytes.fetchedEvidence <= 16384)
+  assert.equal(auditDispatch(realisticCheckerAssignment).conformant, true)
   assert.equal(auditDispatch({ role: 'ap-worker', fork_turns: 'all', fullHistory: [] }).conformant, false)
+})
+
+test('typed checker reassessment carries bounded recovery context without an internal policy stop', t => {
+  const directory = tempDirectory(t, 'autoprompt-checker-recovery-envelope-')
+  const pointer = writeRequestEnvelope(directory, 'Verify the repaired candidate.\n', { route: 'DIRECT' })
+  const recoveryContext = { type: 'bounded-recovery', code: 'DUPLICATE_REFERENCE_METHOD_CLASS' }
+  const dispatch = buildCheckerContext({
+    role: 'ap-independent-checker',
+    purpose: 'verification',
+    assignment: 'Repeat the independent check with a distinct reference method.',
+    requestPointer: pointer,
+    expectedRequestHash: pointer.hash,
+    candidateHash: 'a'.repeat(64),
+    providerCapabilities: PROVIDER_CAPABILITIES,
+    forkTurns: 1,
+    recoveryContext,
+  })
+  assert.equal(dispatch.fork_turns, '1')
+  assert.deepEqual(dispatch.recoveryContext, recoveryContext)
+  assert.equal(auditDispatch(dispatch).conformant, true)
+
+  for (const code of ['PLAN_CHECK_RUNTIME_RETRY', 'PLAN_RECHECK_RUNTIME_RETRY']) {
+    const planRetry = buildCheckerContext({
+      role: 'ap-independent-checker', purpose: 'recovery',
+      assignment: 'Retry the plan check with fresh evidence.',
+      requestPointer: pointer, expectedRequestHash: pointer.hash,
+      candidateHash: 'b'.repeat(64), providerCapabilities: PROVIDER_CAPABILITIES,
+      forkTurns: 1, recoveryContext: { type: 'bounded-recovery', code },
+    })
+    assert.equal(auditDispatch(planRetry).conformant, true)
+  }
+
+  for (const [role, purpose, code] of [
+    ['ap-worker', 'implementation', 'DUPLICATE_REFERENCE_METHOD_CLASS'],
+    ['ap-independent-checker', 'verification', 'ARBITRARY_RECOVERY_CODE'],
+    ['ap-independent-checker', 'recovery', 'ARBITRARY_RECOVERY_CODE'],
+    ['ap-reviewer', 'recovery', 'PLAN_CHECK_RUNTIME_RETRY'],
+    ['ap-run-owner', 'implementation', 'ARBITRARY_RECOVERY_CODE'],
+    ['ap-run-owner', 'recovery', 'ARBITRARY_RECOVERY_CODE'],
+    ['ap-route-analyst', 'recovery', 'ARBITRARY_RECOVERY_CODE'],
+  ]) {
+    assert.equal(auditDispatch({
+      role, purpose, fork_turns: '1',
+      recoveryContext: { type: 'bounded-recovery', code },
+    }).conformant, false)
+  }
 })
 
 test('route transcript content-addresses large outputs and rejects an oversized index', t => {
@@ -881,7 +1005,10 @@ test('L4 excludes only its exact hash-bound request from the auxiliary envelope 
     ['checker exact request does not match its immutable request pointer'])
   assert.ok(auditDispatch({ ...checker, role: 'ap-worker' }).violations.includes(
     'non-L4 dispatch cannot carry the exact request'))
-  assert.ok(auditDispatch({ ...checker, fetchedEvidence: 'y'.repeat(5000) }).violations.some(
+  assert.ok(auditDispatch({
+    ...checker,
+    fetchedEvidence: 'y'.repeat(CONTEXT_ROUTE_CAPS.DIRECT.fetchedEvidenceBytes + 1),
+  }).violations.some(
     violation => violation.includes('fetchedEvidence exceeds')))
 
   const missing = { ...checker }

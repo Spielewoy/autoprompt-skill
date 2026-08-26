@@ -115,6 +115,14 @@ const CHECKER_REASSESSMENT_CODES = new Set([
   'DUPLICATE_UNDERLYING_EVIDENCE', 'DUPLICATE_REFERENCE_METHOD',
   'DUPLICATE_REFERENCE_METHOD_CLASS',
 ])
+const CHECKER_FALSIFICATION_DOCTRINE = Object.freeze([
+  'Derive expected behavior from the request, durable inputs, or an independent source; never from the subject implementation.',
+  'For mappings, joins, references, identity, or deduplication, exercise at least three distinct entities and prove both forward consistency and reverse non-collision.',
+  'For dates, versions, revocations, merges, migrations, or state transitions, test before, exactly at, between, and after each boundary, including a chained transition.',
+  'For generated or serialized artifacts, reopen the saved deliverable through the actual downstream consumer/export path and prove non-empty requested topology and measurements. A custom or relationship-only parser is never a substitute; if the consumer cannot run, return CHECK_INCONCLUSIVE.',
+  'For parsers, sanitizers, interpreters, or security boundaries, test the actual shipped runtime plus encoded, namespaced, malformed, mutation, and interaction-triggered cases. A self-authored substitute parser cannot authorize PASS; if the actual runtime cannot run, return CHECK_INCONCLUSIVE.',
+  'A missing positive, negative, or boundary witness is CHECK_INCONCLUSIVE, never PASS.',
+])
 const CONTROLLER_FAILURE_RELEASE_STATES = new Set([
   'LOAD_SKILL', 'STORE_REQUEST_ENVELOPE', 'RESOLVE_SETTINGS', 'SELECT_SAFE_RUN_ROOT',
   'CREATE_RUN_RECORD', 'CHECK_PROVIDER_CAPABILITIES', 'START_ROUTE_ANALYST',
@@ -1934,10 +1942,34 @@ function validateLiveCheckingPlan(decision = {}) {
       'live checker execution requires the exact one-or-two seat plan with distinct named risks',
     )
   }
+  const semanticRiskRequiresTwoCheckers = Boolean(
+    (decision.capturedDomainContracts || []).some(contract =>
+      contract && contract.kind === 'HIDDEN_EXTERNAL_ORACLE') ||
+    (decision.risks || []).length > 0 || (decision.missingInformation || []).length > 0,
+  )
+  const responsibilities = [...checking.responsibilities]
+  const semanticObligations = [
+    ...(decision.risks || []), ...(decision.missingInformation || []),
+  ].filter(value => typeof value === 'string' && value.trim())
+  if (checkerCount === 1 && semanticRiskRequiresTwoCheckers) {
+    const boundary = semanticObligations.length > 0
+      ? semanticObligations.join(' | ')
+      : (decision.plannedChecks || []).find(value => typeof value === 'string' && value.trim()) ||
+        'the requested behavior boundary'
+    responsibilities.push(
+      `Independently falsify the exact version with positive, negative, and boundary observations for: ${boundary}`,
+    )
+  } else if (checkerCount === 2 && semanticObligations.length > 0) {
+    responsibilities[1] = `${responsibilities[1]} Explicitly falsify these semantic risks and unknowns: ${semanticObligations.join(' | ')}`
+  }
   return Object.freeze({
-    checkerCount,
-    responsibilities: Object.freeze([...checking.responsibilities]),
-    nonOverlapReason: checking.nonOverlapReason || null,
+    checkerCount: responsibilities.length,
+    responsibilities: Object.freeze(responsibilities),
+    nonOverlapReason: semanticRiskRequiresTwoCheckers
+      ? 'The second seat independently falsifies the highest-risk semantic boundary with a distinct evidence source and method.'
+      : checking.nonOverlapReason || (responsibilities.length > 1
+      ? 'The second seat independently falsifies semantic boundaries with a distinct evidence source and method.'
+      : null),
   })
 }
 
@@ -2065,7 +2097,7 @@ function canonicalCheckerTestOutcomes(supplied, namedChecks = []) {
         Object.keys(item).some(key => !['command', 'status', 'fingerprint'].includes(key)) ||
         typeof item.command !== 'string' || !expected.has(item.command) || seen.has(item.command) ||
         !['PASS', 'FAIL'].includes(item.status) || typeof item.fingerprint !== 'string' ||
-        !item.fingerprint.trim() || item.fingerprint.length > 512) return null
+        !/^[a-f0-9]{64}$/u.test(item.fingerprint)) return null
     seen.add(item.command)
     outcomes.push(Object.freeze({
       command: item.command,
@@ -2546,6 +2578,7 @@ function createCodexJsonlAccumulator() {
   const maximumRetainedEvents = 256
   const state = {
     events: [], eventCount: 0, sessionId: null, finalText: null, output: null, usage: null,
+    messageOutputs: [], messageOutputsOverflow: false,
     eventHash: crypto.createHash('sha256'),
   }
   state.eventHash.update('[')
@@ -2569,6 +2602,8 @@ function createCodexJsonlAccumulator() {
           try { state.output = JSON.parse(state.finalText) } catch {
             state.output = { outcome: 'FAILED', terminalEnvelope: { status: 'OUTPUT_SCHEMA_INVALID' }, text: state.finalText }
           }
+          if (state.messageOutputs.length < maximumRetainedEvents) state.messageOutputs.push(state.output)
+          else state.messageOutputsOverflow = true
         }
       }
       if (event.type === 'turn.completed') state.usage = codexUsageFromEvent(event)
@@ -2581,6 +2616,8 @@ function createCodexJsonlAccumulator() {
         eventStreamHash: eventStreamHash(),
         finalText: state.finalText,
         output: state.output,
+        messageOutputs: state.messageOutputs.slice(),
+        messageOutputsOverflow: state.messageOutputsOverflow,
         sessionId: state.sessionId,
         usage: state.usage,
       }
@@ -2589,6 +2626,8 @@ function createCodexJsonlAccumulator() {
       return {
         events: [...state.events], eventCount: state.eventCount, retainedEventCount: state.events.length,
         eventStreamHash: eventStreamHash(), finalText: state.finalText, output: state.output,
+        messageOutputs: state.messageOutputs.slice(),
+        messageOutputsOverflow: state.messageOutputsOverflow,
         sessionId: state.sessionId, usage: state.usage,
       }
     },
@@ -3294,6 +3333,21 @@ class CodexExecAdapter {
     let terminalReceiptPersisted = false
     let committedTerminalResult = null
     let firstProductSignalPersisted = false
+    const distinctTerminalCandidates = parsed => {
+      const candidates = new Map()
+      const outputs = Array.isArray(parsed && parsed.messageOutputs)
+        ? parsed.messageOutputs : [parsed && parsed.output]
+      for (const rawOutput of outputs) {
+        if (!rawOutput || typeof rawOutput !== 'object') continue
+        let output = rawOutput
+        if (this.providerSchemaRoot && typeof output.canonicalJson === 'string') {
+          try { output = decodeCodexProviderEnvelope(output) } catch { continue }
+        }
+        if (!validateJsonSchema(canonicalSchema, output).valid) continue
+        candidates.set(hashText(stableStringify(output)), output)
+      }
+      return candidates
+    }
     const assembledResult = (parsed, completionRequested, decodedOutput = null) => {
       const output = decodedOutput || parsed.output || {}
       return {
@@ -3420,19 +3474,35 @@ class CodexExecAdapter {
         }
       }
       const current = streamAccumulator.watermark()
+      if (typedTerminal) return
       let currentOutput = current.output
-      // Codex may emit commentary/progress as earlier agent_message items even
-      // when --output-schema is active.  Only the last agent message is the
-      // structured terminal value, and it is terminal only after the matching
-      // turn.completed event supplies complete usage.  Decoding an earlier
-      // progress envelope here would cancel a healthy turn as a transport
-      // failure before Codex can emit its actual structured result.
-      if (current.usage && this.providerSchemaRoot && currentOutput &&
-          typeof currentOutput.canonicalJson === 'string') {
-        try { currentOutput = decodeCodexProviderEnvelope(currentOutput) } catch (error) {
-          streamError = error
-          stop(error.code)
+      if (current.usage) {
+        if (current.messageOutputsOverflow) {
+          streamError = new SupervisorIntegrationError(
+            'CODEX_TERMINAL_CANDIDATE_OVERFLOW',
+            'one Codex turn exceeded the bounded terminal-output history',
+          )
+          stop(streamError.code)
           return
+        }
+        const candidates = distinctTerminalCandidates(current)
+        if (candidates.size > 1) {
+          streamError = new SupervisorIntegrationError(
+            'CODEX_MULTIPLE_TERMINAL_OUTPUTS',
+            'one Codex turn emitted conflicting schema-valid terminal outputs',
+            { candidateHashes: [...candidates.keys()].sort() },
+          )
+          stop(streamError.code)
+          return
+        }
+        if (candidates.size === 1) currentOutput = candidates.values().next().value
+        else if (this.providerSchemaRoot && currentOutput &&
+            typeof currentOutput.canonicalJson === 'string') {
+          try { currentOutput = decodeCodexProviderEnvelope(currentOutput) } catch (error) {
+            streamError = error
+            stop(error.code)
+            return
+          }
         }
       }
       const schemaValidation = current.usage && currentOutput
@@ -3507,7 +3577,22 @@ class CodexExecAdapter {
       throw new SupervisorIntegrationError('CODEX_USAGE_INCOMPLETE', 'Codex child ended without all four usage categories')
     }
     if (committedTerminalResult) return committedTerminalResult
-    if (this.providerSchemaRoot) parsed.output = decodeCodexProviderEnvelope(parsed.output)
+    if (parsed.messageOutputsOverflow) {
+      throw new SupervisorIntegrationError(
+        'CODEX_TERMINAL_CANDIDATE_OVERFLOW',
+        'one Codex turn exceeded the bounded terminal-output history',
+      )
+    }
+    const terminalCandidates = distinctTerminalCandidates(parsed)
+    if (terminalCandidates.size > 1) {
+      throw new SupervisorIntegrationError(
+        'CODEX_MULTIPLE_TERMINAL_OUTPUTS',
+        'one Codex turn emitted conflicting schema-valid terminal outputs',
+        { candidateHashes: [...terminalCandidates.keys()].sort() },
+      )
+    }
+    if (terminalCandidates.size === 1) parsed.output = terminalCandidates.values().next().value
+    else if (this.providerSchemaRoot) parsed.output = decodeCodexProviderEnvelope(parsed.output)
     const finalSchemaValidation = validateJsonSchema(canonicalSchema, parsed.output)
     const schemaInvalidCanEnterCorrection = record.logicalRole === 'route-analyst' ||
       (record.logicalRole === 'run-owner' && record.route === 'PRE_ROUTE')
@@ -6417,8 +6502,11 @@ class CodexSupervisorRuntime {
         success: decision.successChecklist || [],
         checks: replayChecks,
         risks: decision.risks || [],
-        fetchedEvidence: assignedDomainContracts.length > 0
-          ? { capturedDomainContracts: assignedDomainContracts } : null,
+        fetchedEvidence: {
+          verificationDoctrine: CHECKER_FALSIFICATION_DOCTRINE,
+          ...(assignedDomainContracts.length > 0
+            ? { capturedDomainContracts: assignedDomainContracts } : {}),
+        },
         ...(resumedPlanPointer ? { roadmapSlice: resumedPlanPointer } : {}),
         ...(resumedPlanPointer ? {
           adoptedProjectionIdentity: {
@@ -10349,6 +10437,7 @@ function writeRouteDecisionArtifacts(record, decision) {
 }
 
 function renderPlanArtifact(route, decision, authorResult = null) {
+  const checking = validateLiveCheckingPlan(decision)
   const lines = [
     `# ${route === 'ROADMAP' ? 'ROADMAP' : route === 'LIGHT' ? 'Light Plan' : 'Success Card'}`,
     '',
@@ -10363,6 +10452,18 @@ function renderPlanArtifact(route, decision, authorResult = null) {
     '## Ownership',
     ...(decision.mutableResourceOwnership || []).map(item =>
       `- ${item.owner}: ${item.kind}:${item.identity} (${item.ownershipMode})`),
+    '',
+    '## Risks to falsify',
+    ...markdownDecisionList(decision.risks),
+    '',
+    '## Information to resolve before editing',
+    ...markdownDecisionList(decision.missingInformation),
+    '',
+    'For every item above, derive an observable positive, negative, and boundary witness from the request or an independent source. Do not validate the implementation with a second copy of its own assumptions.',
+    '',
+    '## Independent verification',
+    ...checking.responsibilities.map((item, index) => `- Seat ${index + 1}: ${item}`),
+    `- Separation: ${checking.nonOverlapReason || 'One independently derived method is sufficient for the recorded ordinary risk.'}`,
   ]
   if (route === 'LIGHT') lines.push('', '## Short order', `- ${decision.chosenRouteReason}`)
   if (route === 'ROADMAP') {
@@ -10397,7 +10498,9 @@ function deterministicChecksForDecision(decision, route) {
     overlaySteps: decision.overlaySteps || decision.overlayExecution || [],
   })
   if (recipe.status !== 'SUPPORTED') return []
-  return [...new Set([...recipe.checks, ...recipe.riskChecks])]
+  return [...new Set([
+    ...recipe.checks, ...recipe.riskChecks, ...(decision.plannedChecks || []),
+  ])]
 }
 
 function createReadOnlyFinalResponse(decision, workResults) {
@@ -12287,6 +12390,7 @@ function createDefaultRouteExecutor(options) {
       : Array.isArray(decision.regressionBaseline) ? decision.regressionBaseline : []
     const checkerNamedChecks = [...new Set([
       ...checks,
+      ...(decision.plannedChecks || []),
       ...regressionBaseline.map(item => item && (item.command || item.id)).filter(Boolean),
     ])]
     const independentVerdicts = []
@@ -12545,7 +12649,7 @@ function createDefaultRouteExecutor(options) {
       for (let index = 0; index < checkerCount; index += 1) {
       const oracle = `independent-check-${index + 1}`
       const canonicalCheckerId = `independent-check-${index + 1}`
-      const checkerAssignment = checking.responsibilities[index] || checking.responsibilities[0]
+      const checkerAssignment = checking.responsibilities[index]
       const assignedDomainContracts = index === 0 ? checkerDomainContracts : []
       let workItemId
       let result
@@ -12594,8 +12698,8 @@ function createDefaultRouteExecutor(options) {
             ? ` Correct the prior non-authoritative report identified by ${retryReason.code}; use distinct underlying evidence when another checker conflict is named.`
             : ''}` +
           ' Return the immutable underlying evidence identifiers you actually consumed in payload.evidenceIds; acceptance-check labels are not evidence identifiers.' +
-          ' Return payload.referenceMethod with methodClass exactly equal to one of requirements-review, authoritative-suite, black-box-boundary, metamorphic-property, or independent-model; also return source, procedure, expectedOutputDerivedFromSubjectCode=false, subjectLogicReimplemented=false, and non-empty positiveInvariants, negativeInvariants, and boundaryInvariants. Execute every accessible pre-existing test and acceptance command; do not substitute only self-authored examples. Expected results must come from an independent source or property.' +
-          ' Return payload.testOutcomes with one entry for every named check: command must exactly equal the named check, status must be PASS or FAIL, and fingerprint must identify the observed output.',
+          ' Return payload.referenceMethod with methodClass exactly equal to one of requirements-review, authoritative-suite, black-box-boundary, metamorphic-property, or independent-model; also return source, procedure, expectedOutputDerivedFromSubjectCode=false, subjectLogicReimplemented=false, and non-empty positiveInvariants, negativeInvariants, and boundaryInvariants. Execute every accessible pre-existing test and acceptance command; do not substitute only self-authored examples. Expected results must come from an independent source or property. Follow fetchedEvidence.verificationDoctrine exactly; treat PASS as an attempted falsification, not a plausibility review.' +
+          ' Return payload.testOutcomes with one entry for every named check: command must exactly equal the named check, status must be PASS or FAIL, and fingerprint must be the lowercase SHA-256 digest of the observed output.',
         candidateHash, oracle, success: successes, checks: checkerNamedChecks,
         isolation: 'snapshot',
         writeProducing: true,
@@ -12604,13 +12708,12 @@ function createDefaultRouteExecutor(options) {
         firstResponsibility: checking.responsibilities[0],
         secondResponsibility: checking.responsibilities[1],
         bounded: true,
-        fetchedEvidence: assignedDomainContracts.length > 0 || retryReason
-          ? {
+        fetchedEvidence: {
+              verificationDoctrine: CHECKER_FALSIFICATION_DOCTRINE,
               ...(assignedDomainContracts.length > 0
                 ? { capturedDomainContracts: assignedDomainContracts } : {}),
               ...(retryReason ? { controllerReassessment: retryReason } : {}),
-            }
-          : null,
+            },
         deferredPromotionToken: deferredPromotion && deferredPromotion.token || null,
         ...(retryAttempt > 0 && checkerRuntimeProgressHashes[index]
           ? { evidenceHashes: [checkerRuntimeProgressHashes[index]] }

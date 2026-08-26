@@ -287,7 +287,13 @@ function evaluateOutcome(contract, outcome) {
   return {
     valid: errors.length === 0,
     status: errors.length === 0 ? 'CAPTURED_DOMAIN_ACCEPTED' : 'CAPTURED_DOMAIN_OUTCOME_INVALID',
-    localDoneAllowed: contract.kind !== 'HIDDEN_EXTERNAL_ORACLE',
+    // A hidden evaluator cannot be invoked from the task container. Recording
+    // that boundary must strengthen the local checks, not turn an otherwise
+    // completed task into PARTIAL forever. A valid boundary outcome means the
+    // controller did not claim to have run the hidden oracle; the independently
+    // checked local candidate may still be returned as DONE for the outer
+    // harness to evaluate.
+    localDoneAllowed: errors.length === 0,
     errors,
     outcomeHash: errors.length === 0
       ? crypto.createHash('sha256').update(JSON.stringify(outcome)).digest('hex')

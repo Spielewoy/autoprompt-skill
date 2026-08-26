@@ -50,7 +50,7 @@ const RUNTIME_PATHS = Object.freeze({
 const RUN_DIRECTORIES = Object.freeze([
   'request', 'request/objects', 'request/objects/sha256',
   'route', 'route/objects', 'route/objects/sha256',
-  'plan', 'work', 'work/assignments', 'work/results',
+  'plan', 'plan/projections', 'work', 'work/assignments', 'work/results',
   'checks', 'checks/review-results', 'checks/test-results',
   'runtime', 'runtime/blobs', 'runtime/process-control', 'runtime/recovered-locks',
   'runtime/recovery', 'runtime/recovery/incomplete-accounting-tail',
@@ -76,6 +76,7 @@ const EXACT_REGISTERED_PATHS = new Set([
 const REGISTERED_PREFIXES = Object.freeze([
   'request/objects/sha256/', 'request/recovered-locks/', 'request/recovery/incomplete-envelope-tail/',
   'route/objects/sha256/', 'route/recovered-locks/', 'route/recovery/incomplete-transcript-tail/',
+  'plan/projections/',
   'work/assignments/', 'work/results/', 'checks/review-results/', 'checks/test-results/', 'runtime/blobs/', 'runtime/process-control/',
   'compatibility/recovered-locks/',
   'compatibility/recovery/incomplete-alias-tail/',
@@ -116,6 +117,7 @@ function normalizeRelativePath(relativePath) {
 function contentAddressedPathValid(relative) {
   const basename = path.posix.basename(relative)
   if (relative.startsWith('request/objects/sha256/') || relative.startsWith('route/objects/sha256/') || relative.startsWith('runtime/blobs/')) return /^[a-f0-9]{64}$/.test(basename)
+  if (relative.startsWith('plan/projections/')) return /^plan\/projections\/[a-f0-9]{64}\.json$/.test(relative)
   if (relative.includes('/recovered-locks/')) return /^[a-f0-9]{64}\.json$/.test(basename)
   if (relative.includes('/incomplete-envelope-tail/') || relative.includes('/incomplete-transcript-tail/')) return /^[a-f0-9]{64}\.bin$/.test(basename)
   if (relative.includes('/incomplete-alias-tail/')) return /^[a-f0-9]{64}\.bin$/.test(basename)

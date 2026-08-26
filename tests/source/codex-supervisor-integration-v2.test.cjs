@@ -48,6 +48,7 @@ const {
   resumePlanProjectionAccepted,
   safeEnvironmentFactory,
   selectWorkRecipe,
+  validateLiveCheckingPlan,
   verifyActivationProviderAttestation,
 } = require(path.join(WORKFLOW, 'phase-budget.js'))
 const { BudgetController } = require(path.join(WORKFLOW, 'budget-controller.js'))
@@ -133,7 +134,7 @@ function checkerTestOutcomes(request, label = request.workItemId) {
   return (request.checks || []).map(command => ({
     command,
     status: 'PASS',
-    fingerprint: `${label}:${crypto.createHash('sha256').update(command).digest('hex')}`,
+    fingerprint: crypto.createHash('sha256').update(`${label}:${command}`).digest('hex'),
   }))
 }
 
@@ -224,7 +225,8 @@ test('checker contract and aggregate evidence defects trigger bounded evidence-b
           evidenceIds: [evidenceId],
           referenceMethod: checkerReferenceMethod(methodClass, request.workItemId),
           testOutcomes: request.checks.map(command => ({
-            command, status: 'PASS', fingerprint: `focused:${request.workItemId}:${command}`,
+            command, status: 'PASS', fingerprint: crypto.createHash('sha256')
+              .update(`focused:${request.workItemId}:${command}`).digest('hex'),
           })),
         },
       }
@@ -251,7 +253,8 @@ test('checker contract and aggregate evidence defects trigger bounded evidence-b
         evidenceIds: ['evidence:shared-first-pass'],
         referenceMethod: checkerReferenceMethod('invented-composite-method', 'independent-check-1'),
         testOutcomes: checks[0].checks.map(command => ({
-          command, status: 'PASS', fingerprint: `focused:independent-check-1:${command}`,
+          command, status: 'PASS', fingerprint: crypto.createHash('sha256')
+            .update(`focused:independent-check-1:${command}`).digest('hex'),
         })),
       },
     })).digest('hex'),
@@ -404,6 +407,10 @@ test('malformed adapter checker output becomes durable non-authoritative evidenc
   const directory = tempDirectory(t, 'autoprompt-malformed-checker-retry-')
   const targetPath = createTempGitTarget(directory)
   const routeDecision = decision('DIRECT')
+  routeDecision.plannedChecks = [
+    'Reopen the serialized deliverable through the downstream consumer and require non-empty output.',
+    'Exercise before, exactly at, between, and after each effective-date boundary.',
+  ]
   const requests = []
   const persisted = []
   const executor = createDefaultRouteExecutor({
@@ -509,7 +516,8 @@ test('every independent checker PASS stays provisional until evidence consumptio
           referenceMethod: checkerReferenceMethod(
             second ? 'black-box-boundary' : 'authoritative-suite', request.workItemId),
           testOutcomes: request.checks.map(command => ({
-            command, status: 'PASS', fingerprint: `focused:${request.workItemId}:${command}`,
+            command, status: 'PASS', fingerprint: crypto.createHash('sha256')
+              .update(`focused:${request.workItemId}:${command}`).digest('hex'),
           })),
         },
       }
@@ -566,8 +574,8 @@ test('provisional checker PASS is never cached when a failed named outcome remai
             command,
             status: command === namedCheck ? 'FAIL' : 'PASS',
             fingerprint: command === namedCheck
-              ? 'new-failure-fingerprint'
-              : `pass:${crypto.createHash('sha256').update(command).digest('hex')}`,
+              ? crypto.createHash('sha256').update('new-failure-fingerprint').digest('hex')
+              : crypto.createHash('sha256').update(`pass:${command}`).digest('hex'),
           })),
         },
       }
@@ -595,7 +603,9 @@ test('crash-restored completed checker retry is consumed exactly once without a 
     runtimeSignals: retryDecision.runtimeSignals || {},
     overlaySteps: retryDecision.overlaySteps || retryDecision.overlayExecution || [],
   })
-  const retryChecks = [...new Set([...retryRecipe.checks, ...retryRecipe.riskChecks])]
+  const retryChecks = [...new Set([
+    ...retryRecipe.checks, ...retryRecipe.riskChecks, ...retryDecision.plannedChecks,
+  ])]
   const retryResult = {
     code: 'PASS',
     currentVersionHash: candidateHash,
@@ -605,7 +615,7 @@ test('crash-restored completed checker retry is consumed exactly once without a 
       testOutcomes: retryChecks.map(command => ({
         command,
         status: 'PASS',
-        fingerprint: `restored:${crypto.createHash('sha256').update(command).digest('hex')}`,
+        fingerprint: crypto.createHash('sha256').update(`restored:${command}`).digest('hex'),
       })),
     },
   }
@@ -709,7 +719,9 @@ test('controller-rejected provisional PASS cannot conflict with its completed co
     runtimeSignals: routeDecision.runtimeSignals || {},
     overlaySteps: routeDecision.overlaySteps || routeDecision.overlayExecution || [],
   })
-  const retryChecks = [...new Set([...retryRecipe.checks, ...retryRecipe.riskChecks])]
+  const retryChecks = [...new Set([
+    ...retryRecipe.checks, ...retryRecipe.riskChecks, ...routeDecision.plannedChecks,
+  ])]
   const baseId = 'independent-check-1'
   const retryId = `${baseId}-runtime-retry-1`
   const records = {
@@ -719,7 +731,8 @@ test('controller-rejected provisional PASS cannot conflict with its completed co
         evidenceIds: ['evidence:provisional-base'],
         referenceMethod: checkerReferenceMethod('authoritative-suite', baseId),
         testOutcomes: retryChecks.map(command => ({
-          command, status: 'FAIL', fingerprint: `rejected:${command}`,
+          command, status: 'FAIL', fingerprint: crypto.createHash('sha256')
+            .update(`rejected:${command}`).digest('hex'),
         })),
       },
     },
@@ -2961,7 +2974,7 @@ test('completed same-author continuation restores only from a run, request, and 
   assert.throws(() => runtime._restoreCompletedWorkerContexts(), error => error.code === 'CRASH_ADOPTION_CONFLICT')
 })
 
-test('hidden external verification caps provisional work and cannot terminate as local DONE', async t => {
+test('hidden external verification strengthens bounded local work without forcing an internal PARTIAL stop', async t => {
   const directory = tempDirectory(t, 'autoprompt-hidden-external-')
   const targetPath = createTempGitTarget(directory)
   const routeDecision = decision('DIRECT')
@@ -2988,6 +3001,10 @@ test('hidden external verification caps provisional work and cannot terminate as
       if (request.logicalRole === 'worker') {
         fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'provisional'\n")
       }
+      if (request.logicalRole.startsWith('independent-')) {
+        assert.deepEqual(routeDecision.plannedChecks.filter(check => !request.checks.includes(check)), [])
+        assert.ok(Array.isArray(request.fetchedEvidence.verificationDoctrine))
+      }
       return request.logicalRole.startsWith('independent-')
         ? { code: 'PASS', payload: {
             evidenceIds: [`evidence:${request.workItemId}`],
@@ -3002,10 +3019,9 @@ test('hidden external verification caps provisional work and cannot terminate as
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
   })
   assert.equal(launches.filter(item => item.logicalRole === 'worker').length, 1)
-  assert.equal(outcome.outcome, 'PARTIAL')
-  assert.equal(outcome.terminalEnvelope.status, 'EXTERNALLY_VERIFIABLE_ONLY')
-  assert.equal(outcome.terminalEnvelope.localDoneAllowed, false)
-  assert.equal(persisted.evaluation.localDoneAllowed, false)
+  assert.equal(launches.filter(item => item.logicalRole.startsWith('independent-')).length, 2)
+  assert.equal(outcome.outcome, 'DONE')
+  assert.equal(persisted.evaluation.localDoneAllowed, true)
 
   const overCap = JSON.parse(JSON.stringify(routeDecision))
   overCap.usefulWorkerCount = 2
@@ -3013,6 +3029,26 @@ test('hidden external verification caps provisional work and cannot terminate as
     route: 'DIRECT', decision: overCap, launch: async () => ({}), completeRetainedLease: () => {},
     resumeAdoptedLaunches: async () => ({}), resumeState: null,
   }), error => error.code === 'PROVISIONAL_WORK_CAP_EXCEEDED')
+})
+
+test('LIGHT plan preserves semantic risks and unknowns as executable falsification obligations', () => {
+  const routeDecision = decision('LIGHT')
+  routeDecision.plannedChecks = ['Confirm the output file exists.']
+  routeDecision.risks = ['Effective-dated merges may collapse distinct donors before the transition.']
+  routeDecision.missingInformation = ['Resolve pre-, at-, and post-effective identity semantics.']
+  routeDecision.independentCheckingPlan.nonOverlapReason = 'One checker is sufficient.'
+  const plan = renderPlanArtifact('LIGHT', routeDecision)
+  assert.match(plan, /Risks to falsify/u)
+  assert.match(plan, /collapse distinct donors before the transition/u)
+  assert.match(plan, /Information to resolve before editing/u)
+  assert.match(plan, /pre-, at-, and post-effective identity semantics/u)
+  assert.match(plan, /positive, negative, and boundary witness/u)
+  assert.match(plan, /Seat 2:/u)
+  const checking = validateLiveCheckingPlan(routeDecision)
+  assert.equal(checking.checkerCount, 2)
+  assert.match(checking.responsibilities[1], /collapse distinct donors before the transition/u)
+  assert.match(checking.responsibilities[1], /pre-, at-, and post-effective identity semantics/u)
+  assert.doesNotMatch(checking.nonOverlapReason, /One checker is sufficient/u)
 })
 
 test('applicable captured domains are durably admitted and delivered before production work', async t => {
@@ -4494,13 +4530,27 @@ test('all worker and checker launches use scheduler leases, context-free briefs,
 })
 
 test('normal history forks are denied while typed recovery is bounded to one through three turns', async t => {
-  const harness = makeHarness(t)
+  const harness = makeHarness(t, { runtimeOptions: { gitEnvironment: () => process.env } })
   const usableDeliverable = path.join(harness.directory, 'bounded-recovery-result.txt')
   let forbiddenCode = null
   let recoveryDispatch = null
+  let checkerRecoveryDispatch = null
   const baseLauncher = harness.runtimeOptions.launcher
   harness.runtimeOptions.launcher = async launch => {
     if (launch.logicalRole === 'worker' && launch.dispatch.recoveryContext) recoveryDispatch = launch.dispatch
+    if (launch.logicalRole === 'independent-reviewer' && launch.dispatch.recoveryContext) {
+      checkerRecoveryDispatch = launch.dispatch
+      return {
+        schemaVersion: '2.0.0', code: 'PASS', runId: 'run-1',
+        requestEnvelopeHash: launch.canonicalAssignment.requestEnvelopeHash,
+        candidateHash: CANDIDATE_A, currentVersionHash: CANDIDATE_A,
+        payload: {
+          evidenceIds: ['evidence:checker-reassessment'],
+          referenceMethod: checkerReferenceMethod('black-box-boundary', 'checker reassessment'),
+        },
+        evidenceHashes: [], usage: ZERO_USAGE,
+      }
+    }
     return baseLauncher(launch)
   }
   harness.runtimeOptions.executeRoute = async ({ launch }) => {
@@ -4517,6 +4567,18 @@ test('normal history forks are denied while typed recovery is bounded to one thr
       forkTurns: 2, recoveryContext: { type: 'bounded-recovery', code: 'LOCAL_CHECK_FAILURE' },
       strategyFingerprint: crypto.createHash('sha256').update('bounded recovery').digest('hex'),
     })
+    await launch({
+      workItemId: 'checker-reassessment', logicalRole: 'independent-reviewer', parent: 'run-owner',
+      purpose: 'verification', assignment: 'Repeat the checker with a distinct reference method.',
+      success: ['the exact candidate is independently verified'], checks: ['focused check'],
+      candidateHash: CANDIDATE_A, oracle: 'focused-oracle', forkTurns: 1,
+      recoveryContext: { type: 'bounded-recovery', code: 'DUPLICATE_REFERENCE_METHOD_CLASS' },
+      harnessAttestation: {
+        repoHash: CANDIDATE_A,
+        buildHash: crypto.createHash('sha256').update('focused-build').digest('hex'),
+        oracleHash: crypto.createHash('sha256').update('focused-oracle').digest('hex'),
+      },
+    })
     fs.writeFileSync(usableDeliverable, 'bounded recovery completed\n')
     const buildAcceptanceHash = crypto.createHash('sha256')
       .update(fs.readFileSync(usableDeliverable)).digest('hex')
@@ -4531,6 +4593,9 @@ test('normal history forks are denied while typed recovery is bounded to one thr
   assert.equal(forbiddenCode, 'INHERITED_CONTEXT_FORBIDDEN')
   assert.equal(recoveryDispatch.fork_turns, '2')
   assert.deepEqual(recoveryDispatch.recoveryContext, { type: 'bounded-recovery', code: 'LOCAL_CHECK_FAILURE' })
+  assert.equal(checkerRecoveryDispatch.fork_turns, '1')
+  assert.deepEqual(checkerRecoveryDispatch.recoveryContext,
+    { type: 'bounded-recovery', code: 'DUPLICATE_REFERENCE_METHOD_CLASS' })
   assert.equal(harness.launches.some(launch => launch.workItemId === 'forbidden-history'), false)
 })
 
@@ -6360,7 +6425,9 @@ test('post-repair checker-one PASS recovery consumes it and launches only repair
     runtimeSignals: routeDecision.runtimeSignals || {},
     overlaySteps: routeDecision.overlaySteps || routeDecision.overlayExecution || [],
   })
-  const completedChecks = [...new Set([...completedRecipe.checks, ...completedRecipe.riskChecks])]
+  const completedChecks = [...new Set([
+    ...completedRecipe.checks, ...completedRecipe.riskChecks, ...routeDecision.plannedChecks,
+  ])]
   const completedResult = { code: 'PASS', currentVersionHash: candidateHash, payload: {
     evidenceIds: ['evidence:repaired-checker-one'],
     referenceMethod: checkerReferenceMethod('requirements-review', completedId),
@@ -6474,7 +6541,9 @@ test('completed repaired checker group rejects every contradictory nonempty reco
       runtimeSignals: routeDecision.runtimeSignals || {},
       overlaySteps: routeDecision.overlaySteps || routeDecision.overlayExecution || [],
     })
-    const completedChecks = [...new Set([...completedRecipe.checks, ...completedRecipe.riskChecks])]
+    const completedChecks = [...new Set([
+      ...completedRecipe.checks, ...completedRecipe.riskChecks, ...routeDecision.plannedChecks,
+    ])]
     const completedResult = { code: 'PASS', currentVersionHash: candidateHash, payload: {
       evidenceIds: ['evidence:valid-repaired-pass'],
       referenceMethod: checkerReferenceMethod('requirements-review', completedId),
@@ -6533,12 +6602,15 @@ test('repaired checker retry PASS preserves repair generation for the remaining 
     runtimeSignals: routeDecision.runtimeSignals || {},
     overlaySteps: routeDecision.overlaySteps || routeDecision.overlayExecution || [],
   })
-  const completedChecks = [...new Set([...completedRecipe.checks, ...completedRecipe.riskChecks])]
+  const completedChecks = [...new Set([
+    ...completedRecipe.checks, ...completedRecipe.riskChecks, ...routeDecision.plannedChecks,
+  ])]
   const retryResult = { code: 'PASS', currentVersionHash: candidateHash, payload: {
     evidenceIds: ['evidence:repaired-retry-pass'],
     referenceMethod: checkerReferenceMethod('requirements-review', retryId),
     testOutcomes: completedChecks.map(command => ({
-      command, status: 'PASS', fingerprint: `repaired-retry:${command}`,
+      command, status: 'PASS', fingerprint: crypto.createHash('sha256')
+        .update(`repaired-retry:${command}`).digest('hex'),
     })),
   } }
   const records = { [baseId]: baseResult, [retryId]: retryResult }
@@ -8203,7 +8275,7 @@ test('AP-CODEX-V2-036 concrete runtime repairs a checker FAIL in the same Codex 
     "    stateClass:'terminal', runId:assignment.runId, requestEnvelopeHash:assignment.requestEnvelopeHash,",
     "    currentVersionHash:context.candidateHash, completedResults:[], nextReadyWork:[],",
     "    cause:{event:checkerAttempt === 1 ? 'ASSERTION_FAILED' : 'CHECK_COMPLETE',reason:checkerAttempt === 1 ? 'Exact candidate still contains the injected behavior defect.' : 'Fake local checker accepted the exact repaired candidate.',unblockPath:checkerAttempt === 1 ? 'repair the receipt-bound implementation defect' : null},",
-    "    payloadSchemaId:'autoprompt.check.fake.v2', payload:checkerAttempt === 1 ? {findingIds:['AP-RUN-026']} : {evidenceIds:[`fake-cli-underlying-evidence:${assignment.assignmentId}`],referenceMethod:{methodClass:/tester/.test(role)?'black-box-boundary':'requirements-review',source:`${role} independent source`,procedure:`${role} independently derives and executes expected observations`,expectedOutputDerivedFromSubjectCode:false,subjectLogicReimplemented:false,positiveInvariants:[`${role} accepted behavior`],negativeInvariants:[`${role} rejected behavior`],boundaryInvariants:[`${role} edge behavior`]},testOutcomes:assignment.checks.map(command=>({command,status:'PASS',fingerprint:`fake-post-green:${command}`}))}, recordedAt:now",
+    "    payloadSchemaId:'autoprompt.check.fake.v2', payload:checkerAttempt === 1 ? {findingIds:['AP-RUN-026']} : {evidenceIds:[`fake-cli-underlying-evidence:${assignment.assignmentId}`],referenceMethod:{methodClass:/tester/.test(role)?'black-box-boundary':'requirements-review',source:`${role} independent source`,procedure:`${role} independently derives and executes expected observations`,expectedOutputDerivedFromSubjectCode:false,subjectLogicReimplemented:false,positiveInvariants:[`${role} accepted behavior`],negativeInvariants:[`${role} rejected behavior`],boundaryInvariants:[`${role} edge behavior`]},testOutcomes:assignment.checks.map(command=>({command,status:'PASS',fingerprint:require('node:crypto').createHash('sha256').update(`fake-post-green:${command}`).digest('hex')}))}, recordedAt:now",
     "  }",
     "  else output = {",
     "    schemaVersion:'2.0.0', reportType:'result', reportId:`result:${assignment.assignmentId}` ,",
@@ -8409,7 +8481,7 @@ test('AP-RUN-037 production supervisor resumes a crashed worker with a fresh gen
     "    stateClass:'terminal', runId:assignment.runId, requestEnvelopeHash:assignment.requestEnvelopeHash,",
     "    currentVersionHash:context.candidateHash, completedResults:[], nextReadyWork:[],",
     "    cause:{event:'CHECK_COMPLETE',reason:'Fake checker accepted the resumed candidate.',unblockPath:null},",
-    "    payloadSchemaId:'autoprompt.check.fake.v2', payload:{evidenceIds:[`fake-cli-underlying-evidence:${assignment.assignmentId}`],referenceMethod:{methodClass:/tester/.test(role)?'black-box-boundary':'requirements-review',source:`${role} independent source`,procedure:`${role} independently derives and executes expected observations`,expectedOutputDerivedFromSubjectCode:false,subjectLogicReimplemented:false,positiveInvariants:[`${role} accepted behavior`],negativeInvariants:[`${role} rejected behavior`],boundaryInvariants:[`${role} edge behavior`]},testOutcomes:assignment.checks.map(command=>({command,status:'PASS',fingerprint:`fake-post-green:${command}`}))}, recordedAt:now",
+    "    payloadSchemaId:'autoprompt.check.fake.v2', payload:{evidenceIds:[`fake-cli-underlying-evidence:${assignment.assignmentId}`],referenceMethod:{methodClass:/tester/.test(role)?'black-box-boundary':'requirements-review',source:`${role} independent source`,procedure:`${role} independently derives and executes expected observations`,expectedOutputDerivedFromSubjectCode:false,subjectLogicReimplemented:false,positiveInvariants:[`${role} accepted behavior`],negativeInvariants:[`${role} rejected behavior`],boundaryInvariants:[`${role} edge behavior`]},testOutcomes:assignment.checks.map(command=>({command,status:'PASS',fingerprint:require('node:crypto').createHash('sha256').update(`fake-post-green:${command}`).digest('hex')}))}, recordedAt:now",
     "  }",
     "  else output = {",
     "    schemaVersion:'2.0.0', reportType:'result', reportId:`result:${assignment.assignmentId}` ,",

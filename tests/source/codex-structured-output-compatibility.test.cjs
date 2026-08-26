@@ -138,7 +138,10 @@ test('oversized auxiliary brief fields are sliced losslessly into fetched eviden
   assert.deepEqual(dispatch.fetchedEvidence.briefSlice, {
     schemaVersion: 1,
     kind: 'context-brief-slice',
-    fields: { successChecklist, ownership, checks, dependencies, returnShape },
+    fields: {
+      assignment: 'Implement the assigned production-planning work item.',
+      successChecklist, ownership, checks, dependencies, returnShape,
+    },
   })
 })
 
@@ -284,6 +287,65 @@ test('Codex adapter preserves a final CHECK_INCONCLUSIVE instead of reconstructi
   assert.equal(result.code, 'CHECK_INCONCLUSIVE')
   assert.equal(terminal.code, 'CHECK_INCONCLUSIVE')
   assert.equal(Object.hasOwn(result, 'reconstructedTerminal'), false)
+})
+
+test('Codex adapter rejects conflicting schema-valid terminals and accepts identical duplicates', async t => {
+  const directory = temporaryDirectory(t)
+  const invalid = canonicalOutcome('INVALID_INPUT', {
+    description: 'The supplied input does not match the required format or facts.',
+    cause: { event: 'INPUT_REJECTED', reason: 'The checker rejected its input.', unblockPath: 'Retry with the exact assignment.' },
+  })
+  const pass = canonicalOutcome('PASS')
+  const launchWith = async (outputs, suffix, buffered = false) => {
+    const runner = {
+      async run(spec) {
+        const events = [{
+          type: 'thread.started', thread_id: `99999999-9999-4999-8999-99999999999${suffix}`,
+        }]
+        for (const output of outputs) {
+          events.push({
+            type: 'item.completed',
+            item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(output) }) },
+          })
+        }
+        events.push({
+          type: 'turn.completed',
+          usage: { input_tokens: 2, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+        })
+        if (!buffered) for (const event of events) spec.onStdoutLine(JSON.stringify(event))
+        return {
+          status: 0, stdout: buffered ? `${events.map(JSON.stringify).join('\n')}\n` : '', stderr: '',
+          processOwned: true, exactArgv: true, drained: true,
+        }
+      },
+      async stop() { return { drained: true } },
+    }
+    const adapter = new CodexExecAdapter({
+      runner, targetPath: ROOT,
+      profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+      outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'outcome.schema.json'),
+      providerSchemaRoot: path.join(directory, `provider-schemas-${suffix}`),
+    })
+    return adapter.launch({
+      ...CHECKER_EXECUTION_POLICY, physicalExecutionPolicy: CHECKER_EXECUTION_POLICY,
+      entryPrompt: '$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\nrequest_sha256=bound',
+      dispatch: { brief: 'Run the exact check.', requestPointer: { path: 'request', hash: 'a'.repeat(64) } },
+      environment: {}, sessionId: `terminal-conflict-${suffix}`, reservationId: `terminal-conflict-reservation-${suffix}`,
+    })
+  }
+
+  await assert.rejects(() => launchWith([invalid, pass], '1'),
+    error => error.code === 'CODEX_MULTIPLE_TERMINAL_OUTPUTS')
+  await assert.rejects(() => launchWith([pass, invalid], '2'),
+    error => error.code === 'CODEX_MULTIPLE_TERMINAL_OUTPUTS')
+  assert.equal((await launchWith([pass, pass], '3')).code, 'PASS')
+  await assert.rejects(() => launchWith([invalid, pass], '4', true),
+    error => error.code === 'CODEX_MULTIPLE_TERMINAL_OUTPUTS')
+  await assert.rejects(() => launchWith([pass, invalid], '5', true),
+    error => error.code === 'CODEX_MULTIPLE_TERMINAL_OUTPUTS')
+  assert.equal((await launchWith([pass, pass], '6', true)).code, 'PASS')
+  await assert.rejects(() => launchWith([invalid, ...Array(256).fill(pass)], '7', true),
+    error => error.code === 'CODEX_TERMINAL_CANDIDATE_OVERFLOW')
 })
 
 test('bundled canonical schemas reject every missing required field and unknown top-level fields', () => {

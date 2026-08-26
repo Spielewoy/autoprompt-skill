@@ -297,7 +297,13 @@ test('run record exposes only canonical registered paths and the uppercase ROADM
   record.write('checks/captured-domain-outcomes.json', '{"schemaVersion":1,"evaluation":{"valid":true}}\n')
   assert.deepEqual(JSON.parse(fs.readFileSync(record.resolve('checks/captured-domain-outcomes.json'), 'utf8')),
     { schemaVersion: 1, evaluation: { valid: true } })
-  assert.deepEqual(fs.readdirSync(path.join(record.runPath, 'plan')), ['ROADMAP.md'])
+  const projectionHash = 'a'.repeat(64)
+  record.write(`plan/projections/${projectionHash}.json`, '{"schemaVersion":1}\n')
+  assert.deepEqual(JSON.parse(fs.readFileSync(record.resolve(`plan/projections/${projectionHash}.json`), 'utf8')),
+    { schemaVersion: 1 })
+  assert.throws(() => record.resolve('plan/projections/not-content-addressed.json'), /not registered/i)
+  assert.throws(() => record.resolve(`plan/projections/nested/${projectionHash}.json`), /not registered/i)
+  assert.deepEqual(fs.readdirSync(path.join(record.runPath, 'plan')), ['ROADMAP.md', 'projections'])
   assert.equal(runRecord.openRunRecord(record.runPath).runId, 'schema-run')
 })
 
