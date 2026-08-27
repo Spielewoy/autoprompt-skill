@@ -359,6 +359,7 @@ test('AP-DESIGN-023 fresh replay is derived only from the persisted assignment',
   assert.deepEqual(replayRequestFromPersistedAssignment(opened), {
     assignment: assignment.requestedResult,
     successChecklist: ['Owned behavior passes.'], success: ['Owned behavior passes.'],
+    checks: assignment.checks,
     findingIds: assignment.findingIds,
     ownership: [{
       kind: 'file', identity: 'src/owned.js', owner: 'worker-1', ownershipMode: 'single-owner',
@@ -366,6 +367,7 @@ test('AP-DESIGN-023 fresh replay is derived only from the persisted assignment',
     manifests: [{
       kind: 'file', identity: 'src/owned.js', owner: 'worker-1', ownershipMode: 'single-owner',
     }],
+    snapshotProjection: null,
     replayedAssignmentPath: relative,
   })
 })

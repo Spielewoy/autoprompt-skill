@@ -126,7 +126,7 @@ function ownershipFor(facts) {
 }
 
 function recommendation(overrides = {}) {
-  return {
+  return decisions.createRouteRecommendation({
     schemaVersion: '2.0.0',
     preWorkResult: 'CONTINUE',
     recommendedRoute: 'DIRECT',
@@ -140,7 +140,7 @@ function recommendation(overrides = {}) {
     reasonsForRoadmap: ['No dependent-work or architecture predicate is true.'],
     userInputNeeded: [], evidenceIndex: [],
     ...overrides,
-  }
+  })
 }
 
 function gateSelectionFor(facts) {
@@ -251,6 +251,133 @@ test('route decision preserves indexed and flag literals from the exact request'
     requestText: exactRequest,
     correctionAttempts: 1,
   }).status, 'ROUTE_DECISION_INVALID')
+})
+
+test('HTML and sanitizer requests receive controller-named parser differential obligations', () => {
+  const routed = decision(routeFacts(), {
+    requested_result: 'Fix the HTML sanitizer so every XSS bypass is rejected.',
+  })
+  const security = routed.verificationObligations.find(item =>
+    item.id === 'security-parser-differentials')
+  assert.ok(security)
+  assert.deepEqual(security.cases.map(item => item.id), [
+    'allowed-canonical', 'alternate-encoding', 'namespace-confusion',
+    'malformed-reparse', 'mutation-after-filter', 'interaction-trigger',
+  ])
+  assert.equal(decisions.validateRouteDecision(routed).valid, true)
+
+  const weakReserved = {
+    id: 'security-parser-differentials', kind: 'invariant', statement: 'HTML renders.',
+    cases: [
+      { id: 'ok', phase: 'ordinary', polarity: 'must-hold', precondition: 'ordinary HTML', expectedObservation: 'it renders' },
+      { id: 'bad', phase: 'ordinary', polarity: 'must-not-hold', precondition: 'bad HTML', expectedObservation: 'it does not render' },
+      { id: 'edge', phase: 'boundary', polarity: 'must-hold', precondition: 'boundary HTML', expectedObservation: 'it renders' },
+    ],
+  }
+  const reservedOverride = decision(routeFacts(), {
+    requested_result: 'Fix the HTML sanitizer so every XSS bypass is rejected.',
+    verification_obligations: [weakReserved],
+  })
+  assert.deepEqual(
+    reservedOverride.verificationObligations[0].cases.map(item => item.id),
+    security.cases.map(item => item.id),
+  )
+  const tamperedReserved = clone(reservedOverride)
+  tamperedReserved.verificationObligations = [weakReserved]
+  assert.equal(decisions.validateRouteDecision(tamperedReserved).valid, false)
+  const normalizedRecommendation = recommendation({ verificationObligations: [weakReserved] })
+  assert.deepEqual(
+    normalizedRecommendation.verificationObligations[0].cases.map(item => item.id),
+    security.cases.map(item => item.id),
+  )
+  const tamperedRecommendation = clone(normalizedRecommendation)
+  tamperedRecommendation.verificationObligations = [weakReserved]
+  assert.equal(decisions.validateRouteRecommendation(tamperedRecommendation).valid, false)
+  const missingReserved = clone(reservedOverride)
+  missingReserved.verificationObligations = missingReserved.verificationObligations
+    .filter(item => item.id !== 'security-parser-differentials')
+  assert.equal(decisions.validateRouteDecision(missingReserved).valid, false)
+
+  const synonym = decision(routeFacts(), {
+    requested_result: 'Fix the SVG parser so onclick cannot execute.',
+  })
+  assert.ok(synonym.verificationObligations.some(item =>
+    item.id === 'security-parser-differentials'))
+  assert.equal(decisions.validateRouteDecision(synonym).valid, true)
+})
+
+test('effective ordered equivalence requests receive immutable temporal and collision matrices', () => {
+  const exactRequest = 'References to the same underlying entity must produce the same token across transitively composing effective-dated subject merges and cross-tenant equivalences.'
+  const generic = {
+    id: 'generic-output', kind: 'invariant', statement: 'The output is produced.',
+    cases: [
+      { id: 'ok', phase: 'ordinary', polarity: 'must-hold', precondition: 'valid input', expectedObservation: 'output exists' },
+      { id: 'bad', phase: 'ordinary', polarity: 'must-not-hold', precondition: 'invalid input', expectedObservation: 'output is rejected' },
+      { id: 'edge', phase: 'boundary', polarity: 'must-hold', precondition: 'edge input', expectedObservation: 'output exists' },
+    ],
+  }
+  const routed = decision(routeFacts(), {
+    requested_result: exactRequest,
+    verification_obligations: [generic],
+  })
+  assert.deepEqual(routed.verificationObligations.map(item => item.id), [
+    'generic-output', 'temporal-ordered-activation', 'identity-equivalence-collisions',
+  ])
+  const ordered = routed.verificationObligations.find(item =>
+    item.id === 'temporal-ordered-activation')
+  assert.equal(ordered.kind, 'ordered-activation')
+  assert.deepEqual(ordered.cases.map(item => [item.id, item.phase, item.polarity]), [
+    ['before-first-boundary', 'inactive', 'must-not-hold'],
+    ['at-first-boundary', 'boundary', 'must-hold'],
+    ['between-boundaries', 'intermediate', 'must-not-hold'],
+    ['at-next-boundary', 'boundary', 'must-hold'],
+    ['after-final-boundary', 'active', 'must-hold'],
+  ])
+  const collision = routed.verificationObligations.find(item =>
+    item.id === 'identity-equivalence-collisions')
+  assert.deepEqual(collision.cases.map(item => item.id), [
+    'equivalent-consistency', 'distinct-noncollision',
+    'transitive-equivalence', 'ambiguous-collision',
+  ])
+  assert.equal(decisions.validateRouteDecision(routed).valid, true)
+  assert.equal(decisions.evaluateL0Decision({
+    startedAtMs: 1, submittedAtMs: 2, nowMs: 2,
+    decision: routed, requestText: exactRequest,
+  }).status, 'ROUTE_DECIDED')
+
+  for (const requiredId of ['temporal-ordered-activation', 'identity-equivalence-collisions']) {
+    const missing = clone(routed)
+    missing.verificationObligations = missing.verificationObligations
+      .filter(item => item.id !== requiredId)
+    assert.equal(decisions.validateRouteDecision(missing).valid, false, requiredId)
+  }
+  const tampered = clone(routed)
+  tampered.verificationObligations.find(item =>
+    item.id === 'identity-equivalence-collisions').cases[1].expectedObservation = 'collisions are acceptable'
+  assert.equal(decisions.validateRouteDecision(tampered).valid, false)
+
+  const summarized = clone(routed)
+  summarized.requestedResult = 'Build an anonymizer.'
+  summarized.verificationObligations = summarized.verificationObligations
+    .filter(item => item.id !== 'temporal-ordered-activation')
+  assert.equal(decisions.evaluateL0Decision({
+    startedAtMs: 1, submittedAtMs: 2, nowMs: 2,
+    decision: summarized, requestText: exactRequest,
+  }).status, 'ROUTE_DECISION_INVALID')
+
+  const singleBoundary = decision(routeFacts(), {
+    requested_result: 'Enable the retention rule at its effective date.',
+  })
+  assert.ok(singleBoundary.verificationObligations.some(item =>
+    item.id === 'temporal-activation-boundaries' && item.kind === 'activation'))
+  assert.equal(singleBoundary.verificationObligations.some(item =>
+    item.id === 'temporal-ordered-activation'), false)
+
+  const ordinaryAdjectives = decision(routeFacts(), {
+    requested_result: 'Build an effective anonymizer with a clear implementation.',
+  })
+  assert.equal(ordinaryAdjectives.verificationObligations.some(item =>
+    item.id.startsWith('temporal-') || item.id === 'identity-equivalence-collisions'), false)
 })
 
 test('captured incident domains enforce exact certificates, ordering, provenance, hidden boundaries, datum rulings, and isolated promotion joins', () => {
@@ -495,6 +622,32 @@ test('route recommendation remains advisory and NEEDS_USER is pre-work, never a 
   assert.equal(decisions.validateRecommendation(waiting).valid, true)
   assert.equal(decisions.evaluateRouteAnalystResult({ elapsed_ms: 10, recommendation: waiting }).status, 'WAITING_USER')
   assert.equal(router.ROUTES.includes('NEEDS_USER'), false)
+})
+
+test('automatic route decision is deterministically compiled without a second model-authored L0 turn', () => {
+  const compiled = decisions.compileAutomaticRouteDecision({
+    recommendation: recommendation(),
+    requestedResult: 'Return the requested result.',
+    requestEnvelopeHash: H,
+    providerCapabilities: {
+      sameContextContinuation: true,
+      isolatedChecking: true,
+      stableChildIdentity: true,
+    },
+    budget: { remaining: { wallMs: 60 * 60 * 1000 } },
+    nowMs: 1,
+  })
+  assert.equal(compiled.route, 'DIRECT')
+  assert.equal(compiled.routeSource, 'automatic')
+  assert.equal(decisions.validateRouteDecision(compiled).valid, true)
+  const contradictory = recommendation()
+  contradictory.recommendedRoute = 'LIGHT'
+  assert.throws(() => decisions.compileAutomaticRouteDecision({
+    recommendation: contradictory,
+    requestedResult: 'Return the requested result.', requestEnvelopeHash: H,
+    providerCapabilities: { isolatedChecking: true, stableChildIdentity: true },
+    budget: { remaining: { wallMs: 60 * 60 * 1000 } },
+  }), error => error.code === 'ROUTE_DECISION_INVALID' && /contradicts/u.test(error.message))
 })
 
 test('runtime schema and classifier fingerprint are compiled from frozen routes.json', () => {
@@ -1308,6 +1461,26 @@ test('admission, recommendation, plan, decision, and event validators fail close
   badDecision.chosenRouteReason = ''
   assert.equal(decisions.validateRouteDecision(badDecision).valid, false)
   assert.equal(decisions.validateRouteDecision(null).valid, false)
+  const ordered = {
+    id: 'temporal-chain', kind: 'ordered-activation', statement: 'Edges activate in order.',
+    cases: [
+      { id: 'pre', phase: 'inactive', polarity: 'must-not-hold', precondition: 'before T1', expectedObservation: 'donor and survivor remain distinct' },
+      { id: 'at-t1', phase: 'boundary', polarity: 'must-hold', precondition: 'at T1', expectedObservation: 'the first edge is active' },
+      { id: 'between', phase: 'intermediate', polarity: 'must-not-hold', precondition: 'between T1 and T2', expectedObservation: 'the second edge remains inactive' },
+      { id: 'at-t2', phase: 'boundary', polarity: 'must-hold', precondition: 'at T2', expectedObservation: 'the second edge is active' },
+      { id: 'post', phase: 'active', polarity: 'must-hold', precondition: 'after T2', expectedObservation: 'the full chain is active' },
+    ],
+  }
+  assert.deepEqual(decisions.canonicalVerificationObligations([ordered]), [ordered])
+  assert.equal(decisions.canonicalVerificationObligations([{
+    ...ordered, cases: ordered.cases.filter(item => item.phase !== 'intermediate'),
+  }]), null)
+  assert.equal(decisions.canonicalVerificationObligations([{
+    ...ordered, cases: ordered.cases.map(item => ({ ...item, polarity: 'must-hold' })),
+  }]), null)
+  assert.equal(decisions.canonicalVerificationObligations([
+    ordered, { ...ordered },
+  ]), null)
   assert.equal(decisions.evaluateL0Decision({ started_at_ms: -1, now_ms: 0, decision: {} }).status,
     'ROUTE_DECISION_INVALID')
   assert.equal(decisions.evaluateL0Decision({ started_at_ms: 1, now_ms: 2, decision: {} }).status,

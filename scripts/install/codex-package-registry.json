@@ -154,12 +154,6 @@
       "sha256": "0f6990c7bfd16dab7928208653537bf03c1efcee0aaccc24d78b970298f049f1",
       "terms": ["candidate"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
-    },
-    {
-      "path": "agents/codex/workflow/scheduler.js",
-      "sha256": "5e2273f27b30c6e8d0f96e95941ccaf19af0bbe7e0e99541d61eef05b38e55be",
-      "terms": ["candidate", "frontier"],
-      "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     }
   ],
   "migrationSources": [

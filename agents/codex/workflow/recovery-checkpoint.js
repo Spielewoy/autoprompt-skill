@@ -30,6 +30,7 @@ const CAUSE_KINDS = Object.freeze([
   'CHECKPOINT', 'ADMISSION', 'LEASE_STARTED', 'THREAD_STARTED', 'CONTINUATION_BOUND',
   'USAGE_RECORDED', 'LEASE_COMPLETED', 'CHECK_COMPLETED', 'CANDIDATE_FROZEN',
   'EXTERNAL_OPERATION', 'FRONTIER_CHANGED', 'RESULT_COMMITTED', 'CRASH_RECOVERY',
+  'ROADMAP_RATIO_RECORDED', 'PLAN_PROJECTION_COMMITTED',
 ])
 const RESULT_COMMIT_FIELDS = Object.freeze([
   'assignmentId', 'assignmentHash', 'leaseId', 'sessionId', 'continuationId',
@@ -423,11 +424,18 @@ function candidateAdvanceIsCanonical(previous, record, events) {
   return candidateHash === record.checkpoint.immutableHashes.candidateHash
 }
 
-function roadmapRepairPlanAdvanceIsCanonical(previous, record) {
+function roadmapPlanAdvanceIsCanonical(previous, record) {
   const before = previous.checkpoint
   const after = record.checkpoint
-  const repairId = 'roadmap-author-plan-repair'
-  const recheckId = 'roadmap-plan-recheck'
+  const transitions = [
+    { authorId: 'roadmap-author-revise', checkerId: 'roadmap-plan-check' },
+    { authorId: 'roadmap-author-plan-repair', checkerId: 'roadmap-plan-recheck' },
+  ]
+  const advance = transitions.find(item =>
+    before.scheduler.completedWorkIds.includes(item.authorId) &&
+    stableStringify(before.scheduler.nextReadyWorkIds) === stableStringify([item.checkerId]))
+  if (!advance) return false
+  const { authorId, checkerId } = advance
   const beforePlanHash = before.immutableHashes.planHash
   const afterPlanHash = after.immutableHashes.planHash
   const lease = after.scheduler.leases.length === 1 ? after.scheduler.leases[0] : null
@@ -440,10 +448,9 @@ function roadmapRepairPlanAdvanceIsCanonical(previous, record) {
     before.immutableHashes.routeDecisionHash === after.immutableHashes.routeDecisionHash &&
     before.immutableHashes.candidateHash === null && after.immutableHashes.candidateHash === null &&
     before.scheduler.candidate.candidateHash === null && after.scheduler.candidate.candidateHash === null &&
-    before.scheduler.completedWorkIds.includes(repairId) &&
-    !before.scheduler.completedCheckIds.includes(recheckId) &&
+    !before.scheduler.completedCheckIds.includes(checkerId) &&
     exact(before.scheduler.openCheckIds, []) &&
-    exact(before.scheduler.nextReadyWorkIds, [recheckId]) &&
+    exact(before.scheduler.nextReadyWorkIds, [checkerId]) &&
     exact(before.scheduler.leases, [])
   if (!common) return false
 
@@ -451,16 +458,22 @@ function roadmapRepairPlanAdvanceIsCanonical(previous, record) {
     before.stateEvent.eventHash === after.stateEvent.eventHash &&
     exact(after.scheduler.completedWorkIds, before.scheduler.completedWorkIds) &&
     exact(after.scheduler.completedCheckIds, before.scheduler.completedCheckIds) &&
-    exact(after.scheduler.openCheckIds, [recheckId]) &&
-    exact(after.scheduler.nextReadyWorkIds, [`reconcile:${recheckId}`]) &&
+    exact(after.scheduler.openCheckIds, [checkerId]) &&
+    exact(after.scheduler.nextReadyWorkIds, [`reconcile:${checkerId}`]) &&
     record.cause.kind === 'LEASE_STARTED' && lease !== null &&
-    lease.workItemId === recheckId && lease.roleId === 'ap-independent-checker' &&
+    lease.workItemId === checkerId && lease.roleId === 'ap-independent-checker' &&
     lease.status === 'ADMITTED' && Boolean(lease.reservationId) && Boolean(lease.sessionId) &&
     Boolean(lease.continuationId) && HASH_PATTERN.test(lease.crashBindingHash || '') &&
     lease.thread.started === false
   const crashProjectionAdoption = record.cause.kind === 'CRASH_RECOVERY' &&
     exact(after.scheduler, before.scheduler)
-  return admittedRecheck || crashProjectionAdoption
+  const committedProjection = record.cause.kind === 'PLAN_PROJECTION_COMMITTED' &&
+    after.stateEvent.sequence === before.stateEvent.sequence &&
+    after.stateEvent.eventHash === before.stateEvent.eventHash &&
+    after.stateEvent.stateChecksum === before.stateEvent.stateChecksum &&
+    after.stateEvent.state === before.stateEvent.state &&
+    exact(after.scheduler, before.scheduler)
+  return admittedRecheck || crashProjectionAdoption || committedProjection
 }
 
 class RecoveryCheckpointAuthority {
@@ -1021,7 +1034,7 @@ class RecoveryCheckpointAuthority {
       const priorPlanHash = previous.checkpoint.immutableHashes.planHash
       if (priorPlanHash !== null && record.checkpoint.immutableHashes.planHash !== priorPlanHash) {
         let verifiedAdvance = false
-        if (roadmapRepairPlanAdvanceIsCanonical(previous, record) && this.roadmapPlanAdvanceVerifier) {
+        if (roadmapPlanAdvanceIsCanonical(previous, record) && this.roadmapPlanAdvanceVerifier) {
           try {
             verifiedAdvance = this.roadmapPlanAdvanceVerifier(previous, record) === true
           } catch {

@@ -33,7 +33,7 @@ const { CleanupRegistry } = require(path.join(ROOT, 'agents', 'codex', 'workflow
 const { validateJsonSchema } = require(
   path.join(ROOT, 'agents', 'codex', 'workflow', 'json-schema-validator.js'),
 )
-const { createRouteDecision, remainingL0DecisionBudgetMs } = require(
+const { createRouteDecision, createRouteRecommendation, remainingL0DecisionBudgetMs } = require(
   path.join(ROOT, 'agents', 'codex', 'workflow', 'route-decision.js'),
 )
 const routeRouter = require(path.join(ROOT, 'agents', 'codex', 'workflow', 'router.js'))
@@ -479,7 +479,7 @@ test('Codex adapter uses the last agent message at turn.completed even when earl
 
 test('Codex route analyst may revise a schema-valid provisional recommendation before turn.completed', async t => {
   const directory = temporaryDirectory(t)
-  const recommendation = (route, confidence, reason) => ({
+  const recommendation = (route, confidence, reason) => createRouteRecommendation({
     schemaVersion: '2.0.0', preWorkResult: 'CONTINUE', recommendedRoute: route, confidence,
     whatTheUserWants: ['Complete the requested benchmark deliverable.'],
     likelyAreas: ['/app'],

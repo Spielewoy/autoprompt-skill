@@ -1387,7 +1387,7 @@ test('runtime schemas reject malformed settings, recommendations, decisions, evi
   assert.notDeepEqual(schemaErrors(pinIgnored, settingsSchema), [])
 
   const recommendationSchema = readJson(product.runtimeSchemas.routeRecommendation)
-  const recommendation = {
+  const recommendation = runtimeRouteDecision.createRouteRecommendation({
     schemaVersion: '2.0.0',
     preWorkResult: 'CONTINUE',
     recommendedRoute: 'DIRECT',
@@ -1400,7 +1400,7 @@ test('runtime schemas reject malformed settings, recommendations, decisions, evi
     reasonsForLight: ['No short design choice is open.'],
     reasonsForRoadmap: ['No dependent work groups exist.'],
     userInputNeeded: [], evidenceIndex: [],
-  }
+  })
   assertSchemaValid(recommendation, recommendationSchema, 'recommendation')
   const missingRouteReason = clone(recommendation)
   missingRouteReason.reasonsForRoadmap = []
@@ -1417,7 +1417,16 @@ test('runtime schemas reject malformed settings, recommendations, decisions, evi
     schemaVersion: '2.0.0', status: 'DECIDED', route: 'DIRECT', routeSource: 'automatic', userInputNeeded: [],
     requestedResult: 'Fix the bounded behavior and retain existing behavior.',
     successChecklist: ['The failing case passes.', 'Existing checks still pass.'],
-    plannedChecks: ['node --test'], likelyAreas: ['src/example.js'], risks: [], missingInformation: [],
+    plannedChecks: ['node --test'],
+    verificationObligations: [{
+      id: 'behavior', kind: 'invariant', statement: 'The bounded behavior remains correct.',
+      cases: [
+        { id: 'positive', phase: 'ordinary', polarity: 'must-hold', precondition: 'valid input', expectedObservation: 'the requested result is produced' },
+        { id: 'negative', phase: 'ordinary', polarity: 'must-not-hold', precondition: 'forbidden input', expectedObservation: 'the forbidden result is absent' },
+        { id: 'boundary', phase: 'boundary', polarity: 'must-hold', precondition: 'edge input', expectedObservation: 'the defined edge behavior is produced' },
+      ],
+    }],
+    likelyAreas: ['src/example.js'], risks: [], missingInformation: [],
     existingTests: [{ id: 'planned-check-1', command: 'node --test' }],
     usefulWorkerCount: 1, workerOwnershipReason: 'One owner controls the connected change.',
     independentCheckingPlan: {

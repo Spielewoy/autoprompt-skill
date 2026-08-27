@@ -119,6 +119,216 @@ function concrete(value) {
   return !['n/a', 'none', 'tbd', 'todo', 'because', 'default', 'as needed', 'unknown'].includes(text)
 }
 
+const VERIFICATION_OBLIGATION_KINDS = new Set(['invariant', 'activation', 'ordered-activation'])
+const VERIFICATION_PHASES = new Set(['ordinary', 'inactive', 'boundary', 'intermediate', 'active'])
+const VERIFICATION_POLARITIES = new Set(['must-hold', 'must-not-hold'])
+
+function defaultVerificationObligations(checks = []) {
+  return (Array.isArray(checks) ? checks : []).map((statement, index) => ({
+    id: `obligation-${index + 1}`,
+    kind: 'invariant',
+    statement: String(statement),
+    cases: [
+      { id: 'positive', phase: 'ordinary', polarity: 'must-hold', precondition: 'valid requested input', expectedObservation: String(statement) },
+      { id: 'negative', phase: 'ordinary', polarity: 'must-not-hold', precondition: 'a forbidden or invalid counterpart', expectedObservation: 'the forbidden counterpart is rejected or remains absent' },
+      { id: 'boundary', phase: 'boundary', polarity: 'must-hold', precondition: 'the exact edge of the requested domain', expectedObservation: String(statement) },
+    ],
+  }))
+}
+
+function canonicalVerificationObligations(supplied, fallbackChecks = []) {
+  const source = Array.isArray(supplied) && supplied.length > 0
+    ? supplied : defaultVerificationObligations(fallbackChecks)
+  if (source.length === 0) return null
+  const obligationIds = new Set()
+  const canonical = []
+  for (const obligation of source) {
+    if (!isObject(obligation) || !concrete(obligation.id) || obligationIds.has(obligation.id) ||
+        !VERIFICATION_OBLIGATION_KINDS.has(obligation.kind) || !concrete(obligation.statement) ||
+        !Array.isArray(obligation.cases) || obligation.cases.length === 0) return null
+    obligationIds.add(obligation.id)
+    const caseIds = new Set()
+    const cases = []
+    for (const item of obligation.cases) {
+      if (!isObject(item) || !concrete(item.id) || caseIds.has(item.id) ||
+          !VERIFICATION_PHASES.has(item.phase) || !VERIFICATION_POLARITIES.has(item.polarity) ||
+          !concrete(item.precondition) || !concrete(item.expectedObservation)) return null
+      caseIds.add(item.id)
+      cases.push({
+        id: item.id, phase: item.phase, polarity: item.polarity,
+        precondition: item.precondition, expectedObservation: item.expectedObservation,
+      })
+    }
+    const phases = new Set(cases.map(item => item.phase))
+    const polarities = new Set(cases.map(item => item.polarity))
+    if (!polarities.has('must-hold') || !polarities.has('must-not-hold') ||
+        obligation.kind === 'invariant' && !phases.has('boundary') ||
+        obligation.kind === 'activation' &&
+          !['inactive', 'boundary', 'active'].every(phase => phases.has(phase)) ||
+        obligation.kind === 'ordered-activation' &&
+          (!['inactive', 'boundary', 'intermediate', 'active'].every(phase => phases.has(phase)) ||
+           cases.filter(item => item.phase === 'boundary').length < 2)) return null
+    canonical.push({ id: obligation.id, kind: obligation.kind, statement: obligation.statement, cases })
+  }
+  return canonical
+}
+
+function securityParserVerificationObligation(requestedResult, force = false) {
+  const request = Array.isArray(requestedResult) ? requestedResult.join(' ') : String(requestedResult || '')
+  const parserOrMarkupSurface = /\b(?:html|svg|mathml|xml|dom|markup|saniti[sz](?:e|er|ation|ing)?|parser|filter|renderer|template|attribute|entit(?:y|ies)|encod(?:e|ed|er|ing)|escap(?:e|ed|ing))\b/iu.test(request)
+  const executableThreat = /\b(?:xss|javascript|script(?:ed|ing)?|executable|execut(?:e|ed|es|ing|ion)|on(?:click|error|load|focus|mouseover)|inject(?:ed|ion)?|bypass(?:ed|es|ing)?|unsafe|forbidden|payload)\b/iu.test(request)
+  if (!force && !(/\b(?:xss|html|javascript|saniti[sz](?:e|er|ation|ing)?|dom|markup|svg|mathml)\b/iu.test(request) ||
+      parserOrMarkupSurface && executableThreat)) return null
+  return Object.freeze({
+    id: 'security-parser-differentials',
+    kind: 'invariant',
+    statement: 'The shipped parser or filter preserves allowed content and rejects executable or policy-forbidden content across parser differentials.',
+    cases: [
+      { id: 'allowed-canonical', phase: 'ordinary', polarity: 'must-hold', precondition: 'canonical allowed content in the shipped runtime', expectedObservation: 'allowed content is preserved without introducing executable behavior' },
+      { id: 'alternate-encoding', phase: 'boundary', polarity: 'must-not-hold', precondition: 'the forbidden payload uses alternate entity, percent, Unicode, or escape encoding', expectedObservation: 'decoded executable or policy-forbidden behavior does not survive' },
+      { id: 'namespace-confusion', phase: 'boundary', polarity: 'must-not-hold', precondition: 'the payload crosses HTML, SVG, MathML, XML, or attribute namespace interpretation', expectedObservation: 'namespace switching cannot recover executable or policy-forbidden behavior' },
+      { id: 'malformed-reparse', phase: 'boundary', polarity: 'must-not-hold', precondition: 'malformed markup is repaired or reparsed by the actual shipped consumer', expectedObservation: 'error recovery cannot recover executable or policy-forbidden behavior' },
+      { id: 'mutation-after-filter', phase: 'intermediate', polarity: 'must-not-hold', precondition: 'safe-looking filtered output is mutated, decoded, or reparsed after the initial check', expectedObservation: 'post-filter mutation cannot activate executable or policy-forbidden behavior' },
+      { id: 'interaction-trigger', phase: 'active', polarity: 'must-not-hold', precondition: 'focus, click, navigation, load, error, animation, or another interaction activates the output', expectedObservation: 'interaction cannot trigger executable or policy-forbidden behavior' },
+    ],
+  })
+}
+
+function temporalVerificationObligation(requestedResult, forceKind = null) {
+  const request = Array.isArray(requestedResult) ? requestedResult.join(' ') : String(requestedResult || '')
+  const temporal = /\b(?:effective[- ](?:dat(?:e|ed)|from|at)|takes?[- ]effect|becomes?[- ]active|as[- ]of|valid[- ](?:from|to)|start(?:ing)?[- ](?:date|time)|end(?:ing)?[- ](?:date|time)|timestamp(?:ed)?|temporal(?:ly)?|before|after|until|since|type[- ]?2|slowly[- ]changing)\b/iu.test(request)
+  const explicitOrder = /\b(?:ordered?|in[- ]order|sequence[ds]?|sequential(?:ly)?|successive(?:ly)?|first\b.{0,80}\bthen|before\b.{0,80}\bafter)\b/iu.test(request)
+  const composed = /\b(?:transitive(?:ly)?|compos(?:e|es|ed|ing|ition)|chain(?:ed|ing)?|multi[- ]?hop|closure)\b/iu.test(request)
+  const kind = forceKind || (explicitOrder || temporal && composed
+    ? 'ordered-activation' : temporal ? 'activation' : null)
+  if (!kind) return null
+  if (kind === 'ordered-activation') {
+    return Object.freeze({
+      id: 'temporal-ordered-activation',
+      kind,
+      statement: 'Successive effective or ordered relationships activate only at their own boundaries, and composed behavior reflects exactly the relationships active at the observation point.',
+      cases: [
+        { id: 'before-first-boundary', phase: 'inactive', polarity: 'must-not-hold', precondition: 'the observation precedes the first effective or ordered boundary', expectedObservation: 'no later relationship or composed effect is active' },
+        { id: 'at-first-boundary', phase: 'boundary', polarity: 'must-hold', precondition: 'the observation is exactly at the first boundary', expectedObservation: 'the first relationship activates and no later relationship activates early' },
+        { id: 'between-boundaries', phase: 'intermediate', polarity: 'must-not-hold', precondition: 'the observation lies after the first boundary and before the next boundary', expectedObservation: 'later relationships and their composed effects remain inactive' },
+        { id: 'at-next-boundary', phase: 'boundary', polarity: 'must-hold', precondition: 'the observation is exactly at the next successive boundary', expectedObservation: 'that relationship activates and composes with exactly the already active relationships' },
+        { id: 'after-final-boundary', phase: 'active', polarity: 'must-hold', precondition: 'the observation follows every applicable boundary', expectedObservation: 'the complete ordered composition is active and deterministic' },
+      ],
+    })
+  }
+  return Object.freeze({
+    id: 'temporal-activation-boundaries',
+    kind: 'activation',
+    statement: 'Time-qualified behavior is inactive before its effective boundary and active from the exact boundary onward.',
+    cases: [
+      { id: 'before-boundary', phase: 'inactive', polarity: 'must-not-hold', precondition: 'the observation precedes the effective boundary', expectedObservation: 'the time-qualified behavior is not active' },
+      { id: 'at-boundary', phase: 'boundary', polarity: 'must-hold', precondition: 'the observation is exactly at the effective boundary', expectedObservation: 'the time-qualified behavior activates according to the requested inclusivity rule' },
+      { id: 'after-boundary', phase: 'active', polarity: 'must-hold', precondition: 'the observation follows the effective boundary', expectedObservation: 'the time-qualified behavior remains active' },
+    ],
+  })
+}
+
+function identityCollisionVerificationObligation(requestedResult, force = false) {
+  const request = Array.isArray(requestedResult) ? requestedResult.join(' ') : String(requestedResult || '')
+  if (!force && !/\b(?:collision(?:s)?|equivalen(?:ce|ces|t)|same[- ]underlying|same[- ](?:token|identifier|identity|pseudonym)|identity[- ]resolution|entity[- ]resolution|deduplicat(?:e|ed|ion|ing)|alias(?:es|ed|ing)?|pseudonymi[sz](?:e|ed|ation|ing)?|tokeni[sz](?:e|ed|ation|ing)?)\b/iu.test(request)) return null
+  return Object.freeze({
+    id: 'identity-equivalence-collisions',
+    kind: 'invariant',
+    statement: 'Equivalent representations resolve to one stable identity while distinct non-equivalent inputs never collapse through a token or identifier collision.',
+    cases: [
+      { id: 'equivalent-consistency', phase: 'ordinary', polarity: 'must-hold', precondition: 'two inputs are asserted to represent the same underlying entity', expectedObservation: 'both resolve to the same deterministic identity or token' },
+      { id: 'distinct-noncollision', phase: 'ordinary', polarity: 'must-not-hold', precondition: 'two inputs are distinct and have no asserted equivalence', expectedObservation: 'they do not resolve to the same identity or token' },
+      { id: 'transitive-equivalence', phase: 'boundary', polarity: 'must-hold', precondition: 'equivalence is established only through a transitive, cross-scope, or representation-changing chain', expectedObservation: 'the complete asserted chain resolves to one identity without depending on traversal order' },
+      { id: 'ambiguous-collision', phase: 'boundary', polarity: 'must-not-hold', precondition: 'a token, alias, or mapping would silently merge unrelated identities', expectedObservation: 'the collision is prevented or resolved by one explicit deterministic policy' },
+    ],
+  })
+}
+
+const CONTROLLER_VERIFICATION_OBLIGATION_IDS = Object.freeze([
+  'temporal-activation-boundaries',
+  'temporal-ordered-activation',
+  'identity-equivalence-collisions',
+  'security-parser-differentials',
+])
+
+function canonicalControllerVerificationObligation(id) {
+  if (id === 'temporal-activation-boundaries') return temporalVerificationObligation('', 'activation')
+  if (id === 'temporal-ordered-activation') return temporalVerificationObligation('', 'ordered-activation')
+  if (id === 'identity-equivalence-collisions') return identityCollisionVerificationObligation('', true)
+  if (id === 'security-parser-differentials') return securityParserVerificationObligation('', true)
+  return null
+}
+
+function controllerVerificationObligationsForRequest(requestedResult) {
+  return [
+    temporalVerificationObligation(requestedResult),
+    identityCollisionVerificationObligation(requestedResult),
+    securityParserVerificationObligation(requestedResult),
+  ].filter(Boolean)
+}
+
+function verificationObligationsForRequest(requestedResult, supplied, fallbackChecks = []) {
+  const obligations = canonicalVerificationObligations(supplied, fallbackChecks)
+  if (!obligations) return null
+  const suppliedControllerIds = new Set(obligations
+    .filter(item => CONTROLLER_VERIFICATION_OBLIGATION_IDS.includes(item.id))
+    .map(item => item.id))
+  const required = controllerVerificationObligationsForRequest(requestedResult)
+  for (const obligation of required) suppliedControllerIds.add(obligation.id)
+  const controllerObligations = CONTROLLER_VERIFICATION_OBLIGATION_IDS
+    .filter(id => suppliedControllerIds.has(id))
+    .map(canonicalControllerVerificationObligation)
+  return [
+    ...obligations.filter(item => !CONTROLLER_VERIFICATION_OBLIGATION_IDS.includes(item.id)),
+    ...controllerObligations,
+  ]
+}
+
+function defaultRouteFactProposal(route = 'DIRECT') {
+  return {
+    requestedEffect: 'mutate',
+    dependencyShape: route === 'ROADMAP' ? 'dependent-groups' : route === 'LIGHT' ? 'connected' : 'bounded',
+    dependentWorkGroupCount: route === 'ROADMAP' ? 2 : 0,
+    integrationOwnerRequired: route === 'ROADMAP',
+    uncertainty: route === 'LIGHT' ? 'reversible-technical' : 'none',
+    reversibility: 'locally-reversible',
+    mutableResources: [{ kind: 'directory', identity: '.', shared: false, ownershipMode: 'single-owner' }],
+    sideEffects: ['deliverable-write'], externality: 'local-only', confidentiality: 'internal',
+    thirdPartyImpact: 'none', riskLevel: 'ordinary', minimumCheckerCount: 2,
+    namedDistinctResponsibilities: ['requirements semantics', 'boundary and regression behavior'],
+    checkQuality: 'authoritative', availableCheckKinds: ['focused-test'], baselineStatus: 'recorded',
+    hiddenExternalCheck: false, architectureImpact: route === 'ROADMAP' ? 'multi-system' : 'local',
+    fitsLightPlan: true, approachNeedsShortPlanning: route === 'LIGHT', shortOrderUnclear: false,
+  }
+}
+
+function validRouteFactProposal(value) {
+  if (!isObject(value)) return false
+  const required = Object.keys(defaultRouteFactProposal())
+  if (required.some(key => !own(value, key)) || Object.keys(value).some(key => !required.includes(key))) return false
+  return ['inspect', 'report', 'research', 'decide', 'mutate', 'external-operation'].includes(value.requestedEffect) &&
+    ['bounded', 'connected', 'independent-edits', 'dependent-groups'].includes(value.dependencyShape) &&
+    Number.isSafeInteger(value.dependentWorkGroupCount) && value.dependentWorkGroupCount >= 0 &&
+    typeof value.integrationOwnerRequired === 'boolean' &&
+    ['none', 'reversible-technical', 'product-semantic', 'architecture'].includes(value.uncertainty) &&
+    ['fully-reversible', 'locally-reversible', 'staged-rollback-required', 'irreversible'].includes(value.reversibility) &&
+    Array.isArray(value.mutableResources) && value.mutableResources.every(resource =>
+      isObject(resource) && concrete(resource.kind) && concrete(resource.identity) &&
+      typeof resource.shared === 'boolean' && concrete(resource.ownershipMode)) &&
+    nonEmptyStringArray(value.sideEffects) &&
+    ['local-only', 'external-read', 'external-write'].includes(value.externality) &&
+    ['public', 'internal', 'confidential', 'restricted'].includes(value.confidentiality) &&
+    ['none', 'minor', 'material'].includes(value.thirdPartyImpact) &&
+    ['ordinary', 'elevated', 'staged-high-impact'].includes(value.riskLevel) &&
+    [1, 2].includes(value.minimumCheckerCount) && nonEmptyStringArray(value.namedDistinctResponsibilities) &&
+    ['authoritative', 'short-plan', 'coordinated-design', 'unavailable'].includes(value.checkQuality) &&
+    requiredNonEmptyStringArray(value.availableCheckKinds) &&
+    ['recorded', 'not-applicable', 'unknown'].includes(value.baselineStatus) &&
+    typeof value.hiddenExternalCheck === 'boolean' &&
+    ['local', 'single-system', 'multi-system'].includes(value.architectureImpact) &&
+    ['fitsLightPlan', 'approachNeedsShortPlanning', 'shortOrderUnclear'].every(key => typeof value[key] === 'boolean')
+}
+
 const ROUTE_REASON_BOILERPLATE = Object.freeze([
   /^(?:it is |this is |the route is )?not (?:appropriate|applicable|needed|necessary|suitable|selected)(?: here)?[.!]?$/u,
   /^(?:not|no) (?:direct|light|roadmap)[.!]?$/u,
@@ -409,6 +619,20 @@ function validateRecommendation(recommendation) {
   for (const field of RECOMMENDATION_ARRAY_FIELDS) {
     if (!nonEmptyStringArray(recommendation[field])) errors.push(`${field} must be an array of non-empty strings`)
   }
+  if (!validRouteFactProposal(recommendation.routeFactProposal)) {
+    errors.push('routeFactProposal must contain the complete bounded semantic route inputs')
+  }
+  const canonicalRecommendationVerification = canonicalVerificationObligations(
+    recommendation.verificationObligations,
+  )
+  const normalizedRecommendationVerification = verificationObligationsForRequest(
+    '',
+    recommendation.verificationObligations,
+  )
+  if (!canonicalRecommendationVerification || !normalizedRecommendationVerification ||
+      !sameValue(canonicalRecommendationVerification, normalizedRecommendationVerification)) {
+    errors.push('verificationObligations must preserve typed cases and canonical controller-reserved bodies')
+  }
   if (!requiredNonEmptyStringArray(recommendation.whatTheUserWants)) {
     errors.push('whatTheUserWants must contain at least one item')
   }
@@ -444,14 +668,16 @@ function validateRecommendation(recommendation) {
 }
 
 function createRouteRecommendation(input = {}) {
+  const recommendedRoute = input.recommendedRoute ?? input.recommended_route ?? null
+  const checks = input.howSuccessCanBeChecked ?? input.how_success_can_be_checked ?? []
   return {
     schemaVersion: ROUTE_RECOMMENDATION_SCHEMA_VERSION,
     preWorkResult: input.preWorkResult ?? input.pre_work_result,
-    recommendedRoute: input.recommendedRoute ?? input.recommended_route ?? null,
+    recommendedRoute,
     confidence: input.confidence,
     whatTheUserWants: input.whatTheUserWants ?? input.what_the_user_wants ?? [],
     likelyAreas: input.likelyAreas ?? input.likely_areas ?? [],
-    howSuccessCanBeChecked: input.howSuccessCanBeChecked ?? input.how_success_can_be_checked ?? [],
+    howSuccessCanBeChecked: checks,
     unknowns: input.unknowns ?? [],
     risks: input.risks ?? [],
     independentWorkItems: input.independentWorkItems ?? input.independent_work_items ?? [],
@@ -461,6 +687,13 @@ function createRouteRecommendation(input = {}) {
     reasonsForRoadmap: input.reasonsForRoadmap ?? input.reasons_for_roadmap ?? [],
     userInputNeeded: input.userInputNeeded ?? input.user_input_needed ?? [],
     evidenceIndex: input.evidenceIndex ?? input.evidence_index ?? [],
+    routeFactProposal: input.routeFactProposal ?? input.route_fact_proposal ??
+      defaultRouteFactProposal(recommendedRoute || 'DIRECT'),
+    verificationObligations: verificationObligationsForRequest(
+      '',
+      input.verificationObligations ?? input.verification_obligations,
+      checks,
+    ),
   }
 }
 
@@ -1047,6 +1280,15 @@ function validateRouteDecision(decision) {
   for (const field of ['successChecklist', 'plannedChecks', 'likelyAreas']) {
     if (!requiredNonEmptyStringArray(decision[field])) errors.push(field+' must contain at least one item')
   }
+  const canonicalVerification = canonicalVerificationObligations(decision.verificationObligations)
+  const requiredVerificationUnion = verificationObligationsForRequest(
+    decision.requestedResult,
+    decision.verificationObligations,
+  )
+  if (!canonicalVerification || !requiredVerificationUnion ||
+      !sameValue(canonicalVerification, requiredVerificationUnion)) {
+    errors.push('verificationObligations must preserve the exact controller-required typed union for this request')
+  }
   if (!Array.isArray(decision.existingTests) || decision.existingTests.length === 0 ||
       new Set(decision.existingTests.map(item => item && item.id)).size !== decision.existingTests.length ||
       decision.existingTests.some(item => !isObject(item) || !concrete(item.id) || !concrete(item.command))) {
@@ -1179,6 +1421,11 @@ function createRouteDecision(input = {}) {
     normalizedFacts,
   )
   const plannedChecks = input.plannedChecks ?? input.checks ?? []
+  const verificationObligations = verificationObligationsForRequest(
+    input.requestedResult ?? input.requested_result,
+    input.verificationObligations ?? input.verification_obligations,
+    plannedChecks,
+  )
   const suppliedExistingTests = input.existingTests ?? input.existing_tests
   const existingTests = Array.isArray(suppliedExistingTests) && suppliedExistingTests.length
     ? suppliedExistingTests.map(item => ({ id: String(item.id), command: String(item.command) }))
@@ -1194,6 +1441,7 @@ function createRouteDecision(input = {}) {
       : (input.requestedResult ?? input.requested_result ?? ''),
     successChecklist: input.successChecklist ?? input.success_checklist ?? [],
     plannedChecks,
+    verificationObligations,
     existingTests,
     likelyAreas: input.likelyAreas ?? input.likely_areas ?? [],
     risks: input.risks ?? input.risksAndMissingInformation ?? input.risks_and_missing_information ?? [],
@@ -1360,6 +1608,152 @@ function exactPathGateSelection(facts) {
   }
 }
 
+function compileAutomaticRouteDecision(input = {}) {
+  const recommendation = input.recommendation
+  const recommendationValidation = validateRecommendation(recommendation)
+  if (!recommendationValidation.valid || recommendation.preWorkResult !== 'CONTINUE') {
+    const error = new Error(recommendationValidation.errors.join('; ') || 'automatic decision requires CONTINUE')
+    error.code = 'ROUTE_DECISION_INVALID'
+    throw error
+  }
+  const proposal = recommendation.routeFactProposal
+  const remainingMs = Number(input.budget?.remaining?.wallMs ?? input.remainingMs ?? 3600000)
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    const error = new Error('automatic route compiler requires a positive live budget')
+    error.code = 'ROUTE_DECISION_INVALID'
+    throw error
+  }
+  const remainingSeconds = remainingMs / 1000
+  const mutating = proposal.requestedEffect === 'mutate'
+  const facts = {
+    schemaVersion: router.ROUTE_FACTS_SCHEMA_VERSION,
+    requestedEffect: proposal.requestedEffect,
+    successCriteria: 'ready',
+    dependency: {
+      shape: proposal.dependencyShape,
+      dependentWorkGroupCount: proposal.dependentWorkGroupCount,
+      integrationOwnerRequired: proposal.integrationOwnerRequired,
+      separateDependentBodies: proposal.dependentWorkGroupCount,
+    },
+    uncertainty: proposal.uncertainty,
+    reversibility: proposal.reversibility,
+    mutableResources: proposal.mutableResources,
+    sideEffects: proposal.sideEffects,
+    externality: proposal.externality,
+    confidentiality: proposal.confidentiality,
+    thirdPartyImpact: proposal.thirdPartyImpact,
+    targetAuthorization: {
+      targetIdentities: [], authorizedTargetIdentities: [], authorizationEvidenceHash: null,
+    },
+    costAuthority: {
+      mayIncurCost: false, estimatedCostMicrounits: 0, limitMicrounits: 0,
+      approvalRequired: false, approvalGranted: false, approvalEvidenceHash: null,
+    },
+    riskAndIndependentCheckFloor: {
+      level: proposal.riskLevel,
+      minimumCheckerCount: proposal.minimumCheckerCount,
+      namedDistinctResponsibilities: proposal.namedDistinctResponsibilities,
+    },
+    checkAndBaseline: {
+      checkQuality: proposal.checkQuality,
+      availableCheckKinds: proposal.availableCheckKinds,
+      baselineStatus: proposal.baselineStatus,
+      hiddenExternalCheck: proposal.hiddenExternalCheck,
+    },
+    capturedIncidentDomains: proposal.hiddenExternalCheck ? ['HIDDEN_EXTERNAL_ORACLE'] : [],
+    deadlineBudget: {
+      remainingSeconds,
+      admissionSeconds: 0,
+      executionReserveSeconds: remainingSeconds * 0.55,
+      verificationReserveSeconds: remainingSeconds * 0.3,
+      recoveryAndFinalizationReserveSeconds: remainingSeconds * 0.1,
+    },
+    operatorMinimumRoute: null,
+    transportCapability: {
+      mode: input.providerCapabilities?.sameContextContinuation === true
+        ? 'native-recursive' : 'sequential-isolated',
+      taskCapabilityPreserved: true,
+    },
+    candidateFreeze: {
+      required: mutating,
+      available: input.providerCapabilities?.isolatedChecking === true,
+      environmentCanBeBound: input.providerCapabilities?.stableChildIdentity === true,
+    },
+    missingUserInput: recommendation.userInputNeeded,
+    architectureImpact: proposal.architectureImpact,
+    fitsLightPlan: proposal.fitsLightPlan,
+    approachNeedsShortPlanning: proposal.approachNeedsShortPlanning,
+    shortOrderUnclear: proposal.shortOrderUnclear,
+  }
+  const classified = router.classifyRoute(facts)
+  if (classified.status !== 'DECIDED') {
+    const error = new Error(`deterministic automatic route classification returned ${classified.status}`)
+    error.code = classified.status === 'WAITING_USER' ? 'WAITING_USER' : 'ROUTE_DECISION_INVALID'
+    error.details = classified
+    throw error
+  }
+  const route = classified.route
+  if (recommendation.recommendedRoute !== route) {
+    const error = new Error(
+      `route analyst recommendation ${recommendation.recommendedRoute} contradicts its deterministic fact classification ${route}`,
+    )
+    error.code = 'ROUTE_DECISION_INVALID'
+    throw error
+  }
+  const workerCount = route === 'ROADMAP'
+    ? Math.max(2, Math.min(3, proposal.dependentWorkGroupCount || 2)) : 1
+  const ownership = facts.mutableResources.map((resource, index) => ({
+    kind: resource.kind,
+    identity: resource.identity,
+    owner: `worker-${index % workerCount + 1}`,
+    ownershipMode: resource.ownershipMode,
+  }))
+  const routeReasonField = `reasonsFor${route[0]}${route.slice(1).toLowerCase()}`
+  const rejectedRouteReasons = Object.fromEntries(ROUTES.filter(other => other !== route).map(other => {
+    const field = `reasonsFor${other[0]}${other.slice(1).toLowerCase()}`
+    return [other, recommendation[field]]
+  }))
+  const recommendationHash = crypto.createHash('sha256').update(JSON.stringify(recommendation)).digest('hex')
+  return createRouteDecision({
+    route,
+    routeFacts: facts,
+    mutableResourceOwnership: ownership,
+    requestedResult: input.requestedResult,
+    successChecklist: recommendation.whatTheUserWants,
+    plannedChecks: recommendation.howSuccessCanBeChecked,
+    verificationObligations: recommendation.verificationObligations,
+    likelyAreas: recommendation.likelyAreas,
+    risks: [...recommendation.risks, ...recommendation.unknowns],
+    missingInformation: recommendation.unknowns,
+    workers: {
+      count: workerCount,
+      nonOverlapReason: workerCount === 1
+        ? 'One worker owns the connected mutation boundary.'
+        : 'Dependent work groups receive disjoint mutable resource ownership.',
+    },
+    chosenRouteReason: recommendation[routeReasonField].join(' '),
+    rejectedRouteReasons,
+    analystComparison: {
+      recommendedRoute: recommendation.recommendedRoute,
+      reason: recommendation.recommendedRoute === route
+        ? 'The deterministic classifier agrees with the analyst fact proposal.'
+        : 'The deterministic classifier corrected the advisory route from the normalized fact proposal.',
+      analystFactsFingerprint: classified.facts_fingerprint,
+      analystClassifierFingerprint: router.ROUTE_CLASSIFIER_FINGERPRINT,
+    },
+    routeChangeTrigger: {
+      event: route === 'DIRECT' ? 'SPEC_MISUNDERSTOOD' : 'MULTI_SURFACE_DISCOVERED',
+      factRequired: route === 'DIRECT'
+        ? 'Acceptance evidence proves the request semantics were misunderstood.'
+        : 'New evidence proves dependent writable surfaces require coordination.',
+    },
+    gateSelection: exactPathGateSelection(classified.normalized_facts),
+    requestEnvelopeHash: input.requestEnvelopeHash,
+    recommendationHash,
+    nowMs: input.nowMs,
+  })
+}
+
 function createExactPathDecision(input = {}) {
   const route = String(input.route || '').toUpperCase()
   if (!ROUTES.includes(route)) throw new TypeError('exact path route must be DIRECT, LIGHT, or ROADMAP')
@@ -1475,8 +1869,21 @@ function evaluateL0Decision(input = {}) {
     }
   }
   const validation = validateRouteDecision(input.decision)
+  const exactRequest = input.requestText ?? input.request_text
+  if (input.decision && input.decision.status === 'DECIDED' && nonEmpty(exactRequest)) {
+    const suppliedVerification = canonicalVerificationObligations(input.decision.verificationObligations)
+    const exactRequiredUnion = verificationObligationsForRequest(
+      exactRequest,
+      input.decision.verificationObligations,
+    )
+    if (!suppliedVerification || !exactRequiredUnion ||
+        !sameValue(suppliedVerification, exactRequiredUnion)) {
+      validation.valid = false
+      validation.errors.push('verificationObligations must preserve the exact request-derived controller union')
+    }
+  }
   const literalValidation = validateRequestLiteralPreservation(
-    input.requestText ?? input.request_text,
+    exactRequest,
     input.decision,
   )
   if (!literalValidation.valid) {
@@ -1751,6 +2158,8 @@ module.exports = {
   ROUTE_RECOMMENDATION_SCHEMA_ID,
   ROUTE_SCHEMA_DIGEST,
   buildRouteTopology,
+  canonicalVerificationObligations,
+  compileAutomaticRouteDecision,
   createFindingDispositionDecision,
   createFrameworkMissCacheIdentity,
   createRoadmapTopology,

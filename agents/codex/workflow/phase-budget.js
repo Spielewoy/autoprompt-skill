@@ -19,6 +19,8 @@ const {
   ROUTE_ANALYST_MAX_DURATION_MS,
   L0_DECISION_MAX_DURATION_MS,
   LIGHT_PLAN_MAX_DURATION_MS,
+  canonicalVerificationObligations,
+  compileAutomaticRouteDecision,
   createFindingDispositionDecision,
   createFrameworkMissCacheIdentity,
   createExactPathDecision,
@@ -236,25 +238,27 @@ function checkerVerdictPassed(logicalRole, result) {
   return CHECKER_ROLES.has(logicalRole) && Boolean(result) && result.code === 'PASS'
 }
 
-function checkerImplementationFailureFingerprint(result) {
+function checkerImplementationFailureFingerprint(result, assignedChecks = []) {
   if (!result || result.code !== 'FAIL') return null
-  const failedObligationIds = result.payload && Array.isArray(result.payload.testOutcomes)
-    ? result.payload.testOutcomes
-        .filter(item => item && item.status === 'FAIL')
-        .map(item => item.command)
-        .filter(value => typeof value === 'string' && value.length > 0)
-        .sort()
-    : []
+  const canonicalOutcomes = canonicalCheckerTestOutcomes(
+    result.payload && result.payload.testOutcomes,
+    assignedChecks,
+  )
+  // Failure identity is controller-owned. A checker may describe or rename a
+  // finding, but that cannot manufacture a new repair generation. When an old
+  // or malformed FAIL omits the exact matrix, conservatively bind the failure
+  // to the whole assigned matrix.
+  const failedCheckIds = canonicalOutcomes
+    ? canonicalOutcomes.filter(item => item.status === 'FAIL').map(item => item.command)
+    : [...new Set(assignedChecks)].sort()
   return hashText(stableStringify({
-    code: result.code,
-    causeEvent: result.cause && result.cause.event || null,
-    findingIds: exactFindingIds(result, result.payload, result.cause).sort(),
-    failedObligationIds,
+    code: 'FAIL',
+    failedCheckIds,
   }))
 }
 
-function checkerFailureIsVerificationLimitation(result) {
-  if (!result || result.code !== 'FAIL') return false
+function checkerResultHasExactVerificationLimitation(result) {
+  if (!result || !['FAIL', 'CHECK_INCONCLUSIVE'].includes(result.code)) return false
   const cause = result.cause && typeof result.cause === 'object' ? result.cause : {}
   const payload = result.payload && typeof result.payload === 'object' ? result.payload : {}
   const limitation = payload.verificationLimitation &&
@@ -277,6 +281,11 @@ function checkerFailureIsVerificationLimitation(result) {
   return codes.some(code => VERIFICATION_LIMITATION_CODES.has(code))
 }
 
+function checkerFailureIsVerificationLimitation(result) {
+  return Boolean(result && result.code === 'FAIL' &&
+    checkerResultHasExactVerificationLimitation(result))
+}
+
 function canonicalizeCheckerVerificationLimitation(result) {
   if (!checkerFailureIsVerificationLimitation(result)) return result
   const cause = result.cause && typeof result.cause === 'object' ? result.cause : {}
@@ -296,7 +305,12 @@ function canonicalizeCheckerVerificationLimitation(result) {
   }
 }
 
-function unsuccessfulWorkTerminal(workItemId, result) {
+function unsuccessfulWorkTerminal(workItemId, result, options = {}) {
+  const code = typeof options.code === 'string' && /^[A-Z][A-Z0-9_]+$/u.test(options.code)
+    ? options.code : 'IMPLEMENTATION_WORK_UNSUCCESSFUL'
+  const reason = typeof options.reason === 'string' && options.reason.length > 0
+    ? options.reason
+    : 'the implementation worker explicitly reported that its assigned implementation and author-side checks did not pass'
   const failedSuccessItemIds = Array.isArray(result && result.successItems)
     ? result.successItems
         .filter(item => !item || item.status !== 'pass')
@@ -307,9 +321,9 @@ function unsuccessfulWorkTerminal(workItemId, result) {
   return Object.freeze({
     outcome: 'FAILED',
     terminalEnvelope: Object.freeze({
-      code: 'IMPLEMENTATION_WORK_UNSUCCESSFUL',
-      status: 'IMPLEMENTATION_WORK_UNSUCCESSFUL',
-      reason: 'the implementation worker explicitly reported that its assigned implementation and author-side checks did not pass',
+      code,
+      status: code,
+      reason,
       workItemId,
       workResultHash: hashText(stableStringify(result)),
       failedSuccessItemIds: Object.freeze(failedSuccessItemIds),
@@ -384,6 +398,10 @@ function checkerRecoveryNextReady(workItemId, result, disposition = null) {
   const id = String(workItemId || '')
   const code = result && result.code
   if (/^independent-check-\d+/u.test(id) && disposition) {
+    if (stableCapabilityUnavailable(result)) {
+      return disposition.stableLimitationNextReadyId
+        ? [disposition.stableLimitationNextReadyId] : []
+    }
     if (['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(code)) {
       return disposition.nonAuthoritativeRetryId ? [disposition.nonAuthoritativeRetryId] : []
     }
@@ -400,6 +418,10 @@ function checkerRecoveryNextReady(workItemId, result, disposition = null) {
     if (/^independent-check-\d+$/u.test(id)) return ['work-1-repair-1']
   }
   return []
+}
+
+function stableCapabilityUnavailable(result) {
+  return checkerResultHasExactVerificationLimitation(result)
 }
 
 function durableNextReadyAfter(
@@ -691,6 +713,13 @@ function schedulerUsageTotal(groups = {}) {
     for (const field of Object.keys(total)) total[field] += Number(usage && usage[field] || 0)
   }
   return total
+}
+
+function billableModelTokens(usage = {}) {
+  // `reasoning` is a diagnostic subset of output_tokens in Codex/OpenAI
+  // usage, not a fourth additive token category.
+  return ['noncachedInput', 'cachedInput', 'output']
+    .reduce((total, field) => total + Number(usage && usage[field] || 0), 0)
 }
 
 function recoveryResumeState(savedState, hasLiveModelSession = false) {
@@ -2288,6 +2317,7 @@ function assertDistinctEvidenceConsumption(checks = []) {
   const methods = new Map()
   const methodClasses = new Map()
   for (const check of checks) {
+    const checkEvidenceIdentities = new Set()
     const evidenceIds = Array.isArray(check && check.evidenceIds)
       ? check.evidenceIds.map(value => typeof value === 'string' ? value.trim() : value)
       : []
@@ -2297,15 +2327,29 @@ function assertDistinctEvidenceConsumption(checks = []) {
       throw new SupervisorIntegrationError('EVIDENCE_CONSUMPTION_INVALID', 'checker evidence consumption must be explicitly identified')
     }
     for (const evidenceId of evidenceIds) {
-      const prior = consumed.get(evidenceId)
+      // Prefix spelling is not evidence identity.  A model must not make the
+      // same underlying file/request/candidate digest appear independent by
+      // renaming `sha256:x` to `file-sha256:x`.
+      const digestAlias = /^(?:(?:[A-Za-z][A-Za-z0-9._-]*-)?sha-?256:|urn:sha-?256:)?([A-Fa-f0-9]{64})(?:[?#][^\s]*)?$/iu.exec(evidenceId)
+      const normalizedEvidenceId = digestAlias
+        ? `sha256:${digestAlias[1].toLowerCase()}` : evidenceId
+      if (checkEvidenceIdentities.has(normalizedEvidenceId)) {
+        throw new SupervisorIntegrationError(
+          'EVIDENCE_CONSUMPTION_INVALID',
+          `checker ${check.checkerId} named the same underlying evidence more than once`,
+          { evidenceId: normalizedEvidenceId, checkerId: check.checkerId },
+        )
+      }
+      checkEvidenceIdentities.add(normalizedEvidenceId)
+      const prior = consumed.get(normalizedEvidenceId)
       if (prior && prior.checkerId !== check.checkerId) {
         throw new SupervisorIntegrationError(
           'DUPLICATE_UNDERLYING_EVIDENCE',
           `independent checkers ${prior.checkerId} and ${check.checkerId} consumed ${evidenceId}`,
-          { evidenceId, firstOracleId: prior.oracleId, secondOracleId: check.oracleId },
+          { evidenceId: normalizedEvidenceId, firstOracleId: prior.oracleId, secondOracleId: check.oracleId },
         )
       }
-      consumed.set(evidenceId, { checkerId: check.checkerId, oracleId: check.oracleId })
+      consumed.set(normalizedEvidenceId, { checkerId: check.checkerId, oracleId: check.oracleId })
     }
     if (check.requireReferenceMethod === true) {
       const supplied = check.referenceMethod
@@ -4441,11 +4485,39 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
     const priorReceipts = canonicalRejectedCheckerReceipts(
       retryState.cumulativeRejectedCheckerReceipts,
     )
-    const expectedReceipts = appendRejectedCheckerReceipt(
-      priorReceipts,
-      details.checkerReceiptPointer,
-      details.checkerResultHash,
-    )
+    const batchCheckerIds = details.checkerIds === undefined
+      ? [details.checkerId] : details.checkerIds
+    const batchCheckerResultHashes = details.checkerResultHashes === undefined
+      ? [details.checkerResultHash] : details.checkerResultHashes
+    const batchCheckerReceiptPointers = details.checkerReceiptPointers === undefined
+      ? [details.checkerReceiptPointer] : details.checkerReceiptPointers
+    if (!uniqueStrings(batchCheckerIds) || batchCheckerIds.length < 1 || batchCheckerIds.length > 2 ||
+        batchCheckerResultHashes.length !== batchCheckerIds.length ||
+        batchCheckerReceiptPointers.length !== batchCheckerIds.length ||
+        batchCheckerIds[0] !== details.checkerId ||
+        batchCheckerResultHashes[0] !== details.checkerResultHash ||
+        stableStringify(batchCheckerReceiptPointers[0]) !== stableStringify(details.checkerReceiptPointer) ||
+        batchCheckerResultHashes.some(hash => !/^[a-f0-9]{64}$/u.test(hash || ''))) {
+      throw new SupervisorIntegrationError(
+        'REPAIR_RECOVERY_INVALID',
+        'implementation repair checker batch must bind one or two exact aligned ids, results, and receipts',
+      )
+    }
+    let expectedReceipts = priorReceipts
+    for (let index = 0; index < batchCheckerIds.length; index += 1) {
+      if (!batchCheckerReceiptPointers[index] ||
+          batchCheckerReceiptPointers[index].name !== batchCheckerIds[index]) {
+        throw new SupervisorIntegrationError(
+          'REPAIR_RECOVERY_INVALID',
+          'implementation repair checker batch pointer identity is not aligned',
+        )
+      }
+      expectedReceipts = appendRejectedCheckerReceipt(
+        expectedReceipts,
+        batchCheckerReceiptPointers[index],
+        batchCheckerResultHashes[index],
+      )
+    }
     const rejectedCheckerReceipts = canonicalRejectedCheckerReceipts(
       details.rejectedCheckerReceipts,
       { allowEmpty: false },
@@ -4550,8 +4622,7 @@ function hydrateBudgetSnapshot(saved, cumulative, authoritativeGeneration = save
     throw new SupervisorIntegrationError('BUDGET_RESUME_REQUIRED', 'resume requires canonical state and accounting snapshots')
   }
   const tokenUsage = cumulative.tokenUsage || {}
-  const replayedTokens = ['noncachedInput', 'cachedInput', 'output', 'reasoning']
-    .reduce((sum, field) => sum + Number(tokenUsage[field] || 0), 0)
+  const replayedTokens = billableModelTokens(tokenUsage)
   const merged = {
     ...saved,
     generation: authoritativeGeneration,
@@ -5320,23 +5391,38 @@ class CodexSupervisorRuntime {
       if (error && error.code === 'WORKSPACE_LEASE_CONFLICT') {
         return this._preLeaseOutcome('WORKSPACE_LEASE_CONFLICT', { error: serializeError(error) })
       }
-      if (!this.lease) return this._preLeaseOutcome(error.code || 'FAILED', { error: serializeError(error) })
+      let terminalError = error
+      let terminalErrorCode = error && typeof error.code === 'string' && error.code
+        ? error.code : 'FAILED'
+      if (!this.lease) return this._preLeaseOutcome(terminalErrorCode, { error: serializeError(error) })
       if (this.cancelled && this.cancellationPromise) return this.cancellationPromise
       const budgetStop = error && [
         'BUDGET_EXHAUSTED', 'MISSION_TIMEOUT', 'EXTERNAL_WRITE_DEADLINE_EXPIRED',
         'RESUME_DEADLINE_EXPIRED', 'PHASE_CONVERGENCE_REQUIRED', 'PHASE_BUDGET_EXHAUSTED',
       ].includes(error.code)
       if (error && !budgetStop && this.budget && typeof this.budget.recordCrash === 'function') {
-        error.crashState = this.budget.recordCrash(hashText(stableStringify({
-          code: error.code || 'FAILED',
+        const crashState = this.budget.recordCrash(hashText(stableStringify({
+          code: terminalErrorCode,
           message: error.message || String(error),
           route: this.route,
         })), { progressEvidence: this.lastAcceptedProgress, activationId: this.activation.id })
+        if ((typeof error === 'object' || typeof error === 'function') &&
+            Object.isExtensible(error)) error.crashState = crashState
         if (typeof this.budget.crashRetryVerdict === 'function') {
           const retry = this.budget.crashRetryVerdict()
           if (retry.exhausted) {
-            error.code = retry.code
-            error.details = { ...(error.details || {}), crashRetry: retry }
+            terminalErrorCode = retry.code
+            if ((typeof error === 'object' || typeof error === 'function') &&
+                Object.isExtensible(error)) {
+              error.code = retry.code
+              error.details = { ...(error.details || {}), crashRetry: retry }
+            } else {
+              terminalError = new SupervisorIntegrationError(
+                retry.code,
+                error && error.message || String(error),
+                { crashRetry: retry, primaryError: serializeError(error), crashState },
+              )
+            }
           }
         }
       }
@@ -5344,7 +5430,7 @@ class CodexSupervisorRuntime {
         const frontier = this._budgetPauseFrontier()
         if (frontier) {
           const pauseResult = {
-            terminalEnvelope: { status: error.code, error: serializeError(error) },
+            terminalEnvelope: { status: terminalErrorCode, error: serializeError(terminalError) },
             transition: { eventId: 'BUDGET_EXHAUSTED_RESUMABLE', frontier },
           }
           try {
@@ -5360,9 +5446,9 @@ class CodexSupervisorRuntime {
       }
       let terminalOutcome = diagnosticDenied ? 'BLOCKED'
         : budgetStop ? 'PARTIAL' : (this.cancelled ? 'CANCELLED' : 'FAILED')
-      terminalOutcome = await this._enterTerminalRelease(terminalOutcome, error)
+      terminalOutcome = await this._enterTerminalRelease(terminalOutcome, terminalError)
       return this._finish(terminalOutcome, {
-        terminalEnvelope: { status: error.code || 'FAILED', error: serializeError(error) },
+        terminalEnvelope: { status: terminalErrorCode, error: serializeError(terminalError) },
       })
     }
   }
@@ -5690,7 +5776,7 @@ class CodexSupervisorRuntime {
         causeId: `root-l0-jsonl:${this.activation.generation}:${rootUsageSequence}`,
         humanDescription: 'Persist complete streamed root L0 usage before allowing route-decision continuation.',
       }, { tokenUsage: delta })
-      const tokens = Object.values(delta).reduce((total, value) => total + Number(value || 0), 0)
+      const tokens = billableModelTokens(delta)
       if (tokens > 0) this.budget.consumeTokens(tokens)
       if (rootContinuationId || this.recoveryThreads.has(rootLease.id)) persistRootCheckpoint('USAGE_RECORDED')
       return { continue: authorization.allowed === true && report.continue === true, authorization, report }
@@ -6094,21 +6180,28 @@ class CodexSupervisorRuntime {
       })
       return this.representativePolicyProbe
     }
-    const result = await this.launchChild({
-      workItemId,
-      logicalRole: 'diagnostic-probe', parent: 'run-owner', purpose: 'diagnostic',
-      assignment: 'Run one bounded read-only representative role policy probe against the active target.',
-      ownership: ['workspace'],
-      success: ['Return PASS with concrete command or inspection evidence from the active target.'],
-      checks: ['No mutation, dispatch, or external operation is permitted.'],
-      bounded: true, nextReadyAfter: [],
-    })
-    if (!representativePolicyProbePassed(result)) {
-      throw new SupervisorIntegrationError(
-        'DIAGNOSTIC_DENIAL_BLOCKED',
-        'the mandatory representative role/policy probe was denied before the worker group launched',
-        { workerCount: Math.max(1, this.diagnosticWorkerLaunches), logicalRole: 'diagnostic-probe', physicalRole, providerRole },
-      )
+    // Role selection and the provider capability binding are deterministic
+    // controller contracts.  Paying for a model turn to run `pwd`/`git
+    // status` cannot prove either one and added a pure-cost launch to every
+    // DIRECT/LIGHT run.  Persist the exact controller validation as the same
+    // canonical child-result shape so crash adoption remains byte-bound.
+    const result = {
+      schemaVersion: '2.0.0', reportType: 'result', runId: this.options.runId,
+      assignmentId: workItemId, logicalRoleId: 'diagnostic-probe', physicalRoleId: physicalRole,
+      requestEnvelopeHash: this.requestPointer && this.requestPointer.hash || null,
+      allAssignedItemsPass: true,
+      filesChanged: [], resourcesChanged: [],
+      behaviorChanged: ['Controller validated the representative role policy and live provider binding.'],
+      commands: [{ command: 'controller:validate-role-policy-and-provider-capability', exitCode: 0 }],
+      successItems: [{ id: 'representative-policy-binding', status: 'pass', evidenceIds: [
+        hashText(stableStringify({ physicalRole, providerRole, route: this.route })),
+      ] }],
+      remainingConcerns: [], findingIds: ['AP-TRACE-013'],
+      requestedTransition: {
+        event: 'WORK_ITEM_VERIFIED',
+        reason: 'Representative role policy and live provider binding validated.',
+        invalidateEvidenceIds: [],
+      },
     }
     this.diagnosticWorkerLaunches = Math.max(1, this.diagnosticWorkerLaunches)
     const resultHash = hashText(stableStringify(result))
@@ -6659,12 +6752,29 @@ class CodexSupervisorRuntime {
         runId: this.options.runId,
         generation: this.activation.generation,
       })
-      const indexMatch = /([0-9]+)$/.exec(saved.workItemId)
+      const checkerIndexMatch = /^independent-check-(\d+)/u.exec(saved.workItemId)
+      const indexMatch = checkerIndexMatch || /([0-9]+)$/u.exec(saved.workItemId)
       const index = indexMatch ? Math.max(0, Number(indexMatch[1]) - 1) : 0
       const capturedDomainContracts = Array.isArray(decision.capturedDomainContracts)
         ? decision.capturedDomainContracts : []
       const assignedDomainContracts = index === 0 ? capturedDomainContracts : []
       const replayChecks = deterministicChecksForDecision(decision, this.route)
+      const replayVerificationObligations = canonicalVerificationObligations(
+        decision.verificationObligations,
+        decision.plannedChecks,
+      )
+      if (!replayVerificationObligations) {
+        throw new SupervisorIntegrationError(
+          'VERIFICATION_OBLIGATIONS_INVALID',
+          'fresh crash replay requires the exact typed acceptance obligations',
+        )
+      }
+      const replayCheckerCount = Math.max(1, Number(
+        decision.independentCheckingPlan && decision.independentCheckingPlan.checkerCount || 1,
+      ))
+      const resumedVerificationObligations = replayVerificationObligations
+        .filter((_, obligationIndex) => obligationIndex % replayCheckerCount === index)
+        .map(obligation => structuredClone(obligation))
       const resumedPlanPointer = saved.logicalRole === 'plan-checker' && typeof this.options.planPointer === 'function'
         ? this.options.planPointer('ROADMAP') : null
       if (resumedPlanPointer && saved.inspectedCandidateHash !== resumedPlanPointer.sha256) {
@@ -6723,6 +6833,7 @@ class CodexSupervisorRuntime {
         risks: decision.risks || [],
         fetchedEvidence: {
           verificationDoctrine: CHECKER_FALSIFICATION_DOCTRINE,
+          verificationObligations: resumedVerificationObligations,
           ...(assignedDomainContracts.length > 0
             ? { capturedDomainContracts: assignedDomainContracts } : {}),
         },
@@ -6767,6 +6878,11 @@ class CodexSupervisorRuntime {
         ownership: resumedWorkerOwnership.length ? resumedWorkerOwnership : ['workspace'],
         success: decision.successChecklist || [],
         checks: replayChecks,
+        fetchedEvidence: {
+          verificationObligations: replayVerificationObligations.map(
+            obligation => structuredClone(obligation),
+          ),
+        },
         retainLease: retainedParent,
       }
       const replayRequest = replayedAssignment ? replayRequestFromPersistedAssignment(replayedAssignment) : null
@@ -8144,7 +8260,7 @@ class CodexSupervisorRuntime {
           causeId: `codex-jsonl:${hashText(sessionId).slice(0, 24)}:${usageSequence}`,
           humanDescription: 'Persist the complete streamed Codex usage delta before allowing the child to continue.',
         }, { costMicrounits, tokenUsage: delta })
-        const tokens = Object.values(delta).reduce((total, value) => total + Number(value || 0), 0)
+        const tokens = billableModelTokens(delta)
         if (tokens > 0) this.budget.consumeTokens(tokens)
         persistSchedulerCheckpoint(identifiedContinuationId, 'USAGE_RECORDED')
         return {
@@ -8366,7 +8482,7 @@ class CodexSupervisorRuntime {
           causeId: `model-terminal:${hashText(sessionId).slice(0, 24)}:${usageSequence}`,
           humanDescription: 'Persist complete terminal model usage from a non-streaming launcher.',
         }, { tokenUsage: terminalUsage })
-        const tokens = Object.values(terminalUsage).reduce((total, value) => total + Number(value), 0)
+        const tokens = billableModelTokens(terminalUsage)
         if (tokens > 0) this.budget.consumeTokens(tokens)
         if (authorization.allowed !== true || report.continue !== true) {
           const error = new SupervisorIntegrationError('BUDGET_EXHAUSTED', 'terminal model usage exhausted the scheduler budget')
@@ -8456,12 +8572,20 @@ class CodexSupervisorRuntime {
         lease.complete({})
         leaseSettled = true
         const checkerPassed = checkerVerdictPassed(policy.child, result)
-        if (checkerPassed) addCanonicalCompletedChecker(this.recoveryCompletedCheckIds, request.workItemId)
+        const checkerCompleted = checkerPassed ||
+          (CHECKER_ROLES.has(policy.child) && (
+            stableCapabilityUnavailable(result) ||
+            (result && result.code === 'FAIL' &&
+              /^independent-check-\d+(?:-repair-\d+)?$/u.test(
+                request.workItemId || '',
+              ))
+          ))
+        if (checkerCompleted) addCanonicalCompletedChecker(this.recoveryCompletedCheckIds, request.workItemId)
         else if (!CHECKER_ROLES.has(policy.child)) this.recoveryCompletedWorkIds.add(request.workItemId)
         this.recoveryThreads.delete(lease.id)
         this._persistRecoveryCheckpoint({
           kind: CHECKER_ROLES.has(policy.child)
-            ? (checkerPassed ? 'CHECK_COMPLETED' : 'FRONTIER_CHANGED')
+            ? (checkerCompleted ? 'CHECK_COMPLETED' : 'FRONTIER_CHANGED')
             : 'LEASE_COMPLETED',
           causeId: `scheduler:${this.activation.generation}:${lease.id}:completed`,
           humanDescription: 'Persist the completed model result and released scheduler lease as one recovery point.',
@@ -8521,6 +8645,13 @@ class CodexSupervisorRuntime {
       }
       return returned
     } catch (error) {
+      const attachErrorField = (field, value) => {
+        if (error && (typeof error === 'object' || typeof error === 'function') &&
+            Object.isExtensible(error)) error[field] = value
+      }
+      const attachCleanupFailure = (field, cleanupError) => {
+        attachErrorField(field, serializeError(cleanupError))
+      }
       if (checkerSnapshotBefore) {
         try {
           const after = hashWorkspaceCandidate(targetWorkingDirectory, this.options.gitEnvironment(targetWorkingDirectory))
@@ -8533,8 +8664,8 @@ class CodexSupervisorRuntime {
             error = drift
           }
         } catch (snapshotError) {
-          if (snapshotError.code === 'CHECKER_SNAPSHOT_MUTATED') error = snapshotError
-          else error.snapshotVerificationFailure = serializeError(snapshotError)
+          if (snapshotError && snapshotError.code === 'CHECKER_SNAPSHOT_MUTATED') error = snapshotError
+          else attachErrorField('snapshotVerificationFailure', serializeError(snapshotError))
         }
       }
       if (error && (typeof error === 'object' || typeof error === 'function') && Object.isExtensible(error)) {
@@ -8543,22 +8674,27 @@ class CodexSupervisorRuntime {
       if (externalOperation && error && ['MISSION_TIMEOUT', 'EXTERNAL_WRITE_DEADLINE_EXPIRED'].includes(error.code)) {
         const reconciled = reconcileExternalOperationTimeout(externalOperation, this.recoveryExternalOperations)
         this.recoveryExternalOperations.set(reconciled.operationId, reconciled)
-        error.details = { ...(error.details || {}), externalOperation: reconciled, terminalBudgetOutcome: 'PARTIAL' }
+        attachErrorField('details', {
+          ...(error.details || {}), externalOperation: reconciled, terminalBudgetOutcome: 'PARTIAL',
+        })
       }
-      let workspaceAbortFailed = false
       if (deferredPromotionHandle) {
-        try { await deferredPromotionHandle.abort(error.code || 'worker completion failed') } catch (abortError) {
-          workspaceAbortFailed = true
-          error.workspaceAbortError = { code: abortError.code, message: abortError.message }
+        try { await deferredPromotionHandle.abort(error && error.code || 'worker completion failed') } catch (abortError) {
+          attachCleanupFailure('workspaceAbortError', abortError)
         }
       }
       if (mutationPermit && workerWorkspace) {
         try { workerWorkspace.manager.abort(workerWorkspace) } catch (abortError) {
-          workspaceAbortFailed = true
-          error.workspaceAbortError = { code: abortError.code, message: abortError.message }
+          attachCleanupFailure('workspaceAbortError', abortError)
         }
       }
-      if (!workspaceAbortFailed && mutationPermit && this.options.mutationEnforcer &&
+      // The durable mutation authority and the physical private workspace are
+      // independent cleanup layers.  A failed workspace abort must never keep
+      // the state-store permit live: terminal release rejects that state as
+      // MUTATION_INCOMPLETE and masks the actual worker failure.  Always close
+      // the exact permit, while retaining either cleanup failure as secondary
+      // evidence on an extensible primary error.
+      if (mutationPermit && this.options.mutationEnforcer &&
           typeof this.options.mutationEnforcer.abort === 'function') {
         try {
           await this.options.mutationEnforcer.abort({
@@ -8569,7 +8705,7 @@ class CodexSupervisorRuntime {
             error,
           })
         } catch (abortError) {
-          error.mutationAbortError = { code: abortError.code, message: abortError.message }
+          attachCleanupFailure('mutationAbortError', abortError)
         }
       }
       if (!leaseSettled) {
@@ -9112,6 +9248,7 @@ function replayRequestFromPersistedAssignment(assignment) {
     assignment: assignment.requestedResult,
     successChecklist: assignment.successChecklist.map(item => item.description),
     success: assignment.successChecklist.map(item => item.description),
+    checks: assignment.checks.map(item => typeof item === 'string' ? item : item.description),
     findingIds: [...assignment.findingIds],
     ownership: resources,
     manifests: resources,
@@ -10566,6 +10703,15 @@ function markdownDecisionList(values) {
   return values.map(value => `- ${markdownDecisionText(value)}`)
 }
 
+function markdownVerificationObligations(obligations) {
+  if (!Array.isArray(obligations) || obligations.length === 0) return ['- None recorded.']
+  return obligations.flatMap(obligation => [
+    `- ${markdownDecisionText(obligation.id)} [${markdownDecisionText(obligation.kind)}]: ${markdownDecisionText(obligation.statement)}`,
+    ...(obligation.cases || []).map(item =>
+      `  - ${markdownDecisionText(item.id)} (${markdownDecisionText(item.phase)}, ${markdownDecisionText(item.polarity)}): if ${markdownDecisionText(item.precondition)}; expect ${markdownDecisionText(item.expectedObservation)}`),
+  ])
+}
+
 function renderRouteDecisionMarkdown(decision) {
   if (!decision || typeof decision !== 'object' || Array.isArray(decision)) {
     throw new SupervisorIntegrationError('ROUTE_DECISION_INVALID', 'route decision markdown requires the canonical decision object')
@@ -10599,6 +10745,10 @@ function renderRouteDecisionMarkdown(decision) {
     '## 5. Likely Files or System Areas',
     '',
     ...markdownDecisionList(decision.likelyAreas),
+    '',
+    '## Typed Verification Obligations',
+    '',
+    ...markdownVerificationObligations(decision.verificationObligations),
     '',
     '## 6. Risks and Missing Information',
     '',
@@ -10667,6 +10817,9 @@ function renderPlanArtifact(route, decision, authorResult = null) {
     '',
     '## Checks',
     ...(decision.plannedChecks || []).map(item => `- ${item}`),
+    '',
+    '## Typed verification obligations',
+    ...markdownVerificationObligations(decision.verificationObligations),
     '',
     '## Ownership',
     ...(decision.mutableResourceOwnership || []).map(item =>
@@ -10941,7 +11094,22 @@ function createDefaultRouteExecutor(options) {
     }
     const successes = decision.successChecklist || []
     const checks = deterministicChecksForDecision(decision, route)
+    const verificationObligations = canonicalVerificationObligations(
+      decision.verificationObligations,
+    )
+    if (!verificationObligations) {
+      throw new SupervisorIntegrationError(
+        'VERIFICATION_OBLIGATIONS_INVALID',
+        'execution requires typed positive, negative, and boundary acceptance obligations',
+      )
+    }
+    const typedWorkEvidence = (base = null) => withDescriptiveLikelyAreas({
+      ...(base && typeof base === 'object' && !Array.isArray(base) ? base : {}),
+      verificationObligations: verificationObligations.map(obligation => structuredClone(obligation)),
+    })
     const likelyAreas = decision.likelyAreas || []
+    const boundedToolOutputDiscipline =
+      ' Keep model-visible command output bounded: redirect large stdout/stderr to a scratch file, then inspect a hash, count, or targeted preview of at most 4 KiB. Never use line-oriented head, tail, sed, or unrestricted recursive search on potentially monolithic generated artifacts or private run-record/transcript trees. Reuse one focused executable validation harness instead of repeatedly dumping source, artifacts, or logs.'
     const workerCount = Math.max(1, Number(decision.usefulWorkerCount || 1))
     const initialWorkFrontier = route === 'ROADMAP'
       ? ['roadmap-author']
@@ -11532,6 +11700,22 @@ function createDefaultRouteExecutor(options) {
     }
     let latestAuthorWorkItemId = completedBeforeResume.has('roadmap-author-revise')
       ? 'roadmap-author-revise' : 'roadmap-author'
+    const unsuccessfulPlanningResult = (workItemId, result) =>
+      result && result.allAssignedItemsPass === false
+        ? unsuccessfulWorkTerminal(workItemId, result, {
+            code: 'PLANNING_WORK_UNSUCCESSFUL',
+            reason: 'the planning worker explicitly reported that its assigned planning work and author-side checks did not pass',
+          })
+        : null
+    for (const planningWorkItemId of ['mission-coordination', 'roadmap-work-group']) {
+      const adoptedPlanningResult = adoptedWorkResults[planningWorkItemId]
+      const planningFailure = unsuccessfulPlanningResult(planningWorkItemId, adoptedPlanningResult)
+      if (planningFailure) {
+        if (retainedManager && retainedManager.completed !== true) completeRetainedLease(retainedManager)
+        if (retainedCoordinator && retainedCoordinator.completed !== true) completeRetainedLease(retainedCoordinator)
+        return planningFailure
+      }
+    }
     let roadmapResult = adoptedWorkResults['roadmap-author'] ||
       (completedBeforeResume.has('roadmap-author') && typeof options.readResult === 'function'
         ? options.readResult('roadmap-author') : null)
@@ -11546,12 +11730,16 @@ function createDefaultRouteExecutor(options) {
           ? Array.from({ length: scoutCount }, (_, index) => `roadmap-scout-${index + 1}`)
           : ['roadmap-plan-check'],
       })
+      const planningFailure = unsuccessfulPlanningResult('roadmap-author', roadmapResult)
+      if (planningFailure) return planningFailure
       roadmapResult = roadmapAuthorArtifact(roadmapResult)
       options.writePlan('ROADMAP', decision, roadmapResult, 'roadmap-author')
       completedBeforeResume.add('roadmap-author')
     }
     if (route === 'ROADMAP' && !resumeAtChecking && typeof options.planExists === 'function' &&
         !options.planExists('ROADMAP')) {
+      const planningFailure = unsuccessfulPlanningResult(latestAuthorWorkItemId, roadmapResult)
+      if (planningFailure) return planningFailure
       if (!roadmapResult) {
         throw new SupervisorIntegrationError(
           'ROADMAP_RESULT_MISSING',
@@ -11586,6 +11774,15 @@ function createDefaultRouteExecutor(options) {
         scoutResults.set(workItemId, result)
         completedBeforeResume.add(workItemId)
       }))
+      const unsuccessfulScoutId = scoutWorkIds.find(workItemId => {
+        const result = scoutResults.get(workItemId) ||
+          (typeof options.readResult === 'function' ? options.readResult(workItemId) : null)
+        return result && result.allAssignedItemsPass === false
+      })
+      if (unsuccessfulScoutId) {
+        const result = scoutResults.get(unsuccessfulScoutId) || options.readResult(unsuccessfulScoutId)
+        return unsuccessfulPlanningResult(unsuccessfulScoutId, result)
+      }
       const missingScouts = scoutWorkIds.filter(workItemId => !completedBeforeResume.has(workItemId))
       if (missingScouts.length > 0) {
         throw new SupervisorIntegrationError(
@@ -11650,6 +11847,8 @@ function createDefaultRouteExecutor(options) {
           'completed same-author ROADMAP revision result is unavailable',
         )
       }
+      const revisionFailure = unsuccessfulPlanningResult('roadmap-author-revise', revisedResult)
+      if (revisionFailure) return revisionFailure
       latestAuthorWorkItemId = 'roadmap-author-revise'
       roadmapResult = roadmapAuthorArtifact(revisedResult, concreteScoutCorrections)
       options.writePlan('ROADMAP', decision, roadmapResult, latestAuthorWorkItemId)
@@ -11851,6 +12050,8 @@ function createDefaultRouteExecutor(options) {
             'completed ROADMAP plan repair lacks its exact durable author result',
           )
         }
+        const repairFailure = unsuccessfulPlanningResult('roadmap-author-plan-repair', repaired)
+        if (repairFailure) return repairFailure
         roadmapResult = roadmapAuthorArtifact(
           repaired,
           roadmapResult && roadmapResult.scoutCorrections || [],
@@ -11947,6 +12148,8 @@ function createDefaultRouteExecutor(options) {
           ],
           nextReadyAfter: ['roadmap-plan-recheck'],
         })
+        const repairFailure = unsuccessfulPlanningResult('roadmap-author-plan-repair', repaired)
+        if (repairFailure) return repairFailure
         completedBeforeResume.add('roadmap-author-plan-repair')
         roadmapResult = roadmapAuthorArtifact(
           repaired,
@@ -12007,6 +12210,13 @@ function createDefaultRouteExecutor(options) {
         fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
         nextReadyAfter: workerCount >= 2 ? ['roadmap-work-group'] : ['work-1'],
       })
+      const coordinatorFailure = unsuccessfulPlanningResult('mission-coordination', coordinator)
+      if (coordinatorFailure) {
+        if (coordinator.retainedLease && coordinator.retainedLease.completed !== true) {
+          completeRetainedLease(coordinator.retainedLease)
+        }
+        return coordinatorFailure
+      }
       retainedCoordinator = coordinator.retainedLease
     }
     if (route === 'ROADMAP' && !resumeAtChecking && workerCount >= 2 && !retainedManager &&
@@ -12053,6 +12263,16 @@ function createDefaultRouteExecutor(options) {
           },
           nextReadyAfter: Array.from({ length: workerCount }, (_, index) => `work-${index + 1}`),
         })
+        const managerFailure = unsuccessfulPlanningResult('roadmap-work-group', manager)
+        if (managerFailure) {
+          if (manager.retainedLease && manager.retainedLease.completed !== true) {
+            completeRetainedLease(manager.retainedLease)
+          }
+          if (retainedCoordinator && retainedCoordinator.completed !== true) {
+            completeRetainedLease(retainedCoordinator)
+          }
+          return managerFailure
+        }
         retainedManager = manager.retainedLease
     }
     const requiredWorkIds = Array.from({ length: workerCount }, (_, index) => `work-${index + 1}`)
@@ -12129,12 +12349,12 @@ function createDefaultRouteExecutor(options) {
           parentLease: retainedManager
             ? retainedManager.schedulerLease
             : retainedCoordinator && retainedCoordinator.schedulerLease,
-          purpose: 'work', assignment: responsibility || decision.requestedResult,
+          purpose: 'work', assignment: `${responsibility || decision.requestedResult} Implement every typed acceptance case in fetchedEvidence.verificationObligations, including inactive, intermediate, negative, and boundary behavior; run those cases before returning.${boundedToolOutputDiscipline}`,
           routeDecisionHash: hashText(stableStringify(decision)),
           ownership: namedOwnership.length ? namedOwnership : ['workspace'],
           success: successes, checks,
           roadmapSlice: planPointer, manifests: executionOwnership,
-          fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
+          fetchedEvidence: typedWorkEvidence(capturedDomainWorkEvidence),
           deferPromotion: Boolean(doneRetryBoundary),
           difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
           risk: (decision.risks || []).length ? 'high' : 'ordinary',
@@ -12230,7 +12450,7 @@ function createDefaultRouteExecutor(options) {
               ownership: namedOwnership.length ? namedOwnership : ['workspace'],
               success: successes, checks, roadmapSlice: planPointer,
               manifests: executionOwnership,
-              fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
+              fetchedEvidence: typedWorkEvidence(capturedDomainWorkEvidence),
               difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
               risk: (decision.risks || []).length ? 'high' : 'ordinary',
               recoveryGroupWorkIds: splitWorkIds,
@@ -12306,7 +12526,7 @@ function createDefaultRouteExecutor(options) {
     const checkerFreezeBinding = {
       missionHash: options.missionHash,
       planHash: planPointer && planPointer.sha256 || hashText(stableStringify(decision)),
-      oracleHash: hashText(stableStringify(checks)),
+      oracleHash: hashText(stableStringify({ checks, verificationObligations })),
       assumptionsHash: hashText(stableStringify({
         risks: decision.risks || [], missingInformation: decision.missingInformation || [],
       })),
@@ -12637,6 +12857,23 @@ function createDefaultRouteExecutor(options) {
       ...(decision.plannedChecks || []),
       ...regressionBaseline.map(item => item && (item.command || item.id)).filter(Boolean),
     ])]
+    const verificationObligationsBySeat = Array.from({ length: checkerCount }, () => [])
+    verificationObligations.forEach((obligation, obligationIndex) => {
+      verificationObligationsBySeat[obligationIndex % checkerCount].push(obligation)
+    })
+    const checkerNamedChecksBySeat = Array.from({ length: checkerCount }, (_, seat) => {
+      const assigned = checkerCount === 1
+        ? [...checkerNamedChecks]
+        : checkerNamedChecks.filter((_, checkIndex) => checkIndex % checkerCount === seat)
+      const obligationChecks = verificationObligationsBySeat[seat].flatMap(obligation =>
+        obligation.cases.map(item => `verification:${obligation.id}:${item.id}`))
+      const complete = [...new Set([...assigned, ...obligationChecks])]
+      return complete.length > 0
+        ? complete
+        : [`checker-responsibility:${checking.responsibilities[seat]}`]
+    })
+    const canonicalSeatTestOutcomes = (supplied, seat) =>
+      canonicalCheckerTestOutcomes(supplied, checkerNamedChecksBySeat[seat])
     const independentVerdicts = []
     const finalFindings = []
     const regressionOutcomeGroups = []
@@ -12681,12 +12918,14 @@ function createDefaultRouteExecutor(options) {
       const selectedId = exactIdsForAttempt.includes(retryId)
         ? retryId : exactIdsForAttempt.includes(attemptBase) ? attemptBase : null
       const selectedResult = selectedId ? options.readResult(selectedId) : null
-      if (!selectedResult || selectedResult.code !== 'PASS' ||
+      if (!selectedResult ||
+          !(selectedResult.code === 'PASS' || selectedResult.code === 'FAIL' ||
+            stableCapabilityUnavailable(selectedResult)) ||
           (selectedResult.currentVersionHash && selectedResult.currentVersionHash !== candidateHash) ||
           (selectedResult.candidateHash && selectedResult.candidateHash !== candidateHash)) {
         throw new SupervisorIntegrationError(
           'CRASH_ADOPTION_CONFLICT',
-          `completed checker ${canonicalId} lacks one exact durable PASS result for the resumed version`,
+          `completed checker ${canonicalId} lacks one exact durable result for the resumed version`,
         )
       }
       if (typeof options.resultPointer !== 'function' ||
@@ -12709,7 +12948,10 @@ function createDefaultRouteExecutor(options) {
         )
       }
       options.verifyDurableResultReceipt(selectedId, selectedResult)
-      completedCheckResults.set(canonicalId, { workItemId: selectedId, result: selectedResult })
+      completedCheckResults.set(canonicalId, {
+        workItemId: selectedId,
+        result: canonicalizeCheckerVerificationLimitation(selectedResult),
+      })
     }
     let checkerRepairAttempt = durableIndependentFrontier &&
         ['fresh', 'completed-repair', 'accepted'].includes(durableIndependentFrontier.kind)
@@ -12746,6 +12988,13 @@ function createDefaultRouteExecutor(options) {
             `durable cumulative checker receipt ${receipt.name} differs from its exact result bytes`,
           )
         }
+        const seatMatch = /^independent-check-(\d+)/u.exec(receipt.name)
+        const seatIndex = seatMatch ? Number(seatMatch[1]) - 1 : -1
+        const fingerprint = checkerImplementationFailureFingerprint(
+          result,
+          checkerNamedChecksBySeat[seatIndex] || [],
+        )
+        if (fingerprint) rejectedImplementationFingerprints.add(fingerprint)
       }
     }
     const rememberRejectedCheckerReceipt = (pointer, resultHash) => {
@@ -12758,7 +13007,7 @@ function createDefaultRouteExecutor(options) {
       return cumulativeRejectedCheckerReceipts.map(item => ({ ...item }))
     }
     const cumulativeRepairAssignment =
-      'Repair the full cumulative union of independently reproduced implementation defects referenced by fetchedEvidence.rejectedCheckerReceipts; do not assume the latest receipt is exhaustive. Generalize each fix beyond the reported examples, preserve all passing behavior, and run the complete named and pre-existing regression matrix before returning one changed independently verifiable version. Read large evidence through its authenticated pointer and use only bounded previews; never paste or dump full deliverables, logs, or transcripts.'
+      `Repair the complete current aggregate of independently reproduced implementation defects referenced by fetchedEvidence.rejectedCheckerReceipts. Generalize each fix beyond the reported examples, preserve all passing behavior, and run the complete named and pre-existing regression matrix before returning one changed independently verifiable version. Read large evidence through its authenticated pointer and use only bounded previews; never paste or dump full deliverables, logs, or transcripts.${boundedToolOutputDiscipline}`
     const pendingRepairRecovery = resumeRepairing
       ? resumeState && resumeState.retryState && resumeState.retryState.pendingImplementationRepair
       : durableIndependentFrontier && durableIndependentFrontier.kind === 'repair'
@@ -12822,6 +13071,8 @@ function createDefaultRouteExecutor(options) {
         checkerReceiptPointer,
         pending.checkerResultHash,
       )
+      const currentRejectedCheckerReceipts = rejectedCheckerReceipts.filter(receipt =>
+        receipt.name === pending.checkerId && receipt.resultHash === pending.checkerResultHash)
       if (!resumeRepairing) {
         await options.transition('IMPLEMENTATION_DEFECT', 'REPAIRING', {
           candidateHash: pending.rejectedCandidateHash,
@@ -12847,8 +13098,11 @@ function createDefaultRouteExecutor(options) {
           success: successes, checks, roadmapSlice: planPointer, manifests: executionOwnership,
           fetchedEvidence: withDescriptiveLikelyAreas({
             ...(capturedDomainWorkEvidence || {}),
+            verificationObligations: verificationObligations.map(
+              obligation => structuredClone(obligation),
+            ),
             rejectedCheckerReceipt: checkerReceiptPointer,
-            rejectedCheckerReceipts,
+            rejectedCheckerReceipts: currentRejectedCheckerReceipts,
             rejectedCandidateHash: pending.rejectedCandidateHash,
             checkerResultHash: pending.checkerResultHash,
           }),
@@ -12865,29 +13119,14 @@ function createDefaultRouteExecutor(options) {
           { repairWorkItemId: pending.repairWorkItemId, checkerResultHash: pending.checkerResultHash },
         )
       }
-      if (repairResult.allAssignedItemsPass === false) {
-        return {
-          outcome: 'FAILED', checkHashes: [],
-          terminalEnvelope: {
-            code: 'IMPLEMENTATION_REPAIR_UNSUCCESSFUL',
-            status: 'IMPLEMENTATION_REPAIR_UNSUCCESSFUL',
-            reason: 'the fresh full-set repair worker could not repair the cumulative checker defect set',
-            repairWorkItemId: pending.repairWorkItemId,
-            checkerIds: rejectedCheckerReceipts.map(item => item.name),
-            checkerResultHashes: rejectedCheckerReceipts.map(item => item.resultHash),
-          },
-        }
-      }
       const repairedCandidateHash = hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
       if (repairedCandidateHash === pending.rejectedCandidateHash) {
+        if (deferredPromotion) await deferredPromotion.abort('repair left the independently rejected version unchanged')
         return {
           outcome: 'FAILED', checkHashes: [],
-          terminalEnvelope: {
-            status: 'REPAIR_NO_PROGRESS',
-            reason: 'the resumed bounded fresh-context repair did not produce a changed exact version',
-            candidateHash: pending.rejectedCandidateHash,
-            checkerResultHash: pending.checkerResultHash,
-          },
+          // Preserve the actual independently observed task failure.  A
+          // controller-invented repair status must never mask it.
+          terminalEnvelope: checkerResult,
         }
       }
       candidateHash = repairedCandidateHash
@@ -12974,19 +13213,35 @@ function createDefaultRouteExecutor(options) {
       finalFindings.length = 0
       regressionOutcomeGroups.length = 0
       capturedDomainOutcomes.length = 0
+      const implementationFailures = []
+      const verificationLimitations = []
+      // Recurrence is meaningful only across candidate generations. Two
+      // independent seats can discover the same defect in the same frozen
+      // candidate; corroboration in one round belongs in the same repair.
+      const previouslyRejectedImplementationFingerprints = new Set(
+        rejectedImplementationFingerprints,
+      )
       if (fixturePrebuildOutcome) capturedDomainOutcomes.push(fixturePrebuildOutcome)
     try {
       for (let index = 0; index < checkerCount; index += 1) {
       const oracle = `independent-check-${index + 1}`
       const canonicalCheckerId = `independent-check-${index + 1}`
       const checkerAssignment = checking.responsibilities[index]
+      const assignedCheckerChecks = checkerNamedChecksBySeat[index]
       const assignedDomainContracts = index === 0 ? checkerDomainContracts : []
       let workItemId
       let result
       let reusedControllerResult = false
+      let recoveredDurableResult = false
+      let stableCapabilityLimitation = false
+      let acceptedCanonicalTestOutcomes = null
       if (checkerControllerAcceptedResults[index]) {
         ({ workItemId, result } = checkerControllerAcceptedResults[index])
         reusedControllerResult = true
+        acceptedCanonicalTestOutcomes = canonicalSeatTestOutcomes(
+          result && result.payload && result.payload.testOutcomes,
+          index,
+        )
       }
       while (!reusedControllerResult) {
         const checkerAttemptId = checkerRepairAttempt > 0
@@ -13000,16 +13255,23 @@ function createDefaultRouteExecutor(options) {
           completedCheckResults.delete(canonicalCheckerId)
           workItemId = completedAttempt.workItemId
           result = completedAttempt.result
+          recoveredDurableResult = true
         } else result = adoptedCheckResults && adoptedCheckResults[workItemId] || await launchChecker({
         workItemId,
         logicalRole: index === 0 ? 'independent-reviewer' : 'independent-tester',
         parent: 'run-owner', purpose: 'verification',
-        checkerRecoveryDisposition: {
+          checkerRecoveryDisposition: {
           nonAuthoritativeRetryId: retryAttempt === 0
             ? `${checkerAttemptId}-runtime-retry-1` : null,
-          failureRepairId: workerCount === 1 &&
+            failureRepairId: workerCount === 1 &&
             !doneRetryBoundary && typeof options.resultPointer === 'function'
-            ? `work-1-repair-${checkerRepairAttempt + 1}` : null,
+            ? index + 1 < checkerCount
+              ? `independent-check-${index + 2}${checkerRepairAttempt > 0 ? `-repair-${checkerRepairAttempt}` : ''}`
+              : null
+                : null,
+            stableLimitationNextReadyId: index + 1 < checkerCount
+              ? `independent-check-${index + 2}${checkerRepairAttempt > 0 ? `-repair-${checkerRepairAttempt}` : ''}`
+              : null,
         },
         nextReadyAfter: index + 1 < checkerCount
           ? [`independent-check-${index + 2}${checkerRepairAttempt > 0 ? `-repair-${checkerRepairAttempt}` : ''}`]
@@ -13028,13 +13290,15 @@ function createDefaultRouteExecutor(options) {
             ? ` Correct the prior non-authoritative report identified by ${retryReason.code}; use distinct underlying evidence when another checker conflict is named.`
             : ''}` +
           ' Return the immutable underlying evidence identifiers you actually consumed in payload.evidenceIds; acceptance-check labels are not evidence identifiers.' +
-          ' Return payload.referenceMethod with methodClass exactly equal to one of requirements-review, authoritative-suite, black-box-boundary, metamorphic-property, or independent-model; also return source, procedure, expectedOutputDerivedFromSubjectCode=false, subjectLogicReimplemented=false, and non-empty positiveInvariants, negativeInvariants, and boundaryInvariants. Execute every accessible pre-existing test and acceptance command; do not substitute only self-authored examples. Expected results must come from an independent source or property. Follow fetchedEvidence.verificationDoctrine exactly; treat PASS as an attempted falsification, not a plausibility review.' +
+          ' Return payload.referenceMethod with methodClass exactly equal to one of requirements-review, authoritative-suite, black-box-boundary, metamorphic-property, or independent-model; also return source, procedure, expectedOutputDerivedFromSubjectCode=false, subjectLogicReimplemented=false, and non-empty positiveInvariants, negativeInvariants, and boundaryInvariants. Execute every command assigned to this checker seat; do not repeat another seat\'s matrix and do not substitute only self-authored examples. Expected results must come from an independent source or property. Follow fetchedEvidence.verificationDoctrine exactly; treat PASS as an attempted falsification, not a plausibility review.' +
           ' Named checks are acceptance obligations and may be descriptive labels, not shell commands. Never report a missing executable merely because a named check is prose. Choose and execute a suitable independent procedure for each obligation; do not repeat an unavailable procedure on retry.' +
           ' When an external verification capability is unavailable, set payload.verificationLimitation to {kind:"CAPABILITY_UNAVAILABLE", capabilityId, explicitUserDeliverable, observedVersionDefectIds}; set explicitUserDeliverable=true when that capability or receipt is itself requested, and list every independently observed exact-version defect ID. Never describe an observed exact-version defect as a capability limitation.' +
-          ' Execute the complete applicable test matrix and continue falsification after the first failure. Enumerate every reproducible defect you can establish across positive, negative, boundary, interaction, and regression cases; never report only the first example.' +
+          ' Execute the complete matrix assigned to this seat and continue falsification after the first failure. Enumerate every reproducible defect you can establish within the assigned positive, negative, boundary, interaction, and regression responsibility; never report only the first example.' +
+          ' Execute every fetchedEvidence.verificationObligations case exactly as typed. Preserve conditional, activation, ordering, threshold, chained, representation, and temporal qualifiers: a must-not-hold case needs a negative witness, and an inactive or intermediate phase may not be collapsed into the active result. For parsers and filters, test alternate encodings and parser differentials. For generated binary or geometric artifacts, reopen the exact deliverable in an independent consumer and inspect its semantic contents, not merely file existence or size.' +
+          ' Build one bounded reusable verification harness or command plan before broad exploration. Redirect large output to scratch files and inspect only summaries or targeted excerpts no larger than 4 KiB. If prior rejected-check receipts are supplied, replay or extend their procedures instead of rediscovering the repository and test matrix from scratch.' +
           ' For large deliverables, logs, command output, or transcripts, return only hashes, authenticated pointers, and bounded diagnostic previews. Never paste or dump a full large deliverable, log, or transcript into the report.' +
           ' Return payload.testOutcomes with one entry for every named check: command must preserve the named check as its stable identifier, status must be PASS or FAIL, and fingerprint must be the lowercase SHA-256 digest of the independent observation.',
-        candidateHash, oracle, success: successes, checks: checkerNamedChecks,
+        candidateHash, oracle, success: successes, checks: assignedCheckerChecks,
         isolation: 'snapshot',
         writeProducing: true,
         roadmapSlice: planPointer, manifests: executionOwnership,
@@ -13046,6 +13310,9 @@ function createDefaultRouteExecutor(options) {
               verificationDoctrine: CHECKER_FALSIFICATION_DOCTRINE,
               ...(assignedDomainContracts.length > 0
                 ? { capturedDomainContracts: assignedDomainContracts } : {}),
+              verificationObligations: verificationObligationsBySeat[index].map(
+                obligation => structuredClone(obligation),
+              ),
               ...(retryReason ? { controllerReassessment: retryReason } : {}),
             },
         deferredPromotionToken: deferredPromotion && deferredPromotion.token || null,
@@ -13062,8 +13329,13 @@ function createDefaultRouteExecutor(options) {
           ? result.payload.evidenceIds.map(value => typeof value === 'string' ? value.trim() : value)
           : []
         const canonicalTestOutcomes = result && result.code === 'PASS'
-          ? canonicalCheckerTestOutcomes(result.payload && result.payload.testOutcomes, checkerNamedChecks)
+          ? canonicalSeatTestOutcomes(
+              result.payload && result.payload.testOutcomes,
+              index,
+              recoveredDurableResult,
+            )
           : null
+        acceptedCanonicalTestOutcomes = canonicalTestOutcomes
         const failedNamedTestOutcome = canonicalTestOutcomes &&
           canonicalTestOutcomes.some(item => item.status !== 'PASS')
         const invalidReferenceMethod = result && result.code === 'PASS' && requireIndependentReferenceMethod &&
@@ -13082,6 +13354,16 @@ function createDefaultRouteExecutor(options) {
             : invalidReferenceMethod ? 'REFERENCE_METHOD_INVALID' : null
         const nonAuthoritative = ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(result && result.code) ||
           controllerDefect !== null
+        const sameEnvironmentCapabilityUnavailable = result && result.code === 'CHECK_INCONCLUSIVE' &&
+          stableCapabilityUnavailable(result)
+        if (nonAuthoritative && retryAttempt === 0 && sameEnvironmentCapabilityUnavailable) {
+          // Re-running the same checker in the same sandbox cannot create a
+          // missing semantic consumer. Preserve the limitation and let every
+          // other independent seat inspect this frozen version; a different
+          // seat may still find concrete repairable defects.
+          stableCapabilityLimitation = true
+          break
+        }
         if (nonAuthoritative && retryAttempt === 0) {
           checkerRuntimeProgressHashes[index] = rawCheckerResultHash
           checkerRuntimeReasons[index] = canonicalCheckerReassessment({
@@ -13122,7 +13404,9 @@ function createDefaultRouteExecutor(options) {
         }
         if (retryAttempt > 0) {
           const repairEligible = result.code === 'FAIL' &&
-            !rejectedImplementationFingerprints.has(checkerImplementationFailureFingerprint(result)) &&
+            !previouslyRejectedImplementationFingerprints.has(
+              checkerImplementationFailureFingerprint(result, checkerNamedChecksBySeat[index]),
+            ) &&
             workerCount === 1 && !doneRetryBoundary && typeof options.resultPointer === 'function'
           await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
             candidateHash,
@@ -13134,119 +13418,50 @@ function createDefaultRouteExecutor(options) {
                 ? [`independent-check-${index + 2}` +
                   (checkerRepairAttempt > 0 ? `-repair-${checkerRepairAttempt}` : '')]
                 : []
-              : repairEligible ? [`work-1-repair-${checkerRepairAttempt + 1}`] : [],
+              : repairEligible
+                ? index + 1 < checkerCount
+                  ? [`independent-check-${index + 2}` +
+                    (checkerRepairAttempt > 0 ? `-repair-${checkerRepairAttempt}` : '')]
+                  : [`work-1-repair-${checkerRepairAttempt + 1}`]
+                : [],
           })
         }
         break
       }
+      if (stableCapabilityLimitation) {
+        verificationLimitations.push(Object.freeze({
+          checkerId: workItemId,
+          result,
+          resultHash: hashText(stableStringify(result)),
+        }))
+        continue
+      }
       if (result.code !== 'PASS') {
-        const implementationFailureFingerprint = checkerImplementationFailureFingerprint(result)
+        const implementationFailureFingerprint = checkerImplementationFailureFingerprint(
+          result,
+          checkerNamedChecksBySeat[index],
+        )
         const repeatedImplementationFailure = implementationFailureFingerprint &&
-          rejectedImplementationFingerprints.has(implementationFailureFingerprint)
+          previouslyRejectedImplementationFingerprints.has(implementationFailureFingerprint)
         const canRepairImplementation = result.code === 'FAIL' &&
           !repeatedImplementationFailure &&
           workerCount === 1 && !doneRetryBoundary && typeof options.resultPointer === 'function'
         if (canRepairImplementation) {
           rejectedImplementationFingerprints.add(implementationFailureFingerprint)
-          const rejectedCandidateHash = candidateHash
           const checkerReceiptPointer = options.resultPointer(workItemId)
           const checkerResultHash = hashText(JSON.stringify(result))
-          const rejectedCheckerReceipts = rememberRejectedCheckerReceipt(
-            checkerReceiptPointer,
-            checkerResultHash,
-          )
-          await options.transition('IMPLEMENTATION_DEFECT', 'REPAIRING', {
-            candidateHash: rejectedCandidateHash,
+          implementationFailures.push(Object.freeze({
             checkerId: workItemId,
-            checkerResultHash,
             checkerReceiptPointer,
-            rejectedCheckerReceipts,
-            repairAttempt: checkerRepairAttempt + 1,
-            repairWorkItemId: `work-1-repair-${checkerRepairAttempt + 1}`,
-            nextReadyWorkIds: [`work-1-repair-${checkerRepairAttempt + 1}`],
-          })
-          const repairWorkItemId = `work-1-repair-${checkerRepairAttempt + 1}`
-          const repairResult = await launch({
-            workItemId: repairWorkItemId,
-            logicalRole: 'worker', parent: 'run-owner', purpose: 'work',
-            executorKey: repairWorkItemId,
-            forkTurns: 'none',
-            assignment: cumulativeRepairAssignment,
-            ownership: executionOwnership.length
-              ? executionOwnership.filter(item => item && item.owner === 'worker-1').map(item => ({ ...item }))
-              : ['workspace'],
-            success: successes, checks, roadmapSlice: planPointer, manifests: executionOwnership,
-            fetchedEvidence: withDescriptiveLikelyAreas({
-              ...(capturedDomainWorkEvidence || {}),
-              rejectedCheckerReceipt: checkerReceiptPointer,
-              rejectedCheckerReceipts,
-              rejectedCandidateHash,
-              checkerResultHash,
-            }),
-            findingIds: exactFindingIds(result, result.payload, result.cause).length > 0
-              ? exactFindingIds(result, result.payload, result.cause) : ['AP-RUN-026'],
-            strategyFingerprint: checkerResultHash,
-            difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
-            risk: 'high', nextReadyAfter: [`independent-check-1-repair-${checkerRepairAttempt + 1}`],
-          })
-          if (!repairResult) {
-            throw new SupervisorIntegrationError(
-              'WORK_ITEM_RESULT_MISSING',
-              'checker repair did not return a durable work result',
-              { repairWorkItemId, checkerResultHash },
-            )
-          }
-          if (repairResult.allAssignedItemsPass === false) {
-            return {
-              outcome: 'FAILED', checkHashes: [],
-              terminalEnvelope: {
-                code: 'IMPLEMENTATION_REPAIR_UNSUCCESSFUL',
-                status: 'IMPLEMENTATION_REPAIR_UNSUCCESSFUL',
-                reason: 'the fresh full-set repair worker could not repair the cumulative checker defect set',
-                repairWorkItemId,
-                checkerIds: rejectedCheckerReceipts.map(item => item.name),
-                checkerResultHashes: rejectedCheckerReceipts.map(item => item.resultHash),
-              },
-            }
-          }
-          const repairedCandidateHash = hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
-          if (repairedCandidateHash === rejectedCandidateHash) {
-            return {
-              outcome: 'FAILED', checkHashes: [],
-              terminalEnvelope: {
-                status: 'REPAIR_NO_PROGRESS',
-                reason: 'the bounded fresh-context repair did not produce a changed exact version',
-                candidateHash: rejectedCandidateHash,
-                checkerResultHash,
-              },
-            }
-          }
-          candidateHash = repairedCandidateHash
-          usableDeliverables = changedDeliverables(options.targetPath, options.gitEnvironment())
-          acceptedWorkResults.set(repairWorkItemId, repairResult)
-          checkerRepairAttempt += 1
-          checkerRuntimeRetries = Array.from({ length: checkerCount }, () => 0)
-          checkerRuntimeProgressHashes = Array.from({ length: checkerCount }, () => null)
-          checkerRuntimeReasons = Array.from({ length: checkerCount }, () => null)
-          checkerControllerAcceptedResults = Array.from({ length: checkerCount }, () => null)
-          await options.transition('REPAIR_READY', 'CHECK_WORK', {
-            ...checkerFreezeBinding,
-            priorCandidateHash: rejectedCandidateHash,
-            candidateHash,
-            dependencyHash: hashText(stableStringify({
-              priorDependencyHash: dependencyHash,
-              repairWorkItemId,
-              checkerResultHash,
-              candidateHash,
-            })),
-            environmentHash: hashEnvironment(options.gitEnvironment()),
             checkerResultHash,
-            rejectedCheckerReceipts,
-            repairWorkItemId,
-            repairAttempt: checkerRepairAttempt,
-            nextReadyWorkIds: [`independent-check-1-repair-${checkerRepairAttempt}`],
-          })
-          continue checkerAttempts
+            result,
+            findingIds: exactFindingIds(result, result.payload, result.cause),
+          }))
+          // Complete every independent seat against this same frozen version
+          // before authorizing mutation.  Otherwise seat one can trigger a
+          // repair while seat two still has undiscovered defects, producing
+          // the one-defect-per-generation amplification seen in DIRECT runs.
+          continue
         }
         if (deferredPromotion) await deferredPromotion.abort('independent checker did not pass')
         return { outcome: 'FAILED', terminalEnvelope: result, checkHashes }
@@ -13274,17 +13489,158 @@ function createDefaultRouteExecutor(options) {
       if (result && result.payload && Array.isArray(result.payload.findings)) {
         finalFindings.push(...result.payload.findings)
       }
-      regressionOutcomeGroups.push(canonicalCheckerTestOutcomes(
-        result && result.payload && result.payload.testOutcomes,
-        checkerNamedChecks,
-      ))
+      regressionOutcomeGroups.push(acceptedCanonicalTestOutcomes)
         checkHashes.push(hashText(JSON.stringify(result)))
         checkerControllerAcceptedResults[index] = { workItemId, result }
       }
     } catch (error) {
-      if (deferredPromotion) await deferredPromotion.abort(error.code || 'checker launch failed')
+      if (deferredPromotion) await deferredPromotion.abort(error && error.code || 'checker launch failed')
       throw error
     }
+      if (implementationFailures.length > 0) {
+        const rejectedCandidateHash = candidateHash
+        let rejectedCheckerReceipts = cumulativeRejectedCheckerReceipts.map(item => ({ ...item }))
+        for (const failure of implementationFailures) {
+          rejectedCheckerReceipts = rememberRejectedCheckerReceipt(
+            failure.checkerReceiptPointer,
+            failure.checkerResultHash,
+          )
+        }
+        const currentRejectedCheckerReceipts = implementationFailures.map(failure => {
+          const receipt = rejectedCheckerReceipts.find(item =>
+            item.name === failure.checkerId && item.resultHash === failure.checkerResultHash)
+          if (!receipt) {
+            throw new SupervisorIntegrationError(
+              'REPAIR_RECOVERY_INVALID',
+              `current checker receipt is absent for ${failure.checkerId}`,
+            )
+          }
+          return receipt
+        })
+        const primaryFailure = implementationFailures[0]
+        const aggregateFailureHash = hashText(stableStringify(implementationFailures.map(failure => ({
+          checkerId: failure.checkerId,
+          checkerResultHash: failure.checkerResultHash,
+          findingIds: failure.findingIds,
+        }))))
+        const repairWorkItemId = `work-1-repair-${checkerRepairAttempt + 1}`
+        await options.transition('IMPLEMENTATION_DEFECT', 'REPAIRING', {
+          candidateHash: rejectedCandidateHash,
+          checkerId: primaryFailure.checkerId,
+          checkerResultHash: primaryFailure.checkerResultHash,
+          checkerReceiptPointer: primaryFailure.checkerReceiptPointer,
+          checkerIds: implementationFailures.map(failure => failure.checkerId),
+          checkerResultHashes: implementationFailures.map(failure => failure.checkerResultHash),
+          checkerReceiptPointers: implementationFailures.map(failure => failure.checkerReceiptPointer),
+          aggregateFailureHash,
+          rejectedCheckerReceipts,
+          repairAttempt: checkerRepairAttempt + 1,
+          repairWorkItemId,
+          nextReadyWorkIds: [repairWorkItemId],
+        })
+        const repairFindingIds = [...new Set(implementationFailures.flatMap(
+          failure => failure.findingIds,
+        ))].sort()
+        const repairResult = await launch({
+          workItemId: repairWorkItemId,
+          logicalRole: 'worker', parent: 'run-owner', purpose: 'work',
+          executorKey: repairWorkItemId,
+          forkTurns: 'none',
+          assignment: cumulativeRepairAssignment,
+          ownership: executionOwnership.length
+            ? executionOwnership.filter(item => item && item.owner === 'worker-1').map(item => ({ ...item }))
+            : ['workspace'],
+          success: successes, checks, roadmapSlice: planPointer, manifests: executionOwnership,
+          fetchedEvidence: withDescriptiveLikelyAreas({
+            ...(capturedDomainWorkEvidence || {}),
+            verificationObligations: verificationObligations.map(
+              obligation => structuredClone(obligation),
+            ),
+            rejectedCheckerReceipt: primaryFailure.checkerReceiptPointer,
+            rejectedCheckerReceipts: currentRejectedCheckerReceipts,
+            rejectedCandidateHash,
+            checkerResultHash: primaryFailure.checkerResultHash,
+            checkerResultHashes: implementationFailures.map(failure => failure.checkerResultHash),
+            aggregateFailureHash,
+          }),
+          findingIds: repairFindingIds.length > 0 ? repairFindingIds : ['AP-RUN-026'],
+          strategyFingerprint: aggregateFailureHash,
+          difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
+          risk: 'high', nextReadyAfter: [`independent-check-1-repair-${checkerRepairAttempt + 1}`],
+        })
+        if (!repairResult) {
+          throw new SupervisorIntegrationError(
+            'WORK_ITEM_RESULT_MISSING',
+            'batched checker repair did not return a durable work result',
+            { repairWorkItemId, checkerResultHashes: implementationFailures.map(item => item.checkerResultHash) },
+          )
+        }
+        const repairedCandidateHash = hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
+        if (repairedCandidateHash === rejectedCandidateHash) {
+          if (deferredPromotion) await deferredPromotion.abort('repair left the independently rejected version unchanged')
+          return {
+            outcome: 'FAILED', checkHashes: [],
+            // Return the concrete checker failure rather than a synthetic
+            // AutoPrompt failure.  Changed partial repairs are always
+            // rechecked even when their worker self-reports incomplete.
+            terminalEnvelope: primaryFailure.result,
+          }
+        }
+        candidateHash = repairedCandidateHash
+        usableDeliverables = changedDeliverables(options.targetPath, options.gitEnvironment())
+        acceptedWorkResults.set(repairWorkItemId, repairResult)
+        checkerRepairAttempt += 1
+        checkerRuntimeRetries = Array.from({ length: checkerCount }, () => 0)
+        checkerRuntimeProgressHashes = Array.from({ length: checkerCount }, () => null)
+        checkerRuntimeReasons = Array.from({ length: checkerCount }, () => null)
+        checkerControllerAcceptedResults = Array.from({ length: checkerCount }, () => null)
+        await options.transition('REPAIR_READY', 'CHECK_WORK', {
+          ...checkerFreezeBinding,
+          priorCandidateHash: rejectedCandidateHash,
+          candidateHash,
+          dependencyHash: hashText(stableStringify({
+            priorDependencyHash: dependencyHash,
+            repairWorkItemId,
+            aggregateFailureHash,
+            candidateHash,
+          })),
+          environmentHash: hashEnvironment(options.gitEnvironment()),
+          checkerResultHash: primaryFailure.checkerResultHash,
+          checkerResultHashes: implementationFailures.map(failure => failure.checkerResultHash),
+          aggregateFailureHash,
+          rejectedCheckerReceipts,
+          repairWorkItemId,
+          repairAttempt: checkerRepairAttempt,
+          nextReadyWorkIds: [`independent-check-1-repair-${checkerRepairAttempt}`],
+        })
+        continue checkerAttempts
+      }
+      if (verificationLimitations.length > 0) {
+        if (deferredPromotion) await deferredPromotion.abort(
+          'an exact semantic consumer remains unavailable after all independent seats ran',
+        )
+        const first = verificationLimitations[0]
+        await options.transition('CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK', {
+          candidateHash,
+          checkerId: first.checkerId,
+          checkerResultHash: first.resultHash,
+          retryAttempt: 0,
+          limitationCount: verificationLimitations.length,
+        })
+        return {
+          outcome: 'PARTIAL', checkHashes,
+          terminalEnvelope: {
+            ...first.result,
+            status: 'CHECK_REMAINS_INCONCLUSIVE',
+            reason: 'all independent seats ran, but the named semantic consumer is unavailable in this environment',
+            limitations: verificationLimitations.map(item => ({
+              checkerId: item.checkerId,
+              resultHash: item.resultHash,
+              verificationLimitation: item.result.payload.verificationLimitation,
+            })),
+          },
+        }
+      }
       try {
         assertDistinctEvidenceConsumption(checkerEvidenceConsumptions)
       } catch (error) {
@@ -13355,7 +13711,7 @@ function createDefaultRouteExecutor(options) {
           planHash: planPointer && planPointer.sha256 || hashText(stableStringify(decision)),
           candidateHash,
           environmentHash,
-          oracleHash: hashText(stableStringify(checks)),
+          oracleHash: hashText(stableStringify({ checks, verificationObligations })),
           assumptionsHash: hashText(stableStringify({
             risks: decision.risks || [],
             missingInformation: decision.missingInformation || [],
@@ -14274,6 +14630,18 @@ function resumePlanProjectionAccepted(route, currentPlanHash, checkpointPlanHash
     typeof validateProjection === 'function' && validateProjection(currentPlanHash) === true
 }
 
+function requiredRoadmapProjectionAuthor(scheduler, currentPlanHash, checkpointPlanHash) {
+  if (!scheduler || scheduler.route !== 'ROADMAP' || currentPlanHash === checkpointPlanHash) return null
+  const completed = new Set(scheduler.completedWorkIds || [])
+  const nextReady = new Set(scheduler.nextReadyWorkIds || [])
+  if (completed.has('roadmap-author-plan-repair') || nextReady.has('roadmap-plan-recheck')) {
+    return 'roadmap-author-plan-repair'
+  }
+  if (completed.has('roadmap-author-revise')) return 'roadmap-author-revise'
+  if (completed.has('roadmap-author')) return 'roadmap-author'
+  return null
+}
+
 function createSupervisorOptions(args = {}, context = {}) {
   const environment = context.environment || process.env
   if (Object.prototype.hasOwnProperty.call(environment, 'SENTINEL')) {
@@ -15023,7 +15391,7 @@ function createDefaultRuntimeOptions(input) {
         runtimeOptions.budgetController = budget
       } else {
         const budgetSnapshot = budget.snapshot()
-        const replayedTokens = Object.values(replayedAccounting.cumulative.tokenUsage).reduce((sum, value) => sum + value, 0)
+        const replayedTokens = billableModelTokens(replayedAccounting.cumulative.tokenUsage)
         if (budgetSnapshot.launches < replayedAccounting.cumulative.launches ||
             budgetSnapshot.sessionsStarted < replayedAccounting.cumulative.sessions ||
             budgetSnapshot.tokensUsed < replayedTokens ||
@@ -15114,11 +15482,30 @@ function createDefaultRuntimeOptions(input) {
           if (decisionBytesHash !== currentHashes.routeDecisionHash ||
               planBytesHash !== currentHashes.planHash) return false
           const decision = readRegularJson(decisionPath, 'ROADMAP repair route decision').parsed
+          const nextReady = previous.checkpoint.scheduler.nextReadyWorkIds
+          const transition = stableStringify(nextReady) === stableStringify(['roadmap-plan-check'])
+            ? {
+                authorId: 'roadmap-author-revise',
+                priorAuthors: ['roadmap-author'],
+              }
+            : stableStringify(nextReady) === stableStringify(['roadmap-plan-recheck'])
+              ? {
+                  authorId: 'roadmap-author-plan-repair',
+                  priorAuthors: ['roadmap-author', 'roadmap-author-revise'],
+                }
+              : null
+          if (!transition || !transition.priorAuthors.some(authorId =>
+            validateRoadmapProjectionReceipt(
+              decision,
+              previous.checkpoint.immutableHashes.planHash,
+              previous.checkpoint,
+              authorId,
+            ))) return false
           return validateRoadmapProjectionReceipt(
             decision,
             currentHashes.planHash,
             previous.checkpoint,
-            'roadmap-author-plan-repair',
+            transition.authorId,
           )
         },
         clock: context.clock,
@@ -15126,6 +15513,55 @@ function createDefaultRuntimeOptions(input) {
       runtimeOptions.recoveryCheckpointAuthority = recoveryCheckpointAuthorityRef
       runtimeOptions.persistRecoveryCheckpoint = persistRecoveryCheckpoint
       runtimeOptions.preparePausedRelease = () => stateStore.preparePausedRelease()
+      const authenticateCrashResumeProjection = (checkpoint, decoded) => {
+        const savedScheduler = ['scheduler-crash-checkpoint', 'scheduler-drained-checkpoint'].includes(decoded.kind)
+          ? decoded.schedulerState : decoded
+        const recommendationPath = record.resolve('route/recommendation.json')
+        const decisionPath = record.resolve('route/decision.json')
+        const recommendation = fs.existsSync(recommendationPath)
+          ? readRegularJson(recommendationPath, 'saved route recommendation').parsed : null
+        const decision = fs.existsSync(decisionPath)
+          ? readRegularJson(decisionPath, 'saved route decision').parsed : null
+        if (savedScheduler.route === 'PENDING' &&
+            ['SAVE_ROUTE_ANALYSIS', 'L0_ROUTE_DECISION'].includes(checkpoint.recovery.savedState) && !recommendation) {
+          throw new SupervisorIntegrationError(
+            'RESUME_STATE_INVALID',
+            `${checkpoint.recovery.savedState} resume lacks the exact saved recommendation`,
+          )
+        }
+        let planHash = checkpoint.immutableHashes.planHash
+        if (savedScheduler.route !== 'PENDING') {
+          const validation = validateRouteDecision(decision)
+          const decisionHash = decision && sha256Bytes(fs.readFileSync(decisionPath))
+          if (!validation.valid || decisionHash !== checkpoint.immutableHashes.routeDecisionHash) {
+            throw new SupervisorIntegrationError(
+              'RESUME_STATE_INVALID',
+              'saved route decision is invalid or differs from the recovery checkpoint',
+              { errors: validation.errors },
+            )
+          }
+          planHash = persistedPlanHash(savedScheduler.route)
+          const requiredProjectionAuthor = requiredRoadmapProjectionAuthor(
+            savedScheduler,
+            planHash,
+            checkpoint.immutableHashes.planHash,
+          )
+          if (!resumePlanProjectionAccepted(
+            savedScheduler.route,
+            planHash,
+            checkpoint.immutableHashes.planHash,
+            currentPlanHash => requiredProjectionAuthor !== null && validateRoadmapProjectionReceipt(
+              decision,
+              currentPlanHash,
+              checkpoint,
+              requiredProjectionAuthor,
+            ),
+          )) {
+            throw new SupervisorIntegrationError('RESUME_STATE_INVALID', 'saved plan differs from the recovery checkpoint')
+          }
+        }
+        return Object.freeze({ savedScheduler, recommendation, decision, planHash })
+      }
       if (generation > 1 && !runtimeOptions.releaseReconciliation) {
         const predecessorState = stateStore.load()
         if (['DONE', 'PARTIAL', 'BLOCKED', 'CANCELLED', 'FAILED'].includes(predecessorState.state)) {
@@ -15138,6 +15574,11 @@ function createDefaultRuntimeOptions(input) {
         const priorEvidence = predecessorState.state === 'PAUSED'
           ? recoveryCheckpointAuthorityRef.resumePausedCheckpoint()
           : recoveryCheckpointAuthorityRef.resumeCheckpoint()
+        const decodedScheduler = decodeSchedulerCheckpoint(priorEvidence.record.checkpoint.scheduler)
+        const authenticatedProjection = authenticateCrashResumeProjection(
+          priorEvidence.record.checkpoint,
+          decodedScheduler,
+        )
         const adopted = predecessorState.state === 'PAUSED'
           ? stateStore.resumePausedGeneration({
               capability: lease,
@@ -15174,7 +15615,8 @@ function createDefaultRuntimeOptions(input) {
         pendingCrashResume = {
           adoptedRecoveryContext: adopted.frontier,
           checkpointEvidence: priorEvidence,
-          decodedScheduler: decodeSchedulerCheckpoint(priorEvidence.record.checkpoint.scheduler),
+          decodedScheduler,
+          authenticatedProjection,
           transitionAhead: predecessorState.sequence ===
             priorEvidence.record.checkpoint.stateEvent.sequence + 1,
           cleanPause: predecessorState.state === 'PAUSED',
@@ -15350,6 +15792,18 @@ function createDefaultRuntimeOptions(input) {
         checkerScratchVerifier: runtimeOptions.checkerScratchFactory.verify,
       })
       if (pendingCrashResume) {
+        const checkpoint = pendingCrashResume.checkpointEvidence.record.checkpoint
+        const decoded = pendingCrashResume.decodedScheduler
+        const restoredFrontier = pendingCrashResume.adoptedRecoveryContext.frontier
+        const {
+          savedScheduler,
+          recommendation,
+          decision,
+          planHash: restoredPlanHash,
+        } = pendingCrashResume.authenticatedProjection
+        // Authenticate every immutable input and the frontier-specific plan
+        // author before either resume transition mutates durable state. A
+        // rejected projection therefore leaves this generation retryable.
         stateStore.acceptResumeCapabilities({
           capability: lease,
           cause: 'Accept the freshly probed compound activation and runtime capability receipts.',
@@ -15358,45 +15812,7 @@ function createDefaultRuntimeOptions(input) {
           capability: lease,
           cause: 'Restore the exact saved runtime state and scheduler next ready work without relaunching completed work.',
         })
-        const checkpoint = pendingCrashResume.checkpointEvidence.record.checkpoint
-        const decoded = pendingCrashResume.decodedScheduler
-        const restoredFrontier = pendingCrashResume.adoptedRecoveryContext.frontier
         const restoredCandidateHash = restored.candidateHash || null
-        const savedScheduler = ['scheduler-crash-checkpoint', 'scheduler-drained-checkpoint'].includes(decoded.kind)
-          ? decoded.schedulerState : decoded
-        const recommendationPath = record.resolve('route/recommendation.json')
-        const decisionPath = record.resolve('route/decision.json')
-        const recommendation = fs.existsSync(recommendationPath)
-          ? readRegularJson(recommendationPath, 'saved route recommendation').parsed : null
-        const decision = fs.existsSync(decisionPath)
-          ? readRegularJson(decisionPath, 'saved route decision').parsed : null
-        if (savedScheduler.route === 'PENDING' &&
-            ['SAVE_ROUTE_ANALYSIS', 'L0_ROUTE_DECISION'].includes(restored.state) && !recommendation) {
-          throw new SupervisorIntegrationError(
-            'RESUME_STATE_INVALID',
-            `${restored.state} resume lacks the exact saved recommendation`,
-          )
-        }
-        if (savedScheduler.route !== 'PENDING') {
-          const validation = validateRouteDecision(decision)
-          const decisionHash = decision && sha256Bytes(fs.readFileSync(decisionPath))
-          if (!validation.valid || decisionHash !== checkpoint.immutableHashes.routeDecisionHash) {
-            throw new SupervisorIntegrationError(
-              'RESUME_STATE_INVALID',
-              'saved route decision is invalid or differs from the recovery checkpoint',
-              { errors: validation.errors },
-            )
-          }
-          const planHash = persistedPlanHash(savedScheduler.route)
-          if (!resumePlanProjectionAccepted(
-            savedScheduler.route,
-            planHash,
-            checkpoint.immutableHashes.planHash,
-            currentPlanHash => validateRoadmapProjectionReceipt(decision, currentPlanHash),
-          )) {
-            throw new SupervisorIntegrationError('RESUME_STATE_INVALID', 'saved plan differs from the recovery checkpoint')
-          }
-        }
         const hasOpenAnalyst = decoded.kind === 'scheduler-crash-checkpoint' &&
           decoded.liveRecords.some(saved => saved.logicalRole === 'route-analyst')
         const resumeStage = hasOpenAnalyst
@@ -15430,7 +15846,7 @@ function createDefaultRuntimeOptions(input) {
             .map(item => item.leaseId),
           recoveryContext: pendingCrashResume.adoptedRecoveryContext,
           candidateHash: restoredCandidateHash,
-          planHash: checkpoint.immutableHashes.planHash,
+          planHash: restoredPlanHash,
           completedWorkIds: checkpoint.scheduler.completedWorkIds,
           completedCheckIds: checkpoint.scheduler.completedCheckIds,
           acceptedResultIds: restoredFrontier.acceptedResultIds,
@@ -15508,8 +15924,31 @@ function createDefaultRuntimeOptions(input) {
       onUsageDelta,
       onTerminalResult,
     }) => {
+      const recommendation = analysis && analysis.recommendation || analysis
+      if (recommendation && recommendation.preWorkResult === 'CONTINUE') {
+        try {
+          return {
+            decision: compileAutomaticRouteDecision({
+              recommendation,
+              requestedResult: activation.entryPrompt,
+              requestEnvelopeHash: requestPointer.hash,
+              providerCapabilities: runtimeOptions.providerCapabilities,
+              budget: runtimeOptions.budgetController.status({ forWork: true }),
+              nowMs: Date.now(),
+            }),
+            submittedAtMs: Date.now(),
+            usage: { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 },
+            usageStreamed: false,
+          }
+        } catch (error) {
+          if (!error || error.code !== 'ROUTE_DECISION_INVALID') throw error
+          // A malformed or self-contradictory analyst proposal must not stop
+          // the task.  Use the costly root model only as an exceptional
+          // correction path; ordinary automatic routing stays controller-only.
+        }
+      }
       if (!codexAdapter || !capabilityBinding || !recordRef) {
-        throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'root L0 transport is not initialized')
+        throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'root L0 recovery transport is not initialized')
       }
       const reservationId = crypto.randomUUID()
       const launchBaseEnvironment = prepareProcessLaunchEnvironment(processAdapter, reservationId, environment)
@@ -15527,9 +15966,9 @@ function createDefaultRuntimeOptions(input) {
         purpose: 'planning',
         assignment: correctionAttempts > 0
           ? 'Correct the invalid L0 route decision once, using the validator findings and the saved analyst evidence.'
-          : 'Make the authoritative L0 DIRECT, LIGHT, or ROADMAP decision from the exact request and saved analyst evidence.',
+          : 'Recover the authoritative L0 DIRECT, LIGHT, or ROADMAP decision because the analyst result was unavailable or internally inconsistent.',
         successChecklist: ['Return the complete canonical route-decision v2 schema within four minutes.'],
-        checks: ['Compare the decision to the saved recommendation and canonical route facts.'],
+        checks: ['Compare the decision to the exact request, durable analyst evidence, and canonical route facts.'],
         requestPointer,
         evidencePointers: analysis && analysis.evidencePointers || [],
         providerCapabilities: runtimeOptions.providerCapabilities,
@@ -15538,7 +15977,7 @@ function createDefaultRuntimeOptions(input) {
       })
       const audit = auditDispatch(dispatch)
       if (!audit.conformant || dispatch.fork_turns !== 'none') {
-        throw new SupervisorIntegrationError('CONTEXT_POLICY_DENIED', 'root L0 dispatch violates the context policy', audit)
+        throw new SupervisorIntegrationError('CONTEXT_POLICY_DENIED', 'root L0 recovery dispatch violates the context policy', audit)
       }
       const sessionId = `${activation.runId}:root-route-decision:${reservationId}`
       if (typeof onLaunchPrepared === 'function') {
@@ -16015,10 +16454,6 @@ function createDefaultRuntimeOptions(input) {
       const relative = route === 'ROADMAP' ? 'plan/ROADMAP.md'
         : route === 'LIGHT' ? 'plan/light-plan.md' : 'plan/success-card.md'
       const plan = renderPlanArtifact(route, decision, authorResult)
-      if (route === 'ROADMAP' && authorResult) {
-        writeRoadmapProjectionReceipt(decision, authorResult, plan, authorWorkItemId)
-      }
-      recordRef.write(relative, plan)
       const runtime = runtimeOptions.runtimeInstance
       if (route === 'ROADMAP' && authorResult && runtime && runtime.scheduler) {
         const roadmap = roadmapAuthorArtifact(authorResult, authorResult.scoutCorrections || [])
@@ -16058,6 +16493,32 @@ function createDefaultRuntimeOptions(input) {
           missionScopeHash,
           planSha256,
           expansionAdmission,
+        })
+        if (['roadmap-author-revise', 'roadmap-author-plan-repair'].includes(authorWorkItemId)) {
+          const checkerId = authorWorkItemId === 'roadmap-author-revise'
+            ? 'roadmap-plan-check' : 'roadmap-plan-recheck'
+          runtime._persistRecoveryCheckpoint({
+            kind: 'ROADMAP_RATIO_RECORDED',
+            causeId: `roadmap-ratio:${activation.generation}:${authorWorkItemId}:${planSha256}`,
+            humanDescription: 'Persist ROADMAP expansion accounting before changing the authenticated plan projection.',
+          }, { candidateHash: null, nextReadyWorkIds: [checkerId] })
+        }
+      }
+      if (route === 'ROADMAP' && authorResult) {
+        writeRoadmapProjectionReceipt(decision, authorResult, plan, authorWorkItemId)
+      }
+      recordRef.write(relative, plan)
+      if (route === 'ROADMAP' && authorResult && runtime && runtime.scheduler &&
+          ['roadmap-author-revise', 'roadmap-author-plan-repair'].includes(authorWorkItemId)) {
+        const checkerId = authorWorkItemId === 'roadmap-author-revise'
+          ? 'roadmap-plan-check' : 'roadmap-plan-recheck'
+        runtime._persistRecoveryCheckpoint({
+          kind: 'PLAN_PROJECTION_COMMITTED',
+          causeId: `plan-projection:${activation.generation}:${authorWorkItemId}:${hashText(plan)}`,
+          humanDescription: 'Persist the authenticated ROADMAP projection before admitting its checker.',
+        }, {
+          candidateHash: null,
+          nextReadyWorkIds: [checkerId],
         })
       }
     },
@@ -16214,6 +16675,7 @@ module.exports = {
   applyBenchmarkEffortPin,
   benchmarkFirstProductSignalDeadlineEnabled,
   benchmarkPhaseTimeoutMs,
+  billableModelTokens,
   productionRoadmapExpansionAuthority,
   resolvePreMutationRouteDecisionHash,
   runtimeCapabilityExpiryMs,
@@ -16335,5 +16797,6 @@ module.exports = {
   roadmapAuthorArtifact,
   resolveTerminalReceiptCandidateHash,
   resumePlanProjectionAccepted,
+  requiredRoadmapProjectionAuthor,
   immutableSemanticUserAskCount,
 }

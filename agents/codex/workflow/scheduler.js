@@ -694,7 +694,7 @@ function normalizeCrashFrontier(value) {
     const entries = value[field]
     if (!Array.isArray(entries) || new Set(entries).size !== entries.length ||
         entries.some((entry) => !nonEmpty(entry))) {
-      throw new SchedulerAdmissionError('CRASH_BINDING_INVALID', `live launch recovery frontier ${field} is invalid`)
+      throw new SchedulerAdmissionError('CRASH_BINDING_INVALID', `live launch recovery next ready work ${field} is invalid`)
     }
     result[field] = entries.map((entry) => entry.trim())
   }
@@ -1231,7 +1231,9 @@ class CentralScheduler {
     const routeValues = {
       noncachedInput: projected.noncachedInput,
       cachedInput: projected.cachedInput,
-      output: projected.output + projected.reasoning,
+      // Provider output already includes reasoning tokens. Keep reasoning as
+      // diagnostic provenance; never bill or cap it a second time.
+      output: projected.output,
     }
     const hardCeilings = []
     const reserveStops = []
@@ -1925,7 +1927,7 @@ class CentralScheduler {
       const immutableNext = { ...normalized, continuationId: null, bindingHash: null }
       if (stableStringify(immutablePrior) !== stableStringify(immutableNext) ||
           (prior.continuationId && prior.continuationId !== normalized.continuationId)) {
-        throw this._error('CRASH_BINDING_CONFLICT', 'live launch recovery binding cannot change identity or frontier')
+        throw this._error('CRASH_BINDING_CONFLICT', 'live launch recovery binding cannot change identity or next ready work')
       }
       if (!prior.continuationId && normalized.continuationId) record.crashBinding = Object.freeze(normalized)
       return record.crashBinding
@@ -1954,7 +1956,7 @@ class CentralScheduler {
       const immutableNext = { ...normalized, continuationId: null, bindingHash: null }
       if (stableStringify(immutablePrior) !== stableStringify(immutableNext) ||
           (prior.continuationId && prior.continuationId !== normalized.continuationId)) {
-        throw this._error('CRASH_BINDING_CONFLICT', 'root recovery binding cannot change identity or frontier')
+        throw this._error('CRASH_BINDING_CONFLICT', 'root recovery binding cannot change identity or next ready work')
       }
       if (!prior.continuationId && normalized.continuationId) record.crashBinding = Object.freeze(normalized)
       return record.crashBinding
@@ -2021,7 +2023,7 @@ class CentralScheduler {
         stableStringify(frontier.acceptedResultIds) !== stableStringify(expectedAcceptedResultIds)) {
       throw this._error(
         'CRASH_BINDING_ROTATION_INVALID',
-        'root correction rotation must preserve the logical frontier and add exactly the committed prior result receipt',
+        'root correction rotation must preserve the logical next ready work and add exactly the committed prior result receipt',
       )
     }
     const normalized = {
@@ -2059,7 +2061,7 @@ class CentralScheduler {
       frontier: normalizeCrashFrontier(binding.frontier || prior.frontier),
     }
     if (stableStringify(normalized.frontier) !== stableStringify(prior.frontier)) {
-      throw this._error('CRASH_ADOPTION_CONFLICT', 'replacement process cannot change the adopted recovery frontier')
+      throw this._error('CRASH_ADOPTION_CONFLICT', 'replacement process cannot change the adopted recovery next ready work')
     }
     normalized.bindingHash = sha256(Buffer.from(stableStringify(normalized), 'utf8'))
     record.crashBinding = Object.freeze(normalized)
@@ -2078,7 +2080,7 @@ class CentralScheduler {
       .sort((left, right) => left.id.localeCompare(right.id))
       .map((record) => {
         if (!record.crashBinding) {
-          throw this._error('CRASH_BINDING_REQUIRED', `live lease ${record.id} lacks its reservation/session/frontier binding`)
+          throw this._error('CRASH_BINDING_REQUIRED', `live lease ${record.id} lacks its reservation/session/next-ready-work binding`)
         }
         return {
           id: record.id,
@@ -2154,7 +2156,7 @@ class CentralScheduler {
     if (!recovery || !recovery.priorOwner || recovery.priorOwner.processesDrained !== true ||
         !nonEmpty(recovery.priorOwner.ownerId) || !Array.isArray(recovery.frontier && recovery.frontier.acceptedResultIds) ||
         !recovery.frontier.acceptedResultIds.includes(checkpoint.stateHash)) {
-      throw this._error('CRASH_OWNER_UNVERIFIED', 'scheduler adoption requires canonical stale-owner drain evidence and frontier binding')
+      throw this._error('CRASH_OWNER_UNVERIFIED', 'scheduler adoption requires canonical stale-owner drain evidence and next-ready-work binding')
     }
     if (options.ownerSessionId !== undefined && checkpoint.ownerSessionId !== options.ownerSessionId) {
       throw this._error('CRASH_OWNER_MISMATCH', 'scheduler checkpoint owner session differs from the adopted physical owner')
@@ -2210,11 +2212,11 @@ class CentralScheduler {
       const inspectedCandidateHash = saved.inspectedCandidateHash === null || saved.inspectedCandidateHash === undefined
         ? null : requireDigest(saved.inspectedCandidateHash, 'inspectedCandidateHash')
       if (saved.logicalRole && /checker|reviewer|tester/u.test(saved.logicalRole) && inspectedCandidateHash === null) {
-        throw this._error('CRASH_CHECKPOINT_INVALID', 'saved checker lease lacks its admitted inspected candidate hash')
+        throw this._error('CRASH_CHECKPOINT_INVALID', 'saved checker lease lacks its admitted exact-version hash')
       }
       if (!Object.hasOwn(crashBinding, 'inspectedCandidateHash') ||
           crashBinding.inspectedCandidateHash !== inspectedCandidateHash) {
-        throw this._error('CRASH_CHECKPOINT_INVALID', 'saved live lease candidate differs from its immutable continuation binding')
+        throw this._error('CRASH_CHECKPOINT_INVALID', 'saved live lease exact version differs from its immutable continuation binding')
       }
       const record = {
         id: saved.id,
@@ -2505,7 +2507,7 @@ class CentralScheduler {
     }
     if (prior > 0) {
       if (!request.progressFingerprint) {
-        throw this._error('RETRY_PROGRESS_EVIDENCE_REQUIRED', 'retry admission requires a candidate/evidence/strategy fingerprint', {
+        throw this._error('RETRY_PROGRESS_EVIDENCE_REQUIRED', 'retry admission requires an exact-version/evidence/strategy fingerprint', {
           equivalenceKey: request.equivalenceKey, priorAttempts: prior,
         })
       }
@@ -2595,12 +2597,12 @@ class CentralScheduler {
     const routeValues = {
       noncachedInput: projected.noncachedInput,
       cachedInput: projected.cachedInput,
-      output: projected.output + projected.reasoning,
+      output: projected.output,
     }
     const laneValues = {
       noncachedInput: laneProjected.noncachedInput,
       cachedInput: laneProjected.cachedInput,
-      output: laneProjected.output + laneProjected.reasoning,
+      output: laneProjected.output,
     }
     const hardCeilings = []
     const at = []
@@ -2813,7 +2815,7 @@ class CentralScheduler {
     for (const dimension of TOKEN_DIMENSIONS) {
       const limit = this.budget.tokens[dimension]
       const totalProjected = dimension === 'output'
-        ? combined.output + combined.reasoning
+        ? combined.output
         : combined[dimension]
       if (totalProjected > limit) {
         throw this._error('TOKEN_BUDGET', `${dimension} token ceiling would be exceeded`, {
@@ -2827,12 +2829,12 @@ class CentralScheduler {
       } else if (request.budgetClass === 'planning') {
         fraction = 1 - VERIFICATION_RESERVE - RECOVERY_RESERVE
         projected = dimension === 'output'
-          ? nonVerification.output + nonVerification.reasoning
+          ? nonVerification.output
           : nonVerification[dimension]
       } else if (request.budgetClass === 'work') {
         fraction = 1 - VERIFICATION_RESERVE - RECOVERY_RESERVE
         projected = dimension === 'output'
-          ? nonVerification.output + nonVerification.reasoning
+          ? nonVerification.output
           : nonVerification[dimension]
       } else if (request.budgetClass === 'verification') fraction = 1 - RECOVERY_RESERVE
       if (projected > limit * fraction) {
@@ -2852,7 +2854,7 @@ class CentralScheduler {
     addUsage(laneProjected, request.estimate)
     for (const dimension of TOKEN_DIMENSIONS) {
       const projected = dimension === 'output'
-        ? laneProjected.output + laneProjected.reasoning
+        ? laneProjected.output
         : laneProjected[dimension]
       if (projected > laneLimit.tokens[dimension]) {
         throw this._error('LANE_TOKEN_BUDGET', `work item stream ${dimension} ceiling would be exceeded`, {
@@ -2888,7 +2890,7 @@ class CentralScheduler {
     for (const usage of Object.values(this._usage)) addUsage(combined, usage)
     return combined.noncachedInput > this.budget.tokens.noncachedInput ||
       combined.cachedInput > this.budget.tokens.cachedInput ||
-      combined.output + combined.reasoning > this.budget.tokens.output ||
+      combined.output > this.budget.tokens.output ||
       (this._totalWorkMs !== null && combined.workMs > this._totalWorkMs)
   }
 
@@ -2899,7 +2901,7 @@ class CentralScheduler {
     if (this._metrics.maxDepthObserved > settings.budget.maxDepth) failures.push('depth')
     if (usage.noncachedInput > settings.budget.tokens.noncachedInput) failures.push('noncachedInput')
     if (usage.cachedInput > settings.budget.tokens.cachedInput) failures.push('cachedInput')
-    if (usage.output + usage.reasoning > settings.budget.tokens.output) failures.push('output')
+    if (usage.output > settings.budget.tokens.output) failures.push('output')
     if (this._totalWorkMs !== null && usage.workMs > this._totalWorkMs) failures.push('workMs')
     for (const [lane, counter] of Object.entries(this._laneCounters)) {
       const limit = settings.lanes[lane]
@@ -2907,7 +2909,7 @@ class CentralScheduler {
       if (counter.launches > limit.maxLaunches) failures.push(`lane:${lane}:launches`)
       if (counter.usage.noncachedInput > limit.tokens.noncachedInput) failures.push(`lane:${lane}:noncachedInput`)
       if (counter.usage.cachedInput > limit.tokens.cachedInput) failures.push(`lane:${lane}:cachedInput`)
-      if (counter.usage.output + counter.usage.reasoning > limit.tokens.output) failures.push(`lane:${lane}:output`)
+      if (counter.usage.output > limit.tokens.output) failures.push(`lane:${lane}:output`)
     }
     if (failures.length > 0) {
       throw this._error('ROUTE_FREEZE_BUDGET_EXCEEDED', 'pre-route usage cannot fit the resolved route settings', { failures })

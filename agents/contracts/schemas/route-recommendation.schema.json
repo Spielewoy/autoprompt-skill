@@ -19,7 +19,9 @@
     "reasonsForLight",
     "reasonsForRoadmap",
     "userInputNeeded",
-    "evidenceIndex"
+    "evidenceIndex",
+    "routeFactProposal",
+    "verificationObligations"
   ],
   "properties": {
     "schemaVersion": {
@@ -119,6 +121,61 @@
         },
         "additionalProperties": false
       }
+    },
+    "routeFactProposal": {
+      "type": "object",
+      "required": [
+        "requestedEffect", "dependencyShape", "dependentWorkGroupCount",
+        "integrationOwnerRequired", "uncertainty", "reversibility",
+        "mutableResources", "sideEffects", "externality", "confidentiality",
+        "thirdPartyImpact", "riskLevel", "minimumCheckerCount",
+        "namedDistinctResponsibilities", "checkQuality", "availableCheckKinds",
+        "baselineStatus", "hiddenExternalCheck", "architectureImpact",
+        "fitsLightPlan", "approachNeedsShortPlanning", "shortOrderUnclear"
+      ],
+      "properties": {
+        "requestedEffect": { "enum": ["inspect", "report", "research", "decide", "mutate", "external-operation"] },
+        "dependencyShape": { "enum": ["bounded", "connected", "independent-edits", "dependent-groups"] },
+        "dependentWorkGroupCount": { "type": "integer", "minimum": 0 },
+        "integrationOwnerRequired": { "type": "boolean" },
+        "uncertainty": { "enum": ["none", "reversible-technical", "product-semantic", "architecture"] },
+        "reversibility": { "enum": ["fully-reversible", "locally-reversible", "staged-rollback-required", "irreversible"] },
+        "mutableResources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind", "identity", "shared", "ownershipMode"],
+            "properties": {
+              "kind": { "type": "string", "minLength": 1 },
+              "identity": { "type": "string", "minLength": 1 },
+              "shared": { "type": "boolean" },
+              "ownershipMode": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        },
+        "sideEffects": { "$ref": "#/$defs/strings" },
+        "externality": { "enum": ["local-only", "external-read", "external-write"] },
+        "confidentiality": { "enum": ["public", "internal", "confidential", "restricted"] },
+        "thirdPartyImpact": { "enum": ["none", "minor", "material"] },
+        "riskLevel": { "enum": ["ordinary", "elevated", "staged-high-impact"] },
+        "minimumCheckerCount": { "enum": [1, 2] },
+        "namedDistinctResponsibilities": { "$ref": "#/$defs/strings" },
+        "checkQuality": { "enum": ["authoritative", "short-plan", "coordinated-design", "unavailable"] },
+        "availableCheckKinds": { "$ref": "#/$defs/nonEmptyStrings" },
+        "baselineStatus": { "enum": ["recorded", "not-applicable", "unknown"] },
+        "hiddenExternalCheck": { "type": "boolean" },
+        "architectureImpact": { "enum": ["local", "single-system", "multi-system"] },
+        "fitsLightPlan": { "type": "boolean" },
+        "approachNeedsShortPlanning": { "type": "boolean" },
+        "shortOrderUnclear": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "verificationObligations": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/verificationObligation" }
     }
   },
   "additionalProperties": false,
@@ -158,6 +215,32 @@
     }
   ],
   "$defs": {
+    "verificationObligation": {
+      "type": "object",
+      "required": ["id", "kind", "statement", "cases"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["invariant", "activation", "ordered-activation"] },
+        "statement": { "type": "string", "minLength": 1 },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "phase", "polarity", "precondition", "expectedObservation"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "phase": { "enum": ["ordinary", "inactive", "boundary", "intermediate", "active"] },
+              "polarity": { "enum": ["must-hold", "must-not-hold"] },
+              "precondition": { "type": "string", "minLength": 1 },
+              "expectedObservation": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "strings": {
       "type": "array",
       "items": {

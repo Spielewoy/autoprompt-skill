@@ -13,7 +13,7 @@ const WORKFLOW = path.join(ROOT, 'agents', 'codex', 'workflow')
 const { CentralScheduler } = require(path.join(WORKFLOW, 'scheduler.js'))
 const requestEnvelope = require(path.join(WORKFLOW, 'request-envelope.js'))
 const {
-  CodexSupervisorRuntime, RolePolicy, createCodexJsonlAccumulator, roadmapAuthorArtifact,
+  CodexSupervisorRuntime, RolePolicy, billableModelTokens, createCodexJsonlAccumulator, roadmapAuthorArtifact,
   runCodexSupervisorEntryAdapter, runCodexTopLevelEntryAdapter, selectWorkRecipe,
 } = require(path.join(WORKFLOW, 'phase-budget.js'))
 
@@ -22,6 +22,12 @@ const ZERO = Object.freeze({ noncachedInput: 0, cachedInput: 0, output: 0, reaso
 const CAPABILITIES = Object.freeze({
   eventStreaming: true, toolOutputCapture: true, stableChildIdentity: true,
   sameContextContinuation: true, isolatedChecking: true, cancellation: true,
+})
+
+test('token accounting does not add reasoning twice to billed model usage', () => {
+  assert.equal(billableModelTokens({
+    noncachedInput: 11, cachedInput: 13, output: 17, reasoning: 7,
+  }), 41)
 })
 
 function authority(scheduler, id) {
@@ -95,43 +101,22 @@ test('LAYER-008 accepts each distinct scout correction exactly once', () => {
   ), error => error.code === 'SCOUT_CORRECTION_NOT_MERGED')
 })
 
-test('TRACE-013 mandatory representative role/policy probe runs before fleet admission and denial is bounded', async () => {
-  const make = verified => {
-    const runtime = Object.create(CodexSupervisorRuntime.prototype)
-    Object.assign(runtime, {
-      representativePolicyProbe: null,
-      rolePolicy: new RolePolicy(),
-      route: 'DIRECT',
-      activation: { id: 'activation-r8', generation: 1 },
-      rootCallers: { runOwner: { logicalRole: 'run-owner', physicalRole: 'autoprompt.v2.run-owner', sessionId: 'root', runId: 'runtime-residual-r8', generation: 1 } },
-      providerCapabilities: CAPABILITIES,
-      diagnosticWorkerLaunches: 0,
-      options: { runId: 'runtime-residual-r8', capabilityVerifier: async () => ({ verified }) },
-    })
-    runtime.launchChild = async request => {
-      runtime.diagnosticWorkerLaunches += 1
-      assert.equal(request.logicalRole, 'diagnostic-probe')
-      assert.equal(request.purpose, 'diagnostic')
-      return verified
-        ? {
-            allAssignedItemsPass: true,
-            successItems: [{ id: 'policy-inspection', status: 'pass', evidenceIds: ['evidence-1'] }],
-            commands: [{ command: 'inspect representative policy', exitCode: 0 }],
-          }
-        : {
-            allAssignedItemsPass: false,
-            successItems: [{ id: 'policy-inspection', status: 'blocked', evidenceIds: [] }],
-            commands: [],
-          }
-    }
-    return runtime
-  }
-  const accepted = make(true)
-  assert.equal((await accepted._runRepresentativePolicyProbe()).verified, true)
-  assert.equal(accepted.diagnosticWorkerLaunches, 1)
-  const denied = make(false)
-  await assert.rejects(denied._runRepresentativePolicyProbe(), error =>
-    error.code === 'DIAGNOSTIC_DENIAL_BLOCKED' && error.details.workerCount === 1)
+test('TRACE-013 representative role/policy admission is controller-validated without a model launch', async () => {
+  const runtime = Object.create(CodexSupervisorRuntime.prototype)
+  Object.assign(runtime, {
+    representativePolicyProbe: null,
+    rolePolicy: new RolePolicy(),
+    route: 'DIRECT',
+    activation: { id: 'activation-r8', generation: 1 },
+    requestPointer: { hash: H('request-envelope') },
+    rootCallers: { runOwner: { logicalRole: 'run-owner', physicalRole: 'autoprompt.v2.run-owner', sessionId: 'root', runId: 'runtime-residual-r8', generation: 1 } },
+    providerCapabilities: CAPABILITIES,
+    diagnosticWorkerLaunches: 0,
+    options: { runId: 'runtime-residual-r8' },
+  })
+  runtime.launchChild = async () => { throw new Error('controller policy validation must not launch a model') }
+  assert.equal((await runtime._runRepresentativePolicyProbe()).verified, true)
+  assert.equal(runtime.diagnosticWorkerLaunches, 1)
 })
 
 test('RUN-037 resume reopens the exact durable representative probe instead of relaunching it', async () => {
@@ -173,7 +158,7 @@ test('RUN-037 resume reopens the exact durable representative probe instead of r
   }
   const first = await fresh._runRepresentativePolicyProbe()
   assert.equal(first.verified, true)
-  assert.equal(launches, 1)
+  assert.equal(launches, 0)
 
   const resultPath = `work/results/${H(workItemId)}.json`
   assert.equal(stored.get(resultPath).generation, 1)

@@ -605,7 +605,7 @@ test('write-producing L4 checks isolate or serialize every realistic resource co
   assert.equal(fs.existsSync(registered), false)
 })
 
-test('fake stream accounts reasoning as output and stops optional work at lane hard ceiling', async () => {
+test('fake stream records reasoning diagnostically without double-counting the output ceiling', async () => {
   const settings = resolveSchedulerSettings({
     route: 'DIRECT',
     lanes: {
@@ -634,16 +634,16 @@ test('fake stream accounts reasoning as output and stops optional work at lane h
   }, { productive: true })
   assert.equal(first.continue, true)
   assert.equal(scheduler.getMetrics().progress.idleMs, 0)
-  assert.equal(lease.authorizeUsage({ noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 30 }).allowed, false)
-  const stopped = lease.reportUsage({ noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 30 })
+  assert.equal(lease.authorizeUsage({ noncachedInput: 0, cachedInput: 0, output: 70, reasoning: 30 }).allowed, false)
+  const stopped = lease.reportUsage({ noncachedInput: 0, cachedInput: 0, output: 70, reasoning: 30 })
   assert.equal(stopped.continue, false)
   assert.equal(stopped.code, 'BUDGET_EXHAUSTED')
   assert.deepEqual(stopped.hardCeilings, ['lane:optional:output'])
   assert.throws(() => lease.complete(), (error) => error.code === 'BUDGET_EXHAUSTED')
   const metrics = scheduler.getMetrics()
-  assert.equal(metrics.usageTotals.output, 40)
+  assert.equal(metrics.usageTotals.output, 110)
   assert.equal(metrics.usageTotals.reasoning, 70)
-  assert.equal(metrics.usageTotals.outputIncludingReasoning, 110)
+  assert.equal(metrics.usageTotals.outputIncludingReasoning, 180)
   assert.equal(metrics.counters.streamReports, 2)
   assert.equal(metrics.counters.forcedStops, 1)
 })
@@ -895,14 +895,14 @@ test('final cumulative hard-cap exhaustion releases as failed and never complete
   })
   const scheduler = createTestScheduler({ settings })
   const streamed = await admit(scheduler, { workItemId: 'stream-over-hard' })
-  const stopped = streamed.reportUsage({ noncachedInput: 0, cachedInput: 0, output: 70, reasoning: 40 })
+  const stopped = streamed.reportUsage({ noncachedInput: 0, cachedInput: 0, output: 110, reasoning: 40 })
   assert.equal(stopped.code, 'BUDGET_EXHAUSTED')
   assert.throws(() => streamed.complete(), (error) => error.code === 'BUDGET_EXHAUSTED')
   assert.equal(scheduler.getMetrics().counters.currentLiveChildren, 0)
 
   const finalScheduler = createTestScheduler({ settings })
   const finalOnly = await admit(finalScheduler, { workItemId: 'final-over-hard' })
-  assert.throws(() => finalOnly.complete({ noncachedInput: 0, cachedInput: 0, output: 80, reasoning: 30 }),
+  assert.throws(() => finalOnly.complete({ noncachedInput: 0, cachedInput: 0, output: 110, reasoning: 30 }),
     (error) => error.code === 'BUDGET_EXHAUSTED')
   assert.equal(finalScheduler.getMetrics().counters.currentLiveChildren, 0)
 })

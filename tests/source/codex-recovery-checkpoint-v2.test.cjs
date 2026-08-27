@@ -632,6 +632,53 @@ test('ROADMAP repair advances plan hash exactly once at the authenticated plan-r
 
   assert.equal(checkpointAuthority._validateRecord(current, prior), true)
 
+  const revisionScheduler = scheduler({
+    route: 'ROADMAP', phase: 'RUN_WORK', candidate: nullCandidate,
+    completedWorkIds: ['roadmap-author', 'roadmap-author-revise'], completedCheckIds: [],
+    openCheckIds: [], nextReadyWorkIds: ['roadmap-plan-check'], leases: [],
+  })
+  const revisionPrior = record({
+    checkpoint: checkpoint({
+      scheduler: revisionScheduler,
+      recovery: recovery({ frontier: {
+        nextReadyWorkIds: ['roadmap-plan-check'], openCheckIds: [],
+        acceptedResultIds: [revisionScheduler.stateHash, H('revision-result-receipt')],
+      } }),
+      immutableHashes: {
+        requestEnvelopeHash: H('request'), routeDecisionHash: H('decision'),
+        planHash: H('plan-before-revision'), candidateHash: null,
+      },
+    }),
+    cause: { kind: 'LEASE_COMPLETED', causeId: 'scheduler:1:revision:completed', humanDescription: 'revision completed' },
+  })
+  const planCheckLease = {
+    ...recheckLease,
+    leaseId: 'lease-roadmap-plan-check', workItemId: 'roadmap-plan-check',
+    reservationId: 'reservation-roadmap-plan-check', sessionId: 'session-roadmap-plan-check',
+    continuationId: 'continuation-roadmap-plan-check', crashBindingHash: H('plan-check-crash-binding'),
+  }
+  const planCheckScheduler = scheduler({
+    route: 'ROADMAP', phase: 'RUN_WORK', candidate: nullCandidate,
+    completedWorkIds: [...revisionScheduler.completedWorkIds], completedCheckIds: [],
+    openCheckIds: ['roadmap-plan-check'], nextReadyWorkIds: ['reconcile:roadmap-plan-check'], leases: [planCheckLease],
+  })
+  const revisionCurrent = record({
+    checkpoint: checkpoint({
+      scheduler: planCheckScheduler,
+      recovery: recovery({ frontier: {
+        nextReadyWorkIds: ['reconcile:roadmap-plan-check'], openCheckIds: ['roadmap-plan-check'],
+        acceptedResultIds: [revisionScheduler.stateHash, H('revision-result-receipt'), planCheckScheduler.stateHash],
+      } }),
+      immutableHashes: {
+        requestEnvelopeHash: H('request'), routeDecisionHash: H('decision'),
+        planHash: H('plan-after-revision'), candidateHash: null,
+      },
+    }),
+    cause: { kind: 'LEASE_STARTED', causeId: 'scheduler:1:plan-check:lease-started', humanDescription: 'plan check admitted' },
+    sequence: 2, previousHash: revisionPrior.entryHash, occurredAt: '2026-08-22T01:00:02.000Z',
+  })
+  assert.equal(checkpointAuthority._validateRecord(revisionCurrent, revisionPrior), true)
+
   const unverifiedAuthority = new RecoveryCheckpointAuthority({
     paths: {
       runRecordRoot: ROOT,
@@ -658,6 +705,28 @@ test('ROADMAP repair advances plan hash exactly once at the authenticated plan-r
   }
   rehash(crashProjection)
   assert.equal(checkpointAuthority._validateRecord(crashProjection, prior), true)
+
+  const committedProjection = clone(current)
+  committedProjection.checkpoint.scheduler = clone(prior.checkpoint.scheduler)
+  committedProjection.checkpoint.recovery = clone(prior.checkpoint.recovery)
+  committedProjection.checkpoint.stateEvent = clone(prior.checkpoint.stateEvent)
+  committedProjection.cause = {
+    kind: 'PLAN_PROJECTION_COMMITTED', causeId: 'plan-projection:1:roadmap-author-plan-repair',
+    humanDescription: 'Persist the authenticated repaired plan projection before its recheck.',
+  }
+  rehash(committedProjection)
+  assert.equal(checkpointAuthority._validateRecord(committedProjection, prior), true)
+
+  const committedWithChangedState = clone(committedProjection)
+  committedWithChangedState.checkpoint.stateEvent.eventHash = H('foreign-plan-commit-event')
+  rehash(committedWithChangedState)
+  assert.throws(
+    () => checkpointAuthority._validateRecord(committedWithChangedState, prior),
+    error => [
+      'RECOVERY_CHECKPOINT_INVALID', 'RECOVERY_CHECKPOINT_ROLLBACK',
+      'RECOVERY_CHECKPOINT_STATE_INVALID', 'RECOVERY_CHECKPOINT_STATE_UNBOUND',
+    ].includes(error.code),
+  )
 
   const crashWithChangedScheduler = clone(crashProjection)
   crashWithChangedScheduler.checkpoint.scheduler.nextReadyWorkIds = ['foreign-work']

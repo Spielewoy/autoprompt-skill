@@ -70,6 +70,11 @@
     "plannedChecks": {
       "$ref": "#/$defs/nonEmptyStrings"
     },
+    "verificationObligations": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/verificationObligation" }
+    },
     "existingTests": {
       "type": "array",
       "minItems": 1,
@@ -526,6 +531,7 @@
         "requestedResult",
         "successChecklist",
         "plannedChecks",
+        "verificationObligations",
         "existingTests",
         "likelyAreas",
         "risks",
@@ -746,6 +752,32 @@
     }
   ],
   "$defs": {
+    "verificationObligation": {
+      "type": "object",
+      "required": ["id", "kind", "statement", "cases"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["invariant", "activation", "ordered-activation"] },
+        "statement": { "type": "string", "minLength": 1 },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "phase", "polarity", "precondition", "expectedObservation"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "phase": { "enum": ["ordinary", "inactive", "boundary", "intermediate", "active"] },
+              "polarity": { "enum": ["must-hold", "must-not-hold"] },
+              "precondition": { "type": "string", "minLength": 1 },
+              "expectedObservation": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "routeTopologyOrNull": {
       "oneOf": [
         { "type": "null" },

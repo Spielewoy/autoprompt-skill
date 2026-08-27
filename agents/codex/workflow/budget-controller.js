@@ -18,6 +18,7 @@ const ACCOUNTING_SNAPSHOT_SCHEMA = require('../../contracts/schemas/accounting-s
 const BUDGET_SCHEMA_VERSION = 2
 const LIMIT_FIELDS = Object.freeze(['wallMs', 'tokens', 'sessions', 'launches'])
 const TOKEN_FIELDS = Object.freeze(['noncachedInput', 'cachedInput', 'output', 'reasoning'])
+const BILLABLE_TOKEN_FIELDS = Object.freeze(['noncachedInput', 'cachedInput', 'output'])
 const ACCOUNTING_VALUE_FIELDS = Object.freeze(['launches', 'retries', 'sessions', 'elapsedMilliseconds', 'costMicrounits', 'tokenUsage'])
 const ACCOUNTING_CAUSES = Object.freeze([...ACCOUNTING_RECORD_SCHEMA.properties.cause.properties.kind.enum])
 const HASH_PATTERN = /^[a-f0-9]{64}$/
@@ -658,7 +659,9 @@ function validateCeilings(ceilings) {
 }
 
 function assertUnderCeilings(cumulative, ceilings) {
-  const totalTokens = TOKEN_FIELDS.reduce((total, field) => total + cumulative.tokenUsage[field], 0)
+  const totalTokens = BILLABLE_TOKEN_FIELDS.reduce(
+    (total, field) => total + cumulative.tokenUsage[field], 0,
+  )
   const checks = [
     ['wallMilliseconds', cumulative.elapsedMilliseconds],
     ['totalTokens', totalTokens],
