@@ -10630,6 +10630,38 @@ function roadmapAuthorArtifact(result, scoutCorrections = []) {
   })
 }
 
+function rebuildRoadmapProjectionAuthorResult(authorResult, durableAuthorResult, durableScoutCorrections = []) {
+  const reconstructed = roadmapAuthorArtifact(durableAuthorResult, durableScoutCorrections)
+  // Transcript references are observational launch metadata appended only to
+  // the in-memory return value after the canonical result is durable. They
+  // must not influence plan bytes or projection receipts.
+  const { transcriptEvidence: _runtimeTranscriptEvidence, ...suppliedCanonical } = authorResult || {}
+  if (stableStringify(reconstructed) !== stableStringify(suppliedCanonical)) {
+    throw new SupervisorIntegrationError(
+      'ROADMAP_RESULT_MISSING',
+      'ROADMAP projection input differs from its exact durable author result',
+    )
+  }
+  return reconstructed
+}
+
+function roadmapProjectionScoutRoster(decision, authorWorkItemId) {
+  if (authorWorkItemId === 'roadmap-author') return Object.freeze([])
+  const scouts = decision && decision.route === 'ROADMAP' && decision.topology &&
+    decision.topology.coordination && decision.topology.coordination.scouts
+  if (!scouts || !Number.isSafeInteger(scouts.count) || scouts.count < 0 ||
+      !Array.isArray(scouts.namedUnknowns) || scouts.namedUnknowns.length !== scouts.count) {
+    throw new SupervisorIntegrationError(
+      'SCOUT_TOPOLOGY_INVALID',
+      'ROADMAP projection requires the exact decision-bound scout roster',
+    )
+  }
+  return Object.freeze(scouts.namedUnknowns.map((namedUnknown, index) => Object.freeze({
+    workItemId: `roadmap-scout-${index + 1}`,
+    namedUnknown,
+  })))
+}
+
 function immutableSemanticUserAskCount(requestScope) {
   if (!requestScope || !/^[a-f0-9]{64}$/.test(requestScope.digest || '') ||
       !Array.isArray(requestScope.records) || requestScope.records.length === 0) {
@@ -14992,6 +15024,36 @@ function createDefaultRuntimeOptions(input) {
       stableStringify(receipt.result) === stableStringify(expectedResult))
   }
   const roadmapProjectionReceiptPath = planHash => `plan/projections/${planHash}.json`
+  const loadCanonicalRoadmapProjectionAuthorResult = (decision, authorResult, authorWorkItemId) => {
+    if (!['roadmap-author', 'roadmap-author-revise', 'roadmap-author-plan-repair'].includes(authorWorkItemId)) {
+      throw new SupervisorIntegrationError(
+        'ROADMAP_RESULT_MISSING',
+        'ROADMAP projection requires the exact durable author work-item identity',
+      )
+    }
+    const durableAuthorResult = readDurableResult(authorWorkItemId)
+    const sourceResultHash = exactFileHash(`work/results/${hashText(authorWorkItemId)}.json`)
+    if (!durableAuthorResult || !sourceResultHash) {
+      throw new SupervisorIntegrationError('ROADMAP_RESULT_MISSING', 'ROADMAP projection source result is not durable')
+    }
+    const durableCorrections = roadmapProjectionScoutRoster(decision, authorWorkItemId).map(expected => {
+      const scoutResult = readDurableResult(expected.workItemId)
+      const resultHash = exactFileHash(`work/results/${hashText(expected.workItemId)}.json`)
+      if (!scoutResult || !resultHash) {
+        throw new SupervisorIntegrationError(
+          'SCOUT_EVIDENCE_MISSING',
+          `ROADMAP projection source result is not durable for ${expected.workItemId}`,
+        )
+      }
+      return scoutCorrection(
+        scoutResult,
+        expected.namedUnknown,
+        expected.workItemId,
+        { hash: resultHash },
+      )
+    })
+    return rebuildRoadmapProjectionAuthorResult(authorResult, durableAuthorResult, durableCorrections)
+  }
   const writeRoadmapProjectionReceipt = (decision, authorResult, plan, authorWorkItemId) => {
     const planSha256 = hashText(plan)
     if (!['roadmap-author', 'roadmap-author-revise', 'roadmap-author-plan-repair'].includes(authorWorkItemId)) {
@@ -15050,22 +15112,21 @@ function createDefaultRuntimeOptions(input) {
     )) return false
     let corrections
     try {
-      corrections = (receipt.authorResult && receipt.authorResult.scoutCorrections || []).map(saved => {
-        const scoutResult = readDurableResult(saved.workItemId)
-        const resultHash = exactFileHash(`work/results/${hashText(saved.workItemId)}.json`)
+      corrections = roadmapProjectionScoutRoster(decision, receipt.authorWorkItemId).map(expected => {
+        const scoutResult = readDurableResult(expected.workItemId)
+        const resultHash = exactFileHash(`work/results/${hashText(expected.workItemId)}.json`)
         if (!scoutResult || !resultHash ||
-            !durableResultMatchesRecoveryReceipt(saved.workItemId, scoutResult, checkpointOverride)) {
+            !durableResultMatchesRecoveryReceipt(expected.workItemId, scoutResult, checkpointOverride)) {
           throw new Error('scout result missing')
         }
         return scoutCorrection(
           scoutResult,
-          saved.namedUnknown,
-          saved.workItemId,
+          expected.namedUnknown,
+          expected.workItemId,
           { hash: resultHash },
         )
       })
-      const reconstructed = roadmapAuthorArtifact(sourceResult, corrections)
-      if (stableStringify(reconstructed) !== stableStringify(receipt.authorResult)) return false
+      const reconstructed = rebuildRoadmapProjectionAuthorResult(receipt.authorResult, sourceResult, corrections)
       return hashText(renderPlanArtifact('ROADMAP', decision, reconstructed)) === planSha256
     } catch {
       return false
@@ -16453,10 +16514,13 @@ function createDefaultRuntimeOptions(input) {
       if (!recordRef) throw new SupervisorIntegrationError('RUN_RECORD_FAILURE', 'plan write requires the opened run record')
       const relative = route === 'ROADMAP' ? 'plan/ROADMAP.md'
         : route === 'LIGHT' ? 'plan/light-plan.md' : 'plan/success-card.md'
-      const plan = renderPlanArtifact(route, decision, authorResult)
+      const projectionAuthorResult = route === 'ROADMAP' && authorResult
+        ? loadCanonicalRoadmapProjectionAuthorResult(decision, authorResult, authorWorkItemId)
+        : authorResult
+      const plan = renderPlanArtifact(route, decision, projectionAuthorResult)
       const runtime = runtimeOptions.runtimeInstance
-      if (route === 'ROADMAP' && authorResult && runtime && runtime.scheduler) {
-        const roadmap = roadmapAuthorArtifact(authorResult, authorResult.scoutCorrections || [])
+      if (route === 'ROADMAP' && projectionAuthorResult && runtime && runtime.scheduler) {
+        const roadmap = projectionAuthorResult
         const requestScope = recordRef.loadRequest()
         const missionScopeHash = requestScope && requestScope.digest
         const userAskCount = immutableSemanticUserAskCount(requestScope)
@@ -16499,22 +16563,22 @@ function createDefaultRuntimeOptions(input) {
             ? 'roadmap-plan-check' : 'roadmap-plan-recheck'
           runtime._persistRecoveryCheckpoint({
             kind: 'ROADMAP_RATIO_RECORDED',
-            causeId: `roadmap-ratio:${activation.generation}:${authorWorkItemId}:${planSha256}`,
+            causeId: `roadmap-ratio:${generation}:${authorWorkItemId}:${planSha256}`,
             humanDescription: 'Persist ROADMAP expansion accounting before changing the authenticated plan projection.',
           }, { candidateHash: null, nextReadyWorkIds: [checkerId] })
         }
       }
-      if (route === 'ROADMAP' && authorResult) {
-        writeRoadmapProjectionReceipt(decision, authorResult, plan, authorWorkItemId)
+      if (route === 'ROADMAP' && projectionAuthorResult) {
+        writeRoadmapProjectionReceipt(decision, projectionAuthorResult, plan, authorWorkItemId)
       }
       recordRef.write(relative, plan)
-      if (route === 'ROADMAP' && authorResult && runtime && runtime.scheduler &&
+      if (route === 'ROADMAP' && projectionAuthorResult && runtime && runtime.scheduler &&
           ['roadmap-author-revise', 'roadmap-author-plan-repair'].includes(authorWorkItemId)) {
         const checkerId = authorWorkItemId === 'roadmap-author-revise'
           ? 'roadmap-plan-check' : 'roadmap-plan-recheck'
         runtime._persistRecoveryCheckpoint({
           kind: 'PLAN_PROJECTION_COMMITTED',
-          causeId: `plan-projection:${activation.generation}:${authorWorkItemId}:${hashText(plan)}`,
+          causeId: `plan-projection:${generation}:${authorWorkItemId}:${hashText(plan)}`,
           humanDescription: 'Persist the authenticated ROADMAP projection before admitting its checker.',
         }, {
           candidateHash: null,
