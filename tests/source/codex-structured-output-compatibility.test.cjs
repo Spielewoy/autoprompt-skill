@@ -1401,8 +1401,17 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       aggregated_output: nodeTapFailure,
     }],
   })
-  assert.equal(partiallyBoundFailure.code, 'CHECK_INCONCLUSIVE',
-    'one observed failure cannot authorize a second unobserved failing claim')
+  assert.equal(partiallyBoundFailure.code, 'FAIL',
+    'an unobserved extra claim cannot erase one controller-bound product failure')
+  assert.deepEqual(
+    partiallyBoundFailure.payload.verificationObservationDisposition
+      .commandBoundFailureCheckIds,
+    [rejectedCase],
+  )
+  assert.deepEqual(
+    partiallyBoundFailure.payload.verificationObservationDisposition.unboundFailureCheckIds,
+    [secondRejectedCase],
+  )
 
   const nonzeroCannotAuthorizePass = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,

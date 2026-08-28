@@ -16,6 +16,7 @@ const {
   createDefaultRouteExecutor,
   createMinimalTestEnvironment,
   executeExistingTestBaseline,
+  persistCapturedDomainAdmissionTransaction,
   promoteIndependentScratchPass,
   resolveTrustedTestDeclarations,
 } = require('../../agents/codex/workflow/phase-budget.js')
@@ -36,6 +37,63 @@ const H = 'a'.repeat(64)
 function digest(value) {
   return crypto.createHash('sha256')
     .update(Buffer.isBuffer(value) ? value : String(value)).digest('hex')
+}
+
+function capturedDomainAdmissionFixture(t, failureBoundary = null) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-captured-admission-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const events = []
+  let injected = false
+  const injectAfter = boundary => {
+    if (injected || failureBoundary !== boundary) return
+    injected = true
+    const error = new Error(`simulated crash after ${boundary}`)
+    error.code = 'SIMULATED_CRASH'
+    throw error
+  }
+  const record = {
+    resolve(relative) { return path.join(root, ...relative.split('/')) },
+    write(relative, bytes) {
+      const target = this.resolve(relative)
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+      fs.writeFileSync(target, bytes, { flag: 'wx' })
+      injectAfter(relative.endsWith('-receipt.json') ? 'receipt' : 'admission')
+    },
+  }
+  const stateStore = {
+    eventLog: { readAll: () => events.map(event => structuredClone(event)) },
+    record(type, input) {
+      const event = {
+        type,
+        generation: 1,
+        details: structuredClone(input.details),
+        sequence: events.length + 1,
+      }
+      event.hash = digest(JSON.stringify(event))
+      events.push(event)
+      injectAfter('event')
+      return event
+    },
+  }
+  const admission = Object.freeze({
+    schemaVersion: 1,
+    route: 'DIRECT',
+    requestEnvelopeHash: '1'.repeat(64),
+    routeDecisionHash: '2'.repeat(64),
+    targetStateHash: '3'.repeat(64),
+    admittedBeforeWork: true,
+    contracts: Object.freeze([]),
+    admissionHash: '4'.repeat(64),
+  })
+  const input = {
+    record,
+    stateStore,
+    capability: Object.freeze({ id: 'test-capability' }),
+    runId: 'captured-admission-run',
+    generation: 1,
+    admission,
+  }
+  return { root, events, input }
 }
 
 function git(cwd, argv) {
@@ -327,7 +385,59 @@ function structurallyUnboundPass(event = 'CHECK_OBSERVATION_INCOMPLETE') {
   }
 }
 
-test('structurally unbound PASS has no report-only retry frontier while FAIL keeps repair authority', () => {
+test('captured-domain admission resumes every pre-work crash window as one exact transaction', t => {
+  for (const boundary of ['admission', 'receipt', 'event']) {
+    const fixture = capturedDomainAdmissionFixture(t, boundary)
+    assert.throws(
+      () => persistCapturedDomainAdmissionTransaction(fixture.input),
+      error => error.code === 'SIMULATED_CRASH',
+      boundary,
+    )
+    const recovered = persistCapturedDomainAdmissionTransaction(fixture.input)
+    const replayed = persistCapturedDomainAdmissionTransaction(fixture.input)
+    assert.deepEqual(replayed, recovered, boundary)
+    assert.match(recovered.receiptHash, /^[a-f0-9]{64}$/u, boundary)
+    assert.match(recovered.stateEventHash, /^[a-f0-9]{64}$/u, boundary)
+    assert.equal(fixture.events.length, 1, boundary)
+    assert.equal(fs.existsSync(path.join(
+      fixture.root, 'work', 'captured-domain-admission.json')),
+    true, boundary)
+    assert.equal(fs.existsSync(path.join(
+      fixture.root, 'work', 'captured-domain-admission-receipt.json')),
+    true, boundary)
+  }
+})
+
+test('captured-domain admission recovery rejects rewritten bytes, receipts, and event forks', t => {
+  for (const corruption of ['admission-bytes', 'receipt', 'event-fork']) {
+    const fixture = capturedDomainAdmissionFixture(t)
+    persistCapturedDomainAdmissionTransaction(fixture.input)
+    if (corruption === 'admission-bytes') {
+      const target = path.join(fixture.root, 'work', 'captured-domain-admission.json')
+      const parsed = JSON.parse(fs.readFileSync(target, 'utf8'))
+      fs.writeFileSync(target, `${JSON.stringify(parsed)}\n`)
+    } else if (corruption === 'receipt') {
+      const target = path.join(
+        fixture.root, 'work', 'captured-domain-admission-receipt.json')
+      const parsed = JSON.parse(fs.readFileSync(target, 'utf8'))
+      parsed.receiptHash = 'f'.repeat(64)
+      fs.writeFileSync(target, `${JSON.stringify(parsed, null, 2)}\n`)
+    } else {
+      fixture.events.push({
+        ...structuredClone(fixture.events[0]),
+        sequence: 2,
+        hash: 'e'.repeat(64),
+      })
+    }
+    assert.throws(
+      () => persistCapturedDomainAdmissionTransaction(fixture.input),
+      error => error.code === 'CRASH_ADOPTION_CONFLICT',
+      corruption,
+    )
+  }
+})
+
+test('structurally unbound PASS gets one fresh-evidence frontier while FAIL keeps repair authority', () => {
   const recovery = {
     nonAuthoritativeRetryId: 'independent-check-1-runtime-retry-1',
     failureRepairId: 'work-1-repair-1',
@@ -339,14 +449,19 @@ test('structurally unbound PASS has no report-only retry frontier while FAIL kee
   ]) {
     assert.deepEqual(
       checkerRecoveryNextReady('independent-check-1', structurallyUnboundPass(event), recovery),
-      ['independent-check-2'],
+      ['independent-check-1-runtime-retry-1'],
       event,
     )
   }
   assert.deepEqual(checkerRecoveryNextReady(
     'independent-check-1',
     structurallyUnboundPass(),
-    { ...recovery, stableLimitationNextReadyId: null },
+    { ...recovery, nonAuthoritativeRetryId: null },
+  ), ['independent-check-2'])
+  assert.deepEqual(checkerRecoveryNextReady(
+    'independent-check-1',
+    structurallyUnboundPass(),
+    { ...recovery, nonAuthoritativeRetryId: null, stableLimitationNextReadyId: null },
   ), [])
   assert.deepEqual(checkerRecoveryNextReady('independent-check-1', {
     ...structurallyUnboundPass(),
@@ -698,7 +813,7 @@ test('a mutate-classified zero-diff structured response always reaches independe
   assert.equal(transitions.some(item => item.eventId === 'ACCEPTANCE_GREEN'), true)
 })
 
-test('a structurally unbound checker PASS stays strict and does not launch the same full checker again', async t => {
+test('a structurally unbound checker PASS gets one fresh full check then releases the candidate with a limitation', async t => {
   for (const event of [
     'CHECK_OBSERVATION_INCOMPLETE',
     'CHECK_OBSERVATION_CONTRADICTION',
@@ -720,28 +835,36 @@ test('a structurally unbound checker PASS stays strict and does not launch the s
         launch: async request => {
           launches.push(request.workItemId)
           if (request.workItemId === 'work-1') return structuredWorkerResult()
-          if (request.workItemId === 'independent-check-1') {
-            return structurallyUnboundPass(event)
+          if (request.workItemId.includes('runtime-retry')) {
+            assert.equal(request.forkTurns, 'none')
+            assert.equal(request.recoveryContext, undefined)
+            assert.match(request.assignment, /fresh expected-result basis and fresh harness/u)
           }
-          assert.equal(request.workItemId, 'independent-check-2')
-          return passingCheckerResult(request)
+          return structurallyUnboundPass(event)
         },
         completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
       })
 
-      assert.equal(outcome.outcome, 'PARTIAL', `${event}/C${checkerCount}`)
-      assert.equal(outcome.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE', event)
+      assert.equal(outcome.outcome, 'DONE', `${event}/C${checkerCount}`)
+      assert.equal(outcome.terminalEnvelope.status,
+        'DONE_WITH_VERIFICATION_LIMITATIONS', event)
       assert.deepEqual(launches, [
-        'work-1', 'independent-check-1',
-        ...(checkerCount === 2 ? ['independent-check-2'] : []),
+        'work-1',
+        'independent-check-1',
+        'independent-check-1-runtime-retry-1',
+        ...(checkerCount === 2 ? [
+          'independent-check-2',
+          'independent-check-2-runtime-retry-1',
+        ] : []),
       ], event)
-      assert.equal(launches.some(id => id.includes('runtime-retry')), false, event)
       assert.equal(transitions.some(item => item.eventId === 'IMPLEMENTATION_DEFECT'), false, event)
-      const inconclusive = transitions.find(item => item.eventId === 'CHECK_INCONCLUSIVE')
-      assert.ok(inconclusive, event)
-      assert.deepEqual(inconclusive.details.nextReadyWorkIds, [], event)
-      assert.equal(inconclusive.details.retryAttempt, 1, event)
-      assert.equal(inconclusive.details.controllerReassessment.code, event, event)
+      const inconclusive = transitions.filter(item => item.eventId === 'CHECK_INCONCLUSIVE')
+      assert.equal(inconclusive.length, checkerCount, event)
+      assert.equal(inconclusive.every(item => item.details.nextReadyWorkIds[0]
+        .endsWith('-runtime-retry-1')), true, event)
+      assert.equal(inconclusive.every(item =>
+        item.details.controllerReassessment.code === event), true, event)
+      assert.equal(transitions.some(item => item.eventId === 'ACCEPTANCE_GREEN'), true, event)
     }
   }
 })
@@ -782,6 +905,11 @@ test('a distinct checker FAIL still repairs and freshly rechecks after an unboun
       launches.push(request.workItemId)
       if (request.workItemId === 'work-1') return structuredWorkerResult()
       if (request.workItemId === 'independent-check-1') return structurallyUnboundPass()
+      if (request.workItemId === 'independent-check-1-runtime-retry-1') {
+        assert.equal(request.forkTurns, 'none')
+        assert.equal(request.recoveryContext, undefined)
+        return structurallyUnboundPass()
+      }
       if (request.workItemId === 'independent-check-2') return failure
       if (request.workItemId === 'work-1-repair-1') {
         fs.writeFileSync(path.join(targetPath, 'subject.txt'), 'bounded evidence\nrepaired\n')
@@ -796,15 +924,16 @@ test('a distinct checker FAIL still repairs and freshly rechecks after an unboun
   assert.deepEqual(launches, [
     'work-1',
     'independent-check-1',
+    'independent-check-1-runtime-retry-1',
     'independent-check-2',
     'work-1-repair-1',
     'independent-check-1-repair-1',
     'independent-check-2-repair-1',
   ])
-  assert.equal(launches.some(id => id.includes('runtime-retry')), false)
+  assert.equal(launches.filter(id => id.includes('runtime-retry')).length, 1)
 })
 
-test('resume collapses a durable f1de11a same-seat retry and still runs a distinct checker', async t => {
+test('resume upgrades a durable f1de11a same-seat retry to fresh evidence and still runs a distinct checker', async t => {
   const targetPath = cleanRepository(t)
   const decision = readOnlyDecision('inspect', 1, 2)
   const workerResult = structuredWorkerResult()
@@ -857,6 +986,11 @@ test('resume collapses a durable f1de11a same-seat retry and still runs a distin
     route: 'DIRECT', decision,
     launch: async request => {
       launches.push(request.workItemId)
+      if (request.workItemId === 'independent-check-1-runtime-retry-1') {
+        assert.equal(request.forkTurns, 'none')
+        assert.equal(request.recoveryContext, undefined)
+        return structurallyUnboundPass('CHECK_OBSERVATION_CONTRADICTION')
+      }
       assert.equal(request.workItemId, 'independent-check-2')
       return passingCheckerResult(request)
     },
@@ -882,10 +1016,12 @@ test('resume collapses a durable f1de11a same-seat retry and still runs a distin
       },
     },
   })
-  assert.equal(outcome.outcome, 'PARTIAL', JSON.stringify(outcome))
-  assert.equal(outcome.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
-  assert.deepEqual(launches, ['independent-check-2'])
-  assert.equal(launches.some(id => id.includes('runtime-retry')), false)
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.equal(outcome.terminalEnvelope.status, 'DONE_WITH_VERIFICATION_LIMITATIONS')
+  assert.deepEqual(launches, [
+    'independent-check-1-runtime-retry-1',
+    'independent-check-2',
+  ])
 })
 
 test('a mutate-classified zero-diff response gets one checker-owned repair and a fresh repaired check', async t => {

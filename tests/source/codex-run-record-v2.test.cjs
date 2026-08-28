@@ -288,9 +288,16 @@ test('run record exposes only canonical registered paths and the uppercase ROADM
   assert.throws(() => record.write('unregistered.txt', 'no'), /not registered/i)
   assert.throws(() => record.write('metadata.json', '{}\n'), /Immutable run metadata/i)
   record.write(runRecord.PLAN_PATHS.ROADMAP, '# Canonical roadmap\n')
-  record.write('work/captured-domain-admission.json', '{"schemaVersion":1,"admittedBeforeWork":true}\n')
-  assert.deepEqual(JSON.parse(fs.readFileSync(record.resolve('work/captured-domain-admission.json'), 'utf8')),
+  record.write(runRecord.CAPTURED_DOMAIN_ADMISSION_PATH,
+    '{"schemaVersion":1,"admittedBeforeWork":true}\n')
+  assert.deepEqual(JSON.parse(fs.readFileSync(
+    record.resolve(runRecord.CAPTURED_DOMAIN_ADMISSION_PATH), 'utf8')),
     { schemaVersion: 1, admittedBeforeWork: true })
+  record.write(runRecord.CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH,
+    '{"schemaVersion":1,"kind":"captured-domain-receipt"}\n')
+  assert.deepEqual(JSON.parse(fs.readFileSync(
+    record.resolve(runRecord.CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH), 'utf8')),
+    { schemaVersion: 1, kind: 'captured-domain-receipt' })
   record.write('work/deferred-promotion.json', '{"schemaVersion":1,"status":"PREPARED"}\n')
   assert.deepEqual(JSON.parse(fs.readFileSync(record.resolve('work/deferred-promotion.json'), 'utf8')),
     { schemaVersion: 1, status: 'PREPARED' })

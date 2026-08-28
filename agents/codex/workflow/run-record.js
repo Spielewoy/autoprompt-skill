@@ -29,6 +29,8 @@ const PRE_MUTATION_BASELINE_PATH = 'checks/pre-mutation-baseline.json'
 const ALL_WORK_JOINED_PATH = 'checks/all-work-joined.json'
 const ROUTE_RECOMMENDATION_STATE_PATH = 'route/recommendation-state.json'
 const CODEX_PHYSICAL_EXECUTION_PATH = 'route/codex-physical-execution.json'
+const CAPTURED_DOMAIN_ADMISSION_PATH = 'work/captured-domain-admission.json'
+const CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH = 'work/captured-domain-admission-receipt.json'
 const PLAN_PATHS = Object.freeze({ DIRECT: 'plan/success-card.md', LIGHT: 'plan/light-plan.md', ROADMAP: 'plan/ROADMAP.md' })
 const RUNTIME_PATHS = Object.freeze({
   metadata: 'metadata.json',
@@ -67,7 +69,8 @@ const EXACT_REGISTERED_PATHS = new Set([
   'route/recommendation.json', ROUTE_RECOMMENDATION_STATE_PATH,
   'route/decision.json', 'route/decision.md', CODEX_PHYSICAL_EXECUTION_PATH,
   ...Object.values(PLAN_PATHS),
-  'work/ownership.json', 'work/captured-domain-admission.json', 'work/deferred-promotion.json',
+  'work/ownership.json', CAPTURED_DOMAIN_ADMISSION_PATH,
+  CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH, 'work/deferred-promotion.json',
   'checks/commands.jsonl', PRE_MUTATION_BASELINE_PATH, ALL_WORK_JOINED_PATH, 'checks/captured-domain-outcomes.json',
   RUNTIME_PATHS.metadata, RUNTIME_PATHS.metadataDigest, RUNTIME_PATHS.state, RUNTIME_PATHS.transaction, RUNTIME_PATHS.events, RUNTIME_PATHS.terminal, RUNTIME_PATHS.cleanupRegistry, RUNTIME_PATHS.processRegistry,
   RUNTIME_PATHS.aliasTelemetry,
@@ -825,7 +828,8 @@ function openRunRecord(runPath, options = {}) {
 module.exports = {
   RUN_RECORD_SCHEMA, PLAN_PATHS, RUNTIME_PATHS, RUN_DIRECTORIES, EXACT_REGISTERED_PATHS, REGISTERED_PREFIXES,
   PRE_MUTATION_BASELINE_PATH, ALL_WORK_JOINED_PATH, ROUTE_RECOMMENDATION_STATE_PATH,
-  CODEX_PHYSICAL_EXECUTION_PATH,
+  CODEX_PHYSICAL_EXECUTION_PATH, CAPTURED_DOMAIN_ADMISSION_PATH,
+  CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH,
   normalizeRelativePath, isRegisteredRunPath, resolveRegisteredPath, canonicalPlanPath, runtimeIntegrationPaths,
   createRunRecord, allocateRunRecord: createRunRecord, openRunRecord, assertRunRecordBinding,
   auditRunRecordTree, atomicWriteRegistered,

@@ -77,6 +77,7 @@ const {
   compileAutomaticRouteDecision,
   createRouteDecision,
   createRouteRecommendation,
+  validateRouteDecision,
 } = require(path.join(WORKFLOW, 'route-decision.js'))
 const { deriveProfileLimits, renderProfile } = require(path.join(WORKFLOW, 'codex-agent-profile.js'))
 const { resolveAgentAssignment } = require(path.join(WORKFLOW, 'codex-agent-casting.js'))
@@ -136,6 +137,22 @@ const MODEL_REGISTRY = Object.freeze([Object.freeze({
   yield: { successRate: 1, sampleSize: 100 },
 })])
 const ZERO_USAGE = Object.freeze({ noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 })
+
+function assertControllerLimitedDone(result, message) {
+  assert.equal(result.outcome, 'DONE', message || JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'DONE_WITH_VERIFICATION_LIMITATIONS', message)
+  assert.equal(result.terminalEnvelope.limitations.length, 1, message)
+  const limitation = result.terminalEnvelope.limitations.find(item =>
+    item && item.verificationLimitation &&
+      item.verificationLimitation.capabilityId === 'autoprompt.independent-check-convergence')
+  assert.ok(limitation, message || JSON.stringify(result.terminalEnvelope))
+  assert.deepEqual(limitation.verificationLimitation, {
+    kind: 'CAPABILITY_UNAVAILABLE',
+    capabilityId: 'autoprompt.independent-check-convergence',
+    explicitUserDeliverable: false,
+    observedVersionDefectIds: [],
+  })
+}
 
 function adapterWorkerResult(overrides = {}) {
   return {
@@ -475,6 +492,61 @@ test('checker contract and aggregate evidence defects trigger bounded evidence-b
   assert.equal(transitions.filter(item => item.event === 'INDEPENDENT_VERDICT_RECORDED').length, 2)
 })
 
+test('exhausted duplicate-evidence correction delivers with a bounded verification limitation', async t => {
+  const directory = tempDirectory(t, 'autoprompt-duplicate-evidence-limitation-')
+  const targetPath = createTempGitTarget(directory)
+  const requests = []
+  const result = await createDefaultRouteExecutor({
+    targetPath,
+    gitEnvironment: () => process.env,
+    transition: async () => {},
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash,
+      buildHash: crypto.createHash('sha256').update('duplicate-limitation-build').digest('hex'),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT',
+    decision: withExactTwoCheckerPlan(decision('DIRECT')),
+    launch: async request => {
+      requests.push(request)
+      if (request.logicalRole === 'worker') {
+        fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'usable'\n")
+        return { reportId: request.workItemId, allAssignedItemsPass: true }
+      }
+      const secondSeat = request.workItemId.startsWith('independent-check-2')
+      return {
+        code: 'PASS',
+        payload: {
+          evidenceIds: ['evidence:shared-even-after-correction'],
+          referenceMethod: checkerReferenceMethod(
+            secondSeat ? 'black-box-boundary' : 'requirements-review',
+            request.workItemId,
+          ),
+          testOutcomes: checkerTestOutcomes(request),
+        },
+      }
+    },
+    completeRetainedLease: () => {},
+    resumeAdoptedLaunches: async () => ({}),
+    resumeState: null,
+  })
+
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'DONE_WITH_VERIFICATION_LIMITATIONS')
+  assert.deepEqual(requests.filter(request => request.logicalRole.startsWith('independent-'))
+    .map(request => request.workItemId), [
+    'independent-check-1',
+    'independent-check-2',
+    'independent-check-2-runtime-retry-1',
+  ])
+  assert.equal(result.terminalEnvelope.limitations.length, 1)
+  assert.equal(
+    result.terminalEnvelope.limitations[0].verificationLimitation.kind,
+    'CAPABILITY_UNAVAILABLE',
+  )
+})
+
 test('one-checker PASS still requires an independent reference method and only one physical reassessment', async t => {
   for (const repeatedDefect of [false, true]) {
     const directory = tempDirectory(t, `autoprompt-one-checker-method-${repeatedDefect}-`)
@@ -556,7 +628,7 @@ test('one-checker PASS still requires an independent reference method and only o
       resumeAdoptedLaunches: async () => ({}),
       resumeState: null,
     })
-    assert.equal(result.outcome, repeatedDefect ? 'PARTIAL' : 'DONE', JSON.stringify({
+    assert.equal(result.outcome, 'DONE', JSON.stringify({
       result,
       transitions,
       requests: requests.map(request => request.workItemId),
@@ -589,8 +661,7 @@ test('one-checker PASS still requires an independent reference method and only o
         'a narrow reference-method correction cannot overwrite verdict, identity, or test outcomes')
     }
     if (repeatedDefect) {
-      assert.equal(result.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
-      assert.equal(result.terminalEnvelope.controllerReason, 'REFERENCE_METHOD_INVALID')
+      assertControllerLimitedDone(result)
     }
   }
 })
@@ -1206,7 +1277,7 @@ test('controller-rejected provisional PASS cannot conflict with its completed co
   assert.deepEqual(verified, [retryId])
 })
 
-test('recovered ordinary checker retry defects preserve a usable candidate without claiming DONE', async t => {
+test('recovered ordinary checker retry defects deliver with an explicit verification limitation', async t => {
   for (const scenario of [
     {
       name: 'invalid-pass-payload',
@@ -1283,12 +1354,10 @@ test('recovered ordinary checker retry defects preserve a usable candidate witho
         } },
       },
     })
-    assert.equal(outcome.outcome, 'PARTIAL', scenario.name)
-    assert.equal(outcome.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE', scenario.name)
-    assert.equal(outcome.terminalEnvelope.usableCandidatePreserved, true, scenario.name)
+    assertControllerLimitedDone(outcome, scenario.name)
     assert.deepEqual(launches, [], scenario.name)
     assert.equal(transitions.filter(([event]) => event === 'CHECK_BECAME_CONCLUSIVE').length,
-      0,
+      1,
       scenario.name)
     assert.equal(transitions.filter(([event]) => event === 'CHECK_REMAINS_INCONCLUSIVE').length, 0,
       scenario.name)
@@ -1631,9 +1700,7 @@ test('post-retry durable terminal receipt is consumed without relaunching the bo
       } },
     },
   })
-  assert.equal(outcome.outcome, 'PARTIAL')
-  assert.equal(outcome.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
-  assert.equal(outcome.terminalEnvelope.usableCandidatePreserved, true)
+  assertControllerLimitedDone(outcome)
   assert.deepEqual(launches, [])
 })
 
@@ -3372,7 +3439,7 @@ test('open legacy depth-probe recovery retires the advisory lease before product
   assert.deepEqual(adoption.skippedPlanningNextReadyWorkIds, ['work-1'])
 })
 
-test('DONE retry keeps its isolated candidate unpromoted until the final acceptance join', async t => {
+test('DONE retry promotes only after a final acceptance or bounded non-defect limitation join', async t => {
   const directory = tempDirectory(t, 'autoprompt-done-retry-')
   const targetPath = createTempGitTarget(directory)
   const H = 'a'.repeat(64)
@@ -3486,7 +3553,15 @@ test('DONE retry keeps its isolated candidate unpromoted until the final accepta
   const inconclusiveEvents = []
   const inconclusiveHandle = {
     token: 'inconclusive-token', candidateHash: H2, workspacePath: failedPrivateCandidate,
-    async commit() { inconclusiveEvents.push('promoted') },
+    async commit(join) {
+      assert.equal(join.verificationLimited, true)
+      assert.ok(join.verificationLimitations.length >= 2)
+      fs.copyFileSync(
+        path.join(failedPrivateCandidate, 'src', 'example.js'),
+        path.join(targetPath, 'src', 'example.js'),
+      )
+      inconclusiveEvents.push('promoted')
+    },
     async abort(reason) { inconclusiveEvents.push(`aborted:${reason}`) },
   }
   const inconclusive = await executor({
@@ -3496,10 +3571,99 @@ test('DONE retry keeps its isolated candidate unpromoted until the final accepta
       : { code: 'CHECK_INCONCLUSIVE', payload: { unblockPath: 'provide checker scratch storage' } },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
   })
-  assert.equal(inconclusive.outcome, 'PARTIAL')
-  assert.equal(inconclusive.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
-  assert.equal(inconclusive.terminalEnvelope.usableCandidatePreserved, true)
-  assert.deepEqual(inconclusiveEvents, ['aborted:independent checker remained non-authoritative'])
+  assert.equal(inconclusive.outcome, 'DONE', JSON.stringify(inconclusive))
+  assert.equal(inconclusive.terminalEnvelope.status,
+    'DONE_WITH_VERIFICATION_LIMITATIONS')
+  assert.equal(inconclusive.terminalEnvelope.candidateHash, H2)
+  assert.equal(fs.readFileSync(path.join(targetPath, 'src', 'example.js'), 'utf8'),
+    "module.exports = 'failed-retry'\n")
+  assert.equal(inconclusive.deliverables.some(item =>
+    item.path === path.join(targetPath, 'src', 'example.js')), true)
+  assert.deepEqual(inconclusiveEvents, ['promoted'])
+
+  const defectEvents = []
+  const defectHandle = {
+    token: 'defect-token', candidateHash: H2, workspacePath: failedPrivateCandidate,
+    async commit() { defectEvents.push('promoted') },
+    async abort() { defectEvents.push('aborted') },
+  }
+  const defectEvidence = await executor({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => request.logicalRole === 'worker'
+      ? { deferredPromotion: defectHandle }
+      : {
+          code: 'CHECK_INCONCLUSIVE',
+          cause: {
+            event: 'DEPENDENCY_UNAVAILABLE',
+            reason: 'The report also contains a concrete failing observation.',
+            unblockPath: 'Repair the observed defect before acceptance.',
+          },
+          payload: {
+            findingIds: ['CONCRETE-DEFECT-EVIDENCE'],
+            testOutcomes: checkerTestOutcomes(request, 'FAIL'),
+          },
+        },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
+    resumeState: null,
+  })
+  assert.equal(defectEvidence.outcome, 'PARTIAL')
+  assert.equal(defectEvidence.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
+  assert.deepEqual(defectEvents, ['aborted'])
+
+  const causeOnlyEvents = []
+  const causeOnlyHandle = {
+    token: 'cause-only-defect-token', candidateHash: H2, workspacePath: failedPrivateCandidate,
+    async commit() { causeOnlyEvents.push('promoted') },
+    async abort() { causeOnlyEvents.push('aborted') },
+  }
+  const causeOnlyDefect = await executor({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => request.logicalRole === 'worker'
+      ? { deferredPromotion: causeOnlyHandle }
+      : {
+          code: 'CHECK_INCONCLUSIVE',
+          cause: {
+            event: 'ASSERTION_FAILED',
+            reason: 'The exact version violated an observed requirement.',
+            unblockPath: 'Repair the exact-version defect.',
+          },
+          payload: {},
+        },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
+    resumeState: null,
+  })
+  assert.equal(causeOnlyDefect.outcome, 'PARTIAL')
+  assert.equal(causeOnlyDefect.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
+  assert.deepEqual(causeOnlyEvents, ['aborted'])
+
+  const requiredCapabilityEvents = []
+  const requiredCapabilityHandle = {
+    token: 'required-capability-token', candidateHash: H2, workspacePath: failedPrivateCandidate,
+    async commit() { requiredCapabilityEvents.push('promoted') },
+    async abort() { requiredCapabilityEvents.push('aborted') },
+  }
+  const requiredCapability = await executor({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => request.logicalRole === 'worker'
+      ? { deferredPromotion: requiredCapabilityHandle }
+      : {
+          code: 'CHECK_INCONCLUSIVE',
+          cause: { event: 'DEPENDENCY_UNAVAILABLE', reason: 'A required product capability is missing.' },
+          payload: {
+            verificationLimitation: {
+              kind: 'CAPABILITY_UNAVAILABLE',
+              capabilityId: 'required.product-capability',
+              explicitUserDeliverable: true,
+              observedVersionDefectIds: [],
+            },
+          },
+        },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
+    resumeState: null,
+  })
+  assert.equal(requiredCapability.outcome, 'PARTIAL')
+  assert.equal(requiredCapability.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
+  assert.deepEqual(requiredCapabilityEvents, ['aborted'])
 })
 
 test('DONE retry repairs its private candidate and promotes only after the repaired PASS join', async t => {
@@ -5246,6 +5410,57 @@ test('settings and one saved analyst precede L0, and a late valid decision still
   assert.ok(harness.record.writes.has('route/recommendation.json'), JSON.stringify(harness.record.events))
   assert.equal(harness.record.writes.has('route/decision.json'), true)
   assert.equal(harness.processOwner.drained > 0, true)
+})
+
+test('deterministic L0 falls back once without exposing a live unbound root checkpoint', async t => {
+  const attempts = []
+  const transitions = []
+  const checkpoints = []
+  let runtime
+  const harness = makeHarness(t, {
+    decideRoute: async input => {
+      attempts.push(input.correctionAttempts)
+      return { decision: {}, usage: ZERO_USAGE }
+    },
+    executeRoute: async ({ route, decision: selected }) => {
+      assert.equal(route, 'DIRECT')
+      assert.equal(validateRouteDecision(selected).valid, true)
+      return usableDoneFixture(harness, 'deterministic-l0-fallback-result')
+    },
+    runtimeOptions: {
+      deterministicRouteDecision: true,
+      runtimeTransition: async payload => {
+        transitions.push({
+          eventId: payload.eventId,
+          rootStatus: runtime.scheduler
+            ? runtime.scheduler.getMetrics().rootAccounting.status : null,
+        })
+        return null
+      },
+      persistRecoveryCheckpoint: checkpoint => {
+        checkpoints.push(checkpoint)
+        return null
+      },
+    },
+  })
+  runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+  const result = await runtime.start()
+
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.deepEqual(attempts, [0])
+  assert.equal(transitions.find(item =>
+    item.eventId === 'ROUTE_DECISION_INVALID_FIRST').rootStatus, 'not-started')
+  assert.equal(result.scheduler.rootAccounting.status, 'completed')
+  assert.deepEqual(result.scheduler.rootAccounting.reported, {
+    noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0,
+    weightedCost: 0, latencyMs: 0, workMs: 0,
+  })
+  const l0Checkpoints = checkpoints.filter(checkpoint =>
+    checkpoint.cause && checkpoint.cause.causeId === 'state:1:L0_ROUTE_DECISION:0')
+  assert.ok(l0Checkpoints.length >= 2)
+  assert.equal(l0Checkpoints.every(checkpoint =>
+    checkpoint.hasLiveModelSession === false), true)
+  assert.deepEqual(harness.launches.map(item => item.logicalRole), ['route-analyst'])
 })
 
 test('the single L0 correction is not abandoned solely because useful route work crosses the former absolute watchdog', async t => {
@@ -8005,9 +8220,9 @@ test('one actionable checker FAIL launches one same-executor full-set repair and
         const doctrine = request.fetchedEvidence.verificationDoctrine.join(' ')
         assert.match(doctrine, /finish the full assigned matrix after any failure/u)
         assert.match(doctrine, /every exact named check ID, return one testOutcomes entry/u)
-        assert.match(doctrine, /containing its command ID and PASS or FAIL status/u)
-        assert.match(doctrine, /Do not inspect Autoprompt transcripts or compute observationId, commandHash, or fingerprint/u)
-        assert.match(doctrine, /the controller owns those fields and adds them only when/u)
+        assert.match(doctrine, /containing that check ID and PASS or FAIL status/u)
+        assert.match(doctrine, /Do not report tool-call IDs or chunk IDs, inspect Autoprompt transcripts/u)
+        assert.match(doctrine, /the controller owns execution identity and adds it only when/u)
         assert.match(doctrine, /PASS requires a unique zero exit bound to the exact version being checked/u)
         assert.match(doctrine, /authenticated nonzero test failure may bind FAIL and drive repair/u)
         assert.match(doctrine, /consumed underlying identifiers in evidenceIds and an allowed referenceMethod/u)
@@ -8962,7 +9177,7 @@ test('a promoted usable deliverable reaches independent checking despite worker 
   assert.deepEqual(adoptedLaunches, ['independent-check-1'])
 })
 
-test('child transport timeouts become bounded worker evidence or an honest non-DONE checker result', async t => {
+test('child transport timeouts become bounded worker evidence or an explicit checker limitation', async t => {
   const target = createTempGitTarget(tempDirectory(t, 'autoprompt-child-watchdog-'))
   const ordering = []
   const executor = createDefaultRouteExecutor({
@@ -9028,9 +9243,7 @@ test('child transport timeouts become bounded worker evidence or an honest non-D
     },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
   })
-  assert.equal(checkerLimited.outcome, 'PARTIAL', JSON.stringify(checkerLimited))
-  assert.equal(checkerLimited.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
-  assert.equal(checkerLimited.terminalEnvelope.usableCandidatePreserved, true)
+  assertControllerLimitedDone(checkerLimited)
   assert.deepEqual(ordering.filter(item => item.startsWith('persist:')), [])
   assert.equal(ordering.includes('transition:CHECK_INCONCLUSIVE'), true)
 })
@@ -10409,9 +10622,7 @@ test('controller-invalid repaired PASS correction cannot smuggle an unbound top-
       acceptedResultIds: [], nextReadyWorkIds: [], retryState: {},
     },
   })
-  assert.equal(outcome.outcome, 'PARTIAL', JSON.stringify(outcome))
-  assert.equal(outcome.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
-  assert.equal(outcome.terminalEnvelope.controllerReason, 'TEST_OUTCOMES_INVALID')
+  assertControllerLimitedDone(outcome)
   assert.deepEqual(launches, [`${completedId}-runtime-retry-1`])
 })
 
@@ -10733,6 +10944,10 @@ test('a no-op checker repair fails directly without stale recheck or a second re
   fs.writeFileSync(receiptPath, '{}\n')
   const runId = 'run-controller-bound-aggregate-failure'
   const routeDecision = decision('DIRECT')
+  routeDecision.plannedChecks = [
+    'controller-bound failing check',
+    'extra unbound failing claim',
+  ]
   const cleanupEntries = []
   const cleanupRegistry = {
     register(entry) { cleanupEntries.push({ ...entry, status: 'REGISTERED' }) },
@@ -10748,6 +10963,7 @@ test('a no-op checker repair fails directly without stale recheck or a second re
   let repairLaunches = 0
   const launchedWorkIds = []
   let authoritativeFailure = null
+  let checkerCheckIds = []
   const transitions = []
   const executor = createDefaultRouteExecutor({
     targetPath: target, gitEnvironment: () => process.env,
@@ -10772,13 +10988,17 @@ test('a no-op checker repair fails directly without stale recheck or a second re
         return { allAssignedItemsPass: true }
       }
       checkerLaunches += 1
+      checkerCheckIds = [...request.checks]
       const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(harnessPath)}`
       const observationBinding = createCheckerObservationBinding({
         assignmentId: request.workItemId,
         candidateHash: request.candidateHash,
         requestEnvelopeHash: routeDecision.requestEnvelopeHash,
         checkIds: request.checks,
-        commandBindings: request.checks.map(checkId => ({ checkId, command })),
+        commandBindings: request.checks.map((checkId, index) => ({
+          checkId,
+          command: index === 0 ? command : `${command} --never-emitted-${index}`,
+        })),
       })
       const checkerOutput = {
         schemaVersion: '2.0.0',
@@ -10905,6 +11125,14 @@ test('a no-op checker repair fails directly without stale recheck or a second re
     authoritativeFailure.payload.verificationObservationDisposition.reportedAggregateCode,
     'PASS',
   )
+  assert.deepEqual(
+    authoritativeFailure.payload.verificationObservationDisposition.commandBoundFailureCheckIds,
+    [checkerCheckIds[0]],
+  )
+  assert.deepEqual(
+    authoritativeFailure.payload.verificationObservationDisposition.unboundFailureCheckIds,
+    checkerCheckIds.slice(1),
+  )
   assert.equal(result.terminalEnvelope.cause.reason,
     authoritativeFailure.cause.reason,
     'a no-op repair preserves the exact authenticated failure')
@@ -10916,7 +11144,7 @@ test('a no-op checker repair fails directly without stale recheck or a second re
   ])
 })
 
-test('persistent local inconclusive checks preserve a non-DONE candidate and never launch implementation repair', async t => {
+test('persistent local inconclusive checks deliver with a limitation and never launch implementation repair', async t => {
   for (const code of ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE']) {
     const target = createTempGitTarget(tempDirectory(t, `autoprompt-checker-${code.toLowerCase()}-`))
     const receiptPath = path.join(target, 'checker-inconclusive-receipt.json')
@@ -10964,15 +11192,15 @@ test('persistent local inconclusive checks preserve a non-DONE candidate and nev
       },
       completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
     })
-    assert.equal(result.outcome, 'PARTIAL')
-    assert.equal(result.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
-    assert.equal(result.terminalEnvelope.usableCandidatePreserved, true)
+    assertControllerLimitedDone(result)
     assert.equal(repairLaunches, 0)
     assert.equal(checkerLaunches, 2)
     assert.deepEqual(workItemIds.filter(id => /^work-/u.test(id)), ['work-1'])
     assert.deepEqual(checkerTransitions.filter(([event]) => [
       'CHECK_BECAME_CONCLUSIVE', 'IMPLEMENTATION_DEFECT', 'REPAIR_READY',
-    ].includes(event)), [])
+    ].includes(event)), [
+      ['CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK'],
+    ])
     assert.deepEqual(checkerTransitions.filter(([event]) => [
       'CHECK_INCONCLUSIVE', 'CHECK_REMAINS_INCONCLUSIVE',
     ].includes(event)), [
@@ -11070,8 +11298,7 @@ test('the same checker seat and candidate cannot receive report correction two',
     },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
   })
-  assert.equal(outcome.outcome, 'PARTIAL', JSON.stringify(outcome))
-  assert.equal(outcome.terminalEnvelope.controllerReason, 'INDEPENDENT_CHECK_RUNTIME_RETRY')
+  assertControllerLimitedDone(outcome)
   assert.deepEqual(launches.filter(id => /^independent-check-/u.test(id)), [
     'independent-check-1', 'independent-check-1-runtime-retry-1',
   ])
@@ -11133,7 +11360,7 @@ test('crash resume restores the exact candidate-seat correction binding', async 
       },
     },
   })
-  assert.equal(outcome.outcome, 'PARTIAL', JSON.stringify(outcome))
+  assertControllerLimitedDone(outcome)
   assert.deepEqual(launches, ['independent-check-1-runtime-retry-1'])
 })
 

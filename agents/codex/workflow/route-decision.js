@@ -1085,10 +1085,11 @@ function buildRouteTopology(route, options = {}) {
   const explicitPath = exactPathSelection(options.pathSelection ?? options.path_selection, route)
   const classified = router.classifyRoute(facts, {
     probeEvidence: options.probe_evidence ?? options.probeEvidence,
-    // Exact-path preflight already established the deterministic route floor.
-    // Its real baseline probe is a later production gate; topology compilation
-    // must not reinterpret that pending gate as an admission-time task stop.
-    safetyFloorOnly: Boolean(explicitPath),
+    // Route-decision topology describes the admitted completion graph. Both
+    // automatic and exact paths capture the immutable executable baseline at
+    // the later pre-mutation production gate, so a truthful pending baseline
+    // must not invalidate the graph that is required to reach that gate.
+    safetyFloorOnly: true,
   })
   if (classified.status !== 'DECIDED' || (!explicitPath && classified.route !== route)) {
     return { valid: false, errors: [`route facts select ${classified.status === 'DECIDED' ? classified.route : classified.status}, not ${route}`] }
@@ -1476,10 +1477,11 @@ function validateRouteDecision(decision) {
     if (hiddenBoundary && decision.usefulWorkerCount > hiddenBoundary.maxProvisionalWorkerLaunches) {
       errors.push('hidden external verification boundary exceeds its provisional worker cap')
     }
-    // Exact-path admission already authenticated the deterministic safety
-    // floor. Its required production baseline is a later execution gate, not
-    // a second route-decision probe with an admission budget of its own.
-    const classified = router.classifyRoute(facts, explicitPath ? { safetyFloorOnly: true } : {})
+    // A composed route decision always reaches the immutable baseline through
+    // the later pre-mutation production gate. Validate the same deterministic
+    // floor used by compilation and topology construction; the standalone
+    // router still owns PROBE_REQUIRED/PROBE_COMPLETE behavior.
+    const classified = router.classifyRoute(facts, { safetyFloorOnly: true })
     if (classified.status !== 'DECIDED' || (!explicitPath && classified.route !== decision.route)) {
       errors.push('normalized route facts must compile to the recorded route unless an exact user path is locked')
     }
@@ -1573,13 +1575,14 @@ function createWaitingUserDecision(userInputNeeded, options = {}) {
 
 function createRouteDecision(input = {}) {
   const normalizedFacts = router.normalizeFacts(input.routeFacts ?? input.route_facts ?? input.normalizedRouteFacts ?? input.normalized_route_facts)
-  const requestedExactPath = exactPathSelection(
-    input.pathSelection ?? input.path_selection,
-    input.route ?? null,
-  )
-  const classified = router.classifyRoute(normalizedFacts, requestedExactPath
-    ? { safetyFloorOnly: true }
-    : { probeEvidence: input.probeEvidence ?? input.probe_evidence })
+  // Creating a route decision commits to the completion graph whose first
+  // mutating gate captures and replays the executable baseline. Classification
+  // here therefore uses the same deferred-baseline floor for automatic and
+  // exact paths; direct router callers can still request an admission probe.
+  const classified = router.classifyRoute(normalizedFacts, {
+    probeEvidence: input.probeEvidence ?? input.probe_evidence,
+    safetyFloorOnly: true,
+  })
   const route = input.route ?? (classified.status === 'DECIDED' ? classified.route : null)
   const pathSelection = exactPathSelection(input.pathSelection ?? input.path_selection, route)
   const independentCheckingPlan = selectIndependentChecking({ facts: normalizedFacts })

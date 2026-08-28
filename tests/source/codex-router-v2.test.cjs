@@ -765,6 +765,35 @@ test('automatic route decision is deterministically compiled without a second mo
   }), error => error.code === 'ROUTE_DECISION_INVALID' && /contradicts/u.test(error.message))
 })
 
+test('automatic route compilation defers an unknown executable baseline to the production gate consistently', () => {
+  const pendingBaseline = recommendation()
+  pendingBaseline.routeFactProposal.baselineStatus = 'unknown'
+  const compiled = decisions.compileAutomaticRouteDecision({
+    recommendation: pendingBaseline,
+    requestedResult: 'Return the requested result.',
+    requestEnvelopeHash: H,
+    providerCapabilities: {
+      sameContextContinuation: true,
+      isolatedChecking: true,
+      stableChildIdentity: true,
+    },
+    budget: { remaining: { wallMs: 60 * 60 * 1000 } },
+    nowMs: 1,
+  })
+  assert.equal(compiled.normalizedRouteFacts.checkAndBaseline.baselineStatus,
+    'required-before-production')
+  assert.equal(decisions.validateRouteDecision(compiled).valid, true)
+  const topology = decisions.buildRouteTopology(compiled.route, {
+    facts: compiled.normalizedRouteFacts,
+    mutableResourceOwnership: compiled.mutableResourceOwnership,
+    workerCount: compiled.usefulWorkerCount,
+    scoutCount: 0,
+    namedUnknowns: [],
+  })
+  assert.equal(topology.valid, true, JSON.stringify(topology.errors))
+  assert.deepEqual(topology, compiled.topology)
+})
+
 test('automatic analyst prose cannot promote activation-target files or databases into external authority', () => {
   const externalAdvisory = recommendation()
   Object.assign(externalAdvisory.routeFactProposal, {

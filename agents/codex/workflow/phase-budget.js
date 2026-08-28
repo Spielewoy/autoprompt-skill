@@ -64,6 +64,8 @@ const {
   planCheckerSandboxes,
 } = require('./check-sandbox.js')
 const {
+  CAPTURED_DOMAIN_ADMISSION_PATH,
+  CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH,
   CODEX_PHYSICAL_EXECUTION_PATH,
   createAllWorkJoinedReceipt,
   createProductionPreMutationBaseline,
@@ -134,11 +136,13 @@ const CHECKER_REASSESSMENT_CODES = new Set([
 ])
 const FULL_EVIDENCE_CHECKER_REASSESSMENT_CODES = new Set([
   'CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE', 'INDEPENDENT_CHECK_RUNTIME_RETRY',
+  'CHECK_OBSERVATION_INCOMPLETE', 'CHECK_OBSERVATION_CONTRADICTION',
 ])
 const CHECKER_FALSIFICATION_DOCTRINE = Object.freeze([
   'Try to disprove every typed verification obligation against the frozen deliverable. Preserve each declared condition and finish the full assigned matrix after any failure.',
-  'For every exact named check ID, return one testOutcomes entry containing its command ID and PASS or FAIL status. Do not inspect Autoprompt transcripts or compute observationId, commandHash, or fingerprint: the controller owns those fields and adds them only when your report resolves to one exact admissible command receipt. PASS requires a unique zero exit bound to the exact version being checked; an authenticated nonzero test failure may bind FAIL and drive repair. One admissible exact-version harness may cover several IDs; failed setup, ambiguous receipts, inline-output/no-op commands, and writable-scratch reads cover none.',
+  'For every exact named check ID, return one testOutcomes entry containing that check ID and PASS or FAIL status. Do not report tool-call IDs or chunk IDs, inspect Autoprompt transcripts, or compute observationId, commandHash, or fingerprint: the controller owns execution identity and adds it only when your report resolves to one exact admissible command receipt. PASS requires a unique zero exit bound to the exact version being checked; an authenticated nonzero test failure may bind FAIL and drive repair. One admissible exact-version harness may cover several IDs; failed setup, ambiguous receipts, inline-output/no-op commands, and writable-scratch reads cover none.',
   'Return the consumed underlying identifiers in evidenceIds and an allowed referenceMethod. Populate every required invariant category from an independent source, property, strongest available consumer, or independently derived observable result; never derive expected behavior from the implementation being checked.',
+  'Build an independent requirement-by-requirement expected-result basis before accepting the implementation. Exercise exact boundaries, adversarial and negative cases, and any declared ordering, optimization, maximality, or global-selection rule; a self-authored happy-path validator that merely restates the exact version being checked is not independent evidence.',
   'If a required consumer or independent check is unavailable, return CHECK_INCONCLUSIVE or RUNTIME_FAILURE instead of implementation FAIL unless that dependency is a required deliverable. A missing applicable witness is never PASS.',
   'Keep large evidence in scratch and return only bounded diagnostics, hashes, or authenticated pointers.',
 ])
@@ -715,6 +719,49 @@ function canonicalizeCheckerVerificationLimitation(result) {
   }
 }
 
+function controllerVerificationLimitation(result, input = {}) {
+  const sourcePayload = result && result.payload && typeof result.payload === 'object' &&
+    !Array.isArray(result.payload) ? result.payload : {}
+  if (Object.prototype.hasOwnProperty.call(sourcePayload, 'verificationLimitation')) {
+    return checkerResultHasExactVerificationLimitation(result)
+      ? canonicalizeCheckerVerificationLimitation(result) : null
+  }
+  // Validate the original report before replacing its controller-facing cause.
+  // Otherwise a cause-only ASSERTION_FAILED could be erased while manufacturing
+  // a capability limitation from the same report.
+  if (result && result.code === 'FAIL' ||
+      explicitFindingIds(result, sourcePayload, result && result.cause).length > 0 ||
+      containsStructuredFailureEvidence([
+    result && result.cause,
+    result && result.completedResults,
+    result && result.commands,
+    sourcePayload,
+  ])) return null
+  const capabilityId = typeof input.capabilityId === 'string' && input.capabilityId
+    ? input.capabilityId : 'autoprompt.independent-check-convergence'
+  const candidate = canonicalizeCheckerVerificationLimitation({
+    ...(result && typeof result === 'object' ? result : {}),
+    code: 'CHECK_INCONCLUSIVE',
+    cause: {
+      event: 'DEPENDENCY_UNAVAILABLE',
+      reason: typeof input.reason === 'string' && input.reason
+        ? input.reason
+        : 'the bounded independent check did not produce authoritative acceptance evidence',
+      unblockPath: null,
+    },
+    payload: {
+      ...sourcePayload,
+      verificationLimitation: {
+        kind: 'CAPABILITY_UNAVAILABLE',
+        capabilityId,
+        explicitUserDeliverable: false,
+        observedVersionDefectIds: [],
+      },
+    },
+  })
+  return checkerResultHasExactVerificationLimitation(candidate) ? candidate : null
+}
+
 function canonicalizeCheckerTerminalResult(result) {
   const canonical = canonicalizeCheckerVerificationLimitation(result)
   const outcomes = canonical && canonical.payload && canonical.payload.testOutcomes
@@ -990,6 +1037,9 @@ function checkerRecoveryNextReady(workItemId, result, disposition = null) {
   const code = result && result.code
   if ((/^independent-check-\d+/u.test(id) || /^roadmap-plan-(?:check|recheck)$/u.test(id)) &&
       checkerResultIsStructurallyUnboundPass(result)) {
+    if (disposition && disposition.nonAuthoritativeRetryId) {
+      return [disposition.nonAuthoritativeRetryId]
+    }
     return disposition && disposition.stableLimitationNextReadyId
       ? [disposition.stableLimitationNextReadyId] : []
   }
@@ -1091,11 +1141,12 @@ function authoritativeRequestNextReady(logicalRole, result, request = {}, comple
 function checkerDispositionSettlesNonAuthoritative(request = {}, result = null) {
   const disposition = request.checkerRecoveryDisposition
   return Boolean(
-    checkerResultIsStructurallyUnboundPass(result) ||
+    (checkerResultIsStructurallyUnboundPass(result) &&
+      (!disposition || disposition.nonAuthoritativeRetryId === null)) ||
     checkerResultRequiresScratchConfirmation(result) ||
-    disposition &&
+    (disposition &&
     disposition.nonAuthoritativeRetryId === null &&
-    result && !['PASS', 'FAIL'].includes(result.code),
+    result && !['PASS', 'FAIL'].includes(result.code)),
   )
 }
 
@@ -5223,10 +5274,10 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
   // substantive nonzero receipt is sufficient to reject the exact version;
   // an accidental aggregate PASS must not erase it or buy another checker
   // turn. Positive cases may remain unbound because they are irrelevant to
-  // the already-proved negative verdict, but every claimed failure must bind.
-  const authenticatedAggregateFailure = output.code === 'PASS' &&
-    hasCommandBoundFailure && unboundFailureCheckIds.length === 0 &&
-    !invalidOutcome && evidence && evidence.boundsExceeded !== true &&
+  // the already-proved negative verdict. Extra malformed or unbound claims
+  // remain diagnostics; they cannot erase the controller-bound failure.
+  const authenticatedAggregateFailure = hasCommandBoundFailure &&
+    evidence && evidence.boundsExceeded !== true &&
     evidence.invalidCount === 0 && conflictingCommandHashes.length === 0
   // PASS authority remains strict: every named case needs a successful,
   // candidate-bound observation. A FAIL may leave positive coverage incomplete
@@ -5294,12 +5345,13 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
         verificationObservationDisposition: Object.freeze({
           bindingHash: binding.bindingHash,
           evidenceHash: evidence.evidenceHash || null,
-          reportedAggregateCode: 'PASS',
+          reportedAggregateCode: output.code,
           controllerAggregateCode: 'FAIL',
           missingCheckIds: Object.freeze(missing.slice(0, CODEX_CHECK_OBSERVATION_MAX_CASES)),
           commandBoundFailureCheckIds: Object.freeze(commandBoundFailureCheckIds
             .slice(0, CODEX_CHECK_OBSERVATION_MAX_CASES)),
-          unboundFailureCheckIds: Object.freeze([]),
+          unboundFailureCheckIds: Object.freeze(unboundFailureCheckIds
+            .slice(0, CODEX_CHECK_OBSERVATION_MAX_CASES)),
           conflictingCommandHashes: Object.freeze([]),
         }),
       }),
@@ -9229,6 +9281,9 @@ class CodexSupervisorRuntime {
   }
 
   async _runL0Decision(analysis, adoptedRoot = null) {
+    if (this.options.deterministicRouteDecision === true && !adoptedRoot) {
+      return this._runDeterministicL0Decision(analysis)
+    }
     const startedAt = this.now()
     const admissionStartedAt = this.monotonicNow()
     const rootSessionId = `${this.activation.id}:root-route-decision`
@@ -9607,6 +9662,110 @@ class CodexSupervisorRuntime {
       }
       return finish(result)
     }
+  }
+
+  async _runDeterministicL0Decision(analysis) {
+    const admissionStartedAt = this.monotonicNow()
+    const finish = result => {
+      // The pending scheduler still requires one closed L0 accounting seat
+      // before route freeze. Close an explicit zero-usage seat only after all
+      // deterministic computation and durable transitions are complete. No
+      // model session, continuation, or crash binding exists at any exposed
+      // checkpoint boundary.
+      const rootLease = this.scheduler.beginRootAccounting({
+        phase: 'routeDecision',
+        sessionId: this.rootCallers.runOwner.sessionId,
+      })
+      rootLease.reportUsage({
+        noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0,
+      })
+      rootLease.complete({})
+      this._recordAdmissionComponent(
+        'routeDecision',
+        Math.max(0, this.monotonicNow() - admissionStartedAt),
+      )
+      return result
+    }
+    const conservativeCompletion = causeCode => ({
+      decision: compileConservativeCompletionDecision({
+        requestedResult: this.canonicalMissionProjection.canonicalMission,
+        requestEnvelopeHash: this.requestPointer.hash,
+        targetIdentity: this.options.targetIdentity,
+        providerCapabilities: this.providerCapabilities,
+        budget: this.budget.status({ forWork: true }),
+        nowMs: this.now(),
+        causeCode,
+        descriptiveRecommendation: analysis && (analysis.recommendation || analysis),
+      }),
+      submittedAtMs: this.now(),
+      usage: { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 },
+      usageStreamed: true,
+    })
+    const evaluate = (submitted, correctionAttempts) => {
+      const observedAt = this.monotonicNow()
+      return evaluateL0Decision({
+        startedAtMs: admissionStartedAt,
+        submittedAtMs: observedAt,
+        nowMs: observedAt,
+        decision: submitted && submitted.decision,
+        requestText: this.options.mission,
+        correctionAttempts,
+        environment: this.options.baseEnvironment || process.env,
+      })
+    }
+
+    let submitted
+    try {
+      submitted = await this.options.decideRoute({
+        analysis,
+        correctionAttempts: 0,
+        requestPointer: this.requestPointer,
+        settings: this.settings,
+        route: null,
+        sessionId: null,
+        continuationId: null,
+      })
+    } catch (error) {
+      if (!error || ![
+        'ROUTE_DECISION_TIMEOUT', 'ROUTE_DECISION_INVALID', 'WAITING_USER',
+        ...PROVIDER_TRANSPORT_AVAILABILITY_CODES,
+      ].includes(error.code)) throw error
+      submitted = conservativeCompletion(error.code)
+    }
+
+    let result = evaluate(submitted, 0)
+    if (result.status === 'ROUTE_DECISION_INVALID') {
+      // A deterministic compiler cannot improve by repeating the same model-
+      // free calculation. Record the rejected projection, then immediately use
+      // the already-tested conservative completion graph. Crucially, no model
+      // root lease exists while this checkpoint is exported.
+      await this._runtimeTransition('ROUTE_DECISION_INVALID_FIRST', 'L0_ROUTE_DECISION')
+      submitted = conservativeCompletion('DETERMINISTIC_ROUTE_DECISION_INVALID')
+      result = evaluate(submitted, 1)
+    }
+    if (result.status === 'WAITING_USER' &&
+        !automaticWaitingRequiresUserAuthority(
+          analysis,
+          this.options.verifyAutomaticWaitingAuthority,
+        )) {
+      submitted = conservativeCompletion('MODEL_WAITING_USER_COLLAPSED')
+      result = evaluate(submitted, 1)
+    }
+    if (!result.start_workers && result.status !== 'WAITING_USER') {
+      submitted = conservativeCompletion(result.status)
+      result = evaluate(submitted, 1)
+    }
+    if (result.decision && this.record && typeof this.record.write === 'function') {
+      writeRouteDecisionArtifacts(this.record, result.decision)
+    }
+    if (!result.start_workers) {
+      if (result.status === 'WAITING_USER') {
+        await this._runtimeTransition('ROUTE_DECISION_NEEDS_USER', 'WAITING_USER')
+      } else {
+        await this._runtimeTransition('ROUTE_DECISION_INVALID_FINAL', 'RELEASING_LOCK')
+      }
+    }
+    return finish(result)
   }
 
   _activateRouteScheduler(
@@ -17916,10 +18075,10 @@ function createDefaultRouteExecutor(options) {
         ? `independent-check-${checkerIndex + 2}` +
           (activeRepairAttempt > 0 ? `-repair-${activeRepairAttempt}` : '')
         : null
-      const expectedNext = structurallyUnboundPass
-        ? nextRequiredCheckerId ? [nextRequiredCheckerId] : []
-        : sourceKind === 'retry'
+      const expectedNext = sourceKind === 'retry'
           ? [`${checkerId}-runtime-retry-1`]
+        : structurallyUnboundPass
+          ? nextRequiredCheckerId ? [nextRequiredCheckerId] : []
           : result.code === 'PASS'
             ? nextRequiredCheckerId ? [nextRequiredCheckerId] : []
             : nonAuthoritative
@@ -17941,11 +18100,8 @@ function createDefaultRouteExecutor(options) {
       const legacyCapabilityRepair = legacyCapabilityOnlyFail &&
         stableStringify(resumedNextReady) ===
           stableStringify([`work-1-repair-${activeRepairAttempt + 1}`])
-      // f1de11a persisted a report-only retry for a PASS whose command
-      // observations were structurally unbound. The controller must keep that
-      // PASS non-authoritative, but recovery must not spend another full
-      // checker turn merely to correct the report shape. Collapse an already
-      // durable retry frontier while retaining the frozen candidate.
+      // Accept the historical f1de11a continuation spelling while upgrading it
+      // to the current fresh-evidence retry on resume.
       const legacyStructuralPassRetry = structurallyUnboundPass &&
         stableStringify(resumedNextReady) ===
           stableStringify([`${checkerId}-runtime-retry-1`])
@@ -17958,8 +18114,8 @@ function createDefaultRouteExecutor(options) {
         )
       }
       return Object.freeze({
-        kind: structurallyUnboundPass ? 'structural'
-          : sourceKind === 'retry' ? 'retry'
+        kind: sourceKind === 'retry' ? 'retry'
+          : structurallyUnboundPass ? 'structural'
           : result.code === 'PASS' ? 'accepted'
           : nonAuthoritative ? 'non-authoritative'
           : repairEligible ? 'repair' : 'terminal',
@@ -18985,7 +19141,6 @@ function createDefaultRouteExecutor(options) {
       regressionOutcomeGroups.length = 0
       capturedDomainOutcomes.length = 0
       const implementationFailures = []
-      const structurallyUnboundPassReports = []
       const exhaustedNonAuthoritativeReports = []
       const provisionalScratchPassReports = []
       const scratchConfirmationByPrimary = new Map()
@@ -19011,7 +19166,6 @@ function createDefaultRouteExecutor(options) {
       let reusedControllerResult = false
       let recoveredDurableResult = false
       let stableCapabilityLimitation = false
-      let structurallyUnboundPassReport = false
       let provisionalScratchPassReport = false
       let exhaustedNonAuthoritativeReport = false
       let acceptedCanonicalTestOutcomes = null
@@ -19030,6 +19184,9 @@ function createDefaultRouteExecutor(options) {
         const retryReason = checkerRuntimeReasons[index]
         const reportOnlyCorrection = retryAttempt > 0 && retryReason &&
           !FULL_EVIDENCE_CHECKER_REASSESSMENT_CODES.has(retryReason.code)
+        const freshEvidenceReassessment = retryAttempt > 0 && retryReason &&
+          ['CHECK_OBSERVATION_INCOMPLETE', 'CHECK_OBSERVATION_CONTRADICTION']
+            .includes(retryReason.code)
         if (reportOnlyCorrection &&
             (!Array.isArray(retryReason.invalidFieldIds) ||
              !Array.isArray(retryReason.checkIds))) {
@@ -19071,11 +19228,13 @@ function createDefaultRouteExecutor(options) {
           : [],
         ...(retryAttempt > 0 ? {
           executorKey: checkerAttemptId,
-          forkTurns: 1,
-          recoveryContext: {
-            type: 'bounded-recovery',
-            code: retryReason && retryReason.code || 'INDEPENDENT_CHECK_RUNTIME_RETRY',
-          },
+          forkTurns: freshEvidenceReassessment ? 'none' : 1,
+          ...(freshEvidenceReassessment ? {} : {
+            recoveryContext: {
+              type: 'bounded-recovery',
+              code: retryReason && retryReason.code || 'INDEPENDENT_CHECK_RUNTIME_RETRY',
+            },
+          }),
         } : {}),
         assignment: reportOnlyCorrection
           ? `Correct only the bounded checker report fields named by fetchedEvidence.controllerReportCorrection. Reuse the prior exact-version observations; do not rerun tools, inspect the exact version being checked again, or repeat the full verification matrix. Return the corrected report fields and preserve every already-valid field.${boundedToolOutputDiscipline}`
@@ -19085,7 +19244,9 @@ function createDefaultRouteExecutor(options) {
             ? ` The frozen exact version being checked has no workspace file delta. Independently verify whether fetchedEvidence.structuredFinalResponse itself satisfies the user request${finalResponse.evidencePointer ? ' by reading its exact evidence pointer' : ''}. PASS authorizes the response; a concrete unmet edit or deliverable obligation is FAIL.`
             : ''}` +
           `${retryReason
-            ? ` Correct the prior non-authoritative report identified by ${retryReason.code}; use distinct underlying evidence when another checker conflict is named.`
+            ? freshEvidenceReassessment
+              ? ` Independently reassess the frozen exact version because the prior PASS lacked admissible observation coverage (${retryReason.code}). Start from the requirements, use a fresh expected-result basis and fresh harness, and do not reuse or merely correct the prior checker report.`
+              : ` Correct the prior non-authoritative report identified by ${retryReason.code}; use distinct underlying evidence when another checker conflict is named.`
             : ''}` +
           ' Apply fetchedEvidence.verificationDoctrine exactly to its named checks and verification obligations.' +
           boundedToolOutputDiscipline,
@@ -19284,22 +19445,6 @@ function createDefaultRouteExecutor(options) {
           }
           break
         }
-        if (nonAuthoritative && retryAttempt === 0 && structurallyUnboundPass) {
-          // The strict observation boundary already rejected this PASS. A
-          // second turn with the same full checker capability only asks the
-          // model to repair its report shape and caused the f1de11a cost
-          // regression; it does not add independent product evidence. Retain
-          // the non-authoritative report while every already-required distinct
-          // checker seat still examines the same frozen candidate.
-          checkerRuntimeProgressHashes[index] = rawCheckerResultHash
-          structurallyUnboundPassReports.push(Object.freeze({
-            checkerId: workItemId,
-            result,
-            checkerResultHash: rawCheckerResultHash,
-          }))
-          structurallyUnboundPassReport = true
-          break
-        }
         if (nonAuthoritative && retryAttempt === 0 && sameEnvironmentCapabilityUnavailable) {
           // Re-running the same checker in the same sandbox cannot create a
           // missing semantic consumer. Preserve the limitation and let every
@@ -19333,7 +19478,8 @@ function createDefaultRouteExecutor(options) {
           checkerRuntimeProgressHashes[index] = rawCheckerResultHash
           checkerReportCorrectionPriorResults[index] = result
           checkerRuntimeReasons[index] = canonicalCheckerReassessment({
-            code: controllerDefect || result.code,
+            code: structurallyUnboundPass
+              ? result.cause.event : controllerDefect || result.code,
             priorResultEvidenceHash: rawCheckerResultHash,
             ...(controllerDefect ? {
               invalidFieldIds: reportCorrectionInvalidFieldIds,
@@ -19352,6 +19498,56 @@ function createDefaultRouteExecutor(options) {
           })
           checkerRuntimeRetries[index] = 1
           continue
+        }
+        if (nonAuthoritative && retryAttempt > 0 && structurallyUnboundPass) {
+          const controllerReason = result.cause.event
+          const controllerReassessment = canonicalCheckerReassessment({
+            code: controllerReason,
+            priorResultEvidenceHash: rawCheckerResultHash,
+          }, { resultHash: rawCheckerResultHash, checkerId: workItemId })
+          if (retryDispositionTransitionPending) {
+            await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
+              candidateHash,
+              checkerId: workItemId,
+              checkerResultHash: rawCheckerResultHash,
+              retryAttempt,
+              controllerReason,
+              terminalDisposition: 'CHECK_INCONCLUSIVE',
+              controllerReassessment,
+              nextReadyWorkIds: index + 1 < checkerCount
+                ? [`independent-check-${index + 2}` +
+                  (checkerRepairAttempt > 0 ? `-repair-${checkerRepairAttempt}` : '')]
+                : [],
+            })
+          }
+          // Two bounded, independent attempts reported no concrete version
+          // defect but could not produce an admissible complete observation
+          // matrix. Preserve that limitation explicitly and release the usable
+          // candidate to any external acceptance authority instead of turning
+          // checker-report mechanics into a task-level PARTIAL stop.
+          const boundedLimitation = controllerVerificationLimitation(result, {
+            capabilityId: 'autoprompt.independent-check-observation',
+            reason: 'two bounded independent checks could not bind a complete acceptance observation matrix',
+          })
+          if (boundedLimitation) {
+            result = boundedLimitation
+            stableCapabilityLimitation = true
+          } else {
+            // Never let a controller fallback erase concrete failure evidence
+            // embedded in a contradictory checker report. Keep the candidate
+            // frozen and expose the unresolved report through the ordinary
+            // bounded inconclusive path.
+            exhaustedNonAuthoritativeReports.push(Object.freeze({
+              checkerId: workItemId,
+              result,
+              checkerResultHash: rawCheckerResultHash,
+              controllerReason,
+              retryAttempt,
+              controllerReassessment,
+            }))
+            exhaustedNonAuthoritativeReport = true
+          }
+          break
         }
         if (nonAuthoritative) {
           const controllerReason = controllerDefect || 'INDEPENDENT_CHECK_RUNTIME_RETRY'
@@ -19432,7 +19628,6 @@ function createDefaultRouteExecutor(options) {
         break
       }
       if (provisionalScratchPassReport) continue
-      if (structurallyUnboundPassReport) continue
       if (exhaustedNonAuthoritativeReport) continue
       if (stableCapabilityLimitation) {
         result = canonicalizeCheckerVerificationLimitation(result)
@@ -19980,25 +20175,48 @@ function createDefaultRouteExecutor(options) {
         }
       }
       const unresolvedNonAuthoritativeReports = [
-        ...structurallyUnboundPassReports.map(report => {
-          const reassessmentCode = report.result.cause.event
-          return Object.freeze({
-            ...report,
-            controllerReason: reassessmentCode,
-            retryAttempt: 1,
-            controllerReassessment: canonicalCheckerReassessment({
-              code: reassessmentCode,
-              priorResultEvidenceHash: report.checkerResultHash,
-            }, {
-              resultHash: report.checkerResultHash,
-              checkerId: report.checkerId,
-            }),
-          })
-        }),
         ...exhaustedNonAuthoritativeReports,
       ].sort((left, right) => left.checkerId.localeCompare(right.checkerId))
-      if (unresolvedNonAuthoritativeReports.length > 0) {
-        const primary = unresolvedNonAuthoritativeReports[0]
+      const reportsWithConcreteDefectEvidence = []
+      for (const report of unresolvedNonAuthoritativeReports) {
+        const seat = /^independent-check-(\d+)/u.exec(report.checkerId || '')
+        const index = seat ? Number(seat[1]) - 1 : -1
+        const limitationResult = controllerVerificationLimitation(report.result, {
+          reason: 'the bounded checker retry ended without authoritative acceptance evidence or a concrete version defect',
+        })
+        if (!limitationResult || index < 0 || index >= checkerCount) {
+          reportsWithConcreteDefectEvidence.push(report)
+          continue
+        }
+        const resultHash = hashText(stableStringify(limitationResult))
+        const capabilityId = limitationResult.payload.verificationLimitation.capabilityId
+        verificationLimitations.push(Object.freeze({
+          checkerId: report.checkerId,
+          result: limitationResult,
+          resultHash,
+        }))
+        checkHashes[index] = resultHash
+        independentVerdicts[index] = {
+          kind: index === 0 ? 'independent-review' : 'independent-verification',
+          status: 'FAIL',
+          verdictHash: resultHash,
+          evidenceIds: [`verification-limitation:${capabilityId}`],
+        }
+        checkerEvidenceConsumptions[index] = null
+        delete regressionOutcomeGroups[index]
+        if (pendingTerminalNonAuthoritativeRetry &&
+            pendingTerminalNonAuthoritativeRetry.checkerId === report.checkerId) {
+          await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
+            candidateHash,
+            ...pendingTerminalNonAuthoritativeRetry,
+            terminalDisposition: 'CHECK_INCONCLUSIVE',
+            nextReadyWorkIds: [],
+          })
+          pendingTerminalNonAuthoritativeRetry = null
+        }
+      }
+      if (reportsWithConcreteDefectEvidence.length > 0) {
+        const primary = reportsWithConcreteDefectEvidence[0]
         return preserveInconclusiveCandidate(
           primary.checkerId,
           primary.result,
@@ -20034,11 +20252,42 @@ function createDefaultRouteExecutor(options) {
             affectedIndex >= checkerCount) throw error
         const accepted = checkerControllerAcceptedResults[affectedIndex]
         if (correctionConsumedFor(accepted && accepted.workItemId || affectedId)) {
-          return preserveInconclusiveCandidate(
-            accepted && accepted.workItemId || affectedId,
+          const limitationResult = controllerVerificationLimitation(
             accepted && accepted.result,
-            error.code,
+            {
+              reason: `the bounded checker report correction did not resolve ${error.code} without reusing non-independent evidence`,
+            },
           )
+          // Exhausting a report-only correction is not evidence that the
+          // frozen candidate is defective.  Keep concrete FAIL observations
+          // authoritative (the limitation constructor rejects them), but do
+          // not discard a usable implementation merely because a checker
+          // could not supply a second independent proof identity.
+          if (!limitationResult) {
+            return preserveInconclusiveCandidate(
+              accepted && accepted.workItemId || affectedId,
+              accepted && accepted.result,
+              error.code,
+            )
+          }
+          const resultHash = hashText(stableStringify(limitationResult))
+          const checkerId = accepted && accepted.workItemId || affectedId
+          const capabilityId = limitationResult.payload.verificationLimitation.capabilityId
+          verificationLimitations.push(Object.freeze({
+            checkerId,
+            result: limitationResult,
+            resultHash,
+          }))
+          checkHashes[affectedIndex] = resultHash
+          independentVerdicts[affectedIndex] = {
+            kind: affectedIndex === 0 ? 'independent-review' : 'independent-verification',
+            status: 'FAIL',
+            verdictHash: resultHash,
+            evidenceIds: [`verification-limitation:${capabilityId}`],
+          }
+          checkerEvidenceConsumptions[affectedIndex] = null
+          delete regressionOutcomeGroups[affectedIndex]
+          checkerControllerAcceptedResults[affectedIndex] = null
         } else {
           const evidenceHash = hashText(stableStringify(accepted && accepted.result || null))
           const reportCorrectionBinding = rememberCorrectionBinding(accepted.workItemId)
@@ -21076,6 +21325,141 @@ function createSupervisorOptions(args = {}, context = {}) {
   options.activationReceipt = activation
   options.entryPrompt = activation.entryPrompt
   return options
+}
+
+function persistCapturedDomainAdmissionTransaction(input = {}) {
+  const record = input.record
+  const stateStore = input.stateStore
+  const capability = input.capability
+  const admission = input.admission
+  const runId = input.runId
+  const generation = input.generation
+  if (!record || typeof record.resolve !== 'function' || typeof record.write !== 'function' ||
+      !stateStore || !stateStore.eventLog || typeof stateStore.eventLog.readAll !== 'function' ||
+      typeof stateStore.record !== 'function' || !capability ||
+      typeof runId !== 'string' || !runId || !Number.isSafeInteger(generation) || generation < 1 ||
+      !admission || typeof admission !== 'object' || Array.isArray(admission)) {
+    throw new SupervisorIntegrationError(
+      'RUN_RECORD_FAILURE',
+      'captured-domain admission requires the opened run record and authenticated runtime state',
+    )
+  }
+  const admissionPath = record.resolve(CAPTURED_DOMAIN_ADMISSION_PATH)
+  const receiptPath = record.resolve(CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH)
+  const canonicalAdmissionBytes = Buffer.from(`${JSON.stringify(admission, null, 2)}\n`)
+  let admissionBytes
+  if (fs.existsSync(admissionPath)) {
+    admissionBytes = fs.readFileSync(admissionPath)
+    const reopenedAdmission = JSON.parse(admissionBytes.toString('utf8'))
+    if (stableStringify(reopenedAdmission) !== stableStringify(admission) ||
+        !admissionBytes.equals(canonicalAdmissionBytes)) {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'durable captured-domain admission differs from its exact pre-work controller bytes',
+      )
+    }
+  } else {
+    admissionBytes = canonicalAdmissionBytes
+  }
+  const receiptBody = Object.freeze({
+    schemaVersion: 1,
+    kind: 'codex-captured-domain-pre-work-admission',
+    runId,
+    generation,
+    admissionHash: admission.admissionHash,
+    admissionFileHash: sha256Bytes(admissionBytes),
+    requestEnvelopeHash: admission.requestEnvelopeHash,
+    routeDecisionHash: admission.routeDecisionHash,
+    targetStateHash: admission.targetStateHash,
+    imageCertificateHashes: Object.freeze((admission.contracts || [])
+      .filter(contract => contract && contract.kind === 'IMAGE_DATUM')
+      .map(contract => contract.certificateHash)
+      .sort()),
+  })
+  const receipt = Object.freeze({
+    ...receiptBody,
+    receiptHash: hashText(stableStringify(receiptBody)),
+  })
+
+  // Each durable step is idempotent. A crash after either file write, or after
+  // the append-only state event was committed but before it returned, resumes
+  // by validating the exact bytes already present and completing only the
+  // missing suffix of the transaction.
+  if (fs.existsSync(receiptPath)) {
+    const saved = readRegularJson(
+      receiptPath,
+      'captured-domain pre-work admission receipt',
+    ).parsed
+    if (stableStringify(saved) !== stableStringify(receipt)) {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'captured-domain pre-work admission receipt changed after its first durable record',
+      )
+    }
+  }
+  if (!fs.existsSync(admissionPath)) {
+    record.write(CAPTURED_DOMAIN_ADMISSION_PATH, canonicalAdmissionBytes)
+    admissionBytes = fs.readFileSync(admissionPath)
+    if (sha256Bytes(admissionBytes) !== receipt.admissionFileHash) {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'recovered captured-domain admission bytes differ from their durable receipt',
+      )
+    }
+  }
+  if (!fs.existsSync(receiptPath)) {
+    record.write(
+      CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH,
+      `${JSON.stringify(receipt, null, 2)}\n`,
+    )
+  }
+
+  const admissionEvents = stateStore.eventLog.readAll().filter(event =>
+    event && event.type === 'CAPTURED_DOMAIN_ADMISSION_RECORDED' &&
+    event.generation === generation)
+  const eventMatches = event => event.details &&
+    event.details.admissionReceiptHash === receipt.receiptHash &&
+    event.details.admissionFileHash === receipt.admissionFileHash &&
+    event.details.routeDecisionHash === receipt.routeDecisionHash &&
+    event.details.targetStateHash === receipt.targetStateHash
+  if (admissionEvents.length > 1 || admissionEvents.some(event => !eventMatches(event))) {
+    throw new SupervisorIntegrationError(
+      'CRASH_ADOPTION_CONFLICT',
+      'captured-domain admission state-event history differs from the one exact durable binding',
+    )
+  }
+  let event = admissionEvents[0] || null
+  if (!event) {
+    stateStore.record('CAPTURED_DOMAIN_ADMISSION_RECORDED', {
+      capability,
+      cause: 'Bind the immutable captured-domain certificate before any product role launch.',
+      details: {
+        admissionReceiptHash: receipt.receiptHash,
+        admissionFileHash: receipt.admissionFileHash,
+        routeDecisionHash: receipt.routeDecisionHash,
+        targetStateHash: receipt.targetStateHash,
+      },
+    })
+    event = stateStore.eventLog.readAll().find(candidate =>
+      candidate && candidate.type === 'CAPTURED_DOMAIN_ADMISSION_RECORDED' &&
+      candidate.generation === generation && candidate.details &&
+      candidate.details.admissionReceiptHash === receipt.receiptHash &&
+      candidate.details.admissionFileHash === receipt.admissionFileHash &&
+      candidate.details.routeDecisionHash === receipt.routeDecisionHash &&
+      candidate.details.targetStateHash === receipt.targetStateHash)
+  }
+  if (!event || !/^[a-f0-9]{64}$/u.test(event.hash || '') ||
+      !Number.isSafeInteger(event.sequence) || event.sequence < 1) {
+    throw new SupervisorIntegrationError(
+      'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
+      'captured-domain pre-work admission lacks its authenticated state-event binding',
+    )
+  }
+  return Object.freeze({
+    ...receipt,
+    stateEventHash: event.hash,
+    stateEventSequence: event.sequence,
+  })
 }
 
 function createDefaultRuntimeOptions(input) {
@@ -22698,6 +23082,7 @@ function createDefaultRuntimeOptions(input) {
       })
     },
     l0ViaScheduler: false,
+    deterministicRouteDecision: true,
     decideRoute: async ({ analysis, requestPointer }) => {
       const recommendation = analysis && analysis.recommendation || analysis
       if (recommendation && recommendation.preWorkResult === 'CONTINUE') {
@@ -23346,101 +23731,13 @@ function createDefaultRuntimeOptions(input) {
       })
     },
     writeCapturedDomainAdmission(admission) {
-      if (!recordRef || !stateStore || !leaseRef) {
-        throw new SupervisorIntegrationError(
-          'RUN_RECORD_FAILURE',
-          'captured-domain admission requires the opened run record and authenticated runtime state',
-        )
-      }
-      const admissionRelative = 'work/captured-domain-admission.json'
-      const receiptRelative = 'work/captured-domain-admission-receipt.json'
-      const admissionPath = recordRef.resolve(admissionRelative)
-      const receiptPath = recordRef.resolve(receiptRelative)
-      const admissionWasDurable = fs.existsSync(admissionPath)
-      const receiptWasDurable = fs.existsSync(receiptPath)
-      if (admissionWasDurable !== receiptWasDurable) {
-        throw new SupervisorIntegrationError(
-          'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
-          'pre-work captured-domain admission and its authenticated receipt must become recoverable together',
-        )
-      }
-      recordRef.write(admissionRelative, `${JSON.stringify(admission, null, 2)}\n`)
-      const admissionBytes = fs.readFileSync(admissionPath)
-      const reopenedAdmission = JSON.parse(admissionBytes.toString('utf8'))
-      if (stableStringify(reopenedAdmission) !== stableStringify(admission)) {
-        throw new SupervisorIntegrationError(
-          'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
-          'durable captured-domain admission differs from its pre-work controller bytes',
-        )
-      }
-      const receiptBody = Object.freeze({
-        schemaVersion: 1,
-        kind: 'codex-captured-domain-pre-work-admission',
+      return persistCapturedDomainAdmissionTransaction({
+        record: recordRef,
+        stateStore,
+        capability: leaseRef,
         runId: activation.runId,
         generation,
-        admissionHash: admission.admissionHash,
-        admissionFileHash: sha256Bytes(admissionBytes),
-        requestEnvelopeHash: admission.requestEnvelopeHash,
-        routeDecisionHash: admission.routeDecisionHash,
-        targetStateHash: admission.targetStateHash,
-        imageCertificateHashes: Object.freeze(admission.contracts
-          .filter(contract => contract && contract.kind === 'IMAGE_DATUM')
-          .map(contract => contract.certificateHash)
-          .sort()),
-      })
-      const receipt = Object.freeze({
-        ...receiptBody,
-        receiptHash: hashText(stableStringify(receiptBody)),
-      })
-      if (fs.existsSync(receiptPath)) {
-        const saved = readRegularJson(receiptPath, 'captured-domain pre-work admission receipt').parsed
-        if (stableStringify(saved) !== stableStringify(receipt)) {
-          throw new SupervisorIntegrationError(
-            'CRASH_ADOPTION_CONFLICT',
-            'captured-domain pre-work admission receipt changed after its first durable record',
-          )
-        }
-      } else {
-        recordRef.write(receiptRelative, `${JSON.stringify(receipt, null, 2)}\n`)
-      }
-      const matchingEvent = () => stateStore.eventLog.readAll().find(event =>
-        event && event.type === 'CAPTURED_DOMAIN_ADMISSION_RECORDED' &&
-        event.generation === generation && event.details &&
-        event.details.admissionReceiptHash === receipt.receiptHash &&
-        event.details.admissionFileHash === receipt.admissionFileHash &&
-        event.details.routeDecisionHash === receipt.routeDecisionHash &&
-        event.details.targetStateHash === receipt.targetStateHash)
-      let event = matchingEvent()
-      if (receiptWasDurable && !event) {
-        throw new SupervisorIntegrationError(
-          'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
-          'a recovered captured-domain receipt lacks its original pre-work state-event binding',
-        )
-      }
-      if (!event) {
-        stateStore.record('CAPTURED_DOMAIN_ADMISSION_RECORDED', {
-          capability: leaseRef,
-          cause: 'Bind the immutable captured-domain certificate before any product role launch.',
-          details: {
-            admissionReceiptHash: receipt.receiptHash,
-            admissionFileHash: receipt.admissionFileHash,
-            routeDecisionHash: receipt.routeDecisionHash,
-            targetStateHash: receipt.targetStateHash,
-          },
-        })
-        event = matchingEvent()
-      }
-      if (!event || !/^[a-f0-9]{64}$/u.test(event.hash || '') ||
-          !Number.isSafeInteger(event.sequence) || event.sequence < 1) {
-        throw new SupervisorIntegrationError(
-          'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
-          'captured-domain pre-work admission lacks its authenticated state-event binding',
-        )
-      }
-      return Object.freeze({
-        ...receipt,
-        stateEventHash: event.hash,
-        stateEventSequence: event.sequence,
+        admission,
       })
     },
     writeCapturedDomainOutcomes(record) {
@@ -23610,6 +23907,7 @@ module.exports = {
   validateCanonicalMissionLaunch,
   modelVisibleDispatch,
   createDefaultRuntimeOptions,
+  persistCapturedDomainAdmissionTransaction,
   createArtifactCoverageContract,
   applyProductionRuntimeTransition,
   bindResidualRiskAuthorityReceipt,
