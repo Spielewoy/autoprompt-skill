@@ -4,6 +4,7 @@
 const crypto = require('node:crypto')
 const router = require('./router.js')
 const capturedDomain = require('./captured-domain.js')
+const { validateJsonSchema } = require('./json-schema-validator.js')
 const { ROUTES } = router
 const GATE_CONTRACT = require('../../contracts/gates.json')
 
@@ -16,19 +17,20 @@ const ROUTE_DECISION_SCHEMA_ID = ROUTE_DECISION_SCHEMA.$id
 const ROUTE_ANALYST_ADMISSION_SCHEMA_ID = 'autoprompt.route-analyst-admission.v2'
 const ROUTE_ANALYST_MAX_DURATION_MS = 2 * 60 * 1000
 const L0_DECISION_MAX_DURATION_MS = 4 * 60 * 1000
+const L0_DECISION_CONVERGENCE_WATCHDOG_MS = 30 * 60 * 1000
 const LIGHT_PLAN_MAX_DURATION_MS = 5 * 60 * 1000
 const MAX_LIGHT_PLAN_BULLETS = 15
+const ROUTE_TOPOLOGY_CHILD_CEILINGS = Object.freeze({ DIRECT: 9, LIGHT: 9, ROADMAP: 18 })
+const DETERMINISTIC_ROADMAP_EXECUTION_MODE = 'deterministic-roadmap-v1'
+const EXECUTABLE_CHECK_KIND = /^(?:command|oracle|adapter):[a-z0-9][a-z0-9._/-]*$/u
+const TYPED_CHECKER_METHOD = /^\[([^\]]+)\]\s+(.+)$/u
 
-function l0DecisionMaxDurationMs(environment = process.env) {
-  return environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
-    ? Number.POSITIVE_INFINITY
-    : L0_DECISION_MAX_DURATION_MS
+function l0DecisionMaxDurationMs() {
+  return L0_DECISION_MAX_DURATION_MS
 }
 
-function routeAnalystMaxDurationMs(environment = process.env) {
-  return environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
-    ? Number.POSITIVE_INFINITY
-    : ROUTE_ANALYST_MAX_DURATION_MS
+function routeAnalystMaxDurationMs() {
+  return ROUTE_ANALYST_MAX_DURATION_MS
 }
 
 const RECOMMENDATION_ARRAY_FIELDS = Object.freeze([
@@ -129,9 +131,13 @@ function defaultVerificationObligations(checks = []) {
     kind: 'invariant',
     statement: String(statement),
     cases: [
-      { id: 'positive', phase: 'ordinary', polarity: 'must-hold', precondition: 'valid requested input', expectedObservation: String(statement) },
-      { id: 'negative', phase: 'ordinary', polarity: 'must-not-hold', precondition: 'a forbidden or invalid counterpart', expectedObservation: 'the forbidden counterpart is rejected or remains absent' },
-      { id: 'boundary', phase: 'boundary', polarity: 'must-hold', precondition: 'the exact edge of the requested domain', expectedObservation: String(statement) },
+      {
+        id: 'expected',
+        phase: 'ordinary',
+        polarity: 'must-hold',
+        precondition: 'the named check is executed',
+        expectedObservation: String(statement),
+      },
     ],
   }))
 }
@@ -161,8 +167,8 @@ function canonicalVerificationObligations(supplied, fallbackChecks = []) {
     }
     const phases = new Set(cases.map(item => item.phase))
     const polarities = new Set(cases.map(item => item.polarity))
-    if (!polarities.has('must-hold') || !polarities.has('must-not-hold') ||
-        obligation.kind === 'invariant' && !phases.has('boundary') ||
+    const phasedActivation = obligation.kind === 'activation' || obligation.kind === 'ordered-activation'
+    if (phasedActivation && (!polarities.has('must-hold') || !polarities.has('must-not-hold')) ||
         obligation.kind === 'activation' &&
           !['inactive', 'boundary', 'active'].every(phase => phases.has(phase)) ||
         obligation.kind === 'ordered-activation' &&
@@ -173,115 +179,12 @@ function canonicalVerificationObligations(supplied, fallbackChecks = []) {
   return canonical
 }
 
-function securityParserVerificationObligation(requestedResult, force = false) {
-  const request = Array.isArray(requestedResult) ? requestedResult.join(' ') : String(requestedResult || '')
-  const parserOrMarkupSurface = /\b(?:html|svg|mathml|xml|dom|markup|saniti[sz](?:e|er|ation|ing)?|parser|filter|renderer|template|attribute|entit(?:y|ies)|encod(?:e|ed|er|ing)|escap(?:e|ed|ing))\b/iu.test(request)
-  const executableThreat = /\b(?:xss|javascript|script(?:ed|ing)?|executable|execut(?:e|ed|es|ing|ion)|on(?:click|error|load|focus|mouseover)|inject(?:ed|ion)?|bypass(?:ed|es|ing)?|unsafe|forbidden|payload)\b/iu.test(request)
-  if (!force && !(/\b(?:xss|html|javascript|saniti[sz](?:e|er|ation|ing)?|dom|markup|svg|mathml)\b/iu.test(request) ||
-      parserOrMarkupSurface && executableThreat)) return null
-  return Object.freeze({
-    id: 'security-parser-differentials',
-    kind: 'invariant',
-    statement: 'The shipped parser or filter preserves allowed content and rejects executable or policy-forbidden content across parser differentials.',
-    cases: [
-      { id: 'allowed-canonical', phase: 'ordinary', polarity: 'must-hold', precondition: 'canonical allowed content in the shipped runtime', expectedObservation: 'allowed content is preserved without introducing executable behavior' },
-      { id: 'alternate-encoding', phase: 'boundary', polarity: 'must-not-hold', precondition: 'the forbidden payload uses alternate entity, percent, Unicode, or escape encoding', expectedObservation: 'decoded executable or policy-forbidden behavior does not survive' },
-      { id: 'namespace-confusion', phase: 'boundary', polarity: 'must-not-hold', precondition: 'the payload crosses HTML, SVG, MathML, XML, or attribute namespace interpretation', expectedObservation: 'namespace switching cannot recover executable or policy-forbidden behavior' },
-      { id: 'malformed-reparse', phase: 'boundary', polarity: 'must-not-hold', precondition: 'malformed markup is repaired or reparsed by the actual shipped consumer', expectedObservation: 'error recovery cannot recover executable or policy-forbidden behavior' },
-      { id: 'mutation-after-filter', phase: 'intermediate', polarity: 'must-not-hold', precondition: 'safe-looking filtered output is mutated, decoded, or reparsed after the initial check', expectedObservation: 'post-filter mutation cannot activate executable or policy-forbidden behavior' },
-      { id: 'interaction-trigger', phase: 'active', polarity: 'must-not-hold', precondition: 'focus, click, navigation, load, error, animation, or another interaction activates the output', expectedObservation: 'interaction cannot trigger executable or policy-forbidden behavior' },
-    ],
-  })
-}
-
-function temporalVerificationObligation(requestedResult, forceKind = null) {
-  const request = Array.isArray(requestedResult) ? requestedResult.join(' ') : String(requestedResult || '')
-  const temporal = /\b(?:effective[- ](?:dat(?:e|ed)|from|at)|takes?[- ]effect|becomes?[- ]active|as[- ]of|valid[- ](?:from|to)|start(?:ing)?[- ](?:date|time)|end(?:ing)?[- ](?:date|time)|timestamp(?:ed)?|temporal(?:ly)?|before|after|until|since|type[- ]?2|slowly[- ]changing)\b/iu.test(request)
-  const explicitOrder = /\b(?:ordered?|in[- ]order|sequence[ds]?|sequential(?:ly)?|successive(?:ly)?|first\b.{0,80}\bthen|before\b.{0,80}\bafter)\b/iu.test(request)
-  const composed = /\b(?:transitive(?:ly)?|compos(?:e|es|ed|ing|ition)|chain(?:ed|ing)?|multi[- ]?hop|closure)\b/iu.test(request)
-  const kind = forceKind || (explicitOrder || temporal && composed
-    ? 'ordered-activation' : temporal ? 'activation' : null)
-  if (!kind) return null
-  if (kind === 'ordered-activation') {
-    return Object.freeze({
-      id: 'temporal-ordered-activation',
-      kind,
-      statement: 'Successive effective or ordered relationships activate only at their own boundaries, and composed behavior reflects exactly the relationships active at the observation point.',
-      cases: [
-        { id: 'before-first-boundary', phase: 'inactive', polarity: 'must-not-hold', precondition: 'the observation precedes the first effective or ordered boundary', expectedObservation: 'no later relationship or composed effect is active' },
-        { id: 'at-first-boundary', phase: 'boundary', polarity: 'must-hold', precondition: 'the observation is exactly at the first boundary', expectedObservation: 'the first relationship activates and no later relationship activates early' },
-        { id: 'between-boundaries', phase: 'intermediate', polarity: 'must-not-hold', precondition: 'the observation lies after the first boundary and before the next boundary', expectedObservation: 'later relationships and their composed effects remain inactive' },
-        { id: 'at-next-boundary', phase: 'boundary', polarity: 'must-hold', precondition: 'the observation is exactly at the next successive boundary', expectedObservation: 'that relationship activates and composes with exactly the already active relationships' },
-        { id: 'after-final-boundary', phase: 'active', polarity: 'must-hold', precondition: 'the observation follows every applicable boundary', expectedObservation: 'the complete ordered composition is active and deterministic' },
-      ],
-    })
-  }
-  return Object.freeze({
-    id: 'temporal-activation-boundaries',
-    kind: 'activation',
-    statement: 'Time-qualified behavior is inactive before its effective boundary and active from the exact boundary onward.',
-    cases: [
-      { id: 'before-boundary', phase: 'inactive', polarity: 'must-not-hold', precondition: 'the observation precedes the effective boundary', expectedObservation: 'the time-qualified behavior is not active' },
-      { id: 'at-boundary', phase: 'boundary', polarity: 'must-hold', precondition: 'the observation is exactly at the effective boundary', expectedObservation: 'the time-qualified behavior activates according to the requested inclusivity rule' },
-      { id: 'after-boundary', phase: 'active', polarity: 'must-hold', precondition: 'the observation follows the effective boundary', expectedObservation: 'the time-qualified behavior remains active' },
-    ],
-  })
-}
-
-function identityCollisionVerificationObligation(requestedResult, force = false) {
-  const request = Array.isArray(requestedResult) ? requestedResult.join(' ') : String(requestedResult || '')
-  if (!force && !/\b(?:collision(?:s)?|equivalen(?:ce|ces|t)|same[- ]underlying|same[- ](?:token|identifier|identity|pseudonym)|identity[- ]resolution|entity[- ]resolution|deduplicat(?:e|ed|ion|ing)|alias(?:es|ed|ing)?|pseudonymi[sz](?:e|ed|ation|ing)?|tokeni[sz](?:e|ed|ation|ing)?)\b/iu.test(request)) return null
-  return Object.freeze({
-    id: 'identity-equivalence-collisions',
-    kind: 'invariant',
-    statement: 'Equivalent representations resolve to one stable identity while distinct non-equivalent inputs never collapse through a token or identifier collision.',
-    cases: [
-      { id: 'equivalent-consistency', phase: 'ordinary', polarity: 'must-hold', precondition: 'two inputs are asserted to represent the same underlying entity', expectedObservation: 'both resolve to the same deterministic identity or token' },
-      { id: 'distinct-noncollision', phase: 'ordinary', polarity: 'must-not-hold', precondition: 'two inputs are distinct and have no asserted equivalence', expectedObservation: 'they do not resolve to the same identity or token' },
-      { id: 'transitive-equivalence', phase: 'boundary', polarity: 'must-hold', precondition: 'equivalence is established only through a transitive, cross-scope, or representation-changing chain', expectedObservation: 'the complete asserted chain resolves to one identity without depending on traversal order' },
-      { id: 'ambiguous-collision', phase: 'boundary', polarity: 'must-not-hold', precondition: 'a token, alias, or mapping would silently merge unrelated identities', expectedObservation: 'the collision is prevented or resolved by one explicit deterministic policy' },
-    ],
-  })
-}
-
-const CONTROLLER_VERIFICATION_OBLIGATION_IDS = Object.freeze([
-  'temporal-activation-boundaries',
-  'temporal-ordered-activation',
-  'identity-equivalence-collisions',
-  'security-parser-differentials',
-])
-
-function canonicalControllerVerificationObligation(id) {
-  if (id === 'temporal-activation-boundaries') return temporalVerificationObligation('', 'activation')
-  if (id === 'temporal-ordered-activation') return temporalVerificationObligation('', 'ordered-activation')
-  if (id === 'identity-equivalence-collisions') return identityCollisionVerificationObligation('', true)
-  if (id === 'security-parser-differentials') return securityParserVerificationObligation('', true)
-  return null
-}
-
-function controllerVerificationObligationsForRequest(requestedResult) {
-  return [
-    temporalVerificationObligation(requestedResult),
-    identityCollisionVerificationObligation(requestedResult),
-    securityParserVerificationObligation(requestedResult),
-  ].filter(Boolean)
-}
-
-function verificationObligationsForRequest(requestedResult, supplied, fallbackChecks = []) {
-  const obligations = canonicalVerificationObligations(supplied, fallbackChecks)
-  if (!obligations) return null
-  const suppliedControllerIds = new Set(obligations
-    .filter(item => CONTROLLER_VERIFICATION_OBLIGATION_IDS.includes(item.id))
-    .map(item => item.id))
-  const required = controllerVerificationObligationsForRequest(requestedResult)
-  for (const obligation of required) suppliedControllerIds.add(obligation.id)
-  const controllerObligations = CONTROLLER_VERIFICATION_OBLIGATION_IDS
-    .filter(id => suppliedControllerIds.has(id))
-    .map(canonicalControllerVerificationObligation)
-  return [
-    ...obligations.filter(item => !CONTROLLER_VERIFICATION_OBLIGATION_IDS.includes(item.id)),
-    ...controllerObligations,
-  ]
+function verificationObligationsForRequest(_requestedResult, supplied, fallbackChecks = []) {
+  // The controller enforces exactly the supplied typed cases but never guesses
+  // a task domain from keywords. Domain semantics belong to the route analyst's
+  // structured obligations and the independent checker, so the same mechanism
+  // generalizes without controller-authored expected answers.
+  return canonicalVerificationObligations(supplied, fallbackChecks)
 }
 
 function defaultRouteFactProposal(route = 'DIRECT') {
@@ -294,8 +197,8 @@ function defaultRouteFactProposal(route = 'DIRECT') {
     reversibility: 'locally-reversible',
     mutableResources: [{ kind: 'directory', identity: '.', shared: false, ownershipMode: 'single-owner' }],
     sideEffects: ['deliverable-write'], externality: 'local-only', confidentiality: 'internal',
-    thirdPartyImpact: 'none', riskLevel: 'ordinary', minimumCheckerCount: 2,
-    namedDistinctResponsibilities: ['requirements semantics', 'boundary and regression behavior'],
+    thirdPartyImpact: 'none', riskLevel: 'ordinary', minimumCheckerCount: 1,
+    namedDistinctResponsibilities: [],
     checkQuality: 'authoritative', availableCheckKinds: ['focused-test'], baselineStatus: 'recorded',
     hiddenExternalCheck: false, architectureImpact: route === 'ROADMAP' ? 'multi-system' : 'local',
     fitsLightPlan: true, approachNeedsShortPlanning: route === 'LIGHT', shortOrderUnclear: false,
@@ -320,13 +223,42 @@ function validRouteFactProposal(value) {
     ['public', 'internal', 'confidential', 'restricted'].includes(value.confidentiality) &&
     ['none', 'minor', 'material'].includes(value.thirdPartyImpact) &&
     ['ordinary', 'elevated', 'staged-high-impact'].includes(value.riskLevel) &&
-    [1, 2].includes(value.minimumCheckerCount) && nonEmptyStringArray(value.namedDistinctResponsibilities) &&
+    validNamedCheckerMethods(value.minimumCheckerCount, value.namedDistinctResponsibilities) &&
     ['authoritative', 'short-plan', 'coordinated-design', 'unavailable'].includes(value.checkQuality) &&
     requiredNonEmptyStringArray(value.availableCheckKinds) &&
     ['recorded', 'not-applicable', 'unknown'].includes(value.baselineStatus) &&
     typeof value.hiddenExternalCheck === 'boolean' &&
     ['local', 'single-system', 'multi-system'].includes(value.architectureImpact) &&
     ['fitsLightPlan', 'approachNeedsShortPlanning', 'shortOrderUnclear'].every(key => typeof value[key] === 'boolean')
+}
+
+function validNamedCheckerMethods(minimumCheckerCount, responsibilities) {
+  if (![1, 2].includes(minimumCheckerCount) || !nonEmptyStringArray(responsibilities)) return false
+  const normalized = responsibilities.map(item => item.trim().toLowerCase())
+  if (new Set(normalized).size !== normalized.length || responsibilities.some(item => !concrete(item))) return false
+  return minimumCheckerCount === 2
+    ? responsibilities.length === 2
+    : responsibilities.length <= 1
+}
+
+function exactTypedCheckerMethods(responsibilities, availableCheckKinds) {
+  if (!Array.isArray(responsibilities) || responsibilities.length !== 2 ||
+      !Array.isArray(availableCheckKinds)) return null
+  const available = new Set(availableCheckKinds
+    .filter(value => concrete(value))
+    .map(value => value.trim().toLowerCase())
+    .filter(value => EXECUTABLE_CHECK_KIND.test(value)))
+  const parsed = responsibilities.map(responsibility => {
+    if (!concrete(responsibility)) return null
+    const match = TYPED_CHECKER_METHOD.exec(responsibility.trim())
+    if (!match || !concrete(match[2])) return null
+    const methodId = match[1].trim().toLowerCase()
+    return EXECUTABLE_CHECK_KIND.test(methodId) && available.has(methodId)
+      ? { methodId, responsibility: responsibility.trim() }
+      : null
+  })
+  if (parsed.some(value => value === null) || parsed[0].methodId === parsed[1].methodId) return null
+  return parsed
 }
 
 const ROUTE_REASON_BOILERPLATE = Object.freeze([
@@ -339,11 +271,7 @@ const ROUTE_REASON_BOILERPLATE = Object.freeze([
 function concreteRouteReason(value) {
   if (!concrete(value)) return false
   const text = value.trim().toLowerCase().replace(/\s+/gu, ' ')
-  if (ROUTE_REASON_BOILERPLATE.some(pattern => pattern.test(text))) return false
-  // A negative route explanation is evidence-bearing only when it names a
-  // route predicate, recorded fact, user constraint, or concrete work shape.
-  // Length alone must not turn generic rejection prose into route evidence.
-  return /\b(?:because|fact|request|user|exact path|predicate|dependen|integration|architect|design|product|mutation|writ|resource|owner|worker|check|verif|risk|scope|file|component|system|contract|rollout|migration|planning|uncertaint|bounded|independent|external|safety|capabilit|budget|time|success|acceptance)\w*\b/u.test(text)
+  return !ROUTE_REASON_BOILERPLATE.some(pattern => pattern.test(text))
 }
 
 function clone(value) {
@@ -495,8 +423,8 @@ function candidateFreezeContract(facts) {
   }
 }
 
-function derivedDistinctResponsibilities(facts) {
-  const responsibilities = [...facts.riskAndIndependentCheckFloor.namedDistinctResponsibilities]
+function derivedSafetyCheckObligations(facts) {
+  const responsibilities = []
   const effects = new Set(facts.sideEffects)
   if (effects.has('destructive-change') || facts.reversibility === 'irreversible') {
     responsibilities.push('Independently check destructive-action authority and rollback or irreversible-action evidence.')
@@ -631,7 +559,7 @@ function validateRecommendation(recommendation) {
   )
   if (!canonicalRecommendationVerification || !normalizedRecommendationVerification ||
       !sameValue(canonicalRecommendationVerification, normalizedRecommendationVerification)) {
-    errors.push('verificationObligations must preserve typed cases and canonical controller-reserved bodies')
+    errors.push('verificationObligations must preserve canonical explicitly typed acceptance cases')
   }
   if (!requiredNonEmptyStringArray(recommendation.whatTheUserWants)) {
     errors.push('whatTheUserWants must contain at least one item')
@@ -694,6 +622,69 @@ function createRouteRecommendation(input = {}) {
       input.verificationObligations ?? input.verification_obligations,
       checks,
     ),
+  }
+}
+
+function canonicalizeProviderVerificationObligations(supplied, fallbackChecks = []) {
+  const alreadyCanonical = canonicalVerificationObligations(supplied, fallbackChecks)
+  if (alreadyCanonical) return alreadyCanonical
+  // The provider schema deliberately describes transport shape, not the full
+  // cross-case matrix.  Its one safe deterministic default already exists:
+  // derive invariant cases from the provider's own success checks.  Do not
+  // infer activation ordering, security properties, or task-specific facts.
+  return canonicalVerificationObligations(null, fallbackChecks)
+}
+
+/**
+ * Provider structured output is a transport contract.  Convert a value which
+ * satisfies that contract into the canonical controller representation before
+ * semantic validation.  This keeps malformed transport fail-closed while
+ * avoiding the old schema-valid-but-runtime-invalid gap.
+ */
+function canonicalizeProviderRecommendation(recommendation) {
+  const schemaValidation = validateJsonSchema(ROUTE_RECOMMENDATION_SCHEMA, recommendation)
+  if (!schemaValidation.valid) {
+    return {
+      valid: false,
+      errors: schemaValidation.errors.map(error =>
+        `${error.path}: ${error.message}`),
+      recommendation: null,
+      canonicalized: false,
+    }
+  }
+  const verificationObligations = canonicalizeProviderVerificationObligations(
+    recommendation.verificationObligations,
+    recommendation.howSuccessCanBeChecked,
+  )
+  const suppliedProposal = recommendation.routeFactProposal
+  const typedMethods = suppliedProposal && suppliedProposal.minimumCheckerCount === 2
+    ? exactTypedCheckerMethods(
+        suppliedProposal.namedDistinctResponsibilities,
+        suppliedProposal.availableCheckKinds,
+      )
+    : null
+  // The provider may recommend a second physical seat only by binding each
+  // responsibility to a different executable command/oracle/adapter identity
+  // that it also declared available. Numeric risk prose is not launch
+  // authority: deterministically collapse it to the ordinary combined seat.
+  const routeFactProposal = suppliedProposal && suppliedProposal.minimumCheckerCount === 2 && !typedMethods
+    ? {
+        ...suppliedProposal,
+        minimumCheckerCount: 1,
+        namedDistinctResponsibilities: [],
+      }
+    : suppliedProposal
+  const canonical = createRouteRecommendation({
+    ...recommendation,
+    routeFactProposal,
+    verificationObligations,
+  })
+  const validation = validateRecommendation(canonical)
+  return {
+    valid: validation.valid,
+    errors: validation.errors,
+    recommendation: validation.valid ? canonical : null,
+    canonicalized: validation.valid && !sameValue(canonical, recommendation),
   }
 }
 
@@ -784,34 +775,44 @@ function evaluateRouteAnalystResult(input = {}) {
   if (!Number.isFinite(elapsed) || elapsed < 0) {
     return fallbackAnalystResult(input, 'ROUTE_ANALYST_RESULT_INVALID', 'MALFORMED', ['elapsed_ms must be non-negative'])
   }
-  if (input.outcome === 'TIMEOUT' || elapsed > routeAnalystMaxDurationMs(input.environment || process.env)) {
+  if (input.outcome === 'TIMEOUT') {
     return fallbackAnalystResult(input, 'ROUTE_ANALYST_TIMEOUT', 'TIMEOUT')
   }
   if (input.outcome === 'CRASH' || input.outcome === 'PROVIDER_UNSUPPORTED') {
     return fallbackAnalystResult(input, `ROUTE_ANALYST_${input.outcome}`, input.outcome)
   }
-  const validation = validateRecommendation(input.recommendation)
-  if (!validation.valid) {
-    return fallbackAnalystResult(input, 'ROUTE_ANALYST_MALFORMED', 'MALFORMED', validation.errors)
+  const normalized = canonicalizeProviderRecommendation(input.recommendation)
+  if (!normalized.valid) {
+    return fallbackAnalystResult(input, 'ROUTE_ANALYST_MALFORMED', 'MALFORMED', normalized.errors)
   }
+  const late = elapsed > routeAnalystMaxDurationMs()
   return {
-    status: input.recommendation.preWorkResult === 'NEEDS_USER' ? 'WAITING_USER' : 'ROUTE_ANALYST_COMPLETE',
-    l0_may_decide: input.recommendation.preWorkResult !== 'NEEDS_USER',
+    status: normalized.recommendation.preWorkResult === 'NEEDS_USER' ? 'WAITING_USER' : 'ROUTE_ANALYST_COMPLETE',
+    l0_may_decide: normalized.recommendation.preWorkResult !== 'NEEDS_USER',
     relaunch: false,
-    confidence: input.recommendation.confidence,
-    recommendation: input.recommendation,
+    confidence: normalized.recommendation.confidence,
+    recommendation: normalized.recommendation,
+    canonicalized: normalized.canonicalized,
+    convergence: late ? {
+      required: true,
+      action: 'USE_AVAILABLE_CANONICAL_RECOMMENDATION',
+      ceiling_ms: ROUTE_ANALYST_MAX_DURATION_MS,
+      elapsed_ms: elapsed,
+    } : { required: false },
   }
 }
 
 function createRoadmapTopology(options = {}) {
   const namedUnknowns = options.named_unknowns ?? options.namedUnknowns ?? []
   const scoutCount = options.scout_count ?? options.scoutCount ?? 0
+  const physicalCount = options.deterministic_controller_projection === true ||
+    options.deterministicControllerProjection === true ? 0 : 1
   return {
     roadmapAuthor: {
       role: 'roadmap-author',
       layer: 'L3',
       parent: 'run-owner',
-      count: 1,
+      count: physicalCount,
       output: 'plan/ROADMAP.md',
       repairOwner: 'SAME_AUTHOR',
       coordinatesImplementation: false,
@@ -833,14 +834,16 @@ function createRoadmapTopology(options = {}) {
       role: 'plan-checker',
       layer: 'L4',
       parent: 'run-owner',
-      count: 1,
+      count: physicalCount,
       independentFromAuthor: true,
       editsPlan: false,
       recheckOwner: 'SAME_CHECKER',
     },
     coordination: {
       beginsAfter: 'PLAN_ACCEPTED',
-      integrationOwner: { role: 'mission-coordinator', layer: 'L1', parent: 'run-owner', count: 1 },
+      integrationOwner: {
+        role: 'mission-coordinator', layer: 'L1', parent: 'run-owner', count: physicalCount,
+      },
       workGroupManagerAdmission: {
         role: 'ap-work-group-manager',
         physicalRoleId: 'autoprompt.v2.ap-work-group-manager',
@@ -909,22 +912,107 @@ function selectIndependentChecking(options = {}) {
   }
   const facts = factValidation.facts
   const acceptance = router.acceptanceContractForEffect(facts.requestedEffect)
-  const separate = derivedDistinctResponsibilities(facts)
   const floor = facts.riskAndIndependentCheckFloor.minimumCheckerCount
-  if (floor === 2 && separate.length === 0) {
-    return { valid: false, errors: ['a two-checker floor requires a named distinct responsibility'] }
-  }
-  const useSecond = floor === 2 || separate.length > 0
+  const suppliedMethods = facts.riskAndIndependentCheckFloor.namedDistinctResponsibilities
+  const namedMethods = [...new Set((Array.isArray(suppliedMethods) ? suppliedMethods : [])
+    .filter(concrete).map(method => method.trim()))]
+  const typedMethods = exactTypedCheckerMethods(
+    Array.isArray(suppliedMethods) ? suppliedMethods : [],
+    facts.checkAndBaseline.availableCheckKinds,
+  )
+  // A second physical checker is admitted only when the facts name exactly two
+  // distinct executable methods. Legacy/provider records that state a numeric
+  // floor without both methods safely converge to one combined checker instead
+  // of failing route selection or inventing an unspecified second consumer.
+  const useSecond = floor === 2 && namedMethods.length === 2 && typedMethods !== null
+  const admittedMethods = useSecond
+    ? typedMethods.map(method => method.responsibility)
+    : namedMethods
+  const safetyObligations = derivedSafetyCheckObligations(facts)
   const primary = `Combined requirements review and real behavior checking for ${facts.requestedEffect}: ${acceptance.requiredAcceptance.join('; ')}`
+  const safetySuffix = safetyObligations.length > 0
+    ? ` Safety obligations: ${safetyObligations.join('; ')}`
+    : ''
+  const singleMethod = floor === 1 && namedMethods.length >= 1
+    ? ` Executable method: ${namedMethods[0]}` : ''
   return {
     valid: true,
     checkerCount: useSecond ? 2 : 1,
-    responsibilities: useSecond ? [primary, separate.join('; ')] : [primary],
+    responsibilities: useSecond
+      ? [`Executable method: ${admittedMethods[0]}. ${primary}${safetySuffix}`, `Executable method: ${admittedMethods[1]}.`]
+      : [`${primary}${singleMethod}${safetySuffix}`],
     nonOverlapReason: useSecond
-      ? separate.join('; ')
-      : 'One checker owns the combined requirements review and real behavior check.',
+      ? `Explicitly bound non-overlapping executable methods: ${typedMethods[0].methodId} / ${typedMethods[1].methodId}`
+      : floor === 2
+        ? 'A second checker was not admitted because the route facts did not bind exactly two distinct typed method identities to available evidence kinds; one checker owns the combined requirements review and real behavior check.'
+        : 'One checker owns the combined requirements review and real behavior check.',
     derivedFromFactsFingerprint: router.routeFactFingerprint(facts),
     duplicateEvidenceConsumptionForbidden: useSecond,
+  }
+}
+
+function hasExactDisjointAutomaticWorkerProof(route, facts, ownership, workers) {
+  if (route !== 'ROADMAP' || !Number.isSafeInteger(workers) || workers < 2 || workers > 3 ||
+      facts.requestedEffect === 'external-operation' || facts.externality === 'external-write' ||
+      facts.dependency.shape !== 'independent-edits' || facts.dependency.integrationOwnerRequired ||
+      facts.dependency.dependentWorkGroupCount > 0 || facts.mutableResources.length !== workers ||
+      facts.mutableResources.some(resource => resource.shared || resource.identity === '.') ||
+      !Array.isArray(ownership) || ownership.length !== workers) return false
+  const expectedOwners = new Set(Array.from({ length: workers }, (_, index) => `worker-${index + 1}`))
+  const actualOwners = new Set(ownership.map(item => item && item.owner))
+  return actualOwners.size === workers && [...expectedOwners].every(owner => actualOwners.has(owner)) &&
+    ownership.every(item => item && facts.mutableResources.some(resource =>
+      resource.kind === item.kind && resource.identity === item.identity))
+}
+
+function completionLaunchRequirement(topology, options = {}) {
+  if (!topology || !ROUTES.includes(topology.route) ||
+      !Number.isSafeInteger(topology.childSessions) || topology.childSessions < 1 ||
+      !topology.counts || ![1, 2].includes(topology.counts.finalCheckers) ||
+      ![0, 1].includes(topology.counts.routeAnalysts) ||
+      !Number.isSafeInteger(topology.counts.workers) || topology.counts.workers < 1) return null
+  const additionalGateLaunches = options.additionalGateLaunches === undefined
+    ? 0 : options.additionalGateLaunches
+  if (!Number.isSafeInteger(additionalGateLaunches) || additionalGateLaunches < 0) return null
+  const { finalCheckers } = topology.counts
+  // B is the frozen initial topology. The first production worker may need one
+  // provider-transport retry without consuming the later checker-driven
+  // correction path. One bounded report correction may then produce concrete
+  // repair evidence; the resulting product/union repair is followed by all C
+  // fresh checker seats: B + T1 + R1 + P1 + C = B + 3 + C. Separate
+  // deterministic gates are counted explicitly and never hidden in a
+  // route-wide padded ceiling.
+  const contingency = 3 + finalCheckers
+  // Historical ROADMAP decisions counted an author, plan checker, and mission
+  // coordinator in childSessions. Codex now projects that planning state in
+  // the controller, so neither current nor legacy intake may turn those three
+  // dormant declarations into provider-call budget.
+  const physicalBase = topology.counts.routeAnalysts +
+    topology.counts.workers + topology.counts.finalCheckers
+  return physicalBase + contingency + additionalGateLaunches
+}
+
+function roadmapCompletionLaunchRequirement(topology, options = {}) {
+  if (!topology || topology.route !== 'ROADMAP') return null
+  return completionLaunchRequirement(topology, options)
+}
+
+function legacyRoadmapProviderTopology(currentTopology) {
+  if (!currentTopology || currentTopology.route !== 'ROADMAP') return null
+  return {
+    ...currentTopology,
+    counts: {
+      ...currentTopology.counts,
+      roadmapAuthors: 1,
+      planCheckers: 1,
+      missionCoordinators: 1,
+    },
+    childSessions: currentTopology.childSessions + 3,
+    totalSessions: currentTopology.totalSessions + 3,
+    coordination: createRoadmapTopology({
+      scout_count: 0,
+      named_unknowns: [],
+    }),
   }
 }
 
@@ -933,8 +1021,14 @@ function buildRouteTopology(route, options = {}) {
   const factValidation = router.validateRouteFacts(options.route_facts ?? options.routeFacts ?? options.facts)
   if (!factValidation.valid) return { valid: false, errors: factValidation.errors.map(error => `route_facts: ${error}`) }
   const facts = factValidation.facts
-  const classified = router.classifyRoute(facts, { probeEvidence: options.probe_evidence ?? options.probeEvidence })
   const explicitPath = exactPathSelection(options.pathSelection ?? options.path_selection, route)
+  const classified = router.classifyRoute(facts, {
+    probeEvidence: options.probe_evidence ?? options.probeEvidence,
+    // Exact-path preflight already established the deterministic route floor.
+    // Its real baseline probe is a later production gate; topology compilation
+    // must not reinterpret that pending gate as an admission-time task stop.
+    safetyFloorOnly: Boolean(explicitPath),
+  })
   if (classified.status !== 'DECIDED' || (!explicitPath && classified.route !== route)) {
     return { valid: false, errors: [`route facts select ${classified.status === 'DECIDED' ? classified.route : classified.status}, not ${route}`] }
   }
@@ -945,37 +1039,43 @@ function buildRouteTopology(route, options = {}) {
   const checkers = checking.valid ? checking.checkerCount : 0
   const scouts = options.scout_count ?? options.scoutCount ?? 0
   const namedUnknowns = options.named_unknowns ?? options.namedUnknowns ?? []
-  const managers = options.manager_count ?? options.managerCount ?? 0
+  const suppliedManagers = options.manager_count ?? options.managerCount
+  const managers = 0
   for (const [name, count] of Object.entries({ workers, checkers, scouts, managers })) {
     if (!Number.isSafeInteger(count) || count < 0) return { valid: false, errors: [`${name} must be a non-negative integer`] }
   }
   const errors = [...ownershipValidation.errors, ...(checking.errors || [])]
   if (workers < 1) errors.push('at least one useful worker is required')
   if (![1, 2].includes(checkers)) errors.push('one or two independent checkers are required')
-  if (route === 'DIRECT' && workers > 3) errors.push('DIRECT allows at most three genuinely separate workers')
-  if (route !== 'ROADMAP' && (scouts > 0 || managers > 0)) errors.push(`${route} has no scouts or managers`)
-  if (route === 'ROADMAP' && scouts > 0 &&
-      (!nonEmptyStringArray(namedUnknowns) || namedUnknowns.length < scouts)) {
-    errors.push('each ROADMAP scout requires one deterministic named unknown')
-  }
-  if (managers > 0 && workers < managers * 2) {
-    errors.push('each work-group manager requires at least two useful workers with disjoint ownership')
+  if (workers > 3) errors.push('a declared topology allows at most three useful workers')
+  if (scouts > 0) errors.push(`${route} deterministic execution has no scout model sessions`)
+  if (suppliedManagers !== undefined && suppliedManagers !== managers) {
+    errors.push(`deterministic execution requires exactly ${managers} work-group managers`)
   }
   const roadmap = route === 'ROADMAP'
   const counts = {
     roots: 1,
     routeAnalysts: explicitPath ? 0 : 1,
     runOwners: 1,
-    roadmapAuthors: roadmap ? 1 : 0,
-    scouts: roadmap ? scouts : 0,
-    planCheckers: roadmap ? 1 : 0,
-    missionCoordinators: roadmap ? 1 : 0,
-    workGroupManagers: roadmap ? managers : 0,
+    // Fresh Codex ROADMAP planning is a deterministic controller projection.
+    // These retained names describe legacy intake only and are never physical
+    // provider sessions in a newly compiled decision.
+    roadmapAuthors: 0,
+    scouts: 0,
+    planCheckers: 0,
+    missionCoordinators: 0,
+    workGroupManagers: 0,
     workers,
     finalCheckers: checkers,
   }
   const routeAnalystCount = counts.routeAnalysts
-  return {
+  const childSessions = routeAnalystCount + counts.roadmapAuthors + counts.scouts +
+    counts.planCheckers + counts.missionCoordinators + counts.workGroupManagers +
+    counts.workers + counts.finalCheckers
+  if (childSessions > ROUTE_TOPOLOGY_CHILD_CEILINGS[route]) {
+    errors.push(`${route} declared topology requires ${childSessions} child sessions, exceeding its ${ROUTE_TOPOLOGY_CHILD_CEILINGS[route]}-launch ceiling`)
+  }
+  const topology = {
     valid: errors.length === 0,
     errors,
     route,
@@ -995,25 +1095,31 @@ function buildRouteTopology(route, options = {}) {
       role: 'ap-work-group-manager',
       physicalRoleId: 'autoprompt.v2.ap-work-group-manager',
       parent: 'mission-coordinator',
-      count: managers,
-      admitted: managers > 0,
+      count: 0,
+      admitted: false,
       planPath: 'plan/ROADMAP.md',
       minimumUsefulWorkersPerManager: 2,
       assignedWorkerCount: workers,
       disjointMutableResourceOwnershipRequired: true,
     } : null,
     counts,
-    childSessions: routeAnalystCount + counts.roadmapAuthors + counts.scouts +
-      counts.planCheckers + counts.missionCoordinators + counts.workGroupManagers +
-      counts.workers + counts.finalCheckers,
+    childSessions,
     totalSessions: counts.roots + routeAnalystCount + counts.roadmapAuthors +
       counts.scouts + counts.planCheckers + counts.missionCoordinators +
       counts.workGroupManagers + counts.workers + counts.finalCheckers,
     coordination: roadmap ? createRoadmapTopology({
-      scout_count: scouts,
-      named_unknowns: Array.isArray(namedUnknowns) ? namedUnknowns.slice(0, scouts) : namedUnknowns,
+      scout_count: 0,
+      named_unknowns: Array.isArray(namedUnknowns) ? namedUnknowns.slice(0, 0) : [],
+      deterministic_controller_projection: true,
     }) : null,
   }
+  const completionLaunches = completionLaunchRequirement(topology)
+  if (completionLaunches !== null && completionLaunches > ROUTE_TOPOLOGY_CHILD_CEILINGS[route]) {
+    errors.push(`${route} initial topology and bounded completion reserve require ${completionLaunches} child sessions, exceeding its ${ROUTE_TOPOLOGY_CHILD_CEILINGS[route]}-launch ceiling`)
+    topology.valid = false
+    topology.errors = errors
+  }
+  return topology
 }
 
 function validateWorkers(workers, errors) {
@@ -1287,7 +1393,7 @@ function validateRouteDecision(decision) {
   )
   if (!canonicalVerification || !requiredVerificationUnion ||
       !sameValue(canonicalVerification, requiredVerificationUnion)) {
-    errors.push('verificationObligations must preserve the exact controller-required typed union for this request')
+    errors.push('verificationObligations must preserve the canonical provider-authored typed acceptance matrix')
   }
   if (!Array.isArray(decision.existingTests) || decision.existingTests.length === 0 ||
       new Set(decision.existingTests.map(item => item && item.id)).size !== decision.existingTests.length ||
@@ -1309,7 +1415,10 @@ function validateRouteDecision(decision) {
     if (hiddenBoundary && decision.usefulWorkerCount > hiddenBoundary.maxProvisionalWorkerLaunches) {
       errors.push('hidden external verification boundary exceeds its provisional worker cap')
     }
-    const classified = router.classifyRoute(facts)
+    // Exact-path admission already authenticated the deterministic safety
+    // floor. Its required production baseline is a later execution gate, not
+    // a second route-decision probe with an admission budget of its own.
+    const classified = router.classifyRoute(facts, explicitPath ? { safetyFloorOnly: true } : {})
     if (classified.status !== 'DECIDED' || (!explicitPath && classified.route !== decision.route)) {
       errors.push('normalized route facts must compile to the recorded route unless an exact user path is locked')
     }
@@ -1326,8 +1435,31 @@ function validateRouteDecision(decision) {
     if (!sameValue(decision.candidateFreeze, expectedFreeze)) errors.push('versionFreeze must match route facts and be required before checking')
     const ownership = validateOwnership(decision.mutableResourceOwnership, facts)
     errors.push(...ownership.errors)
+    if (explicitPath && decision.usefulWorkerCount !== 1) {
+      errors.push('an exact path admits exactly one useful worker')
+    } else if (!explicitPath && decision.usefulWorkerCount !== 1 &&
+        !hasExactDisjointAutomaticWorkerProof(
+          decision.route, facts, ownership.ownership, decision.usefulWorkerCount,
+        )) {
+      errors.push('automatic routing admits multiple workers only for two or three exactly bound disjoint ROADMAP resources')
+    }
     const expectedChecks = selectIndependentChecking({ facts })
     if (!expectedChecks.valid || !sameValue(decision.independentCheckingPlan, canonicalCheckingPlan(expectedChecks))) errors.push('independentCheckingPlan must be automatically derived from risk and requested effect')
+    const expectedTopology = buildRouteTopology(decision.route, {
+      facts,
+      mutableResourceOwnership: ownership.ownership,
+      workerCount: decision.usefulWorkerCount,
+      scoutCount: 0,
+      namedUnknowns: [],
+      managerCount: 0,
+      pathSelection: decision.pathSelection,
+    })
+    if (!expectedTopology.valid) {
+      errors.push(...expectedTopology.errors.map(error => `topology: ${error}`))
+    } else if (!sameValue(decision.topology, expectedTopology) &&
+        !sameValue(decision.topology, legacyRoadmapProviderTopology(expectedTopology))) {
+      errors.push('topology must equal the deterministic controller plan, worker, checker, and physical-session topology')
+    }
     if (!isObject(decision.assurancePreconditions) || decision.assurancePreconditions.mutableResourceOwnershipValid !== true ||
         decision.assurancePreconditions.candidateFreezeBeforeCheck !== true ||
         decision.assurancePreconditions.frozenVersionIdRequired !== facts.candidateFreeze.required) {
@@ -1362,9 +1494,6 @@ function validateRouteDecision(decision) {
     }
   }
   if (!isObject(decision.topology) || decision.topology.valid !== true || decision.topology.route !== decision.route) errors.push('topology must be the valid topology for the chosen route')
-  if (explicitPath && decision.topology && decision.topology.counts && decision.topology.counts.routeAnalysts !== 0) {
-    errors.push('exact path topology must contain zero route analysts')
-  }
   return { valid: errors.length === 0, errors }
 }
 
@@ -1383,7 +1512,13 @@ function createWaitingUserDecision(userInputNeeded, options = {}) {
 
 function createRouteDecision(input = {}) {
   const normalizedFacts = router.normalizeFacts(input.routeFacts ?? input.route_facts ?? input.normalizedRouteFacts ?? input.normalized_route_facts)
-  const classified = router.classifyRoute(normalizedFacts, { probeEvidence: input.probeEvidence ?? input.probe_evidence })
+  const requestedExactPath = exactPathSelection(
+    input.pathSelection ?? input.path_selection,
+    input.route ?? null,
+  )
+  const classified = router.classifyRoute(normalizedFacts, requestedExactPath
+    ? { safetyFloorOnly: true }
+    : { probeEvidence: input.probeEvidence ?? input.probe_evidence })
   const route = input.route ?? (classified.status === 'DECIDED' ? classified.route : null)
   const pathSelection = exactPathSelection(input.pathSelection ?? input.path_selection, route)
   const independentCheckingPlan = selectIndependentChecking({ facts: normalizedFacts })
@@ -1411,9 +1546,9 @@ function createRouteDecision(input = {}) {
     facts: normalizedFacts,
     mutableResourceOwnership: ownership,
     workerCount: workers.count ?? input.usefulWorkerCount ?? 1,
-    scoutCount: input.scoutCount ?? input.scout_count ?? 0,
-    namedUnknowns: input.namedUnknowns ?? input.named_unknowns ?? input.missingInformation ?? [],
-    managerCount: input.managerCount ?? input.manager_count ?? 0,
+    scoutCount: 0,
+    namedUnknowns: [],
+    managerCount: 0,
     pathSelection,
   })
   const capturedDomainContracts = capturedDomain.normalizeContracts(
@@ -1608,15 +1743,54 @@ function exactPathGateSelection(facts) {
   }
 }
 
+function automaticProposalWithinActivationAuthority(proposal, targetIdentity = '.') {
+  const authorityOnlyEffects = new Set([
+    'external-write', 'message-or-notification', 'money-or-quota',
+  ])
+  const claimsUnattestedExternalAuthority = proposal.requestedEffect === 'external-operation' ||
+    proposal.externality === 'external-write' ||
+    proposal.thirdPartyImpact === 'material' ||
+    proposal.sideEffects.some(effect => authorityOnlyEffects.has(effect))
+  if (!claimsUnattestedExternalAuthority) return proposal
+
+  // A route analyst is read-only advisory work. Its structured output can
+  // characterize local work, but it cannot grant an external target, cost, or
+  // notification authority that was absent from the controller activation.
+  // Collapse such claims to one activation-target mutation. A separately
+  // authenticated external operation remains a future controller boundary,
+  // never something mission prose or model-authored facts can activate.
+  return {
+    ...proposal,
+    requestedEffect: 'mutate',
+    mutableResources: [{
+      kind: 'directory',
+      identity: nonEmpty(targetIdentity) ? targetIdentity.trim() : '.',
+      shared: false,
+      ownershipMode: 'single-owner',
+    }],
+    sideEffects: [
+      ...new Set([
+        ...proposal.sideEffects.filter(effect => !authorityOnlyEffects.has(effect)),
+        'deliverable-write',
+      ]),
+    ].sort(),
+    externality: 'local-only',
+    thirdPartyImpact: 'none',
+  }
+}
+
 function compileAutomaticRouteDecision(input = {}) {
-  const recommendation = input.recommendation
-  const recommendationValidation = validateRecommendation(recommendation)
-  if (!recommendationValidation.valid || recommendation.preWorkResult !== 'CONTINUE') {
-    const error = new Error(recommendationValidation.errors.join('; ') || 'automatic decision requires CONTINUE')
+  const normalized = canonicalizeProviderRecommendation(input.recommendation)
+  const recommendation = normalized.recommendation
+  if (!normalized.valid || recommendation.preWorkResult !== 'CONTINUE') {
+    const error = new Error(normalized.errors.join('; ') || 'automatic decision requires CONTINUE')
     error.code = 'ROUTE_DECISION_INVALID'
     throw error
   }
-  const proposal = recommendation.routeFactProposal
+  const proposal = automaticProposalWithinActivationAuthority(
+    recommendation.routeFactProposal,
+    input.targetIdentity,
+  )
   const remainingMs = Number(input.budget?.remaining?.wallMs ?? input.remainingMs ?? 3600000)
   if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
     const error = new Error('automatic route compiler requires a positive live budget')
@@ -1700,8 +1874,7 @@ function compileAutomaticRouteDecision(input = {}) {
     error.code = 'ROUTE_DECISION_INVALID'
     throw error
   }
-  const workerCount = route === 'ROADMAP'
-    ? Math.max(2, Math.min(3, proposal.dependentWorkGroupCount || 2)) : 1
+  const workerCount = automaticWorkerCount(route, recommendation, proposal)
   const ownership = facts.mutableResources.map((resource, index) => ({
     kind: resource.kind,
     identity: resource.identity,
@@ -1728,8 +1901,8 @@ function compileAutomaticRouteDecision(input = {}) {
     workers: {
       count: workerCount,
       nonOverlapReason: workerCount === 1
-        ? 'One worker owns the connected mutation boundary.'
-        : 'Dependent work groups receive disjoint mutable resource ownership.',
+        ? 'One worker owns the connected or coupled mutation boundary sequentially.'
+        : 'Each named independent work item identifies one distinct, unshared mutable resource.',
     },
     chosenRouteReason: recommendation[routeReasonField].join(' '),
     rejectedRouteReasons,
@@ -1752,6 +1925,60 @@ function compileAutomaticRouteDecision(input = {}) {
     recommendationHash,
     nowMs: input.nowMs,
   })
+}
+
+function compileConservativeCompletionDecision(input = {}) {
+  const requestedResult = nonEmpty(input.requestedResult)
+    ? input.requestedResult.trim()
+    : 'Complete the exact user request in the local workspace.'
+  const successCheck = 'Independently exercise the requested result, its forbidden counterpart, and its exact boundary behavior.'
+  const recommendation = createRouteRecommendation({
+    preWorkResult: 'CONTINUE',
+    recommendedRoute: 'DIRECT',
+    confidence: 'low',
+    whatTheUserWants: [requestedResult],
+    likelyAreas: [nonEmpty(input.targetIdentity) ? input.targetIdentity.trim() : '.'],
+    howSuccessCanBeChecked: [successCheck],
+    unknowns: ['The route-analysis provider did not produce a usable decision; the single completion worker must inspect the exact workspace before acting.'],
+    risks: ['Keep all effects local and reversible, preserve unrelated behavior, and require independent verification of the exact result.'],
+    independentWorkItems: [],
+    dependencies: [],
+    reasonsForDirect: ['One completion worker owns the bounded local workspace and can inspect, implement, and test the exact request sequentially.'],
+    reasonsForLight: ['No verified reversible design uncertainty exists to justify a separate planning generation.'],
+    reasonsForRoadmap: ['No verified dependent work groups or disjoint mutable ownership exist to justify coordination generations.'],
+    userInputNeeded: [],
+    evidenceIndex: [],
+    routeFactProposal: defaultRouteFactProposal('DIRECT'),
+  })
+  const reportedRemaining = Number(input.budget && input.budget.remaining && input.budget.remaining.wallMs)
+  const completionBudget = {
+    remaining: {
+      wallMs: Number.isFinite(reportedRemaining) && reportedRemaining > 0
+        ? reportedRemaining : L0_DECISION_CONVERGENCE_WATCHDOG_MS,
+    },
+  }
+  return compileAutomaticRouteDecision({
+    recommendation,
+    requestedResult,
+    requestEnvelopeHash: input.requestEnvelopeHash,
+    providerCapabilities: input.providerCapabilities,
+    budget: completionBudget,
+    nowMs: input.nowMs,
+  })
+}
+
+function automaticWorkerCount(route, recommendation, proposal) {
+  if (route !== 'ROADMAP' || proposal.requestedEffect === 'external-operation' ||
+      proposal.externality === 'external-write' || proposal.dependencyShape !== 'independent-edits' ||
+      proposal.integrationOwnerRequired || proposal.dependentWorkGroupCount > 0 ||
+      recommendation.dependencies.length > 0) return 1
+  const items = recommendation.independentWorkItems
+  const resources = proposal.mutableResources
+  if (items.length < 2 || resources.length < 2 || items.length !== resources.length ||
+      resources.some(resource => resource.shared || resource.identity === '.')) return 1
+  const explicitlyBound = resources.every((resource, index) =>
+    concrete(items[index]) && items[index].includes(resource.identity))
+  return explicitlyBound ? Math.min(3, resources.length) : 1
 }
 
 function createExactPathDecision(input = {}) {
@@ -1827,7 +2054,11 @@ function remainingL0DecisionBudgetMs(input = {}) {
     error.code = 'ROUTE_DECISION_CLOCK_INVALID'
     throw error
   }
-  return Math.max(0, l0DecisionMaxDurationMs(input.environment) - Math.floor(now - started))
+  // Four minutes remains the economic target reported by evaluateL0Decision.
+  // The owned process gets one universal finite transport watchdog so a slow
+  // required decision is not cancelled merely because the caller did not
+  // provide a separate timeout override.
+  return Math.max(0, L0_DECISION_CONVERGENCE_WATCHDOG_MS - Math.floor(now - started))
 }
 
 function protectedRequestLiterals(requestText) {
@@ -1870,18 +2101,6 @@ function evaluateL0Decision(input = {}) {
   }
   const validation = validateRouteDecision(input.decision)
   const exactRequest = input.requestText ?? input.request_text
-  if (input.decision && input.decision.status === 'DECIDED' && nonEmpty(exactRequest)) {
-    const suppliedVerification = canonicalVerificationObligations(input.decision.verificationObligations)
-    const exactRequiredUnion = verificationObligationsForRequest(
-      exactRequest,
-      input.decision.verificationObligations,
-    )
-    if (!suppliedVerification || !exactRequiredUnion ||
-        !sameValue(suppliedVerification, exactRequiredUnion)) {
-      validation.valid = false
-      validation.errors.push('verificationObligations must preserve the exact request-derived controller union')
-    }
-  }
   const literalValidation = validateRequestLiteralPreservation(
     exactRequest,
     input.decision,
@@ -1894,10 +2113,11 @@ function evaluateL0Decision(input = {}) {
   }
   const submittedElapsed = submitted - started
   const elapsed = now - started
-  const maximumDurationMs = l0DecisionMaxDurationMs(input.environment)
+  const maximumDurationMs = l0DecisionMaxDurationMs()
   const remainingMs = Math.max(0, maximumDurationMs - Math.floor(elapsed))
-  if (validation.valid && submittedElapsed <= maximumDurationMs) {
+  if (validation.valid) {
     const waiting = input.decision.status === 'WAITING_USER'
+    const late = submittedElapsed > maximumDurationMs
     return {
       status: waiting ? 'WAITING_USER' : 'ROUTE_DECIDED',
       route: input.decision.route,
@@ -1905,6 +2125,12 @@ function evaluateL0Decision(input = {}) {
       elapsed_ms: submittedElapsed,
       budget_remaining_ms: remainingMs,
       decision: input.decision,
+      convergence: late ? {
+        required: true,
+        action: 'USE_AVAILABLE_VALID_DECISION',
+        ceiling_ms: maximumDurationMs,
+        elapsed_ms: submittedElapsed,
+      } : { required: false },
     }
   }
   if (submittedElapsed > maximumDurationMs || elapsed >= maximumDurationMs) {
@@ -2139,8 +2365,10 @@ function evaluateRouteChange(input = {}) {
 
 module.exports = {
   DECISION_ARRAY_FIELDS,
+  DETERMINISTIC_ROADMAP_EXECUTION_MODE,
   ESCALATION_EVENTS,
   L0_DECISION_MAX_DURATION_MS,
+  L0_DECISION_CONVERGENCE_WATCHDOG_MS,
   LIGHT_PLAN_MAX_DURATION_MS,
   MAX_LIGHT_PLAN_BULLETS,
   NON_ROUTING_FAILURES,
@@ -2159,7 +2387,10 @@ module.exports = {
   ROUTE_SCHEMA_DIGEST,
   buildRouteTopology,
   canonicalVerificationObligations,
+  canonicalizeProviderRecommendation,
   compileAutomaticRouteDecision,
+  completionLaunchRequirement,
+  compileConservativeCompletionDecision,
   createFindingDispositionDecision,
   createFrameworkMissCacheIdentity,
   createRoadmapTopology,
@@ -2179,6 +2410,7 @@ module.exports = {
   evaluateRouteEvent,
   evaluateSafeTransportDegradation,
   noProgressFingerprint,
+  roadmapCompletionLaunchRequirement,
   selectIndependentChecking,
   validateRecommendation,
   validateRouteRecommendation: validateRecommendation,

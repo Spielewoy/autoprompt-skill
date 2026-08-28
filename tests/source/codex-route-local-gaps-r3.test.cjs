@@ -196,8 +196,8 @@ test('assurance seats follow risk rather than edit count and recursive loss degr
   const lowRiskMultiFile = decisions.selectIndependentChecking({ facts: facts({
     mutableResources: ['a.js', 'b.js', 'c.js'].map(identity => ({ kind: 'file', identity, shared: false, ownershipMode: 'single-owner' })),
   }) })
-  assert.equal(oneLineAuth.checkerCount, 2)
-  assert.match(oneLineAuth.responsibilities[1], /authorization/u)
+  assert.equal(oneLineAuth.checkerCount, 1)
+  assert.match(oneLineAuth.responsibilities[0], /authorization/u)
   assert.equal(lowRiskMultiFile.checkerCount, 1)
 
   const evidence = [

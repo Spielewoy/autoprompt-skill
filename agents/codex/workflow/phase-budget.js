@@ -16,11 +16,12 @@ const { StringDecoder } = require('node:string_decoder')
 const { resolveSettings, validateResolvedSettings } = require('./settings.js')
 const routeFactsRouter = require('./router.js')
 const {
+  DETERMINISTIC_ROADMAP_EXECUTION_MODE,
   ROUTE_ANALYST_MAX_DURATION_MS,
   L0_DECISION_MAX_DURATION_MS,
-  LIGHT_PLAN_MAX_DURATION_MS,
   canonicalVerificationObligations,
   compileAutomaticRouteDecision,
+  compileConservativeCompletionDecision,
   createFindingDispositionDecision,
   createFrameworkMissCacheIdentity,
   createExactPathDecision,
@@ -29,7 +30,6 @@ const {
   evaluateL0Decision,
   evaluateRouteAnalystResult,
   evaluateSafeTransportDegradation,
-  remainingL0DecisionBudgetMs,
   validateRouteDecision,
 } = require('./route-decision.js')
 const {
@@ -37,7 +37,9 @@ const {
   ADMISSION_COMPONENT_CEILINGS_MS,
   bindRoadmapExpansionAdmission,
   phaseBudgetVerdict: schedulerPhaseBudgetVerdict,
+  requiresMarginalValue,
   resolveSchedulerSettings,
+  validateLaneSettingsInput,
 } = require('./scheduler.js')
 const {
   auditDispatch,
@@ -59,6 +61,7 @@ const {
   planCheckerSandboxes,
 } = require('./check-sandbox.js')
 const {
+  CODEX_PHYSICAL_EXECUTION_PATH,
   createAllWorkJoinedReceipt,
   createProductionPreMutationBaseline,
   openRunRecord,
@@ -79,6 +82,7 @@ const {
   createPosixProcessAdapter,
   createWindowsJobAdapter,
   prepareProcessLaunchEnvironment,
+  runOwnedProcessConformanceProbe,
 } = require('./process-owner.js')
 const { CleanupRegistry, Finalizer } = require('./finalizer.js')
 const { assertGenerationControlAuthority } = require('./generation-control.js')
@@ -109,6 +113,10 @@ const CHECKER_ROLES = new Set([
   'plan-checker', 'independent-checker', 'independent-reviewer',
   'independent-tester', 'technical-decision-reviewer',
 ])
+const RETIRED_LEGACY_ADVISORY_ROLES = new Set([
+  'roadmap-author', 'scout', 'plan-checker', 'mission-coordinator',
+  'ap-work-group-manager', 'diagnostic-probe',
+])
 const CANONICAL_CHECKER_CODES = new Set(['PASS', 'FAIL', 'CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'])
 const CHECKER_REASSESSMENT_CODES = new Set([
   'CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE', 'INDEPENDENT_CHECK_RUNTIME_RETRY',
@@ -118,12 +126,11 @@ const CHECKER_REASSESSMENT_CODES = new Set([
   'DUPLICATE_REFERENCE_METHOD_CLASS',
 ])
 const CHECKER_FALSIFICATION_DOCTRINE = Object.freeze([
-  'Derive expected behavior from the request, durable inputs, or an independent source; never from the subject implementation.',
-  'For mappings, joins, references, identity, or deduplication, exercise at least three distinct entities and prove both forward consistency and reverse non-collision.',
-  'For dates, versions, revocations, merges, migrations, or state transitions, test before, exactly at, between, and after each boundary, including a chained transition.',
-  'For generated or serialized deliverables, use the strongest available independent method and, when available, reopen the saved deliverable through the actual downstream consumer/export path to prove non-empty requested topology and measurements. An unavailable external consumer, tool, library, or portable reopen receipt is a verification limitation: return CHECK_INCONCLUSIVE or RUNTIME_FAILURE, never implementation FAIL, unless that consumer, tool, or receipt is itself an explicitly required user deliverable. A custom or relationship-only parser cannot authorize claims that require the unavailable consumer, but it may still provide bounded independent evidence for every property it can actually establish.',
-  'For parsers, sanitizers, interpreters, or security boundaries, test the actual shipped runtime plus encoded, namespaced, malformed, mutation, and interaction-triggered cases. A self-authored substitute parser cannot authorize PASS; if the actual runtime cannot run, return CHECK_INCONCLUSIVE.',
-  'A missing positive, negative, or boundary witness is CHECK_INCONCLUSIVE, never PASS.',
+  'Try to disprove every typed verification obligation against the frozen deliverable. Preserve each declared condition and finish the full assigned matrix after any failure.',
+  'For every exact named check ID, return one testOutcomes entry whose command is that ID and whose observationId is the controller-issued ID shown for that check. Set commandHash to the lowercase SHA-256 of the exact completed exact-version harness command event and fingerprint to the lowercase SHA-256 of its trimmed combined output. PASS requires a zero exit; FAIL may bind an admitted nonzero test failure. One admissible exact-version harness may cover several IDs; failed setup, inline-output/no-op commands, and writable-scratch reads cover none.',
+  'Return the consumed underlying identifiers in evidenceIds and an allowed referenceMethod. Populate every required invariant category from an independent source, property, strongest available consumer, or independently derived observable result; never derive expected behavior from the implementation being checked.',
+  'If a required consumer or independent check is unavailable, return CHECK_INCONCLUSIVE or RUNTIME_FAILURE instead of implementation FAIL unless that dependency is a required deliverable. A missing applicable witness is never PASS.',
+  'Keep large evidence in scratch and return only bounded diagnostics, hashes, or authenticated pointers.',
 ])
 const VERIFICATION_LIMITATION_CODES = new Set([
   'DEPENDENCY_UNAVAILABLE',
@@ -132,6 +139,34 @@ const VERIFICATION_LIMITATION_CODES = new Set([
   'EXTERNAL_LIBRARY_UNAVAILABLE',
   'EXTERNAL_TOOL_UNAVAILABLE',
   'REQUIRED_CHECK_RUNTIME_UNAVAILABLE',
+])
+const DEFAULT_VERIFICATION_LIMITATION_EVENT = 'REQUIRED_CHECK_RUNTIME_UNAVAILABLE'
+const CHILD_TRANSPORT_WATCHDOG_MS = 30 * 60 * 1000
+const DEFAULT_TIMEOUT_CLEANUP_WATCHDOG_MS = 60 * 1000
+const CODEX_STDOUT_FALLBACK_MAX_BYTES = 512 * 1024
+const CODEX_STDERR_TAIL_MAX_BYTES = 64 * 1024
+const CODEX_JSONL_PARTIAL_MAX_BYTES = 8 * 1024 * 1024
+const CODEX_JSONL_RETAINED_EVENT_MAX_BYTES = 8 * 1024 * 1024
+const CODEX_TODO_ITEM_ID_MAX_COUNT = 1024
+const CODEX_TODO_ITEM_ID_MAX_BYTES = 1024
+const CODEX_CHECK_OBSERVATION_MAX_CASES = 128
+const CODEX_CHECK_OBSERVATION_MAX_RECEIPTS = 256
+const TERMINAL_INTENT_MAX_BYTES = 8 * 1024 * 1024
+const CODEX_CALLBACK_RECONCILIATION_MAX_ITEMS = 512
+const CODEX_CALLBACK_RECONCILIATION_MAX_BYTES = 8 * 1024 * 1024
+const CODEX_CALLBACK_RECONCILIATION_MAX_REPLAYS = 3
+const DEGRADABLE_LOCAL_CALLBACK_KINDS = new Set([
+  'transcript-event',
+  'first-product-signal',
+])
+const PROVIDER_TRANSPORT_AVAILABILITY_CODES = new Set([
+  'CHILD_TRANSPORT_TIMEOUT',
+  'CODEX_CHILD_FAILED',
+  'CODEX_OUTPUT_TRANSPORT_INVALID',
+  'CODEX_TYPED_TERMINAL_MISSING',
+  'CODEX_SESSION_ID_MISSING',
+  'CODEX_USAGE_INCOMPLETE',
+  'CODEX_EVENT_STREAM_INVALID',
 ])
 const CONTROLLER_FAILURE_RELEASE_STATES = new Set([
   'LOAD_SKILL', 'STORE_REQUEST_ENVELOPE', 'RESOLVE_SETTINGS', 'SELECT_SAFE_RUN_ROOT',
@@ -152,19 +187,238 @@ const ENVIRONMENT_FAILURE_CODES = new Set([
   'PROVIDER_UNSUPPORTED', 'DIAGNOSTIC_DENIAL_BLOCKED', 'CHECKER_SNAPSHOT_UNAVAILABLE',
   'CHECKER_SCRATCH_UNAVAILABLE', 'DEPENDENCY_UNAVAILABLE',
 ])
-const CHECKER_LAUNCH_REASSESSMENT_CODES = new Set([
-  ...WORKER_CONTEXT_FAILURE_CODES,
-  'CHECKER_SNAPSHOT_UNAVAILABLE', 'CHECKER_SCRATCH_UNAVAILABLE',
+const ROUTE_PERSISTENCE_INTEGRITY_CODES = new Set([
+  'RUN_RECORD_UNSAFE',
+  'RECOVERY_CHECKPOINT_FOREIGN_BINDING',
+  'RECOVERY_CHECKPOINT_IMMUTABLE_MISMATCH',
+  'RECOVERY_CHECKPOINT_AUTHORITY_INVALID',
+  'RECOVERY_CHECKPOINT_LOG_UNSAFE',
+  'RECOVERY_CHECKPOINT_LOG_INVALID',
+  'RECOVERY_CHECKPOINT_RESULT_UNVERIFIED',
+  'RECOVERY_CHECKPOINT_EVIDENCE_INVALID',
+  'RECOVERY_CHECKPOINT_SNAPSHOT_INVALID',
 ])
 
-function checkerLaunchRuntimeFailure(request, decision, runId, error) {
+function routePersistenceIntegrityFailure(error) {
+  return Boolean(error && ROUTE_PERSISTENCE_INTEGRITY_CODES.has(error.code))
+}
+
+function callbackFailureRequiresImmediateAbort(error) {
+  const code = error && typeof error.code === 'string' ? error.code : ''
+  return routePersistenceIntegrityFailure(error) ||
+    [
+      'CHECK_REPORT_INVALID',
+      'ROLE_REPORT_INVALID',
+      'CRASH_ADOPTION_CONFLICT',
+      'CODEX_USAGE_INVALID',
+      'USAGE_REGRESSION',
+      'INVALID_USAGE_REPORT',
+      'INCOMPLETE_USAGE_REPORT',
+      'INCOMPLETE_USAGE_ACCOUNTING',
+      'ACTIVATION_RECEIPT_INVALID',
+      'BUDGET_EXHAUSTED',
+    ].includes(code) ||
+    /^(?:ACCOUNTING_|RECOVERY_CHECKPOINT_|RUN_RECORD_UNSAFE)/u.test(code) ||
+    /(?:FOREIGN|TAMPER|HASH_MISMATCH|SIGNATURE_INVALID|ROLLBACK)/u.test(code) ||
+    /^TRANSCRIPT_(?:CHAIN|CONTENT|GAP|HASH|OVERFLOW_AMBIGUOUS|PAYLOAD|READ_DRIFT|TRUNCATED|UNRECOGNIZED)/u.test(code)
+}
+
+function promotedMutationFailureRequiresRollback(error) {
+  const code = error && typeof error.code === 'string' ? error.code : ''
+  return callbackFailureRequiresImmediateAbort(error) ||
+    [
+      'CONCURRENT_MUTATION',
+      'MANIFEST_INVALID',
+      'MUTATION_AUTHORITY_INVALID',
+      'MUTATION_ISOLATION_MISMATCH',
+      'MUTATION_PERMIT_INVALID',
+      'MUTATION_RESULT_MISMATCH',
+      'PREIMAGE_UNSAFE',
+      'WORKER_PROMOTION_INVALID',
+      'WORKER_ROLLBACK_CONFLICT',
+      'WORKER_ROLLBACK_FAILED',
+      'WORKER_WORKSPACE_RECOVERY_FAILED',
+    ].includes(code) ||
+    /(?:FOREIGN|TAMPER|HASH_MISMATCH|SIGNATURE_INVALID|ROLLBACK)/u.test(code)
+}
+
+function deepFreezeJson(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value
+  for (const child of Object.values(value)) deepFreezeJson(child)
+  return Object.freeze(value)
+}
+
+function immutableTerminalIntent(outcome, result) {
+  let bytes
+  try { bytes = stableStringify({ outcome, result }) } catch (error) {
+    throw new SupervisorIntegrationError(
+      'TERMINAL_INTENT_INVALID',
+      'terminal intent must contain only bounded canonical JSON values',
+      { cause: error.message },
+    )
+  }
+  if (Buffer.byteLength(bytes, 'utf8') > TERMINAL_INTENT_MAX_BYTES) {
+    throw new SupervisorIntegrationError(
+      'TERMINAL_INTENT_INVALID',
+      'terminal intent exceeds its finite canonical byte boundary',
+      { maximumBytes: TERMINAL_INTENT_MAX_BYTES },
+    )
+  }
+  return deepFreezeJson(JSON.parse(bytes))
+}
+
+function automaticWaitingRequiresUserAuthority(analysis, verifyAuthority) {
+  // Route-analysis prose is untrusted advisory output. It cannot manufacture
+  // authority by labeling its own uncertainty, side effect, or reversibility.
+  // Suspension is available only through an injected controller verifier that
+  // authenticates an explicit immutable user/target/cost/external decision.
+  if (typeof verifyAuthority !== 'function') return false
+  const receipt = verifyAuthority(analysis)
+  return Boolean(receipt && receipt.authenticated === true &&
+    ['EXPLICIT_USER_DECISION', 'EXTERNAL_WRITE_AUTHORITY', 'COST_AUTHORITY', 'TARGET_AUTHORITY']
+      .includes(receipt.authorityClass) &&
+    /^[a-f0-9]{64}$/u.test(receipt.evidenceHash || ''))
+}
+
+function initialProductFrontier(decision) {
+  return Array.from(
+    { length: Math.max(1, Number(decision && decision.usefulWorkerCount || 1)) },
+    (_, index) => `work-${index + 1}`,
+  )
+}
+
+function validateCodexAdvisoryPayloadBounds(value, limits = {}) {
+  const maximumStringBytes = Number(limits.maximumStringBytes || 16 * 1024)
+  const maximumAggregateBytes = Number(limits.maximumAggregateBytes || 64 * 1024)
+  const maximumArrayItems = Number(limits.maximumArrayItems || 128)
+  const maximumObjectKeys = Number(limits.maximumObjectKeys || 128)
+  const maximumNodes = Number(limits.maximumNodes || 2048)
+  const maximumDepth = Number(limits.maximumDepth || 16)
+  const stack = [{ value, depth: 0 }]
+  const seen = new Set()
+  let aggregateBytes = 0
+  let nodes = 0
+  let strings = 0
+  let maximumObservedStringBytes = 0
+  const violations = []
+  while (stack.length > 0 && violations.length < 8) {
+    const current = stack.pop()
+    nodes += 1
+    if (nodes > maximumNodes) {
+      violations.push('node-count')
+      break
+    }
+    if (current.depth > maximumDepth) {
+      violations.push('nesting-depth')
+      continue
+    }
+    const item = current.value
+    if (typeof item === 'string') {
+      const bytes = Buffer.byteLength(item, 'utf8')
+      strings += 1
+      aggregateBytes += bytes
+      maximumObservedStringBytes = Math.max(maximumObservedStringBytes, bytes)
+      if (bytes > maximumStringBytes) violations.push('string-bytes')
+      if (aggregateBytes > maximumAggregateBytes) violations.push('aggregate-string-bytes')
+      continue
+    }
+    if (!item || typeof item !== 'object') continue
+    if (seen.has(item)) {
+      violations.push('cyclic-value')
+      continue
+    }
+    seen.add(item)
+    if (Array.isArray(item)) {
+      if (item.length > maximumArrayItems) violations.push('array-items')
+      for (let index = Math.min(item.length, maximumArrayItems) - 1; index >= 0; index -= 1) {
+        stack.push({ value: item[index], depth: current.depth + 1 })
+      }
+      continue
+    }
+    const entries = Object.entries(item)
+    if (entries.length > maximumObjectKeys) violations.push('object-keys')
+    for (let index = Math.min(entries.length, maximumObjectKeys) - 1; index >= 0; index -= 1) {
+      const [key, nested] = entries[index]
+      const keyBytes = Buffer.byteLength(key, 'utf8')
+      aggregateBytes += keyBytes
+      maximumObservedStringBytes = Math.max(maximumObservedStringBytes, keyBytes)
+      if (keyBytes > maximumStringBytes) violations.push('key-bytes')
+      if (aggregateBytes > maximumAggregateBytes) violations.push('aggregate-string-bytes')
+      stack.push({ value: nested, depth: current.depth + 1 })
+    }
+  }
+  const summary = Object.freeze({
+    nodes,
+    strings,
+    aggregateBytes,
+    maximumObservedStringBytes,
+    violations: Object.freeze([...new Set(violations)].sort()),
+  })
+  return Object.freeze({
+    valid: summary.violations.length === 0,
+    summary,
+    evidenceHash: hashText(stableStringify(summary)),
+  })
+}
+
+function codexPhysicalExecutionReceipt(decision, options = {}) {
+  const validation = validateRouteDecision(decision)
+  if (!validation.valid) {
+    throw new SupervisorIntegrationError(
+      'ROUTE_TOPOLOGY_INVALID',
+      'Codex physical execution requires the exact validated route decision',
+      { errors: validation.errors },
+    )
+  }
+  const workerLaunches = Number(decision.usefulWorkerCount)
+  const checkerLaunches = Number(
+    decision.independentCheckingPlan && decision.independentCheckingPlan.checkerCount,
+  )
+  const gateLaunches = options.additionalGateLaunches === undefined
+    ? 0 : Number(options.additionalGateLaunches)
+  if (!Number.isSafeInteger(gateLaunches) || gateLaunches < 0 || gateLaunches > 1) {
+    throw new SupervisorIntegrationError(
+      'ROUTE_LAUNCH_REQUIREMENT_INVALID',
+      'Codex physical execution permits zero or one exact pre-production model check',
+    )
+  }
+  const analystLaunches = decision.routeSource === 'automatic' ? 1 : 0
+  const basePhysicalLaunches = analystLaunches + workerLaunches + checkerLaunches
+  // The first production worker may need one provider-transport retry without
+  // consuming the later checker-driven correction path. One bounded report
+  // correction can then become concrete repair evidence, and the resulting
+  // product/union repair must be checked by every fresh checker seat. The exact
+  // worst-case contingency is T1 + R1 + P1 + C, independent of worker width.
+  const boundedContingencyLaunches = 3 + checkerLaunches
+  const body = Object.freeze({
+    schemaVersion: 1,
+    kind: 'codex-physical-execution',
+    executionMode: decision.route === 'ROADMAP'
+      ? DETERMINISTIC_ROADMAP_EXECUTION_MODE : 'direct-product-v1',
+    route: decision.route,
+    routeSource: decision.routeSource,
+    routeDecisionHash: hashText(stableStringify(decision)),
+    analystLaunches,
+    workerLaunches,
+    checkerLaunches,
+    gateLaunches,
+    basePhysicalLaunches,
+    boundedContingencyLaunches,
+    requiredChildLaunches: basePhysicalLaunches + gateLaunches + boundedContingencyLaunches,
+  })
+  return Object.freeze({ ...body, receiptHash: hashText(stableStringify(body)) })
+}
+
+function checkerLaunchRuntimeFailure(request, decision, runId, error, binding = {}) {
   return Object.freeze({
     schemaVersion: '2.0.0',
     code: 'RUNTIME_FAILURE',
     description: 'A tool or execution environment failed before the requested check could finish.',
     stateClass: 'terminal',
-    runId,
-    requestEnvelopeHash: decision.requestEnvelopeHash,
+    runId: typeof runId === 'string' && runId ? runId : 'autoprompt-controller',
+    requestEnvelopeHash: binding.requestEnvelopeHash ||
+      (decision && typeof decision.requestEnvelopeHash === 'string'
+        ? decision.requestEnvelopeHash : null),
     currentVersionHash: request.candidateHash || null,
     candidateHash: request.candidateHash || null,
     completedResults: [],
@@ -177,6 +431,59 @@ function checkerLaunchRuntimeFailure(request, decision, runId, error) {
     payloadSchemaId: 'autoprompt.checker-launch-reassessment.v2',
     payload: { error: serializeError(error) },
     recordedAt: new Date().toISOString(),
+    contextId: binding.contextId || null,
+  })
+}
+
+function workerTransportRuntimeFailure(request, decision, runId, error, binding = {}) {
+  const failureHash = hashText(stableStringify({
+    code: error && error.code || 'CHILD_TRANSPORT_TIMEOUT',
+    workItemId: request.workItemId,
+    candidateHash: request.candidateHash || null,
+  }))
+  return Object.freeze({
+    schemaVersion: '2.0.0',
+    reportType: 'result',
+    outcome: 'FAILED',
+    runId: typeof runId === 'string' && runId ? runId : 'autoprompt-controller',
+    requestEnvelopeHash: binding.requestEnvelopeHash ||
+      decision && decision.requestEnvelopeHash || null,
+    assignmentId: request.workItemId,
+    logicalRoleId: request.logicalRole || 'worker',
+    physicalRoleId: binding.physicalRole || providerRoleForLogical(request.logicalRole || 'worker'),
+    contextId: binding.contextId || `transport-timeout:${failureHash.slice(0, 24)}`,
+    allAssignedItemsPass: false,
+    successItems: [{
+      id: 'provider-transport-completion',
+      status: 'fail',
+      evidenceIds: [failureHash],
+    }],
+    resourcesChanged: [],
+    behaviorChanged: [],
+    remainingConcerns: ['The provider transport ended before the assigned turn returned a canonical terminal result.'],
+    filesChanged: [],
+    commands: [],
+    findingIds: [...new Set(
+      Array.isArray(binding.findingIds) && binding.findingIds.length > 0
+        ? binding.findingIds
+        : [`provider-transport:${failureHash.slice(0, 24)}`],
+    )],
+    evidenceHashes: [failureHash],
+    candidateHash: request.candidateHash || null,
+    requestedTransition: Object.freeze({
+      event: 'WORK_ITEM_VERIFIED',
+      reason: 'Persist the provider transport failure as exact unsuccessful work evidence.',
+      invalidateEvidenceIds: [],
+    }),
+    terminalEnvelope: Object.freeze({
+      status: 'CHILD_TRANSPORT_TIMEOUT',
+      reason: 'The bounded child transport stopped responding before it returned a typed result.',
+      details: Object.freeze({
+        workItemId: request.workItemId,
+        logicalRole: request.logicalRole || 'worker',
+        evidenceHash: failureHash,
+      }),
+    }),
   })
 }
 
@@ -257,9 +564,35 @@ function checkerImplementationFailureFingerprint(result, assignedChecks = []) {
   }))
 }
 
+function containsStructuredFailureEvidence(value, seen = new Set(), depth = 0) {
+  if (value === null || value === undefined || depth > 12) return false
+  if (typeof value !== 'object') return false
+  if (seen.has(value)) return false
+  seen.add(value)
+  if (Array.isArray(value)) {
+    return value.some(item => containsStructuredFailureEvidence(item, seen, depth + 1))
+  }
+  for (const [key, nested] of Object.entries(value)) {
+    const normalizedKey = key.toLowerCase().replace(/[_-]/gu, '')
+    if (normalizedKey === 'exitcode' && Number.isFinite(Number(nested)) && Number(nested) !== 0) {
+      return true
+    }
+    if (['passed', 'success', 'successful'].includes(normalizedKey) && nested === false) return true
+    if (['code', 'status', 'outcome', 'verdict', 'event', 'state'].includes(normalizedKey) &&
+        typeof nested === 'string' &&
+        /^(?:FAIL|FAILED|ERROR|REJECTED|ASSERTION_FAILED|TEST_FAILED)$/u.test(nested.trim().toUpperCase())) {
+      return true
+    }
+    if (/(?:finding|defect)ids?$/u.test(normalizedKey) &&
+        ((Array.isArray(nested) && nested.length > 0) ||
+          (typeof nested === 'string' && nested.trim()))) return true
+    if (containsStructuredFailureEvidence(nested, seen, depth + 1)) return true
+  }
+  return false
+}
+
 function checkerResultHasExactVerificationLimitation(result) {
   if (!result || !['FAIL', 'CHECK_INCONCLUSIVE'].includes(result.code)) return false
-  const cause = result.cause && typeof result.cause === 'object' ? result.cause : {}
   const payload = result.payload && typeof result.payload === 'object' ? result.payload : {}
   const limitation = payload.verificationLimitation &&
     typeof payload.verificationLimitation === 'object' &&
@@ -275,34 +608,107 @@ function checkerResultHasExactVerificationLimitation(result) {
       !uniqueStrings(limitation.observedVersionDefectIds) ||
       limitation.observedVersionDefectIds.some(id => id.length > 256)) return false
   if (limitation.explicitUserDeliverable || limitation.observedVersionDefectIds.length > 0) return false
-  const codes = [cause.code, cause.event, cause.status, payload.code, payload.status]
-    .filter(value => typeof value === 'string')
-    .map(value => value.trim().toUpperCase())
-  return codes.some(code => VERIFICATION_LIMITATION_CODES.has(code))
-}
-
-function checkerFailureIsVerificationLimitation(result) {
-  return Boolean(result && result.code === 'FAIL' &&
-    checkerResultHasExactVerificationLimitation(result))
+  // The empty observed-defect list must agree with the rest of the structured
+  // report.  Otherwise a checker could accidentally (or adversarially) attach
+  // a capability-limitation object to real failing evidence and turn a product
+  // defect into DONE_WITH_VERIFICATION_LIMITATIONS at normalization time.
+  const structuredFindingCollections = [
+    result.findingIds,
+    result.findings,
+    payload.findingIds,
+    payload.findings,
+    payload.defectIds,
+    payload.observedVersionDefectIds,
+  ]
+  if (structuredFindingCollections.some(value => Array.isArray(value) && value.length > 0)) {
+    return false
+  }
+  if (explicitFindingIds(result, payload, result.cause).length > 0) return false
+  if (Array.isArray(payload.testOutcomes) &&
+      payload.testOutcomes.some(item => item && item.status === 'FAIL')) return false
+  const payloadWithoutLimitation = { ...payload }
+  delete payloadWithoutLimitation.verificationLimitation
+  if (containsStructuredFailureEvidence([
+    result.cause,
+    result.completedResults,
+    result.commands,
+    payloadWithoutLimitation,
+  ])) return false
+  // The exact typed payload is the authority.  Free-form model vocabulary is
+  // diagnostic only: an otherwise valid limitation must not become a task
+  // failure because the checker called the same event by a novel name.
+  return true
 }
 
 function canonicalizeCheckerVerificationLimitation(result) {
-  if (!checkerFailureIsVerificationLimitation(result)) return result
+  if (!checkerResultHasExactVerificationLimitation(result)) return result
   const cause = result.cause && typeof result.cause === 'object' ? result.cause : {}
+  const suppliedEvent = typeof cause.event === 'string' ? cause.event : ''
+  const canonicalEvent = VERIFICATION_LIMITATION_CODES.has(suppliedEvent)
+    ? suppliedEvent : DEFAULT_VERIFICATION_LIMITATION_EVENT
   return {
     ...result,
     code: 'CHECK_INCONCLUSIVE',
     description: 'A required check could not determine whether the exact result passes.',
     stateClass: 'intermediate',
     cause: {
-      event: typeof cause.event === 'string' && /^[A-Z][A-Z0-9_]+$/u.test(cause.event)
-        ? cause.event : 'DEPENDENCY_UNAVAILABLE',
+      event: canonicalEvent,
       reason: typeof cause.reason === 'string' && cause.reason.length > 0
         ? cause.reason : 'the checker reported an unavailable external verification capability',
       unblockPath: typeof cause.unblockPath === 'string' && cause.unblockPath.length > 0
         ? cause.unblockPath : null,
     },
   }
+}
+
+function canonicalizeCheckerTerminalResult(result) {
+  const canonical = canonicalizeCheckerVerificationLimitation(result)
+  const outcomes = canonical && canonical.payload && canonical.payload.testOutcomes
+  if (!canonical || canonical.code !== 'PASS' || !Array.isArray(outcomes) ||
+      !outcomes.some(item => item && item.status === 'FAIL')) return canonical
+  // A model-authored PASS and a model-authored failing observation disagree.
+  // Neither spelling gets to manufacture product authority.  A concrete FAIL
+  // must be the checker's aggregate verdict and must be bound to the controller
+  // observation protocol; this contradiction instead consumes the one fresh
+  // checker reassessment.
+  return {
+    ...canonical,
+    code: 'CHECK_INCONCLUSIVE',
+    description: 'A required check could not determine whether the exact result passes.',
+    stateClass: 'intermediate',
+    cause: {
+      event: 'CHECKER_VERDICT_CONTRADICTION',
+      reason: 'The checker aggregate PASS contradicts at least one named failing observation.',
+      unblockPath: 'Run one fresh independent reassessment against the same frozen exact version and return one consistent aggregate verdict.',
+    },
+  }
+}
+
+function canonicalVerificationLimitationSummaries(value, options = {}) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 3) return null
+  const seen = new Set()
+  const canonical = []
+  for (const item of value) {
+    const keys = item && typeof item === 'object' && !Array.isArray(item)
+      ? Object.keys(item).sort() : []
+    if (stableStringify(keys) !== stableStringify([
+      'checkerId', 'resultHash', 'verificationLimitation',
+    ]) || typeof item.checkerId !== 'string' || !item.checkerId || item.checkerId.length > 160 ||
+        !/^[a-f0-9]{64}$/u.test(item.resultHash || '') || seen.has(item.checkerId) ||
+        !checkerResultHasExactVerificationLimitation({
+          code: 'CHECK_INCONCLUSIVE',
+          payload: { verificationLimitation: item.verificationLimitation },
+        })) return null
+    seen.add(item.checkerId)
+    canonical.push(Object.freeze({
+      checkerId: item.checkerId,
+      resultHash: item.resultHash,
+      verificationLimitation: Object.freeze({ ...item.verificationLimitation }),
+    }))
+  }
+  const sorted = canonical.sort((left, right) => left.checkerId.localeCompare(right.checkerId))
+  if (options.requireCanonicalOrder === true && stableStringify(value) !== stableStringify(sorted)) return null
+  return Object.freeze(sorted)
 }
 
 function unsuccessfulWorkTerminal(workItemId, result, options = {}) {
@@ -397,7 +803,7 @@ function roadmapPlanOracleForWorkItem(workItemId) {
 function checkerRecoveryNextReady(workItemId, result, disposition = null) {
   const id = String(workItemId || '')
   const code = result && result.code
-  if (/^independent-check-\d+/u.test(id) && disposition) {
+  if ((/^independent-check-\d+/u.test(id) || /^roadmap-plan-(?:check|recheck)$/u.test(id)) && disposition) {
     if (stableCapabilityUnavailable(result)) {
       return disposition.stableLimitationNextReadyId
         ? [disposition.stableLimitationNextReadyId] : []
@@ -457,12 +863,48 @@ function recoveryGroupNextReady(request = {}, completedWorkIds = []) {
   return missing.length > 0 ? missing : recoveryJoinWorkIds
 }
 
+function authoritativeRequestNextReady(logicalRole, result, request = {}, completedWorkIds = [], fallback = []) {
+  if (!CHECKER_ROLES.has(logicalRole) &&
+      result && result.terminalEnvelope &&
+      result.terminalEnvelope.status === 'CHILD_TRANSPORT_TIMEOUT') {
+    return request.transportFailureRetryId ? [request.transportFailureRetryId] : []
+  }
+  return durableNextReadyAfter(
+    logicalRole,
+    result,
+    recoveryGroupNextReady(request, completedWorkIds),
+    fallback,
+    request.workItemId || null,
+    request.checkerRecoveryDisposition || null,
+  )
+}
+
+function checkerDispositionSettlesNonAuthoritative(request = {}, result = null) {
+  const disposition = request.checkerRecoveryDisposition
+  return Boolean(
+    disposition &&
+    disposition.nonAuthoritativeRetryId === null &&
+    ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(result && result.code),
+  )
+}
+
 function adoptedLeaseMatchesStage(route, logicalRole, stage) {
   const checker = CHECKER_ROLES.has(logicalRole)
   const roadmapWorkStageChecker = route === 'ROADMAP' && logicalRole === 'plan-checker'
   if (stage === 'work') return !checker || roadmapWorkStageChecker
   if (stage === 'check') return checker && !roadmapWorkStageChecker
   return stage === 'route' ? logicalRole === 'route-analyst' : false
+}
+
+function currentProductRecoveryWorkIds(decision, resumeState) {
+  const workerCount = Math.max(1, Number(decision && decision.usefulWorkerCount || 1))
+  const completed = new Set()
+  for (const workItemId of resumeState && resumeState.completedWorkIds || []) {
+    const match = /^(work-\d+)(?:-|$)/u.exec(String(workItemId || ''))
+    if (match) completed.add(match[1])
+  }
+  return Array.from({ length: workerCount }, (_, index) => `work-${index + 1}`)
+    .filter(workItemId => !completed.has(workItemId))
 }
 
 function terminalFinalizationDiagnostics(result = {}) {
@@ -530,6 +972,8 @@ const REQUIRED_SAFETY_CHANNELS = Object.freeze([
   'providerConnectorApiWriteToolDenial',
 ])
 const STREAMED_ROUTE_EVENT_COUNT = Symbol('streamedRouteEventCount')
+const MUTATION_ADMISSION_EVIDENCE = Symbol('mutationAdmissionEvidence')
+const TRANSPORT_QUARANTINE_POINTER = Symbol('transportQuarantinePointer')
 const ROUTE_CAPABILITY_EFFECTS = Object.freeze({
   PRE_ROUTE: Object.freeze(['read']),
   DIRECT: Object.freeze(['isolated-write', 'read', 'run', 'write']),
@@ -670,19 +1114,36 @@ function normalizeTaskDeadline(declared, options = {}) {
       deadline.recoveryAndFinalizationReservePercent > 100) {
     return { valid: false, code: 'TASK_DEADLINE_INVALID', reason: 'task deadline is malformed' }
   }
-  if (!wallTimeUnbounded && absoluteMs <= nowMs) {
-    return { valid: false, code: 'TASK_DEADLINE_EXPIRED', reason: 'task deadline has expired' }
-  }
-  const wallMs = wallTimeUnbounded ? productHardMaximumMs : absoluteMs - nowMs
-  if (!wallTimeUnbounded && declared && wallMs > productHardMaximumMs) {
-    return { valid: false, code: 'TASK_DEADLINE_EXCEEDS_PRODUCT_MAXIMUM', reason: 'task deadline exceeds the product hard maximum' }
-  }
-  const verificationReserveMs = Math.floor(wallMs * deadline.verificationReservePercent / 100)
-  const finalizationReserveMs = Math.floor(wallMs * deadline.recoveryAndFinalizationReservePercent / 100)
+  const declaredRemainingMs = absoluteMs - nowMs
+  // The wall declaration is a convergence target and an external-write safety
+  // boundary, never authority to abandon required local completion. Expired,
+  // tiny, or overlong declarations retain their exact absolute timestamp for
+  // external-write denial while local work receives one finite operational
+  // window. Malformed bindings still fail closed above.
+  const wallMs = wallTimeUnbounded || declaredRemainingMs <= 0
+    ? productHardMaximumMs
+    : Math.min(productHardMaximumMs, Math.max(10, Math.floor(declaredRemainingMs)))
+  let verificationReserveMs = Math.floor(wallMs * deadline.verificationReservePercent / 100)
+  let finalizationReserveMs = Math.floor(wallMs * deadline.recoveryAndFinalizationReservePercent / 100)
+  let convergenceOverride = null
   if (verificationReserveMs + finalizationReserveMs >= wallMs) {
-    return { valid: false, code: 'TASK_DEADLINE_INSUFFICIENT', reason: 'deadline leaves no production interval after protected reserves' }
+    verificationReserveMs = Math.floor(wallMs * 0.25)
+    finalizationReserveMs = Math.floor(wallMs * 0.10)
+    convergenceOverride = 'declared reserves consumed the local production interval'
   }
-  return { valid: true, deadline: { ...deadline }, wallMs, verificationReserveMs, finalizationReserveMs }
+  if (!wallTimeUnbounded && declaredRemainingMs <= 0) {
+    convergenceOverride = 'declared wall target elapsed before local completion'
+  } else if (!wallTimeUnbounded && declaredRemainingMs > productHardMaximumMs) {
+    convergenceOverride = 'declared wall target exceeded the finite product completion window'
+  }
+  return {
+    valid: true,
+    deadline: { ...deadline },
+    wallMs,
+    verificationReserveMs,
+    finalizationReserveMs,
+    ...(convergenceOverride ? { convergenceOverride } : {}),
+  }
 }
 
 function accountingDelta(overrides = {}) {
@@ -865,6 +1326,250 @@ function hashText(value) {
   return crypto.createHash('sha256').update(String(value)).digest('hex')
 }
 
+function createCanonicalMissionProjection(sourceRequest, options = {}) {
+  const source = String(sourceRequest == null ? '' : sourceRequest)
+  let parsed = null
+  try { parsed = JSON.parse(source) } catch {}
+  const canonicalRequest = parsed && parsed.schemaVersion === 1 &&
+      Array.isArray(parsed.argv) && parsed.argv.length > 0 &&
+      parsed.argv.every(value => typeof value === 'string')
+    ? parsed : null
+  if (options.strict === true && (!canonicalRequest || JSON.stringify(canonicalRequest) !== source)) {
+    throw new SupervisorIntegrationError(
+      'ACTIVATION_RECEIPT_INVALID',
+      'canonical original-request projection requires the exact canonical request JSON bytes',
+    )
+  }
+  const parsedPrefix = canonicalRequest
+    ? parseActivationControlPrefix(canonicalRequest.argv)
+    : Object.freeze({ controls: Object.freeze([]), missionArgv: Object.freeze([source]), missionStart: 0 })
+  if (!Array.isArray(parsedPrefix.missionArgv) || parsedPrefix.missionArgv.length === 0) {
+    throw new SupervisorIntegrationError(
+      'ACTIVATION_RECEIPT_INVALID',
+      'canonical request contains controls but no original-request arguments',
+    )
+  }
+  const canonicalMission = JSON.stringify({
+    schemaVersion: 1,
+    argv: [...parsedPrefix.missionArgv],
+  })
+  const body = Object.freeze({
+    schemaVersion: 1,
+    kind: 'codex-canonical-mission-projection',
+    sourceRequestHash: hashText(source),
+    sourceRequestBytes: Buffer.byteLength(source, 'utf8'),
+    controlsHash: hashText(stableStringify(parsedPrefix.controls || [])),
+    missionStart: Number(parsedPrefix.missionStart || 0),
+    canonicalMissionHash: hashText(canonicalMission),
+    canonicalMissionBytes: Buffer.byteLength(canonicalMission, 'utf8'),
+  })
+  return Object.freeze({
+    ...body,
+    canonicalMission,
+    projectionHash: hashText(stableStringify(body)),
+  })
+}
+
+function bindCanonicalMissionForChild(projection, input = {}) {
+  if (!projection || projection.kind !== 'codex-canonical-mission-projection' ||
+      typeof projection.canonicalMission !== 'string' ||
+      projection.canonicalMissionHash !== hashText(projection.canonicalMission) ||
+      projection.canonicalMissionBytes !== Buffer.byteLength(projection.canonicalMission, 'utf8')) {
+    throw new SupervisorIntegrationError(
+      'ACTIVATION_RECEIPT_INVALID',
+      'external child original-request projection is missing or corrupt',
+    )
+  }
+  const { canonicalMission: _canonicalMission, projectionHash, ...projectionBody } = projection
+  if (projectionHash !== hashText(stableStringify(projectionBody)) ||
+      projection.sourceRequestHash !== input.sourceRequestHash ||
+      typeof input.requestEnvelopeHash !== 'string' || !input.requestEnvelopeHash ||
+      typeof input.activationId !== 'string' || !input.activationId ||
+      !Number.isSafeInteger(input.generation) || input.generation < 1 ||
+      typeof input.workItemId !== 'string' || !input.workItemId) {
+    throw new SupervisorIntegrationError(
+      'ACTIVATION_RECEIPT_INVALID',
+      'external child original-request projection does not match the immutable activation/request binding',
+    )
+  }
+  const body = Object.freeze({
+    schemaVersion: 1,
+    kind: 'codex-child-mission-binding',
+    activationId: input.activationId,
+    generation: input.generation,
+    workItemId: input.workItemId,
+    requestEnvelopeHash: input.requestEnvelopeHash,
+    sourceRequestHash: projection.sourceRequestHash,
+    projectionHash,
+    canonicalMissionHash: projection.canonicalMissionHash,
+    canonicalMissionBytes: projection.canonicalMissionBytes,
+  })
+  return Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
+}
+
+function validateCanonicalMissionLaunch(record) {
+  const binding = record && record.missionBinding
+  const mission = record && record.canonicalMission
+  if (!binding || binding.schemaVersion !== 1 || binding.kind !== 'codex-child-mission-binding' ||
+      typeof mission !== 'string' || binding.canonicalMissionHash !== hashText(mission) ||
+      binding.canonicalMissionBytes !== Buffer.byteLength(mission, 'utf8') ||
+      binding.activationId !== record.activationId || binding.generation !== record.generation ||
+      binding.workItemId !== record.workItemId ||
+      !record.dispatch || !record.dispatch.requestPointer ||
+      binding.requestEnvelopeHash !== record.dispatch.requestPointer.hash) {
+    throw new SupervisorIntegrationError(
+      'ACTIVATION_RECEIPT_INVALID',
+      'external Codex launch lacks one exact hash-bound canonical original request',
+    )
+  }
+  const { bindingHash, ...body } = binding
+  if (bindingHash !== hashText(stableStringify(body))) {
+    throw new SupervisorIntegrationError(
+      'ACTIVATION_RECEIPT_INVALID',
+      'external Codex original-request binding hash is invalid',
+    )
+  }
+  return mission
+}
+
+const MODEL_VISIBLE_MISSION_PROSE_FIELDS = new Set([
+  'assignment',
+  'checkid',
+  'checks',
+  'dependencies',
+  'description',
+  'expectedobservation',
+  'nonoverlapreason',
+  'plannedchecks',
+  'precondition',
+  'procedure',
+  'reason',
+  'requestedresult',
+  'responsibilities',
+  'responsibility',
+  'statement',
+  'success',
+  'successchecklist',
+  'whattheuserwants',
+])
+
+function canonicalMissionEchoProjection(canonicalMission, missionBinding) {
+  let parsed
+  try { parsed = JSON.parse(canonicalMission) } catch {}
+  if (!parsed || parsed.schemaVersion !== 1 || !Array.isArray(parsed.argv) ||
+      parsed.argv.length < 1 || parsed.argv.some(value => typeof value !== 'string') ||
+      !missionBinding || missionBinding.canonicalMissionHash !== hashText(canonicalMission)) {
+    throw new SupervisorIntegrationError(
+      'ACTIVATION_RECEIPT_INVALID',
+      'model-visible original-request projection requires the validated canonical request binding',
+    )
+  }
+  return Object.freeze({
+    canonicalMission,
+    canonicalReference: `[canonical-mission:${missionBinding.canonicalMissionHash}]`,
+    arguments: Object.freeze(parsed.argv.map((value, index) => Object.freeze({
+      value,
+      bytes: Buffer.byteLength(value, 'utf8'),
+      reference: `[canonical-mission-argument:${index+1}:${hashText(value)}]`,
+    }))),
+  })
+}
+
+function replaceCanonicalMissionEcho(value, projection, exactField = false) {
+  if (typeof value !== 'string') return value
+  let visible = value === projection.canonicalMission
+    ? projection.canonicalReference
+    : value.split(projection.canonicalMission).join(projection.canonicalReference)
+  for (const argument of projection.arguments) {
+    if (!argument.value) continue
+    if (visible === argument.value && exactField) {
+      visible = argument.reference
+      continue
+    }
+    // Substring replacement is intentionally limited to large exact payloads.
+    // Short words such as "fix", "test", or a path fragment can occur in an
+    // independently derived acceptance statement without being a copied
+    // mission. A whole semantic field remains unambiguous at any length.
+    if (argument.bytes >= 64 && visible.includes(argument.value)) {
+      visible = visible.split(argument.value).join(argument.reference)
+    }
+  }
+  return visible
+}
+
+function projectModelVisibleMissionEchoes(value, projection, fieldName = null) {
+  const normalizedField = fieldName === null
+    ? null : String(fieldName).normalize('NFKC').replace(/[^A-Za-z0-9]/gu, '').toLowerCase()
+  const proseField = normalizedField !== null && MODEL_VISIBLE_MISSION_PROSE_FIELDS.has(normalizedField)
+  if (typeof value === 'string') {
+    // The complete canonical mission and long argv payloads are unique enough
+    // to project from every model-visible string, including provider-defined
+    // evidence keys. Short argv literals are projected only in known semantic
+    // prose fields so ordinary route/format metadata such as "direct" or
+    // "test" is not accidentally rewritten.
+    return replaceCanonicalMissionEcho(value, projection, proseField)
+  }
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map(item =>
+      projectModelVisibleMissionEchoes(item, projection, fieldName)))
+  }
+  if (!value || typeof value !== 'object' || Buffer.isBuffer(value)) return value
+  return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, child]) => [
+    key,
+    projectModelVisibleMissionEchoes(child, projection, key),
+  ])))
+}
+
+function modelVisibleDispatch(dispatch, options = {}) {
+  const visible = { ...(dispatch || {}) }
+  if (options.canonicalAssignment === true) {
+    // The canonical assignment already carries the exact task, checklist,
+    // ownership, and checks. Do not repeat that prose through dispatch.brief
+    // or the lossless overflow slice which buildContextFreeBrief uses for a
+    // large assignment. Keep only fields not represented by the canonical
+    // assignment (dependencies/return shape) in the model-visible slice.
+    delete visible.brief
+    delete visible.briefBytes
+    const fetchedEvidence = visible.fetchedEvidence
+    const briefSlice = fetchedEvidence && !Array.isArray(fetchedEvidence) &&
+      fetchedEvidence.briefSlice && typeof fetchedEvidence.briefSlice === 'object'
+      ? fetchedEvidence.briefSlice : null
+    if (briefSlice && briefSlice.fields && typeof briefSlice.fields === 'object') {
+      const residualFields = { ...briefSlice.fields }
+      for (const field of ['assignment', 'successChecklist', 'success', 'ownership', 'checks']) {
+        delete residualFields[field]
+      }
+      const residualEvidence = { ...fetchedEvidence }
+      if (Object.keys(residualFields).length > 0) {
+        residualEvidence.briefSlice = Object.freeze({ ...briefSlice, fields: Object.freeze(residualFields) })
+      } else {
+        delete residualEvidence.briefSlice
+      }
+      if (Object.keys(residualEvidence).length > 0) visible.fetchedEvidence = Object.freeze(residualEvidence)
+      else delete visible.fetchedEvidence
+    }
+  }
+  if (Object.hasOwn(visible, 'exactRequest')) {
+    const exactRequestBytes = Buffer.isBuffer(visible.exactRequest)
+      ? visible.exactRequest.length
+      : Buffer.byteLength(String(visible.exactRequest), 'utf8')
+    visible.exactRequestControllerBinding = Object.freeze({
+      controllerVerified: true,
+      sha256: visible.exactRequestHash,
+      bytes: exactRequestBytes,
+    })
+    delete visible.exactRequest
+  }
+  if (options.canonicalMission !== undefined || options.missionBinding !== undefined) {
+    const projection = canonicalMissionEchoProjection(
+      options.canonicalMission,
+      options.missionBinding,
+    )
+    return projectModelVisibleMissionEchoes(visible, projection)
+  }
+  return Object.freeze(visible)
+}
+
 function activationAttestationPayload(attestation) {
   return Buffer.from(JSON.stringify({
     schemaVersion: attestation.schemaVersion,
@@ -907,6 +1612,66 @@ function providerRuntimeIdentityHash(record) {
   }), 'utf8'))
 }
 
+function activationProviderTrustMode(record) {
+  const trust = record && record.providerTrust
+  const capabilities = ['isolation', 'privateSkillRoot', 'processOwnership']
+  if (!trust || !/^[a-f0-9]{64}$/u.test(trust.sha256 || '')) return null
+  if (trust.status === 'VERIFIED') {
+    return Object.freeze({ verificationMethod: 'live-conformance-suite', capabilities })
+  }
+  const keys = [
+    'activationId', 'admissionMode', 'capabilityGeneration', 'enforcementProofSha256',
+    'evidenceSha256', 'payloadManifestSha256', 'probedAt', 'processOwnershipProbeSha256',
+    'providerAdmissionSha256', 'providerProbeSha256', 'providerRecordSha256',
+    'registrySha256', 'requestSha256', 'runtimeIdentityHash', 'safetyInspectionSha256',
+    'schemaVersion', 'sha256', 'status', 'targetIdentitySha256', 'verifiedCapabilities',
+  ]
+  const local = record.localConformance
+  const probe = local && local.processProbe
+  const registry = local && local.processRegistry
+  const unsigned = { ...trust }
+  delete unsigned.sha256
+  const probeUnsigned = probe && { ...probe }
+  if (probeUnsigned) delete probeUnsigned.probeHash
+  let registryHash = null
+  try {
+    const item = fs.lstatSync(registry.path)
+    if (!item.isFile() || item.isSymbolicLink() || Number(item.nlink) !== 1 ||
+        !pathIsInside(record.activationRoot, registry.path)) return null
+    registryHash = sha256Bytes(fs.readFileSync(registry.path))
+  } catch { return null }
+  if (trust.status !== 'LOCAL_CONFORMANCE' || trust.schemaVersion !== '2.0.0' ||
+      trust.admissionMode !== 'explicit-local-activation' ||
+      JSON.stringify(Object.keys(trust).sort()) !== JSON.stringify(keys.sort()) ||
+      trust.sha256 !== hashText(stableStringify(unsigned)) ||
+      ![trust.registrySha256, trust.providerRecordSha256, trust.evidenceSha256,
+        trust.runtimeIdentityHash, trust.providerAdmissionSha256]
+        .every(value => /^[a-f0-9]{64}$/u.test(value || '')) ||
+      trust.activationId !== record.activationId ||
+      trust.capabilityGeneration !== record.capability.generation ||
+      trust.requestSha256 !== record.request.sha256 ||
+      trust.targetIdentitySha256 !== hashText(stableStringify(record.target)) ||
+      trust.payloadManifestSha256 !== record.activationBoundary.payloadManifestSha256 ||
+      trust.enforcementProofSha256 !== record.activationBoundary.enforcementProof.sha256 ||
+      trust.providerProbeSha256 !== hashText(stableStringify(record.providerProbe)) ||
+      trust.safetyInspectionSha256 !== hashText(stableStringify(record.safety)) ||
+      !Number.isFinite(Date.parse(trust.probedAt)) ||
+      JSON.stringify(trust.verifiedCapabilities) !== JSON.stringify(capabilities) ||
+      !local || local.schemaVersion !== 1 ||
+      JSON.stringify(Object.keys(local).sort()) !==
+        JSON.stringify(['processProbe', 'processRegistry', 'schemaVersion']) ||
+      !probe || probe.schemaVersion !== 1 || probe.kind !== 'owned-process-conformance' ||
+      probe.drained !== true || probe.terminalStatus !== 'DONE' ||
+      probe.targetKey !== trust.targetIdentitySha256 ||
+      !probeUnsigned || probe.probeHash !== hashText(stableStringify(probeUnsigned)) ||
+      !registry || registry.sha256 !== registryHash ||
+      trust.processOwnershipProbeSha256 !== hashText(stableStringify(local))) return null
+  return Object.freeze({
+    verificationMethod: 'activation-local-conformance',
+    capabilities,
+  })
+}
+
 function verifyActivationProviderAttestation(record, environment = process.env, now = Date.now()) {
   const binding = record.providerAttestation
   const attestation = binding && binding.attestation
@@ -916,6 +1681,7 @@ function verifyActivationProviderAttestation(record, environment = process.env, 
   const expiresAt = Date.parse(attestation && attestation.expiresAt)
   const attestationHash = attestation && sha256Bytes(Buffer.from(JSON.stringify(attestation), 'utf8'))
   const capabilitiesHash = sha256Bytes(Buffer.from(JSON.stringify(record.providerCapabilities), 'utf8'))
+  const trustMode = activationProviderTrustMode(record)
   if (!binding || binding.contractVersion !== '2.0.0' || binding.attestationSha256 !== attestationHash ||
       binding.providerCapabilitiesSha256 !== capabilitiesHash ||
       !publicKey || publicKey.algorithm !== 'ed25519' || publicKey.format !== 'spki-der' ||
@@ -928,9 +1694,9 @@ function verifyActivationProviderAttestation(record, environment = process.env, 
       attestation.expiresAt !== record.capability.expiresAt ||
       attestation.runtimeIdentityHash !== providerRuntimeIdentityHash(record) ||
       !/^[A-Za-z0-9_-]{16,128}$/.test(attestation.activationNonce || '') ||
-      attestation.verificationMethod !== 'live-conformance-suite' ||
+      !trustMode || attestation.verificationMethod !== trustMode.verificationMethod ||
       JSON.stringify(attestation.verifiedCapabilities) !==
-        JSON.stringify(['isolation', 'privateSkillRoot', 'processOwnership']) ||
+        JSON.stringify(trustMode && trustMode.capabilities) ||
       !record.providerTrust ||
       attestation.canonicalProviderTrustSha256 !== record.providerTrust.sha256 ||
       attestation.result !== 'supported' || !signature || signature.algorithm !== 'ed25519' ||
@@ -1054,9 +1820,8 @@ class RuntimeCapabilityAuthority {
     const signature = crypto.createHmac('sha256', this.key).update(JSON.stringify(unsigned)).digest('hex')
     const actual = Buffer.from(String(receipt.signature || ''), 'hex')
     const wanted = Buffer.from(signature, 'hex')
-    const expiresAtMs = Date.parse(receipt.expiresAt)
     if (actual.length !== wanted.length || !crypto.timingSafeEqual(actual, wanted) ||
-        Number(this.now()) >= expiresAtMs || Object.entries(this.binding).some(([key, value]) => receipt[key] !== value) ||
+        Object.entries(this.binding).some(([key, value]) => receipt[key] !== value) ||
         expected.runId !== this.binding.runId || expected.generation !== this.binding.generation ||
         expected.targetIdentity !== this.binding.targetIdentity ||
         !receipt.allowedRoutes.includes(expected.route)) {
@@ -1794,19 +2559,26 @@ class RolePolicy {
     ].includes(child)) {
       throw new SupervisorIntegrationError('ROLE_POLICY_DENIED', `${child} is not part of ${route}`)
     }
+    const definition = this.roles.get(child)
+    const codexSingleWorkerRoadmapEdge = route === 'ROADMAP' &&
+      parent === 'run-owner' && child === 'worker' && definition.legalParents.includes(parent)
     const matching = this.contract.phaseAdjacency.filter(edge =>
       (edge.route === route || edge.route === 'ANY') &&
       edge.parent === parent &&
       edge.children.includes(child),
     )
-    if (matching.length !== 1) {
+    if (matching.length !== 1 && !codexSingleWorkerRoadmapEdge) {
       throw new SupervisorIntegrationError('ROLE_POLICY_DENIED', `illegal ${route} parent/child edge ${parent} -> ${child}`)
     }
-    const definition = this.roles.get(child)
     if (!definition.legalParents.includes(parent)) {
       throw new SupervisorIntegrationError('ROLE_POLICY_DENIED', `role ${child} rejects parent ${parent}`)
     }
-    return { parent, child, route, definition, alias, edge: matching[0] }
+    return {
+      parent, child, route, definition, alias,
+      edge: matching[0] || {
+        route, phase: 'roadmap-execution', parent, children: [child], codexSingleWorker: true,
+      },
+    }
   }
 
   bindPhysicalChild(input) {
@@ -2117,32 +2889,17 @@ function validateLiveCheckingPlan(decision = {}) {
       'live checker execution requires the exact one-or-two seat plan with distinct named risks',
     )
   }
-  const semanticRiskRequiresTwoCheckers = Boolean(
-    (decision.capturedDomainContracts || []).some(contract =>
-      contract && contract.kind === 'HIDDEN_EXTERNAL_ORACLE') ||
-    (decision.risks || []).length > 0 || (decision.missingInformation || []).length > 0,
-  )
   const responsibilities = [...checking.responsibilities]
   const semanticObligations = [
     ...(decision.risks || []), ...(decision.missingInformation || []),
   ].filter(value => typeof value === 'string' && value.trim())
-  if (checkerCount === 1 && semanticRiskRequiresTwoCheckers) {
-    const boundary = semanticObligations.length > 0
-      ? semanticObligations.join(' | ')
-      : (decision.plannedChecks || []).find(value => typeof value === 'string' && value.trim()) ||
-        'the requested behavior boundary'
-    responsibilities.push(
-      `Independently falsify the exact version with positive, negative, and boundary observations for: ${boundary}`,
-    )
-  } else if (checkerCount === 2 && semanticObligations.length > 0) {
+  if (checkerCount === 2 && semanticObligations.length > 0) {
     responsibilities[1] = `${responsibilities[1]} Explicitly falsify these semantic risks and unknowns: ${semanticObligations.join(' | ')}`
   }
   return Object.freeze({
-    checkerCount: responsibilities.length,
+    checkerCount,
     responsibilities: Object.freeze(responsibilities),
-    nonOverlapReason: semanticRiskRequiresTwoCheckers
-      ? 'The second seat independently falsifies the highest-risk semantic boundary with a distinct evidence source and method.'
-      : checking.nonOverlapReason || (responsibilities.length > 1
+    nonOverlapReason: checking.nonOverlapReason || (responsibilities.length > 1
       ? 'The second seat independently falsifies semantic boundaries with a distinct evidence source and method.'
       : null),
   })
@@ -2152,51 +2909,25 @@ async function executePreProductionRuntimeGates(input = {}) {
   const depthTrigger = input.recipe && input.recipe.runtimeGatePlan &&
     input.recipe.runtimeGatePlan.triggers && input.recipe.runtimeGatePlan.triggers.depthProber
   if (!depthTrigger || depthTrigger.required !== true) return Object.freeze({ depthProbe: 'SKIPPED' })
-  if (typeof input.launch !== 'function') {
-    throw new SupervisorIntegrationError('DEPTH_PROBE_REQUIRED', 'depth specialist launcher is unavailable')
-  }
-  const ownership = Array.isArray(input.ownership) && input.ownership.length ? input.ownership : ['workspace']
-  const depthResult = input.durableResult || await input.launch({
-    workItemId: 'conditional-depth-prober', logicalRole: 'diagnostic-probe', parent: 'run-owner',
-    purpose: 'diagnostic',
-    assignment: `Probe the deepest-cause layer before production because: ${depthTrigger.reasons.join(', ')}. Read and run focused diagnostics only.`,
-    ownership,
-    success: ['Return a concrete deepest-cause layer with evidence.'],
-    checks: ['No production mutation; bind every claimed path and result.'],
-    fetchedEvidence: input.fetchedEvidence || null,
-    bounded: true,
-    nextReadyAfter: Array.isArray(input.nextReadyAfter) ? input.nextReadyAfter : ['work-1'],
+  // Wrong-layer facts are already part of the immutable route decision. A
+  // separate read-only model turn cannot strengthen that authority and used
+  // to add a pure-cost diagnostic generation before the product worker. Bind
+  // the exact reasons into the one worker's evidence instead; the worker owns
+  // root-cause inspection, implementation, and its author-side checks in the
+  // same production context, followed by independent verification.
+  const directiveBody = Object.freeze({
+    schemaVersion: 1,
+    kind: 'controller-depth-directive',
+    reasons: Object.freeze([...new Set(depthTrigger.reasons.map(String))]),
+    disposition: 'PRODUCT_WORKER_INSPECT_IMPLEMENT_VERIFY',
   })
-  if (!depthResult || depthResult.code !== 'PASS') {
-    throw new SupervisorIntegrationError(
-      'DEPTH_PROBE_REQUIRED',
-      'the conditionally required depth specialist did not pass before production',
-    )
-  }
-  return Object.freeze({ depthProbe: 'PASS', workItemId: 'conditional-depth-prober' })
-}
-
-function canonicalWorkerRuntimeSignals(result) {
-  const supplied = result && result.payload && result.payload.runtimeSignals
-  if (supplied === undefined) return null
-  const body = supplied && typeof supplied === 'object' && !Array.isArray(supplied)
-    ? {
-        wrongLayerEvidence: supplied.wrongLayerEvidence === true,
-        repeatedFailureCount: Number(supplied.repeatedFailureCount || 0),
-        crossModuleUncertainty: supplied.crossModuleUncertainty === true,
-        evidenceIds: Array.isArray(supplied.evidenceIds) ? supplied.evidenceIds.map(String) : [],
-      }
-    : null
-  if (!body || !Number.isSafeInteger(body.repeatedFailureCount) || body.repeatedFailureCount < 0 ||
-      !uniqueStrings(body.evidenceIds) ||
-      ((body.wrongLayerEvidence || body.repeatedFailureCount > 0 || body.crossModuleUncertainty) &&
-        body.evidenceIds.length === 0)) {
-    throw new SupervisorIntegrationError(
-      'RUNTIME_SIGNALS_INVALID',
-      'worker runtime signals require canonical flags, an exact failure count, and immutable evidence identifiers',
-    )
-  }
-  return Object.freeze({ ...body, signalHash: hashText(stableStringify(body)) })
+  return Object.freeze({
+    depthProbe: 'PRODUCT_WORKER_REQUIRED',
+    directive: Object.freeze({
+      ...directiveBody,
+      evidenceHash: hashText(stableStringify(directiveBody)),
+    }),
+  })
 }
 
 function planOverlayExecution(steps = []) {
@@ -2269,15 +3000,24 @@ function canonicalCheckerTestOutcomes(supplied, namedChecks = []) {
   const outcomes = []
   for (const item of supplied) {
     if (!item || typeof item !== 'object' || Array.isArray(item) ||
-        Object.keys(item).some(key => !['command', 'status', 'fingerprint'].includes(key)) ||
+        Object.keys(item).some(key => ![
+          'command', 'status', 'fingerprint', 'observationId', 'commandHash',
+        ].includes(key)) ||
         typeof item.command !== 'string' || !expected.has(item.command) || seen.has(item.command) ||
         !['PASS', 'FAIL'].includes(item.status) || typeof item.fingerprint !== 'string' ||
-        !/^[a-f0-9]{64}$/u.test(item.fingerprint)) return null
+        !/^[a-f0-9]{64}$/u.test(item.fingerprint) ||
+        ((item.observationId === undefined) !== (item.commandHash === undefined)) ||
+        (item.observationId !== undefined && (!/^[a-f0-9]{64}$/u.test(item.observationId) ||
+          !/^[a-f0-9]{64}$/u.test(item.commandHash)))) return null
     seen.add(item.command)
     outcomes.push(Object.freeze({
       command: item.command,
       status: item.status,
       fingerprint: item.fingerprint.trim(),
+      ...(item.observationId === undefined ? {} : {
+        observationId: item.observationId,
+        commandHash: item.commandHash,
+      }),
     }))
   }
   if (seen.size !== expected.size) return null
@@ -2289,8 +3029,26 @@ const INDEPENDENT_REFERENCE_METHOD_CLASSES = new Set([
   'metamorphic-property', 'independent-model',
 ])
 
-function canonicalIndependentReferenceMethod(supplied) {
-  const stringList = value => Array.isArray(value) && value.length > 0 && uniqueStrings(value) &&
+const REFERENCE_INVARIANT_FIELDS = Object.freeze({
+  positive: 'positiveInvariants',
+  negative: 'negativeInvariants',
+  boundary: 'boundaryInvariants',
+})
+
+function requiredReferenceInvariantCategories(obligations = [], namedChecks = []) {
+  const required = new Set(Array.isArray(namedChecks) && namedChecks.length > 0 ? ['positive'] : [])
+  for (const obligation of Array.isArray(obligations) ? obligations : []) {
+    for (const item of Array.isArray(obligation && obligation.cases) ? obligation.cases : []) {
+      if (item.polarity === 'must-hold') required.add('positive')
+      if (item.polarity === 'must-not-hold') required.add('negative')
+      if (item.phase === 'boundary') required.add('boundary')
+    }
+  }
+  return Object.freeze(['positive', 'negative', 'boundary'].filter(category => required.has(category)))
+}
+
+function canonicalIndependentReferenceMethod(supplied, requiredCategories = []) {
+  const stringList = value => Array.isArray(value) && uniqueStrings(value) &&
     value.every(item => typeof item === 'string' && item.trim() && item.length <= 512)
   if (!supplied || typeof supplied !== 'object' || Array.isArray(supplied) ||
       !INDEPENDENT_REFERENCE_METHOD_CLASSES.has(supplied.methodClass) ||
@@ -2299,7 +3057,11 @@ function canonicalIndependentReferenceMethod(supplied) {
       supplied.expectedOutputDerivedFromSubjectCode !== false ||
       supplied.subjectLogicReimplemented !== false ||
       !stringList(supplied.positiveInvariants) || !stringList(supplied.negativeInvariants) ||
-      !stringList(supplied.boundaryInvariants)) return null
+      !stringList(supplied.boundaryInvariants) ||
+      supplied.positiveInvariants.length + supplied.negativeInvariants.length +
+        supplied.boundaryInvariants.length < 1 ||
+      requiredCategories.some(category => !REFERENCE_INVARIANT_FIELDS[category] ||
+        supplied[REFERENCE_INVARIANT_FIELDS[category]].length === 0)) return null
   return Object.freeze({
     methodClass: supplied.methodClass,
     source: supplied.source.trim().toLowerCase().replace(/\s+/gu, ' '),
@@ -2353,11 +3115,14 @@ function assertDistinctEvidenceConsumption(checks = []) {
     }
     if (check.requireReferenceMethod === true) {
       const supplied = check.referenceMethod
-      const normalized = canonicalIndependentReferenceMethod(supplied)
+      const normalized = canonicalIndependentReferenceMethod(
+        supplied,
+        Array.isArray(check.requiredInvariantCategories) ? check.requiredInvariantCategories : [],
+      )
       if (!normalized) {
         throw new SupervisorIntegrationError(
           'REFERENCE_METHOD_INVALID',
-          'independent checking requires a non-circular method with positive, negative, and edge-case observations',
+          'independent checking requires a non-circular method with every applicable invariant category',
           { checkerId: check.checkerId },
         )
       }
@@ -2503,26 +3268,6 @@ function validateWorkerRequestedTransition(report) {
     )
   }
   return Object.freeze({ ...request, invalidateEvidenceIds: Object.freeze([...request.invalidateEvidenceIds]) })
-}
-
-function consumeSplitRequired(report, context = {}) {
-  if (!report || report.code !== 'SPLIT_REQUIRED') return null
-  const parts = Array.isArray(report.remainingConcerns) ? report.remainingConcerns : []
-  if (!['DIRECT', 'LIGHT', 'ROADMAP'].includes(context.route) || context.depth !== 0 ||
-      parts.length < 2 || parts.length > 3 || !uniqueStrings(parts) ||
-      !Number.isSafeInteger(context.remainingLaunches) || context.remainingLaunches < parts.length ||
-      typeof context.parentWorkItemId !== 'string' || !context.parentWorkItemId) {
-    throw new SupervisorIntegrationError(
-      'SPLIT_DECOMPOSITION_INVALID',
-      'SPLIT_REQUIRED must be consumed once by the parent under the current route and launch budget',
-    )
-  }
-  return Object.freeze({
-    route: context.route, depth: 1,
-    parts: Object.freeze(parts.map((assignment, index) => Object.freeze({
-      workItemId: `${context.parentWorkItemId}:split:${index + 1}`, assignment,
-    }))),
-  })
 }
 
 function requiredCompletionGates(route, tier) {
@@ -2674,7 +3419,9 @@ function selectWorkRecipe(input = {}) {
     }),
     triggers: runtimeTriggers,
     executionPath: Object.freeze({
-      beforeProduction: Object.freeze(runtimeTriggers.depthProber.required ? ['conditional-depth-prober'] : []),
+      beforeProduction: Object.freeze([]),
+      controllerDirectives: Object.freeze(runtimeTriggers.depthProber.required
+        ? ['product-worker-wrong-layer-inspection'] : []),
       documentationPlanning: runtimeTriggers.documentationPlanning.required ? 'REQUIRED' : 'SKIP',
       performanceOracle: runtimeTriggers.performance.required ? 'REQUIRED' : 'SKIP',
     }),
@@ -2768,21 +3515,580 @@ function parseCodexJsonl(source) {
   return accumulator.snapshot()
 }
 
-function createCodexJsonlAccumulator() {
+function codexTransportEvidence(parsed = {}) {
+  const commandFailures = parsed.commandExecutionFailures &&
+    typeof parsed.commandExecutionFailures === 'object'
+    ? parsed.commandExecutionFailures : {}
+  const verificationObservations = parsed.verificationObservations &&
+    typeof parsed.verificationObservations === 'object'
+    ? parsed.verificationObservations : {}
+  return Object.freeze({
+    schemaVersion: 1,
+    eventCount: Number.isSafeInteger(parsed.eventCount) ? parsed.eventCount : 0,
+    retainedEventCount: Number.isSafeInteger(parsed.retainedEventCount)
+      ? parsed.retainedEventCount : 0,
+    retainedEventBytes: Number.isSafeInteger(parsed.retainedEventBytes)
+      ? parsed.retainedEventBytes : 0,
+    eventStreamHash: /^[a-f0-9]{64}$/u.test(parsed.eventStreamHash || '')
+      ? parsed.eventStreamHash : null,
+    rawOutputHash: /^[a-f0-9]{64}$/u.test(parsed.rawOutputHash || '')
+      ? parsed.rawOutputHash : null,
+    commandExecutionFailures: Object.freeze({
+      count: Number.isSafeInteger(commandFailures.count) && commandFailures.count >= 0
+        ? commandFailures.count : 0,
+      evidenceHash: /^[a-f0-9]{64}$/u.test(commandFailures.evidenceHash || '')
+        ? commandFailures.evidenceHash : null,
+      first: commandFailures.first || null,
+      last: commandFailures.last || null,
+    }),
+    verificationObservations: Object.freeze({
+      count: Number.isSafeInteger(verificationObservations.count) &&
+        verificationObservations.count >= 0 ? verificationObservations.count : 0,
+      invalidCount: Number.isSafeInteger(verificationObservations.invalidCount) &&
+        verificationObservations.invalidCount >= 0 ? verificationObservations.invalidCount : 0,
+      boundsExceeded: verificationObservations.boundsExceeded === true,
+      evidenceHash: /^[a-f0-9]{64}$/u.test(verificationObservations.evidenceHash || '')
+        ? verificationObservations.evidenceHash : null,
+      receipts: Object.freeze(Array.isArray(verificationObservations.receipts)
+        ? verificationObservations.receipts.map(receipt => Object.freeze({ ...receipt })) : []),
+    }),
+  })
+}
+
+function validCheckerObservationCore(input, checkIds) {
+  return checkIds.length > 0 && checkIds.length <= CODEX_CHECK_OBSERVATION_MAX_CASES &&
+    checkIds.every(checkId => checkId && Buffer.byteLength(checkId, 'utf8') <= 1024) &&
+    typeof input.assignmentId === 'string' && Boolean(input.assignmentId) &&
+    /^[a-f0-9]{64}$/u.test(input.candidateHash || '') &&
+    /^[a-f0-9]{64}$/u.test(input.requestEnvelopeHash || '')
+}
+
+function normalizeExactCheckerCommandBindings(commandBindings, checkIds) {
+  if (commandBindings === undefined) return []
+  if (!Array.isArray(commandBindings)) return null
+  const normalized = commandBindings.map(binding => ({
+    checkId: binding && String(binding.checkId || ''),
+    commandHash: binding && /^[a-f0-9]{64}$/u.test(binding.commandHash || '')
+      ? binding.commandHash
+      : binding && typeof binding.command === 'string' && binding.command.trim()
+        ? hashText(binding.command) : null,
+  }))
+  if (normalized.some(binding => !checkIds.includes(binding.checkId) ||
+      !/^[a-f0-9]{64}$/u.test(binding.commandHash || '')) ||
+      new Set(normalized.map(binding => `${binding.checkId}\0${binding.commandHash}`)).size !==
+        normalized.length) return null
+  return normalized.sort((left, right) => left.checkId.localeCompare(right.checkId) ||
+    left.commandHash.localeCompare(right.commandHash))
+}
+
+function checkerObservationId(input, checkId) {
+  return hashText(stableStringify({
+    schemaVersion: 1,
+    kind: 'controller-check-observation-id',
+    assignmentId: input.assignmentId,
+    candidateHash: input.candidateHash,
+    requestEnvelopeHash: input.requestEnvelopeHash,
+    checkId,
+  }))
+}
+
+function createLegacyCheckerObservationBinding(input = {}) {
+  const checkIds = Array.isArray(input.checkIds) ? [...new Set(input.checkIds.map(String))] : []
+  const commandBindings = normalizeExactCheckerCommandBindings(input.commandBindings, checkIds)
+  if (!validCheckerObservationCore(input, checkIds) || !commandBindings || commandBindings.length === 0 ||
+      checkIds.some(checkId => !commandBindings.some(binding => binding.checkId === checkId))) {
+    throw new SupervisorIntegrationError(
+      'CHECK_OBSERVATION_BINDING_INVALID',
+      'legacy checker observation binding requires exact command authority for every named check',
+    )
+  }
+  const body = Object.freeze({
+    schemaVersion: 2,
+    assignmentId: input.assignmentId,
+    candidateHash: input.candidateHash,
+    requestEnvelopeHash: input.requestEnvelopeHash,
+    observationRequired: input.observationRequired !== false,
+    checkCount: checkIds.length,
+    checksHash: hashText(stableStringify(checkIds)),
+    commandBindings: Object.freeze(commandBindings.map(binding => Object.freeze(binding))),
+  })
+  return Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
+}
+
+function createCheckerObservationBinding(input = {}) {
+  if (input.schemaVersion === 2) return createLegacyCheckerObservationBinding(input)
+  const checkIds = Array.isArray(input.checkIds) ? [...new Set(input.checkIds.map(String))] : []
+  const commandBindings = normalizeExactCheckerCommandBindings(input.commandBindings, checkIds)
+  if (!validCheckerObservationCore(input, checkIds) || !commandBindings) {
+    throw new SupervisorIntegrationError(
+      'CHECK_OBSERVATION_BINDING_INVALID',
+      'checker observation binding requires a bounded assignment, exact version, request, and named checks',
+    )
+  }
+  const observations = checkIds.map((checkId, index) => {
+    const exactCommandHashes = commandBindings
+      .filter(binding => binding.checkId === checkId)
+      .map(binding => binding.commandHash)
+      .sort()
+    return Object.freeze({
+      checkId,
+      checkOrdinal: index + 1,
+      observationId: checkerObservationId(input, checkId),
+      authorizationMode: exactCommandHashes.length > 0 ? 'EXACT_COMMAND' : 'CANDIDATE_HARNESS',
+      exactCommandHashes: Object.freeze(exactCommandHashes),
+    })
+  })
+  const body = Object.freeze({
+    schemaVersion: 3,
+    assignmentId: input.assignmentId,
+    candidateHash: input.candidateHash,
+    requestEnvelopeHash: input.requestEnvelopeHash,
+    observationRequired: input.observationRequired !== false,
+    checkCount: checkIds.length,
+    checksHash: hashText(stableStringify(checkIds)),
+    commandPolicy: 'candidate-harness-v1',
+    observations: Object.freeze(observations),
+  })
+  return Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
+}
+
+function expectedCheckerObservationBinding(record = {}) {
+  const supplied = record.canonicalAssignment &&
+    record.canonicalAssignment.verificationObservationBinding
+  if (!supplied) return null
+  const input = {
+    assignmentId: record.canonicalAssignment.assignmentId,
+    candidateHash: record.candidateHash,
+    requestEnvelopeHash: record.canonicalAssignment.requestEnvelopeHash,
+    observationRequired: supplied.observationRequired,
+    checkIds: record.canonicalAssignment.checks,
+    commandBindings: supplied.schemaVersion === 2
+      ? supplied.commandBindings
+      : Array.isArray(supplied.observations)
+        ? supplied.observations.flatMap(observation =>
+            (observation.exactCommandHashes || []).map(commandHash => ({
+              checkId: observation.checkId,
+              commandHash,
+            })))
+        : null,
+  }
+  const expected = supplied.schemaVersion === 2
+    ? createLegacyCheckerObservationBinding(input)
+    : createCheckerObservationBinding(input)
+  if (stableStringify(supplied) !== stableStringify(expected)) {
+    throw new SupervisorIntegrationError(
+      'CHECK_OBSERVATION_BINDING_INVALID',
+      'checker observation binding differs from its controller-owned assignment and exact version',
+    )
+  }
+  return expected
+}
+
+function substantiveVerificationCommand(command, output) {
+  const normalizedCommand = String(command || '').trim()
+  const normalizedOutput = String(output || '').trim()
+  if (!normalizedCommand || !normalizedOutput) return false
+  const firstToken = normalizedCommand.match(/^(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*)?([^\s]+)/u)
+  const executable = firstToken ? path.posix.basename(firstToken[1].replace(/^['"]|['"]$/gu, '')) : ''
+  if (['true', 'false', 'echo', 'printf'].includes(executable)) return false
+  if (/^(?:\/usr\/bin\/env\s+)?(?:bash|dash|sh|zsh)\s+(?:-[A-Za-z]+\s+)*['"]?\s*(?:true|echo|printf)\b/iu
+    .test(normalizedCommand)) return false
+  if (/^(?:node|nodejs)(?:\.exe)?\s+(?:[^\s]+\s+)*(?:-e|--eval|-p|--print)(?:\s|=)/iu
+    .test(normalizedCommand) ||
+      /^(?:python(?:\d+(?:\.\d+)*)?|ruby|perl)(?:\.exe)?\s+(?:[^\s]+\s+)*-(?:c|e)(?:\s|$)/iu
+        .test(normalizedCommand)) return false
+  return true
+}
+
+function conservativeCommandTokens(command) {
+  const source = String(command || '').trim()
+  if (!source || /[\r\n;&|<>`$]/u.test(source)) return null
+  const tokens = []
+  let token = ''
+  let quote = null
+  let escaped = false
+  for (const character of source) {
+    if (escaped) {
+      token += character
+      escaped = false
+      continue
+    }
+    if (character === '\\' && quote !== "'") {
+      escaped = true
+      continue
+    }
+    if (quote) {
+      if (character === quote) quote = null
+      else token += character
+      continue
+    }
+    if (character === "'" || character === '"') {
+      quote = character
+      continue
+    }
+    if (/\s/u.test(character)) {
+      if (token) tokens.push(token)
+      token = ''
+      continue
+    }
+    token += character
+  }
+  if (escaped || quote) return null
+  if (token) tokens.push(token)
+  return tokens.length > 0 ? tokens : null
+}
+
+function genericCandidateHarnessCommand(command, context = {}) {
+  const tokens = conservativeCommandTokens(command)
+  if (!tokens) return false
+  let executableIndex = 0
+  if (path.basename(tokens[0]).toLowerCase() === 'env') {
+    executableIndex = 1
+    while (executableIndex < tokens.length &&
+        /^[A-Za-z_][A-Za-z0-9_]*=[^\s]+$/u.test(tokens[executableIndex])) executableIndex += 1
+  }
+  if (executableIndex >= tokens.length) return false
+  const executable = path.basename(tokens[executableIndex]).toLowerCase().replace(/\.exe$/u, '')
+  const deniedExecutables = new Set([
+    'true', 'false', 'echo', 'printf', 'cat', 'head', 'tail', 'sed', 'awk', 'grep', 'rg',
+    'find', 'ls', 'dir', 'pwd', 'stat', 'wc', 'tee', 'sha1sum', 'sha256sum', 'md5sum',
+    'readlink', 'realpath', 'type', 'which', 'where',
+  ])
+  if (deniedExecutables.has(executable)) return false
+  const args = tokens.slice(executableIndex + 1)
+  if (['node', 'nodejs'].includes(executable) &&
+      args.some(argument => ['-e', '--eval', '-p', '--print'].includes(argument.split('=', 1)[0]))) return false
+  if (/^(?:python(?:\d+(?:\.\d+)*)?|ruby|perl)$/u.test(executable) &&
+      args.some(argument => ['-c', '-e'].includes(argument))) return false
+  const normalizedCommand = String(command).replace(/\\/gu, '/').toLowerCase()
+  if (/(?:^|[\s'"/=])(?:scratch|oracle-output|oracle_output)(?:[\s'"/=.:-]|$)/u
+    .test(normalizedCommand)) return false
+  const boundary = context && context.checkerScratchBoundary
+  if (!boundary) return true
+  const writableRoots = [
+    boundary.writableScratchRoot,
+    boundary.temporaryRoot,
+    boundary.cacheRoot,
+    boundary.outputRoot,
+  ].filter(value => typeof value === 'string' && value).map(value => path.resolve(value))
+  for (const root of writableRoots) {
+    if (normalizedCommand.includes(root.replace(/\\/gu, '/').toLowerCase())) return false
+  }
+  const candidateRoot = typeof boundary.frozenCandidateRoot === 'string' && boundary.frozenCandidateRoot
+    ? path.resolve(boundary.frozenCandidateRoot) : null
+  const candidateFileToken = token => {
+    if (!candidateRoot || !path.isAbsolute(token)) return false
+    const resolved = path.resolve(token)
+    if (resolved === candidateRoot || !pathIsInside(candidateRoot, resolved)) return false
+    try {
+      const item = fs.lstatSync(resolved)
+      return item.isFile() && !item.isSymbolicLink()
+    } catch (_) {
+      return false
+    }
+  }
+  const shellExecutables = new Set(['bash', 'dash', 'sh', 'zsh', 'powershell', 'pwsh', 'cmd'])
+  if (shellExecutables.has(executable)) {
+    if (!boundary || !candidateRoot) return false
+    const loweredArgs = args.map(argument => argument.toLowerCase())
+    if (['bash', 'dash', 'sh', 'zsh'].includes(executable) &&
+        loweredArgs.some(argument => argument === '-c' || argument.startsWith('--command='))) return false
+    if (['powershell', 'pwsh'].includes(executable) && loweredArgs.some(argument =>
+      ['-c', '-command', '-encodedcommand', '-ec', '-commandwithargs'].includes(argument) ||
+        argument.startsWith('-command=') || argument.startsWith('-encodedcommand='))) return false
+    return args.some(candidateFileToken)
+  }
+  const workingDirectory = typeof context.workingDirectory === 'string' && context.workingDirectory
+    ? path.resolve(context.workingDirectory) : null
+  const workingInWritableScratch = workingDirectory && writableRoots.some(root =>
+    workingDirectory === root || pathIsInside(root, workingDirectory))
+  if (!workingInWritableScratch) return true
+  if (!candidateRoot) return false
+  return tokens.some(token => {
+    if (!path.isAbsolute(token)) return false
+    const resolved = path.resolve(token)
+    return resolved === candidateRoot || pathIsInside(candidateRoot, resolved)
+  })
+}
+
+function substantiveVerificationFailure(exitCode, output) {
+  if (!Number.isFinite(exitCode) || exitCode === 0 || [126, 127, 9009].includes(exitCode)) return false
+  const normalized = String(output || '').trim()
+  if (!normalized) return false
+  // Do not classify by generic error prose: a missing module, file, import,
+  // or collection target can be the exact product defect under test. Require
+  // a recognizable harness/assertion failure shape; mechanically unavailable
+  // commands (126/127/9009), empty output, and ambiguous nonzero output remain
+  // inconclusive. Typed capability limitations are downgraded separately.
+  return /(?:^|\n)\s*not ok\b/imu.test(normalized) ||
+    /(?:^|\n)\s*(?:---\s+)?FAIL(?::|\s|$)/mu.test(normalized) ||
+    /\b(?:[1-9]\d*\s+failed|fail(?:ure)?s?\s*[:=]\s*[1-9]\d*|assertionerror|failures!)\b/iu.test(normalized) ||
+    /test result:\s*FAILED\b/iu.test(normalized) ||
+    /"(?:status|code)"\s*:\s*"FAIL"/u.test(normalized)
+}
+
+function codexCommandExecutionObservation(event, eventIndex, context = {}) {
+  const item = event && event.type === 'item.completed' &&
+    event.item && typeof event.item === 'object' && event.item.type === 'command_execution'
+    ? event.item : null
+  if (!item) return null
+  const exitValue = item.exit_code ?? item.exitCode
+  const exitCode = typeof exitValue === 'number' && Number.isFinite(exitValue)
+    ? exitValue : typeof exitValue === 'string' && /^-?\d+$/u.test(exitValue.trim())
+      ? Number(exitValue) : null
+  const status = typeof item.status === 'string' ? item.status.trim().toLowerCase() : null
+  const command = typeof item.command === 'string' ? item.command : ''
+  const output = typeof item.aggregated_output === 'string'
+    ? item.aggregated_output : typeof item.output === 'string' ? item.output : ''
+  const successful = exitCode === 0 && status !== 'failed'
+  const observedTestFailure = !successful && substantiveVerificationFailure(exitCode, output)
+  const itemId = typeof item.id === 'string' && item.id ? item.id : null
+  const commandHash = hashText(command)
+  const outputHash = hashText(output)
+  const fingerprint = (successful || observedTestFailure) && itemId &&
+      substantiveVerificationCommand(command, output)
+    ? hashText(output.trim()) : null
+  const receiptBody = fingerprint ? Object.freeze({
+    eventIndex,
+    itemId,
+    exitCode,
+    status,
+    resultDisposition: successful ? 'ZERO_EXIT' : 'NONZERO_TEST_FAILURE',
+    commandHash,
+    outputHash,
+    fingerprint,
+    candidateHarnessAdmissible: genericCandidateHarnessCommand(command, context),
+  }) : null
+  return Object.freeze({
+    successful,
+    exitCode,
+    status,
+    eventIndex,
+    itemId,
+    commandHash,
+    outputHash,
+    receipt: receiptBody
+      ? Object.freeze({ ...receiptBody, observationHash: hashText(stableStringify(receiptBody)) })
+      : null,
+  })
+}
+
+function codexCommandExecutionFailure(event, eventIndex) {
+  const item = event && event.type === 'item.completed' &&
+    event.item && typeof event.item === 'object' && event.item.type === 'command_execution'
+    ? event.item : null
+  if (!item) return null
+  const exitValue = item.exit_code ?? item.exitCode
+  const exitCode = typeof exitValue === 'number' && Number.isFinite(exitValue)
+    ? exitValue : typeof exitValue === 'string' && /^-?\d+$/u.test(exitValue.trim())
+      ? Number(exitValue) : null
+  const status = typeof item.status === 'string' ? item.status.trim().toLowerCase() : null
+  if (!(exitCode !== null && exitCode !== 0) && status !== 'failed') return null
+  const command = typeof item.command === 'string' ? item.command : ''
+  const output = typeof item.aggregated_output === 'string'
+    ? item.aggregated_output : typeof item.output === 'string' ? item.output : ''
+  return Object.freeze({
+    eventIndex,
+    itemId: typeof item.id === 'string' && item.id ? item.id : null,
+    exitCode,
+    status,
+    commandHash: hashText(command),
+    outputHash: hashText(output),
+  })
+}
+
+function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
+  if (!output || !['PASS', 'FAIL'].includes(output.code) ||
+      !CHECKER_ROLES.has(record && record.logicalRole)) return output
+  let binding
+  try { binding = expectedCheckerObservationBinding(record) } catch (error) {
+    return Object.freeze({
+      ...output,
+      code: 'CHECK_INCONCLUSIVE',
+      description: 'A required check could not determine whether the exact result passes.',
+      stateClass: 'intermediate',
+      cause: Object.freeze({
+        event: 'CHECK_OBSERVATION_BINDING_INVALID',
+        reason: error.message,
+        unblockPath: 'Run one fresh checker with the controller-owned exact-version observation binding.',
+      }),
+    })
+  }
+  // Compatibility callers that do not construct a canonical production
+  // assignment have no controller-owned case identities to bind. Production
+  // launches always carry this binding.
+  if (!binding || binding.observationRequired === false) return output
+  const evidence = parsed && parsed.verificationObservations
+  const outcomes = output.payload && Array.isArray(output.payload.testOutcomes)
+    ? output.payload.testOutcomes : []
+  const expectedCases = new Set(record.canonicalAssignment.checks)
+  const legacyBinding = binding.schemaVersion === 2
+  const observationByCheck = new Map(legacyBinding ? [] : binding.observations
+    .map(observation => [observation.checkId, observation]))
+  const outcomeByCheck = new Map()
+  let invalidOutcome = outcomes.length !== expectedCases.size
+  for (const outcome of outcomes) {
+    const observation = outcome && observationByCheck.get(outcome.command)
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome) ||
+        typeof outcome.command !== 'string' || !expectedCases.has(outcome.command) ||
+        outcomeByCheck.has(outcome.command) || !['PASS', 'FAIL'].includes(outcome.status) ||
+        !/^[a-f0-9]{64}$/u.test(outcome.fingerprint || '') ||
+        (!legacyBinding && (!observation || outcome.observationId !== observation.observationId ||
+          !/^[a-f0-9]{64}$/u.test(outcome.commandHash || '')))) {
+      invalidOutcome = true
+      continue
+    }
+    outcomeByCheck.set(outcome.command, outcome)
+  }
+  const receipts = evidence && Array.isArray(evidence.receipts) ? evidence.receipts : []
+  const expectedCommandHashes = new Map(legacyBinding
+    ? binding.commandBindings.map(commandBinding => [commandBinding.checkId, new Set()])
+    : binding.observations.map(observation => [observation.checkId,
+        new Set(observation.exactCommandHashes)]))
+  if (legacyBinding) {
+    for (const commandBinding of binding.commandBindings) {
+      expectedCommandHashes.get(commandBinding.checkId).add(commandBinding.commandHash)
+    }
+  }
+  const missing = []
+  for (const checkId of expectedCases) {
+    const outcome = outcomeByCheck.get(checkId)
+    const authorized = expectedCommandHashes.get(checkId) || new Set()
+    const observation = observationByCheck.get(checkId)
+    if (!outcome || !receipts.some(receipt => receipt.fingerprint === outcome.fingerprint &&
+        (outcome.status !== 'PASS' || receipt.resultDisposition === 'ZERO_EXIT' ||
+          legacyBinding && receipt.resultDisposition === undefined) &&
+        (legacyBinding ? authorized.has(receipt.commandHash) :
+          receipt.commandHash === outcome.commandHash &&
+          (observation.authorizationMode === 'EXACT_COMMAND'
+            ? authorized.has(receipt.commandHash)
+            : receipt.candidateHarnessAdmissible === true)))) {
+      missing.push(checkId)
+    }
+  }
+  const fingerprintsByCommand = new Map()
+  for (const receipt of receipts) {
+    const fingerprints = fingerprintsByCommand.get(receipt.commandHash) || new Set()
+    fingerprints.add(receipt.fingerprint)
+    fingerprintsByCommand.set(receipt.commandHash, fingerprints)
+  }
+  const conflictingCommandHashes = [...fingerprintsByCommand]
+    .filter(([, fingerprints]) => fingerprints.size > 1)
+    .map(([commandHash]) => commandHash)
+  const hasNamedFailure = [...outcomeByCheck.values()].some(outcome => outcome.status === 'FAIL')
+  const aggregateContradiction = output.code === 'PASS' && hasNamedFailure ||
+    output.code === 'FAIL' && !hasNamedFailure
+  const invalidEvidence = !evidence || evidence.boundsExceeded === true ||
+    evidence.invalidCount > 0 || invalidOutcome || missing.length > 0 ||
+    conflictingCommandHashes.length > 0 || aggregateContradiction
+  if (!invalidEvidence) return output
+  const reasonParts = []
+  if (!evidence) reasonParts.push('the event stream contains no verification observation evidence')
+  if (evidence && evidence.boundsExceeded === true) reasonParts.push('observation evidence exceeded its finite bounds')
+  if (evidence && evidence.invalidCount > 0) reasonParts.push(`${evidence.invalidCount} command observation(s) were invalid`)
+  if (invalidOutcome) reasonParts.push('named test outcomes do not exactly cover the controller-owned case identities')
+  if (missing.length > 0) reasonParts.push(`${missing.length} named case(s) lack a matching admissible command observation`)
+  if (conflictingCommandHashes.length > 0) reasonParts.push(`${conflictingCommandHashes.length} same-version harness command(s) produced conflicting admissible outputs`)
+  if (aggregateContradiction) reasonParts.push('the aggregate verdict contradicts its named observations')
+  return Object.freeze({
+    ...output,
+    code: 'CHECK_INCONCLUSIVE',
+    description: 'A required check could not determine whether the exact result passes.',
+    stateClass: 'intermediate',
+    cause: Object.freeze({
+      event: conflictingCommandHashes.length > 0 || aggregateContradiction
+        ? 'CHECK_OBSERVATION_CONTRADICTION' : 'CHECK_OBSERVATION_INCOMPLETE',
+      reason: reasonParts.join('; '),
+      unblockPath: 'Run one fresh bounded checker reassessment and bind every named case to an admissible substantive harness observation for the same frozen exact version.',
+    }),
+    payload: Object.freeze({
+      ...(output.payload || {}),
+      verificationObservationDisposition: Object.freeze({
+        bindingHash: binding.bindingHash,
+        evidenceHash: evidence && evidence.evidenceHash || null,
+        missingCheckIds: Object.freeze(missing.slice(0, CODEX_CHECK_OBSERVATION_MAX_CASES)),
+        conflictingCommandHashes: Object.freeze(conflictingCommandHashes
+          .slice(0, CODEX_CHECK_OBSERVATION_MAX_CASES)),
+      }),
+    }),
+  })
+}
+
+function transcriptEvidencePointer(reference) {
+  if (!reference) return null
+  return Object.freeze({
+    sequence: reference.sequence,
+    path: reference.path,
+    hash: reference.hash,
+    bytes: reference.bytes,
+  })
+}
+
+function createTranscriptEvidenceTracker() {
+  const state = { eventCount: 0, totalBytes: 0, first: null, last: null }
+  return Object.freeze({
+    append(reference) {
+      if (!reference) return
+      state.eventCount += 1
+      state.totalBytes += Number.isSafeInteger(reference.bytes) ? reference.bytes : 0
+      if (!state.first) state.first = transcriptEvidencePointer(reference)
+      state.last = transcriptEvidencePointer(reference)
+    },
+    snapshot() {
+      return Object.freeze({
+        schemaVersion: 1,
+        eventCount: state.eventCount,
+        totalBytes: state.totalBytes,
+        chainHeadHash: state.last && state.last.hash || null,
+        first: state.first,
+        last: state.last,
+      })
+    },
+  })
+}
+
+function createCodexJsonlAccumulator(context = {}) {
   const maximumRetainedEvents = 256
   const state = {
     events: [], eventCount: 0, sessionId: null, finalText: null, output: null, usage: null,
+    retainedEventBytes: 0, retainedEventSizes: [],
     turnCompleted: false, terminalMessageEligible: false, terminalBoundary: null,
     knownTodoItemIds: new Set(), terminalKnownTodoItemIds: new Set(),
+    activeWorkItems: new Map(), activeAnonymousWorkItems: new Map(),
+    activeWorkLifecycleInvalid: false,
     eventHash: crypto.createHash('sha256'),
     rawOutputHash: crypto.createHash('sha256'),
+    commandFailureCount: 0, firstCommandFailure: null, lastCommandFailure: null,
+    commandFailureHash: crypto.createHash('sha256'),
+    verificationReceipts: [], verificationInvalidCount: 0,
+    verificationBoundsExceeded: false,
+    verificationEvidenceCount: 0,
+    verificationObservationHash: crypto.createHash('sha256'),
   }
   state.eventHash.update('[')
+  state.commandFailureHash.update('[')
+  state.verificationObservationHash.update('[')
   const eventStreamHash = () => state.eventHash.copy().update(']').digest('hex')
+  const commandExecutionFailures = () => Object.freeze({
+    count: state.commandFailureCount,
+    evidenceHash: state.commandFailureHash.copy().update(']').digest('hex'),
+    first: state.firstCommandFailure,
+    last: state.lastCommandFailure,
+  })
+  const verificationObservations = () => Object.freeze({
+    count: state.verificationReceipts.length,
+    invalidCount: state.verificationInvalidCount,
+    boundsExceeded: state.verificationBoundsExceeded,
+    evidenceHash: state.verificationObservationHash.copy().update(']').digest('hex'),
+    receipts: Object.freeze([...state.verificationReceipts]),
+  })
   const projection = () => state.terminalBoundary || {
     events: state.events, eventCount: state.eventCount, retainedEventCount: state.events.length,
+    retainedEventBytes: state.retainedEventBytes,
     eventStreamHash: eventStreamHash(), rawOutputHash: state.rawOutputHash.copy().digest('hex'),
     finalText: state.finalText, output: state.output, sessionId: state.sessionId, usage: state.usage,
+    commandExecutionFailures: commandExecutionFailures(),
+    verificationObservations: verificationObservations(),
   }
   return Object.freeze({
     boundaryReached() { return state.turnCompleted },
@@ -2793,13 +4099,94 @@ function createCodexJsonlAccumulator() {
           cause: error.message,
         })
       }
+      const todoItemId = !state.turnCompleted && event.item &&
+        event.item.type === 'todo_list' && typeof event.item.id === 'string'
+        ? event.item.id : null
+      if (todoItemId !== null && !state.knownTodoItemIds.has(todoItemId)) {
+        const todoItemIdBytes = Buffer.byteLength(todoItemId, 'utf8')
+        if (todoItemIdBytes > CODEX_TODO_ITEM_ID_MAX_BYTES ||
+            state.knownTodoItemIds.size >= CODEX_TODO_ITEM_ID_MAX_COUNT) {
+          throw new SupervisorIntegrationError(
+            'CODEX_EVENT_STREAM_INVALID',
+            `Codex JSONL event ${lineNumber} exceeds the finite todo identity boundary`,
+            {
+              uniqueTodoItemIds: state.knownTodoItemIds.size,
+              maximumUniqueTodoItemIds: CODEX_TODO_ITEM_ID_MAX_COUNT,
+              todoItemIdBytes,
+              maximumTodoItemIdBytes: CODEX_TODO_ITEM_ID_MAX_BYTES,
+              todoItemIdHash: hashText(todoItemId),
+            },
+          )
+        }
+      }
+      const serializedEvent = JSON.stringify(event)
+      const serializedEventBytes = Buffer.byteLength(serializedEvent, 'utf8')
       state.rawOutputHash.update(`${String(line).replace(/\r?\n$/u, '')}\n`)
-      state.eventHash.update(state.eventCount === 0 ? '' : ',').update(JSON.stringify(event))
+      state.eventHash.update(state.eventCount === 0 ? '' : ',').update(serializedEvent)
       state.eventCount += 1
+      const commandFailure = !state.turnCompleted
+        ? codexCommandExecutionFailure(event, state.eventCount) : null
+      if (commandFailure) {
+        state.commandFailureHash
+          .update(state.commandFailureCount === 0 ? '' : ',')
+          .update(stableStringify(commandFailure))
+        state.commandFailureCount += 1
+        if (!state.firstCommandFailure) state.firstCommandFailure = commandFailure
+        state.lastCommandFailure = commandFailure
+      }
+      const commandObservation = !state.turnCompleted
+        ? codexCommandExecutionObservation(event, state.eventCount, context) : null
+      if (commandObservation && commandObservation.receipt) {
+        if (state.verificationReceipts.length >= CODEX_CHECK_OBSERVATION_MAX_RECEIPTS) {
+          state.verificationBoundsExceeded = true
+        } else {
+          const receipt = commandObservation.receipt
+          state.verificationObservationHash
+            .update(state.verificationEvidenceCount === 0 ? '' : ',')
+            .update(stableStringify(receipt))
+          state.verificationReceipts.push(receipt)
+          state.verificationEvidenceCount += 1
+        }
+      }
       state.events.push(event)
-      if (state.events.length > maximumRetainedEvents) state.events.shift()
+      state.retainedEventSizes.push(serializedEventBytes)
+      state.retainedEventBytes += serializedEventBytes
+      while (state.events.length > maximumRetainedEvents ||
+          state.retainedEventBytes > CODEX_JSONL_RETAINED_EVENT_MAX_BYTES) {
+        state.events.shift()
+        state.retainedEventBytes -= state.retainedEventSizes.shift()
+      }
       if (!state.turnCompleted && !state.sessionId && event.type === 'thread.started') {
         state.sessionId = event.thread_id || event.threadId || state.sessionId
+      }
+      const lifecycleItem = !state.turnCompleted && event.item && typeof event.item === 'object' &&
+        !['agent_message', 'reasoning', 'todo_list'].includes(event.item.type)
+        ? event.item : null
+      const lifecycleItemId = lifecycleItem && typeof lifecycleItem.id === 'string' && lifecycleItem.id
+        ? lifecycleItem.id : null
+      if (lifecycleItem && event.type === 'item.started') {
+        const anonymousCount = [...state.activeAnonymousWorkItems.values()]
+          .reduce((sum, count) => sum + count, 0)
+        if (lifecycleItemId && Buffer.byteLength(lifecycleItemId, 'utf8') > CODEX_TODO_ITEM_ID_MAX_BYTES ||
+            lifecycleItemId && state.activeWorkItems.has(lifecycleItemId) ||
+            state.activeWorkItems.size + anonymousCount >= CODEX_TODO_ITEM_ID_MAX_COUNT) {
+          state.activeWorkLifecycleInvalid = true
+        } else if (lifecycleItemId) {
+          state.activeWorkItems.set(lifecycleItemId, lifecycleItem.type)
+        } else {
+          state.activeAnonymousWorkItems.set(
+            lifecycleItem.type,
+            (state.activeAnonymousWorkItems.get(lifecycleItem.type) || 0) + 1,
+          )
+        }
+      } else if (lifecycleItem && /^item\.(?:completed|failed|cancelled)$/u.test(String(event.type || '')) &&
+          lifecycleItemId && state.activeWorkItems.get(lifecycleItemId) === lifecycleItem.type) {
+        state.activeWorkItems.delete(lifecycleItemId)
+      } else if (lifecycleItem && /^item\.(?:completed|failed|cancelled)$/u.test(String(event.type || '')) &&
+          !lifecycleItemId && (state.activeAnonymousWorkItems.get(lifecycleItem.type) || 0) > 0) {
+        const remaining = state.activeAnonymousWorkItems.get(lifecycleItem.type) - 1
+        if (remaining === 0) state.activeAnonymousWorkItems.delete(lifecycleItem.type)
+        else state.activeAnonymousWorkItems.set(lifecycleItem.type, remaining)
       }
       const completedAgentMessage = !state.turnCompleted && event.type === 'item.completed' &&
         event.item && event.item.type === 'agent_message'
@@ -2836,13 +4223,18 @@ function createCodexJsonlAccumulator() {
       }
       if (!state.turnCompleted && event.type === 'turn.completed') {
         state.usage = codexUsageFromEvent(event)
-        if (!state.terminalMessageEligible) state.output = null
+        if (!state.terminalMessageEligible || state.activeWorkItems.size > 0 ||
+            state.activeAnonymousWorkItems.size > 0 ||
+            state.activeWorkLifecycleInvalid) state.output = null
         state.turnCompleted = true
         state.terminalBoundary = Object.freeze({
           events: Object.freeze([...state.events]), eventCount: state.eventCount,
           retainedEventCount: state.events.length, eventStreamHash: eventStreamHash(),
+          retainedEventBytes: state.retainedEventBytes,
           rawOutputHash: state.rawOutputHash.copy().digest('hex'), finalText: state.finalText,
           output: state.output, sessionId: state.sessionId, usage: state.usage,
+          commandExecutionFailures: commandExecutionFailures(),
+          verificationObservations: verificationObservations(),
         })
       }
       return event
@@ -2851,9 +4243,12 @@ function createCodexJsonlAccumulator() {
       const current = projection()
       return {
         eventCount: current.eventCount, retainedEventCount: current.retainedEventCount,
+        retainedEventBytes: current.retainedEventBytes,
         eventStreamHash: current.eventStreamHash, rawOutputHash: current.rawOutputHash,
         finalText: current.finalText, output: current.output,
         sessionId: current.sessionId, usage: current.usage,
+        commandExecutionFailures: current.commandExecutionFailures,
+        verificationObservations: current.verificationObservations,
       }
     },
     snapshot() {
@@ -2861,8 +4256,11 @@ function createCodexJsonlAccumulator() {
       return {
         events: [...current.events], eventCount: current.eventCount,
         retainedEventCount: current.retainedEventCount, eventStreamHash: current.eventStreamHash,
+        retainedEventBytes: current.retainedEventBytes,
         rawOutputHash: current.rawOutputHash, finalText: current.finalText, output: current.output,
         sessionId: current.sessionId, usage: current.usage,
+        commandExecutionFailures: current.commandExecutionFailures,
+        verificationObservations: current.verificationObservations,
       }
     },
   })
@@ -3127,42 +4525,11 @@ function decodeCodexProviderEnvelope(output) {
   return decoded
 }
 
-function applyBenchmarkEffortPin(assignment, environment = process.env) {
-  const requested = environment.AUTOPROMPT_BENCHMARK_FORCE_EFFORT
-  if (requested === undefined) return assignment
-  if (requested !== 'xhigh') {
-    throw new SupervisorIntegrationError(
-      'INVALID_EFFORT',
-      'AUTOPROMPT_BENCHMARK_FORCE_EFFORT supports only the audited xhigh benchmark pin',
-    )
-  }
-  if (!assignment || typeof assignment !== 'object') {
-    throw new SupervisorIntegrationError(
-      'MODEL_ASSIGNMENT_INVALID',
-      'benchmark xhigh pin requires a resolved provider assignment',
-    )
-  }
-  return Object.freeze({
-    ...assignment,
-    effort: 'xhigh',
-    source: 'benchmark-explicit-xhigh-pin',
-    routeIndependent: true,
-  })
-}
-
-function benchmarkPhaseTimeoutMs(defaultMs, environment = process.env) {
-  return benchmarkNoTimeoutEnabled(environment)
-    ? Number.POSITIVE_INFINITY
-    : defaultMs
-}
-
-function benchmarkNoTimeoutEnabled(environment = process.env) {
-  return Boolean(environment && environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1')
-}
-
-function benchmarkFirstProductSignalDeadlineEnabled(ceilingMs, environment = process.env) {
-  return environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT !== '1' &&
-    Number.isSafeInteger(ceilingMs) && ceilingMs > 0 && ceilingMs < Number.MAX_SAFE_INTEGER
+function productionTransportWatchdogMs(defaultMs) {
+  // Phase values are economic convergence targets. Required owned processes
+  // share one finite transport watchdog. A watchdog failure becomes bounded
+  // recovery evidence; elapsed time alone never expands the completion graph.
+  return Math.max(defaultMs, CHILD_TRANSPORT_WATCHDOG_MS)
 }
 
 function resolvePreMutationRouteDecisionHash(request, exactFileHash) {
@@ -3178,72 +4545,84 @@ function resolvePreMutationRouteDecisionHash(request, exactFileHash) {
   return persisted
 }
 
-function productionRoadmapExpansionAuthority(input = {}) {
-  const admittedAskCount = Number(input.admittedAskCount)
-  const missionScopeHash = input.missionScopeHash
-  const planSha256 = input.planSha256
-  if (!Number.isSafeInteger(admittedAskCount) || admittedAskCount < 1 ||
-      !/^[a-f0-9]{64}$/u.test(missionScopeHash || '') ||
-      !/^[a-f0-9]{64}$/u.test(planSha256 || '')) {
+function imageDatumOutcomeFromPreWorkAdmission(contract, admission, receipt) {
+  const receiptBody = receipt && {
+    schemaVersion: receipt.schemaVersion,
+    kind: receipt.kind,
+    runId: receipt.runId,
+    generation: receipt.generation,
+    admissionHash: receipt.admissionHash,
+    admissionFileHash: receipt.admissionFileHash,
+    requestEnvelopeHash: receipt.requestEnvelopeHash,
+    routeDecisionHash: receipt.routeDecisionHash,
+    targetStateHash: receipt.targetStateHash,
+    imageCertificateHashes: receipt.imageCertificateHashes,
+  }
+  const expectedCertificates = Array.isArray(admission && admission.contracts)
+    ? admission.contracts
+        .filter(item => item && item.kind === 'IMAGE_DATUM')
+        .map(item => item.certificateHash)
+        .sort()
+    : []
+  if (!contract || contract.kind !== 'IMAGE_DATUM' || !admission || !receipt ||
+      receipt.kind !== 'codex-captured-domain-pre-work-admission' ||
+      receipt.admissionHash !== admission.admissionHash ||
+      receipt.requestEnvelopeHash !== admission.requestEnvelopeHash ||
+      receipt.routeDecisionHash !== admission.routeDecisionHash ||
+      receipt.targetStateHash !== admission.targetStateHash ||
+      stableStringify(receipt.imageCertificateHashes) !== stableStringify(expectedCertificates) ||
+      !expectedCertificates.includes(contract.certificateHash) ||
+      !/^[a-f0-9]{64}$/u.test(receipt.admissionFileHash || '') ||
+      !/^[a-f0-9]{64}$/u.test(receipt.stateEventHash || '') ||
+      !Number.isSafeInteger(receipt.stateEventSequence) || receipt.stateEventSequence < 1 ||
+      receipt.receiptHash !== hashText(stableStringify(receiptBody))) {
     throw new SupervisorIntegrationError(
-      'ROADMAP_EXPANSION_NOT_ADMITTED',
-      'production roadmap authority requires an exact expansion count and immutable request/plan hashes',
+      'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
+      'IMAGE_DATUM ordering requires the exact authenticated Codex pre-work admission receipt',
     )
   }
-  const requestVersionPointerHash = hashText(stableStringify(input.requestVersionPointer || null))
-  const necessityEvidenceHash = hashText(stableStringify({
-    schemaVersion: 1,
-    kind: 'roadmap-decomposition-necessity',
-    admittedAskCount,
-    missionScopeHash,
-    planSha256,
-    requestVersionPointerHash,
-  }))
-  const marginalValueEvidenceHash = hashText(stableStringify({
-    schemaVersion: 1,
-    kind: 'roadmap-decomposition-marginal-value',
-    admittedAskCount,
-    missionScopeHash,
-    planSha256,
-    requestVersionPointerHash,
-  }))
-  const receipt = {
-    schemaVersion: 1,
-    authorityId: 'production-supervisor-roadmap-expansion',
-    accepted: true,
-    admittedAskCount,
-    missionScopeHash,
-    planSha256,
-    requestVersionPointerHash,
-    necessityEvidenceHash,
-    marginalValueEvidenceHash,
-  }
   return Object.freeze({
-    ...receipt,
-    authorityReceiptHash: hashText(stableStringify(receipt)),
+    schemaVersion: '1.0.0',
+    kind: 'IMAGE_DATUM',
+    certificateHash: contract.certificateHash,
+    rulingHash: contract.rulingHash,
+    selectedInterpretationId: contract.selectedInterpretation && contract.selectedInterpretation.id,
+    certificateRecordedBeforeGeometryWrites: true,
+    preWorkAdmissionReceiptHash: receipt.receiptHash,
+    preWorkAdmissionEventHash: receipt.stateEventHash,
   })
 }
 
-function appendSupervisorRecordedCapturedDomainOutcomes(contracts, outcomes) {
-  const target = Array.isArray(outcomes) ? outcomes : []
-  for (const contract of Array.isArray(contracts) ? contracts : []) {
-    if (!contract || contract.kind !== 'IMAGE_DATUM' ||
-        target.some(outcome => outcome && outcome.kind === 'IMAGE_DATUM')) continue
-    target.push(Object.freeze({
-      schemaVersion: '1.0.0',
-      kind: 'IMAGE_DATUM',
-      certificateHash: contract.certificateHash,
-      rulingHash: contract.rulingHash,
-      selectedInterpretationId: contract.selectedInterpretation && contract.selectedInterpretation.id,
-      certificateRecordedBeforeGeometryWrites: true,
-    }))
+function admitRoadmapExpansion(authority, input = {}) {
+  if (typeof authority !== 'function') {
+    throw new SupervisorIntegrationError(
+      'ROADMAP_EXPANSION_NOT_ADMITTED',
+      'roadmap work beyond the immutable request ceiling requires an authenticated external authority receipt',
+    )
   }
-  return target
+  const result = authority(Object.freeze({ ...input }))
+  if (result && typeof result.then === 'function') {
+    throw new SupervisorIntegrationError(
+      'ROADMAP_EXPANSION_NOT_ADMITTED',
+      'roadmap expansion authority must make a synchronous receipt-bound decision before the plan is recorded',
+    )
+  }
+  return bindRoadmapExpansionAdmission({
+    ...result,
+    admittedAskCount: input.admittedAskCount,
+    missionScopeHash: input.missionScopeHash,
+    planSha256: input.planSha256,
+  })
 }
 
-function runtimeCapabilityExpiryMs(requestedExpiryMs, issuedAtMs, environment = process.env) {
-  if (benchmarkNoTimeoutEnabled(environment)) return Date.UTC(9999, 11, 31, 23, 59, 59, 999)
-  return Math.min(Number(requestedExpiryMs), issuedAtMs + 5 * 60 * 1000)
+function runtimeCapabilityExpiryMs(requestedExpiryMs, issuedAtMs, _environment = process.env) {
+  const issued = Number(issuedAtMs)
+  const requested = Number(requestedExpiryMs)
+  if (Number.isFinite(requested) && Number.isFinite(issued) && requested > issued) return requested
+  // A malformed optional request must never create an unbounded receipt. The
+  // fallback remains finite, while an authenticated activation expiry is
+  // honored exactly even for a legitimate long-running task.
+  return issued + 5 * 60 * 1000
 }
 
 function codexPrivateWorkspaceProjection(record, canonicalTargetPath, workingDirectory) {
@@ -3416,13 +4795,7 @@ class CodexExecAdapter {
   }
 
   async launch(record) {
-    if (typeof record.entryPrompt !== 'string' ||
-        !record.entryPrompt.startsWith('$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\n')) {
-      throw new SupervisorIntegrationError(
-        'ACTIVATION_RECEIPT_INVALID',
-        'external Codex launch requires the hash-verified structural $autoprompt envelope',
-      )
-    }
+    const canonicalMission = validateCanonicalMissionLaunch(record)
     const canonicalSchemaPath = path.resolve(this.outputSchemaResolver(record))
     const canonicalSchemaBytes = fs.readFileSync(canonicalSchemaPath)
     let canonicalSchema
@@ -3433,6 +4806,7 @@ class CodexExecAdapter {
         { path: canonicalSchemaPath, cause: error.message },
       )
     }
+    const canonicalSchemaText = JSON.stringify(canonicalSchema)
     const schemaPath = this.providerSchemaRoot
       ? materializeCodexProviderEnvelopeSchema(this.providerSchemaRoot)
       : canonicalSchemaPath
@@ -3519,7 +4893,7 @@ class CodexExecAdapter {
           'Return exactly one provider envelope object. Its only field is canonicalJson.',
           'canonicalJson must be a JSON string which decodes to the complete canonical output object.',
           'The decoded object remains subject to all canonical AutoPrompt validation after transport decoding.',
-          `Canonical output schema: ${canonicalSchemaBytes.toString('utf8')}`,
+          `Canonical output schema: ${canonicalSchemaText}`,
         ]
       : []
     const workspaceProjection = codexPrivateWorkspaceProjection(
@@ -3539,20 +4913,61 @@ class CodexExecAdapter {
           'Judge allAssignedItemsPass and every successItems status only against this worker assignment and its author-side checks.',
           'A later independent reviewer check is owned by the supervisor, is not a blocked worker success item, and must not make allAssignedItemsPass false.',
           'When the owned implementation and author-side checks pass, report allAssignedItemsPass=true so the supervisor can freeze and dispatch the separate checker.',
+          'Complete the whole assigned implementation in this production turn. Do not request decomposition, additional workers, or controller fan-out.',
         ]
       : []
+    const missionEchoProjection = canonicalMissionEchoProjection(
+      canonicalMission,
+      record.missionBinding,
+    )
+    let visibleCanonicalAssignment = record.canonicalAssignment
+      ? projectModelVisibleMissionEchoes(record.canonicalAssignment, missionEchoProjection)
+      : null
+    // The assignment's checks are the single model-visible source of named
+    // verification prose. The private integrity binding remains controller-only;
+    // non-secret deterministic observation ids tell the checker how to join
+    // each reported case to the command receipt validated after the turn.
+    if (visibleCanonicalAssignment && CHECKER_ROLES.has(record.logicalRole)) {
+      const privateObservationBinding = visibleCanonicalAssignment.verificationObservationBinding
+      visibleCanonicalAssignment = Object.freeze({
+        ...Object.fromEntries(
+        Object.entries(visibleCanonicalAssignment)
+          .filter(([key]) => key !== 'verificationObservationBinding'),
+        ),
+        ...(privateObservationBinding && privateObservationBinding.schemaVersion === 3
+          ? {
+              verificationObservationCases: Object.freeze(
+                privateObservationBinding.observations.map(observation => Object.freeze({
+                  checkOrdinal: observation.checkOrdinal,
+                  observationId: observation.observationId,
+                  authorizationMode: observation.authorizationMode,
+                  authorizedCommandHashes: Object.freeze([...observation.exactCommandHashes]),
+                }))),
+            }
+          : {}),
+      })
+    }
+    // L4 exact-request bytes are loaded and hash-checked by buildCheckerContext
+    // and auditDispatch before the scheduler admits this launch. The model
+    // receives the same canonical mission as every other role plus the
+    // immutable pointer/binding, never another raw copy of the request.
+    const visibleDispatch = modelVisibleDispatch(record.dispatch, {
+      canonicalAssignment: Boolean(record.canonicalAssignment),
+      canonicalMission,
+      missionBinding: record.missionBinding,
+    })
     const input = [
-      record.entryPrompt,
       'AUTOPROMPT_EXTERNAL_CHILD_V1',
       `role=${record.logicalRole}`,
       `physical_role=${record.physicalRole}`,
       `provider_role=${record.providerRole}`,
       `physical_role_policy=${executionPolicy.policyId}@${executionPolicy.policyVersion}`,
+      'AUTOPROMPT_CANONICAL_MISSION_V1',
+      `Canonical original request: ${canonicalMission}`,
+      `Original-request binding: ${JSON.stringify(record.missionBinding)}`,
       ...providerTransport,
-      record.dispatch.brief,
-      `Canonical context envelope: ${JSON.stringify(record.dispatch)}`,
-      record.canonicalAssignment ? `Canonical assignment: ${JSON.stringify(record.canonicalAssignment)}` : '',
-      `Request pointer: ${JSON.stringify(record.dispatch.requestPointer)}`,
+      `Canonical context envelope: ${JSON.stringify(visibleDispatch)}`,
+      visibleCanonicalAssignment ? `Canonical assignment: ${JSON.stringify(visibleCanonicalAssignment)}` : '',
       ...workerCompletionBoundary,
       ...workspaceProjection,
       ...checkerScratchProjection,
@@ -3560,22 +4975,212 @@ class CodexExecAdapter {
     ].join('\n')
     let sawStreamedOutput = false
     const rawOutputHash = crypto.createHash('sha256')
-    const streamAccumulator = createCodexJsonlAccumulator()
+    const streamAccumulator = createCodexJsonlAccumulator(record)
     let typedTerminal = null
     let stopPromise = null
     let streamError = null
     let streamedUsage = { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 }
     let terminalReceiptPersisted = false
     let committedTerminalResult = null
+    let committedTerminalEvidence = null
     let firstProductSignalPersisted = false
     let reportedSessionId = null
+    const deferredCallbacks = []
+    let deferredCallbackBytes = 0
+    let callbackSequence = 0
+    const degradedLocalCallbacks = new Map()
+    const recordLocalCallbackDegradation = (kind, descriptor, reason, count = 1) => {
+      const prior = degradedLocalCallbacks.get(kind) || {
+        kind,
+        count: 0,
+        firstSequence: descriptor.sequence,
+        lastSequence: descriptor.sequence,
+        lastEvidenceHash: descriptor.evidenceHash,
+        reasons: new Set(),
+      }
+      prior.count += count
+      prior.lastSequence = descriptor.sequence
+      prior.lastEvidenceHash = descriptor.evidenceHash
+      prior.reasons.add(reason)
+      degradedLocalCallbacks.set(kind, prior)
+    }
+    const localCallbackDegradation = () => Object.freeze({
+      schemaVersion: 1,
+      status: 'DEGRADED_LOCAL_TELEMETRY',
+      durable: false,
+      callbacks: Object.freeze([...degradedLocalCallbacks.values()]
+        .sort((left, right) => left.kind.localeCompare(right.kind))
+        .map(item => Object.freeze({
+          kind: item.kind,
+          count: item.count,
+          firstSequence: item.firstSequence,
+          lastSequence: item.lastSequence,
+          lastEvidenceHash: item.lastEvidenceHash,
+          reasons: Object.freeze([...item.reasons].sort()),
+        }))),
+    })
+    const withLocalCallbackDegradation = result => {
+      if (degradedLocalCallbacks.size === 0) return result
+      const decorated = { ...result }
+      Object.defineProperty(decorated, 'localCallbackReconciliation', {
+        enumerable: false,
+        configurable: false,
+        writable: false,
+        value: localCallbackDegradation(),
+      })
+      return Object.freeze(decorated)
+    }
+    const deferCallback = (kind, invoke, onSuccess, evidence = null, priorError = null) => {
+      const descriptor = Object.freeze({
+        sequence: ++callbackSequence,
+        kind,
+        evidenceHash: hashText(stableStringify(evidence || { kind })),
+      })
+      const capturedBytes = evidence && Number.isSafeInteger(evidence.callbackBytes) &&
+        evidence.callbackBytes >= 0 ? evidence.callbackBytes : 0
+      const descriptorBytes = Buffer.byteLength(stableStringify(descriptor), 'utf8') + capturedBytes
+      if (DEGRADABLE_LOCAL_CALLBACK_KINDS.has(kind)) {
+        const coalesced = deferredCallbacks.find(item => item.descriptor.kind === kind)
+        if (coalesced) {
+          recordLocalCallbackDegradation(kind, descriptor, 'COALESCED_AFTER_LOCAL_OUTAGE')
+          return Object.freeze({ deferred: true, degraded: true, descriptor })
+        }
+      }
+      if (deferredCallbackBytes + descriptorBytes > CODEX_CALLBACK_RECONCILIATION_MAX_BYTES ||
+          deferredCallbacks.length >= CODEX_CALLBACK_RECONCILIATION_MAX_ITEMS) {
+        // Telemetry never consumes space needed by the session, usage, and
+        // terminal-result callbacks that make the turn authoritative. Once a
+        // local transcript/metric sink is unavailable, keep the provider turn
+        // moving and disclose the exact degradation on the returned result.
+        for (let index = deferredCallbacks.length - 1; index >= 0 &&
+            (deferredCallbackBytes + descriptorBytes > CODEX_CALLBACK_RECONCILIATION_MAX_BYTES ||
+             deferredCallbacks.length >= CODEX_CALLBACK_RECONCILIATION_MAX_ITEMS); index -= 1) {
+          const queued = deferredCallbacks[index]
+          if (!DEGRADABLE_LOCAL_CALLBACK_KINDS.has(queued.descriptor.kind)) continue
+          deferredCallbacks.splice(index, 1)
+          deferredCallbackBytes -= queued.descriptorBytes
+          recordLocalCallbackDegradation(
+            queued.descriptor.kind,
+            queued.descriptor,
+            'EVICTED_FOR_ESSENTIAL_CALLBACK',
+          )
+        }
+      }
+      if (deferredCallbacks.length >= CODEX_CALLBACK_RECONCILIATION_MAX_ITEMS ||
+          deferredCallbackBytes + descriptorBytes > CODEX_CALLBACK_RECONCILIATION_MAX_BYTES) {
+        if (DEGRADABLE_LOCAL_CALLBACK_KINDS.has(kind)) {
+          recordLocalCallbackDegradation(kind, descriptor, 'BOUNDED_JOURNAL_COLLAPSED')
+          return Object.freeze({ deferred: true, degraded: true, descriptor })
+        }
+        throw new SupervisorIntegrationError(
+          'CALLBACK_RECONCILIATION_OVERFLOW',
+          'essential local callback reconciliation exceeded its bounded journal',
+          { kind, queued: deferredCallbacks.length, maximumItems: CODEX_CALLBACK_RECONCILIATION_MAX_ITEMS },
+        )
+      }
+      deferredCallbacks.push({ descriptor, descriptorBytes, invoke, onSuccess, priorError, replayFailures: 0 })
+      deferredCallbackBytes += descriptorBytes
+      return Object.freeze({ deferred: true, descriptor })
+    }
+    const invokeOrDeferCallback = (kind, invoke, onSuccess = null, evidence = null) => {
+      if (deferredCallbacks.length > 0) {
+        return deferCallback(kind, invoke, onSuccess, evidence)
+      }
+      try {
+        const value = invoke()
+        if (onSuccess) onSuccess(value)
+        return Object.freeze({ deferred: false, value })
+      } catch (error) {
+        if (callbackFailureRequiresImmediateAbort(error)) throw error
+        return deferCallback(kind, invoke, onSuccess, evidence, error)
+      }
+    }
+    const reconcileDeferredCallbacks = parsed => {
+      while (deferredCallbacks.length > 0) {
+        const pending = deferredCallbacks[0]
+        try {
+          const value = pending.invoke()
+          if (pending.onSuccess) pending.onSuccess(value)
+          deferredCallbacks.shift()
+          deferredCallbackBytes -= pending.descriptorBytes
+        } catch (error) {
+          if (callbackFailureRequiresImmediateAbort(error)) throw error
+          pending.replayFailures += 1
+          if (pending.replayFailures < CODEX_CALLBACK_RECONCILIATION_MAX_REPLAYS) continue
+          if (DEGRADABLE_LOCAL_CALLBACK_KINDS.has(pending.descriptor.kind)) {
+            deferredCallbacks.shift()
+            deferredCallbackBytes -= pending.descriptorBytes
+            recordLocalCallbackDegradation(
+              pending.descriptor.kind,
+              pending.descriptor,
+              'REPLAY_EXHAUSTED',
+            )
+            continue
+          }
+          let resumableCandidate = null
+          if (committedTerminalResult && committedTerminalEvidence) {
+            try {
+              const candidatePath = path.resolve(record.canonicalTargetPath || workingDirectory)
+              const body = Object.freeze({
+                schemaVersion: 1,
+                kind: 'callback-reconciliation-candidate',
+                runId: record.runId || null,
+                activationId: record.activationId || null,
+                generation: record.generation || null,
+                workItemId: record.workItemId || null,
+                sessionId: committedTerminalEvidence.sessionId,
+                candidatePath,
+                candidateHash: hashWorkspaceCandidate(candidatePath, record.environment),
+                terminalResultHash: hashText(JSON.stringify(committedTerminalResult)),
+                terminalEvidenceHash: hashText(stableStringify(committedTerminalEvidence)),
+                callback: pending.descriptor,
+              })
+              resumableCandidate = Object.freeze({
+                ...body,
+                bindingHash: hashText(stableStringify(body)),
+              })
+            } catch {
+              // The original callback error remains authoritative. Candidate
+              // projection is best-effort metadata over an already preserved
+              // exact workspace, never a second persistence authority.
+            }
+          }
+          const reconciliation = new SupervisorIntegrationError(
+            'CALLBACK_RECONCILIATION_PENDING',
+            'the model turn is drained and frozen, but its local persistence callback remains unavailable',
+            {
+              callback: pending.descriptor,
+              queuedCallbacks: deferredCallbacks.length,
+              firstFailure: serializeError(pending.priorError),
+              latestFailure: serializeError(error),
+              terminalResultHash: committedTerminalResult
+                ? hashText(JSON.stringify(committedTerminalResult)) : null,
+              candidateHash: committedTerminalResult && committedTerminalResult.candidateHash || null,
+              resumableCandidate,
+            },
+          )
+          reconciliation.usage = parsed && parsed.usage || streamedUsage
+          Object.defineProperty(reconciliation, 'frozenTerminalResult', {
+            enumerable: false, configurable: false, writable: false,
+            value: committedTerminalResult,
+          })
+          Object.defineProperty(reconciliation, 'frozenTerminalEvidence', {
+            enumerable: false, configurable: false, writable: false,
+            value: committedTerminalEvidence,
+          })
+          throw reconciliation
+        }
+      }
+    }
     const assembledResult = (parsed, completionRequested, decodedOutput = null) => {
-      const output = decodedOutput || parsed.output || {}
+      const output = checkerResultBoundToCommandExecutionEvidence(
+        decodedOutput || parsed.output || {}, parsed, record,
+      )
       return {
         ...output,
         candidateHash: record.candidateHash || output.candidateHash || null,
         contextId: record.continuationId || parsed.sessionId,
-        events: parsed.events,
+        transportEvidence: codexTransportEvidence(parsed),
         usage: parsed.usage,
         usageStreamed: typeof record.onUsageDelta === 'function',
         evidenceHashes: Array.isArray(output.evidenceHashes) ? output.evidenceHashes : [],
@@ -3600,18 +5205,31 @@ class CodexExecAdapter {
         ? record.normalizeTerminalResult(assembled)
         : assembled)
       if (typeof record.onTerminalResult === 'function') {
-        record.onTerminalResult(committedTerminalResult, {
+        const terminalEvidence = Object.freeze({
           rawOutputHash: snapshot.rawOutputHash || rawOutputHash.copy().digest('hex'),
           eventStreamHash: snapshot.eventStreamHash,
           sessionId: record.continuationId || snapshot.sessionId,
         })
-        terminalReceiptPersisted = true
+        committedTerminalEvidence = terminalEvidence
+        invokeOrDeferCallback(
+          'terminal-result',
+          () => record.onTerminalResult(committedTerminalResult, terminalEvidence),
+          () => { terminalReceiptPersisted = true },
+          {
+            terminalResultHash: hashText(JSON.stringify(committedTerminalResult)),
+            callbackBytes: Buffer.byteLength(JSON.stringify(committedTerminalResult), 'utf8'),
+            ...terminalEvidence,
+          },
+        )
       }
       stop(`typed terminal ${typedTerminal}`, 'DONE')
     }
     const onStdoutLine = line => {
       const eventLine = String(line).replace(/\r?\n$/u, '')
       if (!eventLine.trim()) return
+      if (typeof record.onTransportActivity === 'function') {
+        record.onTransportActivity()
+      }
       const normalizedLine = `${eventLine}\n`
       sawStreamedOutput = true
       rawOutputHash.update(normalizedLine)
@@ -3622,7 +5240,20 @@ class CodexExecAdapter {
         let auditEvent
         try { auditEvent = JSON.parse(eventLine) } catch { return }
         if (auditEvent && typeof record.onEvent === 'function') {
-          try { record.onEvent(auditEvent, String(line)) } catch { /* committed result stays authoritative */ }
+          try {
+            invokeOrDeferCallback(
+              'transcript-event',
+              () => record.onEvent(auditEvent, String(line)),
+              null,
+              {
+                eventHash: hashText(eventLine), lateDrain: true,
+                callbackBytes: Buffer.byteLength(String(line), 'utf8') * 2,
+              },
+            )
+          } catch (error) {
+            streamError = error
+            stop(error.code || 'TRANSCRIPT_WRITE_FAILED')
+          }
         }
         return
       }
@@ -3633,7 +5264,17 @@ class CodexExecAdapter {
         return
       }
       if (event && typeof record.onEvent === 'function') {
-        try { record.onEvent(event, String(line)) } catch (error) {
+        try {
+          invokeOrDeferCallback(
+            'transcript-event',
+            () => record.onEvent(event, String(line)),
+            null,
+            {
+              eventHash: hashText(eventLine), lateDrain: false,
+              callbackBytes: Buffer.byteLength(String(line), 'utf8') * 2,
+            },
+          )
+        } catch (error) {
           streamError = error
           stop(error.code || 'TRANSCRIPT_WRITE_FAILED')
           return
@@ -3652,11 +5293,16 @@ class CodexExecAdapter {
           !['failed', 'cancelled'].includes(item.status)
         if (failedCommand || completedEdit) {
           try {
-            record.onFirstProductSignal({
+            const signal = Object.freeze({
               kind: completedEdit ? 'PRODUCT_EDIT' : 'RED',
               evidenceHash: hashText(stableStringify(event)),
             })
-            firstProductSignalPersisted = true
+            invokeOrDeferCallback(
+              'first-product-signal',
+              () => record.onFirstProductSignal(signal),
+              () => { firstProductSignalPersisted = true },
+              signal,
+            )
           } catch (error) {
             streamError = error
             stop(error.code || 'FIRST_PRODUCT_SIGNAL_INVALID')
@@ -3668,12 +5314,24 @@ class CodexExecAdapter {
         const identified = event.thread_id || event.threadId
         const authoritativeSessionId = streamAccumulator.watermark().sessionId
         if (identified && identified === authoritativeSessionId && !reportedSessionId) {
+          const sessionEvidence = Object.freeze({
+            event,
+            raw: String(line),
+            occurredAt: new Date().toISOString(),
+          })
           try {
-            record.onSessionIdentified(String(identified), {
-              event,
-              raw: String(line),
-              occurredAt: new Date().toISOString(),
-            })
+            invokeOrDeferCallback(
+              'session-identified',
+              () => record.onSessionIdentified(String(identified), sessionEvidence),
+              null,
+              {
+                sessionId: String(identified), eventHash: hashText(eventLine),
+                callbackBytes: Buffer.byteLength(String(line), 'utf8') * 2,
+              },
+            )
+            // The provider session identity itself is already frozen by the
+            // accumulator. This flag prevents a duplicate callback entry while
+            // local persistence is waiting for post-drain reconciliation.
             reportedSessionId = String(identified)
           } catch (error) {
             streamError = error
@@ -3703,17 +5361,24 @@ class CodexExecAdapter {
         }
         streamedUsage = cumulative
         try {
-          const verdict = record.onUsageDelta(delta, cumulative)
-          if (!verdict || verdict.continue !== true) {
-            streamError = new SupervisorIntegrationError(
-              'BUDGET_EXHAUSTED',
-              'scheduler denied continued Codex token usage',
-              { verdict },
-            )
-            streamError.usage = cumulative
-            stop(streamError.code)
-            return
-          }
+          invokeOrDeferCallback(
+            'usage-delta',
+            () => {
+              const verdict = record.onUsageDelta(delta, cumulative)
+              if (!verdict || verdict.continue !== true) {
+                const denied = new SupervisorIntegrationError(
+                  'BUDGET_EXHAUSTED',
+                  'scheduler denied continued Codex token usage',
+                  { verdict },
+                )
+                denied.usage = cumulative
+                throw denied
+              }
+              return verdict
+            },
+            null,
+            { delta, cumulative },
+          )
         } catch (error) {
           streamError = error
           streamError.usage = cumulative
@@ -3778,6 +5443,8 @@ class CodexExecAdapter {
       sessionId: record.sessionId,
       reservationId: record.reservationId,
       onStdoutLine,
+      onTransportActivity: typeof record.onTransportActivity === 'function'
+        ? record.onTransportActivity : null,
       beforeExternalWrite,
     })
     if (!execution || execution.processOwned !== true || execution.exactArgv !== true) {
@@ -3796,10 +5463,20 @@ class CodexExecAdapter {
     const parsed = sawStreamedOutput
       ? streamAccumulator.snapshot()
       : parseCodexJsonl(String(execution.stdout || ''))
-    if (streamError) throw streamError
+    if (streamError && (!committedTerminalResult || callbackFailureRequiresImmediateAbort(streamError))) {
+      throw streamError
+    }
+    // Local persistence may fail after the provider has already produced the
+    // one authoritative turn. Reconcile the exact queued callbacks only after
+    // the owned process tree is drained; never resume or relaunch the model.
+    // Semantic, identity, tamper, and accounting failures never enter this
+    // path and remain the original fail-closed error above.
+    if (deferredCallbacks.length > 0) reconcileDeferredCallbacks(parsed)
+    if (committedTerminalResult) return withLocalCallbackDegradation(committedTerminalResult)
     if (execution.status !== 0) {
       throw new SupervisorIntegrationError('CODEX_CHILD_FAILED', `Codex child exited ${execution.status}`, {
-        events: parsed.events, stderr: String(execution.stderr || ''),
+        transportEvidence: codexTransportEvidence(parsed),
+        stderr: String(execution.stderr || '').slice(-4096),
       })
     }
     if (!record.continuationId && !parsed.sessionId) {
@@ -3808,7 +5485,6 @@ class CodexExecAdapter {
     if (!parsed.usage) {
       throw new SupervisorIntegrationError('CODEX_USAGE_INCOMPLETE', 'Codex child ended without all four usage categories')
     }
-    if (committedTerminalResult) return committedTerminalResult
     if (this.providerSchemaRoot && parsed.output) {
       parsed.output = decodeCodexProviderEnvelope(parsed.output)
     }
@@ -3824,13 +5500,71 @@ class CodexExecAdapter {
       ? record.normalizeTerminalResult(assembled)
       : assembled
     if (typeof record.onTerminalResult === 'function' && !terminalReceiptPersisted) {
-      record.onTerminalResult(returned, {
+      const terminalEvidence = Object.freeze({
         rawOutputHash: parsed.rawOutputHash || rawOutputHash.copy().digest('hex'),
         eventStreamHash: parsed.eventStreamHash,
         sessionId: record.continuationId || parsed.sessionId,
       })
+      committedTerminalResult = Object.freeze(returned)
+      committedTerminalEvidence = terminalEvidence
+      invokeOrDeferCallback(
+        'terminal-result',
+        () => record.onTerminalResult(committedTerminalResult, terminalEvidence),
+        () => { terminalReceiptPersisted = true },
+        {
+          terminalResultHash: hashText(JSON.stringify(committedTerminalResult)),
+          callbackBytes: Buffer.byteLength(JSON.stringify(committedTerminalResult), 'utf8'),
+          ...terminalEvidence,
+        },
+      )
+      if (deferredCallbacks.length > 0) reconcileDeferredCallbacks(parsed)
     }
-    return returned
+    return withLocalCallbackDegradation(returned)
+  }
+}
+
+function appendBoundedByteTail(current, bytes, maximumBytes) {
+  const incoming = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes)
+  if (incoming.length >= maximumBytes) {
+    return Buffer.from(incoming.subarray(incoming.length - maximumBytes))
+  }
+  if (current.length + incoming.length <= maximumBytes) {
+    return Buffer.concat([current, incoming], current.length + incoming.length)
+  }
+  const retained = maximumBytes - incoming.length
+  return Buffer.concat([
+    current.subarray(Math.max(0, current.length - retained)),
+    incoming,
+  ], maximumBytes)
+}
+
+function readBoundedRegularFileTail(absolutePath, maximumBytes, label) {
+  if (!fs.existsSync(absolutePath)) {
+    return Object.freeze({ text: '', byteCount: 0, truncated: false })
+  }
+  let descriptor
+  try {
+    descriptor = fs.openSync(absolutePath, 'r')
+    const stat = fs.fstatSync(descriptor)
+    if (!stat.isFile() || !Number.isSafeInteger(stat.size) || stat.size < 0) {
+      throw new SupervisorIntegrationError('CODEX_PROXY_STATUS_INVALID', `${label} is not one regular file`)
+    }
+    const length = Math.min(stat.size, maximumBytes)
+    const bytes = Buffer.allocUnsafe(length)
+    let readTotal = 0
+    const start = stat.size - length
+    while (readTotal < length) {
+      const read = fs.readSync(descriptor, bytes, readTotal, length - readTotal, start + readTotal)
+      if (read <= 0) break
+      readTotal += read
+    }
+    return Object.freeze({
+      text: bytes.subarray(0, readTotal).toString('utf8'),
+      byteCount: stat.size,
+      truncated: stat.size > readTotal,
+    })
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor)
   }
 }
 
@@ -3901,13 +5635,21 @@ class OwnedCodexProxyRunner {
     })
     const session = { ...owned, sessionRoot, statusPath, stopped: false }
     this.sessions.set(spec.sessionId, session)
-    let stdout = ''
+    let stdoutTail = Buffer.alloc(0)
+    const stdoutHash = crypto.createHash('sha256')
     let offset = 0
     let partial = ''
     let stdoutDescriptor
     const stdoutDecoder = new StringDecoder('utf8')
     let status = null
     let terminalRecord = null
+    const emitCompleteStdoutLines = () => {
+      const lines = partial.split(/\r?\n/)
+      partial = lines.pop()
+      for (const line of lines) {
+        if (line && typeof spec.onStdoutLine === 'function') spec.onStdoutLine(line)
+      }
+    }
     try {
       while (!status && !session.stopped) {
         if (fs.existsSync(stdoutPath)) {
@@ -3922,21 +5664,37 @@ class OwnedCodexProxyRunner {
             const read = fs.readSync(stdoutDescriptor, bytes, 0, length, offset)
             if (read <= 0) break
             offset += read
-            partial += stdoutDecoder.write(bytes.subarray(0, read))
-          }
-          const lines = partial.split(/\r?\n/)
-          partial = lines.pop()
-          for (const line of lines) {
-            stdout += `${line}\n`
-            if (line && typeof spec.onStdoutLine === 'function') spec.onStdoutLine(line)
+            const received = bytes.subarray(0, read)
+            stdoutHash.update(received)
+            stdoutTail = appendBoundedByteTail(
+              stdoutTail,
+              received,
+              CODEX_STDOUT_FALLBACK_MAX_BYTES,
+            )
+            if (typeof spec.onTransportActivity === 'function') spec.onTransportActivity()
+            partial += stdoutDecoder.write(received)
+            emitCompleteStdoutLines()
+            if (Buffer.byteLength(partial, 'utf8') > CODEX_JSONL_PARTIAL_MAX_BYTES) {
+              throw new SupervisorIntegrationError(
+                'CODEX_EVENT_STREAM_INVALID',
+                'owned Codex JSONL contains a line larger than the bounded transport parser permits',
+                { maximumBytes: CODEX_JSONL_PARTIAL_MAX_BYTES },
+              )
+            }
           }
         }
         if (fs.existsSync(statusPath)) status = readRegularJson(statusPath, 'owned Codex proxy status').parsed
         if (!status && !session.stopped) await new Promise(resolve => setTimeout(resolve, this.pollMs))
       }
       partial += stdoutDecoder.end()
+      if (Buffer.byteLength(partial, 'utf8') > CODEX_JSONL_PARTIAL_MAX_BYTES) {
+        throw new SupervisorIntegrationError(
+          'CODEX_EVENT_STREAM_INVALID',
+          'owned Codex JSONL contains a line larger than the bounded transport parser permits',
+          { maximumBytes: CODEX_JSONL_PARTIAL_MAX_BYTES },
+        )
+      }
       if (partial) {
-        stdout += partial
         if (typeof spec.onStdoutLine === 'function') spec.onStdoutLine(partial)
       }
       if (!session.stopped) {
@@ -3964,11 +5722,21 @@ class OwnedCodexProxyRunner {
           'owned Codex proxy lacks the exact terminal group-drain receipt',
         )
       }
+      const stderr = readBoundedRegularFileTail(
+        stderrPath,
+        CODEX_STDERR_TAIL_MAX_BYTES,
+        'owned Codex stderr',
+      )
       return {
         status: session.stopped ? 0 : status.code,
         signal: session.stopped ? 'OWNED_STOP' : status.signal,
-        stdout,
-        stderr: fs.existsSync(stderrPath) ? fs.readFileSync(stderrPath, 'utf8') : '',
+        stdout: stdoutTail.toString('utf8'),
+        stdoutByteCount: offset,
+        stdoutSha256: stdoutHash.digest('hex'),
+        stdoutTruncated: offset > stdoutTail.length,
+        stderr: stderr.text,
+        stderrByteCount: stderr.byteCount,
+        stderrTruncated: stderr.truncated,
         processOwned: true,
         exactArgv: true,
         drained: true,
@@ -4060,33 +5828,90 @@ function runOwnedCodexProxy(requestPath) {
   child.stdin.end(request.stdin)
 }
 
-async function withTimeout(operation, milliseconds, timerApi, code, onTimeout) {
+async function withTimeout(
+  operation,
+  milliseconds,
+  timerApi,
+  code,
+  onTimeout,
+  cleanupWatchdogMs = DEFAULT_TIMEOUT_CLEANUP_WATCHDOG_MS,
+) {
   if (milliseconds === Number.POSITIVE_INFINITY) {
     return Promise.resolve().then(operation)
   }
   if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
     throw new SupervisorIntegrationError(code, `${code} elapsed`)
   }
+  if (typeof operation !== 'function' || !timerApi ||
+      typeof timerApi.setTimeout !== 'function' || typeof timerApi.clearTimeout !== 'function' ||
+      typeof code !== 'string' || !code ||
+      (onTimeout !== undefined && onTimeout !== null && typeof onTimeout !== 'function') ||
+      !Number.isSafeInteger(cleanupWatchdogMs) || cleanupWatchdogMs < 1) {
+    throw new SupervisorIntegrationError('TIMEOUT_CONFIG_INVALID', 'timeout and cleanup watchdog configuration is invalid')
+  }
   return new Promise((resolve, reject) => {
     let settled = false
-    const timer = timerApi.setTimeout(async () => {
+    let timer = null
+    let timerArmed = false
+    const expire = () => {
       if (settled) return
       settled = true
-      try { if (onTimeout) await onTimeout() } catch {}
-      reject(new SupervisorIntegrationError(code, `${code} elapsed`))
-    }, milliseconds)
-    if (timer && typeof timer.unref === 'function') timer.unref()
-    Promise.resolve().then(operation).then(
+      timerArmed = false
+      if (!onTimeout) {
+        reject(new SupervisorIntegrationError(code, `${code} elapsed`))
+        return
+      }
+      let cleanupSettled = false
+      const cleanupTimer = timerApi.setTimeout(() => {
+        if (cleanupSettled) return
+        cleanupSettled = true
+        reject(new SupervisorIntegrationError(
+          'PROCESS_DRAIN_TIMEOUT',
+          `${code} cleanup did not settle within its physical drain watchdog`,
+          { timeoutCode: code, cleanupWatchdogMs },
+        ))
+      }, cleanupWatchdogMs)
+      Promise.resolve().then(onTimeout).then(
+        () => {
+          if (cleanupSettled) return
+          cleanupSettled = true
+          timerApi.clearTimeout(cleanupTimer)
+          // A registered timeout cleanup is a trusted drain operation. Its
+          // successful settlement is the proof boundary; only then may the
+          // original phase timeout become authoritative.
+          reject(new SupervisorIntegrationError(code, `${code} elapsed`))
+        },
+        cleanupError => {
+          if (cleanupSettled) return
+          cleanupSettled = true
+          timerApi.clearTimeout(cleanupTimer)
+          reject(new SupervisorIntegrationError(
+            'PROCESS_DRAIN_TIMEOUT',
+            `${code} cleanup failed before proving descendant drain`,
+            { timeoutCode: code, cleanupFailure: serializeError(cleanupError) },
+          ))
+        },
+      )
+    }
+    const refresh = () => {
+      if (settled) return false
+      if (timerArmed) timerApi.clearTimeout(timer)
+      timer = timerApi.setTimeout(expire, milliseconds)
+      timerArmed = true
+      return true
+    }
+    refresh()
+    Promise.resolve().then(() => operation(refresh)).then(
       value => {
         if (settled) return
         settled = true
-        timerApi.clearTimeout(timer)
+        if (timerArmed) timerApi.clearTimeout(timer)
         resolve(value)
       },
       error => {
         if (settled) return
         settled = true
-        timerApi.clearTimeout(timer)
+        if (timerArmed) timerApi.clearTimeout(timer)
         reject(error)
       },
     )
@@ -4172,16 +5997,10 @@ function validateResumedBudget(controller, previous, expectedGeneration) {
     throw new SupervisorIntegrationError('BUDGET_RESUME_REQUIRED', 'a resumed activation requires its prior budget snapshot')
   }
   const current = controller.snapshot()
-  if (typeof controller.crashRetryVerdict === 'function') {
-    const retry = controller.crashRetryVerdict()
-    if (retry.exhausted) {
-      throw new SupervisorIntegrationError(
-        retry.code,
-        'equivalent crash retries exhausted before resume admission',
-        { crashRetry: retry },
-      )
-    }
-  }
+  // Crash equivalence is economic/convergence evidence, not authority to
+  // abandon an authenticated local frontier.  A replacement generation must
+  // still inherit every counter and may collapse optional work, but it cannot
+  // be denied solely because the predecessor controller failed repeatedly.
   for (const field of ['consumedWallMs', 'tokensUsed', 'sessionsStarted', 'launches']) {
     if (!Number.isSafeInteger(current[field]) || !Number.isSafeInteger(previous[field]) || current[field] < previous[field]) {
       throw new SupervisorIntegrationError('BUDGET_RESET_DETECTED', `resumed budget regressed ${field}`, {
@@ -4363,6 +6182,15 @@ async function executeExistingTestBaseline(declaredTests, options = {}) {
       )
     }
     const output = `${String(executed.stdout || '')}\n${String(executed.stderr || '')}`
+    const timeoutEvidenceHash = executed && executed.timedOut === true
+      ? executed.timeoutEvidenceHash : null
+    if (executed && executed.timedOut === true &&
+        !/^[a-f0-9]{64}$/u.test(timeoutEvidenceHash || '')) {
+      throw new SupervisorIntegrationError(
+        'EXISTING_TEST_BASELINE_INVALID',
+        `existing test ${test.id} timeout lacks hashed drain evidence`,
+      )
+    }
     results.push(Object.freeze({
       id: test.id,
       command: JSON.stringify([test.executable, ...test.argv]),
@@ -4371,6 +6199,7 @@ async function executeExistingTestBaseline(declaredTests, options = {}) {
       authority: test.authority,
       exitCode,
       status: exitCode === 0 ? 'PASS' : 'FAIL', outputHash: hashText(output),
+      ...(timeoutEvidenceHash ? { timedOut: true, timeoutEvidenceHash } : {}),
     }))
   }
   return Object.freeze(results)
@@ -4470,12 +6299,47 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
   }
   const current = stateStore.load()
   const retryState = { ...(current.retryState || {}) }
+  const planningChecker = /^roadmap-plan-(?:check|recheck)(?:-runtime-retry)?$/u.test(
+    details.checkerId || '',
+  )
+  const provisionalSequentialCandidate = eventId === 'WORK_ITEM_VERIFIED' &&
+    Array.isArray(details.nextReadyWorkIds) &&
+    details.nextReadyWorkIds.some(id => /^work-\d+(?:-|$)/u.test(id))
+  const checkedVersionHash = planningChecker ? details.planHash : details.candidateHash
+  if (planningChecker && (!/^[a-f0-9]{64}$/u.test(details.planHash || '') || details.candidateHash !== undefined)) {
+    throw new SupervisorIntegrationError(
+      'CHECK_RETRY_STATE_INVALID',
+      'ROADMAP planning transitions require planHash and cannot bind the product candidateHash',
+    )
+  }
+  const planningFallback = details.planningFallback
+  if (planningFallback) {
+    const unavailable = planningFallback.code === 'PLAN_CHECK_UNAVAILABLE' && planningChecker
+    const rejected = planningFallback.code === 'PLAN_RECHECK_REJECTED' &&
+      /^roadmap-plan-recheck(?:-runtime-retry)?$/u.test(details.checkerId || '')
+    const corrected = planningFallback.code === 'PLAN_CORRECTED_PRODUCT_VERIFICATION_REQUIRED' &&
+      /^roadmap-plan-check(?:-runtime-retry)?$/u.test(details.checkerId || '') &&
+      /^[a-f0-9]{64}$/u.test(planningFallback.checkedPlanHash || '') &&
+      planningFallback.checkedPlanHash !== planningFallback.planHash
+    if (!planningChecker || planningFallback.planHash !== checkedVersionHash ||
+        planningFallback.checkerId !== details.checkerId ||
+        planningFallback.checkerResultHash !== details.checkerResultHash ||
+        !/^[a-f0-9]{64}$/u.test(details.checkerResultHash || '') ||
+        typeof planningFallback.reason !== 'string' || !planningFallback.reason ||
+        (!unavailable && !rejected && !corrected)) {
+      throw new SupervisorIntegrationError(
+        'CHECK_RETRY_STATE_INVALID',
+        'ROADMAP planning fallback must bind the exact plan and checker result',
+      )
+    }
+    retryState.planningFallback = { ...planningFallback }
+  }
   if (eventId === 'IMPLEMENTATION_DEFECT') {
     if (!/^[a-f0-9]{64}$/u.test(details.candidateHash || '') ||
-        !/^[a-f0-9]{64}$/u.test(details.checkerResultHash || '') ||
-        typeof details.checkerId !== 'string' || !details.checkerId ||
         typeof details.repairWorkItemId !== 'string' || !/^work-\d+-repair-\d+$/u.test(details.repairWorkItemId) ||
         !Number.isSafeInteger(details.repairAttempt) || details.repairAttempt < 1 ||
+        !/^[a-f0-9]{64}$/u.test(details.checkerResultHash || '') ||
+        typeof details.checkerId !== 'string' || !details.checkerId ||
         !details.checkerReceiptPointer || typeof details.checkerReceiptPointer !== 'object') {
       throw new SupervisorIntegrationError(
         'REPAIR_RECOVERY_INVALID',
@@ -4540,7 +6404,7 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
     }
   } else if (eventId === 'TRANSIENT_RUNTIME' && details.terminalDisposition === 'FAIL') {
     if (!/^roadmap-plan-recheck(?:-runtime-retry)?$/u.test(details.checkerId || '') ||
-        !/^[a-f0-9]{64}$/u.test(details.candidateHash || '') ||
+        !/^[a-f0-9]{64}$/u.test(checkedVersionHash || '') ||
         !/^[a-f0-9]{64}$/u.test(details.checkerResultHash || '')) {
       throw new SupervisorIntegrationError(
         'CHECK_RETRY_STATE_INVALID',
@@ -4549,7 +6413,7 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
     }
     retryState.conclusiveCheckerTerminal = {
       checkerId: details.checkerId,
-      candidateHash: details.candidateHash,
+      planHash: checkedVersionHash,
       checkerResultHash: details.checkerResultHash,
       code: 'FAIL',
       returnState: nextState,
@@ -4576,7 +6440,9 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
     )
     retryState.inconclusiveChecker = {
       checkerId: details.checkerId,
-      candidateHash: details.candidateHash,
+      ...(planningChecker
+        ? { planHash: checkedVersionHash }
+        : { candidateHash: checkedVersionHash }),
       checkerResultHash: details.checkerResultHash,
       retryAttempt: details.retryAttempt,
       returnState: current.state,
@@ -4586,7 +6452,7 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
     const pending = retryState.inconclusiveChecker
     if (!pending || !/^[a-f0-9]{64}$/u.test(pending.checkerResultHash || '') ||
         pending.returnState !== nextState ||
-        pending.candidateHash !== details.candidateHash) {
+        (planningChecker ? pending.planHash : pending.candidateHash) !== checkedVersionHash) {
       throw new SupervisorIntegrationError(
         'CHECK_RETRY_STATE_INVALID',
         'conclusive checker retry must return to its durable originating phase and exact version being checked',
@@ -4596,7 +6462,9 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
     if (details.terminalDisposition === 'FAIL') {
       retryState.conclusiveCheckerTerminal = {
         checkerId: details.checkerId,
-        candidateHash: details.candidateHash,
+        ...(planningChecker
+          ? { planHash: checkedVersionHash }
+          : { candidateHash: checkedVersionHash }),
         checkerResultHash: details.checkerResultHash,
         code: 'FAIL',
         returnState: nextState,
@@ -4607,11 +6475,12 @@ function applyProductionRuntimeTransition(authority, payload = {}) {
     capability, cause: 'deterministic external supervisor progression', eventId,
     statePatch: {
       budgets: budgetController.snapshot(),
-      ...(details.candidateHash ? { candidateHash: details.candidateHash } : {}),
+      ...(!planningChecker && !provisionalSequentialCandidate && details.candidateHash
+        ? { candidateHash: details.candidateHash } : {}),
       retryState,
     },
     ...(details.frontier ? { frontier: details.frontier } : {}),
-    workHashes: details.candidateHash ? [details.candidateHash] : [],
+    workHashes: checkedVersionHash ? [checkedVersionHash] : [],
     checkHashes: details.checkHashes || [],
     openIds: details.nextReadyWorkIds || [],
   })
@@ -4710,6 +6579,14 @@ class CodexSupervisorRuntime {
     this.schedulerFactory = options.schedulerFactory || (settings => new CentralScheduler(settings))
     this.safeEnvFactory = options.safeEnvFactory || safeEnvironmentFactory()
     this.timerApi = options.timerApi || { setTimeout, clearTimeout }
+    this.childTransportWatchdogMs = options.childTransportWatchdogMs === undefined
+      ? CHILD_TRANSPORT_WATCHDOG_MS : options.childTransportWatchdogMs
+    if (!Number.isSafeInteger(this.childTransportWatchdogMs) || this.childTransportWatchdogMs <= 0) {
+      throw new SupervisorIntegrationError(
+        'PROVIDER_UNSUPPORTED',
+        'the optional pre-route analyst requires one finite positive fallback watchdog',
+      )
+    }
     this.now = options.now || Date.now
     this.monotonicNow = options.monotonicNow || (() => Number(process.hrtime.bigint() / 1000000n))
     this.activation = Object.freeze({
@@ -4718,6 +6595,14 @@ class CodexSupervisorRuntime {
       missionHash: options.missionHash || hashText(options.mission || ''),
       generation: options.generation || 1,
     })
+    this.canonicalMissionProjection = options.canonicalMissionProjection ||
+      createCanonicalMissionProjection(options.mission || '')
+    if (this.canonicalMissionProjection.sourceRequestHash !== this.activation.missionHash) {
+      throw new SupervisorIntegrationError(
+        'ACTIVATION_RECEIPT_INVALID',
+        'canonical original-request projection differs from the immutable activation request hash',
+      )
+    }
     this.route = null
     this.routeSource = null
     this.settings = null
@@ -4741,6 +6626,7 @@ class CodexSupervisorRuntime {
     this.startupReadyPromise = null
     this.resolveStartupReady = null
     this.workerContexts = new Map()
+    this.assignmentFindingIdRegistry = new Map()
     this.retainedL1Leases = new Map()
     this.profileLimits = Object.freeze({ route: null, status: 'ROUTE_PENDING', maxDepth: 1, maxConcurrentThreads: 1 })
     this.consumedChecks = new Set()
@@ -4764,6 +6650,7 @@ class CodexSupervisorRuntime {
     this.routeFrozenAt = null
     this.firstChildStartupRecorded = false
     this.diagnosticWorkerLaunches = 0
+    this.diagnosticWorkerAdmissionsInFlight = 0
     this.lastAcceptedProgress = null
     this.rootCallers = Object.freeze({
       controlPlane: this.rolePolicy.bindCaller({
@@ -4799,9 +6686,6 @@ class CodexSupervisorRuntime {
 
   _enforceBudgetPhase(name, evidence = {}) {
     if (!name || !this.budget || !this.budget.phases || !this.budget.phases[name]) return null
-    if ((this.options.baseEnvironment || process.env).AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1') {
-      return Object.freeze({ action: 'CONTINUE', reason: 'authenticated benchmark time policy is unbounded' })
-    }
     const snapshot = this.budget.snapshot()
     const started = snapshot.phaseStartedAtElapsedMs &&
       snapshot.phaseStartedAtElapsedMs[name] !== undefined
@@ -4812,6 +6696,22 @@ class CodexSupervisorRuntime {
       forExecution: name === 'EXECUTION_BUILD',
     })
     if (decision.action === 'CONTINUE') return decision
+    const requiredCompletion = evidence.requiredCompletion === true
+    if (requiredCompletion) {
+      if (decision.phase && ['SOFT', 'HARD'].includes(decision.phase.level) &&
+          !decision.phase.pendingConvergence) {
+        this.budget.requestConvergence(name, {
+          route: this.route,
+          activationId: this.activation.id,
+          ...evidence,
+        })
+      }
+      return {
+        ...decision,
+        completionCanContinue: true,
+        completionTargetOverrun: true,
+      }
+    }
     if (decision.action === 'REQUEST_CONVERGENCE') {
       this.budget.requestConvergence(name, {
         route: this.route,
@@ -4893,45 +6793,24 @@ class CodexSupervisorRuntime {
     })
     const retainedL1 = [...(this.retainedL1Leases || new Map()).entries()]
       .filter(([, retained]) => retained && retained.completed !== true)
-    const redispatched = []
+    const invalidatedRetainedL1Ids = []
     for (const [workItemId, retained] of retainedL1) {
       const prior = this.workerContexts.get(workItemId)
       if (!prior || prior.logicalRole !== 'mission-coordinator') continue
       this.completeRetainedLease(retained)
       this.retainedL1Leases.delete(workItemId)
-      const replacementWorkItemId = `${workItemId}:steering:${entry.entryHash.slice(0, 16)}`
-      const result = await this._launchThroughScheduler(this.scheduler, {
-        workItemId: replacementWorkItemId,
-        logicalRole: 'mission-coordinator', parent: 'run-owner', caller: this.rootCallers.runOwner,
-        route: this.route, purpose: 'planning', retainLease: true,
-        requiredByMission: true,
-        repairOf: workItemId, executorKey: prior.executorKey,
-        assignment: 'Reload and hash-check the rebound immutable request envelope, then revise the retained L1 decomposition for the steering edge.',
-        ownership: ['workspace'],
-        evidenceHashes: [entry.entryHash, reboundPointer.hash],
-        success: ['The retained L1 binds the new request envelope hash before any downstream assignment.'],
-        checks: ['Report the exact rebound request pointer hash and invalidate affected downstream work.'],
-      })
-      if (!result || !result.retainedLease ||
-          this.requestPointer.hash !== reboundPointer.hash) {
-        throw new SupervisorIntegrationError(
-          'REQUEST_STEERING_REDISPATCH_FAILED',
-          'retained L1 was not reloaded and redispatched against the rebound request pointer',
-        )
-      }
-      this.retainedL1Leases.set(replacementWorkItemId, result.retainedLease)
-      redispatched.push(replacementWorkItemId)
+      invalidatedRetainedL1Ids.push(workItemId)
     }
     await this._runtimeTransition('AFFECTED_RESULTS_INVALIDATED', 'L0_ROUTE_DECISION', {
       requestEnvelopeHash: this.requestPointer.hash,
-      invalidatedRetainedL1Ids: retainedL1.map(([workItemId]) => workItemId),
-      redispatchedRetainedL1Ids: redispatched,
+      invalidatedRetainedL1Ids,
+      redispatchedRetainedL1Ids: [],
     })
     return Object.freeze({
       entry,
       previousPointer: Object.freeze({ ...previousPointer }),
       requestPointer: this.requestPointer,
-      redispatchedRetainedL1Ids: Object.freeze(redispatched),
+      redispatchedRetainedL1Ids: Object.freeze([]),
     })
   }
 
@@ -4961,7 +6840,10 @@ class CodexSupervisorRuntime {
     const resumeDeadline = this.options.resumeState && this.options.resumeState.deadline
     const previousDeadline = previous && previous.deadline
     const declared = this.settings.deadline
-    const wallTimeUnbounded = benchmarkNoTimeoutEnabled(this.options.baseEnvironment || process.env)
+    // Local required completion may cross economic wall targets, but the
+    // declared absolute deadline always remains authoritative for external
+    // writes. Ambient process variables never weaken that boundary.
+    const wallTimeUnbounded = false
     // Synthetic/legacy v2 resume fixtures which predate deadline persistence
     // remain readable. Every newly admitted generation-one run is bound below,
     // so no new resumable state can enter this compatibility branch.
@@ -4974,10 +6856,11 @@ class CodexSupervisorRuntime {
           (previousDeadline && !sameCanonicalValue(resumeDeadline, previousDeadline))) {
         return { valid: false, code: 'RESUME_DEADLINE_INVALID', reason: 'resume deadline differs from its declared or persisted binding' }
       }
-      if (!Number.isFinite(Date.parse(resumeDeadline.absoluteDeadline)) ||
-          (!wallTimeUnbounded && Date.parse(resumeDeadline.absoluteDeadline) <= nowMs)) {
-        return { valid: false, code: 'RESUME_DEADLINE_EXPIRED', reason: 'persisted resume deadline has expired' }
+      const resumeAbsoluteMs = Date.parse(resumeDeadline.absoluteDeadline)
+      if (!Number.isFinite(resumeAbsoluteMs)) {
+        return { valid: false, code: 'RESUME_DEADLINE_INVALID', reason: 'persisted resume deadline is malformed' }
       }
+      const convergenceRequired = !wallTimeUnbounded && resumeAbsoluteMs <= nowMs
       if (previousDeadline) {
         const expectedVerification = Math.floor(previous.limits.wallMs * resumeDeadline.verificationReservePercent / 100)
         const expectedFinalization = Math.floor(previous.limits.wallMs * resumeDeadline.recoveryAndFinalizationReservePercent / 100)
@@ -4993,7 +6876,16 @@ class CodexSupervisorRuntime {
       }
       this.settings = Object.freeze({ ...this.settings, deadline: { ...resumeDeadline } })
       this.activation = Object.freeze({ ...this.activation, deadline: { ...resumeDeadline } })
-      return { valid: true, deadline: resumeDeadline }
+      return {
+        valid: true,
+        deadline: resumeDeadline,
+        ...(convergenceRequired ? {
+          convergenceRequired: true,
+          completionCanContinue: true,
+          completionTargetOverrun: ['WALL'],
+          reason: 'persisted resume deadline elapsed; bounded local recovery and completion remain required',
+        } : {}),
+      }
     }
     const configuredWallMaximum = this.budget.snapshot().limits.wallMs
     const admitted = normalizeTaskDeadline(declared, {
@@ -5005,7 +6897,9 @@ class CodexSupervisorRuntime {
     this.budget.bindDeadline({ ...admitted, admittedAtMs: nowMs })
     this.settings = Object.freeze({ ...this.settings, deadline: { ...admitted.deadline } })
     this.activation = Object.freeze({ ...this.activation, deadline: { ...admitted.deadline } })
-    return admitted
+    return this.deadlineAdmissionDiagnostic
+      ? { ...admitted, diagnostic: this.deadlineAdmissionDiagnostic }
+      : admitted
   }
 
   async start() {
@@ -5027,6 +6921,40 @@ class CodexSupervisorRuntime {
       if (this.settings.status === 'CONFIG_REQUIRED' || this.settings.status === 'PROVIDER_UNSUPPORTED') {
         return this._preLeaseOutcome(this.settings.status, this.settings)
       }
+      const rawSettings = this.options.settings || {}
+      const rawDeadlinePresent = rawSettings && typeof rawSettings === 'object' &&
+        Object.prototype.hasOwnProperty.call(rawSettings, 'deadline')
+      if (this.activation.generation === 1 && rawDeadlinePresent) {
+        const configuredWallMaximum = this.budget.snapshot().limits.wallMs
+        const observedNowMs = Number(this.now())
+        const deadlineCheck = normalizeTaskDeadline(this.settings.deadline, {
+          nowMs: observedNowMs,
+          productHardMaximumMs: this.options.productHardMaximumMs ?? configuredWallMaximum,
+        })
+        const deadlineWasDiscarded = this.settings.deadline === undefined
+        if ((deadlineWasDiscarded || !deadlineCheck.valid) && Number.isFinite(observedNowMs)) {
+          // An untrusted/malformed host target cannot authorize an external
+          // write and cannot abandon required local work. Bind an already
+          // elapsed external boundary while giving local completion the
+          // ordinary finite product window in _admitTaskDeadline().
+          this.settings = Object.freeze({
+            ...this.settings,
+            deadline: {
+              absoluteDeadline: new Date(observedNowMs).toISOString(),
+              source: 'product-maximum',
+              verificationReservePercent: 25,
+              recoveryAndFinalizationReservePercent: 10,
+            },
+          })
+          this.deadlineAdmissionDiagnostic = Object.freeze({
+            code: 'TASK_DEADLINE_SANITIZED',
+            reason: deadlineWasDiscarded
+              ? 'declared task deadline was not a canonical object'
+              : deadlineCheck.reason,
+            externalWritesAllowed: false,
+          })
+        }
+      }
       const settingsValidation = validateResolvedSettings(this.settings)
       if (!settingsValidation.valid) {
         throw new SupervisorIntegrationError('SETTINGS_INVALID', 'resolved settings do not match the canonical v2 contract', {
@@ -5038,7 +6966,7 @@ class CodexSupervisorRuntime {
         return this._deadlineFailure(deadlineAdmission.code, deadlineAdmission.reason, deadlineAdmission)
       }
       this.admissionDurations.configuration += Math.max(0, this.monotonicNow() - configurationStartedAt)
-      this.budget.assertAvailable({ forWork: true })
+      this.budget.assertAvailable({ forWork: true, requiredCompletion: true })
       const recordStartedAt = this.monotonicNow()
       if (typeof this.options.beforeMissionAcquire === 'function') {
         await this.options.beforeMissionAcquire({ activation: this.activation })
@@ -5084,7 +7012,10 @@ class CodexSupervisorRuntime {
         validateResumedBudget(this.budget, this.options.previousBudgetSnapshot, this.activation.generation)
       }
       if (this.options.resumeState || this.activation.generation > 1) {
-        this._enforceBudgetPhase('RECOVERY_REPLAY', { boundary: 'activation-resume' })
+        this._enforceBudgetPhase('RECOVERY_REPLAY', {
+          boundary: 'activation-resume',
+          requiredCompletion: true,
+        })
       }
       this.admissionDurations.runRecord += Math.max(0, this.monotonicNow() - recordStartedAt)
       const persistenceStartedAt = this.monotonicNow()
@@ -5201,6 +7132,7 @@ class CodexSupervisorRuntime {
           } else {
             this._activateRouteScheduler(
               this.options.resumeState.schedulerState, decisionResult.route, decisionResult.decision.routeSource,
+              decisionResult.decision,
             )
           }
         }
@@ -5241,16 +7173,11 @@ class CodexSupervisorRuntime {
       this.route = decisionResult.route
       this.routeSource = decisionResult.decision.routeSource
       if (!this.scheduler || this.scheduler.route === 'PENDING') {
-        this._activateRouteScheduler(null, this.route, this.routeSource)
+        this._activateRouteScheduler(null, this.route, this.routeSource, decisionResult.decision)
       }
       if ((!this.options.resumeState && !exactPathRequested) || this.options.resumeState?.resumeState === 'L0_ROUTE_DECISION') {
         await this._runtimeTransition('ROUTE_DECISION_VALID', 'PREPARE_WORK', {
-          nextReadyWorkIds: decisionResult.route === 'ROADMAP'
-            ? ['roadmap-author']
-            : Array.from(
-                { length: Math.max(1, Number(decisionResult.decision.usefulWorkerCount || 1)) },
-                (_, index) => `work-${index + 1}`,
-              ),
+          nextReadyWorkIds: initialProductFrontier(decisionResult.decision),
         })
       }
       if (typeof this.options.profileUpdater === 'function') {
@@ -5282,27 +7209,14 @@ class CodexSupervisorRuntime {
             decision: decisionResult.decision,
             record: this.record,
           })
-          if (this.route === 'LIGHT') {
-            await withTimeout(
-              prepare,
-              benchmarkPhaseTimeoutMs(
-                LIGHT_PLAN_MAX_DURATION_MS,
-                this.options.baseEnvironment || process.env,
-              ),
-              this.timerApi,
-              'LIGHT_PLAN_TIMEOUT',
-              () => this.processOwner.cancelAll({ reason: 'light planning timeout', terminalStatus: 'FAILED' }),
-            )
-          } else {
-            await prepare()
-          }
+          await prepare()
         }
         if (this.route === 'LIGHT') {
           const planningAdmission = this.scheduler.recordAdmissionComponent(
             'lightPlanning',
             Math.max(0, this.monotonicNow() - planningStartedAt),
           )
-          if (!planningAdmission || planningAdmission.withinCeiling !== true) {
+          if (!planningAdmission || planningAdmission.completionCanContinue !== true) {
             throw new SupervisorIntegrationError(
               'ADMISSION_COMPONENT_TIMEOUT',
               'LIGHT planning exceeded the canonical admission ceiling',
@@ -5316,12 +7230,7 @@ class CodexSupervisorRuntime {
         throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'selected route has no executable provider adapter')
       }
       if (!resumesExecution) {
-        const initialReadyWorkIds = this.route === 'ROADMAP'
-          ? ['roadmap-author']
-          : Array.from(
-              { length: Math.max(1, Number(decisionResult.decision.usefulWorkerCount || 1)) },
-              (_, index) => `work-${index + 1}`,
-            )
+        const initialReadyWorkIds = initialProductFrontier(decisionResult.decision)
         await this._runtimeTransition('WORK_PREPARED', 'RUN_WORK', {
           nextReadyWorkIds: initialReadyWorkIds,
         })
@@ -5373,11 +7282,9 @@ class CodexSupervisorRuntime {
           this.resumableSuspensionIntent.result,
         )
       }
-      const benchmarkDiagnostic = this.options.baseEnvironment &&
-        this.options.baseEnvironment.AUTOPROMPT_BENCHMARK_DIAGNOSTICS
-      if (benchmarkDiagnostic) {
+      if (typeof this.options.diagnosticSink === 'function') {
         try {
-          fs.appendFileSync(benchmarkDiagnostic, `${JSON.stringify({
+          this.options.diagnosticSink(Object.freeze({
             label: 'supervisor-runtime-error',
             state: typeof this.options.runtimeStateProvider === 'function'
               ? this.options.runtimeStateProvider()?.state || null
@@ -5385,7 +7292,7 @@ class CodexSupervisorRuntime {
             route: this.route,
             error: serializeError(error),
             stack: error && error.stack || null,
-          })}\n`, { mode: 0o600 })
+          }))
         } catch {}
       }
       if (error && error.code === 'WORKSPACE_LEASE_CONFLICT') {
@@ -5396,6 +7303,23 @@ class CodexSupervisorRuntime {
         ? error.code : 'FAILED'
       if (!this.lease) return this._preLeaseOutcome(terminalErrorCode, { error: serializeError(error) })
       if (this.cancelled && this.cancellationPromise) return this.cancellationPromise
+      if (error && error.code === 'CALLBACK_RECONCILIATION_PENDING' &&
+          error.details && error.details.resumableCandidate) {
+        // The provider turn is already drained and hash-frozen. An essential
+        // local receipt/accounting callback that remains unavailable cannot
+        // authorize DONE, but it also cannot convert the user's intact
+        // candidate into a generic controller FAILED or launch another model.
+        return this._suspendResumable('PARTIAL', {
+          terminalEnvelope: {
+            status: 'LOCAL_PERSISTENCE_PENDING',
+            error: serializeError(error),
+            bestAvailableCandidateEvidence: {
+              disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+              ...error.details.resumableCandidate,
+            },
+          },
+        })
+      }
       const budgetStop = error && [
         'BUDGET_EXHAUSTED', 'MISSION_TIMEOUT', 'EXTERNAL_WRITE_DEADLINE_EXPIRED',
         'RESUME_DEADLINE_EXPIRED', 'PHASE_CONVERGENCE_REQUIRED', 'PHASE_BUDGET_EXHAUSTED',
@@ -5411,16 +7335,28 @@ class CodexSupervisorRuntime {
         if (typeof this.budget.crashRetryVerdict === 'function') {
           const retry = this.budget.crashRetryVerdict()
           if (retry.exhausted) {
-            terminalErrorCode = retry.code
+            // Exhaustion controls whether the supervisor should try the same
+            // controller strategy again. It is not task-result authority and
+            // must never replace the primary failure, a selected terminal
+            // intent, or the best candidate already present in the target.
             if ((typeof error === 'object' || typeof error === 'function') &&
                 Object.isExtensible(error)) {
-              error.code = retry.code
-              error.details = { ...(error.details || {}), crashRetry: retry }
+              error.details = {
+                ...(error.details || {}),
+                crashRetry: retry,
+                convergenceDisposition: 'DO_NOT_REPEAT_EQUIVALENT_CONTROLLER_STRATEGY',
+                primaryErrorCode: terminalErrorCode,
+              }
             } else {
               terminalError = new SupervisorIntegrationError(
-                retry.code,
+                terminalErrorCode,
                 error && error.message || String(error),
-                { crashRetry: retry, primaryError: serializeError(error), crashState },
+                {
+                  crashRetry: retry,
+                  convergenceDisposition: 'DO_NOT_REPEAT_EQUIVALENT_CONTROLLER_STRATEGY',
+                  primaryError: serializeError(error),
+                  crashState,
+                },
               )
             }
           }
@@ -5474,35 +7410,41 @@ class CodexSupervisorRuntime {
     let result = adoptedResult
     let streamedRouteEventCount = 0
     try {
-      if (!result) result = await withTimeout(
-        () => this._launchThroughScheduler(this.scheduler, {
-          workItemId: 'route-analyst',
-          logicalRole: 'route-analyst',
-          parent: 'deterministic-control-plane',
-          caller: this.rootCallers.controlPlane,
-          route: 'PRE_ROUTE',
-          purpose: 'planning',
-          lane: 'routeAnalyst',
-          assignment: 'Inspect only enough read-only project evidence to recommend DIRECT, LIGHT, or ROADMAP.',
-          successChecklist: ['Return the required route recommendation schema.'],
-          checks: ['Read/list/search only; do not mutate or dispatch.'],
-          admission,
-        }),
-        benchmarkPhaseTimeoutMs(
-          ROUTE_ANALYST_MAX_DURATION_MS,
-          this.options.baseEnvironment || process.env,
-        ),
-        this.timerApi,
-        'ROUTE_ANALYST_TIMEOUT',
-        () => this.processOwner.cancelAll({ reason: 'route analyst timeout', terminalStatus: 'FAILED' }),
-      )
+      if (!result) result = await this._launchThroughScheduler(this.scheduler, {
+        workItemId: 'route-analyst',
+        logicalRole: 'route-analyst',
+        parent: 'deterministic-control-plane',
+        caller: this.rootCallers.controlPlane,
+        route: 'PRE_ROUTE',
+        purpose: 'planning',
+        lane: 'routeAnalyst',
+        assignment: 'Inspect only enough read-only project evidence to recommend DIRECT, LIGHT, or ROADMAP. Default to one checker. Recommend two only when availableCheckKinds declares two different exact typed identities and each namedDistinctResponsibilities entry starts with its matching [type:id] identity.',
+        successChecklist: ['Return the required route recommendation schema.'],
+        checks: ['Read/list/search only; do not mutate or dispatch.'],
+        admission,
+      })
       streamedRouteEventCount = Number(result && result[STREAMED_ROUTE_EVENT_COUNT] || 0)
     } catch (error) {
       streamedRouteEventCount = Number(error && error[STREAMED_ROUTE_EVENT_COUNT] || 0)
-      if (error && (/^RECOVERY_CHECKPOINT_/.test(error.code || '') || /^RUN_RECORD_/.test(error.code || ''))) {
-        throw error
-      }
+      if (routePersistenceIntegrityFailure(error)) throw error
       result = { outcome: error.code === 'ROUTE_ANALYST_TIMEOUT' ? 'TIMEOUT' : 'CRASH', events: [{ type: 'failure', error: serializeError(error) }] }
+    }
+    const recommendationBounds = result && result.recommendation
+      ? validateCodexAdvisoryPayloadBounds(result.recommendation) : null
+    if (recommendationBounds && !recommendationBounds.valid) {
+      // Preserve only a bounded receipt of the advisory overflow. Never write
+      // or dispatch the schema-valid verbose body into later model contexts.
+      result = {
+        ...result,
+        outcome: 'MALFORMED',
+        recommendation: null,
+        events: [{
+          type: 'failure',
+          code: 'ROUTE_ANALYST_SEMANTIC_BOUNDS_EXCEEDED',
+          evidenceHash: recommendationBounds.evidenceHash,
+          summary: recommendationBounds.summary,
+        }],
+      }
     }
     for (const event of streamedRouteEventCount === 0 && Array.isArray(result.events) ? result.events :
       result.outcome === 'CRASH' || result.outcome === 'TIMEOUT' ? result.events || [] : []) {
@@ -5516,24 +7458,42 @@ class CodexSupervisorRuntime {
       environment: this.options.baseEnvironment || process.env,
     })
     if (evaluated.recommendation_state) {
-      if (!this.record || typeof this.record.writeRouteAnalystFallbackState !== 'function' ||
-          typeof this.record.readRouteAnalystFallbackState !== 'function') {
-        throw new SupervisorIntegrationError(
-          'RUN_RECORD_SCHEMA_INCOMPATIBLE',
-          'route analyst fallback state requires the immutable registered run-record writer',
-        )
-      }
-      const statePath = typeof this.record.resolve === 'function'
-        ? this.record.resolve('route/recommendation-state.json') : null
-      if (!statePath || !fs.existsSync(statePath)) {
-        this.record.writeRouteAnalystFallbackState(evaluated.recommendation_state)
-      }
-      const restoredFallback = this.record.readRouteAnalystFallbackState()
-      if (stableStringify(restoredFallback) !== stableStringify(evaluated.recommendation_state)) {
-        throw new SupervisorIntegrationError(
-          'CRASH_ADOPTION_CONFLICT',
-          'durable route analyst fallback state differs from the evaluated recommendation state',
-        )
+      try {
+        if (!this.record || typeof this.record.writeRouteAnalystFallbackState !== 'function' ||
+            typeof this.record.readRouteAnalystFallbackState !== 'function') {
+          throw new SupervisorIntegrationError(
+            'RUN_RECORD_SCHEMA_INCOMPATIBLE',
+            'route analyst fallback state requires the immutable registered run-record writer',
+          )
+        }
+        const statePath = typeof this.record.resolve === 'function'
+          ? this.record.resolve('route/recommendation-state.json') : null
+        if (!statePath || !fs.existsSync(statePath)) {
+          this.record.writeRouteAnalystFallbackState(evaluated.recommendation_state)
+        }
+        const restoredFallback = this.record.readRouteAnalystFallbackState()
+        if (stableStringify(restoredFallback) !== stableStringify(evaluated.recommendation_state)) {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            'durable route analyst fallback state differs from the evaluated recommendation state',
+          )
+        }
+      } catch (error) {
+        if (routePersistenceIntegrityFailure(error) || error && error.code === 'CRASH_ADOPTION_CONFLICT') {
+          throw error
+        }
+        // The advisory route is dispensable. A controller writer/schema/io
+        // defect must not stop the mission before work; the already evaluated
+        // conservative DIRECT fallback remains the in-memory authority.
+        if (typeof this.options.diagnosticSink === 'function') {
+          try {
+            this.options.diagnosticSink(Object.freeze({
+              label: 'route-analyst-persistence-fallback',
+              route: 'DIRECT',
+              error: serializeError(error),
+            }))
+          } catch {}
+        }
       }
     }
     this._recordAdmissionComponent('routeAnalyst', Math.max(0, this.monotonicNow() - admissionStartedAt))
@@ -5587,8 +7547,25 @@ class CodexSupervisorRuntime {
       ? requestEnvelopeBinding.hash
       : this.requestPointer.hash
     const budgetSnapshot = this.budget.snapshot()
-    const liveAvailability = this.budget.assertAvailable()
-    const liveBudget = Object.freeze({ ...budgetSnapshot, remaining: { ...liveAvailability.remaining } })
+    const liveAvailability = this.budget.assertAvailable({ requiredCompletion: true })
+    const completionTargetOverrun = liveAvailability.completionTargetOverrun || []
+    const wallTargetElapsed = completionTargetOverrun.some(value =>
+      ['WALL', 'WORK_WALL', 'EXECUTION_WALL'].includes(value))
+    const operationalRemaining = {
+      ...liveAvailability.remaining,
+      ...(wallTargetElapsed ? {
+        wallMs: Math.max(
+          budgetSnapshot.limits.wallMs,
+          Number(budgetSnapshot.verificationReserveMs || 0) +
+            Number(budgetSnapshot.finalizationReserveMs || 0) + 10,
+        ),
+      } : {}),
+    }
+    const liveBudget = Object.freeze({
+      ...budgetSnapshot,
+      remaining: operationalRemaining,
+      ...(completionTargetOverrun.length ? { completionTargetOverrun } : {}),
+    })
     const providerCapabilitiesHash = hashText(stableStringify(this.providerCapabilities))
     const budgetSnapshotHash = hashText(stableStringify(liveBudget))
     const targetEvidence = typeof this.options.exactPathTargetEvidence === 'function'
@@ -5617,7 +7594,7 @@ class CodexSupervisorRuntime {
     const decision = await factory({
       route,
       preflight,
-      requestedResult: this.options.mission,
+      requestedResult: this.canonicalMissionProjection.canonicalMission,
       requestEnvelopeHash: boundRequestEnvelopeHash,
       targetIdentity: this.options.targetIdentity,
       providerCapabilities: this.providerCapabilities,
@@ -5643,14 +7620,9 @@ class CodexSupervisorRuntime {
     }
     this.route = route
     this.routeSource = 'explicit_control'
-    this._activateRouteScheduler(null, route, this.routeSource)
+    this._activateRouteScheduler(null, route, this.routeSource, decision)
     await this._runtimeTransition('EXACT_PATH_ACCEPTED', 'PREPARE_WORK', {
-      nextReadyWorkIds: route === 'ROADMAP'
-        ? ['roadmap-author']
-        : Array.from(
-            { length: Math.max(1, Number(decision.usefulWorkerCount || 1)) },
-            (_, index) => `work-${index + 1}`,
-          ),
+      nextReadyWorkIds: initialProductFrontier(decision),
     })
     return {
       status: 'ROUTE_DECIDED',
@@ -5679,6 +7651,7 @@ class CodexSupervisorRuntime {
         activationId: this.activation.id,
         parentSessionId: this.rootCallers.runOwner.sessionId,
         forWork: true,
+        requiredCompletion: true,
       })
     }
     const recoveryFrontier = {
@@ -5777,9 +7750,9 @@ class CodexSupervisorRuntime {
         humanDescription: 'Persist complete streamed root L0 usage before allowing route-decision continuation.',
       }, { tokenUsage: delta })
       const tokens = billableModelTokens(delta)
-      if (tokens > 0) this.budget.consumeTokens(tokens)
+      if (tokens > 0) this.budget.consumeTokens(tokens, { requiredCompletion: true })
       if (rootContinuationId || this.recoveryThreads.has(rootLease.id)) persistRootCheckpoint('USAGE_RECORDED')
-      return { continue: authorization.allowed === true && report.continue === true, authorization, report }
+      return { continue: true, authorization, report }
     }
     const rootReceiptLocation = attempt => this._terminalReceiptLocation(
       rootLease.id,
@@ -5889,31 +7862,34 @@ class CodexSupervisorRuntime {
       this._recordAdmissionComponent('routeDecision', Math.max(0, this.monotonicNow() - admissionStartedAt))
       return result
     }
+    const conservativeCompletion = causeCode => ({
+      decision: compileConservativeCompletionDecision({
+        requestedResult: this.canonicalMissionProjection.canonicalMission,
+        requestEnvelopeHash: this.requestPointer.hash,
+        targetIdentity: this.options.targetIdentity,
+        providerCapabilities: this.providerCapabilities,
+        budget: this.budget.status({ forWork: true }),
+        nowMs: this.now(),
+        causeCode,
+      }),
+      submittedAtMs: this.now(),
+      usage: { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 },
+      usageStreamed: true,
+    })
     const decide = correctionAttempts => {
-      const remainingMs = remainingL0DecisionBudgetMs({
-        startedAtMs: admissionStartedAt,
-        nowMs: this.monotonicNow(),
-        environment: this.options.baseEnvironment || process.env,
+      return this.options.decideRoute({
+        analysis,
+        correctionAttempts,
+        requestPointer: this.requestPointer,
+        settings: this.settings,
+        route: null,
+        sessionId: this.rootCallers.runOwner.sessionId,
+        continuationId: rootContinuationId,
+        onLaunchPrepared,
+        onSessionIdentified,
+        onUsageDelta,
+        onTerminalResult: (result, evidence) => onTerminalResult(result, evidence, correctionAttempts),
       })
-      return withTimeout(
-        () => this.options.decideRoute({
-          analysis,
-          correctionAttempts,
-          requestPointer: this.requestPointer,
-          settings: this.settings,
-          route: null,
-          sessionId: this.rootCallers.runOwner.sessionId,
-          continuationId: rootContinuationId,
-          onLaunchPrepared,
-          onSessionIdentified,
-          onUsageDelta,
-          onTerminalResult: (result, evidence) => onTerminalResult(result, evidence, correctionAttempts),
-        }),
-        remainingMs,
-        this.timerApi,
-        'ROUTE_DECISION_TIMEOUT',
-        () => this.processOwner.cancelAll({ reason: 'route decision timeout', terminalStatus: 'FAILED' }),
-      )
     }
     const adoptedAcceptedRootResults = adoptedRoot && adoptedRoot.binding &&
       adoptedRoot.binding.frontier && adoptedRoot.binding.frontier.acceptedResultIds || []
@@ -5934,27 +7910,35 @@ class CodexSupervisorRuntime {
         if (committed) armRootCorrectionRotation(committed.receiptHash)
         submitted = committed ? committed.submitted : await decide(correctionAttempts)
       } catch (error) {
-        if (error && error.code === 'ROUTE_DECISION_TIMEOUT') {
+        if (error && (error.code === 'ROUTE_DECISION_TIMEOUT' ||
+            PROVIDER_TRANSPORT_AVAILABILITY_CODES.has(error.code))) {
+          // The recovery model emitted no usable decision before the finite
+          // process watchdog. Continue through one conservative local worker
+          // and independent checker instead of turning elapsed time into a
+          // control-plane terminal state.
+          submitted = conservativeCompletion(error.code)
+        } else {
           try { rootLease.fail(error, {}) } catch {}
           persistTerminalSession(this.budget, rootSessionId, { status: 'FAILED', evidenceHashes: [] }, error)
-          await this._runtimeTransition('ROUTE_DECISION_TIMEOUT', 'RELEASING_LOCK')
-          return finish({ status: 'ROUTE_DECISION_TIMEOUT', route: null, start_workers: false, resumable: true })
+          throw error
         }
-        try { rootLease.fail(error, {}) } catch {}
-        persistTerminalSession(this.budget, rootSessionId, { status: 'FAILED', evidenceHashes: [] }, error)
-        throw error
       }
       if (submitted && submitted.usageStreamed !== true && submitted.usage) {
         const usageVerdict = onUsageDelta(submitted.usage)
         if (usageVerdict.continue !== true) {
           const error = new SupervisorIntegrationError('BUDGET_EXHAUSTED', 'root L0 usage exhausted the scheduler budget')
           rootLease.fail(error, {})
-          this.budget.endSession(rootSessionId, { status: 'PARTIAL', evidenceHashes: [] })
+          persistTerminalSession(
+            this.budget,
+            rootSessionId,
+            { status: 'PARTIAL', evidenceHashes: [] },
+            error,
+          )
           throw error
         }
       }
       const submittedAtMonotonic = this.monotonicNow()
-      const result = evaluateL0Decision({
+      let result = evaluateL0Decision({
         // Model-authored wall-clock fields are evidence only.  Admission and
         // every correction share this one supervisor-owned monotonic window.
         startedAtMs: admissionStartedAt,
@@ -5971,13 +7955,50 @@ class CodexSupervisorRuntime {
         rootContinuationId = null
         continue
       }
+      if (!result.start_workers && result.status !== 'WAITING_USER') {
+        // Two malformed recovery turns are model evidence, not authority to
+        // abandon the requested work. Freeze the same conservative local
+        // completion decision used by the watchdog path.
+        submitted = conservativeCompletion(result.status)
+        const fallbackAt = this.monotonicNow()
+        result = evaluateL0Decision({
+          startedAtMs: admissionStartedAt,
+          submittedAtMs: fallbackAt,
+          nowMs: fallbackAt,
+          decision: submitted.decision,
+          requestText: this.options.mission,
+          correctionAttempts,
+          environment: this.options.baseEnvironment || process.env,
+        })
+      }
+      if (result.status === 'WAITING_USER' &&
+          !automaticWaitingRequiresUserAuthority(
+            analysis,
+            this.options.verifyAutomaticWaitingAuthority,
+          )) {
+        // Model-authored uncertainty is not authority to hand the task back.
+        // Only typed material user decisions or consequential irreversible
+        // external effects may suspend an automatic run; ordinary unknowns
+        // compile to the local one-worker completion path.
+        submitted = conservativeCompletion('MODEL_WAITING_USER_COLLAPSED')
+        const fallbackAt = this.monotonicNow()
+        result = evaluateL0Decision({
+          startedAtMs: admissionStartedAt,
+          submittedAtMs: fallbackAt,
+          nowMs: fallbackAt,
+          decision: submitted.decision,
+          requestText: this.options.mission,
+          correctionAttempts,
+          environment: this.options.baseEnvironment || process.env,
+        })
+      }
       if (result.decision && this.record.write) {
         writeRouteDecisionArtifacts(this.record, result.decision)
       }
       rootLease.complete({})
       this.recoveryThreads.delete(rootLease.id)
       persistRootCheckpoint('LEASE_COMPLETED')
-      this.budget.endSession(rootSessionId, {
+      persistTerminalSession(this.budget, rootSessionId, {
         status: result.start_workers ? 'DONE' : 'FAILED',
         evidenceHashes: result.decision ? [hashText(JSON.stringify(result.decision))] : [],
       })
@@ -5992,21 +8013,91 @@ class CodexSupervisorRuntime {
     }
   }
 
-  _activateRouteScheduler(savedState = null, decidedRoute = this.route, routeSource = this.routeSource || 'automatic') {
+  _activateRouteScheduler(
+    savedState = null,
+    decidedRoute = this.route,
+    routeSource = this.routeSource || 'automatic',
+    routeDecision = null,
+  ) {
     this.route = decidedRoute
     this.routeSource = routeSource
     const effectiveSubs = this.settings.concurrency.effectiveMaxSubs
-    const maxChildLaunches = this.options.maxChildLaunches === undefined
-      ? undefined
-      : Math.max(1, Number(this.options.maxChildLaunches))
+    let workGroups
+    let requiredChildLaunches
+    if (!savedState) {
+      const usefulWorkerCount = routeDecision && routeDecision.usefulWorkerCount
+      const topologyWorkerCount = routeDecision && routeDecision.topology &&
+        routeDecision.topology.counts && routeDecision.topology.counts.workers
+      if (!Number.isSafeInteger(usefulWorkerCount) || usefulWorkerCount < 1 ||
+          topologyWorkerCount !== usefulWorkerCount) {
+        throw new SupervisorIntegrationError(
+          'ROUTE_TOPOLOGY_INVALID',
+          `${this.route} scheduler activation requires the exact validated useful-worker topology`,
+        )
+      }
+      if (this.route === 'ROADMAP') workGroups = usefulWorkerCount
+      const requiredPreProductionLaunches =
+        Array.isArray(routeDecision.capturedDomainContracts) &&
+          routeDecision.capturedDomainContracts.some(contract =>
+            contract && contract.kind === 'FIXTURE_PROVENANCE') ? 1 : 0
+      const physicalExecution = codexPhysicalExecutionReceipt(routeDecision, {
+        additionalGateLaunches: requiredPreProductionLaunches,
+      })
+      requiredChildLaunches = physicalExecution.requiredChildLaunches
+      if (!Number.isSafeInteger(requiredChildLaunches) || requiredChildLaunches < 1) {
+        throw new SupervisorIntegrationError(
+          'ROUTE_TOPOLOGY_INVALID',
+          `${this.route} scheduler activation requires an exact bounded completion-launch requirement`,
+        )
+      }
+      if (this.record && typeof this.record.resolve === 'function' &&
+          typeof this.record.write === 'function') {
+        const relative = CODEX_PHYSICAL_EXECUTION_PATH
+        const absolute = this.record.resolve(relative)
+        if (fs.existsSync(absolute)) {
+          const saved = readRegularJson(absolute, 'Codex physical execution receipt').parsed
+          if (stableStringify(saved) !== stableStringify(physicalExecution)) {
+            throw new SupervisorIntegrationError(
+              'CRASH_ADOPTION_CONFLICT',
+              'Codex physical execution receipt changed after route freeze',
+            )
+          }
+        } else {
+          this.record.write(relative, `${JSON.stringify(physicalExecution, null, 2)}\n`)
+        }
+      }
+    }
+    // Once the route compiler authenticates the exact completion graph, its
+    // required identities are the scheduler's hard safety ceiling. Embedding
+    // options are economic hints only: a stale/undersized custom clamp must
+    // not make an otherwise valid task fail before product work. The global
+    // BudgetController still records those launch/session targets and
+    // required-completion overruns.
+    const maxChildLaunches = !savedState && requiredChildLaunches === undefined &&
+      this.options.maxChildLaunches !== undefined
+      ? Math.max(1, Number(this.options.maxChildLaunches))
+      : undefined
+    const configuredLanes = this.options.lanes || { main: {} }
+    // Validate the embedding-provided container before adding the compiled
+    // main-lane completion ceiling. Object spread must not turn malformed
+    // settings into an apparently valid completion graph.
+    validateLaneSettingsInput(configuredLanes)
+    const lanes = !savedState && requiredChildLaunches !== undefined
+      ? {
+          ...configuredLanes,
+          main: { ...(configuredLanes.main || {}), maxLaunches: requiredChildLaunches },
+        }
+      : configuredLanes
     let settings = resolveSchedulerSettings({
       route: this.route,
       concurrency: this.settings.concurrency,
       liveCeiling: this.route === 'ROADMAP' && this.options.userLiveCeiling !== undefined
         ? Math.min(10, Number(this.options.userLiveCeiling), effectiveSubs + 1)
         : Math.min(effectiveSubs + 1, this.route === 'ROADMAP' ? 6 : 4),
+      ...(workGroups === undefined ? {} : { workGroups }),
+      ...(requiredChildLaunches === undefined ? {} : { requiredChildLaunches }),
       maxChildLaunches,
-      lanes: this.options.lanes || { main: {} },
+      lanes,
       environment: this.options.baseEnvironment || process.env,
     })
     let restoredState = savedState
@@ -6111,7 +8202,7 @@ class CodexSupervisorRuntime {
 
   _recordAdmissionComponent(name, durationMs) {
     const verdict = this.scheduler.recordAdmissionComponent(name, durationMs)
-    if (!verdict || verdict.withinCeiling !== true) {
+    if (!verdict || verdict.completionCanContinue !== true) {
       throw new SupervisorIntegrationError(
         'ADMISSION_COMPONENT_TIMEOUT',
         `admission component exceeded the canonical ceiling: ${name}`,
@@ -6125,12 +8216,21 @@ class CodexSupervisorRuntime {
     if (!this.route || !this.scheduler) {
       throw new SupervisorIntegrationError('ROUTE_REQUIRED', 'production or checking cannot launch before the L0 route decision')
     }
-    return this._launchThroughScheduler(this.scheduler, {
+    const forwardedRequest = {
       ...request,
       caller: request.caller || this.rootCallers.runOwner,
       parent: request.parent || 'run-owner',
       route: this.route,
-    })
+    }
+    if (Object.prototype.hasOwnProperty.call(request, TRANSPORT_QUARANTINE_POINTER)) {
+      Object.defineProperty(forwardedRequest, TRANSPORT_QUARANTINE_POINTER, {
+        value: request[TRANSPORT_QUARANTINE_POINTER],
+        configurable: false,
+        enumerable: false,
+        writable: false,
+      })
+    }
+    return this._launchThroughScheduler(this.scheduler, forwardedRequest)
   }
 
   async _runRepresentativePolicyProbe() {
@@ -6149,33 +8249,34 @@ class CodexSupervisorRuntime {
       ? this.options.readResult(workItemId) : null
     if (this.recoveryCompletedWorkIds && this.recoveryCompletedWorkIds.has(workItemId) || durableProbeReceipt) {
       const receipt = durableProbeReceipt
-      const { receiptHash, ...body } = receipt || {}
       const sourceGeneration = Number(receipt && receipt.generation)
       const generationIsCurrentOrCrashPredecessor = sourceGeneration === this.activation.generation ||
         sourceGeneration + 1 === this.activation.generation
-      if (!receipt || receipt.schemaVersion !== 1 || receipt.kind !== 'representative-policy-probe-result' ||
-          receiptHash !== hashText(stableStringify(body)) || receipt.runId !== this.options.runId ||
-          receipt.activationId !== this.activation.id || !generationIsCurrentOrCrashPredecessor ||
-          receipt.workItemId !== workItemId || receipt.logicalRole !== 'diagnostic-probe' ||
-          receipt.physicalRole !== physicalRole || receipt.providerRole !== providerRole ||
-          receipt.requestEnvelopeHash !== (this.requestPointer && this.requestPointer.hash) ||
-          !representativePolicyProbePassed(receipt.result) ||
-          receipt.resultHash !== hashText(stableStringify(receipt.result))) {
+      const expected = representativePolicyControllerAttestation({
+        runId: this.options.runId,
+        activationId: this.activation.id,
+        generation: sourceGeneration,
+        workItemId,
+        logicalRole: 'diagnostic-probe',
+        physicalRole,
+        providerRole,
+        requestEnvelopeHash: this.requestPointer && this.requestPointer.hash,
+        route: this.route,
+        executionPolicy,
+      })
+      if (!generationIsCurrentOrCrashPredecessor ||
+          stableStringify(receipt) !== stableStringify(expected)) {
         throw new SupervisorIntegrationError(
           'CRASH_ADOPTION_CONFLICT',
-          'completed representative policy probe lacks an exact activation-, generation-, assignment-, and request-bound PASS result',
+          'completed representative policy attestation is not exactly bound to the activation, generation, route, request, and provider policy',
         )
       }
-      validateCanonicalChildResult({
-        workItemId, logicalRole: 'diagnostic-probe', physicalRole,
-      }, receipt.result, this.options.runId, this.requestPointer.hash)
-      this.diagnosticWorkerLaunches = Math.max(1, this.diagnosticWorkerLaunches)
       this.representativePolicyProbe = Object.freeze({
         verified: true,
         logicalRole: 'diagnostic-probe',
         physicalRole,
         providerRole,
-        evidenceHash: receipt.resultHash,
+        evidenceHash: receipt.receiptHash,
         recoveredFromGeneration: sourceGeneration,
       })
       return this.representativePolicyProbe
@@ -6183,51 +8284,28 @@ class CodexSupervisorRuntime {
     // Role selection and the provider capability binding are deterministic
     // controller contracts.  Paying for a model turn to run `pwd`/`git
     // status` cannot prove either one and added a pure-cost launch to every
-    // DIRECT/LIGHT run.  Persist the exact controller validation as the same
-    // canonical child-result shape so crash adoption remains byte-bound.
-    const result = {
-      schemaVersion: '2.0.0', reportType: 'result', runId: this.options.runId,
-      assignmentId: workItemId, logicalRoleId: 'diagnostic-probe', physicalRoleId: physicalRole,
-      requestEnvelopeHash: this.requestPointer && this.requestPointer.hash || null,
-      allAssignedItemsPass: true,
-      filesChanged: [], resourcesChanged: [],
-      behaviorChanged: ['Controller validated the representative role policy and live provider binding.'],
-      commands: [{ command: 'controller:validate-role-policy-and-provider-capability', exitCode: 0 }],
-      successItems: [{ id: 'representative-policy-binding', status: 'pass', evidenceIds: [
-        hashText(stableStringify({ physicalRole, providerRole, route: this.route })),
-      ] }],
-      remainingConcerns: [], findingIds: ['AP-TRACE-013'],
-      requestedTransition: {
-        event: 'WORK_ITEM_VERIFIED',
-        reason: 'Representative role policy and live provider binding validated.',
-        invalidateEvidenceIds: [],
-      },
-    }
-    this.diagnosticWorkerLaunches = Math.max(1, this.diagnosticWorkerLaunches)
-    const resultHash = hashText(stableStringify(result))
+    // DIRECT/LIGHT run. Persist a typed controller attestation without claiming
+    // that a child, command, or task verification ran.
+    const receipt = representativePolicyControllerAttestation({
+      runId: this.options.runId,
+      activationId: this.activation.id,
+      generation: this.activation.generation,
+      workItemId,
+      logicalRole: 'diagnostic-probe',
+      physicalRole,
+      providerRole,
+      requestEnvelopeHash: this.requestPointer && this.requestPointer.hash,
+      route: this.route,
+      executionPolicy,
+    })
     this.representativePolicyProbe = Object.freeze({
       verified: true,
       logicalRole: 'diagnostic-probe',
       physicalRole,
       providerRole,
-      evidenceHash: resultHash,
+      evidenceHash: receipt.receiptHash,
     })
     if (this.record && typeof this.record.write === 'function') {
-      const body = {
-        schemaVersion: 1,
-        kind: 'representative-policy-probe-result',
-        runId: this.options.runId,
-        activationId: this.activation.id,
-        generation: this.activation.generation,
-        workItemId,
-        logicalRole: 'diagnostic-probe',
-        physicalRole,
-        providerRole,
-        requestEnvelopeHash: this.requestPointer.hash,
-        result,
-        resultHash,
-      }
-      const receipt = { ...body, receiptHash: hashText(stableStringify(body)) }
       this.record.write(`work/results/${hashText(workItemId)}.json`, `${JSON.stringify(receipt, null, 2)}\n`)
     }
     return this.representativePolicyProbe
@@ -6243,13 +8321,41 @@ class CodexSupervisorRuntime {
     return this.scheduler.recordAdmissionComponent('waitingUser', durationMs)
   }
 
-  _checkpointAccounting(cause, delta) {
+  _checkpointAccounting(cause, delta, options = {}) {
     const authority = this.options.accountingAuthority
     if (!authority) return null
     if (typeof authority.checkpoint !== 'function') {
       throw new SupervisorIntegrationError('RUN_RECORD_SCHEMA_INCOMPATIBLE', 'accounting authority lacks checkpoint()')
     }
-    return authority.checkpoint({ capability: this.lease, cause, delta: accountingDelta(delta) })
+    let requiredCompletion = false
+    if (options.requiredCompletion === true) {
+      if (!this.scheduler || typeof this.scheduler.authorizeRequiredCompletionAccounting !== 'function' ||
+          !options.schedulerLease) {
+        throw new SupervisorIntegrationError(
+          'INVALID_LAUNCH_AUTHORITY',
+          'completion-target accounting requires an already admitted scheduler graph identity',
+        )
+      }
+      const admission = this.scheduler.authorizeRequiredCompletionAccounting(options.schedulerLease)
+      if (!admission || admission.requiredCompletion !== true ||
+          admission.runId !== this.options.runId ||
+          admission.generation !== this.activation.generation) {
+        throw new SupervisorIntegrationError(
+          'INVALID_LAUNCH_AUTHORITY',
+          'completion-target accounting admission is foreign to this runtime generation',
+        )
+      }
+      requiredCompletion = true
+    }
+    const durableCause = requiredCompletion
+      ? { ...cause, requiredCompletion: true }
+      : cause
+    return authority.checkpoint({
+      capability: this.lease,
+      cause: durableCause,
+      delta: accountingDelta(delta),
+      requiredCompletion,
+    })
   }
 
   _persistRecoveryCheckpoint(cause, hints = {}) {
@@ -6280,6 +8386,7 @@ class CodexSupervisorRuntime {
       threadEvidence: Object.fromEntries([...this.recoveryThreads.entries()]),
       externalOperations: [...this.recoveryExternalOperations.values()].sort((left, right) =>
         left.operationId.localeCompare(right.operationId)),
+      planLineageTransaction: hints.planLineageTransaction || null,
       humanDescription: hints.humanDescription || cause.humanDescription,
     })
     this.latestRecoveryCheckpoint = persisted
@@ -6307,6 +8414,109 @@ class CodexSupervisorRuntime {
     return `work/results/terminal-receipt-${hashText(`${leaseId}\0${workItemId}`)}.json`
   }
 
+  _childRecoveryContractLocation(leaseId, workItemId) {
+    return `work/results/recovery-contract-${hashText(`${leaseId}\0${workItemId}`)}.json`
+  }
+
+  _persistChildRecoveryContract(lease, request, logicalRole) {
+    if (!lease || !request) {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'child recovery disposition requires its admitted lease and request',
+      )
+    }
+    // Lightweight injected records used by embedders that do not expose a
+    // filesystem resolver cannot participate in crash adoption. Keep those
+    // non-adoptable executions compatible; production RunRecord instances
+    // always expose both operations and therefore persist the contract before
+    // the model process is started.
+    if (!this.record || typeof this.record.resolve !== 'function' ||
+        typeof this.record.write !== 'function') return null
+    const body = {
+      schemaVersion: 1,
+      runId: this.options.runId,
+      activationId: this.activation.id,
+      generation: this.activation.generation,
+      leaseId: lease.id,
+      workItemId: request.workItemId,
+      logicalRole,
+      requestedNextReadyWorkIds: Array.isArray(request.nextReadyAfter)
+        ? [...request.nextReadyAfter] : [],
+      checkerRecoveryDisposition: request.checkerRecoveryDisposition
+        ? structuredClone(request.checkerRecoveryDisposition) : null,
+      transportFailureRetryId: request.transportFailureRetryId || null,
+    }
+    const contract = Object.freeze({
+      ...body,
+      contractHash: hashText(stableStringify(body)),
+    })
+    const relative = this._childRecoveryContractLocation(lease.id, request.workItemId)
+    const absolute = this.record.resolve(relative)
+    if (fs.existsSync(absolute)) {
+      if (request.adoptedLease) {
+        const prior = this._readChildRecoveryContract({
+          id: lease.id,
+          workItemId: request.workItemId,
+          logicalRole,
+        })
+        if (stableStringify(prior.requestedNextReadyWorkIds) !==
+              stableStringify(body.requestedNextReadyWorkIds) ||
+            stableStringify(prior.checkerRecoveryDisposition) !==
+              stableStringify(body.checkerRecoveryDisposition) ||
+            prior.transportFailureRetryId !== body.transportFailureRetryId) {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            `adopted child recovery contract changed after launch admission: ${request.workItemId}`,
+          )
+        }
+        return prior
+      }
+      if (stableStringify(readRegularJson(absolute, 'child recovery contract').parsed) !==
+          stableStringify(contract)) {
+        throw new SupervisorIntegrationError(
+          'CRASH_ADOPTION_CONFLICT',
+          `child recovery contract changed after launch admission: ${request.workItemId}`,
+        )
+      }
+    } else {
+      this.record.write(relative, `${JSON.stringify(contract, null, 2)}\n`)
+    }
+    return contract
+  }
+
+  _readChildRecoveryContract(saved) {
+    if (!saved || !this.record || typeof this.record.resolve !== 'function') return null
+    const absolute = this.record.resolve(
+      this._childRecoveryContractLocation(saved.id, saved.workItemId),
+    )
+    if (!fs.existsSync(absolute)) return null
+    const contract = readRegularJson(absolute, 'adopted child recovery contract').parsed
+    const { contractHash, ...body } = contract || {}
+    const disposition = contract && contract.checkerRecoveryDisposition
+    if (!contract || contract.schemaVersion !== 1 ||
+        contractHash !== hashText(stableStringify(body)) ||
+        contract.runId !== this.options.runId || contract.activationId !== this.activation.id ||
+        !Number.isSafeInteger(contract.generation) || contract.generation < 1 ||
+        contract.generation > this.activation.generation || contract.leaseId !== saved.id ||
+        contract.workItemId !== saved.workItemId || contract.logicalRole !== saved.logicalRole ||
+        !Array.isArray(contract.requestedNextReadyWorkIds) ||
+        new Set(contract.requestedNextReadyWorkIds).size !==
+          contract.requestedNextReadyWorkIds.length ||
+        contract.requestedNextReadyWorkIds.some(value =>
+          typeof value !== 'string' || value.length === 0) ||
+        !(contract.transportFailureRetryId === null ||
+          typeof contract.transportFailureRetryId === 'string') ||
+        !(disposition === null || disposition &&
+          ['nonAuthoritativeRetryId', 'failureRepairId', 'stableLimitationNextReadyId']
+            .every(field => disposition[field] === null || typeof disposition[field] === 'string'))) {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        `adopted child recovery contract is foreign or corrupt: ${saved.workItemId}`,
+      )
+    }
+    return Object.freeze(contract)
+  }
+
   _workerContextLocation(workItemId) {
     return `work/results/context-${hashText(workItemId)}.json`
   }
@@ -6319,7 +8529,15 @@ class CodexSupervisorRuntime {
     ])
     for (const workItemId of completed) {
       const absolute = this.record.resolve(this._workerContextLocation(workItemId))
-      if (!fs.existsSync(absolute)) continue
+      if (!fs.existsSync(absolute)) {
+        if (/^work-\d+-transport-retry-1$/u.test(workItemId)) {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            `completed provider transport retry continuation is missing: ${workItemId}`,
+          )
+        }
+        continue
+      }
       const pointer = readRegularJson(absolute, 'completed worker continuation pointer').parsed
       if (!pointer || pointer.schemaVersion !== 2 || pointer.workItemId !== workItemId ||
           !/^[a-f0-9]{64}$/.test(pointer.contentHash || '') ||
@@ -6368,6 +8586,14 @@ class CodexSupervisorRuntime {
       const receipt = readRegularJson(receiptPath, 'worker continuation terminal receipt').parsed
       const { receiptHash, ...receiptBody } = receipt || {}
       const acceptedResultIds = new Set(this.options.resumeState.acceptedResultIds || [])
+      const controllerAuthored = Boolean(receipt &&
+        receipt.physicalRole === 'deterministic-control-plane' &&
+        receipt.providerRole === 'autoprompt-controller' &&
+        receipt.retainLease === false)
+      const partialControllerMarker = Boolean(receipt && (
+        receipt.physicalRole === 'deterministic-control-plane' ||
+        receipt.providerRole === 'autoprompt-controller'
+      )) && !controllerAuthored
       if (!receipt || receiptHash !== saved.terminalReceiptHash || receiptHash !== hashText(JSON.stringify(receiptBody)) ||
           !acceptedResultIds.has(receiptHash) ||
           receipt.runId !== saved.runId || receipt.activationId !== saved.activationId ||
@@ -6375,9 +8601,17 @@ class CodexSupervisorRuntime {
           receipt.executorKey !== saved.executorKey || receipt.continuationId !== saved.contextId ||
           receipt.workerContextBindingHash !== saved.contextBindingHash ||
           receipt.assignmentHash !== saved.assignmentHash || receipt.resultHash !== saved.resultHash ||
-          !receipt.result || receipt.result.contextId !== saved.contextId) {
+          !receipt.result || partialControllerMarker ||
+          (controllerAuthored
+            ? receipt.leaseId !== saved.contextId || receipt.sessionId !== saved.contextId
+            : receipt.result.contextId !== saved.contextId)) {
         throw new SupervisorIntegrationError('CRASH_ADOPTION_CONFLICT', `worker continuation receipt binding changed: ${workItemId}`)
       }
+      // A controller-authored provider/transport failure is a durable terminal
+      // result, not a resumable model context. Its synthetic receipt has an
+      // exact controller identity and is verified above; never adopt it as a
+      // Codex continuation or require a model-generated contextId.
+      if (controllerAuthored) continue
       this.workerContexts.set(workItemId, {
         executorKey: saved.executorKey,
         contextId: saved.contextId,
@@ -6451,7 +8685,13 @@ class CodexSupervisorRuntime {
     }
     const contextBindingHash = hashText(stableStringify(identity))
     const completedContext = { executorKey, contextId, logicalRole, contextBindingHash }
-    this.workerContexts.set(workItemId, completedContext)
+    // Persist controller-authored provider failures as durable evidence, but
+    // never expose their synthetic controller identity as a resumable Codex
+    // context. A successful transport retry receives its own work-item context
+    // and is the only context a later same-executor repair may continue.
+    const controllerAuthored = Boolean(terminalReceipt &&
+      terminalReceipt.controllerAuthoredTransportFailure === true)
+    if (!controllerAuthored) this.workerContexts.set(workItemId, completedContext)
     if (terminalReceipt && this.record && typeof this.record.write === 'function') {
       const { receiptHash, ...receiptBody } = terminalReceipt
       if (!terminalReceiptPath || receiptHash !== hashText(JSON.stringify(receiptBody)) ||
@@ -6497,6 +8737,26 @@ class CodexSupervisorRuntime {
     const receipt = readRegularJson(absolute, 'model terminal receipt').parsed
     const { receiptHash, ...body } = receipt || {}
     const binding = saved.crashBinding || {}
+    const hasDurableDisposition = Boolean(receipt &&
+      Object.prototype.hasOwnProperty.call(receipt, 'authoritativeNextReadyWorkIds'))
+    const durableDispositionValid = !hasDurableDisposition || Boolean(
+      Array.isArray(receipt.authoritativeNextReadyWorkIds) &&
+      new Set(receipt.authoritativeNextReadyWorkIds).size ===
+        receipt.authoritativeNextReadyWorkIds.length &&
+      receipt.authoritativeNextReadyWorkIds.every(value =>
+        typeof value === 'string' && value.length > 0) &&
+      Array.isArray(receipt.requestedNextReadyWorkIds) &&
+      new Set(receipt.requestedNextReadyWorkIds).size === receipt.requestedNextReadyWorkIds.length &&
+      receipt.requestedNextReadyWorkIds.every(value =>
+        typeof value === 'string' && value.length > 0) &&
+      (receipt.transportFailureRetryId === null ||
+        typeof receipt.transportFailureRetryId === 'string') &&
+      (receipt.checkerRecoveryDisposition === null ||
+        receipt.checkerRecoveryDisposition &&
+        ['nonAuthoritativeRetryId', 'failureRepairId', 'stableLimitationNextReadyId']
+          .every(field => receipt.checkerRecoveryDisposition[field] === null ||
+            typeof receipt.checkerRecoveryDisposition[field] === 'string'))
+    )
     if (!receipt || receipt.schemaVersion !== 1 ||
         receiptHash !== hashText(JSON.stringify(body)) ||
         receipt.runId !== this.options.runId || receipt.activationId !== this.activation.id ||
@@ -6510,6 +8770,7 @@ class CodexSupervisorRuntime {
         receipt.continuationId !== binding.continuationId ||
         receipt.requestEnvelopeHash !== this.requestPointer.hash ||
         receipt.resultHash !== hashText(JSON.stringify(receipt.result)) ||
+        !durableDispositionValid ||
         (CHECKER_ROLES.has(saved.logicalRole) &&
           (saved.inspectedCandidateHash !== receipt.result.candidateHash ||
            saved.inspectedCandidateHash !== receipt.result.currentVersionHash ||
@@ -6523,6 +8784,27 @@ class CodexSupervisorRuntime {
         'CRASH_ADOPTION_CONFLICT',
         `terminal receipt for adopted lease ${saved.id} is foreign or corrupt`,
       )
+    }
+    if (hasDurableDisposition) {
+      const expectedNextReady = authoritativeRequestNextReady(
+        saved.logicalRole,
+        receipt.result,
+        {
+          workItemId: saved.workItemId,
+          nextReadyAfter: receipt.requestedNextReadyWorkIds,
+          checkerRecoveryDisposition: receipt.checkerRecoveryDisposition,
+          transportFailureRetryId: receipt.transportFailureRetryId,
+        },
+        [],
+        receipt.requestedNextReadyWorkIds,
+      )
+      if (stableStringify(expectedNextReady) !==
+          stableStringify(receipt.authoritativeNextReadyWorkIds)) {
+        throw new SupervisorIntegrationError(
+          'CRASH_ADOPTION_CONFLICT',
+          `terminal receipt for adopted lease ${saved.id} changed its recovery disposition`,
+        )
+      }
     }
     validateCanonicalChildResult({
       workItemId: saved.workItemId,
@@ -6572,8 +8854,231 @@ class CodexSupervisorRuntime {
     return canonicalRelative
   }
 
-  async _resumeAdoptedLaunches({ resumeState, candidateHash, decision, stage }) {
+  _mutationAdmissionLocation(workItemId) {
+    return `work/results/mutation-admission-${hashText(workItemId)}.json`
+  }
+
+  _persistMutationAdmission(workItemId, admission) {
+    if (!admission || !Array.isArray(admission.actualFilesChanged) ||
+        !Array.isArray(admission.after) || !this.record || typeof this.record.write !== 'function') return null
+    const after = new Map(admission.after.map(item => [item.path, item]))
+    const files = admission.actualFilesChanged.map(relative => {
+      const item = after.get(relative)
+      return Object.freeze({ relative, hash: item && item.hash || null })
+    })
+    const body = {
+      schemaVersion: 1,
+      workItemId,
+      files,
+    }
+    const evidence = Object.freeze({
+      ...body,
+      evidenceHash: hashText(stableStringify(body)),
+    })
+    const relative = this._mutationAdmissionLocation(workItemId)
+    const absolute = this.record.resolve(relative)
+    if (fs.existsSync(absolute)) {
+      if (stableStringify(readRegularJson(absolute, 'mutation admission evidence').parsed) !==
+          stableStringify(evidence)) {
+        throw new SupervisorIntegrationError(
+          'CRASH_ADOPTION_CONFLICT',
+          `mutation admission changed after first persistence: ${workItemId}`,
+        )
+      }
+    } else {
+      this.record.write(relative, `${JSON.stringify(evidence, null, 2)}\n`)
+    }
+    return evidence
+  }
+
+  _readMutationAdmission(workItemId) {
+    if (!this.record || typeof this.record.resolve !== 'function') return null
+    const absolute = this.record.resolve(this._mutationAdmissionLocation(workItemId))
+    if (!fs.existsSync(absolute)) return null
+    const evidence = readRegularJson(absolute, 'mutation admission evidence').parsed
+    const { evidenceHash, ...body } = evidence || {}
+    if (!evidence || evidence.schemaVersion !== 1 || evidence.workItemId !== workItemId ||
+        evidenceHash !== hashText(stableStringify(body)) || !Array.isArray(evidence.files) ||
+        evidence.files.some(item => !item || typeof item.relative !== 'string' || !item.relative ||
+          (item.hash !== null && !/^[a-f0-9]{64}$/u.test(item.hash || '')))) {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        `mutation admission evidence is corrupt: ${workItemId}`,
+      )
+    }
+    return Object.freeze(evidence)
+  }
+
+  _persistControllerTaskResult(request, result) {
+    const checkerResult = Boolean(request && CHECKER_ROLES.has(request.logicalRole))
+    const typedTaskFailure = Boolean(result && result.reportType === 'result' &&
+      result.allAssignedItemsPass === false && result.terminalEnvelope &&
+      result.terminalEnvelope.status === 'CHILD_TRANSPORT_TIMEOUT')
+    if (!request || (!checkerResult && !typedTaskFailure) || !result ||
+        !this.record || typeof this.record.write !== 'function') {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'controller-authored child evidence requires one bound checker or typed unsuccessful task request and run record',
+      )
+    }
+    const resultKind = checkerResult ? 'checker' : 'task'
+    const workItemId = request.workItemId
+    const executorKey = request.executorKey || workItemId
+    const contextId = `controller-child:${hashText(stableStringify({
+      runId: this.options.runId,
+      generation: this.activation.generation,
+      workItemId,
+      resultHash: hashText(JSON.stringify(result)),
+    })).slice(0, 32)}`
+    const identity = {
+      schemaVersion: 1,
+      runId: this.options.runId,
+      activationId: this.activation.id,
+      requestEnvelopeHash: this.requestPointer.hash,
+      missionHash: this.activation.missionHash,
+      workItemId,
+      logicalRole: request.logicalRole,
+      executorKey,
+      contextId,
+    }
+    const assignmentHash = hashText(stableStringify({
+      workItemId,
+      logicalRole: request.logicalRole,
+      candidateHash: request.candidateHash || null,
+      oracle: request.oracle || null,
+    }))
+    const body = {
+      schemaVersion: 1,
+      runId: this.options.runId,
+      activationId: this.activation.id,
+      admittedGeneration: this.activation.generation,
+      leaseId: contextId,
+      workItemId,
+      assignmentId: workItemId,
+      logicalRole: request.logicalRole,
+      executorKey,
+      physicalRole: 'deterministic-control-plane',
+      providerRole: 'autoprompt-controller',
+      retainLease: false,
+      assignmentHash,
+      sessionId: contextId,
+      continuationId: contextId,
+      workerContextBindingHash: hashText(stableStringify(identity)),
+      requestEnvelopeHash: this.requestPointer.hash,
+      candidateHash: request.candidateHash || null,
+      resultHash: hashText(JSON.stringify(result)),
+      rawOutputHash: hashText(`controller-authored-${resultKind}-launch-failure`),
+      eventStreamHash: hashText(`controller-authored-${resultKind}-launch-failure`),
+      result,
+    }
+    const receipt = { ...body, receiptHash: hashText(JSON.stringify(body)) }
+    const relative = this._terminalReceiptLocation(contextId, workItemId)
+    const absolute = this.record.resolve(relative)
+    if (fs.existsSync(absolute)) {
+      if (stableStringify(readRegularJson(absolute, `controller ${resultKind} receipt`).parsed) !==
+          stableStringify(receipt)) {
+        throw new SupervisorIntegrationError(
+          'CRASH_ADOPTION_CONFLICT',
+          `controller ${resultKind} receipt changed after first persistence: ${workItemId}`,
+        )
+      }
+    } else {
+      this.record.write(relative, `${JSON.stringify(receipt, null, 2)}\n`)
+    }
+    this._writeCanonicalResult(workItemId, result)
+    const contentBody = {
+      ...identity,
+      schemaVersion: 2,
+      contextBindingHash: receipt.workerContextBindingHash,
+      terminalReceiptPath: relative,
+      terminalReceiptHash: receipt.receiptHash,
+      assignmentHash,
+      resultHash: receipt.resultHash,
+    }
+    const contentHash = hashText(stableStringify(contentBody))
+    const contentPath = `runtime/blobs/${contentHash}`
+    const contentRecord = { ...contentBody, contentHash }
+    const absoluteContent = this.record.resolve(contentPath)
+    if (fs.existsSync(absoluteContent)) {
+      if (stableStringify(readRegularJson(absoluteContent, `controller ${resultKind} continuation blob`).parsed) !==
+          stableStringify(contentRecord)) {
+        throw new SupervisorIntegrationError(
+          'CRASH_ADOPTION_CONFLICT',
+          `controller ${resultKind} continuation changed after first persistence: ${workItemId}`,
+        )
+      }
+    } else {
+      this.record.write(contentPath, `${JSON.stringify(contentRecord, null, 2)}\n`)
+    }
+    this.record.write(this._workerContextLocation(workItemId), `${JSON.stringify({
+      schemaVersion: 2, workItemId, contentHash, contentPath,
+    }, null, 2)}\n`)
+    this.recoveryAcceptedResultIds.add(receipt.receiptHash)
+    const authoritativeNextReady = checkerResult
+      ? authoritativeRequestNextReady(
+          request.logicalRole,
+          result,
+          request,
+          this.recoveryCompletedWorkIds,
+          [],
+        )
+      : []
+    const dispositionSettlesResult = checkerResult &&
+      checkerDispositionSettlesNonAuthoritative(request, result)
+    if (dispositionSettlesResult) {
+      addCanonicalCompletedChecker(this.recoveryCompletedCheckIds, workItemId)
+    } else if (!checkerResult) {
+      this.recoveryCompletedWorkIds.add(workItemId)
+    }
+    this._persistRecoveryCheckpoint({
+      kind: 'RESULT_COMMITTED',
+      causeId: `controller-${resultKind}:${this.activation.generation}:${hashText(workItemId).slice(0, 24)}`,
+      humanDescription: checkerResult
+        ? 'Persist a supervisor-authored checker launch-failure result before its bounded recovery transition.'
+        : 'Persist a supervisor-authored unsuccessful task result before returning the task-level outcome.',
+      resultCommit: {
+        assignmentId: workItemId,
+        assignmentHash,
+        leaseId: contextId,
+        sessionId: contextId,
+        continuationId: contextId,
+        resultHash: receipt.resultHash,
+        receiptHash: receipt.receiptHash,
+        candidateHash: request.candidateHash || null,
+      },
+    }, {
+      recoveryFrontier: { acceptedResultIds: [receipt.receiptHash] },
+      nextReadyWorkIds: authoritativeNextReady,
+      openCheckIds: checkerResult && !dispositionSettlesResult ? [workItemId] : [],
+      candidateHash: request.candidateHash || null,
+    })
+    return receipt
+  }
+
+  _persistControllerCheckerResult(request, result) {
+    return this._persistControllerTaskResult(request, result)
+  }
+
+  async _resumeAdoptedLaunches({
+    resumeState,
+    candidateHash,
+    decision,
+    stage,
+    skipLegacyPlanningRetryIds = [],
+    skippedPlanningNextReadyWorkIds = [],
+  }) {
     if (!this.adoptedCrashScheduler || !resumeState || !resumeState.schedulerCrashCheckpoint) return {}
+    const skippedPlanningRetries = new Set(skipLegacyPlanningRetryIds)
+    const productRecoveryWorkIds = currentProductRecoveryWorkIds(decision, resumeState)
+    if ([...skippedPlanningRetries].some(workItemId =>
+      !/^(?:roadmap-(?:author(?:-revise|-plan-repair)?|scout-\d+|plan-(?:check|recheck)(?:-runtime-retry)?|work-group)|mission-coordination|conditional-depth-prober)$/u.test(workItemId)) ||
+        !uniqueStrings(skippedPlanningNextReadyWorkIds) ||
+        skippedPlanningNextReadyWorkIds.some(workItemId => !productRecoveryWorkIds.includes(workItemId))) {
+      throw new SupervisorIntegrationError(
+        'CHECK_RETRY_STATE_INVALID',
+        'legacy planning collapse requires historical planning IDs and valid next ready product work IDs',
+      )
+    }
     const results = {}
     const openIds = new Set(resumeState.openLeaseIds || [])
     const savedRecords = new Map((resumeState.adoptedRecords || []).map(record => [record.id, record]))
@@ -6610,9 +9115,18 @@ class CodexSupervisorRuntime {
       }
       const checker = CHECKER_ROLES.has(saved.logicalRole)
       if (!adoptedLeaseMatchesStage(this.route, saved.logicalRole, stage)) continue
+      const recoveryContract = saved.logicalRole === 'route-analyst'
+        ? null : this._readChildRecoveryContract(saved)
       const committed = this._readTerminalReceipt(saved, candidateHash)
       const retainedParent = !checker && (liveParentIds.has(leaseId) || committed && committed.retainLease === true)
       if (committed) {
+        if (recoveryContract &&
+            committed.recoveryContractHash !== recoveryContract.contractHash) {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            `adopted result recovery contract changed for ${saved.workItemId}`,
+          )
+        }
         if (saved.logicalRole !== 'route-analyst') {
           this._writeCanonicalResult(saved.workItemId, committed.result)
         }
@@ -6665,13 +9179,15 @@ class CodexSupervisorRuntime {
               openCheckIds: resumeState.openCheckIds || [],
               acceptedResultIds: [committed.receiptHash],
             },
-            nextReadyWorkIds: durableNextReadyAfter(
-              saved.logicalRole,
-              committed.result,
-              resumeState.nextReadyWorkIds || [],
-              [],
-              saved.workItemId,
-            ),
+            nextReadyWorkIds: Array.isArray(committed.authoritativeNextReadyWorkIds)
+              ? [...committed.authoritativeNextReadyWorkIds]
+              : durableNextReadyAfter(
+                  saved.logicalRole,
+                  committed.result,
+                  resumeState.nextReadyWorkIds || [],
+                  [],
+                  saved.workItemId,
+                ),
             openCheckIds: resumeState.openCheckIds || [],
             candidateHash: committed.candidateHash,
           })
@@ -6693,17 +9209,42 @@ class CodexSupervisorRuntime {
             humanDescription: 'Complete an adopted lease from its exact durable terminal receipt without a second model turn.',
           }, {
             candidateHash: committed.candidateHash,
-            nextReadyWorkIds: durableNextReadyAfter(
-              saved.logicalRole,
-              committed.result,
-              resumeState.nextReadyWorkIds || [],
-              [],
-              saved.workItemId,
-            ),
+            nextReadyWorkIds: Array.isArray(committed.authoritativeNextReadyWorkIds)
+              ? [...committed.authoritativeNextReadyWorkIds]
+              : durableNextReadyAfter(
+                  saved.logicalRole,
+                  committed.result,
+                  resumeState.nextReadyWorkIds || [],
+                  [],
+                  saved.workItemId,
+                ),
             openCheckIds: [],
           })
           results[saved.workItemId] = committed.result
         }
+        continue
+      }
+      if (RETIRED_LEGACY_ADVISORY_ROLES.has(saved.logicalRole)) {
+        // Recovery adoption already proves the prior process tree drained.
+        // Retire every historical advisory lease by its authenticated role,
+        // independent of compatibility hints supplied by a caller. The current
+        // product work IDs are derived from the immutable decision and durable
+        // completed work, so a missing or partial hint cannot reopen a model
+        // turn or narrow the work that remains.
+        lease.complete({})
+        persistTerminalSession(this.budget, saved.crashBinding.sessionId, {
+          status: 'FAILED', evidenceHashes: [],
+        })
+        this.recoveryThreads.delete(lease.id)
+        this._persistRecoveryCheckpoint({
+          kind: 'LEASE_COMPLETED',
+          causeId: `legacy-plan-collapse:${this.activation.generation}:${lease.id}`,
+          humanDescription: 'Retire drained legacy advisory work without relaunching its model generation.',
+        }, {
+          candidateHash,
+          nextReadyWorkIds: [...productRecoveryWorkIds],
+          openCheckIds: [],
+        })
         continue
       }
       if (!openIds.has(leaseId)) {
@@ -6863,7 +9404,7 @@ class CodexSupervisorRuntime {
             ? 'Resume the same-author ROADMAP repair from its exact continuation.'
             : saved.workItemId.includes('revise')
               ? 'Resume the same-author ROADMAP scout-join revision from its exact continuation.'
-              : `Resume the dependency-ordered roadmap for: ${decision.requestedResult}`,
+              : 'Resume the dependency-ordered roadmap for the canonical original request bound to this child launch.',
         ownership: saved.logicalRole === 'roadmap-author'
           ? [{ kind: 'output', identity: 'plan/ROADMAP.md', owner: saved.workItemId }]
           : ['workspace'],
@@ -6874,7 +9415,8 @@ class CodexSupervisorRuntime {
         logicalRole: saved.logicalRole || 'worker',
         parent: parentLogicalRole,
         purpose: saved.purpose || 'work',
-        assignment: decision.workerResponsibilities && decision.workerResponsibilities[index] || decision.requestedResult,
+        assignment: decision.workerResponsibilities && decision.workerResponsibilities[index] ||
+          'Continue the canonical original request bound to this crash-adopted child launch.',
         ownership: resumedWorkerOwnership.length ? resumedWorkerOwnership : ['workspace'],
         success: decision.successChecklist || [],
         checks: replayChecks,
@@ -6905,6 +9447,12 @@ class CodexSupervisorRuntime {
       results[saved.workItemId] = await this._launchThroughScheduler(this.scheduler, {
         ...request,
         ...(replayRequest || {}),
+        ...(recoveryContract ? {
+          nextReadyAfter: [...recoveryContract.requestedNextReadyWorkIds],
+          checkerRecoveryDisposition: recoveryContract.checkerRecoveryDisposition
+            ? structuredClone(recoveryContract.checkerRecoveryDisposition) : null,
+          transportFailureRetryId: recoveryContract.transportFailureRetryId,
+        } : {}),
         route: routeAnalyst ? 'PRE_ROUTE' : this.route,
         parent: parentLogicalRole,
         caller,
@@ -6922,6 +9470,7 @@ class CodexSupervisorRuntime {
       token,
       candidateHash: pending.candidateHash,
       workspacePath: pending.workspacePath,
+      mutationAdmission: pending.mutationAdmission,
       alreadyPromoted: pending.alreadyPromoted === true,
       status: pending.state && pending.state.status,
       acceptedJoin: pending.state && pending.state.join
@@ -7059,6 +9608,11 @@ class CodexSupervisorRuntime {
         'DONE_RETRY_RECOVERY_INVALID',
         `worker promotion journal cannot recover from ${journal.status}`,
       )
+    } else if (state.status === 'PROMOTED') {
+      throw new SupervisorIntegrationError(
+        'DONE_RETRY_RECOVERY_INVALID',
+        'promoted deferred-promotion state requires a committed workspace journal',
+      )
     }
     let mutationPermit = null
     if (!alreadyPromoted) {
@@ -7103,21 +9657,33 @@ class CodexSupervisorRuntime {
 
   async _commitDeferredPromotion(token, join) {
     const pending = this.deferredPromotions.get(token)
+    const verificationLimitations = join && join.verificationLimited === true
+      ? canonicalVerificationLimitationSummaries(join.verificationLimitations, {
+          requireCanonicalOrder: true,
+        })
+      : null
+    const limitationJoinHash = verificationLimitations && hashText(stableStringify({
+      candidateHash: join.candidateHash,
+      verificationLimitations,
+    }))
     if (!pending || !join || join.candidateHash !== pending.candidateHash ||
         !/^[a-f0-9]{64}$/.test(join.acceptanceJoinHash || '') ||
         !/^[a-f0-9]{64}$/.test(join.domainEvaluationHash || '') ||
         !Array.isArray(join.checkHashes) || join.checkHashes.length === 0 ||
-        join.checkHashes.some(value => !/^[a-f0-9]{64}$/.test(value || ''))) {
+        join.checkHashes.some(value => !/^[a-f0-9]{64}$/.test(value || '')) ||
+        (join.verificationLimited === true &&
+          (!verificationLimitations || join.acceptanceJoinHash !== limitationJoinHash))) {
       throw new SupervisorIntegrationError(
         'DONE_RETRY_ACCEPTANCE_JOIN_REQUIRED',
         'deferred DONE retry promotion requires the exact final checker and captured-domain acceptance join',
       )
     }
     if (pending.state.status === 'PROMOTED') {
-      if (stableStringify(pending.state.join) !== stableStringify(join)) {
+      if (pending.alreadyPromoted !== true ||
+          stableStringify(pending.state.join) !== stableStringify(join)) {
         throw new SupervisorIntegrationError(
-          'DONE_RETRY_ACCEPTANCE_JOIN_REQUIRED',
-          'an already promoted DONE retry can only replay its exact accepted join',
+          'DONE_RETRY_RECOVERY_INVALID',
+          'an already promoted DONE retry requires its committed journal and exact accepted join',
         )
       }
       this.deferredPromotions.delete(token)
@@ -7130,13 +9696,24 @@ class CodexSupervisorRuntime {
         status: 'JOIN_ACCEPTED',
         join: JSON.parse(JSON.stringify(join)),
       })
-      const promotedPostimages = pending.alreadyPromoted
+      const wasAlreadyPromoted = pending.alreadyPromoted === true
+      const promotedPostimages = wasAlreadyPromoted
         ? pending.postimages
         : pending.workerWorkspace.manager.promote(
             pending.workerWorkspace,
             pending.mutationAdmission,
           )
-      if (pending.alreadyPromoted) {
+      // From this point the target already contains the candidate.  Make that
+      // fact authoritative in memory before any controller bookkeeping can
+      // fail, so an outer error handler cannot mistake a committed workspace
+      // for a rejectable pre-promotion candidate and roll it back.
+      if (!wasAlreadyPromoted) {
+        pending.alreadyPromoted = true
+        pending.workspacePath = this.options.targetPath
+        pending.postimages = promotedPostimages
+        pending.state = acceptedState
+      }
+      if (wasAlreadyPromoted) {
         if (typeof this.options.mutationEnforcer.recoverCommit !== 'function') {
           throw new SupervisorIntegrationError(
             'DONE_RETRY_RECOVERY_REQUIRED',
@@ -7161,7 +9738,7 @@ class CodexSupervisorRuntime {
         })
         mutationStateCommitted = true
       }
-      this._persistDeferredPromotionState({
+      pending.state = this._persistDeferredPromotionState({
         ...acceptedState,
         status: 'PROMOTED',
       })
@@ -7219,16 +9796,19 @@ class CodexSupervisorRuntime {
   }
 
   async _launchThroughScheduler(scheduler, request) {
+    const requiredCompletion = !requiresMarginalValue(request)
     this._enforceBudgetPhase(lifecycleBudgetPhase({
       purpose: request.route === 'PRE_ROUTE' ? null : request.purpose,
     }), {
       boundary: 'child-launch',
       workItemId: request.workItemId,
       purpose: request.purpose,
+      requiredCompletion,
     })
     this.budget.assertAvailable({
       forWork: request.purpose !== 'recovery',
       forExecution: !protectedDeadlinePurpose(request.purpose),
+      requiredCompletion,
     })
     const caller = this.rolePolicy.bindCaller(request.caller)
     if (caller.runId !== this.options.runId || caller.generation !== this.activation.generation ||
@@ -7239,16 +9819,6 @@ class CodexSupervisorRuntime {
       rolePolicy: this.rolePolicy,
       selection: { parent: request.parent, child: request.logicalRole, route: request.route },
     }).policy
-    if (policy.child === 'diagnostic-probe') {
-      this.diagnosticWorkerLaunches += 1
-      if (this.diagnosticWorkerLaunches > 1) {
-        throw new SupervisorIntegrationError(
-          'DIAGNOSTIC_WORKER_LIMIT',
-          'a denied diagnostic may use at most one bounded worker before BLOCKED',
-          { workerCount: this.diagnosticWorkerLaunches },
-        )
-      }
-    }
     const physicalRole = policy.definition.physicalId
     const providerRole = providerRoleForLogical(policy.child)
     if (request.providerRole !== undefined && request.providerRole !== providerRole) {
@@ -7263,11 +9833,70 @@ class CodexSupervisorRuntime {
       physicalRole,
       providerRole,
     })
-    const findingIds = exactFindingIds(
-      request.findingIds, request.finding_ids, request.assignment,
-      request.successChecklist, request.success, request.checks, this.options.mission,
-    )
-    if (findingIds.length === 0) findingIds.push('AP-DESIGN-023')
+    const findingIds = explicitFindingIds(request.findingIds, request.finding_ids)
+    if (findingIds.length === 0) {
+      findingIds.push(assignmentLocalFindingId(request, {
+        requestEnvelopeHash: this.requestPointer && this.requestPointer.hash,
+      }, this.assignmentFindingIdRegistry))
+    }
+    verifyRequestPointer(this.requestPointer)
+    const missionBinding = bindCanonicalMissionForChild(this.canonicalMissionProjection, {
+      sourceRequestHash: this.activation.missionHash,
+      requestEnvelopeHash: this.requestPointer.hash,
+      activationId: this.activation.id,
+      generation: this.activation.generation,
+      workItemId: request.workItemId,
+    })
+    let continuationId = request.continuationId || null
+    const adoptedBinding = request.adoptedBinding || null
+    const adoptedLease = request.adoptedLease || null
+    const executorKey = request.executorKey || request.equivalenceKey || request.workItemId
+    let repairContextBinding = null
+    if (request.repairOf) {
+      const prior = this.workerContexts.get(request.repairOf)
+      if (!prior || prior.executorKey !== executorKey || prior.logicalRole !== policy.child ||
+          !/^[a-f0-9]{64}$/.test(prior.contextBindingHash || '') || adoptedLease || continuationId) {
+        throw new SupervisorIntegrationError('SAME_EXECUTOR_REQUIRED', 'repair must bind the same logical executor without inheriting provider history')
+      }
+      const repairBody = Object.freeze({
+        schemaVersion: 1,
+        kind: 'bounded-fresh-repair-context',
+        repairWorkItemId: request.workItemId,
+        priorWorkItemId: request.repairOf,
+        logicalRole: policy.child,
+        executorKey,
+        priorContextBindingHash: prior.contextBindingHash,
+        priorContextIdHash: hashText(prior.contextId),
+        requestEnvelopeHash: this.requestPointer.hash,
+        missionHash: this.activation.missionHash,
+        nativeProviderHistoryInherited: false,
+      })
+      repairContextBinding = Object.freeze({
+        ...repairBody,
+        bindingHash: hashText(stableStringify(repairBody)),
+      })
+      // A product repair is a new bounded physical context. Same-executor is
+      // authenticated by repairContextBinding, never implemented as an
+      // unbounded `codex exec resume` of the prior worker's tool history.
+      continuationId = null
+    }
+    const requestedFetchedEvidence = request.fetchedEvidence ?? request.fetched_evidence
+    let boundedFetchedEvidence = requestedFetchedEvidence
+    if (repairContextBinding) {
+      if (requestedFetchedEvidence &&
+          (typeof requestedFetchedEvidence !== 'object' || Array.isArray(requestedFetchedEvidence) ||
+           Buffer.isBuffer(requestedFetchedEvidence) ||
+           Object.hasOwn(requestedFetchedEvidence, 'repairContextBinding'))) {
+        throw new SupervisorIntegrationError(
+          'SAME_EXECUTOR_REQUIRED',
+          'repair evidence must be an object without a caller-authored repair context binding',
+        )
+      }
+      boundedFetchedEvidence = {
+        ...(requestedFetchedEvidence || {}),
+        repairContextBinding,
+      }
+    }
     const common = {
       role: providerRole,
       assignment: request.assignment,
@@ -7283,10 +9912,21 @@ class CodexSupervisorRuntime {
       route: request.route === 'PRE_ROUTE' ? 'PENDING' : request.route,
       roadmapSlice: request.roadmapSlice ?? request.roadmap_slice,
       manifests: request.manifests ?? request.manifestPointers ?? request.manifest_pointers,
-      fetchedEvidence: request.fetchedEvidence ?? request.fetched_evidence,
+      fetchedEvidence: boundedFetchedEvidence,
       forkTurns: request.fork_turns ?? request.forkTurns,
       recoveryContext: request.recoveryContext ?? request.recovery_context,
       findingIds,
+    }
+    const transportQuarantine = request[TRANSPORT_QUARANTINE_POINTER] || null
+    if (transportQuarantine && (
+      request.workItemId !== transportQuarantine.retryWorkItemId ||
+      request.executorKey !== transportQuarantine.sourceWorkItemId ||
+      request.transportFailureRetryId !== null
+    )) {
+      throw new SupervisorIntegrationError(
+        'WORKER_QUARANTINE_INVALID',
+        'transport quarantine may seed only its exact single contingency retry',
+      )
     }
     if (CHECKER_ROLES.has(policy.child) && !/^[a-f0-9]{64}$/.test(request.candidateHash || '')) {
       throw new SupervisorIntegrationError('CANDIDATE_HASH_REQUIRED', `${policy.child} requires an exact sha256 version hash`)
@@ -7300,18 +9940,6 @@ class CodexSupervisorRuntime {
       throw new SupervisorIntegrationError('CONTEXT_POLICY_DENIED', 'child dispatch violates the bounded context policy', audit)
     }
 
-    let continuationId = request.continuationId || null
-    const adoptedBinding = request.adoptedBinding || null
-    const adoptedLease = request.adoptedLease || null
-    const executorKey = request.executorKey || request.equivalenceKey || request.workItemId
-    if (request.repairOf) {
-      const prior = this.workerContexts.get(request.repairOf)
-      if (!prior || prior.executorKey !== executorKey || prior.logicalRole !== policy.child ||
-          !/^[a-f0-9]{64}$/.test(prior.contextBindingHash || '')) {
-        throw new SupervisorIntegrationError('SAME_EXECUTOR_REQUIRED', 'repair must return to the same executor context')
-      }
-      continuationId = prior.contextId
-    }
     const modelRouting = this.settings.modelRouting || {}
     const pins = {
       model: modelRouting.explicitUserModelPin !== undefined,
@@ -7357,7 +9985,6 @@ class CodexSupervisorRuntime {
         workload: request.estimate || {},
       })
     }
-    assignment = applyBenchmarkEffortPin(assignment)
     const durableProgressEvidenceHashes = schedulerProgressEvidenceHashes(request)
     const schedulerRequest = {
       workItemId: request.workItemId,
@@ -7389,6 +10016,10 @@ class CodexSupervisorRuntime {
       // Context pointers alone never authorize another attempt.
       evidenceHashes: durableProgressEvidenceHashes,
       strategyFingerprint: request.strategyFingerprint,
+    }
+    if (requiredCompletion && typeof scheduler.issueRequiredCompletionBinding === 'function') {
+      schedulerRequest.requiredCompletionBinding =
+        scheduler.issueRequiredCompletionBinding(schedulerRequest)
     }
     if (typeof scheduler.assertRetryProgress !== 'function') {
       throw new SupervisorIntegrationError(
@@ -7594,7 +10225,7 @@ class CodexSupervisorRuntime {
       runId: this.options.runId,
       logicalRole: policy.child,
       physicalRole,
-      readOnly: CHECKER_ROLES.has(policy.child) ||
+      readOnly: CHECKER_ROLES.has(policy.child) || policy.child === 'diagnostic-probe' ||
         !Array.isArray(policy.definition.permissions && policy.definition.permissions.write) ||
         policy.definition.permissions.write.length === 0,
       requestEnvelopeHash: this.requestPointer.hash,
@@ -7648,6 +10279,7 @@ class CodexSupervisorRuntime {
         activation: this.activation,
         assignment: canonicalAssignment,
         workItemId: request.workItemId,
+        transportQuarantine,
       })
       if (!workerWorkspace || typeof workerWorkspace.workspacePath !== 'string' ||
           !workerWorkspace.binding || typeof workerWorkspace.binding.bindingHash !== 'string' ||
@@ -7667,7 +10299,8 @@ class CodexSupervisorRuntime {
         )
       }
     }
-    const reservationId = crypto.randomUUID()
+    const physicalLaunchIdentity = `${this.activation.id}:generation:${this.activation.generation}:${request.route}:${request.workItemId}`
+    const reservationId = `${physicalLaunchIdentity}:${crypto.randomUUID()}`
     const launchBaseEnvironment = typeof this.options.processControlEnvironmentFactory === 'function'
       ? this.options.processControlEnvironmentFactory(
           reservationId,
@@ -7821,45 +10454,79 @@ class CodexSupervisorRuntime {
       }
       throw new SupervisorIntegrationError('CAPABILITY_VERIFICATION_FAILED', 'host capability verifier rejected child launch')
     }
-    let lease
-    if (adoptedLease) {
-      if (!adoptedBinding || adoptedLease.workItemId !== request.workItemId ||
-          (adoptedBinding.continuationId && continuationId !== adoptedBinding.continuationId)) {
+    const diagnosticLaunch = policy.child === 'diagnostic-probe'
+    let diagnosticAdmissionReserved = false
+    if (diagnosticLaunch) {
+      if (this.diagnosticWorkerLaunches + this.diagnosticWorkerAdmissionsInFlight >= 1) {
         throw new SupervisorIntegrationError(
-          'CRASH_ADOPTION_CONFLICT',
-          'adopted model continuation does not bind the exact saved lease, work item, and thread',
+          'DIAGNOSTIC_WORKER_LIMIT',
+          'a denied diagnostic may use at most one bounded worker before BLOCKED',
+          { workerCount: this.diagnosticWorkerLaunches },
         )
       }
-      lease = adoptedLease
-    } else {
-      const authority = scheduler.issueLaunchAuthority({
-        callerRole: caller.physicalRole,
-        sessionId: caller.sessionId,
-        runId: caller.runId,
-        generation: caller.generation,
-        parentLease: request.parentLease || null,
-        providerCapabilities: this.providerCapabilities,
-      })
-      // Admission may perform capability and assignment validation. Recheck at
-      // the exact scheduler-lease boundary so none of that time can borrow from
-      // the independent final-verification reserve.
-      this.budget.assertAvailable({
-        forWork: request.purpose !== 'recovery',
-        forExecution: !protectedDeadlinePurpose(request.purpose),
-      })
-      lease = await scheduler.acquireWithAuthority(authority, schedulerRequest)
+      if (!adoptedLease) {
+        this.diagnosticWorkerAdmissionsInFlight += 1
+        diagnosticAdmissionReserved = true
+      }
     }
-    const sessionId = `${this.activation.id}:${request.route}:${lease.id}`
-    let budgetSessionStarted = Boolean(adoptedLease)
+    let lease
+    try {
+      if (adoptedLease) {
+        if (!adoptedBinding || adoptedLease.workItemId !== request.workItemId ||
+            (adoptedBinding.continuationId && continuationId !== adoptedBinding.continuationId)) {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            'adopted model continuation does not bind the exact saved lease, work item, and thread',
+          )
+        }
+        lease = adoptedLease
+      } else {
+        const authority = scheduler.issueLaunchAuthority({
+          callerRole: caller.physicalRole,
+          sessionId: caller.sessionId,
+          runId: caller.runId,
+          generation: caller.generation,
+          parentLease: request.parentLease || null,
+          providerCapabilities: this.providerCapabilities,
+          requiredCompletionBinding: schedulerRequest.requiredCompletionBinding || null,
+        })
+        // Admission may perform capability and assignment validation. Recheck at
+        // the exact scheduler-lease boundary so none of that time can borrow from
+        // the independent final-verification reserve.
+        this.budget.assertAvailable({
+          forWork: request.purpose !== 'recovery',
+          forExecution: !protectedDeadlinePurpose(request.purpose),
+          requiredCompletion,
+        })
+        lease = await scheduler.acquireWithAuthority(authority, schedulerRequest)
+      }
+    } catch (error) {
+      if (diagnosticAdmissionReserved) this.diagnosticWorkerAdmissionsInFlight -= 1
+      throw error
+    }
+    if (diagnosticLaunch) {
+      if (diagnosticAdmissionReserved) this.diagnosticWorkerAdmissionsInFlight -= 1
+      this.diagnosticWorkerLaunches += 1
+    }
+    // Scheduler lease ids are intentionally stable across crash adoption, but
+    // process/session identities are not: the predecessor registry remains
+    // durable so its terminal physical launch can never be aliased.  The
+    // provider continuation id separately preserves the logical model thread.
+    const sessionId = `${this.activation.id}:generation:${this.activation.generation}:${request.route}:${lease.id}`
+    let budgetSessionStarted = false
+    let terminalSessionSettlementAttempted = false
     let externalOperation = null
     let streamedRouteEventCount = 0
     let leaseSettled = false
     let mutationPermit = null
     let mutationBefore = null
     let mutationAdmission = null
+    let promotedMutationCandidate = null
+    let preservePromotedMutationCandidate = false
     let pendingDeferredPromotion = null
     let deferredPromotionHandle = null
     let checkerSnapshotBefore = null
+    let persistProviderTransportFailure = null
     try {
     if (!adoptedLease && request.route !== 'PRE_ROUTE' && !this.firstChildStartupRecorded) {
       const startupAdmission = scheduler.recordAdmissionComponent(
@@ -7868,7 +10535,7 @@ class CodexSupervisorRuntime {
           (this.routeFrozenMonotonicAt === undefined ? this.monotonicNow() : this.routeFrozenMonotonicAt)),
       )
       this.firstChildStartupRecorded = true
-      if (!startupAdmission || startupAdmission.withinCeiling !== true) {
+      if (!startupAdmission || startupAdmission.completionCanContinue !== true) {
         const error = new SupervisorIntegrationError(
           'ADMISSION_COMPONENT_TIMEOUT',
           'first admitted child startup exceeded the canonical admission ceiling',
@@ -7886,9 +10553,19 @@ class CodexSupervisorRuntime {
       openCheckIds: CHECKER_ROLES.has(policy.child) ? [request.workItemId] : [],
       acceptedResultIds: [],
     }
+    const childRecoveryContract = request.route === 'PRE_ROUTE'
+      ? null
+      : this._persistChildRecoveryContract(lease, request, policy.child)
     const requestNextReadyAfterCompletion = () => {
       return recoveryGroupNextReady(request, this.recoveryCompletedWorkIds)
     }
+    const authoritativeNextReadyAfterResult = result => authoritativeRequestNextReady(
+      policy.child,
+      result,
+      request,
+      this.recoveryCompletedWorkIds,
+      recoveryFrontier.nextReadyWorkIds,
+    )
     if (externalOperation) {
       this.recoveryExternalOperations.set(externalOperation.operationId, externalOperation)
     }
@@ -7902,6 +10579,8 @@ class CodexSupervisorRuntime {
     }
     let identifiedContinuationId = continuationId
     let usageSequence = 0
+    let pendingUsageCallback = null
+    const completedUsageCallbacks = new Map()
     const persistSchedulerCheckpoint = (continuation, causeKind = 'CHECKPOINT', threadEvidence = null) => {
       if (continuation) identifiedContinuationId = continuation
       if (threadEvidence) {
@@ -7949,6 +10628,31 @@ class CodexSupervisorRuntime {
         continuationId,
         frontier: adoptedBinding.frontier,
       })
+      persistTerminalSession(this.budget, adoptedBinding.sessionId, {
+        status: 'LOST',
+        evidenceHashes: [],
+      })
+      this._checkpointAccounting({
+        kind: 'RECOVERY',
+        causeId: `scheduler:${this.activation.generation}:${lease.id}:physical-relaunch`,
+        humanDescription: 'Account for the fresh generation-bound physical continuation of an adopted scheduler lease.',
+      }, {
+        launches: 1,
+        sessions: 1,
+      }, { requiredCompletion, schedulerLease: lease })
+      this.budget.recordLaunch({
+        forWork: request.purpose !== 'recovery',
+        forExecution: !protectedDeadlinePurpose(request.purpose),
+        requiredCompletion,
+      })
+      this.budget.startSession(sessionId, {
+        activationId: this.activation.id,
+        parentSessionId: request.parentSessionId || caller.sessionId,
+        forWork: request.purpose !== 'recovery',
+        forExecution: !protectedDeadlinePurpose(request.purpose),
+        requiredCompletion,
+      })
+      budgetSessionStarted = true
     } else {
       scheduler.bindCrashContinuation(lease, {
         reservationId,
@@ -7966,22 +10670,24 @@ class CodexSupervisorRuntime {
         launches: 1,
         retries: lease.attempt > 1 ? 1 : 0,
         sessions: 1,
-      })
+      }, { requiredCompletion, schedulerLease: lease })
       this.budget.recordLaunch({
         forWork: request.purpose !== 'recovery',
         forExecution: !protectedDeadlinePurpose(request.purpose),
+        requiredCompletion,
       })
       this.budget.startSession(sessionId, {
         activationId: this.activation.id,
         parentSessionId: request.parentSessionId || caller.sessionId,
         forWork: request.purpose !== 'recovery',
         forExecution: !protectedDeadlinePurpose(request.purpose),
+        requiredCompletion,
       })
       budgetSessionStarted = true
     }
     persistSchedulerCheckpoint(continuationId, 'LEASE_STARTED')
     if (externalOperation) persistSchedulerCheckpoint(continuationId, 'EXTERNAL_OPERATION')
-    const transcriptReferences = []
+    const transcriptEvidenceTracker = createTranscriptEvidenceTracker()
     let transcriptStore = null
     if (typeof this.options.transcriptStoreFactory === 'function') {
       transcriptStore = this.options.transcriptStoreFactory({ request, sessionId, record: this.record })
@@ -8015,6 +10721,8 @@ class CodexSupervisorRuntime {
         }
       : null
     const launchRecord = {
+      activationId: this.activation.id,
+      generation: this.activation.generation,
       runId: this.options.runId,
       workItemId: request.workItemId,
       schedulerLeaseId: lease.id,
@@ -8028,7 +10736,9 @@ class CodexSupervisorRuntime {
       physicalRole,
       providerRole,
       dispatch,
-      entryPrompt: this.options.entryPrompt,
+      canonicalMission: this.canonicalMissionProjection.canonicalMission,
+      missionBinding,
+      repairContextBinding,
       environment: env,
       environmentHash,
       workingDirectory,
@@ -8054,7 +10764,9 @@ class CodexSupervisorRuntime {
       }) : null,
       onEvent: transcriptStore || policy.child === 'route-analyst'
         ? (event, raw) => {
-            if (transcriptStore) transcriptReferences.push(transcriptStore.append({ event, raw }))
+            if (transcriptStore) {
+              transcriptEvidenceTracker.append(transcriptStore.append({ event, raw }))
+            }
             if (policy.child === 'route-analyst') {
               appendCanonicalRouteEvent(this.record, event, raw)
               streamedRouteEventCount += 1
@@ -8070,7 +10782,7 @@ class CodexSupervisorRuntime {
           }),
       onSessionIdentified: (identified, evidence) => persistSchedulerCheckpoint(identified, 'THREAD_STARTED', evidence),
       normalizeTerminalResult: CHECKER_ROLES.has(policy.child)
-        ? canonicalizeCheckerVerificationLimitation : null,
+        ? canonicalizeCheckerTerminalResult : null,
       onTerminalResult: (terminalResult, terminalEvidence) => {
         try {
           validateCanonicalChildResult({
@@ -8091,6 +10803,7 @@ class CodexSupervisorRuntime {
         }
         if (mutationBefore && !mutationAdmission) {
           mutationAdmission = workerWorkspace.manager.inspect(workerWorkspace, terminalResult)
+          this._persistMutationAdmission(request.workItemId, mutationAdmission)
         }
         if (terminalEvidence.sessionId !== identifiedContinuationId) {
           throw new SupervisorIntegrationError(
@@ -8156,6 +10869,13 @@ class CodexSupervisorRuntime {
           resultHash: hashText(JSON.stringify(terminalResult)),
           rawOutputHash: terminalEvidence.rawOutputHash,
           eventStreamHash: terminalEvidence.eventStreamHash,
+          checkerRecoveryDisposition: request.checkerRecoveryDisposition
+            ? structuredClone(request.checkerRecoveryDisposition) : null,
+          requestedNextReadyWorkIds: Array.isArray(request.nextReadyAfter)
+            ? [...request.nextReadyAfter] : [],
+          transportFailureRetryId: request.transportFailureRetryId || null,
+          authoritativeNextReadyWorkIds: authoritativeNextReadyAfterResult(terminalResult),
+          recoveryContractHash: childRecoveryContract && childRecoveryContract.contractHash || null,
           result: terminalResult,
         }
         const receipt = { ...body, receiptHash: hashText(JSON.stringify(body)) }
@@ -8226,13 +10946,7 @@ class CodexSupervisorRuntime {
             ...recoveryFrontier,
             acceptedResultIds: [receipt.receiptHash],
           },
-          nextReadyWorkIds: durableNextReadyAfter(
-            policy.child,
-            terminalResult,
-            requestNextReadyAfterCompletion(),
-            recoveryFrontier.nextReadyWorkIds,
-            request.workItemId,
-          ),
+          nextReadyWorkIds: authoritativeNextReadyAfterResult(terminalResult),
           openCheckIds: recoveryFrontier.openCheckIds,
           candidateHash: request.candidateHash || null,
         })
@@ -8242,33 +10956,224 @@ class CodexSupervisorRuntime {
         // result/lease binding unverifiable.
         this.recoveryThreads.delete(lease.id)
       },
-      onUsageDelta: (delta) => {
-        const authorization = lease.authorizeUsage(delta)
-        const report = lease.reportUsage(delta, {
-          productive: request.purpose !== 'recovery',
-          progressKind: CHECKER_ROLES.has(policy.child) ? 'verification' : 'work',
+      onUsageDelta: (delta, cumulative = null) => {
+        const callbackKey = hashText(stableStringify({ delta, cumulative }))
+        if (completedUsageCallbacks.has(callbackKey)) return completedUsageCallbacks.get(callbackKey)
+        if (pendingUsageCallback && pendingUsageCallback.callbackKey !== callbackKey) {
+          throw new SupervisorIntegrationError(
+            'CODEX_USAGE_INVALID',
+            'a later usage callback arrived before the prior exact delta reconciled',
+          )
+        }
+        const state = pendingUsageCallback || {
+          callbackKey,
+          sequence: usageSequence + 1,
+          authorization: null,
+          report: null,
+          costMicrounits: null,
+          schedulerAccounted: false,
+          ledgerPersisted: false,
+          budgetConsumed: false,
+          schedulerCheckpointPersisted: false,
+        }
+        pendingUsageCallback = state
+        if (!state.authorization) state.authorization = lease.authorizeUsage(delta)
+        if (!state.schedulerAccounted) {
+          state.report = lease.reportUsage(delta, {
+            productive: request.purpose !== 'recovery',
+            progressKind: CHECKER_ROLES.has(policy.child) ? 'verification' : 'work',
+          })
+          state.schedulerAccounted = true
+        }
+        if (state.costMicrounits === null) {
+          state.costMicrounits = typeof this.options.costCalculator === 'function'
+            ? this.options.costCalculator({ assignment, delta, request, sequence: state.sequence })
+            : 0
+          if (!Number.isSafeInteger(state.costMicrounits) || state.costMicrounits < 0) {
+            throw new SupervisorIntegrationError('ACCOUNTING_VALUES_INVALID', 'model cost accounting must be a non-negative integer')
+          }
+        }
+        if (!state.ledgerPersisted) {
+          this._checkpointAccounting({
+            kind: 'TOKEN_USAGE_RECORDED',
+            causeId: `codex-jsonl:${hashText(sessionId).slice(0, 24)}:${state.sequence}`,
+            humanDescription: 'Persist the complete streamed Codex usage delta before allowing the child to continue.',
+          }, { costMicrounits: state.costMicrounits, tokenUsage: delta })
+          state.ledgerPersisted = true
+        }
+        if (!state.budgetConsumed) {
+          const tokens = billableModelTokens(delta)
+          if (tokens > 0) this.budget.consumeTokens(tokens, { requiredCompletion })
+          state.budgetConsumed = true
+        }
+        if (!state.schedulerCheckpointPersisted) {
+          persistSchedulerCheckpoint(identifiedContinuationId, 'USAGE_RECORDED')
+          state.schedulerCheckpointPersisted = true
+        }
+        usageSequence = state.sequence
+        const verdict = Object.freeze({
+          continue: requiredCompletion ||
+            (state.authorization.allowed === true && state.report.continue === true),
+          authorization: state.authorization,
+          report: state.report,
         })
-        usageSequence += 1
-        const costMicrounits = typeof this.options.costCalculator === 'function'
-          ? this.options.costCalculator({ assignment, delta, request, sequence: usageSequence })
-          : 0
-        if (!Number.isSafeInteger(costMicrounits) || costMicrounits < 0) {
-          throw new SupervisorIntegrationError('ACCOUNTING_VALUES_INVALID', 'model cost accounting must be a non-negative integer')
-        }
-        this._checkpointAccounting({
-          kind: 'TOKEN_USAGE_RECORDED',
-          causeId: `codex-jsonl:${hashText(sessionId).slice(0, 24)}:${usageSequence}`,
-          humanDescription: 'Persist the complete streamed Codex usage delta before allowing the child to continue.',
-        }, { costMicrounits, tokenUsage: delta })
-        const tokens = billableModelTokens(delta)
-        if (tokens > 0) this.budget.consumeTokens(tokens)
-        persistSchedulerCheckpoint(identifiedContinuationId, 'USAGE_RECORDED')
-        return {
-          continue: authorization.allowed === true && report.continue === true,
-          authorization,
-          report,
-        }
+        completedUsageCallbacks.set(callbackKey, verdict)
+        pendingUsageCallback = null
+        return verdict
       },
+    }
+    persistProviderTransportFailure = providerError => {
+      const controllerContinuationId = identifiedContinuationId || continuationId || sessionId
+      // A provider availability result is still the result of this exact
+      // admitted physical launch. Bind the deterministic controller terminal
+      // to the real lease/session before writing any result bytes. This keeps
+      // RESULT_COMMITTED crash-adoptable and prevents the outer executor from
+      // fabricating a second, lease-free control-plane launch.
+      identifiedContinuationId = controllerContinuationId
+      scheduler.bindCrashContinuation(lease, {
+        reservationId,
+        sessionId,
+        continuationId: controllerContinuationId,
+        frontier: recoveryFrontier,
+      })
+      const failure = CHECKER_ROLES.has(policy.child)
+        ? checkerLaunchRuntimeFailure(request, this.decision, this.options.runId, providerError, {
+            contextId: controllerContinuationId,
+            requestEnvelopeHash: this.requestPointer.hash,
+          })
+        : workerTransportRuntimeFailure(request, this.decision, this.options.runId, providerError, {
+            contextId: controllerContinuationId,
+            physicalRole,
+            findingIds: canonicalAssignment && canonicalAssignment.findingIds || findingIds,
+            requestEnvelopeHash: this.requestPointer.hash,
+          })
+      validateCanonicalChildResult({
+        workItemId: request.workItemId,
+        logicalRole: policy.child,
+        physicalRole,
+        candidateHash: request.candidateHash || null,
+        findingIds: canonicalAssignment && canonicalAssignment.findingIds || findingIds,
+      }, failure, this.options.runId, this.requestPointer.hash)
+      const assignmentHash = canonicalAssignment
+        ? hashText(JSON.stringify(canonicalAssignment))
+        : hashText(stableStringify(dispatch))
+      const workerContextIdentity = policy.child === 'route-analyst' ? null : {
+        schemaVersion: 1,
+        runId: this.options.runId,
+        activationId: this.activation.id,
+        requestEnvelopeHash: this.requestPointer.hash,
+        missionHash: this.activation.missionHash,
+        workItemId: request.workItemId,
+        logicalRole: policy.child,
+        executorKey,
+        contextId: controllerContinuationId,
+      }
+      const receiptCandidateHash = resolveTerminalReceiptCandidateHash({
+        logicalRole: policy.child,
+        runtimeStateProvider: this.options.runtimeStateProvider,
+        requestCandidateHash: request.candidateHash,
+        resultCandidateHash: failure.candidateHash,
+      })
+      const transportEvidence = serializeError(providerError)
+      const transportEvidenceHash = hashText(stableStringify({
+        kind: 'provider-transport-failure',
+        leaseId: lease.id,
+        workItemId: request.workItemId,
+        error: transportEvidence,
+      }))
+      const authoritativeNextReadyWorkIds = authoritativeNextReadyAfterResult(failure)
+      const body = {
+        schemaVersion: 1,
+        runId: this.options.runId,
+        activationId: this.activation.id,
+        admittedGeneration: this.activation.generation,
+        leaseId: lease.id,
+        workItemId: request.workItemId,
+        assignmentId: request.workItemId,
+        logicalRole: policy.child,
+        executorKey,
+        physicalRole,
+        providerRole,
+        retainLease: false,
+        assignmentHash,
+        sessionId,
+        continuationId: controllerContinuationId,
+        workerContextBindingHash: workerContextIdentity
+          ? hashText(stableStringify(workerContextIdentity)) : null,
+        requestEnvelopeHash: this.requestPointer.hash,
+        candidateHash: receiptCandidateHash,
+        resultHash: hashText(JSON.stringify(failure)),
+        rawOutputHash: transportEvidenceHash,
+        eventStreamHash: transportEvidenceHash,
+        controllerAuthoredTransportFailure: true,
+        checkerRecoveryDisposition: request.checkerRecoveryDisposition
+          ? structuredClone(request.checkerRecoveryDisposition) : null,
+        requestedNextReadyWorkIds: Array.isArray(request.nextReadyAfter)
+          ? [...request.nextReadyAfter] : [],
+        transportFailureRetryId: request.transportFailureRetryId || null,
+        authoritativeNextReadyWorkIds,
+        recoveryContractHash: childRecoveryContract && childRecoveryContract.contractHash || null,
+        result: failure,
+      }
+      const receipt = { ...body, receiptHash: hashText(JSON.stringify(body)) }
+      const relative = this._terminalReceiptLocation(lease.id, request.workItemId)
+      const absolute = this.record.resolve(relative)
+      if (fs.existsSync(absolute)) {
+        if (stableStringify(readRegularJson(absolute, 'provider transport terminal receipt').parsed) !==
+            stableStringify(receipt)) {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            `provider transport receipt changed after first persistence: ${request.workItemId}`,
+          )
+        }
+      } else {
+        this.record.write(relative, `${JSON.stringify(receipt, null, 2)}\n`)
+      }
+      if (canonicalAssignment) {
+        this._writeCanonicalResult(request.workItemId, failure, canonicalAssignment.resultLocation)
+      }
+      if (policy.child !== 'route-analyst') {
+        this._persistWorkerContext(
+          request.workItemId,
+          executorKey,
+          controllerContinuationId,
+          policy.child,
+          receipt,
+          relative,
+        )
+      }
+      terminalReceiptBinding = receipt
+      terminalReceiptRelative = relative
+      this.recoveryAcceptedResultIds.add(receipt.receiptHash)
+      const checkpoint = scheduler.exportCrashCheckpoint({
+        ownerSessionId: this.rootCallers.controlPlane.sessionId,
+      })
+      this._persistRecoveryCheckpoint({
+        kind: 'RESULT_COMMITTED',
+        causeId: `scheduler:${this.activation.generation}:${lease.id}:transport:${receipt.receiptHash.slice(0, 24)}`,
+        humanDescription: 'Persist an exact provider transport result while its admitted scheduler lease remains open.',
+        resultCommit: {
+          assignmentId: request.workItemId,
+          assignmentHash,
+          leaseId: lease.id,
+          sessionId,
+          continuationId: controllerContinuationId,
+          resultHash: receipt.resultHash,
+          receiptHash: receipt.receiptHash,
+          candidateHash: receipt.candidateHash,
+        },
+      }, {
+        schedulerCheckpoint: checkpoint,
+        recoveryFrontier: {
+          ...recoveryFrontier,
+          acceptedResultIds: [receipt.receiptHash],
+        },
+        nextReadyWorkIds: authoritativeNextReadyWorkIds,
+        openCheckIds: recoveryFrontier.openCheckIds,
+        candidateHash: request.candidateHash || null,
+      })
+      this.recoveryThreads.delete(lease.id)
+      return Object.freeze({ failure, receipt, authoritativeNextReadyWorkIds })
     }
     this.launches.push({
       ...launchRecord,
@@ -8355,8 +11260,38 @@ class CodexSupervisorRuntime {
           reconciledPartialStateHash: hashText(stableStringify([...this.recoveryExternalOperations.values()])),
         })
       }
+      const optionalPreRouteAnalysis = request.route === 'PRE_ROUTE' &&
+        policy.child === 'route-analyst'
+      const launchOwnedChild = () => {
+        // A required local worker/checker is bounded by its owned process
+        // lifecycle and explicit cancellation, not stdout frequency. Long
+        // reasoning/tool calls may be completely silent while healthy; the
+        // runner still resolves/rejects conclusively when that process exits.
+        if (!optionalPreRouteAnalysis) return this.options.launcher(launchRecord)
+        const analystWatchdogMs = Math.min(
+          this.childTransportWatchdogMs,
+          Number(request.admission && request.admission.max_duration_ms) || ROUTE_ANALYST_MAX_DURATION_MS,
+        )
+        return withTimeout(
+          refreshTransportWatchdog => {
+            launchRecord.onTransportActivity = refreshTransportWatchdog
+            return this.options.launcher(launchRecord)
+          },
+          analystWatchdogMs,
+          this.timerApi,
+          'ROUTE_ANALYST_TIMEOUT',
+          typeof this.options.onChildTransportTimeout === 'function'
+            ? () => this.options.onChildTransportTimeout({
+                sessionId,
+                workItemId: request.workItemId,
+                logicalRole: policy.child,
+                schedulerLeaseId: lease.id,
+              })
+            : null,
+        )
+      }
       const result = await this._withinFirstProductSignalDeadline(
-        () => this.options.launcher(launchRecord), scheduler, request,
+        launchOwnedChild, scheduler, request,
       )
       if (checkerSnapshotBefore && hashWorkspaceCandidate(
         targetWorkingDirectory,
@@ -8399,15 +11334,9 @@ class CodexSupervisorRuntime {
               result.firstProductSignalBlocker || null,
           })
         }
-        if (benchmarkFirstProductSignalDeadlineEnabled(
-          scheduler.budget.admissionHardMs,
-          this.options.baseEnvironment || process.env,
-        )) {
-          scheduler.assertFirstProductSignalDue({
-            elapsedMs: Math.max(0, this.monotonicNow() - this.admissionStartedAt),
-            reason: result && result.firstProductSignalBlocker,
-          })
-        }
+        // The first-product target remains recorded as scheduling evidence.
+        // A completed required child is never discarded solely because that
+        // economic target elapsed; later optional width collapses instead.
       }
       if (mutationBefore && !mutationAdmission) {
         validateCanonicalChildResult({
@@ -8418,6 +11347,7 @@ class CodexSupervisorRuntime {
           findingIds: canonicalAssignment && canonicalAssignment.findingIds || [],
         }, result, this.options.runId, this.requestPointer.hash)
         mutationAdmission = workerWorkspace.manager.inspect(workerWorkspace, result)
+        this._persistMutationAdmission(request.workItemId, mutationAdmission)
       }
       if (mutationPermit) {
         for (const resource of canonicalAssignment.resources.filter(item => item.access !== 'read')) {
@@ -8441,15 +11371,83 @@ class CodexSupervisorRuntime {
           }
         } else {
           const promotedPostimages = workerWorkspace.manager.promote(workerWorkspace, mutationAdmission)
-          await this.options.mutationEnforcer.commit({
+          const promotedCandidateHash = hashWorkspaceCandidate(
+            this.options.targetPath,
+            this.options.gitEnvironment(this.options.targetPath),
+          )
+          const promotedBody = Object.freeze({
+            schemaVersion: 1,
+            kind: 'post-promotion-reconciliation-candidate',
+            runId: this.options.runId,
+            activationId: this.activation.id,
+            generation: this.activation.generation,
+            workItemId: request.workItemId,
+            logicalRole: policy.child,
+            candidatePath: path.resolve(this.options.targetPath),
+            candidateHash: promotedCandidateHash,
+            mutationAdmissionHash: hashText(stableStringify(mutationAdmission)),
+            postimagesHash: hashText(stableStringify(promotedPostimages)),
+            terminalResultHash: hashText(JSON.stringify(result)),
+          })
+          promotedMutationCandidate = Object.freeze({
+            ...promotedBody,
+            bindingHash: hashText(stableStringify(promotedBody)),
+          })
+          const commitInput = {
             assignment: canonicalAssignment,
             permit: mutationPermit,
             postimages: promotedPostimages,
             isolation: workerWorkspace.binding,
             workItemId: request.workItemId,
-          })
+          }
+          let commitFailure = null
+          for (let attempt = 1; attempt <= 2; attempt += 1) {
+            try {
+              await this.options.mutationEnforcer.commit(commitInput)
+              commitFailure = null
+              break
+            } catch (error) {
+              let commitAlreadyDurable = false
+              if (typeof this.options.runtimeStateProvider === 'function') {
+                try {
+                  const runtimeState = this.options.runtimeStateProvider()
+                  if (runtimeState && Object.hasOwn(runtimeState, 'activeMutation')) {
+                    if (runtimeState.activeMutation === null) {
+                      commitAlreadyDurable = true
+                    } else if (!sameCanonicalValue(runtimeState.activeMutation, mutationPermit)) {
+                      throw new SupervisorIntegrationError(
+                        'CRASH_ADOPTION_CONFLICT',
+                        'post-promotion runtime state carries a foreign mutation permit',
+                      )
+                    }
+                  }
+                } catch (stateError) {
+                  if (promotedMutationFailureRequiresRollback(stateError)) throw stateError
+                }
+              }
+              if (commitAlreadyDurable) {
+                commitFailure = null
+                break
+              }
+              if (promotedMutationFailureRequiresRollback(error)) throw error
+              commitFailure = error
+            }
+          }
+          if (commitFailure) {
+            preservePromotedMutationCandidate = true
+            throw new SupervisorIntegrationError(
+              'CALLBACK_RECONCILIATION_PENDING',
+              'the exact version is promoted, but its local mutation-state commit remains unavailable',
+              {
+                callback: Object.freeze({ kind: 'mutation-state-commit', attempts: 2 }),
+                latestFailure: serializeError(commitFailure),
+                resumableCandidate: promotedMutationCandidate,
+              },
+            )
+          }
           mutationPermit = null
           workerWorkspace.manager.finalize(workerWorkspace)
+          promotedMutationCandidate = null
         }
       }
       if (pendingDeferredPromotion) {
@@ -8483,8 +11481,8 @@ class CodexSupervisorRuntime {
           humanDescription: 'Persist complete terminal model usage from a non-streaming launcher.',
         }, { tokenUsage: terminalUsage })
         const tokens = billableModelTokens(terminalUsage)
-        if (tokens > 0) this.budget.consumeTokens(tokens)
-        if (authorization.allowed !== true || report.continue !== true) {
+        if (tokens > 0) this.budget.consumeTokens(tokens, { requiredCompletion })
+        if (!requiredCompletion && (authorization.allowed !== true || report.continue !== true)) {
           const error = new SupervisorIntegrationError('BUDGET_EXHAUSTED', 'terminal model usage exhausted the scheduler budget')
           error.usage = terminalUsage
           throw error
@@ -8492,7 +11490,7 @@ class CodexSupervisorRuntime {
       }
       if (checkKey) this.consumedChecks.add(checkKey)
       if (checkKey && this.record && typeof this.record.write === 'function') {
-        const persistedResult = { ...result, transcriptEvidence: transcriptReferences }
+        const persistedResult = { ...result, transcriptEvidence: transcriptEvidenceTracker.snapshot() }
         const rawOutputHash = hashText(JSON.stringify(persistedResult))
         const harness = request.harnessAttestation || {}
         if (![harness.repoHash, harness.buildHash, harness.oracleHash].every(value => /^[a-f0-9]{64}$/.test(value || ''))) {
@@ -8575,6 +11573,7 @@ class CodexSupervisorRuntime {
         const checkerCompleted = checkerPassed ||
           (CHECKER_ROLES.has(policy.child) && (
             stableCapabilityUnavailable(result) ||
+            checkerDispositionSettlesNonAuthoritative(request, result) ||
             (result && result.code === 'FAIL' &&
               /^independent-check-\d+(?:-repair-\d+)?$/u.test(
                 request.workItemId || '',
@@ -8591,14 +11590,7 @@ class CodexSupervisorRuntime {
           humanDescription: 'Persist the completed model result and released scheduler lease as one recovery point.',
         }, {
           candidateHash: request.candidateHash || null,
-          nextReadyWorkIds: durableNextReadyAfter(
-            policy.child,
-            result,
-            requestNextReadyAfterCompletion(),
-            [],
-            request.workItemId,
-            request.checkerRecoveryDisposition || null,
-          ),
+          nextReadyWorkIds: authoritativeNextReadyAfterResult(result),
         })
       } else {
         this.recoveryThreads.delete(lease.id)
@@ -8611,11 +11603,34 @@ class CodexSupervisorRuntime {
           nextReadyWorkIds: requestNextReadyAfterCompletion(),
         })
       }
-      this.budget.endSession(sessionId, { status: 'DONE', evidenceHashes: result && result.evidenceHashes || [] })
+      terminalSessionSettlementAttempted = true
+      persistTerminalSession(this.budget, sessionId, {
+        status: 'DONE',
+        evidenceHashes: result && result.evidenceHashes || [],
+      })
       budgetSessionStarted = false
-      this.budget.assertAvailable({ forWork: request.purpose !== 'recovery' })
-      const returned = { ...result, transcriptEvidence: transcriptReferences }
+      this.budget.assertAvailable({
+        forWork: request.purpose !== 'recovery',
+        requiredCompletion,
+      })
+      const returned = { ...result, transcriptEvidence: transcriptEvidenceTracker.snapshot() }
+      if (result && result.localCallbackReconciliation) {
+        Object.defineProperty(returned, 'localCallbackReconciliation', {
+          enumerable: false,
+          configurable: false,
+          writable: false,
+          value: result.localCallbackReconciliation,
+        })
+      }
       Object.defineProperty(returned, STREAMED_ROUTE_EVENT_COUNT, { value: streamedRouteEventCount })
+      if (mutationAdmission) {
+        Object.defineProperty(returned, MUTATION_ADMISSION_EVIDENCE, {
+          enumerable: false,
+          configurable: false,
+          writable: false,
+          value: mutationAdmission,
+        })
+      }
       if (deferredPromotionHandle) {
         Object.defineProperty(returned, 'deferredPromotion', {
           enumerable: false,
@@ -8645,11 +11660,17 @@ class CodexSupervisorRuntime {
       }
       return returned
     } catch (error) {
+      let cleanupFailure = null
+      let committedTransportFailure = null
+      let transportQuarantinePointer = null
+      let transportQuarantineResolved = false
+      let preserveCallbackWorkspace = false
       const attachErrorField = (field, value) => {
         if (error && (typeof error === 'object' || typeof error === 'function') &&
             Object.isExtensible(error)) error[field] = value
       }
       const attachCleanupFailure = (field, cleanupError) => {
+        cleanupFailure = cleanupFailure || cleanupError
         attachErrorField(field, serializeError(cleanupError))
       }
       if (checkerSnapshotBefore) {
@@ -8671,6 +11692,71 @@ class CodexSupervisorRuntime {
       if (error && (typeof error === 'object' || typeof error === 'function') && Object.isExtensible(error)) {
         Object.defineProperty(error, STREAMED_ROUTE_EVENT_COUNT, { value: streamedRouteEventCount, configurable: true })
       }
+      if (error && error.code === 'CALLBACK_RECONCILIATION_PENDING' &&
+          error.frozenTerminalResult && error.frozenTerminalEvidence) {
+        try {
+          validateCanonicalChildResult({
+            workItemId: request.workItemId,
+            logicalRole: policy.child,
+            physicalRole,
+            candidateHash: request.candidateHash || null,
+            findingIds: canonicalAssignment && canonicalAssignment.findingIds || [],
+          }, error.frozenTerminalResult, this.options.runId, this.requestPointer.hash)
+          if (identifiedContinuationId &&
+              error.frozenTerminalEvidence.sessionId !== identifiedContinuationId ||
+              policy.child !== 'route-analyst' &&
+                error.frozenTerminalResult.contextId !== error.frozenTerminalEvidence.sessionId) {
+            throw new SupervisorIntegrationError(
+              'CRASH_ADOPTION_CONFLICT',
+              'pending callback reconciliation carries a foreign Codex session binding',
+            )
+          }
+          preserveCallbackWorkspace = Boolean(workerWorkspace)
+          const candidatePath = workerWorkspace && workerWorkspace.workspacePath || targetWorkingDirectory
+          const candidateHash = hashWorkspaceCandidate(
+            candidatePath,
+            this.options.gitEnvironment(candidatePath),
+          )
+          const body = Object.freeze({
+            schemaVersion: 1,
+            kind: 'callback-reconciliation-candidate',
+            runId: this.options.runId,
+            activationId: this.activation.id,
+            generation: this.activation.generation,
+            workItemId: request.workItemId,
+            logicalRole: policy.child,
+            schedulerLeaseId: lease.id,
+            sessionId,
+            continuationId: identifiedContinuationId,
+            candidatePath,
+            candidateHash,
+            terminalResultHash: hashText(JSON.stringify(error.frozenTerminalResult)),
+            terminalEvidenceHash: hashText(stableStringify(error.frozenTerminalEvidence)),
+            callback: error.details && error.details.callback || null,
+          })
+          const callbackReconciliationCandidate = Object.freeze({
+            ...body,
+            bindingHash: hashText(stableStringify(body)),
+          })
+          attachErrorField('details', {
+            ...(error.details || {}),
+            resumableCandidate: callbackReconciliationCandidate,
+          })
+          if (error && Object.isExtensible(error)) {
+            Object.defineProperty(error, 'resumableCandidate', {
+              enumerable: false, configurable: false, writable: false,
+              value: callbackReconciliationCandidate,
+            })
+          }
+        } catch (candidateError) {
+          if (callbackFailureRequiresImmediateAbort(candidateError)) {
+            error = candidateError
+            preserveCallbackWorkspace = false
+          } else {
+            attachErrorField('candidatePersistenceFailure', serializeError(candidateError))
+          }
+        }
+      }
       if (externalOperation && error && ['MISSION_TIMEOUT', 'EXTERNAL_WRITE_DEADLINE_EXPIRED'].includes(error.code)) {
         const reconciled = reconcileExternalOperationTimeout(externalOperation, this.recoveryExternalOperations)
         this.recoveryExternalOperations.set(reconciled.operationId, reconciled)
@@ -8678,12 +11764,40 @@ class CodexSupervisorRuntime {
           ...(error.details || {}), externalOperation: reconciled, terminalBudgetOutcome: 'PARTIAL',
         })
       }
+      if (!externalOperation && request.route !== 'PRE_ROUTE' &&
+          PROVIDER_TRANSPORT_AVAILABILITY_CODES.has(error && error.code) &&
+          typeof persistProviderTransportFailure === 'function') {
+        try {
+          committedTransportFailure = persistProviderTransportFailure(error)
+        } catch (persistenceError) {
+          // A failure to bind the transport result to the still-open real
+          // lease is an integrity failure. Preserve it rather than falling
+          // back to a lease-free synthetic result.
+          error = persistenceError
+          committedTransportFailure = null
+        }
+      }
+      if (committedTransportFailure && mutationPermit && workerWorkspace &&
+          request.transportFailureRetryId &&
+          typeof workerWorkspace.manager.quarantine === 'function') {
+        try {
+          transportQuarantinePointer = workerWorkspace.manager.quarantine(workerWorkspace, {
+            retryWorkItemId: request.transportFailureRetryId,
+            transportReceiptHash: committedTransportFailure.receipt.receiptHash,
+          })
+          transportQuarantineResolved = true
+        } catch (quarantineError) {
+          attachCleanupFailure('transportQuarantineError', quarantineError)
+        }
+      }
       if (deferredPromotionHandle) {
         try { await deferredPromotionHandle.abort(error && error.code || 'worker completion failed') } catch (abortError) {
           attachCleanupFailure('workspaceAbortError', abortError)
         }
       }
-      if (mutationPermit && workerWorkspace) {
+      if (mutationPermit && workerWorkspace && !transportQuarantinePointer &&
+          !preservePromotedMutationCandidate &&
+          !preserveCallbackWorkspace) {
         try { workerWorkspace.manager.abort(workerWorkspace) } catch (abortError) {
           attachCleanupFailure('workspaceAbortError', abortError)
         }
@@ -8694,7 +11808,8 @@ class CodexSupervisorRuntime {
       // MUTATION_INCOMPLETE and masks the actual worker failure.  Always close
       // the exact permit, while retaining either cleanup failure as secondary
       // evidence on an extensible primary error.
-      if (mutationPermit && this.options.mutationEnforcer &&
+      if (mutationPermit && !preservePromotedMutationCandidate &&
+          this.options.mutationEnforcer &&
           typeof this.options.mutationEnforcer.abort === 'function') {
         try {
           await this.options.mutationEnforcer.abort({
@@ -8708,10 +11823,60 @@ class CodexSupervisorRuntime {
           attachCleanupFailure('mutationAbortError', abortError)
         }
       }
+      if (committedTransportFailure && !cleanupFailure) {
+        try {
+          lease.complete({})
+          leaseSettled = true
+          const failure = committedTransportFailure.failure
+          const checkerCompleted = CHECKER_ROLES.has(policy.child) && (
+            stableCapabilityUnavailable(failure) ||
+            checkerDispositionSettlesNonAuthoritative(request, failure)
+          )
+          if (checkerCompleted) {
+            addCanonicalCompletedChecker(this.recoveryCompletedCheckIds, request.workItemId)
+          } else if (!CHECKER_ROLES.has(policy.child) &&
+              committedTransportFailure.authoritativeNextReadyWorkIds.length === 0) {
+            // The durable unsuccessful attempt is complete, but its logical
+            // assignment is complete only when no bounded retry frontier
+            // remains. A transport retry keeps the logical item unfinished.
+            this.recoveryCompletedWorkIds.add(request.workItemId)
+          }
+          this._persistRecoveryCheckpoint({
+            kind: CHECKER_ROLES.has(policy.child)
+              ? (checkerCompleted ? 'CHECK_COMPLETED' : 'FRONTIER_CHANGED')
+              : 'LEASE_COMPLETED',
+            causeId: `scheduler:${this.activation.generation}:${lease.id}:transport-completed`,
+            humanDescription: 'Release the real scheduler lease only after its provider transport result is durable.',
+          }, {
+            candidateHash: request.candidateHash || null,
+            nextReadyWorkIds: committedTransportFailure.authoritativeNextReadyWorkIds,
+            openCheckIds: [],
+          })
+          if (budgetSessionStarted) {
+            terminalSessionSettlementAttempted = true
+            persistTerminalSession(this.budget, sessionId, {
+              status: 'FAILED',
+              evidenceHashes: failure.evidenceHashes || [],
+            })
+            budgetSessionStarted = false
+          }
+          if (!transportQuarantineResolved) return failure
+          const returnedFailure = { ...failure }
+          Object.defineProperty(returnedFailure, TRANSPORT_QUARANTINE_POINTER, {
+            enumerable: false,
+            configurable: false,
+            writable: false,
+            value: transportQuarantinePointer,
+          })
+          return returnedFailure
+        } catch (settlementError) {
+          error = settlementError
+        }
+      }
       if (!leaseSettled) {
         failSchedulerLease(lease, error)
       }
-      if (budgetSessionStarted) {
+      if (budgetSessionStarted && !terminalSessionSettlementAttempted) {
         persistTerminalSession(this.budget, sessionId, {
           status: error && error.code === 'MISSION_TIMEOUT' ? 'PARTIAL' : 'FAILED', evidenceHashes: [],
         }, error)
@@ -8721,75 +11886,22 @@ class CodexSupervisorRuntime {
   }
 
   _withinMissionDeadline(operation) {
-    if ((this.options.baseEnvironment || process.env).AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1') {
-      return Promise.resolve().then(operation)
-    }
-    const status = this.budget.assertAvailable({ forWork: true })
-    return withTimeout(operation, status.remaining.wallMs, this.timerApi, 'MISSION_TIMEOUT', async () => {
-      if (this.scheduler) this.scheduler.dispose('original-request deadline elapsed')
-      await this.processOwner.cancelAll({
-        reason: 'original-request deadline elapsed',
-        terminalStatus: 'PARTIAL',
-      })
-      await this.processOwner.assertDrained()
-    })
+    // Mission time is a convergence target, never a reason to discard a
+    // usable in-flight result.  Per-process transport watchdogs still bound a
+    // hung child; the scheduler collapses optional width/retries after target
+    // breaches while mission-essential work is allowed to finish.
+    return Promise.resolve().then(operation)
   }
 
   async _withinFirstProductSignalDeadline(operation, scheduler, request) {
     const missionOperation = () => this._withinMissionDeadline(operation)
-    if (!request || request.route === 'PRE_ROUTE') return missionOperation()
-    const existing = scheduler.getMetrics().economics.firstProductSignal
-    if (existing) return missionOperation()
-    const ceilingMs = request.route === 'DIRECT'
-      ? ADMISSION_COMPONENT_CEILINGS_MS.routeAnalyst + ADMISSION_COMPONENT_CEILINGS_MS.routeDecision
-      : request.route === 'LIGHT'
-        ? ADMISSION_COMPONENT_CEILINGS_MS.routeAnalyst + ADMISSION_COMPONENT_CEILINGS_MS.routeDecision +
-          ADMISSION_COMPONENT_CEILINGS_MS.lightPlanning
-        : scheduler.budget.admissionHardMs
-    if (!benchmarkFirstProductSignalDeadlineEnabled(
-      ceilingMs,
-      this.options.baseEnvironment || process.env,
-    )) return missionOperation()
-    const elapsedMs = Math.max(0, this.monotonicNow() - this.admissionStartedAt)
-    const remainingMs = ceilingMs - elapsedMs
-    if (remainingMs <= 0) {
-      return scheduler.assertFirstProductSignalDue({ elapsedMs: ceilingMs + 1 })
-    }
-    const missionPromise = Promise.resolve().then(missionOperation)
-    return new Promise((resolve, reject) => {
-      let settled = false
-      const timer = this.timerApi.setTimeout(() => {
-        if (settled) return
-        if (scheduler.getMetrics().economics.firstProductSignal) return
-        settled = true
-        Promise.resolve(this.processOwner.cancelAll({
-          reason: 'first RED/product-edit ceiling elapsed',
-          terminalStatus: 'FAILED',
-        })).catch(() => {})
-        try {
-          scheduler.assertFirstProductSignalDue({ elapsedMs: ceilingMs + 1 })
-        } catch (error) {
-          reject(error)
-        }
-      }, remainingMs)
-      if (timer && typeof timer.unref === 'function') timer.unref()
-      missionPromise.then(value => {
-        if (settled) return
-        settled = true
-        this.timerApi.clearTimeout(timer)
-        resolve(value)
-      }, error => {
-        if (settled) return
-        settled = true
-        this.timerApi.clearTimeout(timer)
-        reject(error)
-      })
-    })
+    return missionOperation()
   }
 
   _budgetPauseFrontier() {
-    const runtime = typeof this.options.runtimeStateProvider === 'function'
-      ? this.options.runtimeStateProvider() : null
+    const options = this.options || {}
+    const runtime = typeof options.runtimeStateProvider === 'function'
+      ? options.runtimeStateProvider() : null
     const persisted = this.latestRecoveryCheckpoint
     const record = persisted && persisted.record
     const scheduler = record && record.checkpoint && record.checkpoint.scheduler
@@ -8815,12 +11927,15 @@ class CodexSupervisorRuntime {
       outcome = this.resumableSuspensionIntent.outcome
       result = this.resumableSuspensionIntent.result
     } else {
-      this.resumableSuspensionIntent = Object.freeze({ outcome, result })
+      this.resumableSuspensionIntent = immutableTerminalIntent(outcome, result)
+      outcome = this.resumableSuspensionIntent.outcome
+      result = this.resumableSuspensionIntent.result
     }
     this.suspending = true
     const attempt = (async () => {
-      const runtime = typeof this.options.runtimeStateProvider === 'function'
-        ? this.options.runtimeStateProvider() : null
+      const options = this.options || {}
+      const runtime = typeof options.runtimeStateProvider === 'function'
+        ? options.runtimeStateProvider() : null
       const alreadyPaused = Boolean(result.transition && runtime && runtime.state === 'PAUSED')
       if (!alreadyPaused) {
         if (this.scheduler) this.scheduler.dispose(`resumable ${outcome}`)
@@ -8860,7 +11975,7 @@ class CodexSupervisorRuntime {
         await this._runtimeTransition(result.transition.eventId, 'PAUSED', { frontier })
       }
       if (result.transition) {
-        if (typeof this.options.preparePausedRelease === 'function') {
+        if (typeof options.preparePausedRelease === 'function') {
           const description = this.missionLock.describe(this.lease)
           const history = Array.isArray(description.owner.ownedProcessHistory)
             ? description.owner.ownedProcessHistory : []
@@ -8868,7 +11983,7 @@ class CodexSupervisorRuntime {
             ? await this.processOwner.verifyDrainedIdentities(history) : []
           this.missionLock.updateOwnedProcesses(this.lease, [])
           this.missionLock.release(this.lease, {
-            releaseEvidence: this.options.preparePausedRelease(),
+            releaseEvidence: options.preparePausedRelease(),
             ownedIdentityEvidence,
           })
         } else {
@@ -8904,7 +12019,7 @@ class CodexSupervisorRuntime {
     let priorError = null
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        await this.processOwner.cancelAll({ reason, terminalStatus })
+        await this.processOwner.cancelAll({ reason, terminalStatus, waitForPending: true })
         await this.processOwner.assertDrained()
         return
       } catch (error) {
@@ -8916,7 +12031,7 @@ class CodexSupervisorRuntime {
 
   async _runtimeTransition(eventId, nextState, details = {}) {
     this._enforceBudgetPhase(lifecycleBudgetPhase({ nextState }), {
-      boundary: 'runtime-transition', eventId, nextState,
+      boundary: 'runtime-transition', eventId, nextState, requiredCompletion: true,
     })
     if (typeof this.options.runtimeTransition !== 'function') return null
     const transitioned = await this.options.runtimeTransition({ eventId, nextState, details })
@@ -8948,12 +12063,16 @@ class CodexSupervisorRuntime {
           `${nextState} next-ready work must contain only unique physical work identities`,
         )
       }
+      const checkpointCandidateHash = eventId === 'WORK_ITEM_VERIFIED' &&
+          nextReadyWorkIds.some(id => /^work-\d+(?:-|$)/u.test(id))
+        ? transitioned && transitioned.candidateHash || null
+        : details.candidateHash
       this._persistRecoveryCheckpoint({
-        kind: details.candidateHash ? 'CANDIDATE_FROZEN' : 'FRONTIER_CHANGED',
+        kind: checkpointCandidateHash ? 'CANDIDATE_FROZEN' : 'FRONTIER_CHANGED',
         causeId: `state:${this.activation.generation}:${nextState}:${transitioned && transitioned.sequence || 0}`,
         humanDescription: `Persist the exact scheduler next ready work after canonical state ${nextState}.`,
       }, {
-        candidateHash: details.candidateHash,
+        candidateHash: checkpointCandidateHash,
         openCheckIds: details.openCheckIds || [],
         nextReadyWorkIds,
       })
@@ -9072,6 +12191,18 @@ class CodexSupervisorRuntime {
     if (this.settledResult) return this.settledResult
     if (this.finalizing && this.finalizationPromise) return this.finalizationPromise
     if (this.suspending && this.suspensionPromise) return this.suspensionPromise
+    if (this.lease && typeof this.options.runtimeStateProvider === 'function') {
+      const current = this.options.runtimeStateProvider()
+      if (current && current.state !== 'RELEASING_LOCK' &&
+          !TERMINAL_OUTCOMES.includes(current.state)) {
+        // Persist the cancellation selection before waiting on any reserved
+        // scheduler work or process drain. A crash after this point replays the
+        // immutable CANCELLED release instead of resuming ordinary work.
+        await this._runtimeTransition('CANCEL_REQUESTED', 'RELEASING_LOCK', {
+          reasonHash: hashText(String(reason)),
+        })
+      }
+    }
     if (this.scheduler) this.scheduler.dispose(reason)
     await this._drainOwnedProcessesWithOneRetry(reason, 'CANCELLED')
     const postDrainCheckpoint = await this._bestEffortPostDrainCheckpoint(reason)
@@ -9094,18 +12225,63 @@ class CodexSupervisorRuntime {
     if (this.finished) throw new SupervisorIntegrationError('TERMINAL_DUPLICATE', 'runtime already finalized')
     if (this.finalizing && this.finalizationPromise) return this.finalizationPromise
     if (this.finalizing) throw new SupervisorIntegrationError('TERMINAL_FINALIZATION_IN_PROGRESS', 'runtime finalization is already draining')
+    const runtimeOptions = this.options || {}
+    const replayingTerminalIntent = Boolean(this.terminalFinalizationIntent)
     if (this.terminalFinalizationIntent) {
       outcome = this.terminalFinalizationIntent.outcome
       result = this.terminalFinalizationIntent.result
     }
+    let finalizationDeliverables = Array.isArray(result.deliverables) ? result.deliverables : []
+    if (outcome !== 'DONE' && !replayingTerminalIntent) {
+      try {
+        const currentDeliverables = changedDeliverables(
+          runtimeOptions.targetPath,
+          typeof runtimeOptions.gitEnvironment === 'function'
+            ? runtimeOptions.gitEnvironment(runtimeOptions.targetPath) : process.env,
+        )
+        if (currentDeliverables.length > 0) finalizationDeliverables = currentDeliverables
+      } catch (error) {
+        // Preserve the primary terminal result when discovery itself is a
+        // controller/environment defect. Any caller-supplied manifest remains
+        // subject to the finalizer's strict current-file hash verification.
+        if (typeof runtimeOptions.diagnosticSink === 'function') {
+          try {
+            runtimeOptions.diagnosticSink(Object.freeze({
+              label: 'best-available-deliverable-discovery-failed',
+              outcome,
+              error: serializeError(error),
+            }))
+          } catch {}
+        }
+      }
+      if (finalizationDeliverables.length > 0) {
+        result = {
+          ...result,
+          terminalEnvelope: {
+            ...(result.terminalEnvelope || {}),
+            bestAvailableCandidateEvidence: {
+              disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+              deliverableCount: finalizationDeliverables.length,
+              deliverableManifestHash: hashText(stableStringify(finalizationDeliverables)),
+            },
+          },
+        }
+      }
+    }
     if (outcome === 'DONE') {
-      const deliverables = Array.isArray(result.deliverables) ? result.deliverables : []
       const checkHashes = Array.isArray(result.checkHashes) ? result.checkHashes : []
-      if (deliverables.length === 0 && !validReadOnlyFinalResponse(result.finalResponse)) {
+      if (finalizationDeliverables.length === 0 &&
+          !validStructuredFinalResponseCandidate(result.finalResponse)) {
         throw new SupervisorIntegrationError(
           'USER_USABLE_BUILD_REQUIRED',
-          'DONE short-circuits before terminal worker-group checks when no current user-usable deliverable exists',
+          'DONE requires a current user-usable deliverable or an independently accepted durable structured response',
         )
+      }
+      if (finalizationDeliverables.length === 0) {
+        finalizationDeliverables = [{
+          path: result.finalResponse.evidencePointer.path,
+          hash: result.finalResponse.evidencePointer.hash,
+        }]
       }
       if (checkHashes.length === 0 || checkHashes.some(hash => !/^[a-f0-9]{64}$/.test(hash))) {
         throw new SupervisorIntegrationError(
@@ -9114,15 +12290,18 @@ class CodexSupervisorRuntime {
         )
       }
     }
+    result = { ...result, deliverables: finalizationDeliverables }
     if (!this.terminalFinalizationIntent) {
-      this.terminalFinalizationIntent = Object.freeze({ outcome, result })
+      this.terminalFinalizationIntent = immutableTerminalIntent(outcome, result)
+      outcome = this.terminalFinalizationIntent.outcome
+      result = this.terminalFinalizationIntent.result
+      finalizationDeliverables = result.deliverables
     }
     this.finalizing = true
     const attempt = (async () => {
       if (result.processTreeDrained !== true) {
         if (this.scheduler) this.scheduler.dispose('terminal finalization')
-        await this.processOwner.cancelAll({ reason: 'terminal finalization', terminalStatus: outcome })
-        await this.processOwner.assertDrained()
+        await this._drainOwnedProcessesWithOneRetry('terminal finalization', outcome)
       }
       const activeScheduler = this.scheduler
       const schedulerMetrics = activeScheduler ? activeScheduler.getMetrics() : null
@@ -9145,7 +12324,7 @@ class CodexSupervisorRuntime {
           outcome,
           reason: diagnostics.reason,
           unblockPath: diagnostics.unblockPath,
-          deliverables: result.deliverables || [],
+          deliverables: finalizationDeliverables,
           checkHashes: result.checkHashes || [],
           terminalEnvelope: diagnostics.terminalEnvelope,
           expectedEpoch: result.expectedEpoch,
@@ -9185,16 +12364,23 @@ class CodexSupervisorRuntime {
 }
 
 function readRegularJson(filename, label) {
-  const resolved = fs.realpathSync.native(path.resolve(filename))
-  const stat = fs.lstatSync(resolved)
-  if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.nlink) !== 1) {
-    throw new SupervisorIntegrationError('ACTIVATION_RECEIPT_INVALID', `${label} must be one regular non-linked file`)
+  const resolved = path.resolve(filename)
+  let bytes
+  try { bytes = readFileNoFollow(resolved) } catch (error) {
+    throw new SupervisorIntegrationError(
+      'ACTIVATION_RECEIPT_INVALID',
+      `${label} must be one regular non-linked file`,
+      { cause: error.message },
+    )
+  }
+  if (!bytes) {
+    throw new SupervisorIntegrationError('ACTIVATION_RECEIPT_INVALID', `${label} is missing`)
   }
   let parsed
-  try { parsed = JSON.parse(fs.readFileSync(resolved, 'utf8')) } catch (error) {
+  try { parsed = JSON.parse(bytes.toString('utf8')) } catch (error) {
     throw new SupervisorIntegrationError('ACTIVATION_RECEIPT_INVALID', `${label} is invalid JSON`, { cause: error.message })
   }
-  return { parsed, resolved }
+  return { parsed, resolved, bytes }
 }
 
 function appendCanonicalRouteEvent(record, event, raw) {
@@ -9249,6 +12435,20 @@ function replayRequestFromPersistedAssignment(assignment) {
     successChecklist: assignment.successChecklist.map(item => item.description),
     success: assignment.successChecklist.map(item => item.description),
     checks: assignment.checks.map(item => typeof item === 'string' ? item : item.description),
+    ...(assignment.verificationObservationBinding
+      ? {
+          verificationCommandBindings: assignment.verificationObservationBinding.schemaVersion === 3 &&
+            Array.isArray(assignment.verificationObservationBinding.observations)
+            ? assignment.verificationObservationBinding.observations.flatMap(observation =>
+                (observation.exactCommandHashes || []).map(commandHash => ({
+                  checkId: observation.checkId,
+                  commandHash,
+                })))
+            : Array.isArray(assignment.verificationObservationBinding.commandBindings)
+              ? assignment.verificationObservationBinding.commandBindings.map(binding => ({ ...binding }))
+              : [],
+        }
+      : {}),
     findingIds: [...assignment.findingIds],
     ownership: resources,
     manifests: resources,
@@ -9420,7 +12620,7 @@ function validateActivationInputs(args = {}, environment = process.env, adapterP
     throw new SupervisorIntegrationError('ACTIVATION_RECEIPT_INVALID', 'registered supervisor runtime escapes the activation root')
   }
   const metadataRead = readRegularJson(path.join(canonicalRunPath, 'metadata.json'), 'supervisor runtime metadata')
-  const metadataBytes = fs.readFileSync(metadataRead.resolved)
+  const metadataBytes = metadataRead.bytes
   const metadataDigestRead = fs.readFileSync(path.join(canonicalRunPath, 'metadata.sha256'), 'utf8').trim()
   if (crypto.createHash('sha256').update(metadataBytes).digest('hex') !== supervisorRuntime.metadataSha256 ||
       metadataDigestRead !== supervisorRuntime.metadataSha256 ||
@@ -9449,7 +12649,7 @@ function validateActivationInputs(args = {}, environment = process.env, adapterP
     createdAt: supervisorRuntime.createdAt,
   }
   const canonicalBindingBytes = Buffer.from(JSON.stringify(canonicalRuntimeBinding), 'utf8')
-  const runtimeReceiptBytes = fs.readFileSync(runtimeReceiptRead.resolved)
+  const runtimeReceiptBytes = runtimeReceiptRead.bytes
   const runtimeReceipt = runtimeReceiptRead.parsed
   if (!receiptRelative || path.isAbsolute(receiptRelative) || receiptRelative === '..' ||
       receiptRelative.startsWith(`..${path.sep}`) ||
@@ -9496,7 +12696,7 @@ function validateActivationInputs(args = {}, environment = process.env, adapterP
   const proofBinding = boundary.enforcementProof || {}
   if (fs.realpathSync.native(path.resolve(proofBinding.path || '')) !== proofRead.resolved ||
       fs.realpathSync.native(path.resolve(proofBinding.profilePath || '')) !== canonicalProfile ||
-      proofBinding.sha256 !== crypto.createHash('sha256').update(fs.readFileSync(proofRead.resolved)).digest('hex') ||
+      proofBinding.sha256 !== crypto.createHash('sha256').update(proofRead.bytes).digest('hex') ||
       proofBinding.profileSha256 !== crypto.createHash('sha256').update(fs.readFileSync(canonicalProfile)).digest('hex') ||
       fs.realpathSync.native(path.resolve(proofBinding.checkerProfilePath || '')) !== canonicalCheckerProfile ||
       proofBinding.checkerProfileSha256 !== crypto.createHash('sha256').update(fs.readFileSync(canonicalCheckerProfile)).digest('hex') ||
@@ -9512,7 +12712,7 @@ function validateActivationInputs(args = {}, environment = process.env, adapterP
     throw new SupervisorIntegrationError('ACTIVATION_RECEIPT_INVALID', 'supervisor adapter does not match the activation receipt')
   }
   const manifestRead = readRegularJson(path.join(activationRoot, 'activation-payload.json'), 'activation payload manifest')
-  const manifestBytes = fs.readFileSync(manifestRead.resolved)
+  const manifestBytes = manifestRead.bytes
   if (boundary.payloadManifest && fs.realpathSync.native(path.resolve(boundary.payloadManifest)) !== manifestRead.resolved ||
       boundary.payloadManifestSha256 !== crypto.createHash('sha256').update(manifestBytes).digest('hex')) {
     throw new SupervisorIntegrationError('ACTIVATION_RECEIPT_INVALID', 'activation payload manifest binding drifted')
@@ -9563,7 +12763,7 @@ function validateActivationInputs(args = {}, environment = process.env, adapterP
     const registryRelative = path.relative(activationRoot, registryRead.resolved)
     if (!registryRelative || path.isAbsolute(registryRelative) || registryRelative === '..' ||
         registryRelative.startsWith(`..${path.sep}`) ||
-        crypto.createHash('sha256').update(fs.readFileSync(registryRead.resolved)).digest('hex') !== registryBinding.sha256 ||
+        crypto.createHash('sha256').update(registryRead.bytes).digest('hex') !== registryBinding.sha256 ||
         !registryRead.parsed || typeof registryRead.parsed !== 'object' || Array.isArray(registryRead.parsed)) {
       throw new SupervisorIntegrationError('MODEL_REGISTRY_REQUIRED', 'automatic model registry bytes are invalid or foreign')
     }
@@ -9735,36 +12935,36 @@ function activationRuntimeSettings(activation, context = {}) {
   }
 }
 
-function readPrivateAgentAssignment(activation, providerRole, logicalRole, environment = process.env) {
+function readPrivateAgentAssignment(activation, providerRole, logicalRole) {
   if (activation.modelSelection.mode === 'provider-default') {
     const effort = selectEffort({ role: logicalRole || providerRole.replace(/^ap-/, '') })
-    return applyBenchmarkEffortPin(Object.freeze({
+    return Object.freeze({
       model: null,
       effort: effort.effort,
       source: 'role-effort-policy',
       registryMatched: false,
       routeIndependent: true,
-    }), environment)
+    })
   }
   if (providerRole === 'ap-run-owner') {
     if (activation.modelSelection.mode === 'explicit') {
       const policyEffort = selectEffort({ role: logicalRole || 'run-owner' }).effort
-      return applyBenchmarkEffortPin(Object.freeze({
+      return Object.freeze({
         model: activation.modelSelection.models[0],
         effort: typeof activation.modelSelection.effort === 'string'
           ? activation.modelSelection.effort
           : policyEffort,
         source: 'explicit',
         registryMatched: false,
-      }), environment)
+      })
     }
-    return applyBenchmarkEffortPin(Object.freeze(selectModelAssignment({
+    return Object.freeze(selectModelAssignment({
       role: logicalRole || 'run-owner',
       difficulty: 'hard',
       risk: 'high',
       registry: activation.modelRegistry || [],
       requiredCapabilities: ['contextFreeDispatch'],
-    })), environment)
+    }))
   }
   const profileSource = fs.readFileSync(activation.profilePath, 'utf8')
   const physicalProviderRole = activation.roleProjection?.logicalToPhysicalProviderRole?.[providerRole]
@@ -9807,10 +13007,10 @@ function readPrivateAgentAssignment(activation, providerRole, logicalRole, envir
       !['low', 'medium', 'high', 'xhigh', 'max'].includes(effort[1])) {
     throw new SupervisorIntegrationError('MODEL_ASSIGNMENT_INVALID', `private Codex role assignment is not receipt-compatible: ${providerRole}`)
   }
-  return applyBenchmarkEffortPin(Object.freeze({
+  return Object.freeze({
     model: model[1], effort: effort[1], source: activation.modelSelection.mode,
     registryMatched: activation.modelSelection.mode === 'auto',
-  }), environment)
+  })
 }
 
 function runGit(repository, argv, options = {}) {
@@ -9970,6 +13170,35 @@ function changedDeliverables(repository, environment) {
     }
   }
   return names.sort((left, right) => left.path.localeCompare(right.path))
+}
+
+function usableDeliverablesProducedByWorker(result, repository, environment, admission = null) {
+  if (!result || !Array.isArray(result.filesChanged) || result.filesChanged.length === 0 || !admission) return []
+  const root = path.resolve(repository)
+  const reported = new Set(result.filesChanged.map(name => String(name).replace(/\\/gu, '/')))
+  let admittedFiles
+  if (Array.isArray(admission.files)) {
+    admittedFiles = admission.files
+  } else if (Array.isArray(admission.actualFilesChanged) && Array.isArray(admission.after)) {
+    const after = new Map(admission.after.map(item => [item.path, item]))
+    admittedFiles = admission.actualFilesChanged.map(relative => ({
+      relative,
+      hash: after.get(relative) && after.get(relative).hash || null,
+    }))
+  } else return []
+  const admitted = new Map(admittedFiles.map(item => [
+    String(item.relative || '').replace(/\\/gu, '/'),
+    item.hash || null,
+  ]))
+  if (admitted.size === 0) return []
+  // A worker's self-assessment is not an independent product verdict. Only
+  // physical current deliverables that the isolated mutation admission bound
+  // to this exact result can override it; unrelated dirty target bytes cannot.
+  return changedDeliverables(repository, environment).filter(deliverable => {
+    const relative = path.relative(root, deliverable.path).replace(/\\/gu, '/')
+    return relative && !relative.startsWith('../') && reported.has(relative) &&
+      admitted.has(relative) && admitted.get(relative) === deliverable.hash
+  })
 }
 
 const ASSIGNMENT_RESOURCE_KINDS = new Set([
@@ -10199,10 +13428,10 @@ function canonicalAssignmentResources(input) {
     if (canonicalRelative !== null) {
       assertNoLinkedPathPrefix(canonicalTargetRoot, canonicalAbsolute, prosePath)
     }
-    // Natural prose can contain slash-separated terms such as
-    // `JavaScript/XSS`. Treat a missing bare term as prose unless it is bound
-    // by the resource manifest. Explicit absolute/dot-relative paths remain
-    // fail-closed, as do every existing symlink and declared resource.
+    // Natural prose can contain slash-separated domain terms. Treat a missing
+    // bare term as prose unless it is bound by the resource manifest. Explicit
+    // absolute/dot-relative paths remain fail-closed, as do every existing
+    // symlink and declared resource.
     if (!fs.existsSync(absolute) && !authorizedCreation && !declaredFutureReference) {
       if (!explicitPathSyntax && !boundResource) continue
       throw new SupervisorIntegrationError(
@@ -10291,19 +13520,106 @@ function checkerAssignmentResources(sandboxAssignment, workItemId) {
   })
 }
 
-function exactFindingIds(...values) {
+function explicitFindingIds(...values) {
   const ids = new Set()
-  for (const value of values) {
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        if (/^AP-[A-Z]+-[0-9]{3}$/u.test(String(item))) ids.add(String(item))
-      }
-      continue
+  const append = value => {
+    if (!Array.isArray(value)) return
+    for (const item of value) {
+      if (typeof item === 'string' && item.trim()) ids.add(item.trim())
     }
-    const source = typeof value === 'string' ? value : stableStringify(value || null)
-    for (const match of source.matchAll(/AP-[A-Z]+-[0-9]{3}/gu)) ids.add(match[0])
+  }
+  for (const value of values) {
+    if (Array.isArray(value)) append(value)
+    else if (value && typeof value === 'object') {
+      append(value.findingIds)
+      append(value.finding_ids)
+    }
   }
   return [...ids].sort()
+}
+
+function canonicalAssignmentFindingOrdinal(request = {}) {
+  const workItemId = typeof request.workItemId === 'string' ? request.workItemId : ''
+  const logicalRole = typeof request.logicalRole === 'string' ? request.logicalRole : ''
+  if (workItemId === 'route-analyst' && logicalRole === 'route-analyst') return 1
+  if (workItemId === 'root-route-decision' && logicalRole === 'run-owner') return 2
+  if (workItemId === 'conditional-depth-prober' && logicalRole === 'diagnostic-probe') return 10
+  if (workItemId === 'fixture-prebuild-validation' && logicalRole === 'independent-tester') return 11
+
+  if (logicalRole === 'worker') {
+    const worker = /^work-(\d+)$/u.exec(workItemId)
+    if (worker) {
+      const ordinal = Number(worker[1])
+      if (ordinal >= 1 && ordinal <= 99) return 100 + ordinal
+    }
+    const transportRetry = /^work-(\d+)-transport-retry-1$/u.exec(workItemId)
+    if (transportRetry) {
+      const ordinal = Number(transportRetry[1])
+      if (ordinal >= 1 && ordinal <= 99) return 200 + ordinal
+    }
+    const repair = /^work-(\d+)-repair-(\d+)$/u.exec(workItemId)
+    if (repair) {
+      const ordinal = Number(repair[1])
+      const attempt = Number(repair[2])
+      if (ordinal >= 1 && ordinal <= 9 && attempt >= 1 && attempt <= 9) {
+        return 300 + ((attempt - 1) * 10) + ordinal
+      }
+    }
+  }
+
+  if (['independent-reviewer', 'independent-tester'].includes(logicalRole)) {
+    const checker = /^independent-check-(\d+)(?:-repair-(\d+))?(?:-runtime-retry-(\d+))?$/u
+      .exec(workItemId)
+    if (checker) {
+      const seat = Number(checker[1])
+      const repairAttempt = checker[2] === undefined ? null : Number(checker[2])
+      const reportCorrection = checker[3] === undefined ? null : Number(checker[3])
+      if (seat >= 1 && seat <= 9) {
+        if (repairAttempt === null && reportCorrection === null) return 400 + seat
+        if (repairAttempt === null && reportCorrection >= 1 && reportCorrection <= 2) {
+          return 420 + ((reportCorrection - 1) * 10) + seat
+        }
+        if (repairAttempt >= 1 && repairAttempt <= 2 && reportCorrection === null) {
+          return 440 + ((repairAttempt - 1) * 10) + seat
+        }
+        if (repairAttempt >= 1 && repairAttempt <= 2 && reportCorrection === 1) {
+          return 460 + ((repairAttempt - 1) * 10) + seat
+        }
+      }
+    }
+  }
+  return null
+}
+
+function assignmentLocalFindingId(request = {}, binding = {}, registry = null) {
+  const assignmentIdentity = {
+    schemaVersion: 1,
+    workItemId: typeof request.workItemId === 'string' ? request.workItemId : null,
+    logicalRole: typeof request.logicalRole === 'string' ? request.logicalRole : null,
+    parent: typeof request.parent === 'string' ? request.parent : null,
+    requestEnvelopeHash: binding.requestEnvelopeHash || null,
+    assignment: request.assignment ?? null,
+    successChecklist: request.successChecklist ?? request.success_checklist ?? request.success ?? null,
+    ownership: request.ownership ?? null,
+    checks: request.checks ?? null,
+  }
+  const digest = hashText(stableStringify(assignmentIdentity))
+  const typedOrdinal = canonicalAssignmentFindingOrdinal(request)
+  const ordinal = typedOrdinal === null
+    ? 800 + (Number.parseInt(digest.slice(0, 12), 16) % 200)
+    : typedOrdinal
+  const findingId = `AP-WORK-${String(ordinal).padStart(3, '0')}`
+  if (registry instanceof Map) {
+    const priorIdentity = registry.get(findingId)
+    if (priorIdentity && priorIdentity !== digest) {
+      throw new SupervisorIntegrationError(
+        'ASSIGNMENT_FINDING_ID_COLLISION',
+        `assignment-local finding id ${findingId} is already bound to another exact assignment`,
+      )
+    }
+    registry.set(findingId, digest)
+  }
+  return findingId
 }
 
 function canonicalEvidenceBinding(input) {
@@ -10369,43 +13685,6 @@ function workspaceFileSnapshot(repository, environment) {
     snapshot.set(name, sha256Bytes(fs.readFileSync(absolute)))
   }
   return snapshot
-}
-
-function admitActualWorkerMutation(input) {
-  const after = workspaceFileSnapshot(input.repository, input.environment)
-  const names = [...new Set([...input.before.keys(), ...after.keys()])].sort()
-  const actual = names.filter(name => input.before.get(name) !== after.get(name))
-  const writable = input.assignment.resources.filter(resource => resource.access !== 'read')
-  const owns = name => {
-    const absolute = path.resolve(input.repository, ...name.split('/'))
-    return writable.some(resource => {
-      const owned = resolveOwnedResourcePath(input.repository, resource)
-      return owned && (resource.kind === 'directory'
-        ? absolute === owned || absolute.startsWith(`${owned}${path.sep}`)
-        : absolute === owned)
-    })
-  }
-  const outside = actual.filter(name => !owns(name))
-  if (outside.length) {
-    throw new SupervisorIntegrationError(
-      'OWNERSHIP_SCOPE_VIOLATION',
-      'worker changed physical files outside its admitted ownership',
-      { outside, admitted: writable.map(resource => `${resource.kind}:${resource.identity}`) },
-    )
-  }
-  const reported = Array.isArray(input.result && input.result.filesChanged)
-    ? [...new Set(input.result.filesChanged.map(name => String(name).replace(/\\/g, '/')))].sort() : []
-  if (JSON.stringify(reported) !== JSON.stringify(actual)) {
-    throw new SupervisorIntegrationError(
-      'MUTATION_REPORT_MISMATCH',
-      'worker file report does not match the observed workspace mutation',
-      { reported, actual },
-    )
-  }
-  return Object.freeze({
-    actualFilesChanged: Object.freeze(actual),
-    postimages: Object.freeze(writable.map(resource => resourceStateEntry(input.repository, resource)).filter(Boolean)),
-  })
 }
 
 function assertRealTargetUnchanged(before, repository, environment) {
@@ -10509,12 +13788,24 @@ async function launchCodexChildWithCheckerReassessment(codexAdapter, launch, run
   return validateCanonicalChildResult(launch, result, runId, launch.dispatch.requestPointer.hash)
 }
 
-function representativePolicyProbePassed(result) {
-  return Boolean(result && result.allAssignedItemsPass === true &&
-    Array.isArray(result.successItems) && result.successItems.length > 0 &&
-    result.successItems.every(item => item && item.status === 'pass') &&
-    Array.isArray(result.commands) &&
-    result.commands.some(command => command && Number(command.exitCode) === 0))
+function representativePolicyControllerAttestation(input = {}) {
+  const body = Object.freeze({
+    schemaVersion: 1,
+    kind: 'representative-policy-controller-attestation',
+    controllerIdentity: 'deterministic-control-plane',
+    runId: input.runId,
+    activationId: input.activationId,
+    generation: input.generation,
+    workItemId: input.workItemId,
+    logicalRole: input.logicalRole,
+    physicalRole: input.physicalRole,
+    providerRole: input.providerRole,
+    requestEnvelopeHash: input.requestEnvelopeHash,
+    route: input.route,
+    claims: Object.freeze(['ROLE_SELECTION_ADMITTED', 'PROVIDER_ROLE_BOUND']),
+    policyBindingHash: hashText(stableStringify(input.executionPolicy || null)),
+  })
+  return Object.freeze({ ...body, receiptHash: hashText(stableStringify(body)) })
 }
 
 async function emitItemVerifiedTransition(transition, item) {
@@ -10562,9 +13853,7 @@ function canonicalRoleAssignment(input) {
     logicalRoleId: input.logicalRole,
     physicalRoleId: input.physicalRole,
     requestEnvelopeHash: input.requestEnvelopeHash,
-    findingIds: exactFindingIds(input.request.findingIds, input.request.finding_ids,
-      input.request.assignment, input.request.successChecklist, input.request.success,
-      input.request.checks, input.mission),
+    findingIds: explicitFindingIds(input.request.findingIds, input.request.finding_ids),
     requestedResult: assignmentCore.requestedResult,
     planReference: {
       planPath, sectionId: input.request.workItemId, sectionHash,
@@ -10578,10 +13867,25 @@ function canonicalRoleAssignment(input) {
     resultLocation: `work/results/${hashText(input.request.workItemId)}.json`,
     assignedAt: new Date(input.now()).toISOString(),
   }
+  if (CHECKER_ROLES.has(input.logicalRole) && /^[a-f0-9]{64}$/u.test(input.request.candidateHash || '')) {
+    const structuredFinalResponse = input.request.fetchedEvidence &&
+      input.request.fetchedEvidence.structuredFinalResponse
+    const noFileStructuredResponse = Boolean(structuredFinalResponse &&
+      /^[a-f0-9]{64}$/u.test(structuredFinalResponse.responseHash || '') &&
+      !structuredFinalResponse.evidencePointer)
+    assignment.verificationObservationBinding = createCheckerObservationBinding({
+      assignmentId: assignment.assignmentId,
+      candidateHash: input.request.candidateHash,
+      requestEnvelopeHash: assignment.requestEnvelopeHash,
+      checkIds: assignment.checks,
+      commandBindings: input.request.verificationCommandBindings,
+      observationRequired: !noFileStructuredResponse,
+    })
+  }
   if (assignment.findingIds.length === 0) {
-    // The durable assignment contract itself is the exact finding enforced
-    // when the request has no external AP finding identifier.
-    assignment.findingIds = ['AP-DESIGN-023']
+    assignment.findingIds = [assignmentLocalFindingId(input.request, {
+      requestEnvelopeHash: input.requestEnvelopeHash,
+    })]
   }
   if (input.logicalRole === 'ap-work-group-manager') {
     const admission = input.request.workGroupAdmission
@@ -10627,6 +13931,44 @@ function roadmapAuthorArtifact(result, scoutCorrections = []) {
     ...result,
     behaviorChanged: Object.freeze(steps),
     scoutCorrections: Object.freeze(scoutCorrections.map(item => Object.freeze({ ...item }))),
+  })
+}
+
+function deterministicRoadmapProjectionResult(decision) {
+  const topology = decision && decision.topology
+  if (!decision || decision.route !== 'ROADMAP' ||
+      !topology || topology.valid !== true || topology.route !== 'ROADMAP' ||
+      !topology.counts || !Number.isSafeInteger(topology.counts.workers) ||
+      topology.counts.workers < 1) {
+    throw new SupervisorIntegrationError(
+      'ROUTE_TOPOLOGY_INVALID',
+      'deterministic ROADMAP projection requires an accepted schema-valid ROADMAP decision',
+    )
+  }
+  const responsibilities = Array.isArray(decision.workerResponsibilities) &&
+      decision.workerResponsibilities.length === topology.counts.workers
+    ? decision.workerResponsibilities
+    : Array.from({ length: topology.counts.workers }, () => decision.requestedResult)
+  const orderedWork = responsibilities.map((responsibility, index) =>
+    `worker-${index + 1}: ${String(responsibility).trim()}`).join(' | ')
+  return Object.freeze({
+    schemaVersion: '2.0.0',
+    reportType: 'deterministic-plan-projection',
+    reportId: DETERMINISTIC_ROADMAP_EXECUTION_MODE,
+    executionMode: DETERMINISTIC_ROADMAP_EXECUTION_MODE,
+    behaviorChanged: Object.freeze([
+      `Execute the accepted dependency and ownership order directly from run-owner: ${orderedWork}`,
+    ]),
+    successItems: Object.freeze([Object.freeze({
+      id: DETERMINISTIC_ROADMAP_EXECUTION_MODE,
+      status: 'pass',
+      evidenceIds: Object.freeze([hashText(stableStringify({
+        routeDecisionHash: hashText(stableStringify(decision)),
+        workers: topology.counts.workers,
+        checkers: topology.counts.finalCheckers,
+      }))]),
+    })]),
+    scoutCorrections: Object.freeze([]),
   })
 }
 
@@ -10839,6 +14181,13 @@ function writeRouteDecisionArtifacts(record, decision) {
 
 function renderPlanArtifact(route, decision, authorResult = null) {
   const checking = validateLiveCheckingPlan(decision)
+  const ownership = route === 'ROADMAP'
+    ? executionMutableResourceOwnership(
+        decision,
+        route,
+        Math.max(1, Number(decision.usefulWorkerCount || 1)),
+      )
+    : decision.mutableResourceOwnership || []
   const lines = [
     `# ${route === 'ROADMAP' ? 'ROADMAP' : route === 'LIGHT' ? 'Light Plan' : 'Success Card'}`,
     '',
@@ -10854,7 +14203,7 @@ function renderPlanArtifact(route, decision, authorResult = null) {
     ...markdownVerificationObligations(decision.verificationObligations),
     '',
     '## Ownership',
-    ...(decision.mutableResourceOwnership || []).map(item =>
+    ...ownership.map(item =>
       `- ${item.owner}: ${item.kind}:${item.identity} (${item.ownershipMode})`),
     '',
     '## Risks to falsify',
@@ -10863,7 +14212,7 @@ function renderPlanArtifact(route, decision, authorResult = null) {
     '## Information to resolve before editing',
     ...markdownDecisionList(decision.missingInformation),
     '',
-    'For every item above, derive an observable positive, negative, and boundary witness from the request or an independent source. Do not validate the implementation with a second copy of its own assumptions.',
+    'Execute every explicitly typed case above and derive the strongest applicable counterexamples from the request or an independent source. Do not invent undeclared categories or validate the implementation with a second copy of its own assumptions.',
     '',
     '## Independent verification',
     ...checking.responsibilities.map((item, index) => `- Seat ${index + 1}: ${item}`),
@@ -10888,11 +14237,6 @@ function renderPlanArtifact(route, decision, authorResult = null) {
   return `${lines.join('\n')}\n`
 }
 
-function readOnlyRequestedEffect(decision) {
-  const effect = decision && decision.normalizedRouteFacts && decision.normalizedRouteFacts.requestedEffect
-  return ['inspect', 'report', 'research', 'decide'].includes(effect)
-}
-
 function deterministicChecksForDecision(decision, route) {
   const recipe = selectWorkRecipe({
     ...(decision.gateSelection || {}),
@@ -10907,7 +14251,7 @@ function deterministicChecksForDecision(decision, route) {
   ])]
 }
 
-function createReadOnlyFinalResponse(decision, workResults) {
+function createStructuredFinalResponseCandidate(decision, workResults) {
   const results = workResults.map(({ workItemId, result }) => {
     const validSuccessItems = Array.isArray(result && result.successItems) && result.successItems.length > 0 &&
       result.successItems.every(item => item && typeof item === 'object' && typeof item.id === 'string' && item.id &&
@@ -10920,8 +14264,8 @@ function createReadOnlyFinalResponse(decision, workResults) {
         result.filesChanged.length !== 0 || !validSuccessItems || !validNarrative ||
         !Array.isArray(result.remainingConcerns)) {
       throw new SupervisorIntegrationError(
-        'READ_ONLY_RESULT_INVALID',
-        `read-only work item ${workItemId} lacks a validated structured final response`,
+        'STRUCTURED_FINAL_RESPONSE_INVALID',
+        `zero-diff work item ${workItemId} lacks a validated structured final response`,
       )
     }
     return Object.freeze({
@@ -10942,16 +14286,49 @@ function createReadOnlyFinalResponse(decision, workResults) {
   return Object.freeze({ ...body, responseHash: hashText(stableStringify(body)) })
 }
 
-function validReadOnlyFinalResponse(response) {
+function validateStructuredFinalResponsePointer(pointer) {
+  try {
+    if (!pointer || pointer.name !== 'structured-final-response' ||
+        typeof pointer.path !== 'string' || !path.isAbsolute(pointer.path) ||
+        !/^[a-f0-9]{64}$/u.test(pointer.hash || '') ||
+        !Number.isSafeInteger(pointer.bytes) || pointer.bytes < 1) {
+      throw new Error('structured final-response pointer is malformed')
+    }
+    const pointerPath = path.resolve(pointer.path)
+    const stat = fs.lstatSync(pointerPath)
+    if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.nlink) !== 1 ||
+        stat.size !== pointer.bytes || sha256Bytes(fs.readFileSync(pointerPath)) !== pointer.hash) {
+      throw new Error('structured final-response pointer does not bind one exact regular file')
+    }
+    return Object.freeze({ ...pointer, path: pointerPath })
+  } catch (error) {
+    throw new SupervisorIntegrationError(
+      'STRUCTURED_FINAL_RESPONSE_INVALID',
+      'zero-diff completion requires one exact immutable structured final-response pointer',
+      { cause: error && (error.code || error.message) || 'unknown' },
+    )
+  }
+}
+
+function validStructuredFinalResponseCandidate(response) {
   if (!response || typeof response !== 'object' ||
-      !['read-only-findings', 'decision-record'].includes(response.resultFormat) ||
+      !['read-only-findings', 'decision-record', 'changed-files', 'new-build', 'external-receipt']
+        .includes(response.resultFormat) ||
       typeof response.requestedResult !== 'string' || !response.requestedResult ||
       !Array.isArray(response.results) || response.results.length === 0 ||
       response.results.some(result => !result || typeof result.workItemId !== 'string' ||
         !/^[a-f0-9]{64}$/.test(result.resultHash || '') || !Array.isArray(result.successItems) ||
         result.successItems.length === 0 || !Array.isArray(result.findings) || result.findings.length === 0)) return false
-  const { responseHash, ...body } = response
-  return /^[a-f0-9]{64}$/.test(responseHash || '') && responseHash === hashText(stableStringify(body))
+  const { responseHash, evidencePointer, ...body } = response
+  if (!/^[a-f0-9]{64}$/.test(responseHash || '') ||
+      responseHash !== hashText(stableStringify(body))) return false
+  try {
+    const pointer = validateStructuredFinalResponsePointer(evidencePointer)
+    const persisted = readRegularJson(pointer.path, 'structured final-response version being checked').parsed
+    return stableStringify(persisted) === stableStringify({ ...body, responseHash })
+  } catch {
+    return false
+  }
 }
 
 function validateDurableResultEvidencePointer(pointer, expectedName) {
@@ -11068,8 +14445,6 @@ function createDefaultRouteExecutor(options) {
     resumeState,
   }) => {
     if (typeof options.verifyL1RequestPointer === 'function') options.verifyL1RequestPointer()
-    const roadmapPlanningStartedAt = route === 'ROADMAP' && typeof options.monotonicNow === 'function'
-      ? options.monotonicNow() : null
     if (!decision.gateSelection || typeof decision.gateSelection !== 'object') {
       throw new SupervisorIntegrationError(
         'GATE_SELECTION_REQUIRED',
@@ -11132,7 +14507,7 @@ function createDefaultRouteExecutor(options) {
     if (!verificationObligations) {
       throw new SupervisorIntegrationError(
         'VERIFICATION_OBLIGATIONS_INVALID',
-        'execution requires typed positive, negative, and boundary acceptance obligations',
+        'execution requires canonical explicitly typed acceptance obligations',
       )
     }
     const typedWorkEvidence = (base = null) => withDescriptiveLikelyAreas({
@@ -11143,18 +14518,54 @@ function createDefaultRouteExecutor(options) {
     const boundedToolOutputDiscipline =
       ' Keep model-visible command output bounded: redirect large stdout/stderr to a scratch file, then inspect a hash, count, or targeted preview of at most 4 KiB. Never use line-oriented head, tail, sed, or unrestricted recursive search on potentially monolithic generated artifacts or private run-record/transcript trees. Reuse one focused executable validation harness instead of repeatedly dumping source, artifacts, or logs.'
     const workerCount = Math.max(1, Number(decision.usefulWorkerCount || 1))
-    const initialWorkFrontier = route === 'ROADMAP'
-      ? ['roadmap-author']
-      : Array.from({ length: workerCount }, (_, index) => `work-${index + 1}`)
+    const legacyRoadmapWorkId = /^(?:roadmap-(?:author|scout|plan-|work-group)|mission-coordination)/u
+    const resumeRoadmapIds = resumeState ? [
+      ...(resumeState.completedWorkIds || []),
+      ...(resumeState.completedCheckIds || []),
+      ...(resumeState.nextReadyWorkIds || []),
+      ...((resumeState.adoptedRecords || []).map(record => record && record.workItemId).filter(Boolean)),
+    ] : []
+    const legacyRoadmapRecovery = route === 'ROADMAP' && Boolean(resumeState) &&
+      resumeRoadmapIds.some(id => legacyRoadmapWorkId.test(String(id).replace(/^reconcile:/u, '')))
+    // Shared decisions remain provider-neutral. Fresh Codex ROADMAP work uses
+    // the deterministic controller projection; only authenticated historical
+    // checkpoints containing old planning IDs enter compatibility recovery.
+    const deterministicRoadmap = route === 'ROADMAP' && !legacyRoadmapRecovery
+    const collapseLegacyRoadmapPlanning = legacyRoadmapRecovery
+    const directWorkerFrontier = Array.from(
+      { length: workerCount }, (_, index) => `work-${index + 1}`,
+    )
+    const initialWorkFrontier = directWorkerFrontier
+    const roadmapProductFrontier = directWorkerFrontier
+    const legacyRoadmapProductFrontier = workerCount === 1
+      ? ['work-1'] : ['mission-coordination']
     const executionOwnership = executionMutableResourceOwnership(decision, route, workerCount)
     const launchChecker = async request => {
       try {
-        return canonicalizeCheckerVerificationLimitation(await launch(request))
+        return canonicalizeCheckerTerminalResult(await launch(request))
       } catch (error) {
-        if (!CHECKER_LAUNCH_REASSESSMENT_CODES.has(error && error.code)) throw error
-        return checkerLaunchRuntimeFailure(request, decision, options.runId, error)
+        if (error && error.code === 'CANCELLED') throw error
+        // Only provider/transport availability faults are checker limitations.
+        // Scheduler, recovery, accounting, mutation, and integrity failures
+        // remain control-plane failures and must retain their original code.
+        const recoverableCheckerLaunchCodes = new Set([
+          'CHECKER_SNAPSHOT_UNAVAILABLE',
+          'CHECKER_SCRATCH_UNAVAILABLE',
+          'DEPENDENCY_UNAVAILABLE',
+        ])
+        if (!recoverableCheckerLaunchCodes.has(error && error.code)) throw error
+        const failure = checkerLaunchRuntimeFailure(request, decision, options.runId, error)
+        if (typeof options.persistControllerCheckerResult === 'function') {
+          await options.persistControllerCheckerResult(request, failure)
+        }
+        return failure
       }
     }
+    // Production provider failures are converted at the real scheduler lease
+    // boundary. This executor must never fabricate a lease-free result after
+    // _launchThroughScheduler has already cleaned up the physical launch.
+    const launchTaskRole = request => launch(request)
+    const launchWorker = launchTaskRole
     // likelyAreas is descriptive routing prose, not resource authority. Only
     // the typed mutable ownership contract may become a child filesystem
     // identity; absent that contract, use the explicit workspace sentinel.
@@ -11209,6 +14620,13 @@ function createDefaultRouteExecutor(options) {
       schemaVersion: 1,
       route,
       requestEnvelopeHash: decision.requestEnvelopeHash,
+      routeDecisionHash: hashText(stableStringify(decision)),
+      targetStateHash: capturedDomainAdmission.contracts.length > 0
+        ? hashWorkspaceCandidate(
+            options.targetPath,
+            typeof options.gitEnvironment === 'function' ? options.gitEnvironment() : process.env,
+          )
+        : null,
       admittedBeforeWork: true,
       contracts: capturedDomainAdmission.contracts,
     }
@@ -11218,6 +14636,7 @@ function createDefaultRouteExecutor(options) {
           admissionHash: hashText(JSON.stringify(admissionBody)),
         })
       : null
+    let capturedDomainPreWorkReceipt = null
     if (capturedDomainPreWork) {
       if (typeof options.writeCapturedDomainAdmission !== 'function') {
         throw new SupervisorIntegrationError(
@@ -11225,7 +14644,7 @@ function createDefaultRouteExecutor(options) {
           'captured-domain admission must be durable before any role launch',
         )
       }
-      options.writeCapturedDomainAdmission(capturedDomainPreWork)
+      capturedDomainPreWorkReceipt = options.writeCapturedDomainAdmission(capturedDomainPreWork)
     }
     const hiddenExternalBoundary = capturedDomainContracts.find(contract =>
       contract.kind === 'HIDDEN_EXTERNAL_ORACLE')
@@ -11233,6 +14652,11 @@ function createDefaultRouteExecutor(options) {
       contract.kind === 'DONE_RETRY_PROMOTION')
     const fixtureProvenanceBoundary = capturedDomainContracts.find(contract =>
       contract.kind === 'FIXTURE_PROVENANCE')
+    const imageDatumPreWorkOutcomes = capturedDomainContracts
+      .filter(contract => contract && contract.kind === 'IMAGE_DATUM')
+      .map(contract => imageDatumOutcomeFromPreWorkAdmission(
+        contract, capturedDomainPreWork, capturedDomainPreWorkReceipt,
+      ))
     if (doneRetryBoundary && workerCount !== 1) {
       throw new SupervisorIntegrationError(
         'DONE_RETRY_ISOLATION_REQUIRED',
@@ -11250,7 +14674,7 @@ function createDefaultRouteExecutor(options) {
     if (fixtureProvenanceBoundary) {
       const prebuildCandidateHash = hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
       const oracle = 'fixture-provenance-prebuild-validation'
-      const validationResult = durableCompletedGateResult('fixture-prebuild-validation') || await launch({
+      const validationResult = durableCompletedGateResult('fixture-prebuild-validation') || await launchChecker({
         workItemId: 'fixture-prebuild-validation', logicalRole: 'independent-tester', parent: 'run-owner',
         purpose: 'verification',
         assignment: 'Execute the authoritative fixture-provenance and mutation-replay validation. Return its bound FIXTURE_PROVENANCE outcome; do not build or write the target.',
@@ -11274,18 +14698,28 @@ function createDefaultRouteExecutor(options) {
         fixturePrebuildOutcome ? [fixturePrebuildOutcome] : [],
       )
       if (!validationResult || validationResult.code !== 'PASS' || !validation.valid) {
-        throw new SupervisorIntegrationError(
-          'CAPTURED_DOMAIN_PREBUILD_VALIDATION_REQUIRED',
-          'an executable, contract-bound fixture validation must PASS before any build or write launch',
-          { errors: validation.errors },
-        )
+        // Pre-build validation describes risk in the starting state; it is not
+        // product authority over work that has not run yet. Persist a bounded
+        // exact-result limitation for the worker and require the final checker
+        // to establish the FIXTURE_PROVENANCE contract on the built candidate.
+        fixturePrebuildOutcome = null
+        fixturePrebuildEvidence = Object.freeze({
+          workItemId: 'fixture-prebuild-validation',
+          validationHash: fixtureProvenanceBoundary.executablePrebuildValidationHash,
+          status: 'UNRESOLVED_PREBUILD_EVIDENCE',
+          executionResultHash: hashText(stableStringify(validationResult || null)),
+          validationErrors: Object.freeze((validation.errors || []).map(String).slice(0, 32)),
+          controllerDisposition: 'CONTINUE_TO_DIRECT_IMPLEMENTATION_AND_FINAL_CHECK',
+        })
+      } else {
+        fixturePrebuildEvidence = Object.freeze({
+          workItemId: 'fixture-prebuild-validation',
+          validationHash: fixtureProvenanceBoundary.executablePrebuildValidationHash,
+          status: 'PASS',
+          outcomeHash: validation.results[0].outcomeHash,
+          executionResultHash: hashText(JSON.stringify(validationResult)),
+        })
       }
-      fixturePrebuildEvidence = Object.freeze({
-        workItemId: 'fixture-prebuild-validation',
-        validationHash: fixtureProvenanceBoundary.executablePrebuildValidationHash,
-        outcomeHash: validation.results[0].outcomeHash,
-        executionResultHash: hashText(JSON.stringify(validationResult)),
-      })
     }
     const capturedDomainWorkEvidence = capturedDomainPreWork
       ? Object.freeze({
@@ -11293,15 +14727,45 @@ function createDefaultRouteExecutor(options) {
           ...(fixturePrebuildEvidence ? { fixturePrebuildValidation: fixturePrebuildEvidence } : {}),
         })
       : null
-    let depthGateOutcome = await executePreProductionRuntimeGates({
-      recipe, launch, ownership: admittedReadOwnership,
-      fetchedEvidence: withDescriptiveLikelyAreas(null),
-      durableResult: recipe.runtimeGatePlan && recipe.runtimeGatePlan.triggers &&
-          recipe.runtimeGatePlan.triggers.depthProber &&
-          recipe.runtimeGatePlan.triggers.depthProber.required === true
-        ? durableCompletedGateResult('conditional-depth-prober') : null,
-      nextReadyAfter: initialWorkFrontier,
-    })
+    const depthGateOutcome = await executePreProductionRuntimeGates({ recipe })
+    let recoveredPlanningFallbackMarker = resumeState && resumeState.retryState &&
+      resumeState.retryState.planningFallback || null
+    if (!recoveredPlanningFallbackMarker && route === 'ROADMAP' && resumeState &&
+        Array.isArray(resumeState.completedCheckIds) &&
+        resumeState.completedCheckIds.some(id => canonicalCompletedCheckerId(id) === 'roadmap-plan-check') &&
+        Array.isArray(resumeState.nextReadyWorkIds) &&
+        [roadmapProductFrontier, legacyRoadmapProductFrontier].some(frontier =>
+          stableStringify(resumeState.nextReadyWorkIds) === stableStringify(frontier)) &&
+        typeof options.readResult === 'function' && typeof options.resultPointer === 'function' &&
+        typeof options.verifyDurableResultReceipt === 'function') {
+      const checkerId = resumeState.completedCheckIds.find(id =>
+        canonicalCompletedCheckerId(id) === 'roadmap-plan-check')
+      const result = options.readResult(checkerId)
+      if (result && ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(result.code)) {
+        const pointer = validateDurableResultEvidencePointer(
+          options.resultPointer(checkerId), checkerId,
+        )
+        const receiptResult = readRegularJson(
+          pointer.path, 'product-first ROADMAP planning fallback result',
+        ).parsed
+        if (stableStringify(result) !== stableStringify(receiptResult)) {
+          throw new SupervisorIntegrationError(
+            'CHECK_RETRY_STATE_INVALID',
+            'product-first ROADMAP planning fallback differs from its exact durable result bytes',
+          )
+        }
+        options.verifyDurableResultReceipt(checkerId, result)
+        recoveredPlanningFallbackMarker = Object.freeze({
+          code: 'PLAN_CHECK_UNAVAILABLE',
+          checkerId,
+          planHash: resumeState.planHash,
+          checkerResultHash: hashText(JSON.stringify(result)),
+          reason: result.cause && result.cause.reason || 'the isolated roadmap checker remained unavailable',
+        })
+      }
+    }
+    let recoveredRoadmapPlanningFallback = null
+    const planningRetryPlanHash = marker => marker && (marker.planHash || marker.candidateHash)
     const recoverDurablePlanningFrontier = () => {
       if (route !== 'ROADMAP' || !resumeState ||
           !['RUN_WORK', 'CHECK_INCONCLUSIVE'].includes(resumeState.resumeState)) return null
@@ -11312,7 +14776,7 @@ function createDefaultRouteExecutor(options) {
       if (pendingRetry) {
         if (!/^roadmap-plan-(?:check|recheck)$/u.test(pendingRetry.checkerId || '') ||
             pendingRetry.retryAttempt !== 1 || pendingRetry.returnState !== 'RUN_WORK' ||
-            (resumeState.planHash && pendingRetry.candidateHash !== resumeState.planHash) ||
+            (resumeState.planHash && planningRetryPlanHash(pendingRetry) !== resumeState.planHash) ||
             !/^[a-f0-9]{64}$/u.test(pendingRetry.checkerResultHash || '')) {
           throw new SupervisorIntegrationError(
             'CHECK_RETRY_STATE_INVALID',
@@ -11350,7 +14814,7 @@ function createDefaultRouteExecutor(options) {
             basePointer.path, `durable ${pendingRetry.checkerId} retry base result`,
           ).parsed
           if (stableStringify(baseResult) !== stableStringify(baseBytes) ||
-              (baseResult.candidateHash && baseResult.candidateHash !== pendingRetry.candidateHash)) {
+              (baseResult.candidateHash && baseResult.candidateHash !== planningRetryPlanHash(pendingRetry))) {
             throw new SupervisorIntegrationError(
               'CHECK_RETRY_STATE_INVALID',
               `durable ${pendingRetry.checkerId} retry base differs from its exact receipt bytes or plan version`,
@@ -11391,7 +14855,7 @@ function createDefaultRouteExecutor(options) {
           basePointer.path, `durable ${pendingRetry.checkerId} retry base result`,
         ).parsed
         if (stableStringify(baseResult) !== stableStringify(baseReceiptResult) ||
-            (baseResult.candidateHash && baseResult.candidateHash !== pendingRetry.candidateHash)) {
+            (baseResult.candidateHash && baseResult.candidateHash !== planningRetryPlanHash(pendingRetry))) {
           throw new SupervisorIntegrationError(
             'CHECK_RETRY_STATE_INVALID',
             `durable ${pendingRetry.checkerId} retry base differs from its exact plan or receipt bytes`,
@@ -11407,7 +14871,7 @@ function createDefaultRouteExecutor(options) {
         const pointer = validateDurableResultEvidencePointer(options.resultPointer(resultId), resultId)
         const result = readRegularJson(pointer.path, `durable ${resultId} recovery result`).parsed
         if (stableStringify(indexedResult) !== stableStringify(result) ||
-            (result.candidateHash && result.candidateHash !== pendingRetry.candidateHash)) {
+            (result.candidateHash && result.candidateHash !== planningRetryPlanHash(pendingRetry))) {
           throw new SupervisorIntegrationError(
             'CHECK_RETRY_STATE_INVALID',
             `durable ${resultId} result differs from its exact plan version or receipt bytes`,
@@ -11429,7 +14893,7 @@ function createDefaultRouteExecutor(options) {
         }
         options.verifyDurableResultReceipt(resultId, result)
         const expectedNext = result.code === 'PASS'
-          ? ['mission-coordination']
+          ? legacyRoadmapProductFrontier
           : result.code === 'FAIL' && pendingRetry.checkerId === 'roadmap-plan-check'
             ? ['roadmap-author-plan-repair'] : []
         if (stableStringify(nextReady) !== stableStringify(expectedNext)) {
@@ -11543,12 +15007,18 @@ function createDefaultRouteExecutor(options) {
       })
     }
     const durablePlanningFrontier = recoverDurablePlanningFrontier()
+    const collapseLegacyPlanningRetry = Boolean(route === 'ROADMAP' &&
+      durablePlanningFrontier && durablePlanningFrontier.kind === 'retry' &&
+      /^roadmap-plan-(?:check|recheck)$/u.test(durablePlanningFrontier.resultId || '') &&
+      ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(
+        durablePlanningFrontier.result && durablePlanningFrontier.result.code,
+      ))
     const durableInconclusiveChecker = resumeState && resumeState.retryState &&
       resumeState.retryState.inconclusiveChecker ||
       (durablePlanningFrontier && durablePlanningFrontier.kind === 'retry'
         ? {
             checkerId: durablePlanningFrontier.resultId,
-            candidateHash: resumeState.planHash,
+            planHash: resumeState.planHash,
             checkerResultHash: durablePlanningFrontier.checkerResultHash,
             retryAttempt: 1,
             returnState: 'RUN_WORK',
@@ -11556,12 +15026,53 @@ function createDefaultRouteExecutor(options) {
         : null)
     const durablePlanningCheckerId = durableInconclusiveChecker &&
       canonicalCompletedCheckerId(durableInconclusiveChecker.checkerId)
+    const durablePlanningPlanHash = resumeState && (resumeState.planHash ||
+      planningRetryPlanHash(durableInconclusiveChecker) ||
+      durablePlanningFrontier && durablePlanningFrontier.result &&
+        durablePlanningFrontier.result.candidateHash)
     const durablePlanTerminal = resumeState && resumeState.retryState &&
       resumeState.retryState.conclusiveCheckerTerminal
+    if (route === 'ROADMAP' && recoveredPlanningFallbackMarker) {
+      const marker = recoveredPlanningFallbackMarker
+      const unavailable = marker.code === 'PLAN_CHECK_UNAVAILABLE' &&
+        /^roadmap-plan-(?:check|recheck)(?:-runtime-retry)?$/u.test(marker.checkerId || '')
+      const rejected = marker.code === 'PLAN_RECHECK_REJECTED' &&
+        /^roadmap-plan-recheck(?:-runtime-retry)?$/u.test(marker.checkerId || '')
+      const corrected = marker.code === 'PLAN_CORRECTED_PRODUCT_VERIFICATION_REQUIRED' &&
+        /^roadmap-plan-check(?:-runtime-retry)?$/u.test(marker.checkerId || '') &&
+        /^[a-f0-9]{64}$/u.test(marker.checkedPlanHash || '') &&
+        marker.checkedPlanHash !== marker.planHash
+      if ((!unavailable && !rejected && !corrected) || marker.planHash !== resumeState.planHash ||
+          !/^[a-f0-9]{64}$/u.test(marker.checkerResultHash || '') ||
+          typeof options.readResult !== 'function' || typeof options.resultPointer !== 'function' ||
+          typeof options.verifyDurableResultReceipt !== 'function') {
+        throw new SupervisorIntegrationError(
+          'CHECK_RETRY_STATE_INVALID',
+          'durable ROADMAP planning fallback is incomplete or does not bind the exact plan',
+        )
+      }
+      const result = options.readResult(marker.checkerId)
+      const pointer = validateDurableResultEvidencePointer(
+        options.resultPointer(marker.checkerId), marker.checkerId,
+      )
+      const receiptResult = readRegularJson(pointer.path, 'durable ROADMAP planning fallback result').parsed
+      if (!result || stableStringify(result) !== stableStringify(receiptResult) ||
+          hashText(JSON.stringify(result)) !== marker.checkerResultHash ||
+          (unavailable && !['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(result.code)) ||
+          ((rejected || corrected) && result.code !== 'FAIL') ||
+          (corrected && result.candidateHash !== marker.checkedPlanHash)) {
+        throw new SupervisorIntegrationError(
+          'CHECK_RETRY_STATE_INVALID',
+          'durable ROADMAP planning fallback differs from its exact checker receipt',
+        )
+      }
+      options.verifyDurableResultReceipt(marker.checkerId, result)
+      recoveredRoadmapPlanningFallback = Object.freeze({ ...marker })
+    }
     if (route === 'ROADMAP' && durablePlanTerminal) {
       if (!/^roadmap-plan-recheck(?:-runtime-retry)?$/u.test(durablePlanTerminal.checkerId || '') ||
           durablePlanTerminal.code !== 'FAIL' || durablePlanTerminal.returnState !== 'RUN_WORK' ||
-          durablePlanTerminal.candidateHash !== resumeState.planHash ||
+          planningRetryPlanHash(durablePlanTerminal) !== resumeState.planHash ||
           !/^[a-f0-9]{64}$/u.test(durablePlanTerminal.checkerResultHash || '') ||
           typeof options.readResult !== 'function' || typeof options.resultPointer !== 'function') {
         throw new SupervisorIntegrationError(
@@ -11590,21 +15101,46 @@ function createDefaultRouteExecutor(options) {
         )
       }
       options.verifyDurableResultReceipt(durablePlanTerminal.checkerId, terminalResult)
-      return { outcome: 'FAILED', terminalEnvelope: terminalResult }
+      recoveredRoadmapPlanningFallback = Object.freeze({
+        code: 'PLAN_RECHECK_REJECTED',
+        checkerId: durablePlanTerminal.checkerId,
+        planHash: planningRetryPlanHash(durablePlanTerminal),
+        checkerResultHash: durablePlanTerminal.checkerResultHash,
+        reason: 'the bounded roadmap repair remained rejected',
+      })
     }
     if (route === 'ROADMAP' && durablePlanningFrontier &&
         durablePlanningFrontier.kind === 'recheck-result' &&
         durablePlanningFrontier.result.code === 'FAIL') {
-      return { outcome: 'FAILED', terminalEnvelope: durablePlanningFrontier.result }
+      recoveredRoadmapPlanningFallback = Object.freeze({
+        code: 'PLAN_RECHECK_REJECTED',
+        checkerId: durablePlanningFrontier.resultId,
+        planHash: resumeState.planHash,
+        checkerResultHash: durablePlanningFrontier.checkerResultHash,
+        reason: 'the bounded roadmap repair remained rejected',
+      })
+    }
+    if (collapseLegacyPlanningRetry && !collapseLegacyRoadmapPlanning &&
+        durablePlanningFrontier.resultId === 'roadmap-plan-check') {
+      recoveredRoadmapPlanningFallback = Object.freeze({
+        code: 'PLAN_CHECK_UNAVAILABLE',
+        checkerId: durablePlanningFrontier.resultId,
+        planHash: durablePlanningPlanHash,
+        checkerResultHash: durablePlanningFrontier.checkerResultHash,
+        reason: durablePlanningFrontier.result.cause &&
+          durablePlanningFrontier.result.cause.reason ||
+          'the authenticated legacy planning retry was retired and final product verification owns acceptance',
+      })
     }
     const resumePlanningRetry = Boolean(route === 'ROADMAP' && resumeState &&
+      !collapseLegacyRoadmapPlanning &&
       (resumeState.resumeState === 'CHECK_INCONCLUSIVE' ||
        durablePlanningFrontier && durablePlanningFrontier.kind === 'retry') &&
       ['roadmap-plan-check', 'roadmap-plan-recheck'].includes(durablePlanningCheckerId) &&
       durableInconclusiveChecker.returnState === 'RUN_WORK')
     if (route === 'ROADMAP' && resumeState && resumeState.resumeState === 'CHECK_INCONCLUSIVE' &&
         ['roadmap-plan-check', 'roadmap-plan-recheck'].includes(durablePlanningCheckerId) &&
-        !resumePlanningRetry) {
+        !resumePlanningRetry && !collapseLegacyRoadmapPlanning) {
       throw new SupervisorIntegrationError(
         'CHECK_RETRY_STATE_INVALID',
         'durable ROADMAP plan retry does not return to its canonical RUN_WORK origin',
@@ -11613,14 +15149,17 @@ function createDefaultRouteExecutor(options) {
     const resumeRepairing = Boolean(resumeState && resumeState.resumeState === 'REPAIRING')
     const resumeAtChecking = Boolean(resumeState &&
       (resumeState.resumeState === 'CHECK_WORK' || resumeRepairing ||
-       (resumeState.resumeState === 'CHECK_INCONCLUSIVE' && !resumePlanningRetry)))
+       (resumeState.resumeState === 'CHECK_INCONCLUSIVE' && !resumePlanningRetry &&
+        !collapseLegacyRoadmapPlanning)))
     const resumeInWork = Boolean(resumeState &&
-      (['RUN_WORK', 'ITEM_VERIFIED', 'REPAIRING'].includes(resumeState.resumeState) || resumePlanningRetry))
+      (['RUN_WORK', 'ITEM_VERIFIED', 'REPAIRING'].includes(resumeState.resumeState) ||
+       resumePlanningRetry || collapseLegacyRoadmapPlanning))
     const completedPlanningRetryResult = durablePlanningFrontier &&
       durablePlanningFrontier.kind === 'retry-result' &&
       durablePlanningFrontier.result.code === 'PASS' &&
       canonicalCompletedCheckerId(durablePlanningFrontier.resultId) === durablePlanningCheckerId
     const completedBeforeResume = new Set(resumeState && resumeState.completedWorkIds || [])
+    if (recoveredRoadmapPlanningFallback) completedBeforeResume.add('roadmap-plan-check')
     for (const checkId of resumeState && resumeState.completedCheckIds || []) {
       const canonicalCheckId = canonicalCompletedCheckerId(checkId)
       if (completedPlanningRetryResult && canonicalCheckId === durablePlanningCheckerId) continue
@@ -11635,7 +15174,12 @@ function createDefaultRouteExecutor(options) {
         const indexedResult = options.readResult(checkId)
         const pointer = validateDurableResultEvidencePointer(options.resultPointer(checkId), checkId)
         const receiptResult = readRegularJson(pointer.path, `completed ${checkId} result`).parsed
-        if (!indexedResult || indexedResult.code !== 'PASS' ||
+        const acceptedPlanningFallback = recoveredRoadmapPlanningFallback &&
+          recoveredRoadmapPlanningFallback.checkerId === checkId && indexedResult &&
+          indexedResult.code === 'FAIL' &&
+          recoveredRoadmapPlanningFallback.planHash === resumeState.planHash &&
+          recoveredRoadmapPlanningFallback.checkerResultHash === hashText(JSON.stringify(indexedResult))
+        if (!indexedResult || (!acceptedPlanningFallback && indexedResult.code !== 'PASS') ||
             indexedResult.candidateHash !== resumeState.planHash ||
             stableStringify(indexedResult) !== stableStringify(receiptResult) ||
             typeof options.verifyDurableResultReceipt !== 'function') {
@@ -11659,17 +15203,117 @@ function createDefaultRouteExecutor(options) {
         'durable ROADMAP retry conflicts with already accepted plan-check next ready work',
       )
     }
+    const transportRetryIdentity = workItemId => {
+      const match = /^(work-\d+)-transport-retry-1$/u.exec(workItemId || '')
+      return match ? Object.freeze({ baseId: match[1], retryId: workItemId }) : null
+    }
+    const queuedTransportRetry = resumeState &&
+      Array.isArray(resumeState.nextReadyWorkIds) &&
+      resumeState.nextReadyWorkIds.length === 1
+      ? transportRetryIdentity(resumeState.nextReadyWorkIds[0]) : null
+    let productionTransportContingencyConsumed = Boolean(queuedTransportRetry)
+    const authenticateCompletedWorkResult = (workItemId, description) => {
+      if (typeof options.readResult !== 'function' ||
+          typeof options.resultPointer !== 'function' ||
+          typeof options.verifyDurableResultReceipt !== 'function') {
+        throw new SupervisorIntegrationError(
+          'CHECK_RETRY_STATE_INVALID',
+          `${description} lacks exact durable result authentication`,
+        )
+      }
+      const indexedResult = options.readResult(workItemId)
+      const pointer = validateDurableResultEvidencePointer(
+        options.resultPointer(workItemId), workItemId,
+      )
+      const receiptResult = readRegularJson(pointer.path, description).parsed
+      if (!indexedResult || stableStringify(indexedResult) !== stableStringify(receiptResult)) {
+        throw new SupervisorIntegrationError(
+          'CHECK_RETRY_STATE_INVALID',
+          `${description} differs from its exact durable result bytes`,
+        )
+      }
+      options.verifyDurableResultReceipt(workItemId, indexedResult)
+      return indexedResult
+    }
+    const legacyPlanningIdsToSkip = [...new Set(resumeRoadmapIds
+      .map(id => String(id).replace(/^reconcile:/u, ''))
+      .filter(id => id === 'conditional-depth-prober' ||
+        collapseLegacyRoadmapPlanning &&
+          /^(?:roadmap-(?:author(?:-revise|-plan-repair)?|scout-\d+|plan-(?:check|recheck)(?:-runtime-retry)?|work-group)|mission-coordination)$/u.test(id)))]
     const adoptedWorkResults = resumeInWork && typeof resumeAdoptedLaunches === 'function'
       ? await resumeAdoptedLaunches({
           resumeState,
           candidateHash: resumeState && resumeState.candidateHash || null,
           decision,
           stage: 'work',
+          ...(legacyPlanningIdsToSkip.length > 0 ? {
+            skipLegacyPlanningRetryIds: legacyPlanningIdsToSkip,
+            skippedPlanningNextReadyWorkIds: roadmapProductFrontier,
+          } : {}),
         })
       : {}
+    const completedTransportRetryResults = new Map()
+    const successfulTransportRetryIds = new Map()
+    const transportRetrySucceeded = result => Boolean(result &&
+      !(result.terminalEnvelope &&
+        result.terminalEnvelope.status === 'CHILD_TRANSPORT_TIMEOUT'))
+    for (const completedId of resumeState && resumeState.completedWorkIds || []) {
+      const retry = transportRetryIdentity(completedId)
+      if (!retry) continue
+      const result = adoptedWorkResults[completedId] || authenticateCompletedWorkResult(
+        completedId,
+        `completed provider transport retry ${completedId}`,
+      )
+      completedTransportRetryResults.set(retry.baseId, result)
+      if (transportRetrySucceeded(result)) {
+        successfulTransportRetryIds.set(retry.baseId, retry.retryId)
+      }
+      completedBeforeResume.add(retry.baseId)
+      productionTransportContingencyConsumed = true
+    }
+    for (const [adoptedId, adoptedResult] of Object.entries(adoptedWorkResults)) {
+      const retry = transportRetryIdentity(adoptedId)
+      if (!retry) continue
+      completedTransportRetryResults.set(retry.baseId, adoptedResult)
+      if (transportRetrySucceeded(adoptedResult)) {
+        successfulTransportRetryIds.set(retry.baseId, retry.retryId)
+      }
+      completedBeforeResume.add(retry.baseId)
+      productionTransportContingencyConsumed = true
+    }
+    let pendingTransportRetryResult = null
+    if (queuedTransportRetry) {
+      const adoptedBase = adoptedWorkResults[queuedTransportRetry.baseId]
+      const baseResult = adoptedBase || authenticateCompletedWorkResult(
+        queuedTransportRetry.baseId,
+        `provider transport retry base ${queuedTransportRetry.baseId}`,
+      )
+      if (!baseResult || !baseResult.terminalEnvelope ||
+          baseResult.terminalEnvelope.status !== 'CHILD_TRANSPORT_TIMEOUT') {
+        throw new SupervisorIntegrationError(
+          'CHECK_RETRY_STATE_INVALID',
+          `provider transport retry ${queuedTransportRetry.retryId} lacks its exact timeout result`,
+        )
+      }
+      pendingTransportRetryResult = baseResult
+    }
     const acceptedWorkResults = new Map(Object.entries(adoptedWorkResults)
-      .filter(([workItemId]) => /^work-\d+$/.test(workItemId)))
+      .filter(([workItemId, result]) => /^work-\d+$/.test(workItemId) &&
+        !(queuedTransportRetry && queuedTransportRetry.baseId === workItemId &&
+          result && result.terminalEnvelope &&
+          result.terminalEnvelope.status === 'CHILD_TRANSPORT_TIMEOUT')))
+    for (const [baseId, result] of completedTransportRetryResults) {
+      acceptedWorkResults.set(baseId, result)
+    }
     for (const [workItemId, adoptedResult] of Object.entries(adoptedWorkResults)) {
+      if (queuedTransportRetry && queuedTransportRetry.baseId === workItemId &&
+          adoptedResult && adoptedResult.terminalEnvelope &&
+          adoptedResult.terminalEnvelope.status === 'CHILD_TRANSPORT_TIMEOUT') continue
+      const retry = transportRetryIdentity(workItemId)
+      if (retry) {
+        completedBeforeResume.add(retry.baseId)
+        continue
+      }
       if (!CHECKER_ROLES.has(adoptedResult && adoptedResult.logicalRoleId) &&
           !/^roadmap-plan-(?:check|recheck)(?:-runtime-retry)?$/u.test(workItemId)) {
         completedBeforeResume.add(workItemId)
@@ -11679,16 +15323,22 @@ function createDefaultRouteExecutor(options) {
         completedBeforeResume.add(canonicalCompletedCheckerId(workItemId))
       }
     }
-    const roadmapWorkerStage = route === 'ROADMAP' && completedBeforeResume.has('roadmap-plan-check') &&
+    const roadmapWorkerStage = route === 'ROADMAP' && (deterministicRoadmap ||
+      collapseLegacyRoadmapPlanning ||
+      completedBeforeResume.has('roadmap-plan-check') &&
       (workerCount >= 2
         ? completedBeforeResume.has('roadmap-work-group')
-        : completedBeforeResume.has('mission-coordination'))
+        : true))
     if ((route !== 'ROADMAP' || roadmapWorkerStage) && resumeState &&
         ['RUN_WORK', 'ITEM_VERIFIED'].includes(resumeState.resumeState)) {
       const requiredOrdinaryWorkIds = Array.from(
         { length: workerCount }, (_, index) => `work-${index + 1}`,
       )
       const completedOrdinaryWorkIds = new Set(resumeState.completedWorkIds || [])
+      for (const completedId of resumeState.completedWorkIds || []) {
+        const retry = transportRetryIdentity(completedId)
+        if (retry) completedOrdinaryWorkIds.add(retry.baseId)
+      }
       const expectedMissingWorkIds = requiredOrdinaryWorkIds.filter(
         workItemId => !completedOrdinaryWorkIds.has(workItemId),
       )
@@ -11706,7 +15356,24 @@ function createDefaultRouteExecutor(options) {
         resumeState.schedulerCrashCheckpoint && adoptedWorkRecords.length === 1 &&
         Array.isArray(resumeState.openLeaseIds) &&
         resumeState.openLeaseIds.includes(adoptedWorkRecords[0].id))
-      if (!exactQueuedWork && !exactLiveAdoption) {
+      const exactQueuedTransportRetry = Boolean(queuedTransportRetry &&
+        nextReady && nextReady[0] === queuedTransportRetry.retryId &&
+        expectedMissingWorkIds.includes(queuedTransportRetry.baseId))
+      const exactLegacyPlanningCollapse = Boolean(collapseLegacyRoadmapPlanning &&
+        nextReady && nextReady.length <= 1 &&
+        (nextReady.length === 0 ||
+          legacyRoadmapWorkId.test(String(nextReady[0]).replace(/^reconcile:/u, ''))))
+      const exactLegacyDepthCollapse = Boolean(
+        legacyPlanningIdsToSkip.includes('conditional-depth-prober') &&
+        nextReady && nextReady.length === 1 &&
+        String(nextReady[0]).replace(/^reconcile:/u, '') === 'conditional-depth-prober',
+      )
+      const legacyPlanningTerminalBoundary = route === 'ROADMAP' && workerCount === 1 &&
+        Boolean(recoveredRoadmapPlanningFallback) && nextReady && nextReady.length === 0 &&
+        expectedMissingWorkIds.length === 1 && expectedMissingWorkIds[0] === 'work-1'
+      if (!exactQueuedWork && !exactLiveAdoption && !exactQueuedTransportRetry &&
+          !exactLegacyPlanningCollapse && !exactLegacyDepthCollapse &&
+          !legacyPlanningTerminalBoundary) {
         throw new SupervisorIntegrationError(
           'CHECK_RETRY_STATE_INVALID',
           `durable ${resumeState.resumeState} next ready work differs from the exact missing physical worker set`,
@@ -11718,496 +15385,112 @@ function createDefaultRouteExecutor(options) {
     let retainedManager = adoptedWorkResults['roadmap-work-group'] &&
       adoptedWorkResults['roadmap-work-group'].retainedLease || null
     let planPointer = null
-    const roadmapTopology = route === 'ROADMAP' && decision.topology && decision.topology.coordination
-    const scoutTopology = roadmapTopology && roadmapTopology.scouts
-    const scoutCount = scoutTopology ? Number(scoutTopology.count || 0) : 0
-    const namedUnknowns = scoutTopology && Array.isArray(scoutTopology.namedUnknowns)
-      ? scoutTopology.namedUnknowns : []
-    if (route === 'ROADMAP' && (!Number.isSafeInteger(scoutCount) || scoutCount < 0 ||
-        (scoutCount > 0 && namedUnknowns.length !== scoutCount))) {
-      throw new SupervisorIntegrationError(
-        'SCOUT_TOPOLOGY_INVALID',
-        'ROADMAP scout execution requires exactly one deterministic named unknown per scout',
-      )
-    }
-    let latestAuthorWorkItemId = completedBeforeResume.has('roadmap-author-revise')
-      ? 'roadmap-author-revise' : 'roadmap-author'
-    const unsuccessfulPlanningResult = (workItemId, result) =>
-      result && result.allAssignedItemsPass === false
-        ? unsuccessfulWorkTerminal(workItemId, result, {
-            code: 'PLANNING_WORK_UNSUCCESSFUL',
-            reason: 'the planning worker explicitly reported that its assigned planning work and author-side checks did not pass',
-          })
-        : null
-    for (const planningWorkItemId of ['mission-coordination', 'roadmap-work-group']) {
-      const adoptedPlanningResult = adoptedWorkResults[planningWorkItemId]
-      const planningFailure = unsuccessfulPlanningResult(planningWorkItemId, adoptedPlanningResult)
-      if (planningFailure) {
-        if (retainedManager && retainedManager.completed !== true) completeRetainedLease(retainedManager)
-        if (retainedCoordinator && retainedCoordinator.completed !== true) completeRetainedLease(retainedCoordinator)
-        return planningFailure
-      }
-    }
-    let roadmapResult = adoptedWorkResults['roadmap-author'] ||
-      (completedBeforeResume.has('roadmap-author') && typeof options.readResult === 'function'
-        ? options.readResult('roadmap-author') : null)
-    if (route === 'ROADMAP' && !resumeAtChecking && !completedBeforeResume.has('roadmap-author')) {
-      roadmapResult = adoptedWorkResults['roadmap-author'] || await launch({
-        workItemId: 'roadmap-author', logicalRole: 'roadmap-author', parent: 'run-owner',
-        purpose: 'planning', assignment: `Create the dependency-ordered roadmap for: ${decision.requestedResult}. Return each concrete ordered step in behaviorChanged.`,
-        ownership: [{ kind: 'output', identity: 'plan/ROADMAP.md', owner: 'roadmap-author' }], success: successes, checks,
-        manifests: executionOwnership,
-        fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
-        nextReadyAfter: scoutCount > 0
-          ? Array.from({ length: scoutCount }, (_, index) => `roadmap-scout-${index + 1}`)
-          : ['roadmap-plan-check'],
-      })
-      const planningFailure = unsuccessfulPlanningResult('roadmap-author', roadmapResult)
-      if (planningFailure) return planningFailure
-      roadmapResult = roadmapAuthorArtifact(roadmapResult)
-      options.writePlan('ROADMAP', decision, roadmapResult, 'roadmap-author')
-      completedBeforeResume.add('roadmap-author')
-    }
-    if (route === 'ROADMAP' && !resumeAtChecking && typeof options.planExists === 'function' &&
-        !options.planExists('ROADMAP')) {
-      const planningFailure = unsuccessfulPlanningResult(latestAuthorWorkItemId, roadmapResult)
-      if (planningFailure) return planningFailure
-      if (!roadmapResult) {
+    let deterministicRoadmapPlanningMarker = null
+    if (deterministicRoadmap) {
+      if (typeof options.writePlan !== 'function' || typeof options.planExists !== 'function' ||
+          typeof options.planPointer !== 'function') {
         throw new SupervisorIntegrationError(
           'ROADMAP_RESULT_MISSING',
-          'completed ROADMAP author result is unavailable for deterministic plan recovery',
+          'deterministic ROADMAP execution requires a durable canonical plan projection',
         )
       }
-      roadmapResult = roadmapAuthorArtifact(roadmapResult)
-      options.writePlan('ROADMAP', decision, roadmapResult, latestAuthorWorkItemId)
-    }
-    const scoutWorkIds = Array.from({ length: scoutCount }, (_, index) => `roadmap-scout-${index + 1}`)
-    if (route === 'ROADMAP' && !resumeAtChecking && scoutCount > 0) {
-      const scoutResults = new Map()
-      await Promise.all(scoutWorkIds.map(async (workItemId, index) => {
-        if (completedBeforeResume.has(workItemId)) {
-          const restored = adoptedWorkResults[workItemId] ||
-            (typeof options.readResult === 'function' ? options.readResult(workItemId) : null)
-          if (restored) scoutResults.set(workItemId, restored)
-          return
-        }
-        const result = await launch({
-          workItemId, logicalRole: 'scout', parent: 'run-owner', purpose: 'scouting',
-          requiredByMission: true,
-          assignment: `Resolve only this named ROADMAP unknown: ${namedUnknowns[index]}. Return the concrete correction in behaviorChanged.`,
-          ownership: admittedReadOwnership,
-          success: [`Return evidence for the named unknown: ${namedUnknowns[index]}`],
-          checks: ['Read/list/search only; do not edit the target or the roadmap.'],
-          fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
-          recoveryGroupWorkIds: scoutWorkIds,
-          recoveryJoinWorkId: 'roadmap-author-revise',
-          nextReadyAfter: scoutWorkIds.filter(id => id !== workItemId),
-        })
-        scoutResults.set(workItemId, result)
-        completedBeforeResume.add(workItemId)
-      }))
-      const unsuccessfulScoutId = scoutWorkIds.find(workItemId => {
-        const result = scoutResults.get(workItemId) ||
-          (typeof options.readResult === 'function' ? options.readResult(workItemId) : null)
-        return result && result.allAssignedItemsPass === false
-      })
-      if (unsuccessfulScoutId) {
-        const result = scoutResults.get(unsuccessfulScoutId) || options.readResult(unsuccessfulScoutId)
-        return unsuccessfulPlanningResult(unsuccessfulScoutId, result)
+      const projectionResult = deterministicRoadmapProjectionResult(decision)
+      const expectedPlanHash = hashText(renderPlanArtifact('ROADMAP', decision, projectionResult))
+      if (!options.planExists('ROADMAP')) {
+        options.writePlan(
+          'ROADMAP', decision, projectionResult, DETERMINISTIC_ROADMAP_EXECUTION_MODE,
+        )
       }
-      const missingScouts = scoutWorkIds.filter(workItemId => !completedBeforeResume.has(workItemId))
-      if (missingScouts.length > 0) {
+      planPointer = options.planPointer('ROADMAP')
+      if (!planPointer || planPointer.sha256 !== expectedPlanHash) {
         throw new SupervisorIntegrationError(
-          'SCOUT_JOIN_INCOMPLETE',
-          'same-author ROADMAP revision cannot start until every named scout result is durable',
-          { missingScouts },
+          'CRASH_ADOPTION_CONFLICT',
+          'deterministic ROADMAP bytes differ from the accepted immutable route decision',
         )
       }
-      const scoutEvidence = scoutWorkIds.map(workItemId => {
-        if (typeof options.resultPointer !== 'function') {
-          throw new SupervisorIntegrationError(
-            'SCOUT_EVIDENCE_MISSING',
-            'ROADMAP scout join requires durable evidence pointers for every scout result',
-          )
-        }
-        try {
-          return validateDurableResultEvidencePointer(options.resultPointer(workItemId), workItemId)
-        } catch (error) {
-          throw new SupervisorIntegrationError(
-            'SCOUT_EVIDENCE_MISSING',
-            `ROADMAP scout join requires the exact durable result for ${workItemId}`,
-            { cause: error && (error.code || error.message) || 'unknown' },
-          )
-        }
+      deterministicRoadmapPlanningMarker = Object.freeze({
+        code: 'DETERMINISTIC_ROADMAP',
+        executionMode: DETERMINISTIC_ROADMAP_EXECUTION_MODE,
+        planHash: planPointer.sha256,
+        routeDecisionHash: hashText(stableStringify(decision)),
+        nextReadyWorkIds: Object.freeze([...roadmapProductFrontier]),
       })
-      const concreteScoutCorrections = scoutWorkIds.map((workItemId, index) => {
-        const result = scoutResults.get(workItemId) ||
-          (typeof options.readResult === 'function' ? options.readResult(workItemId) : null)
-        if (!result) {
-          throw new SupervisorIntegrationError(
-            'SCOUT_CORRECTION_INVALID',
-            `durable scout result is unavailable for ${workItemId}`,
-          )
-        }
-        return scoutCorrection(result, namedUnknowns[index], workItemId, scoutEvidence[index])
-      })
-      let revisedResult = adoptedWorkResults['roadmap-author-revise'] ||
-        (completedBeforeResume.has('roadmap-author-revise') && typeof options.readResult === 'function'
-          ? options.readResult('roadmap-author-revise') : null)
-      if (!completedBeforeResume.has('roadmap-author-revise')) {
-        revisedResult = await launch({
-          workItemId: 'roadmap-author-revise', logicalRole: 'roadmap-author', parent: 'run-owner',
-          purpose: 'planning', repairOf: 'roadmap-author', executorKey: 'roadmap-author',
-          assignment: 'Revise the same ROADMAP after consuming every named scout result; preserve one plan owner and return each correction verbatim in behaviorChanged.',
-          ownership: [{ kind: 'output', identity: 'plan/ROADMAP.md', owner: 'roadmap-author' }], success: successes, checks,
-          manifests: executionOwnership,
-          evidenceHashes: scoutEvidence.map(pointer => pointer.hash),
-          evidencePointers: scoutEvidence,
-          fetchedEvidence: {
-            scoutCorrections: concreteScoutCorrections,
-            ...(capturedDomainWorkEvidence || {}),
-            ...(withDescriptiveLikelyAreas(null) || {}),
-          },
-          dependencies: scoutWorkIds,
-          nextReadyAfter: ['roadmap-plan-check'],
-        })
-        completedBeforeResume.add('roadmap-author-revise')
-      }
-      if (!revisedResult) {
+    }
+    if (collapseLegacyRoadmapPlanning) {
+      if (typeof options.writePlan !== 'function' || typeof options.planExists !== 'function' ||
+          typeof options.planPointer !== 'function') {
         throw new SupervisorIntegrationError(
           'ROADMAP_RESULT_MISSING',
-          'completed same-author ROADMAP revision result is unavailable',
+          'legacy ROADMAP collapse requires a durable canonical plan projection',
         )
       }
-      const revisionFailure = unsuccessfulPlanningResult('roadmap-author-revise', revisedResult)
-      if (revisionFailure) return revisionFailure
-      latestAuthorWorkItemId = 'roadmap-author-revise'
-      roadmapResult = roadmapAuthorArtifact(revisedResult, concreteScoutCorrections)
-      options.writePlan('ROADMAP', decision, roadmapResult, latestAuthorWorkItemId)
-    }
-    const isNonAuthoritativePlanResult = result =>
-      ['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(result && result.code)
-    const inconclusivePlanOutcome = result => ({
-      outcome: 'PARTIAL',
-      terminalEnvelope: {
-        ...result,
-        status: 'CHECK_REMAINS_INCONCLUSIVE',
-        reason: result && result.cause && result.cause.reason ||
-          'the isolated runtime retry remained non-authoritative',
-      },
-    })
-    const runRoadmapPlanCheck = async ({ baseId, retryId, candidateHash, requestFor }) => {
-      const markerMatches = resumePlanningRetry && durablePlanningCheckerId === baseId
-      if (markerMatches && (durableInconclusiveChecker.retryAttempt !== 1 ||
-          durableInconclusiveChecker.candidateHash !== candidateHash ||
-          !/^[a-f0-9]{64}$/u.test(durableInconclusiveChecker.checkerResultHash || ''))) {
-        throw new SupervisorIntegrationError(
-          'CHECK_RETRY_STATE_INVALID',
-          `durable ${baseId} retry differs from the exact admitted plan version being checked`,
+      const collapsedProjection = deterministicRoadmapProjectionResult(decision)
+      const collapsedPlanHash = hashText(renderPlanArtifact('ROADMAP', decision, collapsedProjection))
+      const existingPlanPointer = !resumeAtChecking && options.planExists('ROADMAP')
+        ? options.planPointer('ROADMAP') : null
+      if (!resumeAtChecking &&
+          (!existingPlanPointer || existingPlanPointer.sha256 !== collapsedPlanHash)) {
+        options.writePlan(
+          'ROADMAP', decision, collapsedProjection,
+          DETERMINISTIC_ROADMAP_EXECUTION_MODE,
         )
-      }
-      if (adoptedWorkResults[retryId] && !markerMatches) {
-        throw new SupervisorIntegrationError(
-          'CHECK_RETRY_STATE_INVALID',
-          `adopted ${retryId} lacks its durable inconclusive retry marker`,
-        )
-      }
-      let retryStateEntered = markerMatches
-      let activeId = markerMatches ? retryId : baseId
-      let retryProgressHash = markerMatches
-        ? durableInconclusiveChecker.checkerResultHash
-        : null
-      let result = durablePlanningFrontier && durablePlanningFrontier.kind === 'retry-result' &&
-          durablePlanningFrontier.resultId === activeId
-        ? durablePlanningFrontier.result
-        : adoptedWorkResults[activeId] ||
-        await launchChecker(requestFor(activeId, retryProgressHash))
-      if (isNonAuthoritativePlanResult(result) && activeId === baseId) {
-        retryProgressHash = hashText(JSON.stringify(result))
-        await options.transition('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
-          candidateHash,
-          checkerId: baseId,
-          checkerResultHash: retryProgressHash,
-          retryAttempt: 1,
-          nextReadyWorkIds: [retryId],
-        })
-        retryStateEntered = true
-        activeId = retryId
-        result = adoptedWorkResults[retryId] ||
-          await launchChecker(requestFor(retryId, retryProgressHash))
-      }
-      if (isNonAuthoritativePlanResult(result)) {
-        await options.transition('CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK', {
-          candidateHash,
-          checkerId: activeId,
-          checkerResultHash: hashText(JSON.stringify(result)),
-          retryAttempt: 1,
-        })
-        return { activeId, result, terminal: inconclusivePlanOutcome(result) }
-      }
-      if (retryStateEntered) {
-        await options.transition('CHECK_BECAME_CONCLUSIVE', 'RUN_WORK', {
-          candidateHash,
-          checkerId: activeId,
-          checkerResultHash: hashText(JSON.stringify(result)),
-          retryAttempt: 1,
-          nextReadyWorkIds: result.code === 'PASS'
-            ? ['mission-coordination']
-            : baseId === 'roadmap-plan-check' ? ['roadmap-author-plan-repair'] : [],
-          ...(baseId === 'roadmap-plan-recheck' && result.code === 'FAIL'
-            ? { terminalDisposition: 'FAIL' } : {}),
-        })
-      } else if (baseId === 'roadmap-plan-recheck' && result.code === 'FAIL') {
-        await options.transition('TRANSIENT_RUNTIME', 'RUN_WORK', {
-          candidateHash,
-          checkerId: activeId,
-          checkerResultHash: hashText(JSON.stringify(result)),
-          terminalDisposition: 'FAIL',
-          nextReadyWorkIds: [],
-        })
-      }
-      return { activeId, result, terminal: null }
-    }
-    const planCheckRequest = (workItemId, candidateHash, pointer, retryProgressHash = null) => {
-      const retry = workItemId === 'roadmap-plan-check-runtime-retry'
-      return {
-        workItemId, logicalRole: 'plan-checker', parent: 'run-owner',
-        purpose: retry ? 'recovery' : 'verification',
-        ...(retry ? {
-          forkTurns: 1,
-          recoveryContext: { type: 'bounded-recovery', code: 'PLAN_CHECK_RUNTIME_RETRY' },
-        } : {}),
-        ...(retry ? { executorKey: 'roadmap-plan-check' } : {}),
-        assignment: retry
-          ? 'Retry the same admitted roadmap check in a newly materialized exact-byte snapshot. Do not reinterpret a runtime transport or snapshot defect as a plan defect.'
-          : 'Independently check the roadmap against the exact request and dependency facts.',
-        candidateHash, oracle: 'roadmap-plan-oracle', success: successes, checks,
-        ...(retryProgressHash ? { evidenceHashes: [retryProgressHash] } : {}),
-        isolation: 'snapshot', writeProducing: true, roadmapSlice: pointer,
-        evidencePointers: scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
-        ...(retry ? {} : {
-          fetchedEvidence: withDescriptiveLikelyAreas(
-            roadmapResult && Array.isArray(roadmapResult.scoutCorrections)
-              ? { scoutCorrections: roadmapResult.scoutCorrections } : null,
-          ),
-        }),
-        manifests: executionOwnership,
-        harnessAttestation: options.harnessAttestation(candidateHash, 'roadmap-plan-oracle'),
-        nextReadyAfter: ['mission-coordination'],
-      }
-    }
-    const planRecheckRequest = (
-      workItemId,
-      candidateHash,
-      pointer,
-      retryProgressHash = null,
-      repairProgressHash = null,
-    ) => {
-      const retry = workItemId === 'roadmap-plan-recheck-runtime-retry'
-      return {
-        workItemId, logicalRole: 'plan-checker', parent: 'run-owner',
-        purpose: retry ? 'recovery' : 'verification',
-        ...(retry ? {
-          forkTurns: 1,
-          recoveryContext: { type: 'bounded-recovery', code: 'PLAN_RECHECK_RUNTIME_RETRY' },
-        } : {}),
-        repairOf: 'roadmap-plan-check', executorKey: 'roadmap-plan-check',
-        assignment: retry
-          ? 'Retry the repaired roadmap check in a newly materialized exact-byte snapshot without changing the admitted plan.'
-          : 'Recheck only the repaired roadmap findings in the same independent checker context.',
-        candidateHash, oracle: 'roadmap-plan-oracle-recheck', success: successes, checks,
-        ...((retryProgressHash || repairProgressHash)
-          ? { evidenceHashes: [retryProgressHash || repairProgressHash] }
-          : {}),
-        isolation: 'snapshot', writeProducing: true, roadmapSlice: pointer,
-        evidencePointers: scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
-        manifests: executionOwnership,
-        harnessAttestation: options.harnessAttestation(candidateHash, 'roadmap-plan-oracle-recheck'),
-        nextReadyAfter: ['mission-coordination'],
-      }
-    }
-    const priorPlanFailureEvidenceHash = () => {
-      if (typeof options.resultPointer !== 'function' || typeof options.readResult !== 'function') {
-        throw new SupervisorIntegrationError(
-          'PLAN_CHECK_EVIDENCE_MISSING',
-          'repaired ROADMAP recheck requires exact prior FAIL result resolvers',
-        )
-      }
-      for (const checkerId of ['roadmap-plan-check-runtime-retry', 'roadmap-plan-check']) {
-        const indexedResult = options.readResult(checkerId)
-        if (!indexedResult) continue
-        if (indexedResult.code !== 'FAIL') {
-          throw new SupervisorIntegrationError(
-            'PLAN_CHECK_EVIDENCE_MISSING',
-            `repaired ROADMAP recheck found a non-FAIL prior result for ${checkerId}`,
-          )
-        }
-        // Once the durable result index identifies the authoritative attempt,
-        // its pointer must validate. Never fall back to an older result when
-        // the newer receipt is missing, corrupt, or has changed bytes.
-        const pointer = validateDurableResultEvidencePointer(options.resultPointer(checkerId), checkerId)
-        const result = readRegularJson(pointer.path, 'ROADMAP plan-check result').parsed
-        if (!result || result.code !== 'FAIL') {
-          throw new SupervisorIntegrationError(
-            'PLAN_CHECK_EVIDENCE_MISSING',
-            `repaired ROADMAP recheck result bytes are not an exact FAIL for ${checkerId}`,
-          )
-        }
-        if (typeof options.verifyDurableResultReceipt === 'function') {
-          options.verifyDurableResultReceipt(checkerId, result)
-        }
-        return pointer.hash
-      }
-      throw new SupervisorIntegrationError(
-        'PLAN_CHECK_EVIDENCE_MISSING',
-        'repaired ROADMAP recheck lacks an exact durable prior FAIL result',
-      )
-    }
-    const resumeAtPlanRecheck = route === 'ROADMAP' && !resumeAtChecking &&
-      !completedBeforeResume.has('roadmap-plan-check') &&
-      (resumePlanningRetry
-        ? durablePlanningCheckerId === 'roadmap-plan-recheck'
-        : completedBeforeResume.has('roadmap-author-plan-repair') ||
-          Boolean(adoptedWorkResults['roadmap-plan-recheck']))
-    if (resumeAtPlanRecheck) {
-      if (completedBeforeResume.has('roadmap-author-plan-repair') &&
-          !adoptedWorkResults['roadmap-plan-recheck'] &&
-          !adoptedWorkResults['roadmap-plan-recheck-runtime-retry']) {
-        const repaired = adoptedWorkResults['roadmap-author-plan-repair'] ||
-          (typeof options.readResult === 'function'
-            ? options.readResult('roadmap-author-plan-repair') : null)
-        if (!repaired) {
-          throw new SupervisorIntegrationError(
-            'ROADMAP_RESULT_MISSING',
-            'completed ROADMAP plan repair lacks its exact durable author result',
-          )
-        }
-        const repairFailure = unsuccessfulPlanningResult('roadmap-author-plan-repair', repaired)
-        if (repairFailure) return repairFailure
-        roadmapResult = roadmapAuthorArtifact(
-          repaired,
-          roadmapResult && roadmapResult.scoutCorrections || [],
-        )
-        // The repair result can become durable one instruction before the
-        // rendered plan. Deterministically rematerialize those exact bytes
-        // before admitting the resumed recheck.
-        options.writePlan('ROADMAP', decision, roadmapResult, 'roadmap-author-plan-repair')
       }
       planPointer = options.planPointer('ROADMAP')
-      const repairProgressHash = resumePlanningRetry || adoptedWorkResults['roadmap-plan-recheck']
-        ? null
-        : priorPlanFailureEvidenceHash()
-      const recheckAttempt = await runRoadmapPlanCheck({
-        baseId: 'roadmap-plan-recheck',
-        retryId: 'roadmap-plan-recheck-runtime-retry',
-        candidateHash: planPointer.sha256,
-        requestFor: (workItemId, retryProgressHash) => planRecheckRequest(
-          workItemId,
-          planPointer.sha256,
-          planPointer,
-          retryProgressHash,
-          repairProgressHash,
-        ),
-      })
-      if (recheckAttempt.terminal) return recheckAttempt.terminal
-      if (recheckAttempt.result.code && recheckAttempt.result.code !== 'PASS') {
-        return { outcome: 'FAILED', terminalEnvelope: recheckAttempt.result }
-      }
-      completedBeforeResume.add('roadmap-plan-check')
-    }
-    if (route === 'ROADMAP' && !resumeAtChecking && !completedBeforeResume.has('roadmap-plan-check')) {
-      planPointer = options.planPointer('ROADMAP')
-      // The plan checker verifies the frozen roadmap artifact, not the target
-      // workspace. Bind its canonical verdict to the exact roadmap bytes it is
-      // instructed to inspect so a valid PASS or FAIL can enter the repair loop.
-      const resumePlanningRepair = durablePlanningFrontier &&
-        durablePlanningFrontier.kind === 'repair'
-      if (resumePlanningRepair && durablePlanningFrontier.result.candidateHash !== planPointer.sha256) {
-        throw new SupervisorIntegrationError(
-          'CHECK_RETRY_STATE_INVALID',
-          'durable ROADMAP plan repair differs from the current immutable plan bytes',
-        )
-      }
-      const planAttempt = resumePlanningRepair
-        ? {
-            activeId: durablePlanningFrontier.resultId,
-            result: durablePlanningFrontier.result,
-            terminal: null,
+      const sourceEvidence = []
+      if (typeof options.readResult === 'function') {
+        for (const workItemId of legacyPlanningIdsToSkip) {
+          const result = options.readResult(workItemId)
+          if (!result) continue
+          if (typeof options.verifyDurableResultReceipt === 'function') {
+            options.verifyDurableResultReceipt(workItemId, result)
           }
-        : await runRoadmapPlanCheck({
-            baseId: 'roadmap-plan-check',
-            retryId: 'roadmap-plan-check-runtime-retry',
-            candidateHash: planPointer.sha256,
-            requestFor: (workItemId, retryProgressHash) => planCheckRequest(
-              workItemId,
-              planPointer.sha256,
-              planPointer,
-              retryProgressHash,
-            ),
-          })
-      if (planAttempt.terminal) return planAttempt.terminal
-      if (planAttempt.result.code && planAttempt.result.code !== 'PASS') {
-        let planCheckEvidence
-        try {
-          if (typeof options.resultPointer !== 'function') throw new Error('result pointer resolver is unavailable')
-          planCheckEvidence = validateDurableResultEvidencePointer(
-            options.resultPointer(planAttempt.activeId),
-            planAttempt.activeId,
-          )
-        } catch (error) {
-          if (error && error.code === 'PLAN_CHECK_EVIDENCE_MISSING') throw error
-          throw new SupervisorIntegrationError(
-            'PLAN_CHECK_EVIDENCE_MISSING',
-            'ROADMAP plan repair requires the durable exact plan-check result pointer',
-            { cause: error && (error.code || error.message) || 'unknown' },
-          )
-        }
-        const repaired = await launch({
-          workItemId: 'roadmap-author-plan-repair', logicalRole: 'roadmap-author', parent: 'run-owner',
-          purpose: 'planning', repairOf: latestAuthorWorkItemId, executorKey: 'roadmap-author',
-          assignment: 'Repair only the concrete independent plan-check findings in the same author context. Read the exact roadmap-plan-check result through its evidence pointer.',
-          ownership: [{ kind: 'output', identity: 'plan/ROADMAP.md', owner: 'roadmap-author' }], success: successes, checks,
-          manifests: executionOwnership,
-          evidenceHashes: [planCheckEvidence.hash],
-          fetchedEvidence: {
-            scoutCorrections: roadmapResult && roadmapResult.scoutCorrections || [],
-            ...(capturedDomainWorkEvidence || {}),
-            ...(withDescriptiveLikelyAreas(null) || {}),
-          },
-          evidencePointers: [
-            ...scoutWorkIds.map(workItemId => options.resultPointer(workItemId)),
-            planCheckEvidence,
-          ],
-          nextReadyAfter: ['roadmap-plan-recheck'],
-        })
-        const repairFailure = unsuccessfulPlanningResult('roadmap-author-plan-repair', repaired)
-        if (repairFailure) return repairFailure
-        completedBeforeResume.add('roadmap-author-plan-repair')
-        roadmapResult = roadmapAuthorArtifact(
-          repaired,
-          roadmapResult && roadmapResult.scoutCorrections || [],
-        )
-        options.writePlan('ROADMAP', decision, roadmapResult, 'roadmap-author-plan-repair')
-        planPointer = options.planPointer('ROADMAP')
-        const recheckAttempt = await runRoadmapPlanCheck({
-          baseId: 'roadmap-plan-recheck',
-          retryId: 'roadmap-plan-recheck-runtime-retry',
-          candidateHash: planPointer.sha256,
-          requestFor: (workItemId, retryProgressHash) => planRecheckRequest(
+          sourceEvidence.push(Object.freeze({
             workItemId,
-            planPointer.sha256,
-            planPointer,
-            retryProgressHash,
-            planCheckEvidence.hash,
-          ),
-        })
-        if (recheckAttempt.terminal) return recheckAttempt.terminal
-        if (recheckAttempt.result.code && recheckAttempt.result.code !== 'PASS') {
-          return { outcome: 'FAILED', terminalEnvelope: recheckAttempt.result }
+            resultHash: hashText(JSON.stringify(result)),
+            unresolvedHash: hashText(stableStringify({
+              allAssignedItemsPass: result.allAssignedItemsPass,
+              code: result.code || null,
+              remainingConcerns: result.remainingConcerns || [],
+            })),
+          }))
         }
       }
-      completedBeforeResume.add('roadmap-plan-check')
+      deterministicRoadmapPlanningMarker = Object.freeze({
+        code: 'LEGACY_PLANNING_COLLAPSED',
+        executionMode: DETERMINISTIC_ROADMAP_EXECUTION_MODE,
+        planHash: planPointer.sha256,
+        priorPlanHash: resumeState.planHash || null,
+        sourceEvidence: Object.freeze(sourceEvidence),
+        nextReadyWorkIds: Object.freeze([...roadmapProductFrontier]),
+      })
+      if (!resumeAtChecking) {
+        await options.transition('TRANSIENT_RUNTIME', 'RUN_WORK', {
+          planHash: planPointer.sha256,
+          planningFallback: deterministicRoadmapPlanningMarker,
+          nextReadyWorkIds: roadmapProductFrontier,
+        })
+      }
     }
+    if (collapseLegacyPlanningRetry &&
+        durablePlanningFrontier.resultId === 'roadmap-plan-check') {
+      planPointer = options.planPointer('ROADMAP')
+      if (!planPointer || planPointer.sha256 !== durablePlanningPlanHash) {
+        throw new SupervisorIntegrationError(
+          'CHECK_RETRY_STATE_INVALID',
+          'collapsed legacy plan retry differs from the frozen authenticated roadmap bytes',
+        )
+      }
+      await options.transition('TRANSIENT_RUNTIME', 'RUN_WORK', {
+        planHash: planPointer.sha256,
+        checkerId: durablePlanningFrontier.resultId,
+        checkerResultHash: durablePlanningFrontier.checkerResultHash,
+        planningFallback: recoveredRoadmapPlanningFallback,
+        nextReadyWorkIds: roadmapProductFrontier,
+      })
+    }
+    const roadmapPlanningFallback = collapseLegacyRoadmapPlanning
+      ? deterministicRoadmapPlanningMarker
+      : recoveredRoadmapPlanningFallback || deterministicRoadmapPlanningMarker
     if (route === 'ROADMAP' && !planPointer) {
       if (typeof options.planExists !== 'function' || !options.planExists('ROADMAP')) {
         throw new SupervisorIntegrationError(
@@ -12217,95 +15500,22 @@ function createDefaultRouteExecutor(options) {
       }
       planPointer = options.planPointer('ROADMAP')
     }
-    if (route === 'ROADMAP' && !resumeAtChecking && !retainedCoordinator &&
-        !completedBeforeResume.has('mission-coordination')) {
-      if (typeof options.verifyL1RequestPointer === 'function') options.verifyL1RequestPointer()
-      if (roadmapPlanningStartedAt !== null && typeof options.recordRoadmapPlanning === 'function') {
-        const admission = options.recordRoadmapPlanning(
-          Math.max(0, options.monotonicNow() - roadmapPlanningStartedAt),
-        )
-        if (!admission || admission.withinCeiling !== true) {
-          throw new SupervisorIntegrationError(
-            'ADMISSION_COMPONENT_TIMEOUT',
-            'ROADMAP planning exceeded its canonical admission ceiling',
-            admission || {},
-          )
-        }
+    const productWorkEvidence = () => {
+      const evidence = {
+        ...(capturedDomainWorkEvidence || {}),
+        ...(roadmapPlanningFallback ? { roadmapPlanningFallback } : {}),
+        ...(depthGateOutcome.depthProbe === 'PRODUCT_WORKER_REQUIRED'
+          ? { preProductionDepthDirective: depthGateOutcome.directive } : {}),
       }
-      const coordinator = await launch({
-        workItemId: 'mission-coordination', logicalRole: 'mission-coordinator', parent: 'run-owner',
-        purpose: 'planning', retainLease: true,
-        requiredByMission: true,
-        assignment: 'Own dependency ordering and integration for the accepted roadmap.',
-        ownership: admittedReadOwnership, success: successes, checks,
-        roadmapSlice: planPointer, manifests: executionOwnership,
-        fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
-        nextReadyAfter: workerCount >= 2 ? ['roadmap-work-group'] : ['work-1'],
-      })
-      const coordinatorFailure = unsuccessfulPlanningResult('mission-coordination', coordinator)
-      if (coordinatorFailure) {
-        if (coordinator.retainedLease && coordinator.retainedLease.completed !== true) {
-          completeRetainedLease(coordinator.retainedLease)
-        }
-        return coordinatorFailure
-      }
-      retainedCoordinator = coordinator.retainedLease
+      return Object.keys(evidence).length ? evidence : null
     }
-    if (route === 'ROADMAP' && !resumeAtChecking && workerCount >= 2 && !retainedManager &&
-        !completedBeforeResume.has('roadmap-work-group')) {
-      if (!retainedCoordinator) {
-        throw new SupervisorIntegrationError(
-          'CRASH_ADOPTION_CONFLICT',
-          'ROADMAP work group lacks its retained run coordinator in the next ready work',
-        )
-      }
-        const ownership = executionOwnership
-        const workerOwnership = Array.from({ length: workerCount }, (_, index) => ownership
-          .filter(item => item && item.owner === `worker-${index + 1}`)
-          .map(item => item.identity))
-        if (workerOwnership.some(resources => resources.length === 0) ||
-            new Set(workerOwnership.flat()).size !== workerOwnership.flat().length) {
-          throw new SupervisorIntegrationError(
-            'WORK_OWNERSHIP_INVALID',
-            'ROADMAP work-group management requires at least two useful workers with disjoint named ownership',
-          )
-        }
-        const manager = await launch({
-          workItemId: 'roadmap-work-group', logicalRole: 'ap-work-group-manager',
-          parent: 'mission-coordinator', caller: retainedCoordinator.caller,
-          parentLease: retainedCoordinator.schedulerLease, purpose: 'planning', retainLease: true,
-          requiredByMission: true,
-          assignment: decision.workerOwnershipReason ||
-            'Admit the accepted ROADMAP work group with disjoint worker ownership.',
-          ownership: admittedReadOwnership, success: successes, checks,
-          roadmapSlice: planPointer, manifests: executionOwnership,
-          fetchedEvidence: withDescriptiveLikelyAreas(capturedDomainWorkEvidence),
-          workGroupAdmission: {
-            route: 'ROADMAP',
-            parentRoleId: 'mission-coordinator',
-            managerRoleId: 'ap-work-group-manager',
-            usefulWorkerCount: workerCount,
-            disjointMutableResourceOwnershipRequired: true,
-            workerAssignments: workerOwnership.map((mutableResourceIdentities, index) => ({
-              workerAssignmentId: `work-${index + 1}`,
-              workerLogicalRoleId: 'worker',
-              workerMode: 'implementation',
-              mutableResourceIdentities,
-            })),
-          },
-          nextReadyAfter: Array.from({ length: workerCount }, (_, index) => `work-${index + 1}`),
-        })
-        const managerFailure = unsuccessfulPlanningResult('roadmap-work-group', manager)
-        if (managerFailure) {
-          if (manager.retainedLease && manager.retainedLease.completed !== true) {
-            completeRetainedLease(manager.retainedLease)
-          }
-          if (retainedCoordinator && retainedCoordinator.completed !== true) {
-            completeRetainedLease(retainedCoordinator)
-          }
-          return managerFailure
-        }
-        retainedManager = manager.retainedLease
+    const planningCorrectionConsumed = Boolean(roadmapPlanningFallback &&
+      roadmapPlanningFallback.code === 'PLAN_CORRECTED_PRODUCT_VERIFICATION_REQUIRED')
+    if (collapseLegacyRoadmapPlanning) {
+      if (retainedManager && retainedManager.completed !== true) completeRetainedLease(retainedManager)
+      if (retainedCoordinator && retainedCoordinator.completed !== true) completeRetainedLease(retainedCoordinator)
+      retainedManager = null
+      retainedCoordinator = null
     }
     const requiredWorkIds = Array.from({ length: workerCount }, (_, index) => `work-${index + 1}`)
     const satisfiedWorkIds = new Set(completedBeforeResume)
@@ -12330,7 +15540,13 @@ function createDefaultRouteExecutor(options) {
     }
     for (const workItemId of requiredWorkIds) {
       if (adoptedWorkResults[workItemId]) {
-        if (adoptedWorkResults[workItemId].allAssignedItemsPass === false) {
+        if (queuedTransportRetry && queuedTransportRetry.baseId === workItemId &&
+            adoptedWorkResults[workItemId].terminalEnvelope &&
+            adoptedWorkResults[workItemId].terminalEnvelope.status === 'CHILD_TRANSPORT_TIMEOUT') {
+          continue
+        }
+        if (adoptedWorkResults[workItemId].code === 'SPLIT_REQUIRED' ||
+            adoptedWorkResults[workItemId].allAssignedItemsPass === false) {
           if (adoptedWorkResults[workItemId].reconstructedTerminal === true) {
             throw new SupervisorIntegrationError(
               'CODEX_TYPED_TERMINAL_MISSING',
@@ -12338,8 +15554,29 @@ function createDefaultRouteExecutor(options) {
               { workItemId },
             )
           }
-          adoptedUnsuccessfulWork = unsuccessfulWorkTerminal(workItemId, adoptedWorkResults[workItemId])
-          continue
+          const candidatePath = deferredPromotion && deferredPromotion.workspacePath || options.targetPath
+          const produced = usableDeliverablesProducedByWorker(
+            adoptedWorkResults[workItemId],
+            candidatePath,
+            options.gitEnvironment(candidatePath),
+            deferredPromotion && deferredPromotion.mutationAdmission ||
+              (typeof options.readMutationAdmission === 'function'
+                ? options.readMutationAdmission(workItemId) : null),
+          )
+          if (produced.length === 0) {
+            adoptedUnsuccessfulWork = unsuccessfulWorkTerminal(
+              workItemId,
+              adoptedWorkResults[workItemId],
+              adoptedWorkResults[workItemId].code === 'SPLIT_REQUIRED'
+                ? {
+                    code: 'IMPLEMENTATION_WORK_INCOMPLETE',
+                    reason: 'the assigned worker requested decomposition but produced no exact admitted usable deliverable',
+                  }
+                : {},
+            )
+            continue
+          }
+          acceptedWorkResults.set(workItemId, adoptedWorkResults[workItemId])
         }
         satisfiedWorkIds.add(workItemId)
       }
@@ -12358,40 +15595,82 @@ function createDefaultRouteExecutor(options) {
       for (let index = 0; index < workerCount; index += 1) {
         const workItemId = `work-${index + 1}`
         const alreadyCompleted = satisfiedWorkIds.has(workItemId)
-        if (resumeInWork && route === 'ROADMAP' &&
-            !(retainedManager || retainedCoordinator)) {
-          throw new SupervisorIntegrationError(
-            'CRASH_ADOPTION_CONFLICT',
-          `persisted ROADMAP next ready work lacks the retained parent topology for ${workItemId}`,
-          )
-        }
         const responsibility = decision.workerResponsibilities && decision.workerResponsibilities[index]
         const namedOwnership = executionOwnership.length
           ? executionOwnership
               .filter(item => item && item.owner === `worker-${index + 1}`)
               .map(item => item.identity)
           : []
-        let workResult = alreadyCompleted
-          ? adoptedWorkResults[workItemId] ||
-            (typeof options.readResult === 'function' ? options.readResult(workItemId) : null)
-          : await launch({
+        const transportRetryId = `${workItemId}-transport-retry-1`
+        const workerRequest = {
           workItemId, logicalRole: 'worker',
-          parent: retainedManager ? 'ap-work-group-manager' : route === 'ROADMAP' ? 'mission-coordinator' : 'run-owner',
-          caller: retainedManager ? retainedManager.caller : retainedCoordinator && retainedCoordinator.caller,
-          parentLease: retainedManager
-            ? retainedManager.schedulerLease
-            : retainedCoordinator && retainedCoordinator.schedulerLease,
-          purpose: 'work', assignment: `${responsibility || decision.requestedResult} Implement every typed acceptance case in fetchedEvidence.verificationObligations, including inactive, intermediate, negative, and boundary behavior; run those cases before returning.${boundedToolOutputDiscipline}`,
+          parent: 'run-owner',
+          caller: null,
+          parentLease: null,
+          purpose: 'work', assignment: `${responsibility || 'Complete the canonical original request bound to this child launch.'} Implement and run every acceptance case explicitly typed in fetchedEvidence.verificationObligations. Exercise the strongest applicable counterexamples without inventing inactive, intermediate, negative, or boundary semantics that the assignment does not declare. Finish the full assignment in this single production turn; do not request decomposition or additional workers.${boundedToolOutputDiscipline}`,
           routeDecisionHash: hashText(stableStringify(decision)),
           ownership: namedOwnership.length ? namedOwnership : ['workspace'],
           success: successes, checks,
           roadmapSlice: planPointer, manifests: executionOwnership,
-          fetchedEvidence: typedWorkEvidence(capturedDomainWorkEvidence),
+          fetchedEvidence: typedWorkEvidence(productWorkEvidence()),
           deferPromotion: Boolean(doneRetryBoundary),
           difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
           risk: (decision.risks || []).length ? 'high' : 'ordinary',
           nextReadyAfter: requiredWorkIds.slice(index + 1),
-        })
+          ...(!productionTransportContingencyConsumed
+            ? { transportFailureRetryId: transportRetryId } : {}),
+        }
+        let transportRetryLaunched = false
+        let workResult = alreadyCompleted
+          ? completedTransportRetryResults.get(workItemId) ||
+            adoptedWorkResults[workItemId] ||
+            (typeof options.readResult === 'function' ? options.readResult(workItemId) : null)
+          : queuedTransportRetry && queuedTransportRetry.baseId === workItemId
+            ? pendingTransportRetryResult
+            : await launchWorker(workerRequest)
+        if (!alreadyCompleted && workResult && workResult.terminalEnvelope &&
+            workResult.terminalEnvelope.status === 'CHILD_TRANSPORT_TIMEOUT' &&
+            (!productionTransportContingencyConsumed ||
+              queuedTransportRetry && queuedTransportRetry.baseId === workItemId)) {
+          productionTransportContingencyConsumed = true
+          const priorTransportResultHash = hashText(JSON.stringify(workResult))
+          const hasImmediateQuarantineDisposition = Object.prototype.hasOwnProperty.call(
+            workResult,
+            TRANSPORT_QUARANTINE_POINTER,
+          )
+          const quarantinePointer = hasImmediateQuarantineDisposition
+            ? workResult[TRANSPORT_QUARANTINE_POINTER]
+            : typeof options.transportQuarantinePointer === 'function'
+              ? options.transportQuarantinePointer({
+                  sourceWorkItemId: workItemId,
+                  retryWorkItemId: transportRetryId,
+                  transportResult: workResult,
+                })
+              : null
+          transportRetryLaunched = true
+          const transportRetryRequest = {
+            ...workerRequest,
+            workItemId: transportRetryId,
+            executorKey: workItemId,
+            transportFailureRetryId: null,
+            evidenceHashes: [priorTransportResultHash],
+            strategyFingerprint: hashText(stableStringify({
+              kind: 'provider-transport-retry',
+              workItemId,
+              priorTransportResultHash,
+            })),
+            assignment: `${workerRequest.assignment} Resume the same exact assignment after the prior provider transport ended; complete it in this one bounded contingency turn.${quarantinePointer ? ' The controller has loaded the receipt-bound partial work product into this fresh workspace; inspect those bytes and report every file that differs from the canonical target, including preloaded changes.' : ''}`,
+          }
+          if (quarantinePointer) {
+            Object.defineProperty(transportRetryRequest, TRANSPORT_QUARANTINE_POINTER, {
+              enumerable: false,
+              configurable: false,
+              writable: false,
+              value: quarantinePointer,
+            })
+          }
+          workResult = await launchWorker(transportRetryRequest)
+        }
         if (alreadyCompleted && !workResult) {
           throw new SupervisorIntegrationError(
             'CRASH_ADOPTION_CONFLICT',
@@ -12416,89 +15695,38 @@ function createDefaultRouteExecutor(options) {
           }
           options.verifyDurableResultReceipt(workItemId, workResult)
         }
-        const liveRuntimeSignals = canonicalWorkerRuntimeSignals(workResult)
-        if (liveRuntimeSignals && depthGateOutcome.depthProbe !== 'PASS') {
-          const liveTriggers = selectRuntimeGateTriggers(recipe.selection, liveRuntimeSignals)
-          if (liveTriggers.depthProber.required) {
-            depthGateOutcome = await executePreProductionRuntimeGates({
-              recipe: {
-                ...recipe,
-                runtimeGatePlan: { ...recipe.runtimeGatePlan, triggers: liveTriggers },
-              },
-              launch,
-              ownership: admittedReadOwnership,
-              fetchedEvidence: withDescriptiveLikelyAreas(null),
-              durableResult: durableCompletedGateResult('conditional-depth-prober'),
-              nextReadyAfter: requiredWorkIds.filter(
-                id => id !== workItemId && !satisfiedWorkIds.has(id),
-              ),
-            })
+        const workerReportedIncomplete = Boolean(workResult &&
+          (workResult.code === 'SPLIT_REQUIRED' || workResult.allAssignedItemsPass === false))
+        if (workerReportedIncomplete) {
+          const resultPromotion = workResult && workResult.deferredPromotion
+          const candidatePath = resultPromotion && resultPromotion.workspacePath ||
+            deferredPromotion && deferredPromotion.workspacePath || options.targetPath
+          const produced = usableDeliverablesProducedByWorker(
+            workResult,
+            candidatePath,
+            options.gitEnvironment(candidatePath),
+            workResult[MUTATION_ADMISSION_EVIDENCE] ||
+              resultPromotion && resultPromotion.mutationAdmission ||
+              deferredPromotion && deferredPromotion.mutationAdmission ||
+              (typeof options.readMutationAdmission === 'function'
+                ? options.readMutationAdmission(workItemId) : null),
+          )
+          if (produced.length === 0) {
+            if (resultPromotion && typeof resultPromotion.abort === 'function') {
+              await resultPromotion.abort('implementation worker produced no usable deliverable')
+            } else if (deferredPromotion) {
+              await deferredPromotion.abort('implementation worker produced no usable deliverable')
+            }
+            return unsuccessfulWorkTerminal(workItemId, workResult, workResult.code === 'SPLIT_REQUIRED'
+              ? {
+                  code: 'IMPLEMENTATION_WORK_INCOMPLETE',
+                  reason: 'the assigned worker requested decomposition but produced no exact admitted usable deliverable',
+                }
+              : {})
           }
         }
-        if (workResult && workResult.code === 'SPLIT_REQUIRED') {
-          if (doneRetryBoundary) {
-            throw new SupervisorIntegrationError(
-              'SPLIT_DECOMPOSITION_INVALID',
-              'a DONE retry version cannot branch into parent decomposition',
-            )
-          }
-          const split = consumeSplitRequired(workResult, {
-            route, depth: 0, remainingLaunches: 3, parentWorkItemId: workItemId,
-          })
-          const splitResults = []
-          const splitWorkIds = split.parts.map(part => part.workItemId)
-          for (const part of split.parts) {
-            let childResult = typeof options.readResult === 'function'
-              ? options.readResult(part.workItemId) : null
-            if (childResult) {
-              if (typeof options.resultPointer !== 'function' ||
-                  typeof options.verifyDurableResultReceipt !== 'function') {
-                throw new SupervisorIntegrationError(
-                  'CRASH_ADOPTION_CONFLICT',
-                  `completed split worker ${part.workItemId} lacks exact durable authentication`,
-                )
-              }
-              const pointer = validateDurableResultEvidencePointer(
-                options.resultPointer(part.workItemId), part.workItemId,
-              )
-              const receiptResult = readRegularJson(
-                pointer.path, `completed ${part.workItemId} result`,
-              ).parsed
-              if (stableStringify(childResult) !== stableStringify(receiptResult)) {
-                throw new SupervisorIntegrationError(
-                  'CRASH_ADOPTION_CONFLICT',
-                  `completed split worker ${part.workItemId} differs from its exact receipt bytes`,
-                )
-              }
-              options.verifyDurableResultReceipt(part.workItemId, childResult)
-            } else childResult = await launch({
-              workItemId: part.workItemId, logicalRole: 'worker',
-              parent: retainedManager ? 'ap-work-group-manager' : route === 'ROADMAP' ? 'mission-coordinator' : 'run-owner',
-              caller: retainedManager ? retainedManager.caller : retainedCoordinator && retainedCoordinator.caller,
-              parentLease: retainedManager
-                ? retainedManager.schedulerLease
-                : retainedCoordinator && retainedCoordinator.schedulerLease,
-              purpose: 'work', assignment: part.assignment,
-              ownership: namedOwnership.length ? namedOwnership : ['workspace'],
-              success: successes, checks, roadmapSlice: planPointer,
-              manifests: executionOwnership,
-              fetchedEvidence: typedWorkEvidence(capturedDomainWorkEvidence),
-              difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
-              risk: (decision.risks || []).length ? 'high' : 'ordinary',
-              recoveryGroupWorkIds: splitWorkIds,
-              recoveryJoinWorkIds: requiredWorkIds.filter(
-                id => id !== workItemId && !satisfiedWorkIds.has(id),
-              ),
-              nextReadyAfter: splitWorkIds.filter(id => id !== part.workItemId),
-            })
-            if (childResult && childResult.code === 'SPLIT_REQUIRED') {
-              consumeSplitRequired(childResult, {
-                route, depth: 1, remainingLaunches: 0, parentWorkItemId: part.workItemId,
-              })
-            }
-            splitResults.push(childResult)
-          }
-          workResult = { ...workResult, splitConsumedByParent: true, splitResults }
+        if (transportRetryLaunched && transportRetrySucceeded(workResult)) {
+          successfulTransportRetryIds.set(workItemId, transportRetryId)
         }
         if (doneRetryBoundary) {
           if (!workResult || !workResult.deferredPromotion ||
@@ -12511,10 +15739,6 @@ function createDefaultRouteExecutor(options) {
             )
           }
           deferredPromotion = workResult.deferredPromotion
-        }
-        if (workResult && workResult.allAssignedItemsPass === false) {
-          if (deferredPromotion) await deferredPromotion.abort('implementation worker reported an unsuccessful assignment')
-          return unsuccessfulWorkTerminal(workItemId, workResult)
         }
         acceptedWorkResults.set(workItemId, workResult)
         satisfiedWorkIds.add(workItemId)
@@ -12545,10 +15769,55 @@ function createDefaultRouteExecutor(options) {
     let candidateHash = deferredPromotion && deferredPromotion.candidateHash ||
       resumeState && resumeState.candidateHash ||
       hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
+    const usableCandidatePath = deferredPromotion && deferredPromotion.workspacePath || options.targetPath
+    let usableDeliverables = changedDeliverables(usableCandidatePath, options.gitEnvironment(usableCandidatePath))
+    let finalResponse = null
+    if (usableDeliverables.length === 0) {
+      for (const workItemId of requiredWorkIds) {
+        if (!acceptedWorkResults.has(workItemId) && typeof options.readResult === 'function') {
+          const persisted = options.readResult(workItemId)
+          if (persisted) acceptedWorkResults.set(workItemId, persisted)
+        }
+      }
+      let candidate = null
+      try {
+        candidate = createStructuredFinalResponseCandidate(
+          decision,
+          requiredWorkIds.map(workItemId => ({
+            workItemId,
+            result: acceptedWorkResults.get(workItemId),
+          })),
+        )
+      } catch (error) {
+        // An invalid or incomplete worker report is not a controller-authored
+        // product defect. Preserve the frozen zero-diff candidate for the
+        // independent checker; only a valid report can become the response.
+        if (!error || error.code !== 'STRUCTURED_FINAL_RESPONSE_INVALID') throw error
+      }
+      if (candidate && typeof options.persistStructuredFinalResponse === 'function') {
+        const evidencePointer = validateStructuredFinalResponsePointer(
+          options.persistStructuredFinalResponse(candidate, { candidateHash }),
+        )
+        const reopened = readRegularJson(
+          evidencePointer.path,
+          'structured final-response version being checked',
+        ).parsed
+        if (stableStringify(reopened) !== stableStringify(candidate)) {
+          throw new SupervisorIntegrationError(
+            'STRUCTURED_FINAL_RESPONSE_INVALID',
+            'immutable structured final-response version changed after persistence',
+          )
+        }
+        finalResponse = Object.freeze({ ...candidate, evidencePointer })
+      } else if (candidate) {
+        finalResponse = candidate
+      }
+    }
     const dependencyHash = hashText(stableStringify({
       planPointer,
       requiredWorkIds,
       completedWorkIds: [...satisfiedWorkIds].sort(),
+      structuredFinalResponseHash: finalResponse && finalResponse.responseHash || null,
     }))
     const environmentHash = hashEnvironment(options.gitEnvironment())
     const checking = validateLiveCheckingPlan(decision)
@@ -12575,11 +15844,24 @@ function createDefaultRouteExecutor(options) {
         capturedDomainContracts,
         accepted.capturedDomainOutcomes,
       )
+      const restoredLimitations = accepted && accepted.verificationLimited === true
+        ? canonicalVerificationLimitationSummaries(accepted.verificationLimitations, {
+            requireCanonicalOrder: true,
+          })
+        : null
+      const restoredLimitationJoinHash = restoredLimitations && hashText(stableStringify({
+        candidateHash,
+        verificationLimitations: restoredLimitations,
+      }))
+      const restoredDomainJoinValid = restoredEvaluation && restoredEvaluation.valid &&
+        restoredEvaluation.localDoneAllowed &&
+        hashText(JSON.stringify(restoredEvaluation)) === accepted.domainEvaluationHash
+      const restoredLimitationJoinValid = restoredLimitations &&
+        accepted.acceptanceJoinHash === restoredLimitationJoinHash
       if (!accepted || accepted.candidateHash !== candidateHash ||
           !Array.isArray(accepted.checkHashes) || accepted.checkHashes.length === 0 ||
           accepted.checkHashes.some(value => !/^[a-f0-9]{64}$/.test(value || '')) ||
-          !restoredEvaluation || !restoredEvaluation.valid || !restoredEvaluation.localDoneAllowed ||
-          hashText(JSON.stringify(restoredEvaluation)) !== accepted.domainEvaluationHash) {
+          (!restoredDomainJoinValid && !restoredLimitationJoinValid)) {
         throw new SupervisorIntegrationError(
           'DONE_RETRY_RECOVERY_INVALID',
           'promoted DONE retry resume lacks its exact accepted checker/domain join',
@@ -12602,36 +15884,56 @@ function createDefaultRouteExecutor(options) {
         outcome: 'DONE',
         checkHashes: accepted.checkHashes,
         deliverables: changedDeliverables(options.targetPath, options.gitEnvironment()),
-        terminalEnvelope: { candidateHash, checkCount: accepted.checkHashes.length, resumedPromotion: true },
-      }
-    }
-    const usableCandidatePath = deferredPromotion && deferredPromotion.workspacePath || options.targetPath
-    let usableDeliverables = changedDeliverables(usableCandidatePath, options.gitEnvironment(usableCandidatePath))
-    let finalResponse = null
-    if (readOnlyRequestedEffect(decision)) {
-      for (const workItemId of requiredWorkIds) {
-        if (!acceptedWorkResults.has(workItemId) && typeof options.readResult === 'function') {
-          const persisted = options.readResult(workItemId)
-          if (persisted) acceptedWorkResults.set(workItemId, persisted)
-        }
-      }
-      finalResponse = createReadOnlyFinalResponse(decision, requiredWorkIds.map(workItemId => ({
-        workItemId,
-        result: acceptedWorkResults.get(workItemId),
-      })))
-    }
-    const mutatingEffect = decision.normalizedRouteFacts &&
-      decision.normalizedRouteFacts.requestedEffect === 'mutate'
-    if (!resumeAtChecking && mutatingEffect && usableDeliverables.length === 0) {
-      if (deferredPromotion) await deferredPromotion.abort('exact version has no user-usable deliverable')
-      return {
-        outcome: 'FAILED',
-        checkHashes: [],
-        deliverables: [],
         terminalEnvelope: {
-          status: 'USER_USABLE_BUILD_REQUIRED',
-          reason: 'missing user-usable deliverable short-circuited before the independent checker group',
+          status: restoredLimitations ? 'DONE_WITH_VERIFICATION_LIMITATIONS' : 'DONE',
           candidateHash,
+          checkCount: accepted.checkHashes.length,
+          resumedPromotion: true,
+          ...(hiddenExternalBoundary ? {
+            externalVerification: {
+              verificationRoute: 'EXTERNALLY_VERIFIABLE_ONLY',
+              oracleStatus: 'NOT_RUN',
+              acceptanceStatus: 'PENDING',
+              localCandidateStatus: 'DONE',
+            },
+          } : {}),
+          ...(restoredLimitations ? { limitations: restoredLimitations } : {}),
+        },
+      }
+    }
+    const preserveInconclusiveCandidate = async (
+      checkerId,
+      checkerResult,
+      reason,
+      transitionRequired = true,
+    ) => {
+      const checkerResultHash = hashText(stableStringify(checkerResult || null))
+      if (transitionRequired) {
+        await options.transition('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
+          candidateHash,
+          checkerId,
+          checkerResultHash,
+          controllerReason: reason,
+          nextReadyWorkIds: [],
+        })
+      }
+      if (deferredPromotion) {
+        await deferredPromotion.abort('independent checker remained non-authoritative')
+      }
+      const preservedCandidateHash = deferredPromotion
+        ? hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
+        : candidateHash
+      return {
+        outcome: 'PARTIAL',
+        deliverables: changedDeliverables(options.targetPath, options.gitEnvironment()),
+        terminalEnvelope: {
+          status: 'CHECK_REMAINS_INCONCLUSIVE',
+          reason: 'The usable exact version remains available, but the bounded local checker did not produce command-bound acceptance evidence.',
+          currentVersionHash: preservedCandidateHash,
+          checkerId,
+          checkerResultHash,
+          controllerReason: reason,
+          usableCandidatePreserved: true,
         },
       }
     }
@@ -12639,7 +15941,8 @@ function createDefaultRouteExecutor(options) {
       ? await resumeAdoptedLaunches({ resumeState, candidateHash, decision, stage: 'check' })
       : {}
     const durableIndependentFrontier = (() => {
-      if (!resumeState || !['CHECK_WORK', 'CHECK_INCONCLUSIVE'].includes(resumeState.resumeState) ||
+      if (!resumeState || collapseLegacyRoadmapPlanning ||
+          !['CHECK_WORK', 'CHECK_INCONCLUSIVE'].includes(resumeState.resumeState) ||
           !Array.isArray(resumeState.nextReadyWorkIds) ||
           typeof options.readResult !== 'function' || typeof options.resultPointer !== 'function') return null
       if (resumeState.nextReadyWorkIds.length > 1) {
@@ -12730,15 +16033,15 @@ function createDefaultRouteExecutor(options) {
           }
         }
       }
-      const result = options.readResult(checkerId)
-      if (!result) {
+      const durableResult = options.readResult(checkerId)
+      if (!durableResult) {
         throw new SupervisorIntegrationError(
           'CHECK_RETRY_STATE_INVALID',
           `durable ${checkerId} recovery lacks its exact committed checker result`,
         )
       }
-      if ((result.currentVersionHash && result.currentVersionHash !== candidateHash) ||
-          (result.candidateHash && result.candidateHash !== candidateHash)) {
+      if ((durableResult.currentVersionHash && durableResult.currentVersionHash !== candidateHash) ||
+          (durableResult.candidateHash && durableResult.candidateHash !== candidateHash)) {
         throw new SupervisorIntegrationError(
           'CHECK_RETRY_STATE_INVALID',
           `durable ${checkerId} result differs from the exact version being resumed`,
@@ -12774,7 +16077,7 @@ function createDefaultRouteExecutor(options) {
         options.verifyDurableResultReceipt(pendingRetry.checkerId, baseResult)
       }
       if (pendingRetry && sourceKind === 'retry' &&
-          hashText(JSON.stringify(result)) !== pendingRetry.checkerResultHash) {
+          hashText(JSON.stringify(durableResult)) !== pendingRetry.checkerResultHash) {
         throw new SupervisorIntegrationError(
           'CHECK_RETRY_STATE_INVALID',
           `durable ${checkerId} base result differs from its exact retry marker`,
@@ -12782,7 +16085,7 @@ function createDefaultRouteExecutor(options) {
       }
       const pointer = validateDurableResultEvidencePointer(options.resultPointer(checkerId), checkerId)
       const receiptResult = readRegularJson(pointer.path, `durable ${checkerId} recovery result`).parsed
-      if (stableStringify(result) !== stableStringify(receiptResult)) {
+      if (stableStringify(durableResult) !== stableStringify(receiptResult)) {
         throw new SupervisorIntegrationError(
           'CHECK_RETRY_STATE_INVALID',
           `durable ${checkerId} result differs from its exact receipt bytes`,
@@ -12794,7 +16097,15 @@ function createDefaultRouteExecutor(options) {
           `durable ${checkerId} recovery requires its authenticated terminal receipt`,
         )
       }
-      options.verifyDurableResultReceipt(checkerId, result)
+      options.verifyDurableResultReceipt(checkerId, durableResult)
+      // Authenticate the immutable bytes first, then apply the same terminal
+      // normalization used by a live checker. Older checkpoints could persist
+      // an exact capability-only limitation with aggregate code FAIL and a
+      // repair frontier. Treating that legacy spelling as an implementation
+      // defect only after a crash made recovery diverge from live execution.
+      const result = canonicalizeCheckerTerminalResult(durableResult)
+      const legacyCapabilityOnlyFail = durableResult.code === 'FAIL' &&
+        result.code === 'CHECK_INCONCLUSIVE'
       const nonAuthoritative = !['PASS', 'FAIL'].includes(result.code)
       const priorFailureFingerprints = new Set()
       if (activeRepairAttempt > 0 && typeof options.readResult === 'function') {
@@ -12813,7 +16124,7 @@ function createDefaultRouteExecutor(options) {
       )
       const repairEligible = result.code === 'FAIL' &&
         !repeatedFailure &&
-        workerCount === 1 && !doneRetryBoundary
+        activeRepairAttempt === 0 && !doneRetryBoundary
       const expectedNext = sourceKind === 'retry'
         ? [`${checkerId}-runtime-retry-1`]
         : result.code === 'PASS'
@@ -12822,10 +16133,27 @@ function createDefaultRouteExecutor(options) {
               (activeRepairAttempt > 0 ? `-repair-${activeRepairAttempt}` : '')]
             : []
           : repairEligible ? [`work-1-repair-${activeRepairAttempt + 1}`] : []
-      if (stableStringify(resumeState.nextReadyWorkIds) !== stableStringify(expectedNext)) {
+      const resumedNextReady = resumeState.nextReadyWorkIds || []
+      // Releases before the bounded-topology policy could persist an implicit
+      // second checker or a second implementation repair.  Authenticate and
+      // consume those old receipts, but collapse their now-obsolete frontier
+      // instead of turning a usable product into a controller failure.
+      const legacyImplicitSecondChecker = checkerCount === 1 &&
+        stableStringify(resumedNextReady) === stableStringify([
+          `independent-check-2${activeRepairAttempt > 0 ? `-repair-${activeRepairAttempt}` : ''}`,
+        ]) && (result.code === 'PASS' || nonAuthoritative ||
+          checkerResultHasExactVerificationLimitation(result))
+      const legacyExcessRepair = activeRepairAttempt >= 1 && result.code === 'FAIL' &&
+        stableStringify(resumedNextReady) ===
+          stableStringify([`work-1-repair-${activeRepairAttempt + 1}`])
+      const legacyCapabilityRepair = legacyCapabilityOnlyFail &&
+        stableStringify(resumedNextReady) ===
+          stableStringify([`work-1-repair-${activeRepairAttempt + 1}`])
+      if (stableStringify(resumedNextReady) !== stableStringify(expectedNext) &&
+          !legacyImplicitSecondChecker && !legacyExcessRepair && !legacyCapabilityRepair) {
         throw new SupervisorIntegrationError(
           'CHECK_RETRY_STATE_INVALID',
-          `durable ${checkerId} result differs from its exact physical continuation: expected ${JSON.stringify(expectedNext)}, received ${JSON.stringify(resumeState.nextReadyWorkIds)}`,
+          `durable ${checkerId} result differs from its exact physical continuation: expected ${JSON.stringify(expectedNext)}, received ${JSON.stringify(resumedNextReady)}`,
         )
       }
       return Object.freeze({
@@ -12834,7 +16162,7 @@ function createDefaultRouteExecutor(options) {
           : repairEligible ? 'repair' : 'terminal',
         fromRetryState: Boolean(pendingRetry), nextReadyId, checkerId, checkerIndex,
         repairAttempt: repairEligible ? activeRepairAttempt + 1 : activeRepairAttempt || repairAttempt, result, pointer,
-        checkerResultHash: hashText(JSON.stringify(result)), nonAuthoritative,
+        checkerResultHash: hashText(JSON.stringify(durableResult)), nonAuthoritative,
       })
     })()
     if (durableIndependentFrontier && durableIndependentFrontier.fromRetryState &&
@@ -12855,25 +16183,36 @@ function createDefaultRouteExecutor(options) {
               `work-1-repair-${durableIndependentFrontier.repairAttempt}`] : [],
       })
     }
+    let durableRecoveredVerificationLimitation = null
     if (durableIndependentFrontier && durableIndependentFrontier.kind === 'terminal') {
-      if (deferredPromotion) await deferredPromotion.abort('durable independent checker terminal result did not pass')
       if (durableIndependentFrontier.result.code === 'FAIL') {
+        if (deferredPromotion) await deferredPromotion.abort('durable independent checker found a concrete defect')
         return { outcome: 'FAILED', terminalEnvelope: durableIndependentFrontier.result, checkHashes: [] }
       }
-      await options.transition('CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK', {
-        candidateHash,
-        checkerId: durableIndependentFrontier.checkerId,
-        checkerResultHash: durableIndependentFrontier.checkerResultHash,
-        retryAttempt: durableIndependentFrontier.fromRetryState ? 1 : 0,
-      })
-      return {
-        outcome: 'PARTIAL', checkHashes: [],
-        terminalEnvelope: {
-          ...durableIndependentFrontier.result,
-          status: 'CHECK_REMAINS_INCONCLUSIVE',
-          reason: durableIndependentFrontier.result.cause && durableIndependentFrontier.result.cause.reason ||
-            'the durable isolated checker retry remained non-authoritative',
-        },
+      if (!checkerResultHasExactVerificationLimitation(durableIndependentFrontier.result)) {
+        return preserveInconclusiveCandidate(
+          durableIndependentFrontier.checkerId,
+          durableIndependentFrontier.result,
+          'DURABLE_CHECKER_REMAINED_NON_AUTHORITATIVE',
+          !durableIndependentFrontier.fromRetryState,
+        )
+      }
+      durableRecoveredVerificationLimitation = canonicalizeCheckerVerificationLimitation(
+        durableIndependentFrontier.result,
+      )
+      if (durableIndependentFrontier.fromRetryState) {
+        await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
+          candidateHash,
+          checkerId: durableIndependentFrontier.checkerId,
+          checkerResultHash: hashText(stableStringify(durableRecoveredVerificationLimitation)),
+          retryAttempt: 1,
+          verificationLimitation: true,
+          nextReadyWorkIds: durableIndependentFrontier.checkerIndex + 1 < checkerCount
+            ? [`independent-check-${durableIndependentFrontier.checkerIndex + 2}` +
+              (durableIndependentFrontier.repairAttempt > 0
+                ? `-repair-${durableIndependentFrontier.repairAttempt}` : '')]
+            : [],
+        })
       }
     }
     const checkHashes = []
@@ -12904,16 +16243,43 @@ function createDefaultRouteExecutor(options) {
         ? complete
         : [`checker-responsibility:${checking.responsibilities[seat]}`]
     })
+    // The immutable pre-mutation baseline is populated exclusively by
+    // executeExistingTestBaseline(trustedTestDeclarations) and its record hash
+    // binds each exact executed command. createPreMutationBaseline deliberately
+    // projects away declaration-source labels, so the persisted baseline itself
+    // is the authority boundary. Route-analysis prose remains a named
+    // obligation, never a shell allowlist. Checks without an exact baseline
+    // command use the conservative candidate-harness observation mode below.
+    const controllerVerificationCommands = [...new Set((persistedBaseline &&
+      Array.isArray(persistedBaseline.existingTests) ? persistedBaseline.existingTests : [])
+      .filter(item => item && item.command)
+      .map(item => String(item.command)).filter(command => command.trim()))]
+    const checkerCommandBindingsBySeat = checkerNamedChecksBySeat.map(checkIds =>
+      checkIds.flatMap(checkId => controllerVerificationCommands
+        .map(command => ({ checkId, command }))))
+    const checkerInvariantRequirementsBySeat = Array.from(
+      { length: checkerCount },
+      (_, seat) => requiredReferenceInvariantCategories(
+        verificationObligationsBySeat[seat],
+        checkerNamedChecksBySeat[seat],
+      ),
+    )
     const canonicalSeatTestOutcomes = (supplied, seat) =>
       canonicalCheckerTestOutcomes(supplied, checkerNamedChecksBySeat[seat])
     const independentVerdicts = []
     const finalFindings = []
     const regressionOutcomeGroups = []
     const capturedDomainOutcomes = []
-    const checkerDomainContracts = fixturePrebuildOutcome
-      ? capturedDomainContracts.filter(contract => contract.kind !== 'FIXTURE_PROVENANCE')
-      : capturedDomainContracts
+    const checkerDomainContracts = capturedDomainContracts.filter(contract =>
+      !['IMAGE_DATUM', 'HIDDEN_EXTERNAL_ORACLE'].includes(contract.kind) &&
+      (!fixturePrebuildOutcome || contract.kind !== 'FIXTURE_PROVENANCE'))
     const completedCheckResults = new Map()
+    if (durableRecoveredVerificationLimitation) {
+      completedCheckResults.set(`independent-check-${durableIndependentFrontier.checkerIndex + 1}`, {
+        workItemId: durableIndependentFrontier.checkerId,
+        result: durableRecoveredVerificationLimitation,
+      })
+    }
     if (durableIndependentFrontier && durableIndependentFrontier.kind === 'accepted') {
       completedCheckResults.set(`independent-check-${durableIndependentFrontier.checkerIndex + 1}`, {
         workItemId: durableIndependentFrontier.checkerId,
@@ -12992,7 +16358,24 @@ function createDefaultRouteExecutor(options) {
     let checkerRuntimeProgressHashes = Array.from({ length: checkerCount }, () => null)
     let checkerRuntimeReasons = Array.from({ length: checkerCount }, () => null)
     let checkerControllerAcceptedResults = Array.from({ length: checkerCount }, () => null)
+    // A checker seat receives at most one report-only correction for the whole
+    // run, not one per candidate generation. Otherwise a base report retry can
+    // produce a concrete defect, consume the single product repair, and then
+    // silently earn another report retry on the repaired version. Besides
+    // duplicating verification cost, that combined path exceeds the bounded
+    // one-worker ROADMAP launch topology. Completed retry identities make the
+    // guard reconstructible without adding a new recovery-state contract.
+    const checkerReportCorrectionConsumed = Array.from({ length: checkerCount }, () => false)
+    for (const completedId of exactCompletedCheckIds) {
+      const match = /^independent-check-(\d+)(?:-repair-\d+)?-runtime-retry-1$/u.exec(completedId)
+      if (match && Number(match[1]) >= 1 && Number(match[1]) <= checkerCount) {
+        checkerReportCorrectionConsumed[Number(match[1]) - 1] = true
+      }
+    }
+    let checkerGroupReportCorrectionConsumed = checkerReportCorrectionConsumed.some(Boolean)
+    const acceptedVerificationLimitations = []
     const rejectedImplementationFingerprints = new Set()
+    const rejectedCheckerResults = new Map()
     const cumulativeRejectedCheckerReceipts = [...canonicalRejectedCheckerReceipts(
       resumeState && resumeState.retryState &&
         resumeState.retryState.cumulativeRejectedCheckerReceipts,
@@ -13020,6 +16403,14 @@ function createDefaultRouteExecutor(options) {
             `durable cumulative checker receipt ${receipt.name} differs from its exact result bytes`,
           )
         }
+        rejectedCheckerResults.set(receipt.name, result)
+        const correctedSeat = /^independent-check-(\d+)(?:-repair-\d+)?-runtime-retry-1$/u
+          .exec(receipt.name)
+        if (correctedSeat && Number(correctedSeat[1]) >= 1 &&
+            Number(correctedSeat[1]) <= checkerCount) {
+          checkerReportCorrectionConsumed[Number(correctedSeat[1]) - 1] = true
+          checkerGroupReportCorrectionConsumed = true
+        }
         const seatMatch = /^independent-check-(\d+)/u.exec(receipt.name)
         const seatIndex = seatMatch ? Number(seatMatch[1]) - 1 : -1
         const fingerprint = checkerImplementationFailureFingerprint(
@@ -13038,8 +16429,47 @@ function createDefaultRouteExecutor(options) {
       cumulativeRejectedCheckerReceipts.splice(0, cumulativeRejectedCheckerReceipts.length, ...next)
       return cumulativeRejectedCheckerReceipts.map(item => ({ ...item }))
     }
+    const repairedVersionCheckerEvidence = () => {
+      if (checkerRepairAttempt < 1 || cumulativeRejectedCheckerReceipts.length === 0) return null
+      const identities = cumulativeRejectedCheckerReceipts.map(receipt => {
+        const result = rejectedCheckerResults.get(receipt.name) ||
+          (typeof options.readResult === 'function' ? options.readResult(receipt.name) : null)
+        if (!result || hashText(JSON.stringify(result)) !== receipt.resultHash) {
+          throw new SupervisorIntegrationError(
+            'REPAIR_RECOVERY_INVALID',
+            `repaired-version verification lacks exact rejected result ${receipt.name}`,
+          )
+        }
+        rejectedCheckerResults.set(receipt.name, result)
+        return {
+          checkerId: receipt.name,
+          checkerResultHash: receipt.resultHash,
+          findingIds: explicitFindingIds(result, result.payload, result.cause),
+        }
+      })
+      return Object.freeze({
+        receiptPointers: cumulativeRejectedCheckerReceipts.map(receipt => Object.freeze({
+          name: receipt.name, path: receipt.path, hash: receipt.hash, bytes: receipt.bytes,
+        })),
+        rejectedCheckerReceipts: cumulativeRejectedCheckerReceipts.map(receipt => ({ ...receipt })),
+        aggregateFailureHash: hashText(stableStringify(identities)),
+        rejectedFindingIds: [...new Set(identities.flatMap(identity => identity.findingIds))].sort(),
+      })
+    }
     const cumulativeRepairAssignment =
       `Repair the complete current aggregate of independently reproduced implementation defects referenced by fetchedEvidence.rejectedCheckerReceipts. Generalize each fix beyond the reported examples, preserve all passing behavior, and run the complete named and pre-existing regression matrix before returning one changed independently verifiable version. Read large evidence through its authenticated pointer and use only bounded previews; never paste or dump full deliverables, logs, or transcripts.${boundedToolOutputDiscipline}`
+    const repairContextFor = baseId => successfulTransportRetryIds.get(baseId) || baseId
+    const repairResourcesFor = repairWorkItemId => {
+      if (!executionOwnership.length) return ['workspace']
+      if (workerCount > 1) {
+        return executionOwnership.map(item => ({ ...item, owner: repairWorkItemId }))
+      }
+      return executionOwnership
+        .filter(item => item && item.owner === 'worker-1')
+        .map(item => ({ ...item }))
+    }
+    const repairManifestsFor = repairWorkItemId => workerCount > 1
+      ? repairResourcesFor(repairWorkItemId) : executionOwnership
     const pendingRepairRecovery = resumeRepairing
       ? resumeState && resumeState.retryState && resumeState.retryState.pendingImplementationRepair
       : durableIndependentFrontier && durableIndependentFrontier.kind === 'repair'
@@ -13089,22 +16519,49 @@ function createDefaultRouteExecutor(options) {
       }
       if (checkerResult.code !== 'FAIL') {
         if (deferredPromotion) await deferredPromotion.abort('non-authoritative checker evidence cannot authorize implementation repair')
-        return {
-          outcome: 'PARTIAL', checkHashes: [],
-          terminalEnvelope: {
-            ...checkerResult,
-            status: 'CHECK_REMAINS_INCONCLUSIVE',
-            reason: checkerResult.cause && checkerResult.cause.reason ||
-              'the durable checker evidence is non-authoritative and cannot authorize implementation repair',
-          },
+        throw new SupervisorIntegrationError(
+          'REPAIR_RECOVERY_INVALID',
+          'a pending implementation-repair checkpoint is impossible without an exact concrete FAIL result',
+          { checkerId: pending.checkerId, checkerCode: checkerResult.code || null },
+        )
+      }
+      rejectedCheckerResults.set(pending.checkerId, checkerResult)
+      // A legacy checkpoint may have admitted repair generation two or later.
+      // One authenticated repair is the current hard bound: preserve the exact
+      // checker defect as the task result and never launch the obsolete work.
+      if (pending.repairAttempt > 1) {
+        if (typeof options.verifyDurableResultReceipt === 'function') {
+          options.verifyDurableResultReceipt(pending.checkerId, checkerResult)
         }
+        if (deferredPromotion) {
+          await deferredPromotion.abort('legacy repair frontier exceeded the single-repair bound')
+        }
+        return { outcome: 'FAILED', checkHashes: [], terminalEnvelope: checkerResult }
       }
       const rejectedCheckerReceipts = rememberRejectedCheckerReceipt(
         checkerReceiptPointer,
         pending.checkerResultHash,
       )
-      const currentRejectedCheckerReceipts = rejectedCheckerReceipts.filter(receipt =>
-        receipt.name === pending.checkerId && receipt.resultHash === pending.checkerResultHash)
+      const resumedFailureIdentities = rejectedCheckerReceipts.map(receipt => {
+        const result = options.readResult(receipt.name)
+        if (!result || result.code !== 'FAIL' ||
+            hashText(JSON.stringify(result)) !== receipt.resultHash) {
+          throw new SupervisorIntegrationError(
+            'REPAIR_RECOVERY_INVALID',
+            `pending aggregate repair lost exact FAIL evidence ${receipt.name}`,
+          )
+        }
+        rejectedCheckerResults.set(receipt.name, result)
+        return {
+          checkerId: receipt.name,
+          checkerResultHash: receipt.resultHash,
+          findingIds: explicitFindingIds(result, result.payload, result.cause),
+        }
+      })
+      const resumedAggregateFailureHash = hashText(stableStringify(resumedFailureIdentities))
+      const resumedFindingIds = [...new Set(resumedFailureIdentities.flatMap(
+        identity => identity.findingIds,
+      ))].sort()
       if (!resumeRepairing) {
         await options.transition('IMPLEMENTATION_DEFECT', 'REPAIRING', {
           candidateHash: pending.rejectedCandidateHash,
@@ -13118,29 +16575,32 @@ function createDefaultRouteExecutor(options) {
         })
       }
       const repairResult = adoptedWorkResults[pending.repairWorkItemId] ||
-        options.readResult(pending.repairWorkItemId) || await launch({
+        options.readResult(pending.repairWorkItemId) || await launchWorker({
           workItemId: pending.repairWorkItemId,
           logicalRole: 'worker', parent: 'run-owner', purpose: 'work',
-          executorKey: pending.repairWorkItemId,
-          forkTurns: 'none',
+          repairOf: repairContextFor('work-1'), executorKey: 'work-1',
           assignment: cumulativeRepairAssignment,
-          ownership: executionOwnership.length
-            ? executionOwnership.filter(item => item && item.owner === 'worker-1').map(item => ({ ...item }))
-            : ['workspace'],
-          success: successes, checks, roadmapSlice: planPointer, manifests: executionOwnership,
+          ownership: repairResourcesFor(pending.repairWorkItemId),
+          success: successes, checks, roadmapSlice: planPointer,
+          manifests: repairManifestsFor(pending.repairWorkItemId),
           fetchedEvidence: withDescriptiveLikelyAreas({
-            ...(capturedDomainWorkEvidence || {}),
+            ...(productWorkEvidence() || {}),
             verificationObligations: verificationObligations.map(
               obligation => structuredClone(obligation),
             ),
             rejectedCheckerReceipt: checkerReceiptPointer,
-            rejectedCheckerReceipts: currentRejectedCheckerReceipts,
+            rejectedCheckerReceipts,
             rejectedCandidateHash: pending.rejectedCandidateHash,
             checkerResultHash: pending.checkerResultHash,
+            checkerResultHashes: resumedFailureIdentities.map(
+              identity => identity.checkerResultHash,
+            ),
+            aggregateFailureHash: resumedAggregateFailureHash,
           }),
-          findingIds: exactFindingIds(checkerResult, checkerResult.payload, checkerResult.cause).length > 0
-            ? exactFindingIds(checkerResult, checkerResult.payload, checkerResult.cause) : ['AP-RUN-026'],
-          strategyFingerprint: pending.checkerResultHash,
+          findingIds: resumedFindingIds.length > 0
+            ? resumedFindingIds
+            : [`implementation-defect:${resumedAggregateFailureHash.slice(0, 24)}`],
+          strategyFingerprint: resumedAggregateFailureHash,
           difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
           risk: 'high', nextReadyAfter: [`independent-check-1-repair-${pending.repairAttempt}`],
         })
@@ -13163,6 +16623,7 @@ function createDefaultRouteExecutor(options) {
       }
       candidateHash = repairedCandidateHash
       usableDeliverables = changedDeliverables(options.targetPath, options.gitEnvironment())
+      finalResponse = null
       acceptedWorkResults.set(pending.repairWorkItemId, repairResult)
       checkerRepairAttempt = pending.repairAttempt
       await options.transition('REPAIR_READY', 'CHECK_WORK', {
@@ -13191,6 +16652,8 @@ function createDefaultRouteExecutor(options) {
           'durable independent checker retry names an unavailable checker seat',
         )
       }
+      checkerReportCorrectionConsumed[index] = true
+      checkerGroupReportCorrectionConsumed = true
       checkerRuntimeRetries[index] = 1
       checkerRuntimeProgressHashes[index] = durableIndependentFrontier.checkerResultHash
       checkerRuntimeReasons[index] = canonicalCheckerReassessment({
@@ -13216,13 +16679,16 @@ function createDefaultRouteExecutor(options) {
     if (resumedInconclusive && resumedInconclusive.candidateHash === candidateHash) {
       const resumedIndex = /^independent-check-(\d+)/u.exec(String(resumedInconclusive.checkerId || ''))
       if (resumedIndex && Number(resumedIndex[1]) >= 1 && Number(resumedIndex[1]) <= checkerCount) {
-        checkerRuntimeRetries[Number(resumedIndex[1]) - 1] = Math.max(
+        const resumedCheckerIndex = Number(resumedIndex[1]) - 1
+        checkerReportCorrectionConsumed[resumedCheckerIndex] = true
+        checkerGroupReportCorrectionConsumed = true
+        checkerRuntimeRetries[resumedCheckerIndex] = Math.max(
           1,
           Number(resumedInconclusive.retryAttempt || 1),
         )
-        checkerRuntimeProgressHashes[Number(resumedIndex[1]) - 1] =
+        checkerRuntimeProgressHashes[resumedCheckerIndex] =
           resumedInconclusive.checkerResultHash
-        checkerRuntimeReasons[Number(resumedIndex[1]) - 1] = canonicalCheckerReassessment(
+        checkerRuntimeReasons[resumedCheckerIndex] = canonicalCheckerReassessment(
           resumedInconclusive.controllerReassessment || {
             code: 'INDEPENDENT_CHECK_RUNTIME_RETRY',
             priorResultEvidenceHash: resumedInconclusive.checkerResultHash,
@@ -13236,7 +16702,11 @@ function createDefaultRouteExecutor(options) {
     }
     for (let index = 0; index < checkerCount; index += 1) {
       const adoptedRetryId = `independent-check-${index + 1}-runtime-retry-1`
-      if (adoptedCheckResults[adoptedRetryId]) checkerRuntimeRetries[index] = 1
+      if (adoptedCheckResults[adoptedRetryId]) {
+        checkerReportCorrectionConsumed[index] = true
+        checkerGroupReportCorrectionConsumed = true
+        checkerRuntimeRetries[index] = 1
+      }
     }
     checkerAttempts: while (true) {
       checkHashes.length = 0
@@ -13246,7 +16716,8 @@ function createDefaultRouteExecutor(options) {
       regressionOutcomeGroups.length = 0
       capturedDomainOutcomes.length = 0
       const implementationFailures = []
-      const verificationLimitations = []
+      acceptedVerificationLimitations.length = 0
+      const verificationLimitations = acceptedVerificationLimitations
       // Recurrence is meaningful only across candidate generations. Two
       // independent seats can discover the same defect in the same frozen
       // candidate; corroboration in one round belongs in the same repair.
@@ -13254,12 +16725,14 @@ function createDefaultRouteExecutor(options) {
         rejectedImplementationFingerprints,
       )
       if (fixturePrebuildOutcome) capturedDomainOutcomes.push(fixturePrebuildOutcome)
+      capturedDomainOutcomes.push(...imageDatumPreWorkOutcomes)
     try {
       for (let index = 0; index < checkerCount; index += 1) {
       const oracle = `independent-check-${index + 1}`
       const canonicalCheckerId = `independent-check-${index + 1}`
       const checkerAssignment = checking.responsibilities[index]
       const assignedCheckerChecks = checkerNamedChecksBySeat[index]
+      const requiredInvariantCategories = checkerInvariantRequirementsBySeat[index]
       const assignedDomainContracts = index === 0 ? checkerDomainContracts : []
       let workItemId
       let result
@@ -13280,6 +16753,7 @@ function createDefaultRouteExecutor(options) {
           ? `${canonicalCheckerId}-repair-${checkerRepairAttempt}` : canonicalCheckerId
         const retryAttempt = checkerRuntimeRetries[index]
         const retryReason = checkerRuntimeReasons[index]
+        const rejectedVersionEvidence = repairedVersionCheckerEvidence()
         workItemId = retryAttempt > 0
           ? `${checkerAttemptId}-runtime-retry-${retryAttempt}` : checkerAttemptId
         const completedAttempt = completedCheckResults.get(canonicalCheckerId)
@@ -13293,10 +16767,10 @@ function createDefaultRouteExecutor(options) {
         logicalRole: index === 0 ? 'independent-reviewer' : 'independent-tester',
         parent: 'run-owner', purpose: 'verification',
           checkerRecoveryDisposition: {
-          nonAuthoritativeRetryId: retryAttempt === 0
+          nonAuthoritativeRetryId: retryAttempt === 0 && !planningCorrectionConsumed &&
+            !checkerGroupReportCorrectionConsumed
             ? `${checkerAttemptId}-runtime-retry-1` : null,
-            failureRepairId: workerCount === 1 &&
-            !doneRetryBoundary && typeof options.resultPointer === 'function'
+            failureRepairId: !doneRetryBoundary && typeof options.resultPointer === 'function'
             ? index + 1 < checkerCount
               ? `independent-check-${index + 2}${checkerRepairAttempt > 0 ? `-repair-${checkerRepairAttempt}` : ''}`
               : null
@@ -13318,19 +16792,15 @@ function createDefaultRouteExecutor(options) {
         } : {}),
         assignment: `${checkerAssignment}${assignedDomainContracts.length > 0
           ? ' Return every declared captured-domain result in payload.capturedDomainOutcomes.' : ''}` +
+          `${finalResponse
+            ? ` The frozen exact version being checked has no workspace file delta. Independently verify whether fetchedEvidence.structuredFinalResponse itself satisfies the user request${finalResponse.evidencePointer ? ' by reading its exact evidence pointer' : ''}. PASS authorizes the response; a concrete unmet edit or deliverable obligation is FAIL.`
+            : ''}` +
           `${retryReason
             ? ` Correct the prior non-authoritative report identified by ${retryReason.code}; use distinct underlying evidence when another checker conflict is named.`
             : ''}` +
-          ' Return the immutable underlying evidence identifiers you actually consumed in payload.evidenceIds; acceptance-check labels are not evidence identifiers.' +
-          ' Return payload.referenceMethod with methodClass exactly equal to one of requirements-review, authoritative-suite, black-box-boundary, metamorphic-property, or independent-model; also return source, procedure, expectedOutputDerivedFromSubjectCode=false, subjectLogicReimplemented=false, and non-empty positiveInvariants, negativeInvariants, and boundaryInvariants. Execute every command assigned to this checker seat; do not repeat another seat\'s matrix and do not substitute only self-authored examples. Expected results must come from an independent source or property. Follow fetchedEvidence.verificationDoctrine exactly; treat PASS as an attempted falsification, not a plausibility review.' +
-          ' Named checks are acceptance obligations and may be descriptive labels, not shell commands. Never report a missing executable merely because a named check is prose. Choose and execute a suitable independent procedure for each obligation; do not repeat an unavailable procedure on retry.' +
-          ' When an external verification capability is unavailable, set payload.verificationLimitation to {kind:"CAPABILITY_UNAVAILABLE", capabilityId, explicitUserDeliverable, observedVersionDefectIds}; set explicitUserDeliverable=true when that capability or receipt is itself requested, and list every independently observed exact-version defect ID. Never describe an observed exact-version defect as a capability limitation.' +
-          ' Execute the complete matrix assigned to this seat and continue falsification after the first failure. Enumerate every reproducible defect you can establish within the assigned positive, negative, boundary, interaction, and regression responsibility; never report only the first example.' +
-          ' Execute every fetchedEvidence.verificationObligations case exactly as typed. Preserve conditional, activation, ordering, threshold, chained, representation, and temporal qualifiers: a must-not-hold case needs a negative witness, and an inactive or intermediate phase may not be collapsed into the active result. For parsers and filters, test alternate encodings and parser differentials. For generated binary or geometric artifacts, reopen the exact deliverable in an independent consumer and inspect its semantic contents, not merely file existence or size.' +
-          ' Build one bounded reusable verification harness or command plan before broad exploration. Redirect large output to scratch files and inspect only summaries or targeted excerpts no larger than 4 KiB. If prior rejected-check receipts are supplied, replay or extend their procedures instead of rediscovering the repository and test matrix from scratch.' +
-          ' For large deliverables, logs, command output, or transcripts, return only hashes, authenticated pointers, and bounded diagnostic previews. Never paste or dump a full large deliverable, log, or transcript into the report.' +
-          ' Return payload.testOutcomes with one entry for every named check: command must preserve the named check as its stable identifier, status must be PASS or FAIL, and fingerprint must be the lowercase SHA-256 digest of the independent observation.',
+          ' Apply fetchedEvidence.verificationDoctrine exactly to its named checks and verification obligations.',
         candidateHash, oracle, success: successes, checks: assignedCheckerChecks,
+        verificationCommandBindings: checkerCommandBindingsBySeat[index],
         isolation: 'snapshot',
         writeProducing: true,
         roadmapSlice: planPointer, manifests: executionOwnership,
@@ -13340,16 +16810,46 @@ function createDefaultRouteExecutor(options) {
         bounded: true,
         fetchedEvidence: {
               verificationDoctrine: CHECKER_FALSIFICATION_DOCTRINE,
+              requiredInvariantCategories,
               ...(assignedDomainContracts.length > 0
                 ? { capturedDomainContracts: assignedDomainContracts } : {}),
               verificationObligations: verificationObligationsBySeat[index].map(
                 obligation => structuredClone(obligation),
               ),
+              ...(finalResponse ? {
+                structuredFinalResponse: {
+                  responseHash: finalResponse.responseHash,
+                  resultFormat: finalResponse.resultFormat,
+                  resultHashes: finalResponse.results.map(result => result.resultHash),
+                  ...(finalResponse.evidencePointer
+                    ? { evidencePointer: finalResponse.evidencePointer }
+                    : { response: finalResponse }),
+                },
+              } : {}),
+              ...(rejectedVersionEvidence ? {
+                rejectedCheckerReceipts: rejectedVersionEvidence.rejectedCheckerReceipts,
+                aggregateFailureHash: rejectedVersionEvidence.aggregateFailureHash,
+                rejectedFindingIds: rejectedVersionEvidence.rejectedFindingIds,
+              } : {}),
               ...(retryReason ? { controllerReassessment: retryReason } : {}),
             },
+        ...((finalResponse && finalResponse.evidencePointer || rejectedVersionEvidence) ? {
+          evidencePointers: [
+            ...(finalResponse && finalResponse.evidencePointer ? [finalResponse.evidencePointer] : []),
+            ...(rejectedVersionEvidence ? rejectedVersionEvidence.receiptPointers : []),
+          ],
+        } : {}),
         deferredPromotionToken: deferredPromotion && deferredPromotion.token || null,
-        ...(retryAttempt > 0 && checkerRuntimeProgressHashes[index]
-          ? { evidenceHashes: [checkerRuntimeProgressHashes[index]] }
+        ...((finalResponse && finalResponse.evidencePointer || rejectedVersionEvidence ||
+            (retryAttempt > 0 && checkerRuntimeProgressHashes[index]))
+          ? { evidenceHashes: [
+              ...(finalResponse && finalResponse.evidencePointer
+                ? [finalResponse.evidencePointer.hash] : []),
+              ...(rejectedVersionEvidence
+                ? rejectedVersionEvidence.receiptPointers.map(pointer => pointer.hash) : []),
+              ...(retryAttempt > 0 && checkerRuntimeProgressHashes[index]
+                ? [checkerRuntimeProgressHashes[index]] : []),
+            ] }
           : {}),
         // Every PASS remains provisional until evidence IDs, any required
         // reference method, and the whole checker group have been validated.
@@ -13371,7 +16871,10 @@ function createDefaultRouteExecutor(options) {
         const failedNamedTestOutcome = canonicalTestOutcomes &&
           canonicalTestOutcomes.some(item => item.status !== 'PASS')
         const invalidReferenceMethod = result && result.code === 'PASS' && requireIndependentReferenceMethod &&
-          !canonicalIndependentReferenceMethod(result.payload && result.payload.referenceMethod)
+          !canonicalIndependentReferenceMethod(
+            result.payload && result.payload.referenceMethod,
+            requiredInvariantCategories,
+          )
         const invalidEvidenceConsumption = result && result.code === 'PASS' && (
           !uniqueStrings(reportedEvidenceIds) || reportedEvidenceIds.length === 0 ||
           reportedEvidenceIds.some(id => typeof id !== 'string' || id.length > 256 ||
@@ -13396,7 +16899,19 @@ function createDefaultRouteExecutor(options) {
           stableCapabilityLimitation = true
           break
         }
+        if (nonAuthoritative && retryAttempt === 0 &&
+            (planningCorrectionConsumed || checkerGroupReportCorrectionConsumed)) {
+          return preserveInconclusiveCandidate(
+            workItemId,
+            result,
+            controllerDefect || (planningCorrectionConsumed
+              ? 'ROADMAP_CONTINGENCY_RESERVE_PRESERVED'
+              : 'CHECKER_REPORT_CORRECTION_ALREADY_CONSUMED'),
+          )
+        }
         if (nonAuthoritative && retryAttempt === 0) {
+          checkerReportCorrectionConsumed[index] = true
+          checkerGroupReportCorrectionConsumed = true
           checkerRuntimeProgressHashes[index] = rawCheckerResultHash
           checkerRuntimeReasons[index] = canonicalCheckerReassessment({
             code: controllerDefect || result.code,
@@ -13415,31 +16930,19 @@ function createDefaultRouteExecutor(options) {
           continue
         }
         if (nonAuthoritative) {
-          await options.transition('CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK', {
-            candidateHash,
-            checkerId: workItemId,
-            checkerResultHash: rawCheckerResultHash,
-            retryAttempt,
-          })
-          if (deferredPromotion) await deferredPromotion.abort('independent checker did not pass')
-          return {
-            outcome: 'PARTIAL',
-            terminalEnvelope: {
-              ...result, status: 'CHECK_REMAINS_INCONCLUSIVE',
-              reason: controllerDefect
-                ? 'the isolated checker retry did not return a complete independently verifiable report'
-                : result.cause && result.cause.reason ||
-                'the isolated runtime retry remained non-authoritative',
-            },
-            checkHashes,
-          }
+          return preserveInconclusiveCandidate(
+            workItemId,
+            result,
+            controllerDefect || 'INDEPENDENT_CHECK_RUNTIME_RETRY',
+            false,
+          )
         }
         if (retryAttempt > 0) {
           const repairEligible = result.code === 'FAIL' &&
             !previouslyRejectedImplementationFingerprints.has(
               checkerImplementationFailureFingerprint(result, checkerNamedChecksBySeat[index]),
             ) &&
-            workerCount === 1 && !doneRetryBoundary && typeof options.resultPointer === 'function'
+            !doneRetryBoundary && typeof options.resultPointer === 'function'
           await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
             candidateHash,
             checkerId: workItemId,
@@ -13461,11 +16964,21 @@ function createDefaultRouteExecutor(options) {
         break
       }
       if (stableCapabilityLimitation) {
+        result = canonicalizeCheckerVerificationLimitation(result)
+        const resultHash = hashText(stableStringify(result))
+        const capabilityId = result.payload.verificationLimitation.capabilityId
         verificationLimitations.push(Object.freeze({
           checkerId: workItemId,
           result,
-          resultHash: hashText(stableStringify(result)),
+          resultHash,
         }))
+        checkHashes.push(resultHash)
+        independentVerdicts.push({
+          kind: index === 0 ? 'independent-review' : 'independent-verification',
+          status: 'FAIL',
+          verdictHash: resultHash,
+          evidenceIds: [`verification-limitation:${capabilityId}`],
+        })
         continue
       }
       if (result.code !== 'PASS') {
@@ -13477,7 +16990,8 @@ function createDefaultRouteExecutor(options) {
           previouslyRejectedImplementationFingerprints.has(implementationFailureFingerprint)
         const canRepairImplementation = result.code === 'FAIL' &&
           !repeatedImplementationFailure &&
-          workerCount === 1 && !doneRetryBoundary && typeof options.resultPointer === 'function'
+          checkerRepairAttempt === 0 && !doneRetryBoundary &&
+          typeof options.resultPointer === 'function'
         if (canRepairImplementation) {
           rejectedImplementationFingerprints.add(implementationFailureFingerprint)
           const checkerReceiptPointer = options.resultPointer(workItemId)
@@ -13487,7 +17001,7 @@ function createDefaultRouteExecutor(options) {
             checkerReceiptPointer,
             checkerResultHash,
             result,
-            findingIds: exactFindingIds(result, result.payload, result.cause),
+            findingIds: explicitFindingIds(result, result.payload, result.cause),
           }))
           // Complete every independent seat against this same frozen version
           // before authorizing mutation.  Otherwise seat one can trigger a
@@ -13499,7 +17013,8 @@ function createDefaultRouteExecutor(options) {
         return { outcome: 'FAILED', terminalEnvelope: result, checkHashes }
       }
       if (result && result.payload && Array.isArray(result.payload.capturedDomainOutcomes)) {
-        capturedDomainOutcomes.push(...result.payload.capturedDomainOutcomes)
+        capturedDomainOutcomes.push(...result.payload.capturedDomainOutcomes.filter(outcome =>
+          outcome && !['IMAGE_DATUM', 'HIDDEN_EXTERNAL_ORACLE'].includes(outcome.kind)))
       }
       const resultHash = hashText(JSON.stringify(result))
       const consumedEvidenceIds = result && result.payload && Array.isArray(result.payload.evidenceIds)
@@ -13511,6 +17026,7 @@ function createDefaultRouteExecutor(options) {
         evidenceIds: consumedEvidenceIds,
         requireReferenceMethod: requireIndependentReferenceMethod,
         referenceMethod: result && result.payload && result.payload.referenceMethod,
+        requiredInvariantCategories,
       })
       independentVerdicts.push({
         kind: index === 0 ? 'independent-review' : 'independent-verification',
@@ -13526,13 +17042,20 @@ function createDefaultRouteExecutor(options) {
         checkerControllerAcceptedResults[index] = { workItemId, result }
       }
     } catch (error) {
-      if (deferredPromotion) await deferredPromotion.abort(error && error.code || 'checker launch failed')
+      // A checker/controller exception is not an authoritative product
+      // rejection. Preserve the frozen deferred candidate for bounded restart
+      // reconciliation; only a concrete checker FAIL above may abort it.
       throw error
     }
       if (implementationFailures.length > 0) {
+        if (checkerRepairAttempt >= 1) {
+          if (deferredPromotion) await deferredPromotion.abort('bounded repair was independently rejected')
+          return { outcome: 'FAILED', terminalEnvelope: implementationFailures[0].result, checkHashes }
+        }
         const rejectedCandidateHash = candidateHash
         let rejectedCheckerReceipts = cumulativeRejectedCheckerReceipts.map(item => ({ ...item }))
         for (const failure of implementationFailures) {
+          rejectedCheckerResults.set(failure.checkerId, failure.result)
           rejectedCheckerReceipts = rememberRejectedCheckerReceipt(
             failure.checkerReceiptPointer,
             failure.checkerResultHash,
@@ -13573,18 +17096,16 @@ function createDefaultRouteExecutor(options) {
         const repairFindingIds = [...new Set(implementationFailures.flatMap(
           failure => failure.findingIds,
         ))].sort()
-        const repairResult = await launch({
+        const repairResult = await launchWorker({
           workItemId: repairWorkItemId,
           logicalRole: 'worker', parent: 'run-owner', purpose: 'work',
-          executorKey: repairWorkItemId,
-          forkTurns: 'none',
+          repairOf: repairContextFor('work-1'), executorKey: 'work-1',
           assignment: cumulativeRepairAssignment,
-          ownership: executionOwnership.length
-            ? executionOwnership.filter(item => item && item.owner === 'worker-1').map(item => ({ ...item }))
-            : ['workspace'],
-          success: successes, checks, roadmapSlice: planPointer, manifests: executionOwnership,
+          ownership: repairResourcesFor(repairWorkItemId),
+          success: successes, checks, roadmapSlice: planPointer,
+          manifests: repairManifestsFor(repairWorkItemId),
           fetchedEvidence: withDescriptiveLikelyAreas({
-            ...(capturedDomainWorkEvidence || {}),
+            ...(productWorkEvidence() || {}),
             verificationObligations: verificationObligations.map(
               obligation => structuredClone(obligation),
             ),
@@ -13595,7 +17116,9 @@ function createDefaultRouteExecutor(options) {
             checkerResultHashes: implementationFailures.map(failure => failure.checkerResultHash),
             aggregateFailureHash,
           }),
-          findingIds: repairFindingIds.length > 0 ? repairFindingIds : ['AP-RUN-026'],
+          findingIds: repairFindingIds.length > 0
+            ? repairFindingIds
+            : [`implementation-defect:${aggregateFailureHash.slice(0, 24)}`],
           strategyFingerprint: aggregateFailureHash,
           difficulty: route === 'ROADMAP' ? 'hard' : route === 'LIGHT' ? 'medium' : 'ordinary',
           risk: 'high', nextReadyAfter: [`independent-check-1-repair-${checkerRepairAttempt + 1}`],
@@ -13620,6 +17143,7 @@ function createDefaultRouteExecutor(options) {
         }
         candidateHash = repairedCandidateHash
         usableDeliverables = changedDeliverables(options.targetPath, options.gitEnvironment())
+        finalResponse = null
         acceptedWorkResults.set(repairWorkItemId, repairResult)
         checkerRepairAttempt += 1
         checkerRuntimeRetries = Array.from({ length: checkerCount }, () => 0)
@@ -13648,30 +17172,9 @@ function createDefaultRouteExecutor(options) {
         continue checkerAttempts
       }
       if (verificationLimitations.length > 0) {
-        if (deferredPromotion) await deferredPromotion.abort(
-          'an exact semantic consumer remains unavailable after all independent seats ran',
-        )
-        const first = verificationLimitations[0]
-        await options.transition('CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK', {
-          candidateHash,
-          checkerId: first.checkerId,
-          checkerResultHash: first.resultHash,
-          retryAttempt: 0,
-          limitationCount: verificationLimitations.length,
-        })
-        return {
-          outcome: 'PARTIAL', checkHashes,
-          terminalEnvelope: {
-            ...first.result,
-            status: 'CHECK_REMAINS_INCONCLUSIVE',
-            reason: 'all independent seats ran, but the named semantic consumer is unavailable in this environment',
-            limitations: verificationLimitations.map(item => ({
-              checkerId: item.checkerId,
-              resultHash: item.resultHash,
-              verificationLimitation: item.result.payload.verificationLimitation,
-            })),
-          },
-        }
+        // A capability/report limitation is not evidence of a product defect.
+        // Preserve it in the exact join and continue to a direct deliverable;
+        // the external acceptance authority can still grade the artifact.
       }
       try {
         assertDistinctEvidenceConsumption(checkerEvidenceConsumptions)
@@ -13687,45 +17190,45 @@ function createDefaultRouteExecutor(options) {
         const affectedIndex = affectedMatch ? Number(affectedMatch[1]) - 1 : -1
         if (!recoverableAggregate.has(error && error.code) || affectedIndex < 0 ||
             affectedIndex >= checkerCount) throw error
-        if (checkerRuntimeRetries[affectedIndex] > 0) {
-          if (deferredPromotion) await deferredPromotion.abort('independent checker reassessment remained non-authoritative')
-          return {
-            outcome: 'PARTIAL',
-            terminalEnvelope: {
-              status: 'CHECK_REMAINS_INCONCLUSIVE',
-              reason: 'the reassigned independent checker still did not provide distinct verification evidence',
-            },
-            checkHashes,
-          }
+        if (checkerGroupReportCorrectionConsumed) {
+          const accepted = checkerControllerAcceptedResults[affectedIndex]
+          return preserveInconclusiveCandidate(
+            accepted && accepted.workItemId || affectedId,
+            accepted && accepted.result,
+            error.code,
+          )
+        } else {
+          const accepted = checkerControllerAcceptedResults[affectedIndex]
+          const evidenceHash = hashText(stableStringify(accepted && accepted.result || null))
+          checkerReportCorrectionConsumed[affectedIndex] = true
+          checkerGroupReportCorrectionConsumed = true
+          checkerRuntimeProgressHashes[affectedIndex] = evidenceHash
+          checkerRuntimeRetries[affectedIndex] = 1
+          checkerRuntimeReasons[affectedIndex] = canonicalCheckerReassessment({
+            code: error.code,
+            conflictingCheckerId: error.details &&
+              (error.details.firstCheckerId || error.details.firstOracleId) || null,
+            reassignedCheckerId: affectedId,
+            priorResultEvidenceHash: evidenceHash,
+            ...(error.details && error.details.evidenceId
+              ? { evidenceId: error.details.evidenceId } : {}),
+            ...(error.details && error.details.methodClass
+              ? { methodClass: error.details.methodClass } : {}),
+            ...(error.details && error.details.methodHash
+              ? { methodHash: error.details.methodHash } : {}),
+          }, { resultHash: evidenceHash, checkerId: affectedId })
+          checkerControllerAcceptedResults[affectedIndex] = null
+          await options.transition('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
+            candidateHash,
+            checkerId: accepted.workItemId,
+            checkerResultHash: evidenceHash,
+            retryAttempt: 1,
+            controllerReason: error.code,
+            controllerReassessment: checkerRuntimeReasons[affectedIndex],
+            nextReadyWorkIds: [`${accepted.workItemId}-runtime-retry-1`],
+          })
+          continue checkerAttempts
         }
-        const accepted = checkerControllerAcceptedResults[affectedIndex]
-        const evidenceHash = hashText(stableStringify(accepted && accepted.result || null))
-        checkerRuntimeProgressHashes[affectedIndex] = evidenceHash
-        checkerRuntimeRetries[affectedIndex] = 1
-        checkerRuntimeReasons[affectedIndex] = canonicalCheckerReassessment({
-          code: error.code,
-          conflictingCheckerId: error.details &&
-            (error.details.firstCheckerId || error.details.firstOracleId) || null,
-          reassignedCheckerId: affectedId,
-          priorResultEvidenceHash: evidenceHash,
-          ...(error.details && error.details.evidenceId
-            ? { evidenceId: error.details.evidenceId } : {}),
-          ...(error.details && error.details.methodClass
-            ? { methodClass: error.details.methodClass } : {}),
-          ...(error.details && error.details.methodHash
-            ? { methodHash: error.details.methodHash } : {}),
-        }, { resultHash: evidenceHash, checkerId: affectedId })
-        checkerControllerAcceptedResults[affectedIndex] = null
-        await options.transition('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
-          candidateHash,
-          checkerId: accepted.workItemId,
-          checkerResultHash: evidenceHash,
-          retryAttempt: 1,
-          controllerReason: error.code,
-          controllerReassessment: checkerRuntimeReasons[affectedIndex],
-          nextReadyWorkIds: [`${accepted.workItemId}-runtime-retry-1`],
-        })
-        continue checkerAttempts
       }
       for (let index = 0; index < independentVerdicts.length; index += 1) {
         await options.transition('INDEPENDENT_VERDICT_RECORDED', 'CHECK_WORK', {
@@ -13762,14 +17265,15 @@ function createDefaultRouteExecutor(options) {
         )
       }
     }
-    if (regressionBaseline.length > 0 && regressionOutcomeGroups.length === 0) {
+    if (regressionBaseline.length > 0 && regressionOutcomeGroups.length === 0 &&
+        acceptedVerificationLimitations.length === 0) {
       if (deferredPromotion) await deferredPromotion.abort('post-check omitted the immutable regression baseline')
       return {
         outcome: 'FAILED', checkHashes,
         terminalEnvelope: { status: 'REGRESSION_BASELINE_NOT_REEXECUTED', baselineIds: regressionBaseline.map(item => item.id) },
       }
     }
-    if (regressionBaseline.length > 0) {
+    if (regressionBaseline.length > 0 && regressionOutcomeGroups.length > 0) {
       const regressions = regressionOutcomeGroups.map(outcomes =>
         evaluateRegressionDelta(regressionBaseline, outcomes))
       const regression = regressions.find(item => !item.valid)
@@ -13794,48 +17298,59 @@ function createDefaultRouteExecutor(options) {
       }
       createResidualRiskDisposition({ findings: finalFindings, authorityReceipt })
     }
-    if (hiddenExternalBoundary && !capturedDomainOutcomes.some(outcome =>
-      outcome && outcome.kind === 'HIDDEN_EXTERNAL_ORACLE')) {
+    const externalVerificationDisposition = hiddenExternalBoundary
+      ? Object.freeze({
+          verificationRoute: 'EXTERNALLY_VERIFIABLE_ONLY',
+          oracleStatus: 'NOT_RUN',
+          acceptanceStatus: 'PENDING',
+          localCandidateStatus: 'DONE',
+        })
+      : null
+    if (hiddenExternalBoundary) {
+      for (let index = capturedDomainOutcomes.length - 1; index >= 0; index -= 1) {
+        if (capturedDomainOutcomes[index] &&
+            capturedDomainOutcomes[index].kind === 'HIDDEN_EXTERNAL_ORACLE') {
+          capturedDomainOutcomes.splice(index, 1)
+        }
+      }
       capturedDomainOutcomes.push({
         schemaVersion: '1.0.0',
         kind: 'HIDDEN_EXTERNAL_ORACLE',
         verificationRoute: 'EXTERNALLY_VERIFIABLE_ONLY',
         externalBoundaryRecorded: true,
         localDoneRequested: false,
+        externalOracleStatus: externalVerificationDisposition.oracleStatus,
+        externalAcceptanceStatus: externalVerificationDisposition.acceptanceStatus,
+        localCandidateStatus: externalVerificationDisposition.localCandidateStatus,
       })
     }
-    appendSupervisorRecordedCapturedDomainOutcomes(capturedDomainContracts, capturedDomainOutcomes)
     const domainEvaluation = evaluateCapturedDomainOutcomes(capturedDomainContracts, capturedDomainOutcomes)
-    if (!domainEvaluation.valid) {
-      if (deferredPromotion) await deferredPromotion.abort('captured-domain acceptance join failed')
-      return {
-        outcome: 'FAILED',
-        checkHashes,
-        terminalEnvelope: {
-          status: 'CAPTURED_DOMAIN_OUTCOME_INVALID',
-          errors: domainEvaluation.errors,
+    const completionLimitationCandidates = acceptedVerificationLimitations.map(item => ({
+      checkerId: item.checkerId,
+      resultHash: item.resultHash,
+      verificationLimitation: item.result.payload.verificationLimitation,
+    }))
+    if (!domainEvaluation.valid || !domainEvaluation.localDoneAllowed) {
+      completionLimitationCandidates.push({
+        checkerId: 'external-acceptance-authority',
+        resultHash: hashText(stableStringify(domainEvaluation)),
+        verificationLimitation: {
+          kind: 'CAPABILITY_UNAVAILABLE',
+          capabilityId: domainEvaluation.valid
+            ? 'external.hidden-acceptance-oracle' : 'autoprompt.captured-domain-join',
+          explicitUserDeliverable: false,
+          observedVersionDefectIds: [],
         },
-      }
+      })
     }
-    if (!domainEvaluation.localDoneAllowed) {
-      if (deferredPromotion) await deferredPromotion.abort('external-only result cannot promote a DONE retry')
-      if (typeof options.writeCapturedDomainOutcomes === 'function' && capturedDomainContracts.length > 0) {
-        options.writeCapturedDomainOutcomes({
-          schemaVersion: 1, candidateHash, contracts: capturedDomainContracts,
-          outcomes: capturedDomainOutcomes, evaluation: domainEvaluation,
-        })
-      }
-      return {
-        outcome: 'PARTIAL',
-        checkHashes,
-        deliverables: changedDeliverables(options.targetPath, options.gitEnvironment()),
-        terminalEnvelope: {
-          status: 'EXTERNALLY_VERIFIABLE_ONLY',
-          candidateHash,
-          localDoneAllowed: false,
-          externalOracleId: hiddenExternalBoundary.externalOracleId,
-        },
-      }
+    const completionLimitations = completionLimitationCandidates.length > 0
+      ? canonicalVerificationLimitationSummaries(completionLimitationCandidates)
+      : null
+    if (completionLimitationCandidates.length > 0 && !completionLimitations) {
+      throw new SupervisorIntegrationError(
+        'VERIFICATION_LIMITATION_INVALID',
+        'bounded completion limitations could not be canonicalized',
+      )
     }
     if (typeof acceptDeferredCheckerProof === 'function') {
       for (const check of checkerEvidenceConsumptions) acceptDeferredCheckerProof(check.checkerId)
@@ -13844,13 +17359,21 @@ function createDefaultRouteExecutor(options) {
     if (deferredPromotion) {
       const promotionOutcome = capturedDomainOutcomes.find(outcome =>
         outcome && outcome.kind === 'DONE_RETRY_PROMOTION')
+      const limitationJoinHash = completionLimitations && hashText(stableStringify({
+        candidateHash,
+        verificationLimitations: completionLimitations,
+      }))
       await deferredPromotion.commit({
         candidateHash,
         checkHashes,
-        acceptanceJoinHash: promotionOutcome && promotionOutcome.acceptanceJoinHash,
+        acceptanceJoinHash: limitationJoinHash || promotionOutcome && promotionOutcome.acceptanceJoinHash,
         domainEvaluationHash: hashText(JSON.stringify(domainEvaluation)),
         capturedDomainOutcomes,
         domainEvaluation,
+        ...(completionLimitations ? {
+          verificationLimited: true,
+          verificationLimitations: completionLimitations,
+        } : {}),
       })
       persistedCapturedDomainOutcomes = capturedDomainOutcomes.map(outcome =>
         outcome && outcome.kind === 'DONE_RETRY_PROMOTION'
@@ -13870,13 +17393,25 @@ function createDefaultRouteExecutor(options) {
         evaluation: domainEvaluation,
       })
     }
-    await options.transition('ACCEPTANCE_GREEN', 'FINAL_CHECK', { candidateHash, checkHashes })
+    await options.transition('ACCEPTANCE_GREEN', 'FINAL_CHECK', {
+      candidateHash,
+      checkHashes,
+      verificationLimited: Boolean(completionLimitations),
+    })
     return {
       outcome: 'DONE',
       checkHashes,
       deliverables: changedDeliverables(options.targetPath, options.gitEnvironment()),
       ...(finalResponse ? { finalResponse } : {}),
-      terminalEnvelope: { candidateHash, checkCount: checkerCount },
+      terminalEnvelope: {
+        status: completionLimitations ? 'DONE_WITH_VERIFICATION_LIMITATIONS' : 'DONE',
+        candidateHash,
+        checkCount: checkerCount,
+        ...(externalVerificationDisposition ? {
+          externalVerification: externalVerificationDisposition,
+        } : {}),
+        ...(completionLimitations ? { limitations: completionLimitations } : {}),
+      },
     }
   }
 }
@@ -14338,82 +17873,34 @@ function readExactPathRequestEnvelopeBinding(pointer, record) {
   }
 }
 
-const EXACT_PATH_OBSERVATIONAL_GRAMMAR_VERSION = 'codex-contained-local-observation-literal-v1'
-const EXACT_PATH_OBSERVATIONAL_GRAMMAR = Object.freeze({
-  'Inspect the contained local workspace files.': Object.freeze({ verb: 'Inspect', requestedEffect: 'inspect', targetScope: 'workspace files' }),
-  'Review the contained local source files.': Object.freeze({ verb: 'Review', requestedEffect: 'inspect', targetScope: 'source files' }),
-  'Report the contained local repository findings.': Object.freeze({ verb: 'Report', requestedEffect: 'report', targetScope: 'repository findings' }),
-  'Inspect the contained local source files.': Object.freeze({ verb: 'Inspect', requestedEffect: 'inspect', targetScope: 'source files' }),
-  'Read the contained local source files.': Object.freeze({ verb: 'Read', requestedEffect: 'inspect', targetScope: 'source files' }),
-  'Summarize the contained local source files.': Object.freeze({ verb: 'Summarize', requestedEffect: 'report', targetScope: 'source files' }),
-  'List the contained local repository files.': Object.freeze({ verb: 'List', requestedEffect: 'report', targetScope: 'repository files' }),
-  'Report the contained local project findings.': Object.freeze({ verb: 'Report', requestedEffect: 'report', targetScope: 'project findings' }),
-})
-const EXACT_PATH_OBSERVATIONAL_GRAMMAR_HASH = hashText(stableStringify({
-  grammarVersion: EXACT_PATH_OBSERVATIONAL_GRAMMAR_VERSION,
-  literalEntries: EXACT_PATH_OBSERVATIONAL_GRAMMAR,
+const EXACT_PATH_LOCAL_CEILING_VERSION = 'codex-contained-local-authority-ceiling-v1'
+const EXACT_PATH_LOCAL_CEILING_HASH = hashText(stableStringify({
+  classificationVersion: EXACT_PATH_LOCAL_CEILING_VERSION,
+  requestedEffect: 'mutate',
+  targetScope: 'authenticated activation target',
+  allowedEffects: ['local-read', 'local-run', 'local-reversible-write'],
+  excludedEffects: ['external-write', 'irreversible-action', 'credential-use', 'third-party-impact', 'cost'],
 }))
 
-function classifyExactPathObservationalMission(missionLiteral, originalArgv, input, targetEvidence) {
-  const literalGrammarEntry = Object.hasOwn(EXACT_PATH_OBSERVATIONAL_GRAMMAR, missionLiteral)
-    ? EXACT_PATH_OBSERVATIONAL_GRAMMAR[missionLiteral]
-    : null
-  const missionArgv = Array.isArray(originalArgv)
-    ? parseExactPathInvocation(originalArgv, String(input.route || '').toUpperCase(), EXACT_PATH_FORBIDDEN_CONTROL_NAMES).missionArgv
-    : null
-  const grammarEntry = literalGrammarEntry && Array.isArray(missionArgv) && missionArgv.length === 1
-    ? literalGrammarEntry
-    : null
-  const ordinaryMutationVerbs = new Set(['implement', 'fix', 'change', 'consider', 'review'])
-  const deniedMutationWords = new Set([
-    'advise', 'approve', 'architecture', 'authorize', 'authorization', 'choose', 'compare',
-    'cost', 'credential', 'delete', 'deploy', 'destroy', 'determine', 'email', 'external',
-    'formulate', 'money', 'pay', 'permission', 'permissions', 'publish', 'recommend',
-    'remote', 'select', 'send', 'settle', 'strategy', 'third-party', 'weigh',
-  ])
-  const ordinaryMutationTokens = !grammarEntry && Array.isArray(missionArgv) && missionArgv.length > 1 &&
-    missionArgv.every(token => !/\s/u.test(token) && /^[A-Za-z][A-Za-z0-9'-]*[.,;:!?]?$/u.test(token))
-    ? missionArgv.map(token => token.toLowerCase().replace(/[.,;:!?]+$/u, ''))
-    : null
-  const ordinaryLocalMutation = Boolean(ordinaryMutationTokens &&
-    ordinaryMutationVerbs.has(ordinaryMutationTokens[0]) &&
-    ordinaryMutationTokens.every(token => !deniedMutationWords.has(token)) &&
-    !Object.hasOwn(EXACT_PATH_OBSERVATIONAL_GRAMMAR, missionLiteral))
-  // Explicit path controls bypass route selection only. Read-only claims must
-  // match the closed one-token grammar exactly. The documented ordinary
-  // multi-token local mutation form is admitted under mutation safeguards;
-  // unknown, authority-bearing, and external prose fails closed.
-  if (!grammarEntry && !ordinaryLocalMutation) {
-    throw new SupervisorIntegrationError(
-      'EXACT_PATH_FACTS_REQUIRED',
-      'exact-path prose lacks a closed local effect, authority, and uncertainty classification',
-    )
-  }
-  const classification = grammarEntry
-    ? Object.freeze({
-        kind: 'contained-local-observational-directive',
-        observationalVerb: grammarEntry.verb,
-        requestedEffect: grammarEntry.requestedEffect,
-        targetScope: grammarEntry.targetScope,
-        decisionSemantics: false,
-        mutationSemantics: false,
-        externalSemantics: false,
-      })
-    : Object.freeze({
-        kind: 'contained-local-mutating-directive',
-        observationalVerb: null,
-        requestedEffect: 'mutate',
-        targetScope: 'authenticated activation target',
-        decisionSemantics: false,
-        mutationSemantics: true,
-        externalSemantics: false,
-        uncertainty: ordinaryMutationTokens[0] === 'consider' ? 'reversible-technical' : 'none',
-      })
+function classifyExactPathLocalCeiling(missionLiteral, originalArgv, input, targetEvidence) {
+  // Exact-path prose selects no authority and has no semantic grammar. Every
+  // authenticated mission receives the same conservative local completion
+  // ceiling. The worker may return a structured response or local file delta;
+  // the independent checker decides whether that result satisfies the ask.
+  const classification = Object.freeze({
+    kind: 'contained-local-authority-ceiling',
+    requestedEffect: 'mutate',
+    targetScope: 'authenticated activation target',
+    decisionSemantics: false,
+    mutationSemantics: true,
+    externalSemantics: false,
+    uncertainty: 'none',
+  })
   const receipt = Object.freeze({
     schemaVersion: 1,
     receiptType: 'codex-exact-path-mission-classification',
-    grammarVersion: EXACT_PATH_OBSERVATIONAL_GRAMMAR_VERSION,
-    grammarHash: EXACT_PATH_OBSERVATIONAL_GRAMMAR_HASH,
+    classificationVersion: EXACT_PATH_LOCAL_CEILING_VERSION,
+    classificationHash: EXACT_PATH_LOCAL_CEILING_HASH,
     requestEnvelopeHash: input.requestEnvelopeHash,
     targetIdentity: input.targetIdentity,
     targetEvidenceHash: hashText(stableStringify(targetEvidence)),
@@ -14475,7 +17962,7 @@ function productionExactPathPreflight(input = {}) {
       'exact-path production requires authenticated evidence for the exact opened target',
     )
   }
-  const missionClassification = classifyExactPathObservationalMission(
+  const missionClassification = classifyExactPathLocalCeiling(
     missionText, argv, input, targetEvidence,
   )
   const requestedEffect = missionClassification.receipt.classification.requestedEffect
@@ -14551,8 +18038,8 @@ function productionExactPathPreflight(input = {}) {
       shape: 'bounded', dependentWorkGroupCount: 0,
       integrationOwnerRequired: false, separateDependentBodies: 0,
     },
-    // The closed grammar receipt proves this complete directive contains no
-    // unresolved decision token; arbitrary prose never reaches this claim.
+    // The exact-path authority ceiling does not interpret mission prose. Any
+    // unmet choice or requested effect remains for worker/checker evidence.
     uncertainty: missionClassification.receipt.classification.uncertainty || 'none',
     reversibility: mutating ? 'locally-reversible' : 'fully-reversible',
     mutableResources: mutating ? [{
@@ -14573,13 +18060,8 @@ function productionExactPathPreflight(input = {}) {
       approvalRequired: false, approvalGranted: false, approvalEvidenceHash: null, withinLimit: true,
     },
     riskAndIndependentCheckFloor: {
-      level: 'elevated', minimumCheckerCount: 2,
-      namedDistinctResponsibilities: [
-        'Independently verify the frozen exact-path result.',
-        mutating
-          ? 'Independently verify target ownership, baseline, and mutation isolation.'
-          : 'Independently verify the target and read-only boundary remained intact.',
-      ],
+      level: 'elevated', minimumCheckerCount: 1,
+      namedDistinctResponsibilities: [],
     },
     checkAndBaseline: {
       checkQuality: 'observable',
@@ -14656,32 +18138,56 @@ function productionExactPathPreflight(input = {}) {
   return Object.freeze(preflight)
 }
 
-function resumePlanProjectionAccepted(route, currentPlanHash, checkpointPlanHash, validateProjection) {
-  if (currentPlanHash === checkpointPlanHash) return true
-  return route === 'ROADMAP' && /^[a-f0-9]{64}$/u.test(currentPlanHash || '') &&
-    typeof validateProjection === 'function' && validateProjection(currentPlanHash) === true
+function createRoadmapPlanLineageReceipt(input = {}) {
+  const hash = value => typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value)
+  const nullableHash = value => value === null || hash(value)
+  if (!nullableHash(input.priorPlanHash) || !hash(input.replacementPlanHash) ||
+      input.priorPlanHash === input.replacementPlanHash || !hash(input.routeDecisionHash) ||
+      !hash(input.projectionReceiptHash) || !hash(input.artifactReceiptHash) ||
+      !hash(input.transactionReceiptHash) || !Number.isSafeInteger(input.previousCheckpointSequence) ||
+      input.previousCheckpointSequence < 1 || !hash(input.previousCheckpointEntryHash) ||
+      !Number.isSafeInteger(input.checkpointSequence) ||
+      input.checkpointSequence !== input.previousCheckpointSequence + 1 ||
+      !Number.isSafeInteger(input.stateEventSequence) || input.stateEventSequence < 1 ||
+      !Number.isSafeInteger(input.accountingSequence) || input.accountingSequence < 1 ||
+      !hash(input.schedulerStateHash) ||
+      !['PLAN_PROJECTION_COMMITTED', 'CRASH_RECOVERY'].includes(input.causeKind)) {
+    throw new SupervisorIntegrationError(
+      'RECOVERY_CHECKPOINT_IMMUTABLE_MISMATCH',
+      'ROADMAP plan lineage lacks its exact predecessor, receipts, checkpoint sequence, or cause binding',
+    )
+  }
+  const body = {
+    schemaVersion: 1,
+    kind: 'codex-roadmap-plan-lineage',
+    priorPlanHash: input.priorPlanHash,
+    replacementPlanHash: input.replacementPlanHash,
+    routeDecisionHash: input.routeDecisionHash,
+    projectionReceiptHash: input.projectionReceiptHash,
+    artifactReceiptHash: input.artifactReceiptHash,
+    transactionReceiptHash: input.transactionReceiptHash,
+    migration: false,
+    legacyCauseId: null,
+    previousCheckpointSequence: input.previousCheckpointSequence,
+    previousCheckpointEntryHash: input.previousCheckpointEntryHash,
+    checkpointSequence: input.checkpointSequence,
+    stateEventSequence: input.stateEventSequence,
+    accountingSequence: input.accountingSequence,
+    schedulerStateHash: input.schedulerStateHash,
+    causeKind: input.causeKind,
+  }
+  return Object.freeze({ ...body, lineageReceiptHash: hashText(stableStringify(body)) })
 }
 
-function requiredRoadmapProjectionAuthor(scheduler, currentPlanHash, checkpointPlanHash) {
-  if (!scheduler || scheduler.route !== 'ROADMAP' || currentPlanHash === checkpointPlanHash) return null
-  const completed = new Set(scheduler.completedWorkIds || [])
-  const nextReady = new Set(scheduler.nextReadyWorkIds || [])
-  if (completed.has('roadmap-author-plan-repair') || nextReady.has('roadmap-plan-recheck')) {
-    return 'roadmap-author-plan-repair'
-  }
-  if (completed.has('roadmap-author-revise')) return 'roadmap-author-revise'
-  if (completed.has('roadmap-author')) return 'roadmap-author'
-  return null
+function resumePlanProjectionAccepted(route, currentPlanHash, checkpointPlanHash, validateLineage) {
+  if (currentPlanHash === checkpointPlanHash) return true
+  return route === 'ROADMAP' && /^[a-f0-9]{64}$/u.test(currentPlanHash || '') &&
+    typeof validateLineage === 'function' &&
+    validateLineage(checkpointPlanHash, currentPlanHash) === true
 }
 
 function createSupervisorOptions(args = {}, context = {}) {
   const environment = context.environment || process.env
-  if (Object.prototype.hasOwnProperty.call(environment, 'SENTINEL')) {
-    throw new SupervisorIntegrationError(
-      'LEGACY_SENTINEL_UNSUPPORTED',
-      'the modern Codex supervisor rejects the legacy SENTINEL override',
-    )
-  }
   const activation = validateActivationInputs(args, environment, context.adapterPath || __filename)
   let admittedRuntime
   try {
@@ -14725,11 +18231,15 @@ function createSupervisorOptions(args = {}, context = {}) {
 function createDefaultRuntimeOptions(input) {
   const { activation, probe, context = {} } = input
   const environment = context.environment || process.env
-  const wallTimeUnbounded = benchmarkNoTimeoutEnabled(environment)
+  const wallTimeUnbounded = false
   const activationRecord = activation.record
   const targetPath = activationRecord.target.realpath
   const generation = activationRecord.capability.generation
   const missionHash = hashText(activationRecord.request.canonicalJson)
+  const canonicalMissionProjection = createCanonicalMissionProjection(
+    activationRecord.request.canonicalJson,
+    { strict: true },
+  )
   let missionLock = null
   let leaseRef = null
   let recordRef = null
@@ -14751,8 +18261,8 @@ function createDefaultRuntimeOptions(input) {
       'opened run record differs from the activation-owned runtime binding',
     )
   }
-  // AP-RUN-032: this is deliberately unconditional and precedes every
-  // control adapter/owner/lease constructor. Durable controls may belong only
+  // This is deliberately unconditional and precedes every control
+  // adapter/owner/lease constructor. Durable controls may belong only
   // to this activation's current generation or its exact crash predecessor;
   // stale, foreign, future, rolled-back, and unsequenced authority is denied
   // before the production path can mutate control state or launch a process.
@@ -14825,6 +18335,39 @@ function createDefaultRuntimeOptions(input) {
     enforcementProof: activation.enforcementProof,
   }
   const gitEnvironment = repository => safeEnvFactory(repository || targetPath, environment, safetyOptions).environment
+  const openWorkerWorkspaceManager = () => {
+    if (!workerWorkspaceManager) {
+      workerWorkspaceManager = new WorkerWorkspaceManager({
+        targetRoot: targetPath,
+        privateRoot: path.join(activation.activationRoot, 'worker-workspaces'),
+        environment: gitEnvironment(targetPath),
+        runId: activation.runId,
+        activationId: activation.runId,
+        hardenWorkspace: workspacePath => {
+          const repair = childProcess.spawnSync(process.execPath, [
+            path.resolve(__dirname, '..', '..', '..', 'scripts', 'local-only-safety.cjs'),
+            '--repo', workspacePath,
+            '--expected-branch', expectedBranch,
+            '--repair',
+            '--enforcement-proof', activationRecord.activationBoundary.enforcementProof.path,
+            '--json',
+          ], {
+            env: environment,
+            encoding: 'utf8',
+            windowsHide: true,
+            maxBuffer: 4 * 1024 * 1024,
+          })
+          let parsed = null
+          try { parsed = JSON.parse(String(repair.stdout || '')) } catch {}
+          return {
+            accepted: [0, 3].includes(repair.status) && parsed &&
+              parsed.networkContactAttempted === false && parsed.repositoryOk === true,
+          }
+        },
+      })
+    }
+    return workerWorkspaceManager
+  }
   const roleContract = loadRoleContract()
   const liveRolePolicy = new RolePolicy(roleContract)
   const settings = activationRuntimeSettings(activation, context)
@@ -14952,10 +18495,49 @@ function createDefaultRuntimeOptions(input) {
         'decided scheduler state requires its persisted route decision before checkpointing',
       )
     }
+    const accountingCheckpoint = accountingAuthorityRef.resumeCheckpoint()
+    let checkpointCause = payload.cause
+    if (payload.planLineageTransaction) {
+      const replayed = recoveryCheckpointAuthorityRef.replay()
+      const priorRecord = replayed && replayed.latest && replayed.latest.record
+      const decision = readRegularJson(
+        recordRef.resolve('route/decision.json'),
+        'ROADMAP plan-lineage route decision',
+      ).parsed
+      if (!priorRecord || !validateRoadmapPlanTransaction(
+        payload.planLineageTransaction,
+        priorRecord,
+        decision,
+      ) || persistedPlanHash('ROADMAP') !== payload.planLineageTransaction.replacementPlanHash ||
+          routeDecisionHash !== payload.planLineageTransaction.routeDecisionHash) {
+        throw new SupervisorIntegrationError(
+          'RECOVERY_CHECKPOINT_IMMUTABLE_MISMATCH',
+          'ROADMAP plan lineage does not bind the exact durable predecessor, projection, and deliverable bytes',
+        )
+      }
+      const lineage = createRoadmapPlanLineageReceipt({
+        ...payload.planLineageTransaction,
+        checkpointSequence: priorRecord.sequence + 1,
+        stateEventSequence: runtimeState.sequence,
+        accountingSequence: accountingCheckpoint.lastAccountingSequence,
+        schedulerStateHash: scheduler.stateHash,
+        causeKind: payload.cause.kind,
+      })
+      writeImmutableReceipt(
+        roadmapPlanLineagePath(lineage.lineageReceiptHash),
+        lineage,
+        'ROADMAP plan lineage receipt',
+      )
+      checkpointCause = {
+        kind: payload.cause.kind,
+        causeId: `plan-lineage:${lineage.lineageReceiptHash}`,
+        humanDescription: payload.cause.humanDescription,
+      }
+    }
     return recoveryCheckpointAuthorityRef.appendCheckpoint({
       capability: leaseRef,
       providerCapabilitiesHash,
-      accountingCheckpoint: accountingAuthorityRef.resumeCheckpoint(),
+      accountingCheckpoint,
       scheduler,
       recovery: {
         savedState: runtimeState.state,
@@ -14982,7 +18564,7 @@ function createDefaultRuntimeOptions(input) {
       },
       externalOperations,
       humanDescription: payload.humanDescription || payload.cause.humanDescription,
-      cause: payload.cause,
+      cause: checkpointCause,
     })
   }
   const readDurableResult = workItemId => {
@@ -15024,7 +18606,149 @@ function createDefaultRuntimeOptions(input) {
       stableStringify(receipt.result) === stableStringify(expectedResult))
   }
   const roadmapProjectionReceiptPath = planHash => `plan/projections/${planHash}.json`
+  const roadmapArtifactReceiptPath = planHash => `plan/artifacts/${planHash}.json`
+  const roadmapPlanTransactionPath = previousCheckpointEntryHash =>
+    `plan/transactions/${previousCheckpointEntryHash}.json`
+  const roadmapPlanLineagePath = lineageReceiptHash => `plan/lineages/${lineageReceiptHash}.json`
+  const writeImmutableReceipt = (relative, receipt, label) => {
+    const absolute = recordRef.resolve(relative)
+    if (fs.existsSync(absolute)) {
+      if (stableStringify(readRegularJson(absolute, label).parsed) !== stableStringify(receipt)) {
+        throw new SupervisorIntegrationError('CRASH_ADOPTION_CONFLICT', `${label} content address collided`)
+      }
+    } else {
+      recordRef.write(relative, `${JSON.stringify(receipt, null, 2)}\n`)
+    }
+    return receipt
+  }
+  const createRoadmapArtifactReceipt = (plan, projectionReceiptHash) => {
+    const bytes = Buffer.from(plan, 'utf8')
+    const body = {
+      schemaVersion: 1,
+      kind: 'codex-roadmap-plan-artifact',
+      relativePath: 'plan/ROADMAP.md',
+      sha256: sha256Bytes(bytes),
+      bytes: bytes.length,
+      bytesBase64: bytes.toString('base64'),
+      projectionReceiptHash,
+    }
+    return Object.freeze({ ...body, receiptHash: hashText(stableStringify(body)) })
+  }
+  const validateRoadmapArtifactReceipt = (receipt, expectedPlanHash, expectedProjectionReceiptHash) => {
+    const { receiptHash, ...body } = receipt || {}
+    let bytes
+    try { bytes = Buffer.from(receipt.bytesBase64, 'base64') } catch { return false }
+    return Boolean(receipt && receipt.schemaVersion === 1 &&
+      receipt.kind === 'codex-roadmap-plan-artifact' && receipt.relativePath === 'plan/ROADMAP.md' &&
+      receipt.sha256 === expectedPlanHash && receipt.projectionReceiptHash === expectedProjectionReceiptHash &&
+      Number.isSafeInteger(receipt.bytes) && receipt.bytes >= 0 && bytes.length === receipt.bytes &&
+      bytes.toString('base64') === receipt.bytesBase64 && sha256Bytes(bytes) === receipt.sha256 &&
+      receiptHash === hashText(stableStringify(body)))
+  }
+  const createRoadmapPlanTransaction = (priorRecord, projectionReceipt, artifactReceipt) => {
+    if (!priorRecord || !priorRecord.checkpoint || priorRecord.checkpoint.scheduler.route !== 'ROADMAP' ||
+        projectionReceipt.planSha256 !== artifactReceipt.sha256) {
+      throw new SupervisorIntegrationError(
+        'RECOVERY_CHECKPOINT_IMMUTABLE_MISMATCH',
+        'ROADMAP projection transaction requires one exact ROADMAP checkpoint predecessor',
+      )
+    }
+    const body = {
+      schemaVersion: 1,
+      kind: 'codex-roadmap-plan-transaction',
+      runId: priorRecord.authority.runId,
+      activationId: priorRecord.authority.activationId,
+      missionHash: priorRecord.authority.missionHash,
+      requestEnvelopeHash: priorRecord.checkpoint.immutableHashes.requestEnvelopeHash,
+      routeDecisionHash: priorRecord.checkpoint.immutableHashes.routeDecisionHash,
+      priorPlanHash: priorRecord.checkpoint.immutableHashes.planHash,
+      replacementPlanHash: projectionReceipt.planSha256,
+      projectionReceiptHash: projectionReceipt.receiptHash,
+      artifactReceiptHash: artifactReceipt.receiptHash,
+      previousCheckpointSequence: priorRecord.sequence,
+      previousCheckpointEntryHash: priorRecord.entryHash,
+    }
+    if (body.priorPlanHash === body.replacementPlanHash) return null
+    return Object.freeze({ ...body, transactionReceiptHash: hashText(stableStringify(body)) })
+  }
+  const validateRoadmapPlanTransaction = (transaction, priorRecord, decision) => {
+    const { transactionReceiptHash, ...body } = transaction || {}
+    if (!transaction || transaction.schemaVersion !== 1 ||
+        transaction.kind !== 'codex-roadmap-plan-transaction' ||
+        transactionReceiptHash !== hashText(stableStringify(body)) ||
+        transaction.runId !== priorRecord.authority.runId ||
+        transaction.activationId !== priorRecord.authority.activationId ||
+        transaction.missionHash !== priorRecord.authority.missionHash ||
+        transaction.requestEnvelopeHash !== priorRecord.checkpoint.immutableHashes.requestEnvelopeHash ||
+        transaction.routeDecisionHash !== priorRecord.checkpoint.immutableHashes.routeDecisionHash ||
+        transaction.priorPlanHash !== priorRecord.checkpoint.immutableHashes.planHash ||
+        !/^[a-f0-9]{64}$/u.test(transaction.replacementPlanHash || '') ||
+        transaction.replacementPlanHash === transaction.priorPlanHash ||
+        !/^[a-f0-9]{64}$/u.test(transaction.projectionReceiptHash || '') ||
+        !/^[a-f0-9]{64}$/u.test(transaction.artifactReceiptHash || '') ||
+        transaction.previousCheckpointSequence !== priorRecord.sequence ||
+        transaction.previousCheckpointEntryHash !== priorRecord.entryHash) return false
+    const projectionPath = recordRef.resolve(roadmapProjectionReceiptPath(transaction.replacementPlanHash))
+    const artifactPath = recordRef.resolve(roadmapArtifactReceiptPath(transaction.replacementPlanHash))
+    if (!fs.existsSync(projectionPath) || !fs.existsSync(artifactPath)) return false
+    const projectionReceipt = readRegularJson(projectionPath, 'ROADMAP projection receipt').parsed
+    const artifactReceipt = readRegularJson(artifactPath, 'ROADMAP deliverable receipt').parsed
+    return projectionReceipt && projectionReceipt.receiptHash === transaction.projectionReceiptHash &&
+      validateRoadmapArtifactReceipt(
+        artifactReceipt,
+        transaction.replacementPlanHash,
+        transaction.projectionReceiptHash,
+      ) && artifactReceipt.receiptHash === transaction.artifactReceiptHash &&
+      validateRoadmapProjectionReceipt(decision, transaction.replacementPlanHash, priorRecord.checkpoint)
+  }
+  const readRoadmapPlanTransaction = (priorRecord, decision) => {
+    const relative = roadmapPlanTransactionPath(priorRecord.entryHash)
+    const absolute = recordRef.resolve(relative)
+    if (!fs.existsSync(absolute)) return null
+    const transaction = readRegularJson(absolute, 'ROADMAP plan transaction').parsed
+    if (!validateRoadmapPlanTransaction(transaction, priorRecord, decision)) {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'ROADMAP plan transaction is foreign, corrupt, or lacks its authenticated projection bytes',
+      )
+    }
+    return transaction
+  }
+  const materializeRoadmapPlanTransaction = transaction => {
+    const artifact = readRegularJson(
+      recordRef.resolve(roadmapArtifactReceiptPath(transaction.replacementPlanHash)),
+      'ROADMAP deliverable receipt',
+    ).parsed
+    const bytes = Buffer.from(artifact.bytesBase64, 'base64')
+    const relative = 'plan/ROADMAP.md'
+    const currentHash = exactFileHash(relative)
+    if (currentHash !== null && currentHash !== transaction.priorPlanHash &&
+        currentHash !== transaction.replacementPlanHash) {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'ROADMAP plan bytes are neither the authenticated predecessor nor replacement',
+      )
+    }
+    if (currentHash !== transaction.replacementPlanHash) recordRef.write(relative, bytes)
+    if (exactFileHash(relative) !== transaction.replacementPlanHash) {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'ROADMAP replacement bytes did not materialize at their authenticated hash',
+      )
+    }
+    return transaction
+  }
   const loadCanonicalRoadmapProjectionAuthorResult = (decision, authorResult, authorWorkItemId) => {
+    if (authorWorkItemId === DETERMINISTIC_ROADMAP_EXECUTION_MODE) {
+      const projected = deterministicRoadmapProjectionResult(decision)
+      if (stableStringify(authorResult) !== stableStringify(projected)) {
+        throw new SupervisorIntegrationError(
+          'ROADMAP_RESULT_MISSING',
+          'deterministic ROADMAP projection differs from its accepted route decision',
+        )
+      }
+      return projected
+    }
     if (!['roadmap-author', 'roadmap-author-revise', 'roadmap-author-plan-repair'].includes(authorWorkItemId)) {
       throw new SupervisorIntegrationError(
         'ROADMAP_RESULT_MISSING',
@@ -15056,6 +18780,37 @@ function createDefaultRuntimeOptions(input) {
   }
   const writeRoadmapProjectionReceipt = (decision, authorResult, plan, authorWorkItemId) => {
     const planSha256 = hashText(plan)
+    const decisionHash = hashText(stableStringify(decision))
+    if (authorWorkItemId === DETERMINISTIC_ROADMAP_EXECUTION_MODE) {
+      const projected = deterministicRoadmapProjectionResult(decision)
+      if (stableStringify(authorResult) !== stableStringify(projected) ||
+          hashText(renderPlanArtifact('ROADMAP', decision, projected)) !== planSha256) {
+        throw new SupervisorIntegrationError(
+          'ROADMAP_RESULT_MISSING',
+          'deterministic ROADMAP projection bytes differ from the accepted route decision',
+        )
+      }
+      const body = {
+        schemaVersion: 1,
+        route: 'ROADMAP',
+        planSha256,
+        decisionHash,
+        authorWorkItemId,
+        sourceResultHash: decisionHash,
+        authorResult: projected,
+      }
+      const receipt = { ...body, receiptHash: hashText(stableStringify(body)) }
+      const relative = roadmapProjectionReceiptPath(planSha256)
+      const absolute = recordRef.resolve(relative)
+      if (fs.existsSync(absolute)) {
+        if (stableStringify(readRegularJson(absolute, 'ROADMAP projection receipt').parsed) !== stableStringify(receipt)) {
+          throw new SupervisorIntegrationError('CRASH_ADOPTION_CONFLICT', 'ROADMAP projection content address collided')
+        }
+      } else {
+        recordRef.write(relative, `${JSON.stringify(receipt, null, 2)}\n`)
+      }
+      return receipt
+    }
     if (!['roadmap-author', 'roadmap-author-revise', 'roadmap-author-plan-repair'].includes(authorWorkItemId)) {
       throw new SupervisorIntegrationError(
         'ROADMAP_RESULT_MISSING',
@@ -15070,7 +18825,7 @@ function createDefaultRuntimeOptions(input) {
       schemaVersion: 1,
       route: 'ROADMAP',
       planSha256,
-      decisionHash: hashText(stableStringify(decision)),
+      decisionHash,
       authorWorkItemId,
       sourceResultHash,
       authorResult,
@@ -15098,9 +18853,24 @@ function createDefaultRuntimeOptions(input) {
     if (!fs.existsSync(absolute)) return false
     const receipt = readRegularJson(absolute, 'ROADMAP projection receipt').parsed
     const { receiptHash, ...body } = receipt || {}
+    const decisionHash = hashText(stableStringify(decision))
+    if (receipt && receipt.schemaVersion === 1 && receipt.route === 'ROADMAP' &&
+        receipt.authorWorkItemId === DETERMINISTIC_ROADMAP_EXECUTION_MODE) {
+      if (receipt.planSha256 !== planSha256 || receiptHash !== hashText(stableStringify(body)) ||
+          receipt.decisionHash !== decisionHash || receipt.sourceResultHash !== decisionHash ||
+          (requiredAuthorWorkItemId !== null &&
+            requiredAuthorWorkItemId !== DETERMINISTIC_ROADMAP_EXECUTION_MODE)) return false
+      try {
+        const projected = deterministicRoadmapProjectionResult(decision)
+        return stableStringify(receipt.authorResult) === stableStringify(projected) &&
+          hashText(renderPlanArtifact('ROADMAP', decision, projected)) === planSha256
+      } catch {
+        return false
+      }
+    }
     if (!receipt || receipt.schemaVersion !== 1 || receipt.route !== 'ROADMAP' ||
         receipt.planSha256 !== planSha256 || receiptHash !== hashText(stableStringify(body)) ||
-        receipt.decisionHash !== hashText(stableStringify(decision)) ||
+        receipt.decisionHash !== decisionHash ||
         !['roadmap-author', 'roadmap-author-revise', 'roadmap-author-plan-repair'].includes(receipt.authorWorkItemId) ||
         (requiredAuthorWorkItemId !== null && receipt.authorWorkItemId !== requiredAuthorWorkItemId) ||
         receipt.sourceResultHash !== exactFileHash(`work/results/${hashText(receipt.authorWorkItemId)}.json`)) return false
@@ -15131,6 +18901,43 @@ function createDefaultRuntimeOptions(input) {
     } catch {
       return false
     }
+  }
+  const legacyRoadmapPlanLineage = (previous, current, decision) => {
+    const replacementPlanHash = current.checkpoint.immutableHashes.planHash
+    const projectionPath = recordRef.resolve(roadmapProjectionReceiptPath(replacementPlanHash))
+    if (!fs.existsSync(projectionPath)) return null
+    const projectionReceipt = readRegularJson(
+      projectionPath,
+      'legacy ROADMAP projection receipt',
+    ).parsed
+    if (!projectionReceipt || !validateRoadmapProjectionReceipt(
+      decision,
+      replacementPlanHash,
+      current.checkpoint,
+    )) return null
+    const rendered = renderPlanArtifact('ROADMAP', decision, projectionReceipt.authorResult)
+    if (hashText(rendered) !== replacementPlanHash) return null
+    const artifactReceipt = createRoadmapArtifactReceipt(rendered, projectionReceipt.receiptHash)
+    const body = {
+      schemaVersion: 1,
+      kind: 'codex-roadmap-plan-lineage',
+      priorPlanHash: previous.checkpoint.immutableHashes.planHash,
+      replacementPlanHash,
+      routeDecisionHash: current.checkpoint.immutableHashes.routeDecisionHash,
+      projectionReceiptHash: projectionReceipt.receiptHash,
+      artifactReceiptHash: artifactReceipt.receiptHash,
+      transactionReceiptHash: null,
+      migration: true,
+      legacyCauseId: current.cause.causeId,
+      previousCheckpointSequence: previous.sequence,
+      previousCheckpointEntryHash: previous.entryHash,
+      checkpointSequence: current.sequence,
+      stateEventSequence: current.checkpoint.stateEvent.sequence,
+      accountingSequence: current.checkpoint.accounting.lastAccountingSequence,
+      schedulerStateHash: current.checkpoint.scheduler.stateHash,
+      causeKind: current.cause.kind,
+    }
+    return Object.freeze({ ...body, lineageReceiptHash: hashText(stableStringify(body)) })
   }
   const runtimeOptions = {
     activationId: activation.runId,
@@ -15163,6 +18970,10 @@ function createDefaultRuntimeOptions(input) {
     generation,
     generationControlAuthority,
     readResult: readDurableResult,
+    readMutationAdmission(workItemId) {
+      const runtime = runtimeOptions.runtimeInstance
+      return runtime ? runtime._readMutationAdmission(workItemId) : null
+    },
     verifyDurableResultReceipt(workItemId, result) {
       if (!durableResultMatchesRecoveryReceipt(workItemId, result)) {
         throw new SupervisorIntegrationError(
@@ -15252,6 +19063,7 @@ function createDefaultRuntimeOptions(input) {
     },
     mission: activationRecord.request.canonicalJson,
     missionHash,
+    canonicalMissionProjection,
     missionLock,
     modelRegistry: activation.modelRegistry || [],
     monotonicNow: context.monotonicNow,
@@ -15387,6 +19199,7 @@ function createDefaultRuntimeOptions(input) {
         stateProvider: () => stateStore.load(),
         capabilityVerifier: capability => missionLock.verifyCapability(capability),
         budgetController: budget,
+        allowCompletionTargetOverrun: true,
         additionalCeilings: {
           retries: clampNonNegInt(context.retryLimit, 128) || 128,
           costMicrounits: clampNonNegInt(context.costMicrounitLimit, Number.MAX_SAFE_INTEGER) || Number.MAX_SAFE_INTEGER,
@@ -15535,46 +19348,36 @@ function createDefaultRuntimeOptions(input) {
         roadmapPlanAdvanceVerifier: (previous, current) => {
           if (!recordRef) return false
           const decisionPath = recordRef.resolve('route/decision.json')
-          const planPath = recordRef.resolve('plan/ROADMAP.md')
-          if (!fs.existsSync(decisionPath) || !fs.existsSync(planPath)) return false
+          if (!fs.existsSync(decisionPath)) return false
           const decisionBytesHash = sha256Bytes(fs.readFileSync(decisionPath))
-          const planBytesHash = sha256Bytes(fs.readFileSync(planPath))
           const currentHashes = current.checkpoint.immutableHashes
-          if (decisionBytesHash !== currentHashes.routeDecisionHash ||
-              planBytesHash !== currentHashes.planHash) return false
-          const decision = readRegularJson(decisionPath, 'ROADMAP repair route decision').parsed
-          const nextReady = previous.checkpoint.scheduler.nextReadyWorkIds
-          const transition = stableStringify(nextReady) === stableStringify(['roadmap-plan-check'])
-            ? {
-                authorId: 'roadmap-author-revise',
-                priorAuthors: ['roadmap-author'],
-              }
-            : stableStringify(nextReady) === stableStringify(['roadmap-plan-recheck'])
-              ? {
-                  authorId: 'roadmap-author-plan-repair',
-                  priorAuthors: ['roadmap-author', 'roadmap-author-revise'],
-                }
-              : null
-          if (!transition || !transition.priorAuthors.some(authorId =>
-            validateRoadmapProjectionReceipt(
-              decision,
-              previous.checkpoint.immutableHashes.planHash,
-              previous.checkpoint,
-              authorId,
-            ))) return false
-          return validateRoadmapProjectionReceipt(
-            decision,
-            currentHashes.planHash,
-            previous.checkpoint,
-            transition.authorId,
-          )
+          if (decisionBytesHash !== currentHashes.routeDecisionHash) return false
+          const match = /^plan-lineage:([a-f0-9]{64})$/u.exec(current.cause.causeId || '')
+          const decision = readRegularJson(decisionPath, 'ROADMAP plan-lineage route decision').parsed
+          if (!match) return legacyRoadmapPlanLineage(previous, current, decision)
+          const lineagePath = recordRef.resolve(roadmapPlanLineagePath(match[1]))
+          if (!fs.existsSync(lineagePath)) return false
+          const lineage = readRegularJson(lineagePath, 'ROADMAP plan lineage receipt').parsed
+          if (!lineage || lineage.lineageReceiptHash !== match[1]) return false
+          const transactionPath = recordRef.resolve(roadmapPlanTransactionPath(previous.entryHash))
+          if (!fs.existsSync(transactionPath)) return false
+          const transaction = readRegularJson(transactionPath, 'ROADMAP plan transaction').parsed
+          if (!validateRoadmapPlanTransaction(transaction, previous, decision) ||
+              lineage.priorPlanHash !== transaction.priorPlanHash ||
+              lineage.replacementPlanHash !== transaction.replacementPlanHash ||
+              lineage.routeDecisionHash !== transaction.routeDecisionHash ||
+              lineage.projectionReceiptHash !== transaction.projectionReceiptHash ||
+              lineage.artifactReceiptHash !== transaction.artifactReceiptHash ||
+              lineage.transactionReceiptHash !== transaction.transactionReceiptHash) return false
+          return lineage
         },
         clock: context.clock,
       })
       runtimeOptions.recoveryCheckpointAuthority = recoveryCheckpointAuthorityRef
       runtimeOptions.persistRecoveryCheckpoint = persistRecoveryCheckpoint
       runtimeOptions.preparePausedRelease = () => stateStore.preparePausedRelease()
-      const authenticateCrashResumeProjection = (checkpoint, decoded) => {
+      const authenticateCrashResumeProjection = (priorRecord, decoded) => {
+        const checkpoint = priorRecord.checkpoint
         const savedScheduler = ['scheduler-crash-checkpoint', 'scheduler-drained-checkpoint'].includes(decoded.kind)
           ? decoded.schedulerState : decoded
         const recommendationPath = record.resolve('route/recommendation.json')
@@ -15591,6 +19394,7 @@ function createDefaultRuntimeOptions(input) {
           )
         }
         let planHash = checkpoint.immutableHashes.planHash
+        let planLineageTransaction = null
         if (savedScheduler.route !== 'PENDING') {
           const validation = validateRouteDecision(decision)
           const decisionHash = decision && sha256Bytes(fs.readFileSync(decisionPath))
@@ -15601,27 +19405,70 @@ function createDefaultRuntimeOptions(input) {
               { errors: validation.errors },
             )
           }
+          if (savedScheduler.route === 'ROADMAP') {
+            planLineageTransaction = readRoadmapPlanTransaction(priorRecord, decision)
+            const durablePlanHash = persistedPlanHash('ROADMAP')
+            if (!planLineageTransaction && durablePlanHash !== checkpoint.immutableHashes.planHash &&
+                /^[a-f0-9]{64}$/u.test(durablePlanHash || '')) {
+              const projectionPath = recordRef.resolve(roadmapProjectionReceiptPath(durablePlanHash))
+              if (!fs.existsSync(projectionPath)) {
+                throw new SupervisorIntegrationError(
+                  'RESUME_STATE_INVALID',
+                  'legacy ROADMAP replacement lacks its authenticated projection receipt',
+                )
+              }
+              const projectionReceipt = readRegularJson(
+                projectionPath,
+                'legacy pending ROADMAP projection receipt',
+              ).parsed
+              if (!validateRoadmapProjectionReceipt(decision, durablePlanHash, checkpoint)) {
+                throw new SupervisorIntegrationError(
+                  'RESUME_STATE_INVALID',
+                  'legacy ROADMAP replacement projection does not bind its durable author receipt',
+                )
+              }
+              const planBytes = readFileNoFollow(recordRef.resolve('plan/ROADMAP.md'))
+              const artifactReceipt = createRoadmapArtifactReceipt(
+                planBytes.toString('utf8'),
+                projectionReceipt.receiptHash,
+              )
+              writeImmutableReceipt(
+                roadmapArtifactReceiptPath(durablePlanHash),
+                artifactReceipt,
+                'migrated ROADMAP deliverable receipt',
+              )
+              planLineageTransaction = createRoadmapPlanTransaction(
+                priorRecord,
+                projectionReceipt,
+                artifactReceipt,
+              )
+              writeImmutableReceipt(
+                roadmapPlanTransactionPath(priorRecord.entryHash),
+                planLineageTransaction,
+                'migrated ROADMAP plan transaction',
+              )
+            }
+            if (planLineageTransaction) materializeRoadmapPlanTransaction(planLineageTransaction)
+          }
           planHash = persistedPlanHash(savedScheduler.route)
-          const requiredProjectionAuthor = requiredRoadmapProjectionAuthor(
-            savedScheduler,
-            planHash,
-            checkpoint.immutableHashes.planHash,
-          )
           if (!resumePlanProjectionAccepted(
             savedScheduler.route,
             planHash,
             checkpoint.immutableHashes.planHash,
-            currentPlanHash => requiredProjectionAuthor !== null && validateRoadmapProjectionReceipt(
-              decision,
-              currentPlanHash,
-              checkpoint,
-              requiredProjectionAuthor,
-            ),
+            (priorPlanHash, currentPlanHash) => Boolean(planLineageTransaction &&
+              planLineageTransaction.priorPlanHash === priorPlanHash &&
+              planLineageTransaction.replacementPlanHash === currentPlanHash),
           )) {
             throw new SupervisorIntegrationError('RESUME_STATE_INVALID', 'saved plan differs from the recovery checkpoint')
           }
         }
-        return Object.freeze({ savedScheduler, recommendation, decision, planHash })
+        return Object.freeze({
+          savedScheduler,
+          recommendation,
+          decision,
+          planHash,
+          planLineageTransaction,
+        })
       }
       if (generation > 1 && !runtimeOptions.releaseReconciliation) {
         const predecessorState = stateStore.load()
@@ -15637,7 +19484,7 @@ function createDefaultRuntimeOptions(input) {
           : recoveryCheckpointAuthorityRef.resumeCheckpoint()
         const decodedScheduler = decodeSchedulerCheckpoint(priorEvidence.record.checkpoint.scheduler)
         const authenticatedProjection = authenticateCrashResumeProjection(
-          priorEvidence.record.checkpoint,
+          priorEvidence.record,
           decodedScheduler,
         )
         const adopted = predecessorState.state === 'PAUSED'
@@ -15725,36 +19572,37 @@ function createDefaultRuntimeOptions(input) {
           : pendingCrashResume.decodedScheduler
         currentRoute = decodedBase.route === 'PENDING' ? null : decodedBase.route
       }
-      const processProbeReservation = crypto.randomUUID()
+      const targetKey = missionLock.verifyCapability(lease).targetIdentity
+      // The process registry intentionally retains terminal identities across
+      // the one authorized predecessor generation.  Bind the conformance
+      // probe's stable session identity and its physical reservation to the
+      // current generation so crash recovery cannot alias the predecessor's
+      // already-drained probe.  Keeping the session stable *within* one
+      // generation also preserves duplicate-probe rejection before spawn.
+      const processProbeSession = `${activation.runId}:generation:${generation}:process-probe`
+      const processProbeReservation = `${processProbeSession}:${crypto.randomUUID()}`
       const processProbeBaseEnvironment = prepareProcessLaunchEnvironment(
         processAdapter,
         processProbeReservation,
         environment,
       )
       const initialSafety = safeEnvFactory(targetPath, processProbeBaseEnvironment, safetyOptions)
-      const processAdmission = await processAdapter.admit()
-      if (!processAdmission || processAdmission.supported !== true) {
-        throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'owned process-group admission failed', { processAdmission })
-      }
-      const targetKey = missionLock.verifyCapability(lease).targetIdentity
-      const processProbe = await processOwner.launch({
-        executable: process.execPath,
-        argv: ['-e', 'setInterval(() => {}, 1000)'],
-        cwd: targetPath,
-        env: initialSafety.environment,
-        shell: false,
-        sessionId: `${activation.runId}:process-probe`,
+      const processProbe = await runOwnedProcessConformanceProbe({
+        adapter: processAdapter,
+        processOwner,
+        targetPath,
+        environment: initialSafety.environment,
+        sessionId: processProbeSession,
         reservationId: processProbeReservation,
         targetKey,
-        forWork: false,
-      })
-      await processOwner.cancelGroup(processProbe.ownershipId, {
         reason: 'runtime ownership probe',
-        graceMs: 0,
         killMs: 1000,
-        terminalStatus: 'DONE',
       })
-      await processOwner.assertTargetDrained(targetKey)
+      const processAdmission = Object.freeze({
+        supported: true,
+        adapterKind: processProbe.adapterKind,
+        probeHash: processProbe.probeHash,
+      })
       const snapshotRoot = path.join(activation.activationRoot, 'checker-snapshots')
       runtimeOptions.checkerSnapshotFactory = createCheckerSnapshotFactory({
         targetPath,
@@ -15861,6 +19709,7 @@ function createDefaultRuntimeOptions(input) {
           recommendation,
           decision,
           planHash: restoredPlanHash,
+          planLineageTransaction,
         } = pendingCrashResume.authenticatedProjection
         // Authenticate every immutable input and the frontier-specific plan
         // author before either resume transition mutates durable state. A
@@ -15914,6 +19763,7 @@ function createDefaultRuntimeOptions(input) {
           openCheckIds: restoredFrontier.openCheckIds,
           nextReadyWorkIds: restoredFrontier.nextReadyWorkIds,
           externalOperations: checkpoint.externalOperations,
+          planLineageTransaction,
           threadEvidence: Object.fromEntries(checkpoint.scheduler.leases
             .filter(item => item.thread.started)
             .map(item => [item.leaseId, {
@@ -15974,25 +19824,29 @@ function createDefaultRuntimeOptions(input) {
       if (!codexAdapter) throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'Codex external adapter is not initialized')
       return launchCodexChildWithCheckerReassessment(codexAdapter, launch, activation.runId)
     },
+    childTransportWatchdogMs: clampNonNegInt(
+      context.childTransportWatchdogMs,
+      CHILD_TRANSPORT_WATCHDOG_MS,
+    ) || CHILD_TRANSPORT_WATCHDOG_MS,
+    onChildTransportTimeout: async ({ sessionId }) => {
+      if (!trustedTestRunner) return { drained: true, alreadyTerminal: true }
+      return trustedTestRunner.stop({
+        sessionId,
+        reason: 'optional pre-route analyst fallback watchdog elapsed',
+        terminalStatus: 'FAILED',
+      })
+    },
     l0ViaScheduler: false,
-    decideRoute: async ({
-      analysis,
-      correctionAttempts,
-      requestPointer,
-      continuationId,
-      onLaunchPrepared,
-      onSessionIdentified,
-      onUsageDelta,
-      onTerminalResult,
-    }) => {
+    decideRoute: async ({ analysis, requestPointer }) => {
       const recommendation = analysis && analysis.recommendation || analysis
       if (recommendation && recommendation.preWorkResult === 'CONTINUE') {
         try {
           return {
             decision: compileAutomaticRouteDecision({
               recommendation,
-              requestedResult: activation.entryPrompt,
+              requestedResult: canonicalMissionProjection.canonicalMission,
               requestEnvelopeHash: requestPointer.hash,
+              targetIdentity: activation.supervisorRuntime.targetIdentity,
               providerCapabilities: runtimeOptions.providerCapabilities,
               budget: runtimeOptions.budgetController.status({ forWork: true }),
               nowMs: Date.now(),
@@ -16003,94 +19857,23 @@ function createDefaultRuntimeOptions(input) {
           }
         } catch (error) {
           if (!error || error.code !== 'ROUTE_DECISION_INVALID') throw error
-          // A malformed or self-contradictory analyst proposal must not stop
-          // the task.  Use the costly root model only as an exceptional
-          // correction path; ordinary automatic routing stays controller-only.
+          // Fall through to the deterministic conservative projection below.
         }
       }
-      if (!codexAdapter || !capabilityBinding || !recordRef) {
-        throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'root L0 recovery transport is not initialized')
-      }
-      const reservationId = crypto.randomUUID()
-      const launchBaseEnvironment = prepareProcessLaunchEnvironment(processAdapter, reservationId, environment)
-      const safetyBoundary = ensureSafeEnvironment(safeEnvFactory(targetPath, launchBaseEnvironment, safetyOptions))
-      const assignment = readPrivateAgentAssignment(activation, 'ap-run-owner', 'run-owner')
-      const verification = capabilityBinding.verify({
-        child: { logicalRole: 'run-owner' },
-        runId: activation.runId,
-        generation,
-        assignmentId: 'root-route-decision',
-        assignmentHash: hashText(stableStringify(assignment)),
-      })
-      const dispatch = buildContextFreeBrief({
-        role: 'ap-run-owner',
-        purpose: 'planning',
-        assignment: correctionAttempts > 0
-          ? 'Correct the invalid L0 route decision once, using the validator findings and the saved analyst evidence.'
-          : 'Recover the authoritative L0 DIRECT, LIGHT, or ROADMAP decision because the analyst result was unavailable or internally inconsistent.',
-        successChecklist: ['Return the complete canonical route-decision v2 schema within four minutes.'],
-        checks: ['Compare the decision to the exact request, durable analyst evidence, and canonical route facts.'],
-        requestPointer,
-        evidencePointers: analysis && analysis.evidencePointers || [],
-        providerCapabilities: runtimeOptions.providerCapabilities,
-        route: 'PENDING',
-        forkTurns: 'none',
-      })
-      const audit = auditDispatch(dispatch)
-      if (!audit.conformant || dispatch.fork_turns !== 'none') {
-        throw new SupervisorIntegrationError('CONTEXT_POLICY_DENIED', 'root L0 recovery dispatch violates the context policy', audit)
-      }
-      const sessionId = `${activation.runId}:root-route-decision:${reservationId}`
-      if (typeof onLaunchPrepared === 'function') {
-        onLaunchPrepared({ reservationId, sessionId, continuationId: continuationId || null })
-      }
-      const result = await codexAdapter.launch({
-        logicalRole: 'run-owner',
-        physicalRole: roleContract.orchestratorContract.physicalId,
-        providerRole: 'ap-run-owner',
-        physicalExecutionPolicy: liveRolePolicy.bindRootRunOwner(),
-        route: 'PRE_ROUTE',
-        entryPrompt: activation.entryPrompt,
-        dispatch,
-        environment: safetyBoundary.environment,
-        safetyAttestation: safetyBoundary.attestation,
-        workingDirectory: targetPath,
-        assignment,
-        profileLimits: { route: null, status: 'ROUTE_PENDING', maxDepth: 1, maxConcurrentThreads: 1 },
-        sessionId,
-        reservationId,
-        continuationId: continuationId || null,
-        capabilityVerification: verification,
-        onSessionIdentified: (identified, evidence) => {
-          if (typeof onSessionIdentified === 'function') {
-            onSessionIdentified(identified, { ...evidence, reservationId, sessionId })
-          }
-        },
-        onUsageDelta,
-        onTerminalResult: typeof onTerminalResult === 'function'
-          ? (terminalResult, evidence) => onTerminalResult(terminalResult, {
-              ...evidence,
-              controlSessionId: sessionId,
-              assignmentHash: hashText(stableStringify(dispatch)),
-            })
-          : null,
-      })
-      const {
-        candidateHash: _candidateHash,
-        completionRequested: _completionRequested,
-        contextId: _contextId,
-        events: _events,
-        evidenceHashes: _evidenceHashes,
-        recommendation: _recommendation,
-        usage,
-        usageStreamed,
-        ...decision
-      } = result
+      // Advisory route output cannot justify another planning generation.
+      // Malformed, unavailable, contradictory, or semantically over-bound
+      // analysis compiles the one-worker local completion path directly.
       return {
-        decision: result.decision || decision,
+        decision: compileConservativeCompletionDecision({
+          requestedResult: canonicalMissionProjection.canonicalMission,
+          requestEnvelopeHash: requestPointer.hash,
+          providerCapabilities: runtimeOptions.providerCapabilities,
+          budget: runtimeOptions.budgetController.status({ forWork: true }),
+          nowMs: Date.now(),
+        }),
         submittedAtMs: Date.now(),
-        usage,
-        usageStreamed: usageStreamed === true,
+        usage: { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 },
+        usageStreamed: false,
       }
     },
     assignmentResolver: ({ providerRole, logicalRole }) =>
@@ -16177,71 +19960,14 @@ function createDefaultRuntimeOptions(input) {
         })
       },
     },
-    workerWorkspaceFactory: ({ assignment, workItemId }) => {
-      if (!workerWorkspaceManager) {
-        workerWorkspaceManager = new WorkerWorkspaceManager({
-          targetRoot: targetPath,
-          privateRoot: path.join(activation.activationRoot, 'worker-workspaces'),
-          environment: gitEnvironment(targetPath),
-          runId: activation.runId,
-          activationId: activation.runId,
-          hardenWorkspace: workspacePath => {
-            const repair = childProcess.spawnSync(process.execPath, [
-              path.resolve(__dirname, '..', '..', '..', 'scripts', 'local-only-safety.cjs'),
-              '--repo', workspacePath,
-              '--expected-branch', expectedBranch,
-              '--repair',
-              '--enforcement-proof', activationRecord.activationBoundary.enforcementProof.path,
-              '--json',
-            ], {
-              env: environment,
-              encoding: 'utf8',
-              windowsHide: true,
-              maxBuffer: 4 * 1024 * 1024,
-            })
-            let parsed = null
-            try { parsed = JSON.parse(String(repair.stdout || '')) } catch {}
-            return {
-              accepted: [0, 3].includes(repair.status) && parsed &&
-                parsed.networkContactAttempted === false && parsed.repositoryOk === true,
-            }
-          },
-        })
-      }
-      return workerWorkspaceManager.prepare({ assignment, workItemId })
+    workerWorkspaceFactory: ({ assignment, workItemId, transportQuarantine }) => {
+      const manager = openWorkerWorkspaceManager()
+      return transportQuarantine
+        ? manager.prepareFromQuarantine({ assignment, workItemId, quarantine: transportQuarantine })
+        : manager.prepare({ assignment, workItemId })
     },
     workerWorkspaceRecoveryFactory: ({ assignment, workItemId, recordPath }) => {
-      if (!workerWorkspaceManager) {
-        workerWorkspaceManager = new WorkerWorkspaceManager({
-          targetRoot: targetPath,
-          privateRoot: path.join(activation.activationRoot, 'worker-workspaces'),
-          environment: gitEnvironment(targetPath),
-          runId: activation.runId,
-          activationId: activation.runId,
-          hardenWorkspace: workspacePath => {
-            const repair = childProcess.spawnSync(process.execPath, [
-              path.resolve(__dirname, '..', '..', '..', 'scripts', 'local-only-safety.cjs'),
-              '--repo', workspacePath,
-              '--expected-branch', expectedBranch,
-              '--repair',
-              '--enforcement-proof', activationRecord.activationBoundary.enforcementProof.path,
-              '--json',
-            ], {
-              env: environment,
-              encoding: 'utf8',
-              windowsHide: true,
-              maxBuffer: 4 * 1024 * 1024,
-            })
-            let parsed = null
-            try { parsed = JSON.parse(String(repair.stdout || '')) } catch {}
-            return {
-              accepted: [0, 3].includes(repair.status) && parsed &&
-                parsed.networkContactAttempted === false && parsed.repositoryOk === true,
-            }
-          },
-        })
-      }
-      return workerWorkspaceManager.reopen({ assignment, workItemId, recordPath })
+      return openWorkerWorkspaceManager().reopen({ assignment, workItemId, recordPath })
     },
     writeDeferredPromotionState(state) {
       if (!recordRef) {
@@ -16300,21 +20026,61 @@ function createDefaultRuntimeOptions(input) {
               reservationId,
               launch.environment,
             )
-            return withTimeout(
-              () => trustedTestRunner.run({
+            const timeoutMs = productionTransportWatchdogMs(120_000)
+            let timeoutDrainReceipt = null
+            try {
+              return await withTimeout(
+                refreshTransportWatchdog => trustedTestRunner.run({
+                  executable: launch.executable,
+                  argv: launch.argv,
+                  cwd: launch.cwd,
+                  env: ownedEnvironment,
+                  stdin: '',
+                  sessionId,
+                  reservationId,
+                  onTransportActivity: refreshTransportWatchdog,
+                }),
+                timeoutMs,
+                { setTimeout, clearTimeout },
+                'EXISTING_TEST_BASELINE_TIMEOUT',
+                async () => {
+                  timeoutDrainReceipt = await trustedTestRunner.stop({
+                    sessionId,
+                    reason: 'trusted existing-test timeout',
+                    terminalStatus: 'FAILED',
+                  })
+                  return timeoutDrainReceipt
+                },
+              )
+            } catch (error) {
+              if (!error || error.code !== 'EXISTING_TEST_BASELINE_TIMEOUT') throw error
+              if (!timeoutDrainReceipt || timeoutDrainReceipt.drained !== true) {
+                throw new SupervisorIntegrationError(
+                  'PROCESS_DRAIN_TIMEOUT',
+                  `trusted existing test ${launch.id} timed out without a conclusive descendant-drain receipt`,
+                )
+              }
+              const timeoutEvidenceHash = hashText(stableStringify({
+                id: launch.id,
                 executable: launch.executable,
                 argv: launch.argv,
                 cwd: launch.cwd,
-                env: ownedEnvironment,
-                stdin: '',
-                sessionId,
-                reservationId,
-              }),
-              benchmarkPhaseTimeoutMs(120_000, environment),
-              { setTimeout, clearTimeout },
-              'EXISTING_TEST_BASELINE_TIMEOUT',
-              () => trustedTestRunner.stop({ sessionId, reason: 'trusted existing-test timeout' }),
-            )
+                timeoutMs,
+                drainStatus: timeoutDrainReceipt.terminal && timeoutDrainReceipt.terminal.status ||
+                  (timeoutDrainReceipt.alreadyTerminal === true ? 'ALREADY_TERMINAL' : 'DRAINED'),
+              }))
+              return {
+                exitCode: 124,
+                status: 124,
+                stdout: '',
+                stderr: `EXISTING_TEST_BASELINE_TIMEOUT ${timeoutEvidenceHash}`,
+                processOwned: true,
+                exactArgv: true,
+                drained: true,
+                timedOut: true,
+                timeoutEvidenceHash,
+              }
+            }
           }
       const existingTests = await executeExistingTestBaseline(trustedTestDeclarations, {
         runner: runExistingTest,
@@ -16377,9 +20143,7 @@ function createDefaultRuntimeOptions(input) {
     },
     limits: {
       wallMs,
-      tokens: environment.AUTOPROMPT_BENCHMARK_NO_TOKEN_LIMIT === '1'
-        ? Number.MAX_SAFE_INTEGER
-        : clampNonNegInt(context.tokenLimit, 1_000_000),
+      tokens: clampNonNegInt(context.tokenLimit, 1_000_000),
       sessions: clampNonNegInt(context.sessionLimit, 128),
       launches: clampNonNegInt(context.launchLimit, 128),
     },
@@ -16390,6 +20154,8 @@ function createDefaultRuntimeOptions(input) {
   runtimeOptions.executeRoute = createDefaultRouteExecutor({
     targetPath,
     gitEnvironment,
+    runId: activation.runId,
+    activationId: activation.runId,
     missionHash,
     monotonicNow: typeof context.monotonicNow === 'function'
       ? context.monotonicNow : () => Number(process.hrtime.bigint() / 1000000n),
@@ -16398,12 +20164,25 @@ function createDefaultRuntimeOptions(input) {
       if (!runtime) throw new SupervisorIntegrationError('REQUEST_POINTER_REQUIRED', 'active runtime is unavailable')
       return verifyRequestPointer(runtime.requestPointer)
     },
-    recordRoadmapPlanning(durationMs) {
+    transportQuarantinePointer({ sourceWorkItemId, retryWorkItemId, transportResult }) {
       const runtime = runtimeOptions.runtimeInstance
-      if (!runtime || !runtime.scheduler) {
-        throw new SupervisorIntegrationError('SCHEDULER_REQUIRED', 'ROADMAP planning admission requires the active scheduler')
+      if (!runtime) {
+        throw new SupervisorIntegrationError(
+          'WORKER_QUARANTINE_INVALID',
+          'transport retry quarantine requires the active receipt authority',
+        )
       }
-      return runtime.scheduler.recordAdmissionComponent('roadmapPlanning', durationMs)
+      const receipt = runtime._verifyDurableResultReceipt(sourceWorkItemId, transportResult)
+      try {
+        return openWorkerWorkspaceManager().quarantinePointer({
+          sourceWorkItemId,
+          retryWorkItemId,
+          transportReceiptHash: receipt.receiptHash,
+        })
+      } catch (error) {
+        if (error && error.code === 'WORKER_QUARANTINE_NOT_FOUND') return null
+        throw error
+      }
     },
     frameworkAuthorityFactory({ route, requirementHash, missIdentity }) {
       if (!recordRef) {
@@ -16422,14 +20201,20 @@ function createDefaultRuntimeOptions(input) {
       const relative = `work/framework-orchestration-${requirementHash}.json`
       const sharedCacheRoot = path.join(path.dirname(activation.activationRoot), 'framework-cache')
       const sharedCachePath = path.join(sharedCacheRoot, `${requirementHash}.json`)
+      const frameworkAssignmentId = `framework:${requirementHash.slice(0, 24)}`
       return new FrameworkOrchestrationAuthority({
         binding: {
           runId: activation.runId,
           activationId: activation.runId,
           generation,
           route,
-          assignmentId: `framework:${requirementHash.slice(0, 24)}`,
-          findingIds: ['AP-LAYER-004'],
+          assignmentId: frameworkAssignmentId,
+          findingIds: [assignmentLocalFindingId({
+            workItemId: frameworkAssignmentId,
+            logicalRole: 'run-owner',
+            assignment: { route, requirementHash, routeSchemaDigest: missIdentity.routeSchemaDigest },
+          }, { requestEnvelopeHash: requirementHash },
+          runtimeOptions.runtimeInstance && runtimeOptions.runtimeInstance.assignmentFindingIdRegistry)],
           requirementHash,
           routeSchemaDigest: missIdentity.routeSchemaDigest,
           cacheKey: missIdentity.cacheKey,
@@ -16503,6 +20288,26 @@ function createDefaultRuntimeOptions(input) {
         ? runtime._runtimeTransition(eventId, nextState, details)
         : runtimeOptions.runtimeTransition({ eventId, nextState, details })
     },
+    persistControllerCheckerResult(request, result) {
+      const runtime = runtimeOptions.runtimeInstance
+      if (!runtime) {
+        throw new SupervisorIntegrationError(
+          'RUN_RECORD_FAILURE',
+          'controller checker receipt persistence requires the active supervisor runtime',
+        )
+      }
+      return runtime._persistControllerTaskResult(request, result)
+    },
+    persistControllerTaskResult(request, result) {
+      const runtime = runtimeOptions.runtimeInstance
+      if (!runtime) {
+        throw new SupervisorIntegrationError(
+          'RUN_RECORD_FAILURE',
+          'controller task-result persistence requires the active supervisor runtime',
+        )
+      }
+      return runtime._persistControllerTaskResult(request, result)
+    },
     harnessAttestation(candidateHash, oracle) {
       return {
         repoHash: candidateHash,
@@ -16519,6 +20324,7 @@ function createDefaultRuntimeOptions(input) {
         : authorResult
       const plan = renderPlanArtifact(route, decision, projectionAuthorResult)
       const runtime = runtimeOptions.runtimeInstance
+      const productFrontier = initialProductFrontier(decision)
       if (route === 'ROADMAP' && projectionAuthorResult && runtime && runtime.scheduler) {
         const roadmap = projectionAuthorResult
         const requestScope = recordRef.loadRequest()
@@ -16528,27 +20334,12 @@ function createDefaultRuntimeOptions(input) {
         const expansionCount = Math.max(0, roadmap.behaviorChanged.length - userAskCount)
         let expansionAdmission = null
         if (expansionCount > 0) {
-          const expansionAuthority = typeof context.roadmapExpansionAuthority === 'function'
-            ? context.roadmapExpansionAuthority
-            : productionRoadmapExpansionAuthority
-          const authority = expansionAuthority(Object.freeze({
+          expansionAdmission = admitRoadmapExpansion(context.roadmapExpansionAuthority, {
             admittedAskCount: expansionCount,
             missionScopeHash,
             planSha256,
             requestVersionPointer: requestScope.currentPointer,
             proposedEvidence: roadmap.expansionAdmission || null,
-          }))
-          if (authority && typeof authority.then === 'function') {
-            throw new SupervisorIntegrationError(
-              'ROADMAP_EXPANSION_NOT_ADMITTED',
-              'roadmap expansion authority must make a synchronous receipt-bound decision before the plan is recorded',
-            )
-          }
-          expansionAdmission = bindRoadmapExpansionAdmission({
-            ...authority,
-            admittedAskCount: expansionCount,
-            missionScopeHash,
-            planSha256,
           })
         }
         runtime.scheduler.recordRoadmapAskRatio({
@@ -16558,31 +20349,53 @@ function createDefaultRuntimeOptions(input) {
           planSha256,
           expansionAdmission,
         })
-        if (['roadmap-author-revise', 'roadmap-author-plan-repair'].includes(authorWorkItemId)) {
-          const checkerId = authorWorkItemId === 'roadmap-author-revise'
-            ? 'roadmap-plan-check' : 'roadmap-plan-recheck'
-          runtime._persistRecoveryCheckpoint({
-            kind: 'ROADMAP_RATIO_RECORDED',
-            causeId: `roadmap-ratio:${generation}:${authorWorkItemId}:${planSha256}`,
-            humanDescription: 'Persist ROADMAP expansion accounting before changing the authenticated plan projection.',
-          }, { candidateHash: null, nextReadyWorkIds: [checkerId] })
+        runtime._persistRecoveryCheckpoint({
+          kind: 'ROADMAP_RATIO_RECORDED',
+          causeId: `roadmap-ratio:${generation}:${authorWorkItemId}:${planSha256}`,
+          humanDescription: 'Persist ROADMAP expansion accounting before changing the authenticated plan projection.',
+        }, { candidateHash: null, nextReadyWorkIds: productFrontier })
+      }
+      let planLineageTransaction = null
+      if (route === 'ROADMAP' && projectionAuthorResult) {
+        const projectionReceipt = writeRoadmapProjectionReceipt(
+          decision,
+          projectionAuthorResult,
+          plan,
+          authorWorkItemId,
+        )
+        if (runtime && runtime.scheduler) {
+          const artifactReceipt = createRoadmapArtifactReceipt(plan, projectionReceipt.receiptHash)
+          writeImmutableReceipt(
+            roadmapArtifactReceiptPath(artifactReceipt.sha256),
+            artifactReceipt,
+            'ROADMAP deliverable receipt',
+          )
+          const replayed = recoveryCheckpointAuthorityRef && recoveryCheckpointAuthorityRef.replay()
+          const priorRecord = replayed && replayed.latest && replayed.latest.record
+          planLineageTransaction = createRoadmapPlanTransaction(
+            priorRecord,
+            projectionReceipt,
+            artifactReceipt,
+          )
+          if (planLineageTransaction) {
+            writeImmutableReceipt(
+              roadmapPlanTransactionPath(planLineageTransaction.previousCheckpointEntryHash),
+              planLineageTransaction,
+              'ROADMAP plan transaction',
+            )
+          }
         }
       }
-      if (route === 'ROADMAP' && projectionAuthorResult) {
-        writeRoadmapProjectionReceipt(decision, projectionAuthorResult, plan, authorWorkItemId)
-      }
       recordRef.write(relative, plan)
-      if (route === 'ROADMAP' && projectionAuthorResult && runtime && runtime.scheduler &&
-          ['roadmap-author-revise', 'roadmap-author-plan-repair'].includes(authorWorkItemId)) {
-        const checkerId = authorWorkItemId === 'roadmap-author-revise'
-          ? 'roadmap-plan-check' : 'roadmap-plan-recheck'
+      if (route === 'ROADMAP' && planLineageTransaction && runtime && runtime.scheduler) {
         runtime._persistRecoveryCheckpoint({
           kind: 'PLAN_PROJECTION_COMMITTED',
-          causeId: `plan-projection:${generation}:${authorWorkItemId}:${hashText(plan)}`,
+          causeId: `plan-projection-pending:${planLineageTransaction.transactionReceiptHash}`,
           humanDescription: 'Persist the authenticated ROADMAP projection before admitting its checker.',
         }, {
           candidateHash: null,
-          nextReadyWorkIds: [checkerId],
+          nextReadyWorkIds: productFrontier,
+          planLineageTransaction,
         })
       }
     },
@@ -16593,6 +20406,10 @@ function createDefaultRuntimeOptions(input) {
       return fs.existsSync(recordRef.resolve(relative))
     },
     readResult: readDurableResult,
+    readMutationAdmission(workItemId) {
+      const runtime = runtimeOptions.runtimeInstance
+      return runtime ? runtime._readMutationAdmission(workItemId) : null
+    },
     writeAllWorkJoinedReceipt(receipt) {
       if (!recordRef || typeof recordRef.writeAllWorkJoinedReceipt !== 'function') {
         throw new SupervisorIntegrationError('RUN_RECORD_FAILURE', 'ALL_WORK_JOINED receipt writer is unavailable')
@@ -16612,6 +20429,43 @@ function createDefaultRuntimeOptions(input) {
         throw error
       }
     },
+    persistStructuredFinalResponse(response, binding = {}) {
+      if (!recordRef) {
+        throw new SupervisorIntegrationError(
+          'RUN_RECORD_FAILURE',
+          'structured final-response persistence requires the opened immutable run record',
+        )
+      }
+      const { responseHash, ...body } = response && typeof response === 'object' ? response : {}
+      if (!/^[a-f0-9]{64}$/u.test(binding.candidateHash || '') ||
+          !/^[a-f0-9]{64}$/u.test(responseHash || '') ||
+          responseHash !== hashText(stableStringify(body))) {
+        throw new SupervisorIntegrationError(
+          'STRUCTURED_FINAL_RESPONSE_INVALID',
+          'structured final-response persistence requires an exact self-hashed response binding',
+        )
+      }
+      const relative = `work/results/structured-final-response-${binding.candidateHash}.json`
+      const absolute = recordRef.resolve(relative)
+      if (fs.existsSync(absolute)) {
+        const existing = readRegularJson(absolute, 'structured final-response version being checked').parsed
+        if (stableStringify(existing) !== stableStringify(response)) {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            'structured final-response version changed after first immutable persistence',
+          )
+        }
+      } else {
+        recordRef.write(relative, `${JSON.stringify(response, null, 2)}\n`)
+      }
+      const bytes = fs.readFileSync(absolute)
+      return Object.freeze({
+        name: 'structured-final-response',
+        path: absolute,
+        hash: sha256Bytes(bytes),
+        bytes: bytes.length,
+      })
+    },
     resultPointer(workItemId) {
       if (!recordRef) throw new SupervisorIntegrationError('RUN_RECORD_FAILURE', 'result pointer requires the opened run record')
       const absolute = recordRef.resolve(`work/results/${hashText(workItemId)}.json`)
@@ -16627,8 +20481,102 @@ function createDefaultRuntimeOptions(input) {
       })
     },
     writeCapturedDomainAdmission(admission) {
-      if (!recordRef) throw new SupervisorIntegrationError('RUN_RECORD_FAILURE', 'captured-domain admission requires the opened run record')
-      recordRef.write('work/captured-domain-admission.json', `${JSON.stringify(admission, null, 2)}\n`)
+      if (!recordRef || !stateStore || !leaseRef) {
+        throw new SupervisorIntegrationError(
+          'RUN_RECORD_FAILURE',
+          'captured-domain admission requires the opened run record and authenticated runtime state',
+        )
+      }
+      const admissionRelative = 'work/captured-domain-admission.json'
+      const receiptRelative = 'work/captured-domain-admission-receipt.json'
+      const admissionPath = recordRef.resolve(admissionRelative)
+      const receiptPath = recordRef.resolve(receiptRelative)
+      const admissionWasDurable = fs.existsSync(admissionPath)
+      const receiptWasDurable = fs.existsSync(receiptPath)
+      if (admissionWasDurable !== receiptWasDurable) {
+        throw new SupervisorIntegrationError(
+          'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
+          'pre-work captured-domain admission and its authenticated receipt must become recoverable together',
+        )
+      }
+      recordRef.write(admissionRelative, `${JSON.stringify(admission, null, 2)}\n`)
+      const admissionBytes = fs.readFileSync(admissionPath)
+      const reopenedAdmission = JSON.parse(admissionBytes.toString('utf8'))
+      if (stableStringify(reopenedAdmission) !== stableStringify(admission)) {
+        throw new SupervisorIntegrationError(
+          'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
+          'durable captured-domain admission differs from its pre-work controller bytes',
+        )
+      }
+      const receiptBody = Object.freeze({
+        schemaVersion: 1,
+        kind: 'codex-captured-domain-pre-work-admission',
+        runId: activation.runId,
+        generation,
+        admissionHash: admission.admissionHash,
+        admissionFileHash: sha256Bytes(admissionBytes),
+        requestEnvelopeHash: admission.requestEnvelopeHash,
+        routeDecisionHash: admission.routeDecisionHash,
+        targetStateHash: admission.targetStateHash,
+        imageCertificateHashes: Object.freeze(admission.contracts
+          .filter(contract => contract && contract.kind === 'IMAGE_DATUM')
+          .map(contract => contract.certificateHash)
+          .sort()),
+      })
+      const receipt = Object.freeze({
+        ...receiptBody,
+        receiptHash: hashText(stableStringify(receiptBody)),
+      })
+      if (fs.existsSync(receiptPath)) {
+        const saved = readRegularJson(receiptPath, 'captured-domain pre-work admission receipt').parsed
+        if (stableStringify(saved) !== stableStringify(receipt)) {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            'captured-domain pre-work admission receipt changed after its first durable record',
+          )
+        }
+      } else {
+        recordRef.write(receiptRelative, `${JSON.stringify(receipt, null, 2)}\n`)
+      }
+      const matchingEvent = () => stateStore.eventLog.readAll().find(event =>
+        event && event.type === 'CAPTURED_DOMAIN_ADMISSION_RECORDED' &&
+        event.generation === generation && event.details &&
+        event.details.admissionReceiptHash === receipt.receiptHash &&
+        event.details.admissionFileHash === receipt.admissionFileHash &&
+        event.details.routeDecisionHash === receipt.routeDecisionHash &&
+        event.details.targetStateHash === receipt.targetStateHash)
+      let event = matchingEvent()
+      if (receiptWasDurable && !event) {
+        throw new SupervisorIntegrationError(
+          'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
+          'a recovered captured-domain receipt lacks its original pre-work state-event binding',
+        )
+      }
+      if (!event) {
+        stateStore.record('CAPTURED_DOMAIN_ADMISSION_RECORDED', {
+          capability: leaseRef,
+          cause: 'Bind the immutable captured-domain certificate before any product role launch.',
+          details: {
+            admissionReceiptHash: receipt.receiptHash,
+            admissionFileHash: receipt.admissionFileHash,
+            routeDecisionHash: receipt.routeDecisionHash,
+            targetStateHash: receipt.targetStateHash,
+          },
+        })
+        event = matchingEvent()
+      }
+      if (!event || !/^[a-f0-9]{64}$/u.test(event.hash || '') ||
+          !Number.isSafeInteger(event.sequence) || event.sequence < 1) {
+        throw new SupervisorIntegrationError(
+          'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
+          'captured-domain pre-work admission lacks its authenticated state-event binding',
+        )
+      }
+      return Object.freeze({
+        ...receipt,
+        stateEventHash: event.hash,
+        stateEventSequence: event.sequence,
+      })
     },
     writeCapturedDomainOutcomes(record) {
       if (!recordRef) throw new SupervisorIntegrationError('RUN_RECORD_FAILURE', 'captured-domain evidence requires the opened run record')
@@ -16679,7 +20627,7 @@ function supervisorCapabilities() {
     forkTurns: 'none',
     launchAuthority: 'central-scheduler-only',
     concreteRuntime: { supported: false, code: 'PROVIDER_UNSUPPORTED' },
-    externalTransport: 'codex exec --json / codex exec resume --json',
+    externalTransport: 'codex exec --json; codex exec resume --json only for exact live crash adoption',
   }
 }
 
@@ -16735,12 +20683,8 @@ if (require.main === module) {
 
 module.exports = {
   CodexExecAdapter,
-  appendSupervisorRecordedCapturedDomainOutcomes,
-  applyBenchmarkEffortPin,
-  benchmarkFirstProductSignalDeadlineEnabled,
-  benchmarkPhaseTimeoutMs,
+  imageDatumOutcomeFromPreWorkAdmission,
   billableModelTokens,
-  productionRoadmapExpansionAuthority,
   resolvePreMutationRouteDecisionHash,
   runtimeCapabilityExpiryMs,
   CodexSupervisorRuntime,
@@ -16764,6 +20708,7 @@ module.exports = {
   TERMINAL_OUTCOMES,
   WORK_CHECKS,
   admitCodexRoleSelection,
+  admitRoadmapExpansion,
   assertReadOnlyCheckerOperation,
   clampNonNegInt,
   createConcreteSupervisor,
@@ -16784,12 +20729,19 @@ module.exports = {
   runCodexSupervisorEntryAdapter,
   classifyCodexTopLevelPrompt,
   createDefaultRouteExecutor,
-  createReadOnlyFinalResponse,
+  codexPhysicalExecutionReceipt,
+  validateCodexAdvisoryPayloadBounds,
+  createStructuredFinalResponseCandidate,
   activationAttestationPayload,
   activationRuntimeSettings,
   assertDistinctEvidenceConsumption,
   appendCanonicalRouteEvent,
+  assignmentLocalFindingId,
   buildActivationPromptEnvelope,
+  createCanonicalMissionProjection,
+  bindCanonicalMissionForChild,
+  validateCanonicalMissionLaunch,
+  modelVisibleDispatch,
   createDefaultRuntimeOptions,
   createArtifactCoverageContract,
   applyProductionRuntimeTransition,
@@ -16797,8 +20749,8 @@ module.exports = {
   createDefaultExternalOperation,
   createResidualRiskDisposition,
   createMinimalTestEnvironment,
-  consumeSplitRequired,
   createCodexJsonlAccumulator,
+  createCheckerObservationBinding,
   decodeCodexProviderEnvelope,
   createSupervisorOptions,
   ensureSafeEnvironment,
@@ -16816,6 +20768,7 @@ module.exports = {
   physicalProviderRoleForGeneration,
   productionExactPathPreflight,
   productionPhaseBudgets,
+  productionTransportWatchdogMs,
   providerRuntimeIdentityHash,
   readPrivateAgentAssignment,
   readPersistedWorkerAssignment,
@@ -16841,6 +20794,7 @@ module.exports = {
   checkerRecoveryNextReady,
   diagnosticDenialDisposition,
   evidenceInvalidationSet,
+  explicitFindingIds,
   canonicalAssignmentResources,
   assertRealTargetUnchanged,
   workspaceFileSnapshot,
@@ -16860,7 +20814,8 @@ module.exports = {
   reconcileExternalOperationTimeout,
   roadmapAuthorArtifact,
   resolveTerminalReceiptCandidateHash,
+  createRoadmapPlanLineageReceipt,
   resumePlanProjectionAccepted,
-  requiredRoadmapProjectionAuthor,
   immutableSemanticUserAskCount,
+  withTimeout,
 }

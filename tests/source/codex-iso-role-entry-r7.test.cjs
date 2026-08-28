@@ -13,7 +13,9 @@ const {
   RolePolicy,
   admitCodexRoleSelection,
   assertReadOnlyCheckerOperation,
+  bindCanonicalMissionForChild,
   classifyCodexTopLevelPrompt,
+  createCanonicalMissionProjection,
   createCodexEntrySemanticTrace,
   loadRoleContract,
 } = require(path.join(WORKFLOW, 'phase-budget.js'))
@@ -101,11 +103,24 @@ test('ISO-006 checker is mechanically read-only and edit/create/spawn/mutating c
     profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
     outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
   })
+  const projection = createCanonicalMissionProjection('Review the separately bound canonical mission.')
+  const activationId = 'checker-denied-activation'
+  const generation = 1
+  const workItemId = 'checker-denied-work'
+  const requestEnvelopeHash = 'e'.repeat(64)
   await assert.rejects(adapter.launch({
+    activationId, generation, workItemId,
+    canonicalMission: projection.canonicalMission,
+    missionBinding: bindCanonicalMissionForChild(projection, {
+      sourceRequestHash: projection.sourceRequestHash,
+      requestEnvelopeHash,
+      activationId,
+      generation,
+      workItemId,
+    }),
     logicalRole: 'independent-reviewer', physicalRole: execution.physicalRole,
     providerRole: execution.providerRole, physicalExecutionPolicy: { ...execution, sandboxMode: 'workspace-write' },
-    entryPrompt: '$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\nrequest_sha256=bound',
-    dispatch: { brief: 'Review.', requestPointer: { hash: 'e'.repeat(64) } },
+    dispatch: { brief: 'Review.', requestPointer: { hash: requestEnvelopeHash } },
     environment: {}, sessionId: 'checker-denied',
   }), error => error.code === 'CHECKER_READ_ONLY_POLICY_REQUIRED')
   assert.equal(runnerCalls, 0)

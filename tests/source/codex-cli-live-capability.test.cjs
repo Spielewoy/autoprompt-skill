@@ -190,7 +190,13 @@ test('production exact-path refuses self-declared capability evidence without th
 })
 
 test('false or unknown live capabilities deny the route and authentic true capabilities permit only proved requirements', async () => {
-  const live = issueLiveReceipt()
+  const unowned = issueLiveReceipt()
+  assert.throws(
+    () => productionExactPathPreflight(canonicalInput('DIRECT', unowned)),
+    error => providerUnsupported(error) && /processOwnership/u.test(error.message),
+  )
+
+  const live = issueLiveReceipt({ controlCapabilities: ['processOwnership'] })
   assert.equal(productionExactPathPreflight(canonicalInput('DIRECT', live)).source, 'deterministic-preflight')
 
   for (const providerCapabilities of [
@@ -212,7 +218,9 @@ test('false or unknown live capabilities deny the route and authentic true capab
     providerUnsupported,
   )
 
-  const provedRoadmap = issueLiveReceipt({ controlCapabilities: ['topologyEnforcement'] })
+  const provedRoadmap = issueLiveReceipt({
+    controlCapabilities: ['processOwnership', 'topologyEnforcement'],
+  })
   assert.equal(
     productionExactPathPreflight(canonicalInput('ROADMAP', provedRoadmap)).source,
     'deterministic-preflight',
@@ -226,7 +234,10 @@ test('false or unknown live capabilities deny the route and authentic true capab
     toolOutputCapture: true,
     eventStreaming: true,
   }
-  const seamLive = issueLiveReceipt({ providerCapabilities: insertionOrderedCapabilities })
+  const seamLive = issueLiveReceipt({
+    providerCapabilities: insertionOrderedCapabilities,
+    controlCapabilities: ['processOwnership'],
+  })
   const requestEnvelope = canonicalRequestEnvelope([
     'path=direct', 'Review the contained local source files.',
   ])
@@ -239,7 +250,8 @@ test('false or unknown live capabilities deny the route and authentic true capab
         consumedWallMs: 0, verificationReserveMs: 150_000, finalizationReserveMs: 60_000,
       }),
       assertAvailable: () => ({
-        remaining: { wallMs: 600_000, tokens: 1_000, sessions: 10, launches: 10 },
+        remaining: { wallMs: 0, tokens: 1_000, sessions: 10, launches: 10 },
+        completionTargetOverrun: ['WALL'],
       }),
     },
     capabilityVerifier: async () => ({ verified: true }),

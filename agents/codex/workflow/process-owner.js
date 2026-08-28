@@ -19,6 +19,19 @@ const REQUIRED_PROCESS_CAPABILITIES = Object.freeze([
 ])
 const POSIX_RESERVATION_ENV = 'AUTOPROMPT_OWNERSHIP_RESERVATION'
 
+function hasExactNulDelimitedEntry(environment, entry) {
+  if (!Buffer.isBuffer(environment) || typeof entry !== 'string' || !entry || entry.includes('\0')) return false
+  const needle = Buffer.from(`${entry}\0`, 'utf8')
+  let offset = 0
+  while (offset < environment.length) {
+    const match = environment.indexOf(needle, offset)
+    if (match < 0) return false
+    if (match === 0 || environment[match - 1] === 0) return true
+    offset = match + 1
+  }
+  return false
+}
+
 class ProcessOwnerError extends Error {
   constructor(code, message, details = {}) {
     super(message)
@@ -86,6 +99,13 @@ function processLaunchControlEnvironment(adapter, reservationId) {
     fail('PROVIDER_UNSUPPORTED', 'process adapter returned invalid child control environment fields')
   }
   return Object.freeze({ ...fields })
+}
+
+function prepareProcessLaunchEnvironment(adapter, reservationId, environment = {}) {
+  const controls = processLaunchControlEnvironment(adapter, reservationId)
+  return adapter?.kind === 'windows-job-object'
+    ? normalizeWindowsChildEnvironment(environment, controls)
+    : Object.freeze({ ...environment, ...controls })
 }
 
 const WINDOWS_CANONICAL_ENVIRONMENT_KEYS = Object.freeze(new Map([
@@ -183,6 +203,8 @@ class ProcessOwner {
     this.startupTimeoutMs = options.startupTimeoutMs === undefined
       ? (options.adapter.startupTimeoutMs === undefined ? 10000 : options.adapter.startupTimeoutMs)
       : options.startupTimeoutMs
+    this.adapterCallTimeoutMs = options.adapterCallTimeoutMs === undefined
+      ? Math.max(10000, this.startupTimeoutMs + 1000) : options.adapterCallTimeoutMs
     this.budget = options.budget || null
     this.onTerminal = options.onTerminal || (() => {})
     this.onOwnershipChange = options.onOwnershipChange || (() => {})
@@ -190,13 +212,230 @@ class ProcessOwner {
     this.randomId = options.randomId || (() => crypto.randomUUID())
     if (!Number.isSafeInteger(this.pollMs) || this.pollMs < 0 ||
         !Number.isSafeInteger(this.startupTimeoutMs) || this.startupTimeoutMs < 1 ||
+        !Number.isSafeInteger(this.adapterCallTimeoutMs) || this.adapterCallTimeoutMs < 1 ||
         !Number.isSafeInteger(this.zeroConfirmations) || this.zeroConfirmations < 1) {
-      fail('PROCESS_OWNER_CONFIG_INVALID', 'pollMs and zeroConfirmations are invalid')
+      fail('PROCESS_OWNER_CONFIG_INVALID', 'poll, startup, adapter-call, or confirmation bounds are invalid')
     }
     this.groups = new Map()
     this.terminalRecords = new Map()
+    // A durable RESERVED record is the crash-safe half of this fence.  The
+    // in-memory half keeps observing the actual adapter promise after the
+    // caller-facing watchdog fires, so a late physical spawn can never become
+    // detached from ownership merely because its JavaScript call timed out.
+    this.spawnOperationFences = new Map()
     this._restoreRegistry()
     this.onOwnershipChange(this.ownershipIdentities())
+  }
+
+  async _adapterCall(method, ...args) {
+    if (typeof this.adapter[method] !== 'function') {
+      fail('PROVIDER_UNSUPPORTED', `process adapter lacks ${method}`)
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        reject(new ProcessOwnerError(
+          'PROCESS_DRAIN_TIMEOUT',
+          `process adapter ${method} did not settle within its physical-operation watchdog`,
+          { method, timeoutMs: this.adapterCallTimeoutMs },
+        ))
+      }, this.adapterCallTimeoutMs)
+      Promise.resolve().then(() => this.adapter[method](...args)).then(
+        value => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve(value)
+        },
+        error => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          reject(error)
+        },
+      )
+    })
+  }
+
+  _spawnOwnedWithFence(record, input) {
+    const fence = {
+      ownershipId: record.ownershipId,
+      reservationId: record.reservationId,
+      state: 'PENDING',
+      timedOut: false,
+      ownership: null,
+      error: null,
+      reconciliation: null,
+      reconciliationError: null,
+    }
+    this.spawnOperationFences.set(record.ownershipId, fence)
+    const physicalOperation = Promise.resolve().then(() => this.adapter.spawnOwned(input))
+    physicalOperation.then(
+      ownership => {
+        fence.state = 'SETTLED_OWNERSHIP'
+        fence.ownership = ownership
+        if (fence.timedOut) this._scheduleLateSpawnReconciliation(record, fence)
+      },
+      error => {
+        fence.state = 'SETTLED_ERROR'
+        fence.error = error
+        if (fence.timedOut) this._scheduleLateSpawnReconciliation(record, fence)
+      },
+    )
+    return new Promise((resolve, reject) => {
+      let callerSettled = false
+      const timer = setTimeout(() => {
+        if (callerSettled) return
+        callerSettled = true
+        fence.timedOut = true
+        reject(new ProcessOwnerError(
+          'PROCESS_DRAIN_TIMEOUT',
+          'process adapter spawnOwned did not settle within its physical-operation watchdog',
+          { method: 'spawnOwned', timeoutMs: this.adapterCallTimeoutMs },
+        ))
+      }, this.adapterCallTimeoutMs)
+      physicalOperation.then(
+        ownership => {
+          if (callerSettled) return
+          callerSettled = true
+          clearTimeout(timer)
+          resolve(ownership)
+        },
+        error => {
+          if (callerSettled) return
+          callerSettled = true
+          clearTimeout(timer)
+          reject(error)
+        },
+      )
+    })
+  }
+
+  _scheduleLateSpawnReconciliation(record, fence) {
+    if (fence.reconciliation) return fence.reconciliation
+    fence.reconciliation = Promise.resolve().then(async () => {
+      if (fence.state === 'SETTLED_OWNERSHIP') {
+        const current = this.groups.get(record.ownershipId)
+        if (!current) {
+          fail('OWNERSHIP_RECOVERY_FATAL', `late spawn ${record.reservationId} lost its durable reservation`)
+        }
+        if (current.status === 'RESERVED') {
+          this._attachRecovered(current, fence.ownership, 'late-spawn-attach')
+        } else if (current.groupIdentity !== fence.ownership?.groupIdentity ||
+            current.rootPid !== fence.ownership?.rootPid) {
+          fail('PROCESS_IDENTITY_CHANGED',
+            `late spawn ${record.reservationId} conflicts with its recovered ownership identity`)
+        }
+        if (current.status === 'RUNNING') {
+          await this.cancelGroup(current.ownershipId, {
+            reason: 'late physical spawn settled after its caller-facing watchdog',
+            graceMs: 0,
+            killMs: Math.max(1, this.startupTimeoutMs),
+            terminalStatus: 'FAILED',
+          })
+        } else {
+          // Recovery may have attached and drained the group before the adapter
+          // promise itself settled.  Re-probe the exact identity so a second
+          // late member cannot hide behind the already-terminal record.
+          let remaining = await this._adapterCall('listOwned', fence.ownership.groupIdentity)
+          if (remaining.length) {
+            await this._verifyOwnership({ ...current, ...fence.ownership })
+            await this._adapterCall('signalOwned', fence.ownership.groupIdentity, 'KILL')
+            remaining = await this._waitForZero({ ...current, ...fence.ownership }, Math.max(1, this.startupTimeoutMs))
+          }
+          if (remaining.length) {
+            fail('PROCESS_DRAIN_TIMEOUT', `late spawn ${record.reservationId} did not drain`, { remaining })
+          }
+        }
+        this.spawnOperationFences.delete(record.ownershipId)
+        return
+      }
+      // A rejected adapter promise is not proof that no physical side effect
+      // occurred.  Keep the durable reservation and let the adapter's
+      // tri-state recovery prove LIVE or DEAD within the persisted deadline.
+      try {
+        await this.recoverReservations()
+        const current = this.groups.get(record.ownershipId)
+        if (current && current.status === 'RUNNING') {
+          await this.cancelGroup(current.ownershipId, {
+            reason: 'spawn adapter rejected after operation admission',
+            graceMs: 0,
+            killMs: Math.max(1, this.startupTimeoutMs),
+            terminalStatus: 'FAILED',
+          })
+        }
+      } finally {
+        const current = this.groups.get(record.ownershipId)
+        if (current && current.status !== 'RESERVED') {
+          this.spawnOperationFences.delete(record.ownershipId)
+        }
+      }
+    }).catch(error => {
+      fence.reconciliationError = error
+    })
+    return fence.reconciliation
+  }
+
+  _assertUniqueLaunchIdentity(candidate) {
+    for (const [field, value] of Object.entries(candidate)) {
+      if (typeof value !== 'string' || !value || value.includes('\0')) {
+        fail('LAUNCH_SPEC_INVALID', `launch ${field} must be a non-empty identity string`)
+      }
+    }
+    for (const existing of this.groups.values()) {
+      if (existing.ownershipId === candidate.ownershipId ||
+          existing.reservationId === candidate.reservationId ||
+          existing.reservationIdentity === candidate.reservationIdentity ||
+          existing.sessionId === candidate.sessionId) {
+        fail('LAUNCH_SPEC_INVALID', 'launch identities must be globally unique before reservation', {
+          ownershipId: candidate.ownershipId,
+          reservationId: candidate.reservationId,
+          reservationIdentity: candidate.reservationIdentity,
+          sessionId: candidate.sessionId,
+          conflictingOwnershipId: existing.ownershipId,
+        })
+      }
+    }
+  }
+
+  _assertUniqueAttachedIdentity(candidate) {
+    for (const existing of this.groups.values()) {
+      if (existing.ownershipId === candidate.ownershipId) continue
+      if (existing.groupIdentity === candidate.groupIdentity || existing.rootPid === candidate.rootPid) {
+        fail('PROCESS_IDENTITY_CHANGED',
+          'spawned ownership aliases another durable process identity', {
+            ownershipId: candidate.ownershipId,
+            groupIdentity: candidate.groupIdentity,
+            rootPid: candidate.rootPid,
+            conflictingOwnershipId: existing.ownershipId,
+          })
+      }
+    }
+  }
+
+  _assertUniqueRegistryRecords(records) {
+    const fields = ['ownershipId', 'reservationId', 'reservationIdentity', 'sessionId']
+    for (const field of fields) {
+      const values = new Set()
+      for (const record of records) {
+        if (values.has(record[field])) {
+          fail('PROCESS_REGISTRY_FAILURE', `persisted process ${field} values must be globally unique`)
+        }
+        values.add(record[field])
+      }
+    }
+    for (const field of ['groupIdentity', 'rootPid']) {
+      const values = new Set()
+      for (const record of records) {
+        if (record[field] === null || record[field] === undefined) continue
+        if (values.has(record[field])) {
+          fail('PROCESS_REGISTRY_FAILURE', `persisted process ${field} values must be globally unique`)
+        }
+        values.add(record[field])
+      }
+    }
   }
 
   async launch(spec) {
@@ -216,17 +455,17 @@ class ProcessOwner {
     if (this.adapter.kind !== 'test' && !path.isAbsolute(spec.executable)) {
       fail('LAUNCH_SPEC_INVALID', 'owned executable must be an absolute path; child PATH resolution is forbidden')
     }
-    const admission = await this.adapter.admit()
+    const admission = await this._adapterCall('admit')
     if (!admission || admission.supported !== true) {
       fail('PROVIDER_UNSUPPORTED', admission && admission.reason ? admission.reason : 'process ownership adapter refused admission')
     }
-    if (this.budget) this.budget.recordLaunch({ forWork: spec.forWork !== false })
     const ownershipId = this.randomId()
     const reservationId = spec.reservationId === undefined ? ownershipId : spec.reservationId
-    if (typeof reservationId !== 'string' || !reservationId || reservationId.includes('\0') ||
-        [...this.groups.values()].some((entry) => entry.reservationId === reservationId)) {
-      fail('LAUNCH_SPEC_INVALID', 'launch reservationId must be a unique non-empty string')
-    }
+    const reservationIdentity = typeof this.adapter.reservationIdentity === 'function'
+      ? this.adapter.reservationIdentity(reservationId)
+      : reservationId
+    const sessionId = spec.sessionId || ownershipId
+    this._assertUniqueLaunchIdentity({ ownershipId, reservationId, reservationIdentity, sessionId })
     const requiredControlEnvironment = processLaunchControlEnvironment(this.adapter, reservationId)
     const exactEnvironment = spec.env === undefined ? {} : { ...spec.env }
     for (const [name, value] of Object.entries(requiredControlEnvironment)) {
@@ -237,7 +476,7 @@ class ProcessOwner {
         })
       }
     }
-    const sessionId = spec.sessionId || ownershipId
+    if (this.budget) this.budget.recordLaunch({ forWork: spec.forWork !== false })
     if (this.budget) {
       this.budget.startSession(sessionId, {
         activationId: spec.activationId,
@@ -249,9 +488,6 @@ class ProcessOwner {
     const startedAtMs = Date.parse(startedAt)
     if (!Number.isFinite(startedAtMs)) fail('PROCESS_OWNER_CONFIG_INVALID', 'wallClock must return a date-time')
     const startupDeadlineAt = new Date(startedAtMs + this.startupTimeoutMs).toISOString()
-    const reservationIdentity = typeof this.adapter.reservationIdentity === 'function'
-      ? this.adapter.reservationIdentity(reservationId)
-      : reservationId
     const reservationBinding = typeof this.adapter.prepareReservation === 'function'
       ? this.adapter.prepareReservation({ reservationId, reservationIdentity, startupDeadlineAt, targetKey: spec.targetKey })
       : null
@@ -292,7 +528,7 @@ class ProcessOwner {
 
     let handle
     try {
-      handle = await this.adapter.spawnOwned({
+      handle = await this._spawnOwnedWithFence(record, {
         ownershipId,
         reservationId: record.reservationId,
         reservationIdentity: record.reservationIdentity,
@@ -309,12 +545,11 @@ class ProcessOwner {
         stderr: spec.stderr,
       })
     } catch (error) {
-      try { this._terminal(record, 'FAILED', `spawn failed: ${error.message}`) } catch (persistError) {
-        fail('OWNERSHIP_COMMIT_FATAL', 'spawn failed and its durable reservation could not be closed', {
-          spawnCause: error.message,
-          registryCause: persistError.message,
-        })
-      }
+      // Once the durable reservation admits the physical operation, neither a
+      // timeout nor an adapter rejection proves that no child/helper exists.
+      // Recovery must make that determination; closing the reservation here
+      // would allow a late settlement to become an orphan.
+      try { this.onOwnershipChange(this.ownershipIdentities()) } catch {}
       throw error
     }
     if (!handle || !Number.isSafeInteger(handle.rootPid) || handle.rootPid < 1 ||
@@ -329,12 +564,13 @@ class ProcessOwner {
       handle,
     }
     try {
+      this._assertUniqueAttachedIdentity(attached)
       this._persistRegistry(attached, 'attach')
     } catch (registryError) {
       let terminationError = null
       try {
-        await this.adapter.signalOwned(attached.groupIdentity, 'KILL')
-        const remaining = await this.adapter.listOwned(attached.groupIdentity)
+        await this._adapterCall('signalOwned', attached.groupIdentity, 'KILL')
+        const remaining = await this._adapterCall('listOwned', attached.groupIdentity)
         if (remaining.length) throw new Error(`owned members remain: ${remaining.join(',')}`)
       } catch (error) {
         terminationError = error
@@ -349,6 +585,7 @@ class ProcessOwner {
       })
     }
     Object.assign(record, attached)
+    this.spawnOperationFences.delete(record.ownershipId)
     this.onOwnershipChange(this.ownershipIdentities())
     return canonicalize({
       ownershipId,
@@ -392,21 +629,42 @@ class ProcessOwner {
   }
 
   async cancelAll(options = {}) {
-    await this.recoverReservations()
+    let recoveryError = null
+    try {
+      await this.recoverReservations({ waitForPending: options.waitForPending === true })
+    } catch (error) { recoveryError = error }
     const results = []
+    const cleanupFailures = []
     for (const ownershipId of [...this.groups.keys()].sort()) {
       const record = this.groups.get(ownershipId)
-      if (record && record.status === 'RUNNING') results.push(await this.cancelGroup(ownershipId, options))
+      if (!record || record.status !== 'RUNNING') continue
+      try { results.push(await this.cancelGroup(ownershipId, options)) } catch (error) {
+        cleanupFailures.push({ ownershipId, code: error && error.code || 'ERROR', message: error && error.message || String(error) })
+      }
     }
-    await this.assertDrained()
+    try { await this.assertDrained({ skipRecovery: true, skipRunningDrain: true }) } catch (error) {
+      cleanupFailures.push({ ownershipId: null, code: error && error.code || 'ERROR', message: error && error.message || String(error) })
+    }
+    if (cleanupFailures.length) {
+      fail('PROCESS_DRAIN_TIMEOUT', 'one or more known owned process groups could not be drained', {
+        cleanupFailures: canonicalize(cleanupFailures),
+        recoveryFailure: recoveryError ? {
+          code: recoveryError.code || 'ERROR', message: recoveryError.message,
+          details: recoveryError.details || null,
+        } : null,
+      })
+    }
+    if (recoveryError) throw recoveryError
     return results
   }
 
   async cancelGroup(ownershipId, options = {}) {
     let record = this._group(ownershipId)
     if (record.status === 'RESERVED') {
-      await this.recoverReservations()
+      let recoveryError = null
+      try { await this.recoverReservations({ waitForPending: false }) } catch (error) { recoveryError = error }
       record = this._group(ownershipId)
+      if (record.status === 'RESERVED' && recoveryError) throw recoveryError
     }
     if (record.status !== 'RUNNING') return this.terminalRecords.get(ownershipId)
     const reason = options.reason || 'runtime cancellation'
@@ -415,18 +673,18 @@ class ProcessOwner {
     for (const [name, value] of [['graceMs', graceMs], ['killMs', killMs]]) {
       if (!Number.isSafeInteger(value) || value < 0) fail('PROCESS_OWNER_CONFIG_INVALID', `${name} is invalid`)
     }
-    let remaining = await this.adapter.listOwned(record.groupIdentity)
+    let remaining = await this._adapterCall('listOwned', record.groupIdentity)
     if (remaining.length) {
       // A group may have exited and durably published zero membership before
       // cancellation observes it. Only live members require a live process
       // identity; every signal remains identity-gated to reject PID reuse.
       await this._verifyOwnership(record)
-      await this.adapter.signalOwned(record.groupIdentity, 'TERM')
+      await this._adapterCall('signalOwned', record.groupIdentity, 'TERM')
       remaining = await this._waitForZero(record, graceMs)
     }
     if (remaining.length) {
       await this._verifyOwnership(record)
-      await this.adapter.signalOwned(record.groupIdentity, 'KILL')
+      await this._adapterCall('signalOwned', record.groupIdentity, 'KILL')
       remaining = await this._waitForZero(record, killMs)
     }
     if (remaining.length) {
@@ -437,7 +695,7 @@ class ProcessOwner {
     remaining = await this._confirmDrained(record, killMs)
     if (remaining.length) {
       await this._verifyOwnership(record)
-      await this.adapter.signalOwned(record.groupIdentity, 'KILL')
+      await this._adapterCall('signalOwned', record.groupIdentity, 'KILL')
       remaining = await this._waitForZero(record, killMs)
       if (!remaining.length) remaining = await this._confirmDrained(record, killMs)
     }
@@ -449,71 +707,187 @@ class ProcessOwner {
     return this._terminal(record, options.terminalStatus || 'CANCELLED', reason)
   }
 
-  async recoverReservations() {
-    for (const record of [...this.groups.values()].filter((entry) => entry.status === 'RESERVED')) {
-      const recoveryStarted = this.monotonicMs()
-      let recovered
-      while (true) {
-        if (typeof this.adapter.probeReservation !== 'function') {
-          recovered = await this.adapter.recoverReservation(record.reservationId)
-          if (recovered === null) {
-            this._terminal(record, 'FAILED', 'durable launch reservation has no live owned process')
-            break
-          }
-          break
-        }
-        const probe = await this.adapter.probeReservation(record)
-        if (!probe || !['LIVE', 'DEAD', 'PENDING', 'UNKNOWN'].includes(probe.state)) {
-          fail('OWNERSHIP_RECOVERY_FATAL', `reservation ${record.reservationId} returned invalid recovery state`)
-        }
-        if (probe.state === 'LIVE') { recovered = probe.ownership; break }
-        if (probe.state === 'DEAD') {
-          this._terminal(record, 'FAILED', 'durable launch reservation is conclusively dead')
-          break
-        }
-        if (probe.state === 'UNKNOWN') {
-          fail('OWNERSHIP_RECOVERY_FATAL', `reservation ${record.reservationId} liveness is not conclusively known`, {
-            reservationIdentity: record.reservationIdentity,
-            evidence: probe.evidence || null,
+  async recoverReservations(options = {}) {
+    const waitForPending = options.waitForPending !== false
+    const recoveryStarted = this.monotonicMs()
+    let unresolved = []
+    while (true) {
+      unresolved = []
+      let nextWaitMs = null
+      const reservations = [...this.groups.values()]
+        .filter(entry => entry.status === 'RESERVED')
+        .sort((left, right) => left.ownershipId.localeCompare(right.ownershipId))
+      for (const record of reservations) {
+        let probe
+        try {
+          probe = await this._probeReservation(record)
+        } catch (error) {
+          unresolved.push({
+            ownershipId: record.ownershipId,
+            reservationId: record.reservationId,
+            state: 'UNKNOWN',
+            evidence: { code: error && error.code || 'ERROR', message: error && error.message || String(error) },
           })
+          continue
+        }
+        if (!probe || !['LIVE', 'DEAD', 'PENDING', 'UNKNOWN'].includes(probe.state)) {
+          unresolved.push({
+            ownershipId: record.ownershipId,
+            reservationId: record.reservationId,
+            state: 'UNKNOWN', evidence: { reason: 'invalid-recovery-state' },
+          })
+          continue
+        }
+        if (probe.state === 'LIVE') {
+          try { this._attachRecovered(record, probe.ownership, 'recover-attach') } catch (error) {
+            unresolved.push({
+              ownershipId: record.ownershipId,
+              reservationId: record.reservationId,
+              state: 'UNKNOWN',
+              evidence: { code: error && error.code || 'ERROR', message: error && error.message || String(error) },
+            })
+          }
+          continue
+        }
+        if (probe.state === 'DEAD') {
+          try { this._terminal(record, 'FAILED', 'durable launch reservation is conclusively dead') } catch (error) {
+            unresolved.push({
+              ownershipId: record.ownershipId,
+              reservationId: record.reservationId,
+              state: 'UNKNOWN',
+              evidence: { code: error && error.code || 'ERROR', message: error && error.message || String(error) },
+            })
+          }
+          continue
         }
         const remainingWallMs = Date.parse(record.startupDeadlineAt) - Date.parse(String(this.wallClock()))
         const elapsed = Math.max(0, this.monotonicMs() - recoveryStarted)
-        if (!Number.isFinite(remainingWallMs) || remainingWallMs <= 0 || elapsed >= this.startupTimeoutMs) {
-          fail('OWNERSHIP_RECOVERY_PENDING', `reservation ${record.reservationId} did not reach a conclusive state within its persisted startup deadline`)
+        const pendingWithinDeadline = probe.state === 'PENDING' && Number.isFinite(remainingWallMs) &&
+          remainingWallMs > 0 && elapsed < this.startupTimeoutMs
+        unresolved.push({
+          ownershipId: record.ownershipId,
+          reservationId: record.reservationId,
+          state: probe.state,
+          evidence: probe.evidence || null,
+        })
+        if (pendingWithinDeadline && waitForPending) {
+          const bounded = Math.min(Math.max(1, this.pollMs), remainingWallMs, this.startupTimeoutMs - elapsed)
+          nextWaitMs = nextWaitMs === null ? bounded : Math.min(nextWaitMs, bounded)
         }
-        await this.wait(Math.min(Math.max(1, this.pollMs), remainingWallMs, this.startupTimeoutMs - elapsed))
       }
-      if (!recovered) continue
-      if (!recovered || !Number.isSafeInteger(recovered.rootPid) || recovered.rootPid < 1 ||
-          typeof recovered.groupIdentity !== 'string' || !recovered.groupIdentity) {
-        fail('OWNERSHIP_RECOVERY_FATAL', `reservation ${record.reservationId} returned an invalid ownership identity`)
-      }
-      const attached = {
-        ...record,
-        rootPid: recovered.rootPid,
-        groupIdentity: recovered.groupIdentity,
-        status: 'RUNNING',
-        handle: recovered,
-      }
-      this._persistRegistry(attached, 'recover-attach')
-      Object.assign(record, attached)
-      this.onOwnershipChange(this.ownershipIdentities())
+      if (nextWaitMs === null) break
+      await this.wait(nextWaitMs)
+    }
+    if (unresolved.length) {
+      const pendingOnly = unresolved.every(item => item.state === 'PENDING')
+      fail(pendingOnly ? 'OWNERSHIP_RECOVERY_PENDING' : 'OWNERSHIP_RECOVERY_FATAL',
+        'one or more durable launch reservations remain unresolved after the bounded recovery review', {
+          reservations: canonicalize(unresolved),
+        })
     }
     return this.listRecords()
   }
 
-  async assertDrained() {
-    await this.recoverReservations()
+  async _probeReservation(record) {
+    const fence = this.spawnOperationFences.get(record.ownershipId)
+    if (fence && fence.state === 'SETTLED_OWNERSHIP') {
+      return { state: 'LIVE', ownership: fence.ownership, evidence: { source: 'live-operation-fence' } }
+    }
+    if (fence && fence.state === 'PENDING') {
+      const beforeDeadline = Date.parse(String(this.wallClock())) < Date.parse(record.startupDeadlineAt)
+      return beforeDeadline
+        ? { state: 'PENDING', evidence: { source: 'live-operation-fence' } }
+        : { state: 'UNKNOWN', evidence: { source: 'live-operation-fence', reason: 'adapter-promise-unsettled-after-deadline' } }
+    }
+    if (typeof this.adapter.probeReservation === 'function') {
+      return this._adapterCall('probeReservation', record)
+    }
+    const recovered = await this._adapterCall('recoverReservation', record.reservationId)
+    if (recovered !== null) return { state: 'LIVE', ownership: recovered }
+    const beforeDeadline = Date.parse(String(this.wallClock())) < Date.parse(record.startupDeadlineAt)
+    return beforeDeadline
+      ? { state: 'PENDING', evidence: { reason: 'point-scan-empty-before-startup-deadline' } }
+      : { state: 'DEAD', evidence: { reason: 'point-scan-empty-after-startup-deadline' } }
+  }
+
+  _attachRecovered(record, recovered, phase) {
+    if (!recovered || !Number.isSafeInteger(recovered.rootPid) || recovered.rootPid < 1 ||
+        typeof recovered.groupIdentity !== 'string' || !recovered.groupIdentity) {
+      fail('OWNERSHIP_RECOVERY_FATAL', `reservation ${record.reservationId} returned an invalid ownership identity`)
+    }
+    if (record.status === 'RUNNING') {
+      if (record.rootPid !== recovered.rootPid || record.groupIdentity !== recovered.groupIdentity) {
+        fail('PROCESS_IDENTITY_CHANGED', `reservation ${record.reservationId} resolved to conflicting ownership identities`)
+      }
+      return record
+    }
+    if (record.status !== 'RESERVED') {
+      fail('OWNERSHIP_RECOVERY_FATAL', `reservation ${record.reservationId} settled after its durable fence closed`)
+    }
+    const attached = {
+      ...record,
+      rootPid: recovered.rootPid,
+      groupIdentity: recovered.groupIdentity,
+      status: 'RUNNING',
+      handle: recovered,
+    }
+    this._persistRegistry(attached, phase)
+    Object.assign(record, attached)
+    this.onOwnershipChange(this.ownershipIdentities())
+    return record
+  }
+
+  async assertDrained(options = {}) {
+    let recoveryError = null
+    if (options.skipRecovery !== true) {
+      try { await this.recoverReservations({ waitForPending: false }) } catch (error) { recoveryError = error }
+    }
+    const cleanupFailures = options.skipRunningDrain === true
+      ? [] : await this._drainRecoveredRunningGroups(() => true)
+    await this._assertDrainedKnown()
+    if (cleanupFailures.length) {
+      fail('PROCESS_DRAIN_TIMEOUT', 'known recovered process groups failed to drain during the aggregate assertion', {
+        cleanupFailures: canonicalize(cleanupFailures),
+        recoveryFailure: recoveryError ? { code: recoveryError.code, message: recoveryError.message } : null,
+      })
+    }
+    if (recoveryError) throw recoveryError
+    return true
+  }
+
+  async _drainRecoveredRunningGroups(predicate) {
+    const failures = []
+    for (const record of [...this.groups.values()]
+      .filter(entry => entry.status === 'RUNNING' && predicate(entry))
+      .sort((left, right) => left.ownershipId.localeCompare(right.ownershipId))) {
+      try {
+        await this.cancelGroup(record.ownershipId, {
+          reason: 'aggregate drain assertion recovered a live owned group',
+          graceMs: 0,
+          killMs: Math.max(1, this.startupTimeoutMs),
+          terminalStatus: 'LOST',
+        })
+      } catch (error) {
+        failures.push({
+          ownershipId: record.ownershipId,
+          code: error && error.code || 'ERROR',
+          message: error && error.message || String(error),
+        })
+      }
+    }
+    return failures
+  }
+
+  async _assertDrainedKnown() {
     const live = []
     for (const record of this.groups.values()) {
       if (typeof record.groupIdentity !== 'string' || !record.groupIdentity) continue
-      let members = await this.adapter.listOwned(record.groupIdentity)
+      let members = await this._adapterCall('listOwned', record.groupIdentity)
       if (members.length && record.status !== 'RUNNING') {
         members = await this._confirmDrained(record, Math.max(1, this.pollMs))
         if (members.length) {
           await this._verifyOwnership(record)
-          await this.adapter.signalOwned(record.groupIdentity, 'KILL')
+          await this._adapterCall('signalOwned', record.groupIdentity, 'KILL')
           members = await this._waitForZero(record, Math.max(1, this.pollMs))
           if (!members.length) members = await this._confirmDrained(record, Math.max(1, this.pollMs))
         }
@@ -526,18 +900,29 @@ class ProcessOwner {
 
   async assertTargetDrained(targetKey) {
     if (typeof targetKey !== 'string' || !targetKey) fail('PROCESS_IDENTITY_INVALID', 'target identity is required')
-    await this.recoverReservations()
+    let recoveryError = null
+    try { await this.recoverReservations({ waitForPending: false }) } catch (error) { recoveryError = error }
+    const cleanupFailures = await this._drainRecoveredRunningGroups(record => record.targetKey === targetKey)
     if (typeof this.adapter.listTargetOwned !== 'function') {
       fail('PROVIDER_UNSUPPORTED', 'process adapter cannot prove target-global liveness')
     }
-    const roots = await this.adapter.listTargetOwned(targetKey, this.listRecords())
+    const roots = await this._adapterCall('listTargetOwned', targetKey, this.listRecords())
     if (!Array.isArray(roots)) fail('PROCESS_IDENTITY_INVALID', 'target liveness probe returned an invalid result')
     if (roots.length) {
       fail('OWNED_PROCESSES_LIVE', 'target still has live roots or descendants', {
         targetKey,
         roots: canonicalize(roots),
+        cleanupFailures: canonicalize(cleanupFailures),
       })
     }
+    if (cleanupFailures.length) {
+      fail('PROCESS_DRAIN_TIMEOUT', 'known target process groups failed to drain during the aggregate assertion', {
+        targetKey,
+        cleanupFailures: canonicalize(cleanupFailures),
+        recoveryFailure: recoveryError ? { code: recoveryError.code, message: recoveryError.message } : null,
+      })
+    }
+    if (recoveryError) throw recoveryError
     return true
   }
 
@@ -568,8 +953,10 @@ class ProcessOwner {
 
   async _verifyOwnership(record) {
     if (typeof this.adapter.verifyOwnership !== 'function') return
-    const verified = await this.adapter.verifyOwnership({
+    const verified = await this._adapterCall('verifyOwnership', {
       ownershipId: record.ownershipId,
+      reservationId: record.reservationId,
+      reservationIdentity: record.reservationIdentity,
       rootPid: record.rootPid,
       groupIdentity: record.groupIdentity,
     })
@@ -578,13 +965,13 @@ class ProcessOwner {
 
   async _waitForZero(record, timeoutMs) {
     const start = this.monotonicMs()
-    let remaining = await this.adapter.listOwned(record.groupIdentity)
+    let remaining = await this._adapterCall('listOwned', record.groupIdentity)
     const maximumPolls = Math.ceil(timeoutMs / Math.max(1, this.pollMs)) + 1
     let polls = 0
     while (remaining.length && Math.max(0, this.monotonicMs() - start) < timeoutMs && polls < maximumPolls) {
       await this.wait(this.pollMs)
       polls += 1
-      remaining = await this.adapter.listOwned(record.groupIdentity)
+      remaining = await this._adapterCall('listOwned', record.groupIdentity)
     }
     return remaining
   }
@@ -593,13 +980,13 @@ class ProcessOwner {
     const start = this.monotonicMs()
     let confirmations = 0
     do {
-      const remaining = await this.adapter.listOwned(record.groupIdentity)
+      const remaining = await this._adapterCall('listOwned', record.groupIdentity)
       if (remaining.length) return remaining
       confirmations += 1
       if (confirmations >= this.zeroConfirmations) return []
       await this.wait(this.pollMs)
     } while (Math.max(0, this.monotonicMs() - start) <= timeoutMs + this.pollMs * this.zeroConfirmations)
-    return this.adapter.listOwned(record.groupIdentity)
+    return this._adapterCall('listOwned', record.groupIdentity)
   }
 
   _statusFromExit(exit) {
@@ -630,6 +1017,8 @@ class ProcessOwner {
     record.status = status
     record.terminal = terminal
     this.terminalRecords.set(record.ownershipId, terminal)
+    const fence = this.spawnOperationFences.get(record.ownershipId)
+    if (fence && fence.state !== 'PENDING') this.spawnOperationFences.delete(record.ownershipId)
     this.onOwnershipChange(this.ownershipIdentities())
     if (this.budget) this.budget.endSession(record.sessionId, { status, evidenceHashes: [] })
     this.onTerminal(terminal)
@@ -673,16 +1062,27 @@ class ProcessOwner {
     }
     let observed
     if (typeof this.adapter.probeOwnedIdentity === 'function') {
-      observed = await this.adapter.probeOwnedIdentity(identity)
+      observed = await this._adapterCall('probeOwnedIdentity', identity)
       if (!Array.isArray(observed)) fail('PROCESS_IDENTITY_INVALID', `adapter returned invalid liveness for ${identity.id}`)
     } else if (identity.kind === this.adapter.kind) {
-      observed = await this.adapter.listOwned(identity.id)
+      observed = await this._adapterCall('listOwned', identity.id)
       if (!Array.isArray(observed)) fail('PROCESS_IDENTITY_INVALID', `adapter returned invalid liveness for ${identity.id}`)
     } else if (identity.kind === `${this.adapter.kind}-reservation`) {
-      const recovered = typeof this.adapter.recoverReservationIdentity === 'function'
-        ? await this.adapter.recoverReservationIdentity(identity.id)
-        : await this.adapter.recoverReservation(identity.id)
-      observed = recovered === null ? [] : [recovered]
+      const record = [...this.groups.values()].find(entry => entry.reservationIdentity === identity.id)
+      if (record && record.status === 'RESERVED') {
+        const probe = await this._probeReservation(record)
+        if (probe.state === 'LIVE') observed = [probe.ownership]
+        else if (probe.state === 'DEAD') observed = []
+        else fail(probe.state === 'PENDING' ? 'OWNERSHIP_RECOVERY_PENDING' : 'OWNERSHIP_RECOVERY_FATAL',
+          `reservation identity ${identity.id} remains ${probe.state.toLowerCase()}`, {
+            evidence: probe.evidence || null,
+          })
+      } else {
+        const recovered = typeof this.adapter.recoverReservationIdentity === 'function'
+          ? await this._adapterCall('recoverReservationIdentity', identity.id)
+          : await this._adapterCall('recoverReservation', identity.id)
+        observed = recovered === null ? [] : [recovered]
+      }
     } else {
       fail('PROVIDER_UNSUPPORTED', `adapter ${this.adapter.kind} cannot verify ${identity.kind}`)
     }
@@ -725,10 +1125,10 @@ class ProcessOwner {
     if (!currentBinding && !authorizedPredecessor) {
       fail('PROCESS_CONTROL_BINDING_MISMATCH', 'durable process registry belongs to a foreign activation generation')
     }
-    this.registrySequence = registry.sequence
     if (registry.adapterKind !== this.adapter.kind) {
       fail('PROVIDER_UNSUPPORTED', `persisted ${registry.adapterKind} ownership cannot be reopened by ${this.adapter.kind}`)
     }
+    const validated = []
     for (const saved of registry.records) {
       const allowedStatuses = ['RESERVED', 'RUNNING', 'DONE', 'PARTIAL', 'BLOCKED', 'CANCELLED', 'FAILED', 'LOST']
       const reserved = saved && saved.status === 'RESERVED'
@@ -738,12 +1138,46 @@ class ProcessOwner {
           !allowedStatuses.includes(saved.status) ||
           typeof saved.reservationId !== 'string' || !saved.reservationId ||
           typeof saved.reservationIdentity !== 'string' || !saved.reservationIdentity ||
+          typeof saved.sessionId !== 'string' || !saved.sessionId ||
           Number.isNaN(Date.parse(saved.startupDeadlineAt)) ||
           (!reserved && !hasOwnedIdentity && !saved.terminal) ||
           saved.adapterKind !== this.adapter.kind || typeof saved.targetKey !== 'string' || !saved.targetKey) {
         fail('PROCESS_REGISTRY_FAILURE', 'persisted process ownership identity is invalid')
       }
+      const expectedReservationIdentity = typeof this.adapter.reservationIdentity === 'function'
+        ? this.adapter.reservationIdentity(saved.reservationId)
+        : saved.reservationId
+      if (saved.reservationIdentity !== expectedReservationIdentity) {
+        fail('PROCESS_REGISTRY_FAILURE', 'persisted reservation identity does not match its adapter-derived origin')
+      }
       const record = { ...saved, handle: null }
+      try {
+        if (typeof this.adapter.validateReservationBinding === 'function') {
+          this.adapter.validateReservationBinding(record)
+        } else if (typeof this.adapter.prepareReservation === 'function') {
+          const expectedBinding = this.adapter.prepareReservation({
+            reservationId: record.reservationId,
+            reservationIdentity: record.reservationIdentity,
+            startupDeadlineAt: record.startupDeadlineAt,
+            targetKey: record.targetKey,
+          })
+          if (stableStringify(expectedBinding) !== stableStringify(record.reservationBinding)) {
+            fail('PROCESS_REGISTRY_FAILURE', 'persisted reservation binding differs from its adapter-derived binding')
+          }
+        } else if (record.reservationBinding !== null && record.reservationBinding !== undefined) {
+          fail('PROCESS_REGISTRY_FAILURE', 'adapter-less reservation binding is not permitted')
+        }
+      } catch (error) {
+        if (error && error.code === 'PROCESS_REGISTRY_FAILURE') throw error
+        fail('PROCESS_REGISTRY_FAILURE', 'persisted reservation binding is invalid', {
+          cause: error && error.message ? error.message : String(error),
+        })
+      }
+      validated.push(record)
+    }
+    this._assertUniqueRegistryRecords(validated)
+    this.registrySequence = registry.sequence
+    for (const record of validated) {
       this.groups.set(record.ownershipId, record)
       if (!['RUNNING', 'RESERVED'].includes(record.status) && record.terminal) {
         this.terminalRecords.set(record.ownershipId, record.terminal)
@@ -771,6 +1205,7 @@ class ProcessOwner {
       terminal: record.terminal || this.terminalRecords.get(record.ownershipId) || null,
     }
     }).sort((left, right) => left.ownershipId.localeCompare(right.ownershipId))
+    this._assertUniqueRegistryRecords(records)
     this.beforeRegistryCommit({ phase, records: canonicalize(records) })
     const sequence = this.registrySequence + 1
     atomicWriteJson(this.registryPath, {
@@ -791,6 +1226,7 @@ function createPosixProcessAdapter(options = {}) {
   const spawn = options.spawn || childProcess.spawn
   const execFileSync = options.execFileSync || childProcess.execFileSync
   const fsImpl = options.fsImpl || fs
+  const wallNowMs = options.wallNowMs || Date.now
   function pgid(identity) {
     const match = /^posix-pgid:(\d+)$/.exec(identity)
     if (!match) fail('PROCESS_IDENTITY_INVALID', `invalid POSIX group identity: ${identity}`)
@@ -813,7 +1249,10 @@ function createPosixProcessAdapter(options = {}) {
       if (platform !== 'linux' && typeof options.recoverReservation !== 'function') {
         return { supported: false, reason: 'POSIX reservation recovery requires Linux /proc or a provider implementation' }
       }
-      try { execFileSync('ps', ['-eo', 'pid=,pgid='], { encoding: 'utf8' }); return { supported: true } } catch (error) {
+      try {
+        execFileSync('ps', ['-eo', 'pid=,pgid='], { encoding: 'utf8', timeout: 10000 })
+        return { supported: true }
+      } catch (error) {
         return { supported: false, reason: `POSIX process-group probe failed: ${error.message}` }
       }
     },
@@ -836,12 +1275,12 @@ function createPosixProcessAdapter(options = {}) {
     },
     async recoverReservation(reservationId) {
       if (typeof options.recoverReservation === 'function') return options.recoverReservation(reservationId)
-      const marker = Buffer.from(`${POSIX_RESERVATION_ENV}=${reservationId}\0`)
+      const marker = `${POSIX_RESERVATION_ENV}=${reservationId}`
       const matches = []
       for (const name of fsImpl.readdirSync('/proc').filter((entry) => /^\d+$/.test(entry))) {
         try {
           const environment = fsImpl.readFileSync(`/proc/${name}/environ`)
-          if (!environment.includes(marker)) continue
+          if (!hasExactNulDelimitedEntry(environment, marker)) continue
           const stat = fsImpl.readFileSync(`/proc/${name}/stat`, 'utf8')
           const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)
           const processGroup = Number(fields[2])
@@ -852,19 +1291,53 @@ function createPosixProcessAdapter(options = {}) {
       const processGroup = Math.min(...matches)
       return { rootPid: processGroup, groupIdentity: `posix-pgid:${processGroup}` }
     },
+    async probeReservation(record) {
+      const ownership = await adapter.recoverReservation(record.reservationId)
+      if (ownership !== null) return { state: 'LIVE', ownership }
+      const deadline = Date.parse(record.startupDeadlineAt)
+      if (!Number.isFinite(deadline)) {
+        return { state: 'UNKNOWN', evidence: { reason: 'startup-deadline-invalid' } }
+      }
+      return wallNowMs() < deadline
+        ? { state: 'PENDING', evidence: { reason: 'reservation-marker-not-yet-observed' } }
+        : { state: 'DEAD', evidence: { reason: 'reservation-marker-absent-after-startup-deadline' } }
+    },
     async listOwned(identity) {
       const group = pgid(identity)
-      const source = execFileSync('ps', ['-eo', 'pid=,pgid='], { encoding: 'utf8' })
-      return source.split(/\r?\n/).map((line) => line.trim().split(/\s+/).map(Number))
-        .filter(([pid, processGroup]) => Number.isSafeInteger(pid) && processGroup === group)
-        .map(([pid]) => pid)
+      const source = execFileSync('ps', ['-eo', 'pid=,pgid=,stat='], {
+        encoding: 'utf8', timeout: 10000,
+      })
+      return source.split(/\r?\n/).map((line) => {
+        const [pidText, groupText, status = ''] = line.trim().split(/\s+/)
+        return { pid: Number(pidText), processGroup: Number(groupText), status }
+      })
+        // A zombie has no executable side effect and cannot spawn descendants.
+        // Keeping it in the live-member set after TERM would require a second
+        // marker-authorized signal even though Linux exposes an empty environ
+        // for the exited process. The unreaped PID also cannot yet be reused.
+        .filter(({ pid, processGroup, status }) => Number.isSafeInteger(pid) &&
+          processGroup === group && !/^Z/u.test(status))
+        .map(({ pid }) => pid)
     },
     async signalOwned(identity, signal) { process.kill(-pgid(identity), signal === 'KILL' ? 'SIGKILL' : 'SIGTERM') },
-    async verifyOwnership({ rootPid, groupIdentity }) { return pgid(groupIdentity) === rootPid },
+    async verifyOwnership({ reservationId, rootPid, groupIdentity }) {
+      if (typeof reservationId !== 'string' || !reservationId || pgid(groupIdentity) !== rootPid) return false
+      const recovered = await adapter.recoverReservation(reservationId)
+      return Boolean(recovered && recovered.rootPid === rootPid && recovered.groupIdentity === groupIdentity)
+    },
     async listTargetOwned(targetKey, records) {
       const live = []
-      for (const record of records.filter((entry) => entry.targetKey === targetKey && entry.status === 'RUNNING')) {
-        live.push(...await adapter.listOwned(record.groupIdentity))
+      const seen = new Set()
+      for (const record of records.filter(entry => entry.targetKey === targetKey)) {
+        let identity = typeof record.groupIdentity === 'string' && record.groupIdentity
+          ? record.groupIdentity : null
+        if (!identity && record.status === 'RESERVED') {
+          const probe = await adapter.probeReservation(record)
+          if (probe.state === 'LIVE') identity = probe.ownership.groupIdentity
+        }
+        if (!identity || seen.has(identity)) continue
+        seen.add(identity)
+        live.push(...await adapter.listOwned(identity))
       }
       return live
     },
@@ -1303,6 +1776,14 @@ function createWindowsJobAdapter(options = {}) {
     capabilities: Object.fromEntries(REQUIRED_PROCESS_CAPABILITIES.map((field) => [field, true])),
     reservationIdentity(reservationId) { return persistentIdentity(reservationId) },
     prepareReservation(input) { return reservationBindingFor(input) },
+    validateReservationBinding(record) {
+      return validateReservationBinding(record.reservationBinding, {
+        reservationId: record.reservationId,
+        reservationIdentity: record.reservationIdentity,
+        startupDeadlineAt: record.startupDeadlineAt,
+        targetKey: record.targetKey,
+      })
+    },
     async probeReservation(record) {
       const binding = validateReservationBinding(record.reservationBinding, {
         reservationId: record.reservationId,
@@ -1315,7 +1796,9 @@ function createWindowsJobAdapter(options = {}) {
         record.reservationIdentity,
       )
       if (!fsImpl.existsSync(files.directory)) {
-        return { state: 'DEAD', evidence: { reason: 'control-directory-never-created', bindingHash: sha256(stableStringify(binding)) } }
+        return wallNowMs() < Date.parse(record.startupDeadlineAt)
+          ? { state: 'PENDING', evidence: { reason: 'control-directory-publication-pending', bindingHash: sha256(stableStringify(binding)) } }
+          : { state: 'DEAD', evidence: { reason: 'control-directory-never-created-before-deadline', bindingHash: sha256(stableStringify(binding)) } }
       }
       const status = readStatus(files.statusPath)
       if (status) {
@@ -1567,13 +2050,92 @@ function createWindowsJobAdapter(options = {}) {
     },
     async listTargetOwned(targetKey, records) {
       const live = []
-      for (const record of records.filter((entry) => entry.targetKey === targetKey && entry.status === 'RUNNING')) {
-        live.push(...await adapter.listOwned(record.groupIdentity))
+      const seen = new Set()
+      for (const record of records.filter(entry => entry.targetKey === targetKey)) {
+        let identity = typeof record.groupIdentity === 'string' && record.groupIdentity
+          ? record.groupIdentity : null
+        if (!identity && record.status === 'RESERVED') {
+          const probe = await adapter.probeReservation(record)
+          if (probe.state === 'LIVE') identity = probe.ownership.groupIdentity
+        }
+        if (!identity || seen.has(identity)) continue
+        seen.add(identity)
+        live.push(...await adapter.listOwned(identity))
       }
       return live
     },
   }
   return adapter
+}
+
+async function runOwnedProcessConformanceProbe(options = {}) {
+  const adapter = options.adapter
+  const processOwner = options.processOwner
+  const targetKey = options.targetKey
+  const targetPath = options.targetPath
+  const environment = options.environment
+  if (!adapter || !processOwner || typeof processOwner.launch !== 'function' ||
+      typeof targetKey !== 'string' || !targetKey ||
+      typeof targetPath !== 'string' || !path.isAbsolute(targetPath) ||
+      !environment || typeof environment !== 'object' || Array.isArray(environment)) {
+    fail('PROCESS_OWNER_CONFIG_INVALID',
+      'owned process conformance requires an adapter, owner, target, and exact environment')
+  }
+  const reservationId = options.reservationId || crypto.randomUUID()
+  const exactEnvironment = prepareProcessLaunchEnvironment(adapter, reservationId, environment)
+  // ProcessOwner.launch performs the bounded adapter admission itself. Avoid a
+  // second unbounded provider call before the durable reservation exists.
+  const launched = await processOwner.launch({
+    executable: process.execPath,
+    argv: ['-e', 'setInterval(() => {}, 1000)'],
+    cwd: targetPath,
+    env: exactEnvironment,
+    shell: false,
+    sessionId: options.sessionId || `process-conformance:${reservationId}`,
+    reservationId,
+    targetKey,
+    forWork: false,
+  })
+  let drained = false
+  try {
+    await processOwner.cancelGroup(launched.ownershipId, {
+      reason: options.reason || 'owned process conformance probe',
+      graceMs: 0,
+      killMs: options.killMs === undefined ? 1000 : options.killMs,
+      terminalStatus: 'DONE',
+    })
+    await processOwner.assertTargetDrained(targetKey)
+    drained = true
+  } finally {
+    if (!drained) {
+      try {
+        await processOwner.cancelAll({
+          reason: 'owned process conformance cleanup',
+          graceMs: 0,
+          killMs: options.killMs === undefined ? 1000 : options.killMs,
+          terminalStatus: 'FAILED',
+        })
+      } catch {}
+    }
+  }
+  const terminal = processOwner.listRecords().find(record =>
+    record.ownershipId === launched.ownershipId)
+  if (!terminal || terminal.status !== 'DONE' || terminal.targetKey !== targetKey ||
+      terminal.groupIdentity !== launched.groupIdentity) {
+    fail('PROCESS_DRAIN_TIMEOUT',
+      'owned process conformance did not publish one exact drained terminal identity')
+  }
+  const body = canonicalize({
+    schemaVersion: 1,
+    kind: 'owned-process-conformance',
+    adapterKind: adapter.kind,
+    targetKey,
+    ownershipId: launched.ownershipId,
+    groupIdentity: launched.groupIdentity,
+    terminalStatus: terminal.status,
+    drained: true,
+  })
+  return Object.freeze({ ...body, probeHash: sha256(stableStringify(body)) })
 }
 
 module.exports = {
@@ -1591,14 +2153,10 @@ module.exports = {
     launchFields: ['reservationId', 'ownershipId', 'executable', 'argv', 'targetKey'],
   }),
   processLaunchControlEnvironment,
+  runOwnedProcessConformanceProbe,
   normalizeWindowsChildEnvironment,
   selectWindowsLiveStatusPids,
-  prepareProcessLaunchEnvironment: (adapter, reservationId, environment = {}) => {
-    const controls = processLaunchControlEnvironment(adapter, reservationId)
-    return adapter?.kind === 'windows-job-object'
-      ? normalizeWindowsChildEnvironment(environment, controls)
-      : Object.freeze({ ...environment, ...controls })
-  },
+  prepareProcessLaunchEnvironment,
   validateAdapter,
   verifyProcessAdapter: validateAdapter,
 }

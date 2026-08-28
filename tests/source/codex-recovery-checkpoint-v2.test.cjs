@@ -201,6 +201,34 @@ function snapshot(lastRecord, overrides = {}) {
   return value
 }
 
+function bindPlanLineage(current, previous, causeKind = current.cause.kind) {
+  const body = {
+    schemaVersion: 1,
+    kind: 'codex-roadmap-plan-lineage',
+    priorPlanHash: previous.checkpoint.immutableHashes.planHash,
+    replacementPlanHash: current.checkpoint.immutableHashes.planHash,
+    routeDecisionHash: current.checkpoint.immutableHashes.routeDecisionHash,
+    projectionReceiptHash: H(`projection:${current.checkpoint.immutableHashes.planHash}`),
+    artifactReceiptHash: H(`artifact:${current.checkpoint.immutableHashes.planHash}`),
+    transactionReceiptHash: H(`transaction:${previous.entryHash}`),
+    migration: false,
+    legacyCauseId: null,
+    previousCheckpointSequence: previous.sequence,
+    previousCheckpointEntryHash: previous.entryHash,
+    checkpointSequence: current.sequence,
+    stateEventSequence: current.checkpoint.stateEvent.sequence,
+    accountingSequence: current.checkpoint.accounting.lastAccountingSequence,
+    schedulerStateHash: current.checkpoint.scheduler.stateHash,
+    causeKind,
+  }
+  const lineage = { ...body, lineageReceiptHash: stableHash(body) }
+  current.cause.kind = causeKind
+  current.cause.causeId = `plan-lineage:${lineage.lineageReceiptHash}`
+  current.checkpointPayloadHash = stableHash(current.checkpoint)
+  current.entryHash = stableHash(without(current, 'entryHash'))
+  return lineage
+}
+
 function nextRecord(previous) {
   const nextScheduler = scheduler({
     candidate: clone(previous.checkpoint.scheduler.candidate),
@@ -543,13 +571,13 @@ test('recovery checkpoint schemas are official Draft 2020-12 and reject structur
   assertDraftInvalid(SNAPSHOT_SCHEMA_PATH, [missingLastHash, extraSnapshotField, invalidSnapshotCheckpoint])
 })
 
-test('ROADMAP repair advances plan hash exactly once at the authenticated plan-recheck lease boundary', () => {
+test('ROADMAP plan hash advances through authenticated append-only lineage without frontier-name policy', () => {
   const nullCandidate = { candidateId: null, candidateHash: null, frozen: false }
-  const repairId = 'roadmap-author-plan-repair'
-  const recheckId = 'roadmap-plan-recheck'
+  const repairId = 'completed-projection-source-alpha'
+  const recheckId = 'next-product-unit-alpha'
   const priorScheduler = scheduler({
     route: 'ROADMAP', phase: 'RUN_WORK', candidate: nullCandidate,
-    completedWorkIds: ['roadmap-author', repairId], completedCheckIds: [],
+    completedWorkIds: ['completed-source-zero', repairId], completedCheckIds: [],
     openCheckIds: [], nextReadyWorkIds: [recheckId], leases: [],
   })
   const priorRecovery = recovery({
@@ -575,7 +603,7 @@ test('ROADMAP repair advances plan hash exactly once at the authenticated plan-r
 
   const recheckLease = lease({
     leaseId: 'lease-roadmap-recheck', workItemId: recheckId,
-    roleId: 'ap-independent-checker', status: 'ADMITTED',
+    roleId: 'opaque-product-role', status: 'ADMITTED',
     reservationId: 'reservation-roadmap-recheck', sessionId: 'session-roadmap-recheck',
     continuationId: 'continuation-roadmap-recheck', crashBindingHash: H('recheck-crash-binding'),
     resources: [{ id: 'workspace:C:/exact-target/plan/ROADMAP.md', kind: 'workspace', mode: 'read', isolationId: null }],
@@ -586,11 +614,11 @@ test('ROADMAP repair advances plan hash exactly once at the authenticated plan-r
   const recheckScheduler = scheduler({
     route: 'ROADMAP', phase: 'RUN_WORK', candidate: nullCandidate,
     completedWorkIds: [...priorScheduler.completedWorkIds], completedCheckIds: [],
-    openCheckIds: [recheckId], nextReadyWorkIds: [`reconcile:${recheckId}`], leases: [recheckLease],
+    openCheckIds: [], nextReadyWorkIds: [`reconcile:${recheckId}`], leases: [recheckLease],
   })
   const recheckRecovery = recovery({
     frontier: {
-      nextReadyWorkIds: [`reconcile:${recheckId}`], openCheckIds: [recheckId],
+      nextReadyWorkIds: [`reconcile:${recheckId}`], openCheckIds: [],
       acceptedResultIds: [priorScheduler.stateHash, H('repair-result-receipt'), recheckScheduler.stateHash],
     },
   })
@@ -603,8 +631,8 @@ test('ROADMAP repair advances plan hash exactly once at the authenticated plan-r
       },
     }),
     cause: {
-      kind: 'LEASE_STARTED', causeId: 'scheduler:1:recheck:lease-started',
-      humanDescription: 'Persist the repaired-plan recheck lease before spawning it.',
+      kind: 'PLAN_PROJECTION_COMMITTED', causeId: 'pending-plan-lineage',
+      humanDescription: 'Persist the repaired-plan product lease before spawning it.',
     },
     sequence: 2, previousHash: prior.entryHash, occurredAt: '2026-08-22T01:00:02.000Z',
   })
@@ -613,6 +641,8 @@ test('ROADMAP repair advances plan hash exactly once at the authenticated plan-r
     hash: H('event-20'), stateAfter: 'RUN_WORK',
     details: { stateEvent: { runId: current.authority.runId, activationNonce: current.authority.activationNonce } },
   }
+  const planLineages = new Map()
+  planLineages.set(current, bindPlanLineage(current, prior))
   const checkpointAuthority = new RecoveryCheckpointAuthority({
     paths: {
       runRecordRoot: ROOT,
@@ -621,7 +651,7 @@ test('ROADMAP repair advances plan hash exactly once at the authenticated plan-r
     },
     capabilityVerifier: () => ({}), stateProvider: () => ({}),
     accountingCheckpointVerifier: value => value, accountingCheckpointProvider: () => ({}),
-    roadmapPlanAdvanceVerifier: () => true,
+    roadmapPlanAdvanceVerifier: (_previous, candidate) => planLineages.get(candidate) || null,
     eventLog: { readAll: () => events },
   })
   const rehash = value => {
@@ -631,6 +661,102 @@ test('ROADMAP repair advances plan hash exactly once at the authenticated plan-r
   }
 
   assert.equal(checkpointAuthority._validateRecord(current, prior), true)
+
+  const receiptTampered = clone(current)
+  const invalidLineage = {
+    ...planLineages.get(current),
+    artifactReceiptHash: H('foreign-artifact-receipt'),
+  }
+  planLineages.set(receiptTampered, invalidLineage)
+  assert.throws(
+    () => checkpointAuthority._validateRecord(receiptTampered, prior),
+    error => error.code === 'RECOVERY_CHECKPOINT_ROLLBACK' && /planHash/.test(error.message),
+  )
+
+  const legacy = clone(current)
+  legacy.cause = {
+    kind: 'LEASE_STARTED',
+    causeId: 'legacy-projection-and-lease-boundary',
+    humanDescription: 'Authenticated predecessor record produced before plan-lineage receipts existed.',
+  }
+  rehash(legacy)
+  const { lineageReceiptHash: _oldLineageHash, ...legacyBody } = planLineages.get(current)
+  const legacyLineageBody = {
+    ...legacyBody,
+    transactionReceiptHash: null,
+    migration: true,
+    legacyCauseId: legacy.cause.causeId,
+    causeKind: legacy.cause.kind,
+  }
+  planLineages.set(legacy, {
+    ...legacyLineageBody,
+    lineageReceiptHash: stableHash(legacyLineageBody),
+  })
+  assert.equal(checkpointAuthority._validateRecord(legacy, prior), true)
+
+  const missionId = 'mission-coordination'
+  const missionPriorScheduler = scheduler({
+    route: 'ROADMAP', phase: 'RUN_WORK', candidate: nullCandidate,
+    completedWorkIds: ['roadmap-author', repairId], completedCheckIds: [],
+    openCheckIds: [], nextReadyWorkIds: [missionId], leases: [],
+  })
+  const missionPrior = record({
+    checkpoint: checkpoint({
+      scheduler: missionPriorScheduler,
+      recovery: recovery({ frontier: {
+        nextReadyWorkIds: [missionId], openCheckIds: [],
+        acceptedResultIds: [missionPriorScheduler.stateHash, H('mission-repair-result-receipt')],
+      } }),
+      immutableHashes: {
+        requestEnvelopeHash: H('request'), routeDecisionHash: H('decision'),
+        planHash: H('mission-plan-before-repair'), candidateHash: null,
+      },
+    }),
+    cause: {
+      kind: 'LEASE_COMPLETED', causeId: 'scheduler:1:mission-repair:completed',
+      humanDescription: 'Persist the completed multi-worker ROADMAP repair.',
+    },
+  })
+  const missionLease = {
+    ...recheckLease,
+    leaseId: 'lease-mission-coordination', workItemId: missionId,
+    roleId: 'ap-run-coordinator', reservationId: 'reservation-mission-coordination',
+    sessionId: 'session-mission-coordination', continuationId: 'continuation-mission-coordination',
+    crashBindingHash: H('mission-crash-binding'),
+  }
+  const missionScheduler = scheduler({
+    route: 'ROADMAP', phase: 'RUN_WORK', candidate: nullCandidate,
+    completedWorkIds: [...missionPriorScheduler.completedWorkIds], completedCheckIds: [],
+    openCheckIds: [], nextReadyWorkIds: [`reconcile:${missionId}`], leases: [missionLease],
+  })
+  const missionCurrent = record({
+    checkpoint: checkpoint({
+      scheduler: missionScheduler,
+      recovery: recovery({ frontier: {
+        nextReadyWorkIds: [`reconcile:${missionId}`], openCheckIds: [],
+        acceptedResultIds: [
+          missionPriorScheduler.stateHash,
+          H('mission-repair-result-receipt'),
+          missionScheduler.stateHash,
+        ],
+      } }),
+      immutableHashes: {
+        requestEnvelopeHash: H('request'), routeDecisionHash: H('decision'),
+        planHash: H('mission-plan-after-repair'), candidateHash: null,
+      },
+    }),
+    cause: {
+      kind: 'LEASE_STARTED', causeId: 'scheduler:1:mission-coordination:lease-started',
+      humanDescription: 'Persist the repaired-plan mission coordinator before spawning it.',
+    },
+    sequence: 2, previousHash: missionPrior.entryHash, occurredAt: '2026-08-22T01:00:02.000Z',
+  })
+  planLineages.set(missionCurrent, bindPlanLineage(
+    missionCurrent,
+    missionPrior,
+    'PLAN_PROJECTION_COMMITTED',
+  ))
+  assert.equal(checkpointAuthority._validateRecord(missionCurrent, missionPrior), true)
 
   const revisionScheduler = scheduler({
     route: 'ROADMAP', phase: 'RUN_WORK', candidate: nullCandidate,
@@ -654,6 +780,7 @@ test('ROADMAP repair advances plan hash exactly once at the authenticated plan-r
   const planCheckLease = {
     ...recheckLease,
     leaseId: 'lease-roadmap-plan-check', workItemId: 'roadmap-plan-check',
+    roleId: 'ap-independent-checker',
     reservationId: 'reservation-roadmap-plan-check', sessionId: 'session-roadmap-plan-check',
     continuationId: 'continuation-roadmap-plan-check', crashBindingHash: H('plan-check-crash-binding'),
   }
@@ -674,9 +801,10 @@ test('ROADMAP repair advances plan hash exactly once at the authenticated plan-r
         planHash: H('plan-after-revision'), candidateHash: null,
       },
     }),
-    cause: { kind: 'LEASE_STARTED', causeId: 'scheduler:1:plan-check:lease-started', humanDescription: 'plan check admitted' },
+    cause: { kind: 'PLAN_PROJECTION_COMMITTED', causeId: 'pending-plan-lineage', humanDescription: 'plan check admitted' },
     sequence: 2, previousHash: revisionPrior.entryHash, occurredAt: '2026-08-22T01:00:02.000Z',
   })
+  planLineages.set(revisionCurrent, bindPlanLineage(revisionCurrent, revisionPrior))
   assert.equal(checkpointAuthority._validateRecord(revisionCurrent, revisionPrior), true)
 
   const unverifiedAuthority = new RecoveryCheckpointAuthority({
@@ -700,10 +828,11 @@ test('ROADMAP repair advances plan hash exactly once at the authenticated plan-r
   crashProjection.checkpoint.recovery = clone(prior.checkpoint.recovery)
   crashProjection.checkpoint.stateEvent = clone(prior.checkpoint.stateEvent)
   crashProjection.cause = {
-    kind: 'CRASH_RECOVERY', causeId: 'crash-restored:2',
+    kind: 'CRASH_RECOVERY', causeId: 'pending-plan-lineage',
     humanDescription: 'Persist the authenticated repaired plan projection after crash adoption.',
   }
   rehash(crashProjection)
+  planLineages.set(crashProjection, bindPlanLineage(crashProjection, prior))
   assert.equal(checkpointAuthority._validateRecord(crashProjection, prior), true)
 
   const committedProjection = clone(current)
@@ -711,10 +840,11 @@ test('ROADMAP repair advances plan hash exactly once at the authenticated plan-r
   committedProjection.checkpoint.recovery = clone(prior.checkpoint.recovery)
   committedProjection.checkpoint.stateEvent = clone(prior.checkpoint.stateEvent)
   committedProjection.cause = {
-    kind: 'PLAN_PROJECTION_COMMITTED', causeId: 'plan-projection:1:roadmap-author-plan-repair',
-    humanDescription: 'Persist the authenticated repaired plan projection before its recheck.',
+    kind: 'PLAN_PROJECTION_COMMITTED', causeId: 'pending-plan-lineage',
+    humanDescription: 'Persist the authenticated repaired plan projection before product work.',
   }
   rehash(committedProjection)
+  planLineages.set(committedProjection, bindPlanLineage(committedProjection, prior))
   assert.equal(checkpointAuthority._validateRecord(committedProjection, prior), true)
 
   const committedWithChangedState = clone(committedProjection)

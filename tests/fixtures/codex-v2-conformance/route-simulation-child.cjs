@@ -62,7 +62,7 @@ const cases = {
       sideEffects: ['deliverable-write'],
       riskAndIndependentCheckFloor: { level: 'elevated', minimumCheckerCount: 2, namedDistinctResponsibilities: ['output encoding review', 'browser behavior test'] },
     },
-    topology: { workerCount: 2 },
+    topology: { workerCount: 1 },
     effort: { role: 'worker', difficulty: 'high', risk: 'high' },
   },
   'roadmap-soc-build': {
@@ -73,21 +73,20 @@ const cases = {
       sideEffects: ['database-write', 'external-write'],
       riskAndIndependentCheckFloor: { level: 'staged-high-impact', minimumCheckerCount: 2, namedDistinctResponsibilities: ['migration safety', 'data reconciliation'] },
     },
-    topology: { workerCount: 2, scoutCount: 1, namedUnknowns: ['customer-primary migration boundary'] },
+    topology: { workerCount: 1 },
     effort: { role: 'worker', difficulty: 'exceptional', risk: 'critical' },
   },
 }
 
-function expandRoles(counts) {
+function expandPhysicalRoles(counts) {
+  // The shared topology retains ROADMAP's logical planning structure for
+  // cross-provider compatibility. Codex executes that structure as a
+  // deterministic controller projection, so only the analyst, useful product
+  // workers, and fresh final checker seats cross a model boundary.
   const definitions = [
     ['routeAnalysts', 'ap-route-analyst', 'planning'],
-    ['roadmapAuthors', 'ap-roadmap-author', 'planning'],
-    ['scouts', 'ap-roadmap-scout', 'planning'],
-    ['planCheckers', 'ap-reviewer', 'verification'],
-    ['missionCoordinators', 'ap-feature-coordinator', 'planning'],
-    ['workGroupManagers', 'ap-work-group-manager', 'planning'],
     ['workers', 'ap-worker', 'work'],
-    ['finalCheckers', 'ap-verifier', 'verification'],
+    ['finalCheckers', 'ap-independent-checker', 'verification'],
   ]
   return definitions.flatMap(([field, role, purpose]) =>
     Array.from({ length: counts[field] }, (_, index) => ({ role, purpose, ordinal: index + 1 })))
@@ -133,7 +132,7 @@ async function main() {
     const scheduler = new CentralScheduler({ route: decision.route, runIdentity: { runId: `economic-${id}`, generation: 1 } })
     let contextBytes = 0
     let sequence = 0
-    for (const item of expandRoles(topology.counts)) {
+    for (const item of expandPhysicalRoles(topology.counts)) {
       sequence += 1
       const workItemId = `${item.role}-${item.ordinal}`
       const dispatch = buildContextFreeBrief({

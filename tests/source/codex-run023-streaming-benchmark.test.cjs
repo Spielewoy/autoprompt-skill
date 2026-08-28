@@ -16,6 +16,13 @@ test('AP-RUN-023 production JSONL parsing keeps polling and retained memory boun
   const accumulator = createCodexJsonlAccumulator()
   const payload = 'x'.repeat(128 * 1024)
   const line = JSON.stringify({ type: 'item.started', payload })
+  const serializedEventBytes = Buffer.byteLength(line)
+  const retainedEventByteLimit = 8 * 1024 * 1024
+  const retainedEventCountLimit = 256
+  const expectedRetainedEvents = Math.min(
+    retainedEventCountLimit,
+    Math.floor(retainedEventByteLimit / serializedEventBytes),
+  )
   const iterations = Math.ceil((2 * 1024 * 1024 * 1024) / Buffer.byteLength(line))
   const logicalBytes = iterations * Buffer.byteLength(line)
   const heapStart = process.memoryUsage().heapUsed
@@ -41,7 +48,20 @@ test('AP-RUN-023 production JSONL parsing keeps polling and retained memory boun
 
   assert.ok(logicalBytes >= 2 * 1024 * 1024 * 1024, `logicalBytes=${logicalBytes}`)
   assert.equal(snapshot.eventCount, iterations)
-  assert.equal(snapshot.events.length, 256)
+  assert.equal(snapshot.events.length, expectedRetainedEvents)
+  assert.equal(snapshot.retainedEventCount, expectedRetainedEvents)
+  assert.equal(snapshot.retainedEventBytes, expectedRetainedEvents * serializedEventBytes)
+  assert.ok(snapshot.retainedEventBytes <= retainedEventByteLimit)
+
+  const countBounded = createCodexJsonlAccumulator()
+  for (let index = 0; index < retainedEventCountLimit + 32; index += 1) {
+    countBounded.push(JSON.stringify({ type: 'item.started', index }), index + 1)
+  }
+  const countSnapshot = countBounded.snapshot()
+  assert.equal(countSnapshot.eventCount, retainedEventCountLimit + 32)
+  assert.equal(countSnapshot.events.length, retainedEventCountLimit)
+  assert.equal(countSnapshot.retainedEventCount, retainedEventCountLimit)
+  assert.ok(countSnapshot.retainedEventBytes <= retainedEventByteLimit)
   assert.ok(retainedHeapBytes < 256 * 1024 * 1024, `retainedHeapBytes=${retainedHeapBytes}`)
   assert.ok(averagePollMicroseconds < 1000, `averagePollMicroseconds=${averagePollMicroseconds}`)
   t.diagnostic(JSON.stringify({

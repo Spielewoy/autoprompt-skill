@@ -203,7 +203,7 @@ function readyClosureFixture() {
   return { fixture, identity }
 }
 
-test('AP-ISO-018 frozen pre-canary Codex policy refuses only absent evidence/attestation', t => {
+test('AP-ISO-018 exact pre-canary blockers admit only pending local conformance', t => {
   const provider = shippedRegistry.providers.find(candidate => candidate.id === 'codex')
   assert.equal(provider.implementationStatus, 'verified')
   assert.equal(provider.currentIsolationClass, 'strict')
@@ -236,11 +236,44 @@ test('AP-ISO-018 frozen pre-canary Codex policy refuses only absent evidence/att
     'supported-capability-unattested-privateSkillRoot',
     'supported-capability-unattested-processOwnership',
   ])
-  assert.throws(() => configure.requireCanonicalCodexCapabilityTrust({
+  const cleanEnv = { ...process.env }
+  delete cleanEnv.AUTOPROMPT_BENCHMARK_UNATTESTED_BETA
+  const pending = configure.requireCanonicalCodexCapabilityTrust({
+    env: cleanEnv,
     providerRegistry: shippedRegistry,
     now: new Date('2026-08-23T12:00:00.000Z'),
+  })
+  assert.equal(pending.ready, false)
+  assert.equal(pending.status, 'LOCAL_CONFORMANCE_PENDING')
+  assert.equal(pending.localConformancePending, true)
+  assert.deepEqual(pending.blockers, trust.blockers)
+  assert.deepEqual(pending.verifiedCapabilities, [])
+
+  const ambientOverride = configure.requireCanonicalCodexCapabilityTrust({
+    env: {
+      ...cleanEnv,
+      AUTOPROMPT_BENCHMARK_UNATTESTED_BETA: 'acknowledged-local-beta-override',
+    },
+    providerRegistry: shippedRegistry,
+    now: new Date('2026-08-23T12:00:00.000Z'),
+  })
+  assert.equal(ambientOverride.status, pending.status)
+  assert.equal(ambientOverride.localConformancePending, pending.localConformancePending)
+  assert.deepEqual(ambientOverride.blockers, pending.blockers)
+  assert.equal(ambientOverride.runtimeIdentity.runtimeIdentityHash,
+    pending.runtimeIdentity.runtimeIdentityHash,
+    'the retired benchmark variable must not change admission or runtime trust')
+
+  const seventhBlocker = structuredClone(shippedRegistry)
+  seventhBlocker.providers.find(candidate => candidate.id === 'codex')
+    .capabilities.modelRouting = 'supported'
+  assert.throws(() => configure.requireCanonicalCodexCapabilityTrust({
+    env: cleanEnv,
+    providerRegistry: seventhBlocker,
+    now: new Date('2026-08-23T12:00:00.000Z'),
   }), error => error.code === 'PROVIDER_UNSUPPORTED' &&
-      error.reason === 'canonical-provider-capability-refusal')
+      error.reason === 'canonical-provider-capability-refusal',
+  'pending local conformance must fail closed when any seventh blocker appears')
 
   const sandbox = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'ap-cap-trust-'))
   t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
@@ -250,10 +283,9 @@ test('AP-ISO-018 frozen pre-canary Codex policy refuses only absent evidence/att
   fs.mkdirSync(target)
   assert.throws(() => configure.prepareActivation({
     env: { ...process.env, AUTOPROMPT_INSTALL_ROOT: installRoot },
-    mission: 'must refuse before activation mutation',
+    mission: 'must refuse an uninstalled payload before activation mutation',
     target,
-  }), error => error.code === 'PROVIDER_UNSUPPORTED' &&
-      error.reason === 'canonical-provider-capability-refusal')
+  }))
   assert.equal(fs.existsSync(path.join(installRoot, '.a')), false)
 })
 
@@ -293,8 +325,9 @@ test('activation attestations use the exact canonical supported provider capabil
 
   const source = fs.readFileSync(path.join(ROOT, 'scripts', 'codex-configure.cjs'), 'utf8')
   assert.doesNotMatch(source, /verifiedCapabilities:\s*\['isolation', 'privateSkillRoot'\]/)
-  assert.match(source, /verifiedCapabilities:\s*\[\.\.\.canonicalVerifiedCapabilities\]/)
-  assert.match(source, /isCanonicalCodexVerifiedCapabilities\(attestation\.verifiedCapabilities/)
+  assert.match(source, /verifiedCapabilities:\s*\[\.\.\.canonicalCodexVerifiedCapabilities\(\)\]/)
+  assert.match(source, /verifiedCapabilities:\s*\[\.\.\.providerTrust\.verifiedCapabilities\]/)
+  assert.match(source, /JSON\.stringify\(attestation\.verifiedCapabilities\)[\s\S]*JSON\.stringify\(providerTrustValidation\.verifiedCapabilities\)/)
   assert.match(source, /isCanonicalCodexVerifiedCapabilities\(providerTrust\.verifiedCapabilities/)
 })
 

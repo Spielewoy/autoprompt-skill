@@ -918,7 +918,7 @@
           "required": ["role", "layer", "parent", "count", "output", "repairOwner", "coordinatesImplementation"],
           "properties": {
             "role": { "const": "roadmap-author" }, "layer": { "const": "L3" },
-            "parent": { "const": "run-owner" }, "count": { "const": 1 },
+            "parent": { "const": "run-owner" }, "count": { "enum": [0, 1] },
             "output": { "const": "plan/ROADMAP.md" }, "repairOwner": { "const": "SAME_AUTHOR" },
             "coordinatesImplementation": { "const": false }
           },
@@ -945,7 +945,7 @@
           "required": ["role", "layer", "parent", "count", "independentFromAuthor", "editsPlan", "recheckOwner"],
           "properties": {
             "role": { "const": "plan-checker" }, "layer": { "const": "L4" },
-            "parent": { "const": "run-owner" }, "count": { "const": 1 },
+            "parent": { "const": "run-owner" }, "count": { "enum": [0, 1] },
             "independentFromAuthor": { "const": true }, "editsPlan": { "const": false },
             "recheckOwner": { "const": "SAME_CHECKER" }
           },
@@ -959,7 +959,7 @@
               "type": "object", "required": ["role", "layer", "parent", "count"],
               "properties": {
                 "role": { "const": "mission-coordinator" }, "layer": { "const": "L1" },
-                "parent": { "const": "run-owner" }, "count": { "const": 1 }
+                "parent": { "const": "run-owner" }, "count": { "enum": [0, 1] }
               },
               "additionalProperties": false
             },

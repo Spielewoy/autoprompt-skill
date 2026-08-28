@@ -297,6 +297,10 @@ test('run record exposes only canonical registered paths and the uppercase ROADM
   record.write('checks/captured-domain-outcomes.json', '{"schemaVersion":1,"evaluation":{"valid":true}}\n')
   assert.deepEqual(JSON.parse(fs.readFileSync(record.resolve('checks/captured-domain-outcomes.json'), 'utf8')),
     { schemaVersion: 1, evaluation: { valid: true } })
+  record.write(runRecord.CODEX_PHYSICAL_EXECUTION_PATH,
+    '{"schemaVersion":1,"kind":"codex-physical-execution"}\n')
+  assert.deepEqual(JSON.parse(fs.readFileSync(record.resolve(runRecord.CODEX_PHYSICAL_EXECUTION_PATH), 'utf8')),
+    { schemaVersion: 1, kind: 'codex-physical-execution' })
   const projectionHash = 'a'.repeat(64)
   record.write(`plan/projections/${projectionHash}.json`, '{"schemaVersion":1}\n')
   assert.deepEqual(JSON.parse(fs.readFileSync(record.resolve(`plan/projections/${projectionHash}.json`), 'utf8')),

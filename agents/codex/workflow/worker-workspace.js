@@ -23,6 +23,7 @@ const {
 } = require('./safe-run-root.js')
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/
+const TRANSPORT_RETRY_PATTERN = /^(.+)-transport-retry-1$/u
 
 class WorkerWorkspaceError extends Error {
   constructor(code, message, details) {
@@ -236,6 +237,71 @@ function assignmentHash(assignment) {
   return sha256(stableStringify(assignment))
 }
 
+function changedSnapshotPaths(before, after) {
+  const beforeMap = snapshotMap(before)
+  const afterMap = snapshotMap(after)
+  return [...new Set([...beforeMap.keys(), ...afterMap.keys()])].sort().filter(relative =>
+    (beforeMap.get(relative) && beforeMap.get(relative).hash || null) !==
+    (afterMap.get(relative) && afterMap.get(relative).hash || null))
+}
+
+function quarantineBody(record, input) {
+  return Object.freeze({
+    schemaVersion: 1,
+    kind: 'provider-transport-partial-candidate',
+    sourceWorkspaceId: record.workspaceId,
+    sourceWorkItemId: record.workItemId,
+    retryWorkItemId: input.retryWorkItemId,
+    sourceAssignmentHash: record.assignmentHash,
+    sourceBindingHash: record.binding.bindingHash,
+    transportReceiptHash: input.transportReceiptHash,
+    candidateHash: input.candidateHash,
+    changedPathCount: input.actualFilesChanged.length,
+    changedPathsHash: sha256(stableStringify(input.actualFilesChanged)),
+  })
+}
+
+function validQuarantine(record) {
+  const quarantine = record && record.transportQuarantine
+  if (quarantine === undefined || quarantine === null) {
+    return !record || !['QUARANTINED', 'QUARANTINE_CONSUMED'].includes(record.status)
+  }
+  const match = TRANSPORT_RETRY_PATTERN.exec(quarantine.retryWorkItemId || '')
+  const { bindingHash, consumedBy, ...body } = quarantine
+  return Boolean(
+    quarantine.schemaVersion === 1 && quarantine.kind === 'provider-transport-partial-candidate' &&
+    match && match[1] === quarantine.sourceWorkItemId &&
+    quarantine.sourceWorkspaceId === record.workspaceId &&
+    quarantine.sourceWorkItemId === record.workItemId &&
+    quarantine.sourceAssignmentHash === record.assignmentHash &&
+    quarantine.sourceBindingHash === record.binding.bindingHash &&
+    [quarantine.transportReceiptHash, quarantine.candidateHash,
+      quarantine.changedPathsHash, bindingHash].every(value => HASH_PATTERN.test(value || '')) &&
+    Number.isSafeInteger(quarantine.changedPathCount) && quarantine.changedPathCount > 0 &&
+    bindingHash === sha256(stableStringify(body)) &&
+    (record.status === 'QUARANTINED'
+      ? consumedBy === undefined || consumedBy === null
+      : record.status === 'QUARANTINE_CONSUMED' && consumedBy &&
+        typeof consumedBy === 'object' && HASH_PATTERN.test(consumedBy.retryBindingHash || '') &&
+        typeof consumedBy.retryWorkspaceId === 'string' && consumedBy.retryWorkspaceId.length > 0)
+  )
+}
+
+function validTransportSeed(record) {
+  const seed = record && record.transportSeed
+  if (seed === undefined || seed === null) return true
+  const { bindingHash, ...body } = seed
+  return Boolean(
+    seed.schemaVersion === 1 && seed.kind === 'provider-transport-quarantine-seed' &&
+    seed.retryWorkspaceId === record.workspaceId && seed.retryAssignmentHash === record.assignmentHash &&
+    [seed.sourceQuarantineBindingHash, seed.transportReceiptHash, seed.sourceCandidateHash,
+      seed.changedPathsHash, seed.seededSnapshotHash, bindingHash]
+      .every(value => HASH_PATTERN.test(value || '')) &&
+    Number.isSafeInteger(seed.changedPathCount) && seed.changedPathCount > 0 &&
+    bindingHash === sha256(stableStringify(body))
+  )
+}
+
 function resourcePath(targetRoot, resource) {
   if (!resource || !['file', 'directory', 'output', 'cache', 'evidence-root'].includes(resource.kind)) return null
   const identity = String(resource.identity || '')
@@ -401,7 +467,7 @@ class WorkerWorkspaceManager {
       this._validateRecord(existing, { workspaceId, boundAssignmentHash, workspacePath })
       this.recover(existing)
       const recovered = readChecksummedJson(recordPath, { fsImpl: this.fs })
-      if (['COMMITTED', 'FINALIZED'].includes(recovered.status)) {
+      if (['COMMITTED', 'FINALIZED', 'QUARANTINED', 'QUARANTINE_CONSUMED'].includes(recovered.status)) {
         fail('WORKER_WORKSPACE_ALREADY_PROMOTED', `worker workspace ${workspaceId} was already promoted`)
       }
       if (!this.fs.existsSync(workspacePath)) {
@@ -483,6 +549,258 @@ class WorkerWorkspaceManager {
     }
     atomicWriteJson(recordPath, record, { fsImpl: this.fs })
     return this._session(record, assignment)
+  }
+
+  quarantine(session, options = {}) {
+    let record = this._readSession(session)
+    const retryMatch = TRANSPORT_RETRY_PATTERN.exec(options.retryWorkItemId || '')
+    if (!retryMatch || retryMatch[1] !== record.workItemId ||
+        !HASH_PATTERN.test(options.transportReceiptHash || '')) {
+      fail('WORKER_QUARANTINE_INVALID', 'transport quarantine requires the exact receipt and its single retry identity')
+    }
+    if (record.status === 'QUARANTINED' || record.status === 'QUARANTINE_CONSUMED') {
+      const pointer = this._quarantinePointer(record)
+      if (pointer.retryWorkItemId !== options.retryWorkItemId ||
+          pointer.transportReceiptHash !== options.transportReceiptHash) {
+        fail('WORKER_QUARANTINE_INVALID', 'transport quarantine binding changed after first persistence')
+      }
+      return pointer
+    }
+    if (record.status !== 'PREPARED' && record.status !== 'ROLLED_BACK') {
+      fail('WORKER_QUARANTINE_INVALID', `worker workspace cannot be quarantined from ${record.status}`)
+    }
+    const rawAfter = repositorySnapshot(record.workspacePath, this.environment, this.fs)
+    const observedPaths = changedSnapshotPaths(record.baseline, rawAfter)
+    const admission = this.inspect(session, { filesChanged: observedPaths })
+    if (admission.actualFilesChanged.length === 0) {
+      this.abort(session)
+      return null
+    }
+    record = this._readSession(session)
+    const body = quarantineBody(record, {
+      retryWorkItemId: options.retryWorkItemId,
+      transportReceiptHash: options.transportReceiptHash,
+      candidateHash: sha256(stableStringify(admission.after)),
+      actualFilesChanged: admission.actualFilesChanged,
+    })
+    const transportQuarantine = Object.freeze({
+      ...body,
+      bindingHash: sha256(stableStringify(body)),
+    })
+    record = { ...record, status: 'QUARANTINED', transportQuarantine }
+    atomicWriteJson(record.recordPath, record, { fsImpl: this.fs })
+    return this._quarantinePointer(record)
+  }
+
+  quarantinePointer(options = {}) {
+    const recordsRoot = path.join(this.privateRoot, 'records')
+    const matches = []
+    for (const name of this.fs.readdirSync(recordsRoot).sort()) {
+      if (!/^[a-f0-9]{40}\.json$/u.test(name)) continue
+      const recordPath = path.join(recordsRoot, name)
+      let inspection
+      try { inspection = inspectPathNoFollow(recordPath, { mustBeDirectory: false, fsImpl: this.fs }) } catch (error) {
+        fail('WORKER_QUARANTINE_INVALID', 'transport quarantine record crosses a link, junction, or reparse point', {
+          cause: error.code || error.message,
+        })
+      }
+      if (!inspection.exists) continue
+      const record = readChecksummedJson(recordPath, { fsImpl: this.fs })
+      if (record && record.workItemId === options.sourceWorkItemId && record.transportQuarantine &&
+          record.transportQuarantine.retryWorkItemId === options.retryWorkItemId &&
+          record.transportQuarantine.transportReceiptHash === options.transportReceiptHash) {
+        this._validateRecord(record, {
+          workspaceId: record.workspaceId,
+          boundAssignmentHash: record.assignmentHash,
+          workspacePath: record.workspacePath,
+        })
+        matches.push(record)
+      }
+    }
+    if (matches.length === 0) {
+      fail('WORKER_QUARANTINE_NOT_FOUND', 'transport retry has no frozen partial work product and must use the canonical base')
+    }
+    if (matches.length !== 1) {
+      fail('WORKER_QUARANTINE_INVALID', 'transport retry lacks one exact receipt-bound quarantine journal')
+    }
+    return this._quarantinePointer(matches[0])
+  }
+
+  prepareFromQuarantine(options = {}) {
+    const assignment = options.assignment
+    const pointer = options.quarantine
+    if (!assignment || !Array.isArray(assignment.resources) || typeof options.workItemId !== 'string' ||
+        !pointer || typeof pointer.recordPath !== 'string') {
+      fail('WORKER_QUARANTINE_INVALID', 'transport retry requires a canonical assignment and quarantine pointer')
+    }
+    const retryMatch = TRANSPORT_RETRY_PATTERN.exec(options.workItemId)
+    const recordPath = path.resolve(pointer.recordPath)
+    const recordsRoot = path.join(this.privateRoot, 'records')
+    if (!retryMatch || !pathIsInside(recordsRoot, recordPath)) {
+      fail('WORKER_QUARANTINE_INVALID', 'transport retry quarantine pointer escaped its exact private record boundary')
+    }
+    try { inspectPathNoFollow(recordPath, { mustBeDirectory: false, fsImpl: this.fs }) } catch (error) {
+      fail('WORKER_QUARANTINE_INVALID', 'transport retry quarantine record crosses a link, junction, or reparse point', {
+        cause: error.code || error.message,
+      })
+    }
+    const source = readChecksummedJson(recordPath, { fsImpl: this.fs })
+    this._validateRecord(source, {
+      workspaceId: source && source.workspaceId,
+      boundAssignmentHash: source && source.assignmentHash,
+      workspacePath: source && source.workspacePath,
+    })
+    const reopenedPointer = this._quarantinePointer(source)
+    if (stableStringify(reopenedPointer) !== stableStringify(pointer) ||
+        reopenedPointer.retryWorkItemId !== options.workItemId ||
+        reopenedPointer.sourceWorkItemId !== retryMatch[1]) {
+      fail('WORKER_QUARANTINE_INVALID', 'transport retry quarantine pointer changed before consumption')
+    }
+    const retryAssignmentHash = assignmentHash(assignment)
+    const retryWorkspaceId = sha256(stableStringify({
+      runId: this.runId,
+      activationId: this.activationId,
+      workItemId: options.workItemId,
+      assignmentHash: retryAssignmentHash,
+    })).slice(0, 40)
+    if (source.status === 'QUARANTINE_CONSUMED') {
+      if (source.transportQuarantine.consumedBy.retryWorkspaceId !== retryWorkspaceId) {
+        fail('WORKER_QUARANTINE_INVALID', 'consumed transport quarantine points to a foreign retry workspace')
+      }
+      const retryRecordPath = path.join(this.privateRoot, 'records', `${retryWorkspaceId}.json`)
+      if (!this.fs.existsSync(retryRecordPath)) {
+        fail('WORKER_QUARANTINE_TAMPERED', 'consumed transport quarantine retry journal is missing')
+      }
+      const retryRecord = readChecksummedJson(retryRecordPath, { fsImpl: this.fs })
+      this._validateRecord(retryRecord, {
+        workspaceId: retryWorkspaceId,
+        boundAssignmentHash: retryAssignmentHash,
+        workspacePath: path.join(this.privateRoot, 'workspaces', retryWorkspaceId),
+      })
+      const seed = retryRecord.transportSeed
+      if (!seed || seed.sourceQuarantineBindingHash !== source.transportQuarantine.bindingHash ||
+          seed.transportReceiptHash !== source.transportQuarantine.transportReceiptHash ||
+          seed.sourceCandidateHash !== source.transportQuarantine.candidateHash ||
+          source.transportQuarantine.consumedBy.retryBindingHash !== retryRecord.binding.bindingHash ||
+          !this.fs.existsSync(retryRecord.workspacePath) ||
+          sha256(stableStringify(repositorySnapshot(
+            retryRecord.workspacePath,
+            this.environment,
+            this.fs,
+          ))) !== seed.seededSnapshotHash) {
+        fail('WORKER_QUARANTINE_TAMPERED', 'consumed transport quarantine retry bytes changed before launch')
+      }
+      return this._session(retryRecord, assignment)
+    }
+    let sourceInspection
+    try { sourceInspection = inspectPathNoFollow(source.workspacePath, { fsImpl: this.fs }) } catch (error) {
+      fail('WORKER_QUARANTINE_TAMPERED', 'transport quarantine workspace crosses a link, junction, or reparse point', {
+        cause: error.code || error.message,
+      })
+    }
+    if (!sourceInspection.exists || sourceInspection.realpath !== path.resolve(source.workspacePath)) {
+      fail('WORKER_QUARANTINE_TAMPERED', 'transport quarantine workspace is missing or was redirected')
+    }
+    const sourceAfter = repositorySnapshot(source.workspacePath, this.environment, this.fs)
+    const actual = changedSnapshotPaths(source.baseline, sourceAfter)
+    if (actual.length !== source.transportQuarantine.changedPathCount ||
+        sha256(stableStringify(actual)) !== source.transportQuarantine.changedPathsHash ||
+        sha256(stableStringify(sourceAfter)) !== source.transportQuarantine.candidateHash) {
+      fail('WORKER_QUARANTINE_TAMPERED', 'transport quarantine bytes differ from the frozen work-product journal')
+    }
+    const outside = actual.filter(relative => !ownsRelative(this.targetRoot, assignment.resources, relative))
+    if (outside.length) {
+      fail('OWNERSHIP_SCOPE_VIOLATION', 'transport quarantine no longer fits the retry assignment ownership', { outside })
+    }
+
+    const retry = this.prepare({ assignment, workItemId: options.workItemId })
+    let retryRecord = this._readSession(retry)
+    const sourceAfterMap = snapshotMap(sourceAfter)
+    if (retryRecord.transportSeed) {
+      const seed = retryRecord.transportSeed
+      if (seed.sourceQuarantineBindingHash !== source.transportQuarantine.bindingHash ||
+          seed.transportReceiptHash !== source.transportQuarantine.transportReceiptHash ||
+          seed.sourceCandidateHash !== source.transportQuarantine.candidateHash ||
+          sha256(stableStringify(repositorySnapshot(
+            retryRecord.workspacePath,
+            this.environment,
+            this.fs,
+          ))) !== seed.seededSnapshotHash) {
+        fail('WORKER_QUARANTINE_TAMPERED', 'existing transport retry workspace differs from its seed journal')
+      }
+    } else {
+      const retryBeforeSeed = repositorySnapshot(retry.workspacePath, this.environment, this.fs)
+      const unexpected = changedSnapshotPaths(retryRecord.baseline, retryBeforeSeed)
+        .filter(relative => !actual.includes(relative))
+      if (unexpected.length) {
+        fail('WORKER_QUARANTINE_TAMPERED', 'unseeded transport retry workspace contains foreign changes', { unexpected })
+      }
+    }
+    for (const relative of actual) {
+      const destination = resolveInside(retry.workspacePath, relative)
+      const sourceState = sourceAfterMap.get(relative) || null
+      removeFileIfPresent(destination, this.fs)
+      if (!sourceState || sourceState.hash === null) {
+        removeEmptyParents(path.dirname(destination), retry.workspacePath, this.fs)
+        continue
+      }
+      const sourceFile = resolveInside(source.workspacePath, relative)
+      const verified = fileState(sourceFile, this.fs)
+      if (!verified || verified.hash !== sourceState.hash || verified.mode !== sourceState.mode) {
+        fail('WORKER_QUARANTINE_TAMPERED', `transport quarantine postimage changed: ${relative}`)
+      }
+      ensurePhysicalDirectory(path.dirname(destination), retry.workspacePath, this.fs)
+      this.fs.copyFileSync(sourceFile, destination, this.fs.constants.COPYFILE_EXCL)
+      this.fs.chmodSync(destination, sourceState.mode)
+      fsyncFile(destination, this.fs)
+    }
+    const retryAfter = repositorySnapshot(retry.workspacePath, this.environment, this.fs)
+    const retryAfterMap = snapshotMap(retryAfter)
+    for (const relative of actual) {
+      const expected = sourceAfterMap.get(relative) || null
+      const observed = retryAfterMap.get(relative) || null
+      if ((expected && expected.hash || null) !== (observed && observed.hash || null) ||
+          (expected && expected.mode || null) !== (observed && observed.mode || null)) {
+        fail('WORKER_QUARANTINE_TAMPERED', `transport retry did not receive the exact frozen postimage: ${relative}`)
+      }
+    }
+    const seedBody = Object.freeze({
+      schemaVersion: 1,
+      kind: 'provider-transport-quarantine-seed',
+      retryWorkspaceId: retryRecord.workspaceId,
+      retryAssignmentHash: retryRecord.assignmentHash,
+      sourceWorkspaceId: source.workspaceId,
+      sourceQuarantineBindingHash: source.transportQuarantine.bindingHash,
+      transportReceiptHash: source.transportQuarantine.transportReceiptHash,
+      sourceCandidateHash: source.transportQuarantine.candidateHash,
+      changedPathCount: source.transportQuarantine.changedPathCount,
+      changedPathsHash: source.transportQuarantine.changedPathsHash,
+      seededSnapshotHash: sha256(stableStringify(retryAfter)),
+    })
+    const transportSeed = Object.freeze({
+      ...seedBody,
+      bindingHash: sha256(stableStringify(seedBody)),
+    })
+    if (retryRecord.transportSeed && stableStringify(retryRecord.transportSeed) !== stableStringify(transportSeed)) {
+      fail('WORKER_QUARANTINE_TAMPERED', 'transport retry workspace was previously seeded from different bytes')
+    }
+    retryRecord = { ...retryRecord, transportSeed }
+    atomicWriteJson(retryRecord.recordPath, retryRecord, { fsImpl: this.fs })
+
+    const consumedBy = Object.freeze({
+      retryWorkspaceId: retryRecord.workspaceId,
+      retryBindingHash: retryRecord.binding.bindingHash,
+    })
+    const consumed = { ...source, status: 'QUARANTINE_CONSUMED', transportQuarantine: {
+      ...source.transportQuarantine,
+      consumedBy,
+    } }
+    atomicWriteJson(source.recordPath, consumed, { fsImpl: this.fs })
+    if (this.fs.existsSync(source.workspacePath)) {
+      this.fs.rmSync(source.workspacePath, { recursive: true, force: false })
+    }
+    removeEmptyTree(path.join(this.privateRoot, 'caches', source.workspaceId), this.privateRoot, this.fs)
+    return this._session(retryRecord, assignment)
   }
 
   reopen(options = {}) {
@@ -581,13 +899,30 @@ class WorkerWorkspaceManager {
     const reported = Array.isArray(result && result.filesChanged)
       ? [...new Set(result.filesChanged.map(value => normalizeReportedPath(value, this.targetRoot)))]
           .filter(relative => !transientPaths.has(relative)).sort() : []
-    if (stableStringify(reported) !== stableStringify(actual)) {
-      fail('MUTATION_REPORT_MISMATCH', 'worker file report does not match the isolated physical diff', {
-        reported, actual,
+    const reportedOutside = reported.filter(relative =>
+      !ownsRelative(this.targetRoot, session.assignment.resources, relative))
+    if (reportedOutside.length) {
+      fail('OWNERSHIP_SCOPE_VIOLATION', 'worker reported files outside its admitted ownership', {
+        outside: reportedOutside,
+        admitted: session.assignment.resources.filter(resource => resource.access !== 'read')
+          .map(resource => `${resource.kind}:${resource.identity}`),
       })
     }
+    const reportedSet = new Set(reported)
+    const unreportedActual = actual.filter(relative => !reportedSet.has(relative))
+    if (unreportedActual.length) {
+      fail('MUTATION_REPORT_MISMATCH', 'worker omitted an observed isolated physical diff from its file report', {
+        reported, actual, unreportedActual,
+      })
+    }
+    // A worker may write a generated file whose bytes are already canonical.
+    // That is an observed no-op, not an orchestration failure.  Preserve the
+    // distinction for evidence while promoting only byte-different postimages.
+    const actualSet = new Set(actual)
+    const reportedNoopFiles = reported.filter(relative => !actualSet.has(relative))
     return Object.freeze({
       actualFilesChanged: Object.freeze(actual),
+      reportedNoopFiles: Object.freeze(reportedNoopFiles),
       after: Object.freeze(after),
       transientArtifactsRemoved: Object.freeze(recordedTransientArtifacts.map(item => Object.freeze({ ...item }))),
       postimages: Object.freeze(actual.map(relative => {
@@ -991,6 +1326,25 @@ class WorkerWorkspaceManager {
     })
   }
 
+  _quarantinePointer(record) {
+    if (!validQuarantine(record)) {
+      fail('WORKER_QUARANTINE_INVALID', 'transport quarantine journal is foreign or corrupt')
+    }
+    const quarantine = record.transportQuarantine
+    const body = Object.freeze({
+      schemaVersion: 1,
+      kind: 'provider-transport-quarantine-pointer',
+      recordPath: record.recordPath,
+      sourceWorkspaceId: quarantine.sourceWorkspaceId,
+      sourceWorkItemId: quarantine.sourceWorkItemId,
+      retryWorkItemId: quarantine.retryWorkItemId,
+      transportReceiptHash: quarantine.transportReceiptHash,
+      candidateHash: quarantine.candidateHash,
+      quarantineBindingHash: quarantine.bindingHash,
+    })
+    return Object.freeze({ ...body, pointerHash: sha256(stableStringify(body)) })
+  }
+
   _readSession(session) {
     if (!session || session.manager !== this || typeof session.recordPath !== 'string') {
       fail('WORKER_WORKSPACE_INVALID', 'workspace session was not issued by this manager')
@@ -1015,12 +1369,19 @@ class WorkerWorkspaceManager {
         : record.transientCleanupHash === sha256(stableStringify(transientArtifacts)))
     const transientCleanupValid = !record || record.transientCleanup === undefined ||
       record.transientCleanup === null || validTransientCleanup(record.transientCleanup)
+    const canonicalRecordPath = record && typeof record.workspaceId === 'string'
+      ? path.join(this.privateRoot, 'records', `${record.workspaceId}.json`) : null
+    const canonicalWorkspacePath = record && typeof record.workspaceId === 'string'
+      ? path.join(this.privateRoot, 'workspaces', record.workspaceId) : null
     if (!record || record.schemaVersion !== 1 || record.workspaceId !== expected.workspaceId ||
         record.runId !== this.runId || record.activationId !== this.activationId ||
         record.assignmentHash !== expected.boundAssignmentHash ||
         record.targetRootHash !== sha256(this.targetRoot) ||
+        path.resolve(record.recordPath || '') !== path.resolve(canonicalRecordPath || '') ||
+        path.resolve(record.workspacePath || '') !== path.resolve(canonicalWorkspacePath || '') ||
         path.resolve(record.workspacePath) !== path.resolve(expected.workspacePath) ||
         !transientEvidenceValid || !transientCleanupValid ||
+        !validQuarantine(record) || !validTransportSeed(record) ||
         !record.binding || !HASH_PATTERN.test(record.binding.bindingHash || '') ||
         record.binding.bindingHash !== sha256(stableStringify({
           schemaVersion: record.binding.schemaVersion,

@@ -85,6 +85,9 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 500
+        },
+        "requiredCompletion": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false

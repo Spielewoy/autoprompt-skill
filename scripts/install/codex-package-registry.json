@@ -148,12 +148,6 @@
       "sha256": "201d70720b2815ecc546ba674470ea0d86305613c13d2ec6e210ed8b7046256e",
       "terms": ["candidate"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
-    },
-    {
-      "path": "agents/codex/workflow/run-record.js",
-      "sha256": "0f6990c7bfd16dab7928208653537bf03c1efcee0aaccc24d78b970298f049f1",
-      "terms": ["candidate"],
-      "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     }
   ],
   "migrationSources": [

@@ -15,14 +15,6 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-if (Test-Path -LiteralPath Env:SENTINEL) {
-    [Console]::Error.WriteLine('supervisor: LEGACY_SENTINEL_UNSUPPORTED: modern Codex does not accept SENTINEL overrides')
-    # This is a pre-runtime process refusal, so do not enter PowerShell's
-    # extensible shutdown path: registered exit handlers can otherwise keep the
-    # adapter alive after the diagnostic and hide the required exit code from
-    # its parent. Console.Error is synchronous; terminate with the exact code.
-    [Environment]::Exit(2)
-}
 $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $runtime = Join-Path $scriptDirectory 'phase-budget.js'
 if (-not [string]::IsNullOrWhiteSpace($env:AUTOPROMPT_RUNTIME) -and

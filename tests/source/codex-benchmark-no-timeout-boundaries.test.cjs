@@ -21,7 +21,7 @@ const { activationCapabilityTtlSeconds } = require('../../scripts/codex-configur
 
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
-const BENCHMARK_ENVIRONMENT = Object.freeze({ AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' })
+const AMBIENT_MEASUREMENT_ENVIRONMENT = Object.freeze({ AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' })
 const HASH = 'a'.repeat(64)
 const RUNTIME_IDENTITY = Object.freeze({
   activationAttestation: Object.freeze({ hash: '1'.repeat(64) }),
@@ -62,11 +62,11 @@ function controllerAt(clock, options = {}) {
     phases: productionPhaseBudgets(limits.wallMs),
     phaseBudgetFactory: productionPhaseBudgets,
     monotonicMs: () => clock.elapsedMs,
-    monotonicClockId: 'benchmark-boundary-fake-clock',
+    monotonicClockId: 'completion-boundary-fake-clock',
     wallNowMs: () => clock.elapsedMs,
     wallClock: () => new Date(clock.elapsedMs).toISOString(),
     bootId: null,
-    wallTimeUnbounded: options.wallTimeUnbounded !== false,
+    wallTimeUnbounded: options.wallTimeUnbounded === true,
     snapshot: options.snapshot,
   })
   if (!options.snapshot) {
@@ -89,7 +89,7 @@ function assertBudgetError(action, code, dimension) {
   })
 }
 
-test('benchmark no-timeout remains available at execution, work, 24h, 25h, and 48h boundaries', () => {
+test('required local completion remains available across execution, work, and elapsed wall targets', () => {
   const clock = { elapsedMs: 0 }
   const budget = controllerAt(clock)
   const boundaries = [
@@ -109,36 +109,41 @@ test('benchmark no-timeout remains available at execution, work, 24h, 25h, and 4
   for (const elapsedMs of boundaries) {
     clock.elapsedMs = elapsedMs
     for (const view of [{ forExecution: true }, { forWork: true }, {}]) {
-      const status = budget.assertAvailable(view)
+      const status = budget.assertAvailable({ ...view, requiredCompletion: true })
       assert.equal(status.ok, true, `elapsed=${elapsedMs} view=${JSON.stringify(view)}`)
-      assert.deepEqual(status.exhausted, [])
-      assert.equal(status.remaining.wallMs, Number.MAX_SAFE_INTEGER)
-      assert.equal(status.wallTimeUnbounded, true)
+      assert.equal(status.remaining.wallMs >= 0, true)
+      assert.equal(status.wallTimeUnbounded, false)
     }
-    assert.equal(budget.assertExternalWriteAllowed({ operationId: `write-${elapsedMs}` }).allowed, true)
+    if (elapsedMs < DAY_MS) {
+      assert.equal(budget.assertExternalWriteAllowed({ operationId: `write-${elapsedMs}` }).allowed, true)
+    } else {
+      assert.throws(
+        () => budget.assertExternalWriteAllowed({ operationId: `write-${elapsedMs}` }),
+        error => error.code === 'EXTERNAL_WRITE_DEADLINE_EXPIRED',
+      )
+    }
   }
 
   assert.equal(
     budget.accountingCeilings({ retries: 2, costMicrounits: 10 }).wallMilliseconds,
-    Number.MAX_SAFE_INTEGER,
+    DAY_MS,
   )
 })
 
-test('benchmark runtime bypasses elapsed phase convergence and hard-stop decisions at 48h', () => {
+test('required phase work records elapsed targets and continues without an ambient bypass', () => {
   const clock = { elapsedMs: 0 }
   const budget = controllerAt(clock)
   budget.startPhase('EXECUTION_BUILD')
   clock.elapsedMs = 48 * HOUR_MS
-  assert.equal(budget.supervisorDecision('EXECUTION_BUILD').action, 'STOP_PHASE')
+  assert.equal(budget.supervisorDecision('EXECUTION_BUILD').action, 'STOP_ACTIVATION')
 
   const runtime = Object.create(CodexSupervisorRuntime.prototype)
-  runtime.options = { baseEnvironment: BENCHMARK_ENVIRONMENT }
+  runtime.options = { baseEnvironment: AMBIENT_MEASUREMENT_ENVIRONMENT }
   runtime.budget = budget
   runtime.route = 'DIRECT'
-  assert.deepEqual(runtime._enforceBudgetPhase('EXECUTION_BUILD'), {
-    action: 'CONTINUE',
-    reason: 'authenticated benchmark time policy is unbounded',
-  })
+  const decision = runtime._enforceBudgetPhase('EXECUTION_BUILD', { requiredCompletion: true })
+  assert.equal(decision.completionCanContinue, true)
+  assert.equal(decision.completionTargetOverrun, true)
 })
 
 test('normal wall limits still stop at the exact execution, work, deadline, and external-write boundaries', () => {
@@ -161,7 +166,7 @@ test('normal wall limits still stop at the exact execution, work, deadline, and 
   )
 })
 
-test('benchmark no-timeout preserves token, session, and launch ceilings', () => {
+test('ambient measurement variables cannot change token, session, or launch ceilings', () => {
   const tokenClock = { elapsedMs: 48 * HOUR_MS }
   const tokenBudget = controllerAt(tokenClock, {
     limits: { wallMs: DAY_MS, tokens: 2, sessions: 3, launches: 3 },
@@ -186,25 +191,17 @@ test('benchmark no-timeout preserves token, session, and launch ceilings', () =>
   assertBudgetError(() => launchBudget.recordLaunch(), 'BUDGET_EXHAUSTED', 'LAUNCHES')
 })
 
-test('benchmark resume admits an expired persisted deadline and retains useful work at 48h', () => {
+test('resume admits an expired persisted deadline for local work but denies external writes', () => {
   const clock = { elapsedMs: 25 * HOUR_MS }
   const initial = controllerAt(clock)
   const snapshot = initial.snapshot()
   clock.elapsedMs = 48 * HOUR_MS
   const restored = controllerAt(clock, { snapshot })
-  assert.equal(restored.assertAvailable({ forExecution: true }).ok, true)
-  assert.equal(restored.assertExternalWriteAllowed({ operationId: 'resumed-write' }).allowed, true)
-
-  const runtime = Object.create(CodexSupervisorRuntime.prototype)
-  runtime.options = {
-    baseEnvironment: BENCHMARK_ENVIRONMENT,
-    resumeState: { deadline: deadline() },
-  }
-  runtime.activation = { generation: 2 }
-  runtime.settings = { deadline: null }
-  runtime.now = () => clock.elapsedMs
-  runtime.budget = restored
-  assert.deepEqual(runtime._admitTaskDeadline(), { valid: true, deadline: deadline() })
+  assert.equal(restored.assertAvailable({ forExecution: true, requiredCompletion: true }).ok, true)
+  assert.throws(
+    () => restored.assertExternalWriteAllowed({ operationId: 'resumed-write' }),
+    error => error.code === 'EXTERNAL_WRITE_DEADLINE_EXPIRED',
+  )
 
   const boundedRuntime = Object.create(CodexSupervisorRuntime.prototype)
   boundedRuntime.options = { baseEnvironment: {}, resumeState: { deadline: deadline() } }
@@ -212,25 +209,32 @@ test('benchmark resume admits an expired persisted deadline and retains useful w
   boundedRuntime.settings = { deadline: null }
   boundedRuntime.now = () => clock.elapsedMs
   boundedRuntime.budget = controllerAt(clock, { snapshot, wallTimeUnbounded: false })
-  assert.equal(boundedRuntime._admitTaskDeadline().code, 'RESUME_DEADLINE_EXPIRED')
+  assert.deepEqual(boundedRuntime._admitTaskDeadline(), {
+    valid: true,
+    deadline: deadline(),
+    convergenceRequired: true,
+    completionCanContinue: true,
+    completionTargetOverrun: ['WALL'],
+    reason: 'persisted resume deadline elapsed; bounded local recovery and completion remain required',
+  })
 })
 
-test('benchmark runtime and launcher capabilities remain valid beyond 48h while normal lifetimes stay bounded', () => {
+test('runtime capability expiry preserves one live controller but rejects restart and generation replay', () => {
   const issuedAtMs = Date.parse('2026-08-25T00:00:00.000Z')
   const clock = { now: issuedAtMs }
-  const benchmarkAuthority = new RuntimeCapabilityAuthority({
+  const authorityWithAmbientVariable = new RuntimeCapabilityAuthority({
     ...RUNTIME_IDENTITY,
-    environment: BENCHMARK_ENVIRONMENT,
+    environment: AMBIENT_MEASUREMENT_ENVIRONMENT,
     now: () => clock.now,
   })
-  const issue = authority => authority.issue({
+  const issue = (authority, expiresAtMs = issuedAtMs + 72 * HOUR_MS) => authority.issue({
     providerCapabilities: PROVIDER_CAPABILITIES,
     evidenceHashes: ['5'.repeat(64)],
     cliVersion: 'codex-cli benchmark-boundary-fixture',
     allowedRoutes: Object.keys(ROUTE_CAPABILITY_EFFECTS),
     allowedEffects: [...new Set(Object.values(ROUTE_CAPABILITY_EFFECTS).flat())],
     routeEffects: ROUTE_CAPABILITY_EFFECTS,
-    expiresAtMs: issuedAtMs + DAY_MS,
+    expiresAtMs,
   })
   const expected = receipt => ({
     runId: RUNTIME_IDENTITY.runId,
@@ -243,11 +247,13 @@ test('benchmark runtime and launcher capabilities remain valid beyond 48h while 
     requiredCapabilities: receipt.capabilitySet,
   })
 
-  const benchmarkReceipt = issue(benchmarkAuthority)
+  const benchmarkReceipt = issue(authorityWithAmbientVariable)
   clock.now = issuedAtMs + 48 * HOUR_MS
-  assert.equal(benchmarkAuthority.verify(benchmarkReceipt, expected(benchmarkReceipt)).verified, true)
-  assert.ok(Date.parse(benchmarkReceipt.expiresAt) > issuedAtMs + 48 * HOUR_MS)
-  assert.ok(runtimeCapabilityExpiryMs(issuedAtMs + DAY_MS, issuedAtMs, BENCHMARK_ENVIRONMENT) > issuedAtMs + 48 * HOUR_MS)
+  assert.equal(authorityWithAmbientVariable.verify(benchmarkReceipt, expected(benchmarkReceipt)).verified, true)
+  assert.equal(Date.parse(benchmarkReceipt.expiresAt), issuedAtMs + 72 * HOUR_MS)
+  assert.equal(runtimeCapabilityExpiryMs(
+    issuedAtMs + 72 * HOUR_MS, issuedAtMs, AMBIENT_MEASUREMENT_ENVIRONMENT,
+  ), issuedAtMs + 72 * HOUR_MS)
 
   clock.now = issuedAtMs
   const normalAuthority = new RuntimeCapabilityAuthority({
@@ -255,44 +261,63 @@ test('benchmark runtime and launcher capabilities remain valid beyond 48h while 
     environment: {},
     now: () => clock.now,
   })
-  const normalReceipt = issue(normalAuthority)
+  const normalReceipt = issue(normalAuthority, issuedAtMs + 5 * 60 * 1000)
   clock.now = issuedAtMs + 5 * 60 * 1000
+  assert.equal(normalAuthority.verify(normalReceipt, {
+    ...expected(normalReceipt),
+    assignmentId: 'required-check-after-admission-expiry',
+  }).verified, true)
   assert.throws(
-    () => normalAuthority.verify(normalReceipt, expected(normalReceipt)),
+    () => normalAuthority.verify(JSON.parse(JSON.stringify(normalReceipt)), expected(normalReceipt)),
+    error => error.code === 'RUNTIME_CAPABILITY_INVALID',
+  )
+  const restartedAuthority = new RuntimeCapabilityAuthority({
+    ...RUNTIME_IDENTITY,
+    environment: {},
+    key: normalAuthority.key,
+    now: () => clock.now,
+  })
+  assert.throws(
+    () => restartedAuthority.verify(normalReceipt, expected(normalReceipt)),
+    error => error.code === 'RUNTIME_CAPABILITY_INVALID',
+  )
+  const resumedAuthority = new RuntimeCapabilityAuthority({
+    ...RUNTIME_IDENTITY,
+    generation: RUNTIME_IDENTITY.generation + 1,
+    environment: {},
+    now: () => clock.now,
+  })
+  assert.throws(
+    () => resumedAuthority.verify(normalReceipt, {
+      ...expected(normalReceipt),
+      generation: RUNTIME_IDENTITY.generation + 1,
+    }),
     error => error.code === 'RUNTIME_CAPABILITY_INVALID',
   )
 
   const now = new Date(issuedAtMs)
   assert.equal(activationCapabilityTtlSeconds(DAY_MS / 1000, now, {}), DAY_MS / 1000)
-  const benchmarkTtlSeconds = activationCapabilityTtlSeconds(DAY_MS / 1000, now, BENCHMARK_ENVIRONMENT)
-  assert.ok(now.getTime() + benchmarkTtlSeconds * 1000 > issuedAtMs + 48 * HOUR_MS)
+  const observedTtlSeconds = activationCapabilityTtlSeconds(
+    DAY_MS / 1000, now, AMBIENT_MEASUREMENT_ENVIRONMENT,
+  )
+  assert.equal(observedTtlSeconds, DAY_MS / 1000)
 })
 
-test('mission expiry and crash cleanup statuses cannot fabricate user cancellation', async () => {
+test('mission target expiry preserves bounded in-flight completion and cannot fabricate user cancellation', async () => {
   const runtime = Object.create(CodexSupervisorRuntime.prototype)
-  let drainedWith = null
   runtime.options = { baseEnvironment: {} }
   runtime.budget = { assertAvailable: () => ({ remaining: { wallMs: 1 } }) }
   runtime.scheduler = { dispose() {} }
-  runtime.processOwner = {
-    async cancelAll(options) { drainedWith = options },
-    async assertDrained() {},
-  }
-  runtime.timerApi = {
-    setTimeout(callback) {
-      queueMicrotask(callback)
-      return 1
-    },
-    clearTimeout() {},
-  }
   runtime.cancelled = false
 
-  await assert.rejects(
-    runtime._withinMissionDeadline(() => new Promise(() => {})),
-    error => error.code === 'MISSION_TIMEOUT',
-  )
+  let operationRan = false
+  const result = await runtime._withinMissionDeadline(async () => {
+    operationRan = true
+    return 'completed-result'
+  })
+  assert.equal(result, 'completed-result')
+  assert.equal(operationRan, true)
   assert.equal(runtime.cancelled, false)
-  assert.equal(drainedWith.terminalStatus, 'PARTIAL')
 
   const processOwner = Object.create(ProcessOwner.prototype)
   assert.equal(processOwner._statusFromExit({ terminalEnvelope: { status: 'LOST' } }), 'LOST')

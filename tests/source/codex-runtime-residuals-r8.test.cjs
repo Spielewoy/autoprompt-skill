@@ -66,11 +66,13 @@ test('RUN-018/022 arbitrary explicit fingerprints cannot reset equivalent retry 
 
 test('TRACE-006 late first product signal is enforced and reports the exact blocker', () => {
   const scheduler = new CentralScheduler({ route: 'DIRECT', runIdentity: { runId: 'runtime-residual-r8', generation: 1 } })
-  assert.throws(() => scheduler.recordFirstProductSignal({
+  const measurement = scheduler.recordFirstProductSignal({
     kind: 'PRODUCT_EDIT', elapsedMs: 360_001, evidenceHash: H('late'), reason: 'policy service denied the role',
-  }), error => error.code === 'FIRST_PRODUCT_SIGNAL_LATE' &&
-    error.details.firstProductSignal.reason === 'policy service denied the role')
+  })
+  assert.equal(measurement.withinCeiling, false)
+  assert.equal(measurement.reason, 'policy service denied the role')
   assert.equal(scheduler.getMetrics().economics.firstProductSignal.withinCeiling, false)
+  assert.equal(scheduler.getMetrics().economics.firstProductSignal.reason, 'policy service denied the role')
 })
 
 test('GATE selection rejects malformed null/object overlays without duplicate violations or crashes', () => {
@@ -101,7 +103,7 @@ test('LAYER-008 accepts each distinct scout correction exactly once', () => {
   ), error => error.code === 'SCOUT_CORRECTION_NOT_MERGED')
 })
 
-test('TRACE-013 representative role/policy admission is controller-validated without a model launch', async () => {
+test('representative role/policy admission is controller-attested without a model launch', async () => {
   const runtime = Object.create(CodexSupervisorRuntime.prototype)
   Object.assign(runtime, {
     representativePolicyProbe: null,
@@ -116,10 +118,10 @@ test('TRACE-013 representative role/policy admission is controller-validated wit
   })
   runtime.launchChild = async () => { throw new Error('controller policy validation must not launch a model') }
   assert.equal((await runtime._runRepresentativePolicyProbe()).verified, true)
-  assert.equal(runtime.diagnosticWorkerLaunches, 1)
+  assert.equal(runtime.diagnosticWorkerLaunches, 0)
 })
 
-test('RUN-037 resume reopens the exact durable representative probe instead of relaunching it', async () => {
+test('resume reopens the exact durable representative controller attestation instead of relaunching it', async () => {
   const workItemId = 'representative-role-policy-probe'
   const runId = 'runtime-residual-r8'
   const requestHash = H('request-envelope')
@@ -141,27 +143,20 @@ test('RUN-037 resume reopens the exact durable representative probe instead of r
     options: { runId },
   })
   let launches = 0
-  fresh.launchChild = async request => {
-    launches += 1
-    return {
-      schemaVersion: '2.0.0', reportType: 'result', runId,
-      assignmentId: request.workItemId, logicalRoleId: 'diagnostic-probe', physicalRoleId: physicalRole,
-      requestEnvelopeHash: requestHash, allAssignedItemsPass: true,
-      filesChanged: [], resourcesChanged: [], behaviorChanged: ['Representative policy is usable.'],
-      commands: [{ command: 'inspect representative policy', exitCode: 0 }],
-      successItems: [{ id: 'success-1', status: 'pass', evidenceIds: ['policy-inspection'] }],
-      remainingConcerns: [], findingIds: ['AP-TRACE-013'],
-      requestedTransition: {
-        event: 'WORK_ITEM_VERIFIED', reason: 'Representative policy passed.', invalidateEvidenceIds: [],
-      },
-    }
-  }
+  fresh.launchChild = async () => { launches += 1; throw new Error('controller attestation must not launch') }
   const first = await fresh._runRepresentativePolicyProbe()
   assert.equal(first.verified, true)
   assert.equal(launches, 0)
 
   const resultPath = `work/results/${H(workItemId)}.json`
-  assert.equal(stored.get(resultPath).generation, 1)
+  const attestation = stored.get(resultPath)
+  assert.equal(attestation.generation, 1)
+  assert.equal(attestation.kind, 'representative-policy-controller-attestation')
+  assert.deepEqual(attestation.claims, ['ROLE_SELECTION_ADMITTED', 'PROVIDER_ROLE_BOUND'])
+  assert.equal(Object.hasOwn(attestation, 'result'), false)
+  assert.equal(Object.hasOwn(attestation, 'commands'), false)
+  assert.equal(Object.hasOwn(attestation, 'findingIds'), false)
+  assert.doesNotMatch(JSON.stringify(attestation), /AP-(?:TRACE|DESIGN|RUN)-[0-9]{3}/u)
   const resumed = Object.create(CodexSupervisorRuntime.prototype)
   Object.assign(resumed, {
     representativePolicyProbe: null,
@@ -177,7 +172,7 @@ test('RUN-037 resume reopens the exact durable representative probe instead of r
   const recovered = await resumed._runRepresentativePolicyProbe()
   assert.equal(recovered.verified, true)
   assert.equal(recovered.recoveredFromGeneration, 1)
-  assert.equal(resumed.diagnosticWorkerLaunches, 1)
+  assert.equal(resumed.diagnosticWorkerLaunches, 0)
 
   const forged = { ...stored.get(resultPath), requestEnvelopeHash: H('foreign-request') }
   const denied = Object.create(CodexSupervisorRuntime.prototype)

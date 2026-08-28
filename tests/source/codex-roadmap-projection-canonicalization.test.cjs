@@ -12,11 +12,12 @@ const source = fs.readFileSync(PHASE_BUDGET, 'utf8')
 const local = new Module(PHASE_BUDGET, module)
 local.filename = PHASE_BUDGET
 local.paths = Module._nodeModulePaths(path.dirname(PHASE_BUDGET))
-local._compile(`${source}\nmodule.exports.__projectionPrivate = { rebuildRoadmapProjectionAuthorResult, roadmapProjectionScoutRoster, scoutCorrection }\n`, PHASE_BUDGET)
+local._compile(`${source}\nmodule.exports.__projectionPrivate = { rebuildRoadmapProjectionAuthorResult, roadmapProjectionScoutRoster, scoutCorrection, renderPlanArtifact }\n`, PHASE_BUDGET)
 const {
   rebuildRoadmapProjectionAuthorResult,
   roadmapProjectionScoutRoster,
   scoutCorrection,
+  renderPlanArtifact,
 } = local.exports.__projectionPrivate
 
 const durableRepairResult = Object.freeze({
@@ -167,7 +168,7 @@ test('live ROADMAP writer and verifier consume the canonical durable projection 
     /const projectionAuthorResult = route === 'ROADMAP' && authorResult\s+\? loadCanonicalRoadmapProjectionAuthorResult\(decision, authorResult, authorWorkItemId\)/u)
   assert.match(source, /renderPlanArtifact\(route, decision, projectionAuthorResult\)/u)
   assert.match(source,
-    /writeRoadmapProjectionReceipt\(decision, projectionAuthorResult, plan, authorWorkItemId\)/u)
+    /writeRoadmapProjectionReceipt\(\s*decision,\s*projectionAuthorResult,\s*plan,\s*authorWorkItemId,?\s*\)/u)
   assert.doesNotMatch(source,
     /writeRoadmapProjectionReceipt\(decision, authorResult, plan, authorWorkItemId\)/u)
   assert.match(source,
@@ -178,8 +179,34 @@ test('live ROADMAP writer and verifier consume the canonical durable projection 
     /rebuildRoadmapProjectionAuthorResult\(receipt\.authorResult, sourceResult, corrections\)/u)
 })
 
-test('ROADMAP recovery checkpoint cause IDs bind the activation capability generation', () => {
+test('ROADMAP recovery checkpoints bind expansion generation and exact append-only plan lineage', () => {
   assert.match(source, /causeId: `roadmap-ratio:\$\{generation\}:\$\{authorWorkItemId\}:\$\{planSha256\}`/u)
-  assert.match(source, /causeId: `plan-projection:\$\{generation\}:\$\{authorWorkItemId\}:\$\{hashText\(plan\)\}`/u)
-  assert.doesNotMatch(source, /causeId: `(?:roadmap-ratio|plan-projection):\$\{activation\.generation\}/u)
+  assert.match(source, /causeId: `plan-lineage:\$\{lineage\.lineageReceiptHash\}`/u)
+  assert.match(source, /previousCheckpointEntryHash: priorRecord\.entryHash/u)
+  assert.match(source, /projectionReceiptHash: projectionReceipt\.receiptHash/u)
+  assert.match(source, /artifactReceiptHash: artifactReceipt\.receiptHash/u)
+  assert.doesNotMatch(source, /causeId: `roadmap-ratio:\$\{activation\.generation\}/u)
+})
+
+test('ROADMAP projection renders the same canonical owner used for product execution', () => {
+  const plan = renderPlanArtifact('ROADMAP', {
+    route: 'ROADMAP',
+    requestedResult: 'Build the requested production result.',
+    usefulWorkerCount: 1,
+    successChecklist: ['The product result passes.'],
+    plannedChecks: ['Run the product acceptance check.'],
+    verificationObligations: [],
+    mutableResourceOwnership: [{
+      kind: 'directory', identity: 'outputs', owner: 'planning-specialist',
+      ownershipMode: 'single-owner',
+    }],
+    risks: [], missingInformation: [],
+    independentCheckingPlan: {
+      checkerCount: 1, responsibilities: ['Check the product result independently.'],
+      nonOverlapReason: 'One independent product oracle is sufficient.',
+    },
+  }, durableRepairResult)
+
+  assert.match(plan, /- worker-1: directory:outputs \(single-owner\)/u)
+  assert.doesNotMatch(plan, /planning-specialist/u)
 })

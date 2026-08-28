@@ -13,6 +13,7 @@ const WORKFLOW = path.join(ROOT, 'agents', 'codex', 'workflow')
 const {
   EventLog,
   atomicCreateJson,
+  atomicWriteJson,
   fsyncDirectory,
   readChecksummedJson,
   sha256,
@@ -315,26 +316,30 @@ test('runtime state admits every named admission/evolution case and rejects ille
   )
 })
 
-test('planning inconclusive retry durably records and returns to its RUN_WORK origin', t => {
+test('planning inconclusive retry binds planHash without replacing the product candidate', t => {
   const harness = stateHarness(t)
   const { capability, store } = harness
   const candidateHash = digest('roadmap-plan-candidate')
-  const transitionProduction = (eventId, nextState, checkerId, nextReadyWorkIds = []) => applyProductionRuntimeTransition({
+  const transitionProduction = (
+    eventId, nextState, checkerId, nextReadyWorkIds = [], details = {},
+  ) => applyProductionRuntimeTransition({
     stateStore: store, capability, budgetController: { snapshot: () => null },
   }, {
     eventId, nextState,
     details: {
-      checkerId, candidateHash, retryAttempt: 1,
+      checkerId, planHash: candidateHash, retryAttempt: 1,
       checkerResultHash: digest(`${eventId}:${checkerId}`),
       nextReadyWorkIds,
+      ...details,
     },
   })
   advanceToWork(store)
   transitionProduction('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', 'roadmap-plan-check',
     ['roadmap-plan-check-runtime-retry'])
   assert.equal(store.load().state, 'CHECK_INCONCLUSIVE')
+  assert.equal(store.load().candidateHash, null)
   assert.deepEqual(store.load().retryState.inconclusiveChecker, {
-    checkerId: 'roadmap-plan-check', candidateHash,
+    checkerId: 'roadmap-plan-check', planHash: candidateHash,
     checkerResultHash: digest('CHECK_INCONCLUSIVE:roadmap-plan-check'),
     retryAttempt: 1, returnState: 'RUN_WORK',
     controllerReassessment: {
@@ -348,12 +353,94 @@ test('planning inconclusive retry durably records and returns to its RUN_WORK or
     () => transitionProduction('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', 'roadmap-plan-check-runtime-retry'),
     error => error.code === 'CHECK_RETRY_STATE_INVALID',
   )
-  transitionProduction('CHECK_BECAME_CONCLUSIVE', 'RUN_WORK', 'roadmap-plan-check-runtime-retry',
-    ['mission-coordination'])
+  const fallback = {
+    code: 'PLAN_CHECK_UNAVAILABLE', checkerId: 'roadmap-plan-check-runtime-retry',
+    planHash: candidateHash,
+    checkerResultHash: digest('CHECK_BECAME_CONCLUSIVE:roadmap-plan-check-runtime-retry'),
+    reason: 'the planning oracle remained unavailable',
+  }
+  transitionProduction(
+    'CHECK_BECAME_CONCLUSIVE', 'RUN_WORK', 'roadmap-plan-check-runtime-retry',
+    ['mission-coordination'], { planningFallback: fallback },
+  )
   assert.equal(store.load().state, 'RUN_WORK')
+  assert.equal(store.load().candidateHash, null)
   assert.equal(Object.hasOwn(store.load().retryState, 'inconclusiveChecker'), false)
+  assert.deepEqual(store.load().retryState.planningFallback, fallback)
   assert.deepEqual(harness.eventLog.readAll().at(-1).details.stateEvent.openIds,
     ['mission-coordination'])
+})
+
+test('corrected ROADMAP plan marker binds the rejected and replacement plans without consuming the product candidate', t => {
+  const harness = stateHarness(t)
+  const { capability, store } = harness
+  const checkedPlanHash = digest('roadmap-rejected-plan')
+  const correctedPlanHash = digest('roadmap-corrected-plan')
+  const checkerResultHash = digest('roadmap-plan-check-fail-result')
+  const planningFallback = {
+    code: 'PLAN_CORRECTED_PRODUCT_VERIFICATION_REQUIRED',
+    checkerId: 'roadmap-plan-check',
+    planHash: correctedPlanHash,
+    checkedPlanHash,
+    checkerResultHash,
+    reason: 'the same author corrected the concrete plan defect',
+  }
+  advanceToWork(store)
+  assert.throws(() => applyProductionRuntimeTransition({
+    stateStore: store, capability, budgetController: { snapshot: () => null },
+  }, {
+    eventId: 'TRANSIENT_RUNTIME', nextState: 'RUN_WORK',
+    details: {
+      planHash: correctedPlanHash,
+      checkerId: 'roadmap-plan-check',
+      checkerResultHash,
+      planningFallback: { ...planningFallback, checkedPlanHash: correctedPlanHash },
+      nextReadyWorkIds: ['work-1'],
+    },
+  }), error => error.code === 'CHECK_RETRY_STATE_INVALID')
+  applyProductionRuntimeTransition({
+    stateStore: store, capability, budgetController: { snapshot: () => null },
+  }, {
+    eventId: 'TRANSIENT_RUNTIME', nextState: 'RUN_WORK',
+    details: {
+      planHash: correctedPlanHash,
+      checkerId: 'roadmap-plan-check',
+      checkerResultHash,
+      planningFallback,
+      nextReadyWorkIds: ['work-1'],
+    },
+  })
+  assert.equal(store.load().state, 'RUN_WORK')
+  assert.equal(store.load().candidateHash, null)
+  assert.deepEqual(store.load().retryState.planningFallback, planningFallback)
+})
+
+test('sequential worker checkpoints do not advance the global candidate until the final work item', t => {
+  const { capability, store } = stateHarness(t)
+  const budgetController = { snapshot: () => null }
+  const firstCandidate = digest('sequential-worker-one')
+  const finalCandidate = digest('sequential-worker-two')
+  advanceToWork(store)
+  applyProductionRuntimeTransition({ stateStore: store, capability, budgetController }, {
+    eventId: 'WORK_ITEM_VERIFIED', nextState: 'ITEM_VERIFIED',
+    details: {
+      workItemId: 'work-1', resultHash: digest('work-one-result'),
+      candidateHash: firstCandidate, nextReadyWorkIds: ['work-2'],
+    },
+  })
+  assert.equal(store.load().candidateHash, null)
+  applyProductionRuntimeTransition({ stateStore: store, capability, budgetController }, {
+    eventId: 'MORE_WORK_READY', nextState: 'RUN_WORK',
+    details: { completedWorkItemId: 'work-1', nextReadyWorkIds: ['work-2'] },
+  })
+  applyProductionRuntimeTransition({ stateStore: store, capability, budgetController }, {
+    eventId: 'WORK_ITEM_VERIFIED', nextState: 'ITEM_VERIFIED',
+    details: {
+      workItemId: 'work-2', resultHash: digest('work-two-result'),
+      candidateHash: finalCandidate, nextReadyWorkIds: ['independent-check-1'],
+    },
+  })
+  assert.equal(store.load().candidateHash, finalCandidate)
 })
 
 test('every canonical T058 source admits an exact resumable frontier, including CHECK_INCONCLUSIVE', t => {
@@ -376,7 +463,7 @@ test('every canonical T058 source admits an exact resumable frontier, including 
     nextState: 'CHECK_INCONCLUSIVE',
     details: {
       checkerId: 'roadmap-plan-check',
-      candidateHash,
+      planHash: candidateHash,
       retryAttempt: 1,
       checkerResultHash: digest('paused-roadmap-plan-result'),
     },
@@ -1440,7 +1527,29 @@ test('non-resetting budgets use monotonic elapsed time and retain usage across r
   assert.equal(restored.snapshot().tokensUsed, 25)
 })
 
-test('budget resume uses boot evidence or conservative wall time and fails closed on rollback', () => {
+test('required completion records token, session, and launch target overruns while optional admission still collapses', () => {
+  const controller = new BudgetController({
+    limits: { wallMs: 1000, tokens: 1, sessions: 1, launches: 1 },
+    phases: {},
+  })
+  controller.consumeTokens(2, { requiredCompletion: true })
+  controller.recordLaunch({ requiredCompletion: true })
+  controller.recordLaunch({ requiredCompletion: true })
+  controller.startSession('required-one', { requiredCompletion: true })
+  controller.endSession('required-one', { status: 'DONE', evidenceHashes: [] })
+  controller.startSession('required-two', { requiredCompletion: true })
+  const status = controller.assertAvailable({ requiredCompletion: true })
+  assert.equal(status.ok, true)
+  assert.deepEqual(status.completionTargetOverrun.sort(), ['LAUNCHES', 'SESSIONS', 'TOKENS'])
+  assert.throws(() => controller.assertAvailable(), error => error.code === 'BUDGET_EXHAUSTED')
+  assert.throws(() => controller.recordLaunch(), error => error.code === 'BUDGET_EXHAUSTED')
+  assert.throws(
+    () => controller.startSession('optional-three'),
+    error => error.code === 'BUDGET_EXHAUSTED',
+  )
+})
+
+test('budget resume preserves local recovery across uncertain wall rollback and denies external writes', () => {
   let monotonic = 100
   let wallNow = 10000
   const original = new BudgetController({
@@ -1448,6 +1557,18 @@ test('budget resume uses boot evidence or conservative wall time and fails close
     monotonicMs: () => monotonic,
     wallNowMs: () => wallNow,
     bootId: 'boot-a',
+  })
+  original.bindDeadline({
+    deadline: {
+      absoluteDeadline: new Date(20000).toISOString(),
+      source: 'test',
+      verificationReservePercent: 10,
+      recoveryAndFinalizationReservePercent: 10,
+    },
+    wallMs: 1000,
+    verificationReserveMs: 100,
+    finalizationReserveMs: 100,
+    admittedAtMs: wallNow,
   })
   monotonic = 300
   wallNow = 10200
@@ -1461,15 +1582,121 @@ test('budget resume uses boot evidence or conservative wall time and fails close
     snapshot,
   })
   assert.equal(rebooted.elapsedMs(), 400)
-  assert.throws(
-    () => new BudgetController({
+
+  for (const [label, rolledBackWall] of [['small', snapshot.lastObservedWallMs - 1], ['large', 9000]]) {
+    const uncertain = new BudgetController({
       limits: { wallMs: 1000, tokens: 100, sessions: 2, launches: 2 },
       monotonicMs: () => 10,
-      wallNowMs: () => 9000,
+      wallNowMs: () => rolledBackWall,
       bootId: 'boot-b',
       snapshot,
-    }),
-    (error) => error.code === 'BUDGET_CLOCK_RESET',
+    })
+    assert.equal(uncertain.elapsedMs(), snapshot.consumedWallMs,
+      `${label} correction retains authenticated elapsed accounting`)
+    assert.deepEqual(uncertain.assertAvailable({ requiredCompletion: true }).exhausted, [])
+    assert.equal(uncertain.snapshot().lastObservedWallMs, snapshot.lastObservedWallMs)
+    assert.throws(
+      () => uncertain.assertExternalWriteAllowed({ operationId: `${label}-rollback-write` }),
+      (error) => error.code === 'EXTERNAL_WRITE_CLOCK_UNCERTAIN',
+    )
+  }
+
+  wallNow = snapshot.lastObservedWallMs - 1
+  const firstUncertainRestart = new BudgetController({
+    limits: { wallMs: 1000, tokens: 100, sessions: 2, launches: 2 },
+    monotonicMs: () => 10,
+    wallNowMs: () => wallNow,
+    bootId: 'boot-c',
+    snapshot,
+  })
+  const latchedSnapshot = firstUncertainRestart.snapshot()
+  assert.equal(latchedSnapshot.externalWriteClockUncertain, true)
+  wallNow = snapshot.lastObservedWallMs
+  const secondUncertainRestart = new BudgetController({
+    limits: { wallMs: 1000, tokens: 100, sessions: 2, launches: 2 },
+    monotonicMs: () => 11,
+    wallNowMs: () => wallNow,
+    bootId: 'boot-d',
+    snapshot: latchedSnapshot,
+  })
+  assert.throws(
+    () => secondUncertainRestart.assertExternalWriteAllowed({ operationId: 'second-restart-write' }),
+    error => error.code === 'EXTERNAL_WRITE_CLOCK_UNCERTAIN',
+  )
+
+  const legacySnapshot = { ...snapshot }
+  delete legacySnapshot.externalWriteClockUncertain
+  const legacyRestart = new BudgetController({
+    limits: { wallMs: 1000, tokens: 100, sessions: 2, launches: 2 },
+    monotonicMs: () => 12,
+    wallNowMs: () => wallNow,
+    bootId: 'boot-legacy',
+    snapshot: legacySnapshot,
+  })
+  assert.equal(legacyRestart.assertAvailable({ requiredCompletion: true }).ok, true)
+  assert.equal(legacyRestart.snapshot().externalWriteClockUncertain, true)
+  assert.throws(
+    () => legacyRestart.assertExternalWriteAllowed({ operationId: 'legacy-snapshot-write' }),
+    error => error.code === 'EXTERNAL_WRITE_CLOCK_UNCERTAIN',
+  )
+  assert.throws(() => new BudgetController({
+    limits: { wallMs: 1000, tokens: 100, sessions: 2, launches: 2 },
+    monotonicMs: () => 12,
+    wallNowMs: () => wallNow,
+    bootId: 'boot-tampered',
+    snapshot: { ...latchedSnapshot, externalWriteClockUncertain: 'false' },
+  }), error => error.code === 'BUDGET_SNAPSHOT_INVALID')
+
+  assert.throws(() => new BudgetController({
+    limits: { wallMs: 1000, tokens: 100, sessions: 2, launches: 2 },
+    monotonicMs: () => snapshot.checkpointMonotonicMs - 1,
+    wallNowMs: () => 10400,
+    bootId: 'boot-a',
+    snapshot,
+  }), (error) => error.code === 'BUDGET_CLOCK_RESET')
+})
+
+test('a checkpoint that observes wall rollback durably latches external-write denial after wall recovery', () => {
+  let wallNow = 10_000
+  const controller = new BudgetController({
+    limits: { wallMs: 1000, tokens: 100, sessions: 2, launches: 2 },
+    monotonicMs: () => 100,
+    wallNowMs: () => wallNow,
+    bootId: 'same-boot',
+  })
+  controller.bindDeadline({
+    deadline: {
+      absoluteDeadline: new Date(20_000).toISOString(),
+      source: 'test',
+      verificationReservePercent: 10,
+      recoveryAndFinalizationReservePercent: 10,
+    },
+    wallMs: 1000,
+    verificationReserveMs: 100,
+    finalizationReserveMs: 100,
+    admittedAtMs: wallNow,
+  })
+
+  wallNow = 9_000
+  const rollbackCheckpoint = controller.snapshot()
+  assert.equal(rollbackCheckpoint.externalWriteClockUncertain, true)
+  assert.equal(rollbackCheckpoint.lastObservedWallMs, 10_000)
+
+  wallNow = 10_001
+  assert.throws(
+    () => controller.assertExternalWriteAllowed({ operationId: 'same-process-wall-recovery' }),
+    error => error.code === 'EXTERNAL_WRITE_CLOCK_UNCERTAIN',
+  )
+  const restarted = new BudgetController({
+    limits: { wallMs: 1000, tokens: 100, sessions: 2, launches: 2 },
+    monotonicMs: () => 101,
+    wallNowMs: () => wallNow,
+    bootId: 'same-boot',
+    snapshot: rollbackCheckpoint,
+  })
+  assert.throws(
+    () => restarted.assertExternalWriteAllowed({ operationId: 'restart-after-wall-recovery' }),
+    error => error.code === 'EXTERNAL_WRITE_CLOCK_UNCERTAIN',
   )
 })
 
@@ -1581,6 +1808,15 @@ test('separate accounting authority hash-chains launch and streamed token deltas
   })
   assert.equal(usage.record.delta.elapsedMilliseconds, 25)
   assert.deepEqual(usage.record.cumulative.tokenUsage, { noncachedInput: 3, cachedInput: 4, output: 5, reasoning: 6 })
+  monotonic = 150
+  wallMs -= 1
+  const correctedClock = authority.checkpoint({
+    capability: harness.capability,
+    cause: { kind: 'CHECKPOINT', causeId: 'clock:correction', humanDescription: 'Persist local progress across an ordinary wall-clock correction.' },
+    delta: accountingDelta(),
+  })
+  assert.equal(correctedClock.record.occurredAt, usage.record.occurredAt)
+  assert.equal(correctedClock.record.delta.elapsedMilliseconds, 25)
   assertDraft202012Valid(
     path.join(ROOT, 'agents', 'contracts', 'schemas', 'accounting-record.schema.json'),
     authority.replay().records,
@@ -1591,7 +1827,7 @@ test('separate accounting authority hash-chains launch and streamed token deltas
   )
 
   fs.unlinkSync(paths.snapshotPath)
-  monotonic = 150
+  monotonic = 175
   wallMs += 25
   const reopened = makeAuthority()
   assert.equal(reopened.replay().recoveryRequired, true)
@@ -1646,7 +1882,93 @@ test('separate accounting authority hash-chains launch and streamed token deltas
     error.code === 'ACCOUNTING_RECOVERY_REQUIRED' && fs.existsSync(error.details.evidencePath))
   const tailRecovery = reopened.recoverCrashTail({ capability: harness.capability, truncateIncompleteTail: true })
   assert.equal(tailRecovery.recovered, true)
-  assert.equal(reopened.replay().records.length, 3)
+  assert.equal(reopened.replay().records.length, 4)
+})
+
+test('completion-target accounting crosses bounded launch/retry targets only with an explicit admitted cause', (t) => {
+  const run = (allowCompletionTargetOverrun) => {
+    const harness = stateHarness(t)
+    transition(harness.store, 'LOAD_SKILL')
+    const paths = {
+      runRecordRoot: harness.directory,
+      logPath: path.join(harness.directory, 'runtime', 'accounting.jsonl'),
+      snapshotPath: path.join(harness.directory, 'runtime', 'budget.json'),
+    }
+    const authority = new AccountingAuthority({
+      paths,
+      eventLog: harness.eventLog,
+      stateProvider: () => harness.store.load(),
+      capabilityVerifier: candidate => candidate === harness.capability ? {
+        runId: 'run-0001', activationId: 'activation-001', missionHash: digest('mission'),
+        nonce: 'nonce_123456789012', generation: 1, targetIdentity: binding().targetIdentity,
+      } : null,
+      ceilings: {
+        wallMilliseconds: 10000, totalTokens: 1000, sessions: 10,
+        launches: 1, retries: 1, costMicrounits: 10,
+        verificationReserveMilliseconds: 100, finalizationReserveMilliseconds: 100,
+      },
+      allowCompletionTargetOverrun,
+      monotonicMs: () => 100,
+      wallNowMs: () => Date.parse('2026-08-22T00:00:00.000Z'),
+      clock: () => '2026-08-22T00:00:00.000Z',
+      bootId: 'test-boot-cost-overrun',
+    })
+    return { authority, harness }
+  }
+  const strict = run(false)
+  assert.throws(() => strict.authority.checkpoint({
+    capability: strict.harness.capability,
+    cause: { kind: 'TOKEN_USAGE_RECORDED', causeId: 'strict:cost', humanDescription: 'Ordinary admission retains its finite economic ceiling.' },
+    delta: accountingDelta({ costMicrounits: 11 }),
+  }), error => error.code === 'BUDGET_EXHAUSTED' && error.details.field === 'costMicrounits')
+
+  const completion = run(true)
+  const accepted = completion.authority.checkpoint({
+    capability: completion.harness.capability,
+    cause: { kind: 'TOKEN_USAGE_RECORDED', causeId: 'completion:cost', humanDescription: 'Required completion records already-incurred economic usage.' },
+    delta: accountingDelta({ costMicrounits: 11 }),
+  })
+  assert.equal(accepted.record.cumulative.costMicrounits, 11)
+
+  for (const [index, kind] of ['LAUNCH', 'LAUNCH', 'RETRY', 'RETRY'].entries()) {
+    const requiredCompletion = true
+    const result = completion.authority.checkpoint({
+      capability: completion.harness.capability,
+      cause: {
+        kind,
+        causeId: `completion:${kind.toLowerCase()}:${index + 1}`,
+        humanDescription: 'Record one scheduler-admitted required graph identity.',
+        requiredCompletion,
+      },
+      delta: accountingDelta({ launches: 1, retries: kind === 'RETRY' ? 1 : 0 }),
+      requiredCompletion,
+    })
+    assert.equal(result.record.cause.requiredCompletion, true)
+  }
+  assert.deepEqual(completion.authority.replay().cumulative, accountingDelta({
+    launches: 4,
+    retries: 2,
+    costMicrounits: 11,
+  }))
+  const preserved = completion.authority.checkpoint({
+    capability: completion.harness.capability,
+    cause: { kind: 'CHECKPOINT', causeId: 'completion:preserve', humanDescription: 'Preserve the authenticated completion overrun.' },
+    delta: accountingDelta(),
+  })
+  assert.equal(preserved.record.cumulative.launches, 4)
+  assert.throws(() => completion.authority.checkpoint({
+    capability: completion.harness.capability,
+    cause: { kind: 'RETRY', causeId: 'optional:retry', humanDescription: 'An unregistered retry cannot extend the graph.' },
+    delta: accountingDelta({ launches: 1, retries: 1 }),
+  }), error => error.code === 'BUDGET_EXHAUSTED' && ['launches', 'retries'].includes(error.details.field))
+  assert.throws(() => completion.authority.checkpoint({
+    capability: completion.harness.capability,
+    cause: {
+      kind: 'CHECKPOINT', causeId: 'forged:completion',
+      humanDescription: 'A non-launch cause cannot claim graph completion.', requiredCompletion: true,
+    },
+    delta: accountingDelta(), requiredCompletion: true,
+  }), error => error.code === 'ACCOUNTING_CAUSE_INVALID')
 })
 
 test('accounting restart rejects verification reserve drift before reusing resume evidence', (t) => {
@@ -1908,6 +2230,10 @@ test('recovery checkpoint authority binds scheduler, accounting, state, and cras
     route: 'LIGHT', phase: 'RUN_WORK', nextReadyWorkIds: ['work-2'], completedWorkIds: ['work-1'],
     usage: { output: 3 }, cursor: 2,
   })
+  // NTP/manual wall-clock correction must not turn a new authenticated local
+  // checkpoint into a task-fatal rollback. The authority records the prior
+  // durable high-water while preserving all state/accounting checks.
+  occurred = -60
   const second = authority.appendCheckpoint({
     ...checkpointInput, accountingCheckpoint: accounting.resumeCheckpoint(), scheduler: secondScheduler,
     recovery: { ...checkpointInput.recovery, frontier: { ...checkpointInput.recovery.frontier, acceptedResultIds: [secondScheduler.stateHash] } },
@@ -1915,6 +2241,8 @@ test('recovery checkpoint authority binds scheduler, accounting, state, and cras
   })
   assert.equal(second.record.sequence, 2)
   assert.equal(second.record.previousHash, first.record.entryHash)
+  assert.equal(second.record.occurredAt, first.record.occurredAt)
+  occurred = 2
   const goodLog = fs.readFileSync(paths.logPath, 'utf8')
   const goodSnapshot = fs.readFileSync(paths.snapshotPath, 'utf8')
   fs.writeFileSync(paths.snapshotPath, `${JSON.stringify(first.snapshot)}\n`)
@@ -1929,6 +2257,13 @@ test('recovery checkpoint authority binds scheduler, accounting, state, and cras
   }
   mutateLog((rows) => { rows[0].occurredAt = '2027-01-01T00:00:00.000Z' })
   assert.throws(() => authority.replay(), (error) => error.code === 'RECOVERY_CHECKPOINT_LOG_INVALID')
+  fs.writeFileSync(paths.logPath, goodLog)
+  mutateLog((rows) => {
+    rows[1].occurredAt = '2026-08-21T00:00:00.000Z'
+    rows[1].entryHash = recoveryCheckpointEntryHash(rows[1])
+  })
+  assert.throws(() => authority.replay(), (error) =>
+    error.code === 'RECOVERY_CHECKPOINT_ROLLBACK' && /wall time decreased/.test(error.message))
   fs.writeFileSync(paths.logPath, goodLog)
   mutateLog((rows) => { rows[1].sequence = 4; rows[1].entryHash = recoveryCheckpointEntryHash(rows[1]) })
   assert.throws(() => authority.replay(), (error) => error.code === 'RECOVERY_CHECKPOINT_LOG_INVALID')
@@ -2847,6 +3182,199 @@ test('process owner round-trips argv and drains descendants with bounded TERM/KI
   await owner.assertTargetDrained('target-key')
 })
 
+test('process owner bounds a non-settling adapter primitive without claiming drain', async t => {
+  const adapter = new FakeProcessAdapter()
+  const directory = temporary(t)
+  const owner = new ProcessOwner({
+    adapter,
+    registryPath: path.join(directory, 'hung-adapter-processes.json'),
+    allowTestAdapter: true,
+    adapterCallTimeoutMs: 20,
+    pollMs: 1,
+  })
+  const launched = await owner.launch({ executable: 'fake', argv: [], targetKey: 'hung-adapter' })
+  adapter.listOwned = async () => new Promise(() => {})
+  const started = Date.now()
+  await assert.rejects(
+    owner.cancelGroup(launched.ownershipId, { graceMs: 1, killMs: 1 }),
+    error => error.code === 'PROCESS_DRAIN_TIMEOUT' && error.details.method === 'listOwned',
+  )
+  assert.ok(Date.now() - started < 1000)
+  assert.equal(owner.listRecords()[0].status, 'RUNNING',
+    'unproved cleanup must retain the live durable ownership record')
+})
+
+test('a non-settling spawn retains its durable reservation for recovery', async t => {
+  const adapter = new FakeProcessAdapter()
+  adapter.spawnOwned = async () => new Promise(() => {})
+  const directory = temporary(t)
+  const owner = new ProcessOwner({
+    adapter,
+    registryPath: path.join(directory, 'hung-spawn-processes.json'),
+    allowTestAdapter: true,
+    adapterCallTimeoutMs: 20,
+    pollMs: 1,
+  })
+
+  await assert.rejects(
+    owner.launch({ executable: 'fake', argv: [], targetKey: 'hung-spawn' }),
+    error => error.code === 'PROCESS_DRAIN_TIMEOUT' && error.details.method === 'spawnOwned',
+  )
+  const [record] = owner.listRecords()
+  assert.equal(record.status, 'RESERVED')
+  assert.equal(record.terminal, null)
+  assert.deepEqual(owner.ownershipIdentities(), [{
+    kind: `${adapter.kind}-reservation`,
+    id: record.reservationIdentity,
+  }])
+})
+
+test('a spawn settling after its adapter watchdog is durably attached and drained', async t => {
+  const adapter = new FakeProcessAdapter()
+  adapter.spawnOwned = async spec => {
+    await new Promise(resolve => setTimeout(resolve, 40))
+    const rootPid = 742
+    const groupIdentity = `group-${rootPid}`
+    adapter.groups.set(groupIdentity, [rootPid, rootPid + 1])
+    adapter.reservations.set(spec.reservationId, { rootPid, groupIdentity })
+    return { rootPid, groupIdentity }
+  }
+  const directory = temporary(t)
+  const registryPath = path.join(directory, 'late-settlement-processes.json')
+  const owner = new ProcessOwner({
+    adapter,
+    registryPath,
+    allowTestAdapter: true,
+    adapterCallTimeoutMs: 10,
+    startupTimeoutMs: 200,
+    pollMs: 1,
+    randomId: () => 'late-settlement-ownership',
+  })
+
+  await assert.rejects(
+    owner.launch({ executable: 'fake', argv: [], targetKey: 'late-settlement-target' }),
+    error => error.code === 'PROCESS_DRAIN_TIMEOUT' && error.details.method === 'spawnOwned',
+  )
+  assert.equal(owner.listRecords()[0].status, 'RESERVED')
+  await waitFor(() => owner.listRecords()[0].status === 'FAILED', 2000)
+  const [record] = owner.listRecords()
+  assert.equal(record.groupIdentity, 'group-742')
+  assert.deepEqual(adapter.groups.get(record.groupIdentity), [])
+  assert.ok(adapter.signals.some(([identity, signal]) => identity === record.groupIdentity && signal === 'KILL'))
+  assert.equal(readChecksummedJson(registryPath).records[0].status, 'FAILED')
+  assert.equal(await owner.assertTargetDrained('late-settlement-target'), true)
+})
+
+test('an outcome-unknown assignment failure remains recoverable when READY appears later', async t => {
+  const adapter = new FakeProcessAdapter()
+  let published = null
+  adapter.spawnOwned = async spec => {
+    setTimeout(() => {
+      published = { rootPid: 811, groupIdentity: 'group-811' }
+      adapter.groups.set(published.groupIdentity, [published.rootPid, published.rootPid + 1])
+      adapter.reservations.set(spec.reservationId, published)
+    }, 25)
+    const error = new Error('helper did not publish READY before the controller polling deadline')
+    error.code = 'PROCESS_ASSIGNMENT_ESCAPED'
+    throw error
+  }
+  adapter.probeReservation = async record => published
+    ? { state: 'LIVE', ownership: published }
+    : { state: 'PENDING', evidence: { reservationId: record.reservationId } }
+  const owner = new ProcessOwner({
+    adapter,
+    registryPath: path.join(temporary(t), 'ready-after-error.json'),
+    allowTestAdapter: true,
+    startupTimeoutMs: 200,
+    pollMs: 1,
+    randomId: () => 'ready-after-error',
+  })
+
+  await assert.rejects(
+    owner.launch({ executable: 'fake', argv: [], targetKey: 'ready-after-error-target' }),
+    error => error.code === 'PROCESS_ASSIGNMENT_ESCAPED',
+  )
+  assert.equal(owner.listRecords()[0].status, 'RESERVED')
+  await owner.cancelAll({
+    graceMs: 0, killMs: 20, terminalStatus: 'FAILED', waitForPending: true,
+  })
+  assert.notEqual(published, null, 'terminal drain must wait through the durable reservation startup window')
+  assert.equal(owner.listRecords()[0].status, 'FAILED')
+  assert.deepEqual(adapter.groups.get(published.groupIdentity), [])
+})
+
+test('one pending reservation does not prevent cancellation of every known running group', async t => {
+  const adapter = new FakeProcessAdapter()
+  const normalSpawn = adapter.spawnOwned.bind(adapter)
+  adapter.spawnOwned = spec => spec.targetKey === 'pending-target'
+    ? new Promise(() => {})
+    : normalSpawn(spec)
+  const ids = ['known-running-a', 'known-running-b', 'pending-reservation']
+  const owner = new ProcessOwner({
+    adapter,
+    registryPath: path.join(temporary(t), 'aggregate-recovery.json'),
+    allowTestAdapter: true,
+    adapterCallTimeoutMs: 10,
+    startupTimeoutMs: 1000,
+    pollMs: 1,
+    randomId: () => ids.shift(),
+  })
+  const first = await owner.launch({ executable: 'fake', argv: [], targetKey: 'known-target' })
+  const second = await owner.launch({ executable: 'fake', argv: [], targetKey: 'known-target' })
+  await assert.rejects(
+    owner.launch({ executable: 'fake', argv: [], targetKey: 'pending-target' }),
+    error => error.code === 'PROCESS_DRAIN_TIMEOUT',
+  )
+
+  await assert.rejects(
+    owner.cancelAll({ graceMs: 0, killMs: 20 }),
+    error => error.code === 'OWNERSHIP_RECOVERY_PENDING' &&
+      error.details.reservations.some(item => item.ownershipId === 'pending-reservation'),
+  )
+  assert.deepEqual(adapter.groups.get(first.groupIdentity), [])
+  assert.deepEqual(adapter.groups.get(second.groupIdentity), [])
+  assert.deepEqual(owner.listRecords().map(record => [record.ownershipId, record.status]), [
+    ['known-running-a', 'CANCELLED'],
+    ['known-running-b', 'CANCELLED'],
+    ['pending-reservation', 'RESERVED'],
+  ])
+})
+
+test('aggregate drained assertions clean conclusive groups before reporting pending reservations', async t => {
+  for (const boundary of ['assertDrained', 'assertTargetDrained']) {
+    const adapter = new FakeProcessAdapter()
+    const normalSpawn = adapter.spawnOwned.bind(adapter)
+    adapter.spawnOwned = spec => spec.targetKey === 'pending-assertion-target'
+      ? new Promise(() => {})
+      : normalSpawn(spec)
+    const ids = [`${boundary}-running`, `${boundary}-pending`]
+    const owner = new ProcessOwner({
+      adapter,
+      registryPath: path.join(temporary(t), `${boundary}.json`),
+      allowTestAdapter: true,
+      adapterCallTimeoutMs: 10,
+      startupTimeoutMs: 1000,
+      pollMs: 1,
+      randomId: () => ids.shift(),
+    })
+    const running = await owner.launch({ executable: 'fake', argv: [], targetKey: 'assertion-target' })
+    await assert.rejects(
+      owner.launch({ executable: 'fake', argv: [], targetKey: 'pending-assertion-target' }),
+      error => error.code === 'PROCESS_DRAIN_TIMEOUT',
+    )
+    await assert.rejects(
+      boundary === 'assertDrained'
+        ? owner.assertDrained()
+        : owner.assertTargetDrained('assertion-target'),
+      error => error.code === 'OWNERSHIP_RECOVERY_PENDING',
+    )
+    assert.deepEqual(adapter.groups.get(running.groupIdentity), [],
+      `${boundary} must drain conclusive running ownership before returning the aggregate blocker`)
+    assert.equal(owner.listRecords().find(record => record.ownershipId === `${boundary}-running`).status, 'LOST')
+    assert.equal(owner.listRecords().find(record => record.ownershipId === `${boundary}-pending`).status, 'RESERVED')
+  }
+})
+
 test('process owner finalizes conclusively drained groups but rejects live identity reuse', async t => {
   const directory = temporary(t)
   const drainedAdapter = new FakeProcessAdapter()
@@ -2962,6 +3490,164 @@ test('AP-RUN-032 process and cleanup registries bind activation generation and m
   }).load(), (error) => error.code === 'CLEANUP_CONTROL_BINDING_MISMATCH')
 })
 
+test('process registry restore rejects duplicate and adapter-foreign durable identities before mutation', async t => {
+  const directory = temporary(t)
+  const duplicatePath = path.join(directory, 'duplicate-processes.json')
+  const duplicateAdapter = new FakeProcessAdapter()
+  const ids = ['duplicate-one', 'duplicate-two']
+  const duplicateOwner = new ProcessOwner({
+    adapter: duplicateAdapter,
+    registryPath: duplicatePath,
+    allowTestAdapter: true,
+    randomId: () => ids.shift(),
+  })
+  await duplicateOwner.launch({ executable: 'fake', argv: [], targetKey: 'duplicate-target' })
+  await duplicateOwner.launch({ executable: 'fake', argv: [], targetKey: 'duplicate-target' })
+  const { checksum: ignoredDuplicateChecksum, ...duplicateRegistry } = readChecksummedJson(duplicatePath)
+  duplicateRegistry.records[1].ownershipId = duplicateRegistry.records[0].ownershipId
+  atomicWriteJson(duplicatePath, duplicateRegistry)
+  assert.throws(
+    () => new ProcessOwner({ adapter: duplicateAdapter, registryPath: duplicatePath, allowTestAdapter: true }),
+    error => error.code === 'PROCESS_REGISTRY_FAILURE' && /unique/.test(error.message),
+  )
+
+  const bindingPath = path.join(directory, 'binding-processes.json')
+  const bindingAdapter = new FakeProcessAdapter()
+  bindingAdapter.reservationIdentity = reservationId => `test-reservation:${reservationId}`
+  bindingAdapter.prepareReservation = input => ({
+    reservationId: input.reservationId,
+    reservationIdentity: input.reservationIdentity,
+    startupDeadlineAt: input.startupDeadlineAt,
+    targetKey: input.targetKey,
+  })
+  const bindingOwner = new ProcessOwner({
+    adapter: bindingAdapter,
+    registryPath: bindingPath,
+    allowTestAdapter: true,
+    randomId: () => 'bound-ownership',
+  })
+  await bindingOwner.launch({ executable: 'fake', argv: [], targetKey: 'binding-target' })
+  const { checksum: ignoredBindingChecksum, ...bindingRegistry } = readChecksummedJson(bindingPath)
+  const foreignIdentityRegistry = structuredClone(bindingRegistry)
+  foreignIdentityRegistry.records[0].reservationIdentity = 'test-reservation:foreign'
+  atomicWriteJson(bindingPath, foreignIdentityRegistry)
+  assert.throws(
+    () => new ProcessOwner({ adapter: bindingAdapter, registryPath: bindingPath, allowTestAdapter: true }),
+    error => error.code === 'PROCESS_REGISTRY_FAILURE' && /adapter-derived origin/.test(error.message),
+  )
+  const foreignBindingRegistry = structuredClone(bindingRegistry)
+  foreignBindingRegistry.records[0].reservationBinding.targetKey = 'foreign-binding-target'
+  atomicWriteJson(bindingPath, foreignBindingRegistry)
+  assert.throws(
+    () => new ProcessOwner({ adapter: bindingAdapter, registryPath: bindingPath, allowTestAdapter: true }),
+    error => error.code === 'PROCESS_REGISTRY_FAILURE' && /adapter-derived binding/.test(error.message),
+  )
+})
+
+test('launch rejects runtime identity aliases before overwrite and attach rejects a reused physical identity', async t => {
+  const directory = temporary(t)
+  const sessionAdapter = new FakeProcessAdapter()
+  const sessionOwnershipIds = ['same-generation-session-one', 'same-generation-session-two']
+  const sessionOwner = new ProcessOwner({
+    adapter: sessionAdapter,
+    registryPath: path.join(directory, 'session-alias.json'),
+    allowTestAdapter: true,
+    randomId: () => sessionOwnershipIds.shift(),
+  })
+  const terminalSession = await sessionOwner.launch({
+    executable: 'fake', argv: [], targetKey: 'session-target',
+    reservationId: 'same-generation-reservation-one', sessionId: 'generation-1:probe',
+  })
+  await sessionOwner.cancelGroup(terminalSession.ownershipId, {
+    graceMs: 0, killMs: 0, terminalStatus: 'DONE',
+  })
+  await assert.rejects(
+    sessionOwner.launch({
+      executable: 'fake', argv: [], targetKey: 'session-target',
+      reservationId: 'same-generation-reservation-two', sessionId: 'generation-1:probe',
+    }),
+    error => error.code === 'LAUNCH_SPEC_INVALID' && /globally unique/.test(error.message),
+  )
+  assert.equal(sessionAdapter.launches.length, 1,
+    'a terminal launch cannot surrender its same-generation session identity to another spawn')
+
+  const ownershipAdapter = new FakeProcessAdapter()
+  const ownershipOwner = new ProcessOwner({
+    adapter: ownershipAdapter,
+    registryPath: path.join(directory, 'ownership-alias.json'),
+    allowTestAdapter: true,
+    randomId: () => 'same-ownership',
+  })
+  const first = await ownershipOwner.launch({
+    executable: 'fake', argv: [], targetKey: 'alias-target', reservationId: 'reservation-one',
+  })
+  await assert.rejects(
+    ownershipOwner.launch({
+      executable: 'fake', argv: [], targetKey: 'alias-target', reservationId: 'reservation-two',
+    }),
+    error => error.code === 'LAUNCH_SPEC_INVALID' && /globally unique/.test(error.message),
+  )
+  assert.equal(ownershipAdapter.launches.length, 1, 'identity collision must fail before a second spawn')
+  assert.equal(ownershipOwner.listRecords()[0].groupIdentity, first.groupIdentity)
+  assert.deepEqual(ownershipAdapter.groups.get(first.groupIdentity), [first.rootPid, first.rootPid + 1000, first.rootPid + 2000])
+
+  const reservationAdapter = new FakeProcessAdapter()
+  reservationAdapter.reservationIdentity = () => 'same-derived-reservation'
+  const reservationIds = ['derived-owner-one', 'derived-owner-two']
+  const reservationOwner = new ProcessOwner({
+    adapter: reservationAdapter,
+    registryPath: path.join(directory, 'reservation-alias.json'),
+    allowTestAdapter: true,
+    randomId: () => reservationIds.shift(),
+  })
+  await reservationOwner.launch({
+    executable: 'fake', argv: [], targetKey: 'derived-target', reservationId: 'derived-one',
+  })
+  await assert.rejects(
+    reservationOwner.launch({
+      executable: 'fake', argv: [], targetKey: 'derived-target', reservationId: 'derived-two',
+    }),
+    error => error.code === 'LAUNCH_SPEC_INVALID' && /globally unique/.test(error.message),
+  )
+  assert.equal(reservationAdapter.launches.length, 1,
+    'adapter-derived reservation collision must fail before a second spawn')
+
+  const attachAdapter = new FakeProcessAdapter()
+  const normalSpawn = attachAdapter.spawnOwned.bind(attachAdapter)
+  let priorIdentity = null
+  let aliasPhysicalIdentity = false
+  attachAdapter.spawnOwned = async spec => aliasPhysicalIdentity
+    ? (() => {
+        attachAdapter.launches.push(spec)
+        attachAdapter.groups.set(priorIdentity.groupIdentity, [priorIdentity.rootPid])
+        attachAdapter.reservations.set(spec.reservationId, priorIdentity)
+        return { ...priorIdentity }
+      })()
+    : normalSpawn(spec)
+  const attachIds = ['attach-owner-one', 'attach-owner-two']
+  const attachOwner = new ProcessOwner({
+    adapter: attachAdapter,
+    registryPath: path.join(directory, 'physical-alias.json'),
+    allowTestAdapter: true,
+    randomId: () => attachIds.shift(),
+    pollMs: 1,
+  })
+  const attachedFirst = await attachOwner.launch({ executable: 'fake', argv: [], targetKey: 'physical-target' })
+  priorIdentity = { rootPid: attachedFirst.rootPid, groupIdentity: attachedFirst.groupIdentity }
+  await attachOwner.cancelGroup(attachedFirst.ownershipId, { graceMs: 0, killMs: 1 })
+  aliasPhysicalIdentity = true
+  await assert.rejects(
+    attachOwner.launch({ executable: 'fake', argv: [], targetKey: 'physical-target' }),
+    error => error.code === 'OWNERSHIP_COMMIT_FATAL' && /aliases another durable/.test(error.details.registryCause),
+  )
+  assert.deepEqual(attachAdapter.groups.get(priorIdentity.groupIdentity), [],
+    'a spawned physical alias must be killed before the failed attach is returned')
+  assert.equal(attachOwner.listRecords().find(record => record.ownershipId === 'attach-owner-one').status,
+    'CANCELLED')
+  assert.equal(attachOwner.listRecords().find(record => record.ownershipId === 'attach-owner-two').status,
+    'RESERVED')
+})
+
 test('normal root exit still drains late descendants and keeps the typed terminal envelope', async (t) => {
   const adapter = new FakeProcessAdapter()
   const directory = temporary(t)
@@ -3044,6 +3730,51 @@ test('POSIX launch uses only the pre-attested exact environment and resolves no 
   }), (error) => error.code === 'LAUNCH_SPEC_INVALID')
 })
 
+test('POSIX signal authority binds one exact reservation environment entry and rejects numeric process-group reuse', async () => {
+  let environmentEntry = 'AUTOPROMPT_OWNERSHIP_RESERVATION=unrelated-reservation\0'
+  const fsImpl = {
+    readdirSync: () => ['999'],
+    readFileSync(filename) {
+      if (filename.endsWith('/environ')) {
+        return Buffer.from(environmentEntry)
+      }
+      if (filename.endsWith('/stat')) return '999 (fixture) S 1 123 123 0 0 0'
+      throw new Error(`unexpected POSIX fixture read: ${filename}`)
+    },
+  }
+  const adapter = createPosixProcessAdapter({
+    platform: 'linux',
+    fsImpl,
+    execFileSync: () => '999 123\n',
+  })
+  const identity = {
+    reservationId: 'owned-reservation',
+    rootPid: 123,
+    groupIdentity: 'posix-pgid:123',
+  }
+  assert.equal(await adapter.verifyOwnership(identity), false,
+    'matching numeric PGID alone must not authorize a signal after PID reuse')
+  environmentEntry = 'XAUTOPROMPT_OWNERSHIP_RESERVATION=owned-reservation\0'
+  assert.equal(await adapter.verifyOwnership(identity), false,
+    'a reservation marker embedded in a longer environment name is not authority')
+  environmentEntry = 'DECOY=AUTOPROMPT_OWNERSHIP_RESERVATION=owned-reservation\0'
+  assert.equal(await adapter.verifyOwnership(identity), false,
+    'a reservation marker embedded in another environment value is not authority')
+  environmentEntry = 'FIRST=value\0AUTOPROMPT_OWNERSHIP_RESERVATION=owned-reservation\0LAST=value\0'
+  assert.equal(await adapter.verifyOwnership(identity), true,
+    'one exact NUL-delimited live reservation marker restores signal authority')
+})
+
+test('POSIX group liveness excludes unreaped zombies without hiding executable members', async () => {
+  const adapter = createPosixProcessAdapter({
+    platform: 'linux',
+    execFileSync: (executable, argv) => argv.includes('pid=,pgid=,stat=')
+      ? '701 321 Z\n702 321 S\n703 999 R\n'
+      : '',
+  })
+  assert.deepEqual(await adapter.listOwned('posix-pgid:321'), [702])
+})
+
 test('late descendants cannot race drain confirmation and terminal null reservations are not enumerated', async (t) => {
   const directory = temporary(t)
   const adapter = new FakeProcessAdapter()
@@ -3082,15 +3813,21 @@ test('late descendants cannot race drain confirmation and terminal null reservat
     assert.notEqual(identity, null)
     return []
   }
+  let failureWall = Date.parse('2026-08-28T00:00:00.000Z')
   const failedOwner = new ProcessOwner({
     adapter: noIdentityAdapter,
     registryPath: path.join(directory, 'failed.json'),
     allowTestAdapter: true,
     randomId: () => 'pre-identity-failure',
+    startupTimeoutMs: 2,
+    wallClock: () => new Date(failureWall).toISOString(),
   })
   await assert.rejects(failedOwner.launch({ executable: 'fake', argv: [], targetKey: 'target-key' }), /pre-identity failure/)
-  assert.equal(failedOwner.listRecords()[0].status, 'FAILED')
+  assert.equal(failedOwner.listRecords()[0].status, 'RESERVED',
+    'adapter rejection is outcome-unknown until recovery proves no physical spawn')
+  failureWall += 3
   assert.equal(await failedOwner.assertDrained(), true)
+  assert.equal(failedOwner.listRecords()[0].status, 'FAILED')
 })
 
 test('durable process ownership reloads after supervisor restart and unsupported adapters refuse before spawn', async (t) => {
@@ -3232,7 +3969,7 @@ test('reservation recovery keeps pending startup nonterminal until live attachme
   })
   await assert.rejects(
     blockedRestart.assertTargetDrained('target-key'),
-    (error) => error.code === 'OWNERSHIP_RECOVERY_PENDING',
+    (error) => error.code === 'OWNED_PROCESSES_LIVE',
   )
   assert.equal(blockedRestart.listRecords()[0].status, 'RESERVED')
 })

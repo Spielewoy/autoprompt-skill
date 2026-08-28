@@ -43,7 +43,7 @@ test('AP-GATE-010 live checker plan executes its exact distinct seat count', () 
   } }), error => error.code === 'INDEPENDENT_CHECKING_PLAN_INVALID')
 })
 
-test('AP-GATE-024 a triggered depth gate launches and requires the production specialist result', async () => {
+test('AP-GATE-024 wrong-layer evidence becomes a deterministic product-worker directive', async () => {
   const launches = []
   const recipe = { runtimeGatePlan: { triggers: { depthProber: {
     required: true, reasons: ['wrong-layer-evidence'],
@@ -52,12 +52,17 @@ test('AP-GATE-024 a triggered depth gate launches and requires the production sp
     recipe, likelyAreas: ['src/runtime.js'],
     launch: async request => { launches.push(request); return { code: 'PASS' } },
   })
-  assert.deepEqual(passed, { depthProbe: 'PASS', workItemId: 'conditional-depth-prober' })
-  assert.equal(launches[0].logicalRole, 'diagnostic-probe')
-  assert.equal(launches[0].purpose, 'diagnostic')
-  await assert.rejects(() => executePreProductionRuntimeGates({
-    recipe, launch: async () => ({ code: 'FAIL' }),
-  }), error => error.code === 'DEPTH_PROBE_REQUIRED')
+  assert.equal(passed.depthProbe, 'PRODUCT_WORKER_REQUIRED')
+  assert.equal(passed.directive.kind, 'controller-depth-directive')
+  assert.deepEqual(passed.directive.reasons, ['wrong-layer-evidence'])
+  assert.equal(passed.directive.disposition, 'PRODUCT_WORKER_INSPECT_IMPLEMENT_VERIFY')
+  assert.match(passed.directive.evidenceHash, /^[a-f0-9]{64}$/u)
+  assert.deepEqual(launches, [], 'the compatibility launch callback is never reached')
+  assert.deepEqual(await executePreProductionRuntimeGates({
+    recipe: { runtimeGatePlan: { triggers: { depthProber: { required: false, reasons: [] } } } },
+    launch: async request => { launches.push(request); return { code: 'PASS' } },
+  }), { depthProbe: 'SKIPPED' })
+  assert.deepEqual(launches, [], 'an untriggered depth condition reserves and launches nothing')
 })
 
 test('AP-TRACE-014 every path named in brief prose must exist inside the target', t => {
@@ -194,7 +199,7 @@ test('AP-COST-009 real request steering replays immutable semantic asks for ROAD
   }).roadmapAskToUserAskRatio, 1)
 })
 
-test('AP-DESIGN-045 steering invalidates and redispatches a retained L1 on the rebound pointer', async t => {
+test('AP-DESIGN-045 steering invalidates retained L1 and returns to L0 without a duplicate child', async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-r10-steer-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const requestDir = path.join(directory, 'request')
@@ -237,10 +242,14 @@ test('AP-DESIGN-045 steering invalidates and redispatches a retained L1 on the r
   assert.deepEqual(transitions.map(item => item.eventId), [
     'USER_UPDATE', 'REQUEST_STEERING_APPENDED', 'AFFECTED_RESULTS_INVALIDATED',
   ])
-  assert.equal(launched.length, 1)
-  assert.equal(launched[0].repairOf, 'mission-coordination')
-  assert.equal(launched[0].logicalRole, 'mission-coordinator')
-  assert.deepEqual(result.redispatchedRetainedL1Ids, [launched[0].workItemId])
+  assert.deepEqual(transitions.at(-1).details, {
+    requestEnvelopeHash: result.requestPointer.hash,
+    invalidatedRetainedL1Ids: ['mission-coordination'],
+    redispatchedRetainedL1Ids: [],
+  })
+  assert.deepEqual(launched, [], 'L0 must recompile the rebound request before any new child')
+  assert.equal(runtime.retainedL1Leases.size, 0)
+  assert.deepEqual(result.redispatchedRetainedL1Ids, [])
 })
 
 test('CAPABILITY_LOST without degraded transport returns typed refusal instead of clone(undefined)', () => {

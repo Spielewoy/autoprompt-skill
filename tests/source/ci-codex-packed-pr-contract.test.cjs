@@ -8,19 +8,22 @@ const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 
-const CODEX_CORE_SUITES = [
-  'tests/source/codex-activation-preflight-v2.test.cjs',
-  'tests/source/codex-explicit-activation-v2.test.cjs',
-  'tests/source/codex-recovery-checkpoint-v2.test.cjs',
-  'tests/source/codex-router-v2.test.cjs',
-  'tests/source/codex-run-record-v2.test.cjs',
-  'tests/source/codex-runtime-evidence-gates-r5.test.cjs',
-  'tests/source/codex-runtime-state-v2.test.cjs',
-  'tests/source/codex-scheduler-v2.test.cjs',
-  'tests/source/codex-supervisor-integration-v2.test.cjs',
-  'tests/source/codex-v2-conformance.test.cjs',
-  'tests/source/codex-v2-contracts.test.cjs',
-]
+const {
+  CODEX_SOURCE_TEST_OWNERS,
+  CODEX_SOURCE_TESTS_WIRED_ELSEWHERE,
+  discoverCodexSourceTests,
+} = require('../../scripts/run-codex-source-tests.cjs')
+
+const VERIFY_REACHABLE_TEST_SCRIPTS = Object.freeze([
+  'test:cli',
+  'test:providers',
+  'test:benchmark',
+  'test:lifecycle',
+])
+
+function literalOccurrences(source, value) {
+  return String(source).split(value).length - 1
+}
 
 function read(relative) {
   return fs.readFileSync(path.join(ROOT, relative), 'utf8')
@@ -52,7 +55,7 @@ test('AP-TEST-015 pull requests run the full packed Codex lifecycle on Linux and
   assert.match(packageJson.scripts['test:lifecycle'], /tests\/source\/packed-codex-lifecycle\.test\.cjs/)
 })
 
-test('benchmark and deterministic Codex core suites are each wired exactly once', () => {
+test('benchmark and every Codex source suite are each wired exactly once', () => {
   const packageJson = JSON.parse(read('package.json'))
   const workflow = read('.github/workflows/ci.yml')
   const benchmark = packageJson.scripts['test:benchmark']
@@ -61,11 +64,28 @@ test('benchmark and deterministic Codex core suites are each wired exactly once'
   assert.match(benchmark, /tests\/benchmarks\/autoprompt-benchmark\.test\.cjs/)
   assert.doesNotMatch(benchmark, /tests\/benchmarks\/autoprompt-benchmark\.cjs(?:\s|$)/)
   assert.doesNotMatch(benchmark, /test:codex-runtime-evidence|codex-runtime-evidence-gates-r5/)
+  assert.equal(core, 'node scripts/run-codex-source-tests.cjs')
+  const allCodexTests = discoverCodexSourceTests({ excludedTests: [] })
   assert.deepEqual(
-    [...core.matchAll(/tests\/source\/codex-[\w.-]+\.test\.cjs/g)].map(match => match[0]),
-    CODEX_CORE_SUITES,
+    allCodexTests,
+    [...discoverCodexSourceTests(), ...CODEX_SOURCE_TESTS_WIRED_ELSEWHERE].sort(),
   )
-  assert.equal(core.match(/codex-runtime-evidence-gates-r5\.test\.cjs/g)?.length, 1)
-  assert.equal(packageJson.scripts.verify.match(/npm run test:codex-core/g)?.length, 1)
+  assert.equal(new Set(discoverCodexSourceTests()).size, discoverCodexSourceTests().length)
+  assert.deepEqual(Object.keys(CODEX_SOURCE_TEST_OWNERS).sort(), CODEX_SOURCE_TESTS_WIRED_ELSEWHERE)
+  for (const [wiredElsewhere, owner] of Object.entries(CODEX_SOURCE_TEST_OWNERS)) {
+    assert.ok(VERIFY_REACHABLE_TEST_SCRIPTS.includes(owner), `${wiredElsewhere} has a verify-reachable owner`)
+    assert.equal(literalOccurrences(packageJson.scripts[owner], wiredElsewhere), 1,
+      `${wiredElsewhere} must be wired exactly once by ${owner}`)
+    for (const otherOwner of VERIFY_REACHABLE_TEST_SCRIPTS.filter(candidate => candidate !== owner)) {
+      assert.equal(literalOccurrences(packageJson.scripts[otherOwner], wiredElsewhere), 0,
+        `${wiredElsewhere} must not also be wired by ${otherOwner}`)
+    }
+  }
+  assert.equal(literalOccurrences(packageJson.scripts.test, 'npm run test:cli'), 1)
+  assert.equal(literalOccurrences(packageJson.scripts.test, 'npm run test:providers'), 1)
+  assert.equal(literalOccurrences(packageJson.scripts.test, 'npm run test:benchmark'), 1)
+  assert.equal(literalOccurrences(packageJson.scripts.verify, 'npm test'), 1)
+  assert.equal(literalOccurrences(packageJson.scripts.verify, 'npm run test:codex-core'), 1)
+  assert.equal(literalOccurrences(packageJson.scripts.verify, 'npm run test:lifecycle'), 1)
   assert.doesNotMatch(workflow, /run: npm run test:codex-runtime-evidence/)
 })

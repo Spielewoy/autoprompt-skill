@@ -10,7 +10,13 @@ const test = require('node:test')
 const settings = require('../../agents/codex/workflow/settings.js')
 const router = require('../../agents/codex/workflow/router.js')
 const decisions = require('../../agents/codex/workflow/route-decision.js')
+const phaseBudget = require('../../agents/codex/workflow/phase-budget.js')
+const {
+  CentralScheduler,
+  resolveSchedulerSettings,
+} = require('../../agents/codex/workflow/scheduler.js')
 const capturedDomain = require('../../agents/codex/workflow/captured-domain.js')
+const { validateJsonSchema } = require('../../agents/codex/workflow/json-schema-validator.js')
 const benchmarkEvidence = require('../../scripts/benchmark-evidence')
 
 const H = 'a'.repeat(64)
@@ -197,11 +203,16 @@ function decision(facts = routeFacts(), overrides = {}) {
     likely_areas: ['src/example.js'],
     risks_and_missing_information: [],
     workers: {
-      count: Math.max(1, facts.mutableResources.length),
+      count: 1,
       responsibilities: ['Own the assigned result and its declared resources.'],
-      non_overlap_reason: 'Each mutable resource has one recorded owner.',
+      non_overlap_reason: 'One worker owns the connected mutation boundary sequentially.',
     },
-    mutable_resource_ownership: ownershipFor(facts),
+    mutable_resource_ownership: facts.mutableResources.map(resource => ({
+      kind: resource.kind,
+      identity: resource.identity,
+      owner: 'worker-1',
+      ownership_mode: resource.ownershipMode,
+    })),
     chosen_route_reasons: [`Precedence order ${classified.precedence_order} selected ${route}.`],
     rejected_route_reasons: Object.fromEntries(
       router.ROUTES.filter(item => item !== route).map(item => [item, [`The frozen predicates do not select ${item}.`]]),
@@ -253,131 +264,79 @@ test('route decision preserves indexed and flag literals from the exact request'
   }).status, 'ROUTE_DECISION_INVALID')
 })
 
-test('HTML and sanitizer requests receive controller-named parser differential obligations', () => {
-  const routed = decision(routeFacts(), {
-    requested_result: 'Fix the HTML sanitizer so every XSS bypass is rejected.',
-  })
-  const security = routed.verificationObligations.find(item =>
-    item.id === 'security-parser-differentials')
-  assert.ok(security)
-  assert.deepEqual(security.cases.map(item => item.id), [
-    'allowed-canonical', 'alternate-encoding', 'namespace-confusion',
-    'malformed-reparse', 'mutation-after-filter', 'interaction-trigger',
-  ])
-  assert.equal(decisions.validateRouteDecision(routed).valid, true)
-
-  const weakReserved = {
-    id: 'security-parser-differentials', kind: 'invariant', statement: 'HTML renders.',
+test('typed verification obligations are preserved without task-keyword classifiers', () => {
+  const supplied = {
+    id: 'provider-authored-adversarial-matrix',
+    kind: 'invariant',
+    statement: 'The requested transformation preserves allowed inputs and rejects forbidden counterparts.',
     cases: [
-      { id: 'ok', phase: 'ordinary', polarity: 'must-hold', precondition: 'ordinary HTML', expectedObservation: 'it renders' },
-      { id: 'bad', phase: 'ordinary', polarity: 'must-not-hold', precondition: 'bad HTML', expectedObservation: 'it does not render' },
-      { id: 'edge', phase: 'boundary', polarity: 'must-hold', precondition: 'boundary HTML', expectedObservation: 'it renders' },
+      { id: 'allowed', phase: 'ordinary', polarity: 'must-hold', precondition: 'an allowed input', expectedObservation: 'the allowed input is preserved' },
+      { id: 'forbidden', phase: 'ordinary', polarity: 'must-not-hold', precondition: 'a forbidden counterpart', expectedObservation: 'the forbidden counterpart is absent' },
+      { id: 'boundary', phase: 'boundary', polarity: 'must-hold', precondition: 'the exact domain boundary', expectedObservation: 'the specified boundary behavior holds' },
     ],
   }
-  const reservedOverride = decision(routeFacts(), {
-    requested_result: 'Fix the HTML sanitizer so every XSS bypass is rejected.',
-    verification_obligations: [weakReserved],
-  })
-  assert.deepEqual(
-    reservedOverride.verificationObligations[0].cases.map(item => item.id),
-    security.cases.map(item => item.id),
-  )
-  const tamperedReserved = clone(reservedOverride)
-  tamperedReserved.verificationObligations = [weakReserved]
-  assert.equal(decisions.validateRouteDecision(tamperedReserved).valid, false)
-  const normalizedRecommendation = recommendation({ verificationObligations: [weakReserved] })
-  assert.deepEqual(
-    normalizedRecommendation.verificationObligations[0].cases.map(item => item.id),
-    security.cases.map(item => item.id),
-  )
-  const tamperedRecommendation = clone(normalizedRecommendation)
-  tamperedRecommendation.verificationObligations = [weakReserved]
-  assert.equal(decisions.validateRouteRecommendation(tamperedRecommendation).valid, false)
-  const missingReserved = clone(reservedOverride)
-  missingReserved.verificationObligations = missingReserved.verificationObligations
-    .filter(item => item.id !== 'security-parser-differentials')
-  assert.equal(decisions.validateRouteDecision(missingReserved).valid, false)
-
-  const synonym = decision(routeFacts(), {
-    requested_result: 'Fix the SVG parser so onclick cannot execute.',
-  })
-  assert.ok(synonym.verificationObligations.some(item =>
-    item.id === 'security-parser-differentials'))
-  assert.equal(decisions.validateRouteDecision(synonym).valid, true)
-})
-
-test('effective ordered equivalence requests receive immutable temporal and collision matrices', () => {
-  const exactRequest = 'References to the same underlying entity must produce the same token across transitively composing effective-dated subject merges and cross-tenant equivalences.'
-  const generic = {
-    id: 'generic-output', kind: 'invariant', statement: 'The output is produced.',
-    cases: [
-      { id: 'ok', phase: 'ordinary', polarity: 'must-hold', precondition: 'valid input', expectedObservation: 'output exists' },
-      { id: 'bad', phase: 'ordinary', polarity: 'must-not-hold', precondition: 'invalid input', expectedObservation: 'output is rejected' },
-      { id: 'edge', phase: 'boundary', polarity: 'must-hold', precondition: 'edge input', expectedObservation: 'output exists' },
-    ],
-  }
+  const request = 'Transform the supplied format and preserve its exact acceptance constraints.'
   const routed = decision(routeFacts(), {
-    requested_result: exactRequest,
-    verification_obligations: [generic],
+    requested_result: request,
+    verification_obligations: [supplied],
   })
-  assert.deepEqual(routed.verificationObligations.map(item => item.id), [
-    'generic-output', 'temporal-ordered-activation', 'identity-equivalence-collisions',
-  ])
-  const ordered = routed.verificationObligations.find(item =>
-    item.id === 'temporal-ordered-activation')
-  assert.equal(ordered.kind, 'ordered-activation')
-  assert.deepEqual(ordered.cases.map(item => [item.id, item.phase, item.polarity]), [
-    ['before-first-boundary', 'inactive', 'must-not-hold'],
-    ['at-first-boundary', 'boundary', 'must-hold'],
-    ['between-boundaries', 'intermediate', 'must-not-hold'],
-    ['at-next-boundary', 'boundary', 'must-hold'],
-    ['after-final-boundary', 'active', 'must-hold'],
-  ])
-  const collision = routed.verificationObligations.find(item =>
-    item.id === 'identity-equivalence-collisions')
-  assert.deepEqual(collision.cases.map(item => item.id), [
-    'equivalent-consistency', 'distinct-noncollision',
-    'transitive-equivalence', 'ambiguous-collision',
-  ])
+  assert.deepEqual(routed.verificationObligations, [supplied])
   assert.equal(decisions.validateRouteDecision(routed).valid, true)
   assert.equal(decisions.evaluateL0Decision({
     startedAtMs: 1, submittedAtMs: 2, nowMs: 2,
-    decision: routed, requestText: exactRequest,
+    decision: routed, requestText: request,
   }).status, 'ROUTE_DECIDED')
 
-  for (const requiredId of ['temporal-ordered-activation', 'identity-equivalence-collisions']) {
-    const missing = clone(routed)
-    missing.verificationObligations = missing.verificationObligations
-      .filter(item => item.id !== requiredId)
-    assert.equal(decisions.validateRouteDecision(missing).valid, false, requiredId)
-  }
-  const tampered = clone(routed)
-  tampered.verificationObligations.find(item =>
-    item.id === 'identity-equivalence-collisions').cases[1].expectedObservation = 'collisions are acceptable'
-  assert.equal(decisions.validateRouteDecision(tampered).valid, false)
+  assert.equal(routed.verificationObligations[0].cases.some(item =>
+    item.polarity === 'must-not-hold'), true)
+  assert.equal(routed.verificationObligations[0].cases.some(item =>
+    item.phase === 'boundary'), true)
 
-  const summarized = clone(routed)
-  summarized.requestedResult = 'Build an anonymizer.'
-  summarized.verificationObligations = summarized.verificationObligations
-    .filter(item => item.id !== 'temporal-ordered-activation')
+  const keywordHeavy = decision(routeFacts(), {
+    requested_result: 'Implement the requested transformation with exact collision safety.',
+  })
+  assert.deepEqual(keywordHeavy.verificationObligations.map(item => item.id), ['obligation-1'])
+  assert.deepEqual(keywordHeavy.verificationObligations[0].cases, [{
+    id: 'expected', phase: 'ordinary', polarity: 'must-hold',
+    precondition: 'the named check is executed',
+    expectedObservation: keywordHeavy.plannedChecks[0],
+  }])
+  assert.equal(decisions.validateRouteDecision(keywordHeavy).valid, true)
+})
+
+test('provider-authored activation matrices remain generic controller input', () => {
+  const activation = {
+    id: 'provider-authored-ordered-activation',
+    kind: 'ordered-activation',
+    statement: 'Each declared transition becomes active only at its own ordered boundary.',
+    cases: [
+      { id: 'inactive', phase: 'inactive', polarity: 'must-not-hold', precondition: 'before the first boundary', expectedObservation: 'no transition is active' },
+      { id: 'first-boundary', phase: 'boundary', polarity: 'must-hold', precondition: 'at the first boundary', expectedObservation: 'only the first transition is active' },
+      { id: 'intermediate', phase: 'intermediate', polarity: 'must-not-hold', precondition: 'between boundaries', expectedObservation: 'later transitions remain inactive' },
+      { id: 'next-boundary', phase: 'boundary', polarity: 'must-hold', precondition: 'at the next boundary', expectedObservation: 'the next transition becomes active' },
+      { id: 'active', phase: 'active', polarity: 'must-hold', precondition: 'after every boundary', expectedObservation: 'all declared transitions are active' },
+    ],
+  }
+  const request = 'Apply a sequence of conditional state changes.'
+  const routed = decision(routeFacts(), {
+    requested_result: request,
+    verification_obligations: [activation],
+  })
+  assert.deepEqual(routed.verificationObligations, [activation])
+  assert.equal(decisions.validateRouteDecision(routed).valid, true)
   assert.equal(decisions.evaluateL0Decision({
     startedAtMs: 1, submittedAtMs: 2, nowMs: 2,
-    decision: summarized, requestText: exactRequest,
-  }).status, 'ROUTE_DECISION_INVALID')
+    decision: routed, requestText: request,
+  }).status, 'ROUTE_DECIDED')
 
-  const singleBoundary = decision(routeFacts(), {
-    requested_result: 'Enable the retention rule at its effective date.',
-  })
-  assert.ok(singleBoundary.verificationObligations.some(item =>
-    item.id === 'temporal-activation-boundaries' && item.kind === 'activation'))
-  assert.equal(singleBoundary.verificationObligations.some(item =>
-    item.id === 'temporal-ordered-activation'), false)
-
-  const ordinaryAdjectives = decision(routeFacts(), {
-    requested_result: 'Build an effective anonymizer with a clear implementation.',
-  })
-  assert.equal(ordinaryAdjectives.verificationObligations.some(item =>
-    item.id.startsWith('temporal-') || item.id === 'identity-equivalence-collisions'), false)
+  const incomplete = clone(routed)
+  incomplete.verificationObligations[0].cases =
+    incomplete.verificationObligations[0].cases.filter(item => item.phase !== 'intermediate')
+  assert.equal(decisions.validateRouteDecision(incomplete).valid, false)
+  const missingInactive = clone(routed)
+  missingInactive.verificationObligations[0].cases =
+    missingInactive.verificationObligations[0].cases.filter(item => item.phase !== 'inactive')
+  assert.equal(decisions.validateRouteDecision(missingInactive).valid, false)
 })
 
 test('captured incident domains enforce exact certificates, ordering, provenance, hidden boundaries, datum rulings, and isolated promotion joins', () => {
@@ -595,7 +554,7 @@ test('resolved settings validation keeps numeric concurrency and explicit unsupp
   assert.equal(settings.validateResolvedSettings(tooWide).valid, false)
 })
 
-test('one read-only route analyst has a two-minute ceiling, zero children, and no relaunch', () => {
+test('one read-only route analyst has a two-minute target, zero children, and no relaunch', () => {
   const admission = decisions.createRouteAnalystAdmission({ run_id: 'run-1', request_envelope_hash: H })
   assert.equal(decisions.validateRouteAnalystAdmission(admission).valid, true)
   assert.equal(admission.session_count, 1)
@@ -611,6 +570,16 @@ test('one read-only route analyst has a two-minute ceiling, zero children, and n
     environment: { AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' },
   })
   assert.equal(benchmarkLate.status, 'ROUTE_ANALYST_COMPLETE')
+  assert.equal(benchmarkLate.convergence.required, true)
+  const remaining = decisions.remainingL0DecisionBudgetMs({
+    startedAtMs: 0, nowMs: 0,
+    environment: { AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' },
+  })
+  assert.equal(remaining, decisions.L0_DECISION_CONVERGENCE_WATCHDOG_MS)
+  assert.equal(Number.isFinite(remaining), true)
+  assert.equal(decisions.remainingL0DecisionBudgetMs({
+    startedAtMs: 0, nowMs: 0, environment: {},
+  }), remaining)
 })
 
 test('route recommendation remains advisory and NEEDS_USER is pre-work, never a route', () => {
@@ -622,6 +591,152 @@ test('route recommendation remains advisory and NEEDS_USER is pre-work, never a 
   assert.equal(decisions.validateRecommendation(waiting).valid, true)
   assert.equal(decisions.evaluateRouteAnalystResult({ elapsed_ms: 10, recommendation: waiting }).status, 'WAITING_USER')
   assert.equal(router.ROUTES.includes('NEEDS_USER'), false)
+})
+
+test('ordinary one-case LIGHT recommendations remain canonical without invented categories', () => {
+  const raw = recommendation({
+    recommendedRoute: 'LIGHT',
+    reasonsForDirect: ['The reversible technical uncertainty requires a short plan before writing.'],
+    reasonsForLight: ['The connected local change fits a short plan and has reversible technical uncertainty.'],
+    reasonsForRoadmap: ['No dependent work groups or multi-system integration are present.'],
+  })
+  raw.verificationObligations = [{
+    id: 'provider-focused-check',
+    kind: 'invariant',
+    statement: 'The focused behavior check passes.',
+    cases: [{
+      id: 'positive', phase: 'ordinary', polarity: 'must-hold',
+      precondition: 'the requested behavior is exercised',
+      expectedObservation: 'the focused behavior check passes',
+    }],
+  }]
+  assert.equal(validateJsonSchema(decisions.ROUTE_RECOMMENDATION_SCHEMA, raw).valid, true)
+  assert.equal(decisions.validateRecommendation(raw).valid, true)
+  const before = clone(raw)
+  const evaluated = decisions.evaluateRouteAnalystResult({ elapsedMs: 120001, recommendation: raw })
+  assert.equal(evaluated.status, 'ROUTE_ANALYST_COMPLETE')
+  assert.equal(evaluated.canonicalized, false)
+  assert.equal(evaluated.convergence.required, true)
+  assert.equal(decisions.validateRecommendation(evaluated.recommendation).valid, true)
+  assert.deepEqual(evaluated.recommendation.verificationObligations[0].cases, raw.verificationObligations[0].cases)
+  assert.deepEqual(raw, before, 'normalization must not mutate the receipt-bound provider value')
+
+  const compiled = decisions.compileAutomaticRouteDecision({
+    recommendation: raw,
+    requestedResult: 'Apply the connected local change.',
+    requestEnvelopeHash: H,
+    providerCapabilities: {
+      sameContextContinuation: true,
+      isolatedChecking: true,
+      stableChildIdentity: true,
+    },
+    budget: { remaining: { wallMs: 60 * 60 * 1000 } },
+    nowMs: 1,
+  })
+  assert.equal(compiled.route, 'LIGHT')
+  assert.equal(decisions.validateRouteDecision(compiled).valid, true)
+})
+
+test('provider obligation canonicalization uses transport defaults instead of invented semantics', () => {
+  const raw = recommendation()
+  raw.verificationObligations = [{
+    id: 'provider-approximation', kind: 'invariant', statement: 'Provider approximation.',
+    cases: [
+      { id: 'same', phase: 'ordinary', polarity: 'must-hold', precondition: 'allowed', expectedObservation: 'allowed' },
+      { id: 'same', phase: 'ordinary', polarity: 'must-not-hold', precondition: 'forbidden', expectedObservation: 'forbidden is absent' },
+    ],
+  }]
+  assert.equal(validateJsonSchema(decisions.ROUTE_RECOMMENDATION_SCHEMA, raw).valid, true)
+  const normalized = decisions.canonicalizeProviderRecommendation(raw)
+  assert.equal(normalized.valid, true)
+  const obligation = normalized.recommendation.verificationObligations[0]
+  assert.equal(obligation.id, 'obligation-1')
+  assert.equal(obligation.statement, raw.howSuccessCanBeChecked[0])
+  assert.equal(new Set(obligation.cases.map(item => item.id)).size, obligation.cases.length)
+  assert.deepEqual(obligation.cases, [{
+    id: 'expected', phase: 'ordinary', polarity: 'must-hold',
+    precondition: 'the named check is executed',
+    expectedObservation: raw.howSuccessCanBeChecked[0],
+  }])
+  assert.equal(normalized.recommendation.verificationObligations.some(item =>
+    item.id === 'provider-approximation'), false)
+
+  const semanticallyMalformed = recommendation({
+    reasonsForLight: ['   '],
+  })
+  assert.equal(validateJsonSchema(decisions.ROUTE_RECOMMENDATION_SCHEMA, semanticallyMalformed).valid, true)
+  const fallback = decisions.evaluateRouteAnalystResult({
+    elapsedMs: 120001, recommendation: semanticallyMalformed,
+    requestEnvelopeHash: H, transcriptHash: H2, evidenceIndexHash: H3,
+  })
+  assert.equal(fallback.status, 'ROUTE_ANALYST_MALFORMED')
+  assert.equal(fallback.l0_may_decide, true)
+  assert.equal(fallback.recommendation_state.outcome, 'MALFORMED')
+})
+
+test('route reasons are language-agnostic while known empty boilerplate stays rejected', () => {
+  const multilingual = recommendation({
+    reasonsForDirect: ['局所的な変更だけです。'],
+    reasonsForLight: ['短い設計判断が残る。'],
+    reasonsForRoadmap: ['依存する作業群が二つある。'],
+  })
+  assert.equal(decisions.validateRecommendation(multilingual).valid, true)
+  const terse = recommendation({
+    reasonsForDirect: ['one file'],
+    reasonsForLight: ['ordering unresolved'],
+    reasonsForRoadmap: ['two owners'],
+  })
+  assert.equal(decisions.validateRecommendation(terse).valid, true)
+  const boilerplate = recommendation({ reasonsForLight: ['not appropriate'] })
+  assert.equal(decisions.validateRecommendation(boilerplate).valid, true)
+  const decided = decision(routeFacts(), {
+    rejected_route_reasons: {
+      LIGHT: ['not appropriate'],
+      ROADMAP: ['two owners'],
+    },
+  })
+  assert.equal(decisions.validateRouteDecision(decided).valid, false)
+})
+
+test('provider checker recommendations canonically downgrade prose C2 and preserve bound typed C2', () => {
+  const prose = recommendation()
+  prose.routeFactProposal.minimumCheckerCount = 2
+  prose.routeFactProposal.namedDistinctResponsibilities = [
+    'Say hello to the result.',
+    'Say goodbye to the result.',
+  ]
+  const downgraded = decisions.canonicalizeProviderRecommendation(prose)
+  assert.equal(downgraded.valid, true)
+  assert.equal(downgraded.canonicalized, true)
+  assert.equal(downgraded.recommendation.routeFactProposal.minimumCheckerCount, 1)
+  assert.deepEqual(downgraded.recommendation.routeFactProposal.namedDistinctResponsibilities, [])
+
+  const typed = recommendation()
+  typed.routeFactProposal.minimumCheckerCount = 2
+  typed.routeFactProposal.availableCheckKinds = [
+    'command:contract-suite',
+    'oracle:external-observation',
+  ]
+  typed.routeFactProposal.namedDistinctResponsibilities = [
+    '[command:contract-suite] Run the bound contract suite.',
+    '[oracle:external-observation] Query the independent observation.',
+  ]
+  const admitted = decisions.canonicalizeProviderRecommendation(typed)
+  assert.equal(admitted.valid, true)
+  assert.equal(admitted.recommendation.routeFactProposal.minimumCheckerCount, 2)
+  const compiled = decisions.compileAutomaticRouteDecision({
+    recommendation: typed,
+    requestedResult: 'Return the requested result.',
+    requestEnvelopeHash: H,
+    providerCapabilities: {
+      sameContextContinuation: true,
+      isolatedChecking: true,
+      stableChildIdentity: true,
+    },
+    budget: { remaining: { wallMs: 60 * 60 * 1000 } },
+    nowMs: 1,
+  })
+  assert.equal(compiled.independentCheckingPlan.checkerCount, 2)
 })
 
 test('automatic route decision is deterministically compiled without a second model-authored L0 turn', () => {
@@ -648,6 +763,118 @@ test('automatic route decision is deterministically compiled without a second mo
     providerCapabilities: { isolatedChecking: true, stableChildIdentity: true },
     budget: { remaining: { wallMs: 60 * 60 * 1000 } },
   }), error => error.code === 'ROUTE_DECISION_INVALID' && /contradicts/u.test(error.message))
+})
+
+test('automatic analyst prose cannot promote activation-target files or databases into external authority', () => {
+  const externalAdvisory = recommendation()
+  Object.assign(externalAdvisory.routeFactProposal, {
+    requestedEffect: 'external-operation',
+    mutableResources: [
+      { kind: 'database', identity: 'state/local.sqlite', shared: false, ownershipMode: 'single-owner' },
+      { kind: 'file', identity: 'output/result.json', shared: false, ownershipMode: 'single-owner' },
+    ],
+    sideEffects: ['database-write', 'external-write', 'money-or-quota'],
+    externality: 'external-write',
+    thirdPartyImpact: 'material',
+  })
+  const compiled = decisions.compileAutomaticRouteDecision({
+    recommendation: externalAdvisory,
+    requestedResult: 'Update the contained target state and result.',
+    requestEnvelopeHash: H,
+    targetIdentity: 'activation-target',
+    providerCapabilities: {
+      sameContextContinuation: true,
+      isolatedChecking: true,
+      stableChildIdentity: true,
+    },
+    budget: { remaining: { wallMs: 60 * 60 * 1000 } },
+    nowMs: 1,
+  })
+  assert.equal(compiled.route, 'DIRECT')
+  assert.equal(compiled.normalizedRouteFacts.requestedEffect, 'mutate')
+  assert.equal(compiled.normalizedRouteFacts.externality, 'local-only')
+  assert.equal(compiled.normalizedRouteFacts.thirdPartyImpact, 'none')
+  assert.deepEqual(compiled.normalizedRouteFacts.mutableResources, [{
+    kind: 'directory', identity: 'activation-target', shared: false, ownershipMode: 'single-owner',
+  }])
+  assert.deepEqual(compiled.normalizedRouteFacts.sideEffects, ['database-write', 'deliverable-write'])
+  assert.equal(compiled.usefulWorkerCount, 1)
+  assert.equal(compiled.gateSelection.baseWorkType, 'mechanical-change')
+  assert.equal(compiled.gateSelection.riskOverlays.includes('external-write-or-cost'), false)
+  assert.equal(decisions.validateRouteDecision(compiled).valid, true)
+})
+
+test('missing or malformed route-model output compiles one generic local completion fallback', () => {
+  const exactRequest = 'Create result.txt with the requested result.'
+  const compiled = decisions.compileConservativeCompletionDecision({
+    requestedResult: exactRequest,
+    requestEnvelopeHash: H,
+    targetIdentity: '.',
+    providerCapabilities: {
+      sameContextContinuation: true,
+      isolatedChecking: true,
+      stableChildIdentity: true,
+    },
+    budget: { remaining: { wallMs: 0 } },
+    nowMs: 1,
+  })
+  assert.equal(compiled.route, 'DIRECT')
+  assert.equal(compiled.routeSource, 'automatic')
+  assert.equal(compiled.usefulWorkerCount, 1)
+  assert.equal(compiled.requestedResult, exactRequest)
+  assert.deepEqual(compiled.verificationObligations.map(item => item.id), ['obligation-1'])
+  assert.equal(decisions.validateRouteDecision(compiled).valid, true)
+  assert.equal(decisions.evaluateL0Decision({
+    startedAtMs: 0,
+    submittedAtMs: decisions.L0_DECISION_MAX_DURATION_MS + 1,
+    nowMs: decisions.L0_DECISION_MAX_DURATION_MS + 1,
+    decision: compiled,
+    requestText: exactRequest,
+  }).status, 'ROUTE_DECIDED')
+})
+
+test('automatic ROADMAP stays sequential unless work items prove disjoint mutable ownership', () => {
+  const providerCapabilities = {
+    sameContextContinuation: true, isolatedChecking: true, stableChildIdentity: true,
+  }
+  const compile = routeRecommendation => decisions.compileAutomaticRouteDecision({
+    recommendation: routeRecommendation,
+    requestedResult: 'Complete the multi-system change.', requestEnvelopeHash: H,
+    providerCapabilities, budget: { remaining: { wallMs: 60 * 60 * 1000 } }, nowMs: 1,
+  })
+  const coupled = recommendation({
+    recommendedRoute: 'ROADMAP',
+    reasonsForDirect: ['Dependent writable groups require integration rather than a bounded direct edit.'],
+    reasonsForLight: ['The dependent groups exceed one connected short-plan change.'],
+    reasonsForRoadmap: ['Two dependent writable groups and multi-system integration select ROADMAP.'],
+    independentWorkItems: ['Update api.', 'Update web.'],
+  })
+  const coupledDecision = compile(coupled)
+  assert.equal(coupledDecision.route, 'ROADMAP')
+  assert.equal(coupledDecision.usefulWorkerCount, 1)
+  assert.equal(new Set(coupledDecision.mutableResourceOwnership.map(item => item.owner)).size, 1)
+
+  const disjoint = clone(coupled)
+  disjoint.independentWorkItems = ['Implement src/api.js.', 'Implement src/web.js.']
+  disjoint.dependencies = []
+  Object.assign(disjoint.routeFactProposal, {
+    dependencyShape: 'independent-edits', dependentWorkGroupCount: 0,
+    integrationOwnerRequired: false, architectureImpact: 'multi-system',
+    mutableResources: [
+      { kind: 'file', identity: 'src/api.js', shared: false, ownershipMode: 'single-owner' },
+      { kind: 'file', identity: 'src/web.js', shared: false, ownershipMode: 'single-owner' },
+    ],
+  })
+  const disjointDecision = compile(disjoint)
+  assert.equal(disjointDecision.route, 'ROADMAP')
+  assert.equal(disjointDecision.usefulWorkerCount, 2)
+  assert.deepEqual(disjointDecision.mutableResourceOwnership.map(item => item.owner), ['worker-1', 'worker-2'])
+
+  const shared = clone(disjoint)
+  shared.routeFactProposal.mutableResources[1].shared = true
+  const sharedDecision = compile(shared)
+  assert.equal(sharedDecision.usefulWorkerCount, 1)
+  assert.equal(new Set(sharedDecision.mutableResourceOwnership.map(item => item.owner)).size, 1)
 })
 
 test('runtime schema and classifier fingerprint are compiled from frozen routes.json', () => {
@@ -738,7 +965,10 @@ test('normalization consumes every canonical fact and fingerprints exact normali
 
 test('checker-count schema bounds fail closed before route classification', () => {
   const boundary = routeFacts({
-    riskAndIndependentCheckFloor: { minimumCheckerCount: 2 },
+    riskAndIndependentCheckFloor: {
+      minimumCheckerCount: 2,
+      namedDistinctResponsibilities: ['Run the observable-result check.', 'Audit the immutable evidence record.'],
+    },
   })
   assert.equal(router.validateRouteFacts(boundary).valid, true)
   assert.equal(router.classifyRoute(boundary).status, 'DECIDED')
@@ -817,7 +1047,10 @@ test('destructive external effects select staged work and retain all safety obli
     },
     riskAndIndependentCheckFloor: {
       level: 'staged-high-impact', minimumCheckerCount: 2,
-      namedDistinctResponsibilities: ['Check destructive external authority and receipts.'],
+      namedDistinctResponsibilities: [
+        'Check destructive external authority and receipts.',
+        'Reconcile the external result against the immutable audit record.',
+      ],
     },
   }))
   assert.equal(result.route, 'ROADMAP')
@@ -1090,11 +1323,26 @@ test('missing ownership, changed facts, changed acceptance, or unavailable freez
   assert.equal(router.classifyRoute(noFreeze).status, 'PROVIDER_UNSUPPORTED')
 })
 
-test('checker responsibilities derive from effect and risk; second checker needs named distinct work', () => {
+test('checker seats default to one and require two explicit non-overlapping methods for two', () => {
+  const defaultProposal = decisions.createRouteRecommendation({
+    preWorkResult: 'CONTINUE', recommendedRoute: 'DIRECT', confidence: 1,
+  }).routeFactProposal
+  assert.equal(defaultProposal.minimumCheckerCount, 1)
+  assert.deepEqual(defaultProposal.namedDistinctResponsibilities, [])
+
   const ordinary = decisions.selectIndependentChecking({ facts: routeFacts() })
   assert.equal(ordinary.valid, true)
   assert.equal(ordinary.checkerCount, 1)
   assert.match(ordinary.responsibilities[0], /report/u)
+  const derivedRiskOnly = decisions.selectIndependentChecking({ facts: routeFacts({
+    requestedEffect: 'mutate',
+    mutableResources: [{ kind: 'file', identity: 'src/local.js', shared: true, ownershipMode: 'exclusive-lease' }],
+    sideEffects: ['deliverable-write', 'permission-change'],
+  }) })
+  assert.equal(derivedRiskOnly.valid, true)
+  assert.equal(derivedRiskOnly.checkerCount, 1)
+  assert.match(derivedRiskOnly.responsibilities[0], /authorization boundaries/u)
+  assert.match(derivedRiskOnly.responsibilities[0], /shared-resource/u)
   const riskyFacts = routeFacts({
     requestedEffect: 'external-operation', externality: 'external-write',
     sideEffects: ['external-write', 'permission-change'],
@@ -1104,17 +1352,48 @@ test('checker responsibilities derive from effect and risk; second checker needs
     },
     riskAndIndependentCheckFloor: {
       level: 'elevated', minimumCheckerCount: 2,
-      namedDistinctResponsibilities: ['Attack authorization with distinct identities.'],
+      namedDistinctResponsibilities: [
+        '[command:authorization-probe] Attack authorization with distinct identities.',
+        '[oracle:audit-receipt] Verify the external result through an independent audit receipt.',
+      ],
+    },
+    checkAndBaseline: {
+      availableCheckKinds: ['command:authorization-probe', 'oracle:audit-receipt'],
     },
   })
   const risky = decisions.selectIndependentChecking({ facts: riskyFacts })
   assert.equal(risky.checkerCount, 2)
   assert.match(risky.nonOverlapReason, /authorization/u)
-  assert.match(risky.nonOverlapReason, /external/u)
+  assert.match(risky.nonOverlapReason, /audit-receipt/u)
   const unnamed = routeFacts({
     riskAndIndependentCheckFloor: { level: 'elevated', minimumCheckerCount: 2, namedDistinctResponsibilities: [] },
   })
-  assert.equal(decisions.selectIndependentChecking({ facts: unnamed }).valid, false)
+  const unnamedChecks = decisions.selectIndependentChecking({ facts: unnamed })
+  assert.equal(unnamedChecks.valid, true)
+  assert.equal(unnamedChecks.checkerCount, 1)
+  assert.match(unnamedChecks.nonOverlapReason,
+    /second checker was not admitted.*typed method identities/u)
+  const oneNamed = routeFacts({
+    riskAndIndependentCheckFloor: {
+      level: 'elevated', minimumCheckerCount: 2,
+      namedDistinctResponsibilities: ['Only one purported method.'],
+    },
+  })
+  assert.equal(router.validateRouteFacts(oneNamed).valid, true)
+  const oneNamedChecks = decisions.selectIndependentChecking({ facts: oneNamed })
+  assert.equal(oneNamedChecks.valid, true)
+  assert.equal(oneNamedChecks.checkerCount, 1)
+  assert.match(oneNamedChecks.nonOverlapReason,
+    /second checker was not admitted.*typed method identities/u)
+  const normalizedDuplicate = routeFacts({
+    riskAndIndependentCheckFloor: {
+      level: 'elevated', minimumCheckerCount: 2,
+      namedDistinctResponsibilities: ['Run black-box behavior checks.', ' run black-box behavior checks. '],
+    },
+  })
+  const duplicateChecks = decisions.selectIndependentChecking({ facts: normalizedDuplicate })
+  assert.equal(duplicateChecks.valid, true)
+  assert.equal(duplicateChecks.checkerCount, 1)
   const compound = routeFacts({
     requestedEffect: 'external-operation', externality: 'external-write', reversibility: 'irreversible',
     mutableResources: [{ kind: 'database', identity: 'shared', shared: true, ownershipMode: 'exclusive-lease' }],
@@ -1129,47 +1408,156 @@ test('checker responsibilities derive from effect and risk; second checker needs
     },
     riskAndIndependentCheckFloor: {
       level: 'staged-high-impact', minimumCheckerCount: 2,
-      namedDistinctResponsibilities: ['Check staged recovery.'],
+      namedDistinctResponsibilities: [
+        'Exercise staged recovery from the frozen candidate.',
+        'Reconcile durable state through the external read model.',
+      ],
     },
     checkAndBaseline: { hiddenExternalCheck: true },
   })
   const compoundChecks = decisions.selectIndependentChecking({ facts: compound })
   assert.equal(compoundChecks.valid, true)
-  assert.match(compoundChecks.nonOverlapReason, /destructive/u)
-  assert.match(compoundChecks.nonOverlapReason, /cost/u)
-  assert.match(compoundChecks.nonOverlapReason, /shared-resource/u)
-  assert.match(compoundChecks.nonOverlapReason, /hidden external/u)
+  const compoundResponsibilities = compoundChecks.responsibilities.join(' ')
+  assert.match(compoundResponsibilities, /destructive/u)
+  assert.match(compoundResponsibilities, /cost/u)
+  assert.match(compoundResponsibilities, /shared-resource/u)
+  assert.match(compoundResponsibilities, /hidden external/u)
 })
 
 test('topology is route-derived and carries ownership and freeze prerequisites before checking', () => {
-  const facts = roadmapFacts()
+  const facts = roadmapFacts({
+    mutableResources: [
+      { kind: 'service', identity: 'api', shared: false, ownershipMode: 'single-owner' },
+      { kind: 'service', identity: 'web', shared: false, ownershipMode: 'single-owner' },
+    ],
+  })
   const topology = decisions.buildRouteTopology('ROADMAP', {
-    facts, worker_count: 2, manager_count: 1,
-    mutable_resource_ownership: ownershipFor(facts),
+    facts, worker_count: 1,
+    mutable_resource_ownership: facts.mutableResources.map(resource => ({
+      ...resource, owner: 'worker-1', ownership_mode: resource.ownershipMode,
+    })),
   })
   assert.equal(topology.valid, true)
   assert.equal(topology.counts.routeAnalysts, 1)
-  assert.equal(topology.counts.roadmapAuthors, 1)
-  assert.equal(topology.counts.missionCoordinators, 1)
-  assert.equal(topology.counts.workGroupManagers, 1)
+  assert.equal(topology.counts.roadmapAuthors, 0)
+  assert.equal(topology.counts.planCheckers, 0)
+  assert.equal(topology.counts.missionCoordinators, 0)
+  assert.equal(topology.counts.workGroupManagers, 0)
+  assert.equal(topology.coordination.roadmapAuthor.count, 0)
+  assert.equal(topology.coordination.planChecker.count, 0)
+  assert.equal(topology.coordination.coordination.integrationOwner.count, 0)
+  assert.equal(topology.childSessions, 3)
+  assert.equal(decisions.roadmapCompletionLaunchRequirement(topology), 7)
   assert.deepEqual(topology.workGroupManager, {
     role: 'ap-work-group-manager', physicalRoleId: 'autoprompt.v2.ap-work-group-manager',
-    parent: 'mission-coordinator', count: 1, admitted: true, planPath: 'plan/ROADMAP.md',
-    minimumUsefulWorkersPerManager: 2, assignedWorkerCount: 2,
+    parent: 'mission-coordinator', count: 0, admitted: false, planPath: 'plan/ROADMAP.md',
+    minimumUsefulWorkersPerManager: 2, assignedWorkerCount: 1,
     disjointMutableResourceOwnershipRequired: true,
   })
   assert.equal(topology.mutableResourceOwnership.length, 2)
   assert.equal(topology.candidateFreeze.freezeBeforeIndependentCheck, true)
   assert.equal(topology.assurancePreconditions.frozenVersionIdRequired, true)
+
+  const disjointFacts = roadmapFacts({
+    dependency: {
+      shape: 'independent-edits', dependentWorkGroupCount: 0,
+      integrationOwnerRequired: false, separateDependentBodies: 2,
+    },
+    mutableResources: [
+      { kind: 'file', identity: 'src/api.js', shared: false, ownershipMode: 'single-owner' },
+      { kind: 'file', identity: 'src/web.js', shared: false, ownershipMode: 'single-owner' },
+    ],
+  })
+  const disjoint = decisions.buildRouteTopology('ROADMAP', {
+    facts: disjointFacts, worker_count: 2,
+    mutable_resource_ownership: ownershipFor(disjointFacts),
+  })
+  assert.equal(disjoint.valid, true)
+  assert.equal(disjoint.counts.missionCoordinators, 0)
+  assert.equal(disjoint.counts.workGroupManagers, 0)
+  assert.equal(disjoint.childSessions, 4)
+  assert.equal(decisions.roadmapCompletionLaunchRequirement(disjoint), 8)
+  const withScout = decisions.buildRouteTopology('ROADMAP', {
+    facts, worker_count: 1, scout_count: 1, named_unknowns: ['resolve the exact API boundary'],
+    mutable_resource_ownership: facts.mutableResources.map(resource => ({
+      ...resource, owner: 'worker-1', ownership_mode: resource.ownershipMode,
+    })),
+  })
+  assert.equal(withScout.valid, false)
+  assert.match(withScout.errors.join('\n'), /no scout model sessions/u)
+  const twoCheckerFacts = roadmapFacts({
+    riskAndIndependentCheckFloor: {
+      level: 'high', minimumCheckerCount: 2,
+      namedDistinctResponsibilities: [
+        '[command:authoritative-suite] Run the authoritative suite.',
+        '[oracle:black-box-boundary] Exercise the black-box boundary.',
+      ],
+    },
+    checkAndBaseline: {
+      availableCheckKinds: ['command:authoritative-suite', 'oracle:black-box-boundary'],
+    },
+  })
+  const withTwoCheckers = decisions.buildRouteTopology('ROADMAP', {
+    facts: twoCheckerFacts, worker_count: 1,
+    mutable_resource_ownership: twoCheckerFacts.mutableResources.map(resource => ({
+      ...resource, owner: 'worker-1', ownership_mode: resource.ownershipMode,
+    })),
+  })
+  assert.equal(withTwoCheckers.valid, true)
+  assert.equal(withTwoCheckers.childSessions, 4)
+  assert.equal(decisions.roadmapCompletionLaunchRequirement(withTwoCheckers), 9)
   const underfilledManager = decisions.buildRouteTopology('ROADMAP', {
     facts, worker_count: 1, manager_count: 1,
-    mutable_resource_ownership: ownershipFor(facts),
+    mutable_resource_ownership: facts.mutableResources.map(resource => ({
+      ...resource, owner: 'worker-1', ownership_mode: resource.ownershipMode,
+    })),
   })
   assert.equal(underfilledManager.valid, false)
+  const tooManyScouts = decisions.buildRouteTopology('ROADMAP', {
+    facts, worker_count: 1, scout_count: 13,
+    named_unknowns: Array.from({ length: 13 }, (_, index) => `unknown-${index + 1}`),
+    mutable_resource_ownership: facts.mutableResources.map(resource => ({
+      ...resource, owner: 'worker-1', ownership_mode: resource.ownershipMode,
+    })),
+  })
+  assert.equal(tooManyScouts.valid, false)
+  assert.match(tooManyScouts.errors.join('\n'), /no scout model sessions/u)
   const wrongRoute = decisions.buildRouteTopology('DIRECT', {
     facts, mutable_resource_ownership: ownershipFor(facts),
   })
   assert.equal(wrongRoute.valid, false)
+})
+
+test('route decision validation recomputes topology instead of trusting recorded valid flags', () => {
+  const direct = decision(routeFacts())
+  assert.equal(decisions.validateRouteDecision(direct).valid, true)
+  const workerTamper = clone(direct)
+  workerTamper.usefulWorkerCount = 1000
+  const workerValidation = decisions.validateRouteDecision(workerTamper)
+  assert.equal(workerValidation.valid, false)
+  assert.match(workerValidation.errors.join('\n'), /multiple workers|topology must equal/u)
+
+  const roadmap = decision(roadmapFacts())
+  assert.equal(decisions.validateRouteDecision(roadmap).valid, true)
+  const legacyRoadmap = clone(roadmap)
+  Object.assign(legacyRoadmap.topology.counts, {
+    roadmapAuthors: 1, planCheckers: 1, missionCoordinators: 1,
+  })
+  legacyRoadmap.topology.childSessions += 3
+  legacyRoadmap.topology.totalSessions += 3
+  legacyRoadmap.topology.coordination = decisions.createRoadmapTopology()
+  assert.equal(decisions.validateRouteDecision(legacyRoadmap).valid, true,
+    'authenticated legacy ROADMAP intake remains valid without restoring retired provider calls')
+  assert.deepEqual(router.schemaErrors(legacyRoadmap, decisions.ROUTE_DECISION_SCHEMA), [])
+  assert.equal(decisions.completionLaunchRequirement(legacyRoadmap.topology), 7,
+    'legacy topology declarations never inflate the current Codex physical call budget')
+  const managerTamper = clone(roadmap)
+  managerTamper.topology.counts.workGroupManagers = 1
+  managerTamper.topology.workGroupManager.count = 1
+  managerTamper.topology.workGroupManager.admitted = true
+  const managerValidation = decisions.validateRouteDecision(managerTamper)
+  assert.equal(managerValidation.valid, false)
+  assert.match(managerValidation.errors.join('\n'), /topology must equal/u)
 })
 
 test('exact user path decisions have zero route analysts, retain independent checking, and reject silent route changes', () => {
@@ -1203,7 +1591,15 @@ test('exact user path decisions have zero route analysts, retain independent che
     assert.equal(exact.pathSelection.automaticSelectionBypassed, true)
     assert.equal(exact.pathSelection.silentRouteChangesAllowed, false)
     assert.equal(exact.topology.counts.routeAnalysts, 0)
-    assert.ok(exact.independentCheckingPlan.checkerCount >= 1)
+    assert.equal(exact.independentCheckingPlan.checkerCount, 1)
+    const automaticRequirement = decisions.completionLaunchRequirement(automatic.topology)
+    const exactRequirement = decisions.completionLaunchRequirement(exact.topology)
+    if (route === 'DIRECT') {
+      assert.equal(automaticRequirement, 7)
+      assert.equal(exactRequirement, 6)
+    } else {
+      assert.equal(exactRequirement, 6)
+    }
     const alternative = router.ROUTES.find(candidate => candidate !== route)
     const change = decisions.evaluateRouteChange({
       currentRoute: route,
@@ -1216,6 +1612,277 @@ test('exact user path decisions have zero route analysts, retain independent che
     const sourceTamper = clone(exact)
     sourceTamper.routeSource = 'automatic'
     assert.equal(decisions.validateRouteDecision(sourceTamper).valid, false)
+  }
+})
+
+test('Codex-private physical completion receipts cover every valid route, path, worker, checker, and gate shape', () => {
+  const c2 = {
+    level: 'elevated', minimumCheckerCount: 2,
+    namedDistinctResponsibilities: [
+      '[command:unit] Execute the focused unit suite.',
+      '[oracle:artifact] Reopen the produced artifact.',
+    ],
+  }
+  const availableC2 = {
+    checkQuality: 'authoritative',
+    availableCheckKinds: ['command:unit', 'oracle:artifact'],
+    baselineStatus: 'not-applicable', hiddenExternalCheck: false,
+  }
+
+  const checkerFacts = (base, checkerCount) => merge(base, {
+    riskAndIndependentCheckFloor: checkerCount === 2
+      ? c2 : { level: 'ordinary', minimumCheckerCount: 1, namedDistinctResponsibilities: [] },
+    ...(checkerCount === 2 ? { checkAndBaseline: availableC2 } : {}),
+  })
+  const assertReceipt = (compiled, workers, checkers, analystLaunches) => {
+    assert.equal(decisions.validateRouteDecision(compiled).valid, true)
+    assert.deepEqual(validateJsonSchema(decisions.ROUTE_DECISION_SCHEMA, compiled).errors, [])
+    for (const gates of [0, 1]) {
+      const receipt = phaseBudget.codexPhysicalExecutionReceipt(compiled, {
+        additionalGateLaunches: gates,
+      })
+      assert.equal(receipt.analystLaunches, analystLaunches)
+      assert.equal(receipt.workerLaunches, workers)
+      assert.equal(receipt.checkerLaunches, checkers)
+      const expectedContingency = 3 + checkers
+      assert.equal(receipt.boundedContingencyLaunches, expectedContingency)
+      assert.equal(
+        receipt.requiredChildLaunches,
+        analystLaunches + workers + checkers + gates + expectedContingency,
+      )
+    }
+  }
+
+  assert.throws(() => phaseBudget.codexPhysicalExecutionReceipt(decision(routeFacts()), {
+    additionalGateLaunches: 2,
+  }), error => error.code === 'ROUTE_LAUNCH_REQUIREMENT_INVALID')
+
+  for (const route of router.ROUTES) {
+    for (const checkers of [1, 2]) {
+      const base = route === 'ROADMAP' ? roadmapFacts()
+        : route === 'LIGHT' ? routeFacts({ operatorMinimumRoute: 'LIGHT' })
+          : routeFacts()
+      const facts = checkerFacts(base, checkers)
+      assertReceipt(decision(facts), 1, checkers, 1)
+      const exact = decisions.createExactPathDecision({
+        route,
+        preflight: exactPreflight(facts),
+        requestedResult: 'Implement the exact bounded request.',
+        requestEnvelopeHash: H,
+        targetIdentity: 'workspace',
+        providerCapabilities: { toolOutputCapture: true },
+        providerCapabilitiesHash: H2,
+        budget: { remaining: { wallMs: 1_200_000 } },
+        budgetSnapshotHash: H3,
+        nowMs: 0,
+      })
+      assertReceipt(exact, 1, checkers, 0)
+    }
+  }
+
+  for (const workers of [2, 3]) {
+    for (const checkers of [1, 2]) {
+      const facts = checkerFacts(roadmapFacts({
+        dependency: {
+          shape: 'independent-edits', dependentWorkGroupCount: 0,
+          integrationOwnerRequired: false, separateDependentBodies: workers,
+        },
+        mutableResources: Array.from({ length: workers }, (_, index) => ({
+          kind: 'file', identity: `src/owned-${index + 1}.js`, shared: false,
+          ownershipMode: 'single-owner',
+        })),
+      }), checkers)
+      const compiled = decision(facts, {
+        workers: {
+          count: workers,
+          responsibilities: Array.from({ length: workers }, (_, index) =>
+            `Own only src/owned-${index + 1}.js.`),
+          non_overlap_reason: 'Each worker owns one exact disjoint file.',
+        },
+        mutable_resource_ownership: ownershipFor(facts),
+      })
+      assertReceipt(compiled, workers, checkers, 1)
+    }
+  }
+})
+
+test('ROADMAP W2/W3 transport retry plus correction and union repair admits every fresh C1/C2 checker across G0-G1', async () => {
+  const providerCapabilities = Object.freeze({
+    eventStreaming: true,
+    toolOutputCapture: true,
+    stableChildIdentity: true,
+    sameContextContinuation: true,
+    isolatedChecking: true,
+    cancellation: true,
+  })
+  const zeroUsage = Object.freeze({
+    noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0,
+  })
+  let scenario = 0
+
+  for (const workers of [2, 3]) {
+    for (const checkers of [1, 2]) {
+      for (const gates of [0, 1]) {
+        scenario += 1
+        const facts = roadmapFacts({
+          dependency: {
+            shape: 'independent-edits', dependentWorkGroupCount: 0,
+            integrationOwnerRequired: false, separateDependentBodies: workers,
+          },
+          mutableResources: Array.from({ length: workers }, (_, index) => ({
+            kind: 'file', identity: `src/owned-${index + 1}.js`, shared: false,
+            ownershipMode: 'single-owner',
+          })),
+          riskAndIndependentCheckFloor: checkers === 2 ? {
+            level: 'elevated', minimumCheckerCount: 2,
+            namedDistinctResponsibilities: [
+              '[command:unit] Execute the focused unit suite.',
+              '[oracle:artifact] Reopen the produced artifact.',
+            ],
+          } : {
+            level: 'ordinary', minimumCheckerCount: 1, namedDistinctResponsibilities: [],
+          },
+          ...(checkers === 2 ? {
+            checkAndBaseline: {
+              checkQuality: 'authoritative',
+              availableCheckKinds: ['command:unit', 'oracle:artifact'],
+              baselineStatus: 'not-applicable', hiddenExternalCheck: false,
+            },
+          } : {}),
+        })
+        const compiled = decision(facts, {
+          workers: {
+            count: workers,
+            responsibilities: Array.from({ length: workers }, (_, index) =>
+              `Own only src/owned-${index + 1}.js.`),
+            non_overlap_reason: 'Each worker owns one exact disjoint file.',
+          },
+          mutable_resource_ownership: ownershipFor(facts),
+        })
+        const receipt = phaseBudget.codexPhysicalExecutionReceipt(compiled, {
+          additionalGateLaunches: gates,
+        })
+        assert.equal(
+          decisions.completionLaunchRequirement(compiled.topology),
+          1 + workers + checkers + 3 + checkers,
+        )
+        assert.equal(receipt.boundedContingencyLaunches, 3 + checkers)
+        assert.equal(
+          receipt.requiredChildLaunches,
+          1 + gates + workers + checkers + 3 + checkers,
+        )
+
+        const runIdentity = { runId: `roadmap-repair-${scenario}`, generation: 1 }
+        const scheduler = new CentralScheduler({ route: 'PENDING', runIdentity })
+        const launchedRoles = []
+        let session = 0
+        const launch = async ({ workItemId, role, purpose = 'work', lane = 'main' }) => {
+          session += 1
+          const authority = scheduler.issueLaunchAuthority({
+            callerRole: 'ap-root',
+            sessionId: `roadmap-repair-${scenario}-session-${session}`,
+            ...runIdentity,
+            providerCapabilities,
+          })
+          const lease = await scheduler.acquireWithAuthority(authority, {
+            workItemId, role, purpose, lane,
+          })
+          launchedRoles.push(role)
+          lease.complete(zeroUsage)
+        }
+
+        await launch({
+          workItemId: 'route-analyst', role: 'ap-route-analyst',
+          purpose: 'planning', lane: 'routeAnalyst',
+        })
+        const rootDecision = scheduler.beginRootAccounting({
+          phase: 'routeDecision', sessionId: `roadmap-repair-${scenario}-root`,
+        })
+        rootDecision.complete(zeroUsage)
+        scheduler.freezeRoute('ROADMAP', resolveSchedulerSettings({
+          route: 'ROADMAP', requiredChildLaunches: receipt.requiredChildLaunches,
+        }))
+        assert.equal(scheduler.budget.maxChildLaunches, receipt.requiredChildLaunches)
+
+        for (let index = 0; index < gates; index += 1) {
+          await launch({
+            workItemId: `preproduction-gate-${index + 1}`,
+            role: 'ap-independent-checker', purpose: 'verification',
+          })
+        }
+        for (let index = 0; index < workers; index += 1) {
+          await launch({ workItemId: `work-${index + 1}`, role: 'ap-worker' })
+        }
+        await launch({ workItemId: 'work-1-transport-retry-1', role: 'ap-worker' })
+        await launch({
+          workItemId: 'initial-checker-1',
+          role: 'ap-independent-checker', purpose: 'verification',
+        })
+        await launch({
+          workItemId: 'checker-report-correction',
+          role: 'ap-independent-checker', purpose: 'verification',
+        })
+        for (let index = 1; index < checkers; index += 1) {
+          await launch({
+            workItemId: `initial-checker-${index + 1}`,
+            role: 'ap-independent-checker', purpose: 'verification',
+          })
+        }
+        await launch({ workItemId: 'union-repair', role: 'ap-worker' })
+        for (let index = 0; index < checkers; index += 1) {
+          await launch({
+            workItemId: `repaired-checker-${index + 1}`,
+            role: 'ap-independent-checker', purpose: 'verification',
+          })
+        }
+
+        assert.equal(scheduler.getMetrics().counters.totalLaunches, receipt.requiredChildLaunches)
+        assert.equal(scheduler.getMetrics().counters.currentLiveChildren, 0)
+        assert.equal(launchedRoles.filter(role => role === 'ap-route-analyst').length, 1)
+        assert.equal(launchedRoles.filter(role => role === 'ap-worker').length, workers + 2)
+        assert.equal(
+          launchedRoles.filter(role => role === 'ap-independent-checker').length,
+          gates + (2 * checkers) + 1,
+        )
+        assert.equal(
+          launchedRoles.some(role => [
+            'ap-roadmap-author', 'ap-plan-checker', 'ap-mission-coordinator',
+            'ap-work-group-manager',
+          ].includes(role)),
+          false,
+        )
+        await assert.rejects(
+          launch({ workItemId: 'unreserved-extra-generation', role: 'ap-worker' }),
+          error => error.code === 'LAUNCH_LIMIT',
+        )
+        assert.equal(scheduler.getMetrics().counters.totalLaunches, receipt.requiredChildLaunches)
+      }
+    }
+  }
+})
+
+test('shared route-decision schema and semantic validation accept automatic and explicit DIRECT, LIGHT, and ROADMAP matrices', () => {
+  for (const route of router.ROUTES) {
+    const facts = route === 'ROADMAP' ? roadmapFacts()
+      : route === 'LIGHT' ? routeFacts({ operatorMinimumRoute: 'LIGHT' })
+        : routeFacts()
+    const automatic = decision(facts)
+    assert.equal(decisions.validateRouteDecision(automatic).valid, true, route)
+    assert.equal(validateJsonSchema(decisions.ROUTE_DECISION_SCHEMA, automatic).valid, true, route)
+    const exact = decisions.createExactPathDecision({
+      route,
+      preflight: exactPreflight(facts),
+      requestedResult: 'Implement the exact bounded request.',
+      requestEnvelopeHash: H,
+      targetIdentity: 'workspace',
+      providerCapabilities: { toolOutputCapture: true },
+      providerCapabilitiesHash: H2,
+      budget: { remaining: { wallMs: 1_200_000 } },
+      budgetSnapshotHash: H3,
+      nowMs: 0,
+    })
+    assert.equal(decisions.validateRouteDecision(exact).valid, true, route)
+    assert.equal(validateJsonSchema(decisions.ROUTE_DECISION_SCHEMA, exact).valid, true, route)
   }
 })
 
@@ -1280,7 +1947,7 @@ test('wrong analyst correction proves fact or classifier fingerprint comparison'
   assert.equal(decisions.validateRouteDecision(corrected).valid, false)
 })
 
-test('four-minute L0 accepts only valid decisions and timeout starts no worker', () => {
+test('four-minute L0 records late convergence but does not discard an available valid decision', () => {
   const made = decision()
   const timely = decisions.evaluateL0Decision({
     started_at_ms: 1000, submitted_at_ms: 240999, now_ms: 240999, decision: made,
@@ -1290,8 +1957,10 @@ test('four-minute L0 accepts only valid decisions and timeout starts no worker',
   const timeout = decisions.evaluateL0Decision({
     started_at_ms: 1000, submitted_at_ms: 241001, now_ms: 241001, decision: made,
   })
-  assert.equal(timeout.status, 'ROUTE_DECISION_TIMEOUT')
-  assert.equal(timeout.start_workers, false)
+  assert.equal(timeout.status, 'ROUTE_DECIDED')
+  assert.equal(timeout.start_workers, true)
+  assert.equal(timeout.convergence.required, true)
+  assert.equal(timeout.budget_remaining_ms, 0)
 })
 
 test('SIDE_EFFECT_DISCOVERED reclassifies facts and retains prior plus newly triggered obligations', () => {
@@ -1304,7 +1973,10 @@ test('SIDE_EFFECT_DISCOVERED reclassifies facts and retains prior plus newly tri
     },
     riskAndIndependentCheckFloor: {
       level: 'staged-high-impact', minimumCheckerCount: 2,
-      namedDistinctResponsibilities: ['Check destructive external authority.'],
+      namedDistinctResponsibilities: [
+        'Check destructive external authority.',
+        'Verify the external result against its durable receipt.',
+      ],
     },
   })
   const result = decisions.evaluateRouteEvent({

@@ -42,8 +42,18 @@ function runFocusedCheck() {
   }
 }
 
-function emitTypedResult(typed) {
+function emitTypedResult(typed, commandObservation = null) {
   output(JSON.stringify({ type: 'thread.started', thread_id: crypto.randomUUID() }))
+  if (commandObservation) {
+    output(JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: 'installed-canary-focused-check',
+        type: 'command_execution',
+        ...commandObservation,
+      },
+    }))
+  }
   output(JSON.stringify({
     type: 'item.completed',
     item: { type: 'agent_message', text: JSON.stringify(typed) },
@@ -205,7 +215,14 @@ function main() {
   if (/checker|reviewer|tester/u.test(logicalRole) || /checker|reviewer|tester/u.test(role)) {
     const check = runFocusedCheck()
     const passed = check.exitCode === 0 && check.signal === null
-    const evidenceId = `${logicalRole}:${sha256(`${check.stdout}\n${check.stderr}`)}`
+    if (scenario.recommendation.howSuccessCanBeChecked[0] !== 'node --test test.cjs') {
+      throw new Error('installed canary route recommendation lost its exact focused-check identity')
+    }
+    const command = JSON.stringify([process.execPath, '--test', 'test.cjs'])
+    const commandHash = sha256(command)
+    const commandOutput = `${check.stdout}\n${check.stderr}`
+    const fingerprint = sha256(commandOutput.trim())
+    const evidenceId = `${logicalRole}:${sha256(commandOutput)}`
     appendTrace({
       logicalRole,
       phase: 'independent-focused-check',
@@ -233,9 +250,20 @@ function main() {
       payload: {
         evidenceIds: [evidenceId],
         findings: passed ? [] : [{ id: 'CANARY-FOCUSED-CHECK-RED', severity: 'P1' }],
-        testOutcomes: [{ id: 'node-test-test-cjs', status: passed ? 'PASS' : 'FAIL', evidenceId }],
+        testOutcomes: assignment.checks.map((checkId, index) => ({
+          command: checkId,
+          observationId: assignment.verificationObservationCases[index].observationId,
+          commandHash,
+          status: passed ? 'PASS' : 'FAIL',
+          fingerprint,
+        })),
       },
       recordedAt: new Date().toISOString(),
+    }, {
+      command,
+      status: passed ? 'completed' : 'failed',
+      exit_code: check.exitCode,
+      aggregated_output: commandOutput,
     })
     return
   }

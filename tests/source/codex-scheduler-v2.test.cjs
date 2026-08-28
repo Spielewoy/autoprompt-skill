@@ -10,6 +10,7 @@ const test = require('node:test')
 const root = path.resolve(__dirname, '..', '..')
 const workflow = path.join(root, 'agents', 'codex', 'workflow')
 const { stableStringify } = require(path.join(workflow, 'event-log.js'))
+const { BudgetController } = require(path.join(workflow, 'budget-controller.js'))
 const {
   CentralScheduler,
   ROUTE_BUDGETS,
@@ -26,6 +27,7 @@ const {
   buildCheckerContext,
   buildContextFreeBrief,
   loadRequestEnvelope,
+  transcriptRollingHash,
   writeRequestEnvelope,
 } = require(path.join(workflow, 'context-envelope.js'))
 const {
@@ -100,29 +102,52 @@ function optionalValue(overrides = {}) {
   }
 }
 
-test('benchmark scheduler policy removes premature runtime ceilings while retaining a finite launch guard', () => {
+test('benchmark scheduler keeps finite targets and collapses late admission without ending the mission', () => {
   const environment = { AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' }
   const clock = { now: 0 }
   const scheduler = new CentralScheduler({
     route: 'DIRECT', runIdentity: TEST_RUN, environment, now: () => clock.now,
   })
-  assert.equal(scheduler.budget.admissionHardMs, Number.MAX_SAFE_INTEGER)
+  assert.equal(scheduler.budget.admissionHardMs, ROUTE_BUDGETS.DIRECT.admissionHardMs)
   assert.equal(scheduler.budget.tokens.noncachedInput, ROUTE_BUDGETS.DIRECT.tokens.noncachedInput)
-  assert.equal(scheduler.budget.maxChildLaunches, 128)
-  assert.equal(scheduler.settings.lanes.main.maxLaunches, 128)
+  assert.equal(scheduler.budget.maxChildLaunches, ROUTE_BUDGETS.DIRECT.maxChildLaunches)
+  assert.equal(scheduler.settings.lanes.main.maxLaunches, ROUTE_BUDGETS.DIRECT.maxChildLaunches)
   clock.now = 48 * 60 * 60 * 1000
   scheduler.recordAdmissionComponent('configuration', 25 * 60 * 60 * 1000)
   scheduler.recordAdmissionComponent('routeAnalyst', 23 * 60 * 60 * 1000)
-  const unboundedAdmission = scheduler.checkAdmissionTime()
-  assert.deepEqual(unboundedAdmission.breaches, [])
-  assert.equal(unboundedAdmission.withinP95, false)
+  const convergedAdmission = scheduler.checkAdmissionTime()
+  assert.equal(convergedAdmission.withinCeiling, false)
+  assert.equal(convergedAdmission.withinTarget, false)
+  assert.equal(convergedAdmission.completionCanContinue, true)
+  assert.equal(convergedAdmission.convergenceRequired, true)
+  assert.ok(convergedAdmission.breaches.includes('routeAnalyst'))
+  assert.ok(convergedAdmission.breaches.includes('combined'))
+  assert.equal(convergedAdmission.withinP95, false)
+  assert.equal(scheduler.getMetrics().limits.effectiveMaxLiveIncludingRoot, 2)
 
   const ordinary = createTestScheduler()
   ordinary.recordAdmissionComponent('routeAnalyst', 25 * 60 * 60 * 1000)
   assert.ok(ordinary.checkAdmissionTime().breaches.includes('routeAnalyst'))
 })
 
-test('benchmark repair and reassessment paths retain launch capacity beyond the old eight-launch stop', async () => {
+test('benchmark no-limit flags resolve to finite practical ceilings without repeated expansion', () => {
+  const environment = {
+    AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1',
+    AUTOPROMPT_BENCHMARK_NO_TOKEN_LIMIT: '1',
+  }
+  const first = new CentralScheduler({ route: 'LIGHT', runIdentity: TEST_RUN, environment })
+  assert.equal(first.budget.admissionHardMs, ROUTE_BUDGETS.LIGHT.admissionHardMs)
+  assert.deepEqual(first.budget.tokens, ROUTE_BUDGETS.LIGHT.tokens)
+  assert.equal(Object.values(first.budget.tokens).every(Number.isSafeInteger), true)
+  const state = first.exportState()
+  const resumed = new CentralScheduler({
+    route: 'LIGHT', runIdentity: TEST_RUN, environment, state, settings: state.settings,
+  })
+  assert.deepEqual(resumed.budget.tokens, first.budget.tokens)
+  assert.equal(resumed.budget.admissionHardMs, first.budget.admissionHardMs)
+})
+
+test('benchmark flags never authorize extra model generations', async () => {
   const scheduler = new CentralScheduler({
     route: 'DIRECT', runIdentity: TEST_RUN,
     environment: { AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' },
@@ -130,13 +155,49 @@ test('benchmark repair and reassessment paths retain launch capacity beyond the 
   for (let index = 1; index <= 9; index += 1) {
     finish(await admit(scheduler, { workItemId: `required-stage-${index}` }))
   }
+  await assert.rejects(admit(scheduler, { workItemId: 'forbidden-generation-10' }),
+    error => error.code === 'LAUNCH_LIMIT')
   assert.equal(scheduler.getMetrics().counters.totalLaunches, 9)
-  assert.equal(scheduler.budget.maxChildLaunches, 128)
+  assert.equal(scheduler.budget.maxChildLaunches, ROUTE_BUDGETS.DIRECT.maxChildLaunches)
 })
 
-test('benchmark resume widens a legacy eight-launch checkpoint without resetting its counters', async () => {
+test('undersized global launch targets yield to admitted required graph identities while topology stays hard', async () => {
+  const scheduler = new CentralScheduler({
+    route: 'DIRECT', runIdentity: TEST_RUN, maxChildLaunches: 2,
+  })
+  const economicTarget = new BudgetController({
+    limits: { wallMs: 10_000, tokens: 10, sessions: 1, launches: 1 },
+    phases: {},
+  })
+  for (const workItemId of ['required-result', 'required-check']) {
+    const lease = await admit(scheduler, { workItemId, missionEssential: true })
+    const completion = scheduler.authorizeRequiredCompletionAccounting(lease)
+    assert.equal(completion.requiredCompletion, true)
+    economicTarget.recordLaunch({ requiredCompletion: completion.requiredCompletion })
+    finish(lease)
+  }
+  assert.equal(economicTarget.snapshot().launches, 2,
+    'the second exact required node crosses only the economic launch target')
+  assert.throws(() => economicTarget.recordLaunch(), error => error.code === 'BUDGET_EXHAUSTED')
+  await assert.rejects(admit(scheduler, { workItemId: 'unregistered-extra', missionEssential: true }),
+    error => error.code === 'LAUNCH_LIMIT')
+  assert.throws(() => scheduler.authorizeRequiredCompletionAccounting({}),
+    error => ['INVALID_LEASE', 'INVALID_LAUNCH_AUTHORITY'].includes(error.code))
+
+  const optionalScheduler = new CentralScheduler({
+    route: 'DIRECT', runIdentity: TEST_RUN, maxChildLaunches: 2,
+  })
+  const optional = await admit(optionalScheduler, {
+    workItemId: 'optional-expansion', optionalWork: true, valueCase: optionalValue(),
+  })
+  assert.throws(() => optionalScheduler.authorizeRequiredCompletionAccounting(optional),
+    error => error.code === 'INVALID_LAUNCH_AUTHORITY')
+  finish(optional)
+})
+
+test('benchmark resume preserves the normal launch topology and counters', async () => {
   const legacy = createTestScheduler()
-  for (let index = 1; index <= 7; index += 1) {
+  for (let index = 1; index <= 8; index += 1) {
     finish(await admit(legacy, { workItemId: `legacy-stage-${index}` }))
   }
   const state = structuredClone(legacy.exportState())
@@ -145,11 +206,12 @@ test('benchmark resume widens a legacy eight-launch checkpoint without resetting
     runIdentity: TEST_RUN,
     environment: { AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' },
   })
-  assert.equal(resumed.getMetrics().counters.totalLaunches, 7)
-  assert.equal(resumed.budget.maxChildLaunches, 128)
-  assert.equal(resumed.settings.lanes.main.maxLaunches, 128)
-  finish(await admit(resumed, { workItemId: 'legacy-stage-8' }))
+  assert.equal(resumed.getMetrics().counters.totalLaunches, 8)
+  assert.equal(resumed.budget.maxChildLaunches, 9)
+  assert.equal(resumed.settings.lanes.main.maxLaunches, 9)
   finish(await admit(resumed, { workItemId: 'legacy-stage-9' }))
+  await assert.rejects(admit(resumed, { workItemId: 'legacy-stage-10' }),
+    error => error.code === 'LAUNCH_LIMIT')
   assert.equal(resumed.getMetrics().counters.totalLaunches, 9)
 })
 
@@ -165,8 +227,43 @@ test('benchmark launch migration preserves explicit activation and lane ceilings
     route: 'DIRECT', runIdentity: TEST_RUN, environment,
     lanes: { main: { maxLaunches: 2 } },
   })
-  assert.equal(laneCapped.budget.maxChildLaunches, 128)
+  assert.equal(laneCapped.budget.maxChildLaunches, 9)
   assert.equal(laneCapped.settings.lanes.main.maxLaunches, 2)
+})
+
+test('exact completion reserves admit only the executable fixture-provenance gate', () => {
+  const ordinary = resolveSchedulerSettings({ route: 'DIRECT' })
+  assert.equal(ordinary.budget.maxChildLaunches, 9)
+  assert.equal(ordinary.budget.exactCompletionRequirement, undefined)
+
+  const directWithFixtureGate = resolveSchedulerSettings({
+    route: 'DIRECT', requiredChildLaunches: 10,
+  })
+  assert.equal(directWithFixtureGate.budget.maxChildLaunches, 10)
+  assert.equal(directWithFixtureGate.budget.exactCompletionRequirement, 10)
+  assert.equal(directWithFixtureGate.lanes.main.maxLaunches, 10)
+
+  const roadmapWithFixtureGate = resolveSchedulerSettings({
+    route: 'ROADMAP', requiredChildLaunches: 19,
+  })
+  assert.equal(roadmapWithFixtureGate.budget.maxChildLaunches, 19)
+  assert.equal(roadmapWithFixtureGate.budget.exactCompletionRequirement, 19)
+
+  assert.throws(
+    () => resolveSchedulerSettings({ route: 'DIRECT', requiredChildLaunches: 11 }),
+    error => error.code === 'ROUTE_LAUNCH_REQUIREMENT_INVALID',
+  )
+  assert.throws(
+    () => resolveSchedulerSettings({ route: 'ROADMAP', requiredChildLaunches: 21 }),
+    error => error.code === 'ROUTE_LAUNCH_REQUIREMENT_INVALID',
+  )
+  assert.throws(
+    () => resolveSchedulerSettings({
+      route: 'DIRECT', requiredChildLaunches: 10,
+      lanes: { main: { maxLaunches: 9 } },
+    }),
+    error => error.code === 'ROUTE_LAUNCH_REQUIREMENT_INVALID',
+  )
 })
 
 test('resume authenticates supplied settings before any benchmark migration', () => {
@@ -191,12 +288,24 @@ test('P7 route ceilings are exact ceilings, not launch quotas', () => {
       budget.tokens.output,
     ]])),
     {
-      DIRECT: [8, 4, 2, 220000, 900000, 40000],
-      LIGHT: [8, 4, 3, 500000, 2200000, 70000],
+      DIRECT: [9, 4, 2, 220000, 900000, 40000],
+      LIGHT: [9, 4, 3, 500000, 2200000, 70000],
       ROADMAP: [18, 6, 4, 1200000, 5000000, 160000],
     },
   )
   assert.equal(resolveRouteBudget('ROADMAP', { workGroups: 1 }).maxChildLaunches, 8)
+  assert.equal(resolveRouteBudget('ROADMAP', {
+    workGroups: 1, requiredChildLaunches: 11,
+  }).maxChildLaunches, 11)
+  assert.throws(() => resolveRouteBudget('ROADMAP', {
+    workGroups: 1, requiredChildLaunches: 99,
+  }), error => error.code === 'ROUTE_LAUNCH_REQUIREMENT_INVALID')
+  assert.throws(() => resolveRouteBudget('DIRECT', {
+    requiredChildLaunches: 6, maxChildLaunches: 5,
+  }), error => error.code === 'ROUTE_LAUNCH_REQUIREMENT_INVALID')
+  assert.equal(resolveRouteBudget('DIRECT', {
+    requiredChildLaunches: 6, maxChildLaunches: 9,
+  }).maxChildLaunches, 6)
   assert.equal(resolveRouteBudget('ROADMAP', { workGroups: 20 }).maxChildLaunches, 18)
   assert.equal(resolveRouteBudget('ROADMAP', { userLiveCeiling: 99 }).maxLiveIncludingRoot, 10)
 
@@ -276,7 +385,7 @@ test('launch, depth, and progress-aware retry state survive relaunch', async () 
   )
 })
 
-test('optional work needs positive marginal value and cannot consume verification reserve', async () => {
+test('optional work needs positive marginal value while required work converges through token reserves', async () => {
   assert.equal(evaluateMarginalValue(optionalValue()).admitted, true)
   assert.equal(evaluateMarginalValue(optionalValue({ disjointBoundary: '' })).code, 'MARGINAL_VALUE_REQUIRED')
   assert.equal(evaluateMarginalValue(optionalValue({ avoidedRework: 1 })).code, 'OPTIONAL_VALUE_TOO_LOW')
@@ -290,28 +399,26 @@ test('optional work needs positive marginal value and cannot consume verificatio
     }),
     (error) => error.code === 'OPTIONAL_VALUE_TOO_LOW',
   )
-  await assert.rejects(
-    admit(scheduler, {
-      workItemId: 'planning-over-reserve',
-      purpose: 'planning',
-      estimate: { noncachedInput: 150000 },
-    }),
-    (error) => error.code === 'BUDGET_RESERVE',
-  )
-  await assert.rejects(
-    admit(scheduler, {
-      workItemId: 'work-over-both-reserves',
-      purpose: 'work',
-      estimate: { noncachedInput: 150000 },
-    }),
-    (error) => error.code === 'BUDGET_RESERVE',
-  )
   const admittedOptional = await admit(scheduler, {
     workItemId: 'separate-positive-scout',
     optional: true,
     valueCase: optionalValue(),
   })
   finish(admittedOptional)
+  const planning = await admit(scheduler, {
+    workItemId: 'planning-over-reserve', purpose: 'planning',
+    estimate: { noncachedInput: 150000 },
+  })
+  assert.equal(scheduler.checkAdmissionTime().convergenceRequired, true)
+  finish(planning)
+  const requiredWork = await admit(scheduler, {
+    workItemId: 'work-over-both-reserves', purpose: 'work',
+    estimate: { noncachedInput: 150000 },
+  })
+  finish(requiredWork)
+  await assert.rejects(admit(scheduler, {
+    workItemId: 'optional-after-convergence', optional: true, valueCase: optionalValue(),
+  }), error => error.code === 'ADMISSION_OPTIONAL_COLLAPSED')
   const checker = await admit(scheduler, {
     workItemId: 'required-check',
     purpose: 'verification',
@@ -374,8 +481,10 @@ test('admission and session accounting stay componentized and reconcile exactly'
     weightedCost: 1.25,
     latencyMs: 500,
     workMs: 450,
+    normalizedTokenCost: 132,
   })
   assert.equal(metrics.economics.costPerAcceptedSolve, 1.25)
+  assert.equal(metrics.economics.costBasis, 'provider-weighted-cost')
 })
 
 test('context-free L3 brief stays under 2KB and L4 loads byte-identical request', t => {
@@ -504,6 +613,150 @@ test('route transcript content-addresses large outputs and rejects an oversized 
     () => store.evidenceIndex(Array.from({ length: 20 }, () => entry), { maxBytes: 100 }),
     (error) => error.code === 'EVIDENCE_INDEX_TOO_LARGE',
   )
+})
+
+test('TranscriptStore append work is linear and validates the existing chain only at resume', t => {
+  const directory = tempDirectory(t, 'autoprompt-transcript-linear-')
+  const operations = new Map()
+  const observe = operation => operations.set(operation, (operations.get(operation) || 0) + 1)
+  const store = new TranscriptStore(directory, {
+    turnEventLimit: 200,
+    turnByteLimit: 1024 * 1024,
+    onStorageOperation: observe,
+  })
+  const eventCount = 120
+  for (let index = 0; index < eventCount; index++) {
+    store.append({ event: { type: 'item.completed', index }, raw: `event-${index}` })
+  }
+
+  assert.equal(operations.get('readdir'), 1)
+  assert.equal(operations.get('event-read') || 0, 0)
+  assert.equal(operations.get('head-read'), eventCount - 1)
+  assert.equal(operations.get('blob-read') || 0, 0)
+
+  const resumed = store.resume()
+  assert.equal(resumed.eventCount, eventCount)
+  assert.equal(operations.get('readdir'), 2)
+  assert.equal(operations.get('event-read'), eventCount)
+  assert.equal(operations.get('head-read'), eventCount - 1)
+})
+
+test('TranscriptStore bounds overflow storage while preserving exact raw audit and edge evidence', t => {
+  const directory = tempDirectory(t, 'autoprompt-transcript-overflow-')
+  const store = new TranscriptStore(directory, {
+    largeOutputBytes: 16,
+    turnEventLimit: 20,
+    turnByteLimit: 180,
+    edgeEvidenceEvents: 2,
+    overflowEvidenceBytes: 256,
+  })
+  let rollingHash = null
+  let totalBytes = 0
+  let bytesAtFifty = null
+  let finalEntry
+  const diskBytes = () => [store.eventsDirectory, store.blobsDirectory]
+    .flatMap(folder => fs.readdirSync(folder).map(name => path.join(folder, name)))
+    .reduce((sum, file) => sum + fs.statSync(file).size, 0)
+
+  for (let index = 1; index <= 500; index++) {
+    const event = { type: 'item.completed', index, output: 'x'.repeat(64) }
+    const raw = JSON.stringify(event)
+    const rawBytes = Buffer.byteLength(raw, 'utf8')
+    const rawHash = crypto.createHash('sha256').update(raw).digest('hex')
+    totalBytes += rawBytes
+    rollingHash = transcriptRollingHash(rollingHash, rawHash, rawBytes)
+    finalEntry = store.append({ event, raw })
+    if (index === 50) bytesAtFifty = diskBytes()
+  }
+
+  assert.equal(fs.readdirSync(store.eventsDirectory).length, 3)
+  assert.equal(fs.readdirSync(store.blobsDirectory).length, 1)
+  assert.ok(diskBytes() < bytesAtFifty + 4096)
+  assert.equal(finalEntry.sequence, 500)
+  assert.equal(finalEntry.storedSequence, 3)
+  assert.equal(finalEntry.totalBytes, totalBytes)
+  assert.equal(finalEntry.rollingHash, rollingHash)
+
+  const first = store.read(1)
+  assert.equal(Object.hasOwn(first.payload, 'raw'), false)
+  assert.equal(first.payload.rawLine.bytes, Buffer.byteLength(JSON.stringify({
+    type: 'item.completed', index: 1, output: 'x'.repeat(64),
+  }), 'utf8'))
+  const physical = store.readAll({ maxEvents: 10, maxBytes: 100000 }).events
+  const summary = physical.at(-1).payload.$transcriptOverflow
+  assert.equal(summary.eventCount, 500)
+  assert.equal(summary.totalBytes, totalBytes)
+  assert.equal(summary.rollingHash, rollingHash)
+  assert.deepEqual(summary.firstEvidence.map(item => item.eventIndex), [1, 2])
+  assert.deepEqual(summary.lastEvidence.map(item => item.eventIndex), [499, 500])
+
+  const restarted = new TranscriptStore(directory, {
+    largeOutputBytes: 16,
+    turnEventLimit: 20,
+    turnByteLimit: 180,
+    edgeEvidenceEvents: 2,
+    overflowEvidenceBytes: 256,
+  }).resume()
+  assert.equal(restarted.eventCount, 500)
+  assert.equal(restarted.storedEventCount, 3)
+  assert.equal(restarted.totalBytes, totalBytes)
+  assert.equal(restarted.rollingHash, rollingHash)
+  assert.equal(restarted.overflow, true)
+})
+
+test('TranscriptStore recovers an authenticated overflow-tail replacement interrupted before cleanup', t => {
+  const directory = tempDirectory(t, 'autoprompt-transcript-tail-recovery-')
+  let inject = true
+  const options = {
+    turnEventLimit: 1,
+    turnByteLimit: 1024,
+    edgeEvidenceEvents: 2,
+    faultInjector(point) {
+      if (inject && point === 'tail-written-before-old-remove') {
+        inject = false
+        throw new Error('simulated tail replacement crash')
+      }
+    },
+  }
+  const store = new TranscriptStore(directory, options)
+  let rollingHash = null
+  let totalBytes = 0
+  const append = (target, index) => {
+    const event = { type: 'item.completed', index }
+    const raw = JSON.stringify(event)
+    const rawBytes = Buffer.byteLength(raw, 'utf8')
+    const rawHash = crypto.createHash('sha256').update(raw).digest('hex')
+    totalBytes += rawBytes
+    rollingHash = transcriptRollingHash(rollingHash, rawHash, rawBytes)
+    return target.append({ event, raw })
+  }
+
+  append(store, 1)
+  append(store, 2)
+  append(store, 3)
+  assert.throws(() => append(store, 4), /simulated tail replacement crash/)
+  assert.equal(fs.readdirSync(store.eventsDirectory).length, 4)
+
+  const recovered = new TranscriptStore(directory, {
+    turnEventLimit: 1, turnByteLimit: 1024, edgeEvidenceEvents: 2,
+  })
+  assert.equal(fs.readdirSync(recovered.eventsDirectory).length, 3)
+  assert.equal(recovered.resume().eventCount, 4)
+  assert.equal(recovered.resume().totalBytes, totalBytes)
+  assert.equal(recovered.resume().rollingHash, rollingHash)
+
+  const finalEntry = append(recovered, 5)
+  assert.equal(finalEntry.sequence, 5)
+  assert.equal(finalEntry.storedSequence, 3)
+  assert.equal(finalEntry.totalBytes, totalBytes)
+  assert.equal(finalEntry.rollingHash, rollingHash)
+  const restarted = new TranscriptStore(directory, {
+    turnEventLimit: 1, turnByteLimit: 1024, edgeEvidenceEvents: 2,
+  }).resume()
+  assert.equal(restarted.eventCount, 5)
+  assert.equal(restarted.storedEventCount, 3)
+  assert.equal(restarted.totalBytes, totalBytes)
+  assert.equal(restarted.rollingHash, rollingHash)
 })
 
 test('effort is independent of route, user pins win, and cheapest admissible model is selected', () => {
@@ -637,9 +890,9 @@ test('fake stream records reasoning diagnostically without double-counting the o
   assert.equal(lease.authorizeUsage({ noncachedInput: 0, cachedInput: 0, output: 70, reasoning: 30 }).allowed, false)
   const stopped = lease.reportUsage({ noncachedInput: 0, cachedInput: 0, output: 70, reasoning: 30 })
   assert.equal(stopped.continue, false)
-  assert.equal(stopped.code, 'BUDGET_EXHAUSTED')
+  assert.equal(stopped.code, 'ADMISSION_CONVERGENCE_REQUIRED')
   assert.deepEqual(stopped.hardCeilings, ['lane:optional:output'])
-  assert.throws(() => lease.complete(), (error) => error.code === 'BUDGET_EXHAUSTED')
+  lease.fail(new Error('optional stream collapsed'))
   const metrics = scheduler.getMetrics()
   assert.equal(metrics.usageTotals.output, 110)
   assert.equal(metrics.usageTotals.reasoning, 70)
@@ -761,11 +1014,16 @@ test('TranscriptStore reports tamper, truncation, gaps, blob corruption, and bou
   const first = tamper.append({ type: 'one' })
   const second = tamper.append({ type: 'two' })
   assert.equal(tamper.read(1).payload.type, 'one')
-  assert.deepEqual(tamper.resume(), {
-    status: 'COMPLETE', eventCount: 2, nextSequence: 3, headHash: second.hash,
-  })
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(tamper.resume()).filter(([key]) =>
+      ['status', 'eventCount', 'nextSequence', 'headHash'].includes(key))),
+    { status: 'COMPLETE', eventCount: 2, nextSequence: 3, headHash: second.hash },
+  )
   assert.throws(() => tamper.readAll({ maxEvents: 1, maxBytes: 100000 }),
     (error) => error.code === 'TRANSCRIPT_READ_BOUND')
+  fs.appendFileSync(second.path, ' ')
+  assert.throws(() => tamper.append({ type: 'three' }),
+    (error) => error.code === 'TRANSCRIPT_APPEND_DRIFT')
   fs.appendFileSync(first.path, ' ')
   assert.throws(() => new TranscriptStore(tamperRoot),
     (error) => ['TRANSCRIPT_HASH_MISMATCH', 'TRANSCRIPT_CONTENT_INVALID'].includes(error.code))
@@ -781,6 +1039,8 @@ test('TranscriptStore reports tamper, truncation, gaps, blob corruption, and bou
   gap.append({ type: 'one' })
   const gapSecond = gap.append({ type: 'two' })
   fs.renameSync(gapSecond.path, path.join(path.dirname(gapSecond.path), `00000003-${gapSecond.hash}.json`))
+  assert.throws(() => gap.append({ type: 'three' }),
+    (error) => error.code === 'TRANSCRIPT_APPEND_DRIFT')
   assert.throws(() => new TranscriptStore(gapRoot), (error) => error.code === 'TRANSCRIPT_GAP')
 
   const blobRoot = tempDirectory(t, 'autoprompt-transcript-blob-')
@@ -877,18 +1137,117 @@ test('a nonempty resource manifest is write-producing and nested workspaces cann
   assert.deepEqual(plan.batches, [['declared-parent'], ['declared-child']])
 })
 
-test('an admission component breach denies the next acquisition', async () => {
+test('an admission target breach admits essential work sequentially and collapses optional expansion', async () => {
   const scheduler = createTestScheduler()
   const verdict = scheduler.recordAdmissionComponent('routeAnalyst', (2 * 60 * 1000) + 1)
   assert.equal(verdict.withinCeiling, false)
-  await assert.rejects(admit(scheduler, { workItemId: 'late-start' }), (error) => {
-    assert.equal(error.code, 'ADMISSION_COMPONENT_TIMEOUT')
+  assert.equal(verdict.withinTarget, false)
+  const required = await admit(scheduler, { workItemId: 'late-required-work' })
+  let secondStarted = false
+  const secondPromise = admit(scheduler, { workItemId: 'late-required-work-2' }).then(lease => {
+    secondStarted = true
+    return lease
+  })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(secondStarted, false)
+  finish(required)
+  const second = await secondPromise
+  assert.equal(secondStarted, true)
+  finish(second)
+  const requiredRecheck = await admit(scheduler, {
+    workItemId: 'late-required-work-recheck', equivalenceKey: 'late-required-work',
+    purpose: 'verification', candidateHash: 'a'.repeat(64),
+  })
+  finish(requiredRecheck)
+  await assert.rejects(admit(scheduler, {
+    workItemId: 'late-optional-expansion', optional: true, valueCase: optionalValue(),
+  }), (error) => {
+    assert.equal(error.code, 'ADMISSION_OPTIONAL_COLLAPSED')
     assert.deepEqual(error.details.breaches, ['routeAnalyst'])
     return true
   })
 })
 
-test('final cumulative hard-cap exhaustion releases as failed and never completes successfully', async () => {
+test('ROADMAP retained ancestors cannot deadlock low global or lane live ceilings', async () => {
+  const scenarios = [
+    { name: 'normal-global-2', liveCeiling: 2, converged: false },
+    { name: 'converged-global-2', liveCeiling: 2, converged: true },
+    { name: 'normal-global-3', liveCeiling: 3, converged: false },
+    { name: 'converged-global-3', liveCeiling: 3, converged: true },
+    { name: 'normal-lane-1', liveCeiling: 4, laneMaxLive: 1, converged: false },
+    { name: 'converged-lane-1', liveCeiling: 4, laneMaxLive: 1, converged: true },
+  ]
+  for (const scenario of scenarios) {
+    const settings = resolveSchedulerSettings({
+      route: 'ROADMAP',
+      liveCeiling: scenario.liveCeiling,
+      lanes: { main: { maxLive: scenario.laneMaxLive } },
+    })
+    const scheduler = new CentralScheduler({ settings, runIdentity: TEST_RUN })
+    if (scenario.converged) scheduler.recordAdmissionComponent('routeAnalyst', (2 * 60 * 1000) + 1)
+    assert.equal(scheduler.checkAdmissionTime().convergenceRequired, scenario.converged, scenario.name)
+
+    const coordinator = await admit(scheduler, {
+      workItemId: `${scenario.name}-coordinator`, purpose: 'planning',
+    })
+    const manager = await admit(scheduler, {
+      workItemId: `${scenario.name}-manager`, purpose: 'planning',
+    }, coordinator)
+    const worker = await admit(scheduler, {
+      workItemId: `${scenario.name}-worker`, purpose: 'work',
+    }, manager)
+    assert.equal(scheduler.getMetrics().limits.effectiveMaxLiveIncludingRoot, 4, scenario.name)
+
+    let siblingStarted = false
+    const siblingPromise = admit(scheduler, {
+      workItemId: `${scenario.name}-sibling`, purpose: 'work',
+    }, manager).then(lease => { siblingStarted = true; return lease })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(siblingStarted, false, `${scenario.name} admits only one required leaf at a time`)
+    finish(worker)
+    const sibling = await siblingPromise
+    assert.equal(siblingStarted, true, scenario.name)
+    finish(sibling)
+    finish(manager)
+    finish(coordinator)
+    assert.equal(scheduler.getMetrics().counters.currentLiveChildren, 0, scenario.name)
+  }
+})
+
+test('required admission remains queued past an elapsed target and starts after its resource releases', async () => {
+  const scheduler = createTestScheduler()
+  const holder = await admit(scheduler, {
+    workItemId: 'queue-watchdog-holder', resources: ['workspace'],
+  })
+  let waiterStarted = false
+  const waiterPromise = admit(scheduler, {
+    workItemId: 'queue-watchdog-waiter', resources: ['workspace'],
+  }).then(lease => {
+    waiterStarted = true
+    return lease
+  })
+  await new Promise(resolve => setTimeout(resolve, 25))
+  assert.equal(waiterStarted, false)
+  finish(holder)
+  const waiter = await waiterPromise
+  assert.equal(waiterStarted, true)
+  finish(waiter)
+  assert.equal(scheduler.getMetrics().counters.currentLiveChildren, 0)
+})
+
+test('unpriced provider usage gets a deterministic normalized cost without inventing provider billing', async () => {
+  const scheduler = createTestScheduler()
+  const lease = await admit(scheduler, { workItemId: 'unpriced-usage' })
+  finish(lease, { noncachedInput: 10, cachedInput: 20, output: 30, reasoning: 5 })
+  scheduler.recordTerminalResult({ accepted: true })
+  const metrics = scheduler.getMetrics()
+  assert.equal(metrics.usageTotals.weightedCost, 0)
+  assert.equal(metrics.usageTotals.normalizedTokenCost, 132)
+  assert.equal(metrics.economics.costPerAcceptedSolve, 132)
+  assert.equal(metrics.economics.costBasis, 'normalized-token-cost')
+})
+
+test('token target breach converges while required repair/recheck remains admitted', async () => {
   const settings = resolveSchedulerSettings({
     route: 'DIRECT',
     lanes: { main: { tokens: { noncachedInput: 1000, cachedInput: 1000, output: 100 } } },
@@ -896,15 +1255,31 @@ test('final cumulative hard-cap exhaustion releases as failed and never complete
   const scheduler = createTestScheduler({ settings })
   const streamed = await admit(scheduler, { workItemId: 'stream-over-hard' })
   const stopped = streamed.reportUsage({ noncachedInput: 0, cachedInput: 0, output: 110, reasoning: 40 })
-  assert.equal(stopped.code, 'BUDGET_EXHAUSTED')
-  assert.throws(() => streamed.complete(), (error) => error.code === 'BUDGET_EXHAUSTED')
+  assert.equal(stopped.code, 'ADMISSION_CONVERGENCE_REQUIRED')
+  assert.equal(stopped.continue, true)
+  assert.equal(stopped.completionCanContinue, true)
+  assert.equal(scheduler.checkAdmissionTime().withinCeiling, false)
+  streamed.complete()
   assert.equal(scheduler.getMetrics().counters.currentLiveChildren, 0)
+  const requiredRetry = await admit(scheduler, {
+    workItemId: 'stream-over-hard-retry', equivalenceKey: 'stream-over-hard',
+    purpose: 'verification', candidateHash: 'a'.repeat(64),
+  })
+  finish(requiredRetry)
+  await assert.rejects(admit(scheduler, {
+    workItemId: 'stream-over-hard-optional-retry', equivalenceKey: 'stream-over-hard',
+    optional: true, valueCase: optionalValue(), candidateHash: 'b'.repeat(64),
+  }), error => error.code === 'ADMISSION_OPTIONAL_COLLAPSED')
+  const requiredContinuation = await admit(scheduler, {
+    workItemId: 'required-direct-continuation', purpose: 'verification',
+  })
+  finish(requiredContinuation)
 
   const finalScheduler = createTestScheduler({ settings })
   const finalOnly = await admit(finalScheduler, { workItemId: 'final-over-hard' })
-  assert.throws(() => finalOnly.complete({ noncachedInput: 0, cachedInput: 0, output: 110, reasoning: 30 }),
-    (error) => error.code === 'BUDGET_EXHAUSTED')
+  finalOnly.complete({ noncachedInput: 0, cachedInput: 0, output: 110, reasoning: 30 })
   assert.equal(finalScheduler.getMetrics().counters.currentLiveChildren, 0)
+  assert.equal(finalScheduler.getMetrics().counters.completed, 1)
 })
 
 test('pending scheduler launches exactly one analyst and root-accounts L0 without a child launch', async () => {
@@ -943,6 +1318,46 @@ test('pending scheduler launches exactly one analyst and root-accounts L0 withou
   assert.equal(resumed.getMetrics().rootAccounting.status, 'completed')
   assert.throws(() => scheduler.freezeRoute('LIGHT', resolveSchedulerSettings({ route: 'LIGHT' })),
     (error) => error.code === 'ROUTE_ALREADY_FROZEN')
+})
+
+test('late analyst and root usage remains factual while a valid DIRECT task continues', async () => {
+  const scheduler = new CentralScheduler({
+    route: 'PENDING', runIdentity: TEST_RUN,
+    environment: {
+      AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1',
+      AUTOPROMPT_BENCHMARK_NO_TOKEN_LIMIT: '1',
+    },
+  })
+  const analyst = await scheduler.acquireWithAuthority(authority(scheduler), {
+    workItemId: 'route-analyst', role: 'ap-route-analyst', lane: 'routeAnalyst', purpose: 'planning',
+  })
+  const analystVerdict = analyst.reportUsage({
+    noncachedInput: 230000, cachedInput: 0, output: 0, reasoning: 0,
+  })
+  assert.equal(analystVerdict.continue, true)
+  assert.equal(analystVerdict.code, 'ADMISSION_CONVERGENCE_REQUIRED')
+  analyst.complete()
+
+  const root = scheduler.beginRootAccounting({ phase: 'routeDecision', sessionId: 'late-valid-root' })
+  const rootVerdict = root.reportUsage({
+    noncachedInput: 0, cachedInput: 0, output: 41000, reasoning: 0,
+  })
+  assert.equal(rootVerdict.continue, true)
+  assert.equal(rootVerdict.completionCanContinue, true)
+  root.complete()
+  const measured = scheduler.checkAdmissionTime()
+  assert.equal(measured.withinCeiling, false)
+  assert.equal(measured.completionCanContinue, true)
+  assert.ok(measured.breaches.includes('route:noncachedInput'))
+  assert.ok(measured.breaches.includes('route:output'))
+
+  scheduler.freezeRoute('DIRECT', resolveSchedulerSettings({ route: 'DIRECT' }))
+  const required = await admit(scheduler, {
+    workItemId: 'direct-required-after-late-valid-route', purpose: 'work', lane: 'main',
+  })
+  finish(required)
+  assert.equal(scheduler.getMetrics().counters.completed, 2)
+  assert.equal(scheduler.getMetrics().rootAccounting.status, 'completed')
 })
 
 test('invalid terminal root usage releases accounting without fabricating categories or enabling freeze', async () => {
@@ -1129,6 +1544,52 @@ test('retry preflight is side-effect free and rejects missing progress before re
     workItemId: 'preflight-2', equivalenceKey: 'preflight-loop',
     evidenceHashes: ['b'.repeat(64)],
   }).priorAttempts, 1)
+})
+
+test('scheduler-bound completion identities derive bounded retry progress but deny duplicates and extras', async () => {
+  const settings = resolveSchedulerSettings({ route: 'DIRECT', requiredChildLaunches: 3 })
+  const scheduler = createTestScheduler({ settings })
+  const requiredRequest = workItemId => ({
+    workItemId,
+    equivalenceKey: 'required-executor',
+    role: 'ap-worker',
+    logicalRole: 'worker',
+    purpose: 'work',
+    lane: 'main',
+  })
+  const launchRequired = async workItemId => {
+    const request = requiredRequest(workItemId)
+    const requiredCompletionBinding = scheduler.issueRequiredCompletionBinding(request)
+    assert.equal(scheduler.assertRetryProgress({
+      ...request, requiredCompletionBinding,
+    }).admitted, true)
+    const lease = await scheduler.acquireWithAuthority(authority(scheduler, null, {
+      requiredCompletionBinding,
+    }), { ...request, requiredCompletionBinding })
+    finish(lease)
+  }
+
+  await launchRequired('required-generation-1')
+  await launchRequired('required-generation-2')
+  const duplicate = requiredRequest('required-generation-2')
+  const duplicateBinding = scheduler.issueRequiredCompletionBinding(duplicate)
+  assert.throws(() => scheduler.assertRetryProgress({
+    ...duplicate, requiredCompletionBinding: duplicateBinding,
+  }), error => error.code === 'RETRY_REASSESSMENT_REQUIRED')
+  await launchRequired('required-generation-3')
+
+  const extra = requiredRequest('required-generation-4')
+  const extraBinding = scheduler.issueRequiredCompletionBinding(extra)
+  await assert.rejects(scheduler.acquireWithAuthority(authority(scheduler, null, {
+    requiredCompletionBinding: extraBinding,
+  }), { ...extra, requiredCompletionBinding: extraBinding }), error => error.code === 'LAUNCH_LIMIT')
+  assert.throws(() => scheduler.issueRequiredCompletionBinding({
+    ...requiredRequest('optional-extra'), optionalWork: true,
+  }), error => error.code === 'INVALID_LAUNCH_AUTHORITY')
+  await assert.rejects(scheduler.acquireWithAuthority(authority(scheduler), {
+    ...requiredRequest('forged-extra'),
+    requiredCompletionBinding: { ...extraBinding },
+  }), error => error.code === 'INVALID_LAUNCH_AUTHORITY')
 })
 
 test('cache provenance migrates generations but rejects cross-run, changed inputs, and result-hash mismatch', () => {

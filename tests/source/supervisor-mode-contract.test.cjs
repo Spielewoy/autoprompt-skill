@@ -119,7 +119,7 @@ test('affected provider skills define scope markers as post-relaunch durable hin
   }
 })
 
-test('AP-RUN-012 modern Codex shell adapters reject legacy SENTINEL overrides before runtime', () => {
+test('AP-RUN-012 modern Codex shell adapters ignore unrelated legacy SENTINEL variables', () => {
   const copiedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-sentinel-override-'))
   try {
     const fakeRuntime = path.join(copiedRoot, 'phase-budget.js')
@@ -135,22 +135,9 @@ test('AP-RUN-012 modern Codex shell adapters reject legacy SENTINEL overrides be
             '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', copy,
             'sentinel rejection',
           ], { cwd: ROOT, encoding: 'utf8', env, timeout: 10000 })
-      assert.equal(completed.status, 2, `${label}: ${completed.stdout}\n${completed.stderr}`)
-      assert.match(completed.stderr, /LEGACY_SENTINEL_UNSUPPORTED/, label)
-      assert.doesNotMatch(completed.stdout, /STRICT_RUNTIME_REACHED/, label)
-      if (port === 'powershell') {
-        const delayedShutdown = childProcess.spawnSync(POWERSHELL, [
-          '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
-          'Register-EngineEvent -SourceIdentifier PowerShell.Exiting ' +
-            '-Action { Start-Sleep -Seconds 12 } | Out-Null; ' +
-            `& ${powershellLiteral(copy)} 'sentinel rejection'; exit $LASTEXITCODE`,
-        ], { cwd: ROOT, encoding: 'utf8', env, timeout: 10000 })
-        assert.equal(delayedShutdown.status, 2,
-          `${label} delayed shutdown: ${delayedShutdown.stdout}\n${delayedShutdown.stderr}\n` +
-          `${delayedShutdown.error?.message || ''}`)
-        assert.match(delayedShutdown.stderr, /LEGACY_SENTINEL_UNSUPPORTED/, label)
-        assert.doesNotMatch(delayedShutdown.stdout, /STRICT_RUNTIME_REACHED/, label)
-      }
+      assert.equal(completed.status, 77, `${label}: ${completed.stdout}\n${completed.stderr}`)
+      assert.match(completed.stdout, /STRICT_RUNTIME_REACHED/, label)
+      assert.doesNotMatch(completed.stderr, /LEGACY_SENTINEL_UNSUPPORTED/, label)
     }
   } finally {
     fs.rmSync(copiedRoot, { recursive: true, force: true })

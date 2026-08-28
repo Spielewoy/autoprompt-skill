@@ -7,6 +7,7 @@ const test = require('node:test')
 
 const {
   activationRuntimeSettings,
+  codexPhysicalExecutionReceipt,
   productionExactPathPreflight,
   RuntimeCapabilityAuthority,
   runSupervisorCli,
@@ -15,6 +16,7 @@ const {
   stableStringify: serializeCanonicalValue,
 } = require('../../agents/codex/workflow/request-envelope.js')
 const { resolveSettings } = require('../../agents/codex/workflow/settings.js')
+const { createExactPathDecision } = require('../../agents/codex/workflow/route-decision.js')
 
 const H = 'a'.repeat(64)
 const H3 = 'c'.repeat(64)
@@ -123,7 +125,7 @@ test('production supervisor CLI installs its private deterministic exact-path pr
     /createSupervisorOptions\(args,\s*\{\s*adapterPath,\s*exactPathPreflight:\s*productionExactPathPreflight,?\s*\}\)/)
 })
 
-test('production exact-path receipts accept contained read-only direct, light, and roadmap only from attested bindings', () => {
+test('production exact-path receipts apply one contained local ceiling only from attested bindings', () => {
   for (const route of ['DIRECT', 'LIGHT', 'ROADMAP']) {
     const input = canonicalInput(route)
     const receipt = productionExactPathPreflight(input)
@@ -132,10 +134,16 @@ test('production exact-path receipts accept contained read-only direct, light, a
     assert.equal(receipt.targetIdentity, 'filesystem:C:/workspace')
     assert.equal(receipt.providerCapabilitiesHash, H2)
     assert.equal(receipt.budgetSnapshotHash, H3)
-    assert.equal(receipt.routeFacts.requestedEffect, 'inspect')
-    assert.deepEqual(receipt.routeFacts.mutableResources, [])
-    assert.deepEqual(receipt.routeFacts.sideEffects, [])
+    assert.equal(receipt.missionClassificationReceipt.classificationVersion,
+      'codex-contained-local-authority-ceiling-v1')
+    assert.equal(receipt.routeFacts.requestedEffect, 'mutate')
+    assert.deepEqual(receipt.routeFacts.mutableResources, [{
+      kind: 'directory', identity: targetIdentity, shared: false, ownershipMode: 'single-owner',
+    }])
+    assert.deepEqual(receipt.routeFacts.sideEffects, ['deliverable-write'])
     assert.equal(receipt.routeFacts.operatorMinimumRoute, route)
+    assert.equal(receipt.routeFacts.riskAndIndependentCheckFloor.minimumCheckerCount, 1)
+    assert.deepEqual(receipt.routeFacts.riskAndIndependentCheckFloor.namedDistinctResponsibilities, [])
     assert.deepEqual(receipt.routeFacts.deadlineBudget, {
       remainingSeconds: 600,
       admissionSeconds: 0,
@@ -146,7 +154,7 @@ test('production exact-path receipts accept contained read-only direct, light, a
   }
 })
 
-test('leading explicit path strips only its control and conservatively denies preserved inline or quoted path prose', () => {
+test('leading explicit path strips only its control and admits arbitrary quoted mission prose locally', () => {
   for (const argv of [
     ['path=direct', 'Review literal path=light prose in the contained local source files.'],
     ['--path', 'direct', '"path=light" is quoted prose in the contained local source files.'],
@@ -154,22 +162,16 @@ test('leading explicit path strips only its control and conservatively denies pr
     const original = [...argv]
     const settings = resolvedSettings(argv)
     const envelope = canonicalRequestEnvelope(argv)
-    let routeModelCalls = 0
-    let l0Calls = 0
-    let productionCalls = 0
-
     assert.equal(settings.status, 'READY', JSON.stringify(argv))
     assert.equal(settings.path.exactRoute, 'DIRECT', JSON.stringify(argv))
     assert.deepEqual(JSON.parse(envelope.bytes.toString('utf8')).argv, original)
-    assert.throws(() => productionExactPathPreflight(canonicalInput('DIRECT', {
+    const receipt = productionExactPathPreflight(canonicalInput('DIRECT', {
       argv,
-    })), error => error && error.code === 'EXACT_PATH_FACTS_REQUIRED')
+    }))
+    assert.equal(receipt.routeFacts.requestedEffect, 'mutate')
+    assert.equal(receipt.routeFacts.externality, 'local-only')
+    assert.deepEqual(receipt.routeFacts.sideEffects, ['deliverable-write'])
     assert.deepEqual(argv, original)
-    assert.deepEqual({ routeModelCalls, l0Calls, productionCalls }, {
-      routeModelCalls: 0,
-      l0Calls: 0,
-      productionCalls: 0,
-    })
   }
 })
 
@@ -191,21 +193,67 @@ test('inline path text without a leading control preserves the entire mission an
   }
 })
 
-test('production exact-path refuses unknown, mutating, authority-bearing, or unauthenticated facts before models or production', () => {
+test('production exact-path treats free-form mission words as local work, never effect authority', () => {
+  const missions = [
+    ['Consider the repository.'],
+    ['Implement the bounded local change.'],
+    ['Send an email to a third party.'],
+    ['Review', 'and', 'change', 'repository', 'permissions.'],
+  ]
+  for (const route of ['DIRECT', 'LIGHT', 'ROADMAP']) {
+    for (const mission of missions) {
+      const receipt = productionExactPathPreflight(canonicalInput(route, {
+        argv: [`path=${route.toLowerCase()}`, ...mission],
+      }))
+      assert.equal(receipt.routeFacts.requestedEffect, 'mutate')
+      assert.equal(receipt.routeFacts.externality, 'local-only')
+      assert.equal(receipt.routeFacts.thirdPartyImpact, 'none')
+      assert.equal(receipt.routeFacts.costAuthority.mayIncurCost, false)
+      assert.deepEqual(receipt.routeFacts.sideEffects, ['deliverable-write'])
+      assert.equal(receipt.routeFacts.operatorMinimumRoute, route)
+    }
+  }
+})
+
+test('quoted and split missions preserve shared topology while Codex normal execution stays two calls', () => {
+  for (const route of ['DIRECT', 'LIGHT', 'ROADMAP']) {
+    for (const missionArgv of [
+      ['Fix the parser and verify it.'],
+      ['Fix', 'the', 'parser', 'and', 'verify', 'it.'],
+    ]) {
+      const input = canonicalInput(route, {
+        argv: [`path=${route.toLowerCase()}`, ...missionArgv],
+      })
+      const preflight = productionExactPathPreflight(input)
+      const decision = createExactPathDecision({
+        route,
+        preflight,
+        requestedResult: missionArgv.join(' '),
+        requestEnvelopeHash: input.requestEnvelopeHash,
+        targetIdentity,
+        providerCapabilities,
+        providerCapabilitiesHash: H2,
+        budget: input.budget,
+        budgetSnapshotHash: H3,
+        nowMs: 0,
+      })
+      assert.equal(decision.topology.valid, true, decision.topology.errors.join('\n'))
+      assert.equal(decision.topology.counts.routeAnalysts, 0)
+      assert.equal(decision.topology.counts.workers, 1)
+      assert.equal(decision.topology.counts.finalCheckers, 1)
+      assert.equal(decision.topology.childSessions, 2)
+      const physical = codexPhysicalExecutionReceipt(decision)
+      assert.equal(physical.analystLaunches, 0)
+      assert.equal(physical.basePhysicalLaunches, 2)
+      assert.equal(physical.requiredChildLaunches, 6,
+        'worker + checker normal path plus one transport, report, product, and fresh-check contingency')
+    }
+  }
+})
+
+test('production exact-path still refuses malformed or unauthenticated bindings before production', () => {
   const cases = [
     [canonicalInput('DIRECT', { argv: ['path=direct', ''] }), 'EXACT_PATH_FACTS_REQUIRED'],
-    [canonicalInput('DIRECT', {
-      argv: ['path=direct', 'Consider the repository.'],
-    }), 'EXACT_PATH_FACTS_REQUIRED'],
-    [canonicalInput('DIRECT', {
-      argv: ['path=direct', 'Implement the bounded local change.'],
-    }), 'EXACT_PATH_FACTS_REQUIRED'],
-    [canonicalInput('DIRECT', {
-      argv: ['path=direct', 'Send an email to a third party.'],
-    }), 'EXACT_PATH_FACTS_REQUIRED'],
-    [canonicalInput('DIRECT', {
-      argv: ['path=direct', 'Review and change repository permissions.'],
-    }), 'EXACT_PATH_FACTS_REQUIRED'],
     [canonicalInput('DIRECT', { targetEvidence: null }), 'EXACT_PATH_FACTS_REQUIRED'],
     [canonicalInput('DIRECT', {
       targetEvidence: {

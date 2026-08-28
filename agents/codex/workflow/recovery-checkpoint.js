@@ -424,56 +424,61 @@ function candidateAdvanceIsCanonical(previous, record, events) {
   return candidateHash === record.checkpoint.immutableHashes.candidateHash
 }
 
-function roadmapPlanAdvanceIsCanonical(previous, record) {
+function roadmapPlanLineageIsCanonical(previous, record, lineage) {
   const before = previous.checkpoint
   const after = record.checkpoint
-  const transitions = [
-    { authorId: 'roadmap-author-revise', checkerId: 'roadmap-plan-check' },
-    { authorId: 'roadmap-author-plan-repair', checkerId: 'roadmap-plan-recheck' },
-  ]
-  const advance = transitions.find(item =>
-    before.scheduler.completedWorkIds.includes(item.authorId) &&
-    stableStringify(before.scheduler.nextReadyWorkIds) === stableStringify([item.checkerId]))
-  if (!advance) return false
-  const { authorId, checkerId } = advance
   const beforePlanHash = before.immutableHashes.planHash
   const afterPlanHash = after.immutableHashes.planHash
-  const lease = after.scheduler.leases.length === 1 ? after.scheduler.leases[0] : null
-  const exact = (actual, expected) => stableStringify(actual) === stableStringify(expected)
-
-  const common = before.scheduler.route === 'ROADMAP' && after.scheduler.route === 'ROADMAP' &&
-    before.scheduler.phase === 'RUN_WORK' && after.scheduler.phase === 'RUN_WORK' &&
-    HASH_PATTERN.test(beforePlanHash || '') && HASH_PATTERN.test(afterPlanHash || '') &&
+  const fields = [
+    'schemaVersion', 'kind', 'priorPlanHash', 'replacementPlanHash', 'routeDecisionHash',
+    'projectionReceiptHash', 'artifactReceiptHash', 'transactionReceiptHash', 'migration',
+    'legacyCauseId',
+    'previousCheckpointSequence', 'previousCheckpointEntryHash', 'checkpointSequence',
+    'stateEventSequence', 'accountingSequence', 'schedulerStateHash', 'causeKind',
+    'lineageReceiptHash',
+  ]
+  if (!exactKeys(lineage, fields) || lineage.schemaVersion !== 1 ||
+      lineage.kind !== 'codex-roadmap-plan-lineage' ||
+      !(lineage.priorPlanHash === null || HASH_PATTERN.test(lineage.priorPlanHash || '')) ||
+      !HASH_PATTERN.test(lineage.replacementPlanHash || '') ||
+      !HASH_PATTERN.test(lineage.routeDecisionHash || '') ||
+      !HASH_PATTERN.test(lineage.projectionReceiptHash || '') ||
+      !HASH_PATTERN.test(lineage.artifactReceiptHash || '') ||
+      !(lineage.transactionReceiptHash === null || HASH_PATTERN.test(lineage.transactionReceiptHash || '')) ||
+      typeof lineage.migration !== 'boolean' ||
+      !(lineage.legacyCauseId === null || CAUSE_ID_PATTERN.test(lineage.legacyCauseId || '')) ||
+      !Number.isSafeInteger(lineage.previousCheckpointSequence) ||
+      !Number.isSafeInteger(lineage.checkpointSequence) ||
+      !Number.isSafeInteger(lineage.stateEventSequence) ||
+      !Number.isSafeInteger(lineage.accountingSequence) ||
+      !HASH_PATTERN.test(lineage.previousCheckpointEntryHash || '') ||
+      !HASH_PATTERN.test(lineage.schedulerStateHash || '') ||
+      !['PLAN_PROJECTION_COMMITTED', 'CRASH_RECOVERY', 'LEASE_STARTED'].includes(lineage.causeKind) ||
+      !HASH_PATTERN.test(lineage.lineageReceiptHash || '')) return false
+  const unsigned = { ...lineage }
+  delete unsigned.lineageReceiptHash
+  const exactCauseBinding = lineage.migration === false
+    ? lineage.transactionReceiptHash !== null && lineage.legacyCauseId === null &&
+      ['PLAN_PROJECTION_COMMITTED', 'CRASH_RECOVERY'].includes(lineage.causeKind) &&
+      record.cause.causeId === `plan-lineage:${lineage.lineageReceiptHash}`
+    : lineage.transactionReceiptHash === null && lineage.legacyCauseId === record.cause.causeId &&
+      ['PLAN_PROJECTION_COMMITTED', 'CRASH_RECOVERY', 'LEASE_STARTED'].includes(lineage.causeKind)
+  return exactCauseBinding && lineage.lineageReceiptHash === sha256(stableStringify(unsigned)) &&
+    before.scheduler.route === 'ROADMAP' && after.scheduler.route === 'ROADMAP' &&
     beforePlanHash !== afterPlanHash &&
-    before.immutableHashes.routeDecisionHash === after.immutableHashes.routeDecisionHash &&
-    before.immutableHashes.candidateHash === null && after.immutableHashes.candidateHash === null &&
-    before.scheduler.candidate.candidateHash === null && after.scheduler.candidate.candidateHash === null &&
-    !before.scheduler.completedCheckIds.includes(checkerId) &&
-    exact(before.scheduler.openCheckIds, []) &&
-    exact(before.scheduler.nextReadyWorkIds, [checkerId]) &&
-    exact(before.scheduler.leases, [])
-  if (!common) return false
-
-  const admittedRecheck = before.stateEvent.sequence === after.stateEvent.sequence &&
-    before.stateEvent.eventHash === after.stateEvent.eventHash &&
-    exact(after.scheduler.completedWorkIds, before.scheduler.completedWorkIds) &&
-    exact(after.scheduler.completedCheckIds, before.scheduler.completedCheckIds) &&
-    exact(after.scheduler.openCheckIds, [checkerId]) &&
-    exact(after.scheduler.nextReadyWorkIds, [`reconcile:${checkerId}`]) &&
-    record.cause.kind === 'LEASE_STARTED' && lease !== null &&
-    lease.workItemId === checkerId && lease.roleId === 'ap-independent-checker' &&
-    lease.status === 'ADMITTED' && Boolean(lease.reservationId) && Boolean(lease.sessionId) &&
-    Boolean(lease.continuationId) && HASH_PATTERN.test(lease.crashBindingHash || '') &&
-    lease.thread.started === false
-  const crashProjectionAdoption = record.cause.kind === 'CRASH_RECOVERY' &&
-    exact(after.scheduler, before.scheduler)
-  const committedProjection = record.cause.kind === 'PLAN_PROJECTION_COMMITTED' &&
-    after.stateEvent.sequence === before.stateEvent.sequence &&
-    after.stateEvent.eventHash === before.stateEvent.eventHash &&
-    after.stateEvent.stateChecksum === before.stateEvent.stateChecksum &&
-    after.stateEvent.state === before.stateEvent.state &&
-    exact(after.scheduler, before.scheduler)
-  return admittedRecheck || crashProjectionAdoption || committedProjection
+    lineage.priorPlanHash === beforePlanHash &&
+    lineage.replacementPlanHash === afterPlanHash &&
+    lineage.routeDecisionHash === before.immutableHashes.routeDecisionHash &&
+    lineage.routeDecisionHash === after.immutableHashes.routeDecisionHash &&
+    before.immutableHashes.candidateHash === after.immutableHashes.candidateHash &&
+    before.scheduler.candidate.candidateHash === after.scheduler.candidate.candidateHash &&
+    lineage.previousCheckpointSequence === previous.sequence &&
+    lineage.previousCheckpointEntryHash === previous.entryHash &&
+    lineage.checkpointSequence === record.sequence &&
+    lineage.stateEventSequence === after.stateEvent.sequence &&
+    lineage.accountingSequence === after.accounting.lastAccountingSequence &&
+    lineage.schedulerStateHash === after.scheduler.stateHash &&
+    lineage.causeKind === record.cause.kind
 }
 
 class RecoveryCheckpointAuthority {
@@ -531,9 +536,17 @@ class RecoveryCheckpointAuthority {
           const previous = records.at(-1) || null
           const authority = this._authority(binding, input.providerCapabilitiesHash)
           this._validateAuthorityAdvance(authority, previous, cause.kind)
-          const occurredAt = String(this.clock())
+          let occurredAt = String(this.clock())
           if (Number.isNaN(Date.parse(occurredAt))) fail('RECOVERY_CHECKPOINT_CLOCK_INVALID', 'checkpoint wall clock is not a date-time')
-          if (previous && Date.parse(occurredAt) < Date.parse(previous.occurredAt)) fail('RECOVERY_CHECKPOINT_ROLLBACK', 'checkpoint wall time decreased')
+          // A host wall-clock correction is not evidence that authenticated
+          // checkpoint state moved backward. Preserve a monotonic timestamp for
+          // this new record at the already verified durable high-water; replay
+          // still rejects any existing record whose timestamp/hash chain was
+          // rewritten or whose state/accounting/external-operation lineage
+          // regresses.
+          if (previous && Date.parse(occurredAt) < Date.parse(previous.occurredAt)) {
+            occurredAt = previous.occurredAt
+          }
           const record = canonicalize({
             schemaVersion: SCHEMA_VERSION,
             authority,
@@ -1032,16 +1045,17 @@ class RecoveryCheckpointAuthority {
         fail('RECOVERY_CHECKPOINT_ROLLBACK', 'checkpoint changed bound routeDecisionHash')
       }
       const priorPlanHash = previous.checkpoint.immutableHashes.planHash
-      if (priorPlanHash !== null && record.checkpoint.immutableHashes.planHash !== priorPlanHash) {
-        let verifiedAdvance = false
-        if (roadmapPlanAdvanceIsCanonical(previous, record) && this.roadmapPlanAdvanceVerifier) {
+      const replacementPlanHash = record.checkpoint.immutableHashes.planHash
+      const requiresRoadmapLineage = replacementPlanHash !== priorPlanHash &&
+        (priorPlanHash !== null || record.checkpoint.scheduler.route === 'ROADMAP')
+      if (requiresRoadmapLineage) {
+        let verifiedLineage = null
+        if (this.roadmapPlanAdvanceVerifier) {
           try {
-            verifiedAdvance = this.roadmapPlanAdvanceVerifier(previous, record) === true
-          } catch {
-            verifiedAdvance = false
-          }
+            verifiedLineage = this.roadmapPlanAdvanceVerifier(previous, record)
+          } catch {}
         }
-        if (!verifiedAdvance) {
+        if (!roadmapPlanLineageIsCanonical(previous, record, verifiedLineage)) {
           fail('RECOVERY_CHECKPOINT_ROLLBACK', 'checkpoint changed bound planHash')
         }
       }

@@ -441,13 +441,13 @@ test('AP-RUN-028 production lifecycle starts and decides route-neutral execution
 
     const originalExecutionStart = budget.snapshot().phaseStartedAtElapsedMs.EXECUTION_BUILD
     now = phases.EXECUTION_BUILD.hardMs
-    await assert.rejects(
-      runtime._runtimeTransition('MORE_WORK_READY', 'RUN_WORK'),
-      error => error.code === 'PHASE_BUDGET_EXHAUSTED' && error.details.phase === 'EXECUTION_BUILD',
-    )
-    assert.equal(budget.snapshot().phaseStartedAtElapsedMs.EXECUTION_BUILD, originalExecutionStart,
+    await runtime._runtimeTransition('MORE_WORK_READY', 'RUN_WORK')
+    const afterOverrun = budget.snapshot()
+    assert.equal(afterOverrun.phaseStartedAtElapsedMs.EXECUTION_BUILD, originalExecutionStart,
       `${route}: repeated phase entry reset the hard deadline`)
-    assert.deepEqual(transitions, ['RUN_WORK', 'CHECK_WORK', 'RESUME_EXACT_STATE', 'RELEASING_LOCK'])
+    assert.equal(afterOverrun.pendingConvergence.EXECUTION_BUILD.level, 'HARD')
+    assert.equal(afterOverrun.breachEvidence.at(-1).phase, 'EXECUTION_BUILD')
+    assert.deepEqual(transitions, ['RUN_WORK', 'CHECK_WORK', 'RESUME_EXACT_STATE', 'RELEASING_LOCK', 'RUN_WORK'])
   }
 })
 
@@ -493,7 +493,7 @@ test('AP-RUN-034 state-store commit failure has bounded typed recovery and no re
   assert.equal(failedStateCommits, 2)
 })
 
-test('AP-RUN-035 modern supervisor rejects parsed/glob legacy sentinel allowlists before probing or launching', () => {
+test('AP-RUN-035 unrelated legacy sentinel variables have no controller authority', () => {
   const legacySentinels = [
     'DONE-*',
     '../foreign-ledger/DONE-*',
@@ -508,7 +508,7 @@ test('AP-RUN-035 modern supervisor rejects parsed/glob legacy sentinel allowlist
       environment: { SENTINEL },
       execFileSync() { probes += 1 },
       runtimeOptionsFactory() { runtimeFactories += 1; return {} },
-    }), error => error.code === 'LEGACY_SENTINEL_UNSUPPORTED')
+    }), error => error.code === 'ACTIVATION_RECEIPT_INVALID')
   }
   assert.equal(probes, 0)
   assert.equal(runtimeFactories, 0)

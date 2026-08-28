@@ -12,7 +12,8 @@ const { BudgetController } = require(path.join(WORKFLOW, 'budget-controller.js')
 const { CentralScheduler } = require(path.join(WORKFLOW, 'scheduler.js'))
 const {
   CodexExecAdapter, CodexSupervisorRuntime, applyProductionRuntimeTransition,
-  bindResidualRiskAuthorityReceipt, createCodexJsonlAccumulator,
+  bindCanonicalMissionForChild, bindResidualRiskAuthorityReceipt, createCanonicalMissionProjection,
+  createCodexJsonlAccumulator,
   createDefaultExternalOperation, createResidualRiskDisposition, executeExistingTestBaseline,
   persistTerminalSession, phaseBudgetVerdict, reconcileExternalOperationTimeout,
   resolveTrustedTestDeclarations, validateResumedBudget,
@@ -79,7 +80,7 @@ test('RUN-018 production transition progress is activation-bound; overwrite/dele
   }
 })
 
-test('RUN-022 production resume reader exhausts equivalentCount/backoffExponent', () => {
+test('RUN-022 exhausted crash bookkeeping cannot deny an authenticated next generation', () => {
   const controller = budget()
   for (let index = 0; index < 3; index += 1) controller.recordCrash('poison', { activationId: 'activation-r9' })
   const prior = controller.snapshot()
@@ -87,7 +88,16 @@ test('RUN-022 production resume reader exhausts equivalentCount/backoffExponent'
     exhausted: true, code: 'CRASH_RETRY_EXHAUSTED', equivalentCount: 3,
     backoffExponent: 2, maximumEquivalentCrashes: 3,
   })
-  assert.throws(() => validateResumedBudget(controller, prior, 2), error => error.code === 'CRASH_RETRY_EXHAUSTED')
+  assert.deepEqual(validateResumedBudget(controller, prior, 2), {
+    generation: 2,
+    startedAtElapsedMs: 0,
+    reason: 'same activation resume',
+    retainedBreaches: 0,
+    remaining: { wallMs: 100_000, tokens: 10_000, sessions: 20, launches: 20 },
+  })
+  assert.equal(controller.snapshot().generation, 2)
+  assert.equal(controller.crashRetryVerdict().exhausted, true,
+    'crash convergence evidence remains visible without becoming task-stop authority')
 })
 
 test('RUN-023 large JSONL stream retains a bounded tail and constant-size watermark', () => {
@@ -105,16 +115,17 @@ test('RUN-023 large JSONL stream retains a bounded tail and constant-size waterm
   assert.ok(performance.now() - startedAt < 10_000)
 })
 
-test('TRACE-006 production deadline check fails when no first signal was supplied', () => {
+test('TRACE-006 missing first product signal records convergence without stopping required work', () => {
   const scheduler = new CentralScheduler({
     route: 'DIRECT', runIdentity: { runId: 'runtime-residual-r9', generation: 1 },
   })
-  assert.throws(
-    () => scheduler.assertFirstProductSignalDue({ elapsedMs: 360_001 }),
-    error => error.code === 'FIRST_PRODUCT_SIGNAL_MISSING' &&
-      error.details.firstProductSignal.kind === 'MISSING' &&
-      error.details.firstProductSignal.withinCeiling === false,
-  )
+  const measurement = scheduler.assertFirstProductSignalDue({ elapsedMs: 360_001 })
+  assert.deepEqual(measurement, {
+    kind: 'MISSING', elapsedMs: 360_001, evidenceHash: null,
+    ceilingMs: 360_000, withinCeiling: false,
+    reason: 'no RED or product edit was emitted',
+  })
+  assert.equal(scheduler.getMetrics().admission.breaches.includes('admission:firstProductSignal'), true)
 })
 
 test('TRACE-011 external writes get a default producer and terminal reconciled timeout outcome', () => {
@@ -132,15 +143,28 @@ test('TRACE-011 external writes get a default producer and terminal reconciled t
 })
 
 function adapterRecord(overrides = {}) {
+  const projection = createCanonicalMissionProjection('Complete the bounded residual-wiring fixture.')
+  const activationId = 'activation-r9-adapter'
+  const generation = 1
+  const workItemId = 'work-r9-adapter'
+  const requestEnvelopeHash = H('request-r9')
   return {
-    entryPrompt: '$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\n{}',
+    activationId, generation, workItemId,
+    canonicalMission: projection.canonicalMission,
+    missionBinding: bindCanonicalMissionForChild(projection, {
+      sourceRequestHash: projection.sourceRequestHash,
+      requestEnvelopeHash,
+      activationId,
+      generation,
+      workItemId,
+    }),
     logicalRole: 'worker', physicalRole: 'autoprompt.v2.worker', providerRole: 'ap-worker',
     physicalExecutionPolicy: {
       logicalRole: 'worker', physicalRole: 'autoprompt.v2.worker', providerRole: 'ap-worker',
       sandboxMode: 'workspace-write', policyId: 'policy-r9', policyVersion: 1,
       canDispatch: false, resourceSets: { read: [], write: ['workspace'], exclusive: [] },
     },
-    dispatch: { brief: 'bounded work', requestPointer: { hash: H('request-r9') } },
+    dispatch: { brief: 'bounded work', requestPointer: { hash: requestEnvelopeHash } },
     sessionId: 'session-r9', reservationId: 'reservation-r9', environment: {},
     ...overrides,
   }
@@ -157,7 +181,8 @@ test('TRACE-011 default adapter denies or intercepts the actual external-write b
     },
   }
   const adapter = new CodexExecAdapter({
-    runner, targetPath: ROOT, profilePath: ROOT, outputSchemaResolver: () => ROOT,
+    runner, targetPath: ROOT, profilePath: ROOT,
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
   })
   const deadline = Object.assign(new Error('external write deadline elapsed'), {
     code: 'EXTERNAL_WRITE_DEADLINE_EXPIRED',
@@ -170,7 +195,8 @@ test('TRACE-011 default adapter denies or intercepts the actual external-write b
 
   const unavailable = new CodexExecAdapter({
     runner: { run: async () => { writes += 1 } },
-    targetPath: ROOT, profilePath: ROOT, outputSchemaResolver: () => ROOT,
+    targetPath: ROOT, profilePath: ROOT,
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
   })
   await assert.rejects(unavailable.launch(adapterRecord({
     externalOperation: { operationId: 'external:r9-unavailable' }, beforeExternalWrite() {},
@@ -192,7 +218,8 @@ test('TRACE-006 adapter emits a validated product signal while the child remains
         throw Object.assign(new Error('bounded test stop'), { code: 'TEST_STOP' })
       },
     },
-    targetPath: ROOT, profilePath: ROOT, outputSchemaResolver: () => ROOT,
+    targetPath: ROOT, profilePath: ROOT,
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
   })
   const launched = adapter.launch(adapterRecord({ onFirstProductSignal: signal => signals.push(signal) }))
   await new Promise(resolve => setImmediate(resolve))
@@ -292,6 +319,7 @@ test('ROUTE-013 live safe degradation reclassifies DIRECT to sequential LIGHT', 
 test('ROUTE-016/018 production transition freezes full graph and records both bound verdicts', () => {
   const calls = []
   const stateStore = {
+    load() { return { state: 'RUN_WORK', retryState: {} } },
     freezeCandidateForChecks(input) { calls.push(['freeze', input]); return { sequence: 1, lastEventHash: H('freeze') } },
     recordIndependentVerdict(input) { calls.push(['verdict', input]); return { sequence: calls.length, lastEventHash: H(input.verdictId) } },
     transition() { throw new Error('generic transition must not handle graph-bound events') },

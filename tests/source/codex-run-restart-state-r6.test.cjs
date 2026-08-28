@@ -19,7 +19,6 @@ const POWERSHELL_AVAILABLE = spawnSync(
 const { BudgetController } = require(path.join(WORKFLOW, 'budget-controller.js'))
 const {
   assertDistinctEvidenceConsumption,
-  consumeSplitRequired,
   createCodexJsonlAccumulator,
   createResidualRiskDisposition,
   reconstructTypedExitZeroResult,
@@ -113,7 +112,7 @@ test('RUN-023/026 JSONL is accumulated once and exit-zero missing results recons
   assert.equal(reconstructed.requestedTransition.event, 'WORK_ITEM_VERIFIED')
 })
 
-test('LAYER transition, evidence, residual, completion, and split mechanisms fail closed', () => {
+test('LAYER transition, evidence, residual, and completion mechanisms fail closed', () => {
   assert.equal(validateWorkerRequestedTransition({ requestedTransition: {
     event: 'WORK_ITEM_VERIFIED', reason: 'Accepted exact result.', invalidateEvidenceIds: [],
   } }).event, 'WORK_ITEM_VERIFIED')
@@ -144,13 +143,6 @@ test('LAYER transition, evidence, residual, completion, and split mechanisms fai
     assert.ok(gates.includes('usable-build'))
     assert.equal(gates.includes('risk-sign-off'), tier === 'T3')
   }
-  const split = consumeSplitRequired({ code: 'SPLIT_REQUIRED', remainingConcerns: ['api', 'ui'] }, {
-    route: 'LIGHT', depth: 0, remainingLaunches: 2, parentWorkItemId: 'work-1',
-  })
-  assert.deepEqual(split.parts.map(part => part.workItemId), ['work-1:split:1', 'work-1:split:2'])
-  assert.throws(() => consumeSplitRequired({ code: 'SPLIT_REQUIRED', remainingConcerns: ['a', 'b'] }, {
-    route: 'LIGHT', depth: 1, remainingLaunches: 2, parentWorkItemId: 'work-1',
-  }), error => error.code === 'SPLIT_DECOMPOSITION_INVALID')
 })
 
 test('RUN-016 PowerShell adapter rejects alternate, corrupt, and wrong-version controllers', {

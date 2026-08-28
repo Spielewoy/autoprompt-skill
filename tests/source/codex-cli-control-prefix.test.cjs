@@ -250,7 +250,7 @@ test('an explicit delimiter starts mission content and later path-like tokens st
     assert.equal(settings.status, 'READY', JSON.stringify(argv))
     assert.equal(settings.path.exactRoute, 'DIRECT', JSON.stringify(argv))
     if (argv[1] === '--') {
-      assert.equal(preflight(argv, 'DIRECT', settings).routeFacts.requestedEffect, 'inspect')
+      assert.equal(preflight(argv, 'DIRECT', settings).routeFacts.requestedEffect, 'mutate')
     }
   }
 })
@@ -288,7 +288,7 @@ test('production controls accept every supported explicit direct path spelling',
   ]) {
     const settings = resolvedSettings(argv)
     assert.equal(settings.path.exactRoute, 'DIRECT', JSON.stringify(argv))
-    assert.equal(preflight(argv, 'DIRECT', settings).routeFacts.requestedEffect, 'inspect')
+    assert.equal(preflight(argv, 'DIRECT', settings).routeFacts.requestedEffect, 'mutate')
   }
 })
 
@@ -321,7 +321,7 @@ test('inline, quoted, and later path text remains ordinary mission content and s
   }
 })
 
-test('mutating exact-path missions retain safety classification and ambiguity cannot downshift to DIRECT', () => {
+test('mutating exact-path missions retain local safety classification without prose-based route escalation', () => {
   for (const argv of [
     ['path=direct', 'Implement', 'the', 'bounded', 'contained', 'local', 'change.'],
     ['path=direct', 'Review', 'and', 'change', 'the', 'contained', 'local', 'source', 'files.'],
@@ -333,8 +333,10 @@ test('mutating exact-path missions retain safety classification and ambiguity ca
     assert.deepEqual(admitted.routeFacts.sideEffects, ['deliverable-write'])
   }
   const ambiguous = ['path=direct', 'Consider', 'the', 'contained', 'local', 'source', 'files.']
-  assert.throws(() => preflight(ambiguous), error =>
-    error.code === 'EXACT_PATH_ROUTE_FLOOR_UNSATISFIED' && /LIGHT safety floor/.test(error.message))
+  const admitted = preflight(ambiguous)
+  assert.equal(admitted.routeFacts.requestedEffect, 'mutate')
+  assert.equal(admitted.routeFacts.operatorMinimumRoute, 'DIRECT')
+  assert.equal(admitted.routeFacts.externality, 'local-only')
 })
 
 test('documented CLI argv reaches the real supervisor exact-path preflight as mutating work', () => {

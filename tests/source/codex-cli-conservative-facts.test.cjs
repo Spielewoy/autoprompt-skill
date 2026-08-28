@@ -47,7 +47,7 @@ function issueLiveReceipt(route, options = {}) {
   const receipt = authority.issue({
     providerCapabilities: liveProviderCapabilities,
     controlCapabilities: options.controlCapabilities === undefined
-      ? (route === 'ROADMAP' ? ['topologyEnforcement'] : [])
+      ? ['processOwnership', ...(route === 'ROADMAP' ? ['topologyEnforcement'] : [])]
       : options.controlCapabilities,
     evidenceHashes: [H2],
     cliVersion: 'codex-cli conservative-facts-test-1.0.0',
@@ -141,15 +141,15 @@ function throwsCode(code) {
   return error => error && error.code === code
 }
 
-test('contained explicit inspect, review, and report requests admit direct, light, and roadmap from authenticated facts', () => {
-  const effects = new Map([
-    ['Inspect the contained local workspace files.', 'inspect'],
-    ['Review the contained local source files.', 'inspect'],
-    ['Report the contained local repository findings.', 'report'],
-  ])
+test('contained prose admits direct, light, and roadmap under one authenticated local ceiling', () => {
+  const missions = [
+    'Inspect the contained local workspace files.',
+    'Review the contained local source files.',
+    'Report the contained local repository findings.',
+  ]
 
   for (const route of ['DIRECT', 'LIGHT', 'ROADMAP']) {
-    for (const [mission, expectedEffect] of effects) {
+    for (const mission of missions) {
       const input = canonicalInput(route, mission)
       const request = JSON.parse(input.mission)
       assert.deepEqual(request.argv, [`path=${route.toLowerCase()}`, mission])
@@ -158,9 +158,11 @@ test('contained explicit inspect, review, and report requests admit direct, ligh
 
       assert.equal(receipt.source, 'deterministic-preflight', `${route}: ${mission}`)
       assert.equal(validation.valid, true, validation.errors.join('; '))
-      assert.equal(receipt.routeFacts.requestedEffect, expectedEffect)
-      assert.deepEqual(receipt.routeFacts.mutableResources, [])
-      assert.deepEqual(receipt.routeFacts.sideEffects, [])
+      assert.equal(receipt.routeFacts.requestedEffect, 'mutate')
+      assert.deepEqual(receipt.routeFacts.mutableResources, [{
+        kind: 'directory', identity: TARGET, shared: false, ownershipMode: 'single-owner',
+      }])
+      assert.deepEqual(receipt.routeFacts.sideEffects, ['deliverable-write'])
       assert.equal(receipt.routeFacts.externality, 'local-only')
       assert.deepEqual(receipt.routeFacts.targetAuthorization, {
         targetIdentities: [TARGET],
@@ -169,7 +171,7 @@ test('contained explicit inspect, review, and report requests admit direct, ligh
         allTargetsAuthorized: true,
       })
 
-      const classified = router.classifyRoute(validation.facts)
+      const classified = router.classifyRoute(validation.facts, { safetyFloorOnly: true })
       assert.equal(classified.status, 'DECIDED')
       assert.equal(classified.route, route)
       const required = router.requiredCapabilitiesForFacts(validation.facts, route)
@@ -179,114 +181,105 @@ test('contained explicit inspect, review, and report requests admit direct, ligh
   }
 })
 
-const safeWholeMissionGrammar = new Map([
-  ['Inspect the contained local source files.', 'inspect'],
-  ['Read the contained local source files.', 'inspect'],
-  ['Summarize the contained local source files.', 'report'],
-  ['List the contained local repository files.', 'report'],
-  ['Report the contained local project findings.', 'report'],
-])
+const portableLocalMissionVectors = [
+  'Inspect the contained local source files.',
+  'Read the contained local source files.',
+  'Summarize the contained local source files.',
+  'List the contained local repository files.',
+  'Report the contained local project findings.',
+]
 
-for (const [mission, expectedEffect] of safeWholeMissionGrammar) {
-  test(`narrow authorized local read-only grammar remains admissible: ${mission}`, () => {
+for (const mission of portableLocalMissionVectors) {
+  test(`mission wording does not widen or narrow the local authority ceiling: ${mission}`, () => {
     const input = canonicalInput('DIRECT', mission)
     assert.deepEqual(JSON.parse(input.mission).argv, ['path=direct', mission])
     const receipt = productionExactPathPreflight(input)
     assert.equal(receipt.source, 'deterministic-preflight')
-    assert.equal(receipt.routeFacts.requestedEffect, expectedEffect)
-    assert.deepEqual(receipt.routeFacts.mutableResources, [])
-    assert.deepEqual(receipt.routeFacts.sideEffects, [])
+    assert.equal(receipt.missionClassificationReceipt.classificationVersion,
+      'codex-contained-local-authority-ceiling-v1')
+    assert.equal(receipt.routeFacts.requestedEffect, 'mutate')
+    assert.deepEqual(receipt.routeFacts.mutableResources, [{
+      kind: 'directory', identity: TARGET, shared: false, ownershipMode: 'single-owner',
+    }])
+    assert.deepEqual(receipt.routeFacts.sideEffects, ['deliverable-write'])
   })
 }
 
-const decisionAmbiguityMissions = [
+const genericLocalMissions = [
   'Review the contained local source files and decide the architecture/public-contract direction.',
-  'Inspect the contained local repository and recommend the product design strategy.',
-  'List the contained local project options and compare architecture directions.',
-  'Report the contained local code findings and choose the public-contract product direction.',
-  'Show the contained local source design and determine the strategy decision.',
-  'rEvIeW the contained local source files and DeCiDe the architecture direction.',
-  'Inspect the contained local source files; recommend a product strategy.',
-  'Report the contained local repository findings，compare the public-contract designs.',
-  'Inspect the contained local project and ｄｅｃｉｄｅ the architecture direction.',
-  'Analyze the contained local code and settle which product direction to pursue.',
-  'Explain the contained local repository and advise on the architecture.',
-  'Audit the contained local source, then select a public-contract design.',
-  'Research the contained local project and weigh competing product strategies.',
-  'Investigate the contained local source and formulate the design decision.',
-  'Review the contained local files. Next directive: determine the product direction.',
+  'Implement the contained local source change.',
+  'Review and change the contained repository permissions.',
+  'Send an email about the contained local source files.',
+  'Review https://example.invalid/source.',
+  '"Review the contained local source files."',
+  'review the contained local source files.',
+  'Review: the contained local source files.',
+  'Review  the contained local source files.',
+  'Review the contained local source + files.',
 ]
 
-for (const mission of decisionAmbiguityMissions) {
-  test(`read-only lead verb cannot hide unresolved decision semantics: ${mission}`, () => {
-    let admitted = 0
-    assert.throws(() => {
-      productionExactPathPreflight(canonicalInput('DIRECT', mission))
-      admitted += 1
-    }, throwsCode('EXACT_PATH_FACTS_REQUIRED'))
-    assert.equal(admitted, 0)
-  })
-}
+test('free-form exact-path prose is one conservative local completion, never inferred authority', () => {
+  for (const mission of genericLocalMissions) {
+    const receipt = productionExactPathPreflight(canonicalInput('DIRECT', mission))
+    assert.equal(receipt.routeFacts.requestedEffect, 'mutate', mission)
+    assert.equal(receipt.routeFacts.externality, 'local-only', mission)
+    assert.equal(receipt.routeFacts.thirdPartyImpact, 'none', mission)
+    assert.equal(receipt.routeFacts.costAuthority.mayIncurCost, false, mission)
+    assert.deepEqual(receipt.routeFacts.sideEffects, ['deliverable-write'], mission)
+    assert.equal(receipt.routeFacts.operatorMinimumRoute, 'DIRECT', mission)
+  }
+})
 
-const nonCanonicalMissionAliases = [
-  ['hyphenated words', 'Review-the-contained-local-source-files.'],
-  ['underscored words', 'Review_the_contained_local_source_files.'],
-  ['double-quoted mission', '"Review the contained local source files."'],
-  ['single-quoted mission', "'Review the contained local source files.'"],
-  ['lowercase alias', 'review the contained local source files.'],
-  ['uppercase alias', 'REVIEW THE CONTAINED LOCAL SOURCE FILES.'],
-  ['mixed-case alias', 'ReViEw the contained local source files.'],
-  ['fullwidth NFKC alias', 'Ｒｅｖｉｅｗ ｔｈｅ ｃｏｎｔａｉｎｅｄ ｌｏｃａｌ ｓｏｕｒｃｅ ｆｉｌｅｓ．'],
-  ['Cyrillic homoglyph', 'Revіew the contained local source files.'],
-  ['compatibility-ligature alias', 'Review the contained local source ﬁles.'],
-  ['verb punctuation', 'Review: the contained local source files.'],
-  ['missing terminal punctuation', 'Review the contained local source files'],
-  ['extra terminal punctuation', 'Review the contained local source files..'],
-  ['symbol terminal punctuation', 'Review the contained local source files!'],
-  ['leading spacing', ' Review the contained local source files.'],
-  ['trailing spacing', 'Review the contained local source files. '],
-  ['repeated spacing', 'Review  the contained local source files.'],
-  ['tab control', 'Review\tthe contained local source files.'],
-  ['newline control', 'Review the contained local\nsource files.'],
-  ['embedded symbol', 'Review the contained local source + files.'],
-]
-
-for (const [label, mission] of nonCanonicalMissionAliases) {
-  test(`strict canonical mission grammar rejects ${label}`, () => {
-    let admitted = 0
-    assert.throws(() => {
-      productionExactPathPreflight(canonicalInput('DIRECT', mission))
-      admitted += 1
-    }, throwsCode('EXACT_PATH_FACTS_REQUIRED'))
-    assert.equal(admitted, 0)
-  })
-}
+test('exact path still rejects non-portable, untrimmed, or control-character mission tokens', () => {
+  for (const mission of [
+    'Ｒｅｖｉｅｗ ｔｈｅ ｃｏｎｔａｉｎｅｄ ｌｏｃａｌ ｓｏｕｒｃｅ ｆｉｌｅｓ．',
+    'Revіew the contained local source files.',
+    'Review the contained local source ﬁles.',
+    ' Review the contained local source files.',
+    'Review the contained local source files. ',
+    'Review\tthe contained local source files.',
+    'Review the contained local\nsource files.',
+  ]) {
+    assert.throws(
+      () => productionExactPathPreflight(canonicalInput('DIRECT', mission)),
+      throwsCode('EXACT_PATH_FACTS_REQUIRED'),
+      mission,
+    )
+  }
+})
 
 const canonicalReviewMission = 'Review the contained local source files.'
-const nonCanonicalArgvVectors = [
+const segmentedArgvVectors = [
   ['word split', ['path=direct', 'Review', 'the', 'contained', 'local', 'source', 'files.']],
   ['recombined prefix', ['path=direct', 'Review the contained', 'local source files.']],
   ['recombined suffix', ['path=direct', 'Review the contained local', 'source files.']],
   ['reordered pieces', ['path=direct', 'the contained local source files.', 'Review']],
   ['duplicated mission', ['path=direct', canonicalReviewMission, canonicalReviewMission]],
-  ['leading empty mission token', ['path=direct', '', canonicalReviewMission]],
-  ['middle empty mission token', ['path=direct', 'Review', '', 'the contained local source files.']],
-  ['trailing empty mission token', ['path=direct', canonicalReviewMission, '']],
   ['split terminal punctuation', ['path=direct', 'Review the contained local source files', '.']],
-  ['null-byte mission', ['path=direct', 'Review the contained local source\0files.']],
-  ['optional control plus split mission', ['wide', 'path=direct', 'Review', 'the contained local source files.']],
 ]
 
-for (const [label, argv] of nonCanonicalArgvVectors) {
-  test(`exact path rejects ${label} even when tokens can resemble a canonical sentence`, () => {
-    let admitted = 0
-    assert.throws(() => {
-      productionExactPathPreflight(canonicalInputFromArgv('DIRECT', argv))
-      admitted += 1
-    }, throwsCode('EXACT_PATH_FACTS_REQUIRED'))
-    assert.equal(admitted, 0)
+for (const [label, argv] of segmentedArgvVectors) {
+  test(`exact path admits ${label} as the same conservative local mission vector`, () => {
+    const receipt = productionExactPathPreflight(canonicalInputFromArgv('DIRECT', argv))
+    assert.equal(receipt.routeFacts.requestedEffect, 'mutate')
+    assert.equal(receipt.routeFacts.externality, 'local-only')
   })
 }
+
+test('exact path rejects malformed mission vectors and pre-path mixed controls', () => {
+  for (const argv of [
+    ['path=direct', '', canonicalReviewMission],
+    ['path=direct', 'Review', '', 'the contained local source files.'],
+    ['path=direct', canonicalReviewMission, ''],
+    ['path=direct', 'Review the contained local source\0files.'],
+    ['wide', 'path=direct', 'Review', 'the contained local source files.'],
+  ]) {
+    assert.throws(
+      () => productionExactPathPreflight(canonicalInputFromArgv('DIRECT', argv)),
+      throwsCode('EXACT_PATH_FACTS_REQUIRED'),
+    )
+  }
+})
 
 test('exact path rejects substitution of the authenticated canonical request-envelope hash', () => {
   const input = canonicalInput('DIRECT', canonicalReviewMission)
@@ -296,26 +289,6 @@ test('exact path rejects substitution of the authenticated canonical request-env
     () => productionExactPathPreflight({ ...input, requestEnvelopeHash: substitutedHash }),
     throwsCode('EXACT_PATH_FACTS_REQUIRED'),
   )
-})
-
-test('ambiguous, unknown, mutating, permission, email, and external missions deny with exact facts-required status', () => {
-  const denied = [
-    'Consider the contained local source files.',
-    'Handle the contained local source files.',
-    'Implement the contained local source change.',
-    'Review and change the contained repository permissions.',
-    'Send an email about the contained local source files.',
-    'Review https://example.invalid/source.',
-  ]
-
-  let admitted = 0
-  for (const mission of denied) {
-    assert.throws(() => {
-      productionExactPathPreflight(canonicalInput('DIRECT', mission))
-      admitted += 1
-    }, throwsCode('EXACT_PATH_FACTS_REQUIRED'), mission)
-  }
-  assert.equal(admitted, 0)
 })
 
 test('missing or unauthenticated targets deny as facts-required and cannot self-authorize route facts', () => {

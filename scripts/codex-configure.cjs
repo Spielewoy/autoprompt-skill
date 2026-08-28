@@ -68,7 +68,6 @@ const CONTRACT_VERSION = '2.0.0'
 const ACTIVATION_ID_PATTERN = /^apv2-[a-f0-9]{32}$/
 const DEFAULT_ACTIVATION_TTL_SECONDS = 4 * 60 * 60
 const MAX_ACTIVATION_TTL_SECONDS = 24 * 60 * 60
-const BENCHMARK_UNBOUNDED_EXPIRY_MS = Date.UTC(9999, 11, 31, 23, 59, 59, 999)
 const ROOT_LEGAL_CHILDREN = Object.freeze(['ap-route-analyst'])
 const PROVIDER_CAPABILITIES = Object.freeze({
   provider: 'codex',
@@ -84,6 +83,17 @@ const PROVIDER_CAPABILITIES = Object.freeze({
   cancellation: false,
   modelRouting: true,
 })
+const LOCAL_CONFORMANCE_BLOCKERS = Object.freeze([
+  'canonical-live-evidence-invalid',
+  'external-attestation-missing',
+  'external-attestation-verification-method-invalid',
+  'supported-capability-unattested-isolation',
+  'supported-capability-unattested-privateSkillRoot',
+  'supported-capability-unattested-processOwnership',
+])
+const LOCAL_CONFORMANCE_STATUS = 'LOCAL_CONFORMANCE'
+const LOCAL_CONFORMANCE_PENDING_STATUS = 'LOCAL_CONFORMANCE_PENDING'
+const LOCAL_CONFORMANCE_VERIFICATION_METHOD = 'activation-local-conformance'
 const DISABLED_CODEX_FEATURES = Object.freeze([
   'apps',
   'auth_elicitation',
@@ -136,6 +146,10 @@ class ProviderUnsupportedError extends ConfigureError {
 
 function fail(message) { throw new ConfigureError(message) }
 function sha256(bytes) { return crypto.createHash('sha256').update(bytes).digest('hex') }
+function hasExactKeys(value, keys) {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort()))
+}
 function castingDigest(value) {
   const match = CASTING_HASH_PATTERN.exec(String(value || ''))
   return match ? match[1] : ''
@@ -403,11 +417,19 @@ function evaluateCanonicalCodexCapabilityTrust(registry, options = {}) {
   )
 }
 
+function localConformancePending(trust, registry) {
+  const provider = registry?.providers?.find(candidate => candidate?.id === 'codex') || null
+  return Boolean(!trust.ready && trust.runtimeIdentity &&
+    provider?.verificationAttestation === null &&
+    JSON.stringify([...trust.blockers].sort()) ===
+      JSON.stringify([...LOCAL_CONFORMANCE_BLOCKERS].sort()))
+}
+
 function requireCanonicalCodexCapabilityTrust(options = {}) {
   const registry = options.providerRegistry || readJson(
     path.join(PACKAGE_ROOT, 'agents', 'contracts', 'providers.json'), 'provider registry',
   )
-  let trust = evaluateCanonicalCodexCapabilityTrust(registry, {
+  const trust = evaluateCanonicalCodexCapabilityTrust(registry, {
     codexExecutable: options.codexExecutable,
     codexExecutableSha256: options.codexExecutableSha256,
     codexExecutableVersion: options.codexExecutableVersion,
@@ -415,42 +437,8 @@ function requireCanonicalCodexCapabilityTrust(options = {}) {
     now: options.now,
     trustedPublicKeys: loadReleaseCodexTrustedPublicKeys(options),
   })
-  const overrideBlockers = [
-    'canonical-live-evidence-invalid',
-    'external-attestation-missing',
-    'external-attestation-verification-method-invalid',
-    'supported-capability-unattested-isolation',
-    'supported-capability-unattested-privateSkillRoot',
-    'supported-capability-unattested-processOwnership',
-  ]
-  const localBenchmarkOverride =
-    (options.env || process.env).AUTOPROMPT_BENCHMARK_UNATTESTED_BETA ===
-      'acknowledged-local-beta-override' &&
-    JSON.stringify([...trust.blockers].sort()) ===
-      JSON.stringify([...overrideBlockers].sort())
-  if (!trust.ready && localBenchmarkOverride) {
-    const issuer = 'local-benchmark-operator-unverified-beta-override'
-    const keyId = sha256(Buffer.from(`${issuer}:${trust.runtimeIdentity.runtimeIdentityHash}`, 'utf8'))
-    const externalAttestation = Object.freeze({
-      issuer,
-      signature: Object.freeze({ keyId }),
-    })
-    trust = Object.freeze({
-      ...trust,
-      ready: true,
-      status: 'VERIFIED',
-      blockers: Object.freeze([]),
-      externalAttestation,
-      externalAttestationSha256: sha256(Buffer.from(JSON.stringify({
-        issuer,
-        keyId,
-        overrideBlockers,
-        runtimeIdentityHash: trust.runtimeIdentity.runtimeIdentityHash,
-      }), 'utf8')),
-      verifiedCapabilities: canonicalCodexVerifiedCapabilities(registry),
-    })
-  }
-  if (!trust.ready) unsupported('canonical-provider-capability-refusal', {
+  const localPending = localConformancePending(trust, registry)
+  if (!trust.ready && !localPending) unsupported('canonical-provider-capability-refusal', {
     file: path.join(PACKAGE_ROOT, 'agents', 'contracts', 'providers.json'),
     expected: 'externally-verified-strict-isolation-and-private-skill-root',
     actual: trust.blockers.join(','),
@@ -471,15 +459,28 @@ function requireCanonicalCodexCapabilityTrust(options = {}) {
     queryAdmittedCodexVersion(admittedRuntime, {
       cwd: PACKAGE_ROOT,
       environment: options.env || process.env,
-      spawnSync: localBenchmarkOverride ? childProcess.spawnSync : options.spawnSync,
+      // LOCAL_CONFORMANCE must execute the exact admitted binary rather than a
+      // caller-provided probe stub. The runtime identity is fixed before this
+      // first execution and every later local capability is bound to it.
+      spawnSync: localPending ? childProcess.spawnSync : options.spawnSync,
     })
   } catch {
     unsupported('codex-executable-post-admission-verification-failed')
   }
-  return Object.freeze({ ...trust, codexRuntime: admittedRuntime })
+  return Object.freeze({
+    ...trust,
+    ...(localPending ? {
+      status: LOCAL_CONFORMANCE_PENDING_STATUS,
+      localConformancePending: true,
+    } : { localConformancePending: false }),
+    codexRuntime: admittedRuntime,
+  })
 }
 
 function canonicalProviderTrustBinding(trust) {
+  if (!trust || trust.ready !== true || trust.status !== 'VERIFIED') {
+    unsupported('canonical-provider-trust-binding-invalid')
+  }
   const binding = {
     schemaVersion: CONTRACT_VERSION,
     status: 'VERIFIED',
@@ -494,6 +495,189 @@ function canonicalProviderTrustBinding(trust) {
   }
   binding.sha256 = sha256(Buffer.from(JSON.stringify(binding), 'utf8'))
   return binding
+}
+
+function localConformanceTargetHash(target) {
+  return sha256(Buffer.from(stableJsonV1(target), 'utf8'))
+}
+
+function validateOwnedProcessConformanceEvidence(record) {
+  const evidence = record?.localConformance
+  const probe = evidence?.processProbe
+  const registry = evidence?.processRegistry
+  if (!hasExactKeys(evidence, ['schemaVersion', 'processProbe', 'processRegistry']) ||
+      evidence.schemaVersion !== 1 ||
+      !hasExactKeys(probe, [
+        'adapterKind', 'drained', 'groupIdentity', 'kind', 'ownershipId', 'probeHash',
+        'schemaVersion', 'targetKey', 'terminalStatus',
+      ]) || probe.schemaVersion !== 1 || probe.kind !== 'owned-process-conformance' ||
+      !['posix-process-group', 'windows-job-object'].includes(probe.adapterKind) ||
+      probe.drained !== true || probe.terminalStatus !== 'DONE' ||
+      typeof probe.ownershipId !== 'string' || !probe.ownershipId ||
+      typeof probe.groupIdentity !== 'string' || !probe.groupIdentity ||
+      probe.targetKey !== localConformanceTargetHash(record.target) ||
+      !/^[a-f0-9]{64}$/.test(probe.probeHash || '') ||
+      !hasExactKeys(registry, ['path', 'sha256']) ||
+      typeof registry.path !== 'string' || !path.isAbsolute(registry.path) ||
+      !isWithin(record.activationRoot, path.resolve(registry.path)) ||
+      !/^[a-f0-9]{64}$/.test(registry.sha256 || '')) {
+    unsupported('local-conformance-process-evidence-invalid')
+  }
+  const probeBody = { ...probe }
+  delete probeBody.probeHash
+  if (probe.probeHash !== sha256(Buffer.from(stableJsonV1(probeBody), 'utf8'))) {
+    unsupported('local-conformance-process-evidence-invalid')
+  }
+  const registryBytes = readRegularBound(registry.path, 'local-conformance-process-registry')
+  if (sha256(registryBytes) !== registry.sha256) {
+    unsupported('local-conformance-process-evidence-drift')
+  }
+  return evidence
+}
+
+function runLocalOwnedProcessConformance(record, environment) {
+  const directory = ensurePrivateDirectory(
+    record.activationRoot,
+    path.join(record.activationRoot, 'local-conformance'),
+    true,
+  )
+  const generation = Number(record.capability?.generation || 0)
+  if (!Number.isSafeInteger(generation) || generation < 1) {
+    unsupported('local-conformance-generation-invalid')
+  }
+  const registryPath = path.join(directory, `process-registry-${generation}.json`)
+  const controlRoot = path.join(directory, `process-control-${generation}`)
+  const input = Buffer.from(JSON.stringify({
+    modulePath: path.join(PACKAGE_ROOT, 'agents', 'codex', 'workflow', 'process-owner.js'),
+    activationId: record.activationId,
+    generation,
+    registryPath,
+    controlRoot,
+    activationRoot: record.activationRoot,
+    targetPath: record.target.realpath,
+    targetKey: localConformanceTargetHash(record.target),
+  }), 'utf8').toString('base64url')
+  const runner = String.raw`
+'use strict'
+const input = JSON.parse(Buffer.from(process.argv[1], 'base64url').toString('utf8'))
+const ownerModule = require(input.modulePath)
+const adapter = process.platform === 'win32'
+  ? ownerModule.createWindowsJobAdapter({
+      controlRoot: input.controlRoot,
+      providerPrivateOwnershipRoot: input.activationRoot,
+      trustedOwnershipRoots: [input.activationRoot],
+    })
+  : ownerModule.createPosixProcessAdapter()
+const processOwner = new ownerModule.ProcessOwner({
+  adapter,
+  registryPath: input.registryPath,
+  controlBinding: { activationId: input.activationId, generationId: input.generation },
+})
+;(async () => {
+  try {
+    if (process.argv[2] === 'cleanup') {
+      await processOwner.cancelAll({
+        reason: 'activation local process conformance recovery',
+        graceMs: 0,
+        killMs: 1000,
+        terminalStatus: 'FAILED',
+      })
+      await processOwner.assertTargetDrained(input.targetKey)
+      process.stdout.write('{"drained":true}\n')
+      return
+    }
+    const probe = await ownerModule.runOwnedProcessConformanceProbe({
+      adapter,
+      processOwner,
+      targetPath: input.targetPath,
+      targetKey: input.targetKey,
+      environment: process.env,
+      sessionId: input.activationId + ':local-conformance',
+      reason: 'activation local process conformance',
+      killMs: 1000,
+    })
+    process.stdout.write(JSON.stringify(probe) + '\n')
+  } catch (error) {
+    try {
+      await processOwner.cancelAll({
+        reason: 'activation local process conformance failure',
+        graceMs: 0,
+        killMs: 1000,
+        terminalStatus: 'FAILED',
+      })
+    } catch {}
+    process.stderr.write(String(error && (error.code || error.message) || error) + '\n')
+    process.exitCode = 1
+  }
+})()
+`
+  const spawnOptions = {
+    cwd: record.target.realpath,
+    env: environment,
+    encoding: 'utf8',
+    shell: false,
+    timeout: 30_000,
+    windowsHide: true,
+    maxBuffer: 1024 * 1024,
+  }
+  const result = childProcess.spawnSync(process.execPath, ['-e', runner, input], spawnOptions)
+  if (!result || result.status !== 0 || result.error) {
+    const cleanup = childProcess.spawnSync(process.execPath, ['-e', runner, input, 'cleanup'], {
+      ...spawnOptions,
+      timeout: 10_000,
+    })
+    unsupported('local-conformance-process-probe-failed', {
+      expected: 'one bounded owned process must drain and crash recovery must leave no target process',
+      actual: String(result?.error?.code || result?.signal || result?.status ||
+        result?.stderr || 'unknown').slice(0, 768) +
+        ` cleanup=${String(cleanup?.error?.code || cleanup?.signal || cleanup?.status ||
+          cleanup?.stderr || 'unknown').slice(0, 256)}`,
+    })
+  }
+  let processProbe
+  try { processProbe = JSON.parse(String(result.stdout || '').trim()) } catch {
+    unsupported('local-conformance-process-probe-invalid')
+  }
+  const registryBytes = readRegularBound(registryPath, 'local-conformance-process-registry')
+  record.localConformance = {
+    schemaVersion: 1,
+    processProbe,
+    processRegistry: { path: registryPath, sha256: sha256(registryBytes) },
+  }
+  validateOwnedProcessConformanceEvidence(record)
+  return record.localConformance
+}
+
+function localProviderTrustBinding(trust, record, now) {
+  if (!trust?.localConformancePending || trust.status !== LOCAL_CONFORMANCE_PENDING_STATUS) {
+    unsupported('local-conformance-trust-pending-invalid')
+  }
+  const localEvidence = validateOwnedProcessConformanceEvidence(record)
+  const body = {
+    schemaVersion: CONTRACT_VERSION,
+    status: LOCAL_CONFORMANCE_STATUS,
+    admissionMode: 'explicit-local-activation',
+    registrySha256: trust.registrySha256,
+    providerRecordSha256: trust.providerRecordSha256,
+    evidenceSha256: trust.evidenceSha256,
+    runtimeIdentityHash: trust.runtimeIdentity.runtimeIdentityHash,
+    providerAdmissionSha256: trust.providerAdmissionSha256,
+    activationId: record.activationId,
+    capabilityGeneration: record.capability.generation,
+    requestSha256: record.request.sha256,
+    targetIdentitySha256: localConformanceTargetHash(record.target),
+    payloadManifestSha256: record.activationBoundary.payloadManifestSha256,
+    enforcementProofSha256: record.activationBoundary.enforcementProof.sha256,
+    providerProbeSha256: sha256(Buffer.from(stableJsonV1(record.providerProbe), 'utf8')),
+    safetyInspectionSha256: sha256(Buffer.from(stableJsonV1(record.safety), 'utf8')),
+    processOwnershipProbeSha256: sha256(Buffer.from(stableJsonV1(localEvidence), 'utf8')),
+    verifiedCapabilities: [...canonicalCodexVerifiedCapabilities()],
+    probedAt: now.toISOString(),
+  }
+  return Object.freeze({
+    ...body,
+    sha256: sha256(Buffer.from(stableJsonV1(body), 'utf8')),
+  })
 }
 function readableRegularFile(file, label) {
   let stat
@@ -586,11 +770,7 @@ function renderAgent(bytes, role, selection) {
     const tier = ROLE_TIER.get(role)
     if (tier === undefined) fail(`installed role has no Codex casting tier: ${role}`)
     const model = selection.models[modelIndexes(selection.models.length)[tier]]
-    const benchmarkEffort = process.env.AUTOPROMPT_BENCHMARK_FORCE_EFFORT
-    if (benchmarkEffort !== undefined && benchmarkEffort !== 'xhigh') {
-      fail('AUTOPROMPT_BENCHMARK_FORCE_EFFORT supports only the audited xhigh benchmark pin')
-    }
-    const effort = benchmarkEffort || EFFORTS[tier]
+    const effort = EFFORTS[tier]
     const sandbox = header.findIndex(line => /^sandbox_mode\s*=/.test(line))
     if (sandbox < 0) fail(`agent definition has no sandbox_mode: ${role}.toml`)
     header.splice(sandbox + 1, 0, `model = "${model}"`, `model_reasoning_effort = "${effort}"`)
@@ -889,25 +1069,7 @@ function protectActivationRoot(activationRoot, recurse = false) {
       auditedPaths: audited.paths || 1,
       mechanism: audited.mechanism || established.mechanism,
     }
-  } catch (error) {
-    const benchmarkDiagnostic = process.env.AUTOPROMPT_BENCHMARK_DIAGNOSTICS
-    if (benchmarkDiagnostic) {
-      try {
-        const stat = fs.lstatSync(activationRoot)
-        fs.appendFileSync(benchmarkDiagnostic, `${JSON.stringify({
-          label: 'activation-private-permissions',
-          activationRoot,
-          recurse,
-          uid: Number(stat.uid),
-          gid: Number(stat.gid),
-          mode: stat.mode & 0o777,
-          errorName: error?.name || null,
-          errorCode: error?.code || null,
-          errorMessage: error?.message || String(error),
-          errorDetails: error?.details || null,
-        })}\n`, { mode: 0o600 })
-      } catch {}
-    }
+  } catch {
     unsupported('activation-private-permissions-unavailable')
   }
 }
@@ -1858,22 +2020,6 @@ function probeCodexProfile(options) {
     shell: false,
     timeout: 15_000,
   })
-  const benchmarkDiagnostic = options.env.AUTOPROMPT_BENCHMARK_DIAGNOSTICS
-  if (benchmarkDiagnostic) {
-    try {
-      fs.appendFileSync(benchmarkDiagnostic, `${JSON.stringify({
-        executable,
-        label: 'codex-command-sandbox',
-        nodeExecutable: process.execPath,
-        path: options.env.PATH,
-        status: sandbox?.status ?? null,
-        signal: sandbox?.signal ?? null,
-        errorCode: sandbox?.error?.code ?? null,
-        stdout: String(sandbox?.stdout || ''),
-        stderr: String(sandbox?.stderr || ''),
-      })}\n`, { mode: 0o600 })
-    } catch {}
-  }
   let sandboxMarkerValue = null
   try { sandboxMarkerValue = readRegularBound(sandboxMarker, 'codex-command-sandbox-marker').toString('utf8') } catch {}
   try {
@@ -2231,13 +2377,91 @@ function providerAttestationPayload(attestation) {
   }), 'utf8')
 }
 
-function createProviderAttestation(record, now, activationNonce = null) {
-  if (record.providerTrust?.status !== 'VERIFIED' ||
-      !/^[a-f0-9]{64}$/.test(record.providerTrust?.sha256 || '')) {
-    unsupported('canonical-provider-trust-binding-invalid')
+function validateBoundProviderTrust(record, currentRuntimeIdentity) {
+  const providerTrust = record?.providerTrust
+  if (!providerTrust || !/^[a-f0-9]{64}$/.test(providerTrust.sha256 || '') ||
+      !currentRuntimeIdentity ||
+      providerTrust.runtimeIdentityHash !== currentRuntimeIdentity.runtimeIdentityHash) {
+    unsupported('provider-trust-binding-invalid')
   }
+  if (providerTrust.status === 'VERIFIED') {
+    if (!hasExactKeys(providerTrust, [
+      'evidenceSha256', 'externalAttestationSha256', 'externalIssuer', 'externalKeyId',
+      'providerRecordSha256', 'registrySha256', 'runtimeIdentityHash', 'schemaVersion',
+      'sha256', 'status', 'verifiedCapabilities',
+    ])) unsupported('provider-trust-binding-invalid')
+    const unsigned = { ...providerTrust }
+    delete unsigned.sha256
+    if (providerTrust.schemaVersion !== CONTRACT_VERSION ||
+        !/^[a-f0-9]{64}$/.test(providerTrust.registrySha256 || '') ||
+        !/^[a-f0-9]{64}$/.test(providerTrust.providerRecordSha256 || '') ||
+        !/^[a-f0-9]{64}$/.test(providerTrust.externalAttestationSha256 || '') ||
+        !/^[a-f0-9]{64}$/.test(providerTrust.evidenceSha256 || '') ||
+        providerTrust.externalIssuer === 'autoprompt-codex-activation-v2' ||
+        typeof providerTrust.externalIssuer !== 'string' || !providerTrust.externalIssuer ||
+        typeof providerTrust.externalKeyId !== 'string' || !providerTrust.externalKeyId ||
+        !isCanonicalCodexVerifiedCapabilities(providerTrust.verifiedCapabilities) ||
+        providerTrust.sha256 !== sha256(Buffer.from(JSON.stringify(unsigned), 'utf8'))) {
+      unsupported('provider-trust-binding-invalid')
+    }
+    return Object.freeze({
+      status: 'VERIFIED',
+      verificationMethod: 'live-conformance-suite',
+      verifiedCapabilities: Object.freeze([...providerTrust.verifiedCapabilities]),
+    })
+  }
+  if (providerTrust.status !== LOCAL_CONFORMANCE_STATUS ||
+      !hasExactKeys(providerTrust, [
+        'activationId', 'admissionMode', 'capabilityGeneration', 'enforcementProofSha256',
+        'evidenceSha256', 'payloadManifestSha256', 'probedAt', 'processOwnershipProbeSha256',
+        'providerAdmissionSha256', 'providerProbeSha256', 'providerRecordSha256',
+        'registrySha256', 'requestSha256', 'runtimeIdentityHash', 'safetyInspectionSha256',
+        'schemaVersion', 'sha256', 'status', 'targetIdentitySha256', 'verifiedCapabilities',
+      ])) unsupported('provider-trust-binding-invalid')
+  const unsigned = { ...providerTrust }
+  delete unsigned.sha256
+  const registry = readJson(
+    path.join(PACKAGE_ROOT, 'agents', 'contracts', 'providers.json'), 'provider registry',
+  )
+  const provider = registry.providers?.find(candidate => candidate?.id === 'codex') || null
+  const evidence = validateOwnedProcessConformanceEvidence(record)
+  if (providerTrust.schemaVersion !== CONTRACT_VERSION ||
+      providerTrust.admissionMode !== 'explicit-local-activation' ||
+      providerTrust.registrySha256 !== sha256(Buffer.from(JSON.stringify(registry), 'utf8')) ||
+      providerTrust.providerRecordSha256 !== sha256(Buffer.from(JSON.stringify(provider), 'utf8')) ||
+      providerTrust.evidenceSha256 !== currentRuntimeIdentity.evidenceSha256 ||
+      providerTrust.providerAdmissionSha256 !== currentRuntimeIdentity.providerAdmissionSha256 ||
+      providerTrust.activationId !== record.activationId ||
+      providerTrust.capabilityGeneration !== record.capability.generation ||
+      providerTrust.requestSha256 !== record.request.sha256 ||
+      providerTrust.targetIdentitySha256 !== localConformanceTargetHash(record.target) ||
+      providerTrust.payloadManifestSha256 !== record.activationBoundary.payloadManifestSha256 ||
+      providerTrust.enforcementProofSha256 !== record.activationBoundary.enforcementProof.sha256 ||
+      providerTrust.providerProbeSha256 !==
+        sha256(Buffer.from(stableJsonV1(record.providerProbe), 'utf8')) ||
+      providerTrust.safetyInspectionSha256 !==
+        sha256(Buffer.from(stableJsonV1(record.safety), 'utf8')) ||
+      providerTrust.processOwnershipProbeSha256 !==
+        sha256(Buffer.from(stableJsonV1(evidence), 'utf8')) ||
+      !Number.isFinite(Date.parse(providerTrust.probedAt)) ||
+      !isCanonicalCodexVerifiedCapabilities(providerTrust.verifiedCapabilities) ||
+      providerTrust.sha256 !== sha256(Buffer.from(stableJsonV1(unsigned), 'utf8'))) {
+    unsupported('provider-trust-binding-invalid')
+  }
+  return Object.freeze({
+    status: LOCAL_CONFORMANCE_STATUS,
+    verificationMethod: LOCAL_CONFORMANCE_VERIFICATION_METHOD,
+    verifiedCapabilities: Object.freeze([...providerTrust.verifiedCapabilities]),
+  })
+}
+
+function createProviderAttestation(record, now, activationNonce = null) {
+  let currentRuntimeIdentity
+  try { currentRuntimeIdentity = deriveCurrentCodexRuntimeIdentity() } catch {
+    unsupported('canonical-provider-runtime-identity-unavailable')
+  }
+  const providerTrust = validateBoundProviderTrust(record, currentRuntimeIdentity)
   const pair = crypto.generateKeyPairSync('ed25519')
-  const canonicalVerifiedCapabilities = canonicalCodexVerifiedCapabilities()
   const publicKey = pair.publicKey.export({ type: 'spki', format: 'der' })
   const keyId = sha256(publicKey)
   const attestation = {
@@ -2249,8 +2473,8 @@ function createProviderAttestation(record, now, activationNonce = null) {
     expiresAt: record.capability.expiresAt,
     runtimeIdentityHash: providerRuntimeIdentity(record),
     activationNonce: activationNonce || crypto.randomBytes(24).toString('base64url'),
-    verificationMethod: 'live-conformance-suite',
-    verifiedCapabilities: [...canonicalVerifiedCapabilities],
+    verificationMethod: providerTrust.verificationMethod,
+    verifiedCapabilities: [...providerTrust.verifiedCapabilities],
     canonicalProviderTrustSha256: record.providerTrust.sha256,
     result: 'supported',
   }
@@ -2288,18 +2512,7 @@ function verifyProviderAttestation(record, options = {}) {
   try { currentRuntimeIdentity = deriveCurrentCodexRuntimeIdentity() } catch {
     unsupported('canonical-provider-runtime-identity-unavailable')
   }
-  const providerTrustUnsigned = providerTrust && {
-    schemaVersion: providerTrust.schemaVersion,
-    status: providerTrust.status,
-    registrySha256: providerTrust.registrySha256,
-    providerRecordSha256: providerTrust.providerRecordSha256,
-    externalAttestationSha256: providerTrust.externalAttestationSha256,
-    evidenceSha256: providerTrust.evidenceSha256,
-    externalIssuer: providerTrust.externalIssuer,
-    externalKeyId: providerTrust.externalKeyId,
-    runtimeIdentityHash: providerTrust.runtimeIdentityHash,
-    verifiedCapabilities: providerTrust.verifiedCapabilities,
-  }
+  const providerTrustValidation = validateBoundProviderTrust(record, currentRuntimeIdentity)
   if (!binding || binding.contractVersion !== CONTRACT_VERSION ||
       JSON.stringify(Object.keys(binding).sort()) !== JSON.stringify([
         'attestation', 'attestationSha256', 'contractVersion', 'providerCapabilitiesSha256',
@@ -2324,24 +2537,9 @@ function verifyProviderAttestation(record, options = {}) {
       attestation.expiresAt !== record.capability.expiresAt ||
       attestation.runtimeIdentityHash !== providerRuntimeIdentity(record) ||
       !/^[A-Za-z0-9_-]{16,128}$/.test(attestation.activationNonce || '') ||
-      attestation.verificationMethod !== 'live-conformance-suite' ||
-      !isCanonicalCodexVerifiedCapabilities(attestation.verifiedCapabilities) ||
-      !providerTrust || JSON.stringify(Object.keys(providerTrust).sort()) !== JSON.stringify([
-        'evidenceSha256', 'externalAttestationSha256', 'externalIssuer', 'externalKeyId',
-        'providerRecordSha256', 'registrySha256', 'runtimeIdentityHash', 'schemaVersion',
-        'sha256', 'status', 'verifiedCapabilities',
-      ]) || providerTrust.schemaVersion !== CONTRACT_VERSION || providerTrust.status !== 'VERIFIED' ||
-      !/^[a-f0-9]{64}$/.test(providerTrust.registrySha256 || '') ||
-      !/^[a-f0-9]{64}$/.test(providerTrust.providerRecordSha256 || '') ||
-      !/^[a-f0-9]{64}$/.test(providerTrust.externalAttestationSha256 || '') ||
-      !/^[a-f0-9]{64}$/.test(providerTrust.evidenceSha256 || '') ||
-      !/^[a-f0-9]{64}$/.test(providerTrust.runtimeIdentityHash || '') ||
-      providerTrust.runtimeIdentityHash !== currentRuntimeIdentity.runtimeIdentityHash ||
-      providerTrust.externalIssuer === 'autoprompt-codex-activation-v2' ||
-      typeof providerTrust.externalIssuer !== 'string' || !providerTrust.externalIssuer ||
-      typeof providerTrust.externalKeyId !== 'string' || !providerTrust.externalKeyId ||
-      !isCanonicalCodexVerifiedCapabilities(providerTrust.verifiedCapabilities) ||
-      providerTrust.sha256 !== sha256(Buffer.from(JSON.stringify(providerTrustUnsigned), 'utf8')) ||
+      attestation.verificationMethod !== providerTrustValidation.verificationMethod ||
+      JSON.stringify(attestation.verifiedCapabilities) !==
+        JSON.stringify(providerTrustValidation.verifiedCapabilities) ||
       attestation.canonicalProviderTrustSha256 !== providerTrust.sha256 ||
       attestation.result !== 'supported' || !signature || signature.algorithm !== 'ed25519' ||
       JSON.stringify(Object.keys(signature).sort()) !==
@@ -2659,9 +2857,8 @@ function issueCapability(record, recordPath, now, ttlSeconds) {
   return token
 }
 
-function activationCapabilityTtlSeconds(ttlSeconds, now, environment = process.env) {
-  if (!environment || environment.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT !== '1') return ttlSeconds
-  return Math.floor((BENCHMARK_UNBOUNDED_EXPIRY_MS - now.getTime()) / 1000)
+function activationCapabilityTtlSeconds(ttlSeconds) {
+  return ttlSeconds
 }
 
 function consumeCapability(recordPath, token, context, now = new Date()) {
@@ -2925,9 +3122,10 @@ function prepareActivation(options = {}) {
     unsupported('compatibility-alias-telemetry-path-unregistered')
   }
   const canonicalTrust = requireCanonicalCodexCapabilityTrust(options)
-  const providerTrust = canonicalProviderTrustBinding(canonicalTrust)
+  let providerTrust = canonicalTrust.ready === true
+    ? canonicalProviderTrustBinding(canonicalTrust) : null
   const codexExecutable = bindAdmittedCodexExecutable(
-    canonicalTrust.codexRuntime, providerTrust.runtimeIdentityHash,
+    canonicalTrust.codexRuntime, canonicalTrust.runtimeIdentity.runtimeIdentityHash,
   )
   const env = options.env || process.env
   const root = resolveRoot(env)
@@ -2959,8 +3157,12 @@ function prepareActivation(options = {}) {
     activationRoot = resolved.activationRoot
     recordPath = resolved.recordPath
     record = resolved.record
-    if (record.providerTrust?.sha256 !== providerTrust.sha256) {
+    if (canonicalTrust.ready === true && record.providerTrust?.sha256 !== providerTrust.sha256) {
       unsupported('canonical-provider-trust-binding-drift')
+    }
+    if (canonicalTrust.localConformancePending === true &&
+        record.providerTrust?.status !== LOCAL_CONFORMANCE_STATUS) {
+      unsupported('local-conformance-trust-binding-drift')
     }
     verifyActivationPayload(activationRoot)
     if (new Date(record.capability.expiresAt).getTime() > now.getTime() && record.status === 'active') {
@@ -3213,6 +3415,11 @@ function prepareActivation(options = {}) {
       now,
       activationCapabilityTtlSeconds(ttlSeconds, now, env),
     )
+    if (canonicalTrust.localConformancePending === true) {
+      runLocalOwnedProcessConformance(record, probeEnvironment)
+      providerTrust = localProviderTrustBinding(canonicalTrust, record, now)
+      record.providerTrust = providerTrust
+    }
     const activationNonce = options.resume
       ? record.providerAttestation.attestation.activationNonce
       : null
@@ -3319,20 +3526,16 @@ function launchActivation(options = {}) {
     const runtime = createAndRegisterSupervisorRuntime({ ...prepared, record }, capabilityContext, launchNow)
     record = runtime.record
     verifyProviderAttestation(record, { requireFresh: true, now: launchNow })
-    const timeout = Math.max(1,
-      new Date(record.capability.expiresAt).getTime() - launchNow.getTime())
     childEnv.AUTOPROMPT_ACTIVATION_ATTESTATION_SHA256 =
       record.providerAttestation.attestationSha256
     childEnv.AUTOPROMPT_SUPERVISOR_RUN_PATH = runtime.binding.runPath
     childEnv.AUTOPROMPT_SUPERVISOR_RUN_METADATA_SHA256 = runtime.binding.metadataSha256
-    const benchmarkNoTimeout = childEnv.AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT === '1'
     result = spawn(process.execPath, args, {
       cwd: target.realpath,
       env: childEnv,
       shell: false,
       stdio: options.stdio || 'inherit',
       encoding: options.encoding,
-      ...(benchmarkNoTimeout ? {} : { timeout }),
     })
   } finally {
     revokeActivation(recordPath, record, 'launcher-exited', options.now instanceof Date ? options.now : new Date())
@@ -3479,6 +3682,7 @@ function inventoryIsolation(options = {}) {
   let registryError = ''
   let capabilityTrust = null
   let capabilityConflicts = []
+  let localConformanceAvailable = false
   try {
     const registry = options.providerRegistry || readJson(
       path.join(PACKAGE_ROOT, 'agents', 'contracts', 'providers.json'), 'provider registry',
@@ -3491,6 +3695,7 @@ function inventoryIsolation(options = {}) {
       trustedPublicKeys: loadReleaseCodexTrustedPublicKeys(options),
     })
     capabilityConflicts = [...capabilityTrust.blockers]
+    localConformanceAvailable = localConformancePending(capabilityTrust, registry)
     if (!registryCapability) registryError = 'codex provider entry is missing'
   } catch (error) {
     registryError = String(error.message || error)
@@ -3516,6 +3721,8 @@ function inventoryIsolation(options = {}) {
     registryError,
     capabilityTrust,
     capabilityConflicts,
+    canonicalTrustReady: capabilityTrust?.ready === true,
+    localConformanceAvailable,
     recommendations,
     isolationReady: managedPayload === 'verified' && manualPolicy && knownLegacy.length === 0 &&
       malformedActivations.length === 0 && !registryError && capabilityTrust?.ready === true,

@@ -28,6 +28,7 @@ const RUN_RECORD_SCHEMA = 'autoprompt.run-record.v2'
 const PRE_MUTATION_BASELINE_PATH = 'checks/pre-mutation-baseline.json'
 const ALL_WORK_JOINED_PATH = 'checks/all-work-joined.json'
 const ROUTE_RECOMMENDATION_STATE_PATH = 'route/recommendation-state.json'
+const CODEX_PHYSICAL_EXECUTION_PATH = 'route/codex-physical-execution.json'
 const PLAN_PATHS = Object.freeze({ DIRECT: 'plan/success-card.md', LIGHT: 'plan/light-plan.md', ROADMAP: 'plan/ROADMAP.md' })
 const RUNTIME_PATHS = Object.freeze({
   metadata: 'metadata.json',
@@ -63,7 +64,8 @@ const EXACT_REGISTERED_PATHS = new Set([
   'request/envelope.jsonl', 'request/envelope.sha256', 'request/privacy.json', 'request/original-request.txt',
   'settings.json',
   'route/transcript.jsonl', 'route/transcript.sha256', 'route/transcript.md', 'route/evidence-index.json',
-  'route/recommendation.json', ROUTE_RECOMMENDATION_STATE_PATH, 'route/decision.json', 'route/decision.md',
+  'route/recommendation.json', ROUTE_RECOMMENDATION_STATE_PATH,
+  'route/decision.json', 'route/decision.md', CODEX_PHYSICAL_EXECUTION_PATH,
   ...Object.values(PLAN_PATHS),
   'work/ownership.json', 'work/captured-domain-admission.json', 'work/deferred-promotion.json',
   'checks/commands.jsonl', PRE_MUTATION_BASELINE_PATH, ALL_WORK_JOINED_PATH, 'checks/captured-domain-outcomes.json',
@@ -679,8 +681,8 @@ function metadataFor(record, options = {}) {
       recovery_checkpoint: RUNTIME_PATHS.recoveryCheckpoint,
     },
     integration_dependencies: {
-      'AP-ROUTE-016': 'RuntimeStateStore/EventLog must bind accepted evidence to request, plan, candidate, environment, checks, and assumptions and invalidate transitive dependents.',
-      'AP-ROUTE-018': 'RuntimeStateStore must emit the candidate-freeze event/digest and invalidate review plus verification after any authorized mutation.',
+      'AP-ROUTE-016': 'RuntimeStateStore/EventLog must bind accepted evidence to request, plan, exact version being checked, environment, checks, and assumptions and invalidate transitive dependents.',
+      'AP-ROUTE-018': 'RuntimeStateStore must emit the exact-version freeze event/digest and invalidate review plus verification after any authorized mutation.',
     },
   }
 }
@@ -823,6 +825,7 @@ function openRunRecord(runPath, options = {}) {
 module.exports = {
   RUN_RECORD_SCHEMA, PLAN_PATHS, RUNTIME_PATHS, RUN_DIRECTORIES, EXACT_REGISTERED_PATHS, REGISTERED_PREFIXES,
   PRE_MUTATION_BASELINE_PATH, ALL_WORK_JOINED_PATH, ROUTE_RECOMMENDATION_STATE_PATH,
+  CODEX_PHYSICAL_EXECUTION_PATH,
   normalizeRelativePath, isRegisteredRunPath, resolveRegisteredPath, canonicalPlanPath, runtimeIntegrationPaths,
   createRunRecord, allocateRunRecord: createRunRecord, openRunRecord, assertRunRecordBinding,
   auditRunRecordTree, atomicWriteRegistered,

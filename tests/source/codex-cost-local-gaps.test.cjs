@@ -18,8 +18,10 @@ const {
 } = require(path.join(workflow, 'effort-policy.js'))
 const {
   appendCanonicalRouteEvent,
+  assignmentLocalFindingId,
   CodexSupervisorRuntime,
   emitItemVerifiedTransition,
+  explicitFindingIds,
   readPrivateAgentAssignment,
   readPersistedWorkerAssignment,
   replayRequestFromPersistedAssignment,
@@ -372,6 +374,85 @@ test('AP-DESIGN-023 fresh replay is derived only from the persisted assignment',
   })
 })
 
+test('assignment findings consume only explicit fields and use a stable local fallback', () => {
+  const request = {
+    workItemId: 'work-unrelated', logicalRole: 'worker', parent: 'run-owner',
+    assignment: 'Write the ordinary response; the quoted history mentions AP-DESIGN-023.',
+    successChecklist: ['Do not infer AP-TRACE-013 from this prose.'],
+    checks: ['Confirm output without treating AP-RUN-026 as a finding.'],
+  }
+  assert.deepEqual(explicitFindingIds(
+    request,
+    request.assignment,
+    'mission text mentions AP-RUN-027',
+  ), [])
+  const binding = { requestEnvelopeHash: 'a'.repeat(64) }
+  const freshId = assignmentLocalFindingId(request, binding)
+  const resumedId = assignmentLocalFindingId(structuredClone(request), structuredClone(binding))
+  assert.match(freshId, /^AP-WORK-[0-9]{3}$/u)
+  assert.equal(resumedId, freshId)
+  assert.doesNotMatch(freshId, /AP-(?:DESIGN|TRACE|RUN)-/u)
+  assert.deepEqual(explicitFindingIds({
+    ...request,
+    findingIds: ['customer-finding-7'],
+  }), ['customer-finding-7'])
+})
+
+test('W3/C2 assignment-local finding ids are unique and resume-stable across corrections and repair', () => {
+  const requests = [
+    { workItemId: 'route-analyst', logicalRole: 'route-analyst' },
+    ...[1, 2, 3].map(ordinal => ({
+      workItemId: `work-${ordinal}`, logicalRole: 'worker',
+    })),
+    ...[1, 2, 3].map(ordinal => ({
+      workItemId: `work-${ordinal}-transport-retry-1`, logicalRole: 'worker',
+    })),
+    { workItemId: 'work-1-repair-1', logicalRole: 'worker' },
+    ...[1, 2].flatMap(seat => {
+      const logicalRole = seat === 1 ? 'independent-reviewer' : 'independent-tester'
+      return [
+        { workItemId: `independent-check-${seat}`, logicalRole },
+        { workItemId: `independent-check-${seat}-runtime-retry-1`, logicalRole },
+        { workItemId: `independent-check-${seat}-repair-1`, logicalRole },
+        { workItemId: `independent-check-${seat}-repair-1-runtime-retry-1`, logicalRole },
+      ]
+    }),
+  ].map(request => ({
+    ...request,
+    parent: request.logicalRole === 'route-analyst' ? 'deterministic-control-plane' : 'run-owner',
+    assignment: `Exact assignment for ${request.workItemId}`,
+    checks: [`Verify ${request.workItemId}`],
+  }))
+  const binding = { requestEnvelopeHash: 'b'.repeat(64) }
+  const freshRegistry = new Map()
+  const freshIds = requests.map(request =>
+    assignmentLocalFindingId(request, binding, freshRegistry))
+  assert.deepEqual(freshIds, [
+    'AP-WORK-001',
+    'AP-WORK-101', 'AP-WORK-102', 'AP-WORK-103',
+    'AP-WORK-201', 'AP-WORK-202', 'AP-WORK-203',
+    'AP-WORK-301',
+    'AP-WORK-401', 'AP-WORK-421', 'AP-WORK-441', 'AP-WORK-461',
+    'AP-WORK-402', 'AP-WORK-422', 'AP-WORK-442', 'AP-WORK-462',
+  ])
+  assert.equal(new Set(freshIds).size, requests.length)
+  const resumedRegistry = new Map()
+  const resumedIds = structuredClone(requests).map(request =>
+    assignmentLocalFindingId(request, structuredClone(binding), resumedRegistry))
+  assert.deepEqual(resumedIds, freshIds)
+
+  const exoticRegistry = new Map()
+  assert.throws(() => {
+    for (let ordinal = 0; ordinal <= 200; ordinal += 1) {
+      assignmentLocalFindingId({
+        workItemId: `extension-assignment-${ordinal}`,
+        logicalRole: 'worker',
+        assignment: `Extension assignment ${ordinal}`,
+      }, binding, exoticRegistry)
+    }
+  }, error => error.code === 'ASSIGNMENT_FINDING_ID_COLLISION')
+})
+
 test('AP-ROUTE-025 emits item verification before more work continues', async () => {
   const transitions = []
   await emitItemVerifiedTransition(async (...args) => transitions.push(args), {
@@ -394,6 +475,7 @@ test('AP-ROUTE-028/DESIGN-042 stop resumably without finalizer terminalization',
     finalizer: { finalize: async () => { finalized += 1 } },
     budget: { snapshot: () => ({ generation: 1 }) },
   })
+  assert.equal(runtime._budgetPauseFrontier(), null)
   const result = await runtime._suspendResumable('WAITING_USER', {
     terminalEnvelope: { status: 'WAITING_USER', route: null },
   })
@@ -414,7 +496,11 @@ test('AP-DESIGN-035 ROADMAP admission includes planning with p95 and hard bounds
   const exceeded = new CentralScheduler({ route: 'ROADMAP', runIdentity: RUN })
     .recordAdmissionComponent('roadmapPlanning', (15 * 60 * 1000) + 1)
   assert.equal(exceeded.withinCeiling, false)
+  assert.equal(exceeded.withinTarget, false)
+  assert.equal(exceeded.convergenceRequired, true)
+  assert.equal(exceeded.completionCanContinue, true)
   assert.deepEqual(exceeded.breaches, ['roadmapPlanning'])
+  assert.equal(exceeded.convergencePolicy.kind, 'essential-sequential-collapse')
 })
 
 test('AP-DESIGN-045 L1 request pointer is hash-checked before reuse', t => {

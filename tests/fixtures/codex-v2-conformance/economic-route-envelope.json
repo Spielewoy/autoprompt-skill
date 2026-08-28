@@ -33,9 +33,9 @@
       "route": "DIRECT",
       "observed": {
         "childLaunches": 3,
-        "contextBytes": 6144,
-        "noncachedInputTokens": 85000,
-        "outputTokens": 12000,
+        "contextBytes": 4572,
+        "noncachedInputTokens": 992,
+        "outputTokens": 93,
         "usefulWorkLatencyMs": 180000,
         "effort": "medium"
       },
@@ -45,10 +45,10 @@
       "id": "light-security-fix",
       "route": "LIGHT",
       "observed": {
-        "childLaunches": 6,
-        "contextBytes": 12288,
-        "noncachedInputTokens": 320000,
-        "outputTokens": 42000,
+        "childLaunches": 3,
+        "contextBytes": 4566,
+        "noncachedInputTokens": 992,
+        "outputTokens": 93,
         "usefulWorkLatencyMs": 720000,
         "effort": "high"
       },
@@ -58,10 +58,10 @@
       "id": "roadmap-soc-build",
       "route": "ROADMAP",
       "observed": {
-        "childLaunches": 14,
-        "contextBytes": 28672,
-        "noncachedInputTokens": 980000,
-        "outputTokens": 130000,
+        "childLaunches": 3,
+        "contextBytes": 4575,
+        "noncachedInputTokens": 992,
+        "outputTokens": 93,
         "usefulWorkLatencyMs": 2100000,
         "effort": "xhigh"
       },

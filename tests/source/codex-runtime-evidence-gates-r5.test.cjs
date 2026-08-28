@@ -151,6 +151,8 @@ test('AP-TEST-027 scheduler-backed route simulations measure emitted launch and 
   const report = evidence.runEconomicRouteSimulations(economicCorpus, { command: [process.execPath, path.join(FIXTURES, 'route-simulation-child.cjs')], cwd: ROOT, timeoutMs: 10000 })
   assert.equal(report.conformant, true)
   assert.deepEqual(report.results.map(item => item.route), ['DIRECT', 'LIGHT', 'ROADMAP'])
+  assert.deepEqual(report.results.map(item => item.measured.childLaunches), [3, 3, 3],
+    'the compact automatic fixtures launch only analyst + one useful worker + one checker')
   assert.ok(report.results.every(item => item.measured.noncachedInputTokens > 0 && item.measured.outputTokens > 0 && item.measured.usefulWorkLatencyMs > 0))
   const tight = structuredClone(economicCorpus); tight.routeCaps.DIRECT.outputTokens = 1
   assert.throws(() => evidence.runEconomicRouteSimulations(tight, { command: [process.execPath, path.join(FIXTURES, 'route-simulation-child.cjs')], cwd: ROOT }), error => error.code === 'ECONOMIC_ROUTE_LIMIT_EXCEEDED')

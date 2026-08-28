@@ -701,6 +701,8 @@ test('AP-ISO-019 isolation doctor inventories and migrates clean, legacy, foreig
   const clean = doctorReport(cases.clean)
   assert.equal(clean.status, 1)
   assert.equal(clean.report.isolationReady, false)
+  assert.equal(clean.report.canonicalTrustReady, false)
+  assert.equal(clean.report.localConformanceAvailable, true)
   assert.deepEqual(clean.report.knownLegacy, [])
   assert.deepEqual(clean.report.foreignCollisions, [])
   assert.deepEqual(clean.report.capabilityConflicts, EXPECTED_CANONICAL_TRUST_REFUSAL)
@@ -752,6 +754,8 @@ test('AP-ISO-019 deterministic doctor trust refusal fixture', {
 
   assert.equal(clean.status, 1)
   assert.equal(clean.report.isolationReady, false)
+  assert.equal(clean.report.canonicalTrustReady, false)
+  assert.equal(clean.report.localConformanceAvailable, true)
   assert.equal(clean.report.capabilityTrust.ready, false)
   assert.deepEqual(clean.report.capabilityConflicts, EXPECTED_CANONICAL_TRUST_REFUSAL)
   assert.deepEqual(clean.report.capabilityTrust.verifiedCapabilities, [])

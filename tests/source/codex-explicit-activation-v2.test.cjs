@@ -647,8 +647,27 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
     assert.equal(record.modelSelection.probeAcceptance.strictConfig, true)
     assert.equal(record.modelSelection.probeAcceptance.explicitModelAndEffortAssignments, false)
     assert.equal(record.providerAttestation.attestation.result, 'supported')
+    assert.equal(record.providerTrust.status, 'LOCAL_CONFORMANCE')
+    assert.equal(record.providerTrust.admissionMode, 'explicit-local-activation')
+    assert.equal(record.providerTrust.activationId, record.activationId)
+    assert.equal(record.providerTrust.capabilityGeneration, record.capability.generation)
+    assert.deepEqual(record.providerTrust.verifiedCapabilities,
+      ['isolation', 'privateSkillRoot', 'processOwnership'])
+    assert.equal(record.providerAttestation.attestation.verificationMethod,
+      'activation-local-conformance')
     assert.deepEqual(record.providerAttestation.attestation.verifiedCapabilities,
       ['isolation', 'privateSkillRoot', 'processOwnership'])
+    assert.deepEqual(Object.keys(record.localConformance).sort(),
+      ['processProbe', 'processRegistry', 'schemaVersion'])
+    assert.equal(record.localConformance.processProbe.kind, 'owned-process-conformance')
+    assert.equal(record.localConformance.processProbe.drained, true)
+    assert.equal(record.localConformance.processProbe.terminalStatus, 'DONE')
+    assert.equal(record.localConformance.processProbe.targetKey,
+      crypto.createHash('sha256').update(activation.stableJsonV1(record.target)).digest('hex'))
+    assert.equal(path.relative(record.activationRoot,
+      record.localConformance.processRegistry.path).startsWith('..'), false)
+    assert.equal(record.localConformance.processRegistry.sha256,
+      sha256(record.localConformance.processRegistry.path))
     assert.doesNotMatch(JSON.stringify(record.providerAttestation), /privateKey|BEGIN PRIVATE KEY/)
     assert.equal(activation.verifyProviderAttestation(record, {
       requireFresh: true,
@@ -940,6 +959,73 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
   }
 })
 
+test('local conformance trust fails closed on forged scope and bound-state drift', t => {
+  const context = makeCleanInstall()
+  t.after(() => fs.rmSync(context.sandbox, { recursive: true, force: true }))
+  const prepared = activation.prepareActivation({
+    env: context.env,
+    missionArgs: ['local conformance adversarial binding'],
+    now: new Date('2026-08-21T12:00:00.000Z'),
+    spawnSync: probeOnlySpawn,
+    target: context.target,
+    ttlSeconds: 60,
+  })
+  assert.equal(activation.verifyProviderAttestation(prepared.record, {
+    requireFresh: true,
+    now: new Date('2026-08-21T12:00:01.000Z'),
+  }), prepared.record.providerAttestation)
+
+  const resealTrust = record => {
+    const unsigned = { ...record.providerTrust }
+    delete unsigned.sha256
+    record.providerTrust.sha256 = crypto.createHash('sha256')
+      .update(activation.stableJsonV1(unsigned)).digest('hex')
+  }
+  const rejectMutation = mutate => {
+    const record = structuredClone(prepared.record)
+    mutate(record)
+    assert.throws(() => activation.verifyProviderAttestation(record, {
+      requireFresh: true,
+      now: new Date('2026-08-21T12:00:01.000Z'),
+    }), error => error.code === 'PROVIDER_UNSUPPORTED')
+  }
+
+  rejectMutation(record => {
+    record.providerTrust.admissionMode = 'ambient-benchmark-override'
+    resealTrust(record)
+  })
+  rejectMutation(record => {
+    record.providerTrust.unboundedAuthority = true
+    resealTrust(record)
+  })
+  rejectMutation(record => {
+    record.providerTrust.verifiedCapabilities.push('modelRouting')
+    resealTrust(record)
+  })
+  rejectMutation(record => {
+    record.providerTrust.runtimeIdentityHash = '0'.repeat(64)
+    resealTrust(record)
+  })
+  rejectMutation(record => {
+    record.activationBoundary.enforcementProof.profileSha256 = '1'.repeat(64)
+  })
+  rejectMutation(record => {
+    record.activationBoundary.payloadManifestSha256 = '2'.repeat(64)
+  })
+
+  const registryPath = prepared.record.localConformance.processRegistry.path
+  const registryBytes = fs.readFileSync(registryPath)
+  try {
+    fs.appendFileSync(registryPath, ' ')
+    assert.throws(() => activation.verifyProviderAttestation(prepared.record, {
+      requireFresh: true,
+      now: new Date('2026-08-21T12:00:01.000Z'),
+    }), /local-conformance-process-evidence-drift/)
+  } finally {
+    fs.writeFileSync(registryPath, registryBytes)
+  }
+})
+
 test('real Codex dynamic preflight accepts the isolated qualified activation without a model call', {
   skip: process.env.AUTOPROMPT_REAL_CODEX_PREFLIGHT !== '1',
 }, t => {
@@ -1199,6 +1285,38 @@ test('dispatcher capability consume is file-bound, context-bound, expiring, revo
     requireFresh: true,
     now: new Date('2026-08-21T12:01:01.000Z'),
   }), /provider-attestation-not-fresh/)
+  const resumed = activation.prepareActivation({
+    env: context.env,
+    missionArgs: ['expires'],
+    now: new Date('2026-08-21T12:01:01.000Z'),
+    resume: expiring.activationId,
+    spawnSync: probeOnlySpawn,
+    target: context.target,
+    ttlSeconds: 60,
+  })
+  assert.equal(resumed.record.capability.generation, 2)
+  assert.equal(resumed.record.providerTrust.status, 'LOCAL_CONFORMANCE')
+  assert.equal(resumed.record.providerTrust.capabilityGeneration, 2)
+  assert.match(resumed.record.localConformance.processRegistry.path,
+    /process-registry-2\.json$/)
+  assert.equal(resumed.record.providerAttestation.attestation.activationNonce,
+    expiring.record.providerAttestation.attestation.activationNonce)
+  const registryPath = resumed.record.localConformance.processRegistry.path
+  const registryBytes = fs.readFileSync(registryPath)
+  try {
+    fs.appendFileSync(registryPath, ' ')
+    assert.throws(() => activation.prepareActivation({
+      env: context.env,
+      missionArgs: ['expires'],
+      now: new Date('2026-08-21T12:02:02.000Z'),
+      resume: resumed.activationId,
+      spawnSync: probeOnlySpawn,
+      target: context.target,
+      ttlSeconds: 60,
+    }), /local-conformance-process-evidence-drift/)
+  } finally {
+    fs.writeFileSync(registryPath, registryBytes)
+  }
   activation.revokeAllActivations({ env: context.env, reason: 'test-cleanup' })
   assert.throws(() => activation.consumeCapability(
     expiring.recordPath, expiring.token, expiredContext, now,

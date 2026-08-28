@@ -3,7 +3,7 @@
   "evidenceClass": "deterministic-local-execution",
   "corpusPath": "tests/fixtures/codex-v2-conformance/semantic-route-corpus.json",
   "corpusSha256": "0e4bf80c0eccfcf8fe272b6e622454e4f336a5c3f0badadf3113d42b11c34b80",
-  "currentCommit": "4003101383cbca254dc8532ff6cfa7fffb0c3747",
+  "currentCommit": "5b81b070d63a79a512052a14ec4f83679e3f3d83",
   "cohort": {
     "expectedTaskCount": 10,
     "taskIds": [

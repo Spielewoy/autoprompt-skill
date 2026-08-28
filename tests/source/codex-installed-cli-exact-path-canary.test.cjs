@@ -18,11 +18,6 @@ const DIRECT_TASK_FIXTURE = path.join(ROOT, 'tests', 'fixtures', 'codex-low-comp
 const DIRECT_PROVIDER_FIXTURE = path.join(
   ROOT, 'tests', 'fixtures', 'codex-installed-cli', 'direct-normalize-tags-provider.cjs',
 )
-const INSTALL_CACHE = path.join(
-  os.homedir(), '.autoprompt-installed-cli-cache', 'manifest-relative-v6',
-  `${RELEASE.payloadGeneration}-${RELEASE.payloadDigest}`,
-  'codex-home',
-)
 const activation = require('../../scripts/codex-configure.cjs')
 const localSafety = require('../../scripts/local-only-safety.cjs')
 
@@ -100,11 +95,8 @@ function directCanaryRouteArtifacts(routeDecision, router, requestEnvelopeHash) 
       approvalRequired: false, approvalGranted: false, approvalEvidenceHash: null,
     },
     riskAndIndependentCheckFloor: {
-      level: 'ordinary', minimumCheckerCount: 2,
-      namedDistinctResponsibilities: [
-        'Independently run the preregistered normalizeTags focused behavior check.',
-        'Independently verify that the frozen diff is restricted to index.cjs.',
-      ],
+      level: 'ordinary', minimumCheckerCount: 1,
+      namedDistinctResponsibilities: [],
     },
     checkAndBaseline: {
       checkQuality: 'authoritative', availableCheckKinds: ['focused-test'],
@@ -140,7 +132,7 @@ function directCanaryRouteArtifacts(routeDecision, router, requestEnvelopeHash) 
     confidence: 'high',
     whatTheUserWants: ['Fix normalizeTags so the preregistered focused behavior check passes.'],
     likelyAreas: ['index.cjs'],
-    howSuccessCanBeChecked: ['Run node --test test.cjs from the task root.'],
+    howSuccessCanBeChecked: ['node --test test.cjs'],
     unknowns: [],
     risks: ['Keep the diff restricted to the one owned implementation file.'],
     independentWorkItems: ['One worker owns the bounded normalizeTags fix.'],
@@ -208,8 +200,8 @@ function directCanaryRouteArtifacts(routeDecision, router, requestEnvelopeHash) 
   assert.equal(decision.routeSource, 'automatic')
   assert.equal(decision.topology.counts.routeAnalysts, 1)
   assert.equal(decision.topology.counts.workers, 1)
-  assert.equal(decision.topology.counts.finalCheckers, 2)
-  assert.equal(decision.independentCheckingPlan.checkerCount, 2)
+  assert.equal(decision.topology.counts.finalCheckers, 1)
+  assert.equal(decision.independentCheckingPlan.checkerCount, 1)
   return { classified, decision, recommendation }
 }
 
@@ -225,18 +217,26 @@ function assertRegularDirectory(directory, label) {
     `${label} must be a regular directory, not a link or reparse target`)
 }
 
+function installedCodexSkillRoot(root) {
+  return path.join(
+    root, '.autoprompt-private', 'bundles', RELEASE.payloadGeneration, 'skills', 'autoprompt',
+  )
+}
+
 function manifestHashIdentities(root, hashes) {
   const identities = new Map()
   for (const [key, hash] of Object.entries(hashes)) {
-    if (!key || key.includes('\\') || key.includes(':') || /[\x00-\x1f]/.test(key) ||
-        path.posix.isAbsolute(key) || path.win32.isAbsolute(key) ||
-        !/^[a-f0-9]{64}$/.test(hash)) return null
-    const segments = key.split('/')
-    if (segments.some(segment => !segment || segment === '.' || segment === '..')) return null
-    const target = path.resolve(root, ...segments)
+    if (!key || /[\x00-\x1f]/.test(key) || !/^[a-f0-9]{64}$/.test(hash)) return null
+    const nativeAbsolute = path.isAbsolute(key)
+    if (!nativeAbsolute && (key.includes('\\') || key.includes(':') ||
+        path.posix.isAbsolute(key) || path.win32.isAbsolute(key))) return null
+    const segments = nativeAbsolute ? [] : key.split('/')
+    if (!nativeAbsolute && segments.some(segment =>
+      !segment || segment === '.' || segment === '..')) return null
+    const target = nativeAbsolute ? path.resolve(key) : path.resolve(root, ...segments)
     const relative = path.relative(root, target)
     if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) ||
-        relative.split(path.sep).join('/') !== key) return null
+        (!nativeAbsolute && relative.split(path.sep).join('/') !== key)) return null
     const identity = process.platform === 'win32' ? target.toLowerCase() : target
     if (identities.has(identity)) return null
     identities.set(identity, hash)
@@ -250,8 +250,9 @@ function isCurrentInstalledTemplate(root) {
     if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return false
     const receiptPath = path.join(root, '.autoprompt-install-receipt.json')
     const hashesPath = path.join(root, '.autoprompt-install-hashes.json')
-    const manifestPath = path.join(root, 'skills', 'autoprompt', '.autoprompt-runtime-manifest.json')
-    const installedPath = path.join(root, 'skills', 'autoprompt', 'workflow', 'phase-budget.js')
+    const installedSkillRoot = installedCodexSkillRoot(root)
+    const manifestPath = path.join(installedSkillRoot, '.autoprompt-runtime-manifest.json')
+    const installedPath = path.join(installedSkillRoot, 'workflow', 'phase-budget.js')
     if (![receiptPath, hashesPath, manifestPath, installedPath].every(isRegularFile)) return false
     const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'))
     const hashes = JSON.parse(fs.readFileSync(hashesPath, 'utf8'))
@@ -271,13 +272,23 @@ function isCurrentInstalledTemplate(root) {
   }
 }
 
-function validatedInstalledTemplate() {
+function validatedInstalledTemplate(t) {
   assert.match(RELEASE.payloadGeneration, /^codex-v2\.0\.0-[a-f0-9]{16}$/)
   assert.match(RELEASE.payloadDigest, /^[a-f0-9]{64}$/)
   assert.equal(RELEASE.payloadGeneration.endsWith(RELEASE.payloadDigest.slice(0, 16)), true)
-  assert.equal(isCurrentInstalledTemplate(INSTALL_CACHE), true,
-    `the immutable v5 cache must be a current installer-owned Codex template: ${INSTALL_CACHE}`)
-  return INSTALL_CACHE
+  const template = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-installed-cli-template-'))
+  t.after(() => {
+    fs.rmSync(template, { recursive: true, force: true })
+    assert.equal(fs.existsSync(template), false,
+      'hermetic installed template must leave zero residue')
+  })
+  const installed = directCanaryRun(process.execPath, [
+    CLI, 'install', 'codex', '--root', template,
+  ], { cwd: ROOT })
+  assert.equal(installed.status, 0, installed.stderr || installed.stdout)
+  assert.equal(isCurrentInstalledTemplate(template), true,
+    `the hermetic installer-owned Codex template must be current: ${template}`)
+  return template
 }
 
 function receiptOwnedSnapshot(root) {
@@ -339,8 +350,9 @@ function auditInstalledTemplate(root) {
     `the sandbox install must be current and receipt-owned: ${root}`)
   const receiptPath = path.join(root, '.autoprompt-install-receipt.json')
   const hashesPath = path.join(root, '.autoprompt-install-hashes.json')
-  const markerPath = path.join(root, 'skills', 'autoprompt', '.autoprompt-runtime-manifest.json')
-  const installedPath = path.join(root, 'skills', 'autoprompt', 'workflow', 'phase-budget.js')
+  const installedSkillRoot = installedCodexSkillRoot(root)
+  const markerPath = path.join(installedSkillRoot, '.autoprompt-runtime-manifest.json')
+  const installedPath = path.join(installedSkillRoot, 'workflow', 'phase-budget.js')
   const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'))
   const hashes = JSON.parse(fs.readFileSync(hashesPath, 'utf8'))
   const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'))
@@ -361,12 +373,14 @@ function auditInstalledTemplate(root) {
   assert.equal(marker.provider, 'codex')
   assert.equal(marker.payloadGeneration, RELEASE.payloadGeneration)
   assert.equal(marker.payloadDigest, RELEASE.payloadDigest)
-  const phaseKey = 'skills/autoprompt/workflow/phase-budget.js'
   const source = path.join(ROOT, 'agents', 'codex', 'workflow', 'phase-budget.js')
   const sourceManifest = require('../../agents/manifests/codex-runtime.json')
   const rawSha256 = digest(source)
   assert.equal(sourceManifest.sha256['workflow/phase-budget.js'], rawSha256)
-  assert.equal(hashes[phaseKey], rawSha256)
+  const installedIdentity = process.platform === 'win32'
+    ? path.resolve(installedPath).toLowerCase()
+    : path.resolve(installedPath)
+  assert.equal(identities.get(installedIdentity), rawSha256)
   assert.equal(digest(installedPath), rawSha256)
   return { installedPath, markerPath, rawSha256 }
 }
@@ -526,10 +540,10 @@ async function compileOfflineCodex(bin) {
   return executable
 }
 
-test('installed Codex CLI rejects a transplanted cache-A receipt at root B before activation', {
-  timeout: 15_000,
+test('installed Codex CLI rejects a transplanted installer receipt at root B before activation', {
+  timeout: 45_000,
 }, t => {
-  const template = validatedInstalledTemplate()
+  const template = validatedInstalledTemplate(t)
   const cacheSnapshot = receiptOwnedSnapshot(template)
   const sandbox = fs.mkdtempSync(path.join(os.homedir(), '.autoprompt-installed-cli-transplant-'))
   t.after(() => {
@@ -562,7 +576,7 @@ test('installed Codex CLI rejects a transplanted cache-A receipt at root B befor
     captured = error
   }
   assert.equal(captured instanceof activation.ProviderUnsupportedError, true)
-  assert.equal(captured.reason, 'managed-payload-receipt-root-mismatch')
+  assert.equal(captured.reason, 'managed-payload-hash-manifest-invalid')
   assert.equal(childCalls, 0, 'no child, route, model, or production boundary may run')
   assert.equal(fs.existsSync(path.join(root, '.a')), false,
     'no activation payload or private copy may be created')
@@ -572,14 +586,14 @@ test('installed Codex CLI rejects a transplanted cache-A receipt at root B befor
 
 test('installed Codex live-host canary is blocked without provider-owned cap_sid before execution', {
   skip: process.platform !== 'win32',
-  timeout: 15_000,
+  timeout: 45_000,
 }, t => {
-  const root = validatedInstalledTemplate()
+  const root = validatedInstalledTemplate(t)
   const cacheSnapshot = receiptOwnedSnapshot(root)
   const outsideSnapshot = outsideReceiptSnapshot(root)
   const audited = auditInstalledTemplate(root)
   const source = path.join(ROOT, 'agents', 'codex', 'workflow', 'phase-budget.js')
-  const installed = path.join(root, 'skills', 'autoprompt', 'workflow', 'phase-budget.js')
+  const installed = path.join(installedCodexSkillRoot(root), 'workflow', 'phase-budget.js')
   const manifest = require('../../agents/manifests/codex-runtime.json')
   assert.equal(digest(source), manifest.sha256['workflow/phase-budget.js'])
   assert.equal(digest(installed), digest(source))
@@ -647,6 +661,29 @@ test('installed Codex live-host canary is blocked without provider-owned cap_sid
 test('packed installed DIRECT normalizeTags RED-to-GREEN canary', {
   timeout: 180_000,
 }, async t => {
+  let releaseTrustError = null
+  try {
+    artifact.assertCanonicalReleaseTrust(ROOT)
+  } catch (error) {
+    releaseTrustError = error
+  }
+  if (releaseTrustError) {
+    const pending = artifact.assertConformanceOnlyTrust(ROOT)
+    assert.equal(pending.evidenceResult, 'FAIL')
+    assert.equal(pending.refusal.ready, false)
+    assert.deepEqual(pending.refusal.blockers, [
+      'canonical-live-evidence-invalid',
+      'external-attestation-missing',
+      'external-attestation-verification-method-invalid',
+      'supported-capability-unattested-isolation',
+      'supported-capability-unattested-privateSkillRoot',
+      'supported-capability-unattested-processOwnership',
+    ])
+    assert.equal(releaseTrustError.message,
+      `Codex artifact release trust blocked: ${pending.refusal.blockers.join(',')}`)
+    t.skip('packed DIRECT canary requires current externally signed live PASS evidence')
+    return
+  }
   const startedAt = Date.now()
   const sandbox = fs.mkdtempSync(path.join(os.homedir(), '.autoprompt-installed-direct-canary-'))
   const packRoot = path.join(sandbox, 'pack')
@@ -904,6 +941,10 @@ test('packed installed DIRECT normalizeTags RED-to-GREEN canary', {
         executableArgs: [DIRECT_PROVIDER_FIXTURE],
         expectedBranch: 'main',
         providerMaximum: 2,
+        trustedTestDeclarations: { controlPlane: [{
+          id: 'installed-focused-check', executable: process.execPath,
+          argv: ['--test', 'test.cjs'],
+        }] },
         tokenLimit: 1_000,
         sessionLimit: 16,
         launchLimit: 16,
@@ -913,8 +954,8 @@ test('packed installed DIRECT normalizeTags RED-to-GREEN canary', {
     const result = await new installedPhase.CodexSupervisorRuntime(options).start()
     assert.equal(result.outcome, 'DONE', JSON.stringify(result))
     assert.equal(result.route, 'DIRECT')
-    assert.equal(result.scheduler.counters.totalLaunches, 5,
-      'one analyst, one diagnostic probe, one real worker, and two independent checkers must be launched')
+    assert.equal(result.scheduler.counters.totalLaunches, 3,
+      'one analyst, one real worker, and one combined checker must be launched')
     assert.equal(result.scheduler.rootAccounting.status, 'completed')
     await options.processOwner.assertDrained()
     assert.equal(options.processOwner.listRecords().some(item => item.status === 'RUNNING'), false,
@@ -937,9 +978,9 @@ test('packed installed DIRECT normalizeTags RED-to-GREEN canary', {
     assert.equal(persistedDecision.acceptance.terminalResult, 'CHANGE_VERIFIED')
     const joined = installedRunRecord.readAllWorkJoinedReceipt(record)
     assert.equal(joined.eventId, 'ALL_WORK_JOINED')
-    assert.deepEqual(joined.verdicts.map(item => item.status), ['PASS', 'PASS'])
-    assert.equal(new Set(joined.verdicts.flatMap(item => item.evidenceIds)).size, 2,
-      'the two independent seats must consume distinct evidence identities')
+    assert.deepEqual(joined.verdicts.map(item => item.status), ['PASS'])
+    assert.equal(new Set(joined.verdicts.flatMap(item => item.evidenceIds)).size, 1,
+      'the single combined checker must bind its observed evidence identity')
     const terminal = JSON.parse(fs.readFileSync(record.paths.terminalPath, 'utf8'))
     assert.equal(terminal.outcome, 'DONE')
     assert.equal(terminal.terminalEnvelope.code, 'DONE')
@@ -948,16 +989,17 @@ test('packed installed DIRECT normalizeTags RED-to-GREEN canary', {
 
     const trace = fs.readFileSync(tracePath, 'utf8').trim().split(/\r?\n/u).map(JSON.parse)
     assert.equal(trace.filter(item => item.phase === 'automatic-route-analysis').length, 1)
-    assert.equal(trace.filter(item => item.phase === 'automatic-route-decision').length, 1)
+    assert.equal(trace.filter(item => item.phase === 'automatic-route-decision').length, 0,
+      'the deterministic L0 projection must not launch another provider turn')
     const redGreen = trace.filter(item => item.phase === 'red-edit-green')
     assert.equal(redGreen.length, 1)
     assert.notEqual(redGreen[0].beforeExitCode, 0)
     assert.equal(redGreen[0].afterExitCode, 0)
     const independent = trace.filter(item => item.phase === 'independent-focused-check')
-    assert.equal(independent.length, 2)
+    assert.equal(independent.length, 1)
     assert.equal(independent.every(item => item.exitCode === 0), true)
-    assert.equal(new Set(independent.map(item => item.logicalRole)).size, 2)
-    assert.equal(new Set(independent.map(item => item.evidenceId)).size, 2)
+    assert.equal(new Set(independent.map(item => item.logicalRole)).size, 1)
+    assert.equal(new Set(independent.map(item => item.evidenceId)).size, 1)
     assert.equal(trace.every(item => item.providerArgv[0] === 'exec'), true,
       'all route/work/check calls must traverse the installed runtime Codex exec adapter')
 

@@ -96,6 +96,7 @@ class BudgetController {
     this.wallNowMs = options.wallNowMs || Date.now
     this.bootId = options.bootId === undefined ? detectBootId(options.fsImpl) : options.bootId
     this.monotonicClockId = options.monotonicClockId === undefined ? null : options.monotonicClockId
+    this.externalWriteClockUncertain = false
     if (this.monotonicClockId !== null &&
         (typeof this.monotonicClockId !== 'string' || !this.monotonicClockId.trim())) {
       fail('BUDGET_CONFIG_INVALID', 'monotonicClockId must be a non-empty string when provided')
@@ -136,6 +137,7 @@ class BudgetController {
         bootId: this.bootId,
         activationStartedWallMs: wallNow,
         lastObservedWallMs: wallNow,
+        externalWriteClockUncertain: false,
         activationStartedAt: String(this.wallClock()),
         checkpointAt: String(this.wallClock()),
         tokensUsed: 0,
@@ -150,6 +152,21 @@ class BudgetController {
         sessions: {},
       }
     }
+  }
+
+  _observeWallNow(observed = this.wallNowMs()) {
+    const wallNow = Number(observed)
+    if (!Number.isFinite(wallNow)) fail('BUDGET_CLOCK_INVALID', 'wall persistence clock did not return a finite value')
+    if (this.state && wallNow < this.state.lastObservedWallMs) {
+      this.externalWriteClockUncertain = true
+      this.state.externalWriteClockUncertain = true
+    }
+    if (this.state) {
+      this.state.lastObservedWallMs = Math.max(this.state.lastObservedWallMs, wallNow)
+      this.state.externalWriteClockUncertain = this.externalWriteClockUncertain === true ||
+        this.state.externalWriteClockUncertain === true
+    }
+    return wallNow
   }
 
   elapsedMs() {
@@ -195,19 +212,33 @@ class BudgetController {
 
   assertAvailable(options = {}) {
     const status = this.status(options)
-    if (!status.ok) {
-      if (options.forExecution && status.exhausted.includes('EXECUTION_WALL')) {
+    const blocking = options.requiredCompletion === true
+      ? status.exhausted.filter(dimension => ![
+          'WALL', 'WORK_WALL', 'EXECUTION_WALL', 'TOKENS', 'SESSIONS', 'LAUNCHES',
+        ].includes(dimension))
+      : status.exhausted
+    if (blocking.length > 0) {
+      if (options.forExecution && blocking.includes('EXECUTION_WALL')) {
         fail('FINAL_VERIFICATION_RESERVE_REQUIRED', 'execution cannot consume the protected final-verification reserve', status)
       }
-      fail('BUDGET_EXHAUSTED', `runtime budget exhausted: ${status.exhausted.join(', ')}`, status)
+      fail('BUDGET_EXHAUSTED', `runtime budget exhausted: ${blocking.join(', ')}`, status)
     }
-    return status
+    return options.requiredCompletion === true && status.exhausted.length > 0
+      ? { ...status, ok: true, completionTargetOverrun: [...status.exhausted] }
+      : status
   }
 
   assertExternalWriteAllowed(details = {}) {
     const deadline = this.state.deadline && Date.parse(this.state.deadline.absoluteDeadline)
-    const nowMs = Number(this.wallNowMs())
-    if (!Number.isFinite(nowMs)) fail('BUDGET_CLOCK_INVALID', 'external-write wall clock is not finite')
+    const nowMs = this._observeWallNow()
+    if (this.externalWriteClockUncertain) {
+      fail('EXTERNAL_WRITE_CLOCK_UNCERTAIN',
+        'external write denied because wall-clock continuity cannot be established', {
+          lastObservedWallMs: this.state.lastObservedWallMs,
+          observedAtMs: nowMs,
+          operationId: details.operationId || null,
+        })
+    }
     if (!Number.isFinite(deadline)) {
       fail('EXTERNAL_WRITE_DEADLINE_REQUIRED', 'external writes require a bound absolute task deadline')
     }
@@ -261,7 +292,9 @@ class BudgetController {
       anchorMonotonicMs: monotonic,
       checkpointMonotonicMs: monotonic,
       activationStartedWallMs: admittedAtMs,
-      lastObservedWallMs: admittedAtMs,
+      lastObservedWallMs: Math.max(this.state.lastObservedWallMs, admittedAtMs),
+      externalWriteClockUncertain: this.externalWriteClockUncertain === true ||
+        this.state.externalWriteClockUncertain === true,
       activationStartedAt: admittedAt,
       checkpointAt: admittedAt,
     })
@@ -269,9 +302,12 @@ class BudgetController {
     return this.snapshot()
   }
 
-  consumeTokens(count) {
+  consumeTokens(count, options = {}) {
     if (!Number.isSafeInteger(count) || count < 0) fail('BUDGET_USAGE_INVALID', 'token count must be a non-negative safe integer')
-    if (this.state.tokensUsed + count > this.state.limits.tokens) {
+    if (!Number.isSafeInteger(this.state.tokensUsed + count)) {
+      fail('BUDGET_USAGE_INVALID', 'cumulative token count exceeds safe integer accounting')
+    }
+    if (options.requiredCompletion !== true && this.state.tokensUsed + count > this.state.limits.tokens) {
       fail('BUDGET_EXHAUSTED', 'token budget would be exceeded', this.status())
     }
     this.state.tokensUsed += count
@@ -282,8 +318,11 @@ class BudgetController {
     this.assertAvailable({
       forWork: details.forWork !== false,
       forExecution: details.forExecution === true,
+      requiredCompletion: details.requiredCompletion === true,
     })
-    if (this.state.launches >= this.state.limits.launches) fail('BUDGET_EXHAUSTED', 'launch budget is exhausted')
+    if (details.requiredCompletion !== true && this.state.launches >= this.state.limits.launches) {
+      fail('BUDGET_EXHAUSTED', 'launch budget is exhausted')
+    }
     this.state.launches += 1
     return this.state.launches
   }
@@ -300,8 +339,14 @@ class BudgetController {
     this.assertAvailable({
       forWork: details.forWork !== false,
       forExecution: details.forExecution === true,
+      requiredCompletion: details.requiredCompletion === true,
     })
-    if (this.state.sessionsStarted >= this.state.limits.sessions) fail('BUDGET_EXHAUSTED', 'session budget is exhausted')
+    if (details.requiredCompletion !== true && this.state.sessionsStarted >= this.state.limits.sessions) {
+      fail('BUDGET_EXHAUSTED', 'session budget is exhausted')
+    }
+    if (!Number.isSafeInteger(this.state.sessionsStarted + 1)) {
+      fail('BUDGET_USAGE_INVALID', 'cumulative session count exceeds safe integer accounting')
+    }
     this.state.sessionsStarted += 1
     this.state.sessions[sessionId] = {
       sessionId,
@@ -478,8 +523,7 @@ class BudgetController {
 
   snapshot() {
     const elapsed = this.elapsedMs()
-    const wallNow = this.wallNowMs()
-    if (!Number.isFinite(wallNow)) fail('BUDGET_CLOCK_INVALID', 'wall persistence clock did not return a finite value')
+    const wallNow = this._observeWallNow()
     const snapshot = canonicalize({
       ...this.state,
       consumedWallMs: elapsed,
@@ -487,6 +531,8 @@ class BudgetController {
       checkpointMonotonicMs: this.lastMonotonicMs,
       bootId: this.bootId,
       lastObservedWallMs: Math.max(this.state.lastObservedWallMs, wallNow),
+      externalWriteClockUncertain: this.externalWriteClockUncertain === true ||
+        this.state.externalWriteClockUncertain === true,
       checkpointAt: String(this.wallClock()),
     })
     return snapshot
@@ -511,6 +557,14 @@ class BudgetController {
     if (!snapshot || snapshot.schemaVersion !== BUDGET_SCHEMA_VERSION) {
       fail('CONTRACT_UPGRADE_REQUIRED', 'budget snapshot schema is unsupported')
     }
+    if (Object.hasOwn(snapshot, 'externalWriteClockUncertain') &&
+        typeof snapshot.externalWriteClockUncertain !== 'boolean') {
+      fail('BUDGET_SNAPSHOT_INVALID', 'budget snapshot external-write clock uncertainty is invalid')
+    }
+    // Legacy v2 snapshots predate the durable latch.  They remain valid for
+    // local recovery, but absence cannot be interpreted as trusted clock
+    // continuity for an external side effect.
+    this.externalWriteClockUncertain = snapshot.externalWriteClockUncertain !== false
     for (const field of LIMIT_FIELDS) {
       positiveLimit(snapshot.limits && snapshot.limits[field], `snapshot.limits.${field}`)
     }
@@ -557,6 +611,7 @@ class BudgetController {
     let offlineElapsedMs
     const sameInjectedMonotonicClock = this.monotonicClockId && snapshot.monotonicClockId &&
       this.monotonicClockId === snapshot.monotonicClockId
+    if (wallNow < snapshot.lastObservedWallMs) this.externalWriteClockUncertain = true
     if (sameInjectedMonotonicClock || (this.bootId && snapshot.bootId && this.bootId === snapshot.bootId)) {
       if (now < snapshot.checkpointMonotonicMs) {
         fail('BUDGET_CLOCK_RESET', 'same-boot monotonic clock moved backward; resume is fail-closed')
@@ -564,9 +619,15 @@ class BudgetController {
       offlineElapsedMs = now - snapshot.checkpointMonotonicMs
     } else {
       if (wallNow < snapshot.lastObservedWallMs) {
-        fail('BUDGET_CLOCK_RESET', 'boot continuity is unavailable and wall time rolled back; resume is fail-closed')
+        // The authenticated snapshot and accounting hash chains remain the
+        // rollback authorities. A wall-clock correction alone cannot prove
+        // elapsed offline time, so retain the persisted high-water accounting
+        // and deny external effects for this resumed controller.
+        offlineElapsedMs = 0
+        this.externalWriteClockUncertain = true
+      } else {
+        offlineElapsedMs = wallNow - snapshot.lastObservedWallMs
       }
-      offlineElapsedMs = wallNow - snapshot.lastObservedWallMs
     }
     const conservativeConsumed = Math.max(
       snapshot.consumedWallMs + offlineElapsedMs,
@@ -584,6 +645,7 @@ class BudgetController {
       ...(this.monotonicClockId ? { monotonicClockId: this.monotonicClockId } : {}),
       bootId: this.bootId,
       lastObservedWallMs: Math.max(snapshot.lastObservedWallMs, wallNow),
+      externalWriteClockUncertain: this.externalWriteClockUncertain,
     })
     this.finalizationReserveMs = snapshot.finalizationReserveMs
     this.verificationReserveMs = snapshotVerificationReserveMs
@@ -658,7 +720,7 @@ function validateCeilings(ceilings) {
   return canonicalize(ceilings)
 }
 
-function assertUnderCeilings(cumulative, ceilings) {
+function assertUnderCeilings(cumulative, ceilings, options = {}) {
   const totalTokens = BILLABLE_TOKEN_FIELDS.reduce(
     (total, field) => total + cumulative.tokenUsage[field], 0,
   )
@@ -671,6 +733,16 @@ function assertUnderCeilings(cumulative, ceilings) {
     ['costMicrounits', cumulative.costMicrounits],
   ]
   for (const [field, used] of checks) {
+    if (options.allowCompletionTargetOverrun === true &&
+        ['wallMilliseconds', 'totalTokens', 'sessions', 'costMicrounits'].includes(field)) continue
+    if (options.allowCompletionTargetOverrun === true &&
+        ['launches', 'retries'].includes(field) && used > ceilings[field]) {
+      const previousUsed = Number(options.previousCumulative && options.previousCumulative[field] || 0)
+      // A later zero-delta checkpoint may preserve an already authenticated
+      // completion overrun.  Any further launch/retry increase still needs a
+      // fresh required-completion binding on that exact accounting record.
+      if (used === previousUsed || options.requiredCompletion === true) continue
+    }
     if (used > ceilings[field]) fail('BUDGET_EXHAUSTED', `accounting cumulative ${field} exceeds its immutable ceiling`, { field, used, ceiling: ceilings[field] })
   }
 }
@@ -706,6 +778,7 @@ class AccountingAuthority {
     this.wallNowMs = options.wallNowMs || Date.now
     this.clock = options.clock || (() => new Date().toISOString())
     this.bootId = options.bootId === undefined ? detectBootId(this.fs) : options.bootId
+    this.allowCompletionTargetOverrun = options.allowCompletionTargetOverrun === true
     this.ceilings = validateCeilings(options.ceilings || (options.budgetController &&
       options.budgetController.accountingCeilings(options.additionalCeilings)))
     this.ceilingContractHash = sha256(stableStringify(this.ceilings))
@@ -769,8 +842,16 @@ class AccountingAuthority {
     const cause = input.cause
     if (!cause || !ACCOUNTING_CAUSES.includes(cause.kind) ||
         typeof cause.causeId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(cause.causeId) ||
-        typeof cause.humanDescription !== 'string' || !cause.humanDescription || cause.humanDescription.length > 500) {
+        typeof cause.humanDescription !== 'string' || !cause.humanDescription || cause.humanDescription.length > 500 ||
+        (cause.requiredCompletion !== undefined && cause.requiredCompletion !== true)) {
       fail('ACCOUNTING_CAUSE_INVALID', 'accounting checkpoint requires one canonical typed cause')
+    }
+    const requiredCompletion = input.requiredCompletion === true
+    if (requiredCompletion && !['LAUNCH', 'RETRY', 'RECOVERY'].includes(cause.kind)) {
+      fail('ACCOUNTING_CAUSE_INVALID', 'required completion authority is valid only for an admitted launch, retry, or recovery continuation')
+    }
+    if ((cause.requiredCompletion === true) !== requiredCompletion) {
+      fail('ACCOUNTING_CAUSE_INVALID', 'required completion authority must be explicit in both the checkpoint and its durable cause')
     }
     const requestedDelta = validateAccountingValues(input.delta || zeroAccountingValues(), 'accounting delta')
     const lockPath = path.join(path.dirname(this.logPath), '.accounting.lock')
@@ -782,7 +863,7 @@ class AccountingAuthority {
           const records = this._readRecords()
           this._readSnapshot(records)
           const previous = records.at(-1) || null
-          const occurredAt = String(this.clock())
+          let occurredAt = String(this.clock())
           if (Number.isNaN(Date.parse(occurredAt))) fail('ACCOUNTING_CLOCK_INVALID', 'accounting wall clock is not a date-time')
           const observed = Math.floor(this.monotonicMs())
           if (!Number.isSafeInteger(observed) || observed < 0) fail('ACCOUNTING_CLOCK_INVALID', 'accounting monotonic clock is invalid')
@@ -796,13 +877,24 @@ class AccountingAuthority {
               conservativeElapsed = Math.max(conservativeElapsed, observed - previousObserved)
             } else {
               const wallDelta = Date.parse(occurredAt) - Date.parse(previous.occurredAt)
-              if (!Number.isFinite(wallDelta) || wallDelta < 0) fail('BUDGET_CLOCK_RESET', 'accounting continuity is uncertain and wall time moved backward')
-              conservativeElapsed = Math.max(conservativeElapsed, wallDelta)
+              if (!Number.isFinite(wallDelta)) fail('ACCOUNTING_CLOCK_INVALID', 'accounting wall-clock continuity is invalid')
+              if (wallDelta >= 0) conservativeElapsed = Math.max(conservativeElapsed, wallDelta)
+            }
+            // Preserve a monotonic persisted timestamp even when the host wall
+            // clock is corrected backwards. Existing record/hash rollback is
+            // still rejected by _validateRecord; this only canonicalizes a new
+            // authenticated checkpoint at the prior wall-clock high-water.
+            if (Date.parse(occurredAt) < Date.parse(previous.occurredAt)) {
+              occurredAt = previous.occurredAt
             }
           }
           const delta = canonicalize({ ...requestedDelta, elapsedMilliseconds: conservativeElapsed })
           const cumulative = addAccountingValues(previous ? previous.cumulative : zeroAccountingValues(), delta)
-          assertUnderCeilings(cumulative, this.ceilings)
+          assertUnderCeilings(cumulative, this.ceilings, {
+            allowCompletionTargetOverrun: this.allowCompletionTargetOverrun,
+            previousCumulative: previous ? previous.cumulative : zeroAccountingValues(),
+            requiredCompletion,
+          })
           const record = canonicalize({
             schemaVersion: '2.0.0',
             runId: binding.runId,
@@ -925,8 +1017,9 @@ class AccountingAuthority {
         record.previousHash !== (previous ? previous.entryHash : null) || !HASH_PATTERN.test(record.entryHash || '') ||
         record.entryHash !== accountingRecordHash(record) || Number.isNaN(Date.parse(record.occurredAt)) ||
         !record.cause || typeof record.cause !== 'object' || Array.isArray(record.cause) ||
-        Object.keys(record.cause).length !== 3 ||
+        ![3, 4].includes(Object.keys(record.cause).length) ||
         !['kind', 'causeId', 'humanDescription'].every((field) => Object.hasOwn(record.cause, field)) ||
+        (Object.hasOwn(record.cause, 'requiredCompletion') && record.cause.requiredCompletion !== true) ||
         !ACCOUNTING_CAUSES.includes(record.cause.kind) ||
         !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(record.cause.causeId || '') ||
         typeof record.cause.humanDescription !== 'string' || !record.cause.humanDescription || record.cause.humanDescription.length > 500) {
@@ -954,7 +1047,11 @@ class AccountingAuthority {
         currentState.activation.nonce !== record.activationNonce || record.generation > currentState.activation.generation) {
       fail('ACCOUNTING_STATE_UNBOUND', 'accounting record does not bind a persisted canonical state event')
     }
-    assertUnderCeilings(cumulative, this.ceilings)
+    assertUnderCeilings(cumulative, this.ceilings, {
+      allowCompletionTargetOverrun: this.allowCompletionTargetOverrun,
+      previousCumulative: previous ? previous.cumulative : zeroAccountingValues(),
+      requiredCompletion: record.cause.requiredCompletion === true,
+    })
     return true
   }
 
