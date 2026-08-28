@@ -87,14 +87,6 @@ const ROUTE_ANALYST_FALLBACK_OUTCOMES = Object.freeze([
   'TIMEOUT', 'CRASH', 'PROVIDER_UNSUPPORTED', 'MALFORMED',
 ])
 
-const ROUTE_SCHEMA_DIGEST = crypto.createHash('sha256')
-  .update(JSON.stringify({
-    routeDecision: ROUTE_DECISION_SCHEMA,
-    routeRecommendation: ROUTE_RECOMMENDATION_SCHEMA,
-    routeContract: router.ROUTE_CONTRACT,
-  }))
-  .digest('hex')
-
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
@@ -205,10 +197,76 @@ function defaultRouteFactProposal(route = 'DIRECT') {
   }
 }
 
+const ROUTER_PROPOSAL_FACTS = router.ROUTE_FACTS_SCHEMA.properties
+const ROUTER_RESOURCE_KINDS = new Set(
+  ROUTER_PROPOSAL_FACTS.mutableResources.items.properties.kind.enum,
+)
+const ROUTER_OWNERSHIP_MODES = new Set(
+  ROUTER_PROPOSAL_FACTS.mutableResources.items.properties.ownershipMode.enum,
+)
+const ROUTER_SIDE_EFFECTS = new Set(ROUTER_PROPOSAL_FACTS.sideEffects.items.enum)
+const PROVIDER_PROPOSAL_FACTS = ROUTE_RECOMMENDATION_SCHEMA.properties.routeFactProposal.properties
+const CODEX_ROUTE_RECOMMENDATION_SCHEMA = structuredClone(ROUTE_RECOMMENDATION_SCHEMA)
+const CODEX_PROPOSAL_FACTS = CODEX_ROUTE_RECOMMENDATION_SCHEMA.properties.routeFactProposal.properties
+const enumUnion = (...schemas) => [...new Set(schemas.flatMap(schema => schema.enum))]
+CODEX_PROPOSAL_FACTS.mutableResources = structuredClone(ROUTER_PROPOSAL_FACTS.mutableResources)
+CODEX_PROPOSAL_FACTS.sideEffects = structuredClone(ROUTER_PROPOSAL_FACTS.sideEffects)
+CODEX_PROPOSAL_FACTS.namedDistinctResponsibilities = structuredClone(
+  ROUTER_PROPOSAL_FACTS.riskAndIndependentCheckFloor.properties.namedDistinctResponsibilities,
+)
+CODEX_PROPOSAL_FACTS.availableCheckKinds = {
+  ...structuredClone(ROUTER_PROPOSAL_FACTS.checkAndBaseline.properties.availableCheckKinds),
+  minItems: 1,
+}
+CODEX_PROPOSAL_FACTS.thirdPartyImpact.enum = enumUnion(
+  PROVIDER_PROPOSAL_FACTS.thirdPartyImpact,
+  ROUTER_PROPOSAL_FACTS.thirdPartyImpact,
+)
+CODEX_PROPOSAL_FACTS.baselineStatus.enum = enumUnion(
+  PROVIDER_PROPOSAL_FACTS.baselineStatus,
+  ROUTER_PROPOSAL_FACTS.checkAndBaseline.properties.baselineStatus,
+)
+CODEX_PROPOSAL_FACTS.architectureImpact.enum = enumUnion(
+  PROVIDER_PROPOSAL_FACTS.architectureImpact,
+  ROUTER_PROPOSAL_FACTS.architectureImpact,
+)
+const CODEX_THIRD_PARTY_IMPACTS = new Set(CODEX_PROPOSAL_FACTS.thirdPartyImpact.enum)
+const CODEX_BASELINE_STATUSES = new Set(CODEX_PROPOSAL_FACTS.baselineStatus.enum)
+const CODEX_ARCHITECTURE_IMPACTS = new Set(CODEX_PROPOSAL_FACTS.architectureImpact.enum)
+const ROUTE_SCHEMA_DIGEST = crypto.createHash('sha256')
+  .update(JSON.stringify({
+    routeDecision: ROUTE_DECISION_SCHEMA,
+    routeRecommendation: CODEX_ROUTE_RECOMMENDATION_SCHEMA,
+    routeContract: router.ROUTE_CONTRACT,
+  }))
+  .digest('hex')
+
+// The provider-neutral recommendation contract and the deterministic Codex
+// router use three different labels for equivalent states. Keep the durable
+// recommendation in its provider contract, then translate only at the router
+// boundary. Intersecting the enums made truthful `minor`, `unknown`, and
+// `single-system` recommendations schema-valid but unusable, which discarded
+// the analyst's task-specific route and verification matrix.
+function projectProviderProposalToRouter(proposal) {
+  return {
+    ...proposal,
+    thirdPartyImpact: proposal.thirdPartyImpact === 'minor'
+      ? 'incidental' : proposal.thirdPartyImpact,
+    baselineStatus: proposal.baselineStatus === 'unknown'
+      ? 'required-before-production' : proposal.baselineStatus,
+    architectureImpact: proposal.architectureImpact === 'single-system'
+      ? 'local' : proposal.architectureImpact,
+  }
+}
+
 function validRouteFactProposal(value) {
   if (!isObject(value)) return false
   const required = Object.keys(defaultRouteFactProposal())
   if (required.some(key => !own(value, key)) || Object.keys(value).some(key => !required.includes(key))) return false
+  const resourceIdentities = Array.isArray(value.mutableResources)
+    ? value.mutableResources.map(resource => isObject(resource)
+      ? `${resource.kind}\0${resource.identity}` : null)
+    : []
   return ['inspect', 'report', 'research', 'decide', 'mutate', 'external-operation'].includes(value.requestedEffect) &&
     ['bounded', 'connected', 'independent-edits', 'dependent-groups'].includes(value.dependencyShape) &&
     Number.isSafeInteger(value.dependentWorkGroupCount) && value.dependentWorkGroupCount >= 0 &&
@@ -216,19 +274,22 @@ function validRouteFactProposal(value) {
     ['none', 'reversible-technical', 'product-semantic', 'architecture'].includes(value.uncertainty) &&
     ['fully-reversible', 'locally-reversible', 'staged-rollback-required', 'irreversible'].includes(value.reversibility) &&
     Array.isArray(value.mutableResources) && value.mutableResources.every(resource =>
-      isObject(resource) && concrete(resource.kind) && concrete(resource.identity) &&
-      typeof resource.shared === 'boolean' && concrete(resource.ownershipMode)) &&
-    nonEmptyStringArray(value.sideEffects) &&
+      isObject(resource) && ROUTER_RESOURCE_KINDS.has(resource.kind) && concrete(resource.identity) &&
+      typeof resource.shared === 'boolean' && ROUTER_OWNERSHIP_MODES.has(resource.ownershipMode)) &&
+    new Set(resourceIdentities).size === resourceIdentities.length &&
+    nonEmptyStringArray(value.sideEffects) && value.sideEffects.every(effect => ROUTER_SIDE_EFFECTS.has(effect)) &&
+    new Set(value.sideEffects).size === value.sideEffects.length &&
     ['local-only', 'external-read', 'external-write'].includes(value.externality) &&
     ['public', 'internal', 'confidential', 'restricted'].includes(value.confidentiality) &&
-    ['none', 'minor', 'material'].includes(value.thirdPartyImpact) &&
+    CODEX_THIRD_PARTY_IMPACTS.has(value.thirdPartyImpact) &&
     ['ordinary', 'elevated', 'staged-high-impact'].includes(value.riskLevel) &&
     validNamedCheckerMethods(value.minimumCheckerCount, value.namedDistinctResponsibilities) &&
     ['authoritative', 'short-plan', 'coordinated-design', 'unavailable'].includes(value.checkQuality) &&
     requiredNonEmptyStringArray(value.availableCheckKinds) &&
-    ['recorded', 'not-applicable', 'unknown'].includes(value.baselineStatus) &&
+    new Set(value.availableCheckKinds).size === value.availableCheckKinds.length &&
+    CODEX_BASELINE_STATUSES.has(value.baselineStatus) &&
     typeof value.hiddenExternalCheck === 'boolean' &&
-    ['local', 'single-system', 'multi-system'].includes(value.architectureImpact) &&
+    CODEX_ARCHITECTURE_IMPACTS.has(value.architectureImpact) &&
     ['fitsLightPlan', 'approachNeedsShortPlanning', 'shortOrderUnclear'].every(key => typeof value[key] === 'boolean')
 }
 
@@ -642,7 +703,7 @@ function canonicalizeProviderVerificationObligations(supplied, fallbackChecks = 
  * avoiding the old schema-valid-but-runtime-invalid gap.
  */
 function canonicalizeProviderRecommendation(recommendation) {
-  const schemaValidation = validateJsonSchema(ROUTE_RECOMMENDATION_SCHEMA, recommendation)
+  const schemaValidation = validateJsonSchema(CODEX_ROUTE_RECOMMENDATION_SCHEMA, recommendation)
   if (!schemaValidation.valid) {
     return {
       valid: false,
@@ -1787,9 +1848,11 @@ function compileAutomaticRouteDecision(input = {}) {
     error.code = 'ROUTE_DECISION_INVALID'
     throw error
   }
-  const proposal = automaticProposalWithinActivationAuthority(
-    recommendation.routeFactProposal,
-    input.targetIdentity,
+  const proposal = projectProviderProposalToRouter(
+    automaticProposalWithinActivationAuthority(
+      recommendation.routeFactProposal,
+      input.targetIdentity,
+    ),
   )
   const remainingMs = Number(input.budget?.remaining?.wallMs ?? input.remainingMs ?? 3600000)
   if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
@@ -1859,7 +1922,11 @@ function compileAutomaticRouteDecision(input = {}) {
     approachNeedsShortPlanning: proposal.approachNeedsShortPlanning,
     shortOrderUnclear: proposal.shortOrderUnclear,
   }
-  const classified = router.classifyRoute(facts)
+  // Automatic route compilation establishes the route floor. The immutable
+  // executable baseline is captured by the later production gate; requiring
+  // probe evidence here made a truthful provider `unknown` baseline collapse
+  // before the worker could even reach that gate.
+  const classified = router.classifyRoute(facts, { safetyFloorOnly: true })
   if (classified.status !== 'DECIDED') {
     const error = new Error(`deterministic automatic route classification returned ${classified.status}`)
     error.code = classified.status === 'WAITING_USER' ? 'WAITING_USER' : 'ROUTE_DECISION_INVALID'
@@ -1932,15 +1999,51 @@ function compileConservativeCompletionDecision(input = {}) {
     ? input.requestedResult.trim()
     : 'Complete the exact user request in the local workspace.'
   const successCheck = 'Independently exercise the requested result, its forbidden counterpart, and its exact boundary behavior.'
+  const rawDescriptive = validateJsonSchema(
+    CODEX_ROUTE_RECOMMENDATION_SCHEMA,
+    input.descriptiveRecommendation,
+  ).valid ? input.descriptiveRecommendation : null
+  // Provider transport schemas cannot express every controller semantic
+  // invariant (for example, a string containing only whitespace can satisfy a
+  // minLength). Preserve the useful task-specific projection while trimming
+  // and dropping only those unusable values; conservative routing must not
+  // become another pre-work terminal merely because advisory prose is blank.
+  const descriptiveStrings = (field, fallback = []) => {
+    const values = rawDescriptive && Array.isArray(rawDescriptive[field])
+      ? rawDescriptive[field].filter(value => typeof value === 'string')
+          .map(value => value.trim()).filter(Boolean)
+      : []
+    return values.length > 0 ? values : [...fallback]
+  }
+  const descriptiveChecks = descriptiveStrings('howSuccessCanBeChecked', [successCheck])
+  const descriptive = rawDescriptive ? {
+    whatTheUserWants: descriptiveStrings('whatTheUserWants', [requestedResult]),
+    likelyAreas: descriptiveStrings('likelyAreas', [
+      nonEmpty(input.targetIdentity) ? input.targetIdentity.trim() : '.',
+    ]),
+    howSuccessCanBeChecked: descriptiveChecks,
+    unknowns: descriptiveStrings('unknowns'),
+    risks: descriptiveStrings('risks'),
+    verificationObligations: canonicalizeProviderVerificationObligations(
+      rawDescriptive.verificationObligations,
+      descriptiveChecks,
+    ),
+  } : null
   const recommendation = createRouteRecommendation({
     preWorkResult: 'CONTINUE',
     recommendedRoute: 'DIRECT',
     confidence: 'low',
-    whatTheUserWants: [requestedResult],
-    likelyAreas: [nonEmpty(input.targetIdentity) ? input.targetIdentity.trim() : '.'],
-    howSuccessCanBeChecked: [successCheck],
-    unknowns: ['The route-analysis provider did not produce a usable decision; the single completion worker must inspect the exact workspace before acting.'],
-    risks: ['Keep all effects local and reversible, preserve unrelated behavior, and require independent verification of the exact result.'],
+    whatTheUserWants: descriptive ? descriptive.whatTheUserWants : [requestedResult],
+    likelyAreas: descriptive ? descriptive.likelyAreas : [
+      nonEmpty(input.targetIdentity) ? input.targetIdentity.trim() : '.',
+    ],
+    howSuccessCanBeChecked: descriptive ? descriptive.howSuccessCanBeChecked : [successCheck],
+    unknowns: descriptive ? descriptive.unknowns : [
+      'The route-analysis provider did not produce a usable decision; the single completion worker must inspect the exact workspace before acting.',
+    ],
+    risks: descriptive ? descriptive.risks : [
+      'Keep all effects local and reversible, preserve unrelated behavior, and require independent verification of the exact result.',
+    ],
     independentWorkItems: [],
     dependencies: [],
     reasonsForDirect: ['One completion worker owns the bounded local workspace and can inspect, implement, and test the exact request sequentially.'],
@@ -1949,6 +2052,8 @@ function compileConservativeCompletionDecision(input = {}) {
     userInputNeeded: [],
     evidenceIndex: [],
     routeFactProposal: defaultRouteFactProposal('DIRECT'),
+    ...(descriptive && descriptive.verificationObligations
+      ? { verificationObligations: descriptive.verificationObligations } : {}),
   })
   const reportedRemaining = Number(input.budget && input.budget.remaining && input.budget.remaining.wallMs)
   const completionBudget = {
@@ -2383,6 +2488,7 @@ module.exports = {
   ROUTE_DECISION_SCHEMA_VERSION,
   ROUTE_RECOMMENDATION_SCHEMA_VERSION,
   ROUTE_RECOMMENDATION_SCHEMA,
+  CODEX_ROUTE_RECOMMENDATION_SCHEMA,
   ROUTE_RECOMMENDATION_SCHEMA_ID,
   ROUTE_SCHEMA_DIGEST,
   buildRouteTopology,

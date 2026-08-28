@@ -13,6 +13,7 @@ const ROOT = path.resolve(__dirname, '..', '..')
 const {
   CodexExecAdapter,
   admitRoadmapExpansion,
+  assignmentLocalFindingId,
   bindCanonicalMissionForChild,
   canonicalAssignmentResources,
   createCodexJsonlAccumulator,
@@ -38,7 +39,12 @@ const { CleanupRegistry } = require(path.join(ROOT, 'agents', 'codex', 'workflow
 const { validateJsonSchema } = require(
   path.join(ROOT, 'agents', 'codex', 'workflow', 'json-schema-validator.js'),
 )
-const { createRouteDecision, createRouteRecommendation, remainingL0DecisionBudgetMs } = require(
+const {
+  compileAutomaticRouteDecision,
+  createRouteDecision,
+  createRouteRecommendation,
+  remainingL0DecisionBudgetMs,
+} = require(
   path.join(ROOT, 'agents', 'codex', 'workflow', 'route-decision.js'),
 )
 const routeRouter = require(path.join(ROOT, 'agents', 'codex', 'workflow', 'router.js'))
@@ -431,6 +437,14 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   const checkerScratchBoundary = scratchFactory(assignmentId, frozen, {
     candidateHash, adoptedScratchRoots: [],
   })
+  for (const relativeHarness of [
+    'output/independent_harness.py',
+    'tmp/independent_harness.py',
+  ]) {
+    const harnessPath = path.join(checkerScratchBoundary.writableScratchRoot, relativeHarness)
+    fs.mkdirSync(path.dirname(harnessPath), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(harnessPath, 'raise SystemExit(0)\n', { mode: 0o600 })
+  }
   const legacyBindingInput = {
     schemaVersion: 2,
     assignmentId,
@@ -448,12 +462,20 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
     aggregateCode,
     commandOutput,
     outcomeStatus,
+    outcomeStatuses,
     outcomeFingerprint,
+    outcomeFingerprints,
     commandEvents,
     checkIds = [checkId],
     authorizedCommand = 'python3 independent_harness.py',
     outcomeCommandHash,
+    outcomeCommandHashes,
     outcomeObservationId,
+    compactOutcomes = false,
+    outcomeItemOverrides = null,
+    emitCommandStarts = true,
+    beforeCommandCompletion = null,
+    payloadOverrides = {},
   }) => {
     const binding = createCheckerObservationBinding({
       assignmentId, candidateHash, requestEnvelopeHash, checkIds,
@@ -472,14 +494,23 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       runId: 'run-observation',
       currentVersionHash: candidateHash,
       payload: {
-        testOutcomes: checkIds.map(command => ({
-          command,
-          observationId: outcomeObservationId || observationByCheck.get(command).observationId,
-          commandHash: outcomeCommandHash || crypto.createHash('sha256')
-            .update(reportedCommand).digest('hex'),
-          status: outcomeStatus,
-          fingerprint: outcomeFingerprint || fingerprint,
-        })),
+        ...payloadOverrides,
+        testOutcomes: checkIds.map(command => {
+          const status = outcomeStatuses && outcomeStatuses[command] || outcomeStatus
+          const itemOverrides = typeof outcomeItemOverrides === 'function'
+            ? outcomeItemOverrides({ command, status })
+            : outcomeItemOverrides || {}
+          if (compactOutcomes) return { command, status, ...itemOverrides }
+          return {
+            command,
+            observationId: outcomeObservationId || observationByCheck.get(command).observationId,
+            commandHash: outcomeCommandHashes && outcomeCommandHashes[command] || outcomeCommandHash || crypto.createHash('sha256')
+              .update(reportedCommand).digest('hex'),
+            status,
+            fingerprint: outcomeFingerprints && outcomeFingerprints[command] || outcomeFingerprint || fingerprint,
+            ...itemOverrides,
+          }
+        }),
       },
     })
     let terminal
@@ -489,9 +520,12 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
           for (const namedCheck of checkIds) {
             assert.equal(spec.stdin.split(namedCheck).length - 1, 1,
               'each named checker obligation reaches provider stdin exactly once')
-            assert.equal(spec.stdin.split(observationByCheck.get(namedCheck).observationId).length - 1, 1,
-              'each controller-issued observation id reaches provider stdin exactly once')
+            assert.equal(spec.stdin.includes(observationByCheck.get(namedCheck).observationId), false,
+              'controller-issued observation ids never consume model context')
           }
+          assert.doesNotMatch(spec.stdin,
+            /verificationObservationCases|verificationObservationBinding|authorizedCommandHashes/u,
+            'controller-owned receipt binding never enters the model-visible assignment')
           assert.doesNotMatch(spec.stdin, /AUTOPROMPT_(?:CHECKER_)?OBSERVATION/u,
             'controller command binding is not a model-emitted marker protocol')
           spec.onStdoutLine(JSON.stringify({ type: 'thread.started', thread_id: 'thread-observation' }))
@@ -499,6 +533,20 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
             command: 'python3 independent_harness.py', status: 'completed', exit_code: 0,
             aggregated_output: commandOutput,
           }]).entries()) {
+            if (emitCommandStarts) {
+              spec.onStdoutLine(JSON.stringify({
+                type: 'item.started',
+                item: {
+                  id: `command-observation-${index}`,
+                  type: 'command_execution',
+                  command: commandEvent.command,
+                  status: 'in_progress',
+                },
+              }))
+            }
+            if (typeof beforeCommandCompletion === 'function') {
+              beforeCommandCompletion({ index, commandEvent })
+            }
             spec.onStdoutLine(JSON.stringify({
               type: 'item.completed',
               item: { id: `command-observation-${index}`, type: 'command_execution', ...commandEvent },
@@ -547,10 +595,159 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   assert.equal(pass.code, 'PASS')
   assert.equal(pass.transportEvidence.verificationObservations.count, 1)
 
+  const compactPass = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', compactOutcomes: true,
+    commandOutput: `${summary}\n`,
+  })
+  assert.equal(compactPass.code, 'PASS')
+  assert.deepEqual(compactPass.payload.testOutcomes, [{
+    command: checkId,
+    status: 'PASS',
+    fingerprint,
+    observationId: createCheckerObservationBinding({
+      assignmentId, candidateHash, requestEnvelopeHash, checkIds: [checkId],
+      commandBindings: [{ checkId, command: 'python3 independent_harness.py' }],
+    }).observations[0].observationId,
+    commandHash: crypto.createHash('sha256').update('python3 independent_harness.py').digest('hex'),
+  }], 'the controller enriches a compact report from its unique exact receipt')
+
+  const forgedVerificationAuthority = {
+    schemaVersion: 1,
+    authorityHash: 'f'.repeat(64),
+    checks: [{ checkId, authority: 'SCRATCH_HARNESS' }],
+  }
+  const forgedAuthorityPass = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', compactOutcomes: true,
+    commandOutput: `${summary}\n`,
+    payloadOverrides: { verificationAuthority: forgedVerificationAuthority },
+  })
+  assert.equal(forgedAuthorityPass.code, 'PASS')
+  assert.notDeepEqual(forgedAuthorityPass.payload.verificationAuthority,
+    forgedVerificationAuthority,
+    'a checker cannot supply its own controller verification authority')
+  assert.equal(forgedAuthorityPass.payload.verificationAuthority.schemaVersion, 1)
+  assert.match(forgedAuthorityPass.payload.verificationAuthority.authorityHash,
+    /^[a-f0-9]{64}$/u)
+  assert.deepEqual(
+    forgedAuthorityPass.payload.verificationAuthority.checks.map(item => ({
+      checkId: item.checkId,
+      authority: item.authority,
+    })),
+    [{ checkId, authority: 'EXACT_COMMAND' }],
+    'the replacement authority is derived from the selected exact command receipt',
+  )
+
+  const exactHarnessFailure = 'FAIL: authoritative harness found a product defect'
   const fail = await runScenario({
-    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', commandOutput: `${summary}\n`,
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL',
+    outcomeFingerprint: crypto.createHash('sha256').update(exactHarnessFailure).digest('hex'),
+    commandEvents: [{
+      command: 'python3 independent_harness.py', status: 'failed', exit_code: 1,
+      aggregated_output: exactHarnessFailure,
+    }],
   })
   assert.equal(fail.code, 'FAIL', 'a named product FAIL remains the checker verdict')
+
+  const compactFail = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', compactOutcomes: true,
+    commandEvents: [{
+      command: 'python3 independent_harness.py', status: 'failed', exit_code: 1,
+      aggregated_output: exactHarnessFailure,
+    }],
+  })
+  assert.equal(compactFail.code, 'FAIL',
+    'the controller can bind a compact FAIL to one authenticated nonzero receipt')
+  assert.equal(compactFail.payload.testOutcomes[0].fingerprint,
+    crypto.createHash('sha256').update(exactHarnessFailure).digest('hex'))
+
+  const aggregatePassWithBoundFail = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'FAIL', compactOutcomes: true,
+    commandEvents: [{
+      command: 'python3 independent_harness.py', status: 'failed', exit_code: 1,
+      aggregated_output: exactHarnessFailure,
+    }],
+  })
+  assert.equal(aggregatePassWithBoundFail.code, 'FAIL',
+    'controller-bound nonzero evidence overrides an accidental model aggregate PASS')
+  assert.equal(aggregatePassWithBoundFail.cause.event, 'ASSERTION_FAILED')
+  assert.equal(
+    aggregatePassWithBoundFail.payload.verificationObservationDisposition.reportedAggregateCode,
+    'PASS',
+  )
+  assert.equal(
+    aggregatePassWithBoundFail.payload.verificationObservationDisposition.controllerAggregateCode,
+    'FAIL',
+  )
+  assert.deepEqual(
+    aggregatePassWithBoundFail.payload.verificationObservationDisposition
+      .commandBoundFailureCheckIds,
+    [checkId],
+  )
+  assert.match(aggregatePassWithBoundFail.payload.testOutcomes[0].failureIdentity,
+    /^[a-f0-9]{64}$/u)
+
+  const volatileTapFailureOne = [
+    'TAP version 13',
+    'not ok 1 - preserves stable named behavior',
+    '# observed 2026-08-28T10:00:00Z in /tmp/check-17 random=run-17',
+    '# fail 1',
+  ].join('\n')
+  const volatileTapFailureTwo = [
+    'TAP version 13',
+    'not ok 1 - preserves stable named behavior',
+    '# observed 2026-08-28T10:01:00Z in /tmp/check-18 random=run-18',
+    '# fail 1',
+  ].join('\n')
+  const stableNamedFailureOne = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', compactOutcomes: true,
+    commandEvents: [{
+      command: 'python3 independent_harness.py', status: 'failed', exit_code: 1,
+      aggregated_output: volatileTapFailureOne,
+    }],
+  })
+  const stableNamedFailureTwo = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', compactOutcomes: true,
+    outcomeItemOverrides: { failureIdentity: 'f'.repeat(64) },
+    commandEvents: [{
+      command: 'python3 independent_harness.py', status: 'failed', exit_code: 1,
+      aggregated_output: volatileTapFailureTwo,
+    }],
+  })
+  assert.notEqual(
+    stableNamedFailureOne.payload.testOutcomes[0].fingerprint,
+    stableNamedFailureTwo.payload.testOutcomes[0].fingerprint,
+    'raw output remains distinct evidence',
+  )
+  assert.equal(
+    stableNamedFailureOne.payload.testOutcomes[0].failureIdentity,
+    stableNamedFailureTwo.payload.testOutcomes[0].failureIdentity,
+    'volatile diagnostics do not change the controller-owned named failure identity',
+  )
+  assert.notEqual(
+    stableNamedFailureTwo.payload.testOutcomes[0].failureIdentity,
+    'f'.repeat(64),
+    'a model-provided semantic identity is discarded before controller binding',
+  )
+
+  const renamedExactFailureOne = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', compactOutcomes: true,
+    commandEvents: [{
+      command: 'python3 independent_harness.py', status: 'failed', exit_code: 1,
+      aggregated_output: 'TAP version 13\nnot ok 1 - candidate-owned-case-A\n# fail 1',
+    }],
+  })
+  const renamedExactFailureTwo = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', compactOutcomes: true,
+    commandEvents: [{
+      command: 'python3 independent_harness.py', status: 'failed', exit_code: 1,
+      aggregated_output: 'TAP version 13\nnot ok 1 - candidate-owned-case-B\n# fail 1',
+    }],
+  })
+  assert.equal(
+    renamedExactFailureOne.payload.testOutcomes[0].failureIdentity,
+    renamedExactFailureTwo.payload.testOutcomes[0].failureIdentity,
+    'renaming a candidate-owned case behind the same exact command cannot mint repair progress',
+  )
 
   const missing = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', commandEvents: [],
@@ -603,6 +800,17 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   assert.equal(authorizedGenericCommand.code, 'PASS',
     'controller authorization remains executable-agnostic')
 
+  const authorizedWrappedGenericCommand = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: genericCommand,
+    outcomeCommandHash: crypto.createHash('sha256').update(genericCommand).digest('hex'),
+    commandEvents: [{
+      command: `/bin/bash -lc ${JSON.stringify(genericCommand)}`,
+      status: 'completed', exit_code: 0, aggregated_output: summary,
+    }],
+  })
+  assert.equal(authorizedWrappedGenericCommand.code, 'PASS',
+    'an exact inner command authorization binds its Codex-owned shell wrapper')
+
   const discoveredHarness = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
     commandEvents: [{
@@ -611,6 +819,53 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   })
   assert.equal(discoveredHarness.code, 'PASS',
     'a conservative candidate harness can cover a descriptive check without treating its prose as a command')
+
+  const toolWrappedDiscoveredHarness = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [{
+      command: `/bin/bash -lc ${JSON.stringify(genericCommand)}`,
+      status: 'completed', exit_code: 0, aggregated_output: summary,
+    }],
+  })
+  assert.equal(toolWrappedDiscoveredHarness.code, 'PASS',
+    'the exact Codex tool shell wrapper preserves an immutable candidate harness')
+
+  const wrappedByTimeoutHarness = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [{
+      command: `timeout 30s node ${JSON.stringify(discoveredNodeHarnessPath)}`,
+      status: 'completed', exit_code: 0, aggregated_output: summary,
+    }],
+  })
+  assert.equal(wrappedByTimeoutHarness.code, 'PASS',
+    'a transparent timeout wrapper preserves a real frozen-candidate harness binding')
+
+  const ambiguousCompactPass = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    compactOutcomes: true,
+    payloadOverrides: {
+      verificationObservationDisposition: { reportedAggregateCode: 'FAIL' },
+    },
+    commandEvents: [
+      {
+        command: genericCommand, status: 'completed', exit_code: 0,
+        aggregated_output: summary,
+      },
+      {
+        command: `node --no-warnings ${JSON.stringify(discoveredNodeHarnessPath)}`,
+        status: 'completed', exit_code: 0, aggregated_output: summary,
+      },
+    ],
+  })
+  assert.equal(ambiguousCompactPass.code, 'CHECK_INCONCLUSIVE',
+    'a compact PASS cannot choose between distinct admissible command receipts')
+  assert.equal(
+    ambiguousCompactPass.payload.verificationObservationDisposition.reportedAggregateCode,
+    'PASS',
+    'the controller records the original aggregate code when it rejects PASS authority',
+  )
 
   const discoveredShellHarness = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
@@ -642,6 +897,512 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   })
   assert.equal(legitimateNonzeroFailure.code, 'FAIL',
     'a controller-observed nonzero test assertion binds a named product failure')
+
+  const preservedCase = 'verification:preservation:clean-boundary'
+  const rejectedCase = 'verification:security:active-content-boundary'
+  const submittedCheckerHarness = `python3 output/independent_harness.py ${discoveredNodeHarnessPath}`
+  const wrappedCheckerHarness = `/bin/bash -lc ${JSON.stringify(submittedCheckerHarness)}`
+  const absoluteScratchHarness = path.join(
+    checkerScratchBoundary.writableScratchRoot,
+    'output',
+    'independent_harness.py',
+  )
+  const submittedCheckerHarnessHash = crypto.createHash('sha256')
+    .update(submittedCheckerHarness).digest('hex')
+  const alternateScratchHarness = `python3 tmp/independent_harness.py ${discoveredNodeHarnessPath}`
+  const checkerChosenFailureOne = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [{
+      command: wrappedCheckerHarness, status: 'failed', exit_code: 1,
+      aggregated_output: 'TAP version 13\nnot ok 1 - checker-chosen-name-A\n# fail 1',
+    }],
+  })
+  const checkerChosenFailureTwo = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [{
+      command: `/bin/bash -lc ${JSON.stringify(alternateScratchHarness)}`,
+      status: 'failed', exit_code: 1,
+      aggregated_output: 'TAP version 13\nnot ok 1 - checker-chosen-name-B\n# fail 1',
+    }],
+  })
+  assert.equal(checkerChosenFailureOne.code, 'FAIL')
+  assert.equal(checkerChosenFailureTwo.code, 'FAIL')
+  assert.equal(
+    checkerChosenFailureOne.payload.testOutcomes[0].failureIdentity,
+    checkerChosenFailureTwo.payload.testOutcomes[0].failureIdentity,
+    'checker-chosen scratch command paths and printed names cannot mint semantic novelty',
+  )
+  const wrappedCheckerHarnessPass = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    outcomeCommandHash: submittedCheckerHarnessHash,
+    commandEvents: [{
+      command: wrappedCheckerHarness, status: 'completed', exit_code: 0,
+      aggregated_output: summary,
+    }],
+  })
+  assert.equal(wrappedCheckerHarnessPass.code, 'CHECK_INCONCLUSIVE',
+    'a scratch-authored zero-exit wrapper cannot promote its own PASS authority')
+  assert.notEqual(
+    wrappedCheckerHarnessPass.transportEvidence.verificationObservations.receipts[0].commandHash,
+    wrappedCheckerHarnessPass.transportEvidence.verificationObservations.receipts[0].harnessCommandHash,
+  )
+  assert.equal(
+    wrappedCheckerHarnessPass.transportEvidence.verificationObservations.receipts[0]
+      .candidateHarnessAdmissible,
+    false,
+  )
+
+  const strongScratchPassOutput = [
+    'PASS behavior: 2081245 rows preserve schema and relationships',
+    'PASS boundary: malformed memory and policy inputs are rejected',
+    'PASS verification: repeated and changed seeds satisfy determinism invariants',
+  ].join('\n')
+  const sealedScratchHarnessPass = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [{
+      command: wrappedCheckerHarness, status: 'completed', exit_code: 0,
+      aggregated_output: strongScratchPassOutput,
+    }],
+  })
+  assert.equal(sealedScratchHarnessPass.code, 'CHECK_INCONCLUSIVE',
+    'one start-sealed scratch validator is provisional rather than terminal PASS authority')
+  assert.equal(sealedScratchHarnessPass.cause.event,
+    'CHECK_SCRATCH_CONFIRMATION_REQUIRED')
+  assert.equal(
+    sealedScratchHarnessPass.payload.verificationObservationDisposition.reportedAggregateCode,
+    'PASS',
+  )
+  assert.deepEqual(
+    sealedScratchHarnessPass.payload.verificationAuthority.checks.map(item => ({
+      checkId: item.checkId,
+      authority: item.authority,
+    })),
+    [{ checkId, authority: 'SCRATCH_HARNESS' }],
+  )
+  assert.match(sealedScratchHarnessPass.payload.verificationAuthority.authorityHash,
+    /^[a-f0-9]{64}$/u)
+  assert.match(
+    sealedScratchHarnessPass.transportEvidence.verificationObservations.receipts[0]
+      .scratchHarnessProgramDigest,
+    /^[a-f0-9]{64}$/u,
+  )
+  assert.equal(
+    sealedScratchHarnessPass.payload.verificationAuthority.checks[0].programDigest,
+    sealedScratchHarnessPass.transportEvidence.verificationObservations.receipts[0]
+      .scratchHarnessProgramDigest,
+    'the provisional authority retains the controller-observed sealed bytes',
+  )
+
+  const unsealedScratchHarnessPass = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    compactOutcomes: true,
+    emitCommandStarts: false,
+    commandEvents: [{
+      command: wrappedCheckerHarness, status: 'completed', exit_code: 0,
+      aggregated_output: strongScratchPassOutput,
+    }],
+  })
+  assert.equal(unsealedScratchHarnessPass.code, 'CHECK_INCONCLUSIVE',
+    'a completed-only event cannot retroactively seal a mutable scratch validator')
+
+  const originalScratchHarness = fs.readFileSync(absoluteScratchHarness, 'utf8')
+  const changedDuringExecutionPass = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    compactOutcomes: true,
+    beforeCommandCompletion() {
+      fs.appendFileSync(absoluteScratchHarness, '# changed after command start\n')
+    },
+    commandEvents: [{
+      command: wrappedCheckerHarness, status: 'completed', exit_code: 0,
+      aggregated_output: strongScratchPassOutput,
+    }],
+  })
+  fs.writeFileSync(absoluteScratchHarness, originalScratchHarness, { mode: 0o600 })
+  assert.equal(changedDuringExecutionPass.code, 'CHECK_INCONCLUSIVE',
+    'a scratch validator changed after start cannot retain sealed PASS authority')
+
+  const replacedScratchHarnessPath = `${absoluteScratchHarness}.started`
+  const replacedWithIdenticalBytesPass = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    compactOutcomes: true,
+    beforeCommandCompletion() {
+      fs.renameSync(absoluteScratchHarness, replacedScratchHarnessPath)
+      fs.writeFileSync(absoluteScratchHarness, originalScratchHarness, { mode: 0o600 })
+    },
+    commandEvents: [{
+      command: wrappedCheckerHarness, status: 'completed', exit_code: 0,
+      aggregated_output: strongScratchPassOutput,
+    }],
+  })
+  fs.unlinkSync(absoluteScratchHarness)
+  fs.renameSync(replacedScratchHarnessPath, absoluteScratchHarness)
+  assert.equal(replacedWithIdenticalBytesPass.code, 'CHECK_INCONCLUSIVE',
+    'replacing a started validator with identical bytes cannot preserve its inode-bound seal')
+  assert.equal(
+    replacedWithIdenticalBytesPass.payload.verificationAuthority,
+    undefined,
+    'an identity-replaced scratch program produces no provisional PASS authority',
+  )
+
+  const wrappedCheckerHarnessFailure = await runScenario({
+    aggregateCode: 'FAIL',
+    outcomeStatus: 'FAIL',
+    outcomeStatuses: { [preservedCase]: 'PASS', [rejectedCase]: 'FAIL' },
+    authorizedCommand: null,
+    checkIds: [preservedCase, rejectedCase],
+    outcomeCommandHash: submittedCheckerHarnessHash,
+    outcomeFingerprint: crypto.createHash('sha256').update(nodeTapFailure).digest('hex'),
+    commandEvents: [{
+      command: wrappedCheckerHarness, status: 'failed', exit_code: 1,
+      aggregated_output: nodeTapFailure,
+    }],
+  })
+  assert.equal(wrappedCheckerHarnessFailure.code, 'FAIL',
+    'a candidate-bound failure remains actionable when only positive coverage is incomplete')
+
+  const absoluteScratchHarnessFailure = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [{
+      command: `/bin/bash -lc ${JSON.stringify(
+        `python3 ${absoluteScratchHarness} ${discoveredNodeHarnessPath}`,
+      )}`,
+      status: 'failed', exit_code: 1, aggregated_output: nodeTapFailure,
+    }],
+  })
+  assert.equal(absoluteScratchHarnessFailure.code, 'FAIL',
+    'an absolute checker-scratch validator remains actionable only with a distinct frozen input')
+
+  const f1deLegacyResultTelemetryFailure = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    outcomeCommandHash: submittedCheckerHarnessHash,
+    outcomeFingerprint: crypto.createHash('sha256').update(nodeTapFailure).digest('hex'),
+    outcomeItemOverrides: {
+      status: undefined,
+      exitCode: 1,
+      result: 'FAIL',
+      admittedNonzeroTestFailure: true,
+    },
+    commandEvents: [{
+      command: wrappedCheckerHarness, status: 'failed', exit_code: 1,
+      aggregated_output: nodeTapFailure,
+    }],
+  })
+  const f1deStatusAndExtraTelemetryFailure = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    outcomeCommandHash: submittedCheckerHarnessHash,
+    outcomeFingerprint: crypto.createHash('sha256').update(nodeTapFailure).digest('hex'),
+    outcomeItemOverrides: {
+      exitCode: 1,
+      result: 'FAIL',
+      admittedNonzeroTestFailure: true,
+    },
+    commandEvents: [{
+      command: wrappedCheckerHarness, status: 'failed', exit_code: 1,
+      aggregated_output: nodeTapFailure,
+    }],
+  })
+  assert.deepEqual(
+    [f1deLegacyResultTelemetryFailure.code, f1deStatusAndExtraTelemetryFailure.code],
+    ['FAIL', 'FAIL'],
+    'legacy result-only and status-plus-extra f1de telemetry cannot hide authentic bound FAILs',
+  )
+  assert.deepEqual(
+    Object.keys(f1deLegacyResultTelemetryFailure.payload.testOutcomes[0]).sort(),
+    ['command', 'commandHash', 'failureIdentity', 'fingerprint', 'observationId', 'status'],
+    'controller canonicalization strips checker telemetry after binding it to the receipt',
+  )
+  assert.deepEqual(
+    Object.keys(f1deStatusAndExtraTelemetryFailure.payload.testOutcomes[0]).sort(),
+    ['command', 'commandHash', 'failureIdentity', 'fingerprint', 'observationId', 'status'],
+    'known checker telemetry is projected away from the controller-owned outcome',
+  )
+
+  const productionVerifierOutput = JSON.stringify({
+    total: 20,
+    failureCount: 2,
+    failures: ['capacity balance mismatch', 'missing schedule row'],
+  })
+  const productionVerifierFailure = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [{
+      command: `/bin/bash -lc ${JSON.stringify(
+        `python3 ${absoluteScratchHarness} ${frozen}`,
+      )}`,
+      status: 'failed', exit_code: 1, aggregated_output: productionVerifierOutput,
+    }],
+  })
+  assert.equal(productionVerifierFailure.code, 'FAIL',
+    'a candidate-bound verifier JSON failureCount remains actionable')
+
+  const changedScratchHarnessResult = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [
+      {
+        command: `/bin/bash -lc ${JSON.stringify(
+          `python3 ${absoluteScratchHarness} ${frozen}`,
+        )}`,
+        status: 'failed', exit_code: 1, aggregated_output: productionVerifierOutput,
+      },
+      {
+        command: `/bin/bash -lc ${JSON.stringify(
+          `python3 ${absoluteScratchHarness} ${frozen}`,
+        )}`,
+        status: 'completed', exit_code: 0,
+        aggregated_output: JSON.stringify({ total: 20, failureCount: 0, failures: [] }),
+      },
+    ],
+  })
+  assert.equal(changedScratchHarnessResult.code, 'CHECK_INCONCLUSIVE',
+    'contradictory executions of one scratch-validator identity cannot preserve a stale FAIL')
+
+  const selectedCheckFailureOutput = [
+    'MODEL_STRUCTURE PASS faces=2756',
+    'FACETED_BREP_SEMANTICS FAIL faces are not planar FACE_SURFACE records',
+    'SELECTED_CHECK FAIL build-or-run',
+  ].join('\n')
+  const selectedCheckFailure = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    outcomeCommandHash: submittedCheckerHarnessHash,
+    outcomeFingerprint: crypto.createHash('sha256').update(selectedCheckFailureOutput).digest('hex'),
+    commandEvents: [{
+      command: wrappedCheckerHarness, status: 'failed', exit_code: 1,
+      aggregated_output: selectedCheckFailureOutput,
+    }],
+  })
+  assert.equal(selectedCheckFailure.code, 'FAIL',
+    'an anchored selected-check failure from a candidate-bound harness is substantive')
+
+  const capturedCheckerCommand = `set -o pipefail\n${submittedCheckerHarness} | tee output/check-2.txt`
+  const capturedCheckerCommandHash = crypto.createHash('sha256')
+    .update(capturedCheckerCommand).digest('hex')
+  const capturedCheckerFailure = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    outcomeCommandHash: capturedCheckerCommandHash,
+    outcomeFingerprint: crypto.createHash('sha256').update(selectedCheckFailureOutput).digest('hex'),
+    commandEvents: [{
+      command: `/bin/bash -lc "${capturedCheckerCommand}"`, status: 'failed', exit_code: 1,
+      aggregated_output: selectedCheckFailureOutput,
+    }],
+  })
+  assert.equal(capturedCheckerFailure.code, 'FAIL',
+    'a pipefail harness with a bounded scratch capture retains candidate-bound failure authority')
+
+  const incidentCapturedCheckerCommand = [
+    'set -o pipefail;',
+    `PYTHONDONTWRITEBYTECODE=1 python3 tmp/independent_harness.py ${discoveredNodeHarnessPath}`,
+    '2>&1 | tee output/independent_harness.log',
+  ].join(' ')
+  const incidentCapturedCheckerFailure = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    outcomeCommandHash: crypto.createHash('sha256')
+      .update(incidentCapturedCheckerCommand).digest('hex'),
+    outcomeFingerprint: crypto.createHash('sha256').update(selectedCheckFailureOutput).digest('hex'),
+    commandEvents: [{
+      command: `/bin/bash -lc ${JSON.stringify(incidentCapturedCheckerCommand)}`,
+      status: 'failed', exit_code: 1, aggregated_output: selectedCheckFailureOutput,
+    }],
+  })
+  assert.equal(incidentCapturedCheckerFailure.code, 'FAIL',
+    'the exact Codex semicolon, stderr capture, and tee incident shape remains actionable')
+
+  const timeoutCapturedCheckerCommand = [
+    'set -o pipefail;',
+    `timeout 30s env PYTHONDONTWRITEBYTECODE=1 python3 tmp/independent_harness.py ${discoveredNodeHarnessPath}`,
+    '2>&1 | tee output/independent_harness.log',
+  ].join(' ')
+  const timeoutCapturedCheckerFailure = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [{
+      command: `/bin/bash -lc ${JSON.stringify(timeoutCapturedCheckerCommand)}`,
+      status: 'failed', exit_code: 1, aggregated_output: selectedCheckFailureOutput,
+    }],
+  })
+  assert.equal(timeoutCapturedCheckerFailure.code, 'FAIL',
+    'a transparent timeout around the captured HTML/CAD harness retains failure authority')
+
+  const uncapturedPipelineFailure = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    outcomeFingerprint: crypto.createHash('sha256').update(selectedCheckFailureOutput).digest('hex'),
+    commandEvents: [{
+      command: `/bin/bash -lc "${submittedCheckerHarness} | tee output/check-2.txt"`,
+      status: 'failed', exit_code: 1, aggregated_output: selectedCheckFailureOutput,
+    }],
+  })
+  assert.equal(uncapturedPipelineFailure.code, 'CHECK_INCONCLUSIVE',
+    'an arbitrary shell pipeline cannot acquire candidate-harness authority')
+
+  const scratchOnlyFailure = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    outcomeFingerprint: crypto.createHash('sha256').update(nodeTapFailure).digest('hex'),
+    commandEvents: [{
+      command: 'python3 output/independent_harness.py', status: 'failed', exit_code: 1,
+      aggregated_output: nodeTapFailure,
+    }],
+  })
+  assert.equal(scratchOnlyFailure.code, 'CHECK_INCONCLUSIVE',
+    'a scratch-only failure cannot manufacture product-repair authority')
+
+  const scratchCandidateNameDropPass = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    compactOutcomes: true,
+    outcomeCommandHash: crypto.createHash('sha256')
+      .update(`python3 output/fake_harness.py ${discoveredNodeHarnessPath}`).digest('hex'),
+    commandEvents: [{
+      command: `python3 output/fake_harness.py ${discoveredNodeHarnessPath}`,
+      status: 'completed', exit_code: 0, aggregated_output: summary,
+    }],
+  })
+  assert.equal(scratchCandidateNameDropPass.code, 'CHECK_INCONCLUSIVE',
+    'a writable scratch program cannot acquire PASS authority by naming a frozen candidate argument')
+
+  for (const command of [
+    `bash output/fake_harness.sh ${discoveredNodeHarnessPath}`,
+    `node --require=output/fake_harness.js ${discoveredNodeHarnessPath}`,
+    `NODE_OPTIONS=--require=./output/fake_harness.js node ${discoveredNodeHarnessPath}`,
+    `NODE_OPTIONS='--require ./output/fake_harness.js' node ${discoveredNodeHarnessPath}`,
+    `env -S NODE_OPTIONS=--require=./output/fake_harness.js node ${discoveredNodeHarnessPath}`,
+    `python3.12 output/fake_harness.py ${discoveredNodeHarnessPath}`,
+    `PATH=output:/usr/bin fake_harness ${discoveredNodeHarnessPath}`,
+    `python3 -c'print("authoritative harness: 17 assertions completed")' ${discoveredNodeHarnessPath}`,
+    `python3 -qc'print("authoritative harness: 17 assertions completed")' ${discoveredNodeHarnessPath}`,
+    `python3 -Oqc'print("authoritative harness: 17 assertions completed")' ${discoveredNodeHarnessPath}`,
+    `python3 -moutput.fake_harness ${discoveredNodeHarnessPath}`,
+    `perl -e'print("authoritative harness: 17 assertions completed")' ${discoveredNodeHarnessPath}`,
+    `perl -E'print("authoritative harness: 17 assertions completed")' ${discoveredNodeHarnessPath}`,
+    `perl -we'print("authoritative harness: 17 assertions completed")' ${discoveredNodeHarnessPath}`,
+    `node -pe'"authoritative harness: 17 assertions completed"' ${discoveredNodeHarnessPath}`,
+    `bash -c'printf authoritative' ${discoveredNodeHarnessPath}`,
+    `timeout 30s node -pe'"authoritative harness: 17 assertions completed"' ${discoveredNodeHarnessPath}`,
+    `/usr/bin/time -p python3 -qc'print("authoritative harness: 17 assertions completed")' ${discoveredNodeHarnessPath}`,
+    `nice -n 5 perl -we'print("authoritative harness: 17 assertions completed")' ${discoveredNodeHarnessPath}`,
+    `timeout 30s nice -n 5 node -pe'"authoritative harness: 17 assertions completed"' ${discoveredNodeHarnessPath}`,
+    `command timeout 30s node -pe'"authoritative harness: 17 assertions completed"' ${discoveredNodeHarnessPath}`,
+    `exec nice -n 5 python3 -qc'print("authoritative harness: 17 assertions completed")' ${discoveredNodeHarnessPath}`,
+    `busybox timeout 30s perl -we'print("authoritative harness: 17 assertions completed")' ${discoveredNodeHarnessPath}`,
+    `basename ${discoveredNodeHarnessPath}`,
+    `dirname ${discoveredNodeHarnessPath}`,
+    `sha224sum ${discoveredNodeHarnessPath}`,
+    `sha384sum ${discoveredNodeHarnessPath}`,
+    `sha512sum ${discoveredNodeHarnessPath}`,
+    `b2sum ${discoveredNodeHarnessPath}`,
+    `openssl dgst ${discoveredNodeHarnessPath}`,
+    `git hash-object ${discoveredNodeHarnessPath}`,
+    `cp -v ${discoveredNodeHarnessPath} output/copied-candidate`,
+    `node --version ${discoveredNodeHarnessPath}`,
+    `python3 --version ${discoveredNodeHarnessPath}`,
+    `node ${discoveredNodeHarnessPath} --version`,
+    `python3 ${discoveredNodeHarnessPath} --help`,
+    `npm --prefix ${frozen} --version`,
+    `pytest output/fake_test.py --rootdir ${frozen}`,
+    `cmake -P output/fake.cmake ${discoveredNodeHarnessPath}`,
+    `blender --python-expr 'raise AssertionError()' ${discoveredNodeHarnessPath}`,
+  ]) {
+    const alternateScratchProgramPass = await runScenario({
+      aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+      outcomeCommandHash: crypto.createHash('sha256').update(command).digest('hex'),
+      commandEvents: [{
+        command, status: 'completed', exit_code: 0, aggregated_output: summary,
+      }],
+    })
+    assert.equal(alternateScratchProgramPass.code, 'CHECK_INCONCLUSIVE',
+      `scratch code-loading shape cannot acquire PASS authority: ${command}`)
+  }
+
+  for (const command of [
+    `/bin/bash -lc ${JSON.stringify(`python3 output/fake_harness.py # ${discoveredNodeHarnessPath}`)}`,
+    `/bin/bash -lc ${JSON.stringify(
+      `set -o pipefail; python3 output/fake_harness.py # ${discoveredNodeHarnessPath} 2>&1 | tee output/h.log`,
+    )}`,
+  ]) {
+    const commentedCandidateFailure = await runScenario({
+      aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+      outcomeFingerprint: crypto.createHash('sha256').update(selectedCheckFailureOutput).digest('hex'),
+      commandEvents: [{
+        command, status: 'failed', exit_code: 1, aggregated_output: selectedCheckFailureOutput,
+      }],
+    })
+    assert.equal(commentedCandidateFailure.code, 'CHECK_INCONCLUSIVE',
+      'a shell-comment candidate name cannot acquire failure authority')
+  }
+
+  for (const inlineManufacturedFailureCommand of [
+    `python3 -c'raise AssertionError("SELECTED_CHECK FAIL manufactured inline result")' ` +
+      discoveredNodeHarnessPath,
+    `python3 -qc'raise AssertionError("SELECTED_CHECK FAIL manufactured inline result")' ` +
+      discoveredNodeHarnessPath,
+    `python3 -Oqc'raise AssertionError("SELECTED_CHECK FAIL manufactured inline result")' ` +
+      discoveredNodeHarnessPath,
+    `perl -we'die "SELECTED_CHECK FAIL manufactured inline result"' ` +
+      discoveredNodeHarnessPath,
+    `node -pe'throw Error("SELECTED_CHECK FAIL manufactured inline result")' ` +
+      discoveredNodeHarnessPath,
+    `python3.12-dbg -c'raise AssertionError("SELECTED_CHECK FAIL manufactured inline result")' ` +
+      discoveredNodeHarnessPath,
+    `python3.12d -c'raise AssertionError("SELECTED_CHECK FAIL manufactured inline result")' ` +
+      discoveredNodeHarnessPath,
+    `python3.13t-dbg -c'raise AssertionError("SELECTED_CHECK FAIL manufactured inline result")' ` +
+      discoveredNodeHarnessPath,
+    `busybox ash -c'python3 -c "raise AssertionError()"' ${discoveredNodeHarnessPath}`,
+    `timeout 30s busybox ash -c'python3 -c "raise AssertionError()"' ${discoveredNodeHarnessPath}`,
+    `ksh -c'python3 -c "raise AssertionError()"' ${discoveredNodeHarnessPath}`,
+    `fish -c'python3 -c "raise AssertionError()"' ${discoveredNodeHarnessPath}`,
+    `nu -c'python3 -c "raise AssertionError()"' ${discoveredNodeHarnessPath}`,
+    `xargs python3 -c'raise AssertionError()' ${discoveredNodeHarnessPath}`,
+    `timeout 30s xargs python3 -c'raise AssertionError()' ${discoveredNodeHarnessPath}`,
+    `strace python3 -c'raise AssertionError()' ${discoveredNodeHarnessPath}`,
+    `prlimit python3 -c'raise AssertionError()' ${discoveredNodeHarnessPath}`,
+    `taskset -c 0 python3 -c'raise AssertionError()' ${discoveredNodeHarnessPath}`,
+    `parallel python3 -c'raise AssertionError()' ${discoveredNodeHarnessPath}`,
+    `/bin/bash -lc ${JSON.stringify(
+      `npm --prefix ${frozen} exec -c "python3 -c 'raise AssertionError()'"`,
+    )}`,
+    `lua5.4 -e'error("SELECTED_CHECK FAIL")' ${discoveredNodeHarnessPath}`,
+    `php -r'throw new Exception("SELECTED_CHECK FAIL");' ${discoveredNodeHarnessPath}`,
+    `Rscript -e'stop("SELECTED_CHECK FAIL")' ${discoveredNodeHarnessPath}`,
+    `deno eval 'throw new Error("SELECTED_CHECK FAIL")' ${discoveredNodeHarnessPath}`,
+    `julia -e'error("SELECTED_CHECK FAIL")' ${discoveredNodeHarnessPath}`,
+    `sbcl --eval '(error "SELECTED_CHECK FAIL")' ${discoveredNodeHarnessPath}`,
+    `file ${discoveredNodeHarnessPath}`,
+    `test -f ${discoveredNodeHarnessPath}`,
+    `cksum ${discoveredNodeHarnessPath}`,
+    `busybox file ${discoveredNodeHarnessPath}`,
+    `toybox cksum ${discoveredNodeHarnessPath}`,
+  ]) {
+    const inlineManufacturedFailure = await runScenario({
+      aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+      outcomeFingerprint: crypto.createHash('sha256').update(selectedCheckFailureOutput).digest('hex'),
+      commandEvents: [{
+        command: inlineManufacturedFailureCommand,
+        status: 'failed', exit_code: 1, aggregated_output: selectedCheckFailureOutput,
+      }],
+    })
+    assert.equal(inlineManufacturedFailure.code, 'CHECK_INCONCLUSIVE',
+      `an inline-code option cannot manufacture failure authority: ${inlineManufacturedFailureCommand}`)
+  }
+
+  const secondRejectedCase = 'verification:security:encoding-boundary'
+  const partiallyBoundFailure = await runScenario({
+    aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
+    checkIds: [rejectedCase, secondRejectedCase],
+    outcomeCommandHash: submittedCheckerHarnessHash,
+    outcomeFingerprints: {
+      [rejectedCase]: crypto.createHash('sha256').update(nodeTapFailure).digest('hex'),
+      [secondRejectedCase]: 'f'.repeat(64),
+    },
+    commandEvents: [{
+      command: wrappedCheckerHarness, status: 'failed', exit_code: 1,
+      aggregated_output: nodeTapFailure,
+    }],
+  })
+  assert.equal(partiallyBoundFailure.code, 'CHECK_INCONCLUSIVE',
+    'one observed failure cannot authorize a second unobserved failing claim')
 
   const nonzeroCannotAuthorizePass = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
@@ -699,7 +1460,9 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       command: genericCommand, status: 'completed', exit_code: 0, aggregated_output: summary,
     }],
   })
-  assert.equal(wrongObservationId.code, 'CHECK_INCONCLUSIVE')
+  assert.equal(wrongObservationId.code, 'PASS',
+    'a model-guessed controller observation ID is discarded instead of hiding real evidence')
+  assert.notEqual(wrongObservationId.payload.testOutcomes[0].observationId, 'f'.repeat(64))
 
   const wrongCommandHash = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
@@ -711,6 +1474,27 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   assert.equal(wrongCommandHash.code, 'CHECK_INCONCLUSIVE')
 
   const historicalScratchOutput = 'same frozen candidate, scratch oracle revision 1: FAIL'
+  const unrelatedIntrospectionDrift = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [
+      {
+        command: 'uname -a', status: 'completed', exit_code: 0,
+        aggregated_output: 'kernel observation one',
+      },
+      {
+        command: 'uname -a', status: 'completed', exit_code: 0,
+        aggregated_output: 'kernel observation two',
+      },
+      {
+        command: genericCommand, status: 'completed', exit_code: 0,
+        aggregated_output: summary,
+      },
+    ],
+  })
+  assert.equal(unrelatedIntrospectionDrift.code, 'PASS',
+    'changing output from an unrelated command cannot contradict a unique harness binding')
+
   const contradiction = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS',
     commandEvents: [
@@ -769,6 +1553,56 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   assert.equal(sharedHarness.transportEvidence.verificationObservations.count, 1)
 })
 
+test('controller receipts parse stable failure case IDs from common harness formats', () => {
+  const parsedCaseIds = output => {
+    const parsed = parseCodexJsonl([
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'failed-command', type: 'command_execution', command: 'node test-harness.js',
+          status: 'failed', exit_code: 1, aggregated_output: output,
+        },
+      }),
+      JSON.stringify({
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 1, cached_input_tokens: 0, output_tokens: 1,
+          reasoning_output_tokens: 0,
+        },
+      }),
+    ].join('\n'))
+    return parsed.verificationObservations.receipts[0].failureCaseIds
+  }
+  assert.deepEqual(parsedCaseIds([
+    'TAP version 13',
+    'not ok 1 - rejects expired token',
+    '# at 2026-08-28T10:00:00Z /tmp/node-test-17 random=run-17',
+    '# fail 1',
+  ].join('\n')), ['rejects expired token'])
+  assert.deepEqual(parsedCaseIds([
+    '================ FAILURES ================',
+    'FAILED /tmp/pytest-18/tests/test_api.py::test_rejects_expired_token - AssertionError',
+    '1 failed in 0.07s',
+  ].join('\n')), ['test_rejects_expired_token'])
+  assert.deepEqual(parsedCaseIds([
+    'FAIL tests/token.test.js',
+    '  ● token policy › rejects expired token (17 ms)',
+    'Tests: 1 failed, 2 passed, 3 total',
+  ].join('\n')), ['token policy › rejects expired token'])
+  assert.deepEqual(parsedCaseIds([
+    'TOKEN_SHAPE PASS',
+    'TOKEN_EXPIRY FAIL observed timestamp=2026-08-28T10:00:00Z',
+    'SELECTED_CHECK FAIL token-policy',
+  ].join('\n')), ['TOKEN_EXPIRY', 'token-policy'])
+  assert.deepEqual(parsedCaseIds(JSON.stringify({
+    failureCount: 2,
+    failures: [
+      { assertionId: 'token-shape', status: 'FAILED', diagnostic: '/tmp/run-17' },
+      { testName: 'token-expiry', status: 'FAIL', timestamp: '2026-08-28T10:00:00Z' },
+    ],
+  })), ['token-expiry', 'token-shape'])
+})
+
 test('worker result schema exposes the only transition accepted by the runtime', () => {
   const schema = JSON.parse(fs.readFileSync(
     path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
@@ -784,7 +1618,11 @@ test('Codex adapter sends the compatibility schema and restores canonical output
   const directory = temporaryDirectory(t)
   const canonicalSchema = path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json')
   let observed
-  const canonicalOutput = canonicalWorkerResult()
+  const fallbackFindingId = assignmentLocalFindingId({
+    workItemId: 'dynamic-worker-repair', logicalRole: 'worker', parent: 'run-owner',
+    assignment: 'Complete a dynamic repair assignment.', checks: ['Run its focused check.'],
+  }, { requestEnvelopeHash: 'a'.repeat(64) })
+  const canonicalOutput = canonicalWorkerResult({ findingIds: [fallbackFindingId] })
   const runner = {
     async run(spec) {
       observed = spec
@@ -832,13 +1670,23 @@ test('Codex adapter sends the compatibility schema and restores canonical output
   const schemaLine = observed.stdin.split('\n')
     .find(line => line.startsWith('Canonical output schema: '))
   const embeddedSchema = schemaLine.slice('Canonical output schema: '.length)
-  assert.deepEqual(JSON.parse(embeddedSchema), canonicalSchemaObject)
-  assert.equal(embeddedSchema, JSON.stringify(canonicalSchemaObject))
-  assert.ok(Buffer.byteLength(embeddedSchema, 'utf8') < fs.statSync(canonicalSchema).size)
+  const codexCanonicalSchemaObject = JSON.parse(embeddedSchema)
+  assert.equal(
+    canonicalSchemaObject.$defs.base.properties.findingIds.items.pattern,
+    '^AP-[A-Z]+-[0-9]{3}$',
+    'the shared provider-neutral role contract remains unchanged',
+  )
+  assert.equal(
+    codexCanonicalSchemaObject.$defs.base.properties.findingIds.items.pattern,
+    '^AP-[A-Z]+-(?:[0-9]{3}|[0-9]{78})$',
+  )
+  assert.equal(validateJsonSchema(canonicalSchemaObject, canonicalOutput).valid, false)
+  assert.equal(validateJsonSchema(codexCanonicalSchemaObject, canonicalOutput).valid, true)
   assert.doesNotMatch(observed.stdin, /Canonical output schema: \{\n\s+"/u)
   assert.deepEqual(terminal.behaviorChanged, canonicalOutput.behaviorChanged)
   assert.deepEqual(observedUsage, { noncachedInput: 4, cachedInput: 7, output: 1, reasoning: 0 })
   assert.equal(result.reportType, 'result')
+  assert.deepEqual(result.findingIds, [fallbackFindingId])
   assert.equal(Object.hasOwn(result, 'canonicalJson'), false)
 })
 
@@ -1068,7 +1916,11 @@ test('persisted assignment reads reject a symlink before following its JSON targ
 test('Codex adapter preserves a final CHECK_INCONCLUSIVE instead of reconstructing FAIL', async t => {
   const directory = temporaryDirectory(t)
   const canonicalOutput = canonicalOutcome('CHECK_INCONCLUSIVE', {
-    runId: 'run-inconclusive', payload: { unblockPath: 'provide isolated scratch storage' },
+    runId: 'run-inconclusive',
+    payload: {
+      unblockPath: 'provide isolated scratch storage',
+      verificationObservationDisposition: { reportedAggregateCode: 'PASS' },
+    },
   })
   let stopReason = null
   let terminal = null
@@ -1107,6 +1959,8 @@ test('Codex adapter preserves a final CHECK_INCONCLUSIVE instead of reconstructi
   assert.equal(stopReason, 'typed terminal CHECK_INCONCLUSIVE')
   assert.equal(result.code, 'CHECK_INCONCLUSIVE')
   assert.equal(terminal.code, 'CHECK_INCONCLUSIVE')
+  assert.equal(Object.hasOwn(result.payload, 'verificationObservationDisposition'), false,
+    'a direct model-authored inconclusive result cannot forge controller binding disposition')
   assert.equal(Object.hasOwn(result, 'reconstructedTerminal'), false)
 })
 
@@ -1219,6 +2073,248 @@ test('Codex route analyst may revise a schema-valid provisional recommendation b
   assert.equal(result.reconstructedTerminal, undefined)
 })
 
+test('Codex preserves shared route vocabulary and recovers malformed f1de11a task briefs', async t => {
+  const directory = temporaryDirectory(t)
+  const proposals = [
+    {
+      id: 'html-js-filter', route: 'LIGHT',
+      mutableResources: [{
+        kind: 'file', identity: '/app/filter.py', shared: false,
+        ownershipMode: 'single-owner implementation',
+      }],
+      sideEffects: [
+        'Creates or replaces /app/filter.py.',
+        'When executed, the program rewrites the user-supplied HTML file in place.',
+      ],
+      baselineStatus: 'unknown',
+    },
+    {
+      id: 'cad-model', route: 'LIGHT',
+      mutableResources: [{
+        kind: 'file', identity: '/app/out.step', shared: false,
+        ownershipMode: 'single-writer output artifact',
+      }],
+      sideEffects: ['Create or replace /app/out.step.'],
+    },
+    {
+      id: 'production-planning', route: 'ROADMAP',
+      mutableResources: [{
+        kind: 'database', identity: 'ERP planning_runs and planned_work_orders', shared: true,
+        ownershipMode: 'gateway-only coordinated write',
+      }],
+      sideEffects: [
+        'Creates three SQL artifacts.',
+        'Inserts planning, work-order, dispatch, and reservation records into three databases.',
+      ],
+      baselineStatus: 'unknown',
+    },
+    {
+      id: 'data-anonymization', route: 'ROADMAP',
+      mutableResources: [{
+        kind: 'source-file', identity: '/app/anon.py', shared: false,
+        ownershipMode: 'single implementation owner',
+      }],
+      sideEffects: ['Creates or replaces anonymized CSV artifacts under /app/output.'],
+      architectureImpact: 'single-system',
+    },
+    {
+      id: 'shared-only-minor-impact', route: 'DIRECT',
+      mutableResources: [{
+        kind: 'file', identity: '/app/minor.txt', shared: false, ownershipMode: 'single-owner',
+      }],
+      sideEffects: ['deliverable-write'],
+      thirdPartyImpact: 'minor',
+    },
+    {
+      id: 'shared-only-duplicate-check-kind', route: 'DIRECT',
+      mutableResources: [{
+        kind: 'file', identity: '/app/duplicate-check.txt', shared: false,
+        ownershipMode: 'single-owner',
+      }],
+      sideEffects: ['deliverable-write'],
+      availableCheckKinds: ['focused-test', 'focused-test'],
+    },
+  ]
+  const executionPolicy = {
+    logicalRole: 'route-analyst', physicalRole: 'autoprompt.v2.route-analyst',
+    providerRole: 'ap-route-analyst', sandboxMode: 'read-only',
+    policyId: 'autoprompt.codex.role-policy', policyVersion: '2.0.0',
+  }
+  let projectedProviderSchema = null
+
+  for (const proposal of proposals) {
+    const recommendation = createRouteRecommendation({
+      schemaVersion: '2.0.0', preWorkResult: 'CONTINUE',
+      recommendedRoute: proposal.route, confidence: 'high',
+      whatTheUserWants: [`Complete the ${proposal.id} benchmark deliverable.`],
+      likelyAreas: ['/app'], howSuccessCanBeChecked: ['Run the authoritative verifier.'],
+      unknowns: [], risks: [], independentWorkItems: [], dependencies: [],
+      reasonsForDirect: ['The work has one bounded implementation owner.'],
+      reasonsForLight: ['A short reversible implementation choice may be useful.'],
+      reasonsForRoadmap: ['Dependent work would require explicit coordination.'],
+      userInputNeeded: [], evidenceIndex: [],
+    })
+    recommendation.routeFactProposal.mutableResources = proposal.mutableResources
+    recommendation.routeFactProposal.sideEffects = proposal.sideEffects
+    for (const field of [
+      'thirdPartyImpact', 'baselineStatus', 'architectureImpact', 'availableCheckKinds',
+    ]) {
+      if (proposal[field]) recommendation.routeFactProposal[field] = proposal[field]
+    }
+    assert.equal(validateJsonSchema(
+      require(path.join(ROOT, 'agents', 'contracts', 'schemas', 'route-recommendation.schema.json')),
+      recommendation,
+    ).valid, true, `${proposal.id} reproduces the shared-schema acceptance gap`)
+
+    let providerPrompt = ''
+    let stopReason = null
+    const acceptedTerminals = []
+    const runner = {
+      async run(spec) {
+        providerPrompt = spec.stdin
+        for (const event of [
+          { type: 'thread.started', thread_id: `route-replay-${proposal.id}` },
+          {
+            type: 'item.completed',
+            item: {
+              type: 'agent_message',
+              text: JSON.stringify({ canonicalJson: JSON.stringify(recommendation) }),
+            },
+          },
+          {
+            type: 'turn.completed',
+            usage: { input_tokens: 2, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 },
+          },
+        ]) spec.onStdoutLine(JSON.stringify(event))
+        return { status: 0, stdout: '', stderr: '', processOwned: true, exactArgv: true, drained: true }
+      },
+      async stop(spec) { stopReason = spec.reason; return { drained: true } },
+    }
+    const adapter = new CodexExecAdapter({
+      runner, targetPath: ROOT,
+      profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+      outputSchemaResolver: () => path.join(
+        ROOT, 'agents', 'contracts', 'schemas', 'route-recommendation.schema.json',
+      ),
+      providerSchemaRoot: path.join(directory, `provider-schemas-${proposal.id}`),
+    })
+    const result = await adapter.launch({
+      ...executionPolicy, route: 'PRE_ROUTE', physicalExecutionPolicy: executionPolicy,
+      ...adapterMissionFields('a'.repeat(64)),
+      dispatch: {
+        brief: 'Recommend the route.',
+        requestPointer: { path: 'request', hash: 'a'.repeat(64) },
+      },
+      environment: {}, sessionId: `route-replay-${proposal.id}`,
+      reservationId: `route-replay-reservation-${proposal.id}`,
+      onUsageDelta() { return { continue: true } },
+      onTerminalResult(value) { acceptedTerminals.push(value) },
+    })
+    const schemaLine = providerPrompt.split('\n')
+      .find(line => line.startsWith('Canonical output schema: '))
+    const providerSchema = JSON.parse(schemaLine.slice('Canonical output schema: '.length))
+    projectedProviderSchema = providerSchema
+    const providerProposal = providerSchema.properties.routeFactProposal.properties
+    assert.deepEqual(
+      providerProposal.mutableResources,
+      routeRouter.ROUTE_FACTS_SCHEMA.properties.mutableResources,
+    )
+    assert.deepEqual(providerProposal.sideEffects, routeRouter.ROUTE_FACTS_SCHEMA.properties.sideEffects)
+    assert.deepEqual(providerProposal.thirdPartyImpact.enum,
+      ['none', 'minor', 'material', 'incidental'])
+    assert.deepEqual(providerProposal.baselineStatus.enum,
+      ['recorded', 'not-applicable', 'unknown', 'required-before-production', 'unavailable'])
+    assert.deepEqual(providerProposal.architectureImpact.enum,
+      ['local', 'single-system', 'multi-system', 'public-contract'])
+    assert.equal(providerProposal.namedDistinctResponsibilities.uniqueItems, true)
+    assert.equal(providerProposal.availableCheckKinds.uniqueItems, true)
+    assert.equal(providerProposal.availableCheckKinds.minItems, 1)
+    const providerValid = proposal.id === 'shared-only-minor-impact'
+    assert.equal(validateJsonSchema(providerSchema, recommendation).valid, providerValid)
+    assert.equal(stopReason, providerValid
+      ? 'typed terminal CONTINUE'
+      : 'completed turn requires canonical correction')
+    assert.equal(result.reconstructedTerminal, undefined)
+    assert.equal(result.recommendedRoute, 'DIRECT')
+    assert.equal(result.confidence, providerValid ? 'high' : 'low')
+    assert.deepEqual(result.whatTheUserWants, recommendation.whatTheUserWants)
+    assert.deepEqual(result.likelyAreas, recommendation.likelyAreas)
+    assert.deepEqual(result.howSuccessCanBeChecked, recommendation.howSuccessCanBeChecked)
+    assert.deepEqual(result.verificationObligations, recommendation.verificationObligations)
+    if (providerValid) {
+      assert.deepEqual(result.routeFactProposal, recommendation.routeFactProposal,
+        `${proposal.id} provider-contract vocabulary must retain route authority`)
+    } else {
+      assert.notDeepEqual(result.routeFactProposal, recommendation.routeFactProposal,
+        `${proposal.id} malformed model-authored route authority must be discarded`)
+    }
+    assert.equal(acceptedTerminals.length, 1)
+    assert.equal(acceptedTerminals[0].recommendedRoute, 'DIRECT')
+    assert.deepEqual(acceptedTerminals[0].whatTheUserWants, recommendation.whatTheUserWants,
+      `${proposal.id} task detail must survive conservative route recovery`)
+  }
+
+  const projectedValid = createRouteRecommendation({
+    preWorkResult: 'CONTINUE', recommendedRoute: 'DIRECT', confidence: 'high',
+    whatTheUserWants: ['Preserve this exact provider-authored success item.'],
+    likelyAreas: ['/app/projected-valid.txt'],
+    howSuccessCanBeChecked: ['Run the projected contract check.'],
+    unknowns: [], risks: [], independentWorkItems: [], dependencies: [],
+    reasonsForDirect: ['The bounded mutation has one owner and no unresolved design choice.'],
+    reasonsForLight: ['No reversible technical uncertainty requires short planning.'],
+    reasonsForRoadmap: ['No dependent work groups require coordination.'],
+    userInputNeeded: [], evidenceIndex: [],
+  })
+  projectedValid.routeFactProposal.mutableResources = [{
+    kind: 'file', identity: '/app/projected-valid.txt', shared: false,
+    ownershipMode: 'single-owner',
+  }]
+  assert.equal(validateJsonSchema(projectedProviderSchema, projectedValid).valid, true)
+  const compiled = compileAutomaticRouteDecision({
+    recommendation: projectedValid,
+    requestedResult: 'Compile the provider-authored recommendation.',
+    requestEnvelopeHash: 'a'.repeat(64), providerCapabilities: PROVIDER_CAPABILITIES,
+    budget: { remaining: { wallMs: 60 * 60 * 1000 } }, nowMs: 1,
+  })
+  assert.equal(compiled.route, 'DIRECT')
+  assert.deepEqual(compiled.successChecklist, projectedValid.whatTheUserWants,
+    'the projected-valid proposal compiles directly instead of using the generic fallback')
+  assert.deepEqual(compiled.likelyAreas, projectedValid.likelyAreas)
+
+  const sharedVocabulary = structuredClone(projectedValid)
+  sharedVocabulary.routeFactProposal.thirdPartyImpact = 'minor'
+  sharedVocabulary.routeFactProposal.baselineStatus = 'unknown'
+  sharedVocabulary.routeFactProposal.architectureImpact = 'single-system'
+  assert.equal(validateJsonSchema(projectedProviderSchema, sharedVocabulary).valid, true)
+  const translated = compileAutomaticRouteDecision({
+    recommendation: sharedVocabulary,
+    requestedResult: 'Compile provider-neutral facts without discarding the route.',
+    requestEnvelopeHash: 'b'.repeat(64), providerCapabilities: PROVIDER_CAPABILITIES,
+    budget: { remaining: { wallMs: 60 * 60 * 1000 } }, nowMs: 2,
+  })
+  assert.equal(translated.normalizedRouteFacts.thirdPartyImpact, 'incidental')
+  assert.equal(translated.normalizedRouteFacts.checkAndBaseline.baselineStatus, 'required-before-production')
+  assert.equal(translated.normalizedRouteFacts.architectureImpact, 'local')
+  assert.deepEqual(translated.successChecklist, sharedVocabulary.whatTheUserWants)
+
+  const routerVocabulary = structuredClone(projectedValid)
+  routerVocabulary.recommendedRoute = 'ROADMAP'
+  routerVocabulary.routeFactProposal.thirdPartyImpact = 'incidental'
+  routerVocabulary.routeFactProposal.baselineStatus = 'unavailable'
+  routerVocabulary.routeFactProposal.architectureImpact = 'public-contract'
+  assert.equal(validateJsonSchema(projectedProviderSchema, routerVocabulary).valid, true)
+  const routerNative = compileAutomaticRouteDecision({
+    recommendation: routerVocabulary,
+    requestedResult: 'Compile canonical Codex router facts without lossy aliases.',
+    requestEnvelopeHash: 'c'.repeat(64), providerCapabilities: PROVIDER_CAPABILITIES,
+    budget: { remaining: { wallMs: 60 * 60 * 1000 } }, nowMs: 3,
+  })
+  assert.equal(routerNative.route, 'ROADMAP')
+  assert.equal(routerNative.normalizedRouteFacts.thirdPartyImpact, 'incidental')
+  assert.equal(routerNative.normalizedRouteFacts.checkAndBaseline.baselineStatus, 'unavailable')
+  assert.equal(routerNative.normalizedRouteFacts.architectureImpact, 'public-contract')
+})
+
 test('Codex correction boundary suppresses late session and usage callbacks without a valid terminal', async t => {
   const directory = temporaryDirectory(t)
   const sessions = []
@@ -1260,7 +2356,9 @@ test('Codex correction boundary suppresses late session and usage callbacks with
   assert.deepEqual(sessions, ['22222222-3333-4222-8222-222222222222'])
   assert.equal(usage.length, 1)
   assert.equal(result.contextId, '22222222-3333-4222-8222-222222222222')
-  assert.equal(result.reconstructedTerminal, true)
+  assert.equal(result.reconstructedTerminal, undefined)
+  assert.equal(result.recommendedRoute, 'DIRECT')
+  assert.equal(result.confidence, 'low')
 })
 
 test('Codex L0 owner may replace an internal WAITING_USER progress message with its final decision', async t => {

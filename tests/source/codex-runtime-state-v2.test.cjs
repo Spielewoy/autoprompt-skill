@@ -858,6 +858,7 @@ test('checker repair mutates in REPAIRING, invalidates C1, and freezes a fresh C
   const environmentHash = digest('environment')
   const dependencyHash = digest('dependency-one')
   const checkerResultHash = digest('rejected-checker-result')
+  const repairFailureFingerprint = digest('controller-bound-repair-failure')
   const checkerReceiptPath = path.join(directory, 'independent-check-1.json')
   fs.writeFileSync(checkerReceiptPath, '{"code":"FAIL"}\n')
   const checkerReceiptBytes = fs.readFileSync(checkerReceiptPath)
@@ -881,6 +882,9 @@ test('checker repair mutates in REPAIRING, invalidates C1, and freezes a fresh C
           checkerResultHash,
           checkerReceiptPointer,
           rejectedCheckerReceipts,
+          repairFailureFingerprint,
+          repairFailureFingerprints: [repairFailureFingerprint],
+          repairFailureFingerprintChain: [repairFailureFingerprint],
           repairAttempt: 1,
           repairWorkItemId: 'work-1-repair-1',
         } : {}),
@@ -888,6 +892,9 @@ test('checker repair mutates in REPAIRING, invalidates C1, and freezes a fresh C
           priorCandidateHash: candidateOne,
           checkerResultHash,
           rejectedCheckerReceipts,
+          repairFailureFingerprint,
+          repairFailureFingerprints: [repairFailureFingerprint],
+          repairFailureFingerprintChain: [repairFailureFingerprint],
           repairAttempt: 1,
           repairWorkItemId: 'work-1-repair-1',
         } : {}),

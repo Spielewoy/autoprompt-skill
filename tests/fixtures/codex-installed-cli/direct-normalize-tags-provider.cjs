@@ -219,9 +219,7 @@ function main() {
       throw new Error('installed canary route recommendation lost its exact focused-check identity')
     }
     const command = JSON.stringify([process.execPath, '--test', 'test.cjs'])
-    const commandHash = sha256(command)
     const commandOutput = `${check.stdout}\n${check.stderr}`
-    const fingerprint = sha256(commandOutput.trim())
     const evidenceId = `${logicalRole}:${sha256(commandOutput)}`
     appendTrace({
       logicalRole,
@@ -250,12 +248,9 @@ function main() {
       payload: {
         evidenceIds: [evidenceId],
         findings: passed ? [] : [{ id: 'CANARY-FOCUSED-CHECK-RED', severity: 'P1' }],
-        testOutcomes: assignment.checks.map((checkId, index) => ({
+        testOutcomes: assignment.checks.map(checkId => ({
           command: checkId,
-          observationId: assignment.verificationObservationCases[index].observationId,
-          commandHash,
           status: passed ? 'PASS' : 'FAIL',
-          fingerprint,
         })),
       },
       recordedAt: new Date().toISOString(),

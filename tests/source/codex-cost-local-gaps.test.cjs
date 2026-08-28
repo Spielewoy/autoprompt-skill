@@ -389,7 +389,7 @@ test('assignment findings consume only explicit fields and use a stable local fa
   const binding = { requestEnvelopeHash: 'a'.repeat(64) }
   const freshId = assignmentLocalFindingId(request, binding)
   const resumedId = assignmentLocalFindingId(structuredClone(request), structuredClone(binding))
-  assert.match(freshId, /^AP-WORK-[0-9]{3}$/u)
+  assert.match(freshId, /^AP-WORK-[0-9]{78}$/u)
   assert.equal(resumedId, freshId)
   assert.doesNotMatch(freshId, /AP-(?:DESIGN|TRACE|RUN)-/u)
   assert.deepEqual(explicitFindingIds({
@@ -441,16 +441,26 @@ test('W3/C2 assignment-local finding ids are unique and resume-stable across cor
     assignmentLocalFindingId(request, structuredClone(binding), resumedRegistry))
   assert.deepEqual(resumedIds, freshIds)
 
-  const exoticRegistry = new Map()
-  assert.throws(() => {
-    for (let ordinal = 0; ordinal <= 200; ordinal += 1) {
-      assignmentLocalFindingId({
-        workItemId: `extension-assignment-${ordinal}`,
+  const dynamicRequests = Array.from({ length: 512 }, (_, ordinal) => ordinal % 2 === 0
+    ? {
+        workItemId: `work-${100 + ordinal}-repair-${10 + ordinal}`,
         logicalRole: 'worker',
-        assignment: `Extension assignment ${ordinal}`,
-      }, binding, exoticRegistry)
-    }
-  }, error => error.code === 'ASSIGNMENT_FINDING_ID_COLLISION')
+        assignment: `Dynamic repair assignment ${ordinal}`,
+      }
+    : {
+        workItemId: `independent-check-${10 + ordinal}-repair-${3 + ordinal}`,
+        logicalRole: 'independent-tester',
+        assignment: `Dynamic checker assignment ${ordinal}`,
+      })
+  const dynamicRegistry = new Map()
+  const dynamicIds = dynamicRequests.map(request =>
+    assignmentLocalFindingId(request, binding, dynamicRegistry))
+  assert.equal(new Set(dynamicIds).size, dynamicRequests.length)
+  assert.ok(dynamicIds.every(id => /^AP-WORK-[0-9]{78}$/u.test(id)))
+  const resumedDynamicRegistry = new Map()
+  const resumedDynamicIds = structuredClone(dynamicRequests).map(request =>
+    assignmentLocalFindingId(request, structuredClone(binding), resumedDynamicRegistry))
+  assert.deepEqual(resumedDynamicIds, dynamicIds)
 })
 
 test('AP-ROUTE-025 emits item verification before more work continues', async () => {

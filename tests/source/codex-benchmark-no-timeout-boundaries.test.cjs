@@ -14,9 +14,11 @@ const {
   CodexSupervisorRuntime,
   ROUTE_CAPABILITY_EFFECTS,
   RuntimeCapabilityAuthority,
+  createDefaultRuntimeOptions,
   productionPhaseBudgets,
   runtimeCapabilityExpiryMs,
 } = require('../../agents/codex/workflow/phase-budget.js')
+const { createRunRecord } = require('../../agents/codex/workflow/run-record.js')
 const { activationCapabilityTtlSeconds } = require('../../scripts/codex-configure.cjs')
 
 const HOUR_MS = 60 * 60 * 1000
@@ -89,6 +91,85 @@ function assertBudgetError(action, code, dimension) {
   })
 }
 
+function createProductionRuntimeOptionsFixture(directory, fixtureId, context = {}) {
+  const activationRoot = path.join(directory, fixtureId, 'activation')
+  const target = path.join(directory, fixtureId, 'target')
+  fs.mkdirSync(activationRoot, { recursive: true })
+  fs.mkdirSync(target, { recursive: true })
+  const runId = `token-limit-${fixtureId}`
+  const record = createRunRecord({
+    targetPath: target,
+    canonicalProviderPrivateRoot: path.join(activationRoot, 'supervisor-runtime'),
+    allowProjectMutation: true,
+    readOnly: true,
+    exactTree: true,
+    runId,
+    assertStartBoundary: false,
+  })
+  const modelSelection = {
+    schemaVersion: 1,
+    mode: 'provider-default',
+    selector: 'provider-default',
+    models: [],
+    effort: null,
+    castingHash: '6'.repeat(64),
+    agentDefinitionsHash: '7'.repeat(64),
+    registry: null,
+    probeAcceptance: {
+      strictConfig: true,
+      profileAcceptedAt: new Date().toISOString(),
+      explicitModelAndEffortAssignments: false,
+    },
+  }
+  const requestArgv = ['verify-production-token-limit']
+  const activation = {
+    activationAttestation: { hash: '1'.repeat(64) },
+    activationRoot,
+    enforcementProof: { profileSha256: '2'.repeat(64) },
+    entryPrompt: 'verify production token-limit wiring',
+    modelRegistry: null,
+    modelSelection,
+    profilePath: path.join(activationRoot, 'autoprompt.config.toml'),
+    requestArgv,
+    runId,
+    supervisorRuntime: {
+      runPath: record.runPath,
+      runId,
+      metadataSha256: '3'.repeat(64),
+      targetIdentity: record.targetIdentity,
+    },
+    record: {
+      target: { realpath: target },
+      request: { canonicalJson: JSON.stringify({ schemaVersion: 1, argv: requestArgv }) },
+      capability: {
+        generation: 1,
+        expiresAt: new Date(Date.now() + HOUR_MS).toISOString(),
+        parentSession: 'token-limit-parent',
+      },
+      contractVersions: {},
+      providerAttestation: { attestation: { activationNonce: 'token-limit-nonce' } },
+      activationBoundary: {
+        gitConfig: path.join(activationRoot, 'empty.gitconfig'),
+        ghConfigDir: path.join(activationRoot, 'gh-config'),
+        enforcementProof: { path: path.join(activationRoot, 'enforcement-proof.json') },
+        supervisorAdapterSha256: '4'.repeat(64),
+        payloadManifestSha256: '5'.repeat(64),
+      },
+      modelSelection,
+    },
+  }
+  return createDefaultRuntimeOptions({
+    activation,
+    probe: {
+      supported: true,
+      executable: process.execPath,
+      cliVersion: 'token-limit-wiring-fixture',
+      evidenceHashes: ['8'.repeat(64)],
+    },
+    context: { expectedBranch: 'main', providerMaximum: 2, ...context },
+  })
+}
+
 test('required local completion remains available across execution, work, and elapsed wall targets', () => {
   const clock = { elapsedMs: 0 }
   const budget = controllerAt(clock)
@@ -142,8 +223,45 @@ test('required phase work records elapsed targets and continues without an ambie
   runtime.budget = budget
   runtime.route = 'DIRECT'
   const decision = runtime._enforceBudgetPhase('EXECUTION_BUILD', { requiredCompletion: true })
+  assert.equal(decision.action, 'CONTINUE')
+  assert.equal(decision.reason, 'REQUIRED_COMPLETION')
+  assert.equal(Object.hasOwn(decision, 'targetAction'), false,
+    'required completion must not publish an internal stop instruction')
+  assert.equal(Object.hasOwn(decision, 'targetReason'), false)
   assert.equal(decision.completionCanContinue, true)
   assert.equal(decision.completionTargetOverrun, true)
+})
+
+test('production default runtime has no implicit activation token stop and validates explicit targets', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-production-token-limit-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  const unboundedOptions = createProductionRuntimeOptionsFixture(directory, 'absent')
+  assert.equal(unboundedOptions.budgetController.snapshot().limits.tokens, Number.MAX_SAFE_INTEGER)
+  const unboundedRuntime = new CodexSupervisorRuntime(unboundedOptions)
+  assert.equal(unboundedRuntime.budget, unboundedOptions.budgetController)
+  assert.equal(unboundedRuntime.budget.snapshot().limits.tokens, Number.MAX_SAFE_INTEGER)
+
+  const explicitOptions = createProductionRuntimeOptionsFixture(
+    directory,
+    'explicit',
+    { tokenLimit: 1_234_567 },
+  )
+  assert.equal(explicitOptions.budgetController.snapshot().limits.tokens, 1_234_567)
+  const explicitRuntime = new CodexSupervisorRuntime(explicitOptions)
+  assert.equal(explicitRuntime.budget, explicitOptions.budgetController)
+  assert.equal(explicitRuntime.budget.snapshot().limits.tokens, 1_234_567)
+
+  assert.throws(
+    () => createProductionRuntimeOptionsFixture(directory, 'zero', { tokenLimit: 0 }),
+    error => error.code === 'BUDGET_CONFIG_INVALID',
+  )
+  assert.throws(
+    () => createProductionRuntimeOptionsFixture(directory, 'unsafe', {
+      tokenLimit: Number.MAX_SAFE_INTEGER + 1,
+    }),
+    error => error.code === 'BUDGET_CONFIG_INVALID',
+  )
 })
 
 test('normal wall limits still stop at the exact execution, work, deadline, and external-write boundaries', () => {

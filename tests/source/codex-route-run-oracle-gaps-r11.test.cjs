@@ -200,6 +200,13 @@ test('AP-CHECK-034 a bound CHECK_INCONCLUSIVE report is terminal and remains can
     validateCanonicalChildResult(record, report, report.runId, requestEnvelopeHash),
     report,
   )
+
+  const unknownCode = { ...report, code: 'CHECKER_CODE_NOT_REGISTERED' }
+  assert.equal(typedChildOutputReady(unknownCode, record), false)
+  assert.throws(
+    () => validateCanonicalChildResult(record, unknownCode, report.runId, requestEnvelopeHash),
+    error => error.code === 'CHECK_REPORT_INVALID' && error.details.mismatches.includes('code'),
+  )
 })
 
 test('AP-CODEX-V2-033 plan repair accepts only one exact durable result file', t => {

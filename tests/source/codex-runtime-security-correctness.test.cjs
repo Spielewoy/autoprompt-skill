@@ -10,11 +10,21 @@ const test = require('node:test')
 
 const {
   CodexSupervisorRuntime,
+  assertIndependentScratchPassConfirmations,
+  checkerRecoveryNextReady,
+  codexPhysicalExecutionReceipt,
   createDefaultRouteExecutor,
   createMinimalTestEnvironment,
   executeExistingTestBaseline,
+  promoteIndependentScratchPass,
   resolveTrustedTestDeclarations,
 } = require('../../agents/codex/workflow/phase-budget.js')
+const { BudgetController } = require('../../agents/codex/workflow/budget-controller.js')
+const { stableStringify } = require('../../agents/codex/workflow/event-log.js')
+const {
+  CentralScheduler,
+  resolveSchedulerSettings,
+} = require('../../agents/codex/workflow/scheduler.js')
 const {
   createRouteDecision,
   remainingL0DecisionBudgetMs,
@@ -22,6 +32,11 @@ const {
 const router = require('../../agents/codex/workflow/router.js')
 
 const H = 'a'.repeat(64)
+
+function digest(value) {
+  return crypto.createHash('sha256')
+    .update(Buffer.isBuffer(value) ? value : String(value)).digest('hex')
+}
 
 function git(cwd, argv) {
   const result = childProcess.spawnSync('git', argv, { cwd, encoding: 'utf8', windowsHide: true })
@@ -207,6 +222,393 @@ function passingCheckerResult(request) {
   }
 }
 
+function scratchReferenceMethod(label) {
+  return {
+    methodClass: 'black-box-boundary',
+    source: `${label} independently derived boundary corpus`,
+    procedure: `${label} executes a separately authored validator and compares each observation with its own boundary oracle.`,
+    expectedOutputDerivedFromSubjectCode: false,
+    subjectLogicReimplemented: false,
+    positiveInvariants: [`${label} observes the required positive behavior.`],
+    negativeInvariants: [`${label} rejects the independently selected forbidden behavior.`],
+    boundaryInvariants: [`${label} exercises its independently selected boundary case.`],
+  }
+}
+
+function scratchPassResult({
+  candidateHash = digest('scratch-candidate'),
+  requestEnvelopeHash = digest('scratch-request'),
+  workItemId,
+  oracleId,
+  checks = ['focused scratch behavior'],
+  label,
+  evidenceId = `sha256:${digest(`evidence:${label}`)}`,
+  programDigest = digest(`program:${label}`),
+  programPathHash = digest(`program-path:${label}`),
+  programIdentityHash = digest(`program-identity:${label}`),
+}) {
+  const contextId = `context:${label}`
+  const authorityChecks = [...checks].sort().map(checkId => Object.freeze({
+    authority: 'SCRATCH_HARNESS',
+    checkId,
+    commandHash: digest(`command:${label}:${checkId}`),
+    harnessCommandHash: digest(`harness-command:${label}:${checkId}`),
+    fingerprint: digest(`fingerprint:${label}:${checkId}`),
+    observationHash: digest(`observation:${label}:${checkId}`),
+    observationId: digest(`observation-id:${label}:${checkId}`),
+    programBytes: Buffer.byteLength(`program:${label}`),
+    programDigest,
+    programPathHash,
+    programIdentityHash,
+  }))
+  const authorityBody = Object.freeze({
+    schemaVersion: 1,
+    candidateHash,
+    requestEnvelopeHash,
+    assignmentId: `assignment:${label}`,
+    workItemId,
+    oracleId,
+    contextId,
+    bindingHash: digest(`binding:${label}`),
+    observationEvidenceHash: digest(`observation-evidence:${label}`),
+    scratchBoundaryHash: digest(`scratch-boundary:${label}`),
+    frozenCandidateRootPathHash: digest(`candidate-root:${label}`),
+    writableScratchRootPathHash: digest(`scratch-root:${label}`),
+    checks: authorityChecks,
+  })
+  const verificationAuthority = Object.freeze({
+    ...authorityBody,
+    authorityHash: digest(stableStringify(authorityBody)),
+  })
+  return Object.freeze({
+    schemaVersion: '2.0.0',
+    code: 'CHECK_INCONCLUSIVE',
+    candidateHash,
+    requestEnvelopeHash,
+    contextId,
+    cause: Object.freeze({
+      event: 'CHECK_SCRATCH_CONFIRMATION_REQUIRED',
+      reason: 'The independently authored scratch validator is provisional PASS evidence.',
+      unblockPath: 'Join it with one disjoint controller-bound scratch PASS authority.',
+    }),
+    payload: Object.freeze({
+      evidenceIds: Object.freeze([evidenceId]),
+      referenceMethod: Object.freeze(scratchReferenceMethod(label)),
+      testOutcomes: Object.freeze([...checks].sort().map(command => Object.freeze({
+        command,
+        status: 'PASS',
+        fingerprint: digest(`outcome:${label}:${command}`),
+      }))),
+      verificationAuthority,
+      verificationObservationDisposition: Object.freeze({
+        reportedAggregateCode: 'PASS',
+        missingCheckIds: Object.freeze([]),
+        conflictingCommandHashes: Object.freeze([]),
+      }),
+    }),
+  })
+}
+
+function structurallyUnboundPass(event = 'CHECK_OBSERVATION_INCOMPLETE') {
+  return {
+    code: 'CHECK_INCONCLUSIVE',
+    cause: {
+      event,
+      reason: 'The reported PASS lacked controller-bound command observations.',
+      unblockPath: 'Supply command-bound observations for every named check.',
+    },
+    payload: {
+      verificationObservationDisposition: {
+        reportedAggregateCode: 'PASS',
+        missingCheckIds: ['Review the structured finding and its evidence receipt.'],
+        conflictingCommandHashes: [],
+      },
+    },
+  }
+}
+
+test('structurally unbound PASS has no report-only retry frontier while FAIL keeps repair authority', () => {
+  const recovery = {
+    nonAuthoritativeRetryId: 'independent-check-1-runtime-retry-1',
+    failureRepairId: 'work-1-repair-1',
+    stableLimitationNextReadyId: 'independent-check-2',
+  }
+  for (const event of [
+    'CHECK_OBSERVATION_INCOMPLETE',
+    'CHECK_OBSERVATION_CONTRADICTION',
+  ]) {
+    assert.deepEqual(
+      checkerRecoveryNextReady('independent-check-1', structurallyUnboundPass(event), recovery),
+      ['independent-check-2'],
+      event,
+    )
+  }
+  assert.deepEqual(checkerRecoveryNextReady(
+    'independent-check-1',
+    structurallyUnboundPass(),
+    { ...recovery, stableLimitationNextReadyId: null },
+  ), [])
+  assert.deepEqual(checkerRecoveryNextReady('independent-check-1', {
+    ...structurallyUnboundPass(),
+    payload: {
+      verificationObservationDisposition: { reportedAggregateCode: 'FAIL' },
+    },
+  }, recovery), ['independent-check-1-runtime-retry-1'])
+  assert.deepEqual(checkerRecoveryNextReady('independent-check-1', {
+    code: 'FAIL', cause: { event: 'ASSERTION_FAILED' },
+  }, recovery), ['work-1-repair-1'])
+})
+
+test('same-class scratch PASS authorities pair only when their full methods and evidence are independent', () => {
+  const common = {
+    candidateHash: digest('same frozen candidate'),
+    requestEnvelopeHash: digest('same request envelope'),
+    checks: ['Exercise the frozen boundary with an independent oracle.'],
+  }
+  const primary = scratchPassResult({
+    ...common,
+    workItemId: 'independent-check-1',
+    oracleId: 'primary-boundary-oracle',
+    label: 'primary corpus',
+  })
+  const confirmation = scratchPassResult({
+    ...common,
+    workItemId: 'independent-check-1-scratch-confirmation-1',
+    oracleId: 'confirmation-boundary-oracle',
+    label: 'confirmation corpus',
+  })
+
+  assert.equal(primary.payload.referenceMethod.methodClass, 'black-box-boundary')
+  assert.equal(confirmation.payload.referenceMethod.methodClass, 'black-box-boundary')
+  assert.notDeepEqual(primary.payload.referenceMethod, confirmation.payload.referenceMethod)
+  for (const field of [
+    'assignmentId', 'workItemId', 'oracleId', 'contextId', 'bindingHash',
+    'observationEvidenceHash', 'scratchBoundaryHash', 'frozenCandidateRootPathHash',
+    'writableScratchRootPathHash',
+  ]) {
+    assert.notEqual(
+      primary.payload.verificationAuthority[field],
+      confirmation.payload.verificationAuthority[field],
+      field,
+    )
+  }
+  for (const field of ['programDigest', 'programPathHash', 'programIdentityHash']) {
+    assert.notEqual(
+      primary.payload.verificationAuthority.checks[0][field],
+      confirmation.payload.verificationAuthority.checks[0][field],
+      field,
+    )
+  }
+
+  const join = assertIndependentScratchPassConfirmations(primary, confirmation, common)
+  assert.equal(join.kind, 'scratch-pass-confirmation-join')
+  assert.match(join.joinHash, /^[a-f0-9]{64}$/u)
+  const promoted = promoteIndependentScratchPass(primary, confirmation, common)
+  assert.equal(promoted.code, 'PASS')
+  assert.equal(promoted.cause, null)
+  assert.equal(promoted.payload.verificationScratchConfirmation.joinHash, join.joinHash)
+
+  const reusedProgram = scratchPassResult({
+    ...common,
+    workItemId: 'independent-check-1-scratch-confirmation-1',
+    oracleId: 'replacement-program-oracle',
+    label: 'replacement program corpus',
+    programDigest: primary.payload.verificationAuthority.checks[0].programDigest,
+  })
+  assert.throws(
+    () => promoteIndependentScratchPass(primary, reusedProgram, common),
+    error => error.code === 'SCRATCH_PASS_CONFIRMATION_NOT_INDEPENDENT' &&
+      error.details.field === 'programDigest',
+  )
+
+  const reusedEvidence = scratchPassResult({
+    ...common,
+    workItemId: 'independent-check-1-scratch-confirmation-1',
+    oracleId: 'replacement-evidence-oracle',
+    label: 'replacement evidence corpus',
+    evidenceId: primary.payload.evidenceIds[0],
+  })
+  assert.throws(
+    () => promoteIndependentScratchPass(primary, reusedEvidence, common),
+    error => error.code === 'SCRATCH_PASS_CONFIRMATION_NOT_INDEPENDENT' &&
+      /disjoint underlying evidence/u.test(error.message),
+  )
+})
+
+test('required launch topology survives report correction, scratch FAIL repair, and repaired scratch confirmation', async t => {
+  const targetPath = cleanRepository(t)
+  const decision = readOnlyDecision('mutate', 1, 1)
+  const topology = codexPhysicalExecutionReceipt(decision)
+  const economicTarget = new BudgetController({
+    limits: { wallMs: 10_000, tokens: 10, sessions: 1, launches: 1 },
+    phases: {},
+  })
+  const schedulerRun = { runId: 'scratch-topology-run', generation: 1 }
+  const issuerCapability = Object.freeze({})
+  const scheduler = new CentralScheduler({
+    route: 'DIRECT',
+    runIdentity: schedulerRun,
+    requiredCompletionIssuerCapability: issuerCapability,
+    settings: resolveSchedulerSettings({
+      route: 'DIRECT', requiredChildLaunches: topology.requiredChildLaunches,
+    }),
+  })
+  let schedulerSession = 0
+  const admitRequiredLaunch = async workItemId => {
+    const schedulerRequest = {
+      workItemId,
+      equivalenceKey: `physical:${workItemId}`,
+      role: 'ap-worker',
+      purpose: 'work',
+      lane: 'main',
+    }
+    const requiredCompletionBinding =
+      scheduler.issueRequiredCompletionBinding(schedulerRequest, issuerCapability)
+    schedulerSession += 1
+    const authority = scheduler.issueLaunchAuthority({
+      callerRole: 'ap-root',
+      sessionId: `scratch-topology-session-${schedulerSession}`,
+      ...schedulerRun,
+      parentLease: null,
+      providerCapabilities: {
+        eventStreaming: true,
+        toolOutputCapture: true,
+        stableChildIdentity: true,
+        sameContextContinuation: true,
+        isolatedChecking: true,
+        cancellation: true,
+      },
+      requiredCompletionBinding,
+    })
+    const lease = await scheduler.acquireWithAuthority(authority, {
+      ...schedulerRequest,
+      requiredCompletionBinding,
+    })
+    economicTarget.recordLaunch(scheduler.authorizeRequiredCompletionAccounting(lease))
+    lease.complete({ noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 })
+  }
+  await admitRequiredLaunch('route-analyst')
+
+  const receiptRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-scratch-topology-'))
+  t.after(() => fs.rmSync(receiptRoot, { recursive: true, force: true }))
+  const receiptPointers = new Map()
+  const persistResult = (workItemId, result) => {
+    const target = path.join(receiptRoot, `${workItemId}.json`)
+    const bytes = Buffer.from(`${JSON.stringify(result)}\n`)
+    fs.writeFileSync(target, bytes)
+    receiptPointers.set(workItemId, {
+      name: workItemId,
+      path: target,
+      hash: digest(bytes),
+      bytes: bytes.length,
+    })
+    return result
+  }
+  const concreteFailure = {
+    schemaVersion: '2.0.0',
+    code: 'FAIL',
+    cause: {
+      event: 'ASSERTION_FAILED',
+      reason: 'The scratch confirmation found the requested edit was absent.',
+      unblockPath: 'Repair the product, then run a fresh checker and scratch confirmation.',
+    },
+    payload: { findingIds: ['SCRATCH-CONFIRMATION-DEFECT'] },
+  }
+  const launches = []
+  const transitions = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath,
+    gitEnvironment: () => process.env,
+    transition: async (eventId, nextState, details) => {
+      transitions.push({ eventId, nextState, details })
+    },
+    resultPointer: workItemId => receiptPointers.get(workItemId),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash,
+      buildHash: digest(`build:${candidateHash}`),
+      oracleHash: digest(`oracle:${oracle}`),
+    }),
+    persistStructuredFinalResponse: structuredResponsePersistence(t),
+  })({
+    route: 'DIRECT',
+    decision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      await admitRequiredLaunch(request.workItemId)
+      if (request.workItemId === 'work-1') return structuredWorkerResult()
+      if (request.workItemId === 'independent-check-1') {
+        return { schemaVersion: '2.0.0', code: 'MALFORMED_VERDICT', payload: {} }
+      }
+      if (request.workItemId === 'independent-check-1-runtime-retry-1') {
+        assert.equal(request.recoveryContext.code, 'CHECK_REPORT_INVALID')
+        return scratchPassResult({
+          candidateHash: request.candidateHash,
+          requestEnvelopeHash: decision.requestEnvelopeHash,
+          workItemId: request.workItemId,
+          oracleId: request.oracle,
+          checks: request.checks,
+          label: 'corrected primary scratch pass',
+        })
+      }
+      if (request.workItemId === 'independent-check-1-scratch-confirmation-1') {
+        return persistResult(request.workItemId, concreteFailure)
+      }
+      if (request.workItemId === 'work-1-repair-1') {
+        fs.writeFileSync(path.join(targetPath, 'subject.txt'), 'bounded evidence\nrepaired after scratch confirmation\n')
+        return { allAssignedItemsPass: true }
+      }
+      if (request.workItemId === 'independent-check-1-repair-1') {
+        return scratchPassResult({
+          candidateHash: request.candidateHash,
+          requestEnvelopeHash: decision.requestEnvelopeHash,
+          workItemId: request.workItemId,
+          oracleId: request.oracle,
+          checks: request.checks,
+          label: 'repaired primary scratch pass',
+        })
+      }
+      assert.equal(request.workItemId,
+        'independent-check-1-repair-1-scratch-confirmation-1')
+      return scratchPassResult({
+        candidateHash: request.candidateHash,
+        requestEnvelopeHash: decision.requestEnvelopeHash,
+        workItemId: request.workItemId,
+        oracleId: request.oracle,
+        checks: request.checks,
+        label: 'repaired independent scratch confirmation',
+      })
+    },
+    completeRetainedLease: () => {},
+    resumeAdoptedLaunches: async () => ({}),
+    resumeState: null,
+  })
+
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.deepEqual(launches, [
+    'work-1',
+    'independent-check-1',
+    'independent-check-1-runtime-retry-1',
+    'independent-check-1-scratch-confirmation-1',
+    'work-1-repair-1',
+    'independent-check-1-repair-1',
+    'independent-check-1-repair-1-scratch-confirmation-1',
+  ])
+  assert.equal(transitions.some(item => item.eventId === 'CHECK_INCONCLUSIVE'), true)
+  assert.equal(transitions.some(item => item.eventId === 'IMPLEMENTATION_DEFECT'), true)
+  assert.equal(transitions.some(item => item.eventId === 'REPAIR_READY'), true)
+  assert.equal(economicTarget.snapshot().launches,
+    topology.analystLaunches + launches.length)
+  assert.equal(topology.requiredChildLaunches, 7,
+    'the frozen seven-launch graph remains the economic target')
+  const schedulerMetrics = scheduler.getMetrics()
+  assert.equal(schedulerMetrics.counters.totalLaunches, 8)
+  assert.equal(schedulerMetrics.counters.requiredCompletionLaunches, 8)
+  assert.equal(schedulerMetrics.counters.requiredCompletionLaunchOverruns, 1)
+  assert.equal(schedulerMetrics.lanes.main.requiredCompletionLaunches, 8)
+  assert.equal(schedulerMetrics.lanes.main.requiredCompletionLaunchOverruns, 1)
+  assert.throws(() => economicTarget.recordLaunch(), error => error.code === 'BUDGET_EXHAUSTED')
+})
+
 test('read-only inspect/research routes complete DONE from a validated structured final response without a workspace diff', async t => {
   for (const requestedEffect of ['inspect', 'research']) {
     const targetPath = cleanRepository(t)
@@ -294,6 +696,196 @@ test('a mutate-classified zero-diff structured response always reaches independe
   assert.equal(transitions.some(item => item.eventId === 'IMPLEMENTATION_DEFECT'), false)
   assert.equal(transitions.some(item => item.eventId === 'INDEPENDENT_VERDICT_RECORDED'), true)
   assert.equal(transitions.some(item => item.eventId === 'ACCEPTANCE_GREEN'), true)
+})
+
+test('a structurally unbound checker PASS stays strict and does not launch the same full checker again', async t => {
+  for (const event of [
+    'CHECK_OBSERVATION_INCOMPLETE',
+    'CHECK_OBSERVATION_CONTRADICTION',
+  ]) {
+    for (const checkerCount of [1, 2]) {
+      const targetPath = cleanRepository(t)
+      const launches = []
+      const transitions = []
+      const outcome = await createDefaultRouteExecutor({
+        targetPath,
+        gitEnvironment: () => process.env,
+        transition: async (eventId, nextState, details) => {
+          transitions.push({ eventId, nextState, details })
+        },
+        harnessAttestation: () => ({ repoHash: H, buildHash: H, oracleHash: H }),
+        persistStructuredFinalResponse: structuredResponsePersistence(t),
+      })({
+        route: 'DIRECT', decision: readOnlyDecision('inspect', 1, checkerCount),
+        launch: async request => {
+          launches.push(request.workItemId)
+          if (request.workItemId === 'work-1') return structuredWorkerResult()
+          if (request.workItemId === 'independent-check-1') {
+            return structurallyUnboundPass(event)
+          }
+          assert.equal(request.workItemId, 'independent-check-2')
+          return passingCheckerResult(request)
+        },
+        completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+      })
+
+      assert.equal(outcome.outcome, 'PARTIAL', `${event}/C${checkerCount}`)
+      assert.equal(outcome.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE', event)
+      assert.deepEqual(launches, [
+        'work-1', 'independent-check-1',
+        ...(checkerCount === 2 ? ['independent-check-2'] : []),
+      ], event)
+      assert.equal(launches.some(id => id.includes('runtime-retry')), false, event)
+      assert.equal(transitions.some(item => item.eventId === 'IMPLEMENTATION_DEFECT'), false, event)
+      const inconclusive = transitions.find(item => item.eventId === 'CHECK_INCONCLUSIVE')
+      assert.ok(inconclusive, event)
+      assert.deepEqual(inconclusive.details.nextReadyWorkIds, [], event)
+      assert.equal(inconclusive.details.retryAttempt, 1, event)
+      assert.equal(inconclusive.details.controllerReassessment.code, event, event)
+    }
+  }
+})
+
+test('a distinct checker FAIL still repairs and freshly rechecks after an unbound PASS', async t => {
+  const targetPath = cleanRepository(t)
+  const decision = readOnlyDecision('mutate', 1, 2)
+  const failure = {
+    code: 'FAIL',
+    cause: {
+      event: 'ASSERTION_FAILED',
+      reason: 'The distinct black-box checker reproduced a concrete product defect.',
+      unblockPath: 'Repair the product and re-run both independent seats.',
+    },
+    payload: { findingIds: ['DISTINCT-CHECKER-DEFECT'] },
+  }
+  const receiptRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-distinct-fail-'))
+  t.after(() => fs.rmSync(receiptRoot, { recursive: true, force: true }))
+  const receiptPath = path.join(receiptRoot, 'independent-check-2.json')
+  const receiptBytes = Buffer.from(`${JSON.stringify(failure)}\n`)
+  fs.writeFileSync(receiptPath, receiptBytes)
+  const failurePointer = {
+    name: 'independent-check-2', path: receiptPath,
+    hash: crypto.createHash('sha256').update(receiptBytes).digest('hex'),
+    bytes: receiptBytes.length,
+  }
+  const launches = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath,
+    gitEnvironment: () => process.env,
+    transition: async () => {},
+    resultPointer: workItemId => workItemId === 'independent-check-2' ? failurePointer : null,
+    harnessAttestation: () => ({ repoHash: H, buildHash: H, oracleHash: H }),
+    persistStructuredFinalResponse: structuredResponsePersistence(t),
+  })({
+    route: 'DIRECT', decision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'work-1') return structuredWorkerResult()
+      if (request.workItemId === 'independent-check-1') return structurallyUnboundPass()
+      if (request.workItemId === 'independent-check-2') return failure
+      if (request.workItemId === 'work-1-repair-1') {
+        fs.writeFileSync(path.join(targetPath, 'subject.txt'), 'bounded evidence\nrepaired\n')
+        return { allAssignedItemsPass: true }
+      }
+      return passingCheckerResult(request)
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.deepEqual(launches, [
+    'work-1',
+    'independent-check-1',
+    'independent-check-2',
+    'work-1-repair-1',
+    'independent-check-1-repair-1',
+    'independent-check-2-repair-1',
+  ])
+  assert.equal(launches.some(id => id.includes('runtime-retry')), false)
+})
+
+test('resume collapses a durable f1de11a same-seat retry and still runs a distinct checker', async t => {
+  const targetPath = cleanRepository(t)
+  const decision = readOnlyDecision('inspect', 1, 2)
+  const workerResult = structuredWorkerResult()
+  const persistStructuredFinalResponse = structuredResponsePersistence(t)
+  let freezeDetails
+  await assert.rejects(createDefaultRouteExecutor({
+    targetPath,
+    gitEnvironment: () => process.env,
+    transition: async (eventId, _nextState, details) => {
+      if (eventId === 'ALL_WORK_JOINED') {
+        freezeDetails = details
+        throw Object.assign(new Error('crash before checker launch'), {
+          code: 'CRASH_BEFORE_CHECKER',
+        })
+      }
+    },
+    harnessAttestation: () => ({ repoHash: H, buildHash: H, oracleHash: H }),
+    persistStructuredFinalResponse,
+  })({
+    route: 'DIRECT', decision,
+    launch: async () => workerResult,
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  }), error => error.code === 'CRASH_BEFORE_CHECKER')
+
+  const checkerResult = structurallyUnboundPass('CHECK_OBSERVATION_CONTRADICTION')
+  const checkerResultHash = crypto.createHash('sha256')
+    .update(JSON.stringify(checkerResult)).digest('hex')
+  const receiptRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-unbound-pass-resume-'))
+  t.after(() => fs.rmSync(receiptRoot, { recursive: true, force: true }))
+  const receiptPath = path.join(receiptRoot, 'independent-check-1.json')
+  const receiptBytes = Buffer.from(`${JSON.stringify(checkerResult)}\n`)
+  fs.writeFileSync(receiptPath, receiptBytes)
+  const checkerPointer = {
+    name: 'independent-check-1', path: receiptPath,
+    hash: crypto.createHash('sha256').update(receiptBytes).digest('hex'),
+    bytes: receiptBytes.length,
+  }
+  const launches = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath,
+    gitEnvironment: () => process.env,
+    transition: async () => {},
+    readResult: workItemId => workItemId === 'work-1' ? workerResult
+      : workItemId === 'independent-check-1' ? checkerResult : null,
+    resultPointer: workItemId => workItemId === 'independent-check-1' ? checkerPointer : null,
+    verifyDurableResultReceipt: () => {},
+    harnessAttestation: () => ({ repoHash: H, buildHash: H, oracleHash: H }),
+    persistStructuredFinalResponse,
+  })({
+    route: 'DIRECT', decision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      assert.equal(request.workItemId, 'independent-check-2')
+      return passingCheckerResult(request)
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
+    resumeState: {
+      resumeState: 'CHECK_INCONCLUSIVE',
+      candidateHash: freezeDetails.candidateHash,
+      completedWorkIds: ['work-1'], completedCheckIds: [], acceptedResultIds: [],
+      // This is the obsolete full-checker retry frontier emitted by f1de11a.
+      nextReadyWorkIds: ['independent-check-1-runtime-retry-1'],
+      retryState: {
+        inconclusiveChecker: {
+          checkerId: 'independent-check-1',
+          candidateHash: freezeDetails.candidateHash,
+          checkerResultHash,
+          retryAttempt: 1,
+          returnState: 'CHECK_WORK',
+          controllerReassessment: {
+            code: 'CHECK_OBSERVATION_CONTRADICTION',
+            priorResultEvidenceHash: checkerResultHash,
+          },
+        },
+      },
+    },
+  })
+  assert.equal(outcome.outcome, 'PARTIAL', JSON.stringify(outcome))
+  assert.equal(outcome.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
+  assert.deepEqual(launches, ['independent-check-2'])
+  assert.equal(launches.some(id => id.includes('runtime-retry')), false)
 })
 
 test('a mutate-classified zero-diff response gets one checker-owned repair and a fresh repaired check', async t => {
@@ -550,20 +1142,34 @@ test('one empty worker plus one changed worker checks the aggregate artifact wit
   assert.deepEqual(launches, ['work-1', 'work-2', 'independent-check-1'])
 })
 
-test('a rejected W2 zero-diff repair cannot repeat after the fresh checker also FAILs', async t => {
+test('a fresh checker FAIL launches repair-2 and stops only when repair-2 makes no usable change', async t => {
   const targetPath = cleanRepository(t)
   const decision = readOnlyDecision('mutate', 2)
   const receiptRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-response-one-repair-'))
   t.after(() => fs.rmSync(receiptRoot, { recursive: true, force: true }))
   const receiptPointers = new Map()
   const launches = []
-  const failureFor = workItemId => ({
+  const failureFor = request => ({
     code: 'FAIL',
     cause: {
-      event: 'ASSERTION_FAILED', reason: `defect from ${workItemId}`,
+      event: 'ASSERTION_FAILED', reason: `defect from ${request.workItemId}`,
       unblockPath: 'Repair the requested implementation.',
     },
-    payload: { findingIds: [`DEFECT-${workItemId}`] },
+    payload: {
+      findingIds: [`DEFECT-${request.workItemId}`],
+      testOutcomes: (request.checks || []).map(command => ({
+        command,
+        status: 'FAIL',
+        fingerprint: crypto.createHash('sha256')
+          .update(`failure:${request.workItemId}:${command}`).digest('hex'),
+        observationId: crypto.createHash('sha256')
+          .update(`observation:${request.candidateHash}:${command}`).digest('hex'),
+        commandHash: crypto.createHash('sha256')
+          .update(`command:${request.workItemId}:${command}`).digest('hex'),
+        failureIdentity: crypto.createHash('sha256')
+          .update(`failure-identity:${request.workItemId}:${command}`).digest('hex'),
+      })),
+    },
   })
   const persistReceipt = (workItemId, result) => {
     const target = path.join(receiptRoot, `${workItemId}.json`)
@@ -591,7 +1197,10 @@ test('a rejected W2 zero-diff repair cannot repeat after the fresh checker also 
         fs.writeFileSync(path.join(targetPath, 'subject.txt'), 'bounded evidence\none repair\n')
         return { allAssignedItemsPass: true }
       }
-      return persistReceipt(request.workItemId, failureFor(request.workItemId))
+      if (request.workItemId === 'work-1-repair-2') {
+        return { allAssignedItemsPass: true }
+      }
+      return persistReceipt(request.workItemId, failureFor(request))
     },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
   })
@@ -601,8 +1210,12 @@ test('a rejected W2 zero-diff repair cannot repeat after the fresh checker also 
   assert.deepEqual(launches, [
     'work-1', 'work-2', 'independent-check-1',
     'work-1-repair-1', 'independent-check-1-repair-1',
+    'work-1-repair-2',
   ])
   assert.equal(launches.filter(id => id === 'work-1-repair-1').length, 1)
+  assert.equal(launches.filter(id => id === 'work-1-repair-2').length, 1)
+  assert.equal(fs.readFileSync(path.join(targetPath, 'subject.txt'), 'utf8'),
+    'bounded evidence\none repair\n')
 })
 
 test('W2 zero-diff repair resumes exactly once from the durable defect marker', async t => {

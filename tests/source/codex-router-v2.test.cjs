@@ -833,6 +833,35 @@ test('missing or malformed route-model output compiles one generic local complet
   }).status, 'ROUTE_DECIDED')
 })
 
+test('conservative completion trims schema-valid blank advisory prose without stopping pre-work', () => {
+  const advisory = recommendation()
+  advisory.whatTheUserWants = ['   ']
+  advisory.likelyAreas = [' src/task.js ', '   ']
+  advisory.howSuccessCanBeChecked = [' node --test focused.test.cjs ', '   ']
+  advisory.unknowns = ['   ']
+  advisory.risks = [' preserve unrelated behavior ']
+  const compiled = decisions.compileConservativeCompletionDecision({
+    requestedResult: 'Complete the exact requested task.',
+    requestEnvelopeHash: H,
+    targetIdentity: '.',
+    descriptiveRecommendation: advisory,
+    providerCapabilities: {
+      sameContextContinuation: true,
+      isolatedChecking: true,
+      stableChildIdentity: true,
+    },
+    budget: { remaining: { wallMs: 60_000 } },
+    nowMs: 1,
+  })
+
+  assert.equal(compiled.route, 'DIRECT')
+  assert.deepEqual(compiled.successChecklist, ['Complete the exact requested task.'])
+  assert.deepEqual(compiled.likelyAreas, ['src/task.js'])
+  assert.deepEqual(compiled.plannedChecks, ['node --test focused.test.cjs'])
+  assert.deepEqual(compiled.risks, ['preserve unrelated behavior'])
+  assert.equal(decisions.validateRouteDecision(compiled).valid, true)
+})
+
 test('automatic ROADMAP stays sequential unless work items prove disjoint mutable ownership', () => {
   const providerCapabilities = {
     sameContextContinuation: true, isolatedChecking: true, stableChildIdentity: true,

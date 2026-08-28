@@ -12,6 +12,7 @@ const ROOT = path.resolve(__dirname, '..', '..')
 const WORKFLOW = path.join(ROOT, 'agents', 'codex', 'workflow')
 const {
   activationAttestationPayload,
+  applyProductionRuntimeTransition,
   CodexExecAdapter,
   CodexSupervisorRuntime,
   CompatibilityRecoveryAuthority,
@@ -27,6 +28,7 @@ const {
   validatePlanCheckerSnapshot,
   canonicalCompletedCheckerId,
   canonicalizeCheckerVerificationLimitation,
+  controllerCheckerFailureIdentity,
   roadmapPlanOracleForWorkItem,
   checkerVerdictPassed,
   durableNextReadyAfter,
@@ -35,6 +37,8 @@ const {
   terminalFinalizationDiagnostics,
   createConcreteSupervisor,
   createDefaultRouteExecutor,
+  createCheckerObservationBinding,
+  createCheckerScratchFactory,
   codexPhysicalExecutionReceipt,
   createDefaultRuntimeOptions,
   createSupervisorOptions,
@@ -195,6 +199,49 @@ function checkerTestOutcomes(request, label = request.workItemId) {
   }))
 }
 
+function controllerBoundFailureOutcomes(request, semanticFailure, rawEvidence = semanticFailure) {
+  return (request.checks || []).map(command => ({
+    command,
+    status: 'FAIL',
+    fingerprint: crypto.createHash('sha256')
+      .update(`failure-output:${rawEvidence}:${command}`).digest('hex'),
+    commandHash: crypto.createHash('sha256')
+      .update(`controller-harness:${command}`).digest('hex'),
+    observationId: crypto.createHash('sha256')
+      .update(`controller-observation:${request.candidateHash}:${request.workItemId}:${command}`)
+      .digest('hex'),
+    failureIdentity: controllerCheckerFailureIdentity({
+      harnessCommandHash: crypto.createHash('sha256')
+        .update(`controller-harness:${command}`).digest('hex'),
+      failureCaseIds: [semanticFailure],
+    }, command),
+  }))
+}
+
+function controllerBoundSelectiveFailureOutcomes(request, failedCheckId, rawEvidence = failedCheckId) {
+  return (request.checks || []).map(command => {
+    const status = command === failedCheckId ? 'FAIL' : 'PASS'
+    const harnessCommandHash = crypto.createHash('sha256')
+      .update(`controller-harness:${command}`).digest('hex')
+    return {
+      command,
+      status,
+      fingerprint: crypto.createHash('sha256')
+        .update(`${status.toLowerCase()}-output:${rawEvidence}:${command}`).digest('hex'),
+      commandHash: harnessCommandHash,
+      observationId: crypto.createHash('sha256')
+        .update(`controller-observation:${request.candidateHash}:${request.workItemId}:${command}`)
+        .digest('hex'),
+      ...(status === 'FAIL' ? {
+        failureIdentity: controllerCheckerFailureIdentity({
+          harnessCommandHash,
+          failureCaseIds: [rawEvidence],
+        }, command),
+      } : {}),
+    }
+  })
+}
+
 function checkerSeatChecks(routeDecision, seat = 0) {
   const recipe = selectWorkRecipe({
     ...routeDecision.gateSelection,
@@ -203,12 +250,10 @@ function checkerSeatChecks(routeDecision, seat = 0) {
     runtimeSignals: routeDecision.runtimeSignals || {},
     overlaySteps: routeDecision.overlaySteps || routeDecision.overlayExecution || [],
   })
-  const checkerCount = routeDecision.independentCheckingPlan.checkerCount
   const named = [...new Set([
     ...recipe.checks, ...recipe.riskChecks, ...routeDecision.plannedChecks,
-  ])].filter((_, index) => checkerCount === 1 || index % checkerCount === seat)
+  ])]
   const obligations = (routeDecision.verificationObligations || [])
-    .filter((_, index) => index % checkerCount === seat)
     .flatMap(obligation => obligation.cases.map(item =>
       `verification:${obligation.id}:${item.id}`))
   return [...new Set([...named, ...obligations])]
@@ -380,14 +425,22 @@ test('checker contract and aggregate evidence defects trigger bounded evidence-b
     resumeState: null,
   })
 
-  assert.equal(result.outcome, 'PARTIAL', JSON.stringify(result))
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
   const checks = requests.filter(request => request.logicalRole.startsWith('independent-'))
   assert.deepEqual(checks.map(request => request.workItemId), [
     'independent-check-1',
     'independent-check-1-runtime-retry-1',
     'independent-check-2',
+    'independent-check-2-runtime-retry-1',
   ])
   assert.equal(checks.every(request => request.deferProofAcceptance === true), true)
+  assert.deepEqual(checks[0].checks, checks[2].checks,
+    'both independent checker seats receive the complete named acceptance matrix')
+  assert.deepEqual(
+    checks[0].fetchedEvidence.verificationObligations,
+    checks[2].fetchedEvidence.verificationObligations,
+    'both checker seats receive the complete verification-obligation matrix')
+  assert.ok(checks[0].checks.length > 0)
   const { stableStringify } = require(path.join(WORKFLOW, 'event-log.js'))
   assert.deepEqual(checks[1].evidenceHashes, [
     crypto.createHash('sha256').update(stableStringify({
@@ -405,11 +458,21 @@ test('checker contract and aggregate evidence defects trigger bounded evidence-b
   assert.deepEqual(checks[1].recoveryContext, {
     type: 'bounded-recovery', code: 'REFERENCE_METHOD_INVALID',
   })
-  assert.equal(checks[1].fetchedEvidence.controllerReassessment.code, 'REFERENCE_METHOD_INVALID')
-  assert.equal(result.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
-  assert.equal(result.terminalEnvelope.controllerReason, 'DUPLICATE_UNDERLYING_EVIDENCE')
+  assert.equal(checks[1].fetchedEvidence.controllerReportCorrection.code, 'REFERENCE_METHOD_INVALID')
+  assert.deepEqual(checks[1].fetchedEvidence.controllerReportCorrection.invalidFieldIds,
+    ['payload.referenceMethod'])
+  assert.equal(checks[3].fetchedEvidence.controllerReportCorrection.code,
+    'DUPLICATE_UNDERLYING_EVIDENCE')
+  assert.deepEqual(checks[3].fetchedEvidence.controllerReportCorrection.invalidFieldIds,
+    ['payload.evidenceIds'])
+  for (const correction of [checks[1], checks[3]]) {
+    assert.deepEqual(correction.checks, [])
+    assert.deepEqual(correction.verificationCommandBindings, [])
+    assert.equal(correction.fetchedEvidence.verificationDoctrine, undefined)
+    assert.match(correction.assignment, /do not rerun tools/u)
+  }
   assert.equal(transitions.filter(item => item.event === 'CHECK_INCONCLUSIVE').length, 2)
-  assert.equal(transitions.filter(item => item.event === 'INDEPENDENT_VERDICT_RECORDED').length, 0)
+  assert.equal(transitions.filter(item => item.event === 'INDEPENDENT_VERDICT_RECORDED').length, 2)
 })
 
 test('one-checker PASS still requires an independent reference method and only one physical reassessment', async t => {
@@ -418,6 +481,20 @@ test('one-checker PASS still requires an independent reference method and only o
     const targetPath = createTempGitTarget(directory)
     const requests = []
     const transitions = []
+    const priorReportSentinel = `private-prior-report-bytes-${repeatedDefect}`
+    const resultPointers = new Map()
+    const persistResult = (workItemId, result) => {
+      const resultPath = path.join(directory, `${workItemId}.json`)
+      const bytes = Buffer.from(`${JSON.stringify(result)}\n`)
+      fs.writeFileSync(resultPath, bytes)
+      resultPointers.set(workItemId, {
+        name: workItemId,
+        path: resultPath,
+        hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+        bytes: bytes.length,
+      })
+      return result
+    }
     const routeDecision = structuredClone(decision('DIRECT'))
     routeDecision.independentCheckingPlan = {
       checkerCount: 1,
@@ -428,6 +505,7 @@ test('one-checker PASS still requires an independent reference method and only o
       targetPath,
       gitEnvironment: () => process.env,
       transition: async (event, state, details) => transitions.push({ event, state, details }),
+      resultPointer: workItemId => resultPointers.get(workItemId),
       harnessAttestation: (candidateHash, oracle) => ({
         repoHash: candidateHash,
         buildHash: crypto.createHash('sha256').update('one-checker-method-build').digest('hex'),
@@ -444,16 +522,35 @@ test('one-checker PASS still requires an independent reference method and only o
           return { reportId: request.workItemId, allAssignedItemsPass: true }
         }
         const retry = request.workItemId.includes('runtime-retry')
-        return {
-          code: 'PASS',
+        const maliciousWideCorrection = retry && !repeatedDefect
+        const testOutcomes = checkerTestOutcomes(request)
+        if (maliciousWideCorrection) {
+          testOutcomes.splice(0, testOutcomes.length, ...testOutcomes.map(item => ({
+            ...item, status: 'FAIL',
+          })))
+        }
+        const checkerResult = {
+          code: maliciousWideCorrection ? 'FAIL' : 'PASS',
+          ...(maliciousWideCorrection ? {
+            cause: {
+              event: 'ASSERTION_FAILED',
+              reason: 'attempted top-level overwrite outside the correction scope',
+              unblockPath: 'must be ignored',
+            },
+            currentVersionHash: 'f'.repeat(64),
+          } : {}),
           payload: {
-            evidenceIds: [`evidence:${request.workItemId}`],
+            evidenceIds: [maliciousWideCorrection
+              ? 'evidence:attempted-overwrite' : `evidence:${request.workItemId}`],
+            controllerPrivatePriorReportBytes: maliciousWideCorrection
+              ? 'attempted-overwrite' : priorReportSentinel,
             ...(!retry || repeatedDefect ? {} : {
               referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
             }),
-            testOutcomes: checkerTestOutcomes(request),
+            testOutcomes,
           },
         }
+        return retry ? checkerResult : persistResult(request.workItemId, checkerResult)
       },
       completeRetainedLease: () => {},
       resumeAdoptedLaunches: async () => ({}),
@@ -472,10 +569,180 @@ test('one-checker PASS still requires an independent reference method and only o
     assert.equal(reassessment.details.controllerReason, 'REFERENCE_METHOD_INVALID')
     assert.deepEqual(reassessment.details.nextReadyWorkIds, ['independent-check-1-runtime-retry-1'])
     assert.equal(transitions.filter(item => item.event === 'CHECK_INCONCLUSIVE').length, 1)
+    const correction = requests.find(request => request.workItemId.endsWith('runtime-retry-1'))
+    assert.deepEqual(correction.reportCorrectionScope.invalidFieldIds, ['payload.referenceMethod'])
+    assert.deepEqual(correction.reportCorrectionScope.checkIds, [])
+    assert.match(correction.assignment, /Correct only the bounded checker report fields/u)
+    assert.doesNotMatch(correction.assignment, /Apply fetchedEvidence\.verificationDoctrine/u)
+    assert.equal(correction.fetchedEvidence.verificationDoctrine, undefined)
+    assert.deepEqual(correction.verificationCommandBindings, [])
+    assert.deepEqual(correction.checks, [])
+    assert.deepEqual(correction.evidencePointers, [resultPointers.get('independent-check-1')])
+    assert.deepEqual(
+      correction.fetchedEvidence.controllerReportCorrection.priorResultPointer,
+      resultPointers.get('independent-check-1'),
+    )
+    assert.equal(JSON.stringify(correction).includes(priorReportSentinel), false,
+      'the compact assignment carries only the prior result pointer, never its report bytes')
+    if (!repeatedDefect) {
+      assert.equal(result.outcome, 'DONE',
+        'a narrow reference-method correction cannot overwrite verdict, identity, or test outcomes')
+    }
     if (repeatedDefect) {
       assert.equal(result.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
       assert.equal(result.terminalEnvelope.controllerReason, 'REFERENCE_METHOD_INVALID')
     }
+  }
+})
+
+test('whole checker report correction changes only controller-authorized code and payload', async t => {
+  const directory = tempDirectory(t, 'autoprompt-whole-report-correction-')
+  const targetPath = createTempGitTarget(directory)
+  const routeDecision = structuredClone(decision('DIRECT'))
+  routeDecision.independentCheckingPlan = {
+    checkerCount: 1,
+    responsibilities: ['Independently validate the complete exact result.'],
+    nonOverlapReason: null,
+  }
+  const requests = []
+  const transitions = []
+  let priorResult
+  let correctionResult
+  const outcome = await createDefaultRouteExecutor({
+    targetPath,
+    gitEnvironment: () => process.env,
+    transition: async (event, state, details) => transitions.push({ event, state, details }),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash,
+      buildHash: crypto.createHash('sha256').update('whole-report-correction-build').digest('hex'),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT',
+    decision: routeDecision,
+    launch: async request => {
+      requests.push(request)
+      if (request.logicalRole === 'worker') {
+        fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'checked'\n")
+        return { allAssignedItemsPass: true }
+      }
+      if (!request.workItemId.includes('runtime-retry')) {
+        priorResult = {
+          code: 'NONCANONICAL_CHECKER_CODE',
+          description: 'prior description sentinel',
+          stateClass: 'intermediate',
+          runId: 'prior-run-sentinel',
+          requestEnvelopeHash: routeDecision.requestEnvelopeHash,
+          currentVersionHash: request.candidateHash,
+          cause: {
+            event: 'PRIOR_REPORT_INVALID',
+            reason: 'prior cause sentinel',
+            unblockPath: 'prior unblock sentinel',
+          },
+          payloadSchemaId: 'prior-payload-schema-sentinel',
+          payload: { priorPayloadSentinel: true },
+          contextId: 'prior-context-sentinel',
+          transportEvidence: { priorTransportSentinel: true },
+          evidenceHashes: ['a'.repeat(64)],
+          controllerOnlyAuditSentinel: 'preserve-me',
+        }
+        return priorResult
+      }
+      correctionResult = {
+        code: 'PASS',
+        description: 'attacker description must not cross the allowlist',
+        stateClass: 'resumable',
+        runId: 'attacker-run',
+        requestEnvelopeHash: 'f'.repeat(64),
+        currentVersionHash: 'e'.repeat(64),
+        cause: {
+          event: 'ATTACKER_CAUSE',
+          reason: 'attacker cause must not cross the allowlist',
+          unblockPath: null,
+        },
+        payloadSchemaId: 'attacker-payload-schema',
+        payload: {
+          evidenceIds: [`evidence:${request.workItemId}`],
+          referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
+          testOutcomes: checkerTestOutcomes(request),
+        },
+        contextId: 'attacker-context',
+        transportEvidence: { attackerTransport: true },
+        evidenceHashes: ['b'.repeat(64)],
+        attackerOnlyTopField: true,
+      }
+      return correctionResult
+    },
+    completeRetainedLease: () => {},
+    resumeAdoptedLaunches: async () => ({}),
+    resumeState: null,
+  })
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  const correction = requests.find(request => request.workItemId.endsWith('runtime-retry-1'))
+  assert.deepEqual(correction.reportCorrectionScope.invalidFieldIds, ['code', 'payload'])
+  assert.equal(correction.fetchedEvidence.verificationDoctrine, undefined)
+  assert.deepEqual(correction.verificationCommandBindings, [])
+  assert.match(correction.assignment, /do not rerun tools/u)
+  const expectedMerged = {
+    ...priorResult,
+    code: 'PASS',
+    description: 'The checked result satisfies every requirement assigned to this check.',
+    stateClass: 'terminal',
+    cause: {
+      event: 'CHECK_COMPLETED',
+      reason: 'The bounded report correction records a passing checker verdict.',
+      unblockPath: null,
+    },
+    payload: correctionResult.payload,
+  }
+  const verdict = transitions.find(item => item.event === 'INDEPENDENT_VERDICT_RECORDED')
+  assert.equal(
+    verdict.details.verdictHash,
+    crypto.createHash('sha256').update(JSON.stringify(expectedMerged)).digest('hex'),
+    'identity, transport, audit, context, evidence, cause, and schema fields stay controller-owned',
+  )
+})
+
+test('noncanonical checker correction scopes are rejected before any retry can launch', () => {
+  const resultHash = 'a'.repeat(64)
+  const basePayload = {
+    eventId: 'CHECK_INCONCLUSIVE',
+    nextState: 'CHECK_INCONCLUSIVE',
+    details: {
+      candidateHash: 'b'.repeat(64),
+      checkerId: 'independent-check-1',
+      checkerResultHash: resultHash,
+      retryAttempt: 1,
+      nextReadyWorkIds: ['independent-check-1-runtime-retry-1'],
+    },
+  }
+  const authority = {
+    stateStore: { load: () => ({ state: 'CHECK_WORK', retryState: {} }) },
+    capability: {},
+    budgetController: {},
+  }
+  for (const controllerReassessment of [
+    {
+      code: 'REFERENCE_METHOD_INVALID', priorResultEvidenceHash: resultHash,
+      invalidFieldIds: ['code', 'payload.referenceMethod'], checkIds: [],
+    },
+    {
+      code: 'TEST_OUTCOMES_INVALID', priorResultEvidenceHash: resultHash,
+      invalidFieldIds: ['payload.testOutcomes'], checkIds: [],
+    },
+    {
+      code: 'CHECK_REPORT_INVALID', priorResultEvidenceHash: resultHash,
+      invalidFieldIds: ['code', 'payload'], checkIds: [],
+    },
+    {
+      code: 'CHECK_INCONCLUSIVE', priorResultEvidenceHash: resultHash,
+      invalidFieldIds: ['payload.evidenceIds'], checkIds: [],
+    },
+  ]) {
+    assert.throws(() => applyProductionRuntimeTransition(authority, {
+      ...basePayload,
+      details: { ...basePayload.details, controllerReassessment },
+    }), error => error.code === 'CHECK_RETRY_STATE_INVALID')
   }
 })
 
@@ -536,13 +803,29 @@ test('checker PASS with a failed named outcome is non-authoritative and gets one
       'independent-check-1', 'independent-check-1-runtime-retry-1',
     ])
     assert.equal(transitions.filter(item => item.event === 'CHECK_INCONCLUSIVE').length, 1)
+    const correction = requests.find(request => request.workItemId.endsWith('runtime-retry-1'))
+    assert.ok(correction.reportCorrectionScope, JSON.stringify({
+      recoveryContext: correction.recoveryContext,
+      fetchedEvidence: correction.fetchedEvidence,
+    }))
+    assert.deepEqual(correction.reportCorrectionScope.invalidFieldIds, ['payload.testOutcomes'])
+    assert.deepEqual(correction.reportCorrectionScope.checkIds, [correction.checks[0]])
+    assert.equal(correction.checks.length, 1)
+    assert.deepEqual(correction.checks, correction.reportCorrectionScope.checkIds)
+    assert.match(correction.assignment, /do not rerun tools/u)
+    assert.deepEqual(correction.verificationCommandBindings, [])
+    assert.equal(correction.fetchedEvidence.verificationObligations, undefined)
+    assert.equal(
+      correction.fetchedEvidence.controllerReportCorrection.priorReportProjection.kind,
+      'bounded-checker-report-projection',
+    )
     if (repeatedDefect) {
       assert.equal(result.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
     }
   }
 })
 
-test('malformed adapter checker output becomes durable non-authoritative evidence and physically retries', async t => {
+test('late checker binding mismatch preserves bound evidence without rerunning the matrix', async t => {
   const directory = tempDirectory(t, 'autoprompt-malformed-checker-retry-')
   const targetPath = createTempGitTarget(directory)
   const routeDecision = decision('DIRECT')
@@ -579,6 +862,22 @@ test('malformed adapter checker output becomes durable non-authoritative evidenc
           currentVersionHash: request.candidateHash,
           candidateHash: request.candidateHash,
           contextId: 'checker-context-1', usage: ZERO_USAGE, usageStreamed: false,
+          transportEvidence: {
+            verificationObservations: {
+              count: 1,
+              evidenceHash: crypto.createHash('sha256')
+                .update(`bound-observation:${request.workItemId}`).digest('hex'),
+            },
+          },
+          payload: {
+            evidenceIds: [`evidence:bound:${request.workItemId}`],
+            referenceMethod: checkerReferenceMethod(
+              request.workItemId.startsWith('independent-check-1')
+                ? 'black-box-boundary' : 'authoritative-suite',
+              request.workItemId,
+            ),
+            testOutcomes: checkerTestOutcomes(request),
+          },
         }
         const error = Object.assign(new Error('checker binding rejected'), {
           code: 'CHECK_REPORT_INVALID',
@@ -600,32 +899,18 @@ test('malformed adapter checker output becomes durable non-authoritative evidenc
           onTerminalResult: receipt => persisted.push(receipt),
         }, 'run-malformed-checker')
       }
-      return {
-        schemaVersion: '2.0.0', code: 'PASS',
-        runId: 'run-malformed-checker', requestEnvelopeHash: routeDecision.requestEnvelopeHash,
-        currentVersionHash: request.candidateHash, candidateHash: request.candidateHash,
-        payload: {
-          evidenceIds: [`evidence:fresh:${request.workItemId}`],
-          referenceMethod: checkerReferenceMethod(
-            request.workItemId.startsWith('independent-check-1')
-              ? 'black-box-boundary' : 'authoritative-suite',
-            request.workItemId,
-          ),
-          testOutcomes: checkerTestOutcomes(request),
-        },
-      }
+      assert.fail(`late binding repair must not relaunch ${request.workItemId}`)
     },
   })
 
   assert.equal(result.outcome, 'DONE', JSON.stringify(result))
   assert.equal(persisted.length >= 1, true)
-  assert.equal(persisted[0].code, 'RUNTIME_FAILURE')
-  assert.equal(persisted[0].payload.rejectedCode, 'CHECK_REPORT_INVALID')
+  assert.equal(persisted[0].code, 'PASS')
+  assert.equal(persisted[0].runId, 'run-malformed-checker')
+  assert.equal(persisted[0].transportEvidence.verificationObservations.count, 1)
   const checkRequests = requests.filter(request => request.logicalRole.startsWith('independent-'))
-  assert.deepEqual(checkRequests.slice(0, 2).map(request => request.workItemId), [
-    'independent-check-1', 'independent-check-1-runtime-retry-1',
-  ])
-  assert.equal(checkRequests[1].fetchedEvidence.controllerReassessment.code, 'RUNTIME_FAILURE')
+  assert.deepEqual(checkRequests.map(request => request.workItemId), ['independent-check-1'])
+  assert.equal(checkRequests.some(request => request.workItemId.includes('runtime-retry')), false)
 })
 
 test('every independent checker PASS stays provisional until evidence consumption validates', async t => {
@@ -668,7 +953,16 @@ test('every independent checker PASS stays provisional until evidence consumptio
     'independent-check-1', 'independent-check-1-runtime-retry-1', 'independent-check-2',
   ])
   assert.equal(checks.every(check => check.deferProofAcceptance === true), true)
-  assert.equal(checks[1].fetchedEvidence.controllerReassessment.code, 'EVIDENCE_CONSUMPTION_INVALID')
+  assert.equal(checks[1].fetchedEvidence.controllerReportCorrection.code, 'EVIDENCE_CONSUMPTION_INVALID')
+  assert.deepEqual(checks[1].reportCorrectionScope.invalidFieldIds, ['payload.evidenceIds'])
+  assert.deepEqual(checks[1].reportCorrectionScope.checkIds, [])
+  assert.deepEqual(checks[1].checks, [])
+  assert.deepEqual(checks[1].verificationCommandBindings, [])
+  assert.equal(checks[1].fetchedEvidence.verificationDoctrine, undefined)
+  assert.equal(
+    checks[1].fetchedEvidence.controllerReportCorrection.priorReportProjection.kind,
+    'bounded-checker-report-projection',
+  )
 })
 
 test('checker PASS with a failed named outcome is never cached as accepted proof', async t => {
@@ -2156,6 +2450,56 @@ test('full runtime composes provider retry, checker correction, bounded-fresh re
   assert.equal(result.scheduler.limits.maxChildLaunches, 6)
   assert.equal(result.scheduler.counters.rejectedByCode.LAUNCH_LIMIT || 0, 0)
 })
+
+test('DONE retry keeps its private promotion transaction across one repair transport successor', async t => {
+  const fixture = configureRoadmapCompositionHarness(t, [], {
+    completeProduct: true,
+    doneRetryPromotion: true,
+    transportFailureOnRepairBase: true,
+    productCheckerCodes: ['FAIL', 'PASS'],
+  })
+
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+  const launchedIds = fixture.harness.launches.map(launch => launch.workItemId)
+
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.deepEqual(launchedIds, [
+    'work-1', 'independent-check-1',
+    'work-1-repair-1', 'work-1-repair-1-transport-retry-1',
+    'independent-check-1-repair-1',
+  ])
+  assert.equal(fixture.deferredPromotionState().status, 'PROMOTED')
+  assert.equal(
+    fs.readFileSync(path.join(fixture.harness.runtimeOptions.targetPath, 'src', 'example.js'), 'utf8'),
+    "module.exports = 'work-1-repair-1-transport-retry-1'\n",
+  )
+})
+
+test('DONE retry aborts its private promotion when the sole repair transport successor times out', async t => {
+  const fixture = configureRoadmapCompositionHarness(t, [], {
+    completeProduct: true,
+    doneRetryPromotion: true,
+    transportFailureOnRepairBase: true,
+    transportFailureOnRepairSuccessor: true,
+    productCheckerCodes: ['FAIL'],
+  })
+
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+  const launchedIds = fixture.harness.launches.map(launch => launch.workItemId)
+
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'CHILD_TRANSPORT_TIMEOUT')
+  assert.deepEqual(launchedIds, [
+    'work-1', 'independent-check-1',
+    'work-1-repair-1', 'work-1-repair-1-transport-retry-1',
+  ])
+  assert.equal(fixture.deferredPromotionState().status, 'ABORTED')
+  assert.equal(
+    fs.readFileSync(path.join(fixture.harness.runtimeOptions.targetPath, 'src', 'example.js'), 'utf8'),
+    "module.exports = 'ready'\n",
+  )
+})
+
 test('checker recovery helpers enforce plan-stage adoption, canonical retry completion, PASS-only frontier, and diagnostics', () => {
   assert.equal(adoptedLeaseMatchesStage('ROADMAP', 'plan-checker', 'work'), true)
   assert.equal(adoptedLeaseMatchesStage('ROADMAP', 'plan-checker', 'check'), false)
@@ -3156,6 +3500,194 @@ test('DONE retry keeps its isolated candidate unpromoted until the final accepta
   assert.equal(inconclusive.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
   assert.equal(inconclusive.terminalEnvelope.usableCandidatePreserved, true)
   assert.deepEqual(inconclusiveEvents, ['aborted:independent checker remained non-authoritative'])
+})
+
+test('DONE retry repairs its private candidate and promotes only after the repaired PASS join', async t => {
+  const directory = tempDirectory(t, 'autoprompt-done-retry-private-repair-')
+  const targetPath = createTempGitTarget(directory)
+  const targetBefore = fs.readFileSync(path.join(targetPath, 'src', 'example.js'), 'utf8')
+  const privateCandidate = path.join(directory, 'private-repair-candidate')
+  fs.cpSync(targetPath, privateCandidate, { recursive: true })
+  fs.writeFileSync(path.join(privateCandidate, 'src', 'example.js'),
+    "module.exports = 'isolated-defect'\n")
+  const initialCandidateHash = testWorkspaceCandidateHash(privateCandidate)
+  const priorDoneCandidateHash = 'a'.repeat(64)
+  const isolationCertificateHash = 'c'.repeat(64)
+  const acceptanceJoinHash = 'e'.repeat(64)
+  const routeDecision = decision('DIRECT')
+  routeDecision.normalizedRouteFacts.capturedIncidentDomains = ['DONE_RETRY_PROMOTION']
+  routeDecision.capturedDomainContracts = [{
+    schemaVersion: '1.0.0', kind: 'DONE_RETRY_PROMOTION', priorDoneCandidateHash,
+    isolationCertificateHash, requiredAcceptanceIds: ['focused'],
+  }]
+  const pointers = new Map()
+  const persist = (workItemId, result) => {
+    const resultPath = path.join(directory, `${workItemId}.json`)
+    fs.writeFileSync(resultPath, `${JSON.stringify(result)}\n`)
+    const bytes = fs.readFileSync(resultPath)
+    pointers.set(workItemId, {
+      name: workItemId, path: resultPath, bytes: bytes.length,
+      hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+    })
+    return result
+  }
+  let commitCount = 0
+  let abortCount = 0
+  let repairedCandidateHash = null
+  const deferredPromotion = {
+    token: 'deferred-private-repair-token',
+    candidateHash: initialCandidateHash,
+    workspacePath: privateCandidate,
+    async commit(join) {
+      commitCount += 1
+      assert.equal(join.candidateHash, repairedCandidateHash)
+      assert.equal(fs.readFileSync(path.join(targetPath, 'src', 'example.js'), 'utf8'), targetBefore)
+      fs.copyFileSync(path.join(privateCandidate, 'src', 'example.js'),
+        path.join(targetPath, 'src', 'example.js'))
+    },
+    async abort() { abortCount += 1 },
+  }
+  const launches = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath, gitEnvironment: () => process.env, transition: async () => {},
+    resultPointer: workItemId => pointers.get(workItemId),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+    writeCapturedDomainAdmission: () => {},
+  })({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'work-1') return { deferredPromotion }
+      if (request.workItemId === 'independent-check-1') {
+        return persist(request.workItemId, {
+          code: 'FAIL',
+          cause: { event: 'ASSERTION_FAILED', reason: 'private defect A', unblockPath: 'repair' },
+          payload: {
+            findingIds: ['PRIVATE-A'],
+            testOutcomes: controllerBoundFailureOutcomes(request, 'PRIVATE-A'),
+          },
+        })
+      }
+      if (request.workItemId === 'work-1-repair-1') {
+        assert.equal(request.deferredPromotionRepairToken, deferredPromotion.token)
+        assert.equal(request.candidateHash, initialCandidateHash)
+        assert.equal(fs.readFileSync(path.join(targetPath, 'src', 'example.js'), 'utf8'), targetBefore)
+        fs.writeFileSync(path.join(privateCandidate, 'src', 'example.js'),
+          "module.exports = 'isolated-repaired-pass'\n")
+        repairedCandidateHash = testWorkspaceCandidateHash(privateCandidate)
+        return { allAssignedItemsPass: true, filesChanged: ['src/example.js'] }
+      }
+      assert.equal(request.workItemId, 'independent-check-1-repair-1')
+      assert.equal(request.candidateHash, repairedCandidateHash)
+      assert.equal(fs.readFileSync(path.join(targetPath, 'src', 'example.js'), 'utf8'), targetBefore)
+      return {
+        code: 'PASS', currentVersionHash: request.candidateHash,
+        payload: {
+          evidenceIds: ['evidence:private-repaired-pass'],
+          referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
+          testOutcomes: checkerTestOutcomes(request),
+          capturedDomainOutcomes: [{
+            schemaVersion: '1.0.0', kind: 'DONE_RETRY_PROMOTION', priorDoneCandidateHash,
+            isolationCertificateHash, retryCandidateHash: request.candidateHash,
+            isolatedWorktreeHash: 'd'.repeat(64), isolationVerified: true,
+            acceptanceResults: [{ id: 'focused', status: 'PASS', evidenceHash: 'f'.repeat(64) }],
+            acceptanceJoinHash, promotionCandidateHash: request.candidateHash,
+          }],
+        },
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.equal(commitCount, 1)
+  assert.equal(abortCount, 0)
+  assert.equal(fs.readFileSync(path.join(targetPath, 'src', 'example.js'), 'utf8'),
+    "module.exports = 'isolated-repaired-pass'\n")
+  assert.deepEqual(launches, [
+    'work-1', 'independent-check-1', 'work-1-repair-1', 'independent-check-1-repair-1',
+  ])
+})
+
+test('DONE retry recurring private failure aborts without promoting target bytes', async t => {
+  const directory = tempDirectory(t, 'autoprompt-done-retry-private-recurrence-')
+  const targetPath = createTempGitTarget(directory)
+  const targetBefore = fs.readFileSync(path.join(targetPath, 'src', 'example.js'), 'utf8')
+  const privateCandidate = path.join(directory, 'private-recurrence-candidate')
+  fs.cpSync(targetPath, privateCandidate, { recursive: true })
+  fs.writeFileSync(path.join(privateCandidate, 'src', 'example.js'),
+    "module.exports = 'isolated-recurring-defect'\n")
+  const routeDecision = decision('DIRECT')
+  routeDecision.normalizedRouteFacts.capturedIncidentDomains = ['DONE_RETRY_PROMOTION']
+  routeDecision.capturedDomainContracts = [{
+    schemaVersion: '1.0.0', kind: 'DONE_RETRY_PROMOTION',
+    priorDoneCandidateHash: 'a'.repeat(64), isolationCertificateHash: 'c'.repeat(64),
+    requiredAcceptanceIds: ['focused'],
+  }]
+  const pointers = new Map()
+  const persist = (workItemId, result) => {
+    const resultPath = path.join(directory, `${workItemId}.json`)
+    fs.writeFileSync(resultPath, `${JSON.stringify(result)}\n`)
+    const bytes = fs.readFileSync(resultPath)
+    pointers.set(workItemId, {
+      name: workItemId, path: resultPath, bytes: bytes.length,
+      hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+    })
+    return result
+  }
+  let abortCount = 0
+  let commitCount = 0
+  const deferredPromotion = {
+    token: 'deferred-private-recurrence-token',
+    candidateHash: testWorkspaceCandidateHash(privateCandidate),
+    workspacePath: privateCandidate,
+    async commit() { commitCount += 1 },
+    async abort() { abortCount += 1 },
+  }
+  const launches = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath, gitEnvironment: () => process.env, transition: async () => {},
+    resultPointer: workItemId => pointers.get(workItemId),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+    writeCapturedDomainAdmission: () => {},
+  })({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'work-1') return { deferredPromotion }
+      if (request.workItemId === 'work-1-repair-1') {
+        assert.equal(request.deferredPromotionRepairToken, deferredPromotion.token)
+        fs.writeFileSync(path.join(privateCandidate, 'src', 'example.js'),
+          "module.exports = 'isolated-change-same-defect'\n")
+        return { allAssignedItemsPass: true, filesChanged: ['src/example.js'] }
+      }
+      const failure = {
+        code: 'FAIL',
+        cause: { event: 'ASSERTION_FAILED', reason: 'recurring private defect A', unblockPath: 'repair' },
+        payload: {
+          findingIds: ['PRIVATE-A'],
+          testOutcomes: controllerBoundFailureOutcomes(request, 'PRIVATE-A'),
+        },
+      }
+      return persist(request.workItemId, failure)
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+
+  assert.equal(outcome.outcome, 'FAILED', JSON.stringify(outcome))
+  assert.equal(outcome.terminalEnvelope.cause.reason, 'recurring private defect A')
+  assert.equal(commitCount, 0)
+  assert.equal(abortCount, 1)
+  assert.equal(fs.readFileSync(path.join(targetPath, 'src', 'example.js'), 'utf8'), targetBefore)
+  assert.deepEqual(launches, [
+    'work-1', 'independent-check-1', 'work-1-repair-1', 'independent-check-1-repair-1',
+  ])
 })
 
 test('deferred DONE promotion survives separate-process restarts at every CAS/state/finalize window exactly once', t => {
@@ -4304,7 +4836,7 @@ test('AP-RUN-030 an overlong wall target clamps locally and still completes prod
   })
 })
 
-test('AP-RUN-030 essential execution may cross its target while the final-verification reserve remains recorded', async t => {
+test('AP-RUN-030 custom executor cannot start unclassified work inside the final-verification reserve', async t => {
   const wallNowMs = Date.parse('2026-08-23T10:00:00.000Z')
   const declared = run030Deadline(new Date(wallNowMs + 1_000).toISOString())
   let launchError = null
@@ -4349,8 +4881,8 @@ test('AP-RUN-030 essential execution may cross its target while the final-verifi
     launched: harness.launches.some(item => item.workItemId === 'reserve-overrun'),
     verificationReserveMs: result.budget.verificationReserveMs,
   }, {
-    launchErrorCode: null,
-    launched: true,
+    launchErrorCode: 'FINAL_VERIFICATION_RESERVE_REQUIRED',
+    launched: false,
     verificationReserveMs: 250,
   })
 })
@@ -5045,10 +5577,10 @@ test('run-global elapsed target records its overrun without discarding a require
   assert.ok(result.budget.consumedWallMs >= 101)
 })
 
-test('undersized global launch target still reaches a direct result through admitted required identities', async t => {
+test('custom route executor cannot mint required-completion authority beyond an economic launch target', async t => {
   const harness = makeHarness(t, { launchLimit: 1 })
-  // Custom embedding knobs are economic hints. They must not override the
-  // authenticated completion graph with a one-launch hard clamp.
+  // Custom embedding knobs are economic hints, but an injected executor is
+  // not the controller-owned completion graph and cannot mint an override.
   harness.runtimeOptions.maxChildLaunches = 1
   harness.runtimeOptions.lanes = { main: { maxLaunches: 1 } }
   const accountingLaunches = []
@@ -5062,21 +5594,67 @@ test('undersized global launch target still reaches a direct result through admi
     await launch({
       workItemId: 'required-direct-result', logicalRole: 'worker', parent: 'run-owner',
       purpose: 'work', missionEssential: true,
+      requiredCompletion: true,
+      requiredCompletionBinding: { forged: true },
       assignment: 'Produce the required direct result after the economic launch target.',
       success: ['The direct result is usable.'], checks: ['focused completion check'],
     })
     return usableDoneFixture(harness, 'undersized-launch-direct-result')
   }
   const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
-  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.equal(result.outcome, 'PARTIAL', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'BUDGET_EXHAUSTED')
   assert.equal(result.scheduler.limits.maxChildLaunches, 7)
   assert.equal(result.scheduler.lanes.main.limits.maxLaunches, 7)
-  assert.equal(result.budget.launches, 2,
-    'route analysis plus required product work may cross the one-launch economic target')
-  assert.equal(accountingLaunches.length, 2)
-  assert.equal(accountingLaunches.every(item => item.requiredCompletion === true &&
-    item.cause.requiredCompletion === true), true)
+  assert.equal(result.budget.launches, 1)
+  assert.equal(accountingLaunches.length, 1)
+  assert.equal(accountingLaunches[0].requiredCompletion, false)
+  assert.equal(harness.launches.some(item => item.workItemId === 'required-direct-result'), false)
   assert.throws(() => harness.budget.recordLaunch(), error => error.code === 'BUDGET_EXHAUSTED')
+})
+
+test('built-in deterministic executor crosses an economic launch target for its branded finite graph', async t => {
+  const fixture = configureRoadmapCompositionHarness(t, [], {
+    completeProduct: true,
+    launchLimit: 1,
+    productCheckerCodes: ['FAIL', 'PASS'],
+  })
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.deepEqual(fixture.harness.launches.map(item => item.workItemId), [
+    'work-1', 'independent-check-1',
+    'work-1-repair-1', 'independent-check-1-repair-1',
+  ])
+  assert.equal(result.budget.launches, 4)
+  assert.equal(result.scheduler.counters.requiredCompletionLaunches, 4)
+  assert.equal(result.scheduler.counters.requiredCompletionLaunchOverruns > 0, false,
+    'the controller brand crosses the runtime economic target without falsifying scheduler topology')
+  for (const workItemId of [
+    'work-1', 'independent-check-1',
+    'work-1-repair-1', 'independent-check-1-repair-1',
+  ]) {
+    assert.match(
+      fixture.routeRequests.get(workItemId).assignment,
+      /Keep model-visible command output bounded/u,
+    )
+  }
+})
+
+test('built-in deterministic verification starts after an elapsed wall target and still returns DONE', async t => {
+  const fixture = configureRoadmapCompositionHarness(t, [], {
+    completeProduct: true,
+    wallMs: 100,
+    advanceAfterInitialWorkerMs: 101,
+  })
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.deepEqual(fixture.harness.launches.map(item => item.workItemId), [
+    'work-1', 'independent-check-1',
+  ])
+  assert.equal(result.budget.consumedWallMs >= 101, true)
+  assert.equal(result.scheduler.counters.requiredCompletionLaunches, 2)
 })
 
 test('route activation rejects malformed lane containers before topology normalization', async t => {
@@ -6572,10 +7150,10 @@ test('C0 framework orchestration rejects direct spawn, validator bypass, empty f
   )
 })
 
-test('C0 framework candidate survives restart and FAIL returns numbered findings to the same generator before PASS', async () => {
+test('C0 framework candidate survives validator restart without regeneration', async () => {
   let durable = null
   const snapshots = []
-  let crashRepair = true
+  let crashValidation = true
   const generatorCalls = []
   const validatorCalls = []
   const binding = frameworkAuthorityBinding()
@@ -6585,106 +7163,107 @@ test('C0 framework candidate survives restart and FAIL returns numbered findings
   }
   const generate = async handoff => {
     generatorCalls.push(structuredClone(handoff))
-    if (handoff.attempt === 2 && crashRepair) {
-      crashRepair = false
-      throw Object.assign(new Error('simulated coordinator crash before repair result'), { code: 'SIMULATED_CRASH' })
-    }
     return {
       generatorIdentity: 'C0/framework-generator', generation: handoff.receipt.generation,
       assignmentId: handoff.receipt.assignmentId, findingIds: handoff.receipt.findingIds,
-      candidate: { ...generatedFrameworkCandidate(), frameworkId: `generated-framework-${handoff.attempt}` },
+      candidate: generatedFrameworkCandidate(),
     }
   }
   const validate = async handoff => {
     validatorCalls.push(structuredClone(handoff))
+    if (crashValidation) {
+      crashValidation = false
+      throw Object.assign(new Error('simulated coordinator crash during validation'), {
+        code: 'SIMULATED_CRASH',
+      })
+    }
     return {
       validatorIdentity: 'C0/independent-framework-validator', generation: handoff.receipt.generation,
       assignmentId: handoff.receipt.assignmentId, findingIds: handoff.receipt.findingIds,
       candidateHash: handoff.candidateHash,
-      status: handoff.attempt === 1 ? 'FAIL' : 'PASS',
-      findings: handoff.attempt === 1
-        ? [{ id: 'FRAMEWORK-FINDING-001', message: 'Add the missing independent-check edge.' }]
-        : [],
+      status: 'PASS', findings: [],
     }
   }
 
-  const firstProcess = new FrameworkOrchestrationAuthority({ binding, ...storage, generate, validate, maxAttempts: 3 })
+  const firstProcess = new FrameworkOrchestrationAuthority({ binding, ...storage, generate, validate })
   await assert.rejects(
     () => firstProcess.run({ caller: 'deterministic-control-plane' }),
     error => error.code === 'SIMULATED_CRASH',
   )
-  assert.equal(durable.status, 'VALIDATION_FAILED')
-  assert.deepEqual(durable.validatorReceipt.findings.map(item => item.id), ['FRAMEWORK-FINDING-001'])
+  assert.equal(durable.status, 'CANDIDATE_READY')
+  const persistedCandidateHash = durable.candidateHash
 
-  const resumedProcess = new FrameworkOrchestrationAuthority({ binding, ...storage, generate, validate, maxAttempts: 3 })
+  const resumedProcess = new FrameworkOrchestrationAuthority({ binding, ...storage, generate, validate })
   const admitted = await resumedProcess.run({ caller: 'deterministic-control-plane' })
   assert.equal(admitted.status, 'ADMITTED')
   assert.equal(admitted.generatorIdentity, 'C0/framework-generator')
   assert.equal(admitted.validatorReceipt.status, 'PASS')
-  assert.deepEqual(generatorCalls.map(call => call.attempt), [1, 2, 2])
-  assert.deepEqual(generatorCalls.at(-1).repairFindingIds, ['FRAMEWORK-FINDING-001'])
+  assert.equal(admitted.candidateHash, persistedCandidateHash)
+  assert.deepEqual(generatorCalls.map(call => call.attempt), [1])
+  assert.deepEqual(validatorCalls.map(call => call.attempt), [1, 1])
   assert.ok(snapshots.some(state => state.status === 'CANDIDATE_READY'))
-  assert.ok(snapshots.some(state => state.status === 'VALIDATION_FAILED'))
   assert.equal(snapshots.at(-1).status, 'ADMITTED')
 })
 
-test('C0 framework repair rejects a different author and repeated validation failure is bounded default-fail', async () => {
+test('C0 framework validation FAIL blocks once with exact findings and remains tamper evident', async () => {
   let durable = null
+  let generatorCalls = 0
+  let validatorCalls = 0
   const binding = frameworkAuthorityBinding()
   const storage = {
     readState: () => durable && structuredClone(durable),
     writeState: state => { durable = structuredClone(state) },
   }
-  const differentAuthor = new FrameworkOrchestrationAuthority({
-    binding, ...storage, maxAttempts: 3,
-    generate: async handoff => ({
-      generatorIdentity: handoff.attempt === 1 ? 'C0/framework-generator' : 'C0/different-generator',
-      generation: handoff.receipt.generation, assignmentId: handoff.receipt.assignmentId,
-      findingIds: handoff.receipt.findingIds, candidate: generatedFrameworkCandidate(),
-    }),
-    validate: async handoff => ({
-      validatorIdentity: 'C0/independent-framework-validator', generation: handoff.receipt.generation,
-      assignmentId: handoff.receipt.assignmentId, findingIds: handoff.receipt.findingIds,
-      candidateHash: handoff.candidateHash, status: 'FAIL',
-      findings: [{ id: 'FRAMEWORK-FINDING-001', message: 'Repair required.' }],
-    }),
+  const authority = new FrameworkOrchestrationAuthority({
+    binding, ...storage,
+    generate: async handoff => {
+      generatorCalls += 1
+      return {
+        generatorIdentity: 'C0/framework-generator', generation: handoff.receipt.generation,
+        assignmentId: handoff.receipt.assignmentId, findingIds: handoff.receipt.findingIds,
+        candidate: generatedFrameworkCandidate(),
+      }
+    },
+    validate: async handoff => {
+      validatorCalls += 1
+      return {
+        validatorIdentity: 'C0/independent-framework-validator', generation: handoff.receipt.generation,
+        assignmentId: handoff.receipt.assignmentId, findingIds: handoff.receipt.findingIds,
+        candidateHash: handoff.candidateHash, status: 'FAIL',
+        findings: [{ id: 'FRAMEWORK-FINDING-001', message: 'Exact structural defect.' }],
+      }
+    },
   })
   await assert.rejects(
-    () => differentAuthor.run({ caller: 'deterministic-control-plane' }),
-    error => error.code === 'FRAMEWORK_REPAIR_AUTHOR_MISMATCH',
-  )
-
-  durable = null
-  const bounded = new FrameworkOrchestrationAuthority({
-    binding, ...storage, maxAttempts: 2,
-    generate: async handoff => ({
-      generatorIdentity: 'C0/framework-generator', generation: handoff.receipt.generation,
-      assignmentId: handoff.receipt.assignmentId, findingIds: handoff.receipt.findingIds,
-      candidate: generatedFrameworkCandidate(),
-    }),
-    validate: async handoff => ({
-      validatorIdentity: 'C0/independent-framework-validator', generation: handoff.receipt.generation,
-      assignmentId: handoff.receipt.assignmentId, findingIds: handoff.receipt.findingIds,
-      candidateHash: handoff.candidateHash, status: 'FAIL',
-      findings: [{ id: `FRAMEWORK-FINDING-00${handoff.attempt}`, message: 'Still invalid.' }],
-    }),
-  })
-  await assert.rejects(
-    () => bounded.run({ caller: 'deterministic-control-plane' }),
-    error => error.code === 'FRAMEWORK_REPAIR_EXHAUSTED',
+    () => authority.run({ caller: 'deterministic-control-plane' }),
+    error => error.code === 'FRAMEWORK_VALIDATION_FAILED' &&
+      error.details.candidateHash === durable.candidateHash &&
+      error.details.findings[0].message === 'Exact structural defect.',
   )
   assert.equal(durable.status, 'BLOCKED')
-  const persistedAttempt = durable.attempt
-  const resumedBounded = new FrameworkOrchestrationAuthority({
-    binding, ...storage, maxAttempts: 2,
-    generate: async () => assert.fail('a persisted BLOCKED state cannot receive another generation attempt'),
-    validate: async () => assert.fail('a persisted BLOCKED state cannot receive another validation attempt'),
+  assert.equal(durable.attempt, 1)
+  assert.deepEqual({ generatorCalls, validatorCalls }, { generatorCalls: 1, validatorCalls: 1 })
+
+  const resumedBlocked = new FrameworkOrchestrationAuthority({
+    binding, ...storage,
+    generate: async () => assert.fail('a persisted BLOCKED state cannot generate again'),
+    validate: async () => assert.fail('a persisted BLOCKED state cannot validate again'),
   })
   await assert.rejects(
-    () => resumedBounded.run({ caller: 'deterministic-control-plane' }),
-    error => error.code === 'FRAMEWORK_REPAIR_EXHAUSTED',
+    () => resumedBlocked.run({ caller: 'deterministic-control-plane' }),
+    error => error.code === 'FRAMEWORK_VALIDATION_FAILED' &&
+      error.details.validatorReceipt.status === 'FAIL',
   )
-  assert.equal(durable.attempt, persistedAttempt)
+
+  durable.validatorReceipt.findings[0].message = 'tampered after sealing'
+  await assert.rejects(
+    () => new FrameworkOrchestrationAuthority({ binding, ...storage,
+      generate: async () => assert.fail('tampered state must fail before generation'),
+      validate: async () => assert.fail('tampered state must fail before validation'),
+    })
+      .run({ caller: 'deterministic-control-plane' }),
+    error => error.code === 'FRAMEWORK_STATE_INVALID',
+  )
 })
 
 test('C0 framework admission is durable before any production worker can launch', async () => {
@@ -7426,10 +8005,11 @@ test('one actionable checker FAIL launches one same-executor full-set repair and
         const doctrine = request.fetchedEvidence.verificationDoctrine.join(' ')
         assert.match(doctrine, /finish the full assigned matrix after any failure/u)
         assert.match(doctrine, /every exact named check ID, return one testOutcomes entry/u)
-        assert.match(doctrine, /observationId is the controller-issued ID shown for that check/u)
-        assert.match(doctrine, /commandHash to the lowercase SHA-256 of the exact completed exact-version harness command event/u)
-        assert.match(doctrine, /fingerprint to the lowercase SHA-256 of its trimmed combined output/u)
-        assert.match(doctrine, /PASS requires a zero exit; FAIL may bind an admitted nonzero test failure/u)
+        assert.match(doctrine, /containing its command ID and PASS or FAIL status/u)
+        assert.match(doctrine, /Do not inspect Autoprompt transcripts or compute observationId, commandHash, or fingerprint/u)
+        assert.match(doctrine, /the controller owns those fields and adds them only when/u)
+        assert.match(doctrine, /PASS requires a unique zero exit bound to the exact version being checked/u)
+        assert.match(doctrine, /authenticated nonzero test failure may bind FAIL and drive repair/u)
         assert.match(doctrine, /consumed underlying identifiers in evidenceIds and an allowed referenceMethod/u)
         assert.match(doctrine,
           /required consumer or independent check is unavailable, return CHECK_INCONCLUSIVE or RUNTIME_FAILURE/u)
@@ -7512,15 +8092,10 @@ test('all checker seats inspect one frozen candidate and feed one aggregate repa
       }
       if (['independent-reviewer', 'independent-tester'].includes(request.logicalRole)) {
         checkerCandidates.push(request.candidateHash)
-        if (request.logicalRole === 'independent-reviewer') {
-          assert.equal(request.fetchedEvidence.verificationObligations.length, 1)
-          assert.deepEqual(request.checks.filter(check => check.startsWith('verification:')), [
-            'verification:obligation-1:expected',
-          ])
-        } else {
-          assert.deepEqual(request.fetchedEvidence.verificationObligations, [])
-          assert.equal(request.checks.some(check => check.startsWith('verification:')), false)
-        }
+        assert.equal(request.fetchedEvidence.verificationObligations.length, 1)
+        assert.deepEqual(request.checks.filter(check => check.startsWith('verification:')), [
+          'verification:obligation-1:expected',
+        ], 'each checker seat receives the full verification matrix')
         if (repairLaunches === 0) {
           const first = request.logicalRole === 'independent-reviewer'
           return {
@@ -8432,7 +9007,8 @@ test('child transport timeouts become bounded worker evidence or an honest non-D
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
   })
   assert.equal(workerTimedOut.outcome, 'FAILED')
-  assert.equal(workerTimedOut.terminalEnvelope.code, 'IMPLEMENTATION_WORK_UNSUCCESSFUL')
+  assert.deepEqual(workerTimedOut.terminalEnvelope,
+    workerTransportFailure({}).terminalEnvelope)
   assert.deepEqual(workerLaunches, ['work-1', 'work-1-transport-retry-1'])
   assert.deepEqual(ordering.filter(item => item.startsWith('persist:')), [])
 
@@ -8457,6 +9033,324 @@ test('child transport timeouts become bounded worker evidence or an honest non-D
   assert.equal(checkerLimited.terminalEnvelope.usableCandidatePreserved, true)
   assert.deepEqual(ordering.filter(item => item.startsWith('persist:')), [])
   assert.equal(ordering.includes('transition:CHECK_INCONCLUSIVE'), true)
+})
+
+test('each exact worker owns an independent provider transport contingency', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-worker-transport-per-item-'))
+  const routeDecision = structuredClone(decision('DIRECT'))
+  routeDecision.usefulWorkerCount = 2
+  routeDecision.workerResponsibilities = ['Complete item one.', 'Complete item two.']
+  const launches = []
+  const requestedRetries = new Map()
+  const timeout = workItemId => ({
+    allAssignedItemsPass: false,
+    filesChanged: [], commands: [],
+    successItems: [{ id: 'provider-transport', status: 'fail', evidenceIds: [`transport:${workItemId}`] }],
+    findingIds: ['provider-transport'], evidenceHashes: ['a'.repeat(64)],
+    terminalEnvelope: {
+      status: 'CHILD_TRANSPORT_TIMEOUT',
+      reason: `bounded provider watchdog for ${workItemId}`,
+    },
+  })
+  const outcome = await createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'work-1' || request.workItemId === 'work-2') {
+        requestedRetries.set(request.workItemId, request.transportFailureRetryId)
+        return timeout(request.workItemId)
+      }
+      if (request.workItemId === 'work-1-transport-retry-1') {
+        fs.writeFileSync(path.join(target, 'src', 'example.js'),
+          "module.exports = 'both-transport-contingencies-used'\n")
+        return { allAssignedItemsPass: true, filesChanged: ['src/example.js'] }
+      }
+      if (request.workItemId === 'work-2-transport-retry-1') {
+        return { allAssignedItemsPass: true, filesChanged: [] }
+      }
+      return {
+        code: 'PASS', currentVersionHash: request.candidateHash,
+        payload: {
+          evidenceIds: [`evidence:${request.workItemId}`],
+          referenceMethod: checkerReferenceMethod('black-box-boundary', request.workItemId),
+          testOutcomes: checkerTestOutcomes(request),
+        },
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.deepEqual(launches, [
+    'work-1', 'work-1-transport-retry-1',
+    'work-2', 'work-2-transport-retry-1',
+    'independent-check-1',
+  ])
+  assert.deepEqual([...requestedRetries], [
+    ['work-1', 'work-1-transport-retry-1'],
+    ['work-2', 'work-2-transport-retry-1'],
+  ])
+})
+
+test('a later worker retry timeout terminates with its exact provider failure', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-worker-transport-real-failure-'))
+  const routeDecision = structuredClone(decision('DIRECT'))
+  routeDecision.usefulWorkerCount = 2
+  routeDecision.workerResponsibilities = ['Complete item one.', 'Complete item two.']
+  const launches = []
+  const timeout = workItemId => ({
+    allAssignedItemsPass: false,
+    filesChanged: [], commands: [],
+    successItems: [{ id: 'provider-transport', status: 'fail', evidenceIds: [`transport:${workItemId}`] }],
+    findingIds: ['provider-transport'], evidenceHashes: ['a'.repeat(64)],
+    terminalEnvelope: {
+      status: 'CHILD_TRANSPORT_TIMEOUT',
+      reason: `provider remained unavailable for ${workItemId}`,
+      providerFailureId: `provider:${workItemId}`,
+    },
+  })
+  const finalProviderFailure = timeout('work-2-transport-retry-1')
+  const outcome = await createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+  })({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'work-1') return timeout(request.workItemId)
+      if (request.workItemId === 'work-1-transport-retry-1') {
+        fs.writeFileSync(path.join(target, 'src', 'example.js'),
+          "module.exports = 'first-worker-retried'\n")
+        return { allAssignedItemsPass: true, filesChanged: ['src/example.js'] }
+      }
+      if (request.workItemId === 'work-2') return timeout(request.workItemId)
+      if (request.workItemId === 'work-2-transport-retry-1') return finalProviderFailure
+      assert.fail(`unexpected launch ${request.workItemId}`)
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+
+  assert.equal(outcome.outcome, 'FAILED')
+  assert.equal(outcome.terminalEnvelope, finalProviderFailure.terminalEnvelope)
+  assert.deepEqual(launches, [
+    'work-1', 'work-1-transport-retry-1',
+    'work-2', 'work-2-transport-retry-1',
+  ])
+})
+
+test('crash recovery restores transport contingency consumption per exact worker', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-worker-transport-per-item-resume-'))
+  fs.writeFileSync(path.join(target, 'src', 'example.js'),
+    "module.exports = 'durable-first-worker-retry'\n")
+  const routeDecision = structuredClone(decision('DIRECT'))
+  routeDecision.usefulWorkerCount = 2
+  routeDecision.workerResponsibilities = ['Complete item one.', 'Complete item two.']
+  const firstRetryId = 'work-1-transport-retry-1'
+  const firstRetryResult = { allAssignedItemsPass: true, filesChanged: ['src/example.js'] }
+  const resultPath = path.join(path.dirname(target), `${firstRetryId}.json`)
+  fs.writeFileSync(resultPath, `${JSON.stringify(firstRetryResult)}\n`)
+  const resultBytes = fs.readFileSync(resultPath)
+  const pointer = {
+    name: firstRetryId, path: resultPath, bytes: resultBytes.length,
+    hash: crypto.createHash('sha256').update(resultBytes).digest('hex'),
+  }
+  const launches = []
+  const secondBaseTimeout = {
+    allAssignedItemsPass: false, filesChanged: [], commands: [],
+    successItems: [{ id: 'provider-transport', status: 'fail', evidenceIds: ['transport:work-2'] }],
+    findingIds: ['provider-transport'], evidenceHashes: ['a'.repeat(64)],
+    terminalEnvelope: { status: 'CHILD_TRANSPORT_TIMEOUT', reason: 'work-2 provider timeout' },
+  }
+  const outcome = await createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    readResult: workItemId => workItemId === firstRetryId ? firstRetryResult : null,
+    resultPointer: workItemId => { assert.equal(workItemId, firstRetryId); return pointer },
+    verifyDurableResultReceipt: (workItemId, result) => {
+      assert.equal(workItemId, firstRetryId)
+      assert.equal(result, firstRetryResult)
+      return true
+    },
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'work-2') {
+        assert.equal(request.transportFailureRetryId, 'work-2-transport-retry-1')
+        return secondBaseTimeout
+      }
+      if (request.workItemId === 'work-2-transport-retry-1') {
+        return { allAssignedItemsPass: true, filesChanged: [] }
+      }
+      return {
+        code: 'PASS', currentVersionHash: request.candidateHash,
+        payload: {
+          evidenceIds: [`evidence:${request.workItemId}`],
+          referenceMethod: checkerReferenceMethod('black-box-boundary', request.workItemId),
+          testOutcomes: checkerTestOutcomes(request),
+        },
+      }
+    },
+    completeRetainedLease: () => {},
+    resumeAdoptedLaunches: async ({ stage }) => stage === 'work' ? {
+      'work-1': firstRetryResult,
+      [firstRetryId]: firstRetryResult,
+    } : {},
+    resumeState: {
+      resumeState: 'RUN_WORK', completedWorkIds: [firstRetryId], completedCheckIds: [],
+      acceptedResultIds: [], nextReadyWorkIds: ['work-2'], candidateHash: null, retryState: {},
+    },
+  })
+
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.deepEqual(launches, [
+    'work-2', 'work-2-transport-retry-1', 'independent-check-1',
+  ])
+})
+
+test('an implementation repair owns a provider transport retry before repaired recheck', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-repair-transport-success-'))
+  const receiptPointers = new Map()
+  const persist = (workItemId, result) => {
+    const resultPath = path.join(path.dirname(target), `${workItemId}.json`)
+    fs.writeFileSync(resultPath, `${JSON.stringify(result)}\n`)
+    const bytes = fs.readFileSync(resultPath)
+    receiptPointers.set(workItemId, {
+      name: workItemId, path: resultPath, bytes: bytes.length,
+      hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+    })
+    return result
+  }
+  const repairTimeout = {
+    allAssignedItemsPass: false, filesChanged: [], commands: [],
+    successItems: [{ id: 'provider-transport', status: 'fail', evidenceIds: ['transport:repair'] }],
+    findingIds: ['provider-transport'], evidenceHashes: ['a'.repeat(64)],
+    terminalEnvelope: { status: 'CHILD_TRANSPORT_TIMEOUT', reason: 'repair provider timeout' },
+  }
+  const launches = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    resultPointer: workItemId => receiptPointers.get(workItemId),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT', decision: decision('DIRECT'),
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'work-1') {
+        fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'defect'\n")
+        return { allAssignedItemsPass: true, filesChanged: ['src/example.js'] }
+      }
+      if (request.workItemId === 'independent-check-1') {
+        return persist(request.workItemId, {
+          code: 'FAIL',
+          cause: { event: 'ASSERTION_FAILED', reason: 'repair transport defect', unblockPath: 'repair' },
+          payload: {
+            findingIds: ['REPAIR-TRANSPORT'],
+            testOutcomes: controllerBoundFailureOutcomes(request, 'REPAIR-TRANSPORT'),
+          },
+        })
+      }
+      if (request.workItemId === 'work-1-repair-1') {
+        assert.equal(request.transportFailureRetryId,
+          'work-1-repair-1-transport-retry-1')
+        return repairTimeout
+      }
+      if (request.workItemId === 'work-1-repair-1-transport-retry-1') {
+        assert.equal(request.executorKey, 'work-1')
+        fs.writeFileSync(path.join(target, 'src', 'example.js'),
+          "module.exports = 'repaired-after-transport'\n")
+        return { allAssignedItemsPass: true, filesChanged: ['src/example.js'] }
+      }
+      return {
+        code: 'PASS', currentVersionHash: request.candidateHash,
+        payload: {
+          evidenceIds: [`evidence:${request.workItemId}`],
+          referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
+          testOutcomes: checkerTestOutcomes(request),
+        },
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.deepEqual(launches, [
+    'work-1', 'independent-check-1',
+    'work-1-repair-1', 'work-1-repair-1-transport-retry-1',
+    'independent-check-1-repair-1',
+  ])
+})
+
+test('an exhausted implementation-repair transport successor returns its real provider failure', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-repair-transport-failed-'))
+  const receiptPointers = new Map()
+  const persist = (workItemId, result) => {
+    const resultPath = path.join(path.dirname(target), `${workItemId}.json`)
+    fs.writeFileSync(resultPath, `${JSON.stringify(result)}\n`)
+    const bytes = fs.readFileSync(resultPath)
+    receiptPointers.set(workItemId, {
+      name: workItemId, path: resultPath, bytes: bytes.length,
+      hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+    })
+    return result
+  }
+  const timeout = reason => ({
+    allAssignedItemsPass: false, filesChanged: [], commands: [],
+    successItems: [{ id: 'provider-transport', status: 'fail', evidenceIds: ['transport:repair'] }],
+    findingIds: ['provider-transport'], evidenceHashes: ['a'.repeat(64)],
+    terminalEnvelope: { status: 'CHILD_TRANSPORT_TIMEOUT', reason },
+  })
+  const successorFailure = timeout('repair retry provider remained unavailable')
+  const launches = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    resultPointer: workItemId => receiptPointers.get(workItemId),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT', decision: decision('DIRECT'),
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'work-1') {
+        fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'defect'\n")
+        return { allAssignedItemsPass: true, filesChanged: ['src/example.js'] }
+      }
+      if (request.workItemId === 'independent-check-1') {
+        return persist(request.workItemId, {
+          code: 'FAIL',
+          cause: { event: 'ASSERTION_FAILED', reason: 'repair transport defect', unblockPath: 'repair' },
+          payload: {
+            findingIds: ['REPAIR-TRANSPORT'],
+            testOutcomes: controllerBoundFailureOutcomes(request, 'REPAIR-TRANSPORT'),
+          },
+        })
+      }
+      if (request.workItemId === 'work-1-repair-1') return timeout('repair provider timeout')
+      if (request.workItemId === 'work-1-repair-1-transport-retry-1') return successorFailure
+      assert.fail(`unexpected third launch ${request.workItemId}`)
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+
+  assert.equal(outcome.outcome, 'FAILED')
+  assert.equal(outcome.terminalEnvelope, successorFailure.terminalEnvelope)
+  assert.deepEqual(launches, [
+    'work-1', 'independent-check-1',
+    'work-1-repair-1', 'work-1-repair-1-transport-retry-1',
+  ])
 })
 
 test('crash after a durable worker transport timeout resumes only its one bounded contingency', async t => {
@@ -8707,6 +9601,112 @@ test('renaming the same semantic checker failure cannot buy another repair gener
   ])
 })
 
+test('distinct controller-assigned failure obligations authorize repair two and then PASS', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-novel-repair-progress-'))
+  const receiptPath = path.join(target, 'checker-failure-receipt.json')
+  fs.writeFileSync(receiptPath, '{}\n')
+  const routeDecision = structuredClone(decision('DIRECT'))
+  const progressChecks = ['controller-obligation-A', 'controller-obligation-B']
+  routeDecision.plannedChecks = progressChecks
+  let repairAttempt = 0
+  const launches = []
+  const executor = createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    resultPointer: workItemId => ({
+      name: workItemId, path: receiptPath,
+      hash: crypto.createHash('sha256').update(fs.readFileSync(receiptPath)).digest('hex'),
+      bytes: fs.statSync(receiptPath).size,
+    }),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })
+  const outcome = await executor({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.logicalRole === 'worker') {
+        if (/^work-1-repair-\d+$/u.test(request.workItemId)) repairAttempt += 1
+        fs.writeFileSync(path.join(target, 'src', 'example.js'),
+          `module.exports = 'candidate-${repairAttempt}'\n`)
+        return { allAssignedItemsPass: true }
+      }
+      if (repairAttempt < 2) {
+        const failedCheckId = progressChecks[repairAttempt]
+        return {
+          code: 'FAIL',
+          cause: { event: 'ASSERTION_FAILED', reason: failedCheckId, unblockPath: 'repair' },
+          payload: {
+            findingIds: [`AP-NOVEL-${repairAttempt + 1}`],
+            testOutcomes: controllerBoundSelectiveFailureOutcomes(request, failedCheckId),
+          },
+        }
+      }
+      return { code: 'PASS', payload: {
+        evidenceIds: ['evidence:novel-repair-pass'],
+        referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
+        testOutcomes: checkerTestOutcomes(request),
+      } }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.equal(repairAttempt, 2)
+  assert.deepEqual(launches.filter(id => /^work-1-repair-/u.test(id)), [
+    'work-1-repair-1', 'work-1-repair-2',
+  ])
+})
+
+test('controller-assigned A-B-A failure recurrence returns the concrete third FAIL', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-repair-cycle-'))
+  const receiptPath = path.join(target, 'checker-failure-receipt.json')
+  fs.writeFileSync(receiptPath, '{}\n')
+  const routeDecision = structuredClone(decision('DIRECT'))
+  const progressChecks = ['controller-obligation-A', 'controller-obligation-B']
+  routeDecision.plannedChecks = progressChecks
+  let repairAttempt = 0
+  let finalFailure = null
+  const executor = createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    resultPointer: workItemId => ({
+      name: workItemId, path: receiptPath,
+      hash: crypto.createHash('sha256').update(fs.readFileSync(receiptPath)).digest('hex'),
+      bytes: fs.statSync(receiptPath).size,
+    }),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })
+  const outcome = await executor({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      if (request.logicalRole === 'worker') {
+        if (/^work-1-repair-\d+$/u.test(request.workItemId)) repairAttempt += 1
+        fs.writeFileSync(path.join(target, 'src', 'example.js'),
+          `module.exports = 'cycle-${repairAttempt}'\n`)
+        return { allAssignedItemsPass: true }
+      }
+      const failedCheckId = repairAttempt === 1 ? progressChecks[1] : progressChecks[0]
+      finalFailure = {
+        code: 'FAIL',
+        cause: { event: 'ASSERTION_FAILED', reason: failedCheckId, unblockPath: 'repair' },
+        payload: {
+          findingIds: [`AP-CYCLE-${repairAttempt + 1}`],
+          testOutcomes: controllerBoundSelectiveFailureOutcomes(request, failedCheckId),
+        },
+      }
+      return finalFailure
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(outcome.outcome, 'FAILED', JSON.stringify(outcome))
+  assert.equal(outcome.terminalEnvelope, finalFailure)
+  assert.equal(outcome.terminalEnvelope.cause.reason, progressChecks[0])
+  assert.equal(repairAttempt, 2)
+})
+
 test('REPAIRING resume launches the exact pending worker repair before any fresh checker', async t => {
   const target = createTempGitTarget(tempDirectory(t, 'autoprompt-checker-repair-resume-'))
   const retryId = 'work-1-transport-retry-1'
@@ -8842,6 +9842,129 @@ test('REPAIRING resume launches the exact pending worker repair before any fresh
   assert.equal(launches.includes('independent-check-1-repair-1'), true)
 })
 
+test('REPAIRING crash resume authenticates and launches only the queued repair transport successor', async t => {
+  const directory = tempDirectory(t, 'autoprompt-repair-transport-resume-')
+  const target = createTempGitTarget(directory)
+  const routeDecision = decision('DIRECT')
+  const results = new Map()
+  const pointers = new Map()
+  const persist = (workItemId, result) => {
+    results.set(workItemId, result)
+    const resultPath = path.join(directory, `${workItemId}.json`)
+    fs.writeFileSync(resultPath, `${JSON.stringify(result)}\n`)
+    const bytes = fs.readFileSync(resultPath)
+    pointers.set(workItemId, {
+      name: workItemId, path: resultPath, bytes: bytes.length,
+      hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+    })
+    return result
+  }
+  let pending
+  await assert.rejects(createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env,
+    transition: async (eventId, nextState, details) => {
+      if (eventId === 'IMPLEMENTATION_DEFECT') {
+        pending = details
+        throw Object.assign(new Error('pause before repair provider launch'), {
+          code: 'PAUSE_BEFORE_REPAIR_TRANSPORT',
+        })
+      }
+    },
+    resultPointer: workItemId => pointers.get(workItemId),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      if (request.workItemId === 'work-1') {
+        fs.writeFileSync(path.join(target, 'src', 'example.js'),
+          "module.exports = 'repair-transport-rejected'\n")
+        return { allAssignedItemsPass: true, filesChanged: ['src/example.js'] }
+      }
+      return persist(request.workItemId, {
+        code: 'FAIL',
+        cause: { event: 'ASSERTION_FAILED', reason: 'queued repair defect', unblockPath: 'repair' },
+        payload: {
+          findingIds: ['QUEUED-REPAIR-TRANSPORT'],
+          testOutcomes: controllerBoundFailureOutcomes(request, 'QUEUED-REPAIR-TRANSPORT'),
+        },
+      })
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  }), error => error.code === 'PAUSE_BEFORE_REPAIR_TRANSPORT')
+  assert.ok(pending)
+
+  const repairBaseId = pending.repairWorkItemId
+  const repairRetryId = `${repairBaseId}-transport-retry-1`
+  persist(repairBaseId, {
+    allAssignedItemsPass: false, filesChanged: [], commands: [],
+    successItems: [{ id: 'provider-transport', status: 'fail', evidenceIds: ['transport:repair'] }],
+    findingIds: ['provider-transport'], evidenceHashes: ['a'.repeat(64)],
+    terminalEnvelope: { status: 'CHILD_TRANSPORT_TIMEOUT', reason: 'durable repair timeout' },
+  })
+  const launches = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    readResult: workItemId => results.get(workItemId) || null,
+    resultPointer: workItemId => pointers.get(workItemId),
+    verifyDurableResultReceipt: (workItemId, result) => {
+      assert.equal(workItemId, repairBaseId)
+      assert.equal(result, results.get(repairBaseId))
+      return true
+    },
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === repairRetryId) {
+        assert.equal(request.executorKey, 'work-1')
+        fs.writeFileSync(path.join(target, 'src', 'example.js'),
+          "module.exports = 'queued-repair-transport-resumed'\n")
+        return { allAssignedItemsPass: true, filesChanged: ['src/example.js'] }
+      }
+      return {
+        code: 'PASS', currentVersionHash: request.candidateHash,
+        payload: {
+          evidenceIds: [`evidence:${request.workItemId}`],
+          referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
+          testOutcomes: checkerTestOutcomes(request),
+        },
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
+    resumeState: {
+      resumeState: 'REPAIRING', candidateHash: pending.candidateHash,
+      completedWorkIds: ['work-1'], completedCheckIds: [], acceptedResultIds: [],
+      nextReadyWorkIds: [repairRetryId],
+      retryState: {
+        cumulativeRejectedCheckerReceipts: pending.rejectedCheckerReceipts,
+        repairFailureFingerprintChain: pending.repairFailureFingerprintChain,
+        pendingImplementationRepair: {
+          checkerId: pending.checkerId,
+          checkerResultHash: pending.checkerResultHash,
+          checkerReceiptPointer: pending.checkerReceiptPointer,
+          rejectedCheckerReceipts: pending.rejectedCheckerReceipts,
+          rejectedCandidateHash: pending.candidateHash,
+          repairAttempt: pending.repairAttempt,
+          repairWorkItemId: pending.repairWorkItemId,
+          repairFailureFingerprint: pending.repairFailureFingerprint,
+          repairFailureFingerprints: pending.repairFailureFingerprints,
+          repairFailureFingerprintChain: pending.repairFailureFingerprintChain,
+        },
+      },
+    },
+  })
+
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.deepEqual(launches, [repairRetryId, 'independent-check-1-repair-1'])
+})
+
 test('REPAIRING crash resume rejects a legacy second repair as the bound product failure', async t => {
   const directory = tempDirectory(t, 'autoprompt-cumulative-repair-resume-')
   const target = createTempGitTarget(directory)
@@ -8974,6 +10097,210 @@ test('REPAIR_READY recovery invalidates prior-version checker seats and launches
   ])
 })
 
+test('repair recurrence chain survives a REPAIR_READY crash and stops the same observation', async t => {
+  const directory = tempDirectory(t, 'autoprompt-repair-recurrence-resume-')
+  const targetPath = createTempGitTarget(directory)
+  const routeDecision = decision('DIRECT')
+  const results = new Map()
+  const pointers = new Map()
+  const persistResult = (workItemId, result) => {
+    results.set(workItemId, result)
+    const resultPath = path.join(directory, `${workItemId}.json`)
+    fs.writeFileSync(resultPath, `${JSON.stringify(result)}\n`)
+    const bytes = fs.readFileSync(resultPath)
+    pointers.set(workItemId, {
+      name: workItemId, path: resultPath,
+      hash: crypto.createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length,
+    })
+  }
+  let defectTransition
+  let readyTransition
+  const firstExecutor = createDefaultRouteExecutor({
+    targetPath, gitEnvironment: () => process.env,
+    transition: async (eventId, nextState, details) => {
+      if (eventId === 'IMPLEMENTATION_DEFECT') defectTransition = details
+      if (eventId === 'REPAIR_READY') {
+        readyTransition = details
+        throw Object.assign(new Error('pause after durable repaired-version freeze'), {
+          code: 'PAUSE_AFTER_REPAIR_READY',
+        })
+      }
+    },
+    readResult: workItemId => results.get(workItemId) || null,
+    resultPointer: workItemId => pointers.get(workItemId),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })
+  await assert.rejects(firstExecutor({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      if (request.logicalRole === 'worker') {
+        fs.writeFileSync(path.join(targetPath, 'src', 'example.js'),
+          request.workItemId === 'work-1'
+            ? "module.exports = 'rejected'\n" : "module.exports = 'toggled'\n")
+        const result = { allAssignedItemsPass: true }
+        results.set(request.workItemId, result)
+        return result
+      }
+      const result = {
+        code: 'FAIL', currentVersionHash: request.candidateHash,
+        cause: { event: 'ASSERTION_FAILED', reason: 'same resumed observation', unblockPath: 'repair' },
+        payload: {
+          findingIds: ['AP-RESUME-001'],
+          testOutcomes: controllerBoundFailureOutcomes(request, 'resume-failure-A'),
+        },
+      }
+      persistResult(request.workItemId, result)
+      return result
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  }), error => error.code === 'PAUSE_AFTER_REPAIR_READY')
+  assert.ok(defectTransition)
+  assert.ok(readyTransition)
+
+  const candidateHash = testWorkspaceCandidateHash(targetPath)
+  const recurrentId = 'independent-check-1-repair-1'
+  const recurrentRequest = {
+    workItemId: recurrentId,
+    candidateHash,
+    checks: checkerSeatChecks(routeDecision, 0),
+  }
+  const recurrentResult = {
+    code: 'FAIL', candidateHash, currentVersionHash: candidateHash,
+    cause: { event: 'ASSERTION_FAILED', reason: 'same resumed observation', unblockPath: 'repair' },
+    payload: {
+      findingIds: ['AP-RESUME-001'],
+      testOutcomes: controllerBoundFailureOutcomes(recurrentRequest, 'resume-failure-A'),
+    },
+  }
+  persistResult(recurrentId, recurrentResult)
+  const resumeLaunches = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath, gitEnvironment: () => process.env, transition: async () => {},
+    readResult: workItemId => results.get(workItemId) || null,
+    resultPointer: workItemId => pointers.get(workItemId),
+    verifyDurableResultReceipt: () => true,
+    harnessAttestation: (versionHash, oracle) => ({
+      repoHash: versionHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      resumeLaunches.push(request.workItemId)
+      assert.fail(`recurring durable failure must not launch ${request.workItemId}`)
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
+    resumeState: {
+      resumeState: 'CHECK_WORK', candidateHash,
+      completedWorkIds: ['work-1', 'work-1-repair-1'],
+      completedCheckIds: [recurrentId], acceptedResultIds: [], nextReadyWorkIds: [],
+      retryState: {
+        cumulativeRejectedCheckerReceipts: defectTransition.rejectedCheckerReceipts,
+        repairFailureFingerprintChain: readyTransition.repairFailureFingerprintChain,
+      },
+    },
+  })
+  assert.equal(outcome.outcome, 'FAILED', JSON.stringify(outcome))
+  assert.equal(outcome.terminalEnvelope.code, 'FAIL')
+  assert.equal(outcome.terminalEnvelope.cause.reason, 'same resumed observation')
+  assert.deepEqual(resumeLaunches, [])
+})
+
+test('55 distinct controller obligations keep repair evidence bounded to the current generation', async t => {
+  const directory = tempDirectory(t, 'autoprompt-bounded-repair-history-')
+  const targetPath = createTempGitTarget(directory)
+  const routeDecision = structuredClone(decision('DIRECT'))
+  const progressChecks = Array.from({ length: 55 }, (_, index) =>
+    `controller-check-${String(index + 1).padStart(2, '0')}`)
+  routeDecision.plannedChecks = progressChecks
+  const pointers = new Map()
+  const visibleContextBytes = { worker: [], checker: [] }
+  const persistFailure = (workItemId, result) => {
+    const resultPath = path.join(directory, `${workItemId}.json`)
+    fs.writeFileSync(resultPath, `${JSON.stringify(result)}\n`)
+    const bytes = fs.readFileSync(resultPath)
+    pointers.set(workItemId, {
+      name: workItemId, path: resultPath, bytes: bytes.length,
+      hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+    })
+    return result
+  }
+  const inspectBoundedHistory = request => {
+    const receipts = request.fetchedEvidence && request.fetchedEvidence.rejectedCheckerReceipts
+    if (!receipts) return
+    assert.equal(receipts.length, 1)
+    assert.equal((request.evidencePointers || []).length,
+      request.logicalRole === 'worker' ? 0 : 1)
+    const history = request.fetchedEvidence.repairHistory
+    assert.ok(history)
+    assert.equal(history.currentGenerationReceiptCount, 1)
+    assert.equal(history.rejectedGenerationCount, history.rejectedReceiptCount)
+    assert.match(history.historyDigest, /^[a-f0-9]{64}$/u)
+    visibleContextBytes[request.logicalRole === 'worker' ? 'worker' : 'checker'].push(
+      Buffer.byteLength(JSON.stringify({
+      fetchedEvidence: request.fetchedEvidence,
+      evidencePointers: request.evidencePointers,
+      evidenceHashes: request.evidenceHashes,
+      }), 'utf8'),
+    )
+  }
+  let failuresReturned = 0
+  const outcome = await createDefaultRouteExecutor({
+    targetPath, gitEnvironment: () => process.env, transition: async () => {},
+    resultPointer: workItemId => pointers.get(workItemId),
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT', decision: routeDecision,
+    launch: async request => {
+      inspectBoundedHistory(request)
+      if (request.logicalRole === 'worker') {
+        fs.writeFileSync(path.join(targetPath, 'src', 'example.js'),
+          `module.exports = '${request.workItemId}'\n`)
+        return { allAssignedItemsPass: true, filesChanged: ['src/example.js'] }
+      }
+      if (failuresReturned < 55) {
+        const failedCheckId = progressChecks[failuresReturned]
+        failuresReturned += 1
+        return persistFailure(request.workItemId, {
+          code: 'FAIL', currentVersionHash: request.candidateHash,
+          cause: {
+            event: 'ASSERTION_FAILED', reason: `novel defect ${failuresReturned}`,
+            unblockPath: 'repair the current exact version',
+          },
+          payload: {
+            findingIds: [`NOVEL-${failuresReturned}`],
+            testOutcomes: controllerBoundSelectiveFailureOutcomes(request, failedCheckId),
+          },
+        })
+      }
+      return {
+        code: 'PASS', currentVersionHash: request.candidateHash,
+        payload: {
+          evidenceIds: ['evidence:bounded-history-pass'],
+          referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
+          testOutcomes: checkerTestOutcomes(request),
+        },
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.equal(failuresReturned, 55)
+  assert.equal(visibleContextBytes.worker.length, 55)
+  assert.equal(visibleContextBytes.checker.length, 55)
+  for (const contextSizes of Object.values(visibleContextBytes)) {
+    assert.ok(Math.max(...contextSizes) < 16 * 1024)
+    assert.ok(Math.max(...contextSizes) - Math.min(...contextSizes) < 128)
+  }
+})
+
 test('post-repair checker-one PASS recovery consumes it and launches only repaired checker two', async t => {
   const directory = tempDirectory(t, 'autoprompt-repair-checker-two-resume-')
   const targetPath = createTempGitTarget(directory)
@@ -9034,7 +10361,7 @@ test('post-repair checker-one PASS recovery consumes it and launches only repair
   assert.deepEqual(launches, ['independent-check-2-repair-1'])
 })
 
-test('controller-invalid repaired PASS retries, then returns a real persistent defect', async t => {
+test('controller-invalid repaired PASS correction cannot smuggle an unbound top-level FAIL', async t => {
   const directory = tempDirectory(t, 'autoprompt-repair-invalid-final-pass-')
   const targetPath = createTempGitTarget(directory)
   fs.writeFileSync(path.join(targetPath, 'src', 'example.js'), "module.exports = 'repaired-invalid'\n")
@@ -9082,8 +10409,9 @@ test('controller-invalid repaired PASS retries, then returns a real persistent d
       acceptedResultIds: [], nextReadyWorkIds: [], retryState: {},
     },
   })
-  assert.equal(outcome.outcome, 'FAILED', JSON.stringify(outcome))
-  assert.equal(outcome.terminalEnvelope.code, 'FAIL')
+  assert.equal(outcome.outcome, 'PARTIAL', JSON.stringify(outcome))
+  assert.equal(outcome.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
+  assert.equal(outcome.terminalEnvelope.controllerReason, 'TEST_OUTCOMES_INVALID')
   assert.deepEqual(launches, [`${completedId}-runtime-retry-1`])
 })
 
@@ -9225,7 +10553,7 @@ test('repaired checker retry PASS preserves the seat, then a later defect termin
     .details.nextReadyWorkIds, ['independent-check-2-repair-1'])
 })
 
-test('an equivalent post-repair checker failure stops after the single bounded repair', async t => {
+test('the same named failure with volatile output and an unrelated edit stops after one repair', async t => {
   const target = createTempGitTarget(tempDirectory(t, 'autoprompt-checker-repair-bound-'))
   const receiptPath = path.join(target, 'checker-fail-receipt.json')
   fs.writeFileSync(receiptPath, '{}\n')
@@ -9257,7 +10585,15 @@ test('an equivalent post-repair checker failure stops after the single bounded r
         return {
           code: 'FAIL',
           cause: { event: 'ASSERTION_FAILED', reason: 'same exact defect remains', unblockPath: 'manual intervention' },
-          payload: { findingIds: ['AP-RUN-026'] },
+          payload: {
+            findingIds: ['AP-RUN-026'],
+            testOutcomes: controllerBoundFailureOutcomes(
+              request,
+              'same-named-case',
+              `observed=${new Date(1_700_000_000_000 + checkerLaunches).toISOString()} ` +
+                `temp=/tmp/check-${checkerLaunches} random=run-${checkerLaunches}`,
+            ),
+          },
         }
       }
       return { code: 'PASS', payload: {} }
@@ -9270,7 +10606,7 @@ test('an equivalent post-repair checker failure stops after the single bounded r
   assert.equal(checkerLaunches, 2)
 })
 
-test('one-worker ROADMAP consumes at most one report correction per checker across product repair', async t => {
+test('one-worker ROADMAP gives the same checker a fresh correction on a repaired candidate', async t => {
   const directory = tempDirectory(t, 'autoprompt-roadmap-run-global-checker-correction-')
   const target = createTempGitTarget(directory)
   const routeDecision = decision('ROADMAP')
@@ -9351,6 +10687,16 @@ test('one-worker ROADMAP consumes at most one report correction per checker acro
           cause: { event: 'CHECK_RUNTIME_UNAVAILABLE', reason: 'recheck report was incomplete' },
           payload: {},
         }
+      } else if (request.workItemId === 'independent-check-1-repair-1-runtime-retry-1') {
+        result = {
+          code: 'PASS', candidateHash: request.candidateHash,
+          currentVersionHash: request.candidateHash,
+          payload: {
+            evidenceIds: ['evidence:repaired-candidate-corrected-report'],
+            referenceMethod: checkerReferenceMethod('requirements-review', request.workItemId),
+            testOutcomes: checkerTestOutcomes(request),
+          },
+        }
       } else {
         assert.fail(`unexpected launch ${request.workItemId}`)
       }
@@ -9361,10 +10707,7 @@ test('one-worker ROADMAP consumes at most one report correction per checker acro
     resumeAdoptedLaunches: async () => ({}),
     resumeState: null,
   })
-  assert.equal(outcome.outcome, 'PARTIAL', JSON.stringify(outcome))
-  assert.equal(outcome.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
-  assert.equal(outcome.terminalEnvelope.controllerReason,
-    'CHECKER_REPORT_CORRECTION_ALREADY_CONSUMED')
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
   assert.equal(repairLaunches, 1)
   assert.deepEqual(launches, [
     'work-1',
@@ -9372,22 +10715,39 @@ test('one-worker ROADMAP consumes at most one report correction per checker acro
     'independent-check-1-runtime-retry-1',
     'work-1-repair-1',
     'independent-check-1-repair-1',
+    'independent-check-1-repair-1-runtime-retry-1',
   ])
   assert.equal(launches.some(workItemId =>
     /^(?:roadmap-(?:author|scout|plan-|work-group)|mission-coordination)/u.test(workItemId)), false)
-  assert.equal(launches.includes('independent-check-1-repair-1-runtime-retry-1'), false)
-  // The shared topology remains provider-neutral; the private Codex execution
-  // uses only product/check/retry/repair/recheck and consumes one report
-  // correction globally across the repair generation.
-  assert.equal(launches.length, 5)
+  assert.equal(launches.includes('independent-check-1-repair-1-runtime-retry-1'), true)
+  // The shared topology remains provider-neutral; the private correction is
+  // bound to the canonical checker seat and exact candidate hash.
+  assert.equal(launches.length, 6)
 })
 
 test('a no-op checker repair fails directly without stale recheck or a second repair', async t => {
   const target = createTempGitTarget(tempDirectory(t, 'autoprompt-checker-repair-no-progress-'))
+  const harnessPath = path.join(target, 'focused.test.cjs')
+  fs.writeFileSync(harnessPath, "'use strict'\n")
   const receiptPath = path.join(target, 'checker-fail-receipt.json')
   fs.writeFileSync(receiptPath, '{}\n')
+  const runId = 'run-controller-bound-aggregate-failure'
+  const routeDecision = decision('DIRECT')
+  const cleanupEntries = []
+  const cleanupRegistry = {
+    register(entry) { cleanupEntries.push({ ...entry, status: 'REGISTERED' }) },
+    load() { return { entries: cleanupEntries.map(entry => ({ ...entry })) } },
+  }
+  const scratchFactory = createCheckerScratchFactory({
+    scratchRoot: path.join(path.dirname(target), 'checker-scratch'),
+    cleanupRegistry,
+    runId,
+    targetPath: target,
+  })
   let checkerLaunches = 0
   let repairLaunches = 0
+  const launchedWorkIds = []
+  let authoritativeFailure = null
   const transitions = []
   const executor = createDefaultRouteExecutor({
     targetPath: target, gitEnvironment: () => process.env,
@@ -9403,27 +10763,154 @@ test('a no-op checker repair fails directly without stale recheck or a second re
     }),
   })
   const result = await executor({
-    route: 'DIRECT', decision: decision('DIRECT'),
+    route: 'DIRECT', decision: routeDecision,
     launch: async request => {
+      launchedWorkIds.push(request.workItemId)
       if (request.logicalRole === 'worker') {
         if (/^work-1-repair-\d+$/u.test(request.workItemId)) repairLaunches += 1
         else fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'rejected'\n")
         return { allAssignedItemsPass: true }
       }
       checkerLaunches += 1
-      return {
-        code: 'FAIL',
-        cause: { event: 'ASSERTION_FAILED', reason: 'bound behavior mismatch', unblockPath: 'repair implementation' },
-        payload: { findingIds: ['AP-RUN-026'] },
+      const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(harnessPath)}`
+      const observationBinding = createCheckerObservationBinding({
+        assignmentId: request.workItemId,
+        candidateHash: request.candidateHash,
+        requestEnvelopeHash: routeDecision.requestEnvelopeHash,
+        checkIds: request.checks,
+        commandBindings: request.checks.map(checkId => ({ checkId, command })),
+      })
+      const checkerOutput = {
+        schemaVersion: '2.0.0',
+        code: 'PASS',
+        description: 'The checked result satisfies every requirement assigned to this check.',
+        stateClass: 'terminal',
+        runId,
+        requestEnvelopeHash: routeDecision.requestEnvelopeHash,
+        currentVersionHash: request.candidateHash,
+        completedResults: [],
+        nextReadyWork: [],
+        cause: { event: 'CHECK_COMPLETE', reason: 'mistaken aggregate', unblockPath: null },
+        payloadSchemaId: 'autoprompt.check.aggregate-contradiction.v2',
+        payload: {
+          testOutcomes: request.checks.map(checkId => ({ command: checkId, status: 'FAIL' })),
+        },
+        recordedAt: new Date().toISOString(),
       }
+      const checkerScratchBoundary = scratchFactory(
+        request.workItemId,
+        target,
+        { candidateHash: request.candidateHash, adoptedScratchRoots: [] },
+      )
+      const adapter = new CodexExecAdapter({
+        runner: {
+          async run(spec) {
+            spec.onStdoutLine(JSON.stringify({
+              type: 'thread.started', thread_id: 'thread-bound-aggregate-failure',
+            }))
+            spec.onStdoutLine(JSON.stringify({
+              type: 'item.started',
+              item: {
+                id: 'command-bound-aggregate-failure',
+                type: 'command_execution',
+                command,
+                status: 'in_progress',
+              },
+            }))
+            spec.onStdoutLine(JSON.stringify({
+              type: 'item.completed',
+              item: {
+                id: 'command-bound-aggregate-failure',
+                type: 'command_execution',
+                command,
+                status: 'failed',
+                exit_code: 1,
+                aggregated_output: 'TAP version 13\nnot ok 1 - exact candidate defect\n# fail 1',
+              },
+            }))
+            spec.onStdoutLine(JSON.stringify({
+              type: 'item.completed',
+              item: { type: 'agent_message', text: JSON.stringify(checkerOutput) },
+            }))
+            spec.onStdoutLine(JSON.stringify({
+              type: 'turn.completed',
+              usage: {
+                input_tokens: 1, cached_input_tokens: 0,
+                output_tokens: 1, reasoning_output_tokens: 0,
+              },
+            }))
+            return {
+              status: 0, stdout: '', stderr: '', processOwned: true,
+              exactArgv: true, drained: true,
+            }
+          },
+          async stop() { return { drained: true } },
+        },
+        targetPath: target,
+        profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+        outputSchemaResolver: () => path.join(
+          ROOT, 'agents', 'contracts', 'schemas', 'outcome.schema.json',
+        ),
+        checkerScratchVerifier: scratchFactory.verify,
+      })
+      const checkerExecutionPolicy = {
+        logicalRole: request.logicalRole,
+        physicalRole: `autoprompt.v2.${request.logicalRole}`,
+        providerRole: 'ap-independent-checker',
+        sandboxMode: 'read-only',
+        canDispatch: false,
+        resourceSets: { read: ['target.snapshot.read'], write: [], exclusive: [] },
+        policyId: 'autoprompt.codex.role-policy',
+        policyVersion: '2.0.0',
+      }
+      authoritativeFailure = await adapter.launch({
+        ...checkerExecutionPolicy,
+        physicalExecutionPolicy: checkerExecutionPolicy,
+        runId,
+        candidateHash: request.candidateHash,
+        purpose: 'check',
+        ...adapterMissionFields(
+          routeDecision.requestEnvelopeHash,
+          request.workItemId,
+          'Independently check the exact result.',
+        ),
+        canonicalAssignment: {
+          assignmentId: request.workItemId,
+          requestEnvelopeHash: routeDecision.requestEnvelopeHash,
+          checks: request.checks,
+          verificationObservationBinding: observationBinding,
+        },
+        dispatch: {
+          brief: 'Execute the controller-bound checker.',
+          requestPointer: { path: 'request', hash: routeDecision.requestEnvelopeHash },
+        },
+        environment: {},
+        sessionId: 'session-bound-aggregate-failure',
+        reservationId: 'reservation-bound-aggregate-failure',
+        workingDirectory: checkerScratchBoundary.writableScratchRoot,
+        canonicalTargetPath: target,
+        checkerScratchBoundary,
+        sandboxAssignment: { checkerId: request.workItemId },
+      })
+      assert.equal(authoritativeFailure.code, 'FAIL', JSON.stringify(authoritativeFailure))
+      return authoritativeFailure
     },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
   })
-  assert.equal(result.outcome, 'FAILED')
+  assert.equal(result.outcome, 'FAILED', JSON.stringify({ result, launchedWorkIds, transitions }))
   assert.equal(result.terminalEnvelope.code, 'FAIL')
-  assert.equal(result.terminalEnvelope.cause.reason, 'bound behavior mismatch')
+  assert.equal(authoritativeFailure.code, 'FAIL')
+  assert.equal(authoritativeFailure.cause.event, 'ASSERTION_FAILED')
+  assert.equal(
+    authoritativeFailure.payload.verificationObservationDisposition.reportedAggregateCode,
+    'PASS',
+  )
+  assert.equal(result.terminalEnvelope.cause.reason,
+    authoritativeFailure.cause.reason,
+    'a no-op repair preserves the exact authenticated failure')
   assert.equal(repairLaunches, 1)
   assert.equal(checkerLaunches, 1)
+  assert.equal(launchedWorkIds.some(id => id.includes('runtime-retry')), false)
   assert.deepEqual(transitions.filter(([event]) => ['IMPLEMENTATION_DEFECT', 'REPAIR_READY'].includes(event)), [
     ['IMPLEMENTATION_DEFECT', 'REPAIRING'],
   ])
@@ -9494,7 +10981,7 @@ test('persistent local inconclusive checks preserve a non-DONE candidate and nev
   }
 })
 
-test('an exact checker group gets only one same-version report correction', async t => {
+test('both checker seats each receive one same-version report correction', async t => {
   const target = createTempGitTarget(tempDirectory(t, 'autoprompt-per-checker-retry-'))
   const transitions = []
   const checkerLaunches = []
@@ -9540,11 +11027,10 @@ test('an exact checker group gets only one same-version report correction', asyn
     },
     completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
   })
-  assert.equal(outcome.outcome, 'PARTIAL', JSON.stringify(outcome))
-  assert.equal(outcome.terminalEnvelope.status, 'CHECK_REMAINS_INCONCLUSIVE')
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
   assert.deepEqual(checkerLaunches, [
     'independent-check-1', 'independent-check-1-runtime-retry-1',
-    'independent-check-2',
+    'independent-check-2', 'independent-check-2-runtime-retry-1',
   ])
   assert.deepEqual(transitions.filter(([event]) => [
     'CHECK_INCONCLUSIVE', 'CHECK_BECAME_CONCLUSIVE',
@@ -9553,9 +11039,102 @@ test('an exact checker group gets only one same-version report correction', asyn
   ]), [
     ['CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', 'independent-check-1', ['independent-check-1-runtime-retry-1']],
     ['CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', 'independent-check-1-runtime-retry-1', ['independent-check-2']],
-    ['CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', 'independent-check-2', []],
+    ['CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', 'independent-check-2', ['independent-check-2-runtime-retry-1']],
+    ['CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', 'independent-check-2-runtime-retry-1', []],
   ])
   assert.deepEqual(transitions.filter(([event]) => event === 'TRANSIENT_RUNTIME'), [])
+})
+
+test('the same checker seat and candidate cannot receive report correction two', async t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-same-seat-correction-'))
+  const launches = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT', decision: decision('DIRECT'),
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.logicalRole === 'worker') {
+        fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'candidate'\n")
+        return { allAssignedItemsPass: true }
+      }
+      return {
+        code: 'CHECK_INCONCLUSIVE', currentVersionHash: request.candidateHash,
+        cause: { event: 'CHECK_RUNTIME_UNAVAILABLE', reason: 'report remains malformed' },
+        payload: {},
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+  assert.equal(outcome.outcome, 'PARTIAL', JSON.stringify(outcome))
+  assert.equal(outcome.terminalEnvelope.controllerReason, 'INDEPENDENT_CHECK_RUNTIME_RETRY')
+  assert.deepEqual(launches.filter(id => /^independent-check-/u.test(id)), [
+    'independent-check-1', 'independent-check-1-runtime-retry-1',
+  ])
+})
+
+test('crash resume restores the exact candidate-seat correction binding', async t => {
+  const directory = tempDirectory(t, 'autoprompt-correction-binding-resume-')
+  const target = createTempGitTarget(directory)
+  fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'candidate'\n")
+  const candidateHash = testWorkspaceCandidateHash(target)
+  const checkerId = 'independent-check-1'
+  const baseResult = {
+    code: 'CHECK_INCONCLUSIVE', candidateHash, currentVersionHash: candidateHash,
+    cause: { event: 'CHECK_RUNTIME_UNAVAILABLE', reason: 'first report needs correction' },
+    payload: {},
+  }
+  const resultPath = path.join(directory, `${checkerId}.json`)
+  fs.writeFileSync(resultPath, `${JSON.stringify(baseResult)}\n`)
+  const bytes = fs.readFileSync(resultPath)
+  const pointer = {
+    name: checkerId, path: resultPath,
+    hash: crypto.createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length,
+  }
+  const checkerResultHash = crypto.createHash('sha256')
+    .update(JSON.stringify(baseResult)).digest('hex')
+  const correctionBinding = { candidateHash, checkerSeat: checkerId }
+  const launches = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath: target, gitEnvironment: () => process.env, transition: async () => {},
+    readResult: workItemId => workItemId === checkerId ? baseResult : null,
+    resultPointer: workItemId => { assert.equal(workItemId, checkerId); return pointer },
+    verifyDurableResultReceipt: () => true,
+    harnessAttestation: (versionHash, oracle) => ({
+      repoHash: versionHash, buildHash: 'b'.repeat(64),
+      oracleHash: crypto.createHash('sha256').update(oracle).digest('hex'),
+    }),
+  })({
+    route: 'DIRECT', decision: decision('DIRECT'),
+    launch: async request => {
+      launches.push(request.workItemId)
+      assert.equal(request.workItemId, 'independent-check-1-runtime-retry-1')
+      return {
+        code: 'CHECK_INCONCLUSIVE', candidateHash, currentVersionHash: candidateHash,
+        cause: { event: 'CHECK_RUNTIME_UNAVAILABLE', reason: 'corrected report still inconclusive' },
+        payload: {},
+      }
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}),
+    resumeState: {
+      resumeState: 'CHECK_INCONCLUSIVE', candidateHash,
+      completedWorkIds: ['work-1'], completedCheckIds: [checkerId], acceptedResultIds: [],
+      nextReadyWorkIds: ['independent-check-1-runtime-retry-1'],
+      retryState: {
+        checkerReportCorrectionBindings: [correctionBinding],
+        inconclusiveChecker: {
+          checkerId, candidateHash, checkerResultHash, retryAttempt: 1,
+          returnState: 'CHECK_WORK',
+        },
+      },
+    },
+  })
+  assert.equal(outcome.outcome, 'PARTIAL', JSON.stringify(outcome))
+  assert.deepEqual(launches, ['independent-check-1-runtime-retry-1'])
 })
 
 test('live checker keeps target read-only while owning isolated workspace cache database service port and outputs', async t => {
@@ -11167,9 +12746,7 @@ test('AP-CODEX-V2-036 concrete runtime repairs a checker FAIL in a bounded fresh
     "  const checkerHarnessOutput = checkerAttempt === 1 ? 'TAP version 13\\nnot ok 1 - frozen candidate behavior\\n# fail 1' : `TAP version 13\\nok 1 - frozen candidate behavior\\n# pass 1`",
     "  const checkerHarnessExitCode = checkerAttempt === 1 ? 1 : 0",
     "  const checkerHarnessStatus = checkerAttempt === 1 ? 'failed' : 'completed'",
-    "  const checkerHarnessFingerprint = require('node:crypto').createHash('sha256').update(checkerHarnessOutput).digest('hex')",
-    "  const checkerHarnessCommandHash = require('node:crypto').createHash('sha256').update(checkerHarnessCommand).digest('hex')",
-    "  const checkerOutcomes = status => assignment.checks.map((command,index)=>({command,observationId:assignment.verificationObservationCases[index].observationId,commandHash:checkerHarnessCommandHash,status,fingerprint:checkerHarnessFingerprint}))",
+    "  const checkerOutcomes = status => assignment.checks.map(command=>({command,status}))",
     "  if (role === 'worker') traceFs.writeFileSync(require('node:path').join(process.cwd(),'src','example.js'), `module.exports = '${roleAttempt === 1 ? 'rejected' : 'complete'}'\\n`)",
     "  let output",
     "  if (role === 'route-analyst') output = recommendation",
@@ -11402,9 +12979,7 @@ test('AP-RUN-037 production supervisor resumes a crashed worker with a fresh gen
     "  const now = new Date().toISOString()",
     "  const checkerHarnessCommand = JSON.stringify([process.execPath,'--test','focused.test.cjs'])",
     "  const checkerHarnessOutput = `fake-checker-harness:${assignment&&assignment.assignmentId}`",
-    "  const checkerHarnessFingerprint = require('node:crypto').createHash('sha256').update(checkerHarnessOutput).digest('hex')",
-    "  const checkerHarnessCommandHash = require('node:crypto').createHash('sha256').update(checkerHarnessCommand).digest('hex')",
-    "  const checkerOutcomes = status => assignment.checks.map((command,index)=>({command,observationId:assignment.verificationObservationCases[index].observationId,commandHash:checkerHarnessCommandHash,status,fingerprint:checkerHarnessFingerprint}))",
+    "  const checkerOutcomes = status => assignment.checks.map(command=>({command,status}))",
     "  if (role === 'worker') require('node:fs').writeFileSync(require('node:path').join(process.cwd(),'src','example.js'), \"module.exports = 'resumed'\\n\")",
     "  let output",
     "  if (role === 'route-analyst') output = recommendation",
@@ -12183,7 +13758,23 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
   ], { encoding: 'utf8', windowsHide: true })
   assert.equal([0, 3].includes(hardening.status), true, hardening.stderr || hardening.stdout)
 
+  const doneRetryPromotionContract = options.doneRetryPromotion === true ? {
+    schemaVersion: '1.0.0', kind: 'DONE_RETRY_PROMOTION',
+    priorDoneCandidateHash: 'a'.repeat(64), isolationCertificateHash: 'c'.repeat(64),
+    requiredAcceptanceIds: ['focused'],
+  } : null
+  const compositionDecision = decision('ROADMAP')
+  if (doneRetryPromotionContract) {
+    compositionDecision.normalizedRouteFacts.capturedIncidentDomains = [
+      doneRetryPromotionContract.kind,
+    ]
+    compositionDecision.capturedDomainContracts = [doneRetryPromotionContract]
+  }
+  let deferredPromotionState = null
+
   const harness = makeHarness(t, {
+    ...(options.launchLimit !== undefined ? { launchLimit: options.launchLimit } : {}),
+    ...(options.wallMs !== undefined ? { wallMs: options.wallMs } : {}),
     runtimeOptions: {
       targetPath: target,
       expectedBranch: 'main',
@@ -12191,9 +13782,18 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
       settings: {
         explicit: { concurrency: { mode: 'tokensaver' }, path: 'roadmap' },
         capabilities: { modelRouting: false, wideMaxSubs: 10 },
-        providerId: 'codex',
+      providerId: 'codex',
       },
       exactPathPreflight: deterministicExactPathPreflight('ROADMAP'),
+      decideRoute: async () => ({
+        decision: compositionDecision, submittedAtMs: 0, usage: ZERO_USAGE,
+      }),
+      ...(doneRetryPromotionContract ? {
+        writeDeferredPromotionState: state => {
+          deferredPromotionState = structuredClone(state)
+        },
+        readDeferredPromotionState: () => deferredPromotionState,
+      } : {}),
     },
   })
   const recordRoot = path.join(harness.directory, 'composition-record')
@@ -12350,6 +13950,7 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
   let checkIndex = 0
   let productCheckIndex = 0
   let firstWorkerTransportFailed = false
+  let repairTransportFailed = false
   harness.runtimeOptions.launcher = async launch => {
     harness.launches.push(launch)
     if (launch.logicalRole === 'diagnostic-probe') return representativeProbeResult(launch)
@@ -12365,6 +13966,21 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
       launch.onUsageDelta(ZERO_USAGE)
       throw Object.assign(new Error('the first product provider transport timed out'), {
         code: options.transportFailureCode || 'CHILD_TRANSPORT_TIMEOUT',
+      })
+    }
+    if (options.transportFailureOnRepairBase === true &&
+        launch.workItemId === 'work-1-repair-1' && !repairTransportFailed) {
+      repairTransportFailed = true
+      launch.onUsageDelta(ZERO_USAGE)
+      throw Object.assign(new Error('the isolated repair provider transport timed out'), {
+        code: 'CHILD_TRANSPORT_TIMEOUT',
+      })
+    }
+    if (options.transportFailureOnRepairSuccessor === true &&
+        launch.workItemId === 'work-1-repair-1-transport-retry-1') {
+      launch.onUsageDelta(ZERO_USAGE)
+      throw Object.assign(new Error('the isolated repair transport successor timed out'), {
+        code: 'CHILD_TRANSPORT_TIMEOUT',
       })
     }
     let result
@@ -12417,6 +14033,17 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
           ? 'The repaired resumed product passes the independent acceptance check.'
           : 'The first resumed product candidate fails the independent acceptance check.',
       )
+      if (doneRetryPromotionContract && code === 'PASS') {
+        result.payload.capturedDomainOutcomes = [{
+          schemaVersion: '1.0.0', kind: 'DONE_RETRY_PROMOTION',
+          priorDoneCandidateHash: doneRetryPromotionContract.priorDoneCandidateHash,
+          isolationCertificateHash: doneRetryPromotionContract.isolationCertificateHash,
+          retryCandidateHash: launch.candidateHash,
+          isolatedWorktreeHash: 'd'.repeat(64), isolationVerified: true,
+          acceptanceResults: [{ id: 'focused', status: 'PASS', evidenceHash: 'f'.repeat(64) }],
+          acceptanceJoinHash: 'e'.repeat(64), promotionCandidateHash: launch.candidateHash,
+        }]
+      }
     } else {
       result = roadmapCompositionRoleResult(launch, ['Retain the accepted roadmap coordination context.'])
     }
@@ -12443,6 +14070,8 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
       buildHash: crypto.createHash('sha256').update('composition-build').digest('hex'),
       oracleHash: crypto.createHash('sha256').update('composition-oracle').digest('hex'),
     }),
+    writeCapturedDomainAdmission: () => ({}),
+    writeCapturedDomainOutcomes: () => {},
     writePlan: (route, routeDecision, authorResult) => {
       const bytes = Buffer.from(renderPlanArtifact(route, routeDecision, authorResult), 'utf8')
       fs.writeFileSync(planPath, bytes)
@@ -12477,10 +14106,12 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
     },
   })
   const acceptedPlan = path.join(harness.directory, 'accepted-roadmap.txt')
+  let advancedAfterInitialWorker = false
   harness.runtimeOptions.executeRoute = async input => {
     try {
       return await executor({
         ...input,
+        ...(doneRetryPromotionContract ? { decision: compositionDecision } : {}),
         launch: async request => {
           routeRequests.set(request.workItemId, request)
           if (request.workItemId === 'mission-coordination') {
@@ -12505,6 +14136,12 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
             throw Object.assign(new Error('plan composition accepted'), { code: 'COMPOSITION_PLAN_ACCEPTED' })
           }
           const result = await input.launch(request)
+          if (!advancedAfterInitialWorker && request.workItemId === 'work-1' &&
+              Number.isSafeInteger(options.advanceAfterInitialWorkerMs) &&
+              options.advanceAfterInitialWorkerMs > 0) {
+            harness.advance(options.advanceAfterInitialWorkerMs)
+            advancedAfterInitialWorker = true
+          }
           routeReturns.set(request.workItemId, result)
           return result
         },
@@ -12521,6 +14158,7 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
   }
   return {
     harness, planHashes, results, routeRequests, routeReturns, recordRoot, workerPrivateRoot,
+    deferredPromotionState: () => deferredPromotionState,
     setRuntime(value) { runtime = value },
     steeringResult() { return steeringResult },
   }

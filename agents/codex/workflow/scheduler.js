@@ -42,7 +42,7 @@ const ROUTE_BUDGETS = deepFreeze({
     tokens: { noncachedInput: 1200000, cachedInput: 5000000, output: 160000 },
   },
 })
-// The ordinary route maps remain the economic ceiling. A freshly compiled
+// The ordinary route launch maps remain economic convergence targets. A freshly compiled
 // completion graph may additionally contain the one executable
 // pre-production gate (fixture provenance). Wrong-layer/depth evidence is a
 // controller directive carried by the product worker and reserves no model
@@ -117,6 +117,7 @@ const ADMISSION_COMPONENT_CEILINGS_MS = deepFreeze({
   lightPlanning: 5 * 60 * 1000,
   roadmapPlanning: 15 * 60 * 1000,
 })
+const REQUIRED_COMPLETION_ISSUER_CAPABILITIES = new WeakMap()
 
 class SchedulerAdmissionError extends Error {
   constructor(code, message, details = {}) {
@@ -244,7 +245,7 @@ function resolveRouteBudget(route, options = {}) {
     budget.maxLiveIncludingRoot = Math.min(requested, maximum)
   }
 
-  // 5 + 3/work-group is itself a ceiling, capped by the activation-wide 18.
+  // 5 + 3/work-group is itself a launch target, capped by the activation-wide 18.
   // It never creates a minimum or a spawn quota.
   if (normalized === 'ROADMAP' && options.workGroups !== undefined &&
       budget.maxChildLaunches === base.maxChildLaunches) {
@@ -253,8 +254,9 @@ function resolveRouteBudget(route, options = {}) {
   }
 
   // Once the compiler supplies the exact frozen topology plus its finite
-  // correction/gate reserve, use that number for every route. Never silently
-  // clamp an impossible graph and discover LAUNCH_LIMIT after work has begun.
+  // correction/gate reserve, use that number as the route launch target.
+  // Scheduler-authenticated required corrections may cross it; optional and
+  // unbound launches may not.
   let requiredChildLaunches = null
   if (options.requiredChildLaunches !== undefined) {
     requiredChildLaunches = Number(options.requiredChildLaunches)
@@ -317,14 +319,6 @@ function resolveSchedulerSettings(options = {}) {
       },
     }
   }
-  const exactCompletionRequirement = budget.exactCompletionRequirement ?? null
-  if (exactCompletionRequirement !== null &&
-      (!lanes.main || lanes.main.maxLaunches < exactCompletionRequirement)) {
-    throw new SchedulerAdmissionError(
-      'ROUTE_LAUNCH_REQUIREMENT_INVALID',
-      `main work item cannot admit the exact ${exactCompletionRequirement}-launch completion graph`,
-    )
-  }
   return deepFreeze({
     schemaVersion: 1,
     route,
@@ -361,13 +355,17 @@ function validateResolvedSchedulerSettings(settings) {
   const budget = settings.budget
   const exactCompletionCeiling = map.maxChildLaunches + MAX_PREPRODUCTION_GATE_LAUNCHES
   const exactCompletionRequirement = budget.exactCompletionRequirement
-  const validLaunchCeiling = Number.isInteger(budget.maxChildLaunches) && budget.maxChildLaunches > 0 && (
-    budget.maxChildLaunches <= map.maxChildLaunches ||
+  const exactCompletionDeclared = exactCompletionRequirement !== undefined
+  const validExactCompletion = !exactCompletionDeclared ||
     Number.isSafeInteger(exactCompletionRequirement) &&
+      exactCompletionRequirement >= 1 &&
       exactCompletionRequirement === budget.maxChildLaunches &&
       exactCompletionRequirement <= exactCompletionCeiling
+  const validLaunchCeiling = Number.isInteger(budget.maxChildLaunches) && budget.maxChildLaunches > 0 && (
+    budget.maxChildLaunches <= map.maxChildLaunches ||
+    validExactCompletion && exactCompletionDeclared
   )
-  if (!validLaunchCeiling ||
+  if (!validExactCompletion || !validLaunchCeiling ||
       !(Number.isInteger(budget.maxLiveIncludingRoot) && budget.maxLiveIncludingRoot > 0 && budget.maxLiveIncludingRoot <= maximumLive) ||
       !(Number.isInteger(budget.maxDepth) && budget.maxDepth > 0 && budget.maxDepth <= map.maxDepth)) {
     throw new SchedulerAdmissionError('INVALID_SCHEDULER_SETTINGS', 'route settings exceed the map ceiling')
@@ -627,29 +625,50 @@ function budgetClass(request) {
 }
 
 function requiresMarginalValue(request = {}) {
-  const fields = normalizedRequestFields(request)
-  const optional = firstNormalizedField(fields, ['optional', 'optionalWork', 'isOptional'])
-  const implied = firstNormalizedField(fields, ['impliedScope', 'isImplied', 'scopeImplied'])
-  const essential = firstNormalizedField(fields, ['missionEssential', 'isMissionEssential'])
-  const scope = String(firstNormalizedField(fields, ['scopeKind', 'scope', 'workScope']) || '')
-    .toLowerCase().replace(/[_\s]+/g, '-')
-  const roleIdentities = ['logicalRole', 'role', 'providerRole', 'legacyRole', 'roleAlias']
-    .map(name => firstNormalizedField(fields, [name]))
+  const rawValues = names => {
+    const accepted = new Set(names.map(normalizedFieldName))
+    return Object.entries(request)
+      .filter(([name]) => accepted.has(normalizedFieldName(name)))
+      .map(([, value]) => value)
+  }
+  // Read every raw alias value. A normalized Map is useful for ordinary
+  // fallback fields, but it must not let a later snake/camel spelling erase a
+  // security-relevant true signal carried by an earlier spelling.
+  const signalIs = (names, expected) => rawValues(names).some(value => value === expected)
+  const optional = signalIs(['optional', 'optionalWork', 'isOptional'], true)
+  const implied = signalIs(['impliedScope', 'isImplied', 'scopeImplied'], true)
+  const explicitlyNonessential = signalIs(['missionEssential', 'isMissionEssential'], false)
+  const explicitlyEssential = signalIs([
+    'missionEssential', 'isMissionEssential', 'requiredByMission', 'userRequested',
+  ], true)
+  const scopeIdentities = rawValues(['scopeKind', 'scope', 'workScope'])
+    .filter(value => value !== undefined && value !== null)
+    .map(value => String(value).normalize('NFKC').toLowerCase().replace(/[_\s]+/g, '-'))
+  const roleIdentities = rawValues(['logicalRole', 'role', 'providerRole', 'legacyRole', 'roleAlias'])
     .filter(value => value !== undefined && value !== null)
     .map(value => String(value).normalize('NFKC').toLowerCase())
-  const purpose = String(firstNormalizedField(fields, ['purpose', 'kind']) || '').toLowerCase()
+  const purposes = rawValues(['purpose', 'kind'])
+    .filter(value => value !== undefined && value !== null)
+    .map(value => String(value).normalize('NFKC').toLowerCase())
   const optionalRoleIds = new Set([
     'ap-arbiter', 'ap-depth-prober', 'ap-manager', 'ap-re-anchor', 'ap-roadmap-scout',
     'ap-run-coordinator', 'ap-sweeper',
   ])
   const optionalRole = roleIdentities.some(role => optionalRoleIds.has(role) ||
     /(?:^|[-_.])(?:ap-)?(scout|sweeper|juror|researcher)(?:$|[-_.@])/.test(role)) ||
-    ['scouting', 'sweep', 'optional-review', 'optional-research', 'extra-check'].includes(purpose)
-  const explicitlyEssential = essential === true || firstNormalizedField(fields, ['requiredByMission', 'userRequested']) === true
-  return !explicitlyEssential && (
-    optional === true || implied === true || essential === false || optionalRole ||
-    ['optional', 'implied', 'nonessential', 'non-essential'].includes(scope)
-  )
+    purposes.some(purpose =>
+      ['scouting', 'sweep', 'optional-review', 'optional-research', 'extra-check'].includes(purpose))
+  const optionalScope = scopeIdentities.some(scope =>
+    ['optional', 'implied', 'nonessential', 'non-essential'].includes(scope))
+  const optionalSignal = optional || implied || explicitlyNonessential || optionalRole || optionalScope
+  if (optionalSignal && explicitlyEssential) {
+    throw new SchedulerAdmissionError(
+      'OPTIONAL_ESSENTIAL_CONFLICT',
+      'optional or nonessential work cannot be elevated into required completion work',
+      { optional, implied, explicitlyNonessential, optionalRole, optionalScope },
+    )
+  }
+  return optionalSignal
 }
 
 function progressFingerprintFor(request = {}) {
@@ -879,6 +898,19 @@ class RootAccountingLease {
 
 class CentralScheduler {
   constructor(options = {}) {
+    const requiredCompletionIssuerCapability = options.requiredCompletionIssuerCapability
+    if (requiredCompletionIssuerCapability !== undefined &&
+        (requiredCompletionIssuerCapability === null ||
+          !['object', 'function'].includes(typeof requiredCompletionIssuerCapability))) {
+      throw new SchedulerAdmissionError(
+        'INVALID_LAUNCH_AUTHORITY',
+        'required completion issuer capability must be an opaque object identity',
+      )
+    }
+    REQUIRED_COMPLETION_ISSUER_CAPABILITIES.set(
+      this,
+      requiredCompletionIssuerCapability === undefined ? null : requiredCompletionIssuerCapability,
+    )
     this.environment = options.environment || options.baseEnvironment || process.env
     const identity = options.runIdentity
     if (!identity || !nonEmpty(identity.runId) || !Number.isInteger(Number(identity.generation)) || Number(identity.generation) < 0) {
@@ -929,6 +961,8 @@ class CentralScheduler {
     this._progressFingerprints = new Map()
     this._laneCounters = Object.fromEntries(Object.keys(this.settings.lanes).map((lane) => [lane, {
       launches: 0,
+      requiredCompletionLaunches: 0,
+      requiredCompletionLaunchOverruns: 0,
       live: 0,
       usage: emptyUsage(),
       reserved: emptyUsage(),
@@ -991,6 +1025,8 @@ class CentralScheduler {
       queued: 0,
       dequeued: 0,
       totalLaunches: 0,
+      requiredCompletionLaunches: 0,
+      requiredCompletionLaunchOverruns: 0,
       maxDepthObserved: 0,
       peakLiveIncludingRoot: 1,
       optionalEvaluated: 0,
@@ -1053,6 +1089,8 @@ class CentralScheduler {
     this.budget = merged.budget
     this._laneCounters = Object.fromEntries(Object.keys(merged.lanes).map((lane) => [lane, prior[lane] || {
       launches: 0,
+      requiredCompletionLaunches: 0,
+      requiredCompletionLaunchOverruns: 0,
       live: 0,
       usage: emptyUsage(),
       reserved: emptyUsage(),
@@ -1468,20 +1506,18 @@ class CentralScheduler {
       throw this._error('INVALID_WORK_ITEM', 'retry progress preflight requires a work item and equivalence key')
     }
     const requiredCompletionBinding = request.requiredCompletionBinding || null
-    let boundFingerprint = null
     if (requiredCompletionBinding) {
       const expected = requiredCompletionIdentityBody(this.runIdentity, this.route, this.budget, request)
       if (!this._issuedRequiredCompletionBindings.has(requiredCompletionBinding) ||
           !requiredCompletionIdentityMatches(requiredCompletionBinding, expected)) {
         throw this._error('INVALID_LAUNCH_AUTHORITY', 'retry preflight has a foreign required completion identity')
       }
-      boundFingerprint = requiredCompletionBinding.identityHash
     }
     this._assertCanAttempt({
       ...request,
       workItemId,
       equivalenceKey,
-      progressFingerprint: progressFingerprintFor(request) || boundFingerprint,
+      progressFingerprint: progressFingerprintFor(request),
     })
     return Object.freeze({
       equivalenceKey,
@@ -1490,7 +1526,14 @@ class CentralScheduler {
     })
   }
 
-  issueRequiredCompletionBinding(request = {}) {
+  issueRequiredCompletionBinding(request = {}, issuerCapability) {
+    const expectedIssuerCapability = REQUIRED_COMPLETION_ISSUER_CAPABILITIES.get(this)
+    if (expectedIssuerCapability === null || issuerCapability !== expectedIssuerCapability) {
+      throw this._error(
+        'INVALID_LAUNCH_AUTHORITY',
+        'required completion identity requires the exact controller-held issuer capability',
+      )
+    }
     const body = requiredCompletionIdentityBody(this.runIdentity, this.route, this.budget, request)
     if (!Number.isSafeInteger(body.exactCompletionRequirement) || body.exactCompletionRequirement < 1) {
       throw this._error(
@@ -1771,6 +1814,9 @@ class CentralScheduler {
     addUsage(combined, totalUsage(this._reserved))
     const targetBreaches = []
     const ceilingBreaches = []
+    if (this._metrics.totalLaunches > this.budget.maxChildLaunches) {
+      targetBreaches.push('route:launches')
+    }
     for (const dimension of TOKEN_DIMENSIONS) {
       const routeKey = `route:${dimension}`
       if (combined[dimension] >= this.budget.tokens[dimension]) targetBreaches.push(routeKey)
@@ -1783,6 +1829,9 @@ class CentralScheduler {
     for (const [lane, counter] of Object.entries(this._laneCounters)) {
       const laneUsage = { ...counter.usage }
       addUsage(laneUsage, counter.reserved)
+      if (counter.launches > this.settings.lanes[lane].maxLaunches) {
+        targetBreaches.push(`lane:${lane}:launches`)
+      }
       for (const dimension of TOKEN_DIMENSIONS) {
         const key = `lane:${lane}:${dimension}`
         if (laneUsage[dimension] >= this.settings.lanes[lane].tokens[dimension]) targetBreaches.push(key)
@@ -2012,6 +2061,8 @@ class CentralScheduler {
       lanes[lane] = {
         limits: this.settings.lanes[lane],
         launches: this._laneCounters[lane].launches,
+        requiredCompletionLaunches: this._laneCounters[lane].requiredCompletionLaunches,
+        requiredCompletionLaunchOverruns: this._laneCounters[lane].requiredCompletionLaunchOverruns,
         live: this._laneCounters[lane].live,
         usage: { ...this._laneCounters[lane].usage },
         reserved: { ...this._laneCounters[lane].reserved },
@@ -2247,7 +2298,8 @@ class CentralScheduler {
 
   authorizeRequiredCompletionAccounting(lease) {
     const record = this._recordForLease(lease)
-    if (!this._issuedLeases.has(lease) || record.budgetClass === 'optional' ||
+    if (!this._issuedLeases.has(lease) || record.requiredCompletionAuthenticated !== true ||
+        record.budgetClass === 'optional' ||
         record.marginalValueRequired === true || record.status === 'terminal') {
       throw this._error(
         'INVALID_LAUNCH_AUTHORITY',
@@ -2294,6 +2346,9 @@ class CentralScheduler {
           parentLeaseId: record.parentLease ? record.parentLease.id : null,
           resources: record.resources,
           budgetClass: record.budgetClass,
+          marginalValueRequired: record.marginalValueRequired === true,
+          requiredCompletionAuthenticated: record.requiredCompletionAuthenticated === true,
+          requiredCompletionBinding: record.requiredCompletionBinding || null,
           estimate: { ...record.estimate },
           remainingEstimate: { ...record.remainingEstimate },
           reported: { ...record.reported },
@@ -2393,6 +2448,33 @@ class CentralScheduler {
           !saved.caller || !nonEmpty(saved.caller.role) || !nonEmpty(saved.caller.sessionId)) {
         throw this._error('CRASH_CHECKPOINT_INVALID', 'saved live scheduler budget class or physical caller binding is invalid')
       }
+      const marginalValueRequired = saved.budgetClass === 'optional'
+      if (saved.marginalValueRequired !== marginalValueRequired ||
+          (marginalValueRequired && saved.requiredCompletionAuthenticated === true)) {
+        throw this._error('CRASH_CHECKPOINT_INVALID', 'saved live scheduler optional/required classification is invalid')
+      }
+      const requiredCompletionAuthenticated = saved.requiredCompletionAuthenticated === true
+      if (requiredCompletionAuthenticated) {
+        const expectedRequiredBody = requiredCompletionIdentityBody(
+          priorIdentity,
+          this.route,
+          this.budget,
+          {
+            workItemId: saved.workItemId,
+            equivalenceKey: saved.equivalenceKey,
+            role: saved.role,
+            logicalRole: saved.logicalRole,
+            purpose: saved.purpose,
+            lane: saved.lane,
+            candidateHash: saved.inspectedCandidateHash || null,
+          },
+        )
+        if (!requiredCompletionIdentityMatches(saved.requiredCompletionBinding, expectedRequiredBody)) {
+          throw this._error('CRASH_CHECKPOINT_INVALID', 'saved required launch lacks its scheduler-bound completion identity')
+        }
+      } else if (saved.requiredCompletionBinding !== null) {
+        throw this._error('CRASH_CHECKPOINT_INVALID', 'saved unbound launch carries a required completion identity')
+      }
       let providerCapabilities
       try { providerCapabilities = validateProviderCapabilities(saved.providerCapabilities) } catch (error) {
         throw this._error('CRASH_CHECKPOINT_INVALID', 'saved live scheduler provider capabilities are invalid', {
@@ -2430,6 +2512,9 @@ class CentralScheduler {
         parentLease,
         resources,
         budgetClass: saved.budgetClass,
+        marginalValueRequired,
+        requiredCompletionAuthenticated,
+        requiredCompletionBinding: saved.requiredCompletionBinding || null,
         estimate: normalizeUsageDelta(saved.estimate),
         remainingEstimate: normalizeUsageDelta(saved.remainingEstimate),
         reported: normalizeUsageDelta(saved.reported),
@@ -2602,7 +2687,6 @@ class CentralScheduler {
       ? request.equivalenceKey.trim()
       : (nonEmpty(request.retryOf) ? request.retryOf.trim() : workItemId.trim())
     const requiredCompletionBinding = request.requiredCompletionBinding || null
-    let requiredCompletionFingerprint = null
     if (requiredCompletionBinding) {
       if (authority.requiredCompletionBinding !== requiredCompletionBinding ||
           !this._issuedRequiredCompletionBindings.has(requiredCompletionBinding)) {
@@ -2620,7 +2704,6 @@ class CentralScheduler {
       if (!requiredCompletionIdentityMatches(requiredCompletionBinding, expected)) {
         throw this._error('INVALID_LAUNCH_AUTHORITY', 'required completion identity differs from the admitted request')
       }
-      requiredCompletionFingerprint = requiredCompletionBinding.identityHash
     } else if (authority.requiredCompletionBinding) {
       throw this._error('INVALID_LAUNCH_AUTHORITY', 'launch request omitted its authority-bound completion identity')
     }
@@ -2631,8 +2714,9 @@ class CentralScheduler {
       caller: Object.freeze({ role: authority.callerRole, sessionId: authority.sessionId }),
       providerCapabilities: authority.providerCapabilities,
       equivalenceKey,
-      progressFingerprint: progressFingerprintFor(request) || requiredCompletionFingerprint,
+      progressFingerprint: progressFingerprintFor(request),
       requiredCompletionBinding,
+      requiredCompletionAuthenticated: requiredCompletionBinding !== null,
       depth,
       lane,
       parentLease,
@@ -2660,6 +2744,9 @@ class CentralScheduler {
       if (request.lane !== 'routeAnalyst' || request.role !== 'ap-route-analyst' || request.parentLease) {
         throw this._error('PENDING_ADMISSION_ROLE', 'pending child admission permits exactly one root route analyst; L0 uses root accounting')
       }
+      if (this._laneCounters.routeAnalyst.launches >= 1) {
+        throw this._error('PENDING_ADMISSION_ROLE', 'pending admission permits exactly one route analyst launch')
+      }
     }
     if (request.depth > this.budget.maxDepth) {
       throw this._error('DEPTH_LIMIT', 'route depth ceiling exceeded', {
@@ -2667,16 +2754,18 @@ class CentralScheduler {
         limit: this.budget.maxDepth,
       })
     }
-    if (this._metrics.totalLaunches >= this.budget.maxChildLaunches) {
-      throw this._error('LAUNCH_LIMIT', 'activation child-launch ceiling exhausted', {
+    if (this._metrics.totalLaunches >= this.budget.maxChildLaunches &&
+        !request.requiredCompletionAuthenticated) {
+      throw this._error('LAUNCH_LIMIT', 'activation child-launch target exhausted for unbound work', {
         used: this._metrics.totalLaunches,
         limit: this.budget.maxChildLaunches,
       })
     }
     const laneState = this._laneCounters[request.lane]
     const laneLimit = this.settings.lanes[request.lane]
-    if (laneState.launches >= laneLimit.maxLaunches) {
-      throw this._error('LANE_LAUNCH_LIMIT', 'work item stream child-launch ceiling exhausted')
+    if (laneState.launches >= laneLimit.maxLaunches &&
+        !request.requiredCompletionAuthenticated) {
+      throw this._error('LANE_LAUNCH_LIMIT', 'work item stream child-launch target exhausted for unbound work')
     }
     const boundLane = this._equivalenceLanes.get(request.equivalenceKey)
     if (boundLane && boundLane !== request.lane) {
@@ -2689,27 +2778,55 @@ class CentralScheduler {
       throw this._error('DUPLICATE_WORK_ITEM', `work item is already live or queued: ${request.workItemId}`)
     }
     if (request.marginalValueRequired) {
-      this._metrics.optionalEvaluated++
-      request.marginalValue = evaluateMarginalValue(request.valueCase)
-      if (!request.marginalValue.admitted) {
+      const marginalValue = evaluateMarginalValue(request.valueCase)
+      if (!marginalValue.admitted) {
+        this._metrics.optionalEvaluated++
         this._metrics.optionalRejected++
-        throw this._error(request.marginalValue.code, 'optional work lacks positive, separate marginal value', request.marginalValue)
+        throw this._error(marginalValue.code, 'optional work lacks positive, separate marginal value', marginalValue)
       }
+      this._assertRequiredFrontierCapacity(request)
+      this._metrics.optionalEvaluated++
+      request.marginalValue = marginalValue
       request.marginalBoundary = String(request.valueCase.disjointBoundary || request.valueCase.boundary)
         .normalize('NFKC').trim().toLowerCase()
-      const owner = this._optionalBoundaryOwners.get(request.marginalBoundary)
-      if (owner && owner !== request.equivalenceKey) {
-        this._metrics.optionalRejected++
-        throw this._error('OPTIONAL_BOUNDARY_DUPLICATE', 'optional work must cover a named boundary not already admitted', {
-          boundary: request.marginalBoundary,
-          owner,
-        })
-      }
+      this._assertOptionalBoundaryAvailable(request)
     }
     this._assertBudget(request)
-    if (request.marginalValueRequired) {
-      this._optionalBoundaryOwners.set(request.marginalBoundary, request.equivalenceKey)
+  }
+
+  _assertOptionalBoundaryAvailable(request) {
+    if (!request.marginalValueRequired) return
+    const owner = this._optionalBoundaryOwners.get(request.marginalBoundary)
+    if (owner && owner !== request.equivalenceKey) {
+      this._metrics.optionalRejected++
+      throw this._error('OPTIONAL_BOUNDARY_DUPLICATE', 'optional work must cover a named boundary not already admitted', {
+        boundary: request.marginalBoundary,
+        owner,
+      })
     }
+  }
+
+  _assertRequiredFrontierCapacity(request) {
+    if (!request.marginalValueRequired) return
+    const requiredFrontierSlots = this.budget.exactCompletionRequirement
+    if (!Number.isSafeInteger(requiredFrontierSlots) || requiredFrontierSlots < 1) return
+    const optionalLaunchCapacity = Math.max(
+      0,
+      this.budget.maxChildLaunches - requiredFrontierSlots,
+    )
+    if (optionalLaunchCapacity > 0 &&
+        this._metrics.optionalAdmitted < optionalLaunchCapacity) return
+    throw this._error(
+      'ADMISSION_OPTIONAL_COLLAPSED',
+      'authenticated next ready work reserves the remaining launch slots',
+      {
+        reason: 'required-work-reserved',
+        requiredFrontierSlots,
+        optionalLaunchCapacity,
+        optionalLaunchesAdmitted: this._metrics.optionalAdmitted,
+        launchCeiling: this.budget.maxChildLaunches,
+      },
+    )
   }
 
   _tryStart(request) {
@@ -2766,11 +2883,18 @@ class CentralScheduler {
   }
 
   _start(request) {
-    if (this._metrics.totalLaunches >= this.budget.maxChildLaunches) {
-      throw this._error('LAUNCH_LIMIT', 'activation child-launch ceiling exhausted')
+    // Recheck at the physical start boundary: more than one optional request
+    // can pass queue validation before an earlier request acquires its slot.
+    this._assertRequiredFrontierCapacity(request)
+    this._assertOptionalBoundaryAvailable(request)
+    const routeTargetOverrun = this._metrics.totalLaunches >= this.budget.maxChildLaunches
+    const laneTargetOverrun = this._laneCounters[request.lane].launches >=
+      this.settings.lanes[request.lane].maxLaunches
+    if (routeTargetOverrun && !request.requiredCompletionAuthenticated) {
+      throw this._error('LAUNCH_LIMIT', 'activation child-launch target exhausted for unbound work')
     }
-    if (this._laneCounters[request.lane].launches >= this.settings.lanes[request.lane].maxLaunches) {
-      throw this._error('LANE_LAUNCH_LIMIT', 'work item stream child-launch ceiling exhausted')
+    if (laneTargetOverrun && !request.requiredCompletionAuthenticated) {
+      throw this._error('LANE_LAUNCH_LIMIT', 'work item stream child-launch target exhausted for unbound work')
     }
     const attempt = (this._attempts.get(request.equivalenceKey) || 0) + 1
     this._attempts.set(request.equivalenceKey, attempt)
@@ -2790,12 +2914,27 @@ class CentralScheduler {
     this._live.set(id, record)
     this._claimResources(record)
     addUsage(this._reserved[record.budgetClass], record.estimate)
+    if (record.marginalValueRequired) {
+      this._optionalBoundaryOwners.set(record.marginalBoundary, record.equivalenceKey)
+    }
     this._laneCounters[record.lane].launches++
+    if (record.requiredCompletionAuthenticated) {
+      this._laneCounters[record.lane].requiredCompletionLaunches++
+      this._metrics.requiredCompletionLaunches++
+      if (routeTargetOverrun) this._metrics.requiredCompletionLaunchOverruns++
+      if (laneTargetOverrun) this._laneCounters[record.lane].requiredCompletionLaunchOverruns++
+    }
     this._laneCounters[record.lane].live++
     addUsage(this._laneCounters[record.lane].reserved, record.estimate)
 
     this._metrics.admitted++
     this._metrics.totalLaunches++
+    if (routeTargetOverrun) {
+      this._convergenceBreaches.add('route:launches')
+    }
+    if (laneTargetOverrun) {
+      this._convergenceBreaches.add(`lane:${record.lane}:launches`)
+    }
     if (attempt > 1) this._metrics.retriesStarted++
     if (request.marginalValueRequired) this._metrics.optionalAdmitted++
     this._metrics.maxDepthObserved = Math.max(this._metrics.maxDepthObserved, request.depth)
@@ -3219,6 +3358,76 @@ class CentralScheduler {
     if ([...this._optionalBoundaryOwners.entries()].some(([boundary, owner]) => !nonEmpty(boundary) || !nonEmpty(owner))) {
       throw this._error('INVALID_SCHEDULER_STATE', 'saved optional marginal-value boundaries are invalid')
     }
+    const savedMetrics = state.metrics
+    const expectedLanes = Object.keys(this._laneCounters).sort()
+    const savedLaneNames = state.laneCounters && typeof state.laneCounters === 'object' &&
+      !Array.isArray(state.laneCounters)
+      ? Object.keys(state.laneCounters).sort()
+      : []
+    const laneLaunches = expectedLanes.reduce((total, lane) => {
+      const launches = state.laneCounters && state.laneCounters[lane] &&
+        state.laneCounters[lane].launches
+      return total + (Number.isSafeInteger(launches) && launches >= 0 ? launches : 0)
+    }, 0)
+    const totalLaunches = state.totalLaunches
+    const metricTotalLaunches = savedMetrics && savedMetrics.totalLaunches
+    const requiredCompletionLaunches = savedMetrics &&
+      (savedMetrics.requiredCompletionLaunches ?? 0)
+    const requiredCompletionLaunchOverruns = savedMetrics &&
+      (savedMetrics.requiredCompletionLaunchOverruns ?? 0)
+    const optionalAdmitted = savedMetrics && savedMetrics.optionalAdmitted
+    const optionalEvaluated = savedMetrics && savedMetrics.optionalEvaluated
+    const optionalRejected = savedMetrics && savedMetrics.optionalRejected
+    const exactFrontier = this.budget.exactCompletionRequirement
+    const requiredCompletionBindingAvailable = this.route === PENDING_ROUTE ||
+      Number.isSafeInteger(exactFrontier) && exactFrontier > 0
+    const optionalCapacity = Number.isSafeInteger(exactFrontier) && exactFrontier > 0
+      ? Math.max(0, this.budget.maxChildLaunches - exactFrontier)
+      : this.budget.maxChildLaunches
+    const routeLaunchOverrun = Math.max(0, totalLaunches - this.budget.maxChildLaunches)
+    const laneRequiredCompletionLaunches = expectedLanes.reduce((total, lane) => {
+      const saved = state.laneCounters && state.laneCounters[lane] || {}
+      return total + Number(saved.requiredCompletionLaunches ?? 0)
+    }, 0)
+    const validLaneLaunchAccounting = expectedLanes.every((lane) => {
+      const saved = state.laneCounters && state.laneCounters[lane] || {}
+      const requiredLaunches = saved.requiredCompletionLaunches ?? 0
+      const requiredOverruns = saved.requiredCompletionLaunchOverruns ?? 0
+      const targetOverrun = Math.max(0, saved.launches - this.settings.lanes[lane].maxLaunches)
+      return Number.isSafeInteger(requiredLaunches) && requiredLaunches >= 0 &&
+        requiredLaunches <= saved.launches &&
+        Number.isSafeInteger(requiredOverruns) && requiredOverruns === targetOverrun &&
+        requiredOverruns <= requiredLaunches
+    })
+    if (!savedMetrics || typeof savedMetrics !== 'object' || Array.isArray(savedMetrics) ||
+        stableStringify(savedLaneNames) !== stableStringify(expectedLanes) ||
+        !expectedLanes.every(lane => state.laneCounters[lane] &&
+          Number.isSafeInteger(state.laneCounters[lane].launches) &&
+          state.laneCounters[lane].launches >= 0) ||
+        !Number.isSafeInteger(totalLaunches) || totalLaunches < 0 ||
+        (this.route === PENDING_ROUTE && totalLaunches > 1) ||
+        !Number.isSafeInteger(metricTotalLaunches) || metricTotalLaunches !== totalLaunches ||
+        laneLaunches !== totalLaunches ||
+        !Number.isSafeInteger(requiredCompletionLaunches) || requiredCompletionLaunches < 0 ||
+        requiredCompletionLaunches > totalLaunches ||
+        (!requiredCompletionBindingAvailable && requiredCompletionLaunches > 0) ||
+        requiredCompletionLaunches !== laneRequiredCompletionLaunches ||
+        !Number.isSafeInteger(requiredCompletionLaunchOverruns) ||
+        requiredCompletionLaunchOverruns !== routeLaunchOverrun ||
+        requiredCompletionLaunchOverruns > requiredCompletionLaunches ||
+        !validLaneLaunchAccounting ||
+        !Number.isSafeInteger(optionalAdmitted) || optionalAdmitted < 0 ||
+        optionalAdmitted + requiredCompletionLaunches > totalLaunches ||
+        optionalAdmitted > optionalCapacity ||
+        !Number.isSafeInteger(optionalEvaluated) || optionalEvaluated < optionalAdmitted ||
+        !Number.isSafeInteger(optionalRejected) || optionalRejected < 0 ||
+        optionalRejected > optionalEvaluated ||
+        this._optionalBoundaryOwners.size > optionalAdmitted) {
+      throw this._error(
+        'INVALID_SCHEDULER_STATE',
+        'saved launch accounting does not match the authenticated required/optional topology',
+      )
+    }
     for (const group of Object.keys(this._usage)) {
       this._usage[group] = { ...emptyUsage(), ...((state.usage || {})[group] || {}) }
     }
@@ -3227,7 +3436,9 @@ class CentralScheduler {
       ...(state.metrics || {}),
       rejectedByCode: { ...((state.metrics || {}).rejectedByCode || {}) },
     }
-    this._metrics.totalLaunches = finiteNonNegative(state.totalLaunches, this._metrics.totalLaunches)
+    this._metrics.totalLaunches = totalLaunches
+    this._metrics.requiredCompletionLaunches = requiredCompletionLaunches
+    this._metrics.requiredCompletionLaunchOverruns = requiredCompletionLaunchOverruns
     this._startedAt = finiteNonNegative(state.startedAt, this._startedAt)
     this._lastProgressAt = finiteNonNegative(state.lastProgressAt, this._startedAt)
     this._lastProgressKind = state.lastProgressKind || 'activation'
@@ -3305,6 +3516,8 @@ class CentralScheduler {
       if (!saved) continue
       this._laneCounters[lane] = {
         launches: nonNegativeInteger(saved.launches, 0),
+        requiredCompletionLaunches: nonNegativeInteger(saved.requiredCompletionLaunches, 0),
+        requiredCompletionLaunchOverruns: nonNegativeInteger(saved.requiredCompletionLaunchOverruns, 0),
         live: 0,
         usage: { ...emptyUsage(), ...(saved.usage || {}) },
         reserved: emptyUsage(),
@@ -3330,6 +3543,8 @@ function cloneLaneCounters(lanes) {
   for (const lane of Object.keys(lanes).sort()) {
     out[lane] = {
       launches: lanes[lane].launches,
+      requiredCompletionLaunches: lanes[lane].requiredCompletionLaunches,
+      requiredCompletionLaunchOverruns: lanes[lane].requiredCompletionLaunchOverruns,
       live: lanes[lane].live,
       usage: { ...lanes[lane].usage },
       reserved: { ...lanes[lane].reserved },

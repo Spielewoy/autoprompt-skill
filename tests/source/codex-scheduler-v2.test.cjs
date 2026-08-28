@@ -59,9 +59,19 @@ function finish(lease, usage = {}) {
 
 const TEST_RUN = Object.freeze({ runId: 'scheduler-v2-test', generation: 1 })
 let sessionSequence = 0
+const requiredCompletionIssuers = new WeakMap()
 
 function createTestScheduler(options = {}) {
-  return new CentralScheduler({ route: 'DIRECT', runIdentity: TEST_RUN, ...options })
+  const requiredCompletionIssuerCapability = options.requiredCompletionIssuerCapability || Object.freeze({})
+  const scheduler = new CentralScheduler({
+    route: 'DIRECT', runIdentity: TEST_RUN, ...options, requiredCompletionIssuerCapability,
+  })
+  requiredCompletionIssuers.set(scheduler, requiredCompletionIssuerCapability)
+  return scheduler
+}
+
+function issueRequiredCompletionBinding(scheduler, request, capability = requiredCompletionIssuers.get(scheduler)) {
+  return scheduler.issueRequiredCompletionBinding(request, capability)
 }
 
 function authority(scheduler, parentLease = null, overrides = {}) {
@@ -161,16 +171,19 @@ test('benchmark flags never authorize extra model generations', async () => {
   assert.equal(scheduler.budget.maxChildLaunches, ROUTE_BUDGETS.DIRECT.maxChildLaunches)
 })
 
-test('undersized global launch targets yield to admitted required graph identities while topology stays hard', async () => {
-  const scheduler = new CentralScheduler({
-    route: 'DIRECT', runIdentity: TEST_RUN, maxChildLaunches: 2,
-  })
+test('undersized global launch targets yield only to issuer-authenticated required graph identities', async () => {
+  const settings = resolveSchedulerSettings({ route: 'DIRECT', requiredChildLaunches: 2 })
+  const scheduler = createTestScheduler({ settings })
   const economicTarget = new BudgetController({
     limits: { wallMs: 10_000, tokens: 10, sessions: 1, launches: 1 },
     phases: {},
   })
   for (const workItemId of ['required-result', 'required-check']) {
-    const lease = await admit(scheduler, { workItemId, missionEssential: true })
+    const request = { workItemId, equivalenceKey: workItemId, role: 'ap-worker', lane: 'main' }
+    const requiredCompletionBinding = issueRequiredCompletionBinding(scheduler, request)
+    const lease = await scheduler.acquireWithAuthority(authority(scheduler, null, {
+      requiredCompletionBinding,
+    }), { ...request, requiredCompletionBinding })
     const completion = scheduler.authorizeRequiredCompletionAccounting(lease)
     assert.equal(completion.requiredCompletion, true)
     economicTarget.recordLaunch({ requiredCompletion: completion.requiredCompletion })
@@ -184,9 +197,7 @@ test('undersized global launch targets yield to admitted required graph identiti
   assert.throws(() => scheduler.authorizeRequiredCompletionAccounting({}),
     error => ['INVALID_LEASE', 'INVALID_LAUNCH_AUTHORITY'].includes(error.code))
 
-  const optionalScheduler = new CentralScheduler({
-    route: 'DIRECT', runIdentity: TEST_RUN, maxChildLaunches: 2,
-  })
+  const optionalScheduler = createTestScheduler({ maxChildLaunches: 2 })
   const optional = await admit(optionalScheduler, {
     workItemId: 'optional-expansion', optionalWork: true, valueCase: optionalValue(),
   })
@@ -257,13 +268,130 @@ test('exact completion reserves admit only the executable fixture-provenance gat
     () => resolveSchedulerSettings({ route: 'ROADMAP', requiredChildLaunches: 21 }),
     error => error.code === 'ROUTE_LAUNCH_REQUIREMENT_INVALID',
   )
-  assert.throws(
-    () => resolveSchedulerSettings({
-      route: 'DIRECT', requiredChildLaunches: 10,
-      lanes: { main: { maxLaunches: 9 } },
-    }),
-    error => error.code === 'ROUTE_LAUNCH_REQUIREMENT_INVALID',
-  )
+  const laneTargetBelowGraph = resolveSchedulerSettings({
+    route: 'DIRECT', requiredChildLaunches: 10,
+    lanes: { main: { maxLaunches: 9 } },
+  })
+  assert.equal(laneTargetBelowGraph.lanes.main.maxLaunches, 9)
+  assert.equal(laneTargetBelowGraph.budget.exactCompletionRequirement, 10)
+})
+
+test('exact completion frontier immutably reserves every physical launch slot from optional work', async () => {
+  const settings = resolveSchedulerSettings({ route: 'DIRECT', requiredChildLaunches: 4 })
+  const scheduler = createTestScheduler({ settings })
+
+  await assert.rejects(admit(scheduler, {
+    workItemId: 'optional-without-value-before-checker',
+    optionalWork: true,
+  }), error => error.code === 'MARGINAL_VALUE_REQUIRED')
+  await assert.rejects(admit(scheduler, {
+    workItemId: 'positive-value-optional-before-checker',
+    optionalWork: true,
+    valueCase: optionalValue(),
+  }), error => error.code === 'ADMISSION_OPTIONAL_COLLAPSED' &&
+    error.details.reason === 'required-work-reserved' &&
+    error.details.requiredFrontierSlots === 4 &&
+    error.details.optionalLaunchCapacity === 0)
+  assert.equal(scheduler.getMetrics().counters.totalLaunches, 0)
+  assert.equal(scheduler.getMetrics().counters.optionalAdmitted, 0)
+  assert.equal(scheduler.getMetrics().counters.optionalEvaluated, 1,
+    'a valid optional value case must collapse before value-admission side effects')
+  assert.equal(scheduler.getMetrics().counters.optionalRejected, 1)
+
+  const state = scheduler.exportState()
+  const negativeOptionalCount = structuredClone(state)
+  negativeOptionalCount.metrics.optionalAdmitted = -1
+  assert.throws(() => createTestScheduler({
+    settings: negativeOptionalCount.settings,
+    state: negativeOptionalCount,
+  }), error => error.code === 'INVALID_SCHEDULER_STATE')
+  const impossibleOptionalCount = structuredClone(state)
+  impossibleOptionalCount.metrics.optionalAdmitted = 1
+  impossibleOptionalCount.metrics.optionalEvaluated = 1
+  assert.throws(() => createTestScheduler({
+    settings: impossibleOptionalCount.settings,
+    state: impossibleOptionalCount,
+  }), error => error.code === 'INVALID_SCHEDULER_STATE')
+
+  const erasedReservation = structuredClone(state)
+  erasedReservation.settings.budget.exactCompletionRequirement = 0
+  assert.throws(() => createTestScheduler({
+    settings: erasedReservation.settings,
+    state: erasedReservation,
+  }), error => error.code === 'INVALID_SCHEDULER_SETTINGS')
+
+  const resumed = createTestScheduler({ settings: state.settings, state })
+  await assert.rejects(admit(resumed, {
+    workItemId: 'positive-value-optional-after-resume',
+    optionalWork: true,
+    valueCase: optionalValue({ disjointBoundary: 'a distinct resumed optional boundary' }),
+  }), error => error.code === 'ADMISSION_OPTIONAL_COLLAPSED' &&
+    error.details.reason === 'required-work-reserved')
+
+  const requiredFrontier = [
+    ['independent-checker', 'ap-independent-checker', 'verification'],
+    ['checker-correction', 'ap-worker', 'work'],
+    ['product-repair', 'ap-worker', 'work'],
+    ['fresh-recheck', 'ap-independent-checker', 'verification'],
+  ]
+  for (const [workItemId, role, purpose] of requiredFrontier) {
+    const request = { workItemId, equivalenceKey: workItemId, role, purpose, lane: 'main' }
+    const requiredCompletionBinding = issueRequiredCompletionBinding(resumed, request)
+    const lease = await resumed.acquireWithAuthority(authority(resumed, null, {
+      requiredCompletionBinding,
+    }), { ...request, requiredCompletionBinding })
+    finish(lease)
+  }
+
+  assert.equal(resumed.getMetrics().counters.totalLaunches, 4)
+  const beyondTarget = {
+    workItemId: 'fifth-required-generation', equivalenceKey: 'fifth-required-generation',
+    role: 'ap-worker', purpose: 'work', lane: 'main',
+  }
+  const beyondTargetBinding = issueRequiredCompletionBinding(resumed, beyondTarget)
+  finish(await resumed.acquireWithAuthority(authority(resumed, null, {
+    requiredCompletionBinding: beyondTargetBinding,
+  }), { ...beyondTarget, requiredCompletionBinding: beyondTargetBinding }))
+  assert.equal(resumed.getMetrics().counters.totalLaunches, 5)
+  assert.equal(resumed.getMetrics().counters.requiredCompletionLaunchOverruns, 1)
+  await assert.rejects(admit(resumed, {
+    workItemId: 'sixth-unbound-generation', missionEssential: true,
+  }), error => error.code === 'LAUNCH_LIMIT')
+  const overrunState = resumed.exportState()
+  const restoredOverrun = createTestScheduler({ settings: overrunState.settings, state: overrunState })
+  assert.equal(restoredOverrun.getMetrics().counters.requiredCompletionLaunchOverruns, 1)
+  assert.equal(restoredOverrun.getMetrics().lanes.main.requiredCompletionLaunchOverruns, 1)
+  const erasedAuthenticatedOverrun = structuredClone(overrunState)
+  erasedAuthenticatedOverrun.metrics.requiredCompletionLaunchOverruns = 0
+  assert.throws(() => createTestScheduler({
+    settings: erasedAuthenticatedOverrun.settings,
+    state: erasedAuthenticatedOverrun,
+  }), error => error.code === 'INVALID_SCHEDULER_STATE')
+  const impossibleUnboundLaneExcess = structuredClone(overrunState)
+  impossibleUnboundLaneExcess.laneCounters.main.requiredCompletionLaunches = 0
+  assert.throws(() => createTestScheduler({
+    settings: impossibleUnboundLaneExcess.settings,
+    state: impossibleUnboundLaneExcess,
+  }), error => error.code === 'INVALID_SCHEDULER_STATE')
+})
+
+test('aborted queued optional work never claims a durable marginal-value boundary', async () => {
+  const scheduler = createTestScheduler()
+  const blocker = await admit(scheduler, {
+    workItemId: 'optional-boundary-blocker', resources: ['shared-optional-boundary'],
+  })
+  const controller = new AbortController()
+  const queued = admit(scheduler, {
+    workItemId: 'queued-optional-boundary', optionalWork: true,
+    valueCase: optionalValue({ disjointBoundary: 'queued abort boundary' }),
+    resources: ['shared-optional-boundary'], signal: controller.signal,
+  })
+  controller.abort()
+  await assert.rejects(queued, error => error.code === 'ADMISSION_CANCELLED')
+  finish(blocker)
+  assert.equal(scheduler.getMetrics().economics.optionalBoundaryCount, 0)
+  const state = scheduler.exportState()
+  assert.doesNotThrow(() => createTestScheduler({ settings: state.settings, state }))
 })
 
 test('resume authenticates supplied settings before any benchmark migration', () => {
@@ -1470,10 +1598,44 @@ test('marginal admission normalizes snake/camel fields and optional role or purp
   ]) {
     await assert.rejects(admit(scheduler, request), (error) => error.code === 'MARGINAL_VALUE_REQUIRED')
   }
+  await assert.rejects(admit(scheduler, {
+    workItemId: 'contradictory-required-scout', logicalRole: 'ap-scout', mission_essential: true,
+  }), error => error.code === 'OPTIONAL_ESSENTIAL_CONFLICT')
   const essential = await admit(scheduler, {
-    workItemId: 'required-scout', logicalRole: 'ap-scout', mission_essential: true,
+    workItemId: 'required-worker', logicalRole: 'worker', mission_essential: true,
   })
   finish(essential)
+})
+
+test('optional signals cannot be elevated into required completion identities', async () => {
+  const settings = resolveSchedulerSettings({ route: 'DIRECT', requiredChildLaunches: 3 })
+  const scheduler = createTestScheduler({ settings })
+  await assert.rejects(admit(scheduler, {
+    workItemId: 'contradictory-admission',
+    optionalWork: true, optional_work: false, missionEssential: true,
+    valueCase: optionalValue(),
+  }), error => error.code === 'OPTIONAL_ESSENTIAL_CONFLICT')
+  const conflicts = [
+    { optionalWork: true, missionEssential: true },
+    { optionalWork: true, optional_work: false, missionEssential: true },
+    { optionalWork: false, optional_work: true, missionEssential: true },
+    { implied_scope: true, required_by_mission: true },
+    { logicalRole: 'ap-scout', userRequested: true },
+    { logicalRole: 'ap-scout', logical_role: 'worker', userRequested: true },
+    { scopeKind: 'optional', scope_kind: 'required', missionEssential: true },
+    { missionEssential: false, isMissionEssential: true },
+  ]
+  for (const [index, conflict] of conflicts.entries()) {
+    assert.throws(() => issueRequiredCompletionBinding(scheduler, {
+      workItemId: `conflicting-required-${index}`,
+      equivalenceKey: `conflicting-required-${index}`,
+      role: 'ap-worker',
+      purpose: 'work',
+      lane: 'main',
+      ...conflict,
+    }), error => error.code === 'OPTIONAL_ESSENTIAL_CONFLICT')
+  }
+  assert.equal(scheduler.getMetrics().counters.totalLaunches, 0)
 })
 
 test('changed retry fingerprints continue beyond fixed retry settings while identical work reassesses', async () => {
@@ -1546,20 +1708,21 @@ test('retry preflight is side-effect free and rejects missing progress before re
   }).priorAttempts, 1)
 })
 
-test('scheduler-bound completion identities derive bounded retry progress but deny duplicates and extras', async () => {
+test('scheduler-bound completion identities require independent retry progress and cross launch targets', async () => {
   const settings = resolveSchedulerSettings({ route: 'DIRECT', requiredChildLaunches: 3 })
   const scheduler = createTestScheduler({ settings })
-  const requiredRequest = workItemId => ({
+  const requiredRequest = (workItemId, progress = {}) => ({
     workItemId,
     equivalenceKey: 'required-executor',
     role: 'ap-worker',
     logicalRole: 'worker',
     purpose: 'work',
     lane: 'main',
+    ...progress,
   })
-  const launchRequired = async workItemId => {
-    const request = requiredRequest(workItemId)
-    const requiredCompletionBinding = scheduler.issueRequiredCompletionBinding(request)
+  const launchRequired = async (workItemId, progress = {}) => {
+    const request = requiredRequest(workItemId, progress)
+    const requiredCompletionBinding = issueRequiredCompletionBinding(scheduler, request)
     assert.equal(scheduler.assertRetryProgress({
       ...request, requiredCompletionBinding,
     }).admitted, true)
@@ -1570,26 +1733,57 @@ test('scheduler-bound completion identities derive bounded retry progress but de
   }
 
   await launchRequired('required-generation-1')
-  await launchRequired('required-generation-2')
-  const duplicate = requiredRequest('required-generation-2')
-  const duplicateBinding = scheduler.issueRequiredCompletionBinding(duplicate)
+  const renamedWithoutProgress = requiredRequest('required-generation-renamed')
+  const renamedBinding = issueRequiredCompletionBinding(scheduler, renamedWithoutProgress)
+  assert.throws(() => scheduler.assertRetryProgress({
+    ...renamedWithoutProgress, requiredCompletionBinding: renamedBinding,
+  }), error => error.code === 'RETRY_PROGRESS_EVIDENCE_REQUIRED')
+  await launchRequired('required-generation-2', { candidateHash: 'a'.repeat(64) })
+  const duplicate = requiredRequest('required-generation-2', { candidateHash: 'a'.repeat(64) })
+  const duplicateBinding = issueRequiredCompletionBinding(scheduler, duplicate)
   assert.throws(() => scheduler.assertRetryProgress({
     ...duplicate, requiredCompletionBinding: duplicateBinding,
   }), error => error.code === 'RETRY_REASSESSMENT_REQUIRED')
-  await launchRequired('required-generation-3')
+  await launchRequired('required-generation-3', { candidateHash: 'b'.repeat(64) })
 
-  const extra = requiredRequest('required-generation-4')
-  const extraBinding = scheduler.issueRequiredCompletionBinding(extra)
-  await assert.rejects(scheduler.acquireWithAuthority(authority(scheduler, null, {
+  const extra = requiredRequest('required-generation-4', { candidateHash: 'c'.repeat(64) })
+  const extraBinding = issueRequiredCompletionBinding(scheduler, extra)
+  finish(await scheduler.acquireWithAuthority(authority(scheduler, null, {
     requiredCompletionBinding: extraBinding,
-  }), { ...extra, requiredCompletionBinding: extraBinding }), error => error.code === 'LAUNCH_LIMIT')
-  assert.throws(() => scheduler.issueRequiredCompletionBinding({
+  }), { ...extra, requiredCompletionBinding: extraBinding }))
+  assert.equal(scheduler.getMetrics().counters.requiredCompletionLaunchOverruns, 1)
+  await assert.rejects(admit(scheduler, {
+    ...requiredRequest('unbound-extra', { candidateHash: 'd'.repeat(64) }),
+  }), error => error.code === 'LAUNCH_LIMIT')
+  assert.throws(() => issueRequiredCompletionBinding(scheduler, {
     ...requiredRequest('optional-extra'), optionalWork: true,
   }), error => error.code === 'INVALID_LAUNCH_AUTHORITY')
   await assert.rejects(scheduler.acquireWithAuthority(authority(scheduler), {
     ...requiredRequest('forged-extra'),
     requiredCompletionBinding: { ...extraBinding },
   }), error => error.code === 'INVALID_LAUNCH_AUTHORITY')
+})
+
+test('required completion issuer capability is exact, private to the controller, and scheduler-local', () => {
+  const settings = resolveSchedulerSettings({ route: 'DIRECT', requiredChildLaunches: 1 })
+  const scheduler = createTestScheduler({ settings })
+  const request = {
+    workItemId: 'issuer-bound', equivalenceKey: 'issuer-bound',
+    role: 'ap-worker', purpose: 'work', lane: 'main',
+  }
+  assert.throws(() => scheduler.issueRequiredCompletionBinding(request),
+    error => error.code === 'INVALID_LAUNCH_AUTHORITY')
+  assert.throws(() => scheduler.issueRequiredCompletionBinding(request, {}),
+    error => error.code === 'INVALID_LAUNCH_AUTHORITY')
+  const foreign = createTestScheduler({ settings })
+  assert.throws(() => issueRequiredCompletionBinding(
+    scheduler, request, requiredCompletionIssuers.get(foreign),
+  ), error => error.code === 'INVALID_LAUNCH_AUTHORITY')
+  const foreignBinding = issueRequiredCompletionBinding(foreign, request)
+  assert.throws(() => authority(scheduler, null, {
+    requiredCompletionBinding: foreignBinding,
+  }), error => error.code === 'INVALID_LAUNCH_AUTHORITY')
+  assert.equal(issueRequiredCompletionBinding(scheduler, request).workItemId, request.workItemId)
 })
 
 test('cache provenance migrates generations but rejects cross-run, changed inputs, and result-hash mismatch', () => {

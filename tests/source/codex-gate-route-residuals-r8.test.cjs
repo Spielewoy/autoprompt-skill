@@ -45,7 +45,13 @@ test('GATE-019 MISS cache identity binds the canonical route-schema digest', () 
     acceptanceOverlays: ['unit-coverage', 'receipts'], riskOverlays: ['external-side-effect'],
   }
   const identity = route.createFrameworkMissCacheIdentity(input)
+  const expectedDigest = H(JSON.stringify({
+    routeDecision: route.ROUTE_DECISION_SCHEMA,
+    routeRecommendation: route.CODEX_ROUTE_RECOMMENDATION_SCHEMA,
+    routeContract: require(path.join(ROOT, 'agents', 'codex', 'workflow', 'router.js')).ROUTE_CONTRACT,
+  }))
   assert.equal(identity.routeSchemaDigest, route.ROUTE_SCHEMA_DIGEST)
+  assert.equal(identity.routeSchemaDigest, expectedDigest)
   assert.match(identity.routeSchemaDigest, /^[a-f0-9]{64}$/)
   assert.deepEqual(route.createFrameworkMissCacheIdentity(structuredClone(input)), identity)
   assert.notEqual(route.createFrameworkMissCacheIdentity({ ...input, riskOverlays: [] }).cacheKey, identity.cacheKey)
