@@ -3,6 +3,7 @@
 
 const assert = require('node:assert/strict')
 const crypto = require('node:crypto')
+const fs = require('node:fs')
 const path = require('node:path')
 const test = require('node:test')
 
@@ -21,6 +22,15 @@ const {
 const { validateEvidenceInvalidationGraph } = require(path.join(WORKFLOW, 'runtime-state.js'))
 
 const H = value => crypto.createHash('sha256').update(String(value)).digest('hex')
+
+test('production route execution receives the immutable mission used for external-local authority', () => {
+  const source = fs.readFileSync(path.join(WORKFLOW, 'phase-budget.js'), 'utf8')
+  const start = source.indexOf('runtimeOptions.executeRoute = createDefaultRouteExecutor({')
+  const end = source.indexOf('\n  return runtimeOptions', start)
+  assert.ok(start >= 0 && end > start)
+  const wiring = source.slice(start, end)
+  assert.match(wiring, /mission: activationRecord\.request\.canonicalJson,/u)
+})
 
 function budget(snapshot) {
   return new BudgetController({

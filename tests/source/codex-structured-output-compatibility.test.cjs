@@ -17,6 +17,8 @@ const {
   assignmentLocalFindingId,
   bindCanonicalMissionForChild,
   canonicalAssignmentResources,
+  canonicalMissionReadResources,
+  canonicalRoleFindingIds,
   createCodexJsonlAccumulator,
   createCheckerObservationBinding,
   createCanonicalMissionProjection,
@@ -2038,8 +2040,10 @@ test('Codex route analyst may revise a schema-valid provisional recommendation b
   const provisional = recommendation('LIGHT', 'low', 'Evidence inspection is still in progress.')
   const final = recommendation('ROADMAP', 'high', 'Observed dependent work groups require an integration owner.')
   let stopReason = null
+  let routeArgv = null
   const runner = {
     async run(spec) {
+      routeArgv = spec.argv
       const events = [
         { type: 'thread.started', thread_id: '77777777-7777-4777-8777-777777777777' },
         { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(provisional) }) } },
@@ -2077,6 +2081,10 @@ test('Codex route analyst may revise a schema-valid provisional recommendation b
   assert.equal(result.recommendedRoute, 'ROADMAP')
   assert.equal(result.recommendation.recommendedRoute, 'ROADMAP')
   assert.equal(result.reconstructedTerminal, undefined)
+  assert.deepEqual(routeArgv.filter((value, index, all) => all[index - 1] === '--disable'), [
+    'multi_agent', 'multi_agent_v2', 'shell_tool', 'unified_exec',
+  ])
+  assert.equal(routeArgv.includes('model_auto_compact_token_limit=32768'), true)
 })
 
 test('Codex preserves shared route vocabulary and recovers malformed f1de11a task briefs', async t => {
@@ -3270,6 +3278,61 @@ test('canonical brief path validation distinguishes slash-separated prose from e
     readOnly: false,
     enforcePreimages: true,
   }), error => error.code === 'OWNERSHIP_RESOURCE_INVALID')
+
+  const typedDatabaseIdentity =
+    'ERP planning, demand, engineering-release, routing, qualification, and WIP data exposed by the gateway'
+  const typedDatabase = canonicalAssignmentResources({
+    request: {
+      workItemId: 'work-1',
+      assignment: 'Write the admitted planning rows through the gateway.',
+      ownership: [typedDatabaseIdentity],
+      manifests: [{
+        kind: 'database', identity: typedDatabaseIdentity, owner: 'worker-1',
+        ownershipMode: 'ordered-transfer',
+      }],
+    },
+    targetPath: target,
+    logicalRole: 'worker',
+    readOnly: false,
+    enforcePreimages: true,
+  })
+  assert.deepEqual(typedDatabase[0], {
+    kind: 'database', identity: typedDatabaseIdentity, access: 'write',
+    expectedPreimageHash: null, owner: 'worker-1', ownershipMode: 'ordered-transfer',
+  })
+})
+
+test('canonical mission paths become bounded worker read resources and invalid repair findings fall back locally', t => {
+  const directory = temporaryDirectory(t)
+  const canonicalTarget = path.join(directory, 'canonical-target')
+  const workerTarget = path.join(directory, 'worker-target')
+  fs.mkdirSync(canonicalTarget)
+  fs.mkdirSync(workerTarget)
+  fs.writeFileSync(path.join(canonicalTarget, 'schematic.png'), 'canonical image bytes\n')
+  fs.copyFileSync(path.join(canonicalTarget, 'schematic.png'), path.join(workerTarget, 'schematic.png'))
+  const mission = JSON.stringify({ request: `Build output from ${path.join(canonicalTarget, 'schematic.png')}.` })
+  const resources = canonicalMissionReadResources(
+    mission, canonicalTarget, workerTarget, 'work-1',
+  )
+  assert.equal(resources.length, 1)
+  assert.deepEqual({
+    kind: resources[0].kind,
+    identity: resources[0].identity,
+    access: resources[0].access,
+    owner: resources[0].owner,
+    ownershipMode: resources[0].ownershipMode,
+  }, {
+    kind: 'file', identity: 'schematic.png', access: 'read', owner: 'work-1',
+    ownershipMode: 'mission-reference',
+  })
+  assert.match(resources[0].expectedPreimageHash, /^[a-f0-9]{64}$/u)
+  assert.deepEqual(canonicalRoleFindingIds(
+    ['implementation-defect:deadbeef', 'AP-RUN-026'],
+  ), ['AP-RUN-026'])
+  assert.deepEqual(canonicalRoleFindingIds(['implementation-defect:deadbeef']), [])
+  assert.equal(assignmentLocalFindingId({
+    workItemId: 'work-1-repair-1', logicalRole: 'worker',
+  }), 'AP-WORK-301')
 })
 
 test('checker brief validation projects canonical absolute inputs into its snapshot', t => {

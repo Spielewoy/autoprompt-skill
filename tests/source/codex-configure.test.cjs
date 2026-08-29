@@ -932,6 +932,10 @@ test('installed Codex cast supports explicit list, idempotence, auto, and off wi
     assert.match(explicit.stdout, /selector=gpt-5\.6-sol,gpt-5\.6-terra/)
     assert.match(fs.readFileSync(path.join(context.agents, 'ap-manager.toml'), 'utf8'), /model = "gpt-5\.6-sol"/)
     assert.match(fs.readFileSync(path.join(context.agents, 'ap-sweeper.toml'), 'utf8'), /model = "gpt-5\.6-terra"/)
+    assert.match(fs.readFileSync(path.join(context.agents, 'ap-route-analyst.toml'), 'utf8'),
+      /model_reasoning_effort = "low"/)
+    assert.match(fs.readFileSync(path.join(context.agents, 'ap-worker.toml'), 'utf8'),
+      /model_reasoning_effort = "high"/)
     assert.equal(fs.readFileSync(sibling, 'utf8'), 'user-owned\n')
     assert.equal(fs.readFileSync(outside, 'utf8'), 'outside\n')
 

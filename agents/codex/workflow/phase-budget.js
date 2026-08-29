@@ -161,6 +161,7 @@ const VERIFICATION_LIMITATION_CODES = new Set([
 const DEFAULT_VERIFICATION_LIMITATION_EVENT = 'REQUIRED_CHECK_RUNTIME_UNAVAILABLE'
 const CHILD_TRANSPORT_WATCHDOG_MS = 30 * 60 * 1000
 const DEFAULT_TIMEOUT_CLEANUP_WATCHDOG_MS = 60 * 1000
+const CODEX_CHILD_AUTO_COMPACT_TOKEN_LIMIT = 32_768
 const CODEX_STDOUT_FALLBACK_MAX_BYTES = 512 * 1024
 const CODEX_STDERR_TAIL_MAX_BYTES = 64 * 1024
 const CODEX_JSONL_PARTIAL_MAX_BYTES = 8 * 1024 * 1024
@@ -6727,8 +6728,15 @@ class CodexExecAdapter {
     const common = [
       '--json', '--output-schema', schemaPath, '--strict-config',
       '--disable', 'multi_agent', '--disable', 'multi_agent_v2',
+      '-c', `model_auto_compact_token_limit=${CODEX_CHILD_AUTO_COMPACT_TOKEN_LIMIT}`,
       '--sandbox', transportSandboxMode,
     ]
+    // PRE_ROUTE is one bounded classification turn. Its immutable mission,
+    // schema, and route-fact envelope are already present in the prompt, so
+    // shell exploration only replays a growing context before useful work.
+    if (record.logicalRole === 'route-analyst') {
+      common.push('--disable', 'shell_tool', '--disable', 'unified_exec')
+    }
     if (checkerScratchBoundary) {
       common.push(
         '--skip-git-repo-check',
@@ -12089,7 +12097,7 @@ class CodexSupervisorRuntime {
       physicalRole,
       providerRole,
     })
-    const findingIds = explicitFindingIds(request.findingIds, request.finding_ids)
+    const findingIds = canonicalRoleFindingIds(request.findingIds, request.finding_ids)
     if (findingIds.length === 0) {
       findingIds.push(assignmentLocalFindingId(request, {
         requestEnvelopeHash: this.requestPointer && this.requestPointer.hash,
@@ -12517,7 +12525,13 @@ class CodexSupervisorRuntime {
       canonicalTargetPath: this.options.targetPath,
       enforcePreimages: TARGET_MUTATOR_ROLES.has(policy.child) && Boolean(this.options.mutationEnforcer),
       additionalResources: CHECKER_ROLES.has(policy.child)
-        ? checkerAssignmentResources(sandboxAssignment, request.workItemId) : [],
+        ? checkerAssignmentResources(sandboxAssignment, request.workItemId)
+        : canonicalMissionReadResources(
+            this.options.mission,
+            this.options.targetPath,
+            targetWorkingDirectory,
+            request.workItemId,
+          ),
       mission: this.options.mission,
       now: this.now,
     })
@@ -17321,6 +17335,48 @@ function assertNoLinkedPathPrefix(root, absolute, displayPath) {
   }
 }
 
+function canonicalMissionReadResources(mission, canonicalTargetPath, targetPath, owner) {
+  if (typeof mission !== 'string' || typeof canonicalTargetPath !== 'string' ||
+      typeof targetPath !== 'string') return Object.freeze([])
+  const canonicalRoot = path.resolve(canonicalTargetPath)
+  const workingRoot = path.resolve(targetPath)
+  const absolutePathPattern = /(?:^|[\s`'"([{=:])(\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]*[A-Za-z0-9_-])(?=$|[\s`'"),.;:\]}])/gu
+  const resources = []
+  const seen = new Set()
+  for (const match of mission.matchAll(absolutePathPattern)) {
+    const canonicalAbsolute = path.resolve(match[1])
+    if (canonicalAbsolute === canonicalRoot ||
+        !canonicalAbsolute.startsWith(`${canonicalRoot}${path.sep}`)) continue
+    const relative = path.relative(canonicalRoot, canonicalAbsolute)
+    const identity = relative.split(path.sep).join('/')
+    if (!identity || seen.has(identity)) continue
+    const workingAbsolute = path.resolve(workingRoot, relative)
+    assertNoLinkedPathPrefix(canonicalRoot, canonicalAbsolute, match[1])
+    assertNoLinkedPathPrefix(workingRoot, workingAbsolute, match[1])
+    if (!fs.existsSync(workingAbsolute)) continue
+    const stat = fs.lstatSync(workingAbsolute)
+    if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory()) ||
+        (stat.isFile() && Number(stat.nlink) !== 1)) {
+      throw new SupervisorIntegrationError(
+        'MISSION_PATH_INVALID',
+        `canonical original-request input is not one regular file or directory: ${match[1]}`,
+      )
+    }
+    const resource = {
+      kind: stat.isDirectory() ? 'directory' : 'file',
+      identity,
+      access: 'read',
+      expectedPreimageHash: null,
+      owner: String(owner),
+      ownershipMode: 'mission-reference',
+    }
+    resource.expectedPreimageHash = resourceStateEntry(workingRoot, resource).hash
+    resources.push(Object.freeze(resource))
+    seen.add(identity)
+  }
+  return Object.freeze(resources)
+}
+
 function canonicalAssignmentResources(input) {
   const targetRoot = path.resolve(input.targetPath)
   const canonicalTargetRoot = path.resolve(input.canonicalTargetPath || input.targetPath)
@@ -17363,16 +17419,16 @@ function canonicalAssignmentResources(input) {
   }))
   const rows = ownership.map(rawIdentity => {
     const identity = String(rawIdentity && rawIdentity.identity || rawIdentity)
+    const declared = manifests.find(item => item && String(item.identity || '') === identity) ||
+      (rawIdentity && typeof rawIdentity === 'object' ? rawIdentity : null)
     if (typeof rawIdentity === 'string' && identity !== 'workspace' && /\s/u.test(identity) &&
-        !path.isAbsolute(identity) && !/^\.{1,2}[\\/]/u.test(identity)) {
+        !path.isAbsolute(identity) && !/^\.{1,2}[\\/]/u.test(identity) && !declared) {
       throw new SupervisorIntegrationError(
         'OWNERSHIP_RESOURCE_INVALID',
         'untyped descriptive prose cannot become canonical filesystem or service authority',
         { identity },
       )
     }
-    const declared = manifests.find(item => item && String(item.identity || '') === identity) ||
-      (rawIdentity && typeof rawIdentity === 'object' ? rawIdentity : null)
     let kind = String(declared && declared.kind || '').toLowerCase()
     if (!ASSIGNMENT_RESOURCE_KINDS.has(kind)) {
       if (identity === 'workspace') kind = 'directory'
@@ -17570,6 +17626,14 @@ function canonicalAssignmentResources(input) {
       owner: String(additional.owner || input.request.workItemId),
       ownershipMode: String(additional.ownershipMode || 'exclusive-lease'),
     }
+    if (resource.ownershipMode === 'mission-reference') {
+      const additionalAbsolute = resolveOwnedResourcePath(input.targetPath, resource)
+      const alreadyRepresented = rows.some(existing =>
+        resolveOwnedResourcePath(input.targetPath, existing, {
+          allowExplicitExternalLocal: canonicalExternalLocalResource(existing, input.targetPath),
+        }) === additionalAbsolute)
+      if (alreadyRepresented) continue
+    }
     if (!ASSIGNMENT_RESOURCE_KINDS.has(resource.kind) ||
         !['read', 'write', 'exclusive'].includes(resource.access)) {
       throw new SupervisorIntegrationError('OWNERSHIP_AUTHORIZATION_DENIED', 'checker resource manifest is not canonical')
@@ -17630,6 +17694,11 @@ function explicitFindingIds(...values) {
     }
   }
   return [...ids].sort()
+}
+
+function canonicalRoleFindingIds(...values) {
+  return explicitFindingIds(...values)
+    .filter(id => /^AP-[A-Z]+-(?:[0-9]{3}|[0-9]{78})$/u.test(id))
 }
 
 function canonicalAssignmentFindingOrdinal(request = {}) {
@@ -17952,7 +18021,7 @@ function canonicalRoleAssignment(input) {
     logicalRoleId: input.logicalRole,
     physicalRoleId: input.physicalRole,
     requestEnvelopeHash: input.requestEnvelopeHash,
-    findingIds: explicitFindingIds(input.request.findingIds, input.request.finding_ids),
+    findingIds: canonicalRoleFindingIds(input.request.findingIds, input.request.finding_ids),
     requestedResult: assignmentCore.requestedResult,
     planReference: {
       planPath, sectionId: input.request.workItemId, sectionHash,
@@ -18660,9 +18729,9 @@ function createDefaultRouteExecutor(options) {
     })
     const likelyAreas = decision.likelyAreas || []
     const boundedToolOutputDiscipline =
-      ' Keep model-visible command output bounded: redirect large stdout/stderr to a scratch file, then inspect a hash, count, or targeted preview of at most 4 KiB. Never use line-oriented head, tail, sed, or unrestricted recursive search on potentially monolithic generated artifacts or private run-record/transcript trees. Reuse one focused executable validation harness instead of repeatedly dumping source, artifacts, or logs.'
+      ' Keep model-visible command output bounded: use at most 16 tool calls for the whole turn and set each tool output budget to at most 1,000 tokens. Redirect large stdout/stderr to a scratch file, then inspect a hash, count, or targeted preview of at most 4 KiB. Never use line-oriented head, tail, sed, or unrestricted recursive search on potentially monolithic generated artifacts or private run-record/transcript trees. Reuse one focused executable validation harness; after implementation and one focused validation, return the canonical result immediately.'
     const checkerToolOutputDiscipline =
-      ' Keep model-visible command output bounded: if you author a checker harness, first write one regular program in the assigned scratch root, then run exactly one direct invocation as <python3|node|ruby|perl|sh> <absolute sealed scratch program> <absolute frozen exact-version path being checked>, or as <absolute sealed executable> <absolute frozen exact-version path being checked>. Use no interpreter flags. Substitute the projected absolute paths literally and emit one direct JSON summary of at most 4 KiB. Do not use heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or shell glue. Do not run a second harness command merely to reshape the report.'
+      ' Keep model-visible command output bounded: use at most 10 tool calls for the whole turn and set each tool output budget to at most 1,000 tokens. If you author a checker harness, first write one regular program in the assigned scratch root, then run exactly one direct invocation as <python3|node|ruby|perl|sh> <absolute sealed scratch program> <absolute frozen exact-version path being checked>, or as <absolute sealed executable> <absolute frozen exact-version path being checked>. Use no interpreter flags. Substitute the projected absolute paths literally and emit one direct JSON summary of at most 4 KiB. Do not use heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or shell glue. Do not run a second harness command merely to reshape the report; return the canonical result immediately after the required observation.'
     const workerCount = Math.max(1, Number(decision.usefulWorkerCount || 1))
     const legacyRoadmapWorkId = /^(?:roadmap-(?:author|scout|plan-|work-group)|mission-coordination)/u
     const resumeRoadmapIds = resumeState ? [
@@ -20170,6 +20239,20 @@ function createDefaultRouteExecutor(options) {
         }
       }
       const checkerResultHash = hashText(stableStringify(boundedLimitationResult))
+      // Conversion into a controller-owned verification limitation changes
+      // the exact result bytes. Rebind the reassessment receipt at that
+      // conversion boundary instead of carrying a valid receipt for the raw
+      // checker report alongside the new limitation hash.
+      const suppliedReassessment = transitionDetails.controllerReassessment
+      const reassessmentCode = suppliedReassessment &&
+        CHECKER_REASSESSMENT_CODES.has(suppliedReassessment.code)
+        ? suppliedReassessment.code
+        : CHECKER_REASSESSMENT_CODES.has(reason) ? reason : 'CHECK_INCONCLUSIVE'
+      const reboundControllerReassessment = canonicalCheckerReassessment({
+        ...(suppliedReassessment || {}),
+        code: reassessmentCode,
+        priorResultEvidenceHash: checkerResultHash,
+      }, { resultHash: checkerResultHash, checkerId })
       const limitationCandidates = [
         ...acceptedVerificationLimitations
           .filter(item => item.checkerId !== checkerId)
@@ -20225,7 +20308,10 @@ function createDefaultRouteExecutor(options) {
         ...externalDeliverables(),
       ]
       const limitationCheckHashes = [checkerResultHash]
-      const publicTransitionDetails = { ...transitionDetails }
+      const publicTransitionDetails = {
+        ...transitionDetails,
+        controllerReassessment: reboundControllerReassessment,
+      }
       const priorClosureRecorded = checkerClosureWasRecorded(checkerId)
       if (transitionRequired && !priorClosureRecorded) {
         await options.transition('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
@@ -25691,6 +25777,7 @@ function createDefaultRuntimeOptions(input) {
   runtimeOptions.executeRoute = createDefaultRouteExecutor({
     targetPath,
     gitEnvironment,
+    mission: activationRecord.request.canonicalJson,
     runId: activation.runId,
     activationId: activation.runId,
     missionHash,
@@ -26266,7 +26353,9 @@ module.exports = {
   diagnosticDenialDisposition,
   evidenceInvalidationSet,
   explicitFindingIds,
+  canonicalRoleFindingIds,
   canonicalAssignmentResources,
+  canonicalMissionReadResources,
   candidateExternalLocalResources,
   explicitExternalLocalResources,
   materializeExplicitExternalLocalBoundary,

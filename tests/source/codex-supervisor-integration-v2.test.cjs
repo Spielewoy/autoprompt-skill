@@ -444,6 +444,12 @@ test('checker contract defects return the usable candidate after distinct seats 
     'both checker seats receive the complete verification-obligation matrix')
   assert.ok(checks[0].checks.length > 0)
   assert.equal(transitions.filter(item => item.event === 'CHECK_INCONCLUSIVE').length, 1)
+  const inconclusiveTransition = transitions.find(item => item.event === 'CHECK_INCONCLUSIVE')
+  assert.equal(
+    inconclusiveTransition.details.controllerReassessment.priorResultEvidenceHash,
+    inconclusiveTransition.details.checkerResultHash,
+    'controller reassessment is rebound to the converted verification-limitation bytes',
+  )
   assert.equal(transitions.filter(item => item.event === 'INDEPENDENT_VERDICT_RECORDED').length, 0)
 })
 
@@ -12696,6 +12702,7 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
   assert.match(calls[0].stdin, /AUTOPROMPT_CANONICAL_MISSION_V1\nCanonical original request:/u)
   assert.match(calls[0].stdin, /physical_role=autoprompt\.v2\.worker\nprovider_role=ap-worker\n/)
   assert.deepEqual(calls[0].argv.filter((value, index, all) => all[index - 1] === '--disable'), ['multi_agent', 'multi_agent_v2'])
+  assert.equal(calls[0].argv.includes('model_auto_compact_token_limit=32768'), true)
 
   const resumeRunner = {
     async run(spec) {

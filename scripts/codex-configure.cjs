@@ -124,9 +124,9 @@ const DISABLED_CODEX_FEATURES = Object.freeze([
 const TIERS = Object.freeze([
   ['ap-scope-coordinator', 'ap-feature-coordinator', 'ap-sweep-coordinator', 'ap-run-coordinator', 'ap-work-group-manager', 'ap-manager'],
   ['ap-reviewer', 'ap-independent-checker', 'ap-fresh-verifier', 'ap-verifier', 'ap-juror', 'ap-goal-checker', 'ap-depth-prober', 'ap-arbiter', 'ap-framework-validator', 'ap-re-anchor'],
-  ['ap-implementer', 'ap-worker', 'ap-roadmap-author', 'ap-roadmap-scout', 'ap-route-analyst', 'ap-planner', 'ap-researcher', 'ap-scoper', 'ap-synthesizer', 'ap-execharness-resolver', 'ap-framework-generator'],
+  ['ap-implementer', 'ap-worker', 'ap-roadmap-author', 'ap-roadmap-scout', 'ap-planner', 'ap-researcher', 'ap-scoper', 'ap-synthesizer', 'ap-execharness-resolver', 'ap-framework-generator'],
   ['ap-preflight-probe', 'ap-intake', 'ap-scribe'],
-  ['ap-sweeper', 'ap-janitor'],
+  ['ap-sweeper', 'ap-janitor', 'ap-route-analyst'],
 ])
 const EFFORTS = ['xhigh', 'high', 'high', 'medium', 'low']
 const ROLE_TIER = new Map(TIERS.flatMap((roles, tier) => roles.map(role => [role, tier])))

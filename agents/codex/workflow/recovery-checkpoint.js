@@ -368,7 +368,12 @@ function validateCheckpointPayload(checkpoint) {
   for (const lease of checkpoint.scheduler.leases) {
     for (const resource of lease.resources) {
       const claim = journalResourceClaim(resource)
-      const collision = heldResources.find((held) => journalResourcesConflict(held.claim, claim))
+      // One lease may legitimately describe the same owned tree at multiple
+      // granularities (for example a workspace plus one output beneath it).
+      // Mutual exclusion is a cross-lease invariant; treating a lease as
+      // conflicting with itself makes a recoverable checkpoint impossible.
+      const collision = heldResources.find((held) =>
+        held.leaseId !== lease.leaseId && journalResourcesConflict(held.claim, claim))
       if (collision) {
         fail('RECOVERY_CHECKPOINT_INVALID', `scheduler resource collision between ${collision.leaseId} and ${lease.leaseId}`)
       }

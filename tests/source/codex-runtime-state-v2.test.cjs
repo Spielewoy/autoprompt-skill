@@ -2187,13 +2187,14 @@ test('recovery checkpoint authority binds scheduler, accounting, state, and cras
     if (!durableResultCommit) throw new Error('terminal receipt is not durable')
     return { ...durableResultCommit }
   }
-  const authority = new RecoveryCheckpointAuthority({
-    paths, eventLog: harness.eventLog, stateProvider: () => harness.store.load(), capabilityVerifier: verifyCapability,
+  const recoveryAuthorityOptions = {
+    eventLog: harness.eventLog, stateProvider: () => harness.store.load(), capabilityVerifier: verifyCapability,
     accountingCheckpointVerifier: (evidence) => accounting.verifyResumeCheckpoint(evidence),
     accountingCheckpointProvider: () => accounting.resumeCheckpoint(),
     resultCommitVerifier,
     clock: () => new Date(Date.UTC(2026, 7, 22, 3, 0, occurred++)).toISOString(),
-  })
+  }
+  const authority = new RecoveryCheckpointAuthority({ paths, ...recoveryAuthorityOptions })
   const scheduler = schedulerCheckpointFixture({
     route: 'LIGHT', phase: 'RUN_WORK', nextReadyWorkIds: ['work-2'], completedWorkIds: ['work-1'],
     usage: { output: 2 }, cursor: 1,
@@ -2230,6 +2231,33 @@ test('recovery checkpoint authority binds scheduler, accounting, state, and cras
     usage: schedulerUsage(), reserves: schedulerUsage(),
     thread: { started: true, startedEventHash: digest(`thread-${leaseId}`), startedAt: '2026-08-22T02:00:00.000Z' },
   })
+  const sameLease = openLease('lease-same', 'work-same')
+  sameLease.resources.push({
+    id: path.join(directory, 'shared-resource', 'out.step'),
+    kind: 'generated', mode: 'exclusive', isolationId: 'lease-same',
+  })
+  const sameLeaseScheduler = schedulerCheckpointFixture({
+    route: 'LIGHT', phase: 'RUN_WORK', nextReadyWorkIds: ['work-2'], completedWorkIds: ['work-1'],
+    leases: [sameLease],
+  })
+  const sameLeaseAuthority = new RecoveryCheckpointAuthority({
+    ...recoveryAuthorityOptions,
+    paths: {
+      runRecordRoot: directory,
+      logPath: path.join(directory, 'runtime', 'same-lease-recovery-checkpoints.jsonl'),
+      snapshotPath: path.join(directory, 'runtime', 'same-lease-recovery-checkpoint.json'),
+    },
+  })
+  assert.doesNotThrow(() => sameLeaseAuthority.appendCheckpoint({
+    ...checkpointInput, scheduler: sameLeaseScheduler,
+    recovery: {
+      ...checkpointInput.recovery,
+      frontier: {
+        ...checkpointInput.recovery.frontier,
+        acceptedResultIds: [sameLeaseScheduler.stateHash],
+      },
+    },
+  }))
   const collidingScheduler = schedulerCheckpointFixture({
     route: 'LIGHT', phase: 'RUN_WORK', nextReadyWorkIds: ['work-2'], completedWorkIds: ['work-1'],
     leases: [openLease('lease-a', 'work-a'), openLease('lease-b', 'work-b')],
