@@ -31,7 +31,20 @@ const ROUTE_RECOMMENDATION_STATE_PATH = 'route/recommendation-state.json'
 const CODEX_PHYSICAL_EXECUTION_PATH = 'route/codex-physical-execution.json'
 const CAPTURED_DOMAIN_ADMISSION_PATH = 'work/captured-domain-admission.json'
 const CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH = 'work/captured-domain-admission-receipt.json'
+const FRAMEWORK_ORCHESTRATION_DIRECTORY = 'work/framework-orchestration'
+const RESIDUAL_RISK_AUTHORITY_DIRECTORY = 'checks/residual-risk-authority'
+const FRAMEWORK_ORCHESTRATION_PATH_PATTERN = /^work\/framework-orchestration\/[a-f0-9]{64}\.json$/
+const RESIDUAL_RISK_AUTHORITY_PATH_PATTERN = /^checks\/residual-risk-authority\/[a-f0-9]{64}\.json$/
 const PLAN_PATHS = Object.freeze({ DIRECT: 'plan/success-card.md', LIGHT: 'plan/light-plan.md', ROADMAP: 'plan/ROADMAP.md' })
+const PLAN_CONTENT_ADDRESSED_DIRECTORIES = Object.freeze([
+  'plan/projections', 'plan/artifacts', 'plan/transactions', 'plan/lineages',
+])
+const IMMUTABLE_CONTENT_ADDRESSED_DIRECTORIES = Object.freeze([
+  ...PLAN_CONTENT_ADDRESSED_DIRECTORIES, RESIDUAL_RISK_AUTHORITY_DIRECTORY,
+])
+const PLAN_CONTENT_ADDRESSED_PATH_PATTERN = /^plan\/(?:projections|artifacts|transactions|lineages)\/[a-f0-9]{64}\.json$/
+const CONTENT_ADDRESSED_TEMP_PATTERN = /^\.([a-f0-9]{64}\.json)\.([1-9]\d*)\.([a-f0-9]{16})\.tmp$/
+const ATOMIC_WRITE_TEMP_PATTERN = /^\.(.+)\.([1-9]\d*)\.([a-f0-9]{16})\.tmp$/
 const RUNTIME_PATHS = Object.freeze({
   metadata: 'metadata.json',
   metadataDigest: 'metadata.sha256',
@@ -53,8 +66,9 @@ const RUNTIME_PATHS = Object.freeze({
 const RUN_DIRECTORIES = Object.freeze([
   'request', 'request/objects', 'request/objects/sha256',
   'route', 'route/objects', 'route/objects/sha256',
-  'plan', 'plan/projections', 'work', 'work/assignments', 'work/results',
-  'checks', 'checks/review-results', 'checks/test-results',
+  'plan', ...PLAN_CONTENT_ADDRESSED_DIRECTORIES, 'work', 'work/assignments', 'work/results',
+  FRAMEWORK_ORCHESTRATION_DIRECTORY,
+  'checks', 'checks/review-results', 'checks/test-results', RESIDUAL_RISK_AUTHORITY_DIRECTORY,
   'runtime', 'runtime/blobs', 'runtime/process-control', 'runtime/recovered-locks',
   'runtime/recovery', 'runtime/recovery/incomplete-accounting-tail',
   'runtime/recovery/incomplete-recovery-checkpoint-tail', 'cleanup',
@@ -81,8 +95,10 @@ const EXACT_REGISTERED_PATHS = new Set([
 const REGISTERED_PREFIXES = Object.freeze([
   'request/objects/sha256/', 'request/recovered-locks/', 'request/recovery/incomplete-envelope-tail/',
   'route/objects/sha256/', 'route/recovered-locks/', 'route/recovery/incomplete-transcript-tail/',
-  'plan/projections/',
-  'work/assignments/', 'work/results/', 'checks/review-results/', 'checks/test-results/', 'runtime/blobs/', 'runtime/process-control/',
+  ...PLAN_CONTENT_ADDRESSED_DIRECTORIES.map(directory => `${directory}/`),
+  'work/assignments/', 'work/results/', `${FRAMEWORK_ORCHESTRATION_DIRECTORY}/`,
+  'checks/review-results/', 'checks/test-results/', `${RESIDUAL_RISK_AUTHORITY_DIRECTORY}/`,
+  'runtime/blobs/', 'runtime/process-control/',
   'compatibility/recovered-locks/',
   'compatibility/recovery/incomplete-alias-tail/',
   'runtime/recovered-locks/',
@@ -122,7 +138,9 @@ function normalizeRelativePath(relativePath) {
 function contentAddressedPathValid(relative) {
   const basename = path.posix.basename(relative)
   if (relative.startsWith('request/objects/sha256/') || relative.startsWith('route/objects/sha256/') || relative.startsWith('runtime/blobs/')) return /^[a-f0-9]{64}$/.test(basename)
-  if (relative.startsWith('plan/projections/')) return /^plan\/projections\/[a-f0-9]{64}\.json$/.test(relative)
+  if (PLAN_CONTENT_ADDRESSED_DIRECTORIES.some(directory => relative.startsWith(`${directory}/`))) return PLAN_CONTENT_ADDRESSED_PATH_PATTERN.test(relative)
+  if (relative.startsWith(`${FRAMEWORK_ORCHESTRATION_DIRECTORY}/`)) return FRAMEWORK_ORCHESTRATION_PATH_PATTERN.test(relative)
+  if (relative.startsWith(`${RESIDUAL_RISK_AUTHORITY_DIRECTORY}/`)) return RESIDUAL_RISK_AUTHORITY_PATH_PATTERN.test(relative)
   if (relative.includes('/recovered-locks/')) return /^[a-f0-9]{64}\.json$/.test(basename)
   if (relative.includes('/incomplete-envelope-tail/') || relative.includes('/incomplete-transcript-tail/')) return /^[a-f0-9]{64}\.bin$/.test(basename)
   if (relative.includes('/incomplete-alias-tail/')) return /^[a-f0-9]{64}\.bin$/.test(basename)
@@ -159,13 +177,48 @@ function assertExistingDestinationSafe(destination) {
   } catch (error) { if (error.code !== 'ENOENT') throw error }
 }
 
+function atomicWriterIsAlive(pidText, relativePath) {
+  const pid = Number(pidText)
+  if (!Number.isSafeInteger(pid) || pid < 1) {
+    throw new RunRecordError(
+      'RUN_RECORD_UNSAFE',
+      `Atomic run-record residue has an invalid writer identity: ${relativePath}`,
+      { pid: pidText },
+    )
+  }
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    if (error && error.code === 'ESRCH') return false
+    // Permission errors and platform-specific indeterminate probe failures are
+    // never authority to delete another process's publication source.
+    return true
+  }
+}
+
+function assertAtomicWriterInactive(pidText, relativePath) {
+  if (atomicWriterIsAlive(pidText, relativePath)) {
+    throw new RunRecordError(
+      'RUN_RECORD_BUSY',
+      `Atomic run-record publication is still owned by a live writer: ${relativePath}`,
+      { pid: Number(pidText) },
+    )
+  }
+}
+
 function atomicWriteRegistered(record, relativePath, bytes, options = {}) {
   assertRunRecordBinding(record)
   const normalized = normalizeRelativePath(relativePath)
   if (IMMUTABLE_PATHS.has(normalized) && options.initializeImmutable !== true) throw new RunRecordError('RUN_RECORD_UNSAFE', `Immutable run metadata cannot be replaced: ${normalized}`)
   if (APPEND_ONLY_PATHS.has(normalized)) throw new RunRecordError('RUN_RECORD_UNSAFE', `Append-only run authority cannot be replaced: ${normalized}`)
   const destination = resolveRegisteredPath(record.runPath, normalized)
+  const contentAddressedImmutable = PLAN_CONTENT_ADDRESSED_PATH_PATTERN.test(normalized) ||
+    RESIDUAL_RISK_AUTHORITY_PATH_PATTERN.test(normalized)
   assertExistingDestinationSafe(destination)
+  if (contentAddressedImmutable && fs.existsSync(destination)) {
+    throw new RunRecordError('RUN_RECORD_UNSAFE', `Immutable content-addressed run file cannot be replaced: ${normalized}`)
+  }
   const parent = path.dirname(destination)
   if (!inspectPathNoFollow(parent).exists) throw new RunRecordError('RUN_RECORD_UNSAFE', `Registered parent is missing: ${parent}`)
   const temporary = path.join(parent, `.${path.basename(destination)}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`)
@@ -177,15 +230,209 @@ function atomicWriteRegistered(record, relativePath, bytes, options = {}) {
     while (offset < buffer.length) offset += fs.writeSync(fd, buffer, offset, buffer.length - offset)
     fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined
     assertRunRecordBinding(record); assertExistingDestinationSafe(destination)
-    fs.renameSync(temporary, destination); assertRunRecordBinding(record)
+    if (contentAddressedImmutable) {
+      try {
+        fs.linkSync(temporary, destination)
+      } catch (error) {
+        if (error && error.code === 'EEXIST') {
+          throw new RunRecordError('RUN_RECORD_UNSAFE', `Immutable content-addressed run file cannot be replaced: ${normalized}`)
+        }
+        throw error
+      }
+      fs.unlinkSync(temporary)
+    } else {
+      fs.renameSync(temporary, destination)
+    }
+    assertRunRecordBinding(record)
     return destination
   } catch (error) {
     if (error instanceof RunRecordError) throw error
-    throw new RunRecordError('RUN_RECORD_FAILURE', `Atomic run-record write failed: ${normalized}`, { cause: error.code || error.message })
+    throw new RunRecordError('RUN_RECORD_WRITE_UNAVAILABLE', `Atomic run-record write failed: ${normalized}`, { cause: error.code || error.message })
   } finally {
     if (fd !== undefined) fs.closeSync(fd)
     try { fs.unlinkSync(temporary) } catch (error) { if (error.code !== 'ENOENT') throw error }
   }
+}
+
+function immutableContentAddressedPathValid(relative) {
+  return PLAN_CONTENT_ADDRESSED_PATH_PATTERN.test(relative) ||
+    RESIDUAL_RISK_AUTHORITY_PATH_PATTERN.test(relative)
+}
+
+function recoverContentAddressedPublicationResidues(record) {
+  assertRunRecordBinding(record)
+  const recoveries = []
+  const canonicalNames = new Set()
+  for (const relativeDirectory of IMMUTABLE_CONTENT_ADDRESSED_DIRECTORIES) {
+    const directory = path.join(record.runPath, ...relativeDirectory.split('/'))
+    const directoryStats = fs.lstatSync(directory)
+    if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink()) {
+      throw new RunRecordError(
+        'RUN_RECORD_UNSAFE',
+        `Content-addressed run directory is unsafe: ${relativeDirectory}`,
+      )
+    }
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const match = CONTENT_ADDRESSED_TEMP_PATTERN.exec(entry.name)
+      if (!match) continue
+      const canonicalRelative = `${relativeDirectory}/${match[1]}`
+      const temporaryRelative = `${relativeDirectory}/${entry.name}`
+      const temporary = path.join(directory, entry.name)
+      const canonical = path.join(directory, match[1])
+      if (!immutableContentAddressedPathValid(canonicalRelative)) {
+        throw new RunRecordError(
+          'RUN_RECORD_UNSAFE',
+          `Content-addressed publication residue is ambiguous: ${temporaryRelative}`,
+        )
+      }
+      assertAtomicWriterInactive(match[2], temporaryRelative)
+      let temporaryStats
+      try {
+        temporaryStats = fs.lstatSync(temporary)
+      } catch (error) {
+        throw new RunRecordError(
+          'RUN_RECORD_UNSAFE',
+          `Content-addressed publication residue cannot be inspected: ${temporaryRelative}`,
+          { cause: error.code || error.message },
+        )
+      }
+      if (!temporaryStats.isFile() || temporaryStats.isSymbolicLink() ||
+          (temporaryStats.mode & 0o777) !== FILE_MODE) {
+        throw new RunRecordError(
+          'RUN_RECORD_UNSAFE',
+          `Content-addressed publication residue is not a private regular file: ${temporaryRelative}`,
+        )
+      }
+      let canonicalStats = null
+      try {
+        canonicalStats = fs.lstatSync(canonical)
+      } catch (error) {
+        if (!error || error.code !== 'ENOENT') {
+          throw new RunRecordError(
+            'RUN_RECORD_UNSAFE',
+            `Content-addressed publication destination cannot be inspected: ${canonicalRelative}`,
+            { cause: error.code || error.message },
+          )
+        }
+      }
+      if (canonicalStats === null) {
+        if (Number(temporaryStats.nlink) !== 1) {
+          throw new RunRecordError(
+            'RUN_RECORD_UNSAFE',
+            `Unpublished content-addressed residue has an unsafe link count: ${temporaryRelative}`,
+            { temporaryLinks: Number(temporaryStats.nlink) },
+          )
+        }
+        recoveries.push({ canonical: null, canonicalRelative, temporary, temporaryRelative, identity: {
+          dev: String(temporaryStats.dev), ino: String(temporaryStats.ino),
+        } })
+        continue
+      }
+      if (canonicalNames.has(canonicalRelative)) {
+        throw new RunRecordError(
+          'RUN_RECORD_UNSAFE',
+          `Content-addressed publication residue is ambiguous: ${temporaryRelative}`,
+        )
+      }
+      canonicalNames.add(canonicalRelative)
+      const sameInode = String(temporaryStats.dev) === String(canonicalStats.dev) &&
+        String(temporaryStats.ino) === String(canonicalStats.ino)
+      if (!temporaryStats.isFile() || temporaryStats.isSymbolicLink() ||
+          !canonicalStats.isFile() || canonicalStats.isSymbolicLink() ||
+          Number(temporaryStats.nlink) !== 2 || Number(canonicalStats.nlink) !== 2 ||
+          !sameInode || (temporaryStats.mode & 0o777) !== FILE_MODE) {
+        throw new RunRecordError(
+          'RUN_RECORD_UNSAFE',
+          `Content-addressed publication residue is not one exact same-inode crash state: ${temporaryRelative}`,
+          {
+            canonicalLinks: Number(canonicalStats.nlink),
+            temporaryLinks: Number(temporaryStats.nlink),
+          },
+        )
+      }
+      recoveries.push({ canonical, canonicalRelative, temporary, temporaryRelative, identity: {
+        dev: String(canonicalStats.dev), ino: String(canonicalStats.ino),
+      } })
+    }
+  }
+  for (const recovery of recoveries) {
+    fs.unlinkSync(recovery.temporary)
+    if (recovery.canonical === null) continue
+    const published = fs.lstatSync(recovery.canonical)
+    if (!published.isFile() || published.isSymbolicLink() || Number(published.nlink) !== 1 ||
+        String(published.dev) !== recovery.identity.dev ||
+        String(published.ino) !== recovery.identity.ino) {
+      throw new RunRecordError(
+        'RUN_RECORD_UNSAFE',
+        `Recovered content-addressed run file changed identity: ${recovery.canonicalRelative}`,
+      )
+    }
+  }
+  assertRunRecordBinding(record)
+  return Object.freeze(recoveries.map(recovery => recovery.temporaryRelative))
+}
+
+function recoverUnpublishedAtomicWriteResidues(record) {
+  assertRunRecordBinding(record)
+  const recovered = []
+  for (const relativeDirectory of ['', ...RUN_DIRECTORIES]) {
+    if (IMMUTABLE_CONTENT_ADDRESSED_DIRECTORIES.includes(relativeDirectory)) continue
+    const directory = relativeDirectory
+      ? path.join(record.runPath, ...relativeDirectory.split('/'))
+      : record.runPath
+    const directoryStats = fs.lstatSync(directory)
+    if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink()) {
+      throw new RunRecordError(
+        'RUN_RECORD_UNSAFE',
+        `Atomic run-record directory is unsafe: ${relativeDirectory || '.'}`,
+      )
+    }
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const match = ATOMIC_WRITE_TEMP_PATTERN.exec(entry.name)
+      if (!match) continue
+      const canonicalRelative = relativeDirectory
+        ? `${relativeDirectory}/${match[1]}` : match[1]
+      if (!isRegisteredRunPath(canonicalRelative) ||
+          IMMUTABLE_PATHS.has(canonicalRelative) ||
+          APPEND_ONLY_PATHS.has(canonicalRelative) ||
+          immutableContentAddressedPathValid(canonicalRelative)) continue
+      const temporaryRelative = relativeDirectory
+        ? `${relativeDirectory}/${entry.name}` : entry.name
+      assertAtomicWriterInactive(match[2], temporaryRelative)
+      const temporary = path.join(directory, entry.name)
+      const destination = path.join(directory, match[1])
+      const temporaryStats = fs.lstatSync(temporary)
+      if (!temporaryStats.isFile() || temporaryStats.isSymbolicLink() ||
+          Number(temporaryStats.nlink) !== 1 ||
+          (temporaryStats.mode & 0o777) !== FILE_MODE) {
+        throw new RunRecordError(
+          'RUN_RECORD_UNSAFE',
+          `Unpublished atomic run-record residue is unsafe: ${temporaryRelative}`,
+          { temporaryLinks: Number(temporaryStats.nlink) },
+        )
+      }
+      try {
+        const destinationStats = fs.lstatSync(destination)
+        if (!destinationStats.isFile() || destinationStats.isSymbolicLink() ||
+            Number(destinationStats.nlink) !== 1) {
+          throw new RunRecordError(
+            'RUN_RECORD_UNSAFE',
+            `Atomic run-record destination is unsafe during recovery: ${canonicalRelative}`,
+            { destinationLinks: Number(destinationStats.nlink) },
+          )
+        }
+      } catch (error) {
+        if (!error || error.code !== 'ENOENT') throw error
+      }
+      // rename(2) is the authority boundary. A surviving source temp proves
+      // that publication never occurred, so retaining the prior destination
+      // (if any) and discarding this private nlink=1 source is deterministic.
+      fs.unlinkSync(temporary)
+      recovered.push(temporaryRelative)
+    }
+  }
+  assertRunRecordBinding(record)
+  return Object.freeze(recovered)
 }
 
 function validateAliasTelemetryRecord(record, expectedRunId) {
@@ -821,18 +1068,24 @@ function openRunRecord(runPath, options = {}) {
     targetIdentitySha256: metadata.target_identity_sha256, rootBinding: metadata.root_binding, runBinding: metadata.run_binding,
     projectRejection: metadata.project_rejection,
   })
+  recoverContentAddressedPublicationResidues(record)
+  recoverUnpublishedAtomicWriteResidues(record)
   auditRunRecordTree(record, { ...options, permissions: false })
   return record
 }
 
 module.exports = {
-  RUN_RECORD_SCHEMA, PLAN_PATHS, RUNTIME_PATHS, RUN_DIRECTORIES, EXACT_REGISTERED_PATHS, REGISTERED_PREFIXES,
+  RUN_RECORD_SCHEMA, PLAN_PATHS, PLAN_CONTENT_ADDRESSED_DIRECTORIES, RUNTIME_PATHS,
+  RUN_DIRECTORIES, EXACT_REGISTERED_PATHS, REGISTERED_PREFIXES,
   PRE_MUTATION_BASELINE_PATH, ALL_WORK_JOINED_PATH, ROUTE_RECOMMENDATION_STATE_PATH,
   CODEX_PHYSICAL_EXECUTION_PATH, CAPTURED_DOMAIN_ADMISSION_PATH,
-  CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH,
+  CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH, FRAMEWORK_ORCHESTRATION_DIRECTORY,
+  RESIDUAL_RISK_AUTHORITY_DIRECTORY,
   normalizeRelativePath, isRegisteredRunPath, resolveRegisteredPath, canonicalPlanPath, runtimeIntegrationPaths,
   createRunRecord, allocateRunRecord: createRunRecord, openRunRecord, assertRunRecordBinding,
   auditRunRecordTree, atomicWriteRegistered,
+  recoverContentAddressedPublicationResidues,
+  recoverUnpublishedAtomicWriteResidues,
   aliasEntryHash, appendAliasTelemetry, readAliasTelemetry, recoverAliasTelemetry, validateAliasTelemetryRecord,
   createPreMutationBaseline, createProductionPreMutationBaseline,
   validatePreMutationBaseline, writePreMutationBaseline, readPreMutationBaseline,

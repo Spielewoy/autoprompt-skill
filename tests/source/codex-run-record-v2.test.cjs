@@ -23,6 +23,15 @@ function fixture(t, name) {
   return directory
 }
 
+function exitedProcessId() {
+  const exited = spawnSync(process.execPath, ['-e', ''], {
+    encoding: 'utf8', windowsHide: true,
+  })
+  assert.equal(exited.status, 0, exited.stderr)
+  assert.ok(Number.isSafeInteger(exited.pid) && exited.pid > 0)
+  return exited.pid
+}
+
 function gitProject(directory) {
   const project = path.join(directory, 'project')
   fs.mkdirSync(path.join(project, '.git', 'info'), { recursive: true })
@@ -314,8 +323,288 @@ test('run record exposes only canonical registered paths and the uppercase ROADM
     { schemaVersion: 1 })
   assert.throws(() => record.resolve('plan/projections/not-content-addressed.json'), /not registered/i)
   assert.throws(() => record.resolve(`plan/projections/nested/${projectionHash}.json`), /not registered/i)
-  assert.deepEqual(fs.readdirSync(path.join(record.runPath, 'plan')), ['ROADMAP.md', 'projections'])
+  assert.deepEqual(fs.readdirSync(path.join(record.runPath, 'plan')).sort(),
+    ['ROADMAP.md', 'artifacts', 'lineages', 'projections', 'transactions'])
   assert.equal(runRecord.openRunRecord(record.runPath).runId, 'schema-run')
+})
+
+test('ROADMAP content-addressed receipt families are exact, create-once, and exhaustively audited', t => {
+  const directory = fixture(t, 'roadmap-content-addressed')
+  const project = gitProject(directory)
+  const record = runRecord.createRunRecord({
+    targetPath: project,
+    canonicalProviderPrivateRoot: path.join(directory, 'private'),
+    exactTree: true,
+    runId: 'roadmap-content-addressed-run',
+    assertStartBoundary: false,
+  })
+  const families = runRecord.PLAN_CONTENT_ADDRESSED_DIRECTORIES
+  const hashes = ['a', 'b', 'c', 'd'].map(character => character.repeat(64))
+
+  for (const [index, family] of families.entries()) {
+    const relative = `${family}/${hashes[index]}.json`
+    const receipt = { schemaVersion: 1, family, hash: hashes[index] }
+    assert.equal(runRecord.isRegisteredRunPath(relative), true, relative)
+    assert.equal(record.write(relative, `${JSON.stringify(receipt)}\n`), record.resolve(relative))
+    assert.deepEqual(JSON.parse(fs.readFileSync(record.resolve(relative), 'utf8')), receipt)
+    assert.throws(
+      () => record.write(relative, `${JSON.stringify({ ...receipt, changed: true })}\n`),
+      error => error.code === 'RUN_RECORD_UNSAFE' && /immutable content-addressed/i.test(error.message),
+      relative,
+    )
+
+    for (const malformed of [
+      `${family}/${hashes[index]}`,
+      `${family}/${'e'.repeat(63)}.json`,
+      `${family}/${'e'.repeat(65)}.json`,
+      `${family}/${'E'.repeat(64)}.json`,
+      `${family}/${hashes[index]}.JSON`,
+      `${family}/${hashes[index]}.json.bak`,
+      `${family}/nested/${hashes[index]}.json`,
+    ]) {
+      assert.equal(runRecord.isRegisteredRunPath(malformed), false, malformed)
+      assert.throws(() => record.resolve(malformed), /not registered/i, malformed)
+    }
+  }
+
+  for (const sibling of [
+    `plan/projection/${hashes[0]}.json`,
+    `plan/artifact/${hashes[1]}.json`,
+    `plan/transaction/${hashes[2]}.json`,
+    `plan/lineage/${hashes[3]}.json`,
+    `plan/receipts/${hashes[0]}.json`,
+  ]) {
+    assert.equal(runRecord.isRegisteredRunPath(sibling), false, sibling)
+    assert.throws(() => record.resolve(sibling), /not registered/i, sibling)
+  }
+
+  assert.equal(record.auditTree({ permissions: false }).valid, true)
+  assert.equal(runRecord.openRunRecord(record.runPath).runId, record.runId)
+
+  const siblingDirectory = path.join(record.runPath, 'plan', 'receipts')
+  fs.mkdirSync(siblingDirectory)
+  fs.writeFileSync(path.join(siblingDirectory, `${hashes[0]}.json`), '{}\n')
+  assert.throws(
+    () => record.auditTree({ permissions: false }),
+    error => error.code === 'RUN_RECORD_UNSAFE' && /unregistered run-record directory/i.test(error.message),
+  )
+})
+
+test('Codex framework state and residual-risk receipts use exact registered hash paths', t => {
+  const directory = fixture(t, 'codex-authority-paths')
+  const project = gitProject(directory)
+  const record = runRecord.createRunRecord({
+    targetPath: project,
+    canonicalProviderPrivateRoot: path.join(directory, 'private'),
+    exactTree: true,
+    runId: 'codex-authority-paths-run',
+    assertStartBoundary: false,
+  })
+  const frameworkHash = '5'.repeat(64)
+  const residualHash = '6'.repeat(64)
+  const frameworkPath = `${runRecord.FRAMEWORK_ORCHESTRATION_DIRECTORY}/${frameworkHash}.json`
+  const residualPath = `${runRecord.RESIDUAL_RISK_AUTHORITY_DIRECTORY}/${residualHash}.json`
+
+  assert.equal(runRecord.isRegisteredRunPath(frameworkPath), true)
+  assert.equal(runRecord.isRegisteredRunPath(residualPath), true)
+
+  const candidateReady = { schemaVersion: 1, status: 'CANDIDATE_READY' }
+  const admitted = { schemaVersion: 1, status: 'ADMITTED' }
+  record.write(frameworkPath, `${JSON.stringify(candidateReady)}\n`)
+  record.write(frameworkPath, `${JSON.stringify(admitted)}\n`)
+  assert.deepEqual(JSON.parse(fs.readFileSync(record.resolve(frameworkPath), 'utf8')), admitted)
+
+  const residualReceipt = { schemaVersion: 1, status: 'ACCEPTED', candidateHash: residualHash }
+  record.write(residualPath, `${JSON.stringify(residualReceipt)}\n`)
+  assert.throws(
+    () => record.write(residualPath, `${JSON.stringify({ ...residualReceipt, status: 'CHANGED' })}\n`),
+    error => error.code === 'RUN_RECORD_UNSAFE' && /immutable content-addressed/i.test(error.message),
+  )
+
+  for (const malformed of [
+    `work/framework-orchestration-${frameworkHash}.json`,
+    `${runRecord.FRAMEWORK_ORCHESTRATION_DIRECTORY}/${'5'.repeat(63)}.json`,
+    `${runRecord.FRAMEWORK_ORCHESTRATION_DIRECTORY}/${'F'.repeat(64)}.json`,
+    `${runRecord.FRAMEWORK_ORCHESTRATION_DIRECTORY}/nested/${frameworkHash}.json`,
+    `checks/residual-risk-authority-${residualHash}.json`,
+    `${runRecord.RESIDUAL_RISK_AUTHORITY_DIRECTORY}/${'6'.repeat(65)}.json`,
+    `${runRecord.RESIDUAL_RISK_AUTHORITY_DIRECTORY}/${residualHash}.json.bak`,
+    `${runRecord.RESIDUAL_RISK_AUTHORITY_DIRECTORY}/nested/${residualHash}.json`,
+  ]) {
+    assert.equal(runRecord.isRegisteredRunPath(malformed), false, malformed)
+    assert.throws(() => record.resolve(malformed), /not registered/i, malformed)
+  }
+
+  assert.equal(record.auditTree({ permissions: false }).valid, true)
+  const reopened = runRecord.openRunRecord(record.runPath)
+  assert.deepEqual(JSON.parse(fs.readFileSync(reopened.resolve(frameworkPath), 'utf8')), admitted)
+  assert.deepEqual(JSON.parse(fs.readFileSync(reopened.resolve(residualPath), 'utf8')), residualReceipt)
+  assert.throws(
+    () => reopened.write(residualPath, `${JSON.stringify(residualReceipt)}\n`),
+    error => error.code === 'RUN_RECORD_UNSAFE' && /immutable content-addressed/i.test(error.message),
+  )
+})
+
+test('immutable content-addressed publications recover exact pre-link and post-link crash states', t => {
+  const directory = fixture(t, 'roadmap-publication-crash')
+  const project = gitProject(directory)
+  const record = runRecord.createRunRecord({
+    targetPath: project,
+    canonicalProviderPrivateRoot: path.join(directory, 'private'),
+    exactTree: true,
+    runId: 'roadmap-publication-crash-run',
+    assertStartBoundary: false,
+  })
+  const deadPid = exitedProcessId()
+  const publications = [
+    `plan/artifacts/${'9'.repeat(64)}.json`,
+    `${runRecord.RESIDUAL_RISK_AUTHORITY_DIRECTORY}/${'8'.repeat(64)}.json`,
+  ].map((relative, index) => {
+    const canonical = record.write(relative, `{"schemaVersion":1,"index":${index}}\n`)
+    const residue = path.join(
+      path.dirname(canonical),
+      `.${path.basename(canonical)}.${deadPid}.${String.fromCharCode(97 + index).repeat(16)}.tmp`,
+    )
+    fs.linkSync(canonical, residue)
+    assert.equal(fs.lstatSync(canonical).nlink, 2)
+    assert.equal(fs.lstatSync(residue).nlink, 2)
+    return { canonical, residue, expected: `{"schemaVersion":1,"index":${index}}\n` }
+  })
+
+  const unpublishedRelative = `plan/transactions/${'7'.repeat(64)}.json`
+  const unpublishedCanonical = record.resolve(unpublishedRelative)
+  const unpublishedResidue = path.join(
+    path.dirname(unpublishedCanonical),
+    `.${path.basename(unpublishedCanonical)}.${deadPid}.${'c'.repeat(16)}.tmp`,
+  )
+  fs.writeFileSync(unpublishedResidue, '{"schemaVersion":1}\n', { mode: 0o600 })
+
+  const reopened = runRecord.openRunRecord(record.runPath)
+  assert.equal(reopened.runId, record.runId)
+  for (const publication of publications) {
+    assert.equal(fs.existsSync(publication.residue), false)
+    assert.equal(fs.lstatSync(publication.canonical).nlink, 1)
+    assert.equal(fs.readFileSync(publication.canonical, 'utf8'), publication.expected)
+  }
+  assert.equal(fs.existsSync(unpublishedResidue), false)
+  assert.equal(fs.existsSync(unpublishedCanonical), false)
+  assert.equal(reopened.auditTree({ permissions: false }).valid, true)
+
+  const canonical = publications[0].canonical
+  const hostileResidue = path.join(
+    path.dirname(canonical),
+    `.${path.basename(canonical)}.${deadPid}.${'b'.repeat(16)}.tmp`,
+  )
+  fs.writeFileSync(hostileResidue, 'unrelated\n', { mode: 0o600 })
+  assert.throws(
+    () => runRecord.openRunRecord(record.runPath),
+    error => error.code === 'RUN_RECORD_UNSAFE' && /same-inode crash state/i.test(error.message),
+  )
+  assert.equal(fs.readFileSync(canonical, 'utf8'), publications[0].expected)
+  assert.equal(fs.readFileSync(hostileResidue, 'utf8'), 'unrelated\n')
+})
+
+test('ordinary atomic writes discard only exact private unpublished crash residues', t => {
+  const directory = fixture(t, 'ordinary-atomic-write-crash')
+  const project = gitProject(directory)
+  const record = runRecord.createRunRecord({
+    targetPath: project,
+    canonicalProviderPrivateRoot: path.join(directory, 'private'),
+    exactTree: true,
+    runId: 'ordinary-atomic-write-crash-run',
+    assertStartBoundary: false,
+  })
+  const deadPid = exitedProcessId()
+  const hash = '4'.repeat(64)
+  const relative = `${runRecord.FRAMEWORK_ORCHESTRATION_DIRECTORY}/${hash}.json`
+  const canonical = record.write(relative, '{"status":"OLD"}\n')
+  const unpublished = path.join(
+    path.dirname(canonical),
+    `.${path.basename(canonical)}.${deadPid}.${'d'.repeat(16)}.tmp`,
+  )
+  fs.writeFileSync(unpublished, '{"status":"NEW"}\n', { mode: 0o600 })
+
+  const reopened = runRecord.openRunRecord(record.runPath)
+  assert.equal(fs.existsSync(unpublished), false)
+  assert.equal(fs.readFileSync(canonical, 'utf8'), '{"status":"OLD"}\n')
+  assert.equal(reopened.auditTree({ permissions: false }).valid, true)
+
+  const hostile = path.join(
+    path.dirname(canonical),
+    `.${path.basename(canonical)}.${deadPid}.${'e'.repeat(16)}.tmp`,
+  )
+  fs.linkSync(canonical, hostile)
+  assert.throws(
+    () => runRecord.openRunRecord(record.runPath),
+    error => error.code === 'RUN_RECORD_UNSAFE' && /unpublished atomic.*unsafe/i.test(error.message),
+  )
+  assert.equal(fs.existsSync(hostile), true)
+  assert.equal(fs.readFileSync(canonical, 'utf8'), '{"status":"OLD"}\n')
+})
+
+test('concurrent open never removes a live atomic or content-addressed publication source', t => {
+  const directory = fixture(t, 'live-atomic-writer')
+  const project = gitProject(directory)
+  const record = runRecord.createRunRecord({
+    targetPath: project,
+    canonicalProviderPrivateRoot: path.join(directory, 'private'),
+    exactTree: true,
+    runId: 'live-atomic-writer-run',
+    assertStartBoundary: false,
+  })
+  const modulePath = path.join(workflow, 'run-record.js')
+  const opener = [
+    'const runRecord = require(process.argv[1])',
+    'try { runRecord.openRunRecord(process.argv[2]); process.stdout.write("OPENED") }',
+    'catch (error) { process.stdout.write(String(error.code || error.message)); process.exitCode = error.code === "RUN_RECORD_BUSY" ? 0 : 2 }',
+  ].join('\n')
+  const blockConcurrentOpen = () => {
+    const opened = spawnSync(process.execPath, ['-e', opener, modulePath, record.runPath], {
+      encoding: 'utf8', windowsHide: true,
+    })
+    if (opened.status !== 0 || opened.stdout !== 'RUN_RECORD_BUSY') {
+      const failure = new Error(opened.stderr || opened.stdout || 'concurrent opener failed')
+      failure.code = `LIVE_OPEN_${opened.status}_${opened.stdout || 'EMPTY'}`
+      throw failure
+    }
+  }
+
+  const originalRename = fs.renameSync
+  try {
+    fs.renameSync = (source, destination) => {
+      fs.renameSync = originalRename
+      blockConcurrentOpen()
+      return originalRename(source, destination)
+    }
+    let ordinary
+    try {
+      ordinary = record.write(
+        `${runRecord.FRAMEWORK_ORCHESTRATION_DIRECTORY}/${'3'.repeat(64)}.json`,
+        '{"kind":"ordinary"}\n',
+      )
+    } catch (error) {
+      assert.fail(`live ordinary writer failed: ${JSON.stringify(error.details || {})}`)
+    }
+    assert.equal(fs.readFileSync(ordinary, 'utf8'), '{"kind":"ordinary"}\n')
+  } finally {
+    fs.renameSync = originalRename
+  }
+
+  const originalLink = fs.linkSync
+  try {
+    fs.linkSync = (source, destination) => {
+      fs.linkSync = originalLink
+      blockConcurrentOpen()
+      return originalLink(source, destination)
+    }
+    const immutable = record.write(
+      `plan/artifacts/${'2'.repeat(64)}.json`,
+      '{"kind":"immutable"}\n',
+    )
+    assert.equal(fs.readFileSync(immutable, 'utf8'), '{"kind":"immutable"}\n')
+  } finally {
+    fs.linkSync = originalLink
+  }
 })
 
 test('a post-validation directory swap fails closed and does not write through a hostile link', t => {

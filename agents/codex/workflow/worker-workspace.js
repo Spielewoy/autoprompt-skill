@@ -302,10 +302,77 @@ function validTransportSeed(record) {
   )
 }
 
+function survivalBody(record, input) {
+  return Object.freeze({
+    schemaVersion: 1,
+    kind: 'controller-owned-candidate-survival',
+    runId: record.runId,
+    activationId: record.activationId,
+    sourceWorkspaceId: record.workspaceId,
+    sourceWorkItemId: record.workItemId,
+    sourceAssignmentHash: record.assignmentHash,
+    sourceBindingHash: record.binding.bindingHash,
+    sourceStatus: record.status,
+    reasonCode: input.reasonCode,
+    candidateHash: input.candidateHash,
+    snapshotHash: input.snapshotHash,
+    changedPathCount: input.files.length,
+    changedPathsHash: sha256(stableStringify(input.files.map(item => item.relative))),
+    files: input.files,
+  })
+}
+
+function validSurvivalManifest(manifest, record) {
+  if (!manifest || manifest.schemaVersion !== 1 ||
+      manifest.kind !== 'controller-owned-candidate-survival' ||
+      manifest.runId !== record.runId || manifest.activationId !== record.activationId ||
+      manifest.sourceWorkspaceId !== record.workspaceId ||
+      manifest.sourceWorkItemId !== record.workItemId ||
+      manifest.sourceAssignmentHash !== record.assignmentHash ||
+      manifest.sourceBindingHash !== record.binding.bindingHash ||
+      !['PREPARED', 'ROLLED_BACK', 'COMMITTED'].includes(manifest.sourceStatus) ||
+      typeof manifest.reasonCode !== 'string' || !manifest.reasonCode ||
+      !HASH_PATTERN.test(manifest.candidateHash || '') ||
+      !HASH_PATTERN.test(manifest.snapshotHash || '') ||
+      !HASH_PATTERN.test(manifest.changedPathsHash || '') ||
+      !HASH_PATTERN.test(manifest.survivalHash || '') ||
+      !Number.isSafeInteger(manifest.changedPathCount) || manifest.changedPathCount < 1 ||
+      !Array.isArray(manifest.files) || manifest.files.length !== manifest.changedPathCount) return false
+  const paths = []
+  for (const entry of manifest.files) {
+    if (!entry || typeof entry.relative !== 'string' ||
+        !['file', 'missing'].includes(entry.type) ||
+        (entry.type === 'file' && (!HASH_PATTERN.test(entry.hash || '') ||
+          !Number.isSafeInteger(entry.mode) || entry.mode < 0 || entry.mode > 0o777)) ||
+        (entry.type === 'missing' && (entry.hash !== null || entry.mode !== null))) return false
+    try {
+      if (normalizeRelative(entry.relative) !== entry.relative) return false
+    } catch { return false }
+    paths.push(entry.relative)
+  }
+  if (new Set(paths).size !== paths.length ||
+      manifest.changedPathsHash !== sha256(stableStringify(paths))) return false
+  const { checksum, survivalHash, ...body } = manifest
+  return survivalHash === sha256(stableStringify(body))
+}
+
 function resourcePath(targetRoot, resource) {
   if (!resource || !['file', 'directory', 'output', 'cache', 'evidence-root'].includes(resource.kind)) return null
   const identity = String(resource.identity || '')
   if (identity === 'workspace' || identity === '.') return path.resolve(targetRoot)
+  if (path.isAbsolute(identity)) {
+    const root = path.resolve(targetRoot)
+    const absolute = path.resolve(identity)
+    const relative = path.relative(root, absolute)
+    if (!relative) return root
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      // Exact external-local resources are audited by the supervisor and are
+      // deliberately absent from this activation-target clone/CAS mechanism.
+      if (HASH_PATTERN.test(resource.expectedPreimageHash || '') &&
+          typeof resource.owner === 'string' && resource.owner &&
+          typeof resource.ownershipMode === 'string' && resource.ownershipMode) return null
+    }
+  }
   return resolveInside(targetRoot, normalizeReportedPath(identity, targetRoot))
 }
 
@@ -445,6 +512,7 @@ class WorkerWorkspaceManager {
     ensurePhysicalDirectory(path.join(this.privateRoot, 'records'), this.privateRoot, this.fs)
     ensurePhysicalDirectory(path.join(this.privateRoot, 'transactions'), this.privateRoot, this.fs)
     ensurePhysicalDirectory(path.join(this.privateRoot, 'caches'), this.privateRoot, this.fs)
+    ensurePhysicalDirectory(path.join(this.privateRoot, 'candidate-survivals'), this.privateRoot, this.fs)
   }
 
   prepare(options = {}) {
@@ -590,6 +658,123 @@ class WorkerWorkspaceManager {
     record = { ...record, status: 'QUARANTINED', transportQuarantine }
     atomicWriteJson(record.recordPath, record, { fsImpl: this.fs })
     return this._quarantinePointer(record)
+  }
+
+  preserveCandidate(session, options = {}) {
+    const record = this._readSession(session)
+    const admission = options.admission
+    const reasonCode = typeof options.reasonCode === 'string' && options.reasonCode
+      ? options.reasonCode : 'CONTROLLER_BOOKKEEPING_FAILURE'
+    if (!['PREPARED', 'ROLLED_BACK', 'COMMITTED'].includes(record.status) ||
+        !admission || !Array.isArray(admission.actualFilesChanged) ||
+        !Array.isArray(admission.after) || admission.actualFilesChanged.length === 0) {
+      fail('WORKER_SURVIVAL_INVALID', 'exact-version survival requires one admitted private or committed work product')
+    }
+    const actual = admission.actualFilesChanged.map(normalizeRelative)
+    if (new Set(actual).size !== actual.length ||
+        actual.some(relative => !ownsRelative(this.targetRoot, session.assignment.resources, relative))) {
+      fail('WORKER_SURVIVAL_INVALID', 'exact-version survival paths exceed their admitted ownership')
+    }
+    const privateSnapshot = repositorySnapshot(record.workspacePath, this.environment, this.fs)
+    if (!snapshotsEqual(privateSnapshot, admission.after) ||
+        stableStringify(changedSnapshotPaths(record.baseline, privateSnapshot)) !== stableStringify(actual)) {
+      fail('WORKER_SURVIVAL_TAMPERED', 'private exact-version bytes differ from the mutation admission')
+    }
+    const after = snapshotMap(privateSnapshot)
+    const files = Object.freeze(actual.map(relative => {
+      const state = after.get(relative) || null
+      return Object.freeze({
+        relative,
+        type: state && state.hash !== null ? 'file' : 'missing',
+        hash: state && state.hash || null,
+        mode: state && state.mode || null,
+      })
+    }))
+    const snapshotHash = sha256(stableStringify(privateSnapshot))
+    const candidateHash = HASH_PATTERN.test(options.candidateHash || '')
+      ? options.candidateHash : snapshotHash
+    const body = survivalBody(record, { reasonCode, candidateHash, snapshotHash, files })
+    const survivalHash = sha256(stableStringify(body))
+    const survivalRoot = path.join(this.privateRoot, 'candidate-survivals', survivalHash)
+    const filesRoot = path.join(survivalRoot, 'files')
+    const manifestPath = path.join(survivalRoot, 'manifest.json')
+    if (!this.fs.existsSync(survivalRoot)) {
+      ensurePhysicalDirectory(survivalRoot, this.privateRoot, this.fs)
+      ensurePhysicalDirectory(filesRoot, survivalRoot, this.fs)
+      for (const entry of files) {
+        if (entry.type === 'missing') continue
+        const source = resolveInside(record.workspacePath, entry.relative)
+        const destination = resolveInside(filesRoot, entry.relative)
+        const sourceState = fileState(source, this.fs)
+        if (!sourceState || sourceState.hash !== entry.hash || sourceState.mode !== entry.mode) {
+          fail('WORKER_SURVIVAL_TAMPERED', `postimage changed before exact-version survival copy: ${entry.relative}`)
+        }
+        ensurePhysicalDirectory(path.dirname(destination), filesRoot, this.fs)
+        this.fs.copyFileSync(source, destination, this.fs.constants.COPYFILE_EXCL)
+        const copied = fileState(destination, this.fs)
+        if (!copied || copied.hash !== entry.hash) {
+          fail('WORKER_SURVIVAL_TAMPERED', `exact-version survival copy differs from its admitted postimage: ${entry.relative}`)
+        }
+        fsyncFile(destination, this.fs)
+        this.fs.chmodSync(destination, entry.mode & 0o111 ? 0o500 : 0o400)
+      }
+      const signed = atomicWriteJson(manifestPath, { ...body, survivalHash }, { fsImpl: this.fs, mode: 0o400 })
+      if (!validSurvivalManifest(signed, record)) {
+        fail('WORKER_SURVIVAL_INVALID', 'exact-version survival manifest failed its own binding validation')
+      }
+      const directories = [filesRoot]
+      const visit = directory => {
+        for (const name of this.fs.readdirSync(directory)) {
+          const absolute = path.join(directory, name)
+          const stat = this.fs.lstatSync(absolute)
+          if (stat.isDirectory() && !stat.isSymbolicLink()) {
+            visit(absolute)
+            directories.push(absolute)
+          }
+        }
+      }
+      visit(filesRoot)
+      for (const directory of directories.sort((left, right) => right.length - left.length)) {
+        this.fs.chmodSync(directory, 0o500)
+      }
+      this.fs.chmodSync(survivalRoot, 0o500)
+      fsyncDirectory(path.dirname(survivalRoot), this.fs)
+    }
+    let rootInspection
+    let manifestInspection
+    try {
+      rootInspection = inspectPathNoFollow(survivalRoot, { fsImpl: this.fs })
+      manifestInspection = inspectPathNoFollow(manifestPath, { mustBeDirectory: false, fsImpl: this.fs })
+    } catch (error) {
+      fail('WORKER_SURVIVAL_INVALID', 'exact-version survival crosses a link, junction, or reparse point', {
+        cause: error.code || error.message,
+      })
+    }
+    if (!rootInspection.exists || !manifestInspection.exists) {
+      fail('WORKER_SURVIVAL_INVALID', 'exact-version survival manifest is missing')
+    }
+    const manifest = readChecksummedJson(manifestPath, { fsImpl: this.fs })
+    if (!validSurvivalManifest(manifest, record) || manifest.survivalHash !== survivalHash) {
+      fail('WORKER_SURVIVAL_INVALID', 'exact-version survival manifest is foreign or corrupt')
+    }
+    for (const entry of manifest.files) {
+      if (entry.type === 'missing') continue
+      const preserved = fileState(resolveInside(filesRoot, entry.relative), this.fs)
+      if (!preserved || preserved.hash !== entry.hash) {
+        fail('WORKER_SURVIVAL_TAMPERED', `exact-version survival postimage changed: ${entry.relative}`)
+      }
+    }
+    return Object.freeze({
+      schemaVersion: 1,
+      kind: 'controller-owned-candidate-survival-pointer',
+      disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+      candidateHash: manifest.candidateHash,
+      candidateRoot: filesRoot,
+      manifestPath,
+      manifestHash: sha256(stableStringify(manifest)),
+      survivalHash,
+      changedPathCount: manifest.changedPathCount,
+    })
   }
 
   quarantinePointer(options = {}) {

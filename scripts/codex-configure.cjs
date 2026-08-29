@@ -1522,6 +1522,14 @@ function verifyRoleProjection(roleProjection, profilePath) {
     if (!configFile || path.posix.basename(configFile.replaceAll('\\', '/')) !== `${physical}.toml`) {
       unsupported('private-role-projection-file-mismatch')
     }
+    const agentPath = path.resolve(
+      path.dirname(profilePath), ...configFile.replaceAll('\\', '/').split('/'),
+    )
+    const agentText = readRegularBound(agentPath, 'activation-physical-agent').toString('utf8')
+    const names = [...agentText.matchAll(/^name\s*=\s*"([a-z0-9-]+)"\s*$/gm)]
+    if (names.length !== 1 || names[0][1] !== physical) {
+      unsupported('private-role-projection-name-mismatch')
+    }
   }
   return roleProjection
 }
@@ -1614,7 +1622,13 @@ function rewriteActivationProfile(profileBytes, activationSkillRoot, enforcement
     const source = path.join(activationSkillRoot, 'agents-runtime', agent)
     const destination = path.join(activationSkillRoot, 'agents-runtime', physical)
     assertRegularUnlinked(source, 'private-agent')
-    fs.renameSync(source, destination)
+    const logicalRole = path.basename(agent, '.toml')
+    const physicalRole = path.basename(physical, '.toml')
+    const projected = projectPhysicalAgentRoleConfig(
+      readRegularBound(source, 'private-agent'), logicalRole, physicalRole,
+    )
+    writePrivateFile(destination, projected)
+    fs.unlinkSync(source)
   }
   const landedPhysical = fs.readdirSync(path.join(activationSkillRoot, 'agents-runtime'))
     .filter(file => file.endsWith('.toml'))
@@ -1632,6 +1646,27 @@ function rewriteActivationProfile(profileBytes, activationSkillRoot, enforcement
       logicalToPhysicalProviderRole: Object.freeze({ ...logicalToPhysicalProviderRole }),
     }),
   }
+}
+
+function projectPhysicalAgentRoleConfig(bytes, logicalRole, physicalRole) {
+  if (!/^ap-[a-z0-9-]+$/.test(logicalRole || '') ||
+      !/^autoprompt-codex-v[0-9]+-[0-9]+-[0-9]+-[a-f0-9]{16}-ap-[a-z0-9-]+$/.test(
+        physicalRole || '',
+      )) {
+    unsupported('private-agent-role-name-invalid')
+  }
+  const text = Buffer.from(bytes).toString('utf8')
+  const declarations = [...text.matchAll(/^name\s*=\s*"([a-z0-9-]+)"\s*$/gm)]
+  if (declarations.length !== 1 || declarations[0][1] !== logicalRole) {
+    unsupported('private-agent-role-name-mismatch')
+  }
+  const declaration = declarations[0]
+  return Buffer.from(
+    `${text.slice(0, declaration.index)}name = "${physicalRole}"${text.slice(
+      declaration.index + declaration[0].length,
+    )}`,
+    'utf8',
+  )
 }
 
 function refreshActivationSecurityProfile(profileBytes, enforcementEnvironment, sandboxMode = 'workspace-write') {
@@ -2056,7 +2091,9 @@ function proveLocalOnlySafety(target, environment, proof, spawnSync = childProce
     timeout: 15_000,
   })
   const expectedBranch = String(branch?.stdout || '').trim()
-  if (!branch || branch.error || branch.status !== 0 || !expectedBranch) {
+  const namedBranch = branch && !branch.error && branch.status === 0 && expectedBranch !== ''
+  const detachedHead = branch && !branch.error && branch.status === 1 && expectedBranch === ''
+  if (!namedBranch && !detachedHead) {
     unsupported('local-only-expected-branch-unavailable')
   }
   let inspection
@@ -3993,6 +4030,7 @@ module.exports = {
   managedCodexPayload,
   physicalProviderRole,
   prepareActivation,
+  projectPhysicalAgentRoleConfig,
   probeCodexCommandNetwork,
   providerRuntimeIdentity,
   proveLocalOnlySafety,

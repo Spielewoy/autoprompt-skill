@@ -134,15 +134,19 @@ const CHECKER_REASSESSMENT_CODES = new Set([
   'DUPLICATE_UNDERLYING_EVIDENCE', 'DUPLICATE_REFERENCE_METHOD',
   'DUPLICATE_REFERENCE_METHOD_CLASS',
 ])
-const FULL_EVIDENCE_CHECKER_REASSESSMENT_CODES = new Set([
-  'CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE', 'INDEPENDENT_CHECK_RUNTIME_RETRY',
-  'CHECK_OBSERVATION_INCOMPLETE', 'CHECK_OBSERVATION_CONTRADICTION',
+const REPORT_ONLY_CHECKER_CORRECTION_CODES = new Set([
+  'CHECK_REPORT_INVALID', 'EVIDENCE_CONSUMPTION_INVALID',
+  'REFERENCE_METHOD_INVALID', 'TEST_OUTCOMES_INVALID',
 ])
 const CHECKER_FALSIFICATION_DOCTRINE = Object.freeze([
   'Try to disprove every typed verification obligation against the frozen deliverable. Preserve each declared condition and finish the full assigned matrix after any failure.',
-  'For every exact named check ID, return one testOutcomes entry containing that check ID and PASS or FAIL status. Do not report tool-call IDs or chunk IDs, inspect Autoprompt transcripts, or compute observationId, commandHash, or fingerprint: the controller owns execution identity and adds it only when your report resolves to one exact admissible command receipt. PASS requires a unique zero exit bound to the exact version being checked; an authenticated nonzero test failure may bind FAIL and drive repair. One admissible exact-version harness may cover several IDs; failed setup, ambiguous receipts, inline-output/no-op commands, and writable-scratch reads cover none.',
+  'For every exact named check ID, return one testOutcomes entry containing checkId (preferred; command and legacy id are accepted aliases) and PASS or FAIL status. Never use a tool-call or chunk ID, repeat a check ID, or supply conflicting identity aliases. Do not inspect Autoprompt transcripts or compute observationId, commandHash, or fingerprint: the controller owns execution identity and adds it only when your report resolves to one exact admissible command receipt. PASS requires a unique zero exit bound to the exact version being checked; an authenticated nonzero test failure may bind FAIL and drive repair. One admissible exact-version harness may cover several IDs; failed setup, ambiguous receipts, inline-output/no-op commands, and writable-scratch reads cover none.',
+  'For a checker-authored harness, first write one regular program in the assigned writable scratch root. Invoke it exactly once either as <approved runtime> <absolute sealed scratch program> <absolute frozen exact-version root being checked> or as <absolute sealed executable> <absolute frozen exact-version root being checked>. Approved runtimes are Python 3, Node.js, Ruby, Perl, and POSIX shell. Substitute the projected absolute paths literally. Emit one direct JSON summary of at most 4 KiB. Do not use interpreter flags, heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or command glue.',
   'Return the consumed underlying identifiers in evidenceIds and an allowed referenceMethod. Populate every required invariant category from an independent source, property, strongest available consumer, or independently derived observable result; never derive expected behavior from the implementation being checked.',
   'Build an independent requirement-by-requirement expected-result basis before accepting the implementation. Exercise exact boundaries, adversarial and negative cases, and any declared ordering, optimization, maximality, or global-selection rule; a self-authored happy-path validator that merely restates the exact version being checked is not independent evidence.',
+  'A claimed equivalence requires both forward soundness and reverse separation or injectivity for source classes that must remain distinguishable. One-way matching or a few equal examples cannot establish PASS when forbidden collapses, collisions, or false equivalences remain possible.',
+  'For every ordered or temporal relation, execute witnesses before the first boundary, exactly at each boundary, between adjacent boundaries, and after the final boundary. A present endpoint or final-state check alone cannot establish the ordering.',
+  'For security-sensitive transformations, use the strongest locally available downstream consumer and exercise adversarial cases through cross-product and batch composition, including interactions among individually accepted inputs. Static checks may prove FAIL by locating a concrete violation, but static source or schema inspection alone never proves PASS; PASS requires an executed end-to-end observable result.',
   'If a required consumer or independent check is unavailable, return CHECK_INCONCLUSIVE or RUNTIME_FAILURE instead of implementation FAIL unless that dependency is a required deliverable. A missing applicable witness is never PASS.',
   'Keep large evidence in scratch and return only bounded diagnostics, hashes, or authenticated pointers.',
 ])
@@ -232,6 +236,8 @@ function callbackFailureRequiresImmediateAbort(error) {
       'INCOMPLETE_USAGE_ACCOUNTING',
       'ACTIVATION_RECEIPT_INVALID',
       'BUDGET_EXHAUSTED',
+      'RUN_RECORD_BUSY',
+      'RUN_RECORD_FAILURE',
     ].includes(code) ||
     /^(?:ACCOUNTING_|RECOVERY_CHECKPOINT_|RUN_RECORD_UNSAFE)/u.test(code) ||
     /(?:FOREIGN|TAMPER|HASH_MISMATCH|SIGNATURE_INVALID|ROLLBACK)/u.test(code) ||
@@ -255,6 +261,23 @@ function promotedMutationFailureRequiresRollback(error) {
       'WORKER_WORKSPACE_RECOVERY_FAILED',
     ].includes(code) ||
     /(?:FOREIGN|TAMPER|HASH_MISMATCH|SIGNATURE_INVALID|ROLLBACK)/u.test(code)
+}
+
+function controllerBookkeepingFailureCanPreserveCandidate(error) {
+  const code = error && typeof error.code === 'string' ? error.code : ''
+  return routePersistenceIntegrityFailure(error) ||
+    code === 'CRASH_ADOPTION_CONFLICT' || code === 'CALLBACK_RECONCILIATION_PENDING' ||
+    /^(?:ACCOUNTING_|RECOVERY_CHECKPOINT_|RUN_RECORD_)/u.test(code)
+}
+
+function authenticatedResultCanOutliveLocalPersistence(error) {
+  const code = error && typeof error.code === 'string' ? error.code : ''
+  if (routePersistenceIntegrityFailure(error)) return false
+  return [
+    'CALLBACK_RECONCILIATION_PENDING',
+    'RUN_RECORD_WRITE_UNAVAILABLE',
+    'RECOVERY_CHECKPOINT_COMMIT_INCOMPLETE',
+  ].includes(code)
 }
 
 function deepFreezeJson(value) {
@@ -399,13 +422,19 @@ function codexPhysicalExecutionReceipt(decision, options = {}) {
   }
   const analystLaunches = decision.routeSource === 'automatic' ? 1 : 0
   const basePhysicalLaunches = analystLaunches + workerLaunches + checkerLaunches
-  // T1 + R1 + P1 + C is the economic launch target used to provision the
-  // ordinary path: one transport contingency, one report correction, one
-  // initial product repair, and its fresh checker seats. It is not a claim
-  // that progress-authenticated repair succession has a numeric global cap.
-  // Novel controller-bound failures may continue finitely until a stable
-  // failure recurs, a candidate does not change, or acceptance passes.
-  const boundedContingencyLaunches = 3 + checkerLaunches
+  // Each admitted implementation worker owns one bounded provider-transport
+  // retry.  The sole aggregate product repair independently owns the same
+  // contingency and is followed by every fresh checker seat.  A one-seat
+  // checker topology may need one scratch PASS confirmation for both the
+  // initial and repaired generations.  Report-shape correction is local and
+  // never consumes a model launch.  A repaired version that still has a
+  // concrete defect is returned instead of buying another repair generation.
+  const transportRetries = workerLaunches + 1
+  const scratchPassConfirmations = checkerLaunches === 1 ? 2 : 0
+  const repairWorkers = 1
+  const repairedCheckerSeats = checkerLaunches
+  const boundedContingencyLaunches = transportRetries + scratchPassConfirmations +
+    repairWorkers + repairedCheckerSeats
   const body = Object.freeze({
     schemaVersion: 2,
     kind: 'codex-physical-execution',
@@ -420,11 +449,19 @@ function codexPhysicalExecutionReceipt(decision, options = {}) {
     gateLaunches,
     basePhysicalLaunches,
     boundedContingencyLaunches,
+    boundedContingencyComponents: Object.freeze({
+      transportRetries,
+      singleSeatScratchPassConfirmations: scratchPassConfirmations,
+      aggregateProductRepairs: repairWorkers,
+      repairedCheckerSeats,
+    }),
     requiredChildLaunchesSemantics: 'economic-target',
     repairSuccession: Object.freeze({
-      kind: 'progress-authenticated-finite-per-stable-failure',
-      numericGlobalRepairCap: false,
+      kind: 'single-aggregate-repair-then-concrete-result',
+      numericGlobalRepairCap: true,
+      maximumProductRepairGenerations: 1,
       recurrenceAction: 'return-concrete-failure',
+      changedFailureSubsetAction: 'return-concrete-failure',
       unchangedCandidateAction: 'return-concrete-failure',
     }),
     requiredChildLaunches: basePhysicalLaunches + gateLaunches + boundedContingencyLaunches,
@@ -459,10 +496,15 @@ function checkerLaunchRuntimeFailure(request, decision, runId, error, binding = 
 }
 
 function workerTransportRuntimeFailure(request, decision, runId, error, binding = {}) {
+  const filesChanged = Array.isArray(binding.filesChanged)
+    ? [...new Set(binding.filesChanged.map(String))].sort() : []
+  const candidateHash = /^[a-f0-9]{64}$/u.test(binding.candidateHash || '')
+    ? binding.candidateHash : request.candidateHash || null
   const failureHash = hashText(stableStringify({
     code: error && error.code || 'CHILD_TRANSPORT_TIMEOUT',
     workItemId: request.workItemId,
-    candidateHash: request.candidateHash || null,
+    candidateHash,
+    filesChanged,
   }))
   return Object.freeze({
     schemaVersion: '2.0.0',
@@ -481,10 +523,10 @@ function workerTransportRuntimeFailure(request, decision, runId, error, binding 
       status: 'fail',
       evidenceIds: [failureHash],
     }],
-    resourcesChanged: [],
+    resourcesChanged: filesChanged,
     behaviorChanged: [],
     remainingConcerns: ['The provider transport ended before the assigned turn returned a canonical terminal result.'],
-    filesChanged: [],
+    filesChanged,
     commands: [],
     findingIds: [...new Set(
       Array.isArray(binding.findingIds) && binding.findingIds.length > 0
@@ -492,7 +534,7 @@ function workerTransportRuntimeFailure(request, decision, runId, error, binding 
         : [`provider-transport:${failureHash.slice(0, 24)}`],
     )],
     evidenceHashes: [failureHash],
-    candidateHash: request.candidateHash || null,
+    candidateHash,
     requestedTransition: Object.freeze({
       event: 'WORK_ITEM_VERIFIED',
       reason: 'Persist the provider transport failure as exact unsuccessful work evidence.',
@@ -760,6 +802,26 @@ function controllerVerificationLimitation(result, input = {}) {
     },
   })
   return checkerResultHasExactVerificationLimitation(candidate) ? candidate : null
+}
+
+function controllerReportShapeLimitation(result, defectCode, expectedChecks = null) {
+  if (!checkerReportOnlyCorrectionEligible(result, defectCode, expectedChecks)) return null
+  // Complete controller-owned command receipts already preserve the useful
+  // observation. Missing or malformed model-authored report fields cannot make
+  // that observation more authoritative by launching the same expensive seat
+  // again. Project the defect to a bounded capability limitation locally and
+  // let any genuinely distinct configured seat continue on the frozen version.
+  return controllerVerificationLimitation({
+    schemaVersion: result && result.schemaVersion || '2.0.0',
+    candidateHash: result && result.candidateHash || null,
+    currentVersionHash: result && result.currentVersionHash || null,
+    requestEnvelopeHash: result && result.requestEnvelopeHash || null,
+    contextId: result && result.contextId || null,
+    payload: {},
+  }, {
+    capabilityId: 'autoprompt.independent-check-report-shape',
+    reason: `controller-owned command receipts were complete, but the checker report had ${defectCode}`,
+  })
 }
 
 function canonicalizeCheckerTerminalResult(result) {
@@ -1037,9 +1099,6 @@ function checkerRecoveryNextReady(workItemId, result, disposition = null) {
   const code = result && result.code
   if ((/^independent-check-\d+/u.test(id) || /^roadmap-plan-(?:check|recheck)$/u.test(id)) &&
       checkerResultIsStructurallyUnboundPass(result)) {
-    if (disposition && disposition.nonAuthoritativeRetryId) {
-      return [disposition.nonAuthoritativeRetryId]
-    }
     return disposition && disposition.stableLimitationNextReadyId
       ? [disposition.stableLimitationNextReadyId] : []
   }
@@ -1054,14 +1113,16 @@ function checkerRecoveryNextReady(workItemId, result, disposition = null) {
     }
     if (code === 'FAIL') return disposition.failureRepairId ? [disposition.failureRepairId] : []
     if (code !== 'PASS') {
-      if (disposition.nonAuthoritativeRetryId) return [disposition.nonAuthoritativeRetryId]
       return disposition.stableLimitationNextReadyId
         ? [disposition.stableLimitationNextReadyId] : []
     }
   }
   if (['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(code)) {
     if (/^roadmap-plan-(?:check|recheck)$/u.test(id)) return [`${id}-runtime-retry`]
-    if (/^independent-check-\d+(?:-repair-\d+)?$/u.test(id)) return [`${id}-runtime-retry-1`]
+    if (/^independent-check-\d+(?:-repair-\d+)?$/u.test(id)) {
+      return disposition && disposition.stableLimitationNextReadyId
+        ? [disposition.stableLimitationNextReadyId] : []
+    }
   }
   if (code === 'FAIL') {
     if (id === 'roadmap-plan-check' || id === 'roadmap-plan-check-runtime-retry') {
@@ -1074,6 +1135,22 @@ function checkerRecoveryNextReady(workItemId, result, disposition = null) {
 
 function stableCapabilityUnavailable(result) {
   return checkerResultHasExactVerificationLimitation(result)
+}
+
+function checkerHasCompleteCommandReceiptAuthority(result, expectedChecks = null) {
+  const authority = canonicalCheckerVerificationAuthority(result, expectedChecks)
+  if (!authority) return false
+  const disposition = result && result.payload &&
+    result.payload.verificationObservationDisposition
+  if (!disposition || typeof disposition !== 'object') return true
+  return ['missingCheckIds', 'unboundFailureCheckIds', 'conflictingCommandHashes']
+    .every(field => !Array.isArray(disposition[field]) || disposition[field].length === 0)
+}
+
+function checkerReportOnlyCorrectionEligible(result, defectCode, expectedChecks = null) {
+  return REPORT_ONLY_CHECKER_CORRECTION_CODES.has(defectCode) &&
+    !['CHECK_INCONCLUSIVE', 'RUNTIME_FAILURE'].includes(result && result.code) &&
+    checkerHasCompleteCommandReceiptAuthority(result, expectedChecks)
 }
 
 function checkerResultIsStructurallyUnboundPass(result) {
@@ -3258,15 +3335,32 @@ function evaluateRegressionDelta(baseline = [], after = []) {
   return Object.freeze({ valid: newRegressions.length === 0, newRegressions: Object.freeze(newRegressions), preExistingFailures: Object.freeze(preExistingFailures) })
 }
 
+function normalizeCheckerOutcomeIdentity(item, namedChecks = []) {
+  if (!item || typeof item !== 'object' || Array.isArray(item) ||
+      !Array.isArray(namedChecks) || !uniqueStrings(namedChecks)) return null
+  const suppliedAliases = ['command', 'checkId', 'id']
+    .filter(key => Object.prototype.hasOwnProperty.call(item, key))
+    .map(key => ({ key, value: item[key] }))
+  if (suppliedAliases.length === 0 ||
+      suppliedAliases.some(alias => typeof alias.value !== 'string') ||
+      new Set(suppliedAliases.map(alias => alias.value)).size !== 1) return null
+  const command = suppliedAliases[0].value
+  if (!namedChecks.includes(command)) return null
+  const normalized = { ...item, command }
+  delete normalized.checkId
+  delete normalized.id
+  return Object.freeze(normalized)
+}
+
 function canonicalCheckerTestOutcomes(supplied, namedChecks = []) {
   if (!Array.isArray(namedChecks) || !uniqueStrings(namedChecks) ||
       !Array.isArray(supplied) || supplied.length !== namedChecks.length) return null
   const expected = new Set(namedChecks)
   const seen = new Set()
   const outcomes = []
-  for (const item of supplied) {
-    if (!item || typeof item !== 'object' || Array.isArray(item) ||
-        Object.keys(item).some(key => ![
+  for (const suppliedItem of supplied) {
+    const item = normalizeCheckerOutcomeIdentity(suppliedItem, namedChecks)
+    if (!item || Object.keys(item).some(key => ![
           'command', 'status', 'fingerprint', 'observationId', 'commandHash',
           'failureIdentity',
         ].includes(key)) ||
@@ -3971,7 +4065,7 @@ function safeEnvironmentFactory() {
     )
   }
   return (repoPath, baseEnvironment, options = {}) => {
-    if (typeof options.expectedBranch !== 'string' || !options.expectedBranch) {
+    if (typeof options.expectedBranch !== 'string') {
       throw new SupervisorIntegrationError('SAFE_GIT_ENV_INVALID', 'expectedBranch is required for child-boundary verification')
     }
     if (!options.configIsolationPath || !options.ghConfigDir || !options.enforcementProof) {
@@ -4031,6 +4125,9 @@ function codexTransportEvidence(parsed = {}) {
   const verificationObservations = parsed.verificationObservations &&
     typeof parsed.verificationObservations === 'object'
     ? parsed.verificationObservations : {}
+  const usageCompatibility = parsed.usageCompatibility &&
+    typeof parsed.usageCompatibility === 'object'
+    ? parsed.usageCompatibility : null
   return Object.freeze({
     schemaVersion: 1,
     eventCount: Number.isSafeInteger(parsed.eventCount) ? parsed.eventCount : 0,
@@ -4042,6 +4139,18 @@ function codexTransportEvidence(parsed = {}) {
       ? parsed.eventStreamHash : null,
     rawOutputHash: /^[a-f0-9]{64}$/u.test(parsed.rawOutputHash || '')
       ? parsed.rawOutputHash : null,
+    usageCompatibility: usageCompatibility ? Object.freeze({
+      status: usageCompatibility.status === 'CONTROLLER_BOUND_FALLBACK'
+        ? usageCompatibility.status : 'INVALID',
+      reportedFields: Object.freeze(Array.isArray(usageCompatibility.reportedFields)
+        ? usageCompatibility.reportedFields.filter(field =>
+            ['noncachedInput', 'cachedInput', 'output', 'reasoning'].includes(field))
+        : []),
+      fallbackFields: Object.freeze(Array.isArray(usageCompatibility.fallbackFields)
+        ? usageCompatibility.fallbackFields.filter(field =>
+            ['noncachedInput', 'cachedInput', 'output', 'reasoning'].includes(field))
+        : []),
+    }) : null,
     commandExecutionFailures: Object.freeze({
       count: Number.isSafeInteger(commandFailures.count) && commandFailures.count >= 0
         ? commandFailures.count : 0,
@@ -4055,6 +4164,10 @@ function codexTransportEvidence(parsed = {}) {
         verificationObservations.count >= 0 ? verificationObservations.count : 0,
       invalidCount: Number.isSafeInteger(verificationObservations.invalidCount) &&
         verificationObservations.invalidCount >= 0 ? verificationObservations.invalidCount : 0,
+      scratchHarnessInvocationCount:
+        Number.isSafeInteger(verificationObservations.scratchHarnessInvocationCount) &&
+        verificationObservations.scratchHarnessInvocationCount >= 0
+          ? verificationObservations.scratchHarnessInvocationCount : 0,
       boundsExceeded: verificationObservations.boundsExceeded === true,
       evidenceHash: /^[a-f0-9]{64}$/u.test(verificationObservations.evidenceHash || '')
         ? verificationObservations.evidenceHash : null,
@@ -4672,45 +4785,33 @@ function genericCandidateHarnessCommand(command, context = {}, options = {}) {
 }
 
 function checkerScratchHarnessAttestation(command, context = {}) {
-  if (!genericCandidateHarnessCommand(command, context, { unwrapFailureWrapper: true })) return null
-  let directCommand = normalizedHarnessCommand(command)
-  const capturedPipeline = directCommand.match(
-    /^set\s+-o\s+pipefail(?:;\s+|\r?\n)([^\r\n#;&|<>`]+?)(?:\s+2>&1)?\s+\|\s+tee\s+(output\/[A-Za-z0-9._/-]+)\s*$/u,
-  )
-  if (capturedPipeline) directCommand = capturedPipeline[1]
-  const tokens = conservativeCommandTokens(directCommand)
-  if (!tokens) return null
-  let executableIndex = 0
-  let allowEnvironmentAssignments = true
-  for (let wrapperDepth = 0; wrapperDepth <= 8; wrapperDepth += 1) {
-    while (allowEnvironmentAssignments && executableIndex < tokens.length &&
-        /^[A-Za-z_][A-Za-z0-9_]*=.*$/u.test(tokens[executableIndex])) executableIndex += 1
-    allowEnvironmentAssignments = false
-    if (executableIndex >= tokens.length) return null
-    if (harnessExecutableName(tokens[executableIndex]) === 'env') {
-      executableIndex += 1
-      if (tokens[executableIndex] && tokens[executableIndex].startsWith('-')) return null
-      allowEnvironmentAssignments = true
-      continue
-    }
-    const wrappedCommandIndex = transparentHarnessWrapperCommandIndex(tokens, executableIndex)
-    if (wrappedCommandIndex === null) return null
-    if (wrappedCommandIndex === undefined) break
-    executableIndex = wrappedCommandIndex
-    if (wrapperDepth === 8) return null
-  }
-  if (executableIndex >= tokens.length) return null
-  const runtimeKind = harnessRuntimeKind(harnessExecutableName(tokens[executableIndex]))
-  const runtimeProgramIndex = runtimeKind
-    ? genericRuntimeProgramIndex(tokens, executableIndex, runtimeKind) : null
-  const programToken = runtimeKind
-    ? runtimeProgramIndex === null ? null : tokens[runtimeProgramIndex]
-    : tokens[executableIndex]
-  if (!programToken) return null
-  const workingDirectory = typeof context.workingDirectory === 'string' && context.workingDirectory
-    ? path.resolve(context.workingDirectory) : null
-  const programPath = path.resolve(workingDirectory || process.cwd(), programToken)
   const boundary = context && context.checkerScratchBoundary
+  if (!boundary) return null
+  const source = String(command || '').trim()
+  // Codex's command tool records the submitted argv behind one tool-owned
+  // login-shell wrapper. Unwrap only that recognized outer transport; the
+  // inner command still has the deliberately tiny grammar below. A nested
+  // shell, glue, redirection, environment assignment, or fourth argument
+  // consequently remains inadmissible.
+  const directCommand = codexShellWrappedCommand(source) || source
+  const tokens = conservativeCommandTokens(directCommand)
+  // Checker-authored validators have one deliberately tiny command language:
+  // either an approved runtime plus one already-written scratch program, or
+  // one directly executable scratch program.  Both forms receive only the
+  // exact frozen candidate root.  This admits native and non-Python consumers
+  // without admitting interpreter flags, package-runner mini-languages,
+  // wrappers, environment assignments, redirection, or command glue.
+  if (!tokens) return null
+  const runtimeKind = harnessRuntimeKind(harnessExecutableName(tokens[0]))
+  const approvedRuntime = new Set(['node', 'python', 'ruby', 'perl', 'posix-shell'])
+  const interpreted = tokens.length === 3 && approvedRuntime.has(runtimeKind)
+  const native = tokens.length === 2 && path.isAbsolute(tokens[0])
+  if (!interpreted && !native) return null
+  const programToken = interpreted ? tokens[1] : tokens[0]
+  const candidateToken = interpreted ? tokens[2] : tokens[1]
+  if (!path.isAbsolute(programToken) || !path.isAbsolute(candidateToken) ||
+      path.resolve(candidateToken) !== path.resolve(boundary.frozenCandidateRoot)) return null
+  const programPath = path.resolve(programToken)
   const writableRoots = boundary ? [
     boundary.writableScratchRoot,
     boundary.temporaryRoot,
@@ -4735,6 +4836,7 @@ function checkerScratchHarnessAttestation(command, context = {}) {
     const before = fs.fstatSync(descriptor, { bigint: true })
     if (!before.isFile() || before.nlink !== 1n || before.size < 0n ||
         before.size > BigInt(CODEX_CHECKER_HARNESS_MAX_BYTES)) return null
+    if (native && (before.mode & 0o111n) === 0n) return null
     const bytes = fs.readFileSync(descriptor)
     const after = fs.fstatSync(descriptor, { bigint: true })
     const statIdentity = stat => Object.freeze({
@@ -4759,7 +4861,7 @@ function checkerScratchHarnessAttestation(command, context = {}) {
       digest: sha256Bytes(bytes),
     }))
     return Object.freeze({
-      commandHash: hashText(normalizedHarnessCommand(command)),
+      commandHash: hashText(directCommand),
       programPathHash: hashText(realProgramPath),
       programDigest: sha256Bytes(bytes),
       programIdentityHash,
@@ -4942,6 +5044,18 @@ function substantiveVerificationSuccess(output, options = {}) {
     /\b[1-9]\d*\s+assertions?\s+(?:completed|passed)\b/iu.test(normalized)
 }
 
+function boundedDirectCheckerHarnessSummary(output) {
+  const source = String(output || '').trim()
+  if (!source || Buffer.byteLength(source, 'utf8') > 4096) return false
+  try {
+    const parsed = JSON.parse(source)
+    return Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
+      Object.keys(parsed).length > 0 && Object.keys(parsed).length <= 64)
+  } catch (_) {
+    return false
+  }
+}
+
 function codexCommandExecutionObservation(event, eventIndex, context = {}, startedHarness = null) {
   const item = event && event.type === 'item.completed' &&
     event.item && typeof event.item === 'object' && event.item.type === 'command_execution'
@@ -4984,10 +5098,17 @@ function codexCommandExecutionObservation(event, eventIndex, context = {}, start
     candidateHarnessAdmissible: successful && substantiveVerificationSuccess(output) &&
       genericCandidateHarnessCommand(command, context),
     scratchHarnessAdmissible: successful && sealedScratchHarness &&
+      boundedDirectCheckerHarnessSummary(output) &&
       substantiveVerificationSuccess(output, { scratchHarness: true }) &&
       genericCandidateHarnessCommand(command, context, { unwrapFailureWrapper: true }),
     failureHarnessAdmissible: observedTestFailure &&
-      genericCandidateHarnessCommand(command, context, { unwrapFailureWrapper: true }),
+      (genericCandidateHarnessCommand(command, context) ||
+        sealedScratchHarness && boundedDirectCheckerHarnessSummary(output) &&
+        genericCandidateHarnessCommand(
+          normalizedHarnessCommand(command),
+          context,
+          { allowScratchHarnessForFailure: true, shellWrapperNormalized: true },
+        )),
     ...(sealedScratchHarness ? {
       scratchHarnessProgramDigest: completedHarness.programDigest,
       scratchHarnessProgramPathHash: completedHarness.programPathHash,
@@ -5084,6 +5205,10 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
   const boundOutcomeByCheck = new Map()
   let invalidOutcome = outcomes.length !== expectedCases.size
   for (const reportedOutcome of outcomes) {
+    const identifiedOutcome = normalizeCheckerOutcomeIdentity(
+      reportedOutcome,
+      [...expectedCases],
+    )
     const modernStatus = reportedOutcome && reportedOutcome.status
     const legacyStatus = reportedOutcome && reportedOutcome.result
     const aliasesConflict = modernStatus !== undefined && legacyStatus !== undefined &&
@@ -5093,18 +5218,13 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
     // result/exitCode/admittedNonzeroTestFailure and guessed receipt hashes.
     // Those fields are never authority, so project them away and derive all
     // execution identity from the controller-owned event stream below.
-    const outcome = !legacyBinding && reportedOutcome &&
-      typeof reportedOutcome === 'object' && !Array.isArray(reportedOutcome) &&
+    const outcome = !legacyBinding && identifiedOutcome &&
       !aliasesConflict && ['PASS', 'FAIL'].includes(modernStatus ?? legacyStatus)
       ? Object.freeze({
-          command: reportedOutcome.command,
+          command: identifiedOutcome.command,
           status: modernStatus ?? legacyStatus,
-          ...(/^[a-f0-9]{64}$/u.test(reportedOutcome.fingerprint || '')
-            ? { fingerprint: reportedOutcome.fingerprint } : {}),
-          ...(/^[a-f0-9]{64}$/u.test(reportedOutcome.commandHash || '')
-            ? { commandHash: reportedOutcome.commandHash } : {}),
         })
-      : reportedOutcome
+      : identifiedOutcome
     const observation = outcome && observationByCheck.get(outcome.command)
     if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome) ||
         (legacyBinding && Object.keys(outcome).some(key => ![
@@ -5127,6 +5247,14 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
     outcomeByCheck.set(outcome.command, outcome)
   }
   const receipts = evidence && Array.isArray(evidence.receipts) ? evidence.receipts : []
+  const sealedScratchHarnessInvocationCount = Number.isSafeInteger(
+    evidence && evidence.scratchHarnessInvocationCount,
+  ) && evidence.scratchHarnessInvocationCount >= 0
+    ? evidence.scratchHarnessInvocationCount
+    : receipts.filter(receipt =>
+        receipt && /^[a-f0-9]{64}$/u.test(receipt.scratchHarnessProgramIdentityHash || '') &&
+        (receipt.scratchHarnessAdmissible === true || receipt.failureHarnessAdmissible === true)).length
+  const repeatedScratchHarnessInvocation = sealedScratchHarnessInvocationCount > 1
   const expectedCommandHashes = new Map(legacyBinding
     ? binding.commandBindings.map(commandBinding => [commandBinding.checkId, new Set()])
     : binding.observations.map(observation => [observation.checkId,
@@ -5278,7 +5406,8 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
   // remain diagnostics; they cannot erase the controller-bound failure.
   const authenticatedAggregateFailure = hasCommandBoundFailure &&
     evidence && evidence.boundsExceeded !== true &&
-    evidence.invalidCount === 0 && conflictingCommandHashes.length === 0
+    evidence.invalidCount === 0 && conflictingCommandHashes.length === 0 &&
+    !repeatedScratchHarnessInvocation
   // PASS authority remains strict: every named case needs a successful,
   // candidate-bound observation. A FAIL may leave positive coverage incomplete
   // because one authenticated product failure is sufficient to require repair,
@@ -5290,7 +5419,8 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
     : missing.length > 0
   const invalidEvidence = !evidence || evidence.boundsExceeded === true ||
     evidence.invalidCount > 0 || invalidOutcome || missingBlocksVerdict ||
-    conflictingCommandHashes.length > 0 || aggregateContradiction
+    conflictingCommandHashes.length > 0 || aggregateContradiction ||
+    repeatedScratchHarnessInvocation
   const authorityBody = !invalidEvidence && output.code === 'PASS'
     ? Object.freeze({
         schemaVersion: 1,
@@ -5324,8 +5454,10 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
     ...output,
     payload: Object.freeze({
       ...(output.payload || {}),
-      testOutcomes: Object.freeze(outcomes.map(outcome =>
-        outcome && boundOutcomeByCheck.get(outcome.command) || outcome)),
+      testOutcomes: Object.freeze(outcomes.map(outcome => {
+        const normalized = normalizeCheckerOutcomeIdentity(outcome, [...expectedCases])
+        return normalized && boundOutcomeByCheck.get(normalized.command) || normalized || outcome
+      })),
       ...(verificationAuthority ? { verificationAuthority } : {}),
     }),
   })
@@ -5392,6 +5524,9 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
   if (invalidOutcome) reasonParts.push('named test outcomes do not exactly cover the controller-owned case identities')
   if (missingBlocksVerdict) reasonParts.push(`${missing.length} named case(s) lack a matching admissible command observation`)
   if (conflictingCommandHashes.length > 0) reasonParts.push(`${conflictingCommandHashes.length} same-version harness command(s) produced conflicting admissible outputs`)
+  if (repeatedScratchHarnessInvocation) reasonParts.push(
+    `${sealedScratchHarnessInvocationCount} sealed scratch harness invocations were observed; exactly one is allowed`,
+  )
   if (aggregateContradiction) reasonParts.push('the aggregate verdict contradicts its named observations')
   return Object.freeze({
     ...enrichedOutput,
@@ -5461,6 +5596,7 @@ function createCodexJsonlAccumulator(context = {}) {
     events: [], eventCount: 0, sessionId: null, finalText: null, output: null, usage: null,
     retainedEventBytes: 0, retainedEventSizes: [],
     turnCompleted: false, terminalMessageEligible: false, terminalBoundary: null,
+    reportedUsage: null, usageComplete: false,
     knownTodoItemIds: new Set(), terminalKnownTodoItemIds: new Set(),
     activeWorkItems: new Map(), activeAnonymousWorkItems: new Map(),
     activeWorkLifecycleInvalid: false,
@@ -5473,6 +5609,7 @@ function createCodexJsonlAccumulator(context = {}) {
     verificationEvidenceCount: 0,
     verificationObservationHash: crypto.createHash('sha256'),
     verificationHarnessStarts: new Map(),
+    verificationScratchHarnessInvocationCount: 0,
   }
   state.eventHash.update('[')
   state.commandFailureHash.update('[')
@@ -5484,18 +5621,33 @@ function createCodexJsonlAccumulator(context = {}) {
     first: state.firstCommandFailure,
     last: state.lastCommandFailure,
   })
-  const verificationObservations = () => Object.freeze({
-    count: state.verificationReceipts.length,
-    invalidCount: state.verificationInvalidCount,
-    boundsExceeded: state.verificationBoundsExceeded,
-    evidenceHash: state.verificationObservationHash.copy().update(']').digest('hex'),
-    receipts: Object.freeze([...state.verificationReceipts]),
-  })
+  const verificationObservations = () => {
+    const receiptEvidenceHash = state.verificationObservationHash.copy().update(']').digest('hex')
+    return Object.freeze({
+      count: state.verificationReceipts.length,
+      invalidCount: state.verificationInvalidCount,
+      boundsExceeded: state.verificationBoundsExceeded,
+      scratchHarnessInvocationCount: state.verificationScratchHarnessInvocationCount,
+      // A syntactically valid scratch-harness start affects authority even if
+      // its completion is malformed or absent. Bind that controller-observed
+      // count into the persisted evidence identity instead of hashing receipts
+      // alone, so crash adoption cannot erase the first attempted execution.
+      evidenceHash: hashText(stableStringify({
+        receiptEvidenceHash,
+        scratchHarnessInvocationCount: state.verificationScratchHarnessInvocationCount,
+      })),
+      receipts: Object.freeze([...state.verificationReceipts]),
+    })
+  }
   const projection = () => state.terminalBoundary || {
     events: state.events, eventCount: state.eventCount, retainedEventCount: state.events.length,
     retainedEventBytes: state.retainedEventBytes,
     eventStreamHash: eventStreamHash(), rawOutputHash: state.rawOutputHash.copy().digest('hex'),
     finalText: state.finalText, output: state.output, sessionId: state.sessionId, usage: state.usage,
+    reportedUsage: state.reportedUsage, usageComplete: state.usageComplete,
+    terminalMessageEligible: state.terminalMessageEligible,
+    activeWorkSettled: state.activeWorkItems.size === 0 &&
+      state.activeAnonymousWorkItems.size === 0 && !state.activeWorkLifecycleInvalid,
     commandExecutionFailures: commandExecutionFailures(),
     verificationObservations: verificationObservations(),
   }
@@ -5551,7 +5703,10 @@ function createCodexJsonlAccumulator(context = {}) {
       if (commandLifecycleItem && commandLifecycleId && event.type === 'item.started' &&
           typeof commandLifecycleItem.command === 'string') {
         const harnessStart = checkerScratchHarnessAttestation(commandLifecycleItem.command, context)
-        if (harnessStart) state.verificationHarnessStarts.set(commandLifecycleId, harnessStart)
+        if (harnessStart) {
+          state.verificationScratchHarnessInvocationCount += 1
+          state.verificationHarnessStarts.set(commandLifecycleId, harnessStart)
+        }
       }
       const startedHarness = commandLifecycleItem && commandLifecycleId &&
         /^item\.(?:completed|failed|cancelled)$/u.test(String(event.type || ''))
@@ -5647,7 +5802,10 @@ function createCodexJsonlAccumulator(context = {}) {
         state.knownTodoItemIds.add(event.item.id)
       }
       if (!state.turnCompleted && event.type === 'turn.completed') {
-        state.usage = codexUsageFromEvent(event)
+        const usageObservation = codexUsageObservationFromEvent(event)
+        state.reportedUsage = usageObservation && usageObservation.usage || null
+        state.usageComplete = Boolean(usageObservation && usageObservation.complete)
+        state.usage = state.usageComplete ? state.reportedUsage : null
         if (!state.terminalMessageEligible || state.activeWorkItems.size > 0 ||
             state.activeAnonymousWorkItems.size > 0 ||
             state.activeWorkLifecycleInvalid) state.output = null
@@ -5658,6 +5816,10 @@ function createCodexJsonlAccumulator(context = {}) {
           retainedEventBytes: state.retainedEventBytes,
           rawOutputHash: state.rawOutputHash.copy().digest('hex'), finalText: state.finalText,
           output: state.output, sessionId: state.sessionId, usage: state.usage,
+          reportedUsage: state.reportedUsage, usageComplete: state.usageComplete,
+          terminalMessageEligible: state.terminalMessageEligible,
+          activeWorkSettled: state.activeWorkItems.size === 0 &&
+            state.activeAnonymousWorkItems.size === 0 && !state.activeWorkLifecycleInvalid,
           commandExecutionFailures: commandExecutionFailures(),
           verificationObservations: verificationObservations(),
         })
@@ -5672,6 +5834,9 @@ function createCodexJsonlAccumulator(context = {}) {
         eventStreamHash: current.eventStreamHash, rawOutputHash: current.rawOutputHash,
         finalText: current.finalText, output: current.output,
         sessionId: current.sessionId, usage: current.usage,
+        reportedUsage: current.reportedUsage, usageComplete: current.usageComplete,
+        terminalMessageEligible: current.terminalMessageEligible,
+        activeWorkSettled: current.activeWorkSettled,
         commandExecutionFailures: current.commandExecutionFailures,
         verificationObservations: current.verificationObservations,
       }
@@ -5684,6 +5849,9 @@ function createCodexJsonlAccumulator(context = {}) {
         retainedEventBytes: current.retainedEventBytes,
         rawOutputHash: current.rawOutputHash, finalText: current.finalText, output: current.output,
         sessionId: current.sessionId, usage: current.usage,
+        reportedUsage: current.reportedUsage, usageComplete: current.usageComplete,
+        terminalMessageEligible: current.terminalMessageEligible,
+        activeWorkSettled: current.activeWorkSettled,
         commandExecutionFailures: current.commandExecutionFailures,
         verificationObservations: current.verificationObservations,
       }
@@ -5870,8 +6038,16 @@ function typedChildOutputReady(output, record) {
   return output.schemaVersion === '2.0.0' && output.reportType === 'result'
 }
 
-function codexUsageFromEvent(event) {
-  if (!event || event.type !== 'turn.completed' || !event.usage) return null
+function codexUsageObservationFromEvent(event) {
+  if (!event || event.type !== 'turn.completed' || event.usage === undefined || event.usage === null) {
+    return null
+  }
+  if (typeof event.usage !== 'object' || Array.isArray(event.usage)) {
+    throw new SupervisorIntegrationError(
+      'CODEX_USAGE_INVALID',
+      'Codex usage telemetry must be one object',
+    )
+  }
   const aliases = {
     totalInput: ['input_tokens', 'inputTokens'],
     cachedInput: ['cached_input_tokens', 'cachedInputTokens'],
@@ -5881,33 +6057,132 @@ function codexUsageFromEvent(event) {
     // already-captured fixtures and compatible provider projections.
     reasoning: ['reasoning_output_tokens', 'reasoning_tokens', 'reasoningTokens'],
   }
-  const result = {}
-  const missing = []
+  const observed = {}
+  const present = new Set()
   for (const [field, names] of Object.entries(aliases)) {
-    const name = names.find(candidate => Object.prototype.hasOwnProperty.call(event.usage, candidate))
-    if (!name || !Number.isFinite(Number(event.usage[name])) || Number(event.usage[name]) < 0) missing.push(field)
-    else result[field] = Number(event.usage[name])
+    const supplied = names.filter(candidate => Object.prototype.hasOwnProperty.call(event.usage, candidate))
+    if (supplied.length === 0) continue
+    const values = supplied.map(name => Number(event.usage[name]))
+    if (values.some(value => !Number.isSafeInteger(value) || value < 0) ||
+        new Set(values).size !== 1) {
+      throw new SupervisorIntegrationError(
+        'CODEX_USAGE_INVALID',
+        `Codex ${field} usage is invalid or has conflicting aliases`,
+        { field, aliases: supplied },
+      )
+    }
+    observed[field] = values[0]
+    present.add(field)
   }
-  if (missing.length) {
+  if (present.has('totalInput') && present.has('cachedInput') &&
+      observed.cachedInput > observed.totalInput) {
     throw new SupervisorIntegrationError(
-      'CODEX_USAGE_INCOMPLETE',
-      'Codex usage event omitted a required accounting category',
-      { missing },
-    )
-  }
-  if (result.cachedInput > result.totalInput) {
-    throw new SupervisorIntegrationError(
-      'CODEX_USAGE_INCOMPLETE',
+      'CODEX_USAGE_INVALID',
       'Codex cached input usage exceeds total input usage',
-      { totalInput: result.totalInput, cachedInput: result.cachedInput },
+      { totalInput: observed.totalInput, cachedInput: observed.cachedInput },
     )
   }
+  if (present.has('output') && present.has('reasoning') && observed.reasoning > observed.output) {
+    throw new SupervisorIntegrationError(
+      'CODEX_USAGE_INVALID',
+      'Codex reasoning usage exceeds total output usage',
+      { output: observed.output, reasoning: observed.reasoning },
+    )
+  }
+  const usage = {}
   // Codex reports input_tokens as the total input, including cached input.
   // Scheduler accounting keeps those dimensions disjoint so cached tokens
   // must be subtracted exactly once before enforcing either ceiling.
-  result.noncachedInput = result.totalInput - result.cachedInput
-  delete result.totalInput
-  return result
+  if (present.has('totalInput')) {
+    usage.noncachedInput = observed.totalInput -
+      (present.has('cachedInput') ? observed.cachedInput : 0)
+  }
+  if (present.has('cachedInput')) usage.cachedInput = observed.cachedInput
+  if (present.has('output')) usage.output = observed.output
+  if (present.has('reasoning')) usage.reasoning = observed.reasoning
+  return Object.freeze({
+    usage: Object.freeze(usage),
+    complete: ['totalInput', 'cachedInput', 'output', 'reasoning']
+      .every(field => present.has(field)),
+    reportedProviderFields: Object.freeze([...present]),
+  })
+}
+
+function codexUsageFromEvent(event) {
+  const observation = codexUsageObservationFromEvent(event)
+  return observation && observation.complete ? observation.usage : null
+}
+
+function normalizeCodexCompatibilityUsage(reportedUsage, fallbackUsage) {
+  const fields = ['noncachedInput', 'cachedInput', 'output', 'reasoning']
+  const validUsageObject = value => Boolean(value && typeof value === 'object' &&
+    !Array.isArray(value) && Object.keys(value).every(field => fields.includes(field)) &&
+    Object.entries(value).every(([, amount]) => Number.isSafeInteger(amount) && amount >= 0))
+  if (reportedUsage !== null && reportedUsage !== undefined && !validUsageObject(reportedUsage)) {
+    throw new SupervisorIntegrationError(
+      'CODEX_USAGE_INVALID',
+      'Codex partial usage telemetry is not safe accounting input',
+    )
+  }
+  if (!validUsageObject(fallbackUsage) ||
+      !fields.every(field => Object.prototype.hasOwnProperty.call(fallbackUsage, field))) {
+    throw new SupervisorIntegrationError(
+      'CODEX_USAGE_INCOMPLETE',
+      'Codex clean-exit compatibility requires a complete controller-owned accounting bound',
+    )
+  }
+  const reported = reportedUsage || {}
+  const normalized = Object.fromEntries(fields.map(field => [
+    field,
+    Object.prototype.hasOwnProperty.call(reported, field) ? reported[field] : fallbackUsage[field],
+  ]))
+  // reasoning is a diagnostic subset of output. If only one of those fields
+  // was reported, preserve it exactly and adjust only the absent dimension so
+  // the compatibility projection cannot undercharge or invent an impossible
+  // subset relationship.
+  if (normalized.reasoning > normalized.output) {
+    if (Object.prototype.hasOwnProperty.call(reported, 'output')) {
+      normalized.reasoning = normalized.output
+    } else {
+      normalized.output = normalized.reasoning
+    }
+  }
+  if (billableModelTokens(normalized) === 0) {
+    throw new SupervisorIntegrationError(
+      'CODEX_USAGE_INCOMPLETE',
+      'Codex missing telemetry cannot release an all-zero model accounting turn',
+    )
+  }
+  return Object.freeze(normalized)
+}
+
+function codexCompatibilityUsageBound(scheduler, schedulerRequest = {}) {
+  const lane = scheduler && scheduler.settings && scheduler.settings.lanes &&
+    scheduler.settings.lanes[schedulerRequest.lane]
+  const laneTokens = lane && lane.tokens || {}
+  const estimate = schedulerRequest.estimate && typeof schedulerRequest.estimate === 'object' &&
+    !Array.isArray(schedulerRequest.estimate) ? schedulerRequest.estimate : {}
+  const boundedInteger = (value, fallback) => {
+    const numeric = Number(value)
+    if (Number.isFinite(numeric) && numeric >= 0 && numeric <= Number.MAX_SAFE_INTEGER) {
+      return Math.ceil(numeric)
+    }
+    const controllerBound = Number(fallback)
+    return Number.isSafeInteger(controllerBound) && controllerBound >= 0 ? controllerBound : 0
+  }
+  const resolved = {}
+  for (const field of ['noncachedInput', 'cachedInput', 'output']) {
+    resolved[field] = boundedInteger(
+      Object.prototype.hasOwnProperty.call(estimate, field) ? estimate[field] : undefined,
+      laneTokens[field],
+    )
+  }
+  resolved.reasoning = boundedInteger(
+    Object.prototype.hasOwnProperty.call(estimate, 'reasoning')
+      ? estimate.reasoning : estimate.reasoningTokens,
+    0,
+  )
+  return Object.freeze(resolved)
 }
 
 function resolveExecutablePath(command, options = {}) {
@@ -6132,6 +6407,9 @@ function imageDatumOutcomeFromPreWorkAdmission(contract, admission, receipt) {
     routeDecisionHash: receipt.routeDecisionHash,
     targetStateHash: receipt.targetStateHash,
     imageCertificateHashes: receipt.imageCertificateHashes,
+    preWorkState: receipt.preWorkState,
+    preWorkStateEventHash: receipt.preWorkStateEventHash,
+    preWorkStateEventSequence: receipt.preWorkStateEventSequence,
   }
   const expectedCertificates = Array.isArray(admission && admission.contracts)
     ? admission.contracts
@@ -6220,6 +6498,10 @@ function codexPrivateWorkspaceProjection(record, canonicalTargetPath, workingDir
   }
   const resources = record.canonicalAssignment.resources.flatMap(resource => {
     if (!resource || !LOCAL_MUTATION_RESOURCE_KINDS.has(resource.kind)) return []
+    // Exact external local outputs are intentionally not projected through the
+    // private clone. They retain their canonical absolute identities and are
+    // governed by the separately authenticated external-local boundary.
+    if (canonicalExternalLocalResource(resource, canonicalTargetRoot)) return []
     const canonicalPath = resolveOwnedResourcePath(canonicalTargetRoot, resource)
     if (!canonicalPath) return []
     const relativePath = path.relative(canonicalTargetRoot, canonicalPath)
@@ -6246,6 +6528,32 @@ function codexPrivateWorkspaceProjection(record, canonicalTargetPath, workingDir
     'For every read, write, command, or path named at or below canonicalTargetRoot, use the identical relative path below writableWorkspaceRoot instead.',
     'Do not attempt to write canonicalTargetRoot directly. Make all requested mutations in writableWorkspaceRoot.',
     'Report filesChanged as normalized paths relative to canonicalTargetRoot (the reportPath values), never as private absolute paths.',
+  ]
+}
+
+function codexExplicitExternalLocalProjection(record, canonicalTargetPath) {
+  if (!record.externalLocalBoundary) return []
+  const boundary = validateExplicitExternalLocalBoundary(
+    record.externalLocalBoundary,
+    record.canonicalAssignment,
+    canonicalTargetPath,
+  )
+  const projection = Object.freeze({
+    schemaVersion: 1,
+    mode: boundary.mode,
+    resources: Object.freeze(boundary.resources.map(resource => Object.freeze({
+      kind: resource.kind,
+      path: resource.identity,
+      access: resource.access,
+      expectedPreimageHash: resource.expectedPreimageHash,
+    }))),
+  })
+  return [
+    'AUTOPROMPT_EXPLICIT_EXTERNAL_LOCAL_V1',
+    `Exact external local boundary: ${JSON.stringify(projection)}`,
+    'Only the exact absolute paths listed in this boundary (and descendants of a listed directory) are writable outside the private workspace.',
+    'No sibling, parent, linked destination, or other absolute path is authorized.',
+    'Report each changed external resource using its canonical absolute path in filesChanged. Continue to report activation-target changes relative to canonicalTargetRoot.',
   ]
 }
 
@@ -6336,7 +6644,9 @@ function codexCheckerScratchProjection(record, canonicalTargetPath, workingDirec
     'The frozen exact-version root is readable/executable and outside the writable sandbox. Never modify it.',
     'Use only the writable scratch tmp, cache, and output roots for temporary files, databases, bytecode, generated files, and test output.',
     'Execute the exact named acceptance commands and authoritative verifier when available; do not replace them with a weaker approximate check.',
-    'Redirect output destinations into writableScratchRoot while reading and executing the exact frozen version.',
+    `If you author a checker harness, write one regular program under ${JSON.stringify(writableScratchRoot)} before executing it.`,
+    `Invoke it exactly once as either <python3|node|ruby|perl|sh> <absolute harness path under ${JSON.stringify(writableScratchRoot)}> ${JSON.stringify(frozenCandidateRoot)} or <absolute executable harness path under that scratch root> ${JSON.stringify(frozenCandidateRoot)}.`,
+    'Use no interpreter flags. Emit one direct JSON summary no larger than 4 KiB. Do not use a heredoc, redirection, a pipeline, command substitution, an environment assignment, a shell wrapper, or command glue such as && or ;.',
     'Scratch files are neither exact-version changes nor deliverables.',
   ]
 }
@@ -6442,6 +6752,19 @@ class CodexExecAdapter {
       )
     }
     const workingDirectory = record.workingDirectory ? path.resolve(record.workingDirectory) : this.targetPath
+    const externalLocalBoundary = record.externalLocalBoundary
+      ? validateExplicitExternalLocalBoundary(
+          record.externalLocalBoundary,
+          record.canonicalAssignment,
+          record.canonicalTargetPath || this.targetPath,
+        )
+      : null
+    if (externalLocalBoundary) {
+      common.push(
+        '-c', 'sandbox_workspace_write.network_access=false',
+        '-c', `sandbox_workspace_write.writable_roots=${JSON.stringify(externalLocalBoundary.writableRoots)}`,
+      )
+    }
     const externalWriteRequested = Boolean(record.externalOperation)
     if (externalWriteRequested && (typeof record.beforeExternalWrite !== 'function' ||
         this.runner.supportsExternalWriteBoundary !== true)) {
@@ -6476,6 +6799,10 @@ class CodexExecAdapter {
       record,
       record.canonicalTargetPath || this.targetPath,
       workingDirectory,
+    )
+    const externalLocalProjection = codexExplicitExternalLocalProjection(
+      record,
+      record.canonicalTargetPath || this.targetPath,
     )
     const checkerScratchProjection = codexCheckerScratchProjection(
       record,
@@ -6534,6 +6861,7 @@ class CodexExecAdapter {
       visibleCanonicalAssignment ? `Canonical assignment: ${JSON.stringify(visibleCanonicalAssignment)}` : '',
       ...workerCompletionBoundary,
       ...workspaceProjection,
+      ...externalLocalProjection,
       ...checkerScratchProjection,
       '',
     ].join('\n')
@@ -6694,7 +7022,14 @@ class CodexExecAdapter {
                 workItemId: record.workItemId || null,
                 sessionId: committedTerminalEvidence.sessionId,
                 candidatePath,
-                candidateHash: hashWorkspaceCandidate(candidatePath, record.environment),
+                candidateHash: hashWorkspaceCandidate(
+                  candidatePath,
+                  record.environment,
+                  explicitExternalLocalResources(
+                    record.canonicalAssignment,
+                    record.canonicalTargetPath || candidatePath,
+                  ),
+                ),
                 terminalResultHash: hashText(JSON.stringify(committedTerminalResult)),
                 terminalEvidenceHash: hashText(stableStringify(committedTerminalEvidence)),
                 callback: pending.descriptor,
@@ -6787,6 +7122,46 @@ class CodexExecAdapter {
         )
       }
       stop(`typed terminal ${typedTerminal}`, 'DONE')
+    }
+    const accountCumulativeUsage = cumulative => {
+      if (!cumulative || typeof record.onUsageDelta !== 'function' || streamError) return
+      const delta = {}
+      for (const field of Object.keys(streamedUsage)) {
+        if (!Number.isSafeInteger(cumulative[field]) || cumulative[field] < streamedUsage[field]) {
+          streamError = new SupervisorIntegrationError(
+            'CODEX_USAGE_INVALID',
+            `Codex streamed ${field} usage regressed or became invalid`,
+          )
+          stop(streamError.code)
+          return
+        }
+        delta[field] = cumulative[field] - streamedUsage[field]
+      }
+      streamedUsage = cumulative
+      try {
+        invokeOrDeferCallback(
+          'usage-delta',
+          () => {
+            const verdict = record.onUsageDelta(delta, cumulative)
+            if (!verdict || verdict.continue !== true) {
+              const denied = new SupervisorIntegrationError(
+                'BUDGET_EXHAUSTED',
+                'scheduler denied continued Codex token usage',
+                { verdict },
+              )
+              denied.usage = cumulative
+              throw denied
+            }
+            return verdict
+          },
+          null,
+          { delta, cumulative },
+        )
+      } catch (error) {
+        streamError = error
+        streamError.usage = cumulative
+        stop(error.code || 'BUDGET_EXHAUSTED')
+      }
     }
     const onStdoutLine = line => {
       const eventLine = String(line).replace(/\r?\n$/u, '')
@@ -6910,46 +7285,8 @@ class CodexExecAdapter {
         stop(error.code)
         return
       }
-      if (cumulative && typeof record.onUsageDelta === 'function' && !streamError) {
-        const delta = {}
-        for (const field of Object.keys(streamedUsage)) {
-          if (!Number.isFinite(cumulative[field]) || cumulative[field] < streamedUsage[field]) {
-            streamError = new SupervisorIntegrationError(
-              'CODEX_USAGE_INVALID',
-              `Codex streamed ${field} usage regressed or became invalid`,
-            )
-            stop(streamError.code)
-            return
-          }
-          delta[field] = cumulative[field] - streamedUsage[field]
-        }
-        streamedUsage = cumulative
-        try {
-          invokeOrDeferCallback(
-            'usage-delta',
-            () => {
-              const verdict = record.onUsageDelta(delta, cumulative)
-              if (!verdict || verdict.continue !== true) {
-                const denied = new SupervisorIntegrationError(
-                  'BUDGET_EXHAUSTED',
-                  'scheduler denied continued Codex token usage',
-                  { verdict },
-                )
-                denied.usage = cumulative
-                throw denied
-              }
-              return verdict
-            },
-            null,
-            { delta, cumulative },
-          )
-        } catch (error) {
-          streamError = error
-          streamError.usage = cumulative
-          stop(error.code || 'BUDGET_EXHAUSTED')
-          return
-        }
-      }
+      accountCumulativeUsage(cumulative)
+      if (streamError) return
       const current = streamAccumulator.watermark()
       let currentOutput = current.output
       // A Codex turn may emit multiple agent_message items while it works,
@@ -7043,11 +7380,35 @@ class CodexExecAdapter {
         stderr: String(execution.stderr || '').slice(-4096),
       })
     }
+    if (execution.drained !== true) {
+      throw new SupervisorIntegrationError(
+        'PROCESS_DRAIN_TIMEOUT',
+        'clean-exit Codex compatibility requires the exact owned descendant drain receipt',
+      )
+    }
     if (!record.continuationId && !parsed.sessionId) {
       throw new SupervisorIntegrationError('CODEX_SESSION_ID_MISSING', 'fresh Codex JSONL did not provide a stable session id')
     }
     if (!parsed.usage) {
-      throw new SupervisorIntegrationError('CODEX_USAGE_INCOMPLETE', 'Codex child ended without all four usage categories')
+      const usageFields = ['noncachedInput', 'cachedInput', 'output', 'reasoning']
+      const reportedFields = usageFields.filter(field =>
+        parsed.reportedUsage && Object.prototype.hasOwnProperty.call(parsed.reportedUsage, field))
+      parsed.usage = normalizeCodexCompatibilityUsage(
+        parsed.reportedUsage,
+        record.usageCompatibilityFallback,
+      )
+      parsed.usageCompatibility = Object.freeze({
+        status: 'CONTROLLER_BOUND_FALLBACK',
+        reportedFields: Object.freeze(reportedFields),
+        fallbackFields: Object.freeze(usageFields.filter(field => !reportedFields.includes(field))),
+      })
+      accountCumulativeUsage(parsed.usage)
+      if (streamError) throw streamError
+    }
+    if (parsed.terminalMessageEligible !== true || parsed.activeWorkSettled !== true) {
+      // A clean process exit settles accounting, but it cannot promote a
+      // provisional message that was followed by new/unfinished work.
+      parsed.output = null
     }
     if (this.providerSchemaRoot && parsed.output) {
       parsed.output = decodeCodexProviderEnvelope(parsed.output)
@@ -7211,42 +7572,49 @@ class OwnedCodexProxyRunner {
         if (line && typeof spec.onStdoutLine === 'function') spec.onStdoutLine(line)
       }
     }
+    const readAvailableStdout = () => {
+      if (!fs.existsSync(stdoutPath)) return
+      if (stdoutDescriptor === undefined) stdoutDescriptor = fs.openSync(stdoutPath, 'r')
+      const size = fs.fstatSync(stdoutDescriptor).size
+      if (size < offset) {
+        throw new SupervisorIntegrationError('CODEX_EVENT_STREAM_INVALID', 'owned Codex JSONL tail was truncated')
+      }
+      while (offset < size) {
+        const length = Math.min(64 * 1024, size - offset)
+        const bytes = Buffer.allocUnsafe(length)
+        const read = fs.readSync(stdoutDescriptor, bytes, 0, length, offset)
+        if (read <= 0) break
+        offset += read
+        const received = bytes.subarray(0, read)
+        stdoutHash.update(received)
+        stdoutTail = appendBoundedByteTail(
+          stdoutTail,
+          received,
+          CODEX_STDOUT_FALLBACK_MAX_BYTES,
+        )
+        if (typeof spec.onTransportActivity === 'function') spec.onTransportActivity()
+        partial += stdoutDecoder.write(received)
+        emitCompleteStdoutLines()
+        if (Buffer.byteLength(partial, 'utf8') > CODEX_JSONL_PARTIAL_MAX_BYTES) {
+          throw new SupervisorIntegrationError(
+            'CODEX_EVENT_STREAM_INVALID',
+            'owned Codex JSONL contains a line larger than the bounded transport parser permits',
+            { maximumBytes: CODEX_JSONL_PARTIAL_MAX_BYTES },
+          )
+        }
+      }
+    }
     try {
       while (!status && !session.stopped) {
-        if (fs.existsSync(stdoutPath)) {
-          if (stdoutDescriptor === undefined) stdoutDescriptor = fs.openSync(stdoutPath, 'r')
-          const size = fs.fstatSync(stdoutDescriptor).size
-          if (size < offset) {
-            throw new SupervisorIntegrationError('CODEX_EVENT_STREAM_INVALID', 'owned Codex JSONL tail was truncated')
-          }
-          while (offset < size) {
-            const length = Math.min(64 * 1024, size - offset)
-            const bytes = Buffer.allocUnsafe(length)
-            const read = fs.readSync(stdoutDescriptor, bytes, 0, length, offset)
-            if (read <= 0) break
-            offset += read
-            const received = bytes.subarray(0, read)
-            stdoutHash.update(received)
-            stdoutTail = appendBoundedByteTail(
-              stdoutTail,
-              received,
-              CODEX_STDOUT_FALLBACK_MAX_BYTES,
-            )
-            if (typeof spec.onTransportActivity === 'function') spec.onTransportActivity()
-            partial += stdoutDecoder.write(received)
-            emitCompleteStdoutLines()
-            if (Buffer.byteLength(partial, 'utf8') > CODEX_JSONL_PARTIAL_MAX_BYTES) {
-              throw new SupervisorIntegrationError(
-                'CODEX_EVENT_STREAM_INVALID',
-                'owned Codex JSONL contains a line larger than the bounded transport parser permits',
-                { maximumBytes: CODEX_JSONL_PARTIAL_MAX_BYTES },
-              )
-            }
-          }
-        }
+        readAvailableStdout()
         if (fs.existsSync(statusPath)) status = readRegularJson(statusPath, 'owned Codex proxy status').parsed
         if (!status && !session.stopped) await new Promise(resolve => setTimeout(resolve, this.pollMs))
       }
+      // Status is durable only after the proxy closes and fsyncs its output
+      // handles, but it can become visible between this poller's size snapshot
+      // and status read. Always perform one final read against that closed file
+      // before freezing the transcript projection.
+      readAvailableStdout()
       partial += stdoutDecoder.end()
       if (Buffer.byteLength(partial, 'utf8') > CODEX_JSONL_PARTIAL_MAX_BYTES) {
         throw new SupervisorIntegrationError(
@@ -7362,6 +7730,7 @@ function runOwnedCodexProxy(requestPath) {
   child.stdout.on('data', bytes => fs.writeSync(stdoutHandle, bytes))
   child.stderr.on('data', bytes => fs.writeSync(stderrHandle, bytes))
   let settled = false
+  let childError = null
   const finish = (code, signal, error = null) => {
     if (settled) return
     settled = true
@@ -7382,10 +7751,17 @@ function runOwnedCodexProxy(requestPath) {
     })}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
   }
   child.stdin.on('error', error => {
-    if (!['EPIPE', 'ERR_STREAM_DESTROYED'].includes(error && error.code)) finish(1, null, error)
+    if (!['EPIPE', 'ERR_STREAM_DESTROYED'].includes(error && error.code)) {
+      childError = error
+      try { child.kill() } catch {}
+    }
   })
-  child.once('error', error => finish(1, null, error))
-  child.once('exit', (code, signal) => finish(code, signal))
+  child.once('error', error => { childError = error })
+  // `exit` may precede the final stdout/stderr data and stream close events.
+  // Publishing status there lets the owner freeze a transcript before the
+  // provider's terminal usage line. `close` is the process-wide stdio drain
+  // boundary; only then close/fsync the files and expose durable status.
+  child.once('close', (code, signal) => finish(code, signal, childError))
   child.stdin.end(request.stdin)
 }
 
@@ -7487,6 +7863,21 @@ function persistTerminalSession(controller, sessionId, details, primaryError) {
       return controller.endSession(sessionId, details)
     } catch (error) {
       persistenceFailures.push({ attempt, ...serializeError(error) })
+      if (routePersistenceIntegrityFailure(error) ||
+          ['RUN_RECORD_FAILURE', 'RUN_RECORD_BUSY', 'SESSION_TERMINAL_INTEGRITY_FAILED']
+            .includes(error && error.code)) {
+        if (hasPrimaryError) {
+          if ((typeof primaryError === 'object' || typeof primaryError === 'function') &&
+              Object.isExtensible(primaryError)) {
+            primaryError.terminalPersistenceFailure = Object.freeze({
+              code: error && error.code || 'SESSION_TERMINAL_PERSIST_FAILED',
+              attempts: Object.freeze(persistenceFailures.map(item => Object.freeze(item))),
+            })
+          }
+          throw primaryError
+        }
+        throw error
+      }
     }
   }
   if (hasPrimaryError) {
@@ -7498,6 +7889,22 @@ function persistTerminalSession(controller, sessionId, details, primaryError) {
       })
     }
     throw primaryError
+  }
+  const availabilityFailures = persistenceFailures.every(failure =>
+    ['RUN_RECORD_WRITE_UNAVAILABLE', 'SESSION_TERMINAL_WRITE_UNAVAILABLE']
+      .includes(failure.code))
+  if (availabilityFailures && controller && typeof controller.settleSessionLocally === 'function') {
+    const terminal = controller.settleSessionLocally(sessionId, details, {
+      persistenceFailures,
+    })
+    return Object.freeze({
+      ...terminal,
+      localPersistenceLimitation: Object.freeze({
+        code: 'SESSION_TERMINAL_PERSIST_FAILED',
+        attempts: 2,
+        failures: Object.freeze(persistenceFailures.map(item => Object.freeze(item))),
+      }),
+    })
   }
   throw new SupervisorIntegrationError(
     'SESSION_TERMINAL_PERSIST_FAILED',
@@ -8297,6 +8704,7 @@ class CodexSupervisorRuntime {
     this.diagnosticWorkerLaunches = 0
     this.diagnosticWorkerAdmissionsInFlight = 0
     this.lastAcceptedProgress = null
+    this.localPersistenceLimitations = []
     this.rootCallers = Object.freeze({
       controlPlane: this.rolePolicy.bindCaller({
         logicalRole: 'deterministic-control-plane',
@@ -8327,6 +8735,25 @@ class CodexSupervisorRuntime {
         budgetOutcome: { terminal: true, dimension: 'WALL', reconciledPartialState: true },
       },
     }
+  }
+
+  _recordLocalPersistenceLimitation(input = {}) {
+    const body = Object.freeze({
+      schemaVersion: 1,
+      workItemId: input.workItemId || null,
+      stage: input.stage || 'controller-local-persistence',
+      code: input.code || 'LOCAL_PERSISTENCE_UNAVAILABLE',
+      candidateHash: input.candidateHash || null,
+      continuedWithoutModelRelaunch: true,
+    })
+    const limitation = Object.freeze({
+      ...body,
+      bindingHash: hashText(stableStringify(body)),
+    })
+    if (!this.localPersistenceLimitations.some(item => item.bindingHash === limitation.bindingHash)) {
+      this.localPersistenceLimitations.push(limitation)
+    }
+    return limitation
   }
 
   _enforceBudgetPhase(name, evidence = {}) {
@@ -8913,15 +9340,14 @@ class CodexSupervisorRuntime {
       return await this._finish(terminalOutcome, result)
     } catch (error) {
       this._completeStartupBarrier()
-      // A transient drain, scheduler export, or durable-finalizer failure is a
-      // failure to record the already selected terminal result; it is not a
-      // new task failure. Retry that exact immutable intent before applying
-      // any error taxonomy that could replace DONE with FAILED/BLOCKED.
+      // Once terminal finalization starts, its integrity/epoch/manifest/process
+      // checks are the only authority that may release the lease.  The
+      // supervisor cannot safely classify an arbitrary finalizer exception as
+      // transient: it may have happened after partial durable progress.  Let
+      // the error propagate for exact crash recovery instead of retrying or
+      // replacing the selected terminal intent with another outcome.
       if (this.terminalFinalizationIntent && !this.finished) {
-        return this._finish(
-          this.terminalFinalizationIntent.outcome,
-          this.terminalFinalizationIntent.result,
-        )
+        throw error
       }
       if (this.resumableSuspensionIntent && !this.finished) {
         return this._suspendResumable(
@@ -8960,7 +9386,7 @@ class CodexSupervisorRuntime {
           terminalEnvelope: {
             status: 'LOCAL_PERSISTENCE_PENDING',
             error: serializeError(error),
-            bestAvailableCandidateEvidence: {
+            bestAvailableCandidateEvidence: error.bestAvailableCandidateEvidence || {
               disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
               ...error.details.resumableCandidate,
             },
@@ -9031,7 +9457,13 @@ class CodexSupervisorRuntime {
         : budgetStop ? 'PARTIAL' : (this.cancelled ? 'CANCELLED' : 'FAILED')
       terminalOutcome = await this._enterTerminalRelease(terminalOutcome, terminalError)
       return this._finish(terminalOutcome, {
-        terminalEnvelope: { status: terminalErrorCode, error: serializeError(terminalError) },
+        terminalEnvelope: {
+          status: terminalErrorCode,
+          error: serializeError(terminalError),
+          ...(terminalError && terminalError.bestAvailableCandidateEvidence
+            ? { bestAvailableCandidateEvidence: terminalError.bestAvailableCandidateEvidence }
+            : {}),
+        },
       })
     }
   }
@@ -11440,7 +11872,9 @@ class CodexSupervisorRuntime {
       }
       const preimages = state.canonicalAssignment.resources
         .filter(resource => resource.access !== 'read')
-        .map(resource => resourceStateEntry(this.options.targetPath, resource))
+        .map(resource => resourceStateEntry(this.options.targetPath, resource, {
+          allowExplicitExternalLocal: canonicalExternalLocalResource(resource, this.options.targetPath),
+        }))
         .filter(Boolean)
       mutationPermit = await this.options.mutationEnforcer.begin({
         assignment: state.canonicalAssignment,
@@ -11921,10 +12355,19 @@ class CodexSupervisorRuntime {
         const snapshotPath = untrustedSnapshotPath && typeof this.options.validateCheckerSnapshot === 'function'
           ? this.options.validateCheckerSnapshot(untrustedSnapshotPath)
           : null
+        const restoredExternalResources = projection ? [] : candidateExternalLocalResources(
+          request.manifests,
+          this.options.targetPath,
+          this.options.mission,
+        )
         const restoredCandidateHash = snapshotPath && fs.existsSync(snapshotPath)
           ? (projection
               ? validatePlanCheckerSnapshot(snapshotPath, request)
-              : hashWorkspaceCandidate(snapshotPath, this.options.gitEnvironment(snapshotPath)))
+              : hashWorkspaceCandidate(
+                  snapshotPath,
+                  this.options.gitEnvironment(snapshotPath),
+                  restoredExternalResources,
+                ))
           : null
         if (!snapshotPath || !fs.existsSync(snapshotPath) || restoredCandidateHash !== request.candidateHash) {
           throw new SupervisorIntegrationError(
@@ -12363,14 +12806,22 @@ class CodexSupervisorRuntime {
     let mutationPermit = null
     let mutationBefore = null
     let mutationAdmission = null
+    let authenticatedChildResult = null
+    let promotedAuthenticatedCandidateHash = null
+    let externalLocalBoundary = null
+    let externalLocalAdmission = null
+    let externalLocalTransactionCommitted = false
     let promotedMutationCandidate = null
     let preservePromotedMutationCandidate = false
+    let terminalUsageAccounted = false
     let pendingDeferredPromotion = null
     let deferredPromotionHandle = deferredRepairCandidate
       ? this._deferredPromotionHandle(request.deferredPromotionRepairToken, deferredRepairCandidate)
       : null
     let checkerSnapshotBefore = null
     let persistProviderTransportFailure = null
+    let inspectMutationCompletion = null
+    const transcriptEvidenceTracker = createTranscriptEvidenceTracker()
     try {
     if (!adoptedLease && request.route !== 'PRE_ROUTE' && !this.firstChildStartupRecorded) {
       const startupAdmission = scheduler.recordAdmissionComponent(
@@ -12531,7 +12982,6 @@ class CodexSupervisorRuntime {
     }
     persistSchedulerCheckpoint(continuationId, 'LEASE_STARTED')
     if (externalOperation) persistSchedulerCheckpoint(continuationId, 'EXTERNAL_OPERATION')
-    const transcriptEvidenceTracker = createTranscriptEvidenceTracker()
     let transcriptStore = null
     if (typeof this.options.transcriptStoreFactory === 'function') {
       transcriptStore = this.options.transcriptStoreFactory({ request, sessionId, record: this.record })
@@ -12564,6 +13014,48 @@ class CodexSupervisorRuntime {
           return externalWriteBoundaryReceipt
         }
       : null
+    inspectMutationCompletion = terminalResult => {
+      externalLocalAdmission = inspectExplicitExternalLocalBoundary(
+        externalLocalBoundary,
+        canonicalAssignment,
+        targetWorkingDirectory,
+        terminalResult,
+      )
+      const externalResources = externalLocalBoundary && externalLocalBoundary.resources || []
+      const localResult = externalResources.length > 0
+        ? {
+            ...terminalResult,
+            filesChanged: terminalResult.filesChanged.filter(reported =>
+              !externalResources.some(resource =>
+                reportedPathMatchesExternalResource(reported, resource))),
+          }
+        : terminalResult
+      const workspaceAdmission = workerWorkspace.manager.inspect(workerWorkspace, localResult)
+      return Object.freeze({
+        ...workspaceAdmission,
+        workspaceAdmission,
+        actualFilesChanged: Object.freeze([
+          ...workspaceAdmission.actualFilesChanged,
+          ...externalLocalAdmission.actualFilesChanged,
+        ]),
+        after: Object.freeze([
+          ...workspaceAdmission.after,
+          ...externalLocalAdmission.resources.map(resource => Object.freeze({
+            path: resource.identity,
+            hash: resource.type === 'missing' ? null : resource.hash,
+            type: resource.type,
+          })),
+        ]),
+        postimages: Object.freeze([
+          ...workspaceAdmission.postimages,
+          ...externalLocalAdmission.postimages.map(postimage => Object.freeze({
+            path: postimage.path,
+            hash: postimage.hash,
+          })),
+        ]),
+        externalLocalResources: externalLocalAdmission.resources,
+      })
+    }
     const launchRecord = {
       activationId: this.activation.id,
       generation: this.activation.generation,
@@ -12573,6 +13065,12 @@ class CodexSupervisorRuntime {
       schedulerAttempt: lease.attempt,
       sessionId,
       reservationId,
+      // This projection is controller-owned: explicit scheduler estimates win
+      // per category, while an omitted estimate falls back to the admitted
+      // lane token bound. It is consumed only when a clean owned Codex exit
+      // omits terminal usage telemetry, so missing provider fields cannot turn
+      // into a free model launch.
+      usageCompatibilityFallback: codexCompatibilityUsageBound(scheduler, schedulerRequest),
       parent: policy.parent,
       route: request.route,
       caller,
@@ -12606,6 +13104,7 @@ class CodexSupervisorRuntime {
         workspaceId: workerWorkspace.workspaceId,
         binding: workerWorkspace.binding,
       }) : null,
+      externalLocalBoundary: null,
       onEvent: transcriptStore || policy.child === 'route-analyst'
         ? (event, raw) => {
             if (transcriptStore) {
@@ -12645,16 +13144,6 @@ class CodexSupervisorRuntime {
           }
           throw error
         }
-        if (mutationBefore && !mutationAdmission) {
-          mutationAdmission = workerWorkspace.manager.inspect(workerWorkspace, terminalResult)
-          this._persistMutationAdmission(request.workItemId, mutationAdmission)
-        }
-        if (deferredRepairCandidate) {
-          deferredPromotionHandle = this._refreshDeferredPromotionAfterRepair(
-            request.deferredPromotionRepairToken,
-            terminalResult,
-          )
-        }
         if (terminalEvidence.sessionId !== identifiedContinuationId) {
           throw new SupervisorIntegrationError(
             'CRASH_ADOPTION_CONFLICT',
@@ -12665,6 +13154,21 @@ class CodexSupervisorRuntime {
           throw new SupervisorIntegrationError(
             'CRASH_ADOPTION_CONFLICT',
             'terminal worker result context differs from its receipt-bound Codex continuation',
+          )
+        }
+        // From this point the terminal bytes and their physical Codex thread
+        // are authenticated independently of the controller's local journals.
+        // Retain them in memory before any receipt/checkpoint writer runs so a
+        // local persistence outage cannot erase a completed model result.
+        authenticatedChildResult = terminalResult
+        if (mutationBefore && !mutationAdmission) {
+          mutationAdmission = inspectMutationCompletion(terminalResult)
+          this._persistMutationAdmission(request.workItemId, mutationAdmission)
+        }
+        if (deferredRepairCandidate) {
+          deferredPromotionHandle = this._refreshDeferredPromotionAfterRepair(
+            request.deferredPromotionRepairToken,
+            terminalResult,
           )
         }
         if (terminalResult.externalOperation) {
@@ -12883,7 +13387,7 @@ class CodexSupervisorRuntime {
         return verdict
       },
     }
-    persistProviderTransportFailure = providerError => {
+    persistProviderTransportFailure = (providerError, candidateEvidence = null) => {
       const controllerContinuationId = identifiedContinuationId || continuationId || sessionId
       // A provider availability result is still the result of this exact
       // admitted physical launch. Bind the deterministic controller terminal
@@ -12907,6 +13411,10 @@ class CodexSupervisorRuntime {
             physicalRole,
             findingIds: canonicalAssignment && canonicalAssignment.findingIds || findingIds,
             requestEnvelopeHash: this.requestPointer.hash,
+            ...(candidateEvidence ? {
+              candidateHash: candidateEvidence.candidateHash,
+              filesChanged: candidateEvidence.filesChanged,
+            } : {}),
           })
       validateCanonicalChildResult({
         workItemId: request.workItemId,
@@ -13046,9 +13554,40 @@ class CodexSupervisorRuntime {
     const realTargetBefore = enforceRealTargetDenial
       ? workspaceFileSnapshot(this.options.targetPath, this.options.gitEnvironment(this.options.targetPath))
       : null
+    const checkerExternalLocalResources = CHECKER_ROLES.has(policy.child)
+      ? candidateExternalLocalResources(
+          request.manifests,
+          this.options.targetPath,
+          this.options.mission,
+        )
+      : Object.freeze([])
     checkerSnapshotBefore = CHECKER_ROLES.has(policy.child)
-      ? hashWorkspaceCandidate(targetWorkingDirectory, this.options.gitEnvironment(targetWorkingDirectory))
+      ? hashWorkspaceCandidate(
+          targetWorkingDirectory,
+          this.options.gitEnvironment(targetWorkingDirectory),
+          checkerExternalLocalResources,
+        )
       : null
+    if (checkerSnapshotBefore && checkerSnapshotBefore !== request.candidateHash) {
+      throw new SupervisorIntegrationError(
+        'CHECKER_SNAPSHOT_VERSION_MISMATCH',
+        'checker workspace plus exact external local resources differ from the frozen exact version being checked',
+        {
+          expectedCandidateHash: request.candidateHash,
+          actualCandidateHash: checkerSnapshotBefore,
+          snapshotWorkspaceHash: hashWorkspaceCandidate(
+            targetWorkingDirectory,
+            this.options.gitEnvironment(targetWorkingDirectory),
+          ),
+          targetWorkspaceHash: hashWorkspaceCandidate(
+            this.options.targetPath,
+            this.options.gitEnvironment(this.options.targetPath),
+          ),
+          externalLocalResourceIdentities: checkerExternalLocalResources
+            .map(resource => resource.identity),
+        },
+      )
+    }
       if (TARGET_MUTATOR_ROLES.has(policy.child) && canonicalAssignment &&
           this.options.mutationEnforcer && !deferredRepairCandidate) {
         if (!this.record || typeof this.record.writePreMutationBaseline !== 'function' ||
@@ -13096,7 +13635,12 @@ class CodexSupervisorRuntime {
         } else {
           const preimagePairs = canonicalAssignment.resources
             .filter(resource => resource.access !== 'read')
-            .map(resource => ({ resource, state: resourceStateEntry(targetWorkingDirectory, resource) }))
+            .map(resource => ({
+              resource,
+              state: resourceStateEntry(targetWorkingDirectory, resource, {
+                allowExplicitExternalLocal: canonicalExternalLocalResource(resource, targetWorkingDirectory),
+              }),
+            }))
             .filter(pair => pair.state)
           const preimages = preimagePairs.map(pair => pair.state)
           for (const pair of preimagePairs) {
@@ -13115,6 +13659,40 @@ class CodexSupervisorRuntime {
             workItemId: request.workItemId,
           })
         }
+        externalLocalBoundary = materializeExplicitExternalLocalBoundary(
+          canonicalAssignment,
+          targetWorkingDirectory,
+          workerWorkspace && workerWorkspace.recordPath ? {
+            transactionRoot: path.join(
+              path.dirname(path.dirname(workerWorkspace.recordPath)),
+              'external-local-transactions',
+              hashText(stableStringify({
+                runId: this.options.runId,
+                generation: this.activation.generation,
+                workItemId: request.workItemId,
+                leaseId: lease.id,
+              })),
+            ),
+            quarantineRoot: path.join(
+              path.dirname(path.dirname(workerWorkspace.recordPath)),
+              'external-local-quarantines',
+            ),
+            sourceWorkItemId: request.workItemId,
+          } : { sourceWorkItemId: request.workItemId },
+        )
+        if (transportQuarantine && transportQuarantine.externalLocal) {
+          seedExplicitExternalLocalBoundaryFromQuarantine(
+            externalLocalBoundary,
+            canonicalAssignment,
+            targetWorkingDirectory,
+            transportQuarantine.externalLocal,
+            {
+              retryWorkItemId: request.workItemId,
+              transportReceiptHash: transportQuarantine.externalLocal.transportReceiptHash,
+            },
+          )
+        }
+        launchRecord.externalLocalBoundary = externalLocalBoundary
       }
       if (externalOperation) {
         this.budget.assertExternalWriteAllowed({
@@ -13158,6 +13736,7 @@ class CodexSupervisorRuntime {
       if (checkerSnapshotBefore && hashWorkspaceCandidate(
         targetWorkingDirectory,
         this.options.gitEnvironment(targetWorkingDirectory),
+        checkerExternalLocalResources,
       ) !== checkerSnapshotBefore) {
         throw new SupervisorIntegrationError(
           'CHECKER_SNAPSHOT_MUTATED',
@@ -13220,11 +13799,13 @@ class CodexSupervisorRuntime {
           candidateHash: request.candidateHash || null,
           findingIds: canonicalAssignment && canonicalAssignment.findingIds || [],
         }, result, this.options.runId, this.requestPointer.hash)
-        mutationAdmission = workerWorkspace.manager.inspect(workerWorkspace, result)
+        authenticatedChildResult = result
+        mutationAdmission = inspectMutationCompletion(result)
         this._persistMutationAdmission(request.workItemId, mutationAdmission)
       }
       if (mutationPermit) {
-        for (const resource of canonicalAssignment.resources.filter(item => item.access !== 'read')) {
+        for (const resource of canonicalAssignment.resources.filter(item =>
+          item.access !== 'read' && !canonicalExternalLocalResource(item, targetWorkingDirectory))) {
           const current = resourceStateEntry(targetWorkingDirectory, resource)
           if (current && resource.expectedPreimageHash !== current.hash) {
             throw new SupervisorIntegrationError(
@@ -13234,8 +13815,18 @@ class CodexSupervisorRuntime {
           }
         }
         if (request.deferPromotion === true) {
+          if (externalLocalBoundary) {
+            throw new SupervisorIntegrationError(
+              'DONE_RETRY_ISOLATION_REQUIRED',
+              'deferred promotion cannot retain a live explicit external-local transaction',
+            )
+          }
           pendingDeferredPromotion = {
-            candidateHash: hashWorkspaceCandidate(workingDirectory, this.options.gitEnvironment(workingDirectory)),
+            candidateHash: hashWorkspaceCandidate(
+              workingDirectory,
+              this.options.gitEnvironment(workingDirectory),
+              explicitExternalLocalResources(canonicalAssignment, targetWorkingDirectory),
+            ),
             workspacePath: workingDirectory,
             workerWorkspace,
             mutationAdmission,
@@ -13244,10 +13835,15 @@ class CodexSupervisorRuntime {
             workItemId: request.workItemId,
           }
         } else {
-          const promotedPostimages = workerWorkspace.manager.promote(workerWorkspace, mutationAdmission)
+          const workspaceAdmission = mutationAdmission.workspaceAdmission || mutationAdmission
+          const promotedPostimages = [
+            ...workerWorkspace.manager.promote(workerWorkspace, workspaceAdmission),
+            ...(externalLocalAdmission && externalLocalAdmission.postimages || []),
+          ]
           const promotedCandidateHash = hashWorkspaceCandidate(
             this.options.targetPath,
             this.options.gitEnvironment(this.options.targetPath),
+            explicitExternalLocalResources(canonicalAssignment, this.options.targetPath),
           )
           const promotedBody = Object.freeze({
             schemaVersion: 1,
@@ -13308,7 +13904,7 @@ class CodexSupervisorRuntime {
             }
           }
           if (commitFailure) {
-            preservePromotedMutationCandidate = true
+            preservePromotedMutationCandidate = !externalLocalBoundary
             throw new SupervisorIntegrationError(
               'CALLBACK_RECONCILIATION_PENDING',
               'the exact version is promoted, but its local mutation-state commit remains unavailable',
@@ -13320,7 +13916,20 @@ class CodexSupervisorRuntime {
             )
           }
           mutationPermit = null
+          if (externalLocalBoundary) {
+            // The external transaction remains rollback-capable until both the
+            // local CAS promotion and the durable mutation-state commit have
+            // succeeded.  From this point rollback would contradict durable
+            // authority, so mark the unit committed before cleanup can fail.
+            externalLocalTransactionCommitted = true
+            commitExplicitExternalLocalBoundary(
+              externalLocalBoundary,
+              externalLocalAdmission,
+              { mutationStateCommitted: true },
+            )
+          }
           workerWorkspace.manager.finalize(workerWorkspace)
+          promotedAuthenticatedCandidateHash = promotedCandidateHash
           promotedMutationCandidate = null
         }
       }
@@ -13365,6 +13974,7 @@ class CodexSupervisorRuntime {
           throw error
         }
       }
+      terminalUsageAccounted = true
       if (checkKey) this.consumedChecks.add(checkKey)
       if (checkKey && this.record && typeof this.record.write === 'function') {
         const persistedResult = { ...result, transcriptEvidence: transcriptEvidenceTracker.snapshot() }
@@ -13481,10 +14091,18 @@ class CodexSupervisorRuntime {
         })
       }
       terminalSessionSettlementAttempted = true
-      persistTerminalSession(this.budget, sessionId, {
+      const terminalSessionResult = persistTerminalSession(this.budget, sessionId, {
         status: 'DONE',
         evidenceHashes: result && result.evidenceHashes || [],
       })
+      if (terminalSessionResult && terminalSessionResult.localPersistenceLimitation) {
+        this._recordLocalPersistenceLimitation({
+          workItemId: request.workItemId,
+          stage: 'terminal-session',
+          code: terminalSessionResult.localPersistenceLimitation.code,
+          candidateHash: promotedAuthenticatedCandidateHash || request.candidateHash || null,
+        })
+      }
       budgetSessionStarted = false
       this.budget.assertAvailable({
         forWork: request.purpose !== 'recovery',
@@ -13540,8 +14158,12 @@ class CodexSupervisorRuntime {
       let cleanupFailure = null
       let committedTransportFailure = null
       let transportQuarantinePointer = null
+      let workerTransportQuarantinePointer = null
+      let externalTransportQuarantinePointer = null
       let transportQuarantineResolved = false
       let preserveCallbackWorkspace = false
+      let candidateSurvivalEvidence = null
+      let promotedTerminalTransportCandidate = null
       const attachErrorField = (field, value) => {
         if (error && (typeof error === 'object' || typeof error === 'function') &&
             Object.isExtensible(error)) error[field] = value
@@ -13552,7 +14174,11 @@ class CodexSupervisorRuntime {
       }
       if (checkerSnapshotBefore) {
         try {
-          const after = hashWorkspaceCandidate(targetWorkingDirectory, this.options.gitEnvironment(targetWorkingDirectory))
+          const after = hashWorkspaceCandidate(
+            targetWorkingDirectory,
+            this.options.gitEnvironment(targetWorkingDirectory),
+            explicitExternalLocalResources(canonicalAssignment, targetWorkingDirectory),
+          )
           if (after !== checkerSnapshotBefore) {
             const drift = new SupervisorIntegrationError(
               'CHECKER_SNAPSHOT_MUTATED',
@@ -13588,11 +14214,16 @@ class CodexSupervisorRuntime {
               'pending callback reconciliation carries a foreign Codex session binding',
             )
           }
+          authenticatedChildResult = error.frozenTerminalResult
           preserveCallbackWorkspace = Boolean(workerWorkspace)
           const candidatePath = workerWorkspace && workerWorkspace.workspacePath || targetWorkingDirectory
           const candidateHash = hashWorkspaceCandidate(
             candidatePath,
             this.options.gitEnvironment(candidatePath),
+            explicitExternalLocalResources(
+              canonicalAssignment,
+              this.options.targetPath,
+            ),
           )
           const body = Object.freeze({
             schemaVersion: 1,
@@ -13634,6 +14265,289 @@ class CodexSupervisorRuntime {
           }
         }
       }
+      if (authenticatedChildResult &&
+          authenticatedResultCanOutliveLocalPersistence(error)) {
+        const originalPersistenceError = error
+        try {
+          if (mutationAdmission || mutationPermit || workerWorkspace) {
+            if (!mutationAdmission || !workerWorkspace ||
+                !workerWorkspace.manager ||
+                typeof workerWorkspace.manager.promote !== 'function' ||
+                typeof workerWorkspace.manager.finalize !== 'function') {
+              throw new SupervisorIntegrationError(
+                'WORKER_SURVIVAL_INVALID',
+                'authenticated local continuation lacks its exact mutation admission, permit, or workspace',
+              )
+            }
+            const journal = readChecksummedJson(workerWorkspace.recordPath)
+            const alreadyPromoted = ['COMMITTED', 'FINALIZED'].includes(journal.status)
+            if (!mutationPermit && journal.status !== 'FINALIZED') {
+              throw new SupervisorIntegrationError(
+                'MUTATION_PERMIT_INVALID',
+                'authenticated local continuation lacks its exact live mutation permit',
+              )
+            }
+            if (!alreadyPromoted) {
+              const refreshedAdmission = inspectMutationCompletion(authenticatedChildResult)
+              if (stableStringify(refreshedAdmission) !== stableStringify(mutationAdmission)) {
+                throw new SupervisorIntegrationError(
+                  'MUTATION_RESULT_MISMATCH',
+                  'authenticated private exact-version bytes changed before local continuation',
+                )
+              }
+            }
+            let runtimeMutationState = null
+            if (typeof this.options.runtimeStateProvider === 'function') {
+              const runtimeState = this.options.runtimeStateProvider()
+              if (runtimeState && Object.hasOwn(runtimeState, 'activeMutation')) {
+                runtimeMutationState = runtimeState.activeMutation
+                if (runtimeMutationState &&
+                    !sameCanonicalValue(runtimeMutationState, mutationPermit)) {
+                  throw new SupervisorIntegrationError(
+                    'CRASH_ADOPTION_CONFLICT',
+                    'local continuation found a foreign active mutation permit',
+                  )
+                }
+                if (!alreadyPromoted && runtimeMutationState === null) {
+                  throw new SupervisorIntegrationError(
+                    'MUTATION_PERMIT_INVALID',
+                    'unpromoted local continuation no longer owns its exact mutation permit',
+                  )
+                }
+              }
+            }
+            const workspaceAdmission = mutationAdmission.workspaceAdmission || mutationAdmission
+            const promotedPostimages = journal.status === 'FINALIZED'
+              ? mutationAdmission.postimages.map(postimage => Object.freeze({
+                  type: postimage.hash === null ? 'missing' : 'file',
+                  path: postimage.path,
+                  hash: postimage.hash,
+                }))
+              : [
+                  ...workerWorkspace.manager.promote(workerWorkspace, workspaceAdmission),
+                  ...(externalLocalAdmission && externalLocalAdmission.postimages || []),
+                ]
+            for (const postimage of promotedPostimages) {
+              const current = postimage.type === 'missing'
+                ? !fs.existsSync(postimage.path)
+                : fs.existsSync(postimage.path) &&
+                  sha256Bytes(fs.readFileSync(postimage.path)) === postimage.hash
+              if (!current) {
+                throw new SupervisorIntegrationError(
+                  'MUTATION_RESULT_MISMATCH',
+                  `local continuation postimage changed: ${postimage.path}`,
+                )
+              }
+            }
+            const priorStateCommitExhausted = error.code === 'CALLBACK_RECONCILIATION_PENDING' &&
+              error.details && error.details.callback &&
+              error.details.callback.kind === 'mutation-state-commit' &&
+              error.details.callback.attempts === 2
+            let stateCommitFailure = priorStateCommitExhausted
+              ? Object.assign(new Error('mutation-state commit remained unavailable after its bounded retry'), {
+                  code: error.details.latestFailure && error.details.latestFailure.code ||
+                    'LOCAL_PERSISTENCE_UNAVAILABLE',
+                })
+              : null
+            if (!priorStateCommitExhausted && mutationPermit && (runtimeMutationState !== null ||
+                typeof this.options.runtimeStateProvider !== 'function')) {
+              const commitInput = {
+                assignment: canonicalAssignment,
+                permit: mutationPermit,
+                postimages: promotedPostimages,
+                isolation: workerWorkspace.binding,
+                workItemId: request.workItemId,
+              }
+              for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
+                try {
+                  await this.options.mutationEnforcer.commit(commitInput)
+                  stateCommitFailure = null
+                  break
+                } catch (commitError) {
+                  if (promotedMutationFailureRequiresRollback(commitError)) throw commitError
+                  stateCommitFailure = commitError
+                }
+              }
+            }
+            if (stateCommitFailure) {
+              if (externalLocalBoundary) throw stateCommitFailure
+              try {
+                await this.options.mutationEnforcer.abort({
+                  assignment: canonicalAssignment,
+                  permit: mutationPermit,
+                  isolation: workerWorkspace.binding,
+                  workItemId: request.workItemId,
+                  error: stateCommitFailure,
+                })
+              } catch (abortError) {
+                if (!authenticatedResultCanOutliveLocalPersistence(abortError) &&
+                    abortError.code !== 'EIO') throw abortError
+                this._recordLocalPersistenceLimitation({
+                  workItemId: request.workItemId,
+                  stage: 'mutation-permit-close',
+                  code: abortError.code || 'LOCAL_PERSISTENCE_UNAVAILABLE',
+                })
+              }
+            }
+            mutationPermit = null
+            if (externalLocalBoundary && !externalLocalTransactionCommitted) {
+              externalLocalTransactionCommitted = true
+              commitExplicitExternalLocalBoundary(
+                externalLocalBoundary,
+                externalLocalAdmission,
+                { mutationStateCommitted: true },
+              )
+            }
+            if (journal.status !== 'FINALIZED') workerWorkspace.manager.finalize(workerWorkspace)
+            promotedAuthenticatedCandidateHash = hashWorkspaceCandidate(
+              this.options.targetPath,
+              this.options.gitEnvironment(this.options.targetPath),
+              explicitExternalLocalResources(canonicalAssignment, this.options.targetPath),
+            )
+            preservePromotedMutationCandidate = false
+          }
+
+          if (!terminalUsageAccounted && authenticatedChildResult.usageStreamed !== true) {
+            const terminalUsage = authenticatedChildResult.usage
+            if (!terminalUsage || !['noncachedInput', 'cachedInput', 'output', 'reasoning']
+                .every(field => Number.isSafeInteger(terminalUsage[field]) && terminalUsage[field] >= 0)) {
+              throw new SupervisorIntegrationError(
+                'INCOMPLETE_USAGE_ACCOUNTING',
+                'authenticated local continuation still requires all four terminal usage categories',
+              )
+            }
+            lease.authorizeUsage(terminalUsage)
+            lease.reportUsage(terminalUsage, {
+              productive: request.purpose !== 'recovery',
+              progressKind: CHECKER_ROLES.has(policy.child) ? 'verification' : 'work',
+            })
+            const tokens = billableModelTokens(terminalUsage)
+            if (tokens > 0) this.budget.consumeTokens(tokens, {
+              requiredCompletion: requiredCompletion || completeAdmittedTurn,
+            })
+            terminalUsageAccounted = true
+          }
+          if (!request.retainLease) {
+            if (!leaseSettled) {
+              lease.complete({})
+              leaseSettled = true
+            }
+            if (CHECKER_ROLES.has(policy.child)) {
+              addCanonicalCompletedChecker(this.recoveryCompletedCheckIds, request.workItemId)
+            } else {
+              this.recoveryCompletedWorkIds.add(request.workItemId)
+            }
+            this.recoveryThreads.delete(lease.id)
+          }
+          if (budgetSessionStarted) {
+            terminalSessionSettlementAttempted = true
+            const terminalSessionResult = persistTerminalSession(this.budget, sessionId, {
+              status: 'DONE',
+              evidenceHashes: authenticatedChildResult.evidenceHashes || [],
+            })
+            if (terminalSessionResult && terminalSessionResult.localPersistenceLimitation) {
+              this._recordLocalPersistenceLimitation({
+                workItemId: request.workItemId,
+                stage: 'terminal-session',
+                code: terminalSessionResult.localPersistenceLimitation.code,
+                candidateHash: promotedAuthenticatedCandidateHash || request.candidateHash || null,
+              })
+            }
+            budgetSessionStarted = false
+          }
+          const continuationLimitation = this._recordLocalPersistenceLimitation({
+            workItemId: request.workItemId,
+            stage: 'authenticated-result-continuation',
+            code: error.code || 'LOCAL_PERSISTENCE_UNAVAILABLE',
+            candidateHash: promotedAuthenticatedCandidateHash || request.candidateHash || null,
+          })
+          const returned = {
+            ...authenticatedChildResult,
+            transcriptEvidence: transcriptEvidenceTracker.snapshot(),
+          }
+          Object.defineProperty(returned, 'localPersistenceLimitation', {
+            enumerable: false,
+            configurable: false,
+            writable: false,
+            value: continuationLimitation,
+          })
+          Object.defineProperty(returned, STREAMED_ROUTE_EVENT_COUNT, {
+            value: streamedRouteEventCount,
+          })
+          if (mutationAdmission) {
+            Object.defineProperty(returned, MUTATION_ADMISSION_EVIDENCE, {
+              enumerable: false,
+              configurable: false,
+              writable: false,
+              value: mutationAdmission,
+            })
+          }
+          if (request.retainLease) {
+            returned.retainedLease = {
+              schedulerLease: lease,
+              completed: false,
+              workItemId: request.workItemId,
+              isChecker: CHECKER_ROLES.has(policy.child),
+              candidateHash: request.candidateHash || null,
+              caller: this.rolePolicy.bindCaller({
+                logicalRole: policy.child,
+                physicalRole,
+                sessionId,
+                runId: this.options.runId,
+                generation: this.activation.generation,
+              }),
+            }
+            if (policy.child === 'mission-coordinator') {
+              this.retainedL1Leases.set(request.workItemId, returned.retainedLease)
+            }
+          }
+          return returned
+        } catch (continuationError) {
+          if (promotedMutationFailureRequiresRollback(continuationError) ||
+              ['MUTATION_PERMIT_INVALID', 'MUTATION_RESULT_MISMATCH', 'WORKER_SURVIVAL_INVALID']
+                .includes(continuationError && continuationError.code)) {
+            error = continuationError
+          } else {
+            error = originalPersistenceError
+            if (error && (typeof error === 'object' || typeof error === 'function') &&
+                Object.isExtensible(error)) {
+              error.localContinuationFailure = serializeError(continuationError)
+              error.details = {
+                ...(error.details || {}),
+                localContinuationFailure: serializeError(continuationError),
+              }
+            }
+          }
+          authenticatedChildResult = null
+        }
+      }
+      if (mutationAdmission && workerWorkspace &&
+          controllerBookkeepingFailureCanPreserveCandidate(error) &&
+          workerWorkspace.manager && typeof workerWorkspace.manager.preserveCandidate === 'function') {
+        try {
+          const candidatePath = workerWorkspace.workspacePath
+          // This survival area contains only the authenticated private Git
+          // candidate. Exact external-local resources have their own
+          // transaction/quarantine protocol and must not be implied by this
+          // pointer after those resources are rolled back.
+          const candidateHash = hashWorkspaceCandidate(
+            candidatePath,
+            this.options.gitEnvironment(candidatePath),
+          )
+          candidateSurvivalEvidence = workerWorkspace.manager.preserveCandidate(workerWorkspace, {
+            admission: mutationAdmission.workspaceAdmission || mutationAdmission,
+            candidateHash,
+            reasonCode: error && error.code || 'CONTROLLER_BOOKKEEPING_FAILURE',
+          })
+          attachErrorField('bestAvailableCandidateEvidence', candidateSurvivalEvidence)
+          attachErrorField('details', {
+            ...(error.details || {}),
+            bestAvailableCandidateEvidence: candidateSurvivalEvidence,
+          })
+        } catch (survivalError) {
+          attachErrorField('candidateSurvivalFailure', serializeError(survivalError))
+        }
+      }
       if (externalOperation && error && ['MISSION_TIMEOUT', 'EXTERNAL_WRITE_DEADLINE_EXPIRED'].includes(error.code)) {
         const reconciled = reconcileExternalOperationTimeout(externalOperation, this.recoveryExternalOperations)
         this.recoveryExternalOperations.set(reconciled.operationId, reconciled)
@@ -13641,11 +14555,154 @@ class CodexSupervisorRuntime {
           ...(error.details || {}), externalOperation: reconciled, terminalBudgetOutcome: 'PARTIAL',
         })
       }
+      const exhaustedTransportSuccessor = Boolean(
+        !externalOperation &&
+        PROVIDER_TRANSPORT_AVAILABILITY_CODES.has(error && error.code) &&
+        TARGET_MUTATOR_ROLES.has(policy.child) &&
+        /-transport-retry-1$/u.test(request.workItemId || '') &&
+        request.transportFailureRetryId === null &&
+        mutationPermit && workerWorkspace && mutationBefore,
+      )
+      if (exhaustedTransportSuccessor) {
+        try {
+          const mutationAfter = workspaceFileSnapshot(
+            workingDirectory,
+            this.options.gitEnvironment(workingDirectory),
+          )
+          const observedLocalPaths = [...new Set([
+            ...[...new Set([...mutationBefore.keys(), ...mutationAfter.keys()])]
+              .filter(name => mutationBefore.get(name) !== mutationAfter.get(name)),
+            ...changedWorkspacePaths(
+              workingDirectory,
+              this.options.gitEnvironment(workingDirectory),
+            ),
+          ])].sort()
+          const observedExternalPaths = externalLocalBoundary
+            ? externalLocalBoundary.resources.map(resource => resource.identity)
+            : []
+          const observedTransportFiles = [...observedLocalPaths, ...observedExternalPaths]
+          externalLocalAdmission = inspectExplicitExternalLocalBoundary(
+            externalLocalBoundary,
+            canonicalAssignment,
+            targetWorkingDirectory,
+            { filesChanged: observedTransportFiles },
+          )
+          const externalResources = externalLocalBoundary && externalLocalBoundary.resources || []
+          const workspaceAdmission = workerWorkspace.manager.inspect(workerWorkspace, {
+            filesChanged: observedTransportFiles.filter(reported =>
+              !externalResources.some(resource =>
+                reportedPathMatchesExternalResource(reported, resource))),
+          })
+          mutationAdmission = Object.freeze({
+            ...workspaceAdmission,
+            workspaceAdmission,
+            actualFilesChanged: Object.freeze([
+              ...workspaceAdmission.actualFilesChanged,
+              ...externalLocalAdmission.actualFilesChanged,
+            ]),
+            after: Object.freeze([
+              ...workspaceAdmission.after,
+              ...externalLocalAdmission.resources.map(resource => Object.freeze({
+                path: resource.identity,
+                hash: resource.type === 'missing' ? null : resource.hash,
+                type: resource.type,
+              })),
+            ]),
+            postimages: Object.freeze([
+              ...workspaceAdmission.postimages,
+              ...externalLocalAdmission.postimages.map(postimage => Object.freeze({
+                path: postimage.path,
+                hash: postimage.hash,
+              })),
+            ]),
+            externalLocalResources: externalLocalAdmission.resources,
+          })
+          if (mutationAdmission.actualFilesChanged.length > 0) {
+            this._persistMutationAdmission(request.workItemId, mutationAdmission)
+            const promotedPostimages = [
+              ...workerWorkspace.manager.promote(workerWorkspace, workspaceAdmission),
+              ...(externalLocalAdmission && externalLocalAdmission.postimages || []),
+            ]
+            const candidateHash = hashWorkspaceCandidate(
+              this.options.targetPath,
+              this.options.gitEnvironment(this.options.targetPath),
+              explicitExternalLocalResources(canonicalAssignment, this.options.targetPath),
+            )
+            const promotedBody = Object.freeze({
+              schemaVersion: 1,
+              kind: 'terminal-transport-partial-candidate',
+              runId: this.options.runId,
+              activationId: this.activation.id,
+              generation: this.activation.generation,
+              workItemId: request.workItemId,
+              candidatePath: path.resolve(this.options.targetPath),
+              candidateHash,
+              mutationAdmissionHash: hashText(stableStringify(mutationAdmission)),
+              postimagesHash: hashText(stableStringify(promotedPostimages)),
+            })
+            promotedMutationCandidate = Object.freeze({
+              ...promotedBody,
+              bindingHash: hashText(stableStringify(promotedBody)),
+            })
+            const commitInput = {
+              assignment: canonicalAssignment,
+              permit: mutationPermit,
+              postimages: promotedPostimages,
+              isolation: workerWorkspace.binding,
+              workItemId: request.workItemId,
+            }
+            let commitFailure = null
+            for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
+              try {
+                await this.options.mutationEnforcer.commit(commitInput)
+                commitFailure = null
+                break
+              } catch (commitError) {
+                commitFailure = commitError
+              }
+            }
+            if (commitFailure) {
+              preservePromotedMutationCandidate = !externalLocalBoundary
+              throw new SupervisorIntegrationError(
+                'CALLBACK_RECONCILIATION_PENDING',
+                'the exact terminal version is promoted, but its local mutation-state commit remains unavailable',
+                {
+                  callback: Object.freeze({ kind: 'mutation-state-commit', attempts: 2 }),
+                  latestFailure: serializeError(commitFailure),
+                  resumableCandidate: promotedMutationCandidate,
+                },
+              )
+            }
+            mutationPermit = null
+            if (externalLocalBoundary) {
+              externalLocalTransactionCommitted = true
+              commitExplicitExternalLocalBoundary(
+                externalLocalBoundary,
+                externalLocalAdmission,
+                { mutationStateCommitted: true },
+              )
+            }
+            workerWorkspace.manager.finalize(workerWorkspace)
+            promotedTerminalTransportCandidate = Object.freeze({
+              candidateHash,
+              filesChanged: Object.freeze([...mutationAdmission.actualFilesChanged]),
+              mutationAdmission,
+            })
+            promotedMutationCandidate = null
+          }
+        } catch (candidateError) {
+          error = candidateError
+          promotedTerminalTransportCandidate = null
+        }
+      }
       if (!externalOperation && request.route !== 'PRE_ROUTE' &&
           PROVIDER_TRANSPORT_AVAILABILITY_CODES.has(error && error.code) &&
           typeof persistProviderTransportFailure === 'function') {
         try {
-          committedTransportFailure = persistProviderTransportFailure(error)
+          committedTransportFailure = persistProviderTransportFailure(
+            error,
+            promotedTerminalTransportCandidate,
+          )
         } catch (persistenceError) {
           // A failure to bind the transport result to the still-open real
           // lease is an integrity failure. Preserve it rather than falling
@@ -13658,14 +14715,60 @@ class CodexSupervisorRuntime {
           request.transportFailureRetryId &&
           typeof workerWorkspace.manager.quarantine === 'function') {
         try {
-          transportQuarantinePointer = workerWorkspace.manager.quarantine(workerWorkspace, {
+          workerTransportQuarantinePointer = workerWorkspace.manager.quarantine(workerWorkspace, {
             retryWorkItemId: request.transportFailureRetryId,
             transportReceiptHash: committedTransportFailure.receipt.receiptHash,
           })
-          transportQuarantineResolved = true
         } catch (quarantineError) {
           attachCleanupFailure('transportQuarantineError', quarantineError)
         }
+      }
+      if (externalLocalBoundary && !externalLocalTransactionCommitted) {
+        try {
+          if (committedTransportFailure && request.transportFailureRetryId) {
+            externalTransportQuarantinePointer = quarantineExplicitExternalLocalBoundary(
+              externalLocalBoundary,
+              targetWorkingDirectory,
+              {
+                sourceWorkItemId: request.workItemId,
+                retryWorkItemId: request.transportFailureRetryId,
+                transportReceiptHash: committedTransportFailure.receipt.receiptHash,
+              },
+            )
+          } else {
+            rollbackExplicitExternalLocalBoundary(
+              externalLocalBoundary,
+              targetWorkingDirectory,
+            )
+          }
+        } catch (externalRollbackError) {
+          attachCleanupFailure('externalLocalReconciliationError', externalRollbackError)
+          // A failed quarantine is not authority to retain the live partial
+          // output. If its authenticated preimage transaction is still
+          // available, make one deterministic rollback attempt before any
+          // lease or mutation authority can settle.
+          if (externalLocalBoundary.transaction &&
+              fs.existsSync(externalLocalBoundary.transaction.root)) {
+            try {
+              rollbackExplicitExternalLocalBoundary(
+                externalLocalBoundary,
+                targetWorkingDirectory,
+              )
+            } catch (fallbackRollbackError) {
+              attachErrorField(
+                'externalLocalFallbackRollbackError',
+                serializeError(fallbackRollbackError),
+              )
+            }
+          }
+        }
+      }
+      if (committedTransportFailure && request.transportFailureRetryId && !cleanupFailure) {
+        transportQuarantinePointer = transportQuarantineBundle(
+          workerTransportQuarantinePointer,
+          externalTransportQuarantinePointer,
+        )
+        transportQuarantineResolved = true
       }
       const preserveDeferredRepairForTransportSuccessor = Boolean(
         deferredRepairCandidate && committedTransportFailure &&
@@ -13676,7 +14779,7 @@ class CodexSupervisorRuntime {
           attachCleanupFailure('workspaceAbortError', abortError)
         }
       }
-      if (mutationPermit && workerWorkspace && !transportQuarantinePointer &&
+      if (mutationPermit && workerWorkspace && !workerTransportQuarantinePointer &&
           !preservePromotedMutationCandidate &&
           !preserveCallbackWorkspace) {
         try { workerWorkspace.manager.abort(workerWorkspace) } catch (abortError) {
@@ -13741,14 +14844,24 @@ class CodexSupervisorRuntime {
             })
             budgetSessionStarted = false
           }
-          if (!transportQuarantineResolved) return failure
+          if (!transportQuarantineResolved && !promotedTerminalTransportCandidate) return failure
           const returnedFailure = { ...failure }
-          Object.defineProperty(returnedFailure, TRANSPORT_QUARANTINE_POINTER, {
-            enumerable: false,
-            configurable: false,
-            writable: false,
-            value: transportQuarantinePointer,
-          })
+          if (transportQuarantineResolved) {
+            Object.defineProperty(returnedFailure, TRANSPORT_QUARANTINE_POINTER, {
+              enumerable: false,
+              configurable: false,
+              writable: false,
+              value: transportQuarantinePointer,
+            })
+          }
+          if (promotedTerminalTransportCandidate) {
+            Object.defineProperty(returnedFailure, MUTATION_ADMISSION_EVIDENCE, {
+              enumerable: false,
+              configurable: false,
+              writable: false,
+              value: promotedTerminalTransportCandidate.mutationAdmission,
+            })
+          }
           return returnedFailure
         } catch (settlementError) {
           error = settlementError
@@ -13762,6 +14875,7 @@ class CodexSupervisorRuntime {
           status: error && error.code === 'MISSION_TIMEOUT' ? 'PARTIAL' : 'FAILED', evidenceHashes: [],
         }, error)
       }
+      if (candidateSurvivalEvidence) attachErrorField('bestAvailableCandidateEvidence', candidateSurvivalEvidence)
       throw error
     }
   }
@@ -14136,12 +15250,16 @@ class CodexSupervisorRuntime {
         }
       }
       if (finalizationDeliverables.length > 0) {
+        const existingCandidateEvidence = result.terminalEnvelope &&
+          result.terminalEnvelope.bestAvailableCandidateEvidence
         result = {
           ...result,
           terminalEnvelope: {
             ...(result.terminalEnvelope || {}),
             bestAvailableCandidateEvidence: {
-              disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+              ...(existingCandidateEvidence || {
+                disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+              }),
               deliverableCount: finalizationDeliverables.length,
               deliverableManifestHash: hashText(stableStringify(finalizationDeliverables)),
             },
@@ -14199,9 +15317,10 @@ class CodexSupervisorRuntime {
         { boundary: 'terminal-finalization', outcome, requiredCompletion: true },
       )
       let finalized
+      let settledTerminalEnvelope = result.terminalEnvelope || null
       if (this.finalizer && typeof this.finalizer.finalize === 'function') {
         const diagnostics = terminalFinalizationDiagnostics(result)
-        finalized = await this.finalizer.finalize({
+        const finalizerInput = Object.freeze({
           outcome,
           reason: diagnostics.reason,
           unblockPath: diagnostics.unblockPath,
@@ -14210,6 +15329,7 @@ class CodexSupervisorRuntime {
           terminalEnvelope: diagnostics.terminalEnvelope,
           expectedEpoch: result.expectedEpoch,
         })
+        finalized = await this.finalizer.finalize(finalizerInput)
       } else {
         this.missionLock.release(this.lease)
         finalized = { outcome, durable: false, reason: 'runtime record was unavailable before finalizer creation' }
@@ -14218,11 +15338,17 @@ class CodexSupervisorRuntime {
       const settled = {
         outcome,
         route: this.route,
-        terminalEnvelope: result.terminalEnvelope || null,
+        terminalEnvelope: settledTerminalEnvelope,
         finalResponse: result.finalResponse || null,
+        deliverables: finalizationDeliverables,
+        checkHashes: result.checkHashes || [],
         postDrainCheckpoint: result.postDrainCheckpoint || null,
         finalizationBudget,
         finalized,
+        localPersistenceLimitations: Object.freeze([
+          ...(Array.isArray(this.localPersistenceLimitations)
+            ? this.localPersistenceLimitations : []),
+        ]),
         budget: this.budget.snapshot(),
         scheduler: schedulerMetrics,
         schedulerState,
@@ -14433,6 +15559,13 @@ function validateActivationRoleProjection(record, profilePath, activationRoot) {
         containment.startsWith(`..${path.sep}`) || !stat.isFile() || stat.isSymbolicLink() ||
         Number(stat.nlink) !== 1) {
       throw new SupervisorIntegrationError('ACTIVATION_RECEIPT_INVALID', `physical role file is unsafe: ${providerRole}`)
+    }
+    const agentText = fs.readFileSync(agentPath, 'utf8')
+    const names = [...agentText.matchAll(/^name\s*=\s*"([a-z0-9-]+)"\s*$/gm)]
+    if (names.length !== 1 || names[0][1] !== physical) {
+      throw new SupervisorIntegrationError(
+        'ACTIVATION_RECEIPT_INVALID', `physical role name mismatch: ${providerRole}`,
+      )
     }
   }
   return Object.freeze({
@@ -14912,7 +16045,32 @@ function runGit(repository, argv, options = {}) {
   return result.stdout
 }
 
-function hashWorkspaceCandidate(repository, environment) {
+function exactHeadOid(repository, environment) {
+  const oid = String(runGit(repository, ['rev-parse', '--verify', 'HEAD^{commit}'], {
+    environment,
+  })).trim()
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(oid)) {
+    throw new SupervisorIntegrationError('SAFE_GIT_ENV_INVALID', 'repository HEAD is not one exact commit')
+  }
+  return oid
+}
+
+function alignCloneToExpectedHead(sourcePath, clonePath, expectedBranch, environment) {
+  if (expectedBranch !== '') return null
+  const sourceHeadOid = exactHeadOid(sourcePath, environment)
+  runGit(clonePath, ['checkout', '--quiet', '--detach', sourceHeadOid], { environment })
+  const cloneHeadOid = exactHeadOid(clonePath, environment)
+  const cloneBranch = String(runGit(clonePath, ['branch', '--show-current'], { environment })).trim()
+  if (cloneHeadOid !== sourceHeadOid || cloneBranch !== '') {
+    throw new SupervisorIntegrationError(
+      'SAFE_GIT_ENV_INVALID',
+      'private clone did not preserve the exact detached source HEAD',
+    )
+  }
+  return sourceHeadOid
+}
+
+function hashWorkspaceCandidate(repository, environment, externalLocalResources = []) {
   const listing = Buffer.from(runGit(repository, ['ls-files', '-co', '--exclude-standard', '-z'], {
     encoding: null, environment,
   }))
@@ -14933,7 +16091,37 @@ function hashWorkspaceCandidate(repository, environment) {
     digest.update(fs.readFileSync(absolute))
     digest.update(Buffer.from('\0'))
   }
-  return digest.digest('hex')
+  const workspaceHash = digest.digest('hex')
+  if (!Array.isArray(externalLocalResources) || externalLocalResources.length === 0) {
+    return workspaceHash
+  }
+  const externalState = externalLocalResources.map(resource => {
+    const state = resourceStateEntry(repository, resource, { allowExplicitExternalLocal: true })
+    if (!state) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_RESOURCE_INVALID',
+        `exact-version resource is not an exact local filesystem path: ${resource && resource.identity}`,
+      )
+    }
+    return Object.freeze({
+      kind: resource.kind,
+      identity: path.resolve(resource.identity),
+      type: state.type,
+      hash: state.hash,
+      mode: state.mode,
+    })
+  }).sort((left, right) => left.identity.localeCompare(right.identity))
+  if (new Set(externalState.map(item => item.identity)).size !== externalState.length) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_RESOURCE_INVALID',
+      'exact-version resource manifest repeats an exact external local path',
+    )
+  }
+  return hashText(stableStringify({
+    schemaVersion: 1,
+    workspaceHash,
+    externalLocalResources: externalState,
+  }))
 }
 
 function planCheckerProjection(request) {
@@ -15053,6 +16241,24 @@ function changedDeliverables(repository, environment) {
   return names.sort((left, right) => left.path.localeCompare(right.path))
 }
 
+function changedWorkspacePaths(repository, environment) {
+  const records = String(runGit(
+    repository,
+    ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+    { environment },
+  )).split('\0').filter(Boolean)
+  const names = []
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index]
+    if (record.length < 4 || record[2] !== ' ') continue
+    names.push(record.slice(3))
+    if (/[RC]/u.test(record.slice(0, 2)) && index + 1 < records.length) {
+      names.push(records[++index])
+    }
+  }
+  return [...new Set(names.map(name => name.replace(/\\/gu, '/')))].sort()
+}
+
 function usableDeliverablesProducedByWorker(result, repository, environment, admission = null) {
   if (!result || !Array.isArray(result.filesChanged) || result.filesChanged.length === 0 || !admission) return []
   const root = path.resolve(repository)
@@ -15075,11 +16281,22 @@ function usableDeliverablesProducedByWorker(result, repository, environment, adm
   // A worker's self-assessment is not an independent product verdict. Only
   // physical current deliverables that the isolated mutation admission bound
   // to this exact result can override it; unrelated dirty target bytes cannot.
-  return changedDeliverables(repository, environment).filter(deliverable => {
+  const local = changedDeliverables(repository, environment).filter(deliverable => {
     const relative = path.relative(root, deliverable.path).replace(/\\/gu, '/')
     return relative && !relative.startsWith('../') && reported.has(relative) &&
       admitted.has(relative) && admitted.get(relative) === deliverable.hash
   })
+  const external = [...admitted.entries()].flatMap(([identity, expectedHash]) => {
+    if (!path.isAbsolute(identity) || !pathOutsideRoot(root, identity) || !reported.has(identity) ||
+        !fs.existsSync(identity)) return []
+    const stat = fs.lstatSync(identity)
+    if (stat.isSymbolicLink()) return []
+    const hash = stat.isFile() && Number(stat.nlink) === 1
+      ? sha256Bytes(fs.readFileSync(identity))
+      : stat.isDirectory() ? hashDirectoryState(identity) : null
+    return hash && hash === expectedHash ? [{ path: identity, hash }] : []
+  })
+  return [...local, ...external].sort((left, right) => left.path.localeCompare(right.path))
 }
 
 const ASSIGNMENT_RESOURCE_KINDS = new Set([
@@ -15088,7 +16305,58 @@ const ASSIGNMENT_RESOURCE_KINDS = new Set([
 const LOCAL_MUTATION_RESOURCE_KINDS = new Set(['file', 'directory', 'output', 'cache', 'evidence-root'])
 const MISSING_RESOURCE_PREIMAGE_HASH = hashText('autoprompt-resource-missing-v1')
 
-function resolveOwnedResourcePath(repository, resource) {
+function missionContainsExactAbsolutePath(mission, candidatePath) {
+  if (typeof mission !== 'string' || !path.isAbsolute(candidatePath)) return false
+  const exact = String(candidatePath)
+  let offset = 0
+  while (offset <= mission.length) {
+    const index = mission.indexOf(exact, offset)
+    if (index < 0) return false
+    const before = index === 0 ? '' : mission[index - 1]
+    const afterIndex = index + exact.length
+    const after = afterIndex === mission.length ? '' : mission[afterIndex]
+    const leftBoundary = !before || /[\s`'"([{=:]/u.test(before)
+    const rightBoundary = !after || /[\s`'"),.;:\]}]/u.test(after)
+    if (leftBoundary && rightBoundary) return true
+    offset = index + exact.length
+  }
+  return false
+}
+
+function pathOutsideRoot(root, candidate) {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate))
+  return relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)
+}
+
+function assertNoLinkedAbsolutePathPrefix(absolute, displayPath = absolute) {
+  const resolved = path.resolve(absolute)
+  const parsed = path.parse(resolved)
+  let cursor = parsed.root
+  for (const part of resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, part)
+    let stat
+    try { stat = fs.lstatSync(cursor) } catch (error) {
+      if (error && error.code === 'ENOENT') break
+      throw error
+    }
+    if (stat.isSymbolicLink()) {
+      throw new SupervisorIntegrationError(
+        'MISSION_PATH_INVALID',
+        `exact absolute local path traverses a linked path: ${displayPath}`,
+      )
+    }
+  }
+}
+
+function canonicalExternalLocalResource(resource, repository) {
+  if (!resource || !LOCAL_MUTATION_RESOURCE_KINDS.has(resource.kind) ||
+      !path.isAbsolute(String(resource.identity || '')) ||
+      !['read', 'write', 'exclusive'].includes(resource.access) ||
+      !/^[a-f0-9]{64}$/u.test(resource.expectedPreimageHash || '')) return false
+  return pathOutsideRoot(repository, resource.identity)
+}
+
+function resolveOwnedResourcePath(repository, resource, options = {}) {
   if (!resource || !LOCAL_MUTATION_RESOURCE_KINDS.has(resource.kind)) return null
   const root = path.resolve(repository)
   const identity = String(resource.identity || '').replace(/\\/g, '/')
@@ -15097,7 +16365,8 @@ function resolveOwnedResourcePath(repository, resource) {
     : path.isAbsolute(identity)
       ? path.resolve(identity)
       : path.resolve(root, ...identity.split('/'))
-  if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`)) {
+  if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`) &&
+      options.allowExplicitExternalLocal !== true) {
     throw new SupervisorIntegrationError('OWNERSHIP_AUTHORIZATION_DENIED', `owned resource escapes the target: ${identity}`)
   }
   return candidate
@@ -15116,7 +16385,7 @@ function hashDirectoryState(directory) {
         throw new SupervisorIntegrationError('PREIMAGE_UNSAFE', `owned directory contains a symbolic link: ${absolute}`)
       }
       if (stat.isDirectory()) {
-        digest.update(`directory\0${name}\0`)
+        digest.update(`directory\0${name}\0${stat.mode & 0o777}\0`)
         visit(absolute, name)
       } else if (stat.isFile() && Number(stat.nlink) === 1) {
         digest.update(`file\0${name}\0${stat.mode & 0o777}\0${stat.size}\0`)
@@ -15131,11 +16400,11 @@ function hashDirectoryState(directory) {
   return digest.digest('hex')
 }
 
-function resourceStateEntry(repository, resource) {
-  const absolute = resolveOwnedResourcePath(repository, resource)
+function resourceStateEntry(repository, resource, options = {}) {
+  const absolute = resolveOwnedResourcePath(repository, resource, options)
   if (!absolute) return null
   if (!fs.existsSync(absolute)) {
-    return Object.freeze({ path: absolute, hash: MISSING_RESOURCE_PREIMAGE_HASH, type: 'missing' })
+    return Object.freeze({ path: absolute, hash: MISSING_RESOURCE_PREIMAGE_HASH, type: 'missing', mode: null })
   }
   const stat = fs.lstatSync(absolute)
   // A regular file must have one physical link. A directory's link count is
@@ -15145,9 +16414,886 @@ function resourceStateEntry(repository, resource) {
   if (stat.isSymbolicLink() || (stat.isFile() && Number(stat.nlink) !== 1)) {
     throw new SupervisorIntegrationError('PREIMAGE_UNSAFE', `owned resource is not one physical target: ${absolute}`)
   }
-  if (stat.isFile()) return Object.freeze({ path: absolute, hash: sha256Bytes(fs.readFileSync(absolute)), type: 'file' })
-  if (stat.isDirectory()) return Object.freeze({ path: absolute, hash: hashDirectoryState(absolute), type: 'directory' })
+  if (stat.isFile()) return Object.freeze({
+    path: absolute,
+    hash: sha256Bytes(fs.readFileSync(absolute)),
+    type: 'file',
+    mode: stat.mode & 0o777,
+  })
+  if (stat.isDirectory()) return Object.freeze({
+    path: absolute,
+    hash: hashDirectoryState(absolute),
+    type: 'directory',
+    mode: stat.mode & 0o777,
+  })
   throw new SupervisorIntegrationError('PREIMAGE_UNSAFE', `owned resource has an unsupported physical type: ${absolute}`)
+}
+
+function externalLocalLstat(absolute) {
+  try { return fs.lstatSync(absolute) } catch (error) {
+    if (error && error.code === 'ENOENT') return null
+    throw error
+  }
+}
+
+function copyExternalLocalTree(source, destination) {
+  const stat = fs.lstatSync(source)
+  if (stat.isSymbolicLink() || (stat.isFile() && Number(stat.nlink) !== 1)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+      `external local transaction cannot copy an unsafe physical entry: ${source}`,
+    )
+  }
+  if (stat.isFile()) {
+    const descriptor = fs.openSync(destination, 'wx', stat.mode & 0o777)
+    try {
+      fs.writeFileSync(descriptor, fs.readFileSync(source))
+      fs.fsyncSync(descriptor)
+    } finally {
+      fs.closeSync(descriptor)
+    }
+    fs.chmodSync(destination, stat.mode & 0o777)
+    return
+  }
+  if (!stat.isDirectory()) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+      `external local transaction found an unsupported physical entry: ${source}`,
+    )
+  }
+  fs.mkdirSync(destination, { mode: stat.mode & 0o777 })
+  for (const name of fs.readdirSync(source).sort()) {
+    copyExternalLocalTree(path.join(source, name), path.join(destination, name))
+  }
+  fs.chmodSync(destination, stat.mode & 0o777)
+}
+
+function removeExternalLocalTreeNoFollow(absolute) {
+  const stat = externalLocalLstat(absolute)
+  if (!stat) return
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    fs.unlinkSync(absolute)
+    return
+  }
+  for (const name of fs.readdirSync(absolute).sort().reverse()) {
+    removeExternalLocalTreeNoFollow(path.join(absolute, name))
+  }
+  fs.rmdirSync(absolute)
+}
+
+function externalLocalTransactionState(absolute) {
+  const stat = externalLocalLstat(absolute)
+  if (!stat) return Object.freeze({
+    path: path.resolve(absolute), hash: MISSING_RESOURCE_PREIMAGE_HASH, type: 'missing', mode: null,
+  })
+  if (stat.isSymbolicLink() || (stat.isFile() && Number(stat.nlink) !== 1)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+      `external local transaction path is not one physical target: ${absolute}`,
+    )
+  }
+  if (stat.isFile()) return Object.freeze({
+    path: path.resolve(absolute), hash: sha256Bytes(fs.readFileSync(absolute)),
+    type: 'file', mode: stat.mode & 0o777,
+  })
+  if (stat.isDirectory()) return Object.freeze({
+    path: path.resolve(absolute), hash: hashDirectoryState(absolute),
+    type: 'directory', mode: stat.mode & 0o777,
+  })
+  throw new SupervisorIntegrationError(
+    'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+    `external local transaction path has an unsupported physical type: ${absolute}`,
+  )
+}
+
+function validateExternalLocalTransactionBoundary(boundary) {
+  if (!boundary || boundary.schemaVersion !== 1 || boundary.mode !== 'explicit-external-local' ||
+      !Array.isArray(boundary.resources) || !Array.isArray(boundary.writableRoots) ||
+      !boundary.transaction || boundary.transaction.schemaVersion !== 1 ||
+      boundary.transaction.kind !== 'external-local-pre-admission-transaction' ||
+      !/^[a-f0-9]{64}$/u.test(boundary.boundaryHash || '')) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_INVALID',
+      'external local reconciliation lacks its exact pre-admission transaction',
+    )
+  }
+  const { boundaryHash, ...body } = boundary
+  if (hashText(stableStringify(body)) !== boundaryHash) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_INVALID',
+      'external local pre-admission transaction binding is corrupt',
+    )
+  }
+  const root = path.resolve(boundary.transaction.root)
+  const journalPath = path.resolve(boundary.transaction.journalPath)
+  assertNoLinkedAbsolutePathPrefix(root)
+  if (path.dirname(journalPath) !== root || path.basename(journalPath) !== 'boundary.json') {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_INVALID',
+      'external local transaction journal escaped its exact controller root',
+    )
+  }
+  for (const resource of boundary.resources) {
+    if (!resource || !resource.preimage || resource.identity !== path.resolve(resource.identity) ||
+        resource.preimage.path !== resource.identity) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_TRANSACTION_INVALID',
+        'external local transaction contains a foreign resource',
+      )
+    }
+    if (resource.preimage.type === 'missing') {
+      if (resource.backupPath !== null) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_TRANSACTION_INVALID',
+          'missing external local preimage unexpectedly carries backup bytes',
+        )
+      }
+      continue
+    }
+    const backup = path.resolve(resource.backupPath || '')
+    if (path.dirname(backup) !== root || !/^preimage-\d+$/u.test(path.basename(backup))) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_TRANSACTION_INVALID',
+        'external local preimage backup escaped its exact controller root',
+      )
+    }
+  }
+  return boundary
+}
+
+function rollbackExplicitExternalLocalBoundary(boundary, repository) {
+  if (!boundary || !boundary.transaction) {
+    return removeUnchangedExternalLocalPlaceholders(boundary, repository)
+  }
+  const verified = validateExternalLocalTransactionBoundary(boundary)
+  // Verify every retained preimage before touching any external path. A
+  // corrupt backup must fail closed without a partial rollback.
+  for (const resource of verified.resources) {
+    if (resource.preimage.type === 'missing') continue
+    const backup = externalLocalTransactionState(resource.backupPath)
+    if (backup.hash !== resource.preimage.hash || backup.type !== resource.preimage.type ||
+        backup.mode !== resource.preimage.mode) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+        `external local preimage backup changed before reconciliation: ${resource.identity}`,
+      )
+    }
+  }
+  const restored = []
+  for (const resource of [...verified.resources].reverse()) {
+    // The exact leaf may itself have been replaced with a link. Validate its
+    // parent chain, then unlink the leaf/tree without following any link.
+    assertNoLinkedAbsolutePathPrefix(path.dirname(resource.identity), resource.identity)
+    removeExternalLocalTreeNoFollow(resource.identity)
+    if (resource.preimage.type !== 'missing') {
+      copyExternalLocalTree(resource.backupPath, resource.identity)
+    }
+    const after = externalLocalTransactionState(resource.identity)
+    if (after.hash !== resource.preimage.hash || after.type !== resource.preimage.type ||
+        after.mode !== resource.preimage.mode) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_ROLLBACK_FAILED',
+        `external local resource did not return to its exact preimage: ${resource.identity}`,
+      )
+    }
+    restored.push(resource.identity)
+  }
+  removeExternalLocalTreeNoFollow(verified.transaction.root)
+  return Object.freeze(restored.sort())
+}
+
+function commitExplicitExternalLocalBoundary(boundary, admission = null, options = {}) {
+  if (!boundary || !boundary.transaction) return Object.freeze([])
+  if (options.mutationStateCommitted !== true) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_COMMIT_PREMATURE',
+      'external local rollback authority can be released only after durable mutation-state commit',
+    )
+  }
+  const verified = validateExternalLocalTransactionBoundary(boundary)
+  if (!admission || !Array.isArray(admission.resources) ||
+      admission.resources.length !== verified.resources.length) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_ADMISSION_REQUIRED',
+      'external local transaction can commit only after exact mutation admission',
+    )
+  }
+  for (const resource of verified.resources) {
+    const admitted = admission.resources.find(item => item.identity === resource.identity)
+    const current = externalLocalTransactionState(resource.identity)
+    if (!admitted || admitted.hash !== current.hash || admitted.type !== current.type ||
+        admitted.mode !== current.mode) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_ADMISSION_STALE',
+        `external local postimage changed after mutation admission: ${resource.identity}`,
+      )
+    }
+  }
+  removeExternalLocalTreeNoFollow(verified.transaction.root)
+  return Object.freeze(verified.resources.map(resource => resource.identity).sort())
+}
+
+function quarantineExplicitExternalLocalBoundary(boundary, repository, options = {}) {
+  const verified = validateExternalLocalTransactionBoundary(boundary)
+  if (typeof options.sourceWorkItemId !== 'string' || !options.sourceWorkItemId ||
+      typeof options.retryWorkItemId !== 'string' ||
+      options.retryWorkItemId !== `${options.sourceWorkItemId}-transport-retry-1` ||
+      !/^[a-f0-9]{64}$/u.test(options.transportReceiptHash || '')) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+      'external local quarantine requires the exact transport receipt and single retry identity',
+    )
+  }
+  const states = verified.resources.map(resource => {
+    const state = externalLocalTransactionState(resource.identity)
+    return Object.freeze({
+      identity: resource.identity,
+      kind: resource.kind,
+      type: state.type,
+      hash: state.hash,
+      mode: state.mode,
+      changed: state.hash !== resource.preimage.hash || state.type !== resource.preimage.type ||
+        state.mode !== resource.preimage.mode,
+    })
+  })
+  const changed = states.filter(state => state.changed)
+  if (changed.length === 0) {
+    rollbackExplicitExternalLocalBoundary(verified, repository)
+    return null
+  }
+  const quarantineRoot = verified.transaction.quarantineRoot
+  assertNoLinkedAbsolutePathPrefix(path.dirname(quarantineRoot), quarantineRoot)
+  if (!fs.existsSync(quarantineRoot)) fs.mkdirSync(quarantineRoot, { mode: 0o700 })
+  const quarantineId = hashText(stableStringify({
+    sourceWorkItemId: options.sourceWorkItemId,
+    retryWorkItemId: options.retryWorkItemId,
+    transportReceiptHash: options.transportReceiptHash,
+    boundaryHash: verified.boundaryHash,
+  }))
+  const recordRoot = path.join(quarantineRoot, quarantineId)
+  const recordPath = path.join(recordRoot, 'quarantine.json')
+  if (fs.existsSync(recordPath)) {
+    const reopened = JSON.parse(fs.readFileSync(recordPath, 'utf8'))
+    const pointer = externalLocalTransportQuarantinePointer({ recordPath })
+    rollbackExplicitExternalLocalBoundary(verified, repository)
+    return pointer
+  }
+  fs.mkdirSync(recordRoot, { mode: 0o700 })
+  const quarantined = changed.map((state, index) => {
+    const snapshotPath = state.type === 'missing'
+      ? null : path.join(recordRoot, `postimage-${index}`)
+    if (snapshotPath) {
+      copyExternalLocalTree(state.identity, snapshotPath)
+      const copied = externalLocalTransactionState(snapshotPath)
+      if (copied.hash !== state.hash || copied.type !== state.type || copied.mode !== state.mode) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_QUARANTINE_TAMPERED',
+          `external local postimage changed while it was quarantined: ${state.identity}`,
+        )
+      }
+    }
+    return Object.freeze({ ...state, snapshotPath })
+  })
+  const body = Object.freeze({
+    schemaVersion: 1,
+    kind: 'provider-transport-external-local-quarantine',
+    sourceWorkItemId: options.sourceWorkItemId,
+    retryWorkItemId: options.retryWorkItemId,
+    transportReceiptHash: options.transportReceiptHash,
+    sourceBoundaryHash: verified.boundaryHash,
+    recordRoot,
+    recordPath,
+    resources: Object.freeze(quarantined),
+  })
+  const record = Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
+  fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, {
+    encoding: 'utf8', flag: 'wx', mode: 0o600,
+  })
+  rollbackExplicitExternalLocalBoundary(verified, repository)
+  return externalLocalTransportQuarantinePointer({ recordPath })
+}
+
+function externalLocalTransportQuarantinePointer(options = {}) {
+  const recordPath = path.resolve(String(options.recordPath || ''))
+  assertNoLinkedAbsolutePathPrefix(recordPath)
+  let record
+  try { record = JSON.parse(fs.readFileSync(recordPath, 'utf8')) } catch (error) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_QUARANTINE_NOT_FOUND',
+      'external local transport quarantine journal is missing or unreadable',
+      { cause: error.code || error.message },
+    )
+  }
+  const { bindingHash, ...body } = record || {}
+  if (!record || record.schemaVersion !== 1 ||
+      record.kind !== 'provider-transport-external-local-quarantine' ||
+      record.recordPath !== recordPath || path.dirname(recordPath) !== record.recordRoot ||
+      path.basename(recordPath) !== 'quarantine.json' ||
+      !Array.isArray(record.resources) || record.resources.length === 0 ||
+      !/^[a-f0-9]{64}$/u.test(record.transportReceiptHash || '') ||
+      !/^[a-f0-9]{64}$/u.test(record.sourceBoundaryHash || '') ||
+      !/^[a-f0-9]{64}$/u.test(bindingHash || '') ||
+      bindingHash !== hashText(stableStringify(body))) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+      'external local transport quarantine journal is foreign or corrupt',
+    )
+  }
+  const identities = new Set()
+  for (const resource of record.resources) {
+    if (!resource || resource.identity !== path.resolve(resource.identity || '') ||
+        identities.has(resource.identity) ||
+        !['missing', 'file', 'directory'].includes(resource.type) ||
+        !/^[a-f0-9]{64}$/u.test(resource.hash || '') ||
+        !Number.isSafeInteger(resource.mode) && resource.mode !== null) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+        'external local transport quarantine contains a foreign resource',
+      )
+    }
+    identities.add(resource.identity)
+    if (resource.type === 'missing') {
+      if (resource.snapshotPath !== null) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+          'missing external local quarantine postimage unexpectedly carries bytes',
+        )
+      }
+      continue
+    }
+    const snapshotPath = path.resolve(resource.snapshotPath || '')
+    if (path.dirname(snapshotPath) !== record.recordRoot ||
+        !/^postimage-\d+$/u.test(path.basename(snapshotPath))) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+        'external local quarantine postimage escaped its exact controller root',
+      )
+    }
+    assertNoLinkedAbsolutePathPrefix(snapshotPath)
+  }
+  const pointerBody = Object.freeze({
+    schemaVersion: 1,
+    kind: 'provider-transport-external-local-quarantine-pointer',
+    recordPath,
+    sourceWorkItemId: record.sourceWorkItemId,
+    retryWorkItemId: record.retryWorkItemId,
+    transportReceiptHash: record.transportReceiptHash,
+    quarantineBindingHash: record.bindingHash,
+  })
+  return Object.freeze({ ...pointerBody, pointerHash: hashText(stableStringify(pointerBody)) })
+}
+
+function findExternalLocalTransportQuarantinePointer(options = {}) {
+  const quarantineRoot = path.resolve(String(options.quarantineRoot || ''))
+  if (!fs.existsSync(quarantineRoot)) return null
+  assertNoLinkedAbsolutePathPrefix(quarantineRoot)
+  const matches = []
+  for (const name of fs.readdirSync(quarantineRoot).sort()) {
+    if (!/^[a-f0-9]{64}$/u.test(name)) continue
+    const recordPath = path.join(quarantineRoot, name, 'quarantine.json')
+    if (!fs.existsSync(recordPath)) continue
+    const pointer = externalLocalTransportQuarantinePointer({ recordPath })
+    if (pointer.sourceWorkItemId === options.sourceWorkItemId &&
+        pointer.retryWorkItemId === options.retryWorkItemId &&
+        pointer.transportReceiptHash === options.transportReceiptHash) matches.push(pointer)
+  }
+  if (matches.length > 1) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+      'transport retry lacks one exact external local quarantine journal',
+    )
+  }
+  return matches[0] || null
+}
+
+function seedExplicitExternalLocalBoundaryFromQuarantine(
+  boundary,
+  assignment,
+  repository,
+  pointer,
+  options = {},
+) {
+  const verified = validateExplicitExternalLocalBoundary(boundary, assignment, repository)
+  const reopened = externalLocalTransportQuarantinePointer({ recordPath: pointer && pointer.recordPath })
+  if (stableStringify(reopened) !== stableStringify(pointer) ||
+      reopened.retryWorkItemId !== options.retryWorkItemId ||
+      reopened.transportReceiptHash !== options.transportReceiptHash) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+      'external local retry quarantine pointer changed before consumption',
+    )
+  }
+  const record = JSON.parse(fs.readFileSync(reopened.recordPath, 'utf8'))
+  const authority = new Map(verified.resources.map(resource => [resource.identity, resource]))
+  for (const postimage of record.resources) {
+    const resource = authority.get(postimage.identity)
+    if (!resource || !postimage.changed ||
+        !['missing', 'file', 'directory'].includes(postimage.type)) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+        'external local quarantine postimage escaped the retry assignment authority',
+      )
+    }
+    if (postimage.type !== 'missing') {
+      const snapshot = externalLocalTransactionState(postimage.snapshotPath)
+      if (snapshot.hash !== postimage.hash || snapshot.type !== postimage.type ||
+          snapshot.mode !== postimage.mode) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_QUARANTINE_TAMPERED',
+          `external local quarantine postimage changed before retry: ${postimage.identity}`,
+        )
+      }
+    }
+  }
+  for (const postimage of record.resources) {
+    assertNoLinkedAbsolutePathPrefix(path.dirname(postimage.identity), postimage.identity)
+    removeExternalLocalTreeNoFollow(postimage.identity)
+    if (postimage.type !== 'missing') copyExternalLocalTree(postimage.snapshotPath, postimage.identity)
+    const seeded = externalLocalTransactionState(postimage.identity)
+    if (seeded.hash !== postimage.hash || seeded.type !== postimage.type || seeded.mode !== postimage.mode) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_QUARANTINE_TAMPERED',
+        `external local retry did not receive its exact quarantined postimage: ${postimage.identity}`,
+      )
+    }
+  }
+  return Object.freeze(record.resources.map(resource => resource.identity).sort())
+}
+
+function transportQuarantineBundle(workerWorkspacePointer, externalLocalPointer) {
+  if (!workerWorkspacePointer && !externalLocalPointer) return null
+  const authority = workerWorkspacePointer || externalLocalPointer
+  const bundle = { ...authority }
+  // Preserve the legacy enumerable pointer byte-for-byte so existing worker
+  // workspace authorities can verify it. The external companion is a local
+  // controller capability and never becomes part of that manager's receipt.
+  Object.defineProperties(bundle, {
+    workerWorkspace: {
+      enumerable: false, configurable: false, writable: false,
+      value: workerWorkspacePointer || null,
+    },
+    externalLocal: {
+      enumerable: false, configurable: false, writable: false,
+      value: externalLocalPointer || null,
+    },
+  })
+  return Object.freeze(bundle)
+}
+
+function explicitExternalLocalResources(assignment, repository) {
+  const resources = assignment && Array.isArray(assignment.resources)
+    ? assignment.resources.filter(resource => canonicalExternalLocalResource(resource, repository))
+    : []
+  const sorted = resources.map(resource => Object.freeze({ ...resource, identity: path.resolve(resource.identity) }))
+    .sort((left, right) => left.identity.localeCompare(right.identity))
+  for (let index = 0; index < sorted.length; index += 1) {
+    const resource = sorted[index]
+    assertNoLinkedAbsolutePathPrefix(resource.identity)
+    for (const prior of sorted.slice(0, index)) {
+      if (resource.identity === prior.identity ||
+          resource.identity.startsWith(`${prior.identity}${path.sep}`) ||
+          prior.identity.startsWith(`${resource.identity}${path.sep}`)) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_RESOURCE_INVALID',
+          'exact external local resources must be unique and non-overlapping',
+          { first: prior.identity, second: resource.identity },
+        )
+      }
+    }
+  }
+  return Object.freeze(sorted)
+}
+
+function candidateExternalLocalResources(ownership, repository, mission) {
+  const typedOwnership = Array.isArray(ownership) ? ownership : []
+  const absoluteMutableResources = typedOwnership.filter(item =>
+    LOCAL_MUTATION_RESOURCE_KINDS.has(String(item && item.kind || '').toLowerCase()) &&
+    path.isAbsolute(String(item && item.identity || '')))
+  // Context-free route admission is a supported control-plane API and has no
+  // filesystem boundary to classify. Preserve it when there is no absolute
+  // local mutation to authorize; never call path.resolve(undefined).
+  if (typeof repository !== 'string' || !repository) {
+    if (absoluteMutableResources.length > 0) {
+      throw new SupervisorIntegrationError(
+        'OWNERSHIP_AUTHORIZATION_DENIED',
+        'absolute local resources require the exact activation target boundary',
+      )
+    }
+    return Object.freeze([])
+  }
+  const targetRoot = path.resolve(repository)
+  const resources = typedOwnership.flatMap(item => {
+    const kind = String(item && item.kind || '').toLowerCase()
+    const identity = String(item && item.identity || '')
+    if (!LOCAL_MUTATION_RESOURCE_KINDS.has(kind) || !path.isAbsolute(identity) ||
+        !pathOutsideRoot(targetRoot, identity)) return []
+    if (identity !== path.resolve(identity) || !missionContainsExactAbsolutePath(mission, identity)) {
+      throw new SupervisorIntegrationError(
+        'OWNERSHIP_AUTHORIZATION_DENIED',
+        `typed external local resource is absent from the immutable canonical original request: ${identity}`,
+      )
+    }
+    assertNoLinkedAbsolutePathPrefix(identity)
+    const resource = {
+      kind,
+      identity: path.resolve(identity),
+      access: 'read',
+      expectedPreimageHash: null,
+      owner: String(item.owner || 'candidate-version'),
+      ownershipMode: String(item.ownershipMode || item.ownership_mode || 'single-owner'),
+    }
+    const state = resourceStateEntry(targetRoot, resource, { allowExplicitExternalLocal: true })
+    resource.expectedPreimageHash = state.hash
+    resource.expectedPreimageMode = state.mode
+    return [Object.freeze(resource)]
+  })
+  return explicitExternalLocalResources({ resources }, targetRoot)
+}
+
+function materializeExplicitExternalLocalBoundary(assignment, repository, options = {}) {
+  const resources = explicitExternalLocalResources(assignment, repository)
+    .filter(resource => resource.access !== 'read')
+  if (resources.length === 0) return null
+  const requestedRoot = typeof options.transactionRoot === 'string' && options.transactionRoot
+    ? path.resolve(options.transactionRoot) : null
+  if (requestedRoot && fs.existsSync(path.join(requestedRoot, 'boundary.json'))) {
+    assertNoLinkedAbsolutePathPrefix(requestedRoot)
+    let prior
+    try { prior = JSON.parse(fs.readFileSync(path.join(requestedRoot, 'boundary.json'), 'utf8')) } catch (error) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+        'an interrupted external local transaction journal is unreadable',
+        { cause: error.code || error.message },
+      )
+    }
+    rollbackExplicitExternalLocalBoundary(prior, repository)
+  }
+  const transactionRoot = requestedRoot || fs.mkdtempSync(path.join(
+    os.tmpdir(),
+    'autoprompt-external-local-transaction-',
+  ))
+  if (requestedRoot) {
+    const transactionParent = path.dirname(transactionRoot)
+    if (!fs.existsSync(transactionParent)) {
+      assertNoLinkedAbsolutePathPrefix(path.dirname(transactionParent), transactionParent)
+      fs.mkdirSync(transactionParent, { mode: 0o700 })
+    }
+    assertNoLinkedAbsolutePathPrefix(transactionParent, transactionRoot)
+    fs.mkdirSync(transactionRoot, { mode: 0o700 })
+  }
+  const transaction = Object.freeze({
+    schemaVersion: 1,
+    kind: 'external-local-pre-admission-transaction',
+    root: transactionRoot,
+    journalPath: path.join(transactionRoot, 'boundary.json'),
+    quarantineRoot: path.resolve(options.quarantineRoot || `${transactionRoot}-quarantines`),
+    sourceWorkItemId: typeof options.sourceWorkItemId === 'string' && options.sourceWorkItemId
+      ? options.sourceWorkItemId : null,
+  })
+  const materialized = []
+  try {
+    // Snapshot every exact preimage before creating the first placeholder.
+    // The durable journal is then sufficient to roll back a process crash at
+    // any later byte boundary without accepting the observed partial state.
+    for (let index = 0; index < resources.length; index += 1) {
+      const resource = resources[index]
+      const before = resourceStateEntry(repository, resource, { allowExplicitExternalLocal: true })
+      if (before.hash !== resource.expectedPreimageHash ||
+          before.mode !== (resource.expectedPreimageMode ?? before.mode)) {
+        throw new SupervisorIntegrationError(
+          'CONCURRENT_MUTATION',
+          `exact external local resource changed before launch: ${resource.identity}`,
+        )
+      }
+      const backupPath = before.type === 'missing'
+        ? null : path.join(transactionRoot, `preimage-${index}`)
+      if (backupPath) {
+        copyExternalLocalTree(resource.identity, backupPath)
+        const copied = externalLocalTransactionState(backupPath)
+        const current = resourceStateEntry(repository, resource, { allowExplicitExternalLocal: true })
+        if (copied.hash !== before.hash || copied.type !== before.type || copied.mode !== before.mode ||
+            current.hash !== before.hash || current.type !== before.type || current.mode !== before.mode) {
+          throw new SupervisorIntegrationError(
+            'CONCURRENT_MUTATION',
+            `exact external local resource changed while its preimage was frozen: ${resource.identity}`,
+          )
+        }
+      }
+      materialized.push({ ...resource, preimage: before, backupPath })
+    }
+    const journalBody = Object.freeze({
+      schemaVersion: 1,
+      mode: 'explicit-external-local',
+      resources: Object.freeze(materialized.map(resource => Object.freeze({ ...resource }))),
+      writableRoots: Object.freeze(materialized.map(resource => resource.identity)),
+      transaction,
+    })
+    const journal = Object.freeze({
+      ...journalBody,
+      boundaryHash: hashText(stableStringify(journalBody)),
+    })
+    fs.writeFileSync(transaction.journalPath, `${JSON.stringify(journal, null, 2)}\n`, {
+      encoding: 'utf8', flag: 'wx', mode: 0o600,
+    })
+    const journalDescriptor = fs.openSync(transaction.journalPath, 'r')
+    try { fs.fsyncSync(journalDescriptor) } finally { fs.closeSync(journalDescriptor) }
+
+    for (let index = 0; index < materialized.length; index += 1) {
+      const resource = materialized[index]
+      const before = resource.preimage
+      let placeholderCreated = false
+      if (before.type === 'missing') {
+        const parent = path.dirname(resource.identity)
+        assertNoLinkedAbsolutePathPrefix(parent, resource.identity)
+        let parentStat
+        try { parentStat = fs.lstatSync(parent) } catch (error) {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_RESOURCE_INVALID',
+            `parent of exact external local output does not exist: ${resource.identity}`,
+            { cause: error.code || error.message },
+          )
+        }
+        if (!parentStat.isDirectory() || parentStat.isSymbolicLink() ||
+            fs.realpathSync.native(parent) !== path.resolve(parent)) {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_RESOURCE_INVALID',
+            `parent of exact external local output is not one physical directory: ${resource.identity}`,
+          )
+        }
+        if (['file', 'output'].includes(resource.kind)) {
+          const descriptor = fs.openSync(resource.identity, 'wx', 0o600)
+          fs.closeSync(descriptor)
+        } else if (['directory', 'cache', 'evidence-root'].includes(resource.kind)) {
+          fs.mkdirSync(resource.identity, { mode: 0o700 })
+        } else {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_RESOURCE_INVALID',
+            `missing external local ${resource.kind} has no safe materialization`,
+          )
+        }
+        placeholderCreated = true
+      }
+      const physical = fs.lstatSync(resource.identity)
+      const requiresDirectory = ['directory', 'cache', 'evidence-root'].includes(resource.kind)
+      const acceptsEither = resource.kind === 'output'
+      const physicalTypeAllowed = requiresDirectory
+        ? physical.isDirectory()
+        : acceptsEither ? physical.isFile() || physical.isDirectory() : physical.isFile()
+      if (physical.isSymbolicLink() || !physicalTypeAllowed ||
+          (physical.isFile() && Number(physical.nlink) !== 1) ||
+          fs.realpathSync.native(resource.identity) !== resource.identity) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_RESOURCE_INVALID',
+          `exact external local output has the wrong physical type: ${resource.identity}`,
+        )
+      }
+      const materializedState = resourceStateEntry(repository, resource, {
+        allowExplicitExternalLocal: true,
+      })
+      materialized[index] = Object.freeze({
+        ...resource,
+        placeholderCreated,
+        materializedHash: materializedState.hash,
+        materializedType: materializedState.type,
+        materializedMode: materializedState.mode,
+      })
+    }
+  } catch (error) {
+    try {
+      if (fs.existsSync(transaction.journalPath)) {
+        const prior = JSON.parse(fs.readFileSync(transaction.journalPath, 'utf8'))
+        rollbackExplicitExternalLocalBoundary(prior, repository)
+      } else {
+        removeExternalLocalTreeNoFollow(transactionRoot)
+      }
+    } catch (cleanupError) {
+      if (error && (typeof error === 'object' || typeof error === 'function') &&
+          Object.isExtensible(error)) error.externalLocalRollbackFailure = serializeError(cleanupError)
+    }
+    throw error
+  }
+  const body = Object.freeze({
+    schemaVersion: 1,
+    mode: 'explicit-external-local',
+    resources: Object.freeze(materialized),
+    writableRoots: Object.freeze(materialized.map(resource => resource.identity)),
+    transaction,
+  })
+  return Object.freeze({ ...body, boundaryHash: hashText(stableStringify(body)) })
+}
+
+function removeUnchangedExternalLocalPlaceholders(boundary, repository) {
+  if (boundary && boundary.transaction) {
+    return rollbackExplicitExternalLocalBoundary(boundary, repository)
+  }
+  const resources = boundary && Array.isArray(boundary.resources) ? boundary.resources : []
+  const removed = []
+  for (const resource of [...resources].reverse()) {
+    if (!resource || resource.placeholderCreated !== true || !fs.existsSync(resource.identity)) continue
+    let state
+    try {
+      state = resourceStateEntry(repository, resource, { allowExplicitExternalLocal: true })
+    } catch {
+      // Never remove a path whose physical identity no longer matches the
+      // exact regular file/directory that this controller materialized.
+      continue
+    }
+    if (state.hash !== resource.materializedHash || state.type !== resource.materializedType ||
+        state.mode !== resource.materializedMode) continue
+    if (state.type === 'file') fs.unlinkSync(resource.identity)
+    else if (state.type === 'directory' && fs.readdirSync(resource.identity).length === 0) {
+      fs.rmdirSync(resource.identity)
+    } else continue
+    removed.push(resource.identity)
+  }
+  return Object.freeze(removed.sort())
+}
+
+function validateExplicitExternalLocalBoundary(boundary, assignment, repository) {
+  const expected = explicitExternalLocalResources(assignment, repository)
+    .filter(resource => resource.access !== 'read')
+  if (expected.length === 0) return null
+  if (!boundary || boundary.schemaVersion !== 1 || boundary.mode !== 'explicit-external-local' ||
+      !Array.isArray(boundary.resources) || !Array.isArray(boundary.writableRoots) ||
+      !/^[a-f0-9]{64}$/u.test(boundary.boundaryHash || '')) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_BOUNDARY_INVALID',
+      'external local worker launch lacks its exact authenticated resource boundary',
+    )
+  }
+  const { boundaryHash, ...body } = boundary
+  if (boundaryHash !== hashText(stableStringify(body)) ||
+      stableStringify(boundary.writableRoots) !== stableStringify(expected.map(resource => resource.identity)) ||
+      boundary.resources.length !== expected.length) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_BOUNDARY_INVALID',
+      'external local worker boundary differs from canonical assignment authority',
+    )
+  }
+  boundary.resources.forEach((resource, index) => {
+    const canonical = expected[index]
+    if (resource.identity !== canonical.identity || resource.kind !== canonical.kind ||
+        resource.access !== canonical.access || resource.expectedPreimageHash !== canonical.expectedPreimageHash ||
+        !resource.preimage || resource.preimage.hash !== canonical.expectedPreimageHash) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_BOUNDARY_INVALID',
+        `external local worker boundary resource is foreign: ${resource && resource.identity}`,
+      )
+    }
+    assertNoLinkedAbsolutePathPrefix(resource.identity)
+  })
+  return boundary
+}
+
+function reportedPathMatchesExternalResource(reportedPath, resource) {
+  if (typeof reportedPath !== 'string' || !path.isAbsolute(reportedPath)) return false
+  const reported = path.resolve(reportedPath)
+  const exact = path.resolve(resource.identity)
+  if (reported === exact) return true
+  return ['directory', 'output', 'cache', 'evidence-root'].includes(resource.kind) &&
+    reported.startsWith(`${exact}${path.sep}`)
+}
+
+function inspectExplicitExternalLocalBoundary(boundary, assignment, repository, result) {
+  const verified = validateExplicitExternalLocalBoundary(boundary, assignment, repository)
+  if (!verified) return Object.freeze({
+    actualFilesChanged: Object.freeze([]),
+    postimages: Object.freeze([]),
+    resources: Object.freeze([]),
+  })
+  const reported = Array.isArray(result && result.filesChanged) ? result.filesChanged.map(String) : []
+  const targetRoot = path.resolve(repository)
+  const outsideReports = reported.filter(value => path.isAbsolute(value) && pathOutsideRoot(targetRoot, value))
+  const unauthorized = outsideReports.filter(value =>
+    !verified.resources.some(resource => reportedPathMatchesExternalResource(value, resource)))
+  if (unauthorized.length > 0) {
+    throw new SupervisorIntegrationError(
+      'OWNERSHIP_SCOPE_VIOLATION',
+      'worker reported paths outside both the activation target and exact external local authority',
+      { outside: unauthorized.sort() },
+    )
+  }
+  const states = verified.resources.map(resource => {
+    let state = resourceStateEntry(repository, resource, { allowExplicitExternalLocal: true })
+    const resourceReported = reported.some(value => reportedPathMatchesExternalResource(value, resource))
+    if (resource.placeholderCreated && resource.preimage.type === 'missing' && !resourceReported &&
+        state.hash === resource.materializedHash) {
+      if (state.type === 'file') fs.unlinkSync(resource.identity)
+      else if (state.type === 'directory' && fs.readdirSync(resource.identity).length === 0) {
+        fs.rmdirSync(resource.identity)
+      }
+      state = resourceStateEntry(repository, resource, { allowExplicitExternalLocal: true })
+    }
+    return Object.freeze({
+      kind: resource.kind,
+      identity: resource.identity,
+      type: state.type,
+      hash: state.hash,
+      mode: state.mode,
+      preimageHash: resource.expectedPreimageHash,
+      changed: state.hash !== resource.expectedPreimageHash ||
+        state.type !== resource.preimage.type || state.mode !== resource.preimage.mode,
+    })
+  })
+  const changed = states.filter(state => state.changed)
+  const omitted = changed.filter(state =>
+    !reported.some(value => reportedPathMatchesExternalResource(value, state)))
+  if (omitted.length > 0) {
+    throw new SupervisorIntegrationError(
+      'MUTATION_REPORT_MISMATCH',
+      'worker omitted an observed exact external local resource change from its file report',
+      { omitted: omitted.map(item => item.identity) },
+    )
+  }
+  return Object.freeze({
+    actualFilesChanged: Object.freeze(changed.map(item => item.identity)),
+    postimages: Object.freeze(changed.map(item => Object.freeze({
+      type: item.type,
+      path: item.identity,
+      hash: item.type === 'missing' ? null : item.hash,
+    }))),
+    resources: Object.freeze(states),
+  })
+}
+
+function recoverDurableExternalDeliverableIdentities(
+  resumeState,
+  resources,
+  repository,
+  readMutationAdmission,
+) {
+  const recovered = new Set()
+  if (!resumeState || typeof readMutationAdmission !== 'function' ||
+      !Array.isArray(resources) || resources.length === 0) return recovered
+  const completedWorkIds = new Set([
+    ...(Array.isArray(resumeState.completedWorkIds) ? resumeState.completedWorkIds : []),
+    ...(Array.isArray(resumeState.adoptedRecords)
+      ? resumeState.adoptedRecords
+          .filter(record => record && record.completed === true)
+          .map(record => record.workItemId)
+      : []),
+  ].filter(workItemId =>
+    /^work-\d+(?:-repair-\d+)?(?:-transport-retry-1)?$/u.test(String(workItemId || ''))))
+  const targetRoot = path.resolve(repository)
+  for (const workItemId of completedWorkIds) {
+    const evidence = readMutationAdmission(workItemId)
+    if (!evidence) continue
+    for (const file of evidence.files || []) {
+      const reported = String(file && file.relative || '')
+      if (!path.isAbsolute(reported) || !pathOutsideRoot(targetRoot, reported)) continue
+      const matches = resources.filter(resource =>
+        reportedPathMatchesExternalResource(reported, resource))
+      if (matches.length !== 1) {
+        throw new SupervisorIntegrationError(
+          'CRASH_ADOPTION_CONFLICT',
+          'durable mutation admission names an external path outside the resumed canonical authority',
+          { workItemId, reported },
+        )
+      }
+      recovered.add(matches[0].identity)
+    }
+  }
+  return recovered
 }
 
 function assertNoLinkedPathPrefix(root, absolute, displayPath) {
@@ -15181,6 +17327,29 @@ function canonicalAssignmentResources(input) {
   const ownership = Array.isArray(input.request.ownership) && input.request.ownership.length
     ? input.request.ownership : ['workspace']
   const manifests = Array.isArray(input.request.manifests) ? input.request.manifests : []
+  const typedExternalLocalManifests = manifests.filter(item => {
+    if (!item || !LOCAL_MUTATION_RESOURCE_KINDS.has(String(item.kind || '').toLowerCase())) return false
+    const identity = String(item.identity || '')
+    return path.isAbsolute(identity) && pathOutsideRoot(canonicalTargetRoot, identity)
+  })
+  const authorizedExternalManifest = (identity, kind = null) => {
+    const normalized = path.resolve(identity)
+    return typedExternalLocalManifests.find(item =>
+      path.resolve(String(item.identity)) === normalized &&
+      (kind === null || String(item.kind || '').toLowerCase() === kind)) || null
+  }
+  const assertExternalLocalAuthority = (identity, kind = null) => {
+    const manifest = authorizedExternalManifest(identity, kind)
+    if (String(identity) !== path.resolve(String(identity)) || !manifest ||
+        !missionContainsExactAbsolutePath(input.mission, String(identity))) {
+      throw new SupervisorIntegrationError(
+        'OWNERSHIP_AUTHORIZATION_DENIED',
+        `external local write authority requires the exact absolute path in both the immutable original request and typed ownership: ${identity}`,
+      )
+    }
+    assertNoLinkedAbsolutePathPrefix(path.resolve(identity), identity)
+    return manifest
+  }
   const declaredFuturePaths = new Set(manifests.flatMap(item => {
     if (!item || !LOCAL_MUTATION_RESOURCE_KINDS.has(String(item.kind || '').toLowerCase())) return []
     const identity = String(item.identity || '').replace(/\\/g, '/')
@@ -15242,7 +17411,14 @@ function canonicalAssignmentResources(input) {
       owner,
       ownershipMode: String(declared && (declared.ownershipMode || declared.ownership_mode) || 'single-owner'),
     }
-    const state = (input.readOnly || input.enforcePreimages) ? resourceStateEntry(input.targetPath, resource) : null
+    const canonicalAbsolute = path.isAbsolute(identity) ? path.resolve(identity) : null
+    const explicitExternalLocal = Boolean(canonicalAbsolute && pathOutsideRoot(canonicalTargetRoot, canonicalAbsolute))
+    if (explicitExternalLocal) assertExternalLocalAuthority(identity, kind)
+    const state = (input.readOnly || input.enforcePreimages)
+      ? resourceStateEntry(input.targetPath, resource, {
+          allowExplicitExternalLocal: explicitExternalLocal,
+        })
+      : null
     if (state) resource.expectedPreimageHash = state.hash
     if (input.readOnly && !/^[a-f0-9]{64}$/.test(resource.expectedPreimageHash || '')) {
       throw new SupervisorIntegrationError(
@@ -15251,7 +17427,9 @@ function canonicalAssignmentResources(input) {
       )
     }
     if (['file', 'directory', 'evidence-root'].includes(kind)) {
-      const absolute = resolveOwnedResourcePath(input.targetPath, resource)
+      const absolute = resolveOwnedResourcePath(input.targetPath, resource, {
+        allowExplicitExternalLocal: explicitExternalLocal,
+      })
       const exists = Boolean(absolute && fs.existsSync(absolute))
       const authorizedCreation = !input.readOnly && input.enforcePreimages === true &&
         resource.access === 'write' && resource.expectedPreimageHash === MISSING_RESOURCE_PREIMAGE_HASH
@@ -15273,6 +17451,34 @@ function canonicalAssignmentResources(input) {
     }
     return resource
   })
+  if (input.readOnly) {
+    for (const manifest of typedExternalLocalManifests) {
+      const kind = String(manifest.kind || '').toLowerCase()
+      const identity = String(manifest.identity || '')
+      assertExternalLocalAuthority(identity, kind)
+      if (rows.some(resource => path.isAbsolute(resource.identity) &&
+          path.resolve(resource.identity) === path.resolve(identity))) continue
+      const resource = {
+        kind,
+        identity,
+        access: 'read',
+        expectedPreimageHash: null,
+        owner: String(input.request.workItemId),
+        ownershipMode: String(manifest.ownershipMode || manifest.ownership_mode || 'single-owner'),
+      }
+      const state = resourceStateEntry(input.targetPath, resource, {
+        allowExplicitExternalLocal: true,
+      })
+      if (!state || state.type === 'missing') {
+        throw new SupervisorIntegrationError(
+          'MISSION_PATH_INVALID',
+          `checker external local resource is absent from the exact version being checked: ${kind}:${identity}`,
+        )
+      }
+      resource.expectedPreimageHash = state.hash
+      rows.push(resource)
+    }
+  }
   const prosePaths = typeof input.request.assignment === 'string'
     ? [...input.request.assignment.matchAll(/(?:^|[\s`'"(])((?:[A-Za-z]:[\\/]|\.{0,2}[\\/])?[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]*[A-Za-z0-9_-])+)(?=$|[\s`'"),.;:])/gu)]
         .map(match => match[1])
@@ -15294,18 +17500,25 @@ function canonicalAssignmentResources(input) {
       : path.isAbsolute(prosePath)
         ? canonicalAbsolute
         : path.resolve(input.targetPath, ...normalized.replace(/^\.\//u, '').split('/'))
-    const boundResource = rows.find(resource => resolveOwnedResourcePath(input.targetPath, resource) === absolute)
+    const boundResource = rows.find(resource => resolveOwnedResourcePath(input.targetPath, resource, {
+      allowExplicitExternalLocal: canonicalExternalLocalResource(resource, input.targetPath),
+    }) === absolute)
     const authorizedCreation = Boolean(boundResource && boundResource.access === 'write' &&
       input.enforcePreimages === true && boundResource.expectedPreimageHash === MISSING_RESOURCE_PREIMAGE_HASH)
     const declaredFutureReference = input.logicalRole === 'roadmap-author' && !input.readOnly &&
       declaredFuturePaths.has(absolute)
-    if (absolute !== targetRoot && !absolute.startsWith(`${targetRoot}${path.sep}`)) {
+    const explicitExternalLocalReference = Boolean(boundResource &&
+      canonicalExternalLocalResource(boundResource, input.targetPath) &&
+      missionContainsExactAbsolutePath(input.mission, prosePath))
+    if (absolute !== targetRoot && !absolute.startsWith(`${targetRoot}${path.sep}`) &&
+        !explicitExternalLocalReference) {
       throw new SupervisorIntegrationError(
         'MISSION_PATH_INVALID',
         `path named in the canonical child brief is missing, unsafe, or outside the target: ${prosePath}`,
       )
     }
-    assertNoLinkedPathPrefix(targetRoot, absolute, prosePath)
+    if (explicitExternalLocalReference) assertNoLinkedAbsolutePathPrefix(absolute, prosePath)
+    else assertNoLinkedPathPrefix(targetRoot, absolute, prosePath)
     if (canonicalRelative !== null) {
       assertNoLinkedPathPrefix(canonicalTargetRoot, canonicalAbsolute, prosePath)
     }
@@ -15538,7 +17751,9 @@ function evidenceInvalidationSet(before, after) {
 
 function schedulerResourcesForAssignment(assignment, repository) {
   return assignment.resources.map(resource => {
-    const local = resolveOwnedResourcePath(repository, resource)
+    const local = resolveOwnedResourcePath(repository, resource, {
+      allowExplicitExternalLocal: canonicalExternalLocalResource(resource, repository),
+    })
     const kind = local ? 'workspace' : resource.kind === 'external-system' ? 'service' : resource.kind
     return {
       id: local || resource.identity,
@@ -16326,6 +18541,8 @@ function decisionReadOnlyOwnership(decision, targetPath) {
     ? decision.mutableResourceOwnership : []
   const candidates = typed.filter(resource => {
     if (!resource || !['file', 'directory', 'evidence-root'].includes(String(resource.kind || '').toLowerCase())) return false
+    if (path.isAbsolute(String(resource.identity || '')) &&
+        pathOutsideRoot(targetRoot, resource.identity)) return false
     const absolute = resolveOwnedResourcePath(targetRoot, resource)
     if (!absolute || !fs.existsSync(absolute)) return false
     const stat = fs.lstatSync(absolute)
@@ -16444,6 +18661,8 @@ function createDefaultRouteExecutor(options) {
     const likelyAreas = decision.likelyAreas || []
     const boundedToolOutputDiscipline =
       ' Keep model-visible command output bounded: redirect large stdout/stderr to a scratch file, then inspect a hash, count, or targeted preview of at most 4 KiB. Never use line-oriented head, tail, sed, or unrestricted recursive search on potentially monolithic generated artifacts or private run-record/transcript trees. Reuse one focused executable validation harness instead of repeatedly dumping source, artifacts, or logs.'
+    const checkerToolOutputDiscipline =
+      ' Keep model-visible command output bounded: if you author a checker harness, first write one regular program in the assigned scratch root, then run exactly one direct invocation as <python3|node|ruby|perl|sh> <absolute sealed scratch program> <absolute frozen exact-version path being checked>, or as <absolute sealed executable> <absolute frozen exact-version path being checked>. Use no interpreter flags. Substitute the projected absolute paths literally and emit one direct JSON summary of at most 4 KiB. Do not use heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or shell glue. Do not run a second harness command merely to reshape the report.'
     const workerCount = Math.max(1, Number(decision.usefulWorkerCount || 1))
     const legacyRoadmapWorkId = /^(?:roadmap-(?:author|scout|plan-|work-group)|mission-coordination)/u
     const resumeRoadmapIds = resumeState ? [
@@ -16467,6 +18686,34 @@ function createDefaultRouteExecutor(options) {
     const legacyRoadmapProductFrontier = workerCount === 1
       ? ['work-1'] : ['mission-coordination']
     const executionOwnership = executionMutableResourceOwnership(decision, route, workerCount)
+    const externalCandidateResources = candidateExternalLocalResources(
+      executionOwnership,
+      options.targetPath,
+      options.mission,
+    )
+    const durableExternalDeliverableIdentities = recoverDurableExternalDeliverableIdentities(
+      resumeState,
+      externalCandidateResources,
+      options.targetPath,
+      options.readMutationAdmission,
+    )
+    const candidateHashFor = repository => hashWorkspaceCandidate(
+      repository,
+      options.gitEnvironment(repository),
+      externalCandidateResources,
+    )
+    const externalDeliverables = () => externalCandidateResources.flatMap(resource => {
+      const state = resourceStateEntry(options.targetPath, resource, {
+        allowExplicitExternalLocal: true,
+      })
+      return state.hash === resource.expectedPreimageHash &&
+          state.mode === resource.expectedPreimageMode &&
+          !durableExternalDeliverableIdentities.has(resource.identity) ? [] : [{
+        path: resource.identity,
+        hash: state.hash,
+        type: state.type,
+      }]
+    })
     const launchChecker = async request => {
       REQUIRED_COMPLETION_LAUNCH_REQUESTS.add(request)
       try {
@@ -16553,10 +18800,7 @@ function createDefaultRouteExecutor(options) {
       requestEnvelopeHash: decision.requestEnvelopeHash,
       routeDecisionHash: hashText(stableStringify(decision)),
       targetStateHash: capturedDomainAdmission.contracts.length > 0
-        ? hashWorkspaceCandidate(
-            options.targetPath,
-            typeof options.gitEnvironment === 'function' ? options.gitEnvironment() : process.env,
-          )
+        ? candidateHashFor(options.targetPath)
         : null,
       admittedBeforeWork: true,
       contracts: capturedDomainAdmission.contracts,
@@ -16594,6 +18838,12 @@ function createDefaultRouteExecutor(options) {
         'a DONE retry is one isolated version/worktree and cannot be split across promoted workers',
       )
     }
+    if (doneRetryBoundary && externalCandidateResources.length > 0) {
+      throw new SupervisorIntegrationError(
+        'DONE_RETRY_ISOLATION_REQUIRED',
+        'a DONE retry cannot retain exact external local outputs inside the activation-target private transaction',
+      )
+    }
     if (hiddenExternalBoundary && workerCount > hiddenExternalBoundary.maxProvisionalWorkerLaunches) {
       throw new SupervisorIntegrationError(
         'PROVISIONAL_WORK_CAP_EXCEEDED',
@@ -16603,7 +18853,7 @@ function createDefaultRouteExecutor(options) {
     let fixturePrebuildOutcome = null
     let fixturePrebuildEvidence = null
     if (fixtureProvenanceBoundary) {
-      const prebuildCandidateHash = hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
+      const prebuildCandidateHash = candidateHashFor(options.targetPath)
       const oracle = 'fixture-provenance-prebuild-validation'
       const validationResult = durableCompletedGateResult('fixture-prebuild-validation') || await launchChecker({
         workItemId: 'fixture-prebuild-validation', logicalRole: 'independent-tester', parent: 'run-owner',
@@ -17691,7 +19941,7 @@ function createDefaultRouteExecutor(options) {
           resultHash: hashText(JSON.stringify(workResult)),
           candidateHash: workResult && workResult.candidateHash ||
             deferredPromotion && deferredPromotion.candidateHash ||
-            hashWorkspaceCandidate(options.targetPath, options.gitEnvironment()),
+            candidateHashFor(options.targetPath),
           nextReadyWorkIds: requiredWorkIds.filter(id => !satisfiedWorkIds.has(id)),
         })
       }
@@ -17712,9 +19962,12 @@ function createDefaultRouteExecutor(options) {
     }
     let candidateHash = deferredPromotion && deferredPromotion.candidateHash ||
       resumeState && resumeState.candidateHash ||
-      hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
+      candidateHashFor(options.targetPath)
     const usableCandidatePath = deferredPromotion && deferredPromotion.workspacePath || options.targetPath
-    let usableDeliverables = changedDeliverables(usableCandidatePath, options.gitEnvironment(usableCandidatePath))
+    let usableDeliverables = [
+      ...changedDeliverables(usableCandidatePath, options.gitEnvironment(usableCandidatePath)),
+      ...externalDeliverables(),
+    ]
     let finalResponse = null
     if (usableDeliverables.length === 0) {
       for (const workItemId of requiredWorkIds) {
@@ -17827,7 +20080,10 @@ function createDefaultRouteExecutor(options) {
       return {
         outcome: 'DONE',
         checkHashes: accepted.checkHashes,
-        deliverables: changedDeliverables(options.targetPath, options.gitEnvironment()),
+        deliverables: [
+          ...changedDeliverables(options.targetPath, options.gitEnvironment()),
+          ...externalDeliverables(),
+        ],
         terminalEnvelope: {
           status: restoredLimitations ? 'DONE_WITH_VERIFICATION_LIMITATIONS' : 'DONE',
           candidateHash,
@@ -17845,6 +20101,15 @@ function createDefaultRouteExecutor(options) {
         },
       }
     }
+    const closedInconclusiveCheckerIds = new Set()
+    const checkerClosureWasRecorded = checkerId =>
+      closedInconclusiveCheckerIds.has(checkerId) ||
+      closedInconclusiveCheckerIds.has(canonicalCompletedCheckerId(checkerId))
+    const closeInconclusiveChecker = async details => {
+      await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', details)
+      closedInconclusiveCheckerIds.add(details.checkerId)
+      closedInconclusiveCheckerIds.add(canonicalCompletedCheckerId(details.checkerId))
+    }
     const preserveInconclusiveCandidate = async (
       checkerId,
       checkerResult,
@@ -17852,35 +20117,182 @@ function createDefaultRouteExecutor(options) {
       transitionRequired = true,
       transitionDetails = {},
     ) => {
-      const checkerResultHash = hashText(stableStringify(checkerResult || null))
-      if (transitionRequired) {
+      let boundedLimitationResult = checkerResultHasExactVerificationLimitation(checkerResult)
+        ? canonicalizeCheckerVerificationLimitation(checkerResult)
+        : controllerVerificationLimitation(checkerResult, {
+            capabilityId: 'autoprompt.independent-check-convergence',
+            reason: 'the bounded independent checks did not produce authoritative acceptance evidence',
+          })
+      const reportedLimitation = checkerResult && checkerResult.payload &&
+        checkerResult.payload.verificationLimitation
+      const claimsMissingProduct = Boolean(
+        reportedLimitation && (
+          reportedLimitation.explicitUserDeliverable === true ||
+          Array.isArray(reportedLimitation.observedVersionDefectIds) &&
+            reportedLimitation.observedVersionDefectIds.length > 0
+        ),
+      )
+      if (!boundedLimitationResult && checkerResult && checkerResult.code !== 'FAIL' &&
+          !claimsMissingProduct) {
+        // Only an aggregate canonical FAIL is product-failure authority. A
+        // contradictory or malformed non-authoritative report can retain its
+        // source hash, but cannot turn its own report defect into a task stop.
+        boundedLimitationResult = controllerVerificationLimitation({
+          ...(checkerResult.schemaVersion ? { schemaVersion: checkerResult.schemaVersion } : {}),
+          ...(checkerResult.candidateHash ? { candidateHash: checkerResult.candidateHash } : {}),
+          ...(checkerResult.currentVersionHash
+            ? { currentVersionHash: checkerResult.currentVersionHash } : {}),
+          ...(checkerResult.requestEnvelopeHash
+            ? { requestEnvelopeHash: checkerResult.requestEnvelopeHash } : {}),
+          ...(checkerResult.contextId ? { contextId: checkerResult.contextId } : {}),
+          payload: {},
+        }, {
+          capabilityId: 'autoprompt.independent-check-convergence',
+          reason: 'the bounded checker supplied no command-bound acceptance or failure observation',
+        })
+      }
+      if (!boundedLimitationResult) {
+        // Controller uncertainty is never allowed to erase concrete product
+        // failure evidence. A private retry carrying an observed defect stays
+        // private and the exact checker result remains the terminal authority.
+        if (deferredPromotion) {
+          await deferredPromotion.abort('non-authoritative checker evidence contains a concrete product defect')
+        }
+        return {
+          outcome: 'FAILED',
+          checkHashes: [],
+          deliverables: [
+            ...changedDeliverables(options.targetPath, options.gitEnvironment()),
+            ...externalDeliverables(),
+          ],
+          ...(!deferredPromotion && finalResponse ? { finalResponse } : {}),
+          terminalEnvelope: checkerResult,
+        }
+      }
+      const checkerResultHash = hashText(stableStringify(boundedLimitationResult))
+      const limitationCandidates = [
+        ...acceptedVerificationLimitations
+          .filter(item => item.checkerId !== checkerId)
+          .map(item => ({
+          checkerId: item.checkerId,
+          resultHash: item.resultHash,
+          verificationLimitation: item.result.payload.verificationLimitation,
+          })),
+        {
+          checkerId,
+          resultHash: checkerResultHash,
+          verificationLimitation: boundedLimitationResult.payload.verificationLimitation,
+        },
+      ]
+      const verificationLimitationSummaries = canonicalVerificationLimitationSummaries(
+        limitationCandidates,
+      )
+      if (!verificationLimitationSummaries) {
+        throw new SupervisorIntegrationError(
+          'VERIFICATION_LIMITATION_INVALID',
+          'bounded checker uncertainty could not be reduced to one exact verification-limitation join',
+        )
+      }
+      if (deferredPromotion) {
+        // The private retry is the only produced user result. Commit its
+        // already mutation-admitted bytes with an explicit limitation join;
+        // checker uncertainty cannot delete the candidate or invent PASS.
+        const acceptanceJoinHash = hashText(stableStringify({
+          candidateHash,
+          verificationLimitations: verificationLimitationSummaries,
+        }))
+        await deferredPromotion.commit({
+          candidateHash,
+          checkHashes: [checkerResultHash],
+          acceptanceJoinHash,
+          domainEvaluationHash: hashText(stableStringify({
+            kind: 'verification-limited-private-candidate',
+            candidateHash,
+            checkerId,
+            checkerResultHash,
+          })),
+          capturedDomainOutcomes: [],
+          domainEvaluation: null,
+          verificationLimited: true,
+          verificationLimitations: verificationLimitationSummaries,
+        })
+      }
+      const preservedCandidateHash = deferredPromotion
+        ? candidateHashFor(options.targetPath)
+        : candidateHash
+      const preservedDeliverables = [
+        ...changedDeliverables(options.targetPath, options.gitEnvironment()),
+        ...externalDeliverables(),
+      ]
+      const limitationCheckHashes = [checkerResultHash]
+      const publicTransitionDetails = { ...transitionDetails }
+      const priorClosureRecorded = checkerClosureWasRecorded(checkerId)
+      if (transitionRequired && !priorClosureRecorded) {
         await options.transition('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
           candidateHash,
           checkerId,
           checkerResultHash,
+          retryAttempt: Number.isSafeInteger(transitionDetails.retryAttempt)
+            ? transitionDetails.retryAttempt : 0,
           controllerReason: reason,
           nextReadyWorkIds: [],
-          ...transitionDetails,
+          ...publicTransitionDetails,
         })
       }
-      if (deferredPromotion) {
-        await deferredPromotion.abort('independent checker remained non-authoritative')
+      if (!priorClosureRecorded && (transitionRequired ||
+          resumeState && resumeState.resumeState === 'CHECK_INCONCLUSIVE')) {
+        await closeInconclusiveChecker({
+          candidateHash,
+          checkerId,
+          checkerResultHash,
+          terminalDisposition: 'DONE_WITH_VERIFICATION_LIMITATIONS',
+          nextReadyWorkIds: [],
+        })
       }
-      const preservedCandidateHash = deferredPromotion
-        ? hashWorkspaceCandidate(options.targetPath, options.gitEnvironment())
-        : candidateHash
+      // A non-authoritative checker report is still one exact, hash-bound
+      // completed check receipt. It cannot authorize product repair or claim
+      // PASS, but it can close the bounded local verification phase while the
+      // provider terminal explicitly records that acceptance remains limited.
+      await options.transition('ACCEPTANCE_GREEN', 'FINAL_CHECK', {
+        candidateHash,
+        checkHashes: limitationCheckHashes,
+        verificationLimited: true,
+        controllerReason: reason,
+      })
       return {
-        outcome: 'PARTIAL',
-        deliverables: changedDeliverables(options.targetPath, options.gitEnvironment()),
+        // Controller/report/capability uncertainty is not a product failure
+        // and must never turn a usable direct result into a task-level stop.
+        // Expose the exact candidate and annotate the missing authority; an
+        // external verifier may still accept or reject the product normally.
+        outcome: 'DONE',
+        checkHashes: limitationCheckHashes,
+        deliverables: preservedDeliverables,
+        ...(!deferredPromotion && finalResponse ? { finalResponse } : {}),
         terminalEnvelope: {
-          status: 'CHECK_REMAINS_INCONCLUSIVE',
+          status: 'DONE_WITH_VERIFICATION_LIMITATIONS',
           reason: 'The usable exact version remains available, but the bounded local checker did not produce command-bound acceptance evidence.',
           currentVersionHash: preservedCandidateHash,
           checkerId,
           checkerResultHash,
           controllerReason: reason,
+          sourceCheckerResultHash: hashText(stableStringify(checkerResult || null)),
           usableCandidatePreserved: true,
         },
+      }
+    }
+    const returnConcreteCandidateFailure = async (checkerResult, hashes = []) => {
+      if (deferredPromotion) {
+        await deferredPromotion.abort('bounded aggregate repair still has a concrete product defect')
+      }
+      return {
+        outcome: 'FAILED',
+        checkHashes: hashes,
+        deliverables: [
+          ...changedDeliverables(options.targetPath, options.gitEnvironment()),
+          ...externalDeliverables(),
+        ],
+        ...(!deferredPromotion && finalResponse ? { finalResponse } : {}),
+        terminalEnvelope: checkerResult,
       }
     }
     const adoptedCheckResults = typeof resumeAdoptedLaunches === 'function'
@@ -18050,14 +20462,34 @@ function createDefaultRouteExecutor(options) {
       // repair frontier. Treating that legacy spelling as an implementation
       // defect only after a crash made recovery diverge from live execution.
       const result = canonicalizeCheckerTerminalResult(durableResult)
+      const pendingControllerReassessment = pendingRetry
+        ? canonicalCheckerReassessment(
+            pendingRetry.controllerReassessment || {
+              code: 'CHECK_INCONCLUSIVE',
+              priorResultEvidenceHash: pendingRetry.checkerResultHash,
+            },
+            {
+              resultHash: pendingRetry.checkerResultHash,
+              checkerId: pendingRetry.checkerId,
+            },
+          )
+        : null
+      const pendingReportCorrection = sourceKind === 'retry' &&
+        pendingControllerReassessment &&
+        Array.isArray(pendingControllerReassessment.invalidFieldIds) &&
+        Array.isArray(pendingControllerReassessment.checkIds) &&
+        checkerReportOnlyCorrectionEligible(
+          result,
+          pendingControllerReassessment.code,
+        )
       const structurallyUnboundPass = checkerResultIsStructurallyUnboundPass(result)
       const legacyCapabilityOnlyFail = durableResult.code === 'FAIL' &&
         result.code === 'CHECK_INCONCLUSIVE'
       const nonAuthoritative = !['PASS', 'FAIL'].includes(result.code)
-      // A concrete FAIL is product evidence, not a retry-budget event. Every
-      // changed candidate earns the next targeted repair and fresh full check;
-      // route/time/token/launch targets may collapse optional work but cannot
-      // turn a still-repairable defect into an AutoPrompt terminal failure.
+      // A concrete FAIL is product evidence, not a retry-budget event. The
+      // initial aggregate failure earns one repair and fresh full check. A
+      // post-repair failure is the direct model/product result, not authority
+      // for another controller-generated repair generation.
       const durableFailureFingerprint =
         checkerImplementationFailureObservationFingerprint(result)
       const durableRepairFailureChain = canonicalRepairFailureFingerprintChain(
@@ -18069,13 +20501,13 @@ function createDefaultRouteExecutor(options) {
       const legacyPostRepairFailureLacksNovelAuthority = activeRepairAttempt > 0 &&
         durableRepairFailureChain.length === 0 &&
         !checkerImplementationFailureHasControllerObservation(result)
-      const repairEligible = result.code === 'FAIL' &&
+      const repairEligible = result.code === 'FAIL' && activeRepairAttempt < 1 &&
         !repeatedDurableFailure && !legacyPostRepairFailureLacksNovelAuthority
       const nextRequiredCheckerId = checkerIndex + 1 < checkerCount
         ? `independent-check-${checkerIndex + 2}` +
           (activeRepairAttempt > 0 ? `-repair-${activeRepairAttempt}` : '')
         : null
-      const expectedNext = sourceKind === 'retry'
+      const persistedExpectedNext = sourceKind === 'retry'
           ? [`${checkerId}-runtime-retry-1`]
         : structurallyUnboundPass
           ? nextRequiredCheckerId ? [nextRequiredCheckerId] : []
@@ -18088,6 +20520,9 @@ function createDefaultRouteExecutor(options) {
                   ? [nextRequiredCheckerId]
                   : [`work-1-repair-${activeRepairAttempt + 1}`]
                 : []
+      const expectedNext = sourceKind === 'retry' && !pendingReportCorrection
+        ? nextRequiredCheckerId ? [nextRequiredCheckerId] : []
+        : persistedExpectedNext
       const resumedNextReady = resumeState.nextReadyWorkIds || []
       // Releases before the current topology could persist an implicit second
       // checker. Authenticate and consume that old receipt without treating a
@@ -18100,21 +20535,22 @@ function createDefaultRouteExecutor(options) {
       const legacyCapabilityRepair = legacyCapabilityOnlyFail &&
         stableStringify(resumedNextReady) ===
           stableStringify([`work-1-repair-${activeRepairAttempt + 1}`])
-      // Accept the historical f1de11a continuation spelling while upgrading it
-      // to the current fresh-evidence retry on resume.
+      // Accept the historical f1de11a continuation spelling so its exact
+      // receipt can be authenticated and retired without another full launch.
       const legacyStructuralPassRetry = structurallyUnboundPass &&
         stableStringify(resumedNextReady) ===
           stableStringify([`${checkerId}-runtime-retry-1`])
-      if (stableStringify(resumedNextReady) !== stableStringify(expectedNext) &&
+      if (stableStringify(resumedNextReady) !== stableStringify(persistedExpectedNext) &&
           !legacyImplicitSecondChecker && !legacyCapabilityRepair &&
           !legacyStructuralPassRetry) {
         throw new SupervisorIntegrationError(
           'CHECK_RETRY_STATE_INVALID',
-          `durable ${checkerId} result differs from its exact physical continuation: expected ${JSON.stringify(expectedNext)}, received ${JSON.stringify(resumedNextReady)}`,
+          `durable ${checkerId} result differs from its exact physical continuation: expected ${JSON.stringify(persistedExpectedNext)}, received ${JSON.stringify(resumedNextReady)}`,
         )
       }
       return Object.freeze({
-        kind: sourceKind === 'retry' ? 'retry'
+        kind: sourceKind === 'retry'
+          ? pendingReportCorrection ? 'retry' : 'superseded-retry'
           : structurallyUnboundPass ? 'structural'
           : result.code === 'PASS' ? 'accepted'
           : nonAuthoritative ? 'non-authoritative'
@@ -18122,7 +20558,7 @@ function createDefaultRouteExecutor(options) {
         fromRetryState: Boolean(pendingRetry), nextReadyId, checkerId, checkerIndex,
         repairAttempt: repairEligible ? activeRepairAttempt + 1 : activeRepairAttempt || repairAttempt, result, pointer,
         checkerResultHash: hashText(JSON.stringify(durableResult)), nonAuthoritative,
-        expectedNext,
+        expectedNext, controllerReassessment: pendingControllerReassessment,
       })
     })()
     if (durableIndependentFrontier && durableIndependentFrontier.fromRetryState &&
@@ -18130,7 +20566,7 @@ function createDefaultRouteExecutor(options) {
         durableIndependentFrontier.kind !== 'accepted' &&
         !(durableIndependentFrontier.kind === 'non-authoritative' &&
           !checkerResultHasExactVerificationLimitation(durableIndependentFrontier.result))) {
-      await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
+      await closeInconclusiveChecker({
         candidateHash,
         checkerId: durableIndependentFrontier.checkerId,
         checkerResultHash: durableIndependentFrontier.checkerResultHash,
@@ -18146,13 +20582,22 @@ function createDefaultRouteExecutor(options) {
     let durableRecoveredVerificationLimitation = null
     let durableRecoveredNonAuthoritative = null
     if (durableIndependentFrontier &&
-        durableIndependentFrontier.kind === 'non-authoritative') {
+        ['non-authoritative', 'superseded-retry'].includes(durableIndependentFrontier.kind)) {
       durableRecoveredNonAuthoritative = durableIndependentFrontier.result
     }
     if (durableIndependentFrontier && durableIndependentFrontier.kind === 'terminal') {
       if (durableIndependentFrontier.result.code === 'FAIL') {
         if (deferredPromotion) await deferredPromotion.abort('durable independent checker found a concrete defect')
-        return { outcome: 'FAILED', terminalEnvelope: durableIndependentFrontier.result, checkHashes: [] }
+        return {
+          outcome: 'FAILED',
+          checkHashes: [],
+          deliverables: [
+            ...changedDeliverables(options.targetPath, options.gitEnvironment()),
+            ...externalDeliverables(),
+          ],
+          ...(finalResponse ? { finalResponse } : {}),
+          terminalEnvelope: durableIndependentFrontier.result,
+        }
       }
     }
     if (durableIndependentFrontier &&
@@ -18366,27 +20811,10 @@ function createDefaultRouteExecutor(options) {
     const correctionBindingFor = checkerId => checkerReportCorrectionBinding(candidateHash, checkerId)
     const correctionBindingKey = binding => binding &&
       `${binding.candidateHash}\0${binding.checkerSeat}`
-    const correctionConsumedFor = checkerId => {
-      const binding = correctionBindingFor(checkerId)
-      return Boolean(binding && checkerReportCorrectionBindings.has(correctionBindingKey(binding)))
-    }
-    const rememberCorrectionBinding = checkerId => {
-      const binding = correctionBindingFor(checkerId)
-      if (!binding) {
-        throw new SupervisorIntegrationError(
-          'CHECK_RETRY_STATE_INVALID',
-          `checker correction cannot bind noncanonical seat ${checkerId}`,
-        )
-      }
-      const key = correctionBindingKey(binding)
-      if (checkerReportCorrectionBindings.has(key)) {
-        throw new SupervisorIntegrationError(
-          'CHECK_RETRY_STATE_INVALID',
-          `checker ${binding.checkerSeat} already consumed its correction for this exact version`,
-        )
-      }
-      checkerReportCorrectionBindings.set(key, binding)
-      return binding
+    if (durableIndependentFrontier &&
+        durableIndependentFrontier.kind === 'superseded-retry') {
+      const binding = correctionBindingFor(durableIndependentFrontier.checkerId)
+      if (binding) checkerReportCorrectionBindings.set(correctionBindingKey(binding), binding)
     }
     const reportCorrectionEvidenceFor = (checkerIndex, checkerAttemptId, retryReason) => {
       if (!retryReason || !/^[a-f0-9]{64}$/u.test(retryReason.priorResultEvidenceHash || '')) {
@@ -18434,127 +20862,6 @@ function createDefaultRouteExecutor(options) {
           retryReason.priorResultEvidenceHash,
         ),
       })
-    }
-    const applyBoundedReportCorrection = (priorResult, correctionResult, retryReason) => {
-      const invalidFields = new Set(retryReason.invalidFieldIds || [])
-      const allowedFields = new Set([
-        'code', 'payload', 'payload.evidenceIds',
-        'payload.referenceMethod', 'payload.testOutcomes',
-      ])
-      if (invalidFields.size === 0 ||
-          [...invalidFields].some(field => !allowedFields.has(field)) ||
-          invalidFields.has('payload') && [...invalidFields]
-            .some(field => field.startsWith('payload.'))) {
-        throw new SupervisorIntegrationError(
-          'CHECK_RETRY_STATE_INVALID',
-          'checker report correction requested a noncanonical or overlapping field scope',
-        )
-      }
-      const priorPayload = priorResult && priorResult.payload &&
-        typeof priorResult.payload === 'object' && !Array.isArray(priorResult.payload)
-        ? priorResult.payload : {}
-      const correctionPayload = correctionResult && correctionResult.payload &&
-        typeof correctionResult.payload === 'object' && !Array.isArray(correctionResult.payload)
-        ? correctionResult.payload : {}
-      const payload = invalidFields.has('payload') ? { ...correctionPayload } : { ...priorPayload }
-      if (invalidFields.has('payload.evidenceIds')) {
-        if (Object.hasOwn(correctionPayload, 'evidenceIds')) {
-          payload.evidenceIds = correctionPayload.evidenceIds
-        } else delete payload.evidenceIds
-      }
-      if (invalidFields.has('payload.referenceMethod')) {
-        if (Object.hasOwn(correctionPayload, 'referenceMethod')) {
-          payload.referenceMethod = correctionPayload.referenceMethod
-        } else delete payload.referenceMethod
-      }
-      if (invalidFields.has('payload.testOutcomes')) {
-        const targetChecks = new Set(retryReason.checkIds || [])
-        const retained = Array.isArray(priorPayload.testOutcomes)
-          ? priorPayload.testOutcomes.filter(item => !targetChecks.has(item && item.command)) : []
-        const replacements = Array.isArray(correctionPayload.testOutcomes)
-          ? correctionPayload.testOutcomes.filter(item => targetChecks.has(item && item.command)) : []
-        payload.testOutcomes = [...retained, ...replacements]
-      }
-      const merged = {
-        ...(priorResult || {}),
-        payload,
-      }
-      const setControllerVerdictBundle = (code, reason = null) => {
-        merged.code = code
-        const descriptions = {
-          PASS: 'The checked result satisfies every requirement assigned to this check.',
-          FAIL: 'The checked result does not satisfy one or more named requirements.',
-          CHECK_INCONCLUSIVE: 'A required check could not determine whether the exact result passes.',
-          RUNTIME_FAILURE: 'A tool or execution environment failed before the requested check could finish.',
-        }
-        const causeByCode = {
-          PASS: {
-            event: 'CHECK_COMPLETED',
-            reason: 'The bounded report correction records a passing checker verdict.',
-            unblockPath: null,
-          },
-          FAIL: {
-            event: 'ASSERTION_FAILED',
-            reason: 'The bounded report correction records a failed required check.',
-            unblockPath: 'Repair the exact implementation defect and run the required checks again.',
-          },
-          CHECK_INCONCLUSIVE: {
-            event: 'CHECK_REPORT_INCONCLUSIVE',
-            reason: 'The bounded report correction could not establish a conclusive checker verdict.',
-            unblockPath: 'Preserve the exact result and report the unresolved verification limitation.',
-          },
-          RUNTIME_FAILURE: {
-            event: 'CHECK_RUNTIME_FAILURE',
-            reason: 'The bounded report correction records a checker runtime failure.',
-            unblockPath: 'Preserve the exact result and report the unresolved runtime limitation.',
-          },
-        }
-        if (Object.hasOwn(descriptions, code)) {
-          merged.description = descriptions[code]
-          merged.stateClass = code === 'CHECK_INCONCLUSIVE' ? 'intermediate' : 'terminal'
-          merged.cause = reason ? { ...causeByCode[code], reason } : causeByCode[code]
-          const correctedAuthority = code === 'CHECK_INCONCLUSIVE'
-            ? canonicalCheckerVerificationAuthority(merged) : null
-          const correctedDisposition = merged.payload &&
-            merged.payload.verificationObservationDisposition
-          if (correctedAuthority && correctedDisposition &&
-              correctedDisposition.reportedAggregateCode === 'PASS' &&
-              correctedAuthority.checks.some(check => check.authority === 'SCRATCH_HARNESS')) {
-            merged.cause = {
-              event: 'CHECK_SCRATCH_CONFIRMATION_REQUIRED',
-              reason: 'A checker-authored scratch validator produced provisional PASS evidence but cannot independently certify its own semantic coverage.',
-              unblockPath: 'Run one fresh independent checker context with disjoint scratch and a distinct verification method against the same frozen exact version.',
-            }
-          }
-        } else {
-          delete merged.description
-          delete merged.stateClass
-          delete merged.cause
-        }
-      }
-      if (invalidFields.has('code')) {
-        // Verdict explanation is controller-derived from the corrected code;
-        // it is not an implicit extension of the model's field authority.
-        setControllerVerdictBundle(correctionResult && correctionResult.code)
-      } else if (invalidFields.has('payload.testOutcomes') &&
-          priorResult && priorResult.code === 'CHECK_INCONCLUSIVE' &&
-          priorResult.cause && priorResult.cause.event === 'CHECKER_VERDICT_CONTRADICTION' &&
-          Array.isArray(payload.testOutcomes) && payload.testOutcomes.length > 0 &&
-          payload.testOutcomes.every(item => item && item.status === 'PASS')) {
-        // The prior aggregate was already PASS; canonicalization temporarily
-        // downgraded it only because its named outcomes contradicted it. Once
-        // the exact scoped outcomes are corrected to all PASS, restore that
-        // aggregate deterministically rather than accepting a retry-authored
-        // top-level verdict.
-        setControllerVerdictBundle(
-          'PASS',
-          'The bounded report correction resolved every contradictory named outcome as passing.',
-        )
-      }
-      // Narrow payload correction is a field allowlist, not permission to
-      // replace top-level verdict, identity, cause, or audit fields. Whole-code
-      // and whole-payload corrections replace only their explicit bundles.
-      return Object.freeze(merged)
     }
     // Backward-compatible reconstruction is deliberately limited to retry IDs
     // for the exact resumed repair generation. Historical generations cannot
@@ -18837,11 +21144,14 @@ function createDefaultRouteExecutor(options) {
           { checkerId: pending.checkerId, checkerCode: checkerResult.code || null },
         )
       }
+      if (pending.repairAttempt > 1) {
+        // Older releases could persist an unbounded next repair. Reconcile that
+        // checkpoint to its already-authenticated concrete checker failure;
+        // never launch a second aggregate repair after upgrade.
+        return returnConcreteCandidateFailure(checkerResult, [])
+      }
       if (recoveredRepeatedRepairFailure) {
-        if (deferredPromotion) {
-          await deferredPromotion.abort('crash recovery retained a recurring semantic checker failure')
-        }
-        return { outcome: 'FAILED', terminalEnvelope: recoveredRepeatedRepairFailure, checkHashes: [] }
+        return returnConcreteCandidateFailure(recoveredRepeatedRepairFailure, [])
       }
       rejectedCheckerResults.set(pending.checkerId, checkerResult)
       const rejectedCheckerReceipts = rememberRejectedCheckerReceipt(
@@ -18919,10 +21229,7 @@ function createDefaultRouteExecutor(options) {
       } else {
         if (repairFailureFingerprints.some(fingerprint =>
           repairFailureFingerprintChain.includes(fingerprint))) {
-          if (deferredPromotion) {
-            await deferredPromotion.abort('durable checker repeated an already repaired semantic failure')
-          }
-          return { outcome: 'FAILED', terminalEnvelope: checkerResult, checkHashes: [] }
+          return returnConcreteCandidateFailure(checkerResult, [])
         }
         repairFailureFingerprintChain.push(...repairFailureFingerprints)
       }
@@ -19003,32 +21310,26 @@ function createDefaultRouteExecutor(options) {
       }
       if (pendingRepairLaunch.successor && repairResult.terminalEnvelope &&
           repairResult.terminalEnvelope.status === 'CHILD_TRANSPORT_TIMEOUT') {
-        if (deferredPromotion) await deferredPromotion.abort('repair provider retry remained unavailable')
-        return Object.freeze({
-          outcome: 'FAILED',
-          terminalEnvelope: repairResult.terminalEnvelope,
-        })
+        // The checker already established a concrete product defect. If the
+        // one bounded repair transport cannot return a replacement, preserve
+        // that real product result and candidate instead of laundering it as
+        // controller uncertainty or masking it with the transport condition.
+        return returnConcreteCandidateFailure(checkerResult, [])
       }
       const repairCandidatePath = deferredPromotion && deferredPromotion.workspacePath ||
         options.targetPath
-      const repairedCandidateHash = hashWorkspaceCandidate(
-        repairCandidatePath,
-        options.gitEnvironment(repairCandidatePath),
-      )
+      const repairedCandidateHash = candidateHashFor(repairCandidatePath)
       if (repairedCandidateHash === pending.rejectedCandidateHash) {
-        if (deferredPromotion) await deferredPromotion.abort('repair left the independently rejected version unchanged')
-        return {
-          outcome: 'FAILED', checkHashes: [],
-          // Preserve the actual independently observed task failure.  A
-          // controller-invented repair status must never mask it.
-          terminalEnvelope: checkerResult,
-        }
+        // Preserve the actual independently observed task failure and expose
+        // the candidate. A controller-invented repair status must never mask
+        // it or make an already-produced deliverable disappear.
+        return returnConcreteCandidateFailure(checkerResult, [])
       }
       candidateHash = repairedCandidateHash
-      usableDeliverables = changedDeliverables(
-        repairCandidatePath,
-        options.gitEnvironment(repairCandidatePath),
-      )
+      usableDeliverables = [
+        ...changedDeliverables(repairCandidatePath, options.gitEnvironment(repairCandidatePath)),
+        ...externalDeliverables(),
+      ]
       finalResponse = null
       acceptedWorkResults.set(pending.repairWorkItemId, repairResult)
       checkerRepairAttempt = pending.repairAttempt
@@ -19073,13 +21374,18 @@ function createDefaultRouteExecutor(options) {
       }
       checkerRuntimeRetries[index] = 1
       checkerRuntimeProgressHashes[index] = durableIndependentFrontier.checkerResultHash
-      checkerRuntimeReasons[index] = canonicalCheckerReassessment({
-        code: durableIndependentFrontier.result.code,
-        priorResultEvidenceHash: durableIndependentFrontier.checkerResultHash,
-      }, {
-        resultHash: durableIndependentFrontier.checkerResultHash,
-        checkerId: durableIndependentFrontier.checkerId,
-      })
+      checkerRuntimeReasons[index] = durableIndependentFrontier.controllerReassessment ||
+        canonicalCheckerReassessment({
+          code: 'CHECK_REPORT_INVALID',
+          priorResultEvidenceHash: durableIndependentFrontier.checkerResultHash,
+          invalidFieldIds: ['code', 'payload'],
+          checkIds: canonicalCheckerVerificationAuthority(
+            durableIndependentFrontier.result,
+          ).checks.map(check => check.checkId),
+        }, {
+          resultHash: durableIndependentFrontier.checkerResultHash,
+          checkerId: durableIndependentFrontier.checkerId,
+        })
       if (!durableIndependentFrontier.fromRetryState) {
         await options.transition('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
           candidateHash,
@@ -19095,7 +21401,8 @@ function createDefaultRouteExecutor(options) {
     const resumedInconclusive = resumeState && resumeState.retryState &&
       resumeState.retryState.inconclusiveChecker
     if (resumedInconclusive && resumedInconclusive.candidateHash === candidateHash &&
-        !(durableIndependentFrontier && durableIndependentFrontier.kind === 'structural')) {
+        !(durableIndependentFrontier &&
+          ['structural', 'superseded-retry'].includes(durableIndependentFrontier.kind))) {
       const resumedIndex = /^independent-check-(\d+)/u.exec(String(resumedInconclusive.checkerId || ''))
       if (resumedIndex && Number(resumedIndex[1]) >= 1 && Number(resumedIndex[1]) <= checkerCount) {
         const resumedCheckerIndex = Number(resumedIndex[1]) - 1
@@ -19183,10 +21490,7 @@ function createDefaultRouteExecutor(options) {
         const retryAttempt = checkerRuntimeRetries[index]
         const retryReason = checkerRuntimeReasons[index]
         const reportOnlyCorrection = retryAttempt > 0 && retryReason &&
-          !FULL_EVIDENCE_CHECKER_REASSESSMENT_CODES.has(retryReason.code)
-        const freshEvidenceReassessment = retryAttempt > 0 && retryReason &&
-          ['CHECK_OBSERVATION_INCOMPLETE', 'CHECK_OBSERVATION_CONTRADICTION']
-            .includes(retryReason.code)
+          REPORT_ONLY_CHECKER_CORRECTION_CODES.has(retryReason.code)
         if (reportOnlyCorrection &&
             (!Array.isArray(retryReason.invalidFieldIds) ||
              !Array.isArray(retryReason.checkIds))) {
@@ -19197,6 +21501,19 @@ function createDefaultRouteExecutor(options) {
         }
         const reportCorrectionEvidence = reportOnlyCorrection
           ? reportCorrectionEvidenceFor(index, checkerAttemptId, retryReason) : null
+        const controllerLocalReportLimitation = reportOnlyCorrection
+          ? controllerReportShapeLimitation(
+              reportCorrectionEvidence.priorResult,
+              retryReason.code,
+              assignedCheckerChecks,
+            )
+          : null
+        if (reportOnlyCorrection && !controllerLocalReportLimitation) {
+          throw new SupervisorIntegrationError(
+            'CHECK_RETRY_STATE_INVALID',
+            'legacy checker report-correction state lacks complete controller-owned command receipts',
+          )
+        }
         const rejectedVersionEvidence = repairedVersionCheckerEvidence()
         workItemId = retryAttempt > 0
           ? `${checkerAttemptId}-runtime-retry-${retryAttempt}` : checkerAttemptId
@@ -19206,14 +21523,17 @@ function createDefaultRouteExecutor(options) {
           workItemId = completedAttempt.workItemId
           result = completedAttempt.result
           recoveredDurableResult = true
+        } else if (controllerLocalReportLimitation) {
+          result = controllerLocalReportLimitation
         } else result = adoptedCheckResults && adoptedCheckResults[workItemId] || await launchChecker({
         workItemId,
         logicalRole: index === 0 ? 'independent-reviewer' : 'independent-tester',
         parent: 'run-owner', purpose: 'verification',
           checkerRecoveryDisposition: {
-          nonAuthoritativeRetryId: retryAttempt === 0 &&
-            !correctionConsumedFor(checkerAttemptId)
-            ? `${checkerAttemptId}-runtime-retry-1` : null,
+            // Report/observation/runtime uncertainty never authorizes a new
+            // same-seat model turn. Distinct configured seats are the only
+            // bounded continuation; legacy retry markers are retired locally.
+            nonAuthoritativeRetryId: null,
             failureRepairId: typeof options.resultPointer === 'function'
               ? index + 1 < checkerCount
                 ? `independent-check-${index + 2}`
@@ -19228,42 +21548,23 @@ function createDefaultRouteExecutor(options) {
           : [],
         ...(retryAttempt > 0 ? {
           executorKey: checkerAttemptId,
-          forkTurns: freshEvidenceReassessment ? 'none' : 1,
-          ...(freshEvidenceReassessment ? {} : {
-            recoveryContext: {
-              type: 'bounded-recovery',
-              code: retryReason && retryReason.code || 'INDEPENDENT_CHECK_RUNTIME_RETRY',
-            },
-          }),
+          forkTurns: 1,
+          recoveryContext: {
+            type: 'bounded-recovery',
+            code: retryReason && retryReason.code || 'INDEPENDENT_CHECK_RUNTIME_RETRY',
+          },
         } : {}),
-        assignment: reportOnlyCorrection
-          ? `Correct only the bounded checker report fields named by fetchedEvidence.controllerReportCorrection. Reuse the prior exact-version observations; do not rerun tools, inspect the exact version being checked again, or repeat the full verification matrix. Return the corrected report fields and preserve every already-valid field.${boundedToolOutputDiscipline}`
-          : `${checkerAssignment}${assignedDomainContracts.length > 0
+        assignment: `${checkerAssignment}${assignedDomainContracts.length > 0
           ? ' Return every declared captured-domain result in payload.capturedDomainOutcomes.' : ''}` +
           `${finalResponse
             ? ` The frozen exact version being checked has no workspace file delta. Independently verify whether fetchedEvidence.structuredFinalResponse itself satisfies the user request${finalResponse.evidencePointer ? ' by reading its exact evidence pointer' : ''}. PASS authorizes the response; a concrete unmet edit or deliverable obligation is FAIL.`
             : ''}` +
-          `${retryReason
-            ? freshEvidenceReassessment
-              ? ` Independently reassess the frozen exact version because the prior PASS lacked admissible observation coverage (${retryReason.code}). Start from the requirements, use a fresh expected-result basis and fresh harness, and do not reuse or merely correct the prior checker report.`
-              : ` Correct the prior non-authoritative report identified by ${retryReason.code}; use distinct underlying evidence when another checker conflict is named.`
-            : ''}` +
           ' Apply fetchedEvidence.verificationDoctrine exactly to its named checks and verification obligations.' +
-          boundedToolOutputDiscipline,
+          checkerToolOutputDiscipline,
         candidateHash, oracle,
-        success: reportOnlyCorrection
-          ? ['Only the controller-named report fields/check IDs are corrected from prior evidence.']
-          : successes,
-        checks: reportOnlyCorrection ? retryReason.checkIds || [] : assignedCheckerChecks,
-        verificationCommandBindings: reportOnlyCorrection
-          ? [] : checkerCommandBindingsBySeat[index],
-        ...(reportOnlyCorrection ? {
-          reportCorrectionScope: {
-            invalidFieldIds: retryReason.invalidFieldIds || [],
-            checkIds: retryReason.checkIds || [],
-            priorResultEvidenceHash: retryReason.priorResultEvidenceHash,
-          },
-        } : {}),
+        success: successes,
+        checks: assignedCheckerChecks,
+        verificationCommandBindings: checkerCommandBindingsBySeat[index],
         isolation: 'snapshot',
         writeProducing: true,
         roadmapSlice: planPointer, manifests: executionOwnership,
@@ -19271,59 +21572,45 @@ function createDefaultRouteExecutor(options) {
         firstResponsibility: checking.responsibilities[0],
         secondResponsibility: checking.responsibilities[1],
         bounded: true,
-        fetchedEvidence: reportOnlyCorrection ? {
-              controllerReportCorrection: {
-                code: retryReason.code,
-                invalidFieldIds: retryReason.invalidFieldIds || [],
-                checkIds: retryReason.checkIds || [],
-                priorResultEvidenceHash: retryReason.priorResultEvidenceHash,
-                ...(reportCorrectionEvidence.pointer
-                  ? { priorResultPointer: reportCorrectionEvidence.pointer }
-                  : { priorReportProjection: reportCorrectionEvidence.projection }),
-              },
-            } : {
-              verificationDoctrine: CHECKER_FALSIFICATION_DOCTRINE,
-              requiredInvariantCategories,
-              ...(assignedDomainContracts.length > 0
-                ? { capturedDomainContracts: assignedDomainContracts } : {}),
-              verificationObligations: verificationObligationsBySeat[index].map(
-                obligation => structuredClone(obligation),
-              ),
-              ...(finalResponse ? {
-                structuredFinalResponse: {
-                  responseHash: finalResponse.responseHash,
-                  resultFormat: finalResponse.resultFormat,
-                  resultHashes: finalResponse.results.map(result => result.resultHash),
-                  ...(finalResponse.evidencePointer
-                    ? { evidencePointer: finalResponse.evidencePointer }
-                    : { response: finalResponse }),
-                },
-              } : {}),
-              ...(rejectedVersionEvidence ? {
-                rejectedCheckerReceipts: rejectedVersionEvidence.rejectedCheckerReceipts,
-                aggregateFailureHash: rejectedVersionEvidence.aggregateFailureHash,
-                rejectedFindingIds: rejectedVersionEvidence.rejectedFindingIds,
-                repairHistory: rejectedVersionEvidence.repairHistory,
-              } : {}),
-              ...(retryReason ? { controllerReassessment: retryReason } : {}),
+        fetchedEvidence: {
+          verificationDoctrine: CHECKER_FALSIFICATION_DOCTRINE,
+          requiredInvariantCategories,
+          ...(assignedDomainContracts.length > 0
+            ? { capturedDomainContracts: assignedDomainContracts } : {}),
+          verificationObligations: verificationObligationsBySeat[index].map(
+            obligation => structuredClone(obligation),
+          ),
+          ...(finalResponse ? {
+            structuredFinalResponse: {
+              responseHash: finalResponse.responseHash,
+              resultFormat: finalResponse.resultFormat,
+              resultHashes: finalResponse.results.map(result => result.resultHash),
+              ...(finalResponse.evidencePointer
+                ? { evidencePointer: finalResponse.evidencePointer }
+                : { response: finalResponse }),
             },
-        ...(reportOnlyCorrection && reportCorrectionEvidence.pointer ? {
-          evidencePointers: [reportCorrectionEvidence.pointer],
-        } : !reportOnlyCorrection &&
-          (finalResponse && finalResponse.evidencePointer || rejectedVersionEvidence) ? {
+          } : {}),
+          ...(rejectedVersionEvidence ? {
+            rejectedCheckerReceipts: rejectedVersionEvidence.rejectedCheckerReceipts,
+            aggregateFailureHash: rejectedVersionEvidence.aggregateFailureHash,
+            rejectedFindingIds: rejectedVersionEvidence.rejectedFindingIds,
+            repairHistory: rejectedVersionEvidence.repairHistory,
+          } : {}),
+          ...(retryReason ? { controllerReassessment: retryReason } : {}),
+        },
+        ...(finalResponse && finalResponse.evidencePointer || rejectedVersionEvidence ? {
           evidencePointers: [
             ...(finalResponse && finalResponse.evidencePointer ? [finalResponse.evidencePointer] : []),
             ...(rejectedVersionEvidence ? rejectedVersionEvidence.receiptPointers : []),
           ],
         } : {}),
         deferredPromotionToken: deferredPromotion && deferredPromotion.token || null,
-        ...((!reportOnlyCorrection &&
-            (finalResponse && finalResponse.evidencePointer || rejectedVersionEvidence) ||
+        ...(((finalResponse && finalResponse.evidencePointer || rejectedVersionEvidence) ||
             (retryAttempt > 0 && checkerRuntimeProgressHashes[index]))
           ? { evidenceHashes: [
-              ...(!reportOnlyCorrection && finalResponse && finalResponse.evidencePointer
+              ...(finalResponse && finalResponse.evidencePointer
                 ? [finalResponse.evidencePointer.hash] : []),
-              ...(!reportOnlyCorrection && rejectedVersionEvidence
+              ...(rejectedVersionEvidence
                 ? rejectedVersionEvidence.receiptPointers.map(pointer => pointer.hash) : []),
               ...(retryAttempt > 0 && checkerRuntimeProgressHashes[index]
                 ? [checkerRuntimeProgressHashes[index]] : []),
@@ -19334,13 +21621,6 @@ function createDefaultRouteExecutor(options) {
         deferProofAcceptance: true,
         harnessAttestation: options.harnessAttestation(candidateHash, oracle),
         })
-        if (reportOnlyCorrection) {
-          result = applyBoundedReportCorrection(
-            reportCorrectionEvidence.priorResult,
-            result,
-            retryReason,
-          )
-        }
         const rawCheckerResultHash = hashText(stableStringify(result || null))
         const reportedEvidenceIds = result && result.payload && Array.isArray(result.payload.evidenceIds)
           ? result.payload.evidenceIds.map(value => typeof value === 'string' ? value.trim() : value)
@@ -19380,16 +21660,25 @@ function createDefaultRouteExecutor(options) {
           Array.isArray(result.payload.testOutcomes) ? result.payload.testOutcomes : []
         const reportedOutcomeCounts = new Map()
         for (const item of reportedTestOutcomes) {
-          if (item && typeof item.command === 'string') {
-            reportedOutcomeCounts.set(item.command, (reportedOutcomeCounts.get(item.command) || 0) + 1)
-          }
+          const normalized = normalizeCheckerOutcomeIdentity(item, assignedCheckerChecks)
+          if (!normalized) continue
+          reportedOutcomeCounts.set(
+            normalized.command,
+            (reportedOutcomeCounts.get(normalized.command) || 0) + 1,
+          )
         }
         const reportCorrectionCheckIds = controllerDefect === 'TEST_OUTCOMES_INVALID'
-          ? assignedCheckerChecks.filter(checkId => {
-              const items = reportedTestOutcomes.filter(item => item && item.command === checkId)
-              return reportedOutcomeCounts.get(checkId) !== 1 ||
-                items.some(item => !['PASS', 'FAIL'].includes(item.status) || item.status !== 'PASS')
-            })
+          ? (() => {
+              const invalid = assignedCheckerChecks.filter(checkId => {
+                const items = reportedTestOutcomes.filter(item => {
+                  const normalized = normalizeCheckerOutcomeIdentity(item, assignedCheckerChecks)
+                  return normalized && normalized.command === checkId
+                })
+                return reportedOutcomeCounts.get(checkId) !== 1 ||
+                  items.some(item => !['PASS', 'FAIL'].includes(item.status) || item.status !== 'PASS')
+              })
+              return invalid.length > 0 ? invalid : [...assignedCheckerChecks]
+            })()
           : controllerDefect === 'CHECK_REPORT_INVALID' ? [...assignedCheckerChecks]
           : []
         const reportCorrectionInvalidFieldIds = controllerDefect === 'TEST_OUTCOMES_INVALID'
@@ -19430,7 +21719,7 @@ function createDefaultRouteExecutor(options) {
           // a different controller disposition, so close that marker before
           // the independent seat/confirmation frontier proceeds.
           if (retryDispositionTransitionPending) {
-            await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
+            await closeInconclusiveChecker({
               candidateHash,
               checkerId: workItemId,
               checkerResultHash: rawCheckerResultHash,
@@ -19453,18 +21742,87 @@ function createDefaultRouteExecutor(options) {
           stableCapabilityLimitation = true
           break
         }
-        if (nonAuthoritative && retryAttempt === 0 && correctionConsumedFor(checkerAttemptId)) {
-          const controllerReason = controllerDefect ||
-            'CHECKER_REPORT_CORRECTION_ALREADY_CONSUMED'
-          const reassessmentCode = controllerDefect ||
-            (CHECKER_REASSESSMENT_CODES.has(result && result.code)
-              ? result.code : 'CHECK_REPORT_INVALID')
+        if (nonAuthoritative && retryAttempt > 0 && sameEnvironmentCapabilityUnavailable) {
+          if (retryDispositionTransitionPending) {
+            await closeInconclusiveChecker({
+              candidateHash,
+              checkerId: workItemId,
+              checkerResultHash: rawCheckerResultHash,
+              retryAttempt,
+              controllerReason: retryReason && retryReason.code || 'CHECK_REPORT_INVALID',
+              terminalDisposition: 'DONE_WITH_VERIFICATION_LIMITATIONS',
+              nextReadyWorkIds: index + 1 < checkerCount
+                ? [`independent-check-${index + 2}` +
+                  (checkerRepairAttempt > 0 ? `-repair-${checkerRepairAttempt}` : '')]
+                : [],
+            })
+          }
+          stableCapabilityLimitation = true
+          break
+        }
+        const reportCorrectionEligible = nonAuthoritative && retryAttempt === 0 &&
+          controllerDefect && checkerReportOnlyCorrectionEligible(
+            result,
+            controllerDefect,
+            assignedCheckerChecks,
+          )
+        if (reportCorrectionEligible) {
+          const limitation = controllerReportShapeLimitation(
+            result,
+            controllerDefect,
+            assignedCheckerChecks,
+          )
+          if (!limitation) {
+            throw new SupervisorIntegrationError(
+              'CHECK_RETRY_STATE_INVALID',
+              'controller-local report limitation lost its complete command-receipt authority',
+            )
+          }
+          result = limitation
+          stableCapabilityLimitation = true
+          break
+        }
+        if (nonAuthoritative && retryAttempt === 0 && structurallyUnboundPass &&
+            index + 1 < checkerCount) {
+          // A receipt-free aggregate PASS is not acceptance evidence, but it
+          // also is not a product defect. Record it as an explicit limitation
+          // and let the next genuinely distinct configured seat decide the
+          // frozen version. This prevents a retired same-seat retry marker (or
+          // one malformed PASS report) from overriding a later authoritative
+          // checker PASS, while reports containing any concrete failure remain
+          // on the inconclusive/repair path below.
+          const boundedLimitation = controllerVerificationLimitation(result, {
+            capabilityId: 'autoprompt.independent-check-observation',
+            reason: 'one checker reported aggregate PASS without command-bound acceptance receipts; a distinct configured checker remains authoritative',
+          })
+          if (boundedLimitation) {
+            result = boundedLimitation
+            stableCapabilityLimitation = true
+            break
+          }
+        }
+        if (nonAuthoritative && retryAttempt === 0) {
+          // A same-seat model invocation cannot authenticate the first turn's
+          // command stream or make a malformed report authoritative. Keep the
+          // runtime in CHECK_WORK and advance only to a distinct configured
+          // checker seat. The durable launch receipt already carries that
+          // frontier; after every distinct seat is exhausted, one terminal
+          // CHECK_INCONCLUSIVE transition preserves the usable exact version.
+          const controllerReason = structurallyUnboundPass
+            ? result.cause.event
+            : controllerDefect || result && result.cause && result.cause.event ||
+              result && result.code || 'INDEPENDENT_CHECK_NON_AUTHORITATIVE'
+          const reassessmentCode = CHECKER_REASSESSMENT_CODES.has(controllerReason)
+            ? controllerReason
+            : (controllerDefect || CHECKER_REASSESSMENT_CODES.has(result && result.code)
+                ? controllerDefect || result.code
+                : 'CHECK_REPORT_INVALID')
           exhaustedNonAuthoritativeReports.push(Object.freeze({
             checkerId: workItemId,
             result,
             checkerResultHash: rawCheckerResultHash,
             controllerReason,
-            retryAttempt,
+            retryAttempt: 0,
             controllerReassessment: canonicalCheckerReassessment({
               code: reassessmentCode,
               priorResultEvidenceHash: rawCheckerResultHash,
@@ -19473,32 +21831,6 @@ function createDefaultRouteExecutor(options) {
           exhaustedNonAuthoritativeReport = true
           break
         }
-        if (nonAuthoritative && retryAttempt === 0) {
-          const reportCorrectionBinding = rememberCorrectionBinding(checkerAttemptId)
-          checkerRuntimeProgressHashes[index] = rawCheckerResultHash
-          checkerReportCorrectionPriorResults[index] = result
-          checkerRuntimeReasons[index] = canonicalCheckerReassessment({
-            code: structurallyUnboundPass
-              ? result.cause.event : controllerDefect || result.code,
-            priorResultEvidenceHash: rawCheckerResultHash,
-            ...(controllerDefect ? {
-              invalidFieldIds: reportCorrectionInvalidFieldIds,
-              checkIds: reportCorrectionCheckIds,
-            } : {}),
-          }, { resultHash: rawCheckerResultHash, checkerId: workItemId })
-          await options.transition('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
-            candidateHash,
-            checkerId: workItemId,
-            checkerResultHash: checkerRuntimeProgressHashes[index],
-            retryAttempt: 1,
-            reportCorrectionBinding,
-            ...(controllerDefect ? { controllerReason: controllerDefect } : {}),
-            controllerReassessment: checkerRuntimeReasons[index],
-            nextReadyWorkIds: [`${checkerAttemptId}-runtime-retry-1`],
-          })
-          checkerRuntimeRetries[index] = 1
-          continue
-        }
         if (nonAuthoritative && retryAttempt > 0 && structurallyUnboundPass) {
           const controllerReason = result.cause.event
           const controllerReassessment = canonicalCheckerReassessment({
@@ -19506,7 +21838,7 @@ function createDefaultRouteExecutor(options) {
             priorResultEvidenceHash: rawCheckerResultHash,
           }, { resultHash: rawCheckerResultHash, checkerId: workItemId })
           if (retryDispositionTransitionPending) {
-            await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
+            await closeInconclusiveChecker({
               candidateHash,
               checkerId: workItemId,
               checkerResultHash: rawCheckerResultHash,
@@ -19574,7 +21906,7 @@ function createDefaultRouteExecutor(options) {
               : []
             if (nextReadyWorkIds.length > 0) {
               if (retryDispositionTransitionPending) {
-                await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
+                await closeInconclusiveChecker({
                   candidateHash,
                   checkerId: workItemId,
                   checkerResultHash: rawCheckerResultHash,
@@ -19607,7 +21939,7 @@ function createDefaultRouteExecutor(options) {
           const repairEligible = result.code === 'FAIL' &&
             typeof options.resultPointer === 'function' &&
             (index + 1 < checkerCount || !repeatedRepairFailure)
-          await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
+          await closeInconclusiveChecker({
             candidateHash,
             checkerId: workItemId,
             checkerResultHash: hashText(JSON.stringify(result)),
@@ -19669,8 +22001,7 @@ function createDefaultRouteExecutor(options) {
           // the one-defect-per-generation amplification seen in DIRECT runs.
           continue
         }
-        if (deferredPromotion) await deferredPromotion.abort('independent checker did not pass')
-        return { outcome: 'FAILED', terminalEnvelope: result, checkHashes }
+        return returnConcreteCandidateFailure(result, checkHashes)
       }
       if (result && result.payload && Array.isArray(result.payload.capturedDomainOutcomes)) {
         capturedDomainOutcomes.push(...result.payload.capturedDomainOutcomes.filter(outcome =>
@@ -19739,10 +22070,13 @@ function createDefaultRouteExecutor(options) {
               purpose: 'verification',
               executorKey: confirmationId,
               forkTurns: 'none',
-              assignment: `${checking.responsibilities[0]} Independently confirm the complete ` +
-                'acceptance matrix in one fresh context. Derive a distinct reference method and ' +
-                'create any scratch validator independently from the frozen exact version.' +
-                boundedToolOutputDiscipline,
+              assignment: `${checking.responsibilities[0]} Act as a coverage critic for the ` +
+                'primary complete-matrix execution in one fresh context. Inspect its bounded ' +
+                'coverage claims, derive a distinct reference method, and execute targeted ' +
+                'missing-property, negative, separation, boundary, and composition probes. Do ' +
+                'not duplicate the full-scale matrix; run a fresh full-scale execution only when ' +
+                'scale itself is the unverified property.' +
+                checkerToolOutputDiscipline,
               candidateHash,
               oracle: confirmationOracle,
               success: successes,
@@ -19761,6 +22095,15 @@ function createDefaultRouteExecutor(options) {
                 verificationObligations: verificationObligationsBySeat[0].map(
                   obligation => structuredClone(obligation),
                 ),
+                primaryScratchCoverage: {
+                  checkerId: primary.checkerId,
+                  resultHash: primary.checkerResultHash,
+                  testOutcomes: structuredClone(primary.result.payload.testOutcomes),
+                  verificationAuthority: structuredClone(
+                    primary.result.payload.verificationAuthority,
+                  ),
+                  referenceMethod: structuredClone(primary.result.payload.referenceMethod),
+                },
                 ...(finalResponse ? {
                   structuredFinalResponse: {
                     responseHash: finalResponse.responseHash,
@@ -19838,10 +22181,7 @@ function createDefaultRouteExecutor(options) {
               ),
             }))
           } else {
-            if (deferredPromotion) {
-              await deferredPromotion.abort('independent scratch confirmation found a concrete defect')
-            }
-            return { outcome: 'FAILED', terminalEnvelope: confirmationResult, checkHashes }
+            return returnConcreteCandidateFailure(confirmationResult, checkHashes)
           }
         } else if ((confirmationResult && confirmationResult.code === 'PASS' &&
             confirmationControllerDefect === null) || confirmationScratchPass) {
@@ -19882,16 +22222,19 @@ function createDefaultRouteExecutor(options) {
           repairFailureFingerprintChain.length === 0 &&
           implementationFailures.some(failure =>
             !checkerImplementationFailureHasControllerObservation(failure.result))
-        if (repeatedFailureFingerprint || legacyPostRepairFailureLacksNovelAuthority) {
-          if (deferredPromotion) {
-            await deferredPromotion.abort('independent checker repeated an already repaired semantic failure')
-          }
-          return { outcome: 'FAILED', terminalEnvelope: primaryFailure.result, checkHashes }
+        const boundedAggregateRepairConsumed = checkerRepairAttempt >= 1
+        if (boundedAggregateRepairConsumed || repeatedFailureFingerprint ||
+            legacyPostRepairFailureLacksNovelAuthority) {
+          // The first repair receives the complete aggregate failure matrix.
+          // If its fresh checker still finds a concrete defect, that is the
+          // model/product result—not authority for an unbounded repair chain.
+          // Keep ordinary target deliverables visible to the caller/grader.
+          return returnConcreteCandidateFailure(primaryFailure.result, checkHashes)
         }
         const repairFailureFingerprint = aggregateRepairFailureFingerprint(implementationFailures)
         repairFailureFingerprintChain.push(...repairFailureFingerprints)
         if (pendingTerminalNonAuthoritativeRetry) {
-          await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
+          await closeInconclusiveChecker({
             candidateHash,
             ...pendingTerminalNonAuthoritativeRetry,
             terminalDisposition: 'CHECK_INCONCLUSIVE',
@@ -19987,33 +22330,22 @@ function createDefaultRouteExecutor(options) {
         }
         if (repairLaunch.successor && repairResult.terminalEnvelope &&
             repairResult.terminalEnvelope.status === 'CHILD_TRANSPORT_TIMEOUT') {
-          if (deferredPromotion) await deferredPromotion.abort('repair provider retry remained unavailable')
-          return Object.freeze({
-            outcome: 'FAILED',
-            terminalEnvelope: repairResult.terminalEnvelope,
-          })
+          return returnConcreteCandidateFailure(primaryFailure.result, [])
         }
         const repairCandidatePath = deferredPromotion && deferredPromotion.workspacePath ||
           options.targetPath
-        const repairedCandidateHash = hashWorkspaceCandidate(
-          repairCandidatePath,
-          options.gitEnvironment(repairCandidatePath),
-        )
+        const repairedCandidateHash = candidateHashFor(repairCandidatePath)
         if (repairedCandidateHash === rejectedCandidateHash) {
-          if (deferredPromotion) await deferredPromotion.abort('repair left the independently rejected version unchanged')
-          return {
-            outcome: 'FAILED', checkHashes: [],
-            // Return the concrete checker failure rather than a synthetic
-            // AutoPrompt failure.  Changed partial repairs are always
-            // rechecked even when their worker self-reports incomplete.
-            terminalEnvelope: primaryFailure.result,
-          }
+          // Return the concrete checker failure and the usable candidate.
+          // Changed partial repairs are always rechecked even when their
+          // worker self-reports incomplete.
+          return returnConcreteCandidateFailure(primaryFailure.result, [])
         }
         candidateHash = repairedCandidateHash
-        usableDeliverables = changedDeliverables(
-          repairCandidatePath,
-          options.gitEnvironment(repairCandidatePath),
-        )
+        usableDeliverables = [
+          ...changedDeliverables(repairCandidatePath, options.gitEnvironment(repairCandidatePath)),
+          ...externalDeliverables(),
+        ]
         finalResponse = null
         acceptedWorkResults.set(repairWorkItemId, repairResult)
         checkerRepairAttempt += 1
@@ -20174,59 +22506,17 @@ function createDefaultRouteExecutor(options) {
           acceptedScratchConfirmationProofIds.add(confirmation.workItemId)
         }
       }
-      const unresolvedNonAuthoritativeReports = [
-        ...exhaustedNonAuthoritativeReports,
-      ].sort((left, right) => left.checkerId.localeCompare(right.checkerId))
-      const reportsWithConcreteDefectEvidence = []
-      for (const report of unresolvedNonAuthoritativeReports) {
-        const seat = /^independent-check-(\d+)/u.exec(report.checkerId || '')
-        const index = seat ? Number(seat[1]) - 1 : -1
-        const limitationResult = controllerVerificationLimitation(report.result, {
-          reason: 'the bounded checker retry ended without authoritative acceptance evidence or a concrete version defect',
-        })
-        if (!limitationResult || index < 0 || index >= checkerCount) {
-          reportsWithConcreteDefectEvidence.push(report)
-          continue
-        }
-        const resultHash = hashText(stableStringify(limitationResult))
-        const capabilityId = limitationResult.payload.verificationLimitation.capabilityId
-        verificationLimitations.push(Object.freeze({
-          checkerId: report.checkerId,
-          result: limitationResult,
-          resultHash,
-        }))
-        checkHashes[index] = resultHash
-        independentVerdicts[index] = {
-          kind: index === 0 ? 'independent-review' : 'independent-verification',
-          status: 'FAIL',
-          verdictHash: resultHash,
-          evidenceIds: [`verification-limitation:${capabilityId}`],
-        }
-        checkerEvidenceConsumptions[index] = null
-        delete regressionOutcomeGroups[index]
-        if (pendingTerminalNonAuthoritativeRetry &&
-            pendingTerminalNonAuthoritativeRetry.checkerId === report.checkerId) {
-          await options.transition('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
-            candidateHash,
-            ...pendingTerminalNonAuthoritativeRetry,
-            terminalDisposition: 'CHECK_INCONCLUSIVE',
-            nextReadyWorkIds: [],
-          })
-          pendingTerminalNonAuthoritativeRetry = null
-        }
-      }
-      if (reportsWithConcreteDefectEvidence.length > 0) {
-        const primary = reportsWithConcreteDefectEvidence[0]
+      const unresolvedNonAuthoritativeReports = [...exhaustedNonAuthoritativeReports]
+        .sort((left, right) => left.checkerId.localeCompare(right.checkerId))
+      if (unresolvedNonAuthoritativeReports.length > 0) {
+        const primary = unresolvedNonAuthoritativeReports[0]
         return preserveInconclusiveCandidate(
           primary.checkerId,
           primary.result,
           primary.controllerReason,
           pendingTerminalNonAuthoritativeRetry === null,
           {
-            // Recovery state historically calls this the retry attempt. It
-            // records that the sole report correction allowance ended without
-            // placing another physical checker on the frontier.
-            retryAttempt: 1,
+            retryAttempt: primary.retryAttempt,
             controllerReassessment: primary.controllerReassessment,
           },
         )
@@ -20251,78 +22541,13 @@ function createDefaultRouteExecutor(options) {
         if (!recoverableAggregate.has(error && error.code) || affectedIndex < 0 ||
             affectedIndex >= checkerCount) throw error
         const accepted = checkerControllerAcceptedResults[affectedIndex]
-        if (correctionConsumedFor(accepted && accepted.workItemId || affectedId)) {
-          const limitationResult = controllerVerificationLimitation(
-            accepted && accepted.result,
-            {
-              reason: `the bounded checker report correction did not resolve ${error.code} without reusing non-independent evidence`,
-            },
-          )
-          // Exhausting a report-only correction is not evidence that the
-          // frozen candidate is defective.  Keep concrete FAIL observations
-          // authoritative (the limitation constructor rejects them), but do
-          // not discard a usable implementation merely because a checker
-          // could not supply a second independent proof identity.
-          if (!limitationResult) {
-            return preserveInconclusiveCandidate(
-              accepted && accepted.workItemId || affectedId,
-              accepted && accepted.result,
-              error.code,
-            )
-          }
-          const resultHash = hashText(stableStringify(limitationResult))
-          const checkerId = accepted && accepted.workItemId || affectedId
-          const capabilityId = limitationResult.payload.verificationLimitation.capabilityId
-          verificationLimitations.push(Object.freeze({
-            checkerId,
-            result: limitationResult,
-            resultHash,
-          }))
-          checkHashes[affectedIndex] = resultHash
-          independentVerdicts[affectedIndex] = {
-            kind: affectedIndex === 0 ? 'independent-review' : 'independent-verification',
-            status: 'FAIL',
-            verdictHash: resultHash,
-            evidenceIds: [`verification-limitation:${capabilityId}`],
-          }
-          checkerEvidenceConsumptions[affectedIndex] = null
-          delete regressionOutcomeGroups[affectedIndex]
-          checkerControllerAcceptedResults[affectedIndex] = null
-        } else {
-          const evidenceHash = hashText(stableStringify(accepted && accepted.result || null))
-          const reportCorrectionBinding = rememberCorrectionBinding(accepted.workItemId)
-          checkerRuntimeProgressHashes[affectedIndex] = evidenceHash
-          checkerReportCorrectionPriorResults[affectedIndex] = accepted.result
-          checkerRuntimeRetries[affectedIndex] = 1
-          checkerRuntimeReasons[affectedIndex] = canonicalCheckerReassessment({
-            code: error.code,
-            conflictingCheckerId: error.details &&
-              (error.details.firstCheckerId || error.details.firstOracleId) || null,
-            reassignedCheckerId: affectedId,
-            priorResultEvidenceHash: evidenceHash,
-            invalidFieldIds: error.code === 'DUPLICATE_UNDERLYING_EVIDENCE'
-              ? ['payload.evidenceIds'] : ['payload.referenceMethod'],
-            checkIds: [],
-            ...(error.details && error.details.evidenceId
-              ? { evidenceId: error.details.evidenceId } : {}),
-            ...(error.details && error.details.methodClass
-              ? { methodClass: error.details.methodClass } : {}),
-            ...(error.details && error.details.methodHash
-              ? { methodHash: error.details.methodHash } : {}),
-          }, { resultHash: evidenceHash, checkerId: affectedId })
-          checkerControllerAcceptedResults[affectedIndex] = null
-          await options.transition('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
-            candidateHash,
-            checkerId: accepted.workItemId,
-            checkerResultHash: evidenceHash,
-            retryAttempt: 1,
-            reportCorrectionBinding,
-            controllerReason: error.code,
-            controllerReassessment: checkerRuntimeReasons[affectedIndex],
-            nextReadyWorkIds: [`${accepted.workItemId}-runtime-retry-1`],
-          })
-          continue checkerAttempts
-        }
+        // Cross-seat evidence conflicts are join failures, not permission to
+        // buy another model turn just to alter identifiers or report shape.
+        return preserveInconclusiveCandidate(
+          accepted && accepted.workItemId || affectedId,
+          accepted && accepted.result,
+          error.code,
+        )
       }
       for (let index = 0; index < independentVerdicts.length; index += 1) {
         await options.transition('INDEPENDENT_VERDICT_RECORDED', 'CHECK_WORK', {
@@ -20361,34 +22586,64 @@ function createDefaultRouteExecutor(options) {
     }
     if (regressionBaseline.length > 0 && regressionOutcomeGroups.length === 0 &&
         acceptedVerificationLimitations.length === 0) {
-      if (deferredPromotion) await deferredPromotion.abort('post-check omitted the immutable regression baseline')
-      return {
-        outcome: 'FAILED', checkHashes,
-        terminalEnvelope: { status: 'REGRESSION_BASELINE_NOT_REEXECUTED', baselineIds: regressionBaseline.map(item => item.id) },
-      }
+      return preserveInconclusiveCandidate(
+        'regression-baseline-reexecution',
+        {
+          code: 'REGRESSION_BASELINE_NOT_REEXECUTED',
+          baselineIds: regressionBaseline.map(item => item.id),
+        },
+        'REGRESSION_BASELINE_NOT_REEXECUTED',
+        false,
+      )
     }
     if (regressionBaseline.length > 0 && regressionOutcomeGroups.length > 0) {
       const regressions = regressionOutcomeGroups.map(outcomes =>
         evaluateRegressionDelta(regressionBaseline, outcomes))
       const regression = regressions.find(item => !item.valid)
       if (regression) {
-        if (deferredPromotion) await deferredPromotion.abort('new regression detected')
-        return { outcome: 'FAILED', checkHashes, terminalEnvelope: { status: 'NEW_REGRESSION', ...regression } }
+        return returnConcreteCandidateFailure(
+          { status: 'NEW_REGRESSION', ...regression },
+          checkHashes,
+        )
       }
     }
     if (finalFindings.length > 0) {
       let authorityReceipt = null
       if (finalFindings.some(item => item && item.disposition === 'advisory')) {
         if (typeof options.authorizeResidualRisk !== 'function') {
-          throw new SupervisorIntegrationError(
+          return preserveInconclusiveCandidate(
+            'post-finding-residual-risk-authority',
+            {
+              code: 'RESIDUAL_RISK_AUTHORITY_REQUIRED',
+              candidateHash,
+              findingIds: finalFindings
+                .filter(item => item && item.disposition === 'advisory')
+                .map(item => item.id).sort(),
+            },
             'RESIDUAL_RISK_AUTHORITY_REQUIRED',
-            'advisory findings require post-finding authorization from the production control plane',
           )
         }
-        authorityReceipt = await options.authorizeResidualRisk({
-          findings: Object.freeze(finalFindings.map(item => Object.freeze({ ...item }))),
-          candidateHash,
-        })
+        try {
+          authorityReceipt = await options.authorizeResidualRisk({
+            findings: Object.freeze(finalFindings.map(item => Object.freeze({ ...item }))),
+            candidateHash,
+          })
+        } catch (error) {
+          if (error && error.code === 'RESIDUAL_RISK_AUTHORITY_REQUIRED') {
+            return preserveInconclusiveCandidate(
+              'post-finding-residual-risk-authority',
+              {
+                code: error.code,
+                candidateHash,
+                findingIds: finalFindings
+                  .filter(item => item && item.disposition === 'advisory')
+                  .map(item => item.id).sort(),
+              },
+              error.code,
+            )
+          }
+          throw error
+        }
       }
       createResidualRiskDisposition({ findings: finalFindings, authorityReceipt })
     }
@@ -20500,7 +22755,10 @@ function createDefaultRouteExecutor(options) {
     return {
       outcome: 'DONE',
       checkHashes,
-      deliverables: changedDeliverables(options.targetPath, options.gitEnvironment()),
+      deliverables: [
+        ...changedDeliverables(options.targetPath, options.gitEnvironment()),
+        ...externalDeliverables(),
+      ],
       ...(finalResponse ? { finalResponse } : {}),
       terminalEnvelope: {
         status: completionLimitations ? 'DONE_WITH_VERIFICATION_LIMITATIONS' : 'DONE',
@@ -20555,6 +22813,7 @@ function createCheckerSnapshotFactory(options) {
         status: clone.status, stderr: String(clone.stderr || '').slice(-4096),
       })
     }
+    alignCloneToExpectedHead(sourcePath, snapshotPath, options.expectedBranch, sourceEnvironment)
     const safetyRepair = childProcess.spawnSync(process.execPath, [
       options.safetyScriptPath,
       '--repo', snapshotPath,
@@ -20783,7 +23042,7 @@ function outputSchemaForRole(roleContract, record) {
 
 function safeExpectedBranch(repository, environment) {
   const branch = String(runGit(repository, ['branch', '--show-current'], { environment })).trim()
-  if (!branch) throw new SupervisorIntegrationError('SAFE_GIT_ENV_INVALID', 'detached HEAD is not a supported child boundary')
+  if (!branch) exactHeadOid(repository, environment)
   return branch
 }
 
@@ -21330,13 +23589,12 @@ function createSupervisorOptions(args = {}, context = {}) {
 function persistCapturedDomainAdmissionTransaction(input = {}) {
   const record = input.record
   const stateStore = input.stateStore
-  const capability = input.capability
   const admission = input.admission
   const runId = input.runId
   const generation = input.generation
   if (!record || typeof record.resolve !== 'function' || typeof record.write !== 'function' ||
       !stateStore || !stateStore.eventLog || typeof stateStore.eventLog.readAll !== 'function' ||
-      typeof stateStore.record !== 'function' || !capability ||
+      typeof stateStore.load !== 'function' ||
       typeof runId !== 'string' || !runId || !Number.isSafeInteger(generation) || generation < 1 ||
       !admission || typeof admission !== 'object' || Array.isArray(admission)) {
     throw new SupervisorIntegrationError(
@@ -21361,8 +23619,8 @@ function persistCapturedDomainAdmissionTransaction(input = {}) {
   } else {
     admissionBytes = canonicalAdmissionBytes
   }
-  const receiptBody = Object.freeze({
-    schemaVersion: 1,
+  const staticReceiptBody = Object.freeze({
+    schemaVersion: 2,
     kind: 'codex-captured-domain-pre-work-admission',
     runId,
     generation,
@@ -21376,27 +23634,68 @@ function persistCapturedDomainAdmissionTransaction(input = {}) {
       .map(contract => contract.certificateHash)
       .sort()),
   })
-  const receipt = Object.freeze({
-    ...receiptBody,
-    receiptHash: hashText(stableStringify(receiptBody)),
-  })
 
-  // Each durable step is idempotent. A crash after either file write, or after
-  // the append-only state event was committed but before it returned, resumes
-  // by validating the exact bytes already present and completing only the
-  // missing suffix of the transaction.
+  const runtimeState = stateStore.load()
+  const events = stateStore.eventLog.readAll()
+  if (!runtimeState || runtimeState.runId !== runId ||
+      !runtimeState.activation || runtimeState.activation.generation !== generation ||
+      !Number.isSafeInteger(runtimeState.sequence) || runtimeState.sequence < 1 ||
+      !/^[a-f0-9]{64}$/u.test(runtimeState.lastEventHash || '')) {
+    throw new SupervisorIntegrationError(
+      'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
+      'captured-domain admission requires the exact authenticated runtime generation and state-event chain',
+    )
+  }
+
+  let receipt
   if (fs.existsSync(receiptPath)) {
     const saved = readRegularJson(
       receiptPath,
       'captured-domain pre-work admission receipt',
     ).parsed
-    if (stableStringify(saved) !== stableStringify(receipt)) {
+    const allowed = [
+      ...Object.keys(staticReceiptBody),
+      'preWorkState', 'preWorkStateEventHash', 'preWorkStateEventSequence', 'receiptHash',
+    ]
+    const savedBody = { ...saved }
+    delete savedBody.receiptHash
+    if (Object.keys(saved).some(key => !allowed.includes(key)) ||
+        stableStringify(Object.fromEntries(Object.keys(staticReceiptBody)
+          .map(key => [key, saved[key]]))) !== stableStringify(staticReceiptBody) ||
+        saved.preWorkState !== 'RUN_WORK' ||
+        !/^[a-f0-9]{64}$/u.test(saved.preWorkStateEventHash || '') ||
+        !Number.isSafeInteger(saved.preWorkStateEventSequence) ||
+        saved.preWorkStateEventSequence < 1 ||
+        saved.receiptHash !== hashText(stableStringify(savedBody))) {
       throw new SupervisorIntegrationError(
         'CRASH_ADOPTION_CONFLICT',
         'captured-domain pre-work admission receipt changed after its first durable record',
       )
     }
+    receipt = Object.freeze(saved)
+  } else {
+    if (runtimeState.state !== 'RUN_WORK') {
+      throw new SupervisorIntegrationError(
+        'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
+        'captured-domain admission must bind the existing RUN_WORK boundary before any product role launch',
+      )
+    }
+    const receiptBody = Object.freeze({
+      ...staticReceiptBody,
+      preWorkState: 'RUN_WORK',
+      preWorkStateEventHash: runtimeState.lastEventHash,
+      preWorkStateEventSequence: runtimeState.sequence,
+    })
+    receipt = Object.freeze({
+      ...receiptBody,
+      receiptHash: hashText(stableStringify(receiptBody)),
+    })
   }
+
+  // Each durable step is idempotent. The receipt binds to the already
+  // canonical RUN_WORK event instead of inventing a Codex-specific transition
+  // in the shared provider state machine. A crash after either file write
+  // resumes by validating exact bytes and completing only the missing suffix.
   if (!fs.existsSync(admissionPath)) {
     record.write(CAPTURED_DOMAIN_ADMISSION_PATH, canonicalAdmissionBytes)
     admissionBytes = fs.readFileSync(admissionPath)
@@ -21414,51 +23713,23 @@ function persistCapturedDomainAdmissionTransaction(input = {}) {
     )
   }
 
-  const admissionEvents = stateStore.eventLog.readAll().filter(event =>
-    event && event.type === 'CAPTURED_DOMAIN_ADMISSION_RECORDED' &&
-    event.generation === generation)
-  const eventMatches = event => event.details &&
-    event.details.admissionReceiptHash === receipt.receiptHash &&
-    event.details.admissionFileHash === receipt.admissionFileHash &&
-    event.details.routeDecisionHash === receipt.routeDecisionHash &&
-    event.details.targetStateHash === receipt.targetStateHash
-  if (admissionEvents.length > 1 || admissionEvents.some(event => !eventMatches(event))) {
+  const anchor = events[receipt.preWorkStateEventSequence - 1]
+  const stateEvent = anchor && anchor.details && anchor.details.stateEvent
+  if (!anchor || anchor.hash !== receipt.preWorkStateEventHash ||
+      anchor.sequence !== receipt.preWorkStateEventSequence ||
+      anchor.generation !== generation || anchor.stateAfter !== 'RUN_WORK' ||
+      !stateEvent || stateEvent.runId !== runId ||
+      stateEvent.sequence !== receipt.preWorkStateEventSequence ||
+      stateEvent.toState !== 'RUN_WORK') {
     throw new SupervisorIntegrationError(
       'CRASH_ADOPTION_CONFLICT',
-      'captured-domain admission state-event history differs from the one exact durable binding',
-    )
-  }
-  let event = admissionEvents[0] || null
-  if (!event) {
-    stateStore.record('CAPTURED_DOMAIN_ADMISSION_RECORDED', {
-      capability,
-      cause: 'Bind the immutable captured-domain certificate before any product role launch.',
-      details: {
-        admissionReceiptHash: receipt.receiptHash,
-        admissionFileHash: receipt.admissionFileHash,
-        routeDecisionHash: receipt.routeDecisionHash,
-        targetStateHash: receipt.targetStateHash,
-      },
-    })
-    event = stateStore.eventLog.readAll().find(candidate =>
-      candidate && candidate.type === 'CAPTURED_DOMAIN_ADMISSION_RECORDED' &&
-      candidate.generation === generation && candidate.details &&
-      candidate.details.admissionReceiptHash === receipt.receiptHash &&
-      candidate.details.admissionFileHash === receipt.admissionFileHash &&
-      candidate.details.routeDecisionHash === receipt.routeDecisionHash &&
-      candidate.details.targetStateHash === receipt.targetStateHash)
-  }
-  if (!event || !/^[a-f0-9]{64}$/u.test(event.hash || '') ||
-      !Number.isSafeInteger(event.sequence) || event.sequence < 1) {
-    throw new SupervisorIntegrationError(
-      'CAPTURED_DOMAIN_ADMISSION_REQUIRED',
-      'captured-domain pre-work admission lacks its authenticated state-event binding',
+      'captured-domain pre-work admission no longer matches its exact canonical RUN_WORK event',
     )
   }
   return Object.freeze({
     ...receipt,
-    stateEventHash: event.hash,
-    stateEventSequence: event.sequence,
+    stateEventHash: receipt.preWorkStateEventHash,
+    stateEventSequence: receipt.preWorkStateEventSequence,
   })
 }
 
@@ -21561,7 +23832,9 @@ function createDefaultRuntimeOptions(input) {
   const safeEnvFactory = safeEnvironmentFactory()
   const configIsolationPath = activationRecord.activationBoundary.gitConfig
   const ghConfigDir = activationRecord.activationBoundary.ghConfigDir
-  const expectedBranch = context.expectedBranch || safeExpectedBranch(targetPath, environment)
+  const expectedBranch = Object.prototype.hasOwnProperty.call(context, 'expectedBranch')
+    ? context.expectedBranch
+    : safeExpectedBranch(targetPath, environment)
   const safetyOptions = {
     configIsolationPath,
     ghConfigDir,
@@ -21571,13 +23844,15 @@ function createDefaultRuntimeOptions(input) {
   const gitEnvironment = repository => safeEnvFactory(repository || targetPath, environment, safetyOptions).environment
   const openWorkerWorkspaceManager = () => {
     if (!workerWorkspaceManager) {
+      const targetGitEnvironment = gitEnvironment(targetPath)
       workerWorkspaceManager = new WorkerWorkspaceManager({
         targetRoot: targetPath,
         privateRoot: path.join(activation.activationRoot, 'worker-workspaces'),
-        environment: gitEnvironment(targetPath),
+        environment: targetGitEnvironment,
         runId: activation.runId,
         activationId: activation.runId,
         hardenWorkspace: workspacePath => {
+          alignCloneToExpectedHead(targetPath, workspacePath, expectedBranch, targetGitEnvironment)
           const repair = childProcess.spawnSync(process.execPath, [
             path.resolve(__dirname, '..', '..', '..', 'scripts', 'local-only-safety.cjs'),
             '--repo', workspacePath,
@@ -21586,7 +23861,7 @@ function createDefaultRuntimeOptions(input) {
             '--enforcement-proof', activationRecord.activationBoundary.enforcementProof.path,
             '--json',
           ], {
-            env: environment,
+            env: targetGitEnvironment,
             encoding: 'utf8',
             windowsHide: true,
             maxBuffer: 4 * 1024 * 1024,
@@ -23209,8 +25484,11 @@ function createDefaultRuntimeOptions(input) {
     },
     workerWorkspaceFactory: ({ assignment, workItemId, transportQuarantine }) => {
       const manager = openWorkerWorkspaceManager()
-      return transportQuarantine
-        ? manager.prepareFromQuarantine({ assignment, workItemId, quarantine: transportQuarantine })
+      const workerQuarantine = transportQuarantine &&
+        Object.prototype.hasOwnProperty.call(transportQuarantine, 'workerWorkspace')
+        ? transportQuarantine.workerWorkspace : transportQuarantine
+      return workerQuarantine
+        ? manager.prepareFromQuarantine({ assignment, workItemId, quarantine: workerQuarantine })
         : manager.prepare({ assignment, workItemId })
     },
     workerWorkspaceRecoveryFactory: ({ assignment, workItemId, recordPath }) => {
@@ -23241,13 +25519,17 @@ function createDefaultRuntimeOptions(input) {
       }
       return readRegularJson(absolute, 'deferred promotion state').parsed
     },
-    async capturePreMutationBaseline({ request, targetPath: baselineTarget, environment: baselineEnvironment }) {
+    async capturePreMutationBaseline({ assignment, request, targetPath: baselineTarget, environment: baselineEnvironment }) {
       const status = String(runGit(baselineTarget, [
         'status', '--porcelain=v1', '-z', '--untracked-files=all',
       ], { environment: baselineEnvironment }))
       const dirtyPaths = [...new Set(status.split('\0').filter(Boolean)
         .map(entry => entry.slice(3).split(' -> ').at(-1)).filter(Boolean))].sort()
-      const targetStateHash = hashWorkspaceCandidate(baselineTarget, baselineEnvironment)
+      const targetStateHash = hashWorkspaceCandidate(
+        baselineTarget,
+        baselineEnvironment,
+        explicitExternalLocalResources(assignment, baselineTarget),
+      )
       const observableChecks = Array.isArray(request && request.checks) && request.checks.length
         ? request.checks.map(String)
         : ['Compare the isolated worker postimage with the immutable target baseline.']
@@ -23382,7 +25664,7 @@ function createDefaultRuntimeOptions(input) {
       const reopened = readRegularJson(absolute, 'terminal session record').parsed
       if (stableStringify(reopened) !== stableStringify(terminal)) {
         throw new SupervisorIntegrationError(
-          'SESSION_TERMINAL_PERSIST_FAILED',
+          'SESSION_TERMINAL_INTEGRITY_FAILED',
           'terminal session record did not reopen with identical immutable bytes',
         )
       }
@@ -23424,16 +25706,27 @@ function createDefaultRuntimeOptions(input) {
         )
       }
       const receipt = runtime._verifyDurableResultReceipt(sourceWorkItemId, transportResult)
+      let workerPointer = null
       try {
-        return openWorkerWorkspaceManager().quarantinePointer({
+        workerPointer = openWorkerWorkspaceManager().quarantinePointer({
           sourceWorkItemId,
           retryWorkItemId,
           transportReceiptHash: receipt.receiptHash,
         })
       } catch (error) {
-        if (error && error.code === 'WORKER_QUARANTINE_NOT_FOUND') return null
-        throw error
+        if (!error || error.code !== 'WORKER_QUARANTINE_NOT_FOUND') throw error
       }
+      const externalPointer = findExternalLocalTransportQuarantinePointer({
+        quarantineRoot: path.join(
+          activation.activationRoot,
+          'worker-workspaces',
+          'external-local-quarantines',
+        ),
+        sourceWorkItemId,
+        retryWorkItemId,
+        transportReceiptHash: receipt.receiptHash,
+      })
+      return transportQuarantineBundle(workerPointer, externalPointer)
     },
     frameworkAuthorityFactory({ route, requirementHash, missIdentity }) {
       if (!recordRef) {
@@ -23449,7 +25742,7 @@ function createDefaultRuntimeOptions(input) {
           'framework MISS cache requires the route-schema digest and exact composite cache key',
         )
       }
-      const relative = `work/framework-orchestration-${requirementHash}.json`
+      const relative = `work/framework-orchestration/${requirementHash}.json`
       const sharedCacheRoot = path.join(path.dirname(activation.activationRoot), 'framework-cache')
       const sharedCachePath = path.join(sharedCacheRoot, `${requirementHash}.json`)
       const frameworkAssignmentId = `framework:${requirementHash.slice(0, 24)}`
@@ -23523,7 +25816,7 @@ function createDefaultRuntimeOptions(input) {
         runId: activation.runId, activationId: activation.runId, generation,
       })
       if (!recordRef) throw new SupervisorIntegrationError('RUN_RECORD_FAILURE', 'residual-risk authority requires the opened run record')
-      const relative = `checks/residual-risk-authority-${candidateHash}.json`
+      const relative = `checks/residual-risk-authority/${candidateHash}.json`
       const absolute = recordRef.resolve(relative)
       if (!fs.existsSync(absolute)) recordRef.write(relative, `${JSON.stringify(receipt, null, 2)}\n`)
       const reopened = readRegularJson(absolute, 'residual-risk authority receipt').parsed
@@ -23916,6 +26209,9 @@ module.exports = {
   createMinimalTestEnvironment,
   createCodexJsonlAccumulator,
   createCheckerObservationBinding,
+  checkerResultBoundToCommandExecutionEvidence,
+  normalizeCheckerOutcomeIdentity,
+  canonicalCheckerTestOutcomes,
   canonicalCheckerVerificationAuthority,
   checkerResultRequiresScratchConfirmation,
   scratchConfirmationWorkItemId,
@@ -23967,6 +26263,20 @@ module.exports = {
   evidenceInvalidationSet,
   explicitFindingIds,
   canonicalAssignmentResources,
+  candidateExternalLocalResources,
+  explicitExternalLocalResources,
+  materializeExplicitExternalLocalBoundary,
+  removeUnchangedExternalLocalPlaceholders,
+  rollbackExplicitExternalLocalBoundary,
+  commitExplicitExternalLocalBoundary,
+  quarantineExplicitExternalLocalBoundary,
+  externalLocalTransportQuarantinePointer,
+  findExternalLocalTransportQuarantinePointer,
+  seedExplicitExternalLocalBoundaryFromQuarantine,
+  validateExplicitExternalLocalBoundary,
+  inspectExplicitExternalLocalBoundary,
+  recoverDurableExternalDeliverableIdentities,
+  hashWorkspaceCandidate,
   assertRealTargetUnchanged,
   workspaceFileSnapshot,
   evaluateRegressionDelta,

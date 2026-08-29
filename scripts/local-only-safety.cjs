@@ -74,8 +74,8 @@ const NETWORK_PUSH_PREFIXES = Object.freeze([
 ])
 
 const USAGE = `Usage:
-  node scripts/local-only-safety.cjs --expected-branch <branch> [--repo <path>] [--enforcement-proof <json-file>] [--repair] [--json]
-  node scripts/local-only-safety.cjs --expected-branch <branch> [--repo <path>] --emit-child-env --gh-config-dir <empty-directory> [--config-isolation <empty-file>] [--json]
+  node scripts/local-only-safety.cjs --expected-branch <branch-or-empty-for-detached-HEAD> [--repo <path>] [--enforcement-proof <json-file>] [--repair] [--json]
+  node scripts/local-only-safety.cjs --expected-branch <branch-or-empty-for-detached-HEAD> [--repo <path>] --emit-child-env --gh-config-dir <empty-directory> [--config-isolation <empty-file>] [--json]
 
 Exit codes:
   0   all local-only controls pass
@@ -86,7 +86,9 @@ Exit codes:
 
 The checker never runs push, fetch, ls-remote, GitHub CLI, or a hook. Repair only
 changes repository-local Git configuration and the canonical pre-push hook.
-Overall safety requires both repository controls and the emitted child environment.`
+Overall safety requires both repository controls and the emitted child environment.
+An explicitly empty --expected-branch value requires an existing detached HEAD;
+omitting --expected-branch remains invalid.`
 
 function parseArgs(argv) {
   const parsed = {
@@ -127,7 +129,8 @@ function parseArgs(argv) {
   }
 
   if (parsed.help) return parsed
-  if (!parsed.expectedBranch) throw new UsageError('--expected-branch is required')
+  if (parsed.expectedBranch === null) throw new UsageError('--expected-branch is required')
+  if (parsed.expectedBranch === undefined) throw new UsageError('--expected-branch requires a value')
   if (!parsed.repo) throw new UsageError('--repo requires a path')
   if (parsed.configIsolation === undefined) throw new UsageError('--config-isolation requires a path')
   if (parsed.enforcementProof === undefined) throw new UsageError('--enforcement-proof requires a path')
@@ -135,7 +138,7 @@ function parseArgs(argv) {
   if (parsed.emitChildEnv && !parsed.ghConfigDir) throw new UsageError('--emit-child-env requires --gh-config-dir')
   if (parsed.emitChildEnv && parsed.repair) throw new UsageError('--emit-child-env and --repair cannot be combined')
   if (/\0|[\r\n]/.test(parsed.expectedBranch)) {
-    throw new UsageError('--expected-branch must be a single non-empty line')
+    throw new UsageError('--expected-branch must be a single line')
   }
   return parsed
 }
@@ -406,7 +409,34 @@ function environmentConfig(environment) {
 
 function currentBranch(repo) {
   const result = runGit(repo, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { allowFailure: true })
-  return result.status === 0 ? result.stdout.trim() : null
+  if (result.status === 0) return result.stdout.trim()
+  if (result.status === 1) return null
+  throw new OperationalError('HEAD branch state could not be inspected')
+}
+
+function currentHead(repo) {
+  const branch = currentBranch(repo)
+  const oidResult = runGit(repo, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true })
+  if (oidResult.status !== 0 && branch === null) {
+    throw new OperationalError('Detached HEAD does not resolve to an object')
+  }
+  return {
+    branch,
+    oid: oidResult.status === 0 ? oidResult.stdout.trim() : null,
+    state: branch === null ? 'detached' : 'branch',
+  }
+}
+
+function expectedHead(expectedBranch) {
+  return expectedBranch === ''
+    ? { branch: null, state: 'detached' }
+    : { branch: expectedBranch, state: 'branch' }
+}
+
+function headMatchesExpectation(head, expectation) {
+  return expectation.state === 'detached'
+    ? head.state === 'detached'
+    : head.state === 'branch' && head.branch === expectation.branch
 }
 
 function pathEqual(left, right) {
@@ -867,7 +897,10 @@ function inspect(repository, expectedBranch, environment = process.env, options 
     environment,
     excludeCommandConfig: true,
   })
-  const actualBranch = currentBranch(repository.worktreeRoot)
+  const head = currentHead(repository.worktreeRoot)
+  const actualBranch = head.branch
+  const headExpectation = expectedHead(expectedBranch)
+  const expectedHeadMatches = headMatchesExpectation(head, headExpectation)
   const upstreamRemote = actualBranch ? configValues(config, `branch.${actualBranch}.remote`) : []
   const upstreamMerge = actualBranch ? configValues(config, `branch.${actualBranch}.merge`) : []
   const pushDefaultValues = configValues(config, 'push.default')
@@ -880,10 +913,14 @@ function inspect(repository, expectedBranch, environment = process.env, options 
   const checks = [
     check(
       'expected_branch',
-      actualBranch === expectedBranch,
-      `Current branch is ${expectedBranch}.`,
-      `Expected branch ${expectedBranch}, found ${actualBranch || 'detached HEAD'}.`,
-      { actual: actualBranch, expected: expectedBranch },
+      expectedHeadMatches,
+      headExpectation.state === 'detached'
+        ? 'HEAD is detached as explicitly required.'
+        : `Current branch is ${expectedBranch}.`,
+      headExpectation.state === 'detached'
+        ? `Expected detached HEAD, found branch ${actualBranch}.`
+        : `Expected branch ${expectedBranch}, found ${actualBranch || 'detached HEAD'}.`,
+      { actual: actualBranch, actualState: head.state, expected: expectedBranch, expectedState: headExpectation.state },
     ),
     check(
       'no_upstream',
@@ -952,7 +989,10 @@ function inspect(repository, expectedBranch, environment = process.env, options 
     channels,
     checks,
     commandBoundary,
+    expectedHead: headExpectation,
     gitEnforced: repositoryOk && commandBoundary.enforced,
+    head,
+    headExpectationMatched: expectedHeadMatches,
     mechanicallyEnforced,
     ok: mechanicallyEnforced,
     residuals,
@@ -974,8 +1014,10 @@ function setLocal(repo, key, value) {
 function repair(repository, expectedBranch, initial) {
   const changes = []
   const refusals = []
-  if (initial.actualBranch !== expectedBranch) {
-    refusals.push('Branch mismatch is never repaired automatically; no changes were made.')
+  if (!initial.headExpectationMatched) {
+    refusals.push(expectedBranch === ''
+      ? 'Detached HEAD expectation mismatch is never repaired automatically; no changes were made.'
+      : 'Branch mismatch is never repaired automatically; no changes were made.')
     return { changes, refusals }
   }
 
@@ -990,15 +1032,17 @@ function repair(repository, expectedBranch, initial) {
   }
   const localConfig = readConfig(repo, 'local', { excludeCommandConfig: true })
 
-  const remoteKey = `branch.${expectedBranch}.remote`
-  const mergeKey = `branch.${expectedBranch}.merge`
-  if (configValues(localConfig, remoteKey).length > 0) {
-    unsetLocal(repo, remoteKey)
-    changes.push(`unset ${remoteKey}`)
-  }
-  if (configValues(localConfig, mergeKey).length > 0) {
-    unsetLocal(repo, mergeKey)
-    changes.push(`unset ${mergeKey}`)
+  if (expectedBranch !== '') {
+    const remoteKey = `branch.${expectedBranch}.remote`
+    const mergeKey = `branch.${expectedBranch}.merge`
+    if (configValues(localConfig, remoteKey).length > 0) {
+      unsetLocal(repo, remoteKey)
+      changes.push(`unset ${remoteKey}`)
+    }
+    if (configValues(localConfig, mergeKey).length > 0) {
+      unsetLocal(repo, mergeKey)
+      changes.push(`unset ${mergeKey}`)
+    }
   }
 
   setLocal(repo, 'push.default', 'nothing')
@@ -1075,6 +1119,8 @@ function buildResult(mode, repository, expectedBranch, inspection, repairs = nul
     },
     expectedBranch,
     actualBranch: inspection.actualBranch,
+    expectedHead: inspection.expectedHead,
+    actualHead: inspection.head,
     checks: inspection.checks,
     channels: inspection.channels,
     commandBoundary: inspection.commandBoundary,
@@ -1084,10 +1130,19 @@ function buildResult(mode, repository, expectedBranch, inspection, repairs = nul
 }
 
 function formatText(result) {
+  const expectedHead = result.expectedHead.state === 'detached'
+    ? 'detached HEAD'
+    : `branch ${result.expectedHead.branch}`
+  const actualHead = result.actualHead.state === 'detached'
+    ? `detached HEAD at ${result.actualHead.oid}`
+    : `branch ${result.actualHead.branch}`
+  const headLine = result.expectedHead.state === 'detached'
+    ? `HEAD: ${actualHead} (expected ${expectedHead})`
+    : `branch: ${result.actualBranch || 'detached HEAD'} (expected ${result.expectedBranch})`
   const lines = [
     result.mechanicallyEnforced ? 'LOCAL_ONLY_MECHANICALLY_ENFORCED' : 'LOCAL_ONLY_NOT_MECHANICALLY_ENFORCED',
     `repository: ${result.repository.worktreeRoot}`,
-    `branch: ${result.actualBranch || 'detached HEAD'} (expected ${result.expectedBranch})`,
+    headLine,
     `repository controls: ${result.repositoryOk ? 'pass' : 'fail'}`,
     `Git controls: ${result.gitEnforced ? 'pass' : 'fail'}`,
   ]

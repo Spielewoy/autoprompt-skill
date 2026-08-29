@@ -21,7 +21,9 @@ const {
   resolveTrustedTestDeclarations,
 } = require('../../agents/codex/workflow/phase-budget.js')
 const { BudgetController } = require('../../agents/codex/workflow/budget-controller.js')
-const { stableStringify } = require('../../agents/codex/workflow/event-log.js')
+const { EventLog, stableStringify } = require('../../agents/codex/workflow/event-log.js')
+const { RuntimeStateStore } = require('../../agents/codex/workflow/runtime-state.js')
+const runRecord = require('../../agents/codex/workflow/run-record.js')
 const {
   CentralScheduler,
   resolveSchedulerSettings,
@@ -42,7 +44,31 @@ function digest(value) {
 function capturedDomainAdmissionFixture(t, failureBoundary = null) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-captured-admission-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const events = []
+  const runId = 'captured-admission-run'
+  const event = {
+    type: 'WORK_PREPARED',
+    generation: 1,
+    stateBefore: 'PREPARE_WORK',
+    stateAfter: 'RUN_WORK',
+    sequence: 1,
+    details: {
+      stateEvent: {
+        runId,
+        sequence: 1,
+        fromState: 'PREPARE_WORK',
+        toState: 'RUN_WORK',
+      },
+    },
+  }
+  event.hash = digest(JSON.stringify(event))
+  const events = [event]
+  const runtimeState = {
+    runId,
+    activation: { generation: 1 },
+    state: 'RUN_WORK',
+    sequence: 1,
+    lastEventHash: event.hash,
+  }
   let injected = false
   const injectAfter = boundary => {
     if (injected || failureBoundary !== boundary) return
@@ -62,18 +88,7 @@ function capturedDomainAdmissionFixture(t, failureBoundary = null) {
   }
   const stateStore = {
     eventLog: { readAll: () => events.map(event => structuredClone(event)) },
-    record(type, input) {
-      const event = {
-        type,
-        generation: 1,
-        details: structuredClone(input.details),
-        sequence: events.length + 1,
-      }
-      event.hash = digest(JSON.stringify(event))
-      events.push(event)
-      injectAfter('event')
-      return event
-    },
+    load: () => structuredClone(runtimeState),
   }
   const admission = Object.freeze({
     schemaVersion: 1,
@@ -89,11 +104,101 @@ function capturedDomainAdmissionFixture(t, failureBoundary = null) {
     record,
     stateStore,
     capability: Object.freeze({ id: 'test-capability' }),
-    runId: 'captured-admission-run',
+    runId,
     generation: 1,
     admission,
   }
   return { root, events, input }
+}
+
+function capturedDomainAdmissionRuntimeFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-captured-admission-runtime-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const target = path.join(root, 'target')
+  fs.mkdirSync(target)
+  const record = runRecord.createRunRecord({
+    targetPath: target,
+    canonicalProviderPrivateRoot: path.join(root, 'private'),
+    exactTree: true,
+    runId: 'captured-admission-runtime-run',
+    assertStartBoundary: false,
+  })
+  const binding = {
+    runId: record.runId,
+    requestEnvelopeHash: digest('captured-admission-request'),
+    targetIdentity: record.targetIdentity,
+    openedDirectoryIdentity: digest(JSON.stringify(record.runBinding)),
+    digests: {
+      contract: digest('contract'), prompt: digest('prompt'),
+      provider: digest('provider'), tool: digest('tool'),
+    },
+  }
+  const capability = Object.freeze({ type: 'captured-admission-runtime-capability' })
+  const capabilityBinding = {
+    runId: record.runId,
+    activationId: 'captured-admission-activation',
+    missionHash: digest('captured-admission-mission'),
+    nonce: 'captured_nonce_123456789',
+    generation: 1,
+    targetIdentity: record.targetIdentity,
+  }
+  let tick = 0
+  const clock = () => new Date(Date.UTC(2026, 7, 28, 0, 0, tick++)).toISOString()
+  const openState = () => {
+    const eventLog = new EventLog({ ...record.paths.eventLog, binding, clock })
+    return {
+      eventLog,
+      stateStore: new RuntimeStateStore({
+        ...record.paths.stateStore,
+        eventLog,
+        capabilityVerifier: candidate => candidate === capability ? capabilityBinding : null,
+        clock,
+      }),
+    }
+  }
+  const opened = openState()
+  opened.stateStore.create({
+    ...binding,
+    capability,
+    activation: {
+      id: capabilityBinding.activationId,
+      nonce: capabilityBinding.nonce,
+      missionHash: capabilityBinding.missionHash,
+      sessionToken: 'captured-admission-session',
+      generation: 1,
+    },
+  })
+  for (const nextState of [
+    'LOAD_SKILL', 'STORE_REQUEST_ENVELOPE', 'RESOLVE_SETTINGS', 'ACQUIRE_TARGET_LOCK',
+    'SELECT_SAFE_RUN_ROOT', 'CREATE_RUN_RECORD', 'CHECK_PROVIDER_CAPABILITIES',
+    'START_ROUTE_ANALYST', 'SAVE_ROUTE_ANALYSIS', 'L0_ROUTE_DECISION', 'PREPARE_WORK',
+    'RUN_WORK',
+  ]) {
+    opened.stateStore.transition(nextState, {
+      capability,
+      cause: 'advance real captured-domain admission fixture to RUN_WORK',
+      ...(nextState === 'SAVE_ROUTE_ANALYSIS' ? { eventId: 'ROUTE_ANALYST_STARTED' } : {}),
+    })
+  }
+  const admission = Object.freeze({
+    schemaVersion: 1,
+    route: 'DIRECT',
+    requestEnvelopeHash: binding.requestEnvelopeHash,
+    routeDecisionHash: digest('captured-admission-route-decision'),
+    targetStateHash: digest('captured-admission-target-state'),
+    admittedBeforeWork: true,
+    contracts: Object.freeze([]),
+    admissionHash: digest('captured-admission'),
+  })
+  return {
+    admission,
+    capability,
+    generation: 1,
+    openState,
+    record,
+    runId: record.runId,
+    stateStore: opened.stateStore,
+  }
 }
 
 function git(cwd, argv) {
@@ -386,7 +491,7 @@ function structurallyUnboundPass(event = 'CHECK_OBSERVATION_INCOMPLETE') {
 }
 
 test('captured-domain admission resumes every pre-work crash window as one exact transaction', t => {
-  for (const boundary of ['admission', 'receipt', 'event']) {
+  for (const boundary of ['admission', 'receipt']) {
     const fixture = capturedDomainAdmissionFixture(t, boundary)
     assert.throws(
       () => persistCapturedDomainAdmissionTransaction(fixture.input),
@@ -399,6 +504,9 @@ test('captured-domain admission resumes every pre-work crash window as one exact
     assert.match(recovered.receiptHash, /^[a-f0-9]{64}$/u, boundary)
     assert.match(recovered.stateEventHash, /^[a-f0-9]{64}$/u, boundary)
     assert.equal(fixture.events.length, 1, boundary)
+    assert.equal(fixture.events[0].stateAfter, 'RUN_WORK', boundary)
+    assert.equal(recovered.schemaVersion, 2, boundary)
+    assert.equal(recovered.preWorkStateEventHash, fixture.events[0].hash, boundary)
     assert.equal(fs.existsSync(path.join(
       fixture.root, 'work', 'captured-domain-admission.json')),
     true, boundary)
@@ -408,8 +516,8 @@ test('captured-domain admission resumes every pre-work crash window as one exact
   }
 })
 
-test('captured-domain admission recovery rejects rewritten bytes, receipts, and event forks', t => {
-  for (const corruption of ['admission-bytes', 'receipt', 'event-fork']) {
+test('captured-domain admission recovery rejects rewritten bytes, receipts, and event anchors', t => {
+  for (const corruption of ['admission-bytes', 'receipt', 'event-anchor']) {
     const fixture = capturedDomainAdmissionFixture(t)
     persistCapturedDomainAdmissionTransaction(fixture.input)
     if (corruption === 'admission-bytes') {
@@ -423,11 +531,7 @@ test('captured-domain admission recovery rejects rewritten bytes, receipts, and 
       parsed.receiptHash = 'f'.repeat(64)
       fs.writeFileSync(target, `${JSON.stringify(parsed, null, 2)}\n`)
     } else {
-      fixture.events.push({
-        ...structuredClone(fixture.events[0]),
-        sequence: 2,
-        hash: 'e'.repeat(64),
-      })
+      fixture.events[0].hash = 'e'.repeat(64)
     }
     assert.throws(
       () => persistCapturedDomainAdmissionTransaction(fixture.input),
@@ -437,7 +541,40 @@ test('captured-domain admission recovery rejects rewritten bytes, receipts, and 
   }
 })
 
-test('structurally unbound PASS gets one fresh-evidence frontier while FAIL keeps repair authority', () => {
+test('captured-domain admission binds the existing RUN_WORK transition without mutating shared state', t => {
+  const fixture = capturedDomainAdmissionRuntimeFixture(t)
+  const input = {
+    record: fixture.record,
+    stateStore: fixture.stateStore,
+    capability: fixture.capability,
+    runId: fixture.runId,
+    generation: fixture.generation,
+    admission: fixture.admission,
+  }
+  const initialState = fixture.stateStore.load()
+  const initialEvent = fixture.stateStore.eventLog.readAll().at(-1)
+  const persisted = persistCapturedDomainAdmissionTransaction(input)
+  const reopened = fixture.openState()
+  assert.equal(reopened.stateStore.load().state, 'RUN_WORK')
+  const replayed = persistCapturedDomainAdmissionTransaction({
+    ...input,
+    stateStore: reopened.stateStore,
+  })
+
+  assert.deepEqual(replayed, persisted)
+  assert.equal(reopened.stateStore.load().sequence, initialState.sequence)
+  assert.equal(persisted.preWorkState, 'RUN_WORK')
+  assert.equal(persisted.preWorkStateEventHash, initialState.lastEventHash)
+  assert.equal(persisted.preWorkStateEventSequence, initialState.sequence)
+  const admissionEvents = reopened.eventLog.readAll().filter(event =>
+    event.type === 'CAPTURED_DOMAIN_ADMISSION_RECORDED' && event.details &&
+    event.details.recoveryKind === 'CAPTURED_DOMAIN_ADMISSION_RECORDED')
+  assert.equal(admissionEvents.length, 0)
+  assert.equal(reopened.eventLog.readAll().at(-1).hash, initialEvent.hash)
+  assert.equal(reopened.eventLog.readAll().at(-1).details.stateEvent.toState, 'RUN_WORK')
+})
+
+test('structurally unbound or inconclusive evidence has no retry frontier while FAIL keeps repair authority', () => {
   const recovery = {
     nonAuthoritativeRetryId: 'independent-check-1-runtime-retry-1',
     failureRepairId: 'work-1-repair-1',
@@ -449,7 +586,7 @@ test('structurally unbound PASS gets one fresh-evidence frontier while FAIL keep
   ]) {
     assert.deepEqual(
       checkerRecoveryNextReady('independent-check-1', structurallyUnboundPass(event), recovery),
-      ['independent-check-1-runtime-retry-1'],
+      ['independent-check-2'],
       event,
     )
   }
@@ -468,7 +605,7 @@ test('structurally unbound PASS gets one fresh-evidence frontier while FAIL keep
     payload: {
       verificationObservationDisposition: { reportedAggregateCode: 'FAIL' },
     },
-  }, recovery), ['independent-check-1-runtime-retry-1'])
+  }, recovery), ['independent-check-2'])
   assert.deepEqual(checkerRecoveryNextReady('independent-check-1', {
     code: 'FAIL', cause: { event: 'ASSERTION_FAILED' },
   }, recovery), ['work-1-repair-1'])
@@ -550,7 +687,7 @@ test('same-class scratch PASS authorities pair only when their full methods and 
   )
 })
 
-test('required launch topology survives report correction, scratch FAIL repair, and repaired scratch confirmation', async t => {
+test('invalid checker report returns the candidate without consuming correction or repair launches', async t => {
   const targetPath = cleanRepository(t)
   const decision = readOnlyDecision('mutate', 1, 1)
   const topology = codexPhysicalExecutionReceipt(decision)
@@ -699,28 +836,24 @@ test('required launch topology survives report correction, scratch FAIL repair, 
   })
 
   assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.equal(outcome.terminalEnvelope.status, 'DONE_WITH_VERIFICATION_LIMITATIONS')
   assert.deepEqual(launches, [
     'work-1',
     'independent-check-1',
-    'independent-check-1-runtime-retry-1',
-    'independent-check-1-scratch-confirmation-1',
-    'work-1-repair-1',
-    'independent-check-1-repair-1',
-    'independent-check-1-repair-1-scratch-confirmation-1',
   ])
   assert.equal(transitions.some(item => item.eventId === 'CHECK_INCONCLUSIVE'), true)
-  assert.equal(transitions.some(item => item.eventId === 'IMPLEMENTATION_DEFECT'), true)
-  assert.equal(transitions.some(item => item.eventId === 'REPAIR_READY'), true)
+  assert.equal(transitions.some(item => item.eventId === 'IMPLEMENTATION_DEFECT'), false)
+  assert.equal(transitions.some(item => item.eventId === 'REPAIR_READY'), false)
   assert.equal(economicTarget.snapshot().launches,
     topology.analystLaunches + launches.length)
-  assert.equal(topology.requiredChildLaunches, 7,
-    'the frozen seven-launch graph remains the economic target')
+  assert.equal(topology.requiredChildLaunches, 9,
+    'the frozen bounded contingency graph remains the economic target')
   const schedulerMetrics = scheduler.getMetrics()
-  assert.equal(schedulerMetrics.counters.totalLaunches, 8)
-  assert.equal(schedulerMetrics.counters.requiredCompletionLaunches, 8)
-  assert.equal(schedulerMetrics.counters.requiredCompletionLaunchOverruns, 1)
-  assert.equal(schedulerMetrics.lanes.main.requiredCompletionLaunches, 8)
-  assert.equal(schedulerMetrics.lanes.main.requiredCompletionLaunchOverruns, 1)
+  assert.equal(schedulerMetrics.counters.totalLaunches, 3)
+  assert.equal(schedulerMetrics.counters.requiredCompletionLaunches, 3)
+  assert.equal(schedulerMetrics.counters.requiredCompletionLaunchOverruns, 0)
+  assert.equal(schedulerMetrics.lanes.main.requiredCompletionLaunches, 3)
+  assert.equal(schedulerMetrics.lanes.main.requiredCompletionLaunchOverruns, 0)
   assert.throws(() => economicTarget.recordLaunch(), error => error.code === 'BUDGET_EXHAUSTED')
 })
 
@@ -813,7 +946,7 @@ test('a mutate-classified zero-diff structured response always reaches independe
   assert.equal(transitions.some(item => item.eventId === 'ACCEPTANCE_GREEN'), true)
 })
 
-test('a structurally unbound checker PASS gets one fresh full check then releases the candidate with a limitation', async t => {
+test('structurally unbound checker evidence reaches every distinct seat before returning the candidate', async t => {
   for (const event of [
     'CHECK_OBSERVATION_INCOMPLETE',
     'CHECK_OBSERVATION_CONTRADICTION',
@@ -835,41 +968,32 @@ test('a structurally unbound checker PASS gets one fresh full check then release
         launch: async request => {
           launches.push(request.workItemId)
           if (request.workItemId === 'work-1') return structuredWorkerResult()
-          if (request.workItemId.includes('runtime-retry')) {
-            assert.equal(request.forkTurns, 'none')
-            assert.equal(request.recoveryContext, undefined)
-            assert.match(request.assignment, /fresh expected-result basis and fresh harness/u)
-          }
           return structurallyUnboundPass(event)
         },
         completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
       })
 
       assert.equal(outcome.outcome, 'DONE', `${event}/C${checkerCount}`)
-      assert.equal(outcome.terminalEnvelope.status,
-        'DONE_WITH_VERIFICATION_LIMITATIONS', event)
+      assert.equal(outcome.terminalEnvelope.status, 'DONE_WITH_VERIFICATION_LIMITATIONS', event)
       assert.deepEqual(launches, [
         'work-1',
         'independent-check-1',
-        'independent-check-1-runtime-retry-1',
-        ...(checkerCount === 2 ? [
-          'independent-check-2',
-          'independent-check-2-runtime-retry-1',
-        ] : []),
+        ...(checkerCount === 2 ? ['independent-check-2'] : []),
       ], event)
       assert.equal(transitions.some(item => item.eventId === 'IMPLEMENTATION_DEFECT'), false, event)
       const inconclusive = transitions.filter(item => item.eventId === 'CHECK_INCONCLUSIVE')
-      assert.equal(inconclusive.length, checkerCount, event)
-      assert.equal(inconclusive.every(item => item.details.nextReadyWorkIds[0]
-        .endsWith('-runtime-retry-1')), true, event)
+      assert.equal(inconclusive.length, 1, event)
+      assert.deepEqual(inconclusive[0].details.nextReadyWorkIds, [], event)
       assert.equal(inconclusive.every(item =>
         item.details.controllerReassessment.code === event), true, event)
+      assert.equal(transitions.some(item => item.eventId === 'CHECK_BECAME_CONCLUSIVE'), true, event)
       assert.equal(transitions.some(item => item.eventId === 'ACCEPTANCE_GREEN'), true, event)
+      assert.equal(outcome.checkHashes.length, 1, event)
     }
   }
 })
 
-test('a distinct checker FAIL still repairs and freshly rechecks after an unbound PASS', async t => {
+test('an unbound first checker yields to a distinct authenticated checker and product repair', async t => {
   const targetPath = cleanRepository(t)
   const decision = readOnlyDecision('mutate', 1, 2)
   const failure = {
@@ -924,16 +1048,44 @@ test('a distinct checker FAIL still repairs and freshly rechecks after an unboun
   assert.deepEqual(launches, [
     'work-1',
     'independent-check-1',
-    'independent-check-1-runtime-retry-1',
     'independent-check-2',
     'work-1-repair-1',
     'independent-check-1-repair-1',
     'independent-check-2-repair-1',
   ])
-  assert.equal(launches.filter(id => id.includes('runtime-retry')).length, 1)
+  assert.equal(launches.filter(id => id.includes('runtime-retry')).length, 0)
 })
 
-test('resume upgrades a durable f1de11a same-seat retry to fresh evidence and still runs a distinct checker', async t => {
+test('an unbound aggregate PASS yields to a distinct authenticated PASS with an explicit limitation', async t => {
+  const targetPath = cleanRepository(t)
+  const decision = readOnlyDecision('inspect', 1, 2)
+  const launches = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath,
+    gitEnvironment: () => process.env,
+    transition: async () => {},
+    harnessAttestation: () => ({ repoHash: H, buildHash: H, oracleHash: H }),
+    persistStructuredFinalResponse: structuredResponsePersistence(t),
+  })({
+    route: 'DIRECT', decision,
+    launch: async request => {
+      launches.push(request.workItemId)
+      if (request.workItemId === 'work-1') return structuredWorkerResult()
+      if (request.workItemId === 'independent-check-1') {
+        return structurallyUnboundPass('CHECK_OBSERVATION_CONTRADICTION')
+      }
+      assert.equal(request.workItemId, 'independent-check-2')
+      return passingCheckerResult(request)
+    },
+    completeRetainedLease: () => {}, resumeAdoptedLaunches: async () => ({}), resumeState: null,
+  })
+
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.equal(outcome.terminalEnvelope.status, 'DONE_WITH_VERIFICATION_LIMITATIONS')
+  assert.deepEqual(launches, ['work-1', 'independent-check-1', 'independent-check-2'])
+})
+
+test('resume retires a durable f1de11a same-seat retry and still runs a distinct checker', async t => {
   const targetPath = cleanRepository(t)
   const decision = readOnlyDecision('inspect', 1, 2)
   const workerResult = structuredWorkerResult()
@@ -986,11 +1138,6 @@ test('resume upgrades a durable f1de11a same-seat retry to fresh evidence and st
     route: 'DIRECT', decision,
     launch: async request => {
       launches.push(request.workItemId)
-      if (request.workItemId === 'independent-check-1-runtime-retry-1') {
-        assert.equal(request.forkTurns, 'none')
-        assert.equal(request.recoveryContext, undefined)
-        return structurallyUnboundPass('CHECK_OBSERVATION_CONTRADICTION')
-      }
       assert.equal(request.workItemId, 'independent-check-2')
       return passingCheckerResult(request)
     },
@@ -1018,10 +1165,7 @@ test('resume upgrades a durable f1de11a same-seat retry to fresh evidence and st
   })
   assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
   assert.equal(outcome.terminalEnvelope.status, 'DONE_WITH_VERIFICATION_LIMITATIONS')
-  assert.deepEqual(launches, [
-    'independent-check-1-runtime-retry-1',
-    'independent-check-2',
-  ])
+  assert.deepEqual(launches, ['independent-check-2'])
 })
 
 test('a mutate-classified zero-diff response gets one checker-owned repair and a fresh repaired check', async t => {
@@ -1155,7 +1299,7 @@ test('W2/W3 aggregate zero-diff responses get one union-resource repair and fres
   }
 })
 
-test('W2/W3 malformed checker correction can return FAIL, trigger union repair, and re-run all C1/C2 seats', async t => {
+test('W2/W3 malformed checker output exhausts distinct seats without correction or repair', async t => {
   for (const workerCount of [2, 3]) {
     for (const checkerCount of [1, 2]) {
       const targetPath = cleanRepository(t)
@@ -1229,21 +1373,19 @@ test('W2/W3 malformed checker correction can return FAIL, trigger union repair, 
       })
 
       assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+      assert.equal(outcome.terminalEnvelope.status, 'DONE_WITH_VERIFICATION_LIMITATIONS')
       assert.deepEqual(launches, [
         ...Array.from({ length: workerCount }, (_, index) => `work-${index + 1}`),
         'independent-check-1',
-        'independent-check-1-runtime-retry-1',
-        ...Array.from({ length: checkerCount - 1 }, (_, index) => `independent-check-${index + 2}`),
-        'work-1-repair-1',
-        ...Array.from({ length: checkerCount }, (_, index) =>
-          `independent-check-${index + 1}-repair-1`),
+        ...(checkerCount === 2 ? ['independent-check-2'] : []),
       ])
-      assert.equal(launches.filter(id => id.includes('runtime-retry')).length, 1)
-      assert.equal(launches.filter(id => id === 'work-1-repair-1').length, 1)
+      assert.equal(launches.filter(id => id.includes('runtime-retry')).length, 0)
+      assert.equal(launches.filter(id => id === 'work-1-repair-1').length, 0)
       assert.equal(transitions.some(item => item.eventId === 'CHECK_INCONCLUSIVE'), true)
       assert.equal(transitions.some(item => item.eventId === 'CHECK_BECAME_CONCLUSIVE'), true)
-      assert.equal(transitions.some(item => item.eventId === 'IMPLEMENTATION_DEFECT'), true)
-      assert.equal(transitions.some(item => item.eventId === 'REPAIR_READY'), true)
+      assert.equal(transitions.some(item => item.eventId === 'ACCEPTANCE_GREEN'), true)
+      assert.equal(transitions.some(item => item.eventId === 'IMPLEMENTATION_DEFECT'), false)
+      assert.equal(transitions.some(item => item.eventId === 'REPAIR_READY'), false)
     }
   }
 })
@@ -1278,7 +1420,7 @@ test('one empty worker plus one changed worker checks the aggregate artifact wit
   assert.deepEqual(launches, ['work-1', 'work-2', 'independent-check-1'])
 })
 
-test('a fresh checker FAIL launches repair-2 and stops only when repair-2 makes no usable change', async t => {
+test('a fresh checker FAIL gets one aggregate repair and then returns the concrete product failure', async t => {
   const targetPath = cleanRepository(t)
   const decision = readOnlyDecision('mutate', 2)
   const receiptRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-response-one-repair-'))
@@ -1343,13 +1485,15 @@ test('a fresh checker FAIL launches repair-2 and stops only when repair-2 makes 
   assert.equal(outcome.outcome, 'FAILED', JSON.stringify(outcome))
   assert.equal(outcome.terminalEnvelope.cause.reason,
     'defect from independent-check-1-repair-1')
+  assert.equal(outcome.deliverables.some(deliverable =>
+    deliverable.path === path.join(targetPath, 'subject.txt')), true,
+  'the concrete model/product failure cannot make its usable candidate disappear')
   assert.deepEqual(launches, [
     'work-1', 'work-2', 'independent-check-1',
     'work-1-repair-1', 'independent-check-1-repair-1',
-    'work-1-repair-2',
   ])
   assert.equal(launches.filter(id => id === 'work-1-repair-1').length, 1)
-  assert.equal(launches.filter(id => id === 'work-1-repair-2').length, 1)
+  assert.equal(launches.filter(id => id === 'work-1-repair-2').length, 0)
   assert.equal(fs.readFileSync(path.join(targetPath, 'subject.txt'), 'utf8'),
     'bounded evidence\none repair\n')
 })

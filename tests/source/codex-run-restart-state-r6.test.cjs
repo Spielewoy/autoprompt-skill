@@ -90,7 +90,7 @@ test('RUN-023/026 JSONL is accumulated once and exit-zero missing results recons
   }
   consume({ type: 'thread.started', thread_id: 'thread-1' })
   consume({ type: 'turn.completed', usage: {
-    input_tokens: 3, cached_input_tokens: 2, output_tokens: 3, reasoning_tokens: 4,
+    input_tokens: 3, cached_input_tokens: 2, output_tokens: 4, reasoning_tokens: 4,
   } })
   const snapshot = accumulator.snapshot()
   assert.equal(logicalEventCount, 10_002)
@@ -101,7 +101,7 @@ test('RUN-023/026 JSONL is accumulated once and exit-zero missing results recons
   assert.deepEqual(snapshot.events[0], { type: 'item.started', index: 9_746 })
   assert.deepEqual(snapshot.events.at(-2), { type: 'thread.started', thread_id: 'thread-1' })
   assert.equal(snapshot.sessionId, 'thread-1')
-  assert.deepEqual(snapshot.usage, { noncachedInput: 1, cachedInput: 2, output: 3, reasoning: 4 })
+  assert.deepEqual(snapshot.usage, { noncachedInput: 1, cachedInput: 2, output: 4, reasoning: 4 })
   const reconstructed = reconstructTypedExitZeroResult({
     logicalRole: 'worker', physicalRole: 'autoprompt.v2.worker', runId: 'run-12345678',
     workItemId: 'work-1', findingIds: ['AP-RUN-026'], candidateHash: null,

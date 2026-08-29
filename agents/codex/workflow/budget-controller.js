@@ -362,7 +362,7 @@ class BudgetController {
     return canonicalize(this.state.sessions[sessionId])
   }
 
-  endSession(sessionId, details = {}) {
+  _settleSession(sessionId, details = {}, options = {}) {
     const session = this.state.sessions[sessionId]
     if (!session || session.status !== 'RUNNING') fail('SESSION_RECORD_INVALID', 'session is missing or already terminal')
     const terminalStatuses = ['DONE', 'PARTIAL', 'BLOCKED', 'CANCELLED', 'FAILED', 'LOST']
@@ -381,7 +381,7 @@ class BudgetController {
       evidenceHashes: Object.freeze([...new Set(hashes)].sort()),
     }
     terminal.recordHash = sha256(stableStringify(terminal))
-    if (this.terminalSessionWriter) {
+    if (options.persist !== false && this.terminalSessionWriter) {
       const persisted = this.terminalSessionWriter(canonicalize(terminal))
       if (!persisted || persisted.recordHash !== terminal.recordHash ||
           stableStringify(persisted) !== stableStringify(terminal)) {
@@ -390,6 +390,27 @@ class BudgetController {
     }
     this.state.sessions[sessionId] = Object.freeze(terminal)
     return canonicalize(terminal)
+  }
+
+  endSession(sessionId, details = {}) {
+    return this._settleSession(sessionId, details, { persist: true })
+  }
+
+  settleSessionLocally(sessionId, details = {}, options = {}) {
+    const failures = options.persistenceFailures
+    if (!Array.isArray(failures) || failures.length !== 2 ||
+        failures.some((failure, index) => !failure || failure.attempt !== index + 1 ||
+          !['RUN_RECORD_WRITE_UNAVAILABLE', 'SESSION_TERMINAL_WRITE_UNAVAILABLE']
+            .includes(failure.code))) {
+      fail(
+        'SESSION_TERMINAL_PERSIST_FAILED',
+        'local session settlement requires two explicit write-availability failures',
+      )
+    }
+    // This closes only the in-memory accounting session after both durable
+    // writes failed. It grants no mutation, acceptance, recovery, or terminal
+    // authority; callers must surface the persistence limitation separately.
+    return this._settleSession(sessionId, details, { persist: false })
   }
 
   startPhase(name) {

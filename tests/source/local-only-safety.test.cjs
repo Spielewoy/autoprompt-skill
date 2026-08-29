@@ -233,6 +233,16 @@ function byId(result, id) {
   return result.json.checks.find(item => item.id === id)
 }
 
+function detachHead(context) {
+  git(context, ['config', '--local', 'user.name', 'Local Safety Test'])
+  git(context, ['config', '--local', 'user.email', 'local-safety@example.invalid'])
+  git(context, ['commit', '--quiet', '--allow-empty', '-m', 'detached HEAD fixture'])
+  const oid = git(context, ['rev-parse', '--verify', 'HEAD']).stdout.trim()
+  git(context, ['checkout', '--quiet', '--detach', oid])
+  assert.equal(git(context, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { allowFailure: true }).status, 1)
+  return oid
+}
+
 test('repair installs a complete local-only barrier and check mode reports structured passes', t => {
   const context = makeRepo(t)
   git(context, ['remote', 'add', 'origin', 'https://github.com/example/autoprompt.git'])
@@ -293,6 +303,85 @@ test('repair installs a complete local-only barrier and check mode reports struc
   const hookProbe = git(context, ['hook', 'run', 'pre-push'], { allowFailure: true })
   assert.equal(hookProbe.status, 1)
   assert.match(hookProbe.stderr, /Push disabled/)
+})
+
+test('an explicit empty expected branch is an exact detached-HEAD contract', async t => {
+  await t.test('detached repair passes without moving HEAD or fabricating a branch', () => {
+    const context = makeRepo(t)
+    const oid = detachHead(context)
+    git(context, ['remote', 'add', 'origin', 'https://github.com/example/autoprompt.git'])
+    git(context, ['config', '--local', `branch.${EXPECTED_BRANCH}.remote`, 'origin'])
+    git(context, ['config', '--local', `branch.${EXPECTED_BRANCH}.merge`, 'refs/heads/main'])
+    const branchesBefore = git(context, [
+      'for-each-ref', '--format=%(refname)', 'refs/heads',
+    ]).stdout
+
+    const repaired = invoke(context, '', ['--repair'])
+    assert.equal(repaired.status, EXIT.SAFE, repaired.stdout)
+    assert.equal(repaired.json.expectedBranch, '')
+    assert.deepEqual(repaired.json.expectedHead, { branch: null, state: 'detached' })
+    assert.deepEqual(repaired.json.actualHead, { branch: null, oid, state: 'detached' })
+    assert.equal(byId(repaired, 'expected_branch').status, 'pass')
+    assert.match(byId(repaired, 'expected_branch').summary, /detached as explicitly required/)
+    assert.equal(git(context, ['rev-parse', '--verify', 'HEAD']).stdout.trim(), oid)
+    assert.equal(git(context, ['branch', '--show-current']).stdout.trim(), '')
+    assert.equal(git(context, ['for-each-ref', '--format=%(refname)', 'refs/heads']).stdout, branchesBefore)
+    assert.equal(
+      git(context, ['config', '--local', '--get', `branch.${EXPECTED_BRANCH}.remote`]).stdout.trim(),
+      'origin',
+    )
+    assert.equal(git(context, ['config', '--local', '--get', 'push.default']).stdout.trim(), 'nothing')
+    assert.equal(
+      git(context, ['config', '--local', '--get', 'remote.origin.pushurl']).stdout.trim(),
+      discoverRepository(context.repo).rejectTarget,
+    )
+
+    const textResult = run(process.execPath, [
+      CHECKER,
+      '--repo', context.repo,
+      '--expected-branch', '',
+      '--enforcement-proof', context.proofPath,
+    ], { env: boundaryEnvironment(context) })
+    assert.equal(textResult.status, EXIT.SAFE, textResult.stdout)
+    assert.match(textResult.stdout, new RegExp(`HEAD: detached HEAD at ${oid} \\(expected detached HEAD\\)`))
+
+    git(context, ['config', '--local', '--replace-all', 'remote.origin.pushurl', 'https://github.com/example/unsafe.git'])
+    git(context, ['config', '--local', 'push.default', 'current'])
+    const tampered = invoke(context, '')
+    assert.equal(tampered.status, EXIT.UNSAFE)
+    assert.equal(byId(tampered, 'expected_branch').status, 'pass')
+    assert.equal(byId(tampered, 'remote_push_targets').status, 'fail')
+    assert.equal(byId(tampered, 'push_default_nothing').status, 'fail')
+    assert.equal(tampered.json.networkContactAttempted, false)
+  })
+
+  await t.test('an attached branch is a mismatch and repair makes zero changes', () => {
+    const context = makeRepo(t)
+    const gitDir = git(context, ['rev-parse', '--absolute-git-dir']).stdout.trim()
+    const configPath = path.join(gitDir, 'config')
+    const configBefore = fs.readFileSync(configPath)
+
+    const result = invoke(context, '', ['--repair'])
+    assert.equal(result.status, EXIT.REPAIR_INCOMPLETE)
+    assert.equal(byId(result, 'expected_branch').status, 'fail')
+    assert.match(byId(result, 'expected_branch').summary, /Expected detached HEAD, found branch/)
+    assert.deepEqual(result.json.expectedHead, { branch: null, state: 'detached' })
+    assert.equal(result.json.actualHead.state, 'branch')
+    assert.equal(result.json.actualHead.branch, EXPECTED_BRANCH)
+    assert.deepEqual(result.json.repairs.changes, [])
+    assert.match(result.json.repairs.refusals[0], /never repaired automatically/)
+    assert.deepEqual(fs.readFileSync(configPath), configBefore)
+    assert.equal(git(context, ['branch', '--show-current']).stdout.trim(), EXPECTED_BRANCH)
+  })
+
+  await t.test('a named branch remains an exact named-branch contract', () => {
+    const context = makeRepo(t)
+    const result = invoke(context, EXPECTED_BRANCH, ['--repair'])
+    assert.equal(result.status, EXIT.SAFE, result.stdout)
+    assert.deepEqual(result.json.expectedHead, { branch: EXPECTED_BRANCH, state: 'branch' })
+    assert.equal(result.json.actualHead.branch, EXPECTED_BRANCH)
+    assert.equal(byId(result, 'expected_branch').status, 'pass')
+  })
 })
 
 test('check and repair derive unique remotes from parsed config without invoking git remote', t => {
@@ -713,7 +802,10 @@ test('usage and non-repository errors have distinct structured exit codes', t =>
   const isolated = makeEnvironment(path.join(sandbox, 'home'))
   const usage = run(process.execPath, [CHECKER, '--json'], { env: isolated.env })
   assert.equal(usage.status, EXIT.USAGE)
-  assert.equal(JSON.parse(usage.stdout).exitCode, EXIT.USAGE)
+  const usageJson = JSON.parse(usage.stdout)
+  assert.equal(usageJson.exitCode, EXIT.USAGE)
+  assert.equal(usageJson.error.type, 'UsageError')
+  assert.match(usageJson.error.message, /--expected-branch is required/)
 
   const operational = run(process.execPath, [
     CHECKER, '--repo', sandbox, '--expected-branch', EXPECTED_BRANCH, '--json',

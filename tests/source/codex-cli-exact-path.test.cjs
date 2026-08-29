@@ -245,8 +245,8 @@ test('quoted and split missions preserve shared topology while Codex normal exec
       const physical = codexPhysicalExecutionReceipt(decision)
       assert.equal(physical.analystLaunches, 0)
       assert.equal(physical.basePhysicalLaunches, 2)
-      assert.equal(physical.requiredChildLaunches, 6,
-        'worker + checker normal path plus one transport, report, product, and fresh-check contingency')
+      assert.equal(physical.requiredChildLaunches, 8,
+        'worker + checker normal path plus bounded transport, scratch, product-repair, and fresh-check contingencies')
     }
   }
 })

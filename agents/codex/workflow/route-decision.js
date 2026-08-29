@@ -134,41 +134,73 @@ function defaultVerificationObligations(checks = []) {
   }))
 }
 
+function deterministicUniqueId(value, used) {
+  const base = String(value)
+  if (!used.has(base)) {
+    used.add(base)
+    return base
+  }
+  let ordinal = 2
+  while (used.has(`${base}-${ordinal}`)) ordinal += 1
+  const unique = `${base}-${ordinal}`
+  used.add(unique)
+  return unique
+}
+
+function completeActivationMatrix(kind, cases) {
+  const phases = new Set(cases.map(item => item.phase))
+  const polarities = new Set(cases.map(item => item.polarity))
+  if (!polarities.has('must-hold') || !polarities.has('must-not-hold')) return false
+  if (kind === 'activation') {
+    return ['inactive', 'boundary', 'active'].every(phase => phases.has(phase))
+  }
+  return ['inactive', 'boundary', 'intermediate', 'active'].every(phase => phases.has(phase)) &&
+    cases.filter(item => item.phase === 'boundary').length >= 2
+}
+
 function canonicalVerificationObligations(supplied, fallbackChecks = []) {
-  const source = Array.isArray(supplied) && supplied.length > 0
-    ? supplied : defaultVerificationObligations(fallbackChecks)
-  if (source.length === 0) return null
+  const providerSupplied = Array.isArray(supplied) && supplied.length > 0
+  const source = providerSupplied ? supplied : defaultVerificationObligations(fallbackChecks)
   const obligationIds = new Set()
   const canonical = []
   for (const obligation of source) {
-    if (!isObject(obligation) || !concrete(obligation.id) || obligationIds.has(obligation.id) ||
+    // Provider structured output is useful semantic evidence even when one
+    // sibling row is malformed. Preserve every independently well-shaped row
+    // instead of replacing the entire matrix with one generic fallback.
+    if (!isObject(obligation) || !concrete(obligation.id) ||
         !VERIFICATION_OBLIGATION_KINDS.has(obligation.kind) || !concrete(obligation.statement) ||
-        !Array.isArray(obligation.cases) || obligation.cases.length === 0) return null
-    obligationIds.add(obligation.id)
+        !Array.isArray(obligation.cases)) continue
     const caseIds = new Set()
     const cases = []
     for (const item of obligation.cases) {
-      if (!isObject(item) || !concrete(item.id) || caseIds.has(item.id) ||
+      if (!isObject(item) || !concrete(item.id) ||
           !VERIFICATION_PHASES.has(item.phase) || !VERIFICATION_POLARITIES.has(item.polarity) ||
-          !concrete(item.precondition) || !concrete(item.expectedObservation)) return null
-      caseIds.add(item.id)
+          !concrete(item.precondition) || !concrete(item.expectedObservation)) continue
       cases.push({
-        id: item.id, phase: item.phase, polarity: item.polarity,
+        id: deterministicUniqueId(item.id, caseIds), phase: item.phase, polarity: item.polarity,
         precondition: item.precondition, expectedObservation: item.expectedObservation,
       })
     }
-    const phases = new Set(cases.map(item => item.phase))
-    const polarities = new Set(cases.map(item => item.polarity))
-    const phasedActivation = obligation.kind === 'activation' || obligation.kind === 'ordered-activation'
-    if (phasedActivation && (!polarities.has('must-hold') || !polarities.has('must-not-hold')) ||
-        obligation.kind === 'activation' &&
-          !['inactive', 'boundary', 'active'].every(phase => phases.has(phase)) ||
-        obligation.kind === 'ordered-activation' &&
-          (!['inactive', 'boundary', 'intermediate', 'active'].every(phase => phases.has(phase)) ||
-           cases.filter(item => item.phase === 'boundary').length < 2)) return null
-    canonical.push({ id: obligation.id, kind: obligation.kind, statement: obligation.statement, cases })
+    if (cases.length === 0) continue
+    const activationLike = obligation.kind === 'activation' || obligation.kind === 'ordered-activation'
+    // Missing activation witnesses mean the provider has described useful
+    // invariants, but has not proved an activation topology. Retain those
+    // exact cases as invariants rather than discarding them or inventing the
+    // missing temporal semantics.
+    const kind = activationLike && !completeActivationMatrix(obligation.kind, cases)
+      ? 'invariant' : obligation.kind
+    canonical.push({
+      id: deterministicUniqueId(obligation.id, obligationIds),
+      kind,
+      statement: obligation.statement,
+      cases,
+    })
   }
-  return canonical
+  if (canonical.length > 0) return canonical
+  if (providerSupplied) {
+    return canonicalVerificationObligations(null, fallbackChecks)
+  }
+  return null
 }
 
 function verificationObligationsForRequest(_requestedResult, supplied, fallbackChecks = []) {
@@ -619,6 +651,7 @@ function validateRecommendation(recommendation) {
     recommendation.verificationObligations,
   )
   if (!canonicalRecommendationVerification || !normalizedRecommendationVerification ||
+      !sameValue(recommendation.verificationObligations, canonicalRecommendationVerification) ||
       !sameValue(canonicalRecommendationVerification, normalizedRecommendationVerification)) {
     errors.push('verificationObligations must preserve canonical explicitly typed acceptance cases')
   }
@@ -1035,15 +1068,16 @@ function completionLaunchRequirement(topology, options = {}) {
   const additionalGateLaunches = options.additionalGateLaunches === undefined
     ? 0 : options.additionalGateLaunches
   if (!Number.isSafeInteger(additionalGateLaunches) || additionalGateLaunches < 0) return null
-  const { finalCheckers } = topology.counts
-  // B is the frozen initial topology. The first production worker may need one
-  // provider-transport retry without consuming the later checker-driven
-  // correction path. One bounded report correction may then produce concrete
-  // repair evidence; the resulting product/union repair is followed by all C
-  // fresh checker seats: B + T1 + R1 + P1 + C = B + 3 + C. Separate
-  // deterministic gates are counted explicitly and never hidden in a
-  // route-wide padded ceiling.
-  const contingency = 3 + finalCheckers
+  const { workers, finalCheckers } = topology.counts
+  // B is the frozen initial topology. Every admitted production worker may
+  // need one provider-transport retry. The single aggregate product repair
+  // owns an independent transport retry and is followed by all C fresh
+  // checker seats. A C1 topology may require one scratch PASS confirmation in
+  // each generation. Report-shape correction is controller-local and consumes
+  // no provider launch. Separate deterministic gates are counted explicitly.
+  const transportRetries = workers + 1
+  const scratchPassConfirmations = finalCheckers === 1 ? 2 : 0
+  const contingency = transportRetries + 1 + finalCheckers + scratchPassConfirmations
   // Historical ROADMAP decisions counted an author, plan checker, and mission
   // coordinator in childSessions. Codex now projects that planning state in
   // the controller, so neither current nor legacy intake may turn those three
@@ -1454,6 +1488,7 @@ function validateRouteDecision(decision) {
     decision.verificationObligations,
   )
   if (!canonicalVerification || !requiredVerificationUnion ||
+      !sameValue(decision.verificationObligations, canonicalVerification) ||
       !sameValue(canonicalVerification, requiredVerificationUnion)) {
     errors.push('verificationObligations must preserve the canonical provider-authored typed acceptance matrix')
   }
@@ -1549,9 +1584,6 @@ function validateRouteDecision(decision) {
       for (const field of ['analystFactsFingerprint', 'l0FactsFingerprint', 'analystClassifierFingerprint', 'l0ClassifierFingerprint']) {
         if (!sha256(disagreement[field])) errors.push('analystDisagreement.'+field+' must be SHA-256')
       }
-      const changed = disagreement.analystFactsFingerprint !== disagreement.l0FactsFingerprint ||
-        disagreement.analystClassifierFingerprint !== disagreement.l0ClassifierFingerprint
-      if (!changed) errors.push('wrong analyst correction requires a changed fact or classifier fingerprint')
       if (disagreement.l0FactsFingerprint !== decision.routeFactsFingerprint ||
           disagreement.l0ClassifierFingerprint !== decision.classifierFingerprint) errors.push('analystDisagreement must bind the final facts and classifier')
     }
@@ -1937,13 +1969,6 @@ function compileAutomaticRouteDecision(input = {}) {
     throw error
   }
   const route = classified.route
-  if (recommendation.recommendedRoute !== route) {
-    const error = new Error(
-      `route analyst recommendation ${recommendation.recommendedRoute} contradicts its deterministic fact classification ${route}`,
-    )
-    error.code = 'ROUTE_DECISION_INVALID'
-    throw error
-  }
   const workerCount = automaticWorkerCount(route, recommendation, proposal)
   const ownership = facts.mutableResources.map((resource, index) => ({
     kind: resource.kind,

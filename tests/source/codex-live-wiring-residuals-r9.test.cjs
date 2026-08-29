@@ -255,7 +255,7 @@ test('TRACE-021 failure terminal persistence retries and preserves the primary e
     monotonicMs: () => 0, wallNowMs: () => 0, wallClock: () => '2026-01-01T00:00:00.000Z', bootId: null,
     terminalSessionWriter() {
       attempts += 1
-      throw Object.assign(new Error('disk unavailable'), { code: 'RUN_RECORD_FAILURE' })
+      throw Object.assign(new Error('disk unavailable'), { code: 'RUN_RECORD_WRITE_UNAVAILABLE' })
     },
   })
   controller.startSession('failed-session-r9', {

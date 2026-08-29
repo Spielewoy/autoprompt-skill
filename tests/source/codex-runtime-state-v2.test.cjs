@@ -371,6 +371,48 @@ test('planning inconclusive retry binds planHash without replacing the product c
     ['mission-coordination'])
 })
 
+test('verification-limited candidate delivery closes one exact inconclusive state before FINAL_CHECK', t => {
+  const { capability, store, eventLog } = stateHarness(t)
+  const budgetController = { snapshot: () => null }
+  const candidateHash = digest('verification-limited-candidate')
+  const checkerResultHash = digest('verification-limited-checker-result')
+  const transitionProduction = (eventId, nextState, details) =>
+    applyProductionRuntimeTransition({ stateStore: store, capability, budgetController }, {
+      eventId, nextState, details,
+    })
+
+  advanceToWork(store)
+  transition(store, 'CHECK_WORK', 'freeze the exact candidate for checking', 'ALL_WORK_JOINED')
+  transitionProduction('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
+    candidateHash,
+    checkerId: 'independent-check-1',
+    checkerResultHash,
+    retryAttempt: 0,
+    controllerReason: 'CHECK_REPORT_INVALID',
+    nextReadyWorkIds: [],
+  })
+  transitionProduction('CHECK_BECAME_CONCLUSIVE', 'CHECK_WORK', {
+    candidateHash,
+    checkerId: 'independent-check-1',
+    checkerResultHash,
+    terminalDisposition: 'DONE_WITH_VERIFICATION_LIMITATIONS',
+    nextReadyWorkIds: [],
+  })
+  transitionProduction('ACCEPTANCE_GREEN', 'FINAL_CHECK', {
+    candidateHash,
+    checkHashes: [checkerResultHash],
+    verificationLimited: true,
+    controllerReason: 'CHECK_REPORT_INVALID',
+  })
+
+  const state = store.load()
+  assert.equal(state.state, 'FINAL_CHECK')
+  assert.equal(state.candidateHash, candidateHash)
+  assert.equal(Object.hasOwn(state.retryState, 'inconclusiveChecker'), false)
+  assert.deepEqual(eventLog.readAll().slice(-3).map(event =>
+    event.details.stateEvent.transitionId), ['T033', 'T034', 'T052'])
+})
+
 test('corrected ROADMAP plan marker binds the rejected and replacement plans without consuming the product candidate', t => {
   const harness = stateHarness(t)
   const { capability, store } = harness

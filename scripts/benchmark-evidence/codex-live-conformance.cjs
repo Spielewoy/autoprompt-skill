@@ -29,7 +29,11 @@ const OBSERVATION_SCHEMA = 'codex-live-conformance-observation.v1'
 const DRY_RUN_SCHEMA = 'codex-live-conformance-plan.v1'
 const DEFAULT_TIMEOUT_MS = 240_000
 const MAX_TIMEOUT_MS = 300_000
-const MAX_TOTAL_TOKENS = 250_000
+// The provider proof intentionally exercises four bounded model turns (root, worker, same-child
+// resume, independent checker). This is an external conformance ceiling, not an Autoprompt task
+// budget; current Codex accounting charges the repeated tool-turn context to each turn.
+const MAX_TOTAL_TOKENS = 500_000
+const SUPPORTED_PROVIDER_SESSION_VERSIONS = new Set(['0.149.0', '0.149.1'])
 const EXTERNAL_HELPER_TIMEOUT_MS = 10_000
 const CHILD_KILL_VERIFY_MS = 250
 const CHILD_SETTLEMENT_TIMEOUT_MS = 5_000
@@ -37,6 +41,11 @@ const HASH_PATTERN = /^[a-f0-9]{64}$/
 const FROZEN_PROVIDER_ADMISSION_SHA256 = '70921cc6f09b742f31766a915d8a9ea30aaa267576e276b6e6081e6db74dd222'
 const FROZEN_PROVIDER_CONTRACT_CORE_SHA256 = '5750d35c00d98503e6dbb11459ab4c1baba22ccf5dd56da41e3cdda14fca3745'
 const CHECKER_HASH_COMMAND = 'node conformance-sha256.cjs conformance-result.txt'
+const DISCOVERY_COMMAND = 'node conformance-discovery-probe.cjs isolated-during'
+const DISCOVERY_RED_COMMAND = `${DISCOVERY_COMMAND} && node conformance-check.cjs`
+const WORKER_ABSENCE_PROBE_COMMAND = 'xxd -g 1 conformance-result.txt 2>/dev/null || true'
+const WORKER_MISSING_PROBE_COMMAND = 'if [ -e conformance-result.txt ]; then ' +
+  'wc -c conformance-result.txt; else echo MISSING; fi'
 const SOURCE_ROOTS = Object.freeze([
   'agents',
   'assets',
@@ -1239,21 +1248,51 @@ function installIsolatedPayload(layout) {
   ], { cwd: layout.artifact, env: { ...process.env, CODEX_HOME: layout.activationHome } })
   const manifestPath = path.join(layout.artifact, 'agents', 'manifests', 'codex-runtime.json')
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
-  const skillRoot = path.join(
+  const bundledRoot = path.join(
     layout.activationHome, '.autoprompt-private', 'bundles', manifest.payloadGeneration,
-    'skills', 'autoprompt',
   )
+  const bundledSkillRoot = path.join(bundledRoot, 'skills', 'autoprompt')
+  // Production activation gives Codex a fresh, owner-only CODEX_HOME and
+  // projects the private payload into that home's normal discovery root. The
+  // package installer leaves the ordinary launcher shim there, so replace the
+  // shim with the already-verified private bundle to exercise the same shape.
+  fs.unlinkSync(path.join(destination, 'SKILL.md'))
+  copyTree(bundledSkillRoot, destination)
+  const externalDestinations = new Set()
+  for (const dependency of manifest.externalDependencies || []) {
+    const relative = String(dependency?.destination || '').replaceAll('\\', '/')
+    if (!relative || path.isAbsolute(relative) || relative.split('/').some(part => part === '..') ||
+        externalDestinations.has(relative) || !HASH_PATTERN.test(dependency?.sha256 || '')) {
+      fail('PRIVATE_PAYLOAD_INVALID', 'private payload has an invalid external dependency')
+    }
+    externalDestinations.add(relative)
+    const source = path.join(bundledRoot, ...relative.split('/'))
+    const target = path.join(layout.activationHome, ...relative.split('/'))
+    assertWithin(bundledRoot, source, 'bundled external dependency')
+    assertWithin(layout.activationHome, target, 'activation external dependency')
+    assertRegularUnlinked(source, 'bundled external dependency')
+    if (sha256(fs.readFileSync(source)) !== dependency.sha256) {
+      fail('PRIVATE_PAYLOAD_INVALID', 'private payload external dependency changed')
+    }
+    copyTree(source, target, relative)
+  }
+  const skillRoot = destination
   const agentsRoot = path.join(skillRoot, 'agents-runtime')
   const profilePath = path.join(layout.activationHome, 'autoprompt.config.toml')
   fs.mkdirSync(agentsRoot, { recursive: true, mode: 0o700 })
   const roleBindings = resolveRequiredProviderRoles(manifest, {
     requiredLogicalRoles: manifest.logicalRoles,
   })
+  const { projectPhysicalAgentRoleConfig } = require(path.join(
+    layout.artifact, 'scripts', 'codex-configure.cjs',
+  ))
   for (const logicalRole of manifest.logicalRoles) {
     const physicalRole = roleBindings[logicalRole]
     const source = path.join(skillRoot, 'agents', `${logicalRole}.toml`)
     const target = path.join(agentsRoot, `${physicalRole}.toml`)
-    writePrivateFile(target, fs.readFileSync(source))
+    writePrivateFile(target, projectPhysicalAgentRoleConfig(
+      fs.readFileSync(source), logicalRole, physicalRole,
+    ))
   }
   writePrivateFile(profilePath, renderIsolatedProfile(profilePath, agentsRoot, manifest))
   const configPath = path.join(layout.activationHome, 'config.toml')
@@ -1264,7 +1303,14 @@ function installIsolatedPayload(layout) {
     'enabled = true',
     '',
   ].join('\n'))
-  return Object.freeze({ agentsRoot, configPath, manifest, manifestPath, profilePath, skillRoot })
+  const expectedSkillFiles = Object.freeze(listFiles(skillRoot))
+  const expectedTopLevelSkillFiles = Object.freeze(
+    expectedSkillFiles.filter(file => !file.includes('/')),
+  )
+  return Object.freeze({
+    agentsRoot, configPath, expectedSkillFiles, expectedTopLevelSkillFiles,
+    manifest, manifestPath, profilePath, skillRoot,
+  })
 }
 
 function installOrdinaryDiscoveryShim(layout) {
@@ -1309,6 +1355,9 @@ function discoverySnapshot(layout, installed, phase = 'isolated') {
   const home = phase === 'ordinary' ? layout.codexHome : layout.activationHome
   const ambientRoot = path.join(home, 'skills', 'autoprompt')
   const ambientFiles = listFiles(ambientRoot)
+  const expectedAmbientFiles = phase === 'ordinary'
+    ? ['SKILL.md']
+    : installed.expectedSkillFiles
   const privateAgentFiles = phase === 'ordinary'
     ? []
     : listFiles(installed.agentsRoot).filter(file => file.endsWith('.toml'))
@@ -1316,9 +1365,11 @@ function discoverySnapshot(layout, installed, phase = 'isolated') {
   const actualPhysical = privateAgentFiles.map(file => path.basename(file, '.toml')).sort()
   return Object.freeze({
     ambientFiles,
-    ambientOnlyDiscoveryShim: stableJsonV1(ambientFiles) === stableJsonV1(['SKILL.md']),
-    forbiddenAmbientPrivateRoleCount: actualPhysical.filter(role =>
-      fs.existsSync(path.join(ambientRoot, 'agents-runtime', `${role}.toml`))).length,
+    ambientSurfaceExact: stableJsonV1(ambientFiles) === stableJsonV1(expectedAmbientFiles),
+    forbiddenAmbientPrivateRoleCount: phase === 'ordinary'
+      ? installed.manifest.physicalRoles.filter(role =>
+          fs.existsSync(path.join(ambientRoot, 'agents-runtime', `${role}.toml`))).length
+      : 0,
     privateAgentCount: actualPhysical.length,
     privateRoleInventoryExact: phase === 'ordinary'
       ? actualPhysical.length === 0
@@ -1514,9 +1565,10 @@ function liveProviderLimits(rows, providerSession, limits) {
   const sessionTokens = (providerSession.sessionUsageTotals || [])
     .reduce((total, usage) => total + usage.totalTokens, 0)
   const sessionTurns = providerSession.startedTurnCount || 0
-  const launches = Math.max(1, providerSession.sessionIds.length)
+  const launches = Math.max(1, providerSession.observedFileCount || providerSession.sessionIds.length)
   const turns = Math.max(rootTurns.length, sessionTurns)
-  const tokens = Math.max(rootTokens, sessionTokens)
+  const tokens = Math.max(rootTokens,
+    sessionTokens + (providerSession.provisionalTokenUpperBound || 0))
   return Object.freeze({
     launches,
     turns,
@@ -1528,6 +1580,11 @@ function liveProviderLimits(rows, providerSession, limits) {
 }
 
 function eventType(row) { return String(row?.type || row?.event || '') }
+
+function parsedCodexCliVersion(versionText) {
+  const match = /^codex-cli (\d+\.\d+\.\d+)$/.exec(String(versionText).trim())
+  return match ? match[1] : null
+}
 
 function timestampMs(row) {
   for (const key of ['occurred_at_ms', 'started_at_ms', 'completed_at_ms']) {
@@ -1604,10 +1661,522 @@ function pairTurnEvents(turn, beginType, endType) {
   })
 }
 
+function exactObjectKeys(value, expected) {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value) &&
+    stableJsonV1(Object.keys(value).sort()) === stableJsonV1([...expected].sort()))
+}
+
+function parseJsonText(value) {
+  if (typeof value !== 'string') return Object.freeze({ valid: false, value: null })
+  try { return Object.freeze({ valid: true, value: JSON.parse(value) }) } catch {
+    return Object.freeze({ valid: false, value: null })
+  }
+}
+
+// Codex 0.149.1 records MCP tool calls as response_item/custom_tool_call rows. The input is
+// JavaScript source, so it must never be evaluated. This deliberately small parser accepts only
+// the flat primitive object literal emitted by the conformance call wrapper.
+function parseFlatToolObject(source) {
+  let cursor = 0
+  const result = {}
+  const skip = () => { while (/\s/.test(source[cursor] || '')) cursor += 1 }
+  const readJsonString = () => {
+    const start = cursor
+    if (source[cursor] !== '"') return null
+    cursor += 1
+    let escaped = false
+    while (cursor < source.length) {
+      const character = source[cursor]
+      cursor += 1
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === '"') {
+        try { return JSON.parse(source.slice(start, cursor)) } catch { return null }
+      }
+    }
+    return null
+  }
+  skip()
+  if (source[cursor] !== '{') return null
+  cursor += 1
+  while (cursor < source.length) {
+    skip()
+    if (source[cursor] === '}') { cursor += 1; skip(); return cursor === source.length ? result : null }
+    let key = null
+    if (source[cursor] === '"') key = readJsonString()
+    else {
+      const match = /^[A-Za-z_][A-Za-z0-9_]*/.exec(source.slice(cursor))
+      if (!match) return null
+      key = match[0]
+      cursor += key.length
+    }
+    if (typeof key !== 'string' || Object.prototype.hasOwnProperty.call(result, key)) return null
+    skip()
+    if (source[cursor] !== ':') return null
+    cursor += 1
+    skip()
+    let value = null
+    if (source[cursor] === '"') value = readJsonString()
+    else {
+      const match = /^(?:0|[1-9][0-9]*|true|false|null)/.exec(source.slice(cursor))
+      if (!match) return null
+      cursor += match[0].length
+      value = match[0] === 'true' ? true : match[0] === 'false' ? false
+        : match[0] === 'null' ? null : Number(match[0])
+    }
+    if (value === null && source.slice(cursor - 4, cursor) !== 'null') return null
+    result[key] = value
+    skip()
+    if (source[cursor] === ',') { cursor += 1; continue }
+    if (source[cursor] !== '}') return null
+  }
+  return null
+}
+
+function customToolOutput(payloadOutput) {
+  const decoded = payloadOutput && typeof payloadOutput === 'object'
+    ? Object.freeze({ valid: true, value: payloadOutput }) : parseJsonText(payloadOutput)
+  if (!decoded.valid || !decoded.value || typeof decoded.value !== 'object') {
+    return Object.freeze({ state: 'INVALID', result: null })
+  }
+  const keys = Object.keys(decoded.value)
+  if (!Array.isArray(decoded.value) &&
+      stableJsonV1(keys) !== stableJsonV1(keys.map((_, index) => String(index)))) {
+    return Object.freeze({ state: 'INVALID', result: null })
+  }
+  const blocks = Array.isArray(decoded.value) ? decoded.value : keys.map(key => decoded.value[key])
+  if (blocks.length === 0 || blocks.some(block => !exactObjectKeys(block, ['type', 'text']) ||
+      block.type !== 'input_text' || typeof block.text !== 'string')) {
+    return Object.freeze({ state: 'INVALID', result: null })
+  }
+  const texts = blocks.map(block => block.text)
+  const completed = texts.some(text => /^Script completed(?:\r?\n|$)/.test(text))
+  const failed = texts.some(text => /^Script (?:failed|error)(?:\r?\n|:|$)/i.test(text))
+  const parsed = texts.map(parseJsonText).filter(item => item.valid)
+  if ((completed && failed) || (!completed && !failed) || (completed && parsed.length > 1)) {
+    return Object.freeze({ state: 'INVALID', result: null })
+  }
+  return Object.freeze({
+    state: completed ? 'COMPLETED' : 'FAILED', result: parsed[0]?.value ?? null,
+    texts: Object.freeze(texts),
+  })
+}
+
+function customStdoutProjectionBound(evidence) {
+  return Boolean(evidence?.request?.outputProjection === 'stdout' &&
+    evidence.output?.texts?.length === 2 && evidence.output.texts[1] === evidence.item?.stdout)
+}
+
+function customOutputExitProjectionBound(evidence) {
+  const result = evidence?.output?.result
+  return Boolean(evidence?.request?.outputProjection === 'output-exit' &&
+    evidence.output?.texts?.length === 2 &&
+    evidence.output.texts[1] === JSON.stringify({
+      output: evidence.item?.stdout, exit_code: evidence.item?.exit_code,
+    }) &&
+    exactObjectKeys(result, ['output', 'exit_code']) &&
+    result.output === evidence.item?.stdout && result.exit_code === evidence.item?.exit_code)
+}
+
+function parseCustomExecInput(input) {
+  if (typeof input !== 'string') return null
+  const match = /^\s*const r = await tools\.exec_command\(([\s\S]+)\);\s*text\((JSON\.stringify\(r\)|r\.output|JSON\.stringify\(\{output:r\.output,exit_code:r\.exit_code\}\))\);\s*$/.exec(input)
+  if (!match) return null
+  const request = parseFlatToolObject(match[1])
+  if (!exactObjectKeys(request, ['cmd', 'workdir', 'yield_time_ms', 'max_output_tokens']) ||
+      typeof request.cmd !== 'string' || !request.cmd || typeof request.workdir !== 'string' ||
+      !path.isAbsolute(request.workdir) || !Number.isSafeInteger(request.yield_time_ms) ||
+      request.yield_time_ms <= 0 || !Number.isSafeInteger(request.max_output_tokens) ||
+      request.max_output_tokens <= 0) return null
+  const outputProjection = match[2] === 'JSON.stringify(r)' ? 'json'
+    : match[2] === 'r.output' ? 'stdout' : 'output-exit'
+  return Object.freeze({ ...request, outputProjection })
+}
+
+function parseCustomApplyPatchInput(input) {
+  if (typeof input !== 'string') return null
+  const legacy = /^\s*const ([A-Za-z_$][A-Za-z0-9_$]*) = ("(?:\\.|[^"\\])*");\s*const r = await tools\.apply_patch\(([A-Za-z_$][A-Za-z0-9_$]*)\);\s*text\(r\);\s*$/.exec(input)
+  const inline = /^\s*const ([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*("(?:\\.|[^"\\])*");\s*text\(await tools\.apply_patch\(([A-Za-z_$][A-Za-z0-9_$]*)\)\);\s*$/.exec(input)
+  const match = legacy || inline
+  if (!match || match[1] !== match[3]) return null
+  let patchText
+  try { patchText = JSON.parse(match[2]) } catch { return null }
+  const lines = patchText.split('\n')
+  if (lines[0] !== '*** Begin Patch' || lines.at(-1) !== '*** End Patch') return null
+  const operations = []
+  for (let index = 1; index < lines.length - 1; index += 1) {
+    const header = /^\*\*\* (Add|Delete|Update) File: (.+)$/.exec(lines[index])
+    if (!header) continue
+    operations.push({ type: header[1], path: header[2], index })
+  }
+  if (operations.length === 0 || operations.some(operation => {
+    const normalized = operation.path.replaceAll('\\', '/')
+    const parts = normalized.split('/')
+    return !normalized || normalized.includes('\0') ||
+      parts.some(part => part === '.' || part === '..') ||
+      (!path.isAbsolute(operation.path) && parts.some(part => !part))
+  })) return null
+  let addedContent = null
+  if (operations.length === 1 && operations[0].type === 'Add') {
+    const contentLines = lines.slice(operations[0].index + 1, -1)
+    if (contentLines.length === 0 || contentLines.some(line => !line.startsWith('+'))) return null
+    addedContent = `${contentLines.map(line => line.slice(1)).join('\n')}\n`
+  }
+  return Object.freeze({
+    addedContent,
+    operations: Object.freeze(operations.map(operation => Object.freeze({
+      type: operation.type, path: operation.path,
+    }))),
+    patchText,
+  })
+}
+
+function commandExecutionItem(item, request, expectedStatus = 'completed', expectedRead = null) {
+  const parsedCommandBound = expectedRead
+    ? Array.isArray(item?.parsed_cmd) && item.parsed_cmd.length === 1 &&
+      exactObjectKeys(item.parsed_cmd[0], ['type', 'cmd', 'name', 'path']) &&
+      item.parsed_cmd[0].type === 'read' && item.parsed_cmd[0].cmd === request.cmd &&
+      item.parsed_cmd[0].name === path.basename(expectedRead) &&
+      item.parsed_cmd[0].path === expectedRead
+    : Array.isArray(item?.parsed_cmd) && item.parsed_cmd.length === 1 &&
+      exactObjectKeys(item.parsed_cmd[0], ['type', 'cmd']) &&
+      item.parsed_cmd[0].type === 'unknown' && item.parsed_cmd[0].cmd === request.cmd
+  if (!exactObjectKeys(item, [
+    'type', 'id', 'process_id', 'command', 'cwd', 'parsed_cmd', 'source', 'status',
+    'stdout', 'stderr', 'aggregated_output', 'exit_code', 'duration', 'formatted_output',
+  ]) || item.type !== 'CommandExecution' || typeof item.id !== 'string' || !item.id ||
+      typeof item.process_id !== 'string' || !item.process_id || !Array.isArray(item.command) ||
+      item.command.length !== 3 || !path.isAbsolute(item.command[0]) || item.command[1] !== '-lc' ||
+      item.command[2] !== request.cmd || item.cwd !== `file://${request.workdir}` ||
+      !parsedCommandBound ||
+      item.source !== 'unified_exec_startup' || item.status !== expectedStatus ||
+      typeof item.stdout !== 'string' || typeof item.stderr !== 'string' ||
+      item.aggregated_output !== item.stdout || !Number.isSafeInteger(item.exit_code) ||
+      !exactObjectKeys(item.duration, ['secs', 'nanos']) ||
+      !Number.isSafeInteger(item.duration.secs) || item.duration.secs < 0 ||
+      !Number.isSafeInteger(item.duration.nanos) || item.duration.nanos < 0 ||
+      item.formatted_output !== item.stdout) return null
+  return Object.freeze(item)
+}
+
+function fileChangeItem(item) {
+  if (!exactObjectKeys(item, ['type', 'id', 'changes', 'status', 'stdout', 'stderr']) ||
+      item.type !== 'FileChange' || typeof item.id !== 'string' || !item.id ||
+      !item.changes || typeof item.changes !== 'object' || Array.isArray(item.changes) ||
+      item.status !== 'completed' || typeof item.stdout !== 'string' || item.stderr !== '') return null
+  return Object.freeze(item)
+}
+
+function workerResultReadStdout(command, content, resultSha256) {
+  const bytes = Buffer.from(content, 'utf8')
+  const odLines = []
+  for (let offset = 0; offset < bytes.length; offset += 16) {
+    odLines.push(` ${[...bytes.subarray(offset, offset + 16)]
+      .map(byte => byte.toString(16).padStart(2, '0')).join(' ')}`)
+  }
+  const xxdLines = []
+  for (let offset = 0; offset < bytes.length; offset += 16) {
+    const chunk = bytes.subarray(offset, offset + 16)
+    const byteHex = [...chunk].map(byte => byte.toString(16).padStart(2, '0')).join(' ')
+    const ascii = [...chunk].map(byte => byte >= 0x20 && byte <= 0x7e
+      ? String.fromCharCode(byte) : '.').join('')
+    xxdLines.push(`${offset.toString(16).padStart(8, '0')}: ${byteHex.padEnd(47, ' ')}  ${ascii}`)
+  }
+  const primitives = Object.freeze({
+    'sha256sum conformance-result.txt': Object.freeze({ kind: 'hash',
+      output: `${resultSha256}  conformance-result.txt\n` }),
+    'wc -c conformance-result.txt': Object.freeze({ kind: 'size',
+      output: `${bytes.length} conformance-result.txt\n` }),
+    'wc -c < conformance-result.txt': Object.freeze({ kind: 'size', output: `${bytes.length}\n` }),
+    'od -An -tx1 -v conformance-result.txt': Object.freeze({ kind: 'dump',
+      output: odLines.length ? `${odLines.join('\n')}\n` : '' }),
+    'xxd -g 1 conformance-result.txt': Object.freeze({ kind: 'dump',
+      output: xxdLines.length ? `${xxdLines.join('\n')}\n` : '' }),
+  })
+  const commands = typeof command === 'string' ? command.split(' && ') : []
+  if (commands.length === 0 || commands.length > 3) return null
+  const selected = commands.map(item => primitives[item])
+  if (selected.some(item => !item) || !selected.some(item => item.kind === 'hash') ||
+      new Set(selected.map(item => item.kind)).size !== selected.length) return null
+  return selected.map(item => item.output).join('')
+}
+
+function v1491CustomToolEvidence(call) {
+  if (!call || call.name !== 'exec' || typeof call.input !== 'string') return null
+  const output = customToolOutput(call.rawOutput)
+  if (output.state === 'INVALID') return null
+  const applyPatch = parseCustomApplyPatchInput(call.input)
+  if (applyPatch) {
+    const item = fileChangeItem(call.itemCompleted)
+    if ((output.state === 'COMPLETED' && !item) ||
+        (output.state === 'FAILED' && call.itemCompleted !== null)) return null
+    return Object.freeze({ kind: 'apply_patch', item, output, ...applyPatch })
+  }
+  const request = parseCustomExecInput(call.input)
+  if (request) {
+    const item = commandExecutionItem(call.itemCompleted, request)
+    if (output.state !== 'COMPLETED' || !item) return null
+    return Object.freeze({ item, kind: 'exec_command', output, request })
+  }
+  return null
+}
+
+function terminalReportBound(message, phase, resultFile, resultSha256, resultBytes) {
+  if (typeof message !== 'string') return false
+  const resource = path.basename(resultFile)
+  if (phase === 'checker') {
+    const expected = {
+      schemaVersion: 'codex-conformance-checker-report.v1', result: 'PASS', path: resource,
+      sha256: resultSha256, bytes: resultBytes, readOnly: true, command: CHECKER_HASH_COMMAND,
+    }
+    if (message === JSON.stringify(expected)) return true
+    return [
+      `PASS — read-only verification of \`${resource}\`, bound to stdout SHA-256:\n\n` +
+        `\`${resultSha256}\``,
+      `PASS — read-only check stdout SHA-256: \`${resultSha256}\``,
+      `result.checker.v2: read-only PASS\n\nstdout SHA-256: \`${resultSha256}\``,
+    ].includes(message)
+  }
+  const readOnly = phase === 'resumed'
+  const expected = {
+    schemaVersion: 'codex-conformance-worker-report.v1', phase, result: 'PASS', path: resource,
+    sha256: resultSha256, bytes: resultBytes, readOnly,
+  }
+  if (message === JSON.stringify(expected)) return true
+  const contentBytes = resultBytes - 1
+  const compatible = phase === 'initial' ? [
+    `Completed: \`${resource}\` → SHA-256 \`${resultSha256}\`.`,
+    `result.worker.v2: COMPLETED\n\n\`${resource}\` is compliant: exactly ${resultBytes} bytes ` +
+      `containing the required ASCII text followed by one LF byte.\n\nSHA-256: \`${resultSha256}\``,
+    `PASS — \`${resource}\` contains the required bytes and has SHA-256 \`${resultSha256}\`.`,
+  ] : [
+    `Confirmed read-only: \`${resource}\` contains exactly the required ${contentBytes}-byte ` +
+      `string plus one LF byte. SHA-256: \`${resultSha256}\`.`,
+    `result.worker.v2: COMPLETED\n\nFinal read-only verification: \`${resource}\` remains ` +
+      `compliant—exactly ${resultBytes} bytes containing the required ASCII token followed by one ` +
+      `LF byte and nothing else.\n\nSHA-256: \`${resultSha256}\``,
+    `Final handoff: \`${resource}\` is complete and bound to SHA-256 \`${resultSha256}\`.`,
+  ]
+  return compatible.includes(message)
+}
+
+function v1491CollaborationEvidence(rows, root, workerRole, checkerRole, resultFile, resultSha256,
+    resultBytes, resultAbsentBefore) {
+  if (!root || root.cliVersion !== '0.149.1' || root.turns.length !== 1 ||
+      root.turns[0].terminalType !== 'task_complete') return null
+  const rootTurn = root.turns[0]
+  const calls = root.toolCalls || []
+  const validCallInterval = call => call.outputExists && Number.isSafeInteger(call.timestampMs) &&
+    Number.isSafeInteger(call.resultTimestampMs) && call.resultTimestampMs >= call.timestampMs &&
+    call.itemCompleted && Number.isSafeInteger(call.itemStartedTimestampMs) &&
+    Number.isSafeInteger(call.itemCompletedTimestampMs) &&
+    call.itemStartedTimestampMs >= call.timestampMs &&
+    call.itemCompletedTimestampMs >= call.itemStartedTimestampMs &&
+    call.itemCompletedTimestampMs <= call.resultTimestampMs &&
+    call.timestampMs >= rootTurn.startedTimestampMs && call.resultTimestampMs <= rootTurn.terminalTimestampMs
+  if (!calls.every(validCallInterval)) return null
+  const subAgentItem = (call, kind, child) => exactObjectKeys(call.itemCompleted,
+    ['type', 'id', 'kind', 'agent_thread_id', 'agent_path']) &&
+    call.itemCompleted.type === 'SubAgentActivity' && call.itemCompleted.id === call.callId &&
+    call.itemCompleted.kind === kind && call.itemCompleted.agent_thread_id === child.id &&
+    call.itemCompleted.agent_path === child.agentPath
+  const waitItem = call => exactObjectKeys(call.itemCompleted, [
+    'type', 'id', 'tool', 'status', 'sender_thread_id', 'receiver_thread_ids',
+    'receiver_agents', 'agents_states',
+  ]) && call.itemCompleted.type === 'CollabAgentToolCall' &&
+    call.itemCompleted.id === call.callId && call.itemCompleted.tool === 'wait' &&
+    call.itemCompleted.status === 'completed' && call.itemCompleted.sender_thread_id === root.id &&
+    Array.isArray(call.itemCompleted.receiver_thread_ids) &&
+    call.itemCompleted.receiver_thread_ids.length === 0 &&
+    Array.isArray(call.itemCompleted.receiver_agents) &&
+    call.itemCompleted.receiver_agents.length === 0 &&
+    exactObjectKeys(call.itemCompleted.agents_states, [])
+  const spawnCalls = calls.filter(call => call.name === 'spawn_agent')
+  const bindSpawn = role => {
+    const matches = spawnCalls.filter(call => exactObjectKeys(call.arguments,
+      ['agent_type', 'fork_turns', 'message', 'task_name']) &&
+      call.arguments.agent_type === role && call.arguments.fork_turns === 'all' &&
+      typeof call.arguments.message === 'string' && call.arguments.message.length > 0 &&
+      /^[a-z][a-z0-9_]*$/.test(call.arguments.task_name || '') &&
+      exactObjectKeys(call.result, ['task_name']) && typeof call.result.task_name === 'string')
+    if (matches.length !== 1) return null
+    const call = matches[0]
+    const childMatches = rows.sessions.filter(session => session.parentThreadId === root.id &&
+      session.agentRole === role && session.agentPath === call.result.task_name &&
+      path.posix.basename(session.agentPath) === call.arguments.task_name &&
+      session.sourceSpawn?.parent_thread_id === root.id &&
+      session.sourceSpawn?.agent_path === session.agentPath &&
+      session.sourceSpawn?.agent_role === role && session.turns.length > 0 &&
+      session.turns[0].startedTimestampMs >= call.itemCompletedTimestampMs)
+    return childMatches.length === 1 && subAgentItem(call, 'started', childMatches[0])
+      ? { call, child: childMatches[0] } : null
+  }
+  const worker = bindSpawn(workerRole)
+  const checker = bindSpawn(checkerRole)
+  if (!worker || !checker || worker.child.id === checker.child.id || worker.child.turns.length !== 2 ||
+      checker.child.turns.length !== 1) return null
+  const [firstWorkerTurn, secondWorkerTurn] = worker.child.turns
+  const checkerTurn = checker.child.turns[0]
+  if ([firstWorkerTurn, secondWorkerTurn, checkerTurn].some(turn =>
+    turn.terminalType !== 'task_complete') ||
+      !terminalReportBound(firstWorkerTurn.lastAgentMessage, 'initial', resultFile,
+        resultSha256, resultBytes) ||
+      !terminalReportBound(secondWorkerTurn.lastAgentMessage, 'resumed', resultFile,
+        resultSha256, resultBytes) ||
+      !terminalReportBound(checkerTurn.lastAgentMessage, 'checker', resultFile,
+        resultSha256, resultBytes)) return null
+  const waitCalls = calls.filter(call => call.name === 'wait_agent' &&
+    exactObjectKeys(call.arguments, ['timeout_ms']) && Number.isSafeInteger(call.arguments.timeout_ms) &&
+    call.arguments.timeout_ms > 0 && exactObjectKeys(call.result, ['message', 'timed_out']) &&
+    call.result.message === 'Wait completed.' && call.result.timed_out === false && waitItem(call))
+  const bindWait = (turn, afterTimestampMs) => waitCalls.filter(call =>
+    call.timestampMs >= afterTimestampMs && call.timestampMs <= turn.terminalTimestampMs &&
+    call.resultTimestampMs >= turn.terminalTimestampMs)
+  const firstWaits = bindWait(firstWorkerTurn, worker.call.resultTimestampMs)
+  const firstWait = firstWaits.length === 1 ? firstWaits[0] : null
+  const followups = calls.filter(call => firstWait && call.name === 'followup_task' &&
+    exactObjectKeys(call.arguments, ['message', 'target']) &&
+    typeof call.arguments.message === 'string' && call.arguments.message.length > 0 &&
+    call.arguments.target === worker.child.agentPath && call.rawOutput === '' &&
+    subAgentItem(call, 'interacted', worker.child) &&
+    call.timestampMs >= firstWait.resultTimestampMs &&
+    call.timestampMs <= secondWorkerTurn.startedTimestampMs &&
+    call.resultTimestampMs >= secondWorkerTurn.startedTimestampMs &&
+    call.resultTimestampMs <= secondWorkerTurn.terminalTimestampMs)
+  const followup = followups.length === 1 ? followups[0] : null
+  const secondWaits = followup ? bindWait(secondWorkerTurn, followup.resultTimestampMs) : []
+  const secondWait = secondWaits.length === 1 ? secondWaits[0] : null
+  const checkerOrdered = Boolean(secondWait && checker.call.timestampMs >= secondWait.resultTimestampMs)
+  const checkerWaits = checkerOrdered ? bindWait(checkerTurn, checker.call.resultTimestampMs) : []
+  const checkerWait = checkerWaits.length === 1 ? checkerWaits[0] : null
+  const consumed = new Set([
+    worker.call.callId, firstWait?.callId, followup?.callId, secondWait?.callId,
+    checker.call.callId, checkerWait?.callId,
+  ].filter(Boolean))
+  if (!firstWait || !followup || !secondWait || !checkerWait ||
+      firstWorkerTurn.startedTimestampMs > firstWait.resultTimestampMs ||
+      checkerTurn.startedTimestampMs > checkerWait.resultTimestampMs ||
+      calls.some(call => !consumed.has(call.callId))) return null
+
+  const firstWorkerCalls = firstWorkerTurn.responseToolCalls || []
+  const secondWorkerCalls = secondWorkerTurn.responseToolCalls || []
+  const parsedWorkerCalls = firstWorkerCalls.map(call => ({ call, evidence: v1491CustomToolEvidence(call) }))
+  const hasAbsenceProbe = parsedWorkerCalls[0]?.evidence?.kind === 'exec_command' &&
+    [WORKER_ABSENCE_PROBE_COMMAND, WORKER_MISSING_PROBE_COMMAND]
+      .includes(parsedWorkerCalls[0].evidence.request.cmd)
+  const patchIndex = hasAbsenceProbe ? 1 : 0
+  const patchCalls = parsedWorkerCalls.filter(({ evidence }) => evidence?.kind === 'apply_patch')
+  const patchPathsExact = patchCalls.length > 0 && patchCalls.every(({ evidence }) =>
+    evidence.operations.every(operation => path.resolve(path.dirname(resultFile), operation.path) ===
+      path.resolve(resultFile)))
+  const successfulPatches = patchCalls.filter(({ evidence }) => evidence.output.state === 'COMPLETED' &&
+    exactObjectKeys(evidence.output.result, []) && evidence.operations.length === 1 &&
+    evidence.operations[0].type === 'Add' && typeof evidence.addedContent === 'string' &&
+    exactObjectKeys(evidence.item.changes, [path.resolve(resultFile)]) &&
+    exactObjectKeys(evidence.item.changes[path.resolve(resultFile)], ['type', 'content']) &&
+    evidence.item.changes[path.resolve(resultFile)].type === 'add' &&
+    evidence.item.changes[path.resolve(resultFile)].content === evidence.addedContent)
+  const successfulPatch = successfulPatches.length === 1 ? successfulPatches[0] : null
+  const absenceProbe = hasAbsenceProbe ? parsedWorkerCalls[0]?.evidence : null
+  const expectedAbsenceOutput = absenceProbe?.request.cmd === WORKER_MISSING_PROBE_COMMAND
+    ? 'MISSING\n' : ''
+  const absenceProbeBound = !hasAbsenceProbe || Boolean(absenceProbe?.request.workdir ===
+    path.dirname(path.resolve(resultFile)) && absenceProbe.request.outputProjection === 'stdout' &&
+    absenceProbe.output.state === 'COMPLETED' && absenceProbe.item.exit_code === 0 &&
+    absenceProbe.item.stdout === expectedAbsenceOutput && absenceProbe.item.stderr === '' &&
+    customStdoutProjectionBound(absenceProbe))
+  const workerRead = parsedWorkerCalls[patchIndex + 1]?.evidence
+  const expectedWorkerReadStdout = successfulPatch && workerRead?.kind === 'exec_command'
+    ? workerResultReadStdout(workerRead.request.cmd,
+      successfulPatch.evidence.addedContent, resultSha256)
+    : null
+  const workerReadBound = Boolean(workerRead?.kind === 'exec_command' &&
+    workerRead.request.workdir === path.dirname(path.resolve(resultFile)) &&
+    workerRead.request.outputProjection === 'stdout' && workerRead.output.state === 'COMPLETED' &&
+    expectedWorkerReadStdout !== null && workerRead.item.exit_code === 0 &&
+    workerRead.item.stderr === '' && workerRead.item.stdout === expectedWorkerReadStdout &&
+    customStdoutProjectionBound(workerRead))
+  const resumeRead = secondWorkerCalls.length === 1
+    ? v1491CustomToolEvidence(secondWorkerCalls[0]) : null
+  const expectedResumeReadStdout = successfulPatch && resumeRead?.kind === 'exec_command'
+    ? workerResultReadStdout(resumeRead.request.cmd,
+      successfulPatch.evidence.addedContent, resultSha256)
+    : null
+  const resumeReadBound = Boolean(
+    resumeRead?.kind === 'exec_command' &&
+    resumeRead.output.state === 'COMPLETED' && resumeRead.item.exit_code === 0 &&
+    resumeRead.item.stderr === '' && expectedResumeReadStdout !== null &&
+    resumeRead.item.stdout === expectedResumeReadStdout &&
+    resumeRead.request.workdir === path.dirname(path.resolve(resultFile)) &&
+    resumeRead.request.outputProjection === 'stdout' && customStdoutProjectionBound(resumeRead))
+  const workerBound = Boolean(resultAbsentBefore === true &&
+    parsedWorkerCalls.length === patchIndex + 2 &&
+    parsedWorkerCalls.every(({ evidence }) => Boolean(evidence)) &&
+    parsedWorkerCalls[patchIndex] === successfulPatch && patchCalls.length === 1 && patchPathsExact &&
+    absenceProbeBound && workerReadBound && secondWorkerCalls.length === 1 && resumeReadBound &&
+    successfulPatch &&
+    sha256(Buffer.from(successfulPatch.evidence.addedContent, 'utf8')) === resultSha256)
+
+  const checkerCalls = checkerTurn.responseToolCalls || []
+  const checkerEvidence = checkerCalls.length === 1 ? v1491CustomToolEvidence(checkerCalls[0]) : null
+  const checkerResult = checkerEvidence?.output?.result
+  const checkerBound = Boolean(checkerEvidence?.kind === 'exec_command' &&
+    checkerEvidence.output.state === 'COMPLETED' &&
+    checkerEvidence.request.cmd === CHECKER_HASH_COMMAND &&
+    checkerEvidence.request.outputProjection === 'json' &&
+    path.resolve(checkerEvidence.request.workdir) === path.dirname(path.resolve(resultFile)) &&
+    exactObjectKeys(checkerResult,
+      ['chunk_id', 'wall_time_seconds', 'exit_code', 'original_token_count', 'output']) &&
+    typeof checkerResult.chunk_id === 'string' && checkerResult.chunk_id &&
+    typeof checkerResult.wall_time_seconds === 'number' && checkerResult.wall_time_seconds >= 0 &&
+    checkerResult.exit_code === 0 && Number.isSafeInteger(checkerResult.original_token_count) &&
+    checkerResult.original_token_count >= 0 && checkerResult.output === `${resultSha256}\n` &&
+    checkerEvidence.item.exit_code === checkerResult.exit_code &&
+    checkerEvidence.item.stdout === checkerResult.output && checkerEvidence.item.stderr === '')
+  return Object.freeze({
+    checker, checkerBound, checkerShell: checkerBound ? Object.freeze({
+      command: CHECKER_HASH_COMMAND, transport: 'response_item.custom_tool_call',
+    }) : null,
+    followup, patchContent: successfulPatch?.evidence?.addedContent || null,
+    resumeBound: Boolean(followup && secondWait), worker, workerBound,
+  })
+}
+
 function typedSessionEvidence(rows, workerRole, checkerRole, diagnosticRole, resultFile, resultSha256,
-    resultAbsentBefore, requirements) {
+    resultBytes, resultAbsentBefore, requirements) {
   const root = rows.rootSessions?.length === 1 ? rows.rootSessions[0] : null
   const collabEvents = root?.collabEvents || []
+  const responseItemEvidence = collabEvents.length === 0 &&
+    rows.sessions?.every(session => session.cliVersion === '0.149.1')
+    ? v1491CollaborationEvidence(rows, root, workerRole, checkerRole, resultFile, resultSha256,
+      resultBytes, resultAbsentBefore)
+    : null
+  if (responseItemEvidence) {
+    const valid = responseItemEvidence.workerBound && responseItemEvidence.resumeBound &&
+      responseItemEvidence.checkerBound
+    return Object.freeze({
+      cancellationObserved: false,
+      cancellationResult: 'NO_RESULT',
+      checkerChildId: responseItemEvidence.checker.child.id,
+      checkerIndependent: responseItemEvidence.checker.child.id !== responseItemEvidence.worker.child.id,
+      checkerRole,
+      childIds: [responseItemEvidence.worker.child.id, responseItemEvidence.checker.child.id],
+      diagnosticCancellationObserved: false,
+      diagnosticNoPaidTurn: false,
+      editCausallyBoundToWorker: responseItemEvidence.workerBound,
+      checkerReadCausallyBound: responseItemEvidence.checkerBound,
+      checkerShellIdentity: responseItemEvidence.checkerShell,
+      interruptCallId: null,
+      patchContentSha256: typeof responseItemEvidence.patchContent === 'string'
+        ? sha256(Buffer.from(responseItemEvidence.patchContent, 'utf8')) : null,
+      result: valid && rows.schemaCompatible && requirements?.cancellationRequired !== true
+        ? 'PASS' : 'NO_RESULT',
+      rootThreadId: root.id,
+      sameContextResume: responseItemEvidence.resumeBound,
+      workerChildId: responseItemEvidence.worker.child.id,
+      workerRole,
+    })
+  }
   const pair = (beginType, endType) => collabEvents.flatMap(begin => {
     if (begin.type !== beginType || typeof begin.callId !== 'string') return []
     const ends = collabEvents.filter(end => end.type === endType && end.callId === begin.callId &&
@@ -1760,35 +2329,275 @@ function parseMaybeJson(value) {
   try { return JSON.parse(value) } catch { return null }
 }
 
+function responseItemCallPairs(records, callType, outputType) {
+  const outputs = new Map()
+  let valid = true
+  records.forEach((row, index) => {
+    const payload = row?.payload || {}
+    if (row?.type !== 'response_item' || payload.type !== outputType) return
+    const outputShapeValid = outputType === 'custom_tool_call_output'
+      ? ((payload.output && typeof payload.output === 'object') || typeof payload.output === 'string')
+      : typeof payload.output === 'string'
+    if (typeof payload.call_id !== 'string' || !payload.call_id || !outputShapeValid ||
+        outputs.has(payload.call_id) ||
+        !Number.isSafeInteger(timestampMs(row))) {
+      valid = false
+      return
+    }
+    outputs.set(payload.call_id, Object.freeze({
+      index, raw: payload.output, timestampMs: timestampMs(row),
+    }))
+  })
+  const calls = []
+  const callIds = new Set()
+  records.forEach((row, index) => {
+    const payload = row?.payload || {}
+    if (row?.type !== 'response_item' || payload.type !== callType) return
+    const output = outputs.get(payload.call_id)
+    const argumentsJson = callType === 'function_call' ? parseJsonText(payload.arguments) : null
+    if (typeof payload.call_id !== 'string' || !payload.call_id || callIds.has(payload.call_id) ||
+        typeof payload.name !== 'string' || !payload.name || !output || output.index <= index ||
+        !Number.isSafeInteger(timestampMs(row)) || output.timestampMs < timestampMs(row) ||
+        (callType === 'custom_tool_call' && typeof payload.input !== 'string') ||
+        (callType === 'function_call' && (!argumentsJson.valid ||
+          !argumentsJson.value || typeof argumentsJson.value !== 'object' ||
+          Array.isArray(argumentsJson.value)))) {
+      valid = false
+      return
+    }
+    callIds.add(payload.call_id)
+    const outputJson = output.raw && typeof output.raw === 'object'
+      ? { valid: true, value: output.raw } : parseJsonText(output.raw)
+    const interstitial = records.slice(index + 1, output.index)
+    const itemRows = interstitial.filter(candidate => candidate?.type === 'event_msg' &&
+      candidate?.payload?.type === 'item_completed' && exactObjectKeys(candidate.payload,
+        ['type', 'thread_id', 'turn_id', 'item', 'started_at_ms', 'completed_at_ms']))
+    const itemRow = interstitial.length === 1 && itemRows.length === 1 ? itemRows[0] : null
+    const itemStartedTimestampMs = itemRow?.payload?.started_at_ms
+    const itemCompletedTimestampMs = itemRow?.payload?.completed_at_ms
+    const itemIntervalValid = itemRow === null || (
+      Number.isSafeInteger(itemStartedTimestampMs) && itemStartedTimestampMs >= 0 &&
+      Number.isSafeInteger(itemCompletedTimestampMs) &&
+      itemCompletedTimestampMs >= itemStartedTimestampMs &&
+      itemStartedTimestampMs >= timestampMs(row) &&
+      itemCompletedTimestampMs <= output.timestampMs)
+    if (!itemIntervalValid) valid = false
+    calls.push(Object.freeze({
+      arguments: callType === 'function_call' ? argumentsJson.value : null,
+      callId: payload.call_id,
+      index,
+      input: callType === 'custom_tool_call' ? payload.input : null,
+      itemCompleted: itemRow ? cloneJson(itemRow.payload.item) : null,
+      itemStartedTimestampMs: itemRow ? itemStartedTimestampMs : null,
+      itemCompletedTimestampMs: itemRow ? itemCompletedTimestampMs : null,
+      itemCompletedThreadId: itemRow ? itemRow.payload.thread_id : null,
+      itemCompletedTurnId: itemRow ? itemRow.payload.turn_id : null,
+      name: payload.name,
+      namespace: payload.namespace,
+      outputExists: true,
+      outputParsed: outputJson.valid,
+      rawOutput: output.raw,
+      result: outputJson.valid ? outputJson.value : null,
+      resultIndex: output.index,
+      resultTimestampMs: output.timestampMs,
+      timestampMs: timestampMs(row),
+    }))
+  })
+  if (outputs.size !== calls.length) valid = false
+  return Object.freeze({ calls: Object.freeze(calls), valid })
+}
+
 function providerSessionPathReceipt(relative) {
   return safePathReceipt(relative, 'PROVIDER_SESSION')
 }
 
-function readProviderSessionBundle(codexHome, options = {}) {
+function sameFileIdentity(left, right) {
+  return Boolean(left && right && String(left.dev) === String(right.dev) &&
+    String(left.ino) === String(right.ino))
+}
+
+function readProviderSessionInputs(codexHome, options = {}) {
   const sessionRoot = path.join(codexHome, 'sessions')
   const fsImpl = options.fsImpl || fs
   const files = listFiles(sessionRoot, '', {
     category: 'PROVIDER_SESSION', fsImpl,
   }).filter(file => file.endsWith('.jsonl'))
-  const records = []
-  const rawFiles = []
-  const sessions = []
   const maximumFileBytes = Number.isSafeInteger(options.maximumFileBytes) &&
     options.maximumFileBytes > 0 ? options.maximumFileBytes : 32 * 1024 * 1024
+  const inputs = []
   for (const relative of files) {
     const absolute = path.join(sessionRoot, ...relative.split('/'))
     const pathReceipt = providerSessionPathReceipt(relative)
-    assertRegularUnlinked(absolute, 'provider session file', { fsImpl, pathReceipt })
-    let bytes
-    try { bytes = fsImpl.readFileSync(absolute) } catch (error) {
+    let initial
+    try { initial = fsImpl.lstatSync(absolute) } catch (error) {
       filesystemFailure('PROVIDER_SESSION_UNAVAILABLE', 'provider session cannot be read safely',
         pathReceipt, error)
     }
-    if (bytes.length > maximumFileBytes) {
-      fail('PROVIDER_SESSION_TOO_LARGE', 'provider session exceeds the configured byte ceiling', {
+    if (!initial.isFile() || initial.isSymbolicLink() || Number(initial.nlink) !== 1) {
+      fail('PROVIDER_SESSION_UNSAFE', 'provider session is linked or not a regular file', {
         providerSessionPath: pathReceipt,
       })
     }
+    let initialRealpath
+    try {
+      const realpath = fsImpl.realpathSync?.native || fsImpl.realpathSync
+      initialRealpath = realpath(absolute)
+    } catch (error) {
+      filesystemFailure('PROVIDER_SESSION_UNAVAILABLE', 'provider session cannot be resolved safely',
+        pathReceipt, error)
+    }
+    let descriptor
+    try {
+      descriptor = fsImpl.openSync(absolute,
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+    } catch (error) {
+      filesystemFailure('PROVIDER_SESSION_UNAVAILABLE', 'provider session cannot be opened safely',
+        pathReceipt, error)
+    }
+    let opened
+    let bytes
+    try {
+      opened = fsImpl.fstatSync(descriptor)
+      if (!opened.isFile() || Number(opened.nlink) !== 1 ||
+          !sameFileIdentity(initial, opened)) {
+        fail('PROVIDER_SESSION_UNSAFE', 'provider session changed before it was opened', {
+          providerSessionPath: pathReceipt,
+        })
+      }
+      if (!Number.isSafeInteger(Number(opened.size)) || Number(opened.size) < 0 ||
+          Number(opened.size) > maximumFileBytes) {
+        fail('PROVIDER_SESSION_TOO_LARGE', 'provider session exceeds the configured byte ceiling', {
+          providerSessionPath: pathReceipt,
+        })
+      }
+      bytes = Buffer.alloc(Number(opened.size))
+      let offset = 0
+      while (offset < bytes.length) {
+        const count = fsImpl.readSync(descriptor, bytes, offset, bytes.length - offset, offset)
+        if (!Number.isSafeInteger(count) || count <= 0) {
+          fail('PROVIDER_SESSION_UNAVAILABLE', 'provider session changed while it was read', {
+            providerSessionPath: pathReceipt,
+          })
+        }
+        offset += count
+      }
+      const reboundDescriptor = fsImpl.fstatSync(descriptor)
+      if (!sameFileIdentity(opened, reboundDescriptor) ||
+          !reboundDescriptor.isFile() || Number(reboundDescriptor.nlink) !== 1 ||
+          Number(reboundDescriptor.size) < bytes.length) {
+        fail('PROVIDER_SESSION_UNSAFE', 'provider session changed while it was read', {
+          providerSessionPath: pathReceipt,
+        })
+      }
+    } catch (error) {
+      if (error instanceof LiveConformanceError) throw error
+      filesystemFailure('PROVIDER_SESSION_UNAVAILABLE', 'provider session cannot be read safely',
+        pathReceipt, error)
+    } finally {
+      try { fsImpl.closeSync(descriptor) } catch {}
+    }
+    let rebound
+    let reboundRealpath
+    try {
+      rebound = fsImpl.lstatSync(absolute)
+      const realpath = fsImpl.realpathSync?.native || fsImpl.realpathSync
+      reboundRealpath = realpath(absolute)
+    } catch (error) {
+      filesystemFailure('PROVIDER_SESSION_UNAVAILABLE', 'provider session cannot be rebound safely',
+        pathReceipt, error)
+    }
+    if (!rebound.isFile() || rebound.isSymbolicLink() || Number(rebound.nlink) !== 1 ||
+        !sameFileIdentity(opened, rebound) || initialRealpath !== reboundRealpath) {
+      fail('PROVIDER_SESSION_UNSAFE', 'provider session path changed while it was read', {
+        providerSessionPath: pathReceipt,
+      })
+    }
+    inputs.push(Object.freeze({ bytes, pathReceipt, relative }))
+  }
+  return Object.freeze(inputs)
+}
+
+function providerSessionRawFiles(inputs) {
+  return inputs.map(({ bytes, relative }) => Object.freeze({
+    path: `sessions/${relative}`,
+    bytes: bytes.length,
+    sha256: sha256(bytes),
+    base64: bytes.toString('base64'),
+  }))
+}
+
+function forkHistoryProjection(fileRecords) {
+  if (fileRecords.length < 2 || fileRecords[0]?.type !== 'session_meta' ||
+      fileRecords[1]?.type !== 'session_meta') return Object.freeze({ state: 'INVALID' })
+  const child = fileRecords[0]?.payload || {}
+  const parent = fileRecords[1]?.payload || {}
+  const sourceParent = child?.source?.subagent?.thread_spawn?.parent_thread_id
+  const boundary = child.subagent_history_start_ordinal
+  const headerValid = child.cli_version === '0.149.1' &&
+    typeof child.id === 'string' && child.id &&
+    typeof child.parent_thread_id === 'string' && child.parent_thread_id &&
+    child.session_id === child.parent_thread_id && child.forked_from_id === child.parent_thread_id &&
+    sourceParent === child.parent_thread_id && Number.isSafeInteger(boundary) && boundary >= 2 &&
+    parent.id === child.parent_thread_id && parent.session_id === parent.id &&
+    parent.cli_version === child.cli_version && parent.source === 'exec' &&
+    fileRecords.slice(2).every(row => row?.type !== 'session_meta')
+  if (!headerValid) return Object.freeze({ state: 'INVALID' })
+  if (fileRecords.length <= boundary) {
+    return Object.freeze({ state: 'INCOMPLETE', child, boundary })
+  }
+  const boundaryRow = fileRecords[boundary]
+  if (boundaryRow?.type !== 'event_msg' ||
+      boundaryRow?.payload?.type !== 'thread_settings_applied') {
+    return Object.freeze({ state: 'INVALID' })
+  }
+  return Object.freeze({
+    state: 'COMPLETE', child, boundary,
+    records: Object.freeze([fileRecords[0], ...fileRecords.slice(boundary)]),
+  })
+}
+
+function provisionalProviderAccounting(fileRecords) {
+  const startedTurnIds = []
+  let currentTurnId = null
+  let currentMaximum = 0
+  let tokenUpperBound = 0
+  let valid = true
+  const settle = () => {
+    tokenUpperBound += currentMaximum
+    currentMaximum = 0
+    currentTurnId = null
+  }
+  for (const row of fileRecords) {
+    const payload = row?.payload || {}
+    if (row?.type !== 'event_msg') continue
+    if (payload.type === 'task_started') {
+      if (currentTurnId || typeof payload.turn_id !== 'string' || !payload.turn_id) valid = false
+      else {
+        currentTurnId = payload.turn_id
+        startedTurnIds.push(payload.turn_id)
+      }
+    } else if (payload.type === 'token_count') {
+      const usage = parsedTokenUsage(payload?.info?.total_token_usage)
+      if (!currentTurnId || !usage) valid = false
+      else currentMaximum = Math.max(currentMaximum, usage.totalTokens)
+    } else if (['task_complete', 'turn_aborted'].includes(payload.type)) {
+      if (!currentTurnId || payload.turn_id !== currentTurnId) valid = false
+      else settle()
+    }
+  }
+  if (currentTurnId) settle()
+  return Object.freeze({ startedTurnIds, tokenUpperBound, valid })
+}
+
+function readProviderSessionBundle(codexHome, options = {}) {
+  const inputs = readProviderSessionInputs(codexHome, options)
+  const records = []
+  const rawFiles = providerSessionRawFiles(inputs)
+  const sessions = []
+  const provisionalStartedTurnIds = []
+  let provisionalTokenUpperBound = 0
+  let provisionalTokenSchemaValid = true
+  for (const { bytes, pathReceipt, relative } of inputs) {
     const text = bytes.toString('utf8')
     const split = text.split(/\r?\n/)
     if (options.allowIncompleteLastLine && split.at(-1) !== '') split.pop()
@@ -1803,15 +2612,37 @@ function readProviderSessionBundle(codexHome, options = {}) {
         })
       }
       fileRecords.push(record)
-      records.push(record)
     }
     const metaRows = fileRecords.filter(row => row?.type === 'session_meta')
-    if (metaRows.length !== 1 || typeof metaRows[0]?.payload?.id !== 'string') {
+    let sessionRecords = fileRecords
+    // During child creation Codex may expose either no header yet or the child's own header
+    // followed by inherited parent history (including the parent header). Keep that transient
+    // file visible to policy accounting, but never admit it as final evidence.
+    if (metaRows.length > 1) {
+      const forkProjection = forkHistoryProjection(fileRecords)
+      if (forkProjection.state === 'COMPLETE') sessionRecords = forkProjection.records
+      else if (options.allowIncompleteLastLine) {
+        const provisional = provisionalProviderAccounting(fileRecords)
+        provisionalStartedTurnIds.push(...provisional.startedTurnIds)
+        provisionalTokenUpperBound += provisional.tokenUpperBound
+        provisionalTokenSchemaValid &&= forkProjection.state === 'INCOMPLETE' && provisional.valid
+        continue
+      }
+    } else if (options.allowIncompleteLastLine && metaRows.length === 0) {
+      const provisional = provisionalProviderAccounting(fileRecords)
+      provisionalStartedTurnIds.push(...provisional.startedTurnIds)
+      provisionalTokenUpperBound += provisional.tokenUpperBound
+      provisionalTokenSchemaValid &&= provisional.valid
+      continue
+    }
+    const sessionMetaRows = sessionRecords.filter(row => row?.type === 'session_meta')
+    if (sessionMetaRows.length !== 1 || typeof sessionMetaRows[0]?.payload?.id !== 'string') {
       fail('PROVIDER_SESSION_INVALID', 'provider session metadata is not unique', {
         providerSessionPath: pathReceipt,
       })
     }
-    const meta = metaRows[0].payload
+    records.push(...sessionRecords)
+    const meta = sessionMetaRows[0].payload
     const sourceSpawn = meta?.source?.subagent?.thread_spawn || null
     const parentFieldPresent = Object.prototype.hasOwnProperty.call(meta, 'parent_thread_id')
     const parentThreadId = typeof meta.parent_thread_id === 'string' ? meta.parent_thread_id : null
@@ -1819,10 +2650,18 @@ function readProviderSessionBundle(codexHome, options = {}) {
       (!parentFieldPresent || meta.parent_thread_id === null)
     const childAncestryShape = Boolean(sourceSpawn) && typeof meta.parent_thread_id === 'string' &&
       sourceSpawn.parent_thread_id === meta.parent_thread_id
-    let sessionSchemaValid = fileRecords.every(row => Number.isSafeInteger(timestampMs(row))) &&
-      (meta.session_id === undefined || meta.session_id === meta.id) &&
+    const sessionIdShape = childAncestryShape && meta.cli_version === '0.149.1'
+      ? meta.session_id === meta.parent_thread_id
+      : meta.session_id === undefined || meta.session_id === meta.id
+    const functionCallPairs = responseItemCallPairs(sessionRecords,
+      'function_call', 'function_call_output')
+    const customToolCallPairs = responseItemCallPairs(sessionRecords,
+      'custom_tool_call', 'custom_tool_call_output')
+    let sessionSchemaValid = sessionRecords.every(row => Number.isSafeInteger(timestampMs(row))) &&
+      functionCallPairs.valid && customToolCallPairs.valid &&
+      sessionIdShape &&
       (rootAncestryShape || childAncestryShape)
-    const turnContexts = fileRecords.filter(row => row?.type === 'turn_context').map(row => ({
+    const turnContexts = sessionRecords.filter(row => row?.type === 'turn_context').map(row => ({
       turnId: typeof row?.payload?.turn_id === 'string' ? row.payload.turn_id : null,
       sandboxPolicyType: typeof row?.payload?.sandbox_policy?.type === 'string'
         ? row.payload.sandbox_policy.type : null,
@@ -1833,18 +2672,22 @@ function readProviderSessionBundle(codexHome, options = {}) {
     let lastObservedCumulative = null
     let tokenSchemaValid = true
     let tokenEventCount = 0
-    for (let index = 0; index < fileRecords.length; index += 1) {
-      const row = fileRecords[index]
+    const sessionTurnIds = new Set()
+    for (let index = 0; index < sessionRecords.length; index += 1) {
+      const row = sessionRecords[index]
       const payload = row?.payload || {}
       if (row?.type === 'event_msg' && payload.type === 'task_started') {
-        if (currentTurn || typeof payload.turn_id !== 'string') {
+        if (currentTurn || typeof payload.turn_id !== 'string' || !payload.turn_id ||
+            sessionTurnIds.has(payload.turn_id)) {
           fail('PROVIDER_SESSION_INVALID', `provider turn start is malformed at line ${index + 1}`, {
             providerSessionPath: pathReceipt,
           })
         }
+        sessionTurnIds.add(payload.turn_id)
         currentTurn = {
           turnId: payload.turn_id,
           startedTimestampMs: timestampMs(row),
+          startedIndex: index,
           cumulative: null,
           toolEvents: [],
         }
@@ -1914,6 +2757,8 @@ function readProviderSessionBundle(codexHome, options = {}) {
           lastAgentMessage: typeof payload.last_agent_message === 'string'
             ? payload.last_agent_message : null,
           toolEvents: currentTurn.toolEvents,
+          responseToolCalls: customToolCallPairs.calls.filter(call =>
+            call.index > currentTurn.startedIndex && call.resultIndex < index),
           usage: usageValid ? delta : null,
         }))
         if (cumulative && usageValid) previousCumulative = cumulative
@@ -1923,6 +2768,14 @@ function readProviderSessionBundle(codexHome, options = {}) {
     if (currentTurn || turns.some(turn => !Number.isSafeInteger(turn.startedTimestampMs) ||
         !Number.isSafeInteger(turn.terminalTimestampMs) ||
         turn.terminalTimestampMs < turn.startedTimestampMs)) sessionSchemaValid = false
+    const responseCalls = [...functionCallPairs.calls, ...customToolCallPairs.calls]
+    if (responseCalls.some(call => !turns.some(turn => call.timestampMs >= turn.startedTimestampMs &&
+        call.resultTimestampMs <= turn.terminalTimestampMs))) sessionSchemaValid = false
+    if (responseCalls.some(call => call.itemCompleted && !turns.some(turn =>
+      call.timestampMs >= turn.startedTimestampMs && call.resultTimestampMs <= turn.terminalTimestampMs &&
+      call.itemCompletedTurnId === turn.turnId && call.itemCompletedThreadId === meta.id))) {
+      sessionSchemaValid = false
+    }
     sessions.push({
       id: meta.id,
       cliVersion: typeof meta.cli_version === 'string' ? meta.cli_version : null,
@@ -1933,21 +2786,18 @@ function readProviderSessionBundle(codexHome, options = {}) {
         ? cloneJson(meta.selected_capability_roots) : [],
       sourceSpawn,
       file: relative,
-      records: fileRecords,
+      records: sessionRecords,
+      functionCalls: functionCallPairs.calls,
+      customToolCalls: customToolCallPairs.calls,
       turnContexts,
       turns,
       tokenEventCount,
       tokenSchemaValid,
       sessionUsage: tokenSchemaValid ? lastObservedCumulative : null,
+      currentTurnId: currentTurn?.turnId || null,
       incompleteTurn: Boolean(currentTurn),
       schemaValid: sessionSchemaValid && tokenSchemaValid,
     })
-    rawFiles.push(Object.freeze({
-      path: `sessions/${relative}`,
-      bytes: bytes.length,
-      sha256: sha256(bytes),
-      base64: bytes.toString('base64'),
-    }))
   }
   const rootSessions = sessions.filter(session => !session.parentThreadId && !session.sourceSpawn)
   const rootSessionIds = rootSessions.map(session => session.id)
@@ -1991,34 +2841,18 @@ function readProviderSessionBundle(codexHome, options = {}) {
           !['collab_waiting_end'].includes(event.type)) ||
         (event.type === 'collab_waiting_end' &&
           Object.values(event.statuses).some(status => status === null)))) session.schemaValid = false
-    const outputs = new Map()
-    session.records.forEach((row, index) => {
-      const payload = row?.payload || {}
-      if (payload.type !== 'function_call_output' || typeof payload.call_id !== 'string') return
-      outputs.set(payload.call_id, {
-        value: parseMaybeJson(payload.output), raw: payload.output, index,
-        timestampMs: timestampMs(row),
-      })
-    })
-    session.toolCalls = []
-    session.records.forEach((row, index) => {
-      const payload = row?.payload || {}
-      if (payload.type !== 'function_call' || payload.namespace !== 'collaboration' ||
-          typeof payload.name !== 'string' || typeof payload.call_id !== 'string') return
-      const output = outputs.get(payload.call_id)
-      session.toolCalls.push(Object.freeze({
-        index,
-        callId: payload.call_id,
-        name: payload.name,
-        arguments: parseMaybeJson(payload.arguments) || {},
-        result: output?.value || null,
-        outputExists: Boolean(output),
-        resultIndex: output?.index ?? null,
-        timestampMs: timestampMs(row),
-        resultTimestampMs: output?.timestampMs ?? null,
-      }))
-    })
+    session.toolCalls = session.functionCalls.filter(call => call.namespace === 'collaboration')
+    if (session.functionCalls.some(call => call.namespace !== 'collaboration')) session.schemaValid = false
     session.skillInputs = session.records.flatMap(row => {
+      const payload = row?.payload || {}
+      if (row?.type !== 'response_item' || payload.type !== 'message' || payload.role !== 'user') {
+        return []
+      }
+      return (payload.content || []).flatMap(item => item?.type === 'input_text' &&
+        typeof item.text === 'string' && item.text.includes('<skill>')
+        ? [{ text: item.text, sha256: sha256(Buffer.from(item.text, 'utf8')) }] : [])
+    })
+    session.skillCatalogInputs = session.records.flatMap(row => {
       const payload = row?.payload || {}
       if (row?.type !== 'response_item' || payload.type !== 'message' || payload.role !== 'developer') {
         return []
@@ -2039,8 +2873,26 @@ function readProviderSessionBundle(codexHome, options = {}) {
   const sessionUsageComplete = tokenSchemaValid && sessions.every(session =>
     !session.incompleteTurn && (session.turns.length === 0 ||
       (session.sessionUsage && session.turns.every(turn => turn.usage))))
-  const startedTurnCount = sessions.reduce((total, session) => total + session.turns.length +
-    (session.incompleteTurn ? 1 : 0), 0)
+  const startedTurnIds = new Set()
+  let stableStartedTurnCount = 0
+  for (const session of sessions) {
+    for (const turn of session.turns) {
+      if (startedTurnIds.has(turn.turnId)) {
+        fail('PROVIDER_SESSION_INVALID', 'provider turn identity is duplicated across sessions')
+      }
+      startedTurnIds.add(turn.turnId)
+      stableStartedTurnCount += 1
+    }
+    if (session.incompleteTurn && session.currentTurnId) {
+      if (startedTurnIds.has(session.currentTurnId)) {
+        fail('PROVIDER_SESSION_INVALID', 'provider turn identity is duplicated across sessions')
+      }
+      startedTurnIds.add(session.currentTurnId)
+      stableStartedTurnCount += 1
+    }
+  }
+  for (const turnId of provisionalStartedTurnIds) startedTurnIds.add(turnId)
+  const startedTurnCount = stableStartedTurnCount + provisionalStartedTurnIds.length
   const subAgentActivities = rootSessions.flatMap(session => session.records.flatMap(row => {
     const payload = row?.payload || {}
     if (row?.type !== 'event_msg' || payload.type !== 'sub_agent_activity') return []
@@ -2057,6 +2909,10 @@ function readProviderSessionBundle(codexHome, options = {}) {
       !['started', 'interacted', 'interrupted'].includes(activity.kind))) {
     for (const session of rootSessions) session.schemaValid = false
   }
+  const cliVersions = new Set(sessions.map(session => session.cliVersion))
+  const cliVersionCompatible = cliVersions.size === 1 &&
+    sessions.every(session => SUPPORTED_PROVIDER_SESSION_VERSIONS.has(session.cliVersion)) &&
+    (!options.expectedCliVersion || cliVersions.has(options.expectedCliVersion))
   const hierarchyCompatible = rootSessions.length === 1 && new Set(sessions.map(session => session.id)).size ===
     sessions.length && sessions.every(session => session.schemaValid && (session === rootSessions[0]
     ? session.parentThreadId === null && !session.sourceSpawn
@@ -2064,10 +2920,14 @@ function readProviderSessionBundle(codexHome, options = {}) {
       session.sourceSpawn && session.sourceSpawn.parent_thread_id === session.parentThreadId))
   return Object.freeze({
     childUsageComplete, files: rawFiles, records, rootSessionIds, rootSessions, sessions,
-    schemaCompatible: hierarchyCompatible && sessions.length > 0 &&
-      sessions.every(session => session.cliVersion === '0.149.0'),
+    observedFileCount: inputs.length,
+    provisionalFileCount: inputs.length - sessions.length,
+    provisionalTokenUpperBound,
+    schemaCompatible: hierarchyCompatible && sessions.length > 0 && inputs.length === sessions.length &&
+      cliVersionCompatible,
     sessionIds: sessions.map(session => session.id), sessionUsageComplete, sessionUsageTotals,
-    startedTurnCount, subAgentActivities, tokenSchemaValid, usageRecords,
+    startedTurnCount, startedTurnIds: [...startedTurnIds], subAgentActivities,
+    tokenSchemaValid: tokenSchemaValid && provisionalTokenSchemaValid, usageRecords,
   })
 }
 
@@ -2084,62 +2944,98 @@ function parseSkillEntries(text) {
   return entries
 }
 
+function parseExplicitSkillFragment(text) {
+  const value = String(text)
+  const namePrefix = '<skill>\n<name>'
+  const nameSuffix = '</name>\n<path>'
+  const pathSuffix = '</path>\n'
+  const end = '\n</skill>'
+  if (!value.startsWith(namePrefix) || !value.endsWith(end)) return null
+  const nameEnd = value.indexOf(nameSuffix, namePrefix.length)
+  if (nameEnd < 0) return null
+  const pathStart = nameEnd + nameSuffix.length
+  const pathEnd = value.indexOf(pathSuffix, pathStart)
+  if (pathEnd < pathStart) return null
+  const contentStart = pathEnd + pathSuffix.length
+  const contentEnd = value.length - end.length
+  const name = value.slice(namePrefix.length, nameEnd)
+  const file = value.slice(pathStart, pathEnd)
+  if (!name || !file || contentEnd < contentStart || /[<>\r\n]/.test(name) || /[<>\r\n]/.test(file)) {
+    return null
+  }
+  return Object.freeze({ name, path: file, contents: value.slice(contentStart, contentEnd) })
+}
+
 function providerPrivateSkillEvidence(providerSession, installed, profileSha256) {
   const expectedFile = fs.realpathSync(path.join(installed.skillRoot, 'SKILL.md'))
-  const expectedSha256 = sha256(fs.readFileSync(expectedFile))
+  const expectedBytes = fs.readFileSync(expectedFile)
+  const expectedContents = expectedBytes.toString('utf8')
+  const expectedSha256 = sha256(expectedBytes)
   const workerRole = installed.manifest.logicalToPhysicalProviderRole['ap-worker']
   const checkerRole = installed.manifest.logicalToPhysicalProviderRole['ap-independent-checker']
   const requiredSessions = [
-    { label: 'root', matches: providerSession.rootSessions },
-    { label: 'worker', matches: providerSession.sessions.filter(session => session.agentRole === workerRole) },
-    { label: 'checker', matches: providerSession.sessions.filter(session => session.agentRole === checkerRole) },
+    { label: 'root', matches: providerSession.rootSessions, role: null },
+    { label: 'worker', matches: providerSession.sessions.filter(session => session.agentRole === workerRole), role: workerRole },
+    { label: 'checker', matches: providerSession.sessions.filter(session => session.agentRole === checkerRole), role: checkerRole },
   ]
-  const normalizeEntries = session => session.skillInputs.flatMap(input =>
-    parseSkillEntries(input.text).flatMap(entry => {
-    const resolved = path.resolve(entry.path)
-    const privateLike = resolved.split(path.sep).includes('.autoprompt-private')
-    if (!privateLike) return []
-    let realpath = null
-    let fileSha256 = null
-    try {
-      realpath = fs.realpathSync(resolved)
-      fileSha256 = sha256(fs.readFileSync(realpath))
-    } catch {}
-    return [{ id: entry.id, realpath, fileSha256 }]
-  }))
-  const perSession = requiredSessions.map(({ label, matches }) => {
+  const normalizedSelections = providerSession.sessions.flatMap(session =>
+    session.skillInputs.map(input => {
+      const parsed = parseExplicitSkillFragment(input.text)
+      let realpath = null
+      if (parsed?.path) {
+        try { realpath = fs.realpathSync(parsed.path) } catch {}
+      }
+      const exact = parsed?.name === 'autoprompt' && realpath === expectedFile &&
+        parsed.contents === expectedContents
+      return Object.freeze({
+        sessionId: session.id, inputSha256: input.sha256,
+        name: parsed?.name || null, realpath, exact,
+      })
+    }))
+  const root = providerSession.rootSessions.length === 1 ? providerSession.rootSessions[0] : null
+  const rootSelections = root
+    ? normalizedSelections.filter(selection => selection.sessionId === root.id) : []
+  const catalogEntries = providerSession.sessions.flatMap(session =>
+    session.skillCatalogInputs.flatMap(input => parseSkillEntries(input.text).map(entry => ({
+      sessionId: session.id, id: entry.id, path: entry.path,
+    }))))
+  const visibleAutopromptEntries = catalogEntries.filter(entry => entry.id === 'autoprompt' ||
+    (() => { try { return fs.realpathSync(entry.path) === expectedFile } catch { return false } })())
+  const perSession = requiredSessions.map(({ label, matches, role }) => {
     const session = matches.length === 1 ? matches[0] : null
-    const entries = session ? normalizeEntries(session) : []
-    const expected = entries.filter(entry => entry.id === 'autoprompt' &&
-      entry.realpath === expectedFile && entry.fileSha256 === expectedSha256)
-    const unexpected = entries.filter(entry => !expected.includes(entry))
+    const selections = session
+      ? normalizedSelections.filter(selection => selection.sessionId === session.id) : []
+    const exactSelections = selections.filter(selection => selection.exact)
+    const rootBinding = label === 'root'
+      ? selections.length === 1 && exactSelections.length === 1
+      : selections.every(selection => selection.exact)
     return {
       label,
       sessionId: session?.id || null,
       agentRole: session?.agentRole || null,
-      inputSha256: session ? [...new Set(session.skillInputs.map(input => input.sha256))].sort() : [],
-      expectedCount: expected.length,
-      unexpectedCount: unexpected.length,
-      valid: Boolean(session && session.skillInputs.length > 0 &&
-        expected.length === session.skillInputs.length && unexpected.length === 0),
+      inputSha256: selections.map(selection => selection.inputSha256).sort(),
+      expectedCount: exactSelections.length,
+      unexpectedCount: selections.length - exactSelections.length,
+      inheritedFromRoot: label === 'root' ? false : true,
+      valid: Boolean(session && rootBinding && (label === 'root' || session.agentRole === role)),
     }
   })
-  const allPrivateEntries = providerSession.sessions.flatMap(normalizeEntries)
-  const unexpected = allPrivateEntries.filter(entry => !(entry.id === 'autoprompt' &&
-    entry.realpath === expectedFile && entry.fileSha256 === expectedSha256))
-  const inputHashes = [...new Set(perSession.flatMap(session => session.inputSha256))].sort()
+  const unexpectedSelections = normalizedSelections.filter(selection => !selection.exact)
+  const inputHashes = [...new Set(normalizedSelections.map(selection => selection.inputSha256))].sort()
   const roleBindings = providerSession.sessions.filter(session => session.parentThreadId)
     .map(session => session.agentRole).filter(Boolean)
-  const roleBindingsExact = roleBindings.length > 0 && roleBindings.every(role =>
-    installed.manifest.physicalRoles.includes(role))
+  const expectedRoleBindings = [checkerRole, workerRole].sort()
+  const roleBindingsExact = stableJsonV1([...roleBindings].sort()) ===
+    stableJsonV1(expectedRoleBindings)
   const capabilityRootHashes = providerSession.sessions
     .filter(session => session.selectedCapabilityRoots.length > 0)
     .map(session => sha256(Buffer.from(stableJsonV1(session.selectedCapabilityRoots), 'utf8')))
   const capabilityRootsExact = capabilityRootHashes.length === 0 ||
-    (capabilityRootHashes.length === providerSession.sessions.length &&
-      new Set(capabilityRootHashes).size === 1)
-  const valid = inputHashes.length > 0 && perSession.every(session => session.valid) &&
-    unexpected.length === 0 && roleBindingsExact && capabilityRootsExact && providerSession.schemaCompatible &&
+    new Set(capabilityRootHashes).size === 1
+  const valid = rootSelections.length === 1 && rootSelections[0].exact &&
+    perSession.every(session => session.valid) && unexpectedSelections.length === 0 &&
+    visibleAutopromptEntries.length === 0 && roleBindingsExact && capabilityRootsExact &&
+    providerSession.schemaCompatible &&
     HASH_PATTERN.test(profileSha256 || '')
   return Object.freeze({
     providerInputBlockCount: inputHashes.length,
@@ -2147,7 +3043,8 @@ function providerPrivateSkillEvidence(providerSession, installed, profileSha256)
     effectivePrivateSkillIds: valid ? ['autoprompt'] : [],
     effectivePrivateSkillPaths: valid ? ['SKILL.md'] : [],
     privateSkillFileSha256: expectedSha256,
-    unexpectedPrivateEntryCount: unexpected.length,
+    hiddenFromDeveloperCatalog: visibleAutopromptEntries.length === 0,
+    unexpectedPrivateEntryCount: unexpectedSelections.length + visibleAutopromptEntries.length,
     payloadGeneration: installed.manifest.payloadGeneration,
     profileSha256: profileSha256 || null,
     sessionBindings: perSession,
@@ -2225,32 +3122,87 @@ function writeDiscoveryProbe(layout, installed) {
   return file
 }
 
-function providerDiscoveryEvidence(rows, expectedPhysicalRoles) {
+function transcriptCommandPayload(command) {
+  if (typeof command === 'string' && [DISCOVERY_COMMAND, DISCOVERY_RED_COMMAND].includes(command)) {
+    return command
+  }
+  if (Array.isArray(command) && command.length === 3 && path.isAbsolute(command[0]) &&
+      ['bash', 'sh'].includes(path.basename(command[0])) && command[1] === '-lc' &&
+      typeof command[2] === 'string') return command[2]
+  if (typeof command !== 'string') return null
+  const match = /^(\S+) -lc (['"])([^\r\n]*)\2$/.exec(command)
+  if (!match || !path.isAbsolute(match[1]) ||
+      !['bash', 'sh'].includes(path.basename(match[1]))) return null
+  return match[3]
+}
+
+function privateSkillDiscoveryPrefix(installed) {
+  const expectedFile = assertRegularUnlinked(
+    path.join(installed.skillRoot, 'SKILL.md'), 'installed private skill',
+  )
+  if (!/^\/[A-Za-z0-9._/-]+$/.test(expectedFile)) return null
+  const expectedContents = fs.readFileSync(expectedFile, 'utf8')
+  const lineCount = expectedContents.split('\n').length - (expectedContents.endsWith('\n') ? 1 : 0)
+  if (lineCount > 240) return null
+  return Object.freeze({
+    command: `sed -n '1,240p' ${expectedFile} && ${DISCOVERY_RED_COMMAND}`,
+    readCommand: `sed -n '1,240p' ${expectedFile}`,
+    readOutput: expectedContents,
+    readPath: expectedFile,
+    output: expectedContents,
+  })
+}
+
+function providerDiscoveryEvidence(rows, expectedPhysicalRoles, expectedTopLevelSkillFiles,
+    privateSkillPrefix, expectedProfileSha256) {
   const observations = {}
   for (const row of rows) {
-    if (eventType(row) !== 'item.completed' || row?.item?.type !== 'command_execution' ||
-        row.item.exit_code !== 0 || typeof row.item.aggregated_output !== 'string') continue
-    const marker = row.item.aggregated_output.split(/\r?\n/)
-      .find(line => line.startsWith('AUTOPROMPT_DISCOVERY_OBSERVATION '))
-    if (!marker) continue
+    if (eventType(row) !== 'item.completed' || row?.item?.type !== 'command_execution') continue
+    const command = transcriptCommandPayload(row.item.command)
+    const direct = command === DISCOVERY_COMMAND && row.item.exit_code === 0 &&
+      row.item.status === 'completed'
+    const expectedRedCommand = command === DISCOVERY_RED_COMMAND ||
+      command === privateSkillPrefix?.command
+    const expectedRed = expectedRedCommand && row.item.exit_code === 1 &&
+      row.item.status === 'failed'
+    if (!direct && !expectedRed) continue
+    const output = typeof row.item.aggregated_output === 'string'
+      ? row.item.aggregated_output : ''
+    const markerOutput = command === privateSkillPrefix?.command &&
+      output.startsWith(privateSkillPrefix.output)
+      ? output.slice(privateSkillPrefix.output.length)
+      : command === privateSkillPrefix?.command ? null : output
+    const marker = /^AUTOPROMPT_DISCOVERY_OBSERVATION ([^\r\n]+)\r?\n$/
+      .exec(markerOutput || '')
+    if (!marker) {
+      fail('DISCOVERY_OBSERVATION_INVALID', 'bound provider discovery output is malformed')
+    }
     let observation
-    try { observation = JSON.parse(marker.slice('AUTOPROMPT_DISCOVERY_OBSERVATION '.length)) } catch {
+    try { observation = JSON.parse(marker[1]) } catch {
       fail('DISCOVERY_OBSERVATION_INVALID', 'provider discovery observation is invalid JSON')
     }
-    if (observation.schemaVersion !== 'codex-discovery-observation.v1' ||
+    if (!exactObjectKeys(observation, [
+      'schemaVersion', 'phase', 'ambientFiles', 'privateAgentFiles', 'profileSha256',
+      'activationPrivateRootExists', 'activationProfileExists',
+    ]) || observation.schemaVersion !== 'codex-discovery-observation.v1' ||
         observation.phase !== 'isolated-during' ||
+        !Array.isArray(observation.ambientFiles) ||
+        observation.ambientFiles.some(file => typeof file !== 'string') ||
+        !Array.isArray(observation.privateAgentFiles) ||
+        observation.privateAgentFiles.some(file => typeof file !== 'string') ||
         observations[observation.phase]) {
       fail('DISCOVERY_OBSERVATION_INVALID', 'provider discovery observation is malformed or duplicated')
     }
     observations[observation.phase] = observation
   }
   const during = observations['isolated-during']
-  const ordinaryExpected = ['SKILL.md']
+  const isolatedExpected = [...expectedTopLevelSkillFiles].sort()
   const privateExpected = [...expectedPhysicalRoles].map(role => `${role}.toml`).sort()
   const result = during &&
-    stableJsonV1(during.ambientFiles) === stableJsonV1(ordinaryExpected) &&
+    stableJsonV1(during.ambientFiles) === stableJsonV1(isolatedExpected) &&
     stableJsonV1(during.privateAgentFiles) === stableJsonV1(privateExpected) &&
-    HASH_PATTERN.test(during.profileSha256 || '') &&
+    HASH_PATTERN.test(expectedProfileSha256 || '') &&
+    during.profileSha256 === expectedProfileSha256 &&
     during.activationPrivateRootExists === true && during.activationProfileExists === true
   return Object.freeze({
     isolatedDuring: during || null,
@@ -2680,19 +3632,35 @@ function missionText(token, roles, requirements) {
   const workerRole = requiredRoles['ap-worker']
   const checkerRole = requiredRoles['ap-independent-checker']
   const lines = [
+    '$autoprompt',
     'path=direct',
     'This is a bounded, local, verifier-only conformance run.',
+    'The isolated Codex profile and private roles are already installed for this provider canary; do not invoke or search for an Autoprompt launcher.',
     'Use at most six total provider launches or turns and stop immediately if that limit would be exceeded.',
     'Use no network and modify only conformance-result.txt.',
-    'Run node conformance-discovery-probe.cjs isolated-during and preserve its exact output.',
-    `First run node conformance-check.cjs and observe its RED result.`,
+    'Run node conformance-discovery-probe.cjs isolated-during by itself and preserve its exact output.',
+    'Then run node conformance-check.cjs exactly once and observe exactly one initial RED result.',
     `Delegate the edit to the exact private role ${workerRole}.`,
-    `The file must contain exactly ${token}.`,
+    `The file must contain exactly ${token} followed by one LF byte and no other bytes.`,
     `Wait for ${workerRole} to finish and require a report binding conformance-result.txt and its SHA-256.`,
+    'Its initial final message must be exactly one JSON object with only these keys and values: ' +
+      '{"schemaVersion":"codex-conformance-worker-report.v1","phase":"initial",' +
+      '"result":"PASS","path":"conformance-result.txt","sha256":"<observed lowercase SHA-256>",' +
+      '"bytes":48,"readOnly":false}.',
     `Use followup_task to resume that exact completed child context, then wait for its second completed turn.`,
+    'Its resumed final message must be exactly one JSON object with only these keys and values: ' +
+      '{"schemaVersion":"codex-conformance-worker-report.v1","phase":"resumed",' +
+      '"result":"PASS","path":"conformance-result.txt","sha256":"<same observed lowercase SHA-256>",' +
+      '"bytes":48,"readOnly":true}.',
+    `The worker gets exactly those two turns; never message, resume, or relaunch it after the second turn.`,
     'Run node conformance-topology-probe.cjs and preserve its production role-policy rejection.',
     `Then use exact private role ${checkerRole} for an independent read-only check.`,
     `Require ${checkerRole} to run exactly ${CHECKER_HASH_COMMAND} and return a read-only PASS verdict bound to its stdout SHA-256.`,
+    'Its final message must be exactly one JSON object with only these keys and values: ' +
+      '{"schemaVersion":"codex-conformance-checker-report.v1","result":"PASS",' +
+      '"path":"conformance-result.txt","sha256":"<stdout lowercase SHA-256>","bytes":48,' +
+      '"readOnly":true,"command":"node conformance-sha256.cjs conformance-result.txt"}.',
+    `The checker gets exactly one turn; never message, resume, relaunch, repair, or recheck after its verdict. If either child reports a noncompliant result, finish with failure instead of retrying.`,
     'Run node conformance-check.cjs again and observe GREEN.',
   ]
   if (requirements.cancellationRequired) {
@@ -2702,27 +3670,180 @@ function missionText(token, roles, requirements) {
   return lines.join(' ')
 }
 
+function checkCommandResultBound(evidence, expectedExitCode) {
+  const result = evidence?.output?.result
+  const fullResult = evidence?.request.outputProjection === 'json' &&
+    exactObjectKeys(result,
+      ['chunk_id', 'wall_time_seconds', 'exit_code', 'original_token_count', 'output']) &&
+    typeof result.chunk_id === 'string' && result.chunk_id &&
+    typeof result.wall_time_seconds === 'number' && result.wall_time_seconds >= 0 &&
+    result.exit_code === expectedExitCode &&
+    Number.isSafeInteger(result.original_token_count) && result.original_token_count >= 0 &&
+    result.output === ''
+  const outputExit = customOutputExitProjectionBound(evidence) && result.output === '' &&
+    result.exit_code === expectedExitCode
+  return Boolean((fullResult || outputExit) && evidence.item.exit_code === expectedExitCode &&
+    evidence.item.stdout === '' && evidence.item.stderr === '')
+}
+
+function transcriptExecutionBound(rows, call, command) {
+  const matches = (rows || []).filter(row => eventType(row) === 'item.completed' &&
+    row?.item?.type === 'command_execution' && transcriptCommandPayload(row.item.command) === command)
+  if (matches.length !== 1) return false
+  const item = matches[0].item
+  return item.exit_code === call.itemCompleted.exit_code &&
+    item.status === call.itemCompleted.status &&
+    item.aggregated_output === call.itemCompleted.stdout
+}
+
+function providerCheckSequenceBound(providerSession, sessions, workerRole, checkerRole, target,
+    log, privateSkillPrefix, transcriptRows) {
+  const root = providerSession?.rootSessions?.length === 1
+    ? providerSession.rootSessions[0] : null
+  const rootTurn = root?.turns?.length === 1 ? root.turns[0] : null
+  if (!root || !rootTurn || sessions?.result !== 'PASS' ||
+      typeof privateSkillPrefix?.command !== 'string' ||
+      typeof privateSkillPrefix?.readCommand !== 'string' ||
+      typeof privateSkillPrefix?.readOutput !== 'string' ||
+      typeof privateSkillPrefix?.readPath !== 'string') {
+    return false
+  }
+  const workerSpawns = root.toolCalls.filter(call => call.name === 'spawn_agent' &&
+    call.arguments?.agent_type === workerRole)
+  const checkerSpawns = root.toolCalls.filter(call => call.name === 'spawn_agent' &&
+    call.arguments?.agent_type === checkerRole)
+  if (workerSpawns.length !== 1 || checkerSpawns.length !== 1) return false
+  const workerSpawn = workerSpawns[0]
+  const checkerSpawn = checkerSpawns[0]
+  const checkerWaits = root.toolCalls.filter(call => call.name === 'wait_agent' &&
+    exactObjectKeys(call.arguments, ['timeout_ms']) && Number.isSafeInteger(call.arguments.timeout_ms) &&
+    call.arguments.timeout_ms > 0 && exactObjectKeys(call.result, ['message', 'timed_out']) &&
+    call.result.message === 'Wait completed.' && call.result.timed_out === false &&
+    call.timestampMs >= checkerSpawn.resultTimestampMs)
+  if (checkerWaits.length !== 1) return false
+  const combinedCommands = new Set([privateSkillPrefix.command, DISCOVERY_RED_COMMAND])
+  const rootResponseCalls = rootTurn.responseToolCalls || []
+  const relevantCalls = rootResponseCalls.filter(call =>
+    typeof call.input === 'string' && call.input.includes('conformance-check.cjs'))
+  const supportCalls = rootResponseCalls.filter(call => !relevantCalls.includes(call)).map(call => {
+    const request = parseCustomExecInput(call.input)
+    if (!request || request.workdir !== path.resolve(target)) return null
+    const output = customToolOutput(call.rawOutput)
+    const skillRead = request.cmd === privateSkillPrefix.readCommand
+    const item = commandExecutionItem(call.itemCompleted, request, 'completed',
+      skillRead ? privateSkillPrefix.readPath : null)
+    if (!item || output.state !== 'COMPLETED' || item.exit_code !== 0 || item.stderr !== '') return null
+    const evidence = Object.freeze({ item, output, request })
+    if (skillRead &&
+        customStdoutProjectionBound(evidence) && item.stdout === privateSkillPrefix.readOutput) {
+      return Object.freeze({ call, item, kind: 'skill-read', request })
+    }
+    if (request.cmd === DISCOVERY_COMMAND &&
+        (customStdoutProjectionBound(evidence) || customOutputExitProjectionBound(evidence))) {
+      return Object.freeze({ call, item, kind: 'discovery', request })
+    }
+    if (request.cmd !== 'node conformance-topology-probe.cjs') return null
+    const result = output.result
+    const fullResult = request.outputProjection === 'json' && exactObjectKeys(result,
+      ['chunk_id', 'wall_time_seconds', 'exit_code', 'original_token_count', 'output']) &&
+      typeof result.chunk_id === 'string' && result.chunk_id &&
+      typeof result.wall_time_seconds === 'number' && result.wall_time_seconds >= 0 &&
+      result.exit_code === 0 && Number.isSafeInteger(result.original_token_count) &&
+      result.original_token_count >= 0 && result.output === item.stdout
+    const outputExit = customOutputExitProjectionBound(evidence) && result.exit_code === 0
+    return fullResult || outputExit
+      ? Object.freeze({ call, item, kind: 'topology', request }) : null
+  })
+  if (supportCalls.some(item => !item)) return false
+  const classified = relevantCalls.map(call => {
+    const request = parseCustomExecInput(call.input)
+    if (!request || request.workdir !== path.resolve(target)) return null
+    const expectedStatus = combinedCommands.has(request.cmd) ||
+      (request.cmd === 'node conformance-check.cjs' && call.itemCompleted?.exit_code === 1)
+      ? 'failed' : 'completed'
+    const output = customToolOutput(call.rawOutput)
+    const item = commandExecutionItem(call.itemCompleted, request, expectedStatus)
+    if (!item || output.state !== 'COMPLETED') return null
+    const evidence = Object.freeze({ item, output, request })
+    if (combinedCommands.has(request.cmd) && customStdoutProjectionBound(evidence) &&
+        item.exit_code === 1 && item.stderr === '' && output.result === null) {
+      return Object.freeze({ call, item, kind: 'combined-red', request })
+    }
+    if (request.cmd !== 'node conformance-check.cjs') return null
+    if (checkCommandResultBound(evidence, 1)) {
+      return Object.freeze({ call, item, kind: 'red', request })
+    }
+    if (checkCommandResultBound(evidence, 0)) {
+      return Object.freeze({ call, item, kind: 'green', request })
+    }
+    return null
+  })
+  if (classified.some(item => !item) || classified.length !== log.length) return false
+  const discoveryCalls = [
+    ...supportCalls.filter(item => item.kind === 'discovery'),
+    ...classified.filter(item => item.kind === 'combined-red'),
+  ]
+  const topologyCalls = supportCalls.filter(item => item.kind === 'topology')
+  const skillReads = supportCalls.filter(item => item.kind === 'skill-read')
+  if (discoveryCalls.length !== 1 || topologyCalls.length !== 1 ||
+      skillReads.length > 1 ||
+      !transcriptExecutionBound(transcriptRows, discoveryCalls[0].call,
+        discoveryCalls[0].request.cmd) ||
+      !transcriptExecutionBound(transcriptRows, topologyCalls[0].call,
+        topologyCalls[0].request.cmd) ||
+      (skillReads.length === 1 &&
+        (!transcriptExecutionBound(transcriptRows, skillReads[0].call,
+          skillReads[0].request.cmd) ||
+          discoveryCalls[0].kind !== 'discovery' ||
+          skillReads[0].call.resultTimestampMs > discoveryCalls[0].call.timestampMs)) ||
+      (discoveryCalls[0].kind === 'combined-red' && skillReads.length !== 0)) return false
+  const kinds = classified.map(item => item.kind)
+  const acceptedKinds = stableJsonV1(kinds) === stableJsonV1(['combined-red', 'green']) ||
+    stableJsonV1(kinds) === stableJsonV1(['red', 'green']) ||
+    stableJsonV1(kinds) === stableJsonV1(['combined-red', 'red', 'green'])
+  if (!acceptedKinds || (log.length === 2 && stableJsonV1(log) !== stableJsonV1(['RED', 'GREEN'])) ||
+      (log.length === 3 && stableJsonV1(log) !== stableJsonV1(['RED', 'RED', 'GREEN']))) return false
+  const initial = classified.slice(0, -1)
+  const green = classified.at(-1)
+  const workerWaits = root.toolCalls.filter(call => call.name === 'wait_agent' &&
+    call.resultTimestampMs <= checkerSpawn.timestampMs).sort((left, right) =>
+    left.resultTimestampMs - right.resultTimestampMs)
+  if (workerWaits.length !== 2) return false
+  const discovery = discoveryCalls[0]
+  const topology = topologyCalls[0]
+  const standaloneInitial = initial.find(item => item.kind === 'red')
+  return discovery.call.resultTimestampMs <= workerSpawn.timestampMs &&
+    (!standaloneInitial || discovery.call.resultTimestampMs <= standaloneInitial.call.timestampMs) &&
+    initial.every(item => item.call.resultTimestampMs <= workerSpawn.timestampMs) &&
+    workerWaits[1].resultTimestampMs <= topology.call.timestampMs &&
+    topology.call.resultTimestampMs <= checkerSpawn.timestampMs &&
+    green.call.timestampMs >= checkerWaits[0].resultTimestampMs
+}
+
 function inspectMission(providerSession, transcriptText, roles, requirements, token, checkLog, target,
-    targetBefore) {
+    targetBefore, privateSkillPrefix, transcriptRows) {
   const workerRole = roles['ap-worker']
   const checkerRole = roles['ap-independent-checker']
   const diagnosticRole = roles['ap-diagnostic-probe'] || null
   const resultFile = path.join(target, 'conformance-result.txt')
   const resultText = fs.existsSync(resultFile) ? fs.readFileSync(resultFile, 'utf8') : ''
+  const resultBytes = Buffer.byteLength(resultText, 'utf8')
   const resultSha256 = sha256(Buffer.from(resultText, 'utf8'))
   const resultAbsentBefore = !Object.prototype.hasOwnProperty.call(targetBefore || {},
     'conformance-result.txt')
   const sessions = typedSessionEvidence(
     providerSession, workerRole, checkerRole, diagnosticRole, resultFile, resultSha256,
-    resultAbsentBefore, requirements,
+    resultBytes, resultAbsentBefore, requirements,
   )
   const log = fs.existsSync(checkLog) ? fs.readFileSync(checkLog, 'utf8').split(/\r?\n/).filter(Boolean) : []
+  const checkSequenceBound = providerCheckSequenceBound(providerSession, sessions, workerRole,
+    checkerRole, target, log, privateSkillPrefix, transcriptRows)
   return Object.freeze({
     delegation: sessions,
     edit: {
       checkLogSha256: sha256(Buffer.from(log.join('\n'), 'utf8')),
       checkSequence: log,
-      result: resultText === `${token}\n` && stableJsonV1(log) === stableJsonV1(['RED', 'GREEN'])
+      result: resultText === `${token}\n` && checkSequenceBound
         ? 'PASS' : 'FAIL',
       resultFileSha256: sha256(Buffer.from(resultText, 'utf8')),
       resultFileBeforeSha256: null,
@@ -2893,8 +4014,14 @@ async function runConformance(options = {}) {
       cwd: layout.target, env: ordinaryEnvironment, timeoutMs: 15_000,
     })
     launchedPids.push(versionRun.childPid, helpRun.childPid)
+    const versionText = versionRun.stdout.toString('utf8').trim()
+    const expectedCliVersion = parsedCodexCliVersion(versionText)
+    if (!expectedCliVersion) {
+      fail('PROVIDER_SESSION_INVALID', 'Codex CLI version output is not schema-bindable')
+    }
     const before = discoverySnapshot(layout, installed, 'ordinary')
     const duringLocal = discoverySnapshot(layout, installed, 'isolated')
+    const discoveryPrivateSkill = privateSkillDiscoveryPrefix(installed)
     const token = `AUTOPROMPT_CONFORMANCE_${crypto.randomBytes(12).toString('hex')}`
     checkLog = path.join(layout.target, 'conformance-check.log')
     writePrivateFile(path.join(layout.target, 'conformance-check.cjs'), [
@@ -2934,7 +4061,9 @@ async function runConformance(options = {}) {
       stdoutLineGuard: line => transcriptGuard.accept(line),
       policyPollGuard: () => liveProviderLimits(
         transcriptGuard.rows,
-        readProviderSessionBundle(layout.activationHome, { allowIncompleteLastLine: true }),
+        readProviderSessionBundle(layout.activationHome, {
+          allowIncompleteLastLine: true, expectedCliVersion,
+        }),
         { maximumLaunches: 6, maximumTurns: 6, maximumTokens: MAX_TOTAL_TOKENS },
       ).within,
       onLaunchedPid: pid => launchedPids.push(pid),
@@ -2947,15 +4076,30 @@ async function runConformance(options = {}) {
       : await runBoundedCommand(missionCommand, missionOptions)
     if (!launchedPids.includes(missionRun.childPid)) launchedPids.push(missionRun.childPid)
     const transcriptRows = parseJsonl(missionRun.stdout)
+    if (mode === 'live' && missionRun.policyTerminated) {
+      const observedProviderSession = readProviderSessionBundle(layout.activationHome, {
+        allowIncompleteLastLine: true, expectedCliVersion,
+      })
+      fail('PROVIDER_POLICY_LIMIT', 'live conformance reached its explicit provider ceiling', {
+        observed: liveProviderLimits(transcriptGuard.rows, observedProviderSession, {
+          maximumLaunches: 6, maximumTurns: 6, maximumTokens: MAX_TOTAL_TOKENS,
+        }),
+      })
+    }
     const transcriptText = `${missionRun.stdout.toString('utf8')}\n${missionRun.stderr.toString('utf8')}`
-    providerSession = readProviderSessionBundle(layout.activationHome)
+    providerSession = readProviderSessionBundle(layout.activationHome, { expectedCliVersion })
     usage = transcriptUsage(transcriptRows, providerSession)
     const mission = inspectMission(providerSession, transcriptText, requiredProviderRoles,
-      missionRequirements, token, checkLog, layout.target, targetBefore)
-    const providerDiscovery = providerDiscoveryEvidence(transcriptRows, manifest.physicalRoles)
+      missionRequirements, token, checkLog, layout.target, targetBefore,
+      discoveryPrivateSkill, transcriptRows)
+    const providerDiscovery = providerDiscoveryEvidence(
+      transcriptRows, manifest.physicalRoles, installed.expectedTopLevelSkillFiles,
+      discoveryPrivateSkill, duringLocal.profileSha256,
+    )
     const topology = providerTopologyEvidence(transcriptRows)
     const privateSkill = providerPrivateSkillEvidence(
-      providerSession, installed, providerDiscovery.isolatedDuring?.profileSha256,
+      providerSession, installed, providerDiscovery.result === 'PASS'
+        ? providerDiscovery.isolatedDuring?.profileSha256 : null,
     )
     const targetAfter = fileSnapshot(layout.target)
     const changedPaths = snapshotDiff(targetBefore, targetAfter)
@@ -2985,7 +4129,6 @@ async function runConformance(options = {}) {
     if (auth?.destination) { fs.unlinkSync(auth.destination); auth = { ...auth, destination: null } }
     fs.rmSync(layout.activationHome, { recursive: true, force: true })
     const after = discoverySnapshot(layout, installed, 'ordinary')
-    const versionText = versionRun.stdout.toString('utf8').trim()
     const identity = options.identityProvider
       ? options.identityProvider()
       : deriveArtifactRuntimeIdentity(layout, cli, versionText)
@@ -3047,8 +4190,8 @@ async function runConformance(options = {}) {
       missionRun.exitCode === 0 && !missionRun.timedOut && residualPids.length === 0 &&
       usage.accountingComplete && usage.providerLaunchCount <= 6 &&
       usage.providerTurnCount <= 6 && usage.totalTokens <= MAX_TOTAL_TOKENS &&
-      before.ambientOnlyDiscoveryShim && before.privateRoleInventoryExact &&
-      duringLocal.ambientOnlyDiscoveryShim && after.ambientOnlyDiscoveryShim &&
+      before.ambientSurfaceExact && before.privateRoleInventoryExact &&
+      duringLocal.ambientSurfaceExact && after.ambientSurfaceExact &&
       stableJsonV1(before) === stableJsonV1(after) && mission.edit.result === 'PASS' &&
       mission.delegation.result === 'PASS' && mission.delegation.sameContextResume &&
       providerDiscovery.result === 'PASS' && topology.result === 'PASS' && changedPathsAllowed && identityExact &&
@@ -3177,13 +4320,21 @@ async function runConformance(options = {}) {
   } finally {
     if (secureAuditRoot && !secureAudit?.accounting) {
       try {
-        if (!providerSession && missionRun && layout) {
+        if (!providerSession && paidModelLaunchRequested && layout) {
           try {
+            const finalVersionText = versionRun?.stdout?.toString('utf8').trim()
             providerSession = readProviderSessionBundle(layout.activationHome, {
-              allowIncompleteLastLine: true,
+              expectedCliVersion: parsedCodexCliVersion(finalVersionText),
             })
           } catch (error) {
             accountingUnavailableReason = `PROVIDER_SESSION_${error.code || 'INVALID'}`
+            try {
+              providerSession = {
+                files: providerSessionRawFiles(readProviderSessionInputs(layout.activationHome)),
+              }
+            } catch (rawError) {
+              accountingUnavailableReason += `_RAW_${rawError.code || 'UNAVAILABLE'}`
+            }
           }
         }
         if (!usage && missionRun && providerSession) {
@@ -3369,6 +4520,7 @@ module.exports = {
   enforceOwnerOnlyWindowsAcl,
   evidenceEnvelope,
   installIsolatedPayload,
+  inspectMission,
   isWithin,
   isolatedLayout,
   killProcessTree,
@@ -3384,6 +4536,7 @@ module.exports = {
   readProviderSessionBundle,
   resolveRequiredProviderRoles,
   privateAgentConfigPath,
+  privateSkillDiscoveryPrefix,
   renderIsolatedProfile,
   runBoundedCommand,
   runPosixGroupCommand,

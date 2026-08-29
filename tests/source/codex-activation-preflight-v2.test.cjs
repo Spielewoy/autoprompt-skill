@@ -103,6 +103,7 @@ test('manifest generation qualifies every physical provider role and rejects a w
     const physical = aliases[role]
     profile.push('', `[agents."${physical}"]`, `config_file = "agents-runtime/${physical}.toml"`)
     fs.writeFileSync(path.join(agentsDirectory, `${physical}.toml`), [
+      `name = "${physical}"`,
       'model = "test-model"',
       'model_reasoning_effort = "low"',
       '',
@@ -127,6 +128,28 @@ test('manifest generation qualifies every physical provider role and rejects a w
   }, 'ap-worker', 'worker'), {
     model: 'test-model', effort: 'low', source: 'explicit', registryMatched: false,
   })
+
+  const workerPhysical = aliases['ap-worker']
+  const workerFile = path.join(agentsDirectory, `${workerPhysical}.toml`)
+  const originalWorker = fs.readFileSync(workerFile, 'utf8')
+  for (const [label, mutated] of [
+    ['logical', originalWorker.replace(`name = "${workerPhysical}"`, 'name = "ap-worker"')],
+    ['missing', originalWorker.replace(`name = "${workerPhysical}"\n`, '')],
+    ['duplicate', `${originalWorker}name = "${workerPhysical}"\n`],
+  ]) {
+    fs.writeFileSync(workerFile, mutated)
+    assert.throws(
+      () => activation.verifyRoleProjection(projection, profilePath),
+      /private-role-projection-name-mismatch/,
+      label,
+    )
+    assert.throws(
+      () => runtime.validateActivationRoleProjection({ roleProjection: projection }, profilePath, root),
+      /physical role name mismatch/,
+      label,
+    )
+  }
+  fs.writeFileSync(workerFile, originalWorker)
 
   const wrongGeneration = structuredClone(projection)
   wrongGeneration.payloadGeneration = otherGeneration

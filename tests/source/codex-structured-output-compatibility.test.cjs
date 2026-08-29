@@ -12,6 +12,7 @@ const test = require('node:test')
 const ROOT = path.resolve(__dirname, '..', '..')
 const {
   CodexExecAdapter,
+  OwnedCodexProxyRunner,
   admitRoadmapExpansion,
   assignmentLocalFindingId,
   bindCanonicalMissionForChild,
@@ -910,6 +911,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   const submittedCheckerHarnessHash = crypto.createHash('sha256')
     .update(submittedCheckerHarness).digest('hex')
   const alternateScratchHarness = `python3 tmp/independent_harness.py ${discoveredNodeHarnessPath}`
+  const strictScratchHarness = `python3 ${JSON.stringify(absoluteScratchHarness)} ${JSON.stringify(frozen)}`
+  const wrappedStrictScratchHarness = `/bin/bash -lc ${JSON.stringify(strictScratchHarness)}`
   const checkerChosenFailureOne = await runScenario({
     aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
     compactOutcomes: true,
@@ -927,13 +930,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       aggregated_output: 'TAP version 13\nnot ok 1 - checker-chosen-name-B\n# fail 1',
     }],
   })
-  assert.equal(checkerChosenFailureOne.code, 'FAIL')
-  assert.equal(checkerChosenFailureTwo.code, 'FAIL')
-  assert.equal(
-    checkerChosenFailureOne.payload.testOutcomes[0].failureIdentity,
-    checkerChosenFailureTwo.payload.testOutcomes[0].failureIdentity,
-    'checker-chosen scratch command paths and printed names cannot mint semantic novelty',
-  )
+  assert.equal(checkerChosenFailureOne.code, 'CHECK_INCONCLUSIVE')
+  assert.equal(checkerChosenFailureTwo.code, 'CHECK_INCONCLUSIVE')
   const wrappedCheckerHarnessPass = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
     outcomeCommandHash: submittedCheckerHarnessHash,
@@ -954,16 +952,14 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
     false,
   )
 
-  const strongScratchPassOutput = [
-    'PASS behavior: 2081245 rows preserve schema and relationships',
-    'PASS boundary: malformed memory and policy inputs are rejected',
-    'PASS verification: repeated and changed seeds satisfy determinism invariants',
-  ].join('\n')
+  const strongScratchPassOutput = JSON.stringify({
+    total: 20, passCount: 20, failureCount: 0, status: 'PASS',
+  })
   const sealedScratchHarnessPass = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
     compactOutcomes: true,
     commandEvents: [{
-      command: wrappedCheckerHarness, status: 'completed', exit_code: 0,
+      command: wrappedStrictScratchHarness, status: 'completed', exit_code: 0,
       aggregated_output: strongScratchPassOutput,
     }],
   })
@@ -1001,7 +997,7 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
     compactOutcomes: true,
     emitCommandStarts: false,
     commandEvents: [{
-      command: wrappedCheckerHarness, status: 'completed', exit_code: 0,
+      command: wrappedStrictScratchHarness, status: 'completed', exit_code: 0,
       aggregated_output: strongScratchPassOutput,
     }],
   })
@@ -1016,7 +1012,7 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       fs.appendFileSync(absoluteScratchHarness, '# changed after command start\n')
     },
     commandEvents: [{
-      command: wrappedCheckerHarness, status: 'completed', exit_code: 0,
+      command: wrappedStrictScratchHarness, status: 'completed', exit_code: 0,
       aggregated_output: strongScratchPassOutput,
     }],
   })
@@ -1033,7 +1029,7 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       fs.writeFileSync(absoluteScratchHarness, originalScratchHarness, { mode: 0o600 })
     },
     commandEvents: [{
-      command: wrappedCheckerHarness, status: 'completed', exit_code: 0,
+      command: wrappedStrictScratchHarness, status: 'completed', exit_code: 0,
       aggregated_output: strongScratchPassOutput,
     }],
   })
@@ -1060,8 +1056,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       aggregated_output: nodeTapFailure,
     }],
   })
-  assert.equal(wrappedCheckerHarnessFailure.code, 'FAIL',
-    'a candidate-bound failure remains actionable when only positive coverage is incomplete')
+  assert.equal(wrappedCheckerHarnessFailure.code, 'CHECK_INCONCLUSIVE',
+    'a relative scratch program and candidate-file argument cannot authorize product repair')
 
   const absoluteScratchHarnessFailure = await runScenario({
     aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
@@ -1073,13 +1069,18 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       status: 'failed', exit_code: 1, aggregated_output: nodeTapFailure,
     }],
   })
-  assert.equal(absoluteScratchHarnessFailure.code, 'FAIL',
-    'an absolute checker-scratch validator remains actionable only with a distinct frozen input')
+  assert.equal(absoluteScratchHarnessFailure.code, 'CHECK_INCONCLUSIVE',
+    'a scratch validator must receive the exact frozen root, not an arbitrary candidate file')
 
+  const productionVerifierOutput = JSON.stringify({
+    total: 20,
+    failureCount: 2,
+    failures: ['capacity balance mismatch', 'missing schedule row'],
+  })
   const f1deLegacyResultTelemetryFailure = await runScenario({
     aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
-    outcomeCommandHash: submittedCheckerHarnessHash,
-    outcomeFingerprint: crypto.createHash('sha256').update(nodeTapFailure).digest('hex'),
+    outcomeCommandHash: crypto.createHash('sha256').update(strictScratchHarness).digest('hex'),
+    outcomeFingerprint: crypto.createHash('sha256').update(productionVerifierOutput).digest('hex'),
     outcomeItemOverrides: {
       status: undefined,
       exitCode: 1,
@@ -1087,22 +1088,22 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       admittedNonzeroTestFailure: true,
     },
     commandEvents: [{
-      command: wrappedCheckerHarness, status: 'failed', exit_code: 1,
-      aggregated_output: nodeTapFailure,
+      command: wrappedStrictScratchHarness, status: 'failed', exit_code: 1,
+      aggregated_output: productionVerifierOutput,
     }],
   })
   const f1deStatusAndExtraTelemetryFailure = await runScenario({
     aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
-    outcomeCommandHash: submittedCheckerHarnessHash,
-    outcomeFingerprint: crypto.createHash('sha256').update(nodeTapFailure).digest('hex'),
+    outcomeCommandHash: crypto.createHash('sha256').update(strictScratchHarness).digest('hex'),
+    outcomeFingerprint: crypto.createHash('sha256').update(productionVerifierOutput).digest('hex'),
     outcomeItemOverrides: {
       exitCode: 1,
       result: 'FAIL',
       admittedNonzeroTestFailure: true,
     },
     commandEvents: [{
-      command: wrappedCheckerHarness, status: 'failed', exit_code: 1,
-      aggregated_output: nodeTapFailure,
+      command: wrappedStrictScratchHarness, status: 'failed', exit_code: 1,
+      aggregated_output: productionVerifierOutput,
     }],
   })
   assert.deepEqual(
@@ -1121,11 +1122,6 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
     'known checker telemetry is projected away from the controller-owned outcome',
   )
 
-  const productionVerifierOutput = JSON.stringify({
-    total: 20,
-    failureCount: 2,
-    failures: ['capacity balance mismatch', 'missing schedule row'],
-  })
   const productionVerifierFailure = await runScenario({
     aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
     compactOutcomes: true,
@@ -1175,8 +1171,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       aggregated_output: selectedCheckFailureOutput,
     }],
   })
-  assert.equal(selectedCheckFailure.code, 'FAIL',
-    'an anchored selected-check failure from a candidate-bound harness is substantive')
+  assert.equal(selectedCheckFailure.code, 'CHECK_INCONCLUSIVE',
+    'plain selected-check prose from a noncanonical scratch command is not repair authority')
 
   const capturedCheckerCommand = `set -o pipefail\n${submittedCheckerHarness} | tee output/check-2.txt`
   const capturedCheckerCommandHash = crypto.createHash('sha256')
@@ -1190,8 +1186,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       aggregated_output: selectedCheckFailureOutput,
     }],
   })
-  assert.equal(capturedCheckerFailure.code, 'FAIL',
-    'a pipefail harness with a bounded scratch capture retains candidate-bound failure authority')
+  assert.equal(capturedCheckerFailure.code, 'CHECK_INCONCLUSIVE',
+    'redirection and pipeline capture are outside the exact scratch authority grammar')
 
   const incidentCapturedCheckerCommand = [
     'set -o pipefail;',
@@ -1208,8 +1204,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       status: 'failed', exit_code: 1, aggregated_output: selectedCheckFailureOutput,
     }],
   })
-  assert.equal(incidentCapturedCheckerFailure.code, 'FAIL',
-    'the exact Codex semicolon, stderr capture, and tee incident shape remains actionable')
+  assert.equal(incidentCapturedCheckerFailure.code, 'CHECK_INCONCLUSIVE',
+    'semicolon, environment, stderr capture, and tee cannot authorize repair')
 
   const timeoutCapturedCheckerCommand = [
     'set -o pipefail;',
@@ -1224,8 +1220,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       status: 'failed', exit_code: 1, aggregated_output: selectedCheckFailureOutput,
     }],
   })
-  assert.equal(timeoutCapturedCheckerFailure.code, 'FAIL',
-    'a transparent timeout around the captured HTML/CAD harness retains failure authority')
+  assert.equal(timeoutCapturedCheckerFailure.code, 'CHECK_INCONCLUSIVE',
+    'timeout, environment, and capture wrappers cannot authorize repair')
 
   const uncapturedPipelineFailure = await runScenario({
     aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
@@ -1391,26 +1387,26 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   const partiallyBoundFailure = await runScenario({
     aggregateCode: 'FAIL', outcomeStatus: 'FAIL', authorizedCommand: null,
     checkIds: [rejectedCase, secondRejectedCase],
-    outcomeCommandHash: submittedCheckerHarnessHash,
+    outcomeCommandHash: crypto.createHash('sha256').update(genericCommand).digest('hex'),
     outcomeFingerprints: {
       [rejectedCase]: crypto.createHash('sha256').update(nodeTapFailure).digest('hex'),
       [secondRejectedCase]: 'f'.repeat(64),
     },
     commandEvents: [{
-      command: wrappedCheckerHarness, status: 'failed', exit_code: 1,
+      command: genericCommand, status: 'failed', exit_code: 1,
       aggregated_output: nodeTapFailure,
     }],
   })
   assert.equal(partiallyBoundFailure.code, 'FAIL',
-    'an unobserved extra claim cannot erase one controller-bound product failure')
+    'one substantive candidate harness may reject multiple named cases without model selectors')
   assert.deepEqual(
     partiallyBoundFailure.payload.verificationObservationDisposition
       .commandBoundFailureCheckIds,
-    [rejectedCase],
+    [rejectedCase, secondRejectedCase],
   )
   assert.deepEqual(
     partiallyBoundFailure.payload.verificationObservationDisposition.unboundFailureCheckIds,
-    [secondRejectedCase],
+    [],
   )
 
   const nonzeroCannotAuthorizePass = await runScenario({
@@ -1480,7 +1476,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       command: genericCommand, status: 'completed', exit_code: 0, aggregated_output: summary,
     }],
   })
-  assert.equal(wrongCommandHash.code, 'CHECK_INCONCLUSIVE')
+  assert.equal(wrongCommandHash.code, 'PASS',
+    'a model-guessed command selector is discarded in favor of controller-owned evidence')
 
   const historicalScratchOutput = 'same frozen candidate, scratch oracle revision 1: FAIL'
   const unrelatedIntrospectionDrift = await runScenario({
@@ -1729,7 +1726,7 @@ test('fallible local bookkeeping callbacks cannot discard a schema-valid termina
         callbackAttempts += 1
         if (callbackAttempts === 1) {
           throw Object.assign(new Error(`injected ${callbackName} persistence failure`), {
-            code: 'RUN_RECORD_FAILURE',
+            code: 'RUN_RECORD_WRITE_UNAVAILABLE',
           })
         }
         if (callbackName === 'onUsageDelta') return { continue: true }
@@ -1784,7 +1781,7 @@ test('fallible local bookkeeping callbacks cannot discard a schema-valid termina
     onTerminalResult() {
       persistentAttempts += 1
       throw Object.assign(new Error('persistent local terminal persistence outage'), {
-        code: 'RUN_RECORD_FAILURE',
+        code: 'RUN_RECORD_WRITE_UNAVAILABLE',
       })
     },
   }), error => error.code === 'CALLBACK_RECONCILIATION_PENDING' &&
@@ -3065,7 +3062,7 @@ test('IMAGE_DATUM ordering requires an authenticated pre-work admission receipt'
     contracts: [contract],
   }
   const receiptBody = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: 'codex-captured-domain-pre-work-admission',
     runId: 'run-1',
     generation: 1,
@@ -3075,6 +3072,9 @@ test('IMAGE_DATUM ordering requires an authenticated pre-work admission receipt'
     routeDecisionHash: admission.routeDecisionHash,
     targetStateHash: admission.targetStateHash,
     imageCertificateHashes: [contract.certificateHash],
+    preWorkState: 'RUN_WORK',
+    preWorkStateEventHash: '3'.repeat(64),
+    preWorkStateEventSequence: 7,
   }
   const receipt = {
     ...receiptBody,
@@ -3311,4 +3311,317 @@ test('checker brief validation projects canonical absolute inputs into its snaps
     readOnly: true,
     enforcePreimages: false,
   }), error => error.code === 'MISSION_PATH_INVALID')
+})
+
+test('Codex preserves multi-command route analyses on a clean owned exit without turn.completed', async t => {
+  const directory = temporaryDirectory(t)
+  const executionPolicy = {
+    logicalRole: 'route-analyst', physicalRole: 'autoprompt.v2.route-analyst',
+    providerRole: 'ap-route-analyst', sandboxMode: 'read-only',
+    policyId: 'autoprompt.codex.role-policy', policyVersion: '2.0.0',
+  }
+  const fallbackUsage = Object.freeze({
+    noncachedInput: 64000, cachedInput: 128000, output: 8000, reasoning: 4000,
+  })
+  const scenarios = [
+    {
+      id: 'multi-file-index-build', route: 'ROADMAP',
+      commandCount: 3,
+      obligation: 'distinct-keys-remain-distinct',
+      recommendation: createRouteRecommendation({
+        schemaVersion: '2.0.0', preWorkResult: 'CONTINUE', recommendedRoute: 'ROADMAP', confidence: 'high',
+        whatTheUserWants: ['Build related record indexes consistently and deterministically.'],
+        likelyAreas: ['/app/assemble.js', '/app/source', '/app/result'],
+        howSuccessCanBeChecked: [
+          'distinct-keys-remain-distinct: distinct records do not share an index key unless an exact alias rule is declared.',
+          'Verify index identity, memory bounds, and repeated-build behavior against the exact produced artifacts.',
+        ],
+        unknowns: ['The source data may contain ambiguous aliases that require exact detection.'],
+        risks: ['An alias conflict could merge otherwise distinct records.'],
+        independentWorkItems: ['Implement bounded index assembly.', 'Verify exact alias and repeatability invariants.'],
+        dependencies: ['Alias verification consumes the implementation artifact.'],
+        reasonsForDirect: ['The alias and cross-file identity obligations exceed one unplanned edit.'],
+        reasonsForLight: ['A short plan cannot safely coordinate the dependent exact-version verification.'],
+        reasonsForRoadmap: ['Implementation and alias verification are dependent work groups.'],
+        userInputNeeded: [], evidenceIndex: [],
+      }),
+    },
+    {
+      id: 'configuration-validator', route: 'LIGHT', obligation: 'obfuscated directives',
+      commandCount: 1,
+      recommendation: createRouteRecommendation({
+        schemaVersion: '2.0.0', preWorkResult: 'CONTINUE', recommendedRoute: 'LIGHT', confidence: 'high',
+        whatTheUserWants: ['Validate a configuration file in place without changing safe lookalike text.'],
+        likelyAreas: ['/app/validate.js'],
+        howSuccessCanBeChecked: [
+          'Reject forbidden directives, duplicate handlers, obfuscated directives, and embedded active references.',
+          'Preserve safe lookalike text and verify the in-place CLI ordering contract.',
+        ],
+        unknowns: ['Parser behavior for malformed encodings needs a bounded implementation decision.'],
+        risks: ['Parser differentials can leave forbidden directives active.'],
+        independentWorkItems: [], dependencies: [],
+        reasonsForDirect: ['The parser and serialization choice needs an explicit short decision.'],
+        reasonsForLight: ['One implementation follows a short ordered validation policy.'],
+        reasonsForRoadmap: ['There are no separately owned dependent work groups.'],
+        userInputNeeded: [], evidenceIndex: [],
+      }),
+    },
+  ]
+
+  for (const scenario of scenarios) {
+    const observedUsage = []
+    let stops = 0
+    const adapter = new CodexExecAdapter({
+      runner: {
+        async run(spec) {
+          const commandEvents = Array.from({ length: scenario.commandCount }, (_, index) => [
+            {
+              type: 'item.started',
+              item: {
+                id: `cohort-command-${index}`, type: 'command_execution',
+                command: `sed -n '${index + 1}p' README.md`,
+              },
+            },
+            {
+              type: 'item.completed',
+              item: {
+                id: `cohort-command-${index}`, type: 'command_execution',
+                command: `sed -n '${index + 1}p' README.md`, status: 'completed', exit_code: 0,
+              },
+            },
+          ]).flat()
+          for (const event of [
+            { type: 'thread.started', thread_id: `cohort-${scenario.id}` },
+            { type: 'turn.started' },
+            ...commandEvents,
+            {
+              type: 'item.completed',
+              item: {
+                id: 'item-final', type: 'agent_message',
+                text: JSON.stringify({ canonicalJson: JSON.stringify(scenario.recommendation) }),
+              },
+            },
+          ]) spec.onStdoutLine(JSON.stringify(event))
+          return {
+            status: 0, stdout: '', stderr: '', processOwned: true,
+            exactArgv: true, drained: true,
+          }
+        },
+        async stop() { stops += 1; return { drained: true } },
+      },
+      targetPath: ROOT,
+      profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+      outputSchemaResolver: () => path.join(
+        ROOT, 'agents', 'contracts', 'schemas', 'route-recommendation.schema.json',
+      ),
+      providerSchemaRoot: path.join(directory, `provider-${scenario.id}`),
+    })
+    const result = await adapter.launch({
+      ...executionPolicy, route: 'PRE_ROUTE', physicalExecutionPolicy: executionPolicy,
+      ...adapterMissionFields('a'.repeat(64), `cohort-${scenario.id}`),
+      dispatch: {
+        brief: 'Recommend the exact route.',
+        requestPointer: { path: 'request', hash: 'a'.repeat(64) },
+      },
+      environment: {}, sessionId: `session-${scenario.id}`,
+      reservationId: `reservation-${scenario.id}`,
+      usageCompatibilityFallback: fallbackUsage,
+      onUsageDelta(delta) { observedUsage.push(delta); return { continue: true } },
+    })
+    assert.equal(result.recommendedRoute, scenario.route, scenario.id)
+    assert.equal(result.howSuccessCanBeChecked.some(value => value.includes(scenario.obligation)), true,
+      scenario.id)
+    assert.deepEqual(result.usage, fallbackUsage, scenario.id)
+    assert.deepEqual(observedUsage, [fallbackUsage], scenario.id)
+    assert.deepEqual(result.transportEvidence.usageCompatibility, {
+      status: 'CONTROLLER_BOUND_FALLBACK',
+      reportedFields: [],
+      fallbackFields: ['noncachedInput', 'cachedInput', 'output', 'reasoning'],
+    }, scenario.id)
+    assert.equal(result.reconstructedTerminal, undefined, scenario.id)
+    assert.equal(stops, 0, 'clean-exit compatibility does not manufacture an early stop')
+  }
+})
+
+test('Codex clean-exit usage compatibility preserves telemetry and fails closed on unsafe accounting', async t => {
+  const directory = temporaryDirectory(t)
+  const output = canonicalWorkerResult({ reportId: 'partial-usage-clean-exit' })
+  const compatibilityFallback = Object.freeze({
+    noncachedInput: 100, cachedInput: 40, output: 20, reasoning: 2,
+  })
+  const launch = async ({ usage, terminalOutput = output, status = 0, drained = true,
+    fallback = compatibilityFallback, suffix, emitSession = true, malformedJsonl = false,
+    processOwned = true, exactArgv = true, usageContinue = true }) => {
+    const adapter = new CodexExecAdapter({
+      runner: {
+        async run(spec) {
+          if (malformedJsonl) {
+            spec.onStdoutLine('{')
+            return { status, stdout: '', stderr: '', processOwned, exactArgv, drained }
+          }
+          if (emitSession) {
+            spec.onStdoutLine(JSON.stringify({ type: 'thread.started', thread_id: `thread-${suffix}` }))
+          }
+          spec.onStdoutLine(JSON.stringify({
+            type: 'item.completed',
+            item: {
+              type: 'agent_message',
+              text: JSON.stringify({ canonicalJson: JSON.stringify(terminalOutput) }),
+            },
+          }))
+          if (usage !== undefined) {
+            spec.onStdoutLine(JSON.stringify({ type: 'turn.completed', usage }))
+          }
+          return { status, stdout: '', stderr: '', processOwned, exactArgv, drained }
+        },
+        async stop() { return { drained: true } },
+      },
+      targetPath: ROOT,
+      profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+      outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
+      providerSchemaRoot: path.join(directory, `provider-${suffix}`),
+    })
+    const deltas = []
+    const result = await adapter.launch({
+      ...EXECUTION_POLICY, physicalExecutionPolicy: EXECUTION_POLICY,
+      ...adapterMissionFields('hash', `usage-${suffix}`),
+      dispatch: { brief: 'Return the bounded result.', requestPointer: { path: 'request', hash: 'hash' } },
+      environment: {}, sessionId: `session-${suffix}`, reservationId: `reservation-${suffix}`,
+      usageCompatibilityFallback: fallback,
+      onUsageDelta(delta) { deltas.push(delta); return { continue: usageContinue } },
+    })
+    return { result, deltas }
+  }
+
+  const partial = await launch({
+    suffix: 'partial',
+    usage: { input_tokens: 11, output_tokens: 3 },
+  })
+  assert.deepEqual(partial.result.usage, {
+    noncachedInput: 11, cachedInput: 40, output: 3, reasoning: 2,
+  })
+  assert.deepEqual(partial.deltas, [partial.result.usage])
+  assert.deepEqual(partial.result.transportEvidence.usageCompatibility, {
+    status: 'CONTROLLER_BOUND_FALLBACK',
+    reportedFields: ['noncachedInput', 'output'],
+    fallbackFields: ['cachedInput', 'reasoning'],
+  })
+
+  const malformed = await launch({ suffix: 'malformed-output', terminalOutput: { code: 'PASS' } })
+  assert.equal(malformed.result.reportType, 'result')
+  assert.equal(malformed.result.allAssignedItemsPass, false)
+  assert.equal(malformed.result.reconstructedTerminal, true)
+  assert.deepEqual(malformed.deltas, [compatibilityFallback],
+    'a malformed report still pays for its admitted model turn')
+
+  await assert.rejects(
+    launch({ suffix: 'negative-usage', usage: { input_tokens: -1, output_tokens: 3 } }),
+    error => error.code === 'CODEX_USAGE_INVALID',
+  )
+  await assert.rejects(
+    launch({
+      suffix: 'zero-fallback',
+      fallback: { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 },
+    }),
+    error => error.code === 'CODEX_USAGE_INCOMPLETE',
+  )
+  await assert.rejects(
+    launch({ suffix: 'nonzero-exit', status: 9 }),
+    error => error.code === 'CODEX_CHILD_FAILED',
+  )
+  await assert.rejects(
+    launch({ suffix: 'undrained-exit', drained: false }),
+    error => error.code === 'PROCESS_DRAIN_TIMEOUT',
+  )
+  await assert.rejects(
+    launch({ suffix: 'missing-session', emitSession: false }),
+    error => error.code === 'CODEX_SESSION_ID_MISSING',
+  )
+  await assert.rejects(
+    launch({ suffix: 'malformed-jsonl', malformedJsonl: true }),
+    error => error.code === 'CODEX_EVENT_STREAM_INVALID',
+  )
+  await assert.rejects(
+    launch({ suffix: 'unowned-exit', processOwned: false }),
+    error => error.code === 'PROVIDER_UNSUPPORTED',
+  )
+  await assert.rejects(
+    launch({ suffix: 'budget-denied', usageContinue: false }),
+    error => error.code === 'BUDGET_EXHAUSTED' &&
+      error.usage.noncachedInput === compatibilityFallback.noncachedInput,
+  )
+})
+
+test('owned Codex proxy rereads stdout after status appears before the final poll projection', async t => {
+  const directory = temporaryDirectory(t)
+  const controlRoot = path.join(directory, 'proxy-control')
+  fs.mkdirSync(controlRoot)
+  const output = canonicalWorkerResult({ reportId: 'status-before-final-read' })
+  const first = JSON.stringify({ type: 'thread.started', thread_id: 'proxy-drain-thread' })
+  const finalLines = [
+    JSON.stringify({
+      type: 'item.completed',
+      item: { type: 'agent_message', text: JSON.stringify(output) },
+    }),
+    JSON.stringify({
+      type: 'turn.completed',
+      usage: { input_tokens: 7, cached_input_tokens: 2, output_tokens: 3, reasoning_output_tokens: 1 },
+    }),
+  ]
+  let request = null
+  const owner = {
+    async launch(spec) {
+      request = JSON.parse(fs.readFileSync(spec.argv.at(-1), 'utf8'))
+      fs.writeFileSync(request.stdoutPath, `${first}\n`)
+      fs.writeFileSync(request.stderrPath, '')
+      return { ownershipId: 'proxy-drain-owner', groupIdentity: 'proxy-drain-group' }
+    },
+    async observeRootExit() {
+      return {
+        ownershipId: 'proxy-drain-owner', groupIdentity: 'proxy-drain-group', status: 'DONE',
+      }
+    },
+    async cancelGroup() {
+      return {
+        ownershipId: 'proxy-drain-owner', groupIdentity: 'proxy-drain-group', status: 'CANCELLED',
+      }
+    },
+  }
+  const runner = new OwnedCodexProxyRunner({
+    processOwner: owner, controlRoot, targetKey: 'proxy-drain-target', pollMs: 1,
+  })
+  const accumulator = createCodexJsonlAccumulator()
+  let lineCount = 0
+  const execution = await runner.run({
+    executable: process.execPath, argv: ['-e', 'process.exit(0)'], cwd: directory,
+    env: {}, stdin: '', sessionId: 'proxy-drain-session', reservationId: 'proxy-drain-reservation',
+    onStdoutLine(line) {
+      lineCount += 1
+      accumulator.push(line, lineCount)
+      if (lineCount !== 1) return
+      fs.appendFileSync(request.stdoutPath, `${finalLines.join('\n')}\n`)
+      fs.writeFileSync(request.statusPath, `${JSON.stringify({
+        schemaVersion: 2,
+        activationId: request.activationId,
+        generationId: request.generationId,
+        sequence: request.sequence,
+        argvHash: request.argvHash,
+        codexPid: 4242,
+        code: 0,
+        signal: null,
+        error: null,
+      })}\n`)
+    },
+  })
+  const parsed = accumulator.snapshot()
+  const roleSchema = JSON.parse(fs.readFileSync(
+    path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'), 'utf8',
+  ))
+  assert.equal(lineCount, 3)
+  assert.equal(execution.drained, true)
+  assert.equal(parsed.output.reportId, output.reportId)
+  assert.equal(validateJsonSchema(roleSchema, parsed.output).valid, true)
+  assert.deepEqual(parsed.usage, {
+    noncachedInput: 5, cachedInput: 2, output: 3, reasoning: 1,
+  })
 })

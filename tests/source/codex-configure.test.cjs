@@ -187,6 +187,67 @@ test('Codex checker activation profile is a separate mechanically read-only prof
   }
 })
 
+test('Codex local-only activation proof accepts an exact detached HEAD', t => {
+  const { sandbox } = createFixture(t, 'autoprompt codex configure ')
+  const target = path.join(sandbox, 'detached-target')
+  const activationRoot = path.join(sandbox, 'activation')
+  const configIsolationPath = path.join(activationRoot, 'empty.gitconfig')
+  const ghConfigDir = path.join(activationRoot, 'gh-config')
+  const profilePath = path.join(activationRoot, 'autoprompt.config.toml')
+  const proofPath = path.join(activationRoot, 'enforcement-proof.json')
+  fs.mkdirSync(target)
+  fs.mkdirSync(ghConfigDir, { recursive: true, mode: 0o700 })
+  fs.writeFileSync(configIsolationPath, '', { mode: 0o600 })
+  const profile = [
+    'sandbox_mode = "workspace-write"', 'web_search = "disabled"', '',
+    '[sandbox_workspace_write]', 'network_access = false', '', '[features]',
+    'apps = false', 'enable_mcp_apps = false', 'plugins = false',
+    'remote_plugin = false', 'browser_use = false', 'browser_use_external = false',
+    'in_app_browser = false', 'computer_use = false', 'image_generation = false', '',
+  ].join('\n')
+  fs.writeFileSync(profilePath, profile, { mode: 0o600 })
+  const proof = {
+    schemaVersion: 1,
+    provider: 'codex',
+    profilePath,
+    profileSha256: crypto.createHash('sha256').update(profile).digest('hex'),
+    selectedProfile: 'autoprompt',
+    strictConfig: true,
+  }
+  fs.writeFileSync(proofPath, `${JSON.stringify(proof)}\n`, { mode: 0o600 })
+  for (const argv of [
+    ['init', '-b', 'main'],
+    ['config', 'user.name', 'Detached Activation Test'],
+    ['config', 'user.email', 'detached-activation@example.invalid'],
+    ['commit', '--quiet', '--allow-empty', '-m', 'detached activation fixture'],
+    ['checkout', '--quiet', '--detach', 'HEAD'],
+  ]) {
+    const result = run('git', argv, { cwd: target })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+  }
+
+  const safety = require('../../scripts/local-only-safety.cjs')
+  const environment = safety.createSafeChildGitEnvironment(target, process.env, {
+    configIsolationPath,
+    ghConfigDir,
+  })
+  const repaired = run(process.execPath, [
+    path.join(ROOT, 'scripts', 'local-only-safety.cjs'),
+    '--repo', target,
+    '--expected-branch', '',
+    '--enforcement-proof', proofPath,
+    '--repair',
+    '--json',
+  ], { env: environment })
+  assert.equal(repaired.status, 0, repaired.stderr || repaired.stdout)
+
+  const inspection = codexConfigure.proveLocalOnlySafety(target, environment, proof)
+  assert.equal(inspection.mechanicallyEnforced, true)
+  assert.equal(inspection.actualBranch, null)
+  assert.equal(inspection.head.state, 'detached')
+  assert.match(inspection.head.oid, /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/)
+})
+
 test('historical global-role registry classifies legacy roles without a current install receipt', t => {
   const fixture = createFixture(t, 'autoprompt codex configure ')
   const root = path.join(fixture.sandbox, 'codex root')
@@ -434,6 +495,15 @@ test('receipt-bound Codex payload remains byte-identical across side-by-side pro
     projected[0].roleProjection.logicalToPhysicalProviderRole,
     manifest.logicalToPhysicalProviderRole,
   )
+  for (const [logicalRole, physicalRole] of Object.entries(
+    projected[0].roleProjection.logicalToPhysicalProviderRole,
+  )) {
+    const projectedRole = fs.readFileSync(path.join(
+      projected[0].activationSkillRoot, 'agents-runtime', `${physicalRole}.toml`,
+    ), 'utf8')
+    assert.match(projectedRole, new RegExp(`^name = "${physicalRole}"$`, 'm'))
+    assert.doesNotMatch(projectedRole, new RegExp(`^name = "${logicalRole}"$`, 'm'))
+  }
 
   const driftFile = path.join(context.skillRoot, 'SKILL.md')
   const expected = sha256(driftFile)

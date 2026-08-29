@@ -339,6 +339,47 @@ test('provider-authored activation matrices remain generic controller input', ()
   assert.equal(decisions.validateRouteDecision(missingInactive).valid, false)
 })
 
+test('provider obligation canonicalization salvages valid rows, rekeys collisions, and degrades incomplete activation semantics', () => {
+  const supplied = [{
+    id: 'transition-contract',
+    kind: 'ordered-activation',
+    statement: 'Declared transitions preserve the supplied temporal witnesses.',
+    cases: [
+      { id: 'edge', phase: 'inactive', polarity: 'must-not-hold', precondition: 'before the first edge', expectedObservation: 'no transition is active' },
+      { id: 'edge', phase: 'boundary', polarity: 'must-hold', precondition: 'at the first edge', expectedObservation: 'the first transition is active' },
+      { id: 'malformed-only', phase: 'unknown', polarity: 'must-hold', precondition: 'unsupported phase', expectedObservation: 'not admitted' },
+    ],
+  }, {
+    id: 'transition-contract',
+    kind: 'invariant',
+    statement: 'The independent output constraint remains observable.',
+    cases: [{
+      id: 'observable', phase: 'ordinary', polarity: 'must-hold',
+      precondition: 'the output is inspected', expectedObservation: 'the declared constraint is present',
+    }],
+  }, {
+    id: 'discard-only-this-row',
+    kind: 'invariant',
+    statement: 'A row without any valid cases has no verification authority.',
+    cases: [{ id: '', phase: 'ordinary', polarity: 'must-hold', precondition: '', expectedObservation: '' }],
+  }]
+  const canonical = decisions.canonicalVerificationObligations(supplied, ['unused fallback'])
+  assert.deepEqual(canonical.map(item => [item.id, item.kind]), [
+    ['transition-contract', 'invariant'],
+    ['transition-contract-2', 'invariant'],
+  ])
+  assert.deepEqual(canonical[0].cases.map(item => item.id), ['edge', 'edge-2'])
+  assert.equal(canonical[0].cases.some(item => item.id === 'malformed-only'), false)
+  assert.deepEqual(canonical[1].cases, supplied[1].cases)
+
+  const routed = decision(routeFacts(), {
+    requested_result: 'Preserve the supplied transition and output contracts.',
+    verification_obligations: supplied,
+  })
+  assert.deepEqual(routed.verificationObligations, canonical)
+  assert.equal(decisions.validateRouteDecision(routed).valid, true)
+})
+
 test('captured incident domains enforce exact certificates, ordering, provenance, hidden boundaries, datum rulings, and isolated promotion joins', () => {
   const H4 = 'd'.repeat(64)
   const H5 = 'e'.repeat(64)
@@ -637,7 +678,7 @@ test('ordinary one-case LIGHT recommendations remain canonical without invented 
   assert.equal(decisions.validateRouteDecision(compiled).valid, true)
 })
 
-test('provider obligation canonicalization uses transport defaults instead of invented semantics', () => {
+test('provider obligation canonicalization preserves valid duplicate-ID cases with deterministic identities', () => {
   const raw = recommendation()
   raw.verificationObligations = [{
     id: 'provider-approximation', kind: 'invariant', statement: 'Provider approximation.',
@@ -650,16 +691,11 @@ test('provider obligation canonicalization uses transport defaults instead of in
   const normalized = decisions.canonicalizeProviderRecommendation(raw)
   assert.equal(normalized.valid, true)
   const obligation = normalized.recommendation.verificationObligations[0]
-  assert.equal(obligation.id, 'obligation-1')
-  assert.equal(obligation.statement, raw.howSuccessCanBeChecked[0])
+  assert.equal(obligation.id, 'provider-approximation')
+  assert.equal(obligation.statement, 'Provider approximation.')
   assert.equal(new Set(obligation.cases.map(item => item.id)).size, obligation.cases.length)
-  assert.deepEqual(obligation.cases, [{
-    id: 'expected', phase: 'ordinary', polarity: 'must-hold',
-    precondition: 'the named check is executed',
-    expectedObservation: raw.howSuccessCanBeChecked[0],
-  }])
-  assert.equal(normalized.recommendation.verificationObligations.some(item =>
-    item.id === 'provider-approximation'), false)
+  assert.deepEqual(obligation.cases.map(item => item.id), ['same', 'same-2'])
+  assert.deepEqual(obligation.cases.map(item => item.polarity), ['must-hold', 'must-not-hold'])
 
   const semanticallyMalformed = recommendation({
     reasonsForLight: ['   '],
@@ -757,12 +793,55 @@ test('automatic route decision is deterministically compiled without a second mo
   assert.equal(decisions.validateRouteDecision(compiled).valid, true)
   const contradictory = recommendation()
   contradictory.recommendedRoute = 'LIGHT'
-  assert.throws(() => decisions.compileAutomaticRouteDecision({
+  const corrected = decisions.compileAutomaticRouteDecision({
     recommendation: contradictory,
     requestedResult: 'Return the requested result.', requestEnvelopeHash: H,
     providerCapabilities: { isolatedChecking: true, stableChildIdentity: true },
     budget: { remaining: { wallMs: 60 * 60 * 1000 } },
-  }), error => error.code === 'ROUTE_DECISION_INVALID' && /contradicts/u.test(error.message))
+  })
+  assert.equal(corrected.route, 'DIRECT')
+  assert.equal(corrected.analystDisagreement.recommendation, 'LIGHT')
+  assert.equal(corrected.analystDisagreement.analystFactsFingerprint, corrected.routeFactsFingerprint)
+  assert.equal(corrected.analystDisagreement.analystClassifierFingerprint, corrected.classifierFingerprint)
+  assert.equal(decisions.validateRouteDecision(corrected).valid, true)
+})
+
+test('automatic route decision preserves analyst facts when the advisory label understates the route', () => {
+  const proposal = {
+    ...recommendation().routeFactProposal,
+    dependencyShape: 'dependent-groups',
+    dependentWorkGroupCount: 2,
+    integrationOwnerRequired: true,
+    mutableResources: [
+      { kind: 'service', identity: 'api', shared: false, ownershipMode: 'ordered-transfer' },
+      { kind: 'service', identity: 'web', shared: false, ownershipMode: 'ordered-transfer' },
+    ],
+    architectureImpact: 'multi-system',
+  }
+  const advisory = recommendation({
+    recommendedRoute: 'LIGHT',
+    routeFactProposal: proposal,
+    reasonsForRoadmap: ['Two dependent work groups require an integration owner.'],
+  })
+  const compiled = decisions.compileAutomaticRouteDecision({
+    recommendation: advisory,
+    requestedResult: 'Return the integrated result.',
+    requestEnvelopeHash: H,
+    providerCapabilities: {
+      sameContextContinuation: true,
+      isolatedChecking: true,
+      stableChildIdentity: true,
+    },
+    budget: { remaining: { wallMs: 60 * 60 * 1000 } },
+    nowMs: 1,
+  })
+  assert.equal(compiled.route, 'ROADMAP')
+  assert.equal(compiled.normalizedRouteFacts.dependency.shape, 'dependent-groups')
+  assert.equal(compiled.normalizedRouteFacts.dependency.dependentWorkGroupCount, 2)
+  assert.deepEqual(compiled.normalizedRouteFacts.mutableResources.map(resource => resource.identity), ['api', 'web'])
+  assert.equal(compiled.analystDisagreement.recommendation, 'LIGHT')
+  assert.match(compiled.analystDisagreement.concreteReason, /corrected the advisory route/u)
+  assert.equal(decisions.validateRouteDecision(compiled).valid, true)
 })
 
 test('automatic route compilation defers an unknown executable baseline to the production gate consistently', () => {
@@ -1505,7 +1584,7 @@ test('topology is route-derived and carries ownership and freeze prerequisites b
   assert.equal(topology.coordination.planChecker.count, 0)
   assert.equal(topology.coordination.coordination.integrationOwner.count, 0)
   assert.equal(topology.childSessions, 3)
-  assert.equal(decisions.roadmapCompletionLaunchRequirement(topology), 7)
+  assert.equal(decisions.roadmapCompletionLaunchRequirement(topology), 9)
   assert.deepEqual(topology.workGroupManager, {
     role: 'ap-work-group-manager', physicalRoleId: 'autoprompt.v2.ap-work-group-manager',
     parent: 'mission-coordinator', count: 0, admitted: false, planPath: 'plan/ROADMAP.md',
@@ -1534,7 +1613,7 @@ test('topology is route-derived and carries ownership and freeze prerequisites b
   assert.equal(disjoint.counts.missionCoordinators, 0)
   assert.equal(disjoint.counts.workGroupManagers, 0)
   assert.equal(disjoint.childSessions, 4)
-  assert.equal(decisions.roadmapCompletionLaunchRequirement(disjoint), 8)
+  assert.equal(decisions.roadmapCompletionLaunchRequirement(disjoint), 11)
   const withScout = decisions.buildRouteTopology('ROADMAP', {
     facts, worker_count: 1, scout_count: 1, named_unknowns: ['resolve the exact API boundary'],
     mutable_resource_ownership: facts.mutableResources.map(resource => ({
@@ -1607,7 +1686,7 @@ test('route decision validation recomputes topology instead of trusting recorded
   assert.equal(decisions.validateRouteDecision(legacyRoadmap).valid, true,
     'authenticated legacy ROADMAP intake remains valid without restoring retired provider calls')
   assert.deepEqual(router.schemaErrors(legacyRoadmap, decisions.ROUTE_DECISION_SCHEMA), [])
-  assert.equal(decisions.completionLaunchRequirement(legacyRoadmap.topology), 7,
+  assert.equal(decisions.completionLaunchRequirement(legacyRoadmap.topology), 9,
     'legacy topology declarations never inflate the current Codex physical call budget')
   const managerTamper = clone(roadmap)
   managerTamper.topology.counts.workGroupManagers = 1
@@ -1653,10 +1732,10 @@ test('exact user path decisions have zero route analysts, retain independent che
     const automaticRequirement = decisions.completionLaunchRequirement(automatic.topology)
     const exactRequirement = decisions.completionLaunchRequirement(exact.topology)
     if (route === 'DIRECT') {
-      assert.equal(automaticRequirement, 7)
-      assert.equal(exactRequirement, 6)
+      assert.equal(automaticRequirement, 9)
+      assert.equal(exactRequirement, 8)
     } else {
-      assert.equal(exactRequirement, 6)
+      assert.equal(exactRequirement, 8)
     }
     const alternative = router.ROUTES.find(candidate => candidate !== route)
     const change = decisions.evaluateRouteChange({
@@ -1702,8 +1781,16 @@ test('Codex-private physical completion receipts cover every valid route, path, 
       assert.equal(receipt.analystLaunches, analystLaunches)
       assert.equal(receipt.workerLaunches, workers)
       assert.equal(receipt.checkerLaunches, checkers)
-      const expectedContingency = 3 + checkers
+      const transportRetries = workers + 1
+      const expectedContingency = transportRetries +
+        (checkers === 1 ? 2 : 0) + 1 + checkers
       assert.equal(receipt.boundedContingencyLaunches, expectedContingency)
+      assert.deepEqual(receipt.boundedContingencyComponents, {
+        transportRetries,
+        singleSeatScratchPassConfirmations: checkers === 1 ? 2 : 0,
+        aggregateProductRepairs: 1,
+        repairedCheckerSeats: checkers,
+      })
       assert.equal(
         receipt.requiredChildLaunches,
         analystLaunches + workers + checkers + gates + expectedContingency,
@@ -1764,7 +1851,7 @@ test('Codex-private physical completion receipts cover every valid route, path, 
   }
 })
 
-test('ROADMAP W2/W3 transport retry plus correction and union repair admits every fresh C1/C2 checker across G0-G1', async () => {
+test('ROADMAP W2/W3 bounded retries, scratch confirmations, and union repair fit every C1/C2 G0-G1 receipt', async () => {
   const providerCapabilities = Object.freeze({
     eventStreaming: true,
     toolOutputCapture: true,
@@ -1820,14 +1907,16 @@ test('ROADMAP W2/W3 transport retry plus correction and union repair admits ever
         const receipt = phaseBudget.codexPhysicalExecutionReceipt(compiled, {
           additionalGateLaunches: gates,
         })
+        const scratchConfirmations = checkers === 1 ? 2 : 0
+        const expectedContingency = workers + 1 + 1 + checkers + scratchConfirmations
         assert.equal(
           decisions.completionLaunchRequirement(compiled.topology),
-          1 + workers + checkers + 3 + checkers,
+          1 + workers + checkers + expectedContingency,
         )
-        assert.equal(receipt.boundedContingencyLaunches, 3 + checkers)
+        assert.equal(receipt.boundedContingencyLaunches, expectedContingency)
         assert.equal(
           receipt.requiredChildLaunches,
-          1 + gates + workers + checkers + 3 + checkers,
+          1 + gates + workers + checkers + expectedContingency,
         )
 
         const runIdentity = { runId: `roadmap-repair-${scenario}`, generation: 1 }
@@ -1871,25 +1960,34 @@ test('ROADMAP W2/W3 transport retry plus correction and union repair admits ever
         for (let index = 0; index < workers; index += 1) {
           await launch({ workItemId: `work-${index + 1}`, role: 'ap-worker' })
         }
-        await launch({ workItemId: 'work-1-transport-retry-1', role: 'ap-worker' })
-        await launch({
-          workItemId: 'initial-checker-1',
-          role: 'ap-independent-checker', purpose: 'verification',
-        })
-        await launch({
-          workItemId: 'checker-report-correction',
-          role: 'ap-independent-checker', purpose: 'verification',
-        })
-        for (let index = 1; index < checkers; index += 1) {
+        for (let index = 0; index < workers; index += 1) {
+          await launch({
+            workItemId: `work-${index + 1}-transport-retry-1`, role: 'ap-worker',
+          })
+        }
+        for (let index = 0; index < checkers; index += 1) {
           await launch({
             workItemId: `initial-checker-${index + 1}`,
             role: 'ap-independent-checker', purpose: 'verification',
           })
         }
+        if (checkers === 1) {
+          await launch({
+            workItemId: 'initial-checker-1-scratch-confirmation-1',
+            role: 'ap-independent-checker', purpose: 'verification',
+          })
+        }
         await launch({ workItemId: 'union-repair', role: 'ap-worker' })
+        await launch({ workItemId: 'union-repair-transport-retry-1', role: 'ap-worker' })
         for (let index = 0; index < checkers; index += 1) {
           await launch({
             workItemId: `repaired-checker-${index + 1}`,
+            role: 'ap-independent-checker', purpose: 'verification',
+          })
+        }
+        if (checkers === 1) {
+          await launch({
+            workItemId: 'repaired-checker-1-scratch-confirmation-1',
             role: 'ap-independent-checker', purpose: 'verification',
           })
         }
@@ -1897,10 +1995,11 @@ test('ROADMAP W2/W3 transport retry plus correction and union repair admits ever
         assert.equal(scheduler.getMetrics().counters.totalLaunches, receipt.requiredChildLaunches)
         assert.equal(scheduler.getMetrics().counters.currentLiveChildren, 0)
         assert.equal(launchedRoles.filter(role => role === 'ap-route-analyst').length, 1)
-        assert.equal(launchedRoles.filter(role => role === 'ap-worker').length, workers + 2)
+        assert.equal(launchedRoles.filter(role => role === 'ap-worker').length,
+          (2 * workers) + 2)
         assert.equal(
           launchedRoles.filter(role => role === 'ap-independent-checker').length,
-          gates + (2 * checkers) + 1,
+          gates + (2 * checkers) + scratchConfirmations,
         )
         assert.equal(
           launchedRoles.some(role => [
@@ -1987,7 +2086,7 @@ test('exact paths fail closed on missing, unsafe, unaffordable, irreversible, an
     'EXACT_PATH_PREFLIGHT_BINDING_INVALID')
 })
 
-test('wrong analyst correction proves fact or classifier fingerprint comparison', () => {
+test('analyst correction binds both advisory and final fact and classifier fingerprints', () => {
   const facts = routeFacts()
   const classified = router.classifyRoute(facts)
   const corrected = decision(facts, {
@@ -2001,7 +2100,7 @@ test('wrong analyst correction proves fact or classifier fingerprint comparison'
     },
   })
   assert.equal(decisions.validateRouteDecision(corrected).valid, true)
-  corrected.analystDisagreement.analystFactsFingerprint = corrected.analystDisagreement.l0FactsFingerprint
+  corrected.analystDisagreement.l0FactsFingerprint = H3
   assert.equal(decisions.validateRouteDecision(corrected).valid, false)
 })
 
@@ -2204,13 +2303,13 @@ test('admission, recommendation, plan, decision, and event validators fail close
   assert.deepEqual(decisions.canonicalVerificationObligations([ordered]), [ordered])
   assert.equal(decisions.canonicalVerificationObligations([{
     ...ordered, cases: ordered.cases.filter(item => item.phase !== 'intermediate'),
-  }]), null)
+  }])[0].kind, 'invariant')
   assert.equal(decisions.canonicalVerificationObligations([{
     ...ordered, cases: ordered.cases.map(item => ({ ...item, polarity: 'must-hold' })),
-  }]), null)
-  assert.equal(decisions.canonicalVerificationObligations([
+  }])[0].kind, 'invariant')
+  assert.deepEqual(decisions.canonicalVerificationObligations([
     ordered, { ...ordered },
-  ]), null)
+  ]).map(item => item.id), ['temporal-chain', 'temporal-chain-2'])
   assert.equal(decisions.evaluateL0Decision({ started_at_ms: -1, now_ms: 0, decision: {} }).status,
     'ROUTE_DECISION_INVALID')
   assert.equal(decisions.evaluateL0Decision({ started_at_ms: 1, now_ms: 2, decision: {} }).status,
