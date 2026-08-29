@@ -25683,6 +25683,10 @@ function createDefaultRuntimeOptions(input) {
     finalizationReserveMs: Math.min(30_000, Math.floor(wallMs / 10)),
     phases: productionPhaseBudgets(wallMs),
     phaseBudgetFactory: productionPhaseBudgets,
+    monotonicMs: context.monotonicNow,
+    wallNowMs: context.wallNowMs,
+    wallClock: context.clock,
+    bootId: context.bootId,
   })
   runtimeOptions.executeRoute = createDefaultRouteExecutor({
     targetPath,

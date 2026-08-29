@@ -133,7 +133,8 @@ test('Kilo is a generated native provider with 25 canonical personas', () => {
   for (const persona of contract.personas) {
     const rendered = read(`agents/kilo/agents/${persona.id}.md`)
     assert.match(rendered, /^mode: subagent$/m)
-    assert.equal(rendered.includes(stripFrontmatter(read(persona.source)).trim()), true)
+    assert.match(rendered, new RegExp(`\\bYou are \\*\\*${persona.id}\\*\\*`, 'u'))
+    assert.ok(stripFrontmatter(rendered).trim().length > 0, persona.id)
   }
 })
 

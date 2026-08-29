@@ -1,8 +1,8 @@
 # Codex v2 local run records
 
-<!-- codex-v2-release-status: local-v1.0.15-build-not-published -->
-> Release status: this guide describes the local Codex v1.0.15 build.
-> The build has not been published or pushed.
+<!-- codex-v2-release-status: local-v1.0.24-build-not-published -->
+> Release status: this guide describes the local Codex v1.0.24 build.
+> The build has not been published as a package or release.
 
 Codex v2 saves an exact local record so a run can be checked and resumed without
 depending on conversation memory. The record can contain the ordered request,
@@ -11,7 +11,7 @@ and checking evidence. Treat the whole record as potentially confidential.
 
 ## Local build route control
 
-The optional `path=auto|direct|light|roadmap` control is present in the local v1.0.15
+The optional `path=auto|direct|light|roadmap` control is present in the local v1.0.24
 build and has not been published. Put it first in the Codex request
 after `--`. Omitted `path=` and
 `path=auto` run automatic route analysis and selection. `path=direct`, `path=light`,

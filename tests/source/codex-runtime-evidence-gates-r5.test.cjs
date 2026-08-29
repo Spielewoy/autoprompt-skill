@@ -144,7 +144,12 @@ test('AP-TEST-026 simultaneous supervisor contenders activate exactly one owner 
   assert.equal(ownerFiles.length, 1)
   const ownerBytes = fs.readFileSync(path.join(leaseRoot, ownerFiles[0]), 'utf8')
   assert.match(ownerBytes, new RegExp(acquired[0].message.activationId)); assert.doesNotMatch(ownerBytes, new RegExp(rejected[0].message.activationId))
+  const released = new Promise((resolve, reject) => {
+    acquired[0].child.once('error', reject)
+    acquired[0].child.once('exit', resolve)
+  })
   acquired[0].child.send('RELEASE')
+  await released
 })
 
 test('AP-TEST-027 scheduler-backed route simulations measure emitted launch and token records against route caps', t => {

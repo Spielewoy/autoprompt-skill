@@ -513,8 +513,13 @@ function Install-CodexAgents {
     }
     $stage = Join-Path ([System.IO.Path]::GetTempPath()) `
         ("clcodex_" + [guid]::NewGuid().ToString('N'))
-    $stageAgents = Join-Path $stage 'skills/autoprompt/agents-runtime'
-    $stageProfile = Join-Path $stage 'autoprompt.config.toml'
+    $generation = Get-AutopromptCodexPayloadGeneration
+    if ([string]::IsNullOrEmpty($generation)) { return 90 }
+    $stageRoot = Join-Path $stage 'root'
+    $stageAgents = Join-Path $stageRoot `
+        (Join-Path '.autoprompt-private/bundles' `
+            (Join-Path $generation 'skills/autoprompt/agents-runtime'))
+    $stageProfile = Join-Path $stageRoot 'autoprompt.config.toml'
     $hadCodexAgentsDir = Test-Path Env:CODEX_AGENTS_DIR
     $previousCodexAgentsDir = $env:CODEX_AGENTS_DIR
     $journalStart = $script:AutopromptManagedUndoJournal.Count

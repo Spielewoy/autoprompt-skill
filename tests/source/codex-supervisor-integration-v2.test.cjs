@@ -74,6 +74,7 @@ const {
   selectWindowsLiveStatusPids,
 } = require(path.join(WORKFLOW, 'process-owner.js'))
 const { writeRequestEnvelope } = require(path.join(WORKFLOW, 'context-envelope.js'))
+const localSafety = require('../../scripts/local-only-safety.cjs')
 const {
   compileAutomaticRouteDecision,
   createRouteDecision,
@@ -1956,7 +1957,20 @@ test('ROADMAP crash projection binds append-only receipts instead of frontier na
 
 function tempDirectory(t, prefix) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  t.after(() => {
+    const makeRemovable = target => {
+      let stat
+      try { stat = fs.lstatSync(target) } catch (error) {
+        if (error.code === 'ENOENT') return
+        throw error
+      }
+      if (!stat.isDirectory() || stat.isSymbolicLink()) return
+      fs.chmodSync(target, 0o700)
+      for (const name of fs.readdirSync(target)) makeRemovable(path.join(target, name))
+    }
+    makeRemovable(directory)
+    fs.rmSync(directory, { recursive: true, force: true })
+  })
   return directory
 }
 
@@ -2083,12 +2097,16 @@ function createTempGitTarget(directory) {
     ['init', '-b', 'main', target],
     ['-C', target, 'config', 'user.email', 'autoprompt@example.invalid'],
     ['-C', target, 'config', 'user.name', 'Autoprompt Test'],
+    ['-C', target, 'config', 'push.default', 'nothing'],
     ['-C', target, 'add', '--', 'src/example.js', 'focused.test.cjs'],
     ['-C', target, 'commit', '-m', 'fixture'],
   ]) {
     const result = spawnSync('git', argv, { encoding: 'utf8', windowsHide: true })
     assert.equal(result.status, 0, result.stderr || result.stdout)
   }
+  fs.writeFileSync(path.join(target, '.git', 'hooks', 'pre-push'), localSafety.MANAGED_HOOK, {
+    mode: 0o755,
+  })
   return target
 }
 
@@ -4022,7 +4040,8 @@ function makeHarness(t, overrides = {}) {
     selectedProfile: 'autoprompt',
     strictConfig: true,
   }
-  const expectedBranch = spawnSync('git', ['-C', ROOT, 'branch', '--show-current'], { encoding: 'utf8' }).stdout.trim()
+  const targetPath = createTempGitTarget(directory)
+  const expectedBranch = spawnSync('git', ['-C', targetPath, 'branch', '--show-current'], { encoding: 'utf8' }).stdout.trim()
   const requestPointer = writeRequestEnvelope(directory, 'Implement the bounded behavior exactly.\n')
   let monotonic = 0
   const missionLock = overrides.missionLock || new FakeLock()
@@ -4070,7 +4089,7 @@ function makeHarness(t, overrides = {}) {
     },
     checkerSnapshotFactory(checkerId) {
       const snapshot = path.join(directory, `${checkerId}-snapshot-${crypto.randomBytes(4).toString('hex')}`)
-      const snapshotSource = overrides.runtimeOptions && overrides.runtimeOptions.targetPath || ROOT
+      const snapshotSource = overrides.runtimeOptions && overrides.runtimeOptions.targetPath || targetPath
       const clone = spawnSync('git', ['clone', '--quiet', '--no-local', '--no-hardlinks', '--', snapshotSource, snapshot], { encoding: 'utf8' })
       assert.equal(clone.status, 0, clone.stderr)
       const snapshotBranch = overrides.runtimeOptions && overrides.runtimeOptions.expectedBranch || expectedBranch
@@ -4166,7 +4185,7 @@ function makeHarness(t, overrides = {}) {
     enforcementProof,
     expectedBranch,
     ghConfigDir,
-    targetPath: ROOT,
+    targetPath,
     ...overrides.runtimeOptions,
   }
   return {
@@ -4528,7 +4547,7 @@ test('full supervisor never reconciles forged session or invalid checker semanti
     await t.test(fault, async t => {
       const directory = tempDirectory(t, `autoprompt-callback-${fault}-`)
       const isolatedTarget = createTempGitTarget(directory)
-      const targetPath = fault === 'invalid-checker' ? isolatedTarget : ROOT
+      const targetPath = isolatedTarget
       const targetBranch = spawnSync(
         'git', ['-C', targetPath, 'branch', '--show-current'], { encoding: 'utf8' },
       ).stdout.trim()
@@ -12557,6 +12576,7 @@ test('AP-LAYER-017 casting honors explicit model/effort pins without using topol
 
 test('default child environment is emitted and rechecked by the canonical local-only safety module', t => {
   const directory = tempDirectory(t, 'autoprompt-child-git-env-')
+  const target = createTempGitTarget(directory)
   const isolation = path.join(directory, 'empty.gitconfig')
   const ghConfigDir = path.join(directory, 'gh-config')
   const profilePath = path.join(directory, 'autoprompt.config.toml')
@@ -12571,8 +12591,8 @@ test('default child environment is emitted and rechecked by the canonical local-
   fs.writeFileSync(isolation, '', { mode: 0o600 })
   fs.mkdirSync(ghConfigDir, { mode: 0o700 })
   fs.writeFileSync(profilePath, profile, { mode: 0o600 })
-  const branch = spawnSync('git', ['-C', ROOT, 'branch', '--show-current'], { encoding: 'utf8' }).stdout.trim()
-  const boundary = safeEnvironmentFactory()(ROOT, process.env, {
+  const branch = spawnSync('git', ['-C', target, 'branch', '--show-current'], { encoding: 'utf8' }).stdout.trim()
+  const boundary = safeEnvironmentFactory()(target, process.env, {
     configIsolationPath: isolation,
     ghConfigDir,
     expectedBranch: branch,

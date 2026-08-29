@@ -706,7 +706,7 @@ class TranscriptStore {
     const lockPath = path.join(this.root, 'transcript.append.lock')
     let handle
     try {
-      handle = fs.openSync(lockPath, 'wx')
+      handle = fs.openSync(lockPath, 'wx', 0o600)
     } catch (error) {
       if (error && error.code === 'EEXIST') {
         throw new ContextEnvelopeError('TRANSCRIPT_APPEND_BUSY', 'another writer owns the transcript append lock')

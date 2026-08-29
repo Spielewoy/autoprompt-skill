@@ -428,7 +428,13 @@ function assertNoSecretArguments(argv, sensitiveValues) {
     if (SENSITIVE_OUTPUT_PATTERNS.some(pattern => pattern.test(argument))) {
       fail('CODEX_EVIDENCE_SECRET_ARGUMENT', 'a command argument resembles a credential')
     }
-    for (const match of argument.matchAll(/[A-Za-z0-9_+\/=.-]{24,}/g)) {
+    // Treat separators in absolute paths as token boundaries. Otherwise a
+    // normal deep path can look like one high-entropy Base64 token even when
+    // every individual path component is ordinary prose.
+    const opaqueTokenInput = path.isAbsolute(argument) || /^[A-Za-z]:[\\/]/.test(argument) || /^\\\\/.test(argument)
+      ? argument.replace(/[\\/]+/g, ' ')
+      : argument
+    for (const match of opaqueTokenInput.matchAll(/[A-Za-z0-9_+\/=.-]{24,}/g)) {
       const token = match[0]
       if (ALLOWED_LONG_OUTPUT_TOKENS.has(token) || /^[a-f0-9]{64}$/i.test(token) || /^process\.env\.[A-Z0-9_]+$/i.test(token)) continue
       const classes = [/[a-z]/.test(token), /[A-Z]/.test(token), /\d/.test(token), /[_+\/=.-]/.test(token)]
@@ -490,11 +496,12 @@ function sanitizeDiagnostic(value, telemetryValues) {
     if (telemetry) text = text.replaceAll(telemetry, '<redacted-host-value>')
   }
   text = text
+    .replace(/<redacted-host-value>(?:[\\/][^\s|"']+)+/g, '<redacted-path>')
     .replace(/\b(?:session|thread|trace|request)[_-]?id\s*[:=]\s*[^\s|]+/ig, '<redacted-session>')
     .replace(/\b(?:session|thread|trace|request)-[A-Za-z0-9._-]{8,}/ig, '<redacted-session>')
     .replace(/file:\/\/\/[^\s|"']+/ig, '<redacted-path>')
     .replace(/[A-Za-z]:\\[^\r\n|"']+/g, '<redacted-path>')
-    .replace(/(^|[\s|])\/(?:Users|home|tmp|private\/tmp|var\/folders)\/[^\s|"']+/g,
+    .replace(/(^|[\s|])\/[^\s|"']+/g,
       (_match, prefix) => `${prefix}<redacted-path>`)
   if (text.length > MAX_DIAGNOSTIC_CHARS) text = `${text.slice(0, MAX_DIAGNOSTIC_CHARS - 14)}<truncated>`
   return text

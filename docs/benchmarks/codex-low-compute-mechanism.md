@@ -3,9 +3,9 @@
 This harness is a mechanics check, not a quality benchmark. It uses one small
 `DIRECT` task and one repetition across exactly three named arms:
 
-1. `base` — single-agent base
-2. `current` — frozen current Autoprompt
-3. `redesign` — Codex redesign candidate
+1. `base` - single-agent base
+2. `current` - frozen current Autoprompt
+3. `redesign` - Codex redesign candidate
 
 The caller must provide full, locally available baseline and candidate commit SHAs.
 `base` and `current` bind to the baseline SHA; `redesign` binds to the candidate SHA.

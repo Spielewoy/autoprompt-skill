@@ -100,8 +100,8 @@ Autoprompt no formula actualmente ninguna afirmación reproducible sobre rendimi
 
 ## Controles de ejecución
 
-<!-- codex-v2-release-status: local-v1.0.15-build-not-published -->
-> Estado de `path=` en Codex v2: compilación local v1.0.15; no publicada.
+<!-- codex-v2-release-status: local-v1.0.24-build-not-published -->
+> Estado de `path=` en Codex v2: compilación local v1.0.24; no publicada.
 
 Usa `mode=` para definir la concurrencia. Usa `agents=` para dirigir modelos cuando el agente lo admita. La compilación local de Codex v2 también admite el control opcional `path=`.
 
@@ -109,7 +109,7 @@ Usa `mode=` para definir la concurrencia. Usa `agents=` para dirigir modelos cua
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Enrutamiento personalizado con `agents=` | ✓ | ✓ | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo padre seleccionado | ✕ No disponible - hereda el modelo padre seleccionado | ✕ No disponible - hereda el modelo padre seleccionado | ✕ No disponible - hereda el modelo padre seleccionado |
-| Ruta de trabajo `path=` | - | Compilación local v1.0.15; no publicada | - | - | - | - | - | - | - |
+| Ruta de trabajo `path=` | - | Compilación local v1.0.24; no publicada | - | - | - | - | - | - | - |
 
 En Codex v2, coloca `path=auto|direct|light|roadmap` al principio de la solicitud, por ejemplo `autoprompt activate codex -- path=direct <objetivo>`. Omitir `path=` equivale a `path=auto` y conserva la selección automática. Una ruta explícita omite el trabajo de modelos dedicado al análisis y la selección de ruta, pero no las comprobaciones de seguridad y autorización, los entregables propios de la ruta, la ejecución ni la verificación independiente. Si una selección es inválida, conflictiva o inutilizable, falla de forma segura en vez de cambiarla silenciosamente.
 

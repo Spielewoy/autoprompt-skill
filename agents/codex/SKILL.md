@@ -46,6 +46,8 @@ Use real checks available in the target system. Every requested effect has its o
 
 Use the states, events, limits, and typed results in `agents/contracts/state-machine.json`. Retry only a recorded transient failure within the original run-wide limits. Repeated work with the same no-progress fingerprint does not reset a limit. Ask the user only for a choice or authority the user must supply, such as product meaning, credentials, money, destructive action, or consequential external action.
 
+`SCOPE-BUDGET-BREACH` and `SCOPE-CONVERGE-REQUEST` are durable disk hints, not live steering. They take effect only after the child exits and the external supervisor relaunches with `AUTOPROMPT_RESUME=1`.
+
 Provider-specific output is a projection of the version 2 contracts listed in `agents/contracts/product.json`. Generation must stop if a canonical input is missing, a required provider capability is unknown, plain-language lint fails, or the output changes route, role, state, or check behavior.
 
 <!-- AUTOPROMPT-COMPILED-ROUTE-EXAMPLES:BEGIN v2 sha256=123da21c234d6666f82e2899bd243b051a84fdde43551cfe02c11e1b89f27736 -->

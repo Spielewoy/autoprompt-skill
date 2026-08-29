@@ -4935,8 +4935,11 @@ _repair_stage_codex_candidates() {
   local source_agents="$AUTOPROMPT_INSTALL_REPO_ROOT/agents/codex/agents"
   local casting_tool="$stage_skill/workflow/codex-agent-casting.js"
   local profile_tool="$stage_skill/workflow/codex-agent-profile.js"
-  local stage_agents="$stage_skill/agents-runtime"
-  local stage_profile="$stage/autoprompt.config.toml" generated had_nullglob expected_count
+  local generation stage_layout_root stage_agents stage_profile generated had_nullglob expected_count
+  generation="$(autoprompt_codex_payload_generation)" || return 1
+  stage_layout_root="$stage/root"
+  stage_agents="$stage_layout_root/.autoprompt-private/bundles/$generation/skills/autoprompt/agents-runtime"
+  stage_profile="$stage_layout_root/autoprompt.config.toml"
   mkdir -p -- "$stage_agents" || return 1
   local generated_count=0 generated_role
   for generated_role in "$source_agents"/ap-*.toml; do

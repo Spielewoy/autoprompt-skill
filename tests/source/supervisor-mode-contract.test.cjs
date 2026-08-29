@@ -11,7 +11,16 @@ const { runOwnedHarnessScenario } = require('../fixtures/codex-supervisor-contra
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const GIT_BASH = 'C:\\Program Files\\Git\\bin\\bash.exe'
+const BASH = process.platform === 'win32' ? GIT_BASH : 'bash'
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
+const HAS_BASH = process.platform === 'win32'
+  ? fs.existsSync(GIT_BASH)
+  : childProcess.spawnSync(BASH, ['--version'], { stdio: 'ignore' }).status === 0
+const HAS_POWERSHELL = process.platform === 'win32' || childProcess.spawnSync(
+  POWERSHELL,
+  ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'],
+  { stdio: 'ignore', windowsHide: true },
+).status === 0
 const PUBLIC_PROVIDERS = [
   'claude',
   'codex',
@@ -24,6 +33,7 @@ const PUBLIC_PROVIDERS = [
   'reasonix',
 ]
 const EXTERNAL_SUPERVISOR_PROVIDERS = new Set(['claude', 'codex'])
+const EVENT_DRIVEN_SCOPE_PROVIDERS = new Set(['codex'])
 const SUPERVISORS = [
   ['claude Bash', path.join(ROOT, 'agents', 'claude', 'workflow', 'supervisor.sh'), 'bash'],
   ['claude PowerShell', path.join(ROOT, 'agents', 'claude', 'workflow', 'supervisor.ps1'), 'powershell'],
@@ -31,7 +41,11 @@ const SUPERVISORS = [
   ['codex PowerShell', path.join(ROOT, 'agents', 'codex', 'workflow', 'supervisor.ps1'), 'powershell'],
 ]
 
-test('all nine providers have an explicit external-supervisor scope-budget boundary', () => {
+function supervisorPortAvailable(port) {
+  return port === 'bash' ? HAS_BASH : HAS_POWERSHELL
+}
+
+test('external supervisors are packaged and Codex v2 scope budgets are event-driven', () => {
   assert.equal(PUBLIC_PROVIDERS.length, 9)
   for (const provider of PUBLIC_PROVIDERS) {
     const workflow = path.join(ROOT, 'agents', provider, 'workflow')
@@ -52,7 +66,7 @@ test('all nine providers have an explicit external-supervisor scope-budget bound
         'workflow/supervisor.ps1',
         'workflow/supervisor.sh',
       ], provider)
-      for (const port of ports) {
+      for (const port of EVENT_DRIVEN_SCOPE_PROVIDERS.has(provider) ? ports : []) {
         const source = fs.readFileSync(path.join(workflow, port), 'utf8')
         assert.doesNotMatch(source, /SCOPE_BUDGET_TERMINAL|ScopeTerminal|(?:return|exit) 124/)
       }
@@ -71,8 +85,8 @@ test('all nine providers have an explicit external-supervisor scope-budget bound
   }
 })
 
-test('affected provider skills define scope markers as post-relaunch durable hints', () => {
-  for (const provider of EXTERNAL_SUPERVISOR_PROVIDERS) {
+test('Codex v2 skill defines scope markers as post-relaunch durable hints', () => {
+  for (const provider of EVENT_DRIVEN_SCOPE_PROVIDERS) {
     const skill = fs.readFileSync(path.join(ROOT, 'agents', provider, 'SKILL.md'), 'utf8')
     assert.match(skill, /SCOPE-BUDGET-BREACH/)
     assert.match(skill, /SCOPE-CONVERGE-REQUEST/)
@@ -89,9 +103,19 @@ test('affected provider skills define scope markers as post-relaunch durable hin
   const copiedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-copied-supervisor-'))
   try {
     const fakeRuntime = path.join(copiedRoot, 'phase-budget.js')
-    fs.writeFileSync(fakeRuntime,
-      "process.stdout.write('STRICT_RUNTIME_REACHED\\n'); process.exitCode = 77\n")
-    for (const [label, source, port] of SUPERVISORS.filter(([name]) => name.startsWith('codex '))) {
+    fs.writeFileSync(fakeRuntime, [
+      "if (process.argv.slice(2).join(' ') === '--supervisor --capabilities') {",
+      "  process.stdout.write(JSON.stringify({ schemaVersion: 2, provider: 'codex' }))",
+      '} else {',
+      "  process.stdout.write('STRICT_RUNTIME_REACHED\\n')",
+      '  process.exitCode = 77',
+      '}',
+      '',
+    ].join('\n'))
+    const available = SUPERVISORS.filter(([name, , port]) =>
+      name.startsWith('codex ') && supervisorPortAvailable(port))
+    assert.ok(available.length > 0, 'at least one Codex supervisor port must be runnable')
+    for (const [label, source, port] of available) {
       const copy = path.join(copiedRoot, path.basename(source))
       fs.copyFileSync(source, copy)
       const env = {
@@ -105,7 +129,7 @@ test('affected provider skills define scope markers as post-relaunch durable hin
         AUTOPROMPT_TEST_CONTRACT_FILE: port === 'bash' ? bashPath(__filename) : __filename,
       }
       const completed = port === 'bash'
-        ? childProcess.spawnSync(GIT_BASH, [bashPath(copy), '--dry-run', 'copied boundary'],
+        ? childProcess.spawnSync(BASH, [bashPath(copy), '--dry-run', 'copied boundary'],
             { cwd: ROOT, encoding: 'utf8', env, timeout: 10000 })
         : childProcess.spawnSync(POWERSHELL, [
             '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', copy,
@@ -123,13 +147,24 @@ test('AP-RUN-012 modern Codex shell adapters ignore unrelated legacy SENTINEL va
   const copiedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-sentinel-override-'))
   try {
     const fakeRuntime = path.join(copiedRoot, 'phase-budget.js')
-    fs.writeFileSync(fakeRuntime, "process.stdout.write('STRICT_RUNTIME_REACHED\\n'); process.exitCode = 77\n")
-    for (const [label, source, port] of SUPERVISORS.filter(([name]) => name.startsWith('codex '))) {
+    fs.writeFileSync(fakeRuntime, [
+      "if (process.argv.slice(2).join(' ') === '--supervisor --capabilities') {",
+      "  process.stdout.write(JSON.stringify({ schemaVersion: 2, provider: 'codex' }))",
+      '} else {',
+      "  process.stdout.write('STRICT_RUNTIME_REACHED\\n')",
+      '  process.exitCode = 77',
+      '}',
+      '',
+    ].join('\n'))
+    const available = SUPERVISORS.filter(([name, , port]) =>
+      name.startsWith('codex ') && supervisorPortAvailable(port))
+    assert.ok(available.length > 0, 'at least one Codex supervisor port must be runnable')
+    for (const [label, source, port] of available) {
       const copy = path.join(copiedRoot, path.basename(source))
       fs.copyFileSync(source, copy)
       const env = { ...process.env, AUTOPROMPT_RUNTIME: fakeRuntime, SENTINEL: 'custom-stop-file' }
       const completed = port === 'bash'
-        ? childProcess.spawnSync(GIT_BASH, [bashPath(copy), 'sentinel rejection'],
+        ? childProcess.spawnSync(BASH, [bashPath(copy), 'sentinel rejection'],
             { cwd: ROOT, encoding: 'utf8', env, timeout: 10000 })
         : childProcess.spawnSync(POWERSHELL, [
             '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', copy,
@@ -181,7 +216,7 @@ function runSupervisor(script, port, mode, maxConcurrent) {
   try {
     if (port === 'bash') {
       return childProcess.spawnSync(
-        GIT_BASH,
+        BASH,
         [bashPath(script), '--dry-run', '--ledger-dir', bashPath(ledger), 'contract probe'],
         { cwd: ROOT, encoding: 'utf8', env, timeout: 30000 },
       )
@@ -268,7 +303,7 @@ for (const [name, script, port] of SUPERVISORS) {
   })
 
   test(`${name} preserves and reports a bounded custom mode`, {
-    skip: port === 'bash' && (process.platform !== 'win32' || !fs.existsSync(GIT_BASH)),
+    skip: !supervisorPortAvailable(port),
     timeout: 30000,
   }, () => {
     const custom = runSupervisor(script, port, 'custom', '4.9')
@@ -277,7 +312,7 @@ for (const [name, script, port] of SUPERVISORS) {
   })
 
   test(`${name} rejects custom mode without a positive numeric ceiling`, {
-    skip: port === 'bash' && (process.platform !== 'win32' || !fs.existsSync(GIT_BASH)),
+    skip: !supervisorPortAvailable(port),
     timeout: 30000,
   }, () => {
     for (const value of [undefined, '0', '-1', 'not-a-number']) {

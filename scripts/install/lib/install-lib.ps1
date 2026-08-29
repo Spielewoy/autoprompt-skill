@@ -5961,8 +5961,15 @@ function Add-CodexRepairCandidates {
     $sourceAgents = Join-Path $AutopromptInstallRepoRoot 'agents/codex/agents'
     $castingTool = Join-Path $StageSkill 'workflow/codex-agent-casting.js'
     $profileTool = Join-Path $StageSkill 'workflow/codex-agent-profile.js'
-    $stageAgents = Join-Path $StageSkill 'agents-runtime'
-    $stageProfile = Join-Path $StageRoot 'autoprompt.config.toml'
+    $generation = Get-AutopromptCodexPayloadGeneration
+    if ([string]::IsNullOrEmpty($generation)) {
+        throw 'Codex payload generation is unavailable'
+    }
+    $stageLayoutRoot = Join-Path $StageRoot 'root'
+    $stageAgents = Join-Path $stageLayoutRoot `
+        (Join-Path '.autoprompt-private/bundles' `
+            (Join-Path $generation 'skills/autoprompt/agents-runtime'))
+    $stageProfile = Join-Path $stageLayoutRoot 'autoprompt.config.toml'
     $hadAgentsDirectory = Test-Path Env:CODEX_AGENTS_DIR
     $previousAgentsDirectory = $env:CODEX_AGENTS_DIR
     try {

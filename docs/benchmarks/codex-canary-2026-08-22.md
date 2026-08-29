@@ -1,4 +1,4 @@
-# Codex v2 local canary — 2026-08-22
+# Codex v2 local canary - 2026-08-22
 
 This is a diagnostic record, not a benchmark result and not evidence for a quality,
 speed, or cost claim.

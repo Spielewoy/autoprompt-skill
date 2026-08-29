@@ -323,7 +323,7 @@ test('file-sourced npm, AWS, generic config credentials, binary output, and opaq
 test('session and path telemetry are redacted, raw arbitrary output cannot support PASS', async () => {
   const repo = fixture()
   const session = `session-${Date.now()}`
-  const privatePath = path.join(os.tmpdir(), 'u', 'c.json')
+  const privatePath = path.join(os.tmpdir(), 'ordinary-private', 'nested-telemetry', 'u', 'c.json')
   const captured = await capturedFixture(repo, {
     commandArgv: [process.execPath, '-e', "process.stdout.write('ordinary raw output'); process.stderr.write(`${process.argv[1]}|${process.argv[2]}`)", session, privatePath],
   })
