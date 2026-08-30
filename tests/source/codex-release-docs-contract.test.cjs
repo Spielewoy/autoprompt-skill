@@ -28,8 +28,8 @@ const PUBLIC_ROUTE_DOCS = [
   'assets/i18n/ko/anatomy.svg',
   'assets/i18n/zh/anatomy.svg',
 ]
-const LOCAL_BUILD_MARKER = 'codex-v2-release-status: local-v1.0.25-build-not-published'
-const SVG_LOCAL_BUILD_MARKER = 'data-release-status="local-v1.0.25-build-not-published"'
+const LOCAL_BUILD_MARKER = 'codex-v2-release-status: local-v1.0.26-build-not-published'
+const SVG_LOCAL_BUILD_MARKER = 'data-release-status="local-v1.0.26-build-not-published"'
 const ANATOMY_DIAGRAMS = PUBLIC_ROUTE_DOCS.filter(file => file.endsWith('anatomy.svg'))
 const HOW_IT_WORKS_DIAGRAMS = [
   'assets/how-it-works-loop.svg',
@@ -54,13 +54,35 @@ test('Codex local-record user docs define fail-closed retention and export autho
   const readme = read('README.md')
   const guide = read(PRIVACY_GUIDE)
 
-  assert.match(readme, /local v1\.0\.25 build/i)
+  assert.match(readme, /local v1\.0\.26 build/i)
   assert.match(readme, /not (?:been )?published/i)
   assert.match(readme, /codex-v2-local-records\.md/)
-  assert.match(guide, /local Codex v1\.0\.25 build/i)
+  assert.match(guide, /local Codex v1\.0\.26 build/i)
   assert.match(guide, /not been published as a package or release/i)
   assert.match(guide, /automatic deletion is disabled/i)
   assert.match(guide, /expiry is not deletion authority/i)
+  assert.match(guide, /no over-limit child result is accepted/i)
+  assert.match(guide, /lifecycle events can arrive\s+after a tool starts/i)
+  assert.match(guide, /controller-owned loopback relay applies the preventive token envelope/i)
+  assert.match(guide, /consumed tokens plus every concurrent live reservation never exceed 24,000/i)
+  assert.match(guide, /request that cannot fit is refused\s+before it reaches the upstream provider/i)
+  assert.match(guide, /total input including cached input/i)
+  assert.match(guide, /disconnected child cancels its upstream request/i)
+  assert.match(guide, /compaction is not a cumulative token or billing cap/i)
+  assert.match(guide, /24,000-token aggregate provider envelope/i)
+  assert.match(guide, /provider request envelope is at most\s+16,000 tokens[\s\S]*?above 8,000 reported tokens is rejected/i)
+  assert.match(guide, /checker can invoke at most 2 tools[\s\S]*?envelope\s+is at most 24,000 tokens[\s\S]*?above 16,000 reported tokens is rejected/i)
+  assert.match(guide, /worker can invoke at most 2 tools[\s\S]*?capped at 24,000 reported tokens/i)
+  assert.match(guide, /private controlled model catalog forces Codex 0\.148 into direct-tool mode/i)
+  assert.match(guide, /request and stream retries to zero/i)
+  assert.match(guide, /failure without complete usage is never automatically relaunched/i)
+  assert.match(guide, /does not reserve a hidden second budget for verification/i)
+  assert.match(guide, /preserves\s+the usable candidate as `DONE_WITH_VERIFICATION_LIMITATIONS`/i)
+  assert.match(guide, /autoprompt\.independent-check-quota-envelope/i)
+  assert.match(guide, /before the relay can send the first upstream byte[\s\S]*?durably records/i)
+  assert.match(guide, /exact request-bound usage is reconciled\s+without double charging/i)
+  assert.match(guide, /crash-adopted open continuation receives no renewed tool-call allowance/i)
+  assert.match(guide, /model_auto_compact_token_limit=32768/i)
   assert.match(guide, /no built-in export command/i)
   assert.match(guide, /exact run id and exact files/i)
   assert.match(guide, /destination and recipient/i)
@@ -88,7 +110,7 @@ test('Codex install docs separate the unpublished provider package and bind fina
   assert.match(readme, /0 npm dependencies[^\n]*0 optional dependencies/i)
 })
 
-test('Codex target route docs consistently identify the local v1.0.25 build as not published', () => {
+test('Codex target route docs consistently identify the local v1.0.26 build as not published', () => {
   const roadmap = read('AUTOPROMPT-TOTAL-FIX-MAP.md')
   const p11Status = phaseStatus(roadmap, 'P11 Canary and paired evaluation')
   const p12Status = phaseStatus(roadmap, 'P12 Legacy removal and documentation')
@@ -103,7 +125,7 @@ test('Codex target route docs consistently identify the local v1.0.25 build as n
     }
     if (p12Status !== 'DONE') {
       const expected = relative.endsWith('.svg') ? SVG_LOCAL_BUILD_MARKER : LOCAL_BUILD_MARKER
-      assert.ok(source.includes(expected), `${relative}: identifies the local v1.0.25 build as not published`)
+      assert.ok(source.includes(expected), `${relative}: identifies the local v1.0.26 build as not published`)
       assert.doesNotMatch(source, /development-only|development only|not released before P12|until P12/i,
         `${relative}: removes the obsolete phase-based release wording`)
     }

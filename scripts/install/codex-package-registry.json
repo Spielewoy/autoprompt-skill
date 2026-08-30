@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "provider": "codex",
   "compatibility": {
-    "cliMinimum": "0.101.0",
+    "cliMinimum": "0.148.0",
     "runtimeContract": "2.0.0"
   },
   "canonicalInputs": {

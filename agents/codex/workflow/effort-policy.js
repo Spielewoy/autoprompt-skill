@@ -9,7 +9,7 @@ const crypto = require('node:crypto')
 const EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max'])
 const MECHANICAL_ROLES = new Set([
   'scribe', 'janitor', 'finalizer', 'formatter', 'ledger-writer', 'record-writer',
-  'cleanup', 'mechanical',
+  'cleanup', 'mechanical', 'route-analyst',
 ])
 const DEEP_ROLES = new Set([
   'security', 'security-reviewer', 'cryptography', 'formal-proof', 'algorithm',

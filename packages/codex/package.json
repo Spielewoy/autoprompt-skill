@@ -1,6 +1,6 @@
 {
   "name": "@autoprompt-skill/codex-runtime",
-  "version": "1.0.25",
+  "version": "1.0.26",
   "description": "Codex-only Autoprompt runtime and lifecycle CLI.",
   "private": true,
   "license": "MIT",
@@ -15,7 +15,7 @@
   "autoprompt": {
     "provider": "codex",
     "compatibility": {
-      "codexCli": ">=0.101.0",
+      "codexCli": ">=0.148.0",
       "runtimeContract": "2.0.0"
     }
   }

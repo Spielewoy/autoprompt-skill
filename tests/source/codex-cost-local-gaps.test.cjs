@@ -1,8 +1,10 @@
 'use strict'
 
 const assert = require('node:assert/strict')
+const childProcess = require('node:child_process')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
+const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
@@ -22,10 +24,14 @@ const {
   CodexSupervisorRuntime,
   emitItemVerifiedTransition,
   explicitFindingIds,
+  materializeCodexControlledTransport,
   readPrivateAgentAssignment,
   readPersistedWorkerAssignment,
   replayRequestFromPersistedAssignment,
   renderRouteDecisionMarkdown,
+  startCodexCumulativeQuotaProxy,
+  unresolvedCodexProviderEnvelopes,
+  codexToolCallHighWater,
   verifyRequestPointer,
   writeRouteDecisionArtifacts,
 } = require(path.join(workflow, 'phase-budget.js'))
@@ -42,6 +48,895 @@ const CAPABILITIES = Object.freeze({
   cancellation: true,
 })
 let sequence = 0
+
+function pinnedCodexCli() {
+  const candidates = [
+    process.env.AUTOPROMPT_PINNED_CODEX,
+    '/data/benchmark-AP-v2/publish-staging/dependencies/codex-cli-0.148.0/node_modules/@openai/codex/bin/codex.js',
+  ].filter(Boolean)
+  return candidates.find(candidate => {
+    if (!fs.existsSync(candidate)) return false
+    const result = childProcess.spawnSync(process.execPath, [candidate, '--version'], {
+      encoding: 'utf8', timeout: 10_000,
+    })
+    return result.status === 0 && /codex-cli 0\.148\.0/u.test(result.stdout)
+  }) || null
+}
+
+function runPinnedCodex(cli, argv, options) {
+  return new Promise((resolve, reject) => {
+    const child = childProcess.spawn(process.execPath, [cli, ...argv], {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', chunk => { stdout += chunk })
+    child.stderr.on('data', chunk => { stderr += chunk })
+    child.on('error', reject)
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL')
+      reject(new Error('pinned Codex direct-tool probe timed out'))
+    }, 20_000)
+    child.on('close', (status, signal) => {
+      clearTimeout(timeout)
+      resolve({ status, signal, stdout, stderr })
+    })
+    child.stdin.end('Return {"ok":true} and use no tools.\n')
+  })
+}
+
+function postJson(url, body) {
+  return new Promise(resolve => {
+    const bytes = Buffer.from(JSON.stringify(body), 'utf8')
+    const request = http.request(url, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer probe',
+        'content-type': 'application/json',
+        'content-length': String(bytes.length),
+      },
+    })
+    let settled = false
+    const finish = result => {
+      if (settled) return
+      settled = true
+      resolve(result)
+    }
+    request.on('response', response => {
+      let responseBody = ''
+      response.setEncoding('utf8')
+      response.on('data', chunk => { responseBody += chunk })
+      response.on('end', () => finish({ status: response.statusCode, body: responseBody, aborted: false }))
+      response.on('aborted', () => finish({ status: response.statusCode, body: responseBody, aborted: true }))
+      response.on('error', error => finish({ status: response.statusCode, body: responseBody, aborted: true, error }))
+    })
+    request.on('error', error => finish({ status: null, body: '', aborted: true, error }))
+    request.end(bytes)
+  })
+}
+
+function accountingRecord(sequenceNumber, causeId, tokens = 0) {
+  return {
+    sequence: sequenceNumber,
+    cause: { causeId },
+    delta: {
+      tokenUsage: {
+        noncachedInput: tokens,
+        cachedInput: 0,
+        output: 0,
+        reasoning: 0,
+      },
+    },
+  }
+}
+
+test('pinned Codex 0.148 advertises only individually visible direct tools for every controlled model', async t => {
+  const cli = pinnedCodexCli()
+  if (!cli) {
+    t.skip('the exact pinned Codex 0.148 CLI is not installed on this host')
+    return
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-direct-tool-probe-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const codexHome = path.join(directory, 'codex-home')
+  fs.mkdirSync(codexHome, { recursive: true, mode: 0o700 })
+  const schemaPath = path.join(directory, 'output.schema.json')
+  fs.writeFileSync(schemaPath, `${JSON.stringify({
+    type: 'object', required: ['ok'], properties: { ok: { const: true } }, additionalProperties: false,
+  })}\n`, { mode: 0o600 })
+  const requests = []
+  const server = http.createServer((request, response) => {
+    let body = ''
+    request.setEncoding('utf8')
+    request.on('data', chunk => { body += chunk })
+    request.on('end', () => {
+      requests.push({ url: request.url, body: JSON.parse(body) })
+      const responseId = `resp-${requests.length}`
+      const messageId = `msg-${requests.length}`
+      const events = [
+        { type: 'response.created', response: { id: responseId } },
+        {
+          type: 'response.output_item.done',
+          item: {
+            type: 'message', role: 'assistant', id: messageId,
+            content: [{ type: 'output_text', text: '{"ok":true}' }],
+          },
+        },
+        {
+          type: 'response.completed',
+          response: {
+            id: responseId,
+            usage: {
+              input_tokens: 1, input_tokens_details: null,
+              output_tokens: 1, output_tokens_details: null, total_tokens: 2,
+            },
+          },
+        },
+      ]
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end(events.map(event =>
+        `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''))
+    })
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  t.after(() => new Promise(resolve => server.close(resolve)))
+  const port = server.address().port
+  const controlledModels = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']
+  for (const model of controlledModels) {
+    const transport = materializeCodexControlledTransport(
+      path.join(directory, `transport-${model}`),
+      { logicalRole: 'worker', assignment: { model } },
+    )
+    const provider = 'model_providers.autoprompt-probe=' +
+      `{name="probe",base_url="http://127.0.0.1:${port}/v1",env_key="OPENAI_API_KEY",` +
+      'wire_api="responses",requires_openai_auth=false,supports_websockets=false,' +
+      'supports_standalone_web_search=false,request_max_retries=0,stream_max_retries=0}'
+    const result = await runPinnedCodex(cli, [
+      'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules',
+      '--skip-git-repo-check', '--output-schema', schemaPath, '--strict-config',
+      '--disable', 'multi_agent', '--disable', 'multi_agent_v2',
+      '--disable', 'code_mode', '--disable', 'code_mode_only',
+      '--disable', 'goals', '--disable', 'memories', '--disable', 'token_budget',
+      '--disable', 'current_time_reminder', '--disable', 'deferred_executor',
+      '--disable', 'unbounded_connection_retries', '--disable', 'unified_exec',
+      '--disable', 'view_image',
+      '-c', `model_catalog_json=${JSON.stringify(transport.modelCatalogPath)}`,
+      '-c', `model_instructions_file=${JSON.stringify(transport.instructionsPath)}`,
+      '-c', 'model_provider="autoprompt-probe"', '-c', provider,
+      '-c', 'mcp_servers={}', '-c', 'web_search="disabled"',
+      '-c', 'tools.experimental_request_user_input.enabled=false',
+      '-c', 'tools.update_plan.enabled=false',
+      '-c', 'include_permissions_instructions=false',
+      '-c', 'include_apps_instructions=false',
+      '-c', 'include_collaboration_mode_instructions=false',
+      '-c', 'include_environment_context=false',
+      '-c', 'skills.include_instructions=false',
+      '-c', 'project_doc_max_bytes=0', '-c', 'plugins={}', '-c', 'marketplaces={}',
+      '-m', model,
+      '--sandbox', 'workspace-write', '-C', directory, '-',
+    ], {
+      cwd: directory,
+      env: { ...process.env, CODEX_HOME: codexHome, OPENAI_API_KEY: 'probe' },
+    })
+    assert.equal(result.status, 0, `${model}: ${result.stderr}\n${result.stdout}`)
+    assert.match(result.stdout, /"type":"turn\.completed"/u)
+  }
+  const control = materializeCodexControlledTransport(
+    path.join(directory, 'transport-control'),
+    { logicalRole: 'route-analyst', route: 'PRE_ROUTE', assignment: { model: 'gpt-5.6-sol' } },
+  )
+  const controlProvider = 'model_providers.autoprompt-probe=' +
+    `{name="probe",base_url="http://127.0.0.1:${port}/v1",env_key="OPENAI_API_KEY",` +
+    'wire_api="responses",requires_openai_auth=false,supports_websockets=false,' +
+    'supports_standalone_web_search=false,request_max_retries=0,stream_max_retries=0}'
+  const controlResult = await runPinnedCodex(cli, [
+    'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules',
+    '--skip-git-repo-check', '--output-schema', schemaPath, '--strict-config',
+    '--disable', 'multi_agent', '--disable', 'multi_agent_v2',
+    '--disable', 'code_mode', '--disable', 'code_mode_only',
+    '--disable', 'goals', '--disable', 'memories', '--disable', 'token_budget',
+    '--disable', 'current_time_reminder', '--disable', 'deferred_executor',
+    '--disable', 'unbounded_connection_retries', '--disable', 'shell_tool',
+    '--disable', 'unified_exec', '--disable', 'view_image',
+    '-c', `model_catalog_json=${JSON.stringify(control.modelCatalogPath)}`,
+    '-c', `model_instructions_file=${JSON.stringify(control.instructionsPath)}`,
+    '-c', 'model_provider="autoprompt-probe"', '-c', controlProvider,
+    '-c', 'mcp_servers={}', '-c', 'web_search="disabled"',
+    '-c', 'tools.experimental_request_user_input.enabled=false',
+    '-c', 'tools.update_plan.enabled=false',
+    '-c', 'include_permissions_instructions=false',
+    '-c', 'include_apps_instructions=false',
+    '-c', 'include_collaboration_mode_instructions=false',
+    '-c', 'include_environment_context=false',
+    '-c', 'skills.include_instructions=false',
+    '-c', 'project_doc_max_bytes=0', '-c', 'plugins={}', '-c', 'marketplaces={}',
+    '-m', 'gpt-5.6-sol', '--sandbox', 'read-only', '-C', directory, '-',
+  ], {
+    cwd: directory,
+    env: { ...process.env, CODEX_HOME: codexHome, OPENAI_API_KEY: 'probe' },
+  })
+  assert.equal(controlResult.status, 0, `${controlResult.stderr}\n${controlResult.stdout}`)
+
+  assert.equal(requests.length, controlledModels.length + 1)
+  assert.ok(requests.every(request =>
+    Buffer.byteLength(JSON.stringify(request.body), 'utf8') < 8 * 1024),
+  'the controlled base transport stays compact before its exact assignment is appended')
+  for (const [index, request] of requests.slice(0, controlledModels.length).entries()) {
+    assert.equal(request.url, '/v1/responses')
+    assert.equal(request.body.model, controlledModels[index])
+    assert.equal(request.body.tools, undefined)
+    const additions = request.body.input.filter(item => item.type === 'additional_tools')
+    assert.equal(additions.length, 1)
+    assert.equal(additions[0].tools.length, 1)
+    assert.equal(additions[0].tools[0].type, 'namespace')
+    assert.equal(additions[0].tools[0].name, 'functions')
+    assert.deepEqual(additions[0].tools[0].tools.map(tool => `${tool.type}:${tool.name}`).sort(), [
+      'custom:apply_patch', 'function:shell_command',
+    ])
+    assert.equal(request.body.tool_choice, 'auto')
+    assert.equal(request.body.parallel_tool_calls, false)
+  }
+
+  const controlRequest = requests.at(-1)
+  assert.equal(controlRequest.url, '/v1/responses')
+  assert.equal(controlRequest.body.model, 'gpt-5.6-sol')
+  assert.equal(controlRequest.body.tools, undefined)
+  const controlAdditions = controlRequest.body.input.filter(item => item.type === 'additional_tools')
+  assert.ok(controlAdditions.length <= 1)
+  assert.deepEqual(controlAdditions.flatMap(item => item.tools)
+    .flatMap(tool => tool.type === 'namespace' ? tool.tools : [tool]), [])
+  assert.equal(controlRequest.body.parallel_tool_calls, false)
+
+  const controlCatalog = JSON.parse(fs.readFileSync(control.modelCatalogPath, 'utf8'))
+  assert.ok(controlCatalog.models.every(model =>
+    model.tool_mode === 'direct' && model.shell_type === 'disabled' &&
+    model.apply_patch_tool_type === null && model.multi_agent_version === null))
+  assert.throws(() => materializeCodexControlledTransport(
+    path.join(directory, 'transport-unattested'),
+    { logicalRole: 'worker', assignment: { model: 'gpt-5.6' } },
+  ), error => error && error.code === 'PROVIDER_UNSUPPORTED')
+})
+
+test('pinned Codex 0.148 emits one countable lifecycle for each direct patch and shell call', async t => {
+  const cli = pinnedCodexCli()
+  if (!cli) {
+    t.skip('the exact pinned Codex 0.148 CLI is not installed on this host')
+    return
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-direct-lifecycle-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const codexHome = path.join(directory, 'codex-home')
+  fs.mkdirSync(codexHome, { recursive: true, mode: 0o700 })
+  const schemaPath = path.join(directory, 'output.schema.json')
+  fs.writeFileSync(schemaPath, `${JSON.stringify({
+    type: 'object', required: ['ok'], properties: { ok: { const: true } }, additionalProperties: false,
+  })}\n`, { mode: 0o600 })
+  const transport = materializeCodexControlledTransport(
+    path.join(directory, 'transport'),
+    { logicalRole: 'worker', assignment: { model: 'gpt-5.6-sol' } },
+  )
+  const requests = []
+  const server = http.createServer((request, response) => {
+    let body = ''
+    request.setEncoding('utf8')
+    request.on('data', chunk => { body += chunk })
+    request.on('end', () => {
+      requests.push(JSON.parse(body))
+      const step = requests.length
+      const outputItem = step === 1
+        ? {
+            type: 'custom_tool_call', id: 'ctc-1', call_id: 'call-patch',
+            name: 'apply_patch',
+            input: '*** Begin Patch\n*** Add File: probe.txt\n+ok\n*** End Patch\n',
+          }
+        : step === 2
+          ? {
+              type: 'function_call', id: 'fc-1', call_id: 'call-shell',
+              name: 'shell_command',
+              arguments: JSON.stringify({ command: 'pwd', workdir: directory }),
+            }
+          : {
+              type: 'message', role: 'assistant', id: 'msg-final',
+              content: [{ type: 'output_text', text: '{"ok":true}' }],
+            }
+      const usage = {
+        input_tokens: step, input_tokens_details: { cached_tokens: 0 },
+        output_tokens: 1, output_tokens_details: { reasoning_tokens: 0 },
+        total_tokens: step + 1,
+      }
+      const events = [
+        { type: 'response.created', response: { id: `resp-${step}` } },
+        { type: 'response.output_item.done', item: outputItem },
+        { type: 'response.completed', response: { id: `resp-${step}`, usage } },
+      ]
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end(events.map(event =>
+        `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''))
+    })
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  t.after(() => new Promise(resolve => server.close(resolve)))
+  const port = server.address().port
+  const usageSnapshots = []
+  const quotaProxy = await startCodexCumulativeQuotaProxy({
+    tokenLimit: 24_000,
+    upstreamBaseUrl: `http://127.0.0.1:${port}/v1`,
+    onUsage: usage => usageSnapshots.push(usage),
+  })
+  t.after(() => quotaProxy.close())
+  const provider = 'model_providers.autoprompt-probe=' +
+    `{name="probe",base_url=${JSON.stringify(quotaProxy.baseUrl)},env_key="OPENAI_API_KEY",` +
+    'wire_api="responses",requires_openai_auth=false,supports_websockets=false,' +
+    'supports_standalone_web_search=false,request_max_retries=0,stream_max_retries=0}'
+  const result = await runPinnedCodex(cli, [
+    'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules',
+    '--skip-git-repo-check', '--output-schema', schemaPath, '--strict-config',
+    '--disable', 'multi_agent', '--disable', 'multi_agent_v2',
+    '--disable', 'code_mode', '--disable', 'code_mode_only',
+    '--disable', 'goals', '--disable', 'memories', '--disable', 'token_budget',
+    '--disable', 'current_time_reminder', '--disable', 'deferred_executor',
+    '--disable', 'unbounded_connection_retries', '--disable', 'unified_exec',
+    '--disable', 'view_image',
+    '-c', `model_catalog_json=${JSON.stringify(transport.modelCatalogPath)}`,
+    '-c', `model_instructions_file=${JSON.stringify(transport.instructionsPath)}`,
+    '-c', 'model_provider="autoprompt-probe"', '-c', provider,
+    '-c', 'mcp_servers={}', '-c', 'web_search="disabled"',
+    '-c', 'tools.experimental_request_user_input.enabled=false',
+    '-c', 'tools.update_plan.enabled=false',
+    '-c', 'include_permissions_instructions=false',
+    '-c', 'include_apps_instructions=false',
+    '-c', 'include_collaboration_mode_instructions=false',
+    '-c', 'include_environment_context=false',
+    '-c', 'skills.include_instructions=false',
+    '-c', 'project_doc_max_bytes=0', '-c', 'plugins={}', '-c', 'marketplaces={}',
+    '-c', 'sandbox_workspace_write.network_access=false',
+    '-m', 'gpt-5.6-sol', '--sandbox', 'workspace-write', '-C', directory, '-',
+  ], {
+    cwd: directory,
+    env: { ...process.env, CODEX_HOME: codexHome, OPENAI_API_KEY: 'probe' },
+  })
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`)
+  assert.equal(requests.length, 3)
+  assert.ok(requests.every(request => Number.isSafeInteger(request.max_output_tokens) &&
+    request.max_output_tokens > 0 && request.max_output_tokens < 24_000))
+  assert.deepEqual(quotaProxy.snapshot(), {
+    tokenLimit: 24_000,
+    requestCount: 3,
+    providerRequestCount: 3,
+    deniedCount: 0,
+    hardStopped: false,
+    usage: { noncachedInput: 6, cachedInput: 0, output: 3, reasoning: 0 },
+    latestInputBound: quotaProxy.snapshot().latestInputBound,
+    lastFailure: null,
+  })
+  assert.deepEqual(usageSnapshots.at(-1), {
+    noncachedInput: 6, cachedInput: 0, output: 3, reasoning: 0,
+  })
+  assert.equal(fs.readFileSync(path.join(directory, 'probe.txt'), 'utf8'), 'ok\n')
+  const events = result.stdout.trim().split(/\r?\n/u).filter(Boolean).map(line => JSON.parse(line))
+  const toolEvents = events.filter(event => /^item\.(?:started|completed)$/u.test(event.type) &&
+    ['file_change', 'command_execution'].includes(event.item && event.item.type))
+  assert.equal(toolEvents.length, 4)
+  for (const itemType of ['file_change', 'command_execution']) {
+    const lifecycle = toolEvents.filter(event => event.item.type === itemType)
+    assert.deepEqual(lifecycle.map(event => event.type), ['item.started', 'item.completed'])
+    assert.equal(lifecycle[0].item.id, lifecycle[1].item.id)
+  }
+  const ids = new Set(toolEvents.map(event => event.item.id))
+  assert.equal(ids.size, 2)
+  const shellCompleted = toolEvents.find(event =>
+    event.type === 'item.completed' && event.item.type === 'command_execution')
+  assert.equal(shellCompleted.item.exit_code, 0)
+  assert.equal(shellCompleted.item.aggregated_output, `${directory}\n`)
+  const terminal = events.find(event => event.type === 'turn.completed')
+  assert.deepEqual(terminal.usage, {
+    input_tokens: 6, cached_input_tokens: 0, cache_write_input_tokens: 0,
+    output_tokens: 3, reasoning_output_tokens: 0,
+  })
+})
+
+test('cumulative quota relay bills cached input, injects a hard output cap, and denies a non-fitting replay', async t => {
+  const upstreamBodies = []
+  const upstream = http.createServer((request, response) => {
+    let body = ''
+    request.setEncoding('utf8')
+    request.on('data', chunk => { body += chunk })
+    request.on('end', () => {
+      upstreamBodies.push({ url: request.url, body: JSON.parse(body) })
+      const event = {
+        type: 'response.completed',
+        response: {
+          id: 'cached-response',
+          usage: {
+            input_tokens: 10,
+            input_tokens_details: { cached_tokens: 8 },
+            output_tokens: 2,
+            output_tokens_details: { reasoning_tokens: 1 },
+            total_tokens: 12,
+          },
+        },
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end(`event: response.completed\ndata: ${JSON.stringify(event)}\n\n`)
+    })
+  })
+  await new Promise((resolve, reject) => {
+    upstream.once('error', reject)
+    upstream.listen(0, '127.0.0.1', resolve)
+  })
+  t.after(() => new Promise(resolve => upstream.close(resolve)))
+  const usageSnapshots = []
+  const providerStarts = []
+  const providerSettlements = []
+  const quotaProxy = await startCodexCumulativeQuotaProxy({
+    tokenLimit: 512,
+    upstreamBaseUrl: `http://127.0.0.1:${upstream.address().port}/v1`,
+    onUsage: usage => usageSnapshots.push(usage),
+    onProviderRequestStarted: evidence => providerStarts.push(evidence),
+    onProviderRequestSettled: evidence => providerSettlements.push(evidence),
+  })
+  t.after(() => quotaProxy.close())
+  const endpoint = `${quotaProxy.baseUrl}/responses`
+
+  const unknownRoute = await postJson(`${quotaProxy.baseUrl}/models`, {
+    model: 'gpt-5.6-sol', input: [], stream: true,
+  })
+  assert.equal(unknownRoute.status, 404)
+  assert.equal(upstreamBodies.length, 0)
+
+  const accepted = await postJson(endpoint, {
+    model: 'gpt-5.6-sol', input: [{ role: 'user', content: 'bounded' }], stream: true,
+  })
+  assert.equal(accepted.status, 200)
+  assert.equal(accepted.aborted, false)
+  const completedLine = accepted.body.split(/\r?\n/u).find(line => line.startsWith('data:'))
+  const completed = JSON.parse(completedLine.slice(5).trim())
+  assert.equal(completed.response.usage.codex_rollout_budget_units, 12)
+  assert.equal(upstreamBodies.length, 1)
+  assert.equal(upstreamBodies[0].url, '/v1/responses')
+  assert.ok(Number.isSafeInteger(upstreamBodies[0].body.max_output_tokens))
+  assert.ok(upstreamBodies[0].body.max_output_tokens > 0)
+  assert.ok(upstreamBodies[0].body.max_output_tokens < 512)
+  assert.deepEqual(usageSnapshots, [{
+    noncachedInput: 2, cachedInput: 8, output: 2, reasoning: 1,
+  }])
+  assert.equal(providerStarts.length, 1)
+  assert.equal(providerStarts[0].requestOrdinal, 1)
+  assert.equal(providerStarts[0].maximumUnaccountedTokens, 512)
+  assert.equal(providerSettlements.length, 1)
+  assert.equal(providerSettlements[0].requestOrdinal, 1)
+  assert.equal(providerSettlements[0].disposition, 'ACCOUNTED')
+
+  const denied = await postJson(endpoint, {
+    model: 'gpt-5.6-sol',
+    input: [{ role: 'user', content: 'x'.repeat(1_024) }],
+    stream: true,
+  })
+  assert.equal(denied.status, 429)
+  assert.equal(upstreamBodies.length, 1)
+  assert.deepEqual(quotaProxy.snapshot().usage, {
+    noncachedInput: 2, cachedInput: 8, output: 2, reasoning: 1,
+  })
+  assert.equal(quotaProxy.snapshot().requestCount, 1)
+  assert.equal(quotaProxy.snapshot().providerRequestCount, 1)
+  assert.equal(quotaProxy.snapshot().deniedCount, 1)
+  assert.equal(quotaProxy.snapshot().hardStopped, true)
+  assert.equal(quotaProxy.snapshot().lastFailure.code, 'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED')
+})
+
+test('cumulative quota relay fails closed when completed SSE omits usage', async t => {
+  let upstreamCalls = 0
+  const upstream = http.createServer((request, response) => {
+    request.resume()
+    request.on('end', () => {
+      upstreamCalls += 1
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end('event: response.completed\ndata: {"type":"response.completed","response":{"id":"missing"}}\n\n')
+    })
+  })
+  await new Promise((resolve, reject) => {
+    upstream.once('error', reject)
+    upstream.listen(0, '127.0.0.1', resolve)
+  })
+  t.after(() => new Promise(resolve => upstream.close(resolve)))
+  const quotaProxy = await startCodexCumulativeQuotaProxy({
+    tokenLimit: 1_024,
+    upstreamBaseUrl: `http://127.0.0.1:${upstream.address().port}/v1`,
+  })
+  t.after(() => quotaProxy.close())
+  const endpoint = `${quotaProxy.baseUrl}/responses`
+  const failed = await postJson(endpoint, {
+    model: 'gpt-5.6-sol', input: [{ role: 'user', content: 'x' }], stream: true,
+  })
+  assert.equal(failed.aborted, true)
+  assert.equal(upstreamCalls, 1)
+  assert.equal(quotaProxy.snapshot().requestCount, 0)
+  assert.equal(quotaProxy.snapshot().providerRequestCount, 1)
+  assert.equal(quotaProxy.snapshot().hardStopped, true)
+  assert.equal(quotaProxy.snapshot().lastFailure.code, 'CODEX_USAGE_INVALID')
+  const retry = await postJson(endpoint, {
+    model: 'gpt-5.6-sol', input: [{ role: 'user', content: 'retry' }], stream: true,
+  })
+  assert.equal(retry.status, 429)
+  assert.equal(upstreamCalls, 1)
+})
+
+test('cumulative quota relay fails closed on truncated streams and provider bound violations', async t => {
+  const cases = [
+    {
+      id: 'truncated',
+      expectedCode: 'CODEX_USAGE_INCOMPLETE',
+      tokenLimit: 1_024,
+      events: [{ type: 'response.created', response: { id: 'truncated' } }],
+    },
+    {
+      id: 'input-over-bound',
+      expectedCode: 'CODEX_CHILD_QUOTA_BOUND_VIOLATED',
+      tokenLimit: 20_000,
+      exactUsage: {
+        noncachedInput: 1_000, cachedInput: 9_000, output: 1, reasoning: 0,
+      },
+      events: [{
+        type: 'response.completed',
+        response: {
+          id: 'over-bound',
+          usage: {
+            input_tokens: 10_000,
+            input_tokens_details: { cached_tokens: 9_000 },
+            output_tokens: 1,
+            output_tokens_details: { reasoning_tokens: 0 },
+            total_tokens: 10_001,
+          },
+        },
+      }],
+    },
+    {
+      id: 'aggregate-over-bound',
+      expectedCode: 'CODEX_CHILD_QUOTA_BOUND_VIOLATED',
+      tokenLimit: 1_024,
+      exactUsage: {
+        noncachedInput: 400, cachedInput: 500, output: 200, reasoning: 0,
+      },
+      events: [{
+        type: 'response.completed',
+        response: {
+          id: 'aggregate-over-bound',
+          usage: {
+            input_tokens: 900,
+            input_tokens_details: { cached_tokens: 500 },
+            output_tokens: 200,
+            output_tokens_details: { reasoning_tokens: 0 },
+            total_tokens: 1_100,
+          },
+        },
+      }],
+    },
+  ]
+  for (const scenario of cases) {
+    await t.test(scenario.id, async child => {
+      let upstreamCalls = 0
+      const upstream = http.createServer((request, response) => {
+        request.resume()
+        request.on('end', () => {
+          upstreamCalls += 1
+          response.writeHead(200, { 'content-type': 'text/event-stream' })
+          response.end(scenario.events.map(event =>
+            `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''))
+        })
+      })
+      await new Promise((resolve, reject) => {
+        upstream.once('error', reject)
+        upstream.listen(0, '127.0.0.1', resolve)
+      })
+      child.after(() => new Promise(resolve => upstream.close(resolve)))
+      const providerStarts = []
+      const providerSettlements = []
+      const exactUsage = []
+      const quotaProxy = await startCodexCumulativeQuotaProxy({
+        tokenLimit: scenario.tokenLimit,
+        upstreamBaseUrl: `http://127.0.0.1:${upstream.address().port}/v1`,
+        onProviderRequestStarted: evidence => providerStarts.push(evidence),
+        onProviderRequestSettled: evidence => providerSettlements.push(evidence),
+        onUsage: usage => exactUsage.push(usage),
+      })
+      child.after(() => quotaProxy.close())
+      const endpoint = `${quotaProxy.baseUrl}/responses`
+      const failed = await postJson(endpoint, {
+        model: 'gpt-5.6-sol', input: [{ role: 'user', content: 'x' }], stream: true,
+      })
+      assert.equal(failed.aborted, true)
+      assert.equal(upstreamCalls, 1)
+      assert.equal(quotaProxy.snapshot().requestCount, scenario.exactUsage ? 1 : 0)
+      assert.equal(quotaProxy.snapshot().providerRequestCount, 1)
+      assert.equal(quotaProxy.snapshot().hardStopped, true)
+      assert.equal(quotaProxy.snapshot().lastFailure.code, scenario.expectedCode)
+      assert.equal(providerStarts.length, 1)
+      assert.equal(providerSettlements.length, scenario.exactUsage ? 1 : 0)
+      assert.equal(exactUsage.length, scenario.exactUsage ? 1 : 0)
+      if (scenario.exactUsage) {
+        assert.deepEqual(exactUsage[0], scenario.exactUsage)
+        assert.deepEqual(quotaProxy.snapshot().usage, scenario.exactUsage)
+      }
+      const retry = await postJson(endpoint, {
+        model: 'gpt-5.6-sol', input: [{ role: 'user', content: 'retry' }], stream: true,
+      })
+      assert.equal(retry.status, 429)
+      assert.equal(upstreamCalls, 1)
+    })
+  }
+})
+
+test('cumulative quota relay does not acknowledge usage when durable accounting throws', async t => {
+  const upstream = http.createServer((request, response) => {
+    request.resume()
+    request.on('end', () => {
+      const event = {
+        type: 'response.completed',
+        response: {
+          id: 'accounting-callback-failure',
+          usage: {
+            input_tokens: 2,
+            input_tokens_details: { cached_tokens: 1 },
+            output_tokens: 1,
+            output_tokens_details: { reasoning_tokens: 0 },
+            total_tokens: 3,
+          },
+        },
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end(`event: response.completed\ndata: ${JSON.stringify(event)}\n\n`)
+    })
+  })
+  await new Promise((resolve, reject) => {
+    upstream.once('error', reject)
+    upstream.listen(0, '127.0.0.1', resolve)
+  })
+  t.after(() => new Promise(resolve => upstream.close(resolve)))
+  const starts = []
+  const settlements = []
+  const quotaProxy = await startCodexCumulativeQuotaProxy({
+    tokenLimit: 1_024,
+    upstreamBaseUrl: `http://127.0.0.1:${upstream.address().port}/v1`,
+    onProviderRequestStarted: evidence => starts.push(evidence),
+    onProviderRequestSettled: evidence => settlements.push(evidence),
+    onUsage() {
+      throw Object.assign(new Error('durable usage writer unavailable'), {
+        code: 'ACCOUNTING_WRITE_UNAVAILABLE',
+      })
+    },
+  })
+  t.after(() => quotaProxy.close())
+  const failed = await postJson(`${quotaProxy.baseUrl}/responses`, {
+    model: 'gpt-5.6-sol', input: [{ role: 'user', content: 'x' }], stream: true,
+  })
+  assert.equal(failed.aborted, true)
+  assert.equal(starts.length, 1)
+  assert.equal(settlements.length, 0)
+  assert.equal(quotaProxy.snapshot().requestCount, 0)
+  assert.equal(quotaProxy.snapshot().providerRequestCount, 1)
+  assert.equal(quotaProxy.snapshot().hardStopped, true)
+  assert.equal(quotaProxy.snapshot().lastFailure.code, 'ACCOUNTING_WRITE_UNAVAILABLE')
+})
+
+test('durable provider allowance replay distinguishes exact usage from unknown spend', () => {
+  const sessionHash = crypto.createHash('sha256').update('provider-session').digest('hex')
+  const pendingCause = `codex-provider-pending:${sessionHash}:1:16000:16000:0`
+  const usageCause = `codex-provider-usage:${sessionHash}:1:1`
+  const pendingOnly = unresolvedCodexProviderEnvelopes([
+    accountingRecord(1, pendingCause),
+  ])
+  assert.equal(pendingOnly.length, 1)
+  assert.equal(pendingOnly[0].maximumUnaccountedTokens, 16_000)
+  assert.equal(pendingOnly[0].exactUsageRecorded, false)
+
+  const exactButUnsettled = unresolvedCodexProviderEnvelopes([
+    accountingRecord(1, pendingCause),
+    accountingRecord(2, usageCause, 4_000),
+  ])
+  assert.equal(exactButUnsettled.length, 1)
+  assert.equal(exactButUnsettled[0].exactUsageRecorded, true)
+  assert.equal(exactButUnsettled[0].exactUsageTokens, 4_000)
+  assert.deepEqual(unresolvedCodexProviderEnvelopes([
+    accountingRecord(1, pendingCause),
+    accountingRecord(2, usageCause, 4_000),
+    accountingRecord(3, `codex-provider-settled:${sessionHash}:1:ACCOUNTED`),
+  ]), [])
+
+  const exactOverage = unresolvedCodexProviderEnvelopes([
+    accountingRecord(1, pendingCause),
+    accountingRecord(2, usageCause, 20_000),
+  ])
+  assert.equal(exactOverage.length, 1)
+  assert.equal(exactOverage[0].maximumUnaccountedTokens, 16_000)
+  assert.equal(exactOverage[0].exactUsageTokens, 20_000)
+  assert.deepEqual(unresolvedCodexProviderEnvelopes([
+    accountingRecord(1, pendingCause),
+    accountingRecord(2, usageCause, 20_000),
+    accountingRecord(3, `codex-provider-settled:${sessionHash}:1:ACCOUNTED`),
+  ]), [])
+
+  assert.deepEqual(unresolvedCodexProviderEnvelopes([
+    accountingRecord(1, pendingCause),
+    accountingRecord(2, `codex-provider-charge:${sessionHash}:1:LIVE`, 16_000),
+    accountingRecord(3, `codex-provider-settled:${sessionHash}:1:UPPER_BOUND_CHARGED`),
+  ]), [])
+})
+
+test('crash recovery burns an unresolved 16k route envelope before later reservations', () => {
+  const sessionHash = crypto.createHash('sha256').update('crashed-route-session').digest('hex')
+  const records = [accountingRecord(
+    1,
+    `codex-provider-pending:${sessionHash}:1:16000:16000:0`,
+  )]
+  const runtime = Object.create(CodexSupervisorRuntime.prototype)
+  runtime.activation = { generation: 2 }
+  runtime.options = { accountingAuthority: { replay: () => ({ records }) } }
+  runtime.budget = new BudgetController({
+    limits: { wallMs: 60_000, tokens: 48_000, sessions: 10, launches: 10 },
+    phases: {},
+  })
+  runtime.childTokenReservations = new Map()
+  runtime.pendingProviderEnvelopes = new Map()
+  runtime.recoveredProviderEnvelopeHighWater = new Map()
+  const checkpoints = []
+  runtime._checkpointAccounting = (cause, delta) => checkpoints.push({ cause, delta })
+
+  const recovered = runtime._recoverUnresolvedProviderEnvelopes()
+  assert.deepEqual(recovered, [{
+    key: `${sessionHash}:1`,
+    disposition: 'RECOVERY_UPPER_BOUND_CHARGED',
+    chargedTokens: 16_000,
+    leaseHighWater: 16_000,
+  }])
+  assert.equal(runtime.budget.snapshot().tokensUsed, 16_000)
+  assert.equal(runtime.recoveredProviderEnvelopeHighWater.get(sessionHash), 16_000)
+  assert.match(checkpoints[0].cause.causeId,
+    new RegExp(`^codex-provider-charge:${sessionHash}:1:RECOVERY_2$`, 'u'))
+  assert.equal(checkpoints[1].cause.causeId,
+    `codex-provider-settled:${sessionHash}:1:RECOVERY_UPPER_BOUND_CHARGED`)
+
+  assert.equal(runtime._reserveChildTokenEnvelope('worker-after-crash', {
+    logicalRole: 'worker', route: 'DIRECT', priorLeaseModelTokens: 0,
+  }).limit, 24_000)
+  assert.equal(runtime._reserveChildTokenEnvelope('remainder-after-crash', {
+    logicalRole: 'independent-reviewer', route: 'DIRECT', priorLeaseModelTokens: 0,
+  }).limit, 8_000)
+  assert.throws(() => runtime._reserveChildTokenEnvelope('overflow-after-crash', {
+    logicalRole: 'worker', route: 'DIRECT', priorLeaseModelTokens: 0,
+  }), error => error.code === 'BUDGET_EXHAUSTED')
+})
+
+test('crash recovery does not double-charge exact request-bound usage', () => {
+  const sessionHash = crypto.createHash('sha256').update('exact-crashed-session').digest('hex')
+  const records = [
+    accountingRecord(1, `codex-provider-pending:${sessionHash}:1:16000:16000:0`),
+    accountingRecord(2, `codex-provider-usage:${sessionHash}:1:1`, 4_000),
+  ]
+  const runtime = Object.create(CodexSupervisorRuntime.prototype)
+  runtime.activation = { generation: 2 }
+  runtime.options = { accountingAuthority: { replay: () => ({ records }) } }
+  runtime.budget = new BudgetController({
+    limits: { wallMs: 60_000, tokens: 48_000, sessions: 10, launches: 10 },
+    phases: {},
+  })
+  runtime.budget.consumeTokens(4_000)
+  runtime.recoveredProviderEnvelopeHighWater = new Map()
+  runtime._checkpointAccounting = () => null
+  const recovered = runtime._recoverUnresolvedProviderEnvelopes()
+  assert.equal(recovered[0].disposition, 'RECOVERY_ACCOUNTED')
+  assert.equal(recovered[0].chargedTokens, 0)
+  assert.equal(recovered[0].leaseHighWater, 4_000)
+  assert.equal(runtime.budget.snapshot().tokensUsed, 4_000)
+})
+
+test('durable tool-call high-water rejects gaps and restores exact ordinals', () => {
+  const continuationHash = crypto.createHash('sha256').update('continuation').digest('hex')
+  assert.equal(codexToolCallHighWater([], continuationHash), 0)
+  assert.equal(codexToolCallHighWater([
+    accountingRecord(1, `codex-tool-call:${continuationHash}:1`),
+    accountingRecord(2, `codex-tool-call:${continuationHash}:2`),
+  ], continuationHash), 2)
+  assert.throws(() => codexToolCallHighWater([
+    accountingRecord(1, `codex-tool-call:${continuationHash}:2`),
+  ], continuationHash), error => error.code === 'CODEX_USAGE_INVALID')
+})
+
+test('activation quota reservations prevent concurrent child envelopes from multiplying the 48k ceiling', () => {
+  const runtime = Object.create(CodexSupervisorRuntime.prototype)
+  runtime.budget = new BudgetController({
+    limits: { wallMs: 60_000, tokens: 48_000, sessions: 10, launches: 10 },
+    phases: {},
+  })
+  runtime.childTokenReservations = new Map()
+
+  const worker = runtime._reserveChildTokenEnvelope('worker', {
+    logicalRole: 'worker', route: 'ROADMAP',
+  })
+  const checker = runtime._reserveChildTokenEnvelope('checker', {
+    logicalRole: 'independent-reviewer', route: 'ROADMAP',
+  })
+  assert.deepEqual({ worker: worker.limit, checker: checker.limit }, {
+    worker: 24_000, checker: 24_000,
+  })
+  assert.throws(() => runtime._reserveChildTokenEnvelope('overflow', {
+    logicalRole: 'worker', route: 'ROADMAP',
+  }), error => error.code === 'BUDGET_EXHAUSTED' &&
+    error.details.tokensUsed === 0 && error.details.tokensReserved === 48_000)
+
+  assert.deepEqual(runtime._consumeChildTokenReservation('worker', 8_000), {
+    limit: 24_000, consumed: 8_000, remaining: 16_000,
+  })
+  assert.equal(runtime.budget.snapshot().tokensUsed, 8_000)
+  assert.deepEqual(runtime._releaseChildTokenEnvelope('checker'), {
+    limit: 24_000, consumed: 0, released: 24_000,
+  })
+  const route = runtime._reserveChildTokenEnvelope('route', {
+    logicalRole: 'route-analyst', route: 'PRE_ROUTE',
+  })
+  assert.equal(route.limit, 16_000)
+  const remainder = runtime._reserveChildTokenEnvelope('activation-remainder', {
+    logicalRole: 'worker', route: 'ROADMAP',
+  })
+  assert.equal(remainder.limit, 8_000)
+  assert.throws(() => runtime._reserveChildTokenEnvelope('still-overflow', {
+    logicalRole: 'worker', route: 'ROADMAP',
+  }), error => error.code === 'BUDGET_EXHAUSTED')
+
+  runtime._consumeChildTokenReservation('worker', 16_000)
+  runtime._releaseChildTokenEnvelope('worker')
+  runtime._consumeChildTokenReservation('route', 16_000)
+  runtime._releaseChildTokenEnvelope('route')
+  runtime._consumeChildTokenReservation('activation-remainder', 8_000)
+  runtime._releaseChildTokenEnvelope('activation-remainder')
+  assert.equal(runtime.budget.snapshot().tokensUsed, 48_000)
+  assert.equal(runtime.childTokenReservations.size, 0)
+  assert.throws(() => runtime._reserveChildTokenEnvelope('after-ceiling', {
+    logicalRole: 'worker', route: 'ROADMAP',
+  }), error => error.code === 'BUDGET_EXHAUSTED')
+})
+
+test('unknown billed route usage burns its 16k reservation before deterministic fallback', () => {
+  const runtime = Object.create(CodexSupervisorRuntime.prototype)
+  runtime.budget = new BudgetController({
+    limits: { wallMs: 60_000, tokens: 48_000, sessions: 10, launches: 10 },
+    phases: {},
+  })
+  runtime.childTokenReservations = new Map()
+
+  const route = runtime._reserveChildTokenEnvelope('unknown-route', {
+    logicalRole: 'route-analyst', route: 'PRE_ROUTE',
+  })
+  assert.equal(route.limit, 16_000)
+  assert.deepEqual(runtime._chargeUnknownChildTokenUpperBound('unknown-route'), {
+    charged: 16_000, limit: 16_000, consumed: 16_000, remaining: 0,
+  })
+  assert.equal(runtime.budget.snapshot().tokensUsed, 16_000)
+  assert.deepEqual(runtime._releaseChildTokenEnvelope('unknown-route'), {
+    limit: 16_000, consumed: 16_000, released: 0,
+  })
+
+  const worker = runtime._reserveChildTokenEnvelope('post-route-worker', {
+    logicalRole: 'worker', route: 'DIRECT',
+  })
+  const activationRemainder = runtime._reserveChildTokenEnvelope('post-route-remainder', {
+    logicalRole: 'independent-reviewer', route: 'DIRECT',
+  })
+  assert.deepEqual({ worker: worker.limit, activationRemainder: activationRemainder.limit }, {
+    worker: 24_000, activationRemainder: 8_000,
+  })
+  assert.throws(() => runtime._reserveChildTokenEnvelope('post-route-overflow', {
+    logicalRole: 'worker', route: 'DIRECT',
+  }), error => error.code === 'BUDGET_EXHAUSTED' &&
+    error.details.tokensUsed === 16_000 && error.details.tokensReserved === 32_000)
+})
 
 function authority(scheduler, parentLease = null) {
   sequence += 1
@@ -156,6 +1051,9 @@ test('AP-COST-011 agents=off applies role effort instead of inheriting root xhig
     routeIndependent: true,
   })
   assert.equal(readPrivateAgentAssignment(activation, 'ap-worker', 'worker').effort, 'medium')
+  assert.equal(readPrivateAgentAssignment(
+    activation, 'ap-route-analyst', 'route-analyst',
+  ).effort, 'low')
 })
 
 test('AP-COST-012 accepts only a fresh evidence-bound economic registry envelope', () => {

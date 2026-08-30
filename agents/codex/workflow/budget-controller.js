@@ -214,7 +214,7 @@ class BudgetController {
     const status = this.status(options)
     const blocking = options.requiredCompletion === true
       ? status.exhausted.filter(dimension => ![
-          'WALL', 'WORK_WALL', 'EXECUTION_WALL', 'TOKENS', 'SESSIONS', 'LAUNCHES',
+          'WALL', 'WORK_WALL', 'EXECUTION_WALL', 'SESSIONS', 'LAUNCHES',
         ].includes(dimension))
       : status.exhausted
     if (blocking.length > 0) {

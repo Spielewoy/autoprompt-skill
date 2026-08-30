@@ -1576,12 +1576,26 @@ test('non-resetting budgets use monotonic elapsed time and retain usage across r
   assert.equal(restored.snapshot().tokensUsed, 25)
 })
 
-test('required completion records token, session, and launch target overruns while optional admission still collapses', () => {
-  const controller = new BudgetController({
+test('an admitted completion records token overrun but no required launch can cross the token ceiling', () => {
+  const tokenController = new BudgetController({
     limits: { wallMs: 1000, tokens: 1, sessions: 1, launches: 1 },
     phases: {},
   })
-  controller.consumeTokens(2, { requiredCompletion: true })
+  tokenController.consumeTokens(2, { requiredCompletion: true })
+  assert.equal(tokenController.snapshot().tokensUsed, 2)
+  assert.throws(
+    () => tokenController.assertAvailable({ requiredCompletion: true }),
+    error => error.code === 'BUDGET_EXHAUSTED' && error.details.exhausted.includes('TOKENS'),
+  )
+  assert.throws(
+    () => tokenController.recordLaunch({ requiredCompletion: true }),
+    error => error.code === 'BUDGET_EXHAUSTED' && error.details.exhausted.includes('TOKENS'),
+  )
+
+  const controller = new BudgetController({
+    limits: { wallMs: 1000, tokens: 100, sessions: 1, launches: 1 },
+    phases: {},
+  })
   controller.recordLaunch({ requiredCompletion: true })
   controller.recordLaunch({ requiredCompletion: true })
   controller.startSession('required-one', { requiredCompletion: true })
@@ -1589,7 +1603,7 @@ test('required completion records token, session, and launch target overruns whi
   controller.startSession('required-two', { requiredCompletion: true })
   const status = controller.assertAvailable({ requiredCompletion: true })
   assert.equal(status.ok, true)
-  assert.deepEqual(status.completionTargetOverrun.sort(), ['LAUNCHES', 'SESSIONS', 'TOKENS'])
+  assert.deepEqual(status.completionTargetOverrun.sort(), ['LAUNCHES', 'SESSIONS'])
   assert.throws(() => controller.assertAvailable(), error => error.code === 'BUDGET_EXHAUSTED')
   assert.throws(() => controller.recordLaunch(), error => error.code === 'BUDGET_EXHAUSTED')
   assert.throws(

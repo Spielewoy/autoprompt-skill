@@ -232,15 +232,23 @@ test('required phase work records elapsed targets and continues without an ambie
   assert.equal(decision.completionTargetOverrun, true)
 })
 
-test('production default runtime has no implicit activation token stop and validates explicit targets', t => {
+test('production runtime defaults to a 24k activation token ceiling and validates explicit targets', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-production-token-limit-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
 
-  const unboundedOptions = createProductionRuntimeOptionsFixture(directory, 'absent')
-  assert.equal(unboundedOptions.budgetController.snapshot().limits.tokens, Number.MAX_SAFE_INTEGER)
-  const unboundedRuntime = new CodexSupervisorRuntime(unboundedOptions)
-  assert.equal(unboundedRuntime.budget, unboundedOptions.budgetController)
-  assert.equal(unboundedRuntime.budget.snapshot().limits.tokens, Number.MAX_SAFE_INTEGER)
+  const defaultOptions = createProductionRuntimeOptionsFixture(directory, 'absent')
+  assert.equal(defaultOptions.budgetController.snapshot().limits.tokens, 24_000)
+  const defaultRuntime = new CodexSupervisorRuntime(defaultOptions)
+  assert.equal(defaultRuntime.budget, defaultOptions.budgetController)
+  assert.equal(defaultRuntime.budget.snapshot().limits.tokens, 24_000)
+
+  defaultRuntime.budget.consumeTokens(24_001, { requiredCompletion: true })
+  assert.equal(defaultRuntime.budget.snapshot().tokensUsed, 24_001,
+    'the already-admitted turn must retain its complete terminal accounting')
+  assert.throws(
+    () => defaultRuntime.budget.recordLaunch({ requiredCompletion: true }),
+    error => error.code === 'BUDGET_EXHAUSTED' && error.details.exhausted.includes('TOKENS'),
+  )
 
   const explicitOptions = createProductionRuntimeOptionsFixture(
     directory,

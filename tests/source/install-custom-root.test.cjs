@@ -22,7 +22,7 @@ const PUBLIC_CLIENTS = [
 const SHARED_LIFECYCLE_CLIENTS = PUBLIC_CLIENTS.filter(client => client !== 'prime')
 const CLIENT_COMMANDS = {
   claude: ['claude', 'Claude Code 2.1.232'],
-  codex: ['codex', 'codex-cli 0.101.0'],
+  codex: ['codex', 'codex-cli 0.148.0'],
   opencode: ['opencode', 'opencode 1.18.18'],
   kilo: ['kilo', 'kilo 7.4.22'],
   vscode: ['code', '1.133.0'],

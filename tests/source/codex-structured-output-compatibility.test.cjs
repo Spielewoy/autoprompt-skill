@@ -16,6 +16,7 @@ const {
   admitRoadmapExpansion,
   assignmentLocalFindingId,
   bindCanonicalMissionForChild,
+  canonicalAssignmentFindingIds,
   canonicalAssignmentResources,
   canonicalMissionReadResources,
   canonicalRoleFindingIds,
@@ -36,6 +37,7 @@ const {
   readPersistedWorkerAssignment,
   resolvePreMutationRouteDecisionHash,
   runtimeCapabilityExpiryMs,
+  validateCanonicalChildResult,
 } = require(path.join(ROOT, 'agents', 'codex', 'workflow', 'phase-budget.js'))
 const { stableStringify } = require(path.join(ROOT, 'agents', 'codex', 'workflow', 'event-log.js'))
 const { CleanupRegistry } = require(path.join(ROOT, 'agents', 'codex', 'workflow', 'finalizer.js'))
@@ -1487,12 +1489,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
     compactOutcomes: true,
     commandEvents: [
       {
-        command: 'uname -a', status: 'completed', exit_code: 0,
-        aggregated_output: 'kernel observation one',
-      },
-      {
-        command: 'uname -a', status: 'completed', exit_code: 0,
-        aggregated_output: 'kernel observation two',
+        command: 'uname -a && uname -a', status: 'completed', exit_code: 0,
+        aggregated_output: 'kernel observation one\nkernel observation two',
       },
       {
         command: genericCommand, status: 'completed', exit_code: 0,
@@ -1673,29 +1671,145 @@ test('Codex adapter sends the compatibility schema and restores canonical output
   assert.notEqual(providerSchema, canonicalSchema)
   assert.match(observed.stdin, /AUTOPROMPT_CODEX_PROVIDER_TRANSPORT_V1/)
   assert.match(observed.stdin, /parent already activated and announced the AutoPrompt skill/)
-  assert.match(observed.stdin, /Canonical output schema:/)
+  assert.match(observed.stdin, /Canonical output contract \(sha256=[a-f0-9]{64}; exact runtime JSON validation applies\)/)
+  assert.match(observed.stdin, /findingIds must match \^AP-\[A-Z\]\+-\(\?:\[0-9\]\{3\}\|\[0-9\]\{78\}\)\$/)
   const canonicalSchemaObject = JSON.parse(fs.readFileSync(canonicalSchema, 'utf8'))
-  const schemaLine = observed.stdin.split('\n')
-    .find(line => line.startsWith('Canonical output schema: '))
-  const embeddedSchema = schemaLine.slice('Canonical output schema: '.length)
-  const codexCanonicalSchemaObject = JSON.parse(embeddedSchema)
   assert.equal(
     canonicalSchemaObject.$defs.base.properties.findingIds.items.pattern,
     '^AP-[A-Z]+-[0-9]{3}$',
     'the shared provider-neutral role contract remains unchanged',
   )
-  assert.equal(
-    codexCanonicalSchemaObject.$defs.base.properties.findingIds.items.pattern,
-    '^AP-[A-Z]+-(?:[0-9]{3}|[0-9]{78})$',
-  )
   assert.equal(validateJsonSchema(canonicalSchemaObject, canonicalOutput).valid, false)
-  assert.equal(validateJsonSchema(codexCanonicalSchemaObject, canonicalOutput).valid, true)
-  assert.doesNotMatch(observed.stdin, /Canonical output schema: \{\n\s+"/u)
+  assert.doesNotMatch(observed.stdin, /Canonical output schema:/u)
+  assert.ok(Buffer.byteLength(observed.stdin, 'utf8') < Buffer.byteLength(JSON.stringify(canonicalSchemaObject), 'utf8'))
   assert.deepEqual(terminal.behaviorChanged, canonicalOutput.behaviorChanged)
   assert.deepEqual(observedUsage, { noncachedInput: 4, cachedInput: 7, output: 1, reasoning: 0 })
   assert.equal(result.reportType, 'result')
   assert.deepEqual(result.findingIds, [fallbackFindingId])
   assert.equal(Object.hasOwn(result, 'canonicalJson'), false)
+})
+
+test('Codex checker prompt removes duplicated doctrine while retaining exact obligations', async t => {
+  const directory = temporaryDirectory(t)
+  const requestEnvelopeHash = 'a'.repeat(64)
+  const candidateHash = 'b'.repeat(64)
+  const assignmentId = 'compact-checker'
+  const doctrineSentinel = `DUPLICATED_DOCTRINE_SENTINEL_${'d'.repeat(24_000)}`
+  const controllerSentinel = `CONTROLLER_ONLY_SENTINEL_${'c'.repeat(12_000)}`
+  const checkerOutput = canonicalOutcome('CHECK_INCONCLUSIVE', {
+    runId: 'run-compact-checker', requestEnvelopeHash,
+    currentVersionHash: candidateHash,
+  })
+  let observed
+  const runner = {
+    async run(spec) {
+      observed = spec
+      spec.onStdoutLine(JSON.stringify({
+        type: 'thread.started', thread_id: '51515151-5151-4151-8151-515151515151',
+      }))
+      spec.onStdoutLine(JSON.stringify({
+        type: 'item.completed',
+        item: {
+          type: 'agent_message',
+          text: JSON.stringify({ canonicalJson: JSON.stringify(checkerOutput) }),
+        },
+      }))
+      spec.onStdoutLine(JSON.stringify({
+        type: 'turn.completed',
+        usage: { input_tokens: 3, cached_input_tokens: 1, output_tokens: 1, reasoning_output_tokens: 0 },
+      }))
+      return { status: 0, stdout: '', stderr: '', processOwned: true, exactArgv: true, drained: true }
+    },
+    async stop() { return { drained: true } },
+  }
+  const adapter = new CodexExecAdapter({
+    runner, targetPath: ROOT,
+    profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+    outputSchemaResolver: () => path.join(
+      ROOT, 'agents', 'contracts', 'schemas', 'outcome.schema.json',
+    ),
+    providerSchemaRoot: path.join(directory, 'provider-schemas'),
+  })
+  const requestedResult = 'Independently verify the exact frozen CAD deliverable.' +
+    ` Apply fetchedEvidence.verificationDoctrine exactly ${doctrineSentinel}`
+  const result = await adapter.launch({
+    ...CHECKER_EXECUTION_POLICY,
+    physicalExecutionPolicy: CHECKER_EXECUTION_POLICY,
+    runId: 'run-compact-checker', candidateHash, purpose: 'check',
+    ...adapterMissionFields(requestEnvelopeHash, assignmentId),
+    canonicalAssignment: {
+      schemaVersion: '2.0.0', reportType: 'assignment', reportId: 'assignment-compact-checker',
+      runId: 'run-compact-checker', assignmentId, logicalRoleId: 'independent-reviewer',
+      physicalRoleId: 'autoprompt.v2.independent-reviewer', requestEnvelopeHash,
+      findingIds: ['AP-WORK-401'], requestedResult,
+      resources: [{
+        kind: 'deliverable', identity: '/app/out.step', access: 'read',
+        expectedPreimageHash: candidateHash, owner: 'worker', ownershipMode: 'shared',
+        controllerOnlyDescription: controllerSentinel,
+      }],
+      allowedReads: [controllerSentinel],
+      verificationObservationBinding: { controllerSentinel },
+      planReference: controllerSentinel,
+      forbiddenChanges: ['Do not modify the frozen candidate.'],
+      successChecklist: ['The exact required CAD topology is independently verified.'],
+      checks: ['verification:cad:exact-topology'],
+      resultLocation: 'work/results/compact-checker.json',
+      assignedAt: '2026-08-30T12:00:00.000Z',
+    },
+    dispatch: {
+      schemaVersion: '2.0.0', activation: { id: 'compact-activation', generation: 1 },
+      fork_turns: 'none', route: 'DIRECT', role: 'ap-independent-checker', purpose: 'check',
+      requestPointer: { path: 'request', hash: requestEnvelopeHash },
+      providerCapabilities: { controllerSentinel },
+      contextBudget: { controllerSentinel },
+      exactRequestControllerBinding: { controllerSentinel },
+      candidateHash,
+      fetchedEvidence: {
+        verificationDoctrine: [doctrineSentinel],
+        requiredInvariantCategories: ['positive', 'negative', 'boundary', 'adversarial'],
+        verificationObligations: [{
+          obligationId: 'verification:cad:exact-topology',
+          statement: 'Independently verify the exact topology of /app/out.step.',
+          requiredEvidence: ['one executed independent consumer'],
+        }],
+      },
+    },
+    environment: {}, sessionId: 'compact-checker-session',
+    reservationId: 'compact-checker-reservation',
+    onUsageDelta() { return { continue: true } },
+  })
+
+  const contextPrefix = 'Canonical context envelope: '
+  const assignmentPrefix = 'Canonical assignment: '
+  const contextLine = observed.stdin.split('\n').find(line => line.startsWith(contextPrefix))
+  const assignmentLine = observed.stdin.split('\n').find(line => line.startsWith(assignmentPrefix))
+  const visibleContext = JSON.parse(contextLine.slice(contextPrefix.length))
+  const visibleAssignment = JSON.parse(assignmentLine.slice(assignmentPrefix.length))
+  assert.deepEqual(visibleContext.fetchedEvidence.verificationDoctrine, [
+    'Cover every exact named check and verification obligation; one admissible harness may cover several IDs.',
+    'PASS requires independently derived expected behavior and an executed end-to-end observable result on the frozen exact version. Static inspection may prove a concrete FAIL but never PASS.',
+    'Exercise positive, negative, boundary, temporal-order, equivalence-separation, and adversarial composition cases wherever applicable; do not derive the expected result from the implementation being checked.',
+    'Bind PASS to one unique zero exit and a concrete product FAIL to one authenticated nonzero check. Setup, tool, dependency, or consumer unavailability is CHECK_INCONCLUSIVE or RUNTIME_FAILURE.',
+    'Return every named test outcome plus the underlying evidence IDs and independent reference method; keep large evidence in scratch and return bounded diagnostics only.',
+  ])
+  assert.equal(
+    visibleContext.fetchedEvidence.verificationObligations[0].obligationId,
+    'verification:cad:exact-topology',
+  )
+  assert.equal(visibleAssignment.requestedResult,
+    'Independently verify the exact frozen CAD deliverable.')
+  assert.deepEqual(visibleAssignment.resources, [{
+    kind: 'deliverable', identity: '/app/out.step', access: 'read',
+  }])
+  assert.deepEqual(visibleAssignment.checks, ['verification:cad:exact-topology'])
+  for (const controllerOnlyField of [
+    'allowedReads', 'verificationObservationBinding', 'planReference', 'resultLocation', 'assignedAt',
+  ]) assert.equal(Object.hasOwn(visibleAssignment, controllerOnlyField), false)
+  assert.equal(Object.hasOwn(visibleContext, 'contextBudget'), false)
+  assert.equal(Object.hasOwn(visibleContext, 'exactRequestControllerBinding'), false)
+  assert.doesNotMatch(observed.stdin, /DUPLICATED_DOCTRINE_SENTINEL|CONTROLLER_ONLY_SENTINEL/u)
+  assert.ok(Buffer.byteLength(observed.stdin, 'utf8') < 14_000)
+  assert.equal(result.code, 'CHECK_INCONCLUSIVE')
 })
 
 test('fallible local bookkeeping callbacks cannot discard a schema-valid terminal result', async () => {
@@ -2047,8 +2161,6 @@ test('Codex route analyst may revise a schema-valid provisional recommendation b
       const events = [
         { type: 'thread.started', thread_id: '77777777-7777-4777-8777-777777777777' },
         { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(provisional) }) } },
-        { type: 'item.started', item: { type: 'command_execution', command: 'find /app -maxdepth 2 -type f', status: 'in_progress' } },
-        { type: 'item.completed', item: { type: 'command_execution', command: 'find /app -maxdepth 2 -type f', status: 'completed', exit_code: 0 } },
         { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(final) }) } },
         { type: 'turn.completed', usage: { input_tokens: 3, cached_input_tokens: 1, output_tokens: 2, reasoning_output_tokens: 1 } },
       ]
@@ -2082,9 +2194,14 @@ test('Codex route analyst may revise a schema-valid provisional recommendation b
   assert.equal(result.recommendation.recommendedRoute, 'ROADMAP')
   assert.equal(result.reconstructedTerminal, undefined)
   assert.deepEqual(routeArgv.filter((value, index, all) => all[index - 1] === '--disable'), [
-    'multi_agent', 'multi_agent_v2', 'shell_tool', 'unified_exec',
+    'multi_agent', 'multi_agent_v2', 'code_mode', 'code_mode_only', 'goals', 'memories',
+    'token_budget', 'current_time_reminder', 'deferred_executor', 'unbounded_connection_retries',
+    'shell_tool', 'unified_exec', 'view_image',
   ])
+  assert.equal(routeArgv.includes('model_reasoning_effort="low"'), true)
   assert.equal(routeArgv.includes('model_auto_compact_token_limit=32768'), true)
+  assert.equal(routeArgv.includes('tool_output_token_limit=1000'), true)
+  assert.equal(routeArgv.includes('allow_login_shell=false'), true)
 })
 
 test('Codex preserves shared route vocabulary and recovers malformed f1de11a task briefs', async t => {
@@ -2225,10 +2342,21 @@ test('Codex preserves shared route vocabulary and recovers malformed f1de11a tas
       onTerminalResult(value) { acceptedTerminals.push(value) },
     })
     const schemaLine = providerPrompt.split('\n')
-      .find(line => line.startsWith('Canonical output schema: '))
-    const providerSchema = JSON.parse(schemaLine.slice('Canonical output schema: '.length))
+      .find(line => line.startsWith('Canonical routeFactProposal schema: '))
+    const providerProposalSchema = JSON.parse(
+      schemaLine.slice('Canonical routeFactProposal schema: '.length),
+    )
+    const verificationLine = providerPrompt.split('\n')
+      .find(line => line.startsWith('Canonical verificationObligations item schema: '))
+    assert.ok(verificationLine)
+    assert.doesNotMatch(providerPrompt, /Canonical output schema:/u)
+    assert.ok(Buffer.byteLength(providerPrompt, 'utf8') < 12_000)
+    const providerSchema = structuredClone(require(path.join(
+      ROOT, 'agents', 'contracts', 'schemas', 'route-recommendation.schema.json',
+    )))
+    providerSchema.properties.routeFactProposal = providerProposalSchema
     projectedProviderSchema = providerSchema
-    const providerProposal = providerSchema.properties.routeFactProposal.properties
+    const providerProposal = providerProposalSchema.properties
     assert.deepEqual(
       providerProposal.mutableResources,
       routeRouter.ROUTE_FACTS_SCHEMA.properties.mutableResources,
@@ -2390,8 +2518,6 @@ test('Codex L0 owner may replace an internal WAITING_USER progress message with 
       for (const event of [
         { type: 'thread.started', thread_id: '33333333-4444-4333-8333-333333333333' },
         { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(provisional) }) } },
-        { type: 'item.started', item: { type: 'command_execution', command: 'inspect-route-evidence', status: 'in_progress' } },
-        { type: 'item.completed', item: { type: 'command_execution', command: 'inspect-route-evidence', status: 'completed', exit_code: 0 } },
         { type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ canonicalJson: JSON.stringify(final) }) } },
         { type: 'turn.completed', usage: { input_tokens: 3, cached_input_tokens: 1, output_tokens: 2, reasoning_output_tokens: 1 } },
       ]) spec.onStdoutLine(JSON.stringify(event))
@@ -3279,8 +3405,7 @@ test('canonical brief path validation distinguishes slash-separated prose from e
     enforcePreimages: true,
   }), error => error.code === 'OWNERSHIP_RESOURCE_INVALID')
 
-  const typedDatabaseIdentity =
-    'ERP planning, demand, engineering-release, routing, qualification, and WIP data exposed by the gateway'
+  const typedDatabaseIdentity = 'ERP database through /app/data/dbgw.py'
   const typedDatabase = canonicalAssignmentResources({
     request: {
       workItemId: 'work-1',
@@ -3300,6 +3425,27 @@ test('canonical brief path validation distinguishes slash-separated prose from e
     kind: 'database', identity: typedDatabaseIdentity, access: 'write',
     expectedPreimageHash: null, owner: 'worker-1', ownershipMode: 'ordered-transfer',
   })
+  assert.throws(() => canonicalAssignmentResources({
+    request: {
+      workItemId: 'work-1', assignment: 'Create the declared artifact.',
+      ownership: [{ kind: 'not-a-real-kind', identity: 'artifact.txt', owner: 'worker-1' }],
+      manifests: [],
+    },
+    targetPath: target, logicalRole: 'worker', readOnly: false, enforcePreimages: true,
+  }), error => error.code === 'OWNERSHIP_RESOURCE_INVALID')
+  for (const request of [{
+    workItemId: 'work-1', assignment: 'Create the declared artifact.',
+    ownership: ['artifact.txt'],
+    manifests: [{ kind: 'not-a-real-kind', identity: 'artifact.txt' }],
+  }, {
+    workItemId: 'work-1', assignment: 'Use the workspace.', ownership: ['workspace'],
+    manifests: [{ kind: 'not-a-real-kind', identity: 'orphan-artifact.txt' }],
+  }]) {
+    assert.throws(() => canonicalAssignmentResources({
+      request, targetPath: target, logicalRole: 'worker',
+      readOnly: false, enforcePreimages: true,
+    }), error => error.code === 'OWNERSHIP_RESOURCE_INVALID')
+  }
 })
 
 test('canonical mission paths become bounded worker read resources and invalid repair findings fall back locally', t => {
@@ -3333,6 +3479,69 @@ test('canonical mission paths become bounded worker read resources and invalid r
   assert.equal(assignmentLocalFindingId({
     workItemId: 'work-1-repair-1', logicalRole: 'worker',
   }), 'AP-WORK-301')
+  const repairFindingIds = canonicalAssignmentFindingIds({
+    workItemId: 'work-1-repair-1', logicalRole: 'worker',
+    findingIds: ['AP-RUN-026', 'implementation-defect:deadbeef'],
+  }, { requestEnvelopeHash: 'a'.repeat(64) })
+  assert.equal(repairFindingIds.includes('AP-RUN-026'), true)
+  assert.equal(repairFindingIds.length, 2)
+  assert.match(repairFindingIds.find(id => id !== 'AP-RUN-026'), /^AP-WORK-[0-9]{78}$/u)
+  const collisionSafeFindingIds = canonicalAssignmentFindingIds({
+    workItemId: 'work-1-repair-1', logicalRole: 'worker',
+    findingIds: [
+      'AP-RUN-026', 'AP-WORK-301',
+      'implementation-defect:first', 'implementation-defect:second',
+    ],
+  }, { requestEnvelopeHash: 'a'.repeat(64) })
+  assert.equal(collisionSafeFindingIds.includes('AP-WORK-301'), true)
+  assert.equal(collisionSafeFindingIds.length, 4)
+  assert.equal(new Set(collisionSafeFindingIds).size, 4)
+  assert.equal(collisionSafeFindingIds.filter(id => /^AP-WORK-[0-9]{78}$/u.test(id)).length, 2)
+  const repairRecord = {
+    logicalRole: 'worker', physicalRole: 'autoprompt.v2.worker',
+    workItemId: 'work-1-repair-1', findingIds: repairFindingIds,
+  }
+  assert.doesNotThrow(() => validateCanonicalChildResult(
+    repairRecord,
+    canonicalWorkerResult({
+      runId: 'run-cad-repair', assignmentId: 'work-1-repair-1',
+      reportId: 'cad-repair-result', findingIds: repairFindingIds,
+    }),
+    'run-cad-repair', 'a'.repeat(64),
+  ))
+  assert.throws(() => validateCanonicalChildResult(
+    repairRecord,
+    canonicalWorkerResult({
+      runId: 'run-cad-repair', assignmentId: 'work-1-repair-1',
+      reportId: 'cad-repair-wrong-finding', findingIds: ['AP-WORK-401'],
+    }),
+    'run-cad-repair', 'a'.repeat(64),
+  ), error => error.code === 'ROLE_REPORT_INVALID')
+
+  for (const filename of ['input', 'input image.png', 'input 画像+.png', '画像+.png']) {
+    fs.writeFileSync(path.join(canonicalTarget, filename), `${filename}\n`)
+    fs.copyFileSync(path.join(canonicalTarget, filename), path.join(workerTarget, filename))
+  }
+  const ambiguousReadResources = canonicalMissionReadResources(
+    JSON.stringify({ request: `Inspect ${path.join(canonicalTarget, 'input image.png')} before writing.` }),
+    canonicalTarget, workerTarget, 'work-1',
+  )
+  assert.deepEqual(
+    ambiguousReadResources.map(resource => resource.identity),
+    ['input', 'input image.png'],
+    'ambiguous unquoted prose conservatively protects every existing path prefix',
+  )
+  const leadingUnquoted = canonicalMissionReadResources(
+    JSON.stringify({ request: `${path.join(canonicalTarget, '画像+.png')} before output.` }),
+    canonicalTarget, workerTarget, 'work-1',
+  )
+  assert.deepEqual(leadingUnquoted.map(resource => resource.identity), ['画像+.png'])
+  const quotedUnicode = canonicalMissionReadResources(
+    JSON.stringify({ request: `Inspect \`${path.join(canonicalTarget, 'input 画像+.png')}\` before writing.` }),
+    canonicalTarget, workerTarget, 'work-1',
+  )
+  assert.equal(quotedUnicode.length, 1)
+  assert.equal(quotedUnicode[0].identity, 'input 画像+.png')
 })
 
 test('checker brief validation projects canonical absolute inputs into its snapshot', t => {
@@ -3376,7 +3585,7 @@ test('checker brief validation projects canonical absolute inputs into its snaps
   }), error => error.code === 'MISSION_PATH_INVALID')
 })
 
-test('Codex preserves multi-command route analyses on a clean owned exit without turn.completed', async t => {
+test('Codex preserves tool-free bounded route analyses on a clean owned exit without turn.completed', async t => {
   const directory = temporaryDirectory(t)
   const executionPolicy = {
     logicalRole: 'route-analyst', physicalRole: 'autoprompt.v2.route-analyst',
@@ -3384,12 +3593,11 @@ test('Codex preserves multi-command route analyses on a clean owned exit without
     policyId: 'autoprompt.codex.role-policy', policyVersion: '2.0.0',
   }
   const fallbackUsage = Object.freeze({
-    noncachedInput: 64000, cachedInput: 128000, output: 8000, reasoning: 4000,
+    noncachedInput: 3000, cachedInput: 2000, output: 1000, reasoning: 500,
   })
   const scenarios = [
     {
       id: 'multi-file-index-build', route: 'ROADMAP',
-      commandCount: 3,
       obligation: 'distinct-keys-remain-distinct',
       recommendation: createRouteRecommendation({
         schemaVersion: '2.0.0', preWorkResult: 'CONTINUE', recommendedRoute: 'ROADMAP', confidence: 'high',
@@ -3411,7 +3619,6 @@ test('Codex preserves multi-command route analyses on a clean owned exit without
     },
     {
       id: 'configuration-validator', route: 'LIGHT', obligation: 'obfuscated directives',
-      commandCount: 1,
       recommendation: createRouteRecommendation({
         schemaVersion: '2.0.0', preWorkResult: 'CONTINUE', recommendedRoute: 'LIGHT', confidence: 'high',
         whatTheUserWants: ['Validate a configuration file in place without changing safe lookalike text.'],
@@ -3437,26 +3644,9 @@ test('Codex preserves multi-command route analyses on a clean owned exit without
     const adapter = new CodexExecAdapter({
       runner: {
         async run(spec) {
-          const commandEvents = Array.from({ length: scenario.commandCount }, (_, index) => [
-            {
-              type: 'item.started',
-              item: {
-                id: `cohort-command-${index}`, type: 'command_execution',
-                command: `sed -n '${index + 1}p' README.md`,
-              },
-            },
-            {
-              type: 'item.completed',
-              item: {
-                id: `cohort-command-${index}`, type: 'command_execution',
-                command: `sed -n '${index + 1}p' README.md`, status: 'completed', exit_code: 0,
-              },
-            },
-          ]).flat()
           for (const event of [
             { type: 'thread.started', thread_id: `cohort-${scenario.id}` },
             { type: 'turn.started' },
-            ...commandEvents,
             {
               type: 'item.completed',
               item: {
@@ -3590,7 +3780,7 @@ test('Codex clean-exit usage compatibility preserves telemetry and fails closed 
   )
   await assert.rejects(
     launch({ suffix: 'nonzero-exit', status: 9 }),
-    error => error.code === 'CODEX_CHILD_FAILED',
+    error => error.code === 'CODEX_USAGE_UNKNOWN_AFTER_START',
   )
   await assert.rejects(
     launch({ suffix: 'undrained-exit', drained: false }),

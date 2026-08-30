@@ -204,7 +204,7 @@ test('mission-bound typed external outputs are writable, candidate-bound, and ch
   const { target, external } = temporaryFixture(t)
   const script = path.join(external, 'build_asset.py')
   const output = path.join(external, 'compiled_asset.bin')
-  const mission = `Create a reproducible patch script at ${script} and use it to write ${output}.`
+  const mission = `Create a reproducible patch script at \`${script}\` and use it to write \`${output}\`.`
   const ownership = externalOwnership(script, output)
   const assignment = workerAssignment(target, mission, ownership)
   assert.deepEqual(assignment.resources.map(resource => resource.identity).sort(), [output, script].sort())
@@ -275,7 +275,7 @@ test('external-output CHECK_WORK crash recovery retains both admitted deliverabl
   const script = path.join(external, 'build_asset.py')
   const output = path.join(external, 'compiled_asset.bin')
   const foreign = path.join(external, 'foreign-durable-output')
-  const mission = `Create a reproducible patch script at ${script} and use it to write ${output}.`
+  const mission = `Create a reproducible patch script at \`${script}\` and use it to write \`${output}\`.`
   const ownership = externalOwnership(script, output)
   fs.writeFileSync(script, '#!/usr/bin/env python3\nprint("built asset")\n', { mode: 0o700 })
   fs.writeFileSync(output, Buffer.from('ASSET\0compiled-binary\n'))
@@ -375,13 +375,59 @@ test('nested directory mode is part of the exact external candidate hash', t => 
   const ownership = [{
     kind: 'directory', identity: tree, owner: 'worker-1', ownershipMode: 'single-owner',
   }]
-  const mission = `Create the exact directory output ${tree}.`
+  const mission = `Create the exact directory output \`${tree}\`.`
   const resources = candidateExternalLocalResources(ownership, target, mission)
   const before = hashWorkspaceCandidate(target, process.env, resources)
   fs.chmodSync(nested, 0o711)
   const after = hashWorkspaceCandidate(target, process.env, resources)
   assert.notEqual(after, before,
     'chmod on a nested directory must change the frozen external candidate identity')
+})
+
+test('external mission authority never binds a shorter whitespace-delimited path prefix', t => {
+  const { target, external } = temporaryFixture(t)
+  const shorter = path.join(external, 'input')
+  const requested = path.join(external, 'input image.png')
+  fs.writeFileSync(shorter, 'shorter existing file\n')
+  fs.writeFileSync(requested, 'requested file with spaces\n')
+  const ownership = [{
+    kind: 'file', identity: shorter, owner: 'worker-1', ownershipMode: 'single-owner',
+  }]
+  assert.throws(
+    () => candidateExternalLocalResources(
+      ownership, target, `Modify ${requested} and leave the input intact.`,
+    ),
+    error => error.code === 'OWNERSHIP_AUTHORIZATION_DENIED',
+  )
+  assert.equal(candidateExternalLocalResources(
+    ownership, target, `Modify \`${shorter}\`.`,
+  )[0].identity, shorter)
+
+  const spacedPrefix = path.join(external, 'input image')
+  const longerSpacedPath = path.join(external, 'input image final.png')
+  fs.writeFileSync(spacedPrefix, 'spaced prefix file\n')
+  fs.writeFileSync(longerSpacedPath, 'longer spaced file\n')
+  const spacedOwnership = [{
+    kind: 'file', identity: spacedPrefix, owner: 'worker-1', ownershipMode: 'single-owner',
+  }]
+  assert.throws(
+    () => candidateExternalLocalResources(
+      spacedOwnership, target, `Modify ${longerSpacedPath} only.`,
+    ),
+    error => error.code === 'OWNERSHIP_AUTHORIZATION_DENIED',
+  )
+  assert.equal(candidateExternalLocalResources(
+    spacedOwnership, target, `Modify \`${spacedPrefix}\` only.`,
+  )[0].identity, spacedPrefix)
+
+  const absentLongerPath = path.join(external, 'input final')
+  assert.equal(fs.existsSync(absentLongerPath), false)
+  assert.throws(
+    () => candidateExternalLocalResources(
+      ownership, target, `Create ${absentLongerPath} now.`,
+    ),
+    error => error.code === 'OWNERSHIP_AUTHORIZATION_DENIED',
+  )
 })
 
 test('cache and existing or missing directory-valued outputs materialize with safe physical types', t => {
@@ -402,7 +448,7 @@ test('cache and existing or missing directory-valued outputs materialize with sa
     { kind: 'directory', identity: missingOutputDirectory, owner: 'worker-1', ownershipMode: 'single-owner' },
     { kind: 'output', identity: missingGenericOutput, owner: 'worker-1', ownershipMode: 'single-owner' },
   ]
-  const mission = `Use cache roots ${existingCache} and ${missingCache}; preserve or update the directory output ${existingOutputDirectory}; create the directory output ${missingOutputDirectory}; and create ${missingGenericOutput}.`
+  const mission = `Use cache roots \`${existingCache}\` and \`${missingCache}\`; preserve or update the directory output \`${existingOutputDirectory}\`; create the directory output \`${missingOutputDirectory}\`; and create \`${missingGenericOutput}\`.`
   const assignment = workerAssignment(target, mission, ownership)
   const boundary = materializeExplicitExternalLocalBoundary(assignment, target)
   const types = Object.fromEntries(boundary.resources.map(resource => [
@@ -435,7 +481,7 @@ test('outside paths require both immutable-mission text and typed ownership', t 
   const typed = [{ kind: 'file', identity: requested, owner: 'worker-1', ownershipMode: 'single-owner' }]
   assert.throws(() => workerAssignment(target, 'Create a bounded result.', typed),
     error => error.code === 'OWNERSHIP_AUTHORIZATION_DENIED')
-  assert.throws(() => workerAssignment(target, `Create ${requested}.`, [
+  assert.throws(() => workerAssignment(target, `Create \`${requested}\`.`, [
     { kind: 'file', identity: unmentioned, owner: 'worker-1', ownershipMode: 'single-owner' },
   ]), error => error.code === 'OWNERSHIP_AUTHORIZATION_DENIED')
 })
@@ -451,12 +497,12 @@ test('external output authority rejects a linked path prefix and an unauthorized
   }
   const escaped = path.join(linked, 'result.txt')
   const ownership = [{ kind: 'file', identity: escaped, owner: 'worker-1', ownershipMode: 'single-owner' }]
-  assert.throws(() => workerAssignment(target, `Create ${escaped}.`, ownership),
+  assert.throws(() => workerAssignment(target, `Create \`${escaped}\`.`, ownership),
     error => error.code === 'MISSION_PATH_INVALID')
 
   const exact = path.join(external, 'exact.txt')
   const exactOwnership = [{ kind: 'file', identity: exact, owner: 'worker-1', ownershipMode: 'single-owner' }]
-  const assignment = workerAssignment(target, `Create ${exact}.`, exactOwnership)
+  const assignment = workerAssignment(target, `Create \`${exact}\`.`, exactOwnership)
   const boundary = materializeExplicitExternalLocalBoundary(assignment, target)
   fs.writeFileSync(exact, 'exact output\n')
   assert.throws(() => inspectExplicitExternalLocalBoundary(boundary, assignment, target, {
@@ -475,7 +521,7 @@ test('mid-materialization failure rolls back only unchanged tool-created placeho
     { kind: 'file', identity: firstPlaceholder, owner: 'worker-1', ownershipMode: 'single-owner' },
     { kind: 'file', identity: missingParentOutput, owner: 'worker-1', ownershipMode: 'single-owner' },
   ]
-  const mission = `Create ${firstPlaceholder} and ${missingParentOutput}.`
+  const mission = `Create \`${firstPlaceholder}\` and \`${missingParentOutput}\`.`
   const assignment = workerAssignment(target, mission, ownership)
   assert.throws(
     () => materializeExplicitExternalLocalBoundary(assignment, target),
@@ -498,7 +544,7 @@ test('failed Codex launch cleanup rolls back every unadmitted exact external pos
   const changed = path.join(external, 'artifact-changed.txt')
   const preexistingSibling = path.join(external, 'sibling.txt')
   fs.writeFileSync(preexistingSibling, 'preexisting sibling\n')
-  const mission = `Create ${unchanged} and ${changed}.`
+  const mission = `Create \`${unchanged}\` and \`${changed}\`.`
   const ownership = [
     { kind: 'file', identity: unchanged, owner: 'worker-1', ownershipMode: 'single-owner' },
     { kind: 'file', identity: changed, owner: 'worker-1', ownershipMode: 'single-owner' },
@@ -590,7 +636,7 @@ test('external pre-admission transaction restores missing, preexisting, and dire
   ]
   const assignment = workerAssignment(
     target,
-    `Create ${missing}, update ${existing}, and update ${directory}.`,
+    `Create \`${missing}\`, update \`${existing}\`, and update \`${directory}\`.`,
     ownership,
   )
   const boundary = materializeExplicitExternalLocalBoundary(assignment, target, {
@@ -618,7 +664,7 @@ test('post-external pre-local failure keeps rollback authority until mutation st
   const ownership = [{
     kind: 'output', identity: output, owner: 'worker-1', ownershipMode: 'single-owner',
   }]
-  const assignment = workerAssignment(target, `Update ${output}.`, ownership)
+  const assignment = workerAssignment(target, `Update \`${output}\`.`, ownership)
   const transactionRoot = path.join(root, 'controller', 'atomic-attempt')
   const boundary = materializeExplicitExternalLocalBoundary(assignment, target, {
     transactionRoot,
@@ -647,7 +693,7 @@ test('interrupted external transaction deterministically rolls back before resta
   const ownership = [{
     kind: 'output', identity: output, owner: 'worker-1', ownershipMode: 'single-owner',
   }]
-  const assignment = workerAssignment(target, `Create ${output}.`, ownership)
+  const assignment = workerAssignment(target, `Create \`${output}\`.`, ownership)
   const transactionRoot = path.join(root, 'controller', 'stable-attempt')
   materializeExplicitExternalLocalBoundary(assignment, target, { transactionRoot })
   fs.writeFileSync(output, 'bytes left by a dead process\n')
@@ -665,7 +711,7 @@ test('receipt-bound external quarantine seeds one immediate retry and commits ex
   const output = path.join(external, 'patched.bin')
   fs.writeFileSync(output, 'original binary\n', { mode: 0o700 })
   const ownership = externalOwnership(script, output)
-  const mission = `Create ${script} and update ${output}.`
+  const mission = `Create \`${script}\` and update \`${output}\`.`
   const sourceAssignment = workerAssignment(target, mission, ownership)
   const quarantineRoot = path.join(root, 'controller', 'quarantines')
   const sourceBoundary = materializeExplicitExternalLocalBoundary(sourceAssignment, target, {
@@ -714,7 +760,7 @@ test('tampered quarantine and linked prefixes fail closed without deleting outsi
   const ownership = [{
     kind: 'file', identity: output, owner: 'worker-1', ownershipMode: 'single-owner',
   }]
-  const mission = `Create ${output}.`
+  const mission = `Create \`${output}\`.`
   const sourceAssignment = workerAssignment(target, mission, ownership)
   const sourceBoundary = materializeExplicitExternalLocalBoundary(sourceAssignment, target, {
     transactionRoot: path.join(root, 'controller', 'tamper-source'),
@@ -749,7 +795,7 @@ test('tampered quarantine and linked prefixes fail closed without deleting outsi
   const foreignFile = path.join(foreign, 'linked-output')
   fs.writeFileSync(foreignFile, 'must survive\n')
   const linkedOutput = path.join(parent, 'linked-output')
-  const linkedAssignment = workerAssignment(target, `Create ${linkedOutput}.`, [{
+  const linkedAssignment = workerAssignment(target, `Create \`${linkedOutput}\`.`, [{
     kind: 'file', identity: linkedOutput, owner: 'worker-1', ownershipMode: 'single-owner',
   }])
   const linkedBoundary = materializeExplicitExternalLocalBoundary(linkedAssignment, target, {

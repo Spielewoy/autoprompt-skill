@@ -556,7 +556,7 @@ test('independent Codex artifact uses a hermetic externally signed PASS fixture 
   assert.equal(packageJson.bin['autoprompt-codex-evidence'], 'scripts/codex-evidence-bundle.cjs')
   assert.equal(packageJson.autoprompt.provider, 'codex')
   assert.deepEqual(packageJson.autoprompt.compatibility,
-    { codexCli: '>=0.101.0', runtimeContract: '2.0.0' })
+    { codexCli: '>=0.148.0', runtimeContract: '2.0.0' })
   assert.match(packageJson.autoprompt.payloadDigest, /^[a-f0-9]{64}$/)
   assert.match(packageJson.autoprompt.payloadGeneration, /^codex-v2\.0\.0-[a-f0-9]{16}$/)
   assert.equal(artifact.validateArtifactInventory(packageRoot).inventorySha256,

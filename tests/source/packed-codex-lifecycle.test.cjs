@@ -62,10 +62,10 @@ function packedEnvironment(sandbox) {
   const bin = path.join(sandbox, 'bin')
   for (const directory of [home, bin]) fs.mkdirSync(directory, { recursive: true })
   if (process.platform === 'win32') {
-    fs.writeFileSync(path.join(bin, 'codex.cmd'), '@echo off\r\necho codex-cli 0.101.0\r\n')
+    fs.writeFileSync(path.join(bin, 'codex.cmd'), '@echo off\r\necho codex-cli 0.148.0\r\n')
   } else {
     const executable = path.join(bin, 'codex')
-    fs.writeFileSync(executable, '#!/bin/sh\nprintf "%s\\n" "codex-cli 0.101.0"\n')
+    fs.writeFileSync(executable, '#!/bin/sh\nprintf "%s\\n" "codex-cli 0.148.0"\n')
     fs.chmodSync(executable, 0o755)
   }
   const environment = {

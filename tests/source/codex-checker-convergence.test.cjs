@@ -1279,6 +1279,91 @@ test('legacy crash resume retires an authenticated report-correction checkpoint 
   assert.equal(transitions.some(item => item.eventId === 'CHECK_BECAME_CONCLUSIVE'), true)
 })
 
+test('crash after limitation conversion resumes from the durable raw checker receipt', async t => {
+  const targetPath = cleanRepository(t)
+  const pointers = new Map()
+  const initialTransitions = []
+  let checkerRequest = null
+  let rawCheckerResult = null
+  const initial = await createDefaultRouteExecutor({
+    ...routeOptions(t, targetPath, initialTransitions),
+    resultPointer: workItemId => pointers.get(workItemId) || null,
+  })({
+    route: 'DIRECT', decision: directDecision(1, 'mutate'),
+    launch: async request => {
+      if (request.workItemId === 'work-1') {
+        fs.writeFileSync(path.join(targetPath, 'subject.txt'), 'candidate before limitation crash\n')
+        return structuredWorkerResult()
+      }
+      checkerRequest = request
+      rawCheckerResult = JSON.parse(stableStringify({
+        schemaVersion: '2.0.0', code: 'MALFORMED_CHECKER_VERDICT',
+        candidateHash: request.candidateHash,
+        currentVersionHash: request.candidateHash,
+        contextId: 'context:limitation-crash', payload: {},
+      }))
+      pointers.set(request.workItemId,
+        persistResultPointer(t, request.workItemId, rawCheckerResult))
+      return rawCheckerResult
+    },
+    completeRetainedLease: () => {},
+    resumeAdoptedLaunches: async () => ({}),
+    resumeState: null,
+  })
+  assert.equal(initial.terminalEnvelope.status, 'DONE_WITH_VERIFICATION_LIMITATIONS')
+  const marker = initialTransitions.find(item => item.eventId === 'CHECK_INCONCLUSIVE')
+  assert.ok(marker, JSON.stringify(initialTransitions))
+  assert.equal(marker.details.retryAttempt, 0)
+  assert.equal(marker.details.checkerResultHash, digest(stableStringify(rawCheckerResult)))
+  assert.equal(
+    marker.details.controllerReassessment.priorResultEvidenceHash,
+    marker.details.checkerResultHash,
+  )
+  assert.equal(initial.terminalEnvelope.sourceCheckerResultHash, marker.details.checkerResultHash)
+  assert.notEqual(initial.terminalEnvelope.checkerResultHash, marker.details.checkerResultHash,
+    'the converted limitation and durable source receipt have distinct identities')
+
+  const resumedTransitions = []
+  const verified = []
+  const resumed = await createDefaultRouteExecutor({
+    ...routeOptions(t, targetPath, resumedTransitions),
+    readResult: workItemId => workItemId === checkerRequest.workItemId
+      ? rawCheckerResult : null,
+    resultPointer: workItemId => pointers.get(workItemId) || null,
+    verifyDurableResultReceipt: (workItemId, result) => {
+      verified.push(workItemId)
+      assert.deepEqual(result, rawCheckerResult)
+      return true
+    },
+  })({
+    route: 'DIRECT', decision: directDecision(1, 'mutate'),
+    launch: async request => assert.fail(`crash recovery must not relaunch ${request.workItemId}`),
+    completeRetainedLease: () => {},
+    resumeAdoptedLaunches: async () => ({}),
+    resumeState: {
+      resumeState: 'CHECK_INCONCLUSIVE',
+      candidateHash: checkerRequest.candidateHash,
+      completedWorkIds: ['work-1'],
+      completedCheckIds: [checkerRequest.workItemId],
+      acceptedResultIds: [], nextReadyWorkIds: [],
+      retryState: {
+        inconclusiveChecker: {
+          checkerId: checkerRequest.workItemId,
+          candidateHash: checkerRequest.candidateHash,
+          checkerResultHash: marker.details.checkerResultHash,
+          retryAttempt: 0,
+          returnState: 'CHECK_WORK',
+          controllerReassessment: marker.details.controllerReassessment,
+        },
+      },
+    },
+  })
+  assert.equal(resumed.outcome, 'DONE', JSON.stringify(resumed))
+  assert.equal(resumed.terminalEnvelope.status, 'DONE_WITH_VERIFICATION_LIMITATIONS')
+  assert.deepEqual(verified, [checkerRequest.workItemId])
+  assert.equal(resumedTransitions.some(item => item.eventId === 'CHECK_BECAME_CONCLUSIVE'), true)
+})
+
 test('missing residual-risk authority preserves the checked candidate and structured response', async t => {
   for (const mode of ['absent', 'throws']) {
     await t.test(mode, async t => {

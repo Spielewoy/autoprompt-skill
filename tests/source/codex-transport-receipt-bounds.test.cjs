@@ -155,7 +155,7 @@ test('terminal Codex transport externalizes huge streams into bounded hash/count
     {
       type: 'turn.completed',
       usage: {
-        input_tokens: 32000, cached_input_tokens: 1000,
+        input_tokens: 19000, cached_input_tokens: 1000,
         output_tokens: 2000, reasoning_output_tokens: 1500,
       },
     },

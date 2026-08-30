@@ -378,14 +378,29 @@ function resourcePath(targetRoot, resource) {
 
 function ownsRelative(targetRoot, resources, relative) {
   const absolute = resolveInside(targetRoot, relative)
-  return resources.some(resource => {
-    if (!resource || resource.access === 'read') return false
+  const matches = resources.flatMap(resource => {
+    if (!resource) return []
     const owned = resourcePath(targetRoot, resource)
-    if (!owned) return false
-    return ['directory', 'output', 'cache', 'evidence-root'].includes(resource.kind)
+    if (!owned) return []
+    const covers = ['directory', 'output', 'cache', 'evidence-root'].includes(resource.kind)
       ? absolute === owned || absolute.startsWith(`${owned}${path.sep}`)
       : absolute === owned
+    if (!covers) return []
+    const relativeOwned = path.relative(path.resolve(targetRoot), owned)
+    const specificity = relativeOwned
+      ? relativeOwned.split(path.sep).filter(Boolean).length
+      : 0
+    return [{ access: resource.access, specificity }]
   })
+  const writable = matches.filter(match => match.access !== 'read')
+  if (writable.length === 0) return false
+  const readable = matches.filter(match => match.access === 'read')
+  if (readable.length === 0) return true
+  // The most-specific authority wins, with read-only winning ties. This makes
+  // a mission-bound input an actual carve-out from broad workspace ownership
+  // while still allowing an explicitly narrower output inside a read tree.
+  return Math.max(...writable.map(match => match.specificity)) >
+    Math.max(...readable.map(match => match.specificity))
 }
 
 function scopedSnapshot(snapshot, targetRoot, resources) {

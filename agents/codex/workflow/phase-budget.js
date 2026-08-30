@@ -10,6 +10,8 @@
 const crypto = require('node:crypto')
 const childProcess = require('node:child_process')
 const fs = require('node:fs')
+const http = require('node:http')
+const https = require('node:https')
 const os = require('node:os')
 const path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
@@ -28,6 +30,7 @@ const {
   createFrameworkMissCacheIdentity,
   createExactPathDecision,
   createRouteAnalystAdmission,
+  createWaitingUserDecision,
   evaluateExactPathPreflight,
   evaluateL0Decision,
   evaluateRouteAnalystResult,
@@ -110,6 +113,7 @@ const SCOPE_HARD_SEC = 300
 const SCOPE_GRACE_SEC = 60
 const MAX_FORCED_RESETS = 1
 const DEFAULT_PRODUCT_HARD_MAXIMUM_MS = 3_600_000
+const DEFAULT_ACTIVATION_TOKEN_LIMIT = 24_000
 const TERMINAL_OUTCOMES = Object.freeze(['DONE', 'PARTIAL', 'BLOCKED', 'CANCELLED', 'FAILED'])
 const RECOVERABLE_RUNTIME_STATES = new Set([
   'PREPARE_WORK', 'RUN_WORK', 'ITEM_VERIFIED', 'CHECK_WORK', 'REPAIRING', 'CHECK_INCONCLUSIVE',
@@ -150,6 +154,13 @@ const CHECKER_FALSIFICATION_DOCTRINE = Object.freeze([
   'If a required consumer or independent check is unavailable, return CHECK_INCONCLUSIVE or RUNTIME_FAILURE instead of implementation FAIL unless that dependency is a required deliverable. A missing applicable witness is never PASS.',
   'Keep large evidence in scratch and return only bounded diagnostics, hashes, or authenticated pointers.',
 ])
+const CODEX_CHECKER_COMPACT_DOCTRINE = Object.freeze([
+  'Cover every exact named check and verification obligation; one admissible harness may cover several IDs.',
+  'PASS requires independently derived expected behavior and an executed end-to-end observable result on the frozen exact version. Static inspection may prove a concrete FAIL but never PASS.',
+  'Exercise positive, negative, boundary, temporal-order, equivalence-separation, and adversarial composition cases wherever applicable; do not derive the expected result from the implementation being checked.',
+  'Bind PASS to one unique zero exit and a concrete product FAIL to one authenticated nonzero check. Setup, tool, dependency, or consumer unavailability is CHECK_INCONCLUSIVE or RUNTIME_FAILURE.',
+  'Return every named test outcome plus the underlying evidence IDs and independent reference method; keep large evidence in scratch and return bounded diagnostics only.',
+])
 const VERIFICATION_LIMITATION_CODES = new Set([
   'DEPENDENCY_UNAVAILABLE',
   'DOWNSTREAM_CONSUMER_RECEIPT_MISSING',
@@ -162,6 +173,61 @@ const DEFAULT_VERIFICATION_LIMITATION_EVENT = 'REQUIRED_CHECK_RUNTIME_UNAVAILABL
 const CHILD_TRANSPORT_WATCHDOG_MS = 30 * 60 * 1000
 const DEFAULT_TIMEOUT_CLEANUP_WATCHDOG_MS = 60 * 1000
 const CODEX_CHILD_AUTO_COMPACT_TOKEN_LIMIT = 32_768
+const CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT = 1_000
+const CODEX_QUOTA_PROXY_MAX_REQUEST_BYTES = 512 * 1024
+const CODEX_QUOTA_PROXY_SPECIAL_TOKEN_RESERVE = 64
+const CODEX_PROVIDER_PENDING_CAUSE_PATTERN =
+  /^codex-provider-pending:([a-f0-9]{64}):([1-9][0-9]*):([1-9][0-9]*):([1-9][0-9]*):([0-9]+)$/u
+const CODEX_PROVIDER_CHARGE_CAUSE_PATTERN =
+  /^codex-provider-charge:([a-f0-9]{64}):([1-9][0-9]*):(LIVE|FINAL_[1-9][0-9]*|RECOVERY_[1-9][0-9]*)$/u
+const CODEX_PROVIDER_USAGE_CAUSE_PATTERN =
+  /^codex-provider-usage:([a-f0-9]{64}):([1-9][0-9]*):([1-9][0-9]*)$/u
+const CODEX_PROVIDER_SETTLED_CAUSE_PATTERN =
+  /^codex-provider-settled:([a-f0-9]{64}):([1-9][0-9]*):([A-Z_]+)$/u
+const CODEX_TOOL_CALL_CAUSE_PATTERN =
+  /^codex-tool-call:([a-f0-9]{64}):([1-9][0-9]*)$/u
+const CODEX_PROVIDER_SETTLEMENT_DISPOSITIONS = new Set([
+  'ACCOUNTED',
+  'UPPER_BOUND_CHARGED',
+  'FINAL_UPPER_BOUND_CHARGED',
+  'RECOVERY_ACCOUNTED',
+  'RECOVERY_UPPER_BOUND_CHARGED',
+])
+const CODEX_CHILD_TOOL_CALL_LIMITS = Object.freeze({
+  'route-analyst': 0,
+  checker: 2,
+  worker: 2,
+})
+const CODEX_CHILD_TOKEN_LIMITS = Object.freeze({
+  'route-analyst': 8_000,
+  checker: 16_000,
+  worker: 24_000,
+})
+// The relay's preventive spend envelope remains below the user's 30k alarm
+// boundary while leaving enough room for a compact prompt, two checker steps,
+// or a worker edit plus focused validation. The stricter terminal limits above
+// still decide whether a completed result can be accepted.
+const CODEX_CHILD_SPEND_LIMITS = Object.freeze({
+  'route-analyst': 16_000,
+  checker: 24_000,
+  worker: 24_000,
+})
+// Codex 0.148's native fallback ignores cached input. The controller-owned
+// relay supplies exact per-response total-input-plus-output rollout units;
+// these weights remain a fail-closed fallback if that field is unavailable.
+const CODEX_CHILD_ROLLOUT_PREFILL_WEIGHTS = Object.freeze({
+  'route-analyst': 1,
+  checker: 1,
+  worker: 1,
+})
+const CODEX_CONTROLLED_MODELS = Object.freeze([
+  Object.freeze({ slug: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', description: 'High-capability agentic coding model.', defaultEffort: 'low', priority: 1 }),
+  Object.freeze({ slug: 'gpt-5.6-terra', displayName: 'GPT-5.6-Terra', description: 'Balanced agentic coding model for everyday work.', defaultEffort: 'medium', priority: 2 }),
+  Object.freeze({ slug: 'gpt-5.6-luna', displayName: 'GPT-5.6-Luna', description: 'Fast and affordable agentic coding model.', defaultEffort: 'medium', priority: 3 }),
+])
+const CODEX_NON_TOOL_ITEM_TYPES = new Set([
+  'agent_message', 'reasoning', 'todo_list', 'plan',
+])
 const CODEX_STDOUT_FALLBACK_MAX_BYTES = 512 * 1024
 const CODEX_STDERR_TAIL_MAX_BYTES = 64 * 1024
 const CODEX_JSONL_PARTIAL_MAX_BYTES = 8 * 1024 * 1024
@@ -494,6 +560,31 @@ function checkerLaunchRuntimeFailure(request, decision, runId, error, binding = 
     recordedAt: new Date().toISOString(),
     contextId: binding.contextId || null,
   })
+}
+
+function checkerLaunchQuotaUnavailable(error) {
+  if (!error || typeof error !== 'object') return false
+  if (error.code === 'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED') return true
+  if (error.code !== 'BUDGET_EXHAUSTED') return false
+  const details = error.details && typeof error.details === 'object'
+    ? error.details : {}
+  const statusTokenExhaustion = Array.isArray(details.exhausted) &&
+    details.exhausted.includes('TOKENS') &&
+    details.remaining && details.remaining.tokens === 0 &&
+    details.limits && Number.isSafeInteger(details.limits.tokens)
+  const reservationFields = [
+    'activationTokenLimit', 'tokensUsed', 'tokensReserved',
+    'roleTokenLimit', 'priorLeaseModelTokens',
+  ]
+  const exactReservationExhaustion = reservationFields.every(field =>
+    Number.isSafeInteger(details[field]) && details[field] >= 0) && (
+    details.activationTokenLimit - details.tokensUsed - details.tokensReserved <= 0 ||
+    details.roleTokenLimit <= 0
+  )
+  // Only the two exact token-admission shapes are degradable. A generic
+  // scheduler, phase, session, launch, accounting, or malformed-budget error
+  // keeps its original hard control-plane disposition.
+  return statusTokenExhaustion || exactReservationExhaustion
 }
 
 function workerTransportRuntimeFailure(request, decision, runId, error, binding = {}) {
@@ -1377,7 +1468,7 @@ function clampNonNegInt(value, fallback) {
 }
 
 function resolveActivationTokenLimit(value) {
-  if (value === undefined || value === null || value === '') return Number.MAX_SAFE_INTEGER
+  if (value === undefined || value === null || value === '') return DEFAULT_ACTIVATION_TOKEN_LIMIT
   const number = typeof value === 'number' ? value : Number(value)
   if (!Number.isSafeInteger(number) || number <= 0) {
     throw new SupervisorIntegrationError(
@@ -1924,6 +2015,53 @@ function modelVisibleDispatch(dispatch, options = {}) {
     return projectModelVisibleMissionEchoes(visible, projection)
   }
   return Object.freeze(visible)
+}
+
+function codexCompactCheckerVisibleDispatch(dispatch) {
+  const source = dispatch && typeof dispatch === 'object' ? dispatch : {}
+  const compact = {}
+  for (const field of [
+    'schemaVersion', 'activation', 'fork_turns', 'route', 'role', 'purpose',
+    'evidencePointers', 'manifests', 'candidateHash', 'checkResultsPointer',
+  ]) {
+    if (Object.hasOwn(source, field)) compact[field] = source[field]
+  }
+  if (source.fetchedEvidence && typeof source.fetchedEvidence === 'object' &&
+      !Array.isArray(source.fetchedEvidence)) {
+    const fetchedEvidence = { ...source.fetchedEvidence }
+    if (Array.isArray(fetchedEvidence.verificationDoctrine)) {
+      fetchedEvidence.verificationDoctrine = CODEX_CHECKER_COMPACT_DOCTRINE
+    }
+    if (Object.keys(fetchedEvidence).length > 0) {
+      compact.fetchedEvidence = Object.freeze(fetchedEvidence)
+    }
+  }
+  return Object.freeze(compact)
+}
+
+function codexCompactCheckerVisibleAssignment(assignment) {
+  const source = assignment && typeof assignment === 'object' ? assignment : {}
+  const compact = {}
+  for (const field of [
+    'schemaVersion', 'reportType', 'reportId', 'runId', 'assignmentId',
+    'logicalRoleId', 'physicalRoleId', 'requestEnvelopeHash', 'findingIds',
+    'requestedResult', 'resources', 'forbiddenChanges', 'successChecklist', 'checks',
+  ]) {
+    if (Object.hasOwn(source, field)) compact[field] = source[field]
+  }
+  if (typeof compact.requestedResult === 'string') {
+    const duplicateDoctrine = ' Apply fetchedEvidence.verificationDoctrine exactly'
+    const boundary = compact.requestedResult.indexOf(duplicateDoctrine)
+    if (boundary !== -1) compact.requestedResult = compact.requestedResult.slice(0, boundary)
+  }
+  if (Array.isArray(compact.resources)) {
+    compact.resources = Object.freeze(compact.resources.map(resource => Object.freeze({
+      kind: resource.kind,
+      identity: resource.identity,
+      access: resource.access,
+    })))
+  }
+  return Object.freeze(compact)
 }
 
 function activationAttestationPayload(attestation) {
@@ -3524,6 +3662,12 @@ function checkerResultRequiresScratchConfirmation(result) {
     result.cause.event === 'CHECK_SCRATCH_CONFIRMATION_REQUIRED' &&
     disposition && disposition.reportedAggregateCode === 'PASS' && authority &&
     authority.checks.some(check => check.authority === 'SCRATCH_HARNESS'))
+}
+
+function checkerResultMatchesEvidenceHash(result, expectedHash) {
+  if (!/^[a-f0-9]{64}$/u.test(expectedHash || '')) return false
+  return expectedHash === hashText(JSON.stringify(result)) ||
+    expectedHash === hashText(stableStringify(result))
 }
 
 function scratchConfirmationWorkItemId(workItemId) {
@@ -6039,6 +6183,102 @@ function typedChildOutputReady(output, record) {
   return output.schemaVersion === '2.0.0' && output.reportType === 'result'
 }
 
+function codexPreRouteControlPlane(record) {
+  return Boolean(record && (
+    record.logicalRole === 'route-analyst' ||
+    (record.logicalRole === 'run-owner' && record.route === 'PRE_ROUTE')
+  ))
+}
+
+function codexChildToolCallLimit(record) {
+  if (codexPreRouteControlPlane(record)) return CODEX_CHILD_TOOL_CALL_LIMITS['route-analyst']
+  if (CHECKER_ROLES.has(record.logicalRole)) return CODEX_CHILD_TOOL_CALL_LIMITS.checker
+  return CODEX_CHILD_TOOL_CALL_LIMITS.worker
+}
+
+function codexChildTokenRoleLimit(record) {
+  if (codexPreRouteControlPlane(record)) return CODEX_CHILD_TOKEN_LIMITS['route-analyst']
+  if (CHECKER_ROLES.has(record.logicalRole)) return CODEX_CHILD_TOKEN_LIMITS.checker
+  return CODEX_CHILD_TOKEN_LIMITS.worker
+}
+
+function codexChildTokenLimit(record) {
+  const roleLimit = codexChildTokenRoleLimit(record)
+  const prior = record && record.priorLeaseModelTokens === undefined
+    ? 0 : record && record.priorLeaseModelTokens
+  if (!Number.isSafeInteger(prior) || prior < 0 || prior >= roleLimit) {
+    throw new SupervisorIntegrationError(
+      prior === roleLimit ? 'CHILD_TOKEN_LIMIT_EXHAUSTED' : 'BUDGET_CONFIG_INVALID',
+      prior === roleLimit
+        ? `${record.logicalRole} already exhausted its cumulative accepted-result token limit`
+        : 'controller-issued prior child token usage is invalid',
+      { logicalRole: record && record.logicalRole, limit: roleLimit, priorModelTokens: prior },
+    )
+  }
+  return roleLimit - prior
+}
+
+function codexChildSpendRoleLimit(record) {
+  return codexPreRouteControlPlane(record)
+    ? CODEX_CHILD_SPEND_LIMITS['route-analyst']
+    : CHECKER_ROLES.has(record.logicalRole)
+      ? CODEX_CHILD_SPEND_LIMITS.checker
+      : CODEX_CHILD_SPEND_LIMITS.worker
+}
+
+function codexChildSpendLimit(record) {
+  const roleLimit = codexChildSpendRoleLimit(record)
+  if (record && record.providerTokenLimit !== undefined) {
+    if (!Number.isSafeInteger(record.providerTokenLimit) ||
+        record.providerTokenLimit <= 0 || record.providerTokenLimit > roleLimit) {
+      throw new SupervisorIntegrationError(
+        'BUDGET_CONFIG_INVALID',
+        'controller-issued child provider token envelope is invalid',
+      )
+    }
+    return record.providerTokenLimit
+  }
+  return roleLimit
+}
+
+function codexChildRolloutPrefillWeight(record) {
+  if (codexPreRouteControlPlane(record)) return CODEX_CHILD_ROLLOUT_PREFILL_WEIGHTS['route-analyst']
+  if (CHECKER_ROLES.has(record.logicalRole)) return CODEX_CHILD_ROLLOUT_PREFILL_WEIGHTS.checker
+  return CODEX_CHILD_ROLLOUT_PREFILL_WEIGHTS.worker
+}
+
+function codexChildRolloutBudgetConfig(record) {
+  const spendLimit = codexChildSpendLimit(record)
+  // Codex 0.148 rejects at `usage >= limit`. Leave one native unit so an
+  // exactly-at-ceiling relay response remains controller-admissible.
+  const limit = spendLimit + 1
+  const reminder = Math.floor(spendLimit / 2)
+  const prefillWeight = codexChildRolloutPrefillWeight(record).toFixed(1)
+  return `features.rollout_budget={enabled=true,limit_tokens=${limit},` +
+    `reminder_at_remaining_tokens=[${reminder}],sampling_token_weight=1.0,` +
+    `prefill_token_weight=${prefillWeight}}`
+}
+
+function codexNativeRolloutBudgetFailure(event) {
+  if (!event || event.type !== 'turn.failed') return false
+  const message = event.error && typeof event.error.message === 'string'
+    ? event.error.message : typeof event.message === 'string' ? event.message : ''
+  return /session budget exceeded/iu.test(message)
+}
+
+function codexToolCallObservation(event) {
+  if (!event || !/^item\.(?:started|completed|failed|cancelled)$/u.test(event.type || '') ||
+      !event.item ||
+      typeof event.item !== 'object' || typeof event.item.type !== 'string' ||
+      CODEX_NON_TOOL_ITEM_TYPES.has(event.item.type)) return null
+  return Object.freeze({
+    itemId: typeof event.item.id === 'string' && event.item.id
+      ? event.item.id : null,
+    itemType: event.item.type,
+    phase: event.type.slice('item.'.length),
+  })
+}
+
 function codexUsageObservationFromEvent(event) {
   if (!event || event.type !== 'turn.completed' || event.usage === undefined || event.usage === null) {
     return null
@@ -6349,6 +6589,875 @@ function materializeCodexProviderEnvelopeSchema(providerSchemaRoot) {
     )
   }
   return filename
+}
+
+function codexControlledModelCatalog(preRouteControlPlane = false) {
+  const commonReasoningLevels = [
+    ['low', 'Fast responses with lighter reasoning'],
+    ['medium', 'Balances speed and reasoning depth for everyday tasks'],
+    ['high', 'Greater reasoning depth for complex problems'],
+    ['xhigh', 'Extra high reasoning depth for complex problems'],
+    ['max', 'Maximum reasoning depth for the hardest problems'],
+  ]
+  return Object.freeze({
+    models: CODEX_CONTROLLED_MODELS.map(spec => Object.freeze({
+      slug: spec.slug,
+      display_name: spec.displayName,
+      description: spec.description,
+      default_reasoning_level: spec.defaultEffort,
+      supported_reasoning_levels: commonReasoningLevels.map(([effort, description]) => ({
+        effort, description,
+      })),
+      shell_type: preRouteControlPlane ? 'disabled' : 'shell_command',
+      visibility: 'list',
+      supported_in_api: true,
+      priority: spec.priority,
+      additional_speed_tiers: ['fast'],
+      service_tiers: [{ id: 'priority', name: 'Fast', description: '1.5x speed, increased usage' }],
+      default_service_tier: null,
+      availability_nux: null,
+      upgrade: null,
+      // ModelsResponse requires one legacy or V2 instruction source before
+      // config overrides are applied. The content-addressed instructions file
+      // below supplies the real bounded base instructions for every launch.
+      base_instructions: '',
+      model_messages: null,
+      include_skills_usage_instructions: false,
+      include_plugin_usage_instructions: false,
+      include_apps_usage_instructions: false,
+      supports_reasoning_summary_parameter: true,
+      default_reasoning_summary: 'none',
+      support_verbosity: true,
+      default_verbosity: 'low',
+      apply_patch_tool_type: preRouteControlPlane ? null : 'freeform',
+      web_search_tool_type: 'text_and_image',
+      truncation_policy: { mode: 'tokens', limit: 10_000 },
+      supports_image_detail_original: true,
+      context_window: 272_000,
+      max_context_window: 272_000,
+      auto_compact_token_limit: null,
+      comp_hash: '3000',
+      effective_context_window_percent: 95,
+      experimental_supported_tools: [],
+      input_modalities: preRouteControlPlane ? ['text'] : ['text', 'image'],
+      supports_search_tool: false,
+      use_responses_lite: true,
+      node_repl_auto_review_required: false,
+      node_repl_disabled: true,
+      auto_review_model_override: null,
+      model_specialty: null,
+      // The upstream 0.148 catalog marks GPT-5.6 as code_mode_only. In that
+      // mode one visible `exec` item can hide an unbounded batch of nested
+      // tools. The controller owns this static catalog so every usable tool
+      // call is a separate provider response and a separately counted item.
+      tool_mode: 'direct',
+      multi_agent_version: null,
+    })),
+  })
+}
+
+function materializeCodexControlledTransport(providerSchemaRoot, record) {
+  const root = path.resolve(providerSchemaRoot)
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+  fs.chmodSync(root, 0o700)
+  const rootStat = fs.lstatSync(root)
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink() ||
+      (typeof process.geteuid === 'function' && rootStat.uid !== process.geteuid())) {
+    throw new SupervisorIntegrationError(
+      'PROVIDER_SCHEMA_TRANSPORT_UNSAFE',
+      'Codex controlled-transport root must be a private owned directory',
+    )
+  }
+  const selectedModel = record && record.assignment && record.assignment.model
+  if (selectedModel != null &&
+      !CODEX_CONTROLLED_MODELS.some(model => model.slug === String(selectedModel))) {
+    throw new SupervisorIntegrationError(
+      'PROVIDER_UNSUPPORTED',
+      `Codex controlled transport has no pinned direct-tool metadata for ${selectedModel}`,
+    )
+  }
+  const preRouteControlPlane = codexPreRouteControlPlane(record)
+  const instructionText = preRouteControlPlane
+    ? 'You are one bounded AutoPrompt control-plane child. Follow the exact stdin task, use no tools, do not delegate, and return exactly one object matching the supplied output contract.\n'
+    : 'You are one bounded AutoPrompt implementation or checker child. Follow the exact stdin assignment, use only the direct tools supplied by this process, never delegate or ask the user, and return exactly one object matching the supplied output contract immediately after the assigned work and focused validation.\n'
+  const files = [
+    {
+      label: `direct-model-catalog-${preRouteControlPlane ? 'control' : 'work'}`,
+      suffix: '.json',
+      bytes: Buffer.from(`${JSON.stringify(codexControlledModelCatalog(preRouteControlPlane), null, 2)}\n`, 'utf8'),
+    },
+    {
+      label: `bounded-child-instructions-${preRouteControlPlane ? 'control' : 'work'}`,
+      suffix: '.md',
+      bytes: Buffer.from(instructionText, 'utf8'),
+    },
+  ]
+  const materialized = files.map(file => {
+    const digest = crypto.createHash('sha256').update(file.bytes).digest('hex')
+    const filename = path.join(root, `${file.label}-${digest}${file.suffix}`)
+    try {
+      fs.writeFileSync(filename, file.bytes, { encoding: null, flag: 'wx', mode: 0o600 })
+    } catch (error) {
+      if (!error || error.code !== 'EEXIST') throw error
+      const existing = fs.readFileSync(filename)
+      if (!existing.equals(file.bytes)) {
+        throw new SupervisorIntegrationError(
+          'PROVIDER_SCHEMA_TRANSPORT_UNSAFE',
+          'existing Codex controlled-transport file differs from its content-addressed bytes',
+        )
+      }
+    }
+    const stat = fs.lstatSync(filename)
+    if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.nlink) !== 1 ||
+        (stat.mode & 0o077) !== 0 ||
+        (typeof process.geteuid === 'function' && stat.uid !== process.geteuid())) {
+      throw new SupervisorIntegrationError(
+        'PROVIDER_SCHEMA_TRANSPORT_UNSAFE',
+        'Codex controlled-transport file must be one private owned regular file',
+      )
+    }
+    return filename
+  })
+  return Object.freeze({ modelCatalogPath: materialized[0], instructionsPath: materialized[1] })
+}
+
+function codexQuotaProxyUsage(usage) {
+  const input = usage && usage.input_tokens
+  const output = usage && usage.output_tokens
+  const cached = usage && usage.input_tokens_details &&
+    usage.input_tokens_details.cached_tokens !== undefined
+    ? usage.input_tokens_details.cached_tokens : 0
+  const reasoning = usage && usage.output_tokens_details &&
+    usage.output_tokens_details.reasoning_tokens !== undefined
+    ? usage.output_tokens_details.reasoning_tokens : 0
+  for (const [field, value] of Object.entries({ input, output, cached, reasoning })) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new SupervisorIntegrationError(
+        'CODEX_USAGE_INVALID',
+        `Codex quota proxy received invalid ${field} usage`,
+      )
+    }
+  }
+  if (cached > input || reasoning > output) {
+    throw new SupervisorIntegrationError(
+      'CODEX_USAGE_INVALID',
+      'Codex quota proxy received internally inconsistent usage',
+    )
+  }
+  return Object.freeze({
+    noncachedInput: input - cached,
+    cachedInput: cached,
+    output,
+    reasoning,
+  })
+}
+
+function codexQuotaProxyRequestSignature(body) {
+  const projection = { ...body }
+  delete projection.input
+  delete projection.prompt_cache_key
+  delete projection.client_metadata
+  delete projection.max_output_tokens
+  return stableStringify(projection)
+}
+
+function codexQuotaProxyInputUpperBound(body, rawBytes, prior) {
+  const input = Array.isArray(body && body.input) ? body.input : null
+  if (!input) {
+    throw new SupervisorIntegrationError(
+      'PROVIDER_UNSUPPORTED',
+      'Codex quota proxy requires one explicit Responses input array',
+    )
+  }
+  const signature = codexQuotaProxyRequestSignature(body)
+  if (prior && signature === prior.signature && prior.input.length <= input.length) {
+    let prefixMatches = true
+    for (let index = 0; index < prior.input.length; index += 1) {
+      if (stableStringify(prior.input[index]) !== stableStringify(input[index])) {
+        prefixMatches = false
+        break
+      }
+    }
+    if (prefixMatches) {
+      const appended = input.slice(prior.input.length)
+      const appendedBytes = Buffer.byteLength(stableStringify(appended), 'utf8')
+      return Object.freeze({
+        maximumInputTokens: prior.inputTokens + appendedBytes +
+          CODEX_QUOTA_PROXY_SPECIAL_TOKEN_RESERVE * (appended.length + 1),
+        signature,
+        input,
+        method: 'PREFIX_PLUS_BYTES',
+      })
+    }
+  }
+  return Object.freeze({
+    // Every ordinary tokenizer token consumes at least one input byte. The
+    // per-item reserve covers protocol-only/special tokens which are not
+    // represented literally in the JSON body. Counting the entire request,
+    // including non-model metadata, intentionally overestimates first-turn
+    // input rather than trusting a model-family heuristic.
+    maximumInputTokens: rawBytes +
+      CODEX_QUOTA_PROXY_SPECIAL_TOKEN_RESERVE * (input.length + 1),
+    signature,
+    input,
+    method: 'WHOLE_REQUEST_BYTES',
+  })
+}
+
+function codexQuotaProxyUpstream(headers, override = null) {
+  if (override) return new URL(override)
+  return new URL(headers['chatgpt-account-id']
+    ? 'https://chatgpt.com/backend-api/codex'
+    : 'https://api.openai.com/v1')
+}
+
+function codexQuotaProxyJsonError(response, status, message) {
+  if (response.headersSent) {
+    response.destroy()
+    return
+  }
+  const bytes = Buffer.from(JSON.stringify({
+    error: { message, type: 'autoprompt_child_quota', code: 'child_quota_preflight_denied' },
+  }), 'utf8')
+  response.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': String(bytes.length),
+    connection: 'close',
+  })
+  response.end(bytes)
+}
+
+function codexProviderEnvelopeKey(sessionHash, requestOrdinal) {
+  return `${sessionHash}:${requestOrdinal}`
+}
+
+function codexProviderPendingCause(
+  sessionHash,
+  requestOrdinal,
+  tokenLimit,
+  maximumUnaccountedTokens,
+  priorLeaseModelTokens,
+) {
+  return `codex-provider-pending:${sessionHash}:${requestOrdinal}:${tokenLimit}:` +
+    `${maximumUnaccountedTokens}:${priorLeaseModelTokens}`
+}
+
+function codexProviderChargeCause(sessionHash, requestOrdinal, chargeClass) {
+  return `codex-provider-charge:${sessionHash}:${requestOrdinal}:${chargeClass}`
+}
+
+function codexProviderUsageCause(sessionHash, requestOrdinal, usageSequence) {
+  return `codex-provider-usage:${sessionHash}:${requestOrdinal}:${usageSequence}`
+}
+
+function codexProviderSettledCause(sessionHash, requestOrdinal, disposition) {
+  return `codex-provider-settled:${sessionHash}:${requestOrdinal}:${disposition}`
+}
+
+function codexToolCallCause(continuationHash, attemptedCount) {
+  return `codex-tool-call:${continuationHash}:${attemptedCount}`
+}
+
+function accountingRecordModelTokens(record, description) {
+  const usage = record && record.delta && record.delta.tokenUsage
+  const tokens = billableModelTokens(usage)
+  if (!Number.isSafeInteger(tokens) || tokens < 0) {
+    throw new SupervisorIntegrationError(
+      'CODEX_USAGE_INVALID',
+      `${description} has invalid model-token accounting`,
+    )
+  }
+  return tokens
+}
+
+function unresolvedCodexProviderEnvelopes(records = []) {
+  if (!Array.isArray(records)) {
+    throw new SupervisorIntegrationError(
+      'CODEX_USAGE_INVALID',
+      'provider request recovery requires the durable accounting record list',
+    )
+  }
+  const pending = new Map()
+  const retired = new Set()
+  for (const record of records) {
+    const causeId = record && record.cause && record.cause.causeId
+    if (typeof causeId !== 'string') continue
+    const pendingMatch = CODEX_PROVIDER_PENDING_CAUSE_PATTERN.exec(causeId)
+    if (pendingMatch) {
+      const [, sessionHash, ordinalText, limitText, maximumText, priorText] = pendingMatch
+      const requestOrdinal = Number(ordinalText)
+      const tokenLimit = Number(limitText)
+      const maximumUnaccountedTokens = Number(maximumText)
+      const priorLeaseModelTokens = Number(priorText)
+      const key = codexProviderEnvelopeKey(sessionHash, requestOrdinal)
+      if (![requestOrdinal, tokenLimit, maximumUnaccountedTokens, priorLeaseModelTokens]
+          .every(Number.isSafeInteger) || priorLeaseModelTokens < 0 ||
+          maximumUnaccountedTokens > tokenLimit || pending.has(key) || retired.has(key)) {
+        throw new SupervisorIntegrationError(
+          'CODEX_USAGE_INVALID',
+          'durable pending provider request allowance is malformed or duplicated',
+        )
+      }
+      pending.set(key, {
+        key, sessionHash, requestOrdinal, tokenLimit, maximumUnaccountedTokens,
+        priorLeaseModelTokens,
+        exactUsageTokens: 0,
+        exactUsageRecorded: false,
+        upperBoundChargedTokens: 0,
+        accountingSequence: record.sequence,
+      })
+      continue
+    }
+    const usageMatch = CODEX_PROVIDER_USAGE_CAUSE_PATTERN.exec(causeId)
+    if (usageMatch) {
+      const [, sessionHash, ordinalText] = usageMatch
+      const requestOrdinal = Number(ordinalText)
+      const key = codexProviderEnvelopeKey(sessionHash, requestOrdinal)
+      const envelope = pending.get(key)
+      const tokens = accountingRecordModelTokens(record, 'durable provider usage record')
+      if (!Number.isSafeInteger(requestOrdinal) || !envelope || retired.has(key) ||
+          envelope.exactUsageRecorded) {
+        throw new SupervisorIntegrationError(
+          'CODEX_USAGE_INVALID',
+          'durable provider usage does not bind one pending request allowance',
+        )
+      }
+      // maximumUnaccountedTokens is an admission envelope, not permission to
+      // discard truthful provider telemetry. A misbehaving upstream can report
+      // exact usage above that envelope; retain it so billing and crash replay
+      // remain exact even though the response itself is rejected.
+      envelope.exactUsageTokens = tokens
+      envelope.exactUsageRecorded = true
+      continue
+    }
+    const chargeMatch = CODEX_PROVIDER_CHARGE_CAUSE_PATTERN.exec(causeId)
+    if (chargeMatch) {
+      const [, sessionHash, ordinalText] = chargeMatch
+      const requestOrdinal = Number(ordinalText)
+      const key = codexProviderEnvelopeKey(sessionHash, requestOrdinal)
+      const envelope = pending.get(key)
+      const tokens = accountingRecordModelTokens(record, 'durable provider upper-bound charge')
+      if (!Number.isSafeInteger(requestOrdinal) || !envelope || retired.has(key) || tokens <= 0 ||
+          envelope.exactUsageTokens + envelope.upperBoundChargedTokens + tokens >
+            envelope.maximumUnaccountedTokens) {
+        throw new SupervisorIntegrationError(
+          'CODEX_USAGE_INVALID',
+          'durable provider upper-bound charge does not bind one pending request allowance',
+        )
+      }
+      envelope.upperBoundChargedTokens += tokens
+      continue
+    }
+    const settledMatch = CODEX_PROVIDER_SETTLED_CAUSE_PATTERN.exec(causeId)
+    if (!settledMatch) continue
+    const [, sessionHash, ordinalText, disposition] = settledMatch
+    const requestOrdinal = Number(ordinalText)
+    const key = codexProviderEnvelopeKey(sessionHash, requestOrdinal)
+    const envelope = pending.get(key)
+    const accountedDisposition = ['ACCOUNTED', 'RECOVERY_ACCOUNTED'].includes(disposition)
+    const upperBoundDisposition = [
+      'UPPER_BOUND_CHARGED',
+      'FINAL_UPPER_BOUND_CHARGED',
+      'RECOVERY_UPPER_BOUND_CHARGED',
+    ].includes(disposition)
+    if (!Number.isSafeInteger(requestOrdinal) || !envelope || retired.has(key) ||
+        !CODEX_PROVIDER_SETTLEMENT_DISPOSITIONS.has(disposition) ||
+        (accountedDisposition && !envelope.exactUsageRecorded) ||
+        (upperBoundDisposition &&
+          envelope.exactUsageTokens + envelope.upperBoundChargedTokens !==
+            envelope.maximumUnaccountedTokens)) {
+      throw new SupervisorIntegrationError(
+        'CODEX_USAGE_INVALID',
+        'durable provider request settlement lacks one exact pending allowance',
+      )
+    }
+    pending.delete(key)
+    retired.add(key)
+  }
+  return Object.freeze([...pending.values()].map(envelope => Object.freeze({ ...envelope }))
+    .sort((left, right) =>
+      left.accountingSequence - right.accountingSequence || left.key.localeCompare(right.key)))
+}
+
+function codexToolCallHighWater(records = [], continuationHash) {
+  if (!Array.isArray(records) || !/^[a-f0-9]{64}$/u.test(continuationHash || '')) {
+    throw new SupervisorIntegrationError(
+      'CODEX_USAGE_INVALID',
+      'tool-call recovery requires durable accounting records and one continuation hash',
+    )
+  }
+  const ordinals = []
+  for (const record of records) {
+    const causeId = record && record.cause && record.cause.causeId
+    const match = typeof causeId === 'string' ? CODEX_TOOL_CALL_CAUSE_PATTERN.exec(causeId) : null
+    if (!match || match[1] !== continuationHash) continue
+    const ordinal = Number(match[2])
+    if (!Number.isSafeInteger(ordinal) || ordinal <= 0 ||
+        accountingRecordModelTokens(record, 'durable tool-call record') !== 0) {
+      throw new SupervisorIntegrationError(
+        'CODEX_USAGE_INVALID',
+        'durable tool-call high-water record is malformed',
+      )
+    }
+    ordinals.push(ordinal)
+  }
+  ordinals.sort((left, right) => left - right)
+  if (ordinals.some((ordinal, index) => ordinal !== index + 1)) {
+    throw new SupervisorIntegrationError(
+      'CODEX_USAGE_INVALID',
+      'durable tool-call high-water sequence has a duplicate or gap',
+    )
+  }
+  return ordinals.length
+}
+
+async function startCodexCumulativeQuotaProxy(options = {}) {
+  const tokenLimit = options.tokenLimit
+  if (!Number.isSafeInteger(tokenLimit) || tokenLimit <= 0) {
+    throw new SupervisorIntegrationError(
+      'PROVIDER_UNSUPPORTED',
+      'Codex cumulative quota proxy requires a positive token limit',
+    )
+  }
+  const accessToken = crypto.randomBytes(24).toString('hex')
+  const routePrefix = `/${accessToken}/v1`
+  const cumulativeUsage = {
+    noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0,
+  }
+  let priorRequest = null
+  let activeRequest = false
+  let requestCount = 0
+  let providerRequestCount = 0
+  let deniedCount = 0
+  let hardStopped = false
+  let latestInputBound = null
+  let lastFailure = null
+  const upstreamRequests = new Set()
+  const sockets = new Set()
+
+  const recordFailure = (code, message) => {
+    hardStopped = true
+    activeRequest = false
+    if (!lastFailure) lastFailure = Object.freeze({ code, message })
+  }
+
+  const server = http.createServer((request, response) => {
+    const incomingUrl = new URL(request.url || '/', 'http://127.0.0.1')
+    if (request.method !== 'POST' ||
+        incomingUrl.pathname !== `${routePrefix}/responses` || incomingUrl.search) {
+      codexQuotaProxyJsonError(response, 404, 'unknown local quota-proxy route')
+      return
+    }
+    if (activeRequest || hardStopped) {
+      deniedCount += 1
+      codexQuotaProxyJsonError(response, 429, 'bounded child quota admits no further provider response')
+      return
+    }
+    activeRequest = true
+    const chunks = []
+    let receivedBytes = 0
+    let oversized = false
+    let upstreamRequest = null
+    let requestAborted = false
+    request.once('aborted', () => {
+      requestAborted = true
+      recordFailure('CODEX_QUOTA_PROXY_ABORTED', 'bounded child local provider request was aborted')
+      if (upstreamRequest) upstreamRequest.destroy()
+    })
+    response.once('close', () => {
+      if (response.writableEnded) return
+      recordFailure(
+        'CODEX_QUOTA_PROXY_CLIENT_DISCONNECTED',
+        'bounded child disconnected before its provider response completed',
+      )
+      if (upstreamRequest) upstreamRequest.destroy()
+    })
+    request.on('data', chunk => {
+      receivedBytes += chunk.length
+      if (receivedBytes > CODEX_QUOTA_PROXY_MAX_REQUEST_BYTES) {
+        oversized = true
+        chunks.length = 0
+      } else if (!oversized) {
+        chunks.push(Buffer.from(chunk))
+      }
+    })
+    request.on('end', () => {
+      if (oversized) {
+        deniedCount += 1
+        recordFailure('CODEX_QUOTA_PROXY_REQUEST_TOO_LARGE', 'bounded child provider request is too large')
+        codexQuotaProxyJsonError(response, 413, 'bounded child provider request is too large')
+        return
+      }
+      if (requestAborted) return
+      const rawBody = Buffer.concat(chunks)
+      let body
+      let inputBound
+      try {
+        body = JSON.parse(rawBody.toString('utf8'))
+        if (!body || typeof body !== 'object' || Array.isArray(body) ||
+            (Object.hasOwn(body, 'max_output_tokens') &&
+              (!Number.isSafeInteger(body.max_output_tokens) || body.max_output_tokens <= 0))) {
+          throw new SupervisorIntegrationError(
+            'CODEX_QUOTA_PROXY_REQUEST_INVALID',
+            'bounded child provider request body is invalid',
+          )
+        }
+        inputBound = codexQuotaProxyInputUpperBound(body, rawBody.length, priorRequest)
+      } catch (error) {
+        recordFailure(
+          error && error.code || 'CODEX_QUOTA_PROXY_REQUEST_INVALID',
+          'bounded child provider request is invalid',
+        )
+        codexQuotaProxyJsonError(response, 400, 'bounded child provider request is invalid')
+        return
+      }
+      latestInputBound = inputBound
+      const alreadyUsed = billableModelTokens(cumulativeUsage)
+      const outputAllowance = tokenLimit - alreadyUsed - inputBound.maximumInputTokens
+      if (!Number.isSafeInteger(outputAllowance) || outputAllowance <= 0) {
+        deniedCount += 1
+        recordFailure(
+          'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED',
+          'bounded child cumulative quota denied this provider response',
+        )
+        codexQuotaProxyJsonError(response, 429, 'bounded child cumulative quota denied this provider response')
+        return
+      }
+      body.max_output_tokens = Number.isSafeInteger(body.max_output_tokens)
+        ? Math.min(body.max_output_tokens, outputAllowance)
+        : outputAllowance
+      const outboundBody = Buffer.from(JSON.stringify(body), 'utf8')
+      const upstreamBase = codexQuotaProxyUpstream(
+        request.headers,
+        options.upstreamBaseUrl || null,
+      )
+      const upstreamUrl = new URL(upstreamBase)
+      upstreamUrl.pathname = `${upstreamUrl.pathname.replace(/\/$/u, '')}/responses`
+      upstreamUrl.search = ''
+      upstreamUrl.hash = ''
+      const headers = { ...request.headers }
+      for (const name of [
+        'connection', 'content-length', 'host', 'keep-alive', 'proxy-authenticate',
+        'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade',
+      ]) delete headers[name]
+      headers.host = upstreamUrl.host
+      headers['content-length'] = String(outboundBody.length)
+      headers['accept-encoding'] = 'identity'
+      const transport = upstreamUrl.protocol === 'http:' ? http : https
+      const requestOrdinal = providerRequestCount + 1
+      const maximumUnaccountedTokens = tokenLimit - alreadyUsed
+      if (typeof options.onProviderRequestStarted === 'function') {
+        try {
+          options.onProviderRequestStarted(Object.freeze({
+            tokenLimit,
+            maximumUnaccountedTokens,
+            requestOrdinal,
+            completedRequestCount: requestCount,
+            accountedUsage: Object.freeze({ ...cumulativeUsage }),
+          }))
+        } catch (error) {
+          recordFailure(
+            error && error.code || 'CODEX_PROVIDER_ALLOWANCE_PERSIST_FAILED',
+            'bounded child provider request allowance could not be persisted',
+          )
+          codexQuotaProxyJsonError(
+            response,
+            503,
+            'bounded child provider request allowance could not be persisted',
+          )
+          return
+        }
+      }
+      // The durable pending record precedes every possible upstream byte. Count
+      // this request immediately afterward so any later local failure retains
+      // the conservative unknown-spend path.
+      providerRequestCount = requestOrdinal
+      let upstreamResponseStarted = false
+      upstreamRequest = transport.request(upstreamUrl, {
+        method: 'POST', headers,
+      }, upstreamResponse => {
+        upstreamResponseStarted = true
+        const responseHeaders = { ...upstreamResponse.headers }
+        for (const name of [
+          'connection', 'content-length', 'content-encoding', 'keep-alive',
+          'transfer-encoding',
+        ]) delete responseHeaders[name]
+        response.writeHead(upstreamResponse.statusCode || 502, responseHeaders)
+        const contentType = String(upstreamResponse.headers['content-type'] || '')
+        if (!/text\/event-stream/iu.test(contentType)) {
+          recordFailure(
+            'CODEX_QUOTA_PROXY_NON_STREAM_RESPONSE',
+            'bounded child upstream response did not provide accountable SSE usage',
+          )
+          upstreamResponse.pipe(response)
+          return
+        }
+        const decoder = new StringDecoder('utf8')
+        let buffered = ''
+        let completedUsageSeen = false
+        let streamFailed = false
+        const failStream = (code, message) => {
+          if (streamFailed) return
+          streamFailed = true
+          recordFailure(code, message)
+          upstreamResponse.destroy()
+          if (!response.destroyed) response.destroy()
+        }
+        const forwardFrame = frame => {
+          const lines = frame.split(/\r?\n/u)
+          const declaredEvent = lines.find(line => line.startsWith('event:'))
+          const declaredType = declaredEvent ? declaredEvent.slice(6).trim() : null
+          const dataLines = lines.filter(line => line.startsWith('data:'))
+          if (dataLines.length === 0) {
+            response.write(`${frame}\n\n`)
+            return
+          }
+          let event
+          try {
+            event = JSON.parse(dataLines.map(line => line.slice(5).trimStart()).join('\n'))
+          } catch {
+            if (declaredType === 'response.completed') {
+              throw new SupervisorIntegrationError(
+                'CODEX_USAGE_INVALID',
+                'Codex quota proxy received an invalid completed response frame',
+              )
+            }
+            response.write(`${frame}\n\n`)
+            return
+          }
+          if (declaredType === 'response.completed' &&
+              (!event || event.type !== 'response.completed')) {
+            throw new SupervisorIntegrationError(
+              'CODEX_USAGE_INVALID',
+              'Codex quota proxy received an inconsistent completed response frame',
+            )
+          }
+          if (event && event.type === 'response.completed') {
+            if (completedUsageSeen || !event.response || !event.response.usage) {
+              throw new SupervisorIntegrationError(
+                'CODEX_USAGE_INVALID',
+                'Codex quota proxy requires exactly one completed response with usage',
+              )
+            }
+            const delta = codexQuotaProxyUsage(event.response.usage)
+            const nextUsage = Object.fromEntries(Object.keys(cumulativeUsage).map(field => [
+              field, cumulativeUsage[field] + delta[field],
+            ]))
+            const actualResponseUnits = delta.noncachedInput + delta.cachedInput + delta.output
+            const actualInputTokens = delta.noncachedInput + delta.cachedInput
+            const providerBoundViolated = actualInputTokens > inputBound.maximumInputTokens ||
+                delta.output > body.max_output_tokens ||
+                billableModelTokens(nextUsage) > tokenLimit
+            event.response.usage.codex_rollout_budget_units = actualResponseUnits
+            const nextPriorRequest = Object.freeze({
+              signature: inputBound.signature,
+              input: structuredClone(inputBound.input),
+              inputTokens: actualInputTokens,
+            })
+            if (typeof options.onUsage === 'function') {
+              options.onUsage(Object.freeze({ ...nextUsage }), Object.freeze({
+                tokenLimit,
+                maximumUnaccountedTokens,
+                requestOrdinal,
+                completedRequestCount: requestCount + 1,
+              }))
+            }
+            if (typeof options.onProviderRequestSettled === 'function') {
+              options.onProviderRequestSettled(Object.freeze({
+                tokenLimit,
+                maximumUnaccountedTokens,
+                requestOrdinal,
+                completedRequestCount: requestCount + 1,
+                accountedUsage: Object.freeze({ ...nextUsage }),
+                disposition: 'ACCOUNTED',
+              }))
+            }
+            Object.assign(cumulativeUsage, nextUsage)
+            priorRequest = nextPriorRequest
+            requestCount += 1
+            completedUsageSeen = true
+            // Provider telemetry is billing evidence even when the provider
+            // violated max_output_tokens or the conservative input bound.
+            // Persist and settle that exact spend first, then reject the
+            // response so no over-limit output can become a child result.
+            if (providerBoundViolated) {
+              throw new SupervisorIntegrationError(
+                'CODEX_CHILD_QUOTA_BOUND_VIOLATED',
+                'Codex provider usage exceeded the relay-admitted cumulative bound',
+              )
+            }
+            let replaced = false
+            const transformed = lines.flatMap(line => {
+              if (!line.startsWith('data:')) return [line]
+              if (replaced) return []
+              replaced = true
+              return [`data: ${JSON.stringify(event)}`]
+            }).join('\n')
+            response.write(`${transformed}\n\n`)
+            return
+          }
+          response.write(`${frame}\n\n`)
+        }
+        upstreamResponse.on('data', chunk => {
+          if (streamFailed) return
+          buffered += decoder.write(chunk)
+          try {
+            while (true) {
+              const match = /\r?\n\r?\n/u.exec(buffered)
+              if (!match) break
+              const frame = buffered.slice(0, match.index)
+              buffered = buffered.slice(match.index + match[0].length)
+              forwardFrame(frame)
+            }
+          } catch (error) {
+            failStream(
+              error && error.code || 'CODEX_USAGE_INVALID',
+              error && error.message || 'Codex quota proxy could not validate streamed usage',
+            )
+          }
+        })
+        upstreamResponse.on('end', () => {
+          if (streamFailed) return
+          try {
+            buffered += decoder.end()
+            if (buffered) forwardFrame(buffered)
+            if (!completedUsageSeen) {
+              throw new SupervisorIntegrationError(
+                'CODEX_USAGE_INCOMPLETE',
+                'Codex quota proxy stream ended without exactly accounted completion usage',
+              )
+            }
+            activeRequest = false
+            response.end()
+          } catch (error) {
+            failStream(
+              error && error.code || 'CODEX_USAGE_INCOMPLETE',
+              error && error.message || 'Codex quota proxy stream ended without valid usage',
+            )
+          }
+        })
+        upstreamResponse.on('error', () => {
+          failStream(
+            'CODEX_QUOTA_PROXY_UPSTREAM_STREAM_FAILED',
+            'bounded child upstream provider stream failed',
+          )
+        })
+      })
+      upstreamRequests.add(upstreamRequest)
+      upstreamRequest.once('close', () => upstreamRequests.delete(upstreamRequest))
+      upstreamRequest.on('error', () => {
+        if (upstreamResponseStarted && hardStopped) return
+        recordFailure(
+          'CODEX_QUOTA_PROXY_UPSTREAM_FAILED',
+          'bounded child upstream provider request failed',
+        )
+        codexQuotaProxyJsonError(response, 502, 'bounded child upstream provider request failed')
+      })
+      upstreamRequest.end(outboundBody)
+    })
+    request.on('error', () => {
+      recordFailure(
+        'CODEX_QUOTA_PROXY_LOCAL_REQUEST_FAILED',
+        'bounded child local provider request failed',
+      )
+      codexQuotaProxyJsonError(response, 400, 'bounded child local provider request failed')
+    })
+  })
+  server.on('connection', socket => {
+    sockets.add(socket)
+    socket.once('close', () => sockets.delete(socket))
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const port = server.address().port
+  let closed = false
+  return Object.freeze({
+    baseUrl: `http://127.0.0.1:${port}${routePrefix}`,
+    snapshot() {
+      return Object.freeze({
+        tokenLimit,
+        requestCount,
+        providerRequestCount,
+        deniedCount,
+        hardStopped,
+        usage: Object.freeze({ ...cumulativeUsage }),
+        latestInputBound,
+        lastFailure,
+      })
+    },
+    async close() {
+      if (closed) return
+      closed = true
+      for (const request of upstreamRequests) request.destroy()
+      await new Promise(resolve => {
+        server.close(resolve)
+        if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections()
+        for (const socket of sockets) socket.destroy()
+      })
+    },
+  })
+}
+
+function codexCompactCanonicalOutputContract(record, canonicalSchemaText) {
+  const schemaHash = hashText(canonicalSchemaText)
+  if (record.logicalRole === 'route-analyst') {
+    let schema
+    try { schema = JSON.parse(canonicalSchemaText) } catch {}
+    const proposalSchema = schema && schema.properties && schema.properties.routeFactProposal
+    const verificationObligation = schema && schema.$defs && schema.$defs.verificationObligation
+    if (!schema || !Array.isArray(schema.required) || !proposalSchema ||
+        !verificationObligation || !schema.$defs.strings || !schema.$defs.nonEmptyStrings) {
+      throw new SupervisorIntegrationError(
+        'CANONICAL_OUTPUT_SCHEMA_INVALID',
+        'Codex route analyst requires a compactable canonical recommendation schema',
+      )
+    }
+    const stringArrays = [
+      'whatTheUserWants', 'likelyAreas', 'howSuccessCanBeChecked', 'unknowns', 'risks',
+      'independentWorkItems', 'dependencies', 'reasonsForDirect', 'reasonsForLight',
+      'reasonsForRoadmap', 'userInputNeeded',
+    ]
+    const proposalContract = {
+      ...proposalSchema,
+      $defs: {
+        strings: schema.$defs.strings,
+        nonEmptyStrings: schema.$defs.nonEmptyStrings,
+      },
+    }
+    return [
+      `Canonical output contract (sha256=${schemaHash}; exact runtime JSON validation applies): canonicalJson must decode to one route recommendation with exactly these required top-level keys: ${JSON.stringify(schema.required)}.`,
+      'Use schemaVersion="2.0.0", preWorkResult="CONTINUE"|"NEEDS_USER", recommendedRoute="DIRECT"|"LIGHT"|"ROADMAP"|null, and confidence="high"|"medium"|"low".',
+      `These keys are string arrays (non-empty where the exact schema requires it): ${JSON.stringify(stringArrays)}. evidenceIndex is an array of {eventId,reason,byteLength,sha256,truncated}. Emit no extra top-level keys.`,
+      `Canonical verificationObligations item schema: ${JSON.stringify(verificationObligation)}`,
+      `Canonical routeFactProposal schema: ${JSON.stringify(proposalContract)}`,
+    ].join('\n')
+  }
+  const binding = Object.freeze({
+    runId: record.runId || null,
+    assignmentId: record.workItemId || null,
+    logicalRoleId: record.logicalRole || null,
+    physicalRoleId: record.physicalRole || null,
+    requestEnvelopeHash: record.dispatch && record.dispatch.requestPointer &&
+      record.dispatch.requestPointer.hash || null,
+    currentVersionHash: record.candidateHash || null,
+    findingIds: canonicalRoleFindingIds(record.canonicalAssignment, record.assignment, record),
+  })
+  const prefix = `Canonical output contract (sha256=${schemaHash}; exact runtime JSON validation applies)`
+  if (codexPreRouteControlPlane(record)) {
+    return `${prefix}: canonicalJson must decode to a route decision. Always return ` +
+      '{schemaVersion:"2.0.0",status:"DECIDED"|"WAITING_USER",route:"DIRECT"|"LIGHT"|"ROADMAP"|null,routeSource:"automatic"|"explicit_control",requestEnvelopeHash,recommendationHash,decidedAt}. ' +
+      'WAITING_USER also returns userInputNeeded. DECIDED also returns pathSelection, requestedResult, successChecklist, plannedChecks, verificationObligations, existingTests, likelyAreas, risks, missingInformation, usefulWorkerCount, workerOwnershipReason, independentCheckingPlan, chosenRouteReason, rejectedRouteReasons, analystDisagreement, routeChangeTrigger, decisionClassifications, normalizedRouteFacts, routeFactsFingerprint, classifierFingerprint, acceptance, requiredCapabilities, gateSelection, mutableResourceOwnership, candidateFreeze, assurancePreconditions, topology, and capturedDomainContracts. Copy all controller hashes and facts exactly; emit no extra keys.'
+  }
+  if (CHECKER_ROLES.has(record.logicalRole)) {
+    return `${prefix}; controller binding=${JSON.stringify(binding)}: canonicalJson must decode to ` +
+      '{schemaVersion:"2.0.0",code:"PASS"|"FAIL"|"CHECK_INCONCLUSIVE"|"RUNTIME_FAILURE",description,stateClass:"terminal"|"intermediate",runId,requestEnvelopeHash,currentVersionHash,completedResults:[],nextReadyWork:[],cause:{event,reason,unblockPath},payloadSchemaId,payload,recordedAt}. ' +
+      'payload must contain the evidenceIds, referenceMethod, testOutcomes, captured-domain outcomes, and limitation details required by the assignment. Copy controller-bound values exactly and emit no extra top-level keys.'
+  }
+  return `${prefix}; controller binding=${JSON.stringify(binding)}; findingIds must match ^AP-[A-Z]+-(?:[0-9]{3}|[0-9]{78})$: canonicalJson must decode to ` +
+    '{schemaVersion:"2.0.0",reportType:"result",reportId,runId,assignmentId,logicalRoleId,physicalRoleId,requestEnvelopeHash,findingIds,startedAt,endedAt,filesChanged,resourcesChanged,behaviorChanged,commands,successItems,remainingConcerns,allAssignedItemsPass,requestedTransition:{event:"WORK_ITEM_VERIFIED",reason,invalidateEvidenceIds}}. ' +
+    'Each resource is {kind,identity,access,expectedPreimageHash,owner,ownershipMode}; each command is {command,exitCode,result}; each success item is {id,status:"pass"|"fail"|"blocked",evidenceIds}. Copy controller-bound values exactly and emit no extra keys.'
 }
 
 function decodeCodexProviderEnvelope(output) {
@@ -6676,6 +7785,14 @@ class CodexExecAdapter {
     this.providerSchemaRoot = options.providerSchemaRoot
       ? path.resolve(options.providerSchemaRoot)
       : null
+    this.cumulativeQuotaProxyFactory = options.cumulativeQuotaProxyFactory ||
+      startCodexCumulativeQuotaProxy
+    if (typeof this.cumulativeQuotaProxyFactory !== 'function') {
+      throw new SupervisorIntegrationError(
+        'PROVIDER_UNSUPPORTED',
+        'Codex exec adapter cumulative quota proxy factory is invalid',
+      )
+    }
     this.checkerScratchVerifier = typeof options.checkerScratchVerifier === 'function'
       ? options.checkerScratchVerifier : null
   }
@@ -6697,6 +7814,9 @@ class CodexExecAdapter {
     const schemaPath = this.providerSchemaRoot
       ? materializeCodexProviderEnvelopeSchema(this.providerSchemaRoot)
       : canonicalSchemaPath
+    const controlledTransport = this.providerSchemaRoot
+      ? materializeCodexControlledTransport(this.providerSchemaRoot, record)
+      : null
     const executionPolicy = record.physicalExecutionPolicy
     if (!executionPolicy || executionPolicy.logicalRole !== record.logicalRole ||
         executionPolicy.physicalRole !== record.physicalRole ||
@@ -6728,14 +7848,51 @@ class CodexExecAdapter {
     const common = [
       '--json', '--output-schema', schemaPath, '--strict-config',
       '--disable', 'multi_agent', '--disable', 'multi_agent_v2',
+      '--disable', 'code_mode', '--disable', 'code_mode_only',
+      '--disable', 'goals', '--disable', 'memories',
+      '--disable', 'token_budget', '--disable', 'current_time_reminder',
+      '--disable', 'deferred_executor', '--disable', 'unbounded_connection_retries',
       '-c', `model_auto_compact_token_limit=${CODEX_CHILD_AUTO_COMPACT_TOKEN_LIMIT}`,
+      '-c', `tool_output_token_limit=${CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT}`,
+      '-c', 'allow_login_shell=false',
+      '-c', codexChildRolloutBudgetConfig(record),
+      '-c', 'mcp_servers={}',
+      '-c', 'tools.experimental_request_user_input.enabled=false',
+      '-c', 'tools.update_plan.enabled=false',
+      '-c', 'include_permissions_instructions=false',
+      '-c', 'include_apps_instructions=false',
+      '-c', 'include_collaboration_mode_instructions=false',
+      '-c', 'include_environment_context=false',
+      '-c', 'skills.include_instructions=false',
+      '-c', 'web_search="disabled"',
+      '-c', 'project_doc_max_bytes=0',
+      '-c', 'plugins={}',
+      '-c', 'marketplaces={}',
       '--sandbox', transportSandboxMode,
     ]
+    if (controlledTransport) {
+      common.push(
+        '-c', `model_catalog_json=${JSON.stringify(controlledTransport.modelCatalogPath)}`,
+        '-c', `model_instructions_file=${JSON.stringify(controlledTransport.instructionsPath)}`,
+        '-c', 'model_provider="autoprompt-openai"',
+      )
+    }
     // PRE_ROUTE is one bounded classification turn. Its immutable mission,
     // schema, and route-fact envelope are already present in the prompt, so
     // shell exploration only replays a growing context before useful work.
-    if (record.logicalRole === 'route-analyst') {
-      common.push('--disable', 'shell_tool', '--disable', 'unified_exec')
+    const preRouteControlPlane = codexPreRouteControlPlane(record)
+    if (preRouteControlPlane) {
+      common.push(
+        '--disable', 'shell_tool',
+        '--disable', 'unified_exec',
+        '--disable', 'view_image',
+      )
+    } else {
+      // Codex 0.148 omits unified-exec nested calls and ImageView items from
+      // `exec --json`. Those paths cannot participate in the hard transport
+      // counter, so bounded children expose only direct shell and file-change
+      // tools whose individual calls are visible on the owned event stream.
+      common.push('--disable', 'unified_exec', '--disable', 'view_image')
     }
     if (checkerScratchBoundary) {
       common.push(
@@ -6747,11 +7904,13 @@ class CodexExecAdapter {
       )
     }
     if (record.assignment && record.assignment.model) common.push('-m', String(record.assignment.model))
-    if (record.assignment && record.assignment.effort) {
-      if (!['low', 'medium', 'high', 'xhigh', 'max'].includes(record.assignment.effort)) {
-        throw new SupervisorIntegrationError('INVALID_EFFORT', `unsupported Codex effort: ${record.assignment.effort}`)
-      }
-      common.push('-c', `model_reasoning_effort="${record.assignment.effort}"`)
+    const assignedEffort = record.assignment && record.assignment.effort
+    if (assignedEffort && !['low', 'medium', 'high', 'xhigh', 'max'].includes(assignedEffort)) {
+      throw new SupervisorIntegrationError('INVALID_EFFORT', `unsupported Codex effort: ${assignedEffort}`)
+    }
+    const launchEffort = preRouteControlPlane ? 'low' : assignedEffort
+    if (launchEffort) {
+      common.push('-c', `model_reasoning_effort="${launchEffort}"`)
     }
     if (record.profileLimits) {
       common.push(
@@ -6790,9 +7949,6 @@ class CodexExecAdapter {
         }
       : null
     const selectedProfile = CHECKER_ROLES.has(record.logicalRole) ? this.checkerProfile : this.profile
-    const argv = record.continuationId
-      ? [...this.executableArgs, 'exec', ...common, 'resume', record.continuationId, '-']
-      : [...this.executableArgs, 'exec', ...common, '-p', selectedProfile, '-C', workingDirectory, '-']
     const providerTransport = this.providerSchemaRoot
       ? [
           'AUTOPROMPT_CODEX_PROVIDER_TRANSPORT_V1',
@@ -6800,7 +7956,7 @@ class CodexExecAdapter {
           'Return exactly one provider envelope object. Its only field is canonicalJson.',
           'canonicalJson must be a JSON string which decodes to the complete canonical output object.',
           'The decoded object remains subject to all canonical AutoPrompt validation after transport decoding.',
-          `Canonical output schema: ${canonicalSchemaText}`,
+          codexCompactCanonicalOutputContract(record, canonicalSchemaText),
         ]
       : []
     const workspaceProjection = codexPrivateWorkspaceProjection(
@@ -6845,16 +8001,22 @@ class CodexExecAdapter {
           .filter(([key]) => key !== 'verificationObservationBinding'),
         ),
       })
+      visibleCanonicalAssignment = codexCompactCheckerVisibleAssignment(
+        visibleCanonicalAssignment,
+      )
     }
     // L4 exact-request bytes are loaded and hash-checked by buildCheckerContext
     // and auditDispatch before the scheduler admits this launch. The model
     // receives the same canonical mission as every other role plus the
     // immutable pointer/binding, never another raw copy of the request.
-    const visibleDispatch = modelVisibleDispatch(record.dispatch, {
+    let visibleDispatch = modelVisibleDispatch(record.dispatch, {
       canonicalAssignment: Boolean(record.canonicalAssignment),
       canonicalMission,
       missionBinding: record.missionBinding,
     })
+    if (CHECKER_ROLES.has(record.logicalRole)) {
+      visibleDispatch = codexCompactCheckerVisibleDispatch(visibleDispatch)
+    }
     const input = [
       'AUTOPROMPT_EXTERNAL_CHILD_V1',
       `role=${record.logicalRole}`,
@@ -6885,6 +8047,19 @@ class CodexExecAdapter {
     let committedTerminalEvidence = null
     let firstProductSignalPersisted = false
     let reportedSessionId = null
+    const priorToolCallCount = record.priorToolCallCount === undefined
+      ? 0 : record.priorToolCallCount
+    if (!Number.isSafeInteger(priorToolCallCount) || priorToolCallCount < 0) {
+      throw new SupervisorIntegrationError(
+        'BUDGET_CONFIG_INVALID',
+        'controller-issued prior tool-call high-water is invalid',
+      )
+    }
+    let observedToolCalls = priorToolCallCount
+    const activeToolCallIds = new Map()
+    const activeAnonymousToolCalls = new Map()
+    const toolCallLimit = codexChildToolCallLimit(record)
+    const childTokenLimit = codexChildTokenLimit(record)
     const deferredCallbacks = []
     let deferredCallbackBytes = 0
     let callbackSequence = 0
@@ -7131,45 +8306,166 @@ class CodexExecAdapter {
       }
       stop(`typed terminal ${typedTerminal}`, 'DONE')
     }
-    const accountCumulativeUsage = cumulative => {
-      if (!cumulative || typeof record.onUsageDelta !== 'function' || streamError) return
+    const accountCumulativeUsage = (cumulative, providerEvidence = null, options = {}) => {
+      const propagateFailure = options.propagateFailure === true
+      const rejectAccounting = error => {
+        streamError = error
+        if (streamError && typeof streamError === 'object') streamError.usage = cumulative
+        stop(error && error.code || 'BUDGET_EXHAUSTED')
+        if (propagateFailure) throw error
+        return false
+      }
+      if (!cumulative) {
+        const error = new SupervisorIntegrationError(
+          'CODEX_USAGE_INVALID',
+          'Codex cumulative usage callback is missing its exact usage object',
+        )
+        return rejectAccounting(error)
+      }
+      if (streamError) {
+        if (propagateFailure) throw streamError
+        return false
+      }
       const delta = {}
       for (const field of Object.keys(streamedUsage)) {
         if (!Number.isSafeInteger(cumulative[field]) || cumulative[field] < streamedUsage[field]) {
-          streamError = new SupervisorIntegrationError(
+          const error = new SupervisorIntegrationError(
             'CODEX_USAGE_INVALID',
             `Codex streamed ${field} usage regressed or became invalid`,
           )
-          stop(streamError.code)
-          return
+          return rejectAccounting(error)
         }
         delta[field] = cumulative[field] - streamedUsage[field]
       }
       streamedUsage = cumulative
-      try {
-        invokeOrDeferCallback(
-          'usage-delta',
-          () => {
-            const verdict = record.onUsageDelta(delta, cumulative)
-            if (!verdict || verdict.continue !== true) {
-              const denied = new SupervisorIntegrationError(
-                'BUDGET_EXHAUSTED',
-                'scheduler denied continued Codex token usage',
-                { verdict },
-              )
-              denied.usage = cumulative
-              throw denied
-            }
-            return verdict
-          },
-          null,
-          { delta, cumulative },
-        )
-      } catch (error) {
-        streamError = error
-        streamError.usage = cumulative
-        stop(error.code || 'BUDGET_EXHAUSTED')
+      const hasUsageDelta = Object.values(delta).some(value => value > 0)
+      const providerUsageBoundary = providerEvidence &&
+        Number.isSafeInteger(providerEvidence.requestOrdinal)
+      if ((hasUsageDelta || providerUsageBoundary) && typeof record.onUsageDelta === 'function') {
+        try {
+          invokeOrDeferCallback(
+            'usage-delta',
+            () => {
+              const verdict = record.onUsageDelta(delta, cumulative, providerEvidence)
+              if (!verdict || verdict.continue !== true) {
+                const denied = new SupervisorIntegrationError(
+                  'BUDGET_EXHAUSTED',
+                  'scheduler denied continued Codex token usage',
+                  { verdict },
+                )
+                denied.usage = cumulative
+                throw denied
+              }
+              return verdict
+            },
+            null,
+            { delta, cumulative },
+          )
+        } catch (error) {
+          return rejectAccounting(error)
+        }
       }
+      const reportedModelTokens = billableModelTokens(cumulative)
+      if (reportedModelTokens > childTokenLimit) {
+        const error = new SupervisorIntegrationError(
+          'CHILD_TOKEN_LIMIT_EXHAUSTED',
+          `${record.logicalRole} exceeded its transport-enforced model-token limit`,
+          {
+            logicalRole: record.logicalRole,
+            limit: childTokenLimit,
+            reportedModelTokens,
+          },
+        )
+        return rejectAccounting(error)
+      }
+      return true
+    }
+    const observeToolCall = event => {
+      const toolObservation = codexToolCallObservation(event)
+      if (!toolObservation) return null
+      const activeItemType = toolObservation.itemId
+        ? activeToolCallIds.get(toolObservation.itemId)
+        : undefined
+      const reusedActiveId = toolObservation.phase === 'started' && activeItemType !== undefined
+      const mismatchedTerminalType = toolObservation.phase !== 'started' &&
+        activeItemType !== undefined && activeItemType !== toolObservation.itemType
+      if (reusedActiveId || mismatchedTerminalType) {
+        throw new SupervisorIntegrationError(
+          'CHILD_TOOL_LIFECYCLE_INVALID',
+          reusedActiveId
+            ? `${record.logicalRole} reused an active provider tool item id`
+            : `${record.logicalRole} changed the type of an active provider tool item`,
+          {
+            logicalRole: record.logicalRole,
+            itemIdHash: hashText(toolObservation.itemId),
+            itemType: toolObservation.itemType,
+            activeItemType,
+          },
+        )
+      }
+      let firstObservation = false
+      if (toolObservation.itemId) {
+        if (toolObservation.phase === 'started') {
+          if (!activeToolCallIds.has(toolObservation.itemId)) {
+            activeToolCallIds.set(toolObservation.itemId, toolObservation.itemType)
+            firstObservation = true
+          }
+        } else if (activeToolCallIds.get(toolObservation.itemId) === toolObservation.itemType) {
+          activeToolCallIds.delete(toolObservation.itemId)
+        } else {
+          firstObservation = true
+        }
+      } else if (toolObservation.phase === 'started') {
+        activeAnonymousToolCalls.set(
+          toolObservation.itemType,
+          (activeAnonymousToolCalls.get(toolObservation.itemType) || 0) + 1,
+        )
+        firstObservation = true
+      } else {
+        const pending = activeAnonymousToolCalls.get(toolObservation.itemType) || 0
+        if (pending > 0) {
+          if (pending === 1) activeAnonymousToolCalls.delete(toolObservation.itemType)
+          else activeAnonymousToolCalls.set(toolObservation.itemType, pending - 1)
+        } else {
+          firstObservation = true
+        }
+      }
+      if (!firstObservation) return null
+      const attemptedCount = observedToolCalls + 1
+      if (typeof record.onToolCallObserved === 'function') {
+        const authoritativeContinuationId = streamAccumulator.watermark().sessionId ||
+          record.continuationId || null
+        const toolEvidence = Object.freeze({
+          attemptedCount,
+          continuationId: authoritativeContinuationId,
+          itemIdHash: toolObservation.itemId ? hashText(toolObservation.itemId) : null,
+          itemType: toolObservation.itemType,
+          observedPhase: toolObservation.phase,
+        })
+        // Preserve callback order when an earlier local checkpoint is waiting
+        // for post-drain replay. The in-process counter still advances now;
+        // crash adoption separately burns the continuation's remaining tool
+        // allowance when this durable observation could have lagged the tool.
+        invokeOrDeferCallback(
+          'tool-call-observed',
+          () => record.onToolCallObserved(toolEvidence),
+          null,
+          toolEvidence,
+        )
+      }
+      observedToolCalls = attemptedCount
+      if (observedToolCalls <= toolCallLimit) return null
+      return new SupervisorIntegrationError(
+        'CHILD_TOOL_CALL_LIMIT_EXHAUSTED',
+        `${record.logicalRole} exceeded its transport-enforced tool-call limit`,
+        {
+          logicalRole: record.logicalRole,
+          limit: toolCallLimit,
+          attemptedCount: observedToolCalls,
+          itemType: toolObservation.itemType,
+          observedPhase: toolObservation.phase,
+        },
+      )
     }
     const onStdoutLine = line => {
       const eventLine = String(line).replace(/\r?\n$/u, '')
@@ -7210,6 +8506,12 @@ class CodexExecAdapter {
         stop(error.code)
         return
       }
+      let toolLimitError = null
+      try { toolLimitError = observeToolCall(event) } catch (error) {
+        streamError = error
+        stop(error.code || 'CHILD_TOOL_ACCOUNTING_FAILED')
+        return
+      }
       if (event && typeof record.onEvent === 'function') {
         try {
           invokeOrDeferCallback(
@@ -7226,6 +8528,36 @@ class CodexExecAdapter {
           stop(error.code || 'TRANSCRIPT_WRITE_FAILED')
           return
         }
+      }
+      if (toolLimitError) {
+        streamError = toolLimitError
+        stop(streamError.code)
+        return
+      }
+      if (event && event.type === 'error') {
+        streamError = new SupervisorIntegrationError(
+          'CODEX_USAGE_UNKNOWN_AFTER_START',
+          `${record.logicalRole} provider stream failed before complete terminal usage`,
+          {
+            logicalRole: record.logicalRole,
+            providerMessageHash: hashText(String(event.message || 'provider stream error')),
+          },
+        )
+        stop(streamError.code)
+        return
+      }
+      if (codexNativeRolloutBudgetFailure(event)) {
+        streamError = new SupervisorIntegrationError(
+          'CHILD_ROLLOUT_BUDGET_EXHAUSTED',
+          `${record.logicalRole} exhausted the native Codex rollout budget`,
+          {
+            logicalRole: record.logicalRole,
+            limit: childTokenLimit,
+            usageUnavailable: true,
+          },
+        )
+        stop(streamError.code)
+        return
       }
       // The committed receipt is immutable. Keep hashing/persisting drain
       // noise through onEvent, but never let a late event rebind the session,
@@ -7293,7 +8625,11 @@ class CodexExecAdapter {
         stop(error.code)
         return
       }
-      accountCumulativeUsage(cumulative)
+      // Most Codex JSONL records are lifecycle or item events and therefore do
+      // not carry a cumulative usage object. Only usage-bearing provider
+      // boundaries enter the accounting callback; an explicit relay callback
+      // with a missing usage object still fails closed above.
+      if (cumulative) accountCumulativeUsage(cumulative)
       if (streamError) return
       const current = streamAccumulator.watermark()
       let currentOutput = current.output
@@ -7342,20 +8678,130 @@ class CodexExecAdapter {
         }
       }
     }
-    const execution = await this.runner.run({
-      executable: this.executable,
-      argv,
-      cwd: workingDirectory,
-      env: { ...record.environment, ...this.environmentOverlay },
-      stdin: input,
-      shell: false,
-      sessionId: record.sessionId,
-      reservationId: record.reservationId,
-      onStdoutLine,
-      onTransportActivity: typeof record.onTransportActivity === 'function'
-        ? record.onTransportActivity : null,
-      beforeExternalWrite,
-    })
+    let cumulativeQuotaProxy = null
+    let cumulativeQuotaSnapshot = null
+    if (controlledTransport) {
+      if (record.providerTokenLimit !== undefined && [
+        'onProviderRequestStarted',
+        'onProviderRequestSettled',
+        'onUnknownProviderSpend',
+      ].some(callback => typeof record[callback] !== 'function')) {
+        throw new SupervisorIntegrationError(
+          'PROVIDER_UNSUPPORTED',
+          'controller-bounded Codex transport lacks its complete durable provider accounting hooks',
+        )
+      }
+      cumulativeQuotaProxy = await this.cumulativeQuotaProxyFactory({
+        tokenLimit: codexChildSpendLimit(record),
+        onUsage: (cumulative, providerEvidence) => accountCumulativeUsage(
+          cumulative,
+          providerEvidence,
+          { propagateFailure: true },
+        ),
+        onProviderRequestStarted: evidence => {
+          if (typeof record.onProviderRequestStarted === 'function') {
+            return record.onProviderRequestStarted(Object.freeze({
+              ...evidence,
+              priorLeaseModelTokens: record.priorLeaseModelTokens || 0,
+            }))
+          }
+          return null
+        },
+        onProviderRequestSettled: evidence => {
+          if (typeof record.onProviderRequestSettled === 'function') {
+            return record.onProviderRequestSettled(evidence)
+          }
+          return null
+        },
+      })
+      common.push(
+        '-c', `model_providers.autoprompt-openai={name="OpenAI",base_url=${JSON.stringify(cumulativeQuotaProxy.baseUrl)},wire_api="responses",requires_openai_auth=true,supports_websockets=false,supports_standalone_web_search=false,request_max_retries=0,stream_max_retries=0}`,
+      )
+    }
+    const argv = record.continuationId
+      ? [...this.executableArgs, 'exec', ...common, '-p', selectedProfile, 'resume', record.continuationId, '-']
+      : [...this.executableArgs, 'exec', ...common, '-p', selectedProfile, '-C', workingDirectory, '-']
+    let execution
+    let executionError = null
+    try {
+      execution = await this.runner.run({
+        executable: this.executable,
+        argv,
+        cwd: workingDirectory,
+        env: { ...record.environment, ...this.environmentOverlay },
+        stdin: input,
+        shell: false,
+        sessionId: record.sessionId,
+        reservationId: record.reservationId,
+        onStdoutLine,
+        onTransportActivity: typeof record.onTransportActivity === 'function'
+          ? record.onTransportActivity : null,
+        beforeExternalWrite,
+      })
+    } catch (error) {
+      executionError = error
+    } finally {
+      if (cumulativeQuotaProxy) {
+        const quotaSnapshot = cumulativeQuotaProxy.snapshot()
+        cumulativeQuotaSnapshot = quotaSnapshot
+        const unaccountedProviderRequests = Math.max(
+          0,
+          quotaSnapshot.providerRequestCount - quotaSnapshot.requestCount,
+        )
+        if (unaccountedProviderRequests > 0 &&
+            typeof record.onUnknownProviderSpend === 'function') {
+          try {
+            record.onUnknownProviderSpend(Object.freeze({
+              tokenLimit: quotaSnapshot.tokenLimit,
+              maximumUnaccountedTokens: Math.max(
+                0,
+                quotaSnapshot.tokenLimit - billableModelTokens(quotaSnapshot.usage),
+              ),
+              providerRequestCount: quotaSnapshot.providerRequestCount,
+              completedRequestCount: quotaSnapshot.requestCount,
+              requestOrdinal: quotaSnapshot.providerRequestCount,
+              accountedUsage: quotaSnapshot.usage,
+              relayFailure: quotaSnapshot.lastFailure,
+            }))
+          } catch (accountingError) {
+            if (executionError && accountingError && accountingError.cause === undefined) {
+              accountingError.cause = executionError
+            }
+            executionError = accountingError
+          }
+        }
+        try {
+          await cumulativeQuotaProxy.close()
+        } catch (closeError) {
+          if (!executionError) executionError = closeError
+        } finally {
+          // Preserve the final relay state after every socket has been
+          // drained. In particular, a relay-local preflight denial occurs
+          // before the durable provider-request callback and therefore must
+          // not be mislabeled as unknown spend after an upstream handoff.
+          cumulativeQuotaSnapshot = cumulativeQuotaProxy.snapshot()
+        }
+      }
+    }
+    const relayLocalQuotaPreflightFailure = cumulativeQuotaSnapshot &&
+      cumulativeQuotaSnapshot.providerRequestCount === cumulativeQuotaSnapshot.requestCount &&
+      cumulativeQuotaSnapshot.lastFailure &&
+      cumulativeQuotaSnapshot.lastFailure.code === 'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED'
+    if (relayLocalQuotaPreflightFailure) {
+      throw new SupervisorIntegrationError(
+        'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED',
+        cumulativeQuotaSnapshot.lastFailure.message,
+        {
+          logicalRole: record.logicalRole,
+          tokenLimit: cumulativeQuotaSnapshot.tokenLimit,
+          latestInputBound: cumulativeQuotaSnapshot.latestInputBound,
+          deniedCount: cumulativeQuotaSnapshot.deniedCount,
+          upstreamProviderRequests: cumulativeQuotaSnapshot.providerRequestCount,
+          ...(executionError ? { executionError: serializeError(executionError) } : {}),
+        },
+      )
+    }
+    if (executionError) throw executionError
     if (!execution || execution.processOwned !== true || execution.exactArgv !== true) {
       throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'Codex runner did not prove owned process and exact argv')
     }
@@ -7383,10 +8829,16 @@ class CodexExecAdapter {
     if (deferredCallbacks.length > 0) reconcileDeferredCallbacks(parsed)
     if (committedTerminalResult) return withLocalCallbackDegradation(committedTerminalResult)
     if (execution.status !== 0) {
-      throw new SupervisorIntegrationError('CODEX_CHILD_FAILED', `Codex child exited ${execution.status}`, {
+      const usageKnown = Boolean(parsed.usage && parsed.usageComplete === true)
+      throw new SupervisorIntegrationError(
+        usageKnown ? 'CODEX_CHILD_FAILED' : 'CODEX_USAGE_UNKNOWN_AFTER_START',
+        `Codex child exited ${execution.status}${usageKnown ? '' : ' without complete terminal usage'}`,
+        {
         transportEvidence: codexTransportEvidence(parsed),
         stderr: String(execution.stderr || '').slice(-4096),
-      })
+          usageKnown,
+        },
+      )
     }
     if (execution.drained !== true) {
       throw new SupervisorIntegrationError(
@@ -7939,7 +9391,6 @@ function validateRuntimeDependencies(options) {
     ['requestPointerFactory', options.requestPointerFactory],
     ['launcher', options.launcher],
     ['finalizerFactory', options.finalizerFactory],
-    ['decideRoute', options.decideRoute],
   ]
   for (const [name, value] of requiredFunctions) {
     if (typeof value !== 'function') {
@@ -8711,6 +10162,14 @@ class CodexSupervisorRuntime {
     this.firstChildStartupRecorded = false
     this.diagnosticWorkerLaunches = 0
     this.diagnosticWorkerAdmissionsInFlight = 0
+    // Provider envelopes are reserved before a child can reach Codex. This
+    // process-local admission semaphore keeps tokens already consumed plus
+    // every live child's remaining worst-case relay allowance at or below the
+    // persisted activation ceiling, including concurrent ROADMAP launches.
+    this.childTokenReservations = new Map()
+    this.pendingProviderEnvelopes = new Map()
+    this.recoveredProviderEnvelopeHighWater = new Map()
+    this.childToolCallHighWater = new Map()
     this.lastAcceptedProgress = null
     this.localPersistenceLimitations = []
     this.rootCallers = Object.freeze({
@@ -9092,6 +10551,7 @@ class CodexSupervisorRuntime {
       if (this.options.budgetController !== this.budget) this.budget = this.options.budgetController
       if (this.activation.generation > 1) {
         validateResumedBudget(this.budget, this.options.previousBudgetSnapshot, this.activation.generation)
+        this._recoverUnresolvedProviderEnvelopes()
       }
       if (this.options.resumeState || this.activation.generation > 1) {
         this._enforceBudgetPhase('RECOVERY_REPLAY', {
@@ -9513,7 +10973,7 @@ class CodexSupervisorRuntime {
       streamedRouteEventCount = Number(result && result[STREAMED_ROUTE_EVENT_COUNT] || 0)
     } catch (error) {
       streamedRouteEventCount = Number(error && error[STREAMED_ROUTE_EVENT_COUNT] || 0)
-      if (routePersistenceIntegrityFailure(error)) throw error
+      if (callbackFailureRequiresImmediateAbort(error)) throw error
       result = { outcome: error.code === 'ROUTE_ANALYST_TIMEOUT' ? 'TIMEOUT' : 'CRASH', events: [{ type: 'failure', error: serializeError(error) }] }
     }
     const recommendationBounds = result && result.recommendation
@@ -9721,389 +11181,21 @@ class CodexSupervisorRuntime {
   }
 
   async _runL0Decision(analysis, adoptedRoot = null) {
-    if (this.options.deterministicRouteDecision === true && !adoptedRoot) {
-      return this._runDeterministicL0Decision(analysis)
-    }
-    const startedAt = this.now()
-    const admissionStartedAt = this.monotonicNow()
-    const rootSessionId = `${this.activation.id}:root-route-decision`
-    const rootLease = adoptedRoot ? adoptedRoot.lease : this.scheduler.beginRootAccounting({
-      phase: 'routeDecision',
-      sessionId: this.rootCallers.runOwner.sessionId,
-    })
-    if (!adoptedRoot) {
-      this._checkpointAccounting({
-        kind: 'CHECKPOINT',
-        causeId: `root-route-decision:${this.activation.generation}`,
-        humanDescription: 'Persist the root L0 decision session without recording a model child launch.',
-      }, { sessions: 1 })
-      this.budget.startSession(rootSessionId, {
-        activationId: this.activation.id,
-        parentSessionId: this.rootCallers.runOwner.sessionId,
-        forWork: true,
-        requiredCompletion: true,
-      })
-    }
-    const recoveryFrontier = {
-      resumeState: 'L0_ROUTE_DECISION',
-      nextReadyWorkIds: ['root-route-decision'],
-      openCheckIds: [],
-      acceptedResultIds: [],
-    }
-    let rootContinuationId = adoptedRoot && adoptedRoot.binding.continuationId || null
-    let rootCrashBinding = adoptedRoot && adoptedRoot.binding || null
-    let committedRootResultReceiptHash = null
-    let rootResultCommitAuthority = null
-    let adoptedContinuationPending = Boolean(adoptedRoot)
-    const armRootCorrectionRotation = receiptHash => {
-      if (rootResultCommitAuthority && committedRootResultReceiptHash === receiptHash) return
-      committedRootResultReceiptHash = receiptHash
-      rootResultCommitAuthority = this.scheduler.authorizeRootCrashContinuationRotationAfterResult(rootLease, {
-        priorBindingHash: rootCrashBinding && rootCrashBinding.bindingHash,
-        priorResultReceiptHash: receiptHash,
-      })
-    }
-    const persistRootCheckpoint = (causeKind, evidence = null, causeDetails = {}, checkpointHints = {}) => {
-      if (evidence) {
-        this.recoveryThreads.set(rootLease.id, {
-          startedEventHash: hashText(evidence.raw || JSON.stringify(evidence.event)),
-          startedAt: evidence.occurredAt || new Date(this.now()).toISOString(),
-        })
-      }
-      this._persistRecoveryCheckpoint({
-        kind: causeKind,
-        causeId: `root-l0:${this.activation.generation}:${causeKind.toLowerCase()}:${rootUsageSequence}`,
-        humanDescription: `Persist the root L0 session at the ${causeKind.toLowerCase()} recovery boundary.`,
-        ...causeDetails,
-      }, {
-        recoveryFrontier: checkpointHints.recoveryFrontier || recoveryFrontier,
-        nextReadyWorkIds: checkpointHints.nextReadyWorkIds || recoveryFrontier.nextReadyWorkIds,
-      })
-    }
-    const onLaunchPrepared = binding => {
-      if (committedRootResultReceiptHash) {
-        rootCrashBinding = this.scheduler.rotateRootCrashContinuationAfterResult(rootLease, {
-          priorBindingHash: rootCrashBinding && rootCrashBinding.bindingHash,
-          priorResultReceiptHash: committedRootResultReceiptHash,
-          resultCommitAuthority: rootResultCommitAuthority,
-          reservationId: binding.reservationId,
-          sessionId: binding.sessionId,
-          continuationId: binding.continuationId || null,
-          frontier: {
-            ...(rootCrashBinding && rootCrashBinding.frontier || recoveryFrontier),
-            acceptedResultIds: [
-              ...(rootCrashBinding && rootCrashBinding.frontier.acceptedResultIds || []),
-              committedRootResultReceiptHash,
-            ],
-          },
-        })
-        committedRootResultReceiptHash = null
-        rootResultCommitAuthority = null
-        adoptedContinuationPending = false
-      } else if (adoptedContinuationPending) {
-        rootCrashBinding = this.scheduler.rebindAdoptedContinuation(rootLease, {
-          priorBindingHash: rootCrashBinding.bindingHash,
-          reservationId: binding.reservationId,
-          sessionId: binding.sessionId,
-          continuationId: rootContinuationId,
-          frontier: rootCrashBinding.frontier,
-        })
-        adoptedContinuationPending = false
-      } else {
-        rootCrashBinding = this.scheduler.bindRootCrashContinuation(rootLease, {
-          reservationId: binding.reservationId,
-          sessionId: binding.sessionId,
-          continuationId: binding.continuationId || null,
-          frontier: recoveryFrontier,
-        })
-      }
-      persistRootCheckpoint('LEASE_STARTED')
-    }
-    const onSessionIdentified = (continuationId, evidence) => {
-      rootContinuationId = continuationId
-      rootCrashBinding = this.scheduler.bindRootCrashContinuation(rootLease, {
-        reservationId: evidence.reservationId,
-        sessionId: evidence.sessionId,
-        continuationId,
-        frontier: rootCrashBinding && rootCrashBinding.frontier || recoveryFrontier,
-      })
-      persistRootCheckpoint('THREAD_STARTED', evidence)
-    }
-    let rootUsageSequence = 0
-    const onUsageDelta = delta => {
-      const authorization = rootLease.authorizeUsage(delta)
-      const report = rootLease.reportUsage(delta, { productive: true, progressKind: 'planning' })
-      rootUsageSequence += 1
-      this._checkpointAccounting({
-        kind: 'TOKEN_USAGE_RECORDED',
-        causeId: `root-l0-jsonl:${this.activation.generation}:${rootUsageSequence}`,
-        humanDescription: 'Persist complete streamed root L0 usage before allowing route-decision continuation.',
-      }, { tokenUsage: delta })
-      const tokens = billableModelTokens(delta)
-      if (tokens > 0) this.budget.consumeTokens(tokens, { requiredCompletion: true })
-      if (rootContinuationId || this.recoveryThreads.has(rootLease.id)) persistRootCheckpoint('USAGE_RECORDED')
-      return { continue: true, authorization, report }
-    }
-    const rootReceiptLocation = attempt => this._terminalReceiptLocation(
-      rootLease.id,
-      `root-route-decision-attempt-${attempt}`,
-    )
-    const readRootReceipt = attempt => {
-      if (!this.record || typeof this.record.resolve !== 'function') return null
-      const absolute = this.record.resolve(rootReceiptLocation(attempt))
-      if (!fs.existsSync(absolute)) return null
-      const receipt = readRegularJson(absolute, 'root L0 terminal receipt').parsed
-      const { receiptHash, ...body } = receipt || {}
-      if (!receipt || receipt.schemaVersion !== 1 || receiptHash !== hashText(JSON.stringify(body)) ||
-          receipt.runId !== this.options.runId || receipt.activationId !== this.activation.id ||
-          receipt.leaseId !== rootLease.id ||
-          receipt.assignmentId !== 'root-route-decision' || receipt.correctionAttempt !== attempt ||
-          !/^[a-f0-9]{64}$/.test(receipt.assignmentHash || '') ||
-          receipt.requestEnvelopeHash !== this.requestPointer.hash ||
-          receipt.resultHash !== hashText(JSON.stringify(receipt.submitted)) ||
-          receipt.candidateHash !== null) {
-        throw new SupervisorIntegrationError(
-          'CRASH_ADOPTION_CONFLICT',
-          `root L0 terminal receipt for correction ${attempt} is foreign or corrupt`,
-        )
-      }
-      return receipt
-    }
-    const onTerminalResult = (terminalResult, terminalEvidence, correctionAttempt) => {
-      if (!terminalEvidence || !/^[a-f0-9]{64}$/.test(terminalEvidence.assignmentHash || '') ||
-          terminalEvidence.sessionId !== rootContinuationId ||
-          !terminalEvidence.controlSessionId) {
-        throw new SupervisorIntegrationError(
-          'CRASH_ADOPTION_CONFLICT',
-          'root L0 terminal result lacks its exact dispatch/session binding',
-        )
-      }
-      const {
-        candidateHash: _candidateHash,
-        completionRequested: _completionRequested,
-        contextId: _contextId,
-        events: _events,
-        evidenceHashes: _evidenceHashes,
-        recommendation: _recommendation,
-        usage,
-        usageStreamed,
-        ...decision
-      } = terminalResult
-      const submitted = {
-        decision: terminalResult.decision || decision,
-        // The decision deadline is run-global.  Persist the original L0 start
-        // boundary with the terminal receipt so adopting the already-finished
-        // root turn cannot reset (or invert) its four-minute interval.
-        startedAtMs: startedAt,
-        submittedAtMs: this.now(),
-        usage,
-        usageStreamed: usageStreamed === true,
-      }
-      const body = {
-        schemaVersion: 1,
-        runId: this.options.runId,
-        activationId: this.activation.id,
-        admittedGeneration: this.activation.generation,
-        leaseId: rootLease.id,
-        assignmentId: 'root-route-decision',
-        correctionAttempt,
-        assignmentHash: terminalEvidence.assignmentHash,
-        sessionId: terminalEvidence.controlSessionId,
-        continuationId: terminalEvidence.sessionId,
-        requestEnvelopeHash: this.requestPointer.hash,
-        candidateHash: null,
-        resultHash: hashText(JSON.stringify(submitted)),
-        rawOutputHash: terminalEvidence.rawOutputHash,
-        eventStreamHash: terminalEvidence.eventStreamHash,
-        submitted,
-      }
-      const receipt = { ...body, receiptHash: hashText(JSON.stringify(body)) }
-      const relative = rootReceiptLocation(correctionAttempt)
-      const absolute = this.record.resolve(relative)
-      if (fs.existsSync(absolute)) {
-        if (JSON.stringify(readRegularJson(absolute, 'root L0 terminal receipt').parsed) !== JSON.stringify(receipt)) {
-          throw new SupervisorIntegrationError('CRASH_ADOPTION_CONFLICT', 'root L0 terminal receipt changed after persistence')
-        }
-      } else {
-        this.record.write(relative, `${JSON.stringify(receipt, null, 2)}\n`)
-      }
-      persistRootCheckpoint('RESULT_COMMITTED', null, {
-        resultCommit: {
-          assignmentId: 'root-route-decision',
-          assignmentHash: receipt.assignmentHash,
-          leaseId: rootLease.id,
-          sessionId: receipt.sessionId,
-          continuationId: receipt.continuationId,
-          resultHash: receipt.resultHash,
-          receiptHash: receipt.receiptHash,
-          candidateHash: null,
-        },
-      }, {
-        recoveryFrontier: { ...recoveryFrontier, acceptedResultIds: [receipt.receiptHash] },
-      })
-      // The RESULT_COMMITTED verifier requires the exact lease/thread to
-      // remain OPEN in the same durable scheduler checkpoint.  Remove the
-      // thread only after the record and atomic snapshot are both durable.
-      this.recoveryThreads.delete(rootLease.id)
-      armRootCorrectionRotation(receipt.receiptHash)
-      return receipt
-    }
-    const finish = result => {
-      this._recordAdmissionComponent('routeDecision', Math.max(0, this.monotonicNow() - admissionStartedAt))
-      return result
-    }
-    const conservativeCompletion = causeCode => ({
-      decision: compileConservativeCompletionDecision({
-        requestedResult: this.canonicalMissionProjection.canonicalMission,
-        requestEnvelopeHash: this.requestPointer.hash,
-        targetIdentity: this.options.targetIdentity,
-        providerCapabilities: this.providerCapabilities,
-        budget: this.budget.status({ forWork: true }),
-        nowMs: this.now(),
-        causeCode,
-        descriptiveRecommendation: analysis && (analysis.recommendation || analysis),
-      }),
-      submittedAtMs: this.now(),
-      usage: { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 },
-      usageStreamed: true,
-    })
-    const decide = correctionAttempts => {
-      return this.options.decideRoute({
-        analysis,
-        correctionAttempts,
-        requestPointer: this.requestPointer,
-        settings: this.settings,
-        route: null,
-        sessionId: this.rootCallers.runOwner.sessionId,
-        continuationId: rootContinuationId,
-        onLaunchPrepared,
-        onSessionIdentified,
-        onUsageDelta,
-        onTerminalResult: (result, evidence) => onTerminalResult(result, evidence, correctionAttempts),
-      })
-    }
-    const adoptedAcceptedRootResults = adoptedRoot && adoptedRoot.binding &&
-      adoptedRoot.binding.frontier && adoptedRoot.binding.frontier.acceptedResultIds || []
-    if (adoptedAcceptedRootResults.length > 1) {
+    if (adoptedRoot) {
+      // Legacy model-authored root turns predate the durable provider
+      // allowance protocol. Their possible upstream spend cannot be
+      // reconstructed safely, so never continue or replace that turn.
       throw new SupervisorIntegrationError(
         'CRASH_ADOPTION_CONFLICT',
-        'root L0 recovery state contains more committed correction results than the one-correction contract permits',
+        'legacy external L0 continuation cannot be adopted under bounded provider accounting',
       )
     }
-    // A rotated binding has already consumed attempt 0's durable receipt.
-    // Resume directly at the physical correction attempt instead of trying to
-    // authorize or replay the already-consumed result a second time.
-    let correctionAttempts = adoptedAcceptedRootResults.length
-    while (true) {
-      let submitted
-      try {
-        const committed = adoptedRoot && readRootReceipt(correctionAttempts)
-        if (committed) armRootCorrectionRotation(committed.receiptHash)
-        submitted = committed ? committed.submitted : await decide(correctionAttempts)
-      } catch (error) {
-        if (error && (error.code === 'ROUTE_DECISION_TIMEOUT' ||
-            PROVIDER_TRANSPORT_AVAILABILITY_CODES.has(error.code))) {
-          // The recovery model emitted no usable decision before the finite
-          // process watchdog. Continue through one conservative local worker
-          // and independent checker instead of turning elapsed time into a
-          // control-plane terminal state.
-          submitted = conservativeCompletion(error.code)
-        } else {
-          try { rootLease.fail(error, {}) } catch {}
-          persistTerminalSession(this.budget, rootSessionId, { status: 'FAILED', evidenceHashes: [] }, error)
-          throw error
-        }
-      }
-      if (submitted && submitted.usageStreamed !== true && submitted.usage) {
-        const usageVerdict = onUsageDelta(submitted.usage)
-        if (usageVerdict.continue !== true) {
-          const error = new SupervisorIntegrationError('BUDGET_EXHAUSTED', 'root L0 usage exhausted the scheduler budget')
-          rootLease.fail(error, {})
-          persistTerminalSession(
-            this.budget,
-            rootSessionId,
-            { status: 'PARTIAL', evidenceHashes: [] },
-            error,
-          )
-          throw error
-        }
-      }
-      const submittedAtMonotonic = this.monotonicNow()
-      let result = evaluateL0Decision({
-        // Model-authored wall-clock fields are evidence only.  Admission and
-        // every correction share this one supervisor-owned monotonic window.
-        startedAtMs: admissionStartedAt,
-        submittedAtMs: submittedAtMonotonic,
-        nowMs: submittedAtMonotonic,
-        decision: submitted.decision,
-        requestText: this.options.mission,
-        correctionAttempts,
-        environment: this.options.baseEnvironment || process.env,
-      })
-      if (result.status === 'ROUTE_DECISION_INVALID' && result.correction_allowed) {
-        await this._runtimeTransition('ROUTE_DECISION_INVALID_FIRST', 'L0_ROUTE_DECISION')
-        correctionAttempts += 1
-        rootContinuationId = null
-        continue
-      }
-      if (!result.start_workers && result.status !== 'WAITING_USER') {
-        // Two malformed recovery turns are model evidence, not authority to
-        // abandon the requested work. Freeze the same conservative local
-        // completion decision used by the watchdog path.
-        submitted = conservativeCompletion(result.status)
-        const fallbackAt = this.monotonicNow()
-        result = evaluateL0Decision({
-          startedAtMs: admissionStartedAt,
-          submittedAtMs: fallbackAt,
-          nowMs: fallbackAt,
-          decision: submitted.decision,
-          requestText: this.options.mission,
-          correctionAttempts,
-          environment: this.options.baseEnvironment || process.env,
-        })
-      }
-      if (result.status === 'WAITING_USER' &&
-          !automaticWaitingRequiresUserAuthority(
-            analysis,
-            this.options.verifyAutomaticWaitingAuthority,
-          )) {
-        // Model-authored uncertainty is not authority to hand the task back.
-        // Only typed material user decisions or consequential irreversible
-        // external effects may suspend an automatic run; ordinary unknowns
-        // compile to the local one-worker completion path.
-        submitted = conservativeCompletion('MODEL_WAITING_USER_COLLAPSED')
-        const fallbackAt = this.monotonicNow()
-        result = evaluateL0Decision({
-          startedAtMs: admissionStartedAt,
-          submittedAtMs: fallbackAt,
-          nowMs: fallbackAt,
-          decision: submitted.decision,
-          requestText: this.options.mission,
-          correctionAttempts,
-          environment: this.options.baseEnvironment || process.env,
-        })
-      }
-      if (result.decision && this.record.write) {
-        writeRouteDecisionArtifacts(this.record, result.decision)
-      }
-      rootLease.complete({})
-      this.recoveryThreads.delete(rootLease.id)
-      persistRootCheckpoint('LEASE_COMPLETED')
-      persistTerminalSession(this.budget, rootSessionId, {
-        status: result.start_workers ? 'DONE' : 'FAILED',
-        evidenceHashes: result.decision ? [hashText(JSON.stringify(result.decision))] : [],
-      })
-      if (!result.start_workers) {
-        if (result.status === 'WAITING_USER') {
-          await this._runtimeTransition('ROUTE_DECISION_NEEDS_USER', 'WAITING_USER')
-        } else {
-          await this._runtimeTransition('ROUTE_DECISION_INVALID_FINAL', 'RELEASING_LOCK')
-        }
-      }
-      return finish(result)
-    }
+    // L0 route compilation is controller-local and consumes no provider
+    // tokens. Every actual model turn therefore enters through the same
+    // scheduler reservation, durable provider allowance, and tool high-water
+    // seam used by the route analyst, workers, and independent checkers.
+    return this._runDeterministicL0Decision(analysis)
   }
-
   async _runDeterministicL0Decision(analysis) {
     const admissionStartedAt = this.monotonicNow()
     const finish = result => {
@@ -10154,23 +11246,41 @@ class CodexSupervisorRuntime {
       })
     }
 
-    let submitted
-    try {
-      submitted = await this.options.decideRoute({
-        analysis,
-        correctionAttempts: 0,
-        requestPointer: this.requestPointer,
-        settings: this.settings,
-        route: null,
-        sessionId: null,
-        continuationId: null,
-      })
-    } catch (error) {
-      if (!error || ![
-        'ROUTE_DECISION_TIMEOUT', 'ROUTE_DECISION_INVALID', 'WAITING_USER',
-        ...PROVIDER_TRANSPORT_AVAILABILITY_CODES,
-      ].includes(error.code)) throw error
-      submitted = conservativeCompletion(error.code)
+    const recommendation = analysis && (analysis.recommendation || analysis)
+    let submitted = null
+    if (analysis && analysis.status === 'WAITING_USER' && recommendation) {
+      submitted = {
+        decision: createWaitingUserDecision(recommendation.userInputNeeded, {
+          requestEnvelopeHash: this.requestPointer.hash,
+          recommendationHash: hashText(JSON.stringify(recommendation)),
+          nowMs: this.now(),
+        }),
+        submittedAtMs: this.now(),
+        usage: { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 },
+        usageStreamed: true,
+      }
+    } else if (recommendation && recommendation.preWorkResult === 'CONTINUE') {
+      try {
+        submitted = {
+          decision: compileAutomaticRouteDecision({
+            recommendation,
+            requestedResult: this.canonicalMissionProjection.canonicalMission,
+            requestEnvelopeHash: this.requestPointer.hash,
+            targetIdentity: this.options.targetIdentity,
+            providerCapabilities: this.providerCapabilities,
+            budget: this.budget.status({ forWork: true }),
+            nowMs: this.now(),
+          }),
+          submittedAtMs: this.now(),
+          usage: { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 },
+          usageStreamed: true,
+        }
+      } catch (error) {
+        if (!error || error.code !== 'ROUTE_DECISION_INVALID') throw error
+      }
+    }
+    if (!submitted) {
+      submitted = conservativeCompletion('DETERMINISTIC_ROUTE_ANALYSIS_FALLBACK')
     }
 
     let result = evaluate(submitted, 0)
@@ -11518,11 +12628,13 @@ class CodexSupervisorRuntime {
           'fresh crash replay requires the exact typed acceptance obligations',
         )
       }
-      const replayCheckerCount = Math.max(1, Number(
-        decision.independentCheckingPlan && decision.independentCheckingPlan.checkerCount || 1,
-      ))
+      // Live independent seats each receive the complete acceptance matrix;
+      // crash replay must be byte-for-byte equivalent in semantic scope. The
+      // old modulo partition narrowed a resumed two-seat checker to half the
+      // obligations (and could conflict with a retained continuation's prior
+      // context), so recovery now reconstructs the same complete matrix for
+      // every checker seat and scratch confirmation.
       const resumedVerificationObligations = replayVerificationObligations
-        .filter((_, obligationIndex) => obligationIndex % replayCheckerCount === index)
         .map(obligation => structuredClone(obligation))
       const resumedPlanPointer = saved.logicalRole === 'plan-checker' && typeof this.options.planPointer === 'function'
         ? this.options.planPointer('ROADMAP') : null
@@ -11671,6 +12783,7 @@ class CodexSupervisorRuntime {
         continuationId: saved.crashBinding.continuationId,
         adoptedLease: lease,
         adoptedBinding: saved.crashBinding,
+        adoptedReportedUsage: saved.reported,
       })
     }
     return results
@@ -12048,6 +13161,353 @@ class CodexSupervisorRuntime {
     return true
   }
 
+  _durableAccountingRecords() {
+    const authority = this.options && this.options.accountingAuthority
+    if (!authority) return []
+    if (typeof authority.replay !== 'function') {
+      throw new SupervisorIntegrationError(
+        'RUN_RECORD_SCHEMA_INCOMPATIBLE',
+        'accounting authority lacks replay() for provider recovery',
+      )
+    }
+    const replayed = authority.replay()
+    if (!replayed || !Array.isArray(replayed.records)) {
+      throw new SupervisorIntegrationError(
+        'CODEX_USAGE_INVALID',
+        'accounting authority returned no durable provider record list',
+      )
+    }
+    return replayed.records
+  }
+
+  _pendingProviderEnvelope(reservationId, requestOrdinal = null) {
+    if (!(this.pendingProviderEnvelopes instanceof Map)) {
+      this.pendingProviderEnvelopes = new Map()
+    }
+    const matches = [...this.pendingProviderEnvelopes.values()].filter(envelope =>
+      envelope.reservationId === reservationId &&
+      (requestOrdinal === null || envelope.requestOrdinal === requestOrdinal))
+    if (matches.length > 1) {
+      throw new SupervisorIntegrationError(
+        'CODEX_USAGE_INVALID',
+        'one child reservation has multiple live provider request allowances',
+      )
+    }
+    return matches[0] || null
+  }
+
+  _recordChildProviderRequestStart(reservationId, sessionId, evidence) {
+    const reservation = this.childTokenReservations.get(reservationId)
+    const priorLeaseModelTokens = evidence && evidence.priorLeaseModelTokens
+    if (!reservation || typeof sessionId !== 'string' || !sessionId || !evidence ||
+        evidence.tokenLimit !== reservation.limit ||
+        evidence.maximumUnaccountedTokens !== reservation.remaining ||
+        !Number.isSafeInteger(evidence.requestOrdinal) || evidence.requestOrdinal <= 0 ||
+        evidence.completedRequestCount !== evidence.requestOrdinal - 1 ||
+        !Number.isSafeInteger(priorLeaseModelTokens) || priorLeaseModelTokens < 0 ||
+        billableModelTokens(evidence.accountedUsage) !== reservation.consumed ||
+        this._pendingProviderEnvelope(reservationId)) {
+      throw new SupervisorIntegrationError(
+        'CODEX_USAGE_INVALID',
+        'provider request start does not bind the exact live child allowance',
+      )
+    }
+    const sessionHash = hashText(sessionId)
+    const key = codexProviderEnvelopeKey(sessionHash, evidence.requestOrdinal)
+    const causeId = codexProviderPendingCause(
+      sessionHash,
+      evidence.requestOrdinal,
+      reservation.limit,
+      reservation.remaining,
+      priorLeaseModelTokens,
+    )
+    this._checkpointAccounting({
+      kind: 'CHECKPOINT',
+      causeId,
+      humanDescription: 'Persist the maximum unaccounted token allowance before starting one upstream provider request.',
+    }, {})
+    const envelope = {
+      key,
+      reservationId,
+      sessionHash,
+      requestOrdinal: evidence.requestOrdinal,
+      tokenLimit: reservation.limit,
+      maximumUnaccountedTokens: reservation.remaining,
+      consumedAtStart: reservation.consumed,
+      priorLeaseModelTokens,
+      exactUsageTokens: 0,
+      exactUsageRecorded: false,
+      budgetConsumedTokens: 0,
+      upperBoundChargedTokens: 0,
+    }
+    this.pendingProviderEnvelopes.set(key, envelope)
+    return Object.freeze({ ...envelope, causeId })
+  }
+
+  _recordChildProviderRequestSettled(reservationId, sessionId, evidence) {
+    if (!evidence || typeof sessionId !== 'string' || !sessionId ||
+        !Number.isSafeInteger(evidence.requestOrdinal) || evidence.requestOrdinal <= 0 ||
+        !CODEX_PROVIDER_SETTLEMENT_DISPOSITIONS.has(evidence.disposition)) {
+      throw new SupervisorIntegrationError(
+        'CODEX_USAGE_INVALID',
+        'provider request settlement evidence is invalid',
+      )
+    }
+    const envelope = this._pendingProviderEnvelope(reservationId, evidence.requestOrdinal)
+    const sessionHash = hashText(sessionId)
+    const accountedDisposition = evidence.disposition === 'ACCOUNTED'
+    const upperBoundDisposition = [
+      'UPPER_BOUND_CHARGED', 'FINAL_UPPER_BOUND_CHARGED',
+    ].includes(evidence.disposition)
+    if (!envelope || envelope.sessionHash !== sessionHash ||
+        evidence.tokenLimit !== envelope.tokenLimit ||
+        evidence.maximumUnaccountedTokens !== envelope.maximumUnaccountedTokens ||
+        (accountedDisposition && !envelope.exactUsageRecorded) ||
+        (upperBoundDisposition &&
+          envelope.exactUsageTokens + envelope.upperBoundChargedTokens !==
+            envelope.maximumUnaccountedTokens)) {
+      throw new SupervisorIntegrationError(
+        'CODEX_USAGE_INVALID',
+        'provider request settlement does not retire its exact pending allowance',
+      )
+    }
+    const causeId = codexProviderSettledCause(
+      sessionHash,
+      evidence.requestOrdinal,
+      evidence.disposition,
+    )
+    this._checkpointAccounting({
+      kind: 'CHECKPOINT',
+      causeId,
+      humanDescription: 'Retire one durably accounted upstream provider request allowance.',
+    }, {})
+    this.pendingProviderEnvelopes.delete(envelope.key)
+    return Object.freeze({ ...envelope, disposition: evidence.disposition, causeId })
+  }
+
+  _codexToolCallHighWater(continuationId) {
+    if (typeof continuationId !== 'string' || !continuationId) {
+      throw new SupervisorIntegrationError(
+        'CODEX_SESSION_ID_MISSING',
+        'tool-call accounting requires the exact provider continuation identity',
+      )
+    }
+    if (!(this.childToolCallHighWater instanceof Map)) this.childToolCallHighWater = new Map()
+    const continuationHash = hashText(continuationId)
+    // A first-generation launch cannot have a predecessor tool observation.
+    // Avoid making replay() a compatibility requirement until crash recovery
+    // can actually need durable high-water evidence.
+    const durable = this.activation && this.activation.generation > 1
+      ? codexToolCallHighWater(this._durableAccountingRecords(), continuationHash)
+      : 0
+    const local = this.childToolCallHighWater.get(continuationHash) || 0
+    const highWater = Math.max(durable, local)
+    this.childToolCallHighWater.set(continuationHash, highWater)
+    return highWater
+  }
+
+  _recordChildToolCall(continuationId, evidence) {
+    const prior = this._codexToolCallHighWater(continuationId)
+    if (!evidence || evidence.attemptedCount !== prior + 1 ||
+        typeof evidence.itemType !== 'string' || !evidence.itemType ||
+        !['started', 'completed', 'failed', 'cancelled'].includes(evidence.observedPhase)) {
+      throw new SupervisorIntegrationError(
+        'CODEX_USAGE_INVALID',
+        'tool-call observation does not advance the exact continuation high-water by one',
+      )
+    }
+    const continuationHash = hashText(continuationId)
+    const causeId = codexToolCallCause(continuationHash, evidence.attemptedCount)
+    this._checkpointAccounting({
+      kind: 'CHECKPOINT',
+      causeId,
+      humanDescription: 'Persist one observed direct tool lifecycle before the bounded child can continue.',
+    }, {})
+    this.childToolCallHighWater.set(continuationHash, evidence.attemptedCount)
+    return Object.freeze({ continuationHash, causeId, ...evidence })
+  }
+
+  _recoverUnresolvedProviderEnvelopes() {
+    if (!this.activation || this.activation.generation <= 1 ||
+        !this.options || !this.options.accountingAuthority) return Object.freeze([])
+    const unresolved = unresolvedCodexProviderEnvelopes(this._durableAccountingRecords())
+    if (!(this.recoveredProviderEnvelopeHighWater instanceof Map)) {
+      this.recoveredProviderEnvelopeHighWater = new Map()
+    }
+    const receipts = []
+    for (const envelope of unresolved) {
+      const unaccounted = envelope.exactUsageRecorded
+        ? 0
+        : envelope.maximumUnaccountedTokens - envelope.upperBoundChargedTokens
+      const snapshot = this.budget.snapshot()
+      const activationRemaining = Math.max(0, snapshot.limits.tokens - snapshot.tokensUsed)
+      const chargedTokens = Math.min(unaccounted, activationRemaining)
+      if (chargedTokens !== unaccounted) {
+        throw new SupervisorIntegrationError(
+          'BUDGET_RESET_DETECTED',
+          'durable pending provider allowance no longer fits its reserved activation ceiling',
+          { requiredCharge: unaccounted, activationRemaining },
+        )
+      }
+      if (chargedTokens > 0) {
+        this._checkpointAccounting({
+          kind: 'TOKEN_USAGE_RECORDED',
+          causeId: codexProviderChargeCause(
+            envelope.sessionHash,
+            envelope.requestOrdinal,
+            `RECOVERY_${this.activation.generation}`,
+          ),
+          humanDescription: 'Charge the unresolved provider request allowance before admitting resumed work.',
+        }, {
+          tokenUsage: {
+            noncachedInput: chargedTokens,
+            cachedInput: 0,
+            output: 0,
+            reasoning: 0,
+          },
+        })
+        this.budget.consumeTokens(chargedTokens, { requiredCompletion: true })
+      }
+      const disposition = envelope.exactUsageRecorded
+        ? 'RECOVERY_ACCOUNTED' : 'RECOVERY_UPPER_BOUND_CHARGED'
+      this._checkpointAccounting({
+        kind: 'CHECKPOINT',
+        causeId: codexProviderSettledCause(
+          envelope.sessionHash,
+          envelope.requestOrdinal,
+          disposition,
+        ),
+        humanDescription: 'Retire one recovered provider request allowance before any resumed launch.',
+      }, {})
+      const currentLaunchSpent = envelope.tokenLimit - envelope.maximumUnaccountedTokens +
+        (envelope.exactUsageRecorded
+          ? envelope.exactUsageTokens
+          : envelope.maximumUnaccountedTokens)
+      const leaseHighWater = envelope.priorLeaseModelTokens + currentLaunchSpent
+      this.recoveredProviderEnvelopeHighWater.set(
+        envelope.sessionHash,
+        Math.max(
+          this.recoveredProviderEnvelopeHighWater.get(envelope.sessionHash) || 0,
+          leaseHighWater,
+        ),
+      )
+      receipts.push(Object.freeze({
+        key: envelope.key,
+        disposition,
+        chargedTokens,
+        leaseHighWater,
+      }))
+    }
+    return Object.freeze(receipts)
+  }
+
+  _reserveChildTokenEnvelope(reservationId, record) {
+    if (typeof reservationId !== 'string' || !reservationId ||
+        this.childTokenReservations.has(reservationId)) {
+      throw new SupervisorIntegrationError(
+        'BUDGET_CONFIG_INVALID',
+        'child provider token reservation identity is missing or duplicated',
+      )
+    }
+    const snapshot = this.budget.snapshot()
+    const outstanding = [...this.childTokenReservations.values()]
+      .reduce((sum, reservation) => sum + reservation.remaining, 0)
+    const available = snapshot.limits.tokens - snapshot.tokensUsed - outstanding
+    const roleCeiling = codexChildSpendRoleLimit(record)
+    const priorLeaseModelTokens = record && record.priorLeaseModelTokens === undefined
+      ? 0 : record && record.priorLeaseModelTokens
+    if (!Number.isSafeInteger(priorLeaseModelTokens) || priorLeaseModelTokens < 0 ||
+        priorLeaseModelTokens > roleCeiling) {
+      throw new SupervisorIntegrationError(
+        'BUDGET_CONFIG_INVALID',
+        'prior child usage exceeds its cumulative provider spend ceiling',
+      )
+    }
+    const roleLimit = roleCeiling - priorLeaseModelTokens
+    const limit = Math.min(roleLimit, available)
+    if (!Number.isSafeInteger(limit) || limit <= 0) {
+      throw new SupervisorIntegrationError(
+        'BUDGET_EXHAUSTED',
+        'activation token budget cannot reserve another bounded child provider envelope',
+        {
+          activationTokenLimit: snapshot.limits.tokens,
+          tokensUsed: snapshot.tokensUsed,
+          tokensReserved: outstanding,
+          roleTokenLimit: roleLimit,
+          priorLeaseModelTokens,
+        },
+      )
+    }
+    const reservation = {
+      reservationId,
+      limit,
+      remaining: limit,
+      consumed: 0,
+      priorLeaseModelTokens,
+    }
+    this.childTokenReservations.set(reservationId, reservation)
+    return reservation
+  }
+
+  _consumeChildTokenReservation(reservationId, count, options = {}) {
+    const reservation = this.childTokenReservations.get(reservationId)
+    if (!reservation || !Number.isSafeInteger(count) || count < 0) {
+      throw new SupervisorIntegrationError(
+        'BUDGET_USAGE_INVALID',
+        'child provider token usage lacks its exact live reservation',
+      )
+    }
+    if (count > reservation.remaining) {
+      // Preserve truthful accounting even if an unattested provider somehow
+      // violates the controller envelope. The controlled relay reports exact
+      // usage here first, then rejects the response before child acceptance.
+      this.budget.consumeTokens(count, { requiredCompletion: true })
+      reservation.consumed += count
+      reservation.remaining = 0
+      throw new SupervisorIntegrationError(
+        'CODEX_CHILD_QUOTA_BOUND_VIOLATED',
+        'child provider usage exceeded its centrally reserved activation envelope',
+        { reserved: reservation.limit, consumed: reservation.consumed },
+      )
+    }
+    this.budget.consumeTokens(count, options)
+    reservation.consumed += count
+    reservation.remaining -= count
+    return Object.freeze({
+      limit: reservation.limit,
+      consumed: reservation.consumed,
+      remaining: reservation.remaining,
+    })
+  }
+
+  _chargeUnknownChildTokenUpperBound(reservationId) {
+    const reservation = this.childTokenReservations.get(reservationId)
+    if (!reservation) {
+      throw new SupervisorIntegrationError(
+        'BUDGET_USAGE_INVALID',
+        'unknown provider spend lacks its exact live child reservation',
+      )
+    }
+    const charged = reservation.remaining
+    const state = this._consumeChildTokenReservation(reservationId, charged, {
+      // The provider handoff already occurred. This is conservative accounting
+      // of possibly incurred spend, never admission for new optional work.
+      requiredCompletion: true,
+    })
+    return Object.freeze({ charged, ...state })
+  }
+
+  _releaseChildTokenEnvelope(reservationId) {
+    const reservation = this.childTokenReservations.get(reservationId)
+    if (!reservation) return null
+    this.childTokenReservations.delete(reservationId)
+    return Object.freeze({
+      limit: reservation.limit,
+      consumed: reservation.consumed,
+      released: reservation.remaining,
+    })
+  }
+
   async _launchThroughScheduler(scheduler, request) {
     // Economic hints cannot mint required topology. The built-in executor
     // brands its exact finite graph before calling launchChild; crash adoption
@@ -12097,12 +13557,9 @@ class CodexSupervisorRuntime {
       physicalRole,
       providerRole,
     })
-    const findingIds = canonicalRoleFindingIds(request.findingIds, request.finding_ids)
-    if (findingIds.length === 0) {
-      findingIds.push(assignmentLocalFindingId(request, {
-        requestEnvelopeHash: this.requestPointer && this.requestPointer.hash,
-      }, this.assignmentFindingIdRegistry))
-    }
+    const findingIds = canonicalAssignmentFindingIds(request, {
+      requestEnvelopeHash: this.requestPointer && this.requestPointer.hash,
+    }, this.assignmentFindingIdRegistry)
     verifyRequestPointer(this.requestPointer)
     const missionBinding = bindCanonicalMissionForChild(this.canonicalMissionProjection, {
       sourceRequestHash: this.activation.missionHash,
@@ -12115,6 +13572,52 @@ class CodexSupervisorRuntime {
     const adoptedBinding = request.adoptedBinding || null
     const adoptedLease = request.adoptedLease || null
     const executorKey = request.executorKey || request.equivalenceKey || request.workItemId
+    let priorLeaseModelTokens = 0
+    let priorToolCallCount = 0
+    if (adoptedLease) {
+      const priorUsage = request.adoptedReportedUsage
+      if (!priorUsage || !['noncachedInput', 'cachedInput', 'output', 'reasoning']
+          .every(field => Number.isSafeInteger(priorUsage[field]) && priorUsage[field] >= 0)) {
+        throw new SupervisorIntegrationError(
+          'CRASH_ADOPTION_CONFLICT',
+          'adopted child lacks its exact cumulative scheduler usage',
+        )
+      }
+      const savedUsageTokens = billableModelTokens(priorUsage)
+      const recoveredHighWater = adoptedBinding && adoptedBinding.sessionId &&
+        this.recoveredProviderEnvelopeHighWater instanceof Map
+        ? this.recoveredProviderEnvelopeHighWater.get(hashText(adoptedBinding.sessionId)) || 0
+        : 0
+      priorLeaseModelTokens = Math.max(savedUsageTokens, recoveredHighWater)
+      const acceptedRoleLimit = codexChildTokenRoleLimit({
+        logicalRole: policy.child,
+        route: request.route,
+      })
+      if (priorLeaseModelTokens >= acceptedRoleLimit) {
+        throw new SupervisorIntegrationError(
+          'CHILD_TOKEN_LIMIT_EXHAUSTED',
+          'crash-adopted child has no remaining accepted-result token allowance',
+          { limit: acceptedRoleLimit, priorLeaseModelTokens },
+        )
+      }
+      const toolRoleLimit = codexChildToolCallLimit({
+        logicalRole: policy.child,
+        route: request.route,
+      })
+      const observedToolHighWater = continuationId
+        ? this._codexToolCallHighWater(continuationId) : 0
+      if (observedToolHighWater > toolRoleLimit) {
+        throw new SupervisorIntegrationError(
+          'CHILD_TOOL_CALL_LIMIT_EXHAUSTED',
+          'crash-adopted child had already exceeded its cumulative tool-call limit',
+          { limit: toolRoleLimit, attemptedCount: observedToolHighWater },
+        )
+      }
+      // JSON lifecycle notification can lag local tool execution. An OPEN
+      // crash-adopted continuation therefore receives no fresh tool allowance,
+      // even if the predecessor stopped before persisting every observed item.
+      priorToolCallCount = toolRoleLimit
+    }
     let repairContextBinding = null
     if (request.repairOf) {
       const prior = this.workerContexts.get(request.repairOf)
@@ -12835,8 +14338,17 @@ class CodexSupervisorRuntime {
     let checkerSnapshotBefore = null
     let persistProviderTransportFailure = null
     let inspectMutationCompletion = null
+    let completeUsageObserved = false
+    let unknownProviderSpendReceipt = null
+    let childTokenReservation = null
+    let launchRecord = null
     const transcriptEvidenceTracker = createTranscriptEvidenceTracker()
     try {
+    childTokenReservation = this._reserveChildTokenEnvelope(reservationId, {
+      logicalRole: policy.child,
+      route: request.route,
+      priorLeaseModelTokens,
+    })
     if (!adoptedLease && request.route !== 'PRE_ROUTE' && !this.firstChildStartupRecorded) {
       const startupAdmission = scheduler.recordAdmissionComponent(
         'firstChildStartup',
@@ -12916,8 +14428,13 @@ class CodexSupervisorRuntime {
           recoveryFrontier,
         })
       }
+      const recoveryCauseKind = [
+        'TOOL_CALL_RECORDED',
+        'PROVIDER_REQUEST_PENDING',
+        'PROVIDER_REQUEST_SETTLED',
+      ].includes(causeKind) ? 'CHECKPOINT' : causeKind
       this._persistRecoveryCheckpoint({
-        kind: causeKind,
+        kind: recoveryCauseKind,
         causeId: `scheduler:${this.activation.generation}:${lease.id}:${causeKind.toLowerCase()}:${usageSequence}`,
         humanDescription: `Persist scheduler ${lease.id} at the ${causeKind.toLowerCase()} recovery boundary.`,
       }, {
@@ -13070,7 +14587,7 @@ class CodexSupervisorRuntime {
         externalLocalResources: externalLocalAdmission.resources,
       })
     }
-    const launchRecord = {
+    launchRecord = {
       activationId: this.activation.id,
       generation: this.activation.generation,
       runId: this.options.runId,
@@ -13079,6 +14596,13 @@ class CodexSupervisorRuntime {
       schedulerAttempt: lease.attempt,
       sessionId,
       reservationId,
+      // This controller-issued value is the lesser of the role ceiling and
+      // activation tokens not consumed or reserved by concurrent children.
+      // The adapter applies it to both the local relay and Codex's native
+      // rollout fallback; model-visible input cannot increase it.
+      providerTokenLimit: childTokenReservation.limit,
+      priorLeaseModelTokens,
+      priorToolCallCount,
       // This projection is controller-owned: explicit scheduler estimates win
       // per category, while an omitted estimate falls back to the admitted
       // lane token bound. It is consumed only when a clean owned Codex exit
@@ -13138,6 +14662,43 @@ class CodexSupervisorRuntime {
               ? signal.elapsedMs : Math.max(0, this.monotonicNow() - this.admissionStartedAt),
           }),
       onSessionIdentified: (identified, evidence) => persistSchedulerCheckpoint(identified, 'THREAD_STARTED', evidence),
+      onToolCallObserved: evidence => {
+        const toolContinuationId = evidence && evidence.continuationId ||
+          identifiedContinuationId || continuationId
+        const receipt = this._recordChildToolCall(
+          toolContinuationId,
+          evidence,
+        )
+        persistSchedulerCheckpoint(
+          toolContinuationId,
+          'TOOL_CALL_RECORDED',
+        )
+        return receipt
+      },
+      onProviderRequestStarted: evidence => {
+        const receipt = this._recordChildProviderRequestStart(
+          reservationId,
+          sessionId,
+          evidence,
+        )
+        persistSchedulerCheckpoint(
+          identifiedContinuationId || continuationId,
+          'PROVIDER_REQUEST_PENDING',
+        )
+        return receipt
+      },
+      onProviderRequestSettled: evidence => {
+        const receipt = this._recordChildProviderRequestSettled(
+          reservationId,
+          sessionId,
+          evidence,
+        )
+        persistSchedulerCheckpoint(
+          identifiedContinuationId || continuationId,
+          'PROVIDER_REQUEST_SETTLED',
+        )
+        return receipt
+      },
       normalizeTerminalResult: CHECKER_ROLES.has(policy.child)
         ? canonicalizeCheckerTerminalResult : null,
       onTerminalResult: (terminalResult, terminalEvidence) => {
@@ -13333,13 +14894,25 @@ class CodexSupervisorRuntime {
         // result/lease binding unverifiable.
         this.recoveryThreads.delete(lease.id)
       },
-      onUsageDelta: (delta, cumulative = null) => {
-        const callbackKey = hashText(stableStringify({ delta, cumulative }))
+      onUsageDelta: (delta, cumulative = null, providerEvidence = null) => {
+        const callbackKey = hashText(stableStringify({ delta, cumulative, providerEvidence }))
         if (completedUsageCallbacks.has(callbackKey)) return completedUsageCallbacks.get(callbackKey)
         if (pendingUsageCallback && pendingUsageCallback.callbackKey !== callbackKey) {
           throw new SupervisorIntegrationError(
             'CODEX_USAGE_INVALID',
             'a later usage callback arrived before the prior exact delta reconciled',
+          )
+        }
+        const providerEnvelope = providerEvidence
+          ? this._pendingProviderEnvelope(reservationId, providerEvidence.requestOrdinal)
+          : null
+        if (providerEvidence && (!providerEnvelope ||
+            providerEvidence.tokenLimit !== providerEnvelope.tokenLimit ||
+            providerEvidence.maximumUnaccountedTokens !==
+              providerEnvelope.maximumUnaccountedTokens)) {
+          throw new SupervisorIntegrationError(
+            'CODEX_USAGE_INVALID',
+            'provider usage does not bind its exact pending request allowance',
           )
         }
         const state = pendingUsageCallback || {
@@ -13371,34 +14944,176 @@ class CodexSupervisorRuntime {
           }
         }
         if (!state.ledgerPersisted) {
+          const causeId = providerEnvelope
+            ? codexProviderUsageCause(
+                providerEnvelope.sessionHash,
+                providerEnvelope.requestOrdinal,
+                state.sequence,
+              )
+            : `codex-jsonl:${hashText(sessionId).slice(0, 24)}:${state.sequence}`
           this._checkpointAccounting({
             kind: 'TOKEN_USAGE_RECORDED',
-            causeId: `codex-jsonl:${hashText(sessionId).slice(0, 24)}:${state.sequence}`,
+            causeId,
             humanDescription: 'Persist the complete streamed Codex usage delta before allowing the child to continue.',
           }, { costMicrounits: state.costMicrounits, tokenUsage: delta })
           state.ledgerPersisted = true
+          if (providerEnvelope) {
+            providerEnvelope.exactUsageTokens = billableModelTokens(delta)
+            providerEnvelope.exactUsageRecorded = true
+          }
         }
         if (!state.budgetConsumed) {
           const tokens = billableModelTokens(delta)
-          if (tokens > 0) this.budget.consumeTokens(tokens, {
-            requiredCompletion: requiredCompletion || completeAdmittedTurn,
-          })
-          state.budgetConsumed = true
+          try {
+            if (tokens > 0) this._consumeChildTokenReservation(reservationId, tokens, {
+              requiredCompletion: requiredCompletion || completeAdmittedTurn,
+            })
+            if (providerEnvelope) providerEnvelope.budgetConsumedTokens = tokens
+            state.budgetConsumed = true
+          } catch (error) {
+            // _consumeChildTokenReservation truthfully charges a provider
+            // overage before rejecting it. Freeze that fact so the adapter's
+            // final pending-envelope reconciliation cannot charge it twice.
+            if (providerEnvelope && error &&
+                error.code === 'CODEX_CHILD_QUOTA_BOUND_VIOLATED') {
+              providerEnvelope.budgetConsumedTokens = tokens
+              state.budgetConsumed = true
+            }
+            throw error
+          }
         }
         if (!state.schedulerCheckpointPersisted) {
           persistSchedulerCheckpoint(identifiedContinuationId, 'USAGE_RECORDED')
           state.schedulerCheckpointPersisted = true
         }
         usageSequence = state.sequence
+        completeUsageObserved = true
+        const budgetSnapshot = this.budget.snapshot()
+        const acceptedRoleLimit = codexChildTokenRoleLimit({
+          logicalRole: policy.child,
+          route: request.route,
+        })
+        const cumulativeLeaseTokens = priorLeaseModelTokens + billableModelTokens(cumulative)
+        if (cumulativeLeaseTokens > acceptedRoleLimit) {
+          throw new SupervisorIntegrationError(
+            'CHILD_TOKEN_LIMIT_EXHAUSTED',
+            'child cumulative usage exceeded its accepted-result token limit',
+            {
+              logicalRole: policy.child,
+              limit: acceptedRoleLimit,
+              priorLeaseModelTokens,
+              cumulativeLeaseTokens,
+            },
+          )
+        }
         const verdict = Object.freeze({
-          continue: requiredCompletion || completeAdmittedTurn ||
-            (state.authorization.allowed === true && state.report.continue === true),
+          continue: budgetSnapshot.tokensUsed <= budgetSnapshot.limits.tokens && (
+            requiredCompletion || completeAdmittedTurn ||
+            (state.authorization.allowed === true && state.report.continue === true)
+          ),
           authorization: state.authorization,
           report: state.report,
         })
         completedUsageCallbacks.set(callbackKey, verdict)
         pendingUsageCallback = null
         return verdict
+      },
+      onUnknownProviderSpend: evidence => {
+        if (unknownProviderSpendReceipt) return unknownProviderSpendReceipt
+        const reservation = this.childTokenReservations.get(reservationId)
+        const providerEnvelope = evidence && Number.isSafeInteger(evidence.requestOrdinal)
+          ? this._pendingProviderEnvelope(reservationId, evidence.requestOrdinal)
+          : null
+        if (!reservation || !evidence ||
+            evidence.tokenLimit !== reservation.limit ||
+            !Number.isSafeInteger(evidence.maximumUnaccountedTokens) ||
+            evidence.maximumUnaccountedTokens <= 0 ||
+            evidence.maximumUnaccountedTokens < reservation.remaining ||
+            evidence.maximumUnaccountedTokens > reservation.limit ||
+            !Number.isSafeInteger(evidence.providerRequestCount) ||
+            !Number.isSafeInteger(evidence.completedRequestCount) ||
+            evidence.providerRequestCount <= evidence.completedRequestCount ||
+            evidence.requestOrdinal !== evidence.providerRequestCount ||
+            !providerEnvelope) {
+          throw new SupervisorIntegrationError(
+            'CODEX_USAGE_INVALID',
+            'unknown provider spend evidence does not bind the live child envelope',
+          )
+        }
+        const sequence = usageSequence + 1
+        let chargedTokens = 0
+        let accountingClass = 'KNOWN_PROVIDER_SPEND_RECONCILED'
+        let disposition = 'ACCOUNTED'
+        if (providerEnvelope.exactUsageRecorded) {
+          const missingBudgetTokens = providerEnvelope.exactUsageTokens -
+            providerEnvelope.budgetConsumedTokens
+          if (missingBudgetTokens < 0 || missingBudgetTokens > reservation.remaining) {
+            throw new SupervisorIntegrationError(
+              'CODEX_USAGE_INVALID',
+              'durable exact provider usage differs from its live child reservation',
+            )
+          }
+          if (missingBudgetTokens > 0) {
+            this._consumeChildTokenReservation(reservationId, missingBudgetTokens, {
+              requiredCompletion: requiredCompletion || completeAdmittedTurn,
+            })
+            providerEnvelope.budgetConsumedTokens += missingBudgetTokens
+          }
+        } else {
+          const remainingUpperBound = providerEnvelope.maximumUnaccountedTokens -
+            providerEnvelope.upperBoundChargedTokens
+          if (remainingUpperBound !== reservation.remaining) {
+            throw new SupervisorIntegrationError(
+              'CODEX_USAGE_INVALID',
+              'pending provider upper bound differs from its live reservation remainder',
+            )
+          }
+          chargedTokens = remainingUpperBound
+          const upperBoundUsage = Object.freeze({
+            noncachedInput: chargedTokens,
+            cachedInput: 0,
+            output: 0,
+            reasoning: 0,
+          })
+          if (chargedTokens > 0) {
+            lease.authorizeUsage(upperBoundUsage)
+            lease.reportUsage(upperBoundUsage, {
+              productive: false,
+              progressKind: CHECKER_ROLES.has(policy.child) ? 'verification' : 'work',
+            })
+            this._checkpointAccounting({
+              kind: 'TOKEN_USAGE_RECORDED',
+              causeId: codexProviderChargeCause(
+                providerEnvelope.sessionHash,
+                providerEnvelope.requestOrdinal,
+                'LIVE',
+              ),
+              humanDescription: 'Charge the unused child envelope after an upstream provider request ended without complete usage telemetry.',
+            }, { tokenUsage: upperBoundUsage })
+            const chargedReservation = this._chargeUnknownChildTokenUpperBound(reservationId)
+            chargedTokens = chargedReservation.charged
+            providerEnvelope.upperBoundChargedTokens += chargedTokens
+          }
+          accountingClass = 'UNKNOWN_PROVIDER_SPEND_UPPER_BOUND'
+          disposition = 'UPPER_BOUND_CHARGED'
+        }
+        usageSequence = sequence
+        persistSchedulerCheckpoint(identifiedContinuationId, 'USAGE_RECORDED')
+        this._recordChildProviderRequestSettled(reservationId, sessionId, {
+          tokenLimit: providerEnvelope.tokenLimit,
+          maximumUnaccountedTokens: providerEnvelope.maximumUnaccountedTokens,
+          requestOrdinal: providerEnvelope.requestOrdinal,
+          disposition,
+        })
+        persistSchedulerCheckpoint(identifiedContinuationId, 'PROVIDER_REQUEST_SETTLED')
+        unknownProviderSpendReceipt = Object.freeze({
+          accountingClass,
+          chargedTokens,
+          providerRequestCount: evidence.providerRequestCount,
+          completedRequestCount: evidence.completedRequestCount,
+          relayFailureCode: evidence.relayFailure && evidence.relayFailure.code || null,
+        })
+        return unknownProviderSpendReceipt
       },
     }
     persistProviderTransportFailure = (providerError, candidateEvidence = null) => {
@@ -13978,11 +15693,29 @@ class CodexSupervisorRuntime {
           humanDescription: 'Persist complete terminal model usage from a non-streaming launcher.',
         }, { tokenUsage: terminalUsage })
         const tokens = billableModelTokens(terminalUsage)
-        if (tokens > 0) this.budget.consumeTokens(tokens, {
+        if (tokens > 0) this._consumeChildTokenReservation(reservationId, tokens, {
           requiredCompletion: requiredCompletion || completeAdmittedTurn,
         })
-        if (!requiredCompletion && !completeAdmittedTurn &&
-            (authorization.allowed !== true || report.continue !== true)) {
+        const acceptedRoleLimit = codexChildTokenRoleLimit({
+          logicalRole: policy.child,
+          route: request.route,
+        })
+        if (priorLeaseModelTokens + tokens > acceptedRoleLimit) {
+          throw new SupervisorIntegrationError(
+            'CHILD_TOKEN_LIMIT_EXHAUSTED',
+            'non-streaming child cumulative usage exceeded its accepted-result token limit',
+            {
+              logicalRole: policy.child,
+              limit: acceptedRoleLimit,
+              priorLeaseModelTokens,
+              cumulativeLeaseTokens: priorLeaseModelTokens + tokens,
+            },
+          )
+        }
+        const budgetSnapshot = this.budget.snapshot()
+        if (budgetSnapshot.tokensUsed > budgetSnapshot.limits.tokens ||
+            (!requiredCompletion && !completeAdmittedTurn &&
+              (authorization.allowed !== true || report.continue !== true))) {
           const error = new SupervisorIntegrationError('BUDGET_EXHAUSTED', 'terminal model usage exhausted the scheduler budget')
           error.usage = terminalUsage
           throw error
@@ -14118,10 +15851,12 @@ class CodexSupervisorRuntime {
         })
       }
       budgetSessionStarted = false
-      this.budget.assertAvailable({
-        forWork: request.purpose !== 'recovery',
-        requiredCompletion: requiredCompletion || completeAdmittedTurn,
-      })
+      // Terminal usage was already charged and compared with the immutable
+      // activation ceiling above. Hitting that ceiling exactly must preserve
+      // this admitted child's authenticated result; availability is checked
+      // again before any later launch. BudgetController.assertAvailable uses
+      // >= for admission and would otherwise discard the just-finished result
+      // at exactly the legal cap.
       const returned = { ...result, transcriptEvidence: transcriptEvidenceTracker.snapshot() }
       if (result && result.localCallbackReconciliation) {
         Object.defineProperty(returned, 'localCallbackReconciliation', {
@@ -14436,9 +16171,34 @@ class CodexSupervisorRuntime {
               progressKind: CHECKER_ROLES.has(policy.child) ? 'verification' : 'work',
             })
             const tokens = billableModelTokens(terminalUsage)
-            if (tokens > 0) this.budget.consumeTokens(tokens, {
+            if (tokens > 0) this._consumeChildTokenReservation(reservationId, tokens, {
               requiredCompletion: requiredCompletion || completeAdmittedTurn,
             })
+            const acceptedRoleLimit = codexChildTokenRoleLimit({
+              logicalRole: policy.child,
+              route: request.route,
+            })
+            if (priorLeaseModelTokens + tokens > acceptedRoleLimit) {
+              throw new SupervisorIntegrationError(
+                'CHILD_TOKEN_LIMIT_EXHAUSTED',
+                'authenticated child cumulative usage exceeded its accepted-result token limit',
+                {
+                  logicalRole: policy.child,
+                  limit: acceptedRoleLimit,
+                  priorLeaseModelTokens,
+                  cumulativeLeaseTokens: priorLeaseModelTokens + tokens,
+                },
+              )
+            }
+            const budgetSnapshot = this.budget.snapshot()
+            if (budgetSnapshot.tokensUsed > budgetSnapshot.limits.tokens) {
+              const error = new SupervisorIntegrationError(
+                'BUDGET_EXHAUSTED',
+                'authenticated local continuation exhausted the activation token budget',
+              )
+              error.usage = terminalUsage
+              throw error
+            }
             terminalUsageAccounted = true
           }
           if (!request.retainLease) {
@@ -14709,7 +16469,11 @@ class CodexSupervisorRuntime {
           promotedTerminalTransportCandidate = null
         }
       }
-      if (!externalOperation && request.route !== 'PRE_ROUTE' &&
+      // A transport retry is allowed only after this exact launch emitted and
+      // durably accounted one complete usage observation. Codex 0.148 omits
+      // usage from turn.failed (including native rollout-budget failures), so
+      // retrying an unknown billed attempt could silently double the spend.
+      if (!externalOperation && request.route !== 'PRE_ROUTE' && completeUsageObserved &&
           PROVIDER_TRANSPORT_AVAILABILITY_CODES.has(error && error.code) &&
           typeof persistProviderTransportFailure === 'function') {
         try {
@@ -14891,6 +16655,16 @@ class CodexSupervisorRuntime {
       }
       if (candidateSurvivalEvidence) attachErrorField('bestAvailableCandidateEvidence', candidateSurvivalEvidence)
       throw error
+    } finally {
+      const pendingProviderEnvelope = this._pendingProviderEnvelope(reservationId)
+      if (pendingProviderEnvelope) {
+        throw new SupervisorIntegrationError(
+          'INCOMPLETE_USAGE_ACCOUNTING',
+          'child returned with one durable provider request allowance still pending',
+          { requestOrdinal: pendingProviderEnvelope.requestOrdinal },
+        )
+      }
+      this._releaseChildTokenEnvelope(reservationId)
     }
   }
 
@@ -16322,6 +18096,9 @@ const MISSING_RESOURCE_PREIMAGE_HASH = hashText('autoprompt-resource-missing-v1'
 function missionContainsExactAbsolutePath(mission, candidatePath) {
   if (typeof mission !== 'string' || !path.isAbsolute(candidatePath)) return false
   const exact = String(candidatePath)
+  const pairedDelimiters = new Map([
+    ['`', '`'], ["'", "'"], ['"', '"'], ['(', ')'], ['[', ']'], ['{', '}'], ['<', '>'],
+  ])
   let offset = 0
   while (offset <= mission.length) {
     const index = mission.indexOf(exact, offset)
@@ -16329,9 +18106,12 @@ function missionContainsExactAbsolutePath(mission, candidatePath) {
     const before = index === 0 ? '' : mission[index - 1]
     const afterIndex = index + exact.length
     const after = afterIndex === mission.length ? '' : mission[afterIndex]
-    const leftBoundary = !before || /[\s`'"([{=:]/u.test(before)
-    const rightBoundary = !after || /[\s`'"),.;:\]}]/u.test(after)
-    if (leftBoundary && rightBoundary) return true
+    // External mutation authority cannot infer whether whitespace or
+    // punctuation ends a path or continues a longer future filename. Require
+    // the immutable request to delimit the exact path (Markdown/code quotes,
+    // matching brackets, or the whole mission) so no existing prefix can gain
+    // authority from prose or filesystem-existence heuristics.
+    if ((!before && !after) || pairedDelimiters.get(before) === after) return true
     offset = index + exact.length
   }
   return false
@@ -17340,26 +19120,77 @@ function canonicalMissionReadResources(mission, canonicalTargetPath, targetPath,
       typeof targetPath !== 'string') return Object.freeze([])
   const canonicalRoot = path.resolve(canonicalTargetPath)
   const workingRoot = path.resolve(targetPath)
-  const absolutePathPattern = /(?:^|[\s`'"([{=:])(\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]*[A-Za-z0-9_-])(?=$|[\s`'"),.;:\]}])/gu
+  // A delimited path binds exactly. For unquoted prose, conservatively collect
+  // every existing path prefix at a whitespace boundary. This protects both a
+  // no-space input followed by prose and every existing member of an ambiguous
+  // spaced filename; ambiguity may narrow write authority but can never leave
+  // a named existing input writable under broad workspace ownership.
+  const quotedAbsolutePathPattern = /(?:`([^`\r\n]+)`|'([^'\r\n]+)'|"([^"\r\n]+)")/gu
+  const absolutePathScanPattern = /(?=(?:^|[\s`'"([{=:])(\/[^\r\n`'"),;:\]}<>]+))/gu
+  const pairedDelimiters = new Map([
+    ['`', '`'], ["'", "'"], ['"', '"'], ['(', ')'], ['[', ']'], ['{', '}'], ['<', '>'],
+  ])
+  const missionSegments = []
+  const collectMissionStrings = value => {
+    if (typeof value === 'string') missionSegments.push(value)
+    else if (Array.isArray(value)) value.forEach(collectMissionStrings)
+    else if (value && typeof value === 'object') {
+      Object.values(value).forEach(collectMissionStrings)
+    }
+  }
+  try { collectMissionStrings(JSON.parse(mission)) } catch { missionSegments.push(mission) }
+  if (missionSegments.length === 0) missionSegments.push(mission)
+  const absolutePaths = new Set()
+  for (const segment of missionSegments) {
+    for (const match of segment.matchAll(quotedAbsolutePathPattern)) {
+      const delimitedPath = match[1] || match[2] || match[3]
+      if (path.isAbsolute(delimitedPath)) absolutePaths.add(delimitedPath)
+    }
+    for (const match of segment.matchAll(absolutePathScanPattern)) {
+      const raw = String(match[1] || '').trimEnd()
+      if (!path.isAbsolute(raw)) continue
+      const slashIndex = segment.indexOf(raw, match.index)
+      const before = slashIndex > 0 ? segment[slashIndex - 1] : ''
+      const after = segment[slashIndex + raw.length] || ''
+      if (pairedDelimiters.get(before) === after) {
+        absolutePaths.add(raw)
+        continue
+      }
+      const ends = new Set([raw.length])
+      for (const whitespace of raw.matchAll(/\s+/gu)) ends.add(whitespace.index)
+      for (const end of ends) {
+        const prefix = raw.slice(0, end).trimEnd()
+        for (const possiblePath of [prefix, prefix.replace(/[.!?]+$/u, '')]) {
+          if (!path.isAbsolute(possiblePath)) continue
+          const canonicalPossible = path.resolve(possiblePath)
+          if (canonicalPossible !== canonicalRoot &&
+              canonicalPossible.startsWith(`${canonicalRoot}${path.sep}`)) {
+            const relative = path.relative(canonicalRoot, canonicalPossible)
+            if (fs.existsSync(path.resolve(workingRoot, relative))) absolutePaths.add(possiblePath)
+          }
+        }
+      }
+    }
+  }
   const resources = []
   const seen = new Set()
-  for (const match of mission.matchAll(absolutePathPattern)) {
-    const canonicalAbsolute = path.resolve(match[1])
+  for (const absolutePathText of [...absolutePaths].sort()) {
+    const canonicalAbsolute = path.resolve(absolutePathText)
     if (canonicalAbsolute === canonicalRoot ||
         !canonicalAbsolute.startsWith(`${canonicalRoot}${path.sep}`)) continue
     const relative = path.relative(canonicalRoot, canonicalAbsolute)
     const identity = relative.split(path.sep).join('/')
     if (!identity || seen.has(identity)) continue
     const workingAbsolute = path.resolve(workingRoot, relative)
-    assertNoLinkedPathPrefix(canonicalRoot, canonicalAbsolute, match[1])
-    assertNoLinkedPathPrefix(workingRoot, workingAbsolute, match[1])
+    assertNoLinkedPathPrefix(canonicalRoot, canonicalAbsolute, absolutePathText)
+    assertNoLinkedPathPrefix(workingRoot, workingAbsolute, absolutePathText)
     if (!fs.existsSync(workingAbsolute)) continue
     const stat = fs.lstatSync(workingAbsolute)
     if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory()) ||
         (stat.isFile() && Number(stat.nlink) !== 1)) {
       throw new SupervisorIntegrationError(
         'MISSION_PATH_INVALID',
-        `canonical original-request input is not one regular file or directory: ${match[1]}`,
+        `canonical original-request input is not one regular file or directory: ${absolutePathText}`,
       )
     }
     const resource = {
@@ -17383,6 +19214,18 @@ function canonicalAssignmentResources(input) {
   const ownership = Array.isArray(input.request.ownership) && input.request.ownership.length
     ? input.request.ownership : ['workspace']
   const manifests = Array.isArray(input.request.manifests) ? input.request.manifests : []
+  for (const manifest of manifests) {
+    const kind = String(manifest && manifest.kind || '').toLowerCase()
+    const identity = String(manifest && manifest.identity || '')
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) ||
+        !ASSIGNMENT_RESOURCE_KINDS.has(kind) || !identity) {
+      throw new SupervisorIntegrationError(
+        'OWNERSHIP_RESOURCE_INVALID',
+        'typed ownership manifests require one canonical resource kind and identity',
+        { kind: kind || null, identity: identity || null },
+      )
+    }
+  }
   const typedExternalLocalManifests = manifests.filter(item => {
     if (!item || !LOCAL_MUTATION_RESOURCE_KINDS.has(String(item.kind || '').toLowerCase())) return false
     const identity = String(item.identity || '')
@@ -17430,6 +19273,13 @@ function canonicalAssignmentResources(input) {
       )
     }
     let kind = String(declared && declared.kind || '').toLowerCase()
+    if (declared && !ASSIGNMENT_RESOURCE_KINDS.has(kind)) {
+      throw new SupervisorIntegrationError(
+        'OWNERSHIP_RESOURCE_INVALID',
+        'typed ownership resources require one canonical resource kind',
+        { identity, kind: kind || null },
+      )
+    }
     if (!ASSIGNMENT_RESOURCE_KINDS.has(kind)) {
       if (identity === 'workspace') kind = 'directory'
       else {
@@ -17699,6 +19549,32 @@ function explicitFindingIds(...values) {
 function canonicalRoleFindingIds(...values) {
   return explicitFindingIds(...values)
     .filter(id => /^AP-[A-Z]+-(?:[0-9]{3}|[0-9]{78})$/u.test(id))
+}
+
+function canonicalAssignmentFindingIds(request = {}, binding = {}, registry = null) {
+  const supplied = explicitFindingIds(request.findingIds, request.finding_ids)
+  const canonical = canonicalRoleFindingIds(supplied)
+  if (supplied.length === 0) {
+    canonical.push(assignmentLocalFindingId(request, binding, registry))
+  } else {
+    for (const invalidId of supplied.filter(id =>
+      !/^AP-[A-Z]+-(?:[0-9]{3}|[0-9]{78})$/u.test(id))) {
+      // Preserve each otherwise-unrepresentable source obligation under its
+      // own collision-resistant canonical ID. A fixed assignment-local ID can
+      // collide with an already supplied valid ID and cannot distinguish two
+      // different invalid obligations.
+      const digest = hashText(stableStringify({
+        schemaVersion: 1,
+        kind: 'unrepresentable-source-finding',
+        sourceFindingId: invalidId,
+        workItemId: typeof request.workItemId === 'string' ? request.workItemId : null,
+        logicalRole: typeof request.logicalRole === 'string' ? request.logicalRole : null,
+        requestEnvelopeHash: binding.requestEnvelopeHash || null,
+      }))
+      canonical.push(`AP-WORK-${BigInt(`0x${digest}`).toString(10).padStart(78, '0')}`)
+    }
+  }
+  return [...new Set(canonical)].sort()
 }
 
 function canonicalAssignmentFindingOrdinal(request = {}) {
@@ -18021,7 +19897,9 @@ function canonicalRoleAssignment(input) {
     logicalRoleId: input.logicalRole,
     physicalRoleId: input.physicalRole,
     requestEnvelopeHash: input.requestEnvelopeHash,
-    findingIds: canonicalRoleFindingIds(input.request.findingIds, input.request.finding_ids),
+    findingIds: canonicalAssignmentFindingIds(input.request, {
+      requestEnvelopeHash: input.requestEnvelopeHash,
+    }),
     requestedResult: assignmentCore.requestedResult,
     planReference: {
       planPath, sectionId: input.request.workItemId, sectionHash,
@@ -18049,11 +19927,6 @@ function canonicalRoleAssignment(input) {
       commandBindings: input.request.verificationCommandBindings,
       observationRequired: !noFileStructuredResponse,
     })
-  }
-  if (assignment.findingIds.length === 0) {
-    assignment.findingIds = [assignmentLocalFindingId(input.request, {
-      requestEnvelopeHash: input.requestEnvelopeHash,
-    })]
   }
   if (input.logicalRole === 'ap-work-group-manager') {
     const admission = input.request.workGroupAdmission
@@ -18729,9 +20602,9 @@ function createDefaultRouteExecutor(options) {
     })
     const likelyAreas = decision.likelyAreas || []
     const boundedToolOutputDiscipline =
-      ' Keep model-visible command output bounded: use at most 16 tool calls for the whole turn and set each tool output budget to at most 1,000 tokens. Redirect large stdout/stderr to a scratch file, then inspect a hash, count, or targeted preview of at most 4 KiB. Never use line-oriented head, tail, sed, or unrestricted recursive search on potentially monolithic generated artifacts or private run-record/transcript trees. Reuse one focused executable validation harness; after implementation and one focused validation, return the canonical result immediately.'
+      ` Keep model-visible command output bounded: use at most ${CODEX_CHILD_TOOL_CALL_LIMITS.worker} tool calls for the whole turn. The launcher retains at most ${CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT.toLocaleString('en-US')} tokens from each tool output; the classic shell tool has no per-call output-budget argument. Redirect large stdout/stderr to a scratch file, then inspect a hash, count, or targeted preview of at most 4 KiB. Never use line-oriented head, tail, sed, or unrestricted recursive search on potentially monolithic generated artifacts or private run-record/transcript trees. Reuse one focused executable validation harness; after implementation and one focused validation, return the canonical result immediately.`
     const checkerToolOutputDiscipline =
-      ' Keep model-visible command output bounded: use at most 10 tool calls for the whole turn and set each tool output budget to at most 1,000 tokens. If you author a checker harness, first write one regular program in the assigned scratch root, then run exactly one direct invocation as <python3|node|ruby|perl|sh> <absolute sealed scratch program> <absolute frozen exact-version path being checked>, or as <absolute sealed executable> <absolute frozen exact-version path being checked>. Use no interpreter flags. Substitute the projected absolute paths literally and emit one direct JSON summary of at most 4 KiB. Do not use heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or shell glue. Do not run a second harness command merely to reshape the report; return the canonical result immediately after the required observation.'
+      ` Keep model-visible command output bounded: use at most ${CODEX_CHILD_TOOL_CALL_LIMITS.checker} tool calls for the whole turn. The launcher retains at most ${CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT.toLocaleString('en-US')} tokens from each tool output; the classic shell tool has no per-call output-budget argument. If you author a checker harness, first write one regular program in the assigned scratch root, then run exactly one direct invocation as <python3|node|ruby|perl|sh> <absolute sealed scratch program> <absolute frozen exact-version path being checked>, or as <absolute sealed executable> <absolute frozen exact-version path being checked>. Use no interpreter flags. Substitute the projected absolute paths literally and emit one direct JSON summary of at most 4 KiB. Do not use heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or shell glue. Do not run a second harness command merely to reshape the report; return the canonical result immediately after the required observation.`
     const workerCount = Math.max(1, Number(decision.usefulWorkerCount || 1))
     const legacyRoadmapWorkId = /^(?:roadmap-(?:author|scout|plan-|work-group)|mission-coordination)/u
     const resumeRoadmapIds = resumeState ? [
@@ -18797,8 +20670,42 @@ function createDefaultRouteExecutor(options) {
           'CHECKER_SCRATCH_UNAVAILABLE',
           'DEPENDENCY_UNAVAILABLE',
         ])
-        if (!recoverableCheckerLaunchCodes.has(error && error.code)) throw error
-        const failure = checkerLaunchRuntimeFailure(request, decision, options.runId, error)
+        const quotaUnavailable = checkerLaunchQuotaUnavailable(error)
+        if (!quotaUnavailable &&
+            !recoverableCheckerLaunchCodes.has(error && error.code)) throw error
+        const runtimeFailure = checkerLaunchRuntimeFailure(
+          request,
+          decision,
+          options.runId,
+          error,
+        )
+        // If earlier exact usage leaves too little of the aggregate activation
+        // envelope to admit even the checker's conservative first request,
+        // the relay rejects it before any upstream provider call.  That is a
+        // bounded verification-capability limitation, not evidence that the
+        // already produced candidate is defective and not authority to buy a
+        // retry that necessarily has the same remaining envelope.
+        const failure = quotaUnavailable
+          ? canonicalizeCheckerVerificationLimitation({
+              ...runtimeFailure,
+              code: 'CHECK_INCONCLUSIVE',
+              stateClass: 'intermediate',
+              cause: {
+                event: 'REQUIRED_CHECK_RUNTIME_UNAVAILABLE',
+                reason: 'the remaining aggregate token envelope could not admit the required independent checker request',
+                unblockPath: 'Run an external independent check or start a fresh activation with an explicitly larger aggregate token limit.',
+              },
+              payload: {
+                ...runtimeFailure.payload,
+                verificationLimitation: {
+                  kind: 'CAPABILITY_UNAVAILABLE',
+                  capabilityId: 'autoprompt.independent-check-quota-envelope',
+                  explicitUserDeliverable: false,
+                  observedVersionDefectIds: [],
+                },
+              },
+            })
+          : runtimeFailure
         if (typeof options.persistControllerCheckerResult === 'function') {
           await options.persistControllerCheckerResult(request, failure)
         }
@@ -18927,7 +20834,7 @@ function createDefaultRouteExecutor(options) {
       const validationResult = durableCompletedGateResult('fixture-prebuild-validation') || await launchChecker({
         workItemId: 'fixture-prebuild-validation', logicalRole: 'independent-tester', parent: 'run-owner',
         purpose: 'verification',
-        assignment: 'Execute the authoritative fixture-provenance and mutation-replay validation. Return its bound FIXTURE_PROVENANCE outcome; do not build or write the target.',
+        assignment: 'Execute the authoritative fixture-provenance and mutation-replay validation. Return its bound FIXTURE_PROVENANCE outcome; do not build or write the target.' + checkerToolOutputDiscipline,
         candidateHash: prebuildCandidateHash, oracle,
         ownership: admittedReadOwnership,
         success: ['Executable fixture provenance and mutation replay remain RED until the pre-build validation passes.'],
@@ -20238,11 +22145,13 @@ function createDefaultRouteExecutor(options) {
           terminalEnvelope: checkerResult,
         }
       }
-      const checkerResultHash = hashText(stableStringify(boundedLimitationResult))
+      const sourceCheckerResultHash = hashText(stableStringify(checkerResult || null))
+      const limitationResultHash = hashText(stableStringify(boundedLimitationResult))
       // Conversion into a controller-owned verification limitation changes
-      // the exact result bytes. Rebind the reassessment receipt at that
-      // conversion boundary instead of carrying a valid receipt for the raw
-      // checker report alongside the new limitation hash.
+      // the exact result bytes. Runtime recovery authenticates the durable raw
+      // checker receipt, while acceptance joins bind the converted limitation.
+      // Keep those hashes explicit instead of making a crash marker name bytes
+      // that were never durably stored as the checker result.
       const suppliedReassessment = transitionDetails.controllerReassessment
       const reassessmentCode = suppliedReassessment &&
         CHECKER_REASSESSMENT_CODES.has(suppliedReassessment.code)
@@ -20251,8 +22160,8 @@ function createDefaultRouteExecutor(options) {
       const reboundControllerReassessment = canonicalCheckerReassessment({
         ...(suppliedReassessment || {}),
         code: reassessmentCode,
-        priorResultEvidenceHash: checkerResultHash,
-      }, { resultHash: checkerResultHash, checkerId })
+        priorResultEvidenceHash: sourceCheckerResultHash,
+      }, { resultHash: sourceCheckerResultHash, checkerId })
       const limitationCandidates = [
         ...acceptedVerificationLimitations
           .filter(item => item.checkerId !== checkerId)
@@ -20263,7 +22172,7 @@ function createDefaultRouteExecutor(options) {
           })),
         {
           checkerId,
-          resultHash: checkerResultHash,
+          resultHash: limitationResultHash,
           verificationLimitation: boundedLimitationResult.payload.verificationLimitation,
         },
       ]
@@ -20286,13 +22195,13 @@ function createDefaultRouteExecutor(options) {
         }))
         await deferredPromotion.commit({
           candidateHash,
-          checkHashes: [checkerResultHash],
+          checkHashes: [limitationResultHash],
           acceptanceJoinHash,
           domainEvaluationHash: hashText(stableStringify({
             kind: 'verification-limited-private-candidate',
             candidateHash,
             checkerId,
-            checkerResultHash,
+            checkerResultHash: limitationResultHash,
           })),
           capturedDomainOutcomes: [],
           domainEvaluation: null,
@@ -20307,7 +22216,7 @@ function createDefaultRouteExecutor(options) {
         ...changedDeliverables(options.targetPath, options.gitEnvironment()),
         ...externalDeliverables(),
       ]
-      const limitationCheckHashes = [checkerResultHash]
+      const limitationCheckHashes = [limitationResultHash]
       const publicTransitionDetails = {
         ...transitionDetails,
         controllerReassessment: reboundControllerReassessment,
@@ -20317,7 +22226,7 @@ function createDefaultRouteExecutor(options) {
         await options.transition('CHECK_INCONCLUSIVE', 'CHECK_INCONCLUSIVE', {
           candidateHash,
           checkerId,
-          checkerResultHash,
+          checkerResultHash: sourceCheckerResultHash,
           retryAttempt: Number.isSafeInteger(transitionDetails.retryAttempt)
             ? transitionDetails.retryAttempt : 0,
           controllerReason: reason,
@@ -20330,7 +22239,7 @@ function createDefaultRouteExecutor(options) {
         await closeInconclusiveChecker({
           candidateHash,
           checkerId,
-          checkerResultHash,
+          checkerResultHash: sourceCheckerResultHash,
           terminalDisposition: 'DONE_WITH_VERIFICATION_LIMITATIONS',
           nextReadyWorkIds: [],
         })
@@ -20359,9 +22268,9 @@ function createDefaultRouteExecutor(options) {
           reason: 'The usable exact version remains available, but the bounded local checker did not produce command-bound acceptance evidence.',
           currentVersionHash: preservedCandidateHash,
           checkerId,
-          checkerResultHash,
+          checkerResultHash: limitationResultHash,
           controllerReason: reason,
-          sourceCheckerResultHash: hashText(stableStringify(checkerResult || null)),
+          sourceCheckerResultHash,
           usableCandidatePreserved: true,
         },
       }
@@ -20408,7 +22317,9 @@ function createDefaultRouteExecutor(options) {
       let activeRepairAttempt = 0
       if (pendingRetry) {
         if (!/^independent-check-(\d+)(?:-repair-(\d+))?$/u.test(pendingRetry.checkerId || '') ||
-            pendingRetry.retryAttempt !== 1 || pendingRetry.candidateHash !== candidateHash ||
+            ![0, 1].includes(pendingRetry.retryAttempt) ||
+            (pendingRetry.retryAttempt === 0 && nextReadyId !== null) ||
+            pendingRetry.candidateHash !== candidateHash ||
             !/^[a-f0-9]{64}$/u.test(pendingRetry.checkerResultHash || '')) {
           throw new SupervisorIntegrationError(
             'CHECK_RETRY_STATE_INVALID',
@@ -20416,12 +22327,14 @@ function createDefaultRouteExecutor(options) {
           )
         }
         const retryId = `${pendingRetry.checkerId}-runtime-retry-1`
-        const retryAlreadyCommitted = Boolean(options.readResult(retryId))
+        const retryAlreadyCommitted = pendingRetry.retryAttempt === 1 && Boolean(options.readResult(retryId))
         checkerId = retryAlreadyCommitted ? retryId : pendingRetry.checkerId
         const match = /^independent-check-(\d+)(?:-repair-(\d+))?/u.exec(pendingRetry.checkerId)
         checkerIndex = Number(match[1]) - 1
         activeRepairAttempt = match[2] ? Number(match[2]) : 0
-        sourceKind = retryAlreadyCommitted ? 'retry-result' : 'retry'
+        sourceKind = pendingRetry.retryAttempt === 0
+          ? 'terminal-result'
+          : retryAlreadyCommitted ? 'retry-result' : 'retry'
       } else {
         const retryMatch = /^(independent-check-(\d+)(?:-repair-(\d+))?)-runtime-retry-1$/u.exec(nextReadyId)
         if (retryMatch) {
@@ -20493,8 +22406,9 @@ function createDefaultRouteExecutor(options) {
       }
       if (pendingRetry && sourceKind === 'retry-result') {
         const baseResult = options.readResult(pendingRetry.checkerId)
-        if (!baseResult ||
-            hashText(JSON.stringify(baseResult)) !== pendingRetry.checkerResultHash) {
+        if (!baseResult || !checkerResultMatchesEvidenceHash(
+          baseResult, pendingRetry.checkerResultHash,
+        )) {
           throw new SupervisorIntegrationError(
             'CHECK_RETRY_STATE_INVALID',
             `durable ${checkerId} retry result lacks its exact marker-bound base result`,
@@ -20520,8 +22434,8 @@ function createDefaultRouteExecutor(options) {
         }
         options.verifyDurableResultReceipt(pendingRetry.checkerId, baseResult)
       }
-      if (pendingRetry && sourceKind === 'retry' &&
-          hashText(JSON.stringify(durableResult)) !== pendingRetry.checkerResultHash) {
+      if (pendingRetry && ['retry', 'terminal-result'].includes(sourceKind) &&
+          !checkerResultMatchesEvidenceHash(durableResult, pendingRetry.checkerResultHash)) {
         throw new SupervisorIntegrationError(
           'CHECK_RETRY_STATE_INVALID',
           `durable ${checkerId} base result differs from its exact retry marker`,
@@ -20642,8 +22556,12 @@ function createDefaultRouteExecutor(options) {
           : nonAuthoritative ? 'non-authoritative'
           : repairEligible ? 'repair' : 'terminal',
         fromRetryState: Boolean(pendingRetry), nextReadyId, checkerId, checkerIndex,
+        reportRetryAttempt: pendingRetry ? pendingRetry.retryAttempt : null,
         repairAttempt: repairEligible ? activeRepairAttempt + 1 : activeRepairAttempt || repairAttempt, result, pointer,
-        checkerResultHash: hashText(JSON.stringify(durableResult)), nonAuthoritative,
+        checkerResultHash: pendingRetry && ['retry', 'terminal-result'].includes(sourceKind)
+          ? pendingRetry.checkerResultHash
+          : hashText(JSON.stringify(durableResult)),
+        nonAuthoritative,
         expectedNext, controllerReassessment: pendingControllerReassessment,
       })
     })()
@@ -20656,7 +22574,7 @@ function createDefaultRouteExecutor(options) {
         candidateHash,
         checkerId: durableIndependentFrontier.checkerId,
         checkerResultHash: durableIndependentFrontier.checkerResultHash,
-        retryAttempt: 1,
+        retryAttempt: durableIndependentFrontier.reportRetryAttempt ?? 1,
         ...(durableIndependentFrontier.nonAuthoritative
           ? { controllerReason: durableIndependentFrontier.result.cause &&
               durableIndependentFrontier.result.cause.event ||
@@ -21487,6 +23405,7 @@ function createDefaultRouteExecutor(options) {
     const resumedInconclusive = resumeState && resumeState.retryState &&
       resumeState.retryState.inconclusiveChecker
     if (resumedInconclusive && resumedInconclusive.candidateHash === candidateHash &&
+        resumedInconclusive.retryAttempt === 1 &&
         !(durableIndependentFrontier &&
           ['structural', 'superseded-retry'].includes(durableIndependentFrontier.kind))) {
       const resumedIndex = /^independent-check-(\d+)/u.exec(String(resumedInconclusive.checkerId || ''))
@@ -25442,48 +27361,6 @@ function createDefaultRuntimeOptions(input) {
         terminalStatus: 'FAILED',
       })
     },
-    l0ViaScheduler: false,
-    deterministicRouteDecision: true,
-    decideRoute: async ({ analysis, requestPointer }) => {
-      const recommendation = analysis && analysis.recommendation || analysis
-      if (recommendation && recommendation.preWorkResult === 'CONTINUE') {
-        try {
-          return {
-            decision: compileAutomaticRouteDecision({
-              recommendation,
-              requestedResult: canonicalMissionProjection.canonicalMission,
-              requestEnvelopeHash: requestPointer.hash,
-              targetIdentity: activation.supervisorRuntime.targetIdentity,
-              providerCapabilities: runtimeOptions.providerCapabilities,
-              budget: runtimeOptions.budgetController.status({ forWork: true }),
-              nowMs: Date.now(),
-            }),
-            submittedAtMs: Date.now(),
-            usage: { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 },
-            usageStreamed: false,
-          }
-        } catch (error) {
-          if (!error || error.code !== 'ROUTE_DECISION_INVALID') throw error
-          // Fall through to the deterministic conservative projection below.
-        }
-      }
-      // Advisory route output cannot justify another planning generation.
-      // Malformed, unavailable, contradictory, or semantically over-bound
-      // analysis compiles the one-worker local completion path directly.
-      return {
-        decision: compileConservativeCompletionDecision({
-          requestedResult: canonicalMissionProjection.canonicalMission,
-          requestEnvelopeHash: requestPointer.hash,
-          providerCapabilities: runtimeOptions.providerCapabilities,
-          budget: runtimeOptions.budgetController.status({ forWork: true }),
-          nowMs: Date.now(),
-          descriptiveRecommendation: recommendation,
-        }),
-        submittedAtMs: Date.now(),
-        usage: { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 },
-        usageStreamed: false,
-      }
-    },
     assignmentResolver: ({ providerRole, logicalRole }) =>
       readPrivateAgentAssignment(activation, providerRole, logicalRole),
     profileUpdater: async ({ route, settings: resolved }) => {
@@ -25758,10 +27635,10 @@ function createDefaultRuntimeOptions(input) {
     },
     limits: {
       wallMs,
-      // Production has no hidden activation-token stop. The provider or host
-      // remains the external authority, while explicit callers may install a
-      // finite economic target for optional work. Required work is separately
-      // bounded by the authenticated finite execution topology.
+      // Default production admits exactly the minimal automatic DIRECT token
+      // topology (route + worker + checker). Callers may explicitly choose a
+      // larger activation budget, but required-completion branding never
+      // authorizes another model launch after this token boundary is reached.
       tokens: resolveActivationTokenLimit(context.tokenLimit),
       sessions: clampNonNegInt(context.sessionLimit, 128),
       launches: clampNonNegInt(context.launchLimit, 128),
@@ -26340,6 +28217,12 @@ module.exports = {
   serializeError,
   supervisorCapabilities,
   probeCodexExecCapabilities,
+  codexControlledModelCatalog,
+  codexCompactCanonicalOutputContract,
+  startCodexCumulativeQuotaProxy,
+  unresolvedCodexProviderEnvelopes,
+  codexToolCallHighWater,
+  materializeCodexControlledTransport,
   materializeCodexProviderEnvelopeSchema,
   validateActivationInputs,
   validateActivationRoleProjection,
@@ -26354,6 +28237,7 @@ module.exports = {
   evidenceInvalidationSet,
   explicitFindingIds,
   canonicalRoleFindingIds,
+  canonicalAssignmentFindingIds,
   canonicalAssignmentResources,
   canonicalMissionReadResources,
   candidateExternalLocalResources,

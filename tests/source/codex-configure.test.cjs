@@ -1211,9 +1211,9 @@ test('the packed global package exposes a working Codex configure command', { ti
   fs.mkdirSync(fakeBin)
   fs.mkdirSync(packDirectory)
   fs.mkdirSync(prefix)
-  fs.writeFileSync(path.join(fakeBin, 'codex.cmd'), '@echo off\r\necho codex-cli 0.101.0\r\n')
+  fs.writeFileSync(path.join(fakeBin, 'codex.cmd'), '@echo off\r\necho codex-cli 0.148.0\r\n')
   const fakePosix = path.join(fakeBin, 'codex')
-  fs.writeFileSync(fakePosix, '#!/bin/sh\nprintf "%s\\n" "codex-cli 0.101.0"\n')
+  fs.writeFileSync(fakePosix, '#!/bin/sh\nprintf "%s\\n" "codex-cli 0.148.0"\n')
   fs.chmodSync(fakePosix, 0o755)
   const env = {
     ...process.env,
