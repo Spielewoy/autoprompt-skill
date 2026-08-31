@@ -313,7 +313,11 @@ function readLineSync(stdin, stdout) {
       try {
         count = fs.readSync(descriptor, byte, 0, 1, null)
       } catch (error) {
-        if (error && error.code === 'EINTR') continue
+        // EINTR: interrupted by a signal, retry.
+        // EAGAIN: stdin is non-blocking (set by many terminal emulators and
+        // multiplexers like tmux/screen; O_NONBLOCK on fd 0). No key has been
+        // pressed yet — wait for the next one instead of failing the install.
+        if (error && (error.code === 'EINTR' || error.code === 'EAGAIN')) continue
         throw error
       }
       if (count === 0) return bytes.length === 0 ? null : Buffer.from(bytes).toString('utf8')
