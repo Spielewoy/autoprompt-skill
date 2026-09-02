@@ -660,6 +660,50 @@ function reclaimDeadSlot(slotPath, deadLeaseId) {
   }
 }
 
+// Which pids *this* process attached to a lease, keyed by the lease handle. A
+// slot record mixes two kinds of holder: the ancestor that claimed the index, and
+// the workers a holder later bound to it. Only the second kind describes work this
+// process is answerable for, and only that kind may survive a generation change -
+// see withYieldedSlot for why carrying the first kind pins a slot for the whole run.
+const locallyBoundHolders = new Map()
+
+function rememberLocalHolders(lease, holders) {
+  const key = formatSlotHandle(lease)
+  const known = locallyBoundHolders.get(key) || new Set()
+  for (const pid of holders) known.add(pid)
+  locallyBoundHolders.set(key, known)
+}
+
+function forgetLocalHolders(lease) {
+  const key = formatSlotHandle(lease)
+  const known = locallyBoundHolders.get(key)
+  locallyBoundHolders.delete(key)
+  return known ? [...known] : []
+}
+
+// A lease this process took for its own remaining lifetime, rather than for a
+// child it is about to spawn. Nobody else can free one: the handle a parent holds
+// is a copy taken before the yield, so its release is ownership-checked into a
+// no-op, and the env var naming the new lease lives in this process only. Without
+// a release at exit the index would stay claimed until a reclaimer noticed the
+// holder was gone, which is a slot the run does not get back while it still runs.
+const ownedSlotLeases = new Map()
+let ownedSlotExitHook = false
+
+function trackOwnedSlot(lease) {
+  ownedSlotLeases.set(formatSlotHandle(lease), lease)
+  if (ownedSlotExitHook) return
+  ownedSlotExitHook = true
+  process.on('exit', () => {
+    for (const owned of ownedSlotLeases.values()) releaseSlot(owned)
+    ownedSlotLeases.clear()
+  })
+}
+
+function untrackOwnedSlot(lease) {
+  ownedSlotLeases.delete(formatSlotHandle(lease))
+}
+
 // The lease is taken before the child exists, so the child's own pid is recorded
 // once it does. Liveness then follows the worker, not just the dispatcher that
 // started it: a dispatcher that dies while its worker runs must not free the slot.
@@ -678,11 +722,12 @@ function bindHoldersToSlot(lease, pids) {
   try {
     fs.writeFileSync(staging, JSON.stringify({ ...held, pids: merged }))
     retryTransientFs(() => fs.renameSync(staging, lease.path))
-    return true
   } catch {
     removeSlotFile(staging)
     return false
   }
+  rememberLocalHolders(lease, holders)
+  return true
 }
 
 function bindChildToSlot(lease, childPid) {
@@ -709,6 +754,8 @@ function releaseSlot(lease) {
   const record = readSlotRecord(held.path)
   if (record === null || record.leaseId !== held.id) return false
   const removed = removeSlotFile(held.path)
+  untrackOwnedSlot(held)
+  forgetLocalHolders(held)
   // A reclaim token naming this lease can only be an abandoned one - some
   // reclaimer judged this lease dead while it was not - and once the lease is
   // gone it guards nothing, because lease ids are never reused. Removing it here
@@ -742,11 +789,18 @@ async function acquireSlot(env, limit, options = {}) {
 // under a fresh lease, so the yielded index belongs to whoever claimed it next.
 async function withYieldedSlot(env, limit, options, work) {
   const inherited = parseSlotHandle(env.AUTOPROMPT_GROK_SLOT)
-  // The worker this slot was tracking does not change when the lease does, so its
-  // pids are carried into the new generation. Otherwise the reacquired lease would
-  // only record this dispatcher, and a dispatcher death would free a live worker.
-  const holders = inherited ? (readSlotRecord(inherited.path)?.pids ?? []) : []
+  // The workers this process bound to the slot do not change when the lease does,
+  // so their pids are carried into the new generation; otherwise the reacquired
+  // lease would only record this dispatcher, and a dispatcher death would free a
+  // live worker. The rest of the old record is deliberately dropped. An inherited
+  // slot was claimed by an ancestor, so its record also names that ancestor, and
+  // carrying it makes the new lease unreclaimable for as long as the ancestor
+  // lives - while the ancestor's own handle still names the generation it claimed
+  // and can no longer release this one. Enough nested dispatches would then retire
+  // the whole ceiling and leave acquireSlot polling an empty pool forever.
+  const holders = inherited ? forgetLocalHolders(inherited) : []
   if (inherited) {
+    untrackOwnedSlot(inherited)
     releaseSlot(inherited)
     delete env.AUTOPROMPT_GROK_SLOT
   }
@@ -755,7 +809,9 @@ async function withYieldedSlot(env, limit, options, work) {
   } finally {
     if (inherited) {
       const reacquired = await acquireSlot(env, limit, options)
-      bindHoldersToSlot(reacquired, holders)
+      // Taken for this process, not for a child, so this process must give it back.
+      trackOwnedSlot(reacquired)
+      if (holders.length > 0) bindHoldersToSlot(reacquired, holders)
       env.AUTOPROMPT_GROK_SLOT = formatSlotHandle(reacquired)
     }
   }

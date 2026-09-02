@@ -2,6 +2,7 @@
 'use strict'
 
 const assert = require('node:assert/strict')
+const childProcess = require('node:child_process')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -733,6 +734,107 @@ test('a slot follows the spawned child, not only the dispatcher that started it'
   assert.ok(carried.pids.includes(4242), 'the worker pid survived the generation change')
 
   dispatcher.releaseSlot(reacquired)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+// A yielded slot is inherited from an ancestor that is still running, and the
+// ancestor's own handle names the generation it claimed - not the one taken here.
+// So a reacquired lease that copies the ancestor's pid can never be released: its
+// only holder-of-record outlives it, its claimer cannot name it, and reclaimers
+// see a live holder. Enough nested dispatches retire the whole ceiling that way and
+// leave acquireSlot polling a pool nothing will ever free.
+test('a reacquired slot does not inherit holders that outlive it', async () => {
+  const { root } = sandbox('autoprompt-grok-lease-generation-')
+  const env = baseEnv({ AUTOPROMPT_GROK_SLOT_ROOT: root, AUTOPROMPT_GROK_MAX_SUBS: '1' })
+  const slotRoot = dispatcher.slotRoot(env)
+  fs.mkdirSync(slotRoot, { recursive: true })
+
+  // A live stand-in for the ancestor dispatcher that claimed this slot: it must
+  // still be running when the generation changes, or the record looks reclaimable
+  // for reasons that have nothing to do with the bug under test.
+  const ancestor = childProcess.spawn(
+    process.execPath,
+    ['-e', 'setTimeout(() => {}, 60000)'],
+    { stdio: 'ignore' },
+  )
+  try {
+    const slotPath = path.join(slotRoot, 'slot-0')
+    const inherited = { path: slotPath, id: 'c'.repeat(24) }
+    fs.writeFileSync(slotPath, JSON.stringify({
+      leaseId: inherited.id,
+      pids: [ancestor.pid, process.pid],
+      at: Date.now(),
+    }))
+
+    const yielding = { ...env, AUTOPROMPT_GROK_SLOT: dispatcher.formatSlotHandle(inherited) }
+    await dispatcher.withYieldedSlot(yielding, 1, {}, async () => {
+      assert.equal(fs.existsSync(slotPath), false, 'the slot was yielded for the wait')
+    })
+
+    const reacquired = dispatcher.parseSlotHandle(yielding.AUTOPROMPT_GROK_SLOT)
+    assert.notEqual(reacquired.id, inherited.id, 'the slot came back under a fresh lease')
+    const record = JSON.parse(fs.readFileSync(reacquired.path, 'utf8'))
+    assert.deepEqual(
+      record.pids,
+      [process.pid],
+      'the new generation records this dispatcher and no ancestor that could pin it',
+    )
+
+    // The point of the assertion above: with the ancestor gone from the record, the
+    // slot is reclaimable the moment its real holder dies, so the ceiling recovers.
+    fs.writeFileSync(reacquired.path, JSON.stringify({
+      ...record,
+      pids: [2 ** 30],
+    }))
+    const next = await dispatcher.acquireSlot(env, 1, { wait: async () => {} })
+    assert.notEqual(next.id, reacquired.id, 'a dead holder frees the index for the next claim')
+    assert.equal(dispatcher.releaseSlot(next), true)
+  } finally {
+    ancestor.kill()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// Nobody but this process can free a slot it reacquired for itself: the parent's
+// handle names the generation it claimed, and the env var naming the new one is a
+// copy in this process only. A dispatcher that exits without releasing it therefore
+// strands the index for as long as the run lasts.
+test('a dispatcher releases the slot it reacquired for itself when it exits', async () => {
+  const { root } = sandbox('autoprompt-grok-lease-exit-')
+  const slotBase = path.join(root, 'slots')
+  const env = baseEnv({ AUTOPROMPT_GROK_SLOT_ROOT: slotBase, AUTOPROMPT_GROK_MAX_SUBS: '1' })
+  const slotRoot = dispatcher.slotRoot(env)
+  fs.mkdirSync(slotRoot, { recursive: true })
+
+  const slotPath = path.join(slotRoot, 'slot-0')
+  const inheritedId = 'd'.repeat(24)
+  fs.writeFileSync(slotPath, JSON.stringify({
+    leaseId: inheritedId,
+    pids: [process.pid],
+    at: Date.now(),
+  }))
+
+  const script = [
+    `const dispatcher = require(${JSON.stringify(path.join(RUNTIME_ROOT, 'workflow', 'grok-dispatch.js'))});`,
+    `const env = ${JSON.stringify({
+      AUTOPROMPT_GROK_ACTIVATION: ACTIVATION,
+      AUTOPROMPT_GROK_SLOT_ROOT: slotBase,
+      AUTOPROMPT_GROK_SLOT: `${slotPath}#${inheritedId}`,
+    })};`,
+    'dispatcher.withYieldedSlot(env, 1, {}, async () => {}).then(() => {',
+    "  // The slot is genuinely held at this point; only exiting may give it back.",
+    '  if (!env.AUTOPROMPT_GROK_SLOT) process.exit(3);',
+    `  if (!require('node:fs').existsSync(dispatcher.parseSlotHandle(env.AUTOPROMPT_GROK_SLOT).path)) process.exit(4);`,
+    '}, error => { console.error(error); process.exit(5) });',
+  ].join('\n')
+
+  const finished = childProcess.spawnSync(process.execPath, ['-e', script], { encoding: 'utf8' })
+  assert.equal(finished.status, 0, finished.stderr)
+  const left = fs.existsSync(slotRoot)
+    ? fs.readdirSync(slotRoot).filter(entry => entry.includes('slot-'))
+    : []
+  assert.deepEqual(left, [], 'the reacquired slot did not outlive the dispatcher that took it')
+
   fs.rmSync(root, { recursive: true, force: true })
 })
 
