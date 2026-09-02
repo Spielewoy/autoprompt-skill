@@ -141,7 +141,7 @@ function renderVsCodeAgent(persona, source, personaIds) {
 
 function replaceSection(source, start, end, replacement) {
   const pattern = new RegExp(`${start}\\n[\\s\\S]*?\\n(?=${end})`)
-  if (!pattern.test(source)) throw new Error(`VS Code provider source is missing section ${start}`)
+  if (!pattern.test(source)) throw new Error(`Provider source is missing section ${start}`)
   return source.replace(pattern, `${replacement}\n\n`)
 }
 
@@ -256,6 +256,75 @@ function renderKiloProfile() {
   }, null, 2)}\n`
 }
 
+// Grok Build reads Claude-style tool names in an agent definition's `tools`
+// allowlist, so the canonical capability names map across unchanged.
+const GROK_TOOL_ORDER = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch']
+const GROK_DISPATCH_TOOL = 'mcp__autoprompt__dispatch'
+const GROK_RUNTIME_ID = 'grok-build-adapter-v1'
+const GROK_MAX_DEPTH = 4
+
+function grokTools(persona) {
+  const tools = GROK_TOOL_ORDER.filter(tool => persona.capabilities.includes(tool))
+  // Dispatchers reach children only through the sealed MCP dispatch tool. A
+  // non-empty allowlist is load-bearing: an empty one would inherit every tool.
+  if (persona.allowedChildren.length > 0) tools.push(GROK_DISPATCH_TOOL)
+  return tools
+}
+
+function grokDisallowedTools(persona) {
+  // `Agent` strips the native task tool: Grok Build caps native nesting at one
+  // level, so every Autoprompt edge goes through the sealed dispatcher instead.
+  // Non-dispatch roles also lose MCP discovery, which is how they reach it.
+  return persona.allowedChildren.length > 0
+    ? ['Agent']
+    : ['Agent', 'search_tool', 'use_tool']
+}
+
+function grokCapabilityMode(capabilities) {
+  const writes = capabilities.some(capability => capability === 'Write' || capability === 'Edit')
+  const executes = capabilities.includes('Bash')
+  if (writes && executes) return 'all'
+  if (writes) return 'read-write'
+  if (executes) return 'execute'
+  return 'read-only'
+}
+
+function validateGrokPersona(persona, personaIds) {
+  if (!Array.isArray(persona.allowedChildren)) {
+    throw new Error(`Grok persona ${persona.id} must define allowedChildren`)
+  }
+  if (new Set(persona.allowedChildren).size !== persona.allowedChildren.length) {
+    throw new Error(`Grok persona ${persona.id} repeats an allowed child`)
+  }
+  for (const child of persona.allowedChildren) {
+    if (!personaIds.has(child)) throw new Error(`Grok persona ${persona.id} has unknown child ${child}`)
+  }
+  if (persona.capabilities.includes('Agent') !== (persona.allowedChildren.length > 0)) {
+    throw new Error(`Grok persona ${persona.id} has inconsistent Agent capability`)
+  }
+}
+
+function renderGrokAgent(persona, source, personaIds) {
+  validateGrokPersona(persona, personaIds)
+  return asciiDashes([
+    '---',
+    `name: ${yamlDoubleQuoted(persona.id)}`,
+    `description: ${yamlDoubleQuoted(persona.description)}`,
+    `tools: ${yamlDoubleQuoted(grokTools(persona).join(', '))}`,
+    `disallowedTools: ${yamlDoubleQuoted(grokDisallowedTools(persona).join(', '))}`,
+    `capabilityMode: ${grokCapabilityMode(persona.capabilities)}`,
+    'permissionMode: default',
+    'model: inherit',
+    'promptMode: extend',
+    'mcpInheritance: none',
+    'discoverSkills: false',
+    'inheritSkills: false',
+    'agentsMd: true',
+    '---',
+    stripFrontmatter(source),
+  ].join('\n'))
+}
+
 const OMP_TOOL_ALIASES = [
   ['read', ['Read']],
   ['write', ['Write']],
@@ -297,6 +366,205 @@ function renderDeepSeekAgent(persona, source) {
     '---',
     stripFrontmatter(source),
   ].join('\n'))
+}
+
+function renderGrokTopology(personas, frameworks) {
+  return `${JSON.stringify({
+    schemaVersion: 1,
+    runtime: GROK_RUNTIME_ID,
+    maxDepth: GROK_MAX_DEPTH,
+    rootAllowedChildren: PRIME_ROOT_ALLOWED_CHILDREN,
+    frameworks: frameworks.map(framework => framework.id),
+    personas: Object.fromEntries(personas.map(persona => [persona.id, persona.allowedChildren])),
+  }, null, 2)}\n`
+}
+
+function renderGrokProfile(personas, frameworks) {
+  return [
+    '# Autoprompt activation profile for Grok Build.',
+    '# The launcher and the sealed dispatcher read this file. Grok Build does not:',
+    '# its own configuration stays in config.toml and is never rewritten wholesale.',
+    '[autoprompt]',
+    `runtime = "${GROK_RUNTIME_ID}"`,
+    `max_depth = ${GROK_MAX_DEPTH}`,
+    'dispatch = "sealed-headless-reentry"',
+    'mcp_server = "autoprompt"',
+    'native_subagent_spawn = "denied"',
+    `personas = ${personas.length}`,
+    `frameworks = ${frameworks.length}`,
+    '',
+  ].join('\n')
+}
+
+function grokDispatchDisclosure() {
+  return [
+    'Grok Build caps native subagent nesting at one level, so `spawn_subagent` can never',
+    'carry the L0-L4 topology. Every `ap-*` definition therefore denies the native task',
+    'tool, and every edge runs through the sealed dispatcher: it validates the launch',
+    'activation, the caller persona, the canonical child allowlist, the depth ceiling of',
+    '4, the framework registry, and the exact bytes of the prompt ledger before it starts',
+    'the child as its own `grok --prompt-file <envelope> --agent <definition>` process.',
+    'Dispatch roles reach it through the `autoprompt` MCP server (`autoprompt__dispatch`);',
+    'non-dispatch roles have MCP discovery removed, and the dispatcher refuses terminal',
+    'callers regardless. Because Grok Build offers user-scoped MCP servers to every',
+    'session, an activation token minted by the launcher is required before any dispatch:',
+    'a session Autoprompt did not start has none and is refused, never treated as the',
+    'conductor.',
+  ].join(' ')
+}
+
+function grokConcurrencyDisclosure() {
+  return [
+    'Dispatch a ready group in one call by passing `jobs`: every job is admitted before',
+    'any child starts, the group then runs concurrently, and all reports are collected',
+    'together. That is the spawn-all-then-collect shape, so reviewers, verifiers, and',
+    'disjoint lanes really do run in parallel. The live-child ceiling is run-global, not',
+    'per group: because every hop is its own process, the dispatchers of a run share',
+    'file-backed slots keyed to the run activation, so the conductor, each coordinator,',
+    'and each manager all draw from the same set. A dispatcher waiting on its own',
+    'children yields its slot for that wait, which is what keeps a full run from',
+    'deadlocking. The ceiling is `AUTOPROMPT_GROK_MAX_SUBS`, defaulting to the six live',
+    'children `tokensaver` allows; raise it for `wide` or `custom max_subs=N`. A denied',
+    'job cancels its whole group rather than leaving half a fleet running. Each slot is',
+    'held by a lease id rather than by its path: claiming hard-links a fully written file',
+    'into place, and releasing or reclaiming happens only while the lease on disk still',
+    'matches, so a stale holder cannot evict its successor and one dead holder is',
+    'reclaimed exactly once. The slot root therefore has to be a local filesystem that',
+    'supports hard links and exclusive creation - a POSIX temp directory or NTFS does,',
+    'FAT and network shares do not - and `AUTOPROMPT_GROK_SLOT_ROOT` moves it when the',
+    'default temp directory is not one. A root that cannot hold exclusive claims fails',
+    'the dispatch loudly instead of quietly oversubscribing the run.',
+  ].join(' ')
+}
+
+// The identity a dispatcher trusts is process environment, so the boundary is worth
+// stating plainly rather than implying more than it enforces.
+function grokThreatModelDisclosure() {
+  return [
+    'Scope of the seal: the activation token, persona, and depth travel in the child',
+    'process environment. That stops an ordinary Grok Build session from entering a run',
+    'and keeps a cooperating cast inside the canonical topology, and it is not a sandbox',
+    'against a worker that goes out of contract: a role holding `Bash` can read its own',
+    'environment and re-run the dispatcher with different values. Treat the allowlist as',
+    'run correctness, and rely on Grok Build permission modes and the persona tool',
+    'allowlists for containment.',
+  ].join(' ')
+}
+
+function renderGrokSkill(source) {
+  let output = asciiDashes(source).replaceAll('OpenCode', 'Grok Build')
+  output = replaceSection(output, '## 8\\. Grok Build model and effort', '## 9\\.', [
+    '## 8. Grok Build model and effort',
+    '',
+    'Grok Build `ap-*` roles are native agent definitions installed with the skill. Each one pins `model: inherit`, so a child uses the run model the launcher resolved; casting is `inherited-only` and no per-role model selector is available. Because every hop is a fresh top-level process, the dispatcher reapplies the run-wide model and reasoning effort on each child and carries both forward in the sealed environment, so depth 4 runs the same model as depth 1. The launcher resolves them from either `AUTOPROMPT_GROK_MODEL` and `AUTOPROMPT_GROK_EFFORT` or the `--model`, `-m`, `--reasoning-effort`, and `--effort` flags typed on its own command line, whichever the operator used. Record effort as exactly `inherited-only` unless the operator set one run-wide reasoning effort.',
+    '',
+    grokDispatchDisclosure(),
+    '',
+    grokConcurrencyDisclosure(),
+    '',
+    grokThreatModelDisclosure(),
+    '',
+    'Each definition carries an explicit `tools` allowlist built from the persona\'s canonical capabilities, using the Claude-compatible tool names Grok Build resolves natively. Unattended runs need an explicit permission mode: set `AUTOPROMPT_GROK_PERMISSION_MODE` to a Grok Build mode such as `acceptEdits` or `dontAsk`. The default is `default`, and `bypassPermissions` additionally requires `AUTOPROMPT_GROK_ALLOW_BYPASS=1`.',
+  ].join('\n'))
+  return replaceSection(output, '## 11\\. Run', '$', [
+    '## 11. Run',
+    '',
+    'Use Grok Build 1.0.0 or later, install the skill, and start through the launcher so the activation profile, the MCP dispatch registration, and the sealed depth-0 identity are checked first:',
+    '',
+    '```text',
+    '~/.grok/skills/autoprompt/workflow/launch-grok.sh',
+    '/autoprompt <mission>',
+    '```',
+    '',
+    'For an unattended supervisor run, drive the same launcher headlessly:',
+    '',
+    '```text',
+    'AUTOPROMPT_GROK_PERMISSION_MODE=acceptEdits \\',
+    '  ~/.grok/skills/autoprompt/workflow/launch-grok.sh -p "/autoprompt <mission>"',
+    '```',
+    '',
+    'A successful install leaves `autoprompt.grok.toml` beside `config.toml`, the sealed dispatcher under `skills/autoprompt/workflow/`, and one `[mcp_servers.autoprompt]` registration in `config.toml`. Doctor verifies all three before recursive use.',
+  ].join('\n')).replace(/\n+$/, '\n')
+}
+
+function renderGrokModes(source) {
+  const output = asciiDashes(source).replaceAll('OpenCode', 'Grok Build')
+  return replaceSection(output, '### Grok Build agent selection and effort', '## Steering', [
+    '### Grok Build agent selection and effort',
+    '',
+    'Grok Build casting is `inherited-only`: every installed `ap-*` definition pins',
+    '`model: inherit`, so each child process runs the model the launcher resolved for',
+    'the run.',
+    '',
+    '- `agents=off` or omitted: the routable mode; every role inherits the run model.',
+    '- any explicit model selector: not routable through these definitions; record',
+    '  `inherited-only` and do not claim that a selection applied.',
+    '',
+    'Record effort as exactly `inherited-only` unless the operator set one run-wide',
+    'reasoning effort, which the dispatcher applies unchanged to every child and carries',
+    'forward so deeper hops keep it.',
+    '',
+    grokDispatchDisclosure(),
+    '',
+    grokConcurrencyDisclosure(),
+    '',
+    grokThreatModelDisclosure(),
+  ].join('\n'))
+}
+
+function renderGrokGates(source) {
+  let output = asciiDashes(source).replaceAll('OpenCode', 'Grok Build')
+  output = output.replace(
+    /Grok Build agent selection is `inherited-only`:[\s\S]*?Model and effort never change gates or concurrency\./,
+    'Grok Build agent selection is `inherited-only`: the installed `ap-*` agent definitions pin `model: inherit` and run the model the launcher resolved. It does not use Claude Code model aliases, alias routing, or custom-agent TOML casting. Model and effort never change gates or concurrency.',
+  )
+  output = output.replace(
+    /The activation profile pins `subagent_depth = 4`[\s\S]*?These are ceilings, never spawn targets\./,
+    `${grokDispatchDisclosure()} ${grokConcurrencyDisclosure()} ${grokThreatModelDisclosure()} The activation profile pins that contract, and the depth ceiling of 4 is a ceiling, never a spawn target.`,
+  )
+  return output
+}
+
+function renderGrokProviderText(file, source) {
+  if (file === 'SKILL.md') return renderGrokSkill(source)
+  if (file === 'MODES.md') return renderGrokModes(source)
+  if (file === 'GATES.md') return renderGrokGates(source)
+  return asciiDashes(source).replaceAll('OpenCode', 'Grok Build')
+}
+
+function renderGrokReadme(provider) {
+  return [
+    '# Grok Build package',
+    '',
+    `This deterministic adapter targets Grok Build ${provider.target}, checked against the published source at \`${provider.official.commit.slice(0, 12)}\` (upstream source revision \`${provider.official.upstreamSourceRev.slice(0, 12)}\`).`,
+    '',
+    '- [`SKILL.md`](SKILL.md): L0 conductor prompt',
+    '- [`agents`](agents/): 25 native Grok Build agent definitions',
+    '- [`frameworks`](frameworks/): 18 task and gate workflows',
+    '- [`workflow`](workflow/): the sealed dispatcher, its MCP server, and the launchers',
+    '',
+    grokConcurrencyDisclosure(),
+    '- [`GATES.md`](GATES.md), [`MODES.md`](MODES.md), and [`PLAYBOOKS.md`](PLAYBOOKS.md): execution contracts',
+    '',
+    grokDispatchDisclosure(),
+    '',
+    '## What the seal is, and what it is not',
+    '',
+    'The seal is a topology boundary, not a privilege boundary. Every admission input - the activation token, the caller persona, and the parent depth - reaches the dispatcher as environment variables (`AUTOPROMPT_GROK_ACTIVATION`, `AUTOPROMPT_GROK_PERSONA`, `AUTOPROMPT_GROK_DEPTH`), and the launcher exports them into the whole Grok Build process tree so each hop can pass them to the next. A role that can run shell commands is therefore inside the trust boundary rather than behind it: it can invoke the dispatcher directly with a persona or a depth of its own choosing, and admission would honour the values it was handed. The same applies to `AUTOPROMPT_GROK_SLOT_ROOT`, which relocates the run-global ceiling.',
+    '',
+    'That is deliberate, and it is what the checks are worth. Enforced against accident: a role cannot reach a child it is not allowlisted for, exceed depth 4, run an unregistered framework, or dispatch from a prompt whose bytes do not match the ledger, so a confused or drifting agent fails closed instead of quietly widening the run - and a session Autoprompt never started has no activation token at all, which is what keeps an unrelated Grok Build session from picking up the user-scoped MCP server and acting as a conductor. Not enforced against a hostile role: nothing here is cryptographic or OS-enforced, so an agent that has been prompt-injected into running arbitrary commands can rewrite its own environment and re-enter the dispatcher as any persona at any depth.',
+    '',
+    'Holding these guarantees against a hostile role would mean moving lineage and authorization state out of the child\'s reach - a broker that issues per-edge, single-use capabilities and keeps the depth and persona of each edge on its own side instead of reading them back from the caller. That is a larger change than this adapter, so until it exists, treat these checks as run-integrity checks over cooperative agents rather than as a sandbox.',
+    '',
+    'The definitions pin `model: inherit`, so every role runs the model the launcher resolved. Installation adds one `[mcp_servers.autoprompt]` registration to `config.toml` transactionally, stores a byte-exact backup, and restores the prior bytes on rollback or uninstall.',
+    '',
+    '## Run slots on Windows',
+    '',
+    'The slot primitives are available on Windows and behave the same way: `link` maps to `CreateHardLinkW`, which needs no elevation on one NTFS volume; `rename` replaces an existing file; and Node opens files with delete sharing, so a concurrent reader does not block either. What Windows adds is transient contention - a scanner or indexer holding a handle surfaces as `EBUSY`, `EPERM`, or `EACCES` - so slot mutations retry briefly before failing, and a root that cannot do exclusive creation at all is refused with a message naming `AUTOPROMPT_GROK_SLOT_ROOT` rather than silently losing the ceiling.',
+    '',
+    'The slot race is covered by a test that drives real dispatcher processes through the primitives with no shell stub, so it runs wherever Node does, Windows included; the two stub-driven ceiling tests beside it are POSIX-only and say so where they skip. The installer\'s own Windows port is exercised only by the PowerShell lifecycle tests, which run on a Windows host and skip everywhere else, so nothing here reports an untested pass.',
+    '',
+  ].join('\n')
 }
 
 function renderReasonixAgent(persona, source) {
@@ -1130,6 +1398,7 @@ function renderOutputs(root = ROOT) {
       `agents/vscode/agents/${persona.id}.agent.md`,
       renderVsCodeAgent(persona, source, personaIds),
     )
+    outputs.set(`agents/grok/agents/${persona.id}.md`, renderGrokAgent(persona, source, personaIds))
     outputs.set(`agents/prime/personas/${persona.id}.md`, stripFrontmatter(source))
     outputs.set(`agents/omp/agents/${persona.id}.md`, renderOmpAgent(persona, source))
     outputs.set(`agents/deepseek/agents/${persona.id}.md`, renderDeepSeekAgent(persona, source))
@@ -1145,6 +1414,7 @@ function renderOutputs(root = ROOT) {
     outputs.set(`agents/opencode/frameworks/${framework.id}.md`, body)
     outputs.set(`agents/kilo/frameworks/${framework.id}.md`, body)
     outputs.set(`agents/vscode/frameworks/${framework.id}.md`, asciiDashes(body))
+    outputs.set(`agents/grok/frameworks/${framework.id}.md`, asciiDashes(body))
     outputs.set(`agents/prime/prompts/frameworks/${framework.id}.md`, [
       '---',
       `description: ${yamlDoubleQuoted(`Autoprompt ${framework.id} framework`)}`,
@@ -1172,6 +1442,19 @@ function renderOutputs(root = ROOT) {
   }
   outputs.set('agents/vscode/README.md', renderVsCodeReadme(contract.providers.vscode))
 
+  for (const file of ['SKILL.md', 'GATES.md', 'MODES.md', 'PLAYBOOKS.md']) {
+    outputs.set(
+      `agents/grok/${file}`,
+      renderGrokProviderText(file, read(`agents/opencode/${file}`, root)),
+    )
+  }
+  outputs.set('agents/grok/README.md', renderGrokReadme(contract.providers.grok))
+  outputs.set('agents/grok/autoprompt.grok.toml', renderGrokProfile(contract.personas, contract.frameworks))
+  outputs.set(
+    'agents/grok/workflow/autoprompt-topology.json',
+    renderGrokTopology(contract.personas, contract.frameworks),
+  )
+
   for (const provider of ['omp', 'deepseek', 'reasonix']) {
     for (const file of ['SKILL.md', 'GATES.md', 'MODES.md', 'PLAYBOOKS.md']) {
       outputs.set(
@@ -1197,7 +1480,7 @@ function renderOutputs(root = ROOT) {
 
   const packageVersion = JSON.parse(read('package.json', root)).version
   for (const provider of [
-    'claude', 'codex', 'opencode', 'kilo', 'vscode', 'omp', 'deepseek', 'reasonix',
+    'claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'omp', 'deepseek', 'reasonix',
   ]) {
     outputs.set(`agents/${provider}/VERSION`, `${packageVersion}\n`)
   }
@@ -1254,6 +1537,11 @@ if (require.main === module) process.exitCode = run(process.argv.slice(2))
 module.exports = {
   differingOutputs,
   renderCodexAgent,
+  renderGrokAgent,
+  renderGrokProfile,
+  renderGrokProviderText,
+  renderGrokReadme,
+  renderGrokTopology,
   renderKiloProfile,
   renderKiloProviderText,
   renderDeepSeekAgent,

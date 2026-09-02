@@ -30,6 +30,7 @@ AUTOPROMPT_INSTALL_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && 
 declare -A AUTOPROMPT_CLIENT_BIN=(
   [claude]=claude [codex]=codex [cursor]=cursor-agent [roo]=roo
   [opencode]=opencode [kilo]=kilo [vscode]=code
+  [grok]=grok
   [prime]=prime-agent
   [omp]=omp [deepseek]=dsh [reasonix]=reasonix
   [dcode]=dcode [gemini]=gemini [cline]=cline [goose]=goose
@@ -37,11 +38,11 @@ declare -A AUTOPROMPT_CLIENT_BIN=(
 AUTOPROMPT_VERSION_FLAG="--version"
 AUTOPROMPT_PROBE_TIMEOUT=10
 
-# Public install compatibility is a closed nine-provider registry. Historical
+# Public install compatibility is a closed ten-provider registry. Historical
 # path resolvers remain below only for receipt-owned cleanup of earlier installs.
 declare -A AUTOPROMPT_PROVIDER_STATUS=(
   [claude]=supported [codex]=supported [opencode]=supported
-  [kilo]=supported [vscode]=supported [prime]=supported
+  [kilo]=supported [vscode]=supported [grok]=supported [prime]=supported
   [omp]=supported [deepseek]=supported [reasonix]=supported
 )
 declare -A AUTOPROMPT_PROVIDER_BLOCK_REASON=()
@@ -192,6 +193,7 @@ autoprompt_config_root() {
   home="$(resolve_home "$name")" || return $?
   case "$name" in
     codex) printf '%s' "${CODEX_HOME:-$home/.codex}" ;;
+    grok) printf '%s' "${GROK_HOME:-$home/.grok}" ;;
     opencode|kilo) resolve_xdg "$home" ;;
     vibe) printf '%s' "${VIBE_HOME:-$home/.vibe}" ;;
     prime) printf '%s' "${PRIME_AGENT_CODING_AGENT_DIR:-$home/.prime/agent}" ;;
@@ -223,6 +225,7 @@ autoprompt_skill_root() {
     codex) printf '%s/skills/autoprompt' "$(autoprompt_config_root codex)" ;;
     opencode) printf '%s/opencode/skills/autoprompt' "$(autoprompt_config_root opencode)" ;;
     kilo) printf '%s/.kilo/skills/autoprompt' "$home" ;;
+    grok) printf '%s/skills/autoprompt' "$(autoprompt_config_root grok)" ;;
     vscode) printf '%s/.copilot/skills/autoprompt' "$home" ;;
     omp|deepseek|reasonix) printf '%s/skills/autoprompt' "$(autoprompt_config_root "$name")" ;;
     *) return 1 ;;
@@ -250,6 +253,7 @@ autoprompt_native_agents_root() {
     codex) printf '%s/agents-runtime' "$(autoprompt_skill_root codex)" ;;
     opencode) printf '%s/opencode/agents' "$(autoprompt_config_root opencode)" ;;
     kilo) printf '%s/kilo/agents' "$(autoprompt_config_root kilo)" ;;
+    grok) printf '%s/agents' "$(autoprompt_skill_root grok)" ;;
     vscode) printf '%s/.copilot/agents' "$home" ;;
     omp)
       autoprompt_omp_profile >/dev/null; omp_profile_status=$?
@@ -290,6 +294,7 @@ autoprompt_profile_file() {
         printf '%s/kilo/autoprompt.kilo.json' "$root"
       fi
       ;;
+    grok) printf '%s/autoprompt.grok.toml' "$root" ;;
     *) return 1 ;;
   esac
 }
@@ -422,7 +427,7 @@ detect_client() {
 # integer return (0 resolved, 2 unknown-client / no-such-variant, 3 no-home).
 # Error record -> stderr: client=<name> dest=- format=- error=<class>.
 #
-# Each value is a packed spec RELKIND|RELPATH|FORMAT where RELKIND in {HOME,XDG,CODEX}
+# Each value is a packed spec RELKIND|RELPATH|FORMAT where RELKIND in {HOME,XDG,CODEX,GROK}
 # selects the base ($home vs $xdg). Trailing-slash RELPATHs (kilo modes dir)
 # carry the slash verbatim into the record.
 declare -A AUTOPROMPT_CLIENT_DEST=(
@@ -435,6 +440,7 @@ declare -A AUTOPROMPT_CLIENT_DEST=(
   [goose]='HOME|.config/goose/recipes/autoprompt.yaml|goose-recipe'
   [opencode]='XDG|opencode/skills/autoprompt/SKILL.md|md-yaml'
   [kilo]='HOME|.kilo/skills/autoprompt/SKILL.md|md-yaml'
+  [grok]='GROK|skills/autoprompt/SKILL.md|md-claude'
   [vscode]='HOME|.copilot/skills/autoprompt/SKILL.md|md-yaml'
   [omp]='OMP|skills/autoprompt/SKILL.md|md-claude'
   [deepseek]='DSH|skills/autoprompt/SKILL.md|md-claude'
@@ -515,6 +521,8 @@ resolve_destination() {
     base="$(resolve_xdg "$home")"
   elif [ "$relkind" = "CODEX" ]; then
     base="${CODEX_HOME:-$home/.codex}"
+  elif [ "$relkind" = "GROK" ]; then
+    base="${GROK_HOME:-$home/.grok}"
   elif [ "$relkind" = "OMP" ]; then
     base="$(autoprompt_config_root omp)"
   elif [ "$relkind" = "DSH" ]; then
@@ -746,7 +754,7 @@ format_skill() {
 # Version floors are compatibility claims, so prerelease suffixes are significant.
 declare -A AUTOPROMPT_VERSION_FLOOR=(
   [claude]=2.1.219 [cursor]=2.5 [cline]=3.58 [opencode]=1.18.7 [kilo]=7.4.22
-  [vscode]=1.133.0 [prime]=0.7.2
+  [vscode]=1.133.0 [grok]=1.0.0 [prime]=0.7.2
   [omp]=17.4.0 [deepseek]=0.1.0-rc.7 [reasonix]=1.30.0
 )
 AUTOPROMPT_PRECHECK_MARKER_PREFIX=".autoprompt-precheck"
@@ -3787,6 +3795,15 @@ _uninstall_restore_one_configfile() {
   local -a indices=("$@")
   local backup="$file$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX" is_diverged=0
   if [ "${#indices[@]}" -eq 1 ] &&
+     [ "${UNINSTALL_RC_EDIT_KEY[indices[0]]}" = "$AUTOPROMPT_GROK_ACTIVATION_KEY" ]; then
+    local grok_prior="${UNINSTALL_RC_EDIT_PRIOR[indices[0]]}"
+    [ "${UNINSTALL_RC_EDIT_PRIOR_ISNULL[indices[0]]}" -eq 0 ] || grok_prior=absent
+    node "$(grok_config_helper)" restore --file "$file" \
+      --backup "$backup" --prior "$grok_prior" \
+      --server "${file%/*}/skills/autoprompt/workflow/grok-dispatch-server.js" || return 75
+    return 0
+  fi
+  if [ "${#indices[@]}" -eq 1 ] &&
      [ "${UNINSTALL_RC_EDIT_KEY[indices[0]]}" = "$AUTOPROMPT_VSCODE_ACTIVATION_KEY" ]; then
     local prior="${UNINSTALL_RC_EDIT_PRIOR[indices[0]]}"
     [ "${UNINSTALL_RC_EDIT_PRIOR_ISNULL[indices[0]]}" -eq 0 ] || prior=absent
@@ -4057,6 +4074,12 @@ _custom_install_root_owned_path() {
     _idem_paths_equal "$path" "$root/config.toml$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX"
     return $?
   }
+  [ "$provider" = grok ] && {
+    _idem_paths_equal "$path" "$root/autoprompt.grok.toml" && return 0
+    _idem_paths_equal "$path" "$root/config.toml" && return 0
+    _idem_paths_equal "$path" "$root/config.toml$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX"
+    return $?
+  }
   parent="${path%/*}"; basename="${path##*/}"
   case "$provider" in
     claude)
@@ -4148,6 +4171,17 @@ _kilo_owned_config_path() {
   _idem_path_under_root "$2" "$1/kilo"
 }
 
+_grok_owned_path() {
+  local root="$1" path="$2"
+  _idem_path_under_root "$path" "$root/skills/autoprompt" && return 0
+  _idem_paths_equal "$path" "$root/autoprompt.grok.toml" && return 0
+  _idem_paths_equal "$path" "$root/config.toml$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX"
+}
+
+_grok_owned_config_path() {
+  _idem_paths_equal "$2" "$1/config.toml"
+}
+
 _vscode_owned_path() {
   local path="$2" comparable parent basename
   _idem_path_under_root "$path" "$HOME/.copilot/skills/autoprompt" && return 0
@@ -4232,6 +4266,7 @@ _uninstall_provider_owns_path() {
   case "$provider" in
     opencode) _opencode_owned_path "$root" "$path" ;;
     kilo) _kilo_owned_path "$root" "$path" ;;
+    grok) _grok_owned_path "$root" "$path" ;;
     vscode) _vscode_owned_path "$root" "$path" ;;
     vibe) _vibe_owned_path "$root" "$path" ;;
     omp|deepseek|reasonix)
@@ -4254,7 +4289,7 @@ _uninstall_provider_owns_config_path() {
       opencode) _idem_paths_equal "$path" "$root/autoprompt.opencode.json" ;;
       kilo) _idem_paths_equal "$path" "$root/autoprompt.kilo.json" ;;
       vscode) _idem_paths_equal "$path" "$(vscode_settings_file)" ;;
-      codex) _idem_paths_equal "$path" "$root/config.toml" ;;
+      codex|grok) _idem_paths_equal "$path" "$root/config.toml" ;;
       omp) _idem_paths_equal "$path" "$root/config.yml" ;;
       reasonix) _idem_paths_equal "$path" "$root/config.toml" ;;
       *) return 1 ;;
@@ -4264,6 +4299,7 @@ _uninstall_provider_owns_config_path() {
   case "$provider" in
     opencode) _opencode_owned_config_path "$root" "$path" ;;
     kilo) _kilo_owned_config_path "$root" "$path" ;;
+    grok) _grok_owned_config_path "$root" "$path" ;;
     vscode) _vscode_owned_config_path "$root" "$path" ;;
     codex) _idem_paths_equal "$path" "$root/config.toml" ;;
     omp) _idem_paths_equal "$path" "$root/config.yml" ;;
@@ -4308,6 +4344,13 @@ _uninstall_provider_owns_directory() {
     _idem_paths_equal "$path" "$HOME/.kilo/skills/autoprompt" && return 0
     _idem_path_under_root "$path" "$HOME/.kilo/skills/autoprompt" && return 0
     _idem_path_under_root "$path" "$provider_root" && return 0
+  fi
+  if [ "$provider" = "grok" ]; then
+    _idem_paths_equal "$path" "$(autoprompt_config_root grok)" && return 0
+    _idem_paths_equal "$path" "$(autoprompt_config_root grok)/skills" && return 0
+    _idem_path_under_root "$path" "$(grok_runtime_root)" && return 0
+    _idem_paths_equal "$path" "$(grok_runtime_root)" && return 0
+    return 1
   fi
   if [ "$provider" = "vscode" ]; then
     _idem_paths_equal "$path" "$HOME/.copilot" && return 0
@@ -5037,6 +5080,61 @@ sys.exit(0 if ok else 1)
 PY
 }
 
+AUTOPROMPT_GROK_ACTIVATION_KEY='mcp_servers.autoprompt'
+
+grok_config_root() {
+  printf '%s' "${GROK_HOME:-$HOME/.grok}"
+}
+
+grok_runtime_root() {
+  printf '%s/skills/autoprompt' "$(autoprompt_config_root grok)"
+}
+
+grok_config_file() {
+  printf '%s/config.toml' "$(autoprompt_config_root grok)"
+}
+
+grok_dispatch_server() {
+  printf '%s/workflow/grok-dispatch-server.js' "$(grok_runtime_root)"
+}
+
+grok_config_helper() {
+  printf '%s/scripts/install/grok-config.cjs' "$AUTOPROMPT_INSTALL_REPO_ROOT"
+}
+
+# The MCP registration is the only Grok Build configuration Autoprompt owns, so
+# its status is reported the same way the VS Code activation setting is.
+grok_config_status() {
+  local helper config server
+  helper="$(grok_config_helper)"
+  config="$(grok_config_file)"
+  server="$(grok_dispatch_server)"
+  [ -f "$helper" ] && command -v node >/dev/null 2>&1 || {
+    printf '%s\n' 'status=activation-missing reason=config-helper-unavailable'
+    return 3
+  }
+  node "$helper" inspect --file "$config" --server "$server"
+}
+
+validate_grok_profile() {
+  awk '
+    BEGIN { runtime = 0; depth = 0; dispatch = 0; server = 0; native = 0; bad = 0 }
+    /^runtime = "grok-build-adapter-v1"$/ { runtime++; next }
+    /^max_depth = 4$/ { depth++; next }
+    /^dispatch = "sealed-headless-reentry"$/ { dispatch++; next }
+    /^mcp_server = "autoprompt"$/ { server++; next }
+    /^native_subagent_spawn = "denied"$/ { native++; next }
+    /^\[autoprompt\]$/ { next }
+    /^#/ { next }
+    /^[[:space:]]*$/ { next }
+    /^[a-z_]+ = / { next }
+    { bad = 1 }
+    END {
+      exit !(runtime == 1 && depth == 1 && dispatch == 1 && server == 1 && native == 1 && bad == 0)
+    }
+  ' < "$1" >/dev/null 2>&1
+}
+
 kilo_config_dir() {
   printf '%s/kilo' "${XDG_CONFIG_HOME:-$HOME/.config}"
 }
@@ -5153,7 +5251,7 @@ _extras_prepare_install() {
   [ -n "$resolved_root_ref" ] && return 0
   case "$client" in
     claude) resolved_root_ref="${skilldest%/.claude/skills/autoprompt}" ;;
-    codex) resolved_root_ref="${skilldest%/skills/autoprompt}" ;;
+    codex|grok) resolved_root_ref="${skilldest%/skills/autoprompt}" ;;
     *) resolved_root_ref="${skilldest%/*}" ;;
   esac
 }

@@ -12,7 +12,8 @@ const PACKAGE_VERSION = JSON.parse(fs.readFileSync(
   'utf8',
 )).version
 const PUBLIC_PROVIDERS = [
-  'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime', 'omp', 'deepseek', 'reasonix',
+  'claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime',
+  'omp', 'deepseek', 'reasonix',
 ]
 const LEGACY_PROVIDERS = ['vibe', 'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose']
 const LEGACY_PROVIDER_PATTERN = new RegExp(`\\b(?:${LEGACY_PROVIDERS.join('|')})\\b`, 'i')
@@ -49,7 +50,7 @@ function listFiles(relativePath) {
   return files.sort()
 }
 
-test('the public CLI exposes exactly nine providers and rejects legacy provider commands', () => {
+test('the public CLI exposes exactly ten providers and rejects legacy provider commands', () => {
   assert.deepEqual(PROVIDERS.map(provider => provider.id), PUBLIC_PROVIDERS)
   assert.doesNotMatch(HELP_TEXT, LEGACY_PROVIDER_PATTERN)
 
@@ -64,7 +65,7 @@ test('the public CLI exposes exactly nine providers and rejects legacy provider 
   }
 })
 
-test('public lifecycle entry points advertise only the nine supported providers', () => {
+test('public lifecycle entry points advertise only the ten supported providers', () => {
   for (const relativePath of [
     'scripts/install/install.ps1',
     'scripts/install/install.sh',
@@ -96,7 +97,7 @@ test('runtime manifests and npm allowlist contain only public provider packages'
   assert.doesNotMatch(packageJson.scripts['test:lifecycle'], /vibe|cursor/i)
 })
 
-test('public agent source contains only the nine supported provider packages', () => {
+test('public agent source contains only the ten supported provider packages', () => {
   const index = read('agents/README.md')
   assert.match(index, /\[Prime Agent\]\(prime\/\)/)
   assert.match(index, /\[Oh My Pi\]\(omp\/\)/)
@@ -200,7 +201,7 @@ test('unsupported model routing is stated plainly in every language', () => {
   for (const [relativePath, wording] of expectations) {
     const source = read(relativePath)
     const row = source.split('\n').find(line => line.includes('|') && line.includes('`agents=`')) ?? ''
-    assert.equal((row.match(/✕/g) ?? []).length, 7, relativePath)
-    assert.equal(row.split(wording).length - 1, 7, relativePath)
+    assert.equal((row.match(/✕/g) ?? []).length, 8, relativePath)
+    assert.equal(row.split(wording).length - 1, 8, relativePath)
   }
 })

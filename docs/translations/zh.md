@@ -72,6 +72,7 @@ autoprompt
 | 可用 | [Codex](https://github.com/openai/codex) | 支持子智能体的版本；已验证 0.147.0 | `codex` |
 | 可用 | [OpenCode](https://opencode.ai/docs/agents) | 1.18.7+；已验证 1.18.18 | `opencode` |
 | 可用 | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+；已验证 7.4.22 | `kilo` |
+| 可用 | [Grok Build](https://github.com/xai-org/grok-build) | 1.0.0+；已按 1.0.5 源码核对；密封派发适配器 | `grok` |
 | 可用 | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+；已验证 VS Code 1.133.0 和 Copilot 0.61.0 | `vscode` |
 | 可用 | [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 0.7.2；已验证 0.7.2；原生包适配器 | `prime` |
 | 可用 | [Oh My Pi](https://omp.sh/) | 17.4.0+；已在 17.4.0 上验证适配器契约、安装生命周期和原生角色载荷 | `omp` |
@@ -131,10 +132,10 @@ DeepSeek 的 82.7% 来自它自己的测试设置，不能当作可直接比较�
 
 使用 `mode=` 设置并发；编码工具支持时，可用 `agents=` 路由模型。
 
-| 控制项 | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| 自定义 `agents=` 路由 | ✓ | ✓ | ✕ 不支持 - 沿用当前模型 | ✕ 不支持 - 沿用当前模型 | ✕ 不支持 - 沿用当前模型 | ✕ 不支持 - 沿用所选父模型 | ✕ 不支持 - 沿用所选父模型 | ✕ 不支持 - 沿用所选父模型 | ✕ 不支持 - 沿用所选父模型 |
+| 控制项 | Claude Code | Codex | OpenCode | Kilo | Grok Build | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 自定义 `agents=` 路由 | ✓ | ✓ | ✕ 不支持 - 沿用当前模型 | ✕ 不支持 - 沿用当前模型 | ✕ 不支持 - 沿用本次运行模型 | ✕ 不支持 - 沿用当前模型 | ✕ 不支持 - 沿用所选父模型 | ✕ 不支持 - 沿用所选父模型 | ✕ 不支持 - 沿用所选父模型 | ✕ 不支持 - 沿用所选父模型 |
 
 ## 工作方式
 

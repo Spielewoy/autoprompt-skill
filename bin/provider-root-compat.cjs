@@ -129,6 +129,46 @@ function createProviderRootCompat(providerLabels) {
         }),
       ]),
     }),
+    grok: Object.freeze({
+      markers: Object.freeze([
+        Object.freeze({
+          label: 'autoprompt.grok.toml',
+          check(root) {
+            return matchAnchoredProfileLine(
+              root,
+              ['autoprompt.grok.toml'],
+              'runtime = "grok-build-adapter-v1"',
+            )
+          },
+        }),
+        Object.freeze({
+          label: 'skills/autoprompt/agents/ap-*.md (25 files)',
+          check(root) {
+            return matchAnchoredPatternCount(
+              root,
+              ['skills', 'autoprompt', 'agents'],
+              /^ap-.*\.md$/,
+              25,
+            )
+          },
+        }),
+        Object.freeze({
+          label: 'skills/autoprompt/workflow/grok-dispatch.js',
+          check(root) {
+            return matchAnchoredFile(root, ['skills', 'autoprompt', 'workflow', 'grok-dispatch.js'])
+          },
+        }),
+        Object.freeze({
+          label: 'skills/autoprompt/workflow/grok-dispatch-server.js',
+          check(root) {
+            return matchAnchoredFile(
+              root,
+              ['skills', 'autoprompt', 'workflow', 'grok-dispatch-server.js'],
+            )
+          },
+        }),
+      ]),
+    }),
     vscode: Object.freeze({
       externalWarning: 'The required VS Code subagent setting cannot be verified from this provider root.',
       markers: Object.freeze([
@@ -377,6 +417,19 @@ function matchAnchoredJsonSchema(root, segments, schema) {
   try {
     const parsed = JSON.parse(fs.readFileSync(target.absolutePath, 'utf8'))
     return parsed && parsed.$schema === schema
+      ? target
+      : { status: 'partial', absolutePath: target.absolutePath }
+  } catch {
+    return { status: 'partial', absolutePath: target.absolutePath }
+  }
+}
+
+function matchAnchoredProfileLine(root, segments, line) {
+  const target = matchAnchoredFile(root, segments)
+  if (target.status !== 'match') return target
+  try {
+    const text = fs.readFileSync(target.absolutePath, 'utf8').replace(/\r\n/g, '\n')
+    return text.split('\n').includes(line)
       ? target
       : { status: 'partial', absolutePath: target.absolutePath }
   } catch {

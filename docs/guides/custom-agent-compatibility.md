@@ -47,6 +47,7 @@ A copied `SKILL.md` is not enough. The host needs a native adapter and a safe li
 | Codex | Subagent-capable; checked on 0.147.0 | Skill, TOML roles, frameworks, multi-agent runtime | Custom routing |
 | OpenCode | 1.18.7+; checked on 1.18.18 | Skill, Markdown agents, activation profile | Inherits active model |
 | Kilo | 7.4.22+; checked on 7.4.22 | Skill, Markdown subagents, activation profile | Inherits active model |
+| Grok Build | 1.0.0+; source-checked on 1.0.5 | Skill, native agent definitions, sealed MCP dispatch, activation-gated headless re-entry | Inherits run model on every hop |
 | VS Code | 1.133+ with Copilot 0.61.0 | Copilot skill, `.agent.md` roles, recursive setting | Inherits active model |
 | Prime Agent | 0.7.2; checked on 0.7.2 | Native package, personas, framework prompts, guarded recursion | Inherits selected parent model |
 | Oh My Pi | 17.4.0+; adapter contract, install lifecycle, and native role payload verified for 17.4.0 | Skill, Markdown agents, native `spawns` allowlists | Inherits selected parent model |

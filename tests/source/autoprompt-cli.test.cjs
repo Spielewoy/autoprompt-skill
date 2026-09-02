@@ -171,6 +171,15 @@ function writeStrongCustomRoot(root, provider) {
       })
       writeRoles(path.join(root, 'agents'), '.md')
       return
+    case 'grok':
+      writeText(
+        path.join(root, 'autoprompt.grok.toml'),
+        '[autoprompt]\nruntime = "grok-build-adapter-v1"\n',
+      )
+      writeRoles(path.join(root, 'skills', 'autoprompt', 'agents'), '.md')
+      writeText(path.join(root, 'skills', 'autoprompt', 'workflow', 'grok-dispatch.js'))
+      writeText(path.join(root, 'skills', 'autoprompt', 'workflow', 'grok-dispatch-server.js'))
+      return
     case 'vscode':
       writeRoles(path.join(root, 'agents'), '.agent.md')
       return
@@ -335,12 +344,12 @@ test('interactive no-argument launch numbers every install provider plus the cus
   for (const [index, provider] of PROVIDERS.entries()) {
     assert.match(result.stdout, new RegExp(`${index + 1}\\) ${provider.label}`))
   }
-  assert.match(result.stdout, /10\) Custom coding agent/)
-  assert.match(result.stdout, /Provider \[1-10, Esc\]: /)
+  assert.match(result.stdout, /11\) Custom coding agent/)
+  assert.match(result.stdout, /Provider \[1-11, Esc\]: /)
   assert.deepEqual(
     PROVIDERS.map(provider => provider.id),
     [
-      'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime',
+      'claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime',
       'omp', 'deepseek', 'reasonix',
     ],
   )
@@ -679,7 +688,7 @@ test('interactive launch from a repo checkout does not self-install a newer regi
 
 test('interactive custom coding agent option exits safely with the compatibility guide URL', () => {
   const result = invoke([], {
-    answers: ['10'],
+    answers: ['11'],
     interactive: true,
   })
 
@@ -898,14 +907,14 @@ test('OMP custom-root evidence is the real invocable skill plus native agents, w
 
 test('interactive prompts reject invalid choices and closed input without mutating', () => {
   const retried = invoke([], {
-    answers: ['0', 'codex', '5', 'maybe', 'Y'],
+    answers: ['0', 'codex', '6', 'maybe', 'Y'],
     env: { HOME: path.join('test home', 'person') },
     interactive: true,
     platform: 'win32',
     responses: [{ status: 0 }],
   })
   assert.equal(retried.status, 0)
-  assert.match(retried.stdout, /Enter a number from 1 to 10\./)
+  assert.match(retried.stdout, /Enter a number from 1 to 11\./)
   assert.match(retried.stdout, /Please answer Y or N\./)
   assert.equal(retried.calls[0].args.at(-1), 'vscode')
 
@@ -960,6 +969,9 @@ test('provider install locations match default config roots and external VS Code
           { label: 'Native root', path: path.join(env.XDG_CONFIG_HOME, 'kilo') },
         ],
       },
+      grok: {
+        roots: [{ label: 'Install directory', path: path.join(home, '.grok') }],
+      },
       vscode: {
         roots: [{ label: 'Install directory', path: path.join(home, '.copilot') }],
         settings: path.join(home, 'AppData', 'Roaming', 'Code', 'User', 'settings.json'),
@@ -1012,6 +1024,13 @@ test('provider install locations match default config roots and external VS Code
   assert.equal(
     providerInstallLocations('prime', { env: { HOME: home }, platform: 'linux' }).roots[0].path,
     path.join(home, '.prime', 'agent'),
+  )
+  assert.equal(
+    providerInstallLocations('grok', {
+      env: { HOME: home, GROK_HOME: path.join('sandbox', 'grok state') },
+      platform: 'linux',
+    }).roots[0].path,
+    path.join('sandbox', 'grok state'),
   )
   for (const [provider, variable] of [
     ['omp', 'PI_CODING_AGENT_DIR'],
@@ -1098,7 +1117,7 @@ test('interactive chooser explains Kilo split roots and external VS Code setting
   assert.match(kilo.stdout, new RegExp(`Native root: ${path.join(xdg, 'kilo').replaceAll('\\', '\\\\')}`))
 
   const vscode = invoke([], {
-    answers: ['5', 'y'],
+    answers: ['6', 'y'],
     env: { HOME: home, APPDATA: path.join(home, 'roaming') },
     interactive: true,
     platform: 'win32',
@@ -1111,7 +1130,7 @@ test('interactive chooser explains Kilo split roots and external VS Code setting
 test('interactive chooser installs Prime through its detected native config root', () => {
   const primeRoot = path.join('test home', 'prime agent root')
   const result = invoke([], {
-    answers: ['6', 'y'],
+    answers: ['7', 'y'],
     env: { HOME: path.join('test home', 'person'), PRIME_AGENT_CODING_AGENT_DIR: primeRoot },
     interactive: true,
     platform: 'win32',
@@ -1130,7 +1149,7 @@ test('interactive strong Prime custom root reuses the lifecycle installer withou
   try {
     writeStrongCustomRoot(customRoot, 'prime')
     const result = invoke([], {
-      answers: ['6', 'n', customRoot],
+      answers: ['7', 'n', customRoot],
       env: { HOME: sandbox, PRIME_AGENT_CODING_AGENT_DIR: path.join(sandbox, 'detected-prime-root') },
       interactive: true,
       platform: 'win32',
@@ -1153,7 +1172,7 @@ test('interactive VS Code custom root requires confirmation because external act
   try {
     writeStrongCustomRoot(customRoot, 'vscode')
     const result = invoke([], {
-      answers: ['5', 'n', customRoot, 'yes'],
+      answers: ['6', 'n', customRoot, 'yes'],
       env: { HOME: sandbox },
       interactive: true,
       platform: 'win32',
@@ -1315,10 +1334,10 @@ test('interactive custom root warns on mismatched strong markers, re-prompts on 
   }
 })
 
-test('help stays lean and names only the nine public providers', () => {
+test('help stays lean and names only the ten public providers', () => {
   assert.match(
     HELP_TEXT,
-    /Interactive providers: claude, codex, opencode, kilo, vscode, prime, omp, deepseek, reasonix\./,
+    /Interactive providers: claude, codex, opencode, kilo, grok, vscode, prime, omp, deepseek, reasonix\./,
   )
   assert.doesNotMatch(HELP_TEXT, /\b(?:vibe|cursor|dcode|roo|gemini|cline|goose)\b/i)
   assert.match(HELP_TEXT, /^  autoprompt update$/m)

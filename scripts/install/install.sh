@@ -39,7 +39,7 @@ fi
 # shellcheck source=/dev/null
 . "$LIB"
 
-CLIENTS_ALL=(claude codex opencode kilo vscode prime omp deepseek reasonix)
+CLIENTS_ALL=(claude codex opencode kilo grok vscode prime omp deepseek reasonix)
 
 # Per-run result rows for the matrix (RESULT=/SKIP= lines), filled in this shell.
 RESULT_ROWS=()
@@ -72,6 +72,7 @@ payload_file() {
     codex)    printf '%s' "$REPO_ROOT/agents/codex/SKILL.md" ;;
     opencode) printf '%s' "$REPO_ROOT/agents/opencode/SKILL.md" ;;
     kilo)     printf '%s' "$REPO_ROOT/agents/kilo/SKILL.md" ;;
+    grok)     printf '%s' "$REPO_ROOT/agents/grok/SKILL.md" ;;
     vscode)   printf '%s' "$REPO_ROOT/agents/vscode/SKILL.md" ;;
     omp)      printf '%s' "$REPO_ROOT/agents/omp/SKILL.md" ;;
     deepseek) printf '%s' "$REPO_ROOT/agents/deepseek/SKILL.md" ;;
@@ -225,6 +226,7 @@ extras_src_dir() {
     codex)    printf '%s' "$REPO_ROOT/agents/codex" ;;
     opencode) printf '%s' "$REPO_ROOT/agents/opencode" ;;
     kilo)     printf '%s' "$REPO_ROOT/agents/kilo" ;;
+    grok)     printf '%s' "$REPO_ROOT/agents/grok" ;;
     vscode)   printf '%s' "$REPO_ROOT/agents/vscode" ;;
     omp)      printf '%s' "$REPO_ROOT/agents/omp" ;;
     deepseek) printf '%s' "$REPO_ROOT/agents/deepseek" ;;
@@ -507,6 +509,108 @@ install_vscode_activation() {
   esac
   rm -rf -- "$stage" 2>/dev/null
   verify_vscode_activation || return 99
+}
+
+verify_grok_activation() {
+  local runtime_root source_dir target_dir source_agent landed agents=0 status
+  runtime_root="$(grok_runtime_root)"
+  source_dir="$(extras_skill_dir grok)/agents"
+  target_dir="$runtime_root/agents"
+  for source_agent in "$source_dir"/ap-*.md; do
+    [ -f "$source_agent" ] || continue
+    agents=$((agents + 1))
+    landed="$target_dir/${source_agent##*/}"
+    if [ ! -f "$landed" ] || ! cmp -s "$source_agent" "$landed"; then
+      printf '%s\n' "client=grok verify=fail reason=agent-mismatch agent=${source_agent##*/}" >&2
+      return 1
+    fi
+  done
+  if [ "$agents" -ne 25 ]; then
+    printf '%s\n' "client=grok verify=fail reason=agent-count found=$agents expected=25" >&2
+    return 1
+  fi
+  if [ ! -f "$(grok_dispatch_server)" ] ||
+     [ ! -f "$runtime_root/workflow/grok-dispatch.js" ] ||
+     [ ! -f "$runtime_root/workflow/autoprompt-topology.json" ]; then
+    printf '%s\n' 'client=grok verify=fail reason=dispatcher-missing' >&2
+    return 1
+  fi
+  if ! validate_grok_profile "$(autoprompt_profile_file grok)"; then
+    printf '%s\n' 'client=grok verify=fail reason=profile-invalid' >&2
+    return 1
+  fi
+  status="$(grok_config_status 2>&1)" || {
+    printf '%s\n' "client=grok verify=fail reason=activation-missing detail=${status// /-}" >&2
+    return 1
+  }
+}
+
+install_grok_activation() {
+  local root profile source_profile helper config backup server
+  local stage desired original record prior managed_code separator=$'\037'
+  root="$(config_root grok)"
+  profile="$(autoprompt_profile_file grok)"
+  source_profile="$(extras_skill_dir grok)/autoprompt.grok.toml"
+  helper="$(grok_config_helper)"
+  config="$(grok_config_file)"
+  backup="$config$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX"
+  server="$(grok_dispatch_server)"
+  if [ ! -f "$helper" ] || ! command -v node >/dev/null 2>&1; then
+    printf '%s\n' 'client=grok error=activation-missing reason=config-helper-unavailable' >&2
+    return 98
+  fi
+  if [ ! -f "$source_profile" ] || ! validate_grok_profile "$source_profile"; then
+    printf 'Autoprompt install (grok): activation payload is incomplete under %s.\n' \
+      "$(extras_skill_dir grok)" >&2
+    return 96
+  fi
+  _idem_install_managed_file "$root" "$source_profile" "$profile" 1 || return 96
+
+  stage="$(mktemp -d 2>/dev/null)" || return 98
+  desired="$stage/config.toml"
+  original="$stage/config.original.toml"
+  if ! record="$(node "$helper" stage --file "$config" --output "$desired" \
+      --original "$original" --server "$server" 2>&1)"; then
+    rm -rf -- "$stage" 2>/dev/null
+    printf '%s\n' "client=grok error=activation-missing detail=${record// /-}" >&2
+    return 98
+  fi
+
+  case "$record" in
+    status=applied*)
+      prior="${record#* prior=}"
+      prior="${prior%% *}"
+      if [ -f "$original" ]; then
+        _idem_install_managed_file "$root" "$original" "$backup" 1 0 0
+        managed_code=$?
+        if [ "$managed_code" -ne 0 ]; then
+          rm -rf -- "$stage" 2>/dev/null
+          printf '%s\n' "client=grok error=activation-missing detail=backup-batch-code-$managed_code" >&2
+          return 98
+        fi
+      fi
+      _idem_install_managed_file "$root" "$desired" "$config" 1 0 1
+      managed_code=$?
+      if [ "$managed_code" -ne 0 ]; then
+        rm -rf -- "$stage" 2>/dev/null
+        printf '%s\n' "client=grok error=activation-missing detail=config-batch-code-$managed_code" >&2
+        return 98
+      fi
+      [ "$prior" != absent ] || prior="$AUTOPROMPT_RECEIPT_ABSENT"
+      AUTOPROMPT_RECEIPT_EDITS+=(
+        "$config$separator$AUTOPROMPT_GROK_ACTIVATION_KEY${separator}true$separator$prior"
+      )
+      [ ! -f "$backup" ] || AUTOPROMPT_CONFIGEDIT_LAST_BACKUP="$backup"
+      ;;
+    status=noop*) ;;
+    *)
+      rm -rf -- "$stage" 2>/dev/null
+      printf '%s\n' 'client=grok error=activation-missing detail=config-stage-invalid-result' >&2
+      return 98
+      ;;
+  esac
+  rm -rf -- "$stage" 2>/dev/null
+  verify_grok_activation || return 97
 }
 
 opencode_config_dir() {
@@ -1102,6 +1206,11 @@ _landing_activate_client() {
      { ! prune_stale_kilo_agents || ! install_kilo_activation; }; then
     _landing_fail "$client" agents \
       "Autoprompt install ($client): native activation failed."
+    return 1
+  fi
+  if [ "$client" = grok ] && ! install_grok_activation; then
+    _landing_fail "$client" activation-missing \
+      "Autoprompt install ($client): activation-missing; config.toml was not changed."
     return 1
   fi
   if [ "$client" = vscode ] && ! install_vscode_activation; then

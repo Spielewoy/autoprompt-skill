@@ -12,7 +12,7 @@ const ROOT = path.resolve(__dirname, '..', '..')
 const PACKAGE_PATH = path.join(ROOT, 'package.json')
 const PACKAGE_VERSION = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8')).version
 const PROVIDERS = [
-  'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime',
+  'claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime',
   'omp', 'deepseek', 'reasonix',
 ]
 
@@ -187,6 +187,7 @@ test('package metadata is public-ready under the exact available name and remain
     'provider-compatibility-registry',
     'codex-current-parity',
     'prime-provider',
+    'grok-provider',
     'harness-provider-config',
   ]) {
     assert.match(packageJson.scripts['test:providers'], new RegExp(`${suite}\\.test\\.cjs`), suite)
@@ -198,6 +199,7 @@ test('package metadata is public-ready under the exact available name and remain
     'vscode-lifecycle',
     'install-custom-root',
     'prime-lifecycle',
+    'grok-lifecycle',
     'new-harness-lifecycle',
     'packed-new-harness-lifecycle',
   ]) {
@@ -222,6 +224,7 @@ test('package metadata is public-ready under the exact available name and remain
     'agents/codex/',
     'agents/opencode/',
     'agents/kilo/',
+    'agents/grok/',
     'agents/vscode/',
     'agents/prime/',
     'agents/omp/',
@@ -231,6 +234,7 @@ test('package metadata is public-ready under the exact available name and remain
     'agents/manifests/codex-runtime.json',
     'agents/manifests/opencode-runtime.json',
     'agents/manifests/kilo-runtime.json',
+    'agents/manifests/grok-runtime.json',
     'agents/manifests/vscode-runtime.json',
     'agents/manifests/prime-runtime.json',
     'agents/manifests/omp-runtime.json',

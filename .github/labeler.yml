@@ -70,6 +70,12 @@
   - changed-files:
       - any-glob-to-any-file: "agents/kilo/**"
 
+"provider: grok":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "agents/grok/**"
+          - "scripts/install/grok-config.cjs"
+
 "provider: vscode":
   - changed-files:
       - any-glob-to-any-file: "agents/vscode/**"

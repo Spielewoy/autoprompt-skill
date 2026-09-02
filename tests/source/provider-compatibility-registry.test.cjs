@@ -13,7 +13,7 @@ const ROOT = path.resolve(__dirname, '..', '..')
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
 const INSTALL_DIR = path.join(ROOT, 'scripts', 'install')
 const PUBLIC = [
-  'claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime',
+  'claude', 'codex', 'opencode', 'kilo', 'grok', 'vscode', 'prime',
   'omp', 'deepseek', 'reasonix',
 ]
 const LEGACY = ['vibe', 'cursor', 'dcode', 'roo', 'gemini', 'cline', 'goose']
@@ -161,7 +161,7 @@ function writeLegacySharedReceipt(home, flavor) {
   return { claude, cursor, receiptPath }
 }
 
-test('both ports declare exactly nine public install providers and no generic payload fallback', () => {
+test('both ports declare exactly ten public install providers and no generic payload fallback', () => {
   const shellLib = fs.readFileSync(path.join(INSTALL_DIR, 'lib', 'install-lib.sh'), 'utf8')
   const psLib = fs.readFileSync(path.join(INSTALL_DIR, 'lib', 'install-lib.ps1'), 'utf8')
   const shellInstall = fs.readFileSync(path.join(INSTALL_DIR, 'install.sh'), 'utf8')
@@ -309,7 +309,7 @@ test('legacy providers fail as unknown before install writes in both ports', {
   }
 })
 
-test('install all reports only the nine public providers in both ports', {
+test('install all reports only the ten public providers in both ports', {
   skip: process.platform !== 'win32',
 }, () => {
   const bash = findBash()
@@ -331,7 +331,7 @@ test('install all reports only the nine public providers in both ports', {
   }
 })
 
-test('default doctor reports only the nine public providers', {
+test('default doctor reports only the ten public providers', {
   skip: process.platform !== 'win32',
 }, () => {
   const bash = findBash()

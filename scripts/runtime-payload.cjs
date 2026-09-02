@@ -55,6 +55,17 @@ const PROVIDERS = {
     agents: 'personas',
     workflow: [],
   },
+  grok: {
+    topLevel: ['GATES.md', 'MODES.md', 'PLAYBOOKS.md', 'README.md', 'VERSION', 'autoprompt.grok.toml'],
+    agents: 'personas',
+    workflow: [
+      'autoprompt-topology.json',
+      'grok-dispatch-server.js',
+      'grok-dispatch.js',
+      'launch-grok.ps1',
+      'launch-grok.sh',
+    ],
+  },
   vscode: {
     topLevel: ['GATES.md', 'MODES.md', 'PLAYBOOKS.md', 'README.md', 'SKILL.md', 'VERSION'],
     agents: 'vscode-personas',

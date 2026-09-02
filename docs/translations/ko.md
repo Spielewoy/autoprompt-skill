@@ -72,6 +72,7 @@ autoprompt
 | 지원 | [Codex](https://github.com/openai/codex) | 서브에이전트 지원 빌드; 0.147.0 검증 완료 | `codex` |
 | 지원 | [OpenCode](https://opencode.ai/docs/agents) | 1.18.7+; 1.18.18 검증 완료 | `opencode` |
 | 지원 | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; 7.4.22 검증 완료 | `kilo` |
+| 지원 | [Grok Build](https://github.com/xai-org/grok-build) | 1.0.0+; 1.0.5 소스 확인; 봉인 디스패치 어댑터 | `grok` |
 | 지원 | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; VS Code 1.133.0 및 Copilot 0.61.0 검증 완료 | `vscode` |
 | 지원 | [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 0.7.2; 0.7.2 검증 완료; 네이티브 패키지 어댑터 | `prime` |
 | 지원 | [Oh My Pi](https://omp.sh/) | 17.4.0+; 17.4.0에서 어댑터 계약, 설치 수명주기, 네이티브 역할 페이로드 검증 완료 | `omp` |
@@ -131,10 +132,10 @@ DeepSeek의 82.7%는 자체 테스트 설정에서 나온 결과이므로 직접
 
 `mode=`로 동시 실행을 설정하고, 호스트가 지원하면 `agents=`로 모델을 라우팅하세요.
 
-| 제어 | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| 사용자 지정 `agents=` 라우팅 | ✓ | ✓ | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 |
+| 제어 | Claude Code | Codex | OpenCode | Kilo | Grok Build | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 사용자 지정 `agents=` 라우팅 | ✓ | ✓ | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 실행 모델 사용 | ✕ 미지원 - 활성 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 | ✕ 미지원 - 선택한 부모 모델 사용 |
 
 ## 작동 방식
 

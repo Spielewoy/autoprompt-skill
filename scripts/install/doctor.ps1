@@ -24,7 +24,7 @@ if (-not (Test-Path -LiteralPath $Lib -PathType Leaf)) {
 . $Lib
 
 $ClientsAll = @(
-    'claude','codex','opencode','kilo','vscode','prime',
+    'claude','codex','opencode','kilo','grok','vscode','prime',
     'omp','deepseek','reasonix'
 )
 
@@ -198,6 +198,46 @@ function Get-KiloActivationStatus {
     return 'complete'
 }
 
+# The activation state beyond the hash-bound payload: the harness profile beside
+# config.toml, the sealed dispatcher, and the one MCP registration Autoprompt owns.
+function Get-GrokActivationStatus {
+    param([string]$Skill)
+    $profilePath = Get-AutopromptProfileFile -Name 'grok'
+    if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) {
+        return 'missing:autoprompt.grok.toml'
+    }
+    if (-not (Test-GrokProfilePolicy -Path $profilePath)) {
+        return 'invalid:profile-policy'
+    }
+    foreach ($runtimeFile in @('grok-dispatch.js', 'grok-dispatch-server.js',
+        'autoprompt-topology.json')) {
+        $candidate = Join-Path (Join-Path $Skill 'workflow') $runtimeFile
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return 'missing:dispatcher'
+        }
+    }
+    $sourceAgents = @(Get-ChildItem -LiteralPath (Join-Path $Skill 'agents') `
+        -Filter 'ap-*.md' -File -ErrorAction SilentlyContinue)
+    if ($sourceAgents.Count -ne 25) { return 'missing:agents' }
+    $helper = Get-GrokConfigHelper
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf) -or
+        -not (Get-Command node -ErrorAction SilentlyContinue)) {
+        return 'activation-missing:config-helper-unavailable'
+    }
+    $output = @(& node $helper inspect --file (Get-GrokConfigFile) `
+        --server (Get-GrokDispatchServer) 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        $record = $output -join ' '
+        $reason = if ($record -match 'reason=(\S+)') {
+            $Matches[1]
+        } else {
+            'config-invalid'
+        }
+        return "activation-missing:$reason"
+    }
+    return 'complete'
+}
+
 function Get-VscodeActivationStatus {
     param([string]$Skill)
     $sourceAgents = @(Get-ChildItem -LiteralPath (Join-Path $Skill 'agents') `
@@ -321,6 +361,7 @@ function Get-ExtrasStatus {
                 (Get-AutopromptProfileFile -Name 'kilo')
             $skill = Get-AutopromptRuntimeRoot -Name 'kilo'
         }
+        'grok' { $skill = Get-AutopromptRuntimeRoot -Name 'grok' }
         'vscode' { $skill = Get-AutopromptRuntimeRoot -Name 'vscode' }
         'omp' { $skill = Get-AutopromptRuntimeRoot -Name 'omp' }
         'deepseek' { $skill = Get-AutopromptRuntimeRoot -Name 'deepseek' }
@@ -344,6 +385,9 @@ function Get-ExtrasStatus {
         }
         if ($Client -eq 'kilo') {
             return (Get-KiloActivationStatus -Base $kiloBase -Skill $skill)
+        }
+        if ($Client -eq 'grok') {
+            return (Get-GrokActivationStatus -Skill $skill)
         }
         if ($Client -eq 'vscode') {
             return (Get-VscodeActivationStatus -Skill $skill)

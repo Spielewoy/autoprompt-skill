@@ -25,7 +25,7 @@ if (-not (Test-Path -LiteralPath $Lib -PathType Leaf)) {
 . $Lib
 
 $ClientsAll = @(
-    'prime','vscode','claude','codex','opencode','kilo',
+    'prime','vscode','claude','codex','opencode','kilo','grok',
     'omp','deepseek','reasonix'
 )
 $LegacyCleanupClients = @('vibe','cursor','roo','gemini','cline','goose','dcode')
