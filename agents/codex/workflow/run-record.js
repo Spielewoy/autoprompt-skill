@@ -21,7 +21,8 @@ const {
 const requestApi = require('./request-envelope')
 const routeApi = require('./route-transcript')
 const routeDecisionApi = require('./route-decision')
-const { stableStringify } = require('./event-log.js')
+const { fsyncDirectory, stableStringify } = require('./event-log.js')
+const { withStrictAnchoredManifestPath } = require('./runtime-state.js')
 const ROLE_CONTRACT = require('../../contracts/roles.json')
 
 const RUN_RECORD_SCHEMA = 'autoprompt.run-record.v2'
@@ -31,6 +32,8 @@ const ROUTE_RECOMMENDATION_STATE_PATH = 'route/recommendation-state.json'
 const CODEX_PHYSICAL_EXECUTION_PATH = 'route/codex-physical-execution.json'
 const CAPTURED_DOMAIN_ADMISSION_PATH = 'work/captured-domain-admission.json'
 const CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH = 'work/captured-domain-admission-receipt.json'
+const TERMINAL_FINALIZATION_INTENT_SCHEMA = 'autoprompt.terminal-finalization-intent.v1'
+const TERMINAL_FINALIZATION_INTENT_MAX_BYTES = 8 * 1024 * 1024
 const FRAMEWORK_ORCHESTRATION_DIRECTORY = 'work/framework-orchestration'
 const RESIDUAL_RISK_AUTHORITY_DIRECTORY = 'checks/residual-risk-authority'
 const FRAMEWORK_ORCHESTRATION_PATH_PATTERN = /^work\/framework-orchestration\/[a-f0-9]{64}\.json$/
@@ -52,6 +55,7 @@ const RUNTIME_PATHS = Object.freeze({
   transaction: 'runtime/state.json.transaction',
   events: 'runtime/events.jsonl',
   blobs: 'runtime/blobs',
+  terminalFinalizationIntent: 'runtime/terminal-finalization-intent.json',
   terminal: 'terminal.json',
   cleanupRegistry: 'cleanup/registry.json',
   processRegistry: 'runtime/processes.json',
@@ -86,7 +90,7 @@ const EXACT_REGISTERED_PATHS = new Set([
   'work/ownership.json', CAPTURED_DOMAIN_ADMISSION_PATH,
   CAPTURED_DOMAIN_ADMISSION_RECEIPT_PATH, 'work/deferred-promotion.json',
   'checks/commands.jsonl', PRE_MUTATION_BASELINE_PATH, ALL_WORK_JOINED_PATH, 'checks/captured-domain-outcomes.json',
-  RUNTIME_PATHS.metadata, RUNTIME_PATHS.metadataDigest, RUNTIME_PATHS.state, RUNTIME_PATHS.transaction, RUNTIME_PATHS.events, RUNTIME_PATHS.terminal, RUNTIME_PATHS.cleanupRegistry, RUNTIME_PATHS.processRegistry,
+  RUNTIME_PATHS.metadata, RUNTIME_PATHS.metadataDigest, RUNTIME_PATHS.state, RUNTIME_PATHS.transaction, RUNTIME_PATHS.events, RUNTIME_PATHS.terminalFinalizationIntent, RUNTIME_PATHS.terminal, RUNTIME_PATHS.cleanupRegistry, RUNTIME_PATHS.processRegistry,
   RUNTIME_PATHS.aliasTelemetry,
   RUNTIME_PATHS.accounting, RUNTIME_PATHS.budget,
   RUNTIME_PATHS.recoveryCheckpoints, RUNTIME_PATHS.recoveryCheckpoint,
@@ -113,6 +117,7 @@ const OPTIONAL_DIRECTORIES = Object.freeze([
 ])
 const IMMUTABLE_PATHS = new Set([
   RUNTIME_PATHS.metadata, RUNTIME_PATHS.metadataDigest,
+  RUNTIME_PATHS.terminalFinalizationIntent,
   PRE_MUTATION_BASELINE_PATH, ALL_WORK_JOINED_PATH, ROUTE_RECOMMENDATION_STATE_PATH,
 ])
 const APPEND_ONLY_PATHS = new Set([RUNTIME_PATHS.aliasTelemetry, RUNTIME_PATHS.recoveryCheckpoints])
@@ -651,6 +656,354 @@ function assertRunRecordBinding(record) {
   return true
 }
 
+function terminalFinalizationIntentHash(intent) {
+  const unsigned = { ...intent }
+  delete unsigned.intentHash
+  return crypto.createHash('sha256').update(stableStringify(unsigned), 'utf8').digest('hex')
+}
+
+function normalizeTerminalFinalizationManifest(entries) {
+  if (!Array.isArray(entries)) {
+    throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_INVALID', 'terminal finalization deliverables must be an array')
+  }
+  const manifest = entries.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+        typeof entry.path !== 'string' || !path.isAbsolute(entry.path) ||
+        !/^[a-f0-9]{64}$/u.test(entry.hash || '') ||
+        (entry.type !== undefined && !['file', 'directory'].includes(entry.type))) {
+      throw new RunRecordError(
+        'TERMINAL_FINALIZATION_INTENT_INVALID',
+        'terminal finalization deliverables require an absolute path, SHA-256 hash, and optional file/directory type',
+      )
+    }
+    return entry.type === 'directory'
+      ? { path: path.resolve(entry.path), hash: entry.hash, type: 'directory' }
+      : { path: path.resolve(entry.path), hash: entry.hash }
+  }).sort((left, right) => left.path.localeCompare(right.path))
+  if (manifest.some((entry, index) => index > 0 && manifest[index - 1].path === entry.path)) {
+    throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_INVALID', 'terminal finalization deliverable paths must be unique')
+  }
+  return manifest
+}
+
+function canonicalTerminalFinalizationIntent(input = {}) {
+  const checkHashes = Array.isArray(input.checkHashes) ? [...input.checkHashes] : null
+  const route = input.route === undefined ? null : input.route
+  if (typeof input.runId !== 'string' || !input.runId ||
+      typeof input.activationId !== 'string' || !input.activationId ||
+      !Number.isSafeInteger(input.generation) || input.generation < 1 ||
+      !/^[a-f0-9]{64}$/u.test(input.missionHash || '') ||
+      !/^[a-f0-9]{64}$/u.test(input.requestEnvelopeHash || '') ||
+      !Number.isSafeInteger(input.workspaceEpoch) || input.workspaceEpoch < 0 ||
+      !['DONE', 'PARTIAL', 'BLOCKED', 'FAILED', 'CANCELLED'].includes(input.outcome) ||
+      ![null, 'DIRECT', 'LIGHT', 'ROADMAP'].includes(route) ||
+      typeof input.reason !== 'string' || !input.reason ||
+      checkHashes === null || checkHashes.some(hash => !/^[a-f0-9]{64}$/u.test(hash || '')) ||
+      !(input.unblockPath === null || typeof input.unblockPath === 'string')) {
+    throw new RunRecordError(
+      'TERMINAL_FINALIZATION_INTENT_INVALID',
+      'terminal finalization intent is not bound to one run, activation generation, epoch, outcome, and evidence set',
+    )
+  }
+  let canonicalTerminalEnvelope
+  let canonicalFinalResponse
+  try {
+    canonicalTerminalEnvelope = JSON.parse(stableStringify(input.terminalEnvelope === undefined ? null : input.terminalEnvelope))
+    const finalResponse = input.finalResponse === undefined ? null : input.finalResponse
+    if (!(finalResponse === null ||
+        (typeof finalResponse === 'object' && !Array.isArray(finalResponse)))) {
+      throw new Error('finalResponse must be one canonical JSON object or null')
+    }
+    canonicalFinalResponse = JSON.parse(stableStringify(finalResponse))
+  } catch (error) {
+    throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_INVALID', 'terminal finalization envelope and finalResponse must be canonical JSON', {
+      cause: error.code || error.message,
+    })
+  }
+  const intent = {
+    schema: TERMINAL_FINALIZATION_INTENT_SCHEMA,
+    schemaVersion: 1,
+    runId: input.runId,
+    activationId: input.activationId,
+    generation: input.generation,
+    missionHash: input.missionHash,
+    requestEnvelopeHash: input.requestEnvelopeHash,
+    workspaceEpoch: input.workspaceEpoch,
+    outcome: input.outcome,
+    route,
+    reason: input.reason,
+    deliverableManifest: normalizeTerminalFinalizationManifest(input.deliverableManifest),
+    checkHashes,
+    terminalEnvelope: canonicalTerminalEnvelope,
+    finalResponse: canonicalFinalResponse,
+    unblockPath: input.unblockPath,
+    intentHash: '0'.repeat(64),
+  }
+  intent.intentHash = terminalFinalizationIntentHash(intent)
+  const bytes = stableStringify(intent)
+  const byteLength = Buffer.byteLength(bytes, 'utf8')
+  if (byteLength > TERMINAL_FINALIZATION_INTENT_MAX_BYTES) {
+    throw new RunRecordError(
+      'TERMINAL_FINALIZATION_INTENT_INVALID',
+      'terminal finalization intent exceeds its finite canonical byte boundary',
+      { byteLength, maximumBytes: TERMINAL_FINALIZATION_INTENT_MAX_BYTES },
+    )
+  }
+  return JSON.parse(bytes)
+}
+
+function validateTerminalFinalizationIntent(intent, expectedRunId) {
+  const errors = []
+  if (!intent || typeof intent !== 'object' || Array.isArray(intent) ||
+      intent.schema !== TERMINAL_FINALIZATION_INTENT_SCHEMA || intent.schemaVersion !== 1) {
+    return { valid: false, errors: ['terminal finalization intent schema is invalid'] }
+  }
+  let canonical
+  try {
+    canonical = canonicalTerminalFinalizationIntent(intent)
+  } catch (error) {
+    return { valid: false, errors: [error.message] }
+  }
+  if (expectedRunId !== undefined && canonical.runId !== expectedRunId) {
+    errors.push('terminal finalization intent belongs to a foreign run')
+  }
+  if (stableStringify(intent) !== stableStringify(canonical)) {
+    errors.push('terminal finalization intent contains noncanonical or unregistered fields')
+  }
+  if (intent.intentHash !== terminalFinalizationIntentHash(intent)) {
+    errors.push('terminal finalization intent hash does not bind its exact canonical body')
+  }
+  return { valid: errors.length === 0, errors }
+}
+
+function terminalFinalizationIntentPath(runPath) {
+  const absolute = path.resolve(runPath)
+  const intentPath = path.join(absolute, ...RUNTIME_PATHS.terminalFinalizationIntent.split('/'))
+  if (!pathIsInside(absolute, intentPath)) {
+    throw new RunRecordError('RUN_RECORD_UNSAFE', 'terminal finalization intent path escapes its run record')
+  }
+  return intentPath
+}
+
+function withTerminalFinalizationIntentAuthority(runPath, fsImpl, operation) {
+  const absolute = path.resolve(runPath)
+  const intentPath = terminalFinalizationIntentPath(absolute)
+  try {
+    return withStrictAnchoredManifestPath(intentPath, fsImpl, (anchoredIntentPath, verifyLineage) => operation(Object.freeze({
+      runPath: absolute,
+      intentPath,
+      anchoredIntentPath,
+      anchoredDirectory: path.dirname(anchoredIntentPath),
+      verifyLineage,
+    })))
+  } catch (error) {
+    if (error instanceof RunRecordError) throw error
+    throw new RunRecordError(
+      'RUN_RECORD_UNSAFE',
+      'terminal finalization intent authority has a linked or unstable directory lineage',
+      { cause: error && (error.code || error.message) },
+    )
+  }
+}
+
+function assertTerminalFinalizationIntentAuthority(runPath, fsImpl) {
+  const intentPath = terminalFinalizationIntentPath(path.resolve(runPath))
+  withTerminalFinalizationIntentAuthority(runPath, fsImpl, () => true)
+  return intentPath
+}
+
+function samePhysicalFile(left, right) {
+  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino)
+}
+
+function readTerminalFinalizationIntentAnchored(authority, options = {}) {
+  const fsImpl = options.fsImpl || fs
+  const intentPath = authority.anchoredIntentPath
+  let descriptor
+  let bytes
+  try {
+    const initial = fsImpl.lstatSync(intentPath)
+    if (!initial.isFile() || initial.isSymbolicLink() || Number(initial.nlink) !== 1) {
+      throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_INVALID', 'terminal finalization intent is not one immutable regular file')
+    }
+    if (initial.size > TERMINAL_FINALIZATION_INTENT_MAX_BYTES + 1) {
+      throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_INVALID', 'terminal finalization intent exceeds its finite canonical byte boundary', {
+        byteLength: initial.size,
+        maximumBytes: TERMINAL_FINALIZATION_INTENT_MAX_BYTES,
+      })
+    }
+    descriptor = fsImpl.openSync(intentPath, fs.constants.O_RDONLY | Number(fs.constants.O_NOFOLLOW || 0))
+    const opened = fsImpl.fstatSync(descriptor)
+    if (!opened.isFile() || Number(opened.nlink) !== 1 || !samePhysicalFile(initial, opened)) {
+      throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_INVALID', 'terminal finalization intent changed while it was opened')
+    }
+    authority.verifyLineage()
+    bytes = fsImpl.readFileSync(descriptor)
+    const after = fsImpl.fstatSync(descriptor)
+    const live = fsImpl.lstatSync(intentPath)
+    if (!samePhysicalFile(opened, after) || !samePhysicalFile(after, live) || bytes.length !== after.size) {
+      throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_INVALID', 'terminal finalization intent changed while it was read')
+    }
+  } catch (error) {
+    if (error instanceof RunRecordError || (error && error.code === 'PREIMAGE_UNSAFE')) throw error
+    if (error && error.code === 'ENOENT') {
+      throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_REQUIRED', 'terminal finalization intent is missing')
+    }
+    throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_INVALID', 'terminal finalization intent cannot be read safely', {
+      cause: error.code || error.message,
+    })
+  } finally {
+    if (descriptor !== undefined) fsImpl.closeSync(descriptor)
+  }
+  let intent
+  try { intent = JSON.parse(bytes.toString('utf8')) } catch (error) {
+    throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_INVALID', 'terminal finalization intent is not JSON', { cause: error.message })
+  }
+  const canonicalBytes = Buffer.from(`${stableStringify(intent)}\n`, 'utf8')
+  if (!bytes.equals(canonicalBytes)) {
+    throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_INVALID', 'terminal finalization intent bytes are not canonical JSON')
+  }
+  const validation = validateTerminalFinalizationIntent(intent, options.expectedRunId)
+  if (!validation.valid) {
+    throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_INVALID', validation.errors.join('; '))
+  }
+  return Object.freeze(intent)
+}
+
+function readTerminalFinalizationIntentAt(runPath, options = {}) {
+  const fsImpl = options.fsImpl || fs
+  return withTerminalFinalizationIntentAuthority(runPath, fsImpl, authority =>
+    readTerminalFinalizationIntentAnchored(authority, options))
+}
+
+function recoverTerminalFinalizationIntentPublicationResiduesAnchored(authority, options = {}) {
+  const fsImpl = options.fsImpl || fs
+  const intentPath = authority.anchoredIntentPath
+  const directory = authority.anchoredDirectory
+  const basename = path.basename(intentPath)
+  const recovered = []
+  for (const entry of fsImpl.readdirSync(directory, { withFileTypes: true })) {
+    const match = ATOMIC_WRITE_TEMP_PATTERN.exec(entry.name)
+    if (!match || match[1] !== basename) continue
+    const relative = `runtime/${entry.name}`
+    assertAtomicWriterInactive(match[2], relative)
+    const temporary = path.join(directory, entry.name)
+    const temporaryStats = fsImpl.lstatSync(temporary)
+    if (!temporaryStats.isFile() || temporaryStats.isSymbolicLink() ||
+        (temporaryStats.mode & 0o777) !== FILE_MODE) {
+      throw new RunRecordError('RUN_RECORD_UNSAFE', `Terminal finalization intent residue is unsafe: ${relative}`)
+    }
+    let published = null
+    try { published = fsImpl.lstatSync(intentPath) } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error
+    }
+    if (published === null) {
+      if (Number(temporaryStats.nlink) !== 1) {
+        throw new RunRecordError('RUN_RECORD_UNSAFE', `Unpublished terminal finalization intent residue has an unsafe link count: ${relative}`)
+      }
+    } else {
+      const sameInode = samePhysicalFile(temporaryStats, published)
+      const completedPublication = published.isFile() && !published.isSymbolicLink() &&
+        sameInode && Number(temporaryStats.nlink) === 2 && Number(published.nlink) === 2
+      const lostCreateRace = published.isFile() && !published.isSymbolicLink() &&
+        !sameInode && Number(temporaryStats.nlink) === 1 && Number(published.nlink) === 1
+      if (!completedPublication && !lostCreateRace) {
+        throw new RunRecordError('RUN_RECORD_UNSAFE', `Terminal finalization intent publication residue is ambiguous: ${relative}`)
+      }
+    }
+    authority.verifyLineage()
+    fsImpl.unlinkSync(temporary)
+    recovered.push(relative)
+  }
+  if (recovered.length) fsyncDirectory(directory, fsImpl)
+  return Object.freeze(recovered)
+}
+
+function recoverTerminalFinalizationIntentPublicationResidues(runPath, options = {}) {
+  const fsImpl = options.fsImpl || fs
+  return withTerminalFinalizationIntentAuthority(runPath, fsImpl, authority =>
+    recoverTerminalFinalizationIntentPublicationResiduesAnchored(authority, options))
+}
+
+function createOrVerifyTerminalFinalizationIntentAt(runPath, input, options = {}) {
+  const fsImpl = options.fsImpl || fs
+  const expectedRunId = options.expectedRunId || input.runId
+  return withTerminalFinalizationIntentAuthority(runPath, fsImpl, authority => {
+    const intentPath = authority.anchoredIntentPath
+    recoverTerminalFinalizationIntentPublicationResiduesAnchored(authority, { fsImpl })
+    const expected = canonicalTerminalFinalizationIntent(input)
+    if (expected.runId !== expectedRunId) {
+      throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_INVALID', 'terminal finalization intent run binding is foreign')
+    }
+    if (fsImpl.existsSync(intentPath)) {
+      const existing = readTerminalFinalizationIntentAnchored(authority, { fsImpl, expectedRunId })
+      if (stableStringify(existing) !== stableStringify(expected)) {
+        throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_CONFLICT', 'immutable terminal finalization intent conflicts with the requested finalization')
+      }
+      fsyncDirectory(authority.anchoredDirectory, fsImpl)
+      return existing
+    }
+    const temporary = path.join(
+      authority.anchoredDirectory,
+      `.${path.basename(intentPath)}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`,
+    )
+    let descriptor
+    try {
+      descriptor = fsImpl.openSync(
+        temporary,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
+          Number(fs.constants.O_NOFOLLOW || 0),
+        FILE_MODE,
+      )
+      authority.verifyLineage()
+      const bytes = Buffer.from(`${stableStringify(expected)}\n`, 'utf8')
+      let offset = 0
+      while (offset < bytes.length) offset += fsImpl.writeSync(descriptor, bytes, offset, bytes.length - offset)
+      fsImpl.fsyncSync(descriptor)
+      fsImpl.closeSync(descriptor)
+      descriptor = undefined
+      authority.verifyLineage()
+      fsImpl.linkSync(temporary, intentPath)
+      authority.verifyLineage()
+      fsyncDirectory(authority.anchoredDirectory, fsImpl)
+      fsImpl.unlinkSync(temporary)
+      fsyncDirectory(authority.anchoredDirectory, fsImpl)
+      return readTerminalFinalizationIntentAnchored(authority, { fsImpl, expectedRunId })
+    } catch (error) {
+      if (descriptor !== undefined) {
+        try { fsImpl.closeSync(descriptor) } catch {}
+      }
+      try { fsImpl.unlinkSync(temporary) } catch {}
+      if (error && error.code === 'EEXIST') {
+        const existing = readTerminalFinalizationIntentAnchored(authority, { fsImpl, expectedRunId })
+        if (stableStringify(existing) === stableStringify(expected)) return existing
+        throw new RunRecordError('TERMINAL_FINALIZATION_INTENT_CONFLICT', 'immutable terminal finalization intent conflicts with the requested finalization')
+      }
+      if (error instanceof RunRecordError || (error && error.code === 'PREIMAGE_UNSAFE')) throw error
+      throw new RunRecordError('RUN_RECORD_WRITE_UNAVAILABLE', 'terminal finalization intent could not be created atomically', {
+        cause: error.code || error.message,
+      })
+    }
+  })
+}
+
+function createTerminalFinalizationIntentAuthority(runPath, options = {}) {
+  const absolute = path.resolve(runPath)
+  const fsImpl = options.fsImpl || fs
+  assertTerminalFinalizationIntentAuthority(absolute, fsImpl)
+  return Object.freeze({
+    intentPath: terminalFinalizationIntentPath(absolute),
+    createOrVerify: input => createOrVerifyTerminalFinalizationIntentAt(absolute, input, {
+      fsImpl,
+      expectedRunId: options.expectedRunId || input.runId,
+    }),
+    read: () => readTerminalFinalizationIntentAt(absolute, {
+      fsImpl,
+      expectedRunId: options.expectedRunId,
+    }),
+  })
+}
+
 function runtimeIntegrationPaths(runPath) {
   const statePath = path.join(runPath, RUNTIME_PATHS.state)
   const eventPath = path.join(runPath, RUNTIME_PATHS.events)
@@ -661,8 +1014,10 @@ function runtimeIntegrationPaths(runPath) {
     eventLog: Object.freeze({ logPath: eventPath, blobDirectory: path.join(runPath, RUNTIME_PATHS.blobs) }),
     stateStore: Object.freeze({ paths: Object.freeze({
       runRecordRoot: runPath, statePath, eventPath, terminalPath,
+      terminalFinalizationIntentPath: path.join(runPath, RUNTIME_PATHS.terminalFinalizationIntent),
       transactionPath: path.join(runPath, RUNTIME_PATHS.transaction),
     }) }),
+    terminalFinalizationIntent: path.join(runPath, RUNTIME_PATHS.terminalFinalizationIntent),
     terminalPath,
     cleanupRegistry: Object.freeze({ registryPath: path.join(runPath, RUNTIME_PATHS.cleanupRegistry) }),
     processRegistry: path.join(runPath, RUNTIME_PATHS.processRegistry),
@@ -923,7 +1278,8 @@ function metadataFor(record, options = {}) {
     canonical_plan_paths: PLAN_PATHS, request_envelope: 'request/envelope.jsonl', route_transcript: 'route/transcript.jsonl',
     runtime_authority: {
       state: RUNTIME_PATHS.state, transaction: RUNTIME_PATHS.transaction, events: RUNTIME_PATHS.events,
-      blobs: RUNTIME_PATHS.blobs, terminal: RUNTIME_PATHS.terminal, cleanup_registry: RUNTIME_PATHS.cleanupRegistry,
+      blobs: RUNTIME_PATHS.blobs, terminal_finalization_intent: RUNTIME_PATHS.terminalFinalizationIntent,
+      terminal: RUNTIME_PATHS.terminal, cleanup_registry: RUNTIME_PATHS.cleanupRegistry,
       process_registry: RUNTIME_PATHS.processRegistry, process_control: RUNTIME_PATHS.processControl,
       alias_telemetry: RUNTIME_PATHS.aliasTelemetry,
       accounting: RUNTIME_PATHS.accounting, budget: RUNTIME_PATHS.budget,
@@ -1006,6 +1362,14 @@ function facade(data) {
     readPreMutationBaseline: { value: () => readPreMutationBaseline(record) },
     writeAllWorkJoinedReceipt: { value: input => writeAllWorkJoinedReceipt(record, input) },
     readAllWorkJoinedReceipt: { value: () => readAllWorkJoinedReceipt(record) },
+    createOrVerifyTerminalFinalizationIntent: { value: input => {
+      assertRunRecordBinding(record)
+      return createOrVerifyTerminalFinalizationIntentAt(record.runPath, input, { expectedRunId: record.runId })
+    } },
+    readTerminalFinalizationIntent: { value: () => {
+      assertRunRecordBinding(record)
+      return readTerminalFinalizationIntentAt(record.runPath, { expectedRunId: record.runId })
+    } },
     writeRouteAnalystFallbackState: { value: state => writeRouteAnalystFallbackState(record, state) },
     readRouteAnalystFallbackState: { value: () => readRouteAnalystFallbackState(record) },
   })
@@ -1069,6 +1433,7 @@ function openRunRecord(runPath, options = {}) {
     projectRejection: metadata.project_rejection,
   })
   recoverContentAddressedPublicationResidues(record)
+  recoverTerminalFinalizationIntentPublicationResidues(record.runPath)
   recoverUnpublishedAtomicWriteResidues(record)
   auditRunRecordTree(record, { ...options, permissions: false })
   return record
@@ -1076,6 +1441,7 @@ function openRunRecord(runPath, options = {}) {
 
 module.exports = {
   RUN_RECORD_SCHEMA, PLAN_PATHS, PLAN_CONTENT_ADDRESSED_DIRECTORIES, RUNTIME_PATHS,
+  TERMINAL_FINALIZATION_INTENT_SCHEMA, TERMINAL_FINALIZATION_INTENT_MAX_BYTES,
   RUN_DIRECTORIES, EXACT_REGISTERED_PATHS, REGISTERED_PREFIXES,
   PRE_MUTATION_BASELINE_PATH, ALL_WORK_JOINED_PATH, ROUTE_RECOMMENDATION_STATE_PATH,
   CODEX_PHYSICAL_EXECUTION_PATH, CAPTURED_DOMAIN_ADMISSION_PATH,
@@ -1085,6 +1451,10 @@ module.exports = {
   createRunRecord, allocateRunRecord: createRunRecord, openRunRecord, assertRunRecordBinding,
   auditRunRecordTree, atomicWriteRegistered,
   recoverContentAddressedPublicationResidues,
+  canonicalTerminalFinalizationIntent, terminalFinalizationIntentHash,
+  validateTerminalFinalizationIntent, createTerminalFinalizationIntentAuthority,
+  createOrVerifyTerminalFinalizationIntentAt, readTerminalFinalizationIntentAt,
+  recoverTerminalFinalizationIntentPublicationResidues,
   recoverUnpublishedAtomicWriteResidues,
   aliasEntryHash, appendAliasTelemetry, readAliasTelemetry, recoverAliasTelemetry, validateAliasTelemetryRecord,
   createPreMutationBaseline, createProductionPreMutationBaseline,

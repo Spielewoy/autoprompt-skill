@@ -67,7 +67,7 @@ test('RUN-018/022 arbitrary explicit fingerprints cannot reset equivalent retry 
 test('TRACE-006 late first product signal is enforced and reports the exact blocker', () => {
   const scheduler = new CentralScheduler({ route: 'DIRECT', runIdentity: { runId: 'runtime-residual-r8', generation: 1 } })
   const measurement = scheduler.recordFirstProductSignal({
-    kind: 'PRODUCT_EDIT', elapsedMs: 360_001, evidenceHash: H('late'), reason: 'policy service denied the role',
+    kind: 'PRODUCT_EDIT', elapsedMs: 300_001, evidenceHash: H('late'), reason: 'policy service denied the role',
   })
   assert.equal(measurement.withinCeiling, false)
   assert.equal(measurement.reason, 'policy service denied the role')

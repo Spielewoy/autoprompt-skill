@@ -232,23 +232,21 @@ test('required phase work records elapsed targets and continues without an ambie
   assert.equal(decision.completionTargetOverrun, true)
 })
 
-test('production runtime defaults to a 24k activation token ceiling and validates explicit targets', t => {
+test('production runtime has no hidden token ceiling and validates explicit targets', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-production-token-limit-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
 
   const defaultOptions = createProductionRuntimeOptionsFixture(directory, 'absent')
-  assert.equal(defaultOptions.budgetController.snapshot().limits.tokens, 24_000)
+  assert.equal(defaultOptions.budgetController.snapshot().limits.tokens, Number.MAX_SAFE_INTEGER)
   const defaultRuntime = new CodexSupervisorRuntime(defaultOptions)
   assert.equal(defaultRuntime.budget, defaultOptions.budgetController)
-  assert.equal(defaultRuntime.budget.snapshot().limits.tokens, 24_000)
+  assert.equal(defaultRuntime.budget.snapshot().limits.tokens, Number.MAX_SAFE_INTEGER)
 
   defaultRuntime.budget.consumeTokens(24_001, { requiredCompletion: true })
   assert.equal(defaultRuntime.budget.snapshot().tokensUsed, 24_001,
     'the already-admitted turn must retain its complete terminal accounting')
-  assert.throws(
-    () => defaultRuntime.budget.recordLaunch({ requiredCompletion: true }),
-    error => error.code === 'BUDGET_EXHAUSTED' && error.details.exhausted.includes('TOKENS'),
-  )
+  defaultRuntime.budget.recordLaunch({ requiredCompletion: true })
+  assert.equal(defaultRuntime.budget.snapshot().launches, 1)
 
   const explicitOptions = createProductionRuntimeOptionsFixture(
     directory,
@@ -259,6 +257,11 @@ test('production runtime defaults to a 24k activation token ceiling and validate
   const explicitRuntime = new CodexSupervisorRuntime(explicitOptions)
   assert.equal(explicitRuntime.budget, explicitOptions.budgetController)
   assert.equal(explicitRuntime.budget.snapshot().limits.tokens, 1_234_567)
+  explicitRuntime.budget.consumeTokens(1_234_568, { requiredCompletion: true })
+  assert.throws(
+    () => explicitRuntime.budget.recordLaunch({ requiredCompletion: true }),
+    error => error.code === 'BUDGET_EXHAUSTED' && error.details.exhausted.includes('TOKENS'),
+  )
 
   assert.throws(
     () => createProductionRuntimeOptionsFixture(directory, 'zero', { tokenLimit: 0 }),

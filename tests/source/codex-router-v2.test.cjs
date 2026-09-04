@@ -595,19 +595,19 @@ test('resolved settings validation keeps numeric concurrency and explicit unsupp
   assert.equal(settings.validateResolvedSettings(tooWide).valid, false)
 })
 
-test('one read-only route analyst has a two-minute target, zero children, and no relaunch', () => {
+test('one read-only route analyst has a one-minute target, zero children, and no relaunch', () => {
   const admission = decisions.createRouteAnalystAdmission({ run_id: 'run-1', request_envelope_hash: H })
   assert.equal(decisions.validateRouteAnalystAdmission(admission).valid, true)
   assert.equal(admission.session_count, 1)
-  assert.equal(admission.max_duration_ms, 120000)
+  assert.equal(admission.max_duration_ms, 60000)
   assert.equal(admission.permissions.spawn_children, false)
   assert.equal(admission.restart_policy, 'NEVER')
-  const timeout = decisions.evaluateRouteAnalystResult({ admission, elapsed_ms: 120001, outcome: 'TIMEOUT' })
+  const timeout = decisions.evaluateRouteAnalystResult({ admission, elapsed_ms: 60001, outcome: 'TIMEOUT' })
   assert.equal(timeout.status, 'ROUTE_ANALYST_TIMEOUT')
   assert.equal(timeout.relaunch, false)
   assert.equal(timeout.l0_may_decide, true)
   const benchmarkLate = decisions.evaluateRouteAnalystResult({
-    admission, elapsed_ms: 120001, recommendation: recommendation(),
+    admission, elapsed_ms: 60001, recommendation: recommendation(),
     environment: { AUTOPROMPT_BENCHMARK_NO_TIMEOUT_LIMIT: '1' },
   })
   assert.equal(benchmarkLate.status, 'ROUTE_ANALYST_COMPLETE')

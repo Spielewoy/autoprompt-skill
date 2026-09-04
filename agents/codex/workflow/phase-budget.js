@@ -74,9 +74,10 @@ const {
   createProductionPreMutationBaseline,
   openRunRecord,
 } = require('./run-record.js')
-const { EventLog, readChecksummedJson, stableStringify } = require('./event-log.js')
+const { atomicWriteFile, EventLog, readChecksummedJson, stableStringify } = require('./event-log.js')
 const {
-  RuntimeStateStore, createEvidenceInvalidationGraph, runtimeCrashPrecondition,
+  RuntimeStateStore, createEvidenceInvalidationGraph, hashManifestEntryStrict,
+  runtimeCrashPrecondition,
 } = require('./runtime-state.js')
 const {
   RecoveryCheckpointAuthority,
@@ -104,7 +105,11 @@ const {
   evaluateOutcomes: evaluateCapturedDomainOutcomes,
   validateContracts: validateCapturedDomainContracts,
 } = require('./captured-domain.js')
-const { WorkerWorkspaceManager } = require('./worker-workspace.js')
+const {
+  declaredIgnoredWorkspaceNames,
+  projectWorkspaceResources,
+  WorkerWorkspaceManager,
+} = require('./worker-workspace.js')
 const { auditPrivatePermissions, pathIsInside, readFileNoFollow } = require('./safe-run-root.js')
 const { validateJsonSchema } = require('./json-schema-validator.js')
 
@@ -113,7 +118,11 @@ const SCOPE_HARD_SEC = 300
 const SCOPE_GRACE_SEC = 60
 const MAX_FORCED_RESETS = 1
 const DEFAULT_PRODUCT_HARD_MAXIMUM_MS = 3_600_000
-const DEFAULT_ACTIVATION_TOKEN_LIMIT = 24_000
+// Required product work has no hidden Autoprompt token deadline. A finite
+// activation envelope exists only when the caller explicitly supplies one;
+// otherwise the host/provider remains the outer authority while this runtime
+// still records every observed token exactly.
+const DEFAULT_ACTIVATION_TOKEN_LIMIT = Number.MAX_SAFE_INTEGER
 const TERMINAL_OUTCOMES = Object.freeze(['DONE', 'PARTIAL', 'BLOCKED', 'CANCELLED', 'FAILED'])
 const RECOVERABLE_RUNTIME_STATES = new Set([
   'PREPARE_WORK', 'RUN_WORK', 'ITEM_VERIFIED', 'CHECK_WORK', 'REPAIRING', 'CHECK_INCONCLUSIVE',
@@ -144,8 +153,9 @@ const REPORT_ONLY_CHECKER_CORRECTION_CODES = new Set([
 ])
 const CHECKER_FALSIFICATION_DOCTRINE = Object.freeze([
   'Try to disprove every typed verification obligation against the frozen deliverable. Preserve each declared condition and finish the full assigned matrix after any failure.',
-  'For every exact named check ID, return one testOutcomes entry containing checkId (preferred; command and legacy id are accepted aliases) and PASS or FAIL status. Never use a tool-call or chunk ID, repeat a check ID, or supply conflicting identity aliases. Do not inspect Autoprompt transcripts or compute observationId, commandHash, or fingerprint: the controller owns execution identity and adds it only when your report resolves to one exact admissible command receipt. PASS requires a unique zero exit bound to the exact version being checked; an authenticated nonzero test failure may bind FAIL and drive repair. One admissible exact-version harness may cover several IDs; failed setup, ambiguous receipts, inline-output/no-op commands, and writable-scratch reads cover none.',
+  'For every exact named check ID, return one testOutcomes entry containing checkId (preferred; command and legacy id are accepted aliases) and PASS or FAIL status. Never use a tool-call or chunk ID, repeat a check ID, or supply conflicting identity aliases. Do not inspect Autoprompt transcripts or compute observationId, commandHash, or fingerprint: the controller owns execution identity and adds it only when your report resolves to one exact admissible command receipt. PASS requires a unique zero exit bound to the exact version being checked: it must come from a controller-declared command whose pre-mutation program inputs still match; command text alone and newly created or modified harnesses never certify PASS. An authenticated nonzero test failure may bind FAIL and drive repair. One admissible exact-version harness may cover several IDs; failed setup, ambiguous receipts, inline-output/no-op commands, and writable-scratch reads cover none.',
   'For a checker-authored harness, first write one regular program in the assigned writable scratch root. Invoke it exactly once either as <approved runtime> <absolute sealed scratch program> <absolute frozen exact-version root being checked> or as <absolute sealed executable> <absolute frozen exact-version root being checked>. Approved runtimes are Python 3, Node.js, Ruby, Perl, and POSIX shell. Substitute the projected absolute paths literally. Emit one direct JSON summary of at most 4 KiB. Do not use interpreter flags, heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or command glue.',
+  'Treat the frozen exact-version root as immutable, including during reads. Open databases there with an explicit read-only or immutable mode. If a database driver, parser, compiler, or consumer may create a journal, WAL, lock, bytecode, cache, sidecar, or temporary file, first make a hash-bound copy in the assigned writable scratch root and operate only on that copy.',
   'Return the consumed underlying identifiers in evidenceIds and an allowed referenceMethod. Populate every required invariant category from an independent source, property, strongest available consumer, or independently derived observable result; never derive expected behavior from the implementation being checked.',
   'Build an independent requirement-by-requirement expected-result basis before accepting the implementation. Exercise exact boundaries, adversarial and negative cases, and any declared ordering, optimization, maximality, or global-selection rule; a self-authored happy-path validator that merely restates the exact version being checked is not independent evidence.',
   'A claimed equivalence requires both forward soundness and reverse separation or injectivity for source classes that must remain distinguishable. One-way matching or a few equal examples cannot establish PASS when forbidden collapses, collisions, or false equivalences remain possible.',
@@ -158,7 +168,7 @@ const CODEX_CHECKER_COMPACT_DOCTRINE = Object.freeze([
   'Cover every exact named check and verification obligation; one admissible harness may cover several IDs.',
   'PASS requires independently derived expected behavior and an executed end-to-end observable result on the frozen exact version. Static inspection may prove a concrete FAIL but never PASS.',
   'Exercise positive, negative, boundary, temporal-order, equivalence-separation, and adversarial composition cases wherever applicable; do not derive the expected result from the implementation being checked.',
-  'Bind PASS to one unique zero exit and a concrete product FAIL to one authenticated nonzero check. Setup, tool, dependency, or consumer unavailability is CHECK_INCONCLUSIVE or RUNTIME_FAILURE.',
+  'Bind PASS to one unique zero exit from unchanged controller-declared pre-mutation test inputs; newly created or modified harnesses never self-certify PASS. Bind a concrete product FAIL to one authenticated nonzero check. Setup, tool, dependency, or consumer unavailability is CHECK_INCONCLUSIVE or RUNTIME_FAILURE.',
   'Return every named test outcome plus the underlying evidence IDs and independent reference method; keep large evidence in scratch and return bounded diagnostics only.',
 ])
 const VERIFICATION_LIMITATION_CODES = new Set([
@@ -174,10 +184,11 @@ const CHILD_TRANSPORT_WATCHDOG_MS = 30 * 60 * 1000
 const DEFAULT_TIMEOUT_CLEANUP_WATCHDOG_MS = 60 * 1000
 const CODEX_CHILD_AUTO_COMPACT_TOKEN_LIMIT = 32_768
 const CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT = 1_000
+const CODEX_MODEL_CONTEXT_WINDOW = 272_000
 const CODEX_QUOTA_PROXY_MAX_REQUEST_BYTES = 512 * 1024
 const CODEX_QUOTA_PROXY_SPECIAL_TOKEN_RESERVE = 64
 const CODEX_PROVIDER_PENDING_CAUSE_PATTERN =
-  /^codex-provider-pending:([a-f0-9]{64}):([1-9][0-9]*):([1-9][0-9]*):([1-9][0-9]*):([0-9]+)$/u
+  /^codex-provider-pending:([a-f0-9]{64}):([1-9][0-9]*):([1-9][0-9]*):([1-9][0-9]*):([0-9]+)(?::([0-9]+))?$/u
 const CODEX_PROVIDER_CHARGE_CAUSE_PATTERN =
   /^codex-provider-charge:([a-f0-9]{64}):([1-9][0-9]*):(LIVE|FINAL_[1-9][0-9]*|RECOVERY_[1-9][0-9]*)$/u
 const CODEX_PROVIDER_USAGE_CAUSE_PATTERN =
@@ -195,22 +206,13 @@ const CODEX_PROVIDER_SETTLEMENT_DISPOSITIONS = new Set([
 ])
 const CODEX_CHILD_TOOL_CALL_LIMITS = Object.freeze({
   'route-analyst': 0,
-  checker: 2,
-  worker: 2,
 })
+const CODEX_CHILD_TOOL_GUIDANCE_LIMITS = Object.freeze({ checker: 4, worker: 8 })
 const CODEX_CHILD_TOKEN_LIMITS = Object.freeze({
   'route-analyst': 8_000,
-  checker: 16_000,
-  worker: 24_000,
 })
-// The relay's preventive spend envelope remains below the user's 30k alarm
-// boundary while leaving enough room for a compact prompt, two checker steps,
-// or a worker edit plus focused validation. The stricter terminal limits above
-// still decide whether a completed result can be accepted.
 const CODEX_CHILD_SPEND_LIMITS = Object.freeze({
-  'route-analyst': 16_000,
-  checker: 24_000,
-  worker: 24_000,
+  'route-analyst': 8_000,
 })
 // Codex 0.148's native fallback ignores cached input. The controller-owned
 // relay supplies exact per-response total-input-plus-output rollout units;
@@ -254,6 +256,17 @@ const PROVIDER_TRANSPORT_AVAILABILITY_CODES = new Set([
   'CODEX_USAGE_INCOMPLETE',
   'CODEX_EVENT_STREAM_INVALID',
 ])
+// These are explicit execution-envelope interruptions, never product verdicts.
+// They deliberately stay outside PROVIDER_TRANSPORT_AVAILABILITY_CODES: an
+// already billed attempt with unknown remaining spend must not be replayed.
+const PHYSICAL_CANDIDATE_LIMIT_CODES = new Set([
+  'BUDGET_EXHAUSTED',
+  'CHILD_ROLLOUT_BUDGET_EXHAUSTED',
+  'CHILD_TOKEN_LIMIT_EXHAUSTED',
+  'CHILD_TOOL_CALL_LIMIT_EXHAUSTED',
+  'CODEX_CHILD_QUOTA_BOUND_VIOLATED',
+  'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED',
+])
 const CONTROLLER_FAILURE_RELEASE_STATES = new Set([
   'LOAD_SKILL', 'STORE_REQUEST_ENVELOPE', 'RESOLVE_SETTINGS', 'SELECT_SAFE_RUN_ROOT',
   'CREATE_RUN_RECORD', 'CHECK_PROVIDER_CAPABILITIES', 'START_ROUTE_ANALYST',
@@ -287,6 +300,10 @@ const ROUTE_PERSISTENCE_INTEGRITY_CODES = new Set([
 
 function routePersistenceIntegrityFailure(error) {
   return Boolean(error && ROUTE_PERSISTENCE_INTEGRITY_CODES.has(error.code))
+}
+
+function physicalCandidateLimitInterruption(error) {
+  return Boolean(error && PHYSICAL_CANDIDATE_LIMIT_CODES.has(error.code))
 }
 
 function callbackFailureRequiresImmediateAbort(error) {
@@ -330,10 +347,39 @@ function promotedMutationFailureRequiresRollback(error) {
     /(?:FOREIGN|TAMPER|HASH_MISMATCH|SIGNATURE_INVALID|ROLLBACK)/u.test(code)
 }
 
+function candidateSurvivalIntegrityFailure(error) {
+  const code = error && typeof error.code === 'string' ? error.code : ''
+  return promotedMutationFailureRequiresRollback(error) ||
+    ['CHECKSUM_MISMATCH', 'CHECKSUMMED_RECORD_INVALID'].includes(code)
+}
+
+function terminalFinalizationReplaySafe(error) {
+  const code = error && typeof error.code === 'string' ? error.code : ''
+  // Retry only failures that name an unavailable local publication/drain
+  // boundary. Integrity, epoch, manifest, authority, and semantic conflicts
+  // must remain single-shot evidence: replaying those cannot make them true.
+  return [
+    'FINALIZER_WRITE_INTERRUPTED',
+    'PROCESS_DRAIN_TIMEOUT',
+    'RUN_RECORD_WRITE_UNAVAILABLE',
+    'TERMINAL_RECORD_FAILURE',
+  ].includes(code)
+}
+
 function controllerBookkeepingFailureCanPreserveCandidate(error) {
   const code = error && typeof error.code === 'string' ? error.code : ''
   return routePersistenceIntegrityFailure(error) ||
-    code === 'CRASH_ADOPTION_CONFLICT' || code === 'CALLBACK_RECONCILIATION_PENDING' ||
+    [
+      'ACTIVATION_RECEIPT_INVALID',
+      'CALLBACK_RECONCILIATION_PENDING',
+      'CODEX_USAGE_INVALID',
+      'CRASH_ADOPTION_CONFLICT',
+      'CRASH_BINDING_REQUIRED',
+      'INCOMPLETE_USAGE_ACCOUNTING',
+      'INCOMPLETE_USAGE_REPORT',
+      'INVALID_USAGE_REPORT',
+      'USAGE_REGRESSION',
+    ].includes(code) ||
     /^(?:ACCOUNTING_|RECOVERY_CHECKPOINT_|RUN_RECORD_)/u.test(code)
 }
 
@@ -1367,6 +1413,13 @@ function resolveTerminalReceiptCandidateHash({
   return requestCandidateHash || null
 }
 const TARGET_MUTATOR_ROLES = new Set(['worker', 'roadmap-author'])
+const WORKER_REQUIREMENT_FIDELITY_DOCTRINE = Object.freeze([
+  'Literal supplied formulas, schemas, and specification text outrank unstated domain conventions.',
+  'Trace every explicit requirement to an executed witness.',
+  'For ordered or temporal requirements, execute before, at, between, and after cases.',
+  'Maximize, optimal, or global-selection requirements need a complete, independently executable feasibility-and-selection proof; a self-authored happy path is insufficient.',
+  'If wording is ambiguous, test competing interpretations and never silently weaken explicit wording.',
+])
 const FORBIDDEN_RUNTIME_ROLES = new Set([
   'framework-generator', 'framework-validator', 'scribe', 'janitor',
   'scope-coordinator', 'scoper', 'sweep-coordinator', 'sweeper',
@@ -1405,6 +1458,7 @@ const REQUIRED_SAFETY_CHANNELS = Object.freeze([
 const STREAMED_ROUTE_EVENT_COUNT = Symbol('streamedRouteEventCount')
 const MUTATION_ADMISSION_EVIDENCE = Symbol('mutationAdmissionEvidence')
 const TRANSPORT_QUARANTINE_POINTER = Symbol('transportQuarantinePointer')
+const STRUCTURED_FINAL_RESPONSE_SURVIVAL = Symbol('structuredFinalResponseSurvival')
 // Required-completion admission is controller topology authority, not a
 // property a custom route executor may infer from request prose. Only the
 // built-in deterministic executor can place a request object in this set.
@@ -3665,9 +3719,7 @@ function checkerResultRequiresScratchConfirmation(result) {
 }
 
 function checkerResultMatchesEvidenceHash(result, expectedHash) {
-  if (!/^[a-f0-9]{64}$/u.test(expectedHash || '')) return false
-  return expectedHash === hashText(JSON.stringify(result)) ||
-    expectedHash === hashText(stableStringify(result))
+  return checkerResultEvidenceHashMatches(result, expectedHash)
 }
 
 function scratchConfirmationWorkItemId(workItemId) {
@@ -4330,18 +4382,49 @@ function validCheckerObservationCore(input, checkIds) {
     /^[a-f0-9]{64}$/u.test(input.requestEnvelopeHash || '')
 }
 
+function normalizeTrustedTestArtifactBindings(artifacts) {
+  if (artifacts === undefined) return []
+  if (!Array.isArray(artifacts) || artifacts.length > 64) return null
+  const normalized = artifacts.map(artifact => {
+    const relativePath = artifact && typeof artifact.relativePath === 'string'
+      ? artifact.relativePath.replace(/\\/gu, '/') : ''
+    const normalizedPath = path.posix.normalize(relativePath)
+    const kind = artifact && artifact.kind
+    const digest = artifact && artifact.digest
+    if (!['file', 'directory'].includes(kind) || !relativePath ||
+        normalizedPath !== relativePath || normalizedPath === '.' ||
+        normalizedPath === '..' || normalizedPath.startsWith('../') ||
+        path.posix.isAbsolute(normalizedPath) ||
+        !/^[a-f0-9]{64}$/u.test(digest || '')) return null
+    return Object.freeze({ kind, relativePath: normalizedPath, digest })
+  })
+  if (normalized.some(artifact => artifact === null) ||
+      new Set(normalized.map(artifact => `${artifact.kind}\0${artifact.relativePath}`)).size !==
+        normalized.length) return null
+  return normalized.sort((left, right) => left.relativePath.localeCompare(right.relativePath) ||
+    left.kind.localeCompare(right.kind))
+}
+
 function normalizeExactCheckerCommandBindings(commandBindings, checkIds) {
   if (commandBindings === undefined) return []
   if (!Array.isArray(commandBindings)) return null
-  const normalized = commandBindings.map(binding => ({
-    checkId: binding && String(binding.checkId || ''),
-    commandHash: binding && /^[a-f0-9]{64}$/u.test(binding.commandHash || '')
-      ? binding.commandHash
-      : binding && typeof binding.command === 'string' && binding.command.trim()
-        ? hashText(binding.command) : null,
-  }))
+  const normalized = commandBindings.map(binding => {
+    const artifacts = normalizeTrustedTestArtifactBindings(
+      binding && binding.artifacts,
+    )
+    return {
+      checkId: binding && String(binding.checkId || ''),
+      commandHash: binding && /^[a-f0-9]{64}$/u.test(binding.commandHash || '')
+        ? binding.commandHash
+        : binding && typeof binding.command === 'string' && binding.command.trim()
+          ? hashText(binding.command) : null,
+      artifacts,
+      artifactSetHash: artifacts && artifacts.length > 0
+        ? hashText(stableStringify(artifacts)) : null,
+    }
+  })
   if (normalized.some(binding => !checkIds.includes(binding.checkId) ||
-      !/^[a-f0-9]{64}$/u.test(binding.commandHash || '')) ||
+      !/^[a-f0-9]{64}$/u.test(binding.commandHash || '') || !binding.artifacts) ||
       new Set(normalized.map(binding => `${binding.checkId}\0${binding.commandHash}`)).size !==
         normalized.length) return null
   return normalized.sort((left, right) => left.checkId.localeCompare(right.checkId) ||
@@ -4377,7 +4460,10 @@ function createLegacyCheckerObservationBinding(input = {}) {
     observationRequired: input.observationRequired !== false,
     checkCount: checkIds.length,
     checksHash: hashText(stableStringify(checkIds)),
-    commandBindings: Object.freeze(commandBindings.map(binding => Object.freeze(binding))),
+    commandBindings: Object.freeze(commandBindings.map(binding => Object.freeze({
+      checkId: binding.checkId,
+      commandHash: binding.commandHash,
+    }))),
   })
   return Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
 }
@@ -4393,16 +4479,22 @@ function createCheckerObservationBinding(input = {}) {
     )
   }
   const observations = checkIds.map((checkId, index) => {
-    const exactCommandHashes = commandBindings
+    const exactCommandBindings = commandBindings
       .filter(binding => binding.checkId === checkId)
-      .map(binding => binding.commandHash)
-      .sort()
+      .map(binding => Object.freeze({
+        commandHash: binding.commandHash,
+        artifacts: Object.freeze(binding.artifacts),
+        artifactSetHash: binding.artifactSetHash,
+      }))
+      .sort((left, right) => left.commandHash.localeCompare(right.commandHash))
+    const exactCommandHashes = exactCommandBindings.map(binding => binding.commandHash)
     return Object.freeze({
       checkId,
       checkOrdinal: index + 1,
       observationId: checkerObservationId(input, checkId),
       authorizationMode: exactCommandHashes.length > 0 ? 'EXACT_COMMAND' : 'CANDIDATE_HARNESS',
       exactCommandHashes: Object.freeze(exactCommandHashes),
+      exactCommandBindings: Object.freeze(exactCommandBindings),
     })
   })
   const body = Object.freeze({
@@ -4413,7 +4505,7 @@ function createCheckerObservationBinding(input = {}) {
     observationRequired: input.observationRequired !== false,
     checkCount: checkIds.length,
     checksHash: hashText(stableStringify(checkIds)),
-    commandPolicy: 'candidate-harness-v1',
+    commandPolicy: 'trusted-artifact-or-diagnostic-harness-v2',
     observations: Object.freeze(observations),
   })
   return Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
@@ -4433,10 +4525,16 @@ function expectedCheckerObservationBinding(record = {}) {
       ? supplied.commandBindings
       : Array.isArray(supplied.observations)
         ? supplied.observations.flatMap(observation =>
-            (observation.exactCommandHashes || []).map(commandHash => ({
-              checkId: observation.checkId,
-              commandHash,
-            })))
+            (observation.exactCommandHashes || []).map(commandHash => {
+              const exactBinding = Array.isArray(observation.exactCommandBindings)
+                ? observation.exactCommandBindings.find(item =>
+                    item && item.commandHash === commandHash) : null
+              return {
+                checkId: observation.checkId,
+                commandHash,
+                ...(exactBinding ? { artifacts: exactBinding.artifacts } : {}),
+              }
+            }))
         : null,
   }
   const expected = supplied.schemaVersion === 2
@@ -5021,6 +5119,130 @@ function checkerScratchHarnessAttestation(command, context = {}) {
   }
 }
 
+function trustedTestArtifactDigest(absolutePath, rootPath) {
+  const root = path.resolve(rootPath)
+  const absolute = path.resolve(absolutePath)
+  if (absolute !== root && !pathIsInside(root, absolute)) return null
+  try {
+    if (fs.realpathSync(root) !== root || fs.realpathSync(absolute) !== absolute) return null
+  } catch (_) {
+    return null
+  }
+  const stableFile = filename => {
+    let descriptor = null
+    try {
+      descriptor = fs.openSync(filename, fs.constants.O_RDONLY | Number(fs.constants.O_NOFOLLOW || 0))
+      const before = fs.fstatSync(descriptor, { bigint: true })
+      if (!before.isFile() || before.nlink !== 1n || before.size < 0n ||
+          before.size > BigInt(Number.MAX_SAFE_INTEGER)) return null
+      const bytes = fs.readFileSync(descriptor)
+      const after = fs.fstatSync(descriptor, { bigint: true })
+      if (!after.isFile() || after.nlink !== 1n || before.dev !== after.dev ||
+          before.ino !== after.ino || before.size !== after.size ||
+          before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||
+          bytes.length !== Number(after.size)) return null
+      return Object.freeze({
+        mode: Number(after.mode & 0o777n),
+        bytes: bytes.length,
+        contentHash: sha256Bytes(bytes),
+      })
+    } catch (_) {
+      return null
+    } finally {
+      if (descriptor !== null) {
+        try { fs.closeSync(descriptor) } catch (_) {}
+      }
+    }
+  }
+  let stat
+  try { stat = fs.lstatSync(absolute, { bigint: true }) } catch (_) { return null }
+  if (stat.isSymbolicLink()) return null
+  if (stat.isFile()) {
+    const file = stableFile(absolute)
+    return file ? Object.freeze({
+      kind: 'file',
+      digest: hashText(stableStringify({ schemaVersion: 1, kind: 'file', ...file })),
+    }) : null
+  }
+  if (!stat.isDirectory()) return null
+  const entries = []
+  const visit = (directory, relativeDirectory = '') => {
+    let before
+    let names
+    try {
+      before = fs.lstatSync(directory, { bigint: true })
+      names = fs.readdirSync(directory).sort()
+    } catch (_) { return false }
+    if (!before.isDirectory() || before.isSymbolicLink()) return false
+    for (const name of names) {
+      const itemPath = path.join(directory, name)
+      const relative = relativeDirectory
+        ? `${relativeDirectory}/${name}` : name
+      let item
+      try { item = fs.lstatSync(itemPath, { bigint: true }) } catch (_) { return false }
+      if (item.isSymbolicLink()) return false
+      if (item.isDirectory()) {
+        entries.push(Object.freeze({ kind: 'directory', relativePath: relative }))
+        if (!visit(itemPath, relative)) return false
+      } else if (item.isFile()) {
+        const file = stableFile(itemPath)
+        if (!file) return false
+        entries.push(Object.freeze({ kind: 'file', relativePath: relative, ...file }))
+      } else {
+        return false
+      }
+    }
+    try {
+      const after = fs.lstatSync(directory, { bigint: true })
+      const afterNames = fs.readdirSync(directory).sort()
+      return after.isDirectory() && !after.isSymbolicLink() &&
+        before.dev === after.dev && before.ino === after.ino &&
+        before.mode === after.mode && before.mtimeNs === after.mtimeNs &&
+        before.ctimeNs === after.ctimeNs &&
+        stableStringify(names) === stableStringify(afterNames)
+    } catch (_) {
+      return false
+    }
+  }
+  if (!visit(absolute)) return null
+  return Object.freeze({
+    kind: 'directory',
+    digest: hashText(stableStringify({ schemaVersion: 1, kind: 'directory', entries })),
+  })
+}
+
+function exactCommandArtifactAttestation(commandHash, harnessCommandHash, context = {}) {
+  let binding
+  try { binding = expectedCheckerObservationBinding(context) } catch (_) { return null }
+  if (!binding || binding.schemaVersion !== 3 || !Array.isArray(binding.observations)) return null
+  const matching = binding.observations.flatMap(observation =>
+    Array.isArray(observation.exactCommandBindings)
+      ? observation.exactCommandBindings.filter(item => item &&
+          (item.commandHash === commandHash || item.commandHash === harnessCommandHash))
+      : [])
+  if (matching.length === 0 || matching.some(item =>
+    !/^[a-f0-9]{64}$/u.test(item.artifactSetHash || '') ||
+    !Array.isArray(item.artifacts) || item.artifacts.length === 0)) return null
+  const artifactSetHashes = new Set(matching.map(item => item.artifactSetHash))
+  if (artifactSetHashes.size !== 1) return null
+  const artifacts = matching[0].artifacts
+  if (matching.some(item => stableStringify(item.artifacts) !== stableStringify(artifacts))) return null
+  const boundary = context && context.checkerScratchBoundary
+  const frozenRoot = boundary && typeof boundary.frozenCandidateRoot === 'string'
+    ? path.resolve(boundary.frozenCandidateRoot) : null
+  if (!frozenRoot) return null
+  const matched = artifacts.every(artifact => {
+    const absolute = path.resolve(frozenRoot, ...artifact.relativePath.split('/'))
+    if (!pathIsInside(frozenRoot, absolute)) return false
+    const current = trustedTestArtifactDigest(absolute, frozenRoot)
+    return Boolean(current && current.kind === artifact.kind && current.digest === artifact.digest)
+  })
+  return Object.freeze({
+    artifactSetHash: matching[0].artifactSetHash,
+    matched,
+  })
+}
+
 function substantiveVerificationFailure(exitCode, output) {
   if (!Number.isFinite(exitCode) || exitCode === 0 || [126, 127, 9009].includes(exitCode)) return false
   const normalized = String(output || '').trim()
@@ -5149,11 +5371,10 @@ function controllerCheckerFailureIdentity(
       typeof assignedCheckId !== 'string' || !assignedCheckId ||
       Buffer.byteLength(assignedCheckId, 'utf8') > 1024 ||
       !['EXACT_COMMAND', 'CANDIDATE_HARNESS'].includes(authorizationMode)) return null
-  // An exact command is not immutable suite authority: the candidate may own
-  // the test/config files reached by that command and can rename a failed case
-  // after every repair. Until the controller binds and revalidates immutable
-  // pre-mutation suite provenance, printed case names are evidence only. Key
-  // recurrence to the controller-assigned obligation so candidate/checker
+  // Even when PASS is bound to unchanged declared entry artifacts, transitive
+  // candidate inputs can rename a failed case after every repair. Printed case
+  // names therefore remain diagnostics rather than repair-progress authority.
+  // Key recurrence to the controller-assigned obligation so candidate/checker
   // output cannot manufacture an unbounded sequence of "novel" repairs.
   const normalizedHarnessIdentity = authorizationMode === 'EXACT_COMMAND'
     ? receipt.harnessCommandHash
@@ -5164,6 +5385,20 @@ function controllerCheckerFailureIdentity(
     normalizedHarnessIdentity,
     assignedCheckId,
   }))
+}
+
+function canonicalCheckerResultEvidenceHash(result) {
+  return hashText(stableStringify(result || null))
+}
+
+function checkerResultEvidenceHashMatches(result, expectedHash) {
+  if (!/^[a-f0-9]{64}$/u.test(expectedHash || '')) return false
+  // CHECK_INCONCLUSIVE has used both insertion-order JSON hashes and canonical
+  // hashes across durable releases. Both bind the already authenticated result
+  // object; preserve the exact persisted spelling instead of making an upgrade
+  // or crash window look like a foreign checker result.
+  return expectedHash === canonicalCheckerResultEvidenceHash(result) ||
+    expectedHash === hashText(JSON.stringify(result))
 }
 
 function substantiveVerificationSuccess(output, options = {}) {
@@ -5184,21 +5419,106 @@ function substantiveVerificationSuccess(output, options = {}) {
   // This protocol filter only decides whether a sealed execution is useful as
   // provisional evidence for a fresh independent confirmation. Lone `OK`,
   // `1 passed`, or self-authored status JSON is too weak even for that role.
-  if (options.scratchHarness === true) return countedStructured || passLines.length >= 2
+  if (options.scratchHarness === true) {
+    const semanticSummary = boundedSemanticScratchSummary(normalized)
+    if (semanticSummary && semanticSummary.contradiction) return false
+    return countedStructured || passLines.length >= 2 ||
+      Boolean(semanticSummary && semanticSummary.provisionalPass)
+  }
   return structured || passLines.length > 0 ||
     /\b[1-9]\d*\s+assertions?\s+(?:completed|passed)\b/iu.test(normalized)
 }
 
-function boundedDirectCheckerHarnessSummary(output) {
+function boundedDirectCheckerHarnessSummaryValue(output) {
   const source = String(output || '').trim()
-  if (!source || Buffer.byteLength(source, 'utf8') > 4096) return false
+  if (!source || Buffer.byteLength(source, 'utf8') > 4096) return null
   try {
     const parsed = JSON.parse(source)
-    return Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
-      Object.keys(parsed).length > 0 && Object.keys(parsed).length <= 64)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
+      Object.keys(parsed).length > 0 && Object.keys(parsed).length <= 64 ? parsed : null
   } catch (_) {
-    return false
+    return null
   }
+}
+
+function boundedDirectCheckerHarnessSummary(output) {
+  return boundedDirectCheckerHarnessSummaryValue(output) !== null
+}
+
+function boundedSemanticScratchSummary(output) {
+  const parsed = boundedDirectCheckerHarnessSummaryValue(output)
+  if (!parsed) return null
+  const normalizedKey = value => String(value || '').toLowerCase().replace(/[_-]/gu, '')
+  const failureKeys = new Set([
+    'error', 'errors', 'errorcount', 'errorscount', 'fail', 'failcount', 'failed',
+    'failedassertions', 'failedcases', 'failedcount', 'faileditems', 'failedrecords',
+    'failedrows', 'failedruns', 'failedtests', 'failure', 'failurecount', 'failures',
+    'failurescount', 'numerrors', 'numfailed', 'numfailures', 'testsfailing',
+    'testsfailed', 'totalerrors', 'totalfailed', 'totalfailures',
+  ])
+  const positiveCountKeys = new Set([
+    'assertions', 'batches', 'cases', 'checks', 'files', 'items', 'passcount',
+    'passed', 'records', 'rows', 'runs', 'successcount', 'tests', 'total',
+  ])
+  const negativeStatus = value => typeof value === 'string' &&
+    /^(?:ERROR|FAIL|FAILED|FAILURE|NOT_OK|RUNTIME_FAILURE|TEST_FAILED)$/u
+      .test(value.trim().toUpperCase().replace(/[ -]/gu, '_'))
+  const nonemptyFailureValue = value => {
+    if (value === null || value === undefined || value === false || value === 0 || value === '') return false
+    if (Array.isArray(value)) return value.length > 0
+    if (typeof value === 'object') return Object.keys(value).length > 0
+    return true
+  }
+  let contradiction = false
+  let meaningful = false
+  let visited = 0
+  const visit = (value, key = '', depth = 0) => {
+    if (contradiction) return
+    if (depth > 12 || visited >= 4096) {
+      // A summary that exceeds the bounded semantic inspection cannot be
+      // contradiction-free evidence. Keep the provisional admission fail-closed.
+      contradiction = true
+      return
+    }
+    visited += 1
+    const normalized = normalizedKey(key)
+    if (failureKeys.has(normalized) && nonemptyFailureValue(value)) {
+      contradiction = true
+      return
+    }
+    if (['ok', 'pass', 'passed', 'success'].includes(normalized) && value === false) {
+      contradiction = true
+      return
+    }
+    if (['code', 'outcome', 'result', 'status'].includes(normalized) && negativeStatus(value)) {
+      contradiction = true
+      return
+    }
+    if (normalized === 'runs') {
+      if (!Array.isArray(value) || value.length === 0 || value.some(item =>
+        !(Number.isSafeInteger(item) && item === 0))) {
+        contradiction = true
+        return
+      }
+      meaningful = true
+      return
+    } else if (positiveCountKeys.has(normalized) && Number.isSafeInteger(value) && value > 0) {
+      meaningful = true
+    }
+    if (!value || typeof value !== 'object') return
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, key, depth + 1)
+      return
+    }
+    for (const [childKey, childValue] of Object.entries(value)) {
+      visit(childValue, childKey, depth + 1)
+    }
+  }
+  visit(parsed)
+  return Object.freeze({
+    contradiction,
+    provisionalPass: parsed.ok === true && meaningful && !contradiction,
+  })
 }
 
 function codexCommandExecutionObservation(event, eventIndex, context = {}, startedHarness = null) {
@@ -5219,6 +5539,11 @@ function codexCommandExecutionObservation(event, eventIndex, context = {}, start
   const itemId = typeof item.id === 'string' && item.id ? item.id : null
   const commandHash = hashText(command)
   const harnessCommandHash = hashText(normalizedHarnessCommand(command))
+  const trustedArtifactAttestation = exactCommandArtifactAttestation(
+    commandHash,
+    harnessCommandHash,
+    context,
+  )
   const outputHash = hashText(output)
   const completedHarness = startedHarness
     ? checkerScratchHarnessAttestation(command, context) : null
@@ -5237,6 +5562,10 @@ function codexCommandExecutionObservation(event, eventIndex, context = {}, start
     harnessCommandHash,
     outputHash,
     fingerprint,
+    trustedTestArtifactsMatched: Boolean(trustedArtifactAttestation &&
+      trustedArtifactAttestation.matched),
+    trustedTestArtifactSetHash: trustedArtifactAttestation &&
+      trustedArtifactAttestation.artifactSetHash || null,
     ...(observedTestFailure ? {
       failureCaseIds: stableFailureCaseIdsFromOutput(output),
     } : {}),
@@ -5441,11 +5770,11 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
         if (receipt.resultDisposition !== 'ZERO_EXIT' &&
             !(legacyBinding && receipt.resultDisposition === undefined)) return false
         return legacyBinding
-          ? authorized.has(receipt.commandHash) || authorized.has(receipt.harnessCommandHash)
+          ? false
           : observation.authorizationMode === 'EXACT_COMMAND'
-            ? authorized.has(receipt.commandHash) || authorized.has(receipt.harnessCommandHash)
-            : receipt.candidateHarnessAdmissible === true ||
-              receipt.scratchHarnessAdmissible === true
+            ? receipt.trustedTestArtifactsMatched === true &&
+              (authorized.has(receipt.commandHash) || authorized.has(receipt.harnessCommandHash))
+            : receipt.scratchHarnessAdmissible === true
       }
       if (receipt.resultDisposition !== 'NONZERO_TEST_FAILURE') return false
       return legacyBinding
@@ -5465,6 +5794,8 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
     // checker supplied an exact selector that reduces them to one binding.
     const receiptBindings = new Map(admissibleReceipts.map(receipt => [
       `${receipt.commandHash}\0${receipt.fingerprint}\0${receipt.resultDisposition || ''}` +
+        `\0${receipt.trustedTestArtifactSetHash || ''}` +
+        `\0${receipt.trustedTestArtifactsMatched === true ? 'MATCHED' : 'UNMATCHED'}` +
         `\0${receipt.scratchHarnessProgramDigest || ''}` +
         `\0${receipt.scratchHarnessProgramPathHash || ''}` +
         `\0${receipt.scratchHarnessProgramIdentityHash || ''}`,
@@ -5496,9 +5827,7 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
       if (outcome.status === 'PASS') {
         const authority = legacyBinding || observation.authorizationMode === 'EXACT_COMMAND'
           ? 'EXACT_COMMAND'
-          : boundReceipt.candidateHarnessAdmissible === true
-            ? 'CANDIDATE_HARNESS'
-            : boundReceipt.scratchHarnessAdmissible === true ? 'SCRATCH_HARNESS' : null
+          : boundReceipt.scratchHarnessAdmissible === true ? 'SCRATCH_HARNESS' : null
         if (authority) {
           boundPassAuthorities.push(Object.freeze({
             checkId,
@@ -5530,6 +5859,8 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
     const commandIdentity = receipt.harnessCommandHash || receipt.commandHash
     const semantics = receiptSemanticsByCommand.get(commandIdentity) || new Set()
     semantics.add(`${receipt.resultDisposition || ''}\0${receipt.fingerprint}` +
+      `\0${receipt.trustedTestArtifactSetHash || ''}` +
+      `\0${receipt.trustedTestArtifactsMatched === true ? 'MATCHED' : 'UNMATCHED'}` +
       `\0${receipt.scratchHarnessProgramDigest || ''}` +
       `\0${receipt.scratchHarnessProgramPathHash || ''}` +
       `\0${receipt.scratchHarnessProgramIdentityHash || ''}`)
@@ -6192,14 +6523,22 @@ function codexPreRouteControlPlane(record) {
 
 function codexChildToolCallLimit(record) {
   if (codexPreRouteControlPlane(record)) return CODEX_CHILD_TOOL_CALL_LIMITS['route-analyst']
-  if (CHECKER_ROLES.has(record.logicalRole)) return CODEX_CHILD_TOOL_CALL_LIMITS.checker
-  return CODEX_CHILD_TOOL_CALL_LIMITS.worker
+  // Required product work is bounded by its admitted topology and any
+  // caller-supplied aggregate token envelope, not by an unrelated hidden
+  // command counter. Tests/embedders may still provide an explicit physical
+  // tool ceiling when that is part of their own authority.
+  if (Number.isSafeInteger(record && record.providerToolCallLimit) &&
+      record.providerToolCallLimit >= 0) return record.providerToolCallLimit
+  return Number.MAX_SAFE_INTEGER
 }
 
 function codexChildTokenRoleLimit(record) {
   if (codexPreRouteControlPlane(record)) return CODEX_CHILD_TOKEN_LIMITS['route-analyst']
-  if (CHECKER_ROLES.has(record.logicalRole)) return CODEX_CHILD_TOKEN_LIMITS.checker
-  return CODEX_CHILD_TOKEN_LIMITS.worker
+  if (record && record.finiteTokenBudget === true &&
+      Number.isSafeInteger(record.acceptedTokenLimit) && record.acceptedTokenLimit > 0) {
+    return record.acceptedTokenLimit
+  }
+  return Number.MAX_SAFE_INTEGER
 }
 
 function codexChildTokenLimit(record) {
@@ -6219,11 +6558,12 @@ function codexChildTokenLimit(record) {
 }
 
 function codexChildSpendRoleLimit(record) {
-  return codexPreRouteControlPlane(record)
-    ? CODEX_CHILD_SPEND_LIMITS['route-analyst']
-    : CHECKER_ROLES.has(record.logicalRole)
-      ? CODEX_CHILD_SPEND_LIMITS.checker
-      : CODEX_CHILD_SPEND_LIMITS.worker
+  if (codexPreRouteControlPlane(record)) return CODEX_CHILD_SPEND_LIMITS['route-analyst']
+  if (record && record.finiteTokenBudget === true &&
+      Number.isSafeInteger(record.providerTokenLimit) && record.providerTokenLimit > 0) {
+    return record.providerTokenLimit
+  }
+  return Number.MAX_SAFE_INTEGER
 }
 
 function codexChildSpendLimit(record) {
@@ -6248,6 +6588,9 @@ function codexChildRolloutPrefillWeight(record) {
 }
 
 function codexChildRolloutBudgetConfig(record) {
+  if (!codexPreRouteControlPlane(record) && record && record.finiteTokenBudget !== true) {
+    return null
+  }
   const spendLimit = codexChildSpendLimit(record)
   // Codex 0.148 rejects at `usage >= limit`. Leave one native unit so an
   // exactly-at-ceiling relay response remains controller-admissible.
@@ -6633,8 +6976,8 @@ function codexControlledModelCatalog(preRouteControlPlane = false) {
       web_search_tool_type: 'text_and_image',
       truncation_policy: { mode: 'tokens', limit: 10_000 },
       supports_image_detail_original: true,
-      context_window: 272_000,
-      max_context_window: 272_000,
+      context_window: CODEX_MODEL_CONTEXT_WINDOW,
+      max_context_window: CODEX_MODEL_CONTEXT_WINDOW,
       auto_compact_token_limit: null,
       comp_hash: '3000',
       effective_context_window_percent: 95,
@@ -6837,9 +7180,10 @@ function codexProviderPendingCause(
   tokenLimit,
   maximumUnaccountedTokens,
   priorLeaseModelTokens,
+  consumedAtStart,
 ) {
   return `codex-provider-pending:${sessionHash}:${requestOrdinal}:${tokenLimit}:` +
-    `${maximumUnaccountedTokens}:${priorLeaseModelTokens}`
+    `${maximumUnaccountedTokens}:${priorLeaseModelTokens}:${consumedAtStart}`
 }
 
 function codexProviderChargeCause(sessionHash, requestOrdinal, chargeClass) {
@@ -6884,15 +7228,25 @@ function unresolvedCodexProviderEnvelopes(records = []) {
     if (typeof causeId !== 'string') continue
     const pendingMatch = CODEX_PROVIDER_PENDING_CAUSE_PATTERN.exec(causeId)
     if (pendingMatch) {
-      const [, sessionHash, ordinalText, limitText, maximumText, priorText] = pendingMatch
+      const [
+        , sessionHash, ordinalText, limitText, maximumText, priorText, consumedText,
+      ] = pendingMatch
       const requestOrdinal = Number(ordinalText)
       const tokenLimit = Number(limitText)
       const maximumUnaccountedTokens = Number(maximumText)
       const priorLeaseModelTokens = Number(priorText)
+      // Legacy records used the entire remaining child reservation as the
+      // request allowance, so their consumed-at-start value is recoverable.
+      const consumedAtStart = consumedText === undefined
+        ? tokenLimit - maximumUnaccountedTokens : Number(consumedText)
       const key = codexProviderEnvelopeKey(sessionHash, requestOrdinal)
-      if (![requestOrdinal, tokenLimit, maximumUnaccountedTokens, priorLeaseModelTokens]
-          .every(Number.isSafeInteger) || priorLeaseModelTokens < 0 ||
-          maximumUnaccountedTokens > tokenLimit || pending.has(key) || retired.has(key)) {
+      if ([
+        requestOrdinal, tokenLimit, maximumUnaccountedTokens,
+        priorLeaseModelTokens, consumedAtStart,
+      ].some(value => !Number.isSafeInteger(value)) || priorLeaseModelTokens < 0 ||
+          consumedAtStart < 0 || maximumUnaccountedTokens <= 0 ||
+          consumedAtStart + maximumUnaccountedTokens > tokenLimit ||
+          pending.has(key) || retired.has(key)) {
         throw new SupervisorIntegrationError(
           'CODEX_USAGE_INVALID',
           'durable pending provider request allowance is malformed or duplicated',
@@ -6900,7 +7254,7 @@ function unresolvedCodexProviderEnvelopes(records = []) {
       }
       pending.set(key, {
         key, sessionHash, requestOrdinal, tokenLimit, maximumUnaccountedTokens,
-        priorLeaseModelTokens,
+        priorLeaseModelTokens, consumedAtStart,
         exactUsageTokens: 0,
         exactUsageRecorded: false,
         upperBoundChargedTokens: 0,
@@ -7031,6 +7385,7 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
   let deniedCount = 0
   let hardStopped = false
   let latestInputBound = null
+  let latestMaximumUnaccountedTokens = null
   let lastFailure = null
   const upstreamRequests = new Set()
   const sockets = new Set()
@@ -7113,7 +7468,9 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
       }
       latestInputBound = inputBound
       const alreadyUsed = billableModelTokens(cumulativeUsage)
-      const outputAllowance = tokenLimit - alreadyUsed - inputBound.maximumInputTokens
+      const activationOutputAllowance = tokenLimit - alreadyUsed - inputBound.maximumInputTokens
+      const contextOutputAllowance = CODEX_MODEL_CONTEXT_WINDOW - inputBound.maximumInputTokens
+      const outputAllowance = Math.min(activationOutputAllowance, contextOutputAllowance)
       if (!Number.isSafeInteger(outputAllowance) || outputAllowance <= 0) {
         deniedCount += 1
         recordFailure(
@@ -7125,6 +7482,9 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
       }
       body.max_output_tokens = Number.isSafeInteger(body.max_output_tokens)
         ? Math.min(body.max_output_tokens, outputAllowance)
+        // Accounting-only default execution has no Autoprompt cumulative
+        // quota. Keep each response inside the controlled model's real context
+        // boundary instead of forwarding an invalid MAX_SAFE_INTEGER request.
         : outputAllowance
       const outboundBody = Buffer.from(JSON.stringify(body), 'utf8')
       const upstreamBase = codexQuotaProxyUpstream(
@@ -7145,7 +7505,12 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
       headers['accept-encoding'] = 'identity'
       const transport = upstreamUrl.protocol === 'http:' ? http : https
       const requestOrdinal = providerRequestCount + 1
-      const maximumUnaccountedTokens = tokenLimit - alreadyUsed
+      // Unknown billing can consume at most this one admitted provider
+      // response, never the accounting-only activation sentinel. This finite
+      // bound is persisted before the first upstream byte and survives crash
+      // recovery exactly.
+      const maximumUnaccountedTokens = inputBound.maximumInputTokens + body.max_output_tokens
+      latestMaximumUnaccountedTokens = maximumUnaccountedTokens
       if (typeof options.onProviderRequestStarted === 'function') {
         try {
           options.onProviderRequestStarted(Object.freeze({
@@ -7384,6 +7749,7 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
         hardStopped,
         usage: Object.freeze({ ...cumulativeUsage }),
         latestInputBound,
+        latestMaximumUnaccountedTokens,
         lastFailure,
       })
     },
@@ -7753,6 +8119,7 @@ function codexCheckerScratchProjection(record, canonicalTargetPath, workingDirec
     })}`,
     'The frozen exact-version root is readable/executable and outside the writable sandbox. Never modify it.',
     'Use only the writable scratch tmp, cache, and output roots for temporary files, databases, bytecode, generated files, and test output.',
+    'Open databases in the frozen root only with an explicit read-only or immutable mode. If any reader may create journals, WAL files, locks, bytecode, caches, sidecars, or temporary files, copy the required inputs into writable scratch first, verify the copy against the frozen source hash and size, and read only the scratch copy.',
     'Execute the exact named acceptance commands and authoritative verifier when available; do not replace them with a weaker approximate check.',
     `If you author a checker harness, write one regular program under ${JSON.stringify(writableScratchRoot)} before executing it.`,
     `Invoke it exactly once as either <python3|node|ruby|perl|sh> <absolute harness path under ${JSON.stringify(writableScratchRoot)}> ${JSON.stringify(frozenCandidateRoot)} or <absolute executable harness path under that scratch root> ${JSON.stringify(frozenCandidateRoot)}.`,
@@ -7845,6 +8212,7 @@ class CodexExecAdapter {
     }
     const checkerScratchBoundary = verifiedCheckerScratch
     const transportSandboxMode = checkerScratchBoundary ? 'workspace-write' : executionPolicy.sandboxMode
+    const rolloutBudgetConfig = codexChildRolloutBudgetConfig(record)
     const common = [
       '--json', '--output-schema', schemaPath, '--strict-config',
       '--disable', 'multi_agent', '--disable', 'multi_agent_v2',
@@ -7855,7 +8223,6 @@ class CodexExecAdapter {
       '-c', `model_auto_compact_token_limit=${CODEX_CHILD_AUTO_COMPACT_TOKEN_LIMIT}`,
       '-c', `tool_output_token_limit=${CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT}`,
       '-c', 'allow_login_shell=false',
-      '-c', codexChildRolloutBudgetConfig(record),
       '-c', 'mcp_servers={}',
       '-c', 'tools.experimental_request_user_input.enabled=false',
       '-c', 'tools.update_plan.enabled=false',
@@ -7870,6 +8237,7 @@ class CodexExecAdapter {
       '-c', 'marketplaces={}',
       '--sandbox', transportSandboxMode,
     ]
+    if (rolloutBudgetConfig) common.push('-c', rolloutBudgetConfig)
     if (controlledTransport) {
       common.push(
         '-c', `model_catalog_json=${JSON.stringify(controlledTransport.modelCatalogPath)}`,
@@ -7888,11 +8256,15 @@ class CodexExecAdapter {
         '--disable', 'view_image',
       )
     } else {
-      // Codex 0.148 omits unified-exec nested calls and ImageView items from
-      // `exec --json`. Those paths cannot participate in the hard transport
-      // counter, so bounded children expose only direct shell and file-change
-      // tools whose individual calls are visible on the owned event stream.
-      common.push('--disable', 'unified_exec', '--disable', 'view_image')
+      // Nested unified-exec calls are not fully represented in the owned JSON
+      // lifecycle, so keep the direct shell transport. Image inspection is a
+      // required product capability (notably for CAD/visual tasks) and remains
+      // available unless the caller explicitly installed a hard tool counter
+      // that the transport must be able to observe exactly.
+      common.push('--disable', 'unified_exec')
+      if (codexChildToolCallLimit(record) !== Number.MAX_SAFE_INTEGER) {
+        common.push('--disable', 'view_image')
+      }
     }
     if (checkerScratchBoundary) {
       common.push(
@@ -8045,6 +8417,8 @@ class CodexExecAdapter {
     let terminalReceiptPersisted = false
     let committedTerminalResult = null
     let committedTerminalEvidence = null
+    const lateExecutionFailures = []
+    let terminalDrainProof = null
     let firstProductSignalPersisted = false
     let reportedSessionId = null
     const priorToolCallCount = record.priorToolCallCount === undefined
@@ -8094,16 +8468,61 @@ class CodexExecAdapter {
           reasons: Object.freeze([...item.reasons].sort()),
         }))),
     })
-    const withLocalCallbackDegradation = result => {
-      if (degradedLocalCallbacks.size === 0) return result
+    const lateExecutionDegradation = () => Object.freeze({
+      schemaVersion: 1,
+      status: 'DEGRADED_AFTER_COMMITTED_TERMINAL',
+      durableTerminalReceipt: terminalReceiptPersisted,
+      ownedProcessDrain: terminalDrainProof,
+      failures: Object.freeze(lateExecutionFailures.map(failure => Object.freeze({ ...failure }))),
+    })
+    const withAdapterDegradation = result => {
+      if (degradedLocalCallbacks.size === 0 && lateExecutionFailures.length === 0) return result
       const decorated = { ...result }
-      Object.defineProperty(decorated, 'localCallbackReconciliation', {
-        enumerable: false,
-        configurable: false,
-        writable: false,
-        value: localCallbackDegradation(),
-      })
+      if (degradedLocalCallbacks.size > 0) {
+        Object.defineProperty(decorated, 'localCallbackReconciliation', {
+          enumerable: false,
+          configurable: false,
+          writable: false,
+          value: localCallbackDegradation(),
+        })
+      }
+      if (lateExecutionFailures.length > 0) {
+        Object.defineProperty(decorated, 'terminalTransportReconciliation', {
+          enumerable: false,
+          configurable: false,
+          writable: false,
+          value: lateExecutionDegradation(),
+        })
+      }
       return Object.freeze(decorated)
+    }
+    const recordLateExecutionFailure = (stage, error) => {
+      const code = error && error.code || 'FAILED'
+      const message = error && error.message || String(error)
+      let detailsHash
+      try { detailsHash = hashText(stableStringify(error && error.details || {})) } catch {
+        detailsHash = hashText(stableStringify({ unavailable: true }))
+      }
+      lateExecutionFailures.push(Object.freeze({
+        stage,
+        code,
+        message: String(message).slice(0, 4096),
+        detailsHash,
+      }))
+    }
+    const carryCommittedTerminal = error => {
+      if (!committedTerminalResult || !committedTerminalEvidence ||
+          !error || (typeof error !== 'object' && typeof error !== 'function') ||
+          !Object.isExtensible(error)) return error
+      Object.defineProperty(error, 'frozenTerminalResult', {
+        enumerable: false, configurable: false, writable: false,
+        value: committedTerminalResult,
+      })
+      Object.defineProperty(error, 'frozenTerminalEvidence', {
+        enumerable: false, configurable: false, writable: false,
+        value: committedTerminalEvidence,
+      })
+      return error
     }
     const deferCallback = (kind, invoke, onSuccess, evidence = null, priorError = null) => {
       const descriptor = Object.freeze({
@@ -8212,6 +8631,8 @@ class CodexExecAdapter {
                     record.canonicalAssignment,
                     record.canonicalTargetPath || candidatePath,
                   ),
+                  record.canonicalAssignment && record.canonicalAssignment.resources || [],
+                  record.canonicalTargetPath || candidatePath,
                 ),
                 terminalResultHash: hashText(JSON.stringify(committedTerminalResult)),
                 terminalEvidenceHash: hashText(stableStringify(committedTerminalEvidence)),
@@ -8286,13 +8707,13 @@ class CodexExecAdapter {
       committedTerminalResult = Object.freeze(typeof record.normalizeTerminalResult === 'function'
         ? record.normalizeTerminalResult(assembled)
         : assembled)
+      const terminalEvidence = Object.freeze({
+        rawOutputHash: snapshot.rawOutputHash || rawOutputHash.copy().digest('hex'),
+        eventStreamHash: snapshot.eventStreamHash,
+        sessionId: record.continuationId || snapshot.sessionId,
+      })
+      committedTerminalEvidence = terminalEvidence
       if (typeof record.onTerminalResult === 'function') {
-        const terminalEvidence = Object.freeze({
-          rawOutputHash: snapshot.rawOutputHash || rawOutputHash.copy().digest('hex'),
-          eventStreamHash: snapshot.eventStreamHash,
-          sessionId: record.continuationId || snapshot.sessionId,
-        })
-        committedTerminalEvidence = terminalEvidence
         invokeOrDeferCallback(
           'terminal-result',
           () => record.onTerminalResult(committedTerminalResult, terminalEvidence),
@@ -8547,13 +8968,19 @@ class CodexExecAdapter {
         return
       }
       if (codexNativeRolloutBudgetFailure(event)) {
+        const controllerInstalledRolloutBudget = rolloutBudgetConfig !== null
         streamError = new SupervisorIntegrationError(
-          'CHILD_ROLLOUT_BUDGET_EXHAUSTED',
-          `${record.logicalRole} exhausted the native Codex rollout budget`,
+          controllerInstalledRolloutBudget
+            ? 'CHILD_ROLLOUT_BUDGET_EXHAUSTED'
+            : 'CODEX_USAGE_UNKNOWN_AFTER_START',
+          controllerInstalledRolloutBudget
+            ? `${record.logicalRole} exhausted the controller-installed native Codex rollout budget`
+            : `${record.logicalRole} provider turn failed without a controller-installed rollout budget`,
           {
             logicalRole: record.logicalRole,
             limit: childTokenLimit,
             usageUnavailable: true,
+            controllerInstalledRolloutBudget,
           },
         )
         stop(streamError.code)
@@ -8723,6 +9150,7 @@ class CodexExecAdapter {
       : [...this.executableArgs, 'exec', ...common, '-p', selectedProfile, '-C', workingDirectory, '-']
     let execution
     let executionError = null
+    let executionErrorStage = null
     try {
       execution = await this.runner.run({
         executable: this.executable,
@@ -8740,6 +9168,8 @@ class CodexExecAdapter {
       })
     } catch (error) {
       executionError = error
+      executionErrorStage = 'runner-rejection'
+      recordLateExecutionFailure(executionErrorStage, error)
     } finally {
       if (cumulativeQuotaProxy) {
         const quotaSnapshot = cumulativeQuotaProxy.snapshot()
@@ -8753,10 +9183,7 @@ class CodexExecAdapter {
           try {
             record.onUnknownProviderSpend(Object.freeze({
               tokenLimit: quotaSnapshot.tokenLimit,
-              maximumUnaccountedTokens: Math.max(
-                0,
-                quotaSnapshot.tokenLimit - billableModelTokens(quotaSnapshot.usage),
-              ),
+              maximumUnaccountedTokens: quotaSnapshot.latestMaximumUnaccountedTokens,
               providerRequestCount: quotaSnapshot.providerRequestCount,
               completedRequestCount: quotaSnapshot.requestCount,
               requestOrdinal: quotaSnapshot.providerRequestCount,
@@ -8768,12 +9195,18 @@ class CodexExecAdapter {
               accountingError.cause = executionError
             }
             executionError = accountingError
+            executionErrorStage = 'provider-accounting'
+            recordLateExecutionFailure(executionErrorStage, accountingError)
           }
         }
         try {
           await cumulativeQuotaProxy.close()
         } catch (closeError) {
-          if (!executionError) executionError = closeError
+          recordLateExecutionFailure('quota-proxy-close', closeError)
+          if (!executionError) {
+            executionError = closeError
+            executionErrorStage = 'quota-proxy-close'
+          }
         } finally {
           // Preserve the final relay state after every socket has been
           // drained. In particular, a relay-local preflight denial occurs
@@ -8787,33 +9220,82 @@ class CodexExecAdapter {
       cumulativeQuotaSnapshot.providerRequestCount === cumulativeQuotaSnapshot.requestCount &&
       cumulativeQuotaSnapshot.lastFailure &&
       cumulativeQuotaSnapshot.lastFailure.code === 'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED'
-    if (relayLocalQuotaPreflightFailure) {
-      throw new SupervisorIntegrationError(
-        'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED',
-        cumulativeQuotaSnapshot.lastFailure.message,
-        {
-          logicalRole: record.logicalRole,
-          tokenLimit: cumulativeQuotaSnapshot.tokenLimit,
-          latestInputBound: cumulativeQuotaSnapshot.latestInputBound,
-          deniedCount: cumulativeQuotaSnapshot.deniedCount,
-          upstreamProviderRequests: cumulativeQuotaSnapshot.providerRequestCount,
-          ...(executionError ? { executionError: serializeError(executionError) } : {}),
-        },
-      )
+    const quotaPreflightError = relayLocalQuotaPreflightFailure
+      ? new SupervisorIntegrationError(
+          'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED',
+          cumulativeQuotaSnapshot.lastFailure.message,
+          {
+            logicalRole: record.logicalRole,
+            tokenLimit: cumulativeQuotaSnapshot.tokenLimit,
+            latestInputBound: cumulativeQuotaSnapshot.latestInputBound,
+            deniedCount: cumulativeQuotaSnapshot.deniedCount,
+            upstreamProviderRequests: cumulativeQuotaSnapshot.providerRequestCount,
+            ...(executionError ? { executionError: serializeError(executionError) } : {}),
+          },
+        )
+      : null
+    if (relayLocalQuotaPreflightFailure && lateExecutionFailures.length === 0) {
+      recordLateExecutionFailure('quota-proxy-preflight', cumulativeQuotaSnapshot.lastFailure)
     }
-    if (executionError) throw executionError
-    if (!execution || execution.processOwned !== true || execution.exactArgv !== true) {
-      throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'Codex runner did not prove owned process and exact argv')
+    if (!committedTerminalResult) {
+      if (quotaPreflightError) throw quotaPreflightError
+      if (executionError) throw executionError
+      if (!execution || execution.processOwned !== true || execution.exactArgv !== true) {
+        throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'Codex runner did not prove owned process and exact argv')
+      }
+      if (externalWriteRequested && !externalWriteBoundaryConsumed) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_WRITE_BOUNDARY_REQUIRED',
+          'external operation returned without invoking its enforced deadline boundary',
+        )
+      }
     }
-    if (externalWriteRequested && !externalWriteBoundaryConsumed) {
-      throw new SupervisorIntegrationError(
-        'EXTERNAL_WRITE_BOUNDARY_REQUIRED',
-        'external operation returned without invoking its enforced deadline boundary',
-      )
+    let stopped = null
+    let stopError = null
+    if (stopPromise) {
+      try { stopped = await stopPromise } catch (error) {
+        stopError = error
+        recordLateExecutionFailure('runner-stop', error)
+      }
     }
-    const stopped = stopPromise ? await stopPromise : null
-    if (typedTerminal && (!stopped || stopped.drained !== true) && execution.drained !== true) {
-      throw new SupervisorIntegrationError('PROCESS_DRAIN_TIMEOUT', 'typed terminal child did not prove bounded descendant drain')
+    if (typedTerminal) {
+      terminalDrainProof = stopped && stopped.drained === true
+        ? 'OWNED_STOP_RECEIPT'
+        : execution && execution.drained === true
+          ? 'OWNED_EXECUTION_RECEIPT'
+          : null
+      if (!terminalDrainProof) {
+        const drainFailure = new SupervisorIntegrationError(
+          'PROCESS_DRAIN_TIMEOUT',
+          'typed terminal child did not prove bounded descendant drain',
+          {
+            terminalResultHash: committedTerminalResult
+              ? hashText(JSON.stringify(committedTerminalResult)) : null,
+            terminalEvidenceHash: committedTerminalEvidence
+              ? hashText(stableStringify(committedTerminalEvidence)) : null,
+            retryDisposition: committedTerminalResult
+              ? 'PRESERVE_COMMITTED_RESULT_WITHOUT_RELAUNCH' : 'DRAIN_BEFORE_RETRY',
+            ...(executionError ? { executionError: serializeError(executionError) } : {}),
+            ...(stopError ? { stopError: serializeError(stopError) } : {}),
+          },
+        )
+        throw carryCommittedTerminal(drainFailure)
+      }
+    }
+    if (committedTerminalResult) {
+      if (executionErrorStage === 'provider-accounting') throw carryCommittedTerminal(executionError)
+      if (execution && (execution.processOwned !== true || execution.exactArgv !== true)) {
+        throw carryCommittedTerminal(new SupervisorIntegrationError(
+          'PROVIDER_UNSUPPORTED',
+          'Codex runner did not prove owned process and exact argv',
+        ))
+      }
+      if (externalWriteRequested && !externalWriteBoundaryConsumed) {
+        throw carryCommittedTerminal(new SupervisorIntegrationError(
+          'EXTERNAL_WRITE_BOUNDARY_REQUIRED',
+          'external operation returned without invoking its enforced deadline boundary',
+        ))
+      }
     }
     const parsed = sawStreamedOutput
       ? streamAccumulator.snapshot()
@@ -8827,7 +9309,7 @@ class CodexExecAdapter {
     // Semantic, identity, tamper, and accounting failures never enter this
     // path and remain the original fail-closed error above.
     if (deferredCallbacks.length > 0) reconcileDeferredCallbacks(parsed)
-    if (committedTerminalResult) return withLocalCallbackDegradation(committedTerminalResult)
+    if (committedTerminalResult) return withAdapterDegradation(committedTerminalResult)
     if (execution.status !== 0) {
       const usageKnown = Boolean(parsed.usage && parsed.usageComplete === true)
       throw new SupervisorIntegrationError(
@@ -8901,7 +9383,7 @@ class CodexExecAdapter {
       )
       if (deferredCallbacks.length > 0) reconcileDeferredCallbacks(parsed)
     }
-    return withLocalCallbackDegradation(returned)
+    return withAdapterDegradation(returned)
   }
 }
 
@@ -9464,6 +9946,45 @@ function trustedTestDeclarationError(message, details = {}) {
   throw new SupervisorIntegrationError('TRUSTED_TEST_DECLARATION_INVALID', message, details)
 }
 
+function captureDeclaredTrustedTestArtifacts(repository, cwd, executable, argv) {
+  const candidates = []
+  if (pathIsInside(repository, executable)) candidates.push(executable)
+  for (const argument of argv) {
+    const candidateText = argument.startsWith('-') && argument.includes('=')
+      ? argument.slice(argument.indexOf('=') + 1) : argument
+    if (!candidateText || candidateText.startsWith('-')) continue
+    const absolute = path.isAbsolute(candidateText)
+      ? path.resolve(candidateText) : path.resolve(cwd, candidateText)
+    if (!pathIsInside(repository, absolute)) continue
+    try {
+      const item = fs.lstatSync(absolute)
+      if (!item.isFile() && !item.isDirectory()) continue
+    } catch (_) {
+      continue
+    }
+    candidates.push(absolute)
+  }
+  const artifacts = []
+  for (const absolute of [...new Set(candidates.map(value => path.resolve(value)))]) {
+    const relativePath = path.relative(repository, absolute).replace(/\\/gu, '/')
+    if (!relativePath || relativePath === '.' || relativePath.startsWith('../')) continue
+    const identity = trustedTestArtifactDigest(absolute, repository)
+    if (!identity) {
+      trustedTestDeclarationError(
+        `trusted test dependency could not be read as a stable regular file or directory: ${relativePath}`,
+      )
+    }
+    artifacts.push(Object.freeze({
+      kind: identity.kind,
+      relativePath,
+      digest: identity.digest,
+    }))
+  }
+  const normalized = normalizeTrustedTestArtifactBindings(artifacts)
+  if (!normalized) trustedTestDeclarationError('trusted test dependency identity is malformed')
+  return Object.freeze(normalized)
+}
+
 function resolveTrustedTestDeclarations(declarations = {}, options = {}) {
   const repository = path.resolve(options.repository || options.cwd || '')
   if (!repository || !fs.existsSync(repository) || !fs.statSync(repository).isDirectory()) {
@@ -9526,6 +10047,12 @@ function resolveTrustedTestDeclarations(declarations = {}, options = {}) {
         trustedTestDeclarationError(`trusted test ${declaration.id} contains an absolute path outside its cwd`, { argument })
       }
     }
+    const artifacts = captureDeclaredTrustedTestArtifacts(
+      repository,
+      cwd,
+      executable,
+      declaration.argv,
+    )
     return Object.freeze({
       id: declaration.id,
       authority,
@@ -9533,6 +10060,7 @@ function resolveTrustedTestDeclarations(declarations = {}, options = {}) {
       argv: Object.freeze(declaration.argv.slice()),
       cwd,
       shell: false,
+      artifacts,
       [TRUSTED_TEST_EXECUTION_RECORD]: true,
     })
   })
@@ -9624,12 +10152,95 @@ async function executeExistingTestBaseline(declaredTests, options = {}) {
       executable: test.executable,
       argv: test.argv.slice(),
       authority: test.authority,
+      artifacts: Object.freeze((test.artifacts || []).map(artifact => Object.freeze({ ...artifact }))),
       exitCode,
       status: exitCode === 0 ? 'PASS' : 'FAIL', outputHash: hashText(output),
       ...(timeoutEvidenceHash ? { timedOut: true, timeoutEvidenceHash } : {}),
     }))
   }
   return Object.freeze(results)
+}
+
+function trustedTestArtifactReceiptPath(baselineRecordHash) {
+  if (!/^[a-f0-9]{64}$/u.test(baselineRecordHash || '')) {
+    throw new SupervisorIntegrationError(
+      'TRUSTED_TEST_ARTIFACT_BINDING_INVALID',
+      'trusted test dependencies require the immutable pre-mutation baseline hash',
+    )
+  }
+  return `checks/review-results/trusted-test-artifacts-${baselineRecordHash}.json`
+}
+
+function createTrustedTestArtifactReceipt(existingTests, baseline) {
+  const tests = (existingTests || []).map(test => {
+    const artifacts = normalizeTrustedTestArtifactBindings(test && test.artifacts)
+    if (!test || typeof test.id !== 'string' || !test.id ||
+        typeof test.command !== 'string' || !test.command || !artifacts) {
+      throw new SupervisorIntegrationError(
+        'TRUSTED_TEST_ARTIFACT_BINDING_INVALID',
+        'trusted test dependency receipt requires exact baseline test identities',
+      )
+    }
+    return Object.freeze({
+      id: test.id,
+      commandHash: hashText(test.command),
+      artifacts: Object.freeze(artifacts),
+      artifactSetHash: artifacts.length > 0
+        ? hashText(stableStringify(artifacts)) : null,
+    })
+  })
+  const body = Object.freeze({
+    schemaVersion: 1,
+    kind: 'trusted-test-pre-mutation-artifacts',
+    baselineRecordHash: baseline && baseline.recordHash,
+    targetStateHash: baseline && baseline.targetStateHash,
+    tests: Object.freeze(tests),
+  })
+  if (!/^[a-f0-9]{64}$/u.test(body.baselineRecordHash || '') ||
+      !/^[a-f0-9]{64}$/u.test(body.targetStateHash || '') ||
+      !baseline || !Array.isArray(baseline.existingTests) ||
+      stableStringify(baseline.existingTests.map(test => ({
+        id: test.id,
+        commandHash: hashText(test.command),
+      }))) !== stableStringify(tests.map(test => ({
+        id: test.id,
+        commandHash: test.commandHash,
+      })))) {
+    throw new SupervisorIntegrationError(
+      'TRUSTED_TEST_ARTIFACT_BINDING_INVALID',
+      'trusted test dependency receipt differs from the immutable test baseline',
+    )
+  }
+  return Object.freeze({
+    ...body,
+    receiptHash: hashText(stableStringify(body)),
+  })
+}
+
+function validateTrustedTestArtifactReceipt(receipt, baseline) {
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt) ||
+      receipt.schemaVersion !== 1 || receipt.kind !== 'trusted-test-pre-mutation-artifacts' ||
+      receipt.baselineRecordHash !== (baseline && baseline.recordHash) ||
+      receipt.targetStateHash !== (baseline && baseline.targetStateHash) ||
+      !Array.isArray(receipt.tests)) return false
+  const { receiptHash, ...body } = receipt
+  if (!/^[a-f0-9]{64}$/u.test(receiptHash || '') ||
+      receiptHash !== hashText(stableStringify(body)) ||
+      !baseline || !Array.isArray(baseline.existingTests) ||
+      receipt.tests.length !== baseline.existingTests.length) return false
+  const baselineById = new Map(baseline.existingTests.map(test => [test.id, test]))
+  const ids = new Set()
+  for (const test of receipt.tests) {
+    const baselineTest = test && baselineById.get(test.id)
+    const artifacts = normalizeTrustedTestArtifactBindings(test && test.artifacts)
+    if (!baselineTest || ids.has(test.id) || !artifacts ||
+        test.commandHash !== hashText(baselineTest.command) ||
+        test.artifactSetHash !== (artifacts.length > 0
+          ? hashText(stableStringify(artifacts)) : null) ||
+        stableStringify(test.artifacts) !== stableStringify(artifacts)) return false
+    ids.add(test.id)
+  }
+  return ids.size === baseline.existingTests.length
 }
 
 function createDefaultExternalOperation(input = {}) {
@@ -10129,10 +10740,19 @@ class CodexSupervisorRuntime {
     this.suspending = false
     this.finalizationPromise = null
     this.terminalFinalizationIntent = null
+    this.terminalFinalizationIntentDurable = false
+    this.terminalReplayAttempts = 0
+    this.terminalReleasePromise = null
+    this.terminalReleaseRequired = false
+    this.terminalReleaseCompleted = false
+    this.settlementKind = null
+    this.settlementPromise = null
     this.suspensionPromise = null
     this.resumableSuspensionIntent = null
+    this.suspensionReplayAttempts = 0
     this.cancellationPromise = null
     this.settledResult = null
+    this.latestStructuredFinalResponse = null
     this.starting = false
     this.startupReadyPromise = null
     this.resolveStartupReady = null
@@ -10221,6 +10841,25 @@ class CodexSupervisorRuntime {
       this.localPersistenceLimitations.push(limitation)
     }
     return limitation
+  }
+
+  _rememberStructuredFinalResponse(response) {
+    if (!validStructuredFinalResponseCandidate(response)) {
+      throw new SupervisorIntegrationError(
+        'STRUCTURED_FINAL_RESPONSE_INVALID',
+        'runtime cannot retain an unauthenticated structured final response',
+      )
+    }
+    const immutable = deepFreezeJson(JSON.parse(stableStringify(response)))
+    if (this.latestStructuredFinalResponse &&
+        stableStringify(this.latestStructuredFinalResponse) !== stableStringify(immutable)) {
+      throw new SupervisorIntegrationError(
+        'STRUCTURED_FINAL_RESPONSE_INVALID',
+        'runtime cannot replace an already retained structured final response',
+      )
+    }
+    this.latestStructuredFinalResponse = immutable
+    return immutable
   }
 
   _enforceBudgetPhase(name, evidence = {}) {
@@ -10507,7 +11146,6 @@ class CodexSupervisorRuntime {
         return this._deadlineFailure(deadlineAdmission.code, deadlineAdmission.reason, deadlineAdmission)
       }
       this.admissionDurations.configuration += Math.max(0, this.monotonicNow() - configurationStartedAt)
-      this.budget.assertAvailable({ forWork: true, requiredCompletion: true })
       const recordStartedAt = this.monotonicNow()
       if (typeof this.options.beforeMissionAcquire === 'function') {
         await this.options.beforeMissionAcquire({ activation: this.activation })
@@ -10529,41 +11167,45 @@ class CodexSupervisorRuntime {
         lease: this.lease,
         settings: this.settings,
       })
-      if (!this.providerCapabilities) {
-        throw new SupervisorIntegrationError(
-          'PROVIDER_UNSUPPORTED',
-          'record admission did not establish an authenticated live provider capability receipt',
-        )
-      }
-      this.providerCapabilities = validateProviderCapabilities(this.providerCapabilities)
-      if (this.options.resumeState) {
-        for (const id of this.options.resumeState.completedWorkIds || []) this.recoveryCompletedWorkIds.add(id)
-        for (const id of this.options.resumeState.completedCheckIds || []) {
-          addCanonicalCompletedChecker(this.recoveryCompletedCheckIds, id)
-        }
-        for (const [id, evidence] of Object.entries(this.options.resumeState.threadEvidence || {})) {
-          this.recoveryThreads.set(id, evidence)
-        }
-        for (const operation of this.options.resumeState.externalOperations || []) {
-          this.recoveryExternalOperations.set(operation.operationId, operation)
-        }
-      }
       if (this.options.budgetController !== this.budget) this.budget = this.options.budgetController
-      if (this.activation.generation > 1) {
-        validateResumedBudget(this.budget, this.options.previousBudgetSnapshot, this.activation.generation)
-        this._recoverUnresolvedProviderEnvelopes()
-      }
-      if (this.options.resumeState || this.activation.generation > 1) {
-        this._enforceBudgetPhase('RECOVERY_REPLAY', {
-          boundary: 'activation-resume',
-          requiredCompletion: true,
-        })
-      }
       this.admissionDurations.runRecord += Math.max(0, this.monotonicNow() - recordStartedAt)
       const persistenceStartedAt = this.monotonicNow()
       this.requestPointer = await this.options.requestPointerFactory(this.record)
-      this._restoreCompletedWorkerContexts()
-      if (!this.options.resumeState && this.record.initializeRouteTranscript) this.record.initializeRouteTranscript()
+      const durableTerminalIntent = this._adoptDurableTerminalFinalizationIntent()
+      if (!durableTerminalIntent) {
+        this.budget.assertAvailable({ forWork: true, requiredCompletion: true })
+        if (!this.providerCapabilities) {
+          throw new SupervisorIntegrationError(
+            'PROVIDER_UNSUPPORTED',
+            'record admission did not establish an authenticated live provider capability receipt',
+          )
+        }
+        this.providerCapabilities = validateProviderCapabilities(this.providerCapabilities)
+        if (this.options.resumeState) {
+          for (const id of this.options.resumeState.completedWorkIds || []) this.recoveryCompletedWorkIds.add(id)
+          for (const id of this.options.resumeState.completedCheckIds || []) {
+            addCanonicalCompletedChecker(this.recoveryCompletedCheckIds, id)
+          }
+          for (const [id, evidence] of Object.entries(this.options.resumeState.threadEvidence || {})) {
+            this.recoveryThreads.set(id, evidence)
+          }
+          for (const operation of this.options.resumeState.externalOperations || []) {
+            this.recoveryExternalOperations.set(operation.operationId, operation)
+          }
+        }
+        if (this.activation.generation > 1) {
+          validateResumedBudget(this.budget, this.options.previousBudgetSnapshot, this.activation.generation)
+          this._recoverUnresolvedProviderEnvelopes()
+        }
+        if (this.options.resumeState || this.activation.generation > 1) {
+          this._enforceBudgetPhase('RECOVERY_REPLAY', {
+            boundary: 'activation-resume',
+            requiredCompletion: true,
+          })
+        }
+        this._restoreCompletedWorkerContexts()
+        if (!this.options.resumeState && this.record.initializeRouteTranscript) this.record.initializeRouteTranscript()
+      }
       this.finalizer = await this.options.finalizerFactory({
         activation: this.activation,
         lease: this.lease,
@@ -10572,14 +11214,35 @@ class CodexSupervisorRuntime {
       this._completeStartupBarrier()
       if (this.cancelled && this.cancellationPromise) return this.cancellationPromise
       this.admissionDurations.persistence += Math.max(0, this.monotonicNow() - persistenceStartedAt)
+      if (durableTerminalIntent) {
+        const selected = durableTerminalIntent
+        const envelope = selected.result.terminalEnvelope || null
+        const terminalError = new SupervisorIntegrationError(
+          envelope && (envelope.code || envelope.status) || selected.outcome,
+          selected.result.reason || envelope && (envelope.reason ||
+            envelope.cause && envelope.cause.reason) || 'replay durable terminal selection',
+          envelope || {},
+        )
+        this.route = selected.result.route
+        const terminalOutcome = await this._enterTerminalRelease(
+          selected.outcome,
+          terminalError,
+          envelope,
+          selected.result,
+        )
+        return await this._finish(terminalOutcome, selected.result)
+      }
       if (this.options.releaseReconciliation) {
         const release = this.options.releaseReconciliation
         this.route = release.route || null
         return await this._finish(release.outcome, {
-          reason: 'reconcile the existing canonical release intent after supervisor restart',
+          reason: release.reason || 'reconcile the existing canonical release intent after supervisor restart',
           deliverables: release.deliverables || [],
           checkHashes: release.checkHashes || [],
           terminalEnvelope: release.terminalEnvelope || null,
+          unblockPath: release.unblockPath || null,
+          expectedEpoch: release.expectedEpoch,
+          finalResponse: release.finalResponse || null,
         })
       }
       const exactPathRequested = this.settings.path && this.settings.path.mode === 'exact'
@@ -10702,7 +11365,16 @@ class CodexSupervisorRuntime {
         if (decisionResult.status === 'WAITING_USER') {
           return await this._suspendResumable('WAITING_USER', { terminalEnvelope: decisionResult })
         }
-        return await this._finish('FAILED', { terminalEnvelope: decisionResult })
+        const terminalResult = { terminalEnvelope: decisionResult }
+        const terminalError = new SupervisorIntegrationError(
+          decisionResult.status || 'ROUTE_DECISION_INVALID',
+          decisionResult.reason || 'route decision could not produce an executable local completion graph',
+          decisionResult,
+        )
+        const terminalOutcome = await this._enterTerminalRelease(
+          'FAILED', terminalError, decisionResult, terminalResult,
+        )
+        return await this._finish(terminalOutcome, terminalResult)
       }
 
       if (!decisionResult.decision || decisionResult.decision.routeSource !== expectedRouteSource) {
@@ -10799,30 +11471,111 @@ class CodexSupervisorRuntime {
             'route executor returned a typed non-DONE outcome',
           result.terminalEnvelope || {},
         )
-        terminalOutcome = await this._enterTerminalRelease(
-          terminalOutcome,
-          terminalError,
-          result.terminalEnvelope || null,
-        )
+        try {
+          terminalOutcome = await this._enterTerminalRelease(
+            terminalOutcome,
+            terminalError,
+            result.terminalEnvelope || null,
+            result,
+          )
+        } catch (releaseError) {
+          const evidence = result.terminalEnvelope &&
+            result.terminalEnvelope.bestAvailableCandidateEvidence
+          if (releaseError &&
+              (typeof releaseError === 'object' || typeof releaseError === 'function') &&
+              Object.isExtensible(releaseError)) {
+            releaseError.priorTerminalEnvelope = result.terminalEnvelope || null
+            if (evidence) {
+              releaseError.bestAvailableCandidateEvidence = evidence
+              releaseError.details = {
+                ...(releaseError.details || {}),
+                bestAvailableCandidateEvidence: evidence,
+                priorTerminalEnvelope: result.terminalEnvelope || null,
+              }
+            }
+          }
+          throw releaseError
+        }
       }
       return await this._finish(terminalOutcome, result)
     } catch (error) {
       this._completeStartupBarrier()
+      // Cancellation owns settlement synchronously, including when startup's
+      // pre-lease hook fails while cancel() is waiting on the startup barrier.
+      // Do not let that incidental hook error escape as a second pre-lease
+      // outcome after the operator already selected cancellation.
+      if (this.cancelled && this.cancellationPromise) return this.cancellationPromise
       // Once terminal finalization starts, its integrity/epoch/manifest/process
       // checks are the only authority that may release the lease.  The
       // supervisor cannot safely classify an arbitrary finalizer exception as
       // transient: it may have happened after partial durable progress.  Let
-      // the error propagate for exact crash recovery instead of retrying or
-      // replacing the selected terminal intent with another outcome.
+      // one controller-local idempotent replay consume the same immutable
+      // intent before requiring a separate crash generation. This spends no
+      // model tokens and cannot replace the selected outcome.
       if (this.terminalFinalizationIntent && !this.finished) {
+        if (this.cancelled && this.cancellationPromise &&
+            this.terminalFinalizationIntent.outcome === 'CANCELLED') {
+          return this.cancellationPromise
+        }
+        const selectedResult = this.terminalFinalizationIntent.result || null
+        const selectedEnvelope = selectedResult && selectedResult.terminalEnvelope || null
+        const evidence = selectedEnvelope && selectedEnvelope.bestAvailableCandidateEvidence
+        if (this.terminalReplayAttempts < 1 && terminalFinalizationReplaySafe(error)) {
+          this.terminalReplayAttempts += 1
+          try {
+            const selected = this.terminalFinalizationIntent
+            const replayError = new SupervisorIntegrationError(
+              selectedEnvelope && (selectedEnvelope.code || selectedEnvelope.status) ||
+                selected.outcome,
+              selectedResult.reason || selectedEnvelope && (selectedEnvelope.reason ||
+                selectedEnvelope.cause && selectedEnvelope.cause.reason) ||
+                'retry immutable terminal finalization',
+              selectedEnvelope || {},
+            )
+            const replayOutcome = await this._enterTerminalRelease(
+              selected.outcome,
+              replayError,
+              selectedEnvelope,
+              selectedResult,
+            )
+            return await this._finish(replayOutcome, selectedResult)
+          } catch (terminalReplayError) {
+            if (terminalReplayError &&
+                (typeof terminalReplayError === 'object' ||
+                  typeof terminalReplayError === 'function') &&
+                Object.isExtensible(terminalReplayError)) {
+              terminalReplayError.priorTerminalFinalizationFailure = serializeError(error)
+              terminalReplayError.details = {
+                ...(terminalReplayError.details || {}),
+                priorTerminalFinalizationFailure: serializeError(error),
+              }
+            }
+            error = terminalReplayError
+          }
+        }
+        if (error && (typeof error === 'object' || typeof error === 'function') &&
+            Object.isExtensible(error)) {
+          error.priorTerminalEnvelope = selectedEnvelope
+          if (evidence) {
+            error.bestAvailableCandidateEvidence = evidence
+            error.details = {
+              ...(error.details || {}),
+              bestAvailableCandidateEvidence: evidence,
+              priorTerminalEnvelope: selectedEnvelope,
+            }
+          }
+        }
         throw error
       }
-      if (this.resumableSuspensionIntent && !this.finished) {
+      if (this.resumableSuspensionIntent && !this.finished &&
+          this.suspensionReplayAttempts < 1) {
         return this._suspendResumable(
           this.resumableSuspensionIntent.outcome,
           this.resumableSuspensionIntent.result,
         )
       }
+      if (this.resumableSuspensionIntent && !this.finished &&
+          this._resumableSuspensionIsDurablySelected()) throw error
       if (typeof this.options.diagnosticSink === 'function') {
         try {
           this.options.diagnosticSink(Object.freeze({
@@ -10843,6 +11596,12 @@ class CodexSupervisorRuntime {
       let terminalErrorCode = error && typeof error.code === 'string' && error.code
         ? error.code : 'FAILED'
       if (!this.lease) return this._preLeaseOutcome(terminalErrorCode, { error: serializeError(error) })
+      const carriedStructuredFinalResponse = error &&
+        error[STRUCTURED_FINAL_RESPONSE_SURVIVAL] || null
+      if (carriedStructuredFinalResponse) {
+        this._rememberStructuredFinalResponse(carriedStructuredFinalResponse)
+      }
+      const survivedStructuredFinalResponse = this.latestStructuredFinalResponse
       if (this.cancelled && this.cancellationPromise) return this.cancellationPromise
       if (error && error.code === 'CALLBACK_RECONCILIATION_PENDING' &&
           error.details && error.details.resumableCandidate) {
@@ -10851,6 +11610,8 @@ class CodexSupervisorRuntime {
         // authorize DONE, but it also cannot convert the user's intact
         // candidate into a generic controller FAILED or launch another model.
         return this._suspendResumable('PARTIAL', {
+          ...(survivedStructuredFinalResponse
+            ? { finalResponse: survivedStructuredFinalResponse } : {}),
           terminalEnvelope: {
             status: 'LOCAL_PERSISTENCE_PENDING',
             error: serializeError(error),
@@ -10861,7 +11622,8 @@ class CodexSupervisorRuntime {
           },
         })
       }
-      const budgetStop = error && [
+      const childLimitStop = physicalCandidateLimitInterruption(error)
+      const budgetStop = childLimitStop || error && [
         'BUDGET_EXHAUSTED', 'MISSION_TIMEOUT', 'EXTERNAL_WRITE_DEADLINE_EXPIRED',
         'RESUME_DEADLINE_EXPIRED', 'PHASE_CONVERGENCE_REQUIRED', 'PHASE_BUDGET_EXHAUSTED',
       ].includes(error.code)
@@ -10903,18 +11665,25 @@ class CodexSupervisorRuntime {
           }
         }
       }
-      if (budgetStop) {
+      const nonReplayableLimitInterruption = Boolean(
+        childLimitStop && error && error.nonReplayableLimitInterruption === true,
+      )
+      if (budgetStop && !nonReplayableLimitInterruption) {
         const frontier = this._budgetPauseFrontier()
         if (frontier) {
           const pauseResult = {
-            terminalEnvelope: { status: terminalErrorCode, error: serializeError(terminalError) },
+            ...(survivedStructuredFinalResponse
+              ? { finalResponse: survivedStructuredFinalResponse } : {}),
+            terminalEnvelope: {
+              status: terminalErrorCode,
+              error: serializeError(terminalError),
+              ...(terminalError && terminalError.bestAvailableCandidateEvidence
+                ? { bestAvailableCandidateEvidence: terminalError.bestAvailableCandidateEvidence }
+                : {}),
+            },
             transition: { eventId: 'BUDGET_EXHAUSTED_RESUMABLE', frontier },
           }
-          try {
-            return await this._suspendResumable('PAUSED', pauseResult)
-          } catch {
-            return this._suspendResumable('PAUSED', pauseResult)
-          }
+          return await this._suspendResumable('PAUSED', pauseResult)
         }
       }
       const diagnosticDenied = error && ['DIAGNOSTIC_DENIAL_BLOCKED', 'DIAGNOSTIC_WORKER_LIMIT'].includes(error.code)
@@ -10923,8 +11692,9 @@ class CodexSupervisorRuntime {
       }
       let terminalOutcome = diagnosticDenied ? 'BLOCKED'
         : budgetStop ? 'PARTIAL' : (this.cancelled ? 'CANCELLED' : 'FAILED')
-      terminalOutcome = await this._enterTerminalRelease(terminalOutcome, terminalError)
-      return this._finish(terminalOutcome, {
+      const terminalResult = {
+        ...(survivedStructuredFinalResponse
+          ? { finalResponse: survivedStructuredFinalResponse } : {}),
         terminalEnvelope: {
           status: terminalErrorCode,
           error: serializeError(terminalError),
@@ -10932,7 +11702,43 @@ class CodexSupervisorRuntime {
             ? { bestAvailableCandidateEvidence: terminalError.bestAvailableCandidateEvidence }
             : {}),
         },
-      })
+      }
+      try {
+        terminalOutcome = await this._enterTerminalRelease(
+          terminalOutcome,
+          terminalError,
+          terminalResult.terminalEnvelope,
+          terminalResult,
+        )
+        return await this._finish(terminalOutcome, terminalResult)
+      } catch (releaseError) {
+        // Terminal release/finalization integrity remains authoritative and is
+        // never retried here. It also must not make an already frozen product
+        // undiscoverable merely because it replaces the earlier child error.
+        if (releaseError &&
+            (typeof releaseError === 'object' || typeof releaseError === 'function') &&
+            Object.isExtensible(releaseError)) {
+          releaseError.priorTerminalFailure = serializeError(terminalError)
+          if (terminalError && terminalError.priorTerminalEnvelope) {
+            releaseError.priorTerminalEnvelope = terminalError.priorTerminalEnvelope
+            releaseError.details = {
+              ...(releaseError.details || {}),
+              priorTerminalEnvelope: terminalError.priorTerminalEnvelope,
+            }
+          }
+          if (terminalError && terminalError.bestAvailableCandidateEvidence) {
+            releaseError.bestAvailableCandidateEvidence =
+              terminalError.bestAvailableCandidateEvidence
+            releaseError.details = {
+              ...(releaseError.details || {}),
+              bestAvailableCandidateEvidence:
+                terminalError.bestAvailableCandidateEvidence,
+              priorTerminalFailure: serializeError(terminalError),
+            }
+          }
+        }
+        throw releaseError
+      }
     }
   }
 
@@ -11311,8 +12117,6 @@ class CodexSupervisorRuntime {
     if (!result.start_workers) {
       if (result.status === 'WAITING_USER') {
         await this._runtimeTransition('ROUTE_DECISION_NEEDS_USER', 'WAITING_USER')
-      } else {
-        await this._runtimeTransition('ROUTE_DECISION_INVALID_FINAL', 'RELEASING_LOCK')
       }
     }
     return finish(result)
@@ -12043,6 +12847,9 @@ class CodexSupervisorRuntime {
     const absolute = this.record.resolve(relative)
     if (!fs.existsSync(absolute)) return null
     const receipt = readRegularJson(absolute, 'model terminal receipt').parsed
+    if (receipt && receipt.externalLocalMutation) {
+      validateExternalLocalTerminalMutationBinding(receipt.externalLocalMutation)
+    }
     const { receiptHash, ...body } = receipt || {}
     const binding = saved.crashBinding || {}
     const hasDurableDisposition = Boolean(receipt &&
@@ -12367,6 +13174,311 @@ class CodexSupervisorRuntime {
     return this._persistControllerTaskResult(request, result)
   }
 
+  async _resolveMutationCommitAuthority(input) {
+    if (this.options.mutationEnforcer &&
+        typeof this.options.mutationEnforcer.resolve === 'function') {
+      const resolved = await this.options.mutationEnforcer.resolve(input)
+      const status = typeof resolved === 'string' ? resolved : resolved && resolved.status
+      if (['ACTIVE', 'ADOPTED_ACTIVE', 'COMMITTED', 'ABORTED'].includes(status)) {
+        return Object.freeze({
+          status,
+          evidence: typeof resolved === 'object' ? resolved : null,
+        })
+      }
+      throw new SupervisorIntegrationError(
+        'MUTATION_COMMIT_AUTHORITY_UNKNOWN',
+        'durable mutation state/event authority did not resolve the exact permit',
+      )
+    }
+    if (typeof this.options.runtimeStateProvider === 'function') {
+      const runtime = this.options.runtimeStateProvider()
+      if (runtime && runtime.activeMutation) {
+        if (!sameCanonicalValue(runtime.activeMutation, input.permit)) {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            'durable runtime state carries a foreign active mutation permit',
+          )
+        }
+        return Object.freeze({ status: 'ACTIVE', evidence: null })
+      }
+    }
+    // activeMutation:null alone is deliberately not commit authority. Only a
+    // matching event resolver may distinguish committed from aborted.
+    return Object.freeze({ status: 'UNKNOWN', evidence: null })
+  }
+
+  async _commitPromotedMutation(input) {
+    const commitInput = {
+      assignment: input.assignment,
+      permit: input.permit,
+      postimages: input.postimages,
+      isolation: input.isolation,
+      workItemId: input.workItemId,
+    }
+    const commitRecord = input.existingCommitRecord || (input.externalLocalBoundary
+      ? persistExternalLocalCommitRecord(
+          input.externalLocalBoundary,
+          input.externalLocalAdmission,
+          { ...commitInput, workerWorkspace: input.workerWorkspace },
+        )
+      : null)
+    let commitFailure = null
+    let committed = false
+    let resolution = input.resolveBeforeCommit === true
+      ? await this._resolveMutationCommitAuthority({ ...commitInput, commitRecord })
+      : Object.freeze({ status: 'ACTIVE', evidence: null })
+    if (resolution.status === 'ABORTED') {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'the exact mutation permit was durably aborted before terminal-result reconciliation',
+      )
+    }
+    if (resolution.status === 'COMMITTED') committed = true
+    if (input.commitAttemptsExhausted === true && !committed) {
+      return Object.freeze({
+        committed: false,
+        commitFailure: input.priorCommitFailure || new SupervisorIntegrationError(
+          'LOCAL_PERSISTENCE_UNAVAILABLE',
+          'mutation-state commit remained unavailable after its bounded retry',
+        ),
+        commitRecord,
+      })
+    }
+    for (let attempt = 1; !committed && attempt <= 2; attempt += 1) {
+      try {
+        if (resolution.status === 'ADOPTED_ACTIVE') {
+          if (typeof this.options.mutationEnforcer.recoverCommit !== 'function') {
+            throw new SupervisorIntegrationError(
+              'MUTATION_COMMIT_AUTHORITY_UNKNOWN',
+              'adopted mutation commit requires durable event recovery authority',
+            )
+          }
+          await this.options.mutationEnforcer.recoverCommit({
+            ...commitInput,
+            journalPath: input.workerWorkspace.recordPath,
+            commitRecord,
+          })
+        } else {
+          await this.options.mutationEnforcer.commit(commitInput)
+        }
+        committed = true
+        commitFailure = null
+      } catch (error) {
+        if (promotedMutationFailureRequiresRollback(error)) throw error
+        commitFailure = error
+        resolution = await this._resolveMutationCommitAuthority({ ...commitInput, commitRecord })
+        if (resolution.status === 'COMMITTED') {
+          committed = true
+          commitFailure = null
+        } else if (resolution.status === 'ABORTED') {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            'mutation commit retry found an exact durable abort event',
+          )
+        }
+      }
+    }
+    if (!committed) return Object.freeze({ committed: false, commitFailure, commitRecord })
+    if (typeof input.markStateCommitted === 'function') input.markStateCommitted()
+
+    const cleanupFailures = []
+    if (input.externalLocalBoundary) {
+      let externalSettled = !externalLocalLstat(input.externalLocalBoundary.transaction.root)
+      for (let attempt = 1; !externalSettled && attempt <= 2; attempt += 1) {
+        try {
+          commitExplicitExternalLocalBoundary(
+            input.externalLocalBoundary,
+            input.externalLocalAdmission,
+            { mutationStateCommitted: true, commitRecord },
+          )
+          externalSettled = true
+        } catch (error) {
+          cleanupFailures.push(Object.freeze({ stage: 'external-local-cleanup', attempt, error }))
+        }
+      }
+    }
+    let workerSettled = false
+    for (let attempt = 1; !workerSettled && attempt <= 2; attempt += 1) {
+      try {
+        const journal = readChecksummedJson(input.workerWorkspace.recordPath)
+        if (journal.status === 'FINALIZED') {
+          workerSettled = true
+        } else if (journal.status === 'FINALIZING') {
+          input.workerWorkspace.manager.recover(journal)
+          workerSettled = true
+        } else {
+          input.workerWorkspace.manager.finalize(input.workerWorkspace)
+          workerSettled = true
+        }
+      } catch (error) {
+        cleanupFailures.push(Object.freeze({ stage: 'worker-finalize', attempt, error }))
+      }
+    }
+    const cleanupPending = Boolean(cleanupFailures.length > 0 && (
+      (input.externalLocalBoundary &&
+        externalLocalLstat(input.externalLocalBoundary.transaction.root)) ||
+      !workerSettled
+    ))
+    if (!cleanupPending && input.externalLocalBoundary) {
+      removeExternalLocalControllerRecord(input.externalLocalBoundary.transaction.commitRecordPath)
+      removeExternalLocalControllerRecord(input.externalLocalBoundary.transaction.setupJournalPath)
+    }
+    if (cleanupPending) {
+      const latest = cleanupFailures.at(-1)
+      this._recordLocalPersistenceLimitation({
+        workItemId: input.workItemId,
+        stage: latest.stage,
+        code: latest.error && latest.error.code || 'LOCAL_PERSISTENCE_UNAVAILABLE',
+        candidateHash: input.candidateHash || null,
+      })
+    }
+    return Object.freeze({ committed: true, commitFailure: null, cleanupPending, commitRecord })
+  }
+
+  async _reconcileAdoptedTerminalMutation(saved, receipt) {
+    const binding = receipt && receipt.externalLocalMutation
+    if (!binding) return null
+    validateExternalLocalTerminalMutationBinding(binding)
+    if (binding.transactionIdentity.runId !== this.options.runId ||
+        binding.transactionIdentity.activationId !== this.activation.id ||
+        binding.transactionIdentity.workItemId !== saved.workItemId ||
+        binding.transactionIdentity.schedulerLeaseId !== saved.id ||
+        typeof this.options.workerWorkspaceRecoveryFactory !== 'function') {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'adopted terminal external transaction differs from its exact run, activation, work item, or lease',
+      )
+    }
+    const assignmentPath = this.record.resolve(`work/assignments/${hashText(saved.workItemId)}.json`)
+    const assignment = readRegularJson(assignmentPath, 'adopted external local assignment').parsed
+    const workerWorkspace = await this.options.workerWorkspaceRecoveryFactory({
+      assignment,
+      workItemId: saved.workItemId,
+      recordPath: binding.workerRecordPath,
+    })
+    if (!workerWorkspace || workerWorkspace.workspaceId !== binding.workerWorkspaceId ||
+        workerWorkspace.binding.bindingHash !== binding.isolationBindingHash) {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'adopted terminal external transaction reopened a foreign worker workspace',
+      )
+    }
+    const rootExists = Boolean(externalLocalLstat(binding.transactionRoot))
+    let boundary = null
+    let commitRecord = null
+    if (rootExists) {
+      boundary = JSON.parse(fs.readFileSync(binding.journalPath, 'utf8'))
+      validateExternalLocalTransactionBoundary(boundary)
+      if (boundary.boundaryHash !== binding.boundaryHash ||
+          !sameCanonicalValue(boundary.transaction.identity, binding.transactionIdentity)) {
+        throw new SupervisorIntegrationError(
+          'CRASH_ADOPTION_CONFLICT',
+          'adopted terminal external boundary differs from its receipt',
+        )
+      }
+      commitRecord = readExternalLocalCommitRecord(boundary)
+    }
+    const authority = await this._resolveMutationCommitAuthority({
+      assignment,
+      permit: binding.permit,
+      postimages: commitRecord && commitRecord.postimages || [],
+      isolation: workerWorkspace.binding,
+      workItemId: saved.workItemId,
+      commitRecord,
+    })
+    if (authority.status === 'ABORTED') {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'adopted terminal result belongs to a durably aborted mutation',
+      )
+    }
+    if (authority.status === 'COMMITTED' && !rootExists) {
+      const journal = readChecksummedJson(workerWorkspace.recordPath)
+      for (let attempt = 1; attempt <= 2 && journal.status !== 'FINALIZED'; attempt += 1) {
+        try {
+          const current = readChecksummedJson(workerWorkspace.recordPath)
+          if (current.status === 'FINALIZED') break
+          if (current.status === 'FINALIZING') workerWorkspace.manager.recover(current)
+          else workerWorkspace.manager.finalize(workerWorkspace)
+        } catch (error) {
+          if (attempt === 2) this._recordLocalPersistenceLimitation({
+            workItemId: saved.workItemId,
+            stage: 'adopted-worker-finalize',
+            code: error.code || 'LOCAL_PERSISTENCE_UNAVAILABLE',
+          })
+        }
+      }
+      removeExternalLocalControllerRecord(binding.commitRecordPath)
+      removeExternalLocalControllerRecord(binding.setupJournalPath)
+      return Object.freeze({ status: 'COMMITTED', cleanupOnly: true })
+    }
+    if (!boundary) {
+      throw new SupervisorIntegrationError(
+        'CRASH_ADOPTION_CONFLICT',
+        'active adopted terminal mutation lost its exact external rollback boundary',
+      )
+    }
+    let externalAdmission
+    let promotedPostimages
+    if (authority.status === 'COMMITTED') {
+      if (!commitRecord) {
+        throw new SupervisorIntegrationError(
+          'CRASH_ADOPTION_CONFLICT',
+          'committed adopted terminal mutation lacks its durable exact commit record',
+        )
+      }
+      externalAdmission = commitRecord.externalAdmission
+      promotedPostimages = commitRecord.postimages
+    } else {
+      externalAdmission = inspectExplicitExternalLocalBoundary(
+        boundary,
+        assignment,
+        this.options.targetPath,
+        receipt.result,
+      )
+      const externalResources = boundary.resources || []
+      const localResult = {
+        ...receipt.result,
+        filesChanged: (receipt.result.filesChanged || []).filter(reported =>
+          !externalResources.some(resource =>
+            reportedPathMatchesExternalResource(reported, resource))),
+      }
+      const workspaceAdmission = workerWorkspace.manager.inspect(workerWorkspace, localResult)
+      const journal = readChecksummedJson(workerWorkspace.recordPath)
+      promotedPostimages = ['COMMITTED', 'FINALIZING', 'FINALIZED'].includes(journal.status)
+        ? [
+            ...workspaceAdmission.postimages.map(item => Object.freeze({
+              type: item.hash === null ? 'missing' : 'file', path: item.path, hash: item.hash,
+            })),
+            ...externalAdmission.postimages,
+          ]
+        : [
+            ...workerWorkspace.manager.promote(workerWorkspace, workspaceAdmission),
+            ...externalAdmission.postimages,
+          ]
+    }
+    const outcome = await this._commitPromotedMutation({
+      assignment,
+      permit: binding.permit,
+      postimages: promotedPostimages,
+      isolation: workerWorkspace.binding,
+      workItemId: saved.workItemId,
+      workerWorkspace,
+      externalLocalBoundary: boundary,
+      externalLocalAdmission: externalAdmission,
+      existingCommitRecord: commitRecord,
+      resolveBeforeCommit: true,
+    })
+    if (!outcome.committed) {
+      throw new SupervisorIntegrationError(
+        'CALLBACK_RECONCILIATION_PENDING',
+        'adopted terminal mutation remains active after its bounded state-commit reconciliation',
+        { latestFailure: serializeError(outcome.commitFailure) },
+      )
+    }
+    return Object.freeze({ status: 'COMMITTED', cleanupOnly: true })
+  }
+
   async _resumeAdoptedLaunches({
     resumeState,
     candidateHash,
@@ -12435,6 +13547,7 @@ class CodexSupervisorRuntime {
             `adopted result recovery contract changed for ${saved.workItemId}`,
           )
         }
+        await this._reconcileAdoptedTerminalMutation(saved, committed)
         if (saved.logicalRole !== 'route-analyst') {
           this._writeCanonicalResult(saved.workItemId, committed.result)
         }
@@ -12824,6 +13937,9 @@ class CodexSupervisorRuntime {
     const candidateHash = hashWorkspaceCandidate(
       pending.workspacePath,
       this.options.gitEnvironment(pending.workspacePath),
+      explicitExternalLocalResources(pending.canonicalAssignment, this.options.targetPath),
+      pending.canonicalAssignment.resources,
+      this.options.targetPath,
     )
     const postimages = mutationAdmission.postimages.map(item => Object.freeze({
       type: item.hash === null ? 'missing' : 'file',
@@ -12942,6 +14058,9 @@ class CodexSupervisorRuntime {
     const targetCandidateHash = hashWorkspaceCandidate(
       this.options.targetPath,
       this.options.gitEnvironment(this.options.targetPath),
+      explicitExternalLocalResources(state.canonicalAssignment, this.options.targetPath),
+      state.canonicalAssignment.resources,
+      this.options.targetPath,
     )
     let alreadyPromoted = ['COMMITTED', 'FINALIZED'].includes(journal.status)
     if (alreadyPromoted) {
@@ -12985,7 +14104,10 @@ class CodexSupervisorRuntime {
       })
       if (stableStringify(inspected) !== stableStringify(state.mutationAdmission) ||
           hashWorkspaceCandidate(workerWorkspace.workspacePath,
-            this.options.gitEnvironment(workerWorkspace.workspacePath)) !== state.candidateHash) {
+            this.options.gitEnvironment(workerWorkspace.workspacePath),
+            explicitExternalLocalResources(state.canonicalAssignment, this.options.targetPath),
+            state.canonicalAssignment.resources,
+            this.options.targetPath) !== state.candidateHash) {
         throw new SupervisorIntegrationError(
           'DONE_RETRY_RECOVERY_INVALID',
           'private DONE retry version changed before resumed acceptance',
@@ -13201,7 +14323,9 @@ class CodexSupervisorRuntime {
     const priorLeaseModelTokens = evidence && evidence.priorLeaseModelTokens
     if (!reservation || typeof sessionId !== 'string' || !sessionId || !evidence ||
         evidence.tokenLimit !== reservation.limit ||
-        evidence.maximumUnaccountedTokens !== reservation.remaining ||
+        !Number.isSafeInteger(evidence.maximumUnaccountedTokens) ||
+        evidence.maximumUnaccountedTokens <= 0 ||
+        evidence.maximumUnaccountedTokens > reservation.remaining ||
         !Number.isSafeInteger(evidence.requestOrdinal) || evidence.requestOrdinal <= 0 ||
         evidence.completedRequestCount !== evidence.requestOrdinal - 1 ||
         !Number.isSafeInteger(priorLeaseModelTokens) || priorLeaseModelTokens < 0 ||
@@ -13218,8 +14342,9 @@ class CodexSupervisorRuntime {
       sessionHash,
       evidence.requestOrdinal,
       reservation.limit,
-      reservation.remaining,
+      evidence.maximumUnaccountedTokens,
       priorLeaseModelTokens,
+      reservation.consumed,
     )
     this._checkpointAccounting({
       kind: 'CHECKPOINT',
@@ -13232,7 +14357,7 @@ class CodexSupervisorRuntime {
       sessionHash,
       requestOrdinal: evidence.requestOrdinal,
       tokenLimit: reservation.limit,
-      maximumUnaccountedTokens: reservation.remaining,
+      maximumUnaccountedTokens: evidence.maximumUnaccountedTokens,
       consumedAtStart: reservation.consumed,
       priorLeaseModelTokens,
       exactUsageTokens: 0,
@@ -13379,7 +14504,7 @@ class CodexSupervisorRuntime {
         ),
         humanDescription: 'Retire one recovered provider request allowance before any resumed launch.',
       }, {})
-      const currentLaunchSpent = envelope.tokenLimit - envelope.maximumUnaccountedTokens +
+      const currentLaunchSpent = envelope.consumedAtStart +
         (envelope.exactUsageRecorded
           ? envelope.exactUsageTokens
           : envelope.maximumUnaccountedTokens)
@@ -13410,10 +14535,21 @@ class CodexSupervisorRuntime {
       )
     }
     const snapshot = this.budget.snapshot()
-    const outstanding = [...this.childTokenReservations.values()]
-      .reduce((sum, reservation) => sum + reservation.remaining, 0)
+    const activationTokenBudgetExplicit = snapshot.limits.tokens !== DEFAULT_ACTIVATION_TOKEN_LIMIT
+    const optionalControlPlane = codexPreRouteControlPlane(record)
+    const finiteTokenBudget = activationTokenBudgetExplicit || optionalControlPlane
+    // An explicit aggregate envelope must reserve concurrent worst cases. The
+    // default accounting-only ceiling is intentionally not a launch semaphore:
+    // reserving MAX_SAFE_INTEGER for the first ROADMAP child would fabricate a
+    // quota failure for every concurrent required sibling.
+    const outstanding = activationTokenBudgetExplicit
+      ? [...this.childTokenReservations.values()]
+          .reduce((sum, reservation) => sum + reservation.remaining, 0)
+      : 0
     const available = snapshot.limits.tokens - snapshot.tokensUsed - outstanding
-    const roleCeiling = codexChildSpendRoleLimit(record)
+    const roleCeiling = optionalControlPlane
+      ? CODEX_CHILD_SPEND_LIMITS['route-analyst']
+      : activationTokenBudgetExplicit ? snapshot.limits.tokens : Number.MAX_SAFE_INTEGER
     const priorLeaseModelTokens = record && record.priorLeaseModelTokens === undefined
       ? 0 : record && record.priorLeaseModelTokens
     if (!Number.isSafeInteger(priorLeaseModelTokens) || priorLeaseModelTokens < 0 ||
@@ -13444,6 +14580,8 @@ class CodexSupervisorRuntime {
       remaining: limit,
       consumed: 0,
       priorLeaseModelTokens,
+      finiteTokenBudget,
+      acceptedTokenLimit: priorLeaseModelTokens + limit,
     }
     this.childTokenReservations.set(reservationId, reservation)
     return reservation
@@ -13480,15 +14618,16 @@ class CodexSupervisorRuntime {
     })
   }
 
-  _chargeUnknownChildTokenUpperBound(reservationId) {
+  _chargeUnknownChildTokenUpperBound(reservationId, maximumUnaccountedTokens) {
     const reservation = this.childTokenReservations.get(reservationId)
-    if (!reservation) {
+    if (!reservation || !Number.isSafeInteger(maximumUnaccountedTokens) ||
+        maximumUnaccountedTokens <= 0 || maximumUnaccountedTokens > reservation.remaining) {
       throw new SupervisorIntegrationError(
         'BUDGET_USAGE_INVALID',
-        'unknown provider spend lacks its exact live child reservation',
+        'unknown provider spend lacks its exact finite live request allowance',
       )
     }
-    const charged = reservation.remaining
+    const charged = maximumUnaccountedTokens
     const state = this._consumeChildTokenReservation(reservationId, charged, {
       // The provider handoff already occurred. This is conservative accounting
       // of possibly incurred spend, never admission for new optional work.
@@ -13592,6 +14731,8 @@ class CodexSupervisorRuntime {
       const acceptedRoleLimit = codexChildTokenRoleLimit({
         logicalRole: policy.child,
         route: request.route,
+        finiteTokenBudget: this.budget.snapshot().limits.tokens !== DEFAULT_ACTIVATION_TOKEN_LIMIT,
+        acceptedTokenLimit: this.budget.snapshot().limits.tokens,
       })
       if (priorLeaseModelTokens >= acceptedRoleLimit) {
         throw new SupervisorIntegrationError(
@@ -13603,6 +14744,7 @@ class CodexSupervisorRuntime {
       const toolRoleLimit = codexChildToolCallLimit({
         logicalRole: policy.child,
         route: request.route,
+        providerToolCallLimit: request.providerToolCallLimit,
       })
       const observedToolHighWater = continuationId
         ? this._codexToolCallHighWater(continuationId) : 0
@@ -13616,7 +14758,8 @@ class CodexSupervisorRuntime {
       // JSON lifecycle notification can lag local tool execution. An OPEN
       // crash-adopted continuation therefore receives no fresh tool allowance,
       // even if the predecessor stopped before persisting every observed item.
-      priorToolCallCount = toolRoleLimit
+      priorToolCallCount = toolRoleLimit === Number.MAX_SAFE_INTEGER
+        ? observedToolHighWater : toolRoleLimit
     }
     let repairContextBinding = null
     if (request.repairOf) {
@@ -13878,6 +15021,8 @@ class CodexSupervisorRuntime {
                   snapshotPath,
                   this.options.gitEnvironment(snapshotPath),
                   restoredExternalResources,
+                  request.manifests,
+                  this.options.targetPath,
                 ))
           : null
         if (!snapshotPath || !fs.existsSync(snapshotPath) || restoredCandidateHash !== request.candidateHash) {
@@ -13934,7 +15079,7 @@ class CodexSupervisorRuntime {
           materializedCheckerId,
           resources,
           deferredCandidate ? deferredCandidate.workerWorkspace.workspacePath : this.options.targetPath,
-          { projection },
+          { projection, candidateResources: request.manifests || [] },
         )
         const materialized = materializeCheckerSandboxes(sandboxPlan, snapshotFactory)
         sandboxAssignment = materialized.find(item => item.checkerId === checkerId) || materialized[0]
@@ -14321,6 +15466,7 @@ class CodexSupervisorRuntime {
     let streamedRouteEventCount = 0
     let leaseSettled = false
     let mutationPermit = null
+    let adoptedMutationAuthority = null
     let mutationBefore = null
     let mutationAdmission = null
     let authenticatedChildResult = null
@@ -14342,6 +15488,13 @@ class CodexSupervisorRuntime {
     let unknownProviderSpendReceipt = null
     let childTokenReservation = null
     let launchRecord = null
+    let childLaunchStarted = false
+    // Once exact product bytes have been frozen outside disposable execution
+    // state, every later controller replacement error must carry the same
+    // recovery authority. Keep this outside the catch block because a
+    // terminal-session or pending-envelope failure is evaluated in `finally`.
+    let candidateSurvivalEvidence = null
+    let childCompletionFailure = null
     const transcriptEvidenceTracker = createTranscriptEvidenceTracker()
     try {
     childTokenReservation = this._reserveChildTokenEnvelope(reservationId, {
@@ -14601,6 +15754,9 @@ class CodexSupervisorRuntime {
       // The adapter applies it to both the local relay and Codex's native
       // rollout fallback; model-visible input cannot increase it.
       providerTokenLimit: childTokenReservation.limit,
+      finiteTokenBudget: childTokenReservation.finiteTokenBudget,
+      acceptedTokenLimit: childTokenReservation.acceptedTokenLimit,
+      providerToolCallLimit: request.providerToolCallLimit,
       priorLeaseModelTokens,
       priorToolCallCount,
       // This projection is controller-owned: explicit scheduler estimates win
@@ -14805,6 +15961,13 @@ class CodexSupervisorRuntime {
           transportFailureRetryId: request.transportFailureRetryId || null,
           authoritativeNextReadyWorkIds: authoritativeNextReadyAfterResult(terminalResult),
           recoveryContractHash: childRecoveryContract && childRecoveryContract.contractHash || null,
+          externalLocalMutation: externalLocalBoundary
+            ? externalLocalTerminalMutationBinding(
+                externalLocalBoundary,
+                mutationPermit,
+                workerWorkspace,
+              )
+            : null,
           result: terminalResult,
         }
         const receipt = { ...body, receiptHash: hashText(JSON.stringify(body)) }
@@ -14992,6 +16155,8 @@ class CodexSupervisorRuntime {
         const acceptedRoleLimit = codexChildTokenRoleLimit({
           logicalRole: policy.child,
           route: request.route,
+          finiteTokenBudget: childTokenReservation.finiteTokenBudget,
+          acceptedTokenLimit: childTokenReservation.acceptedTokenLimit,
         })
         const cumulativeLeaseTokens = priorLeaseModelTokens + billableModelTokens(cumulative)
         if (cumulativeLeaseTokens > acceptedRoleLimit) {
@@ -15028,13 +16193,13 @@ class CodexSupervisorRuntime {
             evidence.tokenLimit !== reservation.limit ||
             !Number.isSafeInteger(evidence.maximumUnaccountedTokens) ||
             evidence.maximumUnaccountedTokens <= 0 ||
-            evidence.maximumUnaccountedTokens < reservation.remaining ||
-            evidence.maximumUnaccountedTokens > reservation.limit ||
             !Number.isSafeInteger(evidence.providerRequestCount) ||
             !Number.isSafeInteger(evidence.completedRequestCount) ||
             evidence.providerRequestCount <= evidence.completedRequestCount ||
             evidence.requestOrdinal !== evidence.providerRequestCount ||
-            !providerEnvelope) {
+            !providerEnvelope ||
+            evidence.maximumUnaccountedTokens !==
+              providerEnvelope.maximumUnaccountedTokens) {
           throw new SupervisorIntegrationError(
             'CODEX_USAGE_INVALID',
             'unknown provider spend evidence does not bind the live child envelope',
@@ -15045,6 +16210,13 @@ class CodexSupervisorRuntime {
         let accountingClass = 'KNOWN_PROVIDER_SPEND_RECONCILED'
         let disposition = 'ACCOUNTED'
         if (providerEnvelope.exactUsageRecorded) {
+          // Exact telemetry can truthfully exceed the relay's admitted
+          // allowance. In that case _consumeChildTokenReservation has already
+          // charged the overage and reduced the live remainder to zero before
+          // rejecting the response. Settle the durable pending envelope from
+          // those exact bytes instead of comparing its original maximum with
+          // the now-consumed remainder and replacing the real provider error
+          // with INCOMPLETE_USAGE_ACCOUNTING in the launch finally block.
           const missingBudgetTokens = providerEnvelope.exactUsageTokens -
             providerEnvelope.budgetConsumedTokens
           if (missingBudgetTokens < 0 || missingBudgetTokens > reservation.remaining) {
@@ -15062,10 +16234,11 @@ class CodexSupervisorRuntime {
         } else {
           const remainingUpperBound = providerEnvelope.maximumUnaccountedTokens -
             providerEnvelope.upperBoundChargedTokens
-          if (remainingUpperBound !== reservation.remaining) {
+          if (!Number.isSafeInteger(remainingUpperBound) || remainingUpperBound <= 0 ||
+              remainingUpperBound > reservation.remaining) {
             throw new SupervisorIntegrationError(
               'CODEX_USAGE_INVALID',
-              'pending provider upper bound differs from its live reservation remainder',
+              'pending provider upper bound exceeds its live reservation remainder',
             )
           }
           chargedTokens = remainingUpperBound
@@ -15090,7 +16263,10 @@ class CodexSupervisorRuntime {
               ),
               humanDescription: 'Charge the unused child envelope after an upstream provider request ended without complete usage telemetry.',
             }, { tokenUsage: upperBoundUsage })
-            const chargedReservation = this._chargeUnknownChildTokenUpperBound(reservationId)
+            const chargedReservation = this._chargeUnknownChildTokenUpperBound(
+              reservationId,
+              remainingUpperBound,
+            )
             chargedTokens = chargedReservation.charged
             providerEnvelope.upperBoundChargedTokens += chargedTokens
           }
@@ -15281,7 +16457,11 @@ class CodexSupervisorRuntime {
     const enforceRealTargetDenial = path.resolve(workingDirectory) !== path.resolve(this.options.targetPath) ||
       Boolean(canonicalAssignment && canonicalAssignment.resources.every(resource => resource.access === 'read'))
     const realTargetBefore = enforceRealTargetDenial
-      ? workspaceFileSnapshot(this.options.targetPath, this.options.gitEnvironment(this.options.targetPath))
+      ? workspaceFileSnapshot(
+          this.options.targetPath,
+          this.options.gitEnvironment(this.options.targetPath),
+          canonicalAssignment && canonicalAssignment.resources || request.manifests || [],
+        )
       : null
     const checkerExternalLocalResources = CHECKER_ROLES.has(policy.child)
       ? candidateExternalLocalResources(
@@ -15295,6 +16475,8 @@ class CodexSupervisorRuntime {
           targetWorkingDirectory,
           this.options.gitEnvironment(targetWorkingDirectory),
           checkerExternalLocalResources,
+          request.manifests,
+          this.options.targetPath,
         )
       : null
     if (checkerSnapshotBefore && checkerSnapshotBefore !== request.candidateHash) {
@@ -15307,10 +16489,16 @@ class CodexSupervisorRuntime {
           snapshotWorkspaceHash: hashWorkspaceCandidate(
             targetWorkingDirectory,
             this.options.gitEnvironment(targetWorkingDirectory),
+            [],
+            request.manifests,
+            this.options.targetPath,
           ),
           targetWorkspaceHash: hashWorkspaceCandidate(
             this.options.targetPath,
             this.options.gitEnvironment(this.options.targetPath),
+            [],
+            request.manifests,
+            this.options.targetPath,
           ),
           externalLocalResourceIdentities: checkerExternalLocalResources
             .map(resource => resource.identity),
@@ -15343,7 +16531,25 @@ class CodexSupervisorRuntime {
         const runtimeState = adoptedLiveWorker && typeof this.options.runtimeStateProvider === 'function'
           ? this.options.runtimeStateProvider()
           : null
-        const resumedPermit = runtimeState && runtimeState.activeMutation
+        let resumedPermit = runtimeState && runtimeState.activeMutation
+        if (adoptedLiveWorker && !resumedPermit &&
+            typeof this.options.mutationEnforcer.adopt === 'function') {
+          const adoptedMutation = await this.options.mutationEnforcer.adopt({
+            assignment: canonicalAssignment,
+            isolation: workerWorkspace.binding,
+            workItemId: request.workItemId,
+            schedulerLeaseId: lease.id,
+          })
+          if (adoptedMutation && ['ACTIVE', 'ADOPTED_ACTIVE'].includes(adoptedMutation.status)) {
+            resumedPermit = adoptedMutation.permit
+            adoptedMutationAuthority = adoptedMutation.status
+          } else if (adoptedMutation && ['COMMITTED', 'ABORTED'].includes(adoptedMutation.status)) {
+            throw new SupervisorIntegrationError(
+              'CRASH_ADOPTION_CONFLICT',
+              `live adopted worker found a terminal ${adoptedMutation.status.toLowerCase()} mutation permit`,
+            )
+          }
+        }
         if (resumedPermit) {
           if (!runtimeState || runtimeState.runId !== this.options.runId ||
               !runtimeState.activation || runtimeState.activation.id !== this.activation.id ||
@@ -15353,7 +16559,12 @@ class CodexSupervisorRuntime {
               'adopted worker resume found a foreign active mutation permit',
             )
           }
-          mutationBefore = workspaceFileSnapshot(workingDirectory, this.options.gitEnvironment(workingDirectory))
+          mutationBefore = workspaceFileSnapshot(
+            workingDirectory,
+            this.options.gitEnvironment(workingDirectory),
+            canonicalAssignment.resources,
+            this.options.targetPath,
+          )
           mutationPermit = resumedPermit
           if (mutationPermit.isolationBindingHash !== workerWorkspace.binding.bindingHash) {
             throw new SupervisorIntegrationError(
@@ -15380,7 +16591,12 @@ class CodexSupervisorRuntime {
               )
             }
           }
-          mutationBefore = workspaceFileSnapshot(workingDirectory, this.options.gitEnvironment(workingDirectory))
+          mutationBefore = workspaceFileSnapshot(
+            workingDirectory,
+            this.options.gitEnvironment(workingDirectory),
+            canonicalAssignment.resources,
+            this.options.targetPath,
+          )
           mutationPermit = await this.options.mutationEnforcer.begin({
             assignment: canonicalAssignment,
             preimages,
@@ -15388,6 +16604,14 @@ class CodexSupervisorRuntime {
             workItemId: request.workItemId,
           })
         }
+        const externalLocalTransactionIdentity = canonicalExternalLocalTransactionIdentity({
+          runId: this.options.runId,
+          activationId: this.activation.id,
+          workItemId: request.workItemId,
+          schedulerLeaseId: lease.id,
+          permit: mutationPermit,
+          isolation: workerWorkspace.binding,
+        })
         externalLocalBoundary = materializeExplicitExternalLocalBoundary(
           canonicalAssignment,
           targetWorkingDirectory,
@@ -15395,22 +16619,20 @@ class CodexSupervisorRuntime {
             transactionRoot: path.join(
               path.dirname(path.dirname(workerWorkspace.recordPath)),
               'external-local-transactions',
-              hashText(stableStringify({
-                runId: this.options.runId,
-                generation: this.activation.generation,
-                workItemId: request.workItemId,
-                leaseId: lease.id,
-              })),
+              externalLocalTransactionIdentity.bindingHash,
             ),
             quarantineRoot: path.join(
               path.dirname(path.dirname(workerWorkspace.recordPath)),
               'external-local-quarantines',
             ),
             sourceWorkItemId: request.workItemId,
+            transactionIdentity: externalLocalTransactionIdentity,
+            mutationPermit,
+            isolation: workerWorkspace.binding,
           } : { sourceWorkItemId: request.workItemId },
         )
         if (transportQuarantine && transportQuarantine.externalLocal) {
-          seedExplicitExternalLocalBoundaryFromQuarantine(
+          externalLocalBoundary = seedExplicitExternalLocalBoundaryFromQuarantine(
             externalLocalBoundary,
             canonicalAssignment,
             targetWorkingDirectory,
@@ -15432,6 +16654,7 @@ class CodexSupervisorRuntime {
       const optionalPreRouteAnalysis = request.route === 'PRE_ROUTE' &&
         policy.child === 'route-analyst'
       const launchOwnedChild = () => {
+        childLaunchStarted = true
         // A required local worker/checker is bounded by its owned process
         // lifecycle and explicit cancellation, not stdout frequency. Long
         // reasoning/tool calls may be completely silent while healthy; the
@@ -15442,10 +16665,10 @@ class CodexSupervisorRuntime {
           Number(request.admission && request.admission.max_duration_ms) || ROUTE_ANALYST_MAX_DURATION_MS,
         )
         return withTimeout(
-          refreshTransportWatchdog => {
-            launchRecord.onTransportActivity = refreshTransportWatchdog
-            return this.options.launcher(launchRecord)
-          },
+          // Route analysis is optional admission work, so its ceiling is an
+          // absolute elapsed deadline. Transport chatter must not refresh it
+          // into an unbounded pre-product model turn.
+          () => this.options.launcher(launchRecord),
           analystWatchdogMs,
           this.timerApi,
           'ROUTE_ANALYST_TIMEOUT',
@@ -15466,6 +16689,8 @@ class CodexSupervisorRuntime {
         targetWorkingDirectory,
         this.options.gitEnvironment(targetWorkingDirectory),
         checkerExternalLocalResources,
+        request.manifests,
+        this.options.targetPath,
       ) !== checkerSnapshotBefore) {
         throw new SupervisorIntegrationError(
           'CHECKER_SNAPSHOT_MUTATED',
@@ -15485,6 +16710,7 @@ class CodexSupervisorRuntime {
           realTargetBefore,
           this.options.targetPath,
           this.options.gitEnvironment(this.options.targetPath),
+          canonicalAssignment && canonicalAssignment.resources || request.manifests || [],
         )
       }
       if (request.route !== 'PRE_ROUTE') {
@@ -15512,6 +16738,9 @@ class CodexSupervisorRuntime {
         const repairedVersionHash = hashWorkspaceCandidate(
           deferredRepairCandidate.workspacePath,
           this.options.gitEnvironment(deferredRepairCandidate.workspacePath),
+          [],
+          deferredRepairCandidate.canonicalAssignment.resources,
+          this.options.targetPath,
         )
         if (deferredRepairCandidate.candidateHash !== repairedVersionHash) {
           deferredPromotionHandle = this._refreshDeferredPromotionAfterRepair(
@@ -15555,6 +16784,8 @@ class CodexSupervisorRuntime {
               workingDirectory,
               this.options.gitEnvironment(workingDirectory),
               explicitExternalLocalResources(canonicalAssignment, targetWorkingDirectory),
+              canonicalAssignment.resources,
+              this.options.targetPath,
             ),
             workspacePath: workingDirectory,
             workerWorkspace,
@@ -15573,6 +16804,8 @@ class CodexSupervisorRuntime {
             this.options.targetPath,
             this.options.gitEnvironment(this.options.targetPath),
             explicitExternalLocalResources(canonicalAssignment, this.options.targetPath),
+            canonicalAssignment.resources,
+            this.options.targetPath,
           )
           const promotedBody = Object.freeze({
             schemaVersion: 1,
@@ -15592,72 +16825,32 @@ class CodexSupervisorRuntime {
             ...promotedBody,
             bindingHash: hashText(stableStringify(promotedBody)),
           })
-          const commitInput = {
+          const commitOutcome = await this._commitPromotedMutation({
             assignment: canonicalAssignment,
             permit: mutationPermit,
             postimages: promotedPostimages,
             isolation: workerWorkspace.binding,
             workItemId: request.workItemId,
-          }
-          let commitFailure = null
-          for (let attempt = 1; attempt <= 2; attempt += 1) {
-            try {
-              await this.options.mutationEnforcer.commit(commitInput)
-              commitFailure = null
-              break
-            } catch (error) {
-              let commitAlreadyDurable = false
-              if (typeof this.options.runtimeStateProvider === 'function') {
-                try {
-                  const runtimeState = this.options.runtimeStateProvider()
-                  if (runtimeState && Object.hasOwn(runtimeState, 'activeMutation')) {
-                    if (runtimeState.activeMutation === null) {
-                      commitAlreadyDurable = true
-                    } else if (!sameCanonicalValue(runtimeState.activeMutation, mutationPermit)) {
-                      throw new SupervisorIntegrationError(
-                        'CRASH_ADOPTION_CONFLICT',
-                        'post-promotion runtime state carries a foreign mutation permit',
-                      )
-                    }
-                  }
-                } catch (stateError) {
-                  if (promotedMutationFailureRequiresRollback(stateError)) throw stateError
-                }
-              }
-              if (commitAlreadyDurable) {
-                commitFailure = null
-                break
-              }
-              if (promotedMutationFailureRequiresRollback(error)) throw error
-              commitFailure = error
-            }
-          }
-          if (commitFailure) {
+            workerWorkspace,
+            externalLocalBoundary,
+            externalLocalAdmission,
+            candidateHash: promotedCandidateHash,
+            resolveBeforeCommit: adoptedMutationAuthority === 'ADOPTED_ACTIVE',
+            markStateCommitted: () => { externalLocalTransactionCommitted = true },
+          })
+          if (!commitOutcome.committed) {
             preservePromotedMutationCandidate = !externalLocalBoundary
             throw new SupervisorIntegrationError(
               'CALLBACK_RECONCILIATION_PENDING',
               'the exact version is promoted, but its local mutation-state commit remains unavailable',
               {
                 callback: Object.freeze({ kind: 'mutation-state-commit', attempts: 2 }),
-                latestFailure: serializeError(commitFailure),
+                latestFailure: serializeError(commitOutcome.commitFailure),
                 resumableCandidate: promotedMutationCandidate,
               },
             )
           }
           mutationPermit = null
-          if (externalLocalBoundary) {
-            // The external transaction remains rollback-capable until both the
-            // local CAS promotion and the durable mutation-state commit have
-            // succeeded.  From this point rollback would contradict durable
-            // authority, so mark the unit committed before cleanup can fail.
-            externalLocalTransactionCommitted = true
-            commitExplicitExternalLocalBoundary(
-              externalLocalBoundary,
-              externalLocalAdmission,
-              { mutationStateCommitted: true },
-            )
-          }
-          workerWorkspace.manager.finalize(workerWorkspace)
           promotedAuthenticatedCandidateHash = promotedCandidateHash
           promotedMutationCandidate = null
         }
@@ -15699,6 +16892,8 @@ class CodexSupervisorRuntime {
         const acceptedRoleLimit = codexChildTokenRoleLimit({
           logicalRole: policy.child,
           route: request.route,
+          finiteTokenBudget: childTokenReservation.finiteTokenBudget,
+          acceptedTokenLimit: childTokenReservation.acceptedTokenLimit,
         })
         if (priorLeaseModelTokens + tokens > acceptedRoleLimit) {
           throw new SupervisorIntegrationError(
@@ -15858,12 +17053,16 @@ class CodexSupervisorRuntime {
       // >= for admission and would otherwise discard the just-finished result
       // at exactly the legal cap.
       const returned = { ...result, transcriptEvidence: transcriptEvidenceTracker.snapshot() }
-      if (result && result.localCallbackReconciliation) {
-        Object.defineProperty(returned, 'localCallbackReconciliation', {
+      for (const diagnostic of [
+        'localCallbackReconciliation',
+        'terminalTransportReconciliation',
+      ]) {
+        if (!result || !result[diagnostic]) continue
+        Object.defineProperty(returned, diagnostic, {
           enumerable: false,
           configurable: false,
           writable: false,
-          value: result.localCallbackReconciliation,
+          value: result[diagnostic],
         })
       }
       Object.defineProperty(returned, STREAMED_ROUTE_EVENT_COUNT, { value: streamedRouteEventCount })
@@ -15909,9 +17108,9 @@ class CodexSupervisorRuntime {
       let transportQuarantinePointer = null
       let workerTransportQuarantinePointer = null
       let externalTransportQuarantinePointer = null
+      let durableTransportQuarantineEvidence = null
       let transportQuarantineResolved = false
       let preserveCallbackWorkspace = false
-      let candidateSurvivalEvidence = null
       let promotedTerminalTransportCandidate = null
       const attachErrorField = (field, value) => {
         if (error && (typeof error === 'object' || typeof error === 'function') &&
@@ -15919,14 +17118,113 @@ class CodexSupervisorRuntime {
       }
       const attachCleanupFailure = (field, cleanupError) => {
         cleanupFailure = cleanupFailure || cleanupError
-        attachErrorField(field, serializeError(cleanupError))
+        const serialized = serializeError(cleanupError)
+        if (candidateSurvivalIntegrityFailure(cleanupError)) {
+          const priorFailure = error
+          error = cleanupError
+          attachErrorField('priorControllerFailure', serializeError(priorFailure))
+          attachErrorField('details', {
+            ...(error && error.details || {}),
+            priorControllerFailure: serializeError(priorFailure),
+          })
+        }
+        attachErrorField(field, serialized)
+        attachErrorField('details', {
+          ...(error && error.details || {}),
+          [field]: serialized,
+        })
       }
+      const attachCandidateSurvivalFailure = survivalError => {
+        if (!candidateSurvivalIntegrityFailure(survivalError)) {
+          const serialized = serializeError(survivalError)
+          attachErrorField('candidateSurvivalFailure', serialized)
+          attachErrorField('details', {
+            ...(error && error.details || {}),
+            candidateSurvivalFailure: serialized,
+          })
+          return
+        }
+        const priorFailure = error
+        error = survivalError
+        if (error && (typeof error === 'object' || typeof error === 'function') &&
+            Object.isExtensible(error)) {
+          error.priorControllerFailure = serializeError(priorFailure)
+          error.details = {
+            ...(error.details || {}),
+            priorControllerFailure: serializeError(priorFailure),
+          }
+        }
+      }
+      const preserveTransportCandidateAfterQuarantineFailure = quarantineError => {
+        if (candidateSurvivalEvidence || !mutationPermit || !mutationBefore ||
+            !childLaunchStarted || !workerWorkspace ||
+            typeof inspectMutationCompletion !== 'function') return candidateSurvivalEvidence
+        try {
+          const physicalAdmission = inspectMutationCompletion({
+            allAssignedItemsPass: false,
+            filesChanged: [],
+            remainingConcerns: [
+              'The provider ended after physical edits and their retry quarantine could not be persisted.',
+            ],
+          })
+          const workspaceAdmission = physicalAdmission.workspaceAdmission || physicalAdmission
+          const hasLocalChanges = Array.isArray(workspaceAdmission.actualFilesChanged) &&
+            workspaceAdmission.actualFilesChanged.length > 0
+          const hasExternalChanges = externalLocalAdmission &&
+            Array.isArray(externalLocalAdmission.actualFilesChanged) &&
+            externalLocalAdmission.actualFilesChanged.length > 0
+          if (!hasLocalChanges && !hasExternalChanges) return null
+          const candidateHash = hashWorkspaceCandidate(
+            workerWorkspace.workspacePath,
+            this.options.gitEnvironment(workerWorkspace.workspacePath),
+            explicitExternalLocalResources(canonicalAssignment, this.options.targetPath),
+            canonicalAssignment && canonicalAssignment.resources || [],
+            this.options.targetPath,
+          )
+          const reasonCode = quarantineError && quarantineError.code ||
+            'TRANSPORT_QUARANTINE_PERSIST_FAILED'
+          const localPointer = hasLocalChanges
+            ? workerWorkspace.manager.preserveCandidate(workerWorkspace, {
+                admission: workspaceAdmission,
+                candidateHash,
+                reasonCode,
+              })
+            : null
+          const externalPointer = hasExternalChanges && !externalLocalTransactionCommitted
+            ? preserveExplicitExternalLocalCandidate(
+                externalLocalBoundary,
+                externalLocalAdmission,
+                { workItemId: request.workItemId, reasonCode, candidateHash },
+              )
+            : null
+          candidateSurvivalEvidence = physicalCandidateSurvivalBundle(
+            localPointer,
+            externalPointer,
+            { candidateHash, reasonCode },
+          )
+          if (candidateSurvivalEvidence) {
+            attachErrorField('bestAvailableCandidateEvidence', candidateSurvivalEvidence)
+            attachErrorField('details', {
+              ...(error.details || {}),
+              bestAvailableCandidateEvidence: candidateSurvivalEvidence,
+              retryDisposition: 'DO_NOT_DISCARD_PHYSICAL_CANDIDATE_OR_REPLAY_PROVIDER_SPEND',
+            })
+          }
+          return candidateSurvivalEvidence
+        } catch (survivalError) {
+          attachCandidateSurvivalFailure(survivalError)
+          return null
+        }
+      }
+      childCompletionFailure = error
       if (checkerSnapshotBefore) {
         try {
           const after = hashWorkspaceCandidate(
             targetWorkingDirectory,
             this.options.gitEnvironment(targetWorkingDirectory),
             explicitExternalLocalResources(canonicalAssignment, targetWorkingDirectory),
+            canonicalAssignment && canonicalAssignment.resources || request.manifests || [],
+            this.options.targetPath,
           )
           if (after !== checkerSnapshotBefore) {
             const drift = new SupervisorIntegrationError(
@@ -15973,6 +17271,8 @@ class CodexSupervisorRuntime {
               canonicalAssignment,
               this.options.targetPath,
             ),
+            canonicalAssignment && canonicalAssignment.resources || [],
+            this.options.targetPath,
           )
           const body = Object.freeze({
             schemaVersion: 1,
@@ -16092,41 +17392,38 @@ class CodexSupervisorRuntime {
               error.details && error.details.callback &&
               error.details.callback.kind === 'mutation-state-commit' &&
               error.details.callback.attempts === 2
-            let stateCommitFailure = priorStateCommitExhausted
+            const priorCommitFailure = priorStateCommitExhausted
               ? Object.assign(new Error('mutation-state commit remained unavailable after its bounded retry'), {
                   code: error.details.latestFailure && error.details.latestFailure.code ||
                     'LOCAL_PERSISTENCE_UNAVAILABLE',
                 })
               : null
-            if (!priorStateCommitExhausted && mutationPermit && (runtimeMutationState !== null ||
-                typeof this.options.runtimeStateProvider !== 'function')) {
-              const commitInput = {
+            let commitOutcome = Object.freeze({ committed: false, commitFailure: priorCommitFailure })
+            if (mutationPermit) {
+              commitOutcome = await this._commitPromotedMutation({
                 assignment: canonicalAssignment,
                 permit: mutationPermit,
                 postimages: promotedPostimages,
                 isolation: workerWorkspace.binding,
                 workItemId: request.workItemId,
-              }
-              for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
-                try {
-                  await this.options.mutationEnforcer.commit(commitInput)
-                  stateCommitFailure = null
-                  break
-                } catch (commitError) {
-                  if (promotedMutationFailureRequiresRollback(commitError)) throw commitError
-                  stateCommitFailure = commitError
-                }
-              }
+                workerWorkspace,
+                externalLocalBoundary,
+                externalLocalAdmission,
+                resolveBeforeCommit: priorStateCommitExhausted,
+                commitAttemptsExhausted: priorStateCommitExhausted,
+                priorCommitFailure,
+                markStateCommitted: () => { externalLocalTransactionCommitted = true },
+              })
             }
-            if (stateCommitFailure) {
-              if (externalLocalBoundary) throw stateCommitFailure
+            if (!commitOutcome.committed) {
+              if (externalLocalBoundary) throw commitOutcome.commitFailure
               try {
                 await this.options.mutationEnforcer.abort({
                   assignment: canonicalAssignment,
                   permit: mutationPermit,
                   isolation: workerWorkspace.binding,
                   workItemId: request.workItemId,
-                  error: stateCommitFailure,
+                  error: commitOutcome.commitFailure,
                 })
               } catch (abortError) {
                 if (!authenticatedResultCanOutliveLocalPersistence(abortError) &&
@@ -16139,19 +17436,12 @@ class CodexSupervisorRuntime {
               }
             }
             mutationPermit = null
-            if (externalLocalBoundary && !externalLocalTransactionCommitted) {
-              externalLocalTransactionCommitted = true
-              commitExplicitExternalLocalBoundary(
-                externalLocalBoundary,
-                externalLocalAdmission,
-                { mutationStateCommitted: true },
-              )
-            }
-            if (journal.status !== 'FINALIZED') workerWorkspace.manager.finalize(workerWorkspace)
             promotedAuthenticatedCandidateHash = hashWorkspaceCandidate(
               this.options.targetPath,
               this.options.gitEnvironment(this.options.targetPath),
               explicitExternalLocalResources(canonicalAssignment, this.options.targetPath),
+              canonicalAssignment.resources,
+              this.options.targetPath,
             )
             preservePromotedMutationCandidate = false
           }
@@ -16177,6 +17467,8 @@ class CodexSupervisorRuntime {
             const acceptedRoleLimit = codexChildTokenRoleLimit({
               logicalRole: policy.child,
               route: request.route,
+              finiteTokenBudget: childTokenReservation.finiteTokenBudget,
+              acceptedTokenLimit: childTokenReservation.acceptedTokenLimit,
             })
             if (priorLeaseModelTokens + tokens > acceptedRoleLimit) {
               throw new SupervisorIntegrationError(
@@ -16278,7 +17570,7 @@ class CodexSupervisorRuntime {
           return returned
         } catch (continuationError) {
           if (promotedMutationFailureRequiresRollback(continuationError) ||
-              ['MUTATION_PERMIT_INVALID', 'MUTATION_RESULT_MISMATCH', 'WORKER_SURVIVAL_INVALID']
+              ['MUTATION_PERMIT_INVALID', 'MUTATION_RESULT_MISMATCH']
                 .includes(continuationError && continuationError.code)) {
             error = continuationError
           } else {
@@ -16295,31 +17587,127 @@ class CodexSupervisorRuntime {
           authenticatedChildResult = null
         }
       }
+      if (!mutationAdmission && childLaunchStarted && mutationPermit && mutationBefore &&
+          workerWorkspace && typeof inspectMutationCompletion === 'function' &&
+          (physicalCandidateLimitInterruption(error) ||
+            controllerBookkeepingFailureCanPreserveCandidate(error))) {
+        // A provider/runtime limit or controller bookkeeping failure can arrive
+        // after owned edits but before a schema-valid terminal report. Admit
+        // only the drained physical diff and preserve it outside the disposable
+        // workspace. Never mint DONE authority from unreported bytes.
+        const limitInterruption = physicalCandidateLimitInterruption(error)
+        if (limitInterruption) attachErrorField('nonReplayableLimitInterruption', true)
+        try {
+          const physicalAdmission = inspectMutationCompletion({
+            allAssignedItemsPass: false,
+            filesChanged: [],
+            remainingConcerns: [
+              'The child ended at an explicit execution limit before terminal result authority.',
+            ],
+          })
+          const localAdmission = physicalAdmission.workspaceAdmission || physicalAdmission
+          const hasLocalChanges = localAdmission.actualFilesChanged.length > 0
+          const hasExternalChanges = externalLocalAdmission &&
+            externalLocalAdmission.actualFilesChanged.length > 0
+          if (hasLocalChanges || hasExternalChanges) {
+            const candidateHash = hashWorkspaceCandidate(
+              workerWorkspace.workspacePath,
+              this.options.gitEnvironment(workerWorkspace.workspacePath),
+              explicitExternalLocalResources(canonicalAssignment, this.options.targetPath),
+              canonicalAssignment.resources,
+              this.options.targetPath,
+            )
+            const localPointer = hasLocalChanges
+              ? workerWorkspace.manager.preserveCandidate(workerWorkspace, {
+                  admission: localAdmission,
+                  candidateHash,
+                  reasonCode: error && error.code || 'EXECUTION_LIMIT_INTERRUPTED',
+                })
+              : null
+            const externalPointer = hasExternalChanges
+              ? preserveExplicitExternalLocalCandidate(
+                  externalLocalBoundary,
+                  externalLocalAdmission,
+                  {
+                    workItemId: request.workItemId,
+                    reasonCode: error && error.code || 'EXECUTION_LIMIT_INTERRUPTED',
+                    candidateHash,
+                  },
+                )
+              : null
+            candidateSurvivalEvidence = physicalCandidateSurvivalBundle(
+              localPointer,
+              externalPointer,
+              {
+                candidateHash,
+                reasonCode: error && error.code || 'EXECUTION_LIMIT_INTERRUPTED',
+              },
+            )
+            attachErrorField('bestAvailableCandidateEvidence', candidateSurvivalEvidence)
+            attachErrorField('details', {
+              ...(error.details || {}),
+              bestAvailableCandidateEvidence: candidateSurvivalEvidence,
+              retryDisposition: limitInterruption
+                ? 'DO_NOT_REPLAY_UNKNOWN_OR_EXHAUSTED_SPEND'
+                : 'DO_NOT_DISCARD_PHYSICAL_CANDIDATE_FOR_CONTROLLER_BOOKKEEPING',
+            })
+          }
+        } catch (survivalError) {
+          attachCandidateSurvivalFailure(survivalError)
+        }
+      }
       if (mutationAdmission && workerWorkspace &&
           controllerBookkeepingFailureCanPreserveCandidate(error) &&
           workerWorkspace.manager && typeof workerWorkspace.manager.preserveCandidate === 'function') {
         try {
           const candidatePath = workerWorkspace.workspacePath
-          // This survival area contains only the authenticated private Git
-          // candidate. Exact external-local resources have their own
-          // transaction/quarantine protocol and must not be implied by this
-          // pointer after those resources are rolled back.
+          const workspaceAdmission = mutationAdmission.workspaceAdmission || mutationAdmission
+          const hasLocalChanges = Array.isArray(workspaceAdmission.actualFilesChanged) &&
+            workspaceAdmission.actualFilesChanged.length > 0
+          const hasExternalChanges = externalLocalAdmission &&
+            Array.isArray(externalLocalAdmission.actualFilesChanged) &&
+            externalLocalAdmission.actualFilesChanged.length > 0
+          // A bookkeeping failure is not a product verdict. Freeze every
+          // physically admitted component before normal cleanup restores the
+          // official target and external-local preimages. In particular, an
+          // external-only deliverable must not disappear merely because the
+          // private Git workspace has no local diff to preserve.
           const candidateHash = hashWorkspaceCandidate(
             candidatePath,
             this.options.gitEnvironment(candidatePath),
+            explicitExternalLocalResources(canonicalAssignment, this.options.targetPath),
+            canonicalAssignment && canonicalAssignment.resources || [],
+            this.options.targetPath,
           )
-          candidateSurvivalEvidence = workerWorkspace.manager.preserveCandidate(workerWorkspace, {
-            admission: mutationAdmission.workspaceAdmission || mutationAdmission,
-            candidateHash,
-            reasonCode: error && error.code || 'CONTROLLER_BOOKKEEPING_FAILURE',
-          })
-          attachErrorField('bestAvailableCandidateEvidence', candidateSurvivalEvidence)
-          attachErrorField('details', {
-            ...(error.details || {}),
-            bestAvailableCandidateEvidence: candidateSurvivalEvidence,
-          })
+          const reasonCode = error && error.code || 'CONTROLLER_BOOKKEEPING_FAILURE'
+          const localPointer = hasLocalChanges
+            ? workerWorkspace.manager.preserveCandidate(workerWorkspace, {
+                admission: workspaceAdmission,
+                candidateHash,
+                reasonCode,
+              })
+            : null
+          const externalPointer = hasExternalChanges && !externalLocalTransactionCommitted
+            ? preserveExplicitExternalLocalCandidate(
+                externalLocalBoundary,
+                externalLocalAdmission,
+                { workItemId: request.workItemId, reasonCode, candidateHash },
+              )
+            : null
+          candidateSurvivalEvidence = physicalCandidateSurvivalBundle(
+            localPointer,
+            externalPointer,
+            { candidateHash, reasonCode },
+          )
+          if (candidateSurvivalEvidence) {
+            attachErrorField('bestAvailableCandidateEvidence', candidateSurvivalEvidence)
+            attachErrorField('details', {
+              ...(error.details || {}),
+              bestAvailableCandidateEvidence: candidateSurvivalEvidence,
+            })
+          }
         } catch (survivalError) {
-          attachErrorField('candidateSurvivalFailure', serializeError(survivalError))
+          attachCandidateSurvivalFailure(survivalError)
         }
       }
       if (externalOperation && error && ['MISSION_TIMEOUT', 'EXTERNAL_WRITE_DEADLINE_EXPIRED'].includes(error.code)) {
@@ -16329,9 +17717,21 @@ class CodexSupervisorRuntime {
           ...(error.details || {}), externalOperation: reconciled, terminalBudgetOutcome: 'PARTIAL',
         })
       }
+      const accountedUnknownProviderTransport = Boolean(
+        error && error.code === 'CODEX_USAGE_UNKNOWN_AFTER_START' &&
+        childTokenReservation && childTokenReservation.finiteTokenBudget === false &&
+        unknownProviderSpendReceipt &&
+        unknownProviderSpendReceipt.accountingClass === 'UNKNOWN_PROVIDER_SPEND_UPPER_BOUND' &&
+        Number.isSafeInteger(unknownProviderSpendReceipt.chargedTokens) &&
+        unknownProviderSpendReceipt.chargedTokens > 0
+      )
+      const retryableProviderTransport = Boolean(
+        PROVIDER_TRANSPORT_AVAILABILITY_CODES.has(error && error.code) ||
+        accountedUnknownProviderTransport
+      )
       const exhaustedTransportSuccessor = Boolean(
         !externalOperation &&
-        PROVIDER_TRANSPORT_AVAILABILITY_CODES.has(error && error.code) &&
+        retryableProviderTransport &&
         TARGET_MUTATOR_ROLES.has(policy.child) &&
         /-transport-retry-1$/u.test(request.workItemId || '') &&
         request.transportFailureRetryId === null &&
@@ -16342,6 +17742,8 @@ class CodexSupervisorRuntime {
           const mutationAfter = workspaceFileSnapshot(
             workingDirectory,
             this.options.gitEnvironment(workingDirectory),
+            canonicalAssignment.resources,
+            this.options.targetPath,
           )
           const observedLocalPaths = [...new Set([
             ...[...new Set([...mutationBefore.keys(), ...mutationAfter.keys()])]
@@ -16351,18 +17753,19 @@ class CodexSupervisorRuntime {
               this.options.gitEnvironment(workingDirectory),
             ),
           ])].sort()
-          const observedExternalPaths = externalLocalBoundary
-            ? externalLocalBoundary.resources.map(resource => resource.identity)
-            : []
-          const observedTransportFiles = [...observedLocalPaths, ...observedExternalPaths]
+          // Do not report every materialized external slot as changed. In
+          // particular, an untouched placeholder for a missing output must be
+          // removed by physical inspection rather than promoted as product.
+          const observedTransportFiles = [...observedLocalPaths]
           externalLocalAdmission = inspectExplicitExternalLocalBoundary(
             externalLocalBoundary,
             canonicalAssignment,
             targetWorkingDirectory,
-            { filesChanged: observedTransportFiles },
+            { allAssignedItemsPass: false, filesChanged: observedTransportFiles },
           )
           const externalResources = externalLocalBoundary && externalLocalBoundary.resources || []
           const workspaceAdmission = workerWorkspace.manager.inspect(workerWorkspace, {
+            allAssignedItemsPass: false,
             filesChanged: observedTransportFiles.filter(reported =>
               !externalResources.some(resource =>
                 reportedPathMatchesExternalResource(reported, resource))),
@@ -16401,6 +17804,8 @@ class CodexSupervisorRuntime {
               this.options.targetPath,
               this.options.gitEnvironment(this.options.targetPath),
               explicitExternalLocalResources(canonicalAssignment, this.options.targetPath),
+              canonicalAssignment.resources,
+              this.options.targetPath,
             )
             const promotedBody = Object.freeze({
               schemaVersion: 1,
@@ -16418,45 +17823,31 @@ class CodexSupervisorRuntime {
               ...promotedBody,
               bindingHash: hashText(stableStringify(promotedBody)),
             })
-            const commitInput = {
+            const commitOutcome = await this._commitPromotedMutation({
               assignment: canonicalAssignment,
               permit: mutationPermit,
               postimages: promotedPostimages,
               isolation: workerWorkspace.binding,
               workItemId: request.workItemId,
-            }
-            let commitFailure = null
-            for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
-              try {
-                await this.options.mutationEnforcer.commit(commitInput)
-                commitFailure = null
-                break
-              } catch (commitError) {
-                commitFailure = commitError
-              }
-            }
-            if (commitFailure) {
+              workerWorkspace,
+              externalLocalBoundary,
+              externalLocalAdmission,
+              candidateHash,
+              markStateCommitted: () => { externalLocalTransactionCommitted = true },
+            })
+            if (!commitOutcome.committed) {
               preservePromotedMutationCandidate = !externalLocalBoundary
               throw new SupervisorIntegrationError(
                 'CALLBACK_RECONCILIATION_PENDING',
                 'the exact terminal version is promoted, but its local mutation-state commit remains unavailable',
                 {
                   callback: Object.freeze({ kind: 'mutation-state-commit', attempts: 2 }),
-                  latestFailure: serializeError(commitFailure),
+                  latestFailure: serializeError(commitOutcome.commitFailure),
                   resumableCandidate: promotedMutationCandidate,
                 },
               )
             }
             mutationPermit = null
-            if (externalLocalBoundary) {
-              externalLocalTransactionCommitted = true
-              commitExplicitExternalLocalBoundary(
-                externalLocalBoundary,
-                externalLocalAdmission,
-                { mutationStateCommitted: true },
-              )
-            }
-            workerWorkspace.manager.finalize(workerWorkspace)
             promotedTerminalTransportCandidate = Object.freeze({
               candidateHash,
               filesChanged: Object.freeze([...mutationAdmission.actualFilesChanged]),
@@ -16469,12 +17860,18 @@ class CodexSupervisorRuntime {
           promotedTerminalTransportCandidate = null
         }
       }
-      // A transport retry is allowed only after this exact launch emitted and
-      // durably accounted one complete usage observation. Codex 0.148 omits
-      // usage from turn.failed (including native rollout-budget failures), so
-      // retrying an unknown billed attempt could silently double the spend.
-      if (!externalOperation && request.route !== 'PRE_ROUTE' && completeUsageObserved &&
-          PROVIDER_TRANSPORT_AVAILABILITY_CODES.has(error && error.code) &&
+      // A transport retry is allowed after exact usage or after the controlled
+      // relay durably charged and settled one finite context-bound unknown
+      // response. The accounting-only activation remainder is released; the
+      // frozen topology still permits only one fresh successor.
+      const currentRetryableProviderTransport = Boolean(
+        PROVIDER_TRANSPORT_AVAILABILITY_CODES.has(error && error.code) ||
+        accountedUnknownProviderTransport && error &&
+          error.code === 'CODEX_USAGE_UNKNOWN_AFTER_START'
+      )
+      if (!externalOperation && request.route !== 'PRE_ROUTE' &&
+          (completeUsageObserved || accountedUnknownProviderTransport) &&
+          currentRetryableProviderTransport &&
           typeof persistProviderTransportFailure === 'function') {
         try {
           committedTransportFailure = persistProviderTransportFailure(
@@ -16489,64 +17886,190 @@ class CodexSupervisorRuntime {
           committedTransportFailure = null
         }
       }
+      if (!candidateSurvivalEvidence && mutationPermit && mutationBefore &&
+          childLaunchStarted && workerWorkspace &&
+          typeof inspectMutationCompletion === 'function' &&
+          controllerBookkeepingFailureCanPreserveCandidate(error)) {
+        // The provider-result receipt and the exhausted-successor promotion
+        // both perform controller writes after the earlier catch-entry
+        // preservation gates. A late write/checkpoint failure is not authority
+        // to erase product bytes those gates could not yet see. Re-inspect the
+        // exact physical version once, freeze every changed component, and
+        // retain the original bookkeeping failure as the terminal verdict.
+        try {
+          const physicalAdmission = inspectMutationCompletion({
+            allAssignedItemsPass: false,
+            filesChanged: [],
+            remainingConcerns: [
+              'Controller bookkeeping failed after physical product edits were produced.',
+            ],
+          })
+          const workspaceAdmission = physicalAdmission.workspaceAdmission || physicalAdmission
+          const hasLocalChanges = Array.isArray(workspaceAdmission.actualFilesChanged) &&
+            workspaceAdmission.actualFilesChanged.length > 0
+          const hasExternalChanges = externalLocalAdmission &&
+            Array.isArray(externalLocalAdmission.actualFilesChanged) &&
+            externalLocalAdmission.actualFilesChanged.length > 0
+          if (hasLocalChanges || hasExternalChanges) {
+            const candidateHash = hashWorkspaceCandidate(
+              workerWorkspace.workspacePath,
+              this.options.gitEnvironment(workerWorkspace.workspacePath),
+              explicitExternalLocalResources(canonicalAssignment, this.options.targetPath),
+              canonicalAssignment && canonicalAssignment.resources || [],
+              this.options.targetPath,
+            )
+            const reasonCode = error && error.code || 'CONTROLLER_BOOKKEEPING_FAILURE'
+            const localPointer = hasLocalChanges
+              ? workerWorkspace.manager.preserveCandidate(workerWorkspace, {
+                  admission: workspaceAdmission,
+                  candidateHash,
+                  reasonCode,
+                })
+              : null
+            const externalPointer = hasExternalChanges && !externalLocalTransactionCommitted
+              ? preserveExplicitExternalLocalCandidate(
+                  externalLocalBoundary,
+                  externalLocalAdmission,
+                  { workItemId: request.workItemId, reasonCode, candidateHash },
+                )
+              : null
+            candidateSurvivalEvidence = physicalCandidateSurvivalBundle(
+              localPointer,
+              externalPointer,
+              { candidateHash, reasonCode },
+            )
+            if (candidateSurvivalEvidence) {
+              attachErrorField('bestAvailableCandidateEvidence', candidateSurvivalEvidence)
+              attachErrorField('details', {
+                ...(error.details || {}),
+                bestAvailableCandidateEvidence: candidateSurvivalEvidence,
+                retryDisposition: 'DO_NOT_DISCARD_PHYSICAL_CANDIDATE_FOR_CONTROLLER_BOOKKEEPING',
+              })
+            }
+          }
+        } catch (survivalError) {
+          attachCandidateSurvivalFailure(survivalError)
+        }
+      }
       if (committedTransportFailure && mutationPermit && workerWorkspace &&
           request.transportFailureRetryId &&
           typeof workerWorkspace.manager.quarantine === 'function') {
+        const quarantineInput = {
+          retryWorkItemId: request.transportFailureRetryId,
+          transportReceiptHash: committedTransportFailure.receipt.receiptHash,
+        }
         try {
-          workerTransportQuarantinePointer = workerWorkspace.manager.quarantine(workerWorkspace, {
-            retryWorkItemId: request.transportFailureRetryId,
-            transportReceiptHash: committedTransportFailure.receipt.receiptHash,
-          })
-        } catch (quarantineError) {
-          attachCleanupFailure('transportQuarantineError', quarantineError)
+          workerTransportQuarantinePointer = workerWorkspace.manager.quarantine(
+            workerWorkspace,
+            quarantineInput,
+          )
+        } catch (initialQuarantineError) {
+          try {
+            // One controller-local retry can either complete the atomic record
+            // publication or reopen the identical QUARANTINED journal. It
+            // spends no model tokens and cannot create a second retry graph.
+            workerTransportQuarantinePointer = workerWorkspace.manager.quarantine(
+              workerWorkspace,
+              quarantineInput,
+            )
+          } catch (quarantineError) {
+            attachErrorField(
+              'initialTransportQuarantineError',
+              serializeError(initialQuarantineError),
+            )
+            attachCleanupFailure('transportQuarantineError', quarantineError)
+            preserveTransportCandidateAfterQuarantineFailure(quarantineError)
+          }
         }
       }
       if (externalLocalBoundary && !externalLocalTransactionCommitted) {
-        try {
-          if (committedTransportFailure && request.transportFailureRetryId) {
+        if (committedTransportFailure && request.transportFailureRetryId) {
+          const quarantineInput = {
+            sourceWorkItemId: request.workItemId,
+            retryWorkItemId: request.transportFailureRetryId,
+            transportReceiptHash: committedTransportFailure.receipt.receiptHash,
+          }
+          try {
             externalTransportQuarantinePointer = quarantineExplicitExternalLocalBoundary(
               externalLocalBoundary,
               targetWorkingDirectory,
-              {
-                sourceWorkItemId: request.workItemId,
-                retryWorkItemId: request.transportFailureRetryId,
-                transportReceiptHash: committedTransportFailure.receipt.receiptHash,
-              },
+              quarantineInput,
             )
-          } else {
+          } catch (initialExternalQuarantineError) {
+            try {
+              externalTransportQuarantinePointer = quarantineExplicitExternalLocalBoundary(
+                externalLocalBoundary,
+                targetWorkingDirectory,
+                quarantineInput,
+              )
+            } catch (externalQuarantineError) {
+              attachErrorField(
+                'initialExternalLocalQuarantineError',
+                serializeError(initialExternalQuarantineError),
+              )
+              attachCleanupFailure('externalLocalReconciliationError', externalQuarantineError)
+              preserveTransportCandidateAfterQuarantineFailure(externalQuarantineError)
+              // The first attempt may have durably written its exact snapshot
+              // before rollback or pointer reopening failed. Recover that
+              // receipt-bound authority without trusting public bytes.
+              try {
+                externalTransportQuarantinePointer =
+                  findExternalLocalTransportQuarantinePointer({
+                    quarantineRoot: externalLocalBoundary.transaction.quarantineRoot,
+                    sourceWorkItemId: request.workItemId,
+                    retryWorkItemId: request.transportFailureRetryId,
+                    transportReceiptHash: committedTransportFailure.receipt.receiptHash,
+                  })
+              } catch (pointerError) {
+                attachErrorField(
+                  'externalLocalQuarantinePointerError',
+                  serializeError(pointerError),
+                )
+              }
+              // Preservation is complete before rollback. Reconcile the live
+              // public slot to its authenticated preimage when possible; a
+              // concurrent writer remains a retained CAS conflict.
+              if (externalLocalBoundary.transaction &&
+                  fs.existsSync(externalLocalBoundary.transaction.root)) {
+                try {
+                  rollbackExplicitExternalLocalBoundary(
+                    externalLocalBoundary,
+                    targetWorkingDirectory,
+                    externalLocalAdmission,
+                  )
+                } catch (fallbackRollbackError) {
+                  attachErrorField(
+                    'externalLocalFallbackRollbackError',
+                    serializeError(fallbackRollbackError),
+                  )
+                }
+              }
+            }
+          }
+        } else {
+          try {
             rollbackExplicitExternalLocalBoundary(
               externalLocalBoundary,
               targetWorkingDirectory,
+              externalLocalAdmission,
             )
-          }
-        } catch (externalRollbackError) {
-          attachCleanupFailure('externalLocalReconciliationError', externalRollbackError)
-          // A failed quarantine is not authority to retain the live partial
-          // output. If its authenticated preimage transaction is still
-          // available, make one deterministic rollback attempt before any
-          // lease or mutation authority can settle.
-          if (externalLocalBoundary.transaction &&
-              fs.existsSync(externalLocalBoundary.transaction.root)) {
-            try {
-              rollbackExplicitExternalLocalBoundary(
-                externalLocalBoundary,
-                targetWorkingDirectory,
-              )
-            } catch (fallbackRollbackError) {
-              attachErrorField(
-                'externalLocalFallbackRollbackError',
-                serializeError(fallbackRollbackError),
-              )
-            }
+          } catch (externalRollbackError) {
+            attachCleanupFailure('externalLocalReconciliationError', externalRollbackError)
           }
         }
       }
-      if (committedTransportFailure && request.transportFailureRetryId && !cleanupFailure) {
+      if (committedTransportFailure && request.transportFailureRetryId) {
         transportQuarantinePointer = transportQuarantineBundle(
           workerTransportQuarantinePointer,
           externalTransportQuarantinePointer,
         )
-        transportQuarantineResolved = true
+        transportQuarantineResolved = Boolean(transportQuarantinePointer)
+        durableTransportQuarantineEvidence = transportQuarantinePointer
+          ? transportQuarantineCandidateEvidence(
+              transportQuarantinePointer,
+              error && error.code || 'PROVIDER_TRANSPORT_FAILURE',
+            )
+          : null
       }
       const preserveDeferredRepairForTransportSuccessor = Boolean(
         deferredRepairCandidate && committedTransportFailure &&
@@ -16584,6 +18107,20 @@ class CodexSupervisorRuntime {
         } catch (abortError) {
           attachCleanupFailure('mutationAbortError', abortError)
         }
+      }
+      if (cleanupFailure && durableTransportQuarantineEvidence) {
+        // The exact retry seed is already durable even though a later cleanup
+        // layer failed. Expose that authority before settlement is skipped;
+        // never make the caller rediscover private quarantine state or replay
+        // the provider request merely because cleanup also needs recovery.
+        candidateSurvivalEvidence = candidateSurvivalEvidence ||
+          durableTransportQuarantineEvidence
+        attachErrorField('bestAvailableCandidateEvidence', candidateSurvivalEvidence)
+        attachErrorField('details', {
+          ...(error.details || {}),
+          bestAvailableCandidateEvidence: candidateSurvivalEvidence,
+          retryDisposition: 'DO_NOT_DISCARD_QUARANTINED_CANDIDATE_OR_REPLAY_PROVIDER_SPEND',
+        })
       }
       if (committedTransportFailure && !cleanupFailure) {
         try {
@@ -16643,26 +18180,89 @@ class CodexSupervisorRuntime {
           return returnedFailure
         } catch (settlementError) {
           error = settlementError
+          if (transportQuarantineResolved && transportQuarantinePointer) {
+            try {
+              candidateSurvivalEvidence = transportQuarantineCandidateEvidence(
+                transportQuarantinePointer,
+                error && error.code || 'CONTROLLER_SETTLEMENT_FAILURE',
+              )
+              attachErrorField('bestAvailableCandidateEvidence', candidateSurvivalEvidence)
+              attachErrorField('details', {
+                ...(error.details || {}),
+                bestAvailableCandidateEvidence: candidateSurvivalEvidence,
+                retryDisposition: 'DO_NOT_DISCARD_QUARANTINED_CANDIDATE_OR_REPLAY_PROVIDER_SPEND',
+              })
+            } catch (survivalError) {
+              attachCandidateSurvivalFailure(survivalError)
+            }
+          }
         }
       }
       if (!leaseSettled) {
         failSchedulerLease(lease, error)
       }
       if (budgetSessionStarted && !terminalSessionSettlementAttempted) {
-        persistTerminalSession(this.budget, sessionId, {
-          status: error && error.code === 'MISSION_TIMEOUT' ? 'PARTIAL' : 'FAILED', evidenceHashes: [],
-        }, error)
+        try {
+          persistTerminalSession(this.budget, sessionId, {
+            status: error && error.code === 'MISSION_TIMEOUT' ? 'PARTIAL' : 'FAILED', evidenceHashes: [],
+          }, error)
+        } catch (settlementError) {
+          if (candidateSurvivalIntegrityFailure(error)) {
+            if ((typeof error === 'object' || typeof error === 'function') &&
+                Object.isExtensible(error)) {
+              error.terminalSessionSettlementFailure = serializeError(settlementError)
+              error.details = {
+                ...(error.details || {}),
+                terminalSessionSettlementFailure: serializeError(settlementError),
+              }
+            }
+          } else error = settlementError
+          if (candidateSurvivalEvidence &&
+              error && (typeof error === 'object' || typeof error === 'function') &&
+              Object.isExtensible(error)) {
+            error.bestAvailableCandidateEvidence = candidateSurvivalEvidence
+            error.details = {
+              ...(error.details || {}),
+              bestAvailableCandidateEvidence: candidateSurvivalEvidence,
+            }
+          }
+        }
       }
       if (candidateSurvivalEvidence) attachErrorField('bestAvailableCandidateEvidence', candidateSurvivalEvidence)
+      childCompletionFailure = error
       throw error
     } finally {
       const pendingProviderEnvelope = this._pendingProviderEnvelope(reservationId)
       if (pendingProviderEnvelope) {
-        throw new SupervisorIntegrationError(
+        const accountingError = new SupervisorIntegrationError(
           'INCOMPLETE_USAGE_ACCOUNTING',
           'child returned with one durable provider request allowance still pending',
-          { requestOrdinal: pendingProviderEnvelope.requestOrdinal },
+          {
+            requestOrdinal: pendingProviderEnvelope.requestOrdinal,
+            ...(childCompletionFailure
+              ? { priorFailure: serializeError(childCompletionFailure) }
+              : {}),
+            ...(candidateSurvivalEvidence
+              ? { bestAvailableCandidateEvidence: candidateSurvivalEvidence }
+              : {}),
+          },
         )
+        if (candidateSurvivalEvidence) {
+          accountingError.bestAvailableCandidateEvidence = candidateSurvivalEvidence
+        }
+        if (candidateSurvivalIntegrityFailure(childCompletionFailure)) {
+          if ((typeof childCompletionFailure === 'object' ||
+              typeof childCompletionFailure === 'function') &&
+              Object.isExtensible(childCompletionFailure)) {
+            childCompletionFailure.pendingUsageAccountingFailure = serializeError(accountingError)
+            childCompletionFailure.details = {
+              ...(childCompletionFailure.details || {}),
+              pendingUsageAccountingFailure: serializeError(accountingError),
+            }
+          }
+          throw childCompletionFailure
+        }
+        throw accountingError
       }
       this._releaseChildTokenEnvelope(reservationId)
     }
@@ -16702,10 +18302,126 @@ class CodexSupervisorRuntime {
     }
   }
 
-  async _suspendResumable(outcome, result = {}) {
-    if (this.finished) throw new SupervisorIntegrationError('TERMINAL_DUPLICATE', 'runtime already stopped')
-    if (this.suspending && this.suspensionPromise) return this.suspensionPromise
-    if (this.suspending) throw new SupervisorIntegrationError('TERMINAL_FINALIZATION_IN_PROGRESS', 'runtime pause is already draining')
+  _beginSettlement(kind, operation) {
+    if (this.settlementPromise) return this.settlementPromise
+    const attempt = Promise.resolve().then(operation)
+    this.settlementKind = kind
+    this.settlementPromise = attempt
+    if (kind === 'cancel') this.cancellationPromise = attempt
+    if (kind === 'suspend') {
+      this.suspending = true
+      this.suspensionPromise = attempt
+    }
+    if (kind === 'finalize') {
+      this.finalizing = true
+      this.finalizationPromise = attempt
+    }
+    attempt.then(() => {
+      if (kind === 'suspend') this.suspending = false
+      if (kind === 'finalize') this.finalizing = false
+    }, () => {
+      if (this.settlementPromise === attempt) {
+        this.settlementPromise = null
+        this.settlementKind = null
+      }
+      if (kind === 'cancel' && this.cancellationPromise === attempt) {
+        this.cancellationPromise = null
+      }
+      if (kind === 'suspend' && this.suspensionPromise === attempt) {
+        this.suspending = false
+        this.suspensionPromise = null
+      }
+      if (kind === 'finalize' && this.finalizationPromise === attempt) {
+        this.finalizing = false
+        this.finalizationPromise = null
+      }
+    })
+    return attempt
+  }
+
+  _resumableSuspensionIsDurablySelected() {
+    if (!this.resumableSuspensionIntent ||
+        typeof this.options?.runtimeStateProvider !== 'function') return false
+    const opened = this.options.runtimeStateProvider()
+    return Boolean(opened && opened.state === this.resumableSuspensionIntent.outcome &&
+      ['PAUSED', 'WAITING_USER'].includes(opened.state))
+  }
+
+  _suspendResumable(outcome, result = {}) {
+    if (this.settlementPromise) return this.settlementPromise
+    if (this.finished) {
+      return Promise.reject(new SupervisorIntegrationError('TERMINAL_DUPLICATE', 'runtime already stopped'))
+    }
+    if (this.terminalReleasePromise || this.terminalFinalizationIntent) {
+      const release = this.terminalReleasePromise ||
+        Promise.resolve(this.terminalFinalizationIntent.outcome)
+      return release.then(selectedOutcome => this._finish(
+        selectedOutcome,
+        this.terminalFinalizationIntent && this.terminalFinalizationIntent.result || result,
+      ))
+    }
+    return this._beginSettlement('suspend', () =>
+      this._suspendResumableWithOneReplay(outcome, result))
+  }
+
+  async _suspendResumableWithOneReplay(outcome, result = {}) {
+    try {
+      return await this._suspendResumableOnce(outcome, result)
+    } catch (error) {
+      if (!this.resumableSuspensionIntent || this.suspensionReplayAttempts >= 1) throw error
+      this.suspensionReplayAttempts += 1
+      try {
+        return await this._suspendResumableOnce(
+          this.resumableSuspensionIntent.outcome,
+          this.resumableSuspensionIntent.result,
+        )
+      } catch (replayError) {
+        if (replayError &&
+            (typeof replayError === 'object' || typeof replayError === 'function') &&
+            Object.isExtensible(replayError)) {
+          replayError.priorResumableSuspensionFailure = serializeError(error)
+          replayError.details = {
+            ...(replayError.details || {}),
+            priorResumableSuspensionFailure: serializeError(error),
+          }
+        }
+        throw replayError
+      }
+    }
+  }
+
+  async _suspendResumableOnce(outcome, result = {}) {
+    if (!this.resumableSuspensionIntent && result && result.finalResponse) {
+      if (!validStructuredFinalResponseCandidate(result.finalResponse)) {
+        throw new SupervisorIntegrationError(
+          'STRUCTURED_FINAL_RESPONSE_INVALID',
+          'resumable settlement cannot retain an unauthenticated structured final response',
+        )
+      }
+      const deliverables = mergeDeliverableManifests(
+        Array.isArray(result.deliverables) ? result.deliverables : [],
+        [{
+          path: result.finalResponse.evidencePointer.path,
+          hash: result.finalResponse.evidencePointer.hash,
+        }],
+      )
+      const existingCandidateEvidence = result.terminalEnvelope &&
+        result.terminalEnvelope.bestAvailableCandidateEvidence
+      result = {
+        ...result,
+        deliverables,
+        terminalEnvelope: {
+          ...(result.terminalEnvelope || {}),
+          bestAvailableCandidateEvidence: {
+            ...(existingCandidateEvidence || {
+              disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+            }),
+            deliverableCount: deliverables.length,
+            deliverableManifestHash: hashText(stableStringify(deliverables)),
+          },
+        },
+      }
+    }
     if (this.resumableSuspensionIntent) {
       outcome = this.resumableSuspensionIntent.outcome
       result = this.resumableSuspensionIntent.result
@@ -16714,9 +18430,7 @@ class CodexSupervisorRuntime {
       outcome = this.resumableSuspensionIntent.outcome
       result = this.resumableSuspensionIntent.result
     }
-    this.suspending = true
-    const attempt = (async () => {
-      const options = this.options || {}
+    const options = this.options || {}
       const runtime = typeof options.runtimeStateProvider === 'function'
         ? options.runtimeStateProvider() : null
       const alreadyPaused = Boolean(result.transition && runtime && runtime.state === 'PAUSED')
@@ -16775,27 +18489,22 @@ class CodexSupervisorRuntime {
       } else {
         this.missionLock.release(this.lease)
       }
-      this.finished = true
       const settled = {
         outcome,
         resumable: true,
         route: this.route,
         terminalEnvelope: result.terminalEnvelope || null,
+        finalResponse: result.finalResponse || null,
+        deliverables: result.deliverables || [],
+        checkHashes: result.checkHashes || [],
         budget: this.budget.snapshot(),
         scheduler: this.scheduler ? this.scheduler.getMetrics() : null,
         schedulerState: this.scheduler && this.scheduler.getMetrics().counters.currentLiveChildren === 0
           ? this.scheduler.exportState() : null,
       }
+      this.finished = true
       this.settledResult = settled
       return settled
-    })()
-    this.suspensionPromise = attempt
-    try {
-      return await attempt
-    } finally {
-      this.suspending = false
-      if (!this.finished) this.suspensionPromise = null
-    }
   }
 
   async _drainOwnedProcessesWithOneRetry(reason, terminalStatus) {
@@ -16863,28 +18572,279 @@ class CodexSupervisorRuntime {
     return transitioned
   }
 
-  async _enterTerminalRelease(outcome, error, terminalEnvelope = null) {
-    if (!this.finalizer || typeof this.options.runtimeStateProvider !== 'function') return outcome
+  _adoptDurableTerminalFinalizationIntent() {
+    if (!this.record || typeof this.record.readTerminalFinalizationIntent !== 'function') return null
+    let durable
+    try {
+      durable = this.record.readTerminalFinalizationIntent()
+    } catch (error) {
+      if (error && error.code === 'TERMINAL_FINALIZATION_INTENT_REQUIRED') return null
+      throw error
+    }
+    const opened = typeof this.options.runtimeStateProvider === 'function'
+      ? this.options.runtimeStateProvider() : null
+    if (!opened || !opened.activation ||
+        durable.runId !== this.record.runId ||
+        durable.activationId !== opened.activation.id ||
+        durable.activationId !== this.activation.id ||
+        durable.generation > opened.activation.generation ||
+        durable.generation > this.activation.generation ||
+        durable.missionHash !== opened.activation.missionHash ||
+        durable.missionHash !== this.activation.missionHash ||
+        durable.requestEnvelopeHash !== opened.requestEnvelopeHash ||
+        !this.requestPointer || durable.requestEnvelopeHash !== this.requestPointer.hash ||
+        durable.workspaceEpoch !== opened.workspaceEpoch ||
+        ![null, 'DIRECT', 'LIGHT', 'ROADMAP'].includes(durable.route) ||
+        (opened.terminal && opened.terminal.outcome !== durable.outcome) ||
+        (TERMINAL_OUTCOMES.includes(opened.state) && opened.state !== durable.outcome) ||
+        (this.options.releaseReconciliation &&
+          (this.options.releaseReconciliation.outcome !== durable.outcome ||
+           (this.options.releaseReconciliation.route ?? null) !== durable.route))) {
+      throw new SupervisorIntegrationError(
+        'TERMINAL_FINALIZATION_INTENT_MISMATCH',
+        'durable terminal selection does not bind the exact opened run, activation, request, epoch, and outcome',
+      )
+    }
+    if (durable.finalResponse !== null &&
+        !validStructuredFinalResponseCandidate(durable.finalResponse)) {
+      throw new SupervisorIntegrationError(
+        'STRUCTURED_FINAL_RESPONSE_INVALID',
+        'durable terminal selection contains an unauthenticated structured response',
+      )
+    }
+    const result = {
+      route: durable.route,
+      reason: durable.reason,
+      deliverables: durable.deliverableManifest,
+      checkHashes: durable.checkHashes,
+      terminalEnvelope: durable.terminalEnvelope,
+      unblockPath: durable.unblockPath,
+      expectedEpoch: durable.workspaceEpoch,
+      finalResponse: durable.finalResponse,
+    }
+    this.terminalFinalizationIntent = immutableTerminalIntent(durable.outcome, result)
+    this.terminalFinalizationIntentDurable = true
+    return this.terminalFinalizationIntent
+  }
+
+  _persistTerminalFinalizationIntent(selected) {
+    if (this.terminalFinalizationIntentDurable) return
+    const runtimeOptions = this.options || {}
+    const opened = typeof runtimeOptions.runtimeStateProvider === 'function'
+      ? runtimeOptions.runtimeStateProvider() : null
+    const durableState = opened && opened.activation &&
+      typeof opened.activation.id === 'string' &&
+      Number.isSafeInteger(opened.activation.generation) &&
+      /^[a-f0-9]{64}$/u.test(opened.activation.missionHash || '') &&
+      /^[a-f0-9]{64}$/u.test(opened.requestEnvelopeHash || '') &&
+      Number.isSafeInteger(opened.workspaceEpoch)
+      ? opened : null
+    if (!durableState || !this.record ||
+        typeof this.record.createOrVerifyTerminalFinalizationIntent !== 'function') return
+    const diagnostics = terminalFinalizationDiagnostics(selected.result)
+    this.record.createOrVerifyTerminalFinalizationIntent({
+      runId: this.record.runId,
+      activationId: durableState.activation.id,
+      generation: durableState.activation.generation,
+      missionHash: durableState.activation.missionHash,
+      requestEnvelopeHash: durableState.requestEnvelopeHash,
+      workspaceEpoch: durableState.workspaceEpoch,
+      outcome: selected.outcome,
+      route: selected.result.route,
+      reason: diagnostics.reason,
+      deliverableManifest: selected.result.deliverables,
+      checkHashes: selected.result.checkHashes,
+      terminalEnvelope: diagnostics.terminalEnvelope,
+      finalResponse: selected.result.finalResponse || null,
+      unblockPath: diagnostics.unblockPath,
+    })
+    this.terminalFinalizationIntentDurable = true
+  }
+
+  async _prepareTerminalFinalizationIntent(outcome, sourceResult = {}) {
+    if (this.terminalFinalizationIntent) {
+      this._persistTerminalFinalizationIntent(this.terminalFinalizationIntent)
+      return this.terminalFinalizationIntent
+    }
+    const runtimeOptions = this.options || {}
+    let result = sourceResult && typeof sourceResult === 'object' ? { ...sourceResult } : {}
+    const selectedRoute = this.route === undefined ? null : this.route
+    if (![null, 'DIRECT', 'LIGHT', 'ROADMAP'].includes(selectedRoute)) {
+      throw new SupervisorIntegrationError(
+        'TERMINAL_INTENT_INVALID',
+        'terminal selection route must be DIRECT, LIGHT, ROADMAP, or null',
+      )
+    }
+    result = { ...result, route: selectedRoute }
+    let deliverables = mergeDeliverableManifests(
+      Array.isArray(result.deliverables) ? result.deliverables : [],
+    )
+    if (outcome !== 'DONE') {
+      try {
+        deliverables = mergeDeliverableManifests(deliverables, changedDeliverables(
+          runtimeOptions.targetPath,
+          typeof runtimeOptions.gitEnvironment === 'function'
+            ? runtimeOptions.gitEnvironment(runtimeOptions.targetPath) : process.env,
+        ))
+      } catch (error) {
+        if (error && ['TERMINAL_MANIFEST_INVALID', 'TERMINAL_MANIFEST_CONFLICT'].includes(error.code)) throw error
+        // Preserve the primary terminal result when discovery itself is a
+        // controller/environment defect. The supplied exact manifest remains
+        // subject to the finalizer's strict current-entry verification.
+        if (typeof runtimeOptions.diagnosticSink === 'function') {
+          try {
+            runtimeOptions.diagnosticSink(Object.freeze({
+              label: 'best-available-deliverable-discovery-failed',
+              outcome,
+              error: serializeError(error),
+            }))
+          } catch {}
+        }
+      }
+    }
+    if (result.finalResponse !== undefined && result.finalResponse !== null) {
+      if (!validStructuredFinalResponseCandidate(result.finalResponse)) {
+        throw new SupervisorIntegrationError(
+          'STRUCTURED_FINAL_RESPONSE_INVALID',
+          'terminal selection requires an independently authenticated durable structured response',
+        )
+      }
+      deliverables = mergeDeliverableManifests(deliverables, [{
+        path: result.finalResponse.evidencePointer.path,
+        hash: result.finalResponse.evidencePointer.hash,
+      }])
+    }
+    if (outcome !== 'DONE' && deliverables.length > 0) {
+      const existingCandidateEvidence = result.terminalEnvelope &&
+        result.terminalEnvelope.bestAvailableCandidateEvidence
+      result = {
+        ...result,
+        terminalEnvelope: {
+          ...(result.terminalEnvelope || {}),
+          bestAvailableCandidateEvidence: {
+            ...(existingCandidateEvidence || {
+              disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+            }),
+            deliverableCount: deliverables.length,
+            deliverableManifestHash: hashText(stableStringify(deliverables)),
+          },
+        },
+      }
+    }
+    const checkHashes = Array.isArray(result.checkHashes) ? result.checkHashes : []
+    if (outcome === 'DONE') {
+      if (deliverables.length === 0) {
+        throw new SupervisorIntegrationError(
+          'USER_USABLE_BUILD_REQUIRED',
+          'DONE requires a current user-usable deliverable or an independently accepted durable structured response',
+        )
+      }
+      if (checkHashes.length === 0 || checkHashes.some(hash => !/^[a-f0-9]{64}$/u.test(hash))) {
+        throw new SupervisorIntegrationError(
+          'BUILD_ACCEPTANCE_REQUIRED',
+          'DONE requires completed hash-bound build acceptance before terminal independent review and testing',
+        )
+      }
+    }
+    result = { ...result, deliverables, checkHashes }
+    const opened = typeof runtimeOptions.runtimeStateProvider === 'function'
+      ? runtimeOptions.runtimeStateProvider() : null
+    const durableState = opened && opened.activation &&
+      typeof opened.activation.id === 'string' &&
+      Number.isSafeInteger(opened.activation.generation) &&
+      /^[a-f0-9]{64}$/u.test(opened.activation.missionHash || '') &&
+      /^[a-f0-9]{64}$/u.test(opened.requestEnvelopeHash || '') &&
+      Number.isSafeInteger(opened.workspaceEpoch)
+      ? opened : null
+    if (durableState && result.expectedEpoch !== undefined &&
+        result.expectedEpoch !== durableState.workspaceEpoch) {
+      throw new SupervisorIntegrationError(
+        'CONCURRENT_MUTATION',
+        'terminal selection expected a different workspace epoch',
+        { expected: result.expectedEpoch, actual: durableState.workspaceEpoch },
+      )
+    }
+    if (durableState) result = { ...result, expectedEpoch: durableState.workspaceEpoch }
+    const selected = immutableTerminalIntent(outcome, result)
+    // Freeze the in-memory choice before publishing it. If publication itself
+    // crashes, this activation cannot choose a different terminal result; the
+    // next activation either opens the exact durable file or retries this same
+    // create-if-absent operation without launching a model.
+    this.terminalFinalizationIntent = selected
+    this._persistTerminalFinalizationIntent(selected)
+    return selected
+  }
+
+  _enterTerminalRelease(outcome, error, terminalEnvelope = null, terminalResult = null) {
+    if (this.settlementPromise) {
+      return this.settlementPromise.then(settled => settled && settled.outcome || outcome)
+    }
+    if (!this.terminalFinalizationIntent && this._resumableSuspensionIsDurablySelected()) {
+      return this._suspendResumable(
+        this.resumableSuspensionIntent.outcome,
+        this.resumableSuspensionIntent.result,
+      ).then(settled => settled.outcome)
+    }
+    if (this.terminalReleasePromise) return this.terminalReleasePromise
+    this.terminalReleaseRequired = true
+    const attempt = Promise.resolve().then(() => this._enterTerminalReleaseOnce(
+      outcome, error, terminalEnvelope, terminalResult,
+    ))
+    this.terminalReleasePromise = attempt
+    attempt.then(() => {
+      this.terminalReleaseCompleted = true
+    }, () => {
+      if (this.terminalReleasePromise === attempt) this.terminalReleasePromise = null
+    })
+    return attempt
+  }
+
+  async _enterTerminalReleaseOnce(outcome, error, terminalEnvelope = null, terminalResult = null) {
+    if (this.terminalFinalizationIntent) {
+      outcome = this.terminalFinalizationIntent.outcome
+      terminalResult = this.terminalFinalizationIntent.result
+      terminalEnvelope = terminalResult.terminalEnvelope || null
+      error = new SupervisorIntegrationError(
+        terminalEnvelope && (terminalEnvelope.code || terminalEnvelope.status) || outcome,
+        terminalResult.reason || terminalEnvelope && (terminalEnvelope.reason ||
+          terminalEnvelope.cause && terminalEnvelope.cause.reason) ||
+          'continue the already selected immutable terminal outcome',
+        terminalEnvelope || {},
+      )
+    }
+    const select = async selectedOutcome => {
+      const selected = await this._prepareTerminalFinalizationIntent(selectedOutcome, terminalResult || {
+        terminalEnvelope: terminalEnvelope || null,
+      })
+      return selected.outcome
+    }
+    if (!this.finalizer || typeof this.options.runtimeStateProvider !== 'function') {
+      return select(outcome)
+    }
     const opened = this.options.runtimeStateProvider()
     let state = opened && opened.state
-    if (state === 'RELEASING_LOCK') return outcome
+    if (state === 'RELEASING_LOCK') return select(outcome)
     if (outcome === 'CANCELLED') {
+      await select('CANCELLED')
       await this._runtimeTransition('CANCEL_REQUESTED', 'RELEASING_LOCK')
       return 'CANCELLED'
     }
     if (outcome === 'PARTIAL') {
       if (terminalEnvelope && terminalEnvelope.status === 'CHECK_REMAINS_INCONCLUSIVE' &&
           state === 'CHECK_INCONCLUSIVE') {
+        await select('PARTIAL')
         await this._runtimeTransition('CHECK_REMAINS_INCONCLUSIVE', 'RELEASING_LOCK', {
           candidateHash: terminalEnvelope.currentVersionHash || terminalEnvelope.candidateHash || null,
           checkerResultHash: hashText(JSON.stringify(terminalEnvelope)),
         })
         return 'PARTIAL'
       }
+      await select('PARTIAL')
       await this._runtimeTransition('BUDGET_EXHAUSTED_FINAL', 'RELEASING_LOCK')
       return 'PARTIAL'
     }
     if (outcome === 'BLOCKED' && ['PREPARE_WORK', 'RUN_WORK', 'ITEM_VERIFIED', 'CHECK_WORK', 'REPAIRING'].includes(state)) {
+      await select('BLOCKED')
       await this._runtimeTransition('ENVIRONMENT_BLOCKED', 'RELEASING_LOCK', {
         errorCode: error && error.code || 'DIAGNOSTIC_DENIAL_BLOCKED',
       })
@@ -16893,12 +18853,14 @@ class CodexSupervisorRuntime {
     const errorCode = error && error.code || 'FAILED'
     if (outcome === 'FAILED' && ENVIRONMENT_FAILURE_CODES.has(errorCode) &&
         ['PREPARE_WORK', 'RUN_WORK', 'ITEM_VERIFIED', 'CHECK_WORK', 'REPAIRING'].includes(state)) {
+      await select('BLOCKED')
       await this._runtimeTransition('ENVIRONMENT_BLOCKED', 'RELEASING_LOCK', { errorCode })
       return 'BLOCKED'
     }
     const workerContextFailure = WORKER_CONTEXT_FAILURE_CODES.has(errorCode) &&
       ['RUN_WORK', 'REPAIRING'].includes(state)
     if (outcome === 'FAILED' && !workerContextFailure && CONTROLLER_FAILURE_RELEASE_STATES.has(state)) {
+      await select('FAILED')
       await this._runtimeTransition(
         terminalEnvelope && ['PREPARE_WORK', 'RUN_WORK', 'CHECK_WORK', 'REPAIRING'].includes(state)
           ? 'CHECK_FAILED_FINAL' : 'CONTROLLER_FAILED_FINAL',
@@ -16908,24 +18870,27 @@ class CodexSupervisorRuntime {
       return 'FAILED'
     }
     if (['RUN_WORK', 'REPAIRING'].includes(state)) {
+      await select('FAILED')
       await this._runtimeTransition('WORKER_CONTEXT_LOST', 'WORKER_CONTEXT_LOST', {
         errorCode: error && error.code || 'FAILED',
       })
       state = 'WORKER_CONTEXT_LOST'
     }
     if (state === 'WORKER_CONTEXT_LOST') {
+      await select('FAILED')
       await this._runtimeTransition('WORKER_CONTEXT_UNRECOVERABLE', 'RELEASING_LOCK', {
         errorCode: error && error.code || 'FAILED',
       })
       return 'FAILED'
     }
     if (['PREPARE_WORK', 'CHECK_WORK'].includes(state)) {
+      await select('BLOCKED')
       await this._runtimeTransition('ENVIRONMENT_BLOCKED', 'RELEASING_LOCK', {
         errorCode: error && error.code || 'FAILED',
       })
       return 'BLOCKED'
     }
-    return outcome
+    return select(outcome)
   }
 
   async _bestEffortPostDrainCheckpoint(reason) {
@@ -16953,17 +18918,23 @@ class CodexSupervisorRuntime {
 
   async cancel(reason = 'cancel requested') {
     if (this.settledResult) return this.settledResult
-    if (this.finalizing && this.finalizationPromise) return this.finalizationPromise
-    if (this.suspending && this.suspensionPromise) return this.suspensionPromise
-    if (this.cancellationPromise) return this.cancellationPromise
-    const attempt = this._cancelOnce(reason)
-    this.cancellationPromise = attempt
-    try {
-      return await attempt
-    } catch (error) {
-      this.cancellationPromise = null
-      throw error
+    if (this.settlementPromise) return this.settlementPromise
+    if (!this.terminalFinalizationIntent && this._resumableSuspensionIsDurablySelected()) {
+      return this._suspendResumable(
+        this.resumableSuspensionIntent.outcome,
+        this.resumableSuspensionIntent.result,
+      )
     }
+    if (this.terminalReleasePromise || this.terminalFinalizationIntent) {
+      const selected = this.terminalFinalizationIntent
+      return this._finish(selected && selected.outcome || 'CANCELLED',
+        selected && selected.result || {})
+    }
+    // Cancellation ownership is selected synchronously. start() observes this
+    // before its next await, while every competing pause/finalization joins the
+    // same promise instead of draining or publishing a second disposition.
+    this.cancelled = true
+    return this._beginSettlement('cancel', () => this._cancelOnce(reason))
   }
 
   async _cancelOnce(reason) {
@@ -16974,25 +18945,38 @@ class CodexSupervisorRuntime {
     if (this.settledResult) return this.settledResult
     if (this.finalizing && this.finalizationPromise) return this.finalizationPromise
     if (this.suspending && this.suspensionPromise) return this.suspensionPromise
-    if (this.lease && typeof this.options.runtimeStateProvider === 'function') {
-      const current = this.options.runtimeStateProvider()
-      if (current && current.state !== 'RELEASING_LOCK' &&
-          !TERMINAL_OUTCOMES.includes(current.state)) {
-        // Persist the cancellation selection before waiting on any reserved
-        // scheduler work or process drain. A crash after this point replays the
-        // immutable CANCELLED release instead of resuming ordinary work.
-        await this._runtimeTransition('CANCEL_REQUESTED', 'RELEASING_LOCK', {
-          reasonHash: hashText(String(reason)),
-        })
+    const cancellation = new SupervisorIntegrationError('CANCELLED', reason)
+    const cancellationResult = {
+      reason,
+      ...(this.latestStructuredFinalResponse
+        ? { finalResponse: this.latestStructuredFinalResponse } : {}),
+      terminalEnvelope: { status: 'CANCELLED', reason },
+    }
+    let terminalOutcome = 'CANCELLED'
+    if (this.lease) {
+      // The immutable selection is public-run-record durable before either the
+      // release transition or any potentially fallible scheduler/process
+      // drain. Restart therefore completes this exact cancellation and never
+      // resumes ordinary work or launches another model.
+      this.terminalReleaseRequired = true
+      try {
+        terminalOutcome = await this._enterTerminalReleaseOnce(
+          'CANCELLED', cancellation, cancellationResult.terminalEnvelope, cancellationResult,
+        )
+        this.terminalReleaseCompleted = true
+      } catch (error) {
+        this.terminalReleaseCompleted = false
+        throw error
       }
     }
     if (this.scheduler) this.scheduler.dispose(reason)
     await this._drainOwnedProcessesWithOneRetry(reason, 'CANCELLED')
     const postDrainCheckpoint = await this._bestEffortPostDrainCheckpoint(reason)
     if (this.lease && !this.finished) {
-      const cancellation = new SupervisorIntegrationError('CANCELLED', reason)
-      const terminalOutcome = await this._enterTerminalRelease('CANCELLED', cancellation)
-      return this._finish(terminalOutcome, {
+      const finish = this.settlementKind === 'cancel'
+        ? this._finishWithOneReplay.bind(this)
+        : this._finish.bind(this)
+      return finish(terminalOutcome, {
         processTreeDrained: true,
         postDrainCheckpoint,
         terminalEnvelope: { status: 'CANCELLED', reason, postDrainCheckpoint },
@@ -17004,89 +18988,91 @@ class CodexSupervisorRuntime {
     return settled
   }
 
-  async _finish(outcome, result = {}) {
-    if (this.finished) throw new SupervisorIntegrationError('TERMINAL_DUPLICATE', 'runtime already finalized')
-    if (this.finalizing && this.finalizationPromise) return this.finalizationPromise
-    if (this.finalizing) throw new SupervisorIntegrationError('TERMINAL_FINALIZATION_IN_PROGRESS', 'runtime finalization is already draining')
-    const runtimeOptions = this.options || {}
-    const replayingTerminalIntent = Boolean(this.terminalFinalizationIntent)
+  _finish(outcome, result = {}) {
+    if (this.settlementPromise) return this.settlementPromise
+    if (this.finished) {
+      return Promise.reject(new SupervisorIntegrationError('TERMINAL_DUPLICATE', 'runtime already finalized'))
+    }
+    if (this.terminalReleaseRequired && !this.terminalReleaseCompleted) {
+      let release = this.terminalReleasePromise
+      if (!release) {
+        const selected = this.terminalFinalizationIntent
+        if (!selected) {
+          return Promise.reject(new SupervisorIntegrationError(
+            'TERMINAL_RELEASE_SELECTION_MISSING',
+            'required terminal release cannot resume without its immutable selected result',
+          ))
+        }
+        const envelope = selected.result && selected.result.terminalEnvelope || null
+        const releaseError = new SupervisorIntegrationError(
+          envelope && (envelope.code || envelope.status) || selected.outcome,
+          selected.result.reason || envelope && (envelope.reason ||
+            envelope.cause && envelope.cause.reason) ||
+            'resume the already selected terminal release',
+          envelope || {},
+        )
+        release = this._enterTerminalRelease(
+          selected.outcome, releaseError, envelope, selected.result,
+        )
+      }
+      return release.then(selectedOutcome => this._finishAfterRelease(
+        selectedOutcome,
+        this.terminalFinalizationIntent && this.terminalFinalizationIntent.result || result,
+      ))
+    }
+    return this._finishAfterRelease(outcome, result)
+  }
+
+  _finishAfterRelease(outcome, result = {}) {
+    if (this.settlementPromise) return this.settlementPromise
+    if (this.finished) {
+      return Promise.reject(new SupervisorIntegrationError('TERMINAL_DUPLICATE', 'runtime already finalized'))
+    }
     if (this.terminalFinalizationIntent) {
       outcome = this.terminalFinalizationIntent.outcome
       result = this.terminalFinalizationIntent.result
     }
-    let finalizationDeliverables = Array.isArray(result.deliverables) ? result.deliverables : []
-    if (outcome !== 'DONE' && !replayingTerminalIntent) {
+    if (!this.terminalFinalizationIntent && this.resumableSuspensionIntent) {
+      return this._suspendResumable(
+        this.resumableSuspensionIntent.outcome,
+        this.resumableSuspensionIntent.result,
+      )
+    }
+    return this._beginSettlement('finalize', () => this._finishWithOneReplay(outcome, result))
+  }
+
+  async _finishWithOneReplay(outcome, result = {}) {
+    try {
+      return await this._finishOnce(outcome, result)
+    } catch (error) {
+      if (!this.terminalFinalizationIntent || this.terminalReplayAttempts >= 1 ||
+          !terminalFinalizationReplaySafe(error)) throw error
+      this.terminalReplayAttempts += 1
+      const selected = this.terminalFinalizationIntent
       try {
-        const currentDeliverables = changedDeliverables(
-          runtimeOptions.targetPath,
-          typeof runtimeOptions.gitEnvironment === 'function'
-            ? runtimeOptions.gitEnvironment(runtimeOptions.targetPath) : process.env,
-        )
-        if (currentDeliverables.length > 0) finalizationDeliverables = currentDeliverables
-      } catch (error) {
-        // Preserve the primary terminal result when discovery itself is a
-        // controller/environment defect. Any caller-supplied manifest remains
-        // subject to the finalizer's strict current-file hash verification.
-        if (typeof runtimeOptions.diagnosticSink === 'function') {
-          try {
-            runtimeOptions.diagnosticSink(Object.freeze({
-              label: 'best-available-deliverable-discovery-failed',
-              outcome,
-              error: serializeError(error),
-            }))
-          } catch {}
+        return await this._finishOnce(selected.outcome, selected.result)
+      } catch (replayError) {
+        if (replayError &&
+            (typeof replayError === 'object' || typeof replayError === 'function') &&
+            Object.isExtensible(replayError)) {
+          replayError.priorTerminalFinalizationFailure = serializeError(error)
+          replayError.details = {
+            ...(replayError.details || {}),
+            priorTerminalFinalizationFailure: serializeError(error),
+          }
         }
-      }
-      if (finalizationDeliverables.length > 0) {
-        const existingCandidateEvidence = result.terminalEnvelope &&
-          result.terminalEnvelope.bestAvailableCandidateEvidence
-        result = {
-          ...result,
-          terminalEnvelope: {
-            ...(result.terminalEnvelope || {}),
-            bestAvailableCandidateEvidence: {
-              ...(existingCandidateEvidence || {
-                disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
-              }),
-              deliverableCount: finalizationDeliverables.length,
-              deliverableManifestHash: hashText(stableStringify(finalizationDeliverables)),
-            },
-          },
-        }
+        throw replayError
       }
     }
-    if (outcome === 'DONE') {
-      const checkHashes = Array.isArray(result.checkHashes) ? result.checkHashes : []
-      if (finalizationDeliverables.length === 0 &&
-          !validStructuredFinalResponseCandidate(result.finalResponse)) {
-        throw new SupervisorIntegrationError(
-          'USER_USABLE_BUILD_REQUIRED',
-          'DONE requires a current user-usable deliverable or an independently accepted durable structured response',
-        )
-      }
-      if (finalizationDeliverables.length === 0) {
-        finalizationDeliverables = [{
-          path: result.finalResponse.evidencePointer.path,
-          hash: result.finalResponse.evidencePointer.hash,
-        }]
-      }
-      if (checkHashes.length === 0 || checkHashes.some(hash => !/^[a-f0-9]{64}$/.test(hash))) {
-        throw new SupervisorIntegrationError(
-          'BUILD_ACCEPTANCE_REQUIRED',
-          'DONE requires completed hash-bound build acceptance before terminal independent review and testing',
-        )
-      }
-    }
-    result = { ...result, deliverables: finalizationDeliverables }
-    if (!this.terminalFinalizationIntent) {
-      this.terminalFinalizationIntent = immutableTerminalIntent(outcome, result)
-      outcome = this.terminalFinalizationIntent.outcome
-      result = this.terminalFinalizationIntent.result
-      finalizationDeliverables = result.deliverables
-    }
-    this.finalizing = true
-    const attempt = (async () => {
-      if (result.processTreeDrained !== true) {
+  }
+
+  async _finishOnce(outcome, result = {}) {
+    const completionDiagnostics = result && typeof result === 'object' ? result : {}
+      const selected = await this._prepareTerminalFinalizationIntent(outcome, result)
+      outcome = selected.outcome
+      result = selected.result
+      const finalizationDeliverables = result.deliverables
+      if (completionDiagnostics.processTreeDrained !== true) {
         if (this.scheduler) this.scheduler.dispose('terminal finalization')
         await this._drainOwnedProcessesWithOneRetry('terminal finalization', outcome)
       }
@@ -17110,19 +19096,20 @@ class CodexSupervisorRuntime {
         const diagnostics = terminalFinalizationDiagnostics(result)
         const finalizerInput = Object.freeze({
           outcome,
+          route: result.route,
           reason: diagnostics.reason,
           unblockPath: diagnostics.unblockPath,
           deliverables: finalizationDeliverables,
           checkHashes: result.checkHashes || [],
           terminalEnvelope: diagnostics.terminalEnvelope,
           expectedEpoch: result.expectedEpoch,
+          finalResponse: result.finalResponse || null,
         })
         finalized = await this.finalizer.finalize(finalizerInput)
       } else {
         this.missionLock.release(this.lease)
         finalized = { outcome, durable: false, reason: 'runtime record was unavailable before finalizer creation' }
       }
-      this.finished = true
       const settled = {
         outcome,
         route: this.route,
@@ -17130,7 +19117,8 @@ class CodexSupervisorRuntime {
         finalResponse: result.finalResponse || null,
         deliverables: finalizationDeliverables,
         checkHashes: result.checkHashes || [],
-        postDrainCheckpoint: result.postDrainCheckpoint || null,
+        postDrainCheckpoint: completionDiagnostics.postDrainCheckpoint ||
+          result.postDrainCheckpoint || null,
         finalizationBudget,
         finalized,
         localPersistenceLimitations: Object.freeze([
@@ -17141,16 +19129,9 @@ class CodexSupervisorRuntime {
         scheduler: schedulerMetrics,
         schedulerState,
       }
+      this.finished = true
       this.settledResult = settled
       return settled
-    })()
-    this.finalizationPromise = attempt
-    try {
-      return await attempt
-    } finally {
-      this.finalizing = false
-      if (!this.finished) this.finalizationPromise = null
-    }
   }
 
   _preLeaseOutcome(outcome, details) {
@@ -17235,10 +19216,16 @@ function replayRequestFromPersistedAssignment(assignment) {
           verificationCommandBindings: assignment.verificationObservationBinding.schemaVersion === 3 &&
             Array.isArray(assignment.verificationObservationBinding.observations)
             ? assignment.verificationObservationBinding.observations.flatMap(observation =>
-                (observation.exactCommandHashes || []).map(commandHash => ({
-                  checkId: observation.checkId,
-                  commandHash,
-                })))
+                (observation.exactCommandHashes || []).map(commandHash => {
+                  const exactBinding = Array.isArray(observation.exactCommandBindings)
+                    ? observation.exactCommandBindings.find(item =>
+                        item && item.commandHash === commandHash) : null
+                  return {
+                    checkId: observation.checkId,
+                    commandHash,
+                    ...(exactBinding ? { artifacts: exactBinding.artifacts } : {}),
+                  }
+                }))
             : Array.isArray(assignment.verificationObservationBinding.commandBindings)
               ? assignment.verificationObservationBinding.commandBindings.map(binding => ({ ...binding }))
               : [],
@@ -17858,25 +19845,109 @@ function alignCloneToExpectedHead(sourcePath, clonePath, expectedBranch, environ
   return sourceHeadOid
 }
 
-function hashWorkspaceCandidate(repository, environment, externalLocalResources = []) {
+function workspaceCandidateNames(
+  repository,
+  environment,
+  workspaceResources = [],
+  workspaceResourceRoot = repository,
+) {
   const listing = Buffer.from(runGit(repository, ['ls-files', '-co', '--exclude-standard', '-z'], {
     encoding: null, environment,
   }))
-  const names = listing.toString('utf8').split('\0').filter(Boolean).sort()
+  let ignored = []
+  try {
+    ignored = declaredIgnoredWorkspaceNames(
+      repository,
+      environment,
+      projectWorkspaceResources(workspaceResources, workspaceResourceRoot, repository),
+    )
+  } catch (error) {
+    throw new SupervisorIntegrationError(
+      'CANDIDATE_UNSAFE',
+      'declared ignored exact-version inventory could not be established safely',
+      { cause: error.code || error.message },
+    )
+  }
+  return [...new Set([
+    ...listing.toString('utf8').split('\0').filter(Boolean),
+    ...ignored,
+  ])].sort()
+}
+
+function readStableWorkspaceRegularFile(absolute, name, errorCode) {
+  let observed
+  try {
+    observed = fs.lstatSync(absolute)
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return null
+    throw error
+  }
+  const unsafe = () => new SupervisorIntegrationError(
+    errorCode,
+    `exact version entry is not one stable regular file: ${name}`,
+  )
+  if (!observed.isFile() || observed.isSymbolicLink() || Number(observed.nlink) !== 1) {
+    throw unsafe()
+  }
+  let descriptor
+  try {
+    descriptor = fs.openSync(
+      absolute,
+      fs.constants.O_RDONLY | Number(fs.constants.O_NOFOLLOW || 0),
+    )
+  } catch (error) {
+    throw Object.assign(unsafe(), { details: { cause: error.code || error.message } })
+  }
+  try {
+    const opened = fs.fstatSync(descriptor)
+    if (!opened.isFile() || Number(opened.nlink) !== 1 ||
+        opened.dev !== observed.dev || opened.ino !== observed.ino) throw unsafe()
+    const bytes = fs.readFileSync(descriptor)
+    const completed = fs.fstatSync(descriptor)
+    let current
+    try { current = fs.lstatSync(absolute) } catch (error) {
+      if (error && error.code === 'ENOENT') throw unsafe()
+      throw error
+    }
+    if (!current.isFile() || current.isSymbolicLink() || Number(current.nlink) !== 1 ||
+        current.dev !== opened.dev || current.ino !== opened.ino ||
+        completed.dev !== opened.dev || completed.ino !== opened.ino ||
+        completed.size !== opened.size || completed.size !== bytes.length ||
+        (completed.mode & 0o777) !== (opened.mode & 0o777) ||
+        completed.mtimeMs !== opened.mtimeMs || completed.ctimeMs !== opened.ctimeMs) {
+      throw unsafe()
+    }
+    return Object.freeze({
+      bytes,
+      mode: opened.mode & 0o777,
+      size: opened.size,
+    })
+  } finally {
+    fs.closeSync(descriptor)
+  }
+}
+
+function hashWorkspaceCandidate(
+  repository,
+  environment,
+  externalLocalResources = [],
+  workspaceResources = [],
+  workspaceResourceRoot = repository,
+) {
+  const names = workspaceCandidateNames(
+    repository, environment, workspaceResources, workspaceResourceRoot,
+  )
   const digest = crypto.createHash('sha256')
   for (const name of names) {
     const absolute = path.join(repository, ...name.split('/'))
     digest.update(Buffer.from(`${name}\0`, 'utf8'))
-    if (!fs.existsSync(absolute)) {
+    const entry = readStableWorkspaceRegularFile(absolute, name, 'CANDIDATE_UNSAFE')
+    if (!entry) {
       digest.update(Buffer.from('missing\0'))
       continue
     }
-    const stat = fs.lstatSync(absolute)
-    if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.nlink) !== 1) {
-      throw new SupervisorIntegrationError('CANDIDATE_UNSAFE', `exact version contains a non-regular tracked input: ${name}`)
-    }
-    digest.update(Buffer.from(`${stat.mode & 0o777}\0${stat.size}\0`, 'utf8'))
-    digest.update(fs.readFileSync(absolute))
+    digest.update(Buffer.from(`${entry.mode}\0${entry.size}\0`, 'utf8'))
+    digest.update(entry.bytes)
     digest.update(Buffer.from('\0'))
   }
   const workspaceHash = digest.digest('hex')
@@ -17971,7 +20042,13 @@ function planProjectionReceipt(projection, snapshotPath, identity = {}) {
 
 function validatePlanCheckerSnapshot(snapshotPath, request, receipt = null, expectedIdentity = null) {
   const projection = planCheckerProjection(request)
-  if (!projection) return hashWorkspaceCandidate(snapshotPath, process.env)
+  if (!projection) return hashWorkspaceCandidate(
+    snapshotPath,
+    process.env,
+    [],
+    request && request.manifests || [],
+    request && request.canonicalTargetPath || snapshotPath,
+  )
   const destination = path.resolve(snapshotPath, ...projection.relativePath.split('/'))
   if (!pathIsInside(snapshotPath, destination)) {
     throw new SupervisorIntegrationError('PLAN_PROJECTION_INVALID', 'projected ROADMAP escaped the checker snapshot')
@@ -18014,19 +20091,78 @@ function validatePlanCheckerSnapshot(snapshotPath, request, receipt = null, expe
   return actualHash
 }
 
-function changedDeliverables(repository, environment) {
+function changedDeliverables(repository, environment, admittedPaths = []) {
   const source = String(runGit(repository, ['status', '--porcelain=v1', '-z', '--untracked-files=all'], { environment }))
-  const names = []
+  const names = new Set()
   for (const record of source.split('\0').filter(Boolean)) {
     const name = record.slice(3).split(' -> ').at(-1)
+    names.add(name.replace(/\\/gu, '/'))
+  }
+  for (const admitted of admittedPaths || []) {
+    const text = String(admitted || '').replace(/\\/gu, '/')
+    if (!text) continue
+    const absolute = path.isAbsolute(text)
+      ? path.resolve(text)
+      : path.resolve(repository, ...text.split('/'))
+    const relative = path.relative(path.resolve(repository), absolute).replace(/\\/gu, '/')
+    if (!relative || relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)) continue
+    names.add(relative)
+  }
+  const deliverables = []
+  for (const name of [...names].sort()) {
     const absolute = path.resolve(repository, ...name.split('/'))
     if (!absolute.startsWith(`${path.resolve(repository)}${path.sep}`) || !fs.existsSync(absolute)) continue
     const stat = fs.lstatSync(absolute)
     if (stat.isFile() && !stat.isSymbolicLink() && Number(stat.nlink) === 1) {
-      names.push({ path: absolute, hash: sha256Bytes(fs.readFileSync(absolute)) })
+      deliverables.push({ path: absolute, hash: sha256Bytes(fs.readFileSync(absolute)) })
     }
   }
-  return names.sort((left, right) => left.path.localeCompare(right.path))
+  return deliverables.sort((left, right) => left.path.localeCompare(right.path))
+}
+
+function mergeDeliverableManifests(...manifests) {
+  const byPath = new Map()
+  for (const manifest of manifests) {
+    if (!Array.isArray(manifest)) continue
+    for (const sourceEntry of manifest) {
+      let entry = sourceEntry
+      if (typeof sourceEntry === 'string' && path.isAbsolute(sourceEntry)) {
+        const absolute = path.resolve(sourceEntry)
+        const stat = fs.lstatSync(absolute)
+        if (stat.isSymbolicLink() ||
+            (!stat.isDirectory() && (!stat.isFile() || Number(stat.nlink) !== 1))) {
+          throw new SupervisorIntegrationError(
+            'TERMINAL_MANIFEST_INVALID',
+            `terminal deliverable path is not one safe current file or directory: ${absolute}`,
+          )
+        }
+        entry = stat.isDirectory()
+          ? { path: absolute, hash: hashManifestEntryStrict({ path: absolute, type: 'directory' }), type: 'directory' }
+          : { path: absolute, hash: hashManifestEntryStrict({ path: absolute }) }
+      }
+      if (!entry || typeof entry.path !== 'string' || !path.isAbsolute(entry.path) ||
+          !/^[a-f0-9]{64}$/u.test(entry.hash || '') ||
+          (entry.type !== undefined && !['file', 'directory'].includes(entry.type))) {
+        throw new SupervisorIntegrationError(
+          'TERMINAL_MANIFEST_INVALID',
+          'terminal deliverables require an absolute path, SHA-256 hash, and optional file/directory type',
+        )
+      }
+      const canonical = entry.type === 'directory'
+        ? { path: path.resolve(entry.path), hash: entry.hash, type: 'directory' }
+        : { path: path.resolve(entry.path), hash: entry.hash }
+      const prior = byPath.get(canonical.path)
+      if (prior && stableStringify(prior) !== stableStringify(canonical)) {
+        throw new SupervisorIntegrationError(
+          'TERMINAL_MANIFEST_CONFLICT',
+          `terminal deliverable has conflicting immutable descriptions: ${canonical.path}`,
+          { prior, current: canonical },
+        )
+      }
+      byPath.set(canonical.path, canonical)
+    }
+  }
+  return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path))
 }
 
 function changedWorkspacePaths(repository, environment) {
@@ -18069,7 +20205,7 @@ function usableDeliverablesProducedByWorker(result, repository, environment, adm
   // A worker's self-assessment is not an independent product verdict. Only
   // physical current deliverables that the isolated mutation admission bound
   // to this exact result can override it; unrelated dirty target bytes cannot.
-  const local = changedDeliverables(repository, environment).filter(deliverable => {
+  const local = changedDeliverables(repository, environment, admitted.keys()).filter(deliverable => {
     const relative = path.relative(root, deliverable.path).replace(/\\/gu, '/')
     return relative && !relative.startsWith('../') && reported.has(relative) &&
       admitted.has(relative) && admitted.get(relative) === deliverable.hash
@@ -18082,9 +20218,11 @@ function usableDeliverablesProducedByWorker(result, repository, environment, adm
     const hash = stat.isFile() && Number(stat.nlink) === 1
       ? sha256Bytes(fs.readFileSync(identity))
       : stat.isDirectory() ? hashDirectoryState(identity) : null
-    return hash && hash === expectedHash ? [{ path: identity, hash }] : []
+    return hash && hash === expectedHash
+      ? [{ path: identity, hash, ...(stat.isDirectory() ? { type: 'directory' } : {}) }]
+      : []
   })
-  return [...local, ...external].sort((left, right) => left.path.localeCompare(right.path))
+  return mergeDeliverableManifests(local, external)
 }
 
 const ASSIGNMENT_RESOURCE_KINDS = new Set([
@@ -18093,26 +20231,74 @@ const ASSIGNMENT_RESOURCE_KINDS = new Set([
 const LOCAL_MUTATION_RESOURCE_KINDS = new Set(['file', 'directory', 'output', 'cache', 'evidence-root'])
 const MISSING_RESOURCE_PREIMAGE_HASH = hashText('autoprompt-resource-missing-v1')
 
+function missionTextFragments(mission) {
+  const fragments = []
+  const seen = new Set()
+  let remaining = 4096
+  const append = value => {
+    if (typeof value !== 'string' || !value || seen.has(value) || remaining <= 0) return
+    seen.add(value)
+    fragments.push(value)
+    remaining -= 1
+  }
+  const visit = (value, depth = 0) => {
+    if (remaining <= 0 || depth > 32 || value === null || value === undefined) return
+    if (typeof value === 'string') {
+      append(value)
+      return
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1)
+      return
+    }
+    if (typeof value === 'object') {
+      for (const key of Object.keys(value).sort()) visit(value[key], depth + 1)
+    }
+  }
+  if (typeof mission === 'string') {
+    // Production stores the immutable request as canonical JSON. Searching
+    // its encoded bytes can both miss escaped value boundaries and mistake a
+    // structural key for user authorization. Inspect decoded values only when
+    // it is JSON; a non-JSON mission remains ordinary immutable request text.
+    try { visit(JSON.parse(mission)) } catch { append(mission) }
+  } else {
+    // Context-free embedding APIs may already supply the parsed, hash-bound
+    // canonical request. Walk values only: object keys are metadata, not user
+    // authorization text.
+    visit(mission)
+  }
+  return Object.freeze(fragments)
+}
+
 function missionContainsExactAbsolutePath(mission, candidatePath) {
-  if (typeof mission !== 'string' || !path.isAbsolute(candidatePath)) return false
+  if (!path.isAbsolute(candidatePath)) return false
   const exact = String(candidatePath)
   const pairedDelimiters = new Map([
     ['`', '`'], ["'", "'"], ['"', '"'], ['(', ')'], ['[', ']'], ['{', '}'], ['<', '>'],
   ])
-  let offset = 0
-  while (offset <= mission.length) {
-    const index = mission.indexOf(exact, offset)
-    if (index < 0) return false
-    const before = index === 0 ? '' : mission[index - 1]
-    const afterIndex = index + exact.length
-    const after = afterIndex === mission.length ? '' : mission[afterIndex]
-    // External mutation authority cannot infer whether whitespace or
-    // punctuation ends a path or continues a longer future filename. Require
-    // the immutable request to delimit the exact path (Markdown/code quotes,
-    // matching brackets, or the whole mission) so no existing prefix can gain
-    // authority from prose or filesystem-existence heuristics.
-    if ((!before && !after) || pairedDelimiters.get(before) === after) return true
-    offset = index + exact.length
+  for (const fragment of missionTextFragments(mission)) {
+    let offset = 0
+    while (offset <= fragment.length) {
+      const index = fragment.indexOf(exact, offset)
+      if (index < 0) break
+      const before = index === 0 ? '' : fragment[index - 1]
+      const afterIndex = index + exact.length
+      const after = afterIndex === fragment.length ? '' : fragment[afterIndex]
+      const remainder = fragment.slice(afterIndex)
+      const tokenStart = !before || /\s/u.test(before)
+      const tokenEnd = !after || after === '\n' || after === '\r' ||
+        /^[,.;:!?)}\]>'"](?=$|\s)/u.test(remainder)
+      // Walk decoded request values only. Matching delimiters remain the
+      // strongest boundary, while ordinary prose may bind an exact absolute
+      // path as a line-delimited token (optionally followed by terminal
+      // punctuation). A plain space remains ambiguous because POSIX paths may
+      // contain spaces; adjacent suffixes such as ` image.png`, `/child`,
+      // `.ext`, or `-shadow` therefore cannot widen authority. JSON keys stay
+      // outside the searchable value projection.
+      if ((!before && !after) || pairedDelimiters.get(before) === after) return true
+      if (tokenStart && tokenEnd) return true
+      offset = index + exact.length
+    }
   }
   return false
 }
@@ -18166,61 +20352,182 @@ function resolveOwnedResourcePath(repository, resource, options = {}) {
   return candidate
 }
 
-function hashDirectoryState(directory) {
+function sameExternalLocalStableMetadata(left, right) {
+  return sameExternalLocalPhysicalEntry(left, right) && left.mode === right.mode &&
+    Number(left.nlink) === Number(right.nlink) && left.size === right.size &&
+    left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs
+}
+
+function readStableExternalLocalFile(absolute, expectedStat = null) {
+  const initial = expectedStat || externalLocalLstat(absolute)
+  if (!initial || !initial.isFile() || initial.isSymbolicLink() ||
+      Number(initial.nlink) !== 1) {
+    throw new SupervisorIntegrationError(
+      'PREIMAGE_UNSAFE',
+      `owned file is not one physical target: ${absolute}`,
+    )
+  }
+  let descriptor
+  try {
+    descriptor = fs.openSync(
+      absolute,
+      fs.constants.O_RDONLY | Number(fs.constants.O_NOFOLLOW || 0),
+    )
+    const opened = fs.fstatSync(descriptor)
+    if (!opened.isFile() || Number(opened.nlink) !== 1 ||
+        !sameExternalLocalStableMetadata(initial, opened)) {
+      throw new SupervisorIntegrationError(
+        'PREIMAGE_UNSAFE',
+        `owned file changed while it was opened: ${absolute}`,
+      )
+    }
+    const bytes = fs.readFileSync(descriptor)
+    const after = fs.fstatSync(descriptor)
+    const live = externalLocalLstat(absolute)
+    if (!sameExternalLocalStableMetadata(opened, after) ||
+        !sameExternalLocalStableMetadata(after, live) || bytes.length !== after.size) {
+      throw new SupervisorIntegrationError(
+        'PREIMAGE_UNSAFE',
+        `owned file changed while its exact bytes were captured: ${absolute}`,
+      )
+    }
+    return bytes
+  } catch (error) {
+    if (error instanceof SupervisorIntegrationError) throw error
+    throw new SupervisorIntegrationError(
+      'PREIMAGE_UNSAFE',
+      `owned file could not be opened without following links: ${absolute}`,
+      { cause: error.code || error.message },
+    )
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor)
+  }
+}
+
+function hashDirectoryState(directory, expectedRootStat = null) {
   const digest = crypto.createHash('sha256')
-  const visit = (current, relative) => {
-    const entries = fs.readdirSync(current, { withFileTypes: true })
+  const rootStat = expectedRootStat || externalLocalLstat(directory)
+  if (!rootStat || !rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new SupervisorIntegrationError(
+      'PREIMAGE_UNSAFE',
+      `owned directory is not one physical target: ${directory}`,
+    )
+  }
+  const flags = fs.constants.O_RDONLY | Number(fs.constants.O_DIRECTORY || 0) |
+    Number(fs.constants.O_NOFOLLOW || 0)
+  let rootDescriptor
+  const visit = (descriptor, relative, displayedPath, opened) => {
+    const anchor = externalLocalDirectoryDescriptorAnchor(descriptor)
+    const entries = fs.readdirSync(anchor, { withFileTypes: true })
       .sort((left, right) => left.name.localeCompare(right.name))
     for (const entry of entries) {
-      const absolute = path.join(current, entry.name)
+      const absolute = path.join(anchor, entry.name)
       const name = relative ? `${relative}/${entry.name}` : entry.name
-      const stat = fs.lstatSync(absolute)
-      if (stat.isSymbolicLink()) {
-        throw new SupervisorIntegrationError('PREIMAGE_UNSAFE', `owned directory contains a symbolic link: ${absolute}`)
+      const stat = externalLocalLstat(absolute)
+      if (!stat || stat.isSymbolicLink()) {
+        throw new SupervisorIntegrationError(
+          'PREIMAGE_UNSAFE',
+          `owned directory contains a missing or linked entry: ${path.join(displayedPath, entry.name)}`,
+        )
       }
       if (stat.isDirectory()) {
-        digest.update(`directory\0${name}\0${stat.mode & 0o777}\0`)
-        visit(absolute, name)
+        let childDescriptor
+        try {
+          childDescriptor = fs.openSync(absolute, flags)
+          const openedChild = fs.fstatSync(childDescriptor)
+          if (!openedChild.isDirectory() ||
+              !sameExternalLocalStableMetadata(stat, openedChild)) {
+            throw new SupervisorIntegrationError(
+              'PREIMAGE_UNSAFE',
+              `owned directory entry changed while it was opened: ${path.join(displayedPath, entry.name)}`,
+            )
+          }
+          digest.update(`directory\0${name}\0${openedChild.mode & 0o777}\0`)
+          visit(childDescriptor, name, path.join(displayedPath, entry.name), openedChild)
+        } finally {
+          if (childDescriptor !== undefined) fs.closeSync(childDescriptor)
+        }
       } else if (stat.isFile() && Number(stat.nlink) === 1) {
+        const bytes = readStableExternalLocalFile(absolute, stat)
         digest.update(`file\0${name}\0${stat.mode & 0o777}\0${stat.size}\0`)
-        digest.update(fs.readFileSync(absolute))
+        digest.update(bytes)
         digest.update('\0')
       } else {
-        throw new SupervisorIntegrationError('PREIMAGE_UNSAFE', `owned directory contains an unsafe entry: ${absolute}`)
+        throw new SupervisorIntegrationError(
+          'PREIMAGE_UNSAFE',
+          `owned directory contains an unsafe entry: ${path.join(displayedPath, entry.name)}`,
+        )
       }
     }
+    const after = fs.fstatSync(descriptor)
+    const live = externalLocalLstat(displayedPath)
+    if (!sameExternalLocalStableMetadata(opened, after) ||
+        !sameExternalLocalStableMetadata(after, live)) {
+      throw new SupervisorIntegrationError(
+        'PREIMAGE_UNSAFE',
+        `owned directory changed while its exact tree was captured: ${displayedPath}`,
+      )
+    }
   }
-  visit(directory, '')
-  return digest.digest('hex')
+  try {
+    rootDescriptor = fs.openSync(directory, flags)
+    const openedRoot = fs.fstatSync(rootDescriptor)
+    if (!openedRoot.isDirectory() ||
+        !sameExternalLocalStableMetadata(rootStat, openedRoot)) {
+      throw new SupervisorIntegrationError(
+        'PREIMAGE_UNSAFE',
+        `owned directory changed while it was opened: ${directory}`,
+      )
+    }
+    visit(rootDescriptor, '', directory, openedRoot)
+    return digest.digest('hex')
+  } catch (error) {
+    if (error instanceof SupervisorIntegrationError) throw error
+    throw new SupervisorIntegrationError(
+      'PREIMAGE_UNSAFE',
+      `owned directory could not be captured without following links: ${directory}`,
+      { cause: error.code || error.message },
+    )
+  } finally {
+    if (rootDescriptor !== undefined) fs.closeSync(rootDescriptor)
+  }
 }
 
 function resourceStateEntry(repository, resource, options = {}) {
   const absolute = resolveOwnedResourcePath(repository, resource, options)
   if (!absolute) return null
-  if (!fs.existsSync(absolute)) {
-    return Object.freeze({ path: absolute, hash: MISSING_RESOURCE_PREIMAGE_HASH, type: 'missing', mode: null })
+  if (options.allowExplicitExternalLocal === true && pathOutsideRoot(repository, absolute)) {
+    return externalLocalPhysicalState(absolute)
   }
-  const stat = fs.lstatSync(absolute)
-  // A regular file must have one physical link. A directory's link count is
-  // expected to exceed one as soon as it contains subdirectories (`.`/`..`),
-  // so applying the file invariant to checker snapshot roots rejects every
-  // non-empty snapshot before independent checking can start.
+  const stat = externalLocalLstat(absolute)
+  if (!stat) return Object.freeze({
+    path: absolute,
+    hash: MISSING_RESOURCE_PREIMAGE_HASH,
+    type: 'missing',
+    mode: null,
+  })
   if (stat.isSymbolicLink() || (stat.isFile() && Number(stat.nlink) !== 1)) {
-    throw new SupervisorIntegrationError('PREIMAGE_UNSAFE', `owned resource is not one physical target: ${absolute}`)
+    throw new SupervisorIntegrationError(
+      'PREIMAGE_UNSAFE',
+      `owned resource is not one physical target: ${absolute}`,
+    )
   }
   if (stat.isFile()) return Object.freeze({
     path: absolute,
-    hash: sha256Bytes(fs.readFileSync(absolute)),
+    hash: sha256Bytes(readStableExternalLocalFile(absolute, stat)),
     type: 'file',
     mode: stat.mode & 0o777,
   })
   if (stat.isDirectory()) return Object.freeze({
     path: absolute,
-    hash: hashDirectoryState(absolute),
+    hash: hashDirectoryState(absolute, stat),
     type: 'directory',
     mode: stat.mode & 0o777,
   })
-  throw new SupervisorIntegrationError('PREIMAGE_UNSAFE', `owned resource has an unsupported physical type: ${absolute}`)
+  throw new SupervisorIntegrationError(
+    'PREIMAGE_UNSAFE',
+    `owned resource has an unsupported physical type: ${absolute}`,
+  )
 }
 
 function externalLocalLstat(absolute) {
@@ -18230,7 +20537,292 @@ function externalLocalLstat(absolute) {
   }
 }
 
-function copyExternalLocalTree(source, destination) {
+function fsyncExternalLocalDirectory(directory) {
+  const authority = openExternalLocalDirectoryLineage(directory)
+  try {
+    if (!fs.fstatSync(authority.descriptor).isDirectory()) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+        `external local durability target is not one physical directory: ${directory}`,
+      )
+    }
+    fs.fsyncSync(authority.descriptor)
+    verifyExternalLocalDirectoryLineage(authority)
+  } finally {
+    fs.closeSync(authority.descriptor)
+  }
+}
+
+function createExternalLocalDirectoryDurably(directory, mode) {
+  withExternalLocalAnchoredLeaf(directory, (anchored, parentAuthority) => {
+    fs.mkdirSync(anchored, { mode })
+    fs.fsyncSync(parentAuthority.descriptor)
+  })
+}
+
+function writeExternalLocalRecordDurably(recordPath, bytes, mode) {
+  withExternalLocalAnchoredLeaf(recordPath, (anchored, parentAuthority) => {
+    const descriptor = fs.openSync(anchored, 'wx', mode)
+    try {
+      fs.writeFileSync(descriptor, bytes)
+      fs.fsyncSync(descriptor)
+    } finally {
+      fs.closeSync(descriptor)
+    }
+    fs.fsyncSync(parentAuthority.descriptor)
+  })
+}
+
+function fsyncExternalLocalTreeAnchored(absolute) {
+  const stat = externalLocalLstat(absolute)
+  if (!stat) return
+  if (stat.isSymbolicLink()) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+      `external local durability cannot follow a linked path: ${absolute}`,
+    )
+  }
+  if (stat.isFile()) {
+    const descriptor = fs.openSync(
+      absolute,
+      fs.constants.O_RDONLY | Number(fs.constants.O_NOFOLLOW || 0),
+    )
+    try {
+      const opened = fs.fstatSync(descriptor)
+      if (!opened.isFile() || Number(opened.nlink) !== 1 ||
+          !sameExternalLocalPhysicalEntry(stat, opened)) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+          `external local file changed before durability: ${absolute}`,
+        )
+      }
+      fs.fsyncSync(descriptor)
+    } finally {
+      fs.closeSync(descriptor)
+    }
+    return
+  }
+  if (!stat.isDirectory()) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+      `external local durability found an unsupported physical entry: ${absolute}`,
+    )
+  }
+  const descriptor = fs.openSync(
+    absolute,
+    fs.constants.O_RDONLY | Number(fs.constants.O_DIRECTORY || 0) |
+      Number(fs.constants.O_NOFOLLOW || 0),
+  )
+  try {
+    const opened = fs.fstatSync(descriptor)
+    if (!opened.isDirectory() || !sameExternalLocalPhysicalEntry(stat, opened)) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+        `external local directory changed before durability: ${absolute}`,
+      )
+    }
+    const anchor = externalLocalDirectoryDescriptorAnchor(descriptor)
+    for (const name of fs.readdirSync(anchor).sort()) {
+      fsyncExternalLocalTreeAnchored(path.join(anchor, name))
+    }
+    fs.fsyncSync(descriptor)
+  } finally {
+    fs.closeSync(descriptor)
+  }
+}
+
+function fsyncExternalLocalTree(absolute) {
+  return withExternalLocalAnchoredLeaf(absolute, (anchored, parentAuthority) => {
+    const result = fsyncExternalLocalTreeAnchored(anchored)
+    fs.fsyncSync(parentAuthority.descriptor)
+    return result
+  })
+}
+
+function sameExternalLocalPhysicalEntry(left, right) {
+  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino)
+}
+
+function externalLocalDirectoryDescriptorAnchor(descriptor) {
+  const candidates = process.platform === 'linux'
+    ? ['/proc/self/fd']
+    : ['/dev/fd', '/proc/self/fd']
+  const root = candidates.find(candidate => fs.existsSync(candidate))
+  if (!root || !Number.isInteger(fs.constants.O_DIRECTORY) ||
+      !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+      'safe external local directory publication requires a no-follow descriptor anchor',
+    )
+  }
+  return path.join(root, String(descriptor))
+}
+
+function openExternalLocalDirectoryLineage(directory) {
+  const resolved = path.resolve(directory)
+  const root = path.parse(resolved).root
+  const parts = path.relative(root, resolved).split(path.sep).filter(Boolean)
+  const flags = fs.constants.O_RDONLY | Number(fs.constants.O_DIRECTORY || 0) |
+    Number(fs.constants.O_NOFOLLOW || 0)
+  let descriptor
+  const lineage = []
+  try {
+    descriptor = fs.openSync(root, flags)
+    let opened = fs.fstatSync(descriptor)
+    if (!opened.isDirectory()) throw new Error('filesystem root is not a directory')
+    lineage.push(Object.freeze({ name: root, dev: String(opened.dev), ino: String(opened.ino) }))
+    for (const part of parts) {
+      const nextPath = path.join(externalLocalDirectoryDescriptorAnchor(descriptor), part)
+      const next = fs.openSync(nextPath, flags)
+      opened = fs.fstatSync(next)
+      if (!opened.isDirectory()) {
+        fs.closeSync(next)
+        throw new Error(`path component is not a directory: ${part}`)
+      }
+      fs.closeSync(descriptor)
+      descriptor = next
+      lineage.push(Object.freeze({
+        name: part,
+        dev: String(opened.dev),
+        ino: String(opened.ino),
+      }))
+    }
+    return Object.freeze({
+      directory: resolved,
+      descriptor,
+      lineage: Object.freeze(lineage),
+    })
+  } catch (error) {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor) } catch {}
+    }
+    throw new SupervisorIntegrationError(
+      'MISSION_PATH_INVALID',
+      `absolute local path traverses a missing, linked, or unstable directory: ${resolved}`,
+      { cause: error.code || error.message },
+    )
+  }
+}
+
+function verifyExternalLocalDirectoryLineage(authority) {
+  const reopened = openExternalLocalDirectoryLineage(authority.directory)
+  try {
+    if (stableStringify(reopened.lineage) !== stableStringify(authority.lineage)) {
+      throw new SupervisorIntegrationError(
+        'MISSION_PATH_INVALID',
+        `absolute local directory lineage changed during use: ${authority.directory}`,
+      )
+    }
+  } finally {
+    fs.closeSync(reopened.descriptor)
+  }
+}
+
+function withExternalLocalAnchoredLeaf(absolute, operation) {
+  const resolved = path.resolve(absolute)
+  if (resolved === path.parse(resolved).root) {
+    throw new SupervisorIntegrationError(
+      'MISSION_PATH_INVALID',
+      'an exact external local resource cannot be the filesystem root',
+    )
+  }
+  const authority = openExternalLocalDirectoryLineage(path.dirname(resolved))
+  try {
+    const anchored = path.join(
+      externalLocalDirectoryDescriptorAnchor(authority.descriptor),
+      path.basename(resolved),
+    )
+    const result = operation(anchored, authority)
+    verifyExternalLocalDirectoryLineage(authority)
+    return result
+  } finally {
+    fs.closeSync(authority.descriptor)
+  }
+}
+
+function renameExternalLocalTreeNoReplace(source, destination) {
+  return withExternalLocalAnchoredLeaf(source, (anchoredSource, sourceAuthority) =>
+    withExternalLocalAnchoredLeaf(destination, (anchoredDestination, destinationAuthority) => {
+      if (!externalLocalLstat(anchoredSource) || externalLocalLstat(anchoredDestination)) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_ROLLBACK_STALE',
+          `external local atomic capture source or destination changed: ${source}`,
+        )
+      }
+      try {
+        fs.renameSync(anchoredSource, anchoredDestination)
+      } catch (error) {
+        if (error && error.code === 'EXDEV') {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_CROSS_DEVICE_UNSUPPORTED',
+            `external local atomic capture crossed a filesystem boundary: ${source}`,
+            { cause: error.code, source, destination },
+          )
+        }
+        throw error
+      }
+      fs.fsyncSync(sourceAuthority.descriptor)
+      fs.fsyncSync(destinationAuthority.descriptor)
+      if (externalLocalLstat(anchoredSource) || !externalLocalLstat(anchoredDestination)) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_ROLLBACK_STALE',
+          `external local atomic capture did not publish its exact destination: ${destination}`,
+        )
+      }
+      return destination
+    }))
+}
+
+function externalLocalPhysicalState(absolute) {
+  const resolved = path.resolve(absolute)
+  try {
+    return withExternalLocalAnchoredLeaf(resolved, anchored => {
+      const stat = externalLocalLstat(anchored)
+      if (!stat) return Object.freeze({
+        path: resolved,
+        hash: MISSING_RESOURCE_PREIMAGE_HASH,
+        type: 'missing',
+        mode: null,
+      })
+      if (stat.isSymbolicLink() || (stat.isFile() && Number(stat.nlink) !== 1)) {
+        throw new SupervisorIntegrationError(
+          'PREIMAGE_UNSAFE',
+          `owned resource is not one physical target: ${resolved}`,
+        )
+      }
+      if (stat.isFile()) return Object.freeze({
+        path: resolved,
+        hash: sha256Bytes(readStableExternalLocalFile(anchored, stat)),
+        type: 'file',
+        mode: stat.mode & 0o777,
+      })
+      if (stat.isDirectory()) return Object.freeze({
+        path: resolved,
+        hash: hashDirectoryState(anchored, stat),
+        type: 'directory',
+        mode: stat.mode & 0o777,
+      })
+      throw new SupervisorIntegrationError(
+        'PREIMAGE_UNSAFE',
+        `owned resource has an unsupported physical type: ${resolved}`,
+      )
+    })
+  } catch (error) {
+    if (error && error.code === 'MISSION_PATH_INVALID' &&
+        error.details && error.details.cause === 'ENOENT') {
+      assertNoLinkedAbsolutePathPrefix(resolved)
+      return Object.freeze({
+        path: resolved,
+        hash: MISSING_RESOURCE_PREIMAGE_HASH,
+        type: 'missing',
+        mode: null,
+      })
+    }
+    throw error
+  }
+}
+
+function copyExternalLocalTreeAnchored(source, destination) {
   const stat = fs.lstatSync(source)
   if (stat.isSymbolicLink() || (stat.isFile() && Number(stat.nlink) !== 1)) {
     throw new SupervisorIntegrationError(
@@ -18239,14 +20831,39 @@ function copyExternalLocalTree(source, destination) {
     )
   }
   if (stat.isFile()) {
-    const descriptor = fs.openSync(destination, 'wx', stat.mode & 0o777)
-    try {
-      fs.writeFileSync(descriptor, fs.readFileSync(source))
-      fs.fsyncSync(descriptor)
-    } finally {
-      fs.closeSync(descriptor)
+    const sourceDescriptor = fs.openSync(
+      source,
+      fs.constants.O_RDONLY | Number(fs.constants.O_NOFOLLOW || 0),
+    )
+    const openedSource = fs.fstatSync(sourceDescriptor)
+    if (!openedSource.isFile() || Number(openedSource.nlink) !== 1 ||
+        !sameExternalLocalPhysicalEntry(openedSource, stat)) {
+      fs.closeSync(sourceDescriptor)
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+        `external local transaction source changed while it was opened: ${source}`,
+      )
     }
-    fs.chmodSync(destination, stat.mode & 0o777)
+    let descriptor
+    try {
+      descriptor = fs.openSync(destination, 'wx', stat.mode & 0o777)
+      const openedDestination = fs.fstatSync(descriptor)
+      fs.writeFileSync(descriptor, fs.readFileSync(sourceDescriptor))
+      fs.fchmodSync(descriptor, stat.mode & 0o777)
+      fs.fsyncSync(descriptor)
+      const published = externalLocalLstat(destination)
+      if (!published || !published.isFile() || published.isSymbolicLink() ||
+          Number(published.nlink) !== 1 ||
+          !sameExternalLocalPhysicalEntry(openedDestination, published)) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_ROLLBACK_STALE',
+          `external local file destination changed during no-replace publication: ${destination}`,
+        )
+      }
+    } finally {
+      if (descriptor !== undefined) fs.closeSync(descriptor)
+      fs.closeSync(sourceDescriptor)
+    }
     return
   }
   if (!stat.isDirectory()) {
@@ -18255,49 +20872,207 @@ function copyExternalLocalTree(source, destination) {
       `external local transaction found an unsupported physical entry: ${source}`,
     )
   }
-  fs.mkdirSync(destination, { mode: stat.mode & 0o777 })
-  for (const name of fs.readdirSync(source).sort()) {
-    copyExternalLocalTree(path.join(source, name), path.join(destination, name))
+  // Resolve descriptor support before creating a public path. Once the
+  // directory exists, all recursive writes and metadata changes are anchored
+  // to the opened inode rather than to an externally swappable pathname.
+  const directoryFlags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY |
+    fs.constants.O_NOFOLLOW
+  externalLocalDirectoryDescriptorAnchor(0)
+  let sourceDescriptor
+  try {
+    sourceDescriptor = fs.openSync(source, directoryFlags)
+  } catch (error) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+      `external local source directory could not be opened without following links: ${source}`,
+      { cause: error.code || error.message },
+    )
   }
-  fs.chmodSync(destination, stat.mode & 0o777)
+  const openedSource = fs.fstatSync(sourceDescriptor)
+  if (!openedSource.isDirectory() ||
+      !sameExternalLocalStableMetadata(stat, openedSource)) {
+    fs.closeSync(sourceDescriptor)
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+      `external local source directory changed while it was opened: ${source}`,
+    )
+  }
+  try {
+    fs.mkdirSync(destination, { mode: stat.mode & 0o777 })
+  } catch (error) {
+    fs.closeSync(sourceDescriptor)
+    throw error
+  }
+  const created = externalLocalLstat(destination)
+  if (!created || !created.isDirectory() || created.isSymbolicLink()) {
+    fs.closeSync(sourceDescriptor)
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_ROLLBACK_STALE',
+      `external local directory destination changed during creation: ${destination}`,
+    )
+  }
+  let descriptor
+  try {
+    descriptor = fs.openSync(destination, directoryFlags)
+    const opened = fs.fstatSync(descriptor)
+    if (!opened.isDirectory() || !sameExternalLocalPhysicalEntry(opened, created)) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_ROLLBACK_STALE',
+        `external local directory destination changed while it was opened: ${destination}`,
+      )
+    }
+    const anchoredSource = externalLocalDirectoryDescriptorAnchor(sourceDescriptor)
+    const anchoredDestination = externalLocalDirectoryDescriptorAnchor(descriptor)
+    fs.fchmodSync(descriptor, stat.mode & 0o777)
+    for (const name of fs.readdirSync(anchoredSource).sort()) {
+      copyExternalLocalTreeAnchored(
+        path.join(anchoredSource, name),
+        path.join(anchoredDestination, name),
+      )
+    }
+    fs.fsyncSync(descriptor)
+    const sourceAfter = fs.fstatSync(sourceDescriptor)
+    const sourceLive = externalLocalLstat(source)
+    if (!sameExternalLocalStableMetadata(openedSource, sourceAfter) ||
+        !sameExternalLocalStableMetadata(sourceAfter, sourceLive)) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+        `external local source directory changed while it was copied: ${source}`,
+      )
+    }
+    const published = externalLocalLstat(destination)
+    if (!published || !published.isDirectory() || published.isSymbolicLink() ||
+        !sameExternalLocalPhysicalEntry(opened, published)) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_ROLLBACK_STALE',
+        `external local directory destination changed during no-replace publication: ${destination}`,
+      )
+    }
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor)
+    fs.closeSync(sourceDescriptor)
+  }
+}
+
+function copyExternalLocalTree(source, destination) {
+  return withExternalLocalAnchoredLeaf(source, anchoredSource =>
+    withExternalLocalAnchoredLeaf(destination, (anchoredDestination, destinationAuthority) => {
+      const result = copyExternalLocalTreeAnchored(anchoredSource, anchoredDestination)
+      fs.fsyncSync(destinationAuthority.descriptor)
+      return result
+    }))
+}
+
+function publishPreparedExternalLocalTreeNoReplace(source, destination) {
+  copyExternalLocalTree(source, destination)
+}
+
+function freezeExternalLocalTreeNoReplace(source, destination, expectedState) {
+  const existing = externalLocalLstat(destination)
+  if (existing) {
+    const frozen = externalLocalTransactionState(destination)
+    if (!externalLocalStateMatches(frozen, expectedState)) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+        `external local immutable snapshot is incomplete or foreign: ${destination}`,
+      )
+    }
+    return frozen
+  }
+  const pending = `${destination}.pending-${hashText(stableStringify({
+    hash: expectedState.hash,
+    type: expectedState.type,
+    mode: expectedState.mode,
+  })).slice(0, 24)}`
+  const pendingState = externalLocalLstat(pending)
+  if (pendingState) {
+    let reusable = false
+    try {
+      reusable = externalLocalStateMatches(
+        externalLocalTransactionState(pending),
+        expectedState,
+      )
+    } catch (_) {}
+    if (!reusable) removeExternalLocalTreeNoFollow(pending)
+  }
+  if (!externalLocalLstat(pending)) copyExternalLocalTree(source, pending)
+  const prepared = externalLocalTransactionState(pending)
+  if (!externalLocalStateMatches(prepared, expectedState)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+      `external local source changed while its immutable snapshot was prepared: ${source}`,
+    )
+  }
+  fsyncExternalLocalDirectory(path.dirname(destination))
+  if (externalLocalLstat(destination)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+      `external local immutable snapshot destination appeared during publication: ${destination}`,
+    )
+  }
+  renameExternalLocalTreeNoReplace(pending, destination)
+  fsyncExternalLocalDirectory(path.dirname(destination))
+  const frozen = externalLocalTransactionState(destination)
+  if (!externalLocalStateMatches(frozen, expectedState)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+      `external local immutable snapshot changed during publication: ${destination}`,
+    )
+  }
+  return frozen
+}
+
+function publishExternalLocalTreeNoReplace(source, destination, _transactionIdentity) {
+  const sourceState = externalLocalTransactionState(source)
+  if (sourceState.type === 'missing') {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
+      `external local publication source is missing: ${source}`,
+    )
+  }
+  if (externalLocalLstat(destination)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_ROLLBACK_STALE',
+      `external local destination appeared before no-replace publication: ${destination}`,
+    )
+  }
+  try {
+    publishPreparedExternalLocalTreeNoReplace(source, destination)
+  } catch (error) {
+    if (error instanceof SupervisorIntegrationError) throw error
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_ROLLBACK_STALE',
+      `external local destination appeared during no-replace publication: ${destination}`,
+      { cause: error.code || error.message },
+    )
+  }
+  const published = externalLocalTransactionState(destination)
+  if (!externalLocalStateMatches(published, sourceState)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_ROLLBACK_STALE',
+      `external local destination changed during no-replace publication: ${destination}`,
+    )
+  }
+  return published
 }
 
 function removeExternalLocalTreeNoFollow(absolute) {
-  const stat = externalLocalLstat(absolute)
-  if (!stat) return
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    fs.unlinkSync(absolute)
-    return
-  }
-  for (const name of fs.readdirSync(absolute).sort().reverse()) {
-    removeExternalLocalTreeNoFollow(path.join(absolute, name))
-  }
-  fs.rmdirSync(absolute)
+  return withExternalLocalAnchoredLeaf(absolute, (anchored, parentAuthority) => {
+    const stat = externalLocalLstat(anchored)
+    if (!stat) return
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      fs.unlinkSync(anchored)
+    } else {
+      // The parent descriptor fixes the namespace used by recursive removal;
+      // an externally swapped prefix cannot redirect cleanup outside it.
+      fs.rmSync(anchored, { recursive: true, force: false, maxRetries: 0 })
+    }
+    fs.fsyncSync(parentAuthority.descriptor)
+  })
 }
 
 function externalLocalTransactionState(absolute) {
-  const stat = externalLocalLstat(absolute)
-  if (!stat) return Object.freeze({
-    path: path.resolve(absolute), hash: MISSING_RESOURCE_PREIMAGE_HASH, type: 'missing', mode: null,
-  })
-  if (stat.isSymbolicLink() || (stat.isFile() && Number(stat.nlink) !== 1)) {
-    throw new SupervisorIntegrationError(
-      'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
-      `external local transaction path is not one physical target: ${absolute}`,
-    )
-  }
-  if (stat.isFile()) return Object.freeze({
-    path: path.resolve(absolute), hash: sha256Bytes(fs.readFileSync(absolute)),
-    type: 'file', mode: stat.mode & 0o777,
-  })
-  if (stat.isDirectory()) return Object.freeze({
-    path: path.resolve(absolute), hash: hashDirectoryState(absolute),
-    type: 'directory', mode: stat.mode & 0o777,
-  })
-  throw new SupervisorIntegrationError(
-    'EXTERNAL_LOCAL_TRANSACTION_UNSAFE',
-    `external local transaction path has an unsupported physical type: ${absolute}`,
-  )
+  return externalLocalPhysicalState(absolute)
 }
 
 function validateExternalLocalTransactionBoundary(boundary) {
@@ -18355,11 +21130,97 @@ function validateExternalLocalTransactionBoundary(boundary) {
   return boundary
 }
 
-function rollbackExplicitExternalLocalBoundary(boundary, repository) {
+function externalLocalStateMatches(actual, expected) {
+  return Boolean(actual && expected && actual.hash === expected.hash &&
+    actual.type === expected.type && actual.mode === expected.mode)
+}
+
+function expectedExternalLocalRollbackStates(verified, admission, options = {}) {
+  if (admission !== null && admission !== undefined) {
+    if (!admission || !Array.isArray(admission.resources) ||
+        admission.resources.length !== verified.resources.length) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_ROLLBACK_STALE',
+        'external local rollback lacks one exact admitted postimage for every owned path',
+      )
+    }
+    return Object.freeze(verified.resources.map(resource => {
+      const expected = admission.resources.find(item => item.identity === resource.identity)
+      if (!expected || !['missing', 'file', 'directory'].includes(expected.type) ||
+          !/^[a-f0-9]{64}$/u.test(expected.hash || '') ||
+          (!Number.isSafeInteger(expected.mode) && expected.mode !== null)) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_ROLLBACK_STALE',
+          `external local rollback admission is foreign: ${resource.identity}`,
+        )
+      }
+      return Object.freeze({
+        identity: resource.identity,
+        hash: expected.hash,
+        type: expected.type,
+        mode: expected.mode,
+      })
+    }))
+  }
+  return Object.freeze(verified.resources.map(resource => {
+    if (typeof resource.materializedHash === 'string' &&
+        ['missing', 'file', 'directory'].includes(resource.materializedType) &&
+        (Number.isSafeInteger(resource.materializedMode) || resource.materializedMode === null)) {
+      return Object.freeze({
+        identity: resource.identity,
+        hash: resource.materializedHash,
+        type: resource.materializedType,
+        mode: resource.materializedMode,
+      })
+    }
+    if (options.allowUnboundRecovery === true) {
+      // A materialization crash may occur before this controller durably binds
+      // a placeholder identity. Never adopt whatever subsequently appeared at
+      // the public path as controller-owned cleanup authority. The immutable
+      // preimage is the only safe expectation; a foreign arrival becomes a
+      // retained CAS conflict rather than something rollback may delete.
+      return Object.freeze({
+        identity: resource.identity,
+        hash: resource.preimage.hash,
+        type: resource.preimage.type,
+        mode: resource.preimage.mode,
+      })
+    }
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_ROLLBACK_STALE',
+      `external local rollback has no exact owned postimage: ${resource.identity}`,
+    )
+  }))
+}
+
+function restoreCapturedExternalLocalTrees(captured, transactionIdentity = 'external-local-rollback') {
+  const conflicts = []
+  for (const item of [...captured].reverse()) {
+    if (item.restored === true) continue
+    if (!externalLocalLstat(item.discardPath)) continue
+    if (externalLocalLstat(item.identity)) {
+      conflicts.push(item.identity)
+      continue
+    }
+    try {
+      publishExternalLocalTreeNoReplace(
+        item.discardPath,
+        item.identity,
+        transactionIdentity,
+      )
+    } catch (_) {
+      conflicts.push(item.identity)
+    }
+  }
+  return Object.freeze(conflicts.sort())
+}
+
+function rollbackExplicitExternalLocalBoundary(boundary, repository, admission = null, options = {}) {
   if (!boundary || !boundary.transaction) {
     return removeUnchangedExternalLocalPlaceholders(boundary, repository)
   }
   const verified = validateExternalLocalTransactionBoundary(boundary)
+  const expectedStates = expectedExternalLocalRollbackStates(verified, admission, options)
   // Verify every retained preimage before touching any external path. A
   // corrupt backup must fail closed without a partial rollback.
   for (const resource of verified.resources) {
@@ -18373,14 +21234,103 @@ function rollbackExplicitExternalLocalBoundary(boundary, repository) {
       )
     }
   }
+  const discardRoot = path.join(verified.transaction.root, 'rollback-discard')
+  assertNoLinkedAbsolutePathPrefix(discardRoot)
+  if (!fs.existsSync(discardRoot)) createExternalLocalDirectoryDurably(discardRoot, 0o700)
+  assertNoLinkedAbsolutePathPrefix(discardRoot)
+  const captured = []
+  try {
+    // Atomically move every exact live postimage below the controller-owned
+    // transaction root before traversing or deleting it. Revalidate the moved
+    // inode's full state against the inspection-bound postimage. A later
+    // writer therefore survives as a CAS conflict instead of being erased by
+    // rollback, and a leaf swap cannot redirect recursive removal.
+    for (let index = 0; index < verified.resources.length; index += 1) {
+      const resource = verified.resources[index]
+      const expected = expectedStates[index]
+      const discardPath = path.join(
+        discardRoot,
+        `${index}-${hashText(resource.identity).slice(0, 24)}`,
+      )
+      const existingDiscard = externalLocalLstat(discardPath)
+      const live = externalLocalLstat(resource.identity)
+      let alreadyRestored = false
+      if (existingDiscard) {
+        if (live) {
+          const liveState = externalLocalTransactionState(resource.identity)
+          alreadyRestored = externalLocalStateMatches(liveState, resource.preimage)
+          if (!alreadyRestored) {
+            throw new SupervisorIntegrationError(
+              'EXTERNAL_LOCAL_ROLLBACK_STALE',
+              `external local rollback found a foreign path beside its captured postimage: ${resource.identity}`,
+            )
+          }
+        }
+      } else if (!live) {
+        if (expected.type !== 'missing') {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_ROLLBACK_STALE',
+            `external local postimage disappeared before rollback: ${resource.identity}`,
+          )
+        }
+        continue
+      } else {
+        if (expected.type === 'missing') {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_ROLLBACK_STALE',
+            `external local path appeared after its missing postimage was admitted: ${resource.identity}`,
+          )
+        }
+        assertNoLinkedAbsolutePathPrefix(path.dirname(resource.identity), resource.identity)
+        renameExternalLocalTreeNoReplace(resource.identity, discardPath)
+      }
+      const capturedState = externalLocalTransactionState(discardPath)
+      const capturedItem = { identity: resource.identity, discardPath, restored: alreadyRestored }
+      captured.push(capturedItem)
+      if (!externalLocalStateMatches(capturedState, expected)) {
+        const restoreConflicts = restoreCapturedExternalLocalTrees(
+          captured,
+          verified.transaction.root,
+        )
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_ROLLBACK_STALE',
+          `external local postimage changed after admission: ${resource.identity}`,
+          { restoreConflicts },
+        )
+      }
+    }
+  } catch (error) {
+    const restoreConflicts = restoreCapturedExternalLocalTrees(
+      captured,
+      verified.transaction.root,
+    )
+    if (restoreConflicts.length > 0) {
+      error.details = { ...(error.details || {}), restoreConflicts }
+    }
+    throw error
+  }
   const restored = []
   for (const resource of [...verified.resources].reverse()) {
-    // The exact leaf may itself have been replaced with a link. Validate its
-    // parent chain, then unlink the leaf/tree without following any link.
-    assertNoLinkedAbsolutePathPrefix(path.dirname(resource.identity), resource.identity)
-    removeExternalLocalTreeNoFollow(resource.identity)
+    // Every admitted live postimage is now captured under the private root.
+    // A concurrent writer recreating the exact path makes no-replace restore
+    // fail without deleting or overwriting those later bytes.
+    const current = externalLocalTransactionState(resource.identity)
+    if (externalLocalStateMatches(current, resource.preimage)) {
+      restored.push(resource.identity)
+      continue
+    }
+    if (current.type !== 'missing') {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_ROLLBACK_STALE',
+        `external local path was recreated during rollback: ${resource.identity}`,
+      )
+    }
     if (resource.preimage.type !== 'missing') {
-      copyExternalLocalTree(resource.backupPath, resource.identity)
+      publishExternalLocalTreeNoReplace(
+        resource.backupPath,
+        resource.identity,
+        verified.transaction.root,
+      )
     }
     const after = externalLocalTransactionState(resource.identity)
     if (after.hash !== resource.preimage.hash || after.type !== resource.preimage.type ||
@@ -18392,7 +21342,24 @@ function rollbackExplicitExternalLocalBoundary(boundary, repository) {
     }
     restored.push(resource.identity)
   }
+  // A prior process can crash after publishing the exact preimage but before
+  // its durability barrier. Even when restart observes that already-restored
+  // state, repeat the file/tree and parent fsync and then revalidate it before
+  // deleting the only durable rollback authority.
+  for (const resource of verified.resources) {
+    fsyncExternalLocalTree(resource.identity)
+    const durable = externalLocalTransactionState(resource.identity)
+    if (!externalLocalStateMatches(durable, resource.preimage)) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_ROLLBACK_FAILED',
+        `external local resource changed while its restored preimage was made durable: ${resource.identity}`,
+      )
+    }
+  }
+  const transactionParent = path.dirname(verified.transaction.root)
   removeExternalLocalTreeNoFollow(verified.transaction.root)
+  removeExternalLocalControllerRecord(verified.transaction.setupJournalPath)
+  fsyncExternalLocalDirectory(transactionParent)
   return Object.freeze(restored.sort())
 }
 
@@ -18422,8 +21389,19 @@ function commitExplicitExternalLocalBoundary(boundary, admission = null, options
         `external local postimage changed after mutation admission: ${resource.identity}`,
       )
     }
+    if (current.type !== 'missing') fsyncExternalLocalTree(resource.identity)
+    fsyncExternalLocalDirectory(path.dirname(resource.identity))
+    const durable = externalLocalTransactionState(resource.identity)
+    if (!externalLocalStateMatches(durable, admitted)) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_ADMISSION_STALE',
+        `external local postimage changed while it was made durable: ${resource.identity}`,
+      )
+    }
   }
+  const transactionParent = path.dirname(verified.transaction.root)
   removeExternalLocalTreeNoFollow(verified.transaction.root)
+  fsyncExternalLocalDirectory(transactionParent)
   return Object.freeze(verified.resources.map(resource => resource.identity).sort())
 }
 
@@ -18451,13 +21429,20 @@ function quarantineExplicitExternalLocalBoundary(boundary, repository, options =
     })
   })
   const changed = states.filter(state => state.changed)
-  if (changed.length === 0) {
-    rollbackExplicitExternalLocalBoundary(verified, repository)
-    return null
-  }
   const quarantineRoot = verified.transaction.quarantineRoot
   assertNoLinkedAbsolutePathPrefix(path.dirname(quarantineRoot), quarantineRoot)
-  if (!fs.existsSync(quarantineRoot)) fs.mkdirSync(quarantineRoot, { mode: 0o700 })
+  if (!fs.existsSync(quarantineRoot)) {
+    createExternalLocalDirectoryDurably(quarantineRoot, 0o700)
+  }
+  assertNoLinkedAbsolutePathPrefix(quarantineRoot)
+  const quarantineRootState = externalLocalLstat(quarantineRoot)
+  if (!quarantineRootState || !quarantineRootState.isDirectory() ||
+      quarantineRootState.isSymbolicLink()) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+      'external local quarantine root is not one physical directory',
+    )
+  }
   const quarantineId = hashText(stableStringify({
     sourceWorkItemId: options.sourceWorkItemId,
     retryWorkItemId: options.retryWorkItemId,
@@ -18467,18 +21452,98 @@ function quarantineExplicitExternalLocalBoundary(boundary, repository, options =
   const recordRoot = path.join(quarantineRoot, quarantineId)
   const recordPath = path.join(recordRoot, 'quarantine.json')
   if (fs.existsSync(recordPath)) {
-    const reopened = JSON.parse(fs.readFileSync(recordPath, 'utf8'))
-    const pointer = externalLocalTransportQuarantinePointer({ recordPath })
-    rollbackExplicitExternalLocalBoundary(verified, repository)
+    const opened = readExternalLocalTransportQuarantineRecord({ recordPath })
+    const { record, pointer } = opened
+    if (record.recordRoot !== recordRoot || record.recordPath !== recordPath ||
+        record.sourceWorkItemId !== options.sourceWorkItemId ||
+        record.retryWorkItemId !== options.retryWorkItemId ||
+        record.transportReceiptHash !== options.transportReceiptHash ||
+        record.sourceBoundaryHash !== verified.boundaryHash) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+        'existing external local quarantine does not bind this exact transport boundary',
+      )
+    }
+    const authority = new Map(verified.resources.map(resource => [resource.identity, resource]))
+    const recorded = new Map()
+    for (const postimage of record.resources) {
+      const resource = authority.get(postimage.identity)
+      if (!resource || postimage.kind !== resource.kind ||
+          postimage.hash === resource.preimage.hash &&
+            postimage.type === resource.preimage.type &&
+            postimage.mode === resource.preimage.mode) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+          'existing external local quarantine contains a foreign or unchanged resource',
+        )
+      }
+      recorded.set(postimage.identity, postimage)
+    }
+    const resumeStates = verified.resources.map((resource, index) => {
+      const live = states[index]
+      const postimage = recorded.get(resource.identity)
+      const matchesRecorded = postimage && externalLocalStateMatches(live, postimage)
+      const matchesPreimage = externalLocalStateMatches(live, resource.preimage)
+      if (!matchesRecorded && !matchesPreimage) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_QUARANTINE_STALE',
+          `external local path changed after its quarantine journal was committed: ${resource.identity}`,
+        )
+      }
+      return Object.freeze({
+        identity: resource.identity,
+        hash: live.hash,
+        type: live.type,
+        mode: live.mode,
+      })
+    })
+    if (resumeStates.every((state, index) =>
+      externalLocalStateMatches(state, verified.resources[index].preimage))) return pointer
+    rollbackExplicitExternalLocalBoundary(verified, repository, { resources: resumeStates })
     return pointer
   }
-  fs.mkdirSync(recordRoot, { mode: 0o700 })
+  if (changed.length === 0) {
+    rollbackExplicitExternalLocalBoundary(verified, repository, { resources: states })
+    return null
+  }
+  if (!fs.existsSync(recordRoot)) {
+    createExternalLocalDirectoryDurably(recordRoot, 0o700)
+  } else {
+    assertNoLinkedAbsolutePathPrefix(recordRoot)
+    const recordRootStat = fs.lstatSync(recordRoot)
+    if (!recordRootStat.isDirectory() || recordRootStat.isSymbolicLink() ||
+        fs.realpathSync.native(recordRoot) !== path.resolve(recordRoot)) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+        'external local quarantine retry found a foreign private record root',
+      )
+    }
+    const expectedSnapshotNames = new Set(changed.flatMap((state, index) => {
+      if (state.type === 'missing') return []
+      const name = `postimage-${index}`
+      const pending = `${name}.pending-${hashText(stableStringify({
+        hash: state.hash,
+        type: state.type,
+        mode: state.mode,
+      })).slice(0, 24)}`
+      return [name, pending]
+    }))
+    if (fs.readdirSync(recordRoot).some(name => !expectedSnapshotNames.has(name))) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+        'external local quarantine retry found unrecognized private record bytes',
+      )
+    }
+  }
   const quarantined = changed.map((state, index) => {
     const snapshotPath = state.type === 'missing'
       ? null : path.join(recordRoot, `postimage-${index}`)
     if (snapshotPath) {
-      copyExternalLocalTree(state.identity, snapshotPath)
-      const copied = externalLocalTransactionState(snapshotPath)
+      const copied = freezeExternalLocalTreeNoReplace(
+        state.identity,
+        snapshotPath,
+        state,
+      )
       if (copied.hash !== state.hash || copied.type !== state.type || copied.mode !== state.mode) {
         throw new SupervisorIntegrationError(
           'EXTERNAL_LOCAL_QUARANTINE_TAMPERED',
@@ -18488,6 +21553,12 @@ function quarantineExplicitExternalLocalBoundary(boundary, repository, options =
     }
     return Object.freeze({ ...state, snapshotPath })
   })
+  // Snapshot bytes and their directory entries must be stable before the
+  // receipt journal becomes an authority and before rollback removes the
+  // public candidate. A restart can therefore either finish this same record
+  // or reopen the complete immutable record; it never observes a journal that
+  // names filesystem entries which were not durably published.
+  fsyncExternalLocalDirectory(recordRoot)
   const body = Object.freeze({
     schemaVersion: 1,
     kind: 'provider-transport-external-local-quarantine',
@@ -18500,18 +21571,223 @@ function quarantineExplicitExternalLocalBoundary(boundary, repository, options =
     resources: Object.freeze(quarantined),
   })
   const record = Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
-  fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, {
-    encoding: 'utf8', flag: 'wx', mode: 0o600,
-  })
-  rollbackExplicitExternalLocalBoundary(verified, repository)
+  writeExternalLocalRecordDurably(
+    recordPath,
+    `${JSON.stringify(record, null, 2)}\n`,
+    0o600,
+  )
+  rollbackExplicitExternalLocalBoundary(verified, repository, { resources: states })
   return externalLocalTransportQuarantinePointer({ recordPath })
 }
 
-function externalLocalTransportQuarantinePointer(options = {}) {
+function preserveExplicitExternalLocalCandidate(boundary, admission, options = {}) {
+  const verified = validateExternalLocalTransactionBoundary(boundary)
+  const reasonCode = typeof options.reasonCode === 'string' && options.reasonCode
+    ? options.reasonCode : 'EXECUTION_LIMIT_INTERRUPTED'
+  const workItemId = typeof options.workItemId === 'string' && options.workItemId
+    ? options.workItemId : null
+  const candidateHash = options.candidateHash
+  if (!workItemId || !/^[a-f0-9]{64}$/u.test(candidateHash || '') ||
+      !admission || !Array.isArray(admission.resources) ||
+      admission.resources.length !== verified.resources.length) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_SURVIVAL_INVALID',
+      'external local exact-version survival requires its physical admission and aggregate version hash',
+    )
+  }
+  const states = verified.resources.map(resource => {
+    const admitted = admission.resources.find(item => item.identity === resource.identity)
+    const current = externalLocalTransactionState(resource.identity)
+    const changed = current.hash !== resource.preimage.hash ||
+      current.type !== resource.preimage.type || current.mode !== resource.preimage.mode
+    if (!admitted || admitted.hash !== current.hash || admitted.type !== current.type ||
+        admitted.mode !== current.mode || admitted.changed !== changed) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_SURVIVAL_TAMPERED',
+        `external local exact version changed after physical admission: ${resource.identity}`,
+      )
+    }
+    return Object.freeze({
+      identity: resource.identity,
+      kind: resource.kind,
+      type: current.type,
+      hash: current.hash,
+      mode: current.mode,
+      changed,
+    })
+  })
+  const changed = states.filter(state => state.changed)
+  if (changed.length === 0) return null
+  const survivalBase = path.join(
+    path.dirname(path.resolve(verified.transaction.quarantineRoot)),
+    'external-local-candidate-survivals',
+  )
+  assertNoLinkedAbsolutePathPrefix(survivalBase)
+  const survivalBaseBefore = externalLocalLstat(survivalBase)
+  if (!survivalBaseBefore) createExternalLocalDirectoryDurably(survivalBase, 0o700)
+  assertNoLinkedAbsolutePathPrefix(survivalBase)
+  const survivalBaseState = externalLocalLstat(survivalBase)
+  if (!survivalBaseState || !survivalBaseState.isDirectory() ||
+      survivalBaseState.isSymbolicLink()) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_SURVIVAL_INVALID',
+      'external local exact-version survival root is not one physical directory',
+    )
+  }
+  const survivalId = hashText(stableStringify({
+    sourceBoundaryHash: verified.boundaryHash,
+    workItemId,
+    reasonCode,
+    candidateHash,
+    resources: changed,
+  }))
+  const recordRoot = path.join(survivalBase, survivalId)
+  const manifestPath = path.join(recordRoot, 'manifest.json')
+  // The deterministic record identity can pre-exist after a completed prior
+  // preservation. Validate it before the first postimage write; never let a
+  // hostile symlink at that identity redirect controller-owned evidence.
+  assertNoLinkedAbsolutePathPrefix(recordRoot)
+  if (!fs.existsSync(recordRoot)) createExternalLocalDirectoryDurably(recordRoot, 0o700)
+  assertNoLinkedAbsolutePathPrefix(recordRoot)
+  const recordRootState = externalLocalLstat(recordRoot)
+  if (!recordRootState || !recordRootState.isDirectory() || recordRootState.isSymbolicLink()) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_SURVIVAL_INVALID',
+      'external local exact-version survival record is not one physical directory',
+    )
+  }
+  const expectedResources = Object.freeze(changed.map((state, index) => Object.freeze({
+    ...state,
+    snapshotPath: state.type === 'missing'
+      ? null : path.join(recordRoot, `postimage-${index}`),
+  })))
+  if (!fs.existsSync(manifestPath)) {
+    const preserved = expectedResources.map(state => {
+      const snapshotPath = state.snapshotPath
+      if (snapshotPath) {
+        const copied = freezeExternalLocalTreeNoReplace(
+          state.identity,
+          snapshotPath,
+          state,
+        )
+        if (copied.hash !== state.hash || copied.type !== state.type || copied.mode !== state.mode) {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_SURVIVAL_TAMPERED',
+            `external local postimage changed while it was preserved: ${state.identity}`,
+          )
+        }
+      }
+      return state
+    })
+    fsyncExternalLocalDirectory(recordRoot)
+    const body = Object.freeze({
+      schemaVersion: 1,
+      kind: 'controller-owned-external-local-candidate-survival',
+      disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+      workItemId,
+      reasonCode,
+      candidateHash,
+      sourceBoundaryHash: verified.boundaryHash,
+      recordRoot,
+      manifestPath,
+      resources: Object.freeze(preserved),
+    })
+    const manifest = Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
+    writeExternalLocalRecordDurably(
+      manifestPath,
+      `${JSON.stringify(manifest, null, 2)}\n`,
+      0o400,
+    )
+  }
+  assertNoLinkedAbsolutePathPrefix(manifestPath)
+  const manifestState = externalLocalLstat(manifestPath)
+  if (!manifestState || !manifestState.isFile() || manifestState.isSymbolicLink() ||
+      Number(manifestState.nlink) !== 1) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_SURVIVAL_INVALID',
+      'external local exact-version survival manifest is not one physical file',
+    )
+  }
+  let manifest
+  try {
+    const noFollow = Number(fs.constants.O_NOFOLLOW || 0)
+    const descriptor = fs.openSync(manifestPath, fs.constants.O_RDONLY | noFollow)
+    try {
+      const opened = fs.fstatSync(descriptor)
+      if (!opened.isFile() || Number(opened.nlink) !== 1 ||
+          opened.dev !== manifestState.dev || opened.ino !== manifestState.ino) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_SURVIVAL_INVALID',
+          'external local exact-version survival manifest changed while it was opened',
+        )
+      }
+      manifest = JSON.parse(fs.readFileSync(descriptor, 'utf8'))
+    } finally {
+      fs.closeSync(descriptor)
+    }
+  } catch (error) {
+    if (error instanceof SupervisorIntegrationError) throw error
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_SURVIVAL_INVALID',
+      'external local exact-version survival manifest is missing or unreadable',
+      { cause: error.code || error.message },
+    )
+  }
+  const { bindingHash, ...body } = manifest || {}
+  if (!manifest || manifest.schemaVersion !== 1 ||
+      manifest.kind !== 'controller-owned-external-local-candidate-survival' ||
+      manifest.disposition !== 'PRESERVED_WITHOUT_DONE_AUTHORITY' ||
+      manifest.recordRoot !== recordRoot || manifest.manifestPath !== manifestPath ||
+      manifest.workItemId !== workItemId || manifest.reasonCode !== reasonCode ||
+      manifest.candidateHash !== candidateHash ||
+      manifest.sourceBoundaryHash !== verified.boundaryHash ||
+      !Array.isArray(manifest.resources) || manifest.resources.length !== changed.length ||
+      stableStringify(manifest.resources) !== stableStringify(expectedResources) ||
+      bindingHash !== hashText(stableStringify(body))) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_SURVIVAL_INVALID',
+      'external local exact-version survival manifest is foreign or corrupt',
+    )
+  }
+  for (const resource of manifest.resources) {
+    if (resource.snapshotPath !== null) assertNoLinkedAbsolutePathPrefix(resource.snapshotPath)
+    if (resource.type === 'missing') {
+      if (resource.snapshotPath !== null) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_SURVIVAL_INVALID',
+          'a deleted external local postimage unexpectedly carries preserved bytes',
+        )
+      }
+      continue
+    }
+    const copied = externalLocalTransactionState(resource.snapshotPath)
+    if (copied.hash !== resource.hash || copied.type !== resource.type || copied.mode !== resource.mode) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_SURVIVAL_TAMPERED',
+        `preserved external local postimage changed: ${resource.identity}`,
+      )
+    }
+  }
+  const pointerBody = Object.freeze({
+    schemaVersion: 1,
+    kind: 'controller-owned-external-local-candidate-survival-pointer',
+    disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+    candidateHash,
+    manifestPath,
+    manifestHash: hashText(stableStringify(manifest)),
+    changedPathCount: manifest.resources.length,
+  })
+  return Object.freeze({ ...pointerBody, pointerHash: hashText(stableStringify(pointerBody)) })
+}
+
+function readExternalLocalTransportQuarantineRecord(options = {}) {
   const recordPath = path.resolve(String(options.recordPath || ''))
   assertNoLinkedAbsolutePathPrefix(recordPath)
   let record
-  try { record = JSON.parse(fs.readFileSync(recordPath, 'utf8')) } catch (error) {
+  try {
+    const stat = externalLocalLstat(recordPath)
+    record = JSON.parse(readStableExternalLocalFile(recordPath, stat).toString('utf8'))
+  } catch (error) {
     throw new SupervisorIntegrationError(
       'EXTERNAL_LOCAL_QUARANTINE_NOT_FOUND',
       'external local transport quarantine journal is missing or unreadable',
@@ -18524,6 +21800,8 @@ function externalLocalTransportQuarantinePointer(options = {}) {
       record.recordPath !== recordPath || path.dirname(recordPath) !== record.recordRoot ||
       path.basename(recordPath) !== 'quarantine.json' ||
       !Array.isArray(record.resources) || record.resources.length === 0 ||
+      typeof record.sourceWorkItemId !== 'string' || !record.sourceWorkItemId ||
+      record.retryWorkItemId !== `${record.sourceWorkItemId}-transport-retry-1` ||
       !/^[a-f0-9]{64}$/u.test(record.transportReceiptHash || '') ||
       !/^[a-f0-9]{64}$/u.test(record.sourceBoundaryHash || '') ||
       !/^[a-f0-9]{64}$/u.test(bindingHash || '') ||
@@ -18534,9 +21812,11 @@ function externalLocalTransportQuarantinePointer(options = {}) {
     )
   }
   const identities = new Set()
+  const snapshotPaths = new Set()
   for (const resource of record.resources) {
     if (!resource || resource.identity !== path.resolve(resource.identity || '') ||
         identities.has(resource.identity) ||
+        resource.changed !== true ||
         !['missing', 'file', 'directory'].includes(resource.type) ||
         !/^[a-f0-9]{64}$/u.test(resource.hash || '') ||
         !Number.isSafeInteger(resource.mode) && resource.mode !== null) {
@@ -18557,14 +21837,17 @@ function externalLocalTransportQuarantinePointer(options = {}) {
     }
     const snapshotPath = path.resolve(resource.snapshotPath || '')
     if (path.dirname(snapshotPath) !== record.recordRoot ||
-        !/^postimage-\d+$/u.test(path.basename(snapshotPath))) {
+        !/^postimage-\d+$/u.test(path.basename(snapshotPath)) ||
+        snapshotPaths.has(snapshotPath)) {
       throw new SupervisorIntegrationError(
         'EXTERNAL_LOCAL_QUARANTINE_INVALID',
         'external local quarantine postimage escaped its exact controller root',
       )
     }
+    snapshotPaths.add(snapshotPath)
     assertNoLinkedAbsolutePathPrefix(snapshotPath)
   }
+  record = deepFreezeJson(record)
   const pointerBody = Object.freeze({
     schemaVersion: 1,
     kind: 'provider-transport-external-local-quarantine-pointer',
@@ -18574,7 +21857,15 @@ function externalLocalTransportQuarantinePointer(options = {}) {
     transportReceiptHash: record.transportReceiptHash,
     quarantineBindingHash: record.bindingHash,
   })
-  return Object.freeze({ ...pointerBody, pointerHash: hashText(stableStringify(pointerBody)) })
+  const pointer = Object.freeze({
+    ...pointerBody,
+    pointerHash: hashText(stableStringify(pointerBody)),
+  })
+  return Object.freeze({ record, pointer })
+}
+
+function externalLocalTransportQuarantinePointer(options = {}) {
+  return readExternalLocalTransportQuarantineRecord(options).pointer
 }
 
 function findExternalLocalTransportQuarantinePointer(options = {}) {
@@ -18608,7 +21899,10 @@ function seedExplicitExternalLocalBoundaryFromQuarantine(
   options = {},
 ) {
   const verified = validateExplicitExternalLocalBoundary(boundary, assignment, repository)
-  const reopened = externalLocalTransportQuarantinePointer({ recordPath: pointer && pointer.recordPath })
+  const opened = readExternalLocalTransportQuarantineRecord({
+    recordPath: pointer && pointer.recordPath,
+  })
+  const reopened = opened.pointer
   if (stableStringify(reopened) !== stableStringify(pointer) ||
       reopened.retryWorkItemId !== options.retryWorkItemId ||
       reopened.transportReceiptHash !== options.transportReceiptHash) {
@@ -18617,7 +21911,7 @@ function seedExplicitExternalLocalBoundaryFromQuarantine(
       'external local retry quarantine pointer changed before consumption',
     )
   }
-  const record = JSON.parse(fs.readFileSync(reopened.recordPath, 'utf8'))
+  const record = opened.record
   const authority = new Map(verified.resources.map(resource => [resource.identity, resource]))
   for (const postimage of record.resources) {
     const resource = authority.get(postimage.identity)
@@ -18639,19 +21933,235 @@ function seedExplicitExternalLocalBoundaryFromQuarantine(
       }
     }
   }
-  for (const postimage of record.resources) {
-    assertNoLinkedAbsolutePathPrefix(path.dirname(postimage.identity), postimage.identity)
-    removeExternalLocalTreeNoFollow(postimage.identity)
-    if (postimage.type !== 'missing') copyExternalLocalTree(postimage.snapshotPath, postimage.identity)
-    const seeded = externalLocalTransactionState(postimage.identity)
-    if (seeded.hash !== postimage.hash || seeded.type !== postimage.type || seeded.mode !== postimage.mode) {
-      throw new SupervisorIntegrationError(
-        'EXTERNAL_LOCAL_QUARANTINE_TAMPERED',
-        `external local retry did not receive its exact quarantined postimage: ${postimage.identity}`,
+  const resourceIndexes = new Map(
+    verified.resources.map((resource, index) => [resource.identity, index]),
+  )
+  const discardRoot = path.join(verified.transaction.root, 'quarantine-seed-discard')
+  assertNoLinkedAbsolutePathPrefix(discardRoot)
+  if (!fs.existsSync(discardRoot)) createExternalLocalDirectoryDurably(discardRoot, 0o700)
+  const processed = []
+  try {
+    for (const postimage of record.resources) {
+      const index = resourceIndexes.get(postimage.identity)
+      const resource = verified.resources[index]
+      if (typeof resource.materializedHash !== 'string' ||
+          !['missing', 'file', 'directory'].includes(resource.materializedType) ||
+          (!Number.isSafeInteger(resource.materializedMode) &&
+            resource.materializedMode !== null)) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+          `retry boundary lacks an exact materialized state: ${postimage.identity}`,
+        )
+      }
+      const expected = Object.freeze({
+        hash: resource.materializedHash,
+        type: resource.materializedType,
+        mode: resource.materializedMode,
+      })
+      const discardPath = path.join(
+        discardRoot,
+        `${index}-${hashText(resource.identity).slice(0, 24)}`,
       )
+      const failedPath = `${discardPath}-failed-postimage`
+      const intentPath = path.join(discardRoot, `seed-intent-${index}.json`)
+      const transition = { resource, postimage, discardPath, failedPath, captured: false }
+      processed.push(transition)
+      const intentBody = Object.freeze({
+        schemaVersion: 1,
+        kind: 'external-local-quarantine-seed-intent',
+        retryWorkItemId: options.retryWorkItemId,
+        transportReceiptHash: options.transportReceiptHash,
+        resourceIdentity: resource.identity,
+        expected,
+        postimage: Object.freeze({
+          hash: postimage.hash,
+          type: postimage.type,
+          mode: postimage.mode,
+        }),
+      })
+      const intent = Object.freeze({
+        ...intentBody,
+        bindingHash: hashText(stableStringify(intentBody)),
+      })
+      const intentPreexisting = Boolean(externalLocalLstat(intentPath))
+      if (intentPreexisting) {
+        let priorIntent
+        try {
+          const stat = externalLocalLstat(intentPath)
+          priorIntent = JSON.parse(readStableExternalLocalFile(intentPath, stat).toString('utf8'))
+        } catch (error) {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+            'external local retry seed intent is unreadable',
+            { cause: error.code || error.message },
+          )
+        }
+        if (stableStringify(priorIntent) !== stableStringify(intent)) {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_QUARANTINE_INVALID',
+            'external local retry seed intent is foreign or stale',
+          )
+        }
+      } else {
+        writeExternalLocalRecordDurably(
+          intentPath,
+          `${JSON.stringify(intent, null, 2)}\n`,
+          0o600,
+        )
+      }
+      assertNoLinkedAbsolutePathPrefix(path.dirname(postimage.identity), postimage.identity)
+      const existingDiscard = externalLocalLstat(discardPath)
+      let live = externalLocalTransactionState(postimage.identity)
+      if (existingDiscard) {
+        const captured = externalLocalTransactionState(discardPath)
+        if (!externalLocalStateMatches(captured, expected)) {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_QUARANTINE_STALE',
+            `external local retry captured state changed before quarantine seeding: ${postimage.identity}`,
+          )
+        }
+        transition.captured = true
+        if (externalLocalStateMatches(live, postimage)) {
+          transition.seeded = live
+          continue
+        }
+        if (live.type !== 'missing') {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_QUARANTINE_STALE',
+            `external local retry path changed after quarantine seeding began: ${postimage.identity}`,
+          )
+        }
+      } else if (expected.type === 'missing') {
+        if (externalLocalStateMatches(live, postimage) && intentPreexisting) {
+          transition.seeded = live
+          continue
+        }
+        if (live.type !== 'missing') {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_QUARANTINE_STALE',
+            `external local retry path appeared before quarantine seeding: ${postimage.identity}`,
+          )
+        }
+      } else {
+        if (live.type === 'missing') {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_QUARANTINE_STALE',
+            `external local retry materialization disappeared before quarantine seeding: ${postimage.identity}`,
+          )
+        }
+        // Capture the public pathname atomically before inspecting it. A
+        // writer that won before this rename is restored, never deleted; a
+        // writer that wins afterward blocks the no-replace publication.
+        renameExternalLocalTreeNoReplace(postimage.identity, discardPath)
+        transition.captured = true
+        const captured = externalLocalTransactionState(discardPath)
+        if (!externalLocalStateMatches(captured, expected)) {
+          throw new SupervisorIntegrationError(
+            'EXTERNAL_LOCAL_QUARANTINE_STALE',
+            `external local retry materialization changed during quarantine seeding: ${postimage.identity}`,
+          )
+        }
+        live = externalLocalTransactionState(postimage.identity)
+      }
+      if (postimage.type !== 'missing') {
+        publishExternalLocalTreeNoReplace(
+          postimage.snapshotPath,
+          postimage.identity,
+          verified.transaction.root,
+        )
+      }
+      const seeded = externalLocalTransactionState(postimage.identity)
+      if (!externalLocalStateMatches(seeded, postimage)) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_QUARANTINE_TAMPERED',
+          `external local retry did not receive its exact quarantined postimage: ${postimage.identity}`,
+        )
+      }
+      transition.seeded = seeded
     }
+    const seededResources = verified.resources.map((resource, index) => {
+      const transition = processed.find(item => resourceIndexes.get(item.resource.identity) === index)
+      if (!transition) return resource
+      return Object.freeze({
+        ...resource,
+        materializedHash: transition.seeded.hash,
+        materializedType: transition.seeded.type,
+        materializedMode: transition.seeded.mode,
+      })
+    })
+    const seededBoundary = persistExternalLocalBoundaryJournal(
+      seededResources,
+      verified.transaction,
+    )
+    // Retain captured materializations below the authenticated transaction
+    // root until commit/rollback removes that root. They are crash evidence,
+    // not public bytes, and make the journal update recoverable at every
+    // synchronous boundary.
+    return seededBoundary
+  } catch (error) {
+    const restoreConflicts = []
+    for (const transition of [...processed].reverse()) {
+      const desired = transition.postimage
+      const live = externalLocalTransactionState(transition.resource.identity)
+      if (live.type !== 'missing') {
+        if (externalLocalStateMatches(live, desired) &&
+            !externalLocalLstat(transition.failedPath)) {
+          try {
+            renameExternalLocalTreeNoReplace(
+              transition.resource.identity,
+              transition.failedPath,
+            )
+            const capturedDesired = externalLocalTransactionState(transition.failedPath)
+            if (!externalLocalStateMatches(capturedDesired, desired)) {
+              restoreConflicts.push(transition.resource.identity)
+              if (!externalLocalLstat(transition.resource.identity)) {
+                try {
+                  publishExternalLocalTreeNoReplace(
+                    transition.failedPath,
+                    transition.resource.identity,
+                    verified.transaction.root,
+                  )
+                } catch (_) {}
+              }
+            }
+          } catch (_) {
+            restoreConflicts.push(transition.resource.identity)
+          }
+        } else {
+          restoreConflicts.push(transition.resource.identity)
+        }
+      }
+      if (transition.captured && externalLocalLstat(transition.discardPath)) {
+        if (externalLocalLstat(transition.resource.identity)) {
+          restoreConflicts.push(transition.resource.identity)
+        } else {
+          try {
+            publishExternalLocalTreeNoReplace(
+              transition.discardPath,
+              transition.resource.identity,
+              verified.transaction.root,
+            )
+            removeExternalLocalTreeNoFollow(transition.discardPath)
+          } catch (_) {
+            restoreConflicts.push(transition.resource.identity)
+          }
+        }
+      }
+      if (externalLocalLstat(transition.failedPath) &&
+          !restoreConflicts.includes(transition.resource.identity)) {
+        removeExternalLocalTreeNoFollow(transition.failedPath)
+      }
+    }
+    if (restoreConflicts.length > 0 &&
+        error && (typeof error === 'object' || typeof error === 'function') &&
+        Object.isExtensible(error)) {
+      error.details = {
+        ...(error.details || {}),
+        restoreConflicts: [...new Set(restoreConflicts)].sort(),
+      }
+    }
+    throw error
   }
-  return Object.freeze(record.resources.map(resource => resource.identity).sort())
 }
 
 function transportQuarantineBundle(workerWorkspacePointer, externalLocalPointer) {
@@ -18672,6 +22182,53 @@ function transportQuarantineBundle(workerWorkspacePointer, externalLocalPointer)
     },
   })
   return Object.freeze(bundle)
+}
+
+function transportQuarantineCandidateEvidence(pointer, reasonCode) {
+  const local = pointer && pointer.workerWorkspace || null
+  const externalLocal = pointer && pointer.externalLocal || null
+  if (!local && !externalLocal) {
+    throw new SupervisorIntegrationError(
+      'WORKER_SURVIVAL_INVALID',
+      'transport settlement failure lacks an exact quarantined product pointer',
+    )
+  }
+  const body = Object.freeze({
+    schemaVersion: 1,
+    kind: 'controller-owned-transport-quarantine-survival-bundle',
+    disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+    reasonCode: typeof reasonCode === 'string' && reasonCode
+      ? reasonCode : 'CONTROLLER_SETTLEMENT_FAILURE',
+    local,
+    externalLocal,
+  })
+  return Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
+}
+
+function physicalCandidateSurvivalBundle(localPointer, externalPointer, options = {}) {
+  if (!localPointer && !externalPointer) return null
+  const candidateHash = options.candidateHash
+  const reasonCode = typeof options.reasonCode === 'string' && options.reasonCode
+    ? options.reasonCode : 'EXECUTION_LIMIT_INTERRUPTED'
+  if (!/^[a-f0-9]{64}$/u.test(candidateHash || '') ||
+      [localPointer, externalPointer].filter(Boolean)
+        .some(pointer => pointer.candidateHash !== candidateHash ||
+          pointer.disposition !== 'PRESERVED_WITHOUT_DONE_AUTHORITY')) {
+    throw new SupervisorIntegrationError(
+      'WORKER_SURVIVAL_INVALID',
+      'physical exact-version survival components do not bind one aggregate version',
+    )
+  }
+  const body = Object.freeze({
+    schemaVersion: 1,
+    kind: 'controller-owned-physical-candidate-survival-bundle',
+    disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+    reasonCode,
+    candidateHash,
+    local: localPointer || null,
+    externalLocal: externalPointer || null,
+  })
+  return Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
 }
 
 function explicitExternalLocalResources(assignment, repository) {
@@ -18744,46 +22301,317 @@ function candidateExternalLocalResources(ownership, repository, mission) {
   return explicitExternalLocalResources({ resources }, targetRoot)
 }
 
+function externalLocalBoundaryJournal(materialized, transaction) {
+  const body = Object.freeze({
+    schemaVersion: 1,
+    mode: 'explicit-external-local',
+    resources: Object.freeze(materialized.map(resource => Object.freeze({ ...resource }))),
+    writableRoots: Object.freeze(materialized.map(resource => resource.identity)),
+    transaction,
+  })
+  return Object.freeze({ ...body, boundaryHash: hashText(stableStringify(body)) })
+}
+
+function canonicalExternalLocalTransactionIdentity(input) {
+  const permit = input && input.permit
+  const isolation = input && input.isolation
+  const body = Object.freeze({
+    schemaVersion: 1,
+    kind: 'external-local-transaction-identity',
+    runId: String(input && input.runId || permit && permit.runId || ''),
+    activationId: String(input && input.activationId || permit && permit.activationId || ''),
+    workItemId: String(input && input.workItemId || ''),
+    schedulerLeaseId: String(input && (input.schedulerLeaseId || input.leaseId) || ''),
+    permitHash: hashText(stableStringify(permit || null)),
+    isolationBindingHash: String(
+      input && input.isolationBindingHash || isolation && isolation.bindingHash || '',
+    ),
+  })
+  if (![body.runId, body.activationId, body.workItemId, body.schedulerLeaseId,
+    body.isolationBindingHash].every(value => typeof value === 'string' && value.length > 0) ||
+      !/^[a-f0-9]{64}$/u.test(body.permitHash) ||
+      !/^[a-f0-9]{64}$/u.test(body.isolationBindingHash)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_INVALID',
+      'external local transaction identity must bind its run, activation, work item, lease, permit, and isolation',
+    )
+  }
+  return Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
+}
+
+function validateExternalLocalTransactionIdentity(identity) {
+  if (!identity || identity.schemaVersion !== 1 ||
+      identity.kind !== 'external-local-transaction-identity') {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_INVALID',
+      'external local transaction lacks its exact controller identity',
+    )
+  }
+  const { bindingHash, ...body } = identity
+  if (!/^[a-f0-9]{64}$/u.test(bindingHash || '') ||
+      hashText(stableStringify(body)) !== bindingHash ||
+      ![identity.runId, identity.activationId, identity.workItemId,
+        identity.schedulerLeaseId].every(value => typeof value === 'string' && value.length > 0) ||
+      !/^[a-f0-9]{64}$/u.test(identity.permitHash || '') ||
+      !/^[a-f0-9]{64}$/u.test(identity.isolationBindingHash || '')) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_INVALID',
+      'external local transaction identity is corrupt',
+    )
+  }
+  return identity
+}
+
+function externalLocalTerminalMutationBinding(boundary, permit, workerWorkspace) {
+  if (!boundary) return null
+  const verified = validateExternalLocalTransactionBoundary(boundary)
+  const identity = validateExternalLocalTransactionIdentity(verified.transaction.identity)
+  if (!permit || identity.permitHash !== hashText(stableStringify(permit)) ||
+      !workerWorkspace || workerWorkspace.binding.bindingHash !== identity.isolationBindingHash) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_INVALID',
+      'terminal external local binding differs from its exact permit or worker isolation',
+    )
+  }
+  const body = Object.freeze({
+    schemaVersion: 1,
+    kind: 'external-local-terminal-mutation-binding',
+    boundaryHash: verified.boundaryHash,
+    transactionRoot: verified.transaction.root,
+    journalPath: verified.transaction.journalPath,
+    setupJournalPath: verified.transaction.setupJournalPath,
+    commitRecordPath: verified.transaction.commitRecordPath,
+    transactionIdentity: identity,
+    permit,
+    isolationBindingHash: workerWorkspace.binding.bindingHash,
+    workerRecordPath: path.resolve(workerWorkspace.recordPath),
+    workerWorkspaceId: workerWorkspace.workspaceId,
+  })
+  return Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
+}
+
+function validateExternalLocalTerminalMutationBinding(binding) {
+  const { bindingHash, ...body } = binding || {}
+  if (!binding || binding.schemaVersion !== 1 ||
+      binding.kind !== 'external-local-terminal-mutation-binding' ||
+      bindingHash !== hashText(stableStringify(body)) ||
+      !sameCanonicalValue(
+        validateExternalLocalTransactionIdentity(binding.transactionIdentity),
+        binding.transactionIdentity,
+      ) ||
+      binding.transactionIdentity.permitHash !== hashText(stableStringify(binding.permit)) ||
+      binding.transactionIdentity.isolationBindingHash !== binding.isolationBindingHash ||
+      path.resolve(binding.transactionRoot) !== binding.transactionRoot ||
+      path.dirname(path.resolve(binding.journalPath)) !== binding.transactionRoot ||
+      path.resolve(binding.workerRecordPath) !== binding.workerRecordPath) {
+    throw new SupervisorIntegrationError(
+      'CRASH_ADOPTION_CONFLICT',
+      'terminal external local mutation binding is foreign or corrupt',
+    )
+  }
+  return binding
+}
+
+function externalLocalSetupJournal(transaction, resources, repository) {
+  const body = Object.freeze({
+    schemaVersion: 1,
+    kind: 'external-local-transaction-setup',
+    transactionRoot: path.resolve(transaction.root),
+    transactionIdentity: transaction.identity || null,
+    repository: path.resolve(repository),
+    resources: Object.freeze(resources.map(resource => Object.freeze({
+      kind: resource.kind,
+      identity: resource.identity,
+      expectedPreimageHash: resource.expectedPreimageHash,
+      expectedPreimageMode: resource.expectedPreimageMode ?? null,
+    }))),
+  })
+  return Object.freeze({ ...body, bindingHash: hashText(stableStringify(body)) })
+}
+
+function readExactExternalLocalSetupJournal(setupPath, expected) {
+  assertNoLinkedAbsolutePathPrefix(path.dirname(setupPath), setupPath)
+  let parsed
+  try { parsed = JSON.parse(fs.readFileSync(setupPath, 'utf8')) } catch (error) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+      'external local transaction setup journal is unreadable',
+      { cause: error.code || error.message },
+    )
+  }
+  const { bindingHash, ...body } = parsed || {}
+  if (!/^[a-f0-9]{64}$/u.test(bindingHash || '') ||
+      hashText(stableStringify(body)) !== bindingHash ||
+      stableStringify(parsed) !== stableStringify(expected)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+      'external local transaction root belongs to a foreign setup journal',
+    )
+  }
+  return parsed
+}
+
+function removeExternalLocalControllerRecord(recordPath) {
+  if (!recordPath || !externalLocalLstat(recordPath)) return
+  removeExternalLocalTreeNoFollow(recordPath)
+}
+
+function persistExternalLocalBoundaryJournal(materialized, transaction) {
+  const journal = externalLocalBoundaryJournal(materialized, transaction)
+  atomicWriteFile(
+    transaction.journalPath,
+    `${JSON.stringify(journal, null, 2)}\n`,
+    { mode: 0o600 },
+  )
+  return journal
+}
+
 function materializeExplicitExternalLocalBoundary(assignment, repository, options = {}) {
   const resources = explicitExternalLocalResources(assignment, repository)
     .filter(resource => resource.access !== 'read')
   if (resources.length === 0) return null
   const requestedRoot = typeof options.transactionRoot === 'string' && options.transactionRoot
     ? path.resolve(options.transactionRoot) : null
-  if (requestedRoot && fs.existsSync(path.join(requestedRoot, 'boundary.json'))) {
-    assertNoLinkedAbsolutePathPrefix(requestedRoot)
-    let prior
-    try { prior = JSON.parse(fs.readFileSync(path.join(requestedRoot, 'boundary.json'), 'utf8')) } catch (error) {
+  const transactionIdentity = options.transactionIdentity
+    ? validateExternalLocalTransactionIdentity(
+        options.transactionIdentity.bindingHash
+          ? options.transactionIdentity
+          : canonicalExternalLocalTransactionIdentity(options.transactionIdentity),
+      )
+    : null
+  const defaultTransactionParent = path.dirname(resources[0].identity)
+  const resourceDevices = new Set(resources.map(resource => {
+    const parent = path.dirname(resource.identity)
+    assertNoLinkedAbsolutePathPrefix(parent, resource.identity)
+    let stat
+    try { stat = fs.statSync(parent) } catch (error) {
       throw new SupervisorIntegrationError(
-        'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
-        'an interrupted external local transaction journal is unreadable',
+        'EXTERNAL_LOCAL_RESOURCE_INVALID',
+        `parent of exact external local output does not exist: ${resource.identity}`,
         { cause: error.code || error.message },
       )
     }
-    rollbackExplicitExternalLocalBoundary(prior, repository)
+    if (!stat.isDirectory()) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_RESOURCE_INVALID',
+        `parent of exact external local output is not a directory: ${resource.identity}`,
+      )
+    }
+    return String(stat.dev)
+  }))
+  if (resourceDevices.size !== 1) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_CROSS_DEVICE_UNSUPPORTED',
+      'one external local transaction requires all exact outputs on one filesystem',
+    )
   }
-  const transactionRoot = requestedRoot || fs.mkdtempSync(path.join(
-    os.tmpdir(),
-    'autoprompt-external-local-transaction-',
-  ))
+  let transactionRoot
+  let setupJournalPath = null
   if (requestedRoot) {
-    const transactionParent = path.dirname(transactionRoot)
+    const transactionParent = path.dirname(requestedRoot)
     if (!fs.existsSync(transactionParent)) {
       assertNoLinkedAbsolutePathPrefix(path.dirname(transactionParent), transactionParent)
-      fs.mkdirSync(transactionParent, { mode: 0o700 })
+      createExternalLocalDirectoryDurably(transactionParent, 0o700)
     }
-    assertNoLinkedAbsolutePathPrefix(transactionParent, transactionRoot)
-    fs.mkdirSync(transactionRoot, { mode: 0o700 })
+    assertNoLinkedAbsolutePathPrefix(transactionParent, requestedRoot)
+    if (String(fs.statSync(transactionParent).dev) !== [...resourceDevices][0]) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_CROSS_DEVICE_UNSUPPORTED',
+        'external local transaction root must share the exact output filesystem',
+      )
+    }
+    transactionRoot = requestedRoot
+    setupJournalPath = `${transactionRoot}.setup.json`
+  } else {
+    assertNoLinkedAbsolutePathPrefix(defaultTransactionParent)
+    transactionRoot = fs.mkdtempSync(path.join(
+      defaultTransactionParent,
+      `.autoprompt-external-local-transaction-${hashText(path.resolve(repository)).slice(0, 12)}-`,
+    ))
+    fsyncExternalLocalDirectory(defaultTransactionParent)
   }
   const transaction = Object.freeze({
     schemaVersion: 1,
     kind: 'external-local-pre-admission-transaction',
     root: transactionRoot,
     journalPath: path.join(transactionRoot, 'boundary.json'),
+    setupJournalPath,
+    commitRecordPath: setupJournalPath ? `${transactionRoot}.commit.json` : null,
+    identity: transactionIdentity,
     quarantineRoot: path.resolve(options.quarantineRoot || `${transactionRoot}-quarantines`),
     sourceWorkItemId: typeof options.sourceWorkItemId === 'string' && options.sourceWorkItemId
       ? options.sourceWorkItemId : null,
   })
+  if (requestedRoot) {
+    const expectedSetup = externalLocalSetupJournal(transaction, resources, repository)
+    const rootExists = Boolean(externalLocalLstat(transactionRoot))
+    const boundaryExists = Boolean(externalLocalLstat(transaction.journalPath))
+    const setupExists = Boolean(externalLocalLstat(setupJournalPath))
+    if (rootExists && !boundaryExists && !setupExists) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+        'deterministic external local transaction root has no exact durable setup journal',
+      )
+    }
+    if (setupExists) readExactExternalLocalSetupJournal(setupJournalPath, expectedSetup)
+    if (boundaryExists) {
+      assertNoLinkedAbsolutePathPrefix(transactionRoot)
+      let prior
+      try { prior = JSON.parse(fs.readFileSync(transaction.journalPath, 'utf8')) } catch (error) {
+        throw new SupervisorIntegrationError(
+          'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+          'an interrupted external local transaction journal is unreadable',
+          { cause: error.code || error.message },
+        )
+      }
+      const verifiedPrior = validateExternalLocalTransactionBoundary(prior)
+      const exactIdentity = transactionIdentity && verifiedPrior.transaction.identity &&
+        sameCanonicalValue(verifiedPrior.transaction.identity, transactionIdentity)
+      const exactPermit = options.mutationPermit && transactionIdentity &&
+        transactionIdentity.permitHash === hashText(stableStringify(options.mutationPermit)) &&
+        options.isolation && options.isolation.bindingHash === transactionIdentity.isolationBindingHash
+      const fullyMaterialized = verifiedPrior.resources.length === resources.length &&
+        verifiedPrior.resources.every(resource =>
+          typeof resource.materializedHash === 'string' &&
+          typeof resource.materializedType === 'string' &&
+          (Number.isSafeInteger(resource.materializedMode) || resource.materializedMode === null))
+      if (exactIdentity && exactPermit && fullyMaterialized) return verifiedPrior
+      if (transactionIdentity && (!exactIdentity || !exactPermit)) {
+        throw new SupervisorIntegrationError(
+          'CRASH_ADOPTION_CONFLICT',
+          'external local transaction root belongs to a foreign mutation permit or isolation',
+        )
+      }
+      rollbackExplicitExternalLocalBoundary(
+        verifiedPrior,
+        repository,
+        null,
+        { allowUnboundRecovery: true },
+      )
+      removeExternalLocalControllerRecord(setupJournalPath)
+    } else if (rootExists) {
+      // The setup journal was durable before mkdir. No public placeholder can
+      // precede boundary.json, so an exact setup may safely discard a partial
+      // immutable-preimage copy and restart it from the source preimages.
+      removeExternalLocalTreeNoFollow(transactionRoot)
+    }
+    if (!externalLocalLstat(setupJournalPath)) {
+      writeExternalLocalRecordDurably(
+        setupJournalPath,
+        `${JSON.stringify(expectedSetup, null, 2)}\n`,
+        0o600,
+      )
+    }
+    if (!externalLocalLstat(transactionRoot)) {
+      createExternalLocalDirectoryDurably(transactionRoot, 0o700)
+    }
+    // Close the mkdir-without-journal crash window before preimage copying.
+    writeExternalLocalRecordDurably(
+      transaction.journalPath,
+      `${JSON.stringify(externalLocalBoundaryJournal([], transaction), null, 2)}\n`,
+      0o600,
+    )
+  }
   const materialized = []
   try {
     // Snapshot every exact preimage before creating the first placeholder.
@@ -18802,8 +22630,11 @@ function materializeExplicitExternalLocalBoundary(assignment, repository, option
       const backupPath = before.type === 'missing'
         ? null : path.join(transactionRoot, `preimage-${index}`)
       if (backupPath) {
-        copyExternalLocalTree(resource.identity, backupPath)
-        const copied = externalLocalTransactionState(backupPath)
+        const copied = freezeExternalLocalTreeNoReplace(
+          resource.identity,
+          backupPath,
+          before,
+        )
         const current = resourceStateEntry(repository, resource, { allowExplicitExternalLocal: true })
         if (copied.hash !== before.hash || copied.type !== before.type || copied.mode !== before.mode ||
             current.hash !== before.hash || current.type !== before.type || current.mode !== before.mode) {
@@ -18814,24 +22645,8 @@ function materializeExplicitExternalLocalBoundary(assignment, repository, option
         }
       }
       materialized.push({ ...resource, preimage: before, backupPath })
+      persistExternalLocalBoundaryJournal(materialized, transaction)
     }
-    const journalBody = Object.freeze({
-      schemaVersion: 1,
-      mode: 'explicit-external-local',
-      resources: Object.freeze(materialized.map(resource => Object.freeze({ ...resource }))),
-      writableRoots: Object.freeze(materialized.map(resource => resource.identity)),
-      transaction,
-    })
-    const journal = Object.freeze({
-      ...journalBody,
-      boundaryHash: hashText(stableStringify(journalBody)),
-    })
-    fs.writeFileSync(transaction.journalPath, `${JSON.stringify(journal, null, 2)}\n`, {
-      encoding: 'utf8', flag: 'wx', mode: 0o600,
-    })
-    const journalDescriptor = fs.openSync(transaction.journalPath, 'r')
-    try { fs.fsyncSync(journalDescriptor) } finally { fs.closeSync(journalDescriptor) }
-
     for (let index = 0; index < materialized.length; index += 1) {
       const resource = materialized[index]
       const before = resource.preimage
@@ -18854,28 +22669,33 @@ function materializeExplicitExternalLocalBoundary(assignment, repository, option
             `parent of exact external local output is not one physical directory: ${resource.identity}`,
           )
         }
-        if (['file', 'output'].includes(resource.kind)) {
-          const descriptor = fs.openSync(resource.identity, 'wx', 0o600)
-          fs.closeSync(descriptor)
-        } else if (['directory', 'cache', 'evidence-root'].includes(resource.kind)) {
-          fs.mkdirSync(resource.identity, { mode: 0o700 })
-        } else {
-          throw new SupervisorIntegrationError(
-            'EXTERNAL_LOCAL_RESOURCE_INVALID',
-            `missing external local ${resource.kind} has no safe materialization`,
-          )
-        }
+        withExternalLocalAnchoredLeaf(resource.identity, (anchored, parentAuthority) => {
+          if (['file', 'output'].includes(resource.kind)) {
+            const descriptor = fs.openSync(anchored, 'wx', 0o600)
+            try { fs.fsyncSync(descriptor) } finally { fs.closeSync(descriptor) }
+          } else if (['directory', 'cache', 'evidence-root'].includes(resource.kind)) {
+            fs.mkdirSync(anchored, { mode: 0o700 })
+          } else {
+            throw new SupervisorIntegrationError(
+              'EXTERNAL_LOCAL_RESOURCE_INVALID',
+              `missing external local ${resource.kind} has no safe materialization`,
+            )
+          }
+          fs.fsyncSync(parentAuthority.descriptor)
+        })
         placeholderCreated = true
       }
-      const physical = fs.lstatSync(resource.identity)
+      const physical = withExternalLocalAnchoredLeaf(
+        resource.identity,
+        anchored => fs.lstatSync(anchored),
+      )
       const requiresDirectory = ['directory', 'cache', 'evidence-root'].includes(resource.kind)
       const acceptsEither = resource.kind === 'output'
       const physicalTypeAllowed = requiresDirectory
         ? physical.isDirectory()
         : acceptsEither ? physical.isFile() || physical.isDirectory() : physical.isFile()
       if (physical.isSymbolicLink() || !physicalTypeAllowed ||
-          (physical.isFile() && Number(physical.nlink) !== 1) ||
-          fs.realpathSync.native(resource.identity) !== resource.identity) {
+          (physical.isFile() && Number(physical.nlink) !== 1)) {
         throw new SupervisorIntegrationError(
           'EXTERNAL_LOCAL_RESOURCE_INVALID',
           `exact external local output has the wrong physical type: ${resource.identity}`,
@@ -18891,13 +22711,23 @@ function materializeExplicitExternalLocalBoundary(assignment, repository, option
         materializedType: materializedState.type,
         materializedMode: materializedState.mode,
       })
+      // Bind each exact materialized identity before proceeding to the next
+      // public slot. A crash before this write leaves that one slot ambiguous,
+      // which recovery preserves; a completed write gives cleanup exact CAS
+      // authority without ever adopting an observed concurrent path.
+      persistExternalLocalBoundaryJournal(materialized, transaction)
     }
   } catch (error) {
     try {
       if (fs.existsSync(transaction.journalPath)) {
         const prior = JSON.parse(fs.readFileSync(transaction.journalPath, 'utf8'))
-        rollbackExplicitExternalLocalBoundary(prior, repository)
-      } else {
+        rollbackExplicitExternalLocalBoundary(
+          prior,
+          repository,
+          null,
+          { allowUnboundRecovery: true },
+        )
+      } else if (externalLocalLstat(transactionRoot)) {
         removeExternalLocalTreeNoFollow(transactionRoot)
       }
     } catch (cleanupError) {
@@ -18906,41 +22736,235 @@ function materializeExplicitExternalLocalBoundary(assignment, repository, option
     }
     throw error
   }
+  return externalLocalBoundaryJournal(materialized, transaction)
+}
+
+function externalLocalCommitRecord(boundary, admission, input = {}) {
+  const verified = validateExternalLocalTransactionBoundary(boundary)
+  const identity = validateExternalLocalTransactionIdentity(verified.transaction.identity)
+  if (!input.permit || identity.permitHash !== hashText(stableStringify(input.permit)) ||
+      !input.isolation || input.isolation.bindingHash !== identity.isolationBindingHash ||
+      input.workItemId !== identity.workItemId ||
+      !admission || !Array.isArray(admission.resources) ||
+      admission.resources.length !== verified.resources.length ||
+      !input.workerWorkspace || !input.workerWorkspace.recordPath ||
+      !Array.isArray(input.postimages)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_COMMIT_RECORD_INVALID',
+      'external local commit record does not bind its exact permit, isolation, admission, work item, and worker record',
+    )
+  }
+  const workerJournal = readChecksummedJson(input.workerWorkspace.recordPath)
+  if (!['COMMITTED', 'FINALIZING', 'FINALIZED'].includes(workerJournal.status) ||
+      workerJournal.binding.bindingHash !== input.isolation.bindingHash) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_COMMIT_RECORD_INVALID',
+      'external local commit record requires the exact promoted worker journal',
+    )
+  }
+  const externalPaths = new Set(verified.resources.map(resource => resource.identity))
   const body = Object.freeze({
     schemaVersion: 1,
-    mode: 'explicit-external-local',
-    resources: Object.freeze(materialized),
-    writableRoots: Object.freeze(materialized.map(resource => resource.identity)),
-    transaction,
+    kind: 'external-local-mutation-commit-record',
+    transactionIdentity: identity,
+    boundaryHash: verified.boundaryHash,
+    externalAdmission: admission,
+    externalAdmissionHash: hashText(stableStringify(admission)),
+    permit: input.permit,
+    permitHash: identity.permitHash,
+    isolationBindingHash: input.isolation.bindingHash,
+    workItemId: input.workItemId,
+    postimages: Object.freeze(input.postimages.map(item => Object.freeze({ ...item }))),
+    localPostimages: Object.freeze(input.postimages
+      .filter(item => !externalPaths.has(path.resolve(item.path)))
+      .map(item => Object.freeze({ ...item }))),
+    workerRecord: Object.freeze({
+      path: path.resolve(input.workerWorkspace.recordPath),
+      workspaceId: input.workerWorkspace.workspaceId,
+      bindingHash: input.workerWorkspace.binding.bindingHash,
+      status: workerJournal.status,
+      recordHash: hashText(stableStringify(workerJournal)),
+    }),
   })
-  return Object.freeze({ ...body, boundaryHash: hashText(stableStringify(body)) })
+  return Object.freeze({ ...body, commitRecordHash: hashText(stableStringify(body)) })
+}
+
+function persistExternalLocalCommitRecord(boundary, admission, input = {}) {
+  const commitRecordPath = boundary.transaction.commitRecordPath
+  if (!commitRecordPath || path.dirname(commitRecordPath) !== path.dirname(boundary.transaction.root)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_COMMIT_RECORD_INVALID',
+      'external local transaction has no durable sibling commit record path',
+    )
+  }
+  if (externalLocalLstat(commitRecordPath)) {
+    let prior
+    try {
+      assertNoLinkedAbsolutePathPrefix(path.dirname(commitRecordPath), commitRecordPath)
+      prior = JSON.parse(readStableExternalLocalFile(commitRecordPath).toString('utf8'))
+    } catch (error) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+        'external local commit record is unreadable',
+        { cause: error.code || error.message },
+      )
+    }
+    const { commitRecordHash, ...priorBody } = prior || {}
+    if (!prior || commitRecordHash !== hashText(stableStringify(priorBody)) ||
+        prior.kind !== 'external-local-mutation-commit-record' ||
+        prior.boundaryHash !== boundary.boundaryHash ||
+        !sameCanonicalValue(prior.externalAdmission, admission) ||
+        !sameCanonicalValue(prior.permit, input.permit) ||
+        prior.isolationBindingHash !== (input.isolation && input.isolation.bindingHash) ||
+        prior.workItemId !== input.workItemId ||
+        !sameCanonicalValue(prior.postimages, input.postimages) ||
+        !input.workerWorkspace ||
+        prior.workerRecord.path !== path.resolve(input.workerWorkspace.recordPath) ||
+        prior.workerRecord.workspaceId !== input.workerWorkspace.workspaceId ||
+        prior.workerRecord.bindingHash !== input.workerWorkspace.binding.bindingHash) {
+      throw new SupervisorIntegrationError(
+        'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+        'external local commit record is foreign or changed',
+      )
+    }
+    return Object.freeze(prior)
+  }
+  const commitRecord = externalLocalCommitRecord(boundary, admission, input)
+  writeExternalLocalRecordDurably(
+    commitRecordPath,
+    `${JSON.stringify(commitRecord, null, 2)}\n`,
+    0o600,
+  )
+  return commitRecord
+}
+
+function readExternalLocalCommitRecord(boundary) {
+  const verified = validateExternalLocalTransactionBoundary(boundary)
+  const commitRecordPath = verified.transaction.commitRecordPath
+  if (!commitRecordPath || !externalLocalLstat(commitRecordPath)) return null
+  let commitRecord
+  try {
+    assertNoLinkedAbsolutePathPrefix(path.dirname(commitRecordPath), commitRecordPath)
+    commitRecord = JSON.parse(readStableExternalLocalFile(commitRecordPath).toString('utf8'))
+  } catch (error) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+      'external local commit record is unreadable',
+      { cause: error.code || error.message },
+    )
+  }
+  const { commitRecordHash, ...body } = commitRecord || {}
+  if (!commitRecord || commitRecord.kind !== 'external-local-mutation-commit-record' ||
+      commitRecordHash !== hashText(stableStringify(body)) ||
+      commitRecord.boundaryHash !== verified.boundaryHash ||
+      !sameCanonicalValue(commitRecord.transactionIdentity, verified.transaction.identity)) {
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_TRANSACTION_TAMPERED',
+      'external local commit record does not bind the exact transaction boundary',
+    )
+  }
+  return Object.freeze(commitRecord)
+}
+
+function captureExactExternalLocalPlaceholder(verified, resource, index, purpose) {
+  const discardPath = path.join(
+    verified.transaction.root,
+    `${purpose}-${index}-${hashText(resource.identity).slice(0, 24)}`,
+  )
+  const expected = Object.freeze({
+    hash: resource.materializedHash,
+    type: resource.materializedType,
+    mode: resource.materializedMode,
+  })
+  const existingDiscard = externalLocalLstat(discardPath)
+  if (existingDiscard) {
+    const captured = externalLocalTransactionState(discardPath)
+    if (externalLocalStateMatches(captured, expected) &&
+        !externalLocalLstat(resource.identity)) return true
+    throw new SupervisorIntegrationError(
+      'EXTERNAL_LOCAL_ROLLBACK_STALE',
+      `external local placeholder capture is ambiguous: ${resource.identity}`,
+      { retainedPath: discardPath },
+    )
+  }
+  if (!externalLocalLstat(resource.identity)) return true
+  assertNoLinkedAbsolutePathPrefix(path.dirname(resource.identity), resource.identity)
+  renameExternalLocalTreeNoReplace(resource.identity, discardPath)
+  const captured = externalLocalTransactionState(discardPath)
+  if (externalLocalStateMatches(captured, expected)) {
+    // Keep the atomically captured placeholder under the authenticated
+    // transaction root. Commit/rollback removes that private root later, so
+    // inspection never needs a pathname-based unlink against a public slot.
+    return true
+  }
+  let restoreConflict = false
+  if (!externalLocalLstat(resource.identity)) {
+    try {
+      publishExternalLocalTreeNoReplace(
+        discardPath,
+        resource.identity,
+        verified.transaction.root,
+      )
+    } catch (_) {
+      restoreConflict = true
+    }
+  } else {
+    restoreConflict = true
+  }
+  throw new SupervisorIntegrationError(
+    'EXTERNAL_LOCAL_ROLLBACK_STALE',
+    `external local placeholder changed during atomic capture: ${resource.identity}`,
+    { retainedPath: discardPath, restoreConflict },
+  )
 }
 
 function removeUnchangedExternalLocalPlaceholders(boundary, repository) {
   if (boundary && boundary.transaction) {
-    return rollbackExplicitExternalLocalBoundary(boundary, repository)
-  }
-  const resources = boundary && Array.isArray(boundary.resources) ? boundary.resources : []
-  const removed = []
-  for (const resource of [...resources].reverse()) {
-    if (!resource || resource.placeholderCreated !== true || !fs.existsSync(resource.identity)) continue
-    let state
-    try {
-      state = resourceStateEntry(repository, resource, { allowExplicitExternalLocal: true })
-    } catch {
-      // Never remove a path whose physical identity no longer matches the
-      // exact regular file/directory that this controller materialized.
-      continue
+    const verified = validateExternalLocalTransactionBoundary(boundary)
+    const states = verified.resources.map(resource => {
+      const state = externalLocalTransactionState(resource.identity)
+      return Object.freeze({ identity: resource.identity, ...state })
+    })
+    const everyMaterialized = verified.resources.every((resource, index) =>
+      typeof resource.materializedHash === 'string' &&
+      externalLocalStateMatches(states[index], {
+        hash: resource.materializedHash,
+        type: resource.materializedType,
+        mode: resource.materializedMode,
+      }))
+    if (everyMaterialized) {
+      return rollbackExplicitExternalLocalBoundary(
+        verified,
+        repository,
+        { resources: states },
+      )
     }
-    if (state.hash !== resource.materializedHash || state.type !== resource.materializedType ||
-        state.mode !== resource.materializedMode) continue
-    if (state.type === 'file') fs.unlinkSync(resource.identity)
-    else if (state.type === 'directory' && fs.readdirSync(resource.identity).length === 0) {
-      fs.rmdirSync(resource.identity)
-    } else continue
-    removed.push(resource.identity)
+    // Once any owned path changed, absence of a terminal/admission receipt is
+    // not authority to erase those bytes. Remove only untouched placeholders;
+    // retain the authenticated preimage transaction for later reconciliation.
+    const removed = []
+    for (let index = verified.resources.length - 1; index >= 0; index -= 1) {
+      const resource = verified.resources[index]
+      if (resource.placeholderCreated !== true || resource.preimage.type !== 'missing' ||
+          typeof resource.materializedHash !== 'string') continue
+      try {
+        if (captureExactExternalLocalPlaceholder(
+          verified,
+          resource,
+          index,
+          'placeholder-cleanup',
+        )) removed.push(resource.identity)
+      } catch (_) {
+        // Absence of an exact atomic capture is never authority to unlink the
+        // current public pathname. Retain both it and the transaction.
+      }
+    }
+    return Object.freeze(removed.sort())
   }
-  return Object.freeze(removed.sort())
+  // Legacy boundaries have no private transaction namespace in which an
+  // exact public inode can be captured before deletion. Leave their paths in
+  // place rather than performing a pathname check-then-unlink race.
+  return Object.freeze([])
 }
 
 function validateExplicitExternalLocalBoundary(boundary, assignment, repository) {
@@ -19007,15 +23031,17 @@ function inspectExplicitExternalLocalBoundary(boundary, assignment, repository, 
       { outside: unauthorized.sort() },
     )
   }
-  const states = verified.resources.map(resource => {
+  const states = verified.resources.map((resource, index) => {
     let state = resourceStateEntry(repository, resource, { allowExplicitExternalLocal: true })
     const resourceReported = reported.some(value => reportedPathMatchesExternalResource(value, resource))
     if (resource.placeholderCreated && resource.preimage.type === 'missing' && !resourceReported &&
         state.hash === resource.materializedHash) {
-      if (state.type === 'file') fs.unlinkSync(resource.identity)
-      else if (state.type === 'directory' && fs.readdirSync(resource.identity).length === 0) {
-        fs.rmdirSync(resource.identity)
-      }
+      captureExactExternalLocalPlaceholder(
+        verified,
+        resource,
+        index,
+        'inspection-placeholder',
+      )
       state = resourceStateEntry(repository, resource, { allowExplicitExternalLocal: true })
     }
     return Object.freeze({
@@ -19032,7 +23058,12 @@ function inspectExplicitExternalLocalBoundary(boundary, assignment, repository, 
   const changed = states.filter(state => state.changed)
   const omitted = changed.filter(state =>
     !reported.some(value => reportedPathMatchesExternalResource(value, state)))
-  if (omitted.length > 0) {
+  // Match private-workspace admission semantics: an explicitly incomplete
+  // report has no DONE authority, but its absent file list cannot erase an
+  // exact ownership-safe physical postimage observed after process drain.
+  const incompleteReport = result && result.allAssignedItemsPass === false &&
+    Array.isArray(result.filesChanged)
+  if (omitted.length > 0 && !incompleteReport) {
     throw new SupervisorIntegrationError(
       'MUTATION_REPORT_MISMATCH',
       'worker omitted an observed exact external local resource change from its file report',
@@ -19708,31 +23739,41 @@ function schedulerResourcesForAssignment(assignment, repository) {
   })
 }
 
-function workspaceFileSnapshot(repository, environment) {
-  const listing = Buffer.from(runGit(repository, ['ls-files', '-co', '--exclude-standard', '-z'], {
-    encoding: null, environment,
-  })).toString('utf8').split('\0').filter(Boolean).sort()
+function workspaceFileSnapshot(
+  repository,
+  environment,
+  workspaceResources = [],
+  workspaceResourceRoot = repository,
+) {
+  const listing = workspaceCandidateNames(
+    repository, environment, workspaceResources, workspaceResourceRoot,
+  )
   const snapshot = new Map()
   for (const name of listing) {
     const absolute = path.resolve(repository, ...name.split('/'))
     if (!absolute.startsWith(`${path.resolve(repository)}${path.sep}`)) {
       throw new SupervisorIntegrationError('MUTATION_SCOPE_INVALID', `workspace entry escapes the target: ${name}`)
     }
-    if (!fs.existsSync(absolute)) {
+    const entry = readStableWorkspaceRegularFile(absolute, name, 'MUTATION_SCOPE_INVALID')
+    if (!entry) {
       snapshot.set(name, null)
       continue
     }
-    const stat = fs.lstatSync(absolute)
-    if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.nlink) !== 1) {
-      throw new SupervisorIntegrationError('MUTATION_SCOPE_INVALID', `workspace entry is not one regular file: ${name}`)
-    }
-    snapshot.set(name, sha256Bytes(fs.readFileSync(absolute)))
+    snapshot.set(name, `${sha256Bytes(entry.bytes)}:${entry.mode}`)
   }
   return snapshot
 }
 
-function assertRealTargetUnchanged(before, repository, environment) {
-  const after = workspaceFileSnapshot(repository, environment)
+function assertRealTargetUnchanged(
+  before,
+  repository,
+  environment,
+  workspaceResources = [],
+  workspaceResourceRoot = repository,
+) {
+  const after = workspaceFileSnapshot(
+    repository, environment, workspaceResources, workspaceResourceRoot,
+  )
   const changed = [...new Set([...before.keys(), ...after.keys()])]
     .filter(name => before.get(name) !== after.get(name)).sort()
   if (changed.length) {
@@ -19878,11 +23919,14 @@ function canonicalRoleAssignment(input) {
     ? (input.request.successChecklist || input.request.success) : ['Complete the exact assigned result.']
   const planPath = input.route === 'ROADMAP' ? 'plan/ROADMAP.md'
     : input.route === 'LIGHT' ? 'plan/light-plan.md' : 'plan/success-card.md'
+  const requirementFidelityDoctrine = input.logicalRole === 'worker'
+    ? WORKER_REQUIREMENT_FIDELITY_DOCTRINE : null
   const assignmentCore = {
     requestedResult: String(input.request.assignment || 'Complete the assigned work item.'),
     resources: canonicalAssignmentResources(input),
     successChecklist: checklist.map((description, index) => ({ id: `success-${index + 1}`, description: String(description) })),
     checks: (input.request.checks || ['Verify the exact assigned result.']).map(String),
+    ...(requirementFidelityDoctrine ? { requirementFidelityDoctrine } : {}),
   }
   const sectionHash = input.route === 'ROADMAP' && input.request.roadmapSlice &&
       /^[a-f0-9]{64}$/.test(input.request.roadmapSlice.sha256 || '')
@@ -19910,6 +23954,7 @@ function canonicalRoleAssignment(input) {
     forbiddenChanges: ['Do not modify resources outside this assignment.', 'Do not perform network writes.'],
     successChecklist: assignmentCore.successChecklist,
     checks: assignmentCore.checks,
+    ...(requirementFidelityDoctrine ? { requirementFidelityDoctrine } : {}),
     resultLocation: `work/results/${hashText(input.request.workItemId)}.json`,
     assignedAt: new Date(input.now()).toISOString(),
   }
@@ -20530,6 +24575,8 @@ function createDefaultRouteExecutor(options) {
     acceptDeferredCheckerProof,
     resumeState,
   }) => {
+    let persistedStructuredFinalResponse = null
+    try {
     if (typeof options.verifyL1RequestPointer === 'function') options.verifyL1RequestPointer()
     if (!decision.gateSelection || typeof decision.gateSelection !== 'object') {
       throw new SupervisorIntegrationError(
@@ -20602,9 +24649,9 @@ function createDefaultRouteExecutor(options) {
     })
     const likelyAreas = decision.likelyAreas || []
     const boundedToolOutputDiscipline =
-      ` Keep model-visible command output bounded: use at most ${CODEX_CHILD_TOOL_CALL_LIMITS.worker} tool calls for the whole turn. The launcher retains at most ${CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT.toLocaleString('en-US')} tokens from each tool output; the classic shell tool has no per-call output-budget argument. Redirect large stdout/stderr to a scratch file, then inspect a hash, count, or targeted preview of at most 4 KiB. Never use line-oriented head, tail, sed, or unrestricted recursive search on potentially monolithic generated artifacts or private run-record/transcript trees. Reuse one focused executable validation harness; after implementation and one focused validation, return the canonical result immediately.`
+      ` Keep the direct path compact: target roughly ${CODEX_CHILD_TOOL_GUIDANCE_LIMITS.worker} or fewer purposeful tool calls for the whole turn, without abandoning required work merely because that target was exceeded. The launcher retains at most ${CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT.toLocaleString('en-US')} tokens from each tool output; the classic shell tool has no per-call output-budget argument. Redirect large stdout/stderr to a scratch file, then inspect a hash, count, or targeted preview of at most 4 KiB. Never use line-oriented head, tail, sed, or unrestricted recursive search on potentially monolithic generated artifacts or private run-record/transcript trees. Reuse one focused executable validation harness; after implementation and one focused validation, return the canonical result immediately.`
     const checkerToolOutputDiscipline =
-      ` Keep model-visible command output bounded: use at most ${CODEX_CHILD_TOOL_CALL_LIMITS.checker} tool calls for the whole turn. The launcher retains at most ${CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT.toLocaleString('en-US')} tokens from each tool output; the classic shell tool has no per-call output-budget argument. If you author a checker harness, first write one regular program in the assigned scratch root, then run exactly one direct invocation as <python3|node|ruby|perl|sh> <absolute sealed scratch program> <absolute frozen exact-version path being checked>, or as <absolute sealed executable> <absolute frozen exact-version path being checked>. Use no interpreter flags. Substitute the projected absolute paths literally and emit one direct JSON summary of at most 4 KiB. Do not use heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or shell glue. Do not run a second harness command merely to reshape the report; return the canonical result immediately after the required observation.`
+      ` Keep the independent check compact: target roughly ${CODEX_CHILD_TOOL_GUIDANCE_LIMITS.checker} or fewer purposeful tool calls, while still completing every required observation. The launcher retains at most ${CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT.toLocaleString('en-US')} tokens from each tool output; the classic shell tool has no per-call output-budget argument. If you author a checker harness, first write one regular program in the assigned scratch root, then run exactly one direct invocation as <python3|node|ruby|perl|sh> <absolute sealed scratch program> <absolute frozen exact-version path being checked>, or as <absolute sealed executable> <absolute frozen exact-version path being checked>. Use no interpreter flags. Substitute the projected absolute paths literally and emit one direct JSON summary of at most 4 KiB. Do not use heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or shell glue. Treat the frozen path as immutable even for database and compiler reads: use explicit read-only/immutable modes, or hash-bind a copy in writable scratch before using a reader that may create journals, WAL files, locks, bytecode, caches, sidecars, or temporary files. Return the canonical result immediately after the required observation.`
     const workerCount = Math.max(1, Number(decision.usefulWorkerCount || 1))
     const legacyRoadmapWorkId = /^(?:roadmap-(?:author|scout|plan-|work-group)|mission-coordination)/u
     const resumeRoadmapIds = resumeState ? [
@@ -20633,6 +24680,24 @@ function createDefaultRouteExecutor(options) {
       options.targetPath,
       options.mission,
     )
+    const admittedLocalDeliverablePaths = new Set()
+    const rememberLocalMutationAdmission = admission => {
+      const local = admission && (admission.workspaceAdmission || admission)
+      if (!local || !Array.isArray(local.actualFilesChanged) || !Array.isArray(local.after)) return
+      const after = new Map(local.after.map(entry => [entry.path, entry]))
+      for (const reported of local.actualFilesChanged) {
+        const relative = String(reported || '').replace(/\\/gu, '/')
+        if (!relative || path.isAbsolute(relative) || relative === '..' || relative.startsWith('../')) continue
+        const state = after.get(relative)
+        if (state && state.hash !== null) admittedLocalDeliverablePaths.add(relative)
+        else admittedLocalDeliverablePaths.delete(relative)
+      }
+    }
+    const routeChangedDeliverables = repository => changedDeliverables(
+      repository,
+      options.gitEnvironment(repository),
+      admittedLocalDeliverablePaths,
+    )
     const durableExternalDeliverableIdentities = recoverDurableExternalDeliverableIdentities(
       resumeState,
       externalCandidateResources,
@@ -20643,6 +24708,8 @@ function createDefaultRouteExecutor(options) {
       repository,
       options.gitEnvironment(repository),
       externalCandidateResources,
+      executionOwnership,
+      options.targetPath,
     )
     const externalDeliverables = () => externalCandidateResources.flatMap(resource => {
       const state = resourceStateEntry(options.targetPath, resource, {
@@ -21699,9 +25766,15 @@ function createDefaultRouteExecutor(options) {
           'restored deferred promotion handle is not bound to the exact version',
         )
       }
+      rememberLocalMutationAdmission(deferredPromotion.mutationAdmission)
     }
     for (const workItemId of requiredWorkIds) {
       if (adoptedWorkResults[workItemId]) {
+        rememberLocalMutationAdmission(
+          deferredPromotion && deferredPromotion.mutationAdmission ||
+          (typeof options.readMutationAdmission === 'function'
+            ? options.readMutationAdmission(workItemId) : null),
+        )
         if (queuedTransportRetry && queuedTransportRetry.baseId === workItemId &&
             adoptedWorkResults[workItemId].terminalEnvelope &&
             adoptedWorkResults[workItemId].terminalEnvelope.status === 'CHILD_TRANSPORT_TIMEOUT') {
@@ -21857,6 +25930,13 @@ function createDefaultRouteExecutor(options) {
           }
           options.verifyDurableResultReceipt(workItemId, workResult)
         }
+        const acceptedMutationAdmission = workResult && workResult[MUTATION_ADMISSION_EVIDENCE] ||
+          workResult && workResult.deferredPromotion &&
+            workResult.deferredPromotion.mutationAdmission ||
+          deferredPromotion && deferredPromotion.mutationAdmission ||
+          (typeof options.readMutationAdmission === 'function'
+            ? options.readMutationAdmission(workItemId) : null)
+        rememberLocalMutationAdmission(acceptedMutationAdmission)
         const workerReportedIncomplete = Boolean(workResult &&
           (workResult.code === 'SPLIT_REQUIRED' || workResult.allAssignedItemsPass === false))
         if (workerReportedIncomplete) {
@@ -21867,11 +25947,7 @@ function createDefaultRouteExecutor(options) {
             workResult,
             candidatePath,
             options.gitEnvironment(candidatePath),
-            workResult[MUTATION_ADMISSION_EVIDENCE] ||
-              resultPromotion && resultPromotion.mutationAdmission ||
-              deferredPromotion && deferredPromotion.mutationAdmission ||
-              (typeof options.readMutationAdmission === 'function'
-                ? options.readMutationAdmission(workItemId) : null),
+            acceptedMutationAdmission,
           )
           if (produced.length === 0) {
             if (resultPromotion && typeof resultPromotion.abort === 'function') {
@@ -21941,7 +26017,7 @@ function createDefaultRouteExecutor(options) {
       candidateHashFor(options.targetPath)
     const usableCandidatePath = deferredPromotion && deferredPromotion.workspacePath || options.targetPath
     let usableDeliverables = [
-      ...changedDeliverables(usableCandidatePath, options.gitEnvironment(usableCandidatePath)),
+      ...routeChangedDeliverables(usableCandidatePath),
       ...externalDeliverables(),
     ]
     let finalResponse = null
@@ -21982,6 +26058,10 @@ function createDefaultRouteExecutor(options) {
           )
         }
         finalResponse = Object.freeze({ ...candidate, evidencePointer })
+        persistedStructuredFinalResponse = finalResponse
+        if (typeof options.onStructuredFinalResponsePersisted === 'function') {
+          options.onStructuredFinalResponsePersisted(finalResponse)
+        }
       } else if (candidate) {
         finalResponse = candidate
       }
@@ -22057,7 +26137,7 @@ function createDefaultRouteExecutor(options) {
         outcome: 'DONE',
         checkHashes: accepted.checkHashes,
         deliverables: [
-          ...changedDeliverables(options.targetPath, options.gitEnvironment()),
+          ...routeChangedDeliverables(options.targetPath),
           ...externalDeliverables(),
         ],
         terminalEnvelope: {
@@ -22138,7 +26218,7 @@ function createDefaultRouteExecutor(options) {
           outcome: 'FAILED',
           checkHashes: [],
           deliverables: [
-            ...changedDeliverables(options.targetPath, options.gitEnvironment()),
+            ...routeChangedDeliverables(options.targetPath),
             ...externalDeliverables(),
           ],
           ...(!deferredPromotion && finalResponse ? { finalResponse } : {}),
@@ -22213,7 +26293,7 @@ function createDefaultRouteExecutor(options) {
         ? candidateHashFor(options.targetPath)
         : candidateHash
       const preservedDeliverables = [
-        ...changedDeliverables(options.targetPath, options.gitEnvironment()),
+        ...routeChangedDeliverables(options.targetPath),
         ...externalDeliverables(),
       ]
       const limitationCheckHashes = [limitationResultHash]
@@ -22283,7 +26363,7 @@ function createDefaultRouteExecutor(options) {
         outcome: 'FAILED',
         checkHashes: hashes,
         deliverables: [
-          ...changedDeliverables(options.targetPath, options.gitEnvironment()),
+          ...routeChangedDeliverables(options.targetPath),
           ...externalDeliverables(),
         ],
         ...(!deferredPromotion && finalResponse ? { finalResponse } : {}),
@@ -22596,7 +26676,7 @@ function createDefaultRouteExecutor(options) {
           outcome: 'FAILED',
           checkHashes: [],
           deliverables: [
-            ...changedDeliverables(options.targetPath, options.gitEnvironment()),
+            ...routeChangedDeliverables(options.targetPath),
             ...externalDeliverables(),
           ],
           ...(finalResponse ? { finalResponse } : {}),
@@ -22616,6 +26696,9 @@ function createDefaultRouteExecutor(options) {
     const requireIndependentReferenceMethod = true
     const persistedBaseline = typeof options.readPreMutationBaseline === 'function'
       ? options.readPreMutationBaseline() : null
+    const trustedTestArtifactReceipt = persistedBaseline &&
+      typeof options.readTrustedTestArtifactReceipt === 'function'
+      ? options.readTrustedTestArtifactReceipt(persistedBaseline) : null
     const regressionBaseline = persistedBaseline && Array.isArray(persistedBaseline.existingTests)
       ? persistedBaseline.existingTests.map(item => ({ ...item, fingerprint: item.outputHash }))
       : Array.isArray(decision.regressionBaseline) ? decision.regressionBaseline : []
@@ -22643,18 +26726,33 @@ function createDefaultRouteExecutor(options) {
     })
     // The immutable pre-mutation baseline is populated exclusively by
     // executeExistingTestBaseline(trustedTestDeclarations) and its record hash
-    // binds each exact executed command. createPreMutationBaseline deliberately
-    // projects away declaration-source labels, so the persisted baseline itself
-    // is the authority boundary. Route-analysis prose remains a named
-    // obligation, never a shell allowlist. Checks without an exact baseline
-    // command use the conservative candidate-harness observation mode below.
-    const controllerVerificationCommands = [...new Set((persistedBaseline &&
+    // binds each exact executed command. Its content-addressed companion binds
+    // the repository-local program/file/directory identities selected by the
+    // trusted declaration before mutation. Both receipts are required for
+    // terminal exact-command PASS. Route-analysis prose remains a named
+    // obligation, never a shell allowlist; a candidate-resident harness can
+    // still diagnose FAIL but cannot manufacture PASS authority.
+    const trustedArtifactsById = new Map(trustedTestArtifactReceipt &&
+      Array.isArray(trustedTestArtifactReceipt.tests)
+      ? trustedTestArtifactReceipt.tests.map(test => [test.id, test]) : [])
+    const controllerVerificationCommands = (persistedBaseline &&
       Array.isArray(persistedBaseline.existingTests) ? persistedBaseline.existingTests : [])
       .filter(item => item && item.command)
-      .map(item => String(item.command)).filter(command => command.trim()))]
+      .map(item => {
+        const artifactBinding = trustedArtifactsById.get(item.id)
+        return Object.freeze({
+          command: String(item.command),
+          artifacts: Object.freeze(artifactBinding &&
+            artifactBinding.commandHash === hashText(String(item.command)) &&
+            Array.isArray(artifactBinding.artifacts)
+            ? artifactBinding.artifacts.map(artifact => Object.freeze({ ...artifact })) : []),
+        })
+      })
+      .filter((item, index, all) => item.command.trim() &&
+        all.findIndex(candidate => candidate.command === item.command) === index)
     const checkerCommandBindingsBySeat = checkerNamedChecksBySeat.map(checkIds =>
       checkIds.flatMap(checkId => controllerVerificationCommands
-        .map(command => ({ checkId, command }))))
+        .map(binding => ({ checkId, ...binding }))))
     const checkerInvariantRequirementsBySeat = Array.from(
       { length: checkerCount },
       (_, seat) => requiredReferenceInvariantCategories(
@@ -22839,8 +26937,10 @@ function createDefaultRouteExecutor(options) {
             `checker report correction source ${checkerAttemptId}`,
           ).parsed
           const canonicalPriorResult = canonicalizeCheckerTerminalResult(priorResult)
-          if (hashText(stableStringify(canonicalPriorResult)) !==
-              retryReason.priorResultEvidenceHash) {
+          if (!checkerResultEvidenceHashMatches(
+            canonicalPriorResult,
+            retryReason.priorResultEvidenceHash,
+          )) {
             throw new SupervisorIntegrationError(
               'CHECK_RETRY_STATE_INVALID',
               `checker report correction pointer ${checkerAttemptId} differs from its durable prior result hash`,
@@ -22852,8 +26952,10 @@ function createDefaultRouteExecutor(options) {
       const priorResult = checkerReportCorrectionPriorResults[checkerIndex] ||
         (typeof options.readResult === 'function' ? options.readResult(checkerAttemptId) : null)
       const canonicalPriorResult = canonicalizeCheckerTerminalResult(priorResult)
-      if (!canonicalPriorResult || hashText(stableStringify(canonicalPriorResult)) !==
-          retryReason.priorResultEvidenceHash) {
+      if (!canonicalPriorResult || !checkerResultEvidenceHashMatches(
+        canonicalPriorResult,
+        retryReason.priorResultEvidenceHash,
+      )) {
         throw new SupervisorIntegrationError(
           'CHECK_RETRY_STATE_INVALID',
           `checker report correction ${checkerAttemptId} cannot recover its exact prior report`,
@@ -23320,6 +27422,11 @@ function createDefaultRouteExecutor(options) {
         // controller uncertainty or masking it with the transport condition.
         return returnConcreteCandidateFailure(checkerResult, [])
       }
+      rememberLocalMutationAdmission(
+        repairResult[MUTATION_ADMISSION_EVIDENCE] ||
+        (typeof options.readMutationAdmission === 'function'
+          ? options.readMutationAdmission(pending.repairWorkItemId) : null),
+      )
       const repairCandidatePath = deferredPromotion && deferredPromotion.workspacePath ||
         options.targetPath
       const repairedCandidateHash = candidateHashFor(repairCandidatePath)
@@ -23331,7 +27438,7 @@ function createDefaultRouteExecutor(options) {
       }
       candidateHash = repairedCandidateHash
       usableDeliverables = [
-        ...changedDeliverables(repairCandidatePath, options.gitEnvironment(repairCandidatePath)),
+        ...routeChangedDeliverables(repairCandidatePath),
         ...externalDeliverables(),
       ]
       finalResponse = null
@@ -23626,7 +27733,7 @@ function createDefaultRouteExecutor(options) {
         deferProofAcceptance: true,
         harnessAttestation: options.harnessAttestation(candidateHash, oracle),
         })
-        const rawCheckerResultHash = hashText(stableStringify(result || null))
+        const rawCheckerResultHash = canonicalCheckerResultEvidenceHash(result)
         const reportedEvidenceIds = result && result.payload && Array.isArray(result.payload.evidenceIds)
           ? result.payload.evidenceIds.map(value => typeof value === 'string' ? value.trim() : value)
           : []
@@ -24337,6 +28444,11 @@ function createDefaultRouteExecutor(options) {
             repairResult.terminalEnvelope.status === 'CHILD_TRANSPORT_TIMEOUT') {
           return returnConcreteCandidateFailure(primaryFailure.result, [])
         }
+        rememberLocalMutationAdmission(
+          repairResult[MUTATION_ADMISSION_EVIDENCE] ||
+          (typeof options.readMutationAdmission === 'function'
+            ? options.readMutationAdmission(repairWorkItemId) : null),
+        )
         const repairCandidatePath = deferredPromotion && deferredPromotion.workspacePath ||
           options.targetPath
         const repairedCandidateHash = candidateHashFor(repairCandidatePath)
@@ -24348,7 +28460,7 @@ function createDefaultRouteExecutor(options) {
         }
         candidateHash = repairedCandidateHash
         usableDeliverables = [
-          ...changedDeliverables(repairCandidatePath, options.gitEnvironment(repairCandidatePath)),
+          ...routeChangedDeliverables(repairCandidatePath),
           ...externalDeliverables(),
         ]
         finalResponse = null
@@ -24761,7 +28873,7 @@ function createDefaultRouteExecutor(options) {
       outcome: 'DONE',
       checkHashes,
       deliverables: [
-        ...changedDeliverables(options.targetPath, options.gitEnvironment()),
+        ...routeChangedDeliverables(options.targetPath),
         ...externalDeliverables(),
       ],
       ...(finalResponse ? { finalResponse } : {}),
@@ -24775,6 +28887,28 @@ function createDefaultRouteExecutor(options) {
         ...(completionLimitations ? { limitations: completionLimitations } : {}),
       },
     }
+    } catch (error) {
+      if (!persistedStructuredFinalResponse) throw error
+      let survivedError = error
+      if (!survivedError ||
+          !['object', 'function'].includes(typeof survivedError) ||
+          !Object.isExtensible(survivedError)) {
+        survivedError = new SupervisorIntegrationError(
+          error && error.code || 'FAILED',
+          error && error.message || String(error),
+          error && error.details && typeof error.details === 'object'
+            ? { ...error.details }
+            : { priorControllerFailure: serializeError(error) },
+        )
+      }
+      Object.defineProperty(survivedError, STRUCTURED_FINAL_RESPONSE_SURVIVAL, {
+        enumerable: false,
+        configurable: false,
+        writable: false,
+        value: persistedStructuredFinalResponse,
+      })
+      throw survivedError
+    }
   }
 }
 
@@ -24783,6 +28917,8 @@ function createCheckerSnapshotFactory(options) {
   return (checkerId, _resources, candidateSourcePath = options.targetPath, context = {}) => {
     const sourcePath = path.resolve(candidateSourcePath)
     const projection = context && context.projection || null
+    const candidateResources = context && Array.isArray(context.candidateResources)
+      ? context.candidateResources : []
     let projectedBytes = null
     let projectedMode = 0o600
     if (projection) {
@@ -24854,13 +28990,13 @@ function createCheckerSnapshotFactory(options) {
     // checkout filters such as core.autocrlf. Mirror the complete candidate
     // file set after the safe clone is established so the checker sees the
     // exact frozen bytes, including tracked deletions and untracked files.
-    const candidateNames = Buffer.from(runGit(sourcePath, ['ls-files', '-co', '--exclude-standard', '-z'], {
-      encoding: null, environment: sourceEnvironment,
-    })).toString('utf8').split('\0').filter(Boolean)
+    const candidateNames = workspaceCandidateNames(
+      sourcePath, sourceEnvironment, candidateResources, options.targetPath,
+    )
     const candidateNameSet = new Set(candidateNames)
-    const clonedNames = Buffer.from(runGit(snapshotPath, ['ls-files', '-co', '--exclude-standard', '-z'], {
-      encoding: null, environment: sourceEnvironment,
-    })).toString('utf8').split('\0').filter(Boolean)
+    const clonedNames = workspaceCandidateNames(
+      snapshotPath, sourceEnvironment, candidateResources, options.targetPath,
+    )
     for (const relative of clonedNames) {
       if (candidateNameSet.has(relative)) continue
       const destination = path.join(snapshotPath, ...relative.split('/'))
@@ -26669,7 +30805,19 @@ function createDefaultRuntimeOptions(input) {
         }
       }
       let openedRuntimeState = stateStore.load()
+      let durableTerminalIntent = null
+      try {
+        durableTerminalIntent = record.readTerminalFinalizationIntent()
+      } catch (error) {
+        if (!error || error.code !== 'TERMINAL_FINALIZATION_INTENT_REQUIRED') throw error
+      }
       if (openedRuntimeState.state === 'RELEASING_LOCK') {
+        if (!durableTerminalIntent) {
+          throw new SupervisorIntegrationError(
+            'TERMINAL_FINALIZATION_INTENT_REQUIRED',
+            'release reconciliation requires the immutable pre-release terminal selection',
+          )
+        }
         if (generation !== openedRuntimeState.activation.generation + 1) {
           throw new SupervisorIntegrationError(
             'GENERATION_CONFLICT',
@@ -26685,12 +30833,22 @@ function createDefaultRuntimeOptions(input) {
         })
         runtimeOptions.releaseReconciliation = {
           outcome: releaseEvidence.outcome,
-          route: null,
-          deliverables: openedRuntimeState.terminal && openedRuntimeState.terminal.deliverableManifest || [],
-          checkHashes: [],
-          terminalEnvelope: openedRuntimeState.terminal && openedRuntimeState.terminal.terminalEnvelope || null,
+          route: durableTerminalIntent.route,
+          deliverables: durableTerminalIntent.deliverableManifest,
+          checkHashes: durableTerminalIntent.checkHashes,
+          terminalEnvelope: durableTerminalIntent.terminalEnvelope,
+          reason: durableTerminalIntent.reason,
+          unblockPath: durableTerminalIntent.unblockPath,
+          expectedEpoch: durableTerminalIntent.workspaceEpoch,
+          finalResponse: durableTerminalIntent.finalResponse,
           evidence: releaseEvidence,
         }
+      } else if (generation > 1 && durableTerminalIntent) {
+        openedRuntimeState = stateStore.adoptTerminalFinalizationIntent({
+          capability: lease,
+          expectedGeneration: generation - 1,
+          intent: durableTerminalIntent,
+        })
       }
       if (generation > 1) {
         const savedBudget = openedRuntimeState.budgets
@@ -26995,7 +31153,7 @@ function createDefaultRuntimeOptions(input) {
           planLineageTransaction,
         })
       }
-      if (generation > 1 && !runtimeOptions.releaseReconciliation) {
+      if (generation > 1 && !runtimeOptions.releaseReconciliation && !durableTerminalIntent) {
         const predecessorState = stateStore.load()
         if (['DONE', 'PARTIAL', 'BLOCKED', 'CANCELLED', 'FAILED'].includes(predecessorState.state)) {
           throw new SupervisorIntegrationError(
@@ -27096,6 +31254,13 @@ function createDefaultRuntimeOptions(input) {
           ? pendingCrashResume.decodedScheduler.schedulerState
           : pendingCrashResume.decodedScheduler
         currentRoute = decodedBase.route === 'PENDING' ? null : decodedBase.route
+      }
+      if (durableTerminalIntent) {
+        // Terminal replay is a controller-local completion path. The exact
+        // provider result is already immutable and the predecessor process
+        // tree was authenticated as drained during generation adoption, so do
+        // not run capability probes or initialize another model adapter.
+        return record
       }
       const targetKey = missionLock.verifyCapability(lease).targetIdentity
       // The process registry intentionally retains terminal identities across
@@ -27337,6 +31502,7 @@ function createDefaultRuntimeOptions(input) {
       processOwner,
       missionLock,
       capability: lease,
+      runRecord: record,
       cleanupRegistry,
       completionBoundary: () => record.assertBoundary({ phase: 'completion' }),
     }),
@@ -27405,19 +31571,101 @@ function createDefaultRuntimeOptions(input) {
         isolationBindingHash: isolation && isolation.bindingHash,
         cause: `Commit observed owned postimages for ${workItemId}.`,
       }),
+      resolve: ({ permit, postimages = [], isolation }) => {
+        const current = stateStore.load()
+        if (!permit || !isolation || permit.isolationBindingHash !== isolation.bindingHash) {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            'mutation reconciliation lacks its exact permit and isolation',
+          )
+        }
+        if (current.activeMutation) {
+          if (!sameCanonicalValue(current.activeMutation, permit)) {
+            throw new SupervisorIntegrationError(
+              'CRASH_ADOPTION_CONFLICT',
+              'mutation reconciliation found a foreign active permit',
+            )
+          }
+          return Object.freeze({ status: 'ACTIVE', permit })
+        }
+        const expectedPostimages = postimages
+          .filter(entry => entry.type === 'file')
+          .map(({ path: filePath, hash }) => ({ path: filePath, hash }))
+        const expectedDeletions = postimages
+          .filter(entry => entry.type === 'missing')
+          .map(entry => entry.path)
+        for (const event of [...stateStore.eventLog.readAll()].reverse()) {
+          const details = event && event.details || {}
+          if (details.permitId === permit.id) {
+            if (typeof details.failureCode === 'string') {
+              return Object.freeze({ status: 'ABORTED', permit, eventHash: event.hash })
+            }
+            if (Array.isArray(details.postimages) && Array.isArray(details.deletions)) {
+              if (stableStringify(details.postimages) !== stableStringify(expectedPostimages) ||
+                  stableStringify(details.deletions) !== stableStringify(expectedDeletions)) {
+                throw new SupervisorIntegrationError(
+                  'CRASH_ADOPTION_CONFLICT',
+                  'durable mutation commit event binds foreign postimages',
+                )
+              }
+              return Object.freeze({ status: 'COMMITTED', permit, eventHash: event.hash })
+            }
+          }
+          if (details.abandonedMutation && details.abandonedMutation.permitId === permit.id) {
+            if (details.abandonedMutation.isolationBindingHash !== isolation.bindingHash) {
+              throw new SupervisorIntegrationError(
+                'CRASH_ADOPTION_CONFLICT',
+                'adopted mutation event binds a foreign isolation',
+              )
+            }
+            return Object.freeze({ status: 'ADOPTED_ACTIVE', permit, eventHash: event.hash })
+          }
+        }
+        throw new SupervisorIntegrationError(
+          'MUTATION_COMMIT_AUTHORITY_UNKNOWN',
+          'runtime state has no exact active, committed, aborted, or adopted mutation event',
+        )
+      },
+      adopt({ isolation }) {
+        const current = stateStore.load()
+        if (current.activeMutation) {
+          if (current.activeMutation.isolationBindingHash !== isolation.bindingHash) {
+            throw new SupervisorIntegrationError(
+              'CRASH_ADOPTION_CONFLICT',
+              'adopted worker found a foreign active mutation permit',
+            )
+          }
+          return Object.freeze({ status: 'ACTIVE', permit: current.activeMutation })
+        }
+        const admitted = [...stateStore.eventLog.readAll()].reverse().find(event => {
+          const permit = event && event.details && event.details.permit
+          return permit && permit.isolationBindingHash === isolation.bindingHash
+        })
+        if (!admitted) return null
+        return this.resolve({ permit: admitted.details.permit, postimages: [], isolation })
+      },
       abort: ({ permit, isolation, workItemId, error }) => stateStore.abortAuthorizedMutation(permit, {
         capability: leaseRef,
         isolationBindingHash: isolation && isolation.bindingHash,
         cause: `Close failed owned mutation permit for ${workItemId}.`,
         failureCode: error && error.code || 'WORKER_FAILED',
       }),
-      recoverCommit: ({ postimages, isolation, workItemId, journalPath }) => {
+      recoverCommit: ({ permit, postimages, isolation, workItemId, journalPath, commitRecord }) => {
         const journal = readChecksummedJson(journalPath)
         if (!journal || !['COMMITTED', 'FINALIZED'].includes(journal.status) ||
             !isolation || journal.binding.bindingHash !== isolation.bindingHash) {
           throw new SupervisorIntegrationError(
             'DONE_RETRY_RECOVERY_INVALID',
             'physical promotion recovery requires the exact committed worker journal',
+          )
+        }
+        if (commitRecord && (commitRecord.permitHash !== hashText(stableStringify(permit)) ||
+            commitRecord.isolationBindingHash !== isolation.bindingHash ||
+            commitRecord.workItemId !== workItemId ||
+            stableStringify(commitRecord.postimages) !== stableStringify(postimages))) {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            'physical promotion recovery carries a foreign external commit record',
           )
         }
         for (const postimage of postimages) {
@@ -27437,7 +31685,16 @@ function createDefaultRuntimeOptions(input) {
           cause: `Recover journal-proven committed mutation state for ${workItemId}.`,
           workHashes: postimages.filter(item => item.type === 'file').map(item => item.hash),
           details: {
-            recoveryKind: 'DEFERRED_PROMOTION_COMMIT_RECOVERED',
+            recoveryKind: commitRecord
+              ? 'EXTERNAL_LOCAL_MUTATION_COMMIT_RECOVERED'
+              : 'DEFERRED_PROMOTION_COMMIT_RECOVERED',
+            ...(permit ? {
+              permitId: permit.id,
+              postimages: postimages.filter(entry => entry.type === 'file')
+                .map(({ path: filePath, hash }) => ({ path: filePath, hash })),
+              deletions: postimages.filter(entry => entry.type === 'missing')
+                .map(entry => entry.path),
+            } : {}),
             workItemId,
             journalPath,
             isolationBindingHash: isolation.bindingHash,
@@ -27492,6 +31749,7 @@ function createDefaultRuntimeOptions(input) {
         baselineTarget,
         baselineEnvironment,
         explicitExternalLocalResources(assignment, baselineTarget),
+        assignment.resources,
       )
       const observableChecks = Array.isArray(request && request.checks) && request.checks.length
         ? request.checks.map(String)
@@ -27579,7 +31837,7 @@ function createDefaultRuntimeOptions(input) {
         environment: testEnvironment,
       })
       const baselineRouteDecisionHash = resolvePreMutationRouteDecisionHash(request, exactFileHash)
-      return createProductionPreMutationBaseline({
+      const baseline = createProductionPreMutationBaseline({
         capturedBeforeMutation: true,
         targetStateHash,
         environmentHash: hashEnvironment(baselineEnvironment),
@@ -27601,6 +31859,24 @@ function createDefaultRuntimeOptions(input) {
           observableChecks,
         },
       })
+      const artifactReceipt = createTrustedTestArtifactReceipt(existingTests, baseline)
+      const artifactReceiptRelative = trustedTestArtifactReceiptPath(baseline.recordHash)
+      const artifactReceiptAbsolute = recordRef.resolve(artifactReceiptRelative)
+      if (fs.existsSync(artifactReceiptAbsolute)) {
+        const existingReceipt = readRegularJson(
+          artifactReceiptAbsolute,
+          'trusted pre-mutation test dependency receipt',
+        ).parsed
+        if (stableStringify(existingReceipt) !== stableStringify(artifactReceipt)) {
+          throw new SupervisorIntegrationError(
+            'CRASH_ADOPTION_CONFLICT',
+            'trusted pre-mutation test dependency receipt changed after capture',
+          )
+        }
+      } else {
+        recordRef.write(artifactReceiptRelative, `${JSON.stringify(artifactReceipt, null, 2)}\n`)
+      }
+      return baseline
     },
     runtimeStateProvider: () => stateStore.load(),
     rolePolicy: liveRolePolicy,
@@ -27635,10 +31911,10 @@ function createDefaultRuntimeOptions(input) {
     },
     limits: {
       wallMs,
-      // Default production admits exactly the minimal automatic DIRECT token
-      // topology (route + worker + checker). Callers may explicitly choose a
-      // larger activation budget, but required-completion branding never
-      // authorizes another model launch after this token boundary is reached.
+      // No hidden Autoprompt token deadline applies to required work. An
+      // explicit caller value is enforced as the aggregate activation ceiling;
+      // otherwise this MAX_SAFE accounting ceiling merely records usage while
+      // the host/provider retains its own outer limits.
       tokens: resolveActivationTokenLimit(context.tokenLimit),
       sessions: clampNonNegInt(context.sessionLimit, 128),
       launches: clampNonNegInt(context.launchLimit, 128),
@@ -27654,9 +31930,12 @@ function createDefaultRuntimeOptions(input) {
   runtimeOptions.executeRoute = createDefaultRouteExecutor({
     targetPath,
     gitEnvironment,
-    mission: activationRecord.request.canonicalJson,
     runId: activation.runId,
     activationId: activation.runId,
+    // External-local ownership is admitted only when its exact absolute path
+    // occurs in this immutable request. Keep the original request wired into
+    // the production executor; missionHash alone cannot prove textual scope.
+    mission: activationRecord.request.canonicalJson,
     missionHash,
     monotonicNow: typeof context.monotonicNow === 'function'
       ? context.monotonicNow : () => Number(process.hrtime.bigint() / 1000000n),
@@ -27940,6 +32219,22 @@ function createDefaultRuntimeOptions(input) {
         throw error
       }
     },
+    readTrustedTestArtifactReceipt(baseline) {
+      if (!recordRef || !baseline) return null
+      const absolute = recordRef.resolve(trustedTestArtifactReceiptPath(baseline.recordHash))
+      if (!fs.existsSync(absolute)) return null
+      const receipt = readRegularJson(
+        absolute,
+        'trusted pre-mutation test dependency receipt',
+      ).parsed
+      if (!validateTrustedTestArtifactReceipt(receipt, baseline)) {
+        throw new SupervisorIntegrationError(
+          'TRUSTED_TEST_ARTIFACT_BINDING_INVALID',
+          'trusted pre-mutation test dependency receipt is malformed or foreign',
+        )
+      }
+      return Object.freeze(receipt)
+    },
     persistStructuredFinalResponse(response, binding = {}) {
       if (!recordRef) {
         throw new SupervisorIntegrationError(
@@ -27976,6 +32271,16 @@ function createDefaultRuntimeOptions(input) {
         hash: sha256Bytes(bytes),
         bytes: bytes.length,
       })
+    },
+    onStructuredFinalResponsePersisted(response) {
+      const runtime = runtimeOptions.runtimeInstance
+      if (!runtime) {
+        throw new SupervisorIntegrationError(
+          'RUN_RECORD_FAILURE',
+          'structured final-response survival requires the active supervisor runtime',
+        )
+      }
+      return runtime._rememberStructuredFinalResponse(response)
     },
     resultPointer(workItemId) {
       if (!recordRef) throw new SupervisorIntegrationError('RUN_RECORD_FAILURE', 'result pointer requires the opened run record')
@@ -28130,6 +32435,7 @@ module.exports = {
   SUPERVISOR_ADAPTER_INTERFACE,
   TERMINAL_OUTCOMES,
   WORK_CHECKS,
+  WORKER_REQUIREMENT_FIDELITY_DOCTRINE,
   admitCodexRoleSelection,
   admitRoadmapExpansion,
   assertReadOnlyCheckerOperation,
@@ -28172,6 +32478,7 @@ module.exports = {
   createArtifactCoverageContract,
   applyProductionRuntimeTransition,
   bindResidualRiskAuthorityReceipt,
+  canonicalRoleAssignment,
   createDefaultExternalOperation,
   createResidualRiskDisposition,
   createMinimalTestEnvironment,
@@ -28247,6 +32554,7 @@ module.exports = {
   rollbackExplicitExternalLocalBoundary,
   commitExplicitExternalLocalBoundary,
   quarantineExplicitExternalLocalBoundary,
+  preserveExplicitExternalLocalCandidate,
   externalLocalTransportQuarantinePointer,
   findExternalLocalTransportQuarantinePointer,
   seedExplicitExternalLocalBoundaryFromQuarantine,

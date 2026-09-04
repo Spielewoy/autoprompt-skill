@@ -15,7 +15,10 @@ const ROUTE_DECISION_SCHEMA_VERSION = '2.0.0'
 const ROUTE_RECOMMENDATION_SCHEMA_ID = ROUTE_RECOMMENDATION_SCHEMA.$id
 const ROUTE_DECISION_SCHEMA_ID = ROUTE_DECISION_SCHEMA.$id
 const ROUTE_ANALYST_ADMISSION_SCHEMA_ID = 'autoprompt.route-analyst-admission.v2'
-const ROUTE_ANALYST_MAX_DURATION_MS = 2 * 60 * 1000
+// Route analysis is optional admission work. One minute is enough to return a
+// bounded recommendation; after that the deterministic conservative product
+// path starts instead of spending product time on more routing.
+const ROUTE_ANALYST_MAX_DURATION_MS = 60 * 1000
 const L0_DECISION_MAX_DURATION_MS = 4 * 60 * 1000
 const L0_DECISION_CONVERGENCE_WATCHDOG_MS = 30 * 60 * 1000
 const LIGHT_PLAN_MAX_DURATION_MS = 5 * 60 * 1000
@@ -592,7 +595,9 @@ function validateRouteAnalystAdmission(admission) {
     errors.push('route analyst must be one L3 child of the deterministic control plane')
   }
   if (admission.session_count !== 1 || admission.max_sessions !== 1) errors.push('exactly one route-analyst session is required')
-  if (admission.max_duration_ms !== ROUTE_ANALYST_MAX_DURATION_MS) errors.push('route analyst ceiling must be 120000ms')
+  if (admission.max_duration_ms !== ROUTE_ANALYST_MAX_DURATION_MS) {
+    errors.push(`route analyst ceiling must be ${ROUTE_ANALYST_MAX_DURATION_MS}ms`)
+  }
   if (admission.restart_policy !== 'NEVER') errors.push('route analyst must not be relaunched')
   const permissions = admission.permissions
   if (!isObject(permissions)) {

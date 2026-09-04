@@ -129,10 +129,10 @@ test('TRACE-006 missing first product signal records convergence without stoppin
   const scheduler = new CentralScheduler({
     route: 'DIRECT', runIdentity: { runId: 'runtime-residual-r9', generation: 1 },
   })
-  const measurement = scheduler.assertFirstProductSignalDue({ elapsedMs: 360_001 })
+  const measurement = scheduler.assertFirstProductSignalDue({ elapsedMs: 300_001 })
   assert.deepEqual(measurement, {
-    kind: 'MISSING', elapsedMs: 360_001, evidenceHash: null,
-    ceilingMs: 360_000, withinCeiling: false,
+    kind: 'MISSING', elapsedMs: 300_001, evidenceHash: null,
+    ceilingMs: 300_000, withinCeiling: false,
     reason: 'no RED or product edit was emitted',
   })
   assert.equal(scheduler.getMetrics().admission.breaches.includes('admission:firstProductSignal'), true)

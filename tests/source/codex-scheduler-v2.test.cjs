@@ -171,6 +171,20 @@ test('benchmark flags never authorize extra model generations', async () => {
   assert.equal(scheduler.budget.maxChildLaunches, ROUTE_BUDGETS.DIRECT.maxChildLaunches)
 })
 
+test('orderly scheduler disposal is not reported as rejected work', async () => {
+  const scheduler = createTestScheduler()
+  const lease = await admit(scheduler, { workItemId: 'completed-before-close' })
+  finish(lease)
+  scheduler.dispose('normal terminal finalization')
+  assert.equal(scheduler.getMetrics().counters.rejectedByCode.SCHEDULER_CLOSED || 0, 0)
+  await assert.rejects(
+    admit(scheduler, { workItemId: 'late-after-close' }),
+    error => error.code === 'SCHEDULER_CLOSED',
+  )
+  assert.equal(scheduler.getMetrics().counters.rejectedByCode.SCHEDULER_CLOSED || 0, 0,
+    'post-terminal caller mistakes remain errors but do not rewrite completed-run admission metrics')
+})
+
 test('undersized global launch targets yield only to issuer-authenticated required graph identities', async () => {
   const settings = resolveSchedulerSettings({ route: 'DIRECT', requiredChildLaunches: 2 })
   const scheduler = createTestScheduler({ settings })
@@ -577,13 +591,13 @@ test('admission and session accounting stay componentized and reconcile exactly'
   scheduler.recordAdmissionComponent('runRecord', 10000)
   scheduler.recordAdmissionComponent('persistence', 10000)
   scheduler.recordAdmissionComponent('firstChildStartup', 10000)
-  scheduler.recordAdmissionComponent('routeAnalyst', 100000)
+  scheduler.recordAdmissionComponent('routeAnalyst', 60000)
   scheduler.recordAdmissionComponent('routeDecision', 200000)
   const admission = scheduler.recordAdmissionComponent('lightPlanning', 200000)
   assert.equal(admission.withinCeiling, true)
-  assert.equal(admission.includedMs, 540000)
+  assert.equal(admission.includedMs, 500000)
   scheduler.recordAdmissionComponent('waitingUser', 999999)
-  assert.equal(scheduler.checkAdmissionTime().includedMs, 540000)
+  assert.equal(scheduler.checkAdmissionTime().includedMs, 500000)
 
   const lease = await admit(scheduler, {
     workItemId: 'accounted-worker',
@@ -1267,7 +1281,7 @@ test('a nonempty resource manifest is write-producing and nested workspaces cann
 
 test('an admission target breach admits essential work sequentially and collapses optional expansion', async () => {
   const scheduler = createTestScheduler()
-  const verdict = scheduler.recordAdmissionComponent('routeAnalyst', (2 * 60 * 1000) + 1)
+  const verdict = scheduler.recordAdmissionComponent('routeAnalyst', (60 * 1000) + 1)
   assert.equal(verdict.withinCeiling, false)
   assert.equal(verdict.withinTarget, false)
   const required = await admit(scheduler, { workItemId: 'late-required-work' })
@@ -1312,7 +1326,7 @@ test('ROADMAP retained ancestors cannot deadlock low global or lane live ceiling
       lanes: { main: { maxLive: scenario.laneMaxLive } },
     })
     const scheduler = new CentralScheduler({ settings, runIdentity: TEST_RUN })
-    if (scenario.converged) scheduler.recordAdmissionComponent('routeAnalyst', (2 * 60 * 1000) + 1)
+    if (scenario.converged) scheduler.recordAdmissionComponent('routeAnalyst', (60 * 1000) + 1)
     assert.equal(scheduler.checkAdmissionTime().convergenceRequired, scenario.converged, scenario.name)
 
     const coordinator = await admit(scheduler, {

@@ -10,6 +10,7 @@ const test = require('node:test')
 
 const {
   CodexSupervisorRuntime,
+  applyProductionRuntimeTransition,
   assertIndependentScratchPassConfirmations,
   checkerRecoveryNextReady,
   codexPhysicalExecutionReceipt,
@@ -991,6 +992,76 @@ test('structurally unbound checker evidence reaches every distinct seat before r
       assert.equal(outcome.checkHashes.length, 1, event)
     }
   }
+})
+
+test('verification-limited executor keeps the source receipt hash through production runtime transitions', async t => {
+  const runtime = capturedDomainAdmissionRuntimeFixture(t)
+  const targetPath = cleanRepository(t)
+  const transitions = []
+  let checkerAssignment = ''
+  let checkerDoctrine = []
+  const outcome = await createDefaultRouteExecutor({
+    targetPath,
+    gitEnvironment: () => process.env,
+    transition: async (eventId, nextState, details) => {
+      transitions.push({ eventId, nextState, details: structuredClone(details) })
+      if (!['CHECK_INCONCLUSIVE', 'CHECK_BECAME_CONCLUSIVE', 'ACCEPTANCE_GREEN']
+        .includes(eventId)) {
+        return runtime.stateStore.transition(nextState, {
+          capability: runtime.capability,
+          cause: `test setup transition ${eventId}`,
+          eventId,
+        })
+      }
+      return applyProductionRuntimeTransition({
+        stateStore: runtime.stateStore,
+        capability: runtime.capability,
+        budgetController: { snapshot: () => null },
+      }, { eventId, nextState, details })
+    },
+    harnessAttestation: () => ({ repoHash: H, buildHash: H, oracleHash: H }),
+    persistStructuredFinalResponse: structuredResponsePersistence(t),
+  })({
+    route: 'DIRECT',
+    decision: readOnlyDecision('inspect'),
+    launch: async request => {
+      if (request.workItemId === 'work-1') return structuredWorkerResult()
+      checkerAssignment = request.assignment
+      checkerDoctrine = request.fetchedEvidence.verificationDoctrine
+      return structurallyUnboundPass('CHECK_OBSERVATION_INCOMPLETE')
+    },
+    completeRetainedLease: () => {},
+    resumeAdoptedLaunches: async () => ({}),
+    resumeState: null,
+  })
+
+  assert.equal(outcome.outcome, 'DONE', JSON.stringify(outcome))
+  assert.equal(outcome.terminalEnvelope.status, 'DONE_WITH_VERIFICATION_LIMITATIONS')
+  assert.match(outcome.terminalEnvelope.sourceCheckerResultHash, /^[a-f0-9]{64}$/u)
+  assert.match(outcome.terminalEnvelope.checkerResultHash, /^[a-f0-9]{64}$/u)
+  assert.notEqual(
+    outcome.terminalEnvelope.sourceCheckerResultHash,
+    outcome.terminalEnvelope.checkerResultHash,
+    'the synthesized limitation has a distinct acceptance hash',
+  )
+  const inconclusive = transitions.find(item => item.eventId === 'CHECK_INCONCLUSIVE')
+  const closed = transitions.find(item => item.eventId === 'CHECK_BECAME_CONCLUSIVE')
+  const accepted = transitions.find(item => item.eventId === 'ACCEPTANCE_GREEN')
+  assert.equal(
+    inconclusive.details.checkerResultHash,
+    outcome.terminalEnvelope.sourceCheckerResultHash,
+  )
+  assert.equal(
+    inconclusive.details.controllerReassessment.priorResultEvidenceHash,
+    outcome.terminalEnvelope.sourceCheckerResultHash,
+  )
+  assert.equal(closed.details.checkerResultHash,
+    outcome.terminalEnvelope.sourceCheckerResultHash)
+  assert.deepEqual(accepted.details.checkHashes,
+    [outcome.terminalEnvelope.checkerResultHash])
+  assert.equal(runtime.stateStore.load().state, 'FINAL_CHECK')
+  assert.match(checkerDoctrine.join(' '), /immutable, including during reads/u)
+  assert.match(checkerAssignment, /immutable even for database and compiler reads/u)
 })
 
 test('an unbound first checker yields to a distinct authenticated checker and product repair', async t => {

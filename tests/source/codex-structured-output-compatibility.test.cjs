@@ -425,6 +425,19 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   const discoveredShellHarnessPath = path.join(frozen, 'focused-check.sh')
   fs.writeFileSync(discoveredNodeHarnessPath, "'use strict'\n")
   fs.writeFileSync(discoveredShellHarnessPath, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+  const trustedNodeHarnessBytes = fs.readFileSync(discoveredNodeHarnessPath)
+  const trustedNodeHarnessStat = fs.statSync(discoveredNodeHarnessPath)
+  const trustedNodeHarnessArtifacts = Object.freeze([Object.freeze({
+    kind: 'file',
+    relativePath: path.relative(frozen, discoveredNodeHarnessPath).replace(/\\/g, '/'),
+    digest: crypto.createHash('sha256').update(stableStringify({
+      schemaVersion: 1,
+      kind: 'file',
+      mode: trustedNodeHarnessStat.mode & 0o777,
+      bytes: trustedNodeHarnessBytes.length,
+      contentHash: crypto.createHash('sha256').update(trustedNodeHarnessBytes).digest('hex'),
+    })).digest('hex'),
+  })])
   const candidateHash = 'b'.repeat(64)
   const requestEnvelopeHash = 'a'.repeat(64)
   const checkId = 'verification:privacy:reverse-uniqueness:LONG_UNIQUE_CHECK_SENTINEL_7d0a2b41'
@@ -473,6 +486,7 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
     commandEvents,
     checkIds = [checkId],
     authorizedCommand = 'python3 independent_harness.py',
+    authorizedArtifacts = trustedNodeHarnessArtifacts,
     outcomeCommandHash,
     outcomeCommandHashes,
     outcomeObservationId,
@@ -488,6 +502,7 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
         commandBindings: checkIds.map(namedCheck => ({
           checkId: namedCheck,
           command: authorizedCommand,
+          artifacts: authorizedArtifacts,
         })),
       }),
     })
@@ -804,6 +819,23 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   })
   assert.equal(authorizedGenericCommand.code, 'PASS',
     'controller authorization remains executable-agnostic')
+  assert.equal(
+    authorizedGenericCommand.transportEvidence.verificationObservations
+      .receipts[0].trustedTestArtifactsMatched,
+    true,
+    'terminal exact-command PASS retains the pre-mutation test artifact identity',
+  )
+
+  const commandOnlyAuthorization = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: genericCommand,
+    authorizedArtifacts: [], compactOutcomes: true,
+    commandEvents: [{
+      command: genericCommand, status: 'completed', exit_code: 0,
+      aggregated_output: summary,
+    }],
+  })
+  assert.equal(commandOnlyAuthorization.code, 'CHECK_INCONCLUSIVE',
+    'an immutable command string and hash without a pre-mutation program identity cannot certify PASS')
 
   const authorizedWrappedGenericCommand = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: genericCommand,
@@ -816,14 +848,55 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   assert.equal(authorizedWrappedGenericCommand.code, 'PASS',
     'an exact inner command authorization binds its Codex-owned shell wrapper')
 
+  let modifiedTrustedHarnessPass
+  fs.writeFileSync(
+    discoveredNodeHarnessPath,
+    `'use strict'\nconsole.log(${JSON.stringify(summary)})\n`,
+  )
+  try {
+    modifiedTrustedHarnessPass = await runScenario({
+      aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: genericCommand,
+      compactOutcomes: true,
+      commandEvents: [{
+        command: genericCommand, status: 'completed', exit_code: 0,
+        aggregated_output: summary,
+      }],
+    })
+  } finally {
+    fs.writeFileSync(discoveredNodeHarnessPath, trustedNodeHarnessBytes)
+  }
+  assert.equal(modifiedTrustedHarnessPass.code, 'CHECK_INCONCLUSIVE',
+    'an exact command string cannot authorize PASS after its pre-mutation test program changes')
+  assert.equal(
+    modifiedTrustedHarnessPass.transportEvidence.verificationObservations
+      .receipts[0].trustedTestArtifactsMatched,
+    false,
+  )
+
+  const candidateCreatedNoopPath = path.join(frozen, 'candidate-created-noop.cjs')
+  fs.writeFileSync(
+    candidateCreatedNoopPath,
+    `'use strict'\nconsole.log(${JSON.stringify(summary)})\n`,
+  )
+  const candidateCreatedNoopPass = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [{
+      command: `node ${JSON.stringify(candidateCreatedNoopPath)}`,
+      status: 'completed', exit_code: 0, aggregated_output: summary,
+    }],
+  })
+  assert.equal(candidateCreatedNoopPass.code, 'CHECK_INCONCLUSIVE',
+    'a candidate-created no-op harness can never self-certify terminal PASS')
+
   const discoveredHarness = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
     commandEvents: [{
       command: genericCommand, status: 'completed', exit_code: 0, aggregated_output: summary,
     }],
   })
-  assert.equal(discoveredHarness.code, 'PASS',
-    'a conservative candidate harness can cover a descriptive check without treating its prose as a command')
+  assert.equal(discoveredHarness.code, 'CHECK_INCONCLUSIVE',
+    'a candidate-resident harness is useful for diagnostics but cannot self-certify PASS')
 
   const toolWrappedDiscoveredHarness = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
@@ -833,8 +906,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       status: 'completed', exit_code: 0, aggregated_output: summary,
     }],
   })
-  assert.equal(toolWrappedDiscoveredHarness.code, 'PASS',
-    'the exact Codex tool shell wrapper preserves an immutable candidate harness')
+  assert.equal(toolWrappedDiscoveredHarness.code, 'CHECK_INCONCLUSIVE',
+    'a tool wrapper cannot promote a candidate-resident harness to PASS authority')
 
   const wrappedByTimeoutHarness = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
@@ -844,8 +917,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       status: 'completed', exit_code: 0, aggregated_output: summary,
     }],
   })
-  assert.equal(wrappedByTimeoutHarness.code, 'PASS',
-    'a transparent timeout wrapper preserves a real frozen-candidate harness binding')
+  assert.equal(wrappedByTimeoutHarness.code, 'CHECK_INCONCLUSIVE',
+    'a timeout wrapper cannot promote a candidate-resident harness to PASS authority')
 
   const ambiguousCompactPass = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
@@ -879,8 +952,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       status: 'completed', exit_code: 0, aggregated_output: summary,
     }],
   })
-  assert.equal(discoveredShellHarness.code, 'PASS',
-    'a script-file harness inside the frozen candidate is admissible without inline shell execution')
+  assert.equal(discoveredShellHarness.code, 'CHECK_INCONCLUSIVE',
+    'a candidate-resident shell harness cannot self-certify PASS')
 
   const inlineShellHarness = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
@@ -995,6 +1068,48 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       .scratchHarnessProgramDigest,
     'the provisional authority retains the controller-observed sealed bytes',
   )
+
+  const semanticScratchPass = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [{
+      command: wrappedStrictScratchHarness, status: 'completed', exit_code: 0,
+      aggregated_output: JSON.stringify({
+        ok: true, runs: [0, 0, 0], rows: 12345, errors: [],
+      }),
+    }],
+  })
+  assert.equal(semanticScratchPass.code, 'CHECK_INCONCLUSIVE',
+    'a contradiction-free semantic JSON summary is useful only as provisional evidence')
+  assert.equal(semanticScratchPass.cause.event, 'CHECK_SCRATCH_CONFIRMATION_REQUIRED')
+  assert.equal(
+    semanticScratchPass.payload.verificationAuthority.checks[0].authority,
+    'SCRATCH_HARNESS',
+  )
+
+  for (const [name, summary] of Object.entries({
+    errors: { ok: true, runs: [0, 0, 0], rows: 12, errors: ['mismatch'] },
+    failures: { ok: true, runs: [0, 0, 0], rows: 12, failures: ['mismatch'] },
+    failedCount: { ok: true, runs: [0, 0, 0], rows: 12, failedCount: 1 },
+    failCount: { ok: true, runs: [0, 0, 0], rows: 12, failCount: 1 },
+    testsFailed: { ok: true, runs: [0, 0, 0], rows: 12, testsFailed: 1 },
+    nonzeroRun: { ok: true, runs: [0, 1, 0], rows: 12, errors: [] },
+    nestedFailure: {
+      ok: true, runs: [0], rows: 12, errors: [], results: [{ status: 'FAIL' }],
+    },
+  })) {
+    const contradicted = await runScenario({
+      aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+      compactOutcomes: true,
+      commandEvents: [{
+        command: wrappedStrictScratchHarness, status: 'completed', exit_code: 0,
+        aggregated_output: JSON.stringify(summary),
+      }],
+    })
+    assert.equal(contradicted.code, 'CHECK_INCONCLUSIVE', name)
+    assert.notEqual(contradicted.cause.event, 'CHECK_SCRATCH_CONFIRMATION_REQUIRED', name)
+    assert.equal(contradicted.payload.verificationAuthority, undefined, name)
+  }
 
   const unsealedScratchHarnessPass = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
@@ -1469,9 +1584,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       command: genericCommand, status: 'completed', exit_code: 0, aggregated_output: summary,
     }],
   })
-  assert.equal(wrongObservationId.code, 'PASS',
-    'a model-guessed controller observation ID is discarded instead of hiding real evidence')
-  assert.notEqual(wrongObservationId.payload.testOutcomes[0].observationId, 'f'.repeat(64))
+  assert.equal(wrongObservationId.code, 'CHECK_INCONCLUSIVE',
+    'discarding a guessed observation ID cannot promote candidate-owned evidence to PASS')
 
   const wrongCommandHash = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
@@ -1480,8 +1594,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       command: genericCommand, status: 'completed', exit_code: 0, aggregated_output: summary,
     }],
   })
-  assert.equal(wrongCommandHash.code, 'PASS',
-    'a model-guessed command selector is discarded in favor of controller-owned evidence')
+  assert.equal(wrongCommandHash.code, 'CHECK_INCONCLUSIVE',
+    'discarding a guessed command selector cannot promote candidate-owned evidence to PASS')
 
   const historicalScratchOutput = 'same frozen candidate, scratch oracle revision 1: FAIL'
   const unrelatedIntrospectionDrift = await runScenario({
@@ -1498,8 +1612,8 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
       },
     ],
   })
-  assert.equal(unrelatedIntrospectionDrift.code, 'PASS',
-    'changing output from an unrelated command cannot contradict a unique harness binding')
+  assert.equal(unrelatedIntrospectionDrift.code, 'CHECK_INCONCLUSIVE',
+    'unrelated output cannot promote a candidate-owned harness to PASS authority')
 
   const contradiction = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS',
@@ -1789,7 +1903,7 @@ test('Codex checker prompt removes duplicated doctrine while retaining exact obl
     'Cover every exact named check and verification obligation; one admissible harness may cover several IDs.',
     'PASS requires independently derived expected behavior and an executed end-to-end observable result on the frozen exact version. Static inspection may prove a concrete FAIL but never PASS.',
     'Exercise positive, negative, boundary, temporal-order, equivalence-separation, and adversarial composition cases wherever applicable; do not derive the expected result from the implementation being checked.',
-    'Bind PASS to one unique zero exit and a concrete product FAIL to one authenticated nonzero check. Setup, tool, dependency, or consumer unavailability is CHECK_INCONCLUSIVE or RUNTIME_FAILURE.',
+    'Bind PASS to one unique zero exit from unchanged controller-declared pre-mutation test inputs; newly created or modified harnesses never self-certify PASS. Bind a concrete product FAIL to one authenticated nonzero check. Setup, tool, dependency, or consumer unavailability is CHECK_INCONCLUSIVE or RUNTIME_FAILURE.',
     'Return every named test outcome plus the underlying evidence IDs and independent reference method; keep large evidence in scratch and return bounded diagnostics only.',
   ])
   assert.equal(
@@ -2763,6 +2877,234 @@ test('Codex adapter returns the exact committed terminal receipt despite a late 
   assert.notEqual(result.reportId, late.reportId)
 })
 
+test('Codex adapter preserves a persisted terminal result when its owned runner rejects during late close', async () => {
+  const committed = canonicalWorkerResult({ reportId: 'runner-rejected-after-terminal' })
+  const lateRunnerError = Object.assign(new Error('owned runner rejected after terminal drain began'), {
+    code: 'OWNED_RUNNER_CLOSED_AFTER_TERMINAL',
+    details: { boundary: 'wait-for-close' },
+  })
+  let launches = 0
+  let drainCalls = 0
+  let terminalCalls = 0
+  let persistedTerminal = null
+  const adapter = new CodexExecAdapter({
+    runner: {
+      async run(spec) {
+        launches += 1
+        spec.onStdoutLine(JSON.stringify({
+          type: 'thread.started', thread_id: '89898989-8989-4989-8989-898989898989',
+        }))
+        spec.onStdoutLine(JSON.stringify({
+          type: 'item.completed',
+          item: { type: 'agent_message', text: JSON.stringify(committed) },
+        }))
+        spec.onStdoutLine(JSON.stringify({
+          type: 'turn.completed',
+          usage: {
+            input_tokens: 7, cached_input_tokens: 2,
+            output_tokens: 3, reasoning_output_tokens: 1,
+          },
+        }))
+        throw lateRunnerError
+      },
+      async stop() {
+        drainCalls += 1
+        assert.equal(terminalCalls, 1, 'the terminal receipt is persisted before owned drain')
+        return { drained: true }
+      },
+    },
+    targetPath: ROOT,
+    profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+    outputSchemaResolver: () => path.join(
+      ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json',
+    ),
+  })
+  const result = await adapter.launch({
+    ...EXECUTION_POLICY, physicalExecutionPolicy: EXECUTION_POLICY,
+    ...adapterMissionFields('hash'),
+    dispatch: {
+      brief: 'Persist the exact result before transport close.',
+      requestPointer: { path: 'request', hash: 'hash' },
+    },
+    environment: {}, sessionId: 'runner-reject-after-terminal',
+    reservationId: 'runner-reject-after-terminal-reservation',
+    onTerminalResult(value) {
+      terminalCalls += 1
+      persistedTerminal = value
+    },
+  })
+
+  assert.deepEqual(result, persistedTerminal,
+    'late transport rejection cannot replace or reconstruct the persisted terminal result')
+  assert.equal(result.reportId, committed.reportId)
+  assert.deepEqual(result.usage, {
+    noncachedInput: 5, cachedInput: 2, output: 3, reasoning: 1,
+  })
+  assert.equal(launches, 1, 'the committed model turn is never relaunched')
+  assert.equal(drainCalls, 1)
+  assert.equal(terminalCalls, 1)
+  assert.deepEqual(result.terminalTransportReconciliation, {
+    schemaVersion: 1,
+    status: 'DEGRADED_AFTER_COMMITTED_TERMINAL',
+    durableTerminalReceipt: true,
+    ownedProcessDrain: 'OWNED_STOP_RECEIPT',
+    failures: [{
+      stage: 'runner-rejection',
+      code: lateRunnerError.code,
+      message: lateRunnerError.message,
+      detailsHash: crypto.createHash('sha256')
+        .update(stableStringify(lateRunnerError.details)).digest('hex'),
+    }],
+  })
+  assert.equal(Object.prototype.propertyIsEnumerable.call(
+    result, 'terminalTransportReconciliation'), false)
+})
+
+test('Codex adapter preserves a persisted terminal result across a late quota-proxy close failure', async t => {
+  const directory = temporaryDirectory(t)
+  const committed = canonicalWorkerResult({ reportId: 'quota-proxy-close-after-terminal' })
+  const closeError = Object.assign(new Error('quota proxy close failed after terminal commit'), {
+    code: 'QUOTA_PROXY_LATE_CLOSE_FAILED',
+  })
+  let launches = 0
+  let persistedTerminal = null
+  const quotaSnapshot = Object.freeze({
+    tokenLimit: 10_000,
+    requestCount: 0,
+    providerRequestCount: 0,
+    deniedCount: 0,
+    latestInputBound: 0,
+    latestMaximumUnaccountedTokens: 0,
+    usage: { noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 },
+    lastFailure: null,
+  })
+  const adapter = new CodexExecAdapter({
+    runner: {
+      async run(spec) {
+        launches += 1
+        for (const event of [
+          { type: 'thread.started', thread_id: '91919191-9191-4191-8191-919191919191' },
+          {
+            type: 'item.completed',
+            item: {
+              type: 'agent_message',
+              text: JSON.stringify({ canonicalJson: JSON.stringify(committed) }),
+            },
+          },
+          {
+            type: 'turn.completed',
+            usage: {
+              input_tokens: 7, cached_input_tokens: 2,
+              output_tokens: 3, reasoning_output_tokens: 1,
+            },
+          },
+        ]) spec.onStdoutLine(JSON.stringify(event))
+        return {
+          status: 0, stdout: '', stderr: '',
+          processOwned: true, exactArgv: true, drained: true,
+        }
+      },
+      async stop() { return { drained: true } },
+    },
+    targetPath: ROOT,
+    profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+    outputSchemaResolver: () => path.join(
+      ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json',
+    ),
+    providerSchemaRoot: path.join(directory, 'provider-schemas'),
+    async cumulativeQuotaProxyFactory() {
+      return {
+        baseUrl: 'http://127.0.0.1:1/v1',
+        snapshot() { return quotaSnapshot },
+        async close() { throw closeError },
+      }
+    },
+  })
+  const result = await adapter.launch({
+    ...EXECUTION_POLICY, physicalExecutionPolicy: EXECUTION_POLICY,
+    ...adapterMissionFields('hash'),
+    dispatch: {
+      brief: 'Persist the exact result before quota proxy close.',
+      requestPointer: { path: 'request', hash: 'hash' },
+    },
+    environment: {}, sessionId: 'quota-proxy-close-after-terminal',
+    reservationId: 'quota-proxy-close-after-terminal-reservation',
+    onTerminalResult(value) { persistedTerminal = value },
+  })
+
+  assert.deepEqual(result, persistedTerminal)
+  assert.equal(result.reportId, committed.reportId)
+  assert.equal(launches, 1, 'a late quota close failure never relaunches the committed model turn')
+  assert.deepEqual(result.terminalTransportReconciliation.failures, [{
+    stage: 'quota-proxy-close',
+    code: closeError.code,
+    message: closeError.message,
+    detailsHash: crypto.createHash('sha256').update(stableStringify({})).digest('hex'),
+  }])
+})
+
+test('Codex adapter carries a committed terminal receipt when late runner rejection lacks drain proof', async () => {
+  const committed = canonicalWorkerResult({ reportId: 'runner-rejected-undrained-terminal' })
+  let launches = 0
+  let persistedTerminal = null
+  const adapter = new CodexExecAdapter({
+    runner: {
+      async run(spec) {
+        launches += 1
+        for (const event of [
+          { type: 'thread.started', thread_id: '90909090-9090-4090-8090-909090909090' },
+          {
+            type: 'item.completed',
+            item: { type: 'agent_message', text: JSON.stringify(committed) },
+          },
+          {
+            type: 'turn.completed',
+            usage: {
+              input_tokens: 7, cached_input_tokens: 2,
+              output_tokens: 3, reasoning_output_tokens: 1,
+            },
+          },
+        ]) spec.onStdoutLine(JSON.stringify(event))
+        throw Object.assign(new Error('late rejection without drain proof'), {
+          code: 'OWNED_RUNNER_CLOSE_UNVERIFIED',
+        })
+      },
+      async stop() { return { drained: false } },
+    },
+    targetPath: ROOT,
+    profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+    outputSchemaResolver: () => path.join(
+      ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json',
+    ),
+  })
+
+  await assert.rejects(() => adapter.launch({
+    ...EXECUTION_POLICY, physicalExecutionPolicy: EXECUTION_POLICY,
+    ...adapterMissionFields('hash'),
+    dispatch: {
+      brief: 'Carry the exact committed result across an unverified close.',
+      requestPointer: { path: 'request', hash: 'hash' },
+    },
+    environment: {}, sessionId: 'runner-reject-undrained-terminal',
+    reservationId: 'runner-reject-undrained-terminal-reservation',
+    onTerminalResult(value) { persistedTerminal = value },
+  }), error => {
+    assert.equal(error.code, 'PROCESS_DRAIN_TIMEOUT')
+    assert.equal(error.details.retryDisposition, 'PRESERVE_COMMITTED_RESULT_WITHOUT_RELAUNCH')
+    assert.deepEqual(error.frozenTerminalResult, persistedTerminal)
+    assert.equal(error.frozenTerminalEvidence.sessionId,
+      '90909090-9090-4090-8090-909090909090')
+    for (const field of ['frozenTerminalResult', 'frozenTerminalEvidence']) {
+      const descriptor = Object.getOwnPropertyDescriptor(error, field)
+      assert.equal(descriptor.enumerable, false)
+      assert.equal(descriptor.writable, false)
+      assert.equal(descriptor.configurable, false)
+    }
+    return true
+  })
+  assert.equal(launches, 1, 'an unverified drain carries recovery authority without relaunching')
+})
+
 test('Codex buffered parser freezes the final message at the first turn.completed boundary', async t => {
   const directory = temporaryDirectory(t)
   const committed = canonicalWorkerResult({ reportId: 'buffered-committed-result' })
@@ -2958,6 +3300,8 @@ test('checker scratch authority creates private temp roots, enables non-Git Code
   assert.equal(observed.argv[observed.argv.indexOf('-C') + 1], boundary.writableScratchRoot)
   assert.match(observed.stdin, /AUTOPROMPT_CHECKER_SCRATCH_PROJECTION_V2/)
   assert.match(observed.stdin, new RegExp(JSON.stringify(frozen).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  assert.match(observed.stdin, /explicit read-only or immutable mode/u)
+  assert.match(observed.stdin, /verify the copy against the frozen source hash and size/u)
 })
 
 test('Codex adapter ignores an early progress agent message until the final structured turn result', async t => {

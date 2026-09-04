@@ -170,6 +170,11 @@ test('production CLI has no deferred or hard-coded bootstrap capability admissio
   const cliSource = Function.prototype.toString.call(runSupervisorCli)
   const optionsSource = Function.prototype.toString.call(createDefaultRuntimeOptions)
   assert.match(cliSource, /exactPathPreflight:\s*productionExactPathPreflight/)
+  assert.match(
+    optionsSource,
+    /createDefaultRouteExecutor\(\{[\s\S]*?mission:\s*activationRecord\.request\.canonicalJson,[\s\S]*?missionHash,/u,
+    'the production route executor must receive the immutable request used to authorize exact external paths',
+  )
   assert.doesNotMatch(optionsSource, /deferredProviderCapabilityAdmission/)
   assert.doesNotMatch(
     optionsSource,

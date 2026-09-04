@@ -1592,7 +1592,13 @@ function appendCompiledSection(source, rendered) {
 }
 
 function renderCodexSkill(contracts, canonical, routeExamples) {
-  const body = normalizePlainLanguageMarkdown(canonical, contracts.plainLanguage).trim()
+  const sharedBody = normalizePlainLanguageMarkdown(canonical, contracts.plainLanguage).trim()
+  const body = sharedBody.replace(
+    'at most 120 seconds. The run owner records the final decision within 240 seconds.',
+    'at most 60 seconds. The run owner records the final decision within 240 seconds.',
+  )
+  requireCondition(body !== sharedBody,
+    'Codex conductor source is missing the route-analysis ceiling projection')
   return [
     '---',
     'name: autoprompt',

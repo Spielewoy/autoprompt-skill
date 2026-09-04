@@ -24,7 +24,7 @@ Use `agents/contracts/routes.json` and validate the recorded facts against its e
 - `LIGHT` adds one short planning step for a local reversible uncertainty.
 - `ROADMAP` is reserved for dependent work groups, an integration owner, or unresolved architecture or product meaning.
 
-One read-only route analyst may inspect the request and likely target for at most 120 seconds. The run owner records the final decision within 240 seconds. File count, repository size, a failed attempt, or a preference for more agents never selects a larger route.
+One read-only route analyst may inspect the request and likely target for at most 60 seconds. The run owner records the final decision within 240 seconds. File count, repository size, a failed attempt, or a preference for more agents never selects a larger route.
 
 ## Record and protect the run
 

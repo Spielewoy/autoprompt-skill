@@ -17,10 +17,13 @@ const {
   fsyncDirectory,
   readChecksummedJson,
   sha256,
+  stableStringify,
 } = require(path.join(WORKFLOW, 'event-log.js'))
 const {
   RuntimeStateStore,
   RESUMABLE_FRONTIER_STATES,
+  hashDirectoryStateStrict,
+  hashManifestEntryStrict,
   isLegalTransition,
   prepareCrashCheckpoint,
   runtimeCrashPrecondition,
@@ -235,6 +238,7 @@ function stateHarness(t, options = {}) {
     )),
     recoveryCheckpointVerifier: options.recoveryCheckpointVerifier,
     pausedRecoveryCheckpointVerifier: options.pausedRecoveryCheckpointVerifier,
+    fsImpl: options.fsImpl,
     clock: now,
     randomId: () => 'mutation-permit-001',
     beforeCommit: options.beforeCommit,
@@ -864,6 +868,178 @@ test('authorized mutations compare preimages and terminal state permanently clos
   )
   fs.writeFileSync(deliverable, 'foreign change\n')
   assert.equal(store.validateTerminal().reason, 'DELIVERABLE_HASH_CHANGED')
+})
+
+test('typed directory manifests use the execution tree digest for authorized mutation preimages and postimages', t => {
+  const { capability, directory, store } = stateHarness(t)
+  const tree = path.join(directory, 'candidate-tree')
+  const nested = path.join(tree, 'nested')
+  const artifact = path.join(nested, 'artifact.txt')
+  fs.mkdirSync(nested, { recursive: true })
+  fs.chmodSync(nested, 0o750)
+  fs.writeFileSync(artifact, 'before\n')
+  fs.chmodSync(artifact, 0o640)
+  const beforeHash = hashDirectoryStateStrict(tree)
+  const reference = sha256(Buffer.concat([
+    Buffer.from(`directory\0nested\0${0o750}\0`),
+    Buffer.from(`file\0nested/artifact.txt\0${0o640}\0${7}\0`),
+    Buffer.from('before\n'),
+    Buffer.from('\0'),
+  ]))
+  assert.equal(beforeHash, reference, 'runtime directory hashing must match execution ownership hashing exactly')
+
+  advanceToWork(store)
+  const permit = store.beginAuthorizedMutation({
+    capability,
+    expectedEpoch: 0,
+    cause: 'admit exact directory tree',
+    authority: {
+      runId: 'run-0001', activationId: 'activation-001',
+      nonce: 'nonce_123456789012', generation: 1,
+    },
+    preimages: [{ path: tree, hash: beforeHash, type: 'directory' }],
+  })
+  fs.writeFileSync(artifact, 'after\n')
+  const afterHash = hashDirectoryStateStrict(tree)
+  store.commitAuthorizedMutation(permit, {
+    capability,
+    cause: 'commit exact directory tree',
+    postimages: [{ path: tree, hash: afterHash, type: 'directory' }],
+  })
+  assert.equal(store.load().workspaceEpoch, 1)
+  const mutationEvent = store.eventLog.readAll().findLast(event => event.type === 'TRANSIENT_RUNTIME')
+  assert.equal(mutationEvent.details.postimages[0].type, 'directory')
+})
+
+test('terminal binding rejects file and directory manifests after a parent-prefix link swap', t => {
+  const root = temporary(t)
+  const linkType = process.platform === 'win32' ? 'junction' : 'dir'
+  const probeTarget = path.join(root, 'link-probe-target')
+  const probeLink = path.join(root, 'link-probe')
+  fs.mkdirSync(probeTarget)
+  try {
+    fs.symlinkSync(probeTarget, probeLink, linkType)
+    fs.unlinkSync(probeLink)
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOSYS'].includes(error.code)) return t.skip(`links unavailable: ${error.code}`)
+    throw error
+  }
+  for (const kind of ['file', 'directory']) {
+    const parent = path.join(root, `owned-parent-${kind}`)
+    const displaced = path.join(root, `displaced-parent-${kind}`)
+    const foreign = path.join(root, `foreign-parent-${kind}`)
+    fs.mkdirSync(parent)
+    fs.mkdirSync(foreign)
+    const deliverable = path.join(parent, 'accepted-result')
+    const foreignDeliverable = path.join(foreign, 'accepted-result')
+    let manifest
+    if (kind === 'file') {
+      fs.writeFileSync(deliverable, 'byte-identical accepted result\n')
+      fs.writeFileSync(foreignDeliverable, 'byte-identical accepted result\n')
+      manifest = { path: deliverable, hash: sha256(fs.readFileSync(deliverable)) }
+    } else {
+      fs.mkdirSync(deliverable)
+      fs.mkdirSync(foreignDeliverable)
+      fs.writeFileSync(path.join(deliverable, 'artifact.txt'), 'byte-identical accepted tree\n')
+      fs.writeFileSync(path.join(foreignDeliverable, 'artifact.txt'), 'byte-identical accepted tree\n')
+      manifest = { path: deliverable, hash: hashDirectoryStateStrict(deliverable), type: 'directory' }
+    }
+    let armed = false
+    let swapped = false
+    const swapParent = () => {
+      if (!armed || swapped) return
+      swapped = true
+      fs.renameSync(parent, displaced)
+      fs.symlinkSync(foreign, parent, linkType)
+    }
+    const hashingFs = Object.create(fs)
+    if (kind === 'file') {
+      hashingFs.readFileSync = (target, ...args) => {
+        if (typeof target === 'number') swapParent()
+        return fs.readFileSync(target, ...args)
+      }
+    } else {
+      hashingFs.readdirSync = (target, ...args) => {
+        if (armed && String(target).includes('/fd/')) swapParent()
+        return fs.readdirSync(target, ...args)
+      }
+    }
+    const harness = stateHarness(t, {
+      directory: path.join(root, `run-${kind}`),
+      fsImpl: hashingFs,
+    })
+    // A normal absolute path traverses the real filesystem root successfully;
+    // only a linked component introduced below invalidates its authority.
+    assert.equal(manifest.hash.length, 64)
+    advanceToFinalCheck(harness.store)
+    transition(harness.store, 'FINALIZING')
+    armed = true
+    assert.throws(() => harness.store.bindTerminal('DONE', {
+      capability: harness.capability,
+      cause: `reject linked ${kind} parent prefix`,
+      deliverables: [manifest],
+    }), error => error.code === 'PREIMAGE_UNSAFE' && /linked|lineage|no-follow/i.test(error.message))
+    assert.equal(swapped, true, `${kind} finalization did not reach the injected parent-swap boundary`)
+    assert.equal(harness.store.load().state, 'FINALIZING')
+    assert.equal(harness.store.load().terminal, null)
+  }
+})
+
+test('strict manifest access fails closed before named-path operations when descriptor anchors are unavailable', t => {
+  const root = temporary(t)
+  for (const kind of ['file', 'directory']) {
+    const deliverable = path.join(root, `unanchored-${kind}`)
+    let manifest
+    if (kind === 'file') {
+      fs.writeFileSync(deliverable, 'byte-identical accepted result\n')
+      manifest = { path: deliverable, hash: sha256(fs.readFileSync(deliverable)) }
+    } else {
+      fs.mkdirSync(deliverable)
+      fs.writeFileSync(path.join(deliverable, 'artifact.txt'), 'byte-identical accepted tree\n')
+      manifest = { path: deliverable, hash: hashDirectoryStateStrict(deliverable), type: 'directory' }
+    }
+    const hashingFs = Object.create(fs)
+    hashingFs.existsSync = target => ['/proc/self/fd', '/dev/fd'].includes(String(target))
+      ? false : fs.existsSync(target)
+    let namedPathInspections = 0
+    hashingFs.lstatSync = (target, ...args) => {
+      if (path.resolve(String(target)) === deliverable) namedPathInspections += 1
+      return fs.lstatSync(target, ...args)
+    }
+    assert.throws(
+      () => hashManifestEntryStrict(manifest, hashingFs),
+      error => error.code === 'PREIMAGE_UNSAFE' && /descriptor anchor/i.test(error.message),
+    )
+    assert.equal(namedPathInspections, 0, `${kind} access reached an unanchored named path`)
+  }
+})
+
+test('native Windows rejects named descriptor-namespace lookalikes before target access', t => {
+  const root = temporary(t)
+  const deliverable = path.join(root, 'windows-lookalike-anchor.txt')
+  fs.writeFileSync(deliverable, 'must not be reached through a named fallback\n')
+  const hashingFs = Object.create(fs)
+  hashingFs.existsSync = target => ['/proc/self/fd', '/dev/fd'].includes(String(target))
+    ? true : fs.existsSync(target)
+  let namedPathInspections = 0
+  hashingFs.lstatSync = (target, ...args) => {
+    if (path.resolve(String(target)) === deliverable) namedPathInspections += 1
+    return fs.lstatSync(target, ...args)
+  }
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')
+  Object.defineProperty(process, 'platform', { ...platformDescriptor, value: 'win32' })
+  try {
+    assert.throws(
+      () => hashManifestEntryStrict({
+        path: deliverable,
+        hash: sha256(fs.readFileSync(deliverable)),
+      }, hashingFs),
+      error => error.code === 'PREIMAGE_UNSAFE' && /descriptor anchor/i.test(error.message),
+    )
+  } finally {
+    Object.defineProperty(process, 'platform', platformDescriptor)
+  }
+  assert.equal(namedPathInspections, 0)
 })
 
 test('failed workers close the exact live mutation permit without reopening the prior epoch', (t) => {
@@ -2923,6 +3099,107 @@ test('crash adoption excludes release reconciliation and all terminal states', (
   }), (error) => error.code === 'CRASH_ADOPTION_FORBIDDEN')
 })
 
+test('terminal finalization intent adoption binds the exact predecessor generation and rejects tampered authority', t => {
+  const directory = temporary(t)
+  const target = path.join(directory, 'target')
+  const runRoot = path.join(directory, 'run-record')
+  fs.mkdirSync(target)
+  let priorOwnerLive = true
+  let leaseNumber = 0
+  const lock = new MissionLock({
+    leaseRoot: path.join(directory, 'leases'),
+    processIdentityObserver: leaseProcessObserver((pid) =>
+      pid === 351 && priorOwnerLive ? 'terminal-intent-owner-generation-one' : null),
+    identityProbe(owner) {
+      return priorOwnerLive
+        ? { alive: true, verified: true }
+        : { alive: false, verified: true, ownedIdentityEvidence: ownedIdentityEvidence(owner) }
+    },
+    randomId: () => `terminal-intent-lease-${++leaseNumber}`,
+  })
+  const leaseInput = {
+    targetPath: target,
+    ledgerPath: path.join(target, '.autoprompt'),
+    runId: 'run-0001',
+    activationId: 'activation-001',
+    missionHash: digest('mission'),
+    nonce: 'nonce_123456789012',
+    generation: 1,
+    pid: 351,
+    processIdentity: 'terminal-intent-owner-generation-one',
+    token: 'e'.repeat(48),
+  }
+  const predecessorCapability = lock.acquire(leaseInput)
+  const harness = stateHarness(t, {
+    directory: runRoot,
+    capability: predecessorCapability,
+    binding: { ...binding(), targetIdentity: lock.verifyCapability(predecessorCapability).targetIdentity },
+    capabilityVerifier: candidate => lock.verifyCapability(candidate),
+  })
+  advanceToWork(harness.store)
+  const before = harness.store.load()
+  const intent = {
+    runId: before.runId,
+    activationId: before.activation.id,
+    generation: before.activation.generation,
+    missionHash: before.activation.missionHash,
+    requestEnvelopeHash: before.requestEnvelopeHash,
+    workspaceEpoch: before.workspaceEpoch,
+    outcome: 'CANCELLED',
+    route: null,
+    reason: 'replay the immutable cancellation after predecessor death',
+    deliverableManifest: [],
+    checkHashes: [],
+    terminalEnvelope: { status: 'CANCELLED' },
+    finalResponse: null,
+    unblockPath: 'operator://resume-or-restart',
+  }
+
+  priorOwnerLive = false
+  const replacementCapability = lock.acquire({
+    ...leaseInput,
+    generation: 2,
+    pid: 352,
+    processIdentity: 'terminal-intent-owner-generation-two',
+    token: 'f'.repeat(48),
+  })
+  TEST_CAPABILITIES.set(harness.store, replacementCapability)
+  assert.throws(() => harness.store.adoptTerminalFinalizationIntent({
+    capability: replacementCapability,
+    expectedGeneration: 2,
+    intent,
+  }), error => error.code === 'GENERATION_CONFLICT')
+  for (const tamperedIntent of [
+    { ...intent, generation: 2 },
+    { ...intent, missionHash: digest('foreign mission') },
+    { ...intent, requestEnvelopeHash: digest('foreign request') },
+    { ...intent, workspaceEpoch: intent.workspaceEpoch + 1 },
+    { ...intent, route: 'PRE_ROUTE' },
+  ]) {
+    assert.throws(() => harness.store.adoptTerminalFinalizationIntent({
+      capability: replacementCapability,
+      expectedGeneration: 1,
+      intent: tamperedIntent,
+    }), error => error.code === 'TERMINAL_FINALIZATION_INTENT_MISMATCH')
+  }
+
+  const adopted = harness.store.adoptTerminalFinalizationIntent({
+    capability: replacementCapability,
+    expectedGeneration: 1,
+    intent,
+  })
+  assert.equal(adopted.activation.generation, 2)
+  assert.equal(adopted.activation.status, 'TERMINAL_REPLAY')
+  for (const field of Object.keys(before).filter(field => !['activation', 'checksum'].includes(field))) {
+    assert.deepEqual(adopted[field], before[field], `terminal intent adoption changed ${field}`)
+  }
+  assert.throws(() => harness.store.adoptTerminalFinalizationIntent({
+    capability: replacementCapability,
+    expectedGeneration: 1,
+    intent,
+  }), error => error.code === 'GENERATION_CONFLICT')
+})
+
 test('release reconciliation adopts only the exact stale generation and finalizer retry stays deterministic', async (t) => {
   const directory = temporary(t)
   const target = path.join(directory, 'target')
@@ -3579,6 +3856,210 @@ test('AP-RUN-032 process and cleanup registries bind activation generation and m
     allowedRoots: [scratchRoot],
     controlBinding: { activationId: 'foreign-activation', generationId: binding.generationId },
   }).load(), (error) => error.code === 'CLEANUP_CONTROL_BINDING_MISMATCH')
+})
+
+test('cleanup removes the registered physical target through its descriptor while a parent link swaps away and back', t => {
+  const descriptorRoot = (process.platform === 'linux' ? ['/proc/self/fd'] : ['/dev/fd', '/proc/self/fd'])
+    .find(candidate => fs.existsSync(candidate))
+  if (!descriptorRoot || !Number.isInteger(fs.constants.O_DIRECTORY) ||
+      !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    return t.skip('no descriptor-relative directory anchor is available')
+  }
+  const directory = temporary(t)
+  const allowedRoot = path.join(directory, 'scratch-root')
+  const displacedRoot = path.join(directory, 'scratch-root-displaced')
+  const foreignRoot = path.join(directory, 'foreign-root')
+  const target = path.join(allowedRoot, 'registered-target')
+  const foreignTarget = path.join(foreignRoot, path.basename(target))
+  const binding = { activationId: 'cleanup-parent-swap-back', generationId: 1 }
+  fs.mkdirSync(target, { recursive: true })
+  fs.writeFileSync(path.join(target, 'owned.txt'), 'owned cleanup bytes\n')
+  fs.mkdirSync(foreignTarget, { recursive: true })
+  const foreignSentinel = path.join(foreignTarget, 'foreign.txt')
+  fs.writeFileSync(foreignSentinel, 'must survive\n')
+  const registryPath = path.join(directory, 'cleanup.json')
+  new CleanupRegistry({ registryPath, allowedRoots: [allowedRoot], controlBinding: binding })
+    .register({ path: target, owner: 'worker-one' })
+
+  const cleanupFs = Object.create(fs)
+  let swapped = false
+  cleanupFs.rmSync = () => {
+    assert.fail('default cleanup must not delegate an attacker-mutable name to recursive rm')
+  }
+  cleanupFs.rmdirSync = (anchoredTarget, ...args) => {
+    if (path.basename(String(anchoredTarget)) !== path.basename(target)) {
+      return fs.rmdirSync(anchoredTarget, ...args)
+    }
+    assert.ok(String(anchoredTarget).startsWith(`${descriptorRoot}${path.sep}`),
+      'cleanup did not use the opened parent descriptor')
+    fs.renameSync(allowedRoot, displacedRoot)
+    fs.symlinkSync(foreignRoot, allowedRoot, process.platform === 'win32' ? 'junction' : 'dir')
+    try {
+      swapped = true
+      return fs.rmdirSync(anchoredTarget, ...args)
+    } finally {
+      fs.unlinkSync(allowedRoot)
+      fs.renameSync(displacedRoot, allowedRoot)
+    }
+  }
+  const cleanup = new CleanupRegistry({
+    registryPath,
+    allowedRoots: [allowedRoot],
+    controlBinding: binding,
+    fsImpl: cleanupFs,
+  })
+  cleanup.run()
+  assert.equal(swapped, true)
+  assert.equal(fs.existsSync(target), false)
+  assert.equal(fs.readFileSync(foreignSentinel, 'utf8'), 'must survive\n')
+  assert.equal(readChecksummedJson(registryPath).entries[0].status, 'CLEANED')
+})
+
+test('cleanup never recursively deletes a foreign basename replacement after the owned directory is opened', t => {
+  const descriptorRoot = (process.platform === 'linux' ? ['/proc/self/fd'] : ['/dev/fd', '/proc/self/fd'])
+    .find(candidate => fs.existsSync(candidate))
+  if (!descriptorRoot || !Number.isInteger(fs.constants.O_DIRECTORY) ||
+      !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    return t.skip('no descriptor-relative directory anchor is available')
+  }
+  const directory = temporary(t)
+  const allowedRoot = path.join(directory, 'scratch-root')
+  const target = path.join(allowedRoot, 'registered-target')
+  const displacedTarget = path.join(allowedRoot, 'registered-target-displaced')
+  const foreignTarget = path.join(directory, 'foreign-target')
+  const binding = { activationId: 'cleanup-foreign-recursive-replacement', generationId: 1 }
+  fs.mkdirSync(path.join(target, 'owned-nested'), { recursive: true })
+  fs.writeFileSync(path.join(target, 'owned-nested', 'owned.txt'), 'owned cleanup bytes\n')
+  fs.mkdirSync(path.join(foreignTarget, 'foreign-nested'), { recursive: true })
+  const foreignSentinel = path.join(foreignTarget, 'foreign-nested', 'foreign.txt')
+  fs.writeFileSync(foreignSentinel, 'must survive\n')
+  const registryPath = path.join(directory, 'cleanup.json')
+  new CleanupRegistry({ registryPath, allowedRoots: [allowedRoot], controlBinding: binding })
+    .register({ path: target, owner: 'worker-one' })
+
+  const cleanupFs = Object.create(fs)
+  let swapped = false
+  let recursiveRemovalCalls = 0
+  cleanupFs.rmSync = (...args) => {
+    recursiveRemovalCalls += 1
+    return fs.rmSync(...args)
+  }
+  cleanupFs.readdirSync = (anchoredDirectory, ...args) => {
+    if (!swapped && String(anchoredDirectory).startsWith(`${descriptorRoot}${path.sep}`)) {
+      const names = fs.readdirSync(anchoredDirectory)
+      if (names.includes('owned-nested')) {
+        fs.renameSync(target, displacedTarget)
+        fs.renameSync(foreignTarget, target)
+        swapped = true
+      }
+    }
+    return fs.readdirSync(anchoredDirectory, ...args)
+  }
+  const cleanup = new CleanupRegistry({
+    registryPath,
+    allowedRoots: [allowedRoot],
+    controlBinding: binding,
+    fsImpl: cleanupFs,
+  })
+  assert.throws(
+    () => cleanup.run(),
+    error => error.code === 'CLEANUP_ENTRY_UNSAFE' && /changed before removal/i.test(error.message),
+  )
+  assert.equal(swapped, true)
+  assert.equal(recursiveRemovalCalls, 0)
+  assert.equal(
+    fs.readFileSync(path.join(target, path.relative(foreignTarget, foreignSentinel)), 'utf8'),
+    'must survive\n',
+  )
+  assert.equal(fs.existsSync(path.join(displacedTarget, 'owned-nested', 'owned.txt')), false)
+  assert.equal(readChecksummedJson(registryPath).entries[0].status, 'REGISTERED')
+})
+
+test('cleanup fails closed without a descriptor anchor before recursive deletion', t => {
+  const directory = temporary(t)
+  const allowedRoot = path.join(directory, 'scratch-root')
+  const target = path.join(allowedRoot, 'registered-target')
+  const binding = { activationId: 'cleanup-no-anchor', generationId: 1 }
+  fs.mkdirSync(target, { recursive: true })
+  const sentinel = path.join(target, 'owned.txt')
+  fs.writeFileSync(sentinel, 'must remain\n')
+  const registryPath = path.join(directory, 'cleanup.json')
+  new CleanupRegistry({ registryPath, allowedRoots: [allowedRoot], controlBinding: binding })
+    .register({ path: target, owner: 'worker-one' })
+  const cleanupFs = Object.create(fs)
+  cleanupFs.existsSync = candidate => ['/proc/self/fd', '/dev/fd'].includes(String(candidate))
+    ? false : fs.existsSync(candidate)
+  let removalCalls = 0
+  cleanupFs.rmSync = (...args) => {
+    removalCalls += 1
+    return fs.rmSync(...args)
+  }
+  const cleanup = new CleanupRegistry({
+    registryPath,
+    allowedRoots: [allowedRoot],
+    controlBinding: binding,
+    fsImpl: cleanupFs,
+  })
+  assert.throws(
+    () => cleanup.run(),
+    error => error.code === 'CLEANUP_ENTRY_UNSAFE' && /stable physical parent/i.test(error.message),
+  )
+  assert.equal(removalCalls, 0)
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'must remain\n')
+  assert.equal(readChecksummedJson(registryPath).entries[0].status, 'REGISTERED')
+})
+
+test('cleanup rejects a physically replaced registered parent without deleting foreign bytes', t => {
+  const directory = temporary(t)
+  const allowedRoot = path.join(directory, 'scratch-root')
+  const displacedRoot = path.join(directory, 'scratch-root-displaced')
+  const replacementRoot = path.join(directory, 'replacement-root')
+  const target = path.join(allowedRoot, 'registered-target')
+  const replacementTarget = path.join(replacementRoot, path.basename(target))
+  const binding = { activationId: 'cleanup-target-replacement', generationId: 1 }
+  fs.mkdirSync(target, { recursive: true })
+  fs.writeFileSync(path.join(target, 'owned.txt'), 'owned cleanup bytes\n')
+  fs.mkdirSync(replacementTarget, { recursive: true })
+  const foreignSentinel = path.join(replacementTarget, 'foreign.txt')
+  fs.writeFileSync(foreignSentinel, 'must survive\n')
+  const registryPath = path.join(directory, 'cleanup.json')
+  const cleanup = new CleanupRegistry({ registryPath, allowedRoots: [allowedRoot], controlBinding: binding })
+  cleanup.register({ path: target, owner: 'worker-one' })
+  fs.renameSync(allowedRoot, displacedRoot)
+  fs.renameSync(replacementRoot, allowedRoot)
+  assert.throws(
+    () => cleanup.run(),
+    error => error.code === 'CLEANUP_ENTRY_UNSAFE' && /parent changed physical identity/i.test(error.message),
+  )
+  assert.equal(fs.readFileSync(path.join(allowedRoot, path.basename(target), 'foreign.txt'), 'utf8'), 'must survive\n')
+  assert.equal(fs.existsSync(path.join(displacedRoot, path.basename(target), 'owned.txt')), true)
+  assert.equal(readChecksummedJson(registryPath).entries[0].status, 'REGISTERED')
+})
+
+test('cleanup rejects a replacement at the registered basename without deleting it', t => {
+  const directory = temporary(t)
+  const allowedRoot = path.join(directory, 'scratch-root')
+  const target = path.join(allowedRoot, 'registered-target')
+  const displacedTarget = path.join(allowedRoot, 'registered-target-displaced')
+  const replacementTarget = path.join(directory, 'replacement-target')
+  const binding = { activationId: 'cleanup-target-replacement', generationId: 1 }
+  fs.mkdirSync(target, { recursive: true })
+  fs.writeFileSync(path.join(target, 'owned.txt'), 'owned cleanup bytes\n')
+  fs.mkdirSync(replacementTarget)
+  const foreignSentinel = path.join(replacementTarget, 'foreign.txt')
+  fs.writeFileSync(foreignSentinel, 'must survive\n')
+  const registryPath = path.join(directory, 'cleanup.json')
+  const cleanup = new CleanupRegistry({ registryPath, allowedRoots: [allowedRoot], controlBinding: binding })
+  cleanup.register({ path: target, owner: 'worker-one' })
+  fs.renameSync(target, displacedTarget)
+  fs.renameSync(replacementTarget, target)
+  assert.throws(
+    () => cleanup.run(),
+    error => error.code === 'CLEANUP_ENTRY_UNSAFE' && /target changed physical identity/i.test(error.message),
+  )
+  assert.equal(fs.readFileSync(path.join(target, 'foreign.txt'), 'utf8'), 'must survive\n')
+  assert.equal(fs.existsSync(path.join(displacedTarget, 'owned.txt')), true)
+  assert.equal(readChecksummedJson(registryPath).entries[0].status, 'REGISTERED')
 })
 
 test('process registry restore rejects duplicate and adapter-foreign durable identities before mutation', async t => {
@@ -4422,8 +4903,37 @@ test('finalizer drains target-global liveness, cleans only registered scratch, b
   fs.mkdirSync(target)
   fs.mkdirSync(scratchRoot, { recursive: true })
   const deliverable = path.join(target, 'result.txt')
+  const deliverableDirectory = path.join(target, 'verified-build')
   const scratch = path.join(scratchRoot, 'worker-one')
   fs.writeFileSync(deliverable, 'verified result\n')
+  fs.mkdirSync(path.join(deliverableDirectory, 'nested'), { recursive: true })
+  fs.writeFileSync(path.join(deliverableDirectory, 'nested', 'artifact.txt'), 'directory artifact\n')
+  const finalResponseEvidence = path.join(target, 'structured-final-response.json')
+  const finalResponseBody = {
+    resultFormat: 'changed-files',
+    requestedResult: 'Return the accepted build.',
+    results: [{
+      workItemId: 'work-1',
+      resultHash: digest('structured-result'),
+      successItems: ['Accepted build persisted.'],
+      findings: [{ severity: 'info', summary: 'Build accepted.' }],
+    }],
+  }
+  const finalResponsePersisted = {
+    ...finalResponseBody,
+    responseHash: sha256(stableStringify(finalResponseBody)),
+  }
+  const finalResponseBytes = Buffer.from(`${stableStringify(finalResponsePersisted)}\n`)
+  fs.writeFileSync(finalResponseEvidence, finalResponseBytes)
+  const finalResponse = {
+    ...finalResponsePersisted,
+    evidencePointer: {
+      name: 'structured-final-response',
+      path: finalResponseEvidence,
+      hash: sha256(finalResponseBytes),
+      bytes: finalResponseBytes.length,
+    },
+  }
   fs.mkdirSync(scratch)
   fs.writeFileSync(path.join(scratch, 'temporary.txt'), 'remove me\n')
 
@@ -4487,10 +4997,27 @@ test('finalizer drains target-global liveness, cleans only registered scratch, b
     outcome: 'DONE',
     reason: 'final hashes green',
     expectedEpoch: 0,
-    deliverables: [{ path: deliverable, hash: sha256(fs.readFileSync(deliverable)) }],
+    deliverables: [
+      { path: deliverable, hash: sha256(fs.readFileSync(deliverable)) },
+      { path: deliverableDirectory, hash: hashDirectoryStateStrict(deliverableDirectory), type: 'directory' },
+      { path: finalResponseEvidence, hash: finalResponse.evidencePointer.hash },
+    ],
     checkHashes: [digest('checks')],
     terminalEnvelope: { status: 'DONE' },
+    finalResponse,
   }
+  await assert.rejects(finalizer.finalize({
+    ...finalOptions,
+    deliverables: finalOptions.deliverables.filter(entry => entry.path !== finalResponseEvidence),
+  }), error => error.code === 'FINAL_RESPONSE_INVALID' &&
+    error.details.reason === 'FINAL_RESPONSE_POINTER_NOT_IN_MANIFEST')
+  assert.equal(harness.store.load().state, 'FINAL_CHECK')
+  fs.writeFileSync(finalResponseEvidence, '{"tampered":true}\n')
+  await assert.rejects(finalizer.finalize(finalOptions), error =>
+    error.code === 'FINAL_RESPONSE_INVALID' &&
+    ['FINAL_RESPONSE_POINTER_HASH_CHANGED', 'FINAL_RESPONSE_POINTER_BYTES_CHANGED']
+      .includes(error.details.reason))
+  fs.writeFileSync(finalResponseEvidence, finalResponseBytes)
   await assert.rejects(finalizer.finalize(finalOptions), /injected terminal-record failure/)
   assert.equal(harness.store.load().state, 'RELEASING_LOCK')
   assert.equal(fs.existsSync(harness.store.registeredPaths.terminalPath), false)
@@ -4508,17 +5035,232 @@ test('finalizer drains target-global liveness, cleans only registered scratch, b
   assert.equal(fs.existsSync(scratch), false)
   assert.equal(finalizer.validateTerminalRecord().valid, true)
   assert.equal(result.terminal.terminalEnvelope.code, 'DONE')
+  assert.equal(result.terminal.deliverableManifest.find(entry => entry.path === deliverableDirectory).type, 'directory')
+  assert.equal(result.finalizationIntent.intentHash.length, 64)
+  assert.equal(result.finalizationIntent.route, null)
+  assert.deepEqual(result.finalizationIntent.finalResponse, finalOptions.finalResponse)
   assert.deepEqual(result.terminal.terminalEnvelope.payload.providerTerminal, { status: 'DONE' })
   assertDraft202012Valid(
     path.join(ROOT, 'agents', 'contracts', 'schemas', 'outcome.schema.json'),
     [result.terminal.terminalEnvelope],
   )
-  fs.writeFileSync(deliverable, 'changed after done\n')
+  const intentPath = harness.store.registeredPaths.terminalFinalizationIntentPath
+  const intentBytes = fs.readFileSync(intentPath)
+  const checkTamperedIntent = {
+    ...JSON.parse(intentBytes.toString('utf8')),
+    checkHashes: [digest('foreign-check-evidence')],
+  }
+  const unsignedCheckIntent = { ...checkTamperedIntent }
+  delete unsignedCheckIntent.intentHash
+  checkTamperedIntent.intentHash = sha256(stableStringify(unsignedCheckIntent))
+  fs.writeFileSync(intentPath, `${stableStringify(checkTamperedIntent)}\n`)
+  assert.deepEqual(finalizer.validateTerminalRecord(), {
+    valid: false,
+    reason: 'TERMINAL_FINALIZATION_EVIDENCE_MISMATCH',
+  })
+  fs.writeFileSync(intentPath, intentBytes)
+  const changedBody = {
+    ...finalResponseBody,
+    requestedResult: 'Tampered structured response.',
+  }
+  const changedFinalResponse = {
+    ...changedBody,
+    responseHash: sha256(stableStringify(changedBody)),
+    evidencePointer: finalResponse.evidencePointer,
+  }
+  const alteredIntent = {
+    ...result.finalizationIntent,
+    finalResponse: changedFinalResponse,
+  }
+  const unsignedIntent = { ...alteredIntent }
+  delete unsignedIntent.intentHash
+  alteredIntent.intentHash = sha256(stableStringify(unsignedIntent))
+  fs.writeFileSync(intentPath, `${stableStringify(alteredIntent)}\n`)
+  assert.deepEqual(finalizer.validateTerminalRecord(), {
+    valid: false,
+    reason: 'TERMINAL_FINAL_RESPONSE_INVALID',
+    cause: 'FINAL_RESPONSE_EVIDENCE_MISMATCH',
+  })
+  fs.writeFileSync(intentPath, intentBytes)
+  fs.writeFileSync(path.join(deliverableDirectory, 'nested', 'artifact.txt'), 'changed after done\n')
   assert.deepEqual(finalizer.validateTerminalRecord(), {
     valid: false,
     reason: 'DELIVERABLE_HASH_CHANGED',
-    path: deliverable,
+    path: deliverableDirectory,
   })
+})
+
+test('finalizer terminal record read fails closed before a no-anchor transient parent swap can run', t => {
+  const directory = temporary(t)
+  const runRoot = path.join(directory, 'run')
+  const runtimePath = path.join(runRoot, 'runtime')
+  const terminalPath = path.join(runtimePath, 'terminal.json')
+  fs.mkdirSync(runtimePath, { recursive: true })
+  const ordinaryFinalizer = new Finalizer({
+    stateStore: { registeredPaths: { runRecordRoot: runRoot, terminalPath } },
+    processOwner: {}, missionLock: {}, capability: {}, cleanupRegistry: {},
+  })
+  ordinaryFinalizer._createOrVerifyTerminal({
+    schemaVersion: 2,
+    outcome: 'PARTIAL',
+    runId: 'terminal-read-parent-swap-run',
+  })
+  const fsImpl = Object.create(fs)
+  fsImpl.existsSync = target => ['/proc/self/fd', '/dev/fd'].includes(String(target))
+    ? false : fs.existsSync(target)
+  let namedTerminalOpens = 0
+  fsImpl.openSync = (target, ...args) => {
+    if (path.resolve(String(target)) === terminalPath) namedTerminalOpens += 1
+    return fs.openSync(target, ...args)
+  }
+  const finalizer = new Finalizer({
+    stateStore: { registeredPaths: { runRecordRoot: runRoot, terminalPath } },
+    processOwner: {},
+    missionLock: {},
+    capability: {},
+    cleanupRegistry: {},
+    fsImpl,
+  })
+  assert.throws(
+    () => finalizer._readTerminalRecord(),
+    error => error.code === 'TERMINAL_PATH_UNSAFE' && /linked|lineage|unstable/i.test(error.message) &&
+      /PREIMAGE_UNSAFE/.test(error.details.cause),
+  )
+  assert.equal(namedTerminalOpens, 0)
+})
+
+test('finalizer terminal record publication fails closed without an anchor before foreign writes', t => {
+  const directory = temporary(t)
+  const runRoot = path.join(directory, 'run')
+  const runtimePath = path.join(runRoot, 'runtime')
+  const terminalPath = path.join(runtimePath, 'terminal.json')
+  fs.mkdirSync(runtimePath, { recursive: true })
+  const foreignRuntimePath = path.join(directory, 'foreign-runtime-publication')
+  fs.mkdirSync(foreignRuntimePath)
+  const fsImpl = Object.create(fs)
+  fsImpl.existsSync = target => ['/proc/self/fd', '/dev/fd'].includes(String(target))
+    ? false : fs.existsSync(target)
+  let temporaryOpens = 0
+  fsImpl.openSync = (target, ...args) => {
+    if (/\.terminal\.json\.[^.]+\.[^.]+\.create$/.test(String(target))) temporaryOpens += 1
+    return fs.openSync(target, ...args)
+  }
+  const finalizer = new Finalizer({
+    stateStore: { registeredPaths: { runRecordRoot: runRoot, terminalPath } },
+    processOwner: {},
+    missionLock: {},
+    capability: {},
+    cleanupRegistry: {},
+    fsImpl,
+  })
+  assert.throws(
+    () => finalizer._createOrVerifyTerminal({
+      schemaVersion: 2,
+      outcome: 'PARTIAL',
+      runId: 'terminal-publication-parent-swap-run',
+    }),
+    error => error.code === 'TERMINAL_PATH_UNSAFE' && /linked|lineage|unstable/i.test(error.message) &&
+      /PREIMAGE_UNSAFE/.test(error.details.cause),
+  )
+  assert.equal(temporaryOpens, 0)
+  assert.deepEqual(fs.readdirSync(foreignRuntimePath), [])
+})
+
+test('descriptor-anchored terminal publication survives a transient parent swap-back without foreign writes', t => {
+  const descriptorRoot = (process.platform === 'linux' ? ['/proc/self/fd'] : ['/dev/fd', '/proc/self/fd'])
+    .find(candidate => fs.existsSync(candidate))
+  if (!descriptorRoot || !Number.isInteger(fs.constants.O_DIRECTORY) ||
+      !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    return t.skip('no descriptor-relative directory anchor is available')
+  }
+  const directory = temporary(t)
+  const runRoot = path.join(directory, 'run')
+  const runtimePath = path.join(runRoot, 'runtime')
+  const displacedRuntimePath = path.join(runRoot, 'runtime-displaced')
+  const foreignRuntimePath = path.join(directory, 'foreign-runtime')
+  const terminalPath = path.join(runtimePath, 'terminal.json')
+  fs.mkdirSync(runtimePath, { recursive: true })
+  fs.mkdirSync(foreignRuntimePath)
+  const fsImpl = Object.create(fs)
+  let swapped = false
+  fsImpl.openSync = (target, ...args) => {
+    if (!swapped && String(target).startsWith(`${descriptorRoot}${path.sep}`) &&
+        /\.terminal\.json\.[^.]+\.[^.]+\.create$/.test(String(target))) {
+      fs.renameSync(runtimePath, displacedRuntimePath)
+      fs.symlinkSync(foreignRuntimePath, runtimePath, process.platform === 'win32' ? 'junction' : 'dir')
+      try {
+        swapped = true
+        return fs.openSync(target, ...args)
+      } finally {
+        fs.unlinkSync(runtimePath)
+        fs.renameSync(displacedRuntimePath, runtimePath)
+      }
+    }
+    return fs.openSync(target, ...args)
+  }
+  const finalizer = new Finalizer({
+    stateStore: { registeredPaths: { runRecordRoot: runRoot, terminalPath } },
+    processOwner: {}, missionLock: {}, capability: {}, cleanupRegistry: {}, fsImpl,
+  })
+  const saved = finalizer._createOrVerifyTerminal({
+    schemaVersion: 2,
+    outcome: 'PARTIAL',
+    runId: 'terminal-publication-swap-back-run',
+  })
+  assert.equal(swapped, true)
+  assert.equal(finalizer._readTerminalRecord().checksum, saved.checksum)
+  assert.deepEqual(fs.readdirSync(foreignRuntimePath), [])
+})
+
+test('descriptor-anchored terminal read ignores a transient parent swap-back to foreign bytes', t => {
+  const descriptorRoot = (process.platform === 'linux' ? ['/proc/self/fd'] : ['/dev/fd', '/proc/self/fd'])
+    .find(candidate => fs.existsSync(candidate))
+  if (!descriptorRoot || !Number.isInteger(fs.constants.O_DIRECTORY) ||
+      !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    return t.skip('no descriptor-relative directory anchor is available')
+  }
+  const directory = temporary(t)
+  const runRoot = path.join(directory, 'run')
+  const runtimePath = path.join(runRoot, 'runtime')
+  const displacedRuntimePath = path.join(runRoot, 'runtime-displaced')
+  const foreignRuntimePath = path.join(directory, 'foreign-runtime')
+  const terminalPath = path.join(runtimePath, 'terminal.json')
+  fs.mkdirSync(runtimePath, { recursive: true })
+  fs.mkdirSync(foreignRuntimePath)
+  const ordinaryFinalizer = new Finalizer({
+    stateStore: { registeredPaths: { runRecordRoot: runRoot, terminalPath } },
+    processOwner: {}, missionLock: {}, capability: {}, cleanupRegistry: {},
+  })
+  const saved = ordinaryFinalizer._createOrVerifyTerminal({
+    schemaVersion: 2,
+    outcome: 'PARTIAL',
+    runId: 'terminal-read-swap-back-run',
+  })
+  fs.writeFileSync(path.join(foreignRuntimePath, 'terminal.json'), '{"foreign":true}\n')
+  const fsImpl = Object.create(fs)
+  let swapped = false
+  fsImpl.openSync = (target, ...args) => {
+    if (!swapped && String(target).startsWith(`${descriptorRoot}${path.sep}`) &&
+        path.basename(String(target)) === 'terminal.json') {
+      fs.renameSync(runtimePath, displacedRuntimePath)
+      fs.symlinkSync(foreignRuntimePath, runtimePath, process.platform === 'win32' ? 'junction' : 'dir')
+      try {
+        swapped = true
+        return fs.openSync(target, ...args)
+      } finally {
+        fs.unlinkSync(runtimePath)
+        fs.renameSync(displacedRuntimePath, runtimePath)
+      }
+    }
+    return fs.openSync(target, ...args)
+  }
+  const finalizer = new Finalizer({
+    stateStore: { registeredPaths: { runRecordRoot: runRoot, terminalPath } },
+    processOwner: {}, missionLock: {}, capability: {}, cleanupRegistry: {}, fsImpl,
+  })
+  assert.equal(finalizer._readTerminalRecord().checksum, saved.checksum)
+  assert.equal(swapped, true)
+  assert.equal(fs.readFileSync(path.join(foreignRuntimePath, 'terminal.json'), 'utf8'), '{"foreign":true}\n')
 })
 
 test('finalizer retries a crash after deterministic direct release-intent binding without changing outcome', async (t) => {

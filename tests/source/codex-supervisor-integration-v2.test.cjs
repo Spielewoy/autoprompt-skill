@@ -22,8 +22,10 @@ const {
   RolePolicy,
   RuntimeCapabilityAuthority,
   ROUTE_CAPABILITY_EFFECTS,
+  WORKER_REQUIREMENT_FIDELITY_DOCTRINE,
   activationRuntimeSettings,
   bindCanonicalMissionForChild,
+  canonicalRoleAssignment,
   createCanonicalMissionProjection,
   createCheckerSnapshotFactory,
   validatePlanCheckerSnapshot,
@@ -66,6 +68,9 @@ const {
 } = require(path.join(WORKFLOW, 'phase-budget.js'))
 const { BudgetController } = require(path.join(WORKFLOW, 'budget-controller.js'))
 const { CentralScheduler, ROUTE_BUDGETS } = require(path.join(WORKFLOW, 'scheduler.js'))
+const { EventLog, stableStringify } = require(path.join(WORKFLOW, 'event-log.js'))
+const { RuntimeStateStore } = require(path.join(WORKFLOW, 'runtime-state.js'))
+const { processIdentityForPid } = require(path.join(WORKFLOW, 'mission-lock.js'))
 const { createPreMutationBaseline, createRunRecord, openRunRecord } = require(path.join(WORKFLOW, 'run-record.js'))
 const { ensureWindowsPrivateAcl } = require(path.join(WORKFLOW, 'safe-run-root.js'))
 const {
@@ -85,7 +90,15 @@ const {
 } = require(path.join(WORKFLOW, 'route-decision.js'))
 const { deriveProfileLimits, renderProfile } = require(path.join(WORKFLOW, 'codex-agent-profile.js'))
 const { resolveAgentAssignment } = require(path.join(WORKFLOW, 'codex-agent-casting.js'))
-const { WorkerWorkspaceManager } = require(path.join(WORKFLOW, 'worker-workspace.js'))
+
+function digest(value) {
+  return crypto.createHash('sha256')
+    .update(Buffer.isBuffer(value) ? value : String(value)).digest('hex')
+}
+const {
+  declaredIgnoredWorkspaceNames,
+  WorkerWorkspaceManager,
+} = require(path.join(WORKFLOW, 'worker-workspace.js'))
 const {
   createPersistentPidTreeAdapter,
   killAllPersistentPidTrees,
@@ -141,6 +154,31 @@ const MODEL_REGISTRY = Object.freeze([Object.freeze({
   yield: { successRate: 1, sampleSize: 100 },
 })])
 const ZERO_USAGE = Object.freeze({ noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0 })
+
+function canonicalWorkerAssignment(assignmentId, repairOf = null) {
+  return canonicalRoleAssignment({
+    request: {
+      workItemId: assignmentId,
+      ...(repairOf ? { repairOf, executorKey: 'same-executor' } : {}),
+      assignment: repairOf ? 'Repair the exact assigned behavior.' : 'Implement the exact assigned behavior.',
+      ownership: ['workspace'],
+      success: ['The exact assigned behavior passes.'],
+      checks: ['Run the exact focused witness.'],
+      findingIds: ['AP-DESIGN-023'],
+    },
+    route: 'DIRECT',
+    runId: 'run-adapter',
+    logicalRole: 'worker',
+    physicalRole: 'autoprompt.v2.worker',
+    readOnly: false,
+    requestEnvelopeHash: 'hash',
+    targetPath: ROOT,
+    enforcePreimages: false,
+    additionalResources: [],
+    mission: 'Implement the bounded behavior exactly.',
+    now: () => 0,
+  })
+}
 
 function adapterWorkerResult(overrides = {}) {
   return {
@@ -1641,7 +1679,15 @@ test('CHECK_INCONCLUSIVE crash before legacy retry authenticates the base receip
   }
   const baseId = 'independent-check-1'
   const retryId = `${baseId}-runtime-retry-1`
-  const baseResult = { code: 'CHECK_INCONCLUSIVE', cause: { reason: 'base transport ended' } }
+  const baseResult = {
+    payload: { zeta: 'last insertion', alpha: 'first canonically' },
+    code: 'CHECK_INCONCLUSIVE',
+    cause: { reason: 'base transport ended' },
+  }
+  const canonicalBaseResultHash = crypto.createHash('sha256')
+    .update(stableStringify(baseResult)).digest('hex')
+  assert.notEqual(canonicalBaseResultHash,
+    crypto.createHash('sha256').update(JSON.stringify(baseResult)).digest('hex'))
   const resultPath = path.join(directory, `${baseId}.json`)
   fs.writeFileSync(resultPath, `${JSON.stringify(baseResult)}\n`)
   const bytes = fs.readFileSync(resultPath)
@@ -1678,7 +1724,7 @@ test('CHECK_INCONCLUSIVE crash before legacy retry authenticates the base receip
       acceptedResultIds: [], nextReadyWorkIds: [retryId],
       retryState: { inconclusiveChecker: {
         checkerId: baseId, candidateHash,
-        checkerResultHash: crypto.createHash('sha256').update(JSON.stringify(baseResult)).digest('hex'),
+        checkerResultHash: canonicalBaseResultHash,
         retryAttempt: 1, returnState: 'CHECK_WORK',
       } },
     },
@@ -2428,7 +2474,7 @@ test('fresh ROADMAP elides every advisory planner and starts product verificatio
   ].includes(role)), false)
   assert.deepEqual(launchedIds, ['work-1', 'independent-check-1'])
   assert.deepEqual(fixture.harness.launches.map(launch => launch.providerTokenLimit), [
-    24_000, 24_000,
+    1_000_000, 1_000_000,
   ])
   assert.equal(runtime.childTokenReservations.size, 0)
   assert.equal(fixture.routeRequests.get('work-1').parent, 'run-owner')
@@ -2436,7 +2482,7 @@ test('fresh ROADMAP elides every advisory planner and starts product verificatio
     'DETERMINISTIC_ROADMAP')
 })
 
-test('a default 24k activation preserves the candidate when remaining quota cannot fit checking', async t => {
+test('an explicit 24k activation preserves the candidate when remaining quota cannot fit checking', async t => {
   let upstreamRequests = 0
   const upstream = http.createServer((_request, response) => {
     upstreamRequests += 1
@@ -2767,6 +2813,108 @@ test('full runtime keeps provider retry but stops non-authoritative checker evid
   assert.equal(result.scheduler.counters.rejectedByCode.LAUNCH_LIMIT || 0, 0)
 })
 
+test('accounted default-provider unknown spend gets one fresh worker successor and reaches checking', async t => {
+  const partialCandidate = "module.exports = 'unknown-spend-partial'\n"
+  const fixture = configureRoadmapCompositionHarness(t, [], {
+    completeProduct: true,
+    transportFailureOnFirstWorker: true,
+    unknownProviderSpendOnFirstWorker: true,
+    unknownProviderResponseBound: 200_000,
+    transportPartialBeforeFailure: partialCandidate,
+    productCheckerCodes: ['PASS'],
+  })
+  fixture.harness.runtimeOptions.budgetController = new BudgetController({
+    limits: {
+      wallMs: 600_000, tokens: Number.MAX_SAFE_INTEGER,
+      sessions: 20, launches: 20,
+    },
+    finalizationReserveMs: 10,
+    phases: {},
+    monotonicMs: () => fixture.harness.currentTime(),
+    monotonicClockId: 'test-monotonic',
+  })
+  const runtime = new CodexSupervisorRuntime(fixture.harness.runtimeOptions)
+  const result = await runtime.start()
+
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.deepEqual(fixture.harness.launches.map(item => item.workItemId), [
+    'work-1', 'work-1-transport-retry-1', 'independent-check-1',
+  ])
+  assert.equal(result.budget.tokensUsed, 200_000)
+  assert.equal(runtime.childTokenReservations.size, 0)
+  assert.equal(
+    fs.readFileSync(path.join(fixture.harness.runtimeOptions.targetPath, 'src', 'example.js'), 'utf8'),
+    "module.exports = 'work-1-transport-retry-1'\n",
+  )
+})
+
+test('worker quarantine persistence failure freezes product bytes before workspace cleanup', async t => {
+  const partialCandidate = "module.exports = 'quarantine-persistence-survival'\n"
+  const fixture = configureRoadmapCompositionHarness(t, [], {
+    completeProduct: true,
+    transportFailureOnFirstWorker: true,
+    transportPartialBeforeFailure: partialCandidate,
+    workerQuarantineFailure: 'EIO',
+  })
+
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'CHILD_TRANSPORT_TIMEOUT')
+  assert.deepEqual(fixture.harness.launches.map(item => item.workItemId), ['work-1'])
+  assert.equal(
+    fs.readFileSync(path.join(fixture.harness.runtimeOptions.targetPath, 'src', 'example.js'), 'utf8'),
+    "module.exports = 'ready'\n",
+  )
+  const candidate = result.terminalEnvelope.bestAvailableCandidateEvidence
+  assert.equal(candidate.kind, 'controller-owned-physical-candidate-survival-bundle')
+  assert.equal(candidate.reasonCode, 'EIO')
+  assert.equal(candidate.externalLocal, null)
+  assert.equal(candidate.local.changedPathCount, 1)
+  assert.equal(
+    fs.readFileSync(path.join(candidate.local.candidateRoot, 'src', 'example.js'), 'utf8'),
+    partialCandidate,
+  )
+  assert.equal(result.terminalEnvelope.error.details.retryDisposition,
+    'DO_NOT_DISCARD_PHYSICAL_CANDIDATE_OR_REPLAY_PROVIDER_SPEND')
+})
+
+test('a second accounted unknown response surfaces its exact partial candidate without a retry loop', async t => {
+  const firstPartial = "module.exports = 'first-unknown-partial'\n"
+  const finalPartial = "module.exports = 'second-unknown-partial'\n"
+  const fixture = configureRoadmapCompositionHarness(t, [], {
+    completeProduct: true,
+    transportFailureOnFirstWorker: true,
+    unknownProviderSpendOnFirstWorker: true,
+    unknownProviderResponseBound: 200_000,
+    transportPartialBeforeFailure: firstPartial,
+    transportFailureOnWorkerSuccessor: true,
+    unknownProviderSpendOnWorkerSuccessor: true,
+    transportSuccessorPartialBeforeFailure: finalPartial,
+    productCheckerCodes: ['PASS'],
+  })
+  fixture.harness.runtimeOptions.budgetController = new BudgetController({
+    limits: {
+      wallMs: 600_000, tokens: Number.MAX_SAFE_INTEGER,
+      sessions: 20, launches: 20,
+    },
+    finalizationReserveMs: 10,
+    phases: {},
+    monotonicMs: () => fixture.harness.currentTime(),
+    monotonicClockId: 'test-monotonic',
+  })
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.deepEqual(fixture.harness.launches.map(item => item.workItemId), [
+    'work-1', 'work-1-transport-retry-1', 'independent-check-1',
+  ])
+  assert.equal(result.budget.tokensUsed, 400_000)
+  assert.equal(
+    fs.readFileSync(path.join(fixture.harness.runtimeOptions.targetPath, 'src', 'example.js'), 'utf8'),
+    finalPartial,
+  )
+})
+
 test('exhausted provider transport successor surfaces its ownership-safe partial candidate without a third model', async t => {
   const partialCandidate = "module.exports = 'transport-partial-candidate'\n"
   const fixture = configureRoadmapCompositionHarness(t, [], {
@@ -2811,6 +2959,39 @@ test('exhausted provider transport successor with zero admitted diff stays a con
     fs.readFileSync(path.join(fixture.harness.runtimeOptions.targetPath, 'src', 'example.js'), 'utf8'),
     "module.exports = 'ready'\n",
   )
+})
+
+test('exhausted transport successor keeps its candidate when admission bookkeeping fails', async t => {
+  const partialCandidate = "module.exports = 'late-admission-survival'\n"
+  const fixture = configureRoadmapCompositionHarness(t, [], {
+    completeProduct: true,
+    transportFailureOnFirstWorker: true,
+    transportFailureOnWorkerSuccessor: true,
+    transportSuccessorPartialBeforeFailure: partialCandidate,
+    exhaustedTransportAdmissionFailure: 'RUN_RECORD_UNSAFE',
+  })
+
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'RUN_RECORD_UNSAFE')
+  assert.deepEqual(fixture.harness.launches.map(item => item.workItemId), [
+    'work-1', 'work-1-transport-retry-1',
+  ])
+  assert.equal(
+    fs.readFileSync(path.join(fixture.harness.runtimeOptions.targetPath, 'src', 'example.js'), 'utf8'),
+    "module.exports = 'ready'\n",
+  )
+  const candidate = result.terminalEnvelope.bestAvailableCandidateEvidence
+  assert.equal(candidate.kind, 'controller-owned-physical-candidate-survival-bundle')
+  assert.equal(candidate.reasonCode, 'RUN_RECORD_UNSAFE')
+  assert.equal(candidate.externalLocal, null)
+  assert.equal(candidate.local.changedPathCount, 1)
+  assert.equal(
+    fs.readFileSync(path.join(candidate.local.candidateRoot, 'src', 'example.js'), 'utf8'),
+    partialCandidate,
+  )
+  assert.equal(result.terminalEnvelope.error.details.retryDisposition,
+    'DO_NOT_DISCARD_PHYSICAL_CANDIDATE_FOR_CONTROLLER_BOOKKEEPING')
 })
 
 test('DONE retry keeps its private promotion transaction across one repair transport successor', async t => {
@@ -3535,7 +3716,8 @@ test('fixture executable validation must complete before any write-producing lau
       if (request.workItemId === 'fixture-prebuild-validation') {
         assert.equal(request.logicalRole, 'independent-tester')
         assert.equal(request.writeProducing, false)
-        assert.match(request.assignment, /at most 2 tool calls for the whole turn/u)
+        assert.match(request.assignment, /target roughly 4 or fewer purposeful tool calls/u)
+        assert.match(request.assignment, /still completing every required observation/u)
         assert.match(request.assignment, /launcher retains at most 1,000 tokens/u)
         assert.match(request.assignment, /classic shell tool has no per-call output-budget argument/u)
         return { code: 'PASS', payload: { capturedDomainOutcomes: [{
@@ -4742,7 +4924,7 @@ test('required local child can stay stdout-silent past the analyst watchdog and 
   assert.equal(timeoutStops, 0)
 })
 
-test('optional pre-route analyst timeout drains once and conservative local work continues', async t => {
+test('optional pre-route analyst absolute timeout drains once and conservative local work continues', async t => {
   const timerApi = manualTimerApi()
   const harness = makeHarness(t, {
     activationId: 'activation-analyst-timeout',
@@ -4770,7 +4952,8 @@ test('optional pre-route analyst timeout drains once and conservative local work
   }
   harness.runtimeOptions.launcher = launch => {
     if (launch.logicalRole === 'route-analyst') {
-      assert.equal(typeof launch.onTransportActivity, 'function')
+      assert.equal(launch.onTransportActivity, undefined,
+        'optional transport activity cannot extend the absolute route-analysis ceiling')
       announceAnalyst()
       return new Promise(() => {})
     }
@@ -4791,7 +4974,7 @@ test('optional pre-route analyst timeout drains once and conservative local work
   assert.equal(productLaunches, 1)
 })
 
-test('unknown billed analyst usage consumes 16k before conservative product fallback', async t => {
+test('unknown billed analyst usage consumes the bounded 8k before conservative product fallback', async t => {
   const harness = makeHarness(t, {
     activationId: 'activation-unknown-analyst-spend',
     runId: 'run-unknown-analyst-spend',
@@ -4816,19 +4999,19 @@ test('unknown billed analyst usage consumes 16k before conservative product fall
   harness.runtimeOptions.launcher = async launch => {
     harness.launches.push(launch)
     if (launch.logicalRole === 'route-analyst') {
-      assert.equal(launch.providerTokenLimit, 16_000)
+      assert.equal(launch.providerTokenLimit, 8_000)
       assert.equal(typeof launch.onUnknownProviderSpend, 'function')
       launch.onProviderRequestStarted({
-        tokenLimit: 16_000,
-        maximumUnaccountedTokens: 16_000,
+        tokenLimit: 8_000,
+        maximumUnaccountedTokens: 8_000,
         requestOrdinal: 1,
         completedRequestCount: 0,
         accountedUsage: ZERO_USAGE,
         priorLeaseModelTokens: 0,
       })
       const receipt = launch.onUnknownProviderSpend({
-        tokenLimit: 16_000,
-        maximumUnaccountedTokens: 16_000,
+        tokenLimit: 8_000,
+        maximumUnaccountedTokens: 8_000,
         providerRequestCount: 1,
         completedRequestCount: 0,
         requestOrdinal: 1,
@@ -4837,7 +5020,7 @@ test('unknown billed analyst usage consumes 16k before conservative product fall
       })
       assert.deepEqual(receipt, {
         accountingClass: 'UNKNOWN_PROVIDER_SPEND_UPPER_BOUND',
-        chargedTokens: 16_000,
+        chargedTokens: 8_000,
         providerRequestCount: 1,
         completedRequestCount: 0,
         relayFailureCode: 'CODEX_USAGE_INCOMPLETE',
@@ -4847,8 +5030,8 @@ test('unknown billed analyst usage consumes 16k before conservative product fall
       })
     }
     assert.equal(launch.logicalRole, 'worker')
-    assert.equal(launch.providerTokenLimit, 24_000)
-    assert.equal(harness.runtimeOptions.budgetController.snapshot().tokensUsed, 16_000)
+    assert.equal(launch.providerTokenLimit, 40_000)
+    assert.equal(harness.runtimeOptions.budgetController.snapshot().tokensUsed, 8_000)
     return {
       ...roadmapCompositionRoleResult(launch, ['Complete after unknown route spend.']),
       contextId: `context:${launch.workItemId}`,
@@ -4861,10 +5044,10 @@ test('unknown billed analyst usage consumes 16k before conservative product fall
   assert.deepEqual(harness.launches.map(launch => [
     launch.logicalRole, launch.providerTokenLimit,
   ]), [
-    ['route-analyst', 16_000],
-    ['worker', 24_000],
+    ['route-analyst', 8_000],
+    ['worker', 40_000],
   ])
-  assert.equal(result.budget.tokensUsed, 16_000)
+  assert.equal(result.budget.tokensUsed, 8_000)
   assert.equal(runtime.childTokenReservations.size, 0)
 })
 
@@ -5036,6 +5219,13 @@ test('provider aggregate overage is charged exactly once before its rejected chi
   const harness = makeHarness(t, {
     activationId: 'activation-provider-exact-overage',
     runId: 'run-provider-exact-overage',
+  })
+  harness.runtimeOptions.budgetController = new BudgetController({
+    limits: { wallMs: 600_000, tokens: 24_000, sessions: 20, launches: 20 },
+    finalizationReserveMs: 10,
+    phases: {},
+    monotonicMs: () => harness.currentTime(),
+    monotonicClockId: 'test-monotonic',
   })
   const accountingRecords = []
   harness.runtimeOptions.accountingAuthority = {
@@ -5750,10 +5940,10 @@ function run030AutomaticSettings(deadline) {
   }
 }
 
-function run030UsableDone() {
+function run030UsableDone(harness) {
   return {
-    outcome: 'DONE', deliverables: ['deadline-admission-fixture'],
-    checkHashes: ['a'.repeat(64)], terminalEnvelope: { checkCount: 1 },
+    ...usableDoneFixture(harness, 'deadline-admission-fixture'),
+    terminalEnvelope: { checkCount: 1 },
   }
 }
 
@@ -5774,7 +5964,7 @@ test('AP-RUN-030 declared task deadline is authoritative in activation and the c
       productHardMaximumMs: 3_600_000,
       settings: run030ExactSettings(declared),
       exactPathPreflight: deterministicExactPathPreflight('DIRECT'),
-      executeRoute: async () => run030UsableDone(),
+      executeRoute: async () => run030UsableDone(harness),
     },
   })
   const recordFactory = harness.runtimeOptions.recordFactory
@@ -5810,7 +6000,7 @@ test('AP-RUN-030 missing task deadline binds the injected product hard maximum',
       productHardMaximumMs,
       settings: run030ExactSettings(),
       exactPathPreflight: deterministicExactPathPreflight('DIRECT'),
-      executeRoute: async () => run030UsableDone(),
+      executeRoute: async () => run030UsableDone(harness),
     },
   })
   const recordFactory = harness.runtimeOptions.recordFactory
@@ -5846,7 +6036,7 @@ test('AP-RUN-030 an overlong wall target clamps locally and still completes prod
       productHardMaximumMs,
       settings: run030ExactSettings(declared),
       exactPathPreflight: deterministicExactPathPreflight('DIRECT'),
-      executeRoute: async () => { executionCalls++; return run030UsableDone() },
+      executeRoute: async () => { executionCalls++; return run030UsableDone(harness) },
     },
   })
   const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
@@ -5940,7 +6130,7 @@ test('AP-RUN-030 insufficient and expired wall targets still complete required l
         now: () => wallNowMs,
         settings: run030ExactSettings(item.deadline),
         exactPathPreflight: deterministicExactPathPreflight('DIRECT'),
-        executeRoute: async () => { executionCalls++; return run030UsableDone() },
+        executeRoute: async () => { executionCalls++; return run030UsableDone(harness) },
       },
     })
     const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
@@ -5997,7 +6187,7 @@ test('AP-RUN-030 resume preserves the exact persisted deadline and both reserves
         decision: decision('DIRECT'), schedulerState: firstResult.schedulerState,
         deadline: firstActivation && firstActivation.deadline,
       },
-      executeRoute: async () => run030UsableDone(),
+      executeRoute: async () => run030UsableDone(second),
     },
   })
   const secondRecordFactory = second.runtimeOptions.recordFactory
@@ -6146,11 +6336,7 @@ test('explicit direct, light, and roadmap paths bypass analyst and root route-se
       runId: `exact-${requested}-run`,
       executeRoute: async input => {
         observed.push(input)
-        return {
-          outcome: 'DONE',
-          deliverables: [`exact-${requested}-route-fixture`],
-          checkHashes: [CANDIDATE_A],
-        }
+        return usableDoneFixture(harness, `exact-${requested}-route-fixture`)
       },
       decideRoute: async () => assert.fail('exact path must not invoke root route selection'),
       runtimeOptions: {
@@ -6188,9 +6374,7 @@ test('automatic one-worker ROADMAP activation binds its declared topology to the
     decideRoute: async () => ({
       decision: routeDecision, submittedAtMs: 0, usage: ZERO_USAGE,
     }),
-    executeRoute: async () => ({
-      outcome: 'DONE', deliverables: ['automatic-roadmap-fixture'], checkHashes: [CANDIDATE_A],
-    }),
+    executeRoute: async () => usableDoneFixture(harness, 'automatic-roadmap-fixture'),
   })
   const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
 
@@ -6219,9 +6403,7 @@ test('automatic ROADMAP ignores advisory scout expansion and keeps the finite ph
     decideRoute: async () => ({
       decision: routeDecision, submittedAtMs: 0, usage: ZERO_USAGE,
     }),
-    executeRoute: async () => ({
-      outcome: 'DONE', deliverables: ['automatic-roadmap-scout-fixture'], checkHashes: [CANDIDATE_A],
-    }),
+    executeRoute: async () => usableDoneFixture(harness, 'automatic-roadmap-scout-fixture'),
   })
   const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
 
@@ -6605,7 +6787,7 @@ test('built-in deterministic executor crosses an economic launch target for its 
   ]) {
     assert.match(
       fixture.routeRequests.get(workItemId).assignment,
-      /Keep model-visible command output bounded/u,
+      /launcher retains at most 1,000 tokens from each tool output/u,
     )
   }
 })
@@ -6872,7 +7054,10 @@ test('persistent child terminal persistence failure returns the candidate withou
   assert.equal(modelCalls, 1)
   assert.equal(childPersistenceAttempts, 2)
   assert.equal(fs.readFileSync(candidatePath, 'utf8'), "module.exports = 'preserved'\n")
-  assert.deepEqual(harness.finalizations.at(-1).deliverables, [candidatePath])
+  assert.deepEqual(harness.finalizations.at(-1).deliverables, [{
+    path: candidatePath,
+    hash: crypto.createHash('sha256').update(fs.readFileSync(candidatePath)).digest('hex'),
+  }])
   assert.equal(Object.values(result.budget.sessions)
     .filter(session => !session.sessionId.endsWith(':root-route-decision'))
     .every(session => session.status === 'DONE'), true)
@@ -7308,10 +7493,13 @@ test('WAITING_USER retries a one-shot lease release failure and preserves the im
     runId: 'run-waiting-release-boundary', activationId: 'activation-waiting-release-boundary',
   })
   let releaseAttempts = 0
+  let runtime
+  let cancellation
   const originalRelease = harness.missionLock.release.bind(harness.missionLock)
   harness.missionLock.release = (...args) => {
     releaseAttempts += 1
     if (releaseAttempts === 1) {
+      cancellation = runtime.cancel('concurrent cancellation joins waiting-user release retry')
       throw Object.assign(new Error('transient waiting-user release failure'), {
         code: 'MISSION_LOCK_RELEASE_FAILED',
       })
@@ -7331,7 +7519,10 @@ test('WAITING_USER retries a one-shot lease release failure and preserves the im
     authorityClass: 'TARGET_AUTHORITY',
     evidenceHash: CANDIDATE_A,
   })
-  const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
+  runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+  const result = await runtime.start()
+  const cancellationResult = await cancellation
+  assert.deepEqual(cancellationResult, result)
   assert.equal(result.outcome, 'WAITING_USER', JSON.stringify(result))
   assert.equal(result.resumable, true)
   assert.equal(releaseAttempts, 2)
@@ -7447,7 +7638,7 @@ test('full start retries the exact verified DONE intent after one transient term
   assert.equal(harness.missionLock.releaseCalls, 1)
 })
 
-test('durable-finalizer availability failure propagates without releasing or exposing DONE', async t => {
+test('durable-finalizer availability failure gets one exact local replay then propagates without exposing DONE', async t => {
   const harness = makeHarness(t)
   let attempts = 0
   harness.runtimeOptions.finalizerFactory = async () => ({
@@ -7464,9 +7655,41 @@ test('durable-finalizer availability failure propagates without releasing or exp
     new CodexSupervisorRuntime(harness.runtimeOptions).start(),
     error => error.code === 'FINALIZER_WRITE_INTERRUPTED',
   )
-  assert.equal(attempts, 1)
+  assert.equal(attempts, 2)
   assert.deepEqual(harness.finalizations, [])
   assert.equal(harness.missionLock.releaseCalls, 0)
+})
+
+test('concurrent cancellation shares the successful replay of a selected finalization', async t => {
+  const harness = makeHarness(t)
+  let attempts = 0
+  let runtime
+  let cancellation
+  harness.runtimeOptions.finalizerFactory = async ({ lease }) => ({
+    async finalize(input) {
+      attempts += 1
+      if (attempts === 1) {
+        cancellation = runtime.cancel('join the selected finalization replay')
+        throw Object.assign(new Error('transient durable finalizer failure'), {
+          code: 'FINALIZER_WRITE_INTERRUPTED',
+        })
+      }
+      harness.finalizations.push(input)
+      harness.missionLock.release(lease)
+      return { terminal: input.outcome }
+    },
+  })
+  harness.runtimeOptions.executeRoute = async () =>
+    usableDoneFixture(harness, 'shared-finalizer-replay-done')
+  runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+
+  const result = await runtime.start()
+  const cancellationResult = await cancellation
+  assert.deepEqual(cancellationResult, result)
+  assert.equal(result.outcome, 'DONE')
+  assert.equal(attempts, 2)
+  assert.deepEqual(harness.finalizations.map(item => item.outcome), ['DONE'])
+  assert.equal(harness.missionLock.releaseCalls, 1)
 })
 
 test('finalizer integrity disagreement propagates without retry or lease release', async t => {
@@ -7490,6 +7713,518 @@ test('finalizer integrity disagreement propagates without retry or lease release
   assert.equal(attempts, 1)
   assert.equal(harness.missionLock.releaseCalls, 0)
   assert.deepEqual(harness.launches.map(item => item.logicalRole), ['route-analyst'])
+})
+
+test('full runtime preserves a durable zero-diff response when ALL_WORK_JOINED fails without another model launch', async t => {
+  const harness = makeHarness(t, {
+    runtimeOptions: {
+      settings: run030ExactSettings(),
+      exactPathPreflight: deterministicExactPathPreflight('DIRECT'),
+    },
+  })
+  const responseRoot = tempDirectory(t, 'autoprompt-structured-response-survival-')
+  const responsePath = path.join(responseRoot, 'candidate.json')
+  let runtime = null
+  let persistedPointer = null
+  let joinedFailures = 0
+  const executor = createDefaultRouteExecutor({
+    targetPath: harness.runtimeOptions.targetPath,
+    gitEnvironment: () => process.env,
+    transition: async (eventId, nextState, details) => {
+      if (eventId === 'ALL_WORK_JOINED') {
+        joinedFailures += 1
+        throw Object.assign(new Error('injected post-response controller failure'), {
+          code: 'RUN_RECORD_WRITE_UNAVAILABLE',
+        })
+      }
+      return runtime._runtimeTransition(eventId, nextState, details)
+    },
+    harnessAttestation: (candidateHash, oracle) => ({
+      repoHash: candidateHash,
+      buildHash: crypto.createHash('sha256').update(`build:${candidateHash}`).digest('hex'),
+      oracleHash: crypto.createHash('sha256').update(`oracle:${oracle}`).digest('hex'),
+    }),
+    persistStructuredFinalResponse(response) {
+      const bytes = Buffer.from(`${JSON.stringify(response, null, 2)}\n`)
+      fs.writeFileSync(responsePath, bytes)
+      persistedPointer = Object.freeze({
+        name: 'structured-final-response',
+        path: responsePath,
+        hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+        bytes: bytes.length,
+      })
+      return persistedPointer
+    },
+  })
+  harness.runtimeOptions.executeRoute = executor
+  harness.runtimeOptions.launcher = async launch => {
+    harness.launches.push(launch)
+    assert.equal(launch.workItemId, 'work-1')
+    assert.equal(launch.logicalRole, 'worker')
+    return roadmapCompositionRoleResult(launch, [
+      'The requested zero-diff finding is preserved as a structured response.',
+    ])
+  }
+  runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+
+  const result = await runtime.start()
+
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'RUN_RECORD_WRITE_UNAVAILABLE')
+  assert.equal(result.terminalEnvelope.bestAvailableCandidateEvidence.disposition,
+    'PRESERVED_WITHOUT_DONE_AUTHORITY')
+  assert.deepEqual(result.finalResponse.evidencePointer, persistedPointer)
+  assert.equal(result.deliverables.some(item =>
+    item.path === persistedPointer.path && item.hash === persistedPointer.hash), true)
+  assert.deepEqual(harness.launches.map(item => item.workItemId), ['work-1'])
+  assert.equal(joinedFailures, 1)
+  assert.deepEqual(harness.finalizations.map(item => item.outcome), ['FAILED'])
+})
+
+function resumableStructuredResponseFixture(t, harness, id) {
+  const body = {
+    schemaVersion: 1,
+    resultFormat: 'read-only-findings',
+    requestedResult: `Return ${id}.`,
+    results: [{
+      workItemId: 'work-1',
+      reportId: `${id}-report`,
+      successItems: [{ id: `${id}-success`, status: 'pass', evidenceIds: [`${id}-evidence`] }],
+      findings: [{ category: 'result', summary: `${id} is preserved.` }],
+      remainingConcerns: [],
+      resultHash: crypto.createHash('sha256').update(`${id}-result`).digest('hex'),
+    }],
+  }
+  const response = {
+    ...body,
+    responseHash: crypto.createHash('sha256').update(stableStringify(body)).digest('hex'),
+  }
+  const responsePath = path.join(harness.directory, `${id}.json`)
+  const bytes = Buffer.from(`${JSON.stringify(response, null, 2)}\n`)
+  fs.writeFileSync(responsePath, bytes)
+  return Object.freeze({
+    ...response,
+    evidencePointer: Object.freeze({
+      name: 'structured-final-response',
+      path: responsePath,
+      hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+      bytes: bytes.length,
+    }),
+  })
+}
+
+test('post-response physical limit pause returns the exact response without another model launch', async t => {
+  const harness = makeHarness(t, {
+    runtimeOptions: {
+      settings: run030ExactSettings(),
+      exactPathPreflight: deterministicExactPathPreflight('DIRECT'),
+    },
+  })
+  const response = resumableStructuredResponseFixture(t, harness, 'structured-limit-pause')
+  let runtime = null
+  harness.runtimeOptions.executeRoute = async ({ launch }) => {
+    await launch({
+      workItemId: 'structured-limit-worker', logicalRole: 'worker', parent: 'run-owner',
+      purpose: 'work', assignment: 'Produce the exact zero-diff response.',
+      success: ['The structured response is durable.'], checks: ['response binding'],
+    })
+    runtime._rememberStructuredFinalResponse(response)
+    throw Object.assign(new Error('injected accepted child token-envelope limit'), {
+      code: 'CHILD_TOKEN_LIMIT_EXHAUSTED',
+    })
+  }
+  runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+  runtime._budgetPauseFrontier = () => ({
+    resumeState: 'CHECK_WORK',
+    nextReadyWorkIds: ['independent-check-1'],
+    remainingBudgetSeconds: 10,
+    continuationBindingHash: 'a'.repeat(64),
+  })
+  runtime._persistRecoveryCheckpoint = () => ({
+    record: { checkpointPayloadHash: 'c'.repeat(64) },
+  })
+
+  const result = await runtime.start()
+  assert.equal(result.outcome, 'PAUSED', JSON.stringify(result))
+  assert.equal(result.resumable, true)
+  assert.deepEqual(result.finalResponse, response)
+  assert.equal(result.deliverables.some(item =>
+    item.path === response.evidencePointer.path && item.hash === response.evidencePointer.hash), true)
+  assert.equal(result.terminalEnvelope.bestAvailableCandidateEvidence.disposition,
+    'PRESERVED_WITHOUT_DONE_AUTHORITY')
+  assert.deepEqual(harness.launches.map(item => item.workItemId), ['structured-limit-worker'])
+  assert.deepEqual(harness.finalizations, [])
+})
+
+test('post-response callback suspension returns the exact response without another model launch', async t => {
+  const harness = makeHarness(t, {
+    runtimeOptions: {
+      settings: run030ExactSettings(),
+      exactPathPreflight: deterministicExactPathPreflight('DIRECT'),
+    },
+  })
+  const response = resumableStructuredResponseFixture(t, harness, 'structured-callback-pause')
+  let runtime = null
+  harness.runtimeOptions.executeRoute = async ({ launch }) => {
+    await launch({
+      workItemId: 'structured-callback-worker', logicalRole: 'worker', parent: 'run-owner',
+      purpose: 'work', assignment: 'Produce the exact zero-diff response.',
+      success: ['The structured response is durable.'], checks: ['response binding'],
+    })
+    runtime._rememberStructuredFinalResponse(response)
+    throw Object.assign(new Error('injected post-response callback outage'), {
+      code: 'CALLBACK_RECONCILIATION_PENDING',
+      details: { resumableCandidate: { candidateHash: 'b'.repeat(64) } },
+    })
+  }
+  runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+
+  const result = await runtime.start()
+  assert.equal(result.outcome, 'PARTIAL', JSON.stringify(result))
+  assert.equal(result.resumable, true)
+  assert.deepEqual(result.finalResponse, response)
+  assert.equal(result.deliverables.some(item =>
+    item.path === response.evidencePointer.path && item.hash === response.evidencePointer.hash), true)
+  assert.deepEqual(harness.launches.map(item => item.workItemId), ['structured-callback-worker'])
+})
+
+test('cancellation after response persistence returns CANCELLED with the exact response', async t => {
+  const harness = makeHarness(t, {
+    runtimeOptions: {
+      settings: run030ExactSettings(),
+      exactPathPreflight: deterministicExactPathPreflight('DIRECT'),
+    },
+  })
+  const response = resumableStructuredResponseFixture(t, harness, 'structured-cancel-race')
+  let runtime = null
+  let announceResponse
+  let releaseExecution
+  const responsePersisted = new Promise(resolve => { announceResponse = resolve })
+  const executionGate = new Promise(resolve => { releaseExecution = resolve })
+  harness.runtimeOptions.executeRoute = async ({ launch }) => {
+    await launch({
+      workItemId: 'structured-cancel-worker', logicalRole: 'worker', parent: 'run-owner',
+      purpose: 'work', assignment: 'Produce the exact zero-diff response.',
+      success: ['The structured response is durable.'], checks: ['response binding'],
+    })
+    runtime._rememberStructuredFinalResponse(response)
+    announceResponse()
+    await executionGate
+    throw Object.assign(new Error('owned execution observed cancellation'), { code: 'CANCELLED' })
+  }
+  runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+
+  const started = runtime.start()
+  await responsePersisted
+  const cancelled = runtime.cancel('cancel after exact response persistence')
+  releaseExecution()
+  const [startResult, cancelResult] = await Promise.all([started, cancelled])
+
+  assert.deepEqual(startResult, cancelResult)
+  assert.equal(cancelResult.outcome, 'CANCELLED')
+  assert.deepEqual(cancelResult.finalResponse, response)
+  assert.equal(cancelResult.deliverables.some(item =>
+    item.path === response.evidencePointer.path && item.hash === response.evidencePointer.hash), true)
+  assert.deepEqual(harness.launches.map(item => item.workItemId), ['structured-cancel-worker'])
+  assert.deepEqual(harness.finalizations.map(item => item.outcome), ['CANCELLED'])
+})
+
+test('same-tick finalization callers share one drain, one finalizer, and one immutable result', async t => {
+  const harness = makeHarness(t)
+  const runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+  runtime.route = 'DIRECT'
+  runtime.lease = harness.missionLock.acquire({ owner: 'concurrent-finalization-test' })
+  runtime.finalizer = await harness.runtimeOptions.finalizerFactory({ lease: runtime.lease })
+  const terminalResult = {
+    reason: 'one immutable controller failure',
+    terminalEnvelope: { status: 'RUN_RECORD_UNSAFE' },
+  }
+
+  const [first, second] = await Promise.all([
+    runtime._finish('FAILED', terminalResult),
+    runtime._finish('FAILED', terminalResult),
+  ])
+
+  assert.deepEqual(first, second)
+  assert.equal(first.outcome, 'FAILED')
+  assert.equal(harness.processOwner.cancelled, 1)
+  assert.equal(harness.processOwner.drained, 1)
+  assert.equal(harness.finalizations.length, 1)
+  assert.equal(harness.missionLock.releaseCalls, 1)
+})
+
+test('same-tick pause, cancellation, and finalization have one first-writer settlement', async t => {
+  const makeRuntime = async label => {
+    const harness = makeHarness(t, { activationId: `settlement-${label}` })
+    const runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+    runtime.route = 'DIRECT'
+    runtime.lease = harness.missionLock.acquire({ owner: `settlement-${label}` })
+    runtime.finalizer = await harness.runtimeOptions.finalizerFactory({ lease: runtime.lease })
+    return { harness, runtime }
+  }
+
+  for (const outcome of ['WAITING_USER', 'PAUSED']) {
+    const { harness, runtime } = await makeRuntime(`suspend-first-${outcome}`)
+    const pause = runtime._suspendResumable(outcome, {
+      terminalEnvelope: { status: outcome },
+    })
+    const finish = runtime._finish('FAILED', {
+      terminalEnvelope: { status: 'LATE_FAILURE' },
+    })
+    const cancel = runtime.cancel('late cancellation')
+    const [paused, finished, cancelled] = await Promise.all([pause, finish, cancel])
+
+    assert.deepEqual(finished, paused)
+    assert.deepEqual(cancelled, paused)
+    assert.equal(paused.outcome, outcome)
+    assert.equal(paused.resumable, true)
+    assert.equal(harness.processOwner.cancelled, 1)
+    assert.equal(harness.processOwner.drained, 1)
+    assert.equal(harness.finalizations.length, 0)
+    assert.equal(harness.missionLock.releaseCalls, 1)
+    assert.equal(runtime.terminalFinalizationIntent, null)
+    assert.equal(runtime.resumableSuspensionIntent.outcome, outcome)
+  }
+
+  {
+    const { harness, runtime } = await makeRuntime('finish-first')
+    const finish = runtime._finish('FAILED', {
+      terminalEnvelope: { status: 'FIRST_FAILURE' },
+    })
+    const pause = runtime._suspendResumable('WAITING_USER', {
+      terminalEnvelope: { status: 'LATE_PAUSE' },
+    })
+    const [finished, paused] = await Promise.all([finish, pause])
+
+    assert.deepEqual(paused, finished)
+    assert.equal(finished.outcome, 'FAILED')
+    assert.equal(harness.processOwner.cancelled, 1)
+    assert.equal(harness.processOwner.drained, 1)
+    assert.equal(harness.finalizations.length, 1)
+    assert.equal(harness.missionLock.releaseCalls, 1)
+    assert.equal(runtime.resumableSuspensionIntent, null)
+    assert.equal(runtime.terminalFinalizationIntent.outcome, 'FAILED')
+  }
+
+  {
+    const { harness, runtime } = await makeRuntime('cancel-first')
+    const cancel = runtime.cancel('first cancellation')
+    const pause = runtime._suspendResumable('PAUSED', {
+      terminalEnvelope: { status: 'LATE_PAUSE' },
+    })
+    const [cancelled, paused] = await Promise.all([cancel, pause])
+
+    assert.deepEqual(paused, cancelled)
+    assert.equal(cancelled.outcome, 'CANCELLED')
+    assert.equal(harness.processOwner.cancelled, 1)
+    assert.equal(harness.processOwner.drained, 1)
+    assert.equal(harness.finalizations.length, 1)
+    assert.equal(harness.missionLock.releaseCalls, 1)
+    assert.equal(runtime.resumableSuspensionIntent, null)
+    assert.equal(runtime.terminalFinalizationIntent.outcome, 'CANCELLED')
+  }
+})
+
+test('finalization waits for the selected terminal release transition to complete', async t => {
+  const harness = makeHarness(t, { activationId: 'release-before-finalize' })
+  const runtime = new CodexSupervisorRuntime({
+    ...harness.runtimeOptions,
+    runtimeStateProvider: () => ({ state: 'RUN_WORK' }),
+  })
+  runtime.route = 'DIRECT'
+  runtime.lease = harness.missionLock.acquire({ owner: 'release-before-finalize' })
+  runtime.finalizer = await harness.runtimeOptions.finalizerFactory({ lease: runtime.lease })
+  let announceTransition
+  let releaseTransition
+  const transitionStarted = new Promise(resolve => { announceTransition = resolve })
+  const transitionGate = new Promise(resolve => { releaseTransition = resolve })
+  runtime._runtimeTransition = async () => {
+    announceTransition()
+    await transitionGate
+  }
+  const terminalResult = {
+    reason: 'selected cancellation',
+    terminalEnvelope: { status: 'CANCELLED' },
+  }
+
+  const release = runtime._enterTerminalRelease(
+    'CANCELLED', Object.assign(new Error('selected cancellation'), { code: 'CANCELLED' }),
+    terminalResult.terminalEnvelope, terminalResult,
+  )
+  await transitionStarted
+  const finish = runtime._finish('CANCELLED', terminalResult)
+  await flushMicrotasks()
+  assert.equal(harness.finalizations.length, 0)
+  assert.equal(harness.processOwner.cancelled, 0)
+
+  releaseTransition()
+  const [selectedOutcome, settled] = await Promise.all([release, finish])
+  assert.equal(selectedOutcome, 'CANCELLED')
+  assert.equal(settled.outcome, 'CANCELLED')
+  assert.equal(harness.finalizations.length, 1)
+  assert.equal(harness.processOwner.cancelled, 1)
+  assert.equal(harness.processOwner.drained, 1)
+  assert.equal(harness.missionLock.releaseCalls, 1)
+})
+
+test('retry after a failed release transition completes the same terminal intent before finalizing', async t => {
+  const harness = makeHarness(t, { activationId: 'release-transition-retry' })
+  let state = 'RUN_WORK'
+  const runtime = new CodexSupervisorRuntime({
+    ...harness.runtimeOptions,
+    runtimeStateProvider: () => ({ state }),
+  })
+  runtime.route = 'DIRECT'
+  runtime.lease = harness.missionLock.acquire({ owner: 'release-transition-retry' })
+  runtime.finalizer = await harness.runtimeOptions.finalizerFactory({ lease: runtime.lease })
+  let transitions = 0
+  runtime._runtimeTransition = async () => {
+    transitions += 1
+    if (transitions === 1) {
+      throw Object.assign(new Error('injected release transition outage'), {
+        code: 'RUN_RECORD_WRITE_UNAVAILABLE',
+      })
+    }
+    state = 'RELEASING_LOCK'
+  }
+  const terminalResult = {
+    reason: 'selected cancellation',
+    terminalEnvelope: { status: 'CANCELLED' },
+  }
+
+  await assert.rejects(runtime._enterTerminalRelease(
+    'CANCELLED', Object.assign(new Error('selected cancellation'), { code: 'CANCELLED' }),
+    terminalResult.terminalEnvelope, terminalResult,
+  ), error => error.code === 'RUN_RECORD_WRITE_UNAVAILABLE')
+  assert.equal(runtime.terminalFinalizationIntent.outcome, 'CANCELLED')
+  assert.equal(harness.finalizations.length, 0)
+
+  const settled = await runtime.cancel('retry selected cancellation')
+  assert.equal(settled.outcome, 'CANCELLED')
+  assert.equal(transitions, 2)
+  assert.equal(state, 'RELEASING_LOCK')
+  assert.equal(harness.finalizations.length, 1)
+  assert.equal(harness.processOwner.cancelled, 1)
+  assert.equal(harness.processOwner.drained, 1)
+  assert.equal(harness.missionLock.releaseCalls, 1)
+})
+
+test('a selected terminal intent supersedes a previously failed resumable suspension', async t => {
+  const harness = makeHarness(t, { activationId: 'terminal-supersedes-failed-pause' })
+  const runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+  runtime.route = 'DIRECT'
+  runtime.lease = harness.missionLock.acquire({ owner: 'terminal-supersedes-failed-pause' })
+  runtime.finalizer = await harness.runtimeOptions.finalizerFactory({ lease: runtime.lease })
+  runtime._drainOwnedProcessesWithOneRetry = async () => {
+    throw Object.assign(new Error('injected suspension drain failure'), {
+      code: 'PROCESS_DRAIN_TIMEOUT',
+    })
+  }
+
+  await assert.rejects(runtime._suspendResumable('PAUSED', {
+    terminalEnvelope: { status: 'PAUSED' },
+  }), error => error.code === 'PROCESS_DRAIN_TIMEOUT')
+  assert.equal(runtime.resumableSuspensionIntent.outcome, 'PAUSED')
+  runtime._drainOwnedProcessesWithOneRetry =
+    CodexSupervisorRuntime.prototype._drainOwnedProcessesWithOneRetry.bind(runtime)
+
+  const terminalResult = {
+    reason: 'terminal result selected after failed pause',
+    terminalEnvelope: { status: 'FAILED' },
+  }
+  const selectedOutcome = await runtime._enterTerminalRelease(
+    'FAILED', Object.assign(new Error('terminal failure'), { code: 'FAILED' }),
+    terminalResult.terminalEnvelope, terminalResult,
+  )
+  const settled = await runtime._finish(selectedOutcome, terminalResult)
+
+  assert.equal(settled.outcome, 'FAILED')
+  assert.equal(runtime.terminalFinalizationIntent.outcome, 'FAILED')
+  assert.equal(harness.processOwner.cancelled, 1)
+  assert.equal(harness.processOwner.drained, 1)
+  assert.equal(harness.finalizations.length, 1)
+  assert.equal(harness.missionLock.releaseCalls, 1)
+})
+
+test('late cancellation retries a PAUSED release instead of replacing its suspension intent', async t => {
+  let liveLease = null
+  let releaseAttempts = 0
+  const missionLock = {
+    acquire(options) {
+      liveLease = { owner: { targetKey: 'paused-release-target' }, options }
+      return liveLease
+    },
+    release(lease) {
+      assert.equal(lease, liveLease)
+      releaseAttempts += 1
+      if (releaseAttempts <= 2) {
+        throw Object.assign(new Error('injected paused release outage'), {
+          code: 'RUN_RECORD_WRITE_UNAVAILABLE',
+        })
+      }
+      liveLease = null
+    },
+  }
+  const harness = makeHarness(t, {
+    activationId: 'paused-release-retry',
+    missionLock,
+    runtimeOptions: { runtimeStateProvider: () => ({ state: 'PAUSED' }) },
+  })
+  const runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+  runtime.route = 'DIRECT'
+  runtime.lease = missionLock.acquire({ owner: 'paused-release-retry' })
+  const pauseResult = {
+    terminalEnvelope: { status: 'BUDGET_EXHAUSTED' },
+    transition: {
+      eventId: 'BUDGET_EXHAUSTED_RESUMABLE',
+      frontier: {
+        resumeState: 'CHECK_WORK',
+        nextReadyWorkIds: ['independent-check-1'],
+        remainingBudgetSeconds: 10,
+        continuationBindingHash: 'a'.repeat(64),
+      },
+    },
+  }
+
+  await assert.rejects(runtime._suspendResumable('PAUSED', pauseResult),
+    error => error.code === 'RUN_RECORD_WRITE_UNAVAILABLE')
+  assert.equal(runtime.resumableSuspensionIntent.outcome, 'PAUSED')
+  assert.equal(runtime.terminalFinalizationIntent, null)
+
+  const settled = await runtime.cancel('late cancellation after committed pause')
+  assert.equal(settled.outcome, 'PAUSED')
+  assert.equal(settled.resumable, true)
+  assert.equal(releaseAttempts, 3)
+  assert.equal(runtime.terminalFinalizationIntent, null)
+  assert.equal(runtime.resumableSuspensionIntent.outcome, 'PAUSED')
+})
+
+test('cancellation joins a preselected terminal result before finalization ownership begins', async t => {
+  const harness = makeHarness(t)
+  const runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+  runtime.route = 'DIRECT'
+  runtime.lease = harness.missionLock.acquire({ owner: 'selected-terminal-cancel-test' })
+  runtime.finalizer = await harness.runtimeOptions.finalizerFactory({ lease: runtime.lease })
+  const exact = usableDoneFixture(harness, 'selected-terminal-before-cancel')
+  await runtime._prepareTerminalFinalizationIntent('DONE', exact)
+  const competingOutcome = await runtime._enterTerminalRelease(
+    'CANCELLED',
+    Object.assign(new Error('late competing cancellation'), { code: 'CANCELLED' }),
+    { status: 'CANCELLED' },
+    { terminalEnvelope: { status: 'CANCELLED' } },
+  )
+  assert.equal(competingOutcome, 'DONE')
+
+  const finishing = runtime._finish('DONE', exact)
+  const cancelling = runtime.cancel('late cancellation cannot replace selected DONE')
+  const [finished, cancelled] = await Promise.all([finishing, cancelling])
+
+  assert.deepEqual(finished, cancelled)
+  assert.equal(finished.outcome, 'DONE')
+  assert.equal(harness.processOwner.cancelled, 1)
+  assert.equal(harness.processOwner.drained, 1)
+  assert.deepEqual(harness.finalizations.map(item => item.outcome), ['DONE'])
+  assert.equal(harness.missionLock.releaseCalls, 1)
 })
 
 test('concurrent start and explicit cancellation share one truthful terminal release', async t => {
@@ -7543,6 +8278,28 @@ test('cancellation at every pre-execution startup seam prevents post-cancel work
     const [startResult, cancelResult] = await Promise.all([started, cancelled])
     assert.deepEqual(startResult, cancelResult)
     assert.equal(startResult.outcome, 'CANCELLED')
+    assert.equal(harness.missionLock.releaseCalls, 0)
+    assert.deepEqual(harness.launches, [])
+  }
+  {
+    let announce
+    let rejectGate
+    const entered = new Promise(resolve => { announce = resolve })
+    const gate = new Promise((resolve, reject) => { rejectGate = reject })
+    const harness = makeHarness(t, {
+      activationId: 'cancel-before-lock-hook-failure',
+      runId: 'cancel-before-lock-hook-failure',
+    })
+    harness.runtimeOptions.beforeMissionAcquire = async () => { announce(); await gate }
+    const runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+    const started = runtime.start()
+    await entered
+    const cancelled = runtime.cancel('cancel while pre-lease hook fails')
+    rejectGate(Object.assign(new Error('injected pre-lease hook failure'), { code: 'HOOK_FAILED' }))
+    const [startResult, cancelResult] = await Promise.all([started, cancelled])
+    assert.deepEqual(startResult, cancelResult)
+    assert.equal(startResult.outcome, 'CANCELLED')
+    assert.equal(harness.missionLock.acquireCalls, 0)
     assert.equal(harness.missionLock.releaseCalls, 0)
     assert.deepEqual(harness.launches, [])
   }
@@ -7865,11 +8622,7 @@ test('AP-RUN-010 same activation resume restores protected reserves and cumulati
       workItemId: 'resumed-work', logicalRole: 'worker', parent: 'run-owner', depth: 1,
       purpose: 'work', assignment: 'Continue the exact saved state.', success: ['resume passes'], checks: ['focused check'],
     })
-    return {
-      outcome: 'DONE',
-      deliverables: ['same-activation-resume-fixture'],
-      checkHashes: [CANDIDATE_A],
-    }
+    return usableDoneFixture(second, 'same-activation-resume-fixture')
   }
   const secondResult = await new CodexSupervisorRuntime(second.runtimeOptions).start()
   assert.equal(secondResult.outcome, 'DONE', JSON.stringify(secondResult))
@@ -8601,6 +9354,9 @@ test('ordinary worker keeps its exact promoted candidate when mutation-state per
 function configureBookkeepingCandidateSurvivalHarness(t, options = {}) {
   const target = createTempGitTarget(tempDirectory(t, 'autoprompt-candidate-survival-target-'))
   const targetFile = path.join(target, 'src', 'example.js')
+  const targetArtifact = path.join(target, 'output', 'artifact.bin')
+  const externalTarget = options.externalOnly
+    ? path.join(path.dirname(target), 'external-only-result.bin') : null
   const originalBytes = fs.readFileSync(targetFile)
   const hardened = spawnSync(process.execPath, [
     path.join(ROOT, 'scripts', 'local-only-safety.cjs'),
@@ -8618,6 +9374,14 @@ function configureBookkeepingCandidateSurvivalHarness(t, options = {}) {
       exactPathPreflight: deterministicExactPathPreflight('DIRECT'),
     },
   })
+  if (externalTarget) {
+    const mission = `Create the exact external output \`${externalTarget}\`.`
+    const requestDirectory = path.join(harness.directory, 'external-only-request')
+    fs.mkdirSync(requestDirectory, { recursive: true })
+    const requestPointer = writeRequestEnvelope(requestDirectory, `${mission}\n`)
+    harness.runtimeOptions.mission = mission
+    harness.runtimeOptions.requestPointerFactory = async () => requestPointer
+  }
   const recordRoot = path.join(harness.directory, 'candidate-survival-record')
   fs.mkdirSync(recordRoot, { recursive: true, mode: 0o700 })
   harness.record.resolve = relative => path.join(recordRoot, ...String(relative).split('/'))
@@ -8625,6 +9389,12 @@ function configureBookkeepingCandidateSurvivalHarness(t, options = {}) {
     if (options.seam === 'pre-promotion' && relative.startsWith('work/results/mutation-admission-')) {
       throw Object.assign(new Error('injected immutable run-record admission failure'), {
         code: options.prePromotionFailureCode || 'RUN_RECORD_WRITE_UNAVAILABLE',
+      })
+    }
+    if (options.seam === 'transport-result-persistence' &&
+        relative.startsWith('work/results/terminal-receipt-')) {
+      throw Object.assign(new Error('injected provider-result persistence failure'), {
+        code: options.transportPersistenceFailureCode || 'RUN_RECORD_UNSAFE',
       })
     }
     harness.record.writes.set(relative, String(bytes))
@@ -8674,6 +9444,13 @@ function configureBookkeepingCandidateSurvivalHarness(t, options = {}) {
     promoted = true
     return postimages
   }
+  if (options.candidateSurvivalFailure) {
+    workspaceManager.preserveCandidate = () => {
+      throw Object.assign(new Error('injected candidate-survival integrity failure'), {
+        code: options.candidateSurvivalFailure,
+      })
+    }
+  }
   harness.runtimeOptions.workerWorkspaceFactory = ({ assignment, workItemId }) =>
     workspaceManager.prepare({ assignment, workItemId })
   let mutationAbortCalls = 0
@@ -8692,6 +9469,11 @@ function configureBookkeepingCandidateSurvivalHarness(t, options = {}) {
     abort() {
       mutationAbortCalls += 1
       activeMutationPermit = null
+      if (options.mutationAbortFailure) {
+        throw Object.assign(new Error('injected mutation cleanup persistence failure'), {
+          code: options.mutationAbortFailure,
+        })
+      }
     },
   }
   if (options.seam === 'post-promotion') {
@@ -8702,18 +9484,74 @@ function configureBookkeepingCandidateSurvivalHarness(t, options = {}) {
     })
   }
   const candidateBytes = Buffer.from(`module.exports = 'survived-${options.seam}'\n`)
+  const artifactBytes = Buffer.from(`exact-artifact-${options.seam}\n`)
   harness.runtimeOptions.launcher = async launch => {
     harness.launches.push(launch)
     if (launch.logicalRole === 'worker') {
-      fs.writeFileSync(path.join(launch.workingDirectory, 'src', 'example.js'), candidateBytes)
+      if (externalTarget) {
+        fs.writeFileSync(externalTarget, artifactBytes)
+        if (options.limitFailure) {
+          throw Object.assign(new Error('injected post-edit pre-terminal controller failure'), {
+            code: options.limitFailure,
+          })
+        }
+        if (options.transportFailure) {
+          launch.onUsageDelta(ZERO_USAGE)
+          throw Object.assign(new Error('injected provider transport failure after product edits'), {
+            code: options.transportFailure,
+          })
+        }
+        return {
+          ...roadmapCompositionRoleResult(launch, ['Produce the exact external-only candidate.']),
+          runId: harness.runtimeOptions.runId,
+          filesChanged: [externalTarget],
+          contextId: `context:${launch.workItemId}`,
+        }
+      }
+      if (options.partialReport && launch.workItemId === 'candidate-survival-repair') {
+        assert.deepEqual(fs.readFileSync(path.join(launch.workingDirectory, 'implementation.js')), candidateBytes)
+        assert.deepEqual(fs.readFileSync(path.join(launch.workingDirectory, 'output', 'artifact.bin')), artifactBytes)
+        return {
+          ...roadmapCompositionRoleResult(launch, ['Confirmed the exact partial candidate during repair.']),
+          runId: harness.runtimeOptions.runId,
+          filesChanged: [],
+          contextId: `context:${launch.workItemId}`,
+        }
+      }
+      const implementationPath = options.partialReport
+        ? path.join(launch.workingDirectory, 'implementation.js')
+        : path.join(launch.workingDirectory, 'src', 'example.js')
+      fs.writeFileSync(implementationPath, candidateBytes)
+      if (options.partialReport) {
+        const artifactPath = path.join(launch.workingDirectory, 'output', 'artifact.bin')
+        fs.mkdirSync(path.dirname(artifactPath), { recursive: true })
+        fs.writeFileSync(artifactPath, artifactBytes)
+      }
+      if (options.limitFailure) {
+        throw Object.assign(new Error('injected execution limit after physical product edits'), {
+          code: options.limitFailure,
+        })
+      }
       return {
         ...roadmapCompositionRoleResult(launch, ['Produce one exact ownership-safe candidate.']),
         runId: harness.runtimeOptions.runId,
-        filesChanged: ['src/example.js'],
+        filesChanged: options.partialReport ? ['output/artifact.bin'] : ['src/example.js'],
+        ...(options.partialReport ? {
+          successItems: [
+            { id: 'partial-product', status: 'pass', evidenceIds: ['candidate:physical-diff'] },
+            { id: 'author-follow-up', status: 'fail', evidenceIds: ['candidate:follow-up'] },
+          ],
+          remainingConcerns: ['The partial product needs one bounded follow-up.'],
+          allAssignedItemsPass: false,
+        } : {}),
         contextId: `context:${launch.workItemId}`,
       }
     }
     assert.equal(launch.logicalRole, 'independent-reviewer')
+    if (options.partialReport) {
+      assert.deepEqual(fs.readFileSync(path.join(target, 'implementation.js')), candidateBytes)
+      assert.deepEqual(fs.readFileSync(targetArtifact), artifactBytes)
+    }
     return {
       schemaVersion: '2.0.0', code: 'PASS', runId: harness.runtimeOptions.runId,
       requestEnvelopeHash: launch.canonicalAssignment.requestEnvelopeHash,
@@ -8729,19 +9567,63 @@ function configureBookkeepingCandidateSurvivalHarness(t, options = {}) {
     }
   }
   harness.runtimeOptions.executeRoute = async ({ launch }) => {
+    if (externalTarget) {
+      await launch({
+        workItemId: 'candidate-survival-work', logicalRole: 'worker', parent: 'run-owner',
+        purpose: 'work', assignment: `Create the exact external output at ${externalTarget}.`,
+        ...(options.transportFailure ? {
+          transportFailureRetryId: 'candidate-survival-work-transport-retry-1',
+        } : {}),
+        ownership: [externalTarget],
+        manifests: [{
+          kind: 'output', identity: externalTarget, owner: 'candidate-survival-work',
+          ownershipMode: 'single-owner',
+        }],
+        success: ['The exact external output contains the requested result.'],
+        checks: ['candidate survival ownership check'],
+      })
+      assert.fail('the injected controller bookkeeping failure must stop route execution')
+    }
     const worker = await launch({
       workItemId: 'candidate-survival-work', logicalRole: 'worker', parent: 'run-owner',
       purpose: 'work', assignment: 'Change the one owned implementation file.',
-      ownership: ['src/example.js'],
-      manifests: [{
+      ownership: options.partialReport
+        ? ['<implementation-file>', 'output/artifact.bin'] : ['src/example.js'],
+      manifests: options.partialReport ? [{
+        kind: 'file', identity: '<implementation-file>', owner: 'candidate-survival-work',
+        ownershipMode: 'single-owner',
+      }, {
+        kind: 'output', identity: 'output/artifact.bin', owner: 'candidate-survival-work',
+        ownershipMode: 'single-owner',
+      }] : [{
         kind: 'file', identity: 'src/example.js', owner: 'candidate-survival-work',
         ownershipMode: 'single-owner',
       }],
       success: ['The exact implementation file contains the requested result.'],
       checks: ['candidate survival ownership check'],
     })
-    assert.equal(worker.allAssignedItemsPass, true)
-    assert.deepEqual(fs.readFileSync(targetFile), candidateBytes)
+    assert.equal(worker.allAssignedItemsPass, options.partialReport ? false : true)
+    if (options.partialReport) {
+      assert.deepEqual(fs.readFileSync(path.join(target, 'implementation.js')), candidateBytes)
+      assert.deepEqual(fs.readFileSync(targetArtifact), artifactBytes)
+      const repaired = await launch({
+        workItemId: 'candidate-survival-repair', logicalRole: 'worker', parent: 'run-owner',
+        purpose: 'work', assignment: 'Continue repair from the exact physically admitted partial candidate.',
+        ownership: ['implementation.js', 'output/artifact.bin'],
+        manifests: [{
+          kind: 'file', identity: 'implementation.js', owner: 'candidate-survival-repair',
+          ownershipMode: 'single-owner',
+        }, {
+          kind: 'file', identity: 'output/artifact.bin', owner: 'candidate-survival-repair',
+          ownershipMode: 'single-owner',
+        }],
+        success: ['The exact candidate bytes are retained for independent checking.'],
+        checks: ['candidate survival ownership check'],
+      })
+      assert.equal(repaired.allAssignedItemsPass, true)
+    } else {
+      assert.deepEqual(fs.readFileSync(targetFile), candidateBytes)
+    }
     const candidateHash = testWorkspaceCandidateHash(target)
     const checked = await launch({
       workItemId: 'candidate-survival-check', logicalRole: 'independent-reviewer',
@@ -8763,10 +9645,14 @@ function configureBookkeepingCandidateSurvivalHarness(t, options = {}) {
     }
   }
   return {
+    artifactBytes,
     candidateBytes,
     harness,
     originalBytes,
+    targetArtifact,
+    externalTarget,
     targetFile,
+    privateRoot,
     workerLaunchCount: () => harness.launches.filter(launch => launch.logicalRole === 'worker').length,
     mutationAbortCalls: () => mutationAbortCalls,
   }
@@ -8789,6 +9675,296 @@ for (const integrityCode of ['RUN_RECORD_UNSAFE', 'RUN_RECORD_FAILURE', 'RUN_REC
   })
 }
 
+test('candidate-survival integrity failure stays primary through terminal-session and pending-usage cleanup', async t => {
+  const fixture = configureBookkeepingCandidateSurvivalHarness(t, {
+    seam: 'pre-promotion',
+    prePromotionFailureCode: 'RUN_RECORD_UNSAFE',
+    candidateSurvivalFailure: 'WORKER_SURVIVAL_TAMPERED',
+  })
+  fixture.harness.budget.terminalSessionWriter = terminal => {
+    if (!terminal.sessionId.endsWith(':root-route-decision')) {
+      throw Object.assign(new Error('injected terminal-session integrity failure'), {
+        code: 'RUN_RECORD_UNSAFE',
+      })
+    }
+    return terminal
+  }
+  const runtime = new CodexSupervisorRuntime(fixture.harness.runtimeOptions)
+  runtime._pendingProviderEnvelope = () => ({ requestOrdinal: 17 })
+
+  const result = await runtime.start()
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'WORKER_SURVIVAL_TAMPERED')
+  assert.equal(result.terminalEnvelope.error.code, 'WORKER_SURVIVAL_TAMPERED')
+  assert.equal(result.terminalEnvelope.error.details.priorControllerFailure.code,
+    'RUN_RECORD_UNSAFE')
+  assert.equal(result.terminalEnvelope.error.details.terminalSessionSettlementFailure.code,
+    'WORKER_SURVIVAL_TAMPERED')
+  assert.equal(result.terminalEnvelope.error.details.pendingUsageAccountingFailure.code,
+    'INCOMPLETE_USAGE_ACCOUNTING')
+  assert.equal(fixture.workerLaunchCount(), 1)
+  assert.equal(fixture.harness.launches.some(launch =>
+    launch.logicalRole === 'independent-reviewer'), false)
+})
+
+test('ordinary candidate-survival limitation remains a durable secondary diagnostic', async t => {
+  const fixture = configureBookkeepingCandidateSurvivalHarness(t, {
+    seam: 'pre-promotion',
+    prePromotionFailureCode: 'RUN_RECORD_UNSAFE',
+    candidateSurvivalFailure: 'WORKER_SURVIVAL_INVALID',
+  })
+
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'RUN_RECORD_UNSAFE')
+  assert.equal(result.terminalEnvelope.error.code, 'RUN_RECORD_UNSAFE')
+  assert.equal(result.terminalEnvelope.error.details.candidateSurvivalFailure.code,
+    'WORKER_SURVIVAL_INVALID')
+  assert.equal(fixture.workerLaunchCount(), 1)
+})
+
+test('controller bookkeeping failure preserves an external-only candidate before exact rollback', async t => {
+  const fixture = configureBookkeepingCandidateSurvivalHarness(t, {
+    seam: 'pre-promotion', prePromotionFailureCode: 'RUN_RECORD_UNSAFE', externalOnly: true,
+  })
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'RUN_RECORD_UNSAFE')
+  assert.equal(fs.existsSync(fixture.externalTarget), false,
+    'normal cleanup restores the admitted missing preimage after preservation')
+  const candidate = result.terminalEnvelope.bestAvailableCandidateEvidence
+  assert.equal(candidate.kind, 'controller-owned-physical-candidate-survival-bundle')
+  assert.equal(candidate.reasonCode, 'RUN_RECORD_UNSAFE')
+  assert.equal(candidate.local, null)
+  assert.equal(candidate.externalLocal.changedPathCount, 1)
+  const manifest = JSON.parse(fs.readFileSync(candidate.externalLocal.manifestPath, 'utf8'))
+  assert.equal(manifest.resources.length, 1)
+  assert.equal(manifest.resources[0].identity, fixture.externalTarget)
+  assert.deepEqual(fs.readFileSync(manifest.resources[0].snapshotPath), fixture.artifactBytes)
+  assert.equal(fixture.workerLaunchCount(), 1)
+  assert.equal(fixture.harness.launches.some(launch =>
+    launch.logicalRole === 'independent-reviewer'), false)
+})
+
+test('pre-terminal controller bookkeeping failure preserves drained external-only edits', async t => {
+  const fixture = configureBookkeepingCandidateSurvivalHarness(t, {
+    seam: 'pre-terminal-controller-failure', externalOnly: true,
+    limitFailure: 'RECOVERY_CHECKPOINT_LOG_UNSAFE',
+  })
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'RECOVERY_CHECKPOINT_LOG_UNSAFE')
+  assert.equal(fs.existsSync(fixture.externalTarget), false)
+  const candidate = result.terminalEnvelope.bestAvailableCandidateEvidence
+  assert.equal(candidate.kind, 'controller-owned-physical-candidate-survival-bundle')
+  assert.equal(candidate.reasonCode, 'RECOVERY_CHECKPOINT_LOG_UNSAFE')
+  assert.equal(candidate.local, null)
+  assert.equal(candidate.externalLocal.changedPathCount, 1)
+  const manifest = JSON.parse(fs.readFileSync(candidate.externalLocal.manifestPath, 'utf8'))
+  assert.deepEqual(fs.readFileSync(manifest.resources[0].snapshotPath), fixture.artifactBytes)
+  assert.equal(result.terminalEnvelope.error.details.retryDisposition,
+    'DO_NOT_DISCARD_PHYSICAL_CANDIDATE_FOR_CONTROLLER_BOOKKEEPING')
+  assert.equal(fixture.workerLaunchCount(), 1)
+})
+
+test('late provider-result persistence failure preserves external-only edits before rollback', async t => {
+  const fixture = configureBookkeepingCandidateSurvivalHarness(t, {
+    seam: 'transport-result-persistence',
+    externalOnly: true,
+    transportFailure: 'CHILD_TRANSPORT_TIMEOUT',
+    transportPersistenceFailureCode: 'RUN_RECORD_UNSAFE',
+  })
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'RUN_RECORD_UNSAFE')
+  assert.equal(fs.existsSync(fixture.externalTarget), false,
+    'cleanup restores the missing preimage only after freezing the exact candidate')
+  const candidate = result.terminalEnvelope.bestAvailableCandidateEvidence
+  assert.equal(candidate.kind, 'controller-owned-physical-candidate-survival-bundle')
+  assert.equal(candidate.reasonCode, 'RUN_RECORD_UNSAFE')
+  assert.equal(candidate.local, null)
+  assert.equal(candidate.externalLocal.changedPathCount, 1)
+  const manifest = JSON.parse(fs.readFileSync(candidate.externalLocal.manifestPath, 'utf8'))
+  assert.equal(manifest.resources[0].identity, fixture.externalTarget)
+  assert.deepEqual(fs.readFileSync(manifest.resources[0].snapshotPath), fixture.artifactBytes)
+  assert.equal(result.terminalEnvelope.error.details.retryDisposition,
+    'DO_NOT_DISCARD_PHYSICAL_CANDIDATE_FOR_CONTROLLER_BOOKKEEPING')
+  assert.equal(fixture.workerLaunchCount(), 1)
+})
+
+test('post-quarantine checkpoint failure exposes the exact external-only candidate', async t => {
+  const fixture = configureBookkeepingCandidateSurvivalHarness(t, {
+    seam: 'post-quarantine-settlement',
+    externalOnly: true,
+    transportFailure: 'CHILD_TRANSPORT_TIMEOUT',
+  })
+  fixture.harness.runtimeOptions.persistRecoveryCheckpoint = checkpoint => {
+    if (checkpoint.cause && checkpoint.cause.kind === 'LEASE_COMPLETED') {
+      throw Object.assign(new Error('injected post-quarantine checkpoint failure'), {
+        code: 'RECOVERY_CHECKPOINT_LOG_UNSAFE',
+      })
+    }
+    return { record: { checkpointPayloadHash: 'd'.repeat(64) } }
+  }
+
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'RECOVERY_CHECKPOINT_LOG_UNSAFE')
+  assert.equal(fs.existsSync(fixture.externalTarget), false,
+    'the official external path is restored while its quarantine remains durable')
+  const candidate = result.terminalEnvelope.bestAvailableCandidateEvidence
+  assert.equal(candidate.kind, 'controller-owned-transport-quarantine-survival-bundle')
+  assert.equal(candidate.reasonCode, 'RECOVERY_CHECKPOINT_LOG_UNSAFE')
+  assert.equal(candidate.local, null)
+  assert.equal(candidate.externalLocal.kind,
+    'provider-transport-external-local-quarantine-pointer')
+  const quarantine = JSON.parse(fs.readFileSync(candidate.externalLocal.recordPath, 'utf8'))
+  assert.equal(quarantine.resources.length, 1)
+  assert.equal(quarantine.resources[0].identity, fixture.externalTarget)
+  assert.deepEqual(fs.readFileSync(quarantine.resources[0].snapshotPath), fixture.artifactBytes)
+  assert.equal(result.terminalEnvelope.error.details.retryDisposition,
+    'DO_NOT_DISCARD_QUARANTINED_CANDIDATE_OR_REPLAY_PROVIDER_SPEND')
+  assert.equal(fixture.workerLaunchCount(), 1)
+})
+
+test('post-quarantine cleanup failure still exposes the exact external-only candidate', async t => {
+  const fixture = configureBookkeepingCandidateSurvivalHarness(t, {
+    seam: 'post-quarantine-cleanup',
+    externalOnly: true,
+    transportFailure: 'CHILD_TRANSPORT_TIMEOUT',
+    mutationAbortFailure: 'RUN_RECORD_WRITE_UNAVAILABLE',
+  })
+
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'CHILD_TRANSPORT_TIMEOUT')
+  assert.equal(fs.existsSync(fixture.externalTarget), false)
+  const candidate = result.terminalEnvelope.bestAvailableCandidateEvidence
+  assert.equal(candidate.kind, 'controller-owned-transport-quarantine-survival-bundle')
+  assert.equal(candidate.reasonCode, 'CHILD_TRANSPORT_TIMEOUT')
+  assert.equal(candidate.local, null)
+  assert.equal(candidate.externalLocal.kind,
+    'provider-transport-external-local-quarantine-pointer')
+  const quarantine = JSON.parse(fs.readFileSync(candidate.externalLocal.recordPath, 'utf8'))
+  assert.deepEqual(fs.readFileSync(quarantine.resources[0].snapshotPath), fixture.artifactBytes)
+  assert.equal(result.terminalEnvelope.error.details.mutationAbortError.code,
+    'RUN_RECORD_WRITE_UNAVAILABLE')
+  assert.equal(result.terminalEnvelope.error.details.retryDisposition,
+    'DO_NOT_DISCARD_QUARANTINED_CANDIDATE_OR_REPLAY_PROVIDER_SPEND')
+  assert.equal(fixture.workerLaunchCount(), 1)
+})
+
+test('terminal release failure retains prior exact candidate survival evidence', async t => {
+  const harness = makeHarness(t)
+  const candidateEvidence = Object.freeze({
+    schemaVersion: 1,
+    kind: 'controller-owned-physical-candidate-survival-bundle',
+    disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+    candidateHash: 'a'.repeat(64),
+    local: Object.freeze({ pointerHash: 'b'.repeat(64) }),
+    externalLocal: null,
+    bindingHash: 'c'.repeat(64),
+  })
+  harness.runtimeOptions.executeRoute = async () => {
+    const error = Object.assign(new Error('injected post-edit controller failure'), {
+      code: 'RUN_RECORD_UNSAFE',
+      bestAvailableCandidateEvidence: candidateEvidence,
+    })
+    throw error
+  }
+  const runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+  runtime._enterTerminalRelease = async () => {
+    throw Object.assign(new Error('injected terminal release persistence failure'), {
+      code: 'RECOVERY_CHECKPOINT_LOG_UNSAFE',
+    })
+  }
+
+  await assert.rejects(runtime.start(), error => {
+    assert.equal(error.code, 'RECOVERY_CHECKPOINT_LOG_UNSAFE')
+    assert.equal(error.bestAvailableCandidateEvidence, candidateEvidence)
+    assert.equal(error.details.bestAvailableCandidateEvidence, candidateEvidence)
+    assert.equal(error.priorTerminalFailure.code, 'RUN_RECORD_UNSAFE')
+    return true
+  })
+})
+
+test('typed non-DONE result retains candidate evidence when its first release transition fails', async t => {
+  const harness = makeHarness(t)
+  const candidateEvidence = Object.freeze({
+    schemaVersion: 1,
+    kind: 'controller-owned-physical-candidate-survival-bundle',
+    disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+    candidateHash: '1'.repeat(64),
+    local: Object.freeze({ pointerHash: '2'.repeat(64) }),
+    externalLocal: null,
+    bindingHash: '3'.repeat(64),
+  })
+  const terminalEnvelope = Object.freeze({
+    status: 'RUN_RECORD_UNSAFE',
+    reason: 'injected typed controller result',
+    bestAvailableCandidateEvidence: candidateEvidence,
+  })
+  harness.runtimeOptions.executeRoute = async () => Object.freeze({
+    outcome: 'FAILED',
+    terminalEnvelope,
+  })
+  const runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+  runtime._enterTerminalRelease = async () => {
+    throw Object.assign(new Error('injected first release failure'), {
+      code: 'RECOVERY_CHECKPOINT_LOG_UNSAFE',
+    })
+  }
+
+  await assert.rejects(runtime.start(), error => {
+    assert.equal(error.code, 'RECOVERY_CHECKPOINT_LOG_UNSAFE')
+    assert.deepEqual(error.bestAvailableCandidateEvidence, candidateEvidence)
+    assert.deepEqual(error.details.bestAvailableCandidateEvidence, candidateEvidence)
+    assert.deepEqual(error.priorTerminalEnvelope, terminalEnvelope)
+    assert.deepEqual(error.details.priorTerminalEnvelope, terminalEnvelope)
+    return true
+  })
+})
+
+test('typed non-DONE result retains candidate evidence when finalization fails after intent selection', async t => {
+  const harness = makeHarness(t)
+  const candidateEvidence = Object.freeze({
+    schemaVersion: 1,
+    kind: 'controller-owned-physical-candidate-survival-bundle',
+    disposition: 'PRESERVED_WITHOUT_DONE_AUTHORITY',
+    candidateHash: '4'.repeat(64),
+    local: Object.freeze({ pointerHash: '5'.repeat(64) }),
+    externalLocal: null,
+    bindingHash: '6'.repeat(64),
+  })
+  const terminalEnvelope = Object.freeze({
+    status: 'RUN_RECORD_UNSAFE',
+    reason: 'injected typed controller result',
+    bestAvailableCandidateEvidence: candidateEvidence,
+  })
+  harness.runtimeOptions.executeRoute = async () => Object.freeze({
+    outcome: 'FAILED',
+    terminalEnvelope,
+  })
+  harness.runtimeOptions.finalizerFactory = async () => Object.freeze({
+    finalize: async () => {
+      throw Object.assign(new Error('injected finalizer failure'), {
+        code: 'TERMINAL_RELEASE_FAILED',
+      })
+    },
+  })
+  const runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+  runtime._enterTerminalRelease = async outcome => outcome
+
+  await assert.rejects(runtime.start(), error => {
+    assert.equal(error.code, 'TERMINAL_RELEASE_FAILED')
+    assert.deepEqual(error.bestAvailableCandidateEvidence, candidateEvidence)
+    assert.deepEqual(error.details.bestAvailableCandidateEvidence, candidateEvidence)
+    assert.deepEqual(error.priorTerminalEnvelope, terminalEnvelope)
+    assert.deepEqual(error.details.priorTerminalEnvelope, terminalEnvelope)
+    return true
+  })
+})
+
 for (const seam of ['pre-promotion', 'post-promotion']) {
   test(`${seam} internal bookkeeping failure promotes the exact candidate and continues through checking`, async t => {
     const fixture = configureBookkeepingCandidateSurvivalHarness(t, { seam })
@@ -8805,6 +9981,54 @@ for (const seam of ['pre-promotion', 'post-promotion']) {
       item.stage === 'authenticated-result-continuation'), true)
   })
 }
+
+test('partial owned candidate survives into exact repair and independent checking', async t => {
+  const fixture = configureBookkeepingCandidateSurvivalHarness(t, {
+    seam: 'partial-report', partialReport: true,
+  })
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.deepEqual(fs.readFileSync(path.join(path.dirname(path.dirname(fixture.targetFile)), 'implementation.js')),
+    fixture.candidateBytes)
+  assert.deepEqual(fs.readFileSync(fixture.targetArtifact), fixture.artifactBytes)
+  assert.equal(fixture.workerLaunchCount(), 2)
+  assert.equal(fixture.harness.launches.filter(launch =>
+    launch.logicalRole === 'independent-reviewer').length, 1)
+  assert.equal(fixture.mutationAbortCalls(), 0)
+})
+
+test('an execution limit preserves ignored owned outputs without promotion or replay', async t => {
+  const fixture = configureBookkeepingCandidateSurvivalHarness(t, {
+    seam: 'execution-limit',
+    partialReport: true,
+    limitFailure: 'CHILD_ROLLOUT_BUDGET_EXHAUSTED',
+  })
+  const result = await new CodexSupervisorRuntime(fixture.harness.runtimeOptions).start()
+  assert.equal(result.outcome, 'PARTIAL', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'CHILD_ROLLOUT_BUDGET_EXHAUSTED')
+  assert.equal(result.resumable, undefined)
+  assert.equal(fixture.workerLaunchCount(), 1)
+  assert.equal(fixture.harness.launches.some(launch =>
+    launch.logicalRole === 'independent-reviewer'), false)
+  assert.equal(fixture.mutationAbortCalls(), 1)
+  assert.deepEqual(fs.readFileSync(fixture.targetFile), fixture.originalBytes)
+  assert.equal(fs.existsSync(fixture.targetArtifact), false)
+  const candidate = result.terminalEnvelope.bestAvailableCandidateEvidence
+  assert.equal(candidate.kind, 'controller-owned-physical-candidate-survival-bundle')
+  assert.equal(candidate.disposition, 'PRESERVED_WITHOUT_DONE_AUTHORITY')
+  assert.equal(candidate.reasonCode, 'CHILD_ROLLOUT_BUDGET_EXHAUSTED')
+  assert.equal(candidate.externalLocal, null)
+  assert.equal(candidate.local.changedPathCount, 2)
+  assert.deepEqual(
+    fs.readFileSync(path.join(candidate.local.candidateRoot, 'implementation.js')),
+    fixture.candidateBytes,
+  )
+  assert.deepEqual(
+    fs.readFileSync(path.join(candidate.local.candidateRoot, 'output', 'artifact.bin')),
+    fixture.artifactBytes,
+  )
+  assert.deepEqual(fs.readdirSync(path.join(fixture.privateRoot, 'workspaces')), [])
+})
 
 test('a foreign post-promotion mutation permit still rolls back and fails closed', async t => {
   const fixture = configureBookkeepingCandidateSurvivalHarness(t, {
@@ -8833,7 +10057,9 @@ test('terminal and resumable retry intents deep-snapshot nested caller data', as
     })
     let drains = 0
     runtime._drainOwnedProcessesWithOneRetry = async () => {
-      if (++drains === 1) throw Object.assign(new Error('injected drain failure'), { code: 'DRAIN_FAILED' })
+      if (++drains <= 2) {
+        throw Object.assign(new Error('injected drain failure'), { code: 'PROCESS_DRAIN_TIMEOUT' })
+      }
     }
     return runtime
   }
@@ -8845,10 +10071,10 @@ test('terminal and resumable retry intents deep-snapshot nested caller data', as
   }
   const finishInput = {
     terminalEnvelope: { status: 'FAILED', details: { cause: 'original' } },
-    deliverables: [{ path: 'result.txt', hash: '1'.repeat(64) }],
+    deliverables: [{ path: path.join(finishing.options.targetPath, 'result.txt'), hash: '1'.repeat(64) }],
   }
   await assert.rejects(() => finishing._finish('FAILED', finishInput),
-    error => error.code === 'DRAIN_FAILED')
+    error => error.code === 'PROCESS_DRAIN_TIMEOUT')
   finishInput.terminalEnvelope.details.cause = 'mutated'
   finishInput.deliverables.push({ path: 'forged.txt', hash: '2'.repeat(64) })
   const finished = await finishing._finish('FAILED', { terminalEnvelope: { status: 'REPLACED' } })
@@ -8859,12 +10085,486 @@ test('terminal and resumable retry intents deep-snapshot nested caller data', as
   const suspending = makeRuntime()
   const suspendInput = { terminalEnvelope: { status: 'PARTIAL', details: { cause: 'original' } } }
   await assert.rejects(() => suspending._suspendResumable('PARTIAL', suspendInput),
-    error => error.code === 'DRAIN_FAILED')
+    error => error.code === 'PROCESS_DRAIN_TIMEOUT')
   suspendInput.terminalEnvelope.details.cause = 'mutated'
   const suspended = await suspending._suspendResumable('PARTIAL', {
     terminalEnvelope: { status: 'REPLACED' },
   })
   assert.equal(suspended.terminalEnvelope.details.cause, 'original')
+})
+
+test('restart adopts the exact durable pre-release terminal selection before route or model launch', async t => {
+  for (const fixture of [
+    { outcome: 'DONE', openedState: 'FINAL_CHECK', route: 'DIRECT' },
+    { outcome: 'CANCELLED', openedState: 'RUN_WORK', route: null },
+  ]) {
+    await t.test(fixture.outcome, async t => {
+      let routeCalls = 0
+      const harness = makeHarness(t, {
+        runtimeOptions: {
+          generation: 2,
+          providerCapabilities: null,
+          decideRoute: async () => {
+            routeCalls++
+            throw new Error('route decision must not run after durable terminal selection')
+          },
+          executeRoute: async () => {
+            routeCalls++
+            throw new Error('route execution must not run after durable terminal selection')
+          },
+        },
+      })
+      const requestPointer = await harness.runtimeOptions.requestPointerFactory(harness.record)
+      const deliverablePath = path.join(harness.runtimeOptions.targetPath, `durable-${fixture.outcome.toLowerCase()}.txt`)
+      fs.writeFileSync(deliverablePath, `durable ${fixture.outcome} evidence\n`)
+      const responseBody = {
+        resultFormat: 'changed-files',
+        requestedResult: `Replay the exact ${fixture.outcome} selection.`,
+        results: [{
+          workItemId: 'durable-terminal-selection',
+          resultHash: digest(`result:${fixture.outcome}`),
+          successItems: ['The durable selection was recovered.'],
+          findings: [{ severity: 'info', summary: `Recovered ${fixture.outcome}.` }],
+        }],
+      }
+      const responsePersisted = {
+        ...responseBody,
+        responseHash: digest(stableStringify(responseBody)),
+      }
+      const responseBytes = Buffer.from(`${stableStringify(responsePersisted)}\n`)
+      const responsePath = path.join(harness.directory, `structured-${fixture.outcome.toLowerCase()}.json`)
+      fs.writeFileSync(responsePath, responseBytes)
+      const finalResponse = {
+        ...responsePersisted,
+        evidencePointer: {
+          name: 'structured-final-response',
+          path: responsePath,
+          hash: digest(responseBytes),
+          bytes: responseBytes.length,
+        },
+      }
+      const deliverables = [
+        { path: deliverablePath, hash: digest(fs.readFileSync(deliverablePath)) },
+        { path: responsePath, hash: finalResponse.evidencePointer.hash },
+      ].sort((left, right) => left.path.localeCompare(right.path))
+      const checkHashes = [digest(`check-a:${fixture.outcome}`), digest(`check-b:${fixture.outcome}`)]
+      const reason = `preserve exact ${fixture.outcome} reason`
+      const unblockPath = `operator://${fixture.outcome.toLowerCase()}/unblock`
+      const terminalEnvelope = {
+        status: fixture.outcome,
+        provider: { status: 'provider-terminal', receipt: digest(`provider:${fixture.outcome}`) },
+      }
+      const missionHash = digest(harness.runtimeOptions.mission)
+      const workspaceEpoch = 7
+      const durableIntent = {
+        runId: harness.runtimeOptions.runId,
+        activationId: harness.runtimeOptions.activationId,
+        generation: 1,
+        missionHash,
+        requestEnvelopeHash: requestPointer.hash,
+        workspaceEpoch,
+        outcome: fixture.outcome,
+        route: fixture.route,
+        reason,
+        deliverableManifest: deliverables,
+        checkHashes,
+        terminalEnvelope,
+        finalResponse,
+        unblockPath,
+      }
+      let routeTranscriptInitializations = 0
+      let intentPublications = 0
+      harness.record.runId = harness.runtimeOptions.runId
+      harness.record.readTerminalFinalizationIntent = () => JSON.parse(stableStringify(durableIntent))
+      harness.record.createOrVerifyTerminalFinalizationIntent = () => { intentPublications++ }
+      harness.record.initializeRouteTranscript = () => { routeTranscriptInitializations++ }
+      let openedRuntimeState = {
+        runId: harness.runtimeOptions.runId,
+        state: fixture.openedState,
+        activation: {
+          id: harness.runtimeOptions.activationId,
+          generation: 2,
+          missionHash,
+        },
+        requestEnvelopeHash: requestPointer.hash,
+        workspaceEpoch,
+        terminal: null,
+      }
+      const transitions = []
+      harness.runtimeOptions.runtimeStateProvider = () => openedRuntimeState
+      harness.runtimeOptions.runtimeTransition = async transition => {
+        transitions.push(transition)
+        openedRuntimeState = { ...openedRuntimeState, state: transition.nextState }
+        return openedRuntimeState
+      }
+
+      const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
+      assert.equal(result.outcome, fixture.outcome)
+      assert.equal(result.route, fixture.route)
+      assert.deepEqual(result.terminalEnvelope, terminalEnvelope)
+      assert.deepEqual(result.deliverables, deliverables)
+      assert.deepEqual(result.checkHashes, checkHashes)
+      assert.deepEqual(result.finalResponse, finalResponse)
+      assert.equal(routeCalls, 0)
+      assert.equal(harness.launches.length, 0)
+      assert.equal(routeTranscriptInitializations, 0)
+      assert.equal(intentPublications, 0, 'restart must reuse, not replace, the durable terminal selection')
+      assert.equal(harness.finalizations.length, 1)
+      assert.deepEqual(harness.finalizations[0], {
+        outcome: fixture.outcome,
+        route: fixture.route,
+        reason,
+        unblockPath,
+        deliverables,
+        checkHashes,
+        terminalEnvelope,
+        expectedEpoch: workspaceEpoch,
+        finalResponse,
+      })
+      assert.deepEqual(transitions.map(({ eventId, nextState }) => ({ eventId, nextState })),
+        fixture.outcome === 'CANCELLED'
+          ? [{ eventId: 'CANCEL_REQUESTED', nextState: 'RELEASING_LOCK' }]
+          : [])
+    })
+  }
+})
+
+test('createDefaultRuntimeOptions adopts a generation-one durable terminal intent before generation-two probes or launches', async t => {
+  if (process.platform === 'win32') return t.skip('production stale-owner seam uses a POSIX crash owner')
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-production-terminal-replay-'))
+  const pidTreeControlRoot = path.join(directory, 'pid-tree-control')
+  let priorOwnerProcess = null
+  t.after(() => {
+    if (priorOwnerProcess && priorOwnerProcess.exitCode === null) priorOwnerProcess.kill('SIGKILL')
+    const remaining = killAllPersistentPidTrees(pidTreeControlRoot)
+    fs.rmSync(directory, { recursive: true, force: true })
+    assert.deepEqual(remaining, [], 'terminal replay test cleanup left a persistent PID tree alive')
+  })
+  const activationRoot = path.join(directory, 'activation')
+  const targetPath = createTempGitTarget(directory)
+  const runId = 'production-terminal-replay-run'
+  fs.mkdirSync(activationRoot, { recursive: true })
+  const record = createRunRecord({
+    targetPath,
+    canonicalProviderPrivateRoot: path.join(activationRoot, 'supervisor-runtime'),
+    allowProjectMutation: true,
+    readOnly: true,
+    exactTree: true,
+    runId,
+    assertStartBoundary: false,
+  })
+  const profilePath = path.join(activationRoot, 'autoprompt.config.toml')
+  const profile = strictLocalProfile()
+  fs.writeFileSync(profilePath, profile, { mode: 0o600 })
+  const configIsolationPath = path.join(activationRoot, 'empty.gitconfig')
+  const ghConfigDir = path.join(activationRoot, 'gh-config')
+  fs.writeFileSync(configIsolationPath, '', { mode: 0o600 })
+  fs.mkdirSync(ghConfigDir, { mode: 0o700 })
+  const enforcementProof = {
+    schemaVersion: 1,
+    provider: 'codex',
+    profilePath,
+    profileSha256: digest(profile),
+    selectedProfile: 'autoprompt',
+    strictConfig: true,
+  }
+  const enforcementProofPath = path.join(activationRoot, 'enforcement-proof.json')
+  fs.writeFileSync(enforcementProofPath, `${JSON.stringify(enforcementProof, null, 2)}\n`)
+  const repaired = spawnSync(process.execPath, [
+    path.join(ROOT, 'scripts', 'local-only-safety.cjs'),
+    '--repo', targetPath,
+    '--expected-branch', 'main',
+    '--repair',
+    '--enforcement-proof', enforcementProofPath,
+    '--json',
+  ], { encoding: 'utf8', windowsHide: true })
+  assert.equal([0, 3].includes(repaired.status), true, repaired.stderr || repaired.stdout)
+
+  const requestArgv = ['replay', 'the', 'durable', 'terminal', 'selection']
+  const requestCanonicalJson = JSON.stringify({ schemaVersion: 1, argv: requestArgv })
+  const missionHash = digest(requestCanonicalJson)
+  const activationNonce = '_Nun56FgLGR7mAQLNyqoNUrtGc7NNbCR'
+  const modelSelection = {
+    schemaVersion: 1,
+    mode: 'provider-default',
+    selector: 'provider-default',
+    models: [],
+    effort: null,
+    castingHash: CANDIDATE_A,
+    agentDefinitionsHash: CANDIDATE_A,
+    registry: null,
+    probeAcceptance: {
+      strictConfig: true,
+      profileAcceptedAt: new Date().toISOString(),
+      explicitModelAndEffortAssignments: false,
+    },
+  }
+  const metadataBytes = fs.readFileSync(record.paths.metadataPath)
+  const activation = {
+    activationAttestation: { hash: '1'.repeat(64) },
+    activationRoot,
+    enforcementProof,
+    entryPrompt: '$autoprompt\nAUTOPROMPT_REQUEST_ENVELOPE_V2\nrequest_sha256=terminal-replay',
+    modelRegistry: null,
+    modelSelection,
+    profilePath,
+    requestArgv,
+    runId,
+    supervisorRuntime: {
+      runPath: record.runPath,
+      runId,
+      metadataSha256: digest(metadataBytes),
+      targetIdentity: record.targetIdentity,
+    },
+    record: {
+      target: { realpath: targetPath },
+      request: { canonicalJson: requestCanonicalJson },
+      capability: {
+        generation: 1,
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+        parentSession: 'production-terminal-replay-parent',
+      },
+      contractVersions: {
+        settings: '2.0.0',
+        requestEnvelopeEntry: '2.0.0',
+        outcome: '2.0.0',
+        providerCapabilities: '2.0.0',
+        activationRequest: '1.0.0',
+      },
+      supervisorEntry: { promptSha256: '2'.repeat(64) },
+      providerAttestation: { attestation: { activationNonce } },
+      activationBoundary: {
+        gitConfig: configIsolationPath,
+        ghConfigDir,
+        enforcementProof: { path: enforcementProofPath },
+        supervisorAdapterSha256: '3'.repeat(64),
+        payloadManifestSha256: '4'.repeat(64),
+      },
+      modelSelection,
+    },
+  }
+  let monotonic = 0
+  const probe = {
+    supported: true,
+    executable: process.execPath,
+    cliVersion: 'terminal-replay-provider 1.0.0',
+    evidenceHashes: ['5'.repeat(64)],
+  }
+  const runtimeContext = processAdapter => ({
+    environment: { ...process.env },
+    expectedBranch: 'main',
+    providerMaximum: 2,
+    tokenLimit: 1_000,
+    sessionLimit: 16,
+    launchLimit: 16,
+    trustedTestDeclarations: {},
+    monotonicNow: () => ++monotonic,
+    processAdapter,
+  })
+
+  const generationOneAdapter = createPersistentPidTreeAdapter({ controlRoot: pidTreeControlRoot })
+  const generationOneOptions = createDefaultRuntimeOptions({
+    activation,
+    probe,
+    context: runtimeContext(generationOneAdapter),
+  })
+  generationOneOptions.runtimeInstance = {}
+  priorOwnerProcess = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+    windowsHide: true,
+  })
+  await new Promise((resolve, reject) => {
+    priorOwnerProcess.once('spawn', resolve)
+    priorOwnerProcess.once('error', reject)
+  })
+  const priorProcessIdentity = processIdentityForPid(priorOwnerProcess.pid)
+  assert.equal(typeof priorProcessIdentity, 'string')
+  const generationOneLease = generationOneOptions.missionLock.acquire({
+    ...generationOneOptions.lock,
+    runId,
+    activationId: runId,
+    missionHash,
+    nonce: activationNonce,
+    generation: 1,
+    pid: priorOwnerProcess.pid,
+    processIdentity: priorProcessIdentity,
+    token: 'a'.repeat(48),
+  })
+  const runtimeActivation = {
+    id: runId,
+    nonce: activationNonce,
+    missionHash,
+    generation: 1,
+    sessionToken: activation.record.capability.parentSession,
+  }
+  const openedRecord = await generationOneOptions.recordFactory({
+    activation: runtimeActivation,
+    lease: generationOneLease,
+  })
+  const request = openedRecord.loadRequest()
+  const leaseBinding = generationOneOptions.missionLock.verifyCapability(generationOneLease)
+  const eventBinding = {
+    runId,
+    requestEnvelopeHash: request.digest,
+    targetIdentity: leaseBinding.targetIdentity,
+    openedDirectoryIdentity: digest(JSON.stringify(openedRecord.runBinding)),
+    digests: {
+      contract: digest(JSON.stringify(activation.record.contractVersions)),
+      prompt: activation.record.supervisorEntry.promptSha256,
+      provider: activation.activationAttestation.hash,
+      tool: activation.record.activationBoundary.supervisorAdapterSha256,
+    },
+  }
+  const eventLog = new EventLog({ ...openedRecord.paths.eventLog, binding: eventBinding })
+  const stateStore = new RuntimeStateStore({
+    ...openedRecord.paths.stateStore,
+    eventLog,
+    capabilityVerifier: capability => generationOneOptions.missionLock.verifyCapability(capability),
+  })
+  for (const [nextState, eventId] of [
+    ['START_ROUTE_ANALYST', null],
+    ['SAVE_ROUTE_ANALYSIS', 'ROUTE_ANALYST_STARTED'],
+    ['L0_ROUTE_DECISION', null],
+    ['PREPARE_WORK', null],
+    ['RUN_WORK', null],
+    ['CHECK_WORK', null],
+    ['FINAL_CHECK', null],
+  ]) {
+    stateStore.transition(nextState, {
+      capability: generationOneLease,
+      cause: 'prepare exact durable terminal replay fixture',
+      ...(eventId ? { eventId } : {}),
+    })
+  }
+  const deliverablePath = path.join(targetPath, 'production-terminal-result.txt')
+  fs.writeFileSync(deliverablePath, 'exact generation-one terminal result\n')
+  const deliverables = [{ path: deliverablePath, hash: digest(fs.readFileSync(deliverablePath)) }]
+  const checkHashes = [digest('generation-one-independent-acceptance')]
+  const terminalEnvelope = {
+    status: 'DONE',
+    provider: { status: 'accepted', receiptHash: digest('generation-one-provider-terminal') },
+  }
+  const reason = 'replay the exact generation-one accepted terminal result'
+  const unblockPath = 'operator://production-terminal-replay'
+  const durableIntent = openedRecord.createOrVerifyTerminalFinalizationIntent({
+    runId,
+    activationId: runId,
+    generation: 1,
+    missionHash,
+    requestEnvelopeHash: request.digest,
+    workspaceEpoch: 0,
+    outcome: 'DONE',
+    route: 'DIRECT',
+    reason,
+    deliverableManifest: deliverables,
+    checkHashes,
+    terminalEnvelope,
+    finalResponse: null,
+    unblockPath,
+  })
+  assert.equal(durableIntent.route, 'DIRECT')
+  priorOwnerProcess.kill('SIGKILL')
+  await new Promise(resolve => priorOwnerProcess.once('exit', resolve))
+
+  activation.record.capability.generation = 2
+  const generationTwoAdapter = createPersistentPidTreeAdapter({ controlRoot: pidTreeControlRoot })
+  let generationTwoProcessSpawns = 0
+  const spawnOwned = generationTwoAdapter.spawnOwned.bind(generationTwoAdapter)
+  generationTwoAdapter.spawnOwned = async (...args) => {
+    generationTwoProcessSpawns++
+    return spawnOwned(...args)
+  }
+  const generationTwoOptions = createDefaultRuntimeOptions({
+    activation,
+    probe,
+    context: runtimeContext(generationTwoAdapter),
+  })
+  let modelLaunches = 0
+  const launcher = generationTwoOptions.launcher
+  generationTwoOptions.launcher = async launch => {
+    modelLaunches++
+    return launcher(launch)
+  }
+  let adoptedState = null
+  const recordFactory = generationTwoOptions.recordFactory
+  generationTwoOptions.recordFactory = async input => {
+    const reopened = await recordFactory(input)
+    adoptedState = generationTwoOptions.runtimeStateProvider()
+    return reopened
+  }
+  let finalizerInput = null
+  const finalizerFactory = generationTwoOptions.finalizerFactory
+  generationTwoOptions.finalizerFactory = async input => {
+    const finalizer = await finalizerFactory(input)
+    return {
+      finalize: async requested => {
+        finalizerInput = JSON.parse(stableStringify(requested))
+        return finalizer.finalize(requested)
+      },
+    }
+  }
+
+  const result = await new CodexSupervisorRuntime(generationTwoOptions).start()
+  assert.equal(result.outcome, 'DONE')
+  assert.equal(result.route, 'DIRECT')
+  assert.equal(adoptedState.activation.generation, 2)
+  assert.equal(adoptedState.activation.status, 'TERMINAL_REPLAY')
+  assert.equal(generationTwoProcessSpawns, 0,
+    'durable terminal replay must not run the generation-two process conformance probe')
+  assert.equal(modelLaunches, 0, 'durable terminal replay must not launch a provider model')
+  assert.equal(generationTwoOptions.processOwner.listRecords().some(item =>
+    item.sessionId === `${runId}:generation:2:process-probe`), false)
+  assert.deepEqual(finalizerInput, {
+    outcome: 'DONE',
+    route: 'DIRECT',
+    reason,
+    unblockPath,
+    deliverables,
+    checkHashes,
+    terminalEnvelope,
+    expectedEpoch: 0,
+    finalResponse: null,
+  })
+  assert.deepEqual(result.deliverables, deliverables)
+  assert.deepEqual(result.checkHashes, checkHashes)
+  assert.deepEqual(result.terminalEnvelope, terminalEnvelope)
+  assert.equal(result.finalResponse, null)
+  assert.equal(generationTwoOptions.missionLock.assertReleased(generationTwoOptions.runtimeInstance.lease), true)
+})
+
+test('terminal manifest merge retains target Git evidence and caller external evidence and rejects conflicts', async t => {
+  const directory = tempDirectory(t, 'autoprompt-terminal-manifest-merge-')
+  const targetPath = createTempGitTarget(directory)
+  const targetDeliverable = path.join(targetPath, 'src', 'example.js')
+  const externalDeliverable = path.join(directory, 'caller-external.bin')
+  fs.writeFileSync(targetDeliverable, "module.exports = 'changed target evidence'\n")
+  fs.writeFileSync(externalDeliverable, Buffer.from([0, 1, 2, 3, 255]))
+  const targetEntry = { path: targetDeliverable, hash: digest(fs.readFileSync(targetDeliverable)) }
+  const externalEntry = { path: externalDeliverable, hash: digest(fs.readFileSync(externalDeliverable)) }
+  const makeRuntime = () => {
+    const runtime = Object.create(CodexSupervisorRuntime.prototype)
+    Object.assign(runtime, {
+      options: { targetPath, gitEnvironment: () => process.env },
+      terminalFinalizationIntent: null,
+      record: null,
+    })
+    return runtime
+  }
+
+  const selected = await makeRuntime()._prepareTerminalFinalizationIntent('PARTIAL', {
+    reason: 'retain both manifest authorities',
+    deliverables: [externalEntry],
+    terminalEnvelope: { status: 'PARTIAL' },
+  })
+  assert.deepEqual(selected.result.deliverables, [externalEntry, targetEntry]
+    .sort((left, right) => left.path.localeCompare(right.path)))
+
+  await assert.rejects(makeRuntime()._prepareTerminalFinalizationIntent('PARTIAL', {
+    reason: 'reject conflicting descriptions',
+    deliverables: [externalEntry, { path: targetDeliverable, hash: digest('forged target hash') }],
+    terminalEnvelope: { status: 'PARTIAL' },
+  }), error => error.code === 'TERMINAL_MANIFEST_CONFLICT' &&
+    error.details.prior.path === targetDeliverable && error.details.current.path === targetDeliverable)
 })
 
 test('cancellation intent is durable before scheduler disposal and process drain', async () => {
@@ -8881,7 +10581,8 @@ test('cancellation intent is durable before scheduler disposal and process drain
       },
     },
     lease: {}, starting: false, finished: false, finalizing: false, suspending: false,
-    settledResult: null, scheduler: { dispose() { order.push('DISPOSE') } },
+    settledResult: null, scheduler: { dispose() { order.push('DISPOSE') } }, finalizer: {},
+    terminalFinalizationIntent: null,
     _enforceBudgetPhase: () => ({ accepted: true }),
     _drainOwnedProcessesWithOneRetry: async () => { order.push('DRAIN') },
     _bestEffortPostDrainCheckpoint: async () => null,
@@ -12582,6 +14283,9 @@ test('AP-RUN-037 checker snapshot repair ignores ambient Git command overrides a
 
   fs.writeFileSync(path.join(target, 'src', 'example.js'), "module.exports = 'dirty-candidate'\n")
   fs.writeFileSync(path.join(target, 'src', 'new-file.js'), "module.exports = 'untracked-candidate'\n")
+  fs.writeFileSync(path.join(target, '.gitignore'), 'dist/\n')
+  fs.mkdirSync(path.join(target, 'dist'))
+  fs.writeFileSync(path.join(target, 'dist', 'owned.bin'), Buffer.from([7, 8, 9, 255]))
   fs.unlinkSync(deletedPath)
   const stagedDeletion = spawnSync('git', ['-C', target, 'add', '-u', '--', 'src/deleted-after-checkpoint.js'], {
     encoding: 'utf8', windowsHide: true,
@@ -12606,12 +14310,16 @@ test('AP-RUN-037 checker snapshot repair ignores ambient Git command overrides a
     safetyScriptPath: path.join(ROOT, 'scripts', 'local-only-safety.cjs'),
   })
 
-  const snapshot = snapshotFactory('resume-checker')
+  const candidateResources = [{
+    kind: 'output', identity: path.join(target, 'dist', 'owned.bin'), access: 'write',
+  }]
+  const snapshot = snapshotFactory('resume-checker', [], target, { candidateResources })
   assert.equal(fs.readFileSync(path.join(snapshot, 'src', 'example.js'), 'utf8'),
     "module.exports = 'dirty-candidate'\n")
   assert.equal(fs.readFileSync(path.join(snapshot, 'src', 'new-file.js'), 'utf8'),
     "module.exports = 'untracked-candidate'\n")
   assert.equal(fs.existsSync(path.join(snapshot, 'src', 'deleted-after-checkpoint.js')), false)
+  assert.deepEqual(fs.readFileSync(path.join(snapshot, 'dist', 'owned.bin')), Buffer.from([7, 8, 9, 255]))
   assert.deepEqual(registrations, [{
     path: snapshot, kind: 'checker-snapshot', owner: 'resume-checker',
   }])
@@ -12749,10 +14457,177 @@ test('private worker accepts owned byte-identical rewrites while requiring every
   manager.abort(session)
 })
 
+test('private worker admits, checks, and promotes a newly created ignored owned output', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-ignored-output-new-target-'))
+  fs.writeFileSync(path.join(target, '.gitignore'), 'dist/\n')
+  for (const argv of [
+    ['-C', target, 'add', '--', '.gitignore'],
+    ['-C', target, 'commit', '-m', 'ignore generated output fixture'],
+  ]) {
+    const result = spawnSync('git', argv, { encoding: 'utf8', windowsHide: true })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target,
+    privateRoot: tempDirectory(t, 'autoprompt-ignored-output-new-private-'),
+    environment: process.env,
+    runId: 'ignored-output-new-run',
+    activationId: 'ignored-output-new-activation',
+  })
+  const assignment = {
+    resources: [{ kind: 'output', identity: path.join(target, 'dist', 'out.bin'), access: 'write' }],
+  }
+  const session = manager.prepare({ assignment, workItemId: 'ignored-output-new-work' })
+  const candidate = path.join(session.workspacePath, 'dist', 'out.bin')
+  fs.mkdirSync(path.dirname(candidate), { recursive: true })
+  fs.writeFileSync(candidate, Buffer.from([0, 1, 2, 255]))
+  const admission = manager.inspect(session, { filesChanged: ['dist/out.bin'] })
+  assert.deepEqual(admission.actualFilesChanged, ['dist/out.bin'])
+  manager.promote(session, admission)
+  assert.deepEqual(fs.readFileSync(path.join(target, 'dist', 'out.bin')), Buffer.from([0, 1, 2, 255]))
+  manager.finalize(session)
+})
+
+test('private worker preserves a new ignored output owned through the repository root', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-ignored-root-output-target-'))
+  fs.writeFileSync(path.join(target, '.gitignore'), 'dist/\n')
+  for (const argv of [
+    ['-C', target, 'add', '--', '.gitignore'],
+    ['-C', target, 'commit', '-m', 'ignore root-owned generated output fixture'],
+  ]) {
+    const result = spawnSync('git', argv, { encoding: 'utf8', windowsHide: true })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target,
+    privateRoot: tempDirectory(t, 'autoprompt-ignored-root-output-private-'),
+    environment: process.env,
+    runId: 'ignored-root-output-run',
+    activationId: 'ignored-root-output-activation',
+  })
+  const assignment = {
+    resources: [{ kind: 'directory', identity: '.', access: 'write' }],
+  }
+  const session = manager.prepare({ assignment, workItemId: 'ignored-root-output-work' })
+  const candidateBytes = Buffer.from([0, 1, 2, 255])
+  const candidate = path.join(session.workspacePath, 'dist', 'out.bin')
+  fs.mkdirSync(path.dirname(candidate), { recursive: true })
+  fs.writeFileSync(candidate, candidateBytes)
+
+  const admission = manager.inspect(session, {
+    allAssignedItemsPass: false,
+    filesChanged: ['dist/out.bin'],
+  })
+  assert.deepEqual(admission.actualFilesChanged, ['dist/out.bin'])
+  assert.deepEqual(admission.reportedNoopFiles, [])
+  const survival = manager.preserveCandidate(session, {
+    admission,
+    candidateHash: 'b'.repeat(64),
+    reasonCode: 'BUDGET_EXHAUSTED',
+  })
+  assert.equal(survival.changedPathCount, 1)
+  assert.deepEqual(fs.readFileSync(path.join(survival.candidateRoot, 'dist', 'out.bin')), candidateBytes)
+
+  manager.abort(session)
+  assert.equal(fs.existsSync(session.workspacePath), false)
+  assert.equal(fs.existsSync(path.join(target, 'dist', 'out.bin')), false)
+  assert.deepEqual(fs.readFileSync(path.join(survival.candidateRoot, 'dist', 'out.bin')), candidateBytes)
+})
+
+test('ignored inventory keeps exact ownership narrow and cache-only resources excluded', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-ignored-inventory-scope-target-'))
+  fs.writeFileSync(path.join(target, '.gitignore'), 'dist/\ncache/\nforeign/\n')
+  for (const argv of [
+    ['-C', target, 'add', '--', '.gitignore'],
+    ['-C', target, 'commit', '-m', 'ignore inventory scope fixtures'],
+  ]) {
+    const result = spawnSync('git', argv, { encoding: 'utf8', windowsHide: true })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+  }
+  for (const relative of [
+    'dist/out.bin',
+    'dist/sibling.bin',
+    'cache/noise.bin',
+    'foreign/unowned.bin',
+  ]) {
+    const absolute = path.join(target, ...relative.split('/'))
+    fs.mkdirSync(path.dirname(absolute), { recursive: true })
+    fs.writeFileSync(absolute, relative)
+  }
+
+  assert.deepEqual(declaredIgnoredWorkspaceNames(target, process.env, [
+    { kind: 'output', identity: 'dist/out.bin', access: 'write' },
+    { kind: 'cache', identity: '.', access: 'write' },
+  ]), ['dist/out.bin'])
+})
+
+test('private worker materializes and CAS-updates or deletes an existing ignored owned output', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-ignored-output-existing-target-'))
+  fs.writeFileSync(path.join(target, '.gitignore'), 'dist/\n')
+  for (const argv of [
+    ['-C', target, 'add', '--', '.gitignore'],
+    ['-C', target, 'commit', '-m', 'ignore existing output fixture'],
+  ]) {
+    const result = spawnSync('git', argv, { encoding: 'utf8', windowsHide: true })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+  }
+  fs.mkdirSync(path.join(target, 'dist'))
+  fs.writeFileSync(path.join(target, 'dist', 'out.bin'), 'baseline ignored bytes\n')
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target,
+    privateRoot: tempDirectory(t, 'autoprompt-ignored-output-existing-private-'),
+    environment: process.env,
+    runId: 'ignored-output-existing-run',
+    activationId: 'ignored-output-existing-activation',
+  })
+  const assignment = {
+    resources: [{ kind: 'output', identity: 'dist/out.bin', access: 'write' }],
+  }
+  const updated = manager.prepare({ assignment, workItemId: 'ignored-output-update-work' })
+  assert.equal(fs.readFileSync(path.join(updated.workspacePath, 'dist', 'out.bin'), 'utf8'),
+    'baseline ignored bytes\n')
+  fs.writeFileSync(path.join(updated.workspacePath, 'dist', 'out.bin'), 'updated ignored bytes\n')
+  const updateAdmission = manager.inspect(updated, { filesChanged: ['dist/out.bin'] })
+  assert.deepEqual(updateAdmission.actualFilesChanged, ['dist/out.bin'])
+  manager.promote(updated, updateAdmission)
+  manager.finalize(updated)
+  assert.equal(fs.readFileSync(path.join(target, 'dist', 'out.bin'), 'utf8'), 'updated ignored bytes\n')
+
+  const deleted = manager.prepare({ assignment, workItemId: 'ignored-output-delete-work' })
+  fs.unlinkSync(path.join(deleted.workspacePath, 'dist', 'out.bin'))
+  const deleteAdmission = manager.inspect(deleted, { filesChanged: ['dist/out.bin'] })
+  assert.deepEqual(deleteAdmission.actualFilesChanged, ['dist/out.bin'])
+  manager.promote(deleted, deleteAdmission)
+  manager.finalize(deleted)
+  assert.equal(fs.existsSync(path.join(target, 'dist', 'out.bin')), false)
+})
+
+test('private worker promotes a mode-only owned deliverable change', t => {
+  if (process.platform === 'win32') return t.skip('POSIX executable mode')
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-mode-only-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-mode-only-private-')
+  const targetPath = path.join(target, 'src', 'example.js')
+  fs.chmodSync(targetPath, 0o644)
+  const baseline = fs.readFileSync(targetPath)
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'mode-only-run', activationId: 'mode-only-activation',
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'mode-only-work' })
+  fs.chmodSync(path.join(session.workspacePath, 'src', 'example.js'), 0o755)
+  const admission = manager.inspect(session, { filesChanged: ['src/example.js'] })
+  assert.deepEqual(admission.actualFilesChanged, ['src/example.js'])
+  manager.promote(session, admission)
+  assert.deepEqual(fs.readFileSync(targetPath), baseline)
+  assert.equal(fs.statSync(targetPath).mode & 0o777, 0o755)
+  manager.finalize(session)
+})
+
 test('mission read resources carve exact inputs out of broad worker write ownership', t => {
   const target = createTempGitTarget(tempDirectory(t, 'autoprompt-mission-read-carveout-target-'))
-  fs.writeFileSync(path.join(target, 'schematic.png'), 'immutable schematic\n')
-  const add = spawnSync('git', ['-C', target, 'add', '--', 'schematic.png'], {
+  fs.writeFileSync(path.join(target, 'reference-input.bin'), 'immutable reference input\n')
+  const add = spawnSync('git', ['-C', target, 'add', '--', 'reference-input.bin'], {
     encoding: 'utf8', windowsHide: true,
   })
   assert.equal(add.status, 0, add.stderr || add.stdout)
@@ -12769,14 +14644,14 @@ test('mission read resources carve exact inputs out of broad worker write owners
   })
   const assignment = { resources: [
     { kind: 'directory', identity: '.', access: 'write' },
-    { kind: 'file', identity: 'schematic.png', access: 'read' },
+    { kind: 'file', identity: 'reference-input.bin', access: 'read' },
   ] }
-  const session = manager.prepare({ assignment, workItemId: 'cad-model' })
-  fs.writeFileSync(path.join(session.workspacePath, 'schematic.png'), 'mutated schematic\n')
+  const session = manager.prepare({ assignment, workItemId: 'read-carveout-work' })
+  fs.writeFileSync(path.join(session.workspacePath, 'reference-input.bin'), 'mutated input\n')
   assert.throws(
-    () => manager.inspect(session, { filesChanged: ['schematic.png'] }),
+    () => manager.inspect(session, { filesChanged: ['reference-input.bin'] }),
     error => error.code === 'OWNERSHIP_SCOPE_VIOLATION' &&
-      error.details.outside.includes('schematic.png'),
+      error.details.outside.includes('reference-input.bin'),
   )
   manager.abort(session)
 
@@ -12821,6 +14696,114 @@ test('candidate survival rejects bytes changed after admission and retains no fo
   assert.equal(fs.readFileSync(path.join(target, 'src', 'example.js'), 'utf8'),
     "module.exports = 'ready'\n")
   manager.abort(session)
+})
+
+test('incomplete worker report preserves and promotes the exact owned file-slot candidate', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-partial-slot-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-partial-slot-private-')
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target,
+    privateRoot,
+    environment: process.env,
+    runId: 'partial-slot-run',
+    activationId: 'partial-slot-activation',
+  })
+  const assignment = { resources: [
+    { kind: 'file', identity: path.join(target, '<implementation-file>'), access: 'write' },
+    { kind: 'output', identity: path.join(target, 'output', 'artifact.bin'), access: 'write' },
+  ] }
+  const session = manager.prepare({ assignment, workItemId: 'partial-slot-work' })
+  const implementationBytes = Buffer.from('exact partial implementation\n')
+  const artifactBytes = Buffer.from([0, 1, 2, 3, 255])
+  const implementationPath = path.join(session.workspacePath, 'implementation.js')
+  const artifactPath = path.join(session.workspacePath, 'output', 'artifact.bin')
+  fs.writeFileSync(implementationPath, implementationBytes)
+  fs.chmodSync(implementationPath, 0o751)
+  fs.mkdirSync(path.dirname(artifactPath), { recursive: true })
+  fs.writeFileSync(artifactPath, artifactBytes)
+
+  const admission = manager.inspect(session, {
+    allAssignedItemsPass: false,
+    remainingConcerns: ['One author-side check needs follow-up.'],
+    // Incomplete reports are bookkeeping, not mutation authority. The
+    // authenticated private snapshot remains the exact source of changed paths.
+    filesChanged: ['output/artifact.bin'],
+  })
+  assert.deepEqual(admission.actualFilesChanged, ['implementation.js', 'output/artifact.bin'])
+  assert.equal(admission.ownershipResolution.kind, 'worker-owned-file-slot-resolution')
+  assert.equal(admission.ownershipResolution.sourceWorkspaceId, session.workspaceId)
+  assert.equal(admission.ownershipResolution.sourceAssignmentHash, session.binding.assignmentHash)
+  assert.equal(admission.ownershipResolution.sourceBindingHash, session.binding.bindingHash)
+  assert.equal(admission.ownershipResolution.bindings[0].relative, 'implementation.js')
+
+  const survival = manager.preserveCandidate(session, {
+    admission,
+    candidateHash: 'a'.repeat(64),
+    reasonCode: 'PARTIAL_WORK_REQUIRES_FOLLOW_UP',
+  })
+  assert.equal(survival.changedPathCount, 2)
+  assert.equal(survival.ownershipResolutionHash, admission.ownershipResolution.resolutionHash)
+  assert.deepEqual(fs.readFileSync(path.join(survival.candidateRoot, 'implementation.js')), implementationBytes)
+  assert.deepEqual(fs.readFileSync(path.join(survival.candidateRoot, 'output', 'artifact.bin')), artifactBytes)
+  assert.equal(fs.statSync(path.join(survival.candidateRoot, 'implementation.js')).mode & 0o777, 0o751)
+  assert.equal(fs.statSync(path.join(survival.candidateRoot, 'output', 'artifact.bin')).mode & 0o777, 0o644)
+
+  const promoted = manager.promote(session, admission)
+  assert.equal(promoted.length, 2)
+  assert.deepEqual(fs.readFileSync(path.join(target, 'implementation.js')), implementationBytes)
+  assert.deepEqual(fs.readFileSync(path.join(target, 'output', 'artifact.bin')), artifactBytes)
+  manager.finalize(session)
+})
+
+test('file-slot admission rejects ambiguous foreign bytes and a foreign survival binding', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-partial-slot-foreign-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-partial-slot-foreign-private-')
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target,
+    privateRoot,
+    environment: process.env,
+    runId: 'partial-slot-foreign-run',
+    activationId: 'partial-slot-foreign-activation',
+  })
+  const assignment = { resources: [
+    { kind: 'file', identity: '<implementation-file>', access: 'write' },
+    { kind: 'file', identity: 'output/artifact.bin', access: 'write' },
+  ] }
+  const ambiguous = manager.prepare({ assignment, workItemId: 'partial-slot-ambiguous' })
+  fs.writeFileSync(path.join(ambiguous.workspacePath, 'implementation.js'), 'owned candidate\n')
+  fs.writeFileSync(path.join(ambiguous.workspacePath, 'foreign.txt'), 'foreign candidate\n')
+  fs.mkdirSync(path.join(ambiguous.workspacePath, 'output'), { recursive: true })
+  fs.writeFileSync(path.join(ambiguous.workspacePath, 'output', 'artifact.bin'), 'artifact\n')
+  assert.throws(
+    () => manager.inspect(ambiguous, {
+      allAssignedItemsPass: false,
+      filesChanged: ['output/artifact.bin'],
+    }),
+    error => error.code === 'OWNERSHIP_SCOPE_VIOLATION' &&
+      error.details.outside.includes('foreign.txt') &&
+      error.details.outside.includes('implementation.js'),
+  )
+  assert.deepEqual(fs.readdirSync(path.join(privateRoot, 'candidate-survivals')), [])
+  manager.abort(ambiguous)
+
+  const exact = manager.prepare({ assignment, workItemId: 'partial-slot-foreign-binding' })
+  fs.writeFileSync(path.join(exact.workspacePath, 'implementation.js'), 'owned candidate\n')
+  const admission = manager.inspect(exact, {
+    allAssignedItemsPass: false,
+    filesChanged: [],
+  })
+  const foreignAdmission = structuredClone(admission)
+  foreignAdmission.ownershipResolution.sourceBindingHash = 'f'.repeat(64)
+  assert.throws(
+    () => manager.preserveCandidate(exact, {
+      admission: foreignAdmission,
+      candidateHash: 'b'.repeat(64),
+      reasonCode: 'PARTIAL_WORK_REQUIRES_FOLLOW_UP',
+    }),
+    error => error.code === 'WORKER_SURVIVAL_INVALID',
+  )
+  assert.deepEqual(fs.readdirSync(path.join(privateRoot, 'candidate-survivals')), [])
+  manager.abort(exact)
 })
 
 test('worker Python environment redirects explicit compilation into an evidenced private cache root', t => {
@@ -13102,6 +15085,318 @@ test('private worker workspace keeps real target immutable and rejects stale own
   manager.abort(foreignSession)
 })
 
+test('new-file CAS publication never overwrites a target that appears at the link boundary', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-new-file-link-race-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-new-file-link-race-private-')
+  const targetPath = path.join(target, 'generated.txt')
+  const foreignBytes = Buffer.from('independent writer won the new-file race\n')
+  let inject = true
+  const fsImpl = Object.create(fs)
+  fsImpl.linkSync = (source, destination) => {
+    if (inject && path.resolve(destination) === path.resolve(targetPath)) {
+      inject = false
+      fs.writeFileSync(targetPath, foreignBytes)
+    }
+    return fs.linkSync(source, destination)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'new-file-link-race-run', activationId: 'new-file-link-race-activation', fsImpl,
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'generated.txt', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'new-file-link-race-work' })
+  fs.writeFileSync(path.join(session.workspacePath, 'generated.txt'), 'worker candidate\n')
+  const admission = manager.inspect(session, { filesChanged: ['generated.txt'] })
+  assert.throws(() => manager.promote(session, admission), error => error.code === 'CONCURRENT_MUTATION')
+  assert.deepEqual(fs.readFileSync(targetPath), foreignBytes)
+  const journal = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  assert.equal(journal.status, 'ROLLED_BACK')
+  assert.ok(journal.transaction.preservedConflicts.length > 0)
+  assert.equal(fs.existsSync(journal.transaction.entries[0].staged), true,
+    'the rejected exact candidate remains in its private transaction')
+})
+
+test('existing-file CAS revalidates captured bytes and restores a writer that wins before rename', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-existing-capture-race-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-existing-capture-race-private-')
+  const targetPath = path.join(target, 'src', 'example.js')
+  const foreignBytes = Buffer.from('independent writer won before capture\n')
+  let inject = true
+  const fsImpl = Object.create(fs)
+  fsImpl.renameSync = (source, destination) => {
+    if (inject && path.resolve(source) === path.resolve(targetPath) &&
+        path.basename(destination) === 'preimage') {
+      inject = false
+      fs.writeFileSync(targetPath, foreignBytes)
+    }
+    return fs.renameSync(source, destination)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'existing-capture-race-run', activationId: 'existing-capture-race-activation', fsImpl,
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'existing-capture-race-work' })
+  fs.writeFileSync(path.join(session.workspacePath, 'src', 'example.js'), 'worker candidate\n')
+  const admission = manager.inspect(session, { filesChanged: ['src/example.js'] })
+  assert.throws(() => manager.promote(session, admission), error => error.code === 'CONCURRENT_MUTATION')
+  assert.deepEqual(fs.readFileSync(targetPath), foreignBytes)
+  const journal = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  assert.ok(journal.transaction.preservedConflicts.some(item =>
+    item.reason === 'captured-concurrent-bytes-were-restored-without-overwrite'))
+  assert.equal(fs.readFileSync(journal.transaction.entries[0].backup, 'utf8'),
+    "module.exports = 'ready'\n", 'the admitted baseline remains recoverable')
+})
+
+test('existing-file CAS preserves both a late writer and the displaced baseline across reopen', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-existing-link-race-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-existing-link-race-private-')
+  const targetPath = path.join(target, 'src', 'example.js')
+  const foreignBytes = Buffer.from('independent writer won after displacement\n')
+  let inject = true
+  const fsImpl = Object.create(fs)
+  fsImpl.linkSync = (source, destination) => {
+    if (inject && path.resolve(destination) === path.resolve(targetPath)) {
+      inject = false
+      fs.writeFileSync(targetPath, foreignBytes)
+    }
+    return fs.linkSync(source, destination)
+  }
+  const options = {
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'existing-link-race-run', activationId: 'existing-link-race-activation', fsImpl,
+  }
+  const manager = new WorkerWorkspaceManager(options)
+  const assignment = { resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'existing-link-race-work' })
+  fs.writeFileSync(path.join(session.workspacePath, 'src', 'example.js'), 'worker candidate\n')
+  const admission = manager.inspect(session, { filesChanged: ['src/example.js'] })
+  assert.throws(() => manager.promote(session, admission), error => error.code === 'CONCURRENT_MUTATION')
+  assert.deepEqual(fs.readFileSync(targetPath), foreignBytes)
+  let journal = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  assert.equal(fs.readFileSync(journal.transaction.entries[0].displaced, 'utf8'),
+    "module.exports = 'ready'\n")
+  assert.ok(journal.transaction.preservedConflicts.length > 0)
+
+  const reopenedManager = new WorkerWorkspaceManager({ ...options, fsImpl: fs })
+  const reopened = reopenedManager.reopen({
+    assignment, workItemId: 'existing-link-race-work', recordPath: session.recordPath,
+  })
+  journal = JSON.parse(fs.readFileSync(reopened.recordPath, 'utf8'))
+  assert.deepEqual(fs.readFileSync(targetPath), foreignBytes)
+  assert.equal(fs.readFileSync(journal.transaction.entries[0].displaced, 'utf8'),
+    "module.exports = 'ready'\n")
+  assert.ok(journal.transaction.preservedConflicts.length > 0,
+    'restart must not erase a conflict transaction or either side of the race')
+})
+
+test('deletion CAS never removes a target created after the admitted preimage is displaced', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-delete-gap-race-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-delete-gap-race-private-')
+  const targetPath = path.join(target, 'src', 'example.js')
+  const foreignBytes = Buffer.from('independent writer filled the deletion gap\n')
+  let inject = true
+  const fsImpl = Object.create(fs)
+  fsImpl.renameSync = (source, destination) => {
+    const result = fs.renameSync(source, destination)
+    if (inject && path.resolve(source) === path.resolve(targetPath) &&
+        path.basename(destination) === 'preimage') {
+      inject = false
+      fs.writeFileSync(targetPath, foreignBytes)
+    }
+    return result
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'delete-gap-race-run', activationId: 'delete-gap-race-activation', fsImpl,
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'delete-gap-race-work' })
+  fs.unlinkSync(path.join(session.workspacePath, 'src', 'example.js'))
+  const admission = manager.inspect(session, { filesChanged: ['src/example.js'] })
+  assert.throws(() => manager.promote(session, admission), error => error.code === 'MUTATION_RESULT_MISMATCH')
+  assert.deepEqual(fs.readFileSync(targetPath), foreignBytes)
+  const journal = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  assert.equal(fs.readFileSync(journal.transaction.entries[0].displaced, 'utf8'),
+    "module.exports = 'ready'\n")
+  assert.ok(journal.transaction.preservedConflicts.length > 0)
+})
+
+test('promotion preparation is journaled first and an ordinary staging failure leaves no orphan', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-staging-failure-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-staging-failure-private-')
+  let inject = true
+  const fsImpl = Object.create(fs)
+  fsImpl.copyFileSync = (source, destination, flags) => {
+    if (inject && path.basename(destination) === 'candidate') {
+      inject = false
+      const error = new Error('simulated failure while staging the candidate')
+      error.code = 'SIMULATED_STAGE_FAILURE'
+      throw error
+    }
+    return fs.copyFileSync(source, destination, flags)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'staging-failure-run', activationId: 'staging-failure-activation', fsImpl,
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'staging-failure-work' })
+  fs.writeFileSync(path.join(session.workspacePath, 'src', 'example.js'), 'worker candidate\n')
+  const admission = manager.inspect(session, { filesChanged: ['src/example.js'] })
+  assert.throws(() => manager.promote(session, admission), error => error.code === 'SIMULATED_STAGE_FAILURE')
+  const interrupted = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  assert.equal(interrupted.status, 'ROLLED_BACK')
+  assert.equal(interrupted.transaction, null)
+  assert.deepEqual(fs.readdirSync(path.join(target, 'src')).filter(name =>
+    name.startsWith('.autoprompt-cas-')), [])
+  assert.equal(fs.readFileSync(path.join(target, 'src', 'example.js'), 'utf8'),
+    "module.exports = 'ready'\n")
+
+  const promoted = manager.promote(session, admission)
+  assert.equal(promoted.length, 1)
+  assert.equal(fs.readFileSync(path.join(target, 'src', 'example.js'), 'utf8'), 'worker candidate\n')
+  manager.finalize(session)
+})
+
+test('promotion rejects and cleans a rollback backup changed during copy before target mutation', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-backup-copy-race-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-backup-copy-race-private-')
+  const targetPath = path.join(target, 'src', 'example.js')
+  const baselineBytes = fs.readFileSync(targetPath)
+  let inject = true
+  const fsImpl = Object.create(fs)
+  fsImpl.copyFileSync = (source, destination, flags) => {
+    if (inject && destination.includes(`${path.sep}backups${path.sep}`)) {
+      inject = false
+      fs.writeFileSync(targetPath, 'foreign bytes during backup copy\n')
+      const result = fs.copyFileSync(source, destination, flags)
+      fs.writeFileSync(targetPath, baselineBytes)
+      return result
+    }
+    return fs.copyFileSync(source, destination, flags)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'backup-copy-race-run', activationId: 'backup-copy-race-activation', fsImpl,
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'backup-copy-race-work' })
+  fs.writeFileSync(path.join(session.workspacePath, 'src', 'example.js'), 'worker candidate\n')
+  const admission = manager.inspect(session, { filesChanged: ['src/example.js'] })
+  assert.throws(() => manager.promote(session, admission), error => error.code === 'CONCURRENT_MUTATION')
+  assert.deepEqual(fs.readFileSync(targetPath), baselineBytes)
+  const interrupted = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  assert.equal(interrupted.status, 'ROLLED_BACK')
+  assert.equal(interrupted.transaction, null)
+
+  manager.promote(session, admission)
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), 'worker candidate\n')
+  manager.finalize(session)
+})
+
+test('CAS treats a concurrent mode-only preimage change as preserved foreign state', t => {
+  if (process.platform === 'win32') return t.skip('POSIX mode race')
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-mode-race-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-mode-race-private-')
+  const targetPath = path.join(target, 'src', 'example.js')
+  fs.chmodSync(targetPath, 0o644)
+  let inject = true
+  const fsImpl = Object.create(fs)
+  fsImpl.renameSync = (source, destination) => {
+    if (inject && path.resolve(source) === path.resolve(targetPath) &&
+        path.basename(destination) === 'preimage') {
+      inject = false
+      fs.chmodSync(targetPath, 0o600)
+    }
+    return fs.renameSync(source, destination)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'mode-race-run', activationId: 'mode-race-activation', fsImpl,
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'mode-race-work' })
+  fs.writeFileSync(path.join(session.workspacePath, 'src', 'example.js'), 'worker candidate\n')
+  const admission = manager.inspect(session, { filesChanged: ['src/example.js'] })
+  assert.throws(() => manager.promote(session, admission), error => error.code === 'CONCURRENT_MUTATION')
+  assert.equal(fs.statSync(targetPath).mode & 0o777, 0o600)
+  const journal = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  assert.ok(journal.transaction.preservedConflicts.length > 0)
+  assert.equal(fs.statSync(journal.transaction.entries[0].backup).mode & 0o777, 0o644)
+})
+
+test('CAS restores an exact symlink winner displaced after preimage validation', t => {
+  if (process.platform === 'win32') return t.skip('POSIX symlink race')
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-symlink-winner-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-symlink-winner-private-')
+  const targetPath = path.join(target, 'src', 'example.js')
+  let inject = true
+  const fsImpl = Object.create(fs)
+  fsImpl.renameSync = (source, destination) => {
+    if (inject && path.resolve(source) === path.resolve(targetPath) &&
+        path.basename(destination) === 'preimage') {
+      inject = false
+      fs.unlinkSync(targetPath)
+      fs.symlinkSync('foreign-target', targetPath)
+    }
+    return fs.renameSync(source, destination)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'symlink-winner-run', activationId: 'symlink-winner-activation', fsImpl,
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'symlink-winner-work' })
+  fs.writeFileSync(path.join(session.workspacePath, 'src', 'example.js'), 'worker candidate\n')
+  const admission = manager.inspect(session, { filesChanged: ['src/example.js'] })
+  assert.throws(() => manager.promote(session, admission), error => error.code === 'CONCURRENT_MUTATION')
+  assert.equal(fs.lstatSync(targetPath).isSymbolicLink(), true)
+  assert.equal(fs.readlinkSync(targetPath), 'foreign-target')
+  const journal = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  assert.equal(journal.status, 'ROLLED_BACK')
+  assert.equal(journal.transaction.preservedConflicts.some(item =>
+    item.path === 'src/example.js' && item.reason === 'captured-preimage-is-not-a-safe-regular-file' &&
+    item.unsafe === true), true)
+})
+
+test('CAS keeps a displaced concurrent directory reachable at the original target path', t => {
+  if (process.platform === 'win32') return t.skip('POSIX directory displacement race')
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-directory-winner-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-directory-winner-private-')
+  const targetPath = path.join(target, 'src', 'example.js')
+  let inject = true
+  const fsImpl = Object.create(fs)
+  fsImpl.renameSync = (source, destination) => {
+    if (inject && path.resolve(source) === path.resolve(targetPath) &&
+        path.basename(destination) === 'preimage') {
+      inject = false
+      fs.unlinkSync(targetPath)
+      fs.mkdirSync(targetPath)
+      fs.writeFileSync(path.join(targetPath, 'foreign.txt'), 'concurrent directory bytes\n')
+    }
+    return fs.renameSync(source, destination)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'directory-winner-run', activationId: 'directory-winner-activation', fsImpl,
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'directory-winner-work' })
+  fs.writeFileSync(path.join(session.workspacePath, 'src', 'example.js'), 'worker candidate\n')
+  const admission = manager.inspect(session, { filesChanged: ['src/example.js'] })
+  assert.throws(() => manager.promote(session, admission), error => error.code === 'CONCURRENT_MUTATION')
+  assert.equal(fs.existsSync(targetPath), true)
+  assert.equal(fs.lstatSync(targetPath).isSymbolicLink(), true)
+  assert.equal(fs.readFileSync(path.join(targetPath, 'foreign.txt'), 'utf8'),
+    'concurrent directory bytes\n')
+  const journal = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  const conflict = journal.transaction.preservedConflicts.find(item => item.path === 'src/example.js')
+  assert.equal(conflict.recoveryDisposition, 'OPAQUE_OBJECT_SURFACED_BY_NO_REPLACE_POINTER')
+  assert.equal(fs.realpathSync.native(targetPath),
+    fs.realpathSync.native(journal.transaction.entries[0].displaced))
+})
+
 test('worker workspace rejects intermediate symlink and Windows junction escapes before creating leaves', t => {
   const root = tempDirectory(t, 'autoprompt-hostile-worker-root-')
   const target = createTempGitTarget(path.join(root, 'physical-target-parent'))
@@ -13187,6 +15482,127 @@ test('crash during isolated CAS promotion is recovered by exact preimage rollbac
   assert.equal(aborted.status, 'ABORTED')
   assert.equal(fs.existsSync(recovered.workspacePath), false)
   assert.equal(JSON.parse(fs.readFileSync(recovered.recordPath, 'utf8')).transaction, null)
+})
+
+test('guardian retains a durable committed transaction so restart can still abort exactly', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-committed-crash-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-committed-crash-private-')
+  const assignment = {
+    resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }],
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'committed-crash-run', activationId: 'committed-crash-activation',
+  })
+  const session = manager.prepare({ assignment, workItemId: 'committed-crash-work' })
+  fs.writeFileSync(path.join(session.workspacePath, 'src', 'example.js'), 'committed postimage\n')
+  const childScript = [
+    "const {WorkerWorkspaceManager}=require(process.argv[1])",
+    'const target=process.argv[2], privateRoot=process.argv[3]',
+    'const assignment=JSON.parse(process.argv[4])',
+    "const manager=new WorkerWorkspaceManager({targetRoot:target,privateRoot,environment:process.env,runId:'committed-crash-run',activationId:'committed-crash-activation'})",
+    'manager._committedPostimages=()=>process.exit(78)',
+    "const session=manager.prepare({assignment,workItemId:'committed-crash-work'})",
+    "const admission=manager.inspect(session,{filesChanged:['src/example.js']})",
+    'manager.promote(session,admission)',
+  ].join(';')
+  const crashed = spawnSync(process.execPath, [
+    '-e', childScript, path.join(WORKFLOW, 'worker-workspace.js'), target, privateRoot, JSON.stringify(assignment),
+  ], { encoding: 'utf8', windowsHide: true })
+  assert.equal(crashed.status, 78, crashed.stderr || crashed.stdout)
+
+  const recoveryDeadline = Date.now() + 8_000
+  let journal = null
+  while (Date.now() < recoveryDeadline) {
+    try { journal = JSON.parse(fs.readFileSync(session.recordPath, 'utf8')) } catch {}
+    if (journal && journal.status === 'COMMITTED' && journal.guardianOutcome === 'COMMITTED' &&
+        journal.transaction && fs.existsSync(journal.transaction.entries[0].displaced)) break
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
+  }
+  assert.equal(journal && journal.status, 'COMMITTED')
+  assert.ok(journal && journal.transaction,
+    'guardian must retain the exact displaced preimage until explicit finalize or abort')
+  assert.equal(fs.readFileSync(path.join(target, 'src', 'example.js'), 'utf8'), 'committed postimage\n')
+  assert.equal(fs.readFileSync(journal.transaction.entries[0].displaced, 'utf8'),
+    "module.exports = 'ready'\n")
+
+  const reopened = manager.reopen({
+    assignment, workItemId: 'committed-crash-work', recordPath: session.recordPath,
+  })
+  const aborted = manager.abort(reopened)
+  assert.equal(aborted.status, 'ABORTED')
+  assert.equal(fs.readFileSync(path.join(target, 'src', 'example.js'), 'utf8'),
+    "module.exports = 'ready'\n")
+  assert.equal(JSON.parse(fs.readFileSync(session.recordPath, 'utf8')).transaction, null)
+})
+
+test('durable FINALIZING intent makes cleanup restart-idempotent after preimage disposal', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-finalize-crash-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-finalize-crash-private-')
+  let inject = true
+  const fsImpl = Object.create(fs)
+  fsImpl.rmdirSync = directory => {
+    if (inject && directory.includes(`${path.sep}autoprompt-cas-v2${path.sep}`)) {
+      inject = false
+      const error = new Error('simulated cleanup crash after displaced preimage disposal')
+      error.code = 'SIMULATED_CLEANUP_CRASH'
+      throw error
+    }
+    return fs.rmdirSync(directory)
+  }
+  const options = {
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'finalize-crash-run', activationId: 'finalize-crash-activation', fsImpl,
+  }
+  const manager = new WorkerWorkspaceManager(options)
+  const assignment = { resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'finalize-crash-work' })
+  fs.writeFileSync(path.join(session.workspacePath, 'src', 'example.js'), 'accepted candidate\n')
+  const admission = manager.inspect(session, { filesChanged: ['src/example.js'] })
+  manager.promote(session, admission)
+  assert.throws(() => manager.finalize(session), error => error.code === 'SIMULATED_CLEANUP_CRASH')
+  let journal = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  assert.equal(journal.status, 'FINALIZING')
+  assert.ok(journal.transaction.finalizationIntent)
+  assert.equal(fs.readFileSync(path.join(target, 'src', 'example.js'), 'utf8'), 'accepted candidate\n')
+  assert.equal(fs.existsSync(journal.transaction.entries[0].displaced), false)
+
+  const reopenedManager = new WorkerWorkspaceManager({ ...options, fsImpl: fs })
+  const finalized = reopenedManager.recover(journal)
+  assert.equal(finalized.status, 'FINALIZED')
+  journal = JSON.parse(fs.readFileSync(session.recordPath, 'utf8'))
+  assert.equal(journal.status, 'FINALIZED')
+  assert.equal(journal.transaction, null)
+  assert.equal(fs.readFileSync(path.join(target, 'src', 'example.js'), 'utf8'), 'accepted candidate\n')
+})
+
+test('parallel finalization tolerates a shared scratch parent becoming nonempty', t => {
+  const target = createTempGitTarget(tempDirectory(t, 'autoprompt-shared-scratch-race-target-'))
+  const privateRoot = tempDirectory(t, 'autoprompt-shared-scratch-race-private-')
+  let injected = false
+  const fsImpl = Object.create(fs)
+  fsImpl.rmdirSync = directory => {
+    if (!injected && /^[a-f0-9]{40}$/u.test(path.basename(directory))) {
+      injected = true
+      const error = new Error('another promotion populated the shared scratch root')
+      error.code = 'ENOTEMPTY'
+      throw error
+    }
+    return fs.rmdirSync(directory)
+  }
+  const manager = new WorkerWorkspaceManager({
+    targetRoot: target, privateRoot, environment: process.env,
+    runId: 'shared-scratch-race-run', activationId: 'shared-scratch-race-activation', fsImpl,
+  })
+  const assignment = { resources: [{ kind: 'file', identity: 'src/example.js', access: 'write' }] }
+  const session = manager.prepare({ assignment, workItemId: 'shared-scratch-race-work' })
+  fs.writeFileSync(path.join(session.workspacePath, 'src', 'example.js'), 'accepted candidate\n')
+  const admission = manager.inspect(session, { filesChanged: ['src/example.js'] })
+  manager.promote(session, admission)
+  const finalized = manager.finalize(session)
+  assert.equal(injected, true)
+  assert.equal(finalized.status, 'FINALIZED')
+  assert.equal(fs.readFileSync(path.join(target, 'src', 'example.js'), 'utf8'), 'accepted candidate\n')
 })
 
 test('terminal Windows Job records do not mistake a reused historical PID for a live descendant', () => {
@@ -13387,8 +15803,9 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
   const base = {
     ...WORKER_EXECUTION_POLICY,
     physicalExecutionPolicy: WORKER_EXECUTION_POLICY,
-    ...adapterMissionFields('hash'),
+    ...adapterMissionFields('hash', 'work-adapter'),
     dispatch: { brief: 'Do the bounded work.', requestPointer: { path: 'request', hash: 'hash' } },
+    canonicalAssignment: canonicalWorkerAssignment('work-adapter'),
     environment: { GIT_ALLOW_PROTOCOL: 'file' },
     sessionId: 'run:DIRECT:launch-1',
     onSessionIdentified(sessionId) {
@@ -13421,11 +15838,18 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
   assert.match(calls[0].stdin, /^AUTOPROMPT_EXTERNAL_CHILD_V1\nrole=worker\n/)
   assert.match(calls[0].stdin, /AUTOPROMPT_CANONICAL_MISSION_V1\nCanonical original request:/u)
   assert.match(calls[0].stdin, /physical_role=autoprompt\.v2\.worker\nprovider_role=ap-worker\n/)
+  const freshCanonicalAssignment = JSON.parse(/^Canonical assignment: (.+)$/mu.exec(calls[0].stdin)[1])
+  assert.deepEqual(
+    freshCanonicalAssignment.requirementFidelityDoctrine,
+    WORKER_REQUIREMENT_FIDELITY_DOCTRINE,
+  )
   assert.deepEqual(calls[0].argv.filter((value, index, all) => all[index - 1] === '--disable'), [
     'multi_agent', 'multi_agent_v2', 'code_mode', 'code_mode_only', 'goals', 'memories',
     'token_budget', 'current_time_reminder', 'deferred_executor', 'unbounded_connection_retries',
-    'unified_exec', 'view_image',
+    'unified_exec',
   ])
+  assert.equal(calls[0].argv.includes('view_image'), false,
+    'default required work retains image inspection for visual/CAD evidence')
   assert.equal(calls[0].argv.includes('model_auto_compact_token_limit=32768'), true)
   assert.equal(calls[0].argv.includes('tool_output_token_limit=1000'), true)
   assert.equal(calls[0].argv.includes('mcp_servers={}'), true)
@@ -13436,7 +15860,7 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
       return {
         status: 0, processOwned: true, exactArgv: true, drained: true,
         stdout: [
-          JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(adapterWorkerResult({ reportId: 'adapter-resume' })) } }),
+          JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(adapterWorkerResult({ reportId: 'adapter-resume', assignmentId: 'work-adapter-repair' })) } }),
           JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, reasoning_tokens: 0 } }),
           '',
         ].join('\n'),
@@ -13450,7 +15874,12 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
     profile: 'autoprompt-resume-fixture',
     outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
   })
-  await resumeAdapter.launch({ ...base, continuationId: '11111111-1111-4111-8111-111111111111' })
+  await resumeAdapter.launch({
+    ...base,
+    ...adapterMissionFields('hash', 'work-adapter-repair'),
+    continuationId: '11111111-1111-4111-8111-111111111111',
+    canonicalAssignment: canonicalWorkerAssignment('work-adapter-repair', 'work-adapter'),
+  })
   assert.deepEqual(calls[1].argv.slice(0, 2), ['exec', '--json'])
   assert.ok(calls[1].argv.indexOf('--sandbox') < calls[1].argv.indexOf('resume'))
   assert.deepEqual(
@@ -13461,19 +15890,26 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
   assert.equal(calls[1].argv[calls[1].argv.indexOf('resume') + 1], '11111111-1111-4111-8111-111111111111')
   assert.equal(calls[1].argv.at(-2), '11111111-1111-4111-8111-111111111111')
   assert.equal(calls[1].argv.at(-1), '-')
+  const repairCanonicalAssignment = JSON.parse(/^Canonical assignment: (.+)$/mu.exec(calls[1].stdin)[1])
+  assert.equal(repairCanonicalAssignment.assignmentId, 'work-adapter-repair')
+  assert.match(repairCanonicalAssignment.requestedResult, /^Repair/u)
+  assert.deepEqual(
+    repairCanonicalAssignment.requirementFidelityDoctrine,
+    WORKER_REQUIREMENT_FIDELITY_DOCTRINE,
+  )
 })
 
-test('external Codex transport mechanically stops route, checker, and worker tool-call overruns', async t => {
+test('external Codex transport enforces optional-route and explicitly supplied tool-call ceilings', async t => {
   const cases = [
     {
-      logicalRole: 'route-analyst', limit: 0, rolloutLimit: 16_001, rolloutReminder: 8_000,
+      logicalRole: 'route-analyst', limit: 0, rolloutLimit: 8_001, rolloutReminder: 4_000,
       physicalRole: 'autoprompt.v2.route-analyst', providerRole: 'ap-route-analyst',
       sandboxMode: 'read-only',
       schema: 'route-recommendation.schema.json',
     },
     {
       logicalRole: 'run-owner', route: 'PRE_ROUTE', limit: 0,
-      rolloutLimit: 16_001, rolloutReminder: 8_000,
+      rolloutLimit: 8_001, rolloutReminder: 4_000,
       physicalRole: 'autoprompt.v2.run-owner', providerRole: 'ap-run-owner',
       sandboxMode: 'read-only', canDispatch: true,
       resourceSets: { read: ['request-envelope', 'route-evidence'], write: [], exclusive: [] },
@@ -13481,14 +15917,13 @@ test('external Codex transport mechanically stops route, checker, and worker too
     },
     {
       logicalRole: 'independent-reviewer', limit: 2,
-      rolloutLimit: 24_001, rolloutReminder: 12_000,
       physicalRole: 'autoprompt.v2.independent-reviewer', providerRole: 'ap-independent-checker',
       sandboxMode: 'read-only', canDispatch: false,
       resourceSets: { read: ['target.snapshot.read'], write: [], exclusive: [] },
       schema: 'outcome.schema.json',
     },
     {
-      logicalRole: 'worker', limit: 2, rolloutLimit: 24_001, rolloutReminder: 12_000,
+      logicalRole: 'worker', limit: 2,
       physicalRole: 'autoprompt.v2.worker', providerRole: 'ap-worker',
       sandboxMode: 'workspace-write',
       schema: 'role-report.schema.json',
@@ -13551,17 +15986,20 @@ test('external Codex transport mechanically stops route, checker, and worker too
       },
       environment: {}, sessionId: `tool-limit-${scenario.logicalRole}`,
       reservationId: `tool-limit-reservation-${scenario.logicalRole}`,
+      ...(scenario.limit > 0 ? { providerToolCallLimit: scenario.limit } : {}),
     }), error => error.code === 'CHILD_TOOL_CALL_LIMIT_EXHAUSTED' &&
       error.details.limit === scenario.limit &&
       error.details.attemptedCount === scenario.limit + 1)
     assert.equal(stopReason, 'CHILD_TOOL_CALL_LIMIT_EXHAUSTED')
     assert.equal(launchedArgv.includes('tool_output_token_limit=1000'), true)
     assert.equal(launchedArgv.includes('mcp_servers={}'), true)
-    assert.equal(launchedArgv.includes(
-      `features.rollout_budget={enabled=true,limit_tokens=${scenario.rolloutLimit},` +
-      `reminder_at_remaining_tokens=[${scenario.rolloutReminder}],sampling_token_weight=1.0,` +
-      'prefill_token_weight=1.0}',
-    ), true)
+    const rolloutConfig = scenario.rolloutLimit
+      ? `features.rollout_budget={enabled=true,limit_tokens=${scenario.rolloutLimit},` +
+        `reminder_at_remaining_tokens=[${scenario.rolloutReminder}],sampling_token_weight=1.0,` +
+        'prefill_token_weight=1.0}'
+      : null
+    if (rolloutConfig) assert.equal(launchedArgv.includes(rolloutConfig), true)
+    else assert.equal(launchedArgv.some(value => value.startsWith('features.rollout_budget=')), false)
     for (const config of [
       'include_permissions_instructions=false',
       'include_apps_instructions=false',
@@ -13656,6 +16094,7 @@ test('external Codex tool ceiling counts completion-only tool events once', asyn
     },
     environment: {}, sessionId: 'completion-only-tool-limit',
     reservationId: 'completion-only-tool-limit-reservation',
+    providerToolCallLimit: 2,
   }), error => error.code === 'CHILD_TOOL_CALL_LIMIT_EXHAUSTED' &&
     error.details.limit === 2 && error.details.attemptedCount === 3 &&
     error.details.observedPhase === 'completed')
@@ -13701,6 +16140,7 @@ test('crash-resumed Codex tool ceiling includes the predecessor high-water', asy
     reservationId: 'resumed-tool-high-water-reservation',
     continuationId,
     priorToolCallCount: 2,
+    providerToolCallLimit: 2,
     onToolCallObserved: evidence => observed.push(evidence),
   }), error => error.code === 'CHILD_TOOL_CALL_LIMIT_EXHAUSTED' &&
     error.details.limit === 2 && error.details.attemptedCount === 3)
@@ -13767,6 +16207,7 @@ test('external Codex tool ceiling counts failed-only events and sequential reuse
       },
       environment: {}, sessionId: `tool-lifecycle-${scenario.id}`,
       reservationId: `tool-lifecycle-${scenario.id}-reservation`,
+      providerToolCallLimit: 2,
     }), error => error.code === 'CHILD_TOOL_CALL_LIMIT_EXHAUSTED' &&
       error.details.limit === 2 && error.details.attemptedCount === 3)
     assert.equal(stopReason, 'CHILD_TOOL_CALL_LIMIT_EXHAUSTED')
@@ -13912,6 +16353,7 @@ test('external Codex transport accounts then rejects a child above its reported 
     ...adapterMissionFields('hash', 'token-limit-worker'),
     dispatch: { brief: 'Do bounded work.', requestPointer: { path: 'request', hash: 'hash' } },
     environment: {}, sessionId: 'token-limit-worker', reservationId: 'token-limit-reservation',
+    finiteTokenBudget: true, acceptedTokenLimit: 24_000, providerTokenLimit: 24_000,
     onUsageDelta(delta, cumulative) {
       accounted = { delta, cumulative }
       return { continue: true }
@@ -13925,12 +16367,91 @@ test('external Codex transport accounts then rejects a child above its reported 
   assert.equal(terminalPersisted, false)
 })
 
+test('default required Codex work can exceed 24k tokens and two tools without an Autoprompt stop', async () => {
+  const stopReasons = []
+  let terminalPersisted = false
+  const observedTools = []
+  const runner = {
+    async run(spec) {
+      spec.onStdoutLine(JSON.stringify({
+        type: 'thread.started', thread_id: 'unbounded-required-worker',
+      }))
+      for (let index = 1; index <= 5; index += 1) {
+        const item = {
+          id: `unbounded-tool-${index}`, type: 'command_execution',
+          command: 'true', status: 'completed', exit_code: 0, aggregated_output: '',
+        }
+        spec.onStdoutLine(JSON.stringify({
+          type: 'item.started', item: { ...item, status: 'in_progress' },
+        }))
+        spec.onStdoutLine(JSON.stringify({ type: 'item.completed', item }))
+      }
+      spec.onStdoutLine(JSON.stringify({
+        type: 'item.completed',
+        item: {
+          type: 'agent_message',
+          text: JSON.stringify(adapterWorkerResult({
+            reportId: 'unbounded-required-result',
+            assignmentId: 'unbounded-required-worker',
+          })),
+        },
+      }))
+      spec.onStdoutLine(JSON.stringify({
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 24_001, cached_input_tokens: 0,
+          output_tokens: 5, reasoning_output_tokens: 5,
+        },
+      }))
+      return {
+        status: 0, stdout: '', stderr: '', processOwned: true,
+        exactArgv: true, drained: true,
+      }
+    },
+    async stop(spec) { stopReasons.push(spec.reason); return { drained: true } },
+  }
+  const adapter = new CodexExecAdapter({
+    runner, targetPath: ROOT,
+    profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+    outputSchemaResolver: () => path.join(
+      ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json',
+    ),
+  })
+  const result = await adapter.launch({
+    ...WORKER_EXECUTION_POLICY,
+    physicalExecutionPolicy: WORKER_EXECUTION_POLICY,
+    ...adapterMissionFields('hash', 'unbounded-required-worker'),
+    dispatch: {
+      brief: 'Complete required work without a hidden controller quota.',
+      requestPointer: { path: 'request', hash: 'hash' },
+    },
+    canonicalAssignment: canonicalWorkerAssignment('unbounded-required-worker'),
+    environment: {}, sessionId: 'unbounded-required-worker',
+    onUsageDelta() { return { continue: true } },
+    onToolCallObserved(evidence) { observedTools.push(evidence) },
+    onTerminalResult() { terminalPersisted = true },
+  })
+  assert.equal(result.reportType, 'result')
+  assert.equal(result.assignmentId, 'unbounded-required-worker')
+  assert.equal(observedTools.length, 5)
+  assert.equal(terminalPersisted, true)
+  assert.equal(stopReasons.includes('CHILD_TOKEN_LIMIT_EXHAUSTED'), false)
+  assert.equal(stopReasons.includes('CHILD_TOOL_CALL_LIMIT_EXHAUSTED'), false)
+})
+
 test('external Codex stops immediately on native-budget and unknown-usage provider failures', async t => {
   for (const scenario of [
     {
-      id: 'native-budget',
+      id: 'explicit-native-budget',
       event: { type: 'turn.failed', error: { message: 'Session budget exceeded' } },
       code: 'CHILD_ROLLOUT_BUDGET_EXHAUSTED',
+      finiteTokenBudget: true,
+    },
+    {
+      id: 'default-provider-budget-message',
+      event: { type: 'turn.failed', error: { message: 'Session budget exceeded' } },
+      code: 'CODEX_USAGE_UNKNOWN_AFTER_START',
+      finiteTokenBudget: false,
     },
     {
       id: 'provider-error',
@@ -13943,8 +16464,10 @@ test('external Codex stops immediately on native-budget and unknown-usage provid
       let emitted = 0
       let stopReason = null
       let usageCallbacks = 0
+      let launchedArgv = null
       const runner = {
         async run(spec) {
+          launchedArgv = spec.argv
           modelRuns += 1
           spec.onStdoutLine(JSON.stringify({
             type: 'thread.started', thread_id: `failure-${scenario.id}`,
@@ -13983,12 +16506,21 @@ test('external Codex stops immediately on native-budget and unknown-usage provid
         },
         environment: {}, sessionId: `failure-${scenario.id}`,
         reservationId: `failure-${scenario.id}-reservation`,
+        ...(scenario.finiteTokenBudget === true ? {
+          finiteTokenBudget: true,
+          acceptedTokenLimit: 24_000,
+          providerTokenLimit: 24_000,
+        } : {}),
         onUsageDelta() { usageCallbacks += 1; return { continue: true } },
       }), error => error.code === scenario.code)
       assert.equal(stopReason, scenario.code)
       assert.equal(modelRuns, 1)
       assert.equal(emitted, 2, 'the first failure event stops later paid work immediately')
       assert.equal(usageCallbacks, 0, 'unknown usage is never fabricated or compatibility-filled')
+      assert.equal(
+        launchedArgv.some(value => value.startsWith('features.rollout_budget=')),
+        scenario.finiteTokenBudget === true,
+      )
     })
   }
 })
@@ -15798,6 +18330,12 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
     return absolute
   }
   harness.record.write = (relative, bytes) => {
+    if (options.exhaustedTransportAdmissionFailure &&
+        relative.startsWith('work/results/mutation-admission-')) {
+      throw Object.assign(new Error('injected exhausted-successor admission persistence failure'), {
+        code: options.exhaustedTransportAdmissionFailure,
+      })
+    }
     const destination = harness.record.resolve(relative)
     fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 })
     fs.writeFileSync(destination, bytes)
@@ -15871,6 +18409,19 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
       return { accepted: [0, 3].includes(repair.status) && parsed && parsed.repositoryOk === true }
     },
   })
+  if (options.workerQuarantineFailure) {
+    const quarantine = workspaceManager.quarantine.bind(workspaceManager)
+    let injectedQuarantineFailures = 0
+    workspaceManager.quarantine = (...args) => {
+      if (injectedQuarantineFailures < 2) {
+        injectedQuarantineFailures += 1
+        throw Object.assign(new Error('injected worker quarantine persistence failure'), {
+          code: options.workerQuarantineFailure,
+        })
+      }
+      return quarantine(...args)
+    }
+  }
   harness.runtimeOptions.workerWorkspaceFactory = ({ assignment, workItemId, transportQuarantine }) =>
     transportQuarantine
       ? workspaceManager.prepareFromQuarantine({
@@ -15937,6 +18488,31 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
   let productCheckIndex = 0
   let firstWorkerTransportFailed = false
   let repairTransportFailed = false
+  const accountUnknownProviderResponse = launch => {
+    const maximumUnaccountedTokens = options.unknownProviderResponseBound || 200_000
+    launch.onProviderRequestStarted({
+      tokenLimit: launch.providerTokenLimit,
+      maximumUnaccountedTokens,
+      requestOrdinal: 1,
+      completedRequestCount: 0,
+      accountedUsage: ZERO_USAGE,
+      priorLeaseModelTokens: 0,
+    })
+    const receipt = launch.onUnknownProviderSpend({
+      tokenLimit: launch.providerTokenLimit,
+      maximumUnaccountedTokens,
+      providerRequestCount: 1,
+      completedRequestCount: 0,
+      requestOrdinal: 1,
+      accountedUsage: ZERO_USAGE,
+      relayFailure: {
+        code: 'CODEX_USAGE_INCOMPLETE',
+        message: 'fixture provider response lost terminal usage',
+      },
+    })
+    assert.equal(receipt.accountingClass, 'UNKNOWN_PROVIDER_SPEND_UPPER_BOUND')
+    assert.equal(receipt.chargedTokens, maximumUnaccountedTokens)
+  }
   harness.runtimeOptions.launcher = async launch => {
     harness.launches.push(launch)
     if (launch.logicalRole === 'diagnostic-probe') return representativeProbeResult(launch)
@@ -15949,9 +18525,15 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
           options.transportPartialBeforeFailure,
         )
       }
-      launch.onUsageDelta(ZERO_USAGE)
+      if (options.unknownProviderSpendOnFirstWorker === true) {
+        accountUnknownProviderResponse(launch)
+      } else {
+        launch.onUsageDelta(ZERO_USAGE)
+      }
       throw Object.assign(new Error('the first product provider transport timed out'), {
-        code: options.transportFailureCode || 'CHILD_TRANSPORT_TIMEOUT',
+        code: options.unknownProviderSpendOnFirstWorker === true
+          ? 'CODEX_USAGE_UNKNOWN_AFTER_START'
+          : options.transportFailureCode || 'CHILD_TRANSPORT_TIMEOUT',
       })
     }
     if (options.transportFailureOnWorkerSuccessor === true &&
@@ -15962,9 +18544,15 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
           options.transportSuccessorPartialBeforeFailure,
         )
       }
-      launch.onUsageDelta(ZERO_USAGE)
+      if (options.unknownProviderSpendOnWorkerSuccessor === true) {
+        accountUnknownProviderResponse(launch)
+      } else {
+        launch.onUsageDelta(ZERO_USAGE)
+      }
       throw Object.assign(new Error('the product transport successor timed out'), {
-        code: options.transportFailureCode || 'CHILD_TRANSPORT_TIMEOUT',
+        code: options.unknownProviderSpendOnWorkerSuccessor === true
+          ? 'CODEX_USAGE_UNKNOWN_AFTER_START'
+          : options.transportFailureCode || 'CHILD_TRANSPORT_TIMEOUT',
       })
     }
     if (options.transportFailureOnRepairBase === true &&

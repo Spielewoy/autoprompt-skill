@@ -68,7 +68,7 @@ test('TRACE-004 finalizer rehashes deliverables and rejects stale activation', t
 
 test('TRACE-006 and TRACE-007 retain product-signal timing and separate topology counts', () => {
   const scheduler = new CentralScheduler({ route: 'DIRECT', runIdentity: { runId: 'run-trace', generation: 1 } })
-  const signal = scheduler.recordFirstProductSignal({ kind: 'RED', elapsedMs: 359999, evidenceHash: H('red') })
+  const signal = scheduler.recordFirstProductSignal({ kind: 'RED', elapsedMs: 299999, evidenceHash: H('red') })
   assert.equal(signal.withinCeiling, true)
   assert.deepEqual(scheduler.recordTopologyCounts({
     frozenSnapshot: { sessions: 18, attempts: 21 }, livePartial: { sessions: 23, attempts: 29 },

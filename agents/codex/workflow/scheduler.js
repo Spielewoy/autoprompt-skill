@@ -112,7 +112,7 @@ const PHASE_BUDGET_CONTRACT = deepFreeze({
 })
 const ADMISSION_COMPONENT_CEILINGS_MS = deepFreeze({
   bootstrap: 60 * 1000,
-  routeAnalyst: 2 * 60 * 1000,
+  routeAnalyst: 60 * 1000,
   routeDecision: 4 * 60 * 1000,
   lightPlanning: 5 * 60 * 1000,
   roadmapPlanning: 15 * 60 * 1000,
@@ -2032,8 +2032,15 @@ class CentralScheduler {
   dispose(reason = 'scheduler closed') {
     if (this._disposed) return
     this._disposed = true
-    const error = this._recordRejection(this._error('SCHEDULER_CLOSED', reason))
-    for (const item of this._queue.splice(0)) {
+    const queued = this._queue.splice(0)
+    // An orderly close with no queued admission is lifecycle bookkeeping, not
+    // rejected work. Recording it made every successful activation report one
+    // synthetic SCHEDULER_CLOSED rejection. Count the code only when closure
+    // actually denies queued callers.
+    const error = queued.length > 0
+      ? this._recordRejection(this._error('SCHEDULER_CLOSED', reason))
+      : null
+    for (const item of queued) {
       this._removeAbortHandler(item)
       item.reject(error)
     }

@@ -570,18 +570,279 @@ function validateCapabilityBinding(binding, expected) {
 }
 
 function hashFileStrict(filePath, fsImpl = fs) {
-  const item = fsImpl.lstatSync(filePath)
-  if (!item.isFile() || item.isSymbolicLink()) fail('PREIMAGE_UNSAFE', `deliverable is not a regular physical file: ${filePath}`)
-  return sha256(fsImpl.readFileSync(filePath))
+  return sha256(readFileStrict(filePath, fsImpl))
+}
+
+function readFileStrict(filePath, fsImpl = fs) {
+  return withStrictAnchoredManifestPath(filePath, fsImpl, (anchored) => {
+    const item = fsImpl.lstatSync(anchored)
+    if (!item.isFile() || item.isSymbolicLink() || Number(item.nlink) !== 1) {
+      fail('PREIMAGE_UNSAFE', `deliverable is not one regular physical file: ${filePath}`)
+    }
+    return readStableFileBytes(anchored, item, fsImpl, filePath)
+  })
+}
+
+function samePhysicalEntry(left, right) {
+  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino)
+}
+
+function sameStablePhysicalEntry(left, right) {
+  return Boolean(samePhysicalEntry(left, right) &&
+    left.mode === right.mode && Number(left.nlink) === Number(right.nlink) &&
+    left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs)
+}
+
+function strictDescriptorAnchorRoot(fsImpl) {
+  // `/dev/fd` and `/proc/self/fd` are descriptor namespaces on the POSIX
+  // platforms that expose them.  On native Windows those spellings are just
+  // ordinary drive-relative directories; accepting a look-alike directory
+  // there would turn the supposed descriptor anchor back into named-path
+  // traversal.  Windows must therefore fail closed until the runtime exposes
+  // a real handle-relative filesystem primitive.
+  if (process.platform === 'win32') return null
+  const candidates = process.platform === 'linux'
+    ? ['/proc/self/fd']
+    : ['/dev/fd', '/proc/self/fd']
+  return candidates.find(candidate => fsImpl.existsSync(candidate)) || null
+}
+
+function directoryDescriptorAnchor(descriptor, fsImpl) {
+  const root = strictDescriptorAnchorRoot(fsImpl)
+  if (!root || !Number.isInteger(fs.constants.O_DIRECTORY) ||
+      !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    fail('PREIMAGE_UNSAFE', 'safe directory hashing requires a no-follow descriptor anchor')
+  }
+  return path.join(root, String(descriptor))
+}
+
+function closeStrictDirectoryLineage(authority, fsImpl) {
+  if (!authority || !Array.isArray(authority.descriptors)) return
+  for (const item of [...authority.descriptors].reverse()) {
+    try { fsImpl.closeSync(item.descriptor) } catch {}
+  }
+}
+
+function openStrictDirectoryLineage(directory, fsImpl) {
+  const resolved = path.resolve(directory)
+  const root = path.parse(resolved).root
+  const parts = path.relative(root, resolved).split(path.sep).filter(Boolean)
+  if (!Number.isInteger(fs.constants.O_DIRECTORY) || !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    fail('PREIMAGE_UNSAFE', 'safe manifest hashing requires directory and no-follow descriptor support')
+  }
+  const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW
+  const descriptors = []
+  try {
+    const rootStat = fsImpl.lstatSync(root)
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      fail('PREIMAGE_UNSAFE', `absolute manifest path has an unsafe filesystem root: ${resolved}`)
+    }
+    const rootDescriptor = fsImpl.openSync(root, flags)
+    const openedRoot = fsImpl.fstatSync(rootDescriptor)
+    if (!openedRoot.isDirectory() || !samePhysicalEntry(rootStat, openedRoot)) {
+      fsImpl.closeSync(rootDescriptor)
+      fail('PREIMAGE_UNSAFE', `absolute manifest filesystem root changed while it was opened: ${resolved}`)
+    }
+    descriptors.push(Object.freeze({
+      descriptor: rootDescriptor,
+      name: root,
+      dev: String(openedRoot.dev),
+      ino: String(openedRoot.ino),
+    }))
+    for (const part of parts) {
+      const parent = descriptors.at(-1)
+      const nextPath = path.join(directoryDescriptorAnchor(parent.descriptor, fsImpl), part)
+      const stat = fsImpl.lstatSync(nextPath)
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        fail('PREIMAGE_UNSAFE', `absolute manifest path traverses a linked or non-directory component: ${resolved}`)
+      }
+      const descriptor = fsImpl.openSync(nextPath, flags)
+      const opened = fsImpl.fstatSync(descriptor)
+      if (!opened.isDirectory() || !samePhysicalEntry(stat, opened)) {
+        fsImpl.closeSync(descriptor)
+        fail('PREIMAGE_UNSAFE', `absolute manifest directory lineage changed while it was opened: ${resolved}`)
+      }
+      descriptors.push(Object.freeze({
+        descriptor,
+        name: part,
+        dev: String(opened.dev),
+        ino: String(opened.ino),
+      }))
+    }
+    return Object.freeze({
+      directory: resolved,
+      descriptors: Object.freeze(descriptors),
+      lineage: Object.freeze(descriptors.map(item => Object.freeze({
+        name: item.name, dev: item.dev, ino: item.ino,
+      }))),
+    })
+  } catch (error) {
+    closeStrictDirectoryLineage({ descriptors }, fsImpl)
+    if (error instanceof RuntimeStateError) throw error
+    fail('PREIMAGE_UNSAFE', `absolute manifest path traverses a missing, linked, or unstable directory: ${resolved}`, {
+      cause: error && (error.code || error.message),
+    })
+  }
+}
+
+function verifyStrictDirectoryLineage(authority, fsImpl) {
+  for (const item of authority.descriptors) {
+    let opened
+    try { opened = fsImpl.fstatSync(item.descriptor) } catch (error) {
+      fail('PREIMAGE_UNSAFE', `absolute manifest directory lineage became unavailable: ${authority.directory}`, {
+        cause: error && (error.code || error.message),
+      })
+    }
+    if (!opened.isDirectory() || String(opened.dev) !== item.dev || String(opened.ino) !== item.ino) {
+      fail('PREIMAGE_UNSAFE', `absolute manifest directory lineage changed during use: ${authority.directory}`)
+    }
+  }
+  const reopened = openStrictDirectoryLineage(authority.directory, fsImpl)
+  try {
+    if (stableStringify(reopened.lineage) !== stableStringify(authority.lineage)) {
+      fail('PREIMAGE_UNSAFE', `absolute manifest directory lineage changed during use: ${authority.directory}`)
+    }
+  } finally {
+    closeStrictDirectoryLineage(reopened, fsImpl)
+  }
+}
+
+function withStrictAnchoredManifestPath(absolute, fsImpl, operation) {
+  const resolved = path.resolve(absolute)
+  if (!strictDescriptorAnchorRoot(fsImpl) || !Number.isInteger(fs.constants.O_DIRECTORY) ||
+      !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    fail(
+      'PREIMAGE_UNSAFE',
+      `safe absolute path use requires a no-follow descriptor anchor: ${resolved}`,
+    )
+  }
+  const root = path.parse(resolved).root
+  const isRoot = resolved === root
+  const authority = openStrictDirectoryLineage(isRoot ? root : path.dirname(resolved), fsImpl)
+  try {
+    const parentAnchor = directoryDescriptorAnchor(authority.descriptors.at(-1).descriptor, fsImpl)
+    const anchored = isRoot ? `${parentAnchor}${path.sep}.` : path.join(parentAnchor, path.basename(resolved))
+    const verify = () => verifyStrictDirectoryLineage(authority, fsImpl)
+    const parent = authority.descriptors.at(-1)
+    const result = operation(anchored, verify, Object.freeze({ dev: parent.dev, ino: parent.ino }))
+    verify()
+    return result
+  } finally {
+    closeStrictDirectoryLineage(authority, fsImpl)
+  }
+}
+
+function hashDirectoryStateStrict(directory, fsImpl = fs, expectedRootStat = null) {
+  return withStrictAnchoredManifestPath(directory, fsImpl, (anchoredDirectory) => {
+    const digest = crypto.createHash('sha256')
+    const anchoredRootStat = fsImpl.lstatSync(anchoredDirectory)
+    const rootStat = expectedRootStat || anchoredRootStat
+    if (!rootStat || !anchoredRootStat.isDirectory() || anchoredRootStat.isSymbolicLink() ||
+        !sameStablePhysicalEntry(rootStat, anchoredRootStat)) {
+      fail('PREIMAGE_UNSAFE', `deliverable directory is not one physical target: ${directory}`)
+    }
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW
+    let rootDescriptor
+    const visit = (descriptor, relative, displayedPath, opened) => {
+      const anchor = directoryDescriptorAnchor(descriptor, fsImpl)
+      const entries = fsImpl.readdirSync(anchor, { withFileTypes: true })
+        .sort((left, right) => left.name.localeCompare(right.name))
+      for (const entry of entries) {
+        const absolute = path.join(anchor, entry.name)
+        const name = relative ? `${relative}/${entry.name}` : entry.name
+        const stat = fsImpl.lstatSync(absolute)
+        if (!stat || stat.isSymbolicLink()) {
+          fail('PREIMAGE_UNSAFE', `deliverable directory contains a missing or linked entry: ${path.join(displayedPath, entry.name)}`)
+        }
+        if (stat.isDirectory()) {
+          let childDescriptor
+          try {
+            childDescriptor = fsImpl.openSync(absolute, flags)
+            const openedChild = fsImpl.fstatSync(childDescriptor)
+            if (!openedChild.isDirectory() || !sameStablePhysicalEntry(stat, openedChild)) {
+              fail('PREIMAGE_UNSAFE', `deliverable directory entry changed while it was opened: ${path.join(displayedPath, entry.name)}`)
+            }
+            digest.update(`directory\0${name}\0${openedChild.mode & 0o777}\0`)
+            visit(childDescriptor, name, path.join(displayedPath, entry.name), openedChild)
+          } finally {
+            if (childDescriptor !== undefined) fsImpl.closeSync(childDescriptor)
+          }
+        } else if (stat.isFile() && Number(stat.nlink) === 1) {
+          const hashInput = readStableFileBytes(absolute, stat, fsImpl, path.join(directory, ...name.split('/')))
+          digest.update(`file\0${name}\0${stat.mode & 0o777}\0${stat.size}\0`)
+          digest.update(hashInput)
+          digest.update('\0')
+        } else {
+          fail('PREIMAGE_UNSAFE', `deliverable directory contains an unsafe entry: ${path.join(displayedPath, entry.name)}`)
+        }
+      }
+      const after = fsImpl.fstatSync(descriptor)
+      const live = fsImpl.lstatSync(displayedPath)
+      if (!sameStablePhysicalEntry(opened, after) || !sameStablePhysicalEntry(after, live)) {
+        fail('PREIMAGE_UNSAFE', `deliverable directory changed while its exact tree was captured: ${displayedPath}`)
+      }
+    }
+    try {
+      rootDescriptor = fsImpl.openSync(anchoredDirectory, flags)
+      const openedRoot = fsImpl.fstatSync(rootDescriptor)
+      if (!openedRoot.isDirectory() || !sameStablePhysicalEntry(rootStat, openedRoot)) {
+        fail('PREIMAGE_UNSAFE', `deliverable directory changed while it was opened: ${directory}`)
+      }
+      visit(rootDescriptor, '', anchoredDirectory, openedRoot)
+      return digest.digest('hex')
+    } catch (error) {
+      if (error instanceof RuntimeStateError) throw error
+      fail('PREIMAGE_UNSAFE', `deliverable directory could not be captured without following links: ${directory}`, {
+        cause: error && (error.code || error.message),
+      })
+    } finally {
+      if (rootDescriptor !== undefined) fsImpl.closeSync(rootDescriptor)
+    }
+  })
+}
+
+function readStableFileBytes(filePath, expectedStat, fsImpl, displayedPath = filePath) {
+  let descriptor
+  try {
+    descriptor = fsImpl.openSync(
+      filePath,
+      fs.constants.O_RDONLY | Number(fs.constants.O_NOFOLLOW || 0),
+    )
+    const opened = fsImpl.fstatSync(descriptor)
+    if (!opened.isFile() || Number(opened.nlink) !== 1 ||
+        !sameStablePhysicalEntry(expectedStat, opened)) {
+      fail('PREIMAGE_UNSAFE', `deliverable file changed while it was opened: ${displayedPath}`)
+    }
+    const bytes = fsImpl.readFileSync(descriptor)
+    const after = fsImpl.fstatSync(descriptor)
+    const live = fsImpl.lstatSync(filePath)
+    if (!sameStablePhysicalEntry(opened, after) || !sameStablePhysicalEntry(after, live) ||
+        bytes.length !== after.size) {
+      fail('PREIMAGE_UNSAFE', `deliverable file changed while its exact bytes were captured: ${displayedPath}`)
+    }
+    return bytes
+  } finally {
+    if (descriptor !== undefined) fsImpl.closeSync(descriptor)
+  }
+}
+
+function hashManifestEntryStrict(entry, fsImpl = fs) {
+  return entry.type === 'directory'
+    ? hashDirectoryStateStrict(entry.path, fsImpl)
+    : hashFileStrict(entry.path, fsImpl)
 }
 
 function normalizeManifest(entries) {
   if (!Array.isArray(entries)) fail('MANIFEST_INVALID', 'deliverable manifest must be an array')
   const normalized = entries.map((entry) => {
-    if (!entry || typeof entry.path !== 'string' || !path.isAbsolute(entry.path) || !HASH_PATTERN.test(entry.hash || '')) {
-      fail('MANIFEST_INVALID', 'each deliverable requires an absolute path and sha256 hash')
+    if (!entry || typeof entry.path !== 'string' || !path.isAbsolute(entry.path) ||
+        !HASH_PATTERN.test(entry.hash || '') ||
+        (entry.type !== undefined && !['file', 'directory'].includes(entry.type))) {
+      fail('MANIFEST_INVALID', 'each deliverable requires an absolute path, sha256 hash, and optional file/directory type')
     }
-    return { path: path.resolve(entry.path), hash: entry.hash }
+    return entry.type === 'directory'
+      ? { path: path.resolve(entry.path), hash: entry.hash, type: 'directory' }
+      : { path: path.resolve(entry.path), hash: entry.hash }
   }).sort((left, right) => left.path.localeCompare(right.path))
   for (let index = 1; index < normalized.length; index += 1) {
     if (normalized[index - 1].path === normalized[index].path) fail('MANIFEST_INVALID', 'deliverable paths must be unique')
@@ -720,7 +981,11 @@ class RuntimeStateStore {
     const eventPath = path.resolve(requireString(registered.eventPath, 'paths.eventPath'))
     const terminalPath = path.resolve(requireString(registered.terminalPath, 'paths.terminalPath'))
     const transactionPath = path.resolve(registered.transactionPath || `${statePath}.transaction`)
-    const paths = [statePath, eventPath, terminalPath, transactionPath]
+    const terminalFinalizationIntentPath = path.resolve(
+      registered.terminalFinalizationIntentPath ||
+        path.join(runRecordRoot, 'runtime', 'terminal-finalization-intent.json'),
+    )
+    const paths = [statePath, eventPath, terminalPath, transactionPath, terminalFinalizationIntentPath]
     for (const registeredPath of paths) {
       const relative = path.relative(runRecordRoot, registeredPath)
       if (!relative || path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`)) {
@@ -730,7 +995,14 @@ class RuntimeStateStore {
     if (new Set(paths).size !== paths.length || path.resolve(options.eventLog.logPath) !== eventPath) {
       fail('STATE_STORE_CONFIG_INVALID', 'state, event, and terminal paths must be distinct and event-bound')
     }
-    this.registeredPaths = Object.freeze({ runRecordRoot, statePath, eventPath, terminalPath, transactionPath })
+    this.registeredPaths = Object.freeze({
+      runRecordRoot,
+      statePath,
+      eventPath,
+      terminalPath,
+      transactionPath,
+      terminalFinalizationIntentPath,
+    })
     this.statePath = statePath
     this.eventLog = options.eventLog
     this.capabilityVerifier = options.capabilityVerifier
@@ -1063,7 +1335,7 @@ class RuntimeStateStore {
     if (current.activeMutation) fail('CONCURRENT_MUTATION', 'another authorized mutation is already active')
     const preimages = normalizeManifest(options.preimages || [])
     for (const entry of preimages) {
-      const actual = hashFileStrict(entry.path, this.fs)
+      const actual = hashManifestEntryStrict(entry, this.fs)
       if (actual !== entry.hash) {
         fail('CONCURRENT_MUTATION', `exact-version preimage changed: ${entry.path}`, { expected: entry.hash, actual })
       }
@@ -1145,7 +1417,7 @@ class RuntimeStateStore {
     }
     const postimages = normalizeManifest(options.postimages || [])
     for (const entry of postimages) {
-      const actual = hashFileStrict(entry.path, this.fs)
+      const actual = hashManifestEntryStrict(entry, this.fs)
       if (actual !== entry.hash) {
         fail('MUTATION_RESULT_MISMATCH', `exact-version result hash mismatch: ${entry.path}`, {
           expected: entry.hash,
@@ -1207,7 +1479,7 @@ class RuntimeStateStore {
     if (current.activeMutation) fail('MUTATION_INCOMPLETE', 'cannot finalize while a mutation permit is active')
     const manifest = normalizeManifest(options.deliverables || [])
     for (const entry of manifest) {
-      const actual = hashFileStrict(entry.path, this.fs)
+      const actual = hashManifestEntryStrict(entry, this.fs)
       if (actual !== entry.hash) fail('CONCURRENT_MUTATION', `deliverable changed during finalization: ${entry.path}`)
     }
     const completedAt = String(this.clock())
@@ -1277,7 +1549,7 @@ class RuntimeStateStore {
     }
     const manifest = normalizeManifest(options.deliverables || [])
     for (const entry of manifest) {
-      const actual = hashFileStrict(entry.path, this.fs)
+      const actual = hashManifestEntryStrict(entry, this.fs)
       if (actual !== entry.hash) fail('CONCURRENT_MUTATION', `deliverable changed during finalization: ${entry.path}`)
     }
     const completedAt = String(this.clock())
@@ -1368,7 +1640,7 @@ class RuntimeStateStore {
     }
     for (const entry of manifest) {
       let actual
-      try { actual = hashFileStrict(entry.path, this.fs) } catch {
+      try { actual = hashManifestEntryStrict(entry, this.fs) } catch {
         return { valid: false, reason: 'DELIVERABLE_MISSING_OR_UNSAFE', path: entry.path }
       }
       if (actual !== entry.hash) return { valid: false, reason: 'DELIVERABLE_HASH_CHANGED', path: entry.path }
@@ -1673,6 +1945,72 @@ class RuntimeStateStore {
         recoveryContext: normalizedRecovery,
       },
     })
+  }
+
+  adoptTerminalFinalizationIntent(options = {}) {
+    const current = this.load()
+    const intent = options.intent
+    if (current.state === 'RELEASING_LOCK' || FINAL_OUTCOMES.includes(current.state)) {
+      fail(
+        'RELEASE_RECONCILIATION_REQUIRED',
+        'a release or terminal state must use deterministic release reconciliation',
+      )
+    }
+    if (!Number.isSafeInteger(options.expectedGeneration) || options.expectedGeneration < 1 ||
+        current.activation.generation !== options.expectedGeneration) {
+      fail('GENERATION_CONFLICT', 'terminal-selection adoption requires the exact predecessor generation')
+    }
+    if (!intent || typeof intent !== 'object' ||
+        intent.runId !== current.runId || intent.activationId !== current.activation.id ||
+        !Number.isSafeInteger(intent.generation) || intent.generation < 1 ||
+        intent.generation > current.activation.generation ||
+        intent.missionHash !== current.activation.missionHash ||
+        intent.requestEnvelopeHash !== current.requestEnvelopeHash ||
+        intent.workspaceEpoch !== current.workspaceEpoch ||
+        !FINAL_OUTCOMES.includes(intent.outcome) ||
+        ![null, 'DIRECT', 'LIGHT', 'ROADMAP'].includes(intent.route) ||
+        !Array.isArray(intent.deliverableManifest) || !Array.isArray(intent.checkHashes) ||
+        typeof intent.reason !== 'string' || !intent.reason) {
+      fail(
+        'TERMINAL_FINALIZATION_INTENT_MISMATCH',
+        'terminal-selection adoption does not bind the exact persisted runtime generation and workspace',
+      )
+    }
+    const binding = this._authorize(
+      options.capability,
+      'adopt immutable terminal selection',
+      capabilityExpectation(current, current.activation.generation + 1),
+    )
+    const priorOwner = this._crashPriorOwner(binding.takeover, current)
+    if (priorOwner.processesDrained !== true ||
+        !HASH_PATTERN.test(priorOwner.staleOwnerEvidenceHash || '') ||
+        !HASH_PATTERN.test(priorOwner.processDrainEvidenceHash || '')) {
+      fail(
+        'CRASH_OWNER_UNVERIFIED',
+        'terminal-selection adoption lacks exact predecessor death and descendant-drain evidence',
+      )
+    }
+    const unsigned = { ...current }
+    delete unsigned.checksum
+    const next = canonicalize({
+      ...unsigned,
+      activation: {
+        ...current.activation,
+        generation: current.activation.generation + 1,
+        status: 'TERMINAL_REPLAY',
+      },
+    })
+    const written = this._write(next)
+    const unchangedFields = Object.keys(unsigned).filter(field => field !== 'activation')
+    if (unchangedFields.some(field => stableStringify(written[field]) !== stableStringify(current[field])) ||
+        written.state !== current.state || written.sequence !== current.sequence ||
+        written.lastEventHash !== current.lastEventHash) {
+      fail(
+        'RUN_RECORD_FAILURE',
+        'terminal-selection adoption changed canonical work, next ready work, terminal, or event authority',
+      )
+    }
+    return written
   }
 
   adoptReleaseReconciliation(options = {}) {
@@ -2041,7 +2379,12 @@ module.exports = {
   STATES,
   STATE_SCHEMA_VERSION,
   TERMINAL_STATES,
+  hashDirectoryStateStrict,
   hashFileStrict,
+  hashManifestEntryStrict,
+  readFileStrict,
+  directoryDescriptorAnchor,
+  withStrictAnchoredManifestPath,
   capabilityExpectation,
   isLegalTransition,
   createEvidenceInvalidationGraph,

@@ -5,16 +5,26 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 const {
-  atomicCreateJson,
   atomicWriteJson,
+  canonicalize,
+  checksumRecord,
   fsyncDirectory,
   readChecksummedJson,
   sha256,
   stableStringify,
 } = require('./event-log.js')
-const { FINAL_OUTCOMES, hashFileStrict, isLegalTransition, normalizeManifest } = require('./runtime-state.js')
+const {
+  FINAL_OUTCOMES,
+  directoryDescriptorAnchor,
+  hashManifestEntryStrict,
+  isLegalTransition,
+  normalizeManifest,
+  readFileStrict,
+  withStrictAnchoredManifestPath,
+} = require('./runtime-state.js')
+const { createTerminalFinalizationIntentAuthority } = require('./run-record.js')
 
-const CLEANUP_SCHEMA_VERSION = 3
+const CLEANUP_SCHEMA_VERSION = 4
 
 class FinalizerError extends Error {
   constructor(code, message, details = {}) {
@@ -32,6 +42,21 @@ function fail(code, message, details) {
 function isWithin(root, candidate) {
   const relative = path.relative(root, candidate)
   return relative !== '' && !path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`)
+}
+
+function cleanupTargetIdentity(item, target) {
+  const type = item && item.isDirectory()
+    ? 'directory'
+    : item && item.isFile() ? 'file' : null
+  if (!type || item.isSymbolicLink()) {
+    fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup target is linked or not a regular filesystem entry: ${target}`)
+  }
+  return Object.freeze({ type, dev: String(item.dev), ino: String(item.ino) })
+}
+
+function sameCleanupTargetIdentity(expected, actual) {
+  return Boolean(expected && actual && expected.type === actual.type &&
+    expected.dev === actual.dev && expected.ino === actual.ino)
 }
 
 class CleanupRegistry {
@@ -60,7 +85,10 @@ class CleanupRegistry {
     this.allowedRoots = options.allowedRoots.map((root) => path.resolve(root))
     this.fs = options.fsImpl || fs
     this.clock = options.clock || (() => new Date().toISOString())
-    this.cleanup = options.cleanup || ((entry) => this.fs.rmSync(entry.path, { recursive: true, force: false }))
+    if (options.cleanup !== undefined && typeof options.cleanup !== 'function') {
+      fail('CLEANUP_CONFIG_INVALID', 'cleanup override must be a function')
+    }
+    this.cleanup = options.cleanup || null
     this.randomId = options.randomId || (() => crypto.randomUUID())
   }
 
@@ -72,6 +100,10 @@ class CleanupRegistry {
     if (!this.allowedRoots.some((root) => isWithin(root, target))) {
       fail('CLEANUP_ENTRY_UNSAFE', `scratch path is outside registered cleanup roots: ${target}`)
     }
+    const identities = this._withCleanupTarget(target, (anchoredTarget, _verify, parentIdentity) => ({
+      parentIdentity,
+      targetIdentity: cleanupTargetIdentity(this.fs.lstatSync(anchoredTarget), target),
+    }))
     const registry = this.load()
     if (registry.entries.some((item) => item.path === target && item.status !== 'CLEANED')) {
       fail('CLEANUP_ENTRY_DUPLICATE', `scratch path is already registered: ${target}`)
@@ -84,6 +116,8 @@ class CleanupRegistry {
       registeredAt: String(this.clock()),
       status: 'REGISTERED',
       cleanedAt: null,
+      parentIdentity: identities.parentIdentity,
+      targetIdentity: identities.targetIdentity,
     })
     this._write(registry)
     return registry.entries.at(-1)
@@ -109,6 +143,17 @@ class CleanupRegistry {
         !Number.isSafeInteger(registry.sequence) || registry.sequence < 1) {
       fail('CLEANUP_REGISTRY_FAILURE', 'cleanup registry schema is invalid')
     }
+    if (registry.entries.some((entry) => !entry || typeof entry !== 'object' ||
+        typeof entry.id !== 'string' || !entry.id || typeof entry.path !== 'string' ||
+        !path.isAbsolute(entry.path) || path.resolve(entry.path) !== entry.path ||
+        !['REGISTERED', 'CLEANED'].includes(entry.status) ||
+        !entry.parentIdentity || typeof entry.parentIdentity.dev !== 'string' || !entry.parentIdentity.dev ||
+        typeof entry.parentIdentity.ino !== 'string' || !entry.parentIdentity.ino ||
+        !entry.targetIdentity || !['directory', 'file'].includes(entry.targetIdentity.type) ||
+        typeof entry.targetIdentity.dev !== 'string' || !entry.targetIdentity.dev ||
+        typeof entry.targetIdentity.ino !== 'string' || !entry.targetIdentity.ino)) {
+      fail('CLEANUP_REGISTRY_FAILURE', 'cleanup registry entries are invalid')
+    }
     const currentBinding = registry.activationId === this.controlBinding.activationId &&
       registry.generationId === this.controlBinding.generationId
     const authorizedPredecessor = registry.activationId === this.controlBinding.activationId &&
@@ -129,12 +174,148 @@ class CleanupRegistry {
       if (!this.allowedRoots.some((root) => isWithin(root, target))) {
         fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup path is no longer safe: ${target}`)
       }
-      if (this.fs.existsSync(target)) this.cleanup(entry)
+      this._withCleanupTarget(target, (anchoredTarget, _verify, parentIdentity) => {
+        if (parentIdentity.dev !== entry.parentIdentity.dev || parentIdentity.ino !== entry.parentIdentity.ino) {
+          fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup parent changed physical identity: ${target}`)
+        }
+        let item
+        try { item = this.fs.lstatSync(anchoredTarget) } catch (error) {
+          if (error && error.code === 'ENOENT') return
+          throw error
+        }
+        const liveIdentity = cleanupTargetIdentity(item, target)
+        if (!sameCleanupTargetIdentity(entry.targetIdentity, liveIdentity)) {
+          fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup target changed physical identity: ${target}`)
+        }
+        if (this.cleanup) {
+          this.cleanup(Object.freeze({ ...entry, path: anchoredTarget, registeredPath: target }))
+        } else {
+          this._removeOwnedTarget(anchoredTarget, target, entry.targetIdentity)
+        }
+        try {
+          this.fs.lstatSync(anchoredTarget)
+          fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup target still exists after cleanup: ${target}`)
+        } catch (error) {
+          if (error instanceof FinalizerError) throw error
+          if (!error || error.code !== 'ENOENT') throw error
+        }
+        fsyncDirectory(path.dirname(anchoredTarget), this.fs)
+      })
       entry.status = 'CLEANED'
       entry.cleanedAt = String(this.clock())
       this._write(registry)
     }
     return pending.map((entry) => ({ ...entry }))
+  }
+
+  _withCleanupTarget(target, operation) {
+    try {
+      return withStrictAnchoredManifestPath(target, this.fs, operation)
+    } catch (error) {
+      if (error instanceof FinalizerError) throw error
+      fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup target cannot be used through a stable physical parent: ${target}`, {
+        cause: error && (error.code || error.message),
+      })
+    }
+  }
+
+  _removeOwnedTarget(anchoredTarget, registeredPath, expectedIdentity) {
+    if (expectedIdentity.type === 'file') {
+      this._removeOwnedFile(anchoredTarget, registeredPath, expectedIdentity)
+      return
+    }
+    this._removeOwnedDirectory(anchoredTarget, registeredPath, expectedIdentity)
+  }
+
+  _removeOwnedFile(anchoredFile, registeredPath, expectedIdentity) {
+    let descriptor
+    try {
+      const initial = this.fs.lstatSync(anchoredFile)
+      const initialIdentity = cleanupTargetIdentity(initial, registeredPath)
+      if (initialIdentity.type !== 'file' || !sameCleanupTargetIdentity(expectedIdentity, initialIdentity)) {
+        fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup file changed physical identity: ${registeredPath}`)
+      }
+      descriptor = this.fs.openSync(
+        anchoredFile,
+        fs.constants.O_RDONLY | Number(fs.constants.O_NOFOLLOW || 0),
+      )
+      const openedIdentity = cleanupTargetIdentity(this.fs.fstatSync(descriptor), registeredPath)
+      if (!sameCleanupTargetIdentity(expectedIdentity, openedIdentity)) {
+        fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup file changed while it was opened: ${registeredPath}`)
+      }
+      this.fs.closeSync(descriptor)
+      descriptor = undefined
+      const liveIdentity = cleanupTargetIdentity(this.fs.lstatSync(anchoredFile), registeredPath)
+      if (!sameCleanupTargetIdentity(expectedIdentity, liveIdentity)) {
+        fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup file changed before removal: ${registeredPath}`)
+      }
+      // This is deliberately non-recursive.  A last-instruction replacement
+      // can at worst make unlink fail or unlink one leaf; it cannot redirect a
+      // recursive remover into a foreign directory tree.
+      this.fs.unlinkSync(anchoredFile)
+    } finally {
+      if (descriptor !== undefined) this.fs.closeSync(descriptor)
+    }
+  }
+
+  _removeOwnedDirectory(anchoredDirectory, registeredPath, expectedIdentity) {
+    let descriptor
+    try {
+      const initial = this.fs.lstatSync(anchoredDirectory)
+      const initialIdentity = cleanupTargetIdentity(initial, registeredPath)
+      if (initialIdentity.type !== 'directory' ||
+          !sameCleanupTargetIdentity(expectedIdentity, initialIdentity)) {
+        fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup directory changed physical identity: ${registeredPath}`)
+      }
+      descriptor = this.fs.openSync(
+        anchoredDirectory,
+        fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+      )
+      const openedIdentity = cleanupTargetIdentity(this.fs.fstatSync(descriptor), registeredPath)
+      if (!sameCleanupTargetIdentity(expectedIdentity, openedIdentity)) {
+        fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup directory changed while it was opened: ${registeredPath}`)
+      }
+      this._removeOwnedDirectoryContents(descriptor, registeredPath)
+      const afterIdentity = cleanupTargetIdentity(this.fs.fstatSync(descriptor), registeredPath)
+      if (!sameCleanupTargetIdentity(expectedIdentity, afterIdentity)) {
+        fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup directory changed during removal: ${registeredPath}`)
+      }
+      const liveIdentity = cleanupTargetIdentity(this.fs.lstatSync(anchoredDirectory), registeredPath)
+      if (!sameCleanupTargetIdentity(expectedIdentity, liveIdentity)) {
+        fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup directory changed before removal: ${registeredPath}`)
+      }
+      // Never delegate an attacker-mutable basename to a recursive remover.
+      // All recursion above is descriptor-relative; this final named operation
+      // is non-recursive and cannot consume a replacement directory's bytes.
+      this.fs.rmdirSync(anchoredDirectory)
+    } finally {
+      if (descriptor !== undefined) this.fs.closeSync(descriptor)
+    }
+  }
+
+  _removeOwnedDirectoryContents(descriptor, registeredPath) {
+    const anchor = directoryDescriptorAnchor(descriptor, this.fs)
+    const names = this.fs.readdirSync(anchor).sort((left, right) => left.localeCompare(right))
+    for (const name of names) {
+      if (typeof name !== 'string' || !name || name === '.' || name === '..' || path.basename(name) !== name) {
+        fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup directory returned an unsafe child name: ${registeredPath}`)
+      }
+      const anchoredChild = path.join(anchor, name)
+      const displayedChild = path.join(registeredPath, name)
+      const initial = this.fs.lstatSync(anchoredChild)
+      if (initial.isSymbolicLink()) {
+        fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup directory contains a linked child: ${displayedChild}`)
+      }
+      const identity = cleanupTargetIdentity(initial, displayedChild)
+      if (identity.type === 'directory') {
+        this._removeOwnedDirectory(anchoredChild, displayedChild, identity)
+      } else {
+        this._removeOwnedFile(anchoredChild, displayedChild, identity)
+      }
+    }
+    if (this.fs.readdirSync(anchor).length !== 0) {
+      fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup directory changed while it was emptied: ${registeredPath}`)
+    }
   }
 
   _write(registry) {
@@ -183,6 +364,23 @@ class Finalizer {
     }
     this.cleanupRegistry = options.cleanupRegistry
     this.fs = options.fsImpl || fs
+    if (options.runRecord) {
+      if (typeof options.runRecord.runPath !== 'string' ||
+          path.resolve(options.runRecord.runPath) !== registered.runRecordRoot ||
+          typeof options.runRecord.createOrVerifyTerminalFinalizationIntent !== 'function' ||
+          typeof options.runRecord.readTerminalFinalizationIntent !== 'function') {
+        fail('FINALIZATION_INTENT_AUTHORITY_INVALID', 'finalizer runRecord is not the opened registered intent authority')
+      }
+      this.finalizationIntentAuthority = Object.freeze({
+        createOrVerify: input => options.runRecord.createOrVerifyTerminalFinalizationIntent(input),
+        read: () => options.runRecord.readTerminalFinalizationIntent(),
+      })
+    } else if (registered.terminalFinalizationIntentPath) {
+      this.finalizationIntentAuthority = createTerminalFinalizationIntentAuthority(
+        registered.runRecordRoot,
+        { fsImpl: this.fs },
+      )
+    } else this.finalizationIntentAuthority = null
     this.clock = options.clock || (() => new Date().toISOString())
     this.beforeBoundary = options.beforeBoundary || (() => {})
     this.completionBoundary = typeof options.completionBoundary === 'function'
@@ -196,14 +394,26 @@ class Finalizer {
     let state = this.stateStore.load()
     const manifest = normalizeManifest(options.deliverables || [])
     const checkHashes = Array.isArray(options.checkHashes) ? options.checkHashes : []
+    const finalizationReason = options.reason || 'deterministic finalization'
     this._assertDoneReadiness(options.outcome, manifest, checkHashes)
+    const finalResponseValidation = this._validateFinalResponse(
+      options.finalResponse === undefined ? null : options.finalResponse,
+      manifest,
+    )
+    if (!finalResponseValidation.valid) {
+      fail('FINAL_RESPONSE_INVALID', `structured final response is not authentic: ${finalResponseValidation.reason}`, {
+        ...finalResponseValidation,
+      })
+    }
+    const finalizationIntent = this._createOrVerifyFinalizationIntent(state, options, manifest, checkHashes)
+    this.beforeBoundary('terminal-finalization-intent-durable')
     let ownedIdentityEvidence = []
     const initialLease = this.missionLock.describe(this.capability)
     if (FINAL_OUTCOMES.includes(state.state) && initialLease.status === 'RELEASED') {
       const validation = this.validateTerminalRecord()
       if (!validation.valid) fail('TERMINAL_INVALID', `released finalization is inconsistent: ${validation.reason}`)
       this.missionLock.assertReleased(this.capability)
-      return { state, terminal: readChecksummedJson(this.terminalPath, { fsImpl: this.fs }) }
+      return { state, terminal: this._readTerminalRecord(), finalizationIntent }
     }
     if (initialLease.status === 'ACTIVE') this.missionLock.assertOwned(this.capability)
     else if (state.state !== 'RELEASING_LOCK') fail('FINALIZATION_DISAGREEMENT', 'released lease has no canonical pending terminal transition')
@@ -218,7 +428,7 @@ class Finalizer {
       this.missionLock.updateOwnedProcesses(this.capability, this.processOwner.ownershipIdentities())
       this.beforeBoundary('drain-processes')
       await this.processOwner.cancelAll({
-        reason: options.reason || 'deterministic finalization',
+        reason: finalizationReason,
         graceMs: options.graceMs,
         killMs: options.killMs,
         terminalStatus: options.outcome,
@@ -265,7 +475,7 @@ class Finalizer {
       this.beforeBoundary('release-intent-bind')
       state = this.stateStore.bindTerminal(options.outcome, {
         capability: this.capability,
-        cause: options.reason || 'canonical release intent projected to its deterministic terminal outcome',
+        cause: finalizationReason,
         deliverables: manifest,
         checkHashes: options.checkHashes || [],
         terminalEnvelope: options.terminalEnvelope || null,
@@ -277,7 +487,7 @@ class Finalizer {
       }
       state = this.stateStore.transition('FINALIZING', {
         capability: this.capability,
-        cause: options.reason || 'checks complete; drain and bind terminal result',
+        cause: finalizationReason,
         eventId: 'VERIFIED',
       })
     }
@@ -285,10 +495,11 @@ class Finalizer {
       this.beforeBoundary('release-intent')
       state = this.stateStore.bindTerminal(options.outcome, {
         capability: this.capability,
-        cause: options.reason || 'terminal result verified',
+        cause: finalizationReason,
         deliverables: manifest,
         checkHashes: options.checkHashes || [],
         terminalEnvelope: options.terminalEnvelope || null,
+        unblockPath: options.unblockPath || null,
       })
     }
     this._verifyManifest(manifest)
@@ -330,7 +541,7 @@ class Finalizer {
     if (state.state !== options.outcome || !finalAgreement.valid) {
       fail('FINALIZATION_DISAGREEMENT', `release completed without full terminal agreement: ${finalAgreement.reason || state.state}`)
     }
-    return { state, terminal: record }
+    return { state, terminal: record, finalizationIntent }
   }
 
   validateTerminalRecord() {
@@ -338,10 +549,46 @@ class Finalizer {
     const validation = this.stateStore.validateTerminal(state)
     if (!validation.valid) return validation
     let record
-    try { record = readChecksummedJson(this.terminalPath, { fsImpl: this.fs }) } catch (error) {
+    try { record = this._readTerminalRecord() } catch (error) {
       return { valid: false, reason: 'TERMINAL_RECORD_INVALID', cause: error.message }
     }
     const expected = state.terminal
+    if (this.finalizationIntentAuthority) {
+      let intent
+      try { intent = this.finalizationIntentAuthority.read() } catch (error) {
+        return { valid: false, reason: 'TERMINAL_FINALIZATION_INTENT_INVALID', cause: error.message }
+      }
+      if (intent.runId !== state.runId || intent.activationId !== state.activation.id ||
+          !Number.isSafeInteger(intent.generation) || intent.generation < 1 ||
+          intent.generation > expected.generation || intent.missionHash !== expected.missionHash ||
+          intent.requestEnvelopeHash !== expected.requestEnvelopeHash ||
+          intent.workspaceEpoch !== expected.workspaceEpoch || intent.outcome !== expected.outcome ||
+          stableStringify(intent.deliverableManifest) !== stableStringify(expected.deliverableManifest) ||
+          stableStringify(intent.terminalEnvelope) !==
+            stableStringify(expected.terminalEnvelope.payload.providerTerminal) ||
+          intent.reason !== expected.terminalEnvelope.cause.reason ||
+          intent.unblockPath !== expected.terminalEnvelope.cause.unblockPath) {
+        return { valid: false, reason: 'TERMINAL_FINALIZATION_INTENT_MISMATCH' }
+      }
+      const intentEvidenceHashes = [...new Set([
+        ...intent.deliverableManifest.map(entry => entry.hash),
+        ...intent.checkHashes,
+      ])].sort()
+      if (stableStringify(intentEvidenceHashes) !== stableStringify(expected.producedEvidenceHashes)) {
+        return { valid: false, reason: 'TERMINAL_FINALIZATION_EVIDENCE_MISMATCH' }
+      }
+      const finalResponseValidation = this._validateFinalResponse(
+        intent.finalResponse,
+        normalizeManifest(expected.deliverableManifest || []),
+      )
+      if (!finalResponseValidation.valid) {
+        return {
+          valid: false,
+          reason: 'TERMINAL_FINAL_RESPONSE_INVALID',
+          cause: finalResponseValidation.reason,
+        }
+      }
+    }
     if (state.activation && expected.activationId !== state.activation.id) {
       return { valid: false, reason: 'TERMINAL_ACTIVATION_STALE' }
     }
@@ -392,10 +639,114 @@ class Finalizer {
     }
   }
 
+  _createOrVerifyFinalizationIntent(state, options, manifest, checkHashes) {
+    if (!this.finalizationIntentAuthority) return null
+    const reason = options.reason || 'deterministic finalization'
+    const requested = {
+      runId: state.runId,
+      activationId: state.activation.id,
+      generation: state.activation.generation,
+      missionHash: state.activation.missionHash,
+      requestEnvelopeHash: state.requestEnvelopeHash,
+      workspaceEpoch: state.workspaceEpoch,
+      outcome: options.outcome,
+      route: options.route === undefined ? null : options.route,
+      reason,
+      deliverableManifest: manifest,
+      checkHashes,
+      terminalEnvelope: options.terminalEnvelope === undefined ? null : options.terminalEnvelope,
+      finalResponse: options.finalResponse === undefined ? null : options.finalResponse,
+      unblockPath: options.unblockPath || null,
+    }
+    try {
+      let existing = null
+      try { existing = this.finalizationIntentAuthority.read() } catch (error) {
+        if (!error || error.code !== 'TERMINAL_FINALIZATION_INTENT_REQUIRED') throw error
+      }
+      if (existing) {
+        const existingSelection = { ...existing }
+        delete existingSelection.schema
+        delete existingSelection.schemaVersion
+        delete existingSelection.intentHash
+        const selectedGeneration = existingSelection.generation
+        delete existingSelection.generation
+        const requestedSelection = { ...requested }
+        delete requestedSelection.generation
+        if (!Number.isSafeInteger(selectedGeneration) || selectedGeneration < 1 ||
+            selectedGeneration > requested.generation ||
+            stableStringify(existingSelection) !== stableStringify(requestedSelection)) {
+          fail('FINALIZATION_INTENT_CONFLICT', 'finalization conflicts with the durable immutable terminal intent')
+        }
+        return existing
+      }
+      return this.finalizationIntentAuthority.createOrVerify(requested)
+    } catch (error) {
+      if (error instanceof FinalizerError) throw error
+      if (error && error.code === 'TERMINAL_FINALIZATION_INTENT_CONFLICT') {
+        fail('FINALIZATION_INTENT_CONFLICT', 'finalization conflicts with the durable immutable terminal intent', {
+          cause: error.message,
+        })
+      }
+      fail('FINALIZATION_INTENT_INVALID', 'terminal finalization intent could not be created or verified', {
+        cause: error && error.message,
+      })
+    }
+  }
+
+  _validateFinalResponse(finalResponse, manifest) {
+    if (finalResponse === null) return { valid: true }
+    try {
+      if (!finalResponse || typeof finalResponse !== 'object' || Array.isArray(finalResponse)) {
+        return { valid: false, reason: 'FINAL_RESPONSE_NOT_OBJECT' }
+      }
+      const pointer = finalResponse.evidencePointer
+      if (!pointer || typeof pointer !== 'object' || Array.isArray(pointer) ||
+          pointer.name !== 'structured-final-response' ||
+          typeof pointer.path !== 'string' || !path.isAbsolute(pointer.path) ||
+          path.resolve(pointer.path) !== pointer.path ||
+          !/^[a-f0-9]{64}$/.test(pointer.hash || '') ||
+          !Number.isSafeInteger(pointer.bytes) || pointer.bytes < 1) {
+        return { valid: false, reason: 'FINAL_RESPONSE_POINTER_INVALID' }
+      }
+      const manifestEntry = manifest.find(entry => entry.path === pointer.path)
+      if (!manifestEntry || manifestEntry.type === 'directory' || manifestEntry.hash !== pointer.hash) {
+        return { valid: false, reason: 'FINAL_RESPONSE_POINTER_NOT_IN_MANIFEST' }
+      }
+      const strictHash = hashManifestEntryStrict(manifestEntry, this.fs)
+      if (strictHash !== pointer.hash) {
+        return { valid: false, reason: 'FINAL_RESPONSE_POINTER_HASH_CHANGED' }
+      }
+      const bytes = readFileStrict(pointer.path, this.fs)
+      if (bytes.length !== pointer.bytes || sha256(bytes) !== pointer.hash) {
+        return { valid: false, reason: 'FINAL_RESPONSE_POINTER_BYTES_CHANGED' }
+      }
+      let persisted
+      try { persisted = JSON.parse(bytes.toString('utf8')) } catch {
+        return { valid: false, reason: 'FINAL_RESPONSE_EVIDENCE_NOT_JSON' }
+      }
+      const { responseHash, evidencePointer: _discardedPointer, ...body } = finalResponse
+      if (!/^[a-f0-9]{64}$/.test(responseHash || '') ||
+          responseHash !== sha256(stableStringify(body))) {
+        return { valid: false, reason: 'FINAL_RESPONSE_HASH_INVALID' }
+      }
+      if (stableStringify(persisted) !== stableStringify({ ...body, responseHash })) {
+        return { valid: false, reason: 'FINAL_RESPONSE_EVIDENCE_MISMATCH' }
+      }
+      return { valid: true }
+    } catch (error) {
+      return {
+        valid: false,
+        reason: error && error.code === 'PREIMAGE_UNSAFE'
+          ? 'FINAL_RESPONSE_POINTER_UNSAFE' : 'FINAL_RESPONSE_AUTHENTICATION_FAILED',
+        cause: error && error.message,
+      }
+    }
+  }
+
   _verifyManifest(manifest) {
     for (const entry of manifest) {
       let actual
-      try { actual = hashFileStrict(entry.path, this.fs) } catch (error) {
+      try { actual = hashManifestEntryStrict(entry, this.fs) } catch (error) {
         fail('DELIVERABLE_UNSAFE', `cannot verify deliverable: ${entry.path}`, { cause: error.message })
       }
       if (actual !== entry.hash) {
@@ -409,10 +760,75 @@ class Finalizer {
     return manifestHash
   }
 
-  _createOrVerifyTerminal(record) {
-    if (this.fs.existsSync(this.terminalPath)) {
+  _withTerminalRecordAuthority(operation) {
+    try {
+      return withStrictAnchoredManifestPath(
+        this.terminalPath,
+        this.fs,
+        (anchoredTerminalPath, verifyLineage) => operation(anchoredTerminalPath, verifyLineage),
+      )
+    } catch (error) {
+      if (error instanceof FinalizerError) throw error
+      fail('TERMINAL_PATH_UNSAFE', 'registered terminal has a linked or unstable directory lineage', {
+        cause: error && (error.code || error.message),
+      })
+    }
+  }
+
+  _readTerminalRecordAt(terminalPath, verifyLineage) {
+    let descriptor
+    let bytes
+    try {
+      const initial = this.fs.lstatSync(terminalPath)
+      if (!initial.isFile() || initial.isSymbolicLink() || Number(initial.nlink) !== 1) {
+        fail('TERMINAL_RECORD_INVALID', 'registered terminal is not one immutable regular file')
+      }
+      descriptor = this.fs.openSync(
+        terminalPath,
+        fs.constants.O_RDONLY | Number(fs.constants.O_NOFOLLOW || 0),
+      )
+      const opened = this.fs.fstatSync(descriptor)
+      if (!opened.isFile() || Number(opened.nlink) !== 1 ||
+          opened.dev !== initial.dev || opened.ino !== initial.ino) {
+        fail('TERMINAL_RECORD_INVALID', 'registered terminal changed while it was opened')
+      }
+      verifyLineage()
+      bytes = this.fs.readFileSync(descriptor)
+      const after = this.fs.fstatSync(descriptor)
+      const live = this.fs.lstatSync(terminalPath)
+      if (after.dev !== opened.dev || after.ino !== opened.ino ||
+          live.dev !== after.dev || live.ino !== after.ino || bytes.length !== after.size) {
+        fail('TERMINAL_RECORD_INVALID', 'registered terminal changed while it was read')
+      }
+    } catch (error) {
+      if (error instanceof FinalizerError || (error && error.code === 'PREIMAGE_UNSAFE')) throw error
+      fail('TERMINAL_RECORD_INVALID', 'registered terminal cannot be read safely', {
+        cause: error && (error.code || error.message),
+      })
+    } finally {
+      if (descriptor !== undefined) this.fs.closeSync(descriptor)
+    }
+    let parsed
+    try { parsed = JSON.parse(bytes.toString('utf8')) } catch (error) {
+      fail('TERMINAL_RECORD_INVALID', 'registered terminal is not JSON', { cause: error.message })
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+        !/^[a-f0-9]{64}$/.test(parsed.checksum || '') || checksumRecord(parsed) !== parsed.checksum) {
+      fail('TERMINAL_RECORD_INVALID', 'registered terminal checksum is invalid')
+    }
+    return parsed
+  }
+
+  _readTerminalRecord() {
+    return this._withTerminalRecordAuthority((terminalPath, verifyLineage) =>
+      this._readTerminalRecordAt(terminalPath, verifyLineage))
+  }
+
+  _createOrVerifyTerminalAt(record, terminalPath, verifyLineage) {
+    if (this.fs.existsSync(terminalPath)) {
       let existing
-      try { existing = readChecksummedJson(this.terminalPath, { fsImpl: this.fs }) } catch (error) {
+      try { existing = this._readTerminalRecordAt(terminalPath, verifyLineage) } catch (error) {
+        if (error && error.code === 'PREIMAGE_UNSAFE') throw error
         fail('TERMINAL_RECORD_INVALID', 'registered terminal exists but is not valid', { cause: error.message })
       }
       for (const field of [
@@ -429,13 +845,51 @@ class Finalizer {
           fail('TERMINAL_RECORD_CONFLICT', `registered terminal conflicts on ${field}`)
         }
       }
-      fsyncDirectory(path.dirname(this.terminalPath), this.fs)
+      fsyncDirectory(path.dirname(terminalPath), this.fs)
       return existing
     }
-    try { return atomicCreateJson(this.terminalPath, record, { fsImpl: this.fs }) } catch (error) {
-      if (error && error.code === 'EEXIST') return this._createOrVerifyTerminal(record)
+    const signed = { ...canonicalize(record) }
+    signed.checksum = checksumRecord(signed)
+    const directory = path.dirname(terminalPath)
+    const temporary = path.join(
+      directory,
+      `.${path.basename(terminalPath)}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.create`,
+    )
+    let descriptor
+    try {
+      descriptor = this.fs.openSync(temporary, 'wx', 0o600)
+      verifyLineage()
+      const bytes = Buffer.from(`${stableStringify(signed)}\n`, 'utf8')
+      let offset = 0
+      while (offset < bytes.length) {
+        offset += this.fs.writeSync(descriptor, bytes, offset, bytes.length - offset)
+      }
+      this.fs.fsyncSync(descriptor)
+      this.fs.closeSync(descriptor)
+      descriptor = undefined
+      verifyLineage()
+      this.fs.linkSync(temporary, terminalPath)
+      verifyLineage()
+      fsyncDirectory(directory, this.fs)
+      this.fs.unlinkSync(temporary)
+      fsyncDirectory(directory, this.fs)
+      return signed
+    } catch (error) {
+      if (descriptor !== undefined) {
+        try { this.fs.closeSync(descriptor) } catch {}
+      }
+      try { this.fs.unlinkSync(temporary) } catch {}
+      if (error && error.code === 'EEXIST') {
+        return this._createOrVerifyTerminalAt(record, terminalPath, verifyLineage)
+      }
+      if (error && error.code === 'PREIMAGE_UNSAFE') throw error
       fail('TERMINAL_RECORD_FAILURE', 'registered terminal could not be created atomically', { cause: error.message })
     }
+  }
+
+  _createOrVerifyTerminal(record) {
+    return this._withTerminalRecordAuthority((terminalPath, verifyLineage) =>
+      this._createOrVerifyTerminalAt(record, terminalPath, verifyLineage))
   }
 }
 

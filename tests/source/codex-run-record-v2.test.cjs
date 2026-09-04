@@ -504,6 +504,429 @@ test('immutable content-addressed publications recover exact pre-link and post-l
   assert.equal(fs.readFileSync(hostileResidue, 'utf8'), 'unrelated\n')
 })
 
+test('terminal finalization intent is canonical, immutable, reopenable, and recovers its post-link crash state', t => {
+  const directory = fixture(t, 'terminal-finalization-intent')
+  const project = gitProject(directory)
+  const record = runRecord.createRunRecord({
+    targetPath: project,
+    canonicalProviderPrivateRoot: path.join(directory, 'private'),
+    exactTree: true,
+    runId: 'terminal-finalization-intent-run',
+    assertStartBoundary: false,
+  })
+  const input = {
+    runId: record.runId,
+    activationId: 'activation-terminal-001',
+    generation: 1,
+    missionHash: 'a'.repeat(64),
+    requestEnvelopeHash: 'b'.repeat(64),
+    workspaceEpoch: 3,
+    outcome: 'DONE',
+    route: 'DIRECT',
+    reason: 'the exact accepted directory is ready',
+    deliverableManifest: [
+      { path: path.join(project, 'source.txt'), hash: 'c'.repeat(64), type: 'file' },
+      { path: project, hash: 'd'.repeat(64), type: 'directory' },
+    ],
+    checkHashes: ['e'.repeat(64)],
+    terminalEnvelope: { status: 'DONE', evidence: { accepted: true } },
+    unblockPath: null,
+  }
+  const first = record.createOrVerifyTerminalFinalizationIntent(input)
+  assert.equal(first.schema, runRecord.TERMINAL_FINALIZATION_INTENT_SCHEMA)
+  assert.equal(first.route, 'DIRECT')
+  assert.equal(first.finalResponse, null)
+  assert.equal(first.intentHash, runRecord.terminalFinalizationIntentHash(first))
+  assert.deepEqual(first.deliverableManifest, [
+    { path: project, hash: 'd'.repeat(64), type: 'directory' },
+    { path: path.join(project, 'source.txt'), hash: 'c'.repeat(64) },
+  ])
+  const intentPath = record.paths.terminalFinalizationIntent
+  assert.equal(fs.readFileSync(intentPath, 'utf8'), `${JSON.stringify(first)}\n`)
+  assert.deepEqual(record.createOrVerifyTerminalFinalizationIntent(input), first)
+  assert.throws(
+    () => record.createOrVerifyTerminalFinalizationIntent({ ...input, outcome: 'FAILED' }),
+    error => error.code === 'TERMINAL_FINALIZATION_INTENT_CONFLICT',
+  )
+  assert.throws(
+    () => record.createOrVerifyTerminalFinalizationIntent({ ...input, route: 'LIGHT' }),
+    error => error.code === 'TERMINAL_FINALIZATION_INTENT_CONFLICT',
+  )
+  assert.throws(
+    () => runRecord.canonicalTerminalFinalizationIntent({ ...input, route: 'PRE_ROUTE' }),
+    error => error.code === 'TERMINAL_FINALIZATION_INTENT_INVALID',
+  )
+  assert.throws(
+    () => record.createOrVerifyTerminalFinalizationIntent({
+      ...input,
+      finalResponse: { resultFormat: 'read-only-findings', requestedResult: 'foreign replay' },
+    }),
+    error => error.code === 'TERMINAL_FINALIZATION_INTENT_CONFLICT',
+  )
+  assert.throws(
+    () => record.write(runRecord.RUNTIME_PATHS.terminalFinalizationIntent, '{}\n'),
+    error => error.code === 'RUN_RECORD_UNSAFE' && /immutable/i.test(error.message),
+  )
+
+  const deadPid = exitedProcessId()
+  const residue = path.join(
+    path.dirname(intentPath),
+    `.${path.basename(intentPath)}.${deadPid}.${'f'.repeat(16)}.tmp`,
+  )
+  fs.linkSync(intentPath, residue)
+  assert.equal(fs.lstatSync(intentPath).nlink, 2)
+  const reopened = runRecord.openRunRecord(record.runPath)
+  assert.equal(fs.existsSync(residue), false)
+  assert.equal(fs.lstatSync(intentPath).nlink, 1)
+  assert.deepEqual(reopened.readTerminalFinalizationIntent(), first)
+  assert.deepEqual(reopened.createOrVerifyTerminalFinalizationIntent(input), first)
+  assert.equal(reopened.auditTree({ permissions: false }).valid, true)
+})
+
+test('terminal finalization intent read rejects a linked runtime parent swap', t => {
+  const directory = fixture(t, 'terminal-intent-read-parent-swap')
+  const project = gitProject(directory)
+  const record = runRecord.createRunRecord({
+    targetPath: project,
+    canonicalProviderPrivateRoot: path.join(directory, 'private'),
+    exactTree: true,
+    runId: 'terminal-intent-read-parent-swap-run',
+    assertStartBoundary: false,
+  })
+  const input = {
+    runId: record.runId,
+    activationId: 'activation-terminal-read-swap-001',
+    generation: 1,
+    missionHash: '1'.repeat(64),
+    requestEnvelopeHash: '2'.repeat(64),
+    workspaceEpoch: 0,
+    outcome: 'DONE',
+    route: 'DIRECT',
+    reason: 'the exact accepted result is durable',
+    deliverableManifest: [{ path: project, hash: '3'.repeat(64), type: 'directory' }],
+    checkHashes: ['4'.repeat(64)],
+    terminalEnvelope: { status: 'DONE' },
+    finalResponse: null,
+    unblockPath: null,
+  }
+  const saved = record.createOrVerifyTerminalFinalizationIntent(input)
+  const runtimePath = path.join(record.runPath, 'runtime')
+  const displacedRuntimePath = path.join(record.runPath, 'runtime-read-displaced')
+  const foreignRuntimePath = path.join(directory, 'foreign-runtime-read')
+  fs.mkdirSync(foreignRuntimePath)
+  fs.writeFileSync(
+    path.join(foreignRuntimePath, path.basename(record.paths.terminalFinalizationIntent)),
+    `${JSON.stringify(saved)}\n`,
+    { mode: 0o600 },
+  )
+
+  const fsImpl = Object.create(fs)
+  let armed = false
+  let swapped = false
+  fsImpl.lstatSync = (target, ...args) => {
+    if (armed && !swapped && path.basename(String(target)) === path.basename(record.paths.terminalFinalizationIntent)) {
+      swapped = true
+      fs.renameSync(runtimePath, displacedRuntimePath)
+      fs.symlinkSync(foreignRuntimePath, runtimePath, process.platform === 'win32' ? 'junction' : 'dir')
+    }
+    return fs.lstatSync(target, ...args)
+  }
+  const authority = runRecord.createTerminalFinalizationIntentAuthority(record.runPath, {
+    fsImpl,
+    expectedRunId: record.runId,
+  })
+  armed = true
+  assert.throws(
+    () => authority.read(),
+    error => error.code === 'RUN_RECORD_UNSAFE' && /linked|lineage|unstable/i.test(error.message),
+  )
+  assert.equal(swapped, true)
+  assert.equal(
+    fs.readFileSync(path.join(foreignRuntimePath, path.basename(record.paths.terminalFinalizationIntent)), 'utf8'),
+    `${JSON.stringify(saved)}\n`,
+  )
+})
+
+test('terminal finalization intent publication rejects a linked runtime parent swap', t => {
+  const directory = fixture(t, 'terminal-intent-publication-parent-swap')
+  const project = gitProject(directory)
+  const record = runRecord.createRunRecord({
+    targetPath: project,
+    canonicalProviderPrivateRoot: path.join(directory, 'private'),
+    exactTree: true,
+    runId: 'terminal-intent-publication-parent-swap-run',
+    assertStartBoundary: false,
+  })
+  const input = {
+    runId: record.runId,
+    activationId: 'activation-terminal-publication-swap-001',
+    generation: 1,
+    missionHash: '5'.repeat(64),
+    requestEnvelopeHash: '6'.repeat(64),
+    workspaceEpoch: 0,
+    outcome: 'DONE',
+    route: 'DIRECT',
+    reason: 'the exact accepted result is durable',
+    deliverableManifest: [{ path: project, hash: '7'.repeat(64), type: 'directory' }],
+    checkHashes: ['8'.repeat(64)],
+    terminalEnvelope: { status: 'DONE' },
+    finalResponse: null,
+    unblockPath: null,
+  }
+  const runtimePath = path.join(record.runPath, 'runtime')
+  const displacedRuntimePath = path.join(record.runPath, 'runtime-publication-displaced')
+  const foreignRuntimePath = path.join(directory, 'foreign-runtime-publication')
+  fs.mkdirSync(foreignRuntimePath)
+
+  const fsImpl = Object.create(fs)
+  let armed = false
+  let swapped = false
+  fsImpl.openSync = (target, ...args) => {
+    if (armed && !swapped && /\.terminal-finalization-intent\.json\.[^.]+\.[^.]+\.tmp$/.test(String(target))) {
+      swapped = true
+      fs.renameSync(runtimePath, displacedRuntimePath)
+      fs.symlinkSync(foreignRuntimePath, runtimePath, process.platform === 'win32' ? 'junction' : 'dir')
+    }
+    return fs.openSync(target, ...args)
+  }
+  const authority = runRecord.createTerminalFinalizationIntentAuthority(record.runPath, {
+    fsImpl,
+    expectedRunId: record.runId,
+  })
+  armed = true
+  assert.throws(
+    () => authority.createOrVerify(input),
+    error => error.code === 'RUN_RECORD_UNSAFE' && /linked|lineage|unstable/i.test(error.message),
+  )
+  assert.equal(swapped, true)
+  assert.equal(fs.existsSync(path.join(foreignRuntimePath, path.basename(record.paths.terminalFinalizationIntent))), false)
+  assert.deepEqual(fs.readdirSync(foreignRuntimePath), [])
+})
+
+test('terminal finalization intent authority fails closed before named access without a descriptor anchor', t => {
+  const directory = fixture(t, 'terminal-intent-no-anchor')
+  const project = gitProject(directory)
+  const record = runRecord.createRunRecord({
+    targetPath: project,
+    canonicalProviderPrivateRoot: path.join(directory, 'private'),
+    exactTree: true,
+    runId: 'terminal-intent-no-anchor-run',
+    assertStartBoundary: false,
+  })
+  const fsImpl = Object.create(fs)
+  fsImpl.existsSync = target => ['/proc/self/fd', '/dev/fd'].includes(String(target))
+    ? false : fs.existsSync(target)
+  let namedPathInspections = 0
+  fsImpl.lstatSync = (target, ...args) => {
+    if (path.resolve(String(target)) === record.paths.terminalFinalizationIntent) namedPathInspections += 1
+    return fs.lstatSync(target, ...args)
+  }
+  assert.throws(
+    () => runRecord.createTerminalFinalizationIntentAuthority(record.runPath, {
+      fsImpl,
+      expectedRunId: record.runId,
+    }),
+    error => error.code === 'RUN_RECORD_UNSAFE' && /PREIMAGE_UNSAFE/.test(error.details.cause),
+  )
+  assert.equal(namedPathInspections, 0)
+})
+
+test('descriptor-anchored terminal finalization intent publication survives a transient parent swap-back', t => {
+  const descriptorRoot = (process.platform === 'linux' ? ['/proc/self/fd'] : ['/dev/fd', '/proc/self/fd'])
+    .find(candidate => fs.existsSync(candidate))
+  if (!descriptorRoot || !Number.isInteger(fs.constants.O_DIRECTORY) ||
+      !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    return t.skip('no descriptor-relative directory anchor is available')
+  }
+  const directory = fixture(t, 'terminal-intent-publication-swap-back')
+  const project = gitProject(directory)
+  const record = runRecord.createRunRecord({
+    targetPath: project,
+    canonicalProviderPrivateRoot: path.join(directory, 'private'),
+    exactTree: true,
+    runId: 'terminal-intent-publication-swap-back-run',
+    assertStartBoundary: false,
+  })
+  const input = {
+    runId: record.runId,
+    activationId: 'activation-terminal-publication-swap-back-001',
+    generation: 1,
+    missionHash: '1'.repeat(64),
+    requestEnvelopeHash: '2'.repeat(64),
+    workspaceEpoch: 0,
+    outcome: 'DONE',
+    route: 'DIRECT',
+    reason: 'the exact accepted result is durable',
+    deliverableManifest: [{ path: project, hash: '3'.repeat(64), type: 'directory' }],
+    checkHashes: ['4'.repeat(64)],
+    terminalEnvelope: { status: 'DONE' },
+    finalResponse: null,
+    unblockPath: null,
+  }
+  const runtimePath = path.join(record.runPath, 'runtime')
+  const displacedRuntimePath = path.join(record.runPath, 'runtime-displaced')
+  const foreignRuntimePath = path.join(directory, 'foreign-runtime')
+  fs.mkdirSync(foreignRuntimePath)
+  const fsImpl = Object.create(fs)
+  let swapped = false
+  fsImpl.openSync = (target, ...args) => {
+    if (!swapped && String(target).startsWith(`${descriptorRoot}${path.sep}`) &&
+        /\.terminal-finalization-intent\.json\.[^.]+\.[^.]+\.tmp$/.test(String(target))) {
+      fs.renameSync(runtimePath, displacedRuntimePath)
+      fs.symlinkSync(foreignRuntimePath, runtimePath, process.platform === 'win32' ? 'junction' : 'dir')
+      try {
+        swapped = true
+        return fs.openSync(target, ...args)
+      } finally {
+        fs.unlinkSync(runtimePath)
+        fs.renameSync(displacedRuntimePath, runtimePath)
+      }
+    }
+    return fs.openSync(target, ...args)
+  }
+  const authority = runRecord.createTerminalFinalizationIntentAuthority(record.runPath, {
+    fsImpl,
+    expectedRunId: record.runId,
+  })
+  const saved = authority.createOrVerify(input)
+  assert.equal(swapped, true)
+  assert.equal(authority.read().intentHash, saved.intentHash)
+  assert.deepEqual(fs.readdirSync(foreignRuntimePath), [])
+})
+
+test('descriptor-anchored terminal finalization intent read ignores transient foreign swap-back bytes', t => {
+  const descriptorRoot = (process.platform === 'linux' ? ['/proc/self/fd'] : ['/dev/fd', '/proc/self/fd'])
+    .find(candidate => fs.existsSync(candidate))
+  if (!descriptorRoot || !Number.isInteger(fs.constants.O_DIRECTORY) ||
+      !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    return t.skip('no descriptor-relative directory anchor is available')
+  }
+  const directory = fixture(t, 'terminal-intent-read-swap-back')
+  const project = gitProject(directory)
+  const record = runRecord.createRunRecord({
+    targetPath: project,
+    canonicalProviderPrivateRoot: path.join(directory, 'private'),
+    exactTree: true,
+    runId: 'terminal-intent-read-swap-back-run',
+    assertStartBoundary: false,
+  })
+  const saved = record.createOrVerifyTerminalFinalizationIntent({
+    runId: record.runId,
+    activationId: 'activation-terminal-read-swap-back-001',
+    generation: 1,
+    missionHash: '5'.repeat(64),
+    requestEnvelopeHash: '6'.repeat(64),
+    workspaceEpoch: 0,
+    outcome: 'DONE',
+    route: 'DIRECT',
+    reason: 'the exact accepted result is durable',
+    deliverableManifest: [{ path: project, hash: '7'.repeat(64), type: 'directory' }],
+    checkHashes: ['8'.repeat(64)],
+    terminalEnvelope: { status: 'DONE' },
+    finalResponse: null,
+    unblockPath: null,
+  })
+  const runtimePath = path.join(record.runPath, 'runtime')
+  const displacedRuntimePath = path.join(record.runPath, 'runtime-displaced')
+  const foreignRuntimePath = path.join(directory, 'foreign-runtime')
+  fs.mkdirSync(foreignRuntimePath)
+  fs.writeFileSync(path.join(foreignRuntimePath, 'terminal-finalization-intent.json'), '{"foreign":true}\n')
+  const fsImpl = Object.create(fs)
+  let swapped = false
+  fsImpl.openSync = (target, ...args) => {
+    if (!swapped && String(target).startsWith(`${descriptorRoot}${path.sep}`) &&
+        path.basename(String(target)) === 'terminal-finalization-intent.json') {
+      fs.renameSync(runtimePath, displacedRuntimePath)
+      fs.symlinkSync(foreignRuntimePath, runtimePath, process.platform === 'win32' ? 'junction' : 'dir')
+      try {
+        swapped = true
+        return fs.openSync(target, ...args)
+      } finally {
+        fs.unlinkSync(runtimePath)
+        fs.renameSync(displacedRuntimePath, runtimePath)
+      }
+    }
+    return fs.openSync(target, ...args)
+  }
+  const authority = runRecord.createTerminalFinalizationIntentAuthority(record.runPath, {
+    fsImpl,
+    expectedRunId: record.runId,
+  })
+  assert.equal(authority.read().intentHash, saved.intentHash)
+  assert.equal(swapped, true)
+  assert.equal(
+    fs.readFileSync(path.join(foreignRuntimePath, 'terminal-finalization-intent.json'), 'utf8'),
+    '{"foreign":true}\n',
+  )
+})
+
+test('non-null terminal finalResponse is hash-bound, reopenable, conflicting, and size-bounded', t => {
+  const directory = fixture(t, 'terminal-final-response')
+  const project = gitProject(directory)
+  const record = runRecord.createRunRecord({
+    targetPath: project,
+    canonicalProviderPrivateRoot: path.join(directory, 'private'),
+    exactTree: true,
+    runId: 'terminal-final-response-run',
+    assertStartBoundary: false,
+  })
+  const finalResponse = {
+    requestedResult: 'Report the exact accepted findings.',
+    resultFormat: 'read-only-findings',
+    results: [{
+      workItemId: 'work-1',
+      resultHash: 'f'.repeat(64),
+      successItems: ['Finding persisted.'],
+      findings: [{ severity: 'info', summary: 'Bounded structured response.' }],
+    }],
+    responseHash: '1'.repeat(64),
+    evidencePointer: {
+      name: 'structured-final-response',
+      path: path.join(record.runPath, 'work', 'results', `${'2'.repeat(64)}.json`),
+      hash: '3'.repeat(64),
+      bytes: 128,
+    },
+  }
+  const input = {
+    runId: record.runId,
+    activationId: 'activation-final-response-001',
+    generation: 1,
+    missionHash: '4'.repeat(64),
+    requestEnvelopeHash: '5'.repeat(64),
+    workspaceEpoch: 0,
+    outcome: 'DONE',
+    route: null,
+    reason: 'structured response independently accepted',
+    deliverableManifest: [{ path: project, hash: '6'.repeat(64), type: 'directory' }],
+    checkHashes: ['7'.repeat(64)],
+    terminalEnvelope: { status: 'DONE' },
+    finalResponse,
+    unblockPath: null,
+  }
+  const saved = record.createOrVerifyTerminalFinalizationIntent(input)
+  assert.equal(saved.route, null)
+  assert.deepEqual(saved.finalResponse, finalResponse)
+  assert.equal(saved.intentHash, runRecord.terminalFinalizationIntentHash(saved))
+  assert.deepEqual(record.createOrVerifyTerminalFinalizationIntent(input), saved)
+  assert.throws(
+    () => record.createOrVerifyTerminalFinalizationIntent({
+      ...input,
+      finalResponse: { ...finalResponse, requestedResult: 'conflicting response' },
+    }),
+    error => error.code === 'TERMINAL_FINALIZATION_INTENT_CONFLICT',
+  )
+  assert.throws(
+    () => record.createOrVerifyTerminalFinalizationIntent({
+      ...input,
+      finalResponse: { payload: 'x'.repeat(runRecord.TERMINAL_FINALIZATION_INTENT_MAX_BYTES) },
+    }),
+    error => error.code === 'TERMINAL_FINALIZATION_INTENT_INVALID' && /byte boundary/i.test(error.message),
+  )
+  const reopened = runRecord.openRunRecord(record.runPath)
+  assert.deepEqual(reopened.readTerminalFinalizationIntent(), saved)
+  assert.deepEqual(reopened.createOrVerifyTerminalFinalizationIntent(input), saved)
+})
+
 test('ordinary atomic writes discard only exact private unpublished crash residues', t => {
   const directory = fixture(t, 'ordinary-atomic-write-crash')
   const project = gitProject(directory)

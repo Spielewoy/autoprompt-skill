@@ -24,6 +24,7 @@ const {
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/
 const TRANSPORT_RETRY_PATTERN = /^(.+)-transport-retry-1$/u
+const FILE_SLOT_PATTERN = /^<[A-Za-z][A-Za-z0-9._-]{0,63}>$/u
 
 class WorkerWorkspaceError extends Error {
   constructor(code, message, details) {
@@ -107,15 +108,84 @@ function runGit(repository, argv, options = {}) {
   return result.stdout
 }
 
-function repositorySnapshot(repository, environment, fsImpl = fs) {
+function ignoredInventoryResourcePath(targetRoot, resource) {
+  if (!resource) return null
+  const identity = String(resource.identity || '')
+  // File-slot sentinels and exact external-local/scratch identities are not
+  // concrete paths in this repository. Other ownership code validates them;
+  // ignored-file inventory must simply exclude them from its Git pathspecs.
+  if (FILE_SLOT_PATTERN.test(identity)) return null
+  if (path.isAbsolute(identity)) {
+    const root = path.resolve(targetRoot)
+    const absolute = path.resolve(identity)
+    const relative = path.relative(root, absolute)
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      return null
+    }
+  }
+  return resourcePath(targetRoot, resource)
+}
+
+function ignoredResourceCovers(targetRoot, resource, relative) {
+  if (!resource || resource.kind === 'cache') return false
+  const owned = ignoredInventoryResourcePath(targetRoot, resource)
+  if (!owned) return false
+  const absolute = resolveInside(targetRoot, relative)
+  return ['directory', 'output', 'evidence-root'].includes(resource.kind)
+    ? absolute === owned || absolute.startsWith(`${owned}${path.sep}`)
+    : absolute === owned
+}
+
+function ownedIgnoredPathspecs(targetRoot, resources) {
+  if (!Array.isArray(resources)) return Object.freeze([])
+  const root = path.resolve(targetRoot)
+  return Object.freeze([...new Set(resources.flatMap(resource => {
+    if (!resource || resource.kind === 'cache') return []
+    const owned = ignoredInventoryResourcePath(root, resource)
+    if (!owned) return []
+    const relative = path.relative(root, owned).replace(/\\/g, '/')
+    return [relative ? normalizeRelative(relative) : '.']
+  }))].sort())
+}
+
+function projectWorkspaceResources(resources, canonicalRoot, repositoryRoot) {
+  if (!Array.isArray(resources)) return Object.freeze([])
+  const sourceRoot = path.resolve(canonicalRoot)
+  return Object.freeze(resources.map(resource => {
+    if (!resource || !path.isAbsolute(String(resource.identity || ''))) return resource
+    const absolute = path.resolve(resource.identity)
+    const relative = path.relative(sourceRoot, absolute)
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return resource
+    return Object.freeze({
+      ...resource,
+      identity: relative ? relative.replace(/\\/g, '/') : '.',
+    })
+  }))
+}
+
+function declaredIgnoredWorkspaceNames(repository, environment, resources = []) {
   const root = path.resolve(repository)
+  const pathspecs = ownedIgnoredPathspecs(root, resources)
+  if (pathspecs.length === 0) return Object.freeze([])
+  const raw = Buffer.from(runGit(root, [
+    'ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', ...pathspecs,
+  ], { encoding: null, environment }))
+  return Object.freeze([...new Set(raw.toString('utf8').split('\0').filter(Boolean)
+    .map(normalizeRelative).filter(relative =>
+      resources.some(resource => ignoredResourceCovers(root, resource, relative))))].sort())
+}
+
+function repositorySnapshot(repository, environment, fsImpl = fs, resources = [], resourceRoot = repository) {
+  const root = path.resolve(repository)
+  const projectedResources = projectWorkspaceResources(resources, resourceRoot, root)
   const raw = Buffer.from(runGit(root, ['ls-files', '-co', '--exclude-standard', '-z'], {
     encoding: null,
     environment,
   }))
-  const names = raw.toString('utf8').split('\0').filter(Boolean).map(normalizeRelative).sort()
+  const names = new Set(raw.toString('utf8').split('\0').filter(Boolean).map(normalizeRelative))
+  for (const relative of declaredIgnoredWorkspaceNames(root, environment, projectedResources)) names.add(relative)
   const rows = []
-  for (const relative of names) {
+  for (const relative of [...names].sort()) {
     const absolute = resolveInside(root, relative)
     const state = fileState(absolute, fsImpl)
     rows.push(Object.freeze({ path: relative, hash: state && state.hash || null, mode: state && state.mode || null }))
@@ -201,6 +271,11 @@ function snapshotsEqual(left, right) {
   return stableStringify(left) === stableStringify(right)
 }
 
+function snapshotEntryChanged(left, right) {
+  return (left && left.hash || null) !== (right && right.hash || null) ||
+    (left?.mode ?? null) !== (right?.mode ?? null)
+}
+
 function isPythonTransient(relative) {
   const normalized = normalizeRelative(relative)
   const parts = normalized.split('/')
@@ -241,8 +316,7 @@ function changedSnapshotPaths(before, after) {
   const beforeMap = snapshotMap(before)
   const afterMap = snapshotMap(after)
   return [...new Set([...beforeMap.keys(), ...afterMap.keys()])].sort().filter(relative =>
-    (beforeMap.get(relative) && beforeMap.get(relative).hash || null) !==
-    (afterMap.get(relative) && afterMap.get(relative).hash || null))
+    snapshotEntryChanged(beforeMap.get(relative), afterMap.get(relative)))
 }
 
 function quarantineBody(record, input) {
@@ -318,6 +392,7 @@ function survivalBody(record, input) {
     snapshotHash: input.snapshotHash,
     changedPathCount: input.files.length,
     changedPathsHash: sha256(stableStringify(input.files.map(item => item.relative))),
+    ownershipResolution: input.ownershipResolution || null,
     files: input.files,
   })
 }
@@ -337,7 +412,8 @@ function validSurvivalManifest(manifest, record) {
       !HASH_PATTERN.test(manifest.changedPathsHash || '') ||
       !HASH_PATTERN.test(manifest.survivalHash || '') ||
       !Number.isSafeInteger(manifest.changedPathCount) || manifest.changedPathCount < 1 ||
-      !Array.isArray(manifest.files) || manifest.files.length !== manifest.changedPathCount) return false
+      !Array.isArray(manifest.files) || manifest.files.length !== manifest.changedPathCount ||
+      !validOwnershipResolutionBinding(manifest.ownershipResolution, record, manifest.files)) return false
   const paths = []
   for (const entry of manifest.files) {
     if (!entry || typeof entry.relative !== 'string' ||
@@ -403,6 +479,150 @@ function ownsRelative(targetRoot, resources, relative) {
     Math.max(...readable.map(match => match.specificity))
 }
 
+function fileSlot(targetRoot, resource, index) {
+  if (!resource || resource.kind !== 'file' || resource.access === 'read') return null
+  const identity = String(resource.identity || '')
+  const owned = resourcePath(targetRoot, resource)
+  if (!owned || !FILE_SLOT_PATTERN.test(path.basename(owned))) return null
+  return Object.freeze({ index, identity, owned, parent: path.dirname(owned) })
+}
+
+function validOwnershipResolutionBinding(resolution, record, files = null) {
+  if (resolution === null || resolution === undefined) return true
+  if (!resolution || resolution.schemaVersion !== 1 ||
+      resolution.kind !== 'worker-owned-file-slot-resolution' ||
+      resolution.sourceWorkspaceId !== record.workspaceId ||
+      resolution.sourceAssignmentHash !== record.assignmentHash ||
+      resolution.sourceBindingHash !== record.binding.bindingHash ||
+      !Array.isArray(resolution.bindings) || resolution.bindings.length === 0 ||
+      !HASH_PATTERN.test(resolution.resolutionHash || '')) return false
+  const { resolutionHash, ...body } = resolution
+  if (resolutionHash !== sha256(stableStringify(body))) return false
+  const fileMap = files && new Map(files.map(entry => [entry.relative, entry]))
+  const indexes = new Set()
+  const relatives = new Set()
+  for (const binding of resolution.bindings) {
+    if (!binding || !Number.isSafeInteger(binding.resourceIndex) || binding.resourceIndex < 0 ||
+        typeof binding.templateIdentity !== 'string' || !binding.templateIdentity ||
+        typeof binding.resolvedIdentity !== 'string' || !binding.resolvedIdentity ||
+        typeof binding.relative !== 'string' || !HASH_PATTERN.test(binding.postimageHash || '') ||
+        !Number.isSafeInteger(binding.postimageMode) || binding.postimageMode < 0 ||
+        binding.postimageMode > 0o777 ||
+        indexes.has(binding.resourceIndex) || relatives.has(binding.relative)) return false
+    try {
+      if (normalizeRelative(binding.relative) !== binding.relative) return false
+    } catch { return false }
+    if (fileMap) {
+      const file = fileMap.get(binding.relative)
+      if (!file || file.type !== 'file' || file.hash !== binding.postimageHash ||
+          file.mode !== binding.postimageMode) return false
+    }
+    indexes.add(binding.resourceIndex)
+    relatives.add(binding.relative)
+  }
+  return true
+}
+
+function resolvedMutationOwnership(input) {
+  const { targetRoot, resources, actual, beforeMap, afterMap, record } = input
+  const slots = resources.map((resource, index) => fileSlot(targetRoot, resource, index)).filter(Boolean)
+  const fixedResources = resources.filter((resource, index) => !slots.some(slot => slot.index === index))
+  const unmatched = actual.filter(relative => !ownsRelative(targetRoot, fixedResources, relative))
+  if (unmatched.length === 0) {
+    return Object.freeze({ resources: Object.freeze([...resources]), resolution: null })
+  }
+
+  // A descriptive <name> is a single future-file slot, not directory
+  // authority. Resolve it only when the physical diff makes the mapping
+  // bijective within the slot's exact parent. Any extra or ambiguous file is
+  // left unmatched and fails the ordinary ownership check below.
+  const available = new Set(unmatched)
+  const bindings = []
+  const resolvedResources = [...resources]
+  for (const slot of slots) {
+    const candidates = [...available].filter(relative => {
+      const absolute = resolveInside(targetRoot, relative)
+      const before = beforeMap.get(relative) || null
+      const after = afterMap.get(relative) || null
+      return path.dirname(absolute) === slot.parent &&
+        (!before || before.hash === null) && after && after.hash !== null
+    })
+    if (candidates.length !== 1) continue
+    const relative = candidates[0]
+    available.delete(relative)
+    const resolvedIdentity = path.isAbsolute(slot.identity)
+      ? resolveInside(targetRoot, relative) : relative
+    const postimageHash = afterMap.get(relative).hash
+    const postimageMode = afterMap.get(relative).mode
+    resolvedResources[slot.index] = Object.freeze({
+      ...resources[slot.index], identity: resolvedIdentity,
+    })
+    bindings.push(Object.freeze({
+      resourceIndex: slot.index,
+      templateIdentity: slot.identity,
+      resolvedIdentity,
+      relative,
+      postimageHash,
+      postimageMode,
+    }))
+  }
+  if (available.size > 0 || bindings.length === 0) {
+    return Object.freeze({ resources: Object.freeze([...resources]), resolution: null })
+  }
+  const body = Object.freeze({
+    schemaVersion: 1,
+    kind: 'worker-owned-file-slot-resolution',
+    sourceWorkspaceId: record.workspaceId,
+    sourceAssignmentHash: record.assignmentHash,
+    sourceBindingHash: record.binding.bindingHash,
+    bindings: Object.freeze(bindings),
+  })
+  return Object.freeze({
+    resources: Object.freeze(resolvedResources),
+    resolution: Object.freeze({ ...body, resolutionHash: sha256(stableStringify(body)) }),
+  })
+}
+
+function admissionOwnershipResources(targetRoot, session, record, admission, failureCode) {
+  const resolution = admission && admission.ownershipResolution || null
+  if (!resolution) return session.assignment.resources
+  if (!validOwnershipResolutionBinding(resolution, record)) {
+    fail(failureCode, 'worker file-slot resolution is foreign or corrupt')
+  }
+  const resources = [...session.assignment.resources]
+  const beforeMap = snapshotMap(record.baseline)
+  const afterMap = snapshotMap(admission.after || [])
+  const seen = new Set()
+  for (const binding of resolution.bindings) {
+    const resource = resources[binding.resourceIndex]
+    const slot = fileSlot(targetRoot, resource, binding.resourceIndex)
+    let relative
+    try { relative = normalizeReportedPath(binding.resolvedIdentity, targetRoot) } catch {
+      fail(failureCode, 'worker file-slot resolution escaped its canonical target')
+    }
+    const after = afterMap.get(relative) || null
+    const before = beforeMap.get(relative) || null
+    if (!slot || slot.identity !== binding.templateIdentity ||
+        relative !== binding.relative || seen.has(relative) ||
+        path.dirname(resolveInside(targetRoot, relative)) !== slot.parent ||
+        (before && before.hash !== null) || !after || after.hash !== binding.postimageHash ||
+        after.mode !== binding.postimageMode) {
+      fail(failureCode, 'worker file-slot resolution does not match its admitted assignment and postimage')
+    }
+    const expectedIdentity = path.isAbsolute(slot.identity)
+      ? resolveInside(targetRoot, relative) : relative
+    if (binding.resolvedIdentity !== expectedIdentity) {
+      fail(failureCode, 'worker file-slot resolution changed its canonical path representation')
+    }
+    resources[binding.resourceIndex] = Object.freeze({ ...resource, identity: binding.resolvedIdentity })
+    seen.add(relative)
+  }
+  if ((admission.actualFilesChanged || []).some(relative => !ownsRelative(targetRoot, resources, relative))) {
+    fail(failureCode, 'worker file-slot resolution does not own every admitted physical diff')
+  }
+  return Object.freeze(resources)
+}
+
 function scopedSnapshot(snapshot, targetRoot, resources) {
   return snapshot.filter(entry => ownsRelative(targetRoot, resources, entry.path))
 }
@@ -464,9 +684,136 @@ function removeEmptyTree(rootDirectory, boundary, fsImpl = fs) {
   remove(root)
 }
 
+function removeOptionalEmptyDirectory(directory, fsImpl = fs) {
+  let names
+  try { names = fsImpl.readdirSync(directory) } catch (error) {
+    if (error && error.code === 'ENOENT') return false
+    throw error
+  }
+  if (names.length !== 0) return false
+  try { fsImpl.rmdirSync(directory) } catch (error) {
+    if (error && ['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) return false
+    throw error
+  }
+  try { fsyncDirectory(path.dirname(directory), fsImpl) } catch (error) {
+    if (!error || error.code !== 'ENOENT') throw error
+  }
+  return true
+}
+
 function fsyncFile(filename, fsImpl = fs) {
   const descriptor = fsImpl.openSync(filename, 'r+')
   try { fsImpl.fsyncSync(descriptor) } finally { fsImpl.closeSync(descriptor) }
+}
+
+// Promotion-private paths need a recovery view that can recognize the brief,
+// intentional two-link state created by link(2) publication.  The ordinary
+// workspace reader continues to reject every hard link; this reader is used
+// only for transaction paths already bound into the durable promotion record.
+function transactionPathState(absolute, fsImpl = fs) {
+  let inspected
+  try { inspected = inspectPathNoFollow(absolute, { mustBeDirectory: false, fsImpl }) } catch (error) {
+    return Object.freeze({ unsafe: true, cause: error.code || error.message })
+  }
+  if (!inspected.exists) return null
+  let stat
+  try { stat = fsImpl.lstatSync(absolute) } catch (error) {
+    return Object.freeze({ unsafe: true, cause: error.code || error.message })
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    return Object.freeze({ unsafe: true, cause: 'not-a-regular-file' })
+  }
+  try {
+    return Object.freeze({
+      hash: sha256(fsImpl.readFileSync(absolute)),
+      mode: stat.mode & 0o777,
+      nlink: Number(stat.nlink),
+      dev: String(stat.dev),
+      ino: String(stat.ino),
+    })
+  } catch (error) {
+    return Object.freeze({ unsafe: true, cause: error.code || error.message })
+  }
+}
+
+function transactionStateMatches(state, expectedHash, expectedMode) {
+  if (expectedHash === null) return state === null
+  return Boolean(state && !state.unsafe && state.hash === expectedHash && state.mode === expectedMode)
+}
+
+function transactionFinalizationIntent(transaction) {
+  const body = Object.freeze({
+    schemaVersion: 1,
+    decision: 'FINALIZE_COMMITTED_CANDIDATE',
+    transactionId: transaction.id,
+    entries: Object.freeze((transaction.entries || []).map(entry => Object.freeze({
+      path: entry.path,
+      beforeHash: entry.beforeHash,
+      beforeMode: entry.beforeMode,
+      afterHash: entry.afterHash,
+      afterMode: entry.afterMode,
+    }))),
+  })
+  return Object.freeze({ ...body, bindingHash: sha256(stableStringify(body)) })
+}
+
+function tryPublishNoReplace(source, target, fsImpl = fs) {
+  try {
+    fsImpl.linkSync(source, target)
+  } catch (error) {
+    if (error && error.code === 'EEXIST') return false
+    throw error
+  }
+  fsyncDirectory(path.dirname(target), fsImpl)
+  fsImpl.unlinkSync(source)
+  fsyncDirectory(path.dirname(source), fsImpl)
+  return true
+}
+
+function publishNoReplace(source, target, relative, fsImpl = fs) {
+  if (!tryPublishNoReplace(source, target, fsImpl)) {
+    fail('CONCURRENT_MUTATION', `target appeared during no-replace CAS publication: ${relative}`)
+  }
+}
+
+function surfaceOpaquePathNoReplace(source, target, fsImpl = fs) {
+  let stat
+  try { stat = fsImpl.lstatSync(source) } catch (error) {
+    if (error && error.code === 'ENOENT') return null
+    throw error
+  }
+  try {
+    if (stat.isSymbolicLink()) {
+      const linkText = fsImpl.readlinkSync(source)
+      fsImpl.symlinkSync(linkText, target, process.platform === 'win32' ? 'file' : undefined)
+      fsyncDirectory(path.dirname(target), fsImpl)
+      return 'OPAQUE_SYMLINK_RESTORED_NO_REPLACE'
+    }
+    // Directories cannot be hard-linked and Node does not expose
+    // renameat2(RENAME_NOREPLACE). An exclusive symlink creation is still an
+    // atomic no-overwrite operation: it keeps the exact displaced object
+    // reachable from the user's original pathname while the durable conflict
+    // transaction retains its authoritative physical location.
+    fsImpl.symlinkSync(
+      source,
+      target,
+      process.platform === 'win32' && stat.isDirectory() ? 'junction' : undefined,
+    )
+    fsyncDirectory(path.dirname(target), fsImpl)
+    return 'OPAQUE_OBJECT_SURFACED_BY_NO_REPLACE_POINTER'
+  } catch (error) {
+    if (error && ['EEXIST', 'EACCES', 'EPERM'].includes(error.code)) return null
+    throw error
+  }
+}
+
+function removeExactTransactionFile(filename, expectedHash, expectedMode, fsImpl = fs) {
+  const state = transactionPathState(filename, fsImpl)
+  if (!state) return true
+  if (!transactionStateMatches(state, expectedHash, expectedMode)) return false
+  fsImpl.unlinkSync(filename)
+  fsyncDirectory(path.dirname(filename), fsImpl)
+  return true
 }
 
 function processIsAlive(pid) {
@@ -523,6 +870,29 @@ class WorkerWorkspaceManager {
         this.targetRoot.startsWith(`${this.privateRoot}${path.sep}`)) {
       fail('WORKER_ISOLATION_UNSUPPORTED', 'private worker workspaces must be outside the real target')
     }
+    const gitDirectoryText = String(runGit(this.targetRoot, ['rev-parse', '--absolute-git-dir'], {
+      environment: this.environment,
+    })).trim()
+    if (!path.isAbsolute(gitDirectoryText)) {
+      fail('WORKER_ISOLATION_UNSUPPORTED', 'worker target lacks one absolute physical Git metadata directory')
+    }
+    let gitInspection
+    try {
+      gitInspection = inspectPathNoFollow(gitDirectoryText, { mustBeDirectory: true, fsImpl: this.fs })
+    } catch (error) {
+      fail('WORKER_ISOLATION_UNSUPPORTED', 'worker Git metadata crosses a link, junction, or reparse point', {
+        cause: error.code || error.message,
+      })
+    }
+    if (!gitInspection.exists) {
+      fail('WORKER_ISOLATION_UNSUPPORTED', 'worker Git metadata directory is absent')
+    }
+    this.gitDirectory = gitInspection.realpath
+    this.transactionScratchNamespace = path.join(this.gitDirectory, 'autoprompt-cas-v2')
+    this.transactionScratchRoot = path.join(this.transactionScratchNamespace, sha256(stableStringify({
+      runId: this.runId,
+      activationId: this.activationId,
+    })).slice(0, 40))
     ensurePhysicalDirectory(path.join(this.privateRoot, 'workspaces'), this.privateRoot, this.fs)
     ensurePhysicalDirectory(path.join(this.privateRoot, 'records'), this.privateRoot, this.fs)
     ensurePhysicalDirectory(path.join(this.privateRoot, 'transactions'), this.privateRoot, this.fs)
@@ -560,7 +930,9 @@ class WorkerWorkspaceManager {
       return this._session(recovered, assignment)
     }
 
-    const baseline = repositorySnapshot(this.targetRoot, this.environment, this.fs)
+    const baseline = repositorySnapshot(
+      this.targetRoot, this.environment, this.fs, assignment.resources, this.targetRoot,
+    )
     const parent = path.dirname(workspacePath)
     ensurePhysicalDirectory(parent, this.privateRoot, this.fs)
     ensurePhysicalDirectory(cacheRoot, this.privateRoot, this.fs)
@@ -594,14 +966,16 @@ class WorkerWorkspaceManager {
         continue
       }
       const sourceState = fileState(source, this.fs)
-      if (!sourceState || sourceState.hash !== entry.hash) {
+      if (!sourceState || sourceState.hash !== entry.hash || sourceState.mode !== entry.mode) {
         fail('CONCURRENT_MUTATION', `target changed while the private workspace was materialized: ${entry.path}`)
       }
       removeFileIfPresent(destination, this.fs)
       this.fs.copyFileSync(source, destination, this.fs.constants.COPYFILE_EXCL)
       this.fs.chmodSync(destination, entry.mode)
     }
-    const cloned = repositorySnapshot(workspacePath, this.environment, this.fs)
+    const cloned = repositorySnapshot(
+      workspacePath, this.environment, this.fs, assignment.resources, this.targetRoot,
+    )
     if (!snapshotsEqual(cloned, baseline)) {
       fail('WORKER_ISOLATION_MISMATCH', 'private workspace does not reproduce the target working tree exactly')
     }
@@ -652,7 +1026,9 @@ class WorkerWorkspaceManager {
     if (record.status !== 'PREPARED' && record.status !== 'ROLLED_BACK') {
       fail('WORKER_QUARANTINE_INVALID', `worker workspace cannot be quarantined from ${record.status}`)
     }
-    const rawAfter = repositorySnapshot(record.workspacePath, this.environment, this.fs)
+    const rawAfter = repositorySnapshot(
+      record.workspacePath, this.environment, this.fs, session.assignment.resources, this.targetRoot,
+    )
     const observedPaths = changedSnapshotPaths(record.baseline, rawAfter)
     const admission = this.inspect(session, { filesChanged: observedPaths })
     if (admission.actualFilesChanged.length === 0) {
@@ -680,17 +1056,26 @@ class WorkerWorkspaceManager {
     const admission = options.admission
     const reasonCode = typeof options.reasonCode === 'string' && options.reasonCode
       ? options.reasonCode : 'CONTROLLER_BOOKKEEPING_FAILURE'
-    if (!['PREPARED', 'ROLLED_BACK', 'COMMITTED'].includes(record.status) ||
+    if (!['PREPARED', 'ROLLED_BACK', 'COMMITTED', 'QUARANTINED'].includes(record.status) ||
         !admission || !Array.isArray(admission.actualFilesChanged) ||
         !Array.isArray(admission.after) || admission.actualFilesChanged.length === 0) {
       fail('WORKER_SURVIVAL_INVALID', 'exact-version survival requires one admitted private or committed work product')
     }
     const actual = admission.actualFilesChanged.map(normalizeRelative)
+    const admittedResources = admissionOwnershipResources(
+      this.targetRoot,
+      session,
+      record,
+      admission,
+      'WORKER_SURVIVAL_INVALID',
+    )
     if (new Set(actual).size !== actual.length ||
-        actual.some(relative => !ownsRelative(this.targetRoot, session.assignment.resources, relative))) {
+        actual.some(relative => !ownsRelative(this.targetRoot, admittedResources, relative))) {
       fail('WORKER_SURVIVAL_INVALID', 'exact-version survival paths exceed their admitted ownership')
     }
-    const privateSnapshot = repositorySnapshot(record.workspacePath, this.environment, this.fs)
+    const privateSnapshot = repositorySnapshot(
+      record.workspacePath, this.environment, this.fs, session.assignment.resources, this.targetRoot,
+    )
     if (!snapshotsEqual(privateSnapshot, admission.after) ||
         stableStringify(changedSnapshotPaths(record.baseline, privateSnapshot)) !== stableStringify(actual)) {
       fail('WORKER_SURVIVAL_TAMPERED', 'private exact-version bytes differ from the mutation admission')
@@ -708,7 +1093,13 @@ class WorkerWorkspaceManager {
     const snapshotHash = sha256(stableStringify(privateSnapshot))
     const candidateHash = HASH_PATTERN.test(options.candidateHash || '')
       ? options.candidateHash : snapshotHash
-    const body = survivalBody(record, { reasonCode, candidateHash, snapshotHash, files })
+    const body = survivalBody(record, {
+      reasonCode,
+      candidateHash,
+      snapshotHash,
+      files,
+      ownershipResolution: admission.ownershipResolution || null,
+    })
     const survivalHash = sha256(stableStringify(body))
     const survivalRoot = path.join(this.privateRoot, 'candidate-survivals', survivalHash)
     const filesRoot = path.join(survivalRoot, 'files')
@@ -727,11 +1118,10 @@ class WorkerWorkspaceManager {
         ensurePhysicalDirectory(path.dirname(destination), filesRoot, this.fs)
         this.fs.copyFileSync(source, destination, this.fs.constants.COPYFILE_EXCL)
         const copied = fileState(destination, this.fs)
-        if (!copied || copied.hash !== entry.hash) {
+        if (!copied || copied.hash !== entry.hash || copied.mode !== entry.mode) {
           fail('WORKER_SURVIVAL_TAMPERED', `exact-version survival copy differs from its admitted postimage: ${entry.relative}`)
         }
         fsyncFile(destination, this.fs)
-        this.fs.chmodSync(destination, entry.mode & 0o111 ? 0o500 : 0o400)
       }
       const signed = atomicWriteJson(manifestPath, { ...body, survivalHash }, { fsImpl: this.fs, mode: 0o400 })
       if (!validSurvivalManifest(signed, record)) {
@@ -775,7 +1165,7 @@ class WorkerWorkspaceManager {
     for (const entry of manifest.files) {
       if (entry.type === 'missing') continue
       const preserved = fileState(resolveInside(filesRoot, entry.relative), this.fs)
-      if (!preserved || preserved.hash !== entry.hash) {
+      if (!preserved || preserved.hash !== entry.hash || preserved.mode !== entry.mode) {
         fail('WORKER_SURVIVAL_TAMPERED', `exact-version survival postimage changed: ${entry.relative}`)
       }
     }
@@ -789,6 +1179,8 @@ class WorkerWorkspaceManager {
       manifestHash: sha256(stableStringify(manifest)),
       survivalHash,
       changedPathCount: manifest.changedPathCount,
+      ownershipResolutionHash: manifest.ownershipResolution &&
+        manifest.ownershipResolution.resolutionHash || null,
     })
   }
 
@@ -887,6 +1279,8 @@ class WorkerWorkspaceManager {
             retryRecord.workspacePath,
             this.environment,
             this.fs,
+            assignment.resources,
+            this.targetRoot,
           ))) !== seed.seededSnapshotHash) {
         fail('WORKER_QUARANTINE_TAMPERED', 'consumed transport quarantine retry bytes changed before launch')
       }
@@ -901,14 +1295,24 @@ class WorkerWorkspaceManager {
     if (!sourceInspection.exists || sourceInspection.realpath !== path.resolve(source.workspacePath)) {
       fail('WORKER_QUARANTINE_TAMPERED', 'transport quarantine workspace is missing or was redirected')
     }
-    const sourceAfter = repositorySnapshot(source.workspacePath, this.environment, this.fs)
+    const sourceAfter = repositorySnapshot(
+      source.workspacePath, this.environment, this.fs, assignment.resources, this.targetRoot,
+    )
     const actual = changedSnapshotPaths(source.baseline, sourceAfter)
     if (actual.length !== source.transportQuarantine.changedPathCount ||
         sha256(stableStringify(actual)) !== source.transportQuarantine.changedPathsHash ||
         sha256(stableStringify(sourceAfter)) !== source.transportQuarantine.candidateHash) {
       fail('WORKER_QUARANTINE_TAMPERED', 'transport quarantine bytes differ from the frozen work-product journal')
     }
-    const outside = actual.filter(relative => !ownsRelative(this.targetRoot, assignment.resources, relative))
+    const ownership = resolvedMutationOwnership({
+      targetRoot: this.targetRoot,
+      resources: assignment.resources,
+      actual,
+      beforeMap: snapshotMap(source.baseline),
+      afterMap: snapshotMap(sourceAfter),
+      record: source,
+    })
+    const outside = actual.filter(relative => !ownsRelative(this.targetRoot, ownership.resources, relative))
     if (outside.length) {
       fail('OWNERSHIP_SCOPE_VIOLATION', 'transport quarantine no longer fits the retry assignment ownership', { outside })
     }
@@ -925,11 +1329,15 @@ class WorkerWorkspaceManager {
             retryRecord.workspacePath,
             this.environment,
             this.fs,
+            assignment.resources,
+            this.targetRoot,
           ))) !== seed.seededSnapshotHash) {
         fail('WORKER_QUARANTINE_TAMPERED', 'existing transport retry workspace differs from its seed journal')
       }
     } else {
-      const retryBeforeSeed = repositorySnapshot(retry.workspacePath, this.environment, this.fs)
+      const retryBeforeSeed = repositorySnapshot(
+        retry.workspacePath, this.environment, this.fs, assignment.resources, this.targetRoot,
+      )
       const unexpected = changedSnapshotPaths(retryRecord.baseline, retryBeforeSeed)
         .filter(relative => !actual.includes(relative))
       if (unexpected.length) {
@@ -954,7 +1362,9 @@ class WorkerWorkspaceManager {
       this.fs.chmodSync(destination, sourceState.mode)
       fsyncFile(destination, this.fs)
     }
-    const retryAfter = repositorySnapshot(retry.workspacePath, this.environment, this.fs)
+    const retryAfter = repositorySnapshot(
+      retry.workspacePath, this.environment, this.fs, assignment.resources, this.targetRoot,
+    )
     const retryAfterMap = snapshotMap(retryAfter)
     for (const relative of actual) {
       const expected = sourceAfterMap.get(relative) || null
@@ -1039,7 +1449,9 @@ class WorkerWorkspaceManager {
       this.recover(record)
       record = this._readSession(session)
     }
-    let after = repositorySnapshot(record.workspacePath, this.environment, this.fs)
+    let after = repositorySnapshot(
+      record.workspacePath, this.environment, this.fs, session.assignment.resources, this.targetRoot,
+    )
     const beforeMap = snapshotMap(record.baseline)
     let afterMap = snapshotMap(after)
     const workspaceTransientMap = new Map()
@@ -1077,14 +1489,23 @@ class WorkerWorkspaceManager {
     if (transientArtifacts.length > 0) {
       record = this._prepareTransientCleanup(record, transientArtifacts)
       record = this._reconcileTransientCleanup(record)
-      after = repositorySnapshot(record.workspacePath, this.environment, this.fs)
+      after = repositorySnapshot(
+        record.workspacePath, this.environment, this.fs, session.assignment.resources, this.targetRoot,
+      )
       afterMap = snapshotMap(after)
     }
     const names = [...new Set([...beforeMap.keys(), ...afterMap.keys()])].sort()
     const actual = names.filter(relative =>
-      (beforeMap.get(relative) && beforeMap.get(relative).hash || null) !==
-      (afterMap.get(relative) && afterMap.get(relative).hash || null))
-    const outside = actual.filter(relative => !ownsRelative(this.targetRoot, session.assignment.resources, relative))
+      snapshotEntryChanged(beforeMap.get(relative), afterMap.get(relative)))
+    const ownership = resolvedMutationOwnership({
+      targetRoot: this.targetRoot,
+      resources: session.assignment.resources,
+      actual,
+      beforeMap,
+      afterMap,
+      record,
+    })
+    const outside = actual.filter(relative => !ownsRelative(this.targetRoot, ownership.resources, relative))
     if (outside.length) {
       fail('OWNERSHIP_SCOPE_VIOLATION', 'worker changed files outside its admitted ownership in the private workspace', {
         outside,
@@ -1100,7 +1521,7 @@ class WorkerWorkspaceManager {
       ? [...new Set(result.filesChanged.map(value => normalizeReportedPath(value, this.targetRoot)))]
           .filter(relative => !transientPaths.has(relative)).sort() : []
     const reportedOutside = reported.filter(relative =>
-      !ownsRelative(this.targetRoot, session.assignment.resources, relative))
+      !ownsRelative(this.targetRoot, ownership.resources, relative))
     if (reportedOutside.length) {
       fail('OWNERSHIP_SCOPE_VIOLATION', 'worker reported files outside its admitted ownership', {
         outside: reportedOutside,
@@ -1110,7 +1531,13 @@ class WorkerWorkspaceManager {
     }
     const reportedSet = new Set(reported)
     const unreportedActual = actual.filter(relative => !reportedSet.has(relative))
-    if (unreportedActual.length) {
+    // An explicitly incomplete terminal report cannot claim DONE authority,
+    // but its model-authored list is not allowed to erase an otherwise exact,
+    // ownership-safe physical candidate. The observed clone diff remains the
+    // mutation admission; both actual and reported foreign paths still fail.
+    const incompleteReport = result && result.allAssignedItemsPass === false &&
+      Array.isArray(result.filesChanged)
+    if (unreportedActual.length && !incompleteReport) {
       fail('MUTATION_REPORT_MISMATCH', 'worker omitted an observed isolated physical diff from its file report', {
         reported, actual, unreportedActual,
       })
@@ -1124,6 +1551,7 @@ class WorkerWorkspaceManager {
       actualFilesChanged: Object.freeze(actual),
       reportedNoopFiles: Object.freeze(reportedNoopFiles),
       after: Object.freeze(after),
+      ownershipResolution: ownership.resolution,
       transientArtifactsRemoved: Object.freeze(recordedTransientArtifacts.map(item => Object.freeze({ ...item }))),
       postimages: Object.freeze(actual.map(relative => {
         const entry = afterMap.get(relative)
@@ -1141,9 +1569,25 @@ class WorkerWorkspaceManager {
     if (record.status !== 'PREPARED' && record.status !== 'ROLLED_BACK') {
       fail('WORKER_PROMOTION_INVALID', `worker workspace cannot promote from ${record.status}`)
     }
-    const currentTarget = repositorySnapshot(this.targetRoot, this.environment, this.fs)
-    const expectedScope = scopedSnapshot(record.baseline, this.targetRoot, session.assignment.resources)
-    const currentScope = scopedSnapshot(currentTarget, this.targetRoot, session.assignment.resources)
+    if (record.status === 'ROLLED_BACK') {
+      if (!this._cleanupTransaction(record)) {
+        fail('CONCURRENT_MUTATION', 'rolled-back promotion retains concurrent bytes and cannot be replaced')
+      }
+      record = { ...record, status: 'PREPARED', transaction: null }
+      atomicWriteJson(record.recordPath, record, { fsImpl: this.fs })
+    }
+    const admittedResources = admissionOwnershipResources(
+      this.targetRoot,
+      session,
+      record,
+      admission,
+      'WORKER_PROMOTION_INVALID',
+    )
+    const currentTarget = repositorySnapshot(
+      this.targetRoot, this.environment, this.fs, admittedResources,
+    )
+    const expectedScope = scopedSnapshot(record.baseline, this.targetRoot, admittedResources)
+    const currentScope = scopedSnapshot(currentTarget, this.targetRoot, admittedResources)
     if (!snapshotsEqual(currentScope, expectedScope)) {
       fail('CONCURRENT_MUTATION', 'owned target resources changed before isolated CAS promotion', {
         expectedScopeHash: sha256(stableStringify(expectedScope)),
@@ -1154,31 +1598,19 @@ class WorkerWorkspaceManager {
     const afterMap = snapshotMap(admission.after)
     const transactionId = crypto.randomBytes(12).toString('hex')
     const transactionRoot = path.join(this.privateRoot, 'transactions', `${record.workspaceId}-${transactionId}`)
-    this.fs.mkdirSync(path.join(transactionRoot, 'backups'), { recursive: true, mode: 0o700 })
+    const backupsRoot = path.join(transactionRoot, 'backups')
     const entries = admission.actualFilesChanged.map((relative, index) => {
       const before = beforeMap.get(relative) || { path: relative, hash: null, mode: null }
       const after = afterMap.get(relative) || { path: relative, hash: null, mode: null }
       const target = resolveInside(this.targetRoot, relative)
       const source = resolveInside(record.workspacePath, relative)
       const suffix = `${record.workspaceId.slice(0, 10)}-${transactionId}-${index}`
-      const staged = path.join(path.dirname(target), `.autoprompt-cas-${suffix}.new`)
-      const displaced = path.join(path.dirname(target), `.autoprompt-cas-${suffix}.old`)
-      const backup = path.join(transactionRoot, 'backups', String(index))
-      ensurePhysicalDirectory(path.dirname(target), this.targetRoot, this.fs)
-      if (before.hash !== null) {
-        const state = fileState(target, this.fs)
-        if (!state || state.hash !== before.hash) fail('CONCURRENT_MUTATION', `target preimage changed: ${relative}`)
-        this.fs.copyFileSync(target, backup, this.fs.constants.COPYFILE_EXCL)
-        this.fs.chmodSync(backup, before.mode)
-        fsyncFile(backup, this.fs)
-      }
-      if (after.hash !== null) {
-        const state = fileState(source, this.fs)
-        if (!state || state.hash !== after.hash) fail('WORKER_PROMOTION_INVALID', `isolated postimage changed: ${relative}`)
-        this.fs.copyFileSync(source, staged, this.fs.constants.COPYFILE_EXCL)
-        this.fs.chmodSync(staged, after.mode)
-        fsyncFile(staged, this.fs)
-      }
+      const transactionDirectory = path.join(this.transactionScratchRoot, suffix)
+      const staged = path.join(transactionDirectory, 'candidate')
+      const displaced = path.join(transactionDirectory, 'preimage')
+      const rollbackCapture = path.join(transactionDirectory, 'rollback-capture')
+      const restore = path.join(transactionDirectory, 'restore')
+      const backup = path.join(backupsRoot, String(index))
       return {
         path: relative,
         beforeHash: before.hash,
@@ -1186,8 +1618,11 @@ class WorkerWorkspaceManager {
         afterHash: after.hash,
         afterMode: after.mode,
         target,
+        transactionDirectory,
         staged,
         displaced,
+        rollbackCapture,
+        restore,
         backup: before.hash === null ? null : backup,
       }
     })
@@ -1195,21 +1630,101 @@ class WorkerWorkspaceManager {
       ...record,
       status: 'PREPARED_PROMOTION',
       actualFilesChanged: [...admission.actualFilesChanged],
-      transaction: { id: transactionId, root: transactionRoot, appliedCount: 0, entries },
+      transaction: {
+        id: transactionId,
+        root: transactionRoot,
+        scratchNamespace: this.transactionScratchNamespace,
+        scratchRoot: this.transactionScratchRoot,
+        appliedCount: 0,
+        preparationComplete: false,
+        entries,
+      },
     }
-    atomicWriteJson(record.recordPath, record, { fsImpl: this.fs })
-    record = { ...record, status: 'PROMOTING' }
     atomicWriteJson(record.recordPath, record, { fsImpl: this.fs })
     record = this._armRollbackGuardian(record)
     try {
+      ensurePhysicalDirectory(this.transactionScratchNamespace, this.gitDirectory, this.fs)
+      fsyncDirectory(this.gitDirectory, this.fs)
+      ensurePhysicalDirectory(this.transactionScratchRoot, this.gitDirectory, this.fs)
+      fsyncDirectory(this.transactionScratchNamespace, this.fs)
+      this.fs.mkdirSync(transactionRoot, { mode: 0o700 })
+      fsyncDirectory(path.dirname(transactionRoot), this.fs)
+      this.fs.mkdirSync(backupsRoot, { mode: 0o700 })
+      fsyncDirectory(transactionRoot, this.fs)
+      for (const entry of entries) {
+        ensurePhysicalDirectory(path.dirname(entry.target), this.targetRoot, this.fs)
+        if (String(this.fs.statSync(path.dirname(entry.target)).dev) !==
+            String(this.fs.statSync(this.transactionScratchRoot).dev)) {
+          fail('WORKER_ISOLATION_UNSUPPORTED', `owned target is on a foreign filesystem: ${entry.path}`)
+        }
+        try {
+          this.fs.mkdirSync(entry.transactionDirectory, { mode: 0o700 })
+          fsyncDirectory(path.dirname(entry.transactionDirectory), this.fs)
+        } catch (error) {
+          if (error && error.code === 'EEXIST') {
+            fail('CONCURRENT_MUTATION', `promotion-private transaction directory already exists: ${entry.path}`)
+          }
+          throw error
+        }
+        if (entry.beforeHash !== null) {
+          const state = fileState(entry.target, this.fs)
+          if (!state || state.hash !== entry.beforeHash || state.mode !== entry.beforeMode) {
+            fail('CONCURRENT_MUTATION', `target preimage changed: ${entry.path}`)
+          }
+          this.fs.copyFileSync(entry.target, entry.backup, this.fs.constants.COPYFILE_EXCL)
+          this.fs.chmodSync(entry.backup, entry.beforeMode)
+          fsyncFile(entry.backup, this.fs)
+          fsyncDirectory(backupsRoot, this.fs)
+          const backupState = transactionPathState(entry.backup, this.fs)
+          if (!transactionStateMatches(backupState, entry.beforeHash, entry.beforeMode)) {
+            fail('CONCURRENT_MUTATION', `target changed while its rollback backup was captured: ${entry.path}`)
+          }
+        }
+        if (entry.afterHash !== null) {
+          const state = fileState(entry.source || resolveInside(record.workspacePath, entry.path), this.fs)
+          if (!state || state.hash !== entry.afterHash || state.mode !== entry.afterMode) {
+            fail('WORKER_PROMOTION_INVALID', `isolated postimage changed: ${entry.path}`)
+          }
+          const source = entry.source || resolveInside(record.workspacePath, entry.path)
+          this.fs.copyFileSync(source, entry.staged, this.fs.constants.COPYFILE_EXCL)
+          this.fs.chmodSync(entry.staged, entry.afterMode)
+          fsyncFile(entry.staged, this.fs)
+          fsyncDirectory(entry.transactionDirectory, this.fs)
+          const stagedState = fileState(entry.staged, this.fs)
+          if (!stagedState || stagedState.hash !== entry.afterHash || stagedState.mode !== entry.afterMode) {
+            fail('WORKER_PROMOTION_INVALID', `staged postimage does not match its admitted bytes: ${entry.path}`)
+          }
+        } else {
+          fsyncDirectory(entry.transactionDirectory, this.fs)
+        }
+      }
+      record = {
+        ...record,
+        status: 'PROMOTING',
+        transaction: { ...record.transaction, preparationComplete: true },
+      }
+      atomicWriteJson(record.recordPath, record, { fsImpl: this.fs })
       for (let index = 0; index < entries.length; index += 1) {
         const entry = entries[index]
         const current = fileState(entry.target, this.fs)
-        if ((current && current.hash || null) !== entry.beforeHash) {
+        if (!transactionStateMatches(current, entry.beforeHash, entry.beforeMode)) {
           fail('CONCURRENT_MUTATION', `target changed during CAS promotion: ${entry.path}`)
         }
-        if (entry.beforeHash !== null) this.fs.renameSync(entry.target, entry.displaced)
-        if (entry.afterHash !== null) this.fs.renameSync(entry.staged, entry.target)
+        if (entry.beforeHash !== null) {
+          if (transactionPathState(entry.displaced, this.fs)) {
+            fail('CONCURRENT_MUTATION', `promotion displacement path appeared: ${entry.path}`)
+          }
+          this.fs.renameSync(entry.target, entry.displaced)
+          fsyncDirectory(path.dirname(entry.target), this.fs)
+          fsyncDirectory(entry.transactionDirectory, this.fs)
+          const captured = transactionPathState(entry.displaced, this.fs)
+          if (!transactionStateMatches(captured, entry.beforeHash, entry.beforeMode)) {
+            fail('CONCURRENT_MUTATION', `target changed while its CAS preimage was captured: ${entry.path}`)
+          }
+        }
+        if (entry.afterHash !== null) {
+          publishNoReplace(entry.staged, entry.target, entry.path, this.fs)
+        }
         fsyncDirectory(path.dirname(entry.target), this.fs)
         if (this.afterPromotionStep) this.afterPromotionStep({
           workspaceId: record.workspaceId,
@@ -1225,7 +1740,7 @@ class WorkerWorkspaceManager {
       }
       for (const entry of entries) {
         const current = fileState(entry.target, this.fs)
-        if ((current && current.hash || null) !== entry.afterHash) {
+        if (!transactionStateMatches(current, entry.afterHash, entry.afterMode)) {
           fail('MUTATION_RESULT_MISMATCH', `promoted target does not match the isolated postimage: ${entry.path}`)
         }
       }
@@ -1236,6 +1751,10 @@ class WorkerWorkspaceManager {
       try {
         record = this._rollback(readChecksummedJson(record.recordPath, { fsImpl: this.fs }))
         this._disarmRollbackGuardian(record)
+        if (this._cleanupTransaction(record)) {
+          record = { ...record, transaction: null }
+          atomicWriteJson(record.recordPath, record, { fsImpl: this.fs })
+        }
       } catch (rollbackError) {
         fail('WORKER_ROLLBACK_FAILED', 'isolated CAS promotion failed and exact rollback could not be proven', {
           promotionCode: error.code || 'WORKER_PROMOTION_FAILED',
@@ -1389,6 +1908,7 @@ class WorkerWorkspaceManager {
     if (!record || typeof record.status !== 'string') fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'workspace recovery record is invalid')
     if (record.transientCleanup) record = this._reconcileTransientCleanup(record)
     if (['PREPARED_PROMOTION', 'PROMOTING'].includes(record.status)) return this._rollback(record)
+    if (record.status === 'FINALIZING') return this._completeFinalization(record)
     if (record.status === 'COMMITTED') {
       this._committedPostimages(record)
       return record
@@ -1399,10 +1919,32 @@ class WorkerWorkspaceManager {
   finalize(session) {
     let record = this._readSession(session)
     if (record.transientCleanup) record = this.recover(record)
+    if (record.status === 'FINALIZING') return this._completeFinalization(record)
     if (record.status !== 'COMMITTED') fail('WORKER_PROMOTION_INVALID', 'only a committed workspace can be finalized')
     record = this._cleanupConfiguredCache(record)
     this._disarmRollbackGuardian(record)
-    this._cleanupTransaction(record)
+    record = {
+      ...record,
+      status: 'FINALIZING',
+      transaction: {
+        ...record.transaction,
+        finalizationIntent: transactionFinalizationIntent(record.transaction),
+      },
+    }
+    atomicWriteJson(record.recordPath, record, { fsImpl: this.fs })
+    return this._completeFinalization(record)
+  }
+
+  _completeFinalization(record) {
+    if (!record || record.status !== 'FINALIZING' || !record.transaction ||
+        stableStringify(record.transaction.finalizationIntent) !==
+          stableStringify(transactionFinalizationIntent(record.transaction))) {
+      fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'finalization intent is absent, foreign, or corrupt')
+    }
+    record = this._cleanupConfiguredCache(record)
+    if (!this._cleanupTransaction(record)) {
+      fail('WORKER_ROLLBACK_CONFLICT', 'committed transaction contains preserved concurrent bytes')
+    }
     if (this.fs.existsSync(record.workspacePath)) this.fs.rmSync(record.workspacePath, { recursive: true, force: false })
     const cacheRoot = path.join(this.privateRoot, 'caches', record.workspaceId)
     removeEmptyTree(cacheRoot, this.privateRoot, this.fs)
@@ -1414,14 +1956,17 @@ class WorkerWorkspaceManager {
   abort(session) {
     let record = this._readSession(session)
     if (record.transientCleanup) record = this.recover(record)
+    if (record.status === 'FINALIZING') return this._completeFinalization(record)
     if (['PREPARED_PROMOTION', 'PROMOTING'].includes(record.status)) record = this._rollback(record)
     if (record.status === 'COMMITTED') record = this._rollbackCommitted(record)
     record = this._cleanupConfiguredCache(record)
     this._disarmRollbackGuardian(record)
+    if (!this._cleanupTransaction(record)) {
+      fail('WORKER_ROLLBACK_CONFLICT', 'abort preserved a concurrent target and its displaced evidence')
+    }
     if (this.fs.existsSync(record.workspacePath)) this.fs.rmSync(record.workspacePath, { recursive: true, force: false })
     const cacheRoot = path.join(this.privateRoot, 'caches', record.workspaceId)
     removeEmptyTree(cacheRoot, this.privateRoot, this.fs)
-    this._cleanupTransaction(record)
     record = { ...record, status: 'ABORTED', transaction: null }
     atomicWriteJson(record.recordPath, record, { fsImpl: this.fs })
     return record
@@ -1437,57 +1982,228 @@ class WorkerWorkspaceManager {
       if (record.status === 'PREPARED') return record
       fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'incomplete promotion lacks its rollback manifest')
     }
+    const conflicts = []
+    const preserveConflict = (entry, reason, state = null, disposition = null) => {
+      conflicts.push(Object.freeze({
+        path: entry.path,
+        reason,
+        currentHash: state && !state.unsafe ? state.hash : null,
+        unsafe: Boolean(state && state.unsafe),
+        ...(disposition ? { recoveryDisposition: disposition } : {}),
+      }))
+    }
     for (let index = transaction.entries.length - 1; index >= 0; index -= 1) {
       const entry = transaction.entries[index]
-      const current = fileState(entry.target, this.fs)
-      const currentHash = current && current.hash || null
-      const displacedExists = this.fs.existsSync(entry.displaced)
-      if (![entry.beforeHash, entry.afterHash, null].includes(currentHash)) {
-        fail('WORKER_ROLLBACK_CONFLICT', `target changed independently during rollback: ${entry.path}`)
-      }
-      if (currentHash === entry.afterHash && entry.afterHash !== entry.beforeHash) removeFileIfPresent(entry.target, this.fs)
-      if (entry.beforeHash !== null) {
-        if (displacedExists) {
-          removeFileIfPresent(entry.target, this.fs)
-          this.fs.renameSync(entry.displaced, entry.target)
-        } else {
-          const backupState = entry.backup && fileState(entry.backup, this.fs)
-          if (!backupState || backupState.hash !== entry.beforeHash) {
-            fail('WORKER_ROLLBACK_FAILED', `rollback backup is absent or corrupt: ${entry.path}`)
+      const rollbackCapture = entry.rollbackCapture || `${entry.displaced}.rollback`
+      const restore = entry.restore || `${entry.displaced}.restore`
+      let current = transactionPathState(entry.target, this.fs)
+      let capture = transactionPathState(rollbackCapture, this.fs)
+
+      // A prior rollback may have crashed after atomically capturing the
+      // candidate but before restoring the preimage.  Only the exact admitted
+      // candidate may be discarded; captured foreign bytes are published back
+      // with no-replace semantics or retained in the transaction.
+      if (capture) {
+        if (!transactionStateMatches(capture, entry.afterHash, entry.afterMode)) {
+          if (!current && !capture.unsafe && tryPublishNoReplace(rollbackCapture, entry.target, this.fs)) {
+            current = transactionPathState(entry.target, this.fs)
           }
-          removeFileIfPresent(entry.target, this.fs)
-          const restore = `${entry.target}.autoprompt-restore-${transaction.id}`
-          removeFileIfPresent(restore, this.fs)
-          this.fs.copyFileSync(entry.backup, restore, this.fs.constants.COPYFILE_EXCL)
-          this.fs.chmodSync(restore, entry.beforeMode)
-          fsyncFile(restore, this.fs)
-          this.fs.renameSync(restore, entry.target)
+          preserveConflict(entry, 'rollback-capture-is-not-the-admitted-postimage', current || capture)
+          continue
         }
-      } else {
-        removeFileIfPresent(entry.target, this.fs)
-        removeEmptyParents(path.dirname(entry.target), this.targetRoot, this.fs)
       }
-      removeFileIfPresent(entry.staged, this.fs)
-      removeFileIfPresent(entry.displaced, this.fs)
+
+      if (current && current.unsafe) {
+        preserveConflict(entry, 'concurrent-target-is-not-a-safe-regular-file', current)
+        continue
+      }
+      const currentMatchesAfter = transactionStateMatches(current, entry.afterHash, entry.afterMode)
+      const currentMatchesBefore = transactionStateMatches(current, entry.beforeHash, entry.beforeMode)
+      if (current && currentMatchesAfter &&
+          (entry.afterHash !== entry.beforeHash || entry.afterMode !== entry.beforeMode)) {
+        if (capture) {
+          preserveConflict(entry, 'rollback-capture-path-was-reused', capture)
+          continue
+        }
+        this.fs.renameSync(entry.target, rollbackCapture)
+        capture = transactionPathState(rollbackCapture, this.fs)
+        if (!transactionStateMatches(capture, entry.afterHash, entry.afterMode)) {
+          const latest = transactionPathState(entry.target, this.fs)
+          if (!latest && capture && !capture.unsafe) {
+            tryPublishNoReplace(rollbackCapture, entry.target, this.fs)
+          }
+          preserveConflict(entry, 'target-changed-while-rollback-captured-the-postimage', capture)
+          continue
+        }
+        current = null
+      } else if (current && !currentMatchesBefore) {
+        preserveConflict(entry, 'concurrent-target-must-not-be-overwritten-or-removed', current)
+        continue
+      }
+
+      if (entry.beforeHash !== null && !current) {
+        let source = null
+        let sourceState = transactionPathState(entry.displaced, this.fs)
+        if (sourceState) {
+          source = entry.displaced
+        } else {
+          sourceState = transactionPathState(restore, this.fs)
+          if (sourceState) {
+            source = restore
+          } else {
+            const backupState = entry.backup && transactionPathState(entry.backup, this.fs)
+            if (!transactionStateMatches(backupState, entry.beforeHash, entry.beforeMode)) {
+              fail('WORKER_ROLLBACK_FAILED', `rollback backup is absent or corrupt: ${entry.path}`)
+            }
+            this.fs.copyFileSync(entry.backup, restore, this.fs.constants.COPYFILE_EXCL)
+            this.fs.chmodSync(restore, entry.beforeMode)
+            fsyncFile(restore, this.fs)
+            source = restore
+            sourceState = transactionPathState(restore, this.fs)
+          }
+        }
+        if (!sourceState || sourceState.unsafe) {
+          // The pathname may have been replaced after the last regular-file
+          // check and then atomically displaced by rename(2). For linkable
+          // opaque objects (notably symlinks and FIFOs), put that exact inode
+          // back with no-replace semantics before preserving the conflict.
+          // This never follows the object and never overwrites a newer winner.
+          let visibleState = sourceState
+          let recoveryDisposition = null
+          if (sourceState && !current) {
+            try {
+              if (tryPublishNoReplace(source, entry.target, this.fs)) {
+                visibleState = transactionPathState(entry.target, this.fs)
+                recoveryDisposition = 'OPAQUE_INODE_RESTORED_NO_REPLACE'
+              }
+            } catch (error) {
+              if (!error || !['EACCES', 'EPERM', 'EISDIR', 'EXDEV'].includes(error.code)) throw error
+            }
+            if (!transactionPathState(entry.target, this.fs)) {
+              recoveryDisposition = surfaceOpaquePathNoReplace(source, entry.target, this.fs)
+              if (recoveryDisposition) visibleState = transactionPathState(entry.target, this.fs)
+            }
+          }
+          preserveConflict(
+            entry,
+            'captured-preimage-is-not-a-safe-regular-file',
+            visibleState,
+            recoveryDisposition,
+          )
+          continue
+        }
+        if (!tryPublishNoReplace(source, entry.target, this.fs)) {
+          preserveConflict(entry, 'concurrent-target-appeared-during-rollback',
+            transactionPathState(entry.target, this.fs))
+          continue
+        }
+        current = transactionPathState(entry.target, this.fs)
+        if (!transactionStateMatches(sourceState, entry.beforeHash, entry.beforeMode)) {
+          // rename(2) captured a concurrent writer rather than the admitted
+          // preimage.  Its exact bytes have been restored, while the baseline
+          // backup and transaction remain available for explicit recovery.
+          preserveConflict(entry, 'captured-concurrent-bytes-were-restored-without-overwrite', current)
+          continue
+        }
+      }
+
+      current = transactionPathState(entry.target, this.fs)
+      if (current && current.unsafe) {
+        preserveConflict(entry, 'rollback-result-is-not-a-safe-regular-file', current)
+        continue
+      }
+      if (!transactionStateMatches(current, entry.beforeHash, entry.beforeMode)) {
+        preserveConflict(entry, 'rollback-did-not-win-a-no-replace-publication', current)
+        continue
+      }
+
+      const cleanup = [
+        [entry.staged, entry.afterHash, entry.afterMode],
+        [entry.displaced, entry.beforeHash, entry.beforeMode],
+        [rollbackCapture, entry.afterHash, entry.afterMode],
+        [restore, entry.beforeHash, entry.beforeMode],
+      ]
+      if (cleanup.some(([filename, expectedHash, expectedMode]) => expectedHash === null
+        ? Boolean(transactionPathState(filename, this.fs))
+        : !removeExactTransactionFile(filename, expectedHash, expectedMode, this.fs))) {
+        preserveConflict(entry, 'promotion-private-file-changed-before-cleanup')
+        continue
+      }
       fsyncDirectory(path.dirname(entry.target), this.fs)
-      const restored = fileState(entry.target, this.fs)
-      if ((restored && restored.hash || null) !== entry.beforeHash) {
-        fail('WORKER_ROLLBACK_FAILED', `rollback did not restore the admitted preimage: ${entry.path}`)
-      }
+      if (entry.beforeHash === null) removeEmptyParents(path.dirname(entry.target), this.targetRoot, this.fs)
     }
-    const rolledBack = { ...record, status: 'ROLLED_BACK' }
+    const uniqueConflicts = [...new Map(conflicts.map(item => [stableStringify(item), item])).values()]
+    const rolledBack = {
+      ...record,
+      status: 'ROLLED_BACK',
+      transaction: {
+        ...transaction,
+        preservedConflicts: uniqueConflicts,
+      },
+    }
     atomicWriteJson(record.recordPath, rolledBack, { fsImpl: this.fs })
     return rolledBack
   }
 
   _cleanupTransaction(record) {
-    if (!record.transaction) return
+    if (!record.transaction) return true
+    if (Array.isArray(record.transaction.preservedConflicts) &&
+        record.transaction.preservedConflicts.length > 0) return false
+    if (!['COMMITTED', 'FINALIZING', 'ROLLED_BACK'].includes(record.status)) {
+      fail('WORKER_WORKSPACE_RECOVERY_FAILED', `cannot clean a transaction from ${record.status}`)
+    }
+    const acceptingCandidate = ['COMMITTED', 'FINALIZING'].includes(record.status)
+    const resumableFinalization = record.status === 'FINALIZING'
     for (const entry of record.transaction.entries || []) {
-      removeFileIfPresent(entry.staged, this.fs)
-      removeFileIfPresent(entry.displaced, this.fs)
+      const rollbackCapture = entry.rollbackCapture || `${entry.displaced}.rollback`
+      const restore = entry.restore || `${entry.displaced}.restore`
+      const expectedTargetHash = acceptingCandidate ? entry.afterHash : entry.beforeHash
+      const expectedTargetMode = acceptingCandidate ? entry.afterMode : entry.beforeMode
+      const targetState = transactionPathState(entry.target, this.fs)
+      if (!transactionStateMatches(targetState, expectedTargetHash, expectedTargetMode)) {
+        fail('WORKER_ROLLBACK_CONFLICT', `target changed before transaction cleanup: ${entry.path}`)
+      }
+      const stagedState = transactionPathState(entry.staged, this.fs)
+      const displacedState = transactionPathState(entry.displaced, this.fs)
+      const captureState = transactionPathState(rollbackCapture, this.fs)
+      const restoreState = transactionPathState(restore, this.fs)
+      const backupState = entry.backup && transactionPathState(entry.backup, this.fs)
+      if (stagedState || captureState || restoreState ||
+          (record.status === 'COMMITTED' && entry.beforeHash !== null &&
+            !transactionStateMatches(displacedState, entry.beforeHash, entry.beforeMode)) ||
+          (record.status === 'COMMITTED' && entry.beforeHash === null && displacedState) ||
+          (resumableFinalization && displacedState &&
+            !transactionStateMatches(displacedState, entry.beforeHash, entry.beforeMode)) ||
+          (record.status === 'ROLLED_BACK' && displacedState) ||
+          (record.status === 'COMMITTED' && entry.beforeHash !== null &&
+            !transactionStateMatches(backupState, entry.beforeHash, entry.beforeMode)) ||
+          (resumableFinalization && backupState &&
+            !transactionStateMatches(backupState, entry.beforeHash, entry.beforeMode))) {
+        fail('WORKER_ROLLBACK_CONFLICT', `promotion-private bytes changed before cleanup: ${entry.path}`)
+      }
+      if (displacedState && !removeExactTransactionFile(
+        entry.displaced, entry.beforeHash, entry.beforeMode, this.fs,
+      )) {
+        fail('WORKER_ROLLBACK_CONFLICT', `displaced preimage changed during cleanup: ${entry.path}`)
+      }
+      if (entry.transactionDirectory) {
+        if (record.status === 'COMMITTED' && !this.fs.existsSync(entry.transactionDirectory)) {
+          fail('WORKER_ROLLBACK_CONFLICT', `promotion-private directory disappeared: ${entry.path}`)
+        }
+        if (!this.fs.existsSync(entry.transactionDirectory)) continue
+        const names = this.fs.readdirSync(entry.transactionDirectory)
+        if (names.length !== 0) {
+          fail('WORKER_ROLLBACK_CONFLICT', `promotion-private directory is not empty: ${entry.path}`)
+        }
+        this.fs.rmdirSync(entry.transactionDirectory)
+        fsyncDirectory(path.dirname(entry.transactionDirectory), this.fs)
+      }
     }
     if (record.transaction.root && this.fs.existsSync(record.transaction.root)) {
       this.fs.rmSync(record.transaction.root, { recursive: true, force: false })
+    }
+    for (const directory of [record.transaction.scratchRoot, record.transaction.scratchNamespace]) {
+      if (directory) removeOptionalEmptyDirectory(directory, this.fs)
     }
     const guardian = record.transaction.guardian
     if (guardian) {
@@ -1495,6 +2211,7 @@ class WorkerWorkspaceManager {
         removeFileIfPresent(filename, this.fs)
       }
     }
+    return true
   }
 
   _committedPostimages(record) {
@@ -1503,7 +2220,7 @@ class WorkerWorkspaceManager {
     }
     return Object.freeze(record.transaction.entries.map(entry => {
       const current = fileState(entry.target, this.fs)
-      if ((current && current.hash || null) !== entry.afterHash) {
+      if (!transactionStateMatches(current, entry.afterHash, entry.afterMode)) {
         fail('MUTATION_RESULT_MISMATCH', `committed target postimage changed: ${entry.path}`)
       }
       return Object.freeze({
@@ -1636,11 +2353,15 @@ function runRollbackGuardian(requestPath) {
       record = manager.recover(record)
       const status = record.status === 'COMMITTED' ? 'COMMITTED' : 'ROLLED_BACK'
       atomicWriteJson(request.resultPath, { schemaVersion: 1, token: request.token, status })
-      manager._cleanupTransaction(record)
+      // A committed transaction retains its displaced preimages until the
+      // controller explicitly finalizes (discard) or aborts (restore).  The
+      // guardian may acknowledge the durable commit, but must not erase the
+      // only rollback authority merely because its owner process exited.
+      const transactionCleaned = status === 'COMMITTED' ? false : manager._cleanupTransaction(record)
       atomicWriteJson(request.recordPath, {
         ...record,
         status: status === 'COMMITTED' ? 'COMMITTED' : 'ROLLED_BACK',
-        transaction: null,
+        transaction: status === 'COMMITTED' || !transactionCleaned ? record.transaction : null,
         guardianOutcome: status,
       })
       return status
@@ -1654,6 +2375,8 @@ if (require.main === module && process.argv[2] === '--rollback-guardian') {
 }
 
 module.exports = {
+  declaredIgnoredWorkspaceNames,
+  projectWorkspaceResources,
   WorkerWorkspaceError,
   WorkerWorkspaceManager,
   repositorySnapshot,

@@ -10,6 +10,10 @@ const { isDeepStrictEqual } = require('node:util')
 const runtimeSettings = require('../../agents/codex/workflow/settings.js')
 const runtimeRouter = require('../../agents/codex/workflow/router.js')
 const runtimeRouteDecision = require('../../agents/codex/workflow/route-decision.js')
+const {
+  canonicalRoleAssignment,
+  WORKER_REQUIREMENT_FIDELITY_DOCTRINE,
+} = require('../../agents/codex/workflow/phase-budget.js')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const CONTRACTS = path.join(ROOT, 'agents', 'contracts')
@@ -69,6 +73,41 @@ function accountingSnapshotHash(snapshot) {
 function totalTokens(values) {
   return Object.values(values.tokenUsage).reduce((sum, value) => sum + value, 0)
 }
+
+test('Codex worker requirement-fidelity doctrine preserves literal and global requirements', () => {
+  assert.equal(Object.isFrozen(WORKER_REQUIREMENT_FIDELITY_DOCTRINE), true)
+  assert.equal(WORKER_REQUIREMENT_FIDELITY_DOCTRINE.length, 5)
+  const doctrine = WORKER_REQUIREMENT_FIDELITY_DOCTRINE.join(' ')
+  assert.match(doctrine, /formulas, schemas, and specification text outrank unstated domain conventions/iu)
+  assert.match(doctrine, /every explicit requirement to an executed witness/iu)
+  assert.match(doctrine, /before, at, between, and after cases/iu)
+  assert.match(doctrine, /complete, independently executable feasibility-and-selection proof/iu)
+  assert.match(doctrine, /test competing interpretations and never silently weaken explicit wording/iu)
+
+  const assignment = (assignmentId, repairOf = null) => canonicalRoleAssignment({
+    request: {
+      workItemId: assignmentId,
+      ...(repairOf ? { repairOf, executorKey: 'same-executor' } : {}),
+      assignment: repairOf ? 'Repair the exact behavior.' : 'Implement the exact behavior.',
+      ownership: ['workspace'],
+      success: ['The exact behavior passes.'],
+      checks: ['Run the exact witness.'],
+      findingIds: ['AP-DESIGN-023'],
+    },
+    route: 'DIRECT', runId: 'run-1', logicalRole: 'worker', physicalRole: 'autoprompt.v2.worker',
+    readOnly: false, requestEnvelopeHash: H, targetPath: ROOT, enforcePreimages: false,
+    additionalResources: [], mission: 'Implement the exact behavior.', now: () => 0,
+  })
+  assert.deepEqual(assignment('implementation').requirementFidelityDoctrine, WORKER_REQUIREMENT_FIDELITY_DOCTRINE)
+  assert.deepEqual(assignment('repair', 'implementation').requirementFidelityDoctrine, WORKER_REQUIREMENT_FIDELITY_DOCTRINE)
+})
+
+test('Codex route guidance exposes the absolute one-minute optional-analysis ceiling', () => {
+  const skill = fs.readFileSync(path.join(ROOT, 'agents', 'codex', 'SKILL.md'), 'utf8')
+  assert.match(skill, /route analyst may inspect[\s\S]*at most 60 seconds/u)
+  assert.doesNotMatch(skill, /route analyst may inspect[\s\S]*at most 120 seconds/u)
+  assert.equal(runtimeRouteDecision.ROUTE_ANALYST_MAX_DURATION_MS, 60_000)
+})
 
 function accountingValuePaths() {
   return [

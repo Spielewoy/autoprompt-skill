@@ -50,10 +50,7 @@ const CAPABILITIES = Object.freeze({
 let sequence = 0
 
 function pinnedCodexCli() {
-  const candidates = [
-    process.env.AUTOPROMPT_PINNED_CODEX,
-    '/data/benchmark-AP-v2/publish-staging/dependencies/codex-cli-0.148.0/node_modules/@openai/codex/bin/codex.js',
-  ].filter(Boolean)
+  const candidates = [process.env.AUTOPROMPT_PINNED_CODEX].filter(Boolean)
   return candidates.find(candidate => {
     if (!fs.existsSync(candidate)) return false
     const result = childProcess.spawnSync(process.execPath, [candidate, '--version'], {
@@ -415,6 +412,7 @@ test('pinned Codex 0.148 emits one countable lifecycle for each direct patch and
     hardStopped: false,
     usage: { noncachedInput: 6, cachedInput: 0, output: 3, reasoning: 0 },
     latestInputBound: quotaProxy.snapshot().latestInputBound,
+    latestMaximumUnaccountedTokens: quotaProxy.snapshot().latestMaximumUnaccountedTokens,
     lastFailure: null,
   })
   assert.deepEqual(usageSnapshots.at(-1), {
@@ -530,6 +528,58 @@ test('cumulative quota relay bills cached input, injects a hard output cap, and 
   assert.equal(quotaProxy.snapshot().deniedCount, 1)
   assert.equal(quotaProxy.snapshot().hardStopped, true)
   assert.equal(quotaProxy.snapshot().lastFailure.code, 'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED')
+})
+
+test('accounting-only quota relay persists one finite model-context response bound', async t => {
+  const upstreamBodies = []
+  const upstream = http.createServer((request, response) => {
+    let body = ''
+    request.setEncoding('utf8')
+    request.on('data', chunk => { body += chunk })
+    request.on('end', () => {
+      upstreamBodies.push(JSON.parse(body))
+      const event = {
+        type: 'response.completed',
+        response: {
+          id: 'accounting-only-response',
+          usage: {
+            input_tokens: 1, input_tokens_details: { cached_tokens: 0 },
+            output_tokens: 1, output_tokens_details: { reasoning_tokens: 0 },
+            total_tokens: 2,
+          },
+        },
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end(`event: response.completed\ndata: ${JSON.stringify(event)}\n\n`)
+    })
+  })
+  await new Promise((resolve, reject) => {
+    upstream.once('error', reject)
+    upstream.listen(0, '127.0.0.1', resolve)
+  })
+  t.after(() => new Promise(resolve => upstream.close(resolve)))
+  const starts = []
+  const quotaProxy = await startCodexCumulativeQuotaProxy({
+    tokenLimit: Number.MAX_SAFE_INTEGER,
+    upstreamBaseUrl: `http://127.0.0.1:${upstream.address().port}/v1`,
+    onProviderRequestStarted: evidence => starts.push(evidence),
+  })
+  t.after(() => quotaProxy.close())
+
+  const accepted = await postJson(`${quotaProxy.baseUrl}/responses`, {
+    model: 'gpt-5.6-sol', input: [{ role: 'user', content: 'bounded context' }], stream: true,
+  })
+  assert.equal(accepted.status, 200)
+  assert.equal(starts.length, 1)
+  assert.equal(starts[0].tokenLimit, Number.MAX_SAFE_INTEGER)
+  assert.equal(starts[0].maximumUnaccountedTokens, 272_000)
+  assert.equal(quotaProxy.snapshot().latestMaximumUnaccountedTokens, 272_000)
+  assert.equal(upstreamBodies.length, 1)
+  assert.equal(
+    upstreamBodies[0].max_output_tokens +
+      quotaProxy.snapshot().latestInputBound.maximumInputTokens,
+    272_000,
+  )
 })
 
 test('cumulative quota relay fails closed when completed SSE omits usage', async t => {
@@ -805,12 +855,9 @@ test('crash recovery burns an unresolved 16k route envelope before later reserva
 
   assert.equal(runtime._reserveChildTokenEnvelope('worker-after-crash', {
     logicalRole: 'worker', route: 'DIRECT', priorLeaseModelTokens: 0,
-  }).limit, 24_000)
-  assert.equal(runtime._reserveChildTokenEnvelope('remainder-after-crash', {
+  }).limit, 32_000)
+  assert.throws(() => runtime._reserveChildTokenEnvelope('remainder-after-crash', {
     logicalRole: 'independent-reviewer', route: 'DIRECT', priorLeaseModelTokens: 0,
-  }).limit, 8_000)
-  assert.throws(() => runtime._reserveChildTokenEnvelope('overflow-after-crash', {
-    logicalRole: 'worker', route: 'DIRECT', priorLeaseModelTokens: 0,
   }), error => error.code === 'BUDGET_EXHAUSTED')
 })
 
@@ -837,6 +884,68 @@ test('crash recovery does not double-charge exact request-bound usage', () => {
   assert.equal(runtime.budget.snapshot().tokensUsed, 4_000)
 })
 
+test('accounting-only unknown spend and crash recovery charge one response, not the sentinel', () => {
+  const runtime = Object.create(CodexSupervisorRuntime.prototype)
+  runtime.budget = new BudgetController({
+    limits: {
+      wallMs: 60_000, tokens: Number.MAX_SAFE_INTEGER,
+      sessions: 10, launches: 10,
+    },
+    phases: {},
+  })
+  runtime.childTokenReservations = new Map()
+  const worker = runtime._reserveChildTokenEnvelope('default-worker', {
+    logicalRole: 'worker', route: 'DIRECT', priorLeaseModelTokens: 0,
+  })
+  assert.equal(worker.finiteTokenBudget, false)
+  assert.deepEqual(runtime._chargeUnknownChildTokenUpperBound('default-worker', 272_000), {
+    charged: 272_000,
+    limit: Number.MAX_SAFE_INTEGER,
+    consumed: 272_000,
+    remaining: Number.MAX_SAFE_INTEGER - 272_000,
+  })
+  runtime._releaseChildTokenEnvelope('default-worker')
+  const checker = runtime._reserveChildTokenEnvelope('default-checker', {
+    logicalRole: 'independent-reviewer', route: 'DIRECT', priorLeaseModelTokens: 0,
+  })
+  assert.equal(checker.finiteTokenBudget, false)
+  assert.equal(checker.limit, Number.MAX_SAFE_INTEGER - 272_000)
+
+  const sessionHash = crypto.createHash('sha256')
+    .update('accounting-only-crash-session').digest('hex')
+  const recovered = Object.create(CodexSupervisorRuntime.prototype)
+  recovered.activation = { generation: 2 }
+  recovered.options = { accountingAuthority: { replay: () => ({ records: [
+    accountingRecord(
+      1,
+      `codex-provider-pending:${sessionHash}:1:${Number.MAX_SAFE_INTEGER}:272000:0:0`,
+    ),
+  ] }) } }
+  recovered.budget = new BudgetController({
+    limits: {
+      wallMs: 60_000, tokens: Number.MAX_SAFE_INTEGER,
+      sessions: 10, launches: 10,
+    },
+    phases: {},
+  })
+  recovered.childTokenReservations = new Map()
+  recovered.pendingProviderEnvelopes = new Map()
+  recovered.recoveredProviderEnvelopeHighWater = new Map()
+  recovered._checkpointAccounting = () => null
+  assert.deepEqual(recovered._recoverUnresolvedProviderEnvelopes(), [{
+    key: `${sessionHash}:1`,
+    disposition: 'RECOVERY_UPPER_BOUND_CHARGED',
+    chargedTokens: 272_000,
+    leaseHighWater: 272_000,
+  }])
+  assert.equal(recovered.budget.snapshot().tokensUsed, 272_000)
+  const recoveredChecker = recovered._reserveChildTokenEnvelope('recovered-checker', {
+    logicalRole: 'independent-reviewer', route: 'DIRECT', priorLeaseModelTokens: 0,
+  })
+  assert.equal(recoveredChecker.finiteTokenBudget, false)
+  assert.equal(recoveredChecker.limit, Number.MAX_SAFE_INTEGER - 272_000)
+})
+
 test('durable tool-call high-water rejects gaps and restores exact ordinals', () => {
   const continuationHash = crypto.createHash('sha256').update('continuation').digest('hex')
   assert.equal(codexToolCallHighWater([], continuationHash), 0)
@@ -860,41 +969,34 @@ test('activation quota reservations prevent concurrent child envelopes from mult
   const worker = runtime._reserveChildTokenEnvelope('worker', {
     logicalRole: 'worker', route: 'ROADMAP',
   })
-  const checker = runtime._reserveChildTokenEnvelope('checker', {
+  assert.equal(worker.limit, 48_000)
+  assert.throws(() => runtime._reserveChildTokenEnvelope('checker', {
     logicalRole: 'independent-reviewer', route: 'ROADMAP',
-  })
-  assert.deepEqual({ worker: worker.limit, checker: checker.limit }, {
-    worker: 24_000, checker: 24_000,
-  })
-  assert.throws(() => runtime._reserveChildTokenEnvelope('overflow', {
-    logicalRole: 'worker', route: 'ROADMAP',
   }), error => error.code === 'BUDGET_EXHAUSTED' &&
     error.details.tokensUsed === 0 && error.details.tokensReserved === 48_000)
 
   assert.deepEqual(runtime._consumeChildTokenReservation('worker', 8_000), {
-    limit: 24_000, consumed: 8_000, remaining: 16_000,
+    limit: 48_000, consumed: 8_000, remaining: 40_000,
   })
   assert.equal(runtime.budget.snapshot().tokensUsed, 8_000)
-  assert.deepEqual(runtime._releaseChildTokenEnvelope('checker'), {
-    limit: 24_000, consumed: 0, released: 24_000,
+  assert.deepEqual(runtime._releaseChildTokenEnvelope('worker'), {
+    limit: 48_000, consumed: 8_000, released: 40_000,
   })
   const route = runtime._reserveChildTokenEnvelope('route', {
     logicalRole: 'route-analyst', route: 'PRE_ROUTE',
   })
-  assert.equal(route.limit, 16_000)
+  assert.equal(route.limit, 8_000)
   const remainder = runtime._reserveChildTokenEnvelope('activation-remainder', {
     logicalRole: 'worker', route: 'ROADMAP',
   })
-  assert.equal(remainder.limit, 8_000)
+  assert.equal(remainder.limit, 32_000)
   assert.throws(() => runtime._reserveChildTokenEnvelope('still-overflow', {
     logicalRole: 'worker', route: 'ROADMAP',
   }), error => error.code === 'BUDGET_EXHAUSTED')
 
-  runtime._consumeChildTokenReservation('worker', 16_000)
-  runtime._releaseChildTokenEnvelope('worker')
-  runtime._consumeChildTokenReservation('route', 16_000)
+  runtime._consumeChildTokenReservation('route', 8_000)
   runtime._releaseChildTokenEnvelope('route')
-  runtime._consumeChildTokenReservation('activation-remainder', 8_000)
+  runtime._consumeChildTokenReservation('activation-remainder', 32_000)
   runtime._releaseChildTokenEnvelope('activation-remainder')
   assert.equal(runtime.budget.snapshot().tokensUsed, 48_000)
   assert.equal(runtime.childTokenReservations.size, 0)
@@ -903,7 +1005,7 @@ test('activation quota reservations prevent concurrent child envelopes from mult
   }), error => error.code === 'BUDGET_EXHAUSTED')
 })
 
-test('unknown billed route usage burns its 16k reservation before deterministic fallback', () => {
+test('unknown billed route usage burns its 8k reservation before deterministic fallback', () => {
   const runtime = Object.create(CodexSupervisorRuntime.prototype)
   runtime.budget = new BudgetController({
     limits: { wallMs: 60_000, tokens: 48_000, sessions: 10, launches: 10 },
@@ -914,28 +1016,23 @@ test('unknown billed route usage burns its 16k reservation before deterministic 
   const route = runtime._reserveChildTokenEnvelope('unknown-route', {
     logicalRole: 'route-analyst', route: 'PRE_ROUTE',
   })
-  assert.equal(route.limit, 16_000)
-  assert.deepEqual(runtime._chargeUnknownChildTokenUpperBound('unknown-route'), {
-    charged: 16_000, limit: 16_000, consumed: 16_000, remaining: 0,
+  assert.equal(route.limit, 8_000)
+  assert.deepEqual(runtime._chargeUnknownChildTokenUpperBound('unknown-route', 8_000), {
+    charged: 8_000, limit: 8_000, consumed: 8_000, remaining: 0,
   })
-  assert.equal(runtime.budget.snapshot().tokensUsed, 16_000)
+  assert.equal(runtime.budget.snapshot().tokensUsed, 8_000)
   assert.deepEqual(runtime._releaseChildTokenEnvelope('unknown-route'), {
-    limit: 16_000, consumed: 16_000, released: 0,
+    limit: 8_000, consumed: 8_000, released: 0,
   })
 
   const worker = runtime._reserveChildTokenEnvelope('post-route-worker', {
     logicalRole: 'worker', route: 'DIRECT',
   })
-  const activationRemainder = runtime._reserveChildTokenEnvelope('post-route-remainder', {
+  assert.equal(worker.limit, 40_000)
+  assert.throws(() => runtime._reserveChildTokenEnvelope('post-route-remainder', {
     logicalRole: 'independent-reviewer', route: 'DIRECT',
-  })
-  assert.deepEqual({ worker: worker.limit, activationRemainder: activationRemainder.limit }, {
-    worker: 24_000, activationRemainder: 8_000,
-  })
-  assert.throws(() => runtime._reserveChildTokenEnvelope('post-route-overflow', {
-    logicalRole: 'worker', route: 'DIRECT',
   }), error => error.code === 'BUDGET_EXHAUSTED' &&
-    error.details.tokensUsed === 16_000 && error.details.tokensReserved === 32_000)
+    error.details.tokensUsed === 8_000 && error.details.tokensReserved === 40_000)
 })
 
 function authority(scheduler, parentLease = null) {
