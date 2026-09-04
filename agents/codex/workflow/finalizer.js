@@ -22,7 +22,10 @@ const {
   readFileStrict,
   withStrictAnchoredManifestPath,
 } = require('./runtime-state.js')
-const { createTerminalFinalizationIntentAuthority } = require('./run-record.js')
+const {
+  createTerminalFinalizationIntentAuthority,
+  recoverTerminalPublicationResiduesAnchored,
+} = require('./run-record.js')
 
 const CLEANUP_SCHEMA_VERSION = 4
 
@@ -594,7 +597,7 @@ class Finalizer {
     }
     for (const field of [
       'outcome', 'runId', 'activationId', 'generation', 'sequence', 'missionHash', 'requestEnvelopeHash',
-      'workspaceEpoch', 'deliverableManifestHash',
+      'workspaceEpoch', 'deliverableManifestHash', 'completedAt',
     ]) {
       if (record[field] !== expected[field]) return { valid: false, reason: 'TERMINAL_RECORD_FOREIGN', field }
     }
@@ -603,6 +606,11 @@ class Finalizer {
     }
     if (stableStringify(record.producedEvidenceHashes || []) !== stableStringify(expected.producedEvidenceHashes || [])) {
       return { valid: false, reason: 'TERMINAL_RECORD_FOREIGN', field: 'producedEvidenceHashes' }
+    }
+    for (const field of ['terminalEnvelope', 'releaseIntent']) {
+      if (stableStringify(record[field] ?? null) !== stableStringify(expected[field] ?? null)) {
+        return { valid: false, reason: 'TERMINAL_RECORD_FOREIGN', field }
+      }
     }
     try {
       this._verifyManifest(normalizeManifest(expected.deliverableManifest || []))
@@ -616,7 +624,10 @@ class Finalizer {
     }
     const terminalEvent = this.stateStore.eventLog.readAll()[record.terminalEventSequence - 1]
     const expectedEventType = expected.releaseIntent ? expected.releaseIntent.eventId : 'FINAL_RECORD_READY'
-    if (!terminalEvent || terminalEvent.type !== expectedEventType || terminalEvent.hash !== record.terminalEventHash) {
+    if (!terminalEvent || record.terminalEventType !== expectedEventType ||
+        terminalEvent.type !== expectedEventType || terminalEvent.hash !== record.terminalEventHash ||
+        (expected.releaseIntent && (record.terminalEventSequence !== expected.releaseIntent.eventSequence ||
+          record.terminalEventHash !== expected.releaseIntent.eventHash))) {
       return {
         valid: false,
         reason: 'TERMINAL_EVENT_MISMATCH',
@@ -888,8 +899,10 @@ class Finalizer {
   }
 
   _createOrVerifyTerminal(record) {
-    return this._withTerminalRecordAuthority((terminalPath, verifyLineage) =>
-      this._createOrVerifyTerminalAt(record, terminalPath, verifyLineage))
+    return this._withTerminalRecordAuthority((terminalPath, verifyLineage) => {
+      recoverTerminalPublicationResiduesAnchored(terminalPath, verifyLineage, { fsImpl: this.fs })
+      return this._createOrVerifyTerminalAt(record, terminalPath, verifyLineage)
+    })
   }
 }
 

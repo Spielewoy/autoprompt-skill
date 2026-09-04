@@ -13,6 +13,8 @@ const {
 } = require('../../scripts/generate-provider-contracts.cjs')
 
 const ROOT = path.resolve(__dirname, '..', '..')
+const LOCAL_BUILD_VERSION = fs.readFileSync(path.join(ROOT, 'agents/codex/VERSION'), 'utf8').trim()
+const LOCAL_BUILD_PATTERN = LOCAL_BUILD_VERSION.replaceAll('.', '\\.')
 const PRIVACY_GUIDE = 'docs/guides/codex-v2-local-records.md'
 const PUBLIC_ROUTE_DOCS = [
   'README.md',
@@ -28,8 +30,8 @@ const PUBLIC_ROUTE_DOCS = [
   'assets/i18n/ko/anatomy.svg',
   'assets/i18n/zh/anatomy.svg',
 ]
-const LOCAL_BUILD_MARKER = 'codex-v2-release-status: local-v1.0.28-build-not-published'
-const SVG_LOCAL_BUILD_MARKER = 'data-release-status="local-v1.0.28-build-not-published"'
+const LOCAL_BUILD_MARKER = `codex-v2-release-status: local-v${LOCAL_BUILD_VERSION}-build-not-published`
+const SVG_LOCAL_BUILD_MARKER = `data-release-status="local-v${LOCAL_BUILD_VERSION}-build-not-published"`
 const ANATOMY_DIAGRAMS = PUBLIC_ROUTE_DOCS.filter(file => file.endsWith('anatomy.svg'))
 const HOW_IT_WORKS_DIAGRAMS = [
   'assets/how-it-works-loop.svg',
@@ -54,10 +56,10 @@ test('Codex local-record user docs define fail-closed retention and export autho
   const readme = read('README.md')
   const guide = read(PRIVACY_GUIDE)
 
-  assert.match(readme, /local v1\.0\.28 build/i)
+  assert.match(readme, new RegExp(`local v${LOCAL_BUILD_PATTERN} build`, 'i'))
   assert.match(readme, /not (?:been )?published/i)
   assert.match(readme, /codex-v2-local-records\.md/)
-  assert.match(guide, /local Codex v1\.0\.28 build/i)
+  assert.match(guide, new RegExp(`local Codex v${LOCAL_BUILD_PATTERN} build`, 'i'))
   assert.match(guide, /not been published as a package or release/i)
   assert.match(guide, /automatic deletion is disabled/i)
   assert.match(guide, /expiry is not deletion authority/i)
@@ -69,6 +71,12 @@ test('Codex local-record user docs define fail-closed retention and export autho
   assert.match(guide, /explicit aggregate token budget or physical[\s\S]*?tool-call ceiling[\s\S]*?enforced exactly/i)
   assert.match(guide, /controller-owned loopback relay applies a preventive per-response token envelope/i)
   assert.match(guide, /272,000-token model context/i)
+  assert.match(guide, /128,000-token\s+maximum response/i)
+  assert.match(guide, /maximum is not a cumulative task budget/i)
+  assert.match(guide, /concurrent children under an explicit budget wait/i)
+  assert.match(readme, /full Codex runtime validation is Linux-only/i)
+  assert.match(guide, /native Windows has no implemented\s+descriptor-anchored filesystem adapter/i)
+  assert.match(guide, /macOS has not been validated/i)
   assert.match(guide, /request that cannot fit an explicit allowance is refused before it reaches the\s+upstream provider/i)
   assert.match(guide, /total\s+input including cached input/i)
   assert.match(guide, /disconnected child\s+cancels its upstream request/i)
@@ -113,7 +121,7 @@ test('Codex install docs separate the unpublished provider package and bind fina
   assert.match(readme, /0 npm dependencies[^\n]*0 optional dependencies/i)
 })
 
-test('Codex target route docs consistently identify the local v1.0.28 build as not published', () => {
+test('Codex target route docs consistently identify the local v1.0.29 build as not published', () => {
   const roadmap = read('AUTOPROMPT-TOTAL-FIX-MAP.md')
   const p11Status = phaseStatus(roadmap, 'P11 Canary and paired evaluation')
   const p12Status = phaseStatus(roadmap, 'P12 Legacy removal and documentation')
@@ -128,7 +136,7 @@ test('Codex target route docs consistently identify the local v1.0.28 build as n
     }
     if (p12Status !== 'DONE') {
       const expected = relative.endsWith('.svg') ? SVG_LOCAL_BUILD_MARKER : LOCAL_BUILD_MARKER
-      assert.ok(source.includes(expected), `${relative}: identifies the local v1.0.28 build as not published`)
+      assert.ok(source.includes(expected), `${relative}: identifies the local v1.0.29 build as not published`)
       assert.doesNotMatch(source, /development-only|development only|not released before P12|until P12/i,
         `${relative}: removes the obsolete phase-based release wording`)
     }

@@ -55,6 +55,32 @@ test('AP-TEST-015 pull requests run the full packed Codex lifecycle on Linux and
   assert.match(packageJson.scripts['test:lifecycle'], /tests\/source\/packed-codex-lifecycle\.test\.cjs/)
 })
 
+test('beta pushes run the Codex source and packed lifecycle suites with a mandatory pinned native CLI', () => {
+  const workflow = read('.github/workflows/ci.yml').replaceAll('\r\n', '\n')
+  const trigger = workflow.slice(workflow.indexOf('  push:\n'), workflow.indexOf('  pull_request:\n'))
+  assert.match(trigger, /^      - main$/mu)
+  assert.match(trigger, /^      - beta-test\/codex-v2$/mu)
+  const job = workflowJob(workflow, 'node-compatibility')
+  assert.match(job, /^    runs-on: ubuntu-latest$/mu)
+  assert.doesNotMatch(job, /^    if:/mu)
+  assert.match(job, /^    timeout-minutes: \$\{\{ matrix\.node == '24' && 90 \|\| 15 \}\}$/mu)
+  const steps = job.split(/^      - name: /mu).slice(1)
+  const installIndex = steps.findIndex(step => step.includes('@openai/codex@0.148.0'))
+  assert.notEqual(installIndex, -1)
+  const install = steps[installIndex]
+  assert.match(install, /^        if: matrix\.node == '24'$/mu)
+  assert.match(install, /npm install --prefix "\$\{\{ runner\.temp \}\}\/autoprompt-codex-cli"/u)
+  assert.match(install, /node_modules\/\.bin" >> "\$GITHUB_PATH"/u)
+  for (const command of ['npm run test:codex-core', 'npm run test:codex-lifecycle']) {
+    const index = steps.findIndex(step => step.includes(`        run: ${command}\n`))
+    assert.ok(index > installIndex, `${command} runs after installing the pinned CLI`)
+    assert.match(steps[index], /^        if: matrix\.node == '24'$/mu)
+    assert.match(steps[index], /^          AUTOPROMPT_PINNED_CODEX: \$\{\{ runner\.temp \}\}\/autoprompt-codex-cli\/node_modules\/@openai\/codex\/bin\/codex\.js$/mu)
+  }
+  assert.equal(literalOccurrences(job, 'run: npm run test:codex-core'), 1)
+  assert.equal(literalOccurrences(job, 'run: npm run test:codex-lifecycle'), 1)
+})
+
 test('benchmark and every Codex source suite are each wired exactly once', () => {
   const packageJson = JSON.parse(read('package.json'))
   const workflow = read('.github/workflows/ci.yml')

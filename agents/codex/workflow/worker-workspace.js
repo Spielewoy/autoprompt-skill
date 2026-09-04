@@ -25,6 +25,7 @@ const {
 const HASH_PATTERN = /^[a-f0-9]{64}$/
 const TRANSPORT_RETRY_PATTERN = /^(.+)-transport-retry-1$/u
 const FILE_SLOT_PATTERN = /^<[A-Za-z][A-Za-z0-9._-]{0,63}>$/u
+const SURVIVABLE_WORKSPACE_STATES = new Set(['PREPARED', 'ROLLED_BACK', 'COMMITTED', 'QUARANTINED'])
 
 class WorkerWorkspaceError extends Error {
   constructor(code, message, details) {
@@ -405,7 +406,7 @@ function validSurvivalManifest(manifest, record) {
       manifest.sourceWorkItemId !== record.workItemId ||
       manifest.sourceAssignmentHash !== record.assignmentHash ||
       manifest.sourceBindingHash !== record.binding.bindingHash ||
-      !['PREPARED', 'ROLLED_BACK', 'COMMITTED'].includes(manifest.sourceStatus) ||
+      !SURVIVABLE_WORKSPACE_STATES.has(manifest.sourceStatus) ||
       typeof manifest.reasonCode !== 'string' || !manifest.reasonCode ||
       !HASH_PATTERN.test(manifest.candidateHash || '') ||
       !HASH_PATTERN.test(manifest.snapshotHash || '') ||
@@ -702,7 +703,9 @@ function removeOptionalEmptyDirectory(directory, fsImpl = fs) {
 }
 
 function fsyncFile(filename, fsImpl = fs) {
-  const descriptor = fsImpl.openSync(filename, 'r+')
+  // POSIX permits fsync on a readable descriptor. Requiring write access here
+  // makes a valid read-only product impossible to preserve for a nonroot user.
+  const descriptor = fsImpl.openSync(filename, process.platform === 'win32' ? 'r+' : 'r')
   try { fsImpl.fsyncSync(descriptor) } finally { fsImpl.closeSync(descriptor) }
 }
 
@@ -1056,7 +1059,7 @@ class WorkerWorkspaceManager {
     const admission = options.admission
     const reasonCode = typeof options.reasonCode === 'string' && options.reasonCode
       ? options.reasonCode : 'CONTROLLER_BOOKKEEPING_FAILURE'
-    if (!['PREPARED', 'ROLLED_BACK', 'COMMITTED', 'QUARANTINED'].includes(record.status) ||
+    if (!SURVIVABLE_WORKSPACE_STATES.has(record.status) ||
         !admission || !Array.isArray(admission.actualFilesChanged) ||
         !Array.isArray(admission.after) || admission.actualFilesChanged.length === 0) {
       fail('WORKER_SURVIVAL_INVALID', 'exact-version survival requires one admitted private or committed work product')
@@ -1087,7 +1090,7 @@ class WorkerWorkspaceManager {
         relative,
         type: state && state.hash !== null ? 'file' : 'missing',
         hash: state && state.hash || null,
-        mode: state && state.mode || null,
+        mode: state?.mode ?? null,
       })
     }))
     const snapshotHash = sha256(stableStringify(privateSnapshot))
@@ -1104,9 +1107,35 @@ class WorkerWorkspaceManager {
     const survivalRoot = path.join(this.privateRoot, 'candidate-survivals', survivalHash)
     const filesRoot = path.join(survivalRoot, 'files')
     const manifestPath = path.join(survivalRoot, 'manifest.json')
-    if (!this.fs.existsSync(survivalRoot)) {
+    // A failed copy or manifest publication can leave this content-addressed
+    // directory incomplete. Reuse only exact admitted copies and complete the
+    // missing suffix; directory existence alone is not a committed result.
+    if (!this.fs.existsSync(manifestPath)) {
       ensurePhysicalDirectory(survivalRoot, this.privateRoot, this.fs)
       ensurePhysicalDirectory(filesRoot, survivalRoot, this.fs)
+      const allowedFiles = new Set(files.filter(entry => entry.type === 'file').map(entry => entry.relative))
+      const allowedDirectories = new Set()
+      for (const relative of allowedFiles) {
+        let parent = path.posix.dirname(relative)
+        while (parent !== '.') {
+          allowedDirectories.add(parent)
+          parent = path.posix.dirname(parent)
+        }
+      }
+      const validatePartial = directory => {
+        for (const name of this.fs.readdirSync(directory)) {
+          const absolute = path.join(directory, name)
+          const relative = path.relative(filesRoot, absolute).split(path.sep).join('/')
+          const stat = this.fs.lstatSync(absolute)
+          if (stat.isDirectory() && !stat.isSymbolicLink() && allowedDirectories.has(relative)) {
+            validatePartial(absolute)
+          } else if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.nlink) !== 1 ||
+              !allowedFiles.has(relative)) {
+            fail('WORKER_SURVIVAL_TAMPERED', `unexpected entry in partial work-product preservation: ${relative}`)
+          }
+        }
+      }
+      validatePartial(filesRoot)
       for (const entry of files) {
         if (entry.type === 'missing') continue
         const source = resolveInside(record.workspacePath, entry.relative)
@@ -1116,7 +1145,9 @@ class WorkerWorkspaceManager {
           fail('WORKER_SURVIVAL_TAMPERED', `postimage changed before exact-version survival copy: ${entry.relative}`)
         }
         ensurePhysicalDirectory(path.dirname(destination), filesRoot, this.fs)
-        this.fs.copyFileSync(source, destination, this.fs.constants.COPYFILE_EXCL)
+        if (!fileState(destination, this.fs)) {
+          this.fs.copyFileSync(source, destination, this.fs.constants.COPYFILE_EXCL)
+        }
         const copied = fileState(destination, this.fs)
         if (!copied || copied.hash !== entry.hash || copied.mode !== entry.mode) {
           fail('WORKER_SURVIVAL_TAMPERED', `exact-version survival copy differs from its admitted postimage: ${entry.relative}`)

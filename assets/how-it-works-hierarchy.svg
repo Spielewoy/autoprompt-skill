@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1080" viewBox="0 0 1440 1080" role="img" aria-labelledby="title desc" data-release-status="local-v1.0.28-build-not-published">
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1080" viewBox="0 0 1440 1080" role="img" aria-labelledby="title desc" data-release-status="local-v1.0.29-build-not-published">
   <title id="title">Codex v2 route-aware agent hierarchy</title>
-  <desc id="desc">The local, not-published Codex v1.0.28 build uses a shallow hierarchy for DIRECT and LIGHT, and admits coordinators and an optional manager only for ROADMAP work.</desc>
+  <desc id="desc">The local, not-published Codex v1.0.29 build uses a shallow hierarchy for DIRECT and LIGHT, and admits coordinators and an optional manager only for ROADMAP work.</desc>
   <defs>
     <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#e7ebeb" stroke-width="1"/></pattern>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8.5" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#59696b"/></marker>
@@ -10,7 +10,7 @@
   </defs>
   <rect width="1440" height="1080" fill="#fbfcfc"/><rect width="1440" height="1080" fill="url(#grid)"/>
 
-  <rect x="494" y="22" width="452" height="34" rx="17" class="badge"/><text x="720" y="45" class="badgeText" text-anchor="middle">CODEX V2 · LOCAL V1.0.28 BUILD · NOT PUBLISHED</text>
+  <rect x="494" y="22" width="452" height="34" rx="17" class="badge"/><text x="720" y="45" class="badgeText" text-anchor="middle">CODEX V2 · LOCAL V1.0.29 BUILD · NOT PUBLISHED</text>
   <g><rect x="610" y="82" width="220" height="58" rx="9" class="card teal"/><text x="720" y="119" class="label" text-anchor="middle">Request</text></g>
   <path d="M720 140V174" class="flow"/>
   <g>

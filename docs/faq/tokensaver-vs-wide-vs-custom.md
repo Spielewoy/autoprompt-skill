@@ -1,7 +1,7 @@
 # What do mode, max_subs, agents, and path do?
 
-<!-- codex-v2-release-status: local-v1.0.28-build-not-published -->
-> Codex v2 `path=` status: Local v1.0.28 build; not published.
+<!-- codex-v2-release-status: local-v1.0.29-build-not-published -->
+> Codex v2 `path=` status: Local v1.0.29 build; not published.
 
 These controls change concurrency, model routing, and, on Codex v2, work-route
 selection. They do not remove checks.

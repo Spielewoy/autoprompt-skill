@@ -1032,6 +1032,25 @@ test('Codex checker verdicts bind named outcomes directly to substantive command
   const strongScratchPassOutput = JSON.stringify({
     total: 20, passCount: 20, failureCount: 0, status: 'PASS',
   })
+  const setupScratchPath = path.join(checkerScratchBoundary.writableScratchRoot, 'tmp/independent_harness.py')
+  const setupThenCorrectedScratch = await runScenario({
+    aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
+    compactOutcomes: true,
+    commandEvents: [{
+      command: `python3 ${JSON.stringify(setupScratchPath)} ${JSON.stringify(frozen)}`,
+      status: 'failed', exit_code: 1,
+      aggregated_output: "ModuleNotFoundError: No module named 'unavailable_checker_dependency'",
+    }, {
+      command: wrappedStrictScratchHarness, status: 'completed', exit_code: 0,
+      aggregated_output: strongScratchPassOutput,
+    }],
+  })
+  assert.equal(setupThenCorrectedScratch.code, 'CHECK_INCONCLUSIVE')
+  assert.equal(setupThenCorrectedScratch.cause.event, 'CHECK_SCRATCH_CONFIRMATION_REQUIRED',
+    'a corrected setup check in the same adapter turn remains provisional until independent confirmation')
+  assert.equal(setupThenCorrectedScratch.transportEvidence.commandExecutionFailures.count, 1)
+  assert.equal(setupThenCorrectedScratch.transportEvidence.verificationObservations.scratchHarnessInvocationCount, 2)
+
   const sealedScratchHarnessPass = await runScenario({
     aggregateCode: 'PASS', outcomeStatus: 'PASS', authorizedCommand: null,
     compactOutcomes: true,
@@ -1903,6 +1922,7 @@ test('Codex checker prompt removes duplicated doctrine while retaining exact obl
     'Cover every exact named check and verification obligation; one admissible harness may cover several IDs.',
     'PASS requires independently derived expected behavior and an executed end-to-end observable result on the frozen exact version. Static inspection may prove a concrete FAIL but never PASS.',
     'Exercise positive, negative, boundary, temporal-order, equivalence-separation, and adversarial composition cases wherever applicable; do not derive the expected result from the implementation being checked.',
+      'Derive distinguishable input classes and before/at/between/after boundary witnesses from the request before inspecting the implementation; do not reuse the product\'s equivalence or ordering algorithm as the source of expected results.',
     'Bind PASS to one unique zero exit from unchanged controller-declared pre-mutation test inputs; newly created or modified harnesses never self-certify PASS. Bind a concrete product FAIL to one authenticated nonzero check. Setup, tool, dependency, or consumer unavailability is CHECK_INCONCLUSIVE or RUNTIME_FAILURE.',
     'Return every named test outcome plus the underlying evidence IDs and independent reference method; keep large evidence in scratch and return bounded diagnostics only.',
   ])

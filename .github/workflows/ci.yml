@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - beta-test/codex-v2
   pull_request:
     branches:
       - main
@@ -20,7 +21,7 @@ jobs:
   node-compatibility:
     name: Node ${{ matrix.node }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: ${{ matrix.node == '24' && 90 || 15 }}
     strategy:
       fail-fast: false
       matrix:
@@ -47,6 +48,21 @@ jobs:
         run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0
       - name: Run package, provider, and benchmark tests
         run: npm test
+      - name: Install pinned Codex for native transport probes
+        if: matrix.node == '24'
+        run: |
+          npm install --prefix "${{ runner.temp }}/autoprompt-codex-cli" --no-save --package-lock=false --ignore-scripts @openai/codex@0.148.0
+          printf '%s\n' "${{ runner.temp }}/autoprompt-codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Run Codex core including required native transport probes
+        if: matrix.node == '24'
+        env:
+          AUTOPROMPT_PINNED_CODEX: ${{ runner.temp }}/autoprompt-codex-cli/node_modules/@openai/codex/bin/codex.js
+        run: npm run test:codex-core
+      - name: Run packed Codex lifecycle
+        if: matrix.node == '24'
+        env:
+          AUTOPROMPT_PINNED_CODEX: ${{ runner.temp }}/autoprompt-codex-cli/node_modules/@openai/codex/bin/codex.js
+        run: npm run test:codex-lifecycle
 
   windows-provider-contracts:
     name: Windows provider contracts

@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1200" viewBox="0 0 1280 1200" role="img" aria-labelledby="title desc" data-release-status="local-v1.0.28-build-not-published">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1200" viewBox="0 0 1280 1200" role="img" aria-labelledby="title desc" data-release-status="local-v1.0.29-build-not-published">
   <title id="title">How Codex v2 routes Autoprompt work</title>
-  <desc id="desc">The local, not-published Codex v1.0.28 build selects DIRECT, LIGHT, or ROADMAP. Each route has different planning and coordination, then risk-aware independent review and testing and a final record.</desc>
+  <desc id="desc">The local, not-published Codex v1.0.29 build selects DIRECT, LIGHT, or ROADMAP. Each route has different planning and coordination, then risk-aware independent review and testing and a final record.</desc>
   <defs>
     <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#e7ebeb" stroke-width="1"/></pattern>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8.5" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#59696b"/></marker>
@@ -11,7 +11,7 @@
   <rect width="1280" height="1200" fill="#fbfcfc"/><rect width="1280" height="1200" fill="url(#grid)"/>
 
   <rect x="414" y="24" width="452" height="34" rx="17" class="badge"/>
-  <text x="640" y="47" class="badgeText" text-anchor="middle">CODEX V2 · LOCAL V1.0.28 BUILD · NOT PUBLISHED</text>
+  <text x="640" y="47" class="badgeText" text-anchor="middle">CODEX V2 · LOCAL V1.0.29 BUILD · NOT PUBLISHED</text>
 
   <g><rect x="530" y="82" width="220" height="60" rx="9" class="card teal"/><text x="640" y="120" class="label" text-anchor="middle">Request</text></g>
   <path d="M640 142V176" class="flow"/>

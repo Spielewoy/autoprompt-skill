@@ -47,7 +47,9 @@ const IMMUTABLE_CONTENT_ADDRESSED_DIRECTORIES = Object.freeze([
 ])
 const PLAN_CONTENT_ADDRESSED_PATH_PATTERN = /^plan\/(?:projections|artifacts|transactions|lineages)\/[a-f0-9]{64}\.json$/
 const CONTENT_ADDRESSED_TEMP_PATTERN = /^\.([a-f0-9]{64}\.json)\.([1-9]\d*)\.([a-f0-9]{16})\.tmp$/
-const ATOMIC_WRITE_TEMP_PATTERN = /^\.(.+)\.([1-9]\d*)\.([a-f0-9]{16})\.tmp$/
+// Registered writes and event-log writes use distinct, finite temp formats.
+const ATOMIC_WRITE_TEMP_PATTERN = /^\.(.+)\.([1-9]\d*)\.(?:[a-f0-9]{16}|[1-9]\d*\.[a-f0-9]{12})\.tmp$/
+const TERMINAL_CREATE_TEMP_PATTERN = /^\.(.+)\.([1-9]\d*)\.[a-f0-9]{16}\.create$/
 const RUNTIME_PATHS = Object.freeze({
   metadata: 'metadata.json',
   metadataDigest: 'metadata.sha256',
@@ -877,29 +879,36 @@ function readTerminalFinalizationIntentAt(runPath, options = {}) {
 }
 
 function recoverTerminalFinalizationIntentPublicationResiduesAnchored(authority, options = {}) {
+  return recoverTerminalPublicationResiduesAnchored(
+    authority.anchoredIntentPath, authority.verifyLineage,
+    { ...options, relativeDirectory: 'runtime', pattern: ATOMIC_WRITE_TEMP_PATTERN },
+  )
+}
+
+function recoverTerminalPublicationResiduesAnchored(publicationPath, verifyLineage, options = {}) {
   const fsImpl = options.fsImpl || fs
-  const intentPath = authority.anchoredIntentPath
-  const directory = authority.anchoredDirectory
-  const basename = path.basename(intentPath)
+  const directory = path.dirname(publicationPath)
+  const basename = path.basename(publicationPath)
+  const pattern = options.pattern || TERMINAL_CREATE_TEMP_PATTERN
   const recovered = []
   for (const entry of fsImpl.readdirSync(directory, { withFileTypes: true })) {
-    const match = ATOMIC_WRITE_TEMP_PATTERN.exec(entry.name)
+    const match = pattern.exec(entry.name)
     if (!match || match[1] !== basename) continue
-    const relative = `runtime/${entry.name}`
+    const relative = options.relativeDirectory ? `${options.relativeDirectory}/${entry.name}` : entry.name
     assertAtomicWriterInactive(match[2], relative)
     const temporary = path.join(directory, entry.name)
     const temporaryStats = fsImpl.lstatSync(temporary)
     if (!temporaryStats.isFile() || temporaryStats.isSymbolicLink() ||
         (temporaryStats.mode & 0o777) !== FILE_MODE) {
-      throw new RunRecordError('RUN_RECORD_UNSAFE', `Terminal finalization intent residue is unsafe: ${relative}`)
+      throw new RunRecordError('RUN_RECORD_UNSAFE', `Terminal publication residue is unsafe: ${relative}`)
     }
     let published = null
-    try { published = fsImpl.lstatSync(intentPath) } catch (error) {
+    try { published = fsImpl.lstatSync(publicationPath) } catch (error) {
       if (!error || error.code !== 'ENOENT') throw error
     }
     if (published === null) {
       if (Number(temporaryStats.nlink) !== 1) {
-        throw new RunRecordError('RUN_RECORD_UNSAFE', `Unpublished terminal finalization intent residue has an unsafe link count: ${relative}`)
+        throw new RunRecordError('RUN_RECORD_UNSAFE', `Unpublished terminal residue has an unsafe link count: ${relative}`)
       }
     } else {
       const sameInode = samePhysicalFile(temporaryStats, published)
@@ -908,15 +917,22 @@ function recoverTerminalFinalizationIntentPublicationResiduesAnchored(authority,
       const lostCreateRace = published.isFile() && !published.isSymbolicLink() &&
         !sameInode && Number(temporaryStats.nlink) === 1 && Number(published.nlink) === 1
       if (!completedPublication && !lostCreateRace) {
-        throw new RunRecordError('RUN_RECORD_UNSAFE', `Terminal finalization intent publication residue is ambiguous: ${relative}`)
+        throw new RunRecordError('RUN_RECORD_UNSAFE', `Terminal publication residue is ambiguous: ${relative}`)
       }
     }
-    authority.verifyLineage()
+    verifyLineage()
     fsImpl.unlinkSync(temporary)
     recovered.push(relative)
   }
   if (recovered.length) fsyncDirectory(directory, fsImpl)
   return Object.freeze(recovered)
+}
+
+function recoverTerminalRecordPublicationResidues(runPath, options = {}) {
+  const fsImpl = options.fsImpl || fs
+  const terminalPath = path.join(path.resolve(runPath), RUNTIME_PATHS.terminal)
+  return withStrictAnchoredManifestPath(terminalPath, fsImpl, (anchoredPath, verifyLineage) =>
+    recoverTerminalPublicationResiduesAnchored(anchoredPath, verifyLineage, options))
 }
 
 function recoverTerminalFinalizationIntentPublicationResidues(runPath, options = {}) {
@@ -1434,6 +1450,7 @@ function openRunRecord(runPath, options = {}) {
   })
   recoverContentAddressedPublicationResidues(record)
   recoverTerminalFinalizationIntentPublicationResidues(record.runPath)
+  recoverTerminalRecordPublicationResidues(record.runPath)
   recoverUnpublishedAtomicWriteResidues(record)
   auditRunRecordTree(record, { ...options, permissions: false })
   return record
@@ -1455,6 +1472,7 @@ module.exports = {
   validateTerminalFinalizationIntent, createTerminalFinalizationIntentAuthority,
   createOrVerifyTerminalFinalizationIntentAt, readTerminalFinalizationIntentAt,
   recoverTerminalFinalizationIntentPublicationResidues,
+  recoverTerminalRecordPublicationResidues, recoverTerminalPublicationResiduesAnchored,
   recoverUnpublishedAtomicWriteResidues,
   aliasEntryHash, appendAliasTelemetry, readAliasTelemetry, recoverAliasTelemetry, validateAliasTelemetryRecord,
   createPreMutationBaseline, createProductionPreMutationBaseline,

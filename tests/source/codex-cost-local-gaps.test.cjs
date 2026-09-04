@@ -8,6 +8,7 @@ const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
+const { pinnedCodexCli } = require('../helpers/pinned-codex-cli.cjs')
 
 const root = path.resolve(__dirname, '..', '..')
 const workflow = path.join(root, 'agents', 'codex', 'workflow')
@@ -49,20 +50,9 @@ const CAPABILITIES = Object.freeze({
 })
 let sequence = 0
 
-function pinnedCodexCli() {
-  const candidates = [process.env.AUTOPROMPT_PINNED_CODEX].filter(Boolean)
-  return candidates.find(candidate => {
-    if (!fs.existsSync(candidate)) return false
-    const result = childProcess.spawnSync(process.execPath, [candidate, '--version'], {
-      encoding: 'utf8', timeout: 10_000,
-    })
-    return result.status === 0 && /codex-cli 0\.148\.0/u.test(result.stdout)
-  }) || null
-}
-
 function runPinnedCodex(cli, argv, options) {
   return new Promise((resolve, reject) => {
-    const child = childProcess.spawn(process.execPath, [cli, ...argv], {
+    const child = childProcess.spawn(cli.command, [...cli.args, ...argv], {
       cwd: options.cwd,
       env: options.env,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -335,7 +325,10 @@ test('pinned Codex 0.148 emits one countable lifecycle for each direct patch and
           ? {
               type: 'function_call', id: 'fc-1', call_id: 'call-shell',
               name: 'shell_command',
-              arguments: JSON.stringify({ command: 'pwd', workdir: directory }),
+              arguments: JSON.stringify({
+                command: 'node -e "process.stdout.write(\'x\'.repeat(12000))"',
+                workdir: directory,
+              }),
             }
           : {
               type: 'message', role: 'assistant', id: 'msg-final',
@@ -394,6 +387,7 @@ test('pinned Codex 0.148 emits one countable lifecycle for each direct patch and
     '-c', 'include_environment_context=false',
     '-c', 'skills.include_instructions=false',
     '-c', 'project_doc_max_bytes=0', '-c', 'plugins={}', '-c', 'marketplaces={}',
+    '-c', 'tool_output_token_limit=1000', '-c', 'model_auto_compact_token_limit=32768',
     '-c', 'sandbox_workspace_write.network_access=false',
     '-m', 'gpt-5.6-sol', '--sandbox', 'workspace-write', '-C', directory, '-',
   ], {
@@ -433,7 +427,14 @@ test('pinned Codex 0.148 emits one countable lifecycle for each direct patch and
   const shellCompleted = toolEvents.find(event =>
     event.type === 'item.completed' && event.item.type === 'command_execution')
   assert.equal(shellCompleted.item.exit_code, 0)
-  assert.equal(shellCompleted.item.aggregated_output, `${directory}\n`)
+  // The model sees the configured bounded preview while the controller still
+  // retains the complete authenticated command output for verification.
+  assert.equal(shellCompleted.item.aggregated_output, 'x'.repeat(12_000))
+  const shellFeedback = requests[2].input.filter(item => item.type === 'function_call_output')
+  assert.equal(shellFeedback.length, 1)
+  const preview = JSON.stringify(shellFeedback[0])
+  assert.match(preview, /truncated/u)
+  assert.ok(Buffer.byteLength(preview) < 5_000)
   const terminal = events.find(event => event.type === 'turn.completed')
   assert.deepEqual(terminal.usage, {
     input_tokens: 6, cached_input_tokens: 0, cache_write_input_tokens: 0,
@@ -572,13 +573,13 @@ test('accounting-only quota relay persists one finite model-context response bou
   assert.equal(accepted.status, 200)
   assert.equal(starts.length, 1)
   assert.equal(starts[0].tokenLimit, Number.MAX_SAFE_INTEGER)
-  assert.equal(starts[0].maximumUnaccountedTokens, 272_000)
-  assert.equal(quotaProxy.snapshot().latestMaximumUnaccountedTokens, 272_000)
+  const inputBound = quotaProxy.snapshot().latestInputBound.maximumInputTokens
+  assert.equal(starts[0].maximumUnaccountedTokens, inputBound + 128_000)
+  assert.equal(quotaProxy.snapshot().latestMaximumUnaccountedTokens, inputBound + 128_000)
   assert.equal(upstreamBodies.length, 1)
   assert.equal(
-    upstreamBodies[0].max_output_tokens +
-      quotaProxy.snapshot().latestInputBound.maximumInputTokens,
-    272_000,
+    upstreamBodies[0].max_output_tokens,
+    128_000,
   )
 })
 

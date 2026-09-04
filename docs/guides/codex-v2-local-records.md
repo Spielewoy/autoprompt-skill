@@ -1,7 +1,7 @@
 # Codex v2 local run records
 
-<!-- codex-v2-release-status: local-v1.0.28-build-not-published -->
-> Release status: this guide describes the local Codex v1.0.28 build.
+<!-- codex-v2-release-status: local-v1.0.29-build-not-published -->
+> Release status: this guide describes the local Codex v1.0.29 build.
 > The build has not been published as a package or release.
 
 Codex v2 saves an exact local record so a run can be checked and resumed without
@@ -11,7 +11,7 @@ and checking evidence. Treat the whole record as potentially confidential.
 
 ## Local build route control
 
-The optional `path=auto|direct|light|roadmap` control is present in the local v1.0.28
+The optional `path=auto|direct|light|roadmap` control is present in the local v1.0.29
 build and has not been published. Put it first in the Codex request
 after `--`. Omitted `path=` and
 `path=auto` run automatic route analysis and selection. `path=direct`, `path=light`,
@@ -55,7 +55,9 @@ stream retries to zero.
 A controller-owned loopback relay applies a preventive per-response token envelope
 before each Responses API request. It computes a conservative input upper bound from
 the exact UTF-8 request and injects `max_output_tokens` that fits both the controlled
-272,000-token model context and any explicit remaining activation allowance. A
+272,000-token model context, the supported models' documented 128,000-token
+maximum response, and any explicit remaining activation allowance. This response
+maximum is not a cumulative task budget. A
 request that cannot fit an explicit allowance is refused before it reaches the
 upstream provider. Each valid `response.completed` event is rewritten with total
 input including cached input, then charged exactly once. Missing, malformed,
@@ -79,6 +81,10 @@ that verification passed: it preserves the usable candidate as
 `DONE_WITH_VERIFICATION_LIMITATIONS` with capability id
 `autoprompt.independent-check-quota-envelope`. External independent checking or a
 fresh activation with sufficient explicit authority is then required for acceptance.
+Concurrent children under an explicit budget wait for outstanding reservations to
+settle; reserved allowance is not reported as already spent. Cancellation or
+unresolved accounting closes the queue. Default unbudgeted children retain their
+normal concurrency.
 
 Before the relay can send the first upstream byte, it durably records the request's
 maximum unaccounted allowance. After a crash, exact request-bound usage is reconciled
@@ -108,8 +114,12 @@ for an eligible writable Git target. It adds `.autoprompt/` to the repository-lo
 package, non-Git, non-filesystem, unsafe-link, or otherwise ineligible targets use the
 one provider-private sidecar instead.
 
-On POSIX systems, private directories and files use `0700` and `0600`. On Windows,
-the runtime applies and audits a protected owner-only DACL. Creation or reopening
+On POSIX systems, private directories and files use `0700` and `0600`. Windows
+run-record helpers apply and audit a protected owner-only DACL, but that alone
+does not make the full runtime supported: native Windows has no implemented
+descriptor-anchored filesystem adapter for strict snapshots and terminal writes.
+This build's full runtime is validated only on Linux; macOS has not been validated.
+Creation or reopening
 fails closed if the private boundary cannot be established or has been widened. Run
 records are rejected if they enter tracked files, staged files, a package, or an
 archive boundary.

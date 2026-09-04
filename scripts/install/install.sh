@@ -767,13 +767,15 @@ _migrate_restore_codex_config() {
 }
 
 legacy_codex_ownership_state() {
-  local root="$1" output_name="$2" helper
+  local root="$1" output_name="$2" helper owned_file
   local -n out="$output_name"
   local -a owned=()
   out=()
   _idem_paths_equal "$root" "$(config_root codex)" || return 1
   helper="$REPO_ROOT/scripts/install/legacy-compat.cjs"
-  mapfile -d '' -t owned < <(node "$helper" files0 codex "$root" 2>/dev/null)
+  while IFS= read -r -d '' owned_file; do
+    owned+=("$owned_file")
+  done < <(node "$helper" files0 codex "$root" 2>/dev/null)
   [ "${#owned[@]}" -gt 0 ] || return 1
   out=("${owned[@]}")
 }
@@ -907,8 +909,12 @@ remove_exact_legacy_codex_recovery() {
   [ -d "$skill_root" ] && [ ! -L "$skill_root" ] || return 1
   _uninstall_receipt_path_under_root "$root" "$skill_root" || return 1
   node "$helper" match codex "$recovery" >/dev/null 2>&1 || return 1
-  mapfile -d '' -t files < <(node "$helper" files0 codex "$recovery" 2>/dev/null)
-  mapfile -d '' -t directories < <(
+  while IFS= read -r -d '' file; do
+    files+=("$file")
+  done < <(node "$helper" files0 codex "$recovery" 2>/dev/null)
+  while IFS= read -r -d '' directory; do
+    directories+=("$directory")
+  done < <(
     node "$helper" directories0 codex "$recovery" 2>/dev/null
   )
   [ "${#files[@]}" -gt 0 ] || return 1

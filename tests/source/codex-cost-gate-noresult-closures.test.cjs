@@ -119,7 +119,7 @@ test('AP-COST-013 governance finalization uses zero model sessions and determini
     requestEnvelopeHash: H('cost-013-request'), workspaceEpoch: 0,
     deliverableManifestHash: H('[]'), deliverableManifest: [], producedEvidenceHashes: [],
     terminalEnvelope: null,
-    releaseIntent: { eventSequence: 1, eventId: 'RELEASE_INTENT' },
+    releaseIntent: { eventSequence: 1, eventId: 'RELEASE_INTENT', eventHash: terminalEvent.hash },
   }
   let state = { state: 'FINALIZING', workspaceEpoch: 0, terminal: null }
   let bindCalls = 0

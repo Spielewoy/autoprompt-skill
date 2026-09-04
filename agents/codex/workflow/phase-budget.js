@@ -154,7 +154,7 @@ const REPORT_ONLY_CHECKER_CORRECTION_CODES = new Set([
 const CHECKER_FALSIFICATION_DOCTRINE = Object.freeze([
   'Try to disprove every typed verification obligation against the frozen deliverable. Preserve each declared condition and finish the full assigned matrix after any failure.',
   'For every exact named check ID, return one testOutcomes entry containing checkId (preferred; command and legacy id are accepted aliases) and PASS or FAIL status. Never use a tool-call or chunk ID, repeat a check ID, or supply conflicting identity aliases. Do not inspect Autoprompt transcripts or compute observationId, commandHash, or fingerprint: the controller owns execution identity and adds it only when your report resolves to one exact admissible command receipt. PASS requires a unique zero exit bound to the exact version being checked: it must come from a controller-declared command whose pre-mutation program inputs still match; command text alone and newly created or modified harnesses never certify PASS. An authenticated nonzero test failure may bind FAIL and drive repair. One admissible exact-version harness may cover several IDs; failed setup, ambiguous receipts, inline-output/no-op commands, and writable-scratch reads cover none.',
-  'For a checker-authored harness, first write one regular program in the assigned writable scratch root. Invoke it exactly once either as <approved runtime> <absolute sealed scratch program> <absolute frozen exact-version root being checked> or as <absolute sealed executable> <absolute frozen exact-version root being checked>. Approved runtimes are Python 3, Node.js, Ruby, Perl, and POSIX shell. Substitute the projected absolute paths literally. Emit one direct JSON summary of at most 4 KiB. Do not use interpreter flags, heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or command glue.',
+  'For each checker-authored harness version, first write a regular program in the assigned writable scratch root. Invoke that sealed version once either as <approved runtime> <absolute sealed scratch program> <absolute frozen exact-version root being checked> or as <absolute sealed executable> <absolute frozen exact-version root being checked>. Correct a setup failure in the same turn under a fresh filename and preserve prior diagnostics; never overwrite or rerun an executed harness or relabel a product failure as setup. Approved runtimes are Python 3, Node.js, Ruby, Perl, and POSIX shell. Substitute the projected absolute paths literally. Emit one direct JSON summary of at most 4 KiB per invocation. Do not use interpreter flags, heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or command glue.',
   'Treat the frozen exact-version root as immutable, including during reads. Open databases there with an explicit read-only or immutable mode. If a database driver, parser, compiler, or consumer may create a journal, WAL, lock, bytecode, cache, sidecar, or temporary file, first make a hash-bound copy in the assigned writable scratch root and operate only on that copy.',
   'Return the consumed underlying identifiers in evidenceIds and an allowed referenceMethod. Populate every required invariant category from an independent source, property, strongest available consumer, or independently derived observable result; never derive expected behavior from the implementation being checked.',
   'Build an independent requirement-by-requirement expected-result basis before accepting the implementation. Exercise exact boundaries, adversarial and negative cases, and any declared ordering, optimization, maximality, or global-selection rule; a self-authored happy-path validator that merely restates the exact version being checked is not independent evidence.',
@@ -168,6 +168,7 @@ const CODEX_CHECKER_COMPACT_DOCTRINE = Object.freeze([
   'Cover every exact named check and verification obligation; one admissible harness may cover several IDs.',
   'PASS requires independently derived expected behavior and an executed end-to-end observable result on the frozen exact version. Static inspection may prove a concrete FAIL but never PASS.',
   'Exercise positive, negative, boundary, temporal-order, equivalence-separation, and adversarial composition cases wherever applicable; do not derive the expected result from the implementation being checked.',
+  'Derive distinguishable input classes and before/at/between/after boundary witnesses from the request before inspecting the implementation; do not reuse the product\'s equivalence or ordering algorithm as the source of expected results.',
   'Bind PASS to one unique zero exit from unchanged controller-declared pre-mutation test inputs; newly created or modified harnesses never self-certify PASS. Bind a concrete product FAIL to one authenticated nonzero check. Setup, tool, dependency, or consumer unavailability is CHECK_INCONCLUSIVE or RUNTIME_FAILURE.',
   'Return every named test outcome plus the underlying evidence IDs and independent reference method; keep large evidence in scratch and return bounded diagnostics only.',
 ])
@@ -185,6 +186,12 @@ const DEFAULT_TIMEOUT_CLEANUP_WATCHDOG_MS = 60 * 1000
 const CODEX_CHILD_AUTO_COMPACT_TOKEN_LIMIT = 32_768
 const CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT = 1_000
 const CODEX_MODEL_CONTEXT_WINDOW = 272_000
+// Sol, Terra, and Luna each document a 128,000-token maximum response, which
+// is independent of the CLI's configured context window. Checked 2026-09-04:
+// https://developers.openai.com/api/docs/models/gpt-5.6-sol
+// https://developers.openai.com/api/docs/models/gpt-5.6-terra
+// https://developers.openai.com/api/docs/models/gpt-5.6-luna
+const CODEX_MODEL_MAX_OUTPUT_TOKENS = 128_000
 const CODEX_QUOTA_PROXY_MAX_REQUEST_BYTES = 512 * 1024
 const CODEX_QUOTA_PROXY_SPECIAL_TOKEN_RESERVE = 64
 const CODEX_PROVIDER_PENDING_CAUSE_PATTERN =
@@ -4549,10 +4556,10 @@ function expectedCheckerObservationBinding(record = {}) {
   return expected
 }
 
-function substantiveVerificationCommand(command, output) {
+function substantiveVerificationCommand(command, output, options = {}) {
   const normalizedCommand = String(command || '').trim()
   const normalizedOutput = String(output || '').trim()
-  if (!normalizedCommand || !normalizedOutput) return false
+  if (!normalizedCommand || !normalizedOutput && options.allowSilent !== true) return false
   const firstToken = normalizedCommand.match(/^(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*)?([^\s]+)/u)
   const executable = firstToken ? path.posix.basename(firstToken[1].replace(/^['"]|['"]$/gu, '')) : ''
   if (['true', 'false', 'echo', 'printf'].includes(executable)) return false
@@ -5255,6 +5262,8 @@ function substantiveVerificationFailure(exitCode, output) {
   return /(?:^|\n)\s*not ok\b/imu.test(normalized) ||
     /(?:^|\n)\s*(?:---\s+)?FAIL(?::|\s|$)/mu.test(normalized) ||
     /(?:^|\n)\s*(?:RESULT|SELECTED_CHECK)\s+FAIL(?:\s|$)/imu.test(normalized) ||
+    /(?:^|\n)\s*FAILED\s*\([^\n)]*\b(?:errors|failures)\s*=\s*[1-9]\d*[^\n)]*\)\s*(?:\n|$)/mu
+      .test(normalized) ||
     /"(?:failedCount|failureCount|failure_count)"\s*:\s*[1-9]\d*/u.test(normalized) ||
     /\b(?:[1-9]\d*\s+failed|fail(?:ure)?s?\s*[:=]\s*[1-9]\d*|assertionerror|failures!)\b/iu.test(normalized) ||
     /test result:\s*FAILED\b/iu.test(normalized) ||
@@ -5445,7 +5454,7 @@ function boundedDirectCheckerHarnessSummary(output) {
   return boundedDirectCheckerHarnessSummaryValue(output) !== null
 }
 
-function boundedSemanticScratchSummary(output) {
+function boundedSemanticScratchSummary(output, options = {}) {
   const parsed = boundedDirectCheckerHarnessSummaryValue(output)
   if (!parsed) return null
   const normalizedKey = value => String(value || '').toLowerCase().replace(/[_-]/gu, '')
@@ -5494,7 +5503,7 @@ function boundedSemanticScratchSummary(output) {
       contradiction = true
       return
     }
-    if (normalized === 'runs') {
+    if (normalized === 'runs' && options.requireRunExitCodes !== false) {
       if (!Array.isArray(value) || value.length === 0 || value.some(item =>
         !(Number.isSafeInteger(item) && item === 0))) {
         contradiction = true
@@ -5505,6 +5514,10 @@ function boundedSemanticScratchSummary(output) {
     } else if (positiveCountKeys.has(normalized) && Number.isSafeInteger(value) && value > 0) {
       meaningful = true
     }
+    // A declared harness may report deliberately rejected inputs inside its
+    // test details. Its aggregate status/count fields (including a summary
+    // object) own success; nested diagnostic statuses do not redefine them.
+    if (options.aggregateOnly === true && depth > 0 && normalized !== 'summary') return
     if (!value || typeof value !== 'object') return
     if (Array.isArray(value)) {
       for (const item of value) visit(item, key, depth + 1)
@@ -5544,13 +5557,26 @@ function codexCommandExecutionObservation(event, eventIndex, context = {}, start
     harnessCommandHash,
     context,
   )
+  const trustedTestArtifactsMatched = Boolean(trustedArtifactAttestation &&
+    trustedArtifactAttestation.matched)
+  // A zero exit is the contract for a trusted assertion script, including
+  // silent scripts. Explicit failure output contradicts that contract; it must
+  // not become PASS merely because the harness forgot to propagate its exit.
+  // Keep this inconclusive rather than manufacturing a nonzero product FAIL.
+  const semanticSummary = boundedSemanticScratchSummary(output, {
+    requireRunExitCodes: false, aggregateOnly: true,
+  })
+  const outputContradictsSuccess = semanticSummary
+    ? semanticSummary.contradiction : substantiveVerificationFailure(1, output)
   const outputHash = hashText(output)
   const completedHarness = startedHarness
     ? checkerScratchHarnessAttestation(command, context) : null
   const sealedScratchHarness = Boolean(startedHarness && completedHarness &&
     stableStringify(startedHarness) === stableStringify(completedHarness))
   const fingerprint = (successful || observedTestFailure) && itemId &&
-      substantiveVerificationCommand(command, output)
+      substantiveVerificationCommand(command, output, {
+        allowSilent: successful && trustedTestArtifactsMatched,
+      })
     ? hashText(output.trim()) : null
   const receiptBody = fingerprint ? Object.freeze({
     eventIndex,
@@ -5562,8 +5588,8 @@ function codexCommandExecutionObservation(event, eventIndex, context = {}, start
     harnessCommandHash,
     outputHash,
     fingerprint,
-    trustedTestArtifactsMatched: Boolean(trustedArtifactAttestation &&
-      trustedArtifactAttestation.matched),
+    trustedTestArtifactsMatched,
+    outputContradictsSuccess,
     trustedTestArtifactSetHash: trustedArtifactAttestation &&
       trustedArtifactAttestation.artifactSetHash || null,
     ...(observedTestFailure ? {
@@ -5728,7 +5754,24 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
     : receipts.filter(receipt =>
         receipt && /^[a-f0-9]{64}$/u.test(receipt.scratchHarnessProgramIdentityHash || '') &&
         (receipt.scratchHarnessAdmissible === true || receipt.failureHarnessAdmissible === true)).length
-  const repeatedScratchHarnessInvocation = sealedScratchHarnessInvocationCount > 1
+  const scratchInvocations = evidence && Array.isArray(evidence.scratchHarnessInvocations)
+    ? evidence.scratchHarnessInvocations : null
+  const validScratchInvocations = scratchInvocations &&
+    scratchInvocations.length <= CODEX_CHECK_OBSERVATION_MAX_RECEIPTS &&
+    scratchInvocations.every(item => item && /^[a-f0-9]{64}$/u.test(item.commandHash || '') &&
+      /^[a-f0-9]{64}$/u.test(item.programPathHash || '') &&
+      Number.isSafeInteger(item.count) && item.count > 0) &&
+    new Set(scratchInvocations.map(item => `${item.commandHash}:${item.programPathHash}`)).size === scratchInvocations.length &&
+    scratchInvocations.reduce((sum, item) => sum + item.count, 0) === sealedScratchHarnessInvocationCount
+  // Older durable observations retain only the total count. Preserve their
+  // conservative interpretation; never invent distinct command identities
+  // for starts whose completion did not produce a receipt.
+  const repeatedScratchHarnessInvocation = validScratchInvocations
+    ? scratchInvocations.some(item => item.count > 1) ||
+      new Set(scratchInvocations.map(item => item.commandHash)).size !== scratchInvocations.length ||
+      new Set(scratchInvocations.map(item => item.programPathHash)).size !== scratchInvocations.length
+    : sealedScratchHarnessInvocationCount > 1
+  const invalidScratchInvocations = scratchInvocations !== null && !validScratchInvocations
   const expectedCommandHashes = new Map(legacyBinding
     ? binding.commandBindings.map(commandBinding => [commandBinding.checkId, new Set()])
     : binding.observations.map(observation => [observation.checkId,
@@ -5773,6 +5816,7 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
           ? false
           : observation.authorizationMode === 'EXACT_COMMAND'
             ? receipt.trustedTestArtifactsMatched === true &&
+              receipt.outputContradictsSuccess !== true &&
               (authorized.has(receipt.commandHash) || authorized.has(receipt.harnessCommandHash))
             : receipt.scratchHarnessAdmissible === true
       }
@@ -5871,6 +5915,10 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
     .map(([commandHash]) => commandHash)
   const hasNamedFailure = [...outcomeByCheck.values()].some(outcome => outcome.status === 'FAIL')
   const hasCommandBoundFailure = commandBoundFailureCheckIds.length > 0
+  const unreportedCommandFailure = output.code === 'PASS' && relevantAdmissibleReceipts.some(receipt =>
+    receipt.resultDisposition === 'NONZERO_TEST_FAILURE' &&
+    (receipt.failureHarnessAdmissible === true || [...expectedCommandHashes.values()]
+      .some(authorized => authorized.has(receipt.commandHash) || authorized.has(receipt.harnessCommandHash))))
   const aggregateContradiction = output.code === 'PASS' && hasNamedFailure ||
     output.code === 'FAIL' && !hasNamedFailure
   // The aggregate word is model-authored, while these failing observations
@@ -5883,7 +5931,7 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
   const authenticatedAggregateFailure = hasCommandBoundFailure &&
     evidence && evidence.boundsExceeded !== true &&
     evidence.invalidCount === 0 && conflictingCommandHashes.length === 0 &&
-    !repeatedScratchHarnessInvocation
+    !repeatedScratchHarnessInvocation && !invalidScratchInvocations
   // PASS authority remains strict: every named case needs a successful,
   // candidate-bound observation. A FAIL may leave positive coverage incomplete
   // because one authenticated product failure is sufficient to require repair,
@@ -5896,7 +5944,7 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
   const invalidEvidence = !evidence || evidence.boundsExceeded === true ||
     evidence.invalidCount > 0 || invalidOutcome || missingBlocksVerdict ||
     conflictingCommandHashes.length > 0 || aggregateContradiction ||
-    repeatedScratchHarnessInvocation
+    repeatedScratchHarnessInvocation || invalidScratchInvocations || unreportedCommandFailure
   const authorityBody = !invalidEvidence && output.code === 'PASS'
     ? Object.freeze({
         schemaVersion: 1,
@@ -6001,8 +6049,10 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
   if (missingBlocksVerdict) reasonParts.push(`${missing.length} named case(s) lack a matching admissible command observation`)
   if (conflictingCommandHashes.length > 0) reasonParts.push(`${conflictingCommandHashes.length} same-version harness command(s) produced conflicting admissible outputs`)
   if (repeatedScratchHarnessInvocation) reasonParts.push(
-    `${sealedScratchHarnessInvocationCount} sealed scratch harness invocations were observed; exactly one is allowed`,
+    'a sealed scratch harness command was invoked more than once; each corrected harness needs a fresh path and one exact invocation',
   )
+  if (invalidScratchInvocations) reasonParts.push('scratch harness invocation identities are invalid')
+  if (unreportedCommandFailure) reasonParts.push('an applicable authenticated product failure remains unresolved despite the reported PASS')
   if (aggregateContradiction) reasonParts.push('the aggregate verdict contradicts its named observations')
   return Object.freeze({
     ...enrichedOutput,
@@ -6010,7 +6060,7 @@ function checkerResultBoundToCommandExecutionEvidence(output, parsed, record) {
     description: 'A required check could not determine whether the exact result passes.',
     stateClass: 'intermediate',
     cause: Object.freeze({
-      event: conflictingCommandHashes.length > 0 || aggregateContradiction
+      event: conflictingCommandHashes.length > 0 || aggregateContradiction || unreportedCommandFailure
         ? 'CHECK_OBSERVATION_CONTRADICTION' : 'CHECK_OBSERVATION_INCOMPLETE',
       reason: reasonParts.join('; '),
       unblockPath: 'Run one fresh bounded checker reassessment and bind every named case to an admissible substantive harness observation for the same frozen exact version.',
@@ -6086,6 +6136,7 @@ function createCodexJsonlAccumulator(context = {}) {
     verificationObservationHash: crypto.createHash('sha256'),
     verificationHarnessStarts: new Map(),
     verificationScratchHarnessInvocationCount: 0,
+    verificationScratchHarnessInvocations: new Map(),
   }
   state.eventHash.update('[')
   state.commandFailureHash.update('[')
@@ -6099,11 +6150,16 @@ function createCodexJsonlAccumulator(context = {}) {
   })
   const verificationObservations = () => {
     const receiptEvidenceHash = state.verificationObservationHash.copy().update(']').digest('hex')
+    const scratchHarnessInvocations = Object.freeze([...state.verificationScratchHarnessInvocations.values()]
+      .sort((left, right) => left.commandHash.localeCompare(right.commandHash) ||
+        left.programPathHash.localeCompare(right.programPathHash))
+      .map(item => Object.freeze({ ...item })))
     return Object.freeze({
       count: state.verificationReceipts.length,
       invalidCount: state.verificationInvalidCount,
       boundsExceeded: state.verificationBoundsExceeded,
       scratchHarnessInvocationCount: state.verificationScratchHarnessInvocationCount,
+      scratchHarnessInvocations,
       // A syntactically valid scratch-harness start affects authority even if
       // its completion is malformed or absent. Bind that controller-observed
       // count into the persisted evidence identity instead of hashing receipts
@@ -6111,6 +6167,7 @@ function createCodexJsonlAccumulator(context = {}) {
       evidenceHash: hashText(stableStringify({
         receiptEvidenceHash,
         scratchHarnessInvocationCount: state.verificationScratchHarnessInvocationCount,
+        scratchHarnessInvocations,
       })),
       receipts: Object.freeze([...state.verificationReceipts]),
     })
@@ -6181,6 +6238,16 @@ function createCodexJsonlAccumulator(context = {}) {
         const harnessStart = checkerScratchHarnessAttestation(commandLifecycleItem.command, context)
         if (harnessStart) {
           state.verificationScratchHarnessInvocationCount += 1
+          const invocations = state.verificationScratchHarnessInvocations
+          const invocationKey = `${harnessStart.commandHash}:${harnessStart.programPathHash}`
+          if (invocations.has(invocationKey) ||
+              invocations.size < CODEX_CHECK_OBSERVATION_MAX_RECEIPTS) {
+            invocations.set(invocationKey, {
+              commandHash: harnessStart.commandHash,
+              programPathHash: harnessStart.programPathHash,
+              count: (invocations.get(invocationKey)?.count || 0) + 1,
+            })
+          } else state.verificationBoundsExceeded = true
           state.verificationHarnessStarts.set(commandLifecycleId, harnessStart)
         }
       }
@@ -7470,7 +7537,9 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
       const alreadyUsed = billableModelTokens(cumulativeUsage)
       const activationOutputAllowance = tokenLimit - alreadyUsed - inputBound.maximumInputTokens
       const contextOutputAllowance = CODEX_MODEL_CONTEXT_WINDOW - inputBound.maximumInputTokens
-      const outputAllowance = Math.min(activationOutputAllowance, contextOutputAllowance)
+      const outputAllowance = Math.min(
+        CODEX_MODEL_MAX_OUTPUT_TOKENS, activationOutputAllowance, contextOutputAllowance,
+      )
       if (!Number.isSafeInteger(outputAllowance) || outputAllowance <= 0) {
         deniedCount += 1
         recordFailure(
@@ -7483,8 +7552,8 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
       body.max_output_tokens = Number.isSafeInteger(body.max_output_tokens)
         ? Math.min(body.max_output_tokens, outputAllowance)
         // Accounting-only default execution has no Autoprompt cumulative
-        // quota. Keep each response inside the controlled model's real context
-        // boundary instead of forwarding an invalid MAX_SAFE_INTEGER request.
+        // quota. Respect both the provider's maximum response size and the
+        // controlled context boundary without limiting later tool turns.
         : outputAllowance
       const outboundBody = Buffer.from(JSON.stringify(body), 'utf8')
       const upstreamBase = codexQuotaProxyUpstream(
@@ -8118,11 +8187,14 @@ function codexCheckerScratchProjection(record, canonicalTargetPath, workingDirec
       currentVersionHash: record.candidateHash,
     })}`,
     'The frozen exact-version root is readable/executable and outside the writable sandbox. Never modify it.',
+    'currentVersionHash is the controller-owned identity of the complete exact version being checked. Copy it into the report; never compare it with the hash of an individual file. File hashes are separate file evidence.',
     'Use only the writable scratch tmp, cache, and output roots for temporary files, databases, bytecode, generated files, and test output.',
     'Open databases in the frozen root only with an explicit read-only or immutable mode. If any reader may create journals, WAL files, locks, bytecode, caches, sidecars, or temporary files, copy the required inputs into writable scratch first, verify the copy against the frozen source hash and size, and read only the scratch copy.',
     'Execute the exact named acceptance commands and authoritative verifier when available; do not replace them with a weaker approximate check.',
-    `If you author a checker harness, write one regular program under ${JSON.stringify(writableScratchRoot)} before executing it.`,
-    `Invoke it exactly once as either <python3|node|ruby|perl|sh> <absolute harness path under ${JSON.stringify(writableScratchRoot)}> ${JSON.stringify(frozenCandidateRoot)} or <absolute executable harness path under that scratch root> ${JSON.stringify(frozenCandidateRoot)}.`,
+    'Trusted test attestation covers only its declared files or directories. Imported test helpers need their own pre-mutation file or directory binding; an unchanged launcher alone does not prove their expected results stayed unchanged.',
+    `For each checker harness version, write a regular program under ${JSON.stringify(writableScratchRoot)} before executing it.`,
+    `Invoke that sealed version once as either <python3|node|ruby|perl|sh> <absolute harness path under ${JSON.stringify(writableScratchRoot)}> ${JSON.stringify(frozenCandidateRoot)} or <absolute executable harness path under that scratch root> ${JSON.stringify(frozenCandidateRoot)}.`,
+    'Correct a setup failure in the same turn under a fresh filename while preserving prior diagnostics. Never overwrite or rerun an executed harness or relabel a product failure as setup; a later passing harness does not erase an earlier product failure.',
     'Use no interpreter flags. Emit one direct JSON summary no larger than 4 KiB. Do not use a heredoc, redirection, a pipeline, command substitution, an environment assignment, a shell wrapper, or command glue such as && or ;.',
     'Scratch files are neither exact-version changes nor deliverables.',
   ]
@@ -10787,6 +10859,8 @@ class CodexSupervisorRuntime {
     // every live child's remaining worst-case relay allowance at or below the
     // persisted activation ceiling, including concurrent ROADMAP launches.
     this.childTokenReservations = new Map()
+    this.childTokenReservationWaiters = new Set()
+    this.childTokenAdmissionFailure = null
     this.pendingProviderEnvelopes = new Map()
     this.recoveredProviderEnvelopeHighWater = new Map()
     this.childToolCallHighWater = new Map()
@@ -14526,6 +14600,50 @@ class CodexSupervisorRuntime {
     return Object.freeze(receipts)
   }
 
+  _assertChildTokenAdmissionOpen(signal) {
+    if (this.childTokenAdmissionFailure) throw this.childTokenAdmissionFailure
+    if (this.cancelled || signal && signal.aborted) {
+      throw new SupervisorIntegrationError('ADMISSION_CANCELLED', 'child token admission was cancelled')
+    }
+  }
+
+  _closeChildTokenAdmissions(error) {
+    this.childTokenAdmissionFailure = error
+    for (const waiter of [...this.childTokenReservationWaiters || []]) waiter.reject(error)
+  }
+
+  async _acquireChildTokenEnvelope(reservationId, record, signal) {
+    for (;;) {
+      this._assertChildTokenAdmissionOpen(signal)
+      try {
+        return this._reserveChildTokenEnvelope(reservationId, record)
+      } catch (error) {
+        // A concurrent child owns a worst-case allowance, not observed spend.
+        // Wait for its exact settlement instead of treating that reservation
+        // as an exhausted user budget or inventing a per-child token slice.
+        if (error.code !== 'BUDGET_EXHAUSTED' || !error.details ||
+            error.details.tokensReserved <= 0 || error.details.roleTokenLimit <= 0 ||
+            error.details.tokensUsed >= error.details.activationTokenLimit) throw error
+      }
+      await new Promise((resolve, reject) => {
+        if (!this.childTokenReservationWaiters) this.childTokenReservationWaiters = new Set()
+        const cleanup = () => {
+          this.childTokenReservationWaiters.delete(waiter)
+          if (signal) signal.removeEventListener('abort', abort)
+        }
+        const waiter = {
+          resolve: () => { cleanup(); resolve() },
+          reject: error => { cleanup(); reject(error) },
+        }
+        const abort = () => waiter.reject(new SupervisorIntegrationError(
+          'ADMISSION_CANCELLED', 'queued child token admission was cancelled',
+        ))
+        this.childTokenReservationWaiters.add(waiter)
+        if (signal) signal.addEventListener('abort', abort, { once: true })
+      })
+    }
+  }
+
   _reserveChildTokenEnvelope(reservationId, record) {
     if (typeof reservationId !== 'string' || !reservationId ||
         this.childTokenReservations.has(reservationId)) {
@@ -14640,6 +14758,7 @@ class CodexSupervisorRuntime {
     const reservation = this.childTokenReservations.get(reservationId)
     if (!reservation) return null
     this.childTokenReservations.delete(reservationId)
+    for (const waiter of [...this.childTokenReservationWaiters || []]) waiter.resolve()
     return Object.freeze({
       limit: reservation.limit,
       consumed: reservation.consumed,
@@ -15497,11 +15616,12 @@ class CodexSupervisorRuntime {
     let childCompletionFailure = null
     const transcriptEvidenceTracker = createTranscriptEvidenceTracker()
     try {
-    childTokenReservation = this._reserveChildTokenEnvelope(reservationId, {
+    childTokenReservation = await this._acquireChildTokenEnvelope(reservationId, {
       logicalRole: policy.child,
       route: request.route,
       priorLeaseModelTokens,
-    })
+    }, request.signal)
+    this._assertChildTokenAdmissionOpen(request.signal)
     if (!adoptedLease && request.route !== 'PRE_ROUTE' && !this.firstChildStartupRecorded) {
       const startupAdmission = scheduler.recordAdmissionComponent(
         'firstChildStartup',
@@ -18250,6 +18370,7 @@ class CodexSupervisorRuntime {
         if (candidateSurvivalEvidence) {
           accountingError.bestAvailableCandidateEvidence = candidateSurvivalEvidence
         }
+        this._closeChildTokenAdmissions(accountingError)
         if (candidateSurvivalIntegrityFailure(childCompletionFailure)) {
           if ((typeof childCompletionFailure === 'object' ||
               typeof childCompletionFailure === 'function') &&
@@ -18435,6 +18556,9 @@ class CodexSupervisorRuntime {
         ? options.runtimeStateProvider() : null
       const alreadyPaused = Boolean(result.transition && runtime && runtime.state === 'PAUSED')
       if (!alreadyPaused) {
+        this._closeChildTokenAdmissions(new SupervisorIntegrationError(
+          'SCHEDULER_CLOSED', `child token admission closed for resumable ${outcome}`,
+        ))
         if (this.scheduler) this.scheduler.dispose(`resumable ${outcome}`)
         await this._drainOwnedProcessesWithOneRetry(`resumable ${outcome}`, 'PARTIAL')
       }
@@ -18934,6 +19058,7 @@ class CodexSupervisorRuntime {
     // before its next await, while every competing pause/finalization joins the
     // same promise instead of draining or publishing a second disposition.
     this.cancelled = true
+    this._closeChildTokenAdmissions(new SupervisorIntegrationError('ADMISSION_CANCELLED', reason))
     return this._beginSettlement('cancel', () => this._cancelOnce(reason))
   }
 
@@ -19073,6 +19198,9 @@ class CodexSupervisorRuntime {
       result = selected.result
       const finalizationDeliverables = result.deliverables
       if (completionDiagnostics.processTreeDrained !== true) {
+        this._closeChildTokenAdmissions(new SupervisorIntegrationError(
+          'SCHEDULER_CLOSED', 'child token admission closed for terminal finalization',
+        ))
         if (this.scheduler) this.scheduler.dispose('terminal finalization')
         await this._drainOwnedProcessesWithOneRetry('terminal finalization', outcome)
       }
@@ -24651,7 +24779,7 @@ function createDefaultRouteExecutor(options) {
     const boundedToolOutputDiscipline =
       ` Keep the direct path compact: target roughly ${CODEX_CHILD_TOOL_GUIDANCE_LIMITS.worker} or fewer purposeful tool calls for the whole turn, without abandoning required work merely because that target was exceeded. The launcher retains at most ${CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT.toLocaleString('en-US')} tokens from each tool output; the classic shell tool has no per-call output-budget argument. Redirect large stdout/stderr to a scratch file, then inspect a hash, count, or targeted preview of at most 4 KiB. Never use line-oriented head, tail, sed, or unrestricted recursive search on potentially monolithic generated artifacts or private run-record/transcript trees. Reuse one focused executable validation harness; after implementation and one focused validation, return the canonical result immediately.`
     const checkerToolOutputDiscipline =
-      ` Keep the independent check compact: target roughly ${CODEX_CHILD_TOOL_GUIDANCE_LIMITS.checker} or fewer purposeful tool calls, while still completing every required observation. The launcher retains at most ${CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT.toLocaleString('en-US')} tokens from each tool output; the classic shell tool has no per-call output-budget argument. If you author a checker harness, first write one regular program in the assigned scratch root, then run exactly one direct invocation as <python3|node|ruby|perl|sh> <absolute sealed scratch program> <absolute frozen exact-version path being checked>, or as <absolute sealed executable> <absolute frozen exact-version path being checked>. Use no interpreter flags. Substitute the projected absolute paths literally and emit one direct JSON summary of at most 4 KiB. Do not use heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or shell glue. Treat the frozen path as immutable even for database and compiler reads: use explicit read-only/immutable modes, or hash-bind a copy in writable scratch before using a reader that may create journals, WAL files, locks, bytecode, caches, sidecars, or temporary files. Return the canonical result immediately after the required observation.`
+      ` Keep the independent check compact: target roughly ${CODEX_CHILD_TOOL_GUIDANCE_LIMITS.checker} or fewer purposeful tool calls, while still completing every required observation. The launcher retains at most ${CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT.toLocaleString('en-US')} tokens from each tool output; the classic shell tool has no per-call output-budget argument. For each checker harness version, first write a regular program in the assigned scratch root, then run it once directly as <python3|node|ruby|perl|sh> <absolute sealed scratch program> <absolute frozen exact-version path being checked>, or as <absolute sealed executable> <absolute frozen exact-version path being checked>. Correct setup failures in the same turn under a fresh filename, retaining prior diagnostics; never overwrite or rerun an executed harness or relabel a product failure as setup. Use no interpreter flags. Substitute the projected absolute paths literally and emit one direct JSON summary of at most 4 KiB per invocation. Do not use heredocs, redirection, pipelines, command substitution, environment assignments, shell wrappers, or shell glue. Treat the frozen path as immutable even for database and compiler reads: use explicit read-only/immutable modes, or hash-bind a copy in writable scratch before using a reader that may create journals, WAL files, locks, bytecode, caches, sidecars, or temporary files. Return the canonical result immediately after the required observation.`
     const workerCount = Math.max(1, Number(decision.usefulWorkerCount || 1))
     const legacyRoadmapWorkId = /^(?:roadmap-(?:author|scout|plan-|work-group)|mission-coordination)/u
     const resumeRoadmapIds = resumeState ? [

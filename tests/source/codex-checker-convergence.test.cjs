@@ -777,7 +777,7 @@ test('unauthenticated and inconclusive checker evidence has no same-seat runtime
   ), [])
 })
 
-test('multiple sealed scratch executions stay inconclusive even with a model-supplied selector', t => {
+test('duplicate or competing sealed failure receipts stay inconclusive despite a model-supplied selector', t => {
   const fixture = scratchFixture(t)
   const secondHarness = path.join(path.dirname(fixture.harness), 'check-second.py')
   fs.copyFileSync(fixture.harness, secondHarness)
@@ -838,7 +838,8 @@ test('multiple sealed scratch executions stay inconclusive even with a model-sup
     })
     assert.equal(result.code, 'CHECK_INCONCLUSIVE', label)
     assert.equal(result.cause.event, 'CHECK_OBSERVATION_INCOMPLETE', label)
-    assert.match(result.cause.reason, /exactly one is allowed/u, label)
+    assert.match(result.cause.reason, label === 'same command twice'
+      ? /invoked more than once/u : /lack a matching admissible command observation/u, label)
   }
 })
 
@@ -902,7 +903,7 @@ test('a malformed first scratch execution remains bound when a later execution y
     checkerScratchBoundary: fixture.checkerScratchBoundary,
   })
   assert.equal(result.code, 'CHECK_INCONCLUSIVE')
-  assert.match(result.cause.reason, /exactly one is allowed/u)
+  assert.match(result.cause.reason, /invoked more than once/u)
 })
 
 test('configured C1 and C2 scratch authorities confirm each other without a third checker turn', async t => {
