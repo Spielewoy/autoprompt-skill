@@ -15,6 +15,7 @@ const PS_LIB = path.join(INSTALL_DIR, 'lib', 'install-lib.ps1')
 const SH_LIB = path.join(INSTALL_DIR, 'lib', 'install-lib.sh')
 const SH_PROBE_HARNESS = path.join(ROOT, 'tests', 'fixtures', 'codex-version-probe-isolation.sh')
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
+const POWERSHELL_EXECUTABLE = resolvePowerShell()
 const PROBE_PREFIX = 'autoprompt-codex-probe-'
 
 function run(command, args, options = {}) {
@@ -30,10 +31,20 @@ function commandAvailable(command) {
   return run(command, ['--version'], { timeout: 5000 }).status === 0
 }
 
-function powershellAvailable() {
-  return run(POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'], {
+function resolvePowerShell() {
+  // Discover with the caller's PATH once, before any fixture intentionally
+  // replaces it. The isolated probe PATH must not regain host install roots.
+  const result = run(POWERSHELL, [
+    '-NoProfile', '-NonInteractive', '-Command', '[Console]::Out.Write((Get-Process -Id $PID).Path)',
+  ], {
     timeout: 5000,
-  }).status === 0
+  })
+  const executable = result.status === 0 && result.stdout.trim()
+  return executable && path.isAbsolute(executable) && fs.existsSync(executable) ? executable : null
+}
+
+function powershellAvailable() {
+  return POWERSHELL_EXECUTABLE !== null
 }
 
 function findBash() {
@@ -179,11 +190,14 @@ function makeSandbox(mode) {
       HOME: home,
       PATH: [
         bin,
-        path.join(systemRoot, 'System32'),
-        path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0'),
+        ...(process.platform === 'win32' ? [
+          path.join(systemRoot, 'System32'),
+          path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0'),
+        ] : ['/usr/bin', '/bin']),
       ].join(path.delimiter),
       TEMP: temp,
       TMP: temp,
+      TMPDIR: temp,
       USERPROFILE: home,
     },
     shEnv: {
@@ -212,7 +226,7 @@ function runPowerShellDetector(context, timeoutSeconds = 3, commandTimeout = 300
     '[Console]::Out.WriteLine("RESULT_RECORD=$($writer.ToString().Trim())")',
     'exit 0',
   ].join('; ')
-  return run(POWERSHELL, [
+  return run(POWERSHELL_EXECUTABLE, [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command,
   ], { env: context.psEnv, timeout: commandTimeout })
 }
@@ -233,7 +247,7 @@ function runShellDetector(bash, context, timeoutSeconds = 3, commandTimeout = 30
 function runPowerShellDoctor(context) {
   const doctor = path.join(INSTALL_DIR, 'doctor.ps1')
   const command = `& ${quotePowerShell(doctor)} codex; exit $LASTEXITCODE`
-  return run(POWERSHELL, [
+  return run(POWERSHELL_EXECUTABLE, [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command,
   ], { env: context.psEnv })
 }

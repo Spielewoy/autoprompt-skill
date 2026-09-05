@@ -388,7 +388,7 @@ function Test-ClientLegacyCodexInstalled {
         return $false
     }
     $nodeCommand = Get-Command node -CommandType Application `
-        -ErrorAction SilentlyContinue
+        -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $nodeCommand) { return $false }
     $helper = Join-Path $RepoRoot 'scripts/install/legacy-compat.cjs'
     & $nodeCommand.Source $helper match codex $Root *> $null

@@ -51,7 +51,10 @@ switch -CaseSensitive ($mode) {
 }
 $env:AUTOPROMPT_MODE = $mode
 
-$node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue
+# Get-Command can return one Application per matching PATH entry. Invoke only
+# the first executable, never an array of paths coerced into a command name.
+$node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
 if ($null -eq $node) {
     [Console]::Error.WriteLine('supervisor: node is required for the canonical Codex runtime')
     exit 2

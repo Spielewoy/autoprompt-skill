@@ -1155,6 +1155,62 @@ test('canonical sidecar is a target singleton, outside the target, and caller-se
   }), error => error.code === 'RUN_RECORD_UNSAFE' && /outside the target/i.test(error.message))
 })
 
+test('npm pack owns fresh private default caches and preserves explicit caller caches', t => {
+  const directory = fixture(t, 'npm-cache-isolation')
+  const project = gitProject(directory)
+  fs.writeFileSync(path.join(project, 'package.json'), JSON.stringify({ name: 'cache-isolation-fixture', version: '1.0.0' }))
+  fs.writeFileSync(path.join(project, 'index.js'), 'module.exports = 1\n')
+  // A hostile old shared cache must be ignored, not deleted or repaired.
+  const legacyCache = path.join(directory, 'autoprompt-npm-pack-cache')
+  fs.writeFileSync(legacyCache, 'not a cache directory\n', { mode: 0o400 })
+  const legacyBefore = fs.lstatSync(legacyCache, { bigint: true })
+  const inheritedCache = process.env.NPM_CONFIG_CACHE
+  process.env.NPM_CONFIG_CACHE = legacyCache
+  t.after(() => {
+    if (inheritedCache === undefined) delete process.env.NPM_CONFIG_CACHE
+    else process.env.NPM_CONFIG_CACHE = inheritedCache
+  })
+  t.mock.method(os, 'tmpdir', () => directory)
+  const created = []
+  const mkdtemp = fs.mkdtempSync
+  t.mock.method(fs, 'mkdtempSync', (prefix, ...args) => {
+    const cache = mkdtemp(prefix, ...args)
+    created.push(cache)
+    assert.equal(path.dirname(cache), directory)
+    assert.match(path.basename(cache), /^autoprompt-npm-pack-cache-[A-Za-z0-9]{6}$/)
+    if (process.platform !== 'win32') {
+      const stat = fs.statSync(cache)
+      assert.equal(stat.uid, process.getuid())
+      assert.equal(stat.mode & 0o777, 0o700)
+    }
+    return cache
+  })
+  const selection = { targetPath: project }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    assert.equal(safeRoot.assertNpmPackExcludesRunRecords(selection).checked, true)
+    assert.equal(fs.existsSync(created.at(-1)), false, 'successful checks remove only their owned cache')
+  }
+  assert.equal(new Set(created).size, 2, 'each invocation gets a different private cache')
+  assert.throws(() => safeRoot.assertNpmPackExcludesRunRecords(selection, {
+    npmCommand: 'autoprompt-npm-cache-test-command-does-not-exist',
+  }), error => error.code === 'RUN_RECORD_FAILURE')
+  assert.equal(created.length, 3)
+  assert.equal(fs.existsSync(created.at(-1)), false, 'failed checks remove their owned cache too')
+  const explicitCache = path.join(directory, 'caller-cache')
+  fs.mkdirSync(explicitCache, { mode: 0o700 })
+  const sentinel = path.join(explicitCache, 'caller-owned.txt')
+  fs.writeFileSync(sentinel, 'preserve me\n')
+  assert.equal(safeRoot.assertNpmPackExcludesRunRecords(selection, { npmCache: explicitCache }).checked, true)
+  assert.throws(() => safeRoot.assertNpmPackExcludesRunRecords(selection, {
+    npmCache: explicitCache, npmCommand: 'autoprompt-npm-cache-test-command-does-not-exist',
+  }), error => error.code === 'RUN_RECORD_FAILURE')
+  assert.equal(created.length, 3, 'an explicit cache does not allocate a disposable cache')
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'preserve me\n')
+  assert.equal(fs.readFileSync(legacyCache, 'utf8'), 'not a cache directory\n')
+  const legacyAfter = fs.lstatSync(legacyCache, { bigint: true })
+  for (const field of ['dev', 'ino', 'mode']) assert.equal(legacyAfter[field], legacyBefore[field])
+})
+
 test('npm pack and explicit package/archive boundaries contain zero private run files', t => {
   const directory = fixture(t, 'package-boundary')
   const project = gitProject(directory)

@@ -234,8 +234,13 @@ const CODEX_CONTROLLED_MODELS = Object.freeze([
   Object.freeze({ slug: 'gpt-5.6-terra', displayName: 'GPT-5.6-Terra', description: 'Balanced agentic coding model for everyday work.', defaultEffort: 'medium', priority: 2 }),
   Object.freeze({ slug: 'gpt-5.6-luna', displayName: 'GPT-5.6-Luna', description: 'Fast and affordable agentic coding model.', defaultEffort: 'medium', priority: 3 }),
 ])
-const CODEX_NON_TOOL_ITEM_TYPES = new Set([
-  'agent_message', 'reasoning', 'todo_list', 'plan',
+// Count native execution events, not every event outside a small diagnostic
+// exclusion list. In particular, Codex reports startup warnings as `error`
+// items; diagnostics and future progress items do not execute tools.
+const CODEX_TOOL_ITEM_TYPES = new Set([
+  'command_execution', 'file_change', 'file_edit', 'apply_patch',
+  'mcp_tool_call', 'web_search',
+  'collab_tool_call', 'dynamic_tool_call',
 ])
 const CODEX_STDOUT_FALLBACK_MAX_BYTES = 512 * 1024
 const CODEX_STDERR_TAIL_MAX_BYTES = 64 * 1024
@@ -6680,7 +6685,7 @@ function codexToolCallObservation(event) {
   if (!event || !/^item\.(?:started|completed|failed|cancelled)$/u.test(event.type || '') ||
       !event.item ||
       typeof event.item !== 'object' || typeof event.item.type !== 'string' ||
-      CODEX_NON_TOOL_ITEM_TYPES.has(event.item.type)) return null
+      !CODEX_TOOL_ITEM_TYPES.has(event.item.type)) return null
   return Object.freeze({
     itemId: typeof event.item.id === 'string' && event.item.id
       ? event.item.id : null,
@@ -7221,13 +7226,16 @@ function codexQuotaProxyUpstream(headers, override = null) {
     : 'https://api.openai.com/v1')
 }
 
-function codexQuotaProxyJsonError(response, status, message) {
+function codexQuotaProxyJsonError(response, status, code, message, details = null) {
   if (response.headersSent) {
     response.destroy()
     return
   }
   const bytes = Buffer.from(JSON.stringify({
-    error: { message, type: 'autoprompt_child_quota', code: 'child_quota_preflight_denied' },
+    error: {
+      message, type: 'autoprompt_child_transport', code,
+      ...(details ? { details } : {}),
+    },
   }), 'utf8')
   response.writeHead(status, {
     'content-type': 'application/json',
@@ -7457,22 +7465,26 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
   const upstreamRequests = new Set()
   const sockets = new Set()
 
-  const recordFailure = (code, message) => {
+  const recordFailure = (code, message, details = null) => {
     hardStopped = true
     activeRequest = false
-    if (!lastFailure) lastFailure = Object.freeze({ code, message })
+    if (!lastFailure) lastFailure = Object.freeze({
+      code, message, ...(details ? { details: Object.freeze({ ...details }) } : {}),
+    })
   }
 
   const server = http.createServer((request, response) => {
     const incomingUrl = new URL(request.url || '/', 'http://127.0.0.1')
     if (request.method !== 'POST' ||
         incomingUrl.pathname !== `${routePrefix}/responses` || incomingUrl.search) {
-      codexQuotaProxyJsonError(response, 404, 'unknown local quota-proxy route')
+      codexQuotaProxyJsonError(response, 404,
+        'CODEX_QUOTA_PROXY_ROUTE_INVALID', 'unknown local quota-proxy route')
       return
     }
     if (activeRequest || hardStopped) {
       deniedCount += 1
-      codexQuotaProxyJsonError(response, 429, 'bounded child quota admits no further provider response')
+      codexQuotaProxyJsonError(response, 429, 'CODEX_QUOTA_PROXY_NOT_ACCEPTING',
+        'bounded child quota admits no further provider response')
       return
     }
     activeRequest = true
@@ -7481,6 +7493,22 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
     let oversized = false
     let upstreamRequest = null
     let requestAborted = false
+    const encoding = String(request.headers['content-encoding'] || 'identity').trim().toLowerCase()
+    // Never echo arbitrary header values, parser exceptions, or request bytes.
+    // The controlled native hop is explicitly uncompressed on every Node version.
+    const contentEncoding = ['identity', 'zstd', 'gzip', 'deflate', 'br'].includes(encoding)
+      ? encoding : 'other'
+    const denyBeforeProviderRequest = (status, code, message, stage) => {
+      deniedCount += 1
+      const details = Object.freeze({
+        stage, contentEncoding, requestBytes: receivedBytes,
+        providerRequestStarted: false,
+        upstreamProviderRequests: providerRequestCount,
+        completedProviderRequests: requestCount,
+      })
+      recordFailure(code, message, details)
+      codexQuotaProxyJsonError(response, status, code, message, details)
+    }
     request.once('aborted', () => {
       requestAborted = true
       recordFailure('CODEX_QUOTA_PROXY_ABORTED', 'bounded child local provider request was aborted')
@@ -7505,17 +7533,23 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
     })
     request.on('end', () => {
       if (oversized) {
-        deniedCount += 1
-        recordFailure('CODEX_QUOTA_PROXY_REQUEST_TOO_LARGE', 'bounded child provider request is too large')
-        codexQuotaProxyJsonError(response, 413, 'bounded child provider request is too large')
+        denyBeforeProviderRequest(413, 'CODEX_QUOTA_PROXY_REQUEST_TOO_LARGE',
+          'bounded child provider request is too large', 'request-size')
         return
       }
       if (requestAborted) return
+      if (encoding !== 'identity') {
+        denyBeforeProviderRequest(415, 'CODEX_QUOTA_PROXY_ENCODING_UNSUPPORTED',
+          'bounded child provider request requires uncompressed JSON', 'request-encoding')
+        return
+      }
       const rawBody = Buffer.concat(chunks)
       let body
       let inputBound
+      let validationStage = 'request-json'
       try {
         body = JSON.parse(rawBody.toString('utf8'))
+        validationStage = 'request-shape'
         if (!body || typeof body !== 'object' || Array.isArray(body) ||
             (Object.hasOwn(body, 'max_output_tokens') &&
               (!Number.isSafeInteger(body.max_output_tokens) || body.max_output_tokens <= 0))) {
@@ -7524,37 +7558,38 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
             'bounded child provider request body is invalid',
           )
         }
+        validationStage = 'request-input'
         inputBound = codexQuotaProxyInputUpperBound(body, rawBody.length, priorRequest)
-      } catch (error) {
-        recordFailure(
-          error && error.code || 'CODEX_QUOTA_PROXY_REQUEST_INVALID',
-          'bounded child provider request is invalid',
-        )
-        codexQuotaProxyJsonError(response, 400, 'bounded child provider request is invalid')
+      } catch {
+        denyBeforeProviderRequest(400,
+          validationStage === 'request-input'
+            ? 'CODEX_QUOTA_PROXY_INPUT_INVALID' : 'CODEX_QUOTA_PROXY_REQUEST_INVALID',
+          'bounded child provider request is invalid', validationStage)
         return
       }
       latestInputBound = inputBound
       const alreadyUsed = billableModelTokens(cumulativeUsage)
       const activationOutputAllowance = tokenLimit - alreadyUsed - inputBound.maximumInputTokens
       const contextOutputAllowance = CODEX_MODEL_CONTEXT_WINDOW - inputBound.maximumInputTokens
-      const outputAllowance = Math.min(
+      // Subscription-authenticated Codex uses a different backend contract
+      // from the public Responses API: it rejects max_output_tokens. With no
+      // enforceable smaller wire ceiling, admission must reserve the model's
+      // full response maximum, including under an explicit finite budget.
+      const chatgptBackend = Boolean(request.headers['chatgpt-account-id'])
+      const outputAllowance = chatgptBackend ? CODEX_MODEL_MAX_OUTPUT_TOKENS : Math.min(
         CODEX_MODEL_MAX_OUTPUT_TOKENS, activationOutputAllowance, contextOutputAllowance,
       )
-      if (!Number.isSafeInteger(outputAllowance) || outputAllowance <= 0) {
-        deniedCount += 1
-        recordFailure(
-          'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED',
-          'bounded child cumulative quota denied this provider response',
-        )
-        codexQuotaProxyJsonError(response, 429, 'bounded child cumulative quota denied this provider response')
+      if (!Number.isSafeInteger(outputAllowance) || outputAllowance <= 0 ||
+          contextOutputAllowance <= 0 || activationOutputAllowance < outputAllowance) {
+        denyBeforeProviderRequest(429, 'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED',
+          'bounded child cumulative quota denied this provider response', 'request-admission')
         return
       }
-      body.max_output_tokens = Number.isSafeInteger(body.max_output_tokens)
+      const maximumResponseOutputTokens = !chatgptBackend && Number.isSafeInteger(body.max_output_tokens)
         ? Math.min(body.max_output_tokens, outputAllowance)
-        // Accounting-only default execution has no Autoprompt cumulative
-        // quota. Respect both the provider's maximum response size and the
-        // controlled context boundary without limiting later tool turns.
         : outputAllowance
+      if (chatgptBackend) delete body.max_output_tokens
+      else body.max_output_tokens = maximumResponseOutputTokens
       const outboundBody = Buffer.from(JSON.stringify(body), 'utf8')
       const upstreamBase = codexQuotaProxyUpstream(
         request.headers,
@@ -7566,7 +7601,7 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
       upstreamUrl.hash = ''
       const headers = { ...request.headers }
       for (const name of [
-        'connection', 'content-length', 'host', 'keep-alive', 'proxy-authenticate',
+        'connection', 'content-length', 'content-encoding', 'host', 'keep-alive', 'proxy-authenticate',
         'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade',
       ]) delete headers[name]
       headers.host = upstreamUrl.host
@@ -7578,7 +7613,7 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
       // response, never the accounting-only activation sentinel. This finite
       // bound is persisted before the first upstream byte and survives crash
       // recovery exactly.
-      const maximumUnaccountedTokens = inputBound.maximumInputTokens + body.max_output_tokens
+      const maximumUnaccountedTokens = inputBound.maximumInputTokens + maximumResponseOutputTokens
       latestMaximumUnaccountedTokens = maximumUnaccountedTokens
       if (typeof options.onProviderRequestStarted === 'function') {
         try {
@@ -7590,14 +7625,10 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
             accountedUsage: Object.freeze({ ...cumulativeUsage }),
           }))
         } catch (error) {
-          recordFailure(
+          denyBeforeProviderRequest(503,
             error && error.code || 'CODEX_PROVIDER_ALLOWANCE_PERSIST_FAILED',
             'bounded child provider request allowance could not be persisted',
-          )
-          codexQuotaProxyJsonError(
-            response,
-            503,
-            'bounded child provider request allowance could not be persisted',
+            'allowance-persistence',
           )
           return
         }
@@ -7680,7 +7711,7 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
             const actualResponseUnits = delta.noncachedInput + delta.cachedInput + delta.output
             const actualInputTokens = delta.noncachedInput + delta.cachedInput
             const providerBoundViolated = actualInputTokens > inputBound.maximumInputTokens ||
-                delta.output > body.max_output_tokens ||
+                delta.output > maximumResponseOutputTokens ||
                 billableModelTokens(nextUsage) > tokenLimit
             event.response.usage.codex_rollout_budget_units = actualResponseUnits
             const nextPriorRequest = Object.freeze({
@@ -7711,7 +7742,7 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
             requestCount += 1
             completedUsageSeen = true
             // Provider telemetry is billing evidence even when the provider
-            // violated max_output_tokens or the conservative input bound.
+            // violated the admitted response maximum or conservative input bound.
             // Persist and settle that exact spend first, then reject the
             // response so no over-limit output can become a child result.
             if (providerBoundViolated) {
@@ -7785,7 +7816,8 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
           'CODEX_QUOTA_PROXY_UPSTREAM_FAILED',
           'bounded child upstream provider request failed',
         )
-        codexQuotaProxyJsonError(response, 502, 'bounded child upstream provider request failed')
+        codexQuotaProxyJsonError(response, 502, 'CODEX_QUOTA_PROXY_UPSTREAM_FAILED',
+          'bounded child upstream provider request failed')
       })
       upstreamRequest.end(outboundBody)
     })
@@ -7794,7 +7826,8 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
         'CODEX_QUOTA_PROXY_LOCAL_REQUEST_FAILED',
         'bounded child local provider request failed',
       )
-      codexQuotaProxyJsonError(response, 400, 'bounded child local provider request failed')
+      codexQuotaProxyJsonError(response, 400, 'CODEX_QUOTA_PROXY_LOCAL_REQUEST_FAILED',
+        'bounded child local provider request failed')
     })
   })
   server.on('connection', socket => {
@@ -8292,6 +8325,9 @@ class CodexExecAdapter {
       '--disable', 'goals', '--disable', 'memories',
       '--disable', 'token_budget', '--disable', 'current_time_reminder',
       '--disable', 'deferred_executor', '--disable', 'unbounded_connection_retries',
+      // ChatGPT-authenticated native Codex otherwise sends zstd request bodies.
+      // This controller-owned hop uses plain JSON on supported Node versions.
+      '--disable', 'enable_request_compression',
       '-c', `model_auto_compact_token_limit=${CODEX_CHILD_AUTO_COMPACT_TOKEN_LIMIT}`,
       '-c', `tool_output_token_limit=${CODEX_CHILD_TOOL_OUTPUT_TOKEN_LIMIT}`,
       '-c', 'allow_login_shell=false',
@@ -8479,6 +8515,32 @@ class CodexExecAdapter {
       ...checkerScratchProjection,
       '',
     ].join('\n')
+    if (record.logicalRole === 'route-analyst' && !record.continuationId) {
+      // Advisory routing must not launch a request already known to be
+      // impossible under its small envelope. The JSON-escaped prompt alone
+      // is a lower bound on the whole-request byte policy used by the relay;
+      // it deliberately excludes the unknown native wrapper overhead. Never
+      // truncate the canonical mission to force it to fit. The existing
+      // deterministic DIRECT fallback receives that mission unchanged.
+      const promptInputLowerBound = Buffer.byteLength(JSON.stringify(input), 'utf8')
+      const tokenLimit = codexChildSpendLimit(record)
+      if (promptInputLowerBound >= tokenLimit) {
+        throw new SupervisorIntegrationError(
+          'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED',
+          'Optional route analysis cannot fit its prompt; continue with deterministic routing.',
+          {
+            logicalRole: record.logicalRole,
+            stage: 'route-prompt-admission',
+            tokenLimit,
+            promptInputLowerBound,
+            providerRequestStarted: false,
+            upstreamProviderRequests: 0,
+            completedProviderRequests: 0,
+            accountingDisposition: 'NO_PROVIDER_REQUEST_STARTED',
+          },
+        )
+      }
+    }
     let sawStreamedOutput = false
     const rawOutputHash = crypto.createHash('sha256')
     const streamAccumulator = createCodexJsonlAccumulator(record)
@@ -9288,29 +9350,43 @@ class CodexExecAdapter {
         }
       }
     }
-    const relayLocalQuotaPreflightFailure = cumulativeQuotaSnapshot &&
+    const relayLocalPreflightFailure = cumulativeQuotaSnapshot &&
+      Number.isSafeInteger(cumulativeQuotaSnapshot.providerRequestCount) &&
+      cumulativeQuotaSnapshot.providerRequestCount >= 0 &&
       cumulativeQuotaSnapshot.providerRequestCount === cumulativeQuotaSnapshot.requestCount &&
       cumulativeQuotaSnapshot.lastFailure &&
-      cumulativeQuotaSnapshot.lastFailure.code === 'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED'
-    const quotaPreflightError = relayLocalQuotaPreflightFailure
+      (cumulativeQuotaSnapshot.lastFailure.details?.providerRequestStarted === false ||
+        cumulativeQuotaSnapshot.lastFailure.code === 'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED')
+    // Only the drained controller-owned relay can prove a local rejection. A
+    // provider's error text is not authority for zero spend, and any pending
+    // upstream request keeps the existing unknown-spend reconciliation path.
+    const localPreflightError = relayLocalPreflightFailure
       ? new SupervisorIntegrationError(
-          'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED',
+          cumulativeQuotaSnapshot.lastFailure.code,
           cumulativeQuotaSnapshot.lastFailure.message,
           {
+            ...(cumulativeQuotaSnapshot.lastFailure.details || {}),
             logicalRole: record.logicalRole,
             tokenLimit: cumulativeQuotaSnapshot.tokenLimit,
-            latestInputBound: cumulativeQuotaSnapshot.latestInputBound,
+            latestInputBound: cumulativeQuotaSnapshot.latestInputBound ? {
+              maximumInputTokens: cumulativeQuotaSnapshot.latestInputBound.maximumInputTokens,
+              method: cumulativeQuotaSnapshot.latestInputBound.method,
+            } : null,
             deniedCount: cumulativeQuotaSnapshot.deniedCount,
             upstreamProviderRequests: cumulativeQuotaSnapshot.providerRequestCount,
+            completedProviderRequests: cumulativeQuotaSnapshot.requestCount,
+            providerRequestStarted: false,
+            accountingDisposition: cumulativeQuotaSnapshot.providerRequestCount === 0
+              ? 'NO_PROVIDER_REQUEST_STARTED' : 'PRIOR_PROVIDER_REQUESTS_ACCOUNTED',
             ...(executionError ? { executionError: serializeError(executionError) } : {}),
           },
         )
       : null
-    if (relayLocalQuotaPreflightFailure && lateExecutionFailures.length === 0) {
+    if (relayLocalPreflightFailure && lateExecutionFailures.length === 0) {
       recordLateExecutionFailure('quota-proxy-preflight', cumulativeQuotaSnapshot.lastFailure)
     }
     if (!committedTerminalResult) {
-      if (quotaPreflightError) throw quotaPreflightError
+      if (localPreflightError) throw localPreflightError
       if (executionError) throw executionError
       if (!execution || execution.processOwned !== true || execution.exactArgv !== true) {
         throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', 'Codex runner did not prove owned process and exact argv')
@@ -14926,14 +15002,23 @@ class CodexSupervisorRuntime {
         repairContextBinding,
       }
     }
-    const common = {
-      role: providerRole,
+    // Conservative route fallback can copy the complete original request into
+    // its success prose. Project exact mission echoes before the brief/evidence
+    // byte checks, not only at the later native transport boundary: otherwise
+    // the duplicated request overflows a context slice before work can start.
+    // The original request, immutable route decision and canonical assignment
+    // stay intact; only auxiliary prose refers to the already-bound mission.
+    const dispatchProse = projectModelVisibleMissionEchoes({
       assignment: request.assignment,
       successChecklist: request.successChecklist ?? request.success_checklist ?? request.success,
-      ownership: request.ownership,
       checks: request.checks,
       dependencies: request.dependencies,
       returnShape: request.returnShape ?? request.return_shape,
+    }, canonicalMissionEchoProjection(this.canonicalMissionProjection.canonicalMission, missionBinding))
+    const common = {
+      role: providerRole,
+      ...dispatchProse,
+      ownership: request.ownership,
       requestPointer: this.requestPointer,
       evidencePointers: request.evidencePointers ?? request.evidence_pointers ?? [],
       providerCapabilities: this.providerCapabilities,
@@ -18183,7 +18268,10 @@ class CodexSupervisorRuntime {
           workerTransportQuarantinePointer,
           externalTransportQuarantinePointer,
         )
-        transportQuarantineResolved = Boolean(transportQuarantinePointer)
+        // A checked absence is a complete live disposition too. Omitting the
+        // private marker for null makes the executor treat this fresh failure
+        // as a reopened result and incorrectly require crash-adoption state.
+        transportQuarantineResolved = true
         durableTransportQuarantineEvidence = transportQuarantinePointer
           ? transportQuarantineCandidateEvidence(
               transportQuarantinePointer,

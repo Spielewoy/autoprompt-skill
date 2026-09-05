@@ -8,9 +8,41 @@ const path = require('node:path')
 const test = require('node:test')
 const { WorkerWorkspaceManager } = require('../../agents/codex/workflow/worker-workspace.js')
 
+function removeOwnedFixture(root, binding) {
+  let current
+  try { current = fs.lstatSync(root) } catch (error) {
+    if (error.code === 'ENOENT') return
+    throw error
+  }
+  assert.ok(current.isDirectory() && !current.isSymbolicLink(), 'fixture root must remain a real directory')
+  assert.equal(current.dev, binding.dev, 'fixture root device must remain unchanged')
+  assert.equal(current.ino, binding.ino, 'fixture root identity must remain unchanged')
+  const restore = file => {
+    const stat = fs.lstatSync(file)
+    // Links are removed by rmSync, never followed when restoring permissions.
+    if (stat.isSymbolicLink()) return
+    assert.equal(stat.uid, binding.uid, 'cleanup may restore only fixture-owned entries')
+    if (stat.isDirectory()) {
+      fs.chmodSync(file, 0o700)
+      for (const name of fs.readdirSync(file)) restore(path.join(file, name))
+    } else if (stat.isFile()) {
+      assert.equal(stat.nlink, 1, 'cleanup may not change permissions through a hard link')
+      fs.chmodSync(file, 0o600)
+    } else assert.fail('unexpected nonregular fixture entry')
+  }
+  restore(root)
+  fs.rmSync(root, { recursive: true, force: true })
+}
+
+function temporaryRoot(t, prefix) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
+  const binding = fs.lstatSync(root)
+  t.after(() => removeOwnedFixture(root, binding))
+  return root
+}
+
 function fixture(t, filesystem = fs) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-workspace-survival-'))
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const root = temporaryRoot(t, 'autoprompt-workspace-survival-')
   const target = path.join(root, 'target')
   const privateRoot = path.join(root, 'private')
   fs.mkdirSync(target)
@@ -45,6 +77,10 @@ test('quarantined product can be preserved after its transport retry becomes una
     admission, retryWorkItemId: 'work-1-transport-retry-1', transportReceiptHash: 'a'.repeat(64),
   })
   const preserved = f.manager.preserveCandidate(f.session, { admission, reasonCode: 'TRANSPORT_UNAVAILABLE' })
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(preserved.candidateRoot).mode & 0o222, 0,
+      'preserved product remains read-only until test cleanup')
+  }
   assert.equal(fs.readFileSync(path.join(preserved.candidateRoot, 'output.txt'), 'utf8'), 'recoverable product\n')
   assert.deepEqual(f.manager.preserveCandidate(f.session, { admission, reasonCode: 'TRANSPORT_UNAVAILABLE' }), preserved)
   assert.equal(fs.readFileSync(path.join(f.target, 'input.txt'), 'utf8'), 'unchanged input\n')
@@ -104,4 +140,25 @@ test('candidate preservation rejects a replaced partial copy without overwriting
   assert.throws(() => f.manager.preserveCandidate(f.session, { admission }), error =>
     ['WORKER_SURVIVAL_TAMPERED', 'WORKER_SURVIVAL_INVALID'].includes(error.code))
   assert.equal(fs.readFileSync(failedDestination, 'utf8'), 'foreign bytes\n')
+})
+
+test('fixture cleanup restores sealed directories without following an external link', t => {
+  const parent = temporaryRoot(t, 'autoprompt-workspace-cleanup-')
+  const root = path.join(parent, 'owned')
+  const outside = path.join(parent, 'outside')
+  fs.mkdirSync(root)
+  fs.mkdirSync(outside)
+  const externalFile = path.join(outside, 'keep.txt')
+  fs.writeFileSync(externalFile, 'outside bytes\n', { mode: 0o400 })
+  const externalMode = fs.statSync(externalFile).mode
+  fs.symlinkSync(outside, path.join(root, 'outside-link'), process.platform === 'win32' ? 'junction' : 'dir')
+  const sealed = path.join(root, 'sealed')
+  fs.mkdirSync(sealed)
+  fs.writeFileSync(path.join(sealed, 'payload.txt'), 'preserved bytes\n', { mode: 0o400 })
+  fs.chmodSync(sealed, 0o500)
+  const binding = fs.lstatSync(root)
+  removeOwnedFixture(root, binding)
+  assert.equal(fs.existsSync(root), false)
+  assert.equal(fs.readFileSync(externalFile, 'utf8'), 'outside bytes\n')
+  assert.equal(fs.statSync(externalFile).mode, externalMode)
 })

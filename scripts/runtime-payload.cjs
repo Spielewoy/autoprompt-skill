@@ -688,21 +688,62 @@ function sameFilesystemPath(left, right) {
     : normalizedLeft === normalizedRight
 }
 
+function assertWindowsDirectoryAncestorsUnlinked(directory) {
+  // path.parse/dirname treat \\?\UNC\ as a root, but it is not a filesystem
+  // directory. Start extended UNC walks at the actual server/share instead.
+  const extendedUnc = /^(\\\\\?\\UNC\\[^\\]+\\[^\\]+)(?:\\|$)/i.exec(directory)
+  const filesystemRoot = extendedUnc ? `${extendedUnc[1]}\\` : path.parse(directory).root
+  const ancestors = [filesystemRoot]
+  let current = filesystemRoot
+  for (const segment of directory.slice(filesystemRoot.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment)
+    ancestors.push(current)
+  }
+  // Check existing prefixes before recursive creation; a missing child does not
+  // make an existing ancestor junction safe to traverse.
+  for (const ancestor of ancestors) {
+    const stats = fs.lstatSync(ancestor, { throwIfNoEntry: false })
+    if (!stats) break
+    if (!stats.isDirectory() || stats.isSymbolicLink()) {
+      throw new Error(`activation root resolves through a link or unsafe ancestor: ${ancestor}`)
+    }
+  }
+}
+
+function sameUnlinkedWindowsDirectory(root, resolvedRoot, rootStats) {
+  const ordinaryFilesystemPath = value => {
+    const ordinary = path.normalize(value)
+      .replace(/^\\\\\?\\UNC\\/i, '\\\\')
+      .replace(/^\\\\\?\\(?=[a-z]:\\)/i, '')
+    return /^[a-z]:\\/i.test(ordinary) || /^\\\\(?![?.]\\)[^\\]+\\[^\\]+(?:\\|$)/.test(ordinary)
+  }
+  if (!ordinaryFilesystemPath(root) || !ordinaryFilesystemPath(resolvedRoot)) return false
+  const resolvedStats = fs.lstatSync(resolvedRoot, { bigint: true })
+  const currentStats = fs.lstatSync(root, { bigint: true })
+  return [rootStats, resolvedStats, currentStats].every(stats =>
+    stats.isDirectory() && !stats.isSymbolicLink() &&
+    typeof stats.dev === 'bigint' && typeof stats.ino === 'bigint' && stats.ino > 0n &&
+    stats.dev === rootStats.dev && stats.ino === rootStats.ino)
+}
+
 function assertDirectoryChainUnlinked(root, targetDirectory, create = false) {
   const absoluteRoot = path.resolve(root)
   const absoluteTarget = path.resolve(targetDirectory)
   if (!isContained(absoluteRoot, absoluteTarget)) {
     throw new Error(`runtime destination escapes activation root: ${absoluteTarget}`)
   }
+  if (process.platform === 'win32') assertWindowsDirectoryAncestorsUnlinked(absoluteRoot)
   if (!fs.existsSync(absoluteRoot)) {
     if (!create) throw new Error(`activation root is missing: ${absoluteRoot}`)
     fs.mkdirSync(absoluteRoot, { recursive: true })
   }
-  const rootStats = fs.lstatSync(absoluteRoot)
+  const rootStats = fs.lstatSync(absoluteRoot, { bigint: true })
   if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) {
     throw new Error(`activation root is linked or not a directory: ${absoluteRoot}`)
   }
-  if (!sameFilesystemPath(fs.realpathSync.native(absoluteRoot), absoluteRoot)) {
+  const resolvedRoot = fs.realpathSync.native(absoluteRoot)
+  if (!sameFilesystemPath(resolvedRoot, absoluteRoot) &&
+      (process.platform !== 'win32' || !sameUnlinkedWindowsDirectory(absoluteRoot, resolvedRoot, rootStats))) {
     throw new Error(`activation root resolves through a link: ${absoluteRoot}`)
   }
   const relative = path.relative(absoluteRoot, absoluteTarget)

@@ -1,7 +1,7 @@
 # Codex v2 local run records
 
-<!-- codex-v2-release-status: local-v1.0.29-build-not-published -->
-> Release status: this guide describes the local Codex v1.0.29 build.
+<!-- codex-v2-release-status: local-v1.0.30-build-not-published -->
+> Release status: this guide describes the local Codex v1.0.30 build.
 > The build has not been published as a package or release.
 
 Codex v2 saves an exact local record so a run can be checked and resumed without
@@ -11,7 +11,7 @@ and checking evidence. Treat the whole record as potentially confidential.
 
 ## Local build route control
 
-The optional `path=auto|direct|light|roadmap` control is present in the local v1.0.29
+The optional `path=auto|direct|light|roadmap` control is present in the local v1.0.30
 build and has not been published. Put it first in the Codex request
 after `--`. Omitted `path=` and
 `path=auto` run automatic route analysis and selection. `path=direct`, `path=light`,
@@ -19,6 +19,17 @@ and `path=roadmap` skip that model work and enter the exact named route. They do
 skip the local route record, safety or authority checks, required deliverables,
 execution, or independent verification. Invalid, conflicting, or unusable values fail
 closed without silently changing routes.
+
+## Explicit generated-role effort
+
+`autoprompt configure codex --agents gpt-5.6-sol --effort xhigh` sets the
+receipt-bound generated role files, including workers and independent checkers.
+The optional `--effort` accepts `low`, `medium`, `high`, or `xhigh`, including with
+model lists or `auto`; it cannot be combined with `--agents off`. Reconfiguring
+without `--effort` restores the existing per-role defaults. Existing private
+activations retain their prepared configuration; the setting applies to new ones.
+It does not change the outer session or synthetic run-owner effort policy, and
+optional PRE_ROUTE model turns still run at low effort.
 
 ## Child-turn cost bounds
 
@@ -53,19 +64,23 @@ patch, unified exec, and image inspection. The controlled provider sets request 
 stream retries to zero.
 
 A controller-owned loopback relay applies a preventive per-response token envelope
-before each Responses API request. It computes a conservative input upper bound from
-the exact UTF-8 request and injects `max_output_tokens` that fits both the controlled
-272,000-token model context, the supported models' documented 128,000-token
-maximum response, and any explicit remaining activation allowance. This response
-maximum is not a cumulative task budget. A
-request that cannot fit an explicit allowance is refused before it reaches the
-upstream provider. Each valid `response.completed` event is rewritten with total
+before each provider request. It computes a conservative input upper bound from
+the exact UTF-8 request. For API-key authentication, it injects `max_output_tokens`
+that fits the controlled 272,000-token model context, the supported models' documented
+128,000-token response maximum, and any explicit remaining activation allowance.
+The ChatGPT subscription backend rejects that parameter, so the relay omits it and
+reserves the full 128,000-token response maximum plus the input upper bound. Neither
+context packing nor an unsupported requested ceiling establishes a smaller ChatGPT
+response bound. A request that cannot fit an explicit allowance is refused before
+it reaches the upstream provider; an optional 8,000-token route request takes the
+deterministic DIRECT fallback. Default required work has no cumulative token cap.
+Each valid `response.completed` event is rewritten with total
 input including cached input, then charged exactly once. Missing, malformed,
 duplicate, truncated, or out-of-bound usage fails closed; a disconnected child
 cancels its upstream request.
 
 If a required default-budget request reached the provider but complete usage is
-unavailable, the controller charges only that request's finite context-bound maximum
+unavailable, the controller charges only that request's finite admitted maximum
 unaccounted allowance, releases the rest of the accounting-only reservation, and may
 use exactly one fresh transport successor. Partial candidate bytes stay quarantined
 until ownership validation. A second unknown provider response is not looped: its
@@ -93,7 +108,8 @@ charged before resumed work is admitted. Explicit token acceptance limits remain
 cumulative for an adopted child. Because a tool may start before its lifecycle event
 is durable, a crash-adopted continuation under an explicit tool ceiling receives no
 renewed allowance. Preventive guarantees depend on the upstream provider honoring
-`max_output_tokens` and reporting truthful usage; a provider-side protocol violation
+its documented response maximum, the API output ceiling where supported, and
+reporting truthful usage; a provider-side protocol violation
 is stopped and rejected but cannot be retroactively unbilled by the local launcher.
 
 `model_auto_compact_token_limit=32768` is separately configured to compact growing

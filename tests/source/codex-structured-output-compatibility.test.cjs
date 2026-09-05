@@ -32,6 +32,7 @@ const {
   modelVisibleDispatch,
   parseCodexJsonl,
   productionTransportWatchdogMs,
+  hashWorkspaceCandidate,
   imageDatumOutcomeFromPreWorkAdmission,
   readPrivateAgentAssignment,
   readPersistedWorkerAssignment,
@@ -1946,7 +1947,14 @@ test('Codex checker prompt removes duplicated doctrine while retaining exact obl
   assert.equal(result.code, 'CHECK_INCONCLUSIVE')
 })
 
-test('fallible local bookkeeping callbacks cannot discard a schema-valid terminal result', async () => {
+test('fallible local bookkeeping callbacks cannot discard a schema-valid terminal result', async t => {
+  // Recovery hashes the exact candidate through Git. The checkout hosting this
+  // test need not belong to this process, so use a real fixture-owned repository.
+  const target = temporaryDirectory(t)
+  const initialized = childProcess.spawnSync('git', ['init', '--quiet', target], { encoding: 'utf8' })
+  assert.equal(initialized.status, 0, initialized.stderr || String(initialized.error))
+  fs.writeFileSync(path.join(target, 'candidate.txt'), 'preserved terminal candidate\n')
+  const candidateHash = hashWorkspaceCandidate(target, {})
   for (const callbackName of [
     'onEvent', 'onFirstProductSignal', 'onSessionIdentified', 'onUsageDelta', 'onTerminalResult',
   ]) {
@@ -1967,7 +1975,7 @@ test('fallible local bookkeeping callbacks cannot discard a schema-valid termina
         },
         async stop() { return { drained: true } },
       },
-      targetPath: ROOT,
+      targetPath: target,
       profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
       outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
     })
@@ -2018,7 +2026,7 @@ test('fallible local bookkeeping callbacks cannot discard a schema-valid termina
       },
       async stop() { return { drained: true } },
     },
-    targetPath: ROOT,
+    targetPath: target,
     profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
     outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
   })
@@ -2034,9 +2042,15 @@ test('fallible local bookkeeping callbacks cannot discard a schema-valid termina
         code: 'RUN_RECORD_WRITE_UNAVAILABLE',
       })
     },
-  }), error => error.code === 'CALLBACK_RECONCILIATION_PENDING' &&
-    error.details.resumableCandidate &&
-    error.details.resumableCandidate.kind === 'callback-reconciliation-candidate')
+  }), error => {
+    assert.equal(error.code, 'CALLBACK_RECONCILIATION_PENDING')
+    assert.equal(error.details.resumableCandidate.kind, 'callback-reconciliation-candidate')
+    assert.equal(error.details.resumableCandidate.candidatePath, target)
+    assert.equal(error.details.resumableCandidate.candidateHash, candidateHash)
+    assert.deepEqual(Object.fromEntries(Object.keys(persistentOutput).map(key =>
+      [key, error.frozenTerminalResult[key]])), persistentOutput)
+    return true
+  })
   assert.equal(persistentLaunches, 1)
   assert.equal(persistentAttempts, 4)
 
@@ -2058,7 +2072,7 @@ test('fallible local bookkeeping callbacks cannot discard a schema-valid termina
       },
       async stop() { return { drained: true } },
     },
-    targetPath: ROOT,
+    targetPath: target,
     profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
     outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
   })
@@ -2072,6 +2086,7 @@ test('fallible local bookkeeping callbacks cannot discard a schema-valid termina
     },
   }), error => error.code === 'RUN_RECORD_UNSAFE')
   assert.equal(launches, 1)
+  assert.equal(hashWorkspaceCandidate(target, {}), candidateHash)
 })
 
 test('Codex terminal boundary accepts closure of pre-final items but rejects newly-started work', () => {
@@ -2330,6 +2345,7 @@ test('Codex route analyst may revise a schema-valid provisional recommendation b
   assert.deepEqual(routeArgv.filter((value, index, all) => all[index - 1] === '--disable'), [
     'multi_agent', 'multi_agent_v2', 'code_mode', 'code_mode_only', 'goals', 'memories',
     'token_budget', 'current_time_reminder', 'deferred_executor', 'unbounded_connection_retries',
+    'enable_request_compression',
     'shell_tool', 'unified_exec', 'view_image',
   ])
   assert.equal(routeArgv.includes('model_reasoning_effort="low"'), true)

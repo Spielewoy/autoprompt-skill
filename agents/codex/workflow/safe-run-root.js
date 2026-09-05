@@ -736,23 +736,34 @@ function assertNpmPackExcludesRunRecords(selection, options = {}) {
   const args = process.platform === 'win32'
     ? ['/d', '/s', '/c', options.npmCommand || 'npm.cmd', 'pack', '--dry-run', '--json', '--ignore-scripts']
     : ['pack', '--dry-run', '--json', '--ignore-scripts']
-  const result = spawnSync(command, args, {
-    cwd: packageRoot,
-    encoding: 'utf8',
-    windowsHide: true,
-    env: { ...process.env, npm_config_cache: options.npmCache || path.join(os.tmpdir(), 'autoprompt-npm-pack-cache') },
-  })
-  if (result.status !== 0) throw new RunRecordError('RUN_RECORD_FAILURE', 'Cannot prove the npm package boundary excludes run records', {
-    status: result.status,
-    cause: result.error && (result.error.code || result.error.message),
-    stderr: result.stderr && result.stderr.trim(),
-    stdout: result.stdout && result.stdout.trim(),
-  })
-  let reports
-  try { reports = JSON.parse(result.stdout) } catch { throw new RunRecordError('RUN_RECORD_FAILURE', 'npm pack did not return its machine-readable file list') }
-  const files = reports.flatMap(report => report.files || [])
-  assertNoPrivatePackagePaths(selection, files)
-  return { checked: true, files }
+  // A fixed cache under the shared OS temp directory can belong to a previous
+  // caller. Own only a fresh per-check directory; explicit caches stay owned
+  // by the caller and are never removed here.
+  const privateCache = options.npmCache ? null : fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-npm-pack-cache-'))
+  try {
+    const environment = Object.fromEntries(Object.entries(process.env)
+      .filter(([key]) => key.toLowerCase() !== 'npm_config_cache'))
+    environment.npm_config_cache = options.npmCache || privateCache
+    const result = spawnSync(command, args, {
+      cwd: packageRoot,
+      encoding: 'utf8',
+      windowsHide: true,
+      env: environment,
+    })
+    if (result.status !== 0) throw new RunRecordError('RUN_RECORD_FAILURE', 'Cannot prove the npm package boundary excludes run records', {
+      status: result.status,
+      cause: result.error && (result.error.code || result.error.message),
+      stderr: result.stderr && result.stderr.trim(),
+      stdout: result.stdout && result.stdout.trim(),
+    })
+    let reports
+    try { reports = JSON.parse(result.stdout) } catch { throw new RunRecordError('RUN_RECORD_FAILURE', 'npm pack did not return its machine-readable file list') }
+    const files = reports.flatMap(report => report.files || [])
+    assertNoPrivatePackagePaths(selection, files)
+    return { checked: true, files }
+  } finally {
+    if (privateCache) fs.rmSync(privateCache, { recursive: true, force: true })
+  }
 }
 
 function assertRunRecordBoundary(selection, options = {}) {

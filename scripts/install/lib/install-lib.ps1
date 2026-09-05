@@ -1841,8 +1841,11 @@ function Read-IdemManifestDocument {
         -not $document.EndsWith("`n") -or $document.EndsWith("`n`n")) {
         throw "invalid ownership manifest grammar: $Path"
     }
+    # The default split is unlimited in both Windows PowerShell and PowerShell
+    # 7. A negative count means right-to-left splitting in PowerShell 7, not
+    # unlimited splitting, and -1 leaves the entire receipt on one line.
     $lines = @($document.Substring(0, $document.Length - 1) `
-        -split "`n", -1)
+        -split "`n")
     if ($lines.Count -lt 2 -or $lines[0] -cne '{' -or
         $lines[$lines.Count - 1] -cne '}') {
         throw "invalid ownership manifest grammar: $Path"
@@ -4240,7 +4243,7 @@ function Read-UninstallReceiptDocument {
         throw 'invalid receipt newline contract'
     }
     $lines = @($document.Substring(0, $document.Length - 1) `
-        -split "`n", -1)
+        -split "`n")
     if ($lines[0] -cne '{') { throw 'invalid receipt opener' }
     return @{ Document = $document; Lines = $lines }
 }

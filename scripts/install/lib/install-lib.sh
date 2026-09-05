@@ -1333,25 +1333,34 @@ AUTOPROMPT_HASH_MANIFEST_NAME=".autoprompt-install-hashes.json"
 # _idem_sha256 <file>: lowercase 64-hex SHA-256 of <file>, via the documented
 # fallback order. Returns 42 + an operator-actionable stderr line if no tool exists.
 _idem_sha256() {
-  local file="$1" out
+  local file="$1" out hash format=checksum
   if command -v sha256sum >/dev/null 2>&1; then
-    out="$(sha256sum "$file" 2>/dev/null)" || return 42
-    printf '%s' "${out%% *}"
-    return 0
-  fi
-  if command -v shasum >/dev/null 2>&1; then
-    out="$(shasum -a 256 "$file" 2>/dev/null)" || return 42
-    printf '%s' "${out%% *}"
-    return 0
-  fi
-  if command -v openssl >/dev/null 2>&1; then
+    out="$(sha256sum -- "$file" 2>/dev/null)" || return 42
+  elif command -v shasum >/dev/null 2>&1; then
+    out="$(shasum -a 256 -- "$file" 2>/dev/null)" || return 42
+  elif command -v openssl >/dev/null 2>&1; then
     out="$(openssl dgst -sha256 "$file" 2>/dev/null)" || return 42
-    printf '%s' "${out##*= }"
-    return 0
+    format=openssl
+  else
+    printf '%s\n' "error=no-sha256-tool" >&2
+    printf 'Autoprompt idempotency: no SHA-256 tool found (need sha256sum, shasum, or openssl). Install one and re-run.\n' >&2
+    return 42
   fi
-  printf '%s\n' "error=no-sha256-tool" >&2
-  printf 'Autoprompt idempotency: no SHA-256 tool found (need sha256sum, shasum, or openssl). Install one and re-run.\n' >&2
-  return 42
+  if [ "$format" = checksum ]; then
+    # GNU/shasum prefix the record with one backslash when escaping a filename.
+    # That marker is not part of the digest (including native Git Bash paths).
+    out="${out#\\}"
+    hash="${out:0:64}"
+    [[ ${#out} -gt 66 && ( "${out:64:2}" = '  ' || "${out:64:2}" = ' *' ) ]] || hash=""
+  else
+    hash="${out##*= }"
+    [ "$hash" != "$out" ] || hash=""
+  fi
+  if ! [[ "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+    printf '%s\n' 'error=invalid-sha256-output' >&2
+    return 42
+  fi
+  printf '%s' "$hash"
 }
 
 # _idem_read_manifest_hash <root> <key>: echo the recorded hex for <key> from the

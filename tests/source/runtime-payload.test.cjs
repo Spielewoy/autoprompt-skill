@@ -8,6 +8,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
+const vm = require('node:vm')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const {
@@ -43,6 +44,149 @@ function npmCliPath() {
   assert.ok(candidate, `could not locate npm CLI; checked ${candidates.join(', ')}`)
   return candidate
 }
+
+function windowsDirectoryGuardFixture(root, resolvedRoot) {
+  const winPath = path.win32
+  const directories = new Map()
+  const events = []
+  const identity = { dev: 19n, ino: 9007199254740992n, linked: false }
+  const key = file => winPath.normalize(file).replace(/\\$/, '')
+  const addDirectory = (directory, stats = identity) => {
+    for (let current = directory; ; current = winPath.dirname(current)) {
+      if (!directories.has(key(current))) directories.set(key(current), { ...stats })
+      if (winPath.dirname(current) === current) break
+    }
+  }
+  addDirectory(root)
+  addDirectory(resolvedRoot)
+  // These namespace prefixes are not directories; dirname walks above the
+  // actual extended UNC share unless production explicitly anchors the walk.
+  for (const file of [...directories.keys()]) {
+    if (/^\\\\\?\\UNC(?:\\[^\\]+)?$/i.test(file)) directories.delete(file)
+  }
+  const modeledFs = {
+    existsSync: file => directories.has(key(file)),
+    lstatSync(file, options = {}) {
+      events.push({ action: 'lstat', file })
+      const stats = directories.get(key(file))
+      if (!stats) {
+        if (options.throwIfNoEntry === false) return undefined
+        throw Object.assign(new Error(`missing modeled directory: ${file}`), { code: 'ENOENT' })
+      }
+      return {
+        dev: options.bigint ? stats.dev : Number(stats.dev),
+        ino: options.bigint ? stats.ino : Number(stats.ino),
+        isDirectory: () => true,
+        isSymbolicLink: () => stats.linked,
+      }
+    },
+    realpathSync: { native: file => file === root ? resolvedRoot : file },
+    mkdirSync(file, options = {}) {
+      events.push({ action: 'mkdir', file })
+      if (!options.recursive) assert.ok(directories.has(key(winPath.dirname(file))))
+      addDirectory(file)
+    },
+  }
+  // Execute the production guard and all of its helpers, with Windows lexical
+  // semantics and modeled file IDs. Native Windows install tests below retain
+  // their actual os.tmpdir spelling; this model does not replace that CI gate.
+  const source = fs.readFileSync(path.join(ROOT, 'scripts', 'runtime-payload.cjs'), 'utf8')
+  const start = source.indexOf('function isContained(')
+  const end = source.indexOf('function assertRegularUnlinked(', start)
+  assert.ok(start >= 0 && end > start)
+  const guard = vm.runInNewContext(`${source.slice(start, end)}\nassertDirectoryChainUnlinked`, {
+    fs: modeledFs, path: winPath, process: { platform: 'win32' },
+  })
+  return { guard, directories, events, identity }
+}
+
+test('Windows runtime roots accept exact physical short/long aliases after checking every ancestor', () => {
+  for (const [root, resolvedRoot] of [
+    ['C:\\Users\\RUNNER~1\\Temp\\activation', 'C:\\Users\\runneradmin\\Temp\\activation'],
+    ['\\\\server\\share\\RUNNER~1\\activation', '\\\\server\\share\\runneradmin\\activation'],
+    ['\\\\?\\C:\\Users\\RUNNER~1\\activation', '\\\\?\\C:\\Users\\runneradmin\\activation'],
+    ['\\\\?\\UNC\\server\\share\\RUNNER~1\\activation', '\\\\?\\UNC\\server\\share\\runneradmin\\activation'],
+  ]) {
+    const fixture = windowsDirectoryGuardFixture(root, resolvedRoot)
+    const target = path.win32.join(root, 'skills', 'autoprompt')
+    assert.doesNotThrow(() => fixture.guard(root, target, true), root)
+    assert.deepEqual(fixture.events.filter(event => event.action === 'mkdir').map(event => event.file), [
+      path.win32.join(root, 'skills'), target,
+    ])
+    const firstWrite = fixture.events.findIndex(event => event.action === 'mkdir')
+    const extendedShare = /^(\\\\\?\\UNC\\[^\\]+\\[^\\]+)(?:\\|$)/i.exec(root)?.[1]
+    for (let ancestor = root; ; ancestor = path.win32.dirname(ancestor)) {
+      assert.ok(fixture.events.slice(0, firstWrite).some(event => event.action === 'lstat' &&
+        event.file.replace(/\\$/, '') === ancestor.replace(/\\$/, '')), ancestor)
+      if (ancestor === extendedShare) break
+      if (path.win32.dirname(ancestor) === ancestor) break
+    }
+    assert.throws(() => fixture.guard(root, `${root}-outside`, true), /escapes activation root/)
+  }
+})
+
+test('Windows runtime aliases require exact bigint identities and ordinary filesystem paths', () => {
+  const root = 'C:\\Users\\RUNNER~1\\activation'
+  const resolvedRoot = 'C:\\Users\\runneradmin\\activation'
+  for (const replacement of [
+    { ino: 9007199254740993n }, // Adjacent file IDs must not collapse through Number precision.
+    { dev: 20n },
+    { ino: 0n },
+    { ino: undefined },
+    { linked: true },
+  ]) {
+    const fixture = windowsDirectoryGuardFixture(root, resolvedRoot)
+    Object.assign(fixture.directories.get(resolvedRoot), replacement)
+    assert.throws(() => fixture.guard(root, root), /resolves through a link/)
+    assert.equal(fixture.events.some(event => event.action === 'mkdir'), false)
+  }
+  for (const unsupported of ['\\\\.\\pipe\\activation', '\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\activation', '\\??\\C:\\activation']) {
+    const fixture = windowsDirectoryGuardFixture(root, unsupported)
+    assert.throws(() => fixture.guard(root, root), /resolves through a link/)
+  }
+})
+
+test('Windows runtime guards reject ancestor junctions before creating a missing activation root', () => {
+  const parent = 'C:\\Users\\RUNNER~1'
+  const root = `${parent}\\activation`
+  const fixture = windowsDirectoryGuardFixture(root, 'C:\\Users\\runneradmin\\activation')
+  fixture.directories.delete(root)
+  fixture.directories.get(parent).linked = true
+  assert.throws(() => fixture.guard(root, path.win32.join(root, 'skills', 'autoprompt'), true), /unsafe ancestor/)
+  assert.equal(fixture.events.some(event => event.action === 'mkdir'), false)
+
+  const childFixture = windowsDirectoryGuardFixture(root, 'C:\\Users\\runneradmin\\activation')
+  childFixture.directories.set(path.win32.join(root, 'skills'), { ...childFixture.identity, linked: true })
+  assert.throws(() => childFixture.guard(root, path.win32.join(root, 'skills', 'autoprompt'), true), /linked or unsafe/)
+  assert.equal(childFixture.events.some(event => event.action === 'mkdir'), false)
+
+  const uncRoot = '\\\\?\\UNC\\server\\share\\linked\\activation'
+  const uncFixture = windowsDirectoryGuardFixture(uncRoot, '\\\\?\\UNC\\server\\share\\real\\activation')
+  const linkedAncestor = path.win32.dirname(uncRoot)
+  uncFixture.directories.get(linkedAncestor).linked = true
+  assert.throws(() => uncFixture.guard(uncRoot, uncRoot), /unsafe ancestor/)
+  assert.ok(uncFixture.events.some(event => event.action === 'lstat' && event.file === linkedAncestor))
+  assert.equal(uncFixture.events.some(event => event.file === '\\\\?\\UNC\\'), false)
+})
+
+test('runtime installation rejects real linked ancestors without changing the outside directory', t => {
+  const sandbox = temporaryDirectory('autoprompt-runtime-ancestor-')
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
+  const outside = path.join(sandbox, 'outside')
+  const existing = path.join(outside, 'activation')
+  fs.mkdirSync(existing, { recursive: true })
+  fs.writeFileSync(path.join(existing, 'sentinel.txt'), 'untouched\n')
+  const linked = path.join(sandbox, 'linked')
+  fs.symlinkSync(outside, linked, process.platform === 'win32' ? 'junction' : 'dir')
+  assert.throws(() => installPayload('claude', path.join(linked, 'activation'), ROOT), /activation root resolves through a link/)
+  assert.deepEqual(fs.readdirSync(outside), ['activation'])
+  assert.deepEqual(fs.readdirSync(existing), ['sentinel.txt'])
+  assert.equal(fs.readFileSync(path.join(existing, 'sentinel.txt'), 'utf8'), 'untouched\n')
+  if (process.platform === 'win32') {
+    assert.throws(() => installPayload('claude', path.join(linked, 'missing'), ROOT), /activation root resolves through a link/)
+    assert.equal(fs.existsSync(path.join(outside, 'missing')), false)
+  }
+})
 
 test('committed runtime manifests match every provider source file', () => {
   const completed = childProcess.spawnSync(

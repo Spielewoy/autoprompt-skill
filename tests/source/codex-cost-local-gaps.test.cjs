@@ -9,6 +9,7 @@ const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 const { pinnedCodexCli } = require('../helpers/pinned-codex-cli.cjs')
+const { pinnedCodexPackageFixture } = require('../helpers/pinned-codex-package.cjs')
 
 const root = path.resolve(__dirname, '..', '..')
 const workflow = path.join(root, 'agents', 'codex', 'workflow')
@@ -290,15 +291,32 @@ test('pinned Codex 0.148 advertises only individually visible direct tools for e
 })
 
 test('pinned Codex 0.148 emits one countable lifecycle for each direct patch and shell call', async t => {
-  const cli = pinnedCodexCli()
-  if (!cli) {
+  const installedCli = pinnedCodexCli()
+  if (!installedCli) {
     t.skip('the exact pinned Codex 0.148 CLI is not installed on this host')
     return
   }
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-direct-lifecycle-'))
+  const directory = fs.mkdtempSync(path.join(os.homedir(), '.autoprompt-direct-lifecycle-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const codexHome = path.join(directory, 'codex-home')
   fs.mkdirSync(codexHome, { recursive: true, mode: 0o700 })
+  const environment = {
+    PATH: [path.dirname(process.execPath), ...(process.platform === 'win32'
+      ? [path.join(process.env.SystemRoot, 'System32'), path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0')]
+      : ['/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'])].join(path.delimiter),
+    HOME: codexHome, USERPROFILE: codexHome, CODEX_HOME: codexHome,
+    OPENAI_API_KEY: 'probe',
+    ...(process.platform === 'win32'
+      ? { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, COMSPEC: process.env.COMSPEC, PATHEXT: process.env.PATHEXT }
+      : {}),
+  }
+  // Root's ambient capabilities can hide an inaccessible native executable
+  // below another user's home. The real tool sandbox correctly drops them.
+  // Stage byte-identical pinned package contents in this caller-owned fixture.
+  const pinned = pinnedCodexPackageFixture(path.join(directory, 'pinned-cli'), {
+    env: { ...environment, AUTOPROMPT_PINNED_CODEX: installedCli.cliPath },
+  })
+  const cli = { command: process.execPath, args: [pinned.cliPath] }
   const schemaPath = path.join(directory, 'output.schema.json')
   fs.writeFileSync(schemaPath, `${JSON.stringify({
     type: 'object', required: ['ok'], properties: { ok: { const: true } }, additionalProperties: false,
@@ -392,7 +410,7 @@ test('pinned Codex 0.148 emits one countable lifecycle for each direct patch and
     '-m', 'gpt-5.6-sol', '--sandbox', 'workspace-write', '-C', directory, '-',
   ], {
     cwd: directory,
-    env: { ...process.env, CODEX_HOME: codexHome, OPENAI_API_KEY: 'probe' },
+    env: environment,
   })
   assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`)
   assert.equal(requests.length, 3)

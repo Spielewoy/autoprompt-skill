@@ -33,11 +33,17 @@ function sandboxProbeSpawn(mode) {
 test('Codex dynamic preflight distinguishes permitted loopback from denied non-loopback access', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-network-preflight-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const codexHome = path.join(root, 'codex-home')
+  const target = path.join(root, 'target')
+  fs.mkdirSync(codexHome, { mode: 0o700 })
+  fs.mkdirSync(target, { mode: 0o700 })
   const address = activation.controlledNetworkProbeAddress()
   assert.doesNotMatch(address, /^(?:127\.|0\.0\.0\.0$)/)
   const options = {
-    env: { ...process.env, CODEX_HOME: root },
-    target: process.cwd(),
+    env: { ...process.env, CODEX_HOME: codexHome },
+    // The real network controls write receipts in the target. The checkout
+    // need not be writable by the caller running this isolated fixture.
+    target,
   }
   assert.match(
     activation.probeCodexCommandNetwork(options, sandboxProbeSpawn('denied')),
@@ -47,7 +53,8 @@ test('Codex dynamic preflight distinguishes permitted loopback from denied non-l
     () => activation.probeCodexCommandNetwork(options, sandboxProbeSpawn('open')),
     /PROVIDER_UNSUPPORTED provider=codex reason=codex-command-sandbox-network-open/,
   )
-  assert.deepEqual(fs.readdirSync(root), [], 'preflight must remove every listener artifact')
+  assert.deepEqual(fs.readdirSync(codexHome), [], 'preflight must remove every listener artifact')
+  assert.deepEqual(fs.readdirSync(target), [], 'preflight must remove every network receipt')
 })
 
 test('activation signer and supervisor bind the exact Windows sandbox identity', () => {

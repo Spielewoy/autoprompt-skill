@@ -52,7 +52,7 @@ const HELP_TEXT = [
   '  autoprompt doctor [client] [--strict] [--root <absolute-path>]',
   '  autoprompt doctor isolation [--strict] [--root <absolute-path>]',
   '  autoprompt uninstall [client|all] [--root <absolute-path>]',
-  '  autoprompt configure codex --agents <off|auto|model,...> [--model-map <absolute-json>] [--root <absolute-path>]',
+  '  autoprompt configure codex --agents <off|auto|model,...> [--model-map <absolute-json>] [--effort <low|medium|high|xhigh>] [--root <absolute-path>]',
   '  autoprompt activate codex [--target <absolute-path>] [--ttl <seconds>] [--resume <activation-id>] [--root <absolute-path>] -- <mission>',
   '  autoprompt update',
   '  autoprompt repo',
@@ -228,10 +228,11 @@ function parseArgs(argv) {
     if (rest[0] !== 'codex') usageError('Configure currently supports only codex.')
     let selector = ''
     let modelMap = ''
+    let effort
     let root = ''
     for (let index = 1; index < rest.length; index += 1) {
       const flag = rest[index]
-      if (!['--agents', '--model-map', '--root'].includes(flag)) usageError(`Unknown configure flag: ${flag}`)
+      if (!['--agents', '--model-map', '--effort', '--root'].includes(flag)) usageError(`Unknown configure flag: ${flag}`)
       const value = rest[index + 1]
       if (value === undefined || value.startsWith('--')) usageError(`${flag} requires a value.`)
       index += 1
@@ -241,13 +242,19 @@ function parseArgs(argv) {
       } else if (flag === '--model-map') {
         if (modelMap) usageError('--model-map may be provided only once.')
         modelMap = value
+      } else if (flag === '--effort') {
+        if (effort !== undefined) usageError('--effort may be provided only once.')
+        if (!['low', 'medium', 'high', 'xhigh'].includes(value)) usageError('--effort requires low, medium, high, or xhigh.')
+        effort = value
       } else {
         if (root) usageError('--root may be provided only once.')
         root = validateLifecycleRoot(value)
       }
     }
     if (!selector) usageError('Configure codex requires --agents.')
+    if (effort !== undefined && selector.trim().toLowerCase() === 'off') usageError('--effort requires enabled Codex agents.')
     const parsed = { command: 'configure', provider: 'codex', selector, modelMap }
+    if (effort !== undefined) parsed.effort = effort
     if (root) parsed.root = root
     return parsed
   }
@@ -1356,6 +1363,7 @@ function run(argv, overrides = {}) {
         ? { ...options.env, AUTOPROMPT_INSTALL_ROOT: command.root }
         : options.env,
       modelMap: command.modelMap,
+      ...(command.effort !== undefined ? { effort: command.effort } : {}),
       packageRoot: options.packageRoot,
       selector: command.selector,
       stderr: options.stderr,

@@ -5,6 +5,7 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { spawnSync } = require('node:child_process')
 const test = require('node:test')
 
 const root = path.resolve(__dirname, '..', '..')
@@ -740,6 +741,62 @@ test('typed checker reassessment carries bounded recovery context without an int
       recoveryContext: { type: 'bounded-recovery', code },
     }).conformant, false)
   }
+})
+
+test('TranscriptStore keeps shared parents unchanged for a non-root writer and protects its private directories', {
+  skip: process.platform === 'win32' && 'POSIX ownership and permission regression',
+}, t => {
+  // Change permissions only on this newly owned fixture, never os.tmpdir().
+  const sharedParent = tempDirectory(t, 'autoprompt-transcript-shared-parent-')
+  fs.chmodSync(sharedParent, 0o1777)
+  const before = fs.statSync(sharedParent)
+  const dropPrivileges = process.getuid() === 0
+  const completed = spawnSync(process.execPath, ['-e', `
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const path = require('node:path')
+    const { TranscriptStore } = require(process.argv[1])
+    const sharedParent = process.argv[2]
+    if (process.argv[3] === 'drop') {
+      process.setgroups([])
+      process.setgid(65534)
+      process.setuid(65534)
+    }
+    assert.notEqual(process.getuid(), 0, 'filesystem operations must run without root privileges')
+    const before = fs.statSync(sharedParent)
+    if (process.argv[3] === 'drop') assert.notEqual(before.uid, process.getuid())
+    const existingRoot = fs.mkdtempSync(path.join(sharedParent, 'existing-'))
+    fs.chmodSync(existingRoot, 0o755)
+    const roots = [existingRoot, path.join(sharedParent, 'new-parent', 'new-transcript')]
+    for (const root of roots) {
+      const store = new TranscriptStore(root, { largeOutputBytes: 16 })
+      const entry = store.append({ type: 'tool-output', output: 'private transcript bytes' })
+      assert.equal(entry.blobs.length, 1)
+      assert.equal(new TranscriptStore(root).resume().eventCount, 1)
+      for (const directory of [root, store.eventsDirectory, store.blobsDirectory]) {
+        const stat = fs.statSync(directory)
+        assert.equal(stat.uid, process.getuid())
+        assert.equal(stat.mode & 0o7777, 0o700)
+      }
+      for (const file of [entry.path, entry.blobs[0].path]) {
+        assert.equal(fs.statSync(file).mode & 0o7777, 0o600)
+      }
+    }
+    assert.equal(fs.statSync(path.join(sharedParent, 'new-parent')).mode & 0o7777, 0o700)
+    const after = fs.statSync(sharedParent)
+    assert.equal(after.mode, before.mode)
+    assert.equal(after.uid, before.uid)
+    assert.equal(after.ino, before.ino)
+    process.stdout.write(JSON.stringify({ writerUid: process.getuid(), parentUid: after.uid, parentMode: after.mode & 0o7777 }))
+  `, path.join(workflow, 'context-envelope.js'), sharedParent, dropPrivileges ? 'drop' : 'keep'], {
+    cwd: sharedParent, encoding: 'utf8', timeout: 10000,
+  })
+  assert.equal(completed.status, 0, completed.stderr || String(completed.error))
+  const evidence = JSON.parse(completed.stdout)
+  assert.notEqual(evidence.writerUid, 0)
+  assert.equal(evidence.parentMode, 0o1777)
+  assert.equal(fs.statSync(sharedParent).mode, before.mode)
+  assert.equal(fs.statSync(sharedParent).uid, before.uid)
 })
 
 test('route transcript content-addresses large outputs and rejects an oversized index', t => {

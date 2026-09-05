@@ -560,7 +560,10 @@ class TranscriptStore {
     this._lastEvidence = []
     this._overflowStartEntry = null
     this._overflowTailEntry = null
-    for (const directory of [path.dirname(this.root), this.root, this.eventsDirectory, this.blobsDirectory]) {
+    // The caller supplies a private transcript root, not ownership of its
+    // existing parent (which may be a shared OS temp directory). Recursive
+    // mkdir creates missing ancestors privately without chmoding shared ones.
+    for (const directory of [this.root, this.eventsDirectory, this.blobsDirectory]) {
       fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
       if (process.platform !== 'win32') fs.chmodSync(directory, 0o700)
     }

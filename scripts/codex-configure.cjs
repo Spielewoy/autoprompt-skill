@@ -157,10 +157,18 @@ function castingDigest(value) {
 function comparable(file) {
   let resolved = path.resolve(file)
   try { resolved = fs.realpathSync.native(resolved) } catch {}
-  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+  return process.platform === 'win32' ? path.toNamespacedPath(resolved).toLowerCase() : resolved
+}
+function relativePath(root, candidate) {
+  // Compare drive and UNC paths in the same namespace. Stripping a namespace
+  // from a filesystem access could change its meaning; these are comparisons
+  // only, and device/GLOBALROOT paths remain distinct from ordinary roots.
+  return process.platform === 'win32'
+    ? path.relative(path.toNamespacedPath(root), path.toNamespacedPath(candidate))
+    : path.relative(root, candidate)
 }
 function isWithin(root, candidate) {
-  const relative = path.relative(root, candidate)
+  const relative = relativePath(root, candidate)
   return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))
 }
 function readJson(file, label) {
@@ -770,7 +778,7 @@ function renderAgent(bytes, role, selection) {
     const tier = ROLE_TIER.get(role)
     if (tier === undefined) fail(`installed role has no Codex casting tier: ${role}`)
     const model = selection.models[modelIndexes(selection.models.length)[tier]]
-    const effort = EFFORTS[tier]
+    const effort = selection.effort || EFFORTS[tier]
     const sandbox = header.findIndex(line => /^sandbox_mode\s*=/.test(line))
     if (sandbox < 0) fail(`agent definition has no sandbox_mode: ${role}.toml`)
     header.splice(sandbox + 1, 0, `model = "${model}"`, `model_reasoning_effort = "${effort}"`)
@@ -1100,6 +1108,76 @@ function targetIdentity(target) {
   }
 }
 
+function managedPathSpelling(file, reason, directory = false) {
+  if (process.platform !== 'win32') return file
+  const tail = file.slice(path.parse(file).root.length)
+  const parts = tail.split(/[\\/]/)
+  if (directory && parts[parts.length - 1] === '') parts.pop()
+  if (/[\\/]{2}/.test(tail) || tail.includes(':') ||
+      parts.some(part => !part || /[. ]$/.test(part) ||
+        /^(?:con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(part))) unsupported(reason)
+  // Git Bash ownership records retain /c/... spelling. Interpret only an
+  // unambiguous drive-absolute MSYS path, never a device/UNC or traversal alias.
+  if (/^\/[a-z]\//i.test(file)) {
+    const tail = file.slice(3)
+    return `${file[1].toUpperCase()}:\\${tail.replace(/[\\/]/g, '\\')}`
+  }
+  return file
+}
+
+function managedWindowsFilesystemRoot(file) {
+  // dirname/parse stop at a synthetic \\?\UNC\ prefix, not its server/share.
+  const extendedUnc = /^(\\\\\?\\UNC\\[^\\]+\\[^\\]+)(?:\\|$)/i.exec(file)
+  const filesystemRoot = extendedUnc ? `${extendedUnc[1]}\\` : path.parse(file).root
+  const ordinaryRoot = filesystemRoot.replace(/^\\\\\?\\UNC\\/i, '\\\\')
+    .replace(/^\\\\\?\\(?=[a-z]:\\)/i, '')
+  if (!/^[a-z]:\\$/i.test(ordinaryRoot) && !/^\\\\(?![?.]\\)[^\\]+\\[^\\]+\\?$/.test(ordinaryRoot)) {
+    unsupported('managed-payload-receipt-root-mismatch')
+  }
+  return { filesystemRoot, volume: ordinaryRoot.replace(/\\$/, '').toLowerCase() }
+}
+
+function assertManagedWindowsAncestry(file, directory) {
+  const { filesystemRoot } = managedWindowsFilesystemRoot(file)
+  const components = file.slice(filesystemRoot.length).split(path.sep).filter(Boolean)
+  let current = filesystemRoot
+  let stats
+  for (let index = 0; index <= components.length; index += 1) {
+    if (index > 0) current = path.join(current, components[index - 1])
+    stats = fs.lstatSync(current, { bigint: true })
+    if (stats.isSymbolicLink()) unsupported('managed-payload-escape')
+    const needsDirectory = index < components.length || directory
+    if (needsDirectory ? !stats.isDirectory() : !stats.isFile()) {
+      unsupported('managed-payload-receipt-root-mismatch')
+    }
+  }
+  if (typeof stats.dev !== 'bigint' || typeof stats.ino !== 'bigint' || stats.ino <= 0n) {
+    unsupported('managed-payload-receipt-root-mismatch')
+  }
+  return stats
+}
+
+function managedWindowsAliasRelative(root, rootReal, file) {
+  // Reject unrelated drives/shares before probing any candidate ancestor. In
+  // particular an untrusted UNC receipt must not cause an outbound SMB probe.
+  if (managedWindowsFilesystemRoot(root).volume !== managedWindowsFilesystemRoot(file).volume) {
+    unsupported('managed-payload-receipt-root-mismatch')
+  }
+  // Physical containment alone would accept a junction into this root. Check
+  // both original lexical chains before rebasing a genuine short/long alias.
+  const rootStats = assertManagedWindowsAncestry(root, true)
+  assertManagedWindowsAncestry(file, false)
+  const fileReal = fs.realpathSync.native(file)
+  if (!isWithin(rootReal, fileReal)) unsupported('managed-payload-receipt-root-mismatch')
+  const physicalRootStats = fs.lstatSync(rootReal, { bigint: true })
+  if (!physicalRootStats.isDirectory() || physicalRootStats.isSymbolicLink() ||
+      !sameFileIdentity(rootStats, physicalRootStats) ||
+      !sameFileIdentity(rootStats, fs.lstatSync(root, { bigint: true }))) {
+    unsupported('managed-payload-receipt-root-mismatch')
+  }
+  return relativePath(rootReal, fileReal)
+}
+
 function managedHashIdentity(root, key) {
   if (typeof key !== 'string' || key.trim() === '' ||
       /[\u0000-\u001f\u007f]/.test(key) || /[\\/]$/.test(key)) {
@@ -1116,12 +1194,15 @@ function managedHashIdentity(root, key) {
       (absolute && tail.includes(':'))) {
     unsupported('managed-payload-hash-manifest-invalid')
   }
-  const resolvedRoot = path.resolve(root)
-  const resolved = absolute
-    ? path.resolve(key)
-    : path.resolve(resolvedRoot, key.split(/[\\/]/).join(path.sep))
+  const spelledKey = managedPathSpelling(key, 'managed-payload-hash-manifest-invalid')
+  const resolvedRoot = path.resolve(managedPathSpelling(root, 'managed-payload-hash-manifest-invalid', true))
+  let resolved = absolute
+    ? path.resolve(spelledKey)
+    : path.resolve(resolvedRoot, spelledKey.split(/[\\/]/).join(path.sep))
   if (!isWithin(resolvedRoot, resolved)) {
-    unsupported('managed-payload-hash-manifest-invalid')
+    if (process.platform !== 'win32' || !absolute) unsupported('managed-payload-hash-manifest-invalid')
+    try { resolved = receiptFileUnderRoot(resolvedRoot, fs.realpathSync.native(resolvedRoot), resolved) }
+    catch { unsupported('managed-payload-hash-manifest-invalid') }
   }
   return comparable(resolved)
 }
@@ -1131,10 +1212,18 @@ function receiptFileUnderRoot(root, rootReal, declared) {
       /[\u0000-\u001f\u007f]/.test(declared)) {
     unsupported('managed-payload-receipt-root-mismatch')
   }
-  const resolvedRoot = path.resolve(root)
-  const file = path.resolve(declared)
-  if (!isWithin(resolvedRoot, file)) unsupported('managed-payload-receipt-root-mismatch')
-  const parts = path.relative(resolvedRoot, file).split(path.sep).filter(Boolean)
+  const resolvedRoot = path.resolve(managedPathSpelling(root, 'managed-payload-receipt-root-mismatch', true))
+  const file = path.resolve(managedPathSpelling(declared, 'managed-payload-receipt-root-mismatch'))
+  let relative = relativePath(resolvedRoot, file)
+  if (!isWithin(resolvedRoot, file)) {
+    if (process.platform !== 'win32') unsupported('managed-payload-receipt-root-mismatch')
+    try { relative = managedWindowsAliasRelative(resolvedRoot, rootReal, file) }
+    catch (error) {
+      if (error instanceof ProviderUnsupportedError) throw error
+      unsupported('managed-payload-receipt-root-mismatch')
+    }
+  }
+  const parts = relative.split(path.sep).filter(Boolean)
   let current = resolvedRoot
   for (let index = 0; index < parts.length; index += 1) {
     current = path.join(current, parts[index])
@@ -1156,7 +1245,21 @@ function receiptFileUnderRoot(root, rootReal, declared) {
     }
     if (!isWithin(rootReal, currentReal)) unsupported('managed-payload-escape')
   }
-  return file
+  // Return the root's spelling so downstream relative inventory keys agree.
+  // Rebinding is allowed only when the declared alias names the same regular
+  // file as the no-symlink, physically contained descendant just checked.
+  let declaredStat
+  let currentStat
+  try {
+    declaredStat = fs.lstatSync(file, { bigint: true })
+    currentStat = fs.lstatSync(current, { bigint: true })
+  } catch { unsupported('managed-payload-receipt-root-mismatch') }
+  if (!declaredStat.isFile() || declaredStat.isSymbolicLink() ||
+      !currentStat.isFile() || currentStat.isSymbolicLink() ||
+      !sameFileIdentity(declaredStat, currentStat)) {
+    unsupported('managed-payload-receipt-root-mismatch')
+  }
+  return current
 }
 
 function lexicalPathIdentity(file) {
@@ -3816,6 +3919,12 @@ function revokeAllActivations(options = {}) {
   return { revoked }
 }
 function configureCodex(options = {}) {
+  if (options.effort !== undefined && !['low', 'medium', 'high', 'xhigh'].includes(options.effort)) {
+    fail('--effort requires low, medium, high, or xhigh')
+  }
+  if (options.effort !== undefined && String(options.selector || '').trim().toLowerCase() === 'off') {
+    fail('--effort requires enabled Codex agents')
+  }
   const env = options.env || process.env
   const packageRoot = options.packageRoot || PACKAGE_ROOT
   const root = resolveRoot(env)
@@ -3823,6 +3932,9 @@ function configureCodex(options = {}) {
   const lease = operationLock.acquire(root, 'configure-codex', { guard })
   try {
     const selection = resolveSelector(options.selector, options.modelMap || '')
+    // This explicit setting is bound by each generated role's existing file
+    // hashes. Omission deliberately restores the established tier defaults.
+    selection.effort = options.effort
     const managedPayload = managedCodexPayload(root)
     const agentsDirectory = path.join(managedPayload.skillRoot, 'agents-runtime')
     const castingPath = path.join(agentsDirectory, '.autoprompt-casting.json')

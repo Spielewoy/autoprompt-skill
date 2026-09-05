@@ -2961,6 +2961,98 @@ test('exhausted provider transport successor with zero admitted diff stays a con
   )
 })
 
+test('live zero-diff transport failure carries an explicit empty quarantine without crash adoption', async t => {
+  let runtime
+  let durableFallbackCalls = 0
+  const fixture = configureRoadmapCompositionHarness(t, [], {
+    completeProduct: true,
+    transportFailureOnFirstWorker: true,
+    transportFailureOnWorkerSuccessor: true,
+    transportQuarantinePointer({ sourceWorkItemId, transportResult }) {
+      durableFallbackCalls += 1
+      // This is the production callback's receipt boundary, not a permissive
+      // fake. Live results must carry even an empty immediate disposition.
+      return runtime._verifyDurableResultReceipt(sourceWorkItemId, transportResult)
+    },
+  })
+  runtime = new CodexSupervisorRuntime(fixture.harness.runtimeOptions)
+  assert.equal(runtime.options.resumeState, undefined)
+
+  const result = await runtime.start()
+
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.status, 'CHILD_TRANSPORT_TIMEOUT')
+  assert.equal(durableFallbackCalls, 0)
+  assert.deepEqual(fixture.harness.launches.map(item => item.workItemId), [
+    'work-1', 'work-1-transport-retry-1',
+  ])
+  const failedTurn = fixture.routeReturns.get('work-1')
+  const disposition = Object.getOwnPropertySymbols(failedTurn)
+    .find(symbol => symbol.description === 'transportQuarantinePointer')
+  assert.ok(disposition, 'the live controller records that no partial work product exists')
+  assert.equal(failedTurn[disposition], null)
+  assert.equal(Object.getOwnPropertyDescriptor(failedTurn, disposition).enumerable, false)
+  assert.deepEqual(fs.readFileSync(path.join(fixture.harness.runtimeOptions.targetPath,
+    'src', 'example.js'), 'utf8'), "module.exports = 'ready'\n")
+
+  // Serialization intentionally removes the private live disposition. Reopened
+  // results still require the unchanged crash-adoption receipt authority.
+  const durableResult = JSON.parse(JSON.stringify(failedTurn))
+  assert.equal(Object.getOwnPropertySymbols(durableResult).length, 0)
+  assert.throws(() => runtime._verifyDurableResultReceipt('work-1', durableResult),
+    error => error.code === 'CRASH_ADOPTION_CONFLICT' &&
+      /requires crash recovery state/u.test(error.message))
+  const pointer = JSON.parse(fs.readFileSync(runtime.record.resolve(
+    runtime._workerContextLocation('work-1')), 'utf8'))
+  const context = JSON.parse(fs.readFileSync(runtime.record.resolve(pointer.contentPath), 'utf8'))
+  runtime.options.resumeState = { acceptedResultIds: [] }
+  assert.throws(() => runtime._verifyDurableResultReceipt('work-1', durableResult),
+    error => error.code === 'CRASH_ADOPTION_CONFLICT')
+  runtime.options.resumeState.acceptedResultIds.push(context.terminalReceiptHash)
+  const receipt = runtime._verifyDurableResultReceipt('work-1', durableResult)
+  assert.equal(receipt.receiptHash, context.terminalReceiptHash)
+  assert.equal(receipt.controllerAuthoredTransportFailure, true)
+  assert.throws(() => runtime._verifyDurableResultReceipt('work-1', {
+    ...durableResult, allAssignedItemsPass: true,
+  }), error => error.code === 'CRASH_ADOPTION_CONFLICT')
+})
+
+test('live zero-diff repair transport failure keeps its empty disposition and failed outcome', async t => {
+  let runtime
+  let durableFallbackCalls = 0
+  const fixture = configureRoadmapCompositionHarness(t, [], {
+    completeProduct: true,
+    productCheckerCodes: ['FAIL'],
+    transportFailureOnRepairBase: true,
+    transportFailureOnRepairSuccessor: true,
+    transportQuarantinePointer({ sourceWorkItemId, transportResult }) {
+      durableFallbackCalls += 1
+      return runtime._verifyDurableResultReceipt(sourceWorkItemId, transportResult)
+    },
+  })
+  runtime = new CodexSupervisorRuntime(fixture.harness.runtimeOptions)
+
+  const result = await runtime.start()
+
+  assert.equal(result.outcome, 'FAILED', JSON.stringify(result))
+  assert.equal(result.terminalEnvelope.code, 'FAIL')
+  assert.equal(result.terminalEnvelope.cause.event, 'ASSERTION_FAILED')
+  assert.equal(durableFallbackCalls, 0)
+  assert.deepEqual(fixture.harness.launches.map(item => item.workItemId), [
+    'work-1', 'independent-check-1', 'work-1-repair-1',
+    'work-1-repair-1-transport-retry-1',
+  ])
+  const failedRepair = fixture.routeReturns.get('work-1-repair-1')
+  assert.equal(failedRepair.terminalEnvelope.status, 'CHILD_TRANSPORT_TIMEOUT')
+  assert.equal(fixture.routeReturns.get('work-1-repair-1-transport-retry-1')
+    .terminalEnvelope.status, 'CHILD_TRANSPORT_TIMEOUT')
+  const disposition = Object.getOwnPropertySymbols(failedRepair)
+    .find(symbol => symbol.description === 'transportQuarantinePointer')
+  assert.ok(disposition)
+  assert.equal(failedRepair[disposition], null)
+  assert.equal(Object.getOwnPropertyDescriptor(failedRepair, disposition).enumerable, false)
+})
+
 test('exhausted transport successor keeps its candidate when admission bookkeeping fails', async t => {
   const partialCandidate = "module.exports = 'late-admission-survival'\n"
   const fixture = configureRoadmapCompositionHarness(t, [], {
@@ -15846,7 +15938,7 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
   assert.deepEqual(calls[0].argv.filter((value, index, all) => all[index - 1] === '--disable'), [
     'multi_agent', 'multi_agent_v2', 'code_mode', 'code_mode_only', 'goals', 'memories',
     'token_budget', 'current_time_reminder', 'deferred_executor', 'unbounded_connection_retries',
-    'unified_exec',
+    'enable_request_compression', 'unified_exec',
   ])
   assert.equal(calls[0].argv.includes('view_image'), false,
     'default required work retains image inspection for visual/CAD evidence')
@@ -15897,6 +15989,243 @@ test('external Codex adapter uses exact fresh/resume argv and drains terminal-th
     repairCanonicalAssignment.requirementFidelityDoctrine,
     WORKER_REQUIREMENT_FIDELITY_DOCTRINE,
   )
+})
+
+test('native diagnostic and progress items never consume the optional router tool allowance', async () => {
+  const observations = []
+  const retained = []
+  const stops = []
+  const events = [
+    { type: 'thread.started', thread_id: 'route-warning-regression' },
+    { type: 'item.completed', item: { id: 'startup-warning', type: 'error',
+      message: 'Under-development features enabled: rollout_budget.' } },
+    { type: 'turn.started' },
+    ...['reasoning', 'plan', 'todo_list', 'context_compaction', 'future_progress'].map(type => ({
+      type: 'item.completed', item: { id: `diagnostic-${type}`, type, text: 'Progress only.' },
+    })),
+    { type: 'item.completed', item: { id: 'answer', type: 'agent_message',
+      text: JSON.stringify(recommendation('DIRECT')) } },
+    { type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 0,
+      output_tokens: 30, reasoning_output_tokens: 0 } },
+  ]
+  const runner = {
+    async run(spec) {
+      for (const event of events) spec.onStdoutLine(JSON.stringify(event))
+      return { status: 0, stdout: '', stderr: '', processOwned: true, exactArgv: true, drained: true }
+    },
+    async stop(spec) { stops.push(spec.reason); return { drained: true } },
+  }
+  const policy = {
+    logicalRole: 'route-analyst', physicalRole: 'autoprompt.v2.route-analyst',
+    providerRole: 'ap-route-analyst', sandboxMode: 'read-only',
+    policyId: 'autoprompt.codex.role-policy', policyVersion: '2.0.0',
+  }
+  const adapter = new CodexExecAdapter({
+    runner, targetPath: ROOT,
+    profilePath: path.join(ROOT, 'agents/codex/autoprompt.config.toml'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents/contracts/schemas/route-recommendation.schema.json'),
+  })
+  const result = await adapter.launch({
+    ...policy, physicalExecutionPolicy: policy, route: 'PRE_ROUTE',
+    ...adapterMissionFields('a'.repeat(64), 'route-analyst'),
+    dispatch: { brief: 'Classify this small assignment.',
+      requestPointer: { path: 'request', hash: 'a'.repeat(64) } },
+    environment: {}, sessionId: 'route-warning-regression', reservationId: 'route-warning-reservation',
+    onToolCallObserved: item => observations.push(item),
+    onEvent: event => retained.push(event),
+  })
+  assert.equal(result.recommendation.recommendedRoute, 'DIRECT')
+  assert.deepEqual(observations, [])
+  assert.equal(stops.includes('CHILD_TOOL_CALL_LIMIT_EXHAUSTED'), false)
+  assert.equal(retained.some(event => event.item && event.item.id === 'startup-warning'), true)
+  assert.equal(result.usage.noncachedInput, 100)
+  assert.equal(result.usage.output, 30)
+})
+
+test('an oversized optional route prompt falls back before native launch without truncating the worker mission', async t => {
+  const mission = 'Implement the complete requested behavior.\n' + 'Keep every requirement intact.\n'.repeat(700)
+  const harness = makeHarness(t, { runtimeOptions: {
+    mission,
+    modelRegistry: MODEL_REGISTRY.map(model => ({ ...model, id: 'gpt-5.6-sol' })),
+  } })
+  const requestRoot = path.join(harness.directory, 'large-request')
+  fs.mkdirSync(requestRoot)
+  const pointer = writeRequestEnvelope(requestRoot, mission)
+  harness.runtimeOptions.requestPointerFactory = async () => pointer
+  let nativeLaunches = 0
+  let workerMission = null
+  let workerLaunches = 0
+  const independentRequirement = 'A distinct acceptance requirement remains unchanged.'
+  const adapter = new CodexExecAdapter({
+    runner: {
+      async run() { nativeLaunches += 1; assert.fail('impossible optional routing must not start a native child') },
+      async stop() { assert.fail('no native child exists to stop') },
+    },
+    targetPath: harness.runtimeOptions.targetPath,
+    profilePath: path.join(ROOT, 'agents/codex/autoprompt.config.toml'),
+    providerSchemaRoot: path.join(harness.directory, 'schemas'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents/contracts/schemas/route-recommendation.schema.json'),
+  })
+  harness.runtimeOptions.launcher = launch => {
+    if (launch.logicalRole === 'route-analyst') return adapter.launch(launch)
+    assert.equal(launch.logicalRole, 'worker')
+    workerLaunches += 1
+    assert.equal(launch.canonicalMission, workerMission)
+    assert.ok(launch.canonicalAssignment.successChecklist.some(item => item.description === workerMission),
+      'the controller-owned assignment retains the original unsliced mission obligation')
+    assert.match(launch.dispatch.brief, /\[canonical-mission:[a-f0-9]{64}\]/u)
+    assert.ok(launch.dispatch.brief.includes(independentRequirement))
+    assert.equal(launch.dispatch.brief.includes(mission), false)
+    return { ...roadmapCompositionRoleResult(launch, ['Complete the original mission.']), usage: ZERO_USAGE }
+  }
+  const deliverable = path.join(harness.directory, 'verified-result.txt')
+  harness.runtimeOptions.executeRoute = async ({ route, decision: selected, launch }) => {
+    assert.equal(route, 'DIRECT')
+    workerMission = selected.requestedResult
+    assert.deepEqual(selected.successChecklist, [workerMission],
+      'exercise the actual conservative fallback that echoes the complete mission')
+    await launch({
+      workItemId: 'fallback-required-worker', logicalRole: 'worker', parent: 'run-owner',
+      purpose: 'work', assignment: 'Complete the exact canonical original request.',
+      success: [...selected.successChecklist, independentRequirement],
+      checks: ['Independently verify the complete requested behavior.'],
+    })
+    fs.writeFileSync(deliverable, 'independently checked result\n')
+    return { outcome: 'DONE', deliverables: [deliverable], checkHashes: [digest(fs.readFileSync(deliverable))] }
+  }
+  const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.equal(nativeLaunches, 0)
+  assert.equal(workerLaunches, 1)
+  assert.equal(digest(workerMission), digest(createCanonicalMissionProjection(mission).canonicalMission),
+    'the complete canonical mission survives optional routing bypass')
+  assert.equal(result.budget.tokensUsed, 0)
+  const failure = harness.record.events.find(event => event.error && event.error.code === 'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED')
+  assert.ok(failure, JSON.stringify(harness.record.events))
+  assert.equal(failure.error.details.stage, 'route-prompt-admission')
+  assert.equal(failure.error.details.providerRequestStarted, false)
+  assert.ok(failure.error.details.promptInputLowerBound >= failure.error.details.tokenLimit)
+})
+
+test('ChatGPT relay admission denial for optional routing falls back to DIRECT and completes required work', async t => {
+  const harness = makeHarness(t, { runtimeOptions: {
+    mission: 'Complete this small local change.',
+    modelRegistry: MODEL_REGISTRY.map(model => ({ ...model, id: 'gpt-5.6-sol' })),
+  } })
+  let upstreamRequests = 0, transportLaunches = 0, workerLaunches = 0, relay
+  const provider = http.createServer((request, response) => {
+    upstreamRequests += 1
+    response.writeHead(500)
+    response.end('the optional request must never reach the provider')
+  })
+  await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise(resolve => provider.close(resolve)))
+  const adapter = new CodexExecAdapter({
+    // The native process is modeled here; the adapter, relay, scheduler,
+    // fallback decision and required-work continuation are actual code.
+    runner: {
+      async run() {
+        transportLaunches += 1
+        const received = await new Promise((resolve, reject) => {
+          const request = http.request(`${relay.baseUrl}/responses`, {
+            method: 'POST', headers: {
+              'content-type': 'application/json', 'chatgpt-account-id': 'offline-account',
+            },
+          }, response => {
+            let body = ''
+            response.setEncoding('utf8')
+            response.on('data', chunk => { body += chunk })
+            response.on('end', () => resolve({ status: response.statusCode, body }))
+            response.on('error', reject)
+          })
+          request.on('error', reject)
+          request.end(JSON.stringify({ model: 'gpt-5.6-sol', input: [], stream: true }))
+        })
+        assert.equal(received.status, 429)
+        return { status: 1, stdout: '', stderr: received.body, processOwned: true, exactArgv: true, drained: true }
+      },
+      async stop() { return { drained: true } },
+    },
+    targetPath: harness.runtimeOptions.targetPath,
+    profilePath: path.join(ROOT, 'agents/codex/autoprompt.config.toml'),
+    providerSchemaRoot: path.join(harness.directory, 'schemas'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents/contracts/schemas/route-recommendation.schema.json'),
+    cumulativeQuotaProxyFactory: async options => {
+      relay = await startCodexCumulativeQuotaProxy({
+        ...options, upstreamBaseUrl: `http://127.0.0.1:${provider.address().port}/backend-api/codex`,
+      })
+      return relay
+    },
+  })
+  harness.runtimeOptions.launcher = launch => {
+    if (launch.logicalRole === 'route-analyst') return adapter.launch({
+      ...launch,
+      // Model a small advisory envelope so prompt-size admission does not
+      // mask the relay boundary. Keep the complete canonical mission, its
+      // binding, exact role schema and the controller's actual 8k allowance.
+      dispatch: { brief: 'Classify this small change.', requestPointer: launch.dispatch.requestPointer },
+    })
+    assert.equal(launch.logicalRole, 'worker')
+    workerLaunches += 1
+    return { ...roadmapCompositionRoleResult(launch, ['Complete the original mission.']), usage: ZERO_USAGE }
+  }
+  harness.runtimeOptions.executeRoute = async ({ route, launch }) => {
+    assert.equal(route, 'DIRECT')
+    await launch({ workItemId: 'chatgpt-fallback-worker', logicalRole: 'worker', parent: 'run-owner',
+      purpose: 'work', assignment: 'Complete the requested change.', success: ['Complete the original mission.'] })
+    return usableDoneFixture(harness, 'chatgpt-route-fallback')
+  }
+  const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.equal(transportLaunches, 1, JSON.stringify(harness.record.events))
+  assert.equal(workerLaunches, 1)
+  assert.equal(upstreamRequests, 0)
+  assert.equal(relay.snapshot().tokenLimit, 8000)
+  assert.equal(relay.snapshot().providerRequestCount, 0)
+  assert.equal(result.budget.tokensUsed, 0)
+  const failure = harness.record.events.find(event => event.error?.code === 'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED')
+  assert.ok(failure, JSON.stringify(harness.record.events))
+  assert.equal(failure.error.details.providerRequestStarted, false)
+  assert.equal(failure.error.details.accountingDisposition, 'NO_PROVIDER_REQUEST_STARTED')
+})
+
+test('early mission prose projection preserves independent short-word requirements and unrelated evidence limits', async t => {
+  for (const scenario of [
+    { name: 'independent short-word prose', success: 'The test output must pass an independently authored test.', outcome: 'DONE' },
+    { name: 'unrelated oversized prose', success: 'Independent acceptance detail. '.repeat(1000), outcome: 'FAILED' },
+  ]) await t.test(scenario.name, async subtest => {
+    const harness = makeHarness(subtest, { runtimeOptions: { mission: 'test' } })
+    const requestRoot = path.join(harness.directory, 'short-mission-request')
+    fs.mkdirSync(requestRoot)
+    const pointer = writeRequestEnvelope(requestRoot, 'test')
+    harness.runtimeOptions.requestPointerFactory = async () => pointer
+    const baseLauncher = harness.runtimeOptions.launcher
+    let workerLaunches = 0
+    harness.runtimeOptions.launcher = launch => {
+      if (launch.logicalRole === 'route-analyst') return baseLauncher(launch)
+      workerLaunches += 1
+      assert.ok(launch.dispatch.brief.includes(scenario.success))
+      assert.equal(launch.canonicalAssignment.successChecklist[0].description, scenario.success)
+      assert.deepEqual(launch.canonicalAssignment.resources.map(item => item.identity), ['src/example.js'])
+      return roadmapCompositionRoleResult(launch, ['Complete the exact requested behavior.'])
+    }
+    harness.runtimeOptions.executeRoute = async ({ launch }) => {
+      await launch({
+        workItemId: 'prose-projection-worker', logicalRole: 'worker', parent: 'run-owner', purpose: 'work',
+        assignment: 'Complete the requested test.', ownership: ['src/example.js'],
+        success: [scenario.success], checks: ['Run the independent test.'],
+      })
+      return usableDoneFixture(harness, 'prose-projection-result')
+    }
+    const result = await new CodexSupervisorRuntime(harness.runtimeOptions).start()
+    assert.equal(result.outcome, scenario.outcome, JSON.stringify(result.terminalEnvelope))
+    assert.equal(workerLaunches, scenario.outcome === 'DONE' ? 1 : 0)
+    if (scenario.outcome === 'FAILED') {
+      assert.equal(result.terminalEnvelope.error.code, 'CONTEXT_COMPONENT_TOO_LARGE')
+      assert.equal(result.terminalEnvelope.error.details.component, 'fetchedEvidence')
+      assert.equal(result.terminalEnvelope.error.details.limit, 16384)
+    }
+  })
 })
 
 test('external Codex transport enforces optional-route and explicitly supplied tool-call ceilings', async t => {
@@ -16150,6 +16479,15 @@ test('crash-resumed Codex tool ceiling includes the predecessor high-water', asy
 
 test('external Codex tool ceiling counts failed-only events and sequential reused ids', async () => {
   const cases = [
+    ...['file_edit', 'apply_patch'].map(itemType => ({
+      id: `edit-alias-${itemType}`,
+      emit(spec, index) {
+        spec.onStdoutLine(JSON.stringify({
+          type: 'item.completed',
+          item: { id: `edit-${index}`, type: itemType, status: 'completed' },
+        }))
+      },
+    })),
     {
       id: 'failed-only',
       emit(spec, index) {
@@ -17399,7 +17737,13 @@ test('AP-CODEX-V2-036 concrete runtime repairs a checker FAIL in a bounded fresh
   const tracedRoles = traced.map(item => item.role)
   assert.deepEqual([...new Set(traced.map(item => item.gitBranch))], [''])
   assert.deepEqual([...new Set(traced.map(item => item.gitHead))], [detachedHeadOid])
-  assert.equal(tracedRoles.filter(role => role === 'route-analyst').length, 1)
+  assert.equal(tracedRoles.filter(role => role === 'route-analyst').length, 0,
+    'the impossible optional prompt is denied before starting its native subprocess')
+  const routeEvents = fs.readFileSync(record.resolve('route/transcript.jsonl'), 'utf8')
+  assert.match(routeEvents, /CODEX_CHILD_QUOTA_PREFLIGHT_DENIED/u)
+  assert.match(routeEvents, /route-prompt-admission/u)
+  assert.equal(persistedDecision.requestedResult, requestCanonicalJson)
+  assert.deepEqual(persistedDecision.successChecklist, [requestCanonicalJson])
   assert.equal(tracedRoles.filter(role => role === 'run-owner').length, 0)
   assert.equal(tracedRoles.filter(role => role === 'worker').length, 2)
   assert.equal(tracedRoles.filter(role => /checker|reviewer|tester/.test(role)).length, 2)
@@ -18193,7 +18537,7 @@ function roadmapCompositionRoleResult(launch, behaviorChanged) {
   const now = '2026-08-25T00:00:00.000Z'
   return {
     schemaVersion: '2.0.0', reportType: 'result', reportId: `result:${launch.workItemId}`,
-    runId: 'run-1', assignmentId: launch.workItemId, logicalRoleId: launch.logicalRole,
+    runId: launch.runId || 'run-1', assignmentId: launch.workItemId, logicalRoleId: launch.logicalRole,
     physicalRoleId: launch.physicalRole,
     requestEnvelopeHash: launch.canonicalAssignment.requestEnvelopeHash,
     findingIds: [...launch.canonicalAssignment.findingIds],
@@ -18247,7 +18591,7 @@ function roadmapCompositionProductCheckResult(launch, code, causeReason) {
     description: code === 'PASS'
       ? 'The resumed product candidate satisfies every assigned requirement.'
       : 'The resumed product candidate has one concrete repairable defect.',
-    stateClass: 'terminal', runId: 'run-1',
+    stateClass: 'terminal', runId: launch.runId || 'run-1',
     requestEnvelopeHash: launch.canonicalAssignment.requestEnvelopeHash,
     candidateHash: launch.candidateHash, currentVersionHash: launch.candidateHash,
     completedResults: [], nextReadyWork: [],
@@ -18269,6 +18613,7 @@ function roadmapCompositionProductCheckResult(launch, code, causeReason) {
 }
 
 function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
+  const runId = options.runId || 'run-1'
   const target = createTempGitTarget(tempDirectory(t, 'autoprompt-roadmap-composition-target-'))
   const hardening = spawnSync(process.execPath, [
     path.join(ROOT, 'scripts', 'local-only-safety.cjs'),
@@ -18291,6 +18636,7 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
   let deferredPromotionState = null
 
   const harness = makeHarness(t, {
+    runId,
     ...(options.launchLimit !== undefined ? { launchLimit: options.launchLimit } : {}),
     ...(options.wallMs !== undefined ? { wallMs: options.wallMs } : {}),
     runtimeOptions: {
@@ -18397,7 +18743,7 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
     targetRoot: target,
     privateRoot: workerPrivateRoot,
     environment: process.env,
-    runId: 'run-1',
+    runId,
     activationId: 'activation-1',
     hardenWorkspace(workspacePath) {
       const repair = spawnSync(process.execPath, [
@@ -18464,7 +18810,7 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
     fs.copyFileSync(projection.sourcePath, destination)
     const body = {
       schemaVersion: 1,
-      runId: 'run-1',
+      runId,
       generation: 1,
       checkerId,
       relativePath: projection.relativePath,
@@ -18678,6 +19024,8 @@ function configureRoadmapCompositionHarness(t, checkerCodes, options = {}) {
       assert.deepEqual(result, routeReturns.get(workItemId) || results.get(workItemId))
       return true
     },
+    ...(typeof options.transportQuarantinePointer === 'function'
+      ? { transportQuarantinePointer: options.transportQuarantinePointer } : {}),
     resultPointer: workItemId => {
       const result = routeReturns.get(workItemId) || results.get(workItemId)
       assert.ok(result, `missing composition result for ${workItemId}`)
@@ -19071,6 +19419,312 @@ test('legacy ROADMAP plan recheck retry resumes through product repair at the fr
   assert.doesNotMatch(JSON.stringify(resumed.terminalEnvelope || {}),
     /LAUNCH_LIMIT|RECOVERY_CHECKPOINT_ROLLBACK/u)
 })
+
+test('native ChatGPT worker crosses supervisor promotion and independent checking before fixture DONE', {
+  timeout: 120000,
+  skip: process.platform !== 'linux' && 'the native composition fixture requires Linux network isolation',
+}, t => runNativeSupervisorComposition(t))
+
+test('native ChatGPT backend rejection stays a live zero-diff supervisor failure without crash adoption', {
+  timeout: 120000,
+  skip: process.platform !== 'linux' && 'the native composition fixture requires Linux network isolation',
+}, t => runNativeSupervisorComposition(t, { rejectProvider: true }))
+
+async function runNativeSupervisorComposition(t, options = {}) {
+  const { pinnedCodexCli } = require('../helpers/pinned-codex-cli.cjs')
+  const { pinnedCodexPackageFixture } = require('../helpers/pinned-codex-package.cjs')
+  const native = require('../helpers/codex-authenticated-lifecycle.cjs')
+  const cleanEnvironment = { PATH: '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'C.UTF-8' }
+  if (process.env.AUTOPROMPT_SUPERVISOR_NATIVE_NAMESPACE !== '1') {
+    const installed = pinnedCodexCli()
+    if (!installed) {
+      t.skip('install the exact pinned Codex CLI for native supervisor composition coverage')
+      return
+    }
+    const boundary = ['--pid', '--fork', '--kill-child=SIGKILL', '--mount-proc']
+    const candidates = [
+      { command: 'unshare', args: ['--net', ...boundary] },
+      { command: 'unshare', args: ['--user', '--map-root-user', '--net', ...boundary] },
+      { command: 'sudo', args: ['-n', 'unshare', '--net', ...boundary], dropPrivileges: true },
+    ]
+    const namespace = candidates.find(candidate => spawnSync(candidate.command, [...candidate.args, 'true'], {
+      env: cleanEnvironment, encoding: 'utf8', timeout: 5000,
+    }).status === 0)
+    assert.ok(namespace, 'native composition requires a private network namespace')
+    const packageRoot = fs.mkdtempSync(path.join(os.homedir(), '.autoprompt-native-composition-package-'))
+    t.after(() => fs.rmSync(packageRoot, { recursive: true, force: true }))
+    const fixture = pinnedCodexPackageFixture(packageRoot, {
+      env: { ...cleanEnvironment, AUTOPROMPT_PINNED_CODEX: installed.cliPath },
+    })
+    const environment = {
+      ...cleanEnvironment,
+      AUTOPROMPT_PINNED_CODEX: fixture.cliPath,
+      AUTOPROMPT_REQUIRE_PINNED_CODEX: '1',
+      AUTOPROMPT_SUPERVISOR_NATIVE_NAMESPACE: '1',
+      AUTOPROMPT_SUPERVISOR_NATIVE_FIXTURE_ROOT: packageRoot,
+      ...(namespace.dropPrivileges ? {
+        AUTOPROMPT_SUPERVISOR_NATIVE_UID: String(process.getuid()),
+        AUTOPROMPT_SUPERVISOR_NATIVE_GID: String(process.getgid()),
+      } : {}),
+    }
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn(namespace.command, [
+        ...namespace.args, 'env', '-i', ...Object.entries(environment).map(([key, value]) => `${key}=${value}`),
+        process.execPath, '--test-reporter=tap', '--test-name-pattern', `^${t.name}$`, __filename,
+      ], { env: cleanEnvironment, stdio: ['ignore', 'pipe', 'pipe'] })
+      let stdout = '', stderr = '', forceTimer
+      const timer = setTimeout(() => {
+        child.kill('SIGTERM')
+        forceTimer = setTimeout(() => child.kill('SIGKILL'), 2000)
+      }, 100000)
+      child.stdout.on('data', chunk => { stdout += chunk })
+      child.stderr.on('data', chunk => { stderr += chunk })
+      child.on('error', error => { clearTimeout(timer); clearTimeout(forceTimer); reject(error) })
+      child.on('close', (status, signal) => {
+        clearTimeout(timer)
+        clearTimeout(forceTimer)
+        resolve({ status, signal, stdout, stderr })
+      })
+    })
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`)
+    assert.match(result.stdout, /# pass 1\b/u)
+    assert.match(result.stdout, /# skipped 0\b/u)
+    return
+  }
+  const loopback = spawnSync('ip', ['link', 'set', 'lo', 'up'], { encoding: 'utf8' })
+  assert.equal(loopback.status, 0, loopback.stderr)
+  if (process.env.AUTOPROMPT_SUPERVISOR_NATIVE_UID !== undefined) {
+    process.setgroups([])
+    process.setgid(Number(process.env.AUTOPROMPT_SUPERVISOR_NATIVE_GID))
+    process.setuid(Number(process.env.AUTOPROMPT_SUPERVISOR_NATIVE_UID))
+  }
+  await native.assertNetworkNamespace()
+  const cli = pinnedCodexCli()
+  assert.ok(cli)
+  // A user namespace maps this writer to UID 0, but does not grant access to
+  // the host's /root. Keep all writes in the outer process's owned fixture.
+  const home = fs.mkdtempSync(path.join(process.env.AUTOPROMPT_SUPERVISOR_NATIVE_FIXTURE_ROOT, 'home-'))
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(home, 'tmp'), { mode: 0o700 })
+  native.writeFakeAuthentication(home, 'chatgpt')
+  const environment = native.isolatedEnvironment(home)
+  const profilePath = path.join(home, 'autoprompt.config.toml')
+  fs.writeFileSync(profilePath, `cli_auth_credentials_store = "file"\n${strictLocalProfile()}enable_request_compression = true\n`, { mode: 0o600 })
+  let durableFallbackCalls = 0
+  const fixture = configureRoadmapCompositionHarness(t, [], {
+    completeProduct: true, runId: 'native-composition-run',
+    transportQuarantinePointer({ sourceWorkItemId, transportResult }) {
+      durableFallbackCalls += 1
+      return runtime._verifyDurableResultReceipt(sourceWorkItemId, transportResult)
+    },
+  })
+  const { harness } = fixture
+  // Match the default accounting-only run: genuinely unknown provider spend
+  // is charged at its reserved upper bound before the one transport successor.
+  // A finite user ceiling deliberately follows a different fail-closed path.
+  harness.runtimeOptions.budgetController = new BudgetController({
+    limits: {
+      wallMs: 600_000, tokens: Number.MAX_SAFE_INTEGER,
+      sessions: 20, launches: 20,
+    },
+    finalizationReserveMs: 10,
+    phases: {},
+    monotonicMs: () => harness.currentTime(),
+    monotonicClockId: 'test-monotonic',
+  })
+  const target = harness.runtimeOptions.targetPath
+  harness.runtimeOptions.modelRegistry = [{ ...MODEL_REGISTRY[0], id: 'gpt-5.6-sol' }]
+  harness.runtimeOptions.assignmentResolver = () => ({ model: 'gpt-5.6-sol', effort: 'xhigh' })
+  const originalSource = fs.readFileSync(path.join(target, 'src/example.js'), 'utf8')
+  const expectedSource = "module.exports = 'native-promoted'\n"
+  // Authored independently and outside every mutable worker workspace. The
+  // supervisor gets a typed checker report derived from this process's exit,
+  // not a scripted PASS or the worker's own allAssignedItemsPass assertion.
+  const acceptancePath = path.join(home, 'independent-acceptance.cjs')
+  fs.writeFileSync(acceptancePath, [
+    "const assert = require('node:assert/strict')",
+    "const candidate = require(require('node:path').join(process.argv[2], 'src/example.js'))",
+    "assert.equal(candidate, 'native-promoted')",
+    "process.stdout.write('INDEPENDENT_NATIVE_PASS\\n')", '',
+  ].join('\n'), { mode: 0o400 })
+  const acceptanceHash = digest(fs.readFileSync(acceptancePath))
+  assert.equal(spawnSync(process.execPath, [acceptancePath, target], { env: environment }).status, 1,
+    'independent acceptance rejects the original unchanged product')
+  const observations = { lines: [], requests: [] }
+  const relays = []
+  let canonical, providerError, relay
+  const upstream = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', chunk => chunks.push(chunk))
+    request.on('end', () => {
+      try {
+        assert.equal(request.url, '/backend-api/codex/responses')
+        assert.equal(request.headers['content-encoding'], undefined)
+        assert.equal(Boolean(request.headers['chatgpt-account-id']), true)
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+        assert.equal(Object.hasOwn(body, 'max_output_tokens'), false,
+          'the subscription backend rejects the API-only output ceiling')
+        assert.equal(body.model, 'gpt-5.6-sol')
+        assert.equal(body.reasoning.effort, 'xhigh')
+        assert.ok(Array.isArray(body.input))
+        observations.requests.push(body)
+        const step = observations.requests.length
+        assert.ok(step <= 2, 'unexpected provider retries cannot be hidden by the fixture')
+        if (options.rejectProvider === true) {
+          response.writeHead(400, { 'content-type': 'application/json' })
+          response.end(JSON.stringify({ error: {
+            type: 'invalid_request_error', code: 'invalid_request_error',
+            message: 'OFFLINE_BACKEND_400_WITNESS',
+          } }))
+          return
+        }
+        native.sendResponse(response, step, step === 1 ? {
+          type: 'custom_tool_call', id: 'composition-patch', call_id: 'composition-patch', name: 'apply_patch',
+          input: `*** Begin Patch\n*** Update File: src/example.js\n@@\n-${originalSource.trimEnd()}\n+${expectedSource.trimEnd()}\n*** End Patch\n`,
+        } : {
+          type: 'message', role: 'assistant', id: 'composition-result',
+          content: [{ type: 'output_text', text: JSON.stringify({ canonicalJson: JSON.stringify(canonical) }) }],
+        })
+      } catch (error) {
+        providerError = error
+        response.writeHead(500)
+        response.end('invalid offline composition request')
+      }
+    })
+  })
+  await new Promise((resolve, reject) => {
+    upstream.once('error', reject)
+    upstream.listen(0, '127.0.0.1', resolve)
+  })
+  t.after(async () => {
+    for (const opened of relays) await opened.close()
+    upstream.closeAllConnections()
+    await new Promise(resolve => upstream.close(resolve))
+  })
+  const adapter = new CodexExecAdapter({
+    runner: native.createNativeRunner(cli, observations), executable: cli.command, executableArgs: cli.args,
+    targetPath: target, profilePath, providerSchemaRoot: path.join(home, 'transport'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents/contracts/schemas/role-report.schema.json'),
+    cumulativeQuotaProxyFactory: async options => {
+      relay = await startCodexCumulativeQuotaProxy({
+        ...options, upstreamBaseUrl: `http://127.0.0.1:${upstream.address().port}/backend-api/codex`,
+      })
+      relays.push(relay)
+      return relay
+    },
+  })
+  let independentStatus = null
+  harness.runtimeOptions.launcher = async launch => {
+    harness.launches.push(launch)
+    let result
+    if (launch.logicalRole === 'worker') {
+      assert.equal(launch.assignment.model, 'gpt-5.6-sol')
+      assert.equal(launch.assignment.effort, 'xhigh')
+      assert.notEqual(launch.workingDirectory, target)
+      canonical = roadmapCompositionRoleResult(launch, ['Implement the requested bounded product behavior.'])
+      for (const key of ['contextId', 'usage', 'evidenceHashes']) delete canonical[key]
+      canonical.filesChanged = ['src/example.js']
+      const schemaValidation = require(path.join(WORKFLOW, 'json-schema-validator.js')).validateJsonSchema(
+        JSON.parse(fs.readFileSync(path.join(ROOT, 'agents/contracts/schemas/role-report.schema.json'), 'utf8')),
+        canonical,
+      )
+      assert.equal(schemaValidation.valid, true, JSON.stringify(schemaValidation))
+      result = await adapter.launch({ ...launch, environment })
+      if (providerError) throw providerError
+      assert.equal(fs.readFileSync(path.join(launch.workingDirectory, 'src/example.js'), 'utf8'), expectedSource)
+      assert.equal(fs.readFileSync(path.join(target, 'src/example.js'), 'utf8'), originalSource,
+        'native mutation stays private until the supervisor authorizes promotion')
+    } else {
+      assert.notEqual(options.rejectProvider, true, 'a rejected zero-diff native turn cannot authorize a checker')
+      assert.ok(launch.logicalRole.startsWith('independent-'), `unexpected role ${launch.logicalRole}`)
+      const snapshotPath = launch.canonicalTargetPath
+      assert.notEqual(snapshotPath, target)
+      assert.notEqual(snapshotPath, launch.workingDirectory, 'checker scratch is not its frozen source snapshot')
+      const changedPaths = spawnSync('git', ['diff', '--name-only'], {
+        cwd: snapshotPath, env: environment, encoding: 'utf8', timeout: 10000,
+      })
+      assert.equal(changedPaths.status, 0, changedPaths.stderr)
+      assert.equal(changedPaths.stdout.trim(), 'src/example.js')
+      const declaredCheck = spawnSync(process.execPath, ['--test', 'focused.test.cjs'], {
+        cwd: snapshotPath, env: environment, encoding: 'utf8', timeout: 10000,
+      })
+      const check = spawnSync(process.execPath, [acceptancePath, snapshotPath], {
+        env: environment, encoding: 'utf8', timeout: 10000,
+      })
+      independentStatus = check.status
+      assert.equal(digest(fs.readFileSync(acceptancePath)), acceptanceHash)
+      const code = check.status === 0 && declaredCheck.status === 0 ? 'PASS' : 'FAIL'
+      result = roadmapCompositionProductCheckResult(launch, code, 'Independent Node acceptance process completed.')
+      result.payload.testOutcomes = result.payload.testOutcomes.map(item => ({
+        ...item, fingerprint: digest(JSON.stringify({ acceptanceHash, declaredCheck, independent: check })),
+      }))
+      assert.equal(check.stdout, 'INDEPENDENT_NATIVE_PASS\n', check.stderr)
+    }
+    fixture.results.set(launch.workItemId, result)
+    return result
+  }
+  const runtime = new CodexSupervisorRuntime(harness.runtimeOptions)
+  fixture.setRuntime(runtime)
+  const result = await runtime.start()
+  if (providerError) throw providerError
+  assert.equal(durableFallbackCalls, 0, 'a live quarantine disposition never invokes crash-adoption receipt lookup')
+  if (options.rejectProvider === true) {
+    assert.equal(result.outcome, 'FAILED', JSON.stringify(result.terminalEnvelope))
+    assert.equal(result.terminalEnvelope.status, 'CHILD_TRANSPORT_TIMEOUT')
+    assert.doesNotMatch(JSON.stringify(result.terminalEnvelope), /CRASH_ADOPTION_CONFLICT/u)
+    assert.equal(independentStatus, null)
+    assert.equal(fs.readFileSync(path.join(target, 'src/example.js'), 'utf8'), originalSource)
+    assert.deepEqual(harness.launches.map(launch => launch.workItemId), [
+      'work-1', 'work-1-transport-retry-1',
+    ])
+    assert.equal(observations.requests.length, 2, 'one native backend request per admitted transport attempt')
+    assert.ok(observations.lines.some(line => line.includes('OFFLINE_BACKEND_400_WITNESS')),
+      'the genuine native event stream retains the fabricated backend rejection')
+    assert.equal(relays.length, 2)
+    for (const opened of relays) {
+      assert.equal(opened.snapshot().providerRequestCount, 1, 'one upstream request was started')
+      assert.equal(opened.snapshot().requestCount, 0, 'no request completed with provider usage')
+      assert.deepEqual(opened.snapshot().usage, {
+        noncachedInput: 0, cachedInput: 0, output: 0, reasoning: 0,
+      }, 'a backend rejection has no fabricated provider token usage')
+    }
+    assert.equal(runtime.pendingProviderEnvelopes.size, 0)
+    assert.equal(runtime.childTokenReservations.size, 0)
+    assert.equal(result.budget.tokensUsed, relays.reduce((total, opened) =>
+      total + opened.snapshot().latestMaximumUnaccountedTokens, 0),
+    'unknown spend remains conservatively charged, not reported as observed usage')
+    const failedTurn = fixture.routeReturns.get('work-1')
+    const disposition = Object.getOwnPropertySymbols(failedTurn)
+      .find(symbol => symbol.description === 'transportQuarantinePointer')
+    assert.ok(disposition)
+    assert.equal(failedTurn[disposition], null)
+    assert.equal(Object.getOwnPropertyDescriptor(failedTurn, disposition).enumerable, false)
+    assert.deepEqual(workerWorkspaceJournalStatuses(fixture.workerPrivateRoot), ['ABORTED', 'ABORTED'])
+    assert.equal(harness.finalizations.length, 1)
+    assert.equal(harness.finalizations[0].outcome, 'FAILED')
+    // As in the successful composition below, lifecycle authorities/finalizer
+    // remain harness doubles; CLI execution, relay, failure receipts, scheduler,
+    // workspace cleanup and conservative spend settlement are real.
+    return
+  }
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result.terminalEnvelope))
+  assert.equal(independentStatus, 0)
+  assert.equal(fs.readFileSync(path.join(target, 'src/example.js'), 'utf8'), expectedSource)
+  assert.deepEqual(harness.launches.map(launch => launch.workItemId), ['work-1', 'independent-check-1'])
+  assert.equal(observations.requests.length, 2)
+  assert.equal(relay.snapshot().providerRequestCount, 2)
+  assert.equal(relay.snapshot().lastFailure, null)
+  assert.deepEqual(relay.snapshot().usage, { noncachedInput: 3, cachedInput: 0, output: 2, reasoning: 0 })
+  assert.equal(runtime.pendingProviderEnvelopes.size, 0)
+  assert.equal(runtime.childTokenReservations.size, 0)
+  assert.equal(result.budget.tokensUsed, 5)
+  // This is native adapter/relay + real supervisor/workspace composition, not
+  // installed E2E: the harness finalizer, lock, permit and capability authority
+  // and checker snapshot/report/attestation/result-receipt adapters remain test doubles;
+  // durable terminal publication is covered elsewhere.
+  assert.equal(harness.finalizations.length, 1)
+  assert.equal(harness.finalizations[0].outcome, 'DONE')
+}
 
 test('fresh ROADMAP allocates no plan-check proof, retry, or cache entry before product', async t => {
   const fixture = configureRoadmapCompositionHarness(t, [], { completeProduct: true })

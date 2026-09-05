@@ -34,6 +34,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -46,22 +47,26 @@ jobs:
           check-latest: false
       - name: Install validation parsers
         run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0
+      - name: Permit native sandbox namespaces on the disposable Linux runner
+        if: matrix.node == '24'
+        # Ubuntu's additional AppArmor userns gate otherwise rejects nested
+        # native sandbox setup. Tests still run as the unprivileged runner and
+        # enforce actual filesystem/network isolation; no product setting changes.
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Install pinned Codex before dependent tests
+        run: |
+          npm install --global --prefix "${{ runner.temp }}/autoprompt-codex-cli" --install-strategy=nested --ignore-scripts --no-audit --no-fund @openai/codex@0.148.0
+          node tests/helpers/export-pinned-codex-ci.cjs "${{ runner.temp }}/autoprompt-codex-cli"
       - name: Run package, provider, and benchmark tests
         run: npm test
-      - name: Install pinned Codex for native transport probes
-        if: matrix.node == '24'
-        run: |
-          npm install --prefix "${{ runner.temp }}/autoprompt-codex-cli" --no-save --package-lock=false --ignore-scripts @openai/codex@0.148.0
-          printf '%s\n' "${{ runner.temp }}/autoprompt-codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Run Codex core including required native transport probes
         if: matrix.node == '24'
-        env:
-          AUTOPROMPT_PINNED_CODEX: ${{ runner.temp }}/autoprompt-codex-cli/node_modules/@openai/codex/bin/codex.js
         run: npm run test:codex-core
       - name: Run packed Codex lifecycle
         if: matrix.node == '24'
-        env:
-          AUTOPROMPT_PINNED_CODEX: ${{ runner.temp }}/autoprompt-codex-cli/node_modules/@openai/codex/bin/codex.js
         run: npm run test:codex-lifecycle
 
   windows-provider-contracts:
@@ -85,6 +90,10 @@ jobs:
           check-latest: false
       - name: Install validation parsers
         run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0
+      - name: Install pinned Codex for offline package contracts
+        run: |
+          npm install --global --prefix "${{ runner.temp }}/autoprompt-codex-cli" --install-strategy=nested --ignore-scripts --no-audit --no-fund @openai/codex@0.148.0
+          node tests/helpers/export-pinned-codex-ci.cjs "${{ runner.temp }}/autoprompt-codex-cli"
       - name: Run package, provider, and benchmark tests
         run: npm test
       - name: Run older Codex upgrade lifecycle
@@ -106,6 +115,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -118,6 +128,16 @@ jobs:
           check-latest: false
       - name: Install validation parsers
         run: python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0
+      - name: Permit native sandbox namespaces on the disposable Linux runner
+        if: runner.os == 'Linux'
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Install pinned Codex before dependent tests
+        run: |
+          npm install --global --prefix "${{ runner.temp }}/autoprompt-codex-cli" --install-strategy=nested --ignore-scripts --no-audit --no-fund @openai/codex@0.148.0
+          node tests/helpers/export-pinned-codex-ci.cjs "${{ runner.temp }}/autoprompt-codex-cli"
       - name: Check pull request lifecycle contract
         run: node --test tests/source/ci-codex-packed-pr-contract.test.cjs
       - name: Run full verification, including packed Codex lifecycle

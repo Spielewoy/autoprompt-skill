@@ -71,19 +71,25 @@ test('Codex local-record user docs define fail-closed retention and export autho
   assert.match(guide, /explicit aggregate token budget or physical[\s\S]*?tool-call ceiling[\s\S]*?enforced exactly/i)
   assert.match(guide, /controller-owned loopback relay applies a preventive per-response token envelope/i)
   assert.match(guide, /272,000-token model context/i)
-  assert.match(guide, /128,000-token\s+maximum response/i)
-  assert.match(guide, /maximum is not a cumulative task budget/i)
+  assert.match(guide, /128,000-token response maximum/i)
+  assert.match(guide, /API-key authentication, it injects `max_output_tokens`/i)
+  assert.match(guide, /ChatGPT subscription backend rejects that parameter[\s\S]*?omits it[\s\S]*?full 128,000-token response maximum plus the input upper bound/i)
+  assert.match(guide, /Default required work has no cumulative token cap/i)
   assert.match(guide, /concurrent children under an explicit budget wait/i)
   assert.match(readme, /full Codex runtime validation is Linux-only/i)
   assert.match(guide, /native Windows has no implemented\s+descriptor-anchored filesystem adapter/i)
   assert.match(guide, /macOS has not been validated/i)
-  assert.match(guide, /request that cannot fit an explicit allowance is refused before it reaches the\s+upstream provider/i)
+  assert.match(guide, /request that cannot fit an explicit allowance is refused before\s+it reaches the upstream provider/i)
   assert.match(guide, /total\s+input including cached input/i)
   assert.match(guide, /disconnected child\s+cancels its upstream request/i)
   assert.match(guide, /compaction is not a cumulative token or billing cap/i)
   assert.match(guide, /private controlled model catalog forces Codex 0\.148 into direct-tool mode/i)
   assert.match(guide, /request and\s+stream retries to zero/i)
-  assert.match(guide, /charges only that request's finite context-bound maximum\s+unaccounted allowance/i)
+  assert.match(guide, /charges only that request's finite admitted maximum\s+unaccounted allowance/i)
+  assert.match(guide, /configure codex --agents gpt-5\.6-sol --effort xhigh/i)
+  assert.match(guide, /without `--effort` restores the existing per-role defaults/i)
+  assert.match(guide, /cannot be combined with `--agents off`/i)
+  assert.match(guide, /does not change the outer session or synthetic run-owner effort policy[\s\S]*?PRE_ROUTE model turns still run at low effort/i)
   assert.match(guide, /exactly one fresh transport successor/i)
   assert.match(guide, /second unknown provider response is not looped[\s\S]*?candidate is preserved/i)
   assert.match(guide, /no hidden second budget for verification/i)
@@ -121,7 +127,7 @@ test('Codex install docs separate the unpublished provider package and bind fina
   assert.match(readme, /0 npm dependencies[^\n]*0 optional dependencies/i)
 })
 
-test('Codex target route docs consistently identify the local v1.0.29 build as not published', () => {
+test(`Codex target route docs consistently identify the local v${LOCAL_BUILD_VERSION} build as not published`, () => {
   const roadmap = read('AUTOPROMPT-TOTAL-FIX-MAP.md')
   const p11Status = phaseStatus(roadmap, 'P11 Canary and paired evaluation')
   const p12Status = phaseStatus(roadmap, 'P12 Legacy removal and documentation')
@@ -136,7 +142,7 @@ test('Codex target route docs consistently identify the local v1.0.29 build as n
     }
     if (p12Status !== 'DONE') {
       const expected = relative.endsWith('.svg') ? SVG_LOCAL_BUILD_MARKER : LOCAL_BUILD_MARKER
-      assert.ok(source.includes(expected), `${relative}: identifies the local v1.0.29 build as not published`)
+      assert.ok(source.includes(expected), `${relative}: identifies the local v${LOCAL_BUILD_VERSION} build as not published`)
       assert.doesNotMatch(source, /development-only|development only|not released before P12|until P12/i,
         `${relative}: removes the obsolete phase-based release wording`)
     }

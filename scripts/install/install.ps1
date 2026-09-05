@@ -1030,18 +1030,104 @@ function Remove-LegacyCodexRoles {
     return 0
 }
 
+function Get-LegacyCodexOptionalDirectories {
+    param([string]$Root)
+    $compat = Get-Content -LiteralPath `
+        (Join-Path $RepoRoot 'scripts/install/legacy-codex-compat.json') `
+        -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $skillRoot = Join-Path $Root 'skills/autoprompt'
+    foreach ($relativeDirectory in @($compat.optionalDirectories)) {
+        $directory = Join-Path $skillRoot ([string]$relativeDirectory)
+        if (-not (Test-IdemPathUnderRoot -Path $directory -Root $skillRoot)) {
+            throw 'invalid optional older skill directory'
+        }
+        $directory
+    }
+}
+
+function Test-LegacyCodexDirectoryChain {
+    param([string]$Root, [string]$Directory)
+    if (-not (Test-IdemPathEqual -Left $Directory -Right $Root) -and
+        -not (Test-IdemPathUnderRoot -Path $Directory -Root $Root)) {
+        return $false
+    }
+    $current = $Directory
+    while (-not [string]::IsNullOrEmpty($current)) {
+        try {
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        } catch [System.Management.Automation.ItemNotFoundException] {
+            $item = $null
+        } catch {
+            return $false
+        }
+        if ($null -ne $item -and
+            ($item -isnot [System.IO.DirectoryInfo] -or
+            $item.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint))) {
+            return $false
+        }
+        if (Test-IdemPathEqual -Left $current -Right $Root) {
+            return $null -ne $item
+        }
+        $parent = Split-Path -Parent $current
+        if ($parent -ceq $current) { return $false }
+        $current = $parent
+    }
+    return $false
+}
+
 function Remove-LegacyCodexSkillPayload {
     param([string]$Root)
     $skillRoot = Join-Path $Root 'skills/autoprompt'
     if (-not (Test-Path -LiteralPath $skillRoot -PathType Container)) { return 0 }
-    $legacyFiles = @($script:AutopromptReceiptFiles)
-    foreach ($file in $legacyFiles) {
-        if (-not (Test-IdemPathUnderRoot -Path $file -Root $skillRoot)) {
-            continue
+    $legacyFiles = @($script:AutopromptReceiptFiles | Where-Object {
+        Test-IdemPathUnderRoot -Path $_ -Root $skillRoot
+    })
+    $directories = New-Object 'System.Collections.Generic.HashSet[string]' `
+        (Get-IdemPathComparer)
+    try {
+        foreach ($directory in @(Get-LegacyCodexOptionalDirectories -Root $Root)) {
+            [void]$directories.Add($directory)
         }
+        foreach ($file in $legacyFiles) {
+            $directory = Split-Path -Parent $file
+            while (Test-IdemPathUnderRoot -Path $directory -Root $skillRoot) {
+                [void]$directories.Add($directory)
+                $directory = Split-Path -Parent $directory
+            }
+        }
+        # Validate the complete candidate chains before removing any files.
+        # Unknown siblings and directory contents never become deletion targets.
+        foreach ($directory in @($skillRoot) + @($directories)) {
+            if (-not (Test-LegacyCodexDirectoryChain -Root $Root -Directory $directory)) {
+                throw "linked or non-directory older skill path: $directory"
+            }
+        }
+    } catch {
+        [Console]::Error.WriteLine("Autoprompt install (codex): $($_.Exception.Message)")
+        return 93
+    }
+    foreach ($file in $legacyFiles) {
         if (-not (Remove-IdemManagedFile -ConfigRoot $Root -Path $file)) {
             [Console]::Error.WriteLine(
                 "Autoprompt install (codex): could not migrate older skill file $file."
+            )
+            return 93
+        }
+    }
+    foreach ($directory in @($directories | Sort-Object -Property Length -Descending)) {
+        try {
+            if (-not (Test-LegacyCodexDirectoryChain -Root $Root -Directory $directory)) {
+                throw "linked or non-directory older skill path: $directory"
+            }
+            if (-not (Test-Path -LiteralPath $directory -PathType Container)) { continue }
+            if (@([System.IO.Directory]::GetFileSystemEntries($directory)).Count -ne 0) {
+                continue
+            }
+            # This also refuses a directory that becomes nonempty after inspection.
+            [System.IO.Directory]::Delete($directory, $false)
+        } catch {
+            [Console]::Error.WriteLine(
+                "Autoprompt install (codex): could not migrate older skill directory $directory."
             )
             return 93
         }
@@ -1921,11 +2007,25 @@ function Start-RootTransaction {
             throw "unfinished older Codex recovery already exists at $recoveryPath"
         }
         try {
-            Move-Item -LiteralPath $snapshot.RecoveryPath `
-                -Destination $recoveryPath -ErrorAction Stop
+            # Empty optional legacy directories have no file whose parent would
+            # otherwise capture them. Preserve their existence before any cleanup.
+            foreach ($directory in @(Get-LegacyCodexOptionalDirectories -Root $Root)) {
+                if (-not (Test-LegacyCodexDirectoryChain -Root $Root -Directory $directory)) {
+                    throw "linked or non-directory older skill path: $directory"
+                }
+                $snapshot.Directories[$directory] =
+                    Test-Path -LiteralPath $directory -PathType Container
+            }
+            if (-not (Write-IdemManagedRecovery -Snapshot $snapshot `
+                -RecoveryPath $recoveryPath)) {
+                throw 'could not write older Codex recovery'
+            }
         } catch {
             Remove-IdemManagedRecovery -Snapshot $snapshot | Out-Null
             throw "could not preserve older Codex recovery at $recoveryPath"
+        }
+        if (-not (Remove-IdemManagedRecovery -Snapshot $snapshot)) {
+            throw "could not remove temporary state; older Codex recovery retained at $recoveryPath"
         }
         $snapshot.RecoveryPath = $recoveryPath
         $snapshot.InMemoryRestoreToken = $script:AutopromptInMemoryRestoreToken
@@ -2053,8 +2153,17 @@ function Test-LegacyCodexRecoverySnapshot {
         }
     }
     $actualDirectories = @($Snapshot.Directories.Keys)
-    if ($actualDirectories.Count -ne $expectedDirectories.Count) { return $false }
     $skillRoot = Join-Path $Root 'skills/autoprompt'
+    $optionalDirectories = New-Object 'System.Collections.Generic.HashSet[string]' `
+        (Get-IdemPathComparer)
+    foreach ($relativeDirectory in @($compat.optionalDirectories)) {
+        [void]$optionalDirectories.Add((Join-Path $skillRoot ([string]$relativeDirectory)))
+    }
+    # Older recovery records omit empty optional directories. Both forms retain
+    # the exact required key set; only known optional keys may extend it.
+    foreach ($directory in $expectedDirectories) {
+        if (-not $Snapshot.Directories.ContainsKey($directory)) { return $false }
+    }
     $legacyDirectories = New-Object 'System.Collections.Generic.HashSet[string]' `
         (Get-IdemPathComparer)
     [void]$legacyDirectories.Add((Join-Path $Root 'skills'))
@@ -2063,10 +2172,13 @@ function Test-LegacyCodexRecoverySnapshot {
         [void]$legacyDirectories.Add((Join-Path $skillRoot ([string]$relativeDirectory)))
     }
     foreach ($directory in $actualDirectories) {
-        if (-not $expectedDirectories.Contains([string]$directory)) { return $false }
+        $optional = $optionalDirectories.Contains([string]$directory)
+        if (-not $optional -and
+            -not $expectedDirectories.Contains([string]$directory)) { return $false }
         $value = $Snapshot.Directories[$directory]
         if ($value -isnot [bool] -or
-            [bool]$value -ne $legacyDirectories.Contains([string]$directory)) {
+            (-not $optional -and
+            [bool]$value -ne $legacyDirectories.Contains([string]$directory))) {
             return $false
         }
     }

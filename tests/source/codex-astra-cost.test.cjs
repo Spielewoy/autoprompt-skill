@@ -174,6 +174,121 @@ test('relay respects the provider output maximum on every model without creating
   assert.equal(requests.at(-1).max_output_tokens + proxy.snapshot().latestInputBound.maximumInputTokens, 272_000)
 })
 
+async function chatgptRelayFixture(t, tokenLimit, { outputTokens = 80_000, incomplete = false } = {}) {
+  const requests = [], started = [], settled = [], usages = []
+  const provider = http.createServer((request, response) => {
+    let bytes = ''
+    request.setEncoding('utf8')
+    request.on('data', chunk => { bytes += chunk })
+    request.on('end', () => {
+      const body = JSON.parse(bytes)
+      requests.push(body)
+      assert.equal(request.url, '/backend-api/codex/responses')
+      assert.equal(request.headers['chatgpt-account-id'], 'offline-account')
+      if (Object.hasOwn(body, 'max_output_tokens')) {
+        response.writeHead(400, { 'content-type': 'application/json' })
+        response.end('{"error":{"message":"Unsupported parameter: max_output_tokens"}}')
+        return
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      const event = incomplete ? { type: 'response.created', response: { id: 'incomplete' } } : {
+        type: 'response.completed', response: { id: `response-${requests.length}`, usage: {
+          input_tokens: 10, input_tokens_details: { cached_tokens: 0 },
+          output_tokens: outputTokens, output_tokens_details: { reasoning_tokens: 0 },
+        } },
+      }
+      response.end(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+    })
+  })
+  await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve))
+  const proxy = await startCodexCumulativeQuotaProxy({
+    tokenLimit, upstreamBaseUrl: `http://127.0.0.1:${provider.address().port}/backend-api/codex`,
+    onProviderRequestStarted: item => started.push(item),
+    onProviderRequestSettled: item => settled.push(item),
+    onUsage: item => usages.push(item),
+  })
+  t.after(async () => { await proxy.close(); await new Promise(resolve => provider.close(resolve)) })
+  const post = (body = { model: 'gpt-5.6-sol', input: [], stream: true }) => new Promise(resolve => {
+    const request = http.request(`${proxy.baseUrl}/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'chatgpt-account-id': 'offline-account' },
+    }, response => {
+      let bytes = ''
+      response.setEncoding('utf8')
+      response.on('data', chunk => { bytes += chunk })
+      response.once('end', () => resolve({ status: response.statusCode, body: bytes, aborted: false }))
+      response.once('error', () => resolve({ status: response.statusCode, body: bytes, aborted: true }))
+    })
+    request.once('error', () => resolve({ status: null, body: '', aborted: true }))
+    request.end(JSON.stringify(body))
+  })
+  return { proxy, requests, started, settled, usages, post }
+}
+
+test('ChatGPT omits the unsupported API field while reserving the full response maximum on every turn', async t => {
+  const fixture = await chatgptRelayFixture(t, Number.MAX_SAFE_INTEGER)
+  for (let turn = 0; turn < 6; turn += 1) {
+    const response = await fixture.post({
+      model: 'gpt-5.6-sol', input: [{ role: 'user', content: `turn ${turn}` }], stream: true,
+    })
+    assert.equal(response.status, 200, response.body)
+    assert.equal(response.aborted, false)
+    assert.equal(Object.hasOwn(fixture.requests.at(-1), 'max_output_tokens'), false)
+    assert.equal(fixture.started.at(-1).maximumUnaccountedTokens,
+      fixture.proxy.snapshot().latestInputBound.maximumInputTokens + 128_000)
+  }
+  assert.equal(fixture.proxy.snapshot().usage.output, 480_000, '128k is not a cumulative activation cap')
+  const response = await fixture.post({
+    model: 'gpt-5.6-sol', input: [{ role: 'user', content: 'x'.repeat(200_000) }],
+    max_output_tokens: 1024, stream: true,
+  })
+  assert.equal(response.status, 200, response.body)
+  assert.equal(response.aborted, false, 'the backend may exceed the caller-controlled context remainder')
+  assert.equal(Object.hasOwn(fixture.requests.at(-1), 'max_output_tokens'), false)
+  assert.ok(fixture.started.at(-1).maximumUnaccountedTokens > 328_000,
+    'neither an unsupported requested ceiling nor context packing can shrink unknown-spend reservation')
+  assert.equal(fixture.started.at(-1).maximumUnaccountedTokens,
+    fixture.proxy.snapshot().latestInputBound.maximumInputTokens + 128_000)
+  assert.equal(fixture.settled.length, 7)
+})
+
+test('finite ChatGPT admission denies unsupported small ceilings before bytes and preserves remaining budget', async t => {
+  const small = await chatgptRelayFixture(t, 8000)
+  assert.equal((await small.post()).status, 429)
+  assert.equal(small.proxy.snapshot().lastFailure.code, 'CODEX_CHILD_QUOTA_PREFLIGHT_DENIED')
+  assert.equal(small.proxy.snapshot().providerRequestCount, 0)
+  assert.equal(small.requests.length, 0)
+  assert.deepEqual(small.started, [])
+  assert.deepEqual(small.usages, [])
+  const finite = await chatgptRelayFixture(t, 200_000)
+  assert.equal((await finite.post()).status, 200)
+  assert.equal(finite.proxy.snapshot().usage.output, 80_000)
+  assert.equal((await finite.post()).status, 429,
+    'remaining allowance below input plus 128k cannot enforce a smaller ChatGPT response')
+  assert.equal(finite.requests.length, 1)
+  assert.equal(finite.started.length, 1)
+  assert.equal(finite.settled.length, 1)
+  assert.equal(finite.proxy.snapshot().usage.noncachedInput + finite.proxy.snapshot().usage.output, 80_010)
+})
+
+test('ChatGPT unknown spend retains full admission while provider-bound violations retain exact billed usage', async t => {
+  const unknown = await chatgptRelayFixture(t, Number.MAX_SAFE_INTEGER, { incomplete: true })
+  await unknown.post()
+  assert.equal(unknown.requests.length, 1)
+  assert.equal(unknown.started.length, 1)
+  assert.equal(unknown.started[0].maximumUnaccountedTokens,
+    unknown.proxy.snapshot().latestInputBound.maximumInputTokens + 128_000)
+  assert.equal(unknown.proxy.snapshot().latestMaximumUnaccountedTokens, unknown.started[0].maximumUnaccountedTokens)
+  assert.deepEqual(unknown.settled, [])
+  assert.deepEqual(unknown.usages, [])
+  assert.equal(unknown.proxy.snapshot().hardStopped, true)
+  const exceeded = await chatgptRelayFixture(t, Number.MAX_SAFE_INTEGER, { outputTokens: 128_001 })
+  assert.equal((await exceeded.post()).aborted, true)
+  assert.equal(exceeded.proxy.snapshot().lastFailure.code, 'CODEX_CHILD_QUOTA_BOUND_VIOLATED')
+  assert.equal(exceeded.usages[0].output, 128_001)
+  assert.equal(exceeded.settled[0].accountedUsage.output, 128_001)
+  assert.equal(exceeded.settled[0].disposition, 'ACCOUNTED')
+})
+
 test('native Codex probe discovery supports installed package paths and rejects broken explicit pins', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-pin-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))

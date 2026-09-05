@@ -2,7 +2,9 @@
 'use strict'
 
 const assert = require('node:assert/strict')
+const childProcess = require('node:child_process')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 
@@ -68,17 +70,79 @@ test('beta pushes run the Codex source and packed lifecycle suites with a mandat
   const installIndex = steps.findIndex(step => step.includes('@openai/codex@0.148.0'))
   assert.notEqual(installIndex, -1)
   const install = steps[installIndex]
-  assert.match(install, /^        if: matrix\.node == '24'$/mu)
-  assert.match(install, /npm install --prefix "\$\{\{ runner\.temp \}\}\/autoprompt-codex-cli"/u)
-  assert.match(install, /node_modules\/\.bin" >> "\$GITHUB_PATH"/u)
+  assert.doesNotMatch(install, /^        if:/mu, 'every supported Node job needs the native dependency before npm test')
+  assert.match(install, /npm install --global --prefix "\$\{\{ runner\.temp \}\}\/autoprompt-codex-cli" --install-strategy=nested/u)
+  assert.match(install, /node tests\/helpers\/export-pinned-codex-ci\.cjs/u)
+  assert.ok(steps.findIndex(step => /^        run: npm test$/mu.test(step)) > installIndex)
   for (const command of ['npm run test:codex-core', 'npm run test:codex-lifecycle']) {
     const index = steps.findIndex(step => step.includes(`        run: ${command}\n`))
     assert.ok(index > installIndex, `${command} runs after installing the pinned CLI`)
     assert.match(steps[index], /^        if: matrix\.node == '24'$/mu)
-    assert.match(steps[index], /^          AUTOPROMPT_PINNED_CODEX: \$\{\{ runner\.temp \}\}\/autoprompt-codex-cli\/node_modules\/@openai\/codex\/bin\/codex\.js$/mu)
   }
   assert.equal(literalOccurrences(job, 'run: npm run test:codex-core'), 1)
   assert.equal(literalOccurrences(job, 'run: npm run test:codex-lifecycle'), 1)
+})
+
+test('all CI package jobs declare and validate the native CLI before dependent tests', () => {
+  const workflow = read('.github/workflows/ci.yml').replaceAll('\r\n', '\n')
+  for (const id of ['node-compatibility', 'windows-provider-contracts', 'pull-request-lifecycle']) {
+    const steps = workflowJob(workflow, id).split(/^      - name: /mu).slice(1)
+    const installIndex = steps.findIndex(step => step.includes('@openai/codex@0.148.0'))
+    const testIndex = steps.findIndex(step => /^        run: npm (?:test|run verify)$/mu.test(step))
+    assert.ok(installIndex >= 0 && installIndex < testIndex, `${id}: pin installation precedes tests`)
+    assert.doesNotMatch(steps[installIndex], /^        if:/mu)
+    assert.match(steps[installIndex], /--global[\s\S]*--install-strategy=nested[\s\S]*--ignore-scripts/u)
+    assert.match(steps[installIndex], /tests\/helpers\/export-pinned-codex-ci\.cjs/u)
+  }
+  const setup = read('tests/helpers/export-pinned-codex-ci.cjs')
+  assert.match(setup, /resolveCodexExecutable\('codex', \{ environment: \{ PATH: bin \} \}\)/u)
+  assert.match(setup, /pinnedCodexCli\(/u)
+  assert.match(setup, /AUTOPROMPT_PINNED_CODEX=/u)
+  assert.match(setup, /AUTOPROMPT_REQUIRE_PINNED_CODEX=1/u)
+  assert.match(setup, /CODEX_MANAGED_PACKAGE_ROOT=\$\{packageRoot\}/u)
+  const configureTest = read('tests/source/codex-configure.test.cjs')
+  assert.doesNotMatch(configureTest, /hostCodexHome|os\.homedir\(\)/u)
+  assert.doesNotMatch(configureTest, /echo codex-cli|printf.*codex-cli/u)
+  assert.match(configureTest, /pinnedCodexPackageFixture\(/u)
+  assert.match(configureTest, /reason=codex-windows-sandbox-identity-unavailable/u)
+})
+
+test('Linux full-core CI supplies frozen Git history and native namespace prerequisites without root tests', () => {
+  const workflow = read('.github/workflows/ci.yml').replaceAll('\r\n', '\n')
+  for (const id of ['node-compatibility', 'pull-request-lifecycle']) {
+    const job = workflowJob(workflow, id)
+    assert.match(job, /^          fetch-depth: 0$/mu, 'historically frozen empirical fixtures require their actual commits')
+    assert.match(job, /sudo sysctl -w kernel\.apparmor_restrict_unprivileged_userns=0/u)
+    assert.ok(job.indexOf('sudo sysctl') < job.indexOf('run: npm '))
+    assert.doesNotMatch(job, /sudo (?:npm|node)\b/u, 'permission-sensitive tests must execute as the runner, not root')
+  }
+})
+
+test('Windows-style checkouts preserve every hash-bound Codex external and install registry byte', t => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-crlf-contract-'))
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }))
+  const manifest = JSON.parse(read('agents/manifests/codex-runtime.json'))
+  const files = [...new Set([
+    ...manifest.externalDependencies.map(entry => entry.source),
+    'scripts/install/legacy-codex-role-hashes.json',
+    'scripts/install/legacy-codex-compat.json',
+    'scripts/install/codex-package-registry.json',
+    'scripts/install/codex-discovery-shim.md',
+  ])].sort()
+  const attrs = childProcess.spawnSync('git', ['check-attr', 'eol', '--', ...files], { cwd: ROOT, encoding: 'utf8' })
+  assert.equal(attrs.status, 0, attrs.stderr)
+  assert.equal(attrs.stdout.trim().split('\n').length, files.length)
+  for (const row of attrs.stdout.trim().split('\n')) assert.match(row, /: eol: lf$/u)
+  const checkout = childProcess.spawnSync('git', [
+    '-c', 'core.autocrlf=true', '-c', 'core.eol=crlf', 'checkout-index',
+    `--prefix=${temporary.split(path.sep).join('/')}/`, '--', ...files,
+  ], { cwd: ROOT, encoding: 'utf8' })
+  assert.equal(checkout.status, 0, checkout.stderr)
+  for (const file of files) {
+    const indexed = childProcess.spawnSync('git', ['show', `:${file}`], { cwd: ROOT, encoding: null })
+    assert.equal(indexed.status, 0)
+    assert.deepEqual(fs.readFileSync(path.join(temporary, file)), indexed.stdout, file)
+  }
 })
 
 test('benchmark and every Codex source suite are each wired exactly once', () => {

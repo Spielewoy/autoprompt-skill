@@ -57,7 +57,7 @@ autoprompt
 ### Codex-only local package
 
 `autoprompt-skill` is the multi-provider aggregate. For an offline checkout that
-needs only Codex, `@autoprompt-skill/codex-runtime` is the Codex-only local v1.0.29
+needs only Codex, `@autoprompt-skill/codex-runtime` is the Codex-only local v1.0.30
 package; it is not published. Stage and run it without installing the aggregate:
 
 ```bash
@@ -88,8 +88,8 @@ The v2 work on this development branch is Codex-first. The other provider rows b
 describe the existing released adapters; they have not been migrated to the Codex v2
 hierarchy or runtime in this branch.
 
-<!-- codex-v2-release-status: local-v1.0.29-build-not-published -->
-Codex v2 is available in this checkout as a local v1.0.29 build. It has
+<!-- codex-v2-release-status: local-v1.0.30-build-not-published -->
+Codex v2 is available in this checkout as a local v1.0.30 build. It has
 not been published as a package or release. Its local transcript, retention, and export-authority
 boundary is documented in the
 [Codex v2 local-record guide](docs/guides/codex-v2-local-records.md).
@@ -141,18 +141,18 @@ network boundary before routing or model execution.
 ## Anatomy of an invocation
 
 <p align="center">
-  <a href="assets/anatomy.svg"><img src="assets/anatomy.svg" alt="Anatomy of an Autoprompt invocation: trigger, concurrency mode, agent cap, model routing, goal, and the local Codex v1.0.29 path control" width="1000"/></a>
+  <a href="assets/anatomy.svg"><img src="assets/anatomy.svg" alt="Anatomy of an Autoprompt invocation: trigger, concurrency mode, agent cap, model routing, goal, and the local Codex v1.0.30 path control" width="1000"/></a>
 </p>
 
 ## Run controls
 
-Use `mode=` to set concurrency. Use `agents=` to route models where the host supports it. The optional Codex v2 `path=` control is present in the local v1.0.29 build; it has not been published. [Custom model setup](docs/faq/how-to-add-custom-models.md)
+Use `mode=` to set concurrency. Use `agents=` to route models where the host supports it. The optional Codex v2 `path=` control is present in the local v1.0.30 build; it has not been published. [Custom model setup](docs/faq/how-to-add-custom-models.md)
 
 | Control | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Custom `agents=` routing | ✓ | ✓ | ✕ Not available - inherits active model | ✕ Not available - inherits active model | ✕ Not available - inherits active model | ✕ Not available - inherits selected parent model | ✕ Not available - inherits selected parent model | ✕ Not available - inherits selected parent model | ✕ Not available - inherits selected parent model |
-| `path=` work route | - | Local v1.0.29 build; not published | - | - | - | - | - | - | - |
+| `path=` work route | - | Local v1.0.30 build; not published | - | - | - | - | - | - | - |
 
 For local-build testing, use the Codex v2 launcher and put
 `path=auto|direct|light|roadmap` first inside its quoted request. The slash-command
@@ -172,7 +172,7 @@ routes.
 
 ## How it works
 
-These diagrams describe the local Codex v1.0.29 build; it has not been published.
+These diagrams describe the local Codex v1.0.30 build; it has not been published.
 Codex v2 chooses one route instead of forcing every request through a full roadmap:
 DIRECT uses a success card, LIGHT adds a short plan, and ROADMAP alone adds full
 scope, roadmap review, coordination, and integration. Independent checking remains
@@ -231,7 +231,7 @@ The layers separate coordination, management, execution, and independent judgmen
 <details>
 <summary><strong>What do `mode`, `max_subs`, `agents`, and `path` do?</strong></summary>
 
-`mode=tokensaver` caps active subagents at six. `mode=wide` opens every ready lane. `mode=custom max_subs=N` sets your own ceiling. `agents` controls model routing where the host supports it. The local, unpublished Codex v1.0.29 build optionally uses `path` to fix the work route; when omitted, routing stays automatic. [Details](docs/faq/tokensaver-vs-wide-vs-custom.md)
+`mode=tokensaver` caps active subagents at six. `mode=wide` opens every ready lane. `mode=custom max_subs=N` sets your own ceiling. `agents` controls model routing where the host supports it. The local, unpublished Codex v1.0.30 build optionally uses `path` to fix the work route; when omitted, routing stays automatic. [Details](docs/faq/tokensaver-vs-wide-vs-custom.md)
 
 </details>
 

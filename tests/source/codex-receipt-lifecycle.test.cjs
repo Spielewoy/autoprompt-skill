@@ -132,6 +132,41 @@ test('PowerShell Codex uninstall preserves drift and relinquishes receipt owners
   assertRelinquished(fixture, completed, 1)
 })
 
+test('PowerShell Codex receipt readers split canonical LF documents and retain strict grammar rejection', {
+  skip: !HAS_POWERSHELL,
+}, t => {
+  const fixture = createReceiptFixture('autoprompt-codex-receipt-grammar-', false)
+  t.after(() => fs.rmSync(fixture.sandbox, { recursive: true, force: true }))
+  const original = new Map([fixture.manifest, fixture.receipt].map(file => [file, fs.readFileSync(file)]))
+  const mutations = [
+    ['canonical', value => value, true],
+    ['crlf', value => value.replaceAll('\n', '\r\n'), false],
+    ['missing-final-lf', value => value.slice(0, -1), false],
+    ['extra-final-lf', value => value + '\n', false],
+    ['nul', value => value.replace('{', '{\0'), false],
+    ['interior-blank', value => value.replace('{\n', '{\n\n'), false],
+    ['extra-document', value => value + '{}\n', false],
+  ]
+  for (const [name, mutate, accepted] of mutations) {
+    for (const [file, bytes] of original) fs.writeFileSync(file, mutate(bytes.toString('utf8')))
+    const before = new Map([...original.keys()].map(file => [file, fs.readFileSync(file)]))
+    const command = [
+      `. ${psLiteral(LIBRARY_PS1)}`,
+      `$root = ${psLiteral(fixture.root)}`,
+      "try { $entries = Read-IdemManifestEntries -ConfigRoot $root; $manifestOk = $entries.Count -eq 1 } catch { $manifestOk = $false }",
+      '$receiptResult = Read-UninstallReceipt -ConfigRoot $root',
+      "$receiptOk = $receiptResult -is [hashtable] -and $receiptResult.Nonce -ceq 'receipt-lifecycle-test'",
+      `if ($manifestOk -ne $${accepted} -or $receiptOk -ne $${accepted}) { throw 'unexpected grammar admission: ${name}' }`,
+    ].join('; ')
+    const completed = childProcess.spawnSync(POWERSHELL, [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command,
+    ], { encoding: 'utf8', timeout: 30000 })
+    assert.equal(completed.status, 0, `${name}\n${completed.stdout}\n${completed.stderr}`)
+    for (const [file, bytes] of before) assert.deepEqual(fs.readFileSync(file), bytes, 'parsing must not rewrite receipt evidence')
+    assert.equal(fs.readFileSync(fixture.managed, 'utf8'), 'installed Codex payload\n')
+  }
+})
+
 test('Git Bash Codex uninstall preserves drift and relinquishes receipt ownership', {
   skip: !HAS_BASH,
 }, t => {
