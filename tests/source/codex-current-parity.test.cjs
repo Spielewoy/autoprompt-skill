@@ -10,6 +10,14 @@ const test = require('node:test')
 const root = path.resolve(__dirname, '..', '..')
 const castingTool = path.join(root, 'agents', 'codex', 'workflow', 'codex-agent-casting.js')
 const profileTool = path.join(root, 'agents', 'codex', 'workflow', 'codex-agent-profile.js')
+const { deriveProfileLimits, relativeConfigPath } = require('../../agents/codex/workflow/codex-agent-profile.js')
+
+test('private profile accepts dotted descendants and rejects parent escapes', () => {
+  const profile = path.join(os.tmpdir(), 'autoprompt-profile', 'config.toml')
+  const directory = path.dirname(profile)
+  assert.equal(relativeConfigPath(profile, path.join(directory, '..agents'), 'worker.toml'), '..agents/worker.toml')
+  assert.throws(() => relativeConfigPath(profile, path.dirname(directory), 'worker.toml'), /descendants/)
+})
 
 function runNode(script, args, options = {}) {
   return spawnSync(process.execPath, [script, ...args], {
@@ -87,8 +95,8 @@ test('profile writes only the canonical concurrency key and verifies determinist
 
   const expectedPrefix = [
     '[agents]',
-    'max_depth = 10',
-    'max_concurrent_threads_per_session = 10',
+    'max_depth = 1',
+    'max_concurrent_threads_per_session = 1',
     '',
   ].join('\n')
   const written = fs.readFileSync(profilePath, 'utf8')
@@ -114,6 +122,39 @@ test('profile writes only the canonical concurrency key and verifies determinist
   const legacyVerify = runNode(profileTool, verifyArgs)
   assert.notEqual(legacyVerify.status, 0)
   assert.match(legacyVerify.stderr, /profile .* casting manifest|concurrency/i)
+})
+
+test('profile limits stay route-pending until classification and use route caps as ceilings', () => {
+  assert.deepEqual(deriveProfileLimits(), {
+    route: null,
+    status: 'ROUTE_PENDING',
+    maxDepth: 1,
+    maxConcurrentThreads: 1,
+  })
+  assert.deepEqual(deriveProfileLimits({ route: 'DIRECT', maxSubs: 99 }), {
+    route: 'DIRECT',
+    status: 'ROUTE_BOUND',
+    maxDepth: 2,
+    maxConcurrentThreads: 3,
+  })
+  assert.deepEqual(deriveProfileLimits({ route: 'LIGHT', maxSubs: 2 }), {
+    route: 'LIGHT',
+    status: 'ROUTE_BOUND',
+    maxDepth: 3,
+    maxConcurrentThreads: 2,
+  })
+  assert.deepEqual(deriveProfileLimits({ route: 'ROADMAP', maxSubs: 99 }), {
+    route: 'ROADMAP',
+    status: 'ROUTE_BOUND',
+    maxDepth: 4,
+    maxConcurrentThreads: 5,
+  })
+  assert.deepEqual(deriveProfileLimits({ route: 'ROADMAP', maxSubs: 99, userLiveCeiling: 10 }), {
+    route: 'ROADMAP',
+    status: 'ROUTE_BOUND',
+    maxDepth: 4,
+    maxConcurrentThreads: 9,
+  })
 })
 
 test('profile ignores the global Codex cast but still rejects project role collisions', t => {

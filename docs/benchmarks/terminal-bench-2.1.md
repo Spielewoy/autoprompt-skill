@@ -1,5 +1,7 @@
 # Terminal-Bench 2.1
 
+These results are for **Autoprompt version 1**. Version 2 benchmarks will follow.
+
 ## Result
 
 | Run | Solved | Failed | Score |

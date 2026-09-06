@@ -13,6 +13,15 @@ const BASH = process.platform === 'win32'
   ? 'C:\\Program Files\\Git\\bin\\bash.exe'
   : 'bash'
 const POWERSHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
+const POWERSHELL_AVAILABLE = childProcess.spawnSync(
+  POWERSHELL,
+  ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'],
+  { encoding: 'utf8' },
+).status === 0
+const LIFECYCLE_PORTS = Object.freeze([
+  'shell',
+  ...(POWERSHELL_AVAILABLE ? ['powershell'] : []),
+])
 const NODE_DIRECTORY = path.dirname(process.execPath)
 const PYTHON_DIRECTORY = path.dirname(childProcess.spawnSync(
   'python',
@@ -646,7 +655,7 @@ test('POSIX lifecycle installs, diagnoses, repairs, and removes each new harness
 test('forged receipts cannot make either uninstall port delete outside files', {
   timeout: 600000,
 }, () => {
-  for (const port of ['shell', 'powershell']) {
+  for (const port of LIFECYCLE_PORTS) {
     for (const provider of Object.keys(PROVIDERS)) {
       const context = makeContext(`${provider}-forged-${port}`)
       try {
@@ -704,7 +713,7 @@ test('forged receipts cannot make either uninstall port delete outside files', {
 test('OMP custom-root receipts cannot claim an unrecorded detached tree', {
   timeout: 600000,
 }, () => {
-  for (const port of ['shell', 'powershell']) {
+  for (const port of LIFECYCLE_PORTS) {
     const context = makeContext(`omp-unrecorded-detached-${port}`)
     const detached = path.join(
       context.home,
@@ -846,13 +855,17 @@ test('Linux and macOS simulations complete default-root install, doctor, and uni
 
 test('Claude ownership does not block a first detached OMP install in a shared root', {
   timeout: 1200000,
-}, () => {
+}, t => {
   const requestedPort = process.env.AUTOPROMPT_TEST_PORT
   assert.ok(
     !requestedPort || ['shell', 'powershell'].includes(requestedPort),
     `unsupported AUTOPROMPT_TEST_PORT: ${requestedPort}`,
   )
-  const ports = requestedPort ? [requestedPort] : ['shell', 'powershell']
+  if (requestedPort === 'powershell' && !POWERSHELL_AVAILABLE) {
+    t.skip(`${POWERSHELL} is not available`)
+    return
+  }
+  const ports = requestedPort ? [requestedPort] : LIFECYCLE_PORTS
   for (const port of ports) {
     const context = makeContext(`claude-before-detached-omp-${port}`)
     const nativeRoot = path.join(context.home, '.omp-after-claude', 'agent')
@@ -1282,7 +1295,7 @@ test('Bash accepts and uninstalls a PowerShell OMP split-root receipt', {
 test('OMP detached-to-self-contained reinstall requires uninstall first in both ports', {
   timeout: 900000,
 }, () => {
-  for (const port of ['shell', 'powershell']) {
+  for (const port of LIFECYCLE_PORTS) {
     const context = makeContext(`omp-layout-transition-${port}`)
     const nativeRoot = path.join(context.home, '.omp-transition', 'agent')
     const detachedRole = nativeTarget('omp', nativeRoot)
@@ -1406,7 +1419,7 @@ test('OMP detached-to-self-contained reinstall requires uninstall first in both 
 test('OMP self-contained-to-detached reinstall requires uninstall first in both ports', {
   timeout: 900000,
 }, () => {
-  for (const port of ['shell', 'powershell']) {
+  for (const port of LIFECYCLE_PORTS) {
     const context = makeContext(`omp-inverse-layout-transition-${port}`)
     const nativeRoot = path.join(context.home, '.omp-inverse-transition', 'agent')
     const rootLocalRole = nativeTarget('omp', context.customRoot)
@@ -1506,13 +1519,17 @@ test('OMP self-contained-to-detached reinstall requires uninstall first in both 
 
 test('OMP split-root receipts reject detached metadata and migrate legacy state', {
   timeout: 900000,
-}, () => {
+}, t => {
   const requestedPort = process.env.AUTOPROMPT_TEST_PORT
   assert.ok(
     !requestedPort || ['shell', 'powershell'].includes(requestedPort),
     `unsupported AUTOPROMPT_TEST_PORT: ${requestedPort}`,
   )
-  const ports = requestedPort ? [requestedPort] : ['shell', 'powershell']
+  if (requestedPort === 'powershell' && !POWERSHELL_AVAILABLE) {
+    t.skip(`${POWERSHELL} is not available`)
+    return
+  }
+  const ports = requestedPort ? [requestedPort] : LIFECYCLE_PORTS
   for (const port of ports) {
     const context = makeContext(`omp-split-root-${port}`)
     const nativeRoot = path.join(context.home, '.omp-audit', 'agent')
@@ -1730,31 +1747,33 @@ test('OMP roots follow profiles and preserve native task-agent discovery with an
       `${bashHome}/.omp-audit/profiles/work/agent/agents`,
     ])
 
-    const psLibrary = path.join(ROOT, 'scripts', 'install', 'lib', 'install-lib.ps1')
-    const psCommand = [
-      `$env:HOME = ${powershellLiteral(home)}`,
-      `$env:USERPROFILE = ${powershellLiteral(home)}`,
-      `$env:PI_CODING_AGENT_DIR = ${powershellLiteral(custom)}`,
-      "$env:PI_CONFIG_DIR = '.omp-audit'",
-      'Remove-Item Env:OMP_PROFILE, Env:PI_PROFILE, Env:AUTOPROMPT_INSTALL_ROOT -ErrorAction SilentlyContinue',
-      `. ${powershellLiteral(psLibrary)}`,
-      '[Console]::Out.WriteLine((Get-AutopromptConfigRoot -Name omp))',
-      '[Console]::Out.WriteLine((Get-AutopromptNativeAgentsRoot -Name omp))',
-      "$env:OMP_PROFILE = 'work'",
-      "$env:PI_PROFILE = 'legacy'",
-      '[Console]::Out.WriteLine((Get-AutopromptConfigRoot -Name omp))',
-      '[Console]::Out.WriteLine((Get-AutopromptNativeAgentsRoot -Name omp))',
-    ].join('; ')
-    const psResult = run(POWERSHELL, [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psCommand,
-    ])
-    assert.equal(psResult.status, 0, psResult.stderr)
-    assert.deepEqual(psResult.stdout.trim().split(/\r?\n/), [
-      custom,
-      path.join(home, '.omp-audit', 'agent', 'agents'),
-      path.join(home, '.omp-audit', 'profiles', 'work', 'agent'),
-      path.join(home, '.omp-audit', 'profiles', 'work', 'agent', 'agents'),
-    ])
+    if (POWERSHELL_AVAILABLE) {
+      const psLibrary = path.join(ROOT, 'scripts', 'install', 'lib', 'install-lib.ps1')
+      const psCommand = [
+        `$env:HOME = ${powershellLiteral(home)}`,
+        `$env:USERPROFILE = ${powershellLiteral(home)}`,
+        `$env:PI_CODING_AGENT_DIR = ${powershellLiteral(custom)}`,
+        "$env:PI_CONFIG_DIR = '.omp-audit'",
+        'Remove-Item Env:OMP_PROFILE, Env:PI_PROFILE, Env:AUTOPROMPT_INSTALL_ROOT -ErrorAction SilentlyContinue',
+        `. ${powershellLiteral(psLibrary)}`,
+        '[Console]::Out.WriteLine((Get-AutopromptConfigRoot -Name omp))',
+        '[Console]::Out.WriteLine((Get-AutopromptNativeAgentsRoot -Name omp))',
+        "$env:OMP_PROFILE = 'work'",
+        "$env:PI_PROFILE = 'legacy'",
+        '[Console]::Out.WriteLine((Get-AutopromptConfigRoot -Name omp))',
+        '[Console]::Out.WriteLine((Get-AutopromptNativeAgentsRoot -Name omp))',
+      ].join('; ')
+      const psResult = run(POWERSHELL, [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psCommand,
+      ])
+      assert.equal(psResult.status, 0, psResult.stderr)
+      assert.deepEqual(psResult.stdout.trim().split(/\r?\n/), [
+        custom,
+        path.join(home, '.omp-audit', 'agent', 'agents'),
+        path.join(home, '.omp-audit', 'profiles', 'work', 'agent'),
+        path.join(home, '.omp-audit', 'profiles', 'work', 'agent', 'agents'),
+      ])
+    }
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true })
   }
@@ -1777,19 +1796,21 @@ test('OMP root resolvers reject profile traversal and platform-reserved names', 
       assert.notEqual(bashResult.status, 0, `bash accepted ${invalidProfile}`)
       assert.match(`${bashResult.stdout}\n${bashResult.stderr}`, /invalid-omp-profile/i)
 
-      const psLibrary = path.join(ROOT, 'scripts', 'install', 'lib', 'install-lib.ps1')
-      const psCommand = [
-        `$env:USERPROFILE = ${powershellLiteral(home)}`,
-        `$env:OMP_PROFILE = ${powershellLiteral(invalidProfile)}`,
-        'Remove-Item Env:PI_PROFILE, Env:AUTOPROMPT_INSTALL_ROOT -ErrorAction SilentlyContinue',
-        `. ${powershellLiteral(psLibrary)}`,
-        '[Console]::Out.WriteLine((Get-AutopromptConfigRoot -Name omp))',
-      ].join('; ')
-      const psResult = run(POWERSHELL, [
-        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psCommand,
-      ])
-      assert.notEqual(psResult.status, 0, `PowerShell accepted ${invalidProfile}`)
-      assert.match(`${psResult.stdout}\n${psResult.stderr}`, /Invalid OMP profile/i)
+      if (POWERSHELL_AVAILABLE) {
+        const psLibrary = path.join(ROOT, 'scripts', 'install', 'lib', 'install-lib.ps1')
+        const psCommand = [
+          `$env:USERPROFILE = ${powershellLiteral(home)}`,
+          `$env:OMP_PROFILE = ${powershellLiteral(invalidProfile)}`,
+          'Remove-Item Env:PI_PROFILE, Env:AUTOPROMPT_INSTALL_ROOT -ErrorAction SilentlyContinue',
+          `. ${powershellLiteral(psLibrary)}`,
+          '[Console]::Out.WriteLine((Get-AutopromptConfigRoot -Name omp))',
+        ].join('; ')
+        const psResult = run(POWERSHELL, [
+          '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psCommand,
+        ])
+        assert.notEqual(psResult.status, 0, `PowerShell accepted ${invalidProfile}`)
+        assert.match(`${psResult.stdout}\n${psResult.stderr}`, /Invalid OMP profile/i)
+      }
     }
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true })
@@ -1799,7 +1820,7 @@ test('OMP root resolvers reject profile traversal and platform-reserved names', 
 test('dedicated repair restores native files for every new harness in both ports', {
   timeout: 2400000,
 }, () => {
-  for (const port of ['shell', 'powershell']) {
+  for (const port of LIFECYCLE_PORTS) {
     for (const provider of Object.keys(PROVIDERS)) {
       const context = makeContext(`${provider}-${port}`)
       try {
@@ -1828,7 +1849,7 @@ test('dedicated repair restores native files for every new harness in both ports
 test('OMP and Reasonix lifecycle configure recursion depth and restore the prior value', {
   timeout: 600000,
 }, () => {
-  for (const port of ['shell', 'powershell']) {
+  for (const port of LIFECYCLE_PORTS) {
     for (const provider of ['omp', 'reasonix']) {
       const context = makeContext(`${provider}-depth-${port}`)
       const config = providerConfig(provider, context.customRoot)

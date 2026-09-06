@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.dev/schemas/benchmark-run-manifest.v2.json",
+  "title": "Autoprompt preregistered benchmark run manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "manifestId", "benchmarkId", "createdAt", "arms", "repetitions", "tasks", "budgets", "resources", "pricingRef", "taskCatalogRef", "runLease", "canaries", "plannedAttempts", "executionOrder", "manifestDigest", "signature"],
+  "properties": {
+    "schemaVersion": { "const": "benchmark-run-manifest.v2" },
+    "manifestId": { "$ref": "#/$defs/nonEmpty" },
+    "benchmarkId": { "$ref": "#/$defs/nonEmpty" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "arms": { "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true, "items": { "$ref": "#/$defs/arm" } },
+    "repetitions": { "type": "integer", "minimum": 3 },
+    "tasks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/task" } },
+    "budgets": { "$ref": "#/$defs/budgets" },
+    "resources": { "$ref": "#/$defs/resources" },
+    "pricingRef": { "$ref": "#/$defs/pricingRef" },
+    "taskCatalogRef": { "$ref": "#/$defs/taskCatalogRef" },
+    "runLease": { "$ref": "#/$defs/runLease" },
+    "canaries": { "$ref": "#/$defs/canaries" },
+    "plannedAttempts": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/scoredAttempt" } },
+    "executionOrder": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } },
+    "manifestDigest": { "$ref": "#/$defs/sha256" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "portablePath": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*\\\\)(?!.*[\\u0000-\\u001F\\u007F:])(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*(?:^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Ll][Oo][Cc][Kk]\\$|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.[^/]*)?(?:/|$))(?!.*(?:^|/)[^/]*[. ](?:/|$))[^/]+(?:/[^/]+)*$" },
+    "blob": { "type": "object", "additionalProperties": false, "required": ["relativePath", "sha256", "bytes"], "properties": { "relativePath": { "$ref": "#/$defs/portablePath" }, "sha256": { "$ref": "#/$defs/sha256" }, "bytes": { "type": "integer", "minimum": 0 } } },
+    "scoredExecution": { "type": "object", "additionalProperties": false, "required": ["argv", "environment", "toolchain"], "properties": { "argv": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/nonEmpty" } }, "environment": { "$ref": "#/$defs/blob" }, "toolchain": { "$ref": "#/$defs/blob" } } },
+    "attemptExecution": { "type": "object", "additionalProperties": false, "required": ["argv", "input", "environment", "toolchain"], "properties": { "argv": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/nonEmpty" } }, "input": { "$ref": "#/$defs/blob" }, "environment": { "$ref": "#/$defs/blob" }, "toolchain": { "$ref": "#/$defs/blob" } } },
+    "arm": { "type": "object", "additionalProperties": false, "required": ["armId", "role", "producer", "execution"], "properties": { "armId": { "$ref": "#/$defs/nonEmpty" }, "role": { "enum": ["base", "current", "redesign"] }, "producer": { "$ref": "#/$defs/producer" }, "execution": { "$ref": "#/$defs/scoredExecution" } } },
+    "producer": { "type": "object", "additionalProperties": false, "required": ["name", "version", "buildDigest"], "properties": { "name": { "$ref": "#/$defs/nonEmpty" }, "version": { "$ref": "#/$defs/nonEmpty" }, "buildDigest": { "$ref": "#/$defs/sha256" } } },
+    "task": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["taskId", "included", "pairedOrder", "input"], "properties": { "taskId": { "$ref": "#/$defs/nonEmpty" }, "included": { "const": true }, "pairedOrder": { "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } }, "input": { "$ref": "#/$defs/blob" } } },
+        { "type": "object", "additionalProperties": false, "required": ["taskId", "included", "exclusionReason"], "properties": { "taskId": { "$ref": "#/$defs/nonEmpty" }, "included": { "const": false }, "exclusionReason": { "$ref": "#/$defs/nonEmpty" } } }
+      ]
+    },
+    "budgets": { "type": "object", "additionalProperties": false, "required": ["agentTimeoutMs", "verifierTimeoutMs", "hostKillMs", "maxTokens"], "properties": { "agentTimeoutMs": { "type": "integer", "minimum": 1 }, "verifierTimeoutMs": { "type": "integer", "minimum": 1 }, "hostKillMs": { "type": "integer", "minimum": 1 }, "maxTokens": { "type": "integer", "minimum": 1 } } },
+    "resources": { "type": "object", "additionalProperties": false, "required": ["instanceId", "bucket", "runRoot", "containerNamespace", "trialPrefix"], "properties": { "instanceId": { "$ref": "#/$defs/nonEmpty" }, "bucket": { "$ref": "#/$defs/nonEmpty" }, "runRoot": { "$ref": "#/$defs/nonEmpty" }, "containerNamespace": { "$ref": "#/$defs/nonEmpty" }, "trialPrefix": { "$ref": "#/$defs/nonEmpty" } } },
+    "pricingRef": { "type": "object", "additionalProperties": false, "required": ["pricingId", "digest"], "properties": { "pricingId": { "$ref": "#/$defs/nonEmpty" }, "digest": { "$ref": "#/$defs/sha256" } } },
+    "taskCatalogRef": { "type": "object", "additionalProperties": false, "required": ["catalogId", "digest", "taskCount", "issuer", "keyId", "attestationDigest", "fixtureOnly"], "properties": { "catalogId": { "$ref": "#/$defs/nonEmpty" }, "digest": { "$ref": "#/$defs/sha256" }, "taskCount": { "type": "integer", "minimum": 1 }, "issuer": { "$ref": "#/$defs/nonEmpty" }, "keyId": { "$ref": "#/$defs/nonEmpty" }, "attestationDigest": { "$ref": "#/$defs/sha256" }, "fixtureOnly": { "type": "boolean" } } },
+    "runLease": { "type": "object", "additionalProperties": false, "required": ["nonce", "issuer", "validFrom", "validUntil"], "properties": { "nonce": { "$ref": "#/$defs/nonEmpty" }, "issuer": { "$ref": "#/$defs/nonEmpty" }, "validFrom": { "type": "string", "format": "date-time" }, "validUntil": { "type": "string", "format": "date-time" } } },
+    "canaries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stages", "midAfterScoredAttempts", "definitions"],
+      "properties": {
+        "stages": { "const": ["pre", "mid", "post"] },
+        "midAfterScoredAttempts": { "type": "integer", "minimum": 1 },
+        "definitions": {
+          "type": "array", "minItems": 5, "items": { "$ref": "#/$defs/canary" },
+          "allOf": [
+            { "contains": { "properties": { "polarity": { "const": "positive" }, "checks": { "allOf": [{ "contains": { "const": "model-version" } }, { "contains": { "const": "auth" } }, { "contains": { "const": "tools" } }, { "contains": { "const": "verifier" } }, { "contains": { "const": "subagents" } }, { "contains": { "const": "transcript" } }, { "contains": { "const": "upload" } }] } }, "required": ["polarity", "checks"] } },
+            { "contains": { "properties": { "expectedDiagnosis": { "const": "WRONG_MODEL" } }, "required": ["expectedDiagnosis"] } },
+            { "contains": { "properties": { "expectedDiagnosis": { "const": "MISSING_SUBAGENT_TRACE" } }, "required": ["expectedDiagnosis"] } },
+            { "contains": { "properties": { "expectedDiagnosis": { "const": "BROKEN_VERIFIER" } }, "required": ["expectedDiagnosis"] } },
+            { "contains": { "properties": { "expectedDiagnosis": { "const": "UPLOAD_DENIED" } }, "required": ["expectedDiagnosis"] } }
+          ]
+        }
+      }
+    },
+    "canary": { "type": "object", "additionalProperties": false, "required": ["canaryId", "polarity", "checks", "execution"], "properties": { "canaryId": { "$ref": "#/$defs/nonEmpty" }, "polarity": { "enum": ["positive", "negative"] }, "checks": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } }, "expectedDiagnosis": { "enum": ["WRONG_MODEL", "MISSING_SUBAGENT_TRACE", "BROKEN_VERIFIER", "UPLOAD_DENIED"] }, "execution": { "$ref": "#/$defs/canaryExecution" } }, "allOf": [{ "if": { "properties": { "polarity": { "const": "negative" } }, "required": ["polarity"] }, "then": { "required": ["expectedDiagnosis"], "properties": { "execution": { "properties": { "faultInjector": { "$ref": "#/$defs/faultInjector" } }, "required": ["faultInjector"] } } }, "else": { "not": { "required": ["expectedDiagnosis"] }, "properties": { "execution": { "properties": { "faultInjector": { "type": "null" } } } } } }] },
+    "canaryExecution": { "type": "object", "additionalProperties": false, "required": ["argv", "input", "fixture", "environment", "toolchain", "faultInjector"], "properties": { "argv": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/nonEmpty" } }, "input": { "$ref": "#/$defs/blob" }, "fixture": { "$ref": "#/$defs/blob" }, "environment": { "$ref": "#/$defs/blob" }, "toolchain": { "$ref": "#/$defs/blob" }, "faultInjector": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/faultInjector" }] } } },
+    "faultInjector": { "type": "object", "additionalProperties": false, "required": ["name", "argv", "artifact"], "properties": { "name": { "enum": ["wrong-model", "missing-subagent-trace", "broken-verifier", "upload-denied"] }, "argv": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/nonEmpty" } }, "artifact": { "$ref": "#/$defs/blob" } } },
+    "scoredAttempt": { "type": "object", "additionalProperties": false, "required": ["attemptId", "attemptClass", "taskId", "armId", "repetition", "pairedOrder", "execution"], "properties": { "attemptId": { "$ref": "#/$defs/nonEmpty" }, "attemptClass": { "const": "scored" }, "taskId": { "$ref": "#/$defs/nonEmpty" }, "armId": { "$ref": "#/$defs/nonEmpty" }, "repetition": { "type": "integer", "minimum": 1 }, "pairedOrder": { "type": "integer", "minimum": 1 }, "execution": { "$ref": "#/$defs/attemptExecution" } } },
+    "signature": { "type": "object", "additionalProperties": false, "required": ["algorithm", "issuer", "keyId", "value"], "properties": { "algorithm": { "const": "ed25519" }, "issuer": { "$ref": "#/$defs/nonEmpty" }, "keyId": { "$ref": "#/$defs/nonEmpty" }, "value": { "type": "string", "pattern": "^[A-Za-z0-9+/]{86}==$" } } }
+  }
+}

@@ -1,0 +1,482 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/request-envelope-entry.schema.json",
+  "title": "One Autoprompt v2 request envelope JSONL entry",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/header"
+    },
+    {
+      "$ref": "#/$defs/userMessage"
+    },
+    {
+      "$ref": "#/$defs/steering"
+    },
+    {
+      "$ref": "#/$defs/objectRegistration"
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "base": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "entryType",
+        "runId",
+        "sequence",
+        "previousEntryHash",
+        "entryHash",
+        "recordedAt"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "2.0.0"
+        },
+        "entryType": {
+          "enum": [
+            "envelope-header",
+            "user-message",
+            "steering-edge",
+            "object-registration"
+          ]
+        },
+        "runId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "previousEntryHash": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "entryHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "recordedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "objectRef": {
+      "type": "object",
+      "required": [
+        "objectId",
+        "sha256",
+        "byteLength",
+        "mediaType",
+        "storagePath"
+      ],
+      "properties": {
+        "objectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "byteLength": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mediaType": {
+          "type": "string",
+          "minLength": 1
+        },
+        "storagePath": {
+          "type": "string",
+          "pattern": "^request/objects/sha256/[a-f0-9]{64}$"
+        },
+        "purpose": {
+          "enum": [
+            "exact-invocation",
+            "parsed-controls",
+            "canonical-request",
+            "message-content",
+            "attachment"
+          ]
+        },
+        "derivedFromSha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bindingRef": {
+          "type": "string",
+          "pattern": "^(?:exact-invocation|parsed-controls|canonical-request):[a-f0-9]{64}$"
+        },
+        "derivation": {
+          "type": "object",
+          "required": [
+            "method",
+            "sourceRole",
+            "sourceSha256"
+          ],
+          "properties": {
+            "method": {
+              "enum": [
+                "captured-exact-bytes",
+                "parse-controls-v2",
+                "canonicalize-request-v2"
+              ]
+            },
+            "sourceRole": {
+              "oneOf": [
+                {
+                  "const": "exact-invocation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sourceSha256": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/sha256"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "sourceApplication": {
+          "type": "string"
+        },
+        "sourceReference": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "contentBlock": {
+      "type": "object",
+      "required": [
+        "blockId",
+        "kind",
+        "mediaType",
+        "byteLength",
+        "sha256",
+        "exactBytesBase64"
+      ],
+      "properties": {
+        "blockId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "text",
+            "structured",
+            "attachment",
+            "application-reference"
+          ]
+        },
+        "mediaType": {
+          "type": "string",
+          "minLength": 1
+        },
+        "byteLength": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "exactBytesBase64": {
+          "type": "string",
+          "contentEncoding": "base64"
+        },
+        "objectRef": {
+          "$ref": "#/$defs/objectRef"
+        },
+        "readableText": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "header": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "envelopeId",
+            "exactInvocationObject",
+            "parsedControlsObject",
+            "canonicalRequestObject"
+          ],
+          "properties": {
+            "entryType": {
+              "const": "envelope-header"
+            },
+            "sequence": {
+              "const": 0
+            },
+            "previousEntryHash": {
+              "type": "null"
+            },
+            "envelopeId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "exactInvocationObject": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/objectRef"
+                },
+                {
+                  "required": [
+                    "purpose",
+                    "derivedFromSha256",
+                    "bindingRef",
+                    "derivation"
+                  ],
+                  "properties": {
+                    "objectId": {
+                      "pattern": "^exact-invocation:[A-Za-z0-9._:-]+$"
+                    },
+                    "purpose": {
+                      "const": "exact-invocation"
+                    },
+                    "derivedFromSha256": {
+                      "type": "null"
+                    },
+                    "bindingRef": {
+                      "pattern": "^exact-invocation:[a-f0-9]{64}$"
+                    },
+                    "derivation": {
+                      "properties": {
+                        "method": {
+                          "const": "captured-exact-bytes"
+                        },
+                        "sourceRole": {
+                          "type": "null"
+                        },
+                        "sourceSha256": {
+                          "type": "null"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "parsedControlsObject": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/objectRef"
+                },
+                {
+                  "required": [
+                    "purpose",
+                    "derivedFromSha256",
+                    "bindingRef",
+                    "derivation"
+                  ],
+                  "properties": {
+                    "objectId": {
+                      "pattern": "^parsed-controls:[A-Za-z0-9._:-]+$"
+                    },
+                    "purpose": {
+                      "const": "parsed-controls"
+                    },
+                    "derivedFromSha256": {
+                      "$ref": "#/$defs/sha256"
+                    },
+                    "bindingRef": {
+                      "pattern": "^parsed-controls:[a-f0-9]{64}$"
+                    },
+                    "derivation": {
+                      "properties": {
+                        "method": {
+                          "const": "parse-controls-v2"
+                        },
+                        "sourceRole": {
+                          "const": "exact-invocation"
+                        },
+                        "sourceSha256": {
+                          "$ref": "#/$defs/sha256"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "canonicalRequestObject": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/objectRef"
+                },
+                {
+                  "required": [
+                    "purpose",
+                    "derivedFromSha256",
+                    "bindingRef",
+                    "derivation"
+                  ],
+                  "properties": {
+                    "objectId": {
+                      "pattern": "^canonical-request:[A-Za-z0-9._:-]+$"
+                    },
+                    "purpose": {
+                      "const": "canonical-request"
+                    },
+                    "derivedFromSha256": {
+                      "$ref": "#/$defs/sha256"
+                    },
+                    "bindingRef": {
+                      "pattern": "^canonical-request:[a-f0-9]{64}$"
+                    },
+                    "derivation": {
+                      "properties": {
+                        "method": {
+                          "const": "canonicalize-request-v2"
+                        },
+                        "sourceRole": {
+                          "const": "exact-invocation"
+                        },
+                        "sourceSha256": {
+                          "$ref": "#/$defs/sha256"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "userMessage": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "messageId",
+            "orderedContentBlocks"
+          ],
+          "properties": {
+            "entryType": {
+              "const": "user-message"
+            },
+            "messageId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "orderedContentBlocks": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/contentBlock"
+              }
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "steering": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "steeringId",
+            "operation",
+            "targetMessageIds",
+            "orderedContentBlocks"
+          ],
+          "properties": {
+            "entryType": {
+              "const": "steering-edge"
+            },
+            "steeringId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "operation": {
+              "enum": [
+                "ADD",
+                "REPLACE"
+              ]
+            },
+            "targetMessageIds": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "orderedContentBlocks": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/contentBlock"
+              }
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "objectRegistration": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "object"
+          ],
+          "properties": {
+            "entryType": {
+              "const": "object-registration"
+            },
+            "object": {
+              "$ref": "#/$defs/objectRef"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

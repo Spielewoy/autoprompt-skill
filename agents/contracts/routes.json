@@ -1,0 +1,1183 @@
+{
+  "$schema": "./schemas/routes.schema.json",
+  "kind": "autoprompt-route-contract",
+  "contractVersion": "2.0.0",
+  "defaultRoute": null,
+  "predicateLanguage": {
+    "version": 1,
+    "operators": [
+      "all",
+      "any",
+      "eq",
+      "in",
+      "gte",
+      "gt",
+      "lte",
+      "sum-lte"
+    ],
+    "missingPathBehavior": "predicate-false"
+  },
+  "classificationInputs": [
+    "requestedEffect",
+    "successCriteria",
+    "dependency",
+    "uncertainty",
+    "reversibility",
+    "mutableResources",
+    "sideEffects",
+    "externality",
+    "confidentiality",
+    "thirdPartyImpact",
+    "targetAuthorization",
+    "costAuthority",
+    "riskAndIndependentCheckFloor",
+    "checkAndBaseline",
+    "capturedIncidentDomains",
+    "deadlineBudget",
+    "operatorMinimumRoute",
+    "transportCapability",
+    "candidateFreeze",
+    "architectureImpact",
+    "fitsLightPlan",
+    "approachNeedsShortPlanning",
+    "shortOrderUnclear"
+  ],
+  "routeFactsSchema": {
+    "type": "object",
+    "required": [
+      "schemaVersion",
+      "requestedEffect",
+      "successCriteria",
+      "dependency",
+      "uncertainty",
+      "reversibility",
+      "mutableResources",
+      "sideEffects",
+      "externality",
+      "confidentiality",
+      "thirdPartyImpact",
+      "targetAuthorization",
+      "costAuthority",
+      "riskAndIndependentCheckFloor",
+      "checkAndBaseline",
+      "capturedIncidentDomains",
+      "deadlineBudget",
+      "operatorMinimumRoute",
+      "transportCapability",
+      "candidateFreeze",
+      "missingUserInput",
+      "architectureImpact",
+      "fitsLightPlan",
+      "approachNeedsShortPlanning",
+      "shortOrderUnclear"
+    ],
+    "properties": {
+      "schemaVersion": {
+        "const": "2.0.0"
+      },
+      "requestedEffect": {
+        "enum": [
+          "inspect",
+          "report",
+          "research",
+          "decide",
+          "mutate",
+          "external-operation"
+        ]
+      },
+      "successCriteria": {
+        "enum": [
+          "ready",
+          "short-clarification",
+          "unresolved"
+        ]
+      },
+      "dependency": {
+        "type": "object",
+        "required": [
+          "shape",
+          "dependentWorkGroupCount",
+          "integrationOwnerRequired",
+          "separateDependentBodies"
+        ],
+        "properties": {
+          "shape": {
+            "enum": [
+              "bounded",
+              "independent-edits",
+              "connected",
+              "dependent-groups"
+            ]
+          },
+          "dependentWorkGroupCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "integrationOwnerRequired": {
+            "type": "boolean"
+          },
+          "separateDependentBodies": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "uncertainty": {
+        "enum": [
+          "none",
+          "reversible-technical",
+          "architecture",
+          "product-semantic"
+        ]
+      },
+      "reversibility": {
+        "enum": [
+          "fully-reversible",
+          "locally-reversible",
+          "staged-rollback-required",
+          "irreversible"
+        ]
+      },
+      "mutableResources": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": [
+            "kind",
+            "identity",
+            "shared",
+            "ownershipMode"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "file",
+                "directory",
+                "service",
+                "database",
+                "output",
+                "cache",
+                "port",
+                "external-system"
+              ]
+            },
+            "identity": {
+              "type": "string",
+              "minLength": 1
+            },
+            "shared": {
+              "type": "boolean"
+            },
+            "ownershipMode": {
+              "enum": [
+                "single-owner",
+                "ordered-transfer",
+                "isolated-copy",
+                "exclusive-lease"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "sideEffects": {
+        "type": "array",
+        "uniqueItems": true,
+        "items": {
+          "enum": [
+            "deliverable-write",
+            "build-cache-write",
+            "database-write",
+            "service-state-change",
+            "external-write",
+            "message-or-notification",
+            "permission-change",
+            "money-or-quota",
+            "destructive-change"
+          ]
+        }
+      },
+      "externality": {
+        "enum": [
+          "local-only",
+          "external-read",
+          "external-write"
+        ]
+      },
+      "confidentiality": {
+        "enum": [
+          "public",
+          "internal",
+          "confidential",
+          "restricted"
+        ]
+      },
+      "thirdPartyImpact": {
+        "enum": [
+          "none",
+          "incidental",
+          "material"
+        ]
+      },
+      "targetAuthorization": {
+        "type": "object",
+        "required": [
+          "targetIdentities",
+          "authorizedTargetIdentities",
+          "authorizationEvidenceHash",
+          "allTargetsAuthorized"
+        ],
+        "properties": {
+          "targetIdentities": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "authorizedTargetIdentities": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "authorizationEvidenceHash": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            ]
+          },
+          "allTargetsAuthorized": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "costAuthority": {
+        "type": "object",
+        "required": [
+          "mayIncurCost",
+          "estimatedCostMicrounits",
+          "limitMicrounits",
+          "approvalRequired",
+          "approvalGranted",
+          "approvalEvidenceHash",
+          "withinLimit"
+        ],
+        "properties": {
+          "mayIncurCost": {
+            "type": "boolean"
+          },
+          "estimatedCostMicrounits": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "limitMicrounits": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "approvalRequired": {
+            "type": "boolean"
+          },
+          "approvalGranted": {
+            "type": "boolean"
+          },
+          "approvalEvidenceHash": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            ]
+          },
+          "withinLimit": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "riskAndIndependentCheckFloor": {
+        "type": "object",
+        "required": [
+          "level",
+          "minimumCheckerCount",
+          "namedDistinctResponsibilities"
+        ],
+        "properties": {
+          "level": {
+            "enum": [
+              "ordinary",
+              "elevated",
+              "staged-high-impact"
+            ]
+          },
+          "minimumCheckerCount": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2
+          },
+          "namedDistinctResponsibilities": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "checkAndBaseline": {
+        "type": "object",
+        "required": [
+          "checkQuality",
+          "availableCheckKinds",
+          "baselineStatus",
+          "hiddenExternalCheck"
+        ],
+        "properties": {
+          "checkQuality": {
+            "enum": [
+              "authoritative",
+              "public",
+              "observable",
+              "short-plan",
+              "coordinated-design",
+              "unavailable"
+            ]
+          },
+          "availableCheckKinds": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "baselineStatus": {
+            "enum": [
+              "not-applicable",
+              "recorded",
+              "required-before-production",
+              "unavailable"
+            ]
+          },
+          "hiddenExternalCheck": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "capturedIncidentDomains": {
+        "type": "array",
+        "uniqueItems": true,
+        "items": {
+          "enum": [
+            "MISSION_SOURCE_CONFLICT",
+            "SIGNATURE_SEARCH",
+            "FIXTURE_PROVENANCE",
+            "HIDDEN_EXTERNAL_ORACLE",
+            "IMAGE_DATUM",
+            "DONE_RETRY_PROMOTION"
+          ]
+        }
+      },
+      "deadlineBudget": {
+        "type": "object",
+        "required": [
+          "remainingSeconds",
+          "admissionSeconds",
+          "executionReserveSeconds",
+          "verificationReserveSeconds",
+          "recoveryAndFinalizationReserveSeconds"
+        ],
+        "properties": {
+          "remainingSeconds": {
+            "type": "number",
+            "minimum": 0
+          },
+          "admissionSeconds": {
+            "type": "number",
+            "minimum": 0
+          },
+          "executionReserveSeconds": {
+            "type": "number",
+            "minimum": 0
+          },
+          "verificationReserveSeconds": {
+            "type": "number",
+            "minimum": 0
+          },
+          "recoveryAndFinalizationReserveSeconds": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "operatorMinimumRoute": {
+        "oneOf": [
+          {
+            "enum": [
+              "DIRECT",
+              "LIGHT",
+              "ROADMAP"
+            ]
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "transportCapability": {
+        "type": "object",
+        "required": [
+          "mode",
+          "taskCapabilityPreserved"
+        ],
+        "properties": {
+          "mode": {
+            "enum": [
+              "native-recursive",
+              "sequential-isolated",
+              "none"
+            ]
+          },
+          "taskCapabilityPreserved": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "candidateFreeze": {
+        "type": "object",
+        "required": [
+          "required",
+          "available",
+          "environmentCanBeBound"
+        ],
+        "properties": {
+          "required": {
+            "type": "boolean"
+          },
+          "available": {
+            "type": "boolean"
+          },
+          "environmentCanBeBound": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "missingUserInput": {
+        "type": "array",
+        "uniqueItems": true,
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "architectureImpact": {
+        "enum": [
+          "local",
+          "multi-system",
+          "public-contract"
+        ]
+      },
+      "fitsLightPlan": {
+        "type": "boolean"
+      },
+      "approachNeedsShortPlanning": {
+        "type": "boolean"
+      },
+      "shortOrderUnclear": {
+        "type": "boolean"
+      }
+    },
+    "additionalProperties": false,
+    "allOf": [
+      {
+        "if": {
+          "properties": {
+            "requestedEffect": {
+              "enum": [
+                "mutate",
+                "external-operation"
+              ]
+            }
+          },
+          "required": [
+            "requestedEffect"
+          ]
+        },
+        "then": {
+          "properties": {
+            "candidateFreeze": {
+              "properties": {
+                "required": {
+                  "const": true
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "requestedEffect": {
+              "const": "mutate"
+            }
+          },
+          "required": [
+            "requestedEffect"
+          ]
+        },
+        "then": {
+          "properties": {
+            "mutableResources": {
+              "minItems": 1
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "requestedEffect": {
+              "const": "external-operation"
+            }
+          },
+          "required": [
+            "requestedEffect"
+          ]
+        },
+        "then": {
+          "properties": {
+            "externality": {
+              "const": "external-write"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "semanticValidationRules": [
+    {
+      "id": "ROUTE-FACT-001",
+      "validator": "unique-mutable-resource-identities",
+      "errorMessage": "mutableResources identities must be unique per kind"
+    },
+    {
+      "id": "ROUTE-FACT-002",
+      "validator": "authorized-targets-are-exact-subset",
+      "errorMessage": "authorizedTargetIdentities must be a subset of exact targetIdentities"
+    },
+    {
+      "id": "ROUTE-FACT-003",
+      "validator": "target-authority-evidence-is-hash-bound",
+      "errorMessage": "target authorization requires hash-bound authority evidence"
+    },
+    {
+      "id": "ROUTE-FACT-004",
+      "validator": "external-or-material-work-names-targets",
+      "errorMessage": "external, material third-party, or restricted-data work requires exact authorized target identities"
+    },
+    {
+      "id": "ROUTE-FACT-005",
+      "validator": "cost-free-claim-is-zero-and-unapproved",
+      "errorMessage": "cost-free work must carry zero cost and no approval claim"
+    },
+    {
+      "id": "ROUTE-FACT-006",
+      "validator": "granted-cost-approval-is-hash-bound",
+      "errorMessage": "cost approval requires hash-bound authority evidence"
+    },
+    {
+      "id": "ROUTE-FACT-007",
+      "validator": "cost-incurrence-declares-side-effect",
+      "errorMessage": "cost-incurring work must declare the money-or-quota side effect"
+    }
+  ],
+  "capabilityRequirements": {
+    "always": ["toolOutputCapture"],
+    "byRequestedEffect": {
+      "inspect": [],
+      "report": [],
+      "research": [],
+      "decide": [],
+      "mutate": ["stableChildIdentity", "cancellation", "isolatedChecking", "processOwnership"],
+      "external-operation": ["stableChildIdentity", "cancellation", "isolatedChecking", "processOwnership", "eventStreaming"]
+    },
+    "byRoute": {
+      "DIRECT": [],
+      "LIGHT": [],
+      "ROADMAP": ["topologyEnforcement", "sameContextContinuation"]
+    },
+    "conditional": [
+      { "condition": "external-write", "requires": ["eventStreaming"] },
+      { "condition": "two-independent-checkers", "requires": ["isolatedChecking"] },
+      { "condition": "shared-mutable-resource", "requires": ["processOwnership"] }
+    ]
+  },
+  "preWork": {
+    "missingIndispensableInput": "WAITING_USER",
+    "recommendedRouteWhenWaiting": null,
+    "needsUserIsRoute": false
+  },
+  "routeAnalyst": {
+    "count": 1,
+    "timeLimitSeconds": 120,
+    "readOnly": true,
+    "mayDispatch": false,
+    "mayRunBroadChecks": false,
+    "transcriptPath": "route/transcript.jsonl",
+    "readableTranscriptPath": "route/transcript.md",
+    "recommendationPath": "route/recommendation.json",
+    "outputSchema": "agents/contracts/schemas/route-recommendation.schema.json"
+  },
+  "runOwnerDecision": {
+    "timeLimitSeconds": 240,
+    "decisionPath": "route/decision.json",
+    "readableDecisionPath": "route/decision.md",
+    "schema": "agents/contracts/schemas/route-decision.schema.json",
+    "invalidCorrectionLimit": 1,
+    "timeoutOutcome": "ROUTE_DECISION_TIMEOUT",
+    "invalidOutcome": "ROUTE_DECISION_INVALID"
+  },
+  "precedenceTable": [
+    {
+      "order": 1,
+      "when": {
+        "op": "any",
+        "predicates": [
+          {
+            "op": "gt",
+            "path": "missingUserInput.length",
+            "value": 0
+          },
+          {
+            "op": "eq",
+            "path": "targetAuthorization.allTargetsAuthorized",
+            "value": false
+          },
+          {
+            "op": "eq",
+            "path": "costAuthority.withinLimit",
+            "value": false
+          },
+          {
+            "op": "all",
+            "predicates": [
+              {
+                "op": "eq",
+                "path": "costAuthority.approvalRequired",
+                "value": true
+              },
+              {
+                "op": "eq",
+                "path": "costAuthority.approvalGranted",
+                "value": false
+              }
+            ]
+          }
+        ]
+      },
+      "result": "WAITING_USER"
+    },
+    {
+      "order": 2,
+      "when": {
+        "op": "any",
+        "predicates": [
+          {
+            "op": "eq",
+            "path": "transportCapability.taskCapabilityPreserved",
+            "value": false
+          },
+          {
+            "op": "all",
+            "predicates": [
+              {
+                "op": "eq",
+                "path": "candidateFreeze.required",
+                "value": true
+              },
+              {
+                "op": "eq",
+                "path": "candidateFreeze.available",
+                "value": false
+              }
+            ]
+          },
+          {
+            "op": "all",
+            "predicates": [
+              {
+                "op": "eq",
+                "path": "candidateFreeze.required",
+                "value": true
+              },
+              {
+                "op": "eq",
+                "path": "candidateFreeze.environmentCanBeBound",
+                "value": false
+              }
+            ]
+          }
+        ]
+      },
+      "result": "PROVIDER_UNSUPPORTED"
+    },
+    {
+      "order": 3,
+      "when": {
+        "op": "sum-lte",
+        "paths": [
+          "deadlineBudget.admissionSeconds",
+          "deadlineBudget.executionReserveSeconds",
+          "deadlineBudget.verificationReserveSeconds",
+          "deadlineBudget.recoveryAndFinalizationReserveSeconds"
+        ],
+        "limitPath": "deadlineBudget.remainingSeconds",
+        "negate": true
+      },
+      "result": "ROUTE_BUDGET_INSUFFICIENT"
+    },
+    {
+      "order": 4,
+      "when": {
+        "op": "eq",
+        "path": "operatorMinimumRoute",
+        "value": "ROADMAP"
+      },
+      "result": "ROADMAP"
+    },
+    {
+      "order": 5,
+      "when": {
+        "op": "any",
+        "predicates": [
+          {
+            "op": "all",
+            "predicates": [
+              {
+                "op": "gte",
+                "path": "dependency.dependentWorkGroupCount",
+                "value": 2
+              },
+              {
+                "op": "eq",
+                "path": "dependency.integrationOwnerRequired",
+                "value": true
+              }
+            ]
+          },
+          {
+            "op": "in",
+            "path": "architectureImpact",
+            "values": [
+              "multi-system",
+              "public-contract"
+            ]
+          },
+          {
+            "op": "in",
+            "path": "reversibility",
+            "values": [
+              "staged-rollback-required",
+              "irreversible"
+            ]
+          },
+          {
+            "op": "eq",
+            "path": "riskAndIndependentCheckFloor.level",
+            "value": "staged-high-impact"
+          },
+          {
+            "op": "eq",
+            "path": "checkAndBaseline.checkQuality",
+            "value": "coordinated-design"
+          },
+          {
+            "op": "gte",
+            "path": "dependency.separateDependentBodies",
+            "value": 2
+          },
+          {
+            "op": "eq",
+            "path": "fitsLightPlan",
+            "value": false
+          }
+        ]
+      },
+      "result": "ROADMAP"
+    },
+    {
+      "order": 6,
+      "when": {
+        "op": "eq",
+        "path": "operatorMinimumRoute",
+        "value": "LIGHT"
+      },
+      "result": "LIGHT"
+    },
+    {
+      "order": 7,
+      "when": {
+        "op": "any",
+        "predicates": [
+          {
+            "op": "eq",
+            "path": "successCriteria",
+            "value": "short-clarification"
+          },
+          {
+            "op": "eq",
+            "path": "dependency.shape",
+            "value": "connected"
+          },
+          {
+            "op": "eq",
+            "path": "uncertainty",
+            "value": "reversible-technical"
+          },
+          {
+            "op": "eq",
+            "path": "checkAndBaseline.checkQuality",
+            "value": "short-plan"
+          },
+          {
+            "op": "eq",
+            "path": "approachNeedsShortPlanning",
+            "value": true
+          },
+          {
+            "op": "eq",
+            "path": "shortOrderUnclear",
+            "value": true
+          }
+        ]
+      },
+      "result": "LIGHT"
+    },
+    {
+      "order": 8,
+      "when": {
+        "op": "all",
+        "predicates": [
+          {
+            "op": "eq",
+            "path": "successCriteria",
+            "value": "ready"
+          },
+          {
+            "op": "in",
+            "path": "dependency.shape",
+            "values": [
+              "bounded",
+              "independent-edits"
+            ]
+          },
+          {
+            "op": "eq",
+            "path": "uncertainty",
+            "value": "none"
+          },
+          {
+            "op": "in",
+            "path": "checkAndBaseline.checkQuality",
+            "values": [
+              "authoritative",
+              "public",
+              "observable"
+            ]
+          }
+        ]
+      },
+      "result": "DIRECT"
+    },
+    {
+      "order": 9,
+      "when": {
+        "op": "all",
+        "predicates": []
+      },
+      "result": "ROUTE_DECISION_INVALID"
+    }
+  ],
+  "effectAcceptance": {
+    "inspect": {
+      "terminalResult": "INSPECTION_REPORTED",
+      "requiredAcceptance": [
+        "findings tied to inspected project facts"
+      ]
+    },
+    "report": {
+      "terminalResult": "REPORT_DELIVERED",
+      "requiredAcceptance": [
+        "the requested report answers every requested item"
+      ]
+    },
+    "research": {
+      "terminalResult": "RESEARCH_DELIVERED",
+      "requiredAcceptance": [
+        "claims tied to the required evidence or sources"
+      ]
+    },
+    "decide": {
+      "terminalResult": "DECISION_RECORDED",
+      "requiredAcceptance": [
+        "alternatives, reasons, and the selected decision are explicit"
+      ]
+    },
+    "mutate": {
+      "terminalResult": "CHANGE_VERIFIED",
+      "requiredAcceptance": [
+        "the exact changed version passes its real checks"
+      ]
+    },
+    "external-operation": {
+      "terminalResult": "EXTERNAL_EFFECT_CONFIRMED",
+      "requiredAcceptance": [
+        "authority and the observable external result are recorded"
+      ]
+    }
+  },
+  "probeOrCharacterize": {
+    "admission": "after route analysis and within the run-owner decision period",
+    "allowedWhen": [
+      "a debug request needs a real failing baseline",
+      "a behavior-preserving change needs characterization",
+      "one focused runtime fact is required to decide the route"
+    ],
+    "productionWritesAllowed": false,
+    "allowedWrites": [
+      "isolated-check-resources",
+      "run:checks/commands.jsonl"
+    ],
+    "broadTestSuiteAllowed": false,
+    "resultFields": [
+      "command",
+      "expectedResult",
+      "actualResult",
+      "exitCode",
+      "baselineStatus",
+      "outputHash",
+      "environmentHash"
+    ],
+    "failureDoesNotSelectLargerRoute": true
+  },
+  "escalationEvents": {
+    "RISK_DISCOVERED": {
+      "requiredEvidence": [
+        "risk dimension",
+        "affected work or check"
+      ],
+      "action": "add the named risk control; change route only if a route predicate becomes true"
+    },
+    "SIDE_EFFECT_DISCOVERED": {
+      "requiredEvidence": [
+        "new side effect",
+        "authority and reversibility impact"
+      ],
+      "action": "re-evaluate authority, isolation, and staged-change predicates"
+    },
+    "SHARED_RESOURCE_DISCOVERED": {
+      "requiredEvidence": [
+        "resource identity",
+        "competing owners"
+      ],
+      "action": "serialize ownership or raise route only when dependent integration is proven"
+    },
+    "ORACLE_FAILURE": {
+      "requiredEvidence": [
+        "exact failed check",
+        "check authority",
+        "failure classification"
+      ],
+      "action": "use the check resolver or record external-only residual risk; do not invent a pass"
+    },
+    "NO_PROGRESS": {
+      "requiredEvidence": [
+        "repeated failure fingerprint",
+        "unchanged version hash",
+        "unchanged check evidence hash"
+      ],
+      "action": "change approach once; raise route only when a new route fact is proven"
+    },
+    "CAPABILITY_LOST": {
+      "requiredEvidence": [
+        "required capability",
+        "previous verification",
+        "current failure"
+      ],
+      "action": "use a declared safe reduced behavior or stop as PROVIDER_UNSUPPORTED"
+    },
+    "ARCHITECTURE_FORK_DISCOVERED": {
+      "requiredEvidence": [
+        "affected systems or public contracts",
+        "incompatible alternatives"
+      ],
+      "action": "raise LIGHT to ROADMAP or wait for the user when product meaning is involved"
+    }
+  },
+  "routes": {
+    "DIRECT": {
+      "planningFile": "plan/success-card.md",
+      "coordinatorAllowed": false,
+      "managerAllowed": false,
+      "workerRange": {
+        "normalMin": 1,
+        "normalMax": 2,
+        "absoluteMax": 3,
+        "absoluteMaxReason": "separate non-overlapping work"
+      },
+      "checkerRange": {
+        "min": 1,
+        "max": 2
+      },
+      "selectedByPrecedenceOrders": [
+        8
+      ]
+    },
+    "LIGHT": {
+      "planningFile": "plan/light-plan.md",
+      "planningTimeLimitSeconds": 300,
+      "planningBulletLimit": 15,
+      "coordinatorAllowed": false,
+      "managerAllowed": false,
+      "workerRange": {
+        "derivedFromPlan": true,
+        "minimum": 1
+      },
+      "checkerRange": {
+        "min": 1,
+        "max": 2
+      },
+      "selectedByPrecedenceOrders": [
+        6,
+        7
+      ]
+    },
+    "ROADMAP": {
+      "planningFile": "plan/ROADMAP.md",
+      "coordinatorAllowed": true,
+      "managerAdmission": "one accepted work group needs at least two non-overlapping workers or persistent independent context",
+      "checkerRange": {
+        "min": 1,
+        "extraOnlyForNamedRisk": true
+      },
+      "selectedByPrecedenceOrders": [
+        4,
+        5
+      ]
+    }
+  },
+  "tieRules": [
+    {
+      "between": [
+        "DIRECT",
+        "LIGHT"
+      ],
+      "rule": "Resolve the named uncertainty during the decision period; if it remains and affects implementation, select LIGHT."
+    },
+    {
+      "between": [
+        "LIGHT",
+        "ROADMAP"
+      ],
+      "rule": "Select ROADMAP only for a recorded dependency, integration, architecture, or staged-risk reason; otherwise select LIGHT."
+    }
+  ],
+  "nonSelectors": [
+    "file-count",
+    "repository-size",
+    "max-subs",
+    "available-agent-count",
+    "security-word-alone",
+    "refactor-word-alone",
+    "research-word-alone",
+    "one-failed-implementation",
+    "benchmark-label"
+  ],
+  "routeChangeEvents": {
+    "DIRECT_TO_LIGHT": [
+      "SPEC_MISUNDERSTOOD",
+      "REVERSIBLE_DESIGN_UNRESOLVED"
+    ],
+    "LIGHT_TO_ROADMAP": [
+      "MULTI_SURFACE_DISCOVERED",
+      "ARCHITECTURE_FORK_DISCOVERED"
+    ],
+    "ROADMAP_TO_LIGHT": [
+      "DEPENDENCY_REMOVED_BEFORE_PRODUCTION_WRITE"
+    ],
+    "LIGHT_TO_DIRECT": [
+      "UNCERTAINTY_RESOLVED_BEFORE_PRODUCTION_WRITE"
+    ]
+  },
+  "examples": [
+    {
+      "id": "bounded-filter-fix",
+      "facts": "Fix a local filter bypass and add its failing regression case.",
+      "route": "DIRECT"
+    },
+    {
+      "id": "twenty-file-rename",
+      "facts": "Apply a mechanical rename across twenty files with one owner and known checks.",
+      "route": "DIRECT"
+    },
+    {
+      "id": "client-retry",
+      "facts": "Add retry behavior where timeout, cancellation, and idempotency need a short reversible design choice.",
+      "route": "LIGHT"
+    },
+    {
+      "id": "bounded-module-refactor",
+      "facts": "Reshape one connected module while preserving behavior and ordering characterization before edits.",
+      "route": "LIGHT"
+    },
+    {
+      "id": "cross-system-authentication",
+      "facts": "Replace authentication across API, web, mobile, and stored sessions with coordinated migration.",
+      "route": "ROADMAP"
+    },
+    {
+      "id": "three-file-cross-service-rollout",
+      "facts": "Change three files that belong to separately deployed systems and require coordinated rollout.",
+      "route": "ROADMAP"
+    }
+  ],
+  "checkerSelection": {
+    "oneCombinedCheckerWhen": [
+      "bounded-result",
+      "single-toolchain",
+      "no-distinct-high-risk-boundary"
+    ],
+    "twoCheckersRequireOneNamedReason": [
+      "different-access",
+      "different-expertise",
+      "security",
+      "authorization",
+      "privacy",
+      "destructive-change",
+      "concurrency",
+      "external-effect",
+      "visual-behavior",
+      "broad-regression"
+    ]
+  }
+}

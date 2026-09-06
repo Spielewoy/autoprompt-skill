@@ -6,13 +6,42 @@ const path = require('node:path')
 
 const AGENT_FILE_PATTERN = /^ap-[a-z0-9-]+\.toml$/
 const PROFILE_SECTION_PATTERN = /^\[agents\.(ap-[a-z0-9-]+)\]$/
+const ROUTE_PROFILE_LIMITS = Object.freeze({
+  DIRECT: Object.freeze({ maxDepth: 2, maxLiveIncludingRoot: 4 }),
+  LIGHT: Object.freeze({ maxDepth: 3, maxLiveIncludingRoot: 4 }),
+  ROADMAP: Object.freeze({ maxDepth: 4, maxLiveIncludingRoot: 6, absoluteUserLiveCeiling: 10 }),
+})
 
 function fail(message) {
   throw new Error(message)
 }
 
+function positiveInteger(value, label) {
+  const number = typeof value === 'number' ? value : Number(value)
+  if (!Number.isSafeInteger(number) || number <= 0) fail(`${label} must be a positive integer`)
+  return number
+}
+
+function readSettings(settingsPath) {
+  if (!settingsPath) return null
+  let settings
+  try { settings = JSON.parse(fs.readFileSync(path.resolve(settingsPath), 'utf8')) } catch {
+    fail(`settings are unreadable: ${settingsPath}`)
+  }
+  return settings
+}
+
 function parseArgs(argv) {
-  const options = { action: '', agentsDirectory: '', profilePath: '', workspacePath: process.cwd() }
+  const options = {
+    action: '',
+    agentsDirectory: '',
+    profilePath: '',
+    workspacePath: process.cwd(),
+    route: process.env.AUTOPROMPT_ROUTE || null,
+    maxSubs: process.env.AUTOPROMPT_MAX_SUBS || process.env.AUTOPROMPT_MAX_CONCURRENT || null,
+    userLiveCeiling: process.env.AUTOPROMPT_USER_LIVE_CEILING || null,
+    settingsPath: '',
+  }
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]
     if (argument === '--write' || argument === '--verify') {
@@ -20,17 +49,28 @@ function parseArgs(argv) {
       options.action = argument.slice(2)
       continue
     }
-    if (!['--agents-dir', '--profile', '--workspace'].includes(argument)) fail(`unknown flag ${argument}`)
+    if (!['--agents-dir', '--profile', '--workspace', '--route', '--max-subs', '--settings', '--user-live-ceiling'].includes(argument)) fail(`unknown flag ${argument}`)
     const value = argv[index + 1]
     if (value == null) fail(`${argument} requires a value`)
     index += 1
     if (argument === '--agents-dir') options.agentsDirectory = path.resolve(value)
     else if (argument === '--profile') options.profilePath = path.resolve(value)
-    else options.workspacePath = path.resolve(value)
+    else if (argument === '--workspace') options.workspacePath = path.resolve(value)
+    else if (argument === '--route') options.route = value
+    else if (argument === '--max-subs') options.maxSubs = value
+    else if (argument === '--user-live-ceiling') options.userLiveCeiling = value
+    else options.settingsPath = path.resolve(value)
   }
   if (!options.action || !options.agentsDirectory || !options.profilePath) {
-    fail('usage: codex-agent-profile.js --write|--verify --agents-dir <path> --profile <path> [--workspace <path>]')
+    fail('usage: codex-agent-profile.js --write|--verify --agents-dir <path> --profile <path> [--workspace <path>] [--route DIRECT|LIGHT|ROADMAP] [--max-subs N|--settings path] [--user-live-ceiling N]')
   }
+  const settings = readSettings(options.settingsPath)
+  if (settings) {
+    const concurrency = settings.concurrency || {}
+    if (options.maxSubs == null) options.maxSubs = concurrency.effectiveMaxSubs
+    if (!options.route && settings.route) options.route = settings.route
+  }
+  if (options.route) options.route = String(options.route).trim().toUpperCase()
   return options
 }
 
@@ -65,14 +105,43 @@ function relativeConfigPath(profilePath, agentsDirectory, agentFile) {
   const profileDirectory = path.dirname(profilePath)
   const target = path.join(agentsDirectory, agentFile)
   const relative = path.relative(profileDirectory, target)
-  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     fail('private agents must be descendants of the profile directory')
   }
   return relative.split(path.sep).join('/')
 }
 
+function deriveProfileLimits(options = {}) {
+  const route = options.route ? String(options.route).toUpperCase() : null
+  if (route === null) {
+    return Object.freeze({ route: null, status: 'ROUTE_PENDING', maxDepth: 1, maxConcurrentThreads: 1 })
+  }
+  const routeLimits = ROUTE_PROFILE_LIMITS[route]
+  if (!routeLimits) fail(`unknown route: ${options.route}`)
+  const requestedSubs = positiveInteger(options.maxSubs, 'max-subs')
+  let liveIncludingRoot = routeLimits.maxLiveIncludingRoot
+  if (route === 'ROADMAP' && options.userLiveCeiling != null) {
+    liveIncludingRoot = Math.min(
+      positiveInteger(options.userLiveCeiling, 'user-live-ceiling'),
+      routeLimits.absoluteUserLiveCeiling,
+    )
+  }
+  const routeChildCeiling = liveIncludingRoot - 1
+  return Object.freeze({
+    route,
+    status: 'ROUTE_BOUND',
+    maxDepth: routeLimits.maxDepth,
+    maxConcurrentThreads: Math.min(requestedSubs, routeChildCeiling),
+  })
+}
+
 function renderProfile(options, agents) {
-  const lines = ['[agents]', 'max_depth = 10', 'max_concurrent_threads_per_session = 10']
+  const limits = deriveProfileLimits(options)
+  const lines = [
+    '[agents]',
+    `max_depth = ${limits.maxDepth}`,
+    `max_concurrent_threads_per_session = ${limits.maxConcurrentThreads}`,
+  ]
   for (const agentFile of agents) {
     const role = path.basename(agentFile, '.toml')
     lines.push(
@@ -189,7 +258,12 @@ function main(argv) {
   const agents = loadManifest(options.agentsDirectory)
   if (options.action === 'write') writeProfile(options, agents)
   verifyProfile(options, agents)
-  process.stdout.write(`${JSON.stringify({ profile: options.profilePath, agents, agentCount: agents.length })}\n`)
+  process.stdout.write(`${JSON.stringify({
+    profile: options.profilePath,
+    agents,
+    agentCount: agents.length,
+    limits: deriveProfileLimits(options),
+  })}\n`)
 }
 
 if (require.main === module) {
@@ -209,6 +283,8 @@ module.exports = {
   globalCodexAgentsDirectory,
   projectConfigDirectories,
   relativeConfigPath,
+  deriveProfileLimits,
+  ROUTE_PROFILE_LIMITS,
   renderProfile,
   verifyProfile,
   writeProfile,

@@ -1,0 +1,248 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/accounting-snapshot.schema.json",
+  "title": "Autoprompt v2 checksummed runtime budget snapshot",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "runId",
+    "activationId",
+    "activationNonce",
+    "generation",
+    "lastAccountingSequence",
+    "lastAccountingHash",
+    "stateEventSequence",
+    "stateEventHash",
+    "monotonicClock",
+    "cumulative",
+    "ceilings",
+    "ceilingContractHash",
+    "snapshotHash",
+    "recordedAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "2.0.0"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$"
+    },
+    "activationId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "activationNonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16,128}$"
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "lastAccountingSequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "lastAccountingHash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "stateEventSequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "stateEventHash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "monotonicClock": {
+      "$ref": "#/$defs/monotonicClock"
+    },
+    "cumulative": {
+      "$ref": "#/$defs/accountingValues"
+    },
+    "ceilings": {
+      "$ref": "#/$defs/ceilings"
+    },
+    "ceilingContractHash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "snapshotHash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "recordedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false,
+  "x-autopromptSnapshotHash": {
+    "algorithm": "sha256",
+    "canonicalization": "stable-json-v1",
+    "path": "runtime/budget.json",
+    "snapshotHashFormula": "sha256(utf8(stable-json-v1(snapshot excluding snapshotHash)))",
+    "ceilingContractHashFormula": "sha256(utf8(stable-json-v1(ceilings)))",
+    "replacePolicy": "Write a complete temporary file, sync it, and atomically replace runtime/budget.json. Replay fails closed if its accounting hash or sequence is not the last complete runtime/accounting.jsonl record."
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "monotonicClock": {
+      "type": "object",
+      "required": [
+        "source",
+        "bootId",
+        "previousObservedMilliseconds",
+        "observedMilliseconds"
+      ],
+      "properties": {
+        "source": {
+          "const": "process-monotonic-clock"
+        },
+        "bootId": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            }
+          ]
+        },
+        "previousObservedMilliseconds": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0
+            }
+          ]
+        },
+        "observedMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "tokenUsage": {
+      "type": "object",
+      "required": [
+        "noncachedInput",
+        "cachedInput",
+        "output",
+        "reasoning"
+      ],
+      "properties": {
+        "noncachedInput": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cachedInput": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reasoning": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "accountingValues": {
+      "type": "object",
+      "required": [
+        "launches",
+        "retries",
+        "sessions",
+        "elapsedMilliseconds",
+        "costMicrounits",
+        "tokenUsage"
+      ],
+      "properties": {
+        "launches": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sessions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "elapsedMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "costMicrounits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tokenUsage": {
+          "$ref": "#/$defs/tokenUsage"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ceilings": {
+      "type": "object",
+      "required": [
+        "wallMilliseconds",
+        "totalTokens",
+        "sessions",
+        "launches",
+        "retries",
+        "costMicrounits",
+        "verificationReserveMilliseconds",
+        "finalizationReserveMilliseconds"
+      ],
+      "properties": {
+        "wallMilliseconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "totalTokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sessions": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "launches": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "retries": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "costMicrounits": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "verificationReserveMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "finalizationReserveMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

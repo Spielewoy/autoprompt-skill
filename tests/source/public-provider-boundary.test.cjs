@@ -114,7 +114,9 @@ test('public agent source contains only the nine supported provider packages', (
 
 test('README is npm-first and public-release ready', () => {
   const readme = read('README.md')
-  const install = readme.match(/## Install\n([\s\S]*?)\n## Examples/)?.[1] ?? ''
+  const install = readme.match(
+    /## Install\n([\s\S]*?)(?=\n## |$)/,
+  )?.[1] ?? ''
   assert.ok(install.indexOf('npm install -g autoprompt-skill') >= 0)
   assert.ok(install.indexOf('npm install -g autoprompt-skill') < install.indexOf('git clone https://github.com/Spielewoy/autoprompt-skill'))
   assert.doesNotMatch(install, /not published|after npm publication/i)

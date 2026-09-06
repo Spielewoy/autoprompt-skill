@@ -14,17 +14,29 @@ Keep changes focused and show that they work.
 1. Start from current `main` on a short, descriptive branch.
 2. Keep one logical change per pull request.
 3. Update focused tests and documentation when behavior changes.
+   Use Node.js 20+ and a Python 3.11+ environment exposed as `python`.
+   Install the Python test dependencies in that environment:
+
+   ```console
+   python -m pip install PyYAML jsonschema
+   ```
+
 4. If `agents/contracts/` changes, regenerate provider views:
 
    ```console
    node scripts/generate-provider-contracts.cjs
    ```
 
-5. Run:
+5. After changing runtime files, refresh their file inventory:
 
    ```console
-   node scripts/generate-provider-contracts.cjs --check
-   node --test tests/source/*.test.cjs
+   node scripts/runtime-payload.cjs --generate
+   ```
+
+6. Run focused tests while editing, then verify the full change:
+
+   ```console
+   npm run verify
    ```
 
 Some checks need PowerShell, Bash, or Python 3. List any relevant check you could not run.

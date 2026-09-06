@@ -1,104 +1,81 @@
-# Decomposition and playbooks
+# Framework selection and evidence contract
 
-Every roadmap item has three independent axes:
+Select the route before creating any roadmap. Cold-start selection uses only the exact
+user request and shallow target facts allowed by `agents/contracts/routes.json`. A
+roadmap, success card, plan, file count, repository size, or failed attempt is never a
+prerequisite or selector.
 
-1. **Category** - `plan`, `backend`, `frontend`, `data`, `integration`, `infra`, or `docs`.
-2. **Optional playbook tag** - `debug`, `research`, `user-facing`, `polish`, or `external-target`.
-3. **Tier** - `T0` trivial, `T1` bounded, `T2` feature, or `T3` ambitious.
+After route selection, choose a procedure by the requested action:
 
-The category defines ownership, the tag changes how planning or verification is performed, and the tier is a depth ceiling. A framework leaf declares the actual gate path. These axes never replace one another.
+- `apply`: perform an exact, decision-free transformation.
+- `backend-fix` or `frontend-fix`: correct observed broken behavior.
+- `backend-implement` or `frontend-implement`: change one bounded capability.
+- `backend-build` or `frontend-build`: create a whole new component or surface.
+- `frontend-review`: inspect and report on a user-facing surface without changing it.
+- `polish`: change visual, copy, or interaction details.
+- `refactor`: restructure while preserving behavior.
+- `plan-scope`, `plan-research`, or `plan-design`: produce the named planning result.
+- `docs`: produce documentation.
 
-## Useful-first scope
+Browser and runnable-surface availability are evidence conditions, not action
+selectors. A requested review always remains read-only. With a browser it may collect
+live screenshots; without one it returns a clearly marked static review. Findings may
+become separate downstream fix requests, but the review procedure does not implement
+them.
 
-There is no separate intake round trip on a new run. The first useful roadmap author proves RUN/READ/WRITE when no trusted launch attestation exists, inspects the repository, classifies scope, selects frameworks, and writes the executable `ROADMAP.md`.
+## Canonical check graph
 
-- **Bounded:** one roadmap author, then independent reviewer and blind fresh verifier concurrently: 3 agents, 2 rounds.
-- **Multi-surface:** retain the author's complete roadmap and evidence, run exactly two complementary scouts concurrently, then run reviewer and fresh verifier concurrently: exactly 5 agents, 3 rounds, with no redundant ordinary synthesis dispatch.
-- **Unusually large:** may exceed 6 agents only when `ROADMAP.md` records a concrete escalation reason.
+The route graphs compiled from `agents/contracts/gates.json` are authoritative. A
+procedure describes purpose, evidence, and typed outcomes; it must not declare a
+competing sequence. Generated Codex procedure pages append exactly one compiled graph.
 
-The accounting covers useful scope workers. Runtime orchestration does not add dedicated preflight, intake, or scope-coordinator round trips.
+One independent final verifier owns ordinary completeness: it compares the frozen exact
+version being checked with the request and executes the acceptance checks. An extra independent-checking seat
+requires a named distinct risk, a distinct check responsibility, and distinct underlying evidence;
+edit count, tier, or a second label for the same evidence never adds reviewer,
+verification, sign-off, or goal-check work.
 
-External research runs only when current external facts are necessary. Repository-only work does not pay a research round trip. A rejected roadmap keeps accepted scout evidence and repairs only named items.
+For debug fixes the default path is reproduce, implement, then verify. Add detailed
+planning or a depth specialist only after recorded wrong-layer evidence, repeated
+failure, or cross-module uncertainty. A reproduced bounded local defect does not pay
+those gates automatically.
 
-## Executable roadmap
+## Test doubles and contract fixtures
 
-`ROADMAP.md` is the sole scope, decomposition, framework, and lane source of truth. Every item records:
+A unit fake may isolate local logic or force an error path. It is never a substitute
+for integration evidence required by the selected acceptance overlay. Any behavior at
+an external boundary needs a paired contract fixture whose schema and provenance are
+checked, plus a separate real integration or provider-contract result when that result
+is required. Record both results independently; neither can silently satisfy the
+other.
 
-- id, title, category, optional tag, proportional tier, and selected framework leaf;
-- owned boundary, dependencies, launch group, and integration lane;
-- implementation steps and positive acceptance criteria;
-- unhappy paths and tests to write first;
-- real verification instructions;
-- the >=95% changed-line and touched-module coverage requirement;
-- `requiresDetailedPlan` only when another design pass is truly required.
+## Independent overlays
 
-An implementation-ready item dispatches directly to implementation. G1 runs only for debug/depth-lock work, an explicit unresolved design fork, `requiresDetailedPlan: true`, or a worker-reported `PLAN-CONFLICT`.
+Scope, acceptance, and risk are independent. Select every applicable risk overlay even
+for a one-line change. Authorization, privacy, destructive action, external effects,
+performance, concurrency, migration, and rollback each add their own evidence.
 
-Framework selection is a hard gate. An absent or unknown framework is invalid dispatch. A selector miss routes through framework generation and validation before implementation.
+Performance work records a baseline, the named SLO or metric threshold, the measured
+result under a stated workload, regression bounds, and rollback criteria. External or
+destructive work records authority before mutation and a tested recovery or rollback
+path.
 
-## Tier ladder
+Blocking findings remain open work. Advisory residual risk may close only with an exact
+authority receipt naming every accepted finding. A P1 non-defect decision additionally
+binds immutable evidence and its original severity to that receipt; it is never achieved
+by relabeling or downgrading severity.
 
-| Tier | Shape | Default depth |
-|---|---|---|
-| **T0** | obvious mechanical change | roadmap item -> implement -> review + verify -> goal-check |
-| **T1** | one bounded change | roadmap item -> implement -> review + verify -> goal-check |
-| **T2** | coherent multi-file feature | conditional plan only when required -> implement -> review + verify -> sign-off -> goal-check |
-| **T3** | ambitious multi-feature mission | executable roadmap -> conditional per-item planning -> full build/verification -> sweep convergence -> goal-check |
+## Event records and migrated logs
 
-A framework may declare a leaner sequence. GOAL-CHECK remains the universal floor. Workers may return `OUT-OF-SCOPE`, causing one-tier escalation; de-escalation never occurs.
+Write run events to schema-validated `events.jsonl`. Validate every route, category,
+procedure, tier, state, and check id before dispatch or append. Older captured logs are
+inputs only after an explicit migration names the source version, target version, row
+transform, rejected rows, and resulting digest. Replay the migrated corpus through the
+current schema and reject unknown ids; prose logs never bypass validation.
 
-## Ownership and parallelism
+## Composition
 
-Split until each roadmap item has a truthful, disjoint boundary. Integration is its own item whenever independent parts must be wired together. Decompose the mission into every genuinely disjoint lane; never collapse a multi-surface mission into one "bounded" lane.
-
-- Independent items share a launch group and run concurrently when the runtime permits.
-- Dependencies create later launch groups.
-- Homogeneous same-target edits belong in one batched implementation, not one agent per edit.
-- Independent within-feature parts may fan out when boundaries are disjoint.
-- Thin, duplicate, or recursive fan-out is invalid.
-
-Use the minimum gates that catch the work's real failure modes and the maximum honest parallelism the dependency graph allows.
-
-## Compact dispatch envelope
-
-The exact mission is stored once in `PROMPTS.txt`. Later briefs contain only:
-
-- role and objective;
-- owned boundary and dependencies;
-- positive acceptance criteria;
-- mission pointer with canonical path, SHA-256 hash, UTF-8 byte length, and RUN-NONCE;
-- roadmap section and evidence pointers with hashes;
-- output schema;
-- truthful model and effort status.
-
-Do not paste the full mission, full roadmap, transcripts, doctrine, prior reviews, or implementer claims. A worker reads and verifies the pointers before acting. A mismatch is `INVALID-BRIEF`.
-
-Never spawn read-relay agents: a coordinator reads the files it needs itself. Roadmap and plan size stay proportional to the change size.
-
-New-run governance is exactly `PROMPTS.txt`, `ROADMAP.md`, and append-only `GATELOG.md`. Governance lives at the run's governance root outside the mission target repository: the three files are never written into the target working tree and must never appear in its diff. Do not create governance-only `BRIEF.md`, `PLAN.md`, `AGENTS.md`, `COVERAGE.md`, `BACKLOG.md`, `ANCHOR.md`, `bucketlist.md`, `intake.md`, `scope-map.md`, or per-angle files. Legacy files remain readable on explicit resumes.
-
-## Playbook tags
-
-### `debug`
-
-For EVERY debug feature, prove the problem RED before changing production code. Record a falsifiable root-cause hypothesis and at least two competing causes, including one investigator explicitly briefed: "the fix is NOT in the symptom layer - find the function that DECIDES the behavior." This is the mandatory DEPTH FLOOR. G1 and fresh depth verification are mandatory. Fix the deepest evidenced cause. Verification must prove the repro RED before and GREEN after, with no green-to-red regression in touched modules or direct dependents.
-
-### `research`
-
-Use only when the mission asks to discover or choose a target. Research changing external facts with live receipts, rank the options, and bind the chosen direction into `ROADMAP.md`. Do not create a second private scope or repeat research already accepted by roadmap assurance.
-
-### `user-facing`
-
-Verify through the real user surface. Exercise representative first-time, power-user, accessibility, skeptical-evaluator, and constrained-device perspectives where relevant. Convert material findings into named roadmap repair or implementation findings; do not manufacture persona theater.
-
-### `polish`
-
-Define the artifact-specific quality bar, build, judge independently, repair named flaws, and re-judge until the applicable sign-off bar passes. Contradictory aesthetic findings go to arbitration, which freezes one mission-consistent standard.
-
-### `external-target`
-
-Inspect the real external system, select a scalable test-safe integration path, respect auth/rate/cost/terms constraints, and verify end to end against the real target or a verified contract fixture. Never substitute a toy local demonstration for the requested external behavior.
-
-## Closed-loop failures
-
-A failed review or verification, sign-off failure, sweep P0/P1, or NOT-DONE goal check re-enters the owning roadmap item or creates a bounded debug item. Accepted evidence survives. Repairs target only named failures. Arbitration chooses among safe mission-advancing options but cannot waive an open P0/P1, the coverage floor, or required real verification.
+Concurrent work requires disjoint writable ownership. Work on the same file uses an
+ordered ownership transfer as defined in `composition.md`. A non-matching shape returns
+`FRAMEWORK: MISS` and uses `generation.md`; it never silently becomes an implementation
+procedure.

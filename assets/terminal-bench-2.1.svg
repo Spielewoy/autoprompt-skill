@@ -18,7 +18,7 @@
     </style>
   </defs>
   <rect width="1672" height="941" fill="#ffffff"/>
-  <text x="78" y="66" class="eyebrow">Autoprompt benchmark</text>
+  <text x="78" y="66" class="eyebrow">Autoprompt · Version 1 benchmark</text>
   <text x="78" y="126" class="title">OpenCode 1.18.7 on Terminal-Bench 2.1</text>
   <g class="grid">
     <line x1="170" y1="250" x2="1590" y2="250"/><line x1="170" y1="362" x2="1590" y2="362"/>
@@ -32,7 +32,7 @@
     <text x="138" y="481">60</text><text x="138" y="369">80</text><text x="138" y="257">100</text>
   </g>
   <rect x="350" y="432.448" width="360" height="377.552" fill="#c9c9ce"/>
-  <rect x="962" y="350.688" width="360" height="459.312" fill="#255c60"/>
+  <rect x="962" y="350.688" width="360" height="459.312" fill="#965477"/>
   <text x="530" y="490.448" class="value-dark" text-anchor="middle">67.42%</text>
   <text x="530" y="526.448" class="bar-copy-dark" text-anchor="middle">60/89 solved</text>
   <text x="530" y="858" class="category" text-anchor="middle">OpenCode baseline</text>

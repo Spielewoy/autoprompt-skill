@@ -18,7 +18,7 @@ Read the Autoprompt repository and the tool's official documentation or source. 
 Check every requirement:
 1. Explicit entry: Autoprompt starts only when the user explicitly invokes it. An ordinary task must not start it automatically.
 2. Native discovery: the host loads a stable skill, instruction, plugin, or package entry path.
-3. Named workers: it can expose and dispatch 25 isolated roles, return each result, and support recursion to depth 4 directly or through an adapter.
+3. Named workers: it can expose the provider's declared role set, return each result, and enforce the declared hierarchy directly or through an adapter.
 4. Run controls: it can enforce tokensaver, wide, and custom concurrency plus a harness-specific agent cap.
 5. Worker tools: scoped filesystem access, shell commands, and real test execution are available to workers.
 6. Durable state: run plans, evidence, failures, and resumable state can be stored in the workspace.
@@ -57,7 +57,7 @@ See the [support notes](../faq/which-coding-agents-are-supported.md).
 
 ## Build and check an adapter
 
-1. Map the entry, 25 roles, 18 frameworks, and runtime to native formats.
+1. Map the entry, canonical logical roles, compatibility bindings, 18 frameworks, and runtime to native formats. Do not copy Codex's physical-role count into another provider without proving the same isolation and dispatch semantics.
 2. Validate default and custom roots. Never trust a folder name.
 3. Fail closed when version or capability checks fail.
 4. Add transactional install, strict doctor, repair, update, receipt-scoped uninstall, collision checks, and rollback.

@@ -1,14 +1,14 @@
 <p align="center">
-  <img src="../../assets/i18n/es/banner.svg" alt="Autoprompt Skill con un 45% menos de fallos en tareas de programación agéntica" width="760"/>
+  <img src="../../assets/banner.svg" alt="Autoprompt Skill: nubes rosas y gansos en vuelo" width="1000"/>
 </p>
 
-<p align="center">Autoprompt es una skill para agentes de código que reduce un 45% los fallos en tareas agénticas.</p>
+<p align="center">Autoprompt es un flujo de trabajo para agentes de código que reduce los fallos un 45% mediante la revisión, corrección y nueva verificación del trabajo.</p>
 
 <p align="center">
-  <a href="#benchmarks"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20puntos-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1: 14.61 puntos más"/></a>
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=versi%C3%B3n&color=255C60&labelColor=14101F" alt="Versión 1.0.4"/></a>
-  <a href="#instalar"><img src="https://img.shields.io/badge/soporte-9%20proveedores%20compatibles-255C60?style=flat-square&labelColor=14101F" alt="Nueve proveedores compatibles"/></a>
-  <a href="../../LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-255C60?style=flat-square&labelColor=14101F" alt="Licencia MIT"/></a>
+  <a href="#benchmarks"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20puntos-965477?style=flat-square&labelColor=302335" alt="Terminal-Bench 2.1: 14.61 puntos más"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=versi%C3%B3n&color=965477&labelColor=302335" alt="Versión 1.0.4"/></a>
+  <a href="#instalar"><img src="https://img.shields.io/badge/soporte-9%20proveedores%20compatibles-965477?style=flat-square&labelColor=302335" alt="Nueve proveedores compatibles"/></a>
+  <a href="../../LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-965477?style=flat-square&labelColor=302335" alt="Licencia MIT"/></a>
 </p>
 
 <p align="center">
@@ -69,7 +69,7 @@ autoprompt
 | Estado | Agente de programación | Requisito auditado | Clave |
 |---|---|---|---|
 | Operativo | [Claude Code](https://code.claude.com/docs/en/setup) | 2.1.219+; auditado con 2.1.233 | `claude` |
-| Operativo | [Codex](https://github.com/openai/codex) | Versión con subagentes; auditado con 0.147.0 | `codex` |
+| Operativo | [Codex](https://github.com/openai/codex) | Versión con subagentes; auditado con 0.148.0 | `codex` |
 | Operativo | [OpenCode](https://opencode.ai/docs/agents) | 1.18.7+; auditado con 1.18.18 | `opencode` |
 | Operativo | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; auditado con 7.4.22 | `kilo` |
 | Operativo | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; auditado con 1.133.0 y Copilot 0.61.0 | `vscode` |
@@ -93,6 +93,8 @@ Sustituye `PROVIDER` por una clave de la tabla de compatibilidad, como `claude`,
 
 ## Benchmarks
 
+Estos son **benchmarks de la versión 1**. Los de la versión 2 se publicarán más adelante.
+
 <p align="center">
   <img src="../../assets/i18n/es/terminal-bench-2.1-leaderboard.svg" width="1000" alt="Clasificación de Terminal-Bench 2.1 con 18 referencias de Artificial Analysis y las mediciones de DeepSeek V4 Flash 0731 con y sin Autoprompt."/>
 </p>
@@ -112,7 +114,7 @@ Sustituye `PROVIDER` por una clave de la tabla de compatibilidad, como `claude`,
 
 </details>
 
-El 82.7% de DeepSeek procede de otra configuración de prueba, así que sirve como referencia, no como una tercera ejecución comparable. Consulta la [configuración y los límites de la evidencia](../benchmarks/terminal-bench-2.1.md) o [solicita otro benchmark](https://github.com/Spielewoy/autoprompt-skill/issues/new?template=benchmark_request.md).
+El 82.7% de DeepSeek procede de otra configuración de prueba, así que sirve como referencia, no como una tercera ejecución comparable. Consulta la [configuración y los límites de la evidencia](../benchmarks/terminal-bench-2.1.md) o [solicita otro benchmark](https://github.com/Spielewoy/autoprompt-skill/issues/new).
 
 <details>
 <summary><strong>Coste previsto:</strong> cerca de 3x el tiempo y 2x los tokens.</summary>
@@ -123,9 +125,25 @@ No se conservaron registros de tiempo ni de tokens. Por tanto, son estimaciones 
 
 ## Anatomía de una invocación
 
-<p align="center">
-  <a href="../../assets/i18n/es/anatomy.svg"><img src="../../assets/i18n/es/anatomy.svg" alt="Anatomía de una invocación de Autoprompt: activación, modo de concurrencia, límite de agentes, enrutamiento de modelos y objetivo" width="1000"/></a>
-</p>
+```text
+/autoprompt mode=custom max_subs=4 agents=auto <goal>
+```
+
+| Parte | Función |
+|---|---|
+| `/autoprompt` | Inicia la skill. |
+| `mode=custom` | Define la concurrencia: tokensaver, wide o custom. |
+| `max_subs=4` | Máximo de cuatro subagentes simultáneos. |
+| `agents=auto` | Selección automática, modelo actual (off) o lista. |
+| `<goal>` | Resultado deseado, restricciones y comprobaciones. |
+| `path=` | Ruta: auto, direct, light o roadmap. |
+
+Ejemplo en Codex:
+
+```bash
+autoprompt activate codex -- path=light "<goal>"
+```
+
 
 ## Controles de ejecución
 
@@ -139,13 +157,13 @@ Usa `mode=` para definir la concurrencia. Usa `agents=` para dirigir modelos cua
 ## Cómo funciona
 
 <p align="center">
-  <img src="../../assets/i18n/es/how-it-works-loop.svg" alt="Flujo de Autoprompt desde el prompt hasta la planificación, implementación, revisión, pruebas, aprobación y barrido final" width="1100"/>
+  <a href="../../assets/i18n/es/how-it-works-loop.svg"><img src="../../assets/i18n/es/how-it-works-loop.svg" alt="Flujo de Autoprompt desde el prompt hasta la planificación, implementación, revisión, pruebas, aprobación y barrido final" width="1100"/></a>
 </p>
 
 ## Agentes
 
 <p align="center">
-  <img src="../../assets/i18n/es/how-it-works-hierarchy.svg" alt="Jerarquía de agentes de Autoprompt desde el prompt hasta los coordinadores, el gestor, las líneas de ejecución y las comprobaciones independientes" width="1100"/>
+  <a href="../../assets/i18n/es/how-it-works-hierarchy.svg"><img src="../../assets/i18n/es/how-it-works-hierarchy.svg" alt="Jerarquía de agentes de Autoprompt desde el prompt hasta los coordinadores, el gestor, las líneas de ejecución y las comprobaciones independientes" width="1100"/></a>
 </p>
 
 ## Ejemplos
@@ -157,7 +175,7 @@ Usa `mode=` para definir la concurrencia. Usa `agents=` para dirigir modelos cua
 | Investigar | `/autoprompt compara colas de trabajos para este repositorio y recomienda una` |
 | Limitar trabajo paralelo | `/autoprompt mode=custom max_subs=4 migra todos los modelos` |
 
-En Codex, usa `$autoprompt` en lugar de `/autoprompt`. En Oh My Pi, usa `/skill:autoprompt`.
+En Codex, usa `autoprompt activate codex -- "<goal>"` en lugar de `/autoprompt`. En Oh My Pi, usa `/skill:autoprompt`.
 
 ## Preguntas frecuentes
 
@@ -183,6 +201,13 @@ Las capas separan la coordinación, la gestión, la ejecución y la evaluación 
 </details>
 
 <details>
+<summary><strong>¿Qué son las rutas?</strong></summary>
+
+`path=auto` elige la ruta. `direct` inicia un trabajo acotado, `light` añade un plan breve y `roadmap` organiza trabajo con dependencias. Todas incluyen verificación independiente. [Detalles](../faq/work-paths.md)
+
+</details>
+
+<details>
 <summary><strong>¿Qué controlan `mode`, `max_subs` y `agents`?</strong></summary>
 
 `mode=tokensaver` limita los subagentes activos a seis; `mode=wide` abre todas las líneas listas; `mode=custom max_subs=N` fija tu propio límite; `agents` controla el enrutamiento de modelos cuando el agente lo admite. [Detalles](../faq/tokensaver-vs-wide-vs-custom.md)
@@ -192,7 +217,7 @@ Las capas separan la coordinación, la gestión, la ejecución y la evaluación 
 <details>
 <summary><strong>¿Por qué Autoprompt no se inicia en segundo plano?</strong></summary>
 
-Porque cambia el coste, el tiempo y el flujo de trabajo. Inícialo de forma explícita con `/autoprompt <objetivo>`, o con `$autoprompt` en Codex.
+Porque cambia el coste, el tiempo y el flujo de trabajo. Inícialo de forma explícita con `/autoprompt <objetivo>`, o con `autoprompt activate codex -- "<goal>"` en Codex.
 
 </details>
 

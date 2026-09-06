@@ -1,0 +1,363 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/outcome.schema.json",
+  "title": "Autoprompt v2 typed outcome",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "code",
+    "description",
+    "stateClass",
+    "runId",
+    "requestEnvelopeHash",
+    "currentVersionHash",
+    "completedResults",
+    "nextReadyWork",
+    "cause",
+    "payloadSchemaId",
+    "payload",
+    "recordedAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "2.0.0"
+    },
+    "code": {
+      "enum": [
+        "CONFIG_REQUIRED",
+        "RUN_RECORD_UNSAFE",
+        "RUN_RECORD_FAILURE",
+        "PROVIDER_UNSUPPORTED",
+        "ROUTE_DECISION_TIMEOUT",
+        "ROUTE_DECISION_INVALID",
+        "WAITING_USER",
+        "PAUSED",
+        "ITEM_VERIFIED",
+        "CHECK_INCONCLUSIVE",
+        "DONE",
+        "PARTIAL",
+        "BLOCKED",
+        "CANCELLED",
+        "FAILED",
+        "PASS",
+        "FAIL",
+        "INVALID_INPUT",
+        "RUNTIME_FAILURE",
+        "SPLIT_REQUIRED"
+        ,"INSPECTION_REPORTED"
+        ,"REPORT_DELIVERED"
+        ,"RESEARCH_DELIVERED"
+        ,"DECISION_RECORDED"
+        ,"CHANGE_VERIFIED"
+        ,"EXTERNAL_EFFECT_CONFIRMED"
+      ]
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stateClass": {
+      "enum": [
+        "intermediate",
+        "resumable",
+        "terminal"
+      ]
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 8
+    },
+    "requestEnvelopeHash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "currentVersionHash": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "completedResults": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "sha256",
+          "description"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "nextReadyWork": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "cause": {
+      "type": "object",
+      "required": [
+        "event",
+        "reason",
+        "unblockPath"
+      ],
+      "properties": {
+        "event": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]+$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "unblockPath": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "payloadSchemaId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "payload": {
+      "type": "object"
+    },
+    "recordedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "oneOf": [
+        { "properties": { "code": { "const": "CONFIG_REQUIRED" }, "description": { "const": "Required local settings are missing or invalid, so work has not started." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "RUN_RECORD_UNSAFE" }, "description": { "const": "The private local run record cannot be created safely, so work has not started." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "RUN_RECORD_FAILURE" }, "description": { "const": "The private local run record could not be read or written reliably." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "PROVIDER_UNSUPPORTED" }, "description": { "const": "The selected provider cannot supply a required capability for this request." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "ROUTE_DECISION_TIMEOUT" }, "description": { "const": "The allowed time ended before the work structure could be selected." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "ROUTE_DECISION_INVALID" }, "description": { "const": "The recorded work-structure decision is incomplete or contradicts its facts." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "WAITING_USER" }, "description": { "const": "Work is waiting for a necessary choice, permission, credential, or missing fact from the user." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "PAUSED" }, "description": { "const": "Work stopped at a saved continuation point and can resume from the recorded state." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "ITEM_VERIFIED" }, "description": { "const": "One assigned result passed every check required for that result." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "CHECK_INCONCLUSIVE" }, "description": { "const": "A required check could not determine whether the exact result passes." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "DONE" }, "description": { "const": "Every requested result passed its current required checks." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "PARTIAL" }, "description": { "const": "Some requested results passed, while named remaining results did not finish." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "BLOCKED" }, "description": { "const": "No ready work remains until a named external condition changes." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "CANCELLED" }, "description": { "const": "The run stopped because the user cancelled it." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "FAILED" }, "description": { "const": "The requested result did not pass and no permitted recovery remains." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "PASS" }, "description": { "const": "The checked result satisfies every requirement assigned to this check." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "FAIL" }, "description": { "const": "The checked result does not satisfy one or more named requirements." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "INVALID_INPUT" }, "description": { "const": "The supplied input does not match the required format or facts." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "RUNTIME_FAILURE" }, "description": { "const": "A tool or execution environment failed before the requested check could finish." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "SPLIT_REQUIRED" }, "description": { "const": "The assigned work must be divided because its parts require different owners or dependencies." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "INSPECTION_REPORTED" }, "description": { "const": "The requested inspection finished and its findings are tied to the material that was inspected." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "REPORT_DELIVERED" }, "description": { "const": "The requested report was delivered and answers every requested item." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "RESEARCH_DELIVERED" }, "description": { "const": "The requested research was delivered with evidence or sources for its claims." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "DECISION_RECORDED" }, "description": { "const": "The requested decision was recorded with its alternatives and reasons." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "CHANGE_VERIFIED" }, "description": { "const": "The requested change was made and the exact changed version passed its required checks." } }, "required": ["code", "description"] },
+        { "properties": { "code": { "const": "EXTERNAL_EFFECT_CONFIRMED" }, "description": { "const": "The authorized external action finished and its observable result was confirmed." } }, "required": ["code", "description"] }
+      ]
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "PAUSED"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "properties": {
+          "stateClass": {
+            "const": "resumable"
+          },
+          "currentVersionHash": {
+            "$ref": "#/$defs/sha256"
+          },
+          "nextReadyWork": {
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "cause": {
+            "properties": {
+              "event": {
+                "const": "BUDGET_EXHAUSTED_RESUMABLE"
+              },
+              "unblockPath": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "payloadSchemaId": {
+            "const": "autoprompt.paused.v2"
+          },
+          "payload": {
+            "type": "object",
+            "required": [
+              "resumeState",
+              "nextReadyWorkIds",
+              "remainingBudgetSeconds",
+              "continuationBindingHash"
+            ],
+            "properties": {
+              "resumeState": {
+                "enum": [
+                  "PREPARE_WORK",
+                  "RUN_WORK",
+                  "CHECK_WORK",
+                  "REPAIRING"
+                ]
+              },
+              "nextReadyWorkIds": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "remainingBudgetSeconds": {
+                "type": "number",
+                "minimum": 0
+              },
+              "continuationBindingHash": {
+                "$ref": "#/$defs/sha256"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "enum": [
+              "CONFIG_REQUIRED",
+              "WAITING_USER"
+            ]
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "properties": {
+          "stateClass": {
+            "const": "resumable"
+          },
+          "nextReadyWork": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "enum": [
+              "ITEM_VERIFIED",
+              "CHECK_INCONCLUSIVE"
+            ]
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "properties": {
+          "stateClass": {
+            "const": "intermediate"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "enum": [
+              "RUN_RECORD_UNSAFE",
+              "RUN_RECORD_FAILURE",
+              "PROVIDER_UNSUPPORTED",
+              "ROUTE_DECISION_TIMEOUT",
+              "ROUTE_DECISION_INVALID",
+              "DONE",
+              "PARTIAL",
+              "BLOCKED",
+              "CANCELLED",
+              "FAILED",
+              "PASS",
+              "FAIL",
+              "INVALID_INPUT",
+              "RUNTIME_FAILURE",
+              "SPLIT_REQUIRED",
+              "INSPECTION_REPORTED",
+              "REPORT_DELIVERED",
+              "RESEARCH_DELIVERED",
+              "DECISION_RECORDED",
+              "CHANGE_VERIFIED",
+              "EXTERNAL_EFFECT_CONFIRMED"
+            ]
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "properties": {
+          "stateClass": {
+            "const": "terminal"
+          },
+          "nextReadyWork": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

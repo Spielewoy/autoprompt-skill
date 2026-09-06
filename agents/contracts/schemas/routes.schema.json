@@ -1,0 +1,625 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/routes.schema.json",
+  "title": "Autoprompt v2 route contract",
+  "type": "object",
+  "required": [
+    "kind",
+    "contractVersion",
+    "defaultRoute",
+    "predicateLanguage",
+    "classificationInputs",
+    "routeFactsSchema",
+    "semanticValidationRules",
+    "capabilityRequirements",
+    "preWork",
+    "routeAnalyst",
+    "runOwnerDecision",
+    "precedenceTable",
+    "effectAcceptance",
+    "probeOrCharacterize",
+    "escalationEvents",
+    "routes",
+    "tieRules",
+    "nonSelectors",
+    "routeChangeEvents",
+    "examples",
+    "checkerSelection"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "kind": {
+      "const": "autoprompt-route-contract"
+    },
+    "contractVersion": {
+      "const": "2.0.0"
+    },
+    "defaultRoute": {
+      "type": "null"
+    },
+    "predicateLanguage": {
+      "type": "object",
+      "required": [
+        "version",
+        "operators",
+        "missingPathBehavior"
+      ],
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "operators": {
+          "const": [
+            "all",
+            "any",
+            "eq",
+            "in",
+            "gte",
+            "gt",
+            "lte",
+            "sum-lte"
+          ]
+        },
+        "missingPathBehavior": {
+          "const": "predicate-false"
+        }
+      },
+      "additionalProperties": false
+    },
+    "classificationInputs": {
+      "type": "array",
+      "minItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "routeFactsSchema": {
+      "type": "object",
+      "required": [
+        "type",
+        "required",
+        "properties",
+        "additionalProperties"
+      ],
+      "properties": {
+        "type": {
+          "const": "object"
+        },
+        "required": {
+          "type": "array",
+          "minItems": 19,
+          "uniqueItems": true
+        },
+        "properties": {
+          "type": "object",
+          "minProperties": 19
+        },
+        "additionalProperties": {
+          "const": false
+        },
+        "allOf": {
+          "type": "array"
+        }
+      },
+      "additionalProperties": false
+    },
+    "semanticValidationRules": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {
+        "type": "object",
+        "required": ["id", "validator", "errorMessage"],
+        "properties": {
+          "id": { "pattern": "^ROUTE-FACT-[0-9]{3}$" },
+          "validator": {
+            "enum": [
+              "unique-mutable-resource-identities",
+              "authorized-targets-are-exact-subset",
+              "target-authority-evidence-is-hash-bound",
+              "external-or-material-work-names-targets",
+              "cost-free-claim-is-zero-and-unapproved",
+              "granted-cost-approval-is-hash-bound",
+              "cost-incurrence-declares-side-effect"
+            ]
+          },
+          "errorMessage": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "capabilityRequirements": {
+      "type": "object",
+      "required": ["always", "byRequestedEffect", "byRoute", "conditional"],
+      "properties": {
+        "always": { "$ref": "#/$defs/capabilities" },
+        "byRequestedEffect": {
+          "type": "object",
+          "required": ["inspect", "report", "research", "decide", "mutate", "external-operation"],
+          "additionalProperties": { "$ref": "#/$defs/capabilities" }
+        },
+        "byRoute": {
+          "type": "object",
+          "required": ["DIRECT", "LIGHT", "ROADMAP"],
+          "additionalProperties": { "$ref": "#/$defs/capabilities" }
+        },
+        "conditional": {
+          "type": "array", "minItems": 3, "maxItems": 3,
+          "items": {
+            "type": "object", "required": ["condition", "requires"],
+            "properties": {
+              "condition": { "enum": ["external-write", "two-independent-checkers", "shared-mutable-resource"] },
+              "requires": { "$ref": "#/$defs/capabilities" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "preWork": {
+      "type": "object",
+      "required": [
+        "missingIndispensableInput",
+        "recommendedRouteWhenWaiting",
+        "needsUserIsRoute"
+      ],
+      "properties": {
+        "missingIndispensableInput": {
+          "const": "WAITING_USER"
+        },
+        "recommendedRouteWhenWaiting": {
+          "type": "null"
+        },
+        "needsUserIsRoute": {
+          "const": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "routeAnalyst": {
+      "type": "object",
+      "required": [
+        "count",
+        "timeLimitSeconds",
+        "readOnly",
+        "mayDispatch",
+        "mayRunBroadChecks",
+        "transcriptPath",
+        "recommendationPath",
+        "outputSchema"
+      ],
+      "properties": {
+        "count": {
+          "const": 1
+        },
+        "timeLimitSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120
+        },
+        "readOnly": {
+          "const": true
+        },
+        "mayDispatch": {
+          "const": false
+        },
+        "mayRunBroadChecks": {
+          "const": false
+        },
+        "transcriptPath": {
+          "const": "route/transcript.jsonl"
+        },
+        "readableTranscriptPath": {
+          "const": "route/transcript.md"
+        },
+        "recommendationPath": {
+          "const": "route/recommendation.json"
+        },
+        "outputSchema": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "runOwnerDecision": {
+      "type": "object",
+      "required": [
+        "timeLimitSeconds",
+        "decisionPath",
+        "schema",
+        "invalidCorrectionLimit",
+        "timeoutOutcome",
+        "invalidOutcome"
+      ],
+      "properties": {
+        "timeLimitSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 240
+        },
+        "decisionPath": {
+          "const": "route/decision.json"
+        },
+        "readableDecisionPath": {
+          "const": "route/decision.md"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "invalidCorrectionLimit": {
+          "const": 1
+        },
+        "timeoutOutcome": {
+          "const": "ROUTE_DECISION_TIMEOUT"
+        },
+        "invalidOutcome": {
+          "const": "ROUTE_DECISION_INVALID"
+        }
+      },
+      "additionalProperties": false
+    },
+    "precedenceTable": {
+      "type": "array",
+      "minItems": 9,
+      "items": {
+        "type": "object",
+        "required": [
+          "order",
+          "when",
+          "result"
+        ],
+        "properties": {
+          "order": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "when": {
+            "$ref": "#/$defs/predicate"
+          },
+          "result": {
+            "enum": [
+              "WAITING_USER",
+              "PROVIDER_UNSUPPORTED",
+              "ROUTE_BUDGET_INSUFFICIENT",
+              "DIRECT",
+              "LIGHT",
+              "ROADMAP",
+              "ROUTE_DECISION_INVALID"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "effectAcceptance": {
+      "type": "object",
+      "required": [
+        "inspect",
+        "report",
+        "research",
+        "decide",
+        "mutate",
+        "external-operation"
+      ],
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "terminalResult",
+          "requiredAcceptance"
+        ]
+      }
+    },
+    "probeOrCharacterize": {
+      "type": "object",
+      "required": [
+        "admission",
+        "allowedWhen",
+        "productionWritesAllowed",
+        "allowedWrites",
+        "broadTestSuiteAllowed",
+        "resultFields",
+        "failureDoesNotSelectLargerRoute"
+      ],
+      "properties": {
+        "admission": {
+          "type": "string",
+          "minLength": 1
+        },
+        "allowedWhen": {
+          "type": "array",
+          "minItems": 3
+        },
+        "productionWritesAllowed": {
+          "const": false
+        },
+        "allowedWrites": {
+          "type": "array",
+          "minItems": 1
+        },
+        "broadTestSuiteAllowed": {
+          "const": false
+        },
+        "resultFields": {
+          "type": "array",
+          "minItems": 6,
+          "uniqueItems": true
+        },
+        "failureDoesNotSelectLargerRoute": {
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "escalationEvents": {
+      "type": "object",
+      "required": [
+        "RISK_DISCOVERED",
+        "SIDE_EFFECT_DISCOVERED",
+        "SHARED_RESOURCE_DISCOVERED",
+        "ORACLE_FAILURE",
+        "NO_PROGRESS",
+        "CAPABILITY_LOST"
+      ],
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "requiredEvidence",
+          "action"
+        ]
+      }
+    },
+    "routes": {
+      "type": "object",
+      "required": [
+        "DIRECT",
+        "LIGHT",
+        "ROADMAP"
+      ],
+      "properties": {
+        "DIRECT": {
+          "$ref": "#/$defs/route"
+        },
+        "LIGHT": {
+          "$ref": "#/$defs/route"
+        },
+        "ROADMAP": {
+          "$ref": "#/$defs/route"
+        }
+      },
+      "additionalProperties": false
+    },
+    "tieRules": {
+      "type": "array",
+      "minItems": 2
+    },
+    "nonSelectors": {
+      "type": "array",
+      "minItems": 8,
+      "uniqueItems": true
+    },
+    "routeChangeEvents": {
+      "type": "object",
+      "minProperties": 4
+    },
+    "examples": {
+      "type": "array",
+      "minItems": 6,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "facts",
+          "route"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "facts": {
+            "type": "string",
+            "minLength": 1
+          },
+          "route": {
+            "enum": [
+              "DIRECT",
+              "LIGHT",
+              "ROADMAP"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "checkerSelection": {
+      "type": "object",
+      "required": [
+        "oneCombinedCheckerWhen",
+        "twoCheckersRequireOneNamedReason"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": ["isolation", "topologyEnforcement", "privateSkillRoot", "eventStreaming", "toolOutputCapture", "stableChildIdentity", "sameContextContinuation", "cancellation", "isolatedChecking", "processOwnership", "modelRouting"]
+      }
+    },
+    "predicate": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "predicates"
+          ],
+          "properties": {
+            "op": {
+              "enum": [
+                "all",
+                "any"
+              ]
+            },
+            "predicates": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/predicate"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "path",
+            "value"
+          ],
+          "properties": {
+            "op": {
+              "const": "eq"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "value": true
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "path",
+            "values"
+          ],
+          "properties": {
+            "op": {
+              "const": "in"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "values": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "path",
+            "value"
+          ],
+          "properties": {
+            "op": {
+              "enum": [
+                "gte",
+                "gt",
+                "lte"
+              ]
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "value": {
+              "type": "number"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "paths",
+            "limitPath"
+          ],
+          "properties": {
+            "op": {
+              "const": "sum-lte"
+            },
+            "paths": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "limitPath": {
+              "type": "string",
+              "minLength": 1
+            },
+            "negate": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "route": {
+      "type": "object",
+      "required": [
+        "planningFile",
+        "coordinatorAllowed",
+        "checkerRange",
+        "selectedByPrecedenceOrders"
+      ],
+      "properties": {
+        "planningFile": {
+          "type": "string"
+        },
+        "planningTimeLimitSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "planningBulletLimit": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "coordinatorAllowed": {
+          "type": "boolean"
+        },
+        "managerAllowed": {
+          "type": "boolean"
+        },
+        "managerAdmission": {
+          "type": "string"
+        },
+        "workerRange": {
+          "type": "object"
+        },
+        "checkerRange": {
+          "type": "object"
+        },
+        "selectedByPrecedenceOrders": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

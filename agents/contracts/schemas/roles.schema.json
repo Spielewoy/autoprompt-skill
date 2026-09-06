@@ -1,0 +1,539 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/roles.schema.json",
+  "title": "Autoprompt v2 role contract",
+  "type": "object",
+  "required": [
+    "kind",
+    "contractVersion",
+    "orchestratorContract",
+    "roles",
+    "phaseAdjacency",
+    "decisionAuthority",
+    "codexPhysicalRoleProjection",
+    "compatibilityAliases",
+    "compatibilityAliasPolicy",
+    "aliasTelemetrySchema"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "kind": {
+      "const": "autoprompt-role-contract"
+    },
+    "contractVersion": {
+      "const": "2.0.0"
+    },
+    "orchestratorContract": {
+      "$ref": "#/$defs/role"
+    },
+    "roles": {
+      "type": "array",
+      "minItems": 10,
+      "items": {
+        "$ref": "#/$defs/role"
+      }
+    },
+    "phaseAdjacency": {
+      "type": "array",
+      "minItems": 8,
+      "items": {
+        "type": "object",
+        "required": [
+          "route",
+          "phase",
+          "parent",
+          "children"
+        ],
+        "properties": {
+          "route": {
+            "enum": [
+              "PRE_ROUTE",
+              "DIRECT",
+              "LIGHT",
+              "ROADMAP",
+              "ANY"
+            ]
+          },
+          "phase": {
+            "type": "string",
+            "minLength": 1
+          },
+          "parent": {
+            "type": "string",
+            "minLength": 1
+          },
+          "children": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "decisionAuthority": {
+      "type": "object",
+      "minProperties": 10,
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "codexPhysicalRoleProjection": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": [
+          "physicalId",
+          "logicalId",
+          "layer",
+          "modes"
+        ],
+        "properties": {
+          "physicalId": {
+            "type": "string",
+            "pattern": "^ap-[a-z0-9-]+$"
+          },
+          "logicalId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]+$"
+          },
+          "layer": {
+            "enum": [
+              "L1",
+              "L2",
+              "L3",
+              "L4"
+            ]
+          },
+          "modes": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]+$"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "compatibilityAliases": {
+      "type": "array",
+      "minItems": 25,
+      "maxItems": 25,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": [
+          "legacyId",
+          "logicalId",
+          "mode"
+        ],
+        "properties": {
+          "legacyId": {
+            "type": "string",
+            "pattern": "^ap-[a-z0-9-]+$"
+          },
+          "logicalId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "mode": {
+            "enum": [
+              "reversible-technical-only",
+              "root-cause",
+              "check-resolver",
+              "compatibility",
+              "compatibility-compiler",
+              "roadmap-blind",
+              "request-completeness",
+              "implementation",
+              "legacy-resume-only",
+              "finalizer",
+              "named-risk-only",
+              "roadmap-only",
+              "planning",
+              "explicit-diagnostic",
+              "canonical-state-check",
+              "research",
+              "static-review",
+              "author-or-scout-request",
+              "event-recording",
+              "residual-risk",
+              "roadmap-repair",
+              "runtime-testing"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "compatibilityAliasPolicy": {
+      "type": "object",
+      "required": [
+        "status",
+        "activationAllowed",
+        "writeAllowed",
+        "telemetryRequired",
+        "legacyPhysicalIds"
+      ],
+      "properties": {
+        "status": {
+          "const": "closed-read-only"
+        },
+        "activationAllowed": {
+          "const": false
+        },
+        "writeAllowed": {
+          "const": false
+        },
+        "telemetryRequired": {
+          "const": true
+        },
+        "legacyPhysicalIds": {
+          "type": "array",
+          "minItems": 25,
+          "maxItems": 25,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^ap-[a-z0-9-]+$"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "aliasTelemetrySchema": {
+      "type": "object",
+      "required": [
+        "format",
+        "appendPath",
+        "counterField",
+        "enforcer",
+        "legacyReadVersion",
+        "canonicalWriteVersion",
+        "hashChain",
+        "recordSchema"
+      ],
+      "properties": {
+        "format": {
+          "const": "jsonl"
+        },
+        "appendPath": {
+          "const": "compatibility/alias-telemetry.jsonl"
+        },
+        "counterField": {
+          "const": "aliasUseCount"
+        },
+        "enforcer": {
+          "const": "deterministic-control-plane"
+        },
+        "legacyReadVersion": {
+          "const": "1"
+        },
+        "canonicalWriteVersion": {
+          "const": "2.0.0"
+        },
+        "hashChain": {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "canonicalization",
+            "scope",
+            "genesisPreviousHash",
+            "entryHashInputFields",
+            "crashTailPolicy"
+          ],
+          "properties": {
+            "algorithm": { "const": "sha256" },
+            "canonicalization": { "const": "stable-json-v1" },
+            "scope": { "const": "append-file" },
+            "genesisPreviousHash": { "type": "null" },
+            "entryHashInputFields": {
+              "const": [
+                "runId",
+                "activationId",
+                "generation",
+                "legacyId",
+                "logicalId",
+                "physicalId",
+                "legacyReadVersion",
+                "canonicalWriteVersion",
+                "aliasUseCount",
+                "occurredAt",
+                "previousHash"
+              ]
+            },
+            "crashTailPolicy": { "type": "string", "minLength": 40 }
+          },
+          "additionalProperties": false
+        },
+        "recordSchema": {
+          "type": "object",
+          "required": [
+            "type",
+            "required",
+            "properties",
+            "additionalProperties"
+          ],
+          "properties": {
+            "type": {
+              "const": "object"
+            },
+            "required": {
+              "const": [
+                "runId",
+                "activationId",
+                "generation",
+                "legacyId",
+                "logicalId",
+                "physicalId",
+                "legacyReadVersion",
+                "canonicalWriteVersion",
+                "aliasUseCount",
+                "occurredAt",
+                "previousHash",
+                "entryHash"
+              ]
+            },
+            "properties": {
+              "type": "object",
+              "required": [
+                "runId",
+                "activationId",
+                "generation",
+                "legacyId",
+                "logicalId",
+                "physicalId",
+                "legacyReadVersion",
+                "canonicalWriteVersion",
+                "aliasUseCount",
+                "occurredAt",
+                "previousHash",
+                "entryHash"
+              ]
+            },
+            "additionalProperties": {
+              "const": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "role": {
+      "type": "object",
+      "required": [
+        "id",
+        "physicalId",
+        "layer",
+        "reasoningClass",
+        "riskClass",
+        "legalParents",
+        "legalChildren",
+        "permissions",
+        "writes",
+        "inputSchema",
+        "outputSchema",
+        "decisionRights",
+        "humanDescription"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]+$"
+        },
+        "physicalId": {
+          "type": "string",
+          "pattern": "^autoprompt\\.v2\\.[a-z][a-z0-9-]+$"
+        },
+        "layer": {
+          "enum": [
+            "L0",
+            "L1",
+            "L2",
+            "L3",
+            "L4"
+          ]
+        },
+        "phase": {
+          "type": "string"
+        },
+        "phases": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "reasoningClass": {
+          "type": "string",
+          "minLength": 1
+        },
+        "riskClass": {
+          "type": "string",
+          "minLength": 1
+        },
+        "allowedRoutes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "legalParents": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "legalChildren": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "permissions": {
+          "$ref": "#/$defs/permissions"
+        },
+        "writes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "inputSchema": {
+          "type": "string",
+          "pattern": "^agents/contracts/schemas/[a-z0-9-]+\\.schema\\.json$"
+        },
+        "outputSchema": {
+          "type": "string",
+          "pattern": "^agents/contracts/schemas/[a-z0-9-]+\\.schema\\.json$"
+        },
+        "decisionRights": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "admissionPolicy": {
+          "type": "object",
+          "required": [
+            "route",
+            "planPath",
+            "minimumUsefulWorkers",
+            "disjointMutableResourceOwnershipRequired",
+            "singleWorkerGroupsMustStayWithParent"
+          ],
+          "properties": {
+            "route": {
+              "const": "ROADMAP"
+            },
+            "planPath": {
+              "const": "plan/ROADMAP.md"
+            },
+            "minimumUsefulWorkers": {
+              "const": 2
+            },
+            "disjointMutableResourceOwnershipRequired": {
+              "const": true
+            },
+            "singleWorkerGroupsMustStayWithParent": {
+              "const": true
+            }
+          },
+          "additionalProperties": false
+        },
+        "humanDescription": {
+          "type": "string",
+          "minLength": 1
+        },
+        "instructions": {
+          "type": "object",
+          "required": [
+            "whatToRead",
+            "whatToDo",
+            "whatNotToChange",
+            "howToCheck",
+            "whatToReturn"
+          ],
+          "properties": {
+            "whatToRead": {
+              "type": "string",
+              "minLength": 1
+            },
+            "whatToDo": {
+              "type": "string",
+              "minLength": 1
+            },
+            "whatNotToChange": {
+              "type": "string",
+              "minLength": 1
+            },
+            "howToCheck": {
+              "type": "string",
+              "minLength": 1
+            },
+            "whatToReturn": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "permissions": {
+      "type": "object",
+      "required": [
+        "read",
+        "write",
+        "execute",
+        "network",
+        "dispatch"
+      ],
+      "properties": {
+        "read": {
+          "type": "array",
+          "uniqueItems": true
+        },
+        "write": {
+          "type": "array",
+          "uniqueItems": true
+        },
+        "execute": {
+          "type": "array",
+          "uniqueItems": true
+        },
+        "network": {
+          "type": "string"
+        },
+        "dispatch": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

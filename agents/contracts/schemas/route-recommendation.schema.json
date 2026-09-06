@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/route-recommendation.schema.json",
+  "title": "Autoprompt v2 route analyst recommendation",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "preWorkResult",
+    "recommendedRoute",
+    "confidence",
+    "whatTheUserWants",
+    "likelyAreas",
+    "howSuccessCanBeChecked",
+    "unknowns",
+    "risks",
+    "independentWorkItems",
+    "dependencies",
+    "reasonsForDirect",
+    "reasonsForLight",
+    "reasonsForRoadmap",
+    "userInputNeeded",
+    "evidenceIndex",
+    "routeFactProposal",
+    "verificationObligations"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "2.0.0"
+    },
+    "preWorkResult": {
+      "enum": [
+        "CONTINUE",
+        "NEEDS_USER"
+      ]
+    },
+    "recommendedRoute": {
+      "oneOf": [
+        {
+          "enum": [
+            "DIRECT",
+            "LIGHT",
+            "ROADMAP"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "confidence": {
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "whatTheUserWants": {
+      "$ref": "#/$defs/nonEmptyStrings"
+    },
+    "likelyAreas": {
+      "$ref": "#/$defs/strings"
+    },
+    "howSuccessCanBeChecked": {
+      "$ref": "#/$defs/nonEmptyStrings"
+    },
+    "unknowns": {
+      "$ref": "#/$defs/strings"
+    },
+    "risks": {
+      "$ref": "#/$defs/strings"
+    },
+    "independentWorkItems": {
+      "$ref": "#/$defs/strings"
+    },
+    "dependencies": {
+      "$ref": "#/$defs/strings"
+    },
+    "reasonsForDirect": {
+      "$ref": "#/$defs/nonEmptyStrings"
+    },
+    "reasonsForLight": {
+      "$ref": "#/$defs/nonEmptyStrings"
+    },
+    "reasonsForRoadmap": {
+      "$ref": "#/$defs/nonEmptyStrings"
+    },
+    "userInputNeeded": {
+      "$ref": "#/$defs/strings"
+    },
+    "evidenceIndex": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "eventId",
+          "reason",
+          "byteLength",
+          "sha256",
+          "truncated"
+        ],
+        "properties": {
+          "eventId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "byteLength": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "routeFactProposal": {
+      "type": "object",
+      "required": [
+        "requestedEffect", "dependencyShape", "dependentWorkGroupCount",
+        "integrationOwnerRequired", "uncertainty", "reversibility",
+        "mutableResources", "sideEffects", "externality", "confidentiality",
+        "thirdPartyImpact", "riskLevel", "minimumCheckerCount",
+        "namedDistinctResponsibilities", "checkQuality", "availableCheckKinds",
+        "baselineStatus", "hiddenExternalCheck", "architectureImpact",
+        "fitsLightPlan", "approachNeedsShortPlanning", "shortOrderUnclear"
+      ],
+      "properties": {
+        "requestedEffect": { "enum": ["inspect", "report", "research", "decide", "mutate", "external-operation"] },
+        "dependencyShape": { "enum": ["bounded", "connected", "independent-edits", "dependent-groups"] },
+        "dependentWorkGroupCount": { "type": "integer", "minimum": 0 },
+        "integrationOwnerRequired": { "type": "boolean" },
+        "uncertainty": { "enum": ["none", "reversible-technical", "product-semantic", "architecture"] },
+        "reversibility": { "enum": ["fully-reversible", "locally-reversible", "staged-rollback-required", "irreversible"] },
+        "mutableResources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind", "identity", "shared", "ownershipMode"],
+            "properties": {
+              "kind": { "type": "string", "minLength": 1 },
+              "identity": { "type": "string", "minLength": 1 },
+              "shared": { "type": "boolean" },
+              "ownershipMode": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        },
+        "sideEffects": { "$ref": "#/$defs/strings" },
+        "externality": { "enum": ["local-only", "external-read", "external-write"] },
+        "confidentiality": { "enum": ["public", "internal", "confidential", "restricted"] },
+        "thirdPartyImpact": { "enum": ["none", "minor", "material"] },
+        "riskLevel": { "enum": ["ordinary", "elevated", "staged-high-impact"] },
+        "minimumCheckerCount": { "enum": [1, 2] },
+        "namedDistinctResponsibilities": { "$ref": "#/$defs/strings" },
+        "checkQuality": { "enum": ["authoritative", "short-plan", "coordinated-design", "unavailable"] },
+        "availableCheckKinds": { "$ref": "#/$defs/nonEmptyStrings" },
+        "baselineStatus": { "enum": ["recorded", "not-applicable", "unknown"] },
+        "hiddenExternalCheck": { "type": "boolean" },
+        "architectureImpact": { "enum": ["local", "single-system", "multi-system"] },
+        "fitsLightPlan": { "type": "boolean" },
+        "approachNeedsShortPlanning": { "type": "boolean" },
+        "shortOrderUnclear": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "verificationObligations": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/verificationObligation" }
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "preWorkResult": {
+            "const": "NEEDS_USER"
+          }
+        },
+        "required": [
+          "preWorkResult"
+        ]
+      },
+      "then": {
+        "properties": {
+          "recommendedRoute": {
+            "type": "null"
+          },
+          "userInputNeeded": {
+            "minItems": 1
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "recommendedRoute": {
+            "enum": [
+              "DIRECT",
+              "LIGHT",
+              "ROADMAP"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "verificationObligation": {
+      "type": "object",
+      "required": ["id", "kind", "statement", "cases"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["invariant", "activation", "ordered-activation"] },
+        "statement": { "type": "string", "minLength": 1 },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "phase", "polarity", "precondition", "expectedObservation"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "phase": { "enum": ["ordinary", "inactive", "boundary", "intermediate", "active"] },
+              "polarity": { "enum": ["must-hold", "must-not-hold"] },
+              "precondition": { "type": "string", "minLength": 1 },
+              "expectedObservation": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "strings": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "nonEmptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

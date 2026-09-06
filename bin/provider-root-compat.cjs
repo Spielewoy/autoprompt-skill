@@ -5,7 +5,33 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
-function createProviderRootCompat(providerLabels) {
+function loadCanonicalPersonaCount(root = path.resolve(__dirname, '..')) {
+  const registry = JSON.parse(fs.readFileSync(
+    path.join(root, 'scripts', 'install', 'codex-package-registry.json'), 'utf8',
+  ))
+  const contract = JSON.parse(fs.readFileSync(path.join(root, registry.canonicalInputs.contract), 'utf8'))
+  const personaCount = contract.personas.length
+  if (!Number.isSafeInteger(personaCount) || personaCount < 1) {
+    throw new Error('canonical provider inventory is invalid')
+  }
+  return personaCount
+}
+
+function createProviderRootCompat(providerLabels, inventory) {
+  let canonicalPersonaCount
+  function codexPersonaCount(providerId) {
+    if (providerId !== 'codex') return 25
+    if (canonicalPersonaCount === undefined) {
+      canonicalPersonaCount = inventory
+        ? inventory.personaCount
+        : loadCanonicalPersonaCount()
+      if (!Number.isSafeInteger(canonicalPersonaCount) || canonicalPersonaCount < 1) {
+        throw new Error('canonical provider inventory is invalid')
+      }
+    }
+    return canonicalPersonaCount
+  }
+
   const weakLayoutMarkers = Object.freeze([
     Object.freeze({
       label: 'skills/autoprompt/SKILL.md',
@@ -54,13 +80,15 @@ function createProviderRootCompat(providerLabels) {
           },
         }),
         Object.freeze({
-          label: 'skills/autoprompt/agents-runtime/ap-*.toml (25 files)',
-          check(root) {
+          label(providerId) {
+            return `skills/autoprompt/agents-runtime/ap-*.toml (${codexPersonaCount(providerId)} files)`
+          },
+          check(root, providerId) {
             return matchAnchoredPatternCount(
               root,
               ['skills', 'autoprompt', 'agents-runtime'],
               /^ap-.*\.toml$/,
-              25,
+              () => codexPersonaCount(providerId),
             )
           },
         }),
@@ -230,7 +258,12 @@ function createProviderRootCompat(providerLabels) {
 
   return Object.freeze({
     inspect(root, providerId) {
-      const evidence = collectProviderLayoutEvidence(root, providerLayouts, weakLayoutMarkers)
+      const evidence = collectProviderLayoutEvidence(
+        root,
+        providerLayouts,
+        weakLayoutMarkers,
+        providerId,
+      )
       if (evidence.unsafe) return { status: 'unsafe' }
 
       const selected = evidence.providers[providerId]
@@ -349,7 +382,10 @@ function matchAnchoredPatternCount(root, segments, pattern, expectedCount) {
   }
 
   if (matches === 0) return { status: 'missing', absolutePath: target.absolutePath }
-  if (matches === expectedCount) return { status: 'match', absolutePath: target.absolutePath }
+  const resolvedExpectedCount = typeof expectedCount === 'function'
+    ? expectedCount()
+    : expectedCount
+  if (matches === resolvedExpectedCount) return { status: 'match', absolutePath: target.absolutePath }
   return { status: 'partial', absolutePath: target.absolutePath }
 }
 
@@ -447,7 +483,12 @@ function matchAnchoredPrimePackage(root, segments) {
   }
 }
 
-function collectProviderLayoutEvidence(root, providerLayouts, weakLayoutMarkers) {
+function collectProviderLayoutEvidence(
+  root,
+  providerLayouts,
+  weakLayoutMarkers,
+  inspectedProviderId,
+) {
   const providers = {}
   let unsafe = false
 
@@ -457,17 +498,23 @@ function collectProviderLayoutEvidence(root, providerLayouts, weakLayoutMarkers)
     const uniqueMatches = []
     const uniquePartial = []
     for (const marker of layout.markers) {
-      const result = marker.check(root)
+      const result = marker.check(root, inspectedProviderId)
       if (result.status === 'unsafe') {
         unsafe = true
         break
       }
       if (result.status === 'match') {
-        matches.push(marker.label)
-        if (!marker.shared) uniqueMatches.push(marker.label)
+        const markerLabel = typeof marker.label === 'function'
+          ? marker.label(inspectedProviderId)
+          : marker.label
+        matches.push(markerLabel)
+        if (!marker.shared) uniqueMatches.push(markerLabel)
       } else if (result.status === 'partial') {
-        partial.push(marker.label)
-        if (!marker.shared) uniquePartial.push(marker.label)
+        const markerLabel = typeof marker.label === 'function'
+          ? marker.label(inspectedProviderId)
+          : marker.label
+        partial.push(markerLabel)
+        if (!marker.shared) uniquePartial.push(markerLabel)
       }
     }
     providers[providerId] = {

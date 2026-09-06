@@ -3,3 +3,11 @@
 *.cjs text eol=lf
 *.sh text eol=lf
 bin/** text eol=lf
+tests/fixtures/codex-route-holdout-v2.jsonl text eol=lf
+agents/codex/** text eol=lf
+agents/manifests/codex-runtime.json text eol=lf
+scripts/release/codex/** text eol=lf
+# These bytes participate in the Codex install/runtime trust hashes too.
+agents/contracts/** text eol=lf
+scripts/install/*.json text eol=lf
+scripts/install/codex-discovery-shim.md text eol=lf

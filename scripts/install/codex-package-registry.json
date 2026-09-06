@@ -1,0 +1,161 @@
+{
+  "schemaVersion": 1,
+  "provider": "codex",
+  "compatibility": {
+    "cliMinimum": "0.148.0",
+    "runtimeContract": "2.0.0"
+  },
+  "canonicalInputs": {
+    "contract": "agents/contracts/autoprompt.contract.json",
+    "conductor": "agents/contracts/generic.md",
+    "gates": "agents/contracts/gates.json",
+    "modes": [
+      "agents/contracts/product.json",
+      "agents/contracts/routes.json",
+      "agents/contracts/roles.json",
+      "agents/contracts/state-machine.json"
+    ],
+    "playbooks": "agents/contracts/frameworks/README.md",
+    "frameworks": "agents/contracts/frameworks",
+    "personas": "agents/contracts/personas",
+    "rolePolicy": "agents/codex/agents/role-policy.json"
+  },
+  "generatedOutputs": {
+    "README.md": "agents/codex/README.md",
+    "SKILL.md": "agents/codex/SKILL.md",
+    "GATES.md": "agents/codex/GATES.md",
+    "MODES.md": "agents/codex/MODES.md",
+    "PLAYBOOKS.md": "agents/codex/PLAYBOOKS.md",
+    "frameworks": "agents/codex/frameworks",
+    "agents": "agents/codex/agents",
+    "version": "agents/codex/VERSION"
+  },
+  "frameworkRoutes": {
+    "QUICKSTART.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "README.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "apply.md": ["DIRECT"],
+    "backend-build.md": ["LIGHT", "ROADMAP"],
+    "backend-fix.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "backend-implement.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "composition.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "docs.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "frontend-build.md": ["LIGHT", "ROADMAP"],
+    "frontend-fix.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "frontend-implement.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "frontend-review.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "generation.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "plan-design.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "plan-research.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "plan-scope.md": ["ROADMAP"],
+    "polish.md": ["DIRECT", "LIGHT", "ROADMAP"],
+    "refactor.md": ["DIRECT", "LIGHT", "ROADMAP"]
+  },
+  "installation": {
+    "discoveryShimSource": "scripts/install/codex-discovery-shim.md",
+    "discoveryShimReceipt": "skills/autoprompt/SKILL.md",
+    "privateBundlesRoot": ".autoprompt-private/bundles",
+    "generatedAgentsRelative": "agents-runtime",
+    "embeddedManifest": ".autoprompt-runtime-manifest.json",
+    "trustArtifacts": [
+      {
+        "source": "agents/contracts/providers.json",
+        "destination": "skills/contracts/providers.json"
+      },
+      {
+        "source": "agents/contracts/codex-trusted-public-keys.json",
+        "destination": "skills/contracts/codex-trusted-public-keys.json"
+      },
+      {
+        "source": "agents/contracts/codex-live-conformance-evidence.json",
+        "destination": "skills/contracts/codex-live-conformance-evidence.json"
+      }
+    ],
+    "supportedModes": ["standalone"],
+    "defaultMode": "standalone",
+    "sourceExclusions": [
+      "README.md",
+      "model-routing-registry.schema.json",
+      "agents/README.md",
+      "agents/validate_role_policy.py"
+    ]
+  },
+  "releaseHistory": {
+    "path": "scripts/release/codex/release-history.json",
+    "algorithm": "sha256-chain-v1",
+    "genesisRecordDigest": "d5c4d97bf557e513680dd7d2dcd14ed6ac0769f89b538297b4103221ff0a74ab"
+  },
+  "historicalGlobalRoleHashes": "scripts/install/legacy-codex-role-hashes.json",
+  "historicalGlobalRoleHashesSha256": "da2726348402c099757e9e6543bc19777bacdb57cc97dd55f7f71d6fb34e8d70",
+  "requiredCapabilities": [
+    "explicit-activation",
+    "immutable-request-envelope",
+    "no-default-route",
+    "owned-writes",
+    "independent-checking",
+    "typed-stop-results"
+  ],
+  "requiredRoleCapabilities": [
+    {
+      "id": "route-analysis",
+      "logicalRole": "route-analyst",
+      "requiredModes": ["route-analysis"]
+    },
+    {
+      "id": "roadmap-coordination",
+      "logicalRole": "mission-coordinator",
+      "requiredModes": ["roadmap-integration"]
+    },
+    {
+      "id": "work-group-management",
+      "logicalRole": "ap-work-group-manager",
+      "requiredModes": ["roadmap-work-group"]
+    },
+    {
+      "id": "roadmap-authoring",
+      "logicalRole": "roadmap-author",
+      "requiredModes": ["author", "repair"]
+    },
+    {
+      "id": "named-unknown-inspection",
+      "logicalRole": "scout",
+      "requiredModes": ["named-unknown"]
+    },
+    {
+      "id": "assigned-production",
+      "logicalRole": "worker",
+      "requiredModes": ["implementation"]
+    },
+    {
+      "id": "independent-checking",
+      "logicalRole": "independent-checker",
+      "requiredModes": ["combined", "review", "behavior-test"]
+    }
+  ],
+  "promptRequirements": {
+    "ap-run-coordinator": [
+      "Before the first child assignment and after every steering input, mechanically resolve the active request pointer, read its exact bytes, compute SHA-256, and compare it with the bound request-envelope hash. Do not dispatch when the pointer is missing or the hash differs; return REQUEST_BINDING_INVALID."
+    ]
+  },
+  "plainLanguageAuditedExceptions": [
+    {
+      "path": "agents/codex/workflow/captured-domain.js",
+      "sha256": "c216728edfb1a2b6622e78f8e0eda043154e0b027abb8f8913330c398e3d02ec",
+      "terms": ["candidate", "mission"],
+      "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
+    }
+  ],
+  "migrationSources": [
+    "agents/contracts/roles.json#compatibilityAliases",
+    "scripts/install/legacy-codex-compat.json"
+  ],
+  "requiredMigrations": [
+    {
+      "id": "role-alias-contract",
+      "source": "agents/contracts/roles.json#compatibilityAliases"
+    },
+    {
+      "id": "installed-role-compatibility",
+      "source": "scripts/install/legacy-codex-compat.json"
+    }
+  ]
+}

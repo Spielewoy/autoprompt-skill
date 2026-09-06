@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "benchmark-route-holdout.v1",
+  "holdoutId": "codex-route-synthetic-v2",
+  "createdAt": "2026-08-22T00:00:00.000Z",
+  "sealedAt": "2026-08-22T00:00:00.000Z",
+  "purpose": "Deterministic route-classifier mechanics, paraphrase invariance, and costly-error accounting; not route-quality evaluation.",
+  "developmentExamplesSeparated": false,
+  "fixture": {
+    "relativePath": "tests/fixtures/codex-route-holdout-v2.jsonl",
+    "sha256": "3e56d2e9f0ff29c19ec59a18838967355e9fee7b7f1d155eb5486c004e5a6b09",
+    "rowCount": 16
+  },
+  "labels": {
+    "sourceKind": "synthetic-design-fixture",
+    "independentlyHumanLabeled": false,
+    "raterCount": 0,
+    "agreement": {
+      "metric": null,
+      "value": null,
+      "evidenceSha256": null
+    },
+    "adjudicationEvidenceSha256": null
+  },
+  "tuningFreeze": {
+    "frozenBeforePromptTuning": false,
+    "implementationFingerprint": null,
+    "evidenceSha256": null
+  }
+}

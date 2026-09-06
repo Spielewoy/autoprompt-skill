@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/plain-language.schema.json",
+  "title": "Autoprompt v2 plain-language contract",
+  "type": "object",
+  "required": [
+    "kind",
+    "contractVersion",
+    "humanFacingFields",
+    "userVisibleCodeFields",
+    "lintPolicy",
+    "userVisibleCodes",
+    "avoid",
+    "technicalTermsAllowedOnlyIn",
+    "instructionFields",
+    "instructionRules"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "kind": {
+      "const": "autoprompt-plain-language-contract"
+    },
+    "contractVersion": {
+      "const": "2.0.0"
+    },
+    "humanFacingFields": {
+      "type": "array",
+      "minItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "userVisibleCodeFields": {
+      "type": "object",
+      "required": [
+        "required",
+        "descriptionMustStandAlone"
+      ],
+      "properties": {
+        "required": {
+          "const": [
+            "code",
+            "description"
+          ]
+        },
+        "descriptionMustStandAlone": {
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "lintPolicy": {
+      "type": "object",
+      "required": [
+        "mode",
+        "matching",
+        "scopes",
+        "exceptionsRequire",
+        "unapprovedExceptionResult"
+      ],
+      "properties": {
+        "mode": {
+          "const": "fail"
+        },
+        "matching": {
+          "const": "case-insensitive-word-or-phrase"
+        },
+        "scopes": {
+          "type": "array",
+          "minItems": 4,
+          "uniqueItems": true,
+          "contains": {
+            "const": "generated-provider-instructions"
+          }
+        },
+        "exceptionsRequire": {
+          "const": [
+            "term",
+            "location",
+            "technicalContext",
+            "plainExplanation"
+          ]
+        },
+        "unapprovedExceptionResult": {
+          "const": "fail"
+        }
+      },
+      "additionalProperties": false
+    },
+    "userVisibleCodes": {
+      "type": "array",
+      "minItems": 26,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": [
+          "code",
+          "description"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]+$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 12
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "avoid": {
+      "type": "object",
+      "minProperties": 14,
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "technicalTermsAllowedOnlyIn": {
+      "type": "array",
+      "minItems": 5,
+      "uniqueItems": true
+    },
+    "instructionFields": {
+      "const": [
+        "whatToRead",
+        "whatToDo",
+        "whatNotToChange",
+        "howToCheck",
+        "whatToReturn"
+      ]
+    },
+    "instructionRules": {
+      "type": "array",
+      "minItems": 6,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "additionalProperties": false
+}

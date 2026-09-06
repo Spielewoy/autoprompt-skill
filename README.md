@@ -1,14 +1,14 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="Autoprompt Skill with 45% fewer failures on agentic coding tasks" width="760"/>
+  <img src="assets/banner.svg" alt="Autoprompt Skill: pink clouds and flying geese" width="1000"/>
 </p>
 
-<p align="center">Autoprompt is a coding-agent skill that cuts failures by 45% on agentic coding tasks.</p>
+<p align="center">Autoprompt is a coding-agent workflow that cuts failures by 45% by reviewing, fixing, and rechecking its work.</p>
 
 <p align="center">
-  <a href="#benchmarks"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20points-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1: plus 14.61 points"/></a>
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=version&color=255C60&labelColor=14101F" alt="Version 1.0.4"/></a>
-  <a href="#install"><img src="https://img.shields.io/badge/support-9%20supported%20providers-255C60?style=flat-square&labelColor=14101F" alt="Nine supported providers"/></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-255C60?style=flat-square&labelColor=14101F" alt="License MIT"/></a>
+  <a href="#benchmarks"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20points-965477?style=flat-square&labelColor=302335" alt="Terminal-Bench 2.1: plus 14.61 points"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=version&color=965477&labelColor=302335" alt="Version 1.0.4"/></a>
+  <a href="#install"><img src="https://img.shields.io/badge/support-9%20supported%20providers-965477?style=flat-square&labelColor=302335" alt="Nine supported providers"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-965477?style=flat-square&labelColor=302335" alt="License MIT"/></a>
 </p>
 
 <p align="center">
@@ -69,7 +69,7 @@ autoprompt
 | Status | Coding agent | Audited requirement | Key |
 |---|---|---|---|
 | Working | [Claude Code](https://code.claude.com/docs/en/setup) | 2.1.219+; audited 2.1.233 | `claude` |
-| Working | [Codex](https://github.com/openai/codex) | Subagent-capable build; audited 0.147.0 | `codex` |
+| Working | [Codex](https://github.com/openai/codex) | Subagent-capable build; audited 0.148.0 | `codex` |
 | Working | [OpenCode](https://opencode.ai/docs/agents) | 1.18.7+; audited 1.18.18 | `opencode` |
 | Working | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; audited 7.4.22 | `kilo` |
 | Working | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; audited 1.133.0 with Copilot 0.61.0 | `vscode` |
@@ -93,6 +93,8 @@ Replace `PROVIDER` with a key from the support table, such as `claude`, `codex`,
 
 ## Benchmarks
 
+These are **version 1 benchmarks**. Version 2 benchmarks will follow.
+
 <p align="center">
   <img src="assets/terminal-bench-2.1-leaderboard.svg" width="1000" alt="Terminal-Bench 2.1 leaderboard with 18 Artificial Analysis reference scores and measured DeepSeek V4 Flash 0731 scores with and without Autoprompt."/>
 </p>
@@ -112,7 +114,7 @@ Replace `PROVIDER` with a key from the support table, such as `claude`, `codex`,
 
 </details>
 
-DeepSeek's 82.7% used its own test setup, so it is a reference point, not a comparable third run. Read the [setup and evidence boundaries](docs/benchmarks/terminal-bench-2.1.md), or [request another benchmark](https://github.com/Spielewoy/autoprompt-skill/issues/new?template=benchmark_request.md).
+DeepSeek's 82.7% used its own test setup, so it is a reference point, not a comparable third run. Read the [setup and evidence boundaries](docs/benchmarks/terminal-bench-2.1.md), or [request another benchmark](https://github.com/Spielewoy/autoprompt-skill/issues/new).
 
 <details>
 <summary><strong>Expected trade-off:</strong> about 3x the time and 2x the tokens.</summary>
@@ -123,9 +125,30 @@ Timing and token logs were not retained, so these are planning estimates based o
 
 ## Anatomy of an invocation
 
-<p align="center">
-  <a href="assets/anatomy.svg"><img src="assets/anatomy.svg" alt="Anatomy of an Autoprompt invocation: trigger, concurrency mode, agent cap, model routing, and goal" width="1000"/></a>
-</p>
+```text
+/autoprompt mode=custom max_subs=4 agents=auto <goal>
+```
+
+| Part | What it does |
+|---|---|
+| `/autoprompt` | Starts the skill with your request. |
+| `mode=custom` | Lets you set concurrency; `tokensaver` and `wide` are also available. |
+| `max_subs=4` | Allows up to four subagents to run at once. |
+| `agents=auto` | Selects models where supported. Use `off` to inherit the current model, or supply a model list. |
+| `<goal>` | Describes the result you want, constraints, and how to check success. |
+| `path=` | Chooses `auto`, `direct`, `light`, or `roadmap`. See [work paths](docs/faq/work-paths.md). |
+
+In Codex, pass the optional path as a separate argument before the quoted request:
+
+```bash
+autoprompt activate codex -- path=light "add retries and test the edge cases"
+```
+
+To set Codex concurrency, use separate arguments and leave route selection automatic:
+
+```bash
+autoprompt activate codex -- --concurrency custom --max-subs 4 "add retries and test the edge cases"
+```
 
 ## Run controls
 
@@ -139,13 +162,13 @@ Use `mode=` to set concurrency. Use `agents=` to route models where the host sup
 ## How it works
 
 <p align="center">
-  <img src="assets/how-it-works-loop.svg" alt="Autoprompt workflow from prompt through planning, build, review, tests, sign-off, and sweep" width="1100"/>
+  <a href="assets/how-it-works-loop.svg"><img src="assets/how-it-works-loop.svg" alt="Autoprompt workflow: choose a route, plan, build, check, and finish" width="1100"/></a>
 </p>
 
 ## The agents
 
 <p align="center">
-  <img src="assets/how-it-works-hierarchy.svg" alt="Autoprompt agent hierarchy from prompt to coordinators, manager, execution lanes, and independent checks" width="1100"/>
+  <a href="assets/how-it-works-hierarchy.svg"><img src="assets/how-it-works-hierarchy.svg" alt="Autoprompt agents: run coordinator, workers, independent checkers, and coordinators for larger jobs" width="1100"/></a>
 </p>
 
 ## Examples
@@ -157,7 +180,7 @@ Use `mode=` to set concurrency. Use `agents=` to route models where the host sup
 | Research | `/autoprompt compare job queues against this codebase and recommend one` |
 | Limit parallel work | `/autoprompt mode=custom max_subs=4 migrate every model` |
 
-Use `$autoprompt` instead of `/autoprompt` in Codex. In Oh My Pi, use `/skill:autoprompt`.
+In Codex, use `autoprompt activate codex -- "<goal>"`. In Oh My Pi, use `/skill:autoprompt`.
 
 ## FAQ
 
@@ -183,16 +206,23 @@ The layers separate coordination, management, execution, and independent judgmen
 </details>
 
 <details>
-<summary><strong>What do `mode`, `max_subs`, and `agents` do?</strong></summary>
+<summary><strong>What are the paths?</strong></summary>
 
-`mode=tokensaver` caps active subagents at six. `mode=wide` opens every ready lane. `mode=custom max_subs=N` sets your own ceiling. `agents` controls model routing where the host supports it. [Details](docs/faq/tokensaver-vs-wide-vs-custom.md)
+`path=auto` selects a route for the task. `direct` starts focused work, `light` adds a short plan, and `roadmap` organizes dependent work before execution. Every path includes independent verification. [Details](docs/faq/work-paths.md)
+
+</details>
+
+<details>
+<summary><strong>What do `mode`, `max_subs`, `agents`, and `path` do?</strong></summary>
+
+`mode=tokensaver` caps active subagents at six. `mode=wide` opens every ready lane. `mode=custom max_subs=N` sets your own ceiling. `agents` controls model routing where the host supports it, and `path` controls how the work is planned and coordinated. [Details](docs/faq/tokensaver-vs-wide-vs-custom.md)
 
 </details>
 
 <details>
 <summary><strong>Why does Autoprompt not start in the background?</strong></summary>
 
-Because it changes cost, time, and workflow. Start it explicitly with `/autoprompt <goal>`, or `$autoprompt` in Codex.
+Because it changes cost, time, and workflow. Start it explicitly with `/autoprompt <goal>`, or `autoprompt activate codex -- "<goal>"` in Codex.
 
 </details>
 

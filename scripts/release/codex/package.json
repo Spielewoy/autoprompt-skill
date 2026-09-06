@@ -1,0 +1,21 @@
+{
+  "name": "@autoprompt-skill/codex-runtime",
+  "version": "1.0.32",
+  "description": "Internal Codex runtime conformance fixture.",
+  "private": true,
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "autoprompt-codex": "bin/autoprompt-codex.cjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "autoprompt": {
+    "provider": "codex",
+    "compatibility": {
+      "codexCli": ">=0.148.0",
+      "runtimeContract": "2.0.0"
+    }
+  }
+}

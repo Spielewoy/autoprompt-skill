@@ -1,0 +1,71 @@
+{
+  "schemaVersion": "2.0.0",
+  "evidenceClass": "synthetic-economic-conformance-not-provider-canary",
+  "routeCaps": {
+    "DIRECT": {
+      "childLaunches": 6,
+      "contextBytes": 8192,
+      "noncachedInputTokens": 220000,
+      "outputTokens": 40000,
+      "usefulWorkLatencyMs": 480000,
+      "allowedEfforts": ["low", "medium", "high", "xhigh", "max"]
+    },
+    "LIGHT": {
+      "childLaunches": 8,
+      "contextBytes": 16384,
+      "noncachedInputTokens": 500000,
+      "outputTokens": 70000,
+      "usefulWorkLatencyMs": 1200000,
+      "allowedEfforts": ["low", "medium", "high", "xhigh", "max"]
+    },
+    "ROADMAP": {
+      "childLaunches": 18,
+      "contextBytes": 32768,
+      "noncachedInputTokens": 1200000,
+      "outputTokens": 160000,
+      "usefulWorkLatencyMs": 2700000,
+      "allowedEfforts": ["low", "medium", "high", "xhigh", "max"]
+    }
+  },
+  "simulations": [
+    {
+      "id": "direct-bounded-fix",
+      "route": "DIRECT",
+      "observed": {
+        "childLaunches": 3,
+        "contextBytes": 4572,
+        "noncachedInputTokens": 992,
+        "outputTokens": 93,
+        "usefulWorkLatencyMs": 180000,
+        "effort": "medium"
+      },
+      "effortInput": { "role": "worker", "difficulty": "ordinary", "risk": "ordinary" }
+    },
+    {
+      "id": "light-security-fix",
+      "route": "LIGHT",
+      "observed": {
+        "childLaunches": 3,
+        "contextBytes": 4566,
+        "noncachedInputTokens": 992,
+        "outputTokens": 93,
+        "usefulWorkLatencyMs": 720000,
+        "effort": "high"
+      },
+      "effortInput": { "role": "worker", "difficulty": "high", "risk": "high" }
+    },
+    {
+      "id": "roadmap-soc-build",
+      "route": "ROADMAP",
+      "observed": {
+        "childLaunches": 3,
+        "contextBytes": 4575,
+        "noncachedInputTokens": 992,
+        "outputTokens": 93,
+        "usefulWorkLatencyMs": 2100000,
+        "effort": "xhigh"
+      },
+      "effortInput": { "role": "worker", "difficulty": "exceptional", "risk": "critical" }
+    }
+  ]
+}

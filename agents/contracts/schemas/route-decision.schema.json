@@ -1,0 +1,1183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/route-decision.schema.json",
+  "title": "Autoprompt v2 run-owner route decision",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "status",
+    "route",
+    "routeSource",
+    "requestEnvelopeHash",
+    "recommendationHash",
+    "decidedAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "2.0.0"
+    },
+    "status": {
+      "enum": [
+        "DECIDED",
+        "WAITING_USER"
+      ]
+    },
+    "route": {
+      "oneOf": [
+        {
+          "enum": [
+            "DIRECT",
+            "LIGHT",
+            "ROADMAP"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "routeSource": {
+      "enum": ["automatic", "explicit_control"]
+    },
+    "userInputNeeded": {
+      "$ref": "#/$defs/strings"
+    },
+    "pathSelection": {
+      "type": "object",
+      "required": [
+        "mode",
+        "requestedRoute",
+        "automaticSelectionBypassed",
+        "silentRouteChangesAllowed",
+        "conflictPolicy"
+      ],
+      "properties": {
+        "mode": { "const": "exact" },
+        "requestedRoute": { "enum": ["DIRECT", "LIGHT", "ROADMAP"] },
+        "automaticSelectionBypassed": { "const": true },
+        "silentRouteChangesAllowed": { "const": false },
+        "conflictPolicy": { "const": "fail-closed" }
+      },
+      "additionalProperties": false
+    },
+    "requestedResult": {
+      "type": "string",
+      "minLength": 1
+    },
+    "successChecklist": {
+      "$ref": "#/$defs/nonEmptyStrings"
+    },
+    "plannedChecks": {
+      "$ref": "#/$defs/nonEmptyStrings"
+    },
+    "verificationObligations": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/verificationObligation" }
+    },
+    "existingTests": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "command"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "command": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "likelyAreas": {
+      "$ref": "#/$defs/strings"
+    },
+    "risks": {
+      "$ref": "#/$defs/strings"
+    },
+    "missingInformation": {
+      "$ref": "#/$defs/strings"
+    },
+    "usefulWorkerCount": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "workerOwnershipReason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "independentCheckingPlan": {
+      "type": "object",
+      "required": [
+        "checkerCount",
+        "responsibilities",
+        "nonOverlapReason"
+      ],
+      "properties": {
+        "checkerCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2
+        },
+        "responsibilities": {
+          "$ref": "#/$defs/uniqueNonEmptyStrings"
+        },
+        "nonOverlapReason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "checkerCount": {
+                "const": 1
+              }
+            },
+            "required": [
+              "checkerCount"
+            ]
+          },
+          "then": {
+            "properties": {
+              "responsibilities": {
+                "maxItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "checkerCount": {
+                "const": 2
+              }
+            },
+            "required": [
+              "checkerCount"
+            ]
+          },
+          "then": {
+            "properties": {
+              "responsibilities": {
+                "minItems": 2,
+                "maxItems": 2
+              },
+              "nonOverlapReason": {
+                "minLength": 12
+              }
+            }
+          }
+        }
+      ]
+    },
+    "chosenRouteReason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "rejectedRouteReasons": {
+      "type": "object",
+      "minProperties": 2,
+      "maxProperties": 2,
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      },
+      "propertyNames": {
+        "enum": [
+          "DIRECT",
+          "LIGHT",
+          "ROADMAP"
+        ]
+      }
+    },
+    "analystDisagreement": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "recommendation",
+            "concreteReason",
+            "analystFactsFingerprint",
+            "l0FactsFingerprint",
+            "analystClassifierFingerprint",
+            "l0ClassifierFingerprint"
+          ],
+          "properties": {
+            "recommendation": {
+              "enum": [
+                "DIRECT",
+                "LIGHT",
+                "ROADMAP"
+              ]
+            },
+            "concreteReason": {
+              "type": "string",
+              "minLength": 1
+            },
+            "analystFactsFingerprint": {
+              "$ref": "#/$defs/sha256"
+            },
+            "l0FactsFingerprint": {
+              "$ref": "#/$defs/sha256"
+            },
+            "analystClassifierFingerprint": {
+              "$ref": "#/$defs/sha256"
+            },
+            "l0ClassifierFingerprint": {
+              "$ref": "#/$defs/sha256"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "routeChangeTrigger": {
+      "type": "object",
+      "required": [
+        "event",
+        "factRequired"
+      ],
+      "properties": {
+        "event": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]+$"
+        },
+        "factRequired": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "decisionClassifications": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "question",
+          "class",
+          "owner",
+          "materiality",
+          "requiresUserDecision"
+        ],
+        "properties": {
+          "question": {
+            "type": "string",
+            "minLength": 1
+          },
+          "class": {
+            "enum": [
+              "FACTUAL",
+              "REVERSIBLE_TECHNICAL",
+              "PRODUCT_SEMANTIC",
+              "CONSEQUENTIAL_EXTERNAL",
+              "MISSION_CONTRADICTION"
+            ]
+          },
+          "owner": {
+            "enum": [
+              "evidence-owner",
+              "run-owner",
+              "technical-decision-reviewer",
+              "user"
+            ]
+          },
+          "materiality": {
+            "enum": [
+              "evidence-resolution",
+              "reversible-default",
+              "material-user-decision"
+            ]
+          },
+          "requiresUserDecision": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+              "class": { "const": "FACTUAL" }
+              },
+              "required": [
+                "class"
+              ]
+            },
+            "then": {
+              "properties": {
+                "owner": { "const": "evidence-owner" },
+                "materiality": { "const": "evidence-resolution" },
+                "requiresUserDecision": { "const": false }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "class": { "const": "REVERSIBLE_TECHNICAL" } }, "required": ["class"] },
+            "then": {
+              "properties": {
+                "owner": { "const": "run-owner" },
+                "materiality": { "const": "reversible-default" },
+                "requiresUserDecision": { "const": false }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "class": { "const": "PRODUCT_SEMANTIC" } }, "required": ["class"] },
+            "then": {
+              "properties": {
+                "owner": { "const": "user" },
+                "materiality": { "const": "material-user-decision" },
+                "requiresUserDecision": { "const": true }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "class": { "const": "CONSEQUENTIAL_EXTERNAL" } }, "required": ["class"] },
+            "then": {
+              "properties": {
+                "owner": { "const": "user" },
+                "materiality": { "const": "material-user-decision" },
+                "requiresUserDecision": { "const": true }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "class": { "const": "MISSION_CONTRADICTION" } }, "required": ["class"] },
+            "then": {
+              "properties": {
+                "owner": { "const": "user" },
+                "materiality": { "const": "material-user-decision" },
+                "requiresUserDecision": { "const": true }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "normalizedRouteFacts": {
+      "type": "object",
+      "minProperties": 1
+    },
+    "routeFactsFingerprint": {
+      "$ref": "#/$defs/sha256"
+    },
+    "classifierFingerprint": {
+      "$ref": "#/$defs/sha256"
+    },
+    "acceptance": {
+      "type": "object",
+      "required": [
+        "terminalResult",
+        "requiredAcceptance"
+      ],
+      "properties": {
+        "terminalResult": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]+$"
+        },
+        "requiredAcceptance": {
+          "$ref": "#/$defs/nonEmptyStrings"
+        }
+      },
+      "additionalProperties": false
+    },
+    "requiredCapabilities": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "isolation",
+          "topologyEnforcement",
+          "privateSkillRoot",
+          "eventStreaming",
+          "toolOutputCapture",
+          "stableChildIdentity",
+          "sameContextContinuation",
+          "cancellation",
+          "isolatedChecking",
+          "processOwnership",
+          "modelRouting"
+        ]
+      }
+    },
+    "gateSelection": {
+      "type": "object",
+      "required": ["baseWorkType", "resultFormat", "artifactOverlays", "acceptanceOverlays", "riskOverlays", "riskEvidence"],
+      "properties": {
+        "baseWorkType": {
+          "enum": ["inspect-report", "research-decide", "mechanical-change", "debug-fix", "implement-build", "refactor", "review-polish", "external-operation"]
+        },
+        "resultFormat": {
+          "enum": ["read-only-findings", "decision-record", "changed-files", "new-build", "external-receipt"]
+        },
+        "artifactOverlays": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "enum": ["read-only-result", "executable-code", "documentation", "web-visual", "data", "geometry", "hdl", "binary", "ml", "external-system"] }
+        },
+        "acceptanceOverlays": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "enum": ["exact-diff", "failing-to-passing-behavior", "behavior-preservation", "rendered-journey", "documentation-example", "receipts", "data-rules", "geometric-validation", "hdl-simulation-or-synthesis", "binary-comparison-or-site-coverage", "ml-metric-threshold", "dry-run-or-idempotency", "characterization-to-passing-behavior", "external-prepare", "external-commit", "external-reconcile", "external-rollback", "external-idempotency"] }
+        },
+        "riskOverlays": {
+          "type": "array", "uniqueItems": true,
+          "items": { "enum": ["authorization-security-privacy", "destructive-migration", "external-write-or-cost", "irreversible-action", "concurrency-or-shared-state", "performance-or-service-level", "safety-or-compliance"] }
+        },
+        "riskEvidence": {
+          "type": "object",
+          "propertyNames": {
+            "enum": ["authorization-security-privacy", "destructive-migration", "external-write-or-cost", "irreversible-action", "concurrency-or-shared-state", "performance-or-service-level", "safety-or-compliance"]
+          },
+          "additionalProperties": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "mutableResourceOwnership": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "identity",
+          "owner",
+          "ownershipMode"
+        ],
+        "properties": {
+          "kind": { "type": "string", "minLength": 1 },
+          "identity": { "type": "string", "minLength": 1 },
+          "owner": { "type": "string", "minLength": 1 },
+          "ownershipMode": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "candidateFreeze": {
+      "type": "object",
+      "required": [
+        "required",
+        "available",
+        "environmentCanBeBound",
+        "freezeBeforeIndependentCheck",
+        "frozenVersionIdRequired"
+      ],
+      "properties": {
+        "required": { "type": "boolean" },
+        "available": { "type": "boolean" },
+        "environmentCanBeBound": { "type": "boolean" },
+        "freezeBeforeIndependentCheck": { "const": true },
+        "frozenVersionIdRequired": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "assurancePreconditions": {
+      "type": "object",
+      "required": [
+        "mutableResourceOwnershipValid",
+        "candidateFreezeBeforeCheck",
+        "frozenVersionIdRequired"
+      ],
+      "properties": {
+        "mutableResourceOwnershipValid": { "const": true },
+        "candidateFreezeBeforeCheck": { "const": true },
+        "frozenVersionIdRequired": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "topology": {
+      "$ref": "#/$defs/routeTopologyOrNull"
+    },
+    "capturedDomainContracts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/capturedDomainContract" }
+    },
+    "requestEnvelopeHash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "recommendationHash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "decidedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "properties": {
+        "status": { "const": "WAITING_USER" },
+        "route": { "type": "null" },
+        "userInputNeeded": { "minItems": 1 }
+      },
+      "required": [
+        "userInputNeeded"
+      ]
+    },
+    {
+      "properties": {
+        "status": { "const": "DECIDED" },
+        "route": { "enum": ["DIRECT", "LIGHT", "ROADMAP"] },
+        "userInputNeeded": { "maxItems": 0 }
+      },
+      "required": [
+        "requestedResult",
+        "successChecklist",
+        "plannedChecks",
+        "verificationObligations",
+        "existingTests",
+        "likelyAreas",
+        "risks",
+        "missingInformation",
+        "usefulWorkerCount",
+        "workerOwnershipReason",
+        "independentCheckingPlan",
+        "chosenRouteReason",
+        "rejectedRouteReasons",
+        "analystDisagreement",
+        "routeChangeTrigger",
+        "decisionClassifications",
+        "normalizedRouteFacts",
+        "routeFactsFingerprint",
+        "classifierFingerprint",
+        "acceptance",
+        "requiredCapabilities",
+        "gateSelection",
+        "mutableResourceOwnership",
+        "candidateFreeze",
+        "assurancePreconditions",
+        "topology"
+      ]
+    }
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": { "routeSource": { "const": "explicit_control" } },
+        "required": ["routeSource"]
+      },
+      "then": { "required": ["pathSelection"] }
+    },
+    {
+      "if": {
+        "properties": { "routeSource": { "const": "automatic" } },
+        "required": ["routeSource"]
+      },
+      "then": { "not": { "required": ["pathSelection"] } }
+    },
+    {
+      "if": {
+        "properties": { "status": { "const": "WAITING_USER" } },
+        "required": ["status"]
+      },
+      "then": { "properties": { "routeSource": { "const": "automatic" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "route": {
+            "const": "DIRECT"
+          }
+        },
+        "required": [
+          "route"
+        ]
+      },
+      "then": {
+        "properties": {
+          "rejectedRouteReasons": {
+            "required": [
+              "LIGHT",
+              "ROADMAP"
+            ],
+            "not": {
+              "required": [
+                "DIRECT"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "route": {
+            "const": "LIGHT"
+          }
+        },
+        "required": [
+          "route"
+        ]
+      },
+      "then": {
+        "properties": {
+          "rejectedRouteReasons": {
+            "required": [
+              "DIRECT",
+              "ROADMAP"
+            ],
+            "not": {
+              "required": [
+                "LIGHT"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "route": {
+            "const": "ROADMAP"
+          }
+        },
+        "required": [
+          "route"
+        ]
+      },
+      "then": {
+        "properties": {
+          "rejectedRouteReasons": {
+            "required": [
+              "DIRECT",
+              "LIGHT"
+            ],
+            "not": {
+              "required": [
+                "ROADMAP"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "normalizedRouteFacts": {
+          "properties": { "capturedIncidentDomains": { "contains": { "const": "MISSION_SOURCE_CONFLICT" } } },
+          "required": ["capturedIncidentDomains"]
+        } },
+        "required": ["normalizedRouteFacts"]
+      },
+      "then": {
+        "required": ["capturedDomainContracts"],
+        "properties": { "capturedDomainContracts": { "contains": {
+          "type": "object", "properties": { "kind": { "const": "MISSION_SOURCE_CONFLICT" } }, "required": ["kind"]
+        } } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "normalizedRouteFacts": {
+          "properties": { "capturedIncidentDomains": { "contains": { "const": "SIGNATURE_SEARCH" } } },
+          "required": ["capturedIncidentDomains"]
+        } },
+        "required": ["normalizedRouteFacts"]
+      },
+      "then": {
+        "required": ["capturedDomainContracts"],
+        "properties": { "capturedDomainContracts": { "contains": {
+          "type": "object", "properties": { "kind": { "const": "SIGNATURE_SEARCH" } }, "required": ["kind"]
+        } } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "normalizedRouteFacts": {
+          "properties": { "capturedIncidentDomains": { "contains": { "const": "FIXTURE_PROVENANCE" } } },
+          "required": ["capturedIncidentDomains"]
+        } },
+        "required": ["normalizedRouteFacts"]
+      },
+      "then": {
+        "required": ["capturedDomainContracts"],
+        "properties": { "capturedDomainContracts": { "contains": {
+          "type": "object", "properties": { "kind": { "const": "FIXTURE_PROVENANCE" } }, "required": ["kind"]
+        } } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "normalizedRouteFacts": {
+          "properties": { "capturedIncidentDomains": { "contains": { "const": "HIDDEN_EXTERNAL_ORACLE" } } },
+          "required": ["capturedIncidentDomains"]
+        } },
+        "required": ["normalizedRouteFacts"]
+      },
+      "then": {
+        "required": ["capturedDomainContracts"],
+        "properties": { "capturedDomainContracts": { "contains": {
+          "type": "object", "properties": { "kind": { "const": "HIDDEN_EXTERNAL_ORACLE" } }, "required": ["kind"]
+        } } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "normalizedRouteFacts": {
+          "properties": { "capturedIncidentDomains": { "contains": { "const": "IMAGE_DATUM" } } },
+          "required": ["capturedIncidentDomains"]
+        } },
+        "required": ["normalizedRouteFacts"]
+      },
+      "then": {
+        "required": ["capturedDomainContracts"],
+        "properties": { "capturedDomainContracts": { "contains": {
+          "type": "object", "properties": { "kind": { "const": "IMAGE_DATUM" } }, "required": ["kind"]
+        } } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "normalizedRouteFacts": {
+          "properties": { "capturedIncidentDomains": { "contains": { "const": "DONE_RETRY_PROMOTION" } } },
+          "required": ["capturedIncidentDomains"]
+        } },
+        "required": ["normalizedRouteFacts"]
+      },
+      "then": {
+        "required": ["capturedDomainContracts"],
+        "properties": { "capturedDomainContracts": { "contains": {
+          "type": "object", "properties": { "kind": { "const": "DONE_RETRY_PROMOTION" } }, "required": ["kind"]
+        } } }
+      }
+    }
+  ],
+  "$defs": {
+    "verificationObligation": {
+      "type": "object",
+      "required": ["id", "kind", "statement", "cases"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["invariant", "activation", "ordered-activation"] },
+        "statement": { "type": "string", "minLength": 1 },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "phase", "polarity", "precondition", "expectedObservation"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "phase": { "enum": ["ordinary", "inactive", "boundary", "intermediate", "active"] },
+              "polarity": { "enum": ["must-hold", "must-not-hold"] },
+              "precondition": { "type": "string", "minLength": 1 },
+              "expectedObservation": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "routeTopologyOrNull": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": [
+            "valid", "errors", "route", "routeFactsFingerprint", "classifierFingerprint",
+            "requestedEffect", "acceptance", "mutableResourceOwnership", "candidateFreeze",
+            "assurancePreconditions", "workGroupManager", "counts", "childSessions",
+            "totalSessions", "coordination"
+          ],
+          "properties": {
+            "valid": { "const": true },
+            "errors": { "type": "array", "maxItems": 0 },
+            "route": { "enum": ["DIRECT", "LIGHT", "ROADMAP"] },
+            "routeFactsFingerprint": { "$ref": "#/$defs/sha256" },
+            "classifierFingerprint": { "$ref": "#/$defs/sha256" },
+            "requestedEffect": { "enum": ["inspect", "report", "research", "decide", "mutate", "external-operation"] },
+            "acceptance": { "type": "object", "minProperties": 1 },
+            "mutableResourceOwnership": { "$ref": "#/properties/mutableResourceOwnership" },
+            "candidateFreeze": { "$ref": "#/properties/candidateFreeze" },
+            "assurancePreconditions": {
+              "type": "object",
+              "required": [
+                "mutableResourceOwnershipValid", "frozenVersionIdRequired",
+                "environmentBindingRequired", "checkerResponsibilities"
+              ],
+              "properties": {
+                "mutableResourceOwnershipValid": { "const": true },
+                "frozenVersionIdRequired": { "type": "boolean" },
+                "environmentBindingRequired": { "type": "boolean" },
+                "checkerResponsibilities": { "$ref": "#/$defs/topologyCheckerResponsibilities" }
+              },
+              "additionalProperties": false
+            },
+            "workGroupManager": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/$defs/workGroupManagerTopology" }
+              ]
+            },
+            "counts": { "$ref": "#/$defs/topologyCounts" },
+            "childSessions": { "type": "integer", "minimum": 1 },
+            "totalSessions": { "type": "integer", "minimum": 2 },
+            "coordination": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/$defs/roadmapCoordination" }
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": { "properties": { "route": { "const": "ROADMAP" } }, "required": ["route"] },
+              "then": {
+                "properties": {
+                  "workGroupManager": { "$ref": "#/$defs/workGroupManagerTopology" },
+                  "coordination": { "$ref": "#/$defs/roadmapCoordination" }
+                }
+              },
+              "else": {
+                "properties": {
+                  "workGroupManager": { "type": "null" },
+                  "coordination": { "type": "null" }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "topologyCheckerResponsibilities": {
+      "type": "object",
+      "required": [
+        "valid", "checkerCount", "responsibilities", "nonOverlapReason",
+        "derivedFromFactsFingerprint", "duplicateEvidenceConsumptionForbidden"
+      ],
+      "properties": {
+        "valid": { "const": true },
+        "checkerCount": { "enum": [1, 2] },
+        "responsibilities": {
+          "type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "nonOverlapReason": { "type": "string", "minLength": 1 },
+        "derivedFromFactsFingerprint": { "$ref": "#/$defs/sha256" },
+        "duplicateEvidenceConsumptionForbidden": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "workGroupManagerTopology": {
+      "type": "object",
+      "required": [
+        "role", "physicalRoleId", "parent", "count", "admitted", "planPath",
+        "minimumUsefulWorkersPerManager", "assignedWorkerCount",
+        "disjointMutableResourceOwnershipRequired"
+      ],
+      "properties": {
+        "role": { "const": "ap-work-group-manager" },
+        "physicalRoleId": { "const": "autoprompt.v2.ap-work-group-manager" },
+        "parent": { "const": "mission-coordinator" },
+        "count": { "type": "integer", "minimum": 0 },
+        "admitted": { "type": "boolean" },
+        "planPath": { "const": "plan/ROADMAP.md" },
+        "minimumUsefulWorkersPerManager": { "const": 2 },
+        "assignedWorkerCount": { "type": "integer", "minimum": 1 },
+        "disjointMutableResourceOwnershipRequired": { "const": true }
+      },
+      "additionalProperties": false
+    },
+    "topologyCounts": {
+      "type": "object",
+      "required": [
+        "roots", "routeAnalysts", "runOwners", "roadmapAuthors", "scouts",
+        "planCheckers", "missionCoordinators", "workGroupManagers", "workers", "finalCheckers"
+      ],
+      "properties": {
+        "roots": { "const": 1 },
+        "routeAnalysts": { "enum": [0, 1] },
+        "runOwners": { "const": 1 },
+        "roadmapAuthors": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "scouts": { "type": "integer", "minimum": 0 },
+        "planCheckers": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "missionCoordinators": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "workGroupManagers": { "type": "integer", "minimum": 0 },
+        "workers": { "type": "integer", "minimum": 1 },
+        "finalCheckers": { "enum": [1, 2] }
+      },
+      "additionalProperties": false
+    },
+    "roadmapCoordination": {
+      "type": "object",
+      "required": ["roadmapAuthor", "scouts", "scoutJoin", "planChecker", "coordination"],
+      "properties": {
+        "roadmapAuthor": {
+          "type": "object",
+          "required": ["role", "layer", "parent", "count", "output", "repairOwner", "coordinatesImplementation"],
+          "properties": {
+            "role": { "const": "roadmap-author" }, "layer": { "const": "L3" },
+            "parent": { "const": "run-owner" }, "count": { "enum": [0, 1] },
+            "output": { "const": "plan/ROADMAP.md" }, "repairOwner": { "const": "SAME_AUTHOR" },
+            "coordinatesImplementation": { "const": false }
+          },
+          "additionalProperties": false
+        },
+        "scouts": {
+          "type": "object",
+          "required": ["role", "layer", "parent", "count", "namedUnknowns", "onlyForNamedUnknowns", "outputsAreReadOnly"],
+          "properties": {
+            "role": { "const": "scout" }, "layer": { "const": "L3" },
+            "parent": { "const": "run-owner" }, "count": { "type": "integer", "minimum": 0 },
+            "namedUnknowns": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "onlyForNamedUnknowns": { "const": true }, "outputsAreReadOnly": { "const": true }
+          },
+          "additionalProperties": false
+        },
+        "scoutJoin": {
+          "type": "object", "required": ["afterAllNamedScouts", "mergeOwner"],
+          "properties": { "afterAllNamedScouts": { "const": "AUTHOR_REVISE" }, "mergeOwner": { "const": "SAME_AUTHOR" } },
+          "additionalProperties": false
+        },
+        "planChecker": {
+          "type": "object",
+          "required": ["role", "layer", "parent", "count", "independentFromAuthor", "editsPlan", "recheckOwner"],
+          "properties": {
+            "role": { "const": "plan-checker" }, "layer": { "const": "L4" },
+            "parent": { "const": "run-owner" }, "count": { "enum": [0, 1] },
+            "independentFromAuthor": { "const": true }, "editsPlan": { "const": false },
+            "recheckOwner": { "const": "SAME_CHECKER" }
+          },
+          "additionalProperties": false
+        },
+        "coordination": {
+          "type": "object", "required": ["beginsAfter", "integrationOwner", "workGroupManagerAdmission"],
+          "properties": {
+            "beginsAfter": { "const": "PLAN_ACCEPTED" },
+            "integrationOwner": {
+              "type": "object", "required": ["role", "layer", "parent", "count"],
+              "properties": {
+                "role": { "const": "mission-coordinator" }, "layer": { "const": "L1" },
+                "parent": { "const": "run-owner" }, "count": { "enum": [0, 1] }
+              },
+              "additionalProperties": false
+            },
+            "workGroupManagerAdmission": {
+              "type": "object",
+              "required": [
+                "role", "physicalRoleId", "parent", "route", "planPath", "minimumUsefulWorkers",
+                "disjointMutableResourceOwnershipRequired", "singleWorkerGroupsStayWithParent"
+              ],
+              "properties": {
+                "role": { "const": "ap-work-group-manager" },
+                "physicalRoleId": { "const": "autoprompt.v2.ap-work-group-manager" },
+                "parent": { "const": "mission-coordinator" }, "route": { "const": "ROADMAP" },
+                "planPath": { "const": "plan/ROADMAP.md" }, "minimumUsefulWorkers": { "const": 2 },
+                "disjointMutableResourceOwnershipRequired": { "const": true },
+                "singleWorkerGroupsStayWithParent": { "const": true }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "nullableSha256": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "capturedDomainContract": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion", "kind", "certificateHash", "sourceDataHash",
+            "priorCertificateHash", "priorSourceDataHash", "retryAuthority"
+          ],
+          "properties": {
+            "schemaVersion": { "const": "1.0.0" },
+            "kind": { "const": "MISSION_SOURCE_CONFLICT" },
+            "certificateHash": { "$ref": "#/$defs/sha256" },
+            "sourceDataHash": { "$ref": "#/$defs/sha256" },
+            "priorCertificateHash": { "$ref": "#/$defs/sha256" },
+            "priorSourceDataHash": { "$ref": "#/$defs/sha256" },
+            "retryAuthority": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "required": ["mode", "immutableRetryBindingHash"],
+                  "properties": {
+                    "mode": { "const": "UNCHANGED_CERTIFICATE" },
+                    "immutableRetryBindingHash": { "$ref": "#/$defs/sha256" }
+                  },
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["mode", "sourceTransitionCertificateHash"],
+                  "properties": {
+                    "mode": { "const": "NEW_SOURCE_DATA" },
+                    "sourceTransitionCertificateHash": { "$ref": "#/$defs/sha256" }
+                  },
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["mode", "userAuthorityCertificateHash"],
+                  "properties": {
+                    "mode": { "const": "EXPLICIT_USER_AUTHORITY" },
+                    "userAuthorityCertificateHash": { "$ref": "#/$defs/sha256" }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion", "kind", "strongestInvariantInventoryHash",
+            "secondCandidateFamily", "identifiabilityProofHash"
+          ],
+          "properties": {
+            "schemaVersion": { "const": "1.0.0" },
+            "kind": { "const": "SIGNATURE_SEARCH" },
+            "strongestInvariantInventoryHash": { "$ref": "#/$defs/sha256" },
+            "secondCandidateFamily": { "type": "boolean" },
+            "identifiabilityProofHash": { "$ref": "#/$defs/nullableSha256" }
+          },
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": { "secondCandidateFamily": { "const": true } },
+                "required": ["secondCandidateFamily"]
+              },
+              "then": {
+                "properties": { "identifiabilityProofHash": { "$ref": "#/$defs/sha256" } }
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion", "kind", "fixtureProvenanceHash", "mutationReplayHash",
+            "initialStatus", "executablePrebuildValidationRequired", "executablePrebuildValidationHash"
+          ],
+          "properties": {
+            "schemaVersion": { "const": "1.0.0" },
+            "kind": { "const": "FIXTURE_PROVENANCE" },
+            "fixtureProvenanceHash": { "$ref": "#/$defs/sha256" },
+            "mutationReplayHash": { "$ref": "#/$defs/sha256" },
+            "initialStatus": { "const": "RED" },
+            "executablePrebuildValidationRequired": { "const": true },
+            "executablePrebuildValidationHash": { "$ref": "#/$defs/sha256" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion", "kind", "externalOracleId", "verificationRoute",
+            "maxProvisionalWorkerLaunches", "localDoneAllowed"
+          ],
+          "properties": {
+            "schemaVersion": { "const": "1.0.0" },
+            "kind": { "const": "HIDDEN_EXTERNAL_ORACLE" },
+            "externalOracleId": { "type": "string", "minLength": 1 },
+            "verificationRoute": { "const": "EXTERNALLY_VERIFIABLE_ONLY" },
+            "maxProvisionalWorkerLaunches": { "const": 1 },
+            "localDoneAllowed": { "const": false }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion", "kind", "imageEvidenceHash", "selectedInterpretation",
+            "alternativeInterpretations", "rulingHash", "certificateHash"
+          ],
+          "properties": {
+            "schemaVersion": { "const": "1.0.0" },
+            "kind": { "const": "IMAGE_DATUM" },
+            "imageEvidenceHash": { "$ref": "#/$defs/sha256" },
+            "selectedInterpretation": {
+              "type": "object",
+              "required": ["id", "interpretation"],
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "interpretation": { "type": "string", "minLength": 1 }
+              },
+              "additionalProperties": false
+            },
+            "alternativeInterpretations": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "rulingHash": { "$ref": "#/$defs/sha256" },
+            "certificateHash": { "$ref": "#/$defs/sha256" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion", "kind", "priorDoneCandidateHash", "isolationCertificateHash",
+            "requiredAcceptanceIds"
+          ],
+          "properties": {
+            "schemaVersion": { "const": "1.0.0" },
+            "kind": { "const": "DONE_RETRY_PROMOTION" },
+            "priorDoneCandidateHash": { "$ref": "#/$defs/sha256" },
+            "isolationCertificateHash": { "$ref": "#/$defs/sha256" },
+            "requiredAcceptanceIds": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "strings": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "nonEmptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "uniqueNonEmptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

@@ -1,8 +1,0 @@
-blank_issues_enabled: false
-contact_links:
-  - name: Support guide
-    url: https://github.com/Spielewoy/autoprompt-skill/blob/main/docs/SUPPORT.md
-    about: Check diagnostics, supported clients, and the right issue route.
-  - name: Security policy
-    url: https://github.com/Spielewoy/autoprompt-skill/blob/main/docs/SECURITY.md
-    about: Report vulnerabilities privately before sharing any details.

@@ -1,0 +1,305 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/codex-role-policy-v2.json",
+  "title": "Autoprompt Codex role policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "policy_id",
+    "policy_version",
+    "enforcement",
+    "instruction_guards",
+    "control_plane",
+    "reasoning_risk_policy",
+    "compatibility_policy",
+    "resource_set_definitions",
+    "logical_roles",
+    "mutual_exclusion_groups",
+    "checker_selection",
+    "manager_admission",
+    "schemas",
+    "physical_roles"
+  ],
+  "properties": {
+    "$schema": { "const": "./role-policy.schema.json" },
+    "policy_id": { "const": "autoprompt.codex.role-policy" },
+    "policy_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "enforcement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "deny_by_default", "prompt_text_is_not_enforcement", "enforcers", "violation"],
+      "properties": {
+        "required": { "const": true },
+        "deny_by_default": { "const": true },
+        "prompt_text_is_not_enforcement": { "const": true },
+        "enforcers": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "enum": ["supervisor", "provider-generator"] }
+        },
+        "violation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "description"],
+          "properties": {
+            "code": { "const": "ROLE_POLICY_DENIED" },
+            "description": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "instruction_guards": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plain_language", "untrusted_input"],
+      "properties": {
+        "plain_language": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enforced_by", "scan_fields", "forbidden_terms", "physical_id_exception", "violation"],
+          "properties": {
+            "enforced_by": { "type": "array", "contains": { "const": "provider-generator" } },
+            "scan_fields": { "type": "array", "minItems": 2, "uniqueItems": true, "items": { "type": "string" } },
+            "forbidden_terms": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+            "physical_id_exception": { "type": "boolean" },
+            "violation": { "type": "object", "required": ["code", "description"] }
+          }
+        },
+        "untrusted_input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enforced_by", "required_prompt_text", "untrusted_sources", "allowed_instruction_sources", "contradiction_patterns", "violation"],
+          "properties": {
+            "enforced_by": { "type": "array", "contains": { "const": "provider-generator" } },
+            "required_prompt_text": { "type": "string", "minLength": 1 },
+            "untrusted_sources": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+            "allowed_instruction_sources": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+            "contradiction_patterns": { "type": "array", "minItems": 4, "uniqueItems": true, "items": { "type": "string" } },
+            "violation": { "type": "object", "required": ["code", "description"] }
+          }
+        }
+      }
+    },
+    "control_plane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "logical_role", "logical_version", "layer", "external_schema_ref", "allowed_parent", "allowed_children", "can_dispatch", "decision_rights", "input_schema_id", "output_schema_id"],
+      "properties": {
+        "id": { "const": "L0" },
+        "logical_role": { "const": "run-owner" },
+        "logical_version": { "type": "string" },
+        "layer": { "const": "L0" },
+        "external_schema_ref": { "type": "string", "minLength": 1 },
+        "allowed_parent": { "const": "USER" },
+        "allowed_children": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+        "can_dispatch": { "const": true },
+        "decision_rights": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+        "input_schema_id": { "type": "string" },
+        "output_schema_id": { "type": "string" }
+      }
+    },
+    "reasoning_risk_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["independent_from_layer", "assignment_fields", "reasoning_classes", "risk_classes"],
+      "properties": {
+        "independent_from_layer": { "const": true },
+        "assignment_fields": { "type": "array", "minItems": 4, "uniqueItems": true, "items": { "type": "string" } },
+        "reasoning_classes": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } },
+        "risk_classes": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } }
+      }
+    },
+    "compatibility_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["read_versions", "write_version", "legacy_write_allowed", "telemetry_required", "telemetry_output_schema_id", "telemetry_fields"],
+      "properties": {
+        "read_versions": { "type": "array", "minItems": 2, "uniqueItems": true, "items": { "type": "string" } },
+        "write_version": { "const": "2.0.0" },
+        "legacy_write_allowed": { "const": false },
+        "telemetry_required": { "const": true },
+        "telemetry_output_schema_id": { "type": "string" },
+        "telemetry_fields": { "type": "array", "minItems": 8, "uniqueItems": true, "items": { "type": "string" } }
+      }
+    },
+    "resource_set_definitions": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "resolved_by", "rules"],
+        "properties": {
+          "kind": { "enum": ["fixed", "assignment-resolved"] },
+          "resolved_by": { "enum": ["supervisor", "provider-adapter"] },
+          "value": { "type": "string" },
+          "rules": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } }
+        }
+      }
+    },
+    "logical_roles": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["version", "layer", "reasoning_class", "risk_class", "responsibility"],
+        "properties": {
+          "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+          "layer": { "enum": ["L0", "PRE_ROUTE", "L1", "L2", "L3", "L4", "C0_COMPAT"] },
+          "reasoning_class": { "type": "string", "minLength": 1 },
+          "risk_class": { "type": "string", "minLength": 1 },
+          "responsibility": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "mutual_exclusion_groups": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["capacity", "scope", "key_from"],
+        "properties": {
+          "capacity": { "const": 1 },
+          "scope": { "enum": ["run", "work-group", "question", "resource-owner", "check-version", "named-risk", "descriptor"] },
+          "key_from": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "checker_selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selected_by", "selection_schema_id", "bound_to", "unique_mode_per_version", "combined_mode", "combined_conflicts_with", "split_modes", "separate_named_modes", "mode_contracts", "rules"],
+      "properties": {
+        "selected_by": { "const": "L0" },
+        "selection_schema_id": { "const": "assignment.checker-selection.v2" },
+        "bound_to": { "type": "array", "minItems": 2, "uniqueItems": true, "items": { "type": "string" } },
+        "unique_mode_per_version": { "const": true },
+        "combined_mode": { "const": "combined" },
+        "combined_conflicts_with": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+        "split_modes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+        "separate_named_modes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+        "mode_contracts": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["decision_authority", "mutual_exclusion_group", "risk_class"],
+            "properties": {
+              "decision_authority": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+              "mutual_exclusion_group": { "type": "string", "minLength": 1 },
+              "risk_class": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "rules": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } }
+      }
+    },
+    "manager_admission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selected_role", "input_schema_id", "route", "plan_path", "parent_role", "predicate"],
+      "properties": {
+        "selected_role": { "const": "ap-work-group-manager" },
+        "input_schema_id": { "const": "assignment.manager.v2" },
+        "route": { "const": "ROADMAP" },
+        "plan_path": { "const": "plan/ROADMAP.md" },
+        "parent_role": { "const": "ap-run-coordinator" },
+        "predicate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minimum_useful_workers", "require_unique_assignment_ids", "require_distinct_owned_work", "require_pairwise_disjoint_resources", "require_coordination_value_reason", "reject_single_worker"],
+          "properties": {
+            "minimum_useful_workers": { "const": 2 },
+            "require_unique_assignment_ids": { "const": true },
+            "require_distinct_owned_work": { "const": true },
+            "require_pairwise_disjoint_resources": { "const": true },
+            "require_coordination_value_reason": { "const": true },
+            "reject_single_worker": { "const": true }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["$schema", "$id", "type", "required", "properties"]
+      }
+    },
+    "physical_roles": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/physicalRole" }
+    }
+  },
+  "$defs": {
+    "physicalRole": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "logical_role",
+        "logical_version",
+        "layer",
+        "phase",
+        "mode",
+        "supported_modes",
+        "sandbox_mode",
+        "activation_allowed",
+        "telemetry_required",
+        "allowed_parents",
+        "allowed_children",
+        "can_dispatch",
+        "resource_sets",
+        "decision_rights",
+        "input_schema_id",
+        "output_schema_id",
+        "compatibility_alias",
+        "mutual_exclusion_group"
+      ],
+      "properties": {
+        "logical_role": { "type": "string", "minLength": 1 },
+        "logical_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "layer": { "enum": ["PRE_ROUTE", "L1", "L2", "L3", "L4", "C0_COMPAT"] },
+        "phase": { "type": "string", "minLength": 1 },
+        "mode": { "type": "string", "minLength": 1 },
+        "supported_modes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "sandbox_mode": { "enum": ["read-only", "workspace-write"] },
+        "activation_allowed": { "type": "boolean" },
+        "telemetry_required": { "type": "boolean" },
+        "allowed_parents": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+        "allowed_children": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+        "can_dispatch": { "type": "boolean" },
+        "resource_sets": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["read", "write", "exclusive"],
+          "properties": {
+            "read": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+            "write": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+            "exclusive": { "type": "array", "uniqueItems": true, "items": { "type": "string" } }
+          }
+        },
+        "decision_rights": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+        "input_schema_id": { "type": "string", "minLength": 1 },
+        "output_schema_id": { "type": "string", "minLength": 1 },
+        "compatibility_alias": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "alias_of", "remove_after"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "alias_of": { "type": ["string", "null"] },
+            "remove_after": { "type": ["string", "null"] }
+          }
+        },
+        "mutual_exclusion_group": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

@@ -6,6 +6,7 @@
     "GATES.md",
     "MODES.md",
     "PLAYBOOKS.md",
+    "SKILL.md",
     "VERSION",
     "agents/ap-arbiter.toml",
     "agents/ap-depth-prober.toml",
@@ -16,6 +17,7 @@
     "agents/ap-fresh-verifier.toml",
     "agents/ap-goal-checker.toml",
     "agents/ap-implementer.toml",
+    "agents/ap-independent-checker.toml",
     "agents/ap-intake.toml",
     "agents/ap-janitor.toml",
     "agents/ap-juror.toml",
@@ -25,6 +27,10 @@
     "agents/ap-re-anchor.toml",
     "agents/ap-researcher.toml",
     "agents/ap-reviewer.toml",
+    "agents/ap-roadmap-author.toml",
+    "agents/ap-roadmap-scout.toml",
+    "agents/ap-route-analyst.toml",
+    "agents/ap-run-coordinator.toml",
     "agents/ap-scope-coordinator.toml",
     "agents/ap-scoper.toml",
     "agents/ap-scribe.toml",
@@ -32,7 +38,11 @@
     "agents/ap-sweeper.toml",
     "agents/ap-synthesizer.toml",
     "agents/ap-verifier.toml",
+    "agents/ap-work-group-manager.toml",
+    "agents/ap-worker.toml",
     "agents/openai.yaml",
+    "agents/role-policy.json",
+    "agents/role-policy.schema.json",
     "frameworks/QUICKSTART.md",
     "frameworks/README.md",
     "frameworks/apply.md",
@@ -51,65 +61,711 @@
     "frameworks/plan-scope.md",
     "frameworks/polish.md",
     "frameworks/refactor.md",
+    "workflow/budget-controller.js",
+    "workflow/captured-domain.js",
+    "workflow/check-sandbox.js",
     "workflow/codex-agent-casting.js",
     "workflow/codex-agent-profile.js",
+    "workflow/codex-executable.js",
+    "workflow/context-envelope.js",
+    "workflow/effort-policy.js",
+    "workflow/event-log.js",
+    "workflow/finalizer.js",
+    "workflow/generation-control.js",
+    "workflow/json-schema-validator.js",
+    "workflow/mission-lock.js",
+    "workflow/phase-budget.js",
+    "workflow/process-owner.js",
+    "workflow/recovery-checkpoint.js",
+    "workflow/request-envelope.js",
+    "workflow/route-decision.js",
+    "workflow/route-transcript.js",
+    "workflow/router.js",
+    "workflow/run-record.js",
+    "workflow/runtime-state.js",
+    "workflow/safe-run-root.js",
+    "workflow/scheduler.js",
+    "workflow/settings.js",
+    "workflow/supervisor.ps1",
+    "workflow/supervisor.sh",
+    "workflow/worker-workspace.js"
+  ],
+  "sha256": {
+    "GATES.md": "f8ac372da3798cae8302c48d506f7f9a9cf21150799d87b3b8f6797d1269b5af",
+    "MODES.md": "83b385625fa8b9a25059653bd019692bea046d261d1606dfad82f616c6824ee4",
+    "PLAYBOOKS.md": "0e0ea7adc2adaf8202cac2db193bcb656f51ee85b0b7a6e89944af084ecffdd5",
+    "SKILL.md": "fdb88dbe96c23c54c091274a30f0b7b1610144e035668986ff562445493019e8",
+    "VERSION": "658e42e38159081e7af111e618484da6eaf9371197c9a359fddf5d2f009644ef",
+    "agents/ap-arbiter.toml": "c0844708f5c2fe968727fe01aaea51992e091a8e4aa3e206ec6f5bbf5c5d299d",
+    "agents/ap-depth-prober.toml": "fc7349d0c78ee9551660ee3f36e89e812ae31d2100c95ff6c109e349b1f5f926",
+    "agents/ap-execharness-resolver.toml": "4193e3e34d9c13a278fc9d7239cbde8beb93a0ede8be5021441b493d12161f7e",
+    "agents/ap-feature-coordinator.toml": "1977cbca820f10f28bd4bbcc86f2b388a02411c6775da7c5b2dc1933ce59672d",
+    "agents/ap-framework-generator.toml": "1a360461f57781ccb12d35c57d39762166e548840685225844d57bbd4f3c6c3e",
+    "agents/ap-framework-validator.toml": "7e91355e311387ef46787f2071384cf569d27e1565c0ffda45a8875fe5970faf",
+    "agents/ap-fresh-verifier.toml": "6710052a74a4a76cdd956a60edfe09d6e0f39e6b86193a54927c8add7a9e1442",
+    "agents/ap-goal-checker.toml": "e23d1b5e0f123690975b1c9f5704f719682a1c7219228c60eb2acfcf198d4eb9",
+    "agents/ap-implementer.toml": "362cb85593743773a83a55ed133478d55e851f1e05c67f95cc18d3b6c36d1b8f",
+    "agents/ap-independent-checker.toml": "2e6c8535ecfba491b2a109e29ecfb89e89d91487e79591657a6e2b5f4054ae10",
+    "agents/ap-intake.toml": "48692574aa2fcfdfeafcaea4044da70e82d520212128c08c2251f89ab04b70c2",
+    "agents/ap-janitor.toml": "15d079949be7bb486875056b82589c6aaf91246f83e20216dfc6102212b48003",
+    "agents/ap-juror.toml": "cfeff6f8cfa87b35a48949698f7d6360d0f02e98ed58c7f840b623ad0623ed38",
+    "agents/ap-manager.toml": "676fd3be0c2b8d0e43f6b3c7f0cdf29543668aa4fe0024c59297785899ddfcdb",
+    "agents/ap-planner.toml": "33f20c328bf4ce17e4c85c80ba6188d61d71e7aa459dcf42dada1e0c7704b104",
+    "agents/ap-preflight-probe.toml": "d5c501ec772f7843ea4220669a1006831906117ba8050c1d8040037c744da8c3",
+    "agents/ap-re-anchor.toml": "7af1efaf88be651c334aa6b7849b7ef61c6b3e0c3839f5120d195553f2b36a8a",
+    "agents/ap-researcher.toml": "e7e688d542aba1c0f5848f63070121291be14380d00e054ec501311bde438039",
+    "agents/ap-reviewer.toml": "d2a3bc26976afeba022e2f1f648b2e3c566e576dc06ef6246f32621c9b0fff01",
+    "agents/ap-roadmap-author.toml": "990878058931c8d7c300a233a394032d0d79a37b72cdd9f60dfff6cf6621f91c",
+    "agents/ap-roadmap-scout.toml": "680e033cc12e22d029b15d16edae663cd0a5f244386f4e457ec1ebd91d28c6d4",
+    "agents/ap-route-analyst.toml": "d46b69dadae52accbebcd73d5fbd7d987f1f469989e2263e199d5d6d1e509a11",
+    "agents/ap-run-coordinator.toml": "cb5a5cb6cea8f46a0357ec99cc2fb35395faffea73a31ab6c3d9cf566bac633e",
+    "agents/ap-scope-coordinator.toml": "81924f55387b761fbd9117749a2f35752bb7250c6d3c9d440c2b5fe2a3c40e4c",
+    "agents/ap-scoper.toml": "c1934ce36426cfa4f64f161ced806ea6fd5c2fade733b157d795feed9dbb700b",
+    "agents/ap-scribe.toml": "308e3fffc78005d7102de03d9438a83e04c305a68ba4f760d3647acb3b4448f8",
+    "agents/ap-sweep-coordinator.toml": "15296f37ca620ce3f59037e8ba07a6708ea9f5e423575eae84a972fce9a42c1f",
+    "agents/ap-sweeper.toml": "ca93597f085596928d8c052193432539a347637e3353e90f89540b8dfa147211",
+    "agents/ap-synthesizer.toml": "eab294d06d72047415523750e5a9b16c5c46f9c4b8f4a6dbb7e518da80970a33",
+    "agents/ap-verifier.toml": "90303ad6ac1f8b72d6b36c6a1a3a2dfd7117a6d83cada59ebbe58faf40c9ebc4",
+    "agents/ap-work-group-manager.toml": "29aec0742326460452ac1c82324c209b6257ef8965383a641f1e6fe31b0146c6",
+    "agents/ap-worker.toml": "f352b56233db8d12a3c7d640fb8858714962965f917c07f4dcf6e95dd72d7f35",
+    "agents/openai.yaml": "a1499d95abd8447558c535fe5554adcc3c9b988a0a39264a6283d430effe1e94",
+    "agents/role-policy.json": "13bf7b2076107fef3db04821c294574f993c79d3559b317e9646c4df170ad505",
+    "agents/role-policy.schema.json": "b5ac8ab2c184302770536506c1472ecdac47c2ad5b94791210d16e0fab53aceb",
+    "frameworks/QUICKSTART.md": "d1db2f3b1effd54878b725ed8f9e11c88721bc3dc26ccad066e289b153af946a",
+    "frameworks/README.md": "7b58bf6d545d22016a09b02d63c5aa009a10fdc1e0ab8187eb2b7c9abd849183",
+    "frameworks/apply.md": "a421d9c2b62718de55d86f0559c9168453bac1cb63e7bf1933c0c85fd84c6ad2",
+    "frameworks/backend-build.md": "cf8e8119eb5a15a0ab248b5fe104f8b5ac55c259499505f5d86f7f66d2b717e3",
+    "frameworks/backend-fix.md": "3e9191a09e4ade8696c58e8669d8d9aa8f8761a79439acff54cbe218cab13a21",
+    "frameworks/backend-implement.md": "e65939513bfba0c4c644659150d0d21754c037eaa1c59c8aea68a1109ea77e99",
+    "frameworks/composition.md": "d2d68639bbaeeb7d4f9db2f6bc54a111656bff47f12237ddad7e21b78a52b02f",
+    "frameworks/docs.md": "a39623a4e08998183d046c3906c7fb4b6fd241930a98a433a1c9243c2704fee1",
+    "frameworks/frontend-build.md": "a77e8b7f8cb5a8ff839d333248facab486051018d7305217720c273101fb787d",
+    "frameworks/frontend-fix.md": "ee2be45658d1616a485b5c898486d654e396ec5dcc6648202f302a40d442f6a5",
+    "frameworks/frontend-implement.md": "85ba6ff2ea38619a502029c7622a1b7304d82776ef42706764960de1f3077195",
+    "frameworks/frontend-review.md": "f2c17c6e175a40b18b33c87dc53d5a89f9618f36b2bdca2c4f6602ac004fe6e2",
+    "frameworks/generation.md": "8e786196365808bdb6518f59fe321a72452b1f75f409a9108d7151f37b75c6e4",
+    "frameworks/plan-design.md": "e804b7c59013032b9a18c287db95edceb4a1364822cbf573eef37b4723c70176",
+    "frameworks/plan-research.md": "eab9f75f10830215fb1bbab21c3da7638caa0b90531daddd9bcaed690e434824",
+    "frameworks/plan-scope.md": "57be954625ca5f118eda66f568e5f4307a5fe0a83de8bc7c8cae40461824310d",
+    "frameworks/polish.md": "452c2345cc269bc3de089088723a1cc391d8ab70bffa10dba23c36f402198e82",
+    "frameworks/refactor.md": "f652a65e2f6c7b6900e67d009b3ec3f766a4f9075a5a934d994e36c4fea18afb",
+    "workflow/budget-controller.js": "60a07bf74b29c6e35b2dde3cb7fabff25177bbe20057f9f1098420e7fb74f366",
+    "workflow/captured-domain.js": "c216728edfb1a2b6622e78f8e0eda043154e0b027abb8f8913330c398e3d02ec",
+    "workflow/check-sandbox.js": "974d0f4d411ffb2d9a1d7c47fcd2751f4f0ca3d0e18792ee3175c319fbd99904",
+    "workflow/codex-agent-casting.js": "a582f8afe165600f498075c3bef15648c35a8499a5e73d3b38a0ed847be24238",
+    "workflow/codex-agent-profile.js": "b4311236ca3f361af67ed631f91934b9015b4958c16c8e212ddb954dbed829b8",
+    "workflow/codex-executable.js": "b30b01c67db4630f53a059bcdb26b0a5d5feb3ed1ca7e4934b31fe6365e2f1c5",
+    "workflow/context-envelope.js": "c869910be0f52e2fdcd09b7f8a6ccc40f9a42554e850cbfa9b52038b6933150d",
+    "workflow/effort-policy.js": "c13169b36031efc4baf1eebe0b552167d87bb0cf8c0070a97ba0dd2dfe7223aa",
+    "workflow/event-log.js": "3bd427070702935e0652fa64d4239f8203531f4bd7faca4814c02c3571e2dea6",
+    "workflow/finalizer.js": "1137ab8087765d83a7754d4557b5de2b0af7b3969f164b14253dc5d01a172349",
+    "workflow/generation-control.js": "9c9674edaed298c477f9be25517147cdd43d6068f0727a3183d4f18c3761f75c",
+    "workflow/json-schema-validator.js": "74572d64aca05293006950b0c7c46cacc105f4e7e60a1cfd3f24e2865ef1be35",
+    "workflow/mission-lock.js": "1de75f52201c848eddcfe10be33170be23fe98f7add1633d4aba3048b350bf18",
+    "workflow/phase-budget.js": "b37befa2f4874678a8a5cd00676a4796f252fe298b96cc3f50ce5a3918746610",
+    "workflow/process-owner.js": "3115bf256d0d64c41a8919e26252dfc4b08ec308056c0e2d89954e9e026d712d",
+    "workflow/recovery-checkpoint.js": "224e3426fd7413785aa143370c6ef80b5667bd7eea28bd3c630f5f21a3220ac2",
+    "workflow/request-envelope.js": "b4595d27210896ef16c54eec29436ee4456c713b7af1fd0cb4348953f76b071e",
+    "workflow/route-decision.js": "52cc84661c43fe06e8968ddc7673edb0c2146649886963fbab3b683e28f77f40",
+    "workflow/route-transcript.js": "84e639ba93f9322b90557e4a3a8d00ca2d181dabd09c845de84340c97bdbc353",
+    "workflow/router.js": "ea585d890bb25feea6ce1e794c923e0923cb2a4b5e3c010c8b358381e3feed76",
+    "workflow/run-record.js": "425dad676eadc1c511705efd10544a87a3c75a73932908b7017583d1a780eee4",
+    "workflow/runtime-state.js": "d536d72a7484a43d4ef829c01e37a2b851b8e2c6339ef8170786abaa21e428e3",
+    "workflow/safe-run-root.js": "d1ef44c66f0338b97f6676a6d62cc68b09c9fb8f123b4ca7d9018140166ff55c",
+    "workflow/scheduler.js": "f948c95e47e9be9aa2d72b261871d2985e66d002129b84b802340032f4e5d65a",
+    "workflow/settings.js": "14aa663d91f6e1316411a34621f794782bca75d199f21f616d5dedcfc1117991",
+    "workflow/supervisor.ps1": "b744ea2e58c7926722d1c9d9adb4da320c641e159eabfdf6413718c728ee5e3c",
+    "workflow/supervisor.sh": "f3bd75fa31958617ac6096f8240fdf463d35f4bbc2c92184fb67d063536eb728",
+    "workflow/worker-workspace.js": "1442f653171ab5b1d078d575df324fa75f183e0e38108751c205f3b3a0de427e"
+  },
+  "contractVersion": "2.0.0",
+  "rolePolicy": "agents/role-policy.json",
+  "logicalRoles": [
+    "ap-arbiter",
+    "ap-depth-prober",
+    "ap-execharness-resolver",
+    "ap-feature-coordinator",
+    "ap-framework-generator",
+    "ap-framework-validator",
+    "ap-fresh-verifier",
+    "ap-goal-checker",
+    "ap-implementer",
+    "ap-independent-checker",
+    "ap-intake",
+    "ap-janitor",
+    "ap-juror",
+    "ap-manager",
+    "ap-planner",
+    "ap-preflight-probe",
+    "ap-re-anchor",
+    "ap-researcher",
+    "ap-reviewer",
+    "ap-roadmap-author",
+    "ap-roadmap-scout",
+    "ap-route-analyst",
+    "ap-run-coordinator",
+    "ap-scope-coordinator",
+    "ap-scoper",
+    "ap-scribe",
+    "ap-sweep-coordinator",
+    "ap-sweeper",
+    "ap-synthesizer",
+    "ap-verifier",
+    "ap-work-group-manager",
+    "ap-worker"
+  ],
+  "entrypoints": [
     "workflow/phase-budget.js",
     "workflow/supervisor.ps1",
     "workflow/supervisor.sh"
   ],
-  "sha256": {
-    "GATES.md": "de5270f58b447b9713d3da844ce379546b392c8d069801c6eef941ebfc2c0e9e",
-    "MODES.md": "b7a3482584bdf4549d282034f6ce0aa3d4d9735e1e8441ee010cd779125b2b2f",
-    "PLAYBOOKS.md": "448d779d63eed528e1e9b0631d81af38d35944807e63f28ac26c0b2d0ff6b597",
-    "VERSION": "d1b77b88f4b9f675a900e4143ac768a21218623cfe1703ca43162388c3271bd6",
-    "agents/ap-arbiter.toml": "e8e94ed46ece6f25d8f6159e3e41c764544aa716cd763647d693308361c52155",
-    "agents/ap-depth-prober.toml": "a6ea005492c5c7f9c55c17fe7f3c66b9d405c17fb27eda1113cf0ddcc0045d1c",
-    "agents/ap-execharness-resolver.toml": "3ebd97fe986aa996b8261f7f9f118756f6975928d530749f5459102bff47abc1",
-    "agents/ap-feature-coordinator.toml": "4fcdc57698245d77c5c192a7847a930ad6b6e4597fddab02d96edee4a30b07d2",
-    "agents/ap-framework-generator.toml": "c093bf0bd9db95c894bdb3036bbefa8613e79c6d7c398887a34aeffba2f03c92",
-    "agents/ap-framework-validator.toml": "e7f5813325874cb47ef7e5ddb66d74268e706a7fa027f4e56ee7d8aba0b4f7dc",
-    "agents/ap-fresh-verifier.toml": "28af5271cc48b6a6e69c1be8436182cd69daeb7b70a546a95504bc4bfea90a5f",
-    "agents/ap-goal-checker.toml": "e891dc5d10a694bbe4154707c905dc6d2a60e6dfe644c7ecde901b5de295a491",
-    "agents/ap-implementer.toml": "c72e1251b971ce7bae723f83bbf3fe5cf918b36e0046fbb25a90abb989506c55",
-    "agents/ap-intake.toml": "9c8a966da6cc1f4500afe7497358ee1452f25e994cf56ce5fadeaa5e37e52eea",
-    "agents/ap-janitor.toml": "031e9d187413a579e9e23220ced3589211d1919e8c19b6c37347d56b0280ee61",
-    "agents/ap-juror.toml": "b6e2de3c1664232927af50fb28edbe32acfff0f2e6c358be340337f99c2cb756",
-    "agents/ap-manager.toml": "ea2600923f28610d2e0fdd0cd651fa2fceb06b5d62df2097cddb5721934927ee",
-    "agents/ap-planner.toml": "626c42e1fe861d896f3aa16b60244f7abe1cbd08dc48d0cb32825b634b2ab954",
-    "agents/ap-preflight-probe.toml": "276b6db4f07545739670d877ad7fa158583e0e467aeaeec7defa3ca359462033",
-    "agents/ap-re-anchor.toml": "59d7b0fa104930d14992d0103a0c278f854e949ccdcf8392bde2f354e5857d26",
-    "agents/ap-researcher.toml": "839fb5c14aab6ccca1c892ee04b103a20cb111f2094738795996be8a8c92f0ec",
-    "agents/ap-reviewer.toml": "0286121bd302060321538744e79b070bc0700804a49334b059dc0148e64151a9",
-    "agents/ap-scope-coordinator.toml": "b92fcec9e103d22bd40a951b5ff1c5061fdd5d236eec69e6c3830ff84faf31df",
-    "agents/ap-scoper.toml": "a8e68b1d7227269e643cc4708aa1edb70db80a617c1bb4a8eb0b0dc2328413e0",
-    "agents/ap-scribe.toml": "0fb2fac431685ebdb0e4cd56d472ced73fdb0dd9028fbb685abb74819caca8d9",
-    "agents/ap-sweep-coordinator.toml": "29a2d1eb366f552255278267e8bda686ab6d1436e71a48cfe93b6051c852c0ba",
-    "agents/ap-sweeper.toml": "47ba7341f0e7e18eb08fd422aa5d783cda1ce44c86c8649940185124ca7e2562",
-    "agents/ap-synthesizer.toml": "f5540fbc22dc00e24421286c028f494fdb473a5d56d6b5d112fddafeb62e1861",
-    "agents/ap-verifier.toml": "d0dd017ac126b7ab6c5ab1019aa717e8476ca98a8425ba422ea20d70317f3d3d",
-    "agents/openai.yaml": "a1499d95abd8447558c535fe5554adcc3c9b988a0a39264a6283d430effe1e94",
-    "frameworks/QUICKSTART.md": "cca9c0cca44a1399597e884b9ca0089759175a485de3bdb914c5d341ffa4a734",
-    "frameworks/README.md": "e9a95984ad18d815d3ce7348d3b184214f115eca661ecd4386c4e25d12515435",
-    "frameworks/apply.md": "81b421b02bb3cb71fe54a297011b744b3b4cee0dde636b84e078cc4c62fc7f1b",
-    "frameworks/backend-build.md": "c0f7ba6ecb16ff846ac8838f2db02da5f1f7f2cc76660178e6a383105b01f86c",
-    "frameworks/backend-fix.md": "77b9969c2844e13dceb2b008442fe9fb5f546003449b0777fde5e03cf4e057d9",
-    "frameworks/backend-implement.md": "92d1707aa2df1aad29dee4ed2d2ef23d3c2e708a8ee9857f7432216498234dac",
-    "frameworks/composition.md": "f2f5a9a7870d82a48ccf937eff48dabe4daf9edb616a780bd6364363152cbe38",
-    "frameworks/docs.md": "e0cbcedeeba2b8af90c68d1308a2c9dc744aca1c155235ec1b18957feeec555b",
-    "frameworks/frontend-build.md": "830d8a24d7ac4391ef914ce58df7e2ac4108d424ced52a8d60cbf1993b03bb30",
-    "frameworks/frontend-fix.md": "c4509f873327a3f90cf5377d3df8478e9cc2c82ac91ed86a2138b22983739248",
-    "frameworks/frontend-implement.md": "db282aa79283877e1b71e7e9723fab174a56a17323376e33b3b8e031622420c6",
-    "frameworks/frontend-review.md": "48397356c1b9378e10338db42e9cb907f47297839be08fd163a7b16df5e95075",
-    "frameworks/generation.md": "1ee62bcf21b8666e3ad0de04f254d9f23680277ce74566654b43a342896a870e",
-    "frameworks/plan-design.md": "a32221841ee6e838311e41bb68b47611acaeb139a86c61576601fe8e144bf870",
-    "frameworks/plan-research.md": "750bc9bbcb1bf1ff5821ffc64947dd07bb8a5af2cc226ee10bdfd0ed6590b3fe",
-    "frameworks/plan-scope.md": "62fc4a29a3bd8376248480b43edbdd196afde49c83320dd5c472eb20776cbf18",
-    "frameworks/polish.md": "1771c799d56efccc63048103c7391a0b92b7ab4fd74a59163656f68dbfa99e01",
-    "frameworks/refactor.md": "c1a938ba1c2859918f255c914ce23eac73233bec3d92ce9924cf658854083fd4",
-    "workflow/codex-agent-casting.js": "70d59a40c5e87cabb70d416111dc258637abf475996be9d4d7ca849268358fc0",
-    "workflow/codex-agent-profile.js": "1bb1041f93d719e95555b447b140f67b42a51f2a5b232db5979a8418f7567a96",
-    "workflow/phase-budget.js": "548953c67cd8ad67cea784788d45e36421ca659e8d1c2758f74f3951e3665e6a",
-    "workflow/supervisor.ps1": "3eebed561bcca8d3a9c9e710cb180af10e893cb7aa9f82566d59696cc9cea814",
-    "workflow/supervisor.sh": "3fba8ab2b1a67d526443390242bcef74c27ee366fd97dd654ba3ee9757b97428"
-  }
+  "externalDependencies": [
+    {
+      "source": "agents/contracts/codex-live-conformance-evidence.json",
+      "destination": "skills/contracts/codex-live-conformance-evidence.json",
+      "requiredFrom": "scripts/install/codex-package-registry.json",
+      "runtimeRequest": "agents/contracts/codex-live-conformance-evidence.json",
+      "requiredBy": [
+        {
+          "kind": "trust-material",
+          "requiredFrom": "scripts/install/codex-package-registry.json",
+          "runtimeRequest": "agents/contracts/codex-live-conformance-evidence.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "142d7f6c34fae8328a71ba816456aa8f9b31633d11588fe560d7ffe5509ff63e"
+    },
+    {
+      "source": "agents/contracts/codex-trusted-public-keys.json",
+      "destination": "skills/contracts/codex-trusted-public-keys.json",
+      "requiredFrom": "scripts/install/codex-package-registry.json",
+      "runtimeRequest": "agents/contracts/codex-trusted-public-keys.json",
+      "requiredBy": [
+        {
+          "kind": "trust-material",
+          "requiredFrom": "scripts/install/codex-package-registry.json",
+          "runtimeRequest": "agents/contracts/codex-trusted-public-keys.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "67fd6d5f1b68d0b5794df43b293ea852e507bc100c3ca654ce010601246624f8"
+    },
+    {
+      "source": "agents/contracts/gates.json",
+      "destination": "skills/contracts/gates.json",
+      "requiredFrom": "workflow/phase-budget.js",
+      "runtimeRequest": "../../contracts/gates.json",
+      "requiredBy": [
+        {
+          "kind": "runtime-path-resolution",
+          "requiredFrom": "workflow/phase-budget.js",
+          "runtimeRequest": "../../contracts/gates.json"
+        },
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/route-decision.js",
+          "runtimeRequest": "../../contracts/gates.json"
+        }
+      ],
+      "kind": "runtime-path-resolution",
+      "sha256": "b41cfc5bbf3088c61389449ea26a55f47cdbac2bb5c670ea684bd05d615526e1"
+    },
+    {
+      "source": "agents/contracts/plain-language.json",
+      "destination": "skills/contracts/plain-language.json",
+      "requiredFrom": "workflow/runtime-state.js",
+      "runtimeRequest": "../../contracts/plain-language.json",
+      "requiredBy": [
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/runtime-state.js",
+          "runtimeRequest": "../../contracts/plain-language.json"
+        }
+      ],
+      "kind": "static-require",
+      "sha256": "3948d709cfe809a1bac794e9761a9e326a7dd7da49c4587f2fe4c4703d776ac3"
+    },
+    {
+      "source": "agents/contracts/providers.json",
+      "destination": "skills/contracts/providers.json",
+      "requiredFrom": "workflow/router.js",
+      "runtimeRequest": "../../contracts/providers.json",
+      "requiredBy": [
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/router.js",
+          "runtimeRequest": "../../contracts/providers.json"
+        },
+        {
+          "kind": "trust-material",
+          "requiredFrom": "scripts/install/codex-package-registry.json",
+          "runtimeRequest": "agents/contracts/providers.json"
+        }
+      ],
+      "kind": "static-require",
+      "sha256": "7c97a03d2fc9892d353787d14fe3f35ec81ca51e421f8034a6d75428baf1e1b1"
+    },
+    {
+      "source": "agents/contracts/roles.json",
+      "destination": "skills/contracts/roles.json",
+      "requiredFrom": "workflow/phase-budget.js",
+      "runtimeRequest": "../../contracts/roles.json",
+      "requiredBy": [
+        {
+          "kind": "runtime-path-resolution",
+          "requiredFrom": "workflow/phase-budget.js",
+          "runtimeRequest": "../../contracts/roles.json"
+        },
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/run-record.js",
+          "runtimeRequest": "../../contracts/roles.json"
+        }
+      ],
+      "kind": "runtime-path-resolution",
+      "sha256": "c63155de262b94c8a0a806dfa57caef4cef035197b57d5734cd70a96918c2257"
+    },
+    {
+      "source": "agents/contracts/routes.json",
+      "destination": "skills/contracts/routes.json",
+      "requiredFrom": "workflow/router.js",
+      "runtimeRequest": "../../contracts/routes.json",
+      "requiredBy": [
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/router.js",
+          "runtimeRequest": "../../contracts/routes.json"
+        }
+      ],
+      "kind": "static-require",
+      "sha256": "123da21c234d6666f82e2899bd243b051a84fdde43551cfe02c11e1b89f27736"
+    },
+    {
+      "source": "agents/contracts/schemas/accounting-record.schema.json",
+      "destination": "skills/contracts/schemas/accounting-record.schema.json",
+      "requiredFrom": "workflow/budget-controller.js",
+      "runtimeRequest": "../../contracts/schemas/accounting-record.schema.json",
+      "requiredBy": [
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/budget-controller.js",
+          "runtimeRequest": "../../contracts/schemas/accounting-record.schema.json"
+        }
+      ],
+      "kind": "static-require",
+      "sha256": "78bf442052f9c750783c34dae7af1fbe4e369aecb6cb4da27c6e631ddb806ffe"
+    },
+    {
+      "source": "agents/contracts/schemas/accounting-snapshot.schema.json",
+      "destination": "skills/contracts/schemas/accounting-snapshot.schema.json",
+      "requiredFrom": "workflow/budget-controller.js",
+      "runtimeRequest": "../../contracts/schemas/accounting-snapshot.schema.json",
+      "requiredBy": [
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/budget-controller.js",
+          "runtimeRequest": "../../contracts/schemas/accounting-snapshot.schema.json"
+        }
+      ],
+      "kind": "static-require",
+      "sha256": "af3823ff08a50f3d6c4a3321f20ae7feb502a734bd87b2acbf783c9f9a5f7ac9"
+    },
+    {
+      "source": "agents/contracts/schemas/evidence.schema.json",
+      "destination": "skills/contracts/schemas/evidence.schema.json",
+      "requiredFrom": "agents/contracts/roles.json",
+      "runtimeRequest": "agents/contracts/schemas/evidence.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/roles.json",
+          "runtimeRequest": "agents/contracts/schemas/evidence.schema.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "8c226b8527ea6bb896d625033e8084032457f669920304dc5edf481b55d27331"
+    },
+    {
+      "source": "agents/contracts/schemas/gates.schema.json",
+      "destination": "skills/contracts/schemas/gates.schema.json",
+      "requiredFrom": "agents/contracts/gates.json",
+      "runtimeRequest": "./schemas/gates.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/gates.json",
+          "runtimeRequest": "./schemas/gates.schema.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "18897f45a626c3fb75a6bd09df709280a2d5fbedbb0a281c275c085897b0eb6f"
+    },
+    {
+      "source": "agents/contracts/schemas/outcome.schema.json",
+      "destination": "skills/contracts/schemas/outcome.schema.json",
+      "requiredFrom": "agents/contracts/gates.json",
+      "runtimeRequest": "agents/contracts/schemas/outcome.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/gates.json",
+          "runtimeRequest": "agents/contracts/schemas/outcome.schema.json"
+        },
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/roles.json",
+          "runtimeRequest": "agents/contracts/schemas/outcome.schema.json"
+        },
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/state-machine.json",
+          "runtimeRequest": "agents/contracts/schemas/outcome.schema.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "8a03373f89822f5122999b83f8f77543af69382a1ce465d9cc1291052566828c"
+    },
+    {
+      "source": "agents/contracts/schemas/plain-language.schema.json",
+      "destination": "skills/contracts/schemas/plain-language.schema.json",
+      "requiredFrom": "agents/contracts/plain-language.json",
+      "runtimeRequest": "./schemas/plain-language.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/plain-language.json",
+          "runtimeRequest": "./schemas/plain-language.schema.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "1616ebeb32a0f88caf2223a4b72be0a7be9c04045e10a2d724447bc714329b74"
+    },
+    {
+      "source": "agents/contracts/schemas/providers.schema.json",
+      "destination": "skills/contracts/schemas/providers.schema.json",
+      "requiredFrom": "agents/contracts/providers.json",
+      "runtimeRequest": "./schemas/providers.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/providers.json",
+          "runtimeRequest": "./schemas/providers.schema.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "f19f52e3311cc022ec975d06817f559eec9cc9ec7d22f2d12b5bafd419392d88"
+    },
+    {
+      "source": "agents/contracts/schemas/recovery-checkpoint-record.schema.json",
+      "destination": "skills/contracts/schemas/recovery-checkpoint-record.schema.json",
+      "requiredFrom": "workflow/recovery-checkpoint.js",
+      "runtimeRequest": "../../contracts/schemas/recovery-checkpoint-record.schema.json",
+      "requiredBy": [
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/recovery-checkpoint.js",
+          "runtimeRequest": "../../contracts/schemas/recovery-checkpoint-record.schema.json"
+        }
+      ],
+      "kind": "static-require",
+      "sha256": "3952416207e5969e57cf77312760c5e5afccd08b194c6cd06093a6d1c7156afc"
+    },
+    {
+      "source": "agents/contracts/schemas/recovery-checkpoint-snapshot.schema.json",
+      "destination": "skills/contracts/schemas/recovery-checkpoint-snapshot.schema.json",
+      "requiredFrom": "workflow/recovery-checkpoint.js",
+      "runtimeRequest": "../../contracts/schemas/recovery-checkpoint-snapshot.schema.json",
+      "requiredBy": [
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/recovery-checkpoint.js",
+          "runtimeRequest": "../../contracts/schemas/recovery-checkpoint-snapshot.schema.json"
+        }
+      ],
+      "kind": "static-require",
+      "sha256": "1c00f8894396655bde653cd4c8849452bf74c470bf5605d537a359f0e5eb6c31"
+    },
+    {
+      "source": "agents/contracts/schemas/request-envelope-entry.schema.json",
+      "destination": "skills/contracts/schemas/request-envelope-entry.schema.json",
+      "requiredFrom": "agents/contracts/roles.json",
+      "runtimeRequest": "agents/contracts/schemas/request-envelope-entry.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/roles.json",
+          "runtimeRequest": "agents/contracts/schemas/request-envelope-entry.schema.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "1598366d2bc204642013578f2f1f65b9ac59ecca2186a18d62d19972a2577b53"
+    },
+    {
+      "source": "agents/contracts/schemas/role-report.schema.json",
+      "destination": "skills/contracts/schemas/role-report.schema.json",
+      "requiredFrom": "agents/contracts/roles.json",
+      "runtimeRequest": "agents/contracts/schemas/role-report.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/roles.json",
+          "runtimeRequest": "agents/contracts/schemas/role-report.schema.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "c7fbe8091f400c05c41f189fa73d8205fd8259258816673b19774223fc8aac91"
+    },
+    {
+      "source": "agents/contracts/schemas/roles.schema.json",
+      "destination": "skills/contracts/schemas/roles.schema.json",
+      "requiredFrom": "agents/contracts/roles.json",
+      "runtimeRequest": "./schemas/roles.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/roles.json",
+          "runtimeRequest": "./schemas/roles.schema.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "1e31a6b5a6918570e9ffdea769092344df465d16e13a6178a468dcc2817852a6"
+    },
+    {
+      "source": "agents/contracts/schemas/route-decision.schema.json",
+      "destination": "skills/contracts/schemas/route-decision.schema.json",
+      "requiredFrom": "workflow/route-decision.js",
+      "runtimeRequest": "../../contracts/schemas/route-decision.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/routes.json",
+          "runtimeRequest": "agents/contracts/schemas/route-decision.schema.json"
+        },
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/route-decision.js",
+          "runtimeRequest": "../../contracts/schemas/route-decision.schema.json"
+        }
+      ],
+      "kind": "static-require",
+      "sha256": "68a512d54521c1473d2619041e196f63f5011fe783df112b357cb2492dd4370e"
+    },
+    {
+      "source": "agents/contracts/schemas/route-recommendation.schema.json",
+      "destination": "skills/contracts/schemas/route-recommendation.schema.json",
+      "requiredFrom": "workflow/route-decision.js",
+      "runtimeRequest": "../../contracts/schemas/route-recommendation.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/roles.json",
+          "runtimeRequest": "agents/contracts/schemas/route-recommendation.schema.json"
+        },
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/routes.json",
+          "runtimeRequest": "agents/contracts/schemas/route-recommendation.schema.json"
+        },
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/route-decision.js",
+          "runtimeRequest": "../../contracts/schemas/route-recommendation.schema.json"
+        }
+      ],
+      "kind": "static-require",
+      "sha256": "679a6a1c5b03601247dd3c7286e5a4b5afe744d8ce5e8692baf861703a4c56a1"
+    },
+    {
+      "source": "agents/contracts/schemas/routes.schema.json",
+      "destination": "skills/contracts/schemas/routes.schema.json",
+      "requiredFrom": "agents/contracts/routes.json",
+      "runtimeRequest": "./schemas/routes.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/routes.json",
+          "runtimeRequest": "./schemas/routes.schema.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "9ea95bc8d69047065b490a5fed5f745dcf6394a32dcff35540cbf67edc3e144e"
+    },
+    {
+      "source": "agents/contracts/schemas/run-record.schema.json",
+      "destination": "skills/contracts/schemas/run-record.schema.json",
+      "requiredFrom": "agents/contracts/roles.json",
+      "runtimeRequest": "agents/contracts/schemas/run-record.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/roles.json",
+          "runtimeRequest": "agents/contracts/schemas/run-record.schema.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "e89ef6798316bcf3e85bbbd099278c8ccc6408a0374d630ae8ca3e91128c3d44"
+    },
+    {
+      "source": "agents/contracts/schemas/settings.schema.json",
+      "destination": "skills/contracts/schemas/settings.schema.json",
+      "requiredFrom": "workflow/settings.js",
+      "runtimeRequest": "../../contracts/schemas/settings.schema.json",
+      "requiredBy": [
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/settings.js",
+          "runtimeRequest": "../../contracts/schemas/settings.schema.json"
+        }
+      ],
+      "kind": "static-require",
+      "sha256": "5371f940eeed001faaf11d6ae3d5373f4743a4034b127c6088fa9867177c6c77"
+    },
+    {
+      "source": "agents/contracts/schemas/state-event.schema.json",
+      "destination": "skills/contracts/schemas/state-event.schema.json",
+      "requiredFrom": "workflow/runtime-state.js",
+      "runtimeRequest": "../../contracts/schemas/state-event.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/state-machine.json",
+          "runtimeRequest": "agents/contracts/schemas/state-event.schema.json"
+        },
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/runtime-state.js",
+          "runtimeRequest": "../../contracts/schemas/state-event.schema.json"
+        }
+      ],
+      "kind": "static-require",
+      "sha256": "ae46ed956b7af10358afd2abb02930e81a79bbe342d90317b137eaf462232c63"
+    },
+    {
+      "source": "agents/contracts/schemas/state-machine.schema.json",
+      "destination": "skills/contracts/schemas/state-machine.schema.json",
+      "requiredFrom": "agents/contracts/state-machine.json",
+      "runtimeRequest": "./schemas/state-machine.schema.json",
+      "requiredBy": [
+        {
+          "kind": "contract-reference",
+          "requiredFrom": "agents/contracts/state-machine.json",
+          "runtimeRequest": "./schemas/state-machine.schema.json"
+        }
+      ],
+      "kind": "contract-reference",
+      "sha256": "1f2cb98cea63a7dcf5f68c8f960c60892d5d3a2b0502548bf55d1245a7c02e67"
+    },
+    {
+      "source": "agents/contracts/state-machine.json",
+      "destination": "skills/contracts/state-machine.json",
+      "requiredFrom": "workflow/runtime-state.js",
+      "runtimeRequest": "../../contracts/state-machine.json",
+      "requiredBy": [
+        {
+          "kind": "runtime-require",
+          "requiredFrom": "workflow/runtime-state.js",
+          "runtimeRequest": "../../contracts/state-machine.json"
+        }
+      ],
+      "kind": "static-require",
+      "sha256": "210909436165251fd4f25588a21938035de6de6fd42d08438ec8c5f01bc1de87"
+    },
+    {
+      "source": "scripts/local-only-safety.cjs",
+      "destination": "scripts/local-only-safety.cjs",
+      "requiredFrom": "workflow/phase-budget.js",
+      "runtimeRequest": "../../../scripts/local-only-safety.cjs",
+      "requiredBy": [
+        {
+          "kind": "dynamic-runtime-require",
+          "requiredFrom": "workflow/phase-budget.js",
+          "runtimeRequest": "../../../scripts/local-only-safety.cjs"
+        }
+      ],
+      "kind": "dynamic-safety-module",
+      "sha256": "12400cab5541454f34ca5408776a16bf0d91f62fb48675f9f617f8caddb10183"
+    }
+  ],
+  "dynamicRequires": [
+    {
+      "requiredFrom": "workflow/phase-budget.js",
+      "expression": "safetyPath",
+      "source": "scripts/local-only-safety.cjs",
+      "kind": "declared-external-runtime-module"
+    }
+  ],
+  "localRequireClosure": "complete-declared-local-external-and-dynamic-requires",
+  "providerContractCoreSha256": "5750d35c00d98503e6dbb11459ab4c1baba22ccf5dd56da41e3cdda14fca3745",
+  "payloadDigest": "bfae7f930a9f74328f2401dd55b774bbc63c296d20347336e9dece9ed916f59b",
+  "payloadGeneration": "codex-v2.0.0-bfae7f930a9f7432",
+  "logicalToPhysicalProviderRole": {
+    "ap-arbiter": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-arbiter",
+    "ap-depth-prober": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-depth-prober",
+    "ap-execharness-resolver": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-execharness-resolver",
+    "ap-feature-coordinator": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-feature-coordinator",
+    "ap-framework-generator": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-framework-generator",
+    "ap-framework-validator": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-framework-validator",
+    "ap-fresh-verifier": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-fresh-verifier",
+    "ap-goal-checker": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-goal-checker",
+    "ap-implementer": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-implementer",
+    "ap-independent-checker": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-independent-checker",
+    "ap-intake": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-intake",
+    "ap-janitor": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-janitor",
+    "ap-juror": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-juror",
+    "ap-manager": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-manager",
+    "ap-planner": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-planner",
+    "ap-preflight-probe": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-preflight-probe",
+    "ap-re-anchor": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-re-anchor",
+    "ap-researcher": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-researcher",
+    "ap-reviewer": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-reviewer",
+    "ap-roadmap-author": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-roadmap-author",
+    "ap-roadmap-scout": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-roadmap-scout",
+    "ap-route-analyst": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-route-analyst",
+    "ap-run-coordinator": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-run-coordinator",
+    "ap-scope-coordinator": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-scope-coordinator",
+    "ap-scoper": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-scoper",
+    "ap-scribe": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-scribe",
+    "ap-sweep-coordinator": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-sweep-coordinator",
+    "ap-sweeper": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-sweeper",
+    "ap-synthesizer": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-synthesizer",
+    "ap-verifier": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-verifier",
+    "ap-work-group-manager": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-work-group-manager",
+    "ap-worker": "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-worker"
+  },
+  "physicalRoles": [
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-arbiter",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-depth-prober",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-execharness-resolver",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-feature-coordinator",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-framework-generator",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-framework-validator",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-fresh-verifier",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-goal-checker",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-implementer",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-independent-checker",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-intake",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-janitor",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-juror",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-manager",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-planner",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-preflight-probe",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-re-anchor",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-researcher",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-reviewer",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-roadmap-author",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-roadmap-scout",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-route-analyst",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-run-coordinator",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-scope-coordinator",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-scoper",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-scribe",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-sweep-coordinator",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-sweeper",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-synthesizer",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-verifier",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-work-group-manager",
+    "autoprompt-codex-v2-0-0-bfae7f930a9f7432-ap-worker"
+  ],
+  "embeddedReceipt": ".autoprompt-runtime-manifest.json",
+  "payloadClosureDigest": "c7a2f9d29b337c7338987a80271f3d47850ff4d101ba11a2165321fd74d43588"
 }

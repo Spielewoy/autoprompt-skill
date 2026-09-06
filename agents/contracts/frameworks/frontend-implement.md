@@ -1,80 +1,58 @@
+# Frontend capability change
 
-# Framework: frontend-implement  (category frontend × subsection implement · tag user-facing · tier T2)
+Implement the assigned UI capability so a user can reach it and complete the requested interaction.
 
-**You are the L1 FEATURE-SUPERVISOR.** L0 spawned you and handed you this framework;
-you DRIVE it by dispatching each gate to a fresh L3/L4 worker (via your L2 manager)
-and reading its returned report. The gate path itself is opened/extracted for you by a
-reader-capable role - your L2 manager (managers retain Read), or a reader-leaf you spawn
-on a direct L1→L3 hop; you dispatch gates and read the reports they return, but never
-open the corpus yourself. You never edit or run code yourself. Goal: add or change
-ONE bounded UI/client piece - correct, tested, AND genuinely usable on a real render.
+## Assignment and control
 
-GATE PATH (T2): an implementation-ready roadmap item goes directly to G4 IMPLEMENT(TDD) → G5 IMPL-REVIEW → G6 VERIFY(grounded + usability) → G7 SIGN-OFF(1 juror) → GOAL-CHECK. G1 is conditional and runs only when `requiresDetailedPlan: true`, a named design fork remains unresolved, or an implementer reports `PLAN-CONFLICT`.
+Use the selected route and its canonical compiled checks. DIRECT and LIGHT use no
+coordinator, manager, or roadmap. ROADMAP execution follows the accepted plan and
+recorded dependencies. Only the run owner selects independent checkers; workers do
+not start other agents. Follow the ownership rules in `composition.md`.
 
-## Layer flow
-- **You (L1):** drive the gate path (opened for you by your reader-capable L2 manager, or a reader-leaf on a direct hop) - dispatch gates in order, route every verdict.
-- **L2 manager:** builds the handoff, spawns the worker per gate.
-- **L3 executor:** planner (G1), implementer (G4), reviewer (G5), verifier (G6).
-- **L4 leaf:** 1-juror sign-off, goal-check (default-FAIL).
-- **INDEPENDENCE:** every verify/review/goal-check gate MUST be a different agent-instance than the one that produced the work under review - never a reused context.
-- Negative verdicts (BLOCKED / SMASH / REGRESSION / USABILITY-FAIL / OUT-OF-SCOPE) loop UP.
+## Work and evidence
 
-## Gate path (T2)
-Implementation-ready roadmap: G4 IMPLEMENT(TDD) → G5 IMPL-REVIEW →
-G6 VERIFY(grounded + usability) → G7 SIGN-OFF(1 juror) → GOAL-CHECK. Insert G1
-only for the conditional triggers above.
+Inspect the existing UI and establish the required behavior, entry point, data flow,
+and relevant loading, empty, error, populated, overflow, and disabled states. Preserve
+existing conventions and identify keyboard, accessible-label, focus, and responsive
+requirements. Return material product or design conflicts to the run owner before
+implementing dependent behavior.
 
-## THE END-TO-END WORKFLOW
+Record the real build and test baseline. Add behavior tests before implementation when
+feasible, then change only owned files. Respect platform contracts for state, effects,
+keys, controlled inputs, and events. Connect the capability to its real entry point and
+data instead of leaving a working isolated example.
 
-### Phase 1 - CONDITIONAL PLAN (G1)
-FIRST verify an executable `ROADMAP.md` item exists for this feature; if none exists,
-report OUT-OF-SCOPE and escalate (**S4**). An implementation-ready item skips G1. Run
-G1 only for `requiresDetailedPlan: true`, a named unresolved design fork, or
-`PLAN-CONFLICT`; then the planner looks at the real UI first and delivers: the success criterion in user
-terms; the change file-by-file; ALL the states the piece must handle (loading /
-empty / error / populated / overflow / disabled); the responsive + accessibility
-requirements (keyboard, screen-reader roles/labels, focus); and how a real user
-reaches and completes the interaction. One bounded piece - not a whole flow (else
-**S4**). A genuine design fork → **S2** hand to `plan-design`.
+The independent checker uses the rendered UI across the affected states and viewports,
+including the relevant keyboard journey. A source review alone cannot prove usability;
+record unavailable rendered evidence as an unmet check after permitted recovery.
 
-### Phase 2 - GATE-ZERO + IMPLEMENT (G4, TDD)
-Confirm the project's OWN test/build setup runs (else **S1 BLOCKED**). TDD: failing
-tests first (behavior + each state), then minimal correct code, owned files only.
-Honor framework contracts (effect deps, controlled inputs, key stability, a11y
-roles). Coverage to the mission's bar (default 100% of the feature's surface) - ≥95%
-of changed lines is a floor, not the target.
+## Independent checking
 
-### Phase 3 - IMPL-REVIEW (G5, fresh worker)
-Claims vs diff; all states implemented; tests assert real behavior; a11y not
-dropped; no scope creep.
+One independent checker reviews and tests the frozen result by default. An additional
+checker requires a named distinct risk or responsibility and separate evidence. Check
+the requested behavior, relevant failure cases, and the existing tests of touched
+modules and direct dependents. Compare failures with the recorded baseline; an
+unrelated pre-existing failure is not a new regression. Investigate every new failure
+before acceptance. Meet the request's coverage requirements and the 95% changed-line
+floor for executable code, recording the measurement and any applicable exclusions.
 
-### Phase 4 - VERIFY (G6, grounded + USABILITY, fresh worker)
-On the REAL project (returns reproWasRed/reproNowGreen/preExistingRegressions/
-testCommand): the piece's tests pass; the FULL pre-existing tests of touched
-modules + dependents stay GREEN; coverage ≥95%; PLUS a real usability pass on the
-RENDERED artifact - a persona actually uses it across states (not a source read).
-A usability blocker (a real user can't complete the task) → **S3-USABILITY**.
-**REGRESSION-IS-A-SIGNAL:** any green→red flip → root-cause and redo; never weaken/skip.
+## Recovery and result
 
-### Phase 5 - SIGN-OFF + GOAL-CHECK → **S5** DONE.
+A failed command starts diagnosis. Check the command, working directory, supported
+runtime, and available dependencies; repair authorized local setup or an owned defect
+within the recorded allowance. A changed result or check invalidates its dependent
+evidence. Repeat those checks before reporting success. Do not weaken tests, conceal
+regressions, or replace a required real result with a simulated pass.
 
-## THE BLOCKED INVARIANT (non-negotiable)
-Verification runs the REAL check in its REAL environment - NEVER fake a pass, NEVER
-fabricate evidence, NEVER declare DONE over a red or un-runnable check. On ANY blocker,
-STOP and report the attempt + the concrete unblock path, then loop that verdict UP to
-your dispatcher (never sideways) - stay in the closed loop and resolve every open
-question through a subagent, NEVER yielding to the user.
+Return repairable failures to the responsible owner. A repeated failure with unchanged
+evidence requires strategy reassessment, not equivalent new workers. Preserve valid
+results and all run-wide limits. Report `BLOCKED` only when an external, authority,
+environment, or policy condition still prevents required work after permitted diagnosis
+and recovery; include the command, observed failure, and concrete unblock condition.
+Report an unresolved scope or ownership conflict to the run owner without editing
+unowned resources. Only new route facts justify changing the route.
 
-## Closed decision scenarios (each ends at ONE verdict)
-- **S1 - real test/build setup cannot run** → BLOCKED (report attempt + unblock path).
-- **S2 - genuine design fork** → hand to `plan-design`; do not guess it.
-- **S3 - a pre-existing test flips green→red** → FAILED (regression-is-a-signal: redo).
-  **S3-USABILITY - rendered piece fails the usability pass** → back to G4 with the
-  friction named; not DONE until a real user can complete the task.
-- **S4 - bigger than ONE bounded piece** (a whole flow / spans subsystems) →
-  OUT-OF-SCOPE; climb a tier (GATES.md ESCALATION).
-- **S5 - piece proven + zero regressions + usability pass + juror PASS** → DONE.
-
-## Stacking
-ONE L3 track. A multi-surface task is split in ROADMAP.md into disjoint features, each
-its own framework as a sibling track - `frameworks/composition.md`.
+Return the exact result version, requested items completed, commands and exit codes,
+check evidence, remaining defects, and attempted recovery. The run owner requests
+completion only after every requested result passes its current required checks and
+all working agents have stopped. The deterministic control plane records `DONE`.

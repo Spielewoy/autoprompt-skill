@@ -1,14 +1,14 @@
 <p align="center">
-  <img src="../../assets/i18n/zh/banner.svg" alt="Autoprompt Skill：智能体编码任务失败减少 45%" width="760"/>
+  <img src="../../assets/banner.svg" alt="Autoprompt Skill：粉色云朵与飞翔的大雁" width="1000"/>
 </p>
 
-<p align="center">Autoprompt 是一项智能体编程技能，在智能体编程任务中将失败数降低了 45%。</p>
+<p align="center">Autoprompt 是一个编程智能体工作流，通过审查、修复和重新验证工作成果，将失败率降低 45%。</p>
 
 <p align="center">
-  <a href="#基准测试"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20%E5%88%86-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1：提高 14.61 分"/></a>
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%E7%89%88%E6%9C%AC&color=255C60&labelColor=14101F" alt="版本：v1.0.4"/></a>
-  <a href="#安装"><img src="https://img.shields.io/badge/%E6%94%AF%E6%8C%81-9-255C60?style=flat-square&labelColor=14101F" alt="支持：9"/></a>
-  <a href="../../LICENSE"><img src="https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF%E8%AF%81-MIT-255C60?style=flat-square&labelColor=14101F" alt="许可证：MIT"/></a>
+  <a href="#基准测试"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20%E5%88%86-965477?style=flat-square&labelColor=302335" alt="Terminal-Bench 2.1：提高 14.61 分"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%E7%89%88%E6%9C%AC&color=965477&labelColor=302335" alt="版本：v1.0.4"/></a>
+  <a href="#安装"><img src="https://img.shields.io/badge/%E6%94%AF%E6%8C%81-9-965477?style=flat-square&labelColor=302335" alt="支持：9"/></a>
+  <a href="../../LICENSE"><img src="https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF%E8%AF%81-MIT-965477?style=flat-square&labelColor=302335" alt="许可证：MIT"/></a>
 </p>
 
 <p align="center">
@@ -69,7 +69,7 @@ autoprompt
 | 状态 | 编码工具 | 已验证要求 | 标识 |
 |---|---|---|---|
 | 可用 | [Claude Code](https://code.claude.com/docs/en/setup) | 2.1.219+；已验证 2.1.233 | `claude` |
-| 可用 | [Codex](https://github.com/openai/codex) | 支持子智能体的版本；已验证 0.147.0 | `codex` |
+| 可用 | [Codex](https://github.com/openai/codex) | 支持子智能体的版本；已验证 0.148.0 | `codex` |
 | 可用 | [OpenCode](https://opencode.ai/docs/agents) | 1.18.7+；已验证 1.18.18 | `opencode` |
 | 可用 | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+；已验证 7.4.22 | `kilo` |
 | 可用 | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+；已验证 VS Code 1.133.0 和 Copilot 0.61.0 | `vscode` |
@@ -93,6 +93,8 @@ autoprompt
 
 ## 基准测试
 
+以下为 **版本 1 的基准测试**。版本 2 的测试结果将在之后发布。
+
 <p align="center">
   <img src="../../assets/i18n/zh/terminal-bench-2.1-leaderboard.svg" width="1000" alt="Terminal-Bench 2.1 排行榜：18 个 Artificial Analysis 参考分数，以及 DeepSeek V4 Flash 0731 使用和不使用 Autoprompt 的实测分数。"/>
 </p>
@@ -108,24 +110,40 @@ autoprompt
 |---|---:|---:|---:|
 | OpenCode | 60/89 | 67.42% | 29 |
 | **OpenCode + Autoprompt** | **73/89** | **82.02%** | **16** |
-| **变化** | **+13 项** | **+14.61 分** | **减少 45%** |
+| **变化** | **+13 项** | **+14.61 分** | **在版本 1 测试中减少 45%** |
 
 </details>
 
-DeepSeek 的 82.7% 来自它自己的测试设置，不能当作可直接比较的第三次运行。请查看[测试设置与证据范围](../benchmarks/terminal-bench-2.1.md)，或[申请新的基准测试](https://github.com/Spielewoy/autoprompt-skill/issues/new?template=benchmark_request.md)。
+DeepSeek 的 82.7% 来自它自己的测试设置，不能当作可直接比较的第三次运行。请查看[测试设置与证据范围](../benchmarks/terminal-bench-2.1.md)，或[申请新的基准测试](https://github.com/Spielewoy/autoprompt-skill/issues/new)。
 
 <details>
 <summary><strong>预期开销：</strong>耗时约为 3x，token 约为 2x。</summary>
 
-没有保留耗时和 token 日志，因此这些数字只是根据用户体验报告做出的规划估算，并非实测基准数据。本次实测的失败数从 29 降至 16（减少 45%），也就是错误数约减半（约 2x 改善）。小任务上的结果可能相差很大。
+没有保留耗时和 token 日志，因此这些数字只是根据用户体验报告做出的规划估算，并非实测基准数据。本次实测的失败数从 29 降至 16（在版本 1 测试中减少 45%），也就是错误数约减半（约 2x 改善）。小任务上的结果可能相差很大。
 
 </details>
 
 ## 调用结构
 
-<p align="center">
-  <a href="../../assets/i18n/zh/anatomy.svg"><img src="../../assets/i18n/zh/anatomy.svg" alt="Autoprompt 调用结构：触发方式、并发模式、智能体上限、模型路由和目标" width="1000"/></a>
-</p>
+```text
+/autoprompt mode=custom max_subs=4 agents=auto <goal>
+```
+
+| 参数 | 作用 |
+|---|---|
+| `/autoprompt` | 启动技能。 |
+| `mode=custom` | 并发模式：tokensaver、wide 或 custom。 |
+| `max_subs=4` | 最多同时运行四个子智能体。 |
+| `agents=auto` | 自动选择、使用当前模型（off）或指定列表。 |
+| `<goal>` | 描述目标、约束和验证方法。 |
+| `path=` | 工作路径：auto、direct、light 或 roadmap。 |
+
+Codex 示例:
+
+```bash
+autoprompt activate codex -- path=light "<goal>"
+```
+
 
 ## 运行控制
 
@@ -139,13 +157,13 @@ DeepSeek 的 82.7% 来自它自己的测试设置，不能当作可直接比较�
 ## 工作方式
 
 <p align="center">
-  <img src="../../assets/i18n/zh/how-it-works-loop.svg" alt="Autoprompt 从提示词到规划、构建、审查、测试、签署和全面检查的流程" width="1100"/>
+  <a href="../../assets/i18n/zh/how-it-works-loop.svg"><img src="../../assets/i18n/zh/how-it-works-loop.svg" alt="Autoprompt 从提示词到规划、构建、审查、测试、签署和全面检查的流程" width="1100"/></a>
 </p>
 
 ## 智能体
 
 <p align="center">
-  <img src="../../assets/i18n/zh/how-it-works-hierarchy.svg" alt="Autoprompt 智能体层级：提示词、协调者、管理者、执行线路和独立检查" width="1100"/>
+  <a href="../../assets/i18n/zh/how-it-works-hierarchy.svg"><img src="../../assets/i18n/zh/how-it-works-hierarchy.svg" alt="Autoprompt 智能体层级：提示词、协调者、管理者、执行线路和独立检查" width="1100"/></a>
 </p>
 
 ## 示例
@@ -157,7 +175,7 @@ DeepSeek 的 82.7% 来自它自己的测试设置，不能当作可直接比较�
 | 研究 | `/autoprompt 对照此代码库比较任务队列并推荐一个方案` |
 | 限制并发 | `/autoprompt mode=custom max_subs=4 迁移所有模型` |
 
-在 Codex 中请使用 `$autoprompt`，不要使用 `/autoprompt`。在 Oh My Pi 中请使用 `/skill:autoprompt`。
+在 Codex 中请使用 `autoprompt activate codex -- "<goal>"`，不要使用 `/autoprompt`。在 Oh My Pi 中请使用 `/skill:autoprompt`。
 
 ## 常见问题
 
@@ -183,6 +201,13 @@ DeepSeek 的 82.7% 来自它自己的测试设置，不能当作可直接比较�
 </details>
 
 <details>
+<summary><strong>这些工作路径是什么？</strong></summary>
+
+`path=auto` 自动选择路径。`direct` 直接执行明确的任务，`light` 先制定简要计划，`roadmap` 规划有依赖关系的工作。所有路径都包含独立验证。 [详情](../faq/work-paths.md)
+
+</details>
+
+<details>
 <summary><strong>`mode`、`max_subs` 和 `agents` 分别控制什么？</strong></summary>
 
 `mode=tokensaver` 将活跃子智能体限制为六个；`mode=wide` 打开所有就绪线路；`mode=custom max_subs=N` 设置自定义上限；`agents` 在工具支持时控制模型路由。[详情](../faq/tokensaver-vs-wide-vs-custom.md)
@@ -192,7 +217,7 @@ DeepSeek 的 82.7% 来自它自己的测试设置，不能当作可直接比较�
 <details>
 <summary><strong>为什么 Autoprompt 不会在后台启动？</strong></summary>
 
-因为它会改变成本、耗时和工作流。请使用 `/autoprompt <目标>` 显式启动；Codex 中使用 `$autoprompt`。
+因为它会改变成本、耗时和工作流。请使用 `/autoprompt <目标>` 显式启动；Codex 中使用 `autoprompt activate codex -- "<goal>"`。
 
 </details>
 

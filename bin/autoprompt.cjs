@@ -50,8 +50,10 @@ const HELP_TEXT = [
   '  autoprompt version',
   '  autoprompt install <client|all> [--root <absolute-path>]',
   '  autoprompt doctor [client] [--strict] [--root <absolute-path>]',
+  '  autoprompt doctor isolation [--strict] [--root <absolute-path>]',
   '  autoprompt uninstall [client|all] [--root <absolute-path>]',
-  '  autoprompt configure codex --agents <off|auto|model,...> [--model-map <absolute-json>] [--root <absolute-path>]',
+  '  autoprompt configure codex --agents <off|auto|model,...> [--model-map <absolute-json>] [--effort <low|medium|high|xhigh>] [--root <absolute-path>]',
+  '  autoprompt activate codex [--target <absolute-path>] [--ttl <seconds>] [--resume <activation-id>] [--root <absolute-path>] -- <mission>',
   '  autoprompt update',
   '  autoprompt repo',
   '  autoprompt support',
@@ -131,6 +133,62 @@ function parseLifecycle(command, rest, doctor = false) {
   return parsed
 }
 
+function parseCodexActivation(rest, alias = false) {
+  if (!alias && rest[0] !== 'codex') usageError('Activate currently supports only codex.')
+  const args = alias ? rest : rest.slice(1)
+  let root = ''
+  let target = ''
+  let ttlSeconds
+  let resume = ''
+  const mission = []
+  let missionMode = false
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]
+    if (missionMode) {
+      mission.push(argument)
+      continue
+    }
+    if (argument === '--') {
+      missionMode = true
+      continue
+    }
+    if (['--root', '--target', '--ttl', '--resume'].includes(argument)) {
+      const value = args[index + 1]
+      if (value === undefined || value.startsWith('--')) usageError(`${argument} requires a value.`)
+      index += 1
+      if (argument === '--root') {
+        if (root) usageError('--root may be provided only once.')
+        root = validateLifecycleRoot(value)
+      } else if (argument === '--target') {
+        if (target) usageError('--target may be provided only once.')
+        target = validateLifecycleRoot(value)
+      } else if (argument === '--ttl') {
+        if (ttlSeconds !== undefined) usageError('--ttl may be provided only once.')
+        if (!/^[0-9]+$/.test(value)) usageError('--ttl requires integer seconds.')
+        ttlSeconds = Number(value)
+      } else {
+        if (resume) usageError('--resume may be provided only once.')
+        if (!/^apv2-[a-f0-9]{32}$/.test(value)) usageError('--resume requires an Autoprompt v2 activation id.')
+        resume = value
+      }
+      continue
+    }
+    if (argument.startsWith('-')) usageError(`Unknown activate flag: ${argument}`)
+    usageError('Activate codex requires `--` before the mission.')
+  }
+  if (!missionMode || mission.length === 0) usageError('Activate codex requires at least one mission argv after `--`.')
+  return {
+    command: 'activate',
+    provider: 'codex',
+    missionArgs: mission,
+    ...(root ? { root } : {}),
+    ...(target ? { target } : {}),
+    ...(ttlSeconds !== undefined ? { ttlSeconds } : {}),
+    ...(resume ? { resume } : {}),
+    compatibilityAlias: alias,
+  }
+}
+
 function parseArgs(argv) {
   if (!Array.isArray(argv) || argv.some(argument => typeof argument !== 'string')) {
     usageError('Arguments must be strings.')
@@ -157,16 +215,24 @@ function parseArgs(argv) {
     return parseLifecycle(command, rest)
   }
   if (command === 'doctor') {
+    if (rest[0] === 'isolation') {
+      const parsed = parseLifecycle(command, ['codex', ...rest.slice(1)], true)
+      parsed.isolation = true
+      return parsed
+    }
     return parseLifecycle(command, rest, true)
   }
+  if (command === 'activate') return parseCodexActivation(rest)
+  if (command === 'codex') return parseCodexActivation(rest, true)
   if (command === 'configure') {
     if (rest[0] !== 'codex') usageError('Configure currently supports only codex.')
     let selector = ''
     let modelMap = ''
+    let effort
     let root = ''
     for (let index = 1; index < rest.length; index += 1) {
       const flag = rest[index]
-      if (!['--agents', '--model-map', '--root'].includes(flag)) usageError(`Unknown configure flag: ${flag}`)
+      if (!['--agents', '--model-map', '--effort', '--root'].includes(flag)) usageError(`Unknown configure flag: ${flag}`)
       const value = rest[index + 1]
       if (value === undefined || value.startsWith('--')) usageError(`${flag} requires a value.`)
       index += 1
@@ -176,13 +242,19 @@ function parseArgs(argv) {
       } else if (flag === '--model-map') {
         if (modelMap) usageError('--model-map may be provided only once.')
         modelMap = value
+      } else if (flag === '--effort') {
+        if (effort !== undefined) usageError('--effort may be provided only once.')
+        if (!['low', 'medium', 'high', 'xhigh'].includes(value)) usageError('--effort requires low, medium, high, or xhigh.')
+        effort = value
       } else {
         if (root) usageError('--root may be provided only once.')
         root = validateLifecycleRoot(value)
       }
     }
     if (!selector) usageError('Configure codex requires --agents.')
+    if (effort !== undefined && selector.trim().toLowerCase() === 'off') usageError('--effort requires enabled Codex agents.')
     const parsed = { command: 'configure', provider: 'codex', selector, modelMap }
+    if (effort !== undefined) parsed.effort = effort
     if (root) parsed.root = root
     return parsed
   }
@@ -530,7 +602,8 @@ function scriptArguments(command) {
   if (command.command === 'install') return [command.client]
   if (command.command === 'uninstall') return [command.client]
   const args = []
-  if (command.client !== null) args.push(command.client)
+  if (command.isolation) args.push('isolation')
+  else if (command.client !== null) args.push(command.client)
   if (command.strict) args.push('--strict')
   return args
 }
@@ -1290,11 +1363,35 @@ function run(argv, overrides = {}) {
         ? { ...options.env, AUTOPROMPT_INSTALL_ROOT: command.root }
         : options.env,
       modelMap: command.modelMap,
+      ...(command.effort !== undefined ? { effort: command.effort } : {}),
       packageRoot: options.packageRoot,
       selector: command.selector,
       stderr: options.stderr,
       stdout: options.stdout,
     })
+  }
+  if (command.command === 'activate') {
+    const configure = require(path.join(options.packageRoot, 'scripts', 'codex-configure.cjs'))
+    try {
+      const result = configure.launchActivation({
+        env: command.root
+          ? { ...options.env, AUTOPROMPT_INSTALL_ROOT: command.root }
+          : options.env,
+        missionArgs: command.missionArgs,
+        compatibilityAlias: command.compatibilityAlias,
+        now: overrides.now,
+        resume: command.resume,
+        ...(overrides.spawnSync ? { spawnSync: options.spawnSync } : {}),
+        stdio: 'inherit',
+        target: command.target || options.cwd,
+        ttlSeconds: command.ttlSeconds,
+      })
+      options.stdout.write(`Autoprompt activation ${result.activationId}: status=${result.status} revoked=true\n`)
+      return result.status
+    } catch (error) {
+      options.stderr.write(`Autoprompt activate (codex): ${error.message}\n`)
+      return 1
+    }
   }
 
   const lifecycleOptions = command.root

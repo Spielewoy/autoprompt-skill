@@ -233,12 +233,36 @@ autoprompt_runtime_root() {
   autoprompt_skill_root "$1"
 }
 
+autoprompt_codex_payload_generation() {
+  local manifest="$AUTOPROMPT_INSTALL_REPO_ROOT/agents/manifests/codex-runtime.json"
+  command -v node >/dev/null 2>&1 && [ -f "$manifest" ] || return 1
+  node -e '
+    const fs = require("node:fs");
+    const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (!/^codex-v[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{16}$/.test(manifest.payloadGeneration || "")) process.exit(1);
+    process.stdout.write(manifest.payloadGeneration);
+  ' "$manifest"
+}
+
+autoprompt_codex_bundle_skill_root() {
+  local generation
+  generation="$(autoprompt_codex_payload_generation)" || return 1
+  printf '%s/.autoprompt-private/bundles/%s/skills/autoprompt' \
+    "$(autoprompt_config_root codex)" "$generation"
+}
+
+autoprompt_codex_generated_agents_root() {
+  local skill_root
+  skill_root="$(autoprompt_codex_bundle_skill_root)" || return 1
+  printf '%s/agents-runtime' "$skill_root"
+}
+
 autoprompt_native_agents_root() {
   local name="$1" home root omp_profile_status
   if autoprompt_install_root_override_present; then
     root="$(_autoprompt_normalized_install_root)" || return 1
     if [ "$name" = codex ]; then
-      printf '%s/skills/autoprompt/agents-runtime' "$root"
+      autoprompt_codex_generated_agents_root
     else
       printf '%s/agents' "$root"
     fi
@@ -247,7 +271,7 @@ autoprompt_native_agents_root() {
   home="$(resolve_home "$name")" || return $?
   case "$name" in
     claude) printf '%s/.claude/agents' "$home" ;;
-    codex) printf '%s/agents-runtime' "$(autoprompt_skill_root codex)" ;;
+    codex) autoprompt_codex_generated_agents_root ;;
     opencode) printf '%s/opencode/agents' "$(autoprompt_config_root opencode)" ;;
     kilo) printf '%s/kilo/agents' "$(autoprompt_config_root kilo)" ;;
     vscode) printf '%s/.copilot/agents' "$home" ;;
@@ -292,6 +316,21 @@ autoprompt_profile_file() {
       ;;
     *) return 1 ;;
   esac
+}
+
+# Codex v2 durable activation state is deliberately outside every provider-global
+# discovery root. Other providers keep their existing layouts unchanged.
+autoprompt_private_state_root() {
+  local name="$1"
+  [ "$name" = codex ] || return 1
+  printf '%s/.autoprompt-private' "$(autoprompt_config_root codex)"
+}
+
+autoprompt_provider_activation_capabilities() {
+  local name="$1"
+  [ "$name" = codex ] || return 1
+  printf '%s' \
+    'isolation=strict topology-enforcement=prompt-guarded private-skill-root=true process-ownership=false event-streaming=false tool-output-capture=false stable-child-identity=false same-context-continuation=false cancellation=false isolated-checking=false model-routing=true'
 }
 
 # --- F-LIB-DETECT (begin) ---
@@ -560,15 +599,17 @@ _format_body_has_frontmatter() {
   esac
 }
 
-# Emit md + YAML frontmatter (name + description) over the body. $token selects
-# only the description rendering: md-codex single-quotes it (INSTALL.md:24); the
-# other md-family tokens use a plain scalar. No other frontmatter key is emitted.
+# Emit md + YAML frontmatter over the body. Codex receives an exact explicit-only
+# discovery contract in addition to name + description; other md-family formats
+# retain their existing provider-specific keys.
 _format_md_yaml() {
   local token="$1" name="$2" description="$3" body="$4"
   if [ "$token" = "md-codex" ]; then
     # Single-quoted YAML scalar (INSTALL.md:24): a literal ' is escaped by doubling.
     local single="${description//\'/\'\'}"
-    printf '%s\n' "---" "name: $name" "description: '$single'" "---" "" "$body"
+    printf '%s\n' "---" "name: $name" "description: '$single'" \
+      "activation: explicit-only" "allow-implicit-invocation: false" \
+      "---" "" "$body"
     return
   fi
 
@@ -847,11 +888,23 @@ _precheck_dir_writable() {
 _precheck_validate_version() {
   local name="$1" version_name="$2" bin="$3" floor
   local -n checked_version="$version_name"
-  if [ -z "${AUTOPROMPT_VERSION_FLOOR[$name]+set}" ]; then
+  if [ "$name" = codex ]; then
+    floor="$(node -e '
+      const fs = require("node:fs");
+      const registry = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const floor = registry.compatibility && registry.compatibility.cliMinimum;
+      if (!/^\d+\.\d+\.\d+$/.test(floor || "")) process.exit(1);
+      process.stdout.write(floor);
+    ' "$AUTOPROMPT_INSTALL_REPO_ROOT/scripts/install/codex-package-registry.json" 2>/dev/null)" || {
+      printf '%s\n' "client=codex precheck=fail reason=registry-invalid error=missing-version-floor" >&2
+      return 13
+    }
+  elif [ -n "${AUTOPROMPT_VERSION_FLOOR[$name]+set}" ]; then
+    floor="${AUTOPROMPT_VERSION_FLOOR[$name]}"
+  else
     checked_version="na"
     return 0
   fi
-  floor="${AUTOPROMPT_VERSION_FLOOR[$name]}"
   if [ "$checked_version" = "unknown" ]; then
     printf '%s\n' "client=$name precheck=fail reason=version-unknown required=$floor found=unknown error=unreadable-version" >&2
     printf 'Autoprompt precheck (%s): could not read %s'\''s version (got '\''unknown'\'') and a minimum of %s is required. Verify '\''%s --version'\'' works, then re-run.\n' "$name" "$name" "$floor" "$bin" >&2
@@ -1064,7 +1117,9 @@ write_receipt() {
   fi
 
   local backupJson detachedJson escaped_backup escaped_detached escaped_nonce
-  local files_json directories_json edits_json
+  local files_json directories_json edits_json file_sha256_json prior_manifest_json
+  local owned recorded_hash
+  local -a file_sha256=()
   if [ -z "$backup" ] || [ "$backup" = "none" ]; then
     backupJson='null'
   else
@@ -1081,12 +1136,23 @@ write_receipt() {
   local json
   _receipt_json_escape "$nonce" escaped_nonce
   _receipt_path_array AUTOPROMPT_RECEIPT_FILES files_json
+  for owned in "${AUTOPROMPT_RECEIPT_FILES[@]:-}"; do
+    recorded_hash=""
+    _idem_read_manifest_hash "$root" "$owned" recorded_hash || return 40
+    [ -z "$recorded_hash" ] || file_sha256+=("$owned=$recorded_hash")
+  done
+  _receipt_path_array file_sha256 file_sha256_json
+  if [[ "${AUTOPROMPT_RECEIPT_PRIOR_MANIFEST_SHA256:-}" =~ ^[a-f0-9]{64}$ ]]; then
+    prior_manifest_json="\"$AUTOPROMPT_RECEIPT_PRIOR_MANIFEST_SHA256\""
+  else
+    prior_manifest_json=null
+  fi
   _receipt_path_array AUTOPROMPT_RECEIPT_CREATED_DIRECTORIES directories_json
   _receipt_edits_array AUTOPROMPT_RECEIPT_EDITS edits_json
   local omp_managed_json=false
   [ "$AUTOPROMPT_RECEIPT_OMP_MANAGED" -eq 0 ] || omp_managed_json=true
-  printf -v json '{\n  "nonce": "%s",\n  "backup": %s,\n  "files": %s,\n  "createdDirectories": %s,\n  "ompManaged": %s,\n  "ompDetachedRoot": %s,\n  "configEdits": %s\n}' \
-    "$escaped_nonce" "$backupJson" "$files_json" "$directories_json" \
+  printf -v json '{\n  "nonce": "%s",\n  "priorManifestSha256": %s,\n  "fileSha256": %s,\n  "backup": %s,\n  "files": %s,\n  "createdDirectories": %s,\n  "ompManaged": %s,\n  "ompDetachedRoot": %s,\n  "configEdits": %s\n}' \
+    "$escaped_nonce" "$prior_manifest_json" "$file_sha256_json" "$backupJson" "$files_json" "$directories_json" \
     "$omp_managed_json" "$detachedJson" "$edits_json"
 
   local final="$root/$AUTOPROMPT_RECEIPT_NAME"
@@ -1152,6 +1218,7 @@ write_receipt() {
 # caller-prefilled array, since write_receipt reads it; and so a set -u consumer
 # never trips on an unset array). A re-source does not wipe accumulated entries.
 [ -n "${AUTOPROMPT_RECEIPT_FILES+set}" ] || declare -a AUTOPROMPT_RECEIPT_FILES=()
+[ -n "${AUTOPROMPT_RECEIPT_PRIOR_MANIFEST_SHA256+set}" ] || AUTOPROMPT_RECEIPT_PRIOR_MANIFEST_SHA256=""
 
 _copy_render_stage() {
   local client="$1" fmt="$2" name="$3" description="$4" body="$5"
@@ -1266,25 +1333,34 @@ AUTOPROMPT_HASH_MANIFEST_NAME=".autoprompt-install-hashes.json"
 # _idem_sha256 <file>: lowercase 64-hex SHA-256 of <file>, via the documented
 # fallback order. Returns 42 + an operator-actionable stderr line if no tool exists.
 _idem_sha256() {
-  local file="$1" out
+  local file="$1" out hash format=checksum
   if command -v sha256sum >/dev/null 2>&1; then
-    out="$(sha256sum "$file" 2>/dev/null)" || return 42
-    printf '%s' "${out%% *}"
-    return 0
-  fi
-  if command -v shasum >/dev/null 2>&1; then
-    out="$(shasum -a 256 "$file" 2>/dev/null)" || return 42
-    printf '%s' "${out%% *}"
-    return 0
-  fi
-  if command -v openssl >/dev/null 2>&1; then
+    out="$(sha256sum -- "$file" 2>/dev/null)" || return 42
+  elif command -v shasum >/dev/null 2>&1; then
+    out="$(shasum -a 256 -- "$file" 2>/dev/null)" || return 42
+  elif command -v openssl >/dev/null 2>&1; then
     out="$(openssl dgst -sha256 "$file" 2>/dev/null)" || return 42
-    printf '%s' "${out##*= }"
-    return 0
+    format=openssl
+  else
+    printf '%s\n' "error=no-sha256-tool" >&2
+    printf 'Autoprompt idempotency: no SHA-256 tool found (need sha256sum, shasum, or openssl). Install one and re-run.\n' >&2
+    return 42
   fi
-  printf '%s\n' "error=no-sha256-tool" >&2
-  printf 'Autoprompt idempotency: no SHA-256 tool found (need sha256sum, shasum, or openssl). Install one and re-run.\n' >&2
-  return 42
+  if [ "$format" = checksum ]; then
+    # GNU/shasum prefix the record with one backslash when escaping a filename.
+    # That marker is not part of the digest (including native Git Bash paths).
+    out="${out#\\}"
+    hash="${out:0:64}"
+    [[ ${#out} -gt 66 && ( "${out:64:2}" = '  ' || "${out:64:2}" = ' *' ) ]] || hash=""
+  else
+    hash="${out##*= }"
+    [ "$hash" != "$out" ] || hash=""
+  fi
+  if ! [[ "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+    printf '%s\n' 'error=invalid-sha256-output' >&2
+    return 42
+  fi
+  printf '%s' "$hash"
 }
 
 # _idem_read_manifest_hash <root> <key>: echo the recorded hex for <key> from the
@@ -1362,7 +1438,7 @@ _idem_register_created_directories() {
 _idem_parse_manifest_entry() {
   local entry="$1" expects_comma="$2"
   local spelling_name="$3" identity_name="$4" hash_name="$5" line_name="$6"
-  local escaped canonical_escape comma
+  local escaped canonical_escape comma indent indent_width
   local -n parsed_spelling="$spelling_name" parsed_identity="$identity_name"
   local -n parsed_hash="$hash_name" canonical_line="$line_name"
   if [ "$expects_comma" -eq 1 ]; then
@@ -1373,20 +1449,26 @@ _idem_parse_manifest_entry() {
     [ "${entry: -1}" != ',' ] || return 1
     comma=''
   fi
-  [ "${#entry}" -ge 74 ] && [ "${entry:0:5}" = '    "' ] || return 1
+  case "$entry" in
+    '    "'*) indent='    ' ;;
+    '  "'*) indent='  ' ;;
+    *) return 1 ;;
+  esac
+  indent_width="${#indent}"
+  [ "${#entry}" -ge $((indent_width + 70)) ] || return 1
   [ "${entry: -1}" = '"' ] || return 1
   parsed_hash="${entry: -65:64}"
   [[ "$parsed_hash" =~ ^[a-f0-9]{64}$ ]] || return 1
   entry="${entry:0:${#entry}-65}"
   [ "${entry: -4}" = '": "' ] || return 1
-  escaped="${entry:5:${#entry}-9}"
+  escaped="${entry:$((indent_width + 1)):${#entry}-$((indent_width + 5))}"
   _uninstall_json_unescape "$escaped" parsed_spelling || return 1
   [ -n "$parsed_spelling" ] || return 1
   _receipt_json_escape "$parsed_spelling" canonical_escape
   [ "$canonical_escape" = "$escaped" ] || return 1
   _idem_cached_comparable_path "$parsed_spelling" parsed_identity || return 1
   [ -n "$parsed_identity" ] || return 1
-  canonical_line="    \"$canonical_escape\": \"$parsed_hash\"$comma"
+  canonical_line="$indent\"$canonical_escape\": \"$parsed_hash\"$comma"
 }
 
 _idem_parse_manifest() {
@@ -1605,6 +1687,44 @@ _idem_atomic_copy() {
   mkdir -p -- "$parent" 2>/dev/null || return 1
   cp -- "$source" "$tmp" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 1; }
   mv -f -- "$tmp" "$target" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null; return 1; }
+}
+
+_idem_codex_stable_source_copy() {
+  local root="$1" source="$2" target="$3" expected_hash="$4"
+  local before_copy="${5:-}" parent="${3%/*}"
+  local tmp="${3}.autoprompt.codex.tmp.$$" copied_hash source_post_hash relative
+  relative="${target#"$root"/}"
+  [ "$relative" != "$target" ] || relative="${target##*/}"
+  mkdir -p -- "$parent" 2>/dev/null || return 39
+  if [ -n "$before_copy" ]; then
+    "$before_copy" "$source" "$target" || {
+      rm -f -- "$tmp" 2>/dev/null
+      return 39
+    }
+  fi
+  cp -- "$source" "$tmp" 2>/dev/null || {
+    rm -f -- "$tmp" 2>/dev/null
+    return 39
+  }
+  copied_hash="$(_idem_sha256 "$tmp")" || {
+    rm -f -- "$tmp" 2>/dev/null
+    return 39
+  }
+  source_post_hash="$(_idem_sha256 "$source")" || {
+    rm -f -- "$tmp" 2>/dev/null
+    return 39
+  }
+  if [ "$copied_hash" != "$expected_hash" ] ||
+     [ "$source_post_hash" != "$expected_hash" ]; then
+    printf '%s\n' \
+      "client=codex error=SOURCE_CHANGED_DURING_COPY file=$relative expected=$expected_hash copied=$copied_hash source_post=$source_post_hash" >&2
+    rm -f -- "$tmp" 2>/dev/null
+    return 46
+  fi
+  mv -f -- "$tmp" "$target" 2>/dev/null || {
+    rm -f -- "$tmp" 2>/dev/null
+    return 39
+  }
 }
 
 [ -n "${AUTOPROMPT_MANAGED_UNDO_JOURNAL+set}" ] || declare -a AUTOPROMPT_MANAGED_UNDO_JOURNAL=()
@@ -2046,6 +2166,7 @@ _idem_restore_managed_install_failure() {
 _idem_install_managed_file() {
   local root="$1" source="$2" target="$3" refuse_unowned="${4:-0}"
   local track_managed="${5:-1}" allow_unowned="${6:-0}"
+  local stable_source="${7:-0}" before_copy="${8:-}"
   local source_hash recorded_hash snapshot="" rc is_root_transaction=0
   local existing_parent
   existing_parent="$(_idem_nearest_existing_parent "$target")"
@@ -2072,9 +2193,17 @@ _idem_install_managed_file() {
   fi
   _idem_prepare_managed_install \
     "$root" "$target" snapshot is_root_transaction || return $?
-  if ! _idem_atomic_copy "$source" "$target"; then
+  if [ "$stable_source" -eq 1 ]; then
+    _idem_codex_stable_source_copy \
+      "$root" "$source" "$target" "$source_hash" "$before_copy"
+    rc=$?
+  else
+    _idem_atomic_copy "$source" "$target"
+    rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
     _idem_restore_managed_install_failure \
-      "$snapshot" "$is_root_transaction" 39
+      "$snapshot" "$is_root_transaction" "$rc"
     return $?
   fi
   if [ "$track_managed" -eq 1 ]; then
@@ -2135,6 +2264,63 @@ _idem_remove_managed_file() {
     return 2
   }
   return 1
+}
+
+_idem_relinquish_retired_codex_file() {
+  local root="$1" file="$2" owned
+  local -a kept=()
+  _idem_remove_manifest_hash "$root" "$file" || return 1
+  for owned in "${AUTOPROMPT_RECEIPT_FILES[@]:-}"; do
+    _idem_paths_equal "$owned" "$file" || kept+=("$owned")
+  done
+  AUTOPROMPT_RECEIPT_FILES=("${kept[@]}")
+  _idem_root_transaction_matches "$root" &&
+    _idem_mark_root_transaction_changed "$root"
+  return 0
+}
+
+_idem_reconcile_retired_codex_files() {
+  local root="$1" targets_name="$2" file target current path
+  local recorded_hash live_hash reason
+  local -n current_targets_ref="$targets_name"
+  local -a prior_files=("${AUTOPROMPT_RECEIPT_FILES[@]:-}")
+  for file in "${prior_files[@]}"; do
+    [ -n "$file" ] || continue
+    _uninstall_provider_owns_path "$root" codex "$file" || continue
+    current=0
+    for target in "${current_targets_ref[@]}"; do
+      if _idem_paths_equal "$target" "$file"; then current=1; break; fi
+    done
+    [ "$current" -eq 0 ] || continue
+
+    path="$(_uninstall_filesystem_path "$file")" || return 94
+    recorded_hash=""
+    _idem_read_manifest_hash "$root" "$file" recorded_hash || return 94
+    reason=""
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+      reason=already-absent
+    elif [ -L "$path" ] || [ ! -f "$path" ]; then
+      reason=linked-or-unsafe
+    elif [ -z "$recorded_hash" ]; then
+      reason=unfingerprinted
+    else
+      live_hash="$(_idem_sha256 "$path")" || reason=hash-unreadable
+      [ -n "$reason" ] || [ "$live_hash" = "$recorded_hash" ] || reason=hash-drift
+    fi
+
+    if [ -z "$reason" ] || [ "$reason" = already-absent ]; then
+      _idem_remove_managed_file "$root" "$path" "$file" || {
+        printf '%s\n' "client=codex error=retired-file-prune-failed path=$file" >&2
+        return 94
+      }
+      printf '%s\n' "client=codex update-pruned=$file reason=prior-only"
+      continue
+    fi
+
+    _idem_relinquish_retired_codex_file "$root" "$file" || return 94
+    printf '%s\n' \
+      "client=codex update-retained=$file reason=$reason ownership=relinquished"
+  done
 }
 
 _idem_resolve_install_target() {
@@ -3140,7 +3326,8 @@ _uninstall_canonical_receipt() {
   local has_omp_managed="$4" omp_managed="$5"
   local has_detached_root="$6" detached_root="$7"
   local files_name="$8" directories_name="$9" edits_name="${10}"
-  local output_name="${11:-}"
+  local output_name="${11:-}" has_hash_binding="${12:-0}"
+  local prior_manifest_sha256="${13:-}" file_sha256_name="${14:-}"
   local backup_json detached_json escaped_backup escaped_detached escaped_nonce
   local files_json directories_json edits_json document
   if [ -z "$backup" ]; then
@@ -3152,8 +3339,16 @@ _uninstall_canonical_receipt() {
   _receipt_json_escape "$nonce" escaped_nonce
   _receipt_path_array "$files_name" files_json
   _receipt_edits_array "$edits_name" edits_json
-  printf -v document '{\n  "nonce": "%s",\n  "backup": %s,\n  "files": %s,\n' \
-    "$escaped_nonce" "$backup_json" "$files_json"
+  printf -v document '{\n  "nonce": "%s",\n' "$escaped_nonce"
+  if [ "$has_hash_binding" -eq 1 ]; then
+    local prior_json=null file_sha256_json
+    [ -z "$prior_manifest_sha256" ] || prior_json="\"$prior_manifest_sha256\""
+    _receipt_path_array "$file_sha256_name" file_sha256_json
+    document+="  \"priorManifestSha256\": $prior_json,"$'\n'
+    document+="  \"fileSha256\": $file_sha256_json,"$'\n'
+  fi
+  document+="  \"backup\": $backup_json,"$'\n'
+  document+="  \"files\": $files_json,"$'\n'
   if [ "$has_directories" -eq 1 ]; then
     _receipt_path_array "$directories_name" directories_json
     document+="  \"createdDirectories\": $directories_json,"$'\n'
@@ -3454,16 +3649,31 @@ _uninstall_validate_receipt_paths() {
 
 _uninstall_parse_receipt_document() {
   local root="$1" receipt="$2" document="$3" index=0 nonce backup=""
-  local has_directories=0 has_omp_managed=0 omp_managed=0
+  local has_directories=0 has_omp_managed=0 omp_managed=0 has_hash_binding=0
+  local prior_manifest_sha256=""
   local has_detached_root=0 detached_root="" canonical
   local omp_managed_inferred=0 detached_root_inferred=0
-  local -a lines=() files=() directories=() packed_edits=()
+  local -a lines=() files=() directories=() packed_edits=() file_sha256=()
   local -a edit_files=() edit_keys=() edit_values=() edit_priors=() edit_nulls=()
   mapfile -t lines < <(printf '%s' "$document")
   [ "${lines[index]:-}" = '{' ] || return 1
   index=$((index + 1))
   _uninstall_parse_string_member "${lines[index]:-}" '  "nonce": ' ',' nonce || return 1
   index=$((index + 1))
+  if [[ "${lines[index]:-}" == '  "priorManifestSha256": '* ]]; then
+    has_hash_binding=1
+    if [ "${lines[index]:-}" != '  "priorManifestSha256": null,' ]; then
+      _uninstall_parse_string_member "${lines[index]:-}" \
+        '  "priorManifestSha256": ' ',' prior_manifest_sha256 || return 1
+      [[ "$prior_manifest_sha256" =~ ^[a-f0-9]{64}$ ]] || return 1
+    fi
+    index=$((index + 1))
+    _uninstall_parse_string_array lines index fileSha256 ',' file_sha256 || return 1
+    local binding
+    for binding in "${file_sha256[@]}"; do
+      [[ "$binding" =~ =([a-f0-9]{64})$ ]] || return 1
+    done
+  fi
   if [ "${lines[index]:-}" != '  "backup": null,' ]; then
     _uninstall_parse_string_member "${lines[index]:-}" '  "backup": ' ',' backup || return 1
   fi
@@ -3496,7 +3706,8 @@ _uninstall_parse_receipt_document() {
   [ "${lines[index]:-}" = '}' ] && [ $((index + 1)) -eq "${#lines[@]}" ] || return 1
   _uninstall_canonical_receipt "$nonce" "$backup" "$has_directories" \
     "$has_omp_managed" "$omp_managed" "$has_detached_root" "$detached_root" \
-    files directories packed_edits canonical || return 1
+    files directories packed_edits canonical "$has_hash_binding" \
+    "$prior_manifest_sha256" file_sha256 || return 1
   [ "$document" = "$canonical"$'\n' ] || return 1
   if [ "$has_detached_root" -eq 0 ]; then
     if _uninstall_infer_legacy_omp_detached_root \
@@ -4054,7 +4265,11 @@ _custom_install_root_owned_path() {
   [ "$provider" = codex ] && {
     _idem_paths_equal "$path" "$root/autoprompt.config.toml" && return 0
     _idem_paths_equal "$path" "$root/config.toml" && return 0
-    _idem_paths_equal "$path" "$root/config.toml$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX"
+    _idem_paths_equal "$path" "$root/config.toml$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX" && return 0
+    _idem_paths_equal "$path" "$root/scripts" && return 0
+    _idem_paths_equal "$path" "$root/scripts/local-only-safety.cjs" && return 0
+    _idem_paths_equal "$path" "$root/skills/contracts" && return 0
+    _idem_path_under_root "$path" "$root/skills/contracts"
     return $?
   }
   parent="${path%/*}"; basename="${path##*/}"
@@ -4207,6 +4422,10 @@ _legacy_provider_owned_path() {
       _idem_path_under_root "$path" "$root/skills/autoprompt" && return 0
       _idem_paths_equal "$path" "$root/autoprompt.config.toml" && return 0
       _idem_paths_equal "$path" "$root/config.toml$AUTOPROMPT_CONFIGEDIT_BACKUP_SUFFIX" && return 0
+      _idem_paths_equal "$path" "$root/scripts" && return 0
+      _idem_paths_equal "$path" "$root/scripts/local-only-safety.cjs" && return 0
+      _idem_paths_equal "$path" "$root/skills/contracts" && return 0
+      _idem_path_under_root "$path" "$root/skills/contracts" && return 0
       ;;
     cursor)
       _idem_path_under_root "$path" "$root/.cursor/skills/autoprompt" && return 0
@@ -4530,10 +4749,36 @@ _uninstall_collect_provider_paths() {
 }
 
 _uninstall_remove_provider_paths() {
-  local root="$1" paths_name="$2" removed_name="$3" file path operation_code
+  local root="$1" paths_name="$2" removed_name="$3" retained_name="$4" provider="$5"
+  local file path operation_code recorded_hash live_hash reason
   local -n remove_paths_ref="$paths_name" removed_count_ref="$removed_name"
+  local -n retained_count_ref="$retained_name"
   for file in "${remove_paths_ref[@]}"; do
     path="$(_uninstall_filesystem_path "$file")" || return 74
+    if [ "$provider" = codex ]; then
+      recorded_hash=""
+      _idem_read_manifest_hash "$root" "$file" recorded_hash || return 74
+      reason=""
+      if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        _idem_remove_manifest_hash "$root" "$file" || return 74
+        printf '%s\n' "uninstall-file=$file note=already-absent"
+        continue
+      elif [ -L "$path" ] || [ ! -f "$path" ]; then
+        reason=linked-or-unsafe
+      elif [ -z "$recorded_hash" ]; then
+        reason=unfingerprinted
+      else
+        live_hash="$(_idem_sha256 "$path")" || reason=hash-unreadable
+        [ -n "$reason" ] || [ "$live_hash" = "$recorded_hash" ] || reason=hash-drift
+      fi
+      if [ -n "$reason" ]; then
+        printf '%s\n' \
+          "uninstall-retained=$file reason=$reason ownership=relinquished"
+        _idem_remove_manifest_hash "$root" "$file" || return 74
+        retained_count_ref=$((retained_count_ref + 1))
+        continue
+      fi
+    fi
     _uninstall_remove_path "$root" "$path" || {
       operation_code=$?
       return "$operation_code"
@@ -4557,7 +4802,7 @@ _uninstall_seal_provider_receipt() {
 }
 
 _uninstall_shared_provider() {
-  local root="$1" provider="$2" operation_code removed=0 directory
+  local root="$1" provider="$2" operation_code removed=0 retained=0 directory
   local manifest="$root/$AUTOPROMPT_HASH_MANIFEST_NAME"
   local receipt="$root/$AUTOPROMPT_RECEIPT_NAME"
   local -a remove_paths=() retained_files=() retained_directories=()
@@ -4579,7 +4824,7 @@ _uninstall_shared_provider() {
     return $?
   fi
   AUTOPROMPT_RECEIPT_FILES=("${retained_files[@]}")
-  _uninstall_remove_provider_paths "$root" remove_paths removed || {
+  _uninstall_remove_provider_paths "$root" remove_paths removed retained "$provider" || {
     operation_code=$?
     _uninstall_rollback_provider "$operation_code"
     return $?
@@ -4601,7 +4846,11 @@ _uninstall_shared_provider() {
     _uninstall_rollback_provider 77
     return $?
   }
-  printf '%s\n' "client=$provider uninstall=ok removed=$removed restored-edits=${UNINSTALL_RESTORED_EDIT_FILES:-0}"
+  if [ "$provider" = codex ]; then
+    printf '%s\n' "client=$provider uninstall=ok removed=$removed retained=$retained restored-edits=${UNINSTALL_RESTORED_EDIT_FILES:-0}"
+  else
+    printf '%s\n' "client=$provider uninstall=ok removed=$removed restored-edits=${UNINSTALL_RESTORED_EDIT_FILES:-0}"
+  fi
 }
 
 uninstall_client() {
@@ -4692,14 +4941,30 @@ _repair_add_native_candidates() {
 
 _repair_stage_codex_candidates() {
   local root="$1" live_skill="$2" stage="$3" stage_skill="$4"
-  local source_agents="$AUTOPROMPT_INSTALL_REPO_ROOT/agents/claude/agents"
+  local source_agents="$AUTOPROMPT_INSTALL_REPO_ROOT/agents/codex/agents"
   local casting_tool="$stage_skill/workflow/codex-agent-casting.js"
   local profile_tool="$stage_skill/workflow/codex-agent-profile.js"
-  local stage_agents="$stage_skill/agents-runtime"
-  local stage_profile="$stage/autoprompt.config.toml" generated had_nullglob
-  CODEX_AGENTS_DIR="$stage_agents" node "$casting_tool" --export-inheritance \
-    --source-agents "$source_agents" --agents-dir "$stage_agents" \
-    --selector off >/dev/null || return 1
+  local generation stage_layout_root stage_agents stage_profile generated had_nullglob expected_count
+  generation="$(autoprompt_codex_payload_generation)" || return 1
+  stage_layout_root="$stage/root"
+  stage_agents="$stage_layout_root/.autoprompt-private/bundles/$generation/skills/autoprompt/agents-runtime"
+  stage_profile="$stage_layout_root/autoprompt.config.toml"
+  mkdir -p -- "$stage_agents" || return 1
+  local generated_count=0 generated_role
+  for generated_role in "$source_agents"/ap-*.toml; do
+    [ -f "$generated_role" ] || continue
+    cp -- "$generated_role" "$stage_agents/${generated_role##*/}" || return 1
+    generated_count=$((generated_count + 1))
+  done
+  expected_count="$(node -e '
+    const fs = require("node:fs");
+    const policy = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    process.stdout.write(String(Object.keys(policy.physical_roles || {}).length));
+  ' "$stage_skill/agents/role-policy.json")" || return 1
+  [ "$expected_count" -gt 0 ] 2>/dev/null && \
+    [ "$generated_count" -eq "$expected_count" ] || return 1
+  CODEX_AGENTS_DIR="$stage_agents" node "$casting_tool" --write-manifest \
+    --agents-dir "$stage_agents" --selector off >/dev/null || return 1
   node "$profile_tool" --write --agents-dir "$stage_agents" \
     --profile "$stage_profile" >/dev/null || return 1
   CODEX_AGENTS_DIR="$stage_agents" node "$casting_tool" --resolve \
@@ -5064,28 +5329,56 @@ _extras_rollback_changes() {
 _extras_stage_payload() {
   local tool="$1" client="$2" stage="$3" inventory_name="$4" inventory_text
   local -n published_inventory="$inventory_name"
-  node "$tool" --install "$client" --destination "$stage" >/dev/null || return 1
-  node "$tool" --verify "$client" --destination "$stage" >/dev/null || return 1
-  inventory_text="$(node "$tool" --list "$client")" || return 1
+  local runtime_destination="$stage"
+  [ "$client" != codex ] || runtime_destination="$stage/skills/autoprompt"
+  node "$tool" --install "$client" --destination "$runtime_destination" >/dev/null || return 1
+  node "$tool" --verify "$client" --destination "$runtime_destination" >/dev/null || return 1
+  if [ "$client" = codex ]; then
+    inventory_text="$(node -e '
+      const runtime = require(process.argv[1]);
+      const plan = runtime.installationPlan("codex", process.argv[2]);
+      for (const item of plan.files) {
+        if (item.kind === "discovery-shim") continue;
+        if (/[\t\r\n]/.test(item.receiptPath) || /[\t\r\n]/.test(item.target)) process.exit(2);
+        process.stdout.write(`${item.receiptPath}\t${item.target}\n`);
+      }
+    ' "$tool" "$runtime_destination")" || return 1
+  else
+    inventory_text="$(node "$tool" --list "$client")" || return 1
+  fi
   published_inventory="$inventory_text"
 }
 
 _extras_install_inventory() {
   local root="$1" stage="$2" skilldest="$3" inventory="$4"
-  local landed_name="$5" agents_name="$6" relative candidate target copy_rc
+  local landed_name="$5" agents_name="$6" stable_source="${7:-0}"
+  local before_copy="${8:-}" relative receipt candidate target copy_rc
   local -n landed_count="$landed_name" agent_count="$agents_name"
   while IFS= read -r relative; do
     [ -z "$relative" ] && continue
-    candidate="$stage/$relative"
-    target="$skilldest/$relative"
+    if [[ "$relative" == *$'\t'* ]]; then
+      receipt="${relative%%$'\t'*}"
+      candidate="${relative#*$'\t'}"
+      case "/$receipt/" in
+        /*/../*|/*/./*|//*|*/../*|*/./*) return 82 ;;
+      esac
+      target="$root/$receipt"
+    else
+      receipt="$relative"
+      candidate="$stage/$relative"
+      target="$skilldest/$relative"
+    fi
     if [ ! -f "$candidate" ]; then
       return 82
     fi
-    _idem_install_managed_file "$root" "$candidate" "$target" 1
+    _idem_install_managed_file \
+      "$root" "$candidate" "$target" 1 1 0 "$stable_source" "$before_copy"
     copy_rc=$?
     [ "$copy_rc" -eq 0 ] || return "$copy_rc"
     landed_count=$((landed_count + 1))
-    case "$relative" in agents/*) agent_count=$((agent_count + 1)) ;; esac
+    case "$receipt" in
+      agents/*|*/skills/autoprompt/agents/ap-*.toml) agent_count=$((agent_count + 1)) ;;
+    esac
   done <<< "$inventory"
 }
 
@@ -5161,7 +5454,7 @@ _extras_prepare_install() {
 install_extras() {
   local client="$1" srcdir="$2" skilldest="$3" agentsdest="${4:-}" root="${5:-}"
   local native_destdir="" tool="" stage inventory="" copy_code native_code
-  local landed=0 agents=0 natives=0 journal_start
+  local landed=0 agents=0 natives=0 journal_start stable_source=0
   _extras_prepare_install "$client" "$srcdir" "$skilldest" "$agentsdest" \
     root native_destdir tool || return $?
   journal_start="${#AUTOPROMPT_MANAGED_UNDO_JOURNAL[@]}"
@@ -5172,11 +5465,13 @@ install_extras() {
     rm -rf -- "$stage" 2>/dev/null
     printf '%s\n' "client=$client error=extras-copy-failed" >&2; return 83
   fi
+  [ "$client" != codex ] || stable_source=1
   _extras_install_inventory "$root" "$stage" "$skilldest" \
-    "$inventory" landed agents; copy_code=$?
+    "$inventory" landed agents "$stable_source"; copy_code=$?
   if [ "$copy_code" -ne 0 ]; then
     rm -rf -- "$stage" 2>/dev/null
     _extras_rollback_changes "$client" "$root" "$journal_start" || return 85
+    if [ "$copy_code" -eq 46 ]; then return 46; fi
     printf '%s\n' "client=$client error=extras-copy-failed code=$copy_code" >&2; return 83
   fi
   if [ -n "$native_destdir" ]; then

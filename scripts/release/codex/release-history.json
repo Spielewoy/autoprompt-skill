@@ -1,0 +1,203 @@
+{
+  "schemaVersion": 1,
+  "name": "@autoprompt-skill/codex-runtime",
+  "algorithm": "sha256-chain-v1",
+  "releases": [
+    {
+      "version": "1.0.5",
+      "payloadGeneration": "codex-v2.0.0-e77127a56dae2e4f",
+      "payloadDigest": "e77127a56dae2e4f33851678b4baf4d945fe1f6af7aba9441d05dbc48a1712d7",
+      "previousRecordDigest": null,
+      "recordDigest": "d5c4d97bf557e513680dd7d2dcd14ed6ac0769f89b538297b4103221ff0a74ab"
+    },
+    {
+      "version": "1.0.6",
+      "payloadGeneration": "codex-v2.0.0-74c1ebf88a720ab2",
+      "payloadDigest": "74c1ebf88a720ab2c032f2d62bbe7cc40e15f5135b672fdc1ee4567bb588c502",
+      "previousRecordDigest": "d5c4d97bf557e513680dd7d2dcd14ed6ac0769f89b538297b4103221ff0a74ab",
+      "recordDigest": "2be1b27b66a4bd264cbb432e1e7e03534d7c98dcf20033e937677aea8a149a19"
+    },
+    {
+      "version": "1.0.7",
+      "payloadGeneration": "codex-v2.0.0-1e398a597a547574",
+      "payloadDigest": "1e398a597a54757405c2b04a61721454d9b2d18f7a8efbee23f29c1002084681",
+      "previousRecordDigest": "2be1b27b66a4bd264cbb432e1e7e03534d7c98dcf20033e937677aea8a149a19",
+      "recordDigest": "9a2ea32a061980c01c4319b2705f27e663009d0d1a1d10ed9954e5f502f10d21"
+    },
+    {
+      "version": "1.0.8",
+      "payloadGeneration": "codex-v2.0.0-e48ad822f54fc3b0",
+      "payloadDigest": "e48ad822f54fc3b06c533801b82c01d595bc5b8ee8d55c43dc2f554cf70f6f5c",
+      "previousRecordDigest": "9a2ea32a061980c01c4319b2705f27e663009d0d1a1d10ed9954e5f502f10d21",
+      "recordDigest": "ced4ec1d48cfd4ae2c8dfd26c96355b4442722244899ff8d6e8db6f4abe87158"
+    },
+    {
+      "version": "1.0.9",
+      "payloadGeneration": "codex-v2.0.0-576e13a743a0a74e",
+      "payloadDigest": "576e13a743a0a74e7916b69b6ab184058c641f1c60e77bb3092a62fb6e8175e3",
+      "previousRecordDigest": "ced4ec1d48cfd4ae2c8dfd26c96355b4442722244899ff8d6e8db6f4abe87158",
+      "recordDigest": "71f703ec61b16ad273c4895c2631bf7bcd863b7a9d17cd5fa16692dcc33fc069"
+    },
+    {
+      "version": "1.0.10",
+      "payloadGeneration": "codex-v2.0.0-dc4a59806b3347ab",
+      "payloadDigest": "dc4a59806b3347ab69efc6858b7665690dcfbcbf8ae082c1890085809c923a1c",
+      "previousRecordDigest": "71f703ec61b16ad273c4895c2631bf7bcd863b7a9d17cd5fa16692dcc33fc069",
+      "recordDigest": "a5de16dc1b062e47a450239e86f93addcbbec455416056d7fec936b1ca52d386"
+    },
+    {
+      "version": "1.0.11",
+      "payloadGeneration": "codex-v2.0.0-133d45ae22011557",
+      "payloadDigest": "133d45ae22011557a7b54fcc2ef2003c042a32a90e726b40f670bcfd06a3d90b",
+      "previousRecordDigest": "a5de16dc1b062e47a450239e86f93addcbbec455416056d7fec936b1ca52d386",
+      "recordDigest": "1e401185affe64557434b5857a912c32fa01d55d7c5907002b1a427135ba3106"
+    },
+    {
+      "version": "1.0.12",
+      "payloadGeneration": "codex-v2.0.0-2f3b7a044bfd7c17",
+      "payloadDigest": "2f3b7a044bfd7c17d587a3a7dfd82a849736a19c368df168e4cd6f1bf9b13f54",
+      "previousRecordDigest": "1e401185affe64557434b5857a912c32fa01d55d7c5907002b1a427135ba3106",
+      "recordDigest": "977af485c3f0a97f5d409872d99901f3427a9991df1a4b7ba48345d4a0356b1d"
+    },
+    {
+      "version": "1.0.13",
+      "payloadGeneration": "codex-v2.0.0-c0412a9fbc2264e2",
+      "payloadDigest": "c0412a9fbc2264e2a2aa41c1f10c5a34e47a3b0c8f9a392cf15532412d24100b",
+      "previousRecordDigest": "977af485c3f0a97f5d409872d99901f3427a9991df1a4b7ba48345d4a0356b1d",
+      "recordDigest": "02a2bbc95be4a2292fe9fbb09217afe90a724211d35c486e910baecab67137ac"
+    },
+    {
+      "version": "1.0.14",
+      "payloadGeneration": "codex-v2.0.0-b994239ba4a928c8",
+      "payloadDigest": "b994239ba4a928c83341b1aba54513f9a02da7057898617eb9ca4739c7c02b58",
+      "previousRecordDigest": "02a2bbc95be4a2292fe9fbb09217afe90a724211d35c486e910baecab67137ac",
+      "recordDigest": "132dc8c3e3d0ce23f8b68a79739abb7ab8da72e73125e5200c89ccb635bcbacb"
+    },
+    {
+      "version": "1.0.15",
+      "payloadGeneration": "codex-v2.0.0-5c772e046f3ebbd4",
+      "payloadDigest": "5c772e046f3ebbd4a2fb45c64dda92684521ba85b35756eae1aad69c878bf1f5",
+      "previousRecordDigest": "132dc8c3e3d0ce23f8b68a79739abb7ab8da72e73125e5200c89ccb635bcbacb",
+      "recordDigest": "cfff6a41dc75615bf996d266debb85f0fc8edde53a135a0085485a6b3dd03e24"
+    },
+    {
+      "version": "1.0.16",
+      "payloadGeneration": "codex-v2.0.0-837ff283f3da7e99",
+      "payloadDigest": "837ff283f3da7e9949e31898329b3b310a212f08b1838da2b0961310461cf477",
+      "previousRecordDigest": "cfff6a41dc75615bf996d266debb85f0fc8edde53a135a0085485a6b3dd03e24",
+      "recordDigest": "8752cef9cbcf28b3018694a51de9619868468699911d48ef9920444b364e1201"
+    },
+    {
+      "version": "1.0.17",
+      "payloadGeneration": "codex-v2.0.0-b6cdea9d478078e6",
+      "payloadDigest": "b6cdea9d478078e6ecfc94a4ed4017b43ed481581685caca40e6ca93fbc46e71",
+      "previousRecordDigest": "8752cef9cbcf28b3018694a51de9619868468699911d48ef9920444b364e1201",
+      "recordDigest": "57e148447bdb7bf2e02bad9f362cffdb684077ae3f1371215e084844e8ac762d"
+    },
+    {
+      "version": "1.0.18",
+      "payloadGeneration": "codex-v2.0.0-f1fa4b5d0398062f",
+      "payloadDigest": "f1fa4b5d0398062fdc0f207d738e2d15ec55c3480229d3cbf50d3342ebf5f964",
+      "previousRecordDigest": "57e148447bdb7bf2e02bad9f362cffdb684077ae3f1371215e084844e8ac762d",
+      "recordDigest": "1e0e52a7a9d542bf697f806ab504411060b109e587b7f1b0d81c1266d3de6e97"
+    },
+    {
+      "version": "1.0.19",
+      "payloadGeneration": "codex-v2.0.0-10c6679f40a63acd",
+      "payloadDigest": "10c6679f40a63acd281f4e3e7eece9f7dd5511f74ebe08da060fda93e9bea52e",
+      "previousRecordDigest": "1e0e52a7a9d542bf697f806ab504411060b109e587b7f1b0d81c1266d3de6e97",
+      "recordDigest": "87777940f9b074ff3882582a73d63ed86228d4e36f8484a8ee42b4d14529fa41"
+    },
+    {
+      "version": "1.0.20",
+      "payloadGeneration": "codex-v2.0.0-b6d46d14f4cc26c2",
+      "payloadDigest": "b6d46d14f4cc26c225deae4648aab43705a1fce1a63fd56043fda6c879434923",
+      "previousRecordDigest": "87777940f9b074ff3882582a73d63ed86228d4e36f8484a8ee42b4d14529fa41",
+      "recordDigest": "6e1a689ba1ef0aaacdb88f4f9133f880beba818e578c42421f3cf6b3fd41be95"
+    },
+    {
+      "version": "1.0.21",
+      "payloadGeneration": "codex-v2.0.0-690052d35bafe615",
+      "payloadDigest": "690052d35bafe61501b1fc7386bbc89feb03366848b1222b39f64afff548dd4a",
+      "previousRecordDigest": "6e1a689ba1ef0aaacdb88f4f9133f880beba818e578c42421f3cf6b3fd41be95",
+      "recordDigest": "0ffd8f724fcb7761cf6da681ef29f71d31568900f94528085681e0091ca97984"
+    },
+    {
+      "version": "1.0.22",
+      "payloadGeneration": "codex-v2.0.0-130f212a3ccb5e30",
+      "payloadDigest": "130f212a3ccb5e3080a26ece4564a0e6dc896802db198b02c78a0a05523bcf31",
+      "previousRecordDigest": "0ffd8f724fcb7761cf6da681ef29f71d31568900f94528085681e0091ca97984",
+      "recordDigest": "9ff00e297e42acc23c1fc5853964b4f6b5acfe26b61540bf6ba71c685ee7866e"
+    },
+    {
+      "version": "1.0.23",
+      "payloadGeneration": "codex-v2.0.0-983b0f59aa30a577",
+      "payloadDigest": "983b0f59aa30a5773037d08ef88117389c1fbfa745be5a4f99d0bc68d28af7e6",
+      "previousRecordDigest": "9ff00e297e42acc23c1fc5853964b4f6b5acfe26b61540bf6ba71c685ee7866e",
+      "recordDigest": "2d3e994b70e7ad676dd9b1fe90471569e01a7ca70c636354c7170a48566bd230"
+    },
+    {
+      "version": "1.0.24",
+      "payloadGeneration": "codex-v2.0.0-39ed390a9cd723e8",
+      "payloadDigest": "39ed390a9cd723e8849291a9fafc4d62aa2a16518a1585b43a0662c27c84f556",
+      "previousRecordDigest": "2d3e994b70e7ad676dd9b1fe90471569e01a7ca70c636354c7170a48566bd230",
+      "recordDigest": "2192ee49531925268c0d1c0448dce79390731618bdf50a2b8789458421f4c983"
+    },
+    {
+      "version": "1.0.25",
+      "payloadGeneration": "codex-v2.0.0-84b1e448a1c8255b",
+      "payloadDigest": "84b1e448a1c8255badfa9b37b3ba41124188ecb4615f4f0a8ef485a5a6eea618",
+      "previousRecordDigest": "2192ee49531925268c0d1c0448dce79390731618bdf50a2b8789458421f4c983",
+      "recordDigest": "cdc7c83e2bf6ce7918ac25974265824e139cc097c6bbda361f50e1a5d44e99a1"
+    },
+    {
+      "version": "1.0.26",
+      "payloadGeneration": "codex-v2.0.0-d1058f33af4fc35f",
+      "payloadDigest": "d1058f33af4fc35f536a10cafe7c89295a3468d5dc2c25fb03474d9b4b91198e",
+      "previousRecordDigest": "cdc7c83e2bf6ce7918ac25974265824e139cc097c6bbda361f50e1a5d44e99a1",
+      "recordDigest": "a738878a9e9de98760ef5487eb39c5ece2cda846dd155c8d86c0e4e4b0dccc6d"
+    },
+    {
+      "version": "1.0.27",
+      "payloadGeneration": "codex-v2.0.0-4141569f0e7df3ee",
+      "payloadDigest": "4141569f0e7df3ee4d34418f9934479a685bd28c1b0018a6c0a6c311fde3773a",
+      "previousRecordDigest": "a738878a9e9de98760ef5487eb39c5ece2cda846dd155c8d86c0e4e4b0dccc6d",
+      "recordDigest": "41f3f4b51513cbe44c13fab364f683d1e5022262b467181b1cc26dd5aa5ecd19"
+    },
+    {
+      "version": "1.0.28",
+      "payloadGeneration": "codex-v2.0.0-ebb9008a70eeb55a",
+      "payloadDigest": "ebb9008a70eeb55a4f6fc261ab6948eb091f44eef5d30039abc09d5c5b741c27",
+      "previousRecordDigest": "41f3f4b51513cbe44c13fab364f683d1e5022262b467181b1cc26dd5aa5ecd19",
+      "recordDigest": "ce887c677a15e86c3f657f92eee5c1ad5401eae0becc5ecac0dc15c1e54cfb60"
+    },
+    {
+      "version": "1.0.29",
+      "payloadGeneration": "codex-v2.0.0-f2c0ac7a1585f8f3",
+      "payloadDigest": "f2c0ac7a1585f8f39508e615beac4ce20b0e3a88a07ce1fcfa6d765afe963ec7",
+      "previousRecordDigest": "ce887c677a15e86c3f657f92eee5c1ad5401eae0becc5ecac0dc15c1e54cfb60",
+      "recordDigest": "44e7adcc1c347cadd11ac53e6068ae2cf13b0151f6f8a6a488c7be81e9ec9558"
+    },
+    {
+      "version": "1.0.30",
+      "payloadGeneration": "codex-v2.0.0-d96fa16e22ffbfa9",
+      "payloadDigest": "d96fa16e22ffbfa91e750f2200f3dc75eb3b1dea1542b9a1040696a131a966e8",
+      "previousRecordDigest": "44e7adcc1c347cadd11ac53e6068ae2cf13b0151f6f8a6a488c7be81e9ec9558",
+      "recordDigest": "256cf8ea2bf852a7ba91bd2e67d13ebc02f72cbf7bcb6b2ffd5fca4ed35dd939"
+    },
+    {
+      "version": "1.0.31",
+      "payloadGeneration": "codex-v2.0.0-536317e3136b1fff",
+      "payloadDigest": "536317e3136b1fffd6d46b7af5d258d6b24602b05a8818f337f32c151dd4630d",
+      "previousRecordDigest": "256cf8ea2bf852a7ba91bd2e67d13ebc02f72cbf7bcb6b2ffd5fca4ed35dd939",
+      "recordDigest": "6d6e3795c752ebc2c642187edd85f637f9b40d7a3b80686b982bbc8ed5b17894"
+    },
+    {
+      "version": "1.0.32",
+      "payloadGeneration": "codex-v2.0.0-bfae7f930a9f7432",
+      "payloadDigest": "bfae7f930a9f74328f2401dd55b774bbc63c296d20347336e9dece9ed916f59b",
+      "previousRecordDigest": "6d6e3795c752ebc2c642187edd85f637f9b40d7a3b80686b982bbc8ed5b17894",
+      "recordDigest": "606d9613835db5d2d07627ab3922c18940724bad8b007cf3dc8be23083427b77"
+    }
+  ]
+}

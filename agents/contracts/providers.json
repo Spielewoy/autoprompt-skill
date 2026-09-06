@@ -1,0 +1,474 @@
+{
+  "$schema": "./schemas/providers.schema.json",
+  "kind": "autoprompt-provider-capability-contract",
+  "contractVersion": "2.0.0",
+  "safeSupportValues": [
+    "supported",
+    "degraded",
+    "unsupported",
+    "unknown"
+  ],
+  "capabilityDefinitions": {
+    "isolation": {
+      "requiredFor": [
+        "activation"
+      ],
+      "supportedMeans": "Private roles and skills are invisible before activation and after revocation."
+    },
+    "topologyEnforcement": {
+      "requiredFor": [
+        "dispatch"
+      ],
+      "supportedMeans": "The runtime rejects every parent-child edge not present in roles.json before a child starts."
+    },
+    "privateSkillRoot": {
+      "requiredFor": [
+        "activation"
+      ],
+      "supportedMeans": "The active run receives only the approved private skill set."
+    },
+    "eventStreaming": {
+      "requiredFor": [
+        "route-analysis"
+      ],
+      "supportedMeans": "Messages and tool events can be captured as they occur."
+    },
+    "toolOutputCapture": {
+      "requiredFor": [
+        "route-analysis",
+        "evidence"
+      ],
+      "supportedMeans": "Raw tool output, size, media type, and truncation can be recorded."
+    },
+    "stableChildIdentity": {
+      "requiredFor": [
+        "repair",
+        "resume"
+      ],
+      "supportedMeans": "A child has a stable runtime identity bound to its parent and activation."
+    },
+    "sameContextContinuation": {
+      "requiredFor": [
+        "repair"
+      ],
+      "supportedMeans": "A useful worker can continue in the same context after a failed check."
+    },
+    "cancellation": {
+      "requiredFor": [
+        "safe-stop"
+      ],
+      "supportedMeans": "The owned process and every descendant can be stopped and confirmed stopped."
+    },
+    "isolatedChecking": {
+      "requiredFor": [
+        "independent-checking"
+      ],
+      "supportedMeans": "The checked target is read-only while declared check resources are isolated or exclusive."
+    },
+    "processOwnership": {
+      "requiredFor": [
+        "safe-stop",
+        "deadline"
+      ],
+      "supportedMeans": "The controller owns a verifiable process group or equivalent from creation through stop."
+    },
+    "modelRouting": {
+      "requiredFor": [],
+      "supportedMeans": "The provider can apply a user-selected model or effort without changing route topology."
+    }
+  },
+  "admissionPolicy": {
+    "unknown": "refuse-required-feature",
+    "unsupported": "refuse-required-feature",
+    "degraded": "use-only-the-named-safe-degraded-behavior",
+    "supported": "require-a-current-verification-record"
+  },
+  "attestationVerificationPolicy": {
+    "canonicalization": "stable-json-v1",
+    "excludedSignedPaths": [
+      "signature.value"
+    ],
+    "trustedKeySource": "runtime-trusted-key-ring",
+    "acceptedAlgorithms": [
+      "ed25519",
+      "ecdsa-p256-sha256"
+    ],
+    "freshness": {
+      "issuedAtNotAfterVerificationTime": true,
+      "expiresAtAfterVerificationTime": true
+    },
+    "requiredBindings": [
+      "providerId",
+      "runtimeIdentityHash",
+      "activationNonce"
+    ],
+    "requiredCapabilityRule": "every-required-capability-must-be-attested",
+    "acceptedResult": "supported",
+    "failureStatus": "PROVIDER_UNSUPPORTED"
+  },
+  "verificationAttestationSchema": {
+    "type": "object",
+    "required": [
+      "schemaVersion",
+      "attestationId",
+      "providerId",
+      "issuer",
+      "issuedAt",
+      "expiresAt",
+      "signature",
+      "runtimeIdentityHash",
+      "activationNonce",
+      "verificationMethod",
+      "verifiedCapabilities",
+      "result"
+    ],
+    "properties": {
+      "schemaVersion": {
+        "const": "2.0.0"
+      },
+      "attestationId": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
+      },
+      "providerId": {
+        "enum": [
+          "codex",
+          "claude",
+          "opencode",
+          "kilo",
+          "vscode",
+          "prime",
+          "omp",
+          "deepseek",
+          "reasonix"
+        ]
+      },
+      "issuer": {
+        "type": "string",
+        "minLength": 3
+      },
+      "issuedAt": {
+        "type": "string",
+        "format": "date-time"
+      },
+      "expiresAt": {
+        "type": "string",
+        "format": "date-time"
+      },
+      "signature": {
+        "type": "object",
+        "required": [
+          "algorithm",
+          "keyId",
+          "value"
+        ],
+        "properties": {
+          "algorithm": {
+            "enum": [
+              "ed25519",
+              "ecdsa-p256-sha256"
+            ]
+          },
+          "keyId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "value": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43,512}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "runtimeIdentityHash": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$"
+      },
+      "activationNonce": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_-]{16,128}$"
+      },
+      "providerAdmissionSha256": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$"
+      },
+      "supportedEnvironment": {
+        "type": "object",
+        "required": [
+          "platform",
+          "arch",
+          "codexExecutableBasename",
+          "codexExecutableSha256",
+          "codexExecutableVersion"
+        ],
+        "properties": {
+          "platform": {
+            "type": "string",
+            "minLength": 2
+          },
+          "arch": {
+            "type": "string",
+            "minLength": 2
+          },
+          "codexExecutableBasename": {
+            "type": "string",
+            "minLength": 1
+          },
+          "codexExecutableSha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "codexExecutableVersion": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "verificationMethod": {
+        "enum": [
+          "live-conformance-suite",
+          "provider-signed-capability-probe"
+        ]
+      },
+      "verifiedCapabilities": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": {
+          "enum": [
+            "isolation",
+            "topologyEnforcement",
+            "privateSkillRoot",
+            "eventStreaming",
+            "toolOutputCapture",
+            "stableChildIdentity",
+            "sameContextContinuation",
+            "cancellation",
+            "isolatedChecking",
+            "processOwnership",
+            "modelRouting"
+          ]
+        }
+      },
+      "result": {
+        "enum": [
+          "supported",
+          "degraded",
+          "unsupported"
+        ]
+      }
+    },
+    "additionalProperties": false
+  },
+  "providers": [
+    {
+      "id": "codex",
+      "priority": 1,
+      "implementationStatus": "verified",
+      "currentIsolationClass": "strict",
+      "defaultAdmission": "allow-verified-required-capabilities",
+      "attestationRequired": true,
+      "capabilities": {
+        "isolation": "supported",
+        "topologyEnforcement": "degraded",
+        "privateSkillRoot": "supported",
+        "eventStreaming": "unknown",
+        "toolOutputCapture": "unknown",
+        "stableChildIdentity": "unknown",
+        "sameContextContinuation": "unknown",
+        "cancellation": "unknown",
+        "isolatedChecking": "unknown",
+        "processOwnership": "supported",
+        "modelRouting": "unknown"
+      },
+      "safeDegradedBehavior": "Keep internal roles out of global discovery and refuse workflows whose required capability is not verified.",
+      "verificationRequired": "real Codex activation, edge, continuation, cancellation, and isolated-checking conformance",
+      "verificationAttestation": null
+    },
+    {
+      "id": "claude",
+      "priority": 2,
+      "implementationStatus": "declared-unverified",
+      "currentIsolationClass": "prompt-guarded",
+      "defaultAdmission": "refuse-until-p8-verification",
+      "capabilities": {
+        "isolation": "unknown",
+        "topologyEnforcement": "unknown",
+        "privateSkillRoot": "unknown",
+        "eventStreaming": "unknown",
+        "toolOutputCapture": "unknown",
+        "stableChildIdentity": "unknown",
+        "sameContextContinuation": "unknown",
+        "cancellation": "unknown",
+        "isolatedChecking": "unknown",
+        "processOwnership": "unknown",
+        "modelRouting": "unknown"
+      },
+      "safeDegradedBehavior": "Refuse any required feature that lacks a current provider check.",
+      "verificationRequired": "real provider behavioral conformance",
+      "verificationAttestation": null
+    },
+    {
+      "id": "opencode",
+      "priority": 3,
+      "implementationStatus": "declared-unverified",
+      "currentIsolationClass": "prompt-guarded",
+      "defaultAdmission": "refuse-until-p8-verification",
+      "capabilities": {
+        "isolation": "unknown",
+        "topologyEnforcement": "degraded",
+        "privateSkillRoot": "unknown",
+        "eventStreaming": "unknown",
+        "toolOutputCapture": "unknown",
+        "stableChildIdentity": "unknown",
+        "sameContextContinuation": "unknown",
+        "cancellation": "unknown",
+        "isolatedChecking": "unknown",
+        "processOwnership": "unknown",
+        "modelRouting": "unknown"
+      },
+      "safeDegradedBehavior": "Route every child through an enforcing adapter or refuse dispatch.",
+      "verificationRequired": "real provider behavioral conformance",
+      "verificationAttestation": null
+    },
+    {
+      "id": "kilo",
+      "priority": 4,
+      "implementationStatus": "declared-unverified",
+      "currentIsolationClass": "prompt-guarded",
+      "defaultAdmission": "refuse-until-p8-verification",
+      "capabilities": {
+        "isolation": "unknown",
+        "topologyEnforcement": "degraded",
+        "privateSkillRoot": "unknown",
+        "eventStreaming": "unknown",
+        "toolOutputCapture": "unknown",
+        "stableChildIdentity": "unknown",
+        "sameContextContinuation": "unknown",
+        "cancellation": "unknown",
+        "isolatedChecking": "unknown",
+        "processOwnership": "unknown",
+        "modelRouting": "unknown"
+      },
+      "safeDegradedBehavior": "Route every child through an enforcing adapter or refuse dispatch.",
+      "verificationRequired": "real provider behavioral conformance",
+      "verificationAttestation": null
+    },
+    {
+      "id": "vscode",
+      "priority": 5,
+      "implementationStatus": "declared-unverified",
+      "currentIsolationClass": "prompt-guarded",
+      "defaultAdmission": "refuse-until-p8-verification",
+      "capabilities": {
+        "isolation": "unknown",
+        "topologyEnforcement": "unknown",
+        "privateSkillRoot": "unknown",
+        "eventStreaming": "unknown",
+        "toolOutputCapture": "unknown",
+        "stableChildIdentity": "unknown",
+        "sameContextContinuation": "unknown",
+        "cancellation": "unknown",
+        "isolatedChecking": "unknown",
+        "processOwnership": "unknown",
+        "modelRouting": "unknown"
+      },
+      "safeDegradedBehavior": "Disable model invocation for private roles and refuse unverified dispatch.",
+      "verificationRequired": "real provider behavioral conformance",
+      "verificationAttestation": null
+    },
+    {
+      "id": "prime",
+      "priority": 6,
+      "implementationStatus": "declared-unverified",
+      "currentIsolationClass": "prompt-guarded",
+      "defaultAdmission": "refuse-until-p8-verification",
+      "capabilities": {
+        "isolation": "unknown",
+        "topologyEnforcement": "unknown",
+        "privateSkillRoot": "unknown",
+        "eventStreaming": "unknown",
+        "toolOutputCapture": "unknown",
+        "stableChildIdentity": "unknown",
+        "sameContextContinuation": "unknown",
+        "cancellation": "unknown",
+        "isolatedChecking": "unknown",
+        "processOwnership": "unknown",
+        "modelRouting": "unknown"
+      },
+      "safeDegradedBehavior": "Refuse any required feature that lacks a current provider check.",
+      "verificationRequired": "real provider behavioral conformance",
+      "verificationAttestation": null
+    },
+    {
+      "id": "omp",
+      "priority": 7,
+      "implementationStatus": "declared-unverified",
+      "currentIsolationClass": "prompt-guarded",
+      "defaultAdmission": "refuse-until-p8-verification",
+      "capabilities": {
+        "isolation": "unknown",
+        "topologyEnforcement": "unknown",
+        "privateSkillRoot": "unknown",
+        "eventStreaming": "unknown",
+        "toolOutputCapture": "unknown",
+        "stableChildIdentity": "unknown",
+        "sameContextContinuation": "unknown",
+        "cancellation": "unknown",
+        "isolatedChecking": "unknown",
+        "processOwnership": "unknown",
+        "modelRouting": "unknown"
+      },
+      "safeDegradedBehavior": "Refuse any required feature that lacks a current provider check.",
+      "verificationRequired": "real provider behavioral conformance",
+      "verificationAttestation": null
+    },
+    {
+      "id": "deepseek",
+      "priority": 8,
+      "implementationStatus": "declared-unverified",
+      "currentIsolationClass": "prompt-guarded",
+      "defaultAdmission": "refuse-until-p8-verification",
+      "capabilities": {
+        "isolation": "unknown",
+        "topologyEnforcement": "unknown",
+        "privateSkillRoot": "unknown",
+        "eventStreaming": "unknown",
+        "toolOutputCapture": "unknown",
+        "stableChildIdentity": "unknown",
+        "sameContextContinuation": "unknown",
+        "cancellation": "unknown",
+        "isolatedChecking": "unknown",
+        "processOwnership": "unknown",
+        "modelRouting": "unknown"
+      },
+      "safeDegradedBehavior": "Refuse any required feature that lacks a current provider check.",
+      "verificationRequired": "real provider behavioral conformance",
+      "verificationAttestation": null
+    },
+    {
+      "id": "reasonix",
+      "priority": 9,
+      "implementationStatus": "declared-unverified",
+      "currentIsolationClass": "prompt-guarded",
+      "defaultAdmission": "refuse-until-p8-verification",
+      "capabilities": {
+        "isolation": "unknown",
+        "topologyEnforcement": "degraded",
+        "privateSkillRoot": "unknown",
+        "eventStreaming": "unknown",
+        "toolOutputCapture": "unknown",
+        "stableChildIdentity": "unknown",
+        "sameContextContinuation": "unknown",
+        "cancellation": "unknown",
+        "isolatedChecking": "unknown",
+        "processOwnership": "unknown",
+        "modelRouting": "unknown"
+      },
+      "safeDegradedBehavior": "Route every child through an enforcing adapter or refuse dispatch.",
+      "verificationRequired": "real provider behavioral conformance",
+      "verificationAttestation": null
+    }
+  ]
+}

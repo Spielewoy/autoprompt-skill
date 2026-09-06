@@ -1,14 +1,14 @@
 <p align="center">
-  <img src="../../assets/i18n/ko/banner.svg" alt="Autoprompt Skill: 에이전트 코딩 작업 실패 45% 감소" width="760"/>
+  <img src="../../assets/banner.svg" alt="Autoprompt Skill: 분홍색 구름과 날아가는 기러기" width="1000"/>
 </p>
 
-<p align="center">Autoprompt는 에이전트 코딩 작업의 실패를 45% 줄인 코딩 에이전트 스킬입니다.</p>
+<p align="center">Autoprompt는 작업을 검토하고, 수정하고, 다시 검증하여 실패를 45% 줄이는 코딩 에이전트 워크플로입니다.</p>
 
 <p align="center">
-  <a href="#벤치마크"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%EC%A0%90-255C60?style=flat-square&labelColor=14101F" alt="Terminal-Bench 2.1: 14.61점 향상"/></a>
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%EB%B2%84%EC%A0%84&color=255C60&labelColor=14101F" alt="버전: v1.0.4"/></a>
-  <a href="#설치"><img src="https://img.shields.io/badge/%EC%A7%80%EC%9B%90-9-255C60?style=flat-square&labelColor=14101F" alt="지원: 9"/></a>
-  <a href="../../LICENSE"><img src="https://img.shields.io/badge/%EB%9D%BC%EC%9D%B4%EC%84%A0%EC%8A%A4-MIT-255C60?style=flat-square&labelColor=14101F" alt="라이선스: MIT"/></a>
+  <a href="#벤치마크"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%EC%A0%90-965477?style=flat-square&labelColor=302335" alt="Terminal-Bench 2.1: 14.61점 향상"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%EB%B2%84%EC%A0%84&color=965477&labelColor=302335" alt="버전: v1.0.4"/></a>
+  <a href="#설치"><img src="https://img.shields.io/badge/%EC%A7%80%EC%9B%90-9-965477?style=flat-square&labelColor=302335" alt="지원: 9"/></a>
+  <a href="../../LICENSE"><img src="https://img.shields.io/badge/%EB%9D%BC%EC%9D%B4%EC%84%A0%EC%8A%A4-MIT-965477?style=flat-square&labelColor=302335" alt="라이선스: MIT"/></a>
 </p>
 
 <p align="center">
@@ -69,7 +69,7 @@ autoprompt
 | 상태 | 코딩 도구 | 검증 기준 | 키 |
 |---|---|---|---|
 | 지원 | [Claude Code](https://code.claude.com/docs/en/setup) | 2.1.219+; 2.1.233 검증 완료 | `claude` |
-| 지원 | [Codex](https://github.com/openai/codex) | 서브에이전트 지원 빌드; 0.147.0 검증 완료 | `codex` |
+| 지원 | [Codex](https://github.com/openai/codex) | 서브에이전트 지원 빌드; 0.148.0 검증 완료 | `codex` |
 | 지원 | [OpenCode](https://opencode.ai/docs/agents) | 1.18.7+; 1.18.18 검증 완료 | `opencode` |
 | 지원 | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; 7.4.22 검증 완료 | `kilo` |
 | 지원 | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; VS Code 1.133.0 및 Copilot 0.61.0 검증 완료 | `vscode` |
@@ -93,6 +93,8 @@ autoprompt
 
 ## 벤치마크
 
+아래는 **버전 1 벤치마크**입니다. 버전 2 결과는 추후 공개됩니다.
+
 <p align="center">
   <img src="../../assets/i18n/ko/terminal-bench-2.1-leaderboard.svg" width="1000" alt="Terminal-Bench 2.1 순위표: Artificial Analysis 참조 점수 18개와 Autoprompt 사용 전후의 DeepSeek V4 Flash 0731 실측 점수."/>
 </p>
@@ -112,7 +114,7 @@ autoprompt
 
 </details>
 
-DeepSeek의 82.7%는 자체 테스트 설정에서 나온 결과이므로 직접 비교할 수 있는 세 번째 실행이 아닙니다. [테스트 설정과 근거 범위](../benchmarks/terminal-bench-2.1.md)를 확인하거나 [새 벤치마크를 요청](https://github.com/Spielewoy/autoprompt-skill/issues/new?template=benchmark_request.md)하세요.
+DeepSeek의 82.7%는 자체 테스트 설정에서 나온 결과이므로 직접 비교할 수 있는 세 번째 실행이 아닙니다. [테스트 설정과 근거 범위](../benchmarks/terminal-bench-2.1.md)를 확인하거나 [새 벤치마크를 요청](https://github.com/Spielewoy/autoprompt-skill/issues/new)하세요.
 
 <details>
 <summary><strong>예상 비용:</strong> 시간은 약 3x, 토큰은 약 2x입니다.</summary>
@@ -123,9 +125,25 @@ DeepSeek의 82.7%는 자체 테스트 설정에서 나온 결과이므로 직접
 
 ## 호출 구조
 
-<p align="center">
-  <a href="../../assets/i18n/ko/anatomy.svg"><img src="../../assets/i18n/ko/anatomy.svg" alt="Autoprompt 호출 구조: 트리거, 동시 실행 모드, 에이전트 상한, 모델 라우팅, 목표" width="1000"/></a>
-</p>
+```text
+/autoprompt mode=custom max_subs=4 agents=auto <goal>
+```
+
+| 항목 | 설명 |
+|---|---|
+| `/autoprompt` | 스킬을 시작합니다. |
+| `mode=custom` | 동시 실행: tokensaver, wide 또는 custom. |
+| `max_subs=4` | 하위 에이전트를 최대 네 개까지 동시에 실행합니다. |
+| `agents=auto` | 자동 선택, 현재 모델(off) 또는 모델 목록. |
+| `<goal>` | 원하는 결과, 제약, 검증 방법을 설명합니다. |
+| `path=` | 작업 경로: auto, direct, light 또는 roadmap. |
+
+Codex 예시:
+
+```bash
+autoprompt activate codex -- path=light "<goal>"
+```
+
 
 ## 실행 제어
 
@@ -139,13 +157,13 @@ DeepSeek의 82.7%는 자체 테스트 설정에서 나온 결과이므로 직접
 ## 작동 방식
 
 <p align="center">
-  <img src="../../assets/i18n/ko/how-it-works-loop.svg" alt="프롬프트에서 계획, 구현, 검토, 테스트, 승인, 전체 점검까지 이어지는 Autoprompt 흐름" width="1100"/>
+  <a href="../../assets/i18n/ko/how-it-works-loop.svg"><img src="../../assets/i18n/ko/how-it-works-loop.svg" alt="프롬프트에서 계획, 구현, 검토, 테스트, 승인, 전체 점검까지 이어지는 Autoprompt 흐름" width="1100"/></a>
 </p>
 
 ## 에이전트
 
 <p align="center">
-  <img src="../../assets/i18n/ko/how-it-works-hierarchy.svg" alt="프롬프트, 조정자, 관리자, 실행 레인, 독립 검사로 구성된 Autoprompt 에이전트 계층" width="1100"/>
+  <a href="../../assets/i18n/ko/how-it-works-hierarchy.svg"><img src="../../assets/i18n/ko/how-it-works-hierarchy.svg" alt="프롬프트, 조정자, 관리자, 실행 레인, 독립 검사로 구성된 Autoprompt 에이전트 계층" width="1100"/></a>
 </p>
 
 ## 예시
@@ -157,7 +175,7 @@ DeepSeek의 82.7%는 자체 테스트 설정에서 나온 결과이므로 직접
 | 조사 | `/autoprompt 이 코드베이스에 맞는 작업 큐를 비교하고 하나를 추천해 줘` |
 | 동시 실행 제한 | `/autoprompt mode=custom max_subs=4 모든 모델을 마이그레이션해 줘` |
 
-Codex에서는 `/autoprompt` 대신 `$autoprompt`를 사용하세요. Oh My Pi에서는 `/skill:autoprompt`를 사용하세요.
+Codex에서는 `/autoprompt` 대신 `autoprompt activate codex -- "<goal>"`를 사용하세요. Oh My Pi에서는 `/skill:autoprompt`를 사용하세요.
 
 ## 자주 묻는 질문
 
@@ -183,6 +201,13 @@ Codex에서는 `/autoprompt` 대신 `$autoprompt`를 사용하세요. Oh My Pi�
 </details>
 
 <details>
+<summary><strong>작업 경로란 무엇인가요?</strong></summary>
+
+`path=auto`는 경로를 선택합니다. `direct`는 명확한 작업을 시작하고, `light`는 간단한 계획을 추가하며, `roadmap`은 의존 관계가 있는 작업을 구성합니다. 모든 경로에 독립 검증이 포함됩니다. [자세히](../faq/work-paths.md)
+
+</details>
+
+<details>
 <summary><strong>`mode`, `max_subs`, `agents`는 무엇을 제어하나요?</strong></summary>
 
 `mode=tokensaver`는 활성 서브에이전트를 6개로 제한하고, `mode=wide`는 준비된 모든 작업을 엽니다. `mode=custom max_subs=N`은 사용자 지정 상한을 정하며, `agents`는 호스트가 지원할 때 모델 라우팅을 제어합니다. [자세히 보기](../faq/tokensaver-vs-wide-vs-custom.md)
@@ -192,7 +217,7 @@ Codex에서는 `/autoprompt` 대신 `$autoprompt`를 사용하세요. Oh My Pi�
 <details>
 <summary><strong>Autoprompt가 백그라운드에서 시작되지 않는 이유는 무엇인가요?</strong></summary>
 
-비용, 시간, 작업 흐름이 달라지기 때문입니다. `/autoprompt <목표>`로 명시적으로 시작하고, Codex에서는 `$autoprompt`를 사용하세요.
+비용, 시간, 작업 흐름이 달라지기 때문입니다. `/autoprompt <목표>`로 명시적으로 시작하고, Codex에서는 `autoprompt activate codex -- "<goal>"`를 사용하세요.
 
 </details>
 

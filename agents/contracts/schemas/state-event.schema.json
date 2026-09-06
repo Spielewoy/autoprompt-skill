@@ -1,0 +1,303 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/state-event.schema.json",
+  "title": "One Autoprompt v2 events.jsonl entry",
+  "type": "object",
+  "required": [
+    "contractVersion",
+    "transitionId",
+    "eventId",
+    "runId",
+    "activationNonce",
+    "sequence",
+    "fromState",
+    "toState",
+    "requestEnvelopeHash",
+    "targetIdentityHash",
+    "candidateHash",
+    "evidenceHashes",
+    "openIds",
+    "attempt",
+    "causalParent",
+    "occurredAt",
+    "humanDescription"
+  ],
+  "properties": {
+    "contractVersion": {
+      "const": "2.0.0"
+    },
+    "transitionId": {
+      "type": "string",
+      "pattern": "^T[0-9]{3}$"
+    },
+    "eventId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]+$"
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 8
+    },
+    "activationNonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16,128}$"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "fromState": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]+$"
+    },
+    "toState": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]+$"
+    },
+    "requestEnvelopeHash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "targetIdentityHash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "candidateHash": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "evidenceHashes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/sha256"
+      }
+    },
+    "openIds": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "causalParent": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "humanDescription": {
+      "type": "string",
+      "minLength": 1
+    },
+    "resourceState": {
+      "type": "object"
+    },
+    "retryState": {
+      "type": "object"
+    },
+    "recoveryContext": {
+      "$ref": "#/$defs/recoveryContext"
+    }
+  },
+  "additionalProperties": false,
+  "oneOf": [
+    {"properties":{"transitionId":{"const":"T001"},"eventId":{"const":"BOOTSTRAP"},"fromState":{"const":"BOOT"},"toState":{"const":"LOAD_SKILL"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T002"},"eventId":{"const":"SKILL_LOADED"},"fromState":{"const":"LOAD_SKILL"},"toState":{"const":"STORE_REQUEST_ENVELOPE"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T003"},"eventId":{"const":"REQUEST_ENVELOPE_STORED"},"fromState":{"const":"STORE_REQUEST_ENVELOPE"},"toState":{"const":"RESOLVE_SETTINGS"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T004"},"eventId":{"const":"SETTINGS_MISSING"},"fromState":{"const":"RESOLVE_SETTINGS"},"toState":{"const":"CONFIG_REQUIRED"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T005"},"eventId":{"const":"SETTINGS_SUPPLIED"},"fromState":{"const":"CONFIG_REQUIRED"},"toState":{"const":"RESOLVE_SETTINGS"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T006"},"eventId":{"const":"SETTINGS_RESOLVED"},"fromState":{"const":"RESOLVE_SETTINGS"},"toState":{"const":"ACQUIRE_TARGET_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T007"},"eventId":{"const":"TARGET_LOCK_ACQUIRED"},"fromState":{"const":"ACQUIRE_TARGET_LOCK"},"toState":{"const":"SELECT_SAFE_RUN_ROOT"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T008"},"eventId":{"const":"TARGET_LOCK_CONFLICT"},"fromState":{"const":"ACQUIRE_TARGET_LOCK"},"toState":{"const":"BLOCKED"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T009"},"eventId":{"const":"RUN_ROOT_SELECTED"},"fromState":{"const":"SELECT_SAFE_RUN_ROOT"},"toState":{"const":"CREATE_RUN_RECORD"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T010"},"eventId":{"const":"RUN_RECORD_UNSAFE"},"fromState":{"const":"SELECT_SAFE_RUN_ROOT"},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T011"},"eventId":{"const":"RUN_RECORD_CREATED"},"fromState":{"const":"CREATE_RUN_RECORD"},"toState":{"const":"CHECK_PROVIDER_CAPABILITIES"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T012"},"eventId":{"const":"RUN_RECORD_FAILURE"},"fromState":{"const":"CREATE_RUN_RECORD"},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T013"},"eventId":{"const":"PROVIDER_CAPABILITIES_ACCEPTED"},"fromState":{"const":"CHECK_PROVIDER_CAPABILITIES"},"toState":{"const":"START_ROUTE_ANALYST"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T079"},"eventId":{"const":"EXACT_PATH_ACCEPTED"},"fromState":{"const":"CHECK_PROVIDER_CAPABILITIES"},"toState":{"const":"PREPARE_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T014"},"eventId":{"const":"PROVIDER_UNSUPPORTED"},"fromState":{"const":"CHECK_PROVIDER_CAPABILITIES"},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T015"},"eventId":{"const":"ROUTE_ANALYST_STARTED"},"fromState":{"const":"START_ROUTE_ANALYST"},"toState":{"const":"SAVE_ROUTE_ANALYSIS"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T016"},"eventId":{"const":"ROUTE_ANALYST_FAILED_TO_START"},"fromState":{"const":"START_ROUTE_ANALYST"},"toState":{"const":"SAVE_ROUTE_ANALYSIS"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T017"},"eventId":{"const":"ROUTE_ANALYSIS_SAVED"},"fromState":{"const":"SAVE_ROUTE_ANALYSIS"},"toState":{"const":"L0_ROUTE_DECISION"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T018"},"eventId":{"const":"ROUTE_DECISION_VALID"},"fromState":{"const":"L0_ROUTE_DECISION"},"toState":{"const":"PREPARE_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T019"},"eventId":{"const":"ROUTE_DECISION_NEEDS_USER"},"fromState":{"const":"L0_ROUTE_DECISION"},"toState":{"const":"WAITING_USER"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T020"},"eventId":{"const":"ROUTE_DECISION_INVALID_FIRST"},"fromState":{"const":"L0_ROUTE_DECISION"},"toState":{"const":"L0_ROUTE_DECISION"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T021"},"eventId":{"const":"ROUTE_DECISION_INVALID_FINAL"},"fromState":{"const":"L0_ROUTE_DECISION"},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T022"},"eventId":{"const":"ROUTE_DECISION_TIMEOUT"},"fromState":{"const":"L0_ROUTE_DECISION"},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T023"},"eventId":{"const":"WORK_PREPARED"},"fromState":{"const":"PREPARE_WORK"},"toState":{"const":"RUN_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T024"},"eventId":{"const":"WORK_ITEM_VERIFIED"},"fromState":{"const":"RUN_WORK"},"toState":{"const":"ITEM_VERIFIED"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T025"},"eventId":{"const":"MORE_WORK_READY"},"fromState":{"const":"ITEM_VERIFIED"},"toState":{"const":"RUN_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T026"},"eventId":{"const":"ALL_WORK_JOINED"},"fromState":{"enum":["RUN_WORK","ITEM_VERIFIED"]},"toState":{"const":"CHECK_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T027"},"eventId":{"const":"IMPLEMENTATION_DEFECT"},"fromState":{"const":"CHECK_WORK"},"toState":{"const":"REPAIRING"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T028"},"eventId":{"const":"MISSING_EDGE_CASE"},"fromState":{"const":"CHECK_WORK"},"toState":{"const":"REPAIRING"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T029"},"eventId":{"const":"REGRESSION"},"fromState":{"const":"CHECK_WORK"},"toState":{"const":"REPAIRING"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T030"},"eventId":{"const":"CHECK_DEFECT"},"fromState":{"const":"CHECK_WORK"},"toState":{"const":"REPAIRING"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T031"},"eventId":{"const":"REPAIR_READY"},"fromState":{"const":"REPAIRING"},"toState":{"const":"CHECK_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T032"},"eventId":{"const":"TRANSIENT_RUNTIME"},"fromState":{"const":"RUN_WORK"},"toState":{"const":"RUN_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T032"},"eventId":{"const":"TRANSIENT_RUNTIME"},"fromState":{"const":"CHECK_WORK"},"toState":{"const":"CHECK_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T032"},"eventId":{"const":"TRANSIENT_RUNTIME"},"fromState":{"const":"REPAIRING"},"toState":{"const":"REPAIRING"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T033"},"eventId":{"const":"CHECK_INCONCLUSIVE"},"fromState":{"enum":["RUN_WORK","CHECK_WORK"]},"toState":{"const":"CHECK_INCONCLUSIVE"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T034"},"eventId":{"const":"CHECK_BECAME_CONCLUSIVE"},"fromState":{"const":"CHECK_INCONCLUSIVE"},"toState":{"enum":["RUN_WORK","CHECK_WORK"]}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T035"},"eventId":{"const":"CHECK_REMAINS_INCONCLUSIVE"},"fromState":{"const":"CHECK_INCONCLUSIVE"},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T036"},"eventId":{"const":"WORKER_CONTEXT_LOST"},"fromState":{"enum":["RUN_WORK","REPAIRING"]},"toState":{"const":"WORKER_CONTEXT_LOST"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T037"},"eventId":{"const":"WORKER_CONTEXT_RESTORED"},"fromState":{"const":"WORKER_CONTEXT_LOST"},"toState":{"const":"RUN_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T038"},"eventId":{"const":"WORKER_CONTEXT_UNRECOVERABLE"},"fromState":{"const":"WORKER_CONTEXT_LOST"},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T076"},"eventId":{"const":"WORKER_CONTEXT_UNRECOVERABLE_AFTER_PARTIAL_RESULT"},"fromState":{"const":"WORKER_CONTEXT_LOST"},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T039"},"eventId":{"const":"INTEGRATION_CONFLICT"},"fromState":{"const":"RUN_WORK"},"toState":{"const":"INTEGRATION_CONFLICT"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T040"},"eventId":{"const":"INTEGRATION_CONFLICT_RESOLVED"},"fromState":{"const":"INTEGRATION_CONFLICT"},"toState":{"const":"RUN_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T041"},"eventId":{"const":"INTEGRATION_REVEALS_NEW_DEPENDENCY"},"fromState":{"const":"INTEGRATION_CONFLICT"},"toState":{"const":"CHANGING_ROUTE"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T042"},"eventId":{"const":"SPEC_MISUNDERSTOOD"},"fromState":{"const":"CHECK_WORK"},"toState":{"const":"CHANGING_ROUTE"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T043"},"eventId":{"const":"MULTI_SURFACE_DISCOVERED"},"fromState":{"enum":["RUN_WORK","CHECK_WORK"]},"toState":{"const":"CHANGING_ROUTE"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T044"},"eventId":{"const":"ARCHITECTURE_FORK_DISCOVERED"},"fromState":{"enum":["RUN_WORK","CHECK_WORK"]},"toState":{"const":"CHANGING_ROUTE"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T045"},"eventId":{"const":"CAPABILITY_LOST"},"fromState":{"enum":["RUN_WORK","CHECK_WORK"]},"toState":{"const":"REASSESS_STRATEGY"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T046"},"eventId":{"const":"RISK_DISCOVERED"},"fromState":{"enum":["RUN_WORK","CHECK_WORK"]},"toState":{"const":"REASSESS_STRATEGY"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T073"},"eventId":{"const":"SIDE_EFFECT_DISCOVERED"},"fromState":{"enum":["RUN_WORK","CHECK_WORK"]},"toState":{"const":"REASSESS_STRATEGY"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T074"},"eventId":{"const":"SHARED_RESOURCE_DISCOVERED"},"fromState":{"enum":["RUN_WORK","CHECK_WORK"]},"toState":{"const":"REASSESS_STRATEGY"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T075"},"eventId":{"const":"ORACLE_FAILURE"},"fromState":{"const":"CHECK_WORK"},"toState":{"const":"REASSESS_STRATEGY"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T047"},"eventId":{"const":"NO_PROGRESS"},"fromState":{"enum":["RUN_WORK","REPAIRING","CHECK_WORK"]},"toState":{"const":"REASSESS_STRATEGY"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T048"},"eventId":{"const":"STRATEGY_REVISED"},"fromState":{"const":"REASSESS_STRATEGY"},"toState":{"const":"RUN_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T049"},"eventId":{"const":"STRATEGY_BLOCKED"},"fromState":{"const":"REASSESS_STRATEGY"},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T050"},"eventId":{"const":"AUTHORITY_REQUIRED"},"fromState":{"enum":["L0_ROUTE_DECISION","PREPARE_WORK","RUN_WORK","ITEM_VERIFIED","CHECK_WORK","REASSESS_STRATEGY","CHANGING_ROUTE"]},"toState":{"const":"WAITING_USER"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T051"},"eventId":{"const":"ROUTE_CHANGE_DECIDED"},"fromState":{"const":"CHANGING_ROUTE"},"toState":{"const":"PREPARE_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T052"},"eventId":{"const":"ACCEPTANCE_GREEN"},"fromState":{"const":"CHECK_WORK"},"toState":{"const":"FINAL_CHECK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T053"},"eventId":{"const":"SMALL_REFINEMENT_SELECTED"},"fromState":{"const":"FINAL_CHECK"},"toState":{"const":"RUN_WORK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T054"},"eventId":{"const":"VERIFIED"},"fromState":{"const":"FINAL_CHECK"},"toState":{"const":"FINALIZING"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T055"},"eventId":{"const":"FINAL_RECORD_READY"},"fromState":{"const":"FINALIZING"},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T056"},"eventId":{"const":"ENVIRONMENT_BLOCKED"},"fromState":{"enum":["PREPARE_WORK","RUN_WORK","ITEM_VERIFIED","CHECK_WORK","REPAIRING"]},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T080"},"eventId":{"const":"CHECK_FAILED_FINAL"},"fromState":{"enum":["PREPARE_WORK","RUN_WORK","CHECK_WORK","REPAIRING"]},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T081"},"eventId":{"const":"CONTROLLER_FAILED_FINAL"},"fromState":{"enum":["LOAD_SKILL","STORE_REQUEST_ENVELOPE","RESOLVE_SETTINGS","SELECT_SAFE_RUN_ROOT","CREATE_RUN_RECORD","CHECK_PROVIDER_CAPABILITIES","START_ROUTE_ANALYST","SAVE_ROUTE_ANALYSIS","L0_ROUTE_DECISION","PREPARE_WORK","RUN_WORK","ITEM_VERIFIED","CHECK_WORK","REPAIRING","CHECK_INCONCLUSIVE","WORKER_CONTEXT_LOST","INTEGRATION_CONFLICT","REASSESS_STRATEGY","CHANGING_ROUTE","APPEND_REQUEST_STEERING","INVALIDATE_AFFECTED_RESULTS","MIGRATING_CONTRACT","RESUME_EXACT_STATE","FINAL_CHECK","FINALIZING"]},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T057"},"eventId":{"const":"CANCEL_REQUESTED"},"fromState":{"enum":["LOAD_SKILL","STORE_REQUEST_ENVELOPE","RESOLVE_SETTINGS","SELECT_SAFE_RUN_ROOT","CREATE_RUN_RECORD","CHECK_PROVIDER_CAPABILITIES","START_ROUTE_ANALYST","SAVE_ROUTE_ANALYSIS","L0_ROUTE_DECISION","PREPARE_WORK","RUN_WORK","ITEM_VERIFIED","CHECK_WORK","REPAIRING","CHECK_INCONCLUSIVE","WORKER_CONTEXT_LOST","INTEGRATION_CONFLICT","REASSESS_STRATEGY","CHANGING_ROUTE","APPEND_REQUEST_STEERING","INVALIDATE_AFFECTED_RESULTS","MIGRATING_CONTRACT","RESUME_EXACT_STATE","FINAL_CHECK"]},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T058"},"eventId":{"const":"BUDGET_EXHAUSTED_RESUMABLE"},"fromState":{"enum":["PREPARE_WORK","RUN_WORK","ITEM_VERIFIED","CHECK_WORK","REPAIRING","CHECK_INCONCLUSIVE"]},"toState":{"const":"PAUSED"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T059"},"eventId":{"const":"BUDGET_EXHAUSTED_FINAL"},"fromState":{"enum":["START_ROUTE_ANALYST","SAVE_ROUTE_ANALYSIS","L0_ROUTE_DECISION","PREPARE_WORK","RUN_WORK","ITEM_VERIFIED","CHECK_WORK","REPAIRING","CHECK_INCONCLUSIVE","FINAL_CHECK","FINALIZING"]},"toState":{"const":"RELEASING_LOCK"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T060"},"eventId":{"const":"RESUME_REQUESTED"},"fromState":{"const":"PAUSED"},"toState":{"const":"CHECK_PROVIDER_CAPABILITIES"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T061"},"eventId":{"const":"USER_UPDATE"},"fromState":{"enum":["L0_ROUTE_DECISION","WAITING_USER","PREPARE_WORK","RUN_WORK","ITEM_VERIFIED","CHECK_WORK","REPAIRING","CHECK_INCONCLUSIVE","WORKER_CONTEXT_LOST","INTEGRATION_CONFLICT","REASSESS_STRATEGY","CHANGING_ROUTE","FINAL_CHECK","PAUSED","CONFIG_REQUIRED"]},"toState":{"const":"APPEND_REQUEST_STEERING"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T062"},"eventId":{"const":"REQUEST_STEERING_APPENDED"},"fromState":{"const":"APPEND_REQUEST_STEERING"},"toState":{"const":"INVALIDATE_AFFECTED_RESULTS"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T063"},"eventId":{"const":"AFFECTED_RESULTS_INVALIDATED"},"fromState":{"const":"INVALIDATE_AFFECTED_RESULTS"},"toState":{"const":"L0_ROUTE_DECISION"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T064"},"eventId":{"const":"CONTRACT_UPGRADE_REQUIRED"},"fromState":{"enum":["LOAD_SKILL","CHECK_PROVIDER_CAPABILITIES","PAUSED"]},"toState":{"const":"MIGRATING_CONTRACT"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T065"},"eventId":{"const":"CONTRACT_MIGRATION_PASSED"},"fromState":{"const":"MIGRATING_CONTRACT"},"toState":{"const":"RESUME_EXACT_STATE"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T066"},"eventId":{"const":"EXACT_STATE_RESTORED"},"fromState":{"const":"RESUME_EXACT_STATE"},"toState":{"enum":["SELECT_SAFE_RUN_ROOT","CREATE_RUN_RECORD","CHECK_PROVIDER_CAPABILITIES","START_ROUTE_ANALYST","SAVE_ROUTE_ANALYSIS","L0_ROUTE_DECISION","PREPARE_WORK","RUN_WORK","ITEM_VERIFIED","CHECK_WORK","REPAIRING","CHECK_INCONCLUSIVE","WORKER_CONTEXT_LOST","INTEGRATION_CONFLICT","REASSESS_STRATEGY","CHANGING_ROUTE","APPEND_REQUEST_STEERING","INVALIDATE_AFFECTED_RESULTS","MIGRATING_CONTRACT","RESUME_EXACT_STATE","FINAL_CHECK","FINALIZING"]}},"required":["transitionId","eventId","fromState","toState","recoveryContext"]},
+    {"properties":{"transitionId":{"const":"T067"},"eventId":{"const":"CONTRACT_MIGRATION_REFUSED"},"fromState":{"const":"MIGRATING_CONTRACT"},"toState":{"const":"FAILED"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T068"},"eventId":{"const":"LOCK_RELEASED_DONE"},"fromState":{"const":"RELEASING_LOCK"},"toState":{"const":"DONE"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T069"},"eventId":{"const":"LOCK_RELEASED_PARTIAL"},"fromState":{"const":"RELEASING_LOCK"},"toState":{"const":"PARTIAL"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T070"},"eventId":{"const":"LOCK_RELEASED_BLOCKED"},"fromState":{"const":"RELEASING_LOCK"},"toState":{"const":"BLOCKED"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T071"},"eventId":{"const":"LOCK_RELEASED_CANCELLED"},"fromState":{"const":"RELEASING_LOCK"},"toState":{"const":"CANCELLED"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T072"},"eventId":{"const":"LOCK_RELEASED_FAILED"},"fromState":{"const":"RELEASING_LOCK"},"toState":{"const":"FAILED"}},"required":["transitionId","eventId","fromState","toState"]},
+    {"properties":{"transitionId":{"const":"T077"},"eventId":{"const":"CRASH_DETECTED"},"fromState":{"enum":["SELECT_SAFE_RUN_ROOT","CREATE_RUN_RECORD","CHECK_PROVIDER_CAPABILITIES","START_ROUTE_ANALYST","SAVE_ROUTE_ANALYSIS","L0_ROUTE_DECISION","PREPARE_WORK","RUN_WORK","ITEM_VERIFIED","CHECK_WORK","REPAIRING","CHECK_INCONCLUSIVE","WORKER_CONTEXT_LOST","INTEGRATION_CONFLICT","REASSESS_STRATEGY","CHANGING_ROUTE","APPEND_REQUEST_STEERING","INVALIDATE_AFFECTED_RESULTS","MIGRATING_CONTRACT","RESUME_EXACT_STATE","FINAL_CHECK","FINALIZING"]},"toState":{"const":"PAUSED"}},"required":["transitionId","eventId","fromState","toState","recoveryContext"]},
+    {"properties":{"transitionId":{"const":"T078"},"eventId":{"const":"PROVIDER_CAPABILITIES_ACCEPTED_FOR_RESUME"},"fromState":{"const":"CHECK_PROVIDER_CAPABILITIES"},"toState":{"const":"RESUME_EXACT_STATE"}},"required":["transitionId","eventId","fromState","toState","recoveryContext"]}
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "recoveryContext": {
+      "type": "object",
+      "required": [
+        "savedState",
+        "resumeState",
+        "checkpointHash",
+        "frontierHash",
+        "frontier",
+        "completedMilestones",
+        "priorOwner",
+        "externalRecovery",
+        "releaseIntentHash",
+        "accountingCheckpoint"
+      ],
+      "properties": {
+        "savedState": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+        "resumeState": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+        "checkpointHash": { "$ref": "#/$defs/sha256" },
+        "frontierHash": { "$ref": "#/$defs/sha256" },
+        "frontier": {
+          "type": "object",
+          "required": ["nextReadyWorkIds", "openCheckIds", "acceptedResultIds"],
+          "properties": {
+            "nextReadyWorkIds": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "openCheckIds": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "acceptedResultIds": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+          },
+          "additionalProperties": false
+        },
+        "completedMilestones": {
+          "type": "array", "uniqueItems": true,
+          "items": { "enum": ["route-analysis", "route-decision", "work-preparation", "external-prepare", "external-commit", "external-reconcile", "final-check"] }
+        },
+        "priorOwner": {
+          "type": "object",
+          "required": ["ownerId", "staleOwnerEvidenceHash", "processesDrained", "processDrainEvidenceHash"],
+          "properties": {
+            "ownerId": { "type": "string", "minLength": 1 },
+            "staleOwnerEvidenceHash": { "$ref": "#/$defs/sha256" },
+            "processesDrained": { "const": true },
+            "processDrainEvidenceHash": { "$ref": "#/$defs/sha256" }
+          },
+          "additionalProperties": false
+        },
+        "externalRecovery": {
+          "type": "object",
+          "required": ["status", "operationIds", "idempotencyKeys", "receiptHashes"],
+          "properties": {
+            "status": { "enum": ["none", "reconciliation-required"] },
+            "operationIds": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "idempotencyKeys": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "receiptHashes": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/sha256" } }
+          },
+          "additionalProperties": false
+        },
+        "releaseIntentHash": {
+          "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+        },
+        "accountingCheckpoint": {
+          "type": "object",
+          "required": ["snapshotHash", "lastAccountingSequence", "lastAccountingHash"],
+          "properties": {
+            "snapshotHash": { "$ref": "#/$defs/sha256" },
+            "lastAccountingSequence": { "type": "integer", "minimum": 1 },
+            "lastAccountingHash": { "$ref": "#/$defs/sha256" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "externalRecovery": { "properties": { "status": { "const": "reconciliation-required" } }, "required": ["status"] } },
+            "required": ["externalRecovery"]
+          },
+          "then": {
+            "properties": {
+              "resumeState": { "const": "CHECK_WORK" },
+              "externalRecovery": {
+                "properties": {
+                  "operationIds": { "minItems": 1 },
+                  "idempotencyKeys": { "minItems": 1 }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

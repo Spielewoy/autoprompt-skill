@@ -3,7 +3,9 @@
 # Behavior-faithful twin of doctor.sh. Read-only diagnostics over lib/install-lib.ps1.
 #
 # For each client: detected? (Detect-Client) installed? (receipt presence under the
-# client's config-root) verifies? (Verify-Install). Writes NOTHING, edits NOTHING.
+# client's config-root) verifies? (Verify-Install plus Codex's static activation
+# prerequisites). Dynamic Codex sandbox/network capability is still re-proved at
+# activation time. Writes NOTHING, edits NOTHING.
 # Usage: doctor.ps1   (no arguments). HOME / XDG_CONFIG_HOME honored if set.
 
 [CmdletBinding()]
@@ -386,7 +388,7 @@ function Test-ClientLegacyCodexInstalled {
         return $false
     }
     $nodeCommand = Get-Command node -CommandType Application `
-        -ErrorAction SilentlyContinue
+        -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $nodeCommand) { return $false }
     $helper = Join-Path $RepoRoot 'scripts/install/legacy-compat.cjs'
     & $nodeCommand.Source $helper match codex $Root *> $null
@@ -509,11 +511,48 @@ function Get-ClientStatus {
         if ($m.Success) { $reason = $m.Groups[1].Value }
     }
 
+    $activation = '-'
+    if ($Client -ceq 'codex' -and $verifies -ceq 'yes') {
+        $helper = Join-Path $RepoRoot 'scripts/codex-configure.cjs'
+        if (-not (Get-Command node -ErrorAction SilentlyContinue) -or
+            -not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+            $verifies = 'no'
+            $reason = 'diagnostic-helper-missing'
+            $activation = 'unavailable'
+        } else {
+            $output = @(& node $helper --doctor-activation-prerequisites 2>&1)
+            if ($LASTEXITCODE -eq 0) {
+                $activation = 'static-ready;dynamic-preflight-required'
+            } else {
+                $verifies = 'no'
+                $activation = 'unavailable'
+                $match = [regex]::Match(($output -join "`n"), 'reason=([^\s]+)')
+                if ($match.Success) { $reason = $match.Groups[1].Value }
+                else { $reason = 'codex-activation-prerequisite-invalid' }
+            }
+        }
+    }
+
     $mode = '-'
-    return @{ Detected = $detected; Installed = $installed; Verifies = $verifies; Version = $version; Reason = $reason; Extras = (Get-ExtrasStatus -Client $Client); Mode = $mode; Support = $support }
+    return @{ Detected = $detected; Installed = $installed; Verifies = $verifies; Version = $version; Reason = $reason; Extras = (Get-ExtrasStatus -Client $Client); Mode = $mode; Support = $support; Activation = $activation }
 }
 
 # --- main ---
+if ($Target -ceq 'isolation') {
+    if (-not (Test-AutopromptInstallRootContract -Target 'codex')) { exit 2 }
+    $helper = Join-Path $RepoRoot 'scripts/codex-configure.cjs'
+    if (-not (Get-Command node -ErrorAction SilentlyContinue) -or
+        -not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        [Console]::Error.WriteLine(
+            'Autoprompt doctor isolation: PROVIDER_UNSUPPORTED provider=codex reason=diagnostic-helper-missing'
+        )
+        exit 1
+    }
+    $output = @(& node $helper --doctor-isolation 2>&1)
+    $code = $LASTEXITCODE
+    foreach ($line in $output) { [Console]::Out.WriteLine($line) }
+    exit $code
+}
 if (-not [string]::IsNullOrEmpty($Target) -and $ClientsAll -notcontains $Target) {
     [Console]::Error.WriteLine("Usage: doctor.ps1 [client] [-Strict]")
     exit 2
@@ -531,6 +570,7 @@ foreach ($c in $clients) {
     if ($s.Support -in @('blocked', 'retired', 'unverified')) {
         $detail += " support=$($s.Support)"
     }
+    if ($c -ceq 'codex') { $detail += " activation=$($s.Activation)" }
     [Console]::Out.WriteLine(("{0,-9} {1,-9} {2,-10} {3,-10} {4}" -f $c, $s.Detected, $s.Installed, $s.Verifies, $detail))
     if ($Strict -and ($s.Detected -cne 'yes' -or $s.Installed -cne 'yes' -or
         $s.Verifies -cne 'yes' -or $s.Extras -notin @('complete', 'na'))) {

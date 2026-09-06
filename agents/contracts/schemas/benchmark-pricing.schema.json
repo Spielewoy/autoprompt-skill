@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.dev/schemas/benchmark-pricing.v2.json",
+  "title": "Autoprompt immutable benchmark pricing snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "pricingId", "effectiveAt", "currency", "models", "host", "storage", "setup", "digest"],
+  "properties": {
+    "schemaVersion": { "const": "benchmark-pricing.v2" },
+    "pricingId": { "$ref": "#/$defs/nonEmpty" },
+    "effectiveAt": { "type": "string", "format": "date-time" },
+    "currency": { "$ref": "#/$defs/nonEmpty" },
+    "models": { "type": "object", "minProperties": 1, "propertyNames": { "$ref": "#/$defs/sha256" }, "additionalProperties": { "$ref": "#/$defs/modelPrice" } },
+    "host": { "type": "object", "additionalProperties": false, "required": ["perSecond"], "properties": { "perSecond": { "$ref": "#/$defs/nonNegative" } } },
+    "storage": { "type": "object", "additionalProperties": false, "required": ["perByteMonth"], "properties": { "perByteMonth": { "$ref": "#/$defs/nonNegative" } } },
+    "setup": { "type": "object", "additionalProperties": false, "required": ["perUnit"], "properties": { "perUnit": { "$ref": "#/$defs/nonNegative" } } },
+    "digest": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "nonNegative": { "type": "number", "minimum": 0 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "modelPrice": { "type": "object", "additionalProperties": false, "required": ["inputPerMillion", "cachedInputPerMillion", "outputPerMillion", "reasoningPerMillion"], "properties": { "inputPerMillion": { "$ref": "#/$defs/nonNegative" }, "cachedInputPerMillion": { "$ref": "#/$defs/nonNegative" }, "outputPerMillion": { "$ref": "#/$defs/nonNegative" }, "reasoningPerMillion": { "$ref": "#/$defs/nonNegative" } } }
+  }
+}

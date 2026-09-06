@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "1.0.0",
+  "providerId": "codex",
+  "keys": [
+    {
+      "algorithm": "ed25519",
+      "format": "spki-pem",
+      "keyId": "2c56c976bb7baaa8d51318c739355270816cad6a279adf75d989a2a1425da68b",
+      "notBefore": "2026-08-23T20:19:43.644Z",
+      "notAfter": "2027-08-23T20:19:43.644Z",
+      "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAt3PVdgTRcMgFg/sFch1IBhE/c8VaTZs8Zy/G5gOt3X4=\n-----END PUBLIC KEY-----\n",
+      "status": "trusted"
+    }
+  ]
+}

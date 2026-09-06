@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "benchmark-task-catalog.v2",
+  "catalogId": "terminal-bench-3.0-cpu-fixture-2026-08-22",
+  "benchmarkId": "terminal-bench-3.0-cpu-fixture",
+  "fixtureOnly": true,
+  "tasks": [
+    { "taskId": "task-alpha" },
+    { "taskId": "task-excluded" }
+  ],
+  "digest": "71719019a380d3308217af326a02b3e2c59803d45016fc8d64bc9181888e0e4a",
+  "attestation": {
+    "schemaVersion": "benchmark-catalog-attestation.v2",
+    "issuer": "terminal-bench-upstream-fixture",
+    "keyId": "tb3-fixture-ed25519-2026-08-22",
+    "algorithm": "ed25519",
+    "catalogDigest": "71719019a380d3308217af326a02b3e2c59803d45016fc8d64bc9181888e0e4a",
+    "taskCount": 2,
+    "taskIdsDigest": "7b32828d94cfcf3e1cd1c6618f3014b2504887d14a890b4f2087f45f08c14c64",
+    "signature": "2aL5r4M2YrnRLTbLYGDDtBzV1wXIxMoIqQ7YdYvxUlGIZWsZQ3ic+Izs+0vkeJkIZafVVOEMZo1N8YhEjkuaAw=="
+  }
+}

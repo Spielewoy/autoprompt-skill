@@ -1,0 +1,269 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/evidence.schema.json",
+  "title": "Autoprompt v2 evidence record",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "evidenceId",
+    "evidenceType",
+    "producedBy",
+    "immutable",
+    "versionBinding",
+    "inputEvidenceIds",
+    "outputs",
+    "status",
+    "invalidatedBy",
+    "createdAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "2.0.0"
+    },
+    "evidenceId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$"
+    },
+    "evidenceType": {
+      "enum": [
+        "route-analysis",
+        "route-decision",
+        "baseline-check",
+        "work-result",
+        "static-review",
+        "behavior-test",
+        "named-risk-check",
+        "integration-check",
+        "final-check",
+        "provider-capability",
+        "containment-proof"
+      ]
+    },
+    "producedBy": {
+      "type": "object",
+      "required": [
+        "logicalRoleId",
+        "physicalRoleId",
+        "sessionId",
+        "activationNonce"
+      ],
+      "properties": {
+        "logicalRoleId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "physicalRoleId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "activationNonce": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{16,128}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "immutable": {
+      "const": true
+    },
+    "versionBinding": {
+      "type": "object",
+      "required": [
+        "requestEnvelopeHash",
+        "candidate",
+        "environmentHash",
+        "checkDefinitionHash",
+        "assumptionHashes",
+        "contractDigest",
+        "providerDigest",
+        "toolDigest"
+      ],
+      "properties": {
+        "requestEnvelopeHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "candidate": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "workspaceEpoch",
+                "manifestHash"
+              ],
+              "properties": {
+                "workspaceEpoch": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "manifestHash": {
+                  "$ref": "#/$defs/sha256"
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "environmentHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "checkDefinitionHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "assumptionHashes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/sha256"
+          }
+        },
+        "contractDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "providerDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "toolDigest": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "additionalProperties": false
+    },
+    "inputEvidenceIds": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "outputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "sha256",
+          "byteLength",
+          "mediaType",
+          "truncated"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "byteLength": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mediaType": {
+            "type": "string",
+            "minLength": 1
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "objectPath": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "status": {
+      "enum": [
+        "valid",
+        "invalidated"
+      ]
+    },
+    "invalidatedBy": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": [
+          "inputKind",
+          "oldHash",
+          "newHash",
+          "eventId"
+        ],
+        "properties": {
+          "inputKind": {
+            "enum": [
+              "request",
+              "plan",
+              "candidate",
+              "environment",
+              "check-definition",
+              "assumption",
+              "provider",
+              "tool"
+            ]
+          },
+          "oldHash": {
+            "$ref": "#/$defs/sha256"
+          },
+          "newHash": {
+            "$ref": "#/$defs/sha256"
+          },
+          "eventId": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "invalidated"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "invalidatedBy": {
+            "minItems": 1
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "invalidatedBy": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

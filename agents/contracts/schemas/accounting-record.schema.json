@@ -1,0 +1,236 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoprompt.local/schemas/v2/accounting-record.schema.json",
+  "title": "Autoprompt v2 append-only runtime accounting record",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "runId",
+    "activationId",
+    "activationNonce",
+    "generation",
+    "stateEventSequence",
+    "stateEventHash",
+    "monotonicClock",
+    "cumulative",
+    "delta",
+    "cause",
+    "sequence",
+    "previousHash",
+    "entryHash",
+    "occurredAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "2.0.0"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$"
+    },
+    "activationId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "activationNonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16,128}$"
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "stateEventSequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "stateEventHash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "monotonicClock": {
+      "$ref": "#/$defs/monotonicClock"
+    },
+    "cumulative": {
+      "$ref": "#/$defs/accountingValues"
+    },
+    "delta": {
+      "$ref": "#/$defs/accountingValues"
+    },
+    "cause": {
+      "type": "object",
+      "required": [
+        "kind",
+        "causeId",
+        "humanDescription"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "STATE_EVENT",
+            "LAUNCH",
+            "RETRY",
+            "TIME_ELAPSED",
+            "COST_RECORDED",
+            "TOKEN_USAGE_RECORDED",
+            "CHECKPOINT",
+            "RECOVERY"
+          ]
+        },
+        "causeId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+        },
+        "humanDescription": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "requiredCompletion": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "previousHash": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/sha256"
+        }
+      ]
+    },
+    "entryHash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false,
+  "x-autopromptHashChain": {
+    "algorithm": "sha256",
+    "canonicalization": "stable-json-v1",
+    "scope": "runtime/accounting.jsonl",
+    "genesisPreviousHash": null,
+    "entryHashFormula": "sha256(utf8(stable-json-v1(record excluding entryHash)))",
+    "crashTailPolicy": "One unterminated final line may be reported as an incomplete crash tail but must never be accepted as an accounting record. Any malformed complete line fails replay."
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "monotonicClock": {
+      "type": "object",
+      "required": [
+        "source",
+        "bootId",
+        "previousObservedMilliseconds",
+        "observedMilliseconds"
+      ],
+      "properties": {
+        "source": {
+          "const": "process-monotonic-clock"
+        },
+        "bootId": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            }
+          ]
+        },
+        "previousObservedMilliseconds": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0
+            }
+          ]
+        },
+        "observedMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "accountingValues": {
+      "type": "object",
+      "required": [
+        "launches",
+        "retries",
+        "sessions",
+        "elapsedMilliseconds",
+        "costMicrounits",
+        "tokenUsage"
+      ],
+      "properties": {
+        "launches": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sessions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "elapsedMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "costMicrounits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tokenUsage": {
+          "type": "object",
+          "required": [
+            "noncachedInput",
+            "cachedInput",
+            "output",
+            "reasoning"
+          ],
+          "properties": {
+            "noncachedInput": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "cachedInput": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "output": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "reasoning": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
