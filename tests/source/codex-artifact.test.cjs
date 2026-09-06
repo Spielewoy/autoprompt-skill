@@ -41,10 +41,10 @@ function createExternallySignedReleaseFixture(sandbox) {
   const root = path.join(sandbox, 'signed-source')
   const manifest = structuredClone(require('../../agents/manifests/codex-runtime.json'))
   const explicit = [
-    'packages/codex/package.json',
-    'packages/codex/release.json',
-    'packages/codex/release-history.json',
-    'packages/codex/bin/autoprompt-codex.cjs',
+    'scripts/release/codex/package.json',
+    'scripts/release/codex/release.json',
+    'scripts/release/codex/release-history.json',
+    'scripts/release/codex/bin/autoprompt-codex.cjs',
     'scripts/install/codex-package-registry.json',
     'scripts/install/codex-discovery-shim.md',
     'scripts/install/legacy-codex-compat.json',
@@ -54,8 +54,6 @@ function createExternallySignedReleaseFixture(sandbox) {
     'scripts/runtime-payload.cjs',
     'scripts/codex-runtime-identity.cjs',
     'scripts/codex-configure.cjs',
-    'scripts/codex-evidence-bundle.cjs',
-    'scripts/codex-evidence/verification-bundle.cjs',
     'scripts/benchmark-evidence/core.cjs',
     'agents/manifests/codex-runtime.json',
   ]
@@ -197,8 +195,8 @@ function createExternallySignedReleaseFixture(sandbox) {
   assert.equal(signedIdentity.runtimeIdentityHash, unsignedIdentity.runtimeIdentityHash,
     'trust-envelope fixture must preserve its signed runtime identity')
 
-  const historyPath = path.join(root, 'packages', 'codex', 'release-history.json')
-  const releasePath = path.join(root, 'packages', 'codex', 'release.json')
+  const historyPath = path.join(root, 'scripts', 'release', 'codex', 'release-history.json')
+  const releasePath = path.join(root, 'scripts', 'release', 'codex', 'release.json')
   const history = JSON.parse(fs.readFileSync(historyPath, 'utf8'))
   const head = history.releases.at(-1)
   head.payloadGeneration = manifest.payloadGeneration
@@ -351,9 +349,9 @@ test('Codex artifact release binding rejects payload digest reuse under one vers
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-release-guard-'))
   t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
   for (const relative of [
-    'packages/codex/package.json',
-    'packages/codex/release.json',
-    'packages/codex/release-history.json',
+    'scripts/release/codex/package.json',
+    'scripts/release/codex/release.json',
+    'scripts/release/codex/release-history.json',
     'scripts/install/codex-package-registry.json',
     'agents/codex/VERSION',
     'agents/manifests/codex-runtime.json',
@@ -378,8 +376,8 @@ test('Codex local release history rejects version reuse and historical mutation'
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-release-history-'))
   t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
   for (const relative of [
-    'packages/codex/package.json', 'packages/codex/release.json',
-    'packages/codex/release-history.json', 'scripts/install/codex-package-registry.json',
+    'scripts/release/codex/package.json', 'scripts/release/codex/release.json',
+    'scripts/release/codex/release-history.json', 'scripts/install/codex-package-registry.json',
     'agents/codex/VERSION', 'agents/manifests/codex-runtime.json',
   ]) {
     const source = path.join(ROOT, ...relative.split('/'))
@@ -387,7 +385,7 @@ test('Codex local release history rejects version reuse and historical mutation'
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.copyFileSync(source, target)
   }
-  const historyPath = path.join(sandbox, 'packages', 'codex', 'release-history.json')
+  const historyPath = path.join(sandbox, 'scripts', 'release', 'codex', 'release-history.json')
   const original = fs.readFileSync(historyPath)
   const reused = JSON.parse(original)
   reused.releases[1].version = reused.releases[0].version
@@ -402,10 +400,10 @@ test('Codex local release history rejects version reuse and historical mutation'
 
 test('Codex source template is directly unpublishable and canonical FAIL/null cannot promote it', t => {
   const packageTemplate = JSON.parse(fs.readFileSync(
-    path.join(ROOT, 'packages', 'codex', 'package.json'), 'utf8'))
+    path.join(ROOT, 'scripts', 'release', 'codex', 'package.json'), 'utf8'))
   assert.equal(packageTemplate.private, true)
   const unreleased = JSON.parse(fs.readFileSync(
-    path.join(ROOT, 'packages', 'codex', 'release.json'), 'utf8'))
+    path.join(ROOT, 'scripts', 'release', 'codex', 'release.json'), 'utf8'))
   for (const field of ['packedBytes', 'fileCount', 'externalDependencyCount']) {
     assert.equal(Object.prototype.hasOwnProperty.call(unreleased, field), false,
       `${field} must remain absent until a signed PASS tarball is reopened`)
@@ -434,12 +432,12 @@ test('Codex staging refuses stale destinations and source symlinks, and excludes
   fs.mkdirSync(stalePack)
   fs.writeFileSync(path.join(stalePack, 'old.tgz'), 'stale\n')
   const releaseBeforeRejectedPack = fs.readFileSync(
-    path.join(fixture.root, 'packages', 'codex', 'release.json'))
+    path.join(fixture.root, 'scripts', 'release', 'codex', 'release.json'))
   assert.throws(() => artifact.packArtifact(stalePack, fixture.root, trust),
     /destination must be empty/)
   assert.equal(fs.readFileSync(path.join(stalePack, 'old.tgz'), 'utf8'), 'stale\n')
   assert.equal(fs.readFileSync(
-    path.join(fixture.root, 'packages', 'codex', 'release.json'))
+    path.join(fixture.root, 'scripts', 'release', 'codex', 'release.json'))
     .equals(releaseBeforeRejectedPack), true)
 
   const extra = path.join(fixture.root, 'agents', 'codex', 'untracked-release-secret.txt')
@@ -506,7 +504,7 @@ test('independent Codex artifact uses a hermetic externally signed PASS fixture 
     tarballSha256: packed.tarballSha256,
   }))
   const measuredRelease = JSON.parse(fs.readFileSync(
-    path.join(fixture.root, 'packages', 'codex', 'release.json'), 'utf8'))
+    path.join(fixture.root, 'scripts', 'release', 'codex', 'release.json'), 'utf8'))
   assert.deepEqual({
     packedBytes: measuredRelease.packedBytes,
     fileCount: measuredRelease.fileCount,
@@ -516,7 +514,7 @@ test('independent Codex artifact uses a hermetic externally signed PASS fixture 
     fileCount: packed.fileCount,
     externalDependencyCount: packed.externalDependencyCount,
   })
-  assert.deepEqual(fs.readdirSync(path.join(fixture.root, 'packages', 'codex'))
+  assert.deepEqual(fs.readdirSync(path.join(fixture.root, 'scripts', 'release', 'codex'))
     .filter(name => /^\.release\.json\..+\.tmp$/.test(name)), [],
   'atomic measurement commit must not leave a temporary release record')
 
@@ -534,8 +532,6 @@ test('independent Codex artifact uses a hermetic externally signed PASS fixture 
     file === 'scripts/codex-runtime-identity.cjs' ||
     file === 'scripts/codex-configure.cjs' ||
     file === 'scripts/local-only-safety.cjs' ||
-    file === 'scripts/codex-evidence-bundle.cjs' ||
-    file.startsWith('scripts/codex-evidence/') ||
     file === 'scripts/benchmark-evidence/core.cjs' ||
     file === 'release-history.json' ||
     file.startsWith('scripts/install/') ||
@@ -553,7 +549,6 @@ test('independent Codex artifact uses a hermetic externally signed PASS fixture 
   assert.equal(packageJson.dependencies, undefined)
   assert.equal(packageJson.optionalDependencies, undefined)
   assert.deepEqual(files, ['package.json', ...packageJson.files].sort())
-  assert.equal(packageJson.bin['autoprompt-codex-evidence'], 'scripts/codex-evidence-bundle.cjs')
   assert.equal(packageJson.autoprompt.provider, 'codex')
   assert.deepEqual(packageJson.autoprompt.compatibility,
     { codexCli: '>=0.148.0', runtimeContract: '2.0.0' })
@@ -561,7 +556,6 @@ test('independent Codex artifact uses a hermetic externally signed PASS fixture 
   assert.match(packageJson.autoprompt.payloadGeneration, /^codex-v2\.0\.0-[a-f0-9]{16}$/)
   assert.equal(artifact.validateArtifactInventory(packageRoot).inventorySha256,
     packed.inventorySha256)
-  assert.doesNotThrow(() => require(path.join(packageRoot, 'scripts', 'codex-evidence', 'verification-bundle.cjs')))
   assert.doesNotThrow(() => require(path.join(packageRoot, 'scripts', 'codex-runtime-identity.cjs')))
   assert.doesNotThrow(() => require(path.join(packageRoot, 'scripts', 'runtime-payload.cjs')))
 

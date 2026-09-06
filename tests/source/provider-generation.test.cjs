@@ -173,7 +173,7 @@ test('Codex v2 prompts are deterministic policy-backed generated views', () => {
       .sort(),
     Object.keys(contracts.rolePolicy.physical_roles).sort(),
   )
-  const version = JSON.parse(fs.readFileSync(path.join(ROOT, 'packages', 'codex', 'package.json'), 'utf8')).version
+  const version = JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts', 'release', 'codex', 'package.json'), 'utf8')).version
   assert.equal(outputs.get('agents/codex/VERSION'), `${version}\n`)
   const skill = outputs.get('agents/codex/SKILL.md')
   assert.match(skill, /autoprompt activate codex \.\.\. -- <mission>/)
@@ -353,7 +353,7 @@ test('Codex generation rejects policy widening, mismatches, and unsafe checker a
     rolePolicy,
     loadCodexV2Contracts(ROOT).plainLanguage,
   )
-  assert.match(arbiter, /Choose only between reversible technical alternatives/i)
+  assert.match(arbiter, /compatibility redirect to `ap-independent-checker`/i)
   assert.match(arbiter, /cannot start another agent or write files/i)
 
   const unsafeTelemetry = structuredClone(roles)
@@ -362,6 +362,29 @@ test('Codex generation rejects policy widening, mismatches, and unsafe checker a
     () => validateCompatibilityAliasContract(unsafeTelemetry),
     /telemetry path is not canonical/,
   )
+})
+
+test('active Codex prompts preserve canonical job instructions and reject incomplete role definitions', () => {
+  const roles = JSON.parse(read('agents/contracts/roles.json'))
+  const policy = JSON.parse(read('agents/codex/agents/role-policy.json'))
+  const language = JSON.parse(read('agents/contracts/plain-language.json'))
+  for (const projection of roles.codexPhysicalRoleProjection) {
+    const logical = roles.roles.find(role => role.id === projection.logicalId)
+    const physical = policy.physical_roles[projection.physicalId]
+    const rendered = renderCodexPolicyAgent(projection.physicalId, physical, roles, policy, language)
+    for (const instruction of Object.values(logical.instructions)) {
+      assert.ok(rendered.includes(normalizePlainLanguageMarkdown(instruction, language).trim()),
+        `${projection.physicalId} lost a canonical job instruction`)
+    }
+    const incomplete = structuredClone(roles)
+    delete incomplete.roles.find(role => role.id === projection.logicalId).instructions.howToCheck
+    assert.throws(() => renderCodexPolicyAgent(projection.physicalId, physical, incomplete, policy, language),
+      /missing canonical role instruction howToCheck/u)
+  }
+  const retired = renderCodexPolicyAgent('ap-implementer', policy.physical_roles['ap-implementer'], roles, policy, language)
+  assert.ok(retired.includes(policy.physical_roles['ap-implementer'].compatibility_alias.alias_of))
+  assert.ok(!retired.includes(roles.roles.find(role => role.id === 'worker').instructions.whatToDo),
+    'a read-only compatibility redirect must not instruct its retired role to implement work')
 })
 
 test('Codex registry requirements admit optional roles and frameworks but reject missing capabilities and migrations', t => {
@@ -564,15 +587,15 @@ test('Codex generation ignores the legacy contract and fails closed on a stale v
     path.join(sandbox, 'scripts', 'install', 'legacy-codex-compat.json'),
   )
   fs.copyFileSync(path.join(ROOT, 'package.json'), path.join(sandbox, 'package.json'))
-  fs.mkdirSync(path.join(sandbox, 'packages', 'codex'), { recursive: true })
-  const codexPackagePath = path.join(sandbox, 'packages', 'codex', 'package.json')
-  fs.copyFileSync(path.join(ROOT, 'packages', 'codex', 'package.json'), codexPackagePath)
+  fs.mkdirSync(path.join(sandbox, 'scripts', 'release', 'codex'), { recursive: true })
+  const codexPackagePath = path.join(sandbox, 'scripts', 'release', 'codex', 'package.json')
+  fs.copyFileSync(path.join(ROOT, 'scripts', 'release', 'codex', 'package.json'), codexPackagePath)
 
   fs.rmSync(codexPackagePath)
   assert.throws(() => renderCodexOutputs(sandbox), /Codex package metadata is missing/)
   fs.writeFileSync(codexPackagePath, '{"version":"not-semver"}\n')
   assert.throws(() => renderCodexOutputs(sandbox), /must declare a valid semantic version/)
-  fs.copyFileSync(path.join(ROOT, 'packages', 'codex', 'package.json'), codexPackagePath)
+  fs.copyFileSync(path.join(ROOT, 'scripts', 'release', 'codex', 'package.json'), codexPackagePath)
 
   fs.writeFileSync(path.join(sandbox, 'agents', 'contracts', 'autoprompt.contract.json'), '{ invalid legacy JSON\n')
   const sandboxContracts = loadCodexV2Contracts(sandbox)
@@ -596,7 +619,8 @@ test('Codex generation ignores the legacy contract and fails closed on a stale v
   assert.equal(sourceIndependent.size,
     Object.keys(sandboxContracts.rolePolicy.physical_roles).length +
       renderSharedFrameworkOutputs(sandbox, sandboxContracts.plainLanguage).size + sandboxTopLevelCount)
-  assert.match(sourceIndependent.get('agents/codex/agents/ap-arbiter.toml'), /reversible technical alternatives/i)
+  assert.match(sourceIndependent.get('agents/codex/agents/ap-arbiter.toml'), /compatibility redirect to `ap-independent-checker`/i)
+  assert.match(sourceIndependent.get('agents/codex/agents/ap-independent-checker.toml'), /reversible technical alternatives/i)
 
   const sharedFrameworkPath = path.join(sandbox, 'agents', 'contracts', 'frameworks', 'apply.md')
   const sharedFramework = fs.readFileSync(sharedFrameworkPath, 'utf8')
@@ -689,7 +713,7 @@ test('provider projection stays Codex-first, capability-gated, and plain-languag
     new Map([[runtimePath, `${read(runtimePath)}\nconsole.log('Start the mission fleet.')\n`]]),
     packageRegistry.plainLanguageAuditedExceptions,
   ), /forbidden prompt term (?:mission|fleet)/)
-  const diagramPath = 'assets/anatomy.svg'
+  const diagramPath = 'assets/how-it-works-loop.svg'
   assert.throws(() => validateCodexUserFacingLanguage(
     contracts.plainLanguage,
     ROOT,

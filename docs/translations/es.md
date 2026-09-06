@@ -1,11 +1,14 @@
-<h1 align="center">Autoprompt</h1>
+<p align="center">
+  <img src="../../assets/banner.svg" alt="Autoprompt Skill: nubes rosas y gansos en vuelo" width="1000"/>
+</p>
 
-<p align="center">Autoprompt es una skill para agentes de código con enrutamiento explícito, delegación limitada y comprobaciones basadas en evidencia.</p>
+<p align="center">Autoprompt es un flujo de trabajo para agentes de código que reduce los fallos un 45% mediante la revisión, corrección y nueva verificación del trabajo.</p>
 
 <p align="center">
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=versi%C3%B3n&color=255C60&labelColor=14101F" alt="Versión 1.0.4"/></a>
-  <a href="#instalar"><img src="https://img.shields.io/badge/soporte-9%20proveedores%20compatibles-255C60?style=flat-square&labelColor=14101F" alt="Nueve proveedores compatibles"/></a>
-  <a href="../../LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-255C60?style=flat-square&labelColor=14101F" alt="Licencia MIT"/></a>
+  <a href="#benchmarks"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20puntos-965477?style=flat-square&labelColor=302335" alt="Terminal-Bench 2.1: 14.61 puntos más"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=versi%C3%B3n&color=965477&labelColor=302335" alt="Versión 1.0.4"/></a>
+  <a href="#instalar"><img src="https://img.shields.io/badge/soporte-9%20proveedores%20compatibles-965477?style=flat-square&labelColor=302335" alt="Nueve proveedores compatibles"/></a>
+  <a href="../../LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-965477?style=flat-square&labelColor=302335" alt="Licencia MIT"/></a>
 </p>
 
 <p align="center">
@@ -66,7 +69,7 @@ autoprompt
 | Estado | Agente de programación | Requisito auditado | Clave |
 |---|---|---|---|
 | Operativo | [Claude Code](https://code.claude.com/docs/en/setup) | 2.1.219+; auditado con 2.1.233 | `claude` |
-| Operativo | [Codex](https://github.com/openai/codex) | Versión con subagentes; trabajo v2 actual auditado con 0.148.0 | `codex` |
+| Operativo | [Codex](https://github.com/openai/codex) | Versión con subagentes; auditado con 0.148.0 | `codex` |
 | Operativo | [OpenCode](https://opencode.ai/docs/agents) | 1.18.7+; auditado con 1.18.18 | `opencode` |
 | Operativo | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; auditado con 7.4.22 | `kilo` |
 | Operativo | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; auditado con 1.133.0 y Copilot 0.61.0 | `vscode` |
@@ -90,39 +93,77 @@ Sustituye `PROVIDER` por una clave de la tabla de compatibilidad, como `claude`,
 
 ## Benchmarks
 
-Autoprompt no formula actualmente ninguna afirmación reproducible sobre rendimiento o coste. La comparación histórica no conservó los artefactos ni la telemetría necesarios para reconstruirla; consulta el [límite de la evidencia archivada](../benchmarks/terminal-bench-2.1.md). Las afirmaciones futuras deben proceder del pipeline firmado de evidencias del benchmark.
+Estos son **benchmarks de la versión 1**. Los de la versión 2 se publicarán más adelante.
+
+<p align="center">
+  <img src="../../assets/i18n/es/terminal-bench-2.1-leaderboard.svg" width="1000" alt="Clasificación de Terminal-Bench 2.1 con 18 referencias de Artificial Analysis y las mediciones de DeepSeek V4 Flash 0731 con y sin Autoprompt."/>
+</p>
+
+<details>
+<summary><strong>Comparación medida con OpenCode</strong></summary>
+
+<p align="center">
+  <img src="../../assets/i18n/es/terminal-bench-2.1.svg" width="900" alt="OpenCode 1.18.7 en Terminal-Bench 2.1: OpenCode resolvió 60 de 89 tareas y OpenCode con Autoprompt resolvió 73."/>
+</p>
+
+| Ejecución | Resueltas | Puntuación | Fallos |
+|---|---:|---:|---:|
+| OpenCode | 60/89 | 67.42% | 29 |
+| **OpenCode + Autoprompt** | **73/89** | **82.02%** | **16** |
+| **Cambio** | **+13 resueltas** | **+14.61 puntos** | **45% menos** |
+
+</details>
+
+El 82.7% de DeepSeek procede de otra configuración de prueba, así que sirve como referencia, no como una tercera ejecución comparable. Consulta la [configuración y los límites de la evidencia](../benchmarks/terminal-bench-2.1.md) o [solicita otro benchmark](https://github.com/Spielewoy/autoprompt-skill/issues/new).
+
+<details>
+<summary><strong>Coste previsto:</strong> cerca de 3x el tiempo y 2x los tokens.</summary>
+
+No se conservaron registros de tiempo ni de tokens. Por tanto, son estimaciones de planificación basadas en experiencias de usuarios, no resultados medidos del benchmark. En esta ejecución, los fallos bajaron de 29 a 16 (45% menos), aproximadamente la mitad de errores (una mejora cercana a 2x). En tareas muy pequeñas, el resultado puede variar mucho.
+
+</details>
 
 ## Anatomía de una invocación
 
-<p align="center">
-  <a href="../../assets/i18n/es/anatomy.svg"><img src="../../assets/i18n/es/anatomy.svg" alt="Anatomía de una invocación de Autoprompt: activación, modo de concurrencia, límite de agentes, enrutamiento de modelos, objetivo y control path de Codex v2 en desarrollo" width="1000"/></a>
-</p>
+```text
+/autoprompt mode=custom max_subs=4 agents=auto <goal>
+```
+
+| Parte | Función |
+|---|---|
+| `/autoprompt` | Inicia la skill. |
+| `mode=custom` | Define la concurrencia: tokensaver, wide o custom. |
+| `max_subs=4` | Máximo de cuatro subagentes simultáneos. |
+| `agents=auto` | Selección automática, modelo actual (off) o lista. |
+| `<goal>` | Resultado deseado, restricciones y comprobaciones. |
+| `path=` | Ruta: auto, direct, light o roadmap. |
+
+Ejemplo en Codex:
+
+```bash
+autoprompt activate codex -- path=light "<goal>"
+```
+
 
 ## Controles de ejecución
 
-<!-- codex-v2-release-status: local-v1.0.30-build-not-published -->
-> Estado de `path=` en Codex v2: compilación local v1.0.30; no publicada.
-
-Usa `mode=` para definir la concurrencia. Usa `agents=` para dirigir modelos cuando el agente lo admita. La compilación local de Codex v2 también admite el control opcional `path=`.
+Usa `mode=` para definir la concurrencia. Usa `agents=` para dirigir modelos cuando el agente lo admita.
 
 | Control | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Enrutamiento personalizado con `agents=` | ✓ | ✓ | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo activo | ✕ No disponible - hereda el modelo padre seleccionado | ✕ No disponible - hereda el modelo padre seleccionado | ✕ No disponible - hereda el modelo padre seleccionado | ✕ No disponible - hereda el modelo padre seleccionado |
-| Ruta de trabajo `path=` | - | Compilación local v1.0.30; no publicada | - | - | - | - | - | - | - |
-
-En Codex v2, coloca `path=auto|direct|light|roadmap` al principio de la solicitud, por ejemplo `autoprompt activate codex -- path=direct <objetivo>`. Omitir `path=` equivale a `path=auto` y conserva la selección automática. Una ruta explícita omite el trabajo de modelos dedicado al análisis y la selección de ruta, pero no las comprobaciones de seguridad y autorización, los entregables propios de la ruta, la ejecución ni la verificación independiente. Si una selección es inválida, conflictiva o inutilizable, falla de forma segura en vez de cambiarla silenciosamente.
 
 ## Cómo funciona
 
 <p align="center">
-  <img src="../../assets/i18n/es/how-it-works-loop.svg" alt="Flujo de Autoprompt desde el prompt hasta la planificación, implementación, revisión, pruebas, aprobación y barrido final" width="1100"/>
+  <a href="../../assets/i18n/es/how-it-works-loop.svg"><img src="../../assets/i18n/es/how-it-works-loop.svg" alt="Flujo de Autoprompt desde el prompt hasta la planificación, implementación, revisión, pruebas, aprobación y barrido final" width="1100"/></a>
 </p>
 
 ## Agentes
 
 <p align="center">
-  <img src="../../assets/i18n/es/how-it-works-hierarchy.svg" alt="Jerarquía de agentes de Autoprompt desde el prompt hasta los coordinadores, el gestor, las líneas de ejecución y las comprobaciones independientes" width="1100"/>
+  <a href="../../assets/i18n/es/how-it-works-hierarchy.svg"><img src="../../assets/i18n/es/how-it-works-hierarchy.svg" alt="Jerarquía de agentes de Autoprompt desde el prompt hasta los coordinadores, el gestor, las líneas de ejecución y las comprobaciones independientes" width="1100"/></a>
 </p>
 
 ## Ejemplos
@@ -133,9 +174,8 @@ En Codex v2, coloca `path=auto|direct|light|roadmap` al principio de la solicitu
 | Construir | `/autoprompt mode=wide construye el flujo de reservas desde la API hasta el pago` |
 | Investigar | `/autoprompt compara colas de trabajos para este repositorio y recomienda una` |
 | Limitar trabajo paralelo | `/autoprompt mode=custom max_subs=4 migra todos los modelos` |
-| Probar una ruta de Codex v2 en desarrollo | `autoprompt activate codex -- path=light añade reintentos y cubre los casos límite` |
 
-En Codex v2, ejecuta `autoprompt activate codex -- <objetivo>`; el lanzador inyecta internamente el sobre privado `$autoprompt`. En Oh My Pi, usa `/skill:autoprompt`.
+En Codex, usa `autoprompt activate codex -- "<goal>"` en lugar de `/autoprompt`. En Oh My Pi, usa `/skill:autoprompt`.
 
 ## Preguntas frecuentes
 
@@ -161,16 +201,23 @@ Las capas separan la coordinación, la gestión, la ejecución y la evaluación 
 </details>
 
 <details>
-<summary><strong>¿Qué controlan `mode`, `max_subs`, `agents` y `path`?</strong></summary>
+<summary><strong>¿Qué son las rutas?</strong></summary>
 
-`mode=tokensaver` limita los subagentes activos a seis; `mode=wide` abre todas las líneas listas; `mode=custom max_subs=N` fija tu propio límite; `agents` controla el enrutamiento de modelos cuando el agente lo admite; en Codex v2 en desarrollo, `path` fija opcionalmente la ruta de trabajo y, si se omite, la selección sigue siendo automática. [Detalles](../faq/tokensaver-vs-wide-vs-custom.md)
+`path=auto` elige la ruta. `direct` inicia un trabajo acotado, `light` añade un plan breve y `roadmap` organiza trabajo con dependencias. Todas incluyen verificación independiente. [Detalles](../faq/work-paths.md)
+
+</details>
+
+<details>
+<summary><strong>¿Qué controlan `mode`, `max_subs` y `agents`?</strong></summary>
+
+`mode=tokensaver` limita los subagentes activos a seis; `mode=wide` abre todas las líneas listas; `mode=custom max_subs=N` fija tu propio límite; `agents` controla el enrutamiento de modelos cuando el agente lo admite. [Detalles](../faq/tokensaver-vs-wide-vs-custom.md)
 
 </details>
 
 <details>
 <summary><strong>¿Por qué Autoprompt no se inicia en segundo plano?</strong></summary>
 
-Porque cambia el coste, el tiempo y el flujo de trabajo. Inícialo de forma explícita con `/autoprompt <objetivo>` en los hosts compatibles, o con `autoprompt activate codex -- <objetivo>` en Codex v2.
+Porque cambia el coste, el tiempo y el flujo de trabajo. Inícialo de forma explícita con `/autoprompt <objetivo>`, o con `autoprompt activate codex -- "<goal>"` en Codex.
 
 </details>
 

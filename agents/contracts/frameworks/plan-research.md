@@ -1,54 +1,56 @@
+# Research for planning
 
-# Framework: plan-research  (category plan × subsection research · tag research · tier T2)
+Answer the requested research question with inspectable sources and a useful written result.
 
-**You are the L1 SUPERVISOR.** L0 spawned you and handed you this framework; you DRIVE
-it by dispatching workers via your L2 manager and reading their returned reports. The required check
-path itself is opened/extracted for you by a reader-capable role - your L2 manager
-(managers retain Read), or a reader-leaf you spawn on a direct L1→L3 hop; you dispatch
-gates and read the reports they return, but never open the corpus yourself. You never
-search yourself. Goal: find/define an UNKNOWN target via real research-with-receipts
-and output a defensible thesis + ranked shortlist. Owns no production code.
+## Assignment and control
 
+Use the selected route and its canonical compiled checks. DIRECT and LIGHT use no
+coordinator, manager, or roadmap. ROADMAP execution follows the accepted plan and
+recorded dependencies. Only the run owner selects independent checkers; workers do
+not start other agents. Follow the ownership rules in `composition.md`.
 
-## Layer flow
-- **You (L1):** divide the domain into at most 3 disjoint THEMES, each with a named materialized output; have your L2 dispatch ONE researcher per theme; never search yourself.
-- **L3 executor:** ap-researcher - owns ONE theme, runs at most 6 searches and 6 fetches, writes the materialized output, reconciles every claim to an inspectable receipt, and does NOT spawn.
-- **L3 synthesizer + L4 fresh-verify** at the end.
-- **INDEPENDENCE:** the fresh-verify required check MUST be a different agent-instance than the one that produced the work under review - never a reused context.
-- Negative verdicts (BLOCKED / thin-research) loop UP to you.
+## Work and evidence
 
-## THE END-TO-END WORKFLOW
+State the question and required output, such as a comparison, catalog, or decision memo.
+Use at most three non-overlapping themes when decomposition is useful; do not create
+extra agents merely to match that count. The run owner assigns research to permitted
+workers according to the selected route.
 
-### Phase 1 - FRAME + DIVIDE
-Restate the question precisely and decompose it into at most 3 disjoint themes. Name the usable deliverable each theme must materialize: table rows, catalog entries, a manifest, a comparison, or a decision memo. Broad landscape coverage is not a license to open more themes before the first outputs land.
+Each theme has a bounded initial batch of at most six searches and six fetches, subject
+to the tighter remaining run limits. Record the source and observed result for every
+claimed search or inspection. Produce the named output from the evidence obtained;
+progress is substantive findings, not tool-call counts. If a batch produces no useful
+output, return its concrete unresolved question without repeating the same broad batch.
+One targeted follow-up may address a remaining gap after accepted output exists.
 
-### Phase 2 - RESEARCH per theme (bounded queries, receipts, output)
-Dispatch ONE researcher per theme. Each gets one bounded batch of at most 6 WebSearch and 6 WebFetch calls. Every claimed call and usable inspection must reconcile exactly to an inspectable receipt. Each theme must write its named materialized output before it can report progress. If live search is unavailable → **S1 BLOCKED**. If the batch ends with zero output items → **S2 NO-USEFUL-OUTPUT** and stop that work item; do not re-dispatch the same research. A residual gap may open one targeted follow-up only after accepted output exists.
+If live search fails, diagnose the tool and use available authorized primary sources
+where they can answer the question. A local authoritative source may support stable
+facts; it cannot establish current claims that require live verification. Preserve
+useful findings and identify evidence that remains unavailable without inventing sources.
 
-### Phase 3 - SYNTHESIZE
-One synthesizer merges the theme artifacts into a thesis + a ranked shortlist, each
-claim traceable to a receipt, with the tradeoffs that separate the top candidates
-and a clear recommendation with its rationale.
+Combine findings in the requested format, distinguishing observations, inference, and
+uncertainty. Rank alternatives only when comparison or recommendation is requested.
+The independent checker verifies material claims against cited sources and confirms
+that the result answers the request. Research findings alone do not authorize downstream
+implementation.
 
-### Phase 4 - FRESH-VERIFY (default-FAIL)
-A fresh agent confirms every material claim has a live receipt, competitors were
-actually analyzed, and the shortlist genuinely answers the original request → **S5** DONE.
+## Recovery and result
 
-## THE BLOCKED INVARIANT (non-negotiable)
-Verification runs the REAL check in its REAL environment - NEVER fake a pass, NEVER
-fabricate evidence, NEVER declare DONE over a red or un-runnable check. On ANY blocker,
-After bounded diagnosis, a repairable defect returns to its owner. An external,
-authority, environment, or policy blocker terminates with the attempted check, observed
-evidence, and concrete unblock requirement; never fabricate a pass or retry forever.
+A failed command starts diagnosis. Check the command, working directory, supported
+runtime, and available dependencies; repair authorized local setup or an owned defect
+within the recorded allowance. A changed result or check invalidates its dependent
+evidence. Repeat those checks before reporting success. Do not weaken tests, conceal
+regressions, or replace a required real result with a simulated pass.
 
-## Closed decision scenarios (each ends at ONE verdict)
-- **S1 - live search unavailable** → BLOCKED (report attempt; never fabricate sources).
-- **S2 - zero materialized output or receipts do not reconcile** → stop the work item and return the concrete residual; never pay for the same broad wave again.
-- **S3 - the target is actually KNOWN and needs a design** → hand to `plan-design`.
-- **S4 - findings imply build features** → hand to `plan-scope`.
-- **S5 - thesis + shortlist, every claim has a live receipt, original request answered** → DONE.
+Return repairable failures to the responsible owner. A repeated failure with unchanged
+evidence requires strategy reassessment, not equivalent new workers. Preserve valid
+results and all run-wide limits. Report `BLOCKED` only when an external, authority,
+environment, or policy condition still prevents required work after permitted diagnosis
+and recovery; include the command, observed failure, and concrete unblock condition.
+Report an unresolved scope or ownership conflict to the run owner without editing
+unowned resources. Only new route facts justify changing the route.
 
-## Stacking
-ONE L3 track (its parallelism is YOU dispatching sibling researchers per theme). A
-original request needing research THEN build is split in ROADMAP.md - research feeds the build
-framework - `composition.md`.
+Return the exact result version, requested items completed, commands and exit codes,
+check evidence, remaining defects, and attempted recovery. The run owner requests
+completion only after every requested result passes its current required checks and
+all working agents have stopped. The deterministic control plane records `DONE`.

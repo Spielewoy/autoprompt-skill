@@ -184,6 +184,20 @@
       "payloadDigest": "d96fa16e22ffbfa91e750f2200f3dc75eb3b1dea1542b9a1040696a131a966e8",
       "previousRecordDigest": "44e7adcc1c347cadd11ac53e6068ae2cf13b0151f6f8a6a488c7be81e9ec9558",
       "recordDigest": "256cf8ea2bf852a7ba91bd2e67d13ebc02f72cbf7bcb6b2ffd5fca4ed35dd939"
+    },
+    {
+      "version": "1.0.31",
+      "payloadGeneration": "codex-v2.0.0-536317e3136b1fff",
+      "payloadDigest": "536317e3136b1fffd6d46b7af5d258d6b24602b05a8818f337f32c151dd4630d",
+      "previousRecordDigest": "256cf8ea2bf852a7ba91bd2e67d13ebc02f72cbf7bcb6b2ffd5fca4ed35dd939",
+      "recordDigest": "6d6e3795c752ebc2c642187edd85f637f9b40d7a3b80686b982bbc8ed5b17894"
+    },
+    {
+      "version": "1.0.32",
+      "payloadGeneration": "codex-v2.0.0-bfae7f930a9f7432",
+      "payloadDigest": "bfae7f930a9f74328f2401dd55b774bbc63c296d20347336e9dece9ed916f59b",
+      "previousRecordDigest": "6d6e3795c752ebc2c642187edd85f637f9b40d7a3b80686b982bbc8ed5b17894",
+      "recordDigest": "606d9613835db5d2d07627ab3922c18940724bad8b007cf3dc8be23083427b77"
     }
   ]
 }

@@ -15,5 +15,25 @@ Accept only a validated `assignment.roadmap-author.v2` assignment from an allowe
 Read resources: `request-envelope.read`, `target.named.read`, `prior-results.read`. Write resources: `plan.roadmap.write`. Exclusive resources: `plan.roadmap.write`. Do not use any unlisted resource.
 Do not start another agent. Stay within the assignment-owned resources above.
 
+## What to read
+
+Read the bound request, selected ROADMAP route, owned plan path, relevant repository interfaces, and any named scout results.
+
+## What to do
+
+Write a plan covering every requested result with dependencies, owners, integration work, acceptance checks, and relevant failure cases. In repair mode, correct the rejected items and retain valid evidence.
+
+## What not to change
+
+Do not edit production resources, start other agents, add unrelated requirements, or make product choices reserved for the user.
+
+## How to check
+
+Confirm each work item supports a request item, every dependency is ordered, shared writes have an ownership transfer, and each requested effect has an executable or observable check.
+
+## What to return
+
+Return the exact plan version, request coverage, unresolved decisions, needed scout observations, and evidence for any requested change to the plan.
+
 Canonical policy modes: `author`, `repair`.
 """

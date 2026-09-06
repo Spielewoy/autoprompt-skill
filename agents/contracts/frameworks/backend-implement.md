@@ -1,80 +1,57 @@
+# Backend capability change
 
-# Framework: backend-implement  (category backend × subsection implement · no tag · tier T2)
+Add or change the assigned backend capability with explicit input, output, and failure behavior.
 
-**You are the L1 FEATURE-SUPERVISOR.** L0 spawned you and handed you this framework;
-you DRIVE it by dispatching each required check to a fresh L3/L4 worker (via your L2 manager)
-and reading its returned report. The required check path itself is opened/extracted for you by a
-reader-capable role - your L2 manager (managers retain Read), or a reader-leaf you spawn
-on a direct L1→L3 hop; you dispatch gates and read the reports they return, but never
-open the corpus yourself. You never edit or run code yourself. Goal: add or change
-ONE bounded backend capability (an endpoint, a rule, a job) correctly,
-production-grade, with tests that prove behavior and zero regressions.
+## Assignment and control
 
+Use the selected route and its canonical compiled checks. DIRECT and LIGHT use no
+coordinator, manager, or roadmap. ROADMAP execution follows the accepted plan and
+recorded dependencies. Only the run owner selects independent checkers; workers do
+not start other agents. Follow the ownership rules in `composition.md`.
 
-## Layer flow
-- **You (L1):** drive the required check path (opened for you by your reader-capable L2 manager, or a reader-leaf on a direct hop) - dispatch gates in order, route every verdict.
-- **L2 manager:** builds the assignment, spawns the worker per required check.
-- **L3 executor:** implementer plus one independent final verifier for ordinary completeness.
-- **INDEPENDENCE:** an extra seat requires a named distinct risk, check responsibility, and evidence.
-- Negative verdicts (BLOCKED / SMASH / REGRESSION / OUT-OF-SCOPE) loop UP to you.
+## Work and evidence
 
-## Required check path (T2)
-Implementation-ready roadmap: IMPLEMENT(TDD) → INDEPENDENT FINAL VERIFY. Insert G1
-only for the conditional triggers above.
+Read the existing interfaces and the assignment's acceptance requirements. Resolve
+routine technical details from those contracts. Return a material architecture or
+product conflict to the run owner with evidence and alternatives; a bounded capability
+does not require a roadmap solely because implementation is needed.
 
-## THE END-TO-END WORKFLOW
+Record the real test baseline. Add behavior tests before the implementation when
+feasible, covering the requested success cases and applicable invalid input, missing
+or duplicate data, authorization, concurrency, and downstream failure cases. Implement
+within owned resources, validate external inputs, and preserve documented error and
+compatibility contracts. Do not swallow failures to satisfy a happy-path test.
 
-### Phase 1 - CONDITIONAL PLAN (G1)
-FIRST verify an executable `ROADMAP.md` item exists for this feature. If none exists,
-report OUT-OF-SCOPE and escalate (**S4**). An implementation-ready item skips G1. Run
-G1 only for `requiresDetailedPlan: true`, a named unresolved design fork, or
-`PLAN-CONFLICT`; then brief the planner to look at the real code first and deliver: the success
-criterion in the original request's terms; the ONE genuine design choice this capability
-carries and the option chosen with its tradeoff (if the choice is a real
-architecture fork, → **S2** hand to `plan-design`); the file-by-file change; the
-**contract** (inputs, outputs, invariants, error behavior); every unhappy path
-(invalid input, missing/duplicate, auth/permission, concurrency, downstream
-failure); and the test strategy that proves each - not just the happy path. Coverage
-target = the original request's bar (default 100% of the feature's surface); ≥95% of changed
-lines is a floor, not the target.
+Where the capability crosses an integration boundary, keep local unit results separate
+from contract fixtures and the real integration evidence required by the selected checks.
 
-### Phase 2 - REQUIRED CHECK-ZERO + IMPLEMENT (G4, TDD)
-First confirm the repo's OWN test command runs on untouched code (else **S1
-BLOCKED**). Then TDD: write the failing tests first (happy + each unhappy path),
-then the minimal correct code, within owned files only. Validate inputs at the
-boundary; handle the unhappy path at the same detail as the happy path; no
-swallowed errors, no scope creep. Hold the Phase-1 coverage bar (≥95% of changed lines
-is the floor, not the target).
+## Independent checking
 
-### Phase 4 - INDEPENDENT FINAL VERIFY
-The verifier matches every claim to the diff, then runs the evidence below.
-On the REAL repo (returns reproWasRed/reproNowGreen/preExistingRegressions/
-testCommand): the new behavior's tests pass; the FULL pre-existing tests of the
-touched module + direct dependents stay GREEN; adversarial inputs (None, empty,
-wrong type, boundary, concurrent) behave; coverage ≥95%.
-**REGRESSION-IS-A-SIGNAL:** any pre-existing green→red flip means the change broke a
-contract other code relied on → root-cause it and redo (**S3**); never weaken/skip
-the test.
+One independent checker reviews and tests the frozen result by default. An additional
+checker requires a named distinct risk or responsibility and separate evidence. Check
+the requested behavior, relevant failure cases, and the existing tests of touched
+modules and direct dependents. Compare failures with the recorded baseline; an
+unrelated pre-existing failure is not a new regression. Investigate every new failure
+before acceptance. Meet the request's coverage requirements and the 95% changed-line
+floor for executable code, recording the measurement and any applicable exclusions.
 
-The same final verifier confirms the asks on opened evidence and zero open blockers.
+## Recovery and result
 
-## THE BLOCKED INVARIANT (non-negotiable)
-Verification runs the REAL check in its REAL environment - NEVER fake a pass, NEVER
-fabricate evidence, NEVER declare DONE over a red or un-runnable check. On ANY blocker,
-After bounded diagnosis, a repairable defect returns to its owner. An external,
-authority, environment, or policy blocker terminates with the attempted check, observed
-evidence, and concrete unblock requirement; never fabricate a pass or retry forever.
+A failed command starts diagnosis. Check the command, working directory, supported
+runtime, and available dependencies; repair authorized local setup or an owned defect
+within the recorded allowance. A changed result or check invalidates its dependent
+evidence. Repeat those checks before reporting success. Do not weaken tests, conceal
+regressions, or replace a required real result with a simulated pass.
 
-## Closed decision scenarios (each ends at ONE verdict)
-- **S1 - real test suite cannot run** → BLOCKED (report attempt + unblock path).
-- **S2 - the design choice is a genuine architecture fork** → hand to `plan-design`;
-  do not guess it.
-- **S3 - a pre-existing test flips green→red** → FAILED (regression-is-a-signal: redo);
-  never weaken/skip.
-- **S4 - bigger than ONE bounded capability** (spans >1 subsystem) → OUT-OF-SCOPE;
-  reconsider the route under the canonical route-change rules. Never sprawl inline.
-- **S5 - behavior proven + zero regressions + unhappy paths covered** → DONE.
+Return repairable failures to the responsible owner. A repeated failure with unchanged
+evidence requires strategy reassessment, not equivalent new workers. Preserve valid
+results and all run-wide limits. Report `BLOCKED` only when an external, authority,
+environment, or policy condition still prevents required work after permitted diagnosis
+and recovery; include the command, observed failure, and concrete unblock condition.
+Report an unresolved scope or ownership conflict to the run owner without editing
+unowned resources. Only new route facts justify changing the route.
 
-## Stacking
-ONE L3 track. A multi-surface task is split in ROADMAP.md into disjoint features, each
-its own framework as a sibling track - `composition.md`.
+Return the exact result version, requested items completed, commands and exit codes,
+check evidence, remaining defects, and attempted recovery. The run owner requests
+completion only after every requested result passes its current required checks and
+all working agents have stopped. The deterministic control plane records `DONE`.

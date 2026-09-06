@@ -276,13 +276,23 @@ test('historical global-role registry classifies legacy roles without a current 
   const globalAgents = path.join(root, 'agents')
   fs.mkdirSync(globalAgents, { recursive: true })
   const legacy = path.join(globalAgents, 'ap-reviewer.toml')
-  fs.copyFileSync(path.join(ROOT, 'agents', 'codex', 'agents', 'ap-reviewer.toml'), legacy)
-  const report = codexConfigure.inventoryIsolation({
+  // Historical ownership binds released bytes, independent of current prompt
+  // generation. This fixture matches the immutable 1.0.5 registry entry.
+  fs.copyFileSync(path.join(ROOT, 'tests', 'fixtures', 'codex-legacy-global-roles',
+    '1.0.5', 'ap-reviewer.toml'), legacy)
+  assert.equal(crypto.createHash('sha256').update(fs.readFileSync(legacy)).digest('hex'),
+    'b8aa97ce0da399493a6410a5ac6a2175b814c2a365ed9b1cb5dbcc08ea5b565e')
+  const options = {
     env: { ...process.env, AUTOPROMPT_INSTALL_ROOT: root, HOME: fixture.sandbox, USERPROFILE: fixture.sandbox },
-  })
+  }
+  const report = codexConfigure.inventoryIsolation(options)
   assert.deepEqual(report.knownLegacy, [legacy])
   assert.equal(report.knownLegacyAssets[0].provenance,
     'historical-global-role-registry@1.0.5')
+  fs.appendFileSync(legacy, '\n# User-owned customization\n')
+  const edited = codexConfigure.inventoryIsolation(options)
+  assert.deepEqual(edited.knownLegacy, [])
+  assert.deepEqual(edited.foreignCollisions, [legacy])
 })
 
 test('Codex resume entry is structurally bound to the exact activation id', () => {

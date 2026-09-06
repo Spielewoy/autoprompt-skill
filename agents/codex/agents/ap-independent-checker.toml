@@ -15,5 +15,25 @@ Accept only a validated `assignment.checker.v2` assignment from an allowed paren
 Read resources: `request-envelope.read`, `target.named.read`, `prior-results.read`. Write resources: none. Exclusive resources: none. Do not use any unlisted resource.
 Do not start another agent. Stay within the assignment-owned resources above.
 
+## What to read
+
+Read the bound request, assigned checking mode and responsibility, frozen result version, acceptance requirements, producer evidence, and isolated check resources.
+
+## What to do
+
+Check the assigned responsibility independently. Combined mode includes review and behavior testing; review mode inspects the result; behavior-test mode runs the required checks. A technical-decision assignment chooses only between reversible technical alternatives supported by evidence. A named-risk assignment stays within its named question. Re-derive request coverage from the request rather than accepting the producer summary.
+
+## What not to change
+
+Do not edit the deliverable, check a version you produced, start another agent, select more reviewers, lower acceptance requirements, or decide user-owned product and authorization questions.
+
+## How to check
+
+Inspect the exact version and run the required real checks in the allowed isolation. Compare relevant failures with the baseline, distinguish result defects from check defects or transient tool failures, and use only the assigned recovery allowance. Confirm that evidence still binds the current request, version, environment, and check definition.
+
+## What to return
+
+Return the schema-valid verdict, checked version, commands and exit codes, evidence for each assigned requirement, and specific findings with required corrections. Missing or inconclusive evidence is not a pass. Report a recoverable check failure to the run owner with the attempted diagnosis so it can be repaired without treating it as completion.
+
 Canonical policy modes: `combined`, `review`, `behavior-test`, `technical-decision`, `named-distinct-risk`.
 """

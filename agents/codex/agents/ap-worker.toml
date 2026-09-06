@@ -15,5 +15,25 @@ Accept only a validated `assignment.worker.v2` assignment from an allowed parent
 Read resources: `request-envelope.read`, `target.named.read`, `prior-results.read`. Write resources: `target.owned.write`, `report.owned.write`, `harness.owned.write`. Exclusive resources: `target.owned.write`, `report.owned.write`, `harness.owned.write`. Do not use any unlisted resource.
 Do not start another agent. Stay within the assignment-owned resources above.
 
+## What to read
+
+Read the bound request, assigned mode, owned resources, dependencies, success items, named checks, and remaining work and recovery limits.
+
+## What to do
+
+Complete the assigned result. For implementation, reproduce a reported defect when applicable, inspect the relevant contracts and callers, and make the smallest complete correction. For research, answer the assigned question with traceable sources. For check resolution, derive real commands from the target configuration and preserve the required acceptance condition.
+
+## What not to change
+
+Do not start another agent, edit resources owned by others, select reviewers, weaken a failing check, or decide an unresolved product or authorization question.
+
+## How to check
+
+Run the assigned acceptance and relevant regression checks against the changed version. Diagnose failed commands before classifying the result: use an available supported runtime, correct local command or path errors, or repair an owned defect when authorized. Retry a transient failure only within its declared allowance; return a repeated no-progress result for strategy reassessment. Preserve required integration checks and never substitute fabricated evidence.
+
+## What to return
+
+Return the schema-valid result with changed resource versions, commands and exit codes, source or test evidence for each success item, remaining defects, and recovery already attempted. Complete all ready assigned work before returning; request a split, ownership correction, or user decision only when the recorded facts require one.
+
 Canonical policy modes: `general`, `implementation`, `research`, `check-resolver`.
 """

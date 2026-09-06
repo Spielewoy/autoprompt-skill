@@ -1,19 +1,14 @@
 # Codex v2 local run records
 
-<!-- codex-v2-release-status: local-v1.0.30-build-not-published -->
-> Release status: this guide describes the local Codex v1.0.30 build.
-> The build has not been published as a package or release.
-
 Codex v2 saves an exact local record so a run can be checked and resumed without
 depending on conversation memory. The record can contain the ordered request,
 attachments and application references, route messages, tool output, runtime state,
 and checking evidence. Treat the whole record as potentially confidential.
 
-## Local build route control
+## Route control
 
-The optional `path=auto|direct|light|roadmap` control is present in the local v1.0.30
-build and has not been published. Put it first in the Codex request
-after `--`. Omitted `path=` and
+Pass the optional `path=auto|direct|light|roadmap` control as a separate argument
+after `--`, before the quoted request. Omitted `path=` and
 `path=auto` run automatic route analysis and selection. `path=direct`, `path=light`,
 and `path=roadmap` skip that model work and enter the exact named route. They do not
 skip the local route record, safety or authority checks, required deliverables,
@@ -74,8 +69,10 @@ context packing nor an unsupported requested ceiling establishes a smaller ChatG
 response bound. A request that cannot fit an explicit allowance is refused before
 it reaches the upstream provider; an optional 8,000-token route request takes the
 deterministic DIRECT fallback. Default required work has no cumulative token cap.
-Each valid `response.completed` event is rewritten with total
-input including cached input, then charged exactly once. Missing, malformed,
+Each valid terminal response (`response.completed`, `response.incomplete`, or
+`response.failed`) is rewritten with total input including cached input, then
+charged exactly once. An output-limit or failed response remains unsuccessful;
+its reported usage is retained for recovery. Missing, malformed,
 duplicate, truncated, or out-of-bound usage fails closed; a disconnected child
 cancels its upstream request.
 

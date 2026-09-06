@@ -1,13 +1,16 @@
 <div dir="rtl" align="right">
 
-<h1 align="center">Autoprompt</h1>
+<p align="center">
+  <img src="../../assets/banner.svg" alt="Autoprompt Skill: سحب وردية وإوز يطير" width="1000"/>
+</p>
 
-<p align="center">Autoprompt مهارة لوكلاء البرمجة توفر توجيها صريحا وتفويضا محدودا وفحوصا قائمة على الأدلة.</p>
+<p align="center">Autoprompt سير عمل لوكلاء البرمجة يقلل الإخفاقات بنسبة 45% عبر مراجعة العمل وإصلاحه وإعادة التحقق منه.</p>
 
 <p align="center">
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%D8%A7%D9%84%D8%A5%D8%B5%D8%AF%D8%A7%D8%B1&color=255C60&labelColor=14101F" alt="الإصدار v1.0.4"/></a>
-  <a href="#التثبيت"><img src="https://img.shields.io/badge/%D8%A7%D9%84%D8%AF%D8%B9%D9%85-9%20%D9%85%D8%B6%D9%8A%D9%81%D9%8A%D9%86%20%D9%85%D8%AF%D8%B9%D9%88%D9%85%D9%8A%D9%86-255C60?style=flat-square&labelColor=14101F" alt="دعم تسعة مضيفين"/></a>
-  <a href="../../LICENSE"><img src="https://img.shields.io/badge/%D8%A7%D9%84%D8%AA%D8%B1%D8%AE%D9%8A%D8%B5-MIT-255C60?style=flat-square&labelColor=14101F" alt="ترخيص MIT"/></a>
+  <a href="#نتائج-الاختبار-المعياري"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20%D9%86%D9%82%D8%B7%D8%A9-965477?style=flat-square&labelColor=302335" alt="Terminal-Bench 2.1: تحسن 14.61 نقطة"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=%D8%A7%D9%84%D8%A5%D8%B5%D8%AF%D8%A7%D8%B1&color=965477&labelColor=302335" alt="الإصدار v1.0.4"/></a>
+  <a href="#التثبيت"><img src="https://img.shields.io/badge/%D8%A7%D9%84%D8%AF%D8%B9%D9%85-9%20%D9%85%D8%B6%D9%8A%D9%81%D9%8A%D9%86%20%D9%85%D8%AF%D8%B9%D9%88%D9%85%D9%8A%D9%86-965477?style=flat-square&labelColor=302335" alt="دعم تسعة مضيفين"/></a>
+  <a href="../../LICENSE"><img src="https://img.shields.io/badge/%D8%A7%D9%84%D8%AA%D8%B1%D8%AE%D9%8A%D8%B5-MIT-965477?style=flat-square&labelColor=302335" alt="ترخيص MIT"/></a>
 </p>
 
 <p align="center">
@@ -68,7 +71,7 @@ autoprompt
 | الحالة | وكيل البرمجة | المتطلب المدقق | المفتاح |
 |---|---|---|---|
 | يعمل | [Claude Code](https://code.claude.com/docs/en/setup) | 2.1.219+؛ تم تدقيق 2.1.233 | `claude` |
-| يعمل | [Codex](https://github.com/openai/codex) | إصدار يدعم الوكلاء الفرعيين؛ تم تدقيق عمل v2 الحالي باستخدام 0.148.0 | `codex` |
+| يعمل | [Codex](https://github.com/openai/codex) | إصدار يدعم الوكلاء الفرعيين؛ تم تدقيق 0.148.0 | `codex` |
 | يعمل | [OpenCode](https://opencode.ai/docs/agents) | 1.18.7+؛ تم تدقيق 1.18.18 | `opencode` |
 | يعمل | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+؛ تم تدقيق 7.4.22 | `kilo` |
 | يعمل | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+؛ تم تدقيق 1.133.0 مع Copilot 0.61.0 | `vscode` |
@@ -92,39 +95,77 @@ autoprompt
 
 ## نتائج الاختبار المعياري
 
-Autoprompt لا تقدم حاليا أي ادعاء قابل للتكرار بشأن الأداء أو التكلفة. لم تحفظ المقارنة التاريخية العناصر وبيانات القياس اللازمة لإعادة بنائها؛ راجع [حدود الأدلة المؤرشفة](../benchmarks/terminal-bench-2.1.md). يجب أن تصدر أي ادعاءات مستقبلية عن خط أدلة معيارية موقع.
+هذه **نتائج اختبارات الإصدار 1**. ستُنشر نتائج الإصدار 2 لاحقًا.
+
+<p align="center">
+  <img src="../../assets/i18n/ar/terminal-bench-2.1-leaderboard.svg" width="1000" alt="ترتيب Terminal-Bench 2.1 مع 18 درجة مرجعية من Artificial Analysis ودرجتي DeepSeek V4 Flash 0731 المقاسَتين مع Autoprompt ومن دونه."/>
+</p>
+
+<details>
+<summary><strong>مقارنة OpenCode المقاسة</strong></summary>
+
+<p align="center">
+  <img src="../../assets/i18n/ar/terminal-bench-2.1.svg" width="900" alt="أداء OpenCode 1.18.7 على Terminal-Bench 2.1: أنجز OpenCode 60 من 89 مهمة، وأنجز OpenCode مع Autoprompt 73 مهمة."/>
+</p>
+
+| التشغيل | المهام المنجزة | النتيجة | الإخفاقات |
+|---|---:|---:|---:|
+| OpenCode | 60/89 | 67.42% | 29 |
+| **OpenCode + Autoprompt** | **73/89** | **82.02%** | **16** |
+| **الفارق** | **+13 مهمة** | **+14.61 نقطة** | **أقل بنسبة 45%** |
+
+</details>
+
+جاءت نتيجة DeepSeek البالغة 82.7% من إعداد اختبار مختلف، لذا فهي نقطة مرجعية وليست تشغيلا ثالثا قابلا للمقارنة. راجع [إعداد الاختبار وحدود الأدلة](../benchmarks/terminal-bench-2.1.md)، أو [اطلب اختبارا معياريا آخر](https://github.com/Spielewoy/autoprompt-skill/issues/new).
+
+<details>
+<summary><strong>التكلفة المتوقعة:</strong> نحو 3x من الوقت و2x من الرموز.</summary>
+
+لم تحفظ سجلات الوقت والرموز، لذا فهذه تقديرات تخطيط مبنية على تجارب المستخدمين وليست نتائج معيارية مقاسة. في هذا التشغيل، انخفضت حالات الفشل من 29 إلى 16 (أقل بنسبة 45%)، أي نحو نصف عدد الأخطاء (تحسن يقارب 2x). قد تختلف النتيجة كثيرا في المهام الصغيرة جدا.
+
+</details>
 
 ## بنية الاستدعاء
 
-<p align="center">
-  <a href="../../assets/i18n/ar/anatomy.svg"><img src="../../assets/i18n/ar/anatomy.svg" alt="بنية استدعاء Autoprompt: المشغل ونمط التوازي وحد الوكلاء وتوجيه النماذج والهدف وعنصر path الخاص بـ Codex v2 قيد التطوير" width="1000"/></a>
-</p>
+```text
+/autoprompt mode=custom max_subs=4 agents=auto <goal>
+```
+
+| الجزء | الوظيفة |
+|---|---|
+| `/autoprompt` | بدء المهارة. |
+| `mode=custom` | التزامن: tokensaver أو wide أو custom. |
+| `max_subs=4` | أربعة وكلاء فرعيين متزامنين كحد أقصى. |
+| `agents=auto` | اختيار تلقائي أو النموذج الحالي (off) أو قائمة. |
+| `<goal>` | النتيجة المطلوبة والقيود وطريقة التحقق. |
+| `path=` | المسار: auto أو direct أو light أو roadmap. |
+
+مثال في Codex:
+
+```bash
+autoprompt activate codex -- path=light "<goal>"
+```
+
 
 ## عناصر التحكم في التشغيل
 
-<!-- codex-v2-release-status: local-v1.0.30-build-not-published -->
-> حالة `path=` في Codex v2: نسخة محلية v1.0.30؛ غير منشورة.
-
-استخدم `mode=` لتحديد التوازي. واستخدم `agents=` لتوجيه النماذج عندما يدعم المضيف ذلك. ويدعم Codex v2 أيضا عنصر التحكم الاختياري `path=`.
+استخدم `mode=` لتحديد التوازي. واستخدم `agents=` لتوجيه النماذج عندما يدعم المضيف ذلك.
 
 | التحكم | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | التوجيه المخصص عبر `agents=` | ✓ | ✓ | ✕ غير متاح - يرث النموذج النشط | ✕ غير متاح - يرث النموذج النشط | ✕ غير متاح - يرث النموذج النشط | ✕ غير متاح - يرث النموذج الأب المحدد | ✕ غير متاح - يرث النموذج الأب المحدد | ✕ غير متاح - يرث النموذج الأب المحدد | ✕ غير متاح - يرث النموذج الأب المحدد |
-| مسار العمل `path=` | - | نسخة محلية v1.0.30؛ غير منشورة | - | - | - | - | - | - | - |
-
-في Codex v2، ضع `path=auto|direct|light|roadmap` في بداية المهمة، مثل `autoprompt activate codex -- path=direct <الهدف>`. حذف `path=` يعادل `path=auto` ويبقي الاختيار تلقائيا. يتجاوز المسار الصريح عمل النماذج المخصص لتحليل المسار واختياره، لكنه لا يتجاوز فحوص السلامة والصلاحيات أو العمل المطلوب أو التنفيذ أو التحقق المستقل. ويفشل الاختيار غير الصالح أو المتعارض بأمان بدلا من تبديل المسار بصمت.
 
 ## كيف يعمل
 
 <p align="center">
-  <img src="../../assets/i18n/ar/how-it-works-loop.svg" alt="مسار Autoprompt من الأمر إلى التخطيط والتنفيذ والمراجعة والاختبارات والموافقة والفحص النهائي" width="1100"/>
+  <a href="../../assets/i18n/ar/how-it-works-loop.svg"><img src="../../assets/i18n/ar/how-it-works-loop.svg" alt="مسار Autoprompt من الأمر إلى التخطيط والتنفيذ والمراجعة والاختبارات والموافقة والفحص النهائي" width="1100"/></a>
 </p>
 
 ## الوكلاء
 
 <p align="center">
-  <img src="../../assets/i18n/ar/how-it-works-hierarchy.svg" alt="تسلسل وكلاء Autoprompt من الأمر إلى المنسقين والمدير ومسارات التنفيذ وعمليات التحقق المستقلة" width="1100"/>
+  <a href="../../assets/i18n/ar/how-it-works-hierarchy.svg"><img src="../../assets/i18n/ar/how-it-works-hierarchy.svg" alt="تسلسل وكلاء Autoprompt من الأمر إلى المنسقين والمدير ومسارات التنفيذ وعمليات التحقق المستقلة" width="1100"/></a>
 </p>
 
 ## أمثلة
@@ -135,9 +176,8 @@ Autoprompt لا تقدم حاليا أي ادعاء قابل للتكرار بش
 | بناء | `/autoprompt mode=wide أنشئ مسار الحجز من API إلى الدفع` |
 | بحث | `/autoprompt قارن قوائم انتظار المهام لهذا المستودع وأوص بواحدة` |
 | تقييد العمل المتوازي | `/autoprompt mode=custom max_subs=4 انقل جميع النماذج` |
-| اختبار مسار Codex v2 قيد التطوير | `autoprompt activate codex -- path=light أضف إعادة المحاولة واختبر الحالات الحدية` |
 
-في Codex v2، شغل `autoprompt activate codex -- <الهدف>`؛ يضيف المشغل غلاف `$autoprompt` الخاص داخليا. في Oh My Pi، استخدم `/skill:autoprompt`.
+استخدم `autoprompt activate codex -- "<goal>"` بدلا من `/autoprompt` في Codex. في Oh My Pi، استخدم `/skill:autoprompt`.
 
 ## الأسئلة الشائعة
 
@@ -163,16 +203,23 @@ Autoprompt لا تقدم حاليا أي ادعاء قابل للتكرار بش
 </details>
 
 <details>
-<summary><strong>ما الذي تتحكم فيه `mode` و`max_subs` و`agents` و`path`؟</strong></summary>
+<summary><strong>ما هي مسارات العمل؟</strong></summary>
 
-تحد `mode=tokensaver` الوكلاء الفرعيين النشطين بستة، وتفتح `mode=wide` كل المسارات الجاهزة، وتحدد `mode=custom max_subs=N` سقفا مخصصا، وتتحكم `agents` في توجيه النماذج عندما يدعمه المضيف. ويثبت `path` مسار العمل اختياريا في Codex v2 قيد التطوير، بينما يبقى الاختيار تلقائيا عند حذفه. [التفاصيل](../faq/tokensaver-vs-wide-vs-custom.md)
+يختار `path=auto` المسار المناسب. يبدأ `direct` العمل المحدد، ويضيف `light` خطة قصيرة، وينظم `roadmap` الأعمال المترابطة. تتضمن جميع المسارات تحققًا مستقلًا. [التفاصيل](../faq/work-paths.md)
+
+</details>
+
+<details>
+<summary><strong>ما الذي تتحكم فيه `mode` و`max_subs` و`agents`؟</strong></summary>
+
+تحد `mode=tokensaver` الوكلاء الفرعيين النشطين بستة، وتفتح `mode=wide` كل المسارات الجاهزة، وتحدد `mode=custom max_subs=N` سقفا مخصصا، وتتحكم `agents` في توجيه النماذج عندما يدعمه المضيف. [التفاصيل](../faq/tokensaver-vs-wide-vs-custom.md)
 
 </details>
 
 <details>
 <summary><strong>لماذا لا يبدأ Autoprompt في الخلفية؟</strong></summary>
 
-لأنه يغير التكلفة والوقت وسير العمل. شغله صراحة باستخدام `/autoprompt <الهدف>` على المضيفين المتوافقين، أو `autoprompt activate codex -- <الهدف>` في Codex v2.
+لأنه يغير التكلفة والوقت وسير العمل. شغله صراحة باستخدام `/autoprompt <الهدف>`، أو `autoprompt activate codex -- "<goal>"` في Codex.
 
 </details>
 

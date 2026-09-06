@@ -467,6 +467,39 @@
         "humanDescription": {
           "type": "string",
           "minLength": 1
+        },
+        "instructions": {
+          "type": "object",
+          "required": [
+            "whatToRead",
+            "whatToDo",
+            "whatNotToChange",
+            "howToCheck",
+            "whatToReturn"
+          ],
+          "properties": {
+            "whatToRead": {
+              "type": "string",
+              "minLength": 1
+            },
+            "whatToDo": {
+              "type": "string",
+              "minLength": 1
+            },
+            "whatNotToChange": {
+              "type": "string",
+              "minLength": 1
+            },
+            "howToCheck": {
+              "type": "string",
+              "minLength": 1
+            },
+            "whatToReturn": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

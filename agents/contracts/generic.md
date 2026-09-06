@@ -31,7 +31,11 @@ Use real checks available in the target system. Every requested effect has its o
 
 ## Stop and resume honestly
 
-Use the states, events, limits, and typed results in `agents/contracts/state-machine.json`. Retry only a recorded transient failure within the original run-wide limits. Repeated work with the same no-progress fingerprint does not reset a limit. Ask the user only for a choice or authority the user must supply, such as product meaning, credentials, money, destructive action, or consequential external action.
+Use the states, events, limits, and typed results in `agents/contracts/state-machine.json`. A failed command, rejected result, or unavailable default tool does not by itself end the run. Diagnose the cause and use the permitted recovery: correct a local command or path, use an available supported runtime, return a repairable defect to its owner, or resolve a defective check without changing what it must prove. Continue within the existing route unless new facts satisfy a route-change rule.
+
+Retry only a recorded transient failure within its declared allowance and the original run-wide limits. Repeated work with the same no-progress fingerprint does not reset a limit; record one materially different bounded approach when the state machine permits strategy reassessment. Preserve valid completed results and continue ready work allowed by the current state. Report a terminal failure only when the required result remains unverified and no permitted recovery remains. Report an external blocker with the attempted command, observed evidence, and the condition required to resume.
+
+Ask the user only for a choice or authority the user must supply, such as unresolved product meaning, missing credentials, or an unauthorized costly, destructive, or consequential external action. Check existing instructions and authorization first. A routine implementation choice or recoverable tool error is not a reason to request permission.
 
 `SCOPE-BUDGET-BREACH` and `SCOPE-CONVERGE-REQUEST` are durable disk hints, not live steering. They take effect only after the child exits and the external supervisor relaunches with `AUTOPROMPT_RESUME=1`.
 

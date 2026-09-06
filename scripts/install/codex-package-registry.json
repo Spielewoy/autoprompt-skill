@@ -80,7 +80,7 @@
     ]
   },
   "releaseHistory": {
-    "path": "packages/codex/release-history.json",
+    "path": "scripts/release/codex/release-history.json",
     "algorithm": "sha256-chain-v1",
     "genesisRecordDigest": "d5c4d97bf557e513680dd7d2dcd14ed6ac0769f89b538297b4103221ff0a74ab"
   },
@@ -141,12 +141,6 @@
       "path": "agents/codex/workflow/captured-domain.js",
       "sha256": "c216728edfb1a2b6622e78f8e0eda043154e0b027abb8f8913330c398e3d02ec",
       "terms": ["candidate", "mission"],
-      "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
-    },
-    {
-      "path": "agents/codex/workflow/codex-executable.js",
-      "sha256": "201d70720b2815ecc546ba674470ea0d86305613c13d2ec6e210ed8b7046256e",
-      "terms": ["candidate"],
       "reason": "Legacy user-facing terminology retained only for this exact audited source snapshot; any byte change requires re-audit."
     }
   ],

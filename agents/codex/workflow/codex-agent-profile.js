@@ -105,7 +105,7 @@ function relativeConfigPath(profilePath, agentsDirectory, agentFile) {
   const profileDirectory = path.dirname(profilePath)
   const target = path.join(agentsDirectory, agentFile)
   const relative = path.relative(profileDirectory, target)
-  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     fail('private agents must be descendants of the profile directory')
   }
   return relative.split(path.sep).join('/')

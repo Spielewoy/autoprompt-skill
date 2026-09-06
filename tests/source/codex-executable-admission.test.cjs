@@ -12,10 +12,13 @@ const configure = require('../../scripts/codex-configure.cjs')
 const {
   CodexExecutableError,
   admitCodexExecutable,
+  bindAdmittedCodexExecutable,
+  openCodexExecutableAdmission,
   platformBinding,
   queryAdmittedCodexVersion,
   resolveCodexExecutable,
   runtimeFromPackage,
+  runtimeFromStandalonePackage,
 } = require('../../agents/codex/workflow/codex-executable.js')
 const shippedRegistry = require('../../agents/contracts/providers.json')
 
@@ -46,6 +49,99 @@ function writeOfficialPackage(packageRoot, version, executableBytes) {
   if (process.platform !== 'win32') fs.chmodSync(executable, 0o755)
   return executable
 }
+
+function writeStandalonePackage(packageRoot, version, executableBytes) {
+  const [, target, executableName] = platformBinding()
+  const executable = path.join(packageRoot, 'bin', executableName)
+  fs.mkdirSync(path.dirname(executable), { recursive: true })
+  fs.writeFileSync(path.join(packageRoot, 'codex-package.json'), JSON.stringify({
+    layoutVersion: 1, version, target, variant: 'codex',
+    entrypoint: `bin/${executableName}`, resourcesDir: 'codex-resources', pathDir: 'codex-path',
+  }))
+  fs.writeFileSync(executable, executableBytes)
+  if (process.platform !== 'win32') fs.chmodSync(executable, 0o755)
+  return executable
+}
+
+test('standalone package discovery stays inert and requires canonical signed trust', t => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-standalone-'))
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
+  const packageRoot = path.join(sandbox, 'release')
+  const executable = writeStandalonePackage(packageRoot, '7.4.1', Buffer.from('untrusted-native-bytes'))
+  let bin = path.dirname(executable)
+  if (process.platform !== 'win32') {
+    // The installer exposes a PATH symlink through a movable current release.
+    fs.symlinkSync(packageRoot, path.join(sandbox, 'current'), 'dir')
+    bin = path.join(sandbox, 'local-bin')
+    fs.mkdirSync(bin)
+    fs.symlinkSync(path.join(sandbox, 'current', 'bin', 'codex'), path.join(bin, 'codex'))
+  }
+  const environment = { PATH: bin }
+  const candidate = resolveCodexExecutable('codex', { environment })
+  assert.equal(candidate.source, 'standalone-package-runtime')
+  assert.equal(candidate.provenance.kind, 'standalone-package-layout-v1')
+  assert.equal(candidate.executable, fs.realpathSync.native(executable))
+  assert.equal(candidate.identity.sha256, sha256(executable))
+  assert.equal(candidate.identity.version, 'codex-cli 7.4.1')
+  assert.deepEqual(candidate.environmentOverlay, {})
+  let executions = 0
+  const spawnSync = () => {
+    executions += 1
+    return { status: 0, stdout: 'codex-cli 7.4.1\n', stderr: '' }
+  }
+  assert.throws(() => queryAdmittedCodexVersion(candidate, { spawnSync }), CodexExecutableError)
+  const trust = configure.evaluateCanonicalCodexCapabilityTrust(shippedRegistry, {
+    env: environment, spawnSync,
+  })
+  assert.equal(trust.ready, false)
+  assert.equal(trust.runtimeIdentity.codexExecutableRuntime.source, 'standalone-package-runtime')
+  assert.ok(trust.blockers.includes('canonical-live-evidence-invalid'))
+  assert.equal(executions, 0)
+})
+
+test('standalone admission reopens the exact metadata and rejects metadata or executable drift', t => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-standalone-binding-'))
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
+  const executable = writeStandalonePackage(sandbox, '7.4.1', Buffer.from('fixture-native-bytes'))
+  const candidate = runtimeFromStandalonePackage(sandbox)
+  const admitted = admitCodexExecutable(candidate, candidate.identity)
+  const runtimeIdentityHash = 'a'.repeat(64)
+  const binding = bindAdmittedCodexExecutable(admitted, runtimeIdentityHash)
+  const reopened = openCodexExecutableAdmission(binding, runtimeIdentityHash)
+  assert.deepEqual(reopened.identity, candidate.identity)
+  assert.equal(queryAdmittedCodexVersion(reopened, {
+    spawnSync: () => ({ status: 0, stdout: 'codex-cli 7.4.1\n' }),
+  }), 'codex-cli 7.4.1')
+  const metadataPath = path.join(sandbox, 'codex-package.json')
+  const metadataBytes = fs.readFileSync(metadataPath)
+  fs.appendFileSync(metadataPath, '\n')
+  assert.throws(() => openCodexExecutableAdmission(binding, runtimeIdentityHash), CodexExecutableError)
+  fs.writeFileSync(metadataPath, metadataBytes)
+  fs.appendFileSync(executable, 'drift')
+  assert.throws(() => openCodexExecutableAdmission(binding, runtimeIdentityHash), CodexExecutableError)
+})
+
+test('standalone discovery rejects incompatible, redirected and linked package metadata', t => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-standalone-invalid-'))
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
+  const executable = writeStandalonePackage(sandbox, '7.4.1', Buffer.from('fixture-native-bytes'))
+  const metadataPath = path.join(sandbox, 'codex-package.json')
+  const metadata = JSON.parse(fs.readFileSync(metadataPath))
+  for (const patch of [
+    { layoutVersion: 2 }, { version: 'malformed' }, { target: 'other-target' },
+    { variant: 'other' }, { entrypoint: '../codex' }, { resourcesDir: '../resources' },
+    { pathDir: '../path' },
+  ]) {
+    fs.writeFileSync(metadataPath, JSON.stringify({ ...metadata, ...patch }))
+    assert.equal(runtimeFromStandalonePackage(sandbox), null, JSON.stringify(patch))
+  }
+  fs.writeFileSync(metadataPath, JSON.stringify(metadata))
+  fs.linkSync(metadataPath, path.join(sandbox, 'linked-metadata.json'))
+  assert.equal(runtimeFromStandalonePackage(sandbox), null)
+  fs.unlinkSync(path.join(sandbox, 'linked-metadata.json'))
+  fs.linkSync(executable, path.join(sandbox, 'linked-executable'))
+  assert.equal(runtimeFromStandalonePackage(sandbox), null)
+})
 
 test('a PATH-selected malicious Codex is refused without executing any candidate bytes', t => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-path-admission-'))
@@ -179,6 +275,60 @@ test('official package metadata supplies the candidate version without an execut
   assert.equal(runtime.identity.sha256, sha256(executable))
   assert.equal(runtime.provenance.kind, 'official-npm-package-v1')
   assert.equal(runtime.provenance.packageVersion, version)
+})
+
+test('local npm discovery binds a hoisted native sibling and rejects sibling drift', t => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-hoisted-'))
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
+  const packageRoot = path.join(sandbox, 'node_modules', '@openai', 'codex')
+  const [nativePackageName] = platformBinding()
+  const nestedRoot = path.join(packageRoot, 'node_modules', ...nativePackageName.split('/'))
+  const nativeRoot = path.join(sandbox, 'node_modules', ...nativePackageName.split('/'))
+  const nestedExecutable = writeOfficialPackage(packageRoot, '7.4.1', Buffer.from('hoisted-native-bytes'))
+  const executable = path.join(nativeRoot, path.relative(nestedRoot, nestedExecutable))
+  fs.renameSync(nestedRoot, nativeRoot)
+  const candidate = runtimeFromPackage(packageRoot)
+  assert.ok(candidate)
+  assert.equal(candidate.source, 'official-package-runtime')
+  assert.equal(candidate.executable, fs.realpathSync.native(executable))
+  assert.equal(candidate.identity.version, 'codex-cli 7.4.1')
+  assert.equal(candidate.identity.sha256, sha256(executable))
+  assert.equal(candidate.provenance.nativePackageMetadataSha256,
+    sha256(path.join(nativeRoot, 'package.json')))
+
+  if (process.platform !== 'win32') {
+    const launcher = path.join(packageRoot, 'bin', 'codex.js')
+    fs.mkdirSync(path.dirname(launcher), { recursive: true })
+    fs.writeFileSync(launcher, '#!/usr/bin/env node\nthrow new Error("must stay inert")\n')
+    const bin = path.join(sandbox, 'node_modules', '.bin')
+    fs.mkdirSync(bin)
+    fs.symlinkSync(launcher, path.join(bin, 'codex'))
+    assert.deepEqual(resolveCodexExecutable('codex', { environment: { PATH: bin } }), candidate)
+  }
+
+  const identityHash = 'b'.repeat(64)
+  const admitted = admitCodexExecutable(candidate, candidate.identity)
+  const binding = bindAdmittedCodexExecutable(admitted, identityHash)
+  assert.deepEqual(openCodexExecutableAdmission(binding, identityHash).identity, candidate.identity)
+  const metadataPath = path.join(nativeRoot, 'package.json')
+  const metadata = fs.readFileSync(metadataPath)
+  fs.appendFileSync(metadataPath, '\n')
+  assert.throws(() => openCodexExecutableAdmission(binding, identityHash), CodexExecutableError)
+  fs.writeFileSync(metadataPath, JSON.stringify({
+    name: '@openai/codex', version: `9.9.9-${process.platform}-${process.arch}`,
+    os: [process.platform], cpu: [process.arch],
+  }))
+  assert.equal(runtimeFromPackage(packageRoot), null)
+  fs.writeFileSync(metadataPath, metadata)
+  fs.appendFileSync(executable, 'drift')
+  assert.throws(() => openCodexExecutableAdmission(binding, identityHash), CodexExecutableError)
+  if (process.platform !== 'win32') {
+    const foreignRoot = path.join(sandbox, 'foreign-native-package')
+    fs.renameSync(nativeRoot, foreignRoot)
+    fs.symlinkSync(foreignRoot, nativeRoot, 'dir')
+    assert.equal(runtimeFromPackage(packageRoot), null,
+      'a hoisted sibling must not redirect outside its native package root')
+  }
 })
 
 test('explicit executable aliases and hardlinks are refused before admission', t => {

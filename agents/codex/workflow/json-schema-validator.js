@@ -144,6 +144,14 @@ function validateJsonSchema(schema, value) {
       if (valid.length !== 1) add('oneOf', `expected exactly one matching branch, received ${valid.length}`)
       if (valid.length === 1) for (const name of valid[0].evaluated) evaluated.add(name)
     }
+    if (Array.isArray(currentSchema.anyOf)) {
+      const valid = currentSchema.anyOf.map(branch => visit(branch, currentValue, valuePath))
+        .filter(branch => branch.errors.length === 0)
+      if (valid.length === 0) add('anyOf', 'no matching branch')
+      for (const branch of valid) {
+        for (const name of branch.evaluated) evaluated.add(name)
+      }
+    }
     if (currentSchema.not) {
       const denied = visit(currentSchema.not, currentValue, valuePath)
       if (denied.errors.length === 0) add('not', 'value matches denied schema')

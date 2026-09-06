@@ -8,14 +8,14 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const ROOT = path.resolve(__dirname, '..')
-const TEMPLATE_ROOT = path.join(ROOT, 'packages', 'codex')
+const TEMPLATE_ROOT = path.join(ROOT, 'scripts', 'release', 'codex')
 const HASH_PATTERN = /^[a-f0-9]{64}$/
 const ARTIFACT_INVENTORY = 'artifact-inventory.json'
 const RELEASE_MEASUREMENT_FIELDS = Object.freeze([
   'packedBytes', 'fileCount', 'externalDependencyCount',
 ])
 const EXPLICIT_PACKAGE_FILES = Object.freeze([
-  ['packages/codex/release-history.json', 'release-history.json'],
+  ['scripts/release/codex/release-history.json', 'release-history.json'],
   ['scripts/install/codex-package-registry.json', 'scripts/install/codex-package-registry.json'],
   ['scripts/install/codex-discovery-shim.md', 'scripts/install/codex-discovery-shim.md'],
   ['scripts/install/legacy-codex-compat.json', 'scripts/install/legacy-codex-compat.json'],
@@ -25,8 +25,6 @@ const EXPLICIT_PACKAGE_FILES = Object.freeze([
   ['scripts/runtime-payload.cjs', 'scripts/runtime-payload.cjs'],
   ['scripts/codex-runtime-identity.cjs', 'scripts/codex-runtime-identity.cjs'],
   ['scripts/codex-configure.cjs', 'scripts/codex-configure.cjs'],
-  ['scripts/codex-evidence-bundle.cjs', 'scripts/codex-evidence-bundle.cjs'],
-  ['scripts/codex-evidence/verification-bundle.cjs', 'scripts/codex-evidence/verification-bundle.cjs'],
   ['scripts/benchmark-evidence/core.cjs', 'scripts/benchmark-evidence/core.cjs'],
   ['agents/manifests/codex-runtime.json', 'agents/manifests/codex-runtime.json'],
 ])
@@ -40,9 +38,9 @@ function readJson(file) {
 }
 
 function metadata(root = ROOT) {
-  const packageTemplate = readJson(path.join(root, 'packages', 'codex', 'package.json'))
-  const release = readJson(path.join(root, 'packages', 'codex', 'release.json'))
-  const releaseHistory = readJson(path.join(root, 'packages', 'codex', 'release-history.json'))
+  const packageTemplate = readJson(path.join(root, 'scripts', 'release', 'codex', 'package.json'))
+  const release = readJson(path.join(root, 'scripts', 'release', 'codex', 'release.json'))
+  const releaseHistory = readJson(path.join(root, 'scripts', 'release', 'codex', 'release-history.json'))
   const packageRegistry = readJson(path.join(root, 'scripts', 'install', 'codex-package-registry.json'))
   const manifest = readJson(path.join(root, 'agents', 'manifests', 'codex-runtime.json'))
   const codexVersion = fs.readFileSync(path.join(root, 'agents', 'codex', 'VERSION'), 'utf8').trim()
@@ -74,7 +72,7 @@ function compareSemver(left, right) {
 
 function checkReleaseHistory(metadataRecord) {
   const { manifest, packageRegistry, packageTemplate, release, releaseHistory } = metadataRecord
-  assert.equal(packageRegistry.releaseHistory?.path, 'packages/codex/release-history.json')
+  assert.equal(packageRegistry.releaseHistory?.path, 'scripts/release/codex/release-history.json')
   assert.equal(packageRegistry.releaseHistory?.algorithm, 'sha256-chain-v1')
   assert.match(packageRegistry.releaseHistory?.genesisRecordDigest || '', HASH_PATTERN)
   assert.deepEqual(Object.keys(releaseHistory), ['schemaVersion', 'name', 'algorithm', 'releases'])
@@ -328,7 +326,7 @@ function artifactCopyPlan(root, manifest, conformanceOnly) {
     if (!plan.has(destination)) add(source, destination, null, 'explicit-package-dependency')
   }
   if (!conformanceOnly) {
-    add('packages/codex/bin/autoprompt-codex.cjs', 'bin/autoprompt-codex.cjs', null,
+    add('scripts/release/codex/bin/autoprompt-codex.cjs', 'bin/autoprompt-codex.cjs', null,
       'publishable-entrypoint')
   }
   return [...plan.values()].sort((left, right) => left.destination.localeCompare(right.destination))
@@ -445,7 +443,6 @@ function buildArtifact(destination, root, release, trust, conformanceOnly) {
     copyBoundFile(root, entry.source, destination, entry.destination, entry.expectedSha256)
   }
   if (!conformanceOnly) fs.chmodSync(path.join(destination, 'bin', 'autoprompt-codex.cjs'), 0o755)
-  fs.chmodSync(path.join(destination, 'scripts', 'codex-evidence-bundle.cjs'), 0o755)
   const inventory = {
     schemaVersion: 1,
     algorithm: 'sha256',
@@ -493,7 +490,7 @@ function npmCliPath() {
 }
 
 function writeReleaseMeasurements(root, expectedBytes, measurements) {
-  const releasePath = assertRegularSource(root, 'packages/codex/release.json', 'Codex release metadata')
+  const releasePath = assertRegularSource(root, 'scripts/release/codex/release.json', 'Codex release metadata')
   const currentBytes = fs.readFileSync(releasePath)
   assert.equal(currentBytes.equals(expectedBytes), true,
     'Codex release metadata changed while packing; measurements were not committed')
@@ -518,7 +515,7 @@ function writeReleaseMeasurements(root, expectedBytes, measurements) {
 
 function packArtifact(destination, root = ROOT, options = {}) {
   const target = path.resolve(destination)
-  const releaseBytes = fs.readFileSync(path.join(root, 'packages', 'codex', 'release.json'))
+  const releaseBytes = fs.readFileSync(path.join(root, 'scripts', 'release', 'codex', 'release.json'))
   const context = releaseContext(root, options, false)
   const existed = assertFreshDestination(target, 'Codex artifact pack')
   const parent = path.dirname(target)

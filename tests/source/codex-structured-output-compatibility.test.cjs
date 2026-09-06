@@ -2784,6 +2784,23 @@ test('bundled canonical schemas reject every missing required field and unknown 
   }, { INVALID: true }).valid, false)
 })
 
+test('canonical schema anyOf validates alternatives and collects evaluated properties', () => {
+  const schema = {
+    type: 'object',
+    anyOf: [
+      { required: ['model'], properties: { model: { type: 'string' } } },
+      { required: ['effort'], properties: { effort: { type: 'string' } } },
+    ],
+    unevaluatedProperties: false,
+  }
+  for (const value of [{ model: 'gpt-user' }, { effort: 'high' }, { model: 'gpt-user', effort: 'high' }]) {
+    assert.equal(validateJsonSchema(schema, value).valid, true)
+  }
+  for (const value of [{}, { model: 42 }, { model: 'gpt-user', undeclared: true }]) {
+    assert.equal(validateJsonSchema(schema, value).valid, false)
+  }
+})
+
 test('Codex adapter preserves a canonical RUNTIME_FAILURE as a direct terminal result', async t => {
   const directory = temporaryDirectory(t)
   const canonicalOutput = canonicalOutcome('RUNTIME_FAILURE')

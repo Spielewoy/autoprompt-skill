@@ -1,87 +1,62 @@
+# New backend component
 
-# Framework: backend-build  (category backend × subsection build · no tag* · tier T2/T3)
+Build the requested backend component, including the connections needed to use it.
 
-**You are the L1 FEATURE-SUPERVISOR.** L0 spawned you and handed you this framework;
-you DRIVE it by dispatching each required check to a fresh L3/L4 worker (via your L2 manager)
-and reading its returned report. The required check path itself is opened/extracted for you by a
-reader-capable role - your L2 manager (managers retain Read), or a reader-leaf you spawn
-on a direct L1→L3 hop; you dispatch gates and read the reports they return, but never
-open the corpus yourself. You never edit or run code yourself. Goal: build a WHOLE
-NEW backend component/surface from scratch - data model, the rules/endpoints/jobs,
-and the SEAMS that wire it - production-grade and proven end-to-end.
-\*An `external-target` overlay applies where it joins an external system
-(recon → tool-select → build → prove against the real target; `README.md`).
+## Assignment and control
 
+Use the selected route and its canonical compiled checks. DIRECT and LIGHT use no
+coordinator, manager, or roadmap. ROADMAP execution follows the accepted plan and
+recorded dependencies. Only the run owner selects independent checkers; workers do
+not start other agents. Follow the ownership rules in `composition.md`.
 
-## Layer flow
-- **You (L1):** drive the required check path (opened for you by your reader-capable L2 manager, or a reader-leaf on a direct hop) - dispatch gates in order, route every verdict.
-- **L2 manager:** builds the assignment, spawns the worker per required check.
-- **L3 executor:** implementer (which may fan to genuinely parallel pieces) plus one
-  independent final verifier for ordinary completeness.
-- **INDEPENDENCE:** extra seats require named distinct risks, oracles, and evidence.
-- Negative verdicts loop UP to you; re-dispatch or escalate.
+## Work and evidence
 
-## Required check path
-Executable roadmap: IMPLEMENT(TDD) → INDEPENDENT FINAL VERIFY. Insert G1 only for
-the conditional triggers above; tier alone never adds independent-checking seats.
+Identify the component's data model, interfaces, rules, endpoints or jobs, dependencies,
+and integration points. Use the accepted plan when the selected route is ROADMAP; on
+LIGHT use its bounded planning record. Return unresolved material architecture or
+product decisions to the run owner before dependent implementation.
 
-## THE END-TO-END WORKFLOW
+Record the project's real build and test baseline. Build owned parts with behavior
+tests, including relevant validation, authorization, error handling, idempotency,
+concurrency, observability, and migration requirements. Wire the parts into the actual
+application and exercise the full requested path. Assign integration ownership explicitly
+when different workers produce connected parts; the implementing worker cannot spawn
+helpers or acquire another owner's resources.
 
-### Phase 1 - ROADMAP / CONDITIONAL PLAN (G1)
-FIRST verify an executable `ROADMAP.md` item exists for this component; if none exists,
-report OUT-OF-SCOPE and escalate (**S4**). An implementation-ready item skips G1. Run
-G1 only for `requiresDetailedPlan: true`, a named unresolved architecture fork, or
-`PLAN-CONFLICT`; a genuine architecture fork routes through **S2** and `plan-design`.
-When G1 runs, the planner maps the component's pieces (data model, rules/endpoints/
-jobs), the SEAMS that wire them, and the build order. State each
-piece's contract and the cross-cutting concerns a real owner would not ship without:
-input validation at every boundary, authn/authz, error handling, idempotency/
-retries, observability, migrations. Integration is its OWN piece.
+The independent checker must verify both the pieces and their integrated behavior.
+External-system claims require the real target evidence selected by the acceptance
+checks; a local demonstration or unit fake cannot establish that external result.
 
-### Phase 2 - REQUIRED CHECK-ZERO + BUILD piece by piece (G4, TDD)
-Confirm the repo's OWN test command runs (else **S1 BLOCKED**). Build each piece
-TDD (tests first, then code), within its owned files; the implementer may fan to L4
-leaves for genuinely parallel pieces. Coverage to the original request's bar (default 100% of
-the feature's surface) - ≥95% of changed lines is a floor, not the target.
+## Independent checking
 
-### Phase 3 - WIRE THE SEAMS
-Wire the pieces together as a deliberate step - the seams are where it fails. Then
-the final verifier later checks claims, contracts, stubs, unhappy paths, and scope.
+One independent checker reviews and tests the frozen result by default. An additional
+checker requires a named distinct risk or responsibility and separate evidence. Check
+the requested behavior, relevant failure cases, and the existing tests of touched
+modules and direct dependents. Compare failures with the recorded baseline; an
+unrelated pre-existing failure is not a new regression. Investigate every new failure
+before acceptance. Meet the request's coverage requirements and the 95% changed-line
+floor for executable code, recording the measurement and any applicable exclusions.
 
-### Phase 4 - INDEPENDENT FINAL VERIFY END-TO-END
-On the REAL repo (returns reproWasRed/reproNowGreen/preExistingRegressions/
-testCommand): the component's tests pass; the seams work end-to-end (exercise the
-real path, not just unit pieces); the FULL pre-existing tests of every touched
-module + dependents stay GREEN; adversarial inputs behave; coverage ≥95%. For an
-external-target build, prove it against the real target, not a demo.
-**REGRESSION-IS-A-SIGNAL:** any green→red flip → root-cause and redo the owning
-piece (**S3**); never weaken/skip.
+## Recovery and result
 
-The final verifier's complete PASS is **S5** DONE.
+A failed command starts diagnosis. Check the command, working directory, supported
+runtime, and available dependencies; repair authorized local setup or an owned defect
+within the recorded allowance. A changed result or check invalidates its dependent
+evidence. Repeat those checks before reporting success. Do not weaken tests, conceal
+regressions, or replace a required real result with a simulated pass.
 
-## THE BLOCKED INVARIANT (non-negotiable)
-Verification runs the REAL check in its REAL environment - NEVER fake a pass, NEVER
-fabricate evidence, NEVER declare DONE over a red or un-runnable check. On ANY blocker,
-After bounded diagnosis, a repairable defect returns to its owner. An external,
-authority, environment, or policy blocker terminates with the attempted check, observed
-evidence, and concrete unblock requirement; never fabricate a pass or retry forever.
+Return repairable failures to the responsible owner. A repeated failure with unchanged
+evidence requires strategy reassessment, not equivalent new workers. Preserve valid
+results and all run-wide limits. Report `BLOCKED` only when an external, authority,
+environment, or policy condition still prevents required work after permitted diagnosis
+and recovery; include the command, observed failure, and concrete unblock condition.
+Report an unresolved scope or ownership conflict to the run owner without editing
+unowned resources. Only new route facts justify changing the route.
 
-## Closed decision scenarios (each ends at ONE verdict)
-- **S1 - real test suite cannot run** → BLOCKED (report attempt + unblock path).
-- **S2 - architecture genuinely undecided** → hand to `plan-design` for the blueprint
-  before building; never improvise a design mid-build.
-- **S3 - a pre-existing test flips green→red** → FAILED (regression-is-a-signal: redo
-  the owning piece); never weaken/skip.
-- **S4 - a piece proves bigger/cross-cutting than scoped** → OUT-OF-SCOPE; climb a
-  route under the canonical route-change rules. The L2 manager splits into sibling tracks; an L3 never
-  self-splits by spawning.
-- **S5 - every piece built + seams wired + zero regressions + end-to-end proven +
-  final-verifier PASS** → DONE.
-
-## Stacking
-ONE L3 track (its internal L4 fan-out for parallel pieces is internal). A
-multi-surface original request is split in ROADMAP.md into disjoint features, each its own
-framework as a sibling track - `composition.md`.
+Return the exact result version, requested items completed, commands and exit codes,
+check evidence, remaining defects, and attempted recovery. The run owner requests
+completion only after every requested result passes its current required checks and
+all working agents have stopped. The deterministic control plane records `DONE`.
 
 <!-- AUTOPROMPT-FRAMEWORK-GATES:BEGIN v2 sha256=b41cfc5bbf3088c61389449ea26a55f47cdbac2bb5c670ea684bd05d615526e1 -->
 ## Generated route checks

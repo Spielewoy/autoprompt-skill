@@ -528,6 +528,64 @@ test('optional path defaults to auto while explicit direct, light, and roadmap a
   assert.equal(invalid.issues.some(issue => issue.field === 'path' && issue.code === 'INVALID'), true)
 })
 
+test('canonical settings resume every concurrency mode and retain explicit model pins', () => {
+  for (const mode of ['tokensaver', 'wide', 'custom']) {
+    for (const pinned of [false, true]) {
+      const base = {
+        provider: { id: 'codex', wideMaxSubs: 10 },
+        capabilities: { modelRouting: true },
+      }
+      const initial = settings.resolveSettings({
+        ...base,
+        explicit: {
+          concurrency: { mode, maxSubs: 3 }, path: 'light', agents: 'automatic',
+          ...(pinned ? { modelPin: 'gpt-user', effortPin: 'high' } : {}),
+        },
+      })
+      const resumed = settings.resolveSettings({ ...base, run: { settings: initial } })
+      assert.equal(resumed.status, 'READY')
+      assert.equal(settings.validateResolvedSettings(resumed).valid, true)
+      assert.equal(resumed.concurrency.friendlyMode, mode)
+      assert.equal(resumed.concurrency.effectiveMaxSubs, initial.concurrency.effectiveMaxSubs)
+      assert.equal(resumed.path.exactRoute, 'LIGHT')
+      assert.equal(resumed.concurrency.resolvedFrom, 'resumable-run-manifest')
+      if (pinned) {
+        assert.equal(resumed.modelRouting.explicitUserModelPin, 'gpt-user')
+        assert.equal(resumed.modelRouting.explicitUserEffortPin, 'high')
+        assert.equal(resumed.modelRouting.selectedBy, 'user-pin')
+      }
+    }
+  }
+})
+
+test('runtime settings validation enforces the canonical schema and rejects coerced limits', () => {
+  const base = {
+    explicit: { concurrency: { mode: 'tokensaver' } },
+    provider: { id: 'codex', wideMaxSubs: 10 }, capabilities: { modelRouting: false },
+  }
+  const ready = settings.resolveSettings(base)
+  for (const mutate of [
+    value => { value.status = 'CONFIG_REQUIRED' },
+    value => { value.ready = false },
+    value => { value.inspectionAllowed = false },
+    value => { value.concurrency.effectiveMaxSubs = '6' },
+    value => { value.concurrency.providerMaximum = 11 },
+    value => { value.modelRouting.model = 'unsupported-pin' },
+    value => { value.modelRouting.selectedBy = 'automatic' },
+    value => { value.resolvedAt = '2026-09-06' },
+    value => { value.undeclared = true },
+  ]) {
+    const malformed = clone(ready)
+    mutate(malformed)
+    assert.equal(settings.validateResolvedSettings(malformed).valid, false)
+  }
+  for (const maxSubs of [true, [3], { valueOf: () => 3 }]) {
+    assert.equal(settings.resolveSettings({
+      ...base, explicit: { concurrency: { mode: 'custom', maxSubs } },
+    }).status, 'CONFIG_REQUIRED')
+  }
+})
+
 test('unsupported explicit model and effort pins return PROVIDER_UNSUPPORTED and never disappear', () => {
   for (const pin of [{ modelPin: 'gpt-pinned' }, { effortPin: 'xhigh' }, { explicitUserModelPin: 'gpt-user' }]) {
     const result = settings.resolveSettings({
@@ -561,6 +619,18 @@ test('supported explicit pins are authoritative and malformed higher-precedence 
   })
   assert.equal(invalid.status, 'CONFIG_REQUIRED')
   assert.equal(invalid.issues[0].source, 'explicit')
+  for (const field of ['modelRouting', 'model_routing']) {
+    for (const value of [false, 42, ['automatic']]) {
+      const malformedSelector = settings.resolveSettings({
+        explicit: { concurrency: { mode: 'tokensaver' }, [field]: value },
+        saved: { agents: 'automatic' },
+        provider: { id: 'codex', wideMaxSubs: 10 }, capabilities: { modelRouting: true },
+      })
+      assert.equal(malformedSelector.status, 'CONFIG_REQUIRED')
+      assert.ok(malformedSelector.issues.some(issue =>
+        issue.field === 'modelRouting.selector' && issue.code === 'INVALID' && issue.source === 'explicit'))
+    }
+  }
 })
 
 test('resolved settings validation keeps numeric concurrency and explicit unsupported state separate', () => {

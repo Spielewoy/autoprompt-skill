@@ -49,7 +49,6 @@ const WORKER_MISSING_PROBE_COMMAND = 'if [ -e conformance-result.txt ]; then ' +
 const SOURCE_ROOTS = Object.freeze([
   'agents',
   'assets',
-  'packages/codex',
   'scripts',
   'package.json',
 ])
@@ -1041,8 +1040,8 @@ function releaseRecordDigest(record) {
 }
 
 function prepareTemporaryReleaseVersion(sourceRoot) {
-  const packagePath = path.join(sourceRoot, 'packages', 'codex', 'package.json')
-  const historyPath = path.join(sourceRoot, 'packages', 'codex', 'release-history.json')
+  const packagePath = path.join(sourceRoot, 'scripts', 'release', 'codex', 'package.json')
+  const historyPath = path.join(sourceRoot, 'scripts', 'release', 'codex', 'release-history.json')
   const packageRecord = JSON.parse(fs.readFileSync(packagePath, 'utf8'))
   const history = JSON.parse(fs.readFileSync(historyPath, 'utf8'))
   const previous = history.releases.at(-1)
@@ -1055,9 +1054,9 @@ function prepareTemporaryReleaseVersion(sourceRoot) {
 
 function refreshTemporaryReleaseBinding(sourceRoot, prepared) {
   const manifest = JSON.parse(fs.readFileSync(path.join(sourceRoot, 'agents', 'manifests', 'codex-runtime.json'), 'utf8'))
-  const packagePath = path.join(sourceRoot, 'packages', 'codex', 'package.json')
-  const releasePath = path.join(sourceRoot, 'packages', 'codex', 'release.json')
-  const historyPath = path.join(sourceRoot, 'packages', 'codex', 'release-history.json')
+  const packagePath = path.join(sourceRoot, 'scripts', 'release', 'codex', 'package.json')
+  const releasePath = path.join(sourceRoot, 'scripts', 'release', 'codex', 'release.json')
+  const historyPath = path.join(sourceRoot, 'scripts', 'release', 'codex', 'release-history.json')
   const packageRecord = JSON.parse(fs.readFileSync(packagePath, 'utf8'))
   const history = JSON.parse(fs.readFileSync(historyPath, 'utf8'))
   const previous = history.releases.at(-1)

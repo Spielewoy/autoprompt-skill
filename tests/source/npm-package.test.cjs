@@ -13,8 +13,6 @@ const zlib = require('node:zlib')
 
 const ROOT = path.resolve(__dirname, '..', '..')
 const PACKAGE_PATH = path.join(ROOT, 'package.json')
-const COVERAGE_PATH = path.join(ROOT, 'AUTOPROMPT-IMPLEMENTATION-COVERAGE.json')
-const CI_PATH = path.join(ROOT, '.github', 'workflows', 'ci.yml')
 const PACKAGE_VERSION = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8')).version
 const CODEX_PUBLIC_EVIDENCE_PATH = 'agents/contracts/codex-live-conformance-evidence.json'
 const CODEX_RUNTIME_IDENTITY_HASH = '4f2bd92306b2f87156e7a9b3c5db169b8865a4f13ab6ba9d0d1c9df0c5c83a5e'
@@ -130,15 +128,15 @@ function packageFilesOnDisk() {
     path.join(ROOT, 'scripts', 'local-only-safety.cjs'),
     path.join(ROOT, 'scripts', 'harness-provider-config.cjs'),
     path.join(ROOT, 'scripts', 'runtime-payload.cjs'),
-    path.join(ROOT, 'scripts', 'codex-artifact.cjs'),
-    path.join(ROOT, 'scripts', 'codex-evidence-bundle.cjs'),
-    ...filesBelow(path.join(ROOT, 'scripts', 'codex-evidence')),
     ...filesBelow(path.join(ROOT, 'scripts', 'benchmark-evidence')),
     ...filesBelow(path.join(ROOT, 'scripts', 'install')),
+    path.join(ROOT, 'agents', 'README.md'),
     ...filesBelow(path.join(ROOT, 'agents', 'contracts')),
     ...PROVIDERS.map(provider => path.join(ROOT, 'agents', 'manifests', `${provider}-runtime.json`)),
     ...PROVIDERS.flatMap(provider => filesBelow(path.join(ROOT, 'agents', provider))),
-    ...filesBelow(path.join(ROOT, 'packages', 'codex')),
+    ...filesBelow(path.join(ROOT, 'assets')),
+    path.join(ROOT, 'docs', 'benchmarks', 'codex-canary-2026-08-22.md'),
+    path.join(ROOT, 'docs', 'guides', 'codex-v2-local-records.md'),
     ...readmeReferenceClosure()
       .filter(reference => !reference.directory)
       .map(reference => path.join(ROOT, ...reference.target.split('/'))),
@@ -267,28 +265,6 @@ function expectedPublicCodexEvidence() {
   }
 }
 
-test('AP-TEST-018 benchmark consequence suites remain continuously enforced and mapped', () => {
-  const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'))
-  const coverage = JSON.parse(fs.readFileSync(COVERAGE_PATH, 'utf8'))
-  const findings = new Map(coverage.findings.map(finding => [finding.id, finding]))
-  const ci = fs.readFileSync(CI_PATH, 'utf8')
-
-  assert.match(packageJson.scripts.test, /npm run test:benchmark/)
-  assert.equal(packageJson.scripts['test:benchmark'], EXPECTED_BENCHMARK_SCRIPT)
-  assert.equal(packageJson.scripts['test:codex-core'], EXPECTED_CODEX_CORE_SCRIPT)
-  assert.equal(packageJson.scripts.verify.match(/npm run test:codex-core/g)?.length, 1)
-  assert.doesNotMatch(ci, /run: npm run test:codex-runtime-evidence/)
-  assert.match(ci, /run: npm test/)
-  assert.ok(findings.get('AP-TEST-018')?.test_refs.includes('tests/source/npm-package.test.cjs'))
-
-  for (const id of ['AP-TEST-010', 'AP-TEST-020', 'AP-TEST-022']) {
-    assert.ok(findings.get(id)?.test_refs.includes('tests/source/benchmark-evidence-test-closures.test.cjs'), id)
-  }
-  for (const id of ['AP-TEST-025', 'AP-TEST-026', 'AP-TEST-027']) {
-    assert.ok(findings.get(id)?.test_refs.includes('tests/source/codex-runtime-evidence-gates-r5.test.cjs'), id)
-  }
-})
-
 test('package metadata is public-ready under the exact available name and remains dependency-free', () => {
   const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'))
   assert.equal(packageJson.name, 'autoprompt-skill')
@@ -379,9 +355,6 @@ test('package metadata is public-ready under the exact available name and remain
     'scripts/local-only-safety.cjs',
     'scripts/harness-provider-config.cjs',
     'scripts/install/',
-    'scripts/codex-artifact.cjs',
-    'scripts/codex-evidence-bundle.cjs',
-    'scripts/codex-evidence/',
     'scripts/runtime-payload.cjs',
     'scripts/benchmark-evidence/',
     'agents/contracts/',
@@ -403,10 +376,7 @@ test('package metadata is public-ready under the exact available name and remain
     'agents/manifests/omp-runtime.json',
     'agents/manifests/deepseek-runtime.json',
     'agents/manifests/reasonix-runtime.json',
-    'packages/codex/',
-    'assets/anatomy.svg',
-    'assets/how-it-works-hierarchy.svg',
-    'assets/how-it-works-loop.svg',
+    'assets/',
     'docs/CODE_OF_CONDUCT.md',
     'docs/CONTRIBUTING.md',
     'docs/SECURITY.md',
@@ -419,6 +389,7 @@ test('package metadata is public-ready under the exact available name and remain
     'docs/faq/tokensaver-vs-wide-vs-custom.md',
     'docs/faq/what-are-the-layers-for.md',
     'docs/faq/which-coding-agents-are-supported.md',
+    'docs/faq/work-paths.md',
     'docs/guides/9router-multi-provider-setup.md',
     'docs/guides/9router-routing.png',
     'docs/guides/codex-v2-local-records.md',

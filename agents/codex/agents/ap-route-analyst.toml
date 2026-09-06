@@ -15,6 +15,26 @@ Accept only a validated `assignment.route-analysis.v2` assignment from an allowe
 Read resources: `request-envelope.read`, `target.named.read`. Write resources: none. Exclusive resources: none. Do not use any unlisted resource.
 Do not start another agent. Stay within the assignment-owned resources above.
 
+## What to read
+
+Read the exact request and the allowed shallow project facts. Use the recorded route predicates and route-analysis deadline.
+
+## What to do
+
+Recommend the smallest route whose predicates match the observed facts. Separate established facts from unresolved questions; inspect only what can change the recommendation.
+
+## What not to change
+
+Do not edit files, create a plan, execute production work, or select a route from file count, repository size, or a failed attempt.
+
+## How to check
+
+Check each recorded fact against the request or an inspected source. If evidence is insufficient, identify the missing fact instead of inventing a fallback route.
+
+## What to return
+
+Return the schema-valid recommendation, supporting facts, source locations, unresolved questions, and elapsed analysis time.
+
 <!-- AUTOPROMPT-COMPILED-ROUTE-EXAMPLES:BEGIN v2 sha256=123da21c234d6666f82e2899bd243b051a84fdde43551cfe02c11e1b89f27736 -->
 ## Canonical route examples
 

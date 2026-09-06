@@ -22,7 +22,7 @@ function writeAtomic(relativePath, content, root = ROOT) {
 }
 
 function readCodexPackageVersion(root = ROOT) {
-  const relativePath = 'packages/codex/package.json'
+  const relativePath = 'scripts/release/codex/package.json'
   if (!fs.existsSync(path.join(root, relativePath))) {
     throw new Error(`Codex package metadata is missing: ${relativePath}`)
   }
@@ -1530,8 +1530,11 @@ function renderCodexPolicyAgent(physicalId, role, rolesContract, policy, plainLa
   const compatibility = (rolesContract.compatibilityAliases || []).find(entry => entry.legacyId === physicalId)
   requireCondition(Boolean(logical || compatibility), `${physicalId} has no canonical logical role source`)
   const guard = policy.instruction_guards.untrusted_input.required_prompt_text
+  const isCompatibilityAlias = role.compatibility_alias?.enabled === true
   const description = normalizePlainLanguageMarkdown(
-    logical?.humanDescription || `Provide the registered read-only compatibility behavior for mode ${compatibility.mode}.`,
+    isCompatibilityAlias
+      ? `Report the compatibility redirect to \`${role.compatibility_alias.alias_of}\`; this retired role cannot perform new work.`
+      : logical.humanDescription,
     plainLanguage,
   ).trim()
   const readResources = role.resource_sets.read.length ? role.resource_sets.read.map(value => `\`${value}\``).join(', ') : 'none'
@@ -1558,6 +1561,19 @@ function renderCodexPolicyAgent(physicalId, role, rolesContract, policy, plainLa
   }
   if (role.compatibility_alias && role.compatibility_alias.enabled) {
     instructions.push('This compatibility identifier is read-only and cannot be activated as a new version 2 role.')
+  } else {
+    for (const [field, heading] of [
+      ['whatToRead', 'What to read'],
+      ['whatToDo', 'What to do'],
+      ['whatNotToChange', 'What not to change'],
+      ['howToCheck', 'How to check'],
+      ['whatToReturn', 'What to return'],
+    ]) {
+      const instruction = logical.instructions?.[field]
+      requireCondition(typeof instruction === 'string' && instruction.trim().length > 0,
+        `${physicalId} is missing canonical role instruction ${field}`)
+      instructions.push('', `## ${heading}`, '', normalizePlainLanguageMarkdown(instruction, plainLanguage).trim())
+    }
   }
   if (overlays.routeExamples) instructions.push('', overlays.routeExamples)
   for (const requirement of overlays.promptRequirements || []) {
@@ -1602,7 +1618,7 @@ function renderCodexSkill(contracts, canonical, routeExamples) {
   return [
     '---',
     'name: autoprompt',
-    "description: 'Explicit-only Codex runtime projection of the Autoprompt contracts.'",
+    "description: 'Run explicitly requested Autoprompt work with task routing, owned assignments, independent checks, and bounded recovery.'",
     'activation: explicit-only',
     'allow-implicit-invocation: false',
     '---',

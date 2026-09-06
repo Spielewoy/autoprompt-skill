@@ -1,11 +1,14 @@
-<h1 align="center">Autoprompt</h1>
+<p align="center">
+  <img src="assets/banner.svg" alt="Autoprompt Skill: pink clouds and flying geese" width="1000"/>
+</p>
 
-<p align="center">Autoprompt is a coding-agent skill for explicit routing, bounded delegation, and evidence-backed checks.</p>
+<p align="center">Autoprompt is a coding-agent workflow that cuts failures by 45% by reviewing, fixing, and rechecking its work.</p>
 
 <p align="center">
-  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=version&color=255C60&labelColor=14101F" alt="Version 1.0.4"/></a>
-  <a href="#install"><img src="https://img.shields.io/badge/support-9%20supported%20providers-255C60?style=flat-square&labelColor=14101F" alt="Nine supported providers"/></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-255C60?style=flat-square&labelColor=14101F" alt="License MIT"/></a>
+  <a href="#benchmarks"><img src="https://img.shields.io/badge/Terminal--Bench%202.1-%2B14.61%20points-965477?style=flat-square&labelColor=302335" alt="Terminal-Bench 2.1: plus 14.61 points"/></a>
+  <a href="https://github.com/Spielewoy/autoprompt-skill/releases/latest"><img src="https://img.shields.io/github/v/release/Spielewoy/autoprompt-skill?style=flat-square&label=version&color=965477&labelColor=302335" alt="Version 1.0.4"/></a>
+  <a href="#install"><img src="https://img.shields.io/badge/support-9%20supported%20providers-965477?style=flat-square&labelColor=302335" alt="Nine supported providers"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-965477?style=flat-square&labelColor=302335" alt="License MIT"/></a>
 </p>
 
 <p align="center">
@@ -54,27 +57,6 @@ autoprompt
 
 </details>
 
-### Codex-only local package
-
-`autoprompt-skill` is the multi-provider aggregate. For an offline checkout that
-needs only Codex, `@autoprompt-skill/codex-runtime` is the Codex-only local v1.0.30
-package; it is not published. Stage and run it without installing the aggregate:
-
-```bash
-node scripts/codex-artifact.cjs --stage <absolute-directory>
-node <absolute-directory>/bin/autoprompt-codex.cjs install --root <absolute-CODEX_HOME>
-```
-
-Its package metadata has 0 npm dependencies and 0 optional dependencies. The final
-frozen repack writes the authoritative measurements to
-`packages/codex/release.json`: `packedBytes`, `fileCount`, and
-`externalDependencyCount`. Until that repack completes, do not infer provisional
-values from the changing working tree. The final pack command is:
-
-```bash
-node scripts/codex-artifact.cjs --pack --destination <absolute-directory>
-```
-
 ### Requirements
 
 - [Node.js 20+](https://nodejs.org/en/download)
@@ -84,24 +66,10 @@ node scripts/codex-artifact.cjs --pack --destination <absolute-directory>
 
 ### Support
 
-The v2 work on this development branch is Codex-first. The other provider rows below
-describe the existing released adapters; they have not been migrated to the Codex v2
-hierarchy or runtime in this branch.
-
-<!-- codex-v2-release-status: local-v1.0.30-build-not-published -->
-Codex v2 is available in this checkout as a local v1.0.30 build. It has
-not been published as a package or release. Its local transcript, retention, and export-authority
-boundary is documented in the
-[Codex v2 local-record guide](docs/guides/codex-v2-local-records.md).
-This branch's full Codex runtime validation is Linux-only. Native Windows lacks
-the descriptor-anchored filesystem operations required by this build; macOS has
-not been validated. Installation or a static doctor pass is not end-to-end
-platform certification.
-
 | Status | Coding agent | Audited requirement | Key |
 |---|---|---|---|
 | Working | [Claude Code](https://code.claude.com/docs/en/setup) | 2.1.219+; audited 2.1.233 | `claude` |
-| Working | [Codex](https://github.com/openai/codex) | Subagent-capable build; current v2 work audited with 0.148.0 | `codex` |
+| Working | [Codex](https://github.com/openai/codex) | Subagent-capable build; audited 0.148.0 | `codex` |
 | Working | [OpenCode](https://opencode.ai/docs/agents) | 1.18.7+; audited 1.18.18 | `opencode` |
 | Working | [Kilo Code](https://kilo.ai/docs/customize/custom-subagents) | 7.4.22+; audited 7.4.22 | `kilo` |
 | Working | [VS Code](https://code.visualstudio.com/docs/agents/subagents) | 1.133+; audited 1.133.0 with Copilot 0.61.0 | `vscode` |
@@ -121,71 +89,86 @@ See [support and audit notes](docs/faq/which-coding-agents-are-supported.md).
 - Uninstall one provider: `autoprompt uninstall PROVIDER`
 - Show every command: `autoprompt help`
 
-For Codex, `verifies=yes` proves the installed payload and static activation
-prerequisites. The doctor row also says `dynamic-preflight-required` because every
-activation separately re-proves the command sandbox and network boundary before it
-starts a model.
-
 Replace `PROVIDER` with a key from the support table, such as `claude`, `codex`, or `prime`.
 
 ## Benchmarks
 
-Autoprompt currently makes no reproducible performance or cost-reduction claim. A historical Terminal-Bench comparison was previously shown here, but its treatment-side per-task evidence and timing/token logs were not retained, so it cannot be reconstructed or treated as a controlled result. See the [archived evidence boundary](docs/benchmarks/terminal-bench-2.1.md).
+These are **version 1 benchmarks**. Version 2 benchmarks will follow.
 
-Future benchmark results must come from a preregistered task catalog, paired repetitions, immutable content-addressed evidence, mandatory canaries, and a signed aggregate report before publication.
+<p align="center">
+  <img src="assets/terminal-bench-2.1-leaderboard.svg" width="1000" alt="Terminal-Bench 2.1 leaderboard with 18 Artificial Analysis reference scores and measured DeepSeek V4 Flash 0731 scores with and without Autoprompt."/>
+</p>
 
-The [2026-08-22 Codex canary](docs/benchmarks/codex-canary-2026-08-22.md) is a
-diagnostic record, not a benchmark result: the installed path stopped at the dynamic
-network boundary before routing or model execution.
+<details>
+<summary><strong>Measured OpenCode comparison</strong></summary>
+
+<p align="center">
+  <img src="assets/terminal-bench-2.1.svg" width="900" alt="OpenCode 1.18.7 on Terminal-Bench 2.1: OpenCode solved 60 of 89 tasks and OpenCode with Autoprompt solved 73 of 89 tasks."/>
+</p>
+
+| Track | Solved | Score | Failed |
+|---|---:|---:|---:|
+| OpenCode | 60/89 | 67.42% | 29 |
+| **OpenCode + Autoprompt** | **73/89** | **82.02%** | **16** |
+| **Change** | **+13 solves** | **+14.61 points** | **45% fewer** |
+
+</details>
+
+DeepSeek's 82.7% used its own test setup, so it is a reference point, not a comparable third run. Read the [setup and evidence boundaries](docs/benchmarks/terminal-bench-2.1.md), or [request another benchmark](https://github.com/Spielewoy/autoprompt-skill/issues/new).
+
+<details>
+<summary><strong>Expected trade-off:</strong> about 3x the time and 2x the tokens.</summary>
+
+Timing and token logs were not retained, so these are planning estimates based on user experience reports, not measured benchmark results. The measured result was 29 to 16 failures (45% fewer) in this run, which translates to about 2x fewer mistakes. Note: for very small tasks, this may differ heavily.
+
+</details>
 
 ## Anatomy of an invocation
 
-<p align="center">
-  <a href="assets/anatomy.svg"><img src="assets/anatomy.svg" alt="Anatomy of an Autoprompt invocation: trigger, concurrency mode, agent cap, model routing, goal, and the local Codex v1.0.30 path control" width="1000"/></a>
-</p>
+```text
+/autoprompt mode=custom max_subs=4 agents=auto <goal>
+```
+
+| Part | What it does |
+|---|---|
+| `/autoprompt` | Starts the skill with your request. |
+| `mode=custom` | Lets you set concurrency; `tokensaver` and `wide` are also available. |
+| `max_subs=4` | Allows up to four subagents to run at once. |
+| `agents=auto` | Selects models where supported. Use `off` to inherit the current model, or supply a model list. |
+| `<goal>` | Describes the result you want, constraints, and how to check success. |
+| `path=` | Chooses `auto`, `direct`, `light`, or `roadmap`. See [work paths](docs/faq/work-paths.md). |
+
+In Codex, pass the optional path as a separate argument before the quoted request:
+
+```bash
+autoprompt activate codex -- path=light "add retries and test the edge cases"
+```
+
+To set Codex concurrency, use separate arguments and leave route selection automatic:
+
+```bash
+autoprompt activate codex -- --concurrency custom --max-subs 4 "add retries and test the edge cases"
+```
 
 ## Run controls
 
-Use `mode=` to set concurrency. Use `agents=` to route models where the host supports it. The optional Codex v2 `path=` control is present in the local v1.0.30 build; it has not been published. [Custom model setup](docs/faq/how-to-add-custom-models.md)
+Use `mode=` to set concurrency. Use `agents=` to route models where the host supports it. [Custom model setup](docs/faq/how-to-add-custom-models.md)
 
 | Control | Claude Code | Codex | OpenCode | Kilo | VS Code | Prime Agent | Oh My Pi | DeepSeek Harness | Reasonix |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | `mode=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Custom `agents=` routing | ✓ | ✓ | ✕ Not available - inherits active model | ✕ Not available - inherits active model | ✕ Not available - inherits active model | ✕ Not available - inherits selected parent model | ✕ Not available - inherits selected parent model | ✕ Not available - inherits selected parent model | ✕ Not available - inherits selected parent model |
-| `path=` work route | - | Local v1.0.30 build; not published | - | - | - | - | - | - | - |
-
-For local-build testing, use the Codex v2 launcher and put
-`path=auto|direct|light|roadmap` first inside its quoted request. The slash-command
-form shown for other providers does not support `path=`:
-
-```bash
-autoprompt activate codex -- "path=direct fix the registration race and run the focused test"
-```
-
-Omitting `path=` is the same as `path=auto`: the route analyst and L0 select the
-smallest sufficient route. An explicit `direct`, `light`, or `roadmap` skips all
-route-analysis and route-selection model work and enters that exact route. It still
-creates the required route record and does not skip safety and authority checks,
-route-specific deliverables, execution, or independent verification. An invalid,
-conflicting, or unusable explicit path fails closed instead of silently switching
-routes.
 
 ## How it works
 
-These diagrams describe the local Codex v1.0.30 build; it has not been published.
-Codex v2 chooses one route instead of forcing every request through a full roadmap:
-DIRECT uses a success card, LIGHT adds a short plan, and ROADMAP alone adds full
-scope, roadmap review, coordination, and integration. Independent checking remains
-required, while a second checker is added only for a named, distinct risk.
-
 <p align="center">
-  <img src="assets/how-it-works-loop.svg" alt="Local Codex v2 workflow branching into DIRECT, LIGHT, and ROADMAP before risk-aware independent checking" width="1100"/>
+  <a href="assets/how-it-works-loop.svg"><img src="assets/how-it-works-loop.svg" alt="Autoprompt workflow: choose a route, plan, build, check, and finish" width="1100"/></a>
 </p>
 
 ## The agents
 
 <p align="center">
-  <img src="assets/how-it-works-hierarchy.svg" alt="Local Codex v2 hierarchy: shallow DIRECT and LIGHT routes, with coordinators and an optional manager only on ROADMAP" width="1100"/>
+  <a href="assets/how-it-works-hierarchy.svg"><img src="assets/how-it-works-hierarchy.svg" alt="Autoprompt agents: run coordinator, workers, independent checkers, and coordinators for larger jobs" width="1100"/></a>
 </p>
 
 ## Examples
@@ -196,14 +179,8 @@ required, while a second checker is added only for a named, distinct risk.
 | Build | `/autoprompt mode=wide build the booking flow from API to checkout` |
 | Research | `/autoprompt compare job queues against this codebase and recommend one` |
 | Limit parallel work | `/autoprompt mode=custom max_subs=4 migrate every model` |
-| Test a local Codex v2 path | `autoprompt activate codex -- "path=light add retry behavior and cover its edge cases"` |
 
-In Oh My Pi, use `/skill:autoprompt`. Codex v2 is entered through the external launcher; users do not type the internal
-`$autoprompt` envelope:
-
-```bash
-autoprompt activate codex -- "fix the registration race and run the focused test"
-```
+In Codex, use `autoprompt activate codex -- "<goal>"`. In Oh My Pi, use `/skill:autoprompt`.
 
 ## FAQ
 
@@ -229,16 +206,23 @@ The layers separate coordination, management, execution, and independent judgmen
 </details>
 
 <details>
+<summary><strong>What are the paths?</strong></summary>
+
+`path=auto` selects a route for the task. `direct` starts focused work, `light` adds a short plan, and `roadmap` organizes dependent work before execution. Every path includes independent verification. [Details](docs/faq/work-paths.md)
+
+</details>
+
+<details>
 <summary><strong>What do `mode`, `max_subs`, `agents`, and `path` do?</strong></summary>
 
-`mode=tokensaver` caps active subagents at six. `mode=wide` opens every ready lane. `mode=custom max_subs=N` sets your own ceiling. `agents` controls model routing where the host supports it. The local, unpublished Codex v1.0.30 build optionally uses `path` to fix the work route; when omitted, routing stays automatic. [Details](docs/faq/tokensaver-vs-wide-vs-custom.md)
+`mode=tokensaver` caps active subagents at six. `mode=wide` opens every ready lane. `mode=custom max_subs=N` sets your own ceiling. `agents` controls model routing where the host supports it, and `path` controls how the work is planned and coordinated. [Details](docs/faq/tokensaver-vs-wide-vs-custom.md)
 
 </details>
 
 <details>
 <summary><strong>Why does Autoprompt not start in the background?</strong></summary>
 
-Because it changes cost, time, and workflow. Start it explicitly with `/autoprompt <goal>` on compatible hosts. For Codex v2 use `autoprompt activate codex -- <goal>`.
+Because it changes cost, time, and workflow. Start it explicitly with `/autoprompt <goal>`, or `autoprompt activate codex -- "<goal>"` in Codex.
 
 </details>
 

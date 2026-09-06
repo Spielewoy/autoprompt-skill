@@ -10,7 +10,14 @@ const test = require('node:test')
 const root = path.resolve(__dirname, '..', '..')
 const castingTool = path.join(root, 'agents', 'codex', 'workflow', 'codex-agent-casting.js')
 const profileTool = path.join(root, 'agents', 'codex', 'workflow', 'codex-agent-profile.js')
-const { deriveProfileLimits } = require('../../agents/codex/workflow/codex-agent-profile.js')
+const { deriveProfileLimits, relativeConfigPath } = require('../../agents/codex/workflow/codex-agent-profile.js')
+
+test('private profile accepts dotted descendants and rejects parent escapes', () => {
+  const profile = path.join(os.tmpdir(), 'autoprompt-profile', 'config.toml')
+  const directory = path.dirname(profile)
+  assert.equal(relativeConfigPath(profile, path.join(directory, '..agents'), 'worker.toml'), '..agents/worker.toml')
+  assert.throws(() => relativeConfigPath(profile, path.dirname(directory), 'worker.toml'), /descendants/)
+})
 
 function runNode(script, args, options = {}) {
   return spawnSync(process.execPath, [script, ...args], {

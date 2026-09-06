@@ -1,13 +1,12 @@
 {
   "name": "@autoprompt-skill/codex-runtime",
-  "version": "1.0.30",
-  "description": "Codex-only Autoprompt runtime and lifecycle CLI.",
+  "version": "1.0.32",
+  "description": "Internal Codex runtime conformance fixture.",
   "private": true,
   "license": "MIT",
   "type": "commonjs",
   "bin": {
-    "autoprompt-codex": "bin/autoprompt-codex.cjs",
-    "autoprompt-codex-evidence": "scripts/codex-evidence-bundle.cjs"
+    "autoprompt-codex": "bin/autoprompt-codex.cjs"
   },
   "engines": {
     "node": ">=20.0.0"

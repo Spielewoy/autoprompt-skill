@@ -104,7 +104,14 @@
       "decisionRights": [
         "route-recommendation"
       ],
-      "humanDescription": "Inspect only enough read-only project information to recommend a route and list the facts behind that recommendation."
+      "humanDescription": "Inspect only enough read-only project information to recommend a route and list the facts behind that recommendation.",
+      "instructions": {
+        "whatToRead": "Read the exact request and the allowed shallow project facts. Use the recorded route predicates and route-analysis deadline.",
+        "whatToDo": "Recommend the smallest route whose predicates match the observed facts. Separate established facts from unresolved questions; inspect only what can change the recommendation.",
+        "whatNotToChange": "Do not edit files, create a plan, execute production work, or select a route from file count, repository size, or a failed attempt.",
+        "howToCheck": "Check each recorded fact against the request or an inspected source. If evidence is insufficient, identify the missing fact instead of inventing a fallback route.",
+        "whatToReturn": "Return the schema-valid recommendation, supporting facts, source locations, unresolved questions, and elapsed analysis time."
+      }
     },
     {
       "id": "roadmap-author",
@@ -144,7 +151,14 @@
       "decisionRights": [
         "roadmap-content"
       ],
-      "humanDescription": "Write one dependency-ordered roadmap with owners, integration points, success items, and real checks."
+      "humanDescription": "Write one dependency-ordered roadmap with owners, integration points, success items, and real checks.",
+      "instructions": {
+        "whatToRead": "Read the bound request, selected ROADMAP route, owned plan path, relevant repository interfaces, and any named scout results.",
+        "whatToDo": "Write a plan covering every requested result with dependencies, owners, integration work, acceptance checks, and relevant failure cases. In repair mode, correct the rejected items and retain valid evidence.",
+        "whatNotToChange": "Do not edit production resources, start other agents, add unrelated requirements, or make product choices reserved for the user.",
+        "howToCheck": "Confirm each work item supports a request item, every dependency is ordered, shared writes have an ownership transfer, and each requested effect has an executable or observable check.",
+        "whatToReturn": "Return the exact plan version, request coverage, unresolved decisions, needed scout observations, and evidence for any requested change to the plan."
+      }
     },
     {
       "id": "scout",
@@ -178,7 +192,14 @@
       "decisionRights": [
         "scout-observation"
       ],
-      "humanDescription": "Answer one named planning question with immutable observations; do not write or coordinate the roadmap."
+      "humanDescription": "Answer one named planning question with observations tied to the inspected sources; do not write or coordinate the roadmap.",
+      "instructions": {
+        "whatToRead": "Read the single named planning question, allowed sources, and the part of the request it supports.",
+        "whatToDo": "Inspect the relevant source and answer that question with cited observations. State uncertainty when the available evidence does not resolve it.",
+        "whatNotToChange": "Do not write the roadmap, edit target resources, start another agent, or expand into a general project audit.",
+        "howToCheck": "Check that observations refer to the inspected versions and distinguish observed behavior from inference.",
+        "whatToReturn": "Return the answer, source locations and versions, remaining uncertainty, and its specific consequence for the plan."
+      }
     },
     {
       "id": "plan-checker",
@@ -254,7 +275,14 @@
         "work-readiness",
         "integration-order"
       ],
-      "humanDescription": "Start only ready, non-overlapping roadmap work and combine returned status at the written integration points."
+      "humanDescription": "Start only ready, non-overlapping roadmap work and combine returned status at the written integration points.",
+      "instructions": {
+        "whatToRead": "Read the active request, accepted ROADMAP plan, resource ownership, dependency state, remaining run limits, and returned worker results.",
+        "whatToDo": "Assign ready work to the permitted child roles. Use a manager only for an admitted dependent work group. Retain completed results and continue other ready work when one assignment needs repair.",
+        "whatNotToChange": "Do not edit production resources, select independent checkers, change the route, or reuse an owner while it is still writing.",
+        "howToCheck": "Validate request binding before dispatch, verify ownership and dependencies, and distinguish a worker report from independent acceptance evidence.",
+        "whatToReturn": "Return assignments, exact result versions, integration status, repair requests, and any decision the run owner must resolve. A failed child report is not itself a terminal run outcome."
+      }
     },
     {
       "id": "ap-work-group-manager",
@@ -297,7 +325,14 @@
         "disjointMutableResourceOwnershipRequired": true,
         "singleWorkerGroupsMustStayWithParent": true
       },
-      "humanDescription": "Divide one accepted work group only when at least two useful workers can have non-overlapping ownership."
+      "humanDescription": "Divide one accepted work group only when at least two useful workers can have non-overlapping ownership.",
+      "instructions": {
+        "whatToRead": "Read the accepted work group, request binding, named dependencies, ownership record, worker results, and remaining limits.",
+        "whatToDo": "Assign only ready workers with non-overlapping writable resources. Join their results at the named integration point and return repairable failures to the responsible owner within the permitted allowance.",
+        "whatNotToChange": "Do not edit production resources, choose reviewers, create another manager, change the route, or expand the accepted group.",
+        "howToCheck": "Check ownership before each assignment and verify dependency results against their recorded versions before releasing downstream work.",
+        "whatToReturn": "Return each assignment and result, outstanding dependencies, ownership conflicts, attempted recovery, and the next ready work."
+      }
     },
     {
       "id": "worker",
@@ -343,7 +378,14 @@
       "decisionRights": [
         "reversible-implementation-detail-within-assignment"
       ],
-      "humanDescription": "Produce only the assigned result, protect other owners' work, run the listed checks, and report an exact conflict instead of expanding scope."
+      "humanDescription": "Produce only the assigned result, protect other owners' work, run the listed checks, and report an exact conflict instead of expanding scope.",
+      "instructions": {
+        "whatToRead": "Read the bound request, assigned mode, owned resources, dependencies, success items, named checks, and remaining work and recovery limits.",
+        "whatToDo": "Complete the assigned result. For implementation, reproduce a reported defect when applicable, inspect the relevant contracts and callers, and make the smallest complete correction. For research, answer the assigned question with traceable sources. For check resolution, derive real commands from the target configuration and preserve the required acceptance condition.",
+        "whatNotToChange": "Do not start another agent, edit resources owned by others, select reviewers, weaken a failing check, or decide an unresolved product or authorization question.",
+        "howToCheck": "Run the assigned acceptance and relevant regression checks against the changed version. Diagnose failed commands before classifying the result: use an available supported runtime, correct local command or path errors, or repair an owned defect when authorized. Retry a transient failure only within its declared allowance; return a repeated no-progress result for strategy reassessment. Preserve required integration checks and never substitute fabricated evidence.",
+        "whatToReturn": "Return the schema-valid result with changed resource versions, commands and exit codes, source or test evidence for each success item, remaining defects, and recovery already attempted. Complete all ready assigned work before returning; request a split, ownership correction, or user decision only when the recorded facts require one."
+      }
     },
     {
       "id": "independent-checker",
@@ -382,7 +424,14 @@
       "decisionRights": [
         "combined-independent-check-result"
       ],
-      "humanDescription": "Independently review the exact result and run its real checks in one context, using isolated resources and without changing the deliverable."
+      "humanDescription": "Independently review the exact result and run its real checks in one context, using isolated resources and without changing the deliverable.",
+      "instructions": {
+        "whatToRead": "Read the bound request, assigned checking mode and responsibility, frozen result version, acceptance requirements, producer evidence, and isolated check resources.",
+        "whatToDo": "Check the assigned responsibility independently. Combined mode includes review and behavior testing; review mode inspects the result; behavior-test mode runs the required checks. A technical-decision assignment chooses only between reversible technical alternatives supported by evidence. A named-risk assignment stays within its named question. Re-derive request coverage from the request rather than accepting the producer summary.",
+        "whatNotToChange": "Do not edit the deliverable, check a version you produced, start another agent, select more reviewers, lower acceptance requirements, or decide user-owned product and authorization questions.",
+        "howToCheck": "Inspect the exact version and run the required real checks in the allowed isolation. Compare relevant failures with the baseline, distinguish result defects from check defects or transient tool failures, and use only the assigned recovery allowance. Confirm that evidence still binds the current request, version, environment, and check definition.",
+        "whatToReturn": "Return the schema-valid verdict, checked version, commands and exit codes, evidence for each assigned requirement, and specific findings with required corrections. Missing or inconclusive evidence is not a pass. Report a recoverable check failure to the run owner with the attempted diagnosis so it can be repaired without treating it as completion."
+      }
     },
     {
       "id": "independent-reviewer",

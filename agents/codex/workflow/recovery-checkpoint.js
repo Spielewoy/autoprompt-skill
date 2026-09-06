@@ -384,7 +384,6 @@ function validateCheckpointPayload(checkpoint) {
       checkpoint.scheduler.completedCheckIds.some((id) => checkpoint.scheduler.openCheckIds.includes(id))) {
     fail('RECOVERY_CHECKPOINT_INVALID', 'completed scheduler work or checks remain ready or open')
   }
-  const operationIds = checkpoint.externalOperations.map((operation) => operation.operationId)
   const idempotencyKeys = checkpoint.externalOperations.map((operation) => operation.idempotencyKey)
   if (new Set(idempotencyKeys).size !== idempotencyKeys.length) fail('RECOVERY_CHECKPOINT_INVALID', 'external idempotency keys must be unique')
   const unresolved = checkpoint.externalOperations.filter((operation) =>

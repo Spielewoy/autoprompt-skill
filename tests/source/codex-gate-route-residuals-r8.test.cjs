@@ -3,7 +3,6 @@
 const assert = require('node:assert/strict')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 
@@ -125,15 +124,38 @@ test('ROUTE-016/018 ALL_WORK_JOINED preserves six graph bindings and both verdic
   assert.equal(records.validateAllWorkJoinedReceipt(tampered).valid, false)
 })
 
-test('GATE-010/024 shipped procedures use one ordinary verifier and conditional debug depth', () => {
-  const frameworkRoot = path.join(ROOT, 'agents', 'contracts', 'frameworks')
-  const doctrine = fs.readFileSync(path.join(frameworkRoot, 'README.md'), 'utf8')
-  assert.match(doctrine, /one independent final verifier owns ordinary completeness/i)
-  assert.match(doctrine, /extra independent-checking seat\s+requires a named distinct risk/i)
-  for (const file of ['backend-fix.md', 'frontend-fix.md']) {
-    const source = fs.readFileSync(path.join(frameworkRoot, file), 'utf8')
-    assert.match(source, /reproduce.*implement.*verify/is)
-    assert.match(source, /wrong-layer evidence.*repeated failure.*cross-module uncertainty/is)
-    assert.doesNotMatch(source, /G1 PLAN\s*[→-]+\s*G3\.5 DEPTH-LOCK/i)
+test('GATE-010/024 debug selection preserves the shipped graph and adds depth only for qualifying evidence', () => {
+  const { parseFrameworkCompiledGates } = require(path.join(ROOT, 'scripts', 'generate-provider-contracts.cjs'))
+  const input = {
+    baseWorkType: 'debug-fix', resultFormat: 'changed-files',
+    artifactOverlays: ['executable-code'], acceptanceOverlays: ['failing-to-passing-behavior'],
+    riskOverlays: [], riskEvidence: {}, route: 'DIRECT',
   }
+  const ordinary = selectWorkRecipe(input)
+  assert.equal(ordinary.status, 'SUPPORTED')
+  assert.deepEqual(ordinary.gateGraph.order, [
+    'success-definition', 'produce-work', 'freeze-version',
+    'independent-check', 'join-check-results', 'final-record',
+  ])
+  assert.ok(ordinary.checks.includes('failing-to-passing-behavior'))
+  assert.equal(ordinary.runtimeGatePlan.triggers.depthProber.required, false)
+  assert.deepEqual(ordinary.runtimeGatePlan.executionPath.controllerDirectives, [])
+  for (const file of ['backend-fix.md', 'frontend-fix.md']) {
+    const source = fs.readFileSync(path.join(ROOT, 'agents', 'codex', 'frameworks', file), 'utf8')
+    assert.deepEqual(parseFrameworkCompiledGates(source).routeGraphs.DIRECT, ordinary.gateGraph)
+  }
+  for (const runtimeSignals of [
+    { wrongLayerEvidence: true }, { repeatedFailureCount: 2 }, { crossModuleUncertainty: true },
+  ]) {
+    const diagnostic = selectWorkRecipe({ ...input, runtimeSignals })
+    assert.equal(diagnostic.status, 'SUPPORTED')
+    assert.equal(diagnostic.runtimeGatePlan.triggers.depthProber.required, true)
+    assert.ok(diagnostic.checks.includes('conditional-wrong-layer-depth-probe'))
+    assert.deepEqual(diagnostic.runtimeGatePlan.executionPath.controllerDirectives,
+      ['product-worker-wrong-layer-inspection'])
+    assert.deepEqual(diagnostic.gateGraph, ordinary.gateGraph)
+    assert.deepEqual(diagnostic.runtimeGatePlan.acceptanceContracts, ordinary.runtimeGatePlan.acceptanceContracts)
+  }
+  assert.equal(selectWorkRecipe({ ...input, runtimeSignals: { repeatedFailureCount: 1 } })
+    .runtimeGatePlan.triggers.depthProber.required, false)
 })

@@ -1,11 +1,19 @@
 # Terminal-Bench 2.1
 
-## Archived status
+These results are for **Autoprompt version 1**. Version 2 benchmarks will follow.
 
-This page records the boundary of a historical comparison; it is not a current performance claim. The treatment-side per-task map, timing logs, and token logs were not retained. The comparison therefore cannot be independently reconstructed, used as a controlled effect, or used to claim a quality or cost-per-solve improvement.
+## Result
+
+| Run | Solved | Failed | Score |
+|---|---:|---:|---:|
+| OpenCode | 60/89 | 29 | 67.42% |
+| OpenCode + Autoprompt | 73/89 | 16 | 82.02% |
+| Change | +13 solves | 13 fewer | +14.61 points |
+
+Both runs used DeepSeek V4 Flash, OpenCode 1.18.7, and the same 89 tasks. Failures fell from 29 to 16, which is 45% fewer.
 
 ## Evidence boundary
 
-The baseline retained task verdicts, but the Autoprompt treatment result retained only an aggregate and cannot be rebuilt task by task. Any future publication must use the repository's signed benchmark-evidence workflow and retain the complete content-addressed task evidence.
+The OpenCode baseline has [all 89 retained task verdicts](https://github.com/Spielewoy/autoprompt-skill/blob/main/benchmark/terminal-bench-2.1/evidence/opencode-deepseek-v4-flash-matched-plain-89/per-task-verdicts.json). The Autoprompt score is the recorded completed aggregate in the [comparison report](https://github.com/Spielewoy/autoprompt-skill/blob/main/benchmark/terminal-bench-2.1/OPENCODE-DEEPSEEK-V4-FLASH-COMPARISON-89.md), but its original per-task map was not retained, so that result cannot be rebuilt task by task.
 
-External benchmark reports using different harnesses or settings are not comparable arms.
+[DeepSeek reported 82.7%](https://api-docs.deepseek.com/updates/#date-2026-07-31) with its own harness and settings. It is an external reference, not a comparable third run.

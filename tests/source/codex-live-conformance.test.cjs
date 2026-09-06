@@ -12,6 +12,8 @@ const test = require('node:test')
 
 const harness = require('../../scripts/benchmark-evidence/codex-live-conformance.cjs')
 const runtimeIdentity = require('../../scripts/codex-runtime-identity.cjs')
+const { pinnedCodexCli } = require('../helpers/pinned-codex-cli.cjs')
+const { pinnedCodexPackageFixture } = require('../helpers/pinned-codex-package.cjs')
 
 const IDENTITY_HASH = 'a'.repeat(64)
 const ROOT = path.resolve(__dirname, '..', '..')
@@ -2149,14 +2151,20 @@ test('Windows Job exceptional policy cleanup cancels and drains before rejection
 test('temporary candidate fixes release version before manifest hashing', {
   timeout: 45_000,
 }, t => {
+  const cli = pinnedCodexCli()
+  if (!cli || path.basename(cli.cliPath) !== 'codex.js') {
+    t.skip('requires locally installed official npm @openai/codex@0.148.0')
+    return
+  }
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-live-conformance-staging-order-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const fixture = pinnedCodexPackageFixture(path.join(root, 'pinned-codex'))
   const layout = harness.isolatedLayout(root)
-  harness.stageTemporaryCandidate(ROOT, layout, process.env)
+  harness.stageTemporaryCandidate(ROOT, layout, fixture.env)
   const destination = path.join(layout.activationHome, 'skills', 'autoprompt')
   const installed = childProcess.spawnSync(process.execPath, [
     'scripts/runtime-payload.cjs', '--install', 'codex', '--destination', destination,
-  ], { cwd: layout.artifact, encoding: 'utf8', timeout: 30_000 })
+  ], { cwd: layout.artifact, env: fixture.env, encoding: 'utf8', timeout: 30_000 })
   assert.equal(installed.status, 0, installed.stderr)
 
   const executableBytes = fs.readFileSync(process.execPath)
@@ -2180,7 +2188,7 @@ test('temporary candidate fixes release version before manifest hashing', {
 
   const refused = childProcess.spawnSync(process.execPath, [
     'scripts/codex-artifact.cjs', '--check',
-  ], { cwd: layout.source, encoding: 'utf8', timeout: 30_000 })
+  ], { cwd: layout.source, env: fixture.env, encoding: 'utf8', timeout: 30_000 })
   assert.equal(refused.status, 1)
   assert.match(refused.stderr, /canonical-live-evidence-invalid|external-attestation-missing/)
   assert.doesNotMatch(refused.stderr, /source hash mismatch/)

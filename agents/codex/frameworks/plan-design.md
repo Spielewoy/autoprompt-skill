@@ -1,65 +1,52 @@
+# Architecture and design decision
 
-# Framework: plan-design  (category plan × subsection design · no tag · tier T2)
+Produce a design for the requested target that an implementer can follow without inventing material decisions.
 
-**You are the L1 SUPERVISOR.** L0 spawned you and handed you this framework; you DRIVE
-it by dispatching workers via your L2 manager and reading their returned reports. The required check
-path itself is opened/extracted for you by a reader-capable role - your L2 manager
-(managers retain Read), or a reader-leaf you spawn on a direct L1→L3 hop; you dispatch
-gates and read the reports they return, but never open the corpus yourself. You never
-decide the design yourself. Goal: produce an architecture/design DECISION for a
-KNOWN target - the buildable blueprint a build framework consumes. Owns no production code.
+## Assignment and control
 
+Use the selected route and its canonical compiled checks. DIRECT and LIGHT use no
+coordinator, manager, or roadmap. ROADMAP execution follows the accepted plan and
+recorded dependencies. Only the run owner selects independent checkers; workers do
+not start other agents. Follow the ownership rules in `composition.md`.
 
-## Layer flow
-- **You (L1):** dispatch the design (L3) then its fresh-verify (L4); never decide it yourself.
-- **L3 executor:** an architect/planner - states options, picks one with tradeoffs,
-  writes the blueprint.
-- **L4 leaf:** fresh-verify the blueprint (default-FAIL).
-- **INDEPENDENCE:** the fresh-verify required check MUST be a different agent-instance than the one that produced the work under review - never a reused context.
-- Negative verdicts loop UP to you.
+## Work and evidence
 
-## THE END-TO-END WORKFLOW
+Read the target system and identify the decisions the request requires. State relevant
+performance, scale, compatibility, interface, and operational constraints. If a necessary
+fact is unknown, perform or request bounded research within the selected route. This
+procedure owns the design result, not production code.
 
-### Phase 1 - FRAME the decision
-State the KNOWN target, its real constraints (performance, scale, compatibility,
-team, deadline-independent quality bar), and the forks that must be decided for a
-builder to proceed without guessing. If the target is actually UNKNOWN → **S1** hand
-to `plan-research`. If it is really "build it now" not "decide it" → **S3** hand to
-the matching build framework.
+Compare feasible alternatives against those constraints and cite the relevant existing
+interfaces. Choose reversible technical alternatives within the assignment's authority;
+return unresolved product or consequential choices to the run owner with the decision
+needed. Do not fabricate a choice to make the design appear complete.
 
-### Phase 2 - ENUMERATE options honestly
-For each fork, lay out the genuine options with their real tradeoffs (not a straw-man
-+ a favorite). Look at the actual code/system the design must fit; cite how each
-option interacts with existing seams.
+Document the selected interfaces, data flow, integration points, error behavior,
+dependencies, and acceptance checks. An independent checker verifies request coverage,
+feasibility, and whether each material decision is supported or explicitly unresolved.
+Repair rejected design items while retaining accepted analysis. Completing a design
+request does not authorize building or deploying it.
 
-### Phase 3 - DECIDE + write the BLUEPRINT
-Pick each option with a stated reason. Emit a buildable blueprint: the interfaces,
-the data flow, the seams, the error/edge behavior, and - explicitly - every fork
-RESOLVED. No "TBD", no "decide at build time" on a load-bearing choice.
+## Recovery and result
 
-### Phase 4 - FRESH-VERIFY (default-FAIL)
-A fresh agent confirms the blueprint actually DECIDES every fork (no hand-waving)
-and is buildable as written → **S5** DONE.
+A failed command starts diagnosis. Check the command, working directory, supported
+runtime, and available dependencies; repair authorized local setup or an owned defect
+within the recorded allowance. A changed result or check invalidates its dependent
+evidence. Repeat those checks before reporting success. Do not weaken tests, conceal
+regressions, or replace a required real result with a simulated pass.
 
-## THE BLOCKED INVARIANT (non-negotiable)
-Verification runs the REAL check in its REAL environment - NEVER fake a pass, NEVER
-fabricate evidence, NEVER declare DONE over a red or un-runnable check. On ANY blocker,
-After bounded diagnosis, a repairable defect returns to its owner. An external,
-authority, environment, or policy blocker terminates with the attempted check, observed
-evidence, and concrete unblock requirement; never fabricate a pass or retry forever.
+Return repairable failures to the responsible owner. A repeated failure with unchanged
+evidence requires strategy reassessment, not equivalent new workers. Preserve valid
+results and all run-wide limits. Report `BLOCKED` only when an external, authority,
+environment, or policy condition still prevents required work after permitted diagnosis
+and recovery; include the command, observed failure, and concrete unblock condition.
+Report an unresolved scope or ownership conflict to the run owner without editing
+unowned resources. Only new route facts justify changing the route.
 
-## Closed decision scenarios (each ends at ONE verdict)
-- **S1 - the target is actually UNKNOWN** → hand to `plan-research`; never invent a
-  target to design against.
-- **S2 - a load-bearing fork is left undecided** → REJECT; re-dispatch DESIGN to close it.
-- **S3 - the work is really to BUILD now** → hand to the matching build framework with
-  this blueprint as input.
-- **S4 - it spans many features needing ordering** → hand to `plan-scope`.
-- **S5 - every fork decided with tradeoffs + buildable + fresh-verify PASS** → DONE.
-
-## Stacking
-ONE L3 track. Typical flow: `plan-design` produces the blueprint, then a build
-framework consumes it as a sequenced track - `composition.md`.
+Return the exact result version, requested items completed, commands and exit codes,
+check evidence, remaining defects, and attempted recovery. The run owner requests
+completion only after every requested result passes its current required checks and
+all working agents have stopped. The deterministic control plane records `DONE`.
 
 <!-- AUTOPROMPT-FRAMEWORK-GATES:BEGIN v2 sha256=b41cfc5bbf3088c61389449ea26a55f47cdbac2bb5c670ea684bd05d615526e1 -->
 ## Generated route checks

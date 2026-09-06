@@ -168,12 +168,13 @@ test('AP-COST-013 governance finalization uses zero model sessions and determini
   assert.deepEqual(cleanupRegistry.load().entries.map(entry => entry.status), ['CLEANED'])
 })
 
-test('AP-COST-017 unsupported economic claims stay withdrawn and publication defaults closed', () => {
+test('AP-COST-017 historical benchmarks remain attributed to v1 and new publication defaults closed', () => {
   const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8')
-  assert.match(readme, /currently makes no reproducible performance or cost-reduction claim/i)
-  assert.match(readme, /signed aggregate report before publication/i)
-  assert.doesNotMatch(readme, /(?:approximately|about|~)\s*3\s*[x×].{0,40}(?:time|faster)/i)
-  assert.doesNotMatch(readme, /(?:approximately|about|~)\s*2\s*[x×].{0,40}tokens?/i)
+  const benchmarkNotes = fs.readFileSync(path.join(ROOT, 'docs/benchmarks/terminal-bench-2.1.md'), 'utf8')
+  assert.match(readme, /version 1 benchmarks/i)
+  assert.match(benchmarkNotes, /Autoprompt version 1/i)
+  assert.match(readme, /Version 2 benchmarks will follow/i)
+  assert.match(readme, /planning estimates[\s\S]*not measured benchmark results/i)
   assert.throws(
     () => assertPublicationReady({}),
     error => error.code === 'PUBLICATION_BLOCKED' &&
@@ -245,8 +246,26 @@ test('AP-GATE-025 bounded refactor is DIRECT after characterization; unresolved 
   })).route, 'LIGHT')
 
   const procedure = fs.readFileSync(path.join(ROOT, 'agents', 'contracts', 'frameworks', 'refactor.md'), 'utf8')
-  assert.match(procedure, /characterization directly to\s+G4/i)
-  assert.match(procedure, /Conditional PLAN the reshape/i)
+  assert.match(procedure, /characterization tests[\s\S]*must pass before the refactor/i)
+  const rolePolicy = new RolePolicy()
+  let deniedRoleSessions = 0
+  for (const route of ['DIRECT', 'LIGHT']) {
+    for (const [parent, child] of [
+      ['run-owner', 'mission-coordinator'],
+      ['mission-coordinator', 'ap-work-group-manager'],
+      ['run-owner', 'roadmap-author'],
+    ]) {
+      assert.throws(() => admitCodexRoleSelection({
+        rolePolicy,
+        selection: { parent, child, route },
+        createChildSession() { deniedRoleSessions += 1 },
+      }), error => error.code === 'ROLE_POLICY_DENIED')
+    }
+    assert.equal(admitCodexRoleSelection({
+      rolePolicy, selection: { parent: 'run-owner', child: 'worker', route },
+    }).policy.child, 'worker')
+  }
+  assert.equal(deniedRoleSessions, 0)
 })
 
 test('AP-GATE-029 framework MISS uses the deterministic compiler and cannot launch legacy generator models', async () => {

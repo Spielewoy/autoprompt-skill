@@ -164,11 +164,26 @@ function runtimeFromPackage(packageRoot, options = {}) {
       ),
       nativeRoot: path.join(root, 'node_modules', ...packageParts),
     },
-    { executable: path.join(root, 'vendor', targetTriple, 'bin', executableName), nativeRoot: null },
   ]
+  // Local npm installs hoist the optional native package beside @openai/codex.
+  // Limit this additional lookup to that exact node_modules scope; do not search
+  // ancestor packages, NODE_PATH, or an unrelated ambient installation.
+  const scopeRoot = path.dirname(root)
+  if (path.basename(root) === 'codex' && path.basename(scopeRoot) === '@openai' &&
+      path.basename(path.dirname(scopeRoot)) === 'node_modules') {
+    const nativeRoot = path.join(scopeRoot, packageParts[1])
+    candidates.push({
+      executable: path.join(nativeRoot, 'vendor', targetTriple, 'bin', executableName),
+      nativeRoot,
+    })
+  }
+  candidates.push({
+    executable: path.join(root, 'vendor', targetTriple, 'bin', executableName), nativeRoot: null,
+  })
   for (const candidate of candidates) {
     const executableBinding = readRegularBound(candidate.executable)
-    if (!executableBinding || !inside(root, executableBinding.realpath)) continue
+    if (!executableBinding ||
+        !inside(candidate.nativeRoot || root, executableBinding.realpath)) continue
     if (platform !== 'win32') {
       try { fs.accessSync(executableBinding.realpath, fs.constants.X_OK) } catch { continue }
     }
@@ -209,6 +224,52 @@ function runtimeFromPackage(packageRoot, options = {}) {
   return null
 }
 
+function runtimeFromStandalonePackage(packageRoot, options = {}) {
+  const platform = options.platform || process.platform
+  const arch = options.arch || process.arch
+  const binding = platformBinding(platform, arch)
+  if (!binding) return null
+  const [, targetTriple, executableName] = binding
+  let root
+  try {
+    const lexical = fs.lstatSync(packageRoot)
+    if (!lexical.isDirectory() || lexical.isSymbolicLink()) return null
+    root = fs.realpathSync.native(packageRoot)
+  } catch {
+    return null
+  }
+  const metadataBinding = readRegularBound(path.join(root, 'codex-package.json'))
+  if (!metadataBinding || !inside(root, metadataBinding.realpath)) return null
+  let metadata
+  try { metadata = JSON.parse(metadataBinding.bytes.toString('utf8')) } catch { return null }
+  if (!metadata || metadata.layoutVersion !== 1 ||
+      typeof metadata.version !== 'string' || !VERSION_PATTERN.test(metadata.version) ||
+      metadata.target !== targetTriple || metadata.variant !== 'codex' ||
+      metadata.entrypoint !== `bin/${executableName}` ||
+      metadata.resourcesDir !== 'codex-resources' || metadata.pathDir !== 'codex-path') return null
+  const executableBinding = readRegularBound(path.join(root, 'bin', executableName))
+  if (!executableBinding || !inside(root, executableBinding.realpath)) return null
+  if (platform !== 'win32') {
+    try { fs.accessSync(executableBinding.realpath, fs.constants.X_OK) } catch { return null }
+  }
+  // Package layout identifies an inert candidate, not an authentic or admitted
+  // executable. Signed provider trust must still bind its exact version and hash.
+  return executableRuntime(executableBinding, {
+    platform,
+    arch,
+    expectedSha256: options.expectedSha256,
+    version: `codex-cli ${metadata.version}`,
+    packageRoot: root,
+    provenance: {
+      kind: 'standalone-package-layout-v1',
+      packageVersion: metadata.version,
+      packageMetadataSha256: sha256(metadataBinding.bytes),
+      targetTriple,
+    },
+    source: 'standalone-package-runtime',
+  })
+}
+
 function pathDirectories(environment) {
   return String(environment.PATH || environment.Path || '')
     .split(path.delimiter)
@@ -216,9 +277,18 @@ function pathDirectories(environment) {
     .filter(Boolean)
 }
 
-function officialPackageRuntime(name, environment, options) {
+function discoverPackageRuntime(name, environment, options) {
   const { platform, arch } = options
   for (const directory of pathDirectories(environment)) {
+    const nativeName = platform === 'win32' ? `${name}.exe` : name
+    const resolvedNative = regularRealFile(path.join(directory, nativeName), { allowLink: true })
+    if (resolvedNative && path.basename(resolvedNative) === nativeName &&
+        path.basename(path.dirname(resolvedNative)) === 'bin') {
+      const runtime = runtimeFromStandalonePackage(path.dirname(path.dirname(resolvedNative)), {
+        platform, arch, expectedSha256: options.expectedSha256,
+      })
+      if (runtime && runtime.executable === resolvedNative) return runtime
+    }
     if (platform === 'win32') {
       for (const wrapperName of [`${name}.cmd`, `${name}.ps1`]) {
         if (!regularRealFile(path.join(directory, wrapperName))) continue
@@ -267,9 +337,9 @@ function resolveCodexExecutable(requested = 'codex', options = {}) {
   }
 
   if (name.includes('/') || name.includes('\\') || name !== 'codex') {
-    fail('Codex executable must be an explicit absolute path or the official package command')
+    fail('Codex executable must be an explicit absolute path or the packaged codex command')
   }
-  const runtime = officialPackageRuntime(name, environment, {
+  const runtime = discoverPackageRuntime(name, environment, {
     platform, arch, expectedSha256: options.expectedSha256,
   })
   if (runtime) return runtime
@@ -284,6 +354,13 @@ function sameIdentity(actual, expected) {
 }
 
 function refreshedRuntime(runtime) {
+  if (runtime.source === 'standalone-package-runtime') {
+    return runtimeFromStandalonePackage(runtime.packageRoot, {
+      platform: runtime.identity.platform,
+      arch: runtime.identity.arch,
+      expectedSha256: runtime.identity.sha256,
+    })
+  }
   if (runtime.source === 'official-package-runtime') {
     return runtimeFromPackage(runtime.packageRoot, {
       platform: runtime.identity.platform,
@@ -315,10 +392,10 @@ function bindingKeys(value, expected) {
 
 function admitCodexExecutable(runtime, expectedIdentity) {
   if (!runtime || !sameIdentity(runtime.identity, expectedIdentity)) {
-    fail('Codex executable candidate does not match the trusted runtime identity')
+    fail('Codex executable does not match the trusted runtime identity')
   }
   const refreshed = refreshedRuntime(runtime)
-  if (!runtimeUnchanged(runtime, refreshed)) fail('Codex executable candidate drifted before admission')
+  if (!runtimeUnchanged(runtime, refreshed)) fail('Codex executable changed before admission')
   const admitted = Object.freeze({ ...refreshed, admitted: true })
   admittedRuntimes.add(admitted)
   return admitted
@@ -353,15 +430,18 @@ function openCodexExecutableAdmission(binding, expectedRuntimeIdentityHash) {
       ]) || binding.identity.realpath !== binding.executable ||
       !HASH_PATTERN.test(binding.identity.sha256 || '') ||
       typeof binding.identity.version !== 'string' || !binding.identity.version ||
-      !['official-package-runtime', 'explicit-configured-runtime'].includes(binding.source)) {
+      !['official-package-runtime', 'standalone-package-runtime',
+        'explicit-configured-runtime'].includes(binding.source)) {
     fail('Signed Codex executable binding is invalid or belongs to different provider trust')
   }
   let runtime
-  if (binding.source === 'official-package-runtime') {
+  if (['official-package-runtime', 'standalone-package-runtime'].includes(binding.source)) {
     if (typeof binding.packageRoot !== 'string' || !path.isAbsolute(binding.packageRoot)) {
       fail('Signed Codex package root is invalid')
     }
-    runtime = runtimeFromPackage(binding.packageRoot, {
+    const fromPackage = binding.source === 'standalone-package-runtime'
+      ? runtimeFromStandalonePackage : runtimeFromPackage
+    runtime = fromPackage(binding.packageRoot, {
       platform: binding.identity.platform,
       arch: binding.identity.arch,
       expectedSha256: binding.identity.sha256,
@@ -458,5 +538,6 @@ module.exports = {
   queryAdmittedCodexVersion,
   resolveCodexExecutable,
   runtimeFromPackage,
+  runtimeFromStandalonePackage,
   withCodexManagedEnvironment,
 }

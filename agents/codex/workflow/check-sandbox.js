@@ -42,8 +42,8 @@ function pathsOverlap(left, right) {
   if (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b) return true
   const ab = path.relative(a, b)
   const ba = path.relative(b, a)
-  return (ab && !ab.startsWith('..') && !path.isAbsolute(ab)) ||
-    (ba && !ba.startsWith('..') && !path.isAbsolute(ba))
+  return (ab !== '' && ab !== '..' && !ab.startsWith(`..${path.sep}`) && !path.isAbsolute(ab)) ||
+    (ba !== '' && ba !== '..' && !ba.startsWith(`..${path.sep}`) && !path.isAbsolute(ba))
 }
 
 function normalizeResource(resource) {
@@ -405,7 +405,8 @@ class TemporarySandboxRegistry {
   cleanup(directory) {
     const resolved = physicalPath(directory)
     const relative = path.relative(this.root, resolved)
-    if (!this._registered.has(resolved) || !relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    if (!this._registered.has(resolved) || !relative || relative === '..' ||
+        relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       throw new CheckSandboxError('UNREGISTERED_SANDBOX', 'cleanup is limited to an exact registered sandbox')
     }
     fs.rmSync(resolved, { recursive: true, force: true })

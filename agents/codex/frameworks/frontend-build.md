@@ -1,82 +1,62 @@
+# New frontend surface
 
-# Framework: frontend-build  (category frontend × subsection build · tag user-facing · tier T2/T3)
+Build the requested UI surface with its screens, states, navigation, and data connections.
 
-**You are the L1 FEATURE-SUPERVISOR.** L0 spawned you and handed you this framework;
-you DRIVE it by dispatching each required check to a fresh L3/L4 worker (via your L2 manager)
-and reading its returned report. The required check path itself is opened/extracted for you by a
-reader-capable role - your L2 manager (managers retain Read), or a reader-leaf you spawn
-on a direct L1→L3 hop; you dispatch gates and read the reports they return, but never
-open the corpus yourself. You never edit or run code yourself. Goal: build a WHOLE
-NEW UI surface/flow from scratch - every screen/state, the journey end-to-end,
-wired and genuinely usable.
+## Assignment and control
 
+Use the selected route and its canonical compiled checks. DIRECT and LIGHT use no
+coordinator, manager, or roadmap. ROADMAP execution follows the accepted plan and
+recorded dependencies. Only the run owner selects independent checkers; workers do
+not start other agents. Follow the ownership rules in `composition.md`.
 
-## Layer flow
-- **You (L1):** drive the required check path (opened for you by your reader-capable L2 manager, or a reader-leaf on a direct hop) - dispatch gates in order, route every verdict.
-- **L2 manager:** builds the assignment, spawns the worker per required check.
-- **L3 executor:** implementer (which may fan to genuinely parallel pieces) plus one
-  independent final verifier for ordinary completeness and rendered usability.
-- **INDEPENDENCE:** extra seats require named distinct risks, oracles, and evidence.
-- Negative verdicts loop UP to you.
+## Work and evidence
 
-## Required check path
-Executable roadmap: IMPLEMENT(TDD) → INDEPENDENT FINAL VERIFY. Insert G1 only for
-the conditional triggers above; tier alone never adds independent-checking seats.
+Map the requested journey, entry and completion points, state transitions, data sources,
+and relevant first-use, loading, empty, error, populated, and responsive states. Use
+ROADMAP dependencies only when that route was selected. Resolve material design or
+product conflicts before dependent work and keep routine decisions consistent with
+the existing design and platform contracts.
 
-## THE END-TO-END WORKFLOW
+Record the real build and test baseline. Build each owned part with behavior tests and
+connect routing, shared state, transitions, and data. Preserve keyboard access, focus
+behavior, accessible roles and labels, and responsive layout. When work is divided,
+name the integration owner and transfer shared resources in order; workers cannot
+start additional agents.
 
-### Phase 1 - ROADMAP / CONDITIONAL PLAN (G1)
-FIRST verify an executable `ROADMAP.md` item exists for this surface; if none exists,
-report OUT-OF-SCOPE and escalate (**S4**). An implementation-ready item skips G1. Run
-G1 only for `requiresDetailedPlan: true`, a named unresolved design fork, or
-`PLAN-CONFLICT`; a genuine design fork routes through **S2** and `plan-design`. When G1
-runs, map the screens and states, end-to-end journey, data/state wiring, responsive and
-accessibility requirements, and build order. Name
-the first-run/empty/error states explicitly - a surface that only handles the happy
-path is not done.
+The independent checker completes the actual journey on the rendered application,
+including relevant error and empty states and supported viewports. Passing isolated
+component tests alone does not prove the requested whole flow works.
 
-### Phase 2 - REQUIRED CHECK-ZERO + BUILD piece by piece (G4, TDD)
-Confirm the project's OWN test/build setup runs (else **S1 BLOCKED**). Build each
-screen/piece TDD within owned files; fan to L4 leaves for genuinely parallel pieces.
-Honor framework + a11y contracts. Coverage to the original request's bar (default 100% of the
-feature's surface) - ≥95% of changed lines is a floor, not the target.
+## Independent checking
 
-### Phase 3 - WIRE THE FLOW
-Wire the journey across pieces as a deliberate step (routing, shared state,
-transitions). The final verifier later checks claims, states, a11y, stubs, and scope.
+One independent checker reviews and tests the frozen result by default. An additional
+checker requires a named distinct risk or responsibility and separate evidence. Check
+the requested behavior, relevant failure cases, and the existing tests of touched
+modules and direct dependents. Compare failures with the recorded baseline; an
+unrelated pre-existing failure is not a new regression. Investigate every new failure
+before acceptance. Meet the request's coverage requirements and the 95% changed-line
+floor for executable code, recording the measurement and any applicable exclusions.
 
-### Phase 4 - INDEPENDENT FINAL VERIFY WHOLE-FLOW
-On the REAL project (returns reproWasRed/reproNowGreen/preExistingRegressions/
-testCommand): the surface's tests pass; pre-existing tests of touched modules +
-dependents stay GREEN; coverage ≥95%; PLUS a real usability pass on the rendered
-FLOW - a persona completes the whole journey across states. Usability blocker →
-**S3-USABILITY**.
-**REGRESSION-IS-A-SIGNAL:** any green→red flip → root-cause and redo the owning
-piece; never weaken/skip.
+## Recovery and result
 
-The final verifier's complete PASS is **S5** DONE.
+A failed command starts diagnosis. Check the command, working directory, supported
+runtime, and available dependencies; repair authorized local setup or an owned defect
+within the recorded allowance. A changed result or check invalidates its dependent
+evidence. Repeat those checks before reporting success. Do not weaken tests, conceal
+regressions, or replace a required real result with a simulated pass.
 
-## THE BLOCKED INVARIANT (non-negotiable)
-Verification runs the REAL check in its REAL environment - NEVER fake a pass, NEVER
-fabricate evidence, NEVER declare DONE over a red or un-runnable check. On ANY blocker,
-After bounded diagnosis, a repairable defect returns to its owner. An external,
-authority, environment, or policy blocker terminates with the attempted check, observed
-evidence, and concrete unblock requirement; never fabricate a pass or retry forever.
+Return repairable failures to the responsible owner. A repeated failure with unchanged
+evidence requires strategy reassessment, not equivalent new workers. Preserve valid
+results and all run-wide limits. Report `BLOCKED` only when an external, authority,
+environment, or policy condition still prevents required work after permitted diagnosis
+and recovery; include the command, observed failure, and concrete unblock condition.
+Report an unresolved scope or ownership conflict to the run owner without editing
+unowned resources. Only new route facts justify changing the route.
 
-## Closed decision scenarios (each ends at ONE verdict)
-- **S1 - real test/build setup cannot run** → BLOCKED.
-- **S2 - design genuinely undecided** → hand to `plan-design` for the blueprint first.
-- **S3 - a pre-existing test flips green→red** → FAILED (regression-is-a-signal: redo).
-  **S3-USABILITY - rendered flow fails the usability pass** → back to G4 with friction named.
-- **S4 - a piece proves bigger/cross-cutting than scoped** → OUT-OF-SCOPE; climb a
-  route under the canonical route-change rules. The L2 manager splits into sibling tracks; no self-split.
-- **S5 - every piece built + flow wired + zero regressions + usability pass +
-  final-verifier PASS** → DONE.
-
-## Stacking
-ONE L3 track (internal L4 fan-out for parallel pieces). A multi-surface original request is
-split in ROADMAP.md into disjoint features, each its own framework as a sibling track -
-`composition.md`.
+Return the exact result version, requested items completed, commands and exit codes,
+check evidence, remaining defects, and attempted recovery. The run owner requests
+completion only after every requested result passes its current required checks and
+all working agents have stopped. The deterministic control plane records `DONE`.
 
 <!-- AUTOPROMPT-FRAMEWORK-GATES:BEGIN v2 sha256=b41cfc5bbf3088c61389449ea26a55f47cdbac2bb5c670ea684bd05d615526e1 -->
 ## Generated route checks

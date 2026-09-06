@@ -1,82 +1,59 @@
+# Behavior-preserving refactor
 
-# Framework: refactor  (category backend/frontend × subsection refactor · no tag · tier T1/T2)
+Make the requested structural improvement while preserving observable behavior.
 
-**You are the L1 FEATURE-SUPERVISOR.** L0 spawned you and handed you this framework;
-you DRIVE it by dispatching each required check to a fresh L3/L4 worker (via your L2 manager)
-and reading its returned report. The required check path itself is opened/extracted for you by a
-reader-capable role - your L2 manager (managers retain Read), or a reader-leaf you spawn
-on a direct L1→L3 hop; you dispatch gates and read the reports they return, but never
-open the corpus yourself. You never edit or run code yourself. Goal: behavior-preserving
-restructuring - reshape the code, remove dead code, improve the seams - with PROVEN
-zero behavior change. Not a fix (no bug is being corrected), not an implement (no new
-capability is being added). If behavior must change, this is the wrong framework.
+## Assignment and control
 
+Use the selected route and its canonical compiled checks. DIRECT and LIGHT use no
+coordinator, manager, or roadmap. ROADMAP execution follows the accepted plan and
+recorded dependencies. Only the run owner selects independent checkers; workers do
+not start other agents. Follow the ownership rules in `composition.md`.
 
-## Layer flow
-- **You (L1):** drive the required check path (opened for you by your reader-capable L2 manager, or a reader-leaf on a direct hop) - dispatch gates in order, route every verdict.
-- **L2 manager:** builds the assignment, spawns the worker per required check.
-- **L3 executor:** implementer characterizes and reshapes; one independent final
-  verifier owns ordinary completeness.
-- **INDEPENDENCE:** an extra seat requires a named distinct risk, check responsibility, and evidence.
-- Negative verdicts (BLOCKED / BEHAVIOR-CHANGED / OUT-OF-SCOPE) loop UP.
+## Work and evidence
 
-## THE END-TO-END WORKFLOW
+Read the existing contracts and establish the behavior to preserve before editing.
+Run relevant existing tests on the unchanged code. Add characterization tests only
+where the current checks leave behavior at risk; they must pass before the refactor.
+Record any known quirks that are part of the current contract.
 
-### Phase 0 - REQUIRED CHECK-ZERO + CHARACTERIZE: pin the CURRENT behavior first
-Confirm the repo's OWN test command runs on untouched code (else **S1 BLOCKED**).
-Then write CHARACTERIZATION tests that capture the current observable behavior of the
-code to be reshaped - including the quirks, before touching anything. These tests must
-pass GREEN on the UNTOUCHED code (they describe what IS, not what should be). This is
-the safety net; a refactor without a characterization net is flying blind → not
-allowed. If current behavior cannot be pinned (untestable seam) → widen the net or
-**S1**.
+Make the assigned structural changes in owned resources, retaining the behavior checks.
+Remove dead code only when evidence establishes it is unused and its removal belongs
+to the requested refactor. If the task actually needs changed behavior, report that
+conflict to the run owner for the appropriate procedure and acceptance requirements.
 
-### Conditional PLAN the reshape (G1)
-Run only for a named unresolved reshape fork, `requiresDetailedPlan: true`, or
-implementer-reported PLAN-CONFLICT. Resolve the named structural choice file-by-file
-while keeping the observable contract identical. Otherwise the executable roadmap
-already supplies the reshape and dispatch proceeds from characterization directly to
-G4. If the plan smuggles a behavior change, it is the wrong framework → **S3**.
+The independent checker compares the structural result with the request and verifies
+that characterization and regression checks still pass. Test results support the
+specific behavior they exercise; do not claim universal equivalence from a finite
+suite. Investigate new failures and correct the refactor instead of rewriting expected
+behavior solely to make the tests pass.
 
-### Phase 1 - IMPLEMENT the reshape (G4, under the pinned net)
-Reshape within owned files only, keeping the characterization tests GREEN at every
-step. Remove the enumerated dead code. Do NOT change observable behavior; do NOT add
-tests for new behavior (there is none). Coverage to the original request's bar (default 100% of
-the feature's surface) - ≥95% of changed lines is a floor, not the target.
+## Independent checking
 
-### Phase 4 - INDEPENDENT FINAL VERIFY ZERO BEHAVIOR CHANGE
-The verifier checks claims versus diff and that characterization tests are unchanged,
-then runs the grounded evidence.
-On the REAL repo (returns reproWasRed/reproNowGreen/preExistingRegressions/
-testCommand): every characterization test stays GREEN (unchanged); the FULL
-pre-existing tests of touched modules + dependents stay GREEN - ZERO green→red flips;
-coverage ≥95% on changed lines.
-**REGRESSION-IS-A-SIGNAL:** here a green→red flip is the whole point of the net - it
-proves behavior CHANGED, which a refactor must not do → root-cause and redo (**S2**);
-never weaken/skip/rewrite the characterization test to make it pass.
+One independent checker reviews and tests the frozen result by default. An additional
+checker requires a named distinct risk or responsibility and separate evidence. Check
+the requested behavior, relevant failure cases, and the existing tests of touched
+modules and direct dependents. Compare failures with the recorded baseline; an
+unrelated pre-existing failure is not a new regression. Investigate every new failure
+before acceptance. Meet the request's coverage requirements and the 95% changed-line
+floor for executable code, recording the measurement and any applicable exclusions.
 
-The final verifier confirms structure improved, dead code is gone, and behavior is
-provably identical (characterization + suite GREEN) → **S5** DONE.
+## Recovery and result
 
-## THE BLOCKED INVARIANT (non-negotiable)
-Verification runs the REAL check in its REAL environment - NEVER fake a pass, NEVER
-fabricate evidence, NEVER declare DONE over a red or un-runnable check. On ANY blocker,
-After bounded diagnosis, a repairable defect returns to its owner. An external,
-authority, environment, or policy blocker terminates with the attempted check, observed
-evidence, and concrete unblock requirement; never fabricate a pass or retry forever.
+A failed command starts diagnosis. Check the command, working directory, supported
+runtime, and available dependencies; repair authorized local setup or an owned defect
+within the recorded allowance. A changed result or check invalidates its dependent
+evidence. Repeat those checks before reporting success. Do not weaken tests, conceal
+regressions, or replace a required real result with a simulated pass.
 
-## Closed decision scenarios (each ends at ONE verdict)
-- **S1 - real test suite cannot run OR current behavior cannot be pinned** → BLOCKED
-  (report attempt + unblock path).
-- **S2 - a characterization or pre-existing test flips green→red** → BEHAVIOR-CHANGED;
-  the reshape altered behavior → root-cause and redo. Never rewrite the test to pass.
-- **S3 - the task actually needs a behavior change** (a fix or a new capability) →
-  wrong framework: route to `<category>-fix` / `<category>-implement`.
-- **S4 - the reshape spans subsystems beyond the owned scope** → OUT-OF-SCOPE; climb a
-  route under the canonical route-change rules.
-- **S5 - structure improved + dead code removed + characterization & suite GREEN +
-  zero behavior change** → DONE.
+Return repairable failures to the responsible owner. A repeated failure with unchanged
+evidence requires strategy reassessment, not equivalent new workers. Preserve valid
+results and all run-wide limits. Report `BLOCKED` only when an external, authority,
+environment, or policy condition still prevents required work after permitted diagnosis
+and recovery; include the command, observed failure, and concrete unblock condition.
+Report an unresolved scope or ownership conflict to the run owner without editing
+unowned resources. Only new route facts justify changing the route.
 
-## Stacking
-ONE L3 track. A cross-surface refactor is split in ROADMAP.md into disjoint-ownership
-features, each its own refactor track - `composition.md`.
+Return the exact result version, requested items completed, commands and exit codes,
+check evidence, remaining defects, and attempted recovery. The run owner requests
+completion only after every requested result passes its current required checks and
+all working agents have stopped. The deterministic control plane records `DONE`.

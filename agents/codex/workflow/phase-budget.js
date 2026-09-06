@@ -99,7 +99,6 @@ const { deriveProfileLimits } = require('./codex-agent-profile.js')
 const {
   executeAdmittedCodex,
   openCodexExecutableAdmission,
-  resolveCodexExecutable,
 } = require('./codex-executable.js')
 const {
   evaluateOutcomes: evaluateCapturedDomainOutcomes,
@@ -6841,14 +6840,6 @@ function codexCompatibilityUsageBound(scheduler, schedulerRequest = {}) {
   return Object.freeze(resolved)
 }
 
-function resolveExecutablePath(command, options = {}) {
-  try {
-    return resolveCodexExecutable(command, options).executable
-  } catch (error) {
-    throw new SupervisorIntegrationError('PROVIDER_UNSUPPORTED', error.message)
-  }
-}
-
 function probeCodexExecCapabilities(options = {}) {
   try {
     const runtime = options.admittedRuntime
@@ -7648,6 +7639,22 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
           'transfer-encoding',
         ]) delete responseHeaders[name]
         response.writeHead(upstreamResponse.statusCode || 502, responseHeaders)
+        let streamFailed = false
+        const failStream = (code, message) => {
+          if (streamFailed) return
+          streamFailed = true
+          recordFailure(code, message)
+          upstreamResponse.destroy()
+          if (!response.destroyed) response.destroy()
+        }
+        // Error bodies can disconnect midway too. Drain the child response
+        // for every content type while retaining the original accounting failure.
+        upstreamResponse.on('error', () => {
+          failStream(
+            'CODEX_QUOTA_PROXY_UPSTREAM_STREAM_FAILED',
+            'bounded child upstream provider stream failed',
+          )
+        })
         const contentType = String(upstreamResponse.headers['content-type'] || '')
         if (!/text\/event-stream/iu.test(contentType)) {
           recordFailure(
@@ -7660,14 +7667,9 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
         const decoder = new StringDecoder('utf8')
         let buffered = ''
         let completedUsageSeen = false
-        let streamFailed = false
-        const failStream = (code, message) => {
-          if (streamFailed) return
-          streamFailed = true
-          recordFailure(code, message)
-          upstreamResponse.destroy()
-          if (!response.destroyed) response.destroy()
-        }
+        const terminalResponseTypes = new Set([
+          'response.completed', 'response.incomplete', 'response.failed',
+        ])
         const forwardFrame = frame => {
           const lines = frame.split(/\r?\n/u)
           const declaredEvent = lines.find(line => line.startsWith('event:'))
@@ -7681,27 +7683,30 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
           try {
             event = JSON.parse(dataLines.map(line => line.slice(5).trimStart()).join('\n'))
           } catch {
-            if (declaredType === 'response.completed') {
+            if (terminalResponseTypes.has(declaredType)) {
               throw new SupervisorIntegrationError(
                 'CODEX_USAGE_INVALID',
-                'Codex quota proxy received an invalid completed response frame',
+                'Codex quota proxy received an invalid terminal response frame',
               )
             }
             response.write(`${frame}\n\n`)
             return
           }
-          if (declaredType === 'response.completed' &&
-              (!event || event.type !== 'response.completed')) {
+          if (terminalResponseTypes.has(declaredType) &&
+              (!event || event.type !== declaredType)) {
             throw new SupervisorIntegrationError(
               'CODEX_USAGE_INVALID',
-              'Codex quota proxy received an inconsistent completed response frame',
+              'Codex quota proxy received an inconsistent terminal response frame',
             )
           }
-          if (event && event.type === 'response.completed') {
+          // Incomplete/failed Responses can carry exact billed usage too.
+          // Settle that evidence without changing their terminal status into
+          // completion; Codex still reports the unsuccessful turn to L0.
+          if (event && terminalResponseTypes.has(event.type)) {
             if (completedUsageSeen || !event.response || !event.response.usage) {
               throw new SupervisorIntegrationError(
                 'CODEX_USAGE_INVALID',
-                'Codex quota proxy requires exactly one completed response with usage',
+                'Codex quota proxy requires exactly one terminal response with usage',
               )
             }
             const delta = codexQuotaProxyUsage(event.response.usage)
@@ -7800,12 +7805,6 @@ async function startCodexCumulativeQuotaProxy(options = {}) {
               error && error.message || 'Codex quota proxy stream ended without valid usage',
             )
           }
-        })
-        upstreamResponse.on('error', () => {
-          failStream(
-            'CODEX_QUOTA_PROXY_UPSTREAM_STREAM_FAILED',
-            'bounded child upstream provider stream failed',
-          )
         })
       })
       upstreamRequests.add(upstreamRequest)
@@ -9448,6 +9447,25 @@ class CodexExecAdapter {
     const parsed = sawStreamedOutput
       ? streamAccumulator.snapshot()
       : parseCodexJsonl(String(execution.stdout || ''))
+    const relayUsageKnown = Boolean(
+      execution && execution.drained === true && cumulativeQuotaSnapshot &&
+      Number.isSafeInteger(cumulativeQuotaSnapshot.providerRequestCount) &&
+      cumulativeQuotaSnapshot.providerRequestCount > 0 &&
+      cumulativeQuotaSnapshot.providerRequestCount === cumulativeQuotaSnapshot.requestCount &&
+      !cumulativeQuotaSnapshot.lastFailure
+    )
+    // A failed CLI turn often omits turn.completed even though the controlled
+    // relay already settled every provider response. Preserve exact accounting
+    // and let the existing bounded transport successor handle that failure.
+    // Pending requests and explicit budget/integrity failures remain unchanged.
+    if (streamError && streamError.code === 'CODEX_USAGE_UNKNOWN_AFTER_START' && relayUsageKnown) {
+      streamError = new SupervisorIntegrationError(
+        'CODEX_CHILD_FAILED',
+        `${record.logicalRole} provider turn failed after exact relay usage settlement`,
+        { ...streamError.details, usageKnown: true, accountingDisposition: 'ALL_PROVIDER_REQUESTS_ACCOUNTED' },
+      )
+      streamError.usage = cumulativeQuotaSnapshot.usage
+    }
     if (streamError && (!committedTerminalResult || callbackFailureRequiresImmediateAbort(streamError))) {
       throw streamError
     }
@@ -9459,7 +9477,7 @@ class CodexExecAdapter {
     if (deferredCallbacks.length > 0) reconcileDeferredCallbacks(parsed)
     if (committedTerminalResult) return withAdapterDegradation(committedTerminalResult)
     if (execution.status !== 0) {
-      const usageKnown = Boolean(parsed.usage && parsed.usageComplete === true)
+      const usageKnown = Boolean(parsed.usage && parsed.usageComplete === true || relayUsageKnown)
       throw new SupervisorIntegrationError(
         usageKnown ? 'CODEX_CHILD_FAILED' : 'CODEX_USAGE_UNKNOWN_AFTER_START',
         `Codex child exited ${execution.status}${usageKnown ? '' : ' without complete terminal usage'}`,

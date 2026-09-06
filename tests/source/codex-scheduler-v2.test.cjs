@@ -1055,6 +1055,9 @@ test('write-producing L4 checks isolate or serialize every realistic resource co
   assert.throws(() => registry.cleanup(directory), (error) => error.code === 'UNREGISTERED_SANDBOX')
   assert.equal(registry.cleanup(registered), true)
   assert.equal(fs.existsSync(registered), false)
+  const dotted = registry.create('..runtime-checker')
+  assert.equal(registry.cleanup(dotted), true)
+  assert.equal(fs.existsSync(dotted), false)
 })
 
 test('fake stream records reasoning diagnostically without double-counting the output ceiling', async () => {
@@ -1269,6 +1272,33 @@ test('sandbox defaults unknown commands to serialized snapshots and rejects nest
     { id: 'nested', commands: ['test'], writeResources: [{ kind: 'workspace', id: nested }] },
   ], { providerCapabilities: SERIAL_PROVIDER_CAPABILITIES })
   assert.equal(collisionPlan.parallel, false)
+})
+
+test('double-dot-prefixed child directories still collide and cannot be checker snapshots', t => {
+  const directory = tempDirectory(t, 'autoprompt-sandbox-dot-prefix-')
+  const workspace = path.join(directory, 'workspace')
+  const nested = path.join(workspace, '..cache')
+  const sibling = path.join(directory, '..separate')
+  fs.mkdirSync(nested, { recursive: true })
+  fs.mkdirSync(sibling)
+  const checker = (id, resource) => ({
+    id, commands: ['test'], writeResources: [{ kind: 'workspace', id: resource }],
+  })
+  const collisionPlan = planCheckerSandboxes([
+    checker('parent', workspace), checker('nested', nested),
+  ], { providerCapabilities: SERIAL_PROVIDER_CAPABILITIES })
+  assert.deepEqual(collisionPlan.batches, [['parent'], ['nested']])
+  assert.throws(() => planCheckerSandboxes([{
+    ...checker('declared-snapshot', workspace), snapshotPath: nested,
+  }], { providerCapabilities: PROVIDER_CAPABILITIES }),
+  (error) => error.code === 'SNAPSHOT_NOT_ISOLATED')
+
+  const isolatedPlan = planCheckerSandboxes([checker('factory-snapshot', workspace)], {
+    providerCapabilities: PROVIDER_CAPABILITIES, isolatedChecking: true,
+  })
+  assert.throws(() => materializeCheckerSandboxes(isolatedPlan, () => nested),
+    (error) => error.code === 'SNAPSHOT_NOT_ISOLATED')
+  assert.equal(materializeCheckerSandboxes(isolatedPlan, () => sibling)[0].snapshotPath, sibling)
 })
 
 test('checker matrix recognizes canonical visual/destructive/external risks', () => {

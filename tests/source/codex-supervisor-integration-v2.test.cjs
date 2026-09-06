@@ -2813,6 +2813,96 @@ test('full runtime keeps provider retry but stops non-authoritative checker evid
   assert.equal(result.scheduler.counters.rejectedByCode.LAUNCH_LIMIT || 0, 0)
 })
 
+test('max_output_tokens through the real relay gets one fresh successor within the explicit budget', async t => {
+  let providerRequests = 0
+  const upstream = http.createServer((request, response) => {
+    request.resume()
+    request.on('end', () => {
+      providerRequests += 1
+      const event = {
+        type: 'response.incomplete',
+        response: {
+          id: 'bounded-incomplete-response', status: 'incomplete',
+          incomplete_details: { reason: 'max_output_tokens' },
+          usage: {
+            input_tokens: 12, input_tokens_details: { cached_tokens: 2 },
+            output_tokens: 16, output_tokens_details: { reasoning_tokens: 3 },
+          },
+        },
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end(`event: response.incomplete\ndata: ${JSON.stringify(event)}\n\n`)
+    })
+  })
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise(resolve => upstream.close(resolve)))
+  const partialCandidate = "module.exports = 'incomplete-response-partial'\n"
+  const fixture = configureRoadmapCompositionHarness(t, [], {
+    completeProduct: true,
+    transportPartialBeforeFailure: partialCandidate,
+    productCheckerCodes: ['PASS'],
+  })
+  fixture.harness.runtimeOptions.modelRegistry = Object.freeze([Object.freeze({
+    ...MODEL_REGISTRY[0], id: 'gpt-5.6-sol',
+  })])
+  fixture.harness.runtimeOptions.budgetController = new BudgetController({
+    limits: { wallMs: 600_000, tokens: 48_000, sessions: 20, launches: 20 },
+    finalizationReserveMs: 10, phases: {},
+    monotonicMs: () => fixture.harness.currentTime(), monotonicClockId: 'test-monotonic',
+  })
+  const adapter = new CodexExecAdapter({
+    targetPath: fixture.harness.runtimeOptions.targetPath,
+    profilePath: path.join(ROOT, 'agents', 'codex', 'autoprompt.config.toml'),
+    providerSchemaRoot: tempDirectory(t, 'autoprompt-incomplete-successor-schema-'),
+    outputSchemaResolver: () => path.join(ROOT, 'agents', 'contracts', 'schemas', 'role-report.schema.json'),
+    cumulativeQuotaProxyFactory: options => startCodexCumulativeQuotaProxy({
+      ...options, upstreamBaseUrl: `http://127.0.0.1:${upstream.address().port}/v1`,
+    }),
+    runner: {
+      async run(spec) {
+        const config = spec.argv.find(value => value.startsWith('model_providers.autoprompt-openai='))
+        const baseUrl = JSON.parse(/base_url=("[^"]+")/u.exec(config)[1])
+        spec.onStdoutLine(JSON.stringify({ type: 'thread.started', thread_id: 'incomplete-worker-session' }))
+        fs.writeFileSync(path.join(spec.cwd, 'src', 'example.js'), partialCandidate)
+        const response = await fetch(`${baseUrl}/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gpt-5.6-sol', input: [], max_output_tokens: 16, stream: true }),
+        })
+        assert.equal(response.status, 200)
+        assert.match(await response.text(), /response.incomplete/u)
+        spec.onStdoutLine(JSON.stringify({ type: 'error', message: 'response incomplete: max_output_tokens' }))
+        spec.onStdoutLine(JSON.stringify({ type: 'turn.failed', error: { message: 'max_output_tokens' } }))
+        return { status: 1, stdout: '', stderr: '', processOwned: true, exactArgv: true, drained: true }
+      },
+      async stop() { return { drained: true } },
+    },
+  })
+  const baseLauncher = fixture.harness.runtimeOptions.launcher
+  fixture.harness.runtimeOptions.launcher = async launch => {
+    if (launch.workItemId !== 'work-1') {
+      if (launch.workItemId === 'work-1-transport-retry-1') {
+        assert.equal(launch.continuationId, null, 'the failed model context is not resumed')
+        assert.equal(launch.providerTokenLimit, 47_972)
+      }
+      return baseLauncher(launch)
+    }
+    fixture.harness.launches.push(launch)
+    return adapter.launch(launch)
+  }
+  const runtime = new CodexSupervisorRuntime(fixture.harness.runtimeOptions)
+  const result = await runtime.start()
+  assert.equal(result.outcome, 'DONE', JSON.stringify(result))
+  assert.deepEqual(fixture.harness.launches.map(item => item.workItemId), [
+    'work-1', 'work-1-transport-retry-1', 'independent-check-1',
+  ])
+  assert.equal(result.budget.tokensUsed, 28)
+  assert.equal(providerRequests, 1)
+  assert.equal(runtime.pendingProviderEnvelopes.size, 0)
+  assert.equal(runtime.childTokenReservations.size, 0)
+  assert.equal(fs.readFileSync(path.join(fixture.harness.runtimeOptions.targetPath, 'src', 'example.js'), 'utf8'),
+    "module.exports = 'work-1-transport-retry-1'\n")
+})
+
 test('accounted default-provider unknown spend gets one fresh worker successor and reaches checking', async t => {
   const partialCandidate = "module.exports = 'unknown-spend-partial'\n"
   const fixture = configureRoadmapCompositionHarness(t, [], {
@@ -14813,6 +14903,9 @@ test('incomplete worker report preserves and promotes the exact owned file-slot 
   fs.chmodSync(implementationPath, 0o751)
   fs.mkdirSync(path.dirname(artifactPath), { recursive: true })
   fs.writeFileSync(artifactPath, artifactBytes)
+  // Fix the source mode explicitly: preservation must not depend on the
+  // developer shell's umask when checking the exact mode below.
+  fs.chmodSync(artifactPath, 0o644)
 
   const admission = manager.inspect(session, {
     allAssignedItemsPass: false,

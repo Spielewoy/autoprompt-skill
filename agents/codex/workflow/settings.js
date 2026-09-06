@@ -2,6 +2,7 @@
 'use strict'
 
 const SETTINGS_SCHEMA = require('../../contracts/schemas/settings.schema.json')
+const { validateJsonSchema } = require('./json-schema-validator.js')
 const SETTINGS_SCHEMA_VERSION = '2.0.0'
 const SETTINGS_SCHEMA_ID = SETTINGS_SCHEMA.$id
 const SETTINGS_PRECEDENCE = Object.freeze(['explicit', 'run', 'saved'])
@@ -35,6 +36,7 @@ function sourceSettings(value) {
 }
 
 function positiveInteger(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null
   if (typeof value === 'string' && !/^\d+$/.test(value.trim())) return null
   const number = typeof value === 'number' ? value : Number(value)
   return Number.isSafeInteger(number) && number > 0 ? number : null
@@ -47,7 +49,7 @@ function concurrencyFrom(value) {
     present: own(source, 'concurrency') || [
       'mode', 'concurrencyMode', 'concurrency_mode', 'maxSubs', 'max_subs',
     ].some(key => own(source, key)),
-    mode: firstOwn(nested, ['mode', 'friendlyName', 'friendly_name']) ??
+    mode: firstOwn(nested, ['mode', 'friendlyMode', 'friendlyName', 'friendly_name']) ??
       firstOwn(source, ['mode', 'concurrencyMode', 'concurrency_mode']),
     maxSubs: firstOwn(nested, [
       'maxSubs', 'max_subs', 'requestedMaxSubs', 'requested_max_subs',
@@ -154,9 +156,7 @@ function normalizeConcurrency(candidate, options, issues) {
   let requestedMax = null
   let effectiveMax
   if (mode === 'tokensaver') {
-    effectiveMax = runtimeMax === null
-      ? TOKENSAVER_MAX_SUBS
-      : Math.min(TOKENSAVER_MAX_SUBS, runtimeMax)
+    effectiveMax = Math.min(TOKENSAVER_MAX_SUBS, runtimeMax)
   } else if (mode === 'wide') {
     effectiveMax = runtimeMax
   } else {
@@ -169,7 +169,7 @@ function normalizeConcurrency(candidate, options, issues) {
       })
       return null
     }
-    effectiveMax = runtimeMax === null ? requestedMax : Math.min(requestedMax, runtimeMax)
+    effectiveMax = Math.min(requestedMax, runtimeMax)
   }
 
   return {
@@ -190,9 +190,14 @@ function modelFields(value) {
   const pins = isObject(nested.pins) ? nested.pins : {}
   const nestedModelPin = isObject(pins.model) ? pins.model.value : pins.model
   const nestedEffortPin = isObject(pins.effort) ? pins.effort.value : pins.effort
+  const canonicalSelector = nested.supported === true &&
+    ['user-pin', 'automatic', ...Object.values(CANONICAL_SOURCES)].includes(nested.selectedBy)
+    ? 'automatic' : undefined
   return {
     selector: firstOwn(nested, ['selector', 'agents', 'mode']) ??
-      firstOwn(source, ['modelRouting', 'model_routing', 'agents', 'modelSelector', 'model_selector']),
+      (!isObject(source.modelRouting) ? source.modelRouting : undefined) ??
+      (!isObject(source.model_routing) ? source.model_routing : undefined) ??
+      firstOwn(source, ['agents', 'modelSelector', 'model_selector']) ?? canonicalSelector,
     model: firstOwn(nested, ['explicitUserModelPin', 'explicit_user_model_pin', 'modelPin', 'model_pin', 'model']) ?? nestedModelPin ??
       firstOwn(source, ['explicitUserModelPin', 'explicit_user_model_pin', 'modelPin', 'model_pin', 'model']),
     effort: firstOwn(nested, ['explicitUserEffortPin', 'explicit_user_effort_pin', 'effortPin', 'effort_pin', 'effort']) ?? nestedEffortPin ??
@@ -266,7 +271,7 @@ function normalizeModelRouting(options, issues) {
     }
   }
 
-  let selector = normalizeNonEmptyString(selected.selector, 'modelRouting.selector', issues)
+  const selector = normalizeNonEmptyString(selected.selector, 'modelRouting.selector', issues)
   const model = normalizeNonEmptyString(selected.model, 'modelRouting.model', issues)
   const effort = normalizeNonEmptyString(selected.effort, 'modelRouting.effort', issues)
 
@@ -274,10 +279,6 @@ function normalizeModelRouting(options, issues) {
     issues.push({ field: 'modelRouting.selector', code: 'MISSING', source: null })
     return null
   }
-  if ((selected.model && selected.model.pin) || (selected.effort && selected.effort.pin)) {
-    selector = 'pinned'
-  }
-
   const modelPinned = Boolean(selected.model && selected.model.pin)
   const effortPinned = Boolean(selected.effort && selected.effort.pin)
   const firstSource = selected.model?.source ?? selected.effort?.source ?? selected.selector?.source
@@ -289,7 +290,7 @@ function normalizeModelRouting(options, issues) {
     ...(effortPinned ? { explicitUserEffortPin: effort } : {}),
     selectedBy: modelPinned || effortPinned
       ? 'user-pin'
-      : (CANONICAL_SOURCES[firstSource] ?? (selector === 'automatic' ? 'automatic' : 'automatic')),
+      : (CANONICAL_SOURCES[firstSource] ?? 'automatic'),
   }
 }
 
@@ -363,77 +364,19 @@ function resolveSettings(options = {}) {
 }
 
 function validateResolvedSettings(settings) {
-  const errors = []
-  if (!isObject(settings) || settings.schemaVersion !== SETTINGS_SCHEMA_VERSION) {
-    errors.push(`schemaVersion must be ${SETTINGS_SCHEMA_VERSION}`)
+  const errors = validateJsonSchema(SETTINGS_SCHEMA, settings).errors.map(
+    error => `${error.path}: ${error.message}`,
+  )
+  if (errors.length > 0) return { valid: false, errors }
+
+  // JSON Schema covers the shape and fixed limits; pins additionally bind two
+  // runtime values, which the bundled schema cannot compare to one another.
+  const routing = settings.modelRouting
+  if (routing.explicitUserModelPin !== undefined && routing.model !== routing.explicitUserModelPin) {
+    errors.push('resolved model must equal explicitUserModelPin')
   }
-  if (!isObject(settings) || typeof settings.providerId !== 'string' || settings.providerId.length === 0) {
-    errors.push('providerId must be present')
-  }
-  if (!isObject(settings) || !['interactive', 'headless'].includes(settings.interactionMode)) {
-    errors.push('interactionMode must be interactive or headless')
-  }
-  const concurrency = isObject(settings) ? settings.concurrency : null
-  if (!concurrency || !CONCURRENCY_MODES.includes(concurrency.friendlyMode)) {
-    errors.push('concurrency.friendlyMode must be tokensaver, wide, or custom')
-  }
-  if (!concurrency || positiveInteger(concurrency.effectiveMaxSubs) === null) {
-    errors.push('concurrency.effectiveMaxSubs must be a positive integer')
-  }
-  if (!concurrency || positiveInteger(concurrency.providerMaximum) === null ||
-      concurrency.effectiveMaxSubs > concurrency.providerMaximum) {
-    errors.push('effectiveMaxSubs cannot exceed providerMaximum')
-  }
-  if (concurrency && concurrency.friendlyMode === 'tokensaver' &&
-      concurrency.effectiveMaxSubs > TOKENSAVER_MAX_SUBS) {
-    errors.push('tokensaver cannot exceed six live subagents')
-  }
-  const pathSelection = isObject(settings) && settings.path !== undefined
-    ? settings.path
-    : { requested: 'auto', mode: 'automatic', exactRoute: null }
-  if (!isObject(pathSelection) || !PATH_VALUES.includes(pathSelection.requested)) {
-    errors.push('path.requested must be auto, direct, light, or roadmap')
-  } else if (pathSelection.requested === 'auto') {
-    if (pathSelection.mode !== 'automatic' || pathSelection.exactRoute !== null) {
-      errors.push('auto path must use automatic mode without an exact route')
-    }
-  } else if (pathSelection.mode !== 'exact' || pathSelection.exactRoute !== pathSelection.requested.toUpperCase()) {
-    errors.push('explicit path must bind its exact canonical route')
-  }
-  const routing = isObject(settings) ? settings.modelRouting : null
-  if (!isObject(routing)) {
-    errors.push('modelRouting must be present, including when unsupported')
-  } else {
-    if (routing.explicitUserModelPin !== undefined && routing.model !== routing.explicitUserModelPin) {
-      errors.push('resolved model must equal explicitUserModelPin')
-    }
-    if (routing.explicitUserEffortPin !== undefined && routing.effort !== routing.explicitUserEffortPin) {
-      errors.push('resolved effort must equal explicitUserEffortPin')
-    }
-    if ((routing.explicitUserModelPin !== undefined || routing.explicitUserEffortPin !== undefined) &&
-        routing.selectedBy !== 'user-pin') {
-      errors.push('explicit pins require selectedBy user-pin')
-    }
-  }
-  if (settings && settings.deadline !== undefined) {
-    const deadline = settings.deadline
-    const keys = isObject(deadline) ? Object.keys(deadline).sort() : []
-    const expectedKeys = [
-      'absoluteDeadline', 'recoveryAndFinalizationReservePercent', 'source', 'verificationReservePercent',
-    ]
-    if (!isObject(deadline) || JSON.stringify(keys) !== JSON.stringify(expectedKeys) ||
-        !Number.isFinite(Date.parse(deadline.absoluteDeadline)) ||
-        !['explicit-invocation', 'task-host', 'product-maximum'].includes(deadline.source) ||
-        !Number.isSafeInteger(deadline.verificationReservePercent) ||
-        deadline.verificationReservePercent < 25 || deadline.verificationReservePercent > 100 ||
-        !Number.isSafeInteger(deadline.recoveryAndFinalizationReservePercent) ||
-        deadline.recoveryAndFinalizationReservePercent < 10 ||
-        deadline.recoveryAndFinalizationReservePercent > 100) {
-      errors.push('deadline must be one canonical absolute deadline with both protected reserves')
-    }
-  }
-  if (!isObject(settings) || Number.isNaN(Date.parse(settings.resolvedAt))) {
-    errors.push('resolvedAt must be a date-time')
+  if (routing.explicitUserEffortPin !== undefined && routing.effort !== routing.explicitUserEffortPin) {
+    errors.push('resolved effort must equal explicitUserEffortPin')
   }
   return { valid: errors.length === 0, errors }
 }

@@ -18,7 +18,7 @@ Read the Autoprompt repository and the tool's official documentation or source. 
 Check every requirement:
 1. Explicit entry: Autoprompt starts only when the user explicitly invokes it. An ordinary task must not start it automatically.
 2. Native discovery: the host loads a stable skill, instruction, plugin, or package entry path.
-3. Named workers: it can expose the provider's declared role set, return each result, and enforce the declared hierarchy directly or through an adapter. Codex v2 currently uses 13 launchable logical child roles represented by 32 physical TOMLs; older adapters retain their 25-role packages until migration.
+3. Named workers: it can expose the provider's declared role set, return each result, and enforce the declared hierarchy directly or through an adapter.
 4. Run controls: it can enforce tokensaver, wide, and custom concurrency plus a harness-specific agent cap.
 5. Worker tools: scoped filesystem access, shell commands, and real test execution are available to workers.
 6. Durable state: run plans, evidence, failures, and resumable state can be stored in the workspace.
