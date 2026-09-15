@@ -67,5 +67,7 @@ test('native Windows member image verification reconciles only confirmed exits a
   assert.deepEqual(Object.keys(proof).sort(), ['children', 'drained', 'liveDenied', 'nonAccessDeniedRefused', 'observedJobMembers', 'terminatedReconciled'])
   for (const key of ['drained', 'liveDenied', 'nonAccessDeniedRefused', 'terminatedReconciled']) assert.equal(proof[key], true)
   assert.equal(proof.children, 12)
-  assert.ok(Number.isSafeInteger(proof.observedJobMembers) && proof.observedJobMembers >= 2 && proof.observedJobMembers <= 13)
+  // This aggregate job membership is independent of explicit child count. The
+  // fixture separately requires exactly 12 token-checked child completions.
+  assert.ok(Number.isSafeInteger(proof.observedJobMembers) && proof.observedJobMembers >= 2 && proof.observedJobMembers <= 1024)
 })

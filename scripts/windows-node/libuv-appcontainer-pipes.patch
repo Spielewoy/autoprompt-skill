@@ -1,0 +1,108 @@
+--- a/deps/uv/src/win/pipe.c
++++ b/deps/uv/src/win/pipe.c
+@@ -106,8 +106,68 @@
+ }
+ 
+ 
+-static void uv__unique_pipe_name(unsigned long long ptr, char* name, size_t size) {
+-  snprintf(name, size, "\\\\?\\pipe\\uv\\%llu-%lu", ptr, GetCurrentProcessId());
++/* Determine authority from the actual token, never an environment flag.
++ * Do not cache: each pipe pair owns one bounded query and closes its token.
++ * Unknown identity must refuse rather than select the unrestricted namespace.
++ */
++static int uv__pipe_is_appcontainer(int* is_appcontainer) {
++  HANDLE token;
++  DWORD value;
++  DWORD returned;
++  DWORD error;
++  int queried;
++
++  token = NULL;
++  value = 0;
++  returned = 0;
++  *is_appcontainer = 0;
++  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
++    error = GetLastError();
++    return error != 0 ? error : ERROR_INVALID_DATA;
++  }
++
++  queried = GetTokenInformation(token,
++                               TokenIsAppContainer,
++                               &value,
++                               sizeof(value),
++                               &returned);
++  error = queried ? 0 : GetLastError();
++  if (!queried && error == 0)
++    error = ERROR_INVALID_DATA;
++  if (queried && (returned != sizeof(value) || value > 1))
++    error = ERROR_INVALID_DATA;
++  if (!CloseHandle(token) && error == 0) {
++    error = GetLastError();
++    if (error == 0)
++      error = ERROR_INVALID_DATA;
++  }
++  if (error != 0)
++    return error;
++
++  *is_appcontainer = value != 0;
++  return 0;
++}
++
++
++static int uv__unique_pipe_name(unsigned long long ptr,
++                               char* name,
++                               size_t size,
++                               int is_appcontainer) {
++  int length;
++
++  /* LOCAL is virtualized by Windows. Keep its generated leaf flat; do not
++   * manufacture a package SID path or rely on a nested NPFS directory.
++   * Preserve the original ordinary-host namespace byte for byte.
++   */
++  length = snprintf(name,
++                    size,
++                    is_appcontainer ? "\\\\.\\pipe\\LOCAL\\uv-%llu-%lu"
++                                    : "\\\\?\\pipe\\uv\\%llu-%lu",
++                    ptr,
++                    GetCurrentProcessId());
++  if (length < 0 || (size_t) length >= size)
++    return ERROR_INSUFFICIENT_BUFFER;
++  return 0;
+ }
+ 
+ 
+@@ -211,9 +271,19 @@
+     char* name, size_t nameSize, unsigned long long random) {
+   HANDLE pipeHandle;
+   int err;
++  int is_appcontainer;
++  unsigned int attempts;
++
++  pipeHandle = INVALID_HANDLE_VALUE;
++  attempts = 0;
++  err = uv__pipe_is_appcontainer(&is_appcontainer);
++  if (err != 0)
++    goto error;
+ 
+   for (;;) {
+-    uv__unique_pipe_name(random, name, nameSize);
++    err = uv__unique_pipe_name(random, name, nameSize, is_appcontainer);
++    if (err != 0)
++      goto error;
+ 
+     pipeHandle = CreateNamedPipeA(name,
+       access | FILE_FLAG_FIRST_PIPE_INSTANCE,
+@@ -229,6 +299,13 @@
+     if (err != ERROR_PIPE_BUSY && err != ERROR_ACCESS_DENIED) {
+       goto error;
+     }
++
++    /* Access denied can also mean unsupported namespace/security, not a
++     * collision. Bound only the AppContainer retry path, preserving the
++     * ordinary-host behavior and the final native error on refusal.
++     */
++    if (is_appcontainer && ++attempts >= 8)
++      goto error;
+ 
+     /* Pipe name collision.  Increment the random number and try again. */
+     random++;

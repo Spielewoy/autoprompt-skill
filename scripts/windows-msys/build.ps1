@@ -8,6 +8,7 @@ param(
   [string]$ShellPath=(Join-Path $PSScriptRoot 'build.sh'),
   [string]$AdaptationPatch,
   [string]$AdaptationSha256,
+  [switch]$CompilePosixFixture,
   [ValidateRange(1,16)][int]$Jobs=2
 )
 Set-StrictMode -Version Latest
@@ -57,6 +58,15 @@ $payload=Join-Path $sdk 'issue27-build'
 [void](New-Item -ItemType Directory -Path (Join-Path $payload 'archives'))
 Write-Utf8Lf (Join-Path $payload 'lock.json') ([IO.File]::ReadAllText($LockPath))
 Write-Utf8Lf (Join-Path $payload 'build.sh') ([IO.File]::ReadAllText($ShellPath))
+if ($CompilePosixFixture) {
+  $fixtureRoot=Join-Path $payload 'posix-fixture'
+  [void](New-Item -ItemType Directory -Path $fixtureRoot)
+  # Git checkout CRLF is normalized deterministically before the fixed source
+  # digest is checked by compile-posix-fixture.sh. No binary text conversion.
+  foreach ($name in @('posix-proof.c','compile-posix-fixture.sh')) {
+    Write-Utf8Lf (Join-Path $fixtureRoot $name) ([IO.File]::ReadAllText((Join-Path $PSScriptRoot $name)))
+  }
+}
 Fetch-Verified $lock.source.url (Join-Path $payload 'source.tar.gz') $lock.source.sha256
 $records=New-Object 'System.Collections.Generic.List[string]'
 foreach ($package in $lock.modes.$Mode.packages) {
@@ -81,4 +91,8 @@ $env:CHERE_INVOKING='1'
 $env:PATH=(Join-Path $sdk 'usr\bin')+';'+(Join-Path $env:SystemRoot 'System32')
 & (Join-Path $sdk 'usr\bin\bash.exe') --noprofile --norc /issue27-build/build.sh $Mode ([string]$Jobs) ([string]$lock.source.sourceDateEpoch) $lock.source.sha256 $lock.sdk.compilerTarget $lock.sdk.configureBuild $lock.sdk.compilerSha256
 if ($LASTEXITCODE -ne 0) { throw 'Isolated proof build failed; preserve output/config.log for diagnosis.' }
+if ($CompilePosixFixture) {
+  & (Join-Path $sdk 'usr\bin\bash.exe') --noprofile --norc /issue27-build/posix-fixture/compile-posix-fixture.sh /issue27-build/posix-fixture/posix-proof.c /issue27-build/posix-compile-fixture
+  if ($LASTEXITCODE -ne 0) { throw 'POSIX fixture compilation failed; retain compiler artifacts.' }
+}
 Write-Output ('Compiler proof staged in '+(Join-Path $payload 'stage')+'. Native behavior and reproducibility remain unverified.')

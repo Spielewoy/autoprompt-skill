@@ -18,13 +18,20 @@ const temporaryRoot = () => fs.realpathSync.native(fs.mkdtempSync(path.join(os.t
 test('built runtime proof accepts one staged digest and rejects ambiguous or escaping manifests', () => {
   const hash = 'a'.repeat(64), valid = `${hash}  stage/usr/bin/msys-2.0.dll\n`
   assert.equal(probe.stagedDigest(Buffer.from(valid)), hash)
+  assert.equal(probe.stagedDigest(Buffer.from(valid.replace('  ', ' *'))), hash)
   for (const bad of ['', valid.trimEnd(), valid.replace('\n', '\r\n'), valid + valid,
-    valid + valid.replace('msys', 'MSYS'), valid.replace('  ', ' *'),
+    valid + valid.replace('msys', 'MSYS'), valid.replace('  ', '**'), valid.replace('  ', ' x'),
+    valid + valid.replace('  ', ' *'),
     valid.replace('usr/bin', 'usr/../bin'), valid.replace('usr/bin', 'usr//bin'),
     valid.replace('msys-2.0.dll', 'other.dll'), valid.replace(hash, hash.toUpperCase()), valid + 'garbage\n']) {
     assert.throws(() => probe.stagedDigest(Buffer.from(bad)))
   }
   assert.throws(() => probe.stagedDigest(Buffer.concat([Buffer.from(valid), Buffer.from([255, 10])])))
+})
+
+test('built runtime proof parses binary checksum records from the actual MSYS compiler artifact', () => {
+  const actual = fs.readFileSync(path.resolve(__dirname, '../../tests/fixtures/windows-msys/compiler-stage.sha256'))
+  assert.equal(probe.stagedDigest(actual), 'da05c7bdf38798149b94410f11dfced7de563f046fd9eeb259d268ce17740747')
 })
 
 test('built runtime proof requires one successful unskipped native test', () => {
@@ -62,7 +69,7 @@ test('built runtime proof refuses oversized and linked inputs and mismatched cap
 // process calls, native ACL setup and PE binding are substituted; the helper's
 // lock/blob/digest/path checks, exclusive copies, manifest and TAP gate execute
 // unchanged. This is not a substitute for the actual Windows Bash smoke test.
-for (const scenario of ['pass', 'missing pinned SDK Git', 'stage mismatch', 'pinned source drift', 'resolver fallback',
+for (const scenario of ['pass', 'binary checksum', 'missing pinned SDK Git', 'stage mismatch', 'pinned source drift', 'resolver fallback',
   'skipped native case', 'failed native case', 'source changed during smoke']) {
   test(`built runtime controller: ${scenario}`, t => {
     const root = temporaryRoot()
@@ -84,7 +91,7 @@ for (const scenario of ['pass', 'missing pinned SDK Git', 'stage mismatch', 'pin
     for (const [name, bytes] of Object.entries(original)) fs.writeFileSync(path.join(bin, name), bytes)
     if (scenario === 'pinned source drift') fs.writeFileSync(path.join(bin, 'msys-2.0.dll'), foreign)
     fs.writeFileSync(path.join(stage, 'msys-2.0.dll'), scenario === 'stage mismatch' ? foreign : built)
-    fs.writeFileSync(path.join(payload, 'stage.sha256'), `${digest(built)}  stage/usr/bin/msys-2.0.dll\n`)
+    fs.writeFileSync(path.join(payload, 'stage.sha256'), `${digest(built)} ${scenario === 'binary checksum' ? '*' : ' '}stage/usr/bin/msys-2.0.dll\n`)
     const beforeSource = fs.readFileSync(path.join(bin, 'msys-2.0.dll'))
     const beforeStage = fs.readFileSync(path.join(stage, 'msys-2.0.dll'))
     const bind = directory => Object.keys(original).map(name => {
@@ -137,7 +144,7 @@ for (const scenario of ['pass', 'missing pinned SDK Git', 'stage mismatch', 'pin
     vm.runInNewContext(fs.readFileSync(helperPath, 'utf8') + '\nmodule.exports.mainForTest = main;\n',
       { require: customRequire, module, __dirname, process: fakeProcess, Buffer }, { filename: helperPath })
     const main = () => module.exports.mainForTest(root)
-    if (scenario === 'pass') main()
+    if (['pass', 'binary checksum'].includes(scenario)) main()
     else assert.throws(main, {
       message: new RegExp({
         'missing pinned SDK Git': 'ENOENT',
@@ -149,7 +156,7 @@ for (const scenario of ['pass', 'missing pinned SDK Git', 'stage mismatch', 'pin
         'source changed during smoke': 'Smoke proof modified SDK source inputs',
       }[scenario]),
     })
-    const launched = ['pass', 'skipped native case', 'failed native case', 'source changed during smoke'].includes(scenario)
+    const launched = ['pass', 'binary checksum', 'skipped native case', 'failed native case', 'source changed during smoke'].includes(scenario)
     assert.equal(state.childCalls, launched ? 1 : 0, 'Failed input verification must prevent the native test')
     assert.deepEqual(fs.readFileSync(path.join(bin, 'msys-2.0.dll')), scenario === 'source changed during smoke' ? foreign : beforeSource)
     assert.deepEqual(fs.readFileSync(path.join(stage, 'msys-2.0.dll')), beforeStage)
@@ -161,7 +168,7 @@ for (const scenario of ['pass', 'missing pinned SDK Git', 'stage mismatch', 'pin
       assert.equal(manifest.sdkCommit, lock.sdk.commit)
       assert.equal(manifest.bashPath, path.join(state.runtime, 'bash.exe'))
     }
-    assert.ok(log.includes(scenario === 'pass' ? 'native Bash smoke passed' : 'Built runtime smoke refused'))
+    assert.ok(log.includes(['pass', 'binary checksum'].includes(scenario) ? 'native Bash smoke passed' : 'Built runtime smoke refused'))
   })
 }
 

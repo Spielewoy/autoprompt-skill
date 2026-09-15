@@ -12,7 +12,7 @@ public static class NodePipeProof {
  public static Int32 Main(String[] args){try{
   Need(args.Length==2,"controller-arguments");String node=Path.GetFullPath(args[0]),worker=Path.GetFullPath(args[1]),directory=Path.GetDirectoryName(node);Need(Path.GetDirectoryName(worker)==directory,"owned-runtime-directory");String nodeHash=Hash(node),workerHash=Hash(worker),profileName="Autoprompt_"+Guid.NewGuid().ToString("N");IntPtr profile=IntPtr.Zero;Boolean created=false,safeToDelete=true;
   try{Need(WindowsAppContainerNative.CreateAppContainerProfile(profileName,profileName,profileName,IntPtr.Zero,0,out profile)>=0,"create-owned-profile");created=true;String package=new SecurityIdentifier(profile).Value;GrantFixture(directory,node,worker,package);var environment=EnvironmentEntries();Environment.SetEnvironmentVariable("LOCALAPPDATA",null,EnvironmentVariableTarget.Process);
-   foreach(String mode in new[]{"inherit","pipe","ipc"}){
+   foreach(String mode in new[]{"inherit","pipe","ipc","ignore"}){
     Need(Hash(node)==nodeHash&&Hash(worker)==workerHash,"worker-bytes-changed");
     safeToDelete=false;
     var result=WindowsAppContainerNative.Launch(node,nodeHash,new[]{"--preserve-symlinks","--preserve-symlinks-main",worker,mode},directory,environment,10000,16384,profile,package,Path.Combine(directory,"never-cancelled-"+mode));

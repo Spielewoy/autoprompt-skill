@@ -140,7 +140,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $patch = (Resolve-Path scripts/windows-msys/pipe-security.patch).Path
           $digest = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
-          ./scripts/windows-msys/build.ps1 -WorkRoot (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof') -Mode proof -AdaptationPatch $patch -AdaptationSha256 $digest -Jobs 4
+          ./scripts/windows-msys/build.ps1 -WorkRoot (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof') -Mode proof -AdaptationPatch $patch -AdaptationSha256 $digest -Jobs 4 -CompilePosixFixture
       - name: Exercise the built MSYS runtime in a private Bash closure
         id: msys-smoke
         if: steps.msys-proof.outcome == 'success'
@@ -148,6 +148,15 @@ jobs:
         shell: pwsh
         run: |
           node scripts/windows-msys/probe-built-runtime.cjs (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify native POSIX IPC and cancellation with the built MSYS runtime
+        id: msys-posix
+        if: steps.msys-smoke.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof'
+          node scripts/windows-msys/probe-posix-runtime.cjs $PWD.Path $work (Join-Path $work 'sdk/issue27-build/posix-compile-fixture')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve the MSYS compiler proof and diagnostics
         if: always() && steps.msys-proof-input.outputs.run == 'true'
@@ -161,6 +170,51 @@ jobs:
             ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/*.sha256
             ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/built-runtime-manifest.json
             ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/stage
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/proof-runtime-*
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/posix-compile-fixture
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/posix-proof-*/results.jsonl
+          if-no-files-found: warn
+      # Compile Node separately from the MSYS worker, within the existing matrix.
+      - name: Detect changes to the Node compiler proof
+        id: node-proof-input
+        if: github.ref == 'refs/heads/codex/issue-27-native-platform-support' && matrix.runner.os == 'windows-latest' && matrix.node == '20.x'
+        shell: pwsh
+        run: |
+          $changed = @(git diff --name-only HEAD^ HEAD -- scripts/windows-node)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "run=$($changed.Count -gt 0)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
+      - name: Compile the isolated Node AppContainer pipe adapter
+        id: node-proof
+        if: steps.node-proof-input.outputs.run == 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test scripts/windows-node/build-boundaries.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/windows-node/build.ps1 -WorkRoot (Join-Path $env:RUNNER_TEMP 'node-compiler-proof')
+      - name: Require exact subprocess roundtrips with the built Node worker
+        id: node-smoke
+        if: steps.node-proof.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'node-compiler-proof/stage'
+          $proof = Get-Content -LiteralPath (Join-Path $stage 'provenance.json') -Raw | ConvertFrom-Json
+          $env:AUTOPROMPT_NODE_PIPE_WORKER = Join-Path $stage 'node.exe'
+          $env:AUTOPROMPT_NODE_PIPE_WORKER_SHA256 = $proof.nodeSha256
+          $env:AUTOPROMPT_NODE_PIPE_REQUIRE_SUPPORT = '1'
+          node --test tests/source/windows-appcontainer-node-pipes.test.cjs 2>&1 | Tee-Object -FilePath (Join-Path $stage 'built-runtime-proof.txt')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve the Node compiler output and native observations
+        if: always() && steps.node-proof-input.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-node-compiler-proof
+          path: |
+            ${{ runner.temp }}/node-compiler-proof/logs
+            ${{ runner.temp }}/node-compiler-proof/stage
+            ${{ runner.temp }}/node-compiler-proof/inputs/build-lock.json
+            ${{ runner.temp }}/node-compiler-proof/inputs/libuv-appcontainer-pipes.patch
           if-no-files-found: warn
       - name: Run platform tests and reject skips of this host's native cases
         run: node tests/helpers/native-platform-ci.cjs platform
@@ -181,8 +235,8 @@ jobs:
           if-no-files-found: warn
       - name: Packed installer lifecycle
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
-      - name: Require native startup and selected MSYS proofs to succeed
-        if: always() && (steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-smoke.outcome == 'failure')
+      - name: Require native startup and selected compiler proofs to succeed
+        if: always() && (steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure')
         run: node -e "process.exit(1)"
 
   claude-native:

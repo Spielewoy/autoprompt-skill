@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "version": "24.20.0",
+  "status": "candidate-not-Windows-built",
+  "source": {
+    "commit": "71b8b174857e25106d39b61a9e6f30d927da8b01",
+    "file": "node-v24.20.0.tar.xz",
+    "url": "https://nodejs.org/dist/v24.20.0/node-v24.20.0.tar.xz",
+    "sha256": "2732fc3f588dd335cd6779c06864f7cd424bb1b5ff9a1743059a66c54f9ca4a1"
+  },
+  "nasm": {
+    "version": "2.16.03",
+    "file": "nasm-2.16.03-win64.zip",
+    "url": "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip",
+    "sha256": "3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6",
+    "executableSha256": "a93276636266516421cc9b422f47476c21f7a2949f1ae251556b2f1d33a3be04"
+  },
+  "patch": {
+    "file": "libuv-appcontainer-pipes.patch",
+    "sha256": "087bfa470adf2a6439c7a2ffa8ca241e657ed634f926eed5b24cfc950e2b7bbb",
+    "originalFileSha256": "a712502b4bc71ad994e1c639fcba386ac1748ab8dcb693038d0203dbdbfe107a",
+    "patchedFileSha256": "f90d8a11e4e2d7162399bb95e1f1fce79003c224d01cb8139d950ec68f42fa95"
+  }
+}

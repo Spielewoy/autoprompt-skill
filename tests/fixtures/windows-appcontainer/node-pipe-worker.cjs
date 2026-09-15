@@ -18,10 +18,10 @@ if (mode === 'ipc-child') {
   // This inherited HANDLE is already open. Synchronous output survives a
   // libuv loop that blocks before spawn/fork can return to JavaScript.
   emit({ stage: phase, mode, node: process.version, uv: process.versions.uv })
-  const wait = child => new Promise((resolve, reject) => {
+  const wait = (child, expectedExit = 0) => new Promise((resolve, reject) => {
     child.once('error', reject)
     child.once('close', (code, signal) => {
-      try { assert.equal(code, 0); assert.equal(signal, null); resolve() } catch (error) { reject(error) }
+      try { assert.equal(code, expectedExit); assert.equal(signal, null); assert.ok(Number.isSafeInteger(child.pid) && child.pid > 0); resolve() } catch (error) { reject(error) }
     })
   })
   ;(async () => {
@@ -29,6 +29,9 @@ if (mode === 'ipc-child') {
     if (mode === 'inherit') {
       const child = cp.spawn(process.execPath, ['-e', "require('node:fs').writeSync(1,'inherit-child\\n');setTimeout(()=>{},100)"], { stdio: 'inherit' })
       await wait(child)
+    } else if (mode === 'ignore') {
+      const child = cp.spawn(process.execPath, ['-e', 'process.exit(17)'], { stdio: 'ignore' })
+      await wait(child, 17)
     } else if (mode === 'pipe') {
       const child = cp.spawn(process.execPath, ['-e', "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{process.stdout.write('pipe:'+input);process.stderr.write('pipe-stderr\\n')})"], { stdio: 'pipe' })
       let stdout = '', stderr = ''
@@ -41,14 +44,14 @@ if (mode === 'ipc-child') {
       assert.equal(stdout, 'pipe:stdin-witness\n')
       assert.equal(stderr, 'pipe-stderr\n')
     } else if (mode === 'ipc') {
-      const child = cp.fork(__filename, ['ipc-child'], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'], execArgv })
+      const child = cp.fork(__filename, ['ipc-child'], { stdio: ['inherit', 'inherit', 'inherit', 'ipc'], execArgv })
       const received = []
       child.on('message', message => { received.push(message); assert.ok(received.length <= 1) })
       child.send({ request: 'ping' })
       await wait(child)
       assert.deepEqual(received, [{ reply: 'pong' }])
     } else throw new Error('unknown mode')
-    emit({ stage: 'passed', mode })
+    emit({ stage: 'passed', mode, children: 1, childExitCode: mode === 'ignore' ? 17 : 0 })
   })().catch(error => {
     emit({ stage: 'failed', mode, phase, code: String(error.code || error.name).slice(0, 80) })
     process.exitCode = 1

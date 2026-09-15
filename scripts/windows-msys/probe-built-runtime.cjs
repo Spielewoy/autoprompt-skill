@@ -44,7 +44,9 @@ function stagedDigest(bytes) {
   assert.ok(Buffer.from(text, 'utf8').equals(bytes) && text.endsWith('\n') && !text.includes('\r'), 'Stage manifest must be complete UTF-8 with LF records')
   const entries = new Map()
   for (const line of text.slice(0, -1).split('\n')) {
-    const match = /^([a-f0-9]{64})  (stage\/[A-Za-z0-9_+./-]+)$/.exec(line)
+    // GNU sha256sum uses a space for text mode and '*' for binary mode.
+    // The pinned MSYS build emits binary-mode records; neither changes the path.
+    const match = /^([a-f0-9]{64}) [ *](stage\/[A-Za-z0-9_+./-]+)$/.exec(line)
     assert.ok(match, 'Invalid stage checksum record')
     const name = match[2]
     assert.ok(!name.split('/').some(part => !part || part === '.' || part === '..'), 'Invalid stage checksum path')

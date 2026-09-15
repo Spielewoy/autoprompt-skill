@@ -11,3 +11,4 @@ scripts/release/codex/** text eol=lf
 agents/contracts/** text eol=lf
 scripts/install/*.json text eol=lf
 scripts/install/codex-discovery-shim.md text eol=lf
+tests/fixtures/windows-msys/compiler-stage.sha256 text eol=lf
