@@ -37,7 +37,18 @@ test('native Windows pipe diagnostic records namespace and descriptor outcomes u
   })
   // Publish bounded observations before assertions so a native failure keeps
   // its evidence in TAP and in the workflow's streamed platform log.
-  t.diagnostic(`MSYS pipe probe: ${JSON.stringify({ status: result.status, stdout: result.stdout?.slice(0, 16384), stderr: result.stderr?.slice(0, 8192) })}`)
+  t.diagnostic(`MSYS pipe probe status: ${result.status}`)
+  // Live CI logs truncate long lines. Preserve every bounded observation on
+  // separate short lines instead of embedding the complete JSON as a string.
+  for (const [stream, bound] of [['stdout', 32768], ['stderr', 8192]]) {
+    const output = String(result[stream] || '').slice(0, bound)
+    if (!output) continue
+    let diagnostic = output
+    try { diagnostic = JSON.stringify(JSON.parse(output), null, 2) } catch {}
+    for (const line of diagnostic.split(/\r?\n/)) {
+      for (let offset = 0; offset < line.length; offset += 512) t.diagnostic(`${stream}: ${line.slice(offset, offset + 512)}`)
+    }
+  }
   assert.ifError(result.error)
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.equal(result.stderr, '')
@@ -62,7 +73,7 @@ test('native Windows pipe diagnostic records namespace and descriptor outcomes u
         continue
       }
       const expanded = observation.expanded
-      assert.deepEqual(Object.keys(expanded).sort(), ['client', 'name', 'parent', 'query', 'relativeName', 'relativeQuery', 'root', 'server'])
+      assert.deepEqual(Object.keys(expanded).sort(), ['client', 'flat', 'name', 'parent', 'query', 'relativeName', 'relativeQuery', 'root', 'server'])
       function succeeded(status) {
         if (status === null) return false
         assert.deepEqual(Object.keys(status).sort(), ['status', 'win32Error'])
@@ -78,11 +89,53 @@ test('native Windows pipe diagnostic records namespace and descriptor outcomes u
       }
       assert.notEqual(expanded.query, null)
       if (!succeeded(expanded.query)) {
-        for (const key of ['name', 'parent', 'root', 'server', 'client', 'relativeQuery', 'relativeName']) assert.equal(expanded[key], null)
+        for (const key of ['name', 'parent', 'root', 'server', 'client', 'relativeQuery', 'relativeName', 'flat']) assert.equal(expanded[key], null)
         continue
       }
       ownedName(expanded.name)
       assert.equal(expanded.parent, expanded.name.slice(0, expanded.name.lastIndexOf('\\') + 1))
+      // The flat proof is independent of whether NPFS exposes a traversable
+      // parent directory. Only the package cell runs it, keeping output bounded.
+      if (descriptor !== 'package') assert.equal(expanded.flat, null)
+      else {
+        const flat = expanded.flat
+        assert.deepEqual(Object.keys(flat).sort(), ['afterClient', 'beforeClient', 'client', 'name', 'query', 'relativeName', 'root', 'server'])
+        assert.equal(typeof flat.relativeName, 'string')
+        assert.ok(flat.relativeName.length > 0 && flat.relativeName.length <= 512)
+        assert.equal(flat.relativeName.startsWith('\\'), false)
+        const intended = '\\Device\\NamedPipe\\' + flat.relativeName
+        ownedName(intended)
+        assert.equal(intended.slice(0, intended.lastIndexOf('\\') + 1), expanded.parent)
+        assert.notEqual(intended, expanded.name, 'Flat proof creates a fresh independently owned name')
+        function waitObservation(value) {
+          assert.deepEqual(Object.keys(value).sort(), ['elapsedMs', 'timeoutMs', 'win32Error'])
+          assert.equal(value.timeoutMs, 50)
+          assert.ok(Number.isSafeInteger(value.elapsedMs) && value.elapsedMs >= 0 && value.elapsedMs <= 15000)
+          assert.ok(Number.isSafeInteger(value.win32Error) && value.win32Error >= 0 && value.win32Error <= 0xffffffff)
+        }
+        assert.notEqual(flat.root, null)
+        if (!succeeded(flat.root)) {
+          for (const key of ['server', 'client', 'query', 'name', 'beforeClient', 'afterClient']) assert.equal(flat[key], null)
+        } else {
+          assert.notEqual(flat.server, null)
+          if (!succeeded(flat.server)) {
+            for (const key of ['client', 'query', 'name', 'beforeClient', 'afterClient']) assert.equal(flat[key], null)
+          } else {
+            // A fresh native server is not assumed to be LISTENING. Record
+            // before/after-client wait codes without manufacturing availability.
+            waitObservation(flat.beforeClient)
+            assert.notEqual(flat.client, null)
+            if (!succeeded(flat.client)) {
+              for (const key of ['query', 'name', 'afterClient']) assert.equal(flat[key], null)
+            } else {
+              waitObservation(flat.afterClient)
+              assert.notEqual(flat.query, null)
+              if (succeeded(flat.query)) { ownedName(flat.name); assert.equal(flat.name, intended) }
+              else assert.equal(flat.name, null)
+            }
+          }
+        }
+      }
       assert.notEqual(expanded.root, null)
       if (!succeeded(expanded.root)) {
         for (const key of ['server', 'client', 'relativeQuery', 'relativeName']) assert.equal(expanded[key], null)

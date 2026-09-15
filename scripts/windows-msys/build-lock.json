@@ -3,7 +3,14 @@
   "status": "metadata-pinned-unbuilt",
   "sdk": {
     "repository": "https://github.com/git-for-windows/git-sdk-64.git",
-    "commit": "e3cc14afd549778c2f2d3bcc6e89307f40f5c2c1"
+    "commit": "e3cc14afd549778c2f2d3bcc6e89307f40f5c2c1",
+    "compilerTarget": "x86_64-pc-cygwin",
+    "configureBuild": "x86_64-pc-cygwin",
+    "compilerSha256": "4bd76635b6053a7926f4579a30f9c800a673632fd10b4d6adf8083d3eda1b80c",
+    "compilerIdentityEvidence": [
+      "Pinned usr/bin/gcc.exe embeds x86_64-pc-cygwin target and --build=x86_64-pc-cygwin configuration.",
+      "Pinned etc/makepkg.conf declares CHOST=x86_64-pc-cygwin; runtime recipe uses --build=${CHOST}."
+    ]
   },
   "source": {
     "commit": "270ba2980700e6e2a0813944d506eecea0f86402",

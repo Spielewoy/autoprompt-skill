@@ -9,8 +9,18 @@
 [CmdletBinding()]
 param([switch]$Request)
 
+$captureClock = [System.Diagnostics.Stopwatch]::StartNew()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$capturePhases = $env:AUTOPROMPT_CAPTURE_PHASES -ceq '1'
+$captureLastPhase = $null
+function Write-CapturePhase([string]$phase) {
+  $script:captureLastPhase = $phase
+  if ($capturePhases) {
+    $elapsed = $captureClock.ElapsedMilliseconds.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:' + $phase + ':' + $elapsed)
+  }
+}
 
 $source = @'
 using System;
@@ -769,23 +779,22 @@ try {
   if (-not $Request) { throw 'request mode required' }
   # Fixed diagnostic phases use stderr only when the bound controller requests
   # them. They never carry paths, request fields, captured bytes, or authority.
-  $capturePhases = $env:AUTOPROMPT_CAPTURE_PHASES -ceq '1'
-  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input') }
+  Write-CapturePhase 'input'
   $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
-  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input-encoding-created') }
+  Write-CapturePhase 'input-encoding-created'
   [Console]::InputEncoding = $strictUtf8
   [Console]::OutputEncoding = $strictUtf8
-  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input-encoding-set') }
+  Write-CapturePhase 'input-encoding-set'
   # Consume at most the closed request cap and one sentinel character.  Do
   # not allocate an attacker-controlled stdin string before rejecting it.
   $maximumRequest = 12 * 1024 * 1024
   $requestText = New-Object System.Text.StringBuilder
   $requestBuffer = New-Object char[] 1024
-  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input-initialized') }
+  Write-CapturePhase 'input-initialized'
   # Separate Console.In initialization from the bounded blocking read itself.
   # Keep the same reader for the complete request; do not change EOF semantics.
   $requestReader = [Console]::In
-  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input-reading') }
+  Write-CapturePhase 'input-reading'
   while ($true) {
     $readLimit = [Math]::Min($requestBuffer.Length, ($maximumRequest + 1) - $requestText.Length)
     $read = $requestReader.Read($requestBuffer, 0, $readLimit)
@@ -793,12 +802,12 @@ try {
     [void]$requestText.Append($requestBuffer, 0, $read)
     if ($requestText.Length -gt $maximumRequest) { throw 'invalid request' }
   }
-  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input-eof') }
+  Write-CapturePhase 'input-eof'
   $raw = $requestText.ToString()
   if ($raw.Length -eq 0) { throw 'invalid request' }
-  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:compile') }
+  Write-CapturePhase 'compile'
   Add-Type -TypeDefinition $source -Language CSharp
-  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:native') }
+  Write-CapturePhase 'compiled'
   [AutopromptWindowsCapture]::ValidateJson($raw)
   $requestObject = $raw | ConvertFrom-Json
   $names = @($requestObject.PSObject.Properties.Name)
@@ -822,7 +831,9 @@ try {
       $transactionMode=[int]$requestObject.mode
       if ($writeExclusive) { if ($requestObject.bytesBase64 -isnot [string]) { throw 'invalid transaction request' }; $transactionBytes=[string]$requestObject.bytesBase64 }
     } elseif ((-not ($requestObject.maxBytes -is [int] -or $requestObject.maxBytes -is [long])) -or $requestObject.maxBytes -ne 67108864) { throw 'invalid transaction request' }
+    Write-CapturePhase 'dispatch'
     $transactionResult=[AutopromptWindowsCapture]::TransactionOperation([string]$requestObject.operation,[string]$requestObject.root,[string[]]$parts,$destinationRoot,[string[]]$destinationParts,$transactionBytes,$transactionMode)
+    Write-CapturePhase 'completed'
     [ordered]@{schemaVersion=1;status='TRANSACTED';operation=$requestObject.operation;result=$transactionResult} | ConvertTo-Json -Compress -Depth 8
     exit 0
   }
@@ -839,15 +850,19 @@ try {
   elseif ($raw.Length -gt 16384 -or (-not ($requestObject.maxBytes -is [int] -or $requestObject.maxBytes -is [long])) -or $requestObject.maxBytes -lt 0 -or $requestObject.maxBytes -gt 67108864) { throw 'invalid request' }
   $components = @($requestObject.components | ForEach-Object { if ($_ -isnot [string]) { throw 'invalid request' }; [string]$_ })
   if ($remove -or $requestObject.operation -ceq 'inspect-owned-target') {
+    Write-CapturePhase 'dispatch'
     if ($remove) { $owned = [AutopromptWindowsCapture]::OwnedOperation([string]$requestObject.operation, [string]$requestObject.root, [string[]]$components, [string]$requestObject.parentIdentity.dev, [string]$requestObject.parentIdentity.ino, [string]$requestObject.targetIdentity.type, [string]$requestObject.targetIdentity.dev, [string]$requestObject.targetIdentity.ino) }
     else { $owned = [AutopromptWindowsCapture]::OwnedOperation([string]$requestObject.operation, [string]$requestObject.root, [string[]]$components, $null, $null, $null, $null, $null) }
+    Write-CapturePhase 'completed'
     if ($remove) { [ordered]@{ schemaVersion = 1; status = 'REMOVED'; removed = $owned.removed } | ConvertTo-Json -Compress }
     else { [ordered]@{ schemaVersion = 1; status = 'INSPECTED'; parentIdentity = $owned.parentIdentity; targetIdentity = $owned.targetIdentity } | ConvertTo-Json -Compress -Depth 8 }
     exit 0
   }
   if ($publish -or $requestObject.operation -ceq 'assert-record-parent' -or $requestObject.operation -ceq 'recover-record-publication') {
     $recordBytes = if ($publish) { [string]$requestObject.bytesBase64 } else { $null }
+    Write-CapturePhase 'dispatch'
     $record = [AutopromptWindowsCapture]::RecordOperation([string]$requestObject.operation, [string]$requestObject.root, [string[]]$components, $recordBytes)
+    Write-CapturePhase 'completed'
     if ($requestObject.operation -ceq 'recover-record-publication') {
       [ordered]@{ schemaVersion = 1; status = 'RECOVERED'; removed = @($record.removed) } | ConvertTo-Json -Compress -Depth 8
       exit 0
@@ -858,15 +873,20 @@ try {
     exit 0
   }
   if ($requestObject.operation -ceq 'tree') {
+    Write-CapturePhase 'dispatch'
     $tree = [AutopromptWindowsCapture]::CaptureTree([string]$requestObject.root, [string[]]$components, [int]$requestObject.maxBytes)
+    Write-CapturePhase 'completed'
     [ordered]@{ schemaVersion = 1; status = 'TREE_CAPTURED'; operation = 'tree'; bytes = $tree.bytes; entries = @($tree.entries) } | ConvertTo-Json -Compress -Depth 8
     exit 0
   }
+  Write-CapturePhase 'dispatch'
   $captured = [AutopromptWindowsCapture]::Capture([string]$requestObject.operation, [string]$requestObject.root, [string[]]$components, [int]$requestObject.maxBytes)
+  Write-CapturePhase 'completed'
   $out = [ordered]@{ schemaVersion = 1; status = 'CAPTURED'; operation = $requestObject.operation; identity = $captured.identity; length = $captured.length; sha256 = $captured.sha256; stat = $captured.stat }
   if ($requestObject.operation -eq 'read') { $out.dataBase64 = $captured.dataBase64 }
   $out | ConvertTo-Json -Compress -Depth 8
 } catch {
+  if ($captureLastPhase -ceq 'dispatch') { Write-CapturePhase 'completed' }
   $code = Get-RefusalCode $_.Exception
   if ([string]::IsNullOrEmpty($code)) { $code = 'FILESYSTEM_REQUEST_INVALID' }
   [ordered]@{ schemaVersion = 1; status = 'REFUSED'; code = $code } | ConvertTo-Json -Compress

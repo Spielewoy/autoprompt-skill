@@ -77,13 +77,13 @@ test('Windows tree protocol refuses unsafe, ambiguous, missing, and unbound entr
 test('Windows wrapper exposes absolute file and tree captures with bounded closed requests', () => {
   const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path')
   const filename = path.resolve(__dirname, '../../agents/codex/workflow/windows-filesystem.js')
-  const calls = [], descriptors = new Map(); let nextDescriptor = 1, invocationOverride
+  const calls = [], descriptors = new Map(); let nextDescriptor = 1, invocationOverride, clock = 0n
   const physicalStat = { isFile: () => true, isSymbolicLink: () => false, dev: 123, ino: 456, mode: 0o100666, nlink: 1, size: 1, mtimeMs: 1, ctimeMs: 1 }
   const fakeFs = { mkdtempSync: () => 'C:\\private-temp', rmSync: () => {}, constants: { O_RDONLY: 0 }, lstatSync: () => physicalStat, realpathSync: { native: value => value },
     openSync: value => { const fd = nextDescriptor++; descriptors.set(fd, value); return fd }, fstatSync: () => physicalStat,
     readSync: (fd, buffer) => { buffer[0] = 97; return 1 }, closeSync: fd => descriptors.delete(fd) }
 
-  const sandbox = { Buffer, process: { platform: 'win32', env: { SystemRoot: 'C:\\Windows', MALICIOUS: 'omitted' } }, __dirname: path.dirname(filename), module: { exports: {} }, require: name => name === 'node:child_process' ? { spawnSync: (...args) => {
+  const sandbox = { Buffer, process: { platform: 'win32', hrtime: { bigint: () => { clock += 30000000000n; return clock } }, env: { SystemRoot: 'C:\\Windows', MALICIOUS: 'omitted' } }, __dirname: path.dirname(filename), module: { exports: {} }, require: name => name === 'node:child_process' ? { spawnSync: (...args) => {
     calls.push(args)
     if (invocationOverride) return invocationOverride
     const request = JSON.parse(args[2].input)
@@ -144,12 +144,16 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
   assert.throws(() => capture.mkdirExclusive('C:\\project\\bad', 0o10000), { code: 'FILESYSTEM_BACKEND_INVALID' })
   assert.throws(() => capture.writeExclusive('C:\\project\\bad', Buffer.alloc(8388610), 0o600), { code: 'FILESYSTEM_BACKEND_INVALID' })
   invocationOverride = { error: { code: 'ETIMEDOUT' }, signal: 'SIGTERM', status: null,
-    stderr: ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile'].map(phase => `AUTOPROMPT_CAPTURE_PHASE:${phase}\r\n`).join(''), stdout: 'private captured data must not be copied into errors' }
+    stderr: ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile'].map((phase, index) => `AUTOPROMPT_CAPTURE_PHASE:${phase}:${index * 2}\r\n`).join(''), stdout: 'private captured data must not be copied into errors' }
   assert.throws(() => capture.captureTree('C:\\project'), error => {
     assert.equal(error.code, 'FILESYSTEM_BACKEND_UNAVAILABLE')
     assert.match(error.message, /compile: ETIMEDOUT/)
     assert.equal(error.details.helperPhase, 'compile')
+    assert.match(error.message, /totalMs=30000; phaseMs=input=0,.*compile=12; unaccountedMs=29988/)
     assert.equal(error.details.timeoutMs, 30000)
+    assert.equal(error.details.invocationElapsedMs, 30000)
+    assert.equal(error.details.phaseElapsedMs.compile, 12)
+    assert.equal(error.details.unaccountedMs, 29988)
     assert.equal(error.details.cause, 'ETIMEDOUT')
     assert.equal(error.details.stderr, '')
     assert.doesNotMatch(JSON.stringify(error), /private captured data/)
@@ -164,24 +168,37 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
   assert.equal(descriptors.size, 0)
 })
 
-test('Windows capture phases strip only the fixed ordered trace and preserve all unexpected stderr', () => {
+test('Windows capture phases accept only bounded monotonic contiguous timing and preserve unexpected stderr', () => {
   const { invocationDiagnostics } = require('../../agents/codex/workflow/windows-filesystem.js')
-  const phases = ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile', 'native']
+  const phases = ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile', 'compiled', 'dispatch', 'completed']
+  const marker = (phase, time) => `AUTOPROMPT_CAPTURE_PHASE:${phase}:${time}\r\n`
   for (let count = 0; count <= phases.length; count++) {
-    const trace = phases.slice(0, count).map(phase => `AUTOPROMPT_CAPTURE_PHASE:${phase}\r\n`).join('')
-    assert.deepEqual(invocationDiagnostics(trace), { helperPhase: count ? phases[count - 1] : 'startup', stderr: '' })
+    const selected = phases.slice(0, count), trace = selected.map((phase, index) => marker(phase, index * 10)).join('')
+    assert.deepEqual(invocationDiagnostics(trace), {
+      helperPhase: count ? phases[count - 1] : 'startup',
+      phaseElapsedMs: Object.fromEntries(selected.map((phase, index) => [phase, index * 10])), stderr: '',
+    })
     assert.equal(invocationDiagnostics(trace + 'compiler error').stderr, 'compiler error')
   }
-  for (const trace of ['AUTOPROMPT_CAPTURE_PHASE:native', 'AUTOPROMPT_CAPTURE_PHASE:input\nAUTOPROMPT_CAPTURE_PHASE:input',
-    'AUTOPROMPT_CAPTURE_PHASE:input:unexpected', 'AUTOPROMPT_CAPTURE_PHASE:compile\0', '\n', '\r\n',
-    'AUTOPROMPT_CAPTURE_PHASE:input', 'AUTOPROMPT_CAPTURE_PHASE:input\n\n',
-    'AUTOPROMPT_CAPTURE_PHASE:input\nnoise\nAUTOPROMPT_CAPTURE_PHASE:compile\n',
-    'AUTOPROMPT_CAPTURE_PHASE:input\nAUTOPROMPT_CAPTURE_PHASE:compile\n',
-    'AUTOPROMPT_CAPTURE_PHASE:input\nAUTOPROMPT_CAPTURE_PHASE:input-reading\n']) {
+  for (const invalid of ['-1', '1.5', 'NaN', 'Infinity', '1e3', '01', '300001', '9999999999999999999', '', '0:extra', ' 1', '1 ']) {
+    const trace = marker('input', invalid)
+    assert.equal(invocationDiagnostics(trace).stderr, trace, 'Malformed elapsed time must remain a refusal')
+  }
+  assert.equal(invocationDiagnostics(marker('input', 300000)).phaseElapsedMs.input, 300000)
+  assert.equal(invocationDiagnostics(marker('input', 3) + marker('input-encoding-created', 3)).stderr, '')
+  const descending = marker('input-encoding-created', 2)
+  assert.deepEqual(invocationDiagnostics(marker('input', 3) + descending), {
+    helperPhase: 'input', phaseElapsedMs: { input: 3 }, stderr: descending,
+  })
+  for (const trace of [marker('native', 0), marker('compiled', 0), marker('input', 0) + marker('input', 1),
+    'AUTOPROMPT_CAPTURE_PHASE:input:0', '\n', '\r\n', marker('input', 0) + '\n',
+    marker('input', 0) + 'noise\n' + marker('compile', 1),
+    marker('input', 0) + marker('compile', 1), marker('input', 0) + marker('input-reading', 1),
+    marker('input', 0) + marker('completed', 1), marker('input', 0).replace('\r\n', '\0\n')]) {
     assert.notEqual(invocationDiagnostics(trace).stderr, '', 'Malformed phase output must still refuse the invocation')
   }
-  assert.deepEqual(invocationDiagnostics('AUTOPROMPT_CAPTURE_PHASE:input\n\nAUTOPROMPT_CAPTURE_PHASE:compile\n'),
-    { helperPhase: 'input', stderr: '\nAUTOPROMPT_CAPTURE_PHASE:compile\n' })
+  assert.deepEqual(invocationDiagnostics(marker('input', 0) + '\n' + marker('compile', 1)),
+    { helperPhase: 'input', phaseElapsedMs: { input: 0 }, stderr: '\n' + marker('compile', 1) })
 })
 
 

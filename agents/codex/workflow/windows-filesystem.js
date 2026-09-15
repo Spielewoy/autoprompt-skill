@@ -19,16 +19,18 @@ class WindowsFilesystemError extends Error {
 }
 function fail(code, message) { throw new WindowsFilesystemError(code, message) }
 function invocationDiagnostics(stderr) {
-  const phases = ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile', 'native']; let index = 0
+  const phases = ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile', 'compiled', 'dispatch', 'completed']
+  const phaseElapsedMs = {}; let index = 0, previous = 0
   let remaining = String(stderr || '')
   for (const phase of phases) {
-    const marker = `AUTOPROMPT_CAPTURE_PHASE:${phase}`
-    const prefix = remaining.startsWith(marker + '\r\n') ? marker + '\r\n' : marker + '\n'
-    if (!remaining.startsWith(prefix)) break
-    remaining = remaining.slice(prefix.length)
-    index++
+    const match = /^AUTOPROMPT_CAPTURE_PHASE:([a-z-]+):(0|[1-9][0-9]{0,5})\r?\n/u.exec(remaining)
+    if (!match || match[1] !== phase) break
+    const elapsed = Number(match[2])
+    if (elapsed > 300000 || elapsed < previous) break
+    phaseElapsedMs[phase] = elapsed; previous = elapsed
+    remaining = remaining.slice(match[0].length); index++
   }
-  return { helperPhase: index ? phases[index - 1] : 'startup', stderr: remaining }
+  return { helperPhase: index ? phases[index - 1] : 'startup', phaseElapsedMs, stderr: remaining }
 }
 function exact(value, keys) { return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key)) }
 function bounded(value, max) { return Number.isSafeInteger(value) && value >= 0 && value <= max }
@@ -246,11 +248,13 @@ function createWindowsFilesystemCapture(options = {}) {
       heldPowerShell = bindPhysical(powershellBinding.path, 'Windows PowerShell', MAX_BYTES, false)
       if (!equalBinding(heldHelper.binding, helperBinding) || !equalBinding(heldPowerShell.binding, powershellBinding)) fail('FILESYSTEM_BACKEND_MISMATCH', 'Windows filesystem runtime changed after binding')
       temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-capture-'))
+      const invocationStarted = process.hrtime.bigint()
       const result = cp.spawnSync(powershellBinding.path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helperBinding.path, '-Request'], {
         input: request, encoding: 'utf8', timeout: 30000, maxBuffer: MAX_OUTPUT_BYTES, windowsHide: true, shell: false,
         cwd: path.win32.dirname(powershellBinding.path),
         env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '', TEMP: temporary, TMP: temporary, AUTOPROMPT_CAPTURE_PHASES: '1' },
       })
+      const invocationElapsedMs = Number((process.hrtime.bigint() - invocationStarted) / 1000000n)
       for (const [held, expected, label, cap, singleLink] of [[heldHelper, helperBinding, 'Windows filesystem helper', 4 * 1024 * 1024, true], [heldPowerShell, powershellBinding, 'Windows PowerShell', MAX_BYTES, false]]) {
         const after = bindPhysical(expected.path, label, cap, singleLink)
         try {
@@ -260,8 +264,15 @@ function createWindowsFilesystemCapture(options = {}) {
       const diagnostic = invocationDiagnostics(result.stderr)
       if (result.error || result.signal || result.status !== 0 || diagnostic.stderr) {
         const cause = typeof result.error?.code === 'string' && /^[A-Z0-9_]{1,40}$/.test(result.error.code) ? result.error.code : `status ${result.status}`
-        throw new WindowsFilesystemError('FILESYSTEM_BACKEND_UNAVAILABLE', `Windows capture helper invocation failed (${diagnostic.helperPhase}: ${cause})`, {
-          stage: 'windows-capture-invocation', helperPhase: diagnostic.helperPhase, status: result.status,
+        const unaccountedMs = Math.max(0, invocationElapsedMs - (diagnostic.phaseElapsedMs[diagnostic.helperPhase] || 0))
+        const timings = Object.entries(diagnostic.phaseElapsedMs).map(([phase, elapsed]) => `${phase}=${elapsed}`).join(',') || 'none'
+        throw new WindowsFilesystemError('FILESYSTEM_BACKEND_UNAVAILABLE', `Windows capture helper invocation failed (${diagnostic.helperPhase}: ${cause}; totalMs=${invocationElapsedMs}; phaseMs=${timings}; unaccountedMs=${unaccountedMs})`, {
+          stage: 'windows-capture-invocation', helperPhase: diagnostic.helperPhase, phaseElapsedMs: diagnostic.phaseElapsedMs,
+          invocationElapsedMs,
+          // Includes startup before the script clock and work since the last
+          // marker; it cannot identify either interval independently.
+          unaccountedMs,
+          status: result.status,
           cause: result.error?.code, signal: result.signal, timeoutMs: 30000, stderr: diagnostic.stderr.slice(0, 2048),
         })
       }

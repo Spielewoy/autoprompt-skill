@@ -90,3 +90,45 @@ if(!$refused){throw 'Bare CR accepted'}
   assert.equal(checked.status, 0, checked.stderr || checked.stdout)
   assert.match(checked.stdout, /boundary-ok\n$/)
 })
+
+test('the pinned MSYS compiler target accepts exactly LF or CRLF and reports bounded failures', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'msys-target-boundary-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const bash = process.platform === 'win32'
+    ? require('../../agents/codex/workflow/windows-appcontainer-command.js').resolveWindowsBash().bash.path
+    : 'bash'
+  const environment = { ...process.env, LC_ALL: 'C' }
+  if (process.platform === 'win32') environment.PATH = path.dirname(bash) + ';' + (process.env.PATH || process.env.Path || '')
+  const source = fs.readFileSync(path.join(__dirname, 'build.sh'), 'utf8')
+  const definitions = ['build_failed', 'assert_compiler_target'].map(name => {
+    const match = source.match(new RegExp(`^${name}\\(\\) \\{\\n[\\s\\S]*?^\\}`, 'm'))
+    assert.ok(match, `Missing production ${name} function`)
+    return match[0]
+  })
+  const trap = source.split('\n').find(line => line === 'trap \'build_failed "$?" "$LINENO"\' ERR')
+  assert.ok(trap, 'The production failure trap must be active')
+  const script = `set -Eeuo pipefail\n${definitions.join('\n')}\nbuild_stage=compiler-target\n${trap}\nassert_compiler_target "$1" "$2"\n`
+  const expected = 'x86_64-pc-cygwin'
+  const lock = JSON.parse(fs.readFileSync(path.join(__dirname, 'build-lock.json'), 'utf8'))
+  assert.equal(lock.sdk.compilerTarget, expected)
+  assert.equal(lock.sdk.configureBuild, expected)
+  const cases = [
+    [expected + '\n', true], [expected + '\r\n', true],
+    ['x86_64-pc-msys\n', false], ['x86_64-w64-mingw32\n', false],
+    ['i686-pc-cygwin\n', false], [expected + '\nextra\n', false],
+    [expected + '\n\n', false], [expected + '\r\r\n', false],
+    [expected + ' \n', false], [expected, false], [expected + '\0\n', false],
+  ]
+  for (const [index, [contents, accepted]] of cases.entries()) {
+    const input = path.join(root, `target-${index}.txt`)
+    fs.writeFileSync(input, contents)
+    const result = cp.spawnSync(bash, ['-c', script, 'target-check', input, expected], { encoding: 'utf8', env: environment, timeout: 10000 })
+    assert.ifError(result.error)
+    assert.equal(result.status, accepted ? 0 : 1, `${JSON.stringify(contents)}: ${result.stderr}`)
+    if (!accepted) {
+      assert.match(result.stderr, /Unexpected compiler target/)
+      assert.match(result.stderr, /MSYS_BUILD_FAILURE stage=compiler-target line=\d+ status=1/)
+      assert.ok(result.stderr.length < 512, 'Failure reports must remain bounded')
+    }
+  }
+})

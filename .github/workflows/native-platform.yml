@@ -76,12 +76,25 @@ jobs:
         # This early copy supplies prompt diagnostics. The identical test is
         # mandatory in the full suite below and still fails the job there.
         continue-on-error: true
-        run: node --test tests/source/windows-msys-pipe.test.cjs
+        shell: pwsh
+        run: |
+          node --test tests/source/windows-msys-pipe.test.cjs 2>&1 | Tee-Object -FilePath native-windows-pipe.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Record isolated Windows capture input diagnostics
         if: runner.os == 'Windows'
         # This exact native case remains mandatory in the full suite below.
         continue-on-error: true
-        run: node --test --test-name-pattern="Windows terminal publication" tests/source/windows-filesystem.test.cjs
+        shell: pwsh
+        run: |
+          node --test --test-name-pattern="Windows terminal publication" tests/source/windows-filesystem.test.cjs 2>&1 | Tee-Object -FilePath native-windows-capture.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve early native Windows observations
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-early-${{ matrix.runner.os }}-node-${{ matrix.node }}
+          path: native-windows-*.log
+          if-no-files-found: error
       # Branch-scoped compiler investigation; no generated DLL is selected by
       # the native runtime tests. Keep this within the existing 20-job matrix.
       - name: Detect changes to the MSYS compiler proof

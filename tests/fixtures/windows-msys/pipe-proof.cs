@@ -14,6 +14,7 @@ public static class MsysPipeProof {
  [StructLayout(LayoutKind.Sequential)] struct US { public UInt16 Length,MaximumLength; public IntPtr Buffer; }
  [StructLayout(LayoutKind.Sequential)] struct OA { public Int32 Length; public IntPtr RootDirectory,ObjectName; public UInt32 Attributes; public IntPtr SecurityDescriptor,SecurityQualityOfService; }
  [StructLayout(LayoutKind.Sequential)] struct IO { public IntPtr Status,Information; }
+ [DllImport("kernel32.dll",SetLastError=true)] static extern Boolean DeviceIoControl(IntPtr handle,UInt32 control,[In] Byte[] input,UInt32 inputLength,IntPtr output,UInt32 outputLength,out UInt32 returned,IntPtr overlapped);
  [DllImport("ntdll.dll")] static extern Int32 NtQueryObject(IntPtr handle,Int32 information,IntPtr buffer,Int32 length,out UInt32 returned);
  [DllImport("ntdll.dll")] static extern Int32 NtOpenFile(out IntPtr handle,UInt32 access,ref OA attributes,out IO io,UInt32 share,UInt32 options);
  [DllImport("ntdll.dll")] static extern Int32 NtCreateNamedPipeFile(out IntPtr handle,UInt32 access,ref OA attributes,out IO io,UInt32 share,UInt32 disposition,UInt32 options,UInt32 type,UInt32 readMode,UInt32 completionMode,UInt32 instances,UInt32 inbound,UInt32 outbound,ref Int64 timeout);
@@ -53,14 +54,73 @@ public static class MsysPipeProof {
   }finally{Marshal.FreeHGlobal(buffer);}
  }
  static String JsonPipeName(String name){return name==null?"null":"\""+name.Replace("\\","\\\\")+"\"";}
- static String ProbeExpandedRoot(IntPtr firstServer,String firstSuffix,String user,String package){
-  String name,parent=null,relativeName=null;Int32 query=QueryOwnedPipeName(firstServer,firstSuffix,out name);
+ // FILE_PIPE_WAIT_FOR_BUFFER: native LARGE_INTEGER, ULONG, BOOLEAN, then
+ // WCHAR Name[1]. MS-FSCC 2.3.49 specifies the intervening padding byte;
+ // pinned MSYS local_includes/ntdll.h uses this same declaration. Derive
+ // offsets from the declaration and assert the ABI instead of packing it.
+ [StructLayout(LayoutKind.Sequential)] struct PipeWaitHeader { public Int64 Timeout; public UInt32 NameLength; public Byte TimeoutSpecified; public UInt16 Name; }
+ static Byte[] PipeWaitBuffer(String relative){
+  Require(!String.IsNullOrEmpty(relative)&&relative.Length<=512&&!relative.StartsWith("\\",StringComparison.Ordinal)&&
+   relative.All(c=>(c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='\\'||c=='-'||c=='_'||c=='.'||c=='{'||c=='}')&&
+   !relative.Split('\\').Any(part=>part.Length==0||part=="."||part==".."),"flat-wait-name");
+  Int32 timeoutOffset=Marshal.OffsetOf(typeof(PipeWaitHeader),"Timeout").ToInt32(),lengthOffset=Marshal.OffsetOf(typeof(PipeWaitHeader),"NameLength").ToInt32(),specifiedOffset=Marshal.OffsetOf(typeof(PipeWaitHeader),"TimeoutSpecified").ToInt32(),nameOffset=Marshal.OffsetOf(typeof(PipeWaitHeader),"Name").ToInt32();
+  Require(timeoutOffset==0&&lengthOffset==8&&specifiedOffset==12&&nameOffset==14&&BitConverter.IsLittleEndian,"flat-wait-layout");
+  Byte[] name=Encoding.Unicode.GetBytes(relative),buffer=new Byte[nameOffset+name.Length];
+  // Native relative time is in 100ns units: -500000 is exactly 50ms.
+  // See pinned MSYS fhandler/fifo.cc's negative 100ms pipe-wait timeout.
+  Buffer.BlockCopy(BitConverter.GetBytes(-500000L),0,buffer,timeoutOffset,8);
+  Buffer.BlockCopy(BitConverter.GetBytes((UInt32)name.Length),0,buffer,lengthOffset,4);
+  buffer[specifiedOffset]=1;Buffer.BlockCopy(name,0,buffer,nameOffset,name.Length);return buffer;
+ }
+ static String ProbePipeWait(IntPtr synchronousRoot,String relative){
+  Byte[] input=PipeWaitBuffer(relative);UInt32 returned;
+  var clock=System.Diagnostics.Stopwatch.StartNew();
+  // The root was opened FILE_SYNCHRONOUS_IO_NONALERT. No OVERLAPPED or
+  // asynchronous IO_STATUS_BLOCK can outlive this pinned input buffer.
+  Boolean success=DeviceIoControl(synchronousRoot,0x110018,input,(UInt32)input.Length,IntPtr.Zero,0,out returned,IntPtr.Zero);
+  UInt32 error=success?0:unchecked((UInt32)Marshal.GetLastWin32Error());Int64 elapsed=clock.ElapsedMilliseconds;
+  Require((success||error!=0)&&elapsed>=0&&elapsed<=15000,"flat-wait-result");
+  return "{\"win32Error\":"+error+",\"elapsedMs\":"+elapsed+",\"timeoutMs\":50}";
+ }
+ static String ProbeFlatRoot(String parent,String user,String package){
+  const String npfs=@"\Device\NamedPipe\";
+  Require(parent.StartsWith(npfs,StringComparison.OrdinalIgnoreCase)&&parent.EndsWith("\\",StringComparison.Ordinal)&&parent.Length<=512,"flat-parent");
+  String suffix="autoprompt-msys-proof-"+Guid.NewGuid().ToString("N"),relative=parent.Substring(npfs.Length)+suffix,name=null;
+  Require(relative.Length<=512&&parent.Length+suffix.Length<=512,"flat-name-bound");
+  Int32? rootStatus=null,serverStatus=null,clientStatus=null,query=null;String beforeClient="null",afterClient="null";
+  IntPtr root=IntPtr.Zero,server=IntPtr.Zero,client=IntPtr.Zero,descriptor=IntPtr.Zero;
+  try{IO io;using(var attributes=new Attributes(npfs,IntPtr.Zero,IntPtr.Zero))rootStatus=NtOpenFile(out root,0x100080,ref attributes.Value,out io,3,0x20);
+   if(rootStatus.Value>=0){
+    Require(Valid(root),"flat-root-empty");UInt32 size;
+    Require(ConvertStringSecurityDescriptorToSecurityDescriptor("D:(A;;GA;;;"+user+")(A;;GA;;;SY)(A;;GA;;;"+package+")",1,out descriptor,out size),"flat-pipe-descriptor");
+    using(var attributes=new Attributes(relative,root,descriptor)){
+     Int64 timeout=-500000;serverStatus=NtCreateNamedPipeFile(out server,0x80100100,ref attributes.Value,out io,3,2,0x20,1,0,0,1,8192,8192,ref timeout);
+     if(serverStatus.Value>=0){
+      Require(Valid(server),"flat-server-empty");
+      // These are observations, not a claim that an un-listened server is
+      // already available. Each request explicitly allows only 50ms.
+      beforeClient=ProbePipeWait(root,relative);
+      clientStatus=NtOpenFile(out client,0x40100080,ref attributes.Value,out io,0,0);
+      if(clientStatus.Value>=0){
+       Require(Valid(client),"flat-client-empty");afterClient=ProbePipeWait(root,relative);
+       query=QueryOwnedPipeName(server,suffix,out name);
+       if(query.Value>=0)Require(String.Equals(name,parent+suffix,StringComparison.Ordinal),"flat-query-name-mismatch");
+      }
+     }
+    }
+   }
+   return "{\"root\":"+NtStatus(rootStatus)+",\"server\":"+NtStatus(serverStatus)+",\"client\":"+NtStatus(clientStatus)+",\"query\":"+NtStatus(query)+",\"name\":"+JsonPipeName(name)+",\"relativeName\":"+JsonPipeName(relative)+",\"beforeClient\":"+beforeClient+",\"afterClient\":"+afterClient+"}";
+  }finally{Boolean closed=true;if(Valid(client))closed=CloseHandle(client)&&closed;if(Valid(server))closed=CloseHandle(server)&&closed;if(Valid(root))closed=CloseHandle(root)&&closed;if(descriptor!=IntPtr.Zero)LocalFree(descriptor);Require(closed,"close-flat-handles");}
+ }
+ static String ProbeExpandedRoot(IntPtr firstServer,String firstSuffix,String user,String package,Boolean flatProof){
+  String name,parent=null,relativeName=null,flat="null";Int32 query=QueryOwnedPipeName(firstServer,firstSuffix,out name);
   Int32? rootStatus=null,serverStatus=null,clientStatus=null,relativeQuery=null;
   IntPtr root=IntPtr.Zero,server=IntPtr.Zero,client=IntPtr.Zero,descriptor=IntPtr.Zero;
   try{
    if(query>=0){
     // The exact owned listener remains held while deriving/opening its parent.
     parent=name.Substring(0,name.Length-firstSuffix.Length);
+    if(flatProof)flat=ProbeFlatRoot(parent,user,package);
     IO io;using(var attributes=new Attributes(parent,IntPtr.Zero,IntPtr.Zero))rootStatus=NtOpenFile(out root,0x100080,ref attributes.Value,out io,3,0);
     if(rootStatus.Value>=0){
      Require(Valid(root),"expanded-root-empty");UInt32 size;
@@ -80,7 +140,7 @@ public static class MsysPipeProof {
      }
     }
    }
-   return "{\"query\":"+NtStatus(query)+",\"name\":"+JsonPipeName(name)+",\"parent\":"+JsonPipeName(parent)+",\"root\":"+NtStatus(rootStatus)+",\"server\":"+NtStatus(serverStatus)+",\"client\":"+NtStatus(clientStatus)+",\"relativeQuery\":"+NtStatus(relativeQuery)+",\"relativeName\":"+JsonPipeName(relativeName)+"}";
+   return "{\"query\":"+NtStatus(query)+",\"name\":"+JsonPipeName(name)+",\"parent\":"+JsonPipeName(parent)+",\"root\":"+NtStatus(rootStatus)+",\"server\":"+NtStatus(serverStatus)+",\"client\":"+NtStatus(clientStatus)+",\"relativeQuery\":"+NtStatus(relativeQuery)+",\"relativeName\":"+JsonPipeName(relativeName)+",\"flat\":"+flat+"}";
   }finally{if(Valid(client))Require(CloseHandle(client),"close-expanded-client");if(Valid(server))Require(CloseHandle(server),"close-expanded-server");if(Valid(root))Require(CloseHandle(root),"close-expanded-root");if(descriptor!=IntPtr.Zero)LocalFree(descriptor);}
  }
  static String ProbeNt(String user,String package,Boolean controller){
@@ -123,7 +183,7 @@ public static class MsysPipeProof {
      clientError=Valid(client)?0:Marshal.GetLastWin32Error();
      // Query only a connected, wholly owned pair. A denied client leaves
      // this extra observation untouched rather than querying an orphan listener.
-     if(local&&Valid(client))expanded=ProbeExpandedRoot(server,suffix,user,package);
+     if(local&&Valid(client))expanded=ProbeExpandedRoot(server,suffix,user,package,variant=="package");
     }
     Require(Valid(server)||serverError!=0,"server-failure-without-error");
     Require(!clientError.HasValue||Valid(client)||clientError.Value!=0,"client-failure-without-error");

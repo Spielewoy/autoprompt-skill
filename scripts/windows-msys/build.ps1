@@ -33,6 +33,7 @@ if ($WorkRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9_\\.-]+$') { throw 'Use an absolu
 if (Test-Path -LiteralPath $WorkRoot) { throw 'WorkRoot must not exist; SDK and build output are disposable and isolated.' }
 $lock=Get-Content -LiteralPath $LockPath -Raw | ConvertFrom-Json
 if ($lock.schema -ne 1 -or $lock.sdk.commit -ne 'e3cc14afd549778c2f2d3bcc6e89307f40f5c2c1' -or $lock.source.commit -ne '270ba2980700e6e2a0813944d506eecea0f86402') { throw 'Unexpected lock identity.' }
+if ($lock.sdk.compilerTarget -ne 'x86_64-pc-cygwin' -or $lock.sdk.configureBuild -ne 'x86_64-pc-cygwin' -or $lock.sdk.compilerSha256 -notmatch '^[a-f0-9]{64}$') { throw 'Unexpected pinned MSYS compiler identity.' }
 if ($AdaptationPatch -and $AdaptationSha256 -notmatch '^[a-f0-9]{64}$') { throw 'An adaptation requires an explicit SHA256.' }
 $git=(Get-Command git.exe -ErrorAction Stop).Source
 function Run-Git([string[]]$Arguments) { & $git @Arguments; if ($LASTEXITCODE -ne 0) { throw 'Pinned SDK checkout failed.' } }
@@ -78,6 +79,6 @@ $env:MSYSTEM='MSYS'
 $env:MSYS2_PATH_TYPE='strict'
 $env:CHERE_INVOKING='1'
 $env:PATH=(Join-Path $sdk 'usr\bin')+';'+(Join-Path $env:SystemRoot 'System32')
-& (Join-Path $sdk 'usr\bin\bash.exe') --noprofile --norc /issue27-build/build.sh $Mode ([string]$Jobs) ([string]$lock.source.sourceDateEpoch) $lock.source.sha256
+& (Join-Path $sdk 'usr\bin\bash.exe') --noprofile --norc /issue27-build/build.sh $Mode ([string]$Jobs) ([string]$lock.source.sourceDateEpoch) $lock.source.sha256 $lock.sdk.compilerTarget $lock.sdk.configureBuild $lock.sdk.compilerSha256
 if ($LASTEXITCODE -ne 0) { throw 'Isolated proof build failed; preserve output/config.log for diagnosis.' }
 Write-Output ('Compiler proof staged in '+(Join-Path $payload 'stage')+'. Native behavior and reproducibility remain unverified.')

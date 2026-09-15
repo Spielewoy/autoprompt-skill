@@ -13,6 +13,14 @@ path and `-AdaptationSha256` with its verified SHA256. The default proof omits
 unneeded MinGW utilities and documentation. `-Mode full` installs the complete
 locked recipe dependency closure instead.
 
+The pinned SDK's MSYS GCC 15.3.0 identifies its target as
+`x86_64-pc-cygwin`; its `etc/makepkg.conf` sets the same `CHOST`. The lock
+therefore requires that exact compiler target and configure build triplet,
+and verifies the pinned `gcc.exe` hash. This does not select a MinGW compiler.
+Compiler/linker versions and the exact target output bytes are saved before
+the target assertion. Failures include a build stage, line and exit status in
+`bootstrap-output.txt`; target records accept only exact LF or CRLF endings.
+
 The scripts verify source and package hashes, require package signatures, use
 the SDK's MSYS host compiler, and install only into a separate staging directory.
 They record compiler/package provenance and verify that the bootstrap runtime
