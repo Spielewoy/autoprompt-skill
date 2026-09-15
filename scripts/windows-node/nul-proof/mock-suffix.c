@@ -1,6 +1,6 @@
 static LONG query_object(HANDLE handle,ULONG kind,void*output,ULONG size,ULONG*returned){
  uintptr_t n=(uintptr_t)handle;assert(n!=0x100&&n<512&&mock.handles[n].active);mock.queries++;
- if(kind==0){assert(size==sizeof(uv__nul_basic_t));uv__nul_basic_t*basic=output;memset(basic,0,size);basic->granted_access=mock.handles[n].access;*returned=mock.query_short?4:size;return 0;}
+ if(kind==0){assert(size==56&&size==sizeof(uv__nul_basic_t));uv__nul_basic_t*basic=output;memset(basic,0,size);basic->granted_access=mock.handles[n].access;*returned=mock.query_short?4:size;return 0;}
  assert((kind==1||kind==2)&&size==4096);uv__nul_string_t*name=output;
  const WCHAR*value=kind==2?L"File":mock.handles[n].object==1?L"\\Device\\Null":L"\\Device\\Other";
  size_t length=wide_length(value);name->length=(USHORT)(length*sizeof(WCHAR));name->maximum_length=name->length+sizeof(WCHAR);name->buffer=(WCHAR*)((unsigned char*)output+sizeof(*name));
@@ -14,6 +14,8 @@ static int contains(const WCHAR*env,const WCHAR*entry){for(size_t i=0;env[i];i+=
 static void prepare_good(uv__nul_capability_t*cap){assert(uv__nul_capability_prepare(cap)==0&&cap->handle!=NULL);assert(mock.handles[(uintptr_t)cap->handle].inherit==1);assert(cap->locator==0x100);}
 int main(void){
  assert(sizeof(WCHAR)==2&&sizeof(DWORD)==4&&sizeof(uintptr_t)==8);
+ /* Microsoft PUBLIC_OBJECT_BASIC_INFORMATION is fourteen 32-bit fields. */
+ assert(sizeof(uv__nul_basic_t)==56);
  unsigned cases=0;uv__nul_capability_t cap;HANDLE out;WCHAR*env;
  reset();mock.value=0;assert(uv__nul_capability_prepare(&cap)==0&&cap.handle==NULL&&mock.env_reads==0&&mock.duplicates==0);env=NULL;assert(uv__nul_capability_environment(&cap,&env)==0&&env==NULL);cases++;
  reset();mock.env_present=0;assert(uv__nul_capability_prepare(&cap)==0&&cap.handle==NULL&&mock.duplicates==0);cases++;

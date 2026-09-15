@@ -17,10 +17,10 @@ public static class NullCapabilityMock {
  public static UInt32 GetFileType(IntPtr handle){Handle(handle);return Kind;}
  public static Boolean GetHandleInformation(IntPtr handle,out UInt32 flags){Handle(handle);flags=Flags;return FlagSuccess;}
  public static Int32 NtQueryObject(IntPtr handle,Int32 information,IntPtr buffer,UInt32 length,out UInt32 required){
-  Handle(handle);if(length!=512||buffer==IntPtr.Zero)throw new InvalidOperationException("unbounded-query");Queries++;Order.Add(information);
-  for(Int32 i=0;i<512;i++)Marshal.WriteByte(buffer,i,0);
-  Boolean bad=information==BadQuery;required=512;
-  if(information==0){Marshal.WriteInt32(buffer,4,unchecked((Int32)Access));if(bad&&Fault=="short")required=7;else if(bad&&Fault=="oversize")required=513;else if(bad&&Fault=="minimal")required=8;}
+  Handle(handle);if(length!=(information==0?56u:512u)||buffer==IntPtr.Zero)throw new InvalidOperationException("unbounded-query");Queries++;Order.Add(information);
+  for(Int32 i=0;i<length;i++)Marshal.WriteByte(buffer,i,0);
+  Boolean bad=information==BadQuery;required=information==0?56u:512u;
+  if(information==0){Marshal.WriteInt32(buffer,4,unchecked((Int32)Access));if(bad&&Fault=="short")required=7;else if(bad&&Fault=="oversize")required=513;else if(bad&&Fault=="minimal")required=8;else if(bad&&Fault=="one-short")required=55;else if(bad&&Fault=="one-long")required=57;}
   else{
    if(information!=1&&information!=2)throw new InvalidOperationException("unexpected-query-kind");
    String text=information==2?"File":@"\Device\Null";
@@ -65,8 +65,8 @@ public static class NullCapabilityContract {
   Need(NullCapabilityMock.Queries==0,"invalid-handle-must-not-query-object");
   NativeCase(()=>NullCapabilityMock.Access|=0x00040000,null);
   for(Int32 bit=0;bit<32;bit++){UInt32 mask=1u<<bit;if((NullCapabilityMock.Required&mask)!=0)NativeCase(()=>NullCapabilityMock.Access&=~mask,"WINDOWS_NULL_CAPABILITY_ACCESS");}
-  foreach(String fault in new[]{"short","oversize"})NativeCase(()=>{NullCapabilityMock.BadQuery=0;NullCapabilityMock.Fault=fault;},"WINDOWS_NULL_CAPABILITY_ACCESS");
-  NativeCase(()=>{NullCapabilityMock.BadQuery=0;NullCapabilityMock.Fault="minimal";},null);
+  foreach(String fault in new[]{"short","oversize","one-short","one-long"})NativeCase(()=>{NullCapabilityMock.BadQuery=0;NullCapabilityMock.Fault=fault;},"WINDOWS_NULL_CAPABILITY_ACCESS");
+  NativeCase(()=>{NullCapabilityMock.BadQuery=0;NullCapabilityMock.Fault="minimal";},"WINDOWS_NULL_CAPABILITY_ACCESS");
   foreach(Int32 kind in new[]{0,2,1})foreach(Int32 status in new[]{unchecked((Int32)0xc0000022),1})NativeCase(()=>{NullCapabilityMock.BadQuery=kind;NullCapabilityMock.Status=status;},kind==0?"WINDOWS_NULL_CAPABILITY_ACCESS":"WINDOWS_NULL_CAPABILITY_IDENTITY");
   foreach(Int32 kind in new[]{2,1}){
    foreach(String fault in new[]{"short","oversize","header-only","odd","long","capacity","null","before","header-overlap","past-return","outside","wrong"})NativeCase(()=>{NullCapabilityMock.BadQuery=kind;NullCapabilityMock.Fault=fault;},"WINDOWS_NULL_CAPABILITY_IDENTITY");

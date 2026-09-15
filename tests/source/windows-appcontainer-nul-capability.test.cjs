@@ -10,6 +10,38 @@ const { parseController } = require('../helpers/windows-nul-capability-proof.cjs
 const fixtures = path.resolve(__dirname, '../fixtures/windows-appcontainer')
 const nativeSource = path.resolve(__dirname, '../../agents/codex/workflow/windows-appcontainer-native.cs')
 const sid = index => `S-1-15-2-${index}-2-3-4-5-6-7`
+test('native Windows host NUL basic query records exact and oversized buffer results', { skip: process.platform !== 'win32', timeout: 90000 }, t => {
+  const systemRoot = process.env.SystemRoot
+  const powershell = path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop";[Environment]::SetEnvironmentVariable("PSModulePath",[IO.Path]::Combine($PSHOME,"Modules"),[EnvironmentVariableTarget]::Process);Add-Type -Path $env:NULL_BASIC_SOURCE;[NulBasicQueryProof]::Run()'], {
+    encoding: 'utf8', timeout: 60000, maxBuffer: 16384, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { SystemRoot: systemRoot, WINDIR: systemRoot, PATH: path.join(systemRoot, 'System32'), TEMP: os.tmpdir(), TMP: os.tmpdir(), NULL_BASIC_SOURCE: path.join(fixtures, 'nul-basic-query-proof.cs') },
+  })
+  for (const stream of ['stdout', 'stderr']) for (const line of String(result[stream] || '').split(/\r?\n/)) if (line) t.diagnostic('host NUL basic ' + stream + ': ' + line)
+  assert.ifError(result.error); assert.equal(result.status, 0, result.stderr || result.stdout); assert.equal(result.stderr, '')
+  const proof = JSON.parse(result.stdout)
+  assert.deepEqual(Object.keys(proof).sort(), ['schemaVersion', 'pointerBits', 'objectType', 'objectName', 'requestedAccess', 'queries'].sort())
+  assert.equal(proof.schemaVersion, 1); assert.equal(proof.pointerBits, 64)
+  assert.equal(proof.objectType, 'File'); assert.equal(proof.objectName, '\\Device\\Null'); assert.equal(proof.requestedAccess, 0x12019f)
+  assert.equal(proof.queries.length, 3)
+  for (const [index, query] of proof.queries.entries()) {
+    assert.deepEqual(Object.keys(query).sort(), ['requested', 'returned', 'status', 'grantedAccess'].sort())
+    assert.equal(query.requested, [56, 256, 512][index]); assert.match(query.status, /^[0-9a-f]{8}$/)
+    assert.ok(Number.isSafeInteger(query.returned) && query.returned >= 0 && query.returned <= 0xffffffff)
+    if (query.status === '00000000' && query.returned >= 8 && query.returned <= query.requested) {
+      assert.ok(Number.isSafeInteger(query.grantedAccess) && query.grantedAccess >= 0 && query.grantedAccess <= 0xffffffff)
+    } else assert.equal(query.grantedAccess, null)
+  }
+  assert.deepEqual(proof.queries[0], { requested: 56, returned: 56, status: '00000000', grantedAccess: 0x12019f })
+  // Oversized outcomes remain observations: do not require the suspected failure.
+})
+test('host NUL basic query fixture compiles independently of the AppContainer launcher', { skip: process.platform === 'win32', timeout: 30000 }, t => {
+  const result = cp.spawnSync('pwsh', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop";Add-Type -Path $env:NULL_BASIC_SOURCE'], {
+    encoding: 'utf8', timeout: 20000, env: { ...process.env, NULL_BASIC_SOURCE: path.join(fixtures, 'nul-basic-query-proof.cs') },
+  })
+  if (result.error?.code === 'ENOENT') { t.skip('PowerShell unavailable for local C# compilation'); return }
+  assert.ifError(result.error); assert.equal(result.status, 0, result.stderr || result.stdout); assert.equal(result.stderr, '')
+})
 function child(index) { return { schemaVersion: 1, packageSid: sid(index), objectType: 'File', objectName: '\\Device\\Null', grantedAccess: 0x12019f, originalFlags: 1, duplicateFlags: 0, distinctStdin: true, readError: 0, readBytes: 0, writtenBytes: 1, strayEventInherited: false, startedMs: 10000 + index, finishedMs: 13000 + index } }
 function envelope(children = [child(1), child(2)]) { return { schemaVersion: 1, hostEventInheritable: true, results: children.map(value => ({ packageSid: value.packageSid, drained: true, rootImageMatches: true, exitCode: 0, observedJobMembers: 1, stdoutBase64: Buffer.from(JSON.stringify(value)).toString('base64'), stderrBase64: '' })) } }
 test('Null capability proof requires held object authority, exact rights and unrelated handle isolation', () => {

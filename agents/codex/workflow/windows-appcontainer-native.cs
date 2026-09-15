@@ -211,8 +211,12 @@ public static class WindowsAppContainerNative {
   UInt32 flags;if(GetFileType(handle)!=2||!GetHandleInformation(handle,out flags)||(flags&HANDLE_FLAG_INHERIT)==0)throw new InvalidOperationException("WINDOWS_NULL_CAPABILITY_INVALID");
   IntPtr memory=Marshal.AllocHGlobal(512);
   try{
-   UInt32 returned;Int32 status=NtQueryObject(handle,0,memory,512,out returned);
-   if(status!=0||returned<8||returned>512||(unchecked((UInt32)Marshal.ReadInt32(memory,4))&PrivateNullAccess)!=PrivateNullAccess)throw new InvalidOperationException("WINDOWS_NULL_CAPABILITY_ACCESS");
+   // PUBLIC_OBJECT_BASIC_INFORMATION is fourteen 32-bit fields on both
+   // supported architectures. Query its exact fixed size, unlike variable strings.
+   const UInt32 basicLength=56;
+   UInt32 returned;Int32 status=NtQueryObject(handle,0,memory,basicLength,out returned);
+   UInt32 granted=status==0&&returned==basicLength?unchecked((UInt32)Marshal.ReadInt32(memory,4)):0;
+   if(status!=0||returned!=basicLength||(granted&PrivateNullAccess)!=PrivateNullAccess)throw new InvalidOperationException("WINDOWS_NULL_CAPABILITY_ACCESS",new InvalidOperationException("NtQueryObjectBasic status:"+unchecked((UInt32)status).ToString("x8")+" returned:"+returned+" granted:"+granted.ToString("x8")));
    foreach(var query in new[]{new KeyValuePair<Int32,String>(2,"File"),new KeyValuePair<Int32,String>(1,@"\Device\Null")}){
     status=NtQueryObject(handle,query.Key,memory,512,out returned);
     Int32 header=Marshal.SizeOf(typeof(UNICODE_STRING));

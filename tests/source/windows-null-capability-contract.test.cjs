@@ -31,6 +31,6 @@ test('private NUL capability verifies bounded native identity and preserves the 
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.equal(result.stderr, '')
   const proof = JSON.parse(result.stdout)
-  assert.deepEqual(proof, { contractCases: 77, nativeApiBoundaries: 3 })
+  assert.deepEqual(proof, { contractCases: 79, nativeApiBoundaries: 3 })
   t.diagnostic(`${proof.contractCases} actual-source adversarial contracts; native API results are mocked, not Windows execution`)
 })

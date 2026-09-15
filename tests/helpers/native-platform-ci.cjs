@@ -14,6 +14,7 @@ function exportEnvironment(name, value) {
 }
 
 const WINDOWS_NATIVE_CASES = Object.freeze([
+  'native Windows host NUL basic query records exact and oversized buffer results',
   'native Windows Node pipe diagnostic records stdio and fork IPC support with owned job drain',
   'native Windows NUL diagnostic records exact device access under an AppContainer token',
   'native Windows Null capability stays distinct from stdin and excludes stray handles across concurrent profiles',

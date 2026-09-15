@@ -33,7 +33,7 @@ test('actual compiler process helper drains logs, propagates failures and bounds
   })
   assert.ifError(result.error)
   assert.equal(result.status, 0, result.stderr || result.stdout)
-  assert.deepEqual(JSON.parse(result.stdout), { processCases: 3, toolchainCases: 6 })
+  assert.deepEqual(JSON.parse(result.stdout), { processCases: 3, toolchainCases: 6, planCases: 23, peCases: 28, progressRecords: 7, installerCases: 3 })
 })
 
 test('private NUL patch lock binds every original, result and newly created header', () => {
