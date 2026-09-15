@@ -95,8 +95,23 @@ jobs:
           name: windows-early-${{ matrix.runner.os }}-node-${{ matrix.node }}
           path: native-windows-*.log
           if-no-files-found: error
-      # Branch-scoped compiler investigation; no generated DLL is selected by
-      # the native runtime tests. Keep this within the existing 20-job matrix.
+      - name: Compare isolated Windows PowerShell startup environments
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test tests/source/windows-powershell-startup.test.cjs 2>&1 | Tee-Object -FilePath native-windows-powershell-startup.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve Windows PowerShell startup comparisons
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-startup-${{ matrix.runner.os }}-node-${{ matrix.node }}
+          path: native-windows-powershell-startup.log
+          if-no-files-found: error
+      # Branch-scoped compiler investigation. Only the separate smoke proof
+      # selects its private built closure; the full platform gates are unchanged.
+      # Keep this within the existing 20-job matrix.
       - name: Detect changes to the MSYS compiler proof
         id: msys-proof-input
         if: github.ref == 'refs/heads/codex/issue-27-native-platform-support' && matrix.runner.os == 'windows-latest' && matrix.node == '24.x'
@@ -111,11 +126,19 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          node --test scripts/windows-msys/build-boundaries.test.cjs
+          node --test scripts/windows-msys/build-boundaries.test.cjs scripts/windows-msys/probe-built-runtime.test.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $patch = (Resolve-Path scripts/windows-msys/pipe-security.patch).Path
           $digest = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
           ./scripts/windows-msys/build.ps1 -WorkRoot (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof') -Mode proof -AdaptationPatch $patch -AdaptationSha256 $digest -Jobs 4
+      - name: Exercise the built MSYS runtime in a private Bash closure
+        id: msys-smoke
+        if: steps.msys-proof.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node scripts/windows-msys/probe-built-runtime.cjs (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve the MSYS compiler proof and diagnostics
         if: always() && steps.msys-proof-input.outputs.run == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -126,6 +149,7 @@ jobs:
             ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/build/**/config.log
             ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/*.txt
             ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/*.sha256
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/built-runtime-manifest.json
             ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/stage
           if-no-files-found: warn
       - name: Run platform tests and reject skips of this host's native cases
@@ -148,7 +172,7 @@ jobs:
       - name: Packed installer lifecycle
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
       - name: Require the selected MSYS compiler proof to succeed
-        if: always() && steps.msys-proof.outcome == 'failure'
+        if: always() && (steps.msys-proof.outcome == 'failure' || steps.msys-smoke.outcome == 'failure')
         run: node -e "process.exit(1)"
 
   claude-native:

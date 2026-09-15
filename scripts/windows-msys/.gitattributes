@@ -1,4 +1,6 @@
 *.sh text eol=lf
 *.ps1 text eol=lf
-*.patch text eol=lf
+# Unified-diff context prefixes may precede upstream tabs or empty lines.
+# Validate source whitespace after applying the patch to the pinned tree.
+*.patch text eol=lf whitespace=-blank-at-eol,-space-before-tab
 *.json text eol=lf

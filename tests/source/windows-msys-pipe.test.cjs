@@ -108,10 +108,36 @@ test('native Windows pipe diagnostic records namespace and descriptor outcomes u
         assert.equal(intended.slice(0, intended.lastIndexOf('\\') + 1), expanded.parent)
         assert.notEqual(intended, expanded.name, 'Flat proof creates a fresh independently owned name')
         function waitObservation(value) {
-          assert.deepEqual(Object.keys(value).sort(), ['elapsedMs', 'timeoutMs', 'win32Error'])
+          assert.deepEqual(Object.keys(value).sort(), ['cancellation', 'completion', 'drainWait', 'drainWaitError', 'drained', 'elapsedMs', 'initialWait', 'initialWaitError', 'submission', 'timeoutMs', 'watchdogExpired'])
           assert.equal(value.timeoutMs, 50)
           assert.ok(Number.isSafeInteger(value.elapsedMs) && value.elapsedMs >= 0 && value.elapsedMs <= 15000)
-          assert.ok(Number.isSafeInteger(value.win32Error) && value.win32Error >= 0 && value.win32Error <= 0xffffffff)
+          for (const key of ['submission', 'completion', 'cancellation']) {
+            if (key === 'cancellation' && value[key] === null) continue
+            assert.notEqual(value[key], null)
+            succeeded(value[key]) // Validate the closed native status record; outcome is observational.
+          }
+          assert.equal(value.drained, true)
+          assert.notEqual(value.completion.status, '00000103', 'A pending request must never be reported as drained')
+          for (const key of ['initialWait', 'drainWait', 'initialWaitError', 'drainWaitError']) {
+            assert.ok(value[key] === null || (Number.isSafeInteger(value[key]) && value[key] >= 0 && value[key] <= 0xffffffff))
+          }
+          if (value.submission.status === '00000103') {
+            assert.notEqual(value.initialWait, null)
+            if (value.initialWait === 0) {
+              for (const key of ['cancellation', 'drainWait', 'drainWaitError']) assert.equal(value[key], null)
+            } else {
+              assert.notEqual(value.cancellation, null)
+              assert.notEqual(value.cancellation.status, '00000103')
+              assert.equal(value.drainWait, 0, 'Cancellation alone cannot prove original request completion')
+              assert.equal(value.drainWaitError, null)
+            }
+            assert.equal(value.watchdogExpired, value.initialWait === 258)
+            if (value.initialWait === 0xffffffff) assert.notEqual(value.initialWaitError, null)
+            else assert.equal(value.initialWaitError, null)
+          } else {
+            for (const key of ['cancellation', 'initialWait', 'drainWait', 'initialWaitError', 'drainWaitError']) assert.equal(value[key], null)
+            assert.equal(value.watchdogExpired, false)
+          }
         }
         assert.notEqual(flat.root, null)
         if (!succeeded(flat.root)) {
@@ -181,4 +207,68 @@ test('native Windows pipe diagnostic records namespace and descriptor outcomes u
   }
   // Child outcomes are intentionally observations. Existing native Git Bash
   // capability tests remain the mandatory compatibility and isolation gates.
+})
+
+test('native pipe wait lease proves completion before freeing request memory', { timeout: 90000 }, t => {
+  const powershell = process.platform === 'win32'
+    ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'pwsh'
+  const available = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()'], { encoding: 'utf8', timeout: 15000 })
+  if (available.error?.code === 'ENOENT' && process.platform !== 'win32') { t.skip('PowerShell is unavailable'); return }
+  assert.ifError(available.error)
+  assert.equal(available.status, 0, available.stderr)
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pipe-wait-lifetime-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const fixture = fs.readFileSync(path.join(__dirname, '../fixtures/windows-msys/pipe-proof.cs'), 'utf8')
+  // Compile the exact lease and wait implementation without unrelated launch
+  // code; replace only the six native calls with controlled test substitutes.
+  let source = fixture.slice(0, fixture.indexOf(' static String ProbeFlatRoot(')) + '\n}\n'
+  const replacements = {
+    NtFsControlFile: 'return PipeWaitFake.Submit(handle,signal,apc,context,io,control,input,inputLength,output,outputLength);',
+    NtCancelIoFileEx: 'return PipeWaitFake.Cancel(handle,requestIo,cancelIo);',
+    CreateEventW: 'return PipeWaitFake.Event(attributes,manualReset,initialState,name);',
+    WaitForSingleObject: 'return PipeWaitFake.Wait(handle,milliseconds);',
+    CloseHandle: 'return PipeWaitFake.Close(handle);',
+    RtlNtStatusToDosError: 'return PipeWaitFake.Map(status);',
+  }
+  for (const [name, body] of Object.entries(replacements)) {
+    const pattern = new RegExp('^ \\[DllImport\\([^\\n]+\\] static extern ([^\\n]+ ' + name + '\\([^\\n]+\\));$', 'gm')
+    assert.equal([...source.matchAll(pattern)].length, 1, `One exact import must bind ${name}`)
+    source = source.replace(pattern, ' static $1 {' + body + '}')
+  }
+  source += fs.readFileSync(path.join(__dirname, '../fixtures/windows-msys/pipe-wait-lifetime.cs'), 'utf8')
+  const copied = path.join(root, 'wait.cs')
+  fs.writeFileSync(copied, source)
+  const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+    '$ErrorActionPreference="Stop"; Add-Type -Path $env:AUTOPROMPT_WAIT_SOURCE; 0..10 | ForEach-Object { [PipeWaitFake]::Run($_) }'], {
+    encoding: 'utf8', timeout: 60000, env: { ...process.env, AUTOPROMPT_WAIT_SOURCE: copied },
+  })
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const cases = result.stdout.trim().split(/\r?\n/).map(line => JSON.parse(line))
+  assert.equal(cases.length, 11)
+  for (const [mode, value] of cases.entries()) {
+    assert.equal(value.mode, mode)
+    assert.equal(value.submits, 1)
+    assert.equal(value.closes, 1, 'A proven complete lease closes once; a retained lease closes only in explicit test teardown')
+    assert.equal(value.cancels, mode >= 3 && mode <= 8 ? 1 : 0)
+    assert.equal(value.waits, mode === 0 || mode === 1 || mode === 10 ? 0 : mode >= 3 && mode <= 8 ? 2 : 1)
+    if (mode >= 6) {
+      assert.equal(value.report, null)
+      assert.equal(value.retained, true)
+      assert.equal(value.rootHeld, true)
+      assert.equal(value.retryRefused, true)
+      assert.equal(value.memoryReadable, true)
+      assert.equal(value.error, mode === 6 ? 'flat-wait-undrained' : mode === 7 || mode === 8 ? 'flat-wait-cancel-incomplete' : mode === 9 ? 'flat-wait-pending-after-event' : 'flat-wait-inconsistent-completion')
+    } else {
+      assert.equal(value.error, null)
+      assert.equal(value.retained, false)
+      assert.equal(value.report.drained, true)
+      assert.equal(value.report.timeoutMs, 50)
+      assert.equal(value.report.submission.status, mode === 0 ? 'C0000022' : mode === 1 ? '00000000' : '00000103')
+      assert.equal(value.report.completion.status, ['C0000022', '00000000', 'C00000B5', 'C0000120', '00000000', 'C0000120'][mode])
+      assert.equal(value.report.watchdogExpired, mode === 3 || mode === 4)
+      if (mode === 4) assert.equal(value.report.cancellation.status, 'C0000225', 'A cancellation-not-found race still requires original completion')
+      if (mode === 5) assert.ok(Number.isInteger(value.report.initialWaitError))
+    }
+  }
 })

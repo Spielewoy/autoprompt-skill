@@ -14,7 +14,10 @@ public static class MsysPipeProof {
  [StructLayout(LayoutKind.Sequential)] struct US { public UInt16 Length,MaximumLength; public IntPtr Buffer; }
  [StructLayout(LayoutKind.Sequential)] struct OA { public Int32 Length; public IntPtr RootDirectory,ObjectName; public UInt32 Attributes; public IntPtr SecurityDescriptor,SecurityQualityOfService; }
  [StructLayout(LayoutKind.Sequential)] struct IO { public IntPtr Status,Information; }
- [DllImport("kernel32.dll",SetLastError=true)] static extern Boolean DeviceIoControl(IntPtr handle,UInt32 control,[In] Byte[] input,UInt32 inputLength,IntPtr output,UInt32 outputLength,out UInt32 returned,IntPtr overlapped);
+ [DllImport("ntdll.dll")] static extern Int32 NtFsControlFile(IntPtr handle,IntPtr signal,IntPtr apc,IntPtr context,IntPtr io,UInt32 control,IntPtr input,UInt32 inputLength,IntPtr output,UInt32 outputLength);
+ [DllImport("ntdll.dll")] static extern Int32 NtCancelIoFileEx(IntPtr handle,IntPtr requestIo,IntPtr cancelIo);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateEventW(IntPtr attributes,Boolean manualReset,Boolean initialState,String name);
+ [DllImport("kernel32.dll",SetLastError=true)] static extern UInt32 WaitForSingleObject(IntPtr handle,UInt32 milliseconds);
  [DllImport("ntdll.dll")] static extern Int32 NtQueryObject(IntPtr handle,Int32 information,IntPtr buffer,Int32 length,out UInt32 returned);
  [DllImport("ntdll.dll")] static extern Int32 NtOpenFile(out IntPtr handle,UInt32 access,ref OA attributes,out IO io,UInt32 share,UInt32 options);
  [DllImport("ntdll.dll")] static extern Int32 NtCreateNamedPipeFile(out IntPtr handle,UInt32 access,ref OA attributes,out IO io,UInt32 share,UInt32 disposition,UInt32 options,UInt32 type,UInt32 readMode,UInt32 completionMode,UInt32 instances,UInt32 inbound,UInt32 outbound,ref Int64 timeout);
@@ -72,15 +75,73 @@ public static class MsysPipeProof {
   Buffer.BlockCopy(BitConverter.GetBytes((UInt32)name.Length),0,buffer,lengthOffset,4);
   buffer[specifiedOffset]=1;Buffer.BlockCopy(name,0,buffer,nameOffset,name.Length);return buffer;
  }
- static String ProbePipeWait(IntPtr synchronousRoot,String relative){
-  Byte[] input=PipeWaitBuffer(relative);UInt32 returned;
-  var clock=System.Diagnostics.Stopwatch.StartNew();
-  // The root was opened FILE_SYNCHRONOUS_IO_NONALERT. No OVERLAPPED or
-  // asynchronous IO_STATUS_BLOCK can outlive this pinned input buffer.
-  Boolean success=DeviceIoControl(synchronousRoot,0x110018,input,(UInt32)input.Length,IntPtr.Zero,0,out returned,IntPtr.Zero);
-  UInt32 error=success?0:unchecked((UInt32)Marshal.GetLastWin32Error());Int64 elapsed=clock.ElapsedMilliseconds;
-  Require((success||error!=0)&&elapsed>=0&&elapsed<=15000,"flat-wait-result");
-  return "{\"win32Error\":"+error+",\"elapsedMs\":"+elapsed+",\"timeoutMs\":50}";
+ // A failed cancellation never licenses freeing an outstanding request.
+ // This single slot intentionally has no finalizer: the process stops after
+ // uncertainty, retaining every request allocation and the borrowed root.
+ static PipeWaitLease RetainedPipeWait;
+ static Boolean IsRetainedPipeRoot(IntPtr root){return RetainedPipeWait!=null&&RetainedPipeWait.Root==root;}
+ static String JsonUInt(UInt32? value){return value.HasValue?value.Value.ToString(System.Globalization.CultureInfo.InvariantCulture):"null";}
+ sealed class PipeWaitLease {
+  public IntPtr Root,Input,RequestIo,CancelIo,Signal;
+  public Boolean Submitted,Drained,CancelPending,WatchdogExpired;
+  public Int32? Submission,Completion,Cancellation;
+  public UInt32? InitialWait,DrainWait,InitialWaitError,DrainWaitError;
+  public readonly System.Diagnostics.Stopwatch Clock=System.Diagnostics.Stopwatch.StartNew();
+  public String Report(){return "{\"submission\":"+NtStatus(Submission)+",\"completion\":"+NtStatus(Completion)+",\"cancellation\":"+NtStatus(Cancellation)+",\"initialWait\":"+JsonUInt(InitialWait)+",\"drainWait\":"+JsonUInt(DrainWait)+",\"initialWaitError\":"+JsonUInt(InitialWaitError)+",\"drainWaitError\":"+JsonUInt(DrainWaitError)+",\"watchdogExpired\":"+(WatchdogExpired?"true":"false")+",\"drained\":"+(Drained?"true":"false")+",\"elapsedMs\":"+Clock.ElapsedMilliseconds+",\"timeoutMs\":50}";}
+  public void Release(){
+   if(Submitted&&(!Drained||CancelPending)){RetainedPipeWait=this;return;}
+   Boolean closed=!Valid(Signal)||CloseHandle(Signal);Signal=IntPtr.Zero;
+   if(Input!=IntPtr.Zero){Marshal.FreeHGlobal(Input);Input=IntPtr.Zero;}
+   if(RequestIo!=IntPtr.Zero){Marshal.FreeHGlobal(RequestIo);RequestIo=IntPtr.Zero;}
+   if(CancelIo!=IntPtr.Zero){Marshal.FreeHGlobal(CancelIo);CancelIo=IntPtr.Zero;}
+   Require(closed,"close-flat-wait-event");
+  }
+ }
+ static IntPtr NewPipeWaitIo(){
+  Int32 size=Marshal.SizeOf(typeof(IO));Require(size==IntPtr.Size*2,"flat-wait-io-layout");
+  IntPtr value=Marshal.AllocHGlobal(size);Marshal.Copy(new Byte[size],0,value,size);
+  Marshal.WriteInt32(value,0x103);return value;
+ }
+ static String ProbePipeWait(IntPtr asynchronousRoot,String relative){
+  Require(RetainedPipeWait==null,"prior-flat-wait-undrained");
+  Byte[] input=PipeWaitBuffer(relative);var lease=new PipeWaitLease{Root=asynchronousRoot};
+  try{
+   lease.Input=Marshal.AllocHGlobal(input.Length);Marshal.Copy(input,0,lease.Input,input.Length);
+   lease.RequestIo=NewPipeWaitIo();lease.CancelIo=NewPipeWaitIo();
+   lease.Signal=CreateEventW(IntPtr.Zero,true,false,null);Require(Valid(lease.Signal),"flat-wait-event:"+Marshal.GetLastWin32Error());
+   // Asynchronous root + explicit event: no managed array or out/ref stack
+   // storage can be reclaimed while NtFsControlFile owns a pending request.
+   lease.Submitted=true;
+   lease.Submission=NtFsControlFile(asynchronousRoot,lease.Signal,IntPtr.Zero,IntPtr.Zero,lease.RequestIo,0x110018,lease.Input,(UInt32)input.Length,IntPtr.Zero,0);
+   if(lease.Submission.Value==0x103){
+    lease.InitialWait=WaitForSingleObject(lease.Signal,2000);
+    if(lease.InitialWait.Value!=0){
+     lease.WatchdogExpired=lease.InitialWait.Value==258;
+     if(lease.InitialWait.Value==UInt32.MaxValue)lease.InitialWaitError=unchecked((UInt32)Marshal.GetLastWin32Error());
+     // Exact request identity, never cancellation of unrelated root I/O.
+     lease.Cancellation=NtCancelIoFileEx(asynchronousRoot,lease.RequestIo,lease.CancelIo);
+     lease.CancelPending=lease.Cancellation.Value==0x103||(lease.Cancellation.Value>=0&&Marshal.ReadInt32(lease.CancelIo)==0x103);
+     lease.DrainWait=WaitForSingleObject(lease.Signal,2000);
+     if(lease.DrainWait.Value==UInt32.MaxValue)lease.DrainWaitError=unchecked((UInt32)Marshal.GetLastWin32Error());
+     if(lease.DrainWait.Value!=0)throw new InvalidOperationException("flat-wait-undrained:"+lease.Report());
+    }
+    // Event completion is the memory/lifetime barrier; cancellation success
+    // or STATUS_NOT_FOUND alone never proves that the original I/O is done.
+    lease.Completion=Marshal.ReadInt32(lease.RequestIo);
+    if(lease.Completion.Value==0x103)throw new InvalidOperationException("flat-wait-pending-after-event:"+lease.Report());
+    lease.Drained=true;
+   }else if(lease.Submission.Value<0){
+    // An immediate failing return did not leave an outstanding request.
+    lease.Completion=lease.Submission;lease.Drained=true;
+   }else{
+    lease.Completion=Marshal.ReadInt32(lease.RequestIo);
+    if(lease.Completion.Value==0x103)throw new InvalidOperationException("flat-wait-inconsistent-completion:"+lease.Report());
+    lease.Drained=true;
+   }
+   if(lease.CancelPending)throw new InvalidOperationException("flat-wait-cancel-incomplete:"+lease.Report());
+   Require(lease.Clock.ElapsedMilliseconds<=15000,"flat-wait-result-bound");
+   return lease.Report();
+  }finally{lease.Release();}
  }
  static String ProbeFlatRoot(String parent,String user,String package){
   const String npfs=@"\Device\NamedPipe\";
@@ -89,7 +150,7 @@ public static class MsysPipeProof {
   Require(relative.Length<=512&&parent.Length+suffix.Length<=512,"flat-name-bound");
   Int32? rootStatus=null,serverStatus=null,clientStatus=null,query=null;String beforeClient="null",afterClient="null";
   IntPtr root=IntPtr.Zero,server=IntPtr.Zero,client=IntPtr.Zero,descriptor=IntPtr.Zero;
-  try{IO io;using(var attributes=new Attributes(npfs,IntPtr.Zero,IntPtr.Zero))rootStatus=NtOpenFile(out root,0x100080,ref attributes.Value,out io,3,0x20);
+  try{IO io;using(var attributes=new Attributes(npfs,IntPtr.Zero,IntPtr.Zero))rootStatus=NtOpenFile(out root,0x100080,ref attributes.Value,out io,3,0);
    if(rootStatus.Value>=0){
     Require(Valid(root),"flat-root-empty");UInt32 size;
     Require(ConvertStringSecurityDescriptorToSecurityDescriptor("D:(A;;GA;;;"+user+")(A;;GA;;;SY)(A;;GA;;;"+package+")",1,out descriptor,out size),"flat-pipe-descriptor");
@@ -110,7 +171,7 @@ public static class MsysPipeProof {
     }
    }
    return "{\"root\":"+NtStatus(rootStatus)+",\"server\":"+NtStatus(serverStatus)+",\"client\":"+NtStatus(clientStatus)+",\"query\":"+NtStatus(query)+",\"name\":"+JsonPipeName(name)+",\"relativeName\":"+JsonPipeName(relative)+",\"beforeClient\":"+beforeClient+",\"afterClient\":"+afterClient+"}";
-  }finally{Boolean closed=true;if(Valid(client))closed=CloseHandle(client)&&closed;if(Valid(server))closed=CloseHandle(server)&&closed;if(Valid(root))closed=CloseHandle(root)&&closed;if(descriptor!=IntPtr.Zero)LocalFree(descriptor);Require(closed,"close-flat-handles");}
+  }finally{Boolean closed=true;if(Valid(client))closed=CloseHandle(client)&&closed;if(Valid(server))closed=CloseHandle(server)&&closed;if(Valid(root)&&!IsRetainedPipeRoot(root))closed=CloseHandle(root)&&closed;if(descriptor!=IntPtr.Zero)LocalFree(descriptor);Require(closed,"close-flat-handles");}
  }
  static String ProbeExpandedRoot(IntPtr firstServer,String firstSuffix,String user,String package,Boolean flatProof){
   String name,parent=null,relativeName=null,flat="null";Int32 query=QueryOwnedPipeName(firstServer,firstSuffix,out name);

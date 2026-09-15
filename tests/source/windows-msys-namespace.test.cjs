@@ -68,6 +68,11 @@ test('native Windows MSYS namespace isolates event and section leaves across pro
   assert.ok(proof.namespaceCount === 1 || proof.namespaceCount === 2)
   // Each namespace has real event and section leaves with all four MSYS
   // descriptor shapes: WORLD, NULL DACL, default SD, and explicit user/BA/SYSTEM.
-  assert.deepEqual(proof, { sameProfileOpens: proof.namespaceCount * 8, wrongProfileDenied: proof.namespaceCount * 8,
+  // Default descriptors permit real event/section operations. Explicit stock
+  // MSYS descriptors remain incompatible with same-profile opens; proving their
+  // denial does not establish Bash compatibility. Actual Bash success remains
+  // a separate mandatory native CI gate. Every wrong-profile open must fail.
+  assert.deepEqual(proof, { defaultSameProfileOpens: proof.namespaceCount * 2,
+    unsupportedDescriptorSameProfileDenied: proof.namespaceCount * 6, wrongProfileDenied: proof.namespaceCount * 8,
     namespaceCount: proof.namespaceCount, collisionRefused: true, released: true })
 })

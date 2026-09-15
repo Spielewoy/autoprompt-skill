@@ -1,0 +1,158 @@
+'use strict'
+
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const crypto = require('node:crypto')
+const vm = require('node:vm')
+const probe = require('./probe-built-runtime.cjs')
+const lock = require('./build-lock.json')
+const helperPath = path.join(__dirname, 'probe-built-runtime.cjs')
+const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
+const blobDigest = bytes => crypto.createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')
+const temporaryRoot = () => fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'built-runtime-proof-check-')))
+
+test('built runtime proof accepts one staged digest and rejects ambiguous or escaping manifests', () => {
+  const hash = 'a'.repeat(64), valid = `${hash}  stage/usr/bin/msys-2.0.dll\n`
+  assert.equal(probe.stagedDigest(Buffer.from(valid)), hash)
+  for (const bad of ['', valid.trimEnd(), valid.replace('\n', '\r\n'), valid + valid,
+    valid + valid.replace('msys', 'MSYS'), valid.replace('  ', ' *'),
+    valid.replace('usr/bin', 'usr/../bin'), valid.replace('usr/bin', 'usr//bin'),
+    valid.replace('msys-2.0.dll', 'other.dll'), valid.replace(hash, hash.toUpperCase()), valid + 'garbage\n']) {
+    assert.throws(() => probe.stagedDigest(Buffer.from(bad)))
+  }
+  assert.throws(() => probe.stagedDigest(Buffer.concat([Buffer.from(valid), Buffer.from([255, 10])])))
+})
+
+test('built runtime proof requires one successful unskipped native test', () => {
+  const success = `ok 1 - ${probe.TEST_NAME}\n`
+  probe.selectedTestPassed(`TAP version 13\n${success}1..1\n`)
+  for (const output of ['', success.replace('ok ', 'not ok '), success.trimEnd() + ' # SKIP\n',
+    success.trimEnd() + ' # TODO\n', success.trimEnd() + ' different case\n',
+    success + success.replace('ok 1', 'ok 2')]) assert.throws(() => probe.selectedTestPassed(output))
+})
+
+test('built runtime proof refuses oversized and linked inputs and mismatched captured hashes', t => {
+  const root = temporaryRoot()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const directory = path.join(root, 'source'), linkedDirectory = path.join(root, 'linked')
+  fs.mkdirSync(directory)
+  const file = path.join(directory, 'bounded'), bytes = Buffer.from('bounded-data')
+  fs.writeFileSync(file, bytes)
+  assert.deepEqual(probe.readBounded(file, bytes.length), bytes)
+  assert.throws(() => probe.readBounded(file, bytes.length - 1))
+  // A directory junction requires no Windows developer-mode symlink privilege.
+  fs.symlinkSync(directory, linkedDirectory, process.platform === 'win32' ? 'junction' : 'dir')
+  assert.throws(() => probe.readBounded(path.join(linkedDirectory, 'bounded')))
+  const hardlink = path.join(root, 'hardlink')
+  fs.linkSync(file, hardlink)
+  assert.throws(() => probe.readBounded(file))
+  fs.unlinkSync(hardlink)
+  const files = ['bash.exe', 'msys-2.0.dll'].map(name => ({ name, bytes, sha256: digest(bytes) }))
+  assert.equal(probe.closureRecords(files).length, 2)
+  assert.throws(() => probe.closureRecords([files[0], files[0]]))
+  assert.throws(() => probe.closureRecords([files[0], { ...files[1], sha256: 'a'.repeat(64) }]))
+  assert.throws(() => probe.closureRecords([files[0], { ...files[1], name: '../outside.dll' }]))
+})
+
+// Exercise the complete controller and actual filesystem writes. Only Windows
+// process calls, native ACL setup and PE binding are substituted; the helper's
+// lock/blob/digest/path checks, exclusive copies, manifest and TAP gate execute
+// unchanged. This is not a substitute for the actual Windows Bash smoke test.
+for (const scenario of ['pass', 'stage mismatch', 'pinned source drift', 'resolver fallback',
+  'skipped native case', 'failed native case', 'source changed during smoke']) {
+  test(`built runtime controller: ${scenario}`, t => {
+    const root = temporaryRoot()
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const sdk = path.join(root, 'sdk'), payload = path.join(sdk, 'issue27-build')
+    const bin = path.join(sdk, 'usr', 'bin'), systemRoot = path.join(root, 'Windows')
+    const stage = path.join(payload, 'stage', 'usr', 'bin')
+    for (const directory of [bin, stage, systemRoot, path.join(sdk, 'mingw64', 'bin')]) fs.mkdirSync(directory, { recursive: true })
+    fs.writeFileSync(path.join(sdk, 'mingw64', 'bin', 'git.exe'), 'unused process-call placeholder')
+    fs.writeFileSync(path.join(payload, 'lock.json'), JSON.stringify(lock))
+    const original = { 'bash.exe': Buffer.from('pinned Bash'), 'msys-2.0.dll': Buffer.from('pinned original DLL') }
+    const built = Buffer.from('new staged DLL'), foreign = Buffer.from('untrusted mutation')
+    for (const [name, bytes] of Object.entries(original)) fs.writeFileSync(path.join(bin, name), bytes)
+    if (scenario === 'pinned source drift') fs.writeFileSync(path.join(bin, 'msys-2.0.dll'), foreign)
+    fs.writeFileSync(path.join(stage, 'msys-2.0.dll'), scenario === 'stage mismatch' ? foreign : built)
+    fs.writeFileSync(path.join(payload, 'stage.sha256'), `${digest(built)}  stage/usr/bin/msys-2.0.dll\n`)
+    const beforeSource = fs.readFileSync(path.join(bin, 'msys-2.0.dll'))
+    const beforeStage = fs.readFileSync(path.join(stage, 'msys-2.0.dll'))
+    const bind = directory => Object.keys(original).map(name => {
+      const file = path.join(directory, name), bytes = fs.readFileSync(file)
+      return { name, bytes, sha256: digest(bytes), path: file }
+    })
+    const state = { childCalls: 0, acl: [], runtime: null }
+    const module = { exports: {} }
+    const environment = { SystemRoot: systemRoot, AUTOPROMPT_WINDOWS_BASH: 'ambient Bash', Node_Options: 'ambient Node options' }
+    const fakeProcess = { platform: 'win32', arch: 'x64', argv: [process.execPath, helperPath, root],
+      execPath: process.execPath, env: environment, stdout: { write() {} }, stderr: { write() {} } }
+    const native = {
+      spawnSync(executable, args, options) {
+        if (executable === path.join(sdk, 'mingw64', 'bin', 'git.exe')) {
+          if (args.includes('rev-parse')) return { status: 0, stdout: lock.sdk.commit + '\n' }
+          assert.ok(args.includes('ls-tree'))
+          return { status: 0, stdout: Object.entries(original).map(([name, bytes]) => `100755 blob ${blobDigest(bytes)}\tusr/bin/${name}\0`).join('') }
+        }
+        ++state.childCalls
+        assert.equal(executable, process.execPath)
+        assert.ok(args.includes('--test'))
+        assert.equal(args[args.indexOf('--test-name-pattern') + 1], `^${probe.TEST_NAME}$`)
+        assert.equal(options.timeout, 615000)
+        assert.equal(options.env.Node_Options, undefined)
+        assert.equal(options.env.AUTOPROMPT_WINDOWS_BASH, path.join(state.runtime, 'bash.exe'))
+        assert.equal(environment.AUTOPROMPT_WINDOWS_BASH, 'ambient Bash', 'The controller must not mutate its own environment')
+        assert.deepEqual(fs.readFileSync(path.join(state.runtime, 'msys-2.0.dll')), built)
+        assert.deepEqual(fs.readFileSync(path.join(state.runtime, 'bash.exe')), original['bash.exe'])
+        if (scenario === 'source changed during smoke') fs.writeFileSync(path.join(bin, 'msys-2.0.dll'), foreign)
+        return { status: scenario === 'failed native case' ? 1 : 0, signal: null,
+          stdout: `ok 1 - ${probe.TEST_NAME}${scenario === 'skipped native case' ? ' # SKIP' : ''}\n`, stderr: 'native diagnostic witness\n' }
+      },
+    }
+    const customRequire = name => {
+      if (name === 'node:child_process') return native
+      if (name.endsWith('/windows-appcontainer-command.js')) return {
+        bindBashRuntime: bind,
+        resolveWindowsBash({ bashPath }) {
+          state.runtime = path.dirname(bashPath)
+          assert.equal(path.dirname(state.runtime), payload, 'Proof copy must be beside stage')
+          assert.ok(path.basename(state.runtime).startsWith('proof-runtime-'))
+          assert.ok(state.acl.includes(state.runtime), 'Private ACL must precede execution')
+          return { bash: { path: scenario === 'resolver fallback' ? path.join(bin, 'bash.exe') : bashPath }, files: bind(state.runtime) }
+        },
+      }
+      if (name.endsWith('/safe-run-root.js')) return { ensureWindowsPrivateAcl(directory) { state.acl.push(directory) } }
+      return require(name)
+    }
+    // Expose main only in this isolated test copy, without production test hooks.
+    vm.runInNewContext(fs.readFileSync(helperPath, 'utf8') + '\nmodule.exports.mainForTest = main;\n',
+      { require: customRequire, module, __dirname, process: fakeProcess, Buffer }, { filename: helperPath })
+    const main = () => module.exports.mainForTest(root)
+    if (scenario === 'pass') main()
+    else assert.throws(main, {
+      message: new RegExp({
+        'stage mismatch': 'Staged DLL does not match',
+        'pinned source drift': 'SDK working-tree dependency differs',
+        'resolver fallback': 'Bash resolver fell back',
+        'skipped native case': 'must not skip',
+        'failed native case': 'Native Bash smoke test failed',
+        'source changed during smoke': 'Smoke proof modified SDK source inputs',
+      }[scenario]),
+    })
+    const launched = ['pass', 'skipped native case', 'failed native case', 'source changed during smoke'].includes(scenario)
+    assert.equal(state.childCalls, launched ? 1 : 0, 'Failed input verification must prevent the native test')
+    assert.deepEqual(fs.readFileSync(path.join(bin, 'msys-2.0.dll')), scenario === 'source changed during smoke' ? foreign : beforeSource)
+    assert.deepEqual(fs.readFileSync(path.join(stage, 'msys-2.0.dll')), beforeStage)
+    const log = fs.readFileSync(path.join(payload, 'built-runtime-proof.txt'), 'utf8')
+    if (launched) {
+      assert.ok(log.includes('native diagnostic witness'))
+      const manifest = JSON.parse(fs.readFileSync(path.join(payload, 'built-runtime-manifest.json'), 'utf8'))
+      assert.equal(manifest.stageSha256, digest(built))
+      assert.equal(manifest.sdkCommit, lock.sdk.commit)
+      assert.equal(manifest.bashPath, path.join(state.runtime, 'bash.exe'))
+    }
+    assert.ok(log.includes(scenario === 'pass' ? 'native Bash smoke passed' : 'Built runtime smoke refused'))
+  })
+}

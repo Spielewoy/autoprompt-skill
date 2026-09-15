@@ -86,6 +86,8 @@ done
 export PATH=/issue27-build/build-tools:/usr/bin:/bin
 export CFLAGS='-O2 -pipe -g0 -DCYGPORT_RELEASE_INFO=3.6.10'
 export CXXFLAGS='-O2 -pipe -g0'
+export CPPFLAGS='' LDFLAGS=''
+printf 'CFLAGS=%s\nCXXFLAGS=%s\nCPPFLAGS=%s\nLDFLAGS=%s\n' "$CFLAGS" "$CXXFLAGS" "$CPPFLAGS" "$LDFLAGS" > build-flags.txt
 build_stage=autogen
 (cd source/winsup && ./autogen.sh)
 cd build

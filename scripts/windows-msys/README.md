@@ -2,9 +2,18 @@
 
 This directory builds an isolated compiler proof from the exact source and SDK
 commits in `build-lock.json`. It does not replace an installed Git/MSYS runtime
-or select the resulting DLL for production commands. The initial patch only
-adds the pipe security adapter and its build/import registration; pipe creation
-sites are not yet connected to it.
+or select the resulting DLL for production commands. The adaptation connects
+actual-token pipe descriptors and LOCAL names to signal pipes, ordinary native
+pipes, FIFOs and PTY control pipes. Named events, mutexes, semaphores, mappings,
+flock directories, socket state and queues receive the exact package grant.
+Host calls retain their original descriptors and names.
+
+Native Windows observations establish that both LOCAL names and exact package
+permissions are needed. Native pipe names use the observed opaque AppContainer
+prefix under the bare NPFS root; apparent intermediate paths are not directories.
+The adapter discovers that prefix through a fresh, connected, privately owned
+pipe pair and validates both kernel-reported endpoint names. No environment
+variable supplies an object namespace or package identity.
 
 On a native Windows x64 runner with Git and PowerShell, choose a fresh local
 directory without spaces and run `build.ps1 -WorkRoot <directory> -Mode proof`.
@@ -39,5 +48,18 @@ functional compatibility, native isolation, reproducibility, and distribution
 packaging remain acceptance work. No passing compiler result alone establishes
 Git Bash support. Existing native Bash and installed-provider gates remain
 mandatory.
+
+After a successful build, `node scripts/windows-msys/probe-built-runtime.cjs
+<WorkRoot>` assembles a separate private closure from the pinned SDK Bash files
+and the checksum-bound staged DLL. It verifies source Git blobs, copied hashes
+and explicit runtime selection, then runs the existing native Bash scratch-write
+and denied-access test. Its manifest and log accompany the compiler artifacts.
+The installed SDK and ordinary full-suite runtime selection are unchanged.
+
+The pinned default build does not define `__WITH_AF_UNIX`; its experimental
+`socket_unix.cc` implementation is excluded. This patch leaves that dormant
+implementation unchanged. Default AF_LOCAL uses the existing Winsock-backed
+implementation. Compiler flags are explicit and do not inherit CPPFLAGS or
+LDFLAGS from the host.
 
 Upstream build instructions: https://gitforwindows.org/building-msys2-runtime.html
