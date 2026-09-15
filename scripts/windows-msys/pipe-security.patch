@@ -1,0 +1,382 @@
+--- a/winsup/cygwin/Makefile.am
++++ b/winsup/cygwin/Makefile.am
+@@ -264,6 +264,7 @@
+ 
+ SEC_FILES= \
+ 	sec/acl.cc \
++	sec/appcontainer_pipe.cc \
+ 	sec/auth.cc \
+ 	sec/base.cc \
+ 	sec/helper.cc \
+--- a/winsup/cygwin/autoload.cc
++++ b/winsup/cygwin/autoload.cc
+@@ -415,11 +415,31 @@
+ 
+ LoadDLLprime (ws2_32, _wsock_init, 0)
+ 
++LoadDLLfunc (AddAccessAllowedAceEx, advapi32)
++LoadDLLfunc (AddAce, advapi32)
+ LoadDLLfunc (CheckTokenMembership, advapi32)
++LoadDLLfunc (CopySid, advapi32)
+ LoadDLLfunc (CreateProcessAsUserW, advapi32)
++LoadDLLfunc (CreateWellKnownSid, advapi32)
+ LoadDLLfunc (DeregisterEventSource, advapi32)
+ LoadDLLfunc (DecryptFileW, advapi32)
+ LoadDLLfunc (EncryptFileW, advapi32)
++LoadDLLfunc (GetAclInformation, advapi32)
++LoadDLLfunc (GetLengthSid, advapi32)
++LoadDLLfunc (GetSecurityDescriptorControl, advapi32)
++LoadDLLfunc (GetSecurityDescriptorDacl, advapi32)
++LoadDLLfunc (GetSecurityDescriptorGroup, advapi32)
++LoadDLLfunc (GetSecurityDescriptorOwner, advapi32)
++LoadDLLfunc (GetSecurityDescriptorRMControl, advapi32)
++LoadDLLfunc (GetSecurityDescriptorSacl, advapi32)
++LoadDLLfunc (GetSidLengthRequired, advapi32)
++LoadDLLfunc (GetSidSubAuthorityCount, advapi32)
++LoadDLLfunc (GetTokenInformation, advapi32)
++LoadDLLfunc (InitializeAcl, advapi32)
++LoadDLLfunc (InitializeSecurityDescriptor, advapi32)
++LoadDLLfunc (IsValidAcl, advapi32)
++LoadDLLfunc (IsValidSecurityDescriptor, advapi32)
++LoadDLLfunc (IsValidSid, advapi32)
+ LoadDLLfunc (LogonUserW, advapi32)
+ LoadDLLfunc (LookupAccountNameW, advapi32)
+ LoadDLLfunc (LookupAccountSidW, advapi32)
+@@ -431,6 +451,7 @@
+ LoadDLLfunc (LsaQueryInformationPolicy, advapi32)
+ LoadDLLfunc (LsaRetrievePrivateData, advapi32)
+ LoadDLLfunc (LsaStorePrivateData, advapi32)
++LoadDLLfunc (OpenProcessToken, advapi32)
+ LoadDLLfunc (RegOpenUserClassesRoot, advapi32)
+ LoadDLLfunc (RegOpenCurrentUser, advapi32)
+ LoadDLLfunc (RegCloseKey, advapi32)
+@@ -443,6 +464,12 @@
+ LoadDLLfunc (RegQueryValueExW, advapi32)
+ LoadDLLfunc (RegisterEventSourceW, advapi32)
+ LoadDLLfunc (ReportEventW, advapi32)
++LoadDLLfunc (SetSecurityDescriptorControl, advapi32)
++LoadDLLfunc (SetSecurityDescriptorDacl, advapi32)
++LoadDLLfunc (SetSecurityDescriptorGroup, advapi32)
++LoadDLLfunc (SetSecurityDescriptorOwner, advapi32)
++LoadDLLfunc (SetSecurityDescriptorRMControl, advapi32)
++LoadDLLfunc (SetSecurityDescriptorSacl, advapi32)
+ LoadDLLfunc (SystemFunction036, advapi32)	/* Aka "RtlGenRandom" */
+ 
+ LoadDLLfunc (AuthzAccessCheck, authz)
+--- /dev/null
++++ b/winsup/cygwin/local_includes/appcontainer_pipe_security.h
+@@ -0,0 +1,31 @@
++/* Source-only prototype; not part of an installed or tested MSYS runtime. */
++#ifndef _APPCONTAINER_PIPE_SECURITY_H
++#define _APPCONTAINER_PIPE_SECURITY_H
++
++/* Include after winsup.h. One object owns one synchronous pipe-creation
++   descriptor. Do not retain it across fork or cache it in global storage. */
++class appcontainer_pipe_security
++{
++  SECURITY_ATTRIBUTES attributes_;
++  SECURITY_DESCRIPTOR descriptor_;
++  LPSECURITY_ATTRIBUTES result_;
++  void *storage_;
++  bool prepared_;
++  bool appcontainer_;
++
++  appcontainer_pipe_security (const appcontainer_pipe_security &) = delete;
++  appcontainer_pipe_security &operator=
++    (const appcontainer_pipe_security &) = delete;
++
++public:
++  appcontainer_pipe_security ();
++  ~appcontainer_pipe_security ();
++
++  /* Return a Win32 error. On error get() is NULL and callers MUST refuse the
++     pipe operation. On ordinary hosts get() is exactly source, including NULL.
++     In an AppContainer get() owns its complete descriptor until destruction. */
++  DWORD prepare (LPSECURITY_ATTRIBUTES source);
++  LPSECURITY_ATTRIBUTES get () const { return result_; }
++  bool is_appcontainer () const { return appcontainer_; }
++};
++#endif
+--- /dev/null
++++ b/winsup/cygwin/sec/appcontainer_pipe.cc
+@@ -0,0 +1,280 @@
++/* Pipe-only AppContainer descriptor prototype.
++
++   Baseline: git-for-windows/msys2-runtime
++   270ba2980700e6e2a0813944d506eecea0f86402.
++   No global sec_acl change, no environment inputs and no cached token state.
++   This source has not been compiled or run in the MSYS build environment. */
++
++#include "winsup.h"
++#include <stdint.h>
++#include <string.h>
++#include "appcontainer_pipe_security.h"
++
++namespace
++{
++constexpr DWORD pipe_sd_limit = 128 * 1024;
++constexpr DWORD pipe_acl_limit = 0xffff;
++
++struct scoped_token
++{
++  HANDLE value;
++  scoped_token () : value (NULL) {}
++  ~scoped_token () { if (value) CloseHandle (value); }
++};
++
++/* Token information includes a pointer followed by an inline variable SID.
++   Check that pointer against the returned buffer before inspecting the SID. */
++bool
++bounded_sid (PSID sid, const void *buffer, DWORD size)
++{
++  uintptr_t start = reinterpret_cast<uintptr_t> (buffer);
++  uintptr_t value = reinterpret_cast<uintptr_t> (sid);
++  if (!sid || value < start || value - start > size
++      || size - (value - start) < 8)
++    return false;
++  DWORD remaining = size - (value - start);
++  BYTE count = *GetSidSubAuthorityCount (sid);
++  DWORD length = GetSidLengthRequired (count);
++  return length <= SECURITY_MAX_SID_SIZE && length <= remaining
++         && IsValidSid (sid);
++}
++
++union sid_buffer
++{
++  ULONG_PTR align;
++  BYTE bytes[SECURITY_MAX_SID_SIZE];
++};
++
++/* GetTokenInformation is used rather than a user-controlled SID string.
++   Buffers are fixed and bounded; an oversized or malformed result refuses. */
++DWORD
++token_sid (HANDLE token, TOKEN_INFORMATION_CLASS kind, sid_buffer &destination)
++{
++  union
++  {
++    ULONG_PTR align;
++    BYTE bytes[sizeof (TOKEN_USER) + SECURITY_MAX_SID_SIZE];
++  } information;
++  DWORD returned = 0;
++  if (!GetTokenInformation (token, kind, information.bytes,
++                            sizeof information, &returned))
++    return GetLastError ();
++  if (returned > sizeof information || returned < sizeof (PSID))
++    return ERROR_INVALID_DATA;
++  PSID sid = kind == TokenUser
++    ? reinterpret_cast<TOKEN_USER *> (information.bytes)->User.Sid
++    : reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION *>
++        (information.bytes)->TokenAppContainer;
++  if (!bounded_sid (sid, information.bytes, returned))
++    return ERROR_INVALID_SID;
++  if (!CopySid (sizeof destination.bytes, destination.bytes, sid))
++    return GetLastError ();
++  return ERROR_SUCCESS;
++}
++
++DWORD
++sid_size (PSID sid)
++{
++  if (!sid)
++    return 0;
++  return IsValidSid (sid) ? GetLengthSid (sid) : 0xffffffff;
++}
++
++DWORD
++acl_used (PACL acl, ACL_SIZE_INFORMATION &info)
++{
++  if (!acl || !IsValidAcl (acl)
++      || !GetAclInformation (acl, &info, sizeof info, AclSizeInformation)
++      || (acl->AclSize & 3) || (info.AclBytesInUse & 3)
++      || info.AclBytesInUse < sizeof (ACL)
++      || info.AclBytesInUse > acl->AclSize
++      || (acl->AclRevision != ACL_REVISION
++          && acl->AclRevision != ACL_REVISION_DS))
++    return ERROR_INVALID_ACL;
++  return ERROR_SUCCESS;
++}
++}
++
++appcontainer_pipe_security::appcontainer_pipe_security ()
++  : attributes_ {}, descriptor_ {}, result_ (NULL), storage_ (NULL),
++    prepared_ (false), appcontainer_ (false)
++{
++}
++
++appcontainer_pipe_security::~appcontainer_pipe_security ()
++{
++  if (storage_)
++    HeapFree (GetProcessHeap (), 0, storage_);
++}
++
++DWORD
++appcontainer_pipe_security::prepare (LPSECURITY_ATTRIBUTES source)
++{
++  DWORD previous_last_error = GetLastError ();
++  result_ = NULL;
++  if (prepared_)
++    return ERROR_INVALID_FUNCTION;
++  prepared_ = true;
++
++  scoped_token token;
++  if (!OpenProcessToken (GetCurrentProcess (), TOKEN_QUERY, &token.value))
++    return GetLastError ();
++  DWORD container = 0, returned = 0;
++  if (!GetTokenInformation (token.value, TokenIsAppContainer, &container,
++                            sizeof container, &returned))
++    return GetLastError ();
++  if (returned != sizeof container || container > 1)
++    return ERROR_INVALID_DATA;
++  if (!container)
++    {
++      /* Do not inspect, normalize, copy or relabel an ordinary host SD. */
++      result_ = source;
++      CloseHandle (token.value);
++      token.value = NULL;
++      SetLastError (previous_last_error);
++      return ERROR_SUCCESS;
++    }
++  appcontainer_ = true;
++
++  if (source && source->nLength != sizeof (SECURITY_ATTRIBUTES))
++    return ERROR_INVALID_PARAMETER;
++  sid_buffer package, user, system;
++  DWORD error = token_sid (token.value, TokenAppContainerSid, package);
++  if (error)
++    return error;
++
++  PSECURITY_DESCRIPTOR supplied = source ? source->lpSecurityDescriptor : NULL;
++  PSID owner = NULL, group = NULL;
++  PACL old_dacl = NULL, old_sacl = NULL;
++  BOOL owner_defaulted = FALSE, group_defaulted = FALSE;
++  BOOL dacl_present = FALSE, dacl_defaulted = FALSE;
++  BOOL sacl_present = FALSE, sacl_defaulted = FALSE;
++  SECURITY_DESCRIPTOR_CONTROL control = 0;
++  UCHAR rm_control = 0;
++  DWORD revision = 0;
++  if (supplied)
++    {
++      if (!IsValidSecurityDescriptor (supplied)
++          || !GetSecurityDescriptorControl (supplied, &control, &revision)
++          || revision != SECURITY_DESCRIPTOR_REVISION
++          || !GetSecurityDescriptorOwner (supplied, &owner, &owner_defaulted)
++          || !GetSecurityDescriptorGroup (supplied, &group, &group_defaulted)
++          || !GetSecurityDescriptorDacl (supplied, &dacl_present, &old_dacl,
++                                         &dacl_defaulted)
++          || !GetSecurityDescriptorSacl (supplied, &sacl_present, &old_sacl,
++                                         &sacl_defaulted))
++        return ERROR_INVALID_SECURITY_DESCR;
++      /* These legacy control modes cannot be reproduced by the documented
++         component/inheritance setters below. Refuse rather than drop them. */
++      if (control & (SE_DACL_UNTRUSTED | SE_SERVER_SECURITY))
++        return ERROR_INVALID_SECURITY_DESCR;
++      if ((control & SE_RM_CONTROL_VALID)
++          && (error = GetSecurityDescriptorRMControl (supplied, &rm_control)))
++        return error;
++    }
++
++  /* An absent/default/NULL DACL is not copied as broad access. Only these
++     cases receive the explicit private user+SYSTEM+package descriptor. An
++     explicit empty DACL remains empty except for the appended package ACE;
++     it does NOT acquire an otherwise missing user grant. */
++  bool private_default = !dacl_present || !old_dacl;
++  if (private_default)
++    {
++      error = token_sid (token.value, TokenUser, user);
++      if (error)
++        return error;
++      DWORD system_size = sizeof system.bytes;
++      if (!CreateWellKnownSid (WinLocalSystemSid, NULL, system.bytes,
++                               &system_size))
++        return GetLastError ();
++    }
++
++  DWORD owner_size = sid_size (owner), group_size = sid_size (group);
++  if (owner_size > SECURITY_MAX_SID_SIZE || group_size > SECURITY_MAX_SID_SIZE)
++    return ERROR_INVALID_SID;
++  ACL_SIZE_INFORMATION dacl_info {}, sacl_info {};
++  if (!private_default && (error = acl_used (old_dacl, dacl_info)))
++    return error;
++  if (sacl_present && old_sacl && (error = acl_used (old_sacl, sacl_info)))
++    return error;
++  DWORD original_aces = private_default ? 0
++    : dacl_info.AclBytesInUse - sizeof (ACL);
++  DWORD package_ace = sizeof (ACCESS_ALLOWED_ACE) - sizeof (DWORD)
++                      + GetLengthSid (package.bytes);
++  DWORD dacl_size = sizeof (ACL) + original_aces + package_ace;
++  if (private_default)
++    dacl_size += 2 * (sizeof (ACCESS_ALLOWED_ACE) - sizeof (DWORD))
++                 + GetLengthSid (user.bytes) + GetLengthSid (system.bytes);
++  DWORD sacl_size = sacl_present && old_sacl ? old_sacl->AclSize : 0;
++  DWORD total = owner_size + group_size + sacl_size + dacl_size;
++  if (dacl_size > pipe_acl_limit || sacl_size > pipe_acl_limit
++      || total > pipe_sd_limit)
++    return ERROR_ALLOTTED_SPACE_EXCEEDED;
++  storage_ = HeapAlloc (GetProcessHeap (), HEAP_ZERO_MEMORY, total);
++  if (!storage_)
++    return ERROR_NOT_ENOUGH_MEMORY;
++  BYTE *cursor = static_cast<BYTE *> (storage_);
++
++  /* Copy all components. Descriptor pointers never refer back to caller
++     storage or a token-query buffer after prepare returns. */
++  if (!InitializeSecurityDescriptor (&descriptor_, SECURITY_DESCRIPTOR_REVISION))
++    return GetLastError ();
++  PSID copied_owner = NULL, copied_group = NULL;
++  PACL copied_sacl = NULL;
++  if (owner_size)
++    { memcpy (cursor, owner, owner_size); copied_owner = cursor;
++      cursor += owner_size; }
++  if (group_size)
++    { memcpy (cursor, group, group_size); copied_group = cursor;
++      cursor += group_size; }
++  if (sacl_size)
++    { memcpy (cursor, old_sacl, sacl_size);
++      copied_sacl = reinterpret_cast<PACL> (cursor); cursor += sacl_size; }
++
++  PACL dacl = reinterpret_cast<PACL> (cursor);
++  DWORD acl_revision = private_default ? ACL_REVISION : old_dacl->AclRevision;
++  if (!InitializeAcl (dacl, dacl_size, acl_revision))
++    return GetLastError ();
++  if (original_aces
++      && !AddAce (dacl, acl_revision, MAXDWORD,
++                   reinterpret_cast<BYTE *> (old_dacl) + sizeof (ACL),
++                   original_aces))
++    return GetLastError ();
++  if (private_default
++      && (!AddAccessAllowedAceEx (dacl, acl_revision, 0, GENERIC_ALL, user.bytes)
++          || !AddAccessAllowedAceEx (dacl, acl_revision, 0, GENERIC_ALL,
++                                     system.bytes)))
++    return GetLastError ();
++  /* Append AFTER every original ACE. Preserve every deny/allow byte and its
++     order. Never insert the new allow in front of an existing inherited deny.
++     This does not promise canonical reordering; authorization remains subject
++     to the original restrictions and the OS object access check. */
++  if (!AddAccessAllowedAceEx (dacl, acl_revision, 0, GENERIC_ALL, package.bytes))
++    return GetLastError ();
++  if (!SetSecurityDescriptorOwner (&descriptor_, copied_owner, owner_defaulted)
++      || !SetSecurityDescriptorGroup (&descriptor_, copied_group, group_defaulted)
++      || !SetSecurityDescriptorSacl (&descriptor_, sacl_present, copied_sacl,
++                                     sacl_defaulted)
++      || !SetSecurityDescriptorDacl (&descriptor_, TRUE, dacl, dacl_defaulted))
++    return GetLastError ();
++  const SECURITY_DESCRIPTOR_CONTROL inheritance = SE_DACL_AUTO_INHERIT_REQ
++    | SE_SACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED | SE_SACL_AUTO_INHERITED
++    | SE_DACL_PROTECTED | SE_SACL_PROTECTED;
++  if (!SetSecurityDescriptorControl (&descriptor_, inheritance,
++                                     control & inheritance))
++    return GetLastError ();
++  if ((control & SE_RM_CONTROL_VALID)
++      && (error = SetSecurityDescriptorRMControl (&descriptor_, &rm_control)))
++    return error;
++  SECURITY_DESCRIPTOR_CONTROL copied_control;
++  if (!GetSecurityDescriptorControl (&descriptor_, &copied_control, &revision)
++      || copied_control != ((control & ~SE_SELF_RELATIVE) | SE_DACL_PRESENT))
++    return ERROR_INVALID_SECURITY_DESCR;
++  if (!IsValidSecurityDescriptor (&descriptor_))
++    return ERROR_INVALID_SECURITY_DESCR;
++  attributes_.nLength = sizeof attributes_;
++  attributes_.lpSecurityDescriptor = &descriptor_;
++  attributes_.bInheritHandle = source ? source->bInheritHandle : FALSE;
++  result_ = &attributes_;
++  return ERROR_SUCCESS;
++}

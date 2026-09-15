@@ -185,6 +185,16 @@ public static class WindowsAppContainerNative {
    UInt32 count=Math.Min(available,4096u);byte[] bytes=new byte[count];UInt32 read;if(!ReadFile(pipe,bytes,count,out read,IntPtr.Zero)){if(Marshal.GetLastWin32Error()==ERROR_BROKEN_PIPE)return true;throw new Win32Exception(Marshal.GetLastWin32Error(),"ReadFile");}if(total+(long)read>bound)return false;output.Write(bytes,0,(int)read);total+=(int)read;
   }
  }
+ // CreateProcess resolves an AppContainer profile from the caller's
+ // LOCALAPPDATA. Resolve the Windows known folder instead of trusting an
+ // ambient value. The production helper is private to one Launch; repeated
+ // fixture launches resolve the same stable controller-user known folder.
+ // This host API prerequisite is never added to the explicit child block.
+ static void PrepareControllerProfileEnvironment(){
+  String local=Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+  if(String.IsNullOrEmpty(local)||local.Length>32700||!Path.IsPathRooted(local)||!String.Equals(Path.GetFullPath(local),local,StringComparison.OrdinalIgnoreCase)||!Directory.Exists(local))throw new InvalidOperationException("WINDOWS_CONTROLLER_PROFILE_UNAVAILABLE");
+  Environment.SetEnvironmentVariable("LOCALAPPDATA",local,EnvironmentVariableTarget.Process);
+ }
  // Called only by the controller after validating its private deployment and
  // resource grants. No caller handles, network capabilities, or breakaway flag
  // are accepted. The executable remains open without write/delete sharing.
@@ -194,6 +204,7 @@ public static class WindowsAppContainerNative {
  public static LaunchResult Launch(String executable,String executableSha256,String[] arguments,String cwd,String[] environmentEntries,Int32 timeoutMs,Int32 outputLimit,IntPtr appSid,String expectedSid,String cancellationPath,MsysNamespaceRequest msysRuntime) {
   lock(undrainedNamespaces){if(undrainedNamespaces.Count!=0)throw new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED");}
   if(arguments==null||arguments.Length>256||arguments.Any(x=>x==null||x.IndexOf('\0')>=0)||timeoutMs<1||timeoutMs>300000||outputLimit<1||outputLimit>1048576||Sid(appSid)!=expectedSid)throw new InvalidOperationException("WINDOWS_LAUNCH_INVALID");
+  PrepareControllerProfileEnvironment();
   var command=new StringBuilder(String.Join(" ",(new[]{executable}).Concat(arguments).Select(Quote)));if(command.Length>32760)throw new InvalidOperationException("WINDOWS_COMMAND_LIMIT");
   IntPtr size=IntPtr.Zero,list=IntPtr.Zero,caps=IntPtr.Zero,job=IntPtr.Zero,limit=IntPtr.Zero,environment=IntPtr.Zero,stdoutRead=IntPtr.Zero,stdoutWrite=IntPtr.Zero,stderrRead=IntPtr.Zero,stderrWrite=IntPtr.Zero,nulRead=IntPtr.Zero,handleList=IntPtr.Zero;PROCESS_INFORMATION pi=new PROCESS_INFORMATION();Boolean assigned=false,confirmedDrain=true;ImageBinding imageBinding=null;MsysNamespaceLease namespaceLease=null;
   try {

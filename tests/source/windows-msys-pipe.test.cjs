@@ -50,13 +50,62 @@ test('native Windows pipe diagnostic records namespace and descriptor outcomes u
     let index = 0
     for (const namespace of ['bare', 'local']) for (const descriptor of ['world', 'user', 'package']) {
       const observation = cases[index++]
-      assert.deepEqual(Object.keys(observation).sort(), ['clientError', 'descriptor', 'namespace', 'serverError'])
+      assert.deepEqual(Object.keys(observation).sort(), ['clientError', 'descriptor', 'expanded', 'namespace', 'serverError'])
       assert.equal(observation.namespace, namespace)
       assert.equal(observation.descriptor, descriptor)
       assert.ok(Number.isSafeInteger(observation.serverError) && observation.serverError >= 0)
       if (observation.serverError === 0) assert.ok(Number.isSafeInteger(observation.clientError) && observation.clientError >= 0)
       else assert.equal(observation.clientError, null, 'A failed listener must not probe an unrelated client endpoint')
       if (label === 'controller') assert.deepEqual([observation.serverError, observation.clientError], [0, 0])
+      if (namespace !== 'local' || observation.serverError !== 0 || observation.clientError !== 0) {
+        assert.equal(observation.expanded, null)
+        continue
+      }
+      const expanded = observation.expanded
+      assert.deepEqual(Object.keys(expanded).sort(), ['client', 'name', 'parent', 'query', 'relativeName', 'relativeQuery', 'root', 'server'])
+      function succeeded(status) {
+        if (status === null) return false
+        assert.deepEqual(Object.keys(status).sort(), ['status', 'win32Error'])
+        assert.match(status.status, /^[0-9A-F]{8}$/)
+        assert.ok(Number.isSafeInteger(status.win32Error) && status.win32Error >= 0 && status.win32Error <= 0xffffffff)
+        return Number.parseInt(status.status, 16) < 0x80000000
+      }
+      function ownedName(name) {
+        assert.equal(typeof name, 'string')
+        assert.ok(name.length <= 512)
+        assert.match(name, /^\\Device\\NamedPipe\\(?:[A-Za-z0-9_{}.\\-]+\\)?autoprompt-msys-proof-[a-f0-9]{32}$/i)
+        assert.ok(!name.split('\\').some(part => part === '.' || part === '..'))
+      }
+      assert.notEqual(expanded.query, null)
+      if (!succeeded(expanded.query)) {
+        for (const key of ['name', 'parent', 'root', 'server', 'client', 'relativeQuery', 'relativeName']) assert.equal(expanded[key], null)
+        continue
+      }
+      ownedName(expanded.name)
+      assert.equal(expanded.parent, expanded.name.slice(0, expanded.name.lastIndexOf('\\') + 1))
+      assert.notEqual(expanded.root, null)
+      if (!succeeded(expanded.root)) {
+        for (const key of ['server', 'client', 'relativeQuery', 'relativeName']) assert.equal(expanded[key], null)
+        continue
+      }
+      assert.notEqual(expanded.server, null)
+      if (!succeeded(expanded.server)) {
+        for (const key of ['client', 'relativeQuery', 'relativeName']) assert.equal(expanded[key], null)
+        continue
+      }
+      assert.notEqual(expanded.client, null)
+      if (!succeeded(expanded.client)) {
+        assert.equal(expanded.relativeQuery, null)
+        assert.equal(expanded.relativeName, null)
+        continue
+      }
+      assert.notEqual(expanded.relativeQuery, null)
+      if (succeeded(expanded.relativeQuery)) {
+        ownedName(expanded.relativeName)
+        assert.equal(expanded.relativeName.slice(0, expanded.relativeName.lastIndexOf('\\') + 1), expanded.parent)
+        assert.notEqual(expanded.relativeName, expanded.name)
+      } else assert.equal(expanded.relativeName, null)
+
     }
   }
   for (const [label, cases] of [['controller', proof.ntController], ['child', proof.child.ntRoots]]) {

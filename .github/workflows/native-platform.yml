@@ -13,7 +13,7 @@ jobs:
   platform-primitives:
     name: Platform and installer / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -75,6 +75,29 @@ jobs:
         # mandatory in the full suite below and still fails the job there.
         continue-on-error: true
         run: node --test tests/source/windows-msys-pipe.test.cjs
+      # Branch-scoped compiler investigation; no generated DLL is selected by
+      # the native runtime tests. Keep this within the existing 20-job matrix.
+      - name: Compile the isolated MSYS pipe adapter proof
+        id: msys-proof
+        if: github.ref == 'refs/heads/codex/issue-27-native-platform-support' && matrix.runner.os == 'windows-latest' && matrix.node == '24.x'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $patch = (Resolve-Path scripts/windows-msys/pipe-security.patch).Path
+          $digest = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
+          ./scripts/windows-msys/build.ps1 -WorkRoot (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof') -Mode proof -AdaptationPatch $patch -AdaptationSha256 $digest -Jobs 4
+      - name: Preserve the MSYS compiler proof and diagnostics
+        if: always() && github.ref == 'refs/heads/codex/issue-27-native-platform-support' && matrix.runner.os == 'windows-latest' && matrix.node == '24.x'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-compiler-proof
+          path: |
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/build/*.txt
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/build/**/config.log
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/*.txt
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/*.sha256
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/stage
+          if-no-files-found: warn
       - name: Run platform tests and reject skips of this host's native cases
         run: node tests/helpers/native-platform-ci.cjs platform
       - name: Verify doctor readiness and isolated Bash and PowerShell diagnostics
@@ -94,6 +117,9 @@ jobs:
           if-no-files-found: warn
       - name: Packed installer lifecycle
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
+      - name: Require the selected MSYS compiler proof to succeed
+        if: always() && steps.msys-proof.outcome == 'failure'
+        run: node -e "process.exit(1)"
 
   claude-native:
     name: Actual Claude 2.1.270 / ${{ matrix.runner.os }} / Node ${{ matrix.node }}

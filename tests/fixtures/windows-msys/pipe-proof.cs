@@ -14,6 +14,7 @@ public static class MsysPipeProof {
  [StructLayout(LayoutKind.Sequential)] struct US { public UInt16 Length,MaximumLength; public IntPtr Buffer; }
  [StructLayout(LayoutKind.Sequential)] struct OA { public Int32 Length; public IntPtr RootDirectory,ObjectName; public UInt32 Attributes; public IntPtr SecurityDescriptor,SecurityQualityOfService; }
  [StructLayout(LayoutKind.Sequential)] struct IO { public IntPtr Status,Information; }
+ [DllImport("ntdll.dll")] static extern Int32 NtQueryObject(IntPtr handle,Int32 information,IntPtr buffer,Int32 length,out UInt32 returned);
  [DllImport("ntdll.dll")] static extern Int32 NtOpenFile(out IntPtr handle,UInt32 access,ref OA attributes,out IO io,UInt32 share,UInt32 options);
  [DllImport("ntdll.dll")] static extern Int32 NtCreateNamedPipeFile(out IntPtr handle,UInt32 access,ref OA attributes,out IO io,UInt32 share,UInt32 disposition,UInt32 options,UInt32 type,UInt32 readMode,UInt32 completionMode,UInt32 instances,UInt32 inbound,UInt32 outbound,ref Int64 timeout);
  [DllImport("ntdll.dll")] static extern UInt32 RtlNtStatusToDosError(Int32 status);
@@ -33,6 +34,55 @@ public static class MsysPipeProof {
   public void Dispose(){Marshal.FreeHGlobal(name);Marshal.FreeHGlobal(text);}
  }
  static String NtStatus(Int32? status){return status.HasValue?"{\"status\":\""+unchecked((UInt32)status.Value).ToString("X8")+"\",\"win32Error\":"+RtlNtStatusToDosError(status.Value)+"}":"null";}
+ // Fixed-size, single-call query: never log a partial/unvalidated kernel name.
+ // These names belong only to this fixture's held, randomly named listener.
+ static Int32 QueryOwnedPipeName(IntPtr handle,String suffix,out String name){
+  name=null;const Int32 capacity=4096;IntPtr buffer=Marshal.AllocHGlobal(capacity);
+  try{UInt32 returned;Int32 status=NtQueryObject(handle,1,buffer,capacity,out returned);
+   if(status<0)return status;
+   Int32 header=Marshal.SizeOf(typeof(US));Require(returned>=header&&returned<=capacity,"pipe-name-query-size");
+   US value=(US)Marshal.PtrToStructure(buffer,typeof(US));
+   Require(value.Length>0&&value.Length%2==0&&value.Length<=1024&&value.MaximumLength>=value.Length,"pipe-name-query-length");
+   Int64 offset=value.Buffer.ToInt64()-buffer.ToInt64();Require(offset>=header&&offset<=returned&&value.Length<=returned-offset,"pipe-name-query-pointer");
+   String candidate=Marshal.PtrToStringUni(value.Buffer,value.Length/2);
+   Require(candidate.StartsWith(@"\Device\NamedPipe\",StringComparison.OrdinalIgnoreCase)&&candidate.EndsWith("\\"+suffix,StringComparison.Ordinal),"pipe-name-query-ownership");
+   // Restrict to a bounded NPFS namespace, never arbitrary paths or controls.
+   Require(candidate.All(c=>(c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='\\'||c=='-'||c=='_'||c=='.'||c=='{'||c=='}'),"pipe-name-query-characters");
+   Require(!candidate.Split('\\').Any(part=>part=="."||part==".."),"pipe-name-query-components");
+   name=candidate;return status;
+  }finally{Marshal.FreeHGlobal(buffer);}
+ }
+ static String JsonPipeName(String name){return name==null?"null":"\""+name.Replace("\\","\\\\")+"\"";}
+ static String ProbeExpandedRoot(IntPtr firstServer,String firstSuffix,String user,String package){
+  String name,parent=null,relativeName=null;Int32 query=QueryOwnedPipeName(firstServer,firstSuffix,out name);
+  Int32? rootStatus=null,serverStatus=null,clientStatus=null,relativeQuery=null;
+  IntPtr root=IntPtr.Zero,server=IntPtr.Zero,client=IntPtr.Zero,descriptor=IntPtr.Zero;
+  try{
+   if(query>=0){
+    // The exact owned listener remains held while deriving/opening its parent.
+    parent=name.Substring(0,name.Length-firstSuffix.Length);
+    IO io;using(var attributes=new Attributes(parent,IntPtr.Zero,IntPtr.Zero))rootStatus=NtOpenFile(out root,0x100080,ref attributes.Value,out io,3,0);
+    if(rootStatus.Value>=0){
+     Require(Valid(root),"expanded-root-empty");UInt32 size;
+     Require(ConvertStringSecurityDescriptorToSecurityDescriptor("D:(A;;GA;;;"+user+")(A;;GA;;;SY)(A;;GA;;;"+package+")",1,out descriptor,out size),"expanded-pipe-descriptor");
+     String suffix="autoprompt-msys-proof-"+Guid.NewGuid().ToString("N");
+     using(var attributes=new Attributes(suffix,root,descriptor)){
+      Int64 timeout=-500000;serverStatus=NtCreateNamedPipeFile(out server,0x80100100,ref attributes.Value,out io,3,2,0x20,1,0,0,1,8192,8192,ref timeout);
+      if(serverStatus.Value>=0){
+       Require(Valid(server),"expanded-server-empty");
+       clientStatus=NtOpenFile(out client,0x40100080,ref attributes.Value,out io,0,0);
+       if(clientStatus.Value>=0){
+        Require(Valid(client),"expanded-client-empty");
+        relativeQuery=QueryOwnedPipeName(server,suffix,out relativeName);
+        if(relativeQuery.Value>=0)Require(String.Equals(relativeName,parent+suffix,StringComparison.Ordinal),"expanded-relative-name-mismatch");
+       }
+      }
+     }
+    }
+   }
+   return "{\"query\":"+NtStatus(query)+",\"name\":"+JsonPipeName(name)+",\"parent\":"+JsonPipeName(parent)+",\"root\":"+NtStatus(rootStatus)+",\"server\":"+NtStatus(serverStatus)+",\"client\":"+NtStatus(clientStatus)+",\"relativeQuery\":"+NtStatus(relativeQuery)+",\"relativeName\":"+JsonPipeName(relativeName)+"}";
+  }finally{if(Valid(client))Require(CloseHandle(client),"close-expanded-client");if(Valid(server))Require(CloseHandle(server),"close-expanded-server");if(Valid(root))Require(CloseHandle(root),"close-expanded-root");if(descriptor!=IntPtr.Zero)LocalFree(descriptor);}
+ }
  static String ProbeNt(String user,String package,Boolean controller){
   var output=new StringBuilder("[");Int32 count=0;
   foreach(Boolean local in new[]{false,true}){
@@ -58,9 +108,10 @@ public static class MsysPipeProof {
    // this fixture), Administrators and SYSTEM, with no protected-DACL bit.
    // The package cell grants only that user, SYSTEM and this exact profile.
    String sddl=variant=="world"?"D:(A;;GA;;;WD)":"D:(A;;GA;;;"+user+")(A;;GA;;;SY)"+(variant=="package"?"(A;;GA;;;"+package+")":"(A;;GA;;;BA)");
-   IntPtr descriptor=IntPtr.Zero,server=IntPtr.Zero,client=IntPtr.Zero;Int32 serverError=0;Int32? clientError=null;
+   IntPtr descriptor=IntPtr.Zero,server=IntPtr.Zero,client=IntPtr.Zero;Int32 serverError=0;Int32? clientError=null;String expanded="null";
    try{UInt32 size;Require(ConvertStringSecurityDescriptorToSecurityDescriptor(sddl,1,out descriptor,out size),"pipe-descriptor:"+Marshal.GetLastWin32Error());var attributes=new SA{Length=Marshal.SizeOf(typeof(SA)),Descriptor=descriptor,Inherit=0};
-    String name=@"\\.\pipe\"+(local?@"LOCAL\":"")+"autoprompt-msys-proof-"+Guid.NewGuid().ToString("N");
+    String suffix="autoprompt-msys-proof-"+Guid.NewGuid().ToString("N");
+    String name=@"\\.\pipe\"+(local?@"LOCAL\":"")+suffix;
     // PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE; message pipe,
     // byte read mode, remote clients rejected, one instance, no retry.
     server=CreateNamedPipeW(name,0x80001,0x0c,1,8192,8192,0,ref attributes);
@@ -70,11 +121,14 @@ public static class MsysPipeProof {
      // Opening the sole owned listener does not wait for another process.
      client=CreateFileW(name,0x40000080,0,ref attributes,3,0,IntPtr.Zero);
      clientError=Valid(client)?0:Marshal.GetLastWin32Error();
+     // Query only a connected, wholly owned pair. A denied client leaves
+     // this extra observation untouched rather than querying an orphan listener.
+     if(local&&Valid(client))expanded=ProbeExpandedRoot(server,suffix,user,package);
     }
     Require(Valid(server)||serverError!=0,"server-failure-without-error");
     Require(!clientError.HasValue||Valid(client)||clientError.Value!=0,"client-failure-without-error");
     if(requireSuccess)Require(Valid(server)&&Valid(client),"controller-pipe-control:"+(local?"local":"bare")+":"+variant+":"+serverError+":"+clientError);
-    if(count++>0)output.Append(',');output.Append("{\"namespace\":\"").Append(local?"local":"bare").Append("\",\"descriptor\":\"").Append(variant).Append("\",\"serverError\":").Append(serverError).Append(",\"clientError\":").Append(clientError.HasValue?clientError.Value.ToString(System.Globalization.CultureInfo.InvariantCulture):"null").Append('}');
+    if(count++>0)output.Append(',');output.Append("{\"namespace\":\"").Append(local?"local":"bare").Append("\",\"descriptor\":\"").Append(variant).Append("\",\"serverError\":").Append(serverError).Append(",\"clientError\":").Append(clientError.HasValue?clientError.Value.ToString(System.Globalization.CultureInfo.InvariantCulture):"null").Append(",\"expanded\":").Append(expanded).Append('}');
    }finally{if(Valid(client))Require(CloseHandle(client),"close-client");if(Valid(server))Require(CloseHandle(server),"close-server");if(descriptor!=IntPtr.Zero)LocalFree(descriptor);}
   }return output.Append(']').ToString();
  }
@@ -89,7 +143,8 @@ public static class MsysPipeProof {
   if(args.Length==3&&args[0]=="child"){Require(IsAppContainer(),"child-is-not-AppContainer");Require(WindowsIdentity.GetCurrent().User.Value==args[1],"child-user-mismatch");Console.Write("{\"appContainer\":true,\"cases\":"+Probe(args[1],args[2],false)+",\"ntRoots\":"+ProbeNt(args[1],args[2],false)+"}");return 0;}
   Require(args.Length==1,"controller-arguments");Require(!IsAppContainer(),"controller-token");String executable=Path.GetFullPath(args[0]),profileName="Autoprompt_"+Guid.NewGuid().ToString("N");IntPtr profile=IntPtr.Zero;Boolean created=false;
   try{Int32 status=WindowsAppContainerNative.CreateAppContainerProfile(profileName,profileName,profileName,IntPtr.Zero,0,out profile);Require(status>=0,"create-profile:"+unchecked((UInt32)status).ToString("X8"));created=true;String package=new SecurityIdentifier(profile).Value,user=WindowsIdentity.GetCurrent().User.Value;GrantFixture(Path.GetDirectoryName(executable),executable,package);String controls=Probe(user,package,true),ntControls=ProbeNt(user,package,true);
-   var result=WindowsAppContainerNative.Launch(executable,Hash(executable),new[]{"child",user,package},Path.GetDirectoryName(executable),FixtureEnvironment(),15000,16384,profile,package,Path.Combine(Path.GetDirectoryName(executable),"never-created-cancellation"));
+   // Prove the production launcher restores its host-only prerequisite.
+   Environment.SetEnvironmentVariable("LOCALAPPDATA",null,EnvironmentVariableTarget.Process);var result=WindowsAppContainerNative.Launch(executable,Hash(executable),new[]{"child",user,package},Path.GetDirectoryName(executable),FixtureEnvironment(),15000,16384,profile,package,Path.Combine(Path.GetDirectoryName(executable),"never-created-cancellation"));
    Require(result.Drained&&!result.TimedOut&&!result.OutputLimit&&!result.Cancelled&&result.RootImageMatches&&result.AppContainerSid==package,"child-launch-evidence");String output=Encoding.UTF8.GetString(Convert.FromBase64String(result.StdoutBase64)),errors=Encoding.UTF8.GetString(Convert.FromBase64String(result.StderrBase64));Require(result.ExitCode==0&&errors.Length==0,"child-result:"+result.ExitCode+":"+output+":"+errors);Console.Write("{\"controller\":"+controls+",\"ntController\":"+ntControls+",\"child\":"+output+"}");
   }finally{if(profile!=IntPtr.Zero)WindowsAppContainerNative.FreeSid(profile);if(created)Require(WindowsAppContainerNative.DeleteAppContainerProfile(profileName)==0,"delete-profile");}return 0;
  }catch(Exception error){ReportFailure(error);return 1;}}

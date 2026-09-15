@@ -1,0 +1,528 @@
+{
+  "schema": 1,
+  "status": "metadata-pinned-unbuilt",
+  "sdk": {
+    "repository": "https://github.com/git-for-windows/git-sdk-64.git",
+    "commit": "e3cc14afd549778c2f2d3bcc6e89307f40f5c2c1"
+  },
+  "source": {
+    "commit": "270ba2980700e6e2a0813944d506eecea0f86402",
+    "url": "https://codeload.github.com/git-for-windows/msys2-runtime/tar.gz/270ba2980700e6e2a0813944d506eecea0f86402",
+    "sha256": "0571ad83f965bf7682a446a874830a560c8b12431e7d54e55f414a3851ba1146",
+    "sourceDateEpoch": 1789224001
+  },
+  "repositoryMetadata": {
+    "url": "https://repo.msys2.org/msys/x86_64/msys.db",
+    "sha256": "f679dd3ceec3a466f06062e19a511094b6ca9359cdb54fe662c80ad8246c6e39",
+    "retrieved": "2026-09-15",
+    "signatureVerification": "not yet performed; package embedded signatures retained and required by bootstrap"
+  },
+  "modes": {
+    "proof": {
+      "requested": [
+        "cocom",
+        "zlib-devel",
+        "libzstd-devel"
+      ],
+      "packages": [
+        {
+          "name": "cocom",
+          "version": "0.996-6",
+          "filename": "cocom-0.996-6-x86_64.pkg.tar.zst",
+          "sha256": "1f265c5871a6a63daa7bc1f4aead733bd3170840cf037cc577ab92f3e2e76f1d",
+          "url": "https://repo.msys2.org/msys/x86_64/cocom-0.996-6-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmp09Q4ACgkQ+hFTGqCqf1fNNA//R96QB+fVBrJxVELOG00oonXHcm1PNsPUFDeMHVIgjzm6pp6o0CuVTbh790Q8xrRDr+IhmyXycKRTMhboDHl3QHSOS5ioddvrwLjYF/srh74MDO3dr+SaDo1pBqnRFxhrQdvQKv046AQFtWahg7EX8yk9AXKDUH0IV5P80TVthz8T70rJkvM6ylB6BVR1K2lVE9/lRnlgDTm9wFxFCDlWBTYmYb5m/GwSebfKbeV2eDCR+8MJIGBBj4C9PHhN3cD54O1dfimr6Vtr76BiGlTRY5gq7a61ICWQ6SRyvJsA6mpe1bqnuybi2C/9rCkyWmBMeJjQU0ZSXjlfpq3BSWWDmWxdcwiUiNnHLo1Rw77HjOfXyqd9tsVO8XyIG3MfgN3pe0enl0dd1+nSiSXCO+xVAHB/jpn5E+pL1DZd+gLN3PQ+I44BPtNygcOTl7SrNfy2Wm3BN390vqAFghCDC2R2C+5B0VClP7RcRwYO/SeNXU3dUPQAa3fmvynPGdQ9tMKIH3gthrQAd00ejVMTy1nb7kcswmFewuZm1CKan9XhFSf+ayXTo77qulhkYb9BM//Ti2BoAmQlhT8ZRHl075NwNTm/wI1wMPLTJYmlcntYCDR1TmApjzfFEepTW1rlRap0c07uUx0NT1RlUv/MFEukWT2T99eyKV0RPTMV5FtUXZw=",
+          "size": 693732,
+          "depends": [
+            "gmp"
+          ]
+        },
+        {
+          "name": "libzstd-devel",
+          "version": "1.5.7-1",
+          "filename": "libzstd-devel-1.5.7-1-x86_64.pkg.tar.zst",
+          "sha256": "5c819d73ea6dfb5a118fbf9c25ad54ba6fbe41ee1afa5c42eb4aff5d55fb4824",
+          "url": "https://repo.msys2.org/msys/x86_64/libzstd-devel-1.5.7-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAme3fPMACgkQ+hFTGqCqf1dvAw/7BQS9Xn+cikleynh7vVgP87fb926jW5llOC7p3orecc78fb+5U0sHx7ECkFoOUj73Bn0jyfEp9ST5jk/TE7r3OFuSroeblS/7Kbw5c4nLhp4Tt9wlf7kF4T+gnFSvHhEJYYmFFOFT2fj68G4/utowNf0Q0H8sEfqDDv1t4vhIgLKpcNLaK2cZTtIXjIXvRtEtXZq6ZMxfKAFjFiTjFV4b7OpK97KM9BRUuygJ9B3N7nNRrPMvX6rUMVyzF7yoFxvcZPEilxImGUQxJfNBoGTeyNV5RJL5ml/xfZAj2BNxb57lMEoO/VXVdcy0sQcXUBGogW+3iFTq6nk9135mYOsrDdTQyrbU3gDaWRAnA7WvOToikQfa/B5/mC1g17G/WWe3eUd8M/K6GF5Ytz4hSgXKLBd4lv+IP5qME8qye+aUDSGTAufOp2c7v3Zqxf3kFl5wDd197B7UIX1vWX+XTeWcL2a7JocjT8AeDQHiVBYjtqefRL6SdwzMcj5T4XQuFLQyVyKcUlAaLqgAJ0gzfoVuCht4BxHj383xxd3+4QvWJr9dZ/CVN7LXkNJuBgwyjKuWB0k5GYbzdmicEMJoAwCAghfXDW7JmQ26ASynPa4O/ws0AAb00+yo2BKlH40JWLVJ7telLxebxkifXRrh6WxySQVAfRM9qgDZYDvyCQZZPBs=",
+          "size": 482538,
+          "depends": [
+            "libzstd=1.5.7"
+          ]
+        },
+        {
+          "name": "zlib-devel",
+          "version": "1.3.2-1",
+          "filename": "zlib-devel-1.3.2-1-x86_64.pkg.tar.zst",
+          "sha256": "441dc9b1258d72a7a2ef513dfe26f87d07d050a312af00c765db26c31c5a2b45",
+          "url": "https://repo.msys2.org/msys/x86_64/zlib-devel-1.3.2-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmmWwFsACgkQ+hFTGqCqf1dGqA//d+1HgXNfUzCDlYurWEd/AFzjmMlkR4jGicqmOskIsD4Fdc2hUsDRDmemJKxuKppZ7OA6DrQQQNo0aoXXJyMt8R6se2XcGV7g8M2DMs0I7bMIsTJwFxsWEJyBtfCIFOMczAED3qCxJg4p2aZuYsTbkEE95r/LErZoOFwGcGHxyyRnmVdmbuVfsNBSrIkBZNu6zCyMD6d976AZ/MHMwWIt23fHo7n1cKYjJS8mpohTONgmMxFHatyeqL5I1qwiX/P9Nop25+ZLo1OBn5zSB1g+FF1aONCJ3G2c0XywDFGqmYgZna9EcZvZD9TTuWPg4WrpFrsbc5JEsFLXQUiVGVuKCmKBemv7z0m68Ex/nI5W2cEttQDL6Dd6z2UoMPXAfZQHzBUZcBPwxoTJ5BmYImuFOnvTJnIcLf7/taoD4iIfFkuVE5k2xmXb3UhD8HOlhQaMk1+VKmwsaZ2f0In+azmeL5lHBbqXWdHdguu9rfLQ3EIQpT6MqQtH3YnfmDm1Wk30p+uQG8VAv0071Xoy9xLfPaIGss+Nk+YUddZVlhGt/2viFCLhUVXRT5mJKyulkj1YqZOHQkZ9bwFcaOpbVptk03h1hh87lSJNbaAR5p9pl2OzB/FwCnvwP1nqm9JzAaOW+ug2sx/AtKjHIcRUIqH770oi6SKYw8GDW9k2Dzkkyd4=",
+          "size": 85148,
+          "depends": [
+            "zlib=1.3.2"
+          ]
+        }
+      ],
+      "sdkDependencies": {
+        "libzstd": {
+          "version": "1.5.7-1",
+          "requirements": [
+            "libzstd=1.5.7"
+          ]
+        },
+        "zlib": {
+          "version": "1.3.2-1",
+          "requirements": [
+            "zlib=1.3.2"
+          ]
+        },
+        "gmp": {
+          "version": "6.3.0-2",
+          "requirements": [
+            "gmp"
+          ]
+        }
+      },
+      "archiveBytes": 1261418
+    },
+    "full": {
+      "requested": [
+        "cocom",
+        "zlib-devel",
+        "libzstd-devel",
+        "mingw-w64-cross-crt",
+        "mingw-w64-cross-gcc",
+        "mingw-w64-cross-zlib"
+      ],
+      "packages": [
+        {
+          "name": "cocom",
+          "version": "0.996-6",
+          "filename": "cocom-0.996-6-x86_64.pkg.tar.zst",
+          "sha256": "1f265c5871a6a63daa7bc1f4aead733bd3170840cf037cc577ab92f3e2e76f1d",
+          "url": "https://repo.msys2.org/msys/x86_64/cocom-0.996-6-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmp09Q4ACgkQ+hFTGqCqf1fNNA//R96QB+fVBrJxVELOG00oonXHcm1PNsPUFDeMHVIgjzm6pp6o0CuVTbh790Q8xrRDr+IhmyXycKRTMhboDHl3QHSOS5ioddvrwLjYF/srh74MDO3dr+SaDo1pBqnRFxhrQdvQKv046AQFtWahg7EX8yk9AXKDUH0IV5P80TVthz8T70rJkvM6ylB6BVR1K2lVE9/lRnlgDTm9wFxFCDlWBTYmYb5m/GwSebfKbeV2eDCR+8MJIGBBj4C9PHhN3cD54O1dfimr6Vtr76BiGlTRY5gq7a61ICWQ6SRyvJsA6mpe1bqnuybi2C/9rCkyWmBMeJjQU0ZSXjlfpq3BSWWDmWxdcwiUiNnHLo1Rw77HjOfXyqd9tsVO8XyIG3MfgN3pe0enl0dd1+nSiSXCO+xVAHB/jpn5E+pL1DZd+gLN3PQ+I44BPtNygcOTl7SrNfy2Wm3BN390vqAFghCDC2R2C+5B0VClP7RcRwYO/SeNXU3dUPQAa3fmvynPGdQ9tMKIH3gthrQAd00ejVMTy1nb7kcswmFewuZm1CKan9XhFSf+ayXTo77qulhkYb9BM//Ti2BoAmQlhT8ZRHl075NwNTm/wI1wMPLTJYmlcntYCDR1TmApjzfFEepTW1rlRap0c07uUx0NT1RlUv/MFEukWT2T99eyKV0RPTMV5FtUXZw=",
+          "size": 693732,
+          "depends": [
+            "gmp"
+          ]
+        },
+        {
+          "name": "libzstd-devel",
+          "version": "1.5.7-1",
+          "filename": "libzstd-devel-1.5.7-1-x86_64.pkg.tar.zst",
+          "sha256": "5c819d73ea6dfb5a118fbf9c25ad54ba6fbe41ee1afa5c42eb4aff5d55fb4824",
+          "url": "https://repo.msys2.org/msys/x86_64/libzstd-devel-1.5.7-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAme3fPMACgkQ+hFTGqCqf1dvAw/7BQS9Xn+cikleynh7vVgP87fb926jW5llOC7p3orecc78fb+5U0sHx7ECkFoOUj73Bn0jyfEp9ST5jk/TE7r3OFuSroeblS/7Kbw5c4nLhp4Tt9wlf7kF4T+gnFSvHhEJYYmFFOFT2fj68G4/utowNf0Q0H8sEfqDDv1t4vhIgLKpcNLaK2cZTtIXjIXvRtEtXZq6ZMxfKAFjFiTjFV4b7OpK97KM9BRUuygJ9B3N7nNRrPMvX6rUMVyzF7yoFxvcZPEilxImGUQxJfNBoGTeyNV5RJL5ml/xfZAj2BNxb57lMEoO/VXVdcy0sQcXUBGogW+3iFTq6nk9135mYOsrDdTQyrbU3gDaWRAnA7WvOToikQfa/B5/mC1g17G/WWe3eUd8M/K6GF5Ytz4hSgXKLBd4lv+IP5qME8qye+aUDSGTAufOp2c7v3Zqxf3kFl5wDd197B7UIX1vWX+XTeWcL2a7JocjT8AeDQHiVBYjtqefRL6SdwzMcj5T4XQuFLQyVyKcUlAaLqgAJ0gzfoVuCht4BxHj383xxd3+4QvWJr9dZ/CVN7LXkNJuBgwyjKuWB0k5GYbzdmicEMJoAwCAghfXDW7JmQ26ASynPa4O/ws0AAb00+yo2BKlH40JWLVJ7telLxebxkifXRrh6WxySQVAfRM9qgDZYDvyCQZZPBs=",
+          "size": 482538,
+          "depends": [
+            "libzstd=1.5.7"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-common-binutils",
+          "version": "2.47-1",
+          "filename": "mingw-w64-cross-common-binutils-2.47-1-x86_64.pkg.tar.zst",
+          "sha256": "d1850bce8245aa4c0482cfbcf1189a29737d137b930c2b40ab05654dbba9c1ab",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-common-binutils-2.47-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmpnvQgACgkQ+hFTGqCqf1ckVxAAsb6TIS7nZ1BSTK98cbkWXAvHFTA5frwB+oJG7YmKOL/4EAh8rrfxUVu6fT22atkkbMrFbPTBak/oUdwDDmqu/kn7UeGS6sUm4sOuGIdhL+UPRNIuOve3CTiostdRxTT4VCpqdjn60q+C0kAIf3ZLZj9edJrJo+UxUrVCzdpAy4XYJmN9BEoqlzLARplluiIjCy+AsCU2XS5SWh/Z3RwI2A+1R4dQWx+rnboHYVxvoO41SYehNwXQq2AybaDP2lMrIPkVK6nfz37XDIggZFIQoXgXvHvXY7AUGi3VT44h7EfQedkKEoWK2GlPlW2ZRS8VCtWkv0XJqxk4JTf5BC9bexvcLmrGL/70lG5QM1OiL7Jl4QoITRtQBSoeYcKa/mLf1SYrbftk57BBC8zDYDaOMObJR6N4rDg6mUdHN8Rv16WqMUVmQQ8UeSa3lyenz5jpfTGp1pf89qRcLeQNyGGJwh/x+06eJV0nzF6DODzq7qM/6Q6e+rhVuYok0TiIhtcxkFn7TTI2Oe6hrZ4wRhxCkscbWMxZ4fHMSxcI0bwIpmiX0PIHDXS6NlLui3/9QCJPon3XdQYjs2UtVrZlxRsVXbpkXsKNcca00h3DCes03JErrrb9wQ7DJEboxwFy/IQy/RiuX7llmtyhAgjAap6W02qi/QVvgxkfvLl+GjpjMEQ=",
+          "size": 3027516,
+          "depends": [
+            "libiconv",
+            "zlib",
+            "libzstd",
+            "libintl"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-crt",
+          "version": "14.0.0.r147.g31bd54ab7-1",
+          "filename": "mingw-w64-cross-crt-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "sha256": "e551bf90e3c5d01911b2f9f0a139d8de7c227af05a79998153734d1c663723e2",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-crt-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmo+3e8ACgkQ+hFTGqCqf1eD0Q/+L7OPtB3KiTEvax6AzYmrjp8w2UM+ZCC/lNxBrgB+t7fPtbKF52YYy2BNqIJ2p/bB5fNhDycA+VrbKrJaNlTaeA/JE8T7/ZHZyKa7E3CtFd5LWOFpAfx4JoLbwBr6n74OT9QwLiyK6mpk2WYqpq7Eu6d1m73R0xROZ6eMWJJPRDA3VtnI8nR0upH+cWCm9n8IliJu24Jl/dkfRT6AoM9YZsGHqgp0ThoRxIMPZN1v5OqYTbwMGMHsS99ffy5x1tzG9582gIJj2lHlYTFRbpc9Ultq459PfEpZxVYY7dx0L0vmZGb0kw0PGXGTy9CbxaAPXjPqZd+8ar1BfxRJ7B21dnpLFJxLr/O15STcIovCwJJ3Jlml0PXp+k2xYZzbR2amrWMsT47Z96t88CAHaGDft/OHsn5FZom9A5U7YRgQ22S4cb5qiCgru0vsxiP7qnYCiU3neUJYZtLsolzDO59PqxqgEooYLZU02nAN2ugY4caxBx8inAF5I46q/1s7YPM/VtE1V3MIN0kOLpUcdlXCo9YaQH8c4SwdpvkCsgV2ap3hNlhYgvjysaN+vxcSZE3691zhvsBTZZ5ozBBuXcPmQBNcweu4wH5zOYO2PISHI6oBtU0a82IfmCvcQL4gBJutwQG38RI+oAXx4fuXUmHsfM3hAIEKLgJofgF04TOsTkk=",
+          "size": 2609,
+          "depends": [
+            "mingw-w64-cross-ucrt64-crt",
+            "mingw-w64-cross-mingw32-crt",
+            "mingw-w64-cross-mingw64-crt"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-gcc",
+          "version": "16.2.0-1",
+          "filename": "mingw-w64-cross-gcc-16.2.0-1-x86_64.pkg.tar.zst",
+          "sha256": "5c647ac08463416773b6377877a6496d3a1204e7a65c118f6a788ff44ea5941a",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-gcc-16.2.0-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmqP2c0ACgkQ+hFTGqCqf1d95Q/+J3NIE3g1A4ydHmP1KSfNwM+FQGvIn64z0D+8QqaQj9DyDsfxt6kmXtwQ8q33SwPZ/PcheFVg9FIWPaqE68iFJeor8jh3hMbULpsgJa+c7M/kGyUIeZfPPlLssEPgBBgqiJfHDN5gW+q6PhBc4xnOuccuO1kXNEJtwzM8Ze9sUedXLG3/4h83A/wqrdgUSHghgs0RR3PTvSsEe6amBqqU9v9tv4AbDqnx362YPBSPqLmxy2ShBTsJrvYf9E4sC9BtcPhxVBwiTcLSCcwXHxCRXp2nEqMwAcL4Gh7YMNffmsx23BGF+WjXI2RSlyzzUprT46f0YyA2q0TTUkn5fUa81MRP1xX0/RrvX/QoySVSYz4X//FKO72PKZy6I4HsSWYcychIRO7C+0Mi0D8JR2ThnNJoSAJJShEgI3EjosedwqmIwbeAYa0lIO2OKOkYdaS+TJG+fEPDzBhL5ILqdwyrpcIwi3Cr/3FiWBB5TnQ7IsZTBigUsGIl5nK4ACdEwYaIpU9wZt1okdvkWZxS4GwfZYUHfp/a5ptmyV4us8+XQl7nA0+67icsk0x5nMm1j772piG0K8MUgVj0z2LE4LqtqNmXUuO1J0p4Jl1Sz3CYlvE6KNOt+kIoI43qbhClgVmMeMvcT2b3Y6SNPwbEHICZC3ix2vkyrWkWBProW2OepLo=",
+          "size": 2305,
+          "depends": [
+            "mingw-w64-cross-ucrt64-gcc",
+            "mingw-w64-cross-mingw32-gcc",
+            "mingw-w64-cross-mingw64-gcc"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-mingw32-binutils",
+          "version": "2.47-1",
+          "filename": "mingw-w64-cross-mingw32-binutils-2.47-1-x86_64.pkg.tar.zst",
+          "sha256": "829beef6a2f50b6f63a7521f5b6585f821b2616e047db77024033a1ef91389bc",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw32-binutils-2.47-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmpnvQgACgkQ+hFTGqCqf1fiVw/+KyTxyRs795XlLjg2ZuzHCic6lsST5ucJpRCidnujU/76z6QEv/mH1/RSXYoluAnqluEdKw7SD9/1e926aN5qPG+i+hb+tBKRaKAaGmi5K6K7ZQaJ2d9Osw1j2Za8iEO9SdImBIVTVAlOMAdlqotS7P8vQ2DGO/MchYb8Q3b4NZgC2FB9eXcu+MENnxbfxHqtKCR0YvnqkN3h0o0y6iXiChUQX2uiKWoJt7QKFP74Y9Ujrk3P5l4aPRH6kmdLIbJMokuF0f4r7xcklWaMCP/ReEjyrVS9JRREt+H+rj7DTQMjRxQwL89w7cZo6NMGEV/gXN9MHxPBEiSvmR0xQFm19RT8MOHEUzYOfwTIrnM74gqBlp1gWX5tKUnIylq8VV/orVY/oDcKDNqfEzDxLqXGkcHZT7uK9+4yBUbLFm5e3dYkGEZpxu6gSZPvrcVjoYB81CPb+cODDOIagHaep9+FRaNv18WFbDAQj1I22l5fpOgXgoYW1NJj5m1VFiILblqqpH+2z7beBhVDDnDkt+A8Kpu3J9HhRZAOFnhv4HsZ1i7r+AREhbf0PBi0S6d1PjJY+xEzmO5tbDA+PiXdNM1WhBIDSNlmJ3FCOIx6VzEwKDIPQYgGvvDKDmb0TPaXfyXWhj+5i0Pp++nPWhqlRxVl9/aPpf957i/jTW8mECKtpF0=",
+          "size": 2371774,
+          "depends": [
+            "libiconv",
+            "zlib",
+            "libzstd",
+            "libintl",
+            "mingw-w64-cross-common-binutils"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-mingw32-crt",
+          "version": "14.0.0.r147.g31bd54ab7-1",
+          "filename": "mingw-w64-cross-mingw32-crt-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "sha256": "c6d01081878488dd66c0b4c4dd9c9249a59b98a81d6e38df6235af1adce6dab8",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw32-crt-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmo+3fEACgkQ+hFTGqCqf1c3/w/8C7GVBz3OZksJMrKQFF7FQ/3CHbmZaMlXrvaMwPc8PQ/Rvi4Ym4X63bUIEBfl6TTliK+n+SXfFuP4isf8PMD8DgOe/orKGFNQhNB0V9UkpSm2bV16syXc8a95yj79xlUvFNOCV7rV6yCPuvDBFov+Ad18ICFRk3snU34y2ttu0PXyZDKru5d6amrbKDwaMy8tGt2eE3ot1fcNVkcfKr28h19us8ICQxwCWiwBLGU4O7aRl0lbkAf73yYuPdTo9rGK34bb3Nox+Usl3siNH/zU/ziQWR/oud1eT32lmgKmChl3akb0lN5CfeegyALm7aGDe50iWo+WxI/OKe1ilDOxOTa6ggLM3wnR9gvuQ5B+pBC5Eb6ixkgZA45VsCpcgGxv7cKqBl9VAK7FijufIvW3STiks/Xs1q001IQ9/M22rqkv+c4996VLeApNvz6oILwesSjab3YQGhsCxzGUFyu/wKxCNnKQ/kHa9n9lWS+iPasuQuWn9oQ8W0v2vUfNRdPLEb/zcw2djvUS9f5LMVpQ3pgSisFzEMWY17syscXbUx1gge1IfD0tAk7DwYcao2I7Ra1hQ3ahOqQE/mQp56Tdj5n21vKyIh98rijDWcuqvfgBOIp7zil9OhlQl7zsvzroJudEy5IYGj+AtyOzWgRIAHH+3PIkt+39peJ3w47J3e8=",
+          "size": 4205488,
+          "depends": [
+            "mingw-w64-cross-mingw32-headers"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-mingw32-gcc",
+          "version": "16.2.0-1",
+          "filename": "mingw-w64-cross-mingw32-gcc-16.2.0-1-x86_64.pkg.tar.zst",
+          "sha256": "410a7944838f02eaf7cbb0a60d0f0b74808b5c561e9189a7ba0823676a033d26",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw32-gcc-16.2.0-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmqP2c8ACgkQ+hFTGqCqf1fy5BAAnRUpcFYHarkkRioKRiTe8g5aypfGFo/61V/PCz3i9rqZC6JgABQIP3HnqCwiUivMukhdbWzZF6ugkPGq/XJ6QDNtB/48EuOlEEUicu84/2aST4B9j62XDMw7A/roxPSeYQ3ZIFCrllwBtWtqXIl/rpk1McHrfHBjiXTH8JWdd6GSkePskaSECajJMAtbCUAcnW9ZDODQEbssvZRxnzXMWyD3Jl6U9Ua+Sar+mJ5JVZNuaMQfq3lzLZZRK6qvfWX9rT4zAyy5pniE2W6vYgPKG/wTPj/gJZFOet86sXA1doH8mc4xjY3ziDsoVIABY4SxAvVLVi9nbnEhLBssdL6Y/CXmGQgLOqJTpDbrrj55w7cWC6O32P1RiJC4luNLngO/iCo5sDFTfxW04x/ss08h/9BPRrzZBsjEJlg/Hh/mj7U7oIYlKUvEwaIu7lNUAZkJ2+nqlsO5nC4FEV8mYMDGFctTcSqM0nA6S4LF7tpgkPob8pi+OuRB8gsVG4LNhZNZ3j+DIMj0QEMkrhnF1Pe9Qhs8lSR6LnMvYUoy+6eDg8KBLPgP88jQl9dhOSzjaZnGltOg/4GYuFFPEUlZwFNFpg8TxI7E22tqGriJbO7uz2SlWPa+DFwqmcNg8WNM0Bz4XO3X0bU8Ao46Qs5WchbIq5KZLbEVqDRDoyMHx/Tc57U=",
+          "size": 68727293,
+          "depends": [
+            "zlib",
+            "mpc",
+            "isl",
+            "libzstd",
+            "mingw-w64-cross-mingw32-crt",
+            "mingw-w64-cross-mingw32-headers",
+            "mingw-w64-cross-mingw32-winpthreads",
+            "mingw-w64-cross-mingw32-windows-default-manifest",
+            "mingw-w64-cross-mingw32-binutils"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-mingw32-headers",
+          "version": "14.0.0.r147.g31bd54ab7-1",
+          "filename": "mingw-w64-cross-mingw32-headers-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "sha256": "8c81e36f97a7722e08c31a233c84a4c50b26db625dd6ea3459b785c9675f9e53",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw32-headers-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmo+3fIACgkQ+hFTGqCqf1eQWxAAuXZteKb+iSm4rR9DESA3nL1FBl97n7AnESW4miqxZ+UI0ELpDYqrPO3tSTQOR14DSyqdxW3kt38QHi2PVQJU6Km5UudHlvj/AsQmPuGKLXlV2+7v/GTtm4+7A6JZH+Alt6zvbL9NLdhXh5RPlMaec/ET0tSN4IKkRHJ+CjcSXcVm1HRAR8U9Nszz8eRnY1IgLcFC/oZY0396aTj3WzkNKbfnELal8uWdnflNCxdxYYFWA7ZtPAs+dN+CVcrb35y27RmmB8Q90LolYcKzXoL60tWb1xjqCa4jLFP9K5Koeiq+GYQNKrEc+pozKqSdInbfg+2mkm9QRgW043JZx1OkBGs0kXxdAR7MnsGyXyOEeDarcJhfozxvrEO21wfrStihGgKmioLHLovf38YLby1gl0DM0IUChC70feqgVkFyHtragei0KCB+89iDZKITNuMi03ibusrl9a7yeC5qfSa7X7Aa4DnqDZ9bo6p0UYUw0JU2clsiC+MrlUbYwIcyd2wfw5wNCCmjZPcFfaNtZ7FYbrrlOiHjjxBsKWRZ0TTZJfRezkYU2EC1h00x5bPHtwTYY11E4Muy35CGU5N8bVRfWnnLRV/uyexsfzE+sRqn5z2Ge9OHF9pfL3sqSbnsrziXLPKKIXHu66uwEbkyErNSlMk4VKLIJ2Cdy4uO9FE5Ur4=",
+          "size": 6284704,
+          "depends": []
+        },
+        {
+          "name": "mingw-w64-cross-mingw32-windows-default-manifest",
+          "version": "6.4-5",
+          "filename": "mingw-w64-cross-mingw32-windows-default-manifest-6.4-5-x86_64.pkg.tar.zst",
+          "sha256": "2a5db22a5fdb595af6fc7fd17cfeca8c60ca56c84fa46cbcc6f1251277b678a8",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw32-windows-default-manifest-6.4-5-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAma+GJUACgkQ+hFTGqCqf1f7khAArHYvyg4u7OVwby4u2268zOWPfYu4oknLQS34h2SOeM5z9aQBVfgI5Am1qo5XvUl2WFCDOxO7Jq/8xiOo5tHdxjP+FKioo4ahuPQT1EnLRbWTIb/3FGlL1WHB+FL7W13GMonb3fpueRn2P5pgvMxKQP4BpS2YF4R8WbZjopfgAJUSrzaV8gOIaj6TlSBOEwdhOQfzqff7HdYJmKeocu+05BveahHzAJtS3hJyGeWbCieEpIh1ttqMVzKBkEhUf/CPf8LP3Tjz3rD8ZLQ+u4NnBzZO7BYCid+ykSj957Rh/HZMvGTk/onMQCMbsLE1aYdPphKWNBpiJjvQuucjYTyZHB+fq24cWYnyLMaF2ViuA1LdrjYHaJuvOpEJZ5bWtqnMQdJP74lqP+pYcwYD0OXG03JPliW4jAu6cmtXgLY5ONWiOOgMddNp2EEsNy4AtRHzNr1wtlxkfSXwfRGpLTSx7ZaoEbk/R3k6EypIuSHB3Sib0J6j34K8af0A1cUaqksJVLy9PCTWq4IbFHSWR6rtWa6Za9uq1guz11E7zzt9Licv+sSj+iJf4esYWcwTCe4JzzXrTcKR+5sxNWhwfC0Ei7uuugnb0nm0D3wjh3bDzlz6XN0Rxt6Be/xGp5wPRKpXgA4O3ZAG0cnOavxXn5nDZt7rWv9SJVeZ2Tb0gTbMV88=",
+          "size": 3166,
+          "depends": []
+        },
+        {
+          "name": "mingw-w64-cross-mingw32-winpthreads",
+          "version": "14.0.0.r147.g31bd54ab7-1",
+          "filename": "mingw-w64-cross-mingw32-winpthreads-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "sha256": "ca1e31b6cb07dab92c666a94b3acb0ef23c17fa7b7dc66232b3466ed91bf98df",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw32-winpthreads-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmo+3fMACgkQ+hFTGqCqf1fZiA//Rz2rbJotUIPS6AoGRaSxjWH3FJT1o3cuTMf+n/cQpHqZyMRBbAapdkgtdlef0IaM4jS8sPQmV+TI5sjl9pdbXQv3bXZKG9+2dSyjbJeC5IPuF4Ex2JrAyMppOilKaFdE7ObMR82PYb27Vy5ymanf4ZM7Un7glN19PHeIy29VHu16Iib4QtRXeEBnszSfw+AQBYsMCT57Ugk3raxfJ7xpRp88YoU0yeJbQ5RW4p69bCAvwpKz+NETKJ6mtcuZgs72OJM0dK5rHGpVPwp7hsh/myyNiadkQARvuwspfd7lprxDJTFuLbaa3szJuGpF+dXjbyj1O5Pdu8n3QDzfWluEsl5LLy3mh59297mTOO9eMpHsPP4UeRwxHA3N3m9Msk1W1CBE4q543kydus/yFKlb+B0SVFXBmY8Zi4KrWxlma9vMDmOLACnxWrSpYdYkcOYzrKoB/aqjgL0dElM6tUwAPh86eY0S+ge4tA8M6G/PE3IQNQICAYYOgoLStzEIg7YbznZ++IrF03F9B+JdPFQlSwOhM4cNLESowI9WraTPA/G6daUgD/tDb4CU8aHTPvTJzVetrm6+OfF8xCwQOEk67+tnbW6IMJWyyurBJlA33GaydA8XSi2EW+Yn/iAxIxTFx9moCOjxHnVq08lil+cLdbq9wG7zSzR8dEzNSemCveg=",
+          "size": 183930,
+          "depends": [
+            "mingw-w64-cross-mingw32-crt"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-mingw32-zlib",
+          "version": "1.3.2-2",
+          "filename": "mingw-w64-cross-mingw32-zlib-1.3.2-2-x86_64.pkg.tar.zst",
+          "sha256": "05bffab0745b74b3279c10a910bd95f2799b4ac12da2390a8bf135d7be2c1964",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw32-zlib-1.3.2-2-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmoEx6oACgkQ+hFTGqCqf1d1OA/+Po0A3TwK8CJkS0YCgDwXwPqI415N7CqlGheAqLUTPLN80mp3XKZs2oZ5zltCiCmqCyzakJRDIjlYzPqZI648+11MS6msdEOr7/mr2cNJ6Uayp+8FrjwKy8FuBJIUraKSacISECgZ2WqkbsJ9apYKPtNrE++negCH1VRyEvEdre9Rhrc87h8PxFXa+YC/9txle1zTZGnxfPqJDIpcrg6gSf9KP9hM0LMumMyQ+/5T3g2hhq3mbbC6N8qXGdZr2mpOZb5HLPSmHFGrnMpeMNIkooz4mxd8YHBo0HXohY6JkrW0qqXi36bQJw2R7ATyV9xCJb+PiNtFePYR2583NGTHCIA72rKP5giF1tcBlhzLKdzAsjEinsfvGE88CUolfIgiFcZ/Kn9/tWI5pQ5HwEYF3i1N1KCVdWbVYaJ6Z+/SgWfMu42BDuNHydPFDLsg7Se8aAveZSsZ/++iZn9dtGGPAEsBv7qYsNehMmzUvzQvm/Ye9KE0LHI/GBR03ODQVM45dGXMuzyM2vtd0AFGnEZv2fBPkGLTVH+ulM8tCOO2dDSlxp59ULSxoXkEpvnCtWIUph14mWJBMkqYRau2U8lmtw26W+G0/NsZLd9NMfppldX4oZE5hJOxmTo3r/y5Og26bTuoMp/7AquKh5tJLlDrk0A4eOkLkH2OlLU9ZEWdQys=",
+          "size": 186889,
+          "depends": []
+        },
+        {
+          "name": "mingw-w64-cross-mingw64-binutils",
+          "version": "2.47-1",
+          "filename": "mingw-w64-cross-mingw64-binutils-2.47-1-x86_64.pkg.tar.zst",
+          "sha256": "5dd72bdcb3d7d3136c848dc7d6db0f5b8ceaaa15ea377492575572d37791f2e5",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw64-binutils-2.47-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmpnvQkACgkQ+hFTGqCqf1faUA/+LZYh86zPefVP5BNljXePuahE4BJD6BKP4Jw603fDqmm4/oMje+Qg5CY3yMQTCCBDdazn5RiENWgaZHSvGt8HajUYxlgapRVKvawn7iIt8yPTpKBrpnNpYI9q6ZJh6LM54JViQWoddvu0F2wQNWVtrr40qrtnvZRSsoKov0KuQs7qEHXGt1PE4tMj1UvMUyyE6cA7f55TDWZOtH3kDFIPG1JAaDTpRmjYVI9oej6LH8Zoh8c5wIDfLwq4VbRoS331hgP9baU49mdC0zJrQ5KQ8sH1FdfxJyP2mrTE7K4BYGs6bxRBzHnlK3CNwQ+sJUS6hJHBAqEajEI+cNkNLQwDZCXKxAcwkaSyXzYSUVECdFeZiGKAqfUV296fVcKWEVIrOwYkrOUpwFFS5KT/m/LbMyuxIp4O0EYp6mw8FMTY3IKLdjT91ghaXFuDvGb9DRutXA/ff9zY9313pX4min+AaTf1dQ5wj0dp82cPTiq50EfAOboSJcRQg+EKhoZ9OffxqKHNpeFN2ef6+F+XEpq1GUhQj5itsNQq5NY5y0LBQCVoiY4CWasTdJkLqwsWJor2mxsRk3x5JcMQ1PhiH+hcWFjLa6uSdIBTuSPO7iyKkJt2PhI/u3BVUZBadMg8PgOHJXWMcvES1mGXgufbx8JH6TxdO0+XcORxrsaT8M1GOZI=",
+          "size": 2572039,
+          "depends": [
+            "libiconv",
+            "zlib",
+            "libzstd",
+            "libintl",
+            "mingw-w64-cross-common-binutils"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-mingw64-crt",
+          "version": "14.0.0.r147.g31bd54ab7-1",
+          "filename": "mingw-w64-cross-mingw64-crt-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "sha256": "ea1489ad26bc3e2703ac66a0f70d975416aa3c18ee9ae0f100f12500eeded4d6",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw64-crt-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmo+3fUACgkQ+hFTGqCqf1cTGBAAsAOrrWybMuSBKNY4RnBVX6wJUE+hqgAbnLT4TeKyc7uriTiGYFBy5JWWF/6zGy28nNcADhJfUPvOkl5XGCsnOQ5FT6cNQ7tQLhobPQ5L5h8h/qU6svy0AGQu4vaYyzP9Mz+0Ki0l+Dyi8GGFe2PG2ccQ2hmjKtdZ6Jsh1+KKOi/R3yjufN9XkM3TlCqNGxAbd/SQSJMX0K3607kpZQgQ5QUUr49MRFmu+DT2fGIHwMqiMNXwfXAqXI3k+xkOvZXt7YVlhKZ9H8ZcpqbWoQYJX9zDj8oms4bpQdm3F6Eajt/N1Bjk85d9SJGp6aN7wFvLiT5Ae/oRggg6ThK/0EzG1WRkQpcNpfCTeaeR/5cPq8z1WXrBLG0a6AM8pP0+JJXM7126IoYSx/hVPyLqdElLSX9YFxeX6tGcrtn97F8GMedUcWja+gYt3WIdOURs14MQFj1rCEGheZ6ZPEFTQmqFiBzlIswi2baSMK41yxPQj5s5lXXWldniC/ED4QkCIM6HLLL4l8CXgy0yQzytkUvMVsi92KYa9QK267AqYaylsU7EscX1FFHjvY8Ab4VAgYiVMysEi1t9eEeiRFYj0ErSImszoh1NlUQMptRkMx4kOZ5jM5xnNNM7cR+xyZHuuOAiRAxg1qODksC71pxSxveWwF8Vd/5ukuCJy6KpHDxpVdE=",
+          "size": 4803578,
+          "depends": [
+            "mingw-w64-cross-mingw64-headers"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-mingw64-gcc",
+          "version": "16.2.0-1",
+          "filename": "mingw-w64-cross-mingw64-gcc-16.2.0-1-x86_64.pkg.tar.zst",
+          "sha256": "b7f9a36c0813332dde828c14eea673de03136eb1dfd374584adce9c94f6c1fda",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw64-gcc-16.2.0-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmqP2dAACgkQ+hFTGqCqf1fJ0g//fdqIU4cnTC3+8wgDl8WD58ktPJNqZ3+jaMnEPftdYOUoLLQjDJ16NwSIGXLuueaf8eBokqL0M4N/yp3ZRkclG7mZAd1ItP8DfSmJiPXCZe5D5qYOJcJRxv+iGeHwcG62h+dIhpSdUwNSrvQ5XGlq1VpuUmhVm9c01izY/NqVg0S7i2OXy7PHLa+zFlj19dyUPUCJaaxvwfnPIMbZBen0YyL59CxeJFbYGAiY8kl3hD/U6LUH5dX2BLqpDVl11iKxDBgNz8HlffWnLbRzor44vZGOKTJfgLalLbvICOxSCR2TcfANlFfg3Q6q3A/z1/bXoGpd56c3QHEh+yaYSuyM3BIHEwfvK61Z9uoCOqMzOokjYyVLQ5mzFKY9H0EMEokDlnNOy8teLxGyBuBf3Tjcndv5FiV7WknZaU+y5/NWhOwxEPQO1ysKIsKA/GXTnP9vgUbI9EoeithTj9DkAnHGNQZrAodlATnDtb34QgjH1m3GrSwUjviHV6zqkea9KM5thaRiz/X2q1Ad1t89WM6k6X6Ug1anWhOlFrtZ+o6PGDBFm8nJFmkO4l0YXZ0dd9CT6AUgoJqbrbGfzYYZdlOKhRoak5P/Gk9thGv7V0o4E1FnGLu+BTU/7WUJu8isJ6FwGKt9c8A7TOkP74nMMLbL8R4ld0A/tQd5fs4OK4GHjew=",
+          "size": 70162935,
+          "depends": [
+            "zlib",
+            "mpc",
+            "isl",
+            "libzstd",
+            "mingw-w64-cross-mingw64-crt",
+            "mingw-w64-cross-mingw64-headers",
+            "mingw-w64-cross-mingw64-winpthreads",
+            "mingw-w64-cross-mingw64-windows-default-manifest",
+            "mingw-w64-cross-mingw64-binutils"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-mingw64-headers",
+          "version": "14.0.0.r147.g31bd54ab7-1",
+          "filename": "mingw-w64-cross-mingw64-headers-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "sha256": "1cb929b6bb45c84ff6d31f99cd45b5e4a4fc117d2053e417b8a7a57c5e2921c1",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw64-headers-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmo+3fYACgkQ+hFTGqCqf1ebkA//dEoN5mLMJhyCFJJjjkDDVDHFIQt3D//tsrGNg89CI5SdJqRffkfJ1g/KBFouWWGePyES4Yf0QP4fSCf0+AuqoIhg1hFvkzvA5mxwnQi/lDeMl+SqDSOQ25no05BNy1PexnoxYL8Kiw2z42nPiXG7yXsMq7fL+/m1haqjKccLoRVazFb5K24j31ryrUelOEiOhlHeqeKKC9G80zBRItsEFROyUbI/Ony+6lnBnWLSn5O9I4MOKNNt7yb27fO/+39kCDnWD7UEqJ7MrSpL8SVhelySrh0pkf1k/PQeD07ITyPfAiKP/PetCPsphhA0eWUhXH3WtRa8fxu3BgTHpcBuyYfC4KkG7NUX9RRb1f6tRI8YBPBwQGhFEVJfCBDtGtTrrcXWoUmZct87L+YGUQSm6Y0/OvWZgNr9+1J7izHzNBfGUUeKhdvTU1IGTVybooUqj6ZdNwQEpREgGVVFiPwHjxkCviCEqX0wKjSCG3usx9ZhulvSnLHXSfExYO7WiwNKX/UEGqe8e8BEJiJ18wjTMRO6Px9KbVXTia3lOKhkbXaX4mFIHstw6bvVhDe1TWOrcsjnrfnNXybFUT60sN8tdpnKy0zqErtPUK8kkfF6qbF1H40m5VdZpC36Tc9gv9SN3boIGL3Ayn6+huKSZUzSoLmfSliob3rZ1S9qX3qEkkw=",
+          "size": 6285504,
+          "depends": []
+        },
+        {
+          "name": "mingw-w64-cross-mingw64-windows-default-manifest",
+          "version": "6.4-5",
+          "filename": "mingw-w64-cross-mingw64-windows-default-manifest-6.4-5-x86_64.pkg.tar.zst",
+          "sha256": "10bc06d2311959e636f8b257a5d21c58e819ed1d2064d5122a9b8d4223ca8f5c",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw64-windows-default-manifest-6.4-5-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAma+GJcACgkQ+hFTGqCqf1dAFQ//QgAaqTONuk1hfPd9nUIElSPHosFATMkIRxj2hwKAucTSDDACtWJHemuVAnUVwiVmQXxptbjBC+5dHQrtCZ0udQajMzC4RKrdX4TutnobJIO6yhSsGQUViMiEWZDh2bUDTtuFfKojFTrbjhHJ+V79Ks1dJHlVxezZY2/YCZ5o/zycSegoSi57w6jpgII8w9O3lEPVryYB7U5XUSCQSuz5rFO6e0e3o7mTc27LSk59j4WyjY/4dSSHd3UDwpvV+OaJRn7yX2iV6PcYw8tUOzWArEUW8BHI2h7eK2RENbzPEtkNQYut85qiQecTM5TEWQRzf4GGgBcyym0nO+dtbexLoK1JYfxaocMKWTLWsKXvqxGngnwoBhSaEUvgYamKtUHQsxNdpVCBQDalDkwaxebzoO9SVr0C9kSD8P538Km+dEgm0SvsZKvvfhpGVyK/V0A3WEX1bDwURwjNbwdxt6KheKWrkxpO9fZbwrZ0Ji3Cm+kUaCPvNkpv/E/SAACjOn9DjCmyECh4zRy4W6f82nmaBCeWAXhzpbPIQgZurgiV0oYvl6m6Fe61asyucjSTBU15JLioTDZH4VIZWshglKp0bid9nSwDDjbooucHmP9cUIc0XXXauOoPqHcLfpW6aUztuII9QBIDq2WC3vg0fCsap6YvEJ653jXYl6GzaYQFJqw=",
+          "size": 3173,
+          "depends": []
+        },
+        {
+          "name": "mingw-w64-cross-mingw64-winpthreads",
+          "version": "14.0.0.r147.g31bd54ab7-1",
+          "filename": "mingw-w64-cross-mingw64-winpthreads-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "sha256": "00e883e7de0170c2b265a9a469a300d4dbee6e3217715da1cf804c3648d0e6d5",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw64-winpthreads-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmo+3fgACgkQ+hFTGqCqf1cQbg//XyMOqq6V98BYBvxMJxJXcnb79rCZK+80Ae/Q4mmAk1OuV6h8EH4sCxy/+BpcIHUhlf/zjMNXaufukU0fu1MILaVa3pYx5Za/cH42EV7no6iL7Sj/0yHSBBjqhBcgdj2qZ3FqAiC8AEihmKZ1x72SQFuVs5DPGLH/J1ArkZyEwd8dlpzNuYi6Ic3dCfKQnUHWz/pf6+Wozk+nHA2OMFMTX0sV2S15/AS7LaZV9s47Z897PtLFmj/cavyxc0bfzHgOrSGyOFLJnF9WHRSsFuBmp+z1rAaJHCsPMLOxDa5xuqi9Mo9Zo9ppx3/iGv5oohOG9RK37e5UHR9wW5I1q37kraCKge1xpUwKZjiA4TVttycp3LZRfaEs/T4/CDTcaQsQ7hLM93yPW9yOq4iSo+T4PECmIOADNZmUn/PD2qALs8mVSTIcXW//9sGys/Bc5ZK8dx75cDEF3QUugAjALtlXswpPNqyvD3+Qu2N74UnfHpeE2IlmYnPFU3UxOjU9IMaxKRKh49U6dzAOG/AHRp3rqb+dMJgpLE8HY+7rb8tbYPuOzE/2yIzniAFSiZ2NfQFal+F+3efhXnTiqb1X6tV/8rZrKC0uf8dBj4vfdtDHIu6nrBf3kbseigy4I+0SLBm2MRwYwtvb3tkIBAUkceP9xQxdNJqiX0o4B8LDBwVJD/M=",
+          "size": 174332,
+          "depends": [
+            "mingw-w64-cross-mingw64-crt"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-mingw64-zlib",
+          "version": "1.3.2-2",
+          "filename": "mingw-w64-cross-mingw64-zlib-1.3.2-2-x86_64.pkg.tar.zst",
+          "sha256": "baafd309171e7b78e11d5a7ab7cc92a075d86b0a5814a7c1dce19839dd2ca28f",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingw64-zlib-1.3.2-2-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmoEx6wACgkQ+hFTGqCqf1fZyA//YrVcEF+Yb2kfZX3pKw7JSgDIHjmYqvWR15xBT7wOjt7sgfES6WXq9CPjEiGLwekN9/hLvJFWJn2gnyNzJ2yZaLEQ8ySJ4YyH4TzS0IoMD1k59rPZzNhdtoSvHUDm7vnbMzLiW373SG7Odbr/XGy1vB34dyU2E6dOyIsM+lFDAYTElNIspRx3rRGq4bW3JLZ74LawV/3dmXQgrTeBbZfP0JwDcwX3l47CizWhVdOdvjoQpjBh+Vkp83kv6HJqQlgWeFOJptvohMO5aEIIzfoID2P4fcdA/nVVrNMjQrH27bfARPymKTu87FJC9g0rsLr4ja3qlojwneTXrHNpFlOySXGlngJ8g2BFH1Yp10l9y0r5dMPZHvq7MeBzQ0aseqSq8fAqoiUm8oDaB7isJdX9oMX9ClLBou+JFRgXu3Fd9FbzZ/VX57h1R/SxYcN0dok2zr7N1lX8y5qKg53eu4z3Niq3QMFs3hVn02SfoGMBvCWNrPzNGU3muEQsbzMzZ9MBkX/k2uJ6zTdIfobEo6eBlNCyFC7u51H4SCqrpRSl5gJflc4cJMDzlKTKpB5yXOwYQBM78mz4HgUtmkLJq763sSCt0zBDA2yLlqkVIjz1+Os4x56n5/tT4iA8xV/AUJ1+IPnDPMusecFiPGC6kPgx/nemC/3n26Qov9cBxS3EYFs=",
+          "size": 191098,
+          "depends": []
+        },
+        {
+          "name": "mingw-w64-cross-mingwarm64-zlib",
+          "version": "1.3.2-2",
+          "filename": "mingw-w64-cross-mingwarm64-zlib-1.3.2-2-x86_64.pkg.tar.zst",
+          "sha256": "93dbb1343134acdfbda90fdb4de2767b17bdb84f9019eed49bf4474322e4c8d2",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-mingwarm64-zlib-1.3.2-2-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmoEx6wACgkQ+hFTGqCqf1dH6g//c3X2LHGDk/EyRPcvng04/CWE7cvd02m8ewNw96kfGkBTMAeVBNgmtrhNmKvStoe1fzxodiK4Pd9Zy8dx+E9vCYi48s8KIRXOUAfKgELPVd4We8KOtHUkLErFGBFoAfB5bSf7ZSIJ+OcujzP+6jCnWn9IZGNTB6AxDEwiPibOFtuhkm7g2T+VipMo58HKzDwxGEWahat+c3U3Wpy1plS+v/60nd5MEhFJ1Q54XxS5+372cMV7I/GfHDk5drxMeQNTdtUV4fdV2u9oqOcV4eZg0IWdMjZ7viw/+B5ha0bMwILBnqQttrlke1/FiezZ49IaleiNH7pAwTwh2YQGPqHjwT1oEYMMBOVMTUUI9RrNmuejyCgs9u6dVGrMPQgvo7kgM2sumLYEyjVNLMxg3ldOzXKC0OfYQiyMJRlS4xeRWrcwAFTdWxfAB1k9a8Up53AcHwsj23+a4k2gt1FjlSgx9U8XdIdZLkgu136szLGzOQSj1lo24JsyvBtMEKNu/6hz13I2jo/BLHNKv6o6DSryz7M/QL6OHxKo0UPomJpXJiMneQ1YtjzWhJgNGX5msxFhovSFdjTSHLQdefGLcFn3I0kYenMKOF3t4ofWiSB8+cNB8Ifl63Kd/Zl8L+AvtV7CKo8lVMQNoFHzcnVGm7SfT3NCT3CwNc8yHqb1W6Rs3hs=",
+          "size": 120058,
+          "depends": []
+        },
+        {
+          "name": "mingw-w64-cross-ucrt64-binutils",
+          "version": "2.47-1",
+          "filename": "mingw-w64-cross-ucrt64-binutils-2.47-1-x86_64.pkg.tar.zst",
+          "sha256": "7265a0f7f8721b4de215e2b7f4dea5bd4b39d25f61dc7c1b181094e8527f7f5a",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-ucrt64-binutils-2.47-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmpnvQkACgkQ+hFTGqCqf1cgWw/8Dp+KKpASlY5fPp6lNYuEashajHiaBxJPIGZWTzAOJE7jCdvHmum2f1irJ9tA2e14AEu4/dk1iovk+KW6kAA98g7AvDM5m5hY7LIa2lXI8PTJjaGZ9D0IE3dI8eG1PAV0mpnWy0nb4wWl6Bn1qp3rQQm35rCyU+HRyg76Mz79FX7X5DZo2CR9ryrXpiW8JAfS1tZpxmZWkOneA/Cz+hW6L/27W4mBjNsTxYXbkxKMRsu/bkBYJvlV8Y5dit2qPZaKgUaHXbdr5WhLsTdkWOJ+d/txABxC+h9cUILSteUKgAho4E4o4tOlsGM968l2xuyaNUKXTdqnIyus+GLhPxXvGL78eoNIR84V4aKAcabX7eL2BAP5FtvSYi6zbTfAPnn+5ec+RlyTkhIKgcw9QMkw5GZRi55Z67p6v2qKV4K+wZZPa8NdhL08nHpcypexzg/xGpt6v3iCI1Lkcyctq4ThweQslgUQKIDf/cfC9YK1q1KsMJJsdcqlo+bNpmbmSpjG/OmY8g1kl+IkX8U8iztQDEyYMu/921FQK+WByAT+1z4J/Ck7slyFZ6ydKFjyElSn/FnQPzE7CdRNmh+AWJE+83EfCewtXQEOZjqa2InLB6al4i8utCL4eKjrDSTwTCgQEGZ4aOl78T40i84kQbN0dZ91XUqW4kO+a4Tv/ZeBH0A=",
+          "size": 2576280,
+          "depends": [
+            "libiconv",
+            "zlib",
+            "libzstd",
+            "libintl",
+            "mingw-w64-cross-common-binutils"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-ucrt64-crt",
+          "version": "14.0.0.r147.g31bd54ab7-1",
+          "filename": "mingw-w64-cross-ucrt64-crt-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "sha256": "117970376ad032640ed6be00268dfcfc9ca91e26fde9319497292abd68e4bef2",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-ucrt64-crt-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmo+3foACgkQ+hFTGqCqf1coNw//Uuzvu3Ww3f2Wclx2C9xGdI2Qre6aW78M4FFsgNBP8NI2fIcfFvFwN6YAXfGLW8ylI4FVyicC05XHYBZRo0nhBsl8CIescSRjNfZdokNcmiF4ElzDzHC41zRcbCRbrbDoGgipQI2Ehih5i16YcHOFt6YJXPuM56O2FkL3DdWCNU2Fgv7xQWd5dg2C2Cv41V0+7mcEOhldj437hWOPjn7XpA6NJZo5wLVyZWXItcb3Axax8qekuqLx6gRlc+yjYxHlPOw5qm0rt950sEMLGz+cIVZnIWE51o5/3NK9/RbjBSKBlf/ayg4FNIJoNAGUvL3TwSUuWGKfWpZ+eGI2lNbElVPl7G2a50uGKmSIIbFt7avOGAkdcjt7oCBkFz9xLP6BPzxKC3BZz4/GleIOD91saaj9Bus+oQuxpWVDVtOGagQt90Iy59PrU+Xg26DEUZxAExUOrZsHwEGH56eWcLqknup7342qkptee+bZZPqtcPfoazqGnXxuOwoF0rf74pmVxKp+gLCLS2/hzixFFPXpfq86rLadqXjh0KOI3TPfNPqF1bxafyKZOr/xZNAme8u66K7cUx32Y3Em04fD91z9q3/xW5Zlx7BBDTRlyUZST0+3tJhInwWDHwmE93Rn3tF5rmBPwWD+rsIy/lvNM5pqrhISzzjB8rIZDaxEi5/dgHk=",
+          "size": 4874939,
+          "depends": [
+            "mingw-w64-cross-ucrt64-headers"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-ucrt64-gcc",
+          "version": "16.2.0-1",
+          "filename": "mingw-w64-cross-ucrt64-gcc-16.2.0-1-x86_64.pkg.tar.zst",
+          "sha256": "391c7ddf9bf800c81f8c5ca827006c848b9c2f27c91b40eee05d7e9b93c60742",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-ucrt64-gcc-16.2.0-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmqP2dEACgkQ+hFTGqCqf1e1TQ//aTG+A1uXqjdArUY3QBgFw9e5dyIJNCTGQHVmRTgtA+tPu+tJFYjbAhth7Zkrf70eTpPECJUrJrVGSUdjHFUD4Hjhhq2rSpfrHBX0llJnfF5qpwynA/GsdARn6KOzjHdzmlNvHgfqangjCoesV1Spdj6Ob298n33oJsERKPESxOo2Z8QftDNnuNaN+aSW+4y/cZhhxj92PAbuqDow9iRVoJqw173gFeD8F2Uu87NRUzb5R1CdzflPPrD+ratjsxRJbNgS+etuhYCuABdjpa0j8wyxI17gjD09aWsMeRLl/sQ0kNdJsvPez3/UVlwJbQjjLkSvwwEJ9owc95dVHKTZEIsz5laDbXNfWYn2Jt9+8THkb2+9Q7iy1GQbJRDMyDOOB7rMN3loJO618U5cZ1VbjM/0UWPTu0t91DRK9aJpzLjWy2ebSYISu3QaXVLKWaokRB8pZlNBVX5QaEICXLYW4BEA5ti/bt9DqdRV5sV0uhqlxvlKrLdHxxmy2n+3xBTGso9EAJFS+m54TmCHYB1md3I1r4XOzhDt34a+Uzj4+aC7SbFKBaHtXtWnYWlkCaBc2hNJqHecSHi7DFc78dDdPX1VAXtaWOow5ToDiZyMLbxKSxqKiGINGkyaBWPdNzPP4kRDIE8lLXVD09FU2AXkRaDKTOQxv6NZBZNWQ6s5cyE=",
+          "size": 70157505,
+          "depends": [
+            "zlib",
+            "mpc",
+            "isl",
+            "libzstd",
+            "mingw-w64-cross-ucrt64-crt",
+            "mingw-w64-cross-ucrt64-headers",
+            "mingw-w64-cross-ucrt64-winpthreads",
+            "mingw-w64-cross-ucrt64-windows-default-manifest",
+            "mingw-w64-cross-ucrt64-binutils"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-ucrt64-headers",
+          "version": "14.0.0.r147.g31bd54ab7-1",
+          "filename": "mingw-w64-cross-ucrt64-headers-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "sha256": "d37af54ec2f8f5f49f0fb6ff11d40d33f37b62d59b26dbeb13cf27128e2c4b64",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-ucrt64-headers-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmo+3fsACgkQ+hFTGqCqf1duMQ//S+9PfevtJqylRX3s6hIonnCd4Wq4noHycnQ4AsmO9XaTGnoDPV2mtYBm+/iMQdl6dERIUbyWvbVWrYi713aVV47bPZOVM1il0BO5NgcHXgAsbLY45h+1hPgR4qEa1zGBB01GMT24fIvAZGaxBhjkSYJM5VZrzF/9a9YLkT1CXzCPYQzIz+koOjSIWrUkAwQbfTr76t85dfLW1K2rr2/tKX5DWwzUflBleulKd5ON6xPBjCxALfkLNdVx8A/iDQZGiR9qMHabQ5S2qMHqUtJolAAGzulM4dB0yFZhHeKXn4rNj9I0VenZ+as/l3sJVuIbL4+WSbqJBWF80NXEJPiWOtVDRiGDw+88FSBIQYSzYHdtmy4JjdU4WTKi0yk4IYs5G2umhHWVUaLy2ItQovB9N19sQV4tiXoxi9zZnNKj+k8PZKkLQspapgv8F8sbpKUS52HriaR/noKTIg7R5LrHQiLOVtLLxk2WcqS4auE3zDhGzpWRn9rER7LGtCA05zA5pb/DGqZsrm8M7f/GwivC9pNTvHgA3yojLuOMHqXG3+nri+vxaXwAqDoEA2cOOdHHeSu+TC4LxAkdrUpHuNqfksMhNTtA8arqhUcdg2T0+i8zRGNnvWy0AymH4UaSUryYzQT/zEScfzRf5j1AwsfTtEX/JlBLTc6HneYVThDS4Uo=",
+          "size": 6287084,
+          "depends": []
+        },
+        {
+          "name": "mingw-w64-cross-ucrt64-windows-default-manifest",
+          "version": "6.4-5",
+          "filename": "mingw-w64-cross-ucrt64-windows-default-manifest-6.4-5-x86_64.pkg.tar.zst",
+          "sha256": "6ebbfa9b81ce872e8108717493a8f9256a7d6e568f2817cc8e8c721ba6b79a7c",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-ucrt64-windows-default-manifest-6.4-5-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAma+GJoACgkQ+hFTGqCqf1cXpw//XWPF78abNmYaKDozJ3qRwtIwffEW86VRidfeipQEY3Ky/Izu/H2foXOaniYdJfDFwmeHZWrOIcvDTNHqcK7ecMliCXuvZCSkwCfLuZ18YCuDHSMNCLgMniK9o9QNRPS7vtaT4RoKUKietaFG5TzMCeXVDAibvVyaWcPqDkl2iMgVGcp9EpGtS3mlDtILVgCbul/aCpbju9cLRjn2hmw/9DO1bsnuGVevbJmE1U/+RuSkif7qHPcWwzFN4fyaKHf5HrzIeR9LjfljhhUkSUkz4f03+2+bEXwDPfTix/qdbIsll9hq02qbdbgOr7LfKAfNbai90D/s6KPNHAsLToyG5ucVAA3cs/H6VOxSCkPmR8oXO+yObUcEEx61H5Idw0IXB4vVbMjv8rOraOUM2zWZDGkiq1BugWyuYD7HDASxWyammbeBBANOLYaZsBKf4sdlHPLF26+Cet7uwsLxs4Pz+21o5k4nETlpsEA97wLzuyWLTOljL4PkDfIKc9JFCpUOPD2Fnx2RukTTtvNZCs6Q9LH0bN3KEX1jkFB5SClVSn0HyEYiCT7l8GC5tfbDe0mnxL2usD8pN1r/Vjtw0GHxxGdEuKdlNwuzb0LR3BQ/IG8nVVYpygxK9uy9ZsRgO/XN8CKHUrVotNn6Fc+zeUn/uLTcdHDE1BXjzn7mLmMU89M=",
+          "size": 3177,
+          "depends": []
+        },
+        {
+          "name": "mingw-w64-cross-ucrt64-winpthreads",
+          "version": "14.0.0.r147.g31bd54ab7-1",
+          "filename": "mingw-w64-cross-ucrt64-winpthreads-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "sha256": "c981adfedc6045169d3a460e8af86dba65366ad57c1a6a1a8b38cb2546d148cf",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-ucrt64-winpthreads-14.0.0.r147.g31bd54ab7-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmo+3f0ACgkQ+hFTGqCqf1fYaw//YWjuaAoMY3V6R3gM/2JXIJToC80FGJhGT7mHdDlQbjQVXKUpi54+vwJ9N14P/OMfkJn/mEW+JegN7HJHLvhjiBUQ+RxuW0c/86STshNpbLni0p5quKWub7KRCCbZUKJJJQF6tXTg/U3ipdzZv8wPcI3BcOyoWo0G1s6Pd98Kxo7BEI1RBQyisbkmxhSVmpkrI+QvDRi7Z2zdOciYNzoYZcDyQ8uPDbeqEPpQFOuzrm0FtpJVez6RE23iEUb/DIFXlFYn3cY2ePcGk0pq/hFMeYjL1r2MqRy9po5TQgL3J9w3bm2gbuNsHFgXSlfKLzBW0WiHDla9l/7SnJ8YYtq5rsMdl5gNJ1iknrjPfrIHQ/hW1fedgALJ407KwaoO1SqnUyJ7KmOqjuiiQiOXghQz2WZmFbZAIH1+pYc3btoI8sZtbjKpAaKxZthEsJeXnmLs0MQ/9Es3Ypw/TcUutb1oE0nn6Al7ruEUSM2sZ+pg8E3YHwvGkBT6+9iVQwxOtjaj+8njTyzOABmAR9cEHviCyJHKb28ZYHb8gNf0/QZGJnxr1yu3BMQd07SJuEM3rtjwpJ2KAQiu4emKDVq4CaoH8t4NeY0dZx4ROvkyH+1mwRRjDyNoc0cFJ5MP0tCslo+eNtGM9mcR2BPRJj4Z1xbG34YD38pEj17fPHI5KRFtmH4=",
+          "size": 168730,
+          "depends": [
+            "mingw-w64-cross-ucrt64-crt"
+          ]
+        },
+        {
+          "name": "mingw-w64-cross-ucrt64-zlib",
+          "version": "1.3.2-2",
+          "filename": "mingw-w64-cross-ucrt64-zlib-1.3.2-2-x86_64.pkg.tar.zst",
+          "sha256": "670e81f4c1675ee19079b7e22bb4157d01195d553397284d6fca06636b88039c",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-ucrt64-zlib-1.3.2-2-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmoEx64ACgkQ+hFTGqCqf1dkMA/+PdaLft4MswjIQhdF7BypAAuMC1i4fLmW58Bm4Nnw9RaN8Hfhv72zpI5Ti0db+7cWTlxiU0elnfWMfyPpUfPm1W2d+Mo1rGyZl+whck/CSWiEeZoydKPdEgP1ojg0aKDB1DFFTjGWeTkZphtPZFHzBiWzK1t8zTGAtzruZ8zvEfqlzXwErZwYsPgpyW9UTQmxOEnTQmpOvz34UW+scRehDp127PrUs8/tl5hP4/rCp96RipSz5bNZVHVaUd/JrG//z0YvBUlYn1KOPibp/A5LjUJTpB/xpuKJfwCJlr8qXAkegpfuKaXYwmo9cnNtampDbd9zfK8Xg1inq2XqD525o8ZICYpqEOsFj5PW+8B2fiPhT5nqHnOOX1lT9CPW+s70RpODIlyi2RcxnaDXuFusdbZjpjQjvzgah/uzeHeBUhf35pIFCR4uX3xc+28XHcLvt6FHkiycAfsTTb3WTXxbsRTpbgIudKFT7Dqzds+JiHK6qH4B2OOJWB9xdIPJ1BFSqcQQk2TQWdaQ21+GSyMdiE9CyBYwhXLwdefX+yBckOvf2RTQy5Y/nV7oJkxVjGQBqJC0fWFZJJ1Z7h2h7f3zNKO+pAoPHCxVdQqO+HWlhlYXpyUF/kwLYP6dgf0XqufAXbg2yI+y1GerRBwzAlYNzFzRUNSJLJuTqH+L9JpGrz4=",
+          "size": 132608,
+          "depends": []
+        },
+        {
+          "name": "mingw-w64-cross-zlib",
+          "version": "1.3.2-2",
+          "filename": "mingw-w64-cross-zlib-1.3.2-2-x86_64.pkg.tar.zst",
+          "sha256": "948172823a604323ec1186903cb7040bf334c76c83c6a3071b3851839e353457",
+          "url": "https://repo.msys2.org/msys/x86_64/mingw-w64-cross-zlib-1.3.2-2-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmoEx64ACgkQ+hFTGqCqf1es4BAAvBJOVUGYtXtCUABMyniiuhihrl+HNOz2Q4hbXKqx2M3Roa5OvC2OA00qgYxVUzJHiPBPZ8v3+eoDp3/DnJfps7aRMzr6Vy+MP2EZAwVL+WtUiebv2ZXdGXtqmfTcIGYORfOjOvlpiy/x4V/19GG9IMWgqzWv1navE0giWqWcSsEsswvhZsEN6mOaxKvipU0Zkdc3tYprPFfTmUsBeKH11AZCH+YQaNLzbguaIeNGHkDJgzLWs0NIVtJUu1K9To2n+dxO0G9kfEyRVWxyQ16Oexj7kks0SIzFRnzRPI3Nol8hsmIWU+ZV0POBHoOUUd1uzAiMWqTA5kgnfyzWpXYJ7ESxsLNCQXU9g7lLq1/3CxKDLpu6yhbIuraltlyrHkAsJfICeL5y1heEOtW+3OZzH9RZfCr1kLJUHOCdHtDE1hvEFwbUXVF63qgF25bYGXKyTEVOs/fy5tZQ36mxW1Qvz5AuONOCk3lzDa89VItv8weOpCvtvQdodFzpDWM/bpQP7nku5srdWzRWEaaCZiOPTXU+aSTnmogd++Qfc5vU4HEbf5ckhBpIg9JD73y/VoJZVXmujAJ4T9c1xrDHMnPKXspZMlbdghrgIhVTHN2Z51KrY7ljLsK+hu9fewBnmUMfSAmjJUOXf79MTnBRtH+eezRlm6X7DkToHocqt772X20=",
+          "size": 2243,
+          "depends": [
+            "mingw-w64-cross-ucrt64-zlib",
+            "mingw-w64-cross-mingw32-zlib",
+            "mingw-w64-cross-mingw64-zlib",
+            "mingw-w64-cross-mingwarm64-zlib"
+          ]
+        },
+        {
+          "name": "zlib-devel",
+          "version": "1.3.2-1",
+          "filename": "zlib-devel-1.3.2-1-x86_64.pkg.tar.zst",
+          "sha256": "441dc9b1258d72a7a2ef513dfe26f87d07d050a312af00c765db26c31c5a2b45",
+          "url": "https://repo.msys2.org/msys/x86_64/zlib-devel-1.3.2-1-x86_64.pkg.tar.zst",
+          "signatureBase64": "iQIzBAABCgAdFiEEX5RLAn9/4gkZhaou+hFTGqCqf1cFAmmWwFsACgkQ+hFTGqCqf1dGqA//d+1HgXNfUzCDlYurWEd/AFzjmMlkR4jGicqmOskIsD4Fdc2hUsDRDmemJKxuKppZ7OA6DrQQQNo0aoXXJyMt8R6se2XcGV7g8M2DMs0I7bMIsTJwFxsWEJyBtfCIFOMczAED3qCxJg4p2aZuYsTbkEE95r/LErZoOFwGcGHxyyRnmVdmbuVfsNBSrIkBZNu6zCyMD6d976AZ/MHMwWIt23fHo7n1cKYjJS8mpohTONgmMxFHatyeqL5I1qwiX/P9Nop25+ZLo1OBn5zSB1g+FF1aONCJ3G2c0XywDFGqmYgZna9EcZvZD9TTuWPg4WrpFrsbc5JEsFLXQUiVGVuKCmKBemv7z0m68Ex/nI5W2cEttQDL6Dd6z2UoMPXAfZQHzBUZcBPwxoTJ5BmYImuFOnvTJnIcLf7/taoD4iIfFkuVE5k2xmXb3UhD8HOlhQaMk1+VKmwsaZ2f0In+azmeL5lHBbqXWdHdguu9rfLQ3EIQpT6MqQtH3YnfmDm1Wk30p+uQG8VAv0071Xoy9xLfPaIGss+Nk+YUddZVlhGt/2viFCLhUVXRT5mJKyulkj1YqZOHQkZ9bwFcaOpbVptk03h1hh87lSJNbaAR5p9pl2OzB/FwCnvwP1nqm9JzAaOW+ug2sx/AtKjHIcRUIqH770oi6SKYw8GDW9k2Dzkkyd4=",
+          "size": 85148,
+          "depends": [
+            "zlib=1.3.2"
+          ]
+        }
+      ],
+      "sdkDependencies": {
+        "libintl": {
+          "version": "0.22.5-1",
+          "requirements": [
+            "libintl"
+          ]
+        },
+        "libzstd": {
+          "version": "1.5.7-1",
+          "requirements": [
+            "libzstd",
+            "libzstd=1.5.7"
+          ]
+        },
+        "zlib": {
+          "version": "1.3.2-1",
+          "requirements": [
+            "zlib",
+            "zlib=1.3.2"
+          ]
+        },
+        "libiconv": {
+          "version": "1.19-1",
+          "requirements": [
+            "libiconv"
+          ]
+        },
+        "isl": {
+          "version": "0.28-1",
+          "requirements": [
+            "isl"
+          ]
+        },
+        "mpc": {
+          "version": "1.4.1-1",
+          "requirements": [
+            "mpc"
+          ]
+        },
+        "gmp": {
+          "version": "6.3.0-2",
+          "requirements": [
+            "gmp"
+          ]
+        }
+      },
+      "archiveBytes": 254772375
+    }
+  },
+  "limitations": [
+    "No SDK or package archives downloaded; no Windows compilation performed.",
+    "Archive SHA256 values originate from official HTTPS repository database, not independently downloaded archives.",
+    "SDK installed version constraints are rechecked by pacman during execution; package conflicts/new keyring compatibility remain untested.",
+    "proof uses --with-cross-bootstrap and disables docs/dumper; it is a DLL compiler proof, not a distributable runtime closure.",
+    "SOURCE_DATE_EPOCH and exact inputs do not establish bit-for-bit reproducibility until independent clean builds compare."
+  ]
+}
