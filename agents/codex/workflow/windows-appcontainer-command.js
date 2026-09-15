@@ -7,6 +7,83 @@ const { ensureWindowsPrivateAcl } = require('./safe-run-root.js')
 const { createWindowsFilesystemCapture } = require('./windows-filesystem.js')
 const { createWindowsAppContainerLauncher, WindowsAppContainerError } = require('./windows-appcontainer.js')
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
+// Copy a closed executable dependency set into the existing read-only runtime.
+// Granting the original Git installation would also expose unrelated plugins,
+// credentials and mutable launchers to a worker.
+function importedDlls(bytes) {
+  const invalid = () => { throw new WindowsAppContainerError('WINDOWS_RUNTIME_INVALID', 'Git Bash runtime has an invalid PE dependency table') }
+  const range = (offset, size) => { if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(size) || size < 0 || offset + size > bytes.length) invalid(); return offset }
+  if (!Buffer.isBuffer(bytes) || bytes.length < 64 || bytes.readUInt16LE(0) !== 0x5a4d) invalid()
+  const pe = bytes.readUInt32LE(60); range(pe, 24)
+  if (bytes.readUInt32LE(pe) !== 0x00004550) invalid()
+  const sections = bytes.readUInt16LE(pe + 6), optionalSize = bytes.readUInt16LE(pe + 20), optional = pe + 24
+  range(optional, optionalSize)
+  const magic = bytes.readUInt16LE(range(optional, 2)), directoryOffset = magic === 0x20b ? 112 : magic === 0x10b ? 96 : 0
+  if (!directoryOffset || optionalSize < directoryOffset || !sections || sections > 96) invalid()
+  const directoryCount = bytes.readUInt32LE(optional + directoryOffset - 4)
+  if (directoryCount > 16 || optionalSize < directoryOffset + directoryCount * 8) invalid()
+  const sectionTable = optional + optionalSize; range(sectionTable, sections * 40)
+  const locate = (rva, length) => {
+    const matches = []
+    for (let index = 0; index < sections; index++) {
+      const section = sectionTable + index * 40, base = bytes.readUInt32LE(section + 12), size = bytes.readUInt32LE(section + 16), raw = bytes.readUInt32LE(section + 20)
+      if (rva >= base && rva - base + length <= size) matches.push(range(raw + rva - base, length))
+    }
+    if (matches.length !== 1) invalid()
+    return matches[0]
+  }
+  const names = new Set()
+  const nameAt = rva => {
+    let name = ''
+    for (let index = 0; index < 256; index++) {
+      const byte = bytes[locate(rva + index, 1)]
+      if (!byte) { if (!/^[A-Za-z0-9_+.-]+\.dll$/i.test(name) || name.includes('..')) invalid(); names.add(name.toLowerCase()); return }
+      if (byte < 33 || byte > 126) invalid()
+      name += String.fromCharCode(byte)
+    }
+    invalid()
+  }
+  for (const [directoryIndex, descriptorSize, nameOffset] of [[1, 20, 12], [13, 32, 4]]) {
+    if (directoryCount <= directoryIndex) continue
+    const address = optional + directoryOffset + directoryIndex * 8, rva = bytes.readUInt32LE(address), size = bytes.readUInt32LE(address + 4)
+    if (!rva && !size) continue
+    if (!rva || size < descriptorSize || size > 1024 * 1024) invalid()
+    let terminated = false
+    for (let offset = 0; offset + descriptorSize <= size; offset += descriptorSize) {
+      const descriptor = locate(rva + offset, descriptorSize)
+      if (bytes.subarray(descriptor, descriptor + descriptorSize).every(byte => byte === 0)) { terminated = true; break }
+      // Delay imports must use RVAs. Old absolute-address descriptors cannot
+      // be interpreted without relocating the image and are refused.
+      if (directoryIndex === 13 && bytes.readUInt32LE(descriptor) !== 1) invalid()
+      nameAt(bytes.readUInt32LE(descriptor + nameOffset))
+      if (names.size > 128) invalid()
+    }
+    if (!terminated) invalid()
+  }
+  return [...names].sort()
+}
+function bindBashRuntime(runtimeDirectory, systemRoot) {
+  const files = new Map(); let totalBytes = 0
+  const visit = name => {
+    const label = name.toLowerCase()
+    if (files.has(label)) return
+    if (files.size >= 96) throw new WindowsAppContainerError('WINDOWS_RUNTIME_INVALID', 'Git Bash runtime dependency count exceeds its bound')
+    const binding = bindRuntimeFile(path.join(runtimeDirectory, name), 32 * 1024 * 1024)
+    totalBytes += binding.bytes.length
+    if (totalBytes > 256 * 1024 * 1024) throw new WindowsAppContainerError('WINDOWS_RUNTIME_INVALID', 'Git Bash runtime dependency bytes exceed their bound')
+    files.set(label, Object.freeze({ ...binding, name: label }))
+    for (const dependency of importedDlls(binding.bytes)) {
+      if (fs.existsSync(path.join(runtimeDirectory, dependency))) visit(dependency)
+      else if (/^(?:api-ms-win-|ext-ms-win-)[a-z0-9.-]+\.dll$/.test(dependency)) continue
+      else if (!systemRoot || !fs.existsSync(path.join(systemRoot, 'System32', dependency))) {
+        throw new WindowsAppContainerError('WINDOWS_RUNTIME_INVALID', `Git Bash runtime dependency is missing: ${dependency}`)
+      }
+    }
+  }
+  visit('bash.exe')
+  if (!files.has('msys-2.0.dll')) throw new WindowsAppContainerError('WINDOWS_RUNTIME_INVALID', 'Git Bash runtime does not bind its MSYS dependency')
+  return Object.freeze([...files.values()])
+}
 function bindRuntimeFile(file, maxBytes) {
   const canonical = fs.realpathSync.native(file)
   if (canonical.toLowerCase() !== path.resolve(file).toLowerCase()) throw new WindowsAppContainerError('WINDOWS_RUNTIME_INVALID', 'Git Bash runtime paths must be canonical')
@@ -24,26 +101,39 @@ function bindRuntimeFile(file, maxBytes) {
     return Object.freeze({ path: canonical, bytes, sha256: sha256(bytes) })
   } finally { fs.closeSync(descriptor) }
 }
-function resolveWindowsBash(options = {}) {
-  const environment = process.env
-  const candidates = [options.bashPath, environment.AUTOPROMPT_WINDOWS_BASH]
+function windowsBashCandidates(environment = process.env, requested) {
+  const windows = path.win32
+  const candidates = [requested, environment.AUTOPROMPT_WINDOWS_BASH]
   const bases = [environment.ProgramW6432, environment.ProgramFiles, environment['ProgramFiles(x86)'],
-    'C:\\Program Files', 'C:\\Program Files (x86)', environment.LOCALAPPDATA && path.join(environment.LOCALAPPDATA, 'Programs')].filter(Boolean)
-  for (const base of bases) candidates.push(path.join(base, 'Git', 'usr', 'bin', 'bash.exe'), path.join(base, 'Git', 'bin', 'bash.exe'))
-  for (const requested of [...new Set(candidates.filter(Boolean))]) {
+    'C:\\Program Files', 'C:\\Program Files (x86)', environment.LOCALAPPDATA && windows.join(environment.LOCALAPPDATA, 'Programs')].filter(Boolean)
+  for (const base of bases) candidates.push(windows.join(base, 'Git', 'usr', 'bin', 'bash.exe'), windows.join(base, 'Git', 'bin', 'bash.exe'))
+  // Git for Windows may be installed on another drive or under a package
+  // manager. Only a physical Bash/MSYS dependency closure is eligible; never
+  // invoke cmd.exe, where.exe, a PATH script, or WSL's bash.exe shim.
+  for (const directory of (environment.PATH || environment.Path || '').split(';').filter(value => windows.isAbsolute(value))) {
+    if (environment.SystemRoot && windows.resolve(directory).toLowerCase() === windows.join(environment.SystemRoot, 'System32').toLowerCase()) continue
+    candidates.push(windows.join(directory, 'bash.exe'))
+    if (/^(?:cmd|bin)$/i.test(windows.basename(directory))) candidates.push(windows.join(windows.dirname(directory), 'usr', 'bin', 'bash.exe'))
+  }
+  return [...new Set(candidates.filter(value => typeof value === 'string' && windows.isAbsolute(value) && !value.includes('\0')))]
+}
+function resolveWindowsBash(options = {}) {
+  const environment = options.env || process.env
+  let failure
+  for (const requested of windowsBashCandidates(environment, options.bashPath)) {
     try {
       const bash = bindRuntimeFile(requested, 16 * 1024 * 1024)
       const runtimeDirectory = path.dirname(bash.path)
-      const msys = bindRuntimeFile(path.join(runtimeDirectory, 'msys-2.0.dll'), 16 * 1024 * 1024)
+      const files = bindBashRuntime(runtimeDirectory, environment.SystemRoot)
       const version = cp.spawnSync(bash.path, ['--version'], {
         encoding: 'utf8', timeout: 5000, windowsHide: true, shell: false, cwd: runtimeDirectory,
         env: { SystemRoot: environment.SystemRoot, WINDIR: environment.SystemRoot, SystemDrive: environment.SystemDrive || environment.SystemRoot.slice(0, 2), PATH: runtimeDirectory },
       })
       const match = /GNU bash, version (\d+)\.(\d+)/.exec(version.stdout || '')
-      if (!version.error && version.status === 0 && match && (+match[1] > 4 || +match[1] === 4 && +match[2] >= 3)) return Object.freeze({ bash, msys })
-    } catch (_) {}
+      if (!version.error && version.status === 0 && match && (+match[1] > 4 || +match[1] === 4 && +match[2] >= 3)) return Object.freeze({ bash, files })
+    } catch (error) { if (error instanceof WindowsAppContainerError) failure = error }
   }
-  throw new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', 'Git Bash 4.3 or newer is required for the Windows command boundary')
+  throw new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', `Git Bash 4.3 or newer with its complete physical DLL closure is required for the Windows command boundary${failure ? `: ${failure.message}` : ''}`)
 }
 async function runWindowsAppContainerCommand(policy, args, options = {}) {
   if (process.platform !== 'win32' || typeof options.controlRoot !== 'string' || !path.isAbsolute(options.controlRoot)) throw new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', 'A private controller root is required for Windows commands')
@@ -53,7 +143,6 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
   const cancellationPath = path.join(controlRoot, `cancel-${nonce}`)
   const runtimeDirectory = path.join(path.dirname(controlRoot), `command-runtime-${nonce}`)
   const runtimeNode = path.join(runtimeDirectory, 'node.exe'), runtimeBash = path.join(runtimeDirectory, 'bash.exe')
-  const runtimeMsys = path.join(runtimeDirectory, 'msys-2.0.dll')
   const launcher = createWindowsAppContainerLauncher()
   const { prepareWindowsAppContainerResources, recoverWindowsAppContainerResources } = require('./windows-appcontainer-resources.js')
   const bashSource = resolveWindowsBash(options)
@@ -71,10 +160,13 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
     ensureWindowsPrivateAcl(runtimeDirectory)
     const expectedNodeHash = sha256(fs.readFileSync(process.execPath))
     fs.copyFileSync(process.execPath, runtimeNode, fs.constants.COPYFILE_EXCL)
-    fs.writeFileSync(runtimeBash, bashSource.bash.bytes, { flag: 'wx', mode: 0o500 })
-    fs.writeFileSync(runtimeMsys, bashSource.msys.bytes, { flag: 'wx', mode: 0o400 })
+    for (const binding of bashSource.files) {
+      const destination = path.join(runtimeDirectory, binding.name)
+      fs.writeFileSync(destination, binding.bytes, { flag: 'wx', mode: 0o500 })
+      if (sha256(fs.readFileSync(destination)) !== binding.sha256) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Git Bash runtime dependency changed while copying')
+    }
     if (sha256(fs.readFileSync(runtimeNode)) !== expectedNodeHash) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Controller Node changed while copying')
-    if (sha256(fs.readFileSync(runtimeBash)) !== executableSha256 || sha256(fs.readFileSync(runtimeMsys)) !== bashSource.msys.sha256) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Git Bash runtime changed while copying')
+    if (sha256(fs.readFileSync(runtimeBash)) !== executableSha256) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Git Bash runtime changed while copying')
     lease = await prepareWindowsAppContainerResources({ policy, controlRoot,
       executableRoots: [{ path: runtimeDirectory, kind: 'directory' }],
       verifyDrainEvidence: launcher.verifyDrainEvidence })
@@ -124,4 +216,4 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
     }
   }
 }
-module.exports = { runWindowsAppContainerCommand }
+module.exports = { runWindowsAppContainerCommand, importedDlls, bindBashRuntime, windowsBashCandidates, resolveWindowsBash }

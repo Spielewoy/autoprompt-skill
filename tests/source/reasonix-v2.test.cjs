@@ -316,7 +316,10 @@ test('public CLI and POSIX lifecycle share the private v2 receipt', { skip: proc
     const receipt = require('../../scripts/reasonix-package.cjs').verify(destination)
     assert.equal(receipt.contractVersion, '2.0.0')
     const doctor = run('doctor', ['reasonix', '--strict'])
-    assert.equal(doctor.status, 0, doctor.stdout + doctor.stderr)
+    // This version-only fixture cannot stream or resume native work. Payload
+    // integrity alone must not make strict readiness pass.
+    assert.equal(doctor.status, 1, doctor.stdout + doctor.stderr)
+    assert.match(doctor.stdout, /payload=verified activation=unavailable/)
     const cli = cp.spawnSync(process.execPath, [path.join(repo, 'bin/autoprompt.cjs'), 'doctor', 'reasonix', '--root', destination], { env, encoding: 'utf8' })
     assert.equal(cli.status, 0, cli.stdout + cli.stderr)
     const removed = run('uninstall', ['reasonix'])

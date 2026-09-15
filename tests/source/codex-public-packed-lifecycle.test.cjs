@@ -29,6 +29,34 @@ function ok(result, label = '') {
   assert.equal(result.status, 0, `${label}\n${result.stdout}\n${result.stderr}\n${result.error || ''}`)
   return result
 }
+function assertCodexDoctorRow(output) {
+  const row = output.split(/\r?\n/).find(line => /^codex\s/.test(line))
+  assert.ok(row, output)
+  assert.match(row, /extras=complete/)
+  if (process.platform === 'win32') {
+    assert.match(row, /^codex\s+yes\s+yes\s+no\s+/)
+    assert.match(row, /reason=codex-windows-sandbox-identity-unavailable/)
+    assert.match(row, /activation=unavailable/)
+  } else assert.match(row, /^codex\s+yes\s+yes\s+yes\s+/)
+}
+function codexDoctor(result) {
+  assert.equal(result.status, process.platform === 'win32' ? 1 : 0, `${result.stdout}\n${result.stderr}`)
+  assertCodexDoctorRow(result.stdout)
+  return result
+}
+function allProviderDoctor(result) {
+  // Every v2 payload is intact, but version-only sentinels cannot satisfy the
+  // native executable/capability prerequisites. Strict must expose that refusal.
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  for (const provider of Object.keys(VERSIONS).filter(provider => provider !== 'codex')) {
+    const row = result.stdout.split(/\r?\n/).find(line => new RegExp(`^${provider}\\s`).test(line))
+    assert.ok(row, `Missing ${provider} doctor row:\n${result.stdout}`)
+    assert.match(row, new RegExp(`^${provider}\\s+\\S+\\s+yes\\s+no\\s+`))
+    assert.match(row, /extras=complete.*payload=verified activation=unavailable/)
+  }
+  assertCodexDoctorRow(result.stdout)
+  return result
+}
 function write(file, bytes) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, bytes) }
 function digest(bytes) { return crypto.createHash('sha256').update(bytes).digest('hex') }
 function literal(value) { return `'${value.replaceAll("'", `'"'"'`)}'` }
@@ -143,7 +171,7 @@ test('packed public Codex and all-provider lifecycles remove receipt-bound v2 bu
     }
     ok(invoke(['install', 'all']))
     assert.equal(codexInstallation(root).generation, initial.generation)
-    ok(invoke(['doctor', '--strict']))
+    allProviderDoctor(invoke(['doctor', '--strict']))
     // Make receipt-created parents nonempty with unowned data after installation.
     // Uninstall must relinquish them, not recurse or retain a stale receipt.
     const preserved = preservationFiles(root)
@@ -162,7 +190,7 @@ test('packed public Codex and all-provider lifecycles remove receipt-bound v2 bu
     assertPreserved(preserved)
     ok(invoke(['install', 'all']))
     const reinstalled = codexInstallation(root)
-    ok(invoke(['doctor', '--strict']))
+    allProviderDoctor(invoke(['doctor', '--strict']))
     ok(invoke(['uninstall', 'all']))
     assertRemoved(root, reinstalled)
     assertPreserved(preserved)
@@ -184,7 +212,7 @@ test('packed public Codex and all-provider lifecycles remove receipt-bound v2 bu
     const first = codexInstallation(root)
     ok(invoke(['install', 'codex']))
     assert.equal(codexInstallation(root).generation, first.generation)
-    ok(invoke(['doctor', 'codex', '--strict']))
+    codexDoctor(invoke(['doctor', 'codex', '--strict']))
     const lease = lock.acquire(root, 'public-lifecycle-regression')
     try {
       const before = snapshot(root)
@@ -199,7 +227,7 @@ test('packed public Codex and all-provider lifecycles remove receipt-bound v2 bu
     assertPreserved(preserved)
     ok(invoke(['install', 'codex']))
     const second = codexInstallation(root)
-    ok(invoke(['doctor', 'codex', '--strict']))
+    codexDoctor(invoke(['doctor', 'codex', '--strict']))
     const drift = path.join(second.bundle, 'skills/autoprompt/GATES.md')
     fs.appendFileSync(drift, '\nuser edit must survive public uninstall\n')
     fs.appendFileSync(second.marker, '\nuser manifest edit must survive\n')

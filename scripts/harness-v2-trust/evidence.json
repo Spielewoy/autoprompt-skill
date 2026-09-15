@@ -1055,5 +1055,598 @@
       "reviewDigest": "d722f94b8f461d29e9f3e46f9003807ae6913d257c3060f915f4aea276810b48"
     }
   ],
-  "note": "Maintainer-authenticated exact-release reviews under reviewed-local-release-v1; each activation still requires a fresh closed native canary. No independent signature claim."
+  "note": "Historical exact-release reviews are retained unchanged. Local canary policies authorize only fresh receipt-bound native tests on the installed runtime; they assert no previous platform/version certification and never bypass failed, missing, or skipped capability tests.",
+  "localCanaryPolicies": [
+    {
+      "schemaVersion": "harness-v2-local-canary-policy.v1",
+      "provider": "claude",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "architectures": [
+        "x64",
+        "arm64"
+      ],
+      "protocol": "scripts/harness-v2-transport.cjs",
+      "canaryImplementation": "scripts/harness-v2-closed-canary.cjs",
+      "capabilityCases": {
+        "isolation": {
+          "source": "tests/source/harness-v2-claude-capability-native.test.cjs",
+          "testName": "claude closed native capability: isolation denies candidate/private/network while allowing scratch"
+        },
+        "topologyEnforcement": {
+          "source": "tests/source/harness-v2-claude-capability-native.test.cjs",
+          "testName": "claude closed native capability: topology rejects injected nested dispatch and permits only its controller edge"
+        },
+        "privateSkillRoot": {
+          "source": "tests/source/harness-v2-claude-capability-native.test.cjs",
+          "testName": "claude closed native capability: private skill root and ambient project configuration stay outside the model"
+        },
+        "eventStreaming": {
+          "source": "tests/source/harness-v2-claude-capability-native.test.cjs",
+          "testName": "claude closed native capability: intermediate stream events remain correlated to the native session"
+        },
+        "toolOutputCapture": {
+          "source": "tests/source/harness-v2-claude-capability-native.test.cjs",
+          "testName": "claude closed native capability: exact controller tool receipt binds the real command output"
+        },
+        "stableChildIdentity": {
+          "source": "tests/source/harness-v2-claude-capability-native.test.cjs",
+          "testName": "claude closed native capability: concurrently owned siblings receive separate native identities"
+        },
+        "sameContextContinuation": {
+          "source": "tests/source/harness-v2-claude-capability-native.test.cjs",
+          "testName": "claude closed native capability: same-context continuation succeeds while foreign target reuse is refused"
+        },
+        "cancellation": {
+          "source": "tests/source/harness-v2-claude-capability-native.test.cjs",
+          "testName": "claude closed native capability: cancellation drains the held child and a sibling remains operational"
+        },
+        "isolatedChecking": {
+          "source": "tests/source/harness-v2-claude-capability-native.test.cjs",
+          "testName": "claude closed native capability: isolated checker receives read-only candidate and private scratch"
+        },
+        "processOwnership": {
+          "source": "tests/source/harness-v2-claude-capability-native.test.cjs",
+          "testName": "claude closed native capability: process ownership records completion and recovers a fresh session"
+        },
+        "modelRouting": {
+          "source": "tests/source/harness-v2-claude-capability-native.test.cjs",
+          "testName": "claude closed native capability: exact model effort is wired and unsupported assignment is refused"
+        }
+      }
+    },
+    {
+      "schemaVersion": "harness-v2-local-canary-policy.v1",
+      "provider": "deepseek",
+      "platforms": [
+        "linux"
+      ],
+      "architectures": [
+        "x64",
+        "arm64"
+      ],
+      "protocol": "scripts/harness-v2-transport.cjs",
+      "canaryImplementation": "scripts/harness-v2-closed-canary.cjs",
+      "capabilityCases": {
+        "isolation": {
+          "source": "tests/source/harness-v2-deepseek-capability-native.test.cjs",
+          "testName": "deepseek closed native capability: isolation"
+        },
+        "topologyEnforcement": {
+          "source": "tests/source/harness-v2-deepseek-capability-native.test.cjs",
+          "testName": "deepseek closed native capability: topologyEnforcement"
+        },
+        "privateSkillRoot": {
+          "source": "tests/source/harness-v2-deepseek-capability-native.test.cjs",
+          "testName": "deepseek closed native capability: privateSkillRoot"
+        },
+        "eventStreaming": {
+          "source": "tests/source/harness-v2-deepseek-capability-native.test.cjs",
+          "testName": "deepseek closed native capability: eventStreaming"
+        },
+        "toolOutputCapture": {
+          "source": "tests/source/harness-v2-deepseek-capability-native.test.cjs",
+          "testName": "deepseek closed native capability: toolOutputCapture"
+        },
+        "stableChildIdentity": {
+          "source": "tests/source/harness-v2-deepseek-capability-native.test.cjs",
+          "testName": "deepseek closed native capability: stableChildIdentity"
+        },
+        "sameContextContinuation": {
+          "source": "tests/source/harness-v2-deepseek-capability-native.test.cjs",
+          "testName": "deepseek closed native capability: sameContextContinuation"
+        },
+        "cancellation": {
+          "source": "tests/source/harness-v2-deepseek-capability-native.test.cjs",
+          "testName": "deepseek closed native capability: cancellation"
+        },
+        "isolatedChecking": {
+          "source": "tests/source/harness-v2-deepseek-capability-native.test.cjs",
+          "testName": "deepseek closed native capability: isolatedChecking"
+        },
+        "processOwnership": {
+          "source": "tests/source/harness-v2-deepseek-capability-native.test.cjs",
+          "testName": "deepseek closed native capability: processOwnership"
+        },
+        "modelRouting": {
+          "source": "tests/source/harness-v2-deepseek-capability-native.test.cjs",
+          "testName": "deepseek closed native capability: modelRouting"
+        }
+      }
+    },
+    {
+      "schemaVersion": "harness-v2-local-canary-policy.v1",
+      "provider": "grok",
+      "platforms": [
+        "linux"
+      ],
+      "architectures": [
+        "x64",
+        "arm64"
+      ],
+      "protocol": "scripts/harness-v2-transport.cjs",
+      "canaryImplementation": "scripts/harness-v2-closed-canary.cjs",
+      "capabilityCases": {
+        "isolation": {
+          "source": "tests/source/harness-v2-grok-capability-native.test.cjs",
+          "testName": "grok closed native capability: all six owned tools enforce write/private/network isolation and scratch witness"
+        },
+        "topologyEnforcement": {
+          "source": "tests/source/harness-v2-grok-capability-native.test.cjs",
+          "testName": "grok closed native capability: hostile native tool topology is denied before an owned controller call"
+        },
+        "privateSkillRoot": {
+          "source": "tests/source/harness-v2-grok-capability-native.test.cjs",
+          "testName": "grok closed native capability: private and ambient configuration are absent from actual model requests"
+        },
+        "eventStreaming": {
+          "source": "tests/source/harness-v2-grok-capability-native.test.cjs",
+          "testName": "grok closed native capability: native event stream stays correlated to one context"
+        },
+        "toolOutputCapture": {
+          "source": "tests/source/harness-v2-grok-capability-native.test.cjs",
+          "testName": "grok closed native capability: exact output bytes are committed in the controller receipt"
+        },
+        "stableChildIdentity": {
+          "source": "tests/source/harness-v2-grok-capability-native.test.cjs",
+          "testName": "grok closed native capability: overlapping siblings retain unique contexts and drain"
+        },
+        "sameContextContinuation": {
+          "source": "tests/source/harness-v2-grok-capability-native.test.cjs",
+          "testName": "grok closed native capability: resume reuses only its bound target context"
+        },
+        "cancellation": {
+          "source": "tests/source/harness-v2-grok-capability-native.test.cjs",
+          "testName": "grok closed native capability: held child cancels while a fast sibling remains alive and drained"
+        },
+        "isolatedChecking": {
+          "source": "tests/source/harness-v2-grok-capability-native.test.cjs",
+          "testName": "grok closed native capability: checker sees frozen candidate but writes only authenticated scratch"
+        },
+        "processOwnership": {
+          "source": "tests/source/harness-v2-grok-capability-native.test.cjs",
+          "testName": "grok closed native capability: crash recovery drains the durable owned child"
+        },
+        "modelRouting": {
+          "source": "tests/source/harness-v2-grok-capability-native.test.cjs",
+          "testName": "grok closed native capability: model and effort reach native wire while unsupported assignment is refused"
+        }
+      }
+    },
+    {
+      "schemaVersion": "harness-v2-local-canary-policy.v1",
+      "provider": "hermes",
+      "platforms": [
+        "linux"
+      ],
+      "architectures": [
+        "x64",
+        "arm64"
+      ],
+      "protocol": "scripts/harness-v2-transport.cjs",
+      "canaryImplementation": "scripts/harness-v2-closed-canary.cjs",
+      "capabilityCases": {
+        "isolation": {
+          "source": "tests/source/harness-v2-hermes-capability-native.test.cjs",
+          "testName": "hermes closed native capability: isolation denies candidate/private/network while allowing scratch"
+        },
+        "topologyEnforcement": {
+          "source": "tests/source/harness-v2-hermes-capability-native.test.cjs",
+          "testName": "hermes closed native capability: topology rejects injected nested tool and admits controller edge"
+        },
+        "privateSkillRoot": {
+          "source": "tests/source/harness-v2-hermes-capability-native.test.cjs",
+          "testName": "hermes closed native capability: ambient configuration skills and hooks stay absent"
+        },
+        "eventStreaming": {
+          "source": "tests/source/harness-v2-hermes-capability-native.test.cjs",
+          "testName": "hermes closed native capability: real intermediate tool journal event is correlated before final response"
+        },
+        "toolOutputCapture": {
+          "source": "tests/source/harness-v2-hermes-capability-native.test.cjs",
+          "testName": "hermes closed native capability: exact controller output bytes bind to receipt"
+        },
+        "stableChildIdentity": {
+          "source": "tests/source/harness-v2-hermes-capability-native.test.cjs",
+          "testName": "hermes closed native capability: concurrent siblings keep separate identities"
+        },
+        "sameContextContinuation": {
+          "source": "tests/source/harness-v2-hermes-capability-native.test.cjs",
+          "testName": "hermes closed native capability: continuation resumes and foreign target is denied"
+        },
+        "cancellation": {
+          "source": "tests/source/harness-v2-hermes-capability-native.test.cjs",
+          "testName": "hermes closed native capability: cancellation drains held child while sibling succeeds"
+        },
+        "isolatedChecking": {
+          "source": "tests/source/harness-v2-hermes-capability-native.test.cjs",
+          "testName": "hermes closed native capability: independent checker freezes candidate and writes scratch"
+        },
+        "processOwnership": {
+          "source": "tests/source/harness-v2-hermes-capability-native.test.cjs",
+          "testName": "hermes closed native capability: durable owner recovery drains live crashed controller child"
+        },
+        "modelRouting": {
+          "source": "tests/source/harness-v2-hermes-capability-native.test.cjs",
+          "testName": "hermes closed native capability: model effort is wired and unsupported effort is denied"
+        }
+      }
+    },
+    {
+      "schemaVersion": "harness-v2-local-canary-policy.v1",
+      "provider": "kilo",
+      "platforms": [
+        "linux"
+      ],
+      "architectures": [
+        "x64",
+        "arm64"
+      ],
+      "protocol": "scripts/harness-v2-transport.cjs",
+      "canaryImplementation": "scripts/harness-v2-closed-canary.cjs",
+      "capabilityCases": {
+        "isolation": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "kilo closed native capability: isolation"
+        },
+        "topologyEnforcement": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "kilo closed native capability: topologyEnforcement"
+        },
+        "privateSkillRoot": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "kilo closed native capability: privateSkillRoot"
+        },
+        "eventStreaming": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "kilo closed native capability: eventStreaming"
+        },
+        "toolOutputCapture": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "kilo closed native capability: toolOutputCapture"
+        },
+        "stableChildIdentity": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "kilo closed native capability: stableChildIdentity"
+        },
+        "sameContextContinuation": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "kilo closed native capability: sameContextContinuation"
+        },
+        "cancellation": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "kilo closed native capability: cancellation"
+        },
+        "isolatedChecking": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "kilo closed native capability: isolatedChecking"
+        },
+        "processOwnership": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "kilo closed native capability: processOwnership"
+        },
+        "modelRouting": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "kilo closed native capability: modelRouting"
+        }
+      }
+    },
+    {
+      "schemaVersion": "harness-v2-local-canary-policy.v1",
+      "provider": "omp",
+      "platforms": [
+        "linux"
+      ],
+      "architectures": [
+        "x64",
+        "arm64"
+      ],
+      "protocol": "scripts/harness-v2-transport.cjs",
+      "canaryImplementation": "scripts/harness-v2-closed-canary.cjs",
+      "capabilityCases": {
+        "isolation": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "omp closed native capability: all six owned tools enforce write/private/network isolation and scratch witness"
+        },
+        "topologyEnforcement": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "omp closed native capability: hostile nested dispatch is denied and only the fixed controller topology is advertised"
+        },
+        "privateSkillRoot": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "omp closed native capability: private and ambient configuration are absent from actual model requests"
+        },
+        "eventStreaming": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "omp closed native capability: native event stream stays correlated to one context"
+        },
+        "toolOutputCapture": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "omp closed native capability: exact output bytes are committed in the controller receipt"
+        },
+        "stableChildIdentity": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "omp closed native capability: overlapping siblings retain unique contexts and drain"
+        },
+        "sameContextContinuation": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "omp closed native capability: resume reuses only its bound target context"
+        },
+        "cancellation": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "omp closed native capability: held child cancels while a fast sibling remains alive and drained"
+        },
+        "isolatedChecking": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "omp closed native capability: checker sees frozen candidate but writes only authenticated scratch"
+        },
+        "processOwnership": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "omp closed native capability: crash recovery drains the durable owned child"
+        },
+        "modelRouting": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "omp closed native capability: model and effort reach native wire while unsupported assignment is refused"
+        }
+      }
+    },
+    {
+      "schemaVersion": "harness-v2-local-canary-policy.v1",
+      "provider": "opencode",
+      "platforms": [
+        "linux"
+      ],
+      "architectures": [
+        "x64",
+        "arm64"
+      ],
+      "protocol": "scripts/harness-v2-transport.cjs",
+      "canaryImplementation": "scripts/harness-v2-closed-canary.cjs",
+      "capabilityCases": {
+        "isolation": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "opencode closed native capability: isolation"
+        },
+        "topologyEnforcement": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "opencode closed native capability: topologyEnforcement"
+        },
+        "privateSkillRoot": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "opencode closed native capability: privateSkillRoot"
+        },
+        "eventStreaming": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "opencode closed native capability: eventStreaming"
+        },
+        "toolOutputCapture": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "opencode closed native capability: toolOutputCapture"
+        },
+        "stableChildIdentity": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "opencode closed native capability: stableChildIdentity"
+        },
+        "sameContextContinuation": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "opencode closed native capability: sameContextContinuation"
+        },
+        "cancellation": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "opencode closed native capability: cancellation"
+        },
+        "isolatedChecking": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "opencode closed native capability: isolatedChecking"
+        },
+        "processOwnership": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "opencode closed native capability: processOwnership"
+        },
+        "modelRouting": {
+          "source": "tests/source/harness-v2-opencode-capability-native.test.cjs",
+          "testName": "opencode closed native capability: modelRouting"
+        }
+      }
+    },
+    {
+      "schemaVersion": "harness-v2-local-canary-policy.v1",
+      "provider": "prime",
+      "platforms": [
+        "linux"
+      ],
+      "architectures": [
+        "x64",
+        "arm64"
+      ],
+      "protocol": "scripts/harness-v2-transport.cjs",
+      "canaryImplementation": "scripts/harness-v2-closed-canary.cjs",
+      "capabilityCases": {
+        "isolation": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "prime closed native capability: all six owned tools enforce write/private/network isolation and scratch witness"
+        },
+        "topologyEnforcement": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "prime closed native capability: hostile nested dispatch is denied and only the fixed controller topology is advertised"
+        },
+        "privateSkillRoot": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "prime closed native capability: private and ambient configuration are absent from actual model requests"
+        },
+        "eventStreaming": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "prime closed native capability: native event stream stays correlated to one context"
+        },
+        "toolOutputCapture": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "prime closed native capability: exact output bytes are committed in the controller receipt"
+        },
+        "stableChildIdentity": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "prime closed native capability: overlapping siblings retain unique contexts and drain"
+        },
+        "sameContextContinuation": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "prime closed native capability: resume reuses only its bound target context"
+        },
+        "cancellation": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "prime closed native capability: held child cancels while a fast sibling remains alive and drained"
+        },
+        "isolatedChecking": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "prime closed native capability: checker sees frozen candidate but writes only authenticated scratch"
+        },
+        "processOwnership": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "prime closed native capability: crash recovery drains the durable owned child"
+        },
+        "modelRouting": {
+          "source": "tests/source/harness-v2-pi-capability-native.test.cjs",
+          "testName": "prime closed native capability: model and effort reach native wire while unsupported assignment is refused"
+        }
+      }
+    },
+    {
+      "schemaVersion": "harness-v2-local-canary-policy.v1",
+      "provider": "reasonix",
+      "platforms": [
+        "linux"
+      ],
+      "architectures": [
+        "x64",
+        "arm64"
+      ],
+      "protocol": "agents/reasonix/workflow/transport.js",
+      "canaryImplementation": "scripts/harness-v2-closed-canary.cjs",
+      "capabilityCases": {
+        "isolation": {
+          "source": "tests/source/harness-v2-reasonix-capability-native.test.cjs",
+          "testName": "reasonix closed native capability: isolation"
+        },
+        "topologyEnforcement": {
+          "source": "tests/source/harness-v2-reasonix-capability-native.test.cjs",
+          "testName": "reasonix closed native capability: topology"
+        },
+        "privateSkillRoot": {
+          "source": "tests/source/harness-v2-reasonix-capability-native.test.cjs",
+          "testName": "reasonix closed native capability: privateConfiguration"
+        },
+        "eventStreaming": {
+          "source": "tests/source/harness-v2-reasonix-capability-native.test.cjs",
+          "testName": "reasonix closed native capability: intermediateEvents"
+        },
+        "toolOutputCapture": {
+          "source": "tests/source/harness-v2-reasonix-capability-native.test.cjs",
+          "testName": "reasonix closed native capability: exactToolOutput"
+        },
+        "stableChildIdentity": {
+          "source": "tests/source/harness-v2-reasonix-capability-native.test.cjs",
+          "testName": "reasonix closed native capability: concurrency"
+        },
+        "sameContextContinuation": {
+          "source": "tests/source/harness-v2-reasonix-capability-native.test.cjs",
+          "testName": "reasonix closed native capability: resume"
+        },
+        "cancellation": {
+          "source": "tests/source/harness-v2-reasonix-capability-native.test.cjs",
+          "testName": "reasonix closed native capability: cancellation"
+        },
+        "isolatedChecking": {
+          "source": "tests/source/harness-v2-reasonix-capability-native.test.cjs",
+          "testName": "reasonix closed native capability: checker"
+        },
+        "processOwnership": {
+          "source": "tests/source/harness-v2-reasonix-capability-native.test.cjs",
+          "testName": "reasonix closed native capability: processOwnership"
+        },
+        "modelRouting": {
+          "source": "tests/source/harness-v2-reasonix-capability-native.test.cjs",
+          "testName": "reasonix closed native capability: modelEffort"
+        }
+      }
+    },
+    {
+      "schemaVersion": "harness-v2-local-canary-policy.v1",
+      "provider": "vscode",
+      "platforms": [
+        "linux"
+      ],
+      "architectures": [
+        "x64",
+        "arm64"
+      ],
+      "protocol": "scripts/harness-v2-transport.cjs",
+      "canaryImplementation": "scripts/harness-v2-closed-canary.cjs",
+      "capabilityCases": {
+        "isolation": {
+          "source": "tests/source/harness-v2-vscode-capability-native.test.cjs",
+          "testName": "vscode native capability isolation"
+        },
+        "topologyEnforcement": {
+          "source": "tests/source/harness-v2-vscode-capability-native.test.cjs",
+          "testName": "vscode native capability topologyEnforcement"
+        },
+        "privateSkillRoot": {
+          "source": "tests/source/harness-v2-vscode-capability-native.test.cjs",
+          "testName": "vscode native capability privateSkillRoot"
+        },
+        "eventStreaming": {
+          "source": "tests/source/harness-v2-vscode-capability-native.test.cjs",
+          "testName": "vscode native capability eventStreaming"
+        },
+        "toolOutputCapture": {
+          "source": "tests/source/harness-v2-vscode-capability-native.test.cjs",
+          "testName": "vscode native capability toolOutputCapture"
+        },
+        "stableChildIdentity": {
+          "source": "tests/source/harness-v2-vscode-capability-native.test.cjs",
+          "testName": "vscode native capability stableChildIdentity"
+        },
+        "sameContextContinuation": {
+          "source": "tests/source/harness-v2-vscode-capability-native.test.cjs",
+          "testName": "vscode native capability sameContextContinuation"
+        },
+        "cancellation": {
+          "source": "tests/source/harness-v2-vscode-capability-native.test.cjs",
+          "testName": "vscode native capability cancellation"
+        },
+        "isolatedChecking": {
+          "source": "tests/source/harness-v2-vscode-capability-native.test.cjs",
+          "testName": "vscode native capability isolatedChecking"
+        },
+        "processOwnership": {
+          "source": "tests/source/harness-v2-vscode-capability-native.test.cjs",
+          "testName": "vscode native capability processOwnership"
+        },
+        "modelRouting": {
+          "source": "tests/source/harness-v2-vscode-capability-native.test.cjs",
+          "testName": "vscode native capability modelRouting"
+        }
+      }
+    }
+  ]
 }

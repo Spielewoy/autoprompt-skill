@@ -41,11 +41,8 @@ const REVIEWED_LOCAL_EVIDENCE = 'scripts/harness-v2-trust/evidence.json'
 function reviewedLocalPending(installed, executable, options = {}) {
   let evidence
   try { evidence = JSON.parse(readBound(path.join(installed.bundle, REVIEWED_LOCAL_EVIDENCE))) } catch { return null }
-  if (evidence?.reviewedLocalRecords === undefined) return null
-  if (!Array.isArray(evidence.reviewedLocalRecords)) throw new ReasonixError('PROVIDER_UNSUPPORTED', 'Reasonix reviewed-local release records are invalid')
   try {
-    const review = localCanary.selectReview(evidence.reviewedLocalRecords, 'reasonix', installed, executable)
-    return review ? localCanary.verifyReview(review, 'reasonix', installed, executable, options.now) : null
+    return localCanary.pendingFromEvidence(evidence, 'reasonix', installed, executable, options.now)
   }
   catch (error) { throw new ReasonixError('PROVIDER_UNSUPPORTED', `Reasonix reviewed-local release record is rejected: ${error.message}`) }
 }

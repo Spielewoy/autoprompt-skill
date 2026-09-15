@@ -8,7 +8,13 @@ const test = require('node:test')
 const pkg = require('../../scripts/harness-v2-package.cjs')
 const ROOT = path.resolve(__dirname, '../..')
 function execute(command, args, options = {}) { return cp.spawnSync(command, args, { encoding: 'utf8', timeout: 180000, ...options }) }
-function ok(result) { assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}\n${result.error || ''}`); return result }
+function ok(result) { assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}\n${result.error || ''}`); return result }function requiresNative(result) {
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /activation=(?:unavailable|attestation-required)/)
+  assert.match(result.stdout, /extras=complete/)
+  return result
+}
+
 function write(file, bytes) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, bytes) }
 const POWER_SHELL = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
 const HAS_POWER_SHELL = execute(POWER_SHELL, ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'], { stdio: 'ignore' }).status === 0
@@ -109,7 +115,7 @@ test('packed artifact installs and verifies all public providers without the che
     const modelFile = path.join(root, `.autoprompt-${provider}-models.json`)
     const modelBytes = fs.readFileSync(modelFile)
     assert.deepEqual(JSON.parse(modelBytes), { mode: 'explicit', selector: 'provider/test-model', models: ['provider/test-model'] })
-    ok(invoke(['doctor', provider, '--strict', '--root', root]))
+    requiresNative(invoke(['doctor', provider, '--strict', '--root', root]))
     ok(invoke(['install', provider, '--root', root]))
     assert.deepEqual(fs.readFileSync(modelFile), modelBytes, 'idempotent update preserves selected models')
     ok(invoke(['uninstall', provider, '--root', root]))
@@ -129,7 +135,12 @@ test('packed artifact installs and verifies all public providers without the che
       const invoke = args => execute(process.execPath, [publicCli, ...args], { cwd: directory, env })
       ok(invoke(['install', provider, '--root', root]))
       ok(invoke(['configure', provider, '--agents', model, '--root', root]))
-      ok(invoke(['doctor', provider, '--strict', '--root', root]))
+      if (provider === 'reasonix') requiresNative(invoke(['doctor', provider, '--strict', '--root', root]))
+      else if (process.platform === 'win32') {
+        const doctor = requiresNative(invoke(['doctor', provider, '--strict', '--root', root]))
+        assert.match(doctor.stdout, /reason=codex-windows-sandbox-identity-unavailable/)
+      }
+      else ok(invoke(['doctor', provider, '--strict', '--root', root]))
       ok(invoke(['install', provider, '--root', root]))
       ok(invoke(['uninstall', provider, '--root', root]))
       assert.equal(fs.readFileSync(path.join(root, 'unrelated.txt'), 'utf8'), 'preserve provider-specific user data\n')
@@ -152,7 +163,7 @@ test('packed artifact installs and verifies all public providers without the che
       ], { cwd: directory, env: providerEnv })
       ok(invoke('install'))
       ok(execute(process.execPath, [helper, 'verify', provider, '--root', root], { cwd: directory, env: providerEnv }))
-      ok(invoke('doctor', ['-Strict']))
+      requiresNative(invoke('doctor', ['-Strict']))
       ok(invoke('uninstall'))
       assert.equal(fs.existsSync(pkg.launcherPath(provider, root)), false)
       assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8'), 'PowerShell custom config stays byte-for-byte\n')

@@ -17,14 +17,14 @@ const controlled = require('../../scripts/harness-v2-controlled-tools.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessExecAdapter, HarnessEventStream } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
-const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 const { modelService } = require('../helpers/harness-native-service.cjs')
 
-const CLI = process.env.AUTOPROMPT_CLAUDE_TEST_CLI
-const quote = value => `'${value.replaceAll("'", "'\\''")}'`
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment } = require('../helpers/native-platform.cjs')
+const CLI = requiredNativeCli('claude')
 
 function createFixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-capability-native-'))
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'claude-capability-native-')))
   const target = path.join(root, 'target'), controller = path.join(root, 'controller')
   fs.mkdirSync(target, { mode: 0o700 }); fs.mkdirSync(controller, { mode: 0o700 })
   const nativeRoot = path.join(controller, 'native'); fs.mkdirSync(nativeRoot, { mode: 0o700 })
@@ -66,9 +66,12 @@ function createFixture() {
   return { root, target, controller, nativeRoot, record, projection, scratch, schema, challenge }
 }
 
-function registeredProcessOwner(f, adapter) {
+function registeredProcessOwner(f) {
   const root = process.env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT
-  if (!root) return new ProcessOwner({ adapter, registryPath: path.join(f.controller, 'processes.json'), pollMs: 10 })
+  if (!root) {
+    const registryPath = path.join(f.controller, 'processes.json')
+    return new ProcessOwner({ adapter: nativeProcessAdapter(registryPath), registryPath, pollMs: 10 })
+  }
   if (!path.isAbsolute(root) || !/^[A-Za-z0-9_-]{43}$/.test(f.challenge) ||
       process.env.AUTOPROMPT_CLOSED_CANARY_PROVIDER !== 'claude' ||
       process.env.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID !== f.record.activationId ||
@@ -76,12 +79,12 @@ function registeredProcessOwner(f, adapter) {
     throw new Error('closed canary ownership registration binding is invalid')
   }
   const directory = path.join(root, `claude-${crypto.randomUUID()}`)
-  fs.mkdirSync(directory, { mode: 0o700 })
+  privateDirectory(directory)
   const registryPath = path.join(directory, 'processes.json')
   fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify({ schemaVersion: 1,
     provider: 'claude', activationId: f.record.activationId, generation: f.record.generation,
     challenge: f.challenge, registryPath }), { flag: 'wx', mode: 0o600 })
-  return new ProcessOwner({ adapter, registryPath, pollMs: 10 })
+  return new ProcessOwner({ adapter: nativeProcessAdapter(registryPath, root), registryPath, pollMs: 10 })
 }
 
 async function scenario(t, options = {}) {
@@ -89,6 +92,11 @@ async function scenario(t, options = {}) {
   const sandbox = await boundary.probeCommandSandbox()
   assert.equal(sandbox.supported, true, JSON.stringify(sandbox))
   const f = createFixture()
+  let service, owner
+  t.after(async () => {
+    try { if (owner) await owner.cancelAll({ reason: 'claude native capability cleanup', graceMs: 0, killMs: 2000 }) }
+    finally { try { if (service) await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } }
+  })
   const candidate = path.join(f.target, 'candidate.txt')
   const secret = path.join(f.controller, 'private.txt')
   const marker = `claude-native-capability-${crypto.randomUUID()}`
@@ -97,12 +105,12 @@ async function scenario(t, options = {}) {
   fs.writeFileSync(path.join(f.target, 'AGENTS.md'), 'AMBIENT_PROJECT_INSTRUCTIONS_MUST_NOT_AUTOLOAD', { mode: 0o600 })
   let command = typeof options.command === 'function'
     ? options.command({ ...f, candidate, secret, marker })
-    : options.command || `cat ${quote(candidate)}`
-  command = `${command}; printf '\\nCLOSED_CANARY_CHALLENGE:%s\\n' ${quote(f.challenge)}`
-  const service = await modelService('claude', options.tool || { name: controlled.toolName('claude', 'bash'), args: { command } }, options.serviceOptions)
+    : options.command || readCommand(candidate)
+  command = withChallenge(command, f.challenge)
+  service = await modelService('claude', options.tool || { name: controlled.toolName('claude', 'bash'), args: { command } }, options.serviceOptions)
   const binding = native.probeExecutable({ provider: 'claude', executable: CLI })
-  const processAdapter = createPosixProcessAdapter()
-  const owner = registeredProcessOwner(f, processAdapter)
+  owner = registeredProcessOwner(f)
+  const processAdapter = owner.adapter
   const proxy = path.join(f.controller, 'proxy'); fs.mkdirSync(proxy, { mode: 0o700 })
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'claude-closed-native-canary', pollMs: 10 })
   const adapter = new HarnessExecAdapter({
@@ -116,19 +124,18 @@ async function scenario(t, options = {}) {
   const debits = []
   const run = async overrides => {
     const record = { ...f.record, ...overrides }
-    record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, { PATH: process.env.PATH })
+    record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
     record.onUsageDelta = (delta, cumulative, evidence) => { debits.push(delta); return overrides?.onUsageDelta ? overrides.onUsageDelta(delta, cumulative, evidence) : { continue: true } }
     record.signal = overrides?.signal || AbortSignal.timeout(90000)
     const result = await adapter.launch(record)
     assert.ok(service.requests.some(request => JSON.stringify(request.body).includes(`CLOSED_CANARY_CHALLENGE:${f.challenge}`)), 'the actual native tool result omitted its closed-canary challenge')
     return result
   }
-  const close = async () => {
-    try { await owner.cancelAll({ reason: 'claude native capability cleanup', graceMs: 0, killMs: 2000 }) }
-    finally { try { await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } }
-  }
-  t.after(close)
   return { ...f, candidate, secret, marker, service, binding, owner, adapter, run, debits, command }
+}
+
+function checkerCommand(candidate, receipt) {
+  return nodeCommand(`const fs=require('node:fs');process.stdout.write(fs.readFileSync(${JSON.stringify(candidate)}));fs.writeFileSync(${JSON.stringify(receipt)},'checked');let denied=false;try{fs.writeFileSync(${JSON.stringify(candidate)},'wrong')}catch(error){denied=['EACCES','EPERM','EROFS'].includes(error.code)}if(!denied)throw Error('Checker modified frozen candidate')`)
 }
 
 function assertSuccessful(result) {
@@ -138,7 +145,7 @@ function assertSuccessful(result) {
   assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/)
 }
 
-const nativeOptions = { skip: !CLI || process.platform === 'win32', timeout: 240000 }
+const nativeOptions = { skip: !CLI, timeout: 240000 }
 
 test('claude closed native capability: full canonical role schema is accepted and validated', nativeOptions, async t => {
   const output = {
@@ -201,14 +208,18 @@ test('claude closed native capability: isolation denies candidate/private/networ
   try {
     const f = await scenario(t, { command: ({ candidate, secret, scratch }) => {
       const scratchFile = path.join(scratch, 'isolation.txt')
-      const network = `const n=require('node:net');const s=n.connect(${port},'127.0.0.1');s.on('connect',()=>process.exit(19));s.on('error',()=>process.exit(0));setTimeout(()=>process.exit(0),700)`
-      return [
-        `cat ${quote(candidate)}`,
-        `printf scratch-ok > ${quote(scratchFile)}`,
-        `if printf forbidden > ${quote(candidate)} 2>/dev/null; then exit 18; fi`,
-        `if cat ${quote(secret)} 2>/dev/null; then exit 20; fi`,
-        `${quote(process.execPath)} -e ${quote(network)}`,
-      ].join('; ')
+      return nodeCommand(`
+        const fs=require('node:fs'),net=require('node:net');
+        const denied=operation=>{let error;try{operation()}catch(value){error=value}if(!error||!['EACCES','EPERM','EROFS','ENOENT'].includes(error.code))throw Error('Expected permission denial')};
+        process.stdout.write(fs.readFileSync(${JSON.stringify(candidate)}));
+        fs.writeFileSync(${JSON.stringify(scratchFile)},'scratch-ok');
+        denied(()=>fs.writeFileSync(${JSON.stringify(candidate)},'forbidden'));
+        denied(()=>fs.readFileSync(${JSON.stringify(secret)}));
+        const s=net.connect(${port},'127.0.0.1');
+        const timer=setTimeout(()=>{s.destroy();process.exitCode=21},3000);
+        s.once('connect',()=>{clearTimeout(timer);s.destroy();process.exitCode=19});
+        s.once('error',error=>{clearTimeout(timer);if(!['EACCES','EPERM','ENETUNREACH','EHOSTUNREACH','ECONNREFUSED'].includes(error.code))process.exitCode=22});
+      `)
     } })
     const result = await f.run({})
     assertSuccessful(result)
@@ -221,7 +232,7 @@ test('claude closed native capability: isolation denies candidate/private/networ
 test('claude closed native capability: topology rejects injected nested dispatch and permits only its controller edge', nativeOptions, async t => {
   const hostile = await scenario(t, { tool: { name: 'Task', args: { prompt: 'unauthorized nested dispatch' } }, serviceOptions: { forceFirstTool: true } })
   await assert.rejects(hostile.run({}), { code: 'ROLE_POLICY_DENIED' })
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}` })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate) })
   const result = await f.run({})
   assertSuccessful(result)
   const advertised = f.service.requests.filter(request => Array.isArray(request.body.tools))
@@ -234,7 +245,7 @@ test('claude closed native capability: topology rejects injected nested dispatch
 })
 
 test('claude closed native capability: private skill root and ambient project configuration stay outside the model', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}` })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate) })
   fs.mkdirSync(path.join(f.target, '.claude'), { mode: 0o700 })
   fs.writeFileSync(path.join(f.target, '.claude', 'settings.json'), JSON.stringify({ hooks: { PreToolUse: [{ command: 'false' }] } }), { mode: 0o600 })
   const result = await f.run({})
@@ -245,7 +256,7 @@ test('claude closed native capability: private skill root and ambient project co
 })
 
 test('claude closed native capability: intermediate stream events remain correlated to the native session', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}` })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate) })
   const raw = []
   const result = await f.run({ onEvent: event => raw.push(event) })
   assertSuccessful(result)
@@ -273,7 +284,7 @@ test('Claude exact post-message ping is ignored without opening a request', () =
 test('claude closed native capability: exact controller tool receipt binds the real command output', nativeOptions, async t => {
   const f = await scenario(t, { command: ({ candidate, scratch }) => {
     const receipt = path.join(scratch, 'receipt.txt')
-    return `cat ${quote(candidate)}; printf exact-receipt > ${quote(receipt)}`
+    return nodeCommand(`const fs=require('node:fs');process.stdout.write(fs.readFileSync(${JSON.stringify(candidate)}));fs.writeFileSync(${JSON.stringify(receipt)},'exact-receipt')`)
   } })
   const raw = []
   const result = await f.run({ onEvent: event => raw.push(event) })
@@ -285,7 +296,7 @@ test('claude closed native capability: exact controller tool receipt binds the r
 })
 
 test('claude closed native capability: concurrently owned siblings receive separate native identities', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}` })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate) })
   let peak = 0
   const monitor = setInterval(() => { peak = Math.max(peak, f.owner.ownershipIdentities().length) }, 5)
   let results
@@ -305,7 +316,7 @@ test('claude closed native capability: concurrently owned siblings receive separ
 })
 
 test('claude closed native capability: same-context continuation succeeds while foreign target reuse is refused', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}` })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate) })
   const first = await f.run({})
   assertSuccessful(first)
   const before = f.service.requests.length
@@ -317,14 +328,14 @@ test('claude closed native capability: same-context continuation succeeds while 
   await assert.rejects(f.adapter.launch({
     ...f.record, reservationId: crypto.randomUUID(), continuationId: first.contextId,
     workingDirectory: foreignTarget,
-    environment: prepareProcessLaunchEnvironment(createPosixProcessAdapter(), crypto.randomUUID(), { PATH: process.env.PATH }),
+    environment: prepareProcessLaunchEnvironment(f.owner.adapter, crypto.randomUUID(), nativeEnvironment()),
     signal: AbortSignal.timeout(30000),
   }), { code: 'SESSION_ID_MISMATCH' })
 })
 
 test('claude closed native capability: cancellation drains the held child and a sibling remains operational', nativeOptions, async t => {
   const f = await scenario(t, {
-    command: ({ candidate }) => `cat ${quote(candidate)}`,
+    command: ({ candidate }) => readCommand(candidate),
     serviceOptions: { delayMessagesMs: 4000 },
   })
   const controller = new AbortController()
@@ -351,7 +362,7 @@ test('claude closed native capability: cancellation drains the held child and a 
 test('claude closed native capability: isolated checker receives read-only candidate and private scratch', nativeOptions, async t => {
   const f = await scenario(t, { command: ({ candidate, scratch }) => {
     const checked = path.join(scratch, 'checker.txt')
-    return `cat ${quote(candidate)}; printf checked > ${quote(checked)}; if printf wrong > ${quote(candidate)} 2>/dev/null; then exit 19; fi`
+    return checkerCommand(candidate, checked)
   } })
   const frozen = path.join(f.root, 'frozen'); fs.mkdirSync(frozen, { mode: 0o700 })
   const frozenCandidate = path.join(frozen, 'candidate.txt'); fs.writeFileSync(frozenCandidate, f.marker, { mode: 0o600 })
@@ -363,7 +374,7 @@ test('claude closed native capability: isolated checker receives read-only candi
     writableScratchRoot: checkerScratch, temporaryRoot: path.join(checkerScratch, 'tmp'),
     outputRoot: path.join(checkerScratch, 'output'), cacheRoot: path.join(checkerScratch, 'cache'),
   }
-  f.service.tool.args.command = `cat ${quote(frozenCandidate)}; printf checked > ${quote(path.join(checkerScratch, 'checker.txt'))}; if printf wrong > ${quote(frozenCandidate)} 2>/dev/null; then exit 19; fi; printf '\nCLOSED_CANARY_CHALLENGE:%s\n' ${quote(f.challenge)}`
+  f.service.tool.args.command = withChallenge(checkerCommand(frozenCandidate, path.join(checkerScratch, 'checker.txt')), f.challenge)
   const checkerRecord = {
     ...f.record, logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker',
     workingDirectory: checkerScratch, canonicalTargetPath: frozen, candidateHash: checkerBoundary.candidateHash, checkerScratchBoundary: checkerBoundary,
@@ -374,7 +385,7 @@ test('claude closed native capability: isolated checker receives read-only candi
     connection: f.adapter.connection, credentialEnvironment: { ANTHROPIC_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema,
     rolePrompt: () => 'Use only the controller checker tools and return one JSON object.', checkerScratchVerifier: () => checkerBoundary,
   })
-  checkerRecord.environment = prepareProcessLaunchEnvironment(createPosixProcessAdapter(), checkerRecord.reservationId, { PATH: process.env.PATH })
+  checkerRecord.environment = prepareProcessLaunchEnvironment(f.owner.adapter, checkerRecord.reservationId, nativeEnvironment())
   checkerRecord.signal = AbortSignal.timeout(90000)
   const result = await checkerAdapter.launch(checkerRecord)
   assertSuccessful(result)
@@ -383,7 +394,7 @@ test('claude closed native capability: isolated checker receives read-only candi
 })
 
 test('claude closed native capability: process ownership records completion and recovers a fresh session', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}`, serviceOptions: { delayMessagesMs: 10000 } })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate), serviceOptions: { delayMessagesMs: 10000 } })
   const abort = new AbortController()
   const pending = f.run({ signal: abort.signal })
   pending.catch(() => {})
@@ -391,7 +402,7 @@ test('claude closed native capability: process ownership records completion and 
   assert.ok(f.service.requests.length > 0, 'native request must start before recovering its durable owner')
   const registry = JSON.parse(fs.readFileSync(f.owner.registryPath, 'utf8'))
   assert.ok(JSON.stringify(registry).includes('native-claude-'), 'owned native process was not durably registered')
-  const replacement = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: f.owner.registryPath, pollMs: 10 })
+  const replacement = new ProcessOwner({ adapter: nativeProcessAdapter(f.owner.registryPath, process.env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT || f.controller), registryPath: f.owner.registryPath, pollMs: 10 })
   await replacement.recoverReservations()
   assert.equal(replacement.ownershipIdentities().length, 1, 'replacement owner must recover the actual live CLI')
   try {
@@ -406,7 +417,7 @@ test('claude closed native capability: process ownership records completion and 
 })
 
 test('claude closed native capability: exact model effort is wired and unsupported assignment is refused', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}` })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate) })
   const result = await f.run({ assignment: { model: 'claude-sonnet-4-6', effort: 'high' } })
   assertSuccessful(result)
   const modelRequests = f.service.requests.filter(request => request.path.includes('/messages'))
@@ -414,7 +425,7 @@ test('claude closed native capability: exact model effort is wired and unsupport
   assert.ok(modelRequests.every(request => request.body.model === 'claude-sonnet-4-6' && request.body.output_config?.effort === 'high'), JSON.stringify(modelRequests.map(request => ({ model: request.body.model, effort: request.body.output_config }))))
   assert.ok(modelRequests.every(request => request.body.tools?.some(tool => tool.name === 'StructuredOutput' && tool.input_schema?.properties?.ok?.const === true)),
     JSON.stringify(modelRequests.map(request => (request.body.tools || []).map(tool => tool.name))))
-  assert.throws(() => native.createLaunch({ provider: 'claude', executable: f.binding.path, home: path.join(f.root, 'invalid-home'), sessionRoot: path.join(f.root, 'invalid-session'), targetPath: f.target, cwd: f.target, prompt: 'x', input: 'x', connection: f.adapter.connection, credentials: { ANTHROPIC_API_KEY: '<local-test-only>' }, environment: { PATH: process.env.PATH }, readOnly: true, effort: 'unauthorized' }), { code: 'PROFILE_INVALID' })
+  assert.throws(() => native.createLaunch({ provider: 'claude', executable: f.binding.path, home: path.join(f.root, 'invalid-home'), sessionRoot: path.join(f.root, 'invalid-session'), targetPath: f.target, cwd: f.target, prompt: 'x', input: 'x', connection: f.adapter.connection, credentials: { ANTHROPIC_API_KEY: '<local-test-only>' }, environment: nativeEnvironment(), readOnly: true, effort: 'unauthorized' }), { code: 'PROFILE_INVALID' })
 })
 
 for (const deferredInputUsage of [false, true]) {

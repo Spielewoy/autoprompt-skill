@@ -49,6 +49,59 @@ function selectReview(records, provider, installed, executable) {
   if (matches.length !== 1) fail('reviewed-local release review for this runtime is missing or ambiguous')
   return matches[0]
 }
+// A shipped test policy authorizes running the closed native tests, never the
+// mission itself. Unlike historical release reviews it makes no assertion about
+// a particular provider version or operating system having passed those tests.
+// The pending decision binds this installation and native runtime; all eleven
+// observations must be established again before each activation can do work.
+function selectPolicy(evidence, provider) {
+  if (evidence?.localCanaryPolicies === undefined) return null
+  if (!Array.isArray(evidence.localCanaryPolicies)) fail('local canary policies are invalid')
+  const policies = evidence.localCanaryPolicies.filter(item => item?.provider === provider)
+  if (policies.length > 1) fail('local canary policy is ambiguous')
+  return policies[0] || null
+}
+function verifyPolicy(policy, provider, installed, executable) {
+  if (!exact(policy, ['schemaVersion', 'provider', 'platforms', 'architectures', 'protocol', 'canaryImplementation', 'capabilityCases']) ||
+      policy.schemaVersion !== 'harness-v2-local-canary-policy.v1' || policy.provider !== provider ||
+      !Array.isArray(policy.platforms) || !policy.platforms.length || policy.platforms.some(p => !['linux', 'win32', 'darwin'].includes(p)) ||
+      !Array.isArray(policy.architectures) || !policy.architectures.length || policy.architectures.some(a => !['x64', 'arm64'].includes(a)) ||
+      !policy.capabilityCases || !exact(policy.capabilityCases, REQUIRED)) fail('local canary policy shape is invalid')
+  if (!policy.platforms.includes(process.platform) || !policy.architectures.includes(process.arch)) {
+    fail(`native ${provider} canary is unavailable on ${process.platform}/${process.arch}; supported test platforms: ${policy.platforms.join(', ')}`)
+  }
+  const asset = source => {
+    if (typeof source !== 'string' || !/^[A-Za-z0-9@._/-]+$/.test(source) || source.startsWith('/') ||
+        source.split('/').some(p => !p || p === '.' || p === '..') || !HASH.test(installed?.files?.[source] || '')) fail('local canary asset is not bound to the installed receipt')
+    return { source, sha256: installed.files[source] }
+  }
+  const protocol = asset(policy.protocol), implementation = asset(policy.canaryImplementation)
+  const cases = Object.fromEntries(REQUIRED.map(capability => {
+    const item = policy.capabilityCases[capability]
+    if (!exact(item, ['source', 'testName']) || typeof item.testName !== 'string' || item.testName.length < 12 || /[\r\n\0]/.test(item.testName)) fail('local canary case is invalid')
+    return [capability, Object.freeze({ ...asset(item.source), testName: item.testName })]
+  }))
+  if (new Set(Object.values(cases).map(item => `${item.source}\0${item.testName}`)).size !== REQUIRED.length) fail('local canary cases must be distinct')
+  const scope = portableIdentity(provider, installed, executable)
+  const dependencies = executable.runtimeIdentity
+  if (!dependencies || !HASH.test(dependencies.sha256 || '') || !Number.isSafeInteger(dependencies.fileCount) || dependencies.fileCount < 1 ||
+      !Number.isSafeInteger(dependencies.packageCount) || dependencies.packageCount < 0 ||
+      (executable.invocation && !HASH.test(executable.invocation.sha256 || ''))) fail('local canary exact native identity is unavailable')
+  const binding = { policy, scope, payloadDigest: installed.payloadDigest, nativeRuntimeIdentity: dependencies,
+    ...(executable.invocation ? { executableLaunchInvocationSha256: executable.invocation.sha256 } : {}) }
+  return Object.freeze({ mode: 'local-canary-pending', provider,
+    releaseIdentityHash: sha256(canonical(binding)), reviewDigest: sha256(canonical(binding)),
+    // Only the activation's finite deadline grants execution time. A test policy
+    // is software, not a time-limited attestation issued by a reviewer.
+    expiresAt: '9999-12-31T23:59:59.000Z', capabilityCases: Object.freeze(cases),
+    canaryImplementationSha256: implementation.sha256, protocolSha256: protocol.sha256 })
+}
+function pendingFromEvidence(evidence, provider, installed, executable, now) {
+  const policy = selectPolicy(evidence, provider)
+  if (policy) return verifyPolicy(policy, provider, installed, executable)
+  const review = selectReview(evidence?.reviewedLocalRecords || [], provider, installed, executable)
+  return review ? verifyReview(review, provider, installed, executable, now) : null
+}
 function verifyReview(record, provider, installed, executable, now = Date.now()) {
   if (!exact(record, ['schemaVersion','policy','provider','status','releaseScope','releaseIdentityHash','protocol','canaryImplementation','capabilityCases','liveEvidence','reviewer','issuedAt','expiresAt','reviewDigest']) || record.schemaVersion !== 'harness-v2-reviewed-local-canary.v1' || record.policy !== 'reviewed-local-release-v1' ||
       record.provider !== provider || record.status !== 'reviewed' || !record.reviewer || typeof record.reviewer.issuer !== 'string' ||
@@ -84,17 +137,17 @@ function verifyObservations(pending, observations) {
 // Verify persisted local observations against their entire activation context.
 // Callers supply bytes reopened through their private-file boundary. This pure
 // function never executes a harness or reads ambient credentials.
-function verifyActivationProof({ provider, installed, record, proof, proofSha256, review, artifacts, now = Date.now() }) {
+function verifyActivationProof({ provider, installed, record, proof, proofSha256, review, policy, artifacts, now = Date.now() }) {
+  const pending = policy ? verifyPolicy(policy, provider, installed, record?.executable) : verifyReview(review, provider, installed, record?.executable, now)
   if (record?.providerId !== provider || record?.schemaVersion !== 2 ||
       record.payloadDigest !== installed.payloadDigest || !Number.isSafeInteger(record.capability?.generation) ||
       record.capability.generation < 1 || !Number.isFinite(Date.parse(record.capability.expiresAt)) ||
       Date.parse(record.capability.expiresAt) <= now || !Number.isFinite(Date.parse(record.createdAt)) ||
       !HASH.test(record.request?.sha256 || '') || !HASH.test(record.connectionSha256 || '') ||
       proof?.nativeExecutable !== record.executable?.path ||
-      proof.admissionTrust?.kind !== 'reviewed-local-pending' ||
-      proof.admissionTrust.reviewDigest !== review?.reviewDigest ||
+      proof.admissionTrust?.kind !== pending.mode ||
+      proof.admissionTrust.reviewDigest !== pending.reviewDigest ||
       record.activationBoundary?.enforcementProof?.sha256 !== proofSha256) fail('local canary activation binding is invalid')
-  const pending = verifyReview(review, provider, installed, record.executable, now)
   const local = record.reviewedLocalCanary
   if (!local || local.reviewDigest !== pending.reviewDigest || local.releaseIdentityHash !== pending.releaseIdentityHash ||
       local.executableSha256 !== record.executable.sha256 ||
@@ -123,4 +176,4 @@ function verifyActivationProof({ provider, installed, record, proof, proofSha256
   }
   return pending
 }
-module.exports = { REQUIRED, canonical, portableIdentity, releaseIdentity, selectReview, verifyReview, verifyObservations, verifyActivationProof }
+module.exports = { REQUIRED, canonical, portableIdentity, releaseIdentity, selectReview, verifyReview, selectPolicy, verifyPolicy, pendingFromEvidence, verifyObservations, verifyActivationProof }

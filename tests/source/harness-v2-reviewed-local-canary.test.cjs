@@ -85,6 +85,88 @@ function activationFixture() {
   return { provider:'claude', installed:f.installed, record, proof, proofSha256, review:f.body, artifacts, now:Date.parse('2026-09-08T00:02:00.000Z') }
 }
 
+function policyFixture() {
+  const f = activationFixture()
+  const policy = { schemaVersion: 'harness-v2-local-canary-policy.v1', provider: 'claude',
+    platforms: ['linux', 'win32', 'darwin'], architectures: ['x64', 'arm64'],
+    protocol: f.review.protocol.source, canaryImplementation: f.review.canaryImplementation.source,
+    capabilityCases: Object.fromEntries(Object.entries(f.review.capabilityCases).map(([key, value]) =>
+      [key, { source: value.source, testName: value.testName }])) }
+  return { ...f, policy }
+}
+
+test('local native policy permits new provider versions but binds each pending result to the exact runtime', () => {
+  const f = policyFixture()
+  const evidence = { reviewedLocalRecords: [f.review], localCanaryPolicies: [f.policy] }
+  const first = canary.pendingFromEvidence(evidence, f.provider, f.installed, f.record.executable, f.now)
+  assert.equal(first.mode, 'local-canary-pending')
+  assert.equal(Object.hasOwn(first, 'reviewer'), false, 'a local test policy is not a review claim')
+  for (const mutate of [
+    x => { x.record.executable.version = '2.1.270' },
+    x => { x.record.executable.sha256 = h('updated native executable') },
+    x => { x.record.executable.runtimeIdentity.sha256 = h('different dependency tree') },
+    x => { x.record.executable.invocation = { sha256: h('windows node invocation') } },
+    x => { x.installed.files['scripts/harness-v2-transport.cjs'] = h('new transport') },
+    x => { x.installed.payloadDigest = h('new installation') },
+  ]) {
+    const changed = structuredClone(f); mutate(changed)
+    const current = canary.verifyPolicy(changed.policy, changed.provider, changed.installed, changed.record.executable)
+    assert.notEqual(current.reviewDigest, first.reviewDigest)
+    assert.notEqual(current.releaseIdentityHash, first.releaseIdentityHash)
+  }
+})
+
+test('local native policy rejects malformed, duplicate, unsupported and incomplete test policies', () => {
+  const f = policyFixture()
+  for (const mutate of [
+    x => { delete x.policy.capabilityCases.isolation },
+    x => { x.policy.capabilityCases.isolation.source = '../outside.cjs' },
+    x => { x.policy.capabilityCases.isolation.source = 'tests/missing.cjs' },
+    x => { x.policy.capabilityCases.isolation.testName = 'bad\nname here' },
+    x => { x.policy.capabilityCases.isolation = x.policy.capabilityCases.cancellation },
+    x => { x.policy.platforms = ['other'] },
+    x => { x.policy.platforms = ['linux', 'win32', 'darwin'].filter(p => p !== process.platform) },
+    x => { x.policy.architectures = ['x64', 'arm64'].filter(a => a !== process.arch) },
+    x => { x.policy.status = 'passed' },
+    x => { x.record.executable.portableRuntimeIdentity.sha256 = h('forged portable runtime') },
+    x => { delete x.record.executable.runtimeIdentity },
+  ]) {
+    const changed = structuredClone(f); mutate(changed)
+    assert.throws(() => canary.verifyPolicy(changed.policy, changed.provider, changed.installed, changed.record.executable), { code: 'REVIEWED_LOCAL_REJECTED' })
+  }
+  assert.throws(() => canary.selectPolicy({ localCanaryPolicies: [f.policy, f.policy] }, 'claude'), { code: 'REVIEWED_LOCAL_REJECTED' })
+  assert.throws(() => canary.selectPolicy({ localCanaryPolicies: {} }, 'claude'), { code: 'REVIEWED_LOCAL_REJECTED' })
+})
+
+test('local policy admission requires fresh complete activation-bound observations, not historical release evidence', () => {
+  const f = policyFixture()
+  const pending = canary.verifyPolicy(f.policy, f.provider, f.installed, f.record.executable)
+  f.proof.admissionTrust = { kind: pending.mode, reviewDigest: pending.reviewDigest }
+  f.record.reviewedLocalCanary.reviewDigest = pending.reviewDigest
+  f.record.reviewedLocalCanary.releaseIdentityHash = pending.releaseIdentityHash
+  f.artifacts = f.artifacts.map(artifact => {
+    const value = JSON.parse(artifact.bytes); value.reviewDigest = pending.reviewDigest
+    const bytes = JSON.stringify(value)
+    return { ...artifact, bytes, sha256: h(bytes) }
+  })
+  f.record.reviewedLocalCanary.observations = f.artifacts.map(a => ({ capability: a.capability, status: 'passed',
+    caseSha256: pending.capabilityCases[a.capability].sha256, observationSha256: a.sha256 }))
+  assert.equal(canary.verifyActivationProof(f).mode, 'local-canary-pending')
+  for (const mutate of [
+    x => { delete x.record.reviewedLocalCanary },
+    x => { x.record.reviewedLocalCanary.observations.pop() },
+    x => { x.record.reviewedLocalCanary.observations[0].status = 'skipped' },
+    x => { x.record.executable.version = '2.1.271' },
+    x => { x.record.executable.invocation = { sha256: h('changed launch') } },
+    x => { x.record.capability.generation++ },
+    x => { x.proof.admissionTrust.kind = 'reviewed-local-pending' },
+    x => { x.policy.capabilityCases.isolation.testName += ' changed' },
+  ]) {
+    const changed = structuredClone(f); mutate(changed)
+    assert.throws(() => canary.verifyActivationProof(changed), { code: 'REVIEWED_LOCAL_REJECTED' })
+  }
+})
+
 test('persisted local canary rejects replay across every activation context binding', () => {
   const original = activationFixture()
   assert.equal(canary.verifyActivationProof(original).mode, 'reviewed-local-pending')

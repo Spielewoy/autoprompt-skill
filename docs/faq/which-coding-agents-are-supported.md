@@ -18,4 +18,14 @@ Autoprompt v2 supports eleven providers. The [README](../../README.md#support) l
 
 Start a run with `autoprompt activate PROVIDER --target /absolute/project -- "<goal>"`.
 
-The verified execution path is Linux. See [setup and runtime requirements](../guides/harness-v2-verification.md) and [custom model setup](how-to-add-custom-models.md).
+The previously verified execution path is Linux. Native Windows Claude Code can attempt the same closed capability checks using Windows process and sandbox controls, without WSL2 or a VM. This is a local capability check on the installed binary, not a claim that every Windows version or machine has already been tested. Every required check must pass before a mission starts. The other native provider paths remain limited to the platforms named by their shipped test policies; an installer download alone does not establish runtime support.
+
+Run `autoprompt doctor PROVIDER --strict` to check an installation. `payload=verified` means the installed files match their receipt. The separate `activation` field explains whether that native executable can proceed:
+
+- `unavailable`: a required executable, interface, or admission prerequisite failed. The message names the failure and strict doctor exits unsuccessfully.
+- `local-canary-required`: the installed runtime can attempt its shipped capability tests. Activation must run all of them successfully before starting work; doctor does not run those tests or contact a model.
+- `static-ready;dynamic-preflight-required`: static admission is available, and activation must still prove its dynamic prerequisites.
+
+Doctor inspects installation state without modifying it. Native version and help probes use temporary isolated directories. An informational doctor without `--strict` prints problems while returning success; use `--strict` when checking readiness in scripts. A passing strict check is not a substitute for the capability checks performed during activation.
+
+See [setup and runtime requirements](../guides/harness-v2-verification.md) and [custom model setup](how-to-add-custom-models.md).

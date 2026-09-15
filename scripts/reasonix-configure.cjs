@@ -104,7 +104,7 @@ function prepareActivation(options = {}) {
     reviewedLocal = reviewedLocalPending(installed, executable, { now: options.now })
     if (!reviewedLocal) throw error
     admission = { runtimeIdentityBody: runtimeIdentityBody(installed, executable), runtimeIdentityHash: runtimeIdentity(installed, executable),
-      evidenceSha256: reviewedLocal.reviewDigest, trustSource: { kind: 'reviewed-local-pending', reviewDigest: reviewedLocal.reviewDigest } }
+      evidenceSha256: reviewedLocal.reviewDigest, trustSource: { kind: reviewedLocal.mode, reviewDigest: reviewedLocal.reviewDigest } }
   }
   const connection = connectionConfig(path.join(root, 'config.toml'))
   const credentials = credentialEnvironment(connection, root, environment)

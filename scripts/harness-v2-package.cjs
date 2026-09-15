@@ -37,6 +37,7 @@ const CONFORMANCE_ASSETS = Object.freeze([
   'tests/source/reasonix-controlled-native.test.cjs',
   'tests/helpers/harness-native-service.cjs',
   'tests/helpers/harness-pi-native-service.cjs',
+  'tests/helpers/native-platform.cjs',
 ])
 const HASH = /^[a-f0-9]{64}$/
 function fail(code, message) { throw new PackageError(code, message) }
@@ -390,6 +391,37 @@ function uninstall(provider, root) {
     return { status: 'uninstalled', provider, root, runHistoryRetained: true, legacyQuarantineRetained: true }
   } finally { release(lease) }
 }
+// Payload integrity and activation readiness are different checks. This probe
+// uses the same exact native identity and admission precedence as activation,
+// but never creates an activation, runs a canary, or contacts a model.
+function doctorPrerequisites(provider, root, options = {}) {
+  const installed = verify(provider, root)
+  const result = { ...installed, payload: 'verified', detected: false, activation: 'unavailable', reason: 'activation-prerequisites-unavailable' }
+  try {
+    const native = require('./harness-v2-native.cjs')
+    const admission = require('./harness-v2-admission.cjs')
+    const executable = native.probeExecutable({ provider, env: options.env || process.env, executable: options.executable })
+    result.detected = true; result.nativeVersion = executable.version
+    if (native.descriptor(provider).blockers.length) fail('PROVIDER_UNSUPPORTED', `${provider} has unresolved native capabilities`)
+    const imported = require('./harness-v2-configure.cjs').importedAdmission(root, provider)
+    let pending = null
+    try { admission.verifyAdmission(provider, installed, executable, imported || {}) }
+    catch (error) {
+      if (imported) throw error
+      const evidence = JSON.parse(readBound(path.join(installed.bundle, admission.EVIDENCE)))
+      const ring = JSON.parse(readBound(path.join(installed.bundle, admission.KEY_RING)))
+      if (ring.schemaVersion !== 'harness-v2-trusted-keys.v1' || !Array.isArray(ring.keys) ||
+          evidence.schemaVersion !== 'harness-v2-live-conformance.v1' || !Array.isArray(evidence.records) ||
+          evidence.records.some(record => record?.provider === provider)) throw error
+      pending = admission.reviewedLocalPending(provider, installed, executable, { now: options.now })
+      if (!pending) throw error
+    }
+    require('./harness-v2-tool-boundary.cjs').assertCommandSandboxPrerequisites({ env: options.env || process.env })
+    return { ...result, activation: pending ? 'local-canary-required' : 'static-ready;dynamic-preflight-required', reason: '-', nativeVersion: executable.version }
+  } catch (error) {
+    return { ...result, reason: String(error.code || 'RUNTIME_FAILURE').toLowerCase().replaceAll('_', '-'), message: error.message }
+  }
+}
 function run(argv = process.argv.slice(2), options = {}) {
   const [action, provider, flag, value] = argv
   if (!['install', 'verify', 'doctor', 'uninstall', 'plan'].includes(action) || !PROVIDERS.includes(provider) ||
@@ -398,10 +430,11 @@ function run(argv = process.argv.slice(2), options = {}) {
   if (action === 'plan') return { status: 'planned', root, launcher: launcherPath(provider, root), ...sourceInventory(provider, options.sourceRoot) }
   if (action === 'install') return install(provider, root, options.sourceRoot)
   if (action === 'uninstall') return uninstall(provider, root)
+  if (action === 'doctor') return doctorPrerequisites(provider, root, options)
   return verify(provider, root)
 }
 if (require.main === module) {
-  try { const result = run(); process.stdout.write(`${JSON.stringify({ status: result.status, provider: result.provider, root: result.root, bundle: result.bundle, launcher: result.launcher, payloadGeneration: result.payloadGeneration, legacySettingsBackup: result.legacySettingsBackup })}\n`) }
+  try { const result = run(); process.stdout.write(`${JSON.stringify({ status: result.status, provider: result.provider, root: result.root, bundle: result.bundle, launcher: result.launcher, payloadGeneration: result.payloadGeneration, legacySettingsBackup: result.legacySettingsBackup, payload: result.payload, detected: result.detected, activation: result.activation, reason: result.reason, message: result.message, nativeVersion: result.nativeVersion })}\n`); if (result.activation === 'unavailable') process.exitCode = 1 }
   catch (error) { process.stderr.write(`${error.code || 'RUNTIME_FAILURE'}: ${error.message}\n`); process.exitCode = 1 }
 }
-module.exports = { PROVIDERS, ROOT, PackageError, CONFORMANCE_ASSETS, rootCandidate, resolveRoot, receiptName, launcherPath, launcherRelative, launcher, publicFiles, bundlePath, sourceInventory, readReceipt, install, verify, doctor: verify, uninstall, run, walk, assertNoResumableActivation }
+module.exports = { PROVIDERS, ROOT, PackageError, CONFORMANCE_ASSETS, rootCandidate, resolveRoot, receiptName, launcherPath, launcherRelative, launcher, publicFiles, bundlePath, sourceInventory, readReceipt, install, verify, doctor: doctorPrerequisites, doctorPrerequisites, uninstall, run, walk, assertNoResumableActivation }

@@ -872,6 +872,8 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
   )
   let requestCount = 0
   let nativeShellResult = null
+  let advertisedShellTools = []
+  let shellTool
   let fixtureError = null
   const probeServer = http.createServer((request, response) => {
     let body = ''
@@ -884,6 +886,15 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
         assert.equal(request.headers.authorization, 'Bearer synthetic-model-transport-key')
         const input = JSON.parse(body)
         requestCount += 1
+        if (requestCount === 1) {
+          advertisedShellTools = [...(input.tools || []), ...(input.input || [])
+            .filter(item => item.type === 'additional_tools').flatMap(item => item.tools || [])]
+            .flatMap(tool => tool.type === 'namespace' ? tool.tools : [tool])
+            .map(tool => tool.name)
+          shellTool = advertisedShellTools.includes('shell_command') ? 'shell_command' : 'exec_command'
+          assert.ok(advertisedShellTools.includes(shellTool),
+            `native diagnostic must advertise its shell tool before dispatch: ${JSON.stringify(advertisedShellTools)}`)
+        }
         assert.ok(requestCount <= 2, 'one shell call and one terminal response only')
         if (requestCount === 2) {
           nativeShellResult = input.input.find(item => item.type === 'function_call_output' &&
@@ -892,7 +903,9 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
         }
         const item = requestCount === 1
           ? { type: 'function_call', id: 'shell-environment-probe', call_id: 'environment-probe',
-              name: 'shell_command', arguments: JSON.stringify({ command, timeout_ms: 10000 }) }
+              name: shellTool, arguments: JSON.stringify(shellTool === 'exec_command'
+                ? { cmd: command, yield_time_ms: 10000, workdir: context.target }
+                : { command, timeout_ms: 10000 }) }
           : { type: 'message', role: 'assistant', id: 'environment-complete',
               content: [{ type: 'output_text', text: 'Environment probe complete.' }] }
         const id = `environment-response-${requestCount}`
@@ -969,7 +982,7 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
   assert.equal(requestCount, 2)
   const commands = sandboxEnvironment.stdout.trim().split('\n').map(line => JSON.parse(line))
     .filter(event => event.type === 'item.completed' && event.item.type === 'command_execution')
-  assert.equal(commands.length, 1, `expected one native shell execution: ${sandboxEnvironment.stdout}`)
+  assert.equal(commands.length, 1, `expected one native shell execution: ${sandboxEnvironment.stdout}\n${JSON.stringify({ nativeShellResult, advertisedShellTools })}`)
   assert.equal(commands[0].item.exit_code, 0,
     `native shell failed: ${JSON.stringify(nativeShellResult)}\n${commands[0].item.aggregated_output}`)
   const sandboxObserved = JSON.parse(commands[0].item.aggregated_output.trim())

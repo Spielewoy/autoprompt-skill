@@ -132,8 +132,10 @@ function safeEnvironment() {
   if (process.platform === 'win32') {
     const systemRoot = process.env.SystemRoot
     if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/i.test(systemRoot)) fail('COMMAND_SANDBOX_UNSUPPORTED', 'Windows system root is unavailable')
+    const bash = require('../agents/codex/workflow/windows-appcontainer-command.js').resolveWindowsBash().bash.path
     return { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
       PATH: [path.dirname(process.execPath), path.join(systemRoot, 'System32')].join(path.delimiter),
+      AUTOPROMPT_WINDOWS_BASH: bash,
       ComSpec: path.join(systemRoot, 'System32', 'cmd.exe'), PATHEXT: '.COM;.EXE;.BAT;.CMD', LOCALAPPDATA: process.env.LOCALAPPDATA || '',
       GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: 'NUL', GIT_ALLOW_PROTOCOL: '', GIT_TERMINAL_PROMPT: '0',
       GIT_CONFIG_COUNT: '3', GIT_CONFIG_KEY_0: 'push.default', GIT_CONFIG_VALUE_0: 'nothing',
@@ -332,6 +334,30 @@ function appendReceipt(boundary, name, args, result, startedAt) {
   } finally { fs.closeSync(fd) }
   return record
 }
+// Static diagnostics do not certify kernel isolation. The dynamic probe still
+// proves the actual sandbox before a transport can launch a mission.
+function assertCommandSandboxPrerequisites(options = {}) {
+  const platform = options.platform || process.platform
+  if (platform === 'linux') {
+    for (const file of ['/usr/bin/bwrap', '/bin/bash']) {
+      try {
+        if (!fs.statSync(file).isFile()) throw new Error('not a regular file')
+        fs.accessSync(file, fs.constants.X_OK)
+      } catch {
+        fail('COMMAND_SANDBOX_UNSUPPORTED', `Linux command boundary requires executable ${file}; install ${file.endsWith('bwrap') ? 'bubblewrap' : 'Bash'} before activation`)
+      }
+    }
+    return { backend: 'bubblewrap' }
+  }
+  if (platform === 'win32') {
+    const environment = require('../agents/codex/workflow/process-owner.js').normalizeWindowsChildEnvironment(options.env || process.env)
+    const systemRoot = environment.SYSTEMROOT
+    if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/i.test(systemRoot)) fail('COMMAND_SANDBOX_UNSUPPORTED', 'Windows system root is unavailable')
+    const runtime = require('../agents/codex/workflow/windows-appcontainer-command.js').resolveWindowsBash({ env: { ...environment, SystemRoot: systemRoot } })
+    return { backend: 'windows-appcontainer', bashPath: runtime.bash.path }
+  }
+  fail('COMMAND_SANDBOX_UNSUPPORTED', 'This platform has no supported native command sandbox; use the documented Linux VM runtime')
+}
 async function probeCommandSandbox() {
   if (process.platform === 'win32') return require('../agents/codex/workflow/windows-appcontainer-probe.js').probeWindowsAppContainer()
   if (process.platform !== 'linux') return { supported: false, backend: 'bubblewrap', code: 'COMMAND_SANDBOX_UNSUPPORTED' }
@@ -340,4 +366,4 @@ async function probeCommandSandbox() {
     ...(result.error || result.status !== 0 ? { code: 'COMMAND_SANDBOX_UNSUPPORTED', reason: result.error?.code || result.stderr.trim().slice(0, 1024) } : {}) }
 }
 module.exports = { BoundaryError, TOOLS, OUTPUT_LIMIT, canonicalJson, sha256, within, physical, validatePolicy, validateArguments,
-  authorize, executeTool, prepareBoundary, loadBoundary, readReceipts, appendReceipt, probeCommandSandbox, sandboxArguments, safeEnvironment }
+  authorize, executeTool, prepareBoundary, loadBoundary, readReceipts, appendReceipt, assertCommandSandboxPrerequisites, probeCommandSandbox, sandboxArguments, safeEnvironment }

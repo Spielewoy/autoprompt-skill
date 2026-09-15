@@ -946,11 +946,13 @@ function hermesPortableRuntimeDependencyIdentity(executable, environment = proce
   const body = { schemaVersion: 1, provider: 'hermes', platform: process.platform, architecture: process.arch, files }
   return Object.freeze({ ...body, sha256: sha256(JSON.stringify(body)), fileCount: files.length, packageCount: captured.inventory.packageCount })
 }
-function isolatedEnvironment(root, environment = {}, credentials = {}) {
+function isolatedEnvironment(root, environment = {}, credentials = {}, options = {}) {
+  const windows = (options.platform || process.platform) === 'win32'
+  if (windows) environment = require('../agents/codex/workflow/process-owner.js').normalizeWindowsChildEnvironment(environment)
   const result = {}
   // Explicit allowlist: NODE_OPTIONS, plugin paths, shell startup files, and all
   // inherited provider configuration overrides must not reach the child.
-  for (const key of ['PATH', 'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'LANG', 'LC_ALL', 'TZ', 'TERM', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS', 'GIT_CONFIG_COUNT']) {
+  for (const key of ['PATH', windows ? 'SYSTEMROOT' : 'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'LANG', 'LC_ALL', 'TZ', 'TERM', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS', 'GIT_CONFIG_COUNT', ...(windows ? ['AUTOPROMPT_WINDOWS_BASH'] : [])]) {
     if (typeof environment[key] === 'string') result[key] = environment[key]
   }
   // Preserve controller-owned Git safety projection, but no user Git config.

@@ -10,9 +10,11 @@ const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const keys = Object.freeze({ claude:'AUTOPROMPT_CLAUDE_TEST_CLI',opencode:'AUTOPROMPT_OPENCODE_TEST_CLI',kilo:'AUTOPROMPT_KILO_TEST_CLI',prime:'AUTOPROMPT_PRIME_TEST_CLI',omp:'AUTOPROMPT_OMP_TEST_CLI',deepseek:'AUTOPROMPT_DEEPSEEK_TEST_CLI',vscode:'AUTOPROMPT_VSCODE_TEST_CLI',hermes:'AUTOPROMPT_HERMES_TEST_CLI',grok:'AUTOPROMPT_GROK_TEST_CLI',reasonix:'AUTOPROMPT_REASONIX_TEST_CLI' })
 function fail(code, message) { const error = new Error(message); error.code = code; throw error }
 function regular(file) { const stat = fs.lstatSync(file); if (!stat.isFile() || stat.isSymbolicLink()) fail('LOCAL_CANARY_INVALID', 'canary artifact is not regular'); return fs.readFileSync(file) }
-function closedEnvironment(input = {}, provider, root) {
+function closedEnvironment(input = {}, provider, root, options = {}) {
+  const windows = (options.platform || process.platform) === 'win32'
+  if (windows) input = require('../agents/codex/workflow/process-owner.js').normalizeWindowsChildEnvironment(input)
   const env = {}
-  for (const key of ['PATH','SystemRoot','WINDIR','COMSPEC','PATHEXT','LANG','LC_ALL','TZ','TERM','SSL_CERT_FILE','SSL_CERT_DIR','NODE_EXTRA_CA_CERTS']) {
+  for (const key of ['PATH',windows ? 'SYSTEMROOT' : 'SystemRoot','WINDIR','COMSPEC','PATHEXT','LANG','LC_ALL','TZ','TERM','SSL_CERT_FILE','SSL_CERT_DIR','NODE_EXTRA_CA_CERTS',...(windows ? ['AUTOPROMPT_WINDOWS_BASH'] : [])]) {
     if (typeof input[key] === 'string') env[key] = input[key]
   }
   if (typeof root === 'string') {

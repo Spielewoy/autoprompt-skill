@@ -1004,7 +1004,7 @@ function verifyHarnessV2EnforcementProof(repository, environment, proof) {
   const failures = []
   try {
     const provider = proof.provider
-    if (proof.schemaVersion !== 1 || (!NATIVE_V2_PROVIDERS.includes(provider) && !(provider === 'reasonix' && proof.admissionTrust?.kind === 'reviewed-local-pending'))) throw new OperationalError('Unsupported native enforcement proof')
+    if (proof.schemaVersion !== 1 || (!NATIVE_V2_PROVIDERS.includes(provider) && !(provider === 'reasonix' && ['reviewed-local-pending', 'local-canary-pending'].includes(proof.admissionTrust?.kind)))) throw new OperationalError('Unsupported native enforcement proof')
     const profile = path.resolve(proof.profilePath)
     const privateBytes = file => {
       const item = fs.lstatSync(file, { bigint: true })
@@ -1055,7 +1055,7 @@ function verifyHarnessV2EnforcementProof(repository, environment, proof) {
     const evidencePath = 'scripts/harness-v2-trust/evidence.json'
     const keyPath = 'scripts/harness-v2-trust/trusted-public-keys.json'
     const trust = proof.admissionTrust
-    if (trust?.kind === 'reviewed-local-pending') {
+    if (['reviewed-local-pending', 'local-canary-pending'].includes(trust?.kind)) {
       const hash = value => crypto.createHash('sha256').update(value).digest('hex')
       const receipt = JSON.parse(privateBytes(path.join(installRoot, `.autoprompt-${provider}-v2.json`)))
       if (receipt.provider !== provider || receipt.contractVersion !== '2.0.0' || receipt.schemaVersion !== 2 ||
@@ -1091,8 +1091,10 @@ function verifyHarnessV2EnforcementProof(repository, environment, proof) {
       if (diskProof.profileSha256 !== proof.profileSha256 || diskProof.nativeExecutable !== proof.nativeExecutable ||
           diskProof.admissionTrust?.reviewDigest !== trust.reviewDigest) throw new OperationalError('Local canary enforcement proof changed')
       const release = JSON.parse(privateBytes(path.join(bundle, evidencePath)))
-      const review = require('./harness-v2-canary.cjs').selectReview(release.reviewedLocalRecords, provider, { ...receipt, bundle }, record.executable)
-      if (!review) throw new OperationalError('Local canary release review is missing')
+      const verifier = require('./harness-v2-canary.cjs')
+      const policy = verifier.selectPolicy(release, provider)
+      const review = policy ? null : verifier.selectReview(release.reviewedLocalRecords, provider, { ...receipt, bundle }, record.executable)
+      if (!policy && !review) throw new OperationalError('Local canary release review is missing')
       const artifactRoot = path.join(activationRoot, 'reviewed-local-canary', `generation-${record.capability?.generation}`)
       if (!Array.isArray(record.reviewedLocalCanary?.artifacts)) throw new OperationalError('Local canary has not completed')
       const artifacts = record.reviewedLocalCanary.artifacts.map(item => {
@@ -1101,10 +1103,10 @@ function verifyHarnessV2EnforcementProof(repository, environment, proof) {
         return { ...item, bytes: privateBytes(item.path) }
       })
       const admitted = require('./harness-v2-canary.cjs').verifyActivationProof({ provider,
-        installed: { ...receipt, bundle }, record, proof: diskProof, proofSha256: hash(proofBytes), review, artifacts })
+        installed: { ...receipt, bundle }, record, proof: diskProof, proofSha256: hash(proofBytes), review, policy, artifacts })
       evidence.profileSha256 = proof.profileSha256
       evidence.reviewDigest = admitted.reviewDigest
-      evidence.admissionMode = 'reviewed-release-with-local-canary'
+      evidence.admissionMode = policy ? 'local-native-canary' : 'reviewed-release-with-local-canary'
       return { provider: channel(true, true, evidence, []), shell: channel(true, true, evidence, []) }
     }
     let trustDirectory = bundle, trustEvidence = evidencePath, trustKeys = keyPath
@@ -1290,7 +1292,7 @@ function inspect(repository, expectedBranch, environment = process.env, options 
 
   const repositoryOk = checks.every(item => item.status === 'pass')
   const githubCli = inspectGithubCliBoundary(repository, environment)
-  const proof = options.enforcementProof?.provider === 'reasonix' && options.enforcementProof?.admissionTrust?.kind !== 'reviewed-local-pending'
+  const proof = options.enforcementProof?.provider === 'reasonix' && !['reviewed-local-pending', 'local-canary-pending'].includes(options.enforcementProof?.admissionTrust?.kind)
     ? verifyReasonixEnforcementProof(repository, environment, options.enforcementProof)
     : (NATIVE_V2_PROVIDERS.includes(options.enforcementProof?.provider) || options.enforcementProof?.provider === 'reasonix')
       ? verifyHarnessV2EnforcementProof(repository, environment, options.enforcementProof)

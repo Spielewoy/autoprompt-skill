@@ -411,20 +411,7 @@ function Invoke-LibCapture {
 function Get-ClientStatus {
     param([string]$Client)
     if (Test-HarnessV2Provider -Client $Client) { return (Get-HarnessV2Status -Client $Client) }
-    if ($Client -ceq 'reasonix') {
-        $root = Get-ConfigRoot -Client 'reasonix'
-        $det = Invoke-LibCapture -Call { Detect-Client -Name 'reasonix' }
-        $detected = if ($det.Code -eq 0) { 'yes' } else { 'no' }
-        $version = if ($det.Code -eq 0) { $det.Record -replace '^.*version=', '' } else { '-' }
-        $installed = if (Test-Path -LiteralPath (Join-Path $root '.autoprompt-reasonix-v2.json')) { 'yes' } else { 'no' }
-        $verifies = 'no'; $reason = 'not-installed'
-        if ($installed -ceq 'yes') {
-            & node (Join-Path $RepoRoot 'scripts/reasonix-package.cjs') verify --root $root *> $null
-            if ($LASTEXITCODE -eq 0) { $verifies = 'yes'; $reason = '-' }
-            else { $reason = 'payload-invalid' }
-        }
-        return @{ Detected = $detected; Installed = $installed; Verifies = $verifies; Version = $version; Reason = $reason; Extras = $(if ($verifies -ceq 'yes') { 'complete' } else { 'missing' }); Mode = '-'; Support = 'degraded'; Activation = 'attestation-required' }
-    }
+    if ($Client -ceq 'reasonix') { return (Get-HarnessV2Status -Client $Client) }
     if ($Client -ceq 'prime') {
         $root = Get-ConfigRoot -Client 'prime'
         $det = Invoke-LibCapture -Call { Detect-Client -Name 'prime' }
@@ -586,10 +573,12 @@ foreach ($c in $clients) {
     if ($s.Support -in @('blocked', 'retired', 'unverified')) {
         $detail += " support=$($s.Support)"
     }
-    if ($c -ceq 'codex') { $detail += " activation=$($s.Activation)" }
+    if ($s.Payload) { $detail += " payload=$($s.Payload)" }
+    if ($s.Activation) { $detail += " activation=$($s.Activation)" }
+    if ($s.Message) { $detail += " message=$($s.Message)" }
     [Console]::Out.WriteLine(("{0,-9} {1,-9} {2,-10} {3,-10} {4}" -f $c, $s.Detected, $s.Installed, $s.Verifies, $detail))
     if ($Strict -and ($s.Detected -cne 'yes' -or $s.Installed -cne 'yes' -or
-        $s.Verifies -cne 'yes' -or $s.Extras -notin @('complete', 'na'))) {
+        $s.Verifies -cne 'yes' -or $s.Extras -notin @('complete', 'na') -or $s.Activation -in @('unavailable','attestation-required'))) {
         $strictFailure = $true
     }
 }

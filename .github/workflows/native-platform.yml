@@ -1,0 +1,132 @@
+name: Native platform validation
+
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  platform-primitives:
+    name: Platform and installer / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.runner.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - { os: ubuntu-latest, arch: x64 }
+          - { os: ubuntu-24.04-arm, arch: arm64 }
+          - { os: macos-15-intel, arch: x64 }
+          - { os: macos-latest, arch: arm64 }
+          - { os: windows-latest, arch: x64 }
+          - { os: windows-11-arm, arch: arm64 }
+        node: ['20.x', '24.x']
+    env:
+      AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.runner.arch }}
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.runner.arch }}
+      - name: Install declared Python installer and validation dependencies
+        run: 'python -m pip install --only-binary=:all: PyYAML==6.0.3 jsonschema==4.26.0 referencing==0.37.0'
+      - name: Install macOS installer shells
+        if: runner.os == 'macOS'
+        run: brew install bash powershell
+      - name: Require PowerShell
+        shell: pwsh
+        run: $PSVersionTable.PSVersion.ToString()
+      - run: npm ci --ignore-scripts
+      - name: Enable genuine macOS primitive tests and assert runtime limitation
+        if: runner.os == 'macOS'
+        run: node tests/helpers/native-platform-ci.cjs macos-primitives
+      - name: Enable actual Windows short-name coverage
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          fsutil 8dot3name set 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run platform tests and reject skips of this host's native cases
+        run: node tests/helpers/native-platform-ci.cjs platform
+      - name: Verify doctor readiness and isolated Bash and PowerShell diagnostics
+        run: node tests/helpers/native-platform-ci.cjs doctor
+      - name: Exercise the actual Windows Git Bash Kilo installer lifecycle
+        if: runner.os == 'Windows'
+        run: node tests/helpers/native-platform-ci.cjs kilo-shell
+      - name: Preserve platform and diagnostic output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-${{ matrix.runner.os }}-node-${{ matrix.node }}
+          path: |
+            native-platform-primitives.log
+            native-platform-doctor.log
+            native-platform-kilo-shell.log
+          if-no-files-found: warn
+      - name: Packed installer lifecycle
+        run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
+
+  claude-native:
+    name: Actual Claude 2.1.270 / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.runner.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - { os: ubuntu-latest, arch: x64 }
+          - { os: ubuntu-24.04-arm, arch: arm64 }
+          - { os: windows-latest, arch: x64 }
+          - { os: windows-11-arm, arch: arm64 }
+        node: ['20.x', '24.x']
+    env:
+      CLAUDE_CODE_VERSION: '2.1.270'
+      AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.runner.arch }}
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.runner.arch }}
+      - name: Install declared Python installer and validation dependencies
+        run: 'python -m pip install --only-binary=:all: PyYAML==6.0.3 jsonschema==4.26.0 referencing==0.37.0'
+      - name: Install and enable Linux sandbox prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - run: npm ci --ignore-scripts
+      - name: Select the runner's vendor binary
+        run: node tests/helpers/native-platform-ci.cjs prepare
+      - name: Install exact native Claude package without lifecycle scripts
+        shell: bash
+        run: npm install --prefix .native-claude --ignore-scripts --no-package-lock --no-audit --no-fund "${CLAUDE_NATIVE_PACKAGE}@${CLAUDE_CODE_VERSION}"
+      - name: Require native sandbox and run every Claude capability
+        run: node tests/helpers/native-platform-ci.cjs run
+      - name: Preserve actual platform evidence and test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-claude-${{ matrix.runner.os }}-node-${{ matrix.node }}
+          path: |
+            native-platform-evidence.json
+            native-platform-tests.log
+          if-no-files-found: warn

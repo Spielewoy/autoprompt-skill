@@ -208,7 +208,7 @@ function prepareActivation(options = {}) {
     if (!reviewedLocal) throw error
     admission = { runtimeIdentityBody: require('./harness-v2-admission.cjs').runtimeIdentityBody(provider, installed, executable),
       runtimeIdentityHash: require('./harness-v2-admission.cjs').runtimeIdentity(provider, installed, executable), evidenceSha256: reviewedLocal.reviewDigest,
-      trustSource: { kind: 'reviewed-local-pending', reviewDigest: reviewedLocal.reviewDigest } }
+      trustSource: { kind: reviewedLocal.mode, reviewDigest: reviewedLocal.reviewDigest } }
   }
   const connection = native.connectionConfig(provider, root, environment)
   const credentials = native.credentialEnvironment(provider, connection, root, environment)

@@ -31,6 +31,7 @@ const CONFORMANCE_FILES = [
   "tests/source/harness-v2-grok-sandbox.test.cjs",
   "tests/source/harness-v2-grok-adapter-native.test.cjs",
   "tests/source/reasonix-controlled-native.test.cjs",
+  "tests/helpers/native-platform.cjs",
   "tests/helpers/harness-native-service.cjs",
   "tests/helpers/harness-pi-native-service.cjs"
 ]

@@ -9,6 +9,8 @@ const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 const { managedCodexPayload } = require('../../scripts/codex-configure.cjs')
+const harnessPackage = require('../../scripts/harness-v2-package.cjs')
+const reasonixPackage = require('../../scripts/reasonix-package.cjs')
 const { runOwnedTestProcess, processFailureDetails } = require('../helpers/owned-test-process.cjs')
 
 const ROOT = path.resolve(__dirname, '..', '..')
@@ -258,6 +260,19 @@ function physicalPath (filePath) {
 }
 
 function assertCustomLayout (client, customRoot) {
+  if (client !== 'codex') {
+    const installed = client === 'reasonix'
+      ? reasonixPackage.verify(customRoot)
+      : harnessPackage.verify(client, customRoot)
+    assert.equal(installed.status, 'verified')
+    assert.ok(isSameOrWithin(customRoot, installed.bundle), 'v2 runtime stays inside its custom root')
+    assert.match(installed.payloadGeneration, new RegExp(`^${client}-v2\\.0\\.0-`))
+    const launcher = client === 'reasonix'
+      ? path.join(customRoot, 'skills', 'autoprompt', 'SKILL.md')
+      : harnessPackage.launcherPath(client, customRoot)
+    assert.equal(fs.existsSync(launcher), true)
+    return installed
+  }
   const skill = path.join(customRoot, 'skills', 'autoprompt')
   assert.equal(fs.existsSync(path.join(skill, 'SKILL.md')), true)
   assertManifestInstalled(client, customRoot)
@@ -338,7 +353,13 @@ function assertCustomLayout (client, customRoot) {
 
 function assertCustomDoctor (client, completed) {
   const output = `${completed.stdout}\n${completed.stderr}`
-  if (client === 'codex' && process.platform === 'win32') {
+  if (client !== 'codex') {
+    // These lifecycle fixtures emit versions only. A healthy installed payload
+    // must never turn those scripts into native activation evidence.
+    assert.equal(completed.status, 1, output)
+    assert.match(completed.stdout, new RegExp(`^${client}\\s+\\S+\\s+yes\\s+no\\s+`, 'm'))
+    assert.match(completed.stdout, /extras=complete.*payload=verified activation=unavailable/)
+  } else if (process.platform === 'win32') {
     assert.equal(completed.status, 1, output)
     assert.match(completed.stdout, /^codex\s+yes\s+yes\s+no\s+.*reason=codex-windows-sandbox-identity-unavailable extras=complete.*activation=unavailable/m)
   } else {
@@ -354,6 +375,17 @@ function isSameOrWithin (root, candidate) {
 }
 
 function assertReceiptScoped (client, customRoot, settings) {
+  if (client !== 'codex') {
+    const installed = assertCustomLayout(client, customRoot)
+    const receiptFile = path.join(customRoot, client === 'reasonix' ? reasonixPackage.RECEIPT : harnessPackage.receiptName(client))
+    const receipt = JSON.parse(fs.readFileSync(receiptFile, 'utf8'))
+    const publicPaths = client === 'reasonix'
+      ? [path.join(customRoot, 'skills', 'autoprompt', 'SKILL.md')]
+      : Object.keys(harnessPackage.publicFiles(client, customRoot)).map(file => path.join(customRoot, file))
+    const files = [...Object.keys(receipt.files).map(file => path.join(installed.bundle, file)), path.join(installed.bundle, 'package.json'), ...publicPaths]
+    for (const file of files) assert.ok(isSameOrWithin(customRoot, file), `${client}: ${file}`)
+    return { receipt: { ...receipt, files }, receiptFile }
+  }
   const receiptFile = path.join(customRoot, '.autoprompt-install-receipt.json')
   const receipt = JSON.parse(fs.readFileSync(receiptFile, 'utf8'))
   const receiptPaths = [
@@ -395,6 +427,7 @@ function defaultProviderPaths (context, client) {
 }
 
 function customTamperTarget (client, customRoot) {
+  if (client !== 'codex') return path.join(assertCustomLayout(client, customRoot).bundle, 'scripts', 'harness-v2-tool-boundary.cjs')
   const skill = path.join(customRoot, 'skills', 'autoprompt')
   switch (client) {
     case 'claude': return path.join(customRoot, 'agents', 'ap-manager.md')
@@ -711,14 +744,20 @@ test('Git Bash lifecycle entrypoints reject all, blocked, empty, relative, and r
   }
 })
 
-test('PowerShell custom roots complete install, doctor, repair, and uninstall for every provider', {
-  skip: process.platform !== 'win32',
+test('PowerShell custom roots verify activation refusal, tamper recovery, and uninstall for every provider', {
+  skip: !HAS_POWERSHELL,
   timeout: 600000
-}, () => {
+}, t => {
   const clients = process.env.AUTOPROMPT_TEST_CUSTOM_ROOT_CLIENT
     ? [process.env.AUTOPROMPT_TEST_CUSTOM_ROOT_CLIENT]
     : SHARED_LIFECYCLE_CLIENTS
   for (const client of clients) {
+    // The existing Codex fixture exercises Windows-specific legacy installer
+    // behavior. Keep that native gate; v2 package ports also run under pwsh.
+    if (client === 'codex' && process.platform !== 'win32') {
+      t.diagnostic('Legacy Codex PowerShell custom-root fixture requires native Windows')
+      continue
+    }
     const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), `autoprompt-root-${client}-ps-`))
     const context = makeLifecycleContext(sandbox, client)
     const rootSentinel = path.join(context.customRoot, 'keep-user.txt')
@@ -753,20 +792,14 @@ test('PowerShell custom roots complete install, doctor, repair, and uninstall fo
       assert.equal(fs.existsSync(path.join(
         context.customRoot,
         '.autoprompt-install-hashes.json'
-      )), true)
+      )), client === 'codex')
       for (const defaultPath of defaultProviderPaths(context, client)) {
         assert.equal(fs.existsSync(defaultPath), false, `${client}: ${defaultPath}`)
       }
 
       if (client === 'vscode') {
-        assert.match(
-          fs.readFileSync(context.settings, 'utf8'),
-          /"chat\.subagents\.allowInvocationsFromSubagents": true/
-        )
-        assert.deepEqual(
-          fs.readFileSync(`${context.settings}.autoprompt.bak`),
-          originalSettings
-        )
+        assert.deepEqual(fs.readFileSync(context.settings), originalSettings)
+        assert.equal(fs.existsSync(`${context.settings}.autoprompt.bak`), false)
       }
 
       const healthy = run(POWERSHELL, [
@@ -776,6 +809,7 @@ test('PowerShell custom roots complete install, doctor, repair, and uninstall fo
       assertCustomDoctor(client, healthy)
 
       const tamperTarget = customTamperTarget(client, context.customRoot)
+      const trustedBytes = fs.readFileSync(tamperTarget)
       fs.appendFileSync(tamperTarget, '\ncustom-root-tamper\n')
       const broken = run(POWERSHELL, [
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
@@ -788,6 +822,19 @@ test('PowerShell custom roots complete install, doctor, repair, and uninstall fo
       )
       if (client === 'codex') {
         assert.match(broken.stdout, /extras=invalid:installed-hash-mismatch:/)
+      } else {
+        assert.match(broken.stdout, /reason=payload-invalid.*payload=unverified/)
+        const tamperedBytes = fs.readFileSync(tamperTarget)
+        const refused = run(POWERSHELL, [
+          '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+          '-Command', powershellEntry('install', client)
+        ], { env: context.env })
+        assert.notEqual(refused.status, 0, `${refused.stdout}\n${refused.stderr}`)
+        assert.match(`${refused.stdout}\n${refused.stderr}`, /PAYLOAD_INVALID/)
+        assert.deepEqual(fs.readFileSync(tamperTarget), tamperedBytes, 'v2 refuses to overwrite an altered installed runtime')
+        // Restore only the exact known fixture bytes before exercising an
+        // idempotent install. This is deliberate recovery, not silent repair.
+        fs.writeFileSync(tamperTarget, trustedBytes)
       }
 
       const repaired = run(POWERSHELL, [
@@ -799,7 +846,7 @@ test('PowerShell custom roots complete install, doctor, repair, and uninstall fo
         0,
         `${client} repair:\n${repaired.stdout}\n${repaired.stderr}`
       )
-      if (client === 'codex') assertCustomLayout(client, context.customRoot)
+      assertCustomLayout(client, context.customRoot)
       const repairedDoctor = run(POWERSHELL, [
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
         '-Command', powershellEntry('doctor', client, true)
@@ -1360,8 +1407,8 @@ test('Bash upgrades and rolls back a synthetic receiptless legacy Codex install'
   }
 })
 
-test('Git Bash custom Kilo root completes install, doctor, repair, and uninstall', {
-  skip: process.platform !== 'win32' || !GIT_BASH,
+test('Bash custom Kilo root verifies activation refusal, tamper recovery, and uninstall', {
+  skip: !GIT_BASH,
   timeout: 720000
 }, () => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-root-kilo-sh-'))
@@ -1394,16 +1441,24 @@ test('Git Bash custom Kilo root completes install, doctor, repair, and uninstall
     assert.equal(fs.existsSync(path.join(context.xdg, 'kilo')), false)
 
     const healthy = run(GIT_BASH, ['-lc', shellEntry('doctor', true)], { env })
-    assert.equal(healthy.status, 0, `${healthy.stdout}\n${healthy.stderr}`)
-    assert.match(healthy.stdout, /^kilo\s+yes\s+yes\s+yes\s+/m)
+    assertCustomDoctor('kilo', healthy)
 
-    const mainSkill = path.join(context.customRoot, 'skills', 'autoprompt', 'SKILL.md')
+    const mainSkill = harnessPackage.launcherPath('kilo', context.customRoot)
+    const tamperTarget = customTamperTarget('kilo', context.customRoot)
+    const trustedBytes = fs.readFileSync(tamperTarget)
     fs.appendFileSync(
-      customTamperTarget('kilo', context.customRoot),
+      tamperTarget,
       '\nshell-custom-root-tamper\n'
     )
     const broken = run(GIT_BASH, ['-lc', shellEntry('doctor', true)], { env })
     assert.notEqual(broken.status, 0, `${broken.stdout}\n${broken.stderr}`)
+    assert.match(broken.stdout, /reason=payload-invalid.*payload=unverified/)
+    const tamperedBytes = fs.readFileSync(tamperTarget)
+    const refused = run(GIT_BASH, ['-lc', shellEntry('install')], { env })
+    assert.notEqual(refused.status, 0, `${refused.stdout}\n${refused.stderr}`)
+    assert.match(`${refused.stdout}\n${refused.stderr}`, /PAYLOAD_INVALID/)
+    assert.deepEqual(fs.readFileSync(tamperTarget), tamperedBytes)
+    fs.writeFileSync(tamperTarget, trustedBytes)
 
     const repaired = run(GIT_BASH, ['-lc', shellEntry('install')], {
       env,
@@ -1411,11 +1466,7 @@ test('Git Bash custom Kilo root completes install, doctor, repair, and uninstall
     })
     assert.equal(repaired.status, 0, `${repaired.stdout}\n${repaired.stderr}`)
     const repairedDoctor = run(GIT_BASH, ['-lc', shellEntry('doctor', true)], { env })
-    assert.equal(
-      repairedDoctor.status,
-      0,
-      `${repairedDoctor.stdout}\n${repairedDoctor.stderr}`
-    )
+    assertCustomDoctor('kilo', repairedDoctor)
 
     const removed = run(GIT_BASH, ['-lc', shellEntry('uninstall')], { env })
     assert.equal(removed.status, 0, `${removed.stdout}\n${removed.stderr}`)
@@ -1424,7 +1475,7 @@ test('Git Bash custom Kilo root completes install, doctor, repair, and uninstall
     assert.equal(fs.existsSync(path.join(context.customRoot, 'autoprompt.kilo.json')), false)
     assert.equal(fs.existsSync(path.join(
       context.customRoot,
-      '.autoprompt-install-receipt.json'
+      harnessPackage.receiptName('kilo')
     )), false)
     assert.equal(fs.readFileSync(rootSentinel, 'utf8'), 'keep root\n')
     assert.equal(fs.readFileSync(siblingSentinel, 'utf8'), 'keep sibling\n')

@@ -186,9 +186,11 @@ test('packed current CLI completes the private v2 lifecycle for OMP and DeepSeek
       const doctor = invoke(['doctor', provider, '--strict', '--root', root])
       assert.equal(
         doctor.status,
-        0,
+        1,
         `${provider} packed doctor\n${doctor.stdout}\n${doctor.stderr}`,
       )
+      // A version-only fixture verifies installation, not native activation readiness.
+      assert.match(doctor.stdout, /payload=verified activation=unavailable/)
       assert.match(doctor.stdout, /extras=complete/)
 
       fs.appendFileSync(target, '\npacked lifecycle tamper\n')

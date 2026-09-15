@@ -261,6 +261,38 @@ function uninstall(root) {
   } finally { release(lease) }
 }
 
+function doctorPrerequisites(root, options = {}) {
+  const installed = verify(root)
+  const result = { ...installed, payload: 'verified', detected: false, activation: 'unavailable', reason: 'activation-prerequisites-unavailable' }
+  try {
+    const native = require('../agents/reasonix/workflow/native.js')
+    const admission = require('../agents/reasonix/workflow/admission.js')
+    const environment = options.env || process.env
+    const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-reasonix-doctor-'))
+    let executable
+    try {
+      const probeEnv = require('./harness-v2-native.cjs').isolatedEnvironment(probeRoot, environment)
+      executable = native.probeExecutable({ env: environment, executable: options.executable,
+        spawnSync(file, argv, settings) {
+          return require('node:child_process').spawnSync(file, argv, { ...settings, env: probeEnv, cwd: probeRoot, windowsHide: true })
+        } })
+    } finally { fs.rmSync(probeRoot, { recursive: true, force: true }) }
+    result.detected = true; result.nativeVersion = executable.version
+    const imported = require('./reasonix-configure.cjs').importedAdmission(root)
+    let pending = null
+    try { admission.verifyAdmission(installed, executable, imported || {}) }
+    catch (error) {
+      if (imported || !admission.awaitingIndependentConformance(installed)) throw error
+      pending = admission.reviewedLocalPending(installed, executable, { now: options.now })
+      if (!pending) throw error
+    }
+    require('./harness-v2-tool-boundary.cjs').assertCommandSandboxPrerequisites({ env: environment })
+    return { ...result, activation: pending ? 'local-canary-required' : 'static-ready;dynamic-preflight-required', reason: '-', nativeVersion: executable.version }
+  } catch (error) {
+    return { ...result, reason: String(error.code || 'RUNTIME_FAILURE').toLowerCase().replaceAll('_', '-'), message: error.message }
+  }
+}
+
 function run(argv = process.argv.slice(2), options = {}) {
   const [action, flag, value] = argv
   if (!['install', 'verify', 'doctor', 'uninstall', 'plan'].includes(action) ||
@@ -271,11 +303,12 @@ function run(argv = process.argv.slice(2), options = {}) {
   if (action === 'plan') return sourceInventory(options.sourceRoot)
   if (action === 'install') return install(root, options.sourceRoot)
   if (action === 'uninstall') return uninstall(root)
+  if (action === 'doctor') return doctorPrerequisites(root, options)
   return verify(root)
 }
 
 if (require.main === module) {
-  try { const result = run(); process.stdout.write(`${JSON.stringify({ status: result.status, root: result.root, payloadGeneration: result.payloadGeneration })}\n`) }
+  try { const result = run(); process.stdout.write(`${JSON.stringify({ status: result.status, root: result.root, payloadGeneration: result.payloadGeneration, payload: result.payload, detected: result.detected, activation: result.activation, reason: result.reason, message: result.message, nativeVersion: result.nativeVersion })}\n`); if (result.activation === 'unavailable') process.exitCode = 1 }
   catch (error) { process.stderr.write(`${error.code || 'RUNTIME_FAILURE'}: ${error.message}\n`); process.exitCode = 1 }
 }
-module.exports = { RECEIPT, ROOT, SHIM, launcher, bundlePath, install, readReceipt, resolveRoot, run, sourceInventory, uninstall, verify, walk }
+module.exports = { RECEIPT, ROOT, SHIM, launcher, bundlePath, install, readReceipt, resolveRoot, run, sourceInventory, uninstall, verify, doctor: doctorPrerequisites, doctorPrerequisites, walk }

@@ -111,12 +111,8 @@ function runtimeIdentity(provider, installed, executable) {
 function reviewedLocalPending(provider, installed, executable, options = {}) {
   let evidence
   try { evidence = JSON.parse(readBound(path.join(installed.bundle, EVIDENCE))) } catch { return null }
-  const records = evidence?.reviewedLocalRecords
-  if (records === undefined) return null
-  if (!Array.isArray(records)) fail('PROVIDER_UNSUPPORTED', 'Reviewed-local release records are invalid')
   try {
-    const review = localCanary.selectReview(records, provider, installed, executable)
-    return review ? localCanary.verifyReview(review, provider, installed, executable, options.now) : null
+    return localCanary.pendingFromEvidence(evidence, provider, installed, executable, options.now)
   }
   catch (error) { fail('PROVIDER_UNSUPPORTED', `Reviewed-local release record is rejected: ${error.message}`) }
 }

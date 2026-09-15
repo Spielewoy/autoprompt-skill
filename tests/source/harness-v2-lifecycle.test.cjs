@@ -19,6 +19,12 @@ function context(t) {
 function write(file, bytes) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, bytes) }
 function run(file, args, env, cwd = ROOT) { return cp.spawnSync(process.execPath, [file, ...args], { encoding: 'utf8', cwd, env, timeout: 120000 }) }
 function ok(result) { assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}\n${result.error || ''}`); return result }
+function requiresNative(result) {
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /activation=(?:unavailable|attestation-required)/)
+  assert.match(result.stdout, /extras=complete/)
+  return result
+}
 const original = require('../helpers/legacy-provider-fixture.cjs').readLegacyFixture
 function versionEnvironment(directory, provider, root) {
   const bin = path.join(directory, 'bin')
@@ -243,7 +249,8 @@ for (const provider of [...pkg.PROVIDERS, 'reasonix']) test(`${provider}: public
   const directory = context(t), root = path.join(directory, 'config'), env = versionEnvironment(directory, provider, root)
   for (const [script, args] of [['install', []], ['doctor', ['--strict']], ['uninstall', []]]) {
     const result = cp.spawnSync('bash', [path.join(ROOT, 'scripts/install', `${script}.sh`), provider, ...args], { encoding: 'utf8', cwd: directory, env, timeout: 120000 })
-    ok(result)
+    if (script === 'doctor') requiresNative(result)
+    else ok(result)
     if (script === 'install') {
       const verifyCli = provider === 'reasonix' ? path.join(ROOT, 'scripts/reasonix-package.cjs') : CLI
       const verifyArgs = provider === 'reasonix' ? ['verify', '--root', root] : ['verify', provider, '--root', root]
@@ -279,7 +286,7 @@ for (const provider of [...pkg.PROVIDERS, 'reasonix']) test(`${provider}: PowerS
   assert.equal(installed.status, 'verified')
   assert.equal(fs.existsSync(path.join(root, 'agents/ap-manager.md')), false)
   assert.equal(fs.existsSync(path.join(root, 'skills/ap-manager/SKILL.md')), false)
-  ok(invoke('doctor', ['-Strict']))
+  requiresNative(invoke('doctor', ['-Strict']))
   const relative = Object.keys(installed.files).find(file => file.endsWith('/GATES.md') || file === 'GATES.md')
   assert.ok(relative, 'receipt binds a real runtime doctrine file')
   const target = path.join(installed.bundle, relative), originalBytes = fs.readFileSync(target)
@@ -297,7 +304,7 @@ for (const provider of [...pkg.PROVIDERS, 'reasonix']) test(`${provider}: PowerS
   fs.writeFileSync(target, originalBytes)
   ok(invoke('install'))
   assert.equal(verify().payloadDigest, installed.payloadDigest)
-  ok(invoke('doctor', ['-Strict']))
+  requiresNative(invoke('doctor', ['-Strict']))
   ok(invoke('uninstall'))
   assert.equal(fs.existsSync(installed.bundle), false)
   assert.equal(fs.existsSync(receiptFile), false)
