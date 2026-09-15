@@ -32,7 +32,8 @@ test('native Windows pipe diagnostic records namespace and descriptor outcomes u
   fs.copyFileSync(controller, executable, fs.constants.COPYFILE_EXCL)
   const result = cp.spawnSync(controller, [executable], { encoding: 'utf8', timeout: 45000, windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'], cwd: control,
-    env: { SystemRoot: systemRoot, WINDIR: systemRoot, PATH: path.join(systemRoot, 'System32'), TEMP: control, TMP: control },
+    env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
+      PATH: path.join(systemRoot, 'System32'), TEMP: control, TMP: control },
   })
   // Publish bounded observations before assertions so a native failure keeps
   // its evidence in TAP and in the workflow's streamed platform log.

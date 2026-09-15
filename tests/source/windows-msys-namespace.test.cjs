@@ -48,7 +48,8 @@ test('native Windows MSYS namespace isolates event and section leaves across pro
   // launcher to prove each child's exact token, image and job drain.
   const result = cp.spawnSync(controller, [executable, path.join(runtime, 'bash.exe'), dll, dllHash, sharedId], {
     encoding: 'utf8', timeout: 90000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-    cwd: control, env: { SystemRoot: systemRoot, WINDIR: systemRoot, PATH: path.join(systemRoot, 'System32'), TEMP: control, TMP: control },
+    cwd: control, env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
+      PATH: path.join(systemRoot, 'System32'), TEMP: control, TMP: control },
   })
   assert.ifError(result.error)
   assert.equal(result.status, 0, result.stderr || result.stdout)
