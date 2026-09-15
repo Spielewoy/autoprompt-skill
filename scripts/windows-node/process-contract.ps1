@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($env:PROOF_BUILD_SCRIPT,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw 'Builder parser errors'}
-foreach($name in @('Run','WriteNodeBuildProgress','SelectNodeVisualStudio','SelectNodeBuildPlan','NodeBuildCommand','AssertNodePeBytes','AssertNodeIdentity','ReadNodeToolMachine','FindNodeVswhere','Physical','NodeBuildOutput')) {
+foreach($name in @('Run','WriteNodeBuildProgress','SelectNodeVisualStudio','SelectNodeBuildPlan','NodeBuildCommand','AssertNodePeBytes','AssertNodeIdentity','ReadNodeToolMachine','FindNodeVswhere','Physical','NodeBuildOutput','NodeGitConfiguration')) {
  $functions=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true))
  if($functions.Count -ne 1){throw "One actual $name helper required"}
  . ([ScriptBlock]::Create($functions[0].Extent.Text))
@@ -33,6 +33,11 @@ foreach($tuple in @(@('x64','arm64','arm64'),@('arm64','x64','arm64'),@('arm64',
  Refuses {SelectNodeBuildPlan $tuple[0] $tuple[1] $tuple[2]};$planCases++
 }
 $work=$env:PROOF_WORK;$logs=Join-Path $work 'logs';[IO.Directory]::CreateDirectory($logs)|Out-Null
+[void][IO.Directory]::CreateDirectory((Join-Path $work 'inputs'))
+$gitConfiguration=NodeGitConfiguration $work
+Need ($gitConfiguration -ceq [IO.Path]::GetFullPath((Join-Path $work 'inputs/git-empty.config')) -and [IO.File]::ReadAllBytes($gitConfiguration).Length -eq 0) 'Git configuration must be an owned empty physical file'
+Refuses {NodeGitConfiguration $work}
+Refuses {NodeGitConfiguration (Join-Path $work 'linked-config-source')}
 $roots=@((Join-Path $work 'program-files-x86'),(Join-Path $work 'program-files'))
 $installer=Join-Path $roots[1] 'Microsoft Visual Studio/Installer/vswhere.exe'
 [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($installer));[IO.File]::WriteAllText($installer,'fixture')
@@ -84,4 +89,4 @@ for($i=0;$i -lt $expected.Count;$i++) {
  Need (($match.Groups[1].Value+':'+$match.Groups[2].Value) -ceq $expected[$i]) 'Wrong progress phase'
  if($match.Groups[2].Value -ceq 'start'){Need ($match.Groups[3].Value -ceq '0') 'Start timing differs'}
 }
-@{processCases=3;toolchainCases=6;planCases=$planCases;peCases=$peCases;progressRecords=$script:Records.Count;installerCases=3;outputCases=4} | ConvertTo-Json -Compress
+@{processCases=3;toolchainCases=6;planCases=$planCases;peCases=$peCases;progressRecords=$script:Records.Count;installerCases=3;outputCases=4;gitConfigCases=3} | ConvertTo-Json -Compress

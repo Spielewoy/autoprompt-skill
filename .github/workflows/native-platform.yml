@@ -71,6 +71,23 @@ jobs:
         run: |
           fsutil 8dot3name set 0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify native Windows runtime bundle physical capture
+        id: runtime-physical-proof
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test --test-reporter=tap scripts/windows-runtime/physical-proof/audit.test.cjs 2>&1 | Tee-Object -FilePath native-windows-runtime-physical.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-runtime/physical-proof/verify-output.cjs native-windows-runtime-physical.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native runtime bundle capture observations
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-runtime-physical-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: native-windows-runtime-physical.log
+          if-no-files-found: error
       - name: Record native host NUL query sizes before sandbox launches
         if: runner.os == 'Windows'
         # Independent of the AppContainer launcher; mandatory again in the full suite.
@@ -152,7 +169,7 @@ jobs:
         run: |
           $changed = @(git diff --name-only HEAD^ HEAD -- scripts/windows-msys agents/codex/workflow/windows-appcontainer* agents/codex/workflow/windows-filesystem.ps1 tests/source/windows-bash-runtime.test.cjs tests/fixtures/windows-msys/bash-ipc.sh)
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "run=$($changed.Count -gt 0)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
+          "run=$($changed.Count -gt 0 -or '${{ github.event_name }}' -eq 'workflow_dispatch')".ToLowerInvariant() >> $env:GITHUB_OUTPUT
       - name: Compile the isolated MSYS pipe adapter proof
         id: msys-proof
         if: steps.msys-proof-input.outputs.run == 'true'
@@ -203,6 +220,31 @@ jobs:
         run: |
           node scripts/windows-msys/probe-built-runtime.cjs (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compare native entropy initialization directly and through Bash
+        id: msys-entropy
+        if: steps.msys-proof.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof'
+          $toolchain = Join-Path $env:RUNNER_TEMP 'msys-descriptor-toolchain/toolchain.json'
+          $output = Join-Path $env:RUNNER_TEMP 'msys-entropy-proof'
+          node --test scripts/windows-msys/entropy-proof/parser.test.cjs scripts/windows-msys/entropy-proof/probe.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $digest = (Get-FileHash -LiteralPath $toolchain -Algorithm SHA256).Hash.ToLowerInvariant()
+          node scripts/windows-msys/entropy-proof/build.cjs $PWD.Path $toolchain $digest $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-msys/entropy-proof/probe.cjs $work $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native entropy comparison evidence
+        if: always() && steps.msys-proof-input.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-entropy-proof
+          path: |
+            ${{ runner.temp }}/msys-entropy-proof
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/entropy-proof.jsonl
+          if-no-files-found: warn
       - name: Verify native POSIX IPC and cancellation with the built MSYS runtime
         id: msys-posix
         if: steps.msys-smoke.outcome == 'success'
@@ -228,15 +270,17 @@ jobs:
             ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/posix-compile-fixture
             ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/posix-proof-*/results.jsonl
           if-no-files-found: warn
-      # Compile Node separately from the MSYS worker, within the existing matrix.
+      # Compile Node separately from MSYS, within the existing matrix. Source or
+      # fixture changes rebuild it; workflow-only diagnostics reuse no binaries
+      # and do not repeat a full compile. Manual dispatch rebuilds both workers.
       - name: Detect changes to the Node compiler proof
         id: node-proof-input
         if: github.ref == 'refs/heads/codex/issue-27-native-platform-support' && runner.os == 'Windows' && matrix.node == '20.x'
         shell: pwsh
         run: |
-          $changed = @(git diff --name-only HEAD^ HEAD -- scripts/windows-node .github/workflows/native-platform.yml tests/fixtures/windows-appcontainer/node-pipe-proof.cs tests/fixtures/windows-appcontainer/node-pipe-worker.cjs tests/source/windows-appcontainer-node-pipes.test.cjs tests/helpers/windows-node-pipe-worker.cjs)
+          $changed = @(git diff --name-only HEAD^ HEAD -- scripts/windows-node tests/fixtures/windows-appcontainer/node-pipe-proof.cs tests/fixtures/windows-appcontainer/node-pipe-worker.cjs tests/source/windows-appcontainer-node-pipes.test.cjs tests/helpers/windows-node-pipe-worker.cjs)
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "run=$($changed.Count -gt 0)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
+          "run=$($changed.Count -gt 0 -or '${{ github.event_name }}' -eq 'workflow_dispatch')".ToLowerInvariant() >> $env:GITHUB_OUTPUT
       - name: Compile the isolated Node AppContainer pipe adapter
         id: node-proof
         if: steps.node-proof-input.outputs.run == 'true'
@@ -291,7 +335,7 @@ jobs:
       - name: Packed installer lifecycle
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
       - name: Require native startup and selected compiler proofs to succeed
-        if: always() && (steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure')
+        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure')
         run: node -e "process.exit(1)"
 
   claude-native:

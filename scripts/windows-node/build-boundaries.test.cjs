@@ -34,12 +34,24 @@ test('actual compiler process helper drains logs, propagates failures and bounds
   fs.symlinkSync(output, path.join(root, 'output-source', 'Release'), process.platform === 'win32' ? 'junction' : 'dir')
   fs.mkdirSync(path.join(root, 'linked-output-source'))
   fs.symlinkSync(path.dirname(output), path.join(root, 'linked-output-source', 'out'), process.platform === 'win32' ? 'junction' : 'dir')
+  fs.mkdirSync(path.join(root, 'linked-config-source'))
+  fs.symlinkSync(output, path.join(root, 'linked-config-source', 'inputs'), process.platform === 'win32' ? 'junction' : 'dir')
   const result = cp.spawnSync(pwsh, ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', path.join(__dirname, 'process-contract.ps1')], {
     encoding: 'utf8', timeout: 30000, env: { ...process.env, PROOF_BUILD_SCRIPT: path.join(__dirname, 'build.ps1'), PROOF_WORK: root, PROOF_NODE: process.execPath },
   })
   assert.ifError(result.error)
   assert.equal(result.status, 0, result.stderr || result.stdout)
-  assert.deepEqual(JSON.parse(result.stdout), { processCases: 3, toolchainCases: 6, planCases: 23, peCases: 28, progressRecords: 7, installerCases: 3, outputCases: 4 })
+  assert.deepEqual(JSON.parse(result.stdout), { processCases: 3, toolchainCases: 6, planCases: 23, peCases: 28, progressRecords: 7, installerCases: 3, outputCases: 4, gitConfigCases: 3 })
+  assert.equal(fs.existsSync(path.join(output, 'git-empty.config')), false, 'Linked input refusal must precede file creation')
+  const home = path.join(root, 'host-config')
+  fs.mkdirSync(home)
+  fs.writeFileSync(path.join(home, '.gitconfig'), '[user]\nname = must-not-inherit-host-config\n')
+  const config = path.join(root, 'inputs', 'git-empty.config')
+  const git = cp.spawnSync('git', ['config', '--global', '--list'], { encoding: 'utf8', timeout: 10000,
+    env: { ...process.env, HOME: home, USERPROFILE: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_SYSTEM: config, GIT_CONFIG_GLOBAL: config } })
+  assert.ifError(git.error)
+  assert.equal(git.status, 0, git.stderr)
+  assert.equal(git.stdout, '', 'Explicit empty config must suppress the ambient user config')
 })
 
 test('private NUL patch lock binds every original, result and newly created header', () => {

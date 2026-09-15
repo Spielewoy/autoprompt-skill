@@ -63,6 +63,13 @@ function NodeBuildOutput([string]$Source) {
   # actual build output; Physical must still reject every linked ancestor.
   return (Physical (Join-Path (Join-Path (Join-Path $Source 'out') 'Release') 'node.exe'))
 }
+function NodeGitConfiguration([string]$Work) {
+  $inputs=Physical (Join-Path $Work 'inputs')
+  $file=Join-Path $inputs 'git-empty.config'
+  $stream=[IO.File]::Open($file,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+  $stream.Dispose()
+  return (Physical $file)
+}
 function FindNodeVswhere([string[]]$Roots) {
   foreach($root in $Roots) {
     if([string]::IsNullOrEmpty($root)){continue}
@@ -100,6 +107,7 @@ foreach($sid in @($user.Value,'S-1-5-18') | Select-Object -Unique) {
 [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($work),$acl)
 foreach($name in @('inputs','logs','temp','source','tools','stage')) { [IO.Directory]::CreateDirectory((Join-Path $work $name)) | Out-Null }
 $logs=Join-Path $work 'logs'
+$gitConfiguration=NodeGitConfiguration $work
 function Fetch([string]$Name,[string]$Url,[string]$Digest) {
   $destination=Join-Path $work ('inputs\'+$Name)
   $fetchClock=[Diagnostics.Stopwatch]::StartNew();WriteNodeBuildProgress ('fetch-'+$Name) 'start' 0
@@ -135,7 +143,7 @@ $environment=@{
  NUMBER_OF_PROCESSORS='4';PROCESSOR_ARCHITECTURE=$plan.processorArchitecture
  ProgramFiles=$env:ProgramFiles;'ProgramFiles(x86)'=${env:ProgramFiles(x86)};ProgramW6432=$env:ProgramW6432
  USERPROFILE=[Environment]::GetFolderPath('UserProfile');LOCALAPPDATA=[Environment]::GetFolderPath('LocalApplicationData');APPDATA=[Environment]::GetFolderPath('ApplicationData');ProgramData=[Environment]::GetFolderPath('CommonApplicationData')
- GIT_CONFIG_NOSYSTEM='1';GIT_CONFIG_SYSTEM='NUL';GIT_CONFIG_GLOBAL='NUL';GIT_TERMINAL_PROMPT='0'
+ GIT_CONFIG_NOSYSTEM='1';GIT_CONFIG_SYSTEM=$gitConfiguration;GIT_CONFIG_GLOBAL=$gitConfiguration;GIT_TERMINAL_PROMPT='0'
 }
 $script:PendingCompilerStreams=[Collections.Generic.List[object]]::new()
 function Run([string]$Exe,[string[]]$Arguments,[string]$Name,[int]$Timeout=120,[string]$Cwd=$work) {
