@@ -1,5 +1,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory=$true)][string]$NativeSha256,[switch]$Request)
+# Pin inbox modules after PowerShell's startup environment reconstruction.
+[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'

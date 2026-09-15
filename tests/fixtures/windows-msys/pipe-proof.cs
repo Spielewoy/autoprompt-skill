@@ -23,7 +23,9 @@ public static class MsysPipeProof {
  [DllImport("ntdll.dll")] static extern Int32 NtCreateNamedPipeFile(out IntPtr handle,UInt32 access,ref OA attributes,out IO io,UInt32 share,UInt32 disposition,UInt32 options,UInt32 type,UInt32 readMode,UInt32 completionMode,UInt32 instances,UInt32 inbound,UInt32 outbound,ref Int64 timeout);
  [DllImport("ntdll.dll")] static extern UInt32 RtlNtStatusToDosError(Int32 status);
  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateNamedPipeW(String name,UInt32 openMode,UInt32 pipeMode,UInt32 instances,UInt32 outSize,UInt32 inSize,UInt32 timeout,ref SA attributes);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateNamedPipeW(String name,UInt32 openMode,UInt32 pipeMode,UInt32 instances,UInt32 outSize,UInt32 inSize,UInt32 timeout,IntPtr attributes);
  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateFileW(String name,UInt32 access,UInt32 share,ref SA attributes,UInt32 disposition,UInt32 flags,IntPtr template);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateFileW(String name,UInt32 access,UInt32 share,IntPtr attributes,UInt32 disposition,UInt32 flags,IntPtr template);
  [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern Boolean ConvertStringSecurityDescriptorToSecurityDescriptor(String text,UInt32 revision,out IntPtr descriptor,out UInt32 size);
  [DllImport("advapi32.dll",SetLastError=true)] static extern Boolean OpenProcessToken(IntPtr process,UInt32 access,out IntPtr token);
  [DllImport("advapi32.dll",SetLastError=true)] static extern Boolean GetTokenInformation(IntPtr token,Int32 information,out Int32 value,UInt32 length,out UInt32 returned);
@@ -224,31 +226,33 @@ public static class MsysPipeProof {
  static String Hash(String file){using(var stream=File.OpenRead(file))using(var hash=SHA256.Create())return String.Concat(hash.ComputeHash(stream).Select(b=>b.ToString("x2")));}
  static String Probe(String user,String package,Boolean requireSuccess){
   var output=new StringBuilder("[");Int32 count=0;
-  foreach(Boolean local in new[]{false,true})foreach(String variant in new[]{"world","user","package"}){
+  foreach(Boolean local in new[]{false,true})foreach(String variant in new[]{"world","user","package","default"}){
    // The user cell models sec_user_nih: current/saved user (identical in
    // this fixture), Administrators and SYSTEM, with no protected-DACL bit.
    // The package cell grants only that user, SYSTEM and this exact profile.
    String sddl=variant=="world"?"D:(A;;GA;;;WD)":"D:(A;;GA;;;"+user+")(A;;GA;;;SY)"+(variant=="package"?"(A;;GA;;;"+package+")":"(A;;GA;;;BA)");
    IntPtr descriptor=IntPtr.Zero,server=IntPtr.Zero,client=IntPtr.Zero;Int32 serverError=0;Int32? clientError=null;String expanded="null";
-   try{UInt32 size;Require(ConvertStringSecurityDescriptorToSecurityDescriptor(sddl,1,out descriptor,out size),"pipe-descriptor:"+Marshal.GetLastWin32Error());var attributes=new SA{Length=Marshal.SizeOf(typeof(SA)),Descriptor=descriptor,Inherit=0};
+   // Default is a literal NULL SECURITY_ATTRIBUTES pointer: Windows derives
+   // security from the token. It is not an explicit NULL/empty DACL.
+   try{if(variant!="default"){UInt32 size;Require(ConvertStringSecurityDescriptorToSecurityDescriptor(sddl,1,out descriptor,out size),"pipe-descriptor:"+Marshal.GetLastWin32Error());}var attributes=new SA{Length=Marshal.SizeOf(typeof(SA)),Descriptor=descriptor,Inherit=0};
     String suffix="autoprompt-msys-proof-"+Guid.NewGuid().ToString("N");
     String name=@"\\.\pipe\"+(local?@"LOCAL\":"")+suffix;
     // PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE; message pipe,
     // byte read mode, remote clients rejected, one instance, no retry.
-    server=CreateNamedPipeW(name,0x80001,0x0c,1,8192,8192,0,ref attributes);
+    server=variant=="default"?CreateNamedPipeW(name,0x80001,0x0c,1,8192,8192,0,IntPtr.Zero):CreateNamedPipeW(name,0x80001,0x0c,1,8192,8192,0,ref attributes);
     if(!Valid(server))serverError=Marshal.GetLastWin32Error();
     else{
      // MSYS opens its write end with GENERIC_WRITE | FILE_READ_ATTRIBUTES.
      // Opening the sole owned listener does not wait for another process.
-     client=CreateFileW(name,0x40000080,0,ref attributes,3,0,IntPtr.Zero);
+     client=variant=="default"?CreateFileW(name,0x40000080,0,IntPtr.Zero,3,0,IntPtr.Zero):CreateFileW(name,0x40000080,0,ref attributes,3,0,IntPtr.Zero);
      clientError=Valid(client)?0:Marshal.GetLastWin32Error();
      // Query only a connected, wholly owned pair. A denied client leaves
      // this extra observation untouched rather than querying an orphan listener.
-     if(local&&Valid(client))expanded=ProbeExpandedRoot(server,suffix,user,package,variant=="package");
+     if(local&&Valid(client)&&variant!="default")expanded=ProbeExpandedRoot(server,suffix,user,package,variant=="package");
     }
     Require(Valid(server)||serverError!=0,"server-failure-without-error");
     Require(!clientError.HasValue||Valid(client)||clientError.Value!=0,"client-failure-without-error");
-    if(requireSuccess)Require(Valid(server)&&Valid(client),"controller-pipe-control:"+(local?"local":"bare")+":"+variant+":"+serverError+":"+clientError);
+    if(requireSuccess&&variant!="default")Require(Valid(server)&&Valid(client),"controller-pipe-control:"+(local?"local":"bare")+":"+variant+":"+serverError+":"+clientError);
     if(count++>0)output.Append(',');output.Append("{\"namespace\":\"").Append(local?"local":"bare").Append("\",\"descriptor\":\"").Append(variant).Append("\",\"serverError\":").Append(serverError).Append(",\"clientError\":").Append(clientError.HasValue?clientError.Value.ToString(System.Globalization.CultureInfo.InvariantCulture):"null").Append(",\"expanded\":").Append(expanded).Append('}');
    }finally{if(Valid(client))Require(CloseHandle(client),"close-client");if(Valid(server))Require(CloseHandle(server),"close-server");if(descriptor!=IntPtr.Zero)LocalFree(descriptor);}
   }return output.Append(']').ToString();

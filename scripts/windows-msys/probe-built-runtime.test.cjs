@@ -7,6 +7,7 @@ const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const vm = require('node:vm')
+const cp = require('node:child_process')
 const probe = require('./probe-built-runtime.cjs')
 const lock = require('./build-lock.json')
 const helperPath = path.join(__dirname, 'probe-built-runtime.cjs')
@@ -61,7 +62,7 @@ test('built runtime proof refuses oversized and linked inputs and mismatched cap
 // process calls, native ACL setup and PE binding are substituted; the helper's
 // lock/blob/digest/path checks, exclusive copies, manifest and TAP gate execute
 // unchanged. This is not a substitute for the actual Windows Bash smoke test.
-for (const scenario of ['pass', 'stage mismatch', 'pinned source drift', 'resolver fallback',
+for (const scenario of ['pass', 'missing pinned SDK Git', 'stage mismatch', 'pinned source drift', 'resolver fallback',
   'skipped native case', 'failed native case', 'source changed during smoke']) {
   test(`built runtime controller: ${scenario}`, t => {
     const root = temporaryRoot()
@@ -69,8 +70,14 @@ for (const scenario of ['pass', 'stage mismatch', 'pinned source drift', 'resolv
     const sdk = path.join(root, 'sdk'), payload = path.join(sdk, 'issue27-build')
     const bin = path.join(sdk, 'usr', 'bin'), systemRoot = path.join(root, 'Windows')
     const stage = path.join(payload, 'stage', 'usr', 'bin')
-    for (const directory of [bin, stage, systemRoot, path.join(sdk, 'mingw64', 'bin')]) fs.mkdirSync(directory, { recursive: true })
-    fs.writeFileSync(path.join(sdk, 'mingw64', 'bin', 'git.exe'), 'unused process-call placeholder')
+    for (const directory of [bin, stage, systemRoot]) fs.mkdirSync(directory, { recursive: true })
+    if (scenario === 'missing pinned SDK Git') {
+      // An obsolete layout or ambient executable must not hide a missing
+      // expected pinned SDK input.
+      const obsolete = path.join(sdk, 'mingw64', 'bin')
+      fs.mkdirSync(obsolete, { recursive: true })
+      fs.writeFileSync(path.join(obsolete, 'git.exe'), 'must never execute')
+    } else fs.writeFileSync(path.join(bin, 'git.exe'), 'unused pinned SDK process-call placeholder')
     fs.writeFileSync(path.join(payload, 'lock.json'), JSON.stringify(lock))
     const original = { 'bash.exe': Buffer.from('pinned Bash'), 'msys-2.0.dll': Buffer.from('pinned original DLL') }
     const built = Buffer.from('new staged DLL'), foreign = Buffer.from('untrusted mutation')
@@ -91,7 +98,7 @@ for (const scenario of ['pass', 'stage mismatch', 'pinned source drift', 'resolv
       execPath: process.execPath, env: environment, stdout: { write() {} }, stderr: { write() {} } }
     const native = {
       spawnSync(executable, args, options) {
-        if (executable === path.join(sdk, 'mingw64', 'bin', 'git.exe')) {
+        if (executable === path.join(bin, 'git.exe')) {
           if (args.includes('rev-parse')) return { status: 0, stdout: lock.sdk.commit + '\n' }
           assert.ok(args.includes('ls-tree'))
           return { status: 0, stdout: Object.entries(original).map(([name, bytes]) => `100755 blob ${blobDigest(bytes)}\tusr/bin/${name}\0`).join('') }
@@ -133,6 +140,7 @@ for (const scenario of ['pass', 'stage mismatch', 'pinned source drift', 'resolv
     if (scenario === 'pass') main()
     else assert.throws(main, {
       message: new RegExp({
+        'missing pinned SDK Git': 'ENOENT',
         'stage mismatch': 'Staged DLL does not match',
         'pinned source drift': 'SDK working-tree dependency differs',
         'resolver fallback': 'Bash resolver fell back',
@@ -156,3 +164,26 @@ for (const scenario of ['pass', 'stage mismatch', 'pinned source drift', 'resolv
     assert.ok(log.includes(scenario === 'pass' ? 'native Bash smoke passed' : 'Built runtime smoke refused'))
   })
 }
+
+test('built runtime CLI refusal exits nonzero directly and through the workflow PowerShell boundary', { timeout: 90000 }, t => {
+  const root = temporaryRoot()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const missing = path.join(root, 'absent-build-root')
+  const direct = cp.spawnSync(process.execPath, [helperPath, missing], { encoding: 'utf8', timeout: 15000 })
+  assert.ifError(direct.error)
+  assert.equal(direct.status, 1, direct.stdout || direct.stderr)
+  const expected = process.platform !== 'win32' ? 'requires actual Windows' : process.arch !== 'x64' ? 'pinned SDK compiler proof is x64' : 'ENOENT'
+  assert.ok(direct.stderr.includes(expected))
+  const powershell = 'pwsh' // Match the GitHub workflow shell, including on Windows.
+  const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+    '$ErrorActionPreference="Stop";$PSNativeCommandUseErrorActionPreference=$false;& $env:AUTOPROMPT_EXIT_NODE $env:AUTOPROMPT_EXIT_SCRIPT $env:AUTOPROMPT_EXIT_MISSING;$observed=$LASTEXITCODE;Write-Output "probe-exit:$observed";if($observed -ne 0){exit $observed}'], {
+    encoding: 'utf8', timeout: 60000, env: { ...process.env, AUTOPROMPT_EXIT_NODE: process.execPath, AUTOPROMPT_EXIT_SCRIPT: helperPath, AUTOPROMPT_EXIT_MISSING: missing },
+  })
+  if (result.error?.code === 'ENOENT' && process.platform !== 'win32') {
+    t.diagnostic('Direct CLI exit tested; PowerShell boundary unavailable on this host')
+    return
+  }
+  assert.ifError(result.error)
+  assert.equal(result.status, 1, result.stdout || result.stderr)
+  assert.match(result.stdout, /probe-exit:1/)
+})

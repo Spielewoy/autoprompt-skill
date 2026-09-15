@@ -80,6 +80,15 @@ jobs:
         run: |
           node --test tests/source/windows-msys-pipe.test.cjs 2>&1 | Tee-Object -FilePath native-windows-pipe.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Record native Windows Node pipes and process-exit verification
+        if: runner.os == 'Windows'
+        # The same diagnostic remains mandatory in the full platform suite.
+        # Unsupported observations are explicit and do not certify functionality.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test tests/source/windows-appcontainer-node-pipes.test.cjs tests/source/windows-appcontainer-member-image.test.cjs 2>&1 | Tee-Object -FilePath native-windows-node-pipes.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Record isolated Windows capture input diagnostics
         if: runner.os == 'Windows'
         # This exact native case remains mandatory in the full suite below.
@@ -96,6 +105,7 @@ jobs:
           path: native-windows-*.log
           if-no-files-found: error
       - name: Compare isolated Windows PowerShell startup environments
+        id: powershell-startup
         if: runner.os == 'Windows'
         continue-on-error: true
         shell: pwsh
@@ -117,7 +127,7 @@ jobs:
         if: github.ref == 'refs/heads/codex/issue-27-native-platform-support' && matrix.runner.os == 'windows-latest' && matrix.node == '24.x'
         shell: pwsh
         run: |
-          $changed = @(git diff --name-only HEAD^ HEAD -- scripts/windows-msys)
+          $changed = @(git diff --name-only HEAD^ HEAD -- scripts/windows-msys agents/codex/workflow/windows-appcontainer* agents/codex/workflow/windows-filesystem.ps1 tests/source/windows-bash-runtime.test.cjs tests/fixtures/windows-msys/bash-ipc.sh)
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "run=$($changed.Count -gt 0)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
       - name: Compile the isolated MSYS pipe adapter proof
@@ -171,8 +181,8 @@ jobs:
           if-no-files-found: warn
       - name: Packed installer lifecycle
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
-      - name: Require the selected MSYS compiler proof to succeed
-        if: always() && (steps.msys-proof.outcome == 'failure' || steps.msys-smoke.outcome == 'failure')
+      - name: Require native startup and selected MSYS proofs to succeed
+        if: always() && (steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-smoke.outcome == 'failure')
         run: node -e "process.exit(1)"
 
   claude-native:

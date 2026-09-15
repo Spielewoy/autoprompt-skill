@@ -10,6 +10,9 @@
 param([switch]$Request)
 
 $captureClock = [System.Diagnostics.Stopwatch]::StartNew()
+# Windows PowerShell may reconstruct an empty inherited module path on first
+# cmdlet lookup. Pin the inbox path after startup, before any module autoload.
+[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $capturePhases = $env:AUTOPROMPT_CAPTURE_PHASES -ceq '1'

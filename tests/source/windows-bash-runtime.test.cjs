@@ -6,9 +6,25 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
+const cp = require('node:child_process')
 const { importedDlls, bindBashRuntime, windowsBashCandidates } = require('../../agents/codex/workflow/windows-appcontainer-command.js')
 const { parseMsysSharedId } = require('../../agents/codex/workflow/windows-appcontainer.js')
 const msysVersion = 'BEGIN_CYGWIN_VERSION_INFO\n%%% MSYS dll identifier: msys-2.0\n%%% MSYS dll identifier: cygwin1\n%%% MSYS shared data: 5\n%%% MSYS shared id: msys-2.0S5\nEND_CYGWIN_VERSION_INFO'
+const ipcFixture = path.resolve(__dirname, '../fixtures/windows-msys/bash-ipc.sh')
+
+test('Bash IPC fixture executes real pipelines, substitutions, coprocesses and background writes', { skip: process.platform === 'win32' }, t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bash-ipc-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const witness = path.join(root, "space and ' quote")
+  const bash = require('../helpers/resolve-bash.cjs').resolveBash()
+  assert.ok(bash, 'Bash 4.3 or newer is required for the IPC fixture')
+  const result = cp.spawnSync(bash, ['--noprofile', '--norc', ipcFixture, witness], { encoding: 'utf8', timeout: 15000 })
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, '')
+  assert.equal(result.stderr, '')
+  assert.equal(fs.readFileSync(witness, 'utf8'), 'shell-write\n')
+})
 
 test('MSYS namespace identity requires unique production DLL metadata and matching shared ABI', () => {
   const bytes = Buffer.concat([Buffer.alloc(64), Buffer.from(msysVersion), Buffer.alloc(64)])
@@ -156,8 +172,11 @@ test('native Windows Bash copied closure permits scratch writes and denies candi
   for (const directory of [targetPath, scratchPath, controlRoot]) { fs.mkdirSync(directory); ensureWindowsPrivateAcl(directory) }
   const candidate = path.join(targetPath, 'candidate'), secret = path.join(controlRoot, 'secret')
   fs.writeFileSync(candidate, 'preserved'); fs.writeFileSync(secret, 'controller-only')
-  const source = `const fs=require('node:fs'),assert=require('node:assert/strict');fs.writeFileSync(${JSON.stringify(path.join(scratchPath, 'witness'))},'native-node');for(const attempt of [()=>fs.writeFileSync(${JSON.stringify(candidate)},'forbidden'),()=>fs.readFileSync(${JSON.stringify(secret)})])assert.throws(attempt,error=>['EPERM','EACCES'].includes(error.code));process.stdout.write('node-ok')`
-  const command = `printf 'bash-ok:'; node -e "eval(Buffer.from('${Buffer.from(source).toString('base64')}','base64').toString())"`
+  const shellWitness = path.join(scratchPath, 'shell-witness')
+  const source = `const fs=require('node:fs'),assert=require('node:assert/strict');assert.equal(fs.readFileSync(${JSON.stringify(shellWitness)},'utf8'),'shell-write\\n');fs.writeFileSync(${JSON.stringify(path.join(scratchPath, 'witness'))},'native-node');for(const attempt of [()=>fs.writeFileSync(${JSON.stringify(candidate)},'forbidden'),()=>fs.readFileSync(${JSON.stringify(secret)})])assert.throws(attempt,error=>['EPERM','EACCES'].includes(error.code));process.stdout.write('node-ok')`
+  const shellQuote = value => `'${value.replaceAll("'", "'\\''")}'`
+  const command = [`set -- ${shellQuote(shellWitness)}`, fs.readFileSync(ipcFixture, 'utf8'),
+    `printf 'bash-ok:'; node -e "eval(Buffer.from('${Buffer.from(source).toString('base64')}','base64').toString())"`].join('\n')
   const policy = { provider: 'claude', nestedDispatch: false, commandBoundary: true, externalWrites: false, readOnly: true, targetPath, scratchPath, readableRoots: [targetPath, scratchPath], writableRoots: [scratchPath] }
   const result = await boundary.executeTool(policy, 'bash', { command, timeoutMs: 30000 }, { controlRoot })
   assert.equal(result.status, 'completed', JSON.stringify(result)); assert.equal(result.output, 'bash-ok:node-ok')

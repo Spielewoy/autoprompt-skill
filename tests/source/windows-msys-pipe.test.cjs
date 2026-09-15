@@ -57,9 +57,9 @@ test('native Windows pipe diagnostic records namespace and descriptor outcomes u
   assert.deepEqual(Object.keys(proof.child).sort(), ['appContainer', 'cases', 'ntRoots'])
   assert.equal(proof.child.appContainer, true)
   for (const [label, cases] of [['controller', proof.controller], ['child', proof.child.cases]]) {
-    assert.equal(cases.length, 6)
+    assert.equal(cases.length, 8)
     let index = 0
-    for (const namespace of ['bare', 'local']) for (const descriptor of ['world', 'user', 'package']) {
+    for (const namespace of ['bare', 'local']) for (const descriptor of ['world', 'user', 'package', 'default']) {
       const observation = cases[index++]
       assert.deepEqual(Object.keys(observation).sort(), ['clientError', 'descriptor', 'expanded', 'namespace', 'serverError'])
       assert.equal(observation.namespace, namespace)
@@ -67,8 +67,10 @@ test('native Windows pipe diagnostic records namespace and descriptor outcomes u
       assert.ok(Number.isSafeInteger(observation.serverError) && observation.serverError >= 0)
       if (observation.serverError === 0) assert.ok(Number.isSafeInteger(observation.clientError) && observation.clientError >= 0)
       else assert.equal(observation.clientError, null, 'A failed listener must not probe an unrelated client endpoint')
-      if (label === 'controller') assert.deepEqual([observation.serverError, observation.clientError], [0, 0])
-      if (namespace !== 'local' || observation.serverError !== 0 || observation.clientError !== 0) {
+      if (label === 'controller' && descriptor !== 'default') assert.deepEqual([observation.serverError, observation.clientError], [0, 0])
+      if (namespace === 'local' && descriptor === 'package') assert.deepEqual([observation.serverError, observation.clientError], [0, 0],
+        `${label}: the private LOCAL package pipe must create and reopen`)
+      if (namespace !== 'local' || descriptor === 'default' || observation.serverError !== 0 || observation.clientError !== 0) {
         assert.equal(observation.expanded, null)
         continue
       }
@@ -88,6 +90,8 @@ test('native Windows pipe diagnostic records namespace and descriptor outcomes u
         assert.ok(!name.split('\\').some(part => part === '.' || part === '..'))
       }
       assert.notEqual(expanded.query, null)
+      if (descriptor === 'package') assert.equal(succeeded(expanded.query), true,
+        `${label}: the owned private LOCAL pipe name must be queryable`)
       if (!succeeded(expanded.query)) {
         for (const key of ['name', 'parent', 'root', 'server', 'client', 'relativeQuery', 'relativeName', 'flat']) assert.equal(expanded[key], null)
         continue
@@ -100,6 +104,8 @@ test('native Windows pipe diagnostic records namespace and descriptor outcomes u
       else {
         const flat = expanded.flat
         assert.deepEqual(Object.keys(flat).sort(), ['afterClient', 'beforeClient', 'client', 'name', 'query', 'relativeName', 'root', 'server'])
+        for (const key of ['root', 'server', 'client', 'query']) assert.equal(succeeded(flat[key]), true,
+          `${label}: the observed flat NPFS namespace must support ${key}`)
         assert.equal(typeof flat.relativeName, 'string')
         assert.ok(flat.relativeName.length > 0 && flat.relativeName.length <= 512)
         assert.equal(flat.relativeName.startsWith('\\'), false)
@@ -138,6 +144,14 @@ test('native Windows pipe diagnostic records namespace and descriptor outcomes u
             for (const key of ['cancellation', 'initialWait', 'drainWait', 'initialWaitError', 'drainWaitError']) assert.equal(value[key], null)
             assert.equal(value.watchdogExpired, false)
           }
+        }
+        // Native x64/ARM64 observations establish these two distinct states:
+        // the fresh listener is available; its sole connected instance is busy.
+        for (const [key, status] of [['beforeClient', '00000000'], ['afterClient', 'C00000B5']]) {
+          waitObservation(flat[key])
+          assert.equal(flat[key].completion.status, status, `${label}: ${key} must reflect actual pipe availability`)
+          assert.equal(flat[key].watchdogExpired, false)
+          assert.equal(flat[key].cancellation, null)
         }
         assert.notEqual(flat.root, null)
         if (!succeeded(flat.root)) {
@@ -271,4 +285,48 @@ test('native pipe wait lease proves completion before freeing request memory', {
       if (mode === 5) assert.ok(Number.isInteger(value.report.initialWaitError))
     }
   }
+})
+
+test('native pipe default descriptor passes literal null security attributes for both endpoints', { timeout: 90000 }, t => {
+  const powershell = process.platform === 'win32'
+    ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'pwsh'
+  const available = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()'], { encoding: 'utf8', timeout: 15000 })
+  if (available.error?.code === 'ENOENT' && process.platform !== 'win32') { t.skip('PowerShell is unavailable'); return }
+  assert.ifError(available.error)
+  assert.equal(available.status, 0, available.stderr)
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pipe-default-sa-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const original = fs.readFileSync(path.join(__dirname, '../fixtures/windows-msys/pipe-proof.cs'), 'utf8')
+  let source = original.slice(0, original.indexOf(' // Protect the child file')) + `
+ public static int DefaultServers,DefaultClients,ExplicitServers,ExplicitClients,Descriptors;
+ public static string RunDefaultSaProof(){return Probe("S-1-5-21-1","S-1-15-2-1",true);}
+}\n`
+  const replace = (name, signature, body) => {
+    const pattern = new RegExp('^ \\[DllImport\\([^\\n]+\\] static extern ([^\\n]+ ' + name + '\\(' + signature + '\\));$', 'gm')
+    assert.equal([...source.matchAll(pattern)].length, 1, `One exact import must bind ${name} ${signature}`)
+    source = source.replace(pattern, ' static $1 {' + body + '}')
+  }
+  // Copy and compile the actual eight-cell dispatch. Only native boundaries
+  // are replaced; these substitutes distinguish SA-by-reference from NULL SA.
+  replace('CreateNamedPipeW', '[^\\n]+,IntPtr attributes', 'Require(attributes==IntPtr.Zero,"default-server-not-null");DefaultServers++;return new IntPtr(101);')
+  replace('CreateNamedPipeW', '[^\\n]+,ref SA attributes', 'Require(attributes.Descriptor!=IntPtr.Zero,"explicit-server-missing-descriptor");ExplicitServers++;return new IntPtr(101);')
+  replace('CreateFileW', '[^\\n]+,IntPtr attributes,UInt32 disposition,UInt32 flags,IntPtr template', 'Require(attributes==IntPtr.Zero,"default-client-not-null");DefaultClients++;return new IntPtr(102);')
+  replace('CreateFileW', '[^\\n]+,ref SA attributes,UInt32 disposition,UInt32 flags,IntPtr template', 'Require(attributes.Descriptor!=IntPtr.Zero,"explicit-client-missing-descriptor");ExplicitClients++;return new IntPtr(102);')
+  replace('ConvertStringSecurityDescriptorToSecurityDescriptor', '[^\\n]+', 'Descriptors++;descriptor=new IntPtr(103);size=64;return true;')
+  replace('NtQueryObject', '[^\\n]+', 'returned=0;return unchecked((Int32)0xc0000022);')
+  replace('RtlNtStatusToDosError', '[^\\n]+', 'return 5;')
+  replace('LocalFree', '[^\\n]+', 'return IntPtr.Zero;')
+  replace('CloseHandle', '[^\\n]+', 'return true;')
+  const copied = path.join(root, 'default-sa.cs')
+  fs.writeFileSync(copied, source)
+  const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+    '$ErrorActionPreference="Stop";Add-Type -Path $env:AUTOPROMPT_DEFAULT_SA_SOURCE;[MsysPipeProof]::RunDefaultSaProof();@([MsysPipeProof]::DefaultServers,[MsysPipeProof]::DefaultClients,[MsysPipeProof]::ExplicitServers,[MsysPipeProof]::ExplicitClients,[MsysPipeProof]::Descriptors)|ConvertTo-Json -Compress'], {
+    encoding: 'utf8', timeout: 60000, env: { ...process.env, AUTOPROMPT_DEFAULT_SA_SOURCE: copied },
+  })
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const [cases, counts] = result.stdout.trim().split(/\r?\n/).map(line => JSON.parse(line))
+  assert.equal(cases.length, 8)
+  assert.deepEqual(counts, [2, 2, 6, 6, 6], 'Default cells must never construct an explicit descriptor')
+  assert.deepEqual(cases.filter(value => value.descriptor === 'default').map(value => [value.namespace, value.expanded]), [['bare', null], ['local', null]])
 })

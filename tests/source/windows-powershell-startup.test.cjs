@@ -17,6 +17,8 @@ test('native Windows PowerShell startup diagnostic compares isolated module disc
   const powershell = path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
   assert.ok(fs.statSync(powershell).isFile(), 'The diagnostic requires actual Windows PowerShell')
   const source = fs.readFileSync(path.resolve(__dirname, '../../agents/codex/workflow/windows-filesystem.ps1'), 'utf8')
+  const inboxPin = "[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process)"
+  assert.equal(source.split(inboxPin).length, 2, 'The comparison must target the exact production module-path pin')
   const allocationChanges = [
     ['New-Object System.Text.UTF8Encoding($false, $true)', '[System.Text.UTF8Encoding]::new($false, $true)'],
     ['New-Object System.Text.StringBuilder', '[System.Text.StringBuilder]::new()'],
@@ -30,6 +32,7 @@ test('native Windows PowerShell startup diagnostic compares isolated module disc
     { name: 'inbox-module-path', inbox: true },
     { name: 'static-allocations', static: true },
     { name: 'inbox-module-path-cache-disabled', inbox: true, cache: true },
+    { name: 'production', production: true },
   ]
   const phases = ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile', 'compiled', 'dispatch', 'completed']
   const metadataKeys = new Set(['version', 'pshome', 'effective-path', 'first-utility', 'final-effective-path',
@@ -38,7 +41,9 @@ test('native Windows PowerShell startup diagnostic compares isolated module disc
   for (const variant of variants) {
     const directory = path.join(root, variant.name)
     fs.mkdirSync(directory)
-    let helperSource = source
+    // Preserve the old behavior only in owned diagnostic copies. The final
+    // variant must execute the actual unchanged production source and pass.
+    let helperSource = variant.production ? source : source.replace(inboxPin, '')
     if (variant.static) for (const [before, after] of allocationChanges) helperSource = helperSource.replace(before, after)
     const helper = path.join(directory, 'windows-filesystem.ps1')
     fs.writeFileSync(helper, helperSource, { flag: 'wx' })
@@ -102,6 +107,7 @@ Emit-StartupMetadata 'final-effective-path' ([Environment]::GetEnvironmentVariab
   }
   assert.equal(outcomes.length, variants.length)
   for (const outcome of outcomes) {
+    if (outcome.variant === 'production') assert.equal(outcome.error, null, 'The production helper must complete within its unchanged deadline')
     assert.equal(outcome.unexpectedStderr, '', `${outcome.variant}: unexpected stderr`)
     assert.match(outcome.metadata.version || '', /^5\.1\./, `${outcome.variant}: actual Windows PowerShell 5.1 required`)
     assert.equal(outcome.metadata['first-utility'], outcome.variant === 'static-allocations' ? 'Add-Type' : 'New-Object')
@@ -123,6 +129,8 @@ Emit-StartupMetadata 'final-effective-path' ([Environment]::GetEnvironmentVariab
         assert.equal(outcome.metadata[`${command}-module`], 'Microsoft.PowerShell.Utility')
         assert.ok(path.win32.isAbsolute(outcome.metadata[`${command}-assembly`] || ''), `${outcome.variant}: missing actual command assembly origin`)
       }
+      if (outcome.variant === 'production') assert.equal(outcome.metadata['final-effective-path'].toLowerCase(),
+        path.win32.join(outcome.metadata.pshome, 'Modules').toLowerCase(), 'Production lookup must stay within the selected PowerShell inbox modules')
     }
   }
 })

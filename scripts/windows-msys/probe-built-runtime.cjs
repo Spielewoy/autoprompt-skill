@@ -90,7 +90,10 @@ function main(workArgument) {
     assert.equal(lock.sdk.commit, 'e3cc14afd549778c2f2d3bcc6e89307f40f5c2c1')
     assert.deepEqual(JSON.parse(readBounded(path.join(payload, 'lock.json'), 1024 * 1024)), lock, 'Compiler lock differs from the reviewed lock')
     const systemRoot = physical(process.env.SystemRoot, true)
-    const sdkGit = physical(path.join(sdk, 'mingw64', 'bin', 'git.exe'))
+    // The pinned SDK stores its MSYS Git in usr/bin (and native Git in
+    // ucrt64/bin); it has no mingw64 tree. Select this exact pinned layout,
+    // never a PATH executable or an unrelated installed Git fallback.
+    const sdkGit = physical(path.join(sdk, 'usr', 'bin', 'git.exe'))
     const git = args => {
       const result = cp.spawnSync(sdkGit, ['--no-pager', '--no-optional-locks', '-C', sdk, ...args], {
         encoding: 'utf8', timeout: 15000, maxBuffer: 128 * 1024, windowsHide: true, shell: false,
