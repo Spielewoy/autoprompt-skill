@@ -672,15 +672,16 @@ index de53dbf..1f73085 100644
    PROCESS_INFORMATION pi;
    HANDLE hello, goodbye;
 -  HANDLE hr, hw;
-+  HANDLE hr = NULL, hw = NULL;
++  HANDLE hr, hw; /* Initialize below: earlier goto skips this scope. */
    HPCON hpcon;
  
    do
-@@ -3761,7 +3810,8 @@ fhandler_pty_slave::setup_pseudoconsole ()
+@@ -3761,7 +3810,9 @@ fhandler_pty_slave::setup_pseudoconsole ()
  
        hello = CreateEvent (&sec_none, true, false, NULL);
        goodbye = CreateEvent (&sec_none, true, false, NULL);
 -      CreatePipe (&hr, &hw, &sec_none, 0);
++      hr = hw = NULL;
 +      if (!appcontainer_create_pipe (&hr, &hw, &sec_none, 0))
 +	goto cleanup_event_and_pipes;
  
