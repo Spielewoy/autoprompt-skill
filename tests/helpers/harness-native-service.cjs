@@ -41,7 +41,14 @@ async function modelService(provider, tool, options = {}) {
         await new Promise(resolve => setTimeout(resolve, options.delayMessagesMs))
       }
       const advertised = (value.tools || []).some(item => (item.name || item.function?.name) === tool.name)
-      const first = !options.noTool && !toolRequested && (advertised || options.forceFirstTool === true)
+      // Concurrent Claude conversations must each receive their own command.
+      // Their returned assistant history, rather than a shared endpoint flag,
+      // distinguishes the initial request from its tool-result continuation.
+      const requestedInConversation = provider === 'claude' && options.toolPerConversation === true
+        ? Array.isArray(value.messages) && value.messages.some(message => message?.role === 'assistant' &&
+          Array.isArray(message.content) && message.content.some(block => block?.type === 'tool_use' && block.id === 'fixture-native-read' && block.name === tool.name))
+        : toolRequested
+      const first = !options.noTool && !requestedInConversation && (advertised || options.forceFirstTool === true)
       if (first) toolRequested = true
       const structuredTool = (value.tools || []).find(item => {
         const name = item.name || item.function?.name

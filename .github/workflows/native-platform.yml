@@ -71,6 +71,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Record native Windows pipe compatibility before the full suite
         if: runner.os == 'Windows'
+        # This early copy supplies prompt diagnostics. The identical test is
+        # mandatory in the full suite below and still fails the job there.
+        continue-on-error: true
         run: node --test tests/source/windows-msys-pipe.test.cjs
       - name: Run platform tests and reject skips of this host's native cases
         run: node tests/helpers/native-platform-ci.cjs platform

@@ -174,3 +174,45 @@ test('native tool ceilings apply across providers and fresh callbacks wait for a
     assert.equal(seen.at(-1).attemptedCount, 2)
   }
 })
+
+test('Claude model fixture gives concurrent conversations their own tool call and does not repeat completed calls', async t => {
+  const tool = { name: 'Bash', args: { command: 'printf fixture-native-witness' } }
+  const service = await modelService('claude', tool, { toolPerConversation: true })
+  t.after(() => service.close())
+  const invoke = async messages => {
+    const response = await fetch(service.url + '/v1/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(5000),
+      body: JSON.stringify({ model: 'fixture-only', stream: true, messages,
+        tools: [{ name: tool.name, input_schema: { type: 'object', properties: { command: { type: 'string' } } } }] }),
+    })
+    assert.equal(response.status, 200)
+    return (await response.text()).split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)))
+  }
+  const initial = [
+    [{ role: 'user', content: [{ type: 'text', text: 'Conversation A' }] }],
+    [{ role: 'user', content: [{ type: 'text', text: 'Conversation B' },
+      // A user block cannot be evidence that this fixture already requested a tool.
+      { type: 'tool_use', id: 'fixture-native-read', name: tool.name, input: tool.args }] }],
+  ]
+  const starts = await Promise.all(initial.map(invoke))
+  for (const events of starts) {
+    const blocks = events.filter(event => event.type === 'content_block_start').map(event => event.content_block)
+    assert.deepEqual(blocks, [{ type: 'tool_use', id: 'fixture-native-read', name: tool.name, input: {} }])
+    assert.deepEqual(events.find(event => event.type === 'content_block_delta').delta,
+      { type: 'input_json_delta', partial_json: JSON.stringify(tool.args) })
+    assert.equal(events.find(event => event.type === 'message_delta').delta.stop_reason, 'tool_use')
+  }
+  const completed = initial.map((messages, index) => [...messages,
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'fixture-native-read', name: tool.name, input: tool.args }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'fixture-native-read', content: `native-witness-${index}` }] },
+  ])
+  const finishes = await Promise.all(completed.map(invoke))
+  for (const events of finishes) {
+    assert.equal(events.some(event => event.content_block?.type === 'tool_use'), false)
+    assert.equal(events.find(event => event.type === 'message_delta').delta.stop_reason, 'end_turn')
+    assert.deepEqual(events.find(event => event.type === 'content_block_delta').delta,
+      { type: 'text_delta', text: '{"ok":true}' })
+  }
+  assert.equal(service.requests.length, 4)
+  assert.deepEqual(service.errors, [])
+})

@@ -296,7 +296,7 @@ test('claude closed native capability: exact controller tool receipt binds the r
 })
 
 test('claude closed native capability: concurrently owned siblings receive separate native identities', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate) })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate), serviceOptions: { toolPerConversation: true } })
   let peak = 0
   const monitor = setInterval(() => { peak = Math.max(peak, f.owner.ownershipIdentities().length) }, 5)
   let results
@@ -310,6 +310,7 @@ test('claude closed native capability: concurrently owned siblings receive separ
     }))
   } finally { clearInterval(monitor) }
   assert.ok(results.every(result => result.ok === true))
+  for (const result of results) assert.equal(result.toolBoundaryEvidence.receiptHashes.length, 1, 'Each sibling must execute its own native command')
   assert.equal(new Set(results.map(result => result.contextId)).size, 2)
   assert.ok(peak >= 2, `sibling CLI processes did not overlap; peak=${peak}`)
   assert.deepEqual(f.owner.ownershipIdentities(), [])
