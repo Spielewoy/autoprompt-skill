@@ -1,6 +1,11 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
+const os = require('node:os')
+const cp = require('node:child_process')
+const crypto = require('node:crypto')
 const { createWindowsAppContainerResources, resourceRoots, validatePlan } = require('../../agents/codex/workflow/windows-appcontainer-resources.js')
 const controlRoot = 'C:\\controller'
 const policy = { provider: 'claude', schemaVersion: 1, readOnly: false, targetPath: 'C:\\clone', scratchPath: 'C:\\scratch', readableRoots: ['C:\\clone', 'C:\\scratch'], writableRoots: ['C:\\clone', 'C:\\scratch'] }
@@ -100,4 +105,40 @@ test('completion receipt permits exact recovery after private scratch removal wi
   const receipt = JSON.parse(h.records.get(lease.recovery.journalPath + '.restored')); receipt.profileSid += '-9'
   h.records.set(lease.recovery.journalPath + '.restored', Buffer.from(JSON.stringify(receipt)))
   await assert.rejects(h.api.recoverWindowsAppContainerResources({ controlRoot, ...lease.recovery, verifyDrainEvidence: h.verifyDrainEvidence, evidence }), { code: 'WINDOWS_RESOURCE_JOURNAL_MISMATCH' })
+})
+
+test('Windows resource ancestry tolerates sibling writes while refusing captured mutations and ancestor replacement', { skip: process.platform !== 'win32' }, t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'windows-resource-stable-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const workflow = path.resolve(__dirname, '../../agents/codex/workflow')
+  const script = path.join(root, 'windows-appcontainer-resources.ps1')
+  fs.copyFileSync(path.join(workflow, 'windows-appcontainer-resources.ps1'), script)
+  const source = fs.readFileSync(path.join(workflow, 'windows-appcontainer-resources-native.cs'), 'utf8')
+  const marker = '  static void Stable(Forest forest) {'
+  assert.equal(source.includes(marker), true)
+  const injected = source.replace(marker, marker + `
+    string mode=Environment.GetEnvironmentVariable("AUTOPROMPT_STABLE_TEST_MODE");
+    string target=forest.roots[0].path; string parent=Directory.GetParent(target).FullName;
+    System.Threading.Thread.Sleep(20);
+    if(mode=="sibling")File.WriteAllText(Path.Combine(parent,"unrelated.tmp"),"sibling");
+    if(mode=="resource")File.WriteAllText(Path.Combine(target,"changed.tmp"),"mutation");
+    if(mode=="ancestor"){Directory.Move(parent,parent+"-moved");Directory.CreateDirectory(parent);Directory.CreateDirectory(target);}
+`)
+  fs.writeFileSync(path.join(root, 'windows-appcontainer-resources-native.cs'), injected)
+  const hash = crypto.createHash('sha256').update(injected).digest('hex')
+  const powershell = path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toLowerCase() !== 'psmodulepath'))
+  for (const mode of ['sibling', 'resource', 'ancestor']) {
+    const target = path.join(root, mode, 'target'); fs.mkdirSync(target, { recursive: true })
+    const request = { schemaVersion: 1, operation: 'plan', profileName: 'Autoprompt_' + crypto.randomBytes(16).toString('hex'),
+      roots: [{ path: target, kind: 'directory', writable: false }] }
+    const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-NativeSha256', hash, '-Request'], {
+      input: JSON.stringify(request), encoding: 'utf8', timeout: 120000,
+      env: { ...environment, AUTOPROMPT_STABLE_TEST_MODE: mode },
+    })
+    assert.ifError(result.error); assert.equal(result.status, 0, result.stderr); assert.equal(result.stderr, '')
+    const wire = JSON.parse(result.stdout)
+    if (mode === 'sibling') { assert.equal(wire.status, 'PLANNED', result.stdout); assert.equal(wire.plan.entries.length, 1) }
+    else { assert.equal(wire.status, 'REFUSED', result.stdout); assert.equal(wire.code, 'PREIMAGE_UNSAFE', result.stdout) }
+  }
 })

@@ -210,6 +210,7 @@ function ensureWindowsDefaultTokenOwner() {
   try {
     result = spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
       encoding: 'utf8', windowsHide: true, shell: false, timeout: timeoutMs, maxBuffer: 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
       cwd: path.win32.dirname(powershell),
       env: {
         SystemRoot: systemRoot,
@@ -228,10 +229,13 @@ function ensureWindowsDefaultTokenOwner() {
     fs.rmSync(temporary, { recursive: true, force: true })
   }
   if (result.error || result.signal || result.status !== 0 || result.stderr) {
-    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Cannot establish the Windows token user as the default owner for new run-record objects', {
+    const helperPhase = String(result.stdout || '').includes('TOKEN_OWNER_APPLYING') ? 'applying'
+      : String(result.stdout || '').includes('TOKEN_OWNER_COMPILING') ? 'compiling' : 'startup'
+    const cause = result.error && typeof result.error.code === 'string' && /^[A-Z0-9_]{1,40}$/.test(result.error.code)
+      ? result.error.code : `status ${result.status}`
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', `Cannot establish the Windows token user as the default owner for new run-record objects (${helperPhase}: ${cause})`, {
       stage: 'windows-default-token-owner',
-      helperPhase: String(result.stdout || '').includes('TOKEN_OWNER_APPLYING') ? 'applying'
-        : String(result.stdout || '').includes('TOKEN_OWNER_COMPILING') ? 'compiling' : 'startup',
+      helperPhase,
       status: result.status,
       cause: result.error && result.error.code,
       signal: result.signal,
@@ -246,40 +250,74 @@ function ensureWindowsDefaultTokenOwner() {
 function ensureWindowsPrivateAcl(target) {
   if (process.platform !== 'win32') return { supported: true, mechanism: 'posix-mode' }
   ensureWindowsDefaultTokenOwner()
-  // Environment account names need not identify the process token. Use the
-  // token's SID for both grants and ownership, including elevated sessions
-  // whose newly created objects otherwise belong to Administrators.
-  const identity = spawnSync('whoami.exe', ['/user', '/fo', 'csv', '/nh'], {
-    encoding: 'utf8', windowsHide: true, timeout: 15000,
-  })
-  const row = identity.status === 0 && String(identity.stdout || '').trim().match(/^"(?:[^"\r\n]|"")+","(S-1-(?:\d+-)+\d+)"$/i)
-  if (!row) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token identity is unavailable for a private run-record DACL')
-  const account = `*${row[1]}`
-  const stat = fs.lstatSync(target)
-  if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) {
+  const absolute = path.resolve(target)
+  const before = fs.lstatSync(absolute)
+  if (before.isSymbolicLink() || (!before.isDirectory() && !before.isFile())) {
     throw new RunRecordError('PRIVACY_UNSUPPORTED', 'A private Windows DACL requires a physical file or directory')
   }
-  // Inheritance rights apply to directories only. Applying them to a regular
-  // file can remove its usable grant before the subsequent owner update.
-  const rights = stat.isDirectory() ? '(OI)(CI)F' : 'F'
-  const result = spawnSync('icacls.exe', [target, '/inheritance:r', '/grant:r', `${account}:${rights}`, '/grant:r', `*S-1-5-18:${rights}`], {
-    encoding: 'utf8',
-    windowsHide: true, timeout: 30000,
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR
+  if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows system root is unavailable for the private ACL helper')
+  }
+  const powershell = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  // Callers select or claim controller-owned storage before establishment.
+  // A fresh descriptor replaces explicit foreign grants too; /grant:r would
+  // retain those grants even after inheritance was disabled. This does not
+  // change which paths those callers authorize for permission updates.
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    '$p=$env:AUTOPROMPT_PRIVATE_ACL_PATH',
+    "$directory=$env:AUTOPROMPT_PRIVATE_ACL_DIRECTORY -eq '1'",
+    '$attributes=[System.IO.File]::GetAttributes($p)',
+    "if(($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Private ACL target is redirected'}",
+    "if((($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) -ne $directory){throw 'Private ACL target type changed'}",
+    '$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent()',
+    '$user=$identity.User',
+    "$system=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')",
+    '$inheritance=[System.Security.AccessControl.InheritanceFlags]::None',
+    'if($directory){$acl=[System.Security.AccessControl.DirectorySecurity]::new();$inheritance=[System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit}else{$acl=[System.Security.AccessControl.FileSecurity]::new()}',
+    '$acl.SetAccessRuleProtection($true,$false)',
+    '$acl.SetOwner($user)',
+    'foreach($sid in @($user,$system)){$rule=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,[System.Security.AccessControl.FileSystemRights]::FullControl,$inheritance,[System.Security.AccessControl.PropagationFlags]::None,[System.Security.AccessControl.AccessControlType]::Allow);$acl.SetAccessRule($rule)}',
+    'if($directory){[System.IO.Directory]::SetAccessControl($p,$acl);$verified=[System.IO.Directory]::GetAccessControl($p)}else{[System.IO.File]::SetAccessControl($p,$acl);$verified=[System.IO.File]::GetAccessControl($p)}',
+    '$attributes=[System.IO.File]::GetAttributes($p)',
+    "if(($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or ((($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) -ne $directory)){throw 'Private ACL target changed'}",
+    '$ownerSid=$verified.GetOwner([System.Security.Principal.SecurityIdentifier]).Value',
+    '$rules=@($verified.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | ForEach-Object {[pscustomobject]@{identity=$_.IdentityReference.Value;sid=$_.IdentityReference.Value;type=$_.AccessControlType.ToString();inherited=$_.IsInherited;rights=[int]$_.FileSystemRights;inheritanceFlags=[int]$_.InheritanceFlags;propagationFlags=[int]$_.PropagationFlags}})',
+    '$item=[pscustomobject]@{path=$p;owner=$ownerSid;ownerSid=$ownerSid;protected=$verified.AreAccessRulesProtected;rules=$rules}',
+    '[pscustomobject]@{currentName=$identity.Name;currentSid=$user.Value;items=@($item)}|ConvertTo-Json -Compress -Depth 7',
+  ].join(';')
+  const result = spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+    encoding: 'utf8', windowsHide: true, shell: false, timeout: 60000, maxBuffer: 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'], cwd: path.win32.dirname(powershell),
+    env: {
+      SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
+      PATH: path.win32.join(systemRoot, 'System32'),
+      AUTOPROMPT_PRIVATE_ACL_PATH: absolute,
+      AUTOPROMPT_PRIVATE_ACL_DIRECTORY: before.isDirectory() ? '1' : '0',
+    },
   })
-  if (result.status !== 0) {
-    throw new RunRecordError('PRIVACY_UNSUPPORTED', `Cannot establish a private Windows DACL for run-record root: ${target}`, {
-      status: result.status,
+  if (result.error || result.signal || result.status !== 0 || result.stderr) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', `Cannot establish an exact private Windows DACL: ${absolute}`, {
+      status: result.status, signal: result.signal, cause: result.error && result.error.code,
       stderr: result.stderr && result.stderr.trim(),
     })
   }
-  const owner = spawnSync('icacls.exe', [target, '/setowner', account], {
-    encoding: 'utf8', windowsHide: true, timeout: 30000,
-  })
-  if (owner.status !== 0) {
-    throw new RunRecordError('PRIVACY_UNSUPPORTED', `Cannot establish private Windows ownership for run-record root: ${target}`, {
-      status: owner.status,
-      stderr: owner.stderr && owner.stderr.trim(),
-    })
+  const after = fs.lstatSync(absolute)
+  if (after.isSymbolicLink() || before.isDirectory() !== after.isDirectory() || !sameIdentity(statIdentity(before), statIdentity(after))) {
+    throw new RunRecordError('PRIVACY_VIOLATION', `Private Windows ACL target changed during establishment: ${absolute}`)
+  }
+  let snapshot
+  try { snapshot = JSON.parse(result.stdout) } catch { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Private Windows ACL helper returned invalid JSON') }
+  validateWindowsAclSnapshot(snapshot)
+  const item = snapshot.items[0]
+  const expectedSids = new Set([snapshot.currentSid, 'S-1-5-18'])
+  if (snapshot.items.length !== 1 || item.path !== absolute || item.ownerSid !== snapshot.currentSid
+      || !Array.isArray(item.rules) || item.rules.length !== expectedSids.size
+      || item.rules.some(rule => !expectedSids.delete(rule.sid) || rule.type !== 'Allow' || rule.inherited
+        || rule.rights !== 2032127 || rule.inheritanceFlags !== (before.isDirectory() ? 3 : 0) || rule.propagationFlags !== 0)
+      || expectedSids.size !== 0) {
+    throw new RunRecordError('PRIVACY_VIOLATION', `Private Windows ACL helper did not establish the exact owner and grants: ${absolute}`)
   }
   return { supported: true, mechanism: 'windows-dacl' }
 }
@@ -380,7 +418,7 @@ function auditPrivatePermissions(runPath, options = {}) {
     '[pscustomobject]@{currentName=$identity.Name;currentSid=$identity.User.Value;items=$items}|ConvertTo-Json -Compress -Depth 7',
   ].join(';')
   const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-    encoding: 'utf8', windowsHide: true,
+    encoding: 'utf8', windowsHide: true, timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'],
     env: windowsPowerShellEnvironment({
       AUTOPROMPT_ACL_AUDIT_PATHS: JSON.stringify([absolute, ...additional]),
       AUTOPROMPT_ACL_AUDIT_RECURSE: recurse ? '1' : '0',

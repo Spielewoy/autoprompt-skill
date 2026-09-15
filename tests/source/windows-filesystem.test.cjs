@@ -422,7 +422,8 @@ test('Windows terminal publication is exclusive, byte-bound, and cleans only its
   const makeResidue = pid => {
     const name = `.terminal.json.${pid}.0123456789abcdef.create`, target = path.join(root, name)
     fs.writeFileSync(target, 'partial publication')
-    const owner = cp.spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference = "Stop"; $acl = Get-Acl -LiteralPath $env:AUTOPROMPT_RESIDUE; $acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User); Set-Acl -LiteralPath $env:AUTOPROMPT_RESIDUE -AclObject $acl'], { encoding: 'utf8', timeout: 60000, env: { ...process.env, AUTOPROMPT_RESIDUE: target } })
+    const environment = Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toLowerCase() !== 'psmodulepath'))
+    const owner = cp.spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference = "Stop"; $acl = Get-Acl -LiteralPath $env:AUTOPROMPT_RESIDUE; $acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User); Set-Acl -LiteralPath $env:AUTOPROMPT_RESIDUE -AclObject $acl'], { encoding: 'utf8', timeout: 60000, env: { ...environment, AUTOPROMPT_RESIDUE: target } })
     assert.ifError(owner.error)
     assert.equal(owner.status, 0, owner.stderr)
     return name

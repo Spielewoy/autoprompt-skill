@@ -12,6 +12,25 @@ class WindowsAppContainerError extends Error {
 function fail(code, message) { throw new WindowsAppContainerError(code, message) }
 function exact(value, keys) { return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key)) }
 function digest(bytes) { return crypto.createHash('sha256').update(bytes).digest('hex') }
+// Git-for-Windows MSYS scripts/mkvers.sh emits this shared ABI alongside the
+// DLL version. Debug suffixes and ambiguous blocks cannot name a private lease.
+function parseMsysSharedId(bytes) {
+  const invalid = () => fail('WINDOWS_MSYS_RUNTIME_INVALID', 'MSYS runtime requires one bounded production version-info block')
+  if (!Buffer.isBuffer(bytes) || bytes.length < 1 || bytes.length > 32 * 1024 * 1024) invalid()
+  const begin = Buffer.from('BEGIN_CYGWIN_VERSION_INFO\n'), end = Buffer.from('END_CYGWIN_VERSION_INFO')
+  const first = bytes.indexOf(begin), last = bytes.indexOf(end)
+  if (first < 0 || last < first + begin.length || last - first > 8192 || bytes.indexOf(begin, first + 1) !== -1 || bytes.indexOf(end, last + 1) !== -1) invalid()
+  const block = bytes.subarray(first + begin.length, last)
+  if (block.some(byte => byte !== 10 && (byte < 32 || byte > 126))) invalid()
+  const lines = block.toString('ascii').split('\n')
+  if (lines.pop() !== '' || lines.some(line => !line.startsWith('%%% MSYS '))) invalid()
+  const shared = lines.filter(line => line.startsWith('%%% MSYS shared id: '))
+  const data = lines.filter(line => line.startsWith('%%% MSYS shared data: '))
+  if (shared.length !== 1 || data.length !== 1) invalid()
+  const match = /^%%% MSYS shared id: (msys-2\.0S([1-9][0-9]{0,8}))$/.exec(shared[0])
+  if (!match || data[0] !== `%%% MSYS shared data: ${match[2]}`) invalid()
+  return match[1]
+}
 function boundFile(file, maxBytes, singleLink = true) {
   if (typeof file !== 'string' || !path.isAbsolute(file) || file.includes('\0')) fail('WINDOWS_RUNTIME_INVALID', 'Runtime paths must be absolute')
   const canonical = fs.realpathSync.native(file)
@@ -33,12 +52,21 @@ function boundFile(file, maxBytes, singleLink = true) {
 }
 function validateLaunch(input) {
   const keys = ['profileName', 'profileSid', 'executable', 'executableSha256', 'arguments', 'cwd', 'environment', 'timeoutMs', 'outputLimit', 'cancellationPath']
+  if (input && Object.hasOwn(input, 'msysRuntime')) keys.push('msysRuntime')
   if (!exact(input, keys) || !/^Autoprompt_[a-f0-9]{32}$/.test(input.profileName) || !/^S-1-15-2-(?:[0-9]+-){6}[0-9]+$/.test(input.profileSid) ||
       !/^[a-f0-9]{64}$/.test(input.executableSha256) || !Array.isArray(input.arguments) || input.arguments.length > 256 ||
       input.arguments.some(value => typeof value !== 'string' || value.includes('\0')) ||
       !Array.isArray(input.environment) || input.environment.length > 64 || input.environment.some(value => typeof value !== 'string' || !/^[^=\0]+=/.test(value) || value.includes('\0')) ||
       !Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > 300000 || !Number.isSafeInteger(input.outputLimit) || input.outputLimit < 1 || input.outputLimit > MAX_OUTPUT ||
       ['executable', 'cwd', 'cancellationPath'].some(key => typeof input[key] !== 'string' || !path.win32.isAbsolute(input[key]) || input[key].includes('\0'))) fail('WINDOWS_LAUNCH_INVALID', 'Invalid controller AppContainer launch request')
+  if (Object.hasOwn(input, 'msysRuntime')) {
+    const runtime = input.msysRuntime
+    if (!exact(runtime, ['dllPath', 'dllSha256', 'sharedId']) || typeof runtime.dllPath !== 'string' || runtime.dllPath.includes('\0') ||
+        !path.win32.isAbsolute(runtime.dllPath) || path.win32.basename(runtime.dllPath).toLowerCase() !== 'msys-2.0.dll' ||
+        path.win32.basename(input.executable).toLowerCase() !== 'bash.exe' ||
+        path.win32.dirname(runtime.dllPath).toLowerCase() !== path.win32.dirname(input.executable).toLowerCase() ||
+        !/^[a-f0-9]{64}$/.test(runtime.dllSha256) || !/^msys-2\.0S[1-9][0-9]{0,8}$/.test(runtime.sharedId)) fail('WINDOWS_LAUNCH_INVALID', 'Invalid bound MSYS runtime descriptor')
+  }
   if (Buffer.byteLength(JSON.stringify(input)) > 120000) fail('WINDOWS_LAUNCH_INVALID', 'AppContainer launch exceeds its request bound')
   return { schemaVersion: 1, ...input }
 }
@@ -61,6 +89,14 @@ function parseResult(text, expected) {
   if (stdout.length + stderr.length > expected.outputLimit) fail('WINDOWS_LAUNCH_PROTOCOL', 'AppContainer output exceeds the admitted limit')
   return Object.freeze({ rootPid: result.RootPid, launcherSessionId: result.LauncherSessionId, exitCode: result.ExitCode, observedJobMembers: result.ObservedJobMembers, profileSid: result.AppContainerSid, drained: true,
     timedOut: result.TimedOut, truncated: result.OutputLimit, cancelled: result.Cancelled, stdout, stderr })
+}
+function startHelperWatchdog(timeoutMs, cancel, kill) {
+  // The native helper starts its exact worker deadline after suspended-process
+  // setup. PowerShell/Add-Type compilation precedes that clock and must not
+  // create a cancellation marker before the worker can first be resumed.
+  const timer = setTimeout(cancel, 120000 + timeoutMs)
+  const hardTimer = setTimeout(kill, 135000 + timeoutMs)
+  return () => { clearTimeout(timer); clearTimeout(hardTimer) }
 }
 // This primitive does not grant resources or advertise a sandbox capability.
 // Its caller must retain the controller resource lease through confirmed drain.
@@ -85,6 +121,10 @@ function createWindowsAppContainerLauncher(options = {}) {
       if (fs.existsSync(request.cancellationPath)) fail('WINDOWS_LAUNCH_INVALID', 'Cancellation marker must be fresh')
       const executable = boundFile(request.executable, 512 * 1024 * 1024, false)
       if (executable.sha256 !== request.executableSha256) fail('WINDOWS_RUNTIME_MISMATCH', 'Assigned executable changed')
+      if (request.msysRuntime) {
+        const runtime = boundFile(request.msysRuntime.dllPath, 32 * 1024 * 1024)
+        if (runtime.sha256 !== request.msysRuntime.dllSha256) fail('WINDOWS_RUNTIME_MISMATCH', 'Assigned MSYS runtime changed')
+      }
       return new Promise((resolve, reject) => {
         startedLeases.add(options.leaseId)
         const child = cp.spawn(powershell.path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helper.path, '-NativeSha256', native.sha256, '-Request'], {
@@ -93,10 +133,9 @@ function createWindowsAppContainerLauncher(options = {}) {
         })
         const output = [], errors = []; let size = 0, settled = false, overLimit = false
         const cancel = () => { try { fs.writeFileSync(request.cancellationPath, 'cancel\n', { flag: 'wx', mode: 0o600 }) } catch (error) { if (error.code !== 'EEXIST') overLimit = true } }
-        const timer = setTimeout(cancel, request.timeoutMs + 10000)
-        const hardTimer = setTimeout(() => { overLimit = true; child.kill() }, request.timeoutMs + 25000)
+        const stopWatchdog = startHelperWatchdog(request.timeoutMs, cancel, () => { overLimit = true; child.kill() })
         options.signal?.addEventListener('abort', cancel, { once: true }); if (options.signal?.aborted) cancel()
-        const finish = () => { settled = true; clearTimeout(timer); clearTimeout(hardTimer); options.signal?.removeEventListener('abort', cancel) }
+        const finish = () => { settled = true; stopWatchdog(); options.signal?.removeEventListener('abort', cancel) }
         const collect = list => bytes => { size += bytes.length; if (size > 3 * MAX_OUTPUT) { overLimit = true; cancel(); return } list.push(bytes) }
         child.stdout.on('data', collect(output)); child.stderr.on('data', collect(errors))
         child.stdin.on('error', () => {})
@@ -117,4 +156,4 @@ function createWindowsAppContainerLauncher(options = {}) {
     },
   })
 }
-module.exports = { WindowsAppContainerError, validateLaunch, parseResult, createWindowsAppContainerLauncher }
+module.exports = { WindowsAppContainerError, validateLaunch, parseResult, parseMsysSharedId, createWindowsAppContainerLauncher, startHelperWatchdog }

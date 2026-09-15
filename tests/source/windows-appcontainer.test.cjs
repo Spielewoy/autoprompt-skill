@@ -14,6 +14,17 @@ test('AppContainer launch requires bounded controller identity and explicit exec
   assert.equal(validateLaunch(launch()).schemaVersion, 1)
   for (const value of [{ ...launch(), profileName: 'arbitrary' }, { ...launch(), executableSha256: '' }, { ...launch(), timeoutMs: 300001 }, { ...launch(), outputLimit: 1048577 }, { ...launch(), arguments: ['x\0y'] }, { ...launch(), callerHandles: [] }]) assert.throws(() => validateLaunch(value), { code: 'WINDOWS_LAUNCH_INVALID' })
 })
+test('AppContainer MSYS request binds only its colocated production DLL and rejects caller namespace names', () => {
+  const msysRuntime = { dllPath: 'C:\\runtime\\msys-2.0.dll', dllSha256: 'c'.repeat(64), sharedId: 'msys-2.0S5' }
+  const input = { ...launch(), executable: 'C:\\runtime\\bash.exe', msysRuntime }
+  assert.deepEqual(validateLaunch(input).msysRuntime, msysRuntime)
+  for (const runtime of [null, {}, { ...msysRuntime, namespace: '\\BaseNamedObjects\\arbitrary' },
+    { ...msysRuntime, dllPath: 'C:\\elsewhere\\msys-2.0.dll' }, { ...msysRuntime, dllPath: 'C:\\runtime\\other.dll' },
+    { ...msysRuntime, dllPath: 'msys-2.0.dll' }, { ...msysRuntime, dllSha256: '' },
+    { ...msysRuntime, sharedId: 'msys-2.0S5-debug' }, { ...msysRuntime, sharedId: '../outside' },
+  ]) assert.throws(() => validateLaunch({ ...input, msysRuntime: runtime }), { code: 'WINDOWS_LAUNCH_INVALID' })
+  assert.throws(() => validateLaunch({ ...launch(), msysRuntime }), { code: 'WINDOWS_LAUNCH_INVALID' })
+})
 test('AppContainer result cannot claim completion without exact SID, image and process drain', () => {
   const parsed = parseResult(JSON.stringify(result()), launch())
   assert.equal(parsed.drained, true); assert.equal(parsed.stdout.toString(), 'done')
@@ -41,17 +52,34 @@ test('AppContainer refusal preserves bounded native diagnostics and rejects uncl
   }
 })
 
-function windowsModule(file, replacements = {}, directory) {
+function windowsModule(file, replacements = {}, directory, globals = {}) {
   const filename = path.resolve(__dirname, '../../agents/codex/workflow', file)
   const localRequire = createRequire(filename), module = { exports: {} }
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), {
-    module, exports: module.exports, __dirname: directory || path.dirname(filename), Buffer,
+    module, exports: module.exports, __dirname: directory || path.dirname(filename), Buffer, ...globals,
     process: { platform: 'win32', pid: process.pid, execPath: process.execPath,
       env: { SystemRoot: 'C:\\Windows', NODE_OPTIONS: '--require must-not-inherit', OPENAI_API_KEY: 'must-not-inherit' } },
     require: name => Object.hasOwn(replacements, name) ? replacements[name] : localRequire(name),
   }, { filename })
   return module.exports
 }
+
+test('Windows helper watchdog allows bounded cold setup without changing the native worker deadline', () => {
+  const timers = new Map(); let tick = 0, next = 0, cancelled = false, killed = false
+  const module = windowsModule('windows-appcontainer.js', {}, undefined, {
+    setTimeout(fn, delay) { const id = ++next; timers.set(id, { fn, deadline: tick + delay }); return id },
+    clearTimeout(id) { timers.delete(id) },
+  })
+  const request = module.validateLaunch({ ...launch(), timeoutMs: 1000 })
+  const finish = module.startHelperWatchdog(request.timeoutMs, () => { cancelled = true }, () => { killed = true })
+  const advance = now => { tick = now; for (const [id, timer] of [...timers]) if (timer.deadline <= tick) { timers.delete(id); timer.fn() } }
+  advance(30000)
+  assert.equal(cancelled, false, 'cold compiler setup must not pre-cancel a suspended worker')
+  assert.equal(request.timeoutMs, 1000, 'the native request retains its exact worker deadline')
+  advance(121000); assert.equal(cancelled, true); assert.equal(killed, false)
+  advance(136000); assert.equal(killed, true, 'helper cleanup must retain a finite outer bound')
+  finish(); assert.equal(timers.size, 0)
+})
 
 test('Windows helper staging copies only bound native files into verified private controller storage', t => {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'windows-stage-')))
@@ -121,34 +149,74 @@ test('Windows ownership setup keeps a bounded cold-start allowance and never cac
     assert.equal(file, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
     assert.ok(options.timeout > 15000 && options.timeout <= 60000)
     assert.equal(options.shell, false)
+    assert.deepEqual(Array.from(options.stdio), ['ignore', 'pipe', 'pipe'])
     assert.equal(options.env.NODE_OPTIONS, undefined)
     assert.equal(options.env.OPENAI_API_KEY, undefined)
     assert.equal(fs.existsSync(options.env.TEMP), false, 'temporary compiler files must be removed after success and failure')
   }
 })
 
-test('Windows private ACL grants usable file rights, directory inheritance, and refuses linked targets', t => {
+test('Windows private ACL replaces foreign grants with exact file or directory rights and refuses linked targets', t => {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'windows-acl-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const file = path.join(root, 'connection.json'), link = path.join(root, 'linked')
   fs.writeFileSync(file, 'fixture')
   fs.symlinkSync(root, link, process.platform === 'win32' ? 'junction' : 'dir')
   const calls = []
+  let mutate = value => value
+  const currentSid = 'S-1-5-21-123-456-789-1001'
   const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(executable, argv, options) {
     calls.push({ executable, argv, options })
-    return { status: 0, signal: null, stderr: '', stdout: executable === 'whoami.exe' ? '"runner","S-1-5-21-123-456-789-1001"\n' : '' }
+    if (!options.env.AUTOPROMPT_PRIVATE_ACL_PATH) return { status: 0, signal: null, stderr: '', stdout: '' }
+    const snapshot = { currentName: 'runner', currentSid, items: [{ path: options.env.AUTOPROMPT_PRIVATE_ACL_PATH,
+      owner: currentSid, ownerSid: currentSid, protected: true, rules: [currentSid, 'S-1-5-18'].map(sid => ({
+        identity: sid, sid, type: 'Allow', inherited: false, rights: 2032127,
+        inheritanceFlags: options.env.AUTOPROMPT_PRIVATE_ACL_DIRECTORY === '1' ? 3 : 0, propagationFlags: 0,
+      })) }] }
+    return { status: 0, signal: null, stderr: '', stdout: JSON.stringify(mutate(snapshot)) }
   } } })
-  safe.ensureWindowsPrivateAcl(file)
-  safe.ensureWindowsPrivateAcl(root)
-  const grants = calls.filter(call => call.argv.includes('/grant:r'))
+  assert.equal(safe.ensureWindowsPrivateAcl(file).supported, true)
+  assert.equal(safe.ensureWindowsPrivateAcl(root).supported, true)
+  const grants = calls.filter(call => call.options.env.AUTOPROMPT_PRIVATE_ACL_PATH)
   assert.equal(grants.length, 2)
-  assert.ok(grants[0].argv.includes('*S-1-5-21-123-456-789-1001:F'))
-  assert.ok(grants[0].argv.includes('*S-1-5-18:F'))
-  assert.ok(grants[1].argv.includes('*S-1-5-21-123-456-789-1001:(OI)(CI)F'))
-  assert.ok(calls.filter(call => call.executable === 'icacls.exe').every(call => call.options.timeout === 30000))
-  const before = calls.filter(call => call.executable === 'icacls.exe').length
+  assert.equal(grants[0].options.env.AUTOPROMPT_PRIVATE_ACL_DIRECTORY, '0')
+  assert.equal(grants[1].options.env.AUTOPROMPT_PRIVATE_ACL_DIRECTORY, '1')
+  for (const { executable, argv, options } of grants) {
+    assert.equal(executable, path.win32.join('C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))
+    assert.equal(options.timeout, 60000)
+    assert.equal(options.shell, false)
+    assert.deepEqual(Array.from(options.stdio), ['ignore', 'pipe', 'pipe'])
+    assert.equal(options.env.NODE_OPTIONS, undefined)
+    assert.equal(options.env.OPENAI_API_KEY, undefined)
+    assert.equal(options.env.PSModulePath, undefined)
+    assert.match(argv.at(-1), /DirectorySecurity\]::new\(\)/)
+    assert.match(argv.at(-1), /FileSecurity\]::new\(\)/)
+    assert.match(argv.at(-1), /SetAccessRuleProtection\(\$true,\$false\)/)
+    assert.doesNotMatch(argv.at(-1), /Get-Acl|icacls/)
+  }
+  const before = calls.length
   assert.throws(() => safe.ensureWindowsPrivateAcl(link), { code: 'PRIVACY_UNSUPPORTED' })
-  assert.equal(calls.filter(call => call.executable === 'icacls.exe').length, before)
+  assert.equal(calls.length, before, 'linked targets must not invoke the ACL helper')
+  const mutations = [
+    snapshot => { snapshot.items[0].rules.push({ ...snapshot.items[0].rules[0], identity: 'S-1-1-0', sid: 'S-1-1-0' }) },
+    snapshot => { snapshot.items[0].rules.pop() },
+    snapshot => { snapshot.items[0].rules[1] = { ...snapshot.items[0].rules[0] } },
+    snapshot => { snapshot.items[0].rules[0].rights = 131209 },
+    snapshot => { snapshot.items[0].rules[0].inheritanceFlags = 3 },
+    snapshot => { snapshot.items[0].rules[0].propagationFlags = 1 },
+    snapshot => { snapshot.items[0].rules[0].inherited = true },
+    snapshot => { snapshot.items[0].rules[0].type = 'Deny' },
+    snapshot => { snapshot.items[0].protected = false },
+    snapshot => { snapshot.items[0].ownerSid = 'S-1-5-18'; snapshot.items[0].owner = 'S-1-5-18' },
+    snapshot => { snapshot.items[0].path = root },
+    snapshot => { snapshot.items = [] },
+  ]
+  for (const change of mutations) {
+    mutate = snapshot => { change(snapshot); return snapshot }
+    assert.throws(() => safe.ensureWindowsPrivateAcl(file), { code: 'PRIVACY_VIOLATION' })
+  }
+  mutate = () => null
+  assert.throws(() => safe.ensureWindowsPrivateAcl(file), { code: 'PRIVACY_UNSUPPORTED' })
 })
 
 test('Windows boundary establishes privacy on its fresh child before policy writes and audits loaded state', t => {

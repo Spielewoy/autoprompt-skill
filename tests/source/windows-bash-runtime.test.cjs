@@ -7,6 +7,25 @@ const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const { importedDlls, bindBashRuntime, windowsBashCandidates } = require('../../agents/codex/workflow/windows-appcontainer-command.js')
+const { parseMsysSharedId } = require('../../agents/codex/workflow/windows-appcontainer.js')
+const msysVersion = 'BEGIN_CYGWIN_VERSION_INFO\n%%% MSYS dll identifier: msys-2.0\n%%% MSYS dll identifier: cygwin1\n%%% MSYS shared data: 5\n%%% MSYS shared id: msys-2.0S5\nEND_CYGWIN_VERSION_INFO'
+
+test('MSYS namespace identity requires unique production DLL metadata and matching shared ABI', () => {
+  const bytes = Buffer.concat([Buffer.alloc(64), Buffer.from(msysVersion), Buffer.alloc(64)])
+  assert.equal(parseMsysSharedId(bytes), 'msys-2.0S5')
+  for (const value of [Buffer.alloc(0), Buffer.alloc(32 * 1024 * 1024 + 1),
+    Buffer.from(msysVersion + msysVersion), Buffer.from(msysVersion.replace('END_CYGWIN_VERSION_INFO', '')),
+    Buffer.from(msysVersion.replace('msys-2.0S5', 'msys-2.0S5-debug-build')),
+    Buffer.from(msysVersion.replace('shared data: 5', 'shared data: 6')),
+    Buffer.from(msysVersion.replace('shared id: msys-2.0S5', 'shared id: msys-2.0S5\n%%% MSYS shared id: msys-2.0S5')),
+    Buffer.from(msysVersion.replace('shared id: msys-2.0S5', 'shared id: msys-2.0S5\n%%% MSYS shared id: invalid')),
+    Buffer.from(msysVersion.replace('shared data: 5', 'shared data: 5\n%%% MSYS shared data: 5')),
+    Buffer.from(msysVersion.replace('shared id: msys-2.0S5', 'shared id: ../../outside')),
+    Buffer.from(msysVersion.replace('shared data: 5', 'shared data: 5\0')),
+    Buffer.from(msysVersion.replace('shared data: 5', 'shared data: 5\n%%% MSYS extra: \u00ff'), 'latin1'),
+    Buffer.from(msysVersion.replace('shared data: 5', 'shared data: 5\n%%% MSYS padding: ' + 'x'.repeat(8192))),
+  ]) assert.throws(() => parseMsysSharedId(value), { code: 'WINDOWS_MSYS_RUNTIME_INVALID' })
+})
 
 test('Windows Bash discovery includes custom-drive Git PATH installations and excludes System32 WSL stubs', () => {
   const candidates = windowsBashCandidates({ SystemRoot: 'C:\\Windows', Path: 'C:\\Windows\\System32;D:\\Tools\\Git\\cmd;E:\\PortableGit\\usr\\bin;relative;.' }, 'F:\\Custom\\bash.exe')
@@ -83,13 +102,14 @@ test('Windows Bash closure binds transitive DLL bytes, tolerates cycles and excl
   const systemRoot = path.join(root, 'Windows'); fs.mkdirSync(path.join(systemRoot, 'System32'), { recursive: true })
   fs.writeFileSync(path.join(systemRoot, 'System32', 'kernel32.dll'), 'protected system runtime')
   fs.writeFileSync(path.join(root, 'bash.exe'), pe(['msys-2.0.dll', 'kernel32.dll', 'api-ms-win-core-file-l1-1-0.dll']))
-  fs.writeFileSync(path.join(root, 'msys-2.0.dll'), pe(['msys-intl-8.dll']))
+  fs.writeFileSync(path.join(root, 'msys-2.0.dll'), Buffer.concat([pe(['msys-intl-8.dll']), Buffer.from(msysVersion)]))
   const intl = pe(['msys-2.0.dll']); fs.writeFileSync(path.join(root, 'msys-intl-8.dll'), intl)
   fs.writeFileSync(path.join(root, 'credentials.txt'), 'private')
   fs.writeFileSync(path.join(root, 'unrelated.exe'), 'do not execute or copy')
   const closure = bindBashRuntime(root, systemRoot)
   assert.deepEqual(closure.map(item => item.name).sort(), ['bash.exe', 'msys-2.0.dll', 'msys-intl-8.dll'])
   assert.equal(closure.find(item => item.name === 'msys-intl-8.dll').sha256, crypto.createHash('sha256').update(intl).digest('hex'))
+  assert.equal(closure.find(item => item.name === 'msys-2.0.dll').sharedId, 'msys-2.0S5')
   fs.unlinkSync(path.join(root, 'msys-intl-8.dll'))
   assert.throws(() => bindBashRuntime(root, systemRoot), error => error.code === 'WINDOWS_RUNTIME_INVALID' && error.message.includes('msys-intl-8.dll'))
 })
@@ -103,7 +123,27 @@ test('Windows Bash closure refuses linked dependencies instead of granting their
   assert.throws(() => bindBashRuntime(root), { code: 'WINDOWS_RUNTIME_INVALID' })
 })
 
-test('native Windows Bash copied closure permits scratch writes and denies candidate writes and controller reads', { skip: process.platform !== 'win32', timeout: 180000 }, async t => {
+test('Windows Bash discovery never executes or falls back after invalid selected MSYS metadata', () => {
+  const filename = path.resolve(__dirname, '../../agents/codex/workflow/windows-appcontainer-command.js')
+  const localRequire = require('node:module').createRequire(filename), module = { exports: {} }, opened = []
+  const buffers = new Map([['C:\\Selected\\bash.exe', pe(['msys-2.0.dll'])], ['C:\\Selected\\msys-2.0.dll', pe()]])
+  const physicalFs = {
+    realpathSync: { native: file => file },
+    lstatSync: file => ({ isSymbolicLink: () => false, isDirectory: () => !buffers.has(file) }),
+    openSync(file) { opened.push(file); assert.ok(buffers.has(file), 'metadata refusal must precede trying a different Bash installation'); return file },
+    fstatSync: file => ({ isFile: () => true, nlink: 1n, size: BigInt(buffers.get(file).length), dev: 1n, ino: 2n, mtimeNs: 1n, ctimeNs: 1n }),
+    readFileSync: file => buffers.get(file), closeSync() {}, existsSync: file => buffers.has(file),
+  }
+  require('node:vm').runInNewContext(fs.readFileSync(filename, 'utf8'), { module, exports: module.exports, Buffer,
+    require: name => name === 'node:fs' ? physicalFs : name === 'node:path' ? path.win32 : name === 'node:child_process' ? { spawnSync() { assert.fail('Invalid MSYS metadata must never execute Bash') } } : localRequire(name),
+  }, { filename })
+  assert.throws(() => module.exports.resolveWindowsBash({ bashPath: 'C:\\Selected\\bash.exe', env: { SystemRoot: 'C:\\Windows' } }), { code: 'WINDOWS_MSYS_RUNTIME_INVALID' })
+  assert.deepEqual(opened, ['C:\\Selected\\bash.exe', 'C:\\Selected\\bash.exe', 'C:\\Selected\\msys-2.0.dll'])
+})
+
+// This scenario performs two native launches plus bounded privacy/resource
+// setup; each worker retains its separate 15s/30s execution deadline.
+test('native Windows Bash copied closure permits scratch writes and denies candidate writes and controller reads', { skip: process.platform !== 'win32', timeout: 600000 }, async t => {
   const { probeWindowsAppContainer } = require('../../agents/codex/workflow/windows-appcontainer-probe.js')
   const probe = await probeWindowsAppContainer()
   assert.equal(probe.supported, true, JSON.stringify(probe))

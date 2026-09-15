@@ -13,11 +13,38 @@ function exportEnvironment(name, value) {
   fs.appendFileSync(process.env.GITHUB_ENV, `${name}=${value}\n`)
 }
 
+const WINDOWS_NATIVE_CASES = Object.freeze([
+  'native Windows MSYS namespace isolates event and section leaves across profiles and releases owned names',
+  'Windows resource ancestry tolerates sibling writes while refusing captured mutations and ancestor replacement',
+  'Windows HANDLE capture reads bounded bytes and returns a stable content digest',
+  'Windows HANDLE capture accepts strict UTF-8 request bytes and rejects malformed UTF-8',
+  'Windows HANDLE capture accepts canonical long components and refuses their 8.3 aliases',
+  'Windows HANDLE capture refuses reparse points, hard links, devices and ambiguous components',
+  'Windows HANDLE capture refuses a live writable mapped view after its stream closes',
+  'Windows HANDLE capture rejects closed-protocol violations and size overrun',
+  'Windows HANDLE tree capture includes empty directories, exact bytes, and held stat identities',
+  'Windows HANDLE tree capture refuses hardlinked descendants and linked directories',
+  'Windows HANDLE capture permits unrelated sibling activity while retaining the captured subtree checks',
+  'Windows terminal publication is exclusive, byte-bound, and cleans only its held temporary',
+  'Windows owned cleanup binds the target, validates the entire tree, and proves final absence',
+  'Windows transaction operations durably create, copy readonly projection, and rename without replacement',
+  'Windows transaction copy rejects hardlinks and reparse traversal before publication',
+  'Windows transaction rename refuses mutate-and-restore USN races and rolls the root back',
+  'native Windows Bash copied closure permits scratch writes and denies candidate writes and controller reads',
+  'native Windows controller scratch has protected ownership and rejects inherited permissions on reuse',
+  'native Windows worker clone is privately writable without relabeling the source or an occupied clone',
+  'native capability command reads exact fixture bytes through the real platform shell',
+  'failed native isolation assertion cannot emit a successful closed-canary challenge',
+])
+
 function assertHostPrimitiveCases(output, platform = process.platform) {
+  if (platform === 'win32') {
+    for (const name of WINDOWS_NATIVE_CASES) assertNamedCase(output, name)
+    return WINDOWS_NATIVE_CASES.length
+  }
   const requirements = {
     linux: { minimum: 8, names: /^(?:descriptor capture |capture spool |capture request |a later-file |capture rechecks |native capability command |failed native isolation assertion )/ },
     darwin: { minimum: 8, names: /^(?:native Darwin |actual Darwin observer |native capability command |failed native isolation assertion )/ },
-    win32: { minimum: 18, names: /^(?:Windows HANDLE |Windows terminal publication |Windows owned cleanup |Windows transaction |native Windows (?:Bash |controller scratch |worker clone )|native capability command |failed native isolation assertion )/ },
   }
   const required = requirements[platform]
   assert.ok(required, `Unsupported primitive host: ${platform}`)
@@ -145,4 +172,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1 })
-module.exports = { assertHostPrimitiveCases, assertDoctorCases, assertNamedCase }
+module.exports = { WINDOWS_NATIVE_CASES, assertHostPrimitiveCases, assertDoctorCases, assertNamedCase }

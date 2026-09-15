@@ -59,7 +59,7 @@ public static class WindowsAppContainerResourcesNative {
     public bool Same(Snapshot other) { return other != null && Volume == other.Volume && Attributes == other.Attributes && Links == other.Links &&
       SizeHigh == other.SizeHigh && SizeLow == other.SizeLow && IndexHigh == other.IndexHigh && IndexLow == other.IndexLow && LastWrite == other.LastWrite && Creation == other.Creation; }
   }
-  sealed class Opened { public IntPtr Handle; public string Name; public Snapshot Snapshot; public bool Directory; }
+  sealed class Opened { public IntPtr Handle; public string Name; public Snapshot Snapshot; public bool Directory; public Opened Parent; }
 
   static void Need(bool condition, string code) { if (!condition) throw new Refusal(code); }
   static Snapshot Info(IntPtr h, bool allowReparse = false) {
@@ -212,6 +212,7 @@ public static class WindowsAppContainerResourcesNative {
   sealed class Forest : IDisposable {
     public List<Opened> handles = new List<Opened>(); public List<Item> items = new List<Item>(); public List<RootRecord> roots = new List<RootRecord>();
     public Dictionary<string, Opened> volumes = new Dictionary<string, Opened>(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, string> mappings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     public void Dispose() { for (int i=handles.Count-1;i>=0;i--) if(handles[i].Handle!=IntPtr.Zero) CloseHandle(handles[i].Handle); }
   }
   static bool Within(string root, string child) { return String.Equals(root,child,StringComparison.OrdinalIgnoreCase) || child.StartsWith(root.TrimEnd('\\')+"\\",StringComparison.OrdinalIgnoreCase); }
@@ -259,11 +260,11 @@ public static class WindowsAppContainerResourcesNative {
   static Opened Volume(Forest forest,string path) {
     string root=path.Substring(0,3);Opened held;
     if(forest.volumes.TryGetValue(root,out held))return held;
-    string mapping=PhysicalDriveMapping(root);held=OpenChecked("\\??\\"+root,IntPtr.Zero,true,false,false);forest.handles.Add(held);ValidateRootVolume(held.Handle,root,mapping);forest.volumes[root]=held;return held;
+    string mapping=PhysicalDriveMapping(root);held=OpenChecked("\\??\\"+root,IntPtr.Zero,true,false,false);forest.handles.Add(held);ValidateRootVolume(held.Handle,root,mapping);forest.volumes[root]=held;forest.mappings[root]=mapping;return held;
   }
   static Opened OpenRoot(Forest forest,RootSpec spec) {
     Opened parent=Volume(forest,spec.path);string[] parts=spec.path.Substring(3).Split('\\');Need(parts.Length<=128,"WINDOWS_RESOURCE_LIMIT");
-    for(int i=0;i<parts.Length;i++){bool last=i==parts.Length-1;parent=OpenChecked(parts[i],parent.Handle,!last || spec.kind=="directory",last && spec.kind=="file",true,last);forest.handles.Add(parent);}return parent;
+    for(int i=0;i<parts.Length;i++){bool last=i==parts.Length-1;Opened child=OpenChecked(parts[i],parent.Handle,!last || spec.kind=="directory",last && spec.kind=="file",true,last);child.Parent=parent;parent=child;forest.handles.Add(parent);}return parent;
   }
   static void Walk(Forest forest,Opened node,string full,RootSpec[] specs,HashSet<string> seen,int depth,bool recovering) {
     Need(depth<=128,"WINDOWS_RESOURCE_LIMIT");if(!seen.Add(node.Snapshot.Id))return;Need(forest.items.Count<4096,"WINDOWS_RESOURCE_LIMIT");
@@ -274,7 +275,7 @@ public static class WindowsAppContainerResourcesNative {
       Need(depth<128,"WINDOWS_RESOURCE_LIMIT");bool directory=(entry.Attributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
       IntPtr handle=Open(entry.Name,node.Handle,directory,false,false,true);
       Opened child;
-      try { Snapshot snapshot=Info(handle,recovering);Need(snapshot.Volume==node.Snapshot.Volume && snapshot.Attributes==entry.Attributes && (((ulong)snapshot.IndexHigh<<32)|snapshot.IndexLow)==entry.Id && (recovering || directory || snapshot.Links==1),"PREIMAGE_UNSAFE");child=new Opened{Handle=handle,Name=entry.Name,Snapshot=snapshot,Directory=directory}; }
+      try { Snapshot snapshot=Info(handle,recovering);Need(snapshot.Volume==node.Snapshot.Volume && snapshot.Attributes==entry.Attributes && (((ulong)snapshot.IndexHigh<<32)|snapshot.IndexLow)==entry.Id && (recovering || directory || snapshot.Links==1),"PREIMAGE_UNSAFE");child=new Opened{Handle=handle,Name=entry.Name,Snapshot=snapshot,Directory=directory,Parent=node}; }
       catch{CloseHandle(handle);throw;}
       forest.handles.Add(child);Walk(forest,child,full+"\\"+entry.Name,specs,seen,depth+1,recovering);
     }
@@ -284,7 +285,28 @@ public static class WindowsAppContainerResourcesNative {
     try {foreach(var spec in specs){Opened root=OpenRoot(forest,spec);forest.roots.Add(new RootRecord{path=spec.path,kind=spec.kind,writable=spec.writable,identity=root.Snapshot.Id,creation=root.Snapshot.Creation.ToString()});Walk(forest,root,spec.path,specs,seen,0,false);}return forest;}
     catch{forest.Dispose();throw;}
   }
-  static void Stable(Forest forest) { foreach(var held in forest.handles)Need(held.Snapshot.Same(Info(held.Handle)),"PREIMAGE_UNSAFE"); }
+  static bool SameDirectoryIdentity(Snapshot before,Snapshot after) {
+    return after!=null && before.Volume==after.Volume && before.Attributes==after.Attributes && before.Links==after.Links &&
+      before.IndexHigh==after.IndexHigh && before.IndexLow==after.IndexLow && before.Creation==after.Creation;
+  }
+  static void Stable(Forest forest) {
+    var resources=new HashSet<Opened>(forest.items.Select(item=>item.opened));
+    foreach(var volume in forest.volumes)ValidateRootVolume(volume.Value.Handle,volume.Key,forest.mappings[volume.Key]);
+    foreach(var held in forest.handles) {
+      // Shared ancestry may contain unrelated active missions. Resource roots
+      // and descendants retain complete snapshots; ancestors retain physical
+      // identity and are reopened through the held parent to detect renames.
+      bool resource=resources.Contains(held);Snapshot current=Info(held.Handle);
+      Need(resource || !held.Directory?held.Snapshot.Same(current):SameDirectoryIdentity(held.Snapshot,current),"PREIMAGE_UNSAFE");
+      IntPtr fresh=IntPtr.Zero;
+      try {
+        fresh=Open(held.Name,held.Parent==null?IntPtr.Zero:held.Parent.Handle,held.Directory);
+        if(held.Parent!=null)CheckCanonicalComponentName(fresh,held.Name);
+        current=Info(fresh);
+        Need(resource || !held.Directory?held.Snapshot.Same(current):SameDirectoryIdentity(held.Snapshot,current),"PREIMAGE_UNSAFE");
+      } finally {if(fresh!=IntPtr.Zero)CloseHandle(fresh);}
+    }
+  }
   public static ResourcePlan Plan(string profileName,RootSpec[] specs) {
     string sid=ProfileSid(profileName);
     using(var forest=Inventory(specs)) {

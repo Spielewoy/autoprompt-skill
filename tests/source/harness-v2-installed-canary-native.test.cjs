@@ -7,6 +7,7 @@ const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 const { privateDirectory, requiredNativeCli, nativeEnvironment } = require('../helpers/native-platform.cjs')
+const { diagnoseNativeCanary } = require('../helpers/native-canary-diagnostics.cjs')
 const CLI = requiredNativeCli('claude')
 const ROOT = path.resolve(__dirname, '../..')
 
@@ -62,7 +63,12 @@ test('packed actual Claude activation requires all local native observations bef
     .channels.providerConnectorApiWriteToolDenial
   const pending = inspect()
   assert.equal(pending.enforced, false, JSON.stringify(pending))
-  const observed = await configure.runReviewedLocalCanary(activation, { env })
+  let observed
+  try { observed = await configure.runReviewedLocalCanary(activation, { env }) }
+  catch (error) {
+    diagnoseNativeCanary(activation, message => t.diagnostic(message))
+    throw error
+  }
   const required = require(path.join(source, 'scripts/harness-v2-canary.cjs')).REQUIRED
   assert.deepEqual(observed.observations.map(item => item.capability).sort(), [...required].sort())
   assert.ok(observed.observations.every(item => item.status === 'passed'))

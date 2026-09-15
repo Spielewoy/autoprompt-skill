@@ -7,6 +7,26 @@ const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 const { nodeCommand, readCommand, withChallenge } = require('../helpers/native-platform.cjs')
+const { WINDOWS_NATIVE_CASES, assertHostPrimitiveCases } = require('../helpers/native-platform-ci.cjs')
+
+test('Windows native CI guard requires each exact native case and excludes parser lookalikes', () => {
+  const transcript = names => names.map((name, index) => `ok ${index + 1} - ${name}`).join('\n')
+  const complete = transcript(WINDOWS_NATIVE_CASES)
+  assert.equal(assertHostPrimitiveCases(complete, 'win32'), WINDOWS_NATIVE_CASES.length)
+  const parsers = ['Windows owned cleanup parser closes identity and removal framing',
+    'Windows transaction results bind exclusive bytes, readonly projection, and closed operation identity',
+    'Windows transaction protocol distinguishes missing tree, required directory, collisions, and cross-device refusal']
+  assert.throws(() => assertHostPrimitiveCases(transcript(Array(20).fill(parsers).flat()), 'win32'), /Expected exactly one result/)
+  for (const name of WINDOWS_NATIVE_CASES) {
+    assert.throws(() => assertHostPrimitiveCases(transcript(WINDOWS_NATIVE_CASES.filter(item => item !== name)), 'win32'), /Expected exactly one result/)
+    assert.throws(() => assertHostPrimitiveCases(`${complete}\nok 999 - ${name}`, 'win32'), /Expected exactly one result/)
+    for (const directive of ['SKIP native prerequisite absent', 'TODO native case pending']) {
+      assert.throws(() => assertHostPrimitiveCases(complete.replace(`- ${name}`, `- ${name} # ${directive}`), 'win32'), /Required test must execute/)
+    }
+    assert.throws(() => assertHostPrimitiveCases(complete.replace(`- ${name}`, `- parser-only replacement for ${name}`), 'win32'), /Expected exactly one result/)
+    assert.throws(() => assertHostPrimitiveCases(complete.replace(new RegExp(`ok (\\d+) - ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`), 'not ok $1 - ' + name), 'win32'), /Required test failed/)
+  }
+})
 
 function run(command) {
   const bash = process.platform === 'win32'

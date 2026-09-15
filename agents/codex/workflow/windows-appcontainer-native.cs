@@ -8,6 +8,9 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Security.Cryptography;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Text.RegularExpressions;
 public static class WindowsAppContainerNative {
  [DllImport("userenv.dll",CharSet=CharSet.Unicode)] public static extern Int32 DeriveAppContainerSidFromAppContainerName(String name,out IntPtr sid);
  [StructLayout(LayoutKind.Sequential)] public struct SECURITY_CAPABILITIES { public IntPtr AppContainerSid,Capabilities; public UInt32 CapabilityCount,Reserved; }
@@ -54,7 +57,98 @@ public static class WindowsAppContainerNative {
  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool CreateProcess(String app,StringBuilder command,IntPtr processAttributes,IntPtr threadAttributes,bool inheritHandles,UInt32 flags,IntPtr environment,String cwd,ref STARTUPINFOEX startup,out PROCESS_INFORMATION information);
  public sealed class LaunchResult { public UInt32 RootPid,ExitCode; public Int32 ObservedJobMembers,LauncherSessionId; public String AppContainerSid,StdoutBase64,StderrBase64; public Boolean RootImageMatches,Drained,TimedOut,OutputLimit,Cancelled; }
  sealed class MemberSummary { public Int32 Total,SameNode,Other; }
- sealed class ImageBinding : IDisposable { public readonly String FullPath; readonly FileStream Stream; public ImageBinding(String path,String expectedHash){if(String.IsNullOrEmpty(expectedHash)||expectedHash.Length!=64||expectedHash.Any(c=>!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))))throw new InvalidOperationException("image hash invalid");FullPath=Path.GetFullPath(path);if((File.GetAttributes(FullPath)&FileAttributes.ReparsePoint)!=0)throw new InvalidOperationException("image reparse");FileStream stream=null;try{stream=new FileStream(FullPath,FileMode.Open,FileAccess.Read,FileShare.Read);if(stream.Length<=0||stream.Length>536870912)throw new InvalidOperationException("image size invalid");String actual;using(var hash=SHA256.Create()){actual=String.Concat(hash.ComputeHash(stream).Select(b=>b.ToString("x2")));}if(actual.Length!=expectedHash.Length)throw new InvalidOperationException("image hash mismatch");Int32 diff=0;for(Int32 i=0;i<actual.Length;i++)diff|=Char.ToLowerInvariant(actual[i])^Char.ToLowerInvariant(expectedHash[i]);if(diff!=0)throw new InvalidOperationException("image hash mismatch");Stream=stream;stream=null;}finally{if(stream!=null)stream.Dispose();}} public void Dispose(){Stream.Dispose();} }
+ [StructLayout(LayoutKind.Sequential)] struct UNICODE_STRING { public UInt16 Length,MaximumLength; public IntPtr Buffer; }
+ [StructLayout(LayoutKind.Sequential)] struct OBJECT_ATTRIBUTES { public Int32 Length; public IntPtr RootDirectory,ObjectName; public UInt32 Attributes; public IntPtr SecurityDescriptor,SecurityQualityOfService; }
+ [DllImport("ntdll.dll")] static extern Int32 NtCreateDirectoryObject(out IntPtr handle,UInt32 access,ref OBJECT_ATTRIBUTES attributes);
+ [DllImport("ntdll.dll")] static extern Int32 NtQuerySecurityObject(IntPtr handle,UInt32 information,IntPtr descriptor,UInt32 length,out UInt32 required);
+ [DllImport("ntdll.dll")] static extern UInt16 RtlUpcaseUnicodeChar(UInt16 value);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern UInt32 GetFinalPathNameByHandle(IntPtr handle,StringBuilder name,UInt32 length,UInt32 flags);
+ [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern Boolean ConvertStringSecurityDescriptorToSecurityDescriptor(String text,UInt32 revision,out IntPtr descriptor,out UInt32 size);
+ public sealed class MsysNamespaceRequest { public String DllPath,DllSha256,SharedId; }
+
+ // MSYS hashes the final full DLL path, before removing its filename. These
+ // names and the embedded shared ABI come from the exact bound copied DLL;
+ // the caller cannot select a global namespace or execute Bash to discover it.
+ public sealed class MsysNamespaceLease : IDisposable {
+  readonly List<IntPtr> handles=new List<IntPtr>(); ImageBinding dllBinding;
+  public readonly String[] Names;
+  internal MsysNamespaceLease(String executable,MsysNamespaceRequest request,String expectedSid) {
+   if(request==null||!Regex.IsMatch(expectedSid??"",@"\AS-1-15-2-(?:[0-9]+-){6}[0-9]+\z")||
+      !Regex.IsMatch(request.SharedId??"",@"\Amsys-2\.0S[1-9][0-9]{0,8}\z")||
+      !Regex.IsMatch(request.DllSha256??"",@"\A[a-f0-9]{64}\z")||
+      !Path.IsPathRooted(request.DllPath??"")||!String.Equals(Path.GetFileName(request.DllPath),"msys-2.0.dll",StringComparison.OrdinalIgnoreCase)||
+      !String.Equals(Path.GetDirectoryName(Path.GetFullPath(request.DllPath)),Path.GetDirectoryName(Path.GetFullPath(executable)),StringComparison.OrdinalIgnoreCase)||
+      !String.Equals(Path.GetFileName(executable),"bash.exe",StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("WINDOWS_MSYS_NAMESPACE_INVALID");
+   try {
+    dllBinding=new ImageBinding(request.DllPath,request.DllSha256);
+    if(!String.Equals(request.DllPath,dllBinding.FullPath,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("WINDOWS_MSYS_RUNTIME_INVALID");
+    if(dllBinding.Stream.Length>33554432)throw new InvalidOperationException("WINDOWS_MSYS_RUNTIME_INVALID");
+    dllBinding.Stream.Position=0;var bytes=new Byte[(Int32)dllBinding.Stream.Length];Int32 read=0;
+    while(read<bytes.Length){Int32 n=dllBinding.Stream.Read(bytes,read,bytes.Length-read);if(n==0)throw new InvalidOperationException("WINDOWS_MSYS_RUNTIME_INVALID");read+=n;}
+    String binary=Encoding.ASCII.GetString(bytes);const String begin="BEGIN_CYGWIN_VERSION_INFO\n",end="END_CYGWIN_VERSION_INFO";
+    Int32 start=binary.IndexOf(begin,StringComparison.Ordinal),finish=binary.IndexOf(end,StringComparison.Ordinal);
+    if(start<0||finish<start+begin.Length||finish-start>8192||binary.IndexOf(begin,start+begin.Length,StringComparison.Ordinal)>=0||binary.IndexOf(end,finish+end.Length,StringComparison.Ordinal)>=0)throw new InvalidOperationException("WINDOWS_MSYS_RUNTIME_INVALID");
+    for(Int32 i=start+begin.Length;i<finish;i++)if(bytes[i]!=10&&(bytes[i]<32||bytes[i]>126))throw new InvalidOperationException("WINDOWS_MSYS_RUNTIME_INVALID");
+    String block=binary.Substring(start+begin.Length,finish-start-begin.Length);var lines=block.Split('\n');
+    if(lines.Length<2||lines[lines.Length-1]!=""||lines.Take(lines.Length-1).Any(line=>!line.StartsWith("%%% MSYS ",StringComparison.Ordinal)))throw new InvalidOperationException("WINDOWS_MSYS_RUNTIME_INVALID");
+    var ids=lines.Where(line=>line.StartsWith("%%% MSYS shared id: ",StringComparison.Ordinal)).ToArray();
+    var abi=lines.Where(line=>line.StartsWith("%%% MSYS shared data: ",StringComparison.Ordinal)).ToArray();
+    if(ids.Length!=1||abi.Length!=1||ids[0]!="%%% MSYS shared id: "+request.SharedId||abi[0]!="%%% MSYS shared data: "+request.SharedId.Substring("msys-2.0S".Length))throw new InvalidOperationException("WINDOWS_MSYS_RUNTIME_INVALID");
+    var final=new StringBuilder(32768);UInt32 length=GetFinalPathNameByHandle(dllBinding.Stream.SafeFileHandle.DangerousGetHandle(),final,(UInt32)final.Capacity,0);
+    if(length==0||length>=final.Capacity||!final.ToString().StartsWith(@"\\?\",StringComparison.Ordinal))throw new InvalidOperationException("WINDOWS_MSYS_RUNTIME_INVALID");
+    String finalPath=final.ToString().StartsWith(@"\\?\UNC\",StringComparison.OrdinalIgnoreCase)?@"\\"+final.ToString().Substring(8):final.ToString().Substring(4);
+    if(!String.Equals(finalPath,dllBinding.FullPath,StringComparison.OrdinalIgnoreCase)||!PhysicalDirectoryAncestry(Path.GetDirectoryName(dllBinding.FullPath)))throw new InvalidOperationException("WINDOWS_MSYS_RUNTIME_INVALID");
+    String nativePath=@"\??\"+final.ToString().Substring(4);UInt64 hash=0;
+    unchecked{foreach(Char value in nativePath)hash=(UInt64)RtlUpcaseUnicodeChar(value)+(hash<<6)+(hash<<16)-hash;}
+    String leaf=request.SharedId+"-"+hash.ToString("x16");Int32 session=Process.GetCurrentProcess().SessionId;
+    Names=session==0?new[]{@"\BaseNamedObjects\"+leaf}:new[]{@"\BaseNamedObjects\"+leaf,@"\Sessions\BNOLINKS\"+session+@"\"+leaf};
+    String user;using(var identity=WindowsIdentity.GetCurrent()){if(identity.User==null)throw new InvalidOperationException("WINDOWS_MSYS_NAMESPACE_INVALID");user=identity.User.Value;}
+    // Direct namespace rights exclude WRITE_DAC/WRITE_OWNER/DELETE. The
+    // separate inheritance-only grant applies only to new child objects.
+    String sddl="O:"+user+"G:"+user+"D:P(A;;0xf000f;;;"+user+")(A;;0xf000f;;;SY)(A;;0x2000f;;;"+expectedSid+")(A;OICIIO;GA;;;"+user+")(A;OICIIO;GA;;;SY)(A;OICIIO;GA;;;"+expectedSid+")S:(ML;;NW;;;LW)";
+    foreach(String name in Names)Create(name,sddl,user,expectedSid);
+   }catch{Dispose();throw;}
+  }
+  void Create(String name,String sddl,String user,String profileSid) {
+   IntPtr text=IntPtr.Zero,unicode=IntPtr.Zero,descriptor=IntPtr.Zero,handle=IntPtr.Zero;
+   try {
+    UInt32 descriptorSize;Check(ConvertStringSecurityDescriptorToSecurityDescriptor(sddl,1,out descriptor,out descriptorSize),"MSYS-private-descriptor");
+    text=Marshal.StringToHGlobalUni(name);var value=new UNICODE_STRING{Length=checked((UInt16)(name.Length*2)),MaximumLength=checked((UInt16)(name.Length*2+2)),Buffer=text};
+    unicode=Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));Marshal.StructureToPtr(value,unicode,false);
+    // No OBJ_OPENIF, OBJ_PERMANENT, or inherited handle: a preexisting name
+    // is a collision, never a directory whose security we replace or trust.
+    var attributes=new OBJECT_ATTRIBUTES{Length=Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)),ObjectName=unicode,Attributes=0x40,SecurityDescriptor=descriptor};
+    Int32 status=NtCreateDirectoryObject(out handle,0x000f000f,ref attributes);
+    if(status==unchecked((Int32)0xc0000035)||status==0x40000000)throw new InvalidOperationException("WINDOWS_MSYS_NAMESPACE_COLLISION");
+    if(status<0)throw new InvalidOperationException("WINDOWS_MSYS_NAMESPACE_CREATE_"+unchecked((UInt32)status).ToString("X8"));
+    VerifyDescriptor(handle,user,profileSid);handles.Add(handle);handle=IntPtr.Zero;
+   }finally{if(handle!=IntPtr.Zero)CloseHandle(handle);if(descriptor!=IntPtr.Zero)LocalFree(descriptor);if(unicode!=IntPtr.Zero)Marshal.FreeHGlobal(unicode);if(text!=IntPtr.Zero)Marshal.FreeHGlobal(text);}
+  }
+  static void VerifyDescriptor(IntPtr handle,String user,String profileSid) {
+   UInt32 required;NtQuerySecurityObject(handle,0x17,IntPtr.Zero,0,out required);
+   if(required==0||required>16384)throw new InvalidOperationException("WINDOWS_MSYS_NAMESPACE_SECURITY");
+   IntPtr memory=Marshal.AllocHGlobal((Int32)required);
+   try {
+    Int32 status=NtQuerySecurityObject(handle,0x17,memory,required,out required);if(status<0)throw new InvalidOperationException("WINDOWS_MSYS_NAMESPACE_SECURITY");
+    var bytes=new Byte[required];Marshal.Copy(memory,bytes,0,bytes.Length);var security=new RawSecurityDescriptor(bytes,0);
+    if(security.Owner==null||security.Owner.Value!=user||(security.ControlFlags&ControlFlags.DiscretionaryAclProtected)==0||security.DiscretionaryAcl==null||security.DiscretionaryAcl.Count!=6)throw new InvalidOperationException("WINDOWS_MSYS_NAMESPACE_SECURITY");
+    var expected=new HashSet<String>{user+":0:983055","S-1-5-18:0:983055",profileSid+":0:131087",user+":11:268435456","S-1-5-18:11:268435456",profileSid+":11:268435456"};
+    foreach(GenericAce item in security.DiscretionaryAcl){var ace=item as CommonAce;if(ace==null||ace.AceQualifier!=AceQualifier.AccessAllowed||!expected.Remove(ace.SecurityIdentifier.Value+":"+(Int32)ace.AceFlags+":"+ace.AccessMask))throw new InvalidOperationException("WINDOWS_MSYS_NAMESPACE_SECURITY");}
+    if(expected.Count!=0||security.SystemAcl==null||security.SystemAcl.Count!=1)throw new InvalidOperationException("WINDOWS_MSYS_NAMESPACE_SECURITY");
+    // Mandatory labels are SYSTEM_MANDATORY_LABEL_ACE (0x11), mask NW=1,
+    // SID S-1-16-4096. RawSecurityDescriptor retains this ACE as custom bytes.
+    GenericAce label=security.SystemAcl[0];var labelBytes=new Byte[label.BinaryLength];label.GetBinaryForm(labelBytes,0);
+    if(labelBytes[0]!=0x11||labelBytes[1]!=0||BitConverter.ToUInt32(labelBytes,4)!=1||new SecurityIdentifier(labelBytes,8).Value!="S-1-16-4096")throw new InvalidOperationException("WINDOWS_MSYS_NAMESPACE_SECURITY");
+   }finally{Marshal.FreeHGlobal(memory);}
+  }
+  public void Dispose(){for(Int32 i=handles.Count-1;i>=0;i--)CloseHandle(handles[i]);handles.Clear();if(dllBinding!=null){dllBinding.Dispose();dllBinding=null;}}
+ }
+ public static MsysNamespaceLease CreateMsysNamespaceLease(String executable,MsysNamespaceRequest request,String expectedSid){return request==null?null:new MsysNamespaceLease(executable,request,expectedSid);}
+ // An unconfirmed drain is terminal for this helper. Keep these handles (and
+ // the DLL binding) alive until helper exit rather than release a namespace
+ // whose owned process family might still be using it.
+ static readonly List<MsysNamespaceLease> undrainedNamespaces=new List<MsysNamespaceLease>();
+ sealed class ImageBinding : IDisposable { public readonly String FullPath; internal readonly FileStream Stream; public ImageBinding(String path,String expectedHash){if(String.IsNullOrEmpty(expectedHash)||expectedHash.Length!=64||expectedHash.Any(c=>!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))))throw new InvalidOperationException("image hash invalid");FullPath=Path.GetFullPath(path);if((File.GetAttributes(FullPath)&FileAttributes.ReparsePoint)!=0)throw new InvalidOperationException("image reparse");FileStream stream=null;try{stream=new FileStream(FullPath,FileMode.Open,FileAccess.Read,FileShare.Read);if(stream.Length<=0||stream.Length>536870912)throw new InvalidOperationException("image size invalid");String actual;using(var hash=SHA256.Create()){actual=String.Concat(hash.ComputeHash(stream).Select(b=>b.ToString("x2")));}if(actual.Length!=expectedHash.Length)throw new InvalidOperationException("image hash mismatch");Int32 diff=0;for(Int32 i=0;i<actual.Length;i++)diff|=Char.ToLowerInvariant(actual[i])^Char.ToLowerInvariant(expectedHash[i]);if(diff!=0)throw new InvalidOperationException("image hash mismatch");Stream=stream;stream=null;}finally{if(stream!=null)stream.Dispose();}} public void Dispose(){Stream.Dispose();} }
  public static String LastStage="initial"; public static Int32 LastWin32=0; public static UInt32 LastRootWait=UInt32.MaxValue,LastRootExit=UInt32.MaxValue,LastJobActive=UInt32.MaxValue,LastObservedMembers=UInt32.MaxValue,LastCatchRootWait=UInt32.MaxValue,LastCatchRootExit=UInt32.MaxValue; public static Int32 LastRootImageMatches=-1,LastSameNodeMembers=-1,LastOtherImageMembers=-1,LastStderrCategory=-1,LastStderrCode=0,LastStderrSyscall=0,LastStderrTargetRelation=0,LastSetupMs=-1,LastPrelaunchMs=-1,LastObserveMs=-1,LastWaitMs=-1,LastCleanupMs=-1;
  static void Mark(String stage){LastStage=stage;LastWin32=0;}
  static void Check(bool value,String action){Mark(action);if(!value){LastWin32=Marshal.GetLastWin32Error();throw new Win32Exception(LastWin32,action);}}
@@ -95,9 +189,13 @@ public static class WindowsAppContainerNative {
  // resource grants. No caller handles, network capabilities, or breakaway flag
  // are accepted. The executable remains open without write/delete sharing.
  public static LaunchResult Launch(String executable,String executableSha256,String[] arguments,String cwd,String[] environmentEntries,Int32 timeoutMs,Int32 outputLimit,IntPtr appSid,String expectedSid,String cancellationPath) {
+  return Launch(executable,executableSha256,arguments,cwd,environmentEntries,timeoutMs,outputLimit,appSid,expectedSid,cancellationPath,null);
+ }
+ public static LaunchResult Launch(String executable,String executableSha256,String[] arguments,String cwd,String[] environmentEntries,Int32 timeoutMs,Int32 outputLimit,IntPtr appSid,String expectedSid,String cancellationPath,MsysNamespaceRequest msysRuntime) {
+  lock(undrainedNamespaces){if(undrainedNamespaces.Count!=0)throw new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED");}
   if(arguments==null||arguments.Length>256||arguments.Any(x=>x==null||x.IndexOf('\0')>=0)||timeoutMs<1||timeoutMs>300000||outputLimit<1||outputLimit>1048576||Sid(appSid)!=expectedSid)throw new InvalidOperationException("WINDOWS_LAUNCH_INVALID");
   var command=new StringBuilder(String.Join(" ",(new[]{executable}).Concat(arguments).Select(Quote)));if(command.Length>32760)throw new InvalidOperationException("WINDOWS_COMMAND_LIMIT");
-  IntPtr size=IntPtr.Zero,list=IntPtr.Zero,caps=IntPtr.Zero,job=IntPtr.Zero,limit=IntPtr.Zero,environment=IntPtr.Zero,stdoutRead=IntPtr.Zero,stdoutWrite=IntPtr.Zero,stderrRead=IntPtr.Zero,stderrWrite=IntPtr.Zero,nulRead=IntPtr.Zero,handleList=IntPtr.Zero;PROCESS_INFORMATION pi=new PROCESS_INFORMATION();Boolean assigned=false;ImageBinding imageBinding=null;
+  IntPtr size=IntPtr.Zero,list=IntPtr.Zero,caps=IntPtr.Zero,job=IntPtr.Zero,limit=IntPtr.Zero,environment=IntPtr.Zero,stdoutRead=IntPtr.Zero,stdoutWrite=IntPtr.Zero,stderrRead=IntPtr.Zero,stderrWrite=IntPtr.Zero,nulRead=IntPtr.Zero,handleList=IntPtr.Zero;PROCESS_INFORMATION pi=new PROCESS_INFORMATION();Boolean assigned=false,confirmedDrain=true;ImageBinding imageBinding=null;MsysNamespaceLease namespaceLease=null;
   try {
    InitializeProcThreadAttributeList(IntPtr.Zero,2,0,ref size);if(size==IntPtr.Zero)throw new InvalidOperationException("attribute-list size");list=Marshal.AllocHGlobal(size);Check(InitializeProcThreadAttributeList(list,2,0,ref size),"InitializeProcThreadAttributeList");
    var security=new SECURITY_CAPABILITIES{AppContainerSid=appSid,Capabilities=IntPtr.Zero,CapabilityCount=0,Reserved=0};int capsSize=Marshal.SizeOf(typeof(SECURITY_CAPABILITIES));caps=Marshal.AllocHGlobal(capsSize);Marshal.StructureToPtr(security,caps,false);Check(UpdateProcThreadAttribute(list,0,(IntPtr)PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,caps,(IntPtr)capsSize,IntPtr.Zero,IntPtr.Zero),"security-capabilities");
@@ -106,7 +204,9 @@ public static class WindowsAppContainerNative {
    handleList=Marshal.AllocHGlobal(IntPtr.Size*3);Marshal.WriteIntPtr(handleList,0,nulRead);Marshal.WriteIntPtr(handleList,IntPtr.Size,stdoutWrite);Marshal.WriteIntPtr(handleList,IntPtr.Size*2,stderrWrite);Check(UpdateProcThreadAttribute(list,0,(IntPtr)PROC_THREAD_ATTRIBUTE_HANDLE_LIST,handleList,(IntPtr)(IntPtr.Size*3),IntPtr.Zero,IntPtr.Zero),"owned-handle-list");
    job=CreateJobObject(IntPtr.Zero,null);if(job==IntPtr.Zero)throw new Win32Exception(Marshal.GetLastWin32Error(),"CreateJobObject");var limits=new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();limits.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;int limitSize=Marshal.SizeOf(limits);limit=Marshal.AllocHGlobal(limitSize);Marshal.StructureToPtr(limits,limit,false);Check(SetInformationJobObject(job,JobObjectExtendedLimitInformation,limit,(UInt32)limitSize),"job-kill-on-close");
    imageBinding=new ImageBinding(executable,executableSha256);environment=EnvironmentBlock(environmentEntries);var startup=new STARTUPINFOEX();startup.StartupInfo.cb=Marshal.SizeOf(typeof(STARTUPINFOEX));startup.StartupInfo.dwFlags=STARTF_USESTDHANDLES;startup.StartupInfo.hStdInput=nulRead;startup.StartupInfo.hStdOutput=stdoutWrite;startup.StartupInfo.hStdError=stderrWrite;startup.AttributeList=list;
+   namespaceLease=CreateMsysNamespaceLease(executable,msysRuntime,expectedSid);
    Check(CreateProcess(executable,command,IntPtr.Zero,IntPtr.Zero,true,EXTENDED_STARTUPINFO_PRESENT|CREATE_SUSPENDED|CREATE_UNICODE_ENVIRONMENT|CREATE_NO_WINDOW,environment,cwd,ref startup,out pi),"CreateProcess-suspended");
+   confirmedDrain=false;
    Check(CloseHandle(stdoutWrite),"stdout-close-parent-write");stdoutWrite=IntPtr.Zero;Check(CloseHandle(stderrWrite),"stderr-close-parent-write");stderrWrite=IntPtr.Zero;Check(CloseHandle(nulRead),"stdin-close-parent-read");nulRead=IntPtr.Zero;
    Check(AssignProcessToJobObject(job,pi.hProcess),"AssignProcessToJobObject");assigned=true;VerifyAppContainer(pi.hProcess,expectedSid,job,imageBinding,true);if((String.IsNullOrEmpty(cancellationPath)||!File.Exists(cancellationPath))&&ResumeThread(pi.hThread)==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error(),"ResumeThread");CloseHandle(pi.hThread);pi.hThread=IntPtr.Zero;
    using(var stdout=new MemoryStream())using(var stderr=new MemoryStream()){
@@ -114,14 +214,16 @@ public static class WindowsAppContainerNative {
     for(;;){if(!String.IsNullOrEmpty(cancellationPath)&&File.Exists(cancellationPath)){cancelled=true;break;}if(!ReadOutput(stdoutRead,stdout,ref total,outputLimit)||!ReadOutput(stderrRead,stderr,ref total,outputLimit)){limited=true;break;}uint wait=WaitForSingleObject(pi.hProcess,0);if(wait==0)break;if(wait==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error(),"WaitForSingleObject");if(clock.ElapsedMilliseconds>=timeoutMs){timedOut=true;break;}members=Math.Max(members,VerifyMembers(job,expectedSid,imageBinding).Total);System.Threading.Thread.Sleep(25);}
     // Root exit never transfers detached descendants to the host. Terminate and
     // positively drain the entire owned job before returning any result.
-    if(Active(job)>0)Check(TerminateJobObject(job,125),"TerminateJobObject");if(!Drain(job,5000))throw new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED");
+    if(Active(job)>0)Check(TerminateJobObject(job,125),"TerminateJobObject");if(!Drain(job,5000))throw new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED");confirmedDrain=true;
     if(!ReadOutput(stdoutRead,stdout,ref total,outputLimit)||!ReadOutput(stderrRead,stderr,ref total,outputLimit))limited=true;
     UInt32 exit;Check(GetExitCodeProcess(pi.hProcess,out exit),"GetExitCodeProcess");return new LaunchResult{RootPid=pi.dwProcessId,ExitCode=exit,ObservedJobMembers=members,LauncherSessionId=Process.GetCurrentProcess().SessionId,AppContainerSid=expectedSid,RootImageMatches=true,Drained=true,TimedOut=timedOut,OutputLimit=limited,Cancelled=cancelled,StdoutBase64=Convert.ToBase64String(stdout.ToArray()),StderrBase64=Convert.ToBase64String(stderr.ToArray())};
    }
   } catch {
-   bool drained=true;if(assigned&&job!=IntPtr.Zero){try{if(Active(job)>0&&!TerminateJobObject(job,125))drained=false;if(!Drain(job,5000))drained=false;}catch{drained=false;}}else if(pi.hProcess!=IntPtr.Zero){try{if(!TerminateProcess(pi.hProcess,125)||WaitForSingleObject(pi.hProcess,5000)!=0)drained=false;}catch{drained=false;}}if(!drained)throw new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED");throw;
+   bool drained=true;if(assigned&&job!=IntPtr.Zero){try{if(Active(job)>0&&!TerminateJobObject(job,125))drained=false;if(!Drain(job,5000))drained=false;}catch{drained=false;}}else if(pi.hProcess!=IntPtr.Zero){try{if(!TerminateProcess(pi.hProcess,125)||WaitForSingleObject(pi.hProcess,5000)!=0)drained=false;}catch{drained=false;}}confirmedDrain=drained;if(!drained)throw new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED");throw;
   } finally {
-   if(pi.hThread!=IntPtr.Zero)CloseHandle(pi.hThread);if(pi.hProcess!=IntPtr.Zero)CloseHandle(pi.hProcess);if(environment!=IntPtr.Zero)Marshal.FreeHGlobal(environment);if(limit!=IntPtr.Zero)Marshal.FreeHGlobal(limit);if(job!=IntPtr.Zero)CloseHandle(job);if(caps!=IntPtr.Zero)Marshal.FreeHGlobal(caps);if(list!=IntPtr.Zero){DeleteProcThreadAttributeList(list);Marshal.FreeHGlobal(list);}if(imageBinding!=null)imageBinding.Dispose();foreach(IntPtr handle in new[]{stdoutRead,stdoutWrite,stderrRead,stderrWrite,nulRead})if(handle!=IntPtr.Zero)CloseHandle(handle);if(handleList!=IntPtr.Zero)Marshal.FreeHGlobal(handleList);
+   if(pi.hThread!=IntPtr.Zero)CloseHandle(pi.hThread);if(pi.hProcess!=IntPtr.Zero)CloseHandle(pi.hProcess);if(environment!=IntPtr.Zero)Marshal.FreeHGlobal(environment);if(limit!=IntPtr.Zero)Marshal.FreeHGlobal(limit);if(job!=IntPtr.Zero)CloseHandle(job);
+   if(namespaceLease!=null){if(confirmedDrain)namespaceLease.Dispose();else lock(undrainedNamespaces){undrainedNamespaces.Add(namespaceLease);}}
+   if(caps!=IntPtr.Zero)Marshal.FreeHGlobal(caps);if(list!=IntPtr.Zero){DeleteProcThreadAttributeList(list);Marshal.FreeHGlobal(list);}if(imageBinding!=null)imageBinding.Dispose();foreach(IntPtr handle in new[]{stdoutRead,stdoutWrite,stderrRead,stderrWrite,nulRead})if(handle!=IntPtr.Zero)CloseHandle(handle);if(handleList!=IntPtr.Zero)Marshal.FreeHGlobal(handleList);
   }
  }
 }

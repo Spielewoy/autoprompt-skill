@@ -67,7 +67,11 @@ async function probeWindowsAppContainer() {
     phase = 'command-launch'
     const result = await runWindowsAppContainerCommand(policy, { command, cwd: target, timeoutMs: 15000 }, { controlRoot })
     phase = 'command-result'
-    launcherSessionId = result.launcherSessionId; nativeExitCode = result.exitCode; probeFailure = { stdout: result.stdout.slice(0, 1024), stderr: result.stderr.slice(0, 1024) }
+    launcherSessionId = result.launcherSessionId; nativeExitCode = result.exitCode; probeFailure = {
+      stdout: result.stdout.slice(0, 1024), stderr: result.stderr.slice(0, 1024),
+      timedOut: result.timedOut === true, cancelled: result.cancelled === true, truncated: result.truncated === true,
+      durationMs: Number.isSafeInteger(result.durationMs) ? result.durationMs : null,
+    }
     if (result.status !== 'completed' || result.stdout !== 'APPCONTAINER_PROBE_PASS' || result.stderr || fs.readFileSync(path.join(target, '.git', 'guard'), 'utf8') !== 'controller git') throw new Error('NATIVE_PROBE_FAILED')
     phase = 'loopback-denial'
     for (const endpoint of endpoints) { if (endpoint.state.accepted !== 0) throw new Error('SANDBOX_CONNECTED'); await control(endpoint); if (endpoint.state.accepted !== 1) throw new Error('CONTROL_ACCEPT') }

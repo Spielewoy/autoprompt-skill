@@ -4,7 +4,7 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const cp = require('node:child_process')
 const { ensureWindowsPrivateAcl } = require('./safe-run-root.js')
-const { createWindowsAppContainerLauncher, WindowsAppContainerError } = require('./windows-appcontainer.js')
+const { createWindowsAppContainerLauncher, WindowsAppContainerError, parseMsysSharedId } = require('./windows-appcontainer.js')
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 // Copy a closed executable dependency set into the existing read-only runtime.
 // Granting the original Git installation would also expose unrelated plugins,
@@ -70,7 +70,7 @@ function bindBashRuntime(runtimeDirectory, systemRoot) {
     const binding = bindRuntimeFile(path.join(runtimeDirectory, name), 32 * 1024 * 1024)
     totalBytes += binding.bytes.length
     if (totalBytes > 256 * 1024 * 1024) throw new WindowsAppContainerError('WINDOWS_RUNTIME_INVALID', 'Git Bash runtime dependency bytes exceed their bound')
-    files.set(label, Object.freeze({ ...binding, name: label }))
+    files.set(label, Object.freeze({ ...binding, name: label, ...(label === 'msys-2.0.dll' ? { sharedId: parseMsysSharedId(binding.bytes) } : {}) }))
     for (const dependency of importedDlls(binding.bytes)) {
       if (fs.existsSync(path.join(runtimeDirectory, dependency))) visit(dependency)
       else if (/^(?:api-ms-win-|ext-ms-win-)[a-z0-9.-]+\.dll$/.test(dependency)) continue
@@ -130,7 +130,12 @@ function resolveWindowsBash(options = {}) {
       })
       const match = /GNU bash, version (\d+)\.(\d+)/.exec(version.stdout || '')
       if (!version.error && version.status === 0 && match && (+match[1] > 4 || +match[1] === 4 && +match[2] >= 3)) return Object.freeze({ bash, files })
-    } catch (error) { if (error instanceof WindowsAppContainerError) failure = error }
+    } catch (error) {
+      // A selected MSYS DLL with invalid namespace metadata is not eligible for
+      // an unbound fallback or a host-side execution attempt.
+      if (error.code === 'WINDOWS_MSYS_RUNTIME_INVALID') throw error
+      if (error instanceof WindowsAppContainerError) failure = error
+    }
   }
   throw new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', `Git Bash 4.3 or newer with its complete physical DLL closure is required for the Windows command boundary${failure ? `: ${failure.message}` : ''}`)
 }
@@ -146,6 +151,8 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
   const bashSource = resolveWindowsBash(options)
   const systemRoot = process.env.SystemRoot
   const executable = runtimeBash, executableSha256 = bashSource.bash.sha256
+  const msysSource = bashSource.files.find(binding => binding.name === 'msys-2.0.dll')
+  const msysRuntime = { dllPath: path.join(runtimeDirectory, 'msys-2.0.dll'), dllSha256: msysSource.sha256, sharedId: msysSource.sharedId }
   const start = Date.now()
   let lease, evidence, released = false, recoveryPending = false, privateScratch = null
   try {
@@ -180,7 +187,7 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
       ...lease.environment,
     }
     evidence = await launcher.launch({ profileName: lease.profileName, profileSid: lease.profileSid,
-      executable, executableSha256, arguments: ['--noprofile', '--norc', '-c', args.command], cwd: args.cwd,
+      executable, executableSha256, msysRuntime, arguments: ['--noprofile', '--norc', '-c', args.command], cwd: args.cwd,
       environment: Object.entries(env).map(([key, value]) => `${key}=${value}`), timeoutMs: args.timeoutMs || 60000,
       outputLimit: 1024 * 1024, cancellationPath }, { signal: options.signal, leaseId: lease.recovery.leaseId })
     await lease.release(evidence)

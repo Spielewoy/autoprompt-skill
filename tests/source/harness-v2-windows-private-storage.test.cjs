@@ -12,7 +12,17 @@ const { ensureWindowsPrivateAcl, auditPrivatePermissions } = require('../../agen
 test('native Windows controller scratch has protected ownership and rejects inherited permissions on reuse', { skip: process.platform !== 'win32', timeout: 180000 }, t => {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'native-checker-private-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  // This fresh owned fixture deliberately starts with an explicit foreign
+  // grant. Disabling inheritance and replacing only user/SYSTEM entries
+  // would leave it behind, so the production helper must replace the DACL.
+  const addForeignGrant = item => {
+    const grant = cp.spawnSync('icacls.exe', [item, '/grant', '*S-1-1-0:R'], { encoding: 'utf8', timeout: 30000 })
+    assert.ifError(grant.error)
+    assert.equal(grant.status, 0, grant.stderr || grant.stdout)
+  }
+  addForeignGrant(root)
   ensureWindowsPrivateAcl(root)
+  assert.equal(auditPrivatePermissions(root, { recurse: false }).valid, true)
   const target = path.join(root, 'target'), frozen = path.join(root, 'frozen')
   fs.mkdirSync(target); fs.mkdirSync(frozen)
   const entries = []
@@ -30,6 +40,8 @@ test('native Windows controller scratch has protected ownership and rejects inhe
     candidateHash, canonicalTargetPath: frozen, workingDirectory: boundary.writableScratchRoot }), boundary)
   const file = path.join(boundary.writableScratchRoot, 'private-file')
   fs.writeFileSync(file, 'private contents')
+  addForeignGrant(file)
+  assert.throws(() => auditPrivatePermissions(file), { code: 'PRIVACY_VIOLATION' })
   ensureWindowsPrivateAcl(file)
   assert.equal(auditPrivatePermissions(file).valid, true)
   fs.appendFileSync(file, '\nstill writable')
@@ -53,9 +65,13 @@ test('native Windows worker clone is privately writable without relabeling the s
     assert.equal(result.status, 0, result.stderr || result.stdout)
   }
   const security = file => {
+    const environment = { ...process.env, AUTOPROMPT_WORKER_ACL_PATH: file }
+    // The CI shell can export PowerShell Core's module path. Windows
+    // PowerShell must discover its own Microsoft.PowerShell.Security module.
+    for (const key of Object.keys(environment)) if (key.toLowerCase() === 'psmodulepath') delete environment[key]
     const result = cp.spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
-      '[Console]::Out.Write((Get-Acl -LiteralPath $env:AUTOPROMPT_WORKER_ACL_PATH).Sddl)'], {
-      encoding: 'utf8', timeout: 30000, env: { ...process.env, AUTOPROMPT_WORKER_ACL_PATH: file },
+      '$ErrorActionPreference="Stop";[Console]::Out.Write((Get-Acl -LiteralPath $env:AUTOPROMPT_WORKER_ACL_PATH).Sddl)'], {
+      encoding: 'utf8', timeout: 30000, env: environment,
     })
     assert.ifError(result.error)
     assert.equal(result.status, 0, result.stderr || result.stdout)
