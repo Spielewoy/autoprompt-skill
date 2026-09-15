@@ -12,7 +12,7 @@ function failureDiagnostic(error, phase) {
   // This probe only runs fixed controller diagnostics. Preserve their bounded
   // failure explanation, never arbitrary error properties or environment maps.
   const diagnostic = { phase, message: String(error && error.message || 'Native probe failed').slice(0, 1024) }
-  for (const name of ['stage', 'cause', 'signal']) {
+  for (const name of ['stage', 'helperPhase', 'cause', 'signal']) {
     if (typeof details?.[name] === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(details[name])) diagnostic[name] = details[name]
   }
   for (const name of ['status', 'timeoutMs']) if (details?.[name] === null || Number.isSafeInteger(details?.[name])) diagnostic[name] = details[name]
@@ -21,7 +21,7 @@ function failureDiagnostic(error, phase) {
 }
 function runtimeKey() {
   const hash = crypto.createHash('sha256')
-  for (const name of ['windows-appcontainer.js', 'windows-appcontainer.ps1', 'windows-appcontainer-native.cs', 'windows-appcontainer-command.js', 'windows-appcontainer-probe.js', 'windows-appcontainer-resources.js', 'windows-appcontainer-resources.ps1', 'windows-appcontainer-resources-native.cs', 'windows-filesystem.js', 'windows-filesystem.ps1']) hash.update(name).update(fs.readFileSync(path.join(__dirname, name)))
+  for (const name of ['windows-appcontainer.js', 'windows-appcontainer.ps1', 'windows-appcontainer-native.cs', 'windows-appcontainer-command.js', 'windows-appcontainer-probe.js', 'windows-appcontainer-resources.js', 'windows-appcontainer-resources.ps1', 'windows-appcontainer-resources-native.cs', 'windows-helper-deployment.js', 'windows-filesystem.js', 'windows-filesystem.ps1']) hash.update(name).update(fs.readFileSync(path.join(__dirname, name)))
   hash.update(fs.readFileSync(process.execPath))
   return hash.update(JSON.stringify([process.pid, process.env.SystemRoot, process.env.LOCALAPPDATA])).digest('hex')
 }

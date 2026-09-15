@@ -17,7 +17,7 @@ function assertHostPrimitiveCases(output, platform = process.platform) {
   const requirements = {
     linux: { minimum: 8, names: /^(?:descriptor capture |capture spool |capture request |a later-file |capture rechecks |native capability command |failed native isolation assertion )/ },
     darwin: { minimum: 8, names: /^(?:native Darwin |actual Darwin observer |native capability command |failed native isolation assertion )/ },
-    win32: { minimum: 17, names: /^(?:Windows HANDLE |Windows terminal publication |Windows owned cleanup |Windows transaction |native Windows Bash |native capability command |failed native isolation assertion )/ },
+    win32: { minimum: 18, names: /^(?:Windows HANDLE |Windows terminal publication |Windows owned cleanup |Windows transaction |native Windows (?:Bash |controller scratch |worker clone )|native capability command |failed native isolation assertion )/ },
   }
   const required = requirements[platform]
   assert.ok(required, `Unsupported primitive host: ${platform}`)

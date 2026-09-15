@@ -291,6 +291,7 @@ function prepareBoundary({ provider, root, policy }) {
   if ([...normalized.readableRoots, ...normalized.writableRoots].some(task => within(task, parent) || within(parent, task))) fail('TOOL_POLICY_INVALID', 'Controller state must be disjoint from all task roots')
   const directory = path.join(parent, `tools-${crypto.randomUUID()}`)
   fs.mkdirSync(directory, { mode: 0o700 })
+  if (process.platform === 'win32') require('../agents/codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(directory)
   const policyPath = path.join(directory, 'policy.json'), receiptPath = path.join(directory, 'receipts.jsonl')
   const bytes = canonicalJson(normalized), policySha256 = sha256(bytes)
   writePrivate(policyPath, bytes); writePrivate(receiptPath, '')
@@ -301,6 +302,7 @@ function prepareBoundary({ provider, root, policy }) {
 function loadBoundary(policyPath, policySha256) {
   if (!/^[a-f0-9]{64}$/.test(policySha256 || '')) fail('TOOL_POLICY_INVALID', 'Tool policy digest is invalid')
   const root = ownedDirectory(path.dirname(physical(policyPath)))
+  if (process.platform === 'win32') require('../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture().assertRecordParent(policyPath)
   const bytes = readBound(policyPath)
   if (sha256(bytes) !== policySha256 || path.basename(policyPath) !== 'policy.json') fail('TOOL_POLICY_INVALID', 'Tool policy bytes changed')
   return { root, policyPath, policySha256, policy: validatePolicy(JSON.parse(bytes)), receiptPath: path.join(root, 'receipts.jsonl') }

@@ -20,7 +20,8 @@ function fixture(t, privateAcl = false) {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-nt-handle-')))
   if (privateAcl) {
     const script = '$ErrorActionPreference = "Stop"; $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User; $acl = New-Object Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); foreach ($id in @($sid.Value,"S-1-5-18","S-1-5-32-544")) { $principal = New-Object Security.Principal.SecurityIdentifier($id); $rule = New-Object Security.AccessControl.FileSystemAccessRule($principal,"FullControl","ContainerInherit,ObjectInherit","None","Allow"); $acl.AddAccessRule($rule) }; [IO.Directory]::SetAccessControl($env:AUTOPROMPT_PRIVATE_FIXTURE,$acl)'
-    const result = cp.spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: { ...process.env, AUTOPROMPT_PRIVATE_FIXTURE: root } })
+    const result = cp.spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 60000, env: { ...process.env, AUTOPROMPT_PRIVATE_FIXTURE: root } })
+    assert.ifError(result.error)
     assert.equal(result.status, 0, result.stderr)
   }
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -71,6 +72,7 @@ function writableMapping(file, stopPath) {
     // This owner is stopped by its marker file. An unused open stdin pipe can
     // keep Windows PowerShell waiting after the command has finished.
     stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 60000,
     env: { ...process.env, AUTOPROMPT_WINDOWS_CAPTURE_MAPPING_PATH: file, AUTOPROMPT_WINDOWS_CAPTURE_MAPPING_STOP: stopPath },
   })
   const state = { stdout: '', stderr: '' }
@@ -195,24 +197,29 @@ async function stopMapping(mapper, timeoutMs = 10000) {
   } catch (error) {
     // Fail the fixture, but release the mapping so subsequent native cases run.
     child.kill('SIGKILL')
-    await exited
+    try { await once(child, 'close', { signal: AbortSignal.timeout(5000) }) }
+    catch {
+      child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy(); child.unref()
+    }
     throw error
   } finally {
     clearTimeout(timer)
   }
 }
 
-test('mapped-view fixture teardown kills an unresponsive owner and reports the failure', async () => {
-  const child = cp.spawn(process.execPath, ['-e', 'process.stdout.write("ready"); setInterval(() => {}, 1000)'], { stdio: ['pipe', 'pipe', 'pipe'] })
-  await once(child.stdout, 'data')
+test('mapped-view fixture teardown kills an unresponsive owner and reports the failure', { timeout: 30000 }, async t => {
+  const child = cp.spawn(process.execPath, ['-e', 'process.stdout.write("ready"); setInterval(() => {}, 1000)'], { stdio: ['pipe', 'pipe', 'pipe'], timeout: 15000 })
+  t.after(() => { child.kill('SIGKILL'); child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy(); child.unref() })
+  await once(child.stdout, 'data', { signal: AbortSignal.timeout(10000) })
   await assert.rejects(stopMapping({ child, state: { stderr: 'fixture diagnostic' } }, 100), /mapping owner did not stop: fixture diagnostic/)
   assert.notEqual(child.signalCode, null)
 })
 
-test('mapped-view fixture teardown stops a marker-controlled owner with closed stdin', async t => {
+test('mapped-view fixture teardown stops a marker-controlled owner with closed stdin', { timeout: 30000 }, async t => {
   const stopPath = path.join(fixture(t), 'stop')
-  const child = cp.spawn(process.execPath, ['-e', 'process.stdout.write("ready"); setInterval(() => { if (require("node:fs").existsSync(process.argv[1])) process.exit(0) }, 10)', stopPath], { stdio: ['ignore', 'pipe', 'pipe'] })
-  await once(child.stdout, 'data')
+  const child = cp.spawn(process.execPath, ['-e', 'process.stdout.write("ready"); setInterval(() => { if (require("node:fs").existsSync(process.argv[1])) process.exit(0) }, 10)', stopPath], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000 })
+  t.after(() => { child.kill('SIGKILL'); child.stdout?.destroy(); child.stderr?.destroy(); child.unref() })
+  await once(child.stdout, 'data', { signal: AbortSignal.timeout(10000) })
   await stopMapping({ child, stopPath })
   assert.equal(child.exitCode, 0)
 })
@@ -409,12 +416,14 @@ test('Windows terminal publication is exclusive, byte-bound, and cleans only its
   fs.writeFileSync(residue, 'not owned by this invocation')
   backend.recoverRecordPublication(filename)
   assert.equal(fs.readFileSync(residue, 'utf8'), 'not owned by this invocation')
-  const dead = cp.spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' })
+  const dead = cp.spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8', timeout: 15000 })
+  assert.ifError(dead.error)
   assert.equal(dead.status, 0)
   const makeResidue = pid => {
     const name = `.terminal.json.${pid}.0123456789abcdef.create`, target = path.join(root, name)
     fs.writeFileSync(target, 'partial publication')
-    const owner = cp.spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference = "Stop"; $acl = Get-Acl -LiteralPath $env:AUTOPROMPT_RESIDUE; $acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User); Set-Acl -LiteralPath $env:AUTOPROMPT_RESIDUE -AclObject $acl'], { encoding: 'utf8', env: { ...process.env, AUTOPROMPT_RESIDUE: target } })
+    const owner = cp.spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference = "Stop"; $acl = Get-Acl -LiteralPath $env:AUTOPROMPT_RESIDUE; $acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User); Set-Acl -LiteralPath $env:AUTOPROMPT_RESIDUE -AclObject $acl'], { encoding: 'utf8', timeout: 60000, env: { ...process.env, AUTOPROMPT_RESIDUE: target } })
+    assert.ifError(owner.error)
     assert.equal(owner.status, 0, owner.stderr)
     return name
   }

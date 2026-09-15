@@ -134,7 +134,7 @@ test('Lima public VM parsing requires an explicit provider connection binding an
   assert.equal(activation.vmRoot, path.resolve('/private/vm'))
   assert.equal(activation.resume, `apv2-${'a'.repeat(32)}`)
   assert.throws(() => cli.parseArgs(['activate', 'grok', '--vm-root', '/private/vm', '--target', '/work', '--', 'work']), { code: 'AUTOPROMPT_USAGE' })
-  assert.deepEqual(cli.parseArgs(['runtime', 'vm', 'cancel', '--root', '/private/vm', '--request-id', 'a'.repeat(32)]), { command: 'runtime-vm', action: 'cancel', root: '/private/vm', requestId: 'a'.repeat(32) })
+  assert.deepEqual(cli.parseArgs(['runtime', 'vm', 'cancel', '--root', '/private/vm', '--request-id', 'a'.repeat(32)]), { command: 'runtime-vm', action: 'cancel', root: path.resolve('/private/vm'), requestId: 'a'.repeat(32) })
 })
 
 test('Lima provider binding validates every public provider through its concrete native connection projection', t => {
@@ -177,7 +177,7 @@ test('Lima provider binding validates every public provider through its concrete
   // The second rejection must prove privacy enforcement with otherwise valid content.
   fs.writeFileSync(badCredential, JSON.stringify({ schemaVersion: 1, provider: 'hermes', environment: { HERMES_API_KEY: 'fixture-only' } }))
   if (process.platform === 'win32') {
-    const changed = childProcess.spawnSync('icacls.exe', [badCredential, '/inheritance:e'], { encoding: 'utf8', windowsHide: true })
+    const changed = childProcess.spawnSync('icacls.exe', [badCredential, '/grant', '*S-1-1-0:R'], { encoding: 'utf8', windowsHide: true })
     assert.equal(changed.status, 0, changed.stderr || changed.stdout)
   } else fs.chmodSync(badCredential, 0o644)
   assert.throws(() => host.credentialBinding(badCredential, 'hermes', host.connectionBinding(hermesConnection, 'hermes', endpoint)), { code: 'LIMA_PROVIDER_CONFIG_INVALID' })
@@ -215,10 +215,17 @@ test('Lima extends only an unaccelerated QEMU boot readiness deadline', () => {
   assert.equal(host.qemuFallbackStartTimeout('vz', false), null)
 })
 
-test('Lima config exports only selected target and has no SSHFS, automatic sync, sockets, or agent forwarding', () => {
+test('Lima config exports only selected target and has no SSHFS, automatic sync, sockets, or agent forwarding', t => {
+  // Model the macOS host UID for this pure configuration test on Windows.
+  // Actual Lima setup remains macOS-only and must observe its real caller UID.
+  if (typeof process.getuid !== 'function') {
+    Object.defineProperty(process, 'getuid', { configurable: true, value: () => 4242 })
+    t.after(() => { delete process.getuid })
+  }
   const target = path.resolve('/Users/test/project')
   for (const vmType of ['qemu', 'vz']) {
     const config = host.makeConfig({ target, arch: 'x86_64', vmType, provider: 'codex' })
+    assert.equal(config.user.uid, process.getuid())
     assert.equal(config.mounts.length, 1)
     assert.equal(config.mounts[0].location, target)
     assert.equal(config.mounts[0].mountPoint, target)

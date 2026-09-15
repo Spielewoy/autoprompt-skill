@@ -112,7 +112,7 @@ const {
   projectWorkspaceResources,
   WorkerWorkspaceManager,
 } = require('./worker-workspace.js')
-const { auditPrivatePermissions, pathIsInside, readFileNoFollow } = require('./safe-run-root.js')
+const { auditPrivatePermissions, ensureWindowsPrivateAcl, pathIsInside, readFileNoFollow } = require('./safe-run-root.js')
 const { createDarwinFilesystemCapture, createDarwinFilesystemMutations } = require('./darwin-filesystem.js')
 const { validateJsonSchema } = require('./json-schema-validator.js')
 
@@ -30045,8 +30045,10 @@ function createCheckerScratchFactory(options) {
   }
   const secret = crypto.randomBytes(32)
   const scratchRoot = path.resolve(options.scratchRoot)
+  const scratchRootExisted = fs.existsSync(scratchRoot)
   fs.mkdirSync(scratchRoot, { recursive: true, mode: 0o700 })
   if (process.platform !== 'win32') fs.chmodSync(scratchRoot, 0o700)
+  else if (!scratchRootExisted) ensureWindowsPrivateAcl(scratchRoot)
   try { auditPrivatePermissions(scratchRoot, { recurse: false }) } catch (error) {
     throw new SupervisorIntegrationError('CHECKER_SCRATCH_UNAVAILABLE', 'checker scratch authority root is not private and owner-only', { cause: error.message })
   }
@@ -30074,6 +30076,7 @@ function createCheckerScratchFactory(options) {
     } else {
       scratch = path.join(scratchRoot, `${hashText(checkerId)}-${crypto.randomBytes(8).toString('hex')}`)
       fs.mkdirSync(scratch, { recursive: false, mode: 0o700 })
+      ensureWindowsPrivateAcl(scratch)
       for (const child of ['tmp', 'output', 'cache']) fs.mkdirSync(path.join(scratch, child), { mode: 0o700 })
       options.cleanupRegistry.register({ path: scratch, kind: 'checker-scratch', owner: checkerId })
     }

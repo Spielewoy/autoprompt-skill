@@ -23,11 +23,18 @@ try {
  $result=[WindowsAppContainerNative]::Launch([string]$inputObject.executable,[string]$inputObject.executableSha256,[string[]]$inputObject.arguments,[string]$inputObject.cwd,[string[]]$inputObject.environment,[int]$inputObject.timeoutMs,[int]$inputObject.outputLimit,$sid,[string]$inputObject.profileSid,[string]$inputObject.cancellationPath)
  [ordered]@{schemaVersion=1;status='COMPLETED';result=$result}|ConvertTo-Json -Depth 4 -Compress
 } catch {
- $code='WINDOWS_LAUNCH_REFUSED';$exception=$_.Exception
+ $code='WINDOWS_LAUNCH_REFUSED';$exception=$_.Exception;$diagnostic='unknown'
  for($i=0;$i-lt 8-and $null-ne $exception;$i++){
   if($exception.Message-eq 'APPCONTAINER_CLEANUP_UNCONFIRMED'){$code='APPCONTAINER_CLEANUP_UNCONFIRMED';break}
   if($exception.Message-cmatch '^WINDOWS_[A-Z_]{1,64}$'){$code=$exception.Message}
+  $kind=$exception.GetType().Name;$site='unknown'
+  if($null-ne $exception.TargetSite){$site=$exception.TargetSite.Name}
+  if($kind-cmatch '^[A-Za-z0-9_]{1,80}$'-and $site-cmatch '^[A-Za-z0-9_]{1,80}$'){
+   $diagnostic=$kind+':'+$site
+   if($exception-is [ComponentModel.Win32Exception]){$diagnostic+=':'+([string]$exception.NativeErrorCode)}
+   if($exception.Message-cmatch '^[A-Za-z0-9_ .:()-]{1,80}$'){$diagnostic+=':'+ $exception.Message}
+  }
   $exception=$exception.InnerException
  }
- [ordered]@{schemaVersion=1;status='REFUSED';code=$code}|ConvertTo-Json -Compress
+ [ordered]@{schemaVersion=1;status='REFUSED';code=$code;diagnostic=$diagnostic}|ConvertTo-Json -Compress
 } finally {if($sid-ne [IntPtr]::Zero){[void][WindowsAppContainerNative]::FreeSid($sid)}}

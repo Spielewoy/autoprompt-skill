@@ -4,7 +4,6 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const cp = require('node:child_process')
 const { ensureWindowsPrivateAcl } = require('./safe-run-root.js')
-const { createWindowsFilesystemCapture } = require('./windows-filesystem.js')
 const { createWindowsAppContainerLauncher, WindowsAppContainerError } = require('./windows-appcontainer.js')
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 // Copy a closed executable dependency set into the existing read-only runtime.
@@ -138,12 +137,11 @@ function resolveWindowsBash(options = {}) {
 async function runWindowsAppContainerCommand(policy, args, options = {}) {
   if (process.platform !== 'win32' || typeof options.controlRoot !== 'string' || !path.isAbsolute(options.controlRoot)) throw new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', 'A private controller root is required for Windows commands')
   const controlRoot = fs.realpathSync.native(options.controlRoot)
-  const capture = createWindowsFilesystemCapture()
   const nonce = crypto.randomUUID().replaceAll('-', '')
   const cancellationPath = path.join(controlRoot, `cancel-${nonce}`)
   const runtimeDirectory = path.join(path.dirname(controlRoot), `command-runtime-${nonce}`)
   const runtimeNode = path.join(runtimeDirectory, 'node.exe'), runtimeBash = path.join(runtimeDirectory, 'bash.exe')
-  const launcher = createWindowsAppContainerLauncher()
+  let launcher, helperDeployment
   const { prepareWindowsAppContainerResources, recoverWindowsAppContainerResources } = require('./windows-appcontainer-resources.js')
   const bashSource = resolveWindowsBash(options)
   const systemRoot = process.env.SystemRoot
@@ -151,6 +149,8 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
   const start = Date.now()
   let lease, evidence, released = false, recoveryPending = false, privateScratch = null
   try {
+    helperDeployment = require('./windows-helper-deployment.js').stageWindowsHelperDeployment(controlRoot)
+    launcher = createWindowsAppContainerLauncher({ deploymentRoot: helperDeployment.root })
     if (!policy.scratchPath) {
       privateScratch = path.join(path.dirname(controlRoot), `command-scratch-${nonce}`)
       fs.mkdirSync(privateScratch, { mode: 0o700 }); ensureWindowsPrivateAcl(privateScratch)
@@ -167,7 +167,7 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
     }
     if (sha256(fs.readFileSync(runtimeNode)) !== expectedNodeHash) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Controller Node changed while copying')
     if (sha256(fs.readFileSync(runtimeBash)) !== executableSha256) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Git Bash runtime changed while copying')
-    lease = await prepareWindowsAppContainerResources({ policy, controlRoot,
+    lease = await prepareWindowsAppContainerResources({ policy, controlRoot, deploymentRoot: helperDeployment.root,
       executableRoots: [{ path: runtimeDirectory, kind: 'directory' }],
       verifyDrainEvidence: launcher.verifyDrainEvidence })
     const env = {
@@ -196,7 +196,7 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
       recoveryPending = true
       const binding = { profileSid: error.recovery.profileSid, leaseId: error.recovery.leaseId }
       const unused = launcher.proveNotStarted(binding)
-      await recoverWindowsAppContainerResources({ controlRoot, journalPath: error.recovery.journalPath, verifyDrainEvidence: launcher.verifyDrainEvidence, evidence: unused })
+      await recoverWindowsAppContainerResources({ controlRoot, deploymentRoot: helperDeployment.root, journalPath: error.recovery.journalPath, verifyDrainEvidence: launcher.verifyDrainEvidence, evidence: unused })
       recoveryPending = false; released = true; error.recoveryResolved = true
     }
     if (lease && !evidence) {
@@ -212,6 +212,7 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
     if ((!lease && !recoveryPending) || released) {
       if (privateScratch) fs.rmSync(privateScratch, { recursive: true, force: true })
       fs.rmSync(runtimeDirectory, { recursive: true, force: true })
+      helperDeployment?.cleanup()
       try { fs.unlinkSync(cancellationPath) } catch (error) { if (error.code !== 'ENOENT') throw error }
     }
   }

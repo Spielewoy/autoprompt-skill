@@ -25,8 +25,8 @@ const CLI = requiredNativeCli('claude')
 
 function createFixture() {
   const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'claude-capability-native-')))
-  const target = path.join(root, 'target'), controller = path.join(root, 'controller')
-  fs.mkdirSync(target, { mode: 0o700 }); fs.mkdirSync(controller, { mode: 0o700 })
+  const target = privateDirectory(path.join(root, 'target')), controller = path.join(root, 'controller')
+  fs.mkdirSync(controller, { mode: 0o700 })
   const nativeRoot = path.join(controller, 'native'); fs.mkdirSync(nativeRoot, { mode: 0o700 })
   const suppliedChallenge = process.env.AUTOPROMPT_CLOSED_CANARY_CHALLENGE
   if (suppliedChallenge !== undefined && !/^[A-Za-z0-9_-]{43}$/.test(suppliedChallenge)) throw new Error('AUTOPROMPT_CLOSED_CANARY_CHALLENGE must be one 32-byte base64url nonce')
@@ -366,7 +366,9 @@ test('claude closed native capability: isolated checker receives read-only candi
   } })
   const frozen = path.join(f.root, 'frozen'); fs.mkdirSync(frozen, { mode: 0o700 })
   const frozenCandidate = path.join(frozen, 'candidate.txt'); fs.writeFileSync(frozenCandidate, f.marker, { mode: 0o600 })
-  const checkerScratch = path.join(f.root, 'checker-scratch'); fs.mkdirSync(checkerScratch, { mode: 0o700 })
+  // This fixture supplies the checker resource root itself; Windows requires
+  // its own protected ACL, even when its parent already has a private ACL.
+  const checkerScratch = privateDirectory(path.join(f.root, 'checker-scratch'))
   for (const name of ['tmp', 'output', 'cache']) fs.mkdirSync(path.join(checkerScratch, name), { mode: 0o700 })
   const checkerBoundary = {
     schemaVersion: 1, capability: native.sha256('closed-native-checker-boundary'), runId: 'closed-native-checker',

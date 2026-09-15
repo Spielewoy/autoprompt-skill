@@ -146,7 +146,7 @@ function assertPreserved(files) { for (const [file, bytes] of files) assert.equa
 test('packed public Codex and all-provider lifecycles remove receipt-bound v2 bundles without deleting private user data', {
   timeout: 1200000,
 }, async t => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-public-packed-'))
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-public-packed-')))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const packEnv = environment(path.join(directory, 'pack-env'))
   const packed = ok(run(process.execPath, [npmCli(), 'pack', '--ignore-scripts', '--json', '--pack-destination', directory], { cwd: ROOT, env: packEnv }), 'offline npm pack')
@@ -258,7 +258,7 @@ for (const port of ['bash', 'powershell']) test(`${port}: Codex v2 scope require
     : (process.platform === 'win32' ? 'powershell.exe' : 'pwsh')
   const probeArgs = port === 'bash' ? ['--version'] : ['-NoProfile', '-NonInteractive', '-Command', 'exit 0']
   if (!executable || run(executable, probeArgs).status !== 0) { t.skip(`${executable} unavailable`); return }
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-scope-'))
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-scope-')))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const env = environment(directory)
   const root = path.join(directory, 'root')

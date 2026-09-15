@@ -18,6 +18,7 @@ const {
 } = require('./event-log.js')
 const {
   ensureDirectoryNoFollow,
+  ensureWindowsPrivateAcl,
   inspectPathNoFollow,
   pathIsInside,
 } = require('./safe-run-root.js')
@@ -939,6 +940,15 @@ class WorkerWorkspaceManager {
     const parent = path.dirname(workspacePath)
     ensurePhysicalDirectory(parent, this.privateRoot, this.fs)
     ensurePhysicalDirectory(cacheRoot, this.privateRoot, this.fs)
+    if (process.platform === 'win32') {
+      // Git accepts an existing empty destination. Allocate it exclusively so
+      // only this fresh controller-owned clone receives a protected DACL;
+      // neither the user project nor an occupied workspace may be relabeled.
+      try { this.fs.mkdirSync(workspacePath, { mode: 0o700 }) } catch (error) {
+        fail('WORKER_ISOLATION_UNSUPPORTED', 'fresh Windows worker clone destination is unavailable', { cause: error.code })
+      }
+      ensureWindowsPrivateAcl(workspacePath)
+    }
     const clone = childProcess.spawnSync('git', [
       'clone', '--no-local', '--no-hardlinks', '--', this.targetRoot, workspacePath,
     ], {

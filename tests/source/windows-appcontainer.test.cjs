@@ -33,11 +33,19 @@ test('AppContainer runtime is never advertised on other operating systems', { sk
   assert.throws(() => createWindowsAppContainerLauncher(), { code: 'COMMAND_SANDBOX_UNSUPPORTED' })
 })
 
-function windowsModule(file, replacements = {}) {
+test('AppContainer refusal preserves bounded native diagnostics and rejects unclosed diagnostic fields', () => {
+  const wire = { schemaVersion: 1, status: 'REFUSED', code: 'WINDOWS_LAUNCH_REFUSED', diagnostic: 'Win32Exception:Check:5:CreateProcessAsUser' }
+  assert.throws(() => parseResult(JSON.stringify(wire), launch()), error => error.code === wire.code && error.message.includes(wire.diagnostic))
+  for (const invalid of [{ ...wire, diagnostic: 'x'.repeat(257) }, { ...wire, diagnostic: 'secret\\path' }, { ...wire, environment: {} }]) {
+    assert.throws(() => parseResult(JSON.stringify(invalid), launch()), { code: 'WINDOWS_LAUNCH_PROTOCOL' })
+  }
+})
+
+function windowsModule(file, replacements = {}, directory) {
   const filename = path.resolve(__dirname, '../../agents/codex/workflow', file)
   const localRequire = createRequire(filename), module = { exports: {} }
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), {
-    module, exports: module.exports, __dirname: path.dirname(filename), Buffer,
+    module, exports: module.exports, __dirname: directory || path.dirname(filename), Buffer,
     process: { platform: 'win32', pid: process.pid, execPath: process.execPath,
       env: { SystemRoot: 'C:\\Windows', NODE_OPTIONS: '--require must-not-inherit', OPENAI_API_KEY: 'must-not-inherit' } },
     require: name => Object.hasOwn(replacements, name) ? replacements[name] : localRequire(name),
@@ -45,12 +53,57 @@ function windowsModule(file, replacements = {}) {
   return module.exports
 }
 
+test('Windows helper staging copies only bound native files into verified private controller storage', t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'windows-stage-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const calls = [], original = path.resolve(__dirname, '../../agents/codex/workflow')
+  const modes = fs.statSync(original).mode
+  const deployment = windowsModule('windows-helper-deployment.js', {
+    './safe-run-root.js': { ensureWindowsPrivateAcl(directory) { calls.push(['private', directory]) } },
+    './windows-filesystem.js': { createWindowsFilesystemCapture() { return { assertRecordParent(file) { calls.push(['verify', path.dirname(file)]) } } } },
+  }).stageWindowsHelperDeployment(root)
+  assert.equal(calls[0][0], 'verify')
+  assert.equal(calls[0][1], root)
+  assert.equal(calls[1][0], 'private')
+  assert.equal(calls[1][1], deployment.root)
+  assert.deepEqual(calls[2], ['verify', deployment.root])
+  assert.equal(path.dirname(deployment.root), root)
+  const names = fs.readdirSync(deployment.root).sort()
+  assert.deepEqual(names, ['windows-appcontainer-native.cs', 'windows-appcontainer-resources-native.cs', 'windows-appcontainer-resources.ps1', 'windows-appcontainer.ps1'])
+  for (const name of names) assert.deepEqual(fs.readFileSync(path.join(deployment.root, name)), fs.readFileSync(path.join(original, name)))
+  assert.equal(fs.statSync(original).mode, modes, 'the shared installed/source runtime is never relabeled')
+  deployment.cleanup()
+  assert.deepEqual(fs.readdirSync(root), [])
+})
+
+test('Windows helper staging refuses unverified parents and linked helper inputs without residue', t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'windows-stage-refuse-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const denied = windowsModule('windows-helper-deployment.js', {
+    './safe-run-root.js': { ensureWindowsPrivateAcl() { assert.fail('Unverified parent must prevent staging') } },
+    './windows-filesystem.js': { createWindowsFilesystemCapture() { return { assertRecordParent() { throw Object.assign(new Error('private parent refused'), { code: 'PREIMAGE_UNSAFE' }) } } } },
+  })
+  assert.throws(() => denied.stageWindowsHelperDeployment(root), { code: 'PREIMAGE_UNSAFE' })
+  assert.deepEqual(fs.readdirSync(root), [])
+  const source = path.join(root, 'source'), control = path.join(root, 'control')
+  fs.mkdirSync(source); fs.mkdirSync(control)
+  const real = path.join(root, 'linked-source.ps1')
+  fs.writeFileSync(real, 'bounded helper fixture')
+  fs.linkSync(real, path.join(source, 'windows-appcontainer.ps1'))
+  const unsafe = windowsModule('windows-helper-deployment.js', {
+    './safe-run-root.js': { ensureWindowsPrivateAcl() {} },
+    './windows-filesystem.js': { createWindowsFilesystemCapture() { return { assertRecordParent() {} } } },
+  }, source)
+  assert.throws(() => unsafe.stageWindowsHelperDeployment(control), { code: 'WINDOWS_RUNTIME_MISMATCH' })
+  assert.deepEqual(fs.readdirSync(control), [])
+})
+
 test('Windows ownership setup keeps a bounded cold-start allowance and never caches a failed privacy proof', () => {
   const attempts = []
   const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(file, argv, options) {
     attempts.push({ file, argv, options })
     return attempts.length === 1
-      ? { status: null, signal: 'SIGTERM', error: { code: 'ETIMEDOUT' }, stderr: 'bounded native diagnostic' }
+      ? { status: null, signal: 'SIGTERM', error: { code: 'ETIMEDOUT' }, stdout: 'TOKEN_OWNER_COMPILING\n', stderr: 'bounded native diagnostic' }
       : { status: 0, signal: null, stderr: '' }
   } } })
   assert.throws(() => safe.ensureWindowsDefaultTokenOwner(), error => {
@@ -58,6 +111,7 @@ test('Windows ownership setup keeps a bounded cold-start allowance and never cac
     assert.equal(error.details.stage, 'windows-default-token-owner')
     assert.equal(error.details.cause, 'ETIMEDOUT')
     assert.equal(error.details.signal, 'SIGTERM')
+    assert.equal(error.details.helperPhase, 'compiling')
     return true
   })
   assert.equal(safe.ensureWindowsDefaultTokenOwner().supported, true)
@@ -71,6 +125,60 @@ test('Windows ownership setup keeps a bounded cold-start allowance and never cac
     assert.equal(options.env.OPENAI_API_KEY, undefined)
     assert.equal(fs.existsSync(options.env.TEMP), false, 'temporary compiler files must be removed after success and failure')
   }
+})
+
+test('Windows private ACL grants usable file rights, directory inheritance, and refuses linked targets', t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'windows-acl-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'connection.json'), link = path.join(root, 'linked')
+  fs.writeFileSync(file, 'fixture')
+  fs.symlinkSync(root, link, process.platform === 'win32' ? 'junction' : 'dir')
+  const calls = []
+  const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(executable, argv, options) {
+    calls.push({ executable, argv, options })
+    return { status: 0, signal: null, stderr: '', stdout: executable === 'whoami.exe' ? '"runner","S-1-5-21-123-456-789-1001"\n' : '' }
+  } } })
+  safe.ensureWindowsPrivateAcl(file)
+  safe.ensureWindowsPrivateAcl(root)
+  const grants = calls.filter(call => call.argv.includes('/grant:r'))
+  assert.equal(grants.length, 2)
+  assert.ok(grants[0].argv.includes('*S-1-5-21-123-456-789-1001:F'))
+  assert.ok(grants[0].argv.includes('*S-1-5-18:F'))
+  assert.ok(grants[1].argv.includes('*S-1-5-21-123-456-789-1001:(OI)(CI)F'))
+  assert.ok(calls.filter(call => call.executable === 'icacls.exe').every(call => call.options.timeout === 30000))
+  const before = calls.filter(call => call.executable === 'icacls.exe').length
+  assert.throws(() => safe.ensureWindowsPrivateAcl(link), { code: 'PRIVACY_UNSUPPORTED' })
+  assert.equal(calls.filter(call => call.executable === 'icacls.exe').length, before)
+})
+
+test('Windows boundary establishes privacy on its fresh child before policy writes and audits loaded state', t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'windows-boundary-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  for (const name of ['parent', 'target', 'scratch']) fs.mkdirSync(path.join(root, name))
+  const native = require('../../agents/reasonix/workflow/native.js'), privateRoots = new Set()
+  let audited = false
+  const boundary = windowsModule('../../../scripts/harness-v2-tool-boundary.cjs', {
+    '../agents/reasonix/workflow/native.js': { ...native,
+      writePrivate(file, bytes) { assert.ok(privateRoots.has(path.dirname(file))); native.writePrivate(file, bytes) },
+      readBound(file) { assert.equal(audited, true); return native.readBound(file) },
+    },
+    '../agents/codex/workflow/safe-run-root.js': { ensureWindowsPrivateAcl(directory) {
+      assert.equal(path.dirname(directory), path.join(root, 'parent'))
+      assert.deepEqual(fs.readdirSync(directory), [])
+      privateRoots.add(directory)
+    } },
+    '../agents/codex/workflow/windows-filesystem.js': { createWindowsFilesystemCapture() { return { assertRecordParent(file) {
+      assert.ok(privateRoots.has(path.dirname(file))); audited = true
+    } } } },
+    '../agents/codex/workflow/windows-appcontainer-command.js': { resolveWindowsBash() { return { bash: { path: 'C:\\Git\\usr\\bin\\bash.exe' } } } },
+  })
+  const policy = { readOnly: true, targetPath: path.join(root, 'target'), scratchPath: path.join(root, 'scratch'),
+    readableRoots: [path.join(root, 'target'), path.join(root, 'scratch')], writableRoots: [path.join(root, 'scratch')],
+    nestedDispatch: false, commandBoundary: true, externalWrites: false }
+  const prepared = boundary.prepareBoundary({ provider: 'claude', root: path.join(root, 'parent'), policy })
+  assert.equal(privateRoots.size, 1)
+  boundary.loadBoundary(prepared.policyPath, prepared.policySha256)
+  assert.equal(audited, true)
 })
 
 test('Windows AppContainer probe reports bounded native privacy causes before launch without exposing arbitrary details', async () => {

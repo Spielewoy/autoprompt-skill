@@ -78,7 +78,9 @@ function packedEnvironment(directory, bin) {
 test('packed artifact installs and verifies all public providers without the checkout or network', { timeout: 900000 }, async t => {
   // The space in this prefix is deliberate: it exercises npm, Node, and the
   // installer ports with paths that need quoting on every supported host.
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt packed v2-'))
+  // macOS exposes its temporary directory through the system /var symlink.
+  // Use the physical owned root so private-root checks still reject real links.
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt packed v2-')))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const bin = path.join(directory, 'version probes')
   const env = { ...packedEnvironment(directory, bin), npm_config_cache: path.join(directory, 'npm cache') }

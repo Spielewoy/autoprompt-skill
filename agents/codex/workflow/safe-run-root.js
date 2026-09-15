@@ -190,8 +190,11 @@ function ensureWindowsDefaultTokenOwner() {
   ].join(' ')
   const script = [
     "$ErrorActionPreference='Stop'",
+    "[Console]::Out.WriteLine('TOKEN_OWNER_COMPILING')",
     'Add-Type -TypeDefinition $env:AUTOPROMPT_TOKEN_OWNER_SOURCE -Language CSharp',
+    "[Console]::Out.WriteLine('TOKEN_OWNER_APPLYING')",
     '[AutopromptDefaultTokenOwner]::Apply([int]$env:AUTOPROMPT_TOKEN_OWNER_PID,$env:AUTOPROMPT_TOKEN_OWNER_IMAGE)',
+    "[Console]::Out.WriteLine('TOKEN_OWNER_READY')",
   ].join(';')
   const systemRoot = process.env.SystemRoot || process.env.WINDIR
   if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) {
@@ -227,6 +230,8 @@ function ensureWindowsDefaultTokenOwner() {
   if (result.error || result.signal || result.status !== 0 || result.stderr) {
     throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Cannot establish the Windows token user as the default owner for new run-record objects', {
       stage: 'windows-default-token-owner',
+      helperPhase: String(result.stdout || '').includes('TOKEN_OWNER_APPLYING') ? 'applying'
+        : String(result.stdout || '').includes('TOKEN_OWNER_COMPILING') ? 'compiling' : 'startup',
       status: result.status,
       cause: result.error && result.error.code,
       signal: result.signal,
@@ -245,14 +250,21 @@ function ensureWindowsPrivateAcl(target) {
   // token's SID for both grants and ownership, including elevated sessions
   // whose newly created objects otherwise belong to Administrators.
   const identity = spawnSync('whoami.exe', ['/user', '/fo', 'csv', '/nh'], {
-    encoding: 'utf8', windowsHide: true,
+    encoding: 'utf8', windowsHide: true, timeout: 15000,
   })
   const row = identity.status === 0 && String(identity.stdout || '').trim().match(/^"(?:[^"\r\n]|"")+","(S-1-(?:\d+-)+\d+)"$/i)
   if (!row) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token identity is unavailable for a private run-record DACL')
   const account = `*${row[1]}`
-  const result = spawnSync('icacls.exe', [target, '/inheritance:r', '/grant:r', `${account}:(OI)(CI)F`, '/grant:r', '*S-1-5-18:(OI)(CI)F'], {
+  const stat = fs.lstatSync(target)
+  if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'A private Windows DACL requires a physical file or directory')
+  }
+  // Inheritance rights apply to directories only. Applying them to a regular
+  // file can remove its usable grant before the subsequent owner update.
+  const rights = stat.isDirectory() ? '(OI)(CI)F' : 'F'
+  const result = spawnSync('icacls.exe', [target, '/inheritance:r', '/grant:r', `${account}:${rights}`, '/grant:r', `*S-1-5-18:${rights}`], {
     encoding: 'utf8',
-    windowsHide: true,
+    windowsHide: true, timeout: 30000,
   })
   if (result.status !== 0) {
     throw new RunRecordError('PRIVACY_UNSUPPORTED', `Cannot establish a private Windows DACL for run-record root: ${target}`, {
@@ -261,7 +273,7 @@ function ensureWindowsPrivateAcl(target) {
     })
   }
   const owner = spawnSync('icacls.exe', [target, '/setowner', account], {
-    encoding: 'utf8', windowsHide: true,
+    encoding: 'utf8', windowsHide: true, timeout: 30000,
   })
   if (owner.status !== 0) {
     throw new RunRecordError('PRIVACY_UNSUPPORTED', `Cannot establish private Windows ownership for run-record root: ${target}`, {

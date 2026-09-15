@@ -117,7 +117,7 @@ function parseRecordResult(stdout, operation, content, leaf) {
   let value; try { value = JSON.parse(stdout) } catch { fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows record response is not JSON') }
   if (value?.status === 'REFUSED') {
     if (!exact(value, ['schemaVersion', 'status', 'code']) || value.schemaVersion !== 1 || typeof value.code !== 'string' || !/^[A-Z_]{3,80}$/u.test(value.code)) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows record refusal is malformed')
-    fail(value.code === 'FILESYSTEM_ALREADY_EXISTS' ? 'EEXIST' : value.code === 'FILESYSTEM_NOT_FOUND' ? 'ENOENT' : value.code, 'Windows record helper refused request')
+    fail(value.code === 'FILESYSTEM_ALREADY_EXISTS' ? 'EEXIST' : value.code === 'FILESYSTEM_NOT_FOUND' ? 'ENOENT' : value.code, `Windows record helper refused ${operation}`)
   }
   if (operation === 'inspect-owned-target') {
     if (!exact(value, ['schemaVersion', 'status', 'parentIdentity', 'targetIdentity']) || value.schemaVersion !== 1 || value.status !== 'INSPECTED') fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows target inspection is malformed')

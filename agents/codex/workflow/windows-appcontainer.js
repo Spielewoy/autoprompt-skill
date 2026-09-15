@@ -45,7 +45,7 @@ function validateLaunch(input) {
 function parseResult(text, expected) {
   let wire
   try { wire = JSON.parse(text) } catch { fail('WINDOWS_LAUNCH_PROTOCOL', 'AppContainer helper returned invalid JSON') }
-  if (exact(wire, ['schemaVersion', 'status', 'code']) && wire.schemaVersion === 1 && wire.status === 'REFUSED' && /^(?:WINDOWS_[A-Z_]{1,64}|APPCONTAINER_CLEANUP_UNCONFIRMED)$/.test(wire.code)) fail(wire.code, 'AppContainer helper refused the launch')
+  if ((exact(wire, ['schemaVersion', 'status', 'code']) || (exact(wire, ['schemaVersion', 'status', 'code', 'diagnostic']) && typeof wire.diagnostic === 'string' && /^[A-Za-z0-9_ .:()-]{1,256}$/.test(wire.diagnostic))) && wire.schemaVersion === 1 && wire.status === 'REFUSED' && /^(?:WINDOWS_[A-Z_]{1,64}|APPCONTAINER_CLEANUP_UNCONFIRMED)$/.test(wire.code)) fail(wire.code, `AppContainer helper refused the launch${wire.diagnostic ? `: ${wire.diagnostic}` : ''}`)
   const keys = ['RootPid', 'ExitCode', 'ObservedJobMembers', 'LauncherSessionId', 'AppContainerSid', 'StdoutBase64', 'StderrBase64', 'RootImageMatches', 'Drained', 'TimedOut', 'OutputLimit', 'Cancelled']
   const result = wire && wire.result
   if (!exact(wire, ['schemaVersion', 'status', 'result']) || wire.schemaVersion !== 1 || wire.status !== 'COMPLETED' || !exact(result, keys) || result.AppContainerSid !== expected.profileSid || result.RootImageMatches !== true || result.Drained !== true ||

@@ -1259,7 +1259,16 @@ class HarnessExecAdapter {
     const cwd = path.join(sessionRoot, 'cwd'); privateDirectory(cwd)
     const checkerScratch = record.checkerScratchBoundary ? this.checkerScratchVerifier?.(record) : null
     if (record.checkerScratchBoundary && !checkerScratch) fail('CHECKER_SCRATCH_BOUNDARY_INVALID', 'Native checker scratch boundary is not authenticated')
-    const scratchPath = checkerScratch ? targetPath : path.join(launchRoot, 'scratch'); privateDirectory(scratchPath)
+    const scratchPath = checkerScratch ? targetPath : path.join(launchRoot, 'scratch')
+    const scratchExisted = fs.existsSync(scratchPath)
+    privateDirectory(scratchPath)
+    if (process.platform === 'win32' && !checkerScratch) {
+      // Only newly allocated controller scratch may be relabeled. A resumed
+      // directory must already satisfy the native private-owner contract.
+      if (!scratchExisted) require('../agents/codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(scratchPath)
+      require('../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture()
+        .assertRecordParent(path.join(scratchPath, 'scratch-parent-check'))
+    }
     const candidatePath = checkerScratch ? path.resolve(checkerScratch.frozenCandidateRoot) : targetPath
     if (checkerScratch && path.resolve(checkerScratch.writableScratchRoot) !== scratchPath) fail('CHECKER_SCRATCH_BOUNDARY_INVALID', 'Native checker scratch differs from its authenticated working directory')
     if (record.logicalRole === 'independent-checker' && (!readOnly || execution.canDispatch !== false ||

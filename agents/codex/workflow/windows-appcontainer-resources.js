@@ -84,33 +84,39 @@ function bind(file, max, single = true) {
     return { path: canonical, dev: String(before.dev), ino: String(before.ino), size: Number(before.size), sha256: sha(bytes) }
   } finally { fs.closeSync(fd) }
 }
-function nativeBackend(controlRoot) {
+function nativeBackend(controlRoot, deploymentRoot) {
   need(process.platform === 'win32', 'COMMAND_SANDBOX_UNSUPPORTED')
-  const systemRoot = process.env.SystemRoot
-  need(typeof systemRoot === 'string' && /^[A-Za-z]:\\Windows$/i.test(systemRoot), 'WINDOWS_RUNTIME_INVALID')
-  const files = [
-    [path.join(__dirname, 'windows-appcontainer-resources.ps1'), 1024 * 1024, true],
-    [path.join(__dirname, 'windows-appcontainer-resources-native.cs'), 4 * 1024 * 1024, true],
-    [path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), 64 * 1024 * 1024, false],
-  ]
-  const bindings = files.map(args => bind(...args)), capture = createWindowsFilesystemCapture()
-  capture.assertRecordParent(bindings[0].path)
-  const verify = () => files.forEach((args, index) => need(JSON.stringify(bind(...args)) === JSON.stringify(bindings[index]), 'WINDOWS_RUNTIME_MISMATCH'))
-  return { capture, invoke(request) {
-    verify()
-    const input = JSON.stringify(request); need(Buffer.byteLength(input) <= 12 * 1024 * 1024, 'WINDOWS_RESOURCE_LIMIT')
-    const result = cp.spawnSync(bindings[2].path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', bindings[0].path, '-NativeSha256', bindings[1].sha256, '-Request'], {
-      input, encoding: 'utf8', timeout: 120000, maxBuffer: 12 * 1024 * 1024, windowsHide: true, shell: false, cwd: path.dirname(bindings[2].path),
-      env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.join(systemRoot, 'System32'), PSModulePath: '', TEMP: controlRoot, TMP: controlRoot },
-    })
-    verify()
-    need(!result.error && result.status === 0 && !result.signal && result.stderr === '', 'WINDOWS_RESOURCE_HELPER_FAILED')
-    let wire; try { wire = JSON.parse(result.stdout) } catch { fail('WINDOWS_RESOURCE_PROTOCOL', 'Resource helper returned invalid JSON') }
-    if (exact(wire, ['schemaVersion', 'status', 'code']) && wire.schemaVersion === 1 && wire.status === 'REFUSED' && /^(?:WINDOWS|FILESYSTEM|PREIMAGE)_[A-Z_]{1,80}$/.test(wire.code)) fail(wire.code, 'Resource helper refused the operation')
-    const field = request.operation === 'plan' ? 'plan' : 'result', status = { plan: 'PLANNED', apply: 'PREPARED', restore: 'RESTORED' }[request.operation]
-    need(exact(wire, ['schemaVersion', 'status', field]) && wire.schemaVersion === 1 && wire.status === status, 'WINDOWS_RESOURCE_PROTOCOL')
-    return wire[field]
-  } }
+  // Standalone crash recovery creates a fresh verified deployment under the
+  // retained controller root; command execution supplies its existing one.
+  const ownedDeployment = deploymentRoot ? null : require('./windows-helper-deployment.js').stageWindowsHelperDeployment(controlRoot)
+  deploymentRoot ||= ownedDeployment.root
+  try {
+    const systemRoot = process.env.SystemRoot
+    need(typeof systemRoot === 'string' && /^[A-Za-z]:\\Windows$/i.test(systemRoot), 'WINDOWS_RUNTIME_INVALID')
+    const files = [
+      [path.join(deploymentRoot, 'windows-appcontainer-resources.ps1'), 1024 * 1024, true],
+      [path.join(deploymentRoot, 'windows-appcontainer-resources-native.cs'), 4 * 1024 * 1024, true],
+      [path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), 64 * 1024 * 1024, false],
+    ]
+    const bindings = files.map(args => bind(...args)), capture = createWindowsFilesystemCapture()
+    capture.assertRecordParent(bindings[0].path)
+    const verify = () => files.forEach((args, index) => need(JSON.stringify(bind(...args)) === JSON.stringify(bindings[index]), 'WINDOWS_RUNTIME_MISMATCH'))
+    return { capture, cleanup: ownedDeployment?.cleanup, invoke(request) {
+      verify()
+      const input = JSON.stringify(request); need(Buffer.byteLength(input) <= 12 * 1024 * 1024, 'WINDOWS_RESOURCE_LIMIT')
+      const result = cp.spawnSync(bindings[2].path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', bindings[0].path, '-NativeSha256', bindings[1].sha256, '-Request'], {
+        input, encoding: 'utf8', timeout: 120000, maxBuffer: 12 * 1024 * 1024, windowsHide: true, shell: false, cwd: path.dirname(bindings[2].path),
+        env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.join(systemRoot, 'System32'), PSModulePath: '', TEMP: controlRoot, TMP: controlRoot },
+      })
+      verify()
+      need(!result.error && result.status === 0 && !result.signal && result.stderr === '', 'WINDOWS_RESOURCE_HELPER_FAILED')
+      let wire; try { wire = JSON.parse(result.stdout) } catch { fail('WINDOWS_RESOURCE_PROTOCOL', 'Resource helper returned invalid JSON') }
+      if ((exact(wire, ['schemaVersion', 'status', 'code']) || (exact(wire, ['schemaVersion', 'status', 'code', 'diagnostic']) && typeof wire.diagnostic === 'string' && /^[A-Za-z0-9_ .:()-]{1,256}$/.test(wire.diagnostic))) && wire.schemaVersion === 1 && wire.status === 'REFUSED' && /^(?:WINDOWS|FILESYSTEM|PREIMAGE)_[A-Z_]{1,80}$/.test(wire.code)) fail(wire.code, `Resource helper refused ${request.operation}${wire.diagnostic ? `: ${wire.diagnostic}` : ''}`)
+      const field = request.operation === 'plan' ? 'plan' : 'result', status = { plan: 'PLANNED', apply: 'PREPARED', restore: 'RESTORED' }[request.operation]
+      need(exact(wire, ['schemaVersion', 'status', field]) && wire.schemaVersion === 1 && wire.status === status, 'WINDOWS_RESOURCE_PROTOCOL')
+      return wire[field]
+    } }
+  } catch (error) { ownedDeployment?.cleanup(); throw error }
 }
 // The factory is an explicit controller dependency seam; normal callers use the
 // exports below, whose backend is always the bound native helper.
@@ -142,13 +148,14 @@ function createWindowsAppContainerResources(backendFactory = nativeBackend) {
             need(exact(receipt, ['schemaVersion', 'leaseId', 'profileSid', 'result']) && receipt.schemaVersion === 1 && receipt.leaseId === leaseId && receipt.profileSid === plan.profileSid, 'WINDOWS_RESOURCE_JOURNAL_MISMATCH')
             const result = restoreResult(receipt.result)
             need(result.restored + result.deletedEntries === plan.entries.length, 'WINDOWS_RESOURCE_JOURNAL_MISMATCH')
-            released = true; return result
+            released = true; backend.cleanup?.(); return result
           }
           const result = restoreResult(await backend.invoke({ schemaVersion: 1, operation: 'restore', plan }))
           need(result.restored + result.deletedEntries === plan.entries.length, 'WINDOWS_RESOURCE_PROTOCOL')
           const done = Buffer.from(JSON.stringify({ schemaVersion: 1, leaseId, profileSid: plan.profileSid, result }) + '\n')
           try { backend.capture.publishRecordExclusive(journalPath + '.restored', done) } catch (error) { if (error.code !== 'EEXIST') throw error; need(backend.capture.captureFileBytes(journalPath + '.restored').content.equals(done), 'WINDOWS_RESOURCE_JOURNAL_MISMATCH') }
           released = true
+          backend.cleanup?.()
           return result
         } catch (error) {
           error.recovery = Object.freeze({ journalPath, leaseId, profileSid: plan.profileSid }); throw error
@@ -163,30 +170,35 @@ function createWindowsAppContainerResources(backendFactory = nativeBackend) {
       need(typeof verifyDrainEvidence === 'function', 'APPCONTAINER_CLEANUP_UNCONFIRMED')
       const roots = resourceRoots(policy, controlRoot, executableRoots)
       const leaseId = crypto.randomBytes(16).toString('hex'), profileName = `Autoprompt_${leaseId}`
-      const backend = backendFactory(controlRoot), journalPath = path.win32.join(controlRoot, `${leaseId}.resources.json`)
-      backend.capture.assertRecordParent(journalPath)
-      const plan = validatePlan(await backend.invoke({ schemaVersion: 1, operation: 'plan', profileName, roots }), { profileName, roots })
-      backend.capture.publishRecordExclusive(journalPath, journalBytes(leaseId, plan))
+      const backend = backendFactory(controlRoot, options.deploymentRoot), journalPath = path.win32.join(controlRoot, `${leaseId}.resources.json`)
       try {
-        const result = await backend.invoke({ schemaVersion: 1, operation: 'apply', plan })
-        need(exact(result, ['profileName', 'profileSid', 'profilePath']) && result.profileName === profileName && result.profileSid === plan.profileSid, 'WINDOWS_RESOURCE_PROTOCOL')
-        absolute(result.profilePath)
-        return leaseFor(plan, leaseId, journalPath, backend, verifyDrainEvidence, { USERPROFILE: result.profilePath, HOME: result.profilePath, APPDATA: result.profilePath, TEMP: policy.scratchPath, TMP: policy.scratchPath })
-      } catch (error) {
-        error.recovery = Object.freeze({ journalPath, leaseId, profileSid: plan.profileSid }); throw error
-      }
+        backend.capture.assertRecordParent(journalPath)
+        const plan = validatePlan(await backend.invoke({ schemaVersion: 1, operation: 'plan', profileName, roots }), { profileName, roots })
+        backend.capture.publishRecordExclusive(journalPath, journalBytes(leaseId, plan))
+        try {
+          const result = await backend.invoke({ schemaVersion: 1, operation: 'apply', plan })
+          need(exact(result, ['profileName', 'profileSid', 'profilePath']) && result.profileName === profileName && result.profileSid === plan.profileSid, 'WINDOWS_RESOURCE_PROTOCOL')
+          absolute(result.profilePath)
+          return leaseFor(plan, leaseId, journalPath, backend, verifyDrainEvidence, { USERPROFILE: result.profilePath, HOME: result.profilePath, APPDATA: result.profilePath, TEMP: policy.scratchPath, TMP: policy.scratchPath })
+        } catch (error) {
+          error.recovery = Object.freeze({ journalPath, leaseId, profileSid: plan.profileSid }); throw error
+        }
+      } catch (error) { backend.cleanup?.(); throw error }
     },
     async recoverWindowsAppContainerResources(options) {
       const { controlRoot, journalPath, verifyDrainEvidence, evidence } = options
       absolute(controlRoot); absolute(journalPath)
       need(path.win32.dirname(journalPath).toLowerCase() === controlRoot.toLowerCase() && /^[a-f0-9]{32}\.resources\.json$/.test(path.win32.basename(journalPath)))
-      const backend = backendFactory(controlRoot); backend.capture.assertRecordParent(journalPath)
-      const captured = backend.capture.captureFileBytes(journalPath)
-      need(Buffer.isBuffer(captured.content) && captured.content.length <= LIMIT)
-      let journal; try { journal = JSON.parse(captured.content.toString('utf8')) } catch { fail('WINDOWS_RESOURCE_JOURNAL_INVALID', 'Resource journal is invalid') }
-      need(exact(journal, ['schemaVersion', 'leaseId', 'plan', 'sha256']) && journal.schemaVersion === 1 && /^[a-f0-9]{32}$/.test(journal.leaseId) && path.win32.basename(journalPath) === `${journal.leaseId}.resources.json` && journal.sha256 === sha(JSON.stringify({ schemaVersion: 1, leaseId: journal.leaseId, plan: journal.plan })), 'WINDOWS_RESOURCE_JOURNAL_INVALID')
-      const plan = validatePlan(journal.plan, { profileName: `Autoprompt_${journal.leaseId}` })
-      return leaseFor(plan, journal.leaseId, journalPath, backend, verifyDrainEvidence).release(evidence)
+      const backend = backendFactory(controlRoot, options.deploymentRoot)
+      try {
+        backend.capture.assertRecordParent(journalPath)
+        const captured = backend.capture.captureFileBytes(journalPath)
+        need(Buffer.isBuffer(captured.content) && captured.content.length <= LIMIT)
+        let journal; try { journal = JSON.parse(captured.content.toString('utf8')) } catch { fail('WINDOWS_RESOURCE_JOURNAL_INVALID', 'Resource journal is invalid') }
+        need(exact(journal, ['schemaVersion', 'leaseId', 'plan', 'sha256']) && journal.schemaVersion === 1 && /^[a-f0-9]{32}$/.test(journal.leaseId) && path.win32.basename(journalPath) === `${journal.leaseId}.resources.json` && journal.sha256 === sha(JSON.stringify({ schemaVersion: 1, leaseId: journal.leaseId, plan: journal.plan })), 'WINDOWS_RESOURCE_JOURNAL_INVALID')
+        const plan = validatePlan(journal.plan, { profileName: `Autoprompt_${journal.leaseId}` })
+        return await leaseFor(plan, journal.leaseId, journalPath, backend, verifyDrainEvidence).release(evidence)
+      } finally { backend.cleanup?.() }
     },
   }
 }
