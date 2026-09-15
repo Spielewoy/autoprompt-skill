@@ -40,9 +40,22 @@ jobs:
           architecture: ${{ matrix.runner.arch }}
       - name: Install declared Python installer and validation dependencies
         run: 'python -m pip install --only-binary=:all: PyYAML==6.0.3 jsonschema==4.26.0 referencing==0.37.0'
+      - name: Install and enable Linux sandbox prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Install macOS installer shells
         if: runner.os == 'macOS'
-        run: brew install bash powershell
+        shell: bash
+        run: |
+          brew install bash
+          if ! command -v pwsh >/dev/null 2>&1; then
+            brew install powershell
+          fi
       - name: Require PowerShell
         shell: pwsh
         run: $PSVersionTable.PSVersion.ToString()

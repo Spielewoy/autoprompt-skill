@@ -12,7 +12,7 @@ function processGroup(pid) { return fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
 
 if (process.platform !== 'linux') test('owned VS Code Xvfb lifecycle requires Linux process fixtures', { skip: true }, () => {})
 else test('owned VS Code display is a private worker-group child and drains on normal completion', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-lima-vscode-display-'))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-lima-vscode-display-')))
   fs.chmodSync(root, 0o700)
   const server = path.join(root, 'fake-xvfb.cjs'), xvfb = path.join(root, 'fake-xvfb'), xauth = path.join(root, 'fake-xauth'), probe = path.join(root, 'fake-xdpyinfo')
   fs.writeFileSync(server, `const fs=require('node:fs'),net=require('node:net'); const n=Number(process.argv[2].slice(1)); fs.mkdirSync('/tmp/.X11-unix',{recursive:true}); const socket='/tmp/.X11-unix/X'+n; try{fs.unlinkSync(socket)}catch{} const s=net.createServer(); s.listen(socket); const stop=()=>s.close(()=>process.exit(0)); process.on('SIGTERM',stop); process.on('SIGINT',stop);`, { mode: 0o600 })
@@ -39,17 +39,20 @@ else test('owned VS Code display is a private worker-group child and drains on n
   assert.equal(fs.existsSync(`/proc/${owned.child.pid}`), false, `owned Xvfb pid ${owned.child.pid}/${childTicks} survived shutdown`)
 })
 
-test('owned VS Code display rejects malformed request identities and missing system prerequisites', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-lima-vscode-display-invalid-'))
+test('owned VS Code display rejects malformed request identities', () => {
+  assert.throws(() => display.requestDisplay('bad'), { code: 'LIMA_REQUEST_INVALID' })
+})
+
+test('owned VS Code display rejects missing POSIX system prerequisites', { skip: process.platform === 'win32' }, async t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-lima-vscode-display-invalid-')))
   fs.chmodSync(root, 0o700)
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  assert.throws(() => display.requestDisplay('bad'), { code: 'LIMA_REQUEST_INVALID' })
   await assert.rejects(display.startOwnedDisplay({ root, requestId: '00000020000000000000000000000000', xvfbPath: path.join(root, 'missing-xvfb') }), { code: 'LIMA_VSCODE_DISPLAY_UNAVAILABLE' })
 })
 
 
 test('stale display reclaim refuses a replaced reservation identity', t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-lima-vscode-slot-'))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-lima-vscode-slot-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const slot = path.join(root, 'slot'), replacement = path.join(root, 'replacement')
   const first = '{"request":"stale"}\n', second = '{"request":"live"}\n'
@@ -61,8 +64,9 @@ test('stale display reclaim refuses a replaced reservation identity', t => {
   assert.equal(fs.readFileSync(slot, 'utf8'), second, 'reclaim must not unlink a replacement reservation')
 })
 
-test('concurrent stale reclaim serializes a replacement reservation', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-lima-vscode-stale-race-'))
+// This guest integration uses Linux /proc start ticks and the real flock binary.
+test('concurrent Linux guest stale reclaim serializes a replacement reservation', { skip: process.platform !== 'linux' }, async t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-lima-vscode-stale-race-')))
   fs.chmodSync(root, 0o700)
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const firstRequest = '00000000000000000000000000000000', secondRequest = '00000020000000000000000000000000'

@@ -39,7 +39,7 @@ function physicalPython() {
 }
 
 function fixture(t) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-darwin-wrapper-')))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-darwin-wrapper-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const helper = path.join(root, 'helper.py')
   fs.copyFileSync(sourceHelper, helper)
@@ -62,9 +62,9 @@ const python = physicalPython()
 const linuxExercise = process.platform === 'linux' && Boolean(python)
 
 test('Darwin runtime closure manifest binds an exact controller-owned Python/helper set', t => {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-runtime-closure-')))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-runtime-closure-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const interpreter = fs.realpathSync(python || process.execPath)
+  const interpreter = fs.realpathSync.native(python || process.execPath)
   const copiedHelper = path.join(root, 'helper.py')
   fs.copyFileSync(sourceHelper, copiedHelper)
   fs.chmodSync(copiedHelper, 0o600)
@@ -86,7 +86,7 @@ test('Darwin runtime closure manifest binds an exact controller-owned Python/hel
 })
 
 for (const platform of ['darwin', 'win32']) test(`${platform} runtime-state hash dispatch accepts only an exact typed capture result`, t => {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-runtime-dispatch-')))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-runtime-dispatch-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const target = path.join(root, 'target')
   fs.mkdirSync(target, { mode: 0o700 })

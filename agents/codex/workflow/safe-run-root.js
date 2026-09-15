@@ -199,10 +199,14 @@ function ensureWindowsDefaultTokenOwner() {
   }
   const powershell = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-token-owner-'))
+  // The first native PowerShell/Add-Type startup on a Windows runner can be
+  // slower than a warmed helper. Keep a finite setup bound without treating a
+  // cold compiler as proof that private ownership cannot be established.
+  const timeoutMs = 60000
   let result
   try {
     result = spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
-      encoding: 'utf8', windowsHide: true, shell: false, timeout: 15000, maxBuffer: 1024 * 1024,
+      encoding: 'utf8', windowsHide: true, shell: false, timeout: timeoutMs, maxBuffer: 1024 * 1024,
       cwd: path.win32.dirname(powershell),
       env: {
         SystemRoot: systemRoot,
@@ -222,8 +226,11 @@ function ensureWindowsDefaultTokenOwner() {
   }
   if (result.error || result.signal || result.status !== 0 || result.stderr) {
     throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Cannot establish the Windows token user as the default owner for new run-record objects', {
+      stage: 'windows-default-token-owner',
       status: result.status,
       cause: result.error && result.error.code,
+      signal: result.signal,
+      timeoutMs,
       stderr: result.stderr && result.stderr.trim(),
     })
   }

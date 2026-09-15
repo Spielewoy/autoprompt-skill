@@ -52,13 +52,17 @@ function assertDoctorCases(output, platform = process.platform) {
 }
 
 async function runTests(argv, environment, logPath) {
-  const child = cp.spawn(process.execPath, argv, { env: environment, stdio: ['ignore', 'pipe', 'pipe'] })
-  let output = ''
-  child.stdout.on('data', bytes => { output += bytes; process.stdout.write(bytes) })
-  child.stderr.on('data', bytes => { output += bytes; process.stderr.write(bytes) })
-  const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve) })
-  fs.writeFileSync(logPath, output)
-  return { code, output }
+  // Preserve evidence as it arrives, including when a hung job is cancelled
+  // before the child closes and the final assertions can run.
+  const log = fs.openSync(logPath, 'w')
+  try {
+    const child = cp.spawn(process.execPath, argv, { env: environment, stdio: ['ignore', 'pipe', 'pipe'] })
+    let output = ''
+    child.stdout.on('data', bytes => { fs.writeSync(log, bytes); output += bytes; process.stdout.write(bytes) })
+    child.stderr.on('data', bytes => { fs.writeSync(log, bytes); output += bytes; process.stderr.write(bytes) })
+    const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve) })
+    return { code, output }
+  } finally { fs.closeSync(log) }
 }
 
 async function main() {

@@ -11,6 +11,7 @@ const host = require('../../scripts/lima-runtime.cjs')
 const guest = require('../../scripts/lima-runtime-guest.cjs')
 const lifecycle = require('../../scripts/lima-runtime-guest-lifecycle.cjs')
 const cli = require('../../bin/autoprompt.cjs')
+const { ensureWindowsPrivateAcl } = require('../../agents/codex/workflow/safe-run-root.js')
 
 test('Lima guest rejects transport control, arbitrary executables, host paths, and self-admission', () => {
   const request = value => guest.parseRequest(Buffer.from(JSON.stringify(value)))
@@ -130,14 +131,15 @@ test('Lima public VM parsing requires an explicit provider connection binding an
   assert.equal(setup.modelSelection, '/private/grok-selection.json')
   assert.throws(() => cli.parseArgs(['runtime', 'vm', 'setup', '--root', '/private/vm', '--target', '/work', '--provider', 'codex', '--endpoint', 'https://gateway.example.invalid', '--lima', '/tools/limactl', '--archive', '/private/autoprompt.tgz', '--vm-type', 'vz']), { code: 'AUTOPROMPT_USAGE' })
   const activation = cli.parseArgs(['activate', 'grok', '--vm-root', '/private/vm', '--resume', `apv2-${'a'.repeat(32)}`, '--', 'work'])
-  assert.equal(activation.vmRoot, '/private/vm')
+  assert.equal(activation.vmRoot, path.resolve('/private/vm'))
   assert.equal(activation.resume, `apv2-${'a'.repeat(32)}`)
   assert.throws(() => cli.parseArgs(['activate', 'grok', '--vm-root', '/private/vm', '--target', '/work', '--', 'work']), { code: 'AUTOPROMPT_USAGE' })
   assert.deepEqual(cli.parseArgs(['runtime', 'vm', 'cancel', '--root', '/private/vm', '--request-id', 'a'.repeat(32)]), { command: 'runtime-vm', action: 'cancel', root: '/private/vm', requestId: 'a'.repeat(32) })
 })
 
 test('Lima provider binding validates every public provider through its concrete native connection projection', t => {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lima-provider-')))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'lima-provider-')))
+  ensureWindowsPrivateAcl(root)
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const endpoint = 'https://gateway.example.invalid/v1'
   const connections = {
@@ -156,9 +158,11 @@ test('Lima provider binding validates every public provider through its concrete
   for (const provider of Object.keys(connections)) {
     const connection = path.join(root, `${provider}.connection`)
     fs.writeFileSync(connection, typeof connections[provider] === 'string' ? connections[provider] : JSON.stringify(connections[provider]), { mode: 0o600 })
+    ensureWindowsPrivateAcl(connection)
     const native = host.connectionBinding(connection, provider, endpoint)
     const credential = path.join(root, `${provider}.credentials.json`)
     fs.writeFileSync(credential, JSON.stringify({ schemaVersion: 1, provider, environment: { [credentials[provider]]: 'fixture-only' } }), { mode: 0o600 })
+    ensureWindowsPrivateAcl(credential)
     const bound = host.credentialBinding(credential, provider, native)
     assert.match(bound.sha256, /^[a-f0-9]{64}$/)
     assert.doesNotMatch(JSON.stringify({ native, bound }), /fixture-only/)
@@ -167,15 +171,22 @@ test('Lima provider binding validates every public provider through its concrete
   const badCredential = path.join(root, 'bad.json')
   fs.writeFileSync(badCredential, JSON.stringify({ schemaVersion: 1, provider: 'hermes', environment: { BASH_ENV: 'fixture-only' } }), { mode: 0o600 })
   const hermesConnection = path.join(root, 'hermes-valid.json'); fs.writeFileSync(hermesConnection, '{}', { mode: 0o600 })
+  ensureWindowsPrivateAcl(badCredential)
+  ensureWindowsPrivateAcl(hermesConnection)
   assert.throws(() => host.credentialBinding(badCredential, 'hermes', host.connectionBinding(hermesConnection, 'hermes', endpoint)), { code: 'LIMA_PROVIDER_CONFIG_INVALID' })
-  fs.chmodSync(badCredential, 0o644)
+  // The second rejection must prove privacy enforcement with otherwise valid content.
+  fs.writeFileSync(badCredential, JSON.stringify({ schemaVersion: 1, provider: 'hermes', environment: { HERMES_API_KEY: 'fixture-only' } }))
+  if (process.platform === 'win32') {
+    const changed = childProcess.spawnSync('icacls.exe', [badCredential, '/inheritance:e'], { encoding: 'utf8', windowsHide: true })
+    assert.equal(changed.status, 0, changed.stderr || changed.stdout)
+  } else fs.chmodSync(badCredential, 0o644)
   assert.throws(() => host.credentialBinding(badCredential, 'hermes', host.connectionBinding(hermesConnection, 'hermes', endpoint)), { code: 'LIMA_PROVIDER_CONFIG_INVALID' })
-  fs.chmodSync(badCredential, 0o600)
   const alias = path.join(root, 'connection-alias.json'); fs.symlinkSync(hermesConnection, alias)
   assert.throws(() => host.connectionBinding(alias, 'hermes', endpoint), { code: 'LIMA_PATH_UNSAFE' })
 })
 
-test('guest worker terminates itself when its lifecycle IPC owner disconnects', async t => {
+// The Linux guest owns a POSIX process group; Windows hosts use the WSL guest.
+test('guest worker terminates itself when its lifecycle IPC owner disconnects', { skip: process.platform === 'win32' }, async t => {
   const worker = childProcess.fork(path.join(__dirname, '..', '..', 'scripts', 'lima-runtime-guest-worker.cjs'), [], {
     detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
   })
@@ -205,11 +216,12 @@ test('Lima extends only an unaccelerated QEMU boot readiness deadline', () => {
 })
 
 test('Lima config exports only selected target and has no SSHFS, automatic sync, sockets, or agent forwarding', () => {
+  const target = path.resolve('/Users/test/project')
   for (const vmType of ['qemu', 'vz']) {
-    const config = host.makeConfig({ target: '/Users/test/project', arch: 'x86_64', vmType, provider: 'codex' })
+    const config = host.makeConfig({ target, arch: 'x86_64', vmType, provider: 'codex' })
     assert.equal(config.mounts.length, 1)
-    assert.equal(config.mounts[0].location, '/Users/test/project')
-    assert.equal(config.mounts[0].mountPoint, '/Users/test/project')
+    assert.equal(config.mounts[0].location, target)
+    assert.equal(config.mounts[0].mountPoint, target)
     assert.equal(config.mountType, vmType === 'qemu' ? '9p' : 'virtiofs')
     assert.doesNotMatch(config.provision[0].script, /(?:Xvfb|xvfb|libgtk-3-0|libasound2)/, 'Codex setup must not install VS Code GUI dependencies')
     if (vmType === 'qemu') assert.deepEqual(config.mounts[0]['9p'], { securityModel: 'none', cache: 'none' })
@@ -217,13 +229,13 @@ test('Lima config exports only selected target and has no SSHFS, automatic sync,
     assert.deepEqual(config.portForwards, [{ guestPortRange: [1, 65535], ignore: true }])
     assert.match(config.images[0].digest, /^sha256:[a-f0-9]{64}$/)
   }
-  const vscode = host.makeConfig({ target: '/Users/test/project', arch: 'x86_64', vmType: 'qemu', provider: 'vscode' })
+  const vscode = host.makeConfig({ target, arch: 'x86_64', vmType: 'qemu', provider: 'vscode' })
   assert.match(vscode.provision[0].script, /resolve_candidate\(\).*libgtk-3-0t64 libgtk-3-0/s, 'Fresh VS Code guests must resolve the release-specific GTK runtime package')
   assert.match(vscode.provision[0].script, /resolve_candidate libasound2t64 libasound2/, 'Fresh VS Code guests must resolve the release-specific ALSA runtime package')
   assert.match(vscode.provision[0].script, /apt-get install -y xvfb xauth .*"\$gtk_package" .*libnss3 .*"\$asound_package" .*libx11-xcb1/, 'Fresh VS Code guests must install the owned display prerequisites')
-  assert.throws(() => host.makeConfig({ target: '/Users/test,readonly=off', arch: 'x86_64', vmType: 'qemu' }), { code: 'LIMA_PATH_INVALID' })
-  assert.throws(() => host.makeConfig({ target: '/Users/test/project', arch: 'arm64', vmType: 'qemu', provider: 'codex' }), { code: 'LIMA_CONFIG_INVALID' })
-  assert.throws(() => host.makeConfig({ target: '/Users/test/project', arch: 'x86_64', vmType: 'qemu' }), { code: 'LIMA_CONFIG_INVALID' })
+  assert.throws(() => host.makeConfig({ target: path.resolve('/Users/test,readonly=off'), arch: 'x86_64', vmType: 'qemu' }), { code: 'LIMA_PATH_INVALID' })
+  assert.throws(() => host.makeConfig({ target, arch: 'arm64', vmType: 'qemu', provider: 'codex' }), { code: 'LIMA_CONFIG_INVALID' })
+  assert.throws(() => host.makeConfig({ target, arch: 'x86_64', vmType: 'qemu' }), { code: 'LIMA_CONFIG_INVALID' })
   assert.throws(() => host.shellArgs('default;evil'), { code: 'LIMA_DESCRIPTOR_INVALID' })
   for (const [arch, node] of [['x86_64', '/home/autoprompt/runtime/pinned/toolchain/node-v22.23.2-linux-x64/bin/node'], ['aarch64', '/home/autoprompt/runtime/pinned/toolchain/node-v22.23.2-linux-arm64/bin/node']]) {
     assert.deepEqual(host.shellArgs('apvm-0123456789abcdef', arch), ['--tty=false', 'shell', '--workdir=/home/autoprompt/runtime', 'apvm-0123456789abcdef', node, '/home/autoprompt/runtime/lima-runtime-guest.cjs'])
@@ -242,7 +254,9 @@ test('Lima tool binding rejects symlink ancestors and tracks equal-size replacem
   assert.throws(() => host.binding(path.join(alias, 'tool')), { code: 'LIMA_PATH_UNSAFE' })
 })
 
-test('Lima toolchain identity detects dependency changes and refuses escaping library links', t => {
+// Native Lima setup is macOS-only; these imported trees carry POSIX modes/links.
+// Windows uses WSL and does not import native Lima runtime closures.
+test('Lima toolchain identity detects dependency changes and refuses escaping library links', { skip: process.platform === 'win32' }, t => {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lima-toolchain-')))
   t.after(() => fs.rmSync(base, { recursive: true, force: true }))
   const root = path.join(base, 'tools'); fs.mkdirSync(root, { mode: 0o755 }); fs.chmodSync(root, 0o755)
@@ -256,7 +270,9 @@ test('Lima toolchain identity detects dependency changes and refuses escaping li
   assert.throws(() => host.treeBinding(root), { code: 'LIMA_PATH_UNSAFE' })
 })
 
-test('Lima host and guest portable closure digests agree for a Node-style internal executable link', t => {
+// Native Lima setup is macOS-only; these imported trees carry POSIX modes/links.
+// Windows uses WSL and does not import native Lima runtime closures.
+test('Lima host and guest portable closure digests agree for a Node-style internal executable link', { skip: process.platform === 'win32' }, t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lima-portable-closure-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const packageBin = path.join(root, 'node_modules', 'fixture', 'bin')
@@ -270,7 +286,9 @@ test('Lima host and guest portable closure digests agree for a Node-style intern
   assert.equal(host.treeBinding(root).portableSha256, guest.portableTreeDigest(root))
 })
 
-test('Lima loads a completed setup descriptor with its enriched native connection binding', t => {
+// Native Lima setup is macOS-only; these imported trees carry POSIX modes/links.
+// Windows uses WSL and does not import native Lima runtime closures.
+test('Lima loads a completed setup descriptor with its enriched native connection binding', { skip: process.platform === 'win32' }, t => {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lima-load-descriptor-')))
   t.after(() => fs.rmSync(base, { recursive: true, force: true }))
   const root = path.join(base, 'private'), target = path.join(base, 'target')
@@ -316,7 +334,8 @@ test('guest runtime binding detects installed dependency drift', t => {
   assert.notEqual(guest.packageDigest(root), before)
 })
 
-test('guest lifecycle lock distinguishes a genuine owner from a reused PID and never releases a replacement lock', async t => {
+// Exercise the Linux guest's actual flock critical section, including takeover.
+test('guest lifecycle lock distinguishes a genuine owner from a reused PID and never releases a replacement lock', { skip: process.platform !== 'linux' }, async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-lifecycle-lock-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const lockPath = path.join(root, 'lifecycle.lock')

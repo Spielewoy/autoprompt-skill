@@ -81,10 +81,54 @@ for (const provider of ['claude', 'reasonix']) test(`${provider} doctor retains 
   })
   const report = provider === 'reasonix' ? pkg.doctorPrerequisites(root, { env }) : pkg.doctorPrerequisites(provider, root, { env })
   assert.equal(report.payload, 'verified')
-  assert.equal(report.detected, true)
+  assert.equal(report.detected, true, JSON.stringify(report))
   assert.equal(report.nativeVersion, '2.1.270')
   assert.equal(report.activation, 'unavailable')
   assert.equal(report.reason, 'command-sandbox-unsupported')
   assert.match(report.message, /install bubblewrap before activation/)
   assert.equal(fs.existsSync(path.join(root, '.autoprompt-private', 'activations')), false)
+})
+
+for (const provider of ['claude', 'reasonix']) test(`${provider} native diagnostics canonicalize their owned directory beneath an aliased OS temp root`, t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-temp-alias-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const physical = path.join(root, 'physical-temp'), alias = path.join(root, 'temp-alias')
+  fs.mkdirSync(physical, { mode: 0o700 })
+  fs.symlinkSync(physical, alias, process.platform === 'win32' ? 'junction' : 'dir')
+  const native = provider === 'reasonix' ? require('../../agents/reasonix/workflow/native.js') : require('../../scripts/harness-v2-native.cjs')
+  const stop = Object.assign(new Error('fixture stops after observing isolated native launch'), { code: 'TEMP_PROBE_OBSERVED' })
+  let observedRoot
+  const inspectLaunch = options => {
+    observedRoot = options.cwd
+    assert.equal(fs.realpathSync.native(observedRoot), observedRoot)
+    assert.equal(path.dirname(observedRoot), physical)
+    assert.equal(options.env.HOME, observedRoot)
+  }
+  let installedRoot
+  if (provider === 'reasonix') {
+    installedRoot = path.join(root, 'reasonix-install')
+    require('../../scripts/reasonix-package.cjs').install(installedRoot)
+    t.mock.method(native, 'probeExecutable', options => {
+      const output = options.spawnSync(process.execPath, ['-e', 'process.stdout.write(JSON.stringify({cwd:process.cwd(),home:process.env.HOME}))'],
+        { encoding: 'utf8', env: options.env, shell: false })
+      assert.equal(output.status, 0, output.stderr)
+      const result = JSON.parse(output.stdout)
+      inspectLaunch({ cwd: result.cwd, env: { HOME: result.home } })
+      throw stop
+    })
+  }
+  // macOS exposes the system temp directory through /var -> /private/var.
+  // Canonicalize only the newly created owned directory; trust paths still
+  // reject linked ancestors elsewhere.
+  t.mock.method(os, 'tmpdir', () => alias)
+  if (provider === 'reasonix') {
+    const result = require('../../scripts/reasonix-package.cjs').doctorPrerequisites(installedRoot)
+    assert.equal(result.reason, 'temp-probe-observed', result.message)
+  } else {
+    assert.throws(() => native.probeExecutable({ provider, executable: process.execPath,
+      spawnSync(_executable, _argv, options) { inspectLaunch(options); throw stop } }), { code: 'TEMP_PROBE_OBSERVED' })
+  }
+  assert.ok(observedRoot, 'the native probe must be reached after private temp setup')
+  assert.equal(fs.existsSync(observedRoot), false, 'owned probe storage is removed after failure')
+  assert.equal(fs.existsSync(alias), true, 'the ambient temp alias must remain untouched')
 })

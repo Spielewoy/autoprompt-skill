@@ -8,13 +8,25 @@ const test = require('node:test')
 const { bindActivation } = require('../../scripts/darwin-runtime-setup.cjs')
 
 function fixture(t) {
-  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-setup-binding-')))
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-setup-binding-')))
   t.after(() => fs.rmSync(base, { recursive: true, force: true }))
   const root = path.join(base, 'provider')
   const runtime = path.join(root, '.autoprompt-private', 'darwin-runtime')
   fs.mkdirSync(runtime, { recursive: true, mode: 0o700 })
   const activationRoot = path.join(base, 'activation')
   fs.mkdirSync(activationRoot, { mode: 0o700 })
+  // These rejection-order tests model Darwin private directories on Windows.
+  // Keep real file identities, bytes, and closure validation; native permission
+  // enforcement is exercised by the actual Darwin setup test below.
+  if (process.platform === 'win32') {
+    const privateDirectories = new Set([path.dirname(runtime), runtime, activationRoot])
+    const lstatSync = fs.lstatSync
+    t.mock.method(fs, 'lstatSync', (file, ...args) => {
+      const stat = lstatSync(file, ...args)
+      if (privateDirectories.has(file)) stat.mode &= ~0o077
+      return stat
+    })
+  }
   const entries = ['python', 'helper', 'dependency'].map(role => {
     const file = path.join(base, role)
     fs.writeFileSync(file, role)

@@ -6,6 +6,7 @@ const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 const pkg = require('../../scripts/harness-v2-package.cjs')
+const { packedToolPath } = require('../helpers/packed-tool-path.cjs')
 const ROOT = path.resolve(__dirname, '../..')
 function execute(command, args, options = {}) { return cp.spawnSync(command, args, { encoding: 'utf8', timeout: 180000, ...options }) }
 function ok(result) { assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}\n${result.error || ''}`); return result }function requiresNative(result) {
@@ -56,12 +57,13 @@ function packedEnvironment(directory, bin) {
   const appData = path.join(directory, 'appdata with spaces')
   const localAppData = path.join(directory, 'localappdata with spaces')
   for (const folder of [home, xdg, appData, localAppData, bin, path.join(directory, 'temp with spaces')]) fs.mkdirSync(folder, { recursive: true })
+  const toolPath = packedToolPath(path.join(directory, 'tool views'))
   return {
     ...process.env,
     APPDATA: appData,
     HOME: home,
     LOCALAPPDATA: localAppData,
-    PATH: [bin, path.dirname(process.execPath), process.env.PATH || ''].filter(Boolean).join(path.delimiter),
+    PATH: [bin, ...toolPath].filter(Boolean).join(path.delimiter),
     TEMP: path.join(directory, 'temp with spaces'),
     TMP: path.join(directory, 'temp with spaces'),
     USERPROFILE: home,
@@ -136,11 +138,12 @@ test('packed artifact installs and verifies all public providers without the che
       ok(invoke(['install', provider, '--root', root]))
       ok(invoke(['configure', provider, '--agents', model, '--root', root]))
       if (provider === 'reasonix') requiresNative(invoke(['doctor', provider, '--strict', '--root', root]))
-      else if (process.platform === 'win32') {
+      else {
         const doctor = requiresNative(invoke(['doctor', provider, '--strict', '--root', root]))
-        assert.match(doctor.stdout, /reason=codex-windows-sandbox-identity-unavailable/)
+        assert.match(doctor.stdout, process.platform === 'win32'
+          ? /reason=codex-windows-sandbox-identity-unavailable/
+          : /reason=codex-cli-missing/)
       }
-      else ok(invoke(['doctor', provider, '--strict', '--root', root]))
       ok(invoke(['install', provider, '--root', root]))
       ok(invoke(['uninstall', provider, '--root', root]))
       assert.equal(fs.readFileSync(path.join(root, 'unrelated.txt'), 'utf8'), 'preserve provider-specific user data\n')

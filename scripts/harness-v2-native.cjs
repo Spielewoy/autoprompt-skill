@@ -1091,7 +1091,7 @@ function probeExecutable(options = {}) {
   const binding = locateExecutable(options)
   const timeout = options.timeoutMs ?? 30000
   if (!Number.isSafeInteger(timeout) || timeout < 1000 || timeout > 120000) fail('PROVIDER_UNSUPPORTED', 'Native probe timeout must be bounded between 1 and 120 seconds')
-  const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-native-probe-'))
+  const probeRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-native-probe-')))
   try {
     const env = isolatedEnvironment(probeRoot, options.env || process.env)
     const spawn = options.spawnSync || cp.spawnSync

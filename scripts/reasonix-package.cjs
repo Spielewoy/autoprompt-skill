@@ -268,7 +268,7 @@ function doctorPrerequisites(root, options = {}) {
     const native = require('../agents/reasonix/workflow/native.js')
     const admission = require('../agents/reasonix/workflow/admission.js')
     const environment = options.env || process.env
-    const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-reasonix-doctor-'))
+    const probeRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-reasonix-doctor-')))
     let executable
     try {
       const probeEnv = require('./harness-v2-native.cjs').isolatedEnvironment(probeRoot, environment)

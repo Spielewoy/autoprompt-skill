@@ -9,6 +9,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
+const { packedToolPath } = require('../helpers/packed-tool-path.cjs')
 
 const ROOT = path.resolve(__dirname, '../..')
 const RECEIPT = '.autoprompt-install-receipt.json'
@@ -37,10 +38,13 @@ function assertCodexDoctorRow(output) {
     assert.match(row, /^codex\s+yes\s+yes\s+no\s+/)
     assert.match(row, /reason=codex-windows-sandbox-identity-unavailable/)
     assert.match(row, /activation=unavailable/)
-  } else assert.match(row, /^codex\s+yes\s+yes\s+yes\s+/)
+  } else {
+    assert.match(row, /^codex\s+yes\s+yes\s+no\s+/)
+    assert.match(row, /reason=codex-cli-missing.*activation=unavailable/)
+  }
 }
 function codexDoctor(result) {
-  assert.equal(result.status, process.platform === 'win32' ? 1 : 0, `${result.stdout}\n${result.stderr}`)
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
   assertCodexDoctorRow(result.stdout)
   return result
 }
@@ -73,6 +77,7 @@ function npmCli() {
 }
 function environment(directory) {
   const env = { ...process.env }
+  const toolPath = packedToolPath(path.join(directory, 'tool views'))
   for (const key of ['AUTOPROMPT_INSTALL_ROOT', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'PRIME_AGENT_CODING_AGENT_DIR',
     'OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR', 'DSH_HOME', 'HERMES_HOME', 'GROK_HOME', 'REASONIX_HOME',
     'AUTOPROMPT_WORKSPACE_ROOT', 'NODE_PATH']) delete env[key]
@@ -83,7 +88,7 @@ function environment(directory) {
     LOCALAPPDATA: path.join(directory, 'localappdata'),
     npm_config_cache: path.join(directory, 'npm-cache'), npm_config_offline: 'true',
     npm_config_audit: 'false', npm_config_fund: 'false', npm_config_update_notifier: 'false',
-    PATH: [path.join(directory, 'bin'), path.dirname(process.execPath), process.env.PATH || ''].join(path.delimiter),
+    PATH: [path.join(directory, 'bin'), ...toolPath].filter(Boolean).join(path.delimiter),
   })
   for (const key of ['HOME', 'XDG_CONFIG_HOME', 'APPDATA', 'LOCALAPPDATA', 'npm_config_cache']) fs.mkdirSync(env[key], { recursive: true })
   for (const [command, version] of Object.values(VERSIONS)) {

@@ -82,6 +82,8 @@ test('Darwin UID-filtered proc_listpids interprets byte counts and refuses ambig
     'import ctypes, importlib.util, os',
     `spec=importlib.util.spec_from_file_location('darwin_process', ${JSON.stringify(helper)})`,
     'm=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)',
+    // This unit fixture supplies the Darwin caller UID; Windows Python has no getuid.
+    'os.getuid=lambda: 4242',
     'class Fake:',
     '  def __init__(self, result): self.result=result; self.calls=[]',
     '  def proc_listpids(self, kind, uid, values, size):',
@@ -89,7 +91,7 @@ test('Darwin UID-filtered proc_listpids interprets byte counts and refuses ambig
     'for result, expected in ((8,[3,17]), (6,"PIDLIST_MALFORMED"), (-1,"PIDLIST_GREW")):',
     '  probe=m.DarwinProc.__new__(m.DarwinProc); probe.proc=Fake(result)',
     '  try: got=probe.pids()\n  except m.UnknownProcess as e: got=e.reason',
-    '  assert got == expected, (result,got); assert probe.proc.calls[0][0] == m.PROC_UID_ONLY; assert probe.proc.calls[0][1] == os.getuid()',
+    '  assert got == expected, (result,got); assert probe.proc.calls[0][0] == m.PROC_UID_ONLY; assert probe.proc.calls[0][1] == 4242',
   ].join('\n'), { mode: 0o600 })
   try {
     const result = childProcess.spawnSync('python3', ['-I', '-S', '-B', runner], { encoding: 'utf8', timeout: 10000 })
@@ -133,7 +135,7 @@ test('Darwin wrapper refuses use outside Darwin before resolving a helper or Pyt
 })
 
 test('Darwin wrapper binds a bounded large Python executable without relaxing the helper limit', () => {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-process-size-')))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-process-size-')))
   const python = path.join(root, 'python')
   const oversizedHelper = path.join(root, 'oversized-helper.py')
   fs.writeFileSync(python, Buffer.alloc(4 * 1024 * 1024 + 1, 0x50), { mode: 0o700 })
@@ -142,7 +144,7 @@ test('Darwin wrapper binds a bounded large Python executable without relaxing th
     "Object.defineProperty(process, 'platform', { value: 'darwin' })",
     `const observer = require(${JSON.stringify(path.resolve(__dirname, '../../agents/codex/workflow/darwin-process.js'))})`,
     `const python = ${JSON.stringify(python)}`,
-    `const helper = ${JSON.stringify(helper)}`,
+    `const helper = ${JSON.stringify(fs.realpathSync.native(helper))}`,
     `const oversizedHelper = ${JSON.stringify(oversizedHelper)}`,
     "const bound = observer.createDarwinProcessObserver({ python, helper })",
     "if (bound.python.size <= 4 * 1024 * 1024 || bound.helper.size > 4 * 1024 * 1024) process.exit(2)",

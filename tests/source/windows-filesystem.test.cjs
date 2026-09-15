@@ -68,7 +68,9 @@ function writableMapping(file, stopPath) {
     '$mapping.Dispose()',
   ].join('; ')
   const child = cp.spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
-    stdio: ['pipe', 'pipe', 'pipe'],
+    // This owner is stopped by its marker file. An unused open stdin pipe can
+    // keep Windows PowerShell waiting after the command has finished.
+    stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, AUTOPROMPT_WINDOWS_CAPTURE_MAPPING_PATH: file, AUTOPROMPT_WINDOWS_CAPTURE_MAPPING_STOP: stopPath },
   })
   const state = { stdout: '', stderr: '' }
@@ -179,13 +181,41 @@ function usnRaceRunner(root) {
   return runner
 }
 
-async function stopMapping(mapper) {
-  if (mapper.child.exitCode === null) {
-    if (mapper.stopPath) fs.writeFileSync(mapper.stopPath, 'stop')
-    else mapper.child.stdin.end('\n')
-    await once(mapper.child, 'exit')
+async function stopMapping(mapper, timeoutMs = 10000) {
+  const child = mapper.child
+  if (child.exitCode !== null || child.signalCode !== null) return
+  const exited = once(child, 'exit')
+  if (mapper.stopPath) fs.writeFileSync(mapper.stopPath, 'stop')
+  else child.stdin.end('\n')
+  let timer
+  try {
+    await Promise.race([exited, new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`mapping owner did not stop: ${mapper.state?.stderr || ''}`)), timeoutMs)
+    })])
+  } catch (error) {
+    // Fail the fixture, but release the mapping so subsequent native cases run.
+    child.kill('SIGKILL')
+    await exited
+    throw error
+  } finally {
+    clearTimeout(timer)
   }
 }
+
+test('mapped-view fixture teardown kills an unresponsive owner and reports the failure', async () => {
+  const child = cp.spawn(process.execPath, ['-e', 'process.stdout.write("ready"); setInterval(() => {}, 1000)'], { stdio: ['pipe', 'pipe', 'pipe'] })
+  await once(child.stdout, 'data')
+  await assert.rejects(stopMapping({ child, state: { stderr: 'fixture diagnostic' } }, 100), /mapping owner did not stop: fixture diagnostic/)
+  assert.notEqual(child.signalCode, null)
+})
+
+test('mapped-view fixture teardown stops a marker-controlled owner with closed stdin', async t => {
+  const stopPath = path.join(fixture(t), 'stop')
+  const child = cp.spawn(process.execPath, ['-e', 'process.stdout.write("ready"); setInterval(() => { if (require("node:fs").existsSync(process.argv[1])) process.exit(0) }, 10)', stopPath], { stdio: ['ignore', 'pipe', 'pipe'] })
+  await once(child.stdout, 'data')
+  await stopMapping({ child, stopPath })
+  assert.equal(child.exitCode, 0)
+})
 
 test('Windows HANDLE capture reads bounded bytes and returns a stable content digest', { skip: !windows }, t => {
   const root = fixture(t)
