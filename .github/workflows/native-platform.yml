@@ -89,6 +89,14 @@ jobs:
         run: |
           node --test tests/source/windows-appcontainer-node-pipes.test.cjs tests/source/windows-appcontainer-member-image.test.cjs 2>&1 | Tee-Object -FilePath native-windows-node-pipes.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Record native Windows NUL device access
+        if: runner.os == 'Windows'
+        # Actual access observations are mandatory in the full suite as well.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test --test-reporter=tap tests/source/windows-appcontainer-nul.test.cjs 2>&1 | Tee-Object -FilePath native-windows-nul.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Record isolated Windows capture input diagnostics
         if: runner.os == 'Windows'
         # This exact native case remains mandatory in the full suite below.
@@ -141,6 +149,37 @@ jobs:
           $patch = (Resolve-Path scripts/windows-msys/pipe-security.patch).Path
           $digest = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
           ./scripts/windows-msys/build.ps1 -WorkRoot (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof') -Mode proof -AdaptationPatch $patch -AdaptationSha256 $digest -Jobs 4 -CompilePosixFixture
+      - name: Verify adapted descriptors and cross-profile denial natively
+        id: msys-descriptor
+        if: steps.msys-proof.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof'
+          $payload = Join-Path $work 'sdk/issue27-build'
+          $prepared = Join-Path $env:RUNNER_TEMP 'msys-descriptor-prepared'
+          $toolchain = Join-Path $env:RUNNER_TEMP 'msys-descriptor-toolchain'
+          $output = Join-Path $env:RUNNER_TEMP 'msys-descriptor-proof'
+          node --test scripts/windows-msys/descriptor-proof/parser.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/windows-msys/descriptor-proof/prepare.py $PWD.Path $prepared
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/windows-msys/descriptor-proof/discover-toolchain.ps1 -WorkRoot $toolchain
+          $manifest = Join-Path $payload 'stage.sha256'
+          $digest = node -e "const fs=require('node:fs'); const p=require('./scripts/windows-msys/probe-built-runtime.cjs'); process.stdout.write(p.stagedDigest(fs.readFileSync(process.argv[1])));" $manifest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-msys/descriptor-proof/run.cjs $PWD.Path $prepared (Join-Path $work 'sdk/usr/bin/bash.exe') (Join-Path $payload 'stage/usr/bin/msys-2.0.dll') $output (Join-Path $toolchain 'toolchain.json') $digest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native descriptor proof evidence
+        if: always() && steps.msys-proof-input.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-descriptor-proof
+          path: |
+            ${{ runner.temp }}/msys-descriptor-prepared
+            ${{ runner.temp }}/msys-descriptor-toolchain
+            ${{ runner.temp }}/msys-descriptor-proof/artifacts
+          if-no-files-found: warn
       - name: Exercise the built MSYS runtime in a private Bash closure
         id: msys-smoke
         if: steps.msys-proof.outcome == 'success'
@@ -236,7 +275,7 @@ jobs:
       - name: Packed installer lifecycle
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
       - name: Require native startup and selected compiler proofs to succeed
-        if: always() && (steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure')
+        if: always() && (steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure')
         run: node -e "process.exit(1)"
 
   claude-native:

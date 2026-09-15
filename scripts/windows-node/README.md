@@ -8,7 +8,7 @@ The patch queries the actual process token once per pipe pair. Ordinary host nam
 
 The existing native NULL-SA LOCAL probe proves basic generic read/write creation and connection. It does not establish libuv's additional WRITE_DAC access. The source-derived mock proof checks the exact read, write, duplex, WRITE_DAC and inheritance arguments, plus failure cleanup; only real selected-worker Windows tests can prove compatibility.
 
-The builder requires PowerShell 7, Windows x64, a new ASCII path without spaces, Visual Studio 2022 17.14+ with LLVM and C++ tools, Python, Git, and Windows tar. It captures selected compiler identities, configuration, logs, copied LICENSE, and staged node.exe provenance. It uses vcbuild's default Release configuration with x64 vs2022 clang-cl nonpm nocorepack no-cctest; full OpenSSL assembly remains enabled with the pinned NASM.
+The builder requires PowerShell 7, Windows x64, a new ASCII path without spaces, Visual Studio 2022 17.14+ or Visual Studio 2026 18.x with LLVM and C++ tools, Python, Git, and Windows tar. It captures selected compiler identities, configuration, logs, copied LICENSE, and staged node.exe provenance. It uses vcbuild's default Release configuration with x64, the exact selected vs2022/vs2026 target, and clang-cl nonpm nocorepack no-cctest; full OpenSSL assembly remains enabled with the pinned NASM.
 
 Work trees are retained on failure. Timeout cleanup requests process-tree termination but does not claim every descendant was independently verified. Output copies are bounded and unfinished stream owners remain retained.
 

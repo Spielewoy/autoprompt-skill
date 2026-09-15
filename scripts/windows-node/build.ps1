@@ -106,9 +106,17 @@ $environment.PATH=[IO.Path]::GetDirectoryName($nasm)+';'+$environment.PATH
 Run $nasm @('-v') 'nasm-version'
 Run $python @('-V') 'python-version'
 $requirements=@('Microsoft.VisualStudio.Component.VC.Tools.x86.x64','Microsoft.VisualStudio.Component.VC.Llvm.Clang','Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset')
-Run $vswhere (@('-latest','-prerelease','-products','*','-version','[17.14,18.0)','-requires')+$requirements+@('-format','json')) 'visual-studio'
+function SelectNodeVisualStudio([string]$Version) {
+  $parsed=$null
+  if(-not [Version]::TryParse($Version,[ref]$parsed)){throw 'Invalid Visual Studio version'}
+  if($parsed.Major -eq 18){return 'vs2026'}
+  if($parsed.Major -eq 17 -and $parsed.Minor -ge 14){return 'vs2022'}
+  throw 'Node requires Visual Studio 2022 17.14+ or Visual Studio 2026 18.x'
+}
+Run $vswhere (@('-latest','-prerelease','-products','*','-version','[17.14,19.0)','-requires')+$requirements+@('-format','json')) 'visual-studio'
 $instances=@(Get-Content -LiteralPath (Join-Path $logs 'visual-studio.stdout.txt') -Raw | ConvertFrom-Json)
-if($instances.Count -ne 1){throw 'One suitable Visual Studio2022 instance is required'}
+if($instances.Count -ne 1){throw 'One suitable Visual Studio 2022 or 2026 instance is required'}
+$visualStudioTarget=SelectNodeVisualStudio $instances[0].installationVersion
 $vs=Physical $instances[0].installationPath
 $vcvars=Physical (Join-Path $vs 'VC\Auxiliary\Build\vcvarsall.bat')
 if($vcvars -match '[%"!&|<>^]' -or $vcvars -match '[^\x20-\x7e]'){throw 'Unsupported Visual Studio command path'}
@@ -137,7 +145,7 @@ if errorlevel 1 exit /b 1
 where dumpbin.exe > "$logs\actual-dumpbin.txt"
 if errorlevel 1 exit /b 1
 (set VSCMD_VER&set WindowsSDKVersion&set VCToolsVersion&set WindowsSdkDir) > "$logs\toolchain-environment.txt"
-call vcbuild.bat x64 vs2022 clang-cl nonpm nocorepack no-cctest
+call vcbuild.bat x64 $visualStudioTarget clang-cl nonpm nocorepack no-cctest
 exit /b %errorlevel%
 "@
 [IO.File]::WriteAllText($build,$batch,[Text.Encoding]::ASCII)
@@ -158,7 +166,7 @@ $actualTools=@{};foreach($name in @('clang-cl','link','msbuild','dumpbin')){
 if($actualTools['clang-cl'].path -ine $clang){throw 'Unexpected ClangCL selected'}
 Run $actualTools['dumpbin'].path @('/dependents',$node) 'built-node-dependencies'
 [IO.File]::Copy((Join-Path $logs 'built-node-dependencies.stdout.txt'),(Join-Path $stage 'dependencies.txt'),$false)
-$record=@{schema=1;purpose='candidate Node compiler proof; native AppContainer compatibility not established';lockSha256=(Hash $lockPath);source=$lock.source;patch=$lock.patch;nasm=$lock.nasm;identity=$identity;visualStudio=$instances[0];compilerInputs=$toolsBefore;actualTools=$actualTools;command='vcbuild.bat x64 vs2022 clang-cl nonpm nocorepack no-cctest';nodeSha256=(Hash (Join-Path $stage 'node.exe'));licenseSha256=(Hash (Join-Path $stage 'LICENSE'));configSha256=(Hash (Join-Path $stage 'config.gypi'))}
+$record=@{schema=1;purpose='candidate Node compiler proof; native AppContainer compatibility not established';lockSha256=(Hash $lockPath);source=$lock.source;patch=$lock.patch;nasm=$lock.nasm;identity=$identity;visualStudio=$instances[0];compilerInputs=$toolsBefore;actualTools=$actualTools;command="vcbuild.bat x64 $visualStudioTarget clang-cl nonpm nocorepack no-cctest";nodeSha256=(Hash (Join-Path $stage 'node.exe'));licenseSha256=(Hash (Join-Path $stage 'LICENSE'));configSha256=(Hash (Join-Path $stage 'config.gypi'))}
 [IO.File]::WriteAllText((Join-Path $stage 'provenance.json'),($record | ConvertTo-Json -Depth 12)+"`n",[Text.UTF8Encoding]::new($false))
 Write-Host "Node compiler proof staged: $stage"
 Write-Host "Native AppContainer pipe/IPC acceptance remains required."

@@ -56,7 +56,6 @@ public static class WindowsAppContainerNative {
  [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr list);
  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool CreateProcess(String app,StringBuilder command,IntPtr processAttributes,IntPtr threadAttributes,bool inheritHandles,UInt32 flags,IntPtr environment,String cwd,ref STARTUPINFOEX startup,out PROCESS_INFORMATION information);
  public sealed class LaunchResult { public UInt32 RootPid,ExitCode; public Int32 ObservedJobMembers,LauncherSessionId; public String AppContainerSid,StdoutBase64,StderrBase64; public Boolean RootImageMatches,Drained,TimedOut,OutputLimit,Cancelled; }
- sealed class MemberSummary { public Int32 Total,SameNode,Other; }
  [StructLayout(LayoutKind.Sequential)] struct UNICODE_STRING { public UInt16 Length,MaximumLength; public IntPtr Buffer; }
  [StructLayout(LayoutKind.Sequential)] struct OBJECT_ATTRIBUTES { public Int32 Length; public IntPtr RootDirectory,ObjectName; public UInt32 Attributes; public IntPtr SecurityDescriptor,SecurityQualityOfService; }
  [DllImport("ntdll.dll")] static extern Int32 NtCreateDirectoryObject(out IntPtr handle,UInt32 access,ref OBJECT_ATTRIBUTES attributes);
@@ -149,42 +148,43 @@ public static class WindowsAppContainerNative {
  // whose owned process family might still be using it.
  static readonly List<MsysNamespaceLease> undrainedNamespaces=new List<MsysNamespaceLease>();
  sealed class ImageBinding : IDisposable { public readonly String FullPath; internal readonly FileStream Stream; public ImageBinding(String path,String expectedHash){if(String.IsNullOrEmpty(expectedHash)||expectedHash.Length!=64||expectedHash.Any(c=>!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))))throw new InvalidOperationException("image hash invalid");FullPath=Path.GetFullPath(path);if((File.GetAttributes(FullPath)&FileAttributes.ReparsePoint)!=0)throw new InvalidOperationException("image reparse");FileStream stream=null;try{stream=new FileStream(FullPath,FileMode.Open,FileAccess.Read,FileShare.Read);if(stream.Length<=0||stream.Length>536870912)throw new InvalidOperationException("image size invalid");String actual;using(var hash=SHA256.Create()){actual=String.Concat(hash.ComputeHash(stream).Select(b=>b.ToString("x2")));}if(actual.Length!=expectedHash.Length)throw new InvalidOperationException("image hash mismatch");Int32 diff=0;for(Int32 i=0;i<actual.Length;i++)diff|=Char.ToLowerInvariant(actual[i])^Char.ToLowerInvariant(expectedHash[i]);if(diff!=0)throw new InvalidOperationException("image hash mismatch");Stream=stream;stream=null;}finally{if(stream!=null)stream.Dispose();}} public void Dispose(){Stream.Dispose();} }
- public static String LastStage="initial"; public static Int32 LastWin32=0; public static UInt32 LastRootWait=UInt32.MaxValue,LastRootExit=UInt32.MaxValue,LastJobActive=UInt32.MaxValue,LastObservedMembers=UInt32.MaxValue,LastCatchRootWait=UInt32.MaxValue,LastCatchRootExit=UInt32.MaxValue; public static Int32 LastRootImageMatches=-1,LastSameNodeMembers=-1,LastOtherImageMembers=-1,LastStderrCategory=-1,LastStderrCode=0,LastStderrSyscall=0,LastStderrTargetRelation=0,LastSetupMs=-1,LastPrelaunchMs=-1,LastObserveMs=-1,LastWaitMs=-1,LastCleanupMs=-1;
+ public static String LastStage="initial"; public static Int32 LastWin32=0; public static UInt32 LastRootWait=UInt32.MaxValue,LastRootExit=UInt32.MaxValue,LastJobActive=UInt32.MaxValue,LastObservedMembers=UInt32.MaxValue,LastCatchRootWait=UInt32.MaxValue,LastCatchRootExit=UInt32.MaxValue; public static Int32 LastRootImageMatches=-1,LastStderrCategory=-1,LastStderrCode=0,LastStderrSyscall=0,LastStderrTargetRelation=0,LastSetupMs=-1,LastPrelaunchMs=-1,LastObserveMs=-1,LastWaitMs=-1,LastCleanupMs=-1;
  static void Mark(String stage){LastStage=stage;LastWin32=0;}
  static void Check(bool value,String action){Mark(action);if(!value){LastWin32=Marshal.GetLastWin32Error();throw new Win32Exception(LastWin32,action);}}
  static String Sid(IntPtr sid){IntPtr text=IntPtr.Zero;try{if(sid==IntPtr.Zero)throw new InvalidOperationException("invalid sid");Check(ConvertSidToStringSid(sid,out text),"ConvertSidToStringSidW");return Marshal.PtrToStringUni(text);}finally{if(text!=IntPtr.Zero)LocalFree(text);}}
  public static Boolean IsExactLowNoWriteUpLabel(String path){IntPtr owner=IntPtr.Zero,sacl=IntPtr.Zero,descriptor=IntPtr.Zero,text=IntPtr.Zero;try{UInt32 status=GetNamedSecurityInfo(path,SE_FILE_OBJECT,LABEL_SECURITY_INFORMATION,out owner,IntPtr.Zero,IntPtr.Zero,out sacl,out descriptor);if(status!=0||descriptor==IntPtr.Zero)return false;UInt32 length;if(!ConvertSecurityDescriptorToStringSecurityDescriptor(descriptor,1,LABEL_SECURITY_INFORMATION,out text,out length)||text==IntPtr.Zero)return false;String sddl=Marshal.PtrToStringUni(text);const String ace="(ML;;NW;;;LW)";if(sddl==null||!sddl.StartsWith("S:",StringComparison.Ordinal)||!sddl.EndsWith(ace,StringComparison.Ordinal))return false;String flags=sddl.Substring(2,sddl.Length-2-ace.Length);return flags.Length==0||String.Equals(flags,"PAI",StringComparison.Ordinal);}finally{if(text!=IntPtr.Zero)LocalFree(text);if(descriptor!=IntPtr.Zero)LocalFree(descriptor);}}
  static IntPtr Info(IntPtr token,Int32 kind){Int32 required;GetTokenInformation(token,kind,IntPtr.Zero,0,out required);if(required<=0)throw new Win32Exception(Marshal.GetLastWin32Error(),"GetTokenInformation-size");IntPtr result=Marshal.AllocHGlobal(required);try{Check(GetTokenInformation(token,kind,result,required,out required),"GetTokenInformation");return result;}catch{Marshal.FreeHGlobal(result);throw;}}
- static Boolean VerifyAppContainer(IntPtr process,String expectedSid,IntPtr job,ImageBinding imageBinding,Boolean root){String role=root?"ROOT":"MEMBER";IntPtr token=IntPtr.Zero,isApp=IntPtr.Zero,sid=IntPtr.Zero;try{Check(OpenProcessToken(process,TOKEN_QUERY,out token),"OpenProcessToken");isApp=Info(token,TokenIsAppContainer);if(Marshal.ReadInt32(isApp)==0){Mark(root?"root-token-appcontainer-result":"member-token-appcontainer-result");throw new InvalidOperationException("APP_PROBE_"+role+"_TOKEN_NOT_APPCONTAINER");}sid=Info(token,TokenAppContainerSid);if(Sid(Marshal.ReadIntPtr(sid))!=expectedSid){Mark(root?"root-sid-result":"member-sid-result");throw new InvalidOperationException("APP_PROBE_"+role+"_SID_MISMATCH");}bool inJob;Check(IsProcessInJob(process,job,out inJob),"IsProcessInJob");if(!inJob){Mark(root?"root-job-membership-result":"member-job-membership-result");throw new InvalidOperationException("APP_PROBE_"+role+"_JOB_MISMATCH");}var name=new StringBuilder(32768);UInt32 length=(UInt32)name.Capacity;if(!QueryFullProcessImageName(process,0,name,ref length)){Int32 error=Marshal.GetLastWin32Error();Mark("QueryFullProcessImageName");LastWin32=error;if(!root&&error==5)throw new MemberImageQueryFailure(error);throw new Win32Exception(error,"QueryFullProcessImageName");}Boolean same=String.Equals(Path.GetFullPath(name.ToString()),imageBinding.FullPath,StringComparison.OrdinalIgnoreCase);if(root&&!same){LastRootImageMatches=0;Mark("root-image-identity-result");throw new InvalidOperationException("APP_PROBE_ROOT_IMAGE_MISMATCH");}if(root)LastRootImageMatches=1;return same;}finally{if(sid!=IntPtr.Zero)Marshal.FreeHGlobal(sid);if(isApp!=IntPtr.Zero)Marshal.FreeHGlobal(isApp);if(token!=IntPtr.Zero)CloseHandle(token);}}
+ static void VerifyAppContainerTokenAndJob(IntPtr process,String expectedSid,IntPtr job,Boolean root){String role=root?"ROOT":"MEMBER";IntPtr token=IntPtr.Zero,isApp=IntPtr.Zero,sid=IntPtr.Zero;try{Check(OpenProcessToken(process,TOKEN_QUERY,out token),"OpenProcessToken");isApp=Info(token,TokenIsAppContainer);if(Marshal.ReadInt32(isApp)==0){Mark(root?"root-token-appcontainer-result":"member-token-appcontainer-result");throw new InvalidOperationException("APP_PROBE_"+role+"_TOKEN_NOT_APPCONTAINER");}sid=Info(token,TokenAppContainerSid);if(Sid(Marshal.ReadIntPtr(sid))!=expectedSid){Mark(root?"root-sid-result":"member-sid-result");throw new InvalidOperationException("APP_PROBE_"+role+"_SID_MISMATCH");}bool inJob;Check(IsProcessInJob(process,job,out inJob),"IsProcessInJob");if(!inJob){Mark(root?"root-job-membership-result":"member-job-membership-result");throw new InvalidOperationException("APP_PROBE_"+role+"_JOB_MISMATCH");}}finally{if(sid!=IntPtr.Zero)Marshal.FreeHGlobal(sid);if(isApp!=IntPtr.Zero)Marshal.FreeHGlobal(isApp);if(token!=IntPtr.Zero)CloseHandle(token);}}
+ static void VerifyRootImage(IntPtr process,ImageBinding imageBinding) {
+  var name=new StringBuilder(32768);UInt32 length=(UInt32)name.Capacity;
+  if(!QueryFullProcessImageName(process,0,name,ref length)){Int32 error=Marshal.GetLastWin32Error();Mark("QueryFullProcessImageName-root");LastWin32=error;throw new Win32Exception(error,"QueryFullProcessImageName-root");}
+  if(!String.Equals(Path.GetFullPath(name.ToString()),imageBinding.FullPath,StringComparison.OrdinalIgnoreCase)){LastRootImageMatches=0;Mark("root-image-identity-result");throw new InvalidOperationException("APP_PROBE_ROOT_IMAGE_MISMATCH");}
+  LastRootImageMatches=1;
+ }
  static UInt32 Active(IntPtr job){Int32 size=Marshal.SizeOf(typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));IntPtr pointer=Marshal.AllocHGlobal(size);try{UInt32 returned;Check(QueryInformationJobObject(job,JobObjectBasicAccountingInformation,pointer,(UInt32)size,out returned),"QueryInformationJobObject-accounting");return ((JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)Marshal.PtrToStructure(pointer,typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION))).ActiveProcesses;}finally{Marshal.FreeHGlobal(pointer);}}
- // A member can lose queryable image state before its process object signals.
- // Error 5 alone is not exit evidence. Only this dedicated post-token/SID/job
- // failure may consume a shared monitoring-sweep grace budget; root verification
- // remains strict. The same held process HANDLE supplies the termination proof.
- sealed class MemberImageQueryFailure : Win32Exception {
-  internal MemberImageQueryFailure(Int32 error) : base(error,"QueryFullProcessImageName-member") {}
- }
- static void ReconcileMemberImageFailure(IntPtr process,Int32 error,Stopwatch clock,Int32 timeoutMs,ref Int32 graceBudgetMs) {
-  if(error!=5)throw new Win32Exception(error,"QueryFullProcessImageName-member");
-  UInt32 first=WaitForSingleObject(process,0);Int32 firstError=first==UInt32.MaxValue?Marshal.GetLastWin32Error():0;
-  if(first==0)return;
-  UInt32 final=first;Int32 finalError=firstError,requested=0;Int64 began=clock.ElapsedMilliseconds;
-  if(first==258&&graceBudgetMs>0){
-   Int64 remaining=(Int64)timeoutMs-clock.ElapsedMilliseconds;
-   if(remaining>0){requested=(Int32)Math.Min(Math.Min(25,graceBudgetMs),remaining);graceBudgetMs-=requested;
-    final=WaitForSingleObject(process,(UInt32)requested);finalError=final==UInt32.MaxValue?Marshal.GetLastWin32Error():0;
-    if(final==0)return;
+ // Descendant authority is the actual AppContainer token, expected package SID
+ // and owned job. Different child executables are permitted by this sandbox;
+ // image-path classification did not restrict them and is not an authority
+ // check. Only the root image is queried and bound before it can execute.
+ static Int32 VerifyMembers(IntPtr job,String expectedSid) {
+  Int32 capacity=16;
+  for(;;){IntPtr pointer=Marshal.AllocHGlobal(8+capacity*IntPtr.Size);try{
+   UInt32 returned;
+   if(QueryInformationJobObject(job,JobObjectBasicProcessIdList,pointer,(UInt32)(8+capacity*IntPtr.Size),out returned)){
+    Int32 count=Marshal.ReadInt32(pointer,4);LastObservedMembers=(UInt32)count;
+    if(count<0||count>capacity){Mark("job-member-count-result");throw new InvalidOperationException("APP_PROBE_JOB_MEMBER_COUNT_INVALID");}
+    for(Int32 i=0;i<count;i++){
+     IntPtr process=OpenProcessForToken((Int32)Marshal.ReadIntPtr(pointer,8+i*IntPtr.Size).ToInt64());if(process==IntPtr.Zero)continue;
+     try{try{VerifyAppContainerTokenAndJob(process,expectedSid,job,false);}
+      catch(Win32Exception){if(WaitForSingleObject(process,0)!=0)throw;}
+     }finally{CloseHandle(process);}
+    }
+    return count;
    }
-  }
-  // Fixed labels and bounded numeric observations only; never publish paths,
-  // request arguments or a PID. A live/failed/unknown wait preserves refusal.
-  // Format: firstWait.error:finalWait.error and requested.elapsed grace ms.
-  // At most 70 characters, including worst-case UInt32/Int32 decimal values,
-  // so the existing PowerShell diagnostic filter preserves the observations.
-  Int64 elapsed=Math.Min(Int32.MaxValue,Math.Max(0,clock.ElapsedMilliseconds-began));
-  throw new Win32Exception(error,"wait:"+first+"."+firstError+":"+final+"."+finalError+" grace:"+requested+"."+elapsed);
+   if(Marshal.GetLastWin32Error()!=234||capacity>=1024)throw new Win32Exception(Marshal.GetLastWin32Error(),"QueryInformationJobObject-members");
+   capacity*=2;
+  }finally{Marshal.FreeHGlobal(pointer);}}
  }
- static MemberSummary VerifyMembers(IntPtr job,String expectedSid,ImageBinding imageBinding,Stopwatch clock,Int32 timeoutMs){Int32 capacity=16,graceBudgetMs=25;for(;;){IntPtr pointer=Marshal.AllocHGlobal(8+capacity*IntPtr.Size);try{UInt32 returned;if(QueryInformationJobObject(job,JobObjectBasicProcessIdList,pointer,(UInt32)(8+capacity*IntPtr.Size),out returned)){Int32 count=Marshal.ReadInt32(pointer,4);LastObservedMembers=(UInt32)count;if(count<0||count>capacity){Mark("job-member-count-result");throw new InvalidOperationException("APP_PROBE_JOB_MEMBER_COUNT_INVALID");}var summary=new MemberSummary{Total=count};for(Int32 i=0;i<count;i++){IntPtr process=OpenProcessForToken((Int32)Marshal.ReadIntPtr(pointer,8+i*IntPtr.Size).ToInt64());if(process==IntPtr.Zero)continue;try{try{if(VerifyAppContainer(process,expectedSid,job,imageBinding,false))summary.SameNode++;else summary.Other++;}catch(MemberImageQueryFailure error){ReconcileMemberImageFailure(process,error.NativeErrorCode,clock,timeoutMs,ref graceBudgetMs);}catch(Win32Exception){if(WaitForSingleObject(process,0)!=0)throw;}}finally{CloseHandle(process);}}LastSameNodeMembers=summary.SameNode;LastOtherImageMembers=summary.Other;return summary;}if(Marshal.GetLastWin32Error()!=234||capacity>=1024)throw new Win32Exception(Marshal.GetLastWin32Error(),"QueryInformationJobObject-members");capacity*=2;}finally{Marshal.FreeHGlobal(pointer);}}}
  [DllImport("kernel32.dll",SetLastError=true,EntryPoint="OpenProcess")] static extern IntPtr OpenProcessForToken(Int32 access,Boolean inherit,Int32 pid);
  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true,EntryPoint="QueryFullProcessImageNameW")] static extern Boolean QueryFullProcessImageName(IntPtr process,UInt32 flags,StringBuilder image,ref UInt32 length);
  static IntPtr OpenProcessForToken(Int32 pid){IntPtr process=OpenProcessForToken(0x101000,false,pid);if(process==IntPtr.Zero&&Marshal.GetLastWin32Error()!=87)throw new Win32Exception(Marshal.GetLastWin32Error(),"OpenProcess");return process;}
@@ -246,10 +246,10 @@ public static class WindowsAppContainerNative {
    Check(CreateProcess(executable,command,IntPtr.Zero,IntPtr.Zero,true,EXTENDED_STARTUPINFO_PRESENT|CREATE_SUSPENDED|CREATE_UNICODE_ENVIRONMENT|CREATE_NO_WINDOW,environment,cwd,ref startup,out pi),"CreateProcess-suspended");
    confirmedDrain=false;
    Check(CloseHandle(stdoutWrite),"stdout-close-parent-write");stdoutWrite=IntPtr.Zero;Check(CloseHandle(stderrWrite),"stderr-close-parent-write");stderrWrite=IntPtr.Zero;Check(CloseHandle(nulRead),"stdin-close-parent-read");nulRead=IntPtr.Zero;
-   Check(AssignProcessToJobObject(job,pi.hProcess),"AssignProcessToJobObject");assigned=true;VerifyAppContainer(pi.hProcess,expectedSid,job,imageBinding,true);if((String.IsNullOrEmpty(cancellationPath)||!File.Exists(cancellationPath))&&ResumeThread(pi.hThread)==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error(),"ResumeThread");CloseHandle(pi.hThread);pi.hThread=IntPtr.Zero;
+   Check(AssignProcessToJobObject(job,pi.hProcess),"AssignProcessToJobObject");assigned=true;VerifyAppContainerTokenAndJob(pi.hProcess,expectedSid,job,true);VerifyRootImage(pi.hProcess,imageBinding);if((String.IsNullOrEmpty(cancellationPath)||!File.Exists(cancellationPath))&&ResumeThread(pi.hThread)==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error(),"ResumeThread");CloseHandle(pi.hThread);pi.hThread=IntPtr.Zero;
    using(var stdout=new MemoryStream())using(var stderr=new MemoryStream()){
     var clock=Stopwatch.StartNew();int total=0,members=1;bool timedOut=false,limited=false,cancelled=false;
-    for(;;){if(!String.IsNullOrEmpty(cancellationPath)&&File.Exists(cancellationPath)){cancelled=true;break;}if(!ReadOutput(stdoutRead,stdout,ref total,outputLimit)||!ReadOutput(stderrRead,stderr,ref total,outputLimit)){limited=true;break;}uint wait=WaitForSingleObject(pi.hProcess,0);if(wait==0)break;if(wait==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error(),"WaitForSingleObject");if(clock.ElapsedMilliseconds>=timeoutMs){timedOut=true;break;}members=Math.Max(members,VerifyMembers(job,expectedSid,imageBinding,clock,timeoutMs).Total);System.Threading.Thread.Sleep(25);}
+    for(;;){if(!String.IsNullOrEmpty(cancellationPath)&&File.Exists(cancellationPath)){cancelled=true;break;}if(!ReadOutput(stdoutRead,stdout,ref total,outputLimit)||!ReadOutput(stderrRead,stderr,ref total,outputLimit)){limited=true;break;}uint wait=WaitForSingleObject(pi.hProcess,0);if(wait==0)break;if(wait==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error(),"WaitForSingleObject");if(clock.ElapsedMilliseconds>=timeoutMs){timedOut=true;break;}members=Math.Max(members,VerifyMembers(job,expectedSid));System.Threading.Thread.Sleep(25);}
     // Root exit never transfers detached descendants to the host. Terminate and
     // positively drain the entire owned job before returning any result.
     if(Active(job)>0)Check(TerminateJobObject(job,125),"TerminateJobObject");if(!Drain(job,5000))throw new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED");confirmedDrain=true;

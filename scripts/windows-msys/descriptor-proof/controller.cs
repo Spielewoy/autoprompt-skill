@@ -1,0 +1,55 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Diagnostics;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Threading;
+using System.Threading.Tasks;
+public static class DescriptorController {
+ [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern Boolean ConvertStringSecurityDescriptorToSecurityDescriptor(String text,UInt32 revision,out IntPtr descriptor,out UInt32 size);
+ [DllImport("advapi32.dll",SetLastError=true)] static extern Boolean GetSecurityDescriptorSacl(IntPtr descriptor,out Boolean present,out IntPtr sacl,out Boolean defaulted);
+ [DllImport("advapi32.dll",CharSet=CharSet.Unicode)] static extern UInt32 SetNamedSecurityInfo(String name,Int32 type,UInt32 flags,IntPtr owner,IntPtr group,IntPtr dacl,IntPtr sacl);
+ [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+ static readonly List<Object> Retained=new List<Object>();
+ sealed class Operation { public String Name,Cancel;public Task<WindowsAppContainerNative.LaunchResult> Task;public WindowsAppContainerNative.LaunchResult Result; }
+ static void Need(Boolean value,String reason){if(!value)throw new InvalidOperationException(reason);}
+ static String Hash(String file){using(var stream=File.OpenRead(file))using(var hash=SHA256.Create())return BitConverter.ToString(hash.ComputeHash(stream)).Replace("-","").ToLowerInvariant();}
+ static void LowDirectory(String directory){IntPtr sd=IntPtr.Zero,sacl;try{UInt32 size;Boolean present,defaulted;Need(ConvertStringSecurityDescriptorToSecurityDescriptor("S:(ML;;NW;;;LW)",1,out sd,out size),"low-descriptor");Need(GetSecurityDescriptorSacl(sd,out present,out sacl,out defaulted)&&present,"low-sacl");Need(SetNamedSecurityInfo(directory,1,0x10,IntPtr.Zero,IntPtr.Zero,IntPtr.Zero,sacl)==0,"low-directory-label");Need(WindowsAppContainerNative.IsExactLowNoWriteUpLabel(directory),"confirmed-low-directory-label");}finally{if(sd!=IntPtr.Zero)LocalFree(sd);}}
+ static void DirectoryAcl(String directory,String[] packages,Boolean writable){var user=WindowsIdentity.GetCurrent().User;var sd=new DirectorySecurity();sd.SetOwner(user);sd.SetAccessRuleProtection(true,false);foreach(String sid in new[]{user.Value,"S-1-5-18"})sd.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid),FileSystemRights.FullControl,InheritanceFlags.ContainerInherit|InheritanceFlags.ObjectInherit,PropagationFlags.None,AccessControlType.Allow));foreach(String sid in packages)sd.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid),writable?FileSystemRights.Modify:FileSystemRights.ReadAndExecute,writable?InheritanceFlags.ContainerInherit|InheritanceFlags.ObjectInherit:InheritanceFlags.None,PropagationFlags.None,AccessControlType.Allow));new DirectoryInfo(directory).SetAccessControl(sd);if(writable)LowDirectory(directory);}
+ static void ExecutableAcl(String executable,String sidA,String sidB){var user=WindowsIdentity.GetCurrent().User;var sd=new FileSecurity();sd.SetOwner(user);sd.SetAccessRuleProtection(true,false);foreach(String sid in new[]{user.Value,"S-1-5-18",sidA,sidB})sd.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid),sid==sidA||sid==sidB?FileSystemRights.ReadAndExecute:FileSystemRights.FullControl,AccessControlType.Allow));new FileInfo(executable).SetAccessControl(sd);DirectoryAcl(Path.GetDirectoryName(executable),new[]{sidA,sidB},false);}
+ static String[] EnvironmentEntries(){String root=Environment.GetEnvironmentVariable("SystemRoot"),local=Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);Need(!String.IsNullOrEmpty(root)&&!String.IsNullOrEmpty(local)&&Directory.Exists(local),"known-Windows-folders");return new[]{"SystemRoot="+root,"WINDIR="+root,"SystemDrive="+root.Substring(0,2),"PATH="+Path.Combine(root,"System32"),"LOCALAPPDATA="+local};}
+ static void ExclusiveMarker(String path,String value){using(var stream=new FileStream(path,FileMode.CreateNew,FileAccess.Write,FileShare.Read)){Byte[] bytes=Encoding.UTF8.GetBytes(value);stream.Write(bytes,0,bytes.Length);stream.Flush(true);}}
+ static Operation Start(List<Operation> all,String name,String control,String executable,String digest,String[] arguments,String cwd,String[] env,IntPtr sid,String sidText,Int32 timeout){var operation=new Operation{Name=name,Cancel=Path.Combine(control,"cancel-"+name)};Need(!File.Exists(operation.Cancel),"fresh-cancellation");all.Add(operation);operation.Task=Task.Factory.StartNew(()=>WindowsAppContainerNative.Launch(executable,digest,arguments,cwd,env,timeout,16384,sid,sidText,operation.Cancel),CancellationToken.None,TaskCreationOptions.LongRunning,TaskScheduler.Default);return operation;}
+ static WindowsAppContainerNative.LaunchResult Complete(Operation operation,Int32 timeout){Need(operation.Task.Wait(timeout),operation.Name+"-controller-wait");var result=operation.Task.GetAwaiter().GetResult();operation.Result=result;Need(result.Drained&&!result.TimedOut&&!result.Cancelled&&!result.OutputLimit&&result.RootImageMatches,operation.Name+"-owned-drain-and-identity");Need(result.ExitCode==0,operation.Name+"-exit:"+result.ExitCode+":"+Encoding.UTF8.GetString(Convert.FromBase64String(result.StderrBase64)));Need(result.StderrBase64=="",operation.Name+"-unexpected-stderr");return result;}
+ static Boolean DrainAll(List<Operation> all){Boolean confirmed=true;foreach(var operation in all)if(operation.Task!=null&&!operation.Task.IsCompleted){try{ExclusiveMarker(operation.Cancel,"cancel\n");}catch(IOException){if(!File.Exists(operation.Cancel))confirmed=false;}}var clock=Stopwatch.StartNew();foreach(var operation in all){if(operation.Task==null)continue;try{Int32 remaining=(Int32)Math.Max(0,7000-clock.ElapsedMilliseconds);if(!operation.Task.Wait(remaining)){confirmed=false;continue;}operation.Result=operation.Task.GetAwaiter().GetResult();if(!operation.Result.Drained)confirmed=false;}catch{confirmed=false;}}return confirmed;}
+
+ static void Ready(Operation creator,String path){var clock=Stopwatch.StartNew();for(;;){if(File.Exists(path)){try{Need((File.GetAttributes(path)&(FileAttributes.ReparsePoint|FileAttributes.Directory))==0,"ready-physical-file");using(var stream=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.Read)){Need(stream.Length==5,"ready-length");Byte[] bytes=new Byte[5];Need(stream.Read(bytes,0,5)==5&&Encoding.ASCII.GetString(bytes)=="ready","ready-bytes");}return;}catch(IOException error){Int32 code=error.HResult&0xffff;if(code!=32&&code!=33)throw;}}Need(!creator.Task.IsCompleted,"creator-exited-before-ready");Need(clock.ElapsedMilliseconds<10000,"ready-deadline");Thread.Sleep(10);}}
+
+ static String Output(WindowsAppContainerNative.LaunchResult result){return result.StdoutBase64;}
+ public static Int32 Main(String[] args){
+  var operations=new List<Operation>();WindowsAppContainerNative.MsysNamespaceLease lease=null;IntPtr sidA=IntPtr.Zero,sidB=IntPtr.Zero;String nameA="Autoprompt_"+Guid.NewGuid().ToString("N"),nameB="Autoprompt_"+Guid.NewGuid().ToString("N");Boolean createdA=false,createdB=false,drained=true;String proof=null;Exception failure=null;
+  try{
+   Need(args.Length==10,"arguments: child-exe digest bash bash-digest dll dll-digest shared-id control cwd-A cwd-B");String executable=Path.GetFullPath(args[0]),bash=Path.GetFullPath(args[2]),dll=Path.GetFullPath(args[4]),control=Path.GetFullPath(args[7]),cwdA=Path.GetFullPath(args[8]),cwdB=Path.GetFullPath(args[9]);Need(Hash(executable)==args[1]&&Hash(bash)==args[3]&&Hash(dll)==args[5],"bound-fixture-and-Bash-DLL-bytes");String communications=Path.Combine(cwdA,"communications");Directory.CreateDirectory(communications);String ready=Path.Combine(communications,"ready"),release=Path.Combine(communications,"release");Need(!File.Exists(ready)&&!File.Exists(release),"fresh-communication-markers");
+   Need(WindowsAppContainerNative.CreateAppContainerProfile(nameA,nameA,nameA,IntPtr.Zero,0,out sidA)>=0,"create-profile-A");createdA=true;Need(WindowsAppContainerNative.CreateAppContainerProfile(nameB,nameB,nameB,IntPtr.Zero,0,out sidB)>=0,"create-profile-B");createdB=true;String packageA=new SecurityIdentifier(sidA).Value,packageB=new SecurityIdentifier(sidB).Value;Need(packageA!=packageB,"distinct-package-identities");
+   ExecutableAcl(executable,packageA,packageB);DirectoryAcl(cwdA,new[]{packageA},false);DirectoryAcl(cwdB,new[]{packageB},false);DirectoryAcl(communications,new[]{packageA},true);
+   var request=new WindowsAppContainerNative.MsysNamespaceRequest{DllPath=dll,DllSha256=args[5],SharedId=args[6]};lease=WindowsAppContainerNative.CreateMsysNamespaceLease(bash,request,packageA);Need(lease!=null&&lease.Names.Length>=1&&lease.Names[0].StartsWith(@"\BaseNamedObjects\",StringComparison.Ordinal),"bound-private-namespace");String prefix=lease.Names[0];var env=EnvironmentEntries();
+   var creator=Start(operations,"creator",control,executable,args[1],new[]{"create-hold",prefix,packageA,ready,release},cwdA,env,sidA,packageA,30000);Ready(creator,ready);
+   var same=Start(operations,"same",control,executable,args[1],new[]{"same-profile",prefix,packageA},cwdA,env,sidA,packageA,6000);var sameResult=Complete(same,8000);
+   var other=Start(operations,"other",control,executable,args[1],new[]{"other-profile",prefix,packageB},cwdB,env,sidB,packageB,6000);var otherResult=Complete(other,8000);
+   ExclusiveMarker(release,"release\n");var creatorResult=Complete(creator,5000);Need(Hash(executable)==args[1]&&Hash(bash)==args[3]&&Hash(dll)==args[5],"bound-inputs-remain-unchanged");
+   proof="{\"schemaVersion\":1,\"objects\":16,\"sameProfileOpens\":16,\"otherProfileDenied\":16,\"drainedJobs\":3,\"namespaceCount\":"+lease.Names.Length+",\"creatorBase64\":\""+Output(creatorResult)+"\",\"sameBase64\":\""+Output(sameResult)+"\",\"otherBase64\":\""+Output(otherResult)+"\"}";
+  }catch(Exception error){failure=error;}finally{
+   drained=DrainAll(operations);
+   if(drained){if(lease!=null)lease.Dispose();if(createdB&&WindowsAppContainerNative.DeleteAppContainerProfile(nameB)!=0)failure=new InvalidOperationException("delete-profile-B",failure);if(createdA&&WindowsAppContainerNative.DeleteAppContainerProfile(nameA)!=0)failure=new InvalidOperationException("delete-profile-A",failure);if(sidB!=IntPtr.Zero)WindowsAppContainerNative.FreeSid(sidB);if(sidA!=IntPtr.Zero)WindowsAppContainerNative.FreeSid(sidA);}
+   else{Retained.Add(lease);Retained.Add(operations);Console.Error.WriteLine("retained-profiles:"+nameA+":"+nameB);failure=new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED",failure);}
+  }
+  if(failure!=null){Console.Error.WriteLine(failure);foreach(var operation in operations){if(operation.Result!=null)Console.Error.WriteLine("operation:"+operation.Name+":stdout:"+operation.Result.StdoutBase64+":stderr:"+operation.Result.StderrBase64);}return 1;}
+  Need(drained&&proof!=null,"completed-proof");Console.Write(proof);return 0;
+ }
+}

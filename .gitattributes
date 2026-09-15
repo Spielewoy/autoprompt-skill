@@ -12,3 +12,6 @@ agents/contracts/** text eol=lf
 scripts/install/*.json text eol=lf
 scripts/install/codex-discovery-shim.md text eol=lf
 tests/fixtures/windows-msys/compiler-stage.sha256 text eol=lf
+
+# Descriptor proof sources and binding inputs require exact LF bytes.
+scripts/windows-msys/descriptor-proof/** text eol=lf

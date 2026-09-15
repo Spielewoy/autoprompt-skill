@@ -33,5 +33,5 @@ test('actual compiler process helper drains logs, propagates failures and bounds
   })
   assert.ifError(result.error)
   assert.equal(result.status, 0, result.stderr || result.stdout)
-  assert.deepEqual(JSON.parse(result.stdout), { processCases: 3 })
+  assert.deepEqual(JSON.parse(result.stdout), { processCases: 3, toolchainCases: 6 })
 })
