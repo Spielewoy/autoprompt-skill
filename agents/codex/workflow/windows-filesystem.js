@@ -19,7 +19,7 @@ class WindowsFilesystemError extends Error {
 }
 function fail(code, message) { throw new WindowsFilesystemError(code, message) }
 function invocationDiagnostics(stderr) {
-  const phases = ['input', 'compile', 'native']; let index = 0
+  const phases = ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile', 'native']; let index = 0
   let remaining = String(stderr || '')
   for (const phase of phases) {
     const marker = `AUTOPROMPT_CAPTURE_PHASE:${phase}`

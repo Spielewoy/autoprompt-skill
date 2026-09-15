@@ -18,6 +18,14 @@ the SDK's MSYS host compiler, and install only into a separate staging directory
 They record compiler/package provenance and verify that the bootstrap runtime
 was not replaced. Original source notices accompany staged output.
 
+PowerShell writes Bash scripts and checksum manifests as UTF-8 without a BOM,
+using explicit LF endings. Hash-bound adaptation patches are copied unchanged;
+CRLF or BOM patches are rejected. The cross-shell regression can be run with
+`node --test scripts/windows-msys/build-boundaries.test.cjs` with PowerShell
+(`pwsh`) and Bash available; it exercises Windows CRLF input and verifies the
+generated LF manifests with the real `sha256sum` command. Some host versions
+accept CRLF checksums; the pinned MSYS reader rejected them in native CI.
+
 Syntax and patch-application checks passed locally. Windows compilation,
 functional compatibility, native isolation, reproducibility, and distribution
 packaging remain acceptance work. No passing compiler result alone establishes

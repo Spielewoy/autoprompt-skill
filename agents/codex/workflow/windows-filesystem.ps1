@@ -772,20 +772,28 @@ try {
   $capturePhases = $env:AUTOPROMPT_CAPTURE_PHASES -ceq '1'
   if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input') }
   $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input-encoding-created') }
   [Console]::InputEncoding = $strictUtf8
   [Console]::OutputEncoding = $strictUtf8
+  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input-encoding-set') }
   # Consume at most the closed request cap and one sentinel character.  Do
   # not allocate an attacker-controlled stdin string before rejecting it.
   $maximumRequest = 12 * 1024 * 1024
   $requestText = New-Object System.Text.StringBuilder
   $requestBuffer = New-Object char[] 1024
+  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input-initialized') }
+  # Separate Console.In initialization from the bounded blocking read itself.
+  # Keep the same reader for the complete request; do not change EOF semantics.
+  $requestReader = [Console]::In
+  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input-reading') }
   while ($true) {
     $readLimit = [Math]::Min($requestBuffer.Length, ($maximumRequest + 1) - $requestText.Length)
-    $read = [Console]::In.Read($requestBuffer, 0, $readLimit)
+    $read = $requestReader.Read($requestBuffer, 0, $readLimit)
     if ($read -le 0) { break }
     [void]$requestText.Append($requestBuffer, 0, $read)
     if ($requestText.Length -gt $maximumRequest) { throw 'invalid request' }
   }
+  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input-eof') }
   $raw = $requestText.ToString()
   if ($raw.Length -eq 0) { throw 'invalid request' }
   if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:compile') }

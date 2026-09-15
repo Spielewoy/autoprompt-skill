@@ -144,7 +144,7 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
   assert.throws(() => capture.mkdirExclusive('C:\\project\\bad', 0o10000), { code: 'FILESYSTEM_BACKEND_INVALID' })
   assert.throws(() => capture.writeExclusive('C:\\project\\bad', Buffer.alloc(8388610), 0o600), { code: 'FILESYSTEM_BACKEND_INVALID' })
   invocationOverride = { error: { code: 'ETIMEDOUT' }, signal: 'SIGTERM', status: null,
-    stderr: 'AUTOPROMPT_CAPTURE_PHASE:input\r\nAUTOPROMPT_CAPTURE_PHASE:compile\r\n', stdout: 'private captured data must not be copied into errors' }
+    stderr: ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile'].map(phase => `AUTOPROMPT_CAPTURE_PHASE:${phase}\r\n`).join(''), stdout: 'private captured data must not be copied into errors' }
   assert.throws(() => capture.captureTree('C:\\project'), error => {
     assert.equal(error.code, 'FILESYSTEM_BACKEND_UNAVAILABLE')
     assert.match(error.message, /compile: ETIMEDOUT/)
@@ -166,7 +166,7 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
 
 test('Windows capture phases strip only the fixed ordered trace and preserve all unexpected stderr', () => {
   const { invocationDiagnostics } = require('../../agents/codex/workflow/windows-filesystem.js')
-  const phases = ['input', 'compile', 'native']
+  const phases = ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile', 'native']
   for (let count = 0; count <= phases.length; count++) {
     const trace = phases.slice(0, count).map(phase => `AUTOPROMPT_CAPTURE_PHASE:${phase}\r\n`).join('')
     assert.deepEqual(invocationDiagnostics(trace), { helperPhase: count ? phases[count - 1] : 'startup', stderr: '' })
@@ -175,7 +175,9 @@ test('Windows capture phases strip only the fixed ordered trace and preserve all
   for (const trace of ['AUTOPROMPT_CAPTURE_PHASE:native', 'AUTOPROMPT_CAPTURE_PHASE:input\nAUTOPROMPT_CAPTURE_PHASE:input',
     'AUTOPROMPT_CAPTURE_PHASE:input:unexpected', 'AUTOPROMPT_CAPTURE_PHASE:compile\0', '\n', '\r\n',
     'AUTOPROMPT_CAPTURE_PHASE:input', 'AUTOPROMPT_CAPTURE_PHASE:input\n\n',
-    'AUTOPROMPT_CAPTURE_PHASE:input\nnoise\nAUTOPROMPT_CAPTURE_PHASE:compile\n']) {
+    'AUTOPROMPT_CAPTURE_PHASE:input\nnoise\nAUTOPROMPT_CAPTURE_PHASE:compile\n',
+    'AUTOPROMPT_CAPTURE_PHASE:input\nAUTOPROMPT_CAPTURE_PHASE:compile\n',
+    'AUTOPROMPT_CAPTURE_PHASE:input\nAUTOPROMPT_CAPTURE_PHASE:input-reading\n']) {
     assert.notEqual(invocationDiagnostics(trace).stderr, '', 'Malformed phase output must still refuse the invocation')
   }
   assert.deepEqual(invocationDiagnostics('AUTOPROMPT_CAPTURE_PHASE:input\n\nAUTOPROMPT_CAPTURE_PHASE:compile\n'),

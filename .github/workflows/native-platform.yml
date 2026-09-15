@@ -29,6 +29,8 @@ jobs:
       AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node }}
@@ -75,19 +77,34 @@ jobs:
         # mandatory in the full suite below and still fails the job there.
         continue-on-error: true
         run: node --test tests/source/windows-msys-pipe.test.cjs
+      - name: Record isolated Windows capture input diagnostics
+        if: runner.os == 'Windows'
+        # This exact native case remains mandatory in the full suite below.
+        continue-on-error: true
+        run: node --test --test-name-pattern="Windows terminal publication" tests/source/windows-filesystem.test.cjs
       # Branch-scoped compiler investigation; no generated DLL is selected by
       # the native runtime tests. Keep this within the existing 20-job matrix.
+      - name: Detect changes to the MSYS compiler proof
+        id: msys-proof-input
+        if: github.ref == 'refs/heads/codex/issue-27-native-platform-support' && matrix.runner.os == 'windows-latest' && matrix.node == '24.x'
+        shell: pwsh
+        run: |
+          $changed = @(git diff --name-only HEAD^ HEAD -- scripts/windows-msys)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "run=$($changed.Count -gt 0)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
       - name: Compile the isolated MSYS pipe adapter proof
         id: msys-proof
-        if: github.ref == 'refs/heads/codex/issue-27-native-platform-support' && matrix.runner.os == 'windows-latest' && matrix.node == '24.x'
+        if: steps.msys-proof-input.outputs.run == 'true'
         continue-on-error: true
         shell: pwsh
         run: |
+          node --test scripts/windows-msys/build-boundaries.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $patch = (Resolve-Path scripts/windows-msys/pipe-security.patch).Path
           $digest = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
           ./scripts/windows-msys/build.ps1 -WorkRoot (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof') -Mode proof -AdaptationPatch $patch -AdaptationSha256 $digest -Jobs 4
       - name: Preserve the MSYS compiler proof and diagnostics
-        if: always() && github.ref == 'refs/heads/codex/issue-27-native-platform-support' && matrix.runner.os == 'windows-latest' && matrix.node == '24.x'
+        if: always() && steps.msys-proof-input.outputs.run == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-msys-compiler-proof

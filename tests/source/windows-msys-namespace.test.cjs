@@ -47,17 +47,27 @@ test('native Windows MSYS namespace isolates event and section leaves across pro
   // empty working directory to the two profiles, then uses the production
   // launcher to prove each child's exact token, image and job drain.
   const result = cp.spawnSync(controller, [executable, path.join(runtime, 'bash.exe'), dll, dllHash, sharedId], {
-    encoding: 'utf8', timeout: 90000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+    encoding: 'utf8', timeout: 90000, maxBuffer: 262144, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
     cwd: control, env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
       PATH: path.join(systemRoot, 'System32'), TEMP: control, TMP: control },
   })
+  const lines = (result.stdout || '').trimEnd().split(/\r?\n/)
+  const diagnosticPrefix = 'NAMESPACE_DIAGNOSTIC '
+  for (const line of lines.filter(line => line.startsWith(diagnosticPrefix))) {
+    const encoded = line.slice(diagnosticPrefix.length)
+    assert.match(encoded, /^[A-Za-z0-9+/]+={0,2}$/)
+    const diagnostic = Buffer.from(encoded, 'base64').toString('utf8')
+    assert.ok(diagnostic.length <= 16448)
+    t.diagnostic(diagnostic)
+  }
   assert.ifError(result.error)
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.equal(result.stderr, '')
-  const proof = JSON.parse(result.stdout)
+  const proof = JSON.parse(lines.pop())
+  assert.ok(lines.every(line => line.startsWith(diagnosticPrefix)), 'Unexpected controller output')
   assert.ok(proof.namespaceCount === 1 || proof.namespaceCount === 2)
-  // Each namespace has real event and section leaves with all three MSYS
-  // descriptor shapes: explicit WORLD, explicit NULL DACL and default SD.
-  assert.deepEqual(proof, { sameProfileOpens: proof.namespaceCount * 6, wrongProfileDenied: proof.namespaceCount * 6,
+  // Each namespace has real event and section leaves with all four MSYS
+  // descriptor shapes: WORLD, NULL DACL, default SD, and explicit user/BA/SYSTEM.
+  assert.deepEqual(proof, { sameProfileOpens: proof.namespaceCount * 8, wrongProfileDenied: proof.namespaceCount * 8,
     namespaceCount: proof.namespaceCount, collisionRefused: true, released: true })
 })

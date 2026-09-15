@@ -1,4 +1,4 @@
-# Research bootstrap: Windows x64 only. Not yet executed on Windows.
+# Windows x64 research bootstrap; native compilation remains unverified.
 # Downloads the large pinned SDK only when explicitly invoked.
 [CmdletBinding()]
 param(
@@ -12,6 +12,21 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
+function Write-Utf8Lf([string]$Destination,[string]$Content) {
+  $normalized=$Content.Replace("`r`n","`n")
+  if ($normalized.Contains("`r")) { throw 'Bare carriage return in cross-shell text.' }
+  [IO.File]::WriteAllText($Destination,$normalized,[Text.UTF8Encoding]::new($false))
+}
+function Write-BuildChecksums([string]$Destination,[string[]]$Records) {
+  # WriteAllLines uses CRLF on Windows, which sha256sum reads as filename data.
+  Write-Utf8Lf $Destination ([string]::Join("`n",$Records)+"`n")
+}
+function Assert-LfPatch([string]$PatchPath) {
+  $bytes=[IO.File]::ReadAllBytes($PatchPath)
+  if ($bytes -contains 13 -or ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191)) {
+    throw 'Adaptation patch must use LF without a UTF-8 BOM; do not rewrite a hash-bound patch.'
+  }
+}
 if ($env:OS -ne 'Windows_NT' -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Initial compiler proof requires native Windows x64.' }
 $WorkRoot=[IO.Path]::GetFullPath($WorkRoot)
 if ($WorkRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9_\\.-]+$') { throw 'Use an absolute local path without spaces/metacharacters for this compiler proof.' }
@@ -39,8 +54,8 @@ if ($LASTEXITCODE -ne 0 -or $head -ne $lock.sdk.commit) { throw 'SDK commit mism
 $payload=Join-Path $sdk 'issue27-build'
 [void](New-Item -ItemType Directory -Path $payload)
 [void](New-Item -ItemType Directory -Path (Join-Path $payload 'archives'))
-Copy-Item -LiteralPath $LockPath -Destination (Join-Path $payload 'lock.json')
-Copy-Item -LiteralPath $ShellPath -Destination (Join-Path $payload 'build.sh')
+Write-Utf8Lf (Join-Path $payload 'lock.json') ([IO.File]::ReadAllText($LockPath))
+Write-Utf8Lf (Join-Path $payload 'build.sh') ([IO.File]::ReadAllText($ShellPath))
 Fetch-Verified $lock.source.url (Join-Path $payload 'source.tar.gz') $lock.source.sha256
 $records=New-Object 'System.Collections.Generic.List[string]'
 foreach ($package in $lock.modes.$Mode.packages) {
@@ -51,11 +66,12 @@ foreach ($package in $lock.modes.$Mode.packages) {
   [IO.File]::WriteAllBytes($destination+'.sig',[Convert]::FromBase64String($package.signatureBase64))
   $records.Add($package.sha256+'  archives/'+$package.filename)
 }
-[IO.File]::WriteAllLines((Join-Path $payload 'archives.sha256'),$records,[Text.UTF8Encoding]::new($false))
+Write-BuildChecksums (Join-Path $payload 'archives.sha256') $records.ToArray()
 if ($AdaptationPatch) {
   if ((Get-FileHash -LiteralPath $AdaptationPatch -Algorithm SHA256).Hash.ToLowerInvariant() -ne $AdaptationSha256) { throw 'Adaptation digest mismatch.' }
+  Assert-LfPatch $AdaptationPatch
   Copy-Item -LiteralPath $AdaptationPatch -Destination (Join-Path $payload 'adaptation.patch')
-  [IO.File]::WriteAllText((Join-Path $payload 'adaptation.sha256'),$AdaptationSha256+'  adaptation.patch'+"`n",[Text.UTF8Encoding]::new($false))
+  Write-BuildChecksums (Join-Path $payload 'adaptation.sha256') @($AdaptationSha256+'  adaptation.patch')
 }
 # Build through only this checkout's MSYS host tools; never modify an installed SDK.
 $env:MSYSTEM='MSYS'
