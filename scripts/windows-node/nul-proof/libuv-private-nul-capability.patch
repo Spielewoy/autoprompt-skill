@@ -1,0 +1,380 @@
+--- a/deps/uv/src/win/internal.h
++++ b/deps/uv/src/win/internal.h
+@@ -275,8 +275,14 @@
+ /*
+  * Process stdio handles.
+  */
++typedef struct {
++  HANDLE handle;
++  uintptr_t locator;
++} uv__nul_capability_t;
++int uv__nul_capability_duplicate(HANDLE capability, DWORD access, HANDLE* output);
+ int uv__stdio_create(uv_loop_t* loop,
+                      const uv_process_options_t* options,
++                     HANDLE nul_capability,
+                      BYTE** buffer_ptr);
+ void uv__stdio_destroy(BYTE* buffer);
+ void uv__stdio_noinherit(BYTE* buffer);
+--- a/deps/uv/src/win/process-stdio.c
++++ b/deps/uv/src/win/process-stdio.c
+@@ -142,9 +142,12 @@
+ 
+ 
+ int uv__create_nul_handle(HANDLE* handle_ptr,
+-    DWORD access) {
++    DWORD access, HANDLE capability) {
+   HANDLE handle;
+   SECURITY_ATTRIBUTES sa;
++
++  if (capability != NULL)
++    return uv__nul_capability_duplicate(capability, access, handle_ptr);
+ 
+   sa.nLength = sizeof sa;
+   sa.lpSecurityDescriptor = NULL;
+@@ -168,6 +171,7 @@
+ 
+ int uv__stdio_create(uv_loop_t* loop,
+                      const uv_process_options_t* options,
++                     HANDLE nul_capability,
+                      BYTE** buffer_ptr) {
+   BYTE* buffer;
+   int count, i;
+@@ -219,7 +223,7 @@
+           DWORD access = (i == 0) ? FILE_GENERIC_READ :
+                                     FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES;
+ 
+-          err = uv__create_nul_handle(&nul, access);
++          err = uv__create_nul_handle(&nul, access, nul_capability);
+           if (err)
+             goto error;
+ 
+--- a/deps/uv/src/win/process.c
++++ b/deps/uv/src/win/process.c
+@@ -34,6 +34,7 @@
+ #include <dbghelp.h>
+ #include <shlobj.h>
+ #include <psapi.h>     /* GetModuleBaseNameW */
++#include "nul-capability.h"
+ 
+ 
+ #define SIGKILL         9
+@@ -900,6 +901,7 @@
+   PROCESS_INFORMATION info;
+   DWORD process_flags, cwd_len;
+   BYTE* child_stdio_buffer;
++  uv__nul_capability_t nul_capability = { NULL, 0 };
+ 
+   uv__process_init(loop, process);
+   process->exit_cb = options->exit_cb;
+@@ -935,11 +937,19 @@
+   if (err)
+     goto done_uv;
+ 
++  err = uv__nul_capability_prepare(&nul_capability);
++  if (err)
++    goto done;
++
+   if (options->env) {
+      err = make_program_env(options->env, &env);
+      if (err)
+        goto done_uv;
+   }
++
++  err = uv__nul_capability_environment(&nul_capability, &env);
++  if (err)
++    goto done;
+ 
+   if (options->cwd) {
+     /* Explicit cwd */
+@@ -1002,7 +1012,7 @@
+     }
+   }
+ 
+-  err = uv__stdio_create(loop, options, &child_stdio_buffer);
++  err = uv__stdio_create(loop, options, nul_capability.handle, &child_stdio_buffer);
+   if (err)
+     goto done;
+ 
+@@ -1148,6 +1158,8 @@
+   err = uv_translate_sys_error(err);
+ 
+  done_uv:
++  if (nul_capability.handle != NULL)
++    CloseHandle(nul_capability.handle);
+   uv__free(application);
+   uv__free(application_path);
+   uv__free(arguments);
+--- /dev/null
++++ b/deps/uv/src/win/nul-capability.h
+@@ -0,0 +1,271 @@
++/* Experimental private NUL capability. Included only by process.c.
++ * No environment value grants authority; an owned duplicate must prove its
++ * actual kernel object and access mask. No global environment or handle cache.
++ */
++#define UV__NUL_ENV L"AUTOPROMPT_PRIVATE_NUL_HANDLE"
++#define UV__NUL_ALL ((DWORD) (FILE_GENERIC_READ | FILE_GENERIC_WRITE))
++#define UV__NUL_ENV_LIMIT 32767u
++
++typedef struct {
++  USHORT length;
++  USHORT maximum_length;
++  WCHAR* buffer;
++} uv__nul_string_t;
++
++typedef struct {
++  ULONG attributes;
++  ACCESS_MASK granted_access;
++  ULONG handle_count;
++  ULONG pointer_count;
++  ULONG reserved[10];
++} uv__nul_basic_t;
++
++typedef LONG (NTAPI *uv__nul_query_t)(HANDLE, ULONG, void*, ULONG, ULONG*);
++
++static int uv__nul_error(void) {
++  DWORD error = GetLastError();
++  return error != 0 ? (int) error : ERROR_INVALID_DATA;
++}
++
++static int uv__nul_token(int* app) {
++  HANDLE token;
++  DWORD value, returned;
++  int error;
++  token = NULL;
++  value = returned = 0;
++  *app = 0;
++  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
++    return uv__nul_error();
++  error = GetTokenInformation(token, TokenIsAppContainer, &value,
++                              sizeof(value), &returned) ? 0 : uv__nul_error();
++  if (!error && (returned != sizeof(value) || value > 1))
++    error = ERROR_INVALID_DATA;
++  if (!CloseHandle(token) && !error)
++    error = uv__nul_error();
++  if (!error)
++    *app = value != 0;
++  return error;
++}
++
++static int uv__nul_parse(const WCHAR* text, size_t length, uintptr_t* value) {
++  size_t i;
++  uintptr_t result = 0;
++  unsigned int digit;
++  if (length != sizeof(uintptr_t) * 2)
++    return ERROR_INVALID_DATA;
++  for (i = 0; i < length; i++) {
++    if (text[i] >= L'0' && text[i] <= L'9')
++      digit = text[i] - L'0';
++    else if (text[i] >= L'a' && text[i] <= L'f')
++      digit = text[i] - L'a' + 10;
++    else
++      return ERROR_INVALID_DATA;
++    result = (result << 4) | digit;
++  }
++  /* Positive pointer-sized values only: never process/thread pseudo handles. */
++  if (result == 0 || result > UINTPTR_MAX / 2)
++    return ERROR_INVALID_HANDLE;
++  *value = result;
++  return 0;
++}
++
++static int uv__nul_query_string(uv__nul_query_t query, HANDLE handle,
++                                ULONG kind, const WCHAR* expected,
++                                size_t expected_length) {
++  union { uintptr_t alignment; unsigned char bytes[4096]; } storage;
++  uv__nul_string_t* name;
++  ULONG returned = 0;
++  uintptr_t start, pointer;
++  if (query(handle, kind, storage.bytes, sizeof(storage.bytes), &returned) != 0)
++    return ERROR_INVALID_DATA;
++  if (returned < sizeof(uv__nul_string_t) || returned > sizeof(storage.bytes))
++    return ERROR_INVALID_DATA;
++  name = (uv__nul_string_t*) storage.bytes;
++  start = (uintptr_t) storage.bytes;
++  pointer = (uintptr_t) name->buffer;
++  if (name->length != expected_length * sizeof(WCHAR) ||
++      name->maximum_length < name->length || pointer < start ||
++      pointer - start < sizeof(uv__nul_string_t) || pointer - start > returned ||
++      name->length > returned - (pointer - start))
++    return ERROR_INVALID_DATA;
++  if (CompareStringOrdinal(name->buffer, (int) expected_length,
++                           expected, (int) expected_length, TRUE) != CSTR_EQUAL)
++    return ERROR_INVALID_HANDLE;
++  return 0;
++}
++
++static int uv__nul_validate(HANDLE handle, DWORD wanted, int exact_mask) {
++  union { FARPROC address; uv__nul_query_t query; } api;
++  uv__nul_basic_t basic;
++  ULONG returned = 0;
++  int error;
++  /* Reject disks/pipes before querying their object names. */
++  if (GetFileType(handle) != FILE_TYPE_CHAR)
++    return ERROR_INVALID_HANDLE;
++  api.address = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject");
++  if (api.address == NULL)
++    return ERROR_PROC_NOT_FOUND;
++  error = uv__nul_query_string(api.query, handle, 2, L"File", 4);
++  if (error)
++    return error;
++  error = uv__nul_query_string(api.query, handle, 1, L"\\Device\\Null", 12);
++  if (error)
++    return error;
++  if (api.query(handle, 0, &basic, sizeof(basic), &returned) != 0 ||
++      returned != sizeof(basic))
++    return ERROR_INVALID_DATA;
++  if ((basic.granted_access & wanted) != wanted ||
++      (exact_mask && basic.granted_access != wanted))
++    return ERROR_ACCESS_DENIED;
++  return 0;
++}
++
++static int uv__nul_capability_prepare(uv__nul_capability_t* capability) {
++  WCHAR locator[sizeof(uintptr_t) * 2 + 1];
++  DWORD length;
++  uintptr_t source;
++  HANDLE duplicate = NULL;
++  int app, error;
++  capability->handle = NULL;
++  capability->locator = 0;
++  error = uv__nul_token(&app);
++  if (error || !app)
++    return error;
++  SetLastError(0);
++  length = GetEnvironmentVariableW(UV__NUL_ENV, locator,
++                                    sizeof(locator) / sizeof(locator[0]));
++  if (length == 0)
++    return GetLastError() == ERROR_ENVVAR_NOT_FOUND ? 0 : ERROR_INVALID_DATA;
++  if (length >= sizeof(locator) / sizeof(locator[0]) || locator[length] != 0)
++    return ERROR_INVALID_DATA;
++  error = uv__nul_parse(locator, length, &source);
++  if (error)
++    return error;
++  if (!DuplicateHandle(GetCurrentProcess(), (HANDLE) source, GetCurrentProcess(),
++                        &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
++    return uv__nul_error();
++  error = uv__nul_validate(duplicate, UV__NUL_ALL, 0);
++  if (!error && !SetHandleInformation(duplicate, HANDLE_FLAG_INHERIT,
++                                     HANDLE_FLAG_INHERIT))
++    error = uv__nul_error();
++  if (error) {
++    CloseHandle(duplicate);
++    return error;
++  }
++  capability->handle = duplicate;
++  capability->locator = source;
++  return 0;
++}
++
++int uv__nul_capability_duplicate(HANDLE capability, DWORD access, HANDLE* output) {
++  HANDLE duplicate = NULL;
++  int error;
++  if (access != FILE_GENERIC_READ &&
++      access != (FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES))
++    return ERROR_INVALID_PARAMETER;
++  if (!DuplicateHandle(GetCurrentProcess(), capability, GetCurrentProcess(),
++                        &duplicate, access, TRUE, 0))
++    return uv__nul_error();
++  error = uv__nul_validate(duplicate, access, 1);
++  if (error) {
++    CloseHandle(duplicate);
++    return error;
++  }
++  *output = duplicate;
++  return 0;
++}
++
++static int uv__nul_env_compare(const void* left, const void* right) {
++  const WCHAR* a = *(const WCHAR* const*) left;
++  const WCHAR* b = *(const WCHAR* const*) right;
++  return CompareStringOrdinal(a, -1, b, -1, TRUE) - CSTR_EQUAL;
++}
++
++static int uv__nul_capability_environment(const uv__nul_capability_t* capability,
++                                          WCHAR** environment) {
++  WCHAR entry[sizeof(UV__NUL_ENV) / sizeof(WCHAR) + sizeof(uintptr_t) * 2 + 1];
++  WCHAR* inherited = NULL;
++  const WCHAR* source;
++  const WCHAR** entries = NULL;
++  WCHAR* replacement = NULL;
++  size_t i, j, length, count, kept, total, key_length, entry_length;
++  uintptr_t locator, numeric;
++  int error = 0, seen = 0;
++  if (capability->handle == NULL)
++    return 0;
++  key_length = sizeof(UV__NUL_ENV) / sizeof(WCHAR) - 1;
++  for (i = 0; i < key_length; i++)
++    entry[i] = UV__NUL_ENV[i];
++  entry[i++] = L'=';
++  numeric = (uintptr_t) capability->handle;
++  for (j = 0; j < sizeof(uintptr_t) * 2; j++)
++    entry[i++] = L"0123456789abcdef"[
++        (numeric >> ((sizeof(uintptr_t) * 2 - 1 - j) * 4)) & 15];
++  entry[i] = 0;
++  entry_length = i + 1;
++  source = *environment;
++  if (source == NULL) {
++    inherited = GetEnvironmentStringsW();
++    if (inherited == NULL)
++      return uv__nul_error();
++    source = inherited;
++  }
++  count = 0;
++  total = 1 + entry_length;
++  for (i = 0;;) {
++    if (i >= UV__NUL_ENV_LIMIT) { error = ERROR_INVALID_DATA; goto done; }
++    if (source[i] == 0) break;
++    for (length = 0; i + length < UV__NUL_ENV_LIMIT && source[i + length]; length++);
++    if (i + length >= UV__NUL_ENV_LIMIT) { error = ERROR_INVALID_DATA; goto done; }
++    if (length > key_length && source[i + key_length] == L'=' &&
++        CompareStringOrdinal(source + i, (int) key_length,
++                             UV__NUL_ENV, (int) key_length, TRUE) == CSTR_EQUAL) {
++      if (seen++) { error = ERROR_INVALID_DATA; goto done; }
++      error = uv__nul_parse(source + i + key_length + 1,
++                            length - key_length - 1, &locator);
++      if (error) goto done;
++      if (locator != capability->locator) { error = ERROR_INVALID_HANDLE; goto done; }
++    } else {
++      count++;
++      total += length + 1;
++      if (total > UV__NUL_ENV_LIMIT) { error = ERROR_INVALID_DATA; goto done; }
++    }
++    i += length + 1;
++  }
++  entries = uv__malloc((count + 1) * sizeof(*entries));
++  replacement = uv__malloc(total * sizeof(WCHAR));
++  if (entries == NULL || replacement == NULL) { error = ERROR_NOT_ENOUGH_MEMORY; goto done; }
++  kept = 0;
++  for (i = 0; source[i] != 0;) {
++    for (length = 0; source[i + length]; length++);
++    if (length > key_length && source[i + key_length] == L'=' &&
++        CompareStringOrdinal(source + i, (int) key_length,
++                             UV__NUL_ENV, (int) key_length, TRUE) == CSTR_EQUAL) {
++      /* Already validated in the bounded sizing pass; replace, do not append. */
++    } else {
++      entries[kept++] = source + i;
++    }
++    i += length + 1;
++  }
++  entries[kept++] = entry;
++  qsort(entries, kept, sizeof(*entries), uv__nul_env_compare);
++  i = 0;
++  for (j = 0; j < kept; j++) {
++    for (length = 0; entries[j][length]; length++);
++    memcpy(replacement + i, entries[j], (length + 1) * sizeof(WCHAR));
++    i += length + 1;
++  }
++  replacement[i] = 0;
++  if (inherited != NULL && !FreeEnvironmentStringsW(inherited)) {
++    inherited = NULL; error = uv__nul_error(); goto done;
++  }
++  inherited = NULL;
++  uv__free(*environment);
++  *environment = replacement;
++  replacement = NULL;
++ done:
++  if (inherited != NULL) FreeEnvironmentStringsW(inherited);
++  uv__free(entries);
++  uv__free(replacement);
++  return error;
++}

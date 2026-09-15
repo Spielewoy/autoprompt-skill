@@ -10,7 +10,7 @@ const fixtures = path.resolve(__dirname, '../fixtures/windows-appcontainer')
 const workerSource = path.join(fixtures, 'node-pipe-worker.cjs')
 const { bindWorker, identify, unchanged, hostEnvironment } = require('../helpers/windows-node-pipe-worker.cjs')
 const modes = ['inherit', 'pipe', 'ipc', 'ignore']
-const passed = mode => ({ stage: 'passed', mode, children: 1, childExitCode: mode === 'ignore' ? 17 : 0 })
+const passed = mode => ({ stage: 'passed', mode, children: 1, childExitCode: mode === 'ignore' ? 17 : 0, ...(mode === 'pipe' || mode === 'ignore' ? { grandchildren: 2, grandchildIgnoredExitCode: 23, emptyEnvironment: true } : {}) })
 
 test('Node pipe worker selection binds an explicit physical file and rejects incomplete or changed bindings', t => {
   const folder = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'node-pipe-binding-')))
@@ -53,6 +53,30 @@ test('Node pipe diagnostic fixture proves exact host stdio and fork IPC roundtri
     assert.equal(result.stderr, '')
     assert.deepEqual(lines(result.stdout, mode, identity).map(value => JSON.parse(value)), [passed(mode)])
   }
+  unchanged(selected)
+})
+
+test('native-only Node requirement refuses a missing locator instead of relaxing the proof', () => {
+  const selected = bindWorker(), identity = identify(selected), env = hostEnvironment()
+  for (const key of Object.keys(env)) if (key.toUpperCase() === 'AUTOPROMPT_PRIVATE_NUL_HANDLE') delete env[key]
+  const result = cp.spawnSync(selected.file, [workerSource, 'pipe', '--require-private-null'], { encoding: 'utf8', timeout: 5000, env })
+  assert.ifError(result.error); assert.equal(result.status, 1); assert.equal(result.stderr, '')
+  assert.deepEqual(lines(result.stdout, 'pipe', identity).map(value => JSON.parse(value)), [{ stage: 'failed', mode: 'pipe', phase: 'spawn', code: 'ERR_ASSERTION' }])
+  unchanged(selected)
+})
+
+test('nested Node worker refuses a locator that does not propagate through an empty child environment', () => {
+  const selected = bindWorker()
+  // A host-only fake locator is never opened: ordinary Node leaves it out of
+  // env={}, so the grandchild must fail its required-propagation assertion.
+  const result = cp.spawnSync(selected.file, [workerSource, 'nested-child', 'ignore', '1'], {
+    encoding: 'utf8', timeout: 5000,
+    env: { ...hostEnvironment(), AUTOPROMPT_PRIVATE_NUL_HANDLE: '0000000000001234' },
+  })
+  assert.ifError(result.error)
+  assert.equal(result.status, 1)
+  assert.equal(result.stdout, '')
+  assert.match(result.stderr, /AssertionError/)
   unchanged(selected)
 })
 
@@ -105,7 +129,8 @@ test('native Windows Node pipe diagnostic records stdio and fork IPC support wit
     assert.equal(observation.drained, true)
     assert.ok(Number.isSafeInteger(observation.exitCode) && observation.exitCode >= 0 && observation.exitCode <= 0xffffffff)
     // Aggregate job membership is independent of explicit child count; passed records
-    // independently prove exactly one explicit child and its expected exit.
+    // independently prove the explicit child plus two nested grandchildren for
+    // pipe/ignore, their exact effects, empty environments and expected exits.
     assert.ok(Number.isSafeInteger(observation.observedJobMembers) && observation.observedJobMembers >= 1 && observation.observedJobMembers <= 1024)
     assert.equal(typeof observation.timedOut, 'boolean')
     const decode = value => { assert.equal(typeof value, 'string'); assert.ok(value.length <= 21848); const bytes = Buffer.from(value, 'base64'); assert.equal(bytes.toString('base64'), value); return bytes.toString('utf8') }

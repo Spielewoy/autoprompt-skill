@@ -26,3 +26,31 @@ for (const [name, mutate] of [
   ['duplicate object check', p => { p.creatorBase64 = encode(Buffer.from(p.creatorBase64, 'base64').toString().replace('variant=0:kind=1', 'variant=0:kind=0')) }],
   ['missing final operation effects', p => { p.creatorBase64 = encode(Buffer.from(p.creatorBase64, 'base64').toString().replace('creator:16:descriptor-and-peer-effects-passed', 'creator:16:passed')) }],
 ]) test(name + ' refuses', () => { const p = proof(); mutate(p); assert.throws(() => parseProof(JSON.stringify(p))) })
+
+test('descriptor fixture verifies exact low-label bytes independently of SDDL control flags', { timeout: 90000 }, t => {
+  const cp = require('node:child_process'), path = require('node:path'), fs = require('node:fs'), os = require('node:os')
+  const shell = process.platform === 'win32' ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'pwsh'
+  const source = String.raw`public static class LabelContract {
+    public static int Run() {
+      var method=typeof(DescriptorController).GetMethod("ExactLowLabelAcl",System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Static);
+      byte[] valid={2,0,28,0,1,0,0,0,17,0,20,0,1,0,0,0,1,1,0,0,0,0,0,16,0,16,0,0};
+      System.Func<byte[],bool> check=bytes=>(bool)method.Invoke(null,new object[]{bytes});
+      if(!check(valid))throw new System.Exception("exact-low-label-refused");
+      byte[] ds=(byte[])valid.Clone();ds[0]=4;if(!check(ds))throw new System.Exception("DS-ACL-revision-refused");
+      int cases=2;
+      for(int i=0;i<valid.Length;i++){byte[] wrong=(byte[])valid.Clone();wrong[i]^=1;if(check(wrong))throw new System.Exception("invalid-label-byte-accepted:"+i);cases++;}
+      foreach(byte[] wrong in new byte[][]{null,new byte[0],new byte[27],new byte[29]}){if(check(wrong))throw new System.Exception("invalid-label-size-accepted");cases++;}
+      return cases;
+    }
+  }`
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'descriptor-label-contract-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const contract = path.join(directory, 'contract.cs'); fs.writeFileSync(contract, source)
+  const result = cp.spawnSync(shell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop";Add-Type -Path @($env:AP_LABEL_NATIVE,$env:AP_LABEL_CONTROLLER,$env:AP_LABEL_TEST);[LabelContract]::Run()'], {
+    encoding: 'utf8', timeout: 60000, windowsHide: true,
+    env: { ...process.env, AP_LABEL_NATIVE: path.resolve(__dirname, '../../../agents/codex/workflow/windows-appcontainer-native.cs'), AP_LABEL_CONTROLLER: path.join(__dirname, 'controller.cs'), AP_LABEL_TEST: contract },
+  })
+  if (result.error?.code === 'ENOENT' && process.platform !== 'win32') { t.skip('PowerShell unavailable for actual-source label contract'); return }
+  assert.ifError(result.error); assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.equal(result.stderr, ''); assert.equal(result.stdout.trim(), '34')
+})

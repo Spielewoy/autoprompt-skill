@@ -15,7 +15,7 @@ public static class NodePipeProof {
    foreach(String mode in new[]{"inherit","pipe","ipc","ignore"}){
     Need(Hash(node)==nodeHash&&Hash(worker)==workerHash,"worker-bytes-changed");
     safeToDelete=false;
-    var result=WindowsAppContainerNative.Launch(node,nodeHash,new[]{"--preserve-symlinks","--preserve-symlinks-main",worker,mode},directory,environment,10000,16384,profile,package,Path.Combine(directory,"never-cancelled-"+mode));
+    var result=WindowsAppContainerNative.Launch(node,nodeHash,new[]{"--preserve-symlinks","--preserve-symlinks-main",worker,mode,"--require-private-null"},directory,environment,10000,16384,profile,package,Path.Combine(directory,"never-cancelled-"+mode));
     safeToDelete=result.Drained;
     Need(result.Drained&&result.RootImageMatches&&result.AppContainerSid==package&&!result.Cancelled&&!result.OutputLimit,"owned-launch-and-drain-required");
     Console.WriteLine("{\"mode\":\""+mode+"\",\"exitCode\":"+result.ExitCode+",\"timedOut\":"+(result.TimedOut?"true":"false")+",\"drained\":true,\"observedJobMembers\":"+result.ObservedJobMembers+",\"stdoutBase64\":\""+result.StdoutBase64+"\",\"stderrBase64\":\""+result.StderrBase64+"\"}");Console.Out.Flush();

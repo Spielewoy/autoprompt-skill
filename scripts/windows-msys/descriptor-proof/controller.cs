@@ -15,12 +15,36 @@ public static class DescriptorController {
  [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern Boolean ConvertStringSecurityDescriptorToSecurityDescriptor(String text,UInt32 revision,out IntPtr descriptor,out UInt32 size);
  [DllImport("advapi32.dll",SetLastError=true)] static extern Boolean GetSecurityDescriptorSacl(IntPtr descriptor,out Boolean present,out IntPtr sacl,out Boolean defaulted);
  [DllImport("advapi32.dll",CharSet=CharSet.Unicode)] static extern UInt32 SetNamedSecurityInfo(String name,Int32 type,UInt32 flags,IntPtr owner,IntPtr group,IntPtr dacl,IntPtr sacl);
+ [DllImport("advapi32.dll",CharSet=CharSet.Unicode)] static extern UInt32 GetNamedSecurityInfo(String name,Int32 type,UInt32 flags,out IntPtr owner,IntPtr group,IntPtr dacl,out IntPtr sacl,out IntPtr descriptor);
+ [DllImport("advapi32.dll")] static extern UInt32 GetSecurityDescriptorLength(IntPtr descriptor);
+ [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern Boolean ConvertSecurityDescriptorToStringSecurityDescriptor(IntPtr descriptor,UInt32 revision,UInt32 flags,out IntPtr text,out UInt32 length);
  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
  static readonly List<Object> Retained=new List<Object>();
  sealed class Operation { public String Name,Cancel;public Task<WindowsAppContainerNative.LaunchResult> Task;public WindowsAppContainerNative.LaunchResult Result; }
  static void Need(Boolean value,String reason){if(!value)throw new InvalidOperationException(reason);}
  static String Hash(String file){using(var stream=File.OpenRead(file))using(var hash=SHA256.Create())return BitConverter.ToString(hash.ComputeHash(stream)).Replace("-","").ToLowerInvariant();}
- static void LowDirectory(String directory){IntPtr sd=IntPtr.Zero,sacl;try{UInt32 size;Boolean present,defaulted;Need(ConvertStringSecurityDescriptorToSecurityDescriptor("S:(ML;;NW;;;LW)",1,out sd,out size),"low-descriptor");Need(GetSecurityDescriptorSacl(sd,out present,out sacl,out defaulted)&&present,"low-sacl");Need(SetNamedSecurityInfo(directory,1,0x10,IntPtr.Zero,IntPtr.Zero,IntPtr.Zero,sacl)==0,"low-directory-label");Need(WindowsAppContainerNative.IsExactLowNoWriteUpLabel(directory),"confirmed-low-directory-label");}finally{if(sd!=IntPtr.Zero)LocalFree(sd);}}
+ // SACL control flags describe descriptor inheritance state; they are not
+ // mandatory-label ACE flags. Require the exact sole label independently of
+ // its SDDL serialization, including zero ACE propagation/inherited flags.
+ static Boolean ExactLowLabelAcl(Byte[] acl){
+  Byte[] expected={2,0,28,0,1,0,0,0,17,0,20,0,1,0,0,0,1,1,0,0,0,0,0,16,0,16,0,0};
+  if(acl==null||acl.Length!=expected.Length||(acl[0]!=2&&acl[0]!=4))return false;
+  for(Int32 i=1;i<expected.Length;i++)if(acl[i]!=expected[i])return false;
+  return true;
+ }
+ static String LabelDiagnostic(IntPtr descriptor){IntPtr text=IntPtr.Zero;try{UInt32 length;if(descriptor==IntPtr.Zero||!ConvertSecurityDescriptorToStringSecurityDescriptor(descriptor,1,0x10,out text,out length)||text==IntPtr.Zero||length==0||length>1024)return "unavailable";String value=Marshal.PtrToStringUni(text,(Int32)length);if(value!=null&&value.EndsWith("\0",StringComparison.Ordinal))value=value.Substring(0,value.Length-1);return value!=null&&value.IndexOf('\0')<0?value:"unavailable";}finally{if(text!=IntPtr.Zero)LocalFree(text);}}
+ static void VerifyLowDirectory(String directory){IntPtr owner=IntPtr.Zero,sacl=IntPtr.Zero,descriptor=IntPtr.Zero;try{
+  UInt32 status=GetNamedSecurityInfo(directory,1,0x10,out owner,IntPtr.Zero,IntPtr.Zero,out sacl,out descriptor);
+  Need(status==0&&descriptor!=IntPtr.Zero&&sacl!=IntPtr.Zero,"query-low-directory-label:"+status);
+  UInt32 size=GetSecurityDescriptorLength(descriptor);Int64 offset=sacl.ToInt64()-descriptor.ToInt64();
+  Need(size>=20&&size<=4096&&offset>=20&&offset<=(Int64)size-8,"bounded-low-directory-label");
+  Int32 aclSize=unchecked((UInt16)Marshal.ReadInt16(sacl,2));
+  if(aclSize!=28||offset>(Int64)size-aclSize)throw new InvalidOperationException("low-directory-label-size:"+aclSize+":"+LabelDiagnostic(descriptor));
+  Byte[] bytes=new Byte[aclSize];Marshal.Copy(sacl,bytes,0,bytes.Length);
+  if(!ExactLowLabelAcl(bytes))throw new InvalidOperationException("confirmed-low-directory-label:"+LabelDiagnostic(descriptor));
+ }finally{if(descriptor!=IntPtr.Zero)LocalFree(descriptor);}}
+ static void LowDirectory(String directory){IntPtr sd=IntPtr.Zero,sacl;try{UInt32 size;Boolean present,defaulted;Need(ConvertStringSecurityDescriptorToSecurityDescriptor("S:(ML;;NW;;;LW)",1,out sd,out size),"low-descriptor");Need(GetSecurityDescriptorSacl(sd,out present,out sacl,out defaulted)&&present,"low-sacl");Need(SetNamedSecurityInfo(directory,1,0x10,IntPtr.Zero,IntPtr.Zero,IntPtr.Zero,sacl)==0,"low-directory-label");VerifyLowDirectory(directory);}finally{if(sd!=IntPtr.Zero)LocalFree(sd);}}
+
  static void DirectoryAcl(String directory,String[] packages,Boolean writable){var user=WindowsIdentity.GetCurrent().User;var sd=new DirectorySecurity();sd.SetOwner(user);sd.SetAccessRuleProtection(true,false);foreach(String sid in new[]{user.Value,"S-1-5-18"})sd.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid),FileSystemRights.FullControl,InheritanceFlags.ContainerInherit|InheritanceFlags.ObjectInherit,PropagationFlags.None,AccessControlType.Allow));foreach(String sid in packages)sd.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid),writable?FileSystemRights.Modify:FileSystemRights.ReadAndExecute,writable?InheritanceFlags.ContainerInherit|InheritanceFlags.ObjectInherit:InheritanceFlags.None,PropagationFlags.None,AccessControlType.Allow));new DirectoryInfo(directory).SetAccessControl(sd);if(writable)LowDirectory(directory);}
  static void ExecutableAcl(String executable,String sidA,String sidB){var user=WindowsIdentity.GetCurrent().User;var sd=new FileSecurity();sd.SetOwner(user);sd.SetAccessRuleProtection(true,false);foreach(String sid in new[]{user.Value,"S-1-5-18",sidA,sidB})sd.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid),sid==sidA||sid==sidB?FileSystemRights.ReadAndExecute:FileSystemRights.FullControl,AccessControlType.Allow));new FileInfo(executable).SetAccessControl(sd);DirectoryAcl(Path.GetDirectoryName(executable),new[]{sidA,sidB},false);}
  static String[] EnvironmentEntries(){String root=Environment.GetEnvironmentVariable("SystemRoot"),local=Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);Need(!String.IsNullOrEmpty(root)&&!String.IsNullOrEmpty(local)&&Directory.Exists(local),"known-Windows-folders");return new[]{"SystemRoot="+root,"WINDIR="+root,"SystemDrive="+root.Substring(0,2),"PATH="+Path.Combine(root,"System32"),"LOCALAPPDATA="+local};}

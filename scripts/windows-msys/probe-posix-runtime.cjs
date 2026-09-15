@@ -83,7 +83,11 @@ async function main(repoArgument, workArgument, compileArgument) {
   const root = path.join(payload, 'posix-proof-' + crypto.randomUUID())
   const mkdir = name => { const dir = path.join(root, name); fs.mkdirSync(dir); ensureWindowsPrivateAcl(dir); return dir }
   fs.mkdirSync(root); ensureWindowsPrivateAcl(root)
-  const runtime = mkdir('runtime')
+  const runtimeRoot = mkdir('runtime')
+  const runtime = path.join(runtimeRoot, 'usr', 'bin')
+  fs.mkdirSync(runtime, { recursive: true })
+  fs.mkdirSync(path.join(runtimeRoot, 'etc'))
+  fs.writeFileSync(path.join(runtimeRoot, 'etc', 'fstab'), 'none /tmp usertemp binary,posix=0,noacl 0 0\n', { flag: 'wx', mode: 0o400 })
   for (const file of original) fs.writeFileSync(path.join(runtime, file.name), file.bytes, { flag: 'wx', mode: 0o500 })
   fs.writeFileSync(path.join(runtime, 'posix-proof.exe'), fixture, { flag: 'wx', mode: 0o500 })
   const copied = bindBashRuntime(runtime, process.env.SystemRoot)
@@ -102,7 +106,7 @@ async function main(repoArgument, workArgument, compileArgument) {
       launcher = createWindowsAppContainerLauncher({ deploymentRoot: deployment.root })
       lease = await prepareWindowsAppContainerResources({
         policy: { readOnly: true, targetPath: target, scratchPath: scratch, readableRoots: [target, scratch], writableRoots: [scratch] },
-        controlRoot, deploymentRoot: deployment.root, executableRoots: [{ path: runtime, kind: 'directory' }], verifyDrainEvidence: launcher.verifyDrainEvidence,
+        controlRoot, deploymentRoot: deployment.root, executableRoots: [{ path: runtimeRoot, kind: 'directory' }], verifyDrainEvidence: launcher.verifyDrainEvidence,
       })
       const env = { SystemRoot: process.env.SystemRoot, WINDIR: process.env.SystemRoot, SystemDrive: process.env.SystemRoot.slice(0, 2),
         PATH: runtime, MSYSTEM: 'MSYS', CHERE_INVOKING: '1', ...lease.environment }

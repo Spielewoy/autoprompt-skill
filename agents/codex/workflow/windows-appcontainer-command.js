@@ -144,7 +144,10 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
   const controlRoot = fs.realpathSync.native(options.controlRoot)
   const nonce = crypto.randomUUID().replaceAll('-', '')
   const cancellationPath = path.join(controlRoot, `cancel-${nonce}`)
-  const runtimeDirectory = path.join(path.dirname(controlRoot), `command-runtime-${nonce}`)
+  // MSYS derives its installation root by removing the DLL filename, bin and
+  // usr components. Keep that real layout inside one owned command directory.
+  const runtimeRoot = path.join(path.dirname(controlRoot), `command-runtime-${nonce}`)
+  const runtimeDirectory = path.join(runtimeRoot, 'usr', 'bin')
   const runtimeNode = path.join(runtimeDirectory, 'node.exe'), runtimeBash = path.join(runtimeDirectory, 'bash.exe')
   let launcher, helperDeployment
   const { prepareWindowsAppContainerResources, recoverWindowsAppContainerResources } = require('./windows-appcontainer-resources.js')
@@ -163,8 +166,14 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
       fs.mkdirSync(privateScratch, { mode: 0o700 }); ensureWindowsPrivateAcl(privateScratch)
       policy = { ...policy, scratchPath: privateScratch, readableRoots: [...policy.readableRoots, privateScratch], writableRoots: [...policy.writableRoots, privateScratch] }
     }
-    fs.mkdirSync(runtimeDirectory, { mode: 0o700 })
-    ensureWindowsPrivateAcl(runtimeDirectory)
+    fs.mkdirSync(runtimeRoot, { mode: 0o700 })
+    ensureWindowsPrivateAcl(runtimeRoot)
+    fs.mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 })
+    const runtimeEtc = path.join(runtimeRoot, 'etc')
+    fs.mkdirSync(runtimeEtc, { mode: 0o700 })
+    // The immutable per-command mount table maps /tmp to the lease's existing
+    // private TEMP/TMP scratch path; no host installation or global mount changes.
+    fs.writeFileSync(path.join(runtimeEtc, 'fstab'), 'none /tmp usertemp binary,posix=0,noacl 0 0\n', { flag: 'wx', mode: 0o400 })
     const expectedNodeHash = sha256(fs.readFileSync(process.execPath))
     fs.copyFileSync(process.execPath, runtimeNode, fs.constants.COPYFILE_EXCL)
     for (const binding of bashSource.files) {
@@ -175,7 +184,7 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
     if (sha256(fs.readFileSync(runtimeNode)) !== expectedNodeHash) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Controller Node changed while copying')
     if (sha256(fs.readFileSync(runtimeBash)) !== executableSha256) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Git Bash runtime changed while copying')
     lease = await prepareWindowsAppContainerResources({ policy, controlRoot, deploymentRoot: helperDeployment.root,
-      executableRoots: [{ path: runtimeDirectory, kind: 'directory' }],
+      executableRoots: [{ path: runtimeRoot, kind: 'directory' }],
       verifyDrainEvidence: launcher.verifyDrainEvidence })
     const env = {
       SystemRoot: systemRoot, WINDIR: systemRoot, ComSpec: path.join(systemRoot, 'System32', 'cmd.exe'), LOCALAPPDATA: process.env.LOCALAPPDATA || '',
@@ -218,7 +227,7 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
     // resource journal. Recovery must prove process drain before revoking grants.
     if ((!lease && !recoveryPending) || released) {
       if (privateScratch) fs.rmSync(privateScratch, { recursive: true, force: true })
-      fs.rmSync(runtimeDirectory, { recursive: true, force: true })
+      fs.rmSync(runtimeRoot, { recursive: true, force: true })
       helperDeployment?.cleanup()
       try { fs.unlinkSync(cancellationPath) } catch (error) { if (error.code !== 'ENOENT') throw error }
     }

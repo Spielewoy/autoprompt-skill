@@ -60,6 +60,9 @@ public static class WindowsAppContainerNative {
  [StructLayout(LayoutKind.Sequential)] struct OBJECT_ATTRIBUTES { public Int32 Length; public IntPtr RootDirectory,ObjectName; public UInt32 Attributes; public IntPtr SecurityDescriptor,SecurityQualityOfService; }
  [DllImport("ntdll.dll")] static extern Int32 NtCreateDirectoryObject(out IntPtr handle,UInt32 access,ref OBJECT_ATTRIBUTES attributes);
  [DllImport("ntdll.dll")] static extern Int32 NtQuerySecurityObject(IntPtr handle,UInt32 information,IntPtr descriptor,UInt32 length,out UInt32 required);
+ [DllImport("ntdll.dll")] static extern Int32 NtQueryObject(IntPtr handle,Int32 information,IntPtr buffer,UInt32 length,out UInt32 required);
+ [DllImport("kernel32.dll",SetLastError=true)] static extern UInt32 GetFileType(IntPtr handle);
+ [DllImport("kernel32.dll",SetLastError=true)] static extern Boolean GetHandleInformation(IntPtr handle,out UInt32 flags);
  [DllImport("ntdll.dll")] static extern UInt16 RtlUpcaseUnicodeChar(UInt16 value);
  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern UInt32 GetFinalPathNameByHandle(IntPtr handle,StringBuilder name,UInt32 length,UInt32 flags);
  [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern Boolean ConvertStringSecurityDescriptorToSecurityDescriptor(String text,UInt32 revision,out IntPtr descriptor,out UInt32 size);
@@ -200,8 +203,33 @@ public static class WindowsAppContainerNative {
  static String Sha256(String value){using(var hash=SHA256.Create()){return String.Concat(hash.ComputeHash(Encoding.UTF8.GetBytes(value)).Select(b=>b.ToString("x2")));}}
  static Boolean PhysicalDirectoryAncestry(String path){try{for(DirectoryInfo current=new DirectoryInfo(path);current!=null;current=current.Parent){if(!current.Exists||(current.Attributes&FileAttributes.ReparsePoint)!=0)return false;}return true;}catch{return false;}}
 
+ const String PrivateNullEnvironmentName="AUTOPROMPT_PRIVATE_NUL_HANDLE";
+ const UInt32 PrivateNullAccess=0x0012019f;
+ // The locator carries no authority. Only the separately inherited, exact
+ // owned device handle can supply read-EOF/discard-write access to the worker.
+ static void VerifyPrivateNullHandle(IntPtr handle) {
+  UInt32 flags;if(GetFileType(handle)!=2||!GetHandleInformation(handle,out flags)||(flags&HANDLE_FLAG_INHERIT)==0)throw new InvalidOperationException("WINDOWS_NULL_CAPABILITY_INVALID");
+  IntPtr memory=Marshal.AllocHGlobal(512);
+  try{
+   UInt32 returned;Int32 status=NtQueryObject(handle,0,memory,512,out returned);
+   if(status!=0||returned<8||returned>512||(unchecked((UInt32)Marshal.ReadInt32(memory,4))&PrivateNullAccess)!=PrivateNullAccess)throw new InvalidOperationException("WINDOWS_NULL_CAPABILITY_ACCESS");
+   foreach(var query in new[]{new KeyValuePair<Int32,String>(2,"File"),new KeyValuePair<Int32,String>(1,@"\Device\Null")}){
+    status=NtQueryObject(handle,query.Key,memory,512,out returned);
+    Int32 header=Marshal.SizeOf(typeof(UNICODE_STRING));
+    if(status!=0||returned<header||returned>512)throw new InvalidOperationException("WINDOWS_NULL_CAPABILITY_IDENTITY");
+    var value=(UNICODE_STRING)Marshal.PtrToStructure(memory,typeof(UNICODE_STRING));
+    Int64 offset=value.Buffer.ToInt64()-memory.ToInt64();
+    if(value.Length!=query.Value.Length*2||value.MaximumLength<value.Length||offset<header||offset>(Int64)returned-value.Length||!String.Equals(Marshal.PtrToStringUni(value.Buffer,value.Length/2),query.Value,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("WINDOWS_NULL_CAPABILITY_IDENTITY");
+   }
+  }finally{Marshal.FreeHGlobal(memory);}
+ }
+ static String[] OwnedNullEnvironment(String[] entries,IntPtr handle) {
+  if(entries==null||entries.Length>64||handle.ToInt64()<=0)throw new InvalidOperationException("WINDOWS_ENVIRONMENT_INVALID");
+  foreach(String entry in entries){Int32 at=entry==null?-1:entry.IndexOf('=');if(at>0&&String.Equals(entry.Substring(0,at),PrivateNullEnvironmentName,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("WINDOWS_NULL_CAPABILITY_RESERVED");}
+  return entries.Concat(new[]{PrivateNullEnvironmentName+"="+handle.ToInt64().ToString(IntPtr.Size==8?"x16":"x8",System.Globalization.CultureInfo.InvariantCulture)}).ToArray();
+ }
  static IntPtr EnvironmentBlock(String[] entries) {
-  if(entries==null||entries.Length>64)throw new InvalidOperationException("WINDOWS_ENVIRONMENT_INVALID");
+  if(entries==null||entries.Length>65)throw new InvalidOperationException("WINDOWS_ENVIRONMENT_INVALID");
   var seen=new HashSet<String>(StringComparer.OrdinalIgnoreCase);Int32 length=0;
   foreach(String entry in entries){Int32 at=entry==null?-1:entry.IndexOf('=');if(at<=0||entry.IndexOf('\0')>=0||!seen.Add(entry.Substring(0,at)))throw new InvalidOperationException("WINDOWS_ENVIRONMENT_INVALID");length+=entry.Length+1;}
   if(length>32760||!seen.Contains("SystemRoot"))throw new InvalidOperationException("WINDOWS_ENVIRONMENT_INVALID");
@@ -233,19 +261,21 @@ public static class WindowsAppContainerNative {
   if(arguments==null||arguments.Length>256||arguments.Any(x=>x==null||x.IndexOf('\0')>=0)||timeoutMs<1||timeoutMs>300000||outputLimit<1||outputLimit>1048576||Sid(appSid)!=expectedSid)throw new InvalidOperationException("WINDOWS_LAUNCH_INVALID");
   PrepareControllerProfileEnvironment();
   var command=new StringBuilder(String.Join(" ",(new[]{executable}).Concat(arguments).Select(Quote)));if(command.Length>32760)throw new InvalidOperationException("WINDOWS_COMMAND_LIMIT");
-  IntPtr size=IntPtr.Zero,list=IntPtr.Zero,caps=IntPtr.Zero,job=IntPtr.Zero,limit=IntPtr.Zero,environment=IntPtr.Zero,stdoutRead=IntPtr.Zero,stdoutWrite=IntPtr.Zero,stderrRead=IntPtr.Zero,stderrWrite=IntPtr.Zero,nulRead=IntPtr.Zero,handleList=IntPtr.Zero;PROCESS_INFORMATION pi=new PROCESS_INFORMATION();Boolean assigned=false,confirmedDrain=true;ImageBinding imageBinding=null;MsysNamespaceLease namespaceLease=null;
+  IntPtr size=IntPtr.Zero,list=IntPtr.Zero,caps=IntPtr.Zero,job=IntPtr.Zero,limit=IntPtr.Zero,environment=IntPtr.Zero,stdoutRead=IntPtr.Zero,stdoutWrite=IntPtr.Zero,stderrRead=IntPtr.Zero,stderrWrite=IntPtr.Zero,nulRead=IntPtr.Zero,privateNull=IntPtr.Zero,handleList=IntPtr.Zero;PROCESS_INFORMATION pi=new PROCESS_INFORMATION();Boolean assigned=false,confirmedDrain=true;ImageBinding imageBinding=null;MsysNamespaceLease namespaceLease=null;
   try {
    InitializeProcThreadAttributeList(IntPtr.Zero,2,0,ref size);if(size==IntPtr.Zero)throw new InvalidOperationException("attribute-list size");list=Marshal.AllocHGlobal(size);Check(InitializeProcThreadAttributeList(list,2,0,ref size),"InitializeProcThreadAttributeList");
    var security=new SECURITY_CAPABILITIES{AppContainerSid=appSid,Capabilities=IntPtr.Zero,CapabilityCount=0,Reserved=0};int capsSize=Marshal.SizeOf(typeof(SECURITY_CAPABILITIES));caps=Marshal.AllocHGlobal(capsSize);Marshal.StructureToPtr(security,caps,false);Check(UpdateProcThreadAttribute(list,0,(IntPtr)PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,caps,(IntPtr)capsSize,IntPtr.Zero,IntPtr.Zero),"security-capabilities");
    var inherit=new SECURITY_ATTRIBUTES{nLength=Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)),inherit=true};Check(CreatePipe(out stdoutRead,out stdoutWrite,ref inherit,0),"stdout-pipe");Check(CreatePipe(out stderrRead,out stderrWrite,ref inherit,0),"stderr-pipe");Check(SetHandleInformation(stdoutRead,HANDLE_FLAG_INHERIT,0),"stdout-private");Check(SetHandleInformation(stderrRead,HANDLE_FLAG_INHERIT,0),"stderr-private");
    nulRead=CreateFile("NUL",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,ref inherit,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,IntPtr.Zero);if(nulRead==new IntPtr(-1)){nulRead=IntPtr.Zero;throw new Win32Exception(Marshal.GetLastWin32Error(),"stdin-nul");}
-   handleList=Marshal.AllocHGlobal(IntPtr.Size*3);Marshal.WriteIntPtr(handleList,0,nulRead);Marshal.WriteIntPtr(handleList,IntPtr.Size,stdoutWrite);Marshal.WriteIntPtr(handleList,IntPtr.Size*2,stderrWrite);Check(UpdateProcThreadAttribute(list,0,(IntPtr)PROC_THREAD_ATTRIBUTE_HANDLE_LIST,handleList,(IntPtr)(IntPtr.Size*3),IntPtr.Zero,IntPtr.Zero),"owned-handle-list");
+   privateNull=CreateFile("NUL",PrivateNullAccess,FILE_SHARE_READ|FILE_SHARE_WRITE,ref inherit,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,IntPtr.Zero);if(privateNull==new IntPtr(-1)){privateNull=IntPtr.Zero;throw new Win32Exception(Marshal.GetLastWin32Error(),"private-nul");}
+   VerifyPrivateNullHandle(privateNull);
+   handleList=Marshal.AllocHGlobal(IntPtr.Size*4);Marshal.WriteIntPtr(handleList,0,nulRead);Marshal.WriteIntPtr(handleList,IntPtr.Size,stdoutWrite);Marshal.WriteIntPtr(handleList,IntPtr.Size*2,stderrWrite);Marshal.WriteIntPtr(handleList,IntPtr.Size*3,privateNull);Check(UpdateProcThreadAttribute(list,0,(IntPtr)PROC_THREAD_ATTRIBUTE_HANDLE_LIST,handleList,(IntPtr)(IntPtr.Size*4),IntPtr.Zero,IntPtr.Zero),"owned-handle-list");
    job=CreateJobObject(IntPtr.Zero,null);if(job==IntPtr.Zero)throw new Win32Exception(Marshal.GetLastWin32Error(),"CreateJobObject");var limits=new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();limits.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;int limitSize=Marshal.SizeOf(limits);limit=Marshal.AllocHGlobal(limitSize);Marshal.StructureToPtr(limits,limit,false);Check(SetInformationJobObject(job,JobObjectExtendedLimitInformation,limit,(UInt32)limitSize),"job-kill-on-close");
-   imageBinding=new ImageBinding(executable,executableSha256);environment=EnvironmentBlock(environmentEntries);var startup=new STARTUPINFOEX();startup.StartupInfo.cb=Marshal.SizeOf(typeof(STARTUPINFOEX));startup.StartupInfo.dwFlags=STARTF_USESTDHANDLES;startup.StartupInfo.hStdInput=nulRead;startup.StartupInfo.hStdOutput=stdoutWrite;startup.StartupInfo.hStdError=stderrWrite;startup.AttributeList=list;
+   imageBinding=new ImageBinding(executable,executableSha256);environment=EnvironmentBlock(OwnedNullEnvironment(environmentEntries,privateNull));var startup=new STARTUPINFOEX();startup.StartupInfo.cb=Marshal.SizeOf(typeof(STARTUPINFOEX));startup.StartupInfo.dwFlags=STARTF_USESTDHANDLES;startup.StartupInfo.hStdInput=nulRead;startup.StartupInfo.hStdOutput=stdoutWrite;startup.StartupInfo.hStdError=stderrWrite;startup.AttributeList=list;
    namespaceLease=CreateMsysNamespaceLease(executable,msysRuntime,expectedSid);
    Check(CreateProcess(executable,command,IntPtr.Zero,IntPtr.Zero,true,EXTENDED_STARTUPINFO_PRESENT|CREATE_SUSPENDED|CREATE_UNICODE_ENVIRONMENT|CREATE_NO_WINDOW,environment,cwd,ref startup,out pi),"CreateProcess-suspended");
    confirmedDrain=false;
-   Check(CloseHandle(stdoutWrite),"stdout-close-parent-write");stdoutWrite=IntPtr.Zero;Check(CloseHandle(stderrWrite),"stderr-close-parent-write");stderrWrite=IntPtr.Zero;Check(CloseHandle(nulRead),"stdin-close-parent-read");nulRead=IntPtr.Zero;
+   Check(CloseHandle(stdoutWrite),"stdout-close-parent-write");stdoutWrite=IntPtr.Zero;Check(CloseHandle(stderrWrite),"stderr-close-parent-write");stderrWrite=IntPtr.Zero;Check(CloseHandle(nulRead),"stdin-close-parent-read");nulRead=IntPtr.Zero;Check(CloseHandle(privateNull),"private-nul-close-parent");privateNull=IntPtr.Zero;
    Check(AssignProcessToJobObject(job,pi.hProcess),"AssignProcessToJobObject");assigned=true;VerifyAppContainerTokenAndJob(pi.hProcess,expectedSid,job,true);VerifyRootImage(pi.hProcess,imageBinding);if((String.IsNullOrEmpty(cancellationPath)||!File.Exists(cancellationPath))&&ResumeThread(pi.hThread)==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error(),"ResumeThread");CloseHandle(pi.hThread);pi.hThread=IntPtr.Zero;
    using(var stdout=new MemoryStream())using(var stderr=new MemoryStream()){
     var clock=Stopwatch.StartNew();int total=0,members=1;bool timedOut=false,limited=false,cancelled=false;
@@ -261,7 +291,7 @@ public static class WindowsAppContainerNative {
   } finally {
    if(pi.hThread!=IntPtr.Zero)CloseHandle(pi.hThread);if(pi.hProcess!=IntPtr.Zero)CloseHandle(pi.hProcess);if(environment!=IntPtr.Zero)Marshal.FreeHGlobal(environment);if(limit!=IntPtr.Zero)Marshal.FreeHGlobal(limit);if(job!=IntPtr.Zero)CloseHandle(job);
    if(namespaceLease!=null){if(confirmedDrain)namespaceLease.Dispose();else lock(undrainedNamespaces){undrainedNamespaces.Add(namespaceLease);}}
-   if(caps!=IntPtr.Zero)Marshal.FreeHGlobal(caps);if(list!=IntPtr.Zero){DeleteProcThreadAttributeList(list);Marshal.FreeHGlobal(list);}if(imageBinding!=null)imageBinding.Dispose();foreach(IntPtr handle in new[]{stdoutRead,stdoutWrite,stderrRead,stderrWrite,nulRead})if(handle!=IntPtr.Zero)CloseHandle(handle);if(handleList!=IntPtr.Zero)Marshal.FreeHGlobal(handleList);
+   if(caps!=IntPtr.Zero)Marshal.FreeHGlobal(caps);if(list!=IntPtr.Zero){DeleteProcThreadAttributeList(list);Marshal.FreeHGlobal(list);}if(imageBinding!=null)imageBinding.Dispose();foreach(IntPtr handle in new[]{stdoutRead,stdoutWrite,stderrRead,stderrWrite,nulRead,privateNull})if(handle!=IntPtr.Zero)CloseHandle(handle);if(handleList!=IntPtr.Zero)Marshal.FreeHGlobal(handleList);
   }
  }
 }

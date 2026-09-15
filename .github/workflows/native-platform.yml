@@ -89,13 +89,13 @@ jobs:
         run: |
           node --test tests/source/windows-appcontainer-node-pipes.test.cjs tests/source/windows-appcontainer-member-image.test.cjs 2>&1 | Tee-Object -FilePath native-windows-node-pipes.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Record native Windows NUL device access
+      - name: Record native Windows NUL access and private handle isolation
         if: runner.os == 'Windows'
         # Actual access observations are mandatory in the full suite as well.
         continue-on-error: true
         shell: pwsh
         run: |
-          node --test --test-reporter=tap tests/source/windows-appcontainer-nul.test.cjs 2>&1 | Tee-Object -FilePath native-windows-nul.log
+          node --test --test-reporter=tap tests/source/windows-appcontainer-nul.test.cjs tests/source/windows-appcontainer-nul-capability.test.cjs tests/source/windows-null-capability-contract.test.cjs 2>&1 | Tee-Object -FilePath native-windows-nul.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Record isolated Windows capture input diagnostics
         if: runner.os == 'Windows'
@@ -254,6 +254,7 @@ jobs:
             ${{ runner.temp }}/node-compiler-proof/stage
             ${{ runner.temp }}/node-compiler-proof/inputs/build-lock.json
             ${{ runner.temp }}/node-compiler-proof/inputs/libuv-appcontainer-pipes.patch
+            ${{ runner.temp }}/node-compiler-proof/inputs/libuv-private-nul-capability.patch
           if-no-files-found: warn
       - name: Run platform tests and reject skips of this host's native cases
         run: node tests/helpers/native-platform-ci.cjs platform

@@ -1,0 +1,6 @@
+# Unified-diff context retains upstream whitespace; check the applied source.
+*.patch -text whitespace=-blank-at-eol,-space-before-tab
+*.json text eol=lf
+*.py text eol=lf
+*.c text eol=lf
+*.md text eol=lf

@@ -473,10 +473,17 @@ index 11ef78c..7492fcb 100644
      }
  
 diff --git a/winsup/cygwin/fhandler/pty.cc b/winsup/cygwin/fhandler/pty.cc
-index de53dbf..626c978 100644
+index de53dbf..1f73085 100644
 --- a/winsup/cygwin/fhandler/pty.cc
 +++ b/winsup/cygwin/fhandler/pty.cc
-@@ -13,6 +13,7 @@ details. */
+@@ -7,12 +7,14 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+ details. */
+ 
+ #include "winsup.h"
++#include "appcontainer_anonymous_pipe.h"
+ #include <stdlib.h>
+ #include <sys/param.h>
+ #include <cygwin/acl.h>
  #include <cygwin/kd.h>
  #include "cygerrno.h"
  #include "security.h"
@@ -484,7 +491,7 @@ index de53dbf..626c978 100644
  #include "path.h"
  #include "fhandler.h"
  #include "dtable.h"
-@@ -41,6 +42,78 @@ extern "C" int sscanf (const char *, const char *, ...);
+@@ -41,6 +43,78 @@ extern "C" int sscanf (const char *, const char *, ...);
        CloseHandle (h); \
    } while (0)
  
@@ -563,7 +570,7 @@ index de53dbf..626c978 100644
  /* pty master control pipe messages */
  enum pipe_request_cmd {
    GET_HANDLES,
-@@ -988,12 +1061,11 @@ fhandler_pty_slave::open (int flags, mode_t)
+@@ -988,12 +1062,11 @@ fhandler_pty_slave::open (int flags, mode_t)
        pipe_reply repl;
        DWORD len;
  
@@ -581,7 +588,7 @@ index de53dbf..626c978 100644
        termios_printf ("dup handles via master control pipe %s", buf);
        if (!CallNamedPipe (buf, &req, sizeof req, &repl, sizeof repl,
  			  &len, 500))
-@@ -1295,13 +1367,8 @@ fhandler_pty_slave::reset_switch_to_nat_pipe (void)
+@@ -1295,13 +1368,8 @@ fhandler_pty_slave::reset_switch_to_nat_pipe (void)
  		  else
  		    {
  		      char pipe[MAX_PATH];
@@ -597,7 +604,7 @@ index de53dbf..626c978 100644
  		      pipe_request req = { GET_HANDLES, GetCurrentProcessId () };
  		      pipe_reply repl;
  		      DWORD len;
-@@ -1789,15 +1856,11 @@ fhandler_pty_slave::tcflush (int queue)
+@@ -1789,15 +1857,11 @@ fhandler_pty_slave::tcflush (int queue)
    if (queue == TCIFLUSH || queue == TCIOFLUSH)
      {
        char pipe[MAX_PATH];
@@ -618,7 +625,7 @@ index de53dbf..626c978 100644
        pipe_request req = { FLUSH_INPUT, GetCurrentProcessId () };
        pipe_reply repl;
        DWORD n;
-@@ -2253,17 +2316,13 @@ fhandler_pty_master::close (int flag)
+@@ -2253,17 +2317,13 @@ fhandler_pty_master::close (int flag)
  	  pipe_reply repl;
  	  DWORD len;
  
@@ -640,7 +647,7 @@ index de53dbf..626c978 100644
  	      CloseHandle (master_ctl);
  	      master_thread->detach ();
  	      get_ttyp ()->set_master_ctl_closed ();
-@@ -3422,18 +3481,7 @@ fhandler_pty_master::setup ()
+@@ -3422,18 +3482,7 @@ fhandler_pty_master::setup ()
  
    /* Create master control pipe which allows the master to duplicate
       the pty pipe handles to processes which deserve it. */
@@ -660,7 +667,26 @@ index de53dbf..626c978 100644
    if (master_ctl == INVALID_HANDLE_VALUE)
      {
        errstr = "pty master control pipe";
-@@ -4323,13 +4371,8 @@ fhandler_pty_slave::transfer_input (tty::xfer_dir dir, HANDLE from, tty *ttyp,
+@@ -3718,7 +3767,7 @@ fhandler_pty_slave::setup_pseudoconsole ()
+   STARTUPINFOEXW si;
+   PROCESS_INFORMATION pi;
+   HANDLE hello, goodbye;
+-  HANDLE hr, hw;
++  HANDLE hr = NULL, hw = NULL;
+   HPCON hpcon;
+ 
+   do
+@@ -3761,7 +3810,8 @@ fhandler_pty_slave::setup_pseudoconsole ()
+ 
+       hello = CreateEvent (&sec_none, true, false, NULL);
+       goodbye = CreateEvent (&sec_none, true, false, NULL);
+-      CreatePipe (&hr, &hw, &sec_none, 0);
++      if (!appcontainer_create_pipe (&hr, &hw, &sec_none, 0))
++	goto cleanup_event_and_pipes;
+ 
+       HANDLE handles_to_inherit[] = {hello, goodbye, hw};
+       if (!UpdateProcThreadAttribute (si.lpAttributeList,
+@@ -4323,13 +4373,8 @@ fhandler_pty_slave::transfer_input (tty::xfer_dir dir, HANDLE from, tty *ttyp,
    if (to == NULL)
      {
        char pipe[MAX_PATH];
@@ -760,19 +786,140 @@ index 5a40e39..d7b3ec2 100644
        if (!NT_SUCCESS (status))
  	{
  	  if (status != STATUS_OBJECT_NAME_COLLISION)
-diff --git a/winsup/cygwin/kernel32.cc b/winsup/cygwin/kernel32.cc
-index f07f80d..f1d5538 100644
---- a/winsup/cygwin/kernel32.cc
-+++ b/winsup/cygwin/kernel32.cc
+diff --git a/winsup/cygwin/fork.cc b/winsup/cygwin/fork.cc
+index 2aa5273..51631ac 100644
+--- a/winsup/cygwin/fork.cc
++++ b/winsup/cygwin/fork.cc
 @@ -7,6 +7,7 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
  details. */
  
  #include "winsup.h"
++#include "appcontainer_anonymous_pipe.h"
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <stdlib.h>
+@@ -119,7 +120,7 @@ child_info::prefork (bool detached)
+ {
+   if (!detached)
+     {
+-      if (!CreatePipe (&rd_proc_pipe, &wr_proc_pipe, &sec_none_nih, 16))
++      if (!appcontainer_create_pipe (&rd_proc_pipe, &wr_proc_pipe, &sec_none_nih, 16))
+ 	api_fatal ("prefork: couldn't create pipe process tracker, %E");
+ 
+       if (!SetHandleInformation (wr_proc_pipe, HANDLE_FLAG_INHERIT,
+diff --git a/winsup/cygwin/kernel32.cc b/winsup/cygwin/kernel32.cc
+index f07f80d..f7a41e8 100644
+--- a/winsup/cygwin/kernel32.cc
++++ b/winsup/cygwin/kernel32.cc
+@@ -7,6 +7,9 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+ details. */
+ 
+ #include "winsup.h"
++#include <ntsecapi.h>
++#include "appcontainer_anonymous_pipe.h"
 +#include "appcontainer_pipe_security.h"
  #include "shared_info.h"
  #include "ntdll.h"
  #include "cygerrno.h"
-@@ -39,14 +40,39 @@ CreateEventW (LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset,
+@@ -19,6 +22,97 @@ details. */
+ #include "winf.h"
+ #include "sys/cygwin.h"
+ 
++/* CreatePipe chooses an inaccessible bare NPFS name in an AppContainer.
++   These two MSYS-internal users need synchronous byte pipes, not the message
++   and FILE_READ_ATTRIBUTES behavior of fhandler_pipe::create. */
++static BOOL
++create_appcontainer_anonymous_pipe (PHANDLE read_pipe, PHANDLE write_pipe,
++                                   LPSECURITY_ATTRIBUTES attributes,
++                                   DWORD size)
++{
++  if (!read_pipe || !write_pipe || read_pipe == write_pipe || size > 65536)
++    {
++      SetLastError (ERROR_INVALID_PARAMETER);
++      return FALSE;
++    }
++  *read_pipe = NULL;
++  *write_pipe = NULL;
++  for (unsigned attempt = 0; attempt < 8; ++attempt)
++    {
++      BYTE nonce[16];
++      if (!RtlGenRandom (nonce, sizeof nonce))
++        {
++          /* RtlGenRandom does not specify GetLastError on failure. */
++          SetLastError (ERROR_GEN_FAILURE);
++          return FALSE;
++        }
++      WCHAR name[80] = L"\\\\.\\pipe\\LOCAL\\msys-anon-";
++      static const WCHAR hex[] = L"0123456789abcdef";
++      size_t offset = wcslen (name);
++      for (size_t i = 0; i < sizeof nonce; ++i)
++        {
++          name[offset++] = hex[nonce[i] >> 4];
++          name[offset++] = hex[nonce[i] & 15];
++        }
++      name[offset] = L'\0';
++      HANDLE reader = CreateNamedPipeW
++        (name, PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
++         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT
++         | PIPE_REJECT_REMOTE_CLIENTS,
++         1, size, size, 0, attributes);
++      if (reader == INVALID_HANDLE_VALUE)
++        {
++          DWORD error = GetLastError ();
++          if (error == ERROR_PIPE_BUSY && attempt + 1 < 8)
++            continue;
++          SetLastError (error ? error : ERROR_GEN_FAILURE);
++          return FALSE;
++        }
++      HANDLE writer = CreateFileW (name, GENERIC_WRITE, 0, attributes,
++                                  OPEN_EXISTING, 0, NULL);
++      if (writer == INVALID_HANDLE_VALUE)
++        {
++          DWORD error = GetLastError ();
++          CloseHandle (reader);
++          SetLastError (error ? error : ERROR_GEN_FAILURE);
++          return FALSE;
++        }
++      *read_pipe = reader;
++      *write_pipe = writer;
++      return TRUE;
++    }
++  SetLastError (ERROR_PIPE_BUSY);
++  return FALSE;
++}
++
++BOOL
++appcontainer_create_pipe (PHANDLE read_pipe, PHANDLE write_pipe,
++                          LPSECURITY_ATTRIBUTES attributes, DWORD size)
++{
++  DWORD error = GetLastError ();
++  BOOL result = FALSE;
++  {
++    appcontainer_pipe_security security;
++    DWORD prepare_error = security.prepare (attributes);
++    if (prepare_error)
++      error = prepare_error;
++    else
++      {
++        /* Preserve the original host API arguments and LastError input.
++           No environment, cached SID or caller flag selects the AC branch. */
++        SetLastError (error);
++        result = security.is_appcontainer ()
++          ? create_appcontainer_anonymous_pipe (read_pipe, write_pipe,
++                                               security.get (), size)
++          : CreatePipe (read_pipe, write_pipe, attributes, size);
++        error = GetLastError ();
++      }
++  }
++  /* The owned descriptor destructor must not replace the operation error. */
++  SetLastError (error);
++  return result;
++}
++
+ /* Implement CreateEvent/OpenEvent so that named objects are always created in
+    Cygwin shared object namespace. */
+ 
+@@ -39,14 +133,39 @@ CreateEventW (LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset,
        RtlInitUnicodeString (&uname, lpName);
        flags |= OBJ_OPENIF | OBJ_CASE_INSENSITIVE;
      }
@@ -820,7 +967,7 @@ index f07f80d..f1d5538 100644
    if (!NT_SUCCESS (status))
      {
        SetLastError (RtlNtStatusToDosError (status));
-@@ -133,11 +159,36 @@ CreateMutexW (LPSECURITY_ATTRIBUTES lpMutexAttributes, BOOL bInitialOwner,
+@@ -133,11 +252,36 @@ CreateMutexW (LPSECURITY_ATTRIBUTES lpMutexAttributes, BOOL bInitialOwner,
        RtlInitUnicodeString (&uname, lpName);
        flags |= OBJ_OPENIF | OBJ_CASE_INSENSITIVE;
      }
@@ -862,7 +1009,7 @@ index f07f80d..f1d5538 100644
    if (!NT_SUCCESS (status))
      {
        SetLastError (RtlNtStatusToDosError (status));
-@@ -223,13 +274,38 @@ CreateSemaphoreW (LPSECURITY_ATTRIBUTES lpSemaphoreAttributes,
+@@ -223,13 +367,38 @@ CreateSemaphoreW (LPSECURITY_ATTRIBUTES lpSemaphoreAttributes,
        RtlInitUnicodeString (&uname, lpName);
        flags |= OBJ_OPENIF | OBJ_CASE_INSENSITIVE;
      }
@@ -908,7 +1055,7 @@ index f07f80d..f1d5538 100644
    if (!NT_SUCCESS (status))
      {
        SetLastError (RtlNtStatusToDosError (status));
-@@ -334,16 +410,41 @@ CreateFileMappingW (HANDLE hFile, LPSECURITY_ATTRIBUTES lpAttributes,
+@@ -334,16 +503,41 @@ CreateFileMappingW (HANDLE hFile, LPSECURITY_ATTRIBUTES lpAttributes,
        RtlInitUnicodeString (&uname, lpName);
        flags |= OBJ_OPENIF | OBJ_CASE_INSENSITIVE;
      }
@@ -960,6 +1107,17 @@ index f07f80d..f1d5538 100644
    if (!NT_SUCCESS (status))
      {
        SetLastError (RtlNtStatusToDosError (status));
+diff --git a/winsup/cygwin/local_includes/appcontainer_anonymous_pipe.h b/winsup/cygwin/local_includes/appcontainer_anonymous_pipe.h
+new file mode 100644
+index 0000000..198ab39
+--- /dev/null
++++ b/winsup/cygwin/local_includes/appcontainer_anonymous_pipe.h
+@@ -0,0 +1,5 @@
++/* MSYS-internal synchronous byte pipe; include after winsup.h. */
++#ifndef _APPCONTAINER_ANONYMOUS_PIPE_H
++#define _APPCONTAINER_ANONYMOUS_PIPE_H
++BOOL appcontainer_create_pipe (PHANDLE, PHANDLE, LPSECURITY_ATTRIBUTES, DWORD);
++#endif
 diff --git a/winsup/cygwin/local_includes/appcontainer_named_kernel.h b/winsup/cygwin/local_includes/appcontainer_named_kernel.h
 new file mode 100644
 index 0000000..6548c73

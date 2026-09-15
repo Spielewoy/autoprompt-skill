@@ -16,6 +16,7 @@ function exportEnvironment(name, value) {
 const WINDOWS_NATIVE_CASES = Object.freeze([
   'native Windows Node pipe diagnostic records stdio and fork IPC support with owned job drain',
   'native Windows NUL diagnostic records exact device access under an AppContainer token',
+  'native Windows Null capability stays distinct from stdin and excludes stray handles across concurrent profiles',
   'native Windows member authority verifies actual descendants and preserves root image binding',
   'native Windows pipe diagnostic records namespace and descriptor outcomes under an AppContainer token',
   'native Windows MSYS namespace isolates event and section leaves across profiles and releases owned names',
