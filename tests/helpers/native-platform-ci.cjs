@@ -14,6 +14,7 @@ function exportEnvironment(name, value) {
 }
 
 const WINDOWS_NATIVE_CASES = Object.freeze([
+  'native Windows pipe diagnostic records namespace and descriptor outcomes under an AppContainer token',
   'native Windows MSYS namespace isolates event and section leaves across profiles and releases owned names',
   'Windows resource ancestry tolerates sibling writes while refusing captured mutations and ancestor replacement',
   'Windows HANDLE capture reads bounded bytes and returns a stable content digest',

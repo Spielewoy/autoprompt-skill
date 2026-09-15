@@ -77,7 +77,7 @@ test('Windows tree protocol refuses unsafe, ambiguous, missing, and unbound entr
 test('Windows wrapper exposes absolute file and tree captures with bounded closed requests', () => {
   const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path')
   const filename = path.resolve(__dirname, '../../agents/codex/workflow/windows-filesystem.js')
-  const calls = [], descriptors = new Map(); let nextDescriptor = 1
+  const calls = [], descriptors = new Map(); let nextDescriptor = 1, invocationOverride
   const physicalStat = { isFile: () => true, isSymbolicLink: () => false, dev: 123, ino: 456, mode: 0o100666, nlink: 1, size: 1, mtimeMs: 1, ctimeMs: 1 }
   const fakeFs = { mkdtempSync: () => 'C:\\private-temp', rmSync: () => {}, constants: { O_RDONLY: 0 }, lstatSync: () => physicalStat, realpathSync: { native: value => value },
     openSync: value => { const fd = nextDescriptor++; descriptors.set(fd, value); return fd }, fstatSync: () => physicalStat,
@@ -85,6 +85,7 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
 
   const sandbox = { Buffer, process: { platform: 'win32', env: { SystemRoot: 'C:\\Windows', MALICIOUS: 'omitted' } }, __dirname: path.dirname(filename), module: { exports: {} }, require: name => name === 'node:child_process' ? { spawnSync: (...args) => {
     calls.push(args)
+    if (invocationOverride) return invocationOverride
     const request = JSON.parse(args[2].input)
     if (['fsync-directory', 'fsync-tree', 'mkdir-exclusive', 'write-exclusive', 'copy-tree-exclusive', 'rename-tree-no-replace'].includes(request.operation)) {
       const wire = transactionFixture(request.operation, request.operation !== 'write-exclusive', request.bytesBase64 ? Buffer.from(request.bytesBase64, 'base64') : Buffer.alloc(0))
@@ -111,6 +112,7 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
   assert.equal(calls[0][2].shell, false)
   assert.equal(calls[0][0], 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
   assert.equal(calls[0][2].env.MALICIOUS, undefined)
+  assert.equal(calls[0][2].env.AUTOPROMPT_CAPTURE_PHASES, '1')
   assert.equal(descriptors.size, 0)
   assert.ok(calls[0][2].maxBuffer >= Math.ceil(67108864 / 3) * 4)
   for (const target of ['C:\\project\\..\\escape', 'C:\\project\\', '\\\\server\\share', 'C:\\project\\CON', 'C:\\project\\a:b']) {
@@ -141,11 +143,43 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
   assert.equal(JSON.parse(calls.at(-1)[2].input).operation, 'rename-tree-no-replace')
   assert.throws(() => capture.mkdirExclusive('C:\\project\\bad', 0o10000), { code: 'FILESYSTEM_BACKEND_INVALID' })
   assert.throws(() => capture.writeExclusive('C:\\project\\bad', Buffer.alloc(8388610), 0o600), { code: 'FILESYSTEM_BACKEND_INVALID' })
+  invocationOverride = { error: { code: 'ETIMEDOUT' }, signal: 'SIGTERM', status: null,
+    stderr: 'AUTOPROMPT_CAPTURE_PHASE:input\r\nAUTOPROMPT_CAPTURE_PHASE:compile\r\n', stdout: 'private captured data must not be copied into errors' }
+  assert.throws(() => capture.captureTree('C:\\project'), error => {
+    assert.equal(error.code, 'FILESYSTEM_BACKEND_UNAVAILABLE')
+    assert.match(error.message, /compile: ETIMEDOUT/)
+    assert.equal(error.details.helperPhase, 'compile')
+    assert.equal(error.details.timeoutMs, 30000)
+    assert.equal(error.details.cause, 'ETIMEDOUT')
+    assert.equal(error.details.stderr, '')
+    assert.doesNotMatch(JSON.stringify(error), /private captured data/)
+    return true
+  })
+  assert.equal(descriptors.size, 0)
+  invocationOverride = undefined
   const invoked = calls.length
   fakeFs.readSync = (fd, buffer) => { buffer[0] = 98; return 1 }
   assert.throws(() => capture.captureTree('C:\\project'), { code: 'FILESYSTEM_BACKEND_MISMATCH' })
   assert.equal(calls.length, invoked)
   assert.equal(descriptors.size, 0)
+})
+
+test('Windows capture phases strip only the fixed ordered trace and preserve all unexpected stderr', () => {
+  const { invocationDiagnostics } = require('../../agents/codex/workflow/windows-filesystem.js')
+  const phases = ['input', 'compile', 'native']
+  for (let count = 0; count <= phases.length; count++) {
+    const trace = phases.slice(0, count).map(phase => `AUTOPROMPT_CAPTURE_PHASE:${phase}\r\n`).join('')
+    assert.deepEqual(invocationDiagnostics(trace), { helperPhase: count ? phases[count - 1] : 'startup', stderr: '' })
+    assert.equal(invocationDiagnostics(trace + 'compiler error').stderr, 'compiler error')
+  }
+  for (const trace of ['AUTOPROMPT_CAPTURE_PHASE:native', 'AUTOPROMPT_CAPTURE_PHASE:input\nAUTOPROMPT_CAPTURE_PHASE:input',
+    'AUTOPROMPT_CAPTURE_PHASE:input:unexpected', 'AUTOPROMPT_CAPTURE_PHASE:compile\0', '\n', '\r\n',
+    'AUTOPROMPT_CAPTURE_PHASE:input', 'AUTOPROMPT_CAPTURE_PHASE:input\n\n',
+    'AUTOPROMPT_CAPTURE_PHASE:input\nnoise\nAUTOPROMPT_CAPTURE_PHASE:compile\n']) {
+    assert.notEqual(invocationDiagnostics(trace).stderr, '', 'Malformed phase output must still refuse the invocation')
+  }
+  assert.deepEqual(invocationDiagnostics('AUTOPROMPT_CAPTURE_PHASE:input\n\nAUTOPROMPT_CAPTURE_PHASE:compile\n'),
+    { helperPhase: 'input', stderr: '\nAUTOPROMPT_CAPTURE_PHASE:compile\n' })
 })
 
 

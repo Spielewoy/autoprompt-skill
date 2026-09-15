@@ -122,7 +122,23 @@ test('Windows resource ancestry tolerates sibling writes while refusing captured
     System.Threading.Thread.Sleep(20);
     if(mode=="sibling")File.WriteAllText(Path.Combine(parent,"unrelated.tmp"),"sibling");
     if(mode=="resource")File.WriteAllText(Path.Combine(target,"changed.tmp"),"mutation");
-    if(mode=="ancestor"){Directory.Move(parent,parent+"-moved");Directory.CreateDirectory(parent);Directory.CreateDirectory(target);}
+    if(mode=="ancestor"){
+      int denied=0;
+      try{Directory.Move(parent,parent+"-moved");}
+      catch(IOException error){uint status=unchecked((uint)error.HResult);Need(status==0x80070020u || status==0x80070005u,"STABLE_FIXTURE_MOVE_ERROR");denied=(int)(status&0xffff);}
+      catch(UnauthorizedAccessException error){Need(unchecked((uint)error.HResult)==0x80070005u,"STABLE_FIXTURE_MOVE_ERROR");denied=5;}
+      if(denied!=0){
+        var heldParent=forest.items.Single(item=>item.full==target).opened.Parent;
+        IntPtr fresh=Open(heldParent.Name,heldParent.Parent.Handle,true);
+        try{Need(SameDirectoryIdentity(heldParent.Snapshot,Info(fresh)),"STABLE_FIXTURE_PARENT_CHANGED");}
+        finally{CloseHandle(fresh);}
+        Need(Directory.Exists(parent)&&Directory.Exists(target)&&!Directory.Exists(parent+"-moved"),"STABLE_FIXTURE_MOVE_PARTIAL");
+        File.WriteAllText(Environment.GetEnvironmentVariable("AUTOPROMPT_STABLE_TEST_OUTCOME"),"blocked:"+denied);
+      }else{
+        Directory.CreateDirectory(parent);Directory.CreateDirectory(target);
+        File.WriteAllText(Environment.GetEnvironmentVariable("AUTOPROMPT_STABLE_TEST_OUTCOME"),"renamed");
+      }
+    }
 `)
   fs.writeFileSync(path.join(root, 'windows-appcontainer-resources-native.cs'), injected)
   const hash = crypto.createHash('sha256').update(injected).digest('hex')
@@ -130,15 +146,23 @@ test('Windows resource ancestry tolerates sibling writes while refusing captured
   const environment = Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toLowerCase() !== 'psmodulepath'))
   for (const mode of ['sibling', 'resource', 'ancestor']) {
     const target = path.join(root, mode, 'target'); fs.mkdirSync(target, { recursive: true })
+    const parent = path.dirname(target), before = fs.statSync(parent, { bigint: true }), outcome = path.join(root, `${mode}-outcome`)
     const request = { schemaVersion: 1, operation: 'plan', profileName: 'Autoprompt_' + crypto.randomBytes(16).toString('hex'),
       roots: [{ path: target, kind: 'directory', writable: false }] }
     const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-NativeSha256', hash, '-Request'], {
       input: JSON.stringify(request), encoding: 'utf8', timeout: 120000,
-      env: { ...environment, AUTOPROMPT_STABLE_TEST_MODE: mode },
+      env: { ...environment, AUTOPROMPT_STABLE_TEST_MODE: mode, AUTOPROMPT_STABLE_TEST_OUTCOME: outcome },
     })
     assert.ifError(result.error); assert.equal(result.status, 0, result.stderr); assert.equal(result.stderr, '')
     const wire = JSON.parse(result.stdout)
-    if (mode === 'sibling') { assert.equal(wire.status, 'PLANNED', result.stdout); assert.equal(wire.plan.entries.length, 1) }
+    const blocked = mode === 'ancestor' && fs.existsSync(outcome) && /^blocked:(?:5|32)$/.test(fs.readFileSync(outcome, 'utf8'))
+    if (blocked) {
+      const after = fs.statSync(parent, { bigint: true })
+      assert.equal(after.dev, before.dev); assert.equal(after.ino, before.ino)
+      assert.equal(fs.existsSync(target), true); assert.equal(fs.existsSync(parent + '-moved'), false)
+    }
+    if (mode === 'sibling' || blocked) { assert.equal(wire.status, 'PLANNED', result.stdout); assert.equal(wire.plan.entries.length, 1) }
     else { assert.equal(wire.status, 'REFUSED', result.stdout); assert.equal(wire.code, 'PREIMAGE_UNSAFE', result.stdout) }
+    if (mode === 'ancestor' && !blocked) assert.equal(fs.readFileSync(outcome, 'utf8'), 'renamed')
   }
 })

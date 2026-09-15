@@ -28,22 +28,25 @@ test('native Windows MSYS namespace isolates event and section leaves across pro
   const nativeSource = path.join(control, 'windows-appcontainer-native.cs'), fixtureSource = path.join(control, 'namespace-proof.cs')
   fs.copyFileSync(path.resolve(__dirname, '../../agents/codex/workflow/windows-appcontainer-native.cs'), nativeSource, fs.constants.COPYFILE_EXCL)
   fs.copyFileSync(path.resolve(__dirname, '../fixtures/windows-msys/namespace-proof.cs'), fixtureSource, fs.constants.COPYFILE_EXCL)
-  const executable = path.join(child, 'namespace-proof.exe')
+  const executable = path.join(child, 'namespace-proof.exe'), controller = path.join(control, 'namespace-controller.exe')
   const systemRoot = process.env.SystemRoot
   const powershell = path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
   const environment = { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
     PATH: path.join(systemRoot, 'System32'), TEMP: control, TMP: control,
-    AUTOPROMPT_NAMESPACE_NATIVE: nativeSource, AUTOPROMPT_NAMESPACE_FIXTURE: fixtureSource, AUTOPROMPT_NAMESPACE_EXE: executable }
+    AUTOPROMPT_NAMESPACE_NATIVE: nativeSource, AUTOPROMPT_NAMESPACE_FIXTURE: fixtureSource, AUTOPROMPT_NAMESPACE_EXE: controller }
   const compiled = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
     '$ErrorActionPreference="Stop";Add-Type -Path @($env:AUTOPROMPT_NAMESPACE_NATIVE,$env:AUTOPROMPT_NAMESPACE_FIXTURE) -OutputAssembly $env:AUTOPROMPT_NAMESPACE_EXE -OutputType ConsoleApplication'], {
     encoding: 'utf8', timeout: 60000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: environment,
   })
   assert.ifError(compiled.error)
   assert.equal(compiled.status, 0, compiled.stderr || compiled.stdout)
+  fs.copyFileSync(controller, executable, fs.constants.COPYFILE_EXCL)
+  // Keep the running controller image separate: Windows can refuse ACL
+  // updates to an image that is already mapped for execution.
   // The controller grants only this fixture executable and its containing
   // empty working directory to the two profiles, then uses the production
   // launcher to prove each child's exact token, image and job drain.
-  const result = cp.spawnSync(executable, [path.join(runtime, 'bash.exe'), dll, dllHash, sharedId], {
+  const result = cp.spawnSync(controller, [executable, path.join(runtime, 'bash.exe'), dll, dllHash, sharedId], {
     encoding: 'utf8', timeout: 90000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
     cwd: control, env: { SystemRoot: systemRoot, WINDIR: systemRoot, PATH: path.join(systemRoot, 'System32'), TEMP: control, TMP: control },
   })

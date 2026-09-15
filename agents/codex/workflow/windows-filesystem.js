@@ -15,9 +15,21 @@ const IDENTITY = /^[0-9a-f]{8}:[0-9a-f]{16}$/u
 const DIGEST = /^[a-f0-9]{64}$/u
 
 class WindowsFilesystemError extends Error {
-  constructor(code, message) { super(message); this.name = 'WindowsFilesystemError'; this.code = code }
+  constructor(code, message, details = {}) { super(message); this.name = 'WindowsFilesystemError'; this.code = code; this.details = details }
 }
 function fail(code, message) { throw new WindowsFilesystemError(code, message) }
+function invocationDiagnostics(stderr) {
+  const phases = ['input', 'compile', 'native']; let index = 0
+  let remaining = String(stderr || '')
+  for (const phase of phases) {
+    const marker = `AUTOPROMPT_CAPTURE_PHASE:${phase}`
+    const prefix = remaining.startsWith(marker + '\r\n') ? marker + '\r\n' : marker + '\n'
+    if (!remaining.startsWith(prefix)) break
+    remaining = remaining.slice(prefix.length)
+    index++
+  }
+  return { helperPhase: index ? phases[index - 1] : 'startup', stderr: remaining }
+}
 function exact(value, keys) { return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key)) }
 function bounded(value, max) { return Number.isSafeInteger(value) && value >= 0 && value <= max }
 function validComponent(value) {
@@ -237,7 +249,7 @@ function createWindowsFilesystemCapture(options = {}) {
       const result = cp.spawnSync(powershellBinding.path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helperBinding.path, '-Request'], {
         input: request, encoding: 'utf8', timeout: 30000, maxBuffer: MAX_OUTPUT_BYTES, windowsHide: true, shell: false,
         cwd: path.win32.dirname(powershellBinding.path),
-        env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '', TEMP: temporary, TMP: temporary },
+        env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '', TEMP: temporary, TMP: temporary, AUTOPROMPT_CAPTURE_PHASES: '1' },
       })
       for (const [held, expected, label, cap, singleLink] of [[heldHelper, helperBinding, 'Windows filesystem helper', 4 * 1024 * 1024, true], [heldPowerShell, powershellBinding, 'Windows PowerShell', MAX_BYTES, false]]) {
         const after = bindPhysical(expected.path, label, cap, singleLink)
@@ -245,7 +257,14 @@ function createWindowsFilesystemCapture(options = {}) {
           if (!sameStat(held.stat, fs.fstatSync(held.descriptor)) || !equalBinding(after.binding, expected)) fail('FILESYSTEM_BACKEND_MISMATCH', label + ' changed during invocation')
         } finally { fs.closeSync(after.descriptor) }
       }
-      if (result.error || result.signal || result.status !== 0 || result.stderr) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows capture helper invocation failed')
+      const diagnostic = invocationDiagnostics(result.stderr)
+      if (result.error || result.signal || result.status !== 0 || diagnostic.stderr) {
+        const cause = typeof result.error?.code === 'string' && /^[A-Z0-9_]{1,40}$/.test(result.error.code) ? result.error.code : `status ${result.status}`
+        throw new WindowsFilesystemError('FILESYSTEM_BACKEND_UNAVAILABLE', `Windows capture helper invocation failed (${diagnostic.helperPhase}: ${cause})`, {
+          stage: 'windows-capture-invocation', helperPhase: diagnostic.helperPhase, status: result.status,
+          cause: result.error?.code, signal: result.signal, timeoutMs: 30000, stderr: diagnostic.stderr.slice(0, 2048),
+        })
+      }
       if (transaction) return parseTransactionResult(result.stdout, operation, recordBytes, ownership?.mode)
       if (publish || operation === 'assert-record-parent' || operation === 'recover-record-publication' || operation === 'inspect-owned-target' || operation === 'remove-owned-target') return parseRecordResult(result.stdout, operation, recordBytes, target.components.at(-1))
       const captured = parseCapture(result.stdout, operation)
@@ -272,4 +291,4 @@ function createWindowsFilesystemCapture(options = {}) {
     helper: helperBinding, powershell: powershellBinding, captureFileBytes: (root, components, maxBytes) => invoke('read', root, components, maxBytes), captureFile: (root, components, maxBytes) => invoke('hash', root, components, maxBytes), captureTree: (root, components, maxBytes) => invoke('tree', root, components, maxBytes) })
 }
 function createWindowsFilesystemMutations(options = {}) { return createWindowsFilesystemCapture(options) }
-module.exports = { WindowsFilesystemError, parseCapture, parseRecordResult, parseTransactionResult, createWindowsFilesystemCapture, createWindowsFilesystemMutations }
+module.exports = { WindowsFilesystemError, invocationDiagnostics, parseCapture, parseRecordResult, parseTransactionResult, createWindowsFilesystemCapture, createWindowsFilesystemMutations }

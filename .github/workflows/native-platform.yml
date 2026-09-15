@@ -69,6 +69,9 @@ jobs:
         run: |
           fsutil 8dot3name set 0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Record native Windows pipe compatibility before the full suite
+        if: runner.os == 'Windows'
+        run: node --test tests/source/windows-msys-pipe.test.cjs
       - name: Run platform tests and reject skips of this host's native cases
         run: node tests/helpers/native-platform-ci.cjs platform
       - name: Verify doctor readiness and isolated Bash and PowerShell diagnostics

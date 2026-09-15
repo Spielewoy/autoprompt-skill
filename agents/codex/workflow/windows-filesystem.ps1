@@ -767,6 +767,10 @@ function Get-RefusalCode([System.Exception]$Exception) {
 
 try {
   if (-not $Request) { throw 'request mode required' }
+  # Fixed diagnostic phases use stderr only when the bound controller requests
+  # them. They never carry paths, request fields, captured bytes, or authority.
+  $capturePhases = $env:AUTOPROMPT_CAPTURE_PHASES -ceq '1'
+  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:input') }
   $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
   [Console]::InputEncoding = $strictUtf8
   [Console]::OutputEncoding = $strictUtf8
@@ -784,7 +788,9 @@ try {
   }
   $raw = $requestText.ToString()
   if ($raw.Length -eq 0) { throw 'invalid request' }
+  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:compile') }
   Add-Type -TypeDefinition $source -Language CSharp
+  if ($capturePhases) { [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:native') }
   [AutopromptWindowsCapture]::ValidateJson($raw)
   $requestObject = $raw | ConvertFrom-Json
   $names = @($requestObject.PSObject.Properties.Name)
