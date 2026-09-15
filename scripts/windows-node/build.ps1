@@ -58,6 +58,11 @@ function Physical([string]$Path) {
   }
   return $full
 }
+function NodeBuildOutput([string]$Source) {
+  # Pinned vcbuild creates Release as a junction to out\Release. Select the
+  # actual build output; Physical must still reject every linked ancestor.
+  return (Physical (Join-Path (Join-Path (Join-Path $Source 'out') 'Release') 'node.exe'))
+}
 function FindNodeVswhere([string[]]$Roots) {
   foreach($root in $Roots) {
     if([string]::IsNullOrEmpty($root)){continue}
@@ -246,7 +251,7 @@ $compilerInputs=@($python,$git,$tar,$vswhere,$clang,$clangDriver);if($plan.nasmR
 $toolsBefore=@{};$compilerMachines=@{};foreach($tool in $compilerInputs){$toolsBefore[$tool]=Hash $tool;$compilerMachines[$tool]=ReadNodeToolMachine $tool}
 Run $cmd @('/d','/v:off','/c',$build) 'node-build' $BuildTimeoutSeconds $source
 foreach($tool in $toolsBefore.Keys){if((Hash $tool) -ne $toolsBefore[$tool]){throw 'Compiler input changed during build'}}
-$node=Physical (Join-Path $source 'Release\node.exe')
+$node=NodeBuildOutput $source
 AssertNodePeBytes ([IO.File]::ReadAllBytes($node)) $plan
 Run $node @('-p','JSON.stringify({node:process.version,uv:process.versions.uv,arch:process.arch,platform:process.platform})') 'built-node-identity'
 $identity=Get-Content -LiteralPath (Join-Path $logs 'built-node-identity.stdout.txt') -Raw | ConvertFrom-Json

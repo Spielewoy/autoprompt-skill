@@ -2,7 +2,9 @@
 // Research controller only: no production selection, SDK mutation or global grants.
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto')
 const assert = require('node:assert/strict')
-const MODES = ['pipe-fork', 'fifo', 'locks', 'af-local', 'blocked-fifo']
+// Prove active-I/O cancellation before the network-backed AF_LOCAL operation;
+// its compatibility failure must not prevent the cancellation test from running.
+const MODES = ['pipe-fork', 'fifo', 'locks', 'blocked-fifo', 'af-local']
 const SOURCE_SHA = '8fecff15b9d87c8a4cf13ec2c1175f12634572af8e89b20d191a3f732be9ace9'
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))

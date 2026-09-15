@@ -28,12 +28,18 @@ test('actual compiler process helper drains logs, propagates failures and bounds
   assert.ok(Number(available.stdout.trim()) >= 7)
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'node-builder-contract-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const output = path.join(root, 'output-source', 'out', 'Release')
+  fs.mkdirSync(output, { recursive: true })
+  fs.writeFileSync(path.join(output, 'node.exe'), 'owned physical output fixture')
+  fs.symlinkSync(output, path.join(root, 'output-source', 'Release'), process.platform === 'win32' ? 'junction' : 'dir')
+  fs.mkdirSync(path.join(root, 'linked-output-source'))
+  fs.symlinkSync(path.dirname(output), path.join(root, 'linked-output-source', 'out'), process.platform === 'win32' ? 'junction' : 'dir')
   const result = cp.spawnSync(pwsh, ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', path.join(__dirname, 'process-contract.ps1')], {
     encoding: 'utf8', timeout: 30000, env: { ...process.env, PROOF_BUILD_SCRIPT: path.join(__dirname, 'build.ps1'), PROOF_WORK: root, PROOF_NODE: process.execPath },
   })
   assert.ifError(result.error)
   assert.equal(result.status, 0, result.stderr || result.stdout)
-  assert.deepEqual(JSON.parse(result.stdout), { processCases: 3, toolchainCases: 6, planCases: 23, peCases: 28, progressRecords: 7, installerCases: 3 })
+  assert.deepEqual(JSON.parse(result.stdout), { processCases: 3, toolchainCases: 6, planCases: 23, peCases: 28, progressRecords: 7, installerCases: 3, outputCases: 4 })
 })
 
 test('private NUL patch lock binds every original, result and newly created header', () => {
