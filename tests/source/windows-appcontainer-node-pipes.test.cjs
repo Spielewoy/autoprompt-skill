@@ -84,7 +84,14 @@ test('native Windows Node pipe diagnostic records stdio and fork IPC support wit
   const selected = bindWorker(), identity = identify(selected)
   const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'node-pipe-native-')))
   let cleanupSafe = true
-  t.after(() => { if (cleanupSafe) fs.rmSync(directory, { recursive: true, force: true }); else t.diagnostic(`Retained owned fixture after unconfirmed controller outcome: ${directory}`) })
+  t.after(async () => {
+    if (!cleanupSafe) { t.diagnostic(`Retained owned fixture after unconfirmed controller outcome: ${directory}`); return }
+    // The controller has exited and every started job has positive drain evidence.
+    // Windows may still briefly retain executable/image or scanner handles. Retry
+    // only cleanup with a finite retry count; never reinterpret a failed
+    // launch/drain or swallow persistent deletion failures.
+    await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  })
   const { ensureWindowsPrivateAcl } = require('../../agents/codex/workflow/safe-run-root.js')
   ensureWindowsPrivateAcl(directory)
   const control = path.join(directory, 'control'), runtime = path.join(directory, 'runtime')

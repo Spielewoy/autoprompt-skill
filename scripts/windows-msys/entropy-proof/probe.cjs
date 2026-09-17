@@ -116,7 +116,7 @@ async function main(workArgument, diagnosticArgument) {
       if (item.name.endsWith('entropy')) {
         assert.equal(latestEvidence.exitCode, 0)
         assert.equal(latestEvidence.stderr.length, 0)
-        try { record.entropy = require('./parse.cjs').parseProof(latestEvidence.stdout.toString('utf8'), lease.profileSid) }
+        try { record.entropy = require('./parse.cjs').parseDiagnostic(latestEvidence.stdout.toString('utf8'), lease.profileSid) }
         catch (error) { note({ ...record, drained: true, parseError: String(error.message).slice(0, 512) }); throw error }
       }
       note({ ...record, drained: true })

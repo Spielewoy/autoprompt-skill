@@ -73,6 +73,34 @@ test('physical proof closed inventory refuses aliases, duplicates and oversized 
   for (const files of [[record, record], [{ ...record, path: '../manifest.json' }], [{ ...record, path: 'NUL' }], [{ ...record, length: 17000000 }], [{ ...record, extra: true }], [{ ...record, sha256: '00' }], []]) {
     assert.throws(() => validateFiles(files))
   }
+  if (windows) {
+    // Exercise the actual EncodedCommand transport and the driver's exact
+    // preference prefix. Progress must disappear at its source; ordinary
+    // PowerShell errors and direct stderr must remain observable.
+    const prefix = fs.readFileSync(path.join(__dirname, 'driver.ps1'), 'utf8').split('$env:PSModulePath')[0]
+    function encoded(source) {
+      const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+        Buffer.from(source, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 30000, maxBuffer: 16384 })
+      assert.ifError(result.error)
+      return result
+    }
+    const progress = "Write-Progress -Activity 'bundle-lease-progress-control' -Status 'running' -PercentComplete 1; [Console]::Out.WriteLine('transport-ok')"
+    const baseline = encoded(prefix.replace("$ProgressPreference = 'SilentlyContinue'", "$ProgressPreference = 'Continue'") + progress)
+    assert.equal(baseline.status, 0)
+    assert.equal(baseline.stdout, 'transport-ok\r\n')
+    assert.match(baseline.stderr, /#< CLIXML/)
+    assert.match(baseline.stderr, /S="progress"/)
+    const quiet = encoded(prefix + progress)
+    assert.equal(quiet.status, 0)
+    assert.equal(quiet.stdout, baseline.stdout)
+    assert.equal(quiet.stderr, '')
+    const rawError = encoded(prefix + "[Console]::Error.WriteLine('native-error-control')")
+    assert.equal(rawError.status, 0)
+    assert.equal(rawError.stderr, 'native-error-control\r\n')
+    const error = encoded(prefix + "Write-Error 'powershell-error-control'")
+    assert.notEqual(error.status, 0)
+    assert.match(error.stderr, /powershell-error-control/)
+  }
 })
 
 test('native Windows physical lease rejects hardlinks, junctions, writers, mappings and tree mutations', { skip: !windows, timeout: 90000 }, t => {

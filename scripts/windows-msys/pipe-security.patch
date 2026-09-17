@@ -1,12 +1,13 @@
 diff --git a/winsup/cygwin/Makefile.am b/winsup/cygwin/Makefile.am
-index 41190bd..e1db324 100644
+index 41190bd..cf3f6c2 100644
 --- a/winsup/cygwin/Makefile.am
 +++ b/winsup/cygwin/Makefile.am
-@@ -264,6 +264,8 @@ REGEX_FILES = \
+@@ -264,6 +264,9 @@ REGEX_FILES = \
  
  SEC_FILES= \
  	sec/acl.cc \
 +	sec/appcontainer_pipe.cc \
++	sec/appcontainer_null.cc \
 +	sec/appcontainer_pipe_name.cc \
  	sec/auth.cc \
  	sec/base.cc \
@@ -68,6 +69,91 @@ index d5d344d..a26146c 100644
  LoadDLLfunc (SystemFunction036, advapi32)	/* Aka "RtlGenRandom" */
  
  LoadDLLfunc (AuthzAccessCheck, authz)
+diff --git a/winsup/cygwin/fhandler/base.cc b/winsup/cygwin/fhandler/base.cc
+index beebd71..e64c698 100644
+--- a/winsup/cygwin/fhandler/base.cc
++++ b/winsup/cygwin/fhandler/base.cc
+@@ -7,6 +7,7 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+ details. */
+ 
+ #include "winsup.h"
++#include "appcontainer_null.h"
+ #include <unistd.h>
+ #include <stdlib.h>
+ #include <sys/uio.h>
+@@ -494,17 +495,28 @@ int
+ fhandler_base::open_null (int flags)
+ {
+   int res = 0;
+-  HANDLE fh;
++  HANDLE fh = NULL;
+   OBJECT_ATTRIBUTES attr;
+   IO_STATUS_BLOCK io;
+-  NTSTATUS status;
++  NTSTATUS status = STATUS_UNSUCCESSFUL;
++  DWORD null_error = 0;
+ 
+   InitializeObjectAttributes (&attr, &ro_u_null, OBJ_CASE_INSENSITIVE |
+ 			      ((flags & O_CLOEXEC) ? 0 : OBJ_INHERIT),
+ 			      NULL, NULL);
+-  status = NtCreateFile (&fh, GENERIC_READ | SYNCHRONIZE, &attr, &io, NULL, 0,
+-			 FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+-			 FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
++  if (appcontainer_null_open (&fh, GENERIC_READ | SYNCHRONIZE, FILE_OPEN,
++                              FILE_SYNCHRONOUS_IO_NONALERT, flags & O_CLOEXEC,
++                              &null_error))
++    {
++      if (null_error) { __seterrno_from_win_error (null_error); goto done; }
++      status = STATUS_SUCCESS;
++      io.Status = status;
++      io.Information = FILE_OPENED;
++    }
++  else
++    status = NtCreateFile (&fh, GENERIC_READ | SYNCHRONIZE, &attr, &io, NULL, 0,
++			   FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
++			   FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+   if (!NT_SUCCESS (status))
+     {
+       __seterrno_from_nt_status (status);
+@@ -525,14 +537,15 @@ int
+ fhandler_base::open (int flags, mode_t mode)
+ {
+   int res = 0;
+-  HANDLE fh;
++  HANDLE fh = NULL;
+   ULONG file_attributes = 0;
+   ULONG shared = (get_major () == DEV_TAPE_MAJOR ? 0 : FILE_SHARE_VALID_FLAGS);
+   ULONG create_disposition;
+   FILE_BASIC_INFORMATION fbi;
+   OBJECT_ATTRIBUTES attr;
+   IO_STATUS_BLOCK io, io_bi;
+-  NTSTATUS status;
++  NTSTATUS status = STATUS_UNSUCCESSFUL;
++  DWORD null_error = 0;
+   PFILE_FULL_EA_INFORMATION p = NULL;
+   ULONG plen = 0;
+ 
+@@ -691,8 +704,18 @@ fhandler_base::open (int flags, mode_t mode)
+ 	}
+     }
+ 
+-  status = NtCreateFile (&fh, access, &attr, &io, NULL, file_attributes, shared,
+-			 create_disposition, options, p, plen);
++  if (get_device () == FH_NULL
++      && appcontainer_null_open (&fh, access, create_disposition, options,
++                                 flags, &null_error))
++    {
++      if (null_error) { __seterrno_from_win_error (null_error); goto done; }
++      status = STATUS_SUCCESS;
++      io.Status = status;
++      io.Information = FILE_OPENED;
++    }
++  else
++    status = NtCreateFile (&fh, access, &attr, &io, NULL, file_attributes, shared,
++			   create_disposition, options, p, plen);
+   /* Pre-W10, we can't reopen a file by handle with delete disposition
+      set, so we have to lie our ass off. */
+   if (get_handle () && status == STATUS_DELETE_PENDING)
 diff --git a/winsup/cygwin/fhandler/fifo.cc b/winsup/cygwin/fhandler/fifo.cc
 index 15117db..abe6732 100644
 --- a/winsup/cygwin/fhandler/fifo.cc
@@ -788,18 +874,19 @@ index 5a40e39..d7b3ec2 100644
  	{
  	  if (status != STATUS_OBJECT_NAME_COLLISION)
 diff --git a/winsup/cygwin/fork.cc b/winsup/cygwin/fork.cc
-index 2aa5273..51631ac 100644
+index 2aa5273..af93a58 100644
 --- a/winsup/cygwin/fork.cc
 +++ b/winsup/cygwin/fork.cc
-@@ -7,6 +7,7 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+@@ -7,6 +7,8 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
  details. */
  
  #include "winsup.h"
++#include "appcontainer_child_security.h"
 +#include "appcontainer_anonymous_pipe.h"
  #include <stdio.h>
  #include <unistd.h>
  #include <stdlib.h>
-@@ -119,7 +120,7 @@ child_info::prefork (bool detached)
+@@ -119,7 +121,7 @@ child_info::prefork (bool detached)
  {
    if (!detached)
      {
@@ -808,6 +895,33 @@ index 2aa5273..51631ac 100644
  	api_fatal ("prefork: couldn't create pipe process tracker, %E");
  
        if (!SetHandleInformation (wr_proc_pipe, HANDLE_FLAG_INHERIT,
+@@ -363,20 +365,23 @@ frok::parent (volatile char * volatile stack_here)
+       hchild = NULL;
+       /* cygwin1.dll may reuse the forking_progname buffer, even
+ 	 in case of failure: don't reuse forking_progname later */
+-      rc = CreateProcessW (forking_progname,	/* image to run */
++      rc = appcontainer_child_create (sa,
++        [&] (LPSECURITY_ATTRIBUTES child_security) {
++      return CreateProcessW (forking_progname,	/* image to run */
+ 			   GetCommandLineW (),	/* Take same space for command
+ 						   line as in parent to make
+ 						   sure child stack is allocated
+ 						   in the same memory location
+ 						   as in parent. */
+-			   sa,
+-			   sa,
++			   child_security,
++			   child_security,
+ 			   TRUE,		/* inherit handles */
+ 			   c_flags,
+ 			   NULL,		/* environ filled in later */
+ 			   0,			/* use cwd */
+ 			   &si,
+ 			   &pi);
++        });
+ 
+       if (rc)
+ 	debug_printf ("forked pid %u", pi.dwProcessId);
 diff --git a/winsup/cygwin/kernel32.cc b/winsup/cygwin/kernel32.cc
 index f07f80d..f7a41e8 100644
 --- a/winsup/cygwin/kernel32.cc
@@ -1119,6 +1233,44 @@ index 0000000..198ab39
 +#define _APPCONTAINER_ANONYMOUS_PIPE_H
 +BOOL appcontainer_create_pipe (PHANDLE, PHANDLE, LPSECURITY_ATTRIBUTES, DWORD);
 +#endif
+diff --git a/winsup/cygwin/local_includes/appcontainer_child_security.h b/winsup/cygwin/local_includes/appcontainer_child_security.h
+new file mode 100644
+index 0000000..3fbca5b
+--- /dev/null
++++ b/winsup/cygwin/local_includes/appcontainer_child_security.h
+@@ -0,0 +1,32 @@
++/* Same-primary-token child creation only; include after winsup.h. */
++#ifndef _APPCONTAINER_CHILD_SECURITY_H
++#define _APPCONTAINER_CHILD_SECURITY_H
++#include "appcontainer_pipe_security.h"
++
++/* CreateProcessW inherits the primary token, but an explicit sec_user_nih SD
++   omits that token's package SID. Preserve that SD and append only the actual
++   package grant for both child objects. Never use this for CreateProcessAsUser:
++   its target token can identify a different user or package. One synchronous
++   operation owns the descriptor; no environment SID, globals or fork cache.
++   The helper uses Windows HeapAlloc, never the locked Cygwin malloc heap. */
++template <typename Create>
++static BOOL
++appcontainer_child_create (LPSECURITY_ATTRIBUTES original, Create create)
++{
++  BOOL result = FALSE;
++  DWORD error;
++  {
++    appcontainer_pipe_security security;
++    error = security.prepare (original);
++    if (!error)
++      {
++        result = create (security.get ());
++        error = GetLastError ();
++      }
++  }
++  /* Token/descriptor cleanup must not replace preparation or CreateProcessW
++     failure. The existing caller retains its complete cleanup/errno path. */
++  SetLastError (error);
++  return result;
++}
++#endif
 diff --git a/winsup/cygwin/local_includes/appcontainer_named_kernel.h b/winsup/cygwin/local_includes/appcontainer_named_kernel.h
 new file mode 100644
 index 0000000..6548c73
@@ -1162,6 +1314,16 @@ index 0000000..6548c73
 +  adapted.SecurityDescriptor = security.get ()->lpSecurityDescriptor;
 +  return create (&adapted);
 +}
++#endif
+diff --git a/winsup/cygwin/local_includes/appcontainer_null.h b/winsup/cygwin/local_includes/appcontainer_null.h
+new file mode 100644
+index 0000000..a691bd4
+--- /dev/null
++++ b/winsup/cygwin/local_includes/appcontainer_null.h
+@@ -0,0 +1,4 @@
++#ifndef CYGWIN_APPCONTAINER_NULL_H
++#define CYGWIN_APPCONTAINER_NULL_H
++bool appcontainer_null_open (HANDLE *, DWORD, ULONG, ULONG, int, DWORD *);
 +#endif
 diff --git a/winsup/cygwin/local_includes/appcontainer_pipe_name.h b/winsup/cygwin/local_includes/appcontainer_pipe_name.h
 new file mode 100644
@@ -1236,6 +1398,212 @@ index 0000000..597753b
 +  bool is_appcontainer () const { return appcontainer_; }
 +};
 +#endif
+diff --git a/winsup/cygwin/sec/appcontainer_null.cc b/winsup/cygwin/sec/appcontainer_null.cc
+new file mode 100644
+index 0000000..50f7e7b
+--- /dev/null
++++ b/winsup/cygwin/sec/appcontainer_null.cc
+@@ -0,0 +1,200 @@
++/* Private inherited NUL adapter; candidate, not native-runtime accepted.
++   Validation derived from the reviewed pinned libuv NUL capability helper.
++   No global capability cache, environment mutation, or device ACL changes. */
++#include "winsup.h"
++#include <stdint.h>
++#include <fcntl.h>
++#include "appcontainer_null.h"
++
++/* Private NUL capability validation adapted from the reviewed libuv helper.
++ * No environment value grants authority; an owned duplicate must prove its
++ * actual kernel object and access mask. No global environment or handle cache.
++ */
++#define MSYS_NULL_ENV L"AUTOPROMPT_PRIVATE_NUL_HANDLE"
++#define MSYS_NULL_ALL ((DWORD) (FILE_GENERIC_READ | FILE_GENERIC_WRITE))
++
++typedef struct {
++  USHORT length;
++  USHORT maximum_length;
++  WCHAR* buffer;
++} null_string_t;
++
++typedef struct {
++  ULONG attributes;
++  ACCESS_MASK granted_access;
++  ULONG handle_count;
++  ULONG pointer_count;
++  ULONG reserved[10];
++} null_basic_t;
++
++typedef LONG (NTAPI *null_query_t)(HANDLE, ULONG, void*, ULONG, ULONG*);
++
++static int null_error(void) {
++  DWORD error = GetLastError();
++  return error != 0 ? (int) error : ERROR_INVALID_DATA;
++}
++
++static int null_token(int* app) {
++  HANDLE token;
++  DWORD value, returned;
++  int error;
++  token = NULL;
++  value = returned = 0;
++  *app = 0;
++  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
++    return null_error();
++  error = GetTokenInformation(token, TokenIsAppContainer, &value,
++                              sizeof(value), &returned) ? 0 : null_error();
++  if (!error && (returned != sizeof(value) || value > 1))
++    error = ERROR_INVALID_DATA;
++  if (!CloseHandle(token) && !error)
++    error = null_error();
++  if (!error)
++    *app = value != 0;
++  return error;
++}
++
++static int null_parse(const WCHAR* text, size_t length, uintptr_t* value) {
++  size_t i;
++  uintptr_t result = 0;
++  unsigned int digit;
++  if (length != sizeof(uintptr_t) * 2)
++    return ERROR_INVALID_DATA;
++  for (i = 0; i < length; i++) {
++    if (text[i] >= L'0' && text[i] <= L'9')
++      digit = text[i] - L'0';
++    else if (text[i] >= L'a' && text[i] <= L'f')
++      digit = text[i] - L'a' + 10;
++    else
++      return ERROR_INVALID_DATA;
++    result = (result << 4) | digit;
++  }
++  /* Positive pointer-sized values only: never process/thread pseudo handles. */
++  if (result == 0 || result > UINTPTR_MAX / 2)
++    return ERROR_INVALID_HANDLE;
++  *value = result;
++  return 0;
++}
++
++static int null_query_string(null_query_t query, HANDLE handle,
++                                ULONG kind, const WCHAR* expected,
++                                size_t expected_length) {
++  union { uintptr_t alignment; unsigned char bytes[4096]; } storage;
++  null_string_t* name;
++  ULONG returned = 0;
++  uintptr_t start, pointer;
++  if (query(handle, kind, storage.bytes, sizeof(storage.bytes), &returned) != 0)
++    return ERROR_INVALID_DATA;
++  if (returned < sizeof(null_string_t) || returned > sizeof(storage.bytes))
++    return ERROR_INVALID_DATA;
++  name = (null_string_t*) storage.bytes;
++  start = (uintptr_t) storage.bytes;
++  pointer = (uintptr_t) name->buffer;
++  if (name->length != expected_length * sizeof(WCHAR) ||
++      name->maximum_length < name->length || pointer % alignof(WCHAR) || pointer < start ||
++      pointer - start < sizeof(null_string_t) || pointer - start > returned ||
++      name->maximum_length > returned - (pointer - start))
++    return ERROR_INVALID_DATA;
++  if (CompareStringOrdinal(name->buffer, (int) expected_length,
++                           expected, (int) expected_length, TRUE) != CSTR_EQUAL)
++    return ERROR_INVALID_HANDLE;
++  return 0;
++}
++
++static int null_validate(HANDLE handle, DWORD wanted, int exact_mask) {
++  union { FARPROC address; null_query_t query; } api;
++  null_basic_t basic;
++  ULONG returned = 0;
++  int error;
++  /* Reject disks/pipes before querying their object names. */
++  if (GetFileType(handle) != FILE_TYPE_CHAR)
++    return ERROR_INVALID_HANDLE;
++  api.address = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject");
++  if (api.address == NULL)
++    return ERROR_PROC_NOT_FOUND;
++  error = null_query_string(api.query, handle, 2, L"File", 4);
++  if (error)
++    return error;
++  error = null_query_string(api.query, handle, 1, L"\\Device\\Null", 12);
++  if (error)
++    return error;
++  if (api.query(handle, 0, &basic, sizeof(basic), &returned) != 0 ||
++      returned != sizeof(basic))
++    return ERROR_INVALID_DATA;
++  if ((basic.granted_access & wanted) != wanted ||
++      (exact_mask && basic.granted_access != wanted))
++    return ERROR_ACCESS_DENIED;
++  return 0;
++}
++
++static_assert (sizeof (null_basic_t) == 56, "Native object basic layout");
++
++struct null_owner
++{
++  HANDLE value = NULL;
++  ~null_owner () {
++    DWORD error = GetLastError ();
++    if (value) CloseHandle (value);
++    SetLastError (error);
++  }
++};
++
++/* false means untouched ordinary path; true means success or strict refusal.
++   Only a host token or absent locator selects the original NtCreateFile. */
++bool
++appcontainer_null_open (HANDLE *output, DWORD access, ULONG disposition,
++                       ULONG options, int flags, DWORD *error)
++{
++  int app = 0;
++  *error = null_token (&app);
++  if (*error) return true;
++  if (!app) return false;
++  WCHAR locator[sizeof (uintptr_t) * 2 + 1];
++  SetLastError (0);
++  DWORD length = GetEnvironmentVariableW (MSYS_NULL_ENV, locator,
++                                         sizeof locator / sizeof locator[0]);
++  if (!length && GetLastError () == ERROR_ENVVAR_NOT_FOUND) return false;
++  if (!length || length >= sizeof locator / sizeof locator[0]
++      || locator[length]) { *error = ERROR_INVALID_DATA; return true; }
++  uintptr_t source = 0;
++  *error = null_parse (locator, length, &source);
++  if (*error) return true;
++  null_owner capability;
++  if (!DuplicateHandle (GetCurrentProcess (), (HANDLE) source,
++                        GetCurrentProcess (), &capability.value, 0, FALSE,
++                        DUPLICATE_SAME_ACCESS)) {
++    *error = null_error (); return true;
++  }
++  *error = null_validate (capability.value, MSYS_NULL_ALL, 1);
++  if (*error) return true;
++  if (flags & (O_DIRECTORY | O_TMPFILE)) {
++    *error = ERROR_DIRECTORY; return true;
++  }
++  if (disposition == FILE_CREATE) { *error = ERROR_FILE_EXISTS; return true; }
++  if (disposition != FILE_OPEN && disposition != FILE_OPEN_IF) {
++    *error = ERROR_INVALID_PARAMETER; return true;
++  }
++  const ULONG supported = FILE_OPEN_FOR_BACKUP_INTENT
++    | FILE_SYNCHRONOUS_IO_NONALERT | FILE_WRITE_THROUGH
++    | FILE_NO_INTERMEDIATE_BUFFERING;
++  if (options & ~supported) { *error = ERROR_INVALID_PARAMETER; return true; }
++  DWORD wanted = access;
++  if (wanted & GENERIC_READ) wanted = (wanted & ~GENERIC_READ) | FILE_GENERIC_READ;
++  if (wanted & GENERIC_WRITE) wanted = (wanted & ~GENERIC_WRITE) | FILE_GENERIC_WRITE;
++  /* Every non-read/write generic right and MAXIMUM_ALLOWED lies outside this
++     explicit subset. Duplicating cannot silently widen requested authority. */
++  if (!wanted || (wanted & ~MSYS_NULL_ALL)) {
++    *error = ERROR_ACCESS_DENIED; return true;
++  }
++  null_owner result;
++  if (!DuplicateHandle (GetCurrentProcess (), capability.value,
++                        GetCurrentProcess (), &result.value, wanted,
++                        !(flags & O_CLOEXEC), 0)) {
++    *error = null_error (); return true;
++  }
++  *error = null_validate (result.value, wanted, 1);
++  if (*error) return true;
++  *output = result.value;
++  result.value = NULL;
++  return true;
++}
 diff --git a/winsup/cygwin/sec/appcontainer_pipe.cc b/winsup/cygwin/sec/appcontainer_pipe.cc
 new file mode 100644
 index 0000000..2d9caba
@@ -1771,3 +2139,38 @@ index 0000000..288fc5c
 +  result_ = &value_;
 +  return ERROR_SUCCESS;
 +}
+diff --git a/winsup/cygwin/spawn.cc b/winsup/cygwin/spawn.cc
+index 9408903..e43f94c 100644
+--- a/winsup/cygwin/spawn.cc
++++ b/winsup/cygwin/spawn.cc
+@@ -7,6 +7,7 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+ details. */
+ 
+ #include "winsup.h"
++#include "appcontainer_child_security.h"
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <process.h>
+@@ -653,16 +654,19 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
+ 	      && !::cygheap->user.groups.issetgroups ()
+ 	      && !::cygheap->user.setuid_to_restricted))
+ 	{
+-	  rc = CreateProcessW (runpath,		/* image name w/ full path */
++	  rc = appcontainer_child_create (sa,
++	    [&] (LPSECURITY_ATTRIBUTES child_security) {
++	  return CreateProcessW (runpath,		/* image name w/ full path */
+ 			       cmd.wcs (wcmd),	/* what was passed to exec */
+-			       sa,		/* process security attrs */
+-			       sa,		/* thread security attrs */
++			       child_security,		/* process security attrs */
++			       child_security,		/* thread security attrs */
+ 			       TRUE,		/* inherit handles */
+ 			       c_flags,
+ 			       envblock,	/* environment */
+ 			       NULL,
+ 			       &si,
+ 			       &pi);
++	    });
+ 	}
+       else
+ 	{

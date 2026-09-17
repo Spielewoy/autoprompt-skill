@@ -26,6 +26,16 @@ function AssertNodePeBytes([byte[]]$Bytes,$Plan) {
   $flags=[BitConverter]::ToUInt16($Bytes,[int]$offset+22)
   if($machine -ne $Plan.machine -or $optional -lt 112 -or $optional -gt $Bytes.Length-$offset-24 -or [BitConverter]::ToUInt16($Bytes,[int]$offset+24) -ne 0x20b -or ($flags -band 2) -eq 0 -or ($flags -band 0x2000) -ne 0){throw 'Built Node PE architecture or executable kind mismatch'}
 }
+function NodeClangToolPaths([string]$VisualStudio,$Plan) {
+  if($Plan.architecture -cnotin @('x64','arm64')){throw 'Invalid native compiler architecture'}
+  $hostDirectory=if($Plan.architecture -ceq 'arm64'){'ARM64'}else{'x64'}
+  # vcvars/MSBuild use the native host compiler. Pinned vcbuild separately
+  # queries x64 clang.exe for the Clang version, even on native ARM64.
+  return [pscustomobject]@{
+    compiler=(Physical (Join-Path $VisualStudio "VC/Tools/Llvm/$hostDirectory/bin/clang-cl.exe"))
+    versionDriver=(Physical (Join-Path $VisualStudio 'VC/Tools/Llvm/x64/bin/clang.exe'))
+  }
+}
 function ReadNodeToolMachine([string]$Path) {
   $stream=[IO.File]::OpenRead($Path);$reader=[IO.BinaryReader]::new($stream)
   try {
@@ -217,10 +227,9 @@ $visualStudioTarget=SelectNodeVisualStudio $instances[0].installationVersion
 $vs=Physical $instances[0].installationPath
 $vcvars=Physical (Join-Path $vs 'VC\Auxiliary\Build\vcvarsall.bat')
 if($vcvars -match '[%"!&|<>^]' -or $vcvars -match '[^\x20-\x7e]'){throw 'Unsupported Visual Studio command path'}
-# Upstream vcbuild deliberately uses this VS x64 LLVM location for both
-# host architectures. Record actual PE machines; do not claim all tools are native ARM64.
-$clang=Physical (Join-Path $vs 'VC\Tools\Llvm\x64\bin\clang-cl.exe')
-$clangDriver=Physical (Join-Path $vs 'VC\Tools\Llvm\x64\bin\clang.exe')
+$clangTools=NodeClangToolPaths $vs $plan
+$clang=$clangTools.compiler
+$clangDriver=$clangTools.versionDriver
 $environment.PATH=[IO.Path]::GetDirectoryName($clang)+';'+$environment.PATH
 Run $clang @('--version') 'clang-cl-version'
 Run $git @('-C',$source,'apply','--check','--whitespace=error',$patch) 'patch-check'

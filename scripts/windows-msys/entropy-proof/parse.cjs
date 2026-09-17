@@ -69,4 +69,14 @@ function parseProof(stdout, expectedPackageSid) {
   }
   return p
 }
-module.exports = { parseProof, ENVIRONMENT }
+// A diagnostic may discover that the child cannot inspect its own token.
+// Preserve that failure; never substitute the launcher's SID for missing data.
+function parseDiagnostic(stdout, expectedPackageSid) {
+  assert.match(expectedPackageSid, /^S-1-15-2-(?:[0-9]+-){6}[0-9]+$/)
+  const record = parseProof(stdout)
+  assert.equal(record.identity.threadTokenPresent, false)
+  assert.equal(record.identity.threadTokenError, 1008)
+  if (record.identity.primary.error === 0) parseProof(stdout, expectedPackageSid)
+  return record
+}
+module.exports = { parseProof, parseDiagnostic, ENVIRONMENT }

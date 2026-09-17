@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($env:PROOF_BUILD_SCRIPT,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw 'Builder parser errors'}
-foreach($name in @('Run','WriteNodeBuildProgress','SelectNodeVisualStudio','SelectNodeBuildPlan','NodeBuildCommand','AssertNodePeBytes','AssertNodeIdentity','ReadNodeToolMachine','FindNodeVswhere','Physical','NodeBuildOutput','NodeGitConfiguration')) {
+foreach($name in @('Run','WriteNodeBuildProgress','SelectNodeVisualStudio','SelectNodeBuildPlan','NodeBuildCommand','AssertNodePeBytes','AssertNodeIdentity','ReadNodeToolMachine','FindNodeVswhere','Physical','NodeBuildOutput','NodeGitConfiguration','NodeClangToolPaths')) {
  $functions=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true))
  if($functions.Count -ne 1){throw "One actual $name helper required"}
  . ([ScriptBlock]::Create($functions[0].Extent.Text))
@@ -52,6 +52,22 @@ Need ((NodeBuildOutput $outputSource) -ceq $expectedOutput) 'Build output did no
 Refuses {Physical (Join-Path $outputSource 'Release/node.exe')}
 Refuses {NodeBuildOutput (Join-Path $work 'linked-output-source')}
 Refuses {NodeBuildOutput (Join-Path $work 'missing-output-source')}
+$compilerCases=0
+$compilerRoot=Join-Path $work 'compiler-vs'
+foreach($relative in @('x64/bin/clang-cl.exe','ARM64/bin/clang-cl.exe','x64/bin/clang.exe')) {
+ $file=Join-Path $compilerRoot ('VC/Tools/Llvm/'+$relative)
+ [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($file));[IO.File]::WriteAllText($file,'physical compiler fixture')
+}
+foreach($architecture in @('x64','arm64')) {
+ $plan=SelectNodeBuildPlan $architecture $architecture $architecture
+ $selected=NodeClangToolPaths $compilerRoot $plan
+ $hostDirectory=if($architecture -ceq 'arm64'){'ARM64'}else{'x64'}
+ Need ($selected.compiler -ceq [IO.Path]::GetFullPath((Join-Path $compilerRoot "VC/Tools/Llvm/$hostDirectory/bin/clang-cl.exe"))) 'Native compiler must match vcvars host architecture';$compilerCases++
+ Need ($selected.versionDriver -ceq [IO.Path]::GetFullPath((Join-Path $compilerRoot 'VC/Tools/Llvm/x64/bin/clang.exe'))) 'Upstream version query must retain x64 driver';$compilerCases++
+}
+[IO.File]::Delete((Join-Path $compilerRoot 'VC/Tools/Llvm/ARM64/bin/clang-cl.exe'))
+Refuses {NodeClangToolPaths $compilerRoot (SelectNodeBuildPlan 'arm64' 'arm64' 'arm64')};$compilerCases++
+Refuses {NodeClangToolPaths $compilerRoot ([pscustomobject]@{architecture='x86'})};$compilerCases++
 $peCases=0
 foreach($architecture in @('x64','arm64')) {
  $plan=SelectNodeBuildPlan $architecture $architecture $architecture
@@ -89,4 +105,4 @@ for($i=0;$i -lt $expected.Count;$i++) {
  Need (($match.Groups[1].Value+':'+$match.Groups[2].Value) -ceq $expected[$i]) 'Wrong progress phase'
  if($match.Groups[2].Value -ceq 'start'){Need ($match.Groups[3].Value -ceq '0') 'Start timing differs'}
 }
-@{processCases=3;toolchainCases=6;planCases=$planCases;peCases=$peCases;progressRecords=$script:Records.Count;installerCases=3;outputCases=4;gitConfigCases=3} | ConvertTo-Json -Compress
+@{processCases=3;toolchainCases=6;planCases=$planCases;peCases=$peCases;progressRecords=$script:Records.Count;installerCases=3;outputCases=4;gitConfigCases=3;compilerCases=$compilerCases} | ConvertTo-Json -Compress

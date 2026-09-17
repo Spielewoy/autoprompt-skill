@@ -245,6 +245,27 @@ jobs:
             ${{ runner.temp }}/msys-entropy-proof
             ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/entropy-proof.jsonl
           if-no-files-found: warn
+      - name: Verify Bash child process and thread isolation across profiles
+        id: msys-process-security
+        if: steps.msys-proof.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof'
+          $toolchain = Join-Path $env:RUNNER_TEMP 'msys-descriptor-toolchain/toolchain.json'
+          $output = Join-Path $env:RUNNER_TEMP 'msys-process-security-proof'
+          node --test scripts/windows-msys/process-security-proof/parser.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $digest = (Get-FileHash -LiteralPath $toolchain -Algorithm SHA256).Hash.ToLowerInvariant()
+          node scripts/windows-msys/process-security-proof/run.cjs $PWD.Path $work $toolchain $digest $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native process and thread isolation evidence
+        if: always() && steps.msys-proof-input.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-process-security-proof
+          path: ${{ runner.temp }}/msys-process-security-proof
+          if-no-files-found: warn
       - name: Verify native POSIX IPC and cancellation with the built MSYS runtime
         id: msys-posix
         if: steps.msys-smoke.outcome == 'success'
@@ -315,6 +336,13 @@ jobs:
             ${{ runner.temp }}/node-compiler-proof/inputs/libuv-appcontainer-pipes.patch
             ${{ runner.temp }}/node-compiler-proof/inputs/libuv-private-nul-capability.patch
           if-no-files-found: warn
+      - name: Check exact MSYS child creation contracts
+        if: runner.os == 'Linux' && matrix.node == '24.x'
+        run: |
+          python3 scripts/windows-msys/child-security-proof/run.py
+          python3 scripts/windows-msys/anonymous-proof/run.py
+          python3 scripts/windows-msys/null-proof/run.py
+          node --test scripts/windows-msys/process-security-proof/parser.test.cjs
       - name: Run platform tests and reject skips of this host's native cases
         run: node tests/helpers/native-platform-ci.cjs platform
       - name: Verify doctor readiness and isolated Bash and PowerShell diagnostics
@@ -335,7 +363,7 @@ jobs:
       - name: Packed installer lifecycle
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
       - name: Require native startup and selected compiler proofs to succeed
-        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure')
+        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure')
         run: node -e "process.exit(1)"
 
   claude-native:

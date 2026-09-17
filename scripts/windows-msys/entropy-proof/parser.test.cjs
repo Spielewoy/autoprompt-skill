@@ -1,6 +1,6 @@
 'use strict'
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path'), os = require('node:os'), cp = require('node:child_process')
-const { parseProof, ENVIRONMENT } = require('./parse.cjs')
+const { parseProof, parseDiagnostic, ENVIRONMENT } = require('./parse.cjs')
 const { pe } = require('./build.cjs')
 const packageSid = 'S-1-15-2-1-2-3-4-5-6-7'
 function proof() {
@@ -79,4 +79,16 @@ test('actual C++ serializer and legacy RNG branches preserve failures and erase 
   const run = cp.spawnSync(path.join(dir, 'contract'), [], { encoding: 'utf8', timeout: 5000 }); assert.ifError(run.error); assert.equal(run.status, 0, run.stderr)
   const lines = run.stdout.trim().split('\n'); assert.equal(lines.length, 6); assert.equal(JSON.parse(lines[0]), 'quote"\nΩ'); assert.equal(JSON.parse(lines[1]), 'c0000022')
   for (let i = 0; i < 4; i++) { const p = proof(); p.legacyRng = JSON.parse(lines[2 + i]); parseProof(encode(p), packageSid); assert.equal(p.legacyRng.acquireSuccess, i !== 1); assert.equal(p.legacyRng.generateSuccess, i === 1 ? null : i !== 2); assert.equal(p.legacyRng.releaseSuccess, i === 1 ? null : i !== 3) }
+})
+
+test('diagnostic preserves denied token inspection without claiming a matching identity', () => {
+  const p = proof()
+  p.identity.primary = { error: 5, appContainer: null, userSid: null, packageSid: null, integrityRid: null }
+  assert.deepEqual(parseDiagnostic(encode(p), packageSid), p)
+  assert.throws(() => parseProof(encode(p), packageSid))
+  p.identity.primary = proof().identity.primary
+  assert.deepEqual(parseDiagnostic(encode(p), packageSid), p)
+  assert.throws(() => parseDiagnostic(encode(p), packageSid.replace(/7$/, '8')))
+  p.identity.threadTokenPresent = true; p.identity.threadTokenError = 0; p.identity.thread = proof().identity.primary
+  assert.throws(() => parseDiagnostic(encode(p), packageSid))
 })

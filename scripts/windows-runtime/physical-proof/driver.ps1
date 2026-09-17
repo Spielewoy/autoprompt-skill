@@ -1,5 +1,9 @@
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $ErrorActionPreference = 'Stop'
+# EncodedCommand serializes Windows PowerShell module-loading progress to
+# stderr. Disable only progress at its source; all errors remain fatal and the
+# controller still rejects every byte received on stderr.
+$ProgressPreference = 'SilentlyContinue'
 $env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')
 # Validate the real .NET compiler temporary path before the first Add-Type.
 $helperTemp = [IO.Path]::GetFullPath($env:TEMP)

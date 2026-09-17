@@ -45,6 +45,24 @@ function helperEnvironment(systemRoot, helperRoot) {
     PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '', TEMP: helperRoot, TMP: helperRoot })
 }
 
+class StderrCapture {
+  constructor() { this.length = 0; this.bytes = Buffer.alloc(0) }
+  append(bytes) {
+    const remaining = 1024 - this.bytes.length
+    if (remaining > 0) this.bytes = Buffer.concat([this.bytes, bytes.subarray(0, remaining)])
+    this.length += bytes.length
+    need(this.length <= 1024, 'lease-stderr-bound')
+  }
+  assertQuiet(pending) { need(this.length === 0 && pending === '', 'lease-output-refused') }
+  diagnostic(session, pending) {
+    // Preserve raw evidence without rendering control characters or allowing
+    // a failing helper to turn diagnostics into an unbounded output channel.
+    return Object.freeze({ phase: session.phase, closed: session.closed, exitCode: session.code,
+      stderrBytes: this.length, stderrBase64: this.bytes.toString('base64'),
+      pendingStdoutBase64: Buffer.from(pending.slice(0, 256), 'ascii').toString('base64') })
+  }
+}
+
 class Session {
   constructor(root, child) {
     this.root = root
@@ -136,7 +154,8 @@ async function captureForProof(root, files, authority, testHooks = {}) {
     stdio: ['pipe', 'pipe', 'pipe']
   })
   const session = new Session(root, child)
-  let pending = '', error = null, stderr = 0, readyResolve, readyReject, closeResolve, closeTimer, stopReject
+  let pending = '', error = null, readyResolve, readyReject, closeResolve, closeTimer, stopReject
+  const stderr = new StderrCapture()
   const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject })
   const closed = new Promise(resolve => { closeResolve = resolve })
   const stopped = new Promise((_, reject) => { stopReject = reject })
@@ -151,7 +170,7 @@ async function captureForProof(root, files, authority, testHooks = {}) {
   const timer = setTimeout(() => fail(Error('lease-deadline')), 60000)
   child.on('error', fail)
   child.stdin.on('error', fail)
-  child.stderr.on('data', bytes => { stderr += bytes.length; if (stderr > 1024) fail(Error('lease-stderr-bound')) })
+  child.stderr.on('data', bytes => { try { stderr.append(bytes) } catch (problem) { fail(problem) } })
   child.stdout.on('data', bytes => {
     try {
       need(bytes.every(value => value < 128) && bytes.length + pending.length <= 256, 'lease-stdout-bound')
@@ -183,7 +202,7 @@ async function captureForProof(root, files, authority, testHooks = {}) {
     child.stdin.end((testHooks.finishLine === undefined ? 'finish' : testHooks.finishLine) + '\n')
     await Promise.race([closed, stopped, new Promise((_, reject) => { closeTimer = setTimeout(() => reject(Error('lease-close-unconfirmed')), 65000) })])
     if (error) throw error
-    need(stderr === 0 && pending === '', 'lease-output-refused')
+    stderr.assertQuiet(pending)
     session.accepted()
     return captured
   } catch (problem) {
@@ -191,6 +210,8 @@ async function captureForProof(root, files, authority, testHooks = {}) {
     let cleanupTimer
     await Promise.race([closed, new Promise(resolve => { cleanupTimer = setTimeout(resolve, 5000) })])
     clearTimeout(cleanupTimer)
+    problem.nativeDiagnostic = stderr.diagnostic(session, pending)
+    if (/^lease-/.test(problem.message)) problem.message += ': ' + JSON.stringify(problem.nativeDiagnostic)
     problem.cleanupConfirmed = session.closed
     if (!session.closed) problem.retainedHelperRoot = helperRoot
     if (!session.closed) {
@@ -204,4 +225,4 @@ async function captureForProof(root, files, authority, testHooks = {}) {
     if (session.closed) fs.rmSync(helperRoot, { recursive: true, force: true })
   }
 }
-module.exports = { Session, validateFiles, helperEnvironment, captureForProof }
+module.exports = { Session, StderrCapture, validateFiles, helperEnvironment, captureForProof }

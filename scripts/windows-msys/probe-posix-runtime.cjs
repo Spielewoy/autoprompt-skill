@@ -4,8 +4,11 @@ const fs = require('node:fs'), path = require('node:path'), crypto = require('no
 const assert = require('node:assert/strict')
 // Prove active-I/O cancellation before the network-backed AF_LOCAL operation;
 // its compatibility failure must not prevent the cancellation test from running.
-const MODES = ['pipe-fork', 'fifo', 'locks', 'blocked-fifo', 'af-local']
-const SOURCE_SHA = '8fecff15b9d87c8a4cf13ec2c1175f12634572af8e89b20d191a3f732be9ace9'
+const MODES = ['pipe-fork', 'fifo', 'locks', 'blocked-fifo', 'null', 'af-local']
+// A noninteractive asynchronous Bash command receives /dev/null as stdin.
+// Require its read to observe EOF before the syscall fixture starts.
+const BASH_WRAPPER = 'output=$1; shift; if [ "$2" = null ]; then ( IFS= read -r line; [ $? -eq 1 ] ) & child=$!; wait "$child" || exit; fi; exec "$@" > "$output"'
+const SOURCE_SHA = '4e225db6364d28e7dd2b7b9458e9ac2506e9eb31358251784be4fcbf2eb0856b'
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 const slash = value => value.replaceAll('\\', '/')
@@ -116,7 +119,7 @@ async function main(repoArgument, workArgument, compileArgument) {
       const launch = launcher.launch({ profileName: lease.profileName, profileSid: lease.profileSid,
         executable: bash.path, executableSha256: bash.sha256,
         msysRuntime: { dllPath: msys.path, dllSha256: msys.sha256, sharedId: msys.sharedId },
-        arguments: ['--noprofile', '--norc', '-c', 'output=$1; shift; exec "$@" > "$output"', '--', slash(stdoutPath), slash(path.join(runtime, 'posix-proof.exe')), mode, slash(scratch)],
+        arguments: ['--noprofile', '--norc', '-c', BASH_WRAPPER, '--', slash(stdoutPath), slash(path.join(runtime, 'posix-proof.exe')), mode, slash(scratch)],
         cwd: scratch, environment: Object.entries(env).map(([key, value]) => key + '=' + value),
         timeoutMs: 25000, outputLimit: 65536, cancellationPath,
       }, { signal: stop.signal, leaseId: lease.recovery.leaseId })
@@ -159,7 +162,9 @@ async function main(repoArgument, workArgument, compileArgument) {
         assert.equal(readBounded(stdoutPath, 4096).toString('utf8'), stdout)
       } else {
         assert.equal(evidence.exitCode, 0); assert.equal(evidence.cancelled, false); assert.equal(evidence.timedOut, false)
-        assert.equal(stdout, JSON.stringify({ status: 'passed', mode, supported: true }) + '\n')
+        const expected = { status: 'passed', mode, supported: true }
+        if (mode === 'null') expected.capabilityRefusals = 3
+        assert.equal(stdout, JSON.stringify(expected) + '\n')
         assert.deepEqual(fs.readdirSync(scratch), ['fixture-output.jsonl'])
       }
       assert.deepEqual(closureRecords(bindBashRuntime(runtime, process.env.SystemRoot)), smoke.copied)
@@ -193,4 +198,4 @@ async function main(repoArgument, workArgument, compileArgument) {
   note({ status: 'passed', modes: MODES, mqueue: 'not-run: isolated /dev/mqueue backing required', root })
 }
 if (require.main === module) main(...process.argv.slice(2)).catch(error => { process.stderr.write((error.stack || error) + '\n'); process.exitCode = 1 })
-module.exports = { readyRecord, fixtureDigest, MODES, SOURCE_SHA }
+module.exports = { readyRecord, fixtureDigest, MODES, SOURCE_SHA, BASH_WRAPPER }

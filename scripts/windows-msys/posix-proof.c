@@ -21,11 +21,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#if defined(__CYGWIN__) || defined(__MSYS__)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#define NATIVE_NULL_CAPABILITY_CASES 3
+#else
+#define NATIVE_NULL_CAPABILITY_CASES 0
+#endif
 
 static volatile sig_atomic_t owned_child;
 static int child_role;
 static const char *mode;
 static char work[PATH_MAX];
+static char program[PATH_MAX];
 static const char *classify(int error) {
   if (error == EACCES || error == EPERM) return "denied";
   if (error == ENOSYS || error == ENOTSUP || error == EOPNOTSUPP || error == EAFNOSUPPORT || error == EPROTONOSUPPORT) return "unsupported";
@@ -107,6 +115,93 @@ static int open_file(const char *name, int flags, mode_t permissions, const char
   int fd = open(name, flags, permissions); if (fd < 0) fail(stage, errno); return fd;
 }
 static void remove_file(const char *name) { if (unlink(name) != 0) fail("unlink-owned-file", errno); }
+
+static void null_read_positive(const char *stage) {
+  char byte; int fd = open_file("/dev/null", O_RDONLY, 0, stage);
+  require(read(fd, &byte, 1) == 0, "null-read-eof"); close_fd(fd, "null-positive-close");
+}
+static int descriptor_argument(const char *text) {
+  char *end; long value; errno = 0; value = strtol(text, &end, 10);
+  require(text[0] && !*end && !errno && value >= 3 && value <= INT_MAX, "null-child-descriptor-argument");
+  return (int)value;
+}
+static void null_exec_child(const char *inherited_text, const char *closed_text) {
+  int inherited = descriptor_argument(inherited_text), closed = descriptor_argument(closed_text);
+  char byte; struct stat info;
+  require(inherited != closed, "null-child-distinct-descriptors");
+  require(fcntl(inherited, F_GETFD) == 0, "null-inherited-after-exec");
+  require(fstat(inherited, &info) == 0 && S_ISCHR(info.st_mode), "null-inherited-character-device");
+  require(read(inherited, &byte, 1) == 0, "null-inherited-eof-after-exec");
+  errno = 0; require(fcntl(closed, F_GETFD) == -1 && errno == EBADF, "null-cloexec-closed-after-exec");
+  close_fd(inherited, "null-child-inherited-close");
+  null_read_positive("null-reopen-after-exec"); _exit(0);
+}
+#if NATIVE_NULL_CAPABILITY_CASES
+static void null_locator_refused(const WCHAR *locator, const WCHAR *original, int expected_errno, const char *stage) {
+  int fd, saved;
+  require(SetEnvironmentVariableW(L"AUTOPROMPT_PRIVATE_NUL_HANDLE", locator) != 0, "null-set-native-locator");
+  errno = 0; fd = open("/dev/null", O_RDONLY); saved = errno;
+  /* Restore the actual Win32 environment even if the negative control fails.
+     Cygwin setenv alone does not establish which value the helper observes. */
+  require(SetEnvironmentVariableW(L"AUTOPROMPT_PRIVATE_NUL_HANDLE", original) != 0, "null-restore-native-locator");
+  if (fd >= 0) close_fd(fd, "null-unexpected-negative-close");
+  require(fd == -1 && saved == expected_errno, stage);
+  null_read_positive("null-restored-positive-control");
+}
+static void null_capability_controls(void) {
+  WCHAR original[sizeof(uintptr_t) * 2 + 1], locator[sizeof(uintptr_t) * 2 + 1];
+  HANDLE event; uintptr_t numeric; size_t index;
+  DWORD length = GetEnvironmentVariableW(L"AUTOPROMPT_PRIVATE_NUL_HANDLE", original, sizeof(original) / sizeof(original[0]));
+  require(length == sizeof(uintptr_t) * 2 && original[length] == 0, "null-original-native-locator");
+  null_locator_refused(L"invalid", original, EINVAL, "null-malformed-locator-refused");
+  event = CreateEventW(NULL, TRUE, FALSE, NULL);
+  require(event != NULL, "null-owned-event-create");
+  numeric = (uintptr_t)event;
+  for (index = 0; index < sizeof(uintptr_t) * 2; index++)
+    locator[index] = L"0123456789abcdef"[(numeric >> ((sizeof(uintptr_t) * 2 - 1 - index) * 4)) & 15];
+  locator[index] = 0;
+  null_locator_refused(locator, original, EBADF, "null-wrong-object-locator-refused");
+  require(CloseHandle(event) != 0, "null-owned-event-close");
+  null_locator_refused(locator, original, EBADF, "null-closed-locator-refused");
+}
+#endif
+static void proof_null(void) {
+  int reader, writer, closed, rejected; char byte; char inherited_arg[32], closed_arg[32]; struct stat info;
+  reader = open_file("/dev/null", O_RDONLY, 0, "null-readonly-open");
+  require(read(reader, &byte, 1) == 0, "null-readonly-eof");
+  errno = 0; require(write(reader, "x", 1) == -1 && errno == EBADF, "null-readonly-write-refused");
+  writer = open_file("/dev/null", O_WRONLY | O_CREAT | O_TRUNC, 0600, "null-writeonly-create-truncate-open");
+  require(write(writer, "null-write", 10) == 10, "null-writeonly-write");
+  errno = 0; require(read(writer, &byte, 1) == -1 && errno == EBADF, "null-writeonly-read-refused");
+  close_fd(writer, "null-writeonly-close");
+  writer = open_file("/dev/null", O_RDWR, 0, "null-readwrite-open");
+  require(read(writer, &byte, 1) == 0, "null-readwrite-eof");
+  require(write(writer, "readwrite", 9) == 9, "null-readwrite-write");
+  close_fd(writer, "null-readwrite-close");
+  errno = 0; rejected = open("/dev/null", O_WRONLY | O_CREAT | O_EXCL, 0600);
+  require(rejected == -1 && errno == EEXIST, "null-exclusive-create-refused");
+  errno = 0; rejected = open("/dev/null", O_RDONLY | O_DIRECTORY);
+  require(rejected == -1 && errno == ENOTDIR, "null-directory-open-refused");
+  closed = open_file("/dev/null", O_RDONLY | O_CLOEXEC, 0, "null-cloexec-open");
+  require(fcntl(reader, F_GETFD) == 0, "null-inherited-descriptor-flags");
+  require(fcntl(closed, F_GETFD) == FD_CLOEXEC, "null-cloexec-descriptor-flags");
+  require(snprintf(inherited_arg, sizeof(inherited_arg), "%d", reader) > 0, "null-inherited-argument");
+  require(snprintf(closed_arg, sizeof(closed_arg), "%d", closed) > 0, "null-closed-argument");
+  if (fork_owned("null-fork") == 0) {
+    execl(program, program, "null-child", inherited_arg, closed_arg, (char *)NULL);
+    fail("null-exec", errno);
+  }
+  wait_owned("null-exec-waitpid");
+  close_fd(reader, "null-parent-reader-close"); close_fd(closed, "null-parent-cloexec-close");
+  /* /dev is a real directory on Linux and a fake-lock-handle fhandler in MSYS. */
+  reader = open_file("/dev", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0, "null-fake-directory-open");
+  require(fstat(reader, &info) == 0 && S_ISDIR(info.st_mode), "null-fake-directory-kind");
+  require(fcntl(reader, F_GETFD) == FD_CLOEXEC, "null-fake-directory-cloexec");
+  close_fd(reader, "null-fake-directory-close");
+#if NATIVE_NULL_CAPABILITY_CASES
+  null_capability_controls();
+#endif
+}
 
 static void proof_pipe_fork(void) {
   int request[2], reply[2]; make_pipe(request, "pipe-request"); make_pipe(reply, "pipe-reply");
@@ -268,10 +363,14 @@ static void proof_blocked_fifo(void) {
 int main(int argc, char **argv) {
   const char *scratch; struct stat status; int length;
   mode = argc > 1 ? argv[1] : "invalid";
-  if (argc != 3 || (strcmp(mode, "fifo") && strcmp(mode, "locks") && strcmp(mode, "mqueue") && strcmp(mode, "af-local") && strcmp(mode, "pipe-fork") && strcmp(mode, "blocked-fifo"))) {
-    fputs("usage: posix-proof <fifo|locks|mqueue|af-local|pipe-fork|blocked-fifo> <owned-scratch>\n", stderr); return 64;
+  if (argc == 4 && !strcmp(mode, "null-child")) {
+    child_role = 1; arm_watchdog(); null_exec_child(argv[2], argv[3]);
+  }
+  if (argc != 3 || (strcmp(mode, "fifo") && strcmp(mode, "locks") && strcmp(mode, "mqueue") && strcmp(mode, "af-local") && strcmp(mode, "pipe-fork") && strcmp(mode, "blocked-fifo") && strcmp(mode, "null"))) {
+    fputs("usage: posix-proof <fifo|locks|mqueue|af-local|pipe-fork|blocked-fifo|null> <owned-scratch>\n", stderr); return 64;
   }
   scratch = argv[2]; arm_watchdog(); umask(077);
+  if (!strcmp(mode, "null") && !realpath(argv[0], program)) fail("null-executable-realpath", errno);
   require(scratch[0] == '/' || (strlen(scratch) >= 3 && scratch[1] == ':' && (scratch[2] == '/' || scratch[2] == '\\')), "scratch-must-be-absolute");
   if (lstat(scratch, &status) != 0) fail("scratch-stat", errno);
   require(S_ISDIR(status.st_mode) && !S_ISLNK(status.st_mode), "scratch-must-be-physical-directory");
@@ -284,10 +383,13 @@ int main(int argc, char **argv) {
   else if (!strcmp(mode, "mqueue")) proof_mqueue();
   else if (!strcmp(mode, "af-local")) proof_af_local();
   else if (!strcmp(mode, "pipe-fork")) proof_pipe_fork();
+  else if (!strcmp(mode, "null")) proof_null();
   else proof_blocked_fifo();
   if (chdir(scratch) != 0) fail("scratch-return", errno);
   if (rmdir(work) != 0) fail("owned-directory-remove", errno);
   alarm(0);
-  printf("{\"status\":\"passed\",\"mode\":\"%s\",\"supported\":true}\n", mode);
+  if (!strcmp(mode, "null"))
+    printf("{\"status\":\"passed\",\"mode\":\"null\",\"supported\":true,\"capabilityRefusals\":%d}\n", NATIVE_NULL_CAPABILITY_CASES);
+  else printf("{\"status\":\"passed\",\"mode\":\"%s\",\"supported\":true}\n", mode);
   return 0;
 }

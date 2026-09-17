@@ -54,6 +54,9 @@ pacman --config /issue27-build/pacman.conf --noconfirm -U "${archives[@]}"
 pacman -Q > installed-packages.txt
 build_stage=compiler-provenance
 printf '%s  /usr/bin/gcc.exe\n' "$compiler_sha" | sha256sum -c -
+# Bind the observed compiler and linker bytes on both sides of compilation.
+# Package/SDK provenance remains separate from this mutation check.
+sha256sum /usr/bin/gcc.exe /usr/bin/ld.exe > toolchain-inputs.sha256
 gcc --version > compiler.txt
 ld --version > linker.txt
 gcc -dumpmachine > compiler-target.raw.txt
@@ -106,6 +109,8 @@ build_stage=stage-verify
 # A compiler proof emits original unstripped staged output; packaging is separate.
 [[ -s stage/usr/bin/msys-2.0.dll ]]
 sha256sum -c bootstrap-runtime.sha256
+sha256sum /usr/bin/gcc.exe /usr/bin/ld.exe > toolchain-outputs.sha256
+cmp -s toolchain-inputs.sha256 toolchain-outputs.sha256
 mkdir -p stage/source-notices
 for item in COPYING COPYING3 COPYING.LIB COPYING.NEWLIB COPYING.LIBGLOSS winsup/COPYING winsup/COPYING.LIB winsup/CYGWIN_LICENSE winsup/CONTRIBUTORS; do
   if [[ -f source/$item ]]; then
@@ -113,5 +118,5 @@ for item in COPYING COPYING3 COPYING.LIB COPYING.NEWLIB COPYING.LIBGLOSS winsup/
     cp "source/$item" "stage/source-notices/$item"
   fi
 done
-cp lock.json compiler.txt linker.txt installed-packages.txt stage/
+cp lock.json compiler.txt linker.txt installed-packages.txt toolchain-inputs.sha256 toolchain-outputs.sha256 stage/
 find stage -type f -print0 | sort -z | xargs -0 sha256sum > stage.sha256
