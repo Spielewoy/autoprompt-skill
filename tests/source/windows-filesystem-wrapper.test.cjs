@@ -110,6 +110,7 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
   assert.equal(capture.captureFileBytes('C:\\', ['project', 'empty'], 1).content.length, 0)
   assert.deepEqual(JSON.parse(calls[0][2].input), { schemaVersion: 1, operation: 'tree', root: 'C:\\', components: ['project'], maxBytes: 67108864 })
   assert.equal(calls[0][2].shell, false)
+  assert.equal(calls[0][2].timeout, 30000)
   assert.equal(calls[0][0], 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
   assert.equal(calls[0][2].env.MALICIOUS, undefined)
   assert.equal(calls[0][2].env.AUTOPROMPT_CAPTURE_PHASES, '1')
@@ -139,7 +140,10 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
   assert.deepEqual(JSON.parse(calls.at(-1)[2].input), { schemaVersion: 1, operation: 'write-exclusive', root: 'C:\\', components: ['project', 'bytes'], mode: 0o600, bytesBase64: Buffer.from('exact').toString('base64') })
   capture.copyTreeExclusive('C:\\project\\source', 'D:\\private\\copy')
   assert.deepEqual(JSON.parse(calls.at(-1)[2].input).destination, { root: 'D:\\', components: ['private', 'copy'] })
+  assert.equal(calls.at(-1)[2].timeout, 120000)
   capture.renameTreeNoReplace('C:\\project\\source', 'C:\\project\\moved')
+  assert.equal(calls.at(-1)[2].timeout, 30000)
+  for (const call of calls) assert.equal(call[2].timeout, JSON.parse(call[2].input).operation === 'copy-tree-exclusive' ? 120000 : 30000)
   assert.equal(JSON.parse(calls.at(-1)[2].input).operation, 'rename-tree-no-replace')
   assert.throws(() => capture.mkdirExclusive('C:\\project\\bad', 0o10000), { code: 'FILESYSTEM_BACKEND_INVALID' })
   assert.throws(() => capture.writeExclusive('C:\\project\\bad', Buffer.alloc(8388610), 0o600), { code: 'FILESYSTEM_BACKEND_INVALID' })
@@ -158,6 +162,9 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
     assert.equal(error.details.stderr, '')
     assert.doesNotMatch(JSON.stringify(error), /private captured data/)
     return true
+  })
+  assert.throws(() => capture.copyTreeExclusive('C:\\project\\source', 'C:\\private\\copy'), error => {
+    assert.equal(error.details.timeoutMs, 120000); assert.equal(error.details.cause, 'ETIMEDOUT'); return true
   })
   assert.equal(descriptors.size, 0)
   invocationOverride = undefined

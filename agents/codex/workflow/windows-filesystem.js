@@ -239,6 +239,9 @@ function createWindowsFilesystemCapture(options = {}) {
   const invoke = (operation, root, components, maxBytes = MAX_BYTES, recordBytes, ownership) => {
     const target = requestTarget(root, components)
     if (!bounded(maxBytes, MAX_BYTES)) fail('FILESYSTEM_BACKEND_INVALID', 'Windows capture byte limit is invalid')
+    // Large copies perform creation, exact readback, and final durability checks
+    // for every object; all other operations retain the shorter deadline.
+    const timeoutMs = operation === 'copy-tree-exclusive' ? 120000 : 30000
     const transaction = TRANSACTIONS.has(operation)
     const publish = operation === 'publish-record-exclusive' || operation === 'write-exclusive'
     if (publish && (!Buffer.isBuffer(recordBytes) || recordBytes.length > MAX_RECORD_BYTES)) fail('FILESYSTEM_BACKEND_INVALID', 'Windows record bytes exceed the publication limit')
@@ -252,7 +255,7 @@ function createWindowsFilesystemCapture(options = {}) {
       temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-capture-'))
       const invocationStarted = process.hrtime.bigint()
       const result = cp.spawnSync(powershellBinding.path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helperBinding.path, '-Request'], {
-        input: request, encoding: 'utf8', timeout: 30000, maxBuffer: MAX_OUTPUT_BYTES, windowsHide: true, shell: false,
+        input: request, encoding: 'utf8', timeout: timeoutMs, maxBuffer: MAX_OUTPUT_BYTES, windowsHide: true, shell: false,
         cwd: path.win32.dirname(powershellBinding.path),
         env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '', TEMP: temporary, TMP: temporary, AUTOPROMPT_CAPTURE_PHASES: '1' },
       })
@@ -275,7 +278,7 @@ function createWindowsFilesystemCapture(options = {}) {
           // marker; it cannot identify either interval independently.
           unaccountedMs,
           status: result.status,
-          cause: result.error?.code, signal: result.signal, timeoutMs: 30000, stderr: diagnostic.stderr.slice(0, 2048),
+          cause: result.error?.code, signal: result.signal, timeoutMs, stderr: diagnostic.stderr.slice(0, 2048),
         })
       }
       if (transaction) return parseTransactionResult(result.stdout, operation, recordBytes, ownership?.mode)

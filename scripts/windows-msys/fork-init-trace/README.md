@@ -193,3 +193,10 @@ and shell syntax.
 The Node suite checks strict bounded stage/drain parsing and actual dependency
 composition plus strict DLL-map/malformed-COFF cases. None of
 these local checks claim native Windows execution.
+
+The current base adaptation additionally makes `wincap` process-local with
+`NO_COPY`; its source pin therefore names the adapted declaration. This is a
+functional candidate awaiting native proof. Historical CI37 diagnostics remain
+bound to their original committed base patch and shared declaration. Source
+composition tests must always apply the complete current base patch before
+using these live pins; do not reuse them to reinterpret historical artifacts.

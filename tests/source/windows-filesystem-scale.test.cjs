@@ -79,6 +79,52 @@ function snapshot(root) {
   visit(); return { count, sha256: digest.digest('hex') }
 }
 
+// Failure diagnostics only: these path observations are not held-identity
+// verification and may race pathname changes; rejecting an observed link is
+// not a security boundary. Counts never authorize cleanup or assert drain. The elapsed
+// bound is checked between local filesystem calls, not a cancellation guarantee.
+function partialCopyInventory(root, maxEntries = 32768) {
+  const start = process.hrtime.bigint()
+  const result = { observationOnly: true, complete: false, entries: 0, files: 0, directories: 0, bytes: 0, status: 'started' }
+  const stop = status => { const error = new Error(status); error.inventoryStatus = status; throw error }
+  const visit = (file, depth) => {
+    if (Number((process.hrtime.bigint() - start) / 1000000n) >= 5000) stop('time-limit')
+    if (result.entries >= maxEntries) stop('entry-limit')
+    if (depth > 128) stop('depth-limit')
+    const stat = fs.lstatSync(file)
+    if (stat.isSymbolicLink() || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1))) stop('unsafe-entry')
+    result.entries++
+    if (stat.isFile()) { result.files++; result.bytes += stat.size; return }
+    result.directories++
+    const directory = fs.opendirSync(file)
+    try { for (let item; (item = directory.readSync());) visit(path.join(file, item.name), depth + 1) }
+    finally { directory.closeSync() }
+  }
+  try { visit(root, 0); result.complete = true; result.status = 'complete' }
+  catch (error) {
+    result.status = error.inventoryStatus || (error.code === 'ENOENT' && result.entries === 0 ? 'absent' : 'io-error')
+    if (typeof error.code === 'string' && /^[A-Z0-9_]{1,40}$/.test(error.code)) result.code = error.code
+  }
+  result.elapsedMs = Number((process.hrtime.bigint() - start) / 1000000n)
+  return result
+}
+test('partial copy diagnostics count bounded objects and reject observed links without cleanup claims', t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'partial-copy-observation-'))
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  const root = path.join(base, 'copy'); fs.mkdirSync(root); fs.mkdirSync(path.join(root, 'child')); fs.writeFileSync(path.join(root, 'child', 'data'), 'bytes')
+  const complete = partialCopyInventory(root)
+  assert.equal(complete.status, 'complete'); assert.equal(complete.complete, true)
+  assert.equal(complete.entries, 3); assert.equal(complete.directories, 2); assert.equal(complete.files, 1); assert.equal(complete.bytes, 5)
+  assert.equal(complete.observationOnly, true); assert.equal(complete.cleanupConfirmed, undefined)
+  assert.equal(partialCopyInventory(root, 2).status, 'entry-limit')
+  const absent = partialCopyInventory(path.join(base, 'absent')); assert.equal(absent.status, 'absent'); assert.equal(absent.complete, false)
+  const outside = path.join(base, 'outside'); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'guard'), 'outside')
+  fs.symlinkSync(outside, path.join(root, 'link'), windows ? 'junction' : 'dir')
+  const linked = partialCopyInventory(root); assert.equal(linked.status, 'unsafe-entry'); assert.equal(linked.complete, false)
+  assert.equal(fs.readFileSync(path.join(outside, 'guard'), 'utf8'), 'outside')
+  assert.equal(fs.readFileSync(path.join(root, 'child', 'data'), 'utf8'), 'bytes')
+})
+
 const nativeName = 'native Windows filesystem scale captures copies renames flushes and cleans bounded large trees'
 test(nativeName, { skip: !windows, timeout: 1500000 }, t => {
   const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'windows-filesystem-scale-')))
@@ -106,12 +152,15 @@ test(nativeName, { skip: !windows, timeout: 1500000 }, t => {
   evidence = { schema: 1, scope: 'filesystem-component', platform: process.platform, controllerArchitecture: process.arch, controllerVersion: process.version, sourceBindings, powershell: { sha256: api.powershell.sha256, bytes: api.powershell.size }, operations: [], cases: [], cleanupConfirmed: false }
   const evidenceFile = path.join(base, 'proof.json')
   const save = () => fs.writeFileSync(evidenceFile, JSON.stringify(evidence, null, 2) + '\n')
-  const call = (name, action) => {
+  const call = (name, action, failureObservation) => {
     const start = process.hrtime.bigint()
     try {
       const value = action(); evidence.operations.push({ name, outcome: 'returned', elapsedMs: Number((process.hrtime.bigint() - start) / 1000000n) }); save(); return value
     } catch (error) {
-      evidence.operations.push({ name, outcome: 'threw', code: String(error.code || 'UNKNOWN').slice(0, 80), elapsedMs: Number((process.hrtime.bigint() - start) / 1000000n), ...(error.details ? { details: error.details } : {}) }); try { save() } catch {} throw error
+      const elapsedMs = Number((process.hrtime.bigint() - start) / 1000000n)
+      let partialCopy
+      try { if (failureObservation) partialCopy = failureObservation() } catch { partialCopy = { observationOnly: true, complete: false, status: 'diagnostic-unavailable' } }
+      evidence.operations.push({ name, outcome: 'threw', ...(partialCopy ? { partialCopy } : {}), code: String(error.code || 'UNKNOWN').slice(0, 80), elapsedMs, ...(error.details ? { details: error.details } : {}) }); try { save() } catch {} throw error
     }
   }
   const remove = (name, target, owned) => {
@@ -143,7 +192,7 @@ test(nativeName, { skip: !windows, timeout: 1500000 }, t => {
     const first = call(name + '-capture', () => api.captureTree(source)); verifyCapture(source, entries, first)
     const repeated = call(name + '-capture-repeat', () => api.captureTree(source)); assert.equal(repeated.hash, first.hash); assert.deepEqual(repeated.entries.map(item => item.identity), first.entries.map(item => item.identity))
     assert.deepEqual(call(name + '-flush', () => api.fsyncTree(source)), { flushed: true })
-    const copy = call(name + '-copy', () => api.copyTreeExclusive(source, copied))
+    const copy = call(name + '-copy', () => api.copyTreeExclusive(source, copied), () => partialCopyInventory(copied))
     const copiedState = call(name + '-copy-capture', () => api.captureTree(copied)); verifyCapture(copied, entries, copiedState)
     assert.equal(copy.stat.dev, copiedState.entries[0].stat.dev); assert.equal(copy.stat.ino, copiedState.entries[0].stat.ino)
     const sourceIds = new Set(first.entries.map(item => item.identity)); assert.ok(copiedState.entries.every(item => !sourceIds.has(item.identity)))

@@ -412,11 +412,49 @@ public static class WindowsAppContainerResourcesNative {
       IntPtr folder=IntPtr.Zero;try{Need(GetAppContainerFolderPath(plan.profileSid,out folder)==0 && folder!=IntPtr.Zero,"WINDOWS_PROFILE_UNAVAILABLE");return new Dictionary<string,object>{{"profileName",plan.profileName},{"profileSid",plan.profileSid},{"profilePath",Marshal.PtrToStringUni(folder)}};}finally{if(folder!=IntPtr.Zero)CoTaskMemFree(folder);}
     }
   }
+  static bool ValidIdHandle(IntPtr handle) { return handle!=IntPtr.Zero && handle!=new IntPtr(-1); }
+  static FILE_ID_DESCRIPTOR IdentityDescriptor(string identity) {
+    // Error87 is ambiguous for malformed descriptors. Every call below uses
+    // this fixed, validated ABI and the same share/flag constants.
+    Need(IntPtr.Size==8 && Marshal.SizeOf(typeof(FILE_ID_DESCRIPTOR))==24 &&
+      Marshal.OffsetOf(typeof(FILE_ID_DESCRIPTOR),"Size").ToInt32()==0 &&
+      Marshal.OffsetOf(typeof(FILE_ID_DESCRIPTOR),"Type").ToInt32()==4 &&
+      Marshal.OffsetOf(typeof(FILE_ID_DESCRIPTOR),"Low").ToInt32()==8 &&
+      Marshal.OffsetOf(typeof(FILE_ID_DESCRIPTOR),"High").ToInt32()==16,"WINDOWS_ACL_IDENTITY_UNAVAILABLE");
+    Need(identity!=null && System.Text.RegularExpressions.Regex.IsMatch(identity,"^[a-f0-9]{8}:[a-f0-9]{16}$"),"WINDOWS_RESOURCE_INVALID");
+    return new FILE_ID_DESCRIPTOR{Size=24,Type=0,Low=Convert.ToUInt64(identity.Substring(9),16),High=0};
+  }
+  static IntPtr OpenIdentity(IntPtr volume,string identity,uint access,out int error) {
+    var id=IdentityDescriptor(identity);
+    IntPtr handle=OpenFileById(volume,ref id,access,7,IntPtr.Zero,0x02200000);
+    error=ValidIdHandle(handle)?0:Marshal.GetLastWin32Error();return handle;
+  }
+  static void VerifyIdLookupContext(Forest forest,RootRecord hint,Opened volume) {
+    string root=hint.path.Substring(0,3);ValidateRootVolume(volume.Handle,root,forest.mappings[root]);
+    Snapshot current=Info(volume.Handle);
+    Need(current.Id==volume.Snapshot.Id && current.Creation==volume.Snapshot.Creation && (current.Attributes&FILE_ATTRIBUTE_DIRECTORY)!=0,"PREIMAGE_UNSAFE");
+    int error;IntPtr live=OpenIdentity(volume.Handle,volume.Snapshot.Id,0x00100080,out error);
+    Need(ValidIdHandle(live),"WINDOWS_ACL_IDENTITY_UNAVAILABLE");
+    try {Snapshot actual=Info(live);Need(actual.Id==volume.Snapshot.Id && actual.Creation==volume.Snapshot.Creation && (actual.Attributes&FILE_ATTRIBUTE_DIRECTORY)!=0,"WINDOWS_ACL_IDENTITY_MISMATCH");}
+    finally {Need(CloseHandle(live),"WINDOWS_ACL_IDENTITY_UNAVAILABLE");}
+  }
+  static bool MissingNtfsIdentity(Forest forest,RootRecord hint,Opened volume,string identity) {
+    // NTFS reports ERROR_INVALID_PARAMETER for a deleted file ID. BuildXL's
+    // openingById adapter documents the same empirical compatibility rule:
+    // microsoft/BuildXL 842e92badd6f539ffd8e851fcdb906d8ec4136b0,
+    // Public/Src/Utilities/Native/IO/OpenFileResult.cs. It is not a general
+    // absence code. Recheck the physical NTFS context and a held live ID on
+    // both sides of a minimal-access lookup with the identical fixed request.
+    VerifyIdLookupContext(forest,hint,volume);
+    int error;IntPtr probe=OpenIdentity(volume.Handle,identity,0x00100080,out error);
+    if(ValidIdHandle(probe)){Need(CloseHandle(probe),"WINDOWS_ACL_IDENTITY_UNAVAILABLE");return false;}
+    if(error!=87)return false;
+    VerifyIdLookupContext(forest,hint,volume);return true;
+  }
   static Opened ById(Forest forest,RootRecord volumeHint,string identity,string creation) {
     Opened volume=Volume(forest,volumeHint.path);Need(identity.Substring(0,8)==volume.Snapshot.Volume.ToString("x8"),"PREIMAGE_UNSAFE");
-    var id=new FILE_ID_DESCRIPTOR{Size=(uint)Marshal.SizeOf(typeof(FILE_ID_DESCRIPTOR)),Type=0,Low=Convert.ToUInt64(identity.Substring(9),16),High=0};
-    IntPtr handle=OpenFileById(volume.Handle,ref id,0x001e0081,7,IntPtr.Zero,0x02200000);
-    if(handle==IntPtr.Zero || handle==new IntPtr(-1)){int error=Marshal.GetLastWin32Error();if(error!=2){var refusal=new Refusal("WINDOWS_ACL_IDENTITY_UNAVAILABLE",new System.ComponentModel.Win32Exception(error));refusal.Data["resourceIdentity"]=identity;refusal.Data["resourceCreation"]=creation;throw refusal;}return null;}
+    int error;IntPtr handle=OpenIdentity(volume.Handle,identity,0x001e0081,out error);
+    if(!ValidIdHandle(handle)){if(error!=2 && !(error==87 && MissingNtfsIdentity(forest,volumeHint,volume,identity))){var refusal=new Refusal("WINDOWS_ACL_IDENTITY_UNAVAILABLE",new System.ComponentModel.Win32Exception(error));refusal.Data["resourceIdentity"]=identity;refusal.Data["resourceCreation"]=creation;throw refusal;}return null;}
     try{Snapshot snapshot=Info(handle,true);Need(snapshot.Id==identity && snapshot.Creation.ToString()==creation,"WINDOWS_ACL_IDENTITY_MISMATCH");var item=new Opened{Handle=handle,Snapshot=snapshot,Directory=(snapshot.Attributes&FILE_ATTRIBUTE_DIRECTORY)!=0};forest.handles.Add(item);return item;}catch{CloseHandle(handle);throw;}
   }
   public static Dictionary<string,object> Restore(ResourcePlan plan) {

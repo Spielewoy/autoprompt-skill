@@ -574,10 +574,10 @@ public static class AutopromptWindowsCapture {
     finally {Marshal.FreeHGlobal(basic);}
     var after=Info(item.Handle);Need(before.Id==after.Id && before.Size==after.Size && before.Links==after.Links && ((after.Attributes&1)!=0)==readOnly,"PREIMAGE_UNSAFE");item.Snapshot=after;
   }
-  static void TransactionWrite(Opened item,byte[] bytes) {
+  static void TransactionWrite(Opened item,byte[] bytes,bool flushImmediately) {
     int offset=0;
     while(offset<bytes.Length) {int amount=Math.Min(1024*1024,bytes.Length-offset);byte[] block=new byte[amount];Buffer.BlockCopy(bytes,offset,block,0,amount);uint written;Need(WriteFile(item.Handle,block,(uint)amount,out written,IntPtr.Zero) && written>0 && written<=amount,"PREIMAGE_UNSAFE");offset+=(int)written;}
-    TransactionFlush(item.Handle);item.Snapshot=Info(item.Handle);
+    if(flushImmediately)TransactionFlush(item.Handle);item.Snapshot=Info(item.Handle);
     Need(item.Snapshot.Size==bytes.Length && (string)ReadCapturedFile(item,true,MaxBytes)["dataBase64"]==Convert.ToBase64String(bytes),"PREIMAGE_UNSAFE");
   }
   static void TransactionWalk(TreeNode node,List<TreeNode> nodes,List<Opened> handles,ref long total,int depth,bool flush,bool rename) {
@@ -616,7 +616,7 @@ public static class AutopromptWindowsCapture {
         if(mkdir || write) {
           TransactionAbsent(source.Parent,source.Leaf);source.VerifyNow();
           var made=TransactionOpen(source.Leaf,source.Parent.Handle,mkdir,true,0x104u,false,false,false);created.Add(made);
-          if(write)TransactionWrite(made,bytes);
+          if(write)TransactionWrite(made,bytes,true);
           TransactionReadonly(made,(mode&146)==0);TransactionFlush(made.Handle);source.VerifyNow();TransactionFlush(source.Parent.Handle);
           var check=new List<TreeNode>{new TreeNode{Opened=made,Parent=source.Parent,Path="",Children=mkdir?new List<DirectoryEntry>():null,Result=write?ReadCapturedFile(made,true,MaxRecordBytes):null}};
           TransactionValidate(check);source.VerifyNow();success=true;var result=TransactionStat(made);
@@ -675,7 +675,9 @@ public static class AutopromptWindowsCapture {
             var parent=node.Path.Length==0?destination.Parent:byPath[parentPath].Opened;string name=node.Path.Length==0?destination.Leaf:node.Opened.Name;
             var made=TransactionOpen(name,parent.Handle,node.Opened.Directory,true,0x104u,false,false,false);created.Add(made);
             var copied=new TreeNode{Opened=made,Parent=parent,Path=node.Path,Result=node.Result};copies.Add(copied);byPath[node.Path]=copied;
-            if(!made.Directory)TransactionWrite(made,Convert.FromBase64String((string)node.Result["dataBase64"]));
+            // Copy flushes every held file after its final attributes are set below.
+            // Keep exact readback here; success still requires all final flushes.
+            if(!made.Directory)TransactionWrite(made,Convert.FromBase64String((string)node.Result["dataBase64"]),false);
           }
           for(int i=copies.Count-1;i>=0;i--){TransactionReadonly(copies[i].Opened,(nodes[i].Opened.Snapshot.Attributes&1)!=0);TransactionFlush(copies[i].Opened.Handle);}
           // Index parents by the same Opened reference identity used by the

@@ -159,6 +159,24 @@ jobs:
           name: windows-resource-scale-${{ matrix.runner.arch }}-node-${{ matrix.node }}
           path: native-windows-resource-scale.log
           if-no-files-found: error
+      - name: Verify native resource identity recovery and lookup refusals
+        id: resource-identity-proof
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 17
+        shell: pwsh
+        run: |
+          node --test --test-reporter=tap --test-name-pattern='^native Windows resource identity recovery preserves moved originals and refuses ambiguous lookup failures$' tests/source/windows-appcontainer-resource-identity.test.cjs 2>&1 | Tee-Object -FilePath native-windows-resource-identity.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native resource identity observations
+        id: resource-identity-evidence
+        if: always() && runner.os == 'Windows'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-resource-identity-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: native-windows-resource-identity.log
+          if-no-files-found: error
       - name: Exercise native filesystem operations on large trees
         id: filesystem-scale-proof
         if: runner.os == 'Windows'
@@ -270,9 +288,25 @@ jobs:
           $patch = (Resolve-Path scripts/windows-msys/pipe-security.patch).Path
           $digest = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
           ./scripts/windows-msys/build.ps1 -WorkRoot (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof') -Mode proof -AdaptationPatch $patch -AdaptationSha256 $digest -Jobs 4 -CompilePosixFixture
+      - name: Verify process-local wincap placement in the compiled DLL
+        id: msys-wincap
+        if: steps.msys-proof.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $dll = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof/sdk/issue27-build/stage/usr/bin/msys-2.0.dll'
+          python scripts/windows-msys/wincap-local-proof/audit-pe.py $dll --output (Join-Path $env:RUNNER_TEMP 'msys-wincap-placement.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve compiled wincap placement evidence
+        if: always() && steps.msys-wincap.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-wincap-placement
+          path: ${{ runner.temp }}/msys-wincap-placement.json
+          if-no-files-found: error
       - name: Export the exact compiled MSYS candidate for native reuse
         id: msys-candidate
-        if: steps.msys-proof.outcome == 'success'
+        if: steps.msys-proof.outcome == 'success' && steps.msys-wincap.outcome == 'success'
         continue-on-error: true
         shell: pwsh
         env:
@@ -533,6 +567,8 @@ jobs:
           python3 scripts/windows-msys/token-default-proof/run.py
           python3 scripts/windows-msys/loader-lock-proof/run.py
           python3 scripts/windows-msys/fork-init-trace/test.py
+          python3 scripts/windows-msys/wincap-local-proof/test.py
+          python3 scripts/windows-msys/wincap-local-proof/audit-pe.test.py
           node --test scripts/windows-msys/fork-init-trace/parser.test.cjs
           node --test scripts/windows-msys/process-security-proof/parser.test.cjs
           node --test scripts/windows-msys/portable-runtime/portable.test.cjs scripts/windows-msys/portable-runtime/cli.test.cjs scripts/windows-msys/portable-runtime/producer-context.test.cjs
@@ -603,7 +639,7 @@ jobs:
       - name: Packed installer lifecycle
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
       - name: Require native startup and selected compiler proofs to succeed
-        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.runtime-precompiled-proof.outcome == 'failure' || steps.runtime-precompiled-evidence.outcome == 'failure' || steps.git-acl-proof.outcome == 'failure' || steps.git-acl-evidence.outcome == 'failure' || steps.resource-scale-proof.outcome == 'failure' || steps.resource-scale-evidence.outcome == 'failure' || steps.filesystem-scale-proof.outcome == 'failure' || steps.filesystem-scale-evidence.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-candidate.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure' || steps.msys-portable.outcome == 'failure' || steps.msys-portable-evidence.outcome == 'failure')
+        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.runtime-precompiled-proof.outcome == 'failure' || steps.runtime-precompiled-evidence.outcome == 'failure' || steps.git-acl-proof.outcome == 'failure' || steps.git-acl-evidence.outcome == 'failure' || steps.resource-scale-proof.outcome == 'failure' || steps.resource-scale-evidence.outcome == 'failure' || steps.resource-identity-proof.outcome == 'failure' || steps.resource-identity-evidence.outcome == 'failure' || steps.filesystem-scale-proof.outcome == 'failure' || steps.filesystem-scale-evidence.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-wincap.outcome == 'failure' || steps.msys-candidate.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure' || steps.msys-portable.outcome == 'failure' || steps.msys-portable-evidence.outcome == 'failure')
         run: node -e "process.exit(1)"
 
   claude-native:

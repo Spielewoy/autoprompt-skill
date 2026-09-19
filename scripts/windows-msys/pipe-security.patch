@@ -2320,3 +2320,16 @@ new file mode 100644
 +}
 +}
 +#endif
+
+diff --git a/winsup/cygwin/wincap.cc b/winsup/cygwin/wincap.cc
+--- a/winsup/cygwin/wincap.cc
++++ b/winsup/cygwin/wincap.cc
+@@ -243,7 +243,7 @@
+   },
+ };
+ 
+-wincapc wincap __attribute__((section (".cygwin_dll_common"), shared));
++wincapc wincap NO_COPY;
+ 
+ extern IMAGE_DOS_HEADER
+ __image_base__;
