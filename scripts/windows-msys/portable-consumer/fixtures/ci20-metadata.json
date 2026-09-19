@@ -1,0 +1,625 @@
+{
+  "source": "Selected fields from authenticated GitHub CI20 run/job/artifact API responses; all20 job IDs/names preserved. No native bytes embedded.",
+  "run": {
+    "id": 35231596403,
+    "run_attempt": 1,
+    "head_sha": "f8e68b143d9c15f97a79a85165de08c6982f0da2",
+    "path": ".github/workflows/native-platform.yml",
+    "head_branch": "codex/issue-27-native-platform-support",
+    "event": "push",
+    "status": "completed",
+    "conclusion": "failure",
+    "repository": {
+      "id": 1337733621,
+      "full_name": "Spielewoy/autoprompt-skill"
+    },
+    "head_repository": {
+      "id": 1337733621
+    }
+  },
+  "jobs": {
+    "total_count": 20,
+    "jobs": [
+      {
+        "id": 105236809555,
+        "name": "Actual Claude 2.1.270 / ubuntu-latest / Node 24.x"
+      },
+      {
+        "id": 105236809702,
+        "name": "Actual Claude 2.1.270 / ubuntu-24.04-arm / Node 24.x"
+      },
+      {
+        "id": 105236809798,
+        "name": "Actual Claude 2.1.270 / windows-latest / Node 20.x"
+      },
+      {
+        "id": 105236809824,
+        "name": "Platform and installer / windows-11-arm / Node 20.x",
+        "run_id": 35231596403,
+        "run_url": "https://api.github.com/repos/Spielewoy/autoprompt-skill/actions/runs/35231596403",
+        "head_sha": "f8e68b143d9c15f97a79a85165de08c6982f0da2",
+        "run_attempt": 1,
+        "status": "completed",
+        "conclusion": "failure",
+        "started_at": "2026-09-17T14:08:30Z",
+        "completed_at": "2026-09-17T15:09:18Z",
+        "steps": [
+          {
+            "name": "Set up job",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Run actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Run actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Install declared Python installer and validation dependencies",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Install and enable Linux sandbox prerequisites",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Install macOS installer shells",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Require PowerShell",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Run npm ci --ignore-scripts",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Enable genuine macOS primitive tests and assert runtime limitation",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Enable actual Windows short-name coverage",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Verify native Windows runtime bundle physical capture",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Preserve native runtime bundle capture observations",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Record native host NUL query sizes before sandbox launches",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Preserve native host NUL query observations",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Record native Windows pipe compatibility before the full suite",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Record native Windows Node pipes and process-exit verification",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Record native Windows NUL access and private handle isolation",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Record isolated Windows capture input diagnostics",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Preserve early native Windows observations",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Compare isolated Windows PowerShell startup environments",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Preserve Windows PowerShell startup comparisons",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Detect changes to the MSYS compiler proof",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Compile the isolated MSYS pipe adapter proof",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Verify adapted descriptors and cross-profile denial natively",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Preserve native descriptor proof evidence",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Exercise the built MSYS runtime in a private Bash closure",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Compare native entropy initialization directly and through Bash",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Preserve native entropy comparison evidence",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Verify Bash child process and thread isolation across profiles",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Preserve native process and thread isolation evidence",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Verify native POSIX IPC and cancellation with the built MSYS runtime",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Preserve the MSYS compiler proof and diagnostics",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Detect changes to the Node compiler proof",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Compile the isolated Node AppContainer pipe adapter",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Require exact subprocess roundtrips with the built Node worker",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Preserve the Node compiler output and native observations",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Check exact MSYS child creation contracts",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Run platform tests and reject skips of this host's native cases",
+            "status": "completed",
+            "conclusion": "failure"
+          },
+          {
+            "name": "Verify doctor readiness and isolated Bash and PowerShell diagnostics",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Exercise the actual Windows Git Bash Kilo installer lifecycle",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Preserve platform and diagnostic output",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Packed installer lifecycle",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Require native startup and selected compiler proofs to succeed",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Post Run actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Post Run actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Post Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Complete job",
+            "status": "completed",
+            "conclusion": "success"
+          }
+        ]
+      },
+      {
+        "id": 105236809826,
+        "name": "Actual Claude 2.1.270 / windows-latest / Node 24.x"
+      },
+      {
+        "id": 105236809857,
+        "name": "Actual Claude 2.1.270 / ubuntu-latest / Node 20.x"
+      },
+      {
+        "id": 105236809914,
+        "name": "Actual Claude 2.1.270 / windows-11-arm / Node 24.x"
+      },
+      {
+        "id": 105236809978,
+        "name": "Actual Claude 2.1.270 / windows-11-arm / Node 20.x"
+      },
+      {
+        "id": 105236810067,
+        "name": "Platform and installer / windows-latest / Node 24.x",
+        "run_id": 35231596403,
+        "run_url": "https://api.github.com/repos/Spielewoy/autoprompt-skill/actions/runs/35231596403",
+        "head_sha": "f8e68b143d9c15f97a79a85165de08c6982f0da2",
+        "run_attempt": 1,
+        "status": "completed",
+        "conclusion": "failure",
+        "started_at": "2026-09-17T14:08:29Z",
+        "completed_at": "2026-09-17T14:39:59Z",
+        "steps": [
+          {
+            "name": "Set up job",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Run actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Run actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Install declared Python installer and validation dependencies",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Install and enable Linux sandbox prerequisites",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Install macOS installer shells",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Require PowerShell",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Run npm ci --ignore-scripts",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Enable genuine macOS primitive tests and assert runtime limitation",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Enable actual Windows short-name coverage",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Verify native Windows runtime bundle physical capture",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Preserve native runtime bundle capture observations",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Record native host NUL query sizes before sandbox launches",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Preserve native host NUL query observations",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Record native Windows pipe compatibility before the full suite",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Record native Windows Node pipes and process-exit verification",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Record native Windows NUL access and private handle isolation",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Record isolated Windows capture input diagnostics",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Preserve early native Windows observations",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Compare isolated Windows PowerShell startup environments",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Preserve Windows PowerShell startup comparisons",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Detect changes to the MSYS compiler proof",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Compile the isolated MSYS pipe adapter proof",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Verify adapted descriptors and cross-profile denial natively",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Preserve native descriptor proof evidence",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Exercise the built MSYS runtime in a private Bash closure",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Compare native entropy initialization directly and through Bash",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Preserve native entropy comparison evidence",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Verify Bash child process and thread isolation across profiles",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Preserve native process and thread isolation evidence",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Verify native POSIX IPC and cancellation with the built MSYS runtime",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Preserve the MSYS compiler proof and diagnostics",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Detect changes to the Node compiler proof",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Compile the isolated Node AppContainer pipe adapter",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Require exact subprocess roundtrips with the built Node worker",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Preserve the Node compiler output and native observations",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Check exact MSYS child creation contracts",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Run platform tests and reject skips of this host's native cases",
+            "status": "completed",
+            "conclusion": "failure"
+          },
+          {
+            "name": "Verify doctor readiness and isolated Bash and PowerShell diagnostics",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Exercise the actual Windows Git Bash Kilo installer lifecycle",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Preserve platform and diagnostic output",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Packed installer lifecycle",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Require native startup and selected compiler proofs to succeed",
+            "status": "completed",
+            "conclusion": "failure"
+          },
+          {
+            "name": "Post Run actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Post Run actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+            "status": "completed",
+            "conclusion": "skipped"
+          },
+          {
+            "name": "Post Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+            "status": "completed",
+            "conclusion": "success"
+          },
+          {
+            "name": "Complete job",
+            "status": "completed",
+            "conclusion": "success"
+          }
+        ]
+      },
+      {
+        "id": 105236810070,
+        "name": "Platform and installer / ubuntu-24.04-arm / Node 24.x"
+      },
+      {
+        "id": 105236810079,
+        "name": "Platform and installer / macos-15-intel / Node 20.x"
+      },
+      {
+        "id": 105236810081,
+        "name": "Actual Claude 2.1.270 / ubuntu-24.04-arm / Node 20.x"
+      },
+      {
+        "id": 105236810171,
+        "name": "Platform and installer / ubuntu-latest / Node 20.x"
+      },
+      {
+        "id": 105236810214,
+        "name": "Platform and installer / macos-15-intel / Node 24.x"
+      },
+      {
+        "id": 105236810295,
+        "name": "Platform and installer / ubuntu-latest / Node 24.x"
+      },
+      {
+        "id": 105236810314,
+        "name": "Platform and installer / windows-11-arm / Node 24.x"
+      },
+      {
+        "id": 105236810362,
+        "name": "Platform and installer / macos-latest / Node 20.x"
+      },
+      {
+        "id": 105236810445,
+        "name": "Platform and installer / macos-latest / Node 24.x"
+      },
+      {
+        "id": 105236810453,
+        "name": "Platform and installer / ubuntu-24.04-arm / Node 20.x"
+      },
+      {
+        "id": 105236810514,
+        "name": "Platform and installer / windows-latest / Node 20.x"
+      }
+    ]
+  },
+  "artifact": {
+    "id": 10504040551,
+    "node_id": "MDg6QXJ0aWZhY3QxMDUwNDA0MDU1MQ==",
+    "name": "windows-node-compiler-proof-arm64",
+    "size_in_bytes": 36787200,
+    "url": "https://api.github.com/repos/Spielewoy/autoprompt-skill/actions/artifacts/10504040551",
+    "archive_download_url": "https://api.github.com/repos/Spielewoy/autoprompt-skill/actions/artifacts/10504040551/zip",
+    "expired": false,
+    "digest": "sha256:71d51c5b83530ed310cf350a5691853124cc9958712b89bf8a4a37311f240a95",
+    "created_at": "2026-09-17T14:58:51Z",
+    "updated_at": "2026-09-17T14:58:51Z",
+    "expires_at": "2026-12-16T14:08:27Z",
+    "workflow_run": {
+      "id": 35231596403,
+      "repository_id": 1337733621,
+      "head_repository_id": 1337733621,
+      "head_branch": "codex/issue-27-native-platform-support",
+      "head_sha": "f8e68b143d9c15f97a79a85165de08c6982f0da2"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "kind": "portable-source-factoring-not-native-proof",
+  "sourcePath": "scripts/windows-msys/probe-posix-runtime.cjs",
+  "sourceSha256": "69610e4c727a985f3af8d8be9c8fe7b589ae8ec92beebdffc5938dd246af3929",
+  "derivedSha256": "7c427dbb66244ca92c0cb10cccab5ae9cefae7d11a1c15fab197faddbc74f777",
+  "preservedExecutionStart": "const dependencies = importedDlls(fixture)",
+  "preservedNativeModes": [
+    "pipe-fork",
+    "fifo",
+    "locks",
+    "blocked-fifo",
+    "null",
+    "af-local"
+  ],
+  "bindingChanges": [
+    "opaque imported candidate and same-tuple fresh native smoke capability",
+    "fresh output root independent from SDK",
+    "captured source/runtime/fixture bytes instead of SDK paths",
+    "consumer-only tuple receipt; no copied producer smoke pass"
+  ],
+  "nativeExecution": "not-performed"
+}
