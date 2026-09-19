@@ -98,7 +98,7 @@ jobs:
           node --test scripts/windows-runtime/precompiled-proof/verify-output.test.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $build = Join-Path $env:RUNNER_TEMP 'precompiled-capture'
-          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -File scripts/windows-runtime/precompiled-proof/build.ps1 -OutputDirectory $build
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -File scripts/windows-runtime/precompiled-proof/build.ps1 -OutputDirectory $build 2>&1 | Tee-Object -FilePath native-windows-runtime-precompiled-build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:AUTOPROMPT_CAPTURE_BUILD = $build
           node --test --test-reporter=tap scripts/windows-runtime/precompiled-proof/native.test.cjs 2>&1 | Tee-Object -FilePath (Join-Path $build 'native.tap')
@@ -106,11 +106,15 @@ jobs:
           node scripts/windows-runtime/precompiled-proof/verify-output.cjs (Join-Path $build 'native.tap')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve fixed native capture executable and observations
+        id: runtime-precompiled-evidence
         if: always() && runner.os == 'Windows'
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-runtime-precompiled-${{ matrix.runner.arch }}-node-${{ matrix.node }}
-          path: ${{ runner.temp }}/precompiled-capture
+          path: |
+            ${{ runner.temp }}/precompiled-capture
+            native-windows-runtime-precompiled-build.log
           if-no-files-found: error
       - name: Record native host NUL query sizes before sandbox launches
         if: runner.os == 'Windows'
@@ -191,7 +195,7 @@ jobs:
         if: github.ref == 'refs/heads/codex/issue-27-native-platform-support' && matrix.runner.os == 'windows-latest' && matrix.node == '24.x'
         shell: pwsh
         run: |
-          $changed = @(git diff --name-only HEAD^ HEAD -- scripts/windows-msys agents/codex/workflow/windows-appcontainer* agents/codex/workflow/windows-filesystem.ps1 tests/source/windows-bash-runtime.test.cjs tests/fixtures/windows-msys/bash-ipc.sh)
+          $changed = @(git diff --name-only HEAD^ HEAD -- .github/workflows/native-platform.yml scripts/windows-msys agents/codex/workflow/windows-appcontainer* agents/codex/workflow/windows-filesystem.ps1 tests/source/windows-bash-runtime.test.cjs tests/fixtures/windows-msys/bash-ipc.sh)
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "run=$($changed.Count -gt 0 -or '${{ github.event_name }}' -eq 'workflow_dispatch')".ToLowerInvariant() >> $env:GITHUB_OUTPUT
       - name: Compile the isolated MSYS pipe adapter proof
@@ -418,7 +422,7 @@ jobs:
       - name: Packed installer lifecycle
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
       - name: Require native startup and selected compiler proofs to succeed
-        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.runtime-precompiled-proof.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-candidate.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure')
+        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.runtime-precompiled-proof.outcome == 'failure' || steps.runtime-precompiled-evidence.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-candidate.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure')
         run: node -e "process.exit(1)"
 
   claude-native:

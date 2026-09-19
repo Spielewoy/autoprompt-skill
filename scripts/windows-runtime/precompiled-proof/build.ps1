@@ -14,9 +14,34 @@ $compiler.GenerateExecutable=$true
 $compiler.GenerateInMemory=$false
 $compiler.OutputAssembly=$exe
 $compiler.MainClass='BundleLeaseMain'
+$compiler.TreatWarningsAsErrors=$true
+$compiler.WarningLevel=4
 [void]$compiler.ReferencedAssemblies.Add('System.dll')
 [void]$compiler.ReferencedAssemblies.Add('System.Core.dll')
-Add-Type -Path @((Join-Path $PSScriptRoot '../physical-proof/audit.cs'),(Join-Path $PSScriptRoot 'lease-main.cs')) -OutputAssembly $exe -OutputType ConsoleApplication -CompilerParameters $compiler
+# PS5.1 rejects combining Add-Type CompilerParameters with OutputAssembly at
+# runtime, despite advertising both in its parameter-set syntax. Use CodeDOM
+# directly so one explicit CompilerParameters object controls the build.
+$providerOptions=[Collections.Generic.Dictionary[string,string]]::new()
+$providerOptions.Add('CompilerVersion','v4.0')
+$provider=[Microsoft.CSharp.CSharpCodeProvider]::new($providerOptions)
+try {
+  $result=$provider.CompileAssemblyFromFile($compiler,[string[]]@(
+    [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../physical-proof/audit.cs')),
+    [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'lease-main.cs'))))
+  if ($result.NativeCompilerReturnValue -ne 0 -or $result.Errors.HasErrors -or $result.Errors.HasWarnings) {
+    # Compiler text is evidence only, bounded independently of the compiler's
+    # diagnostic count; don't emit arbitrary command-line/source dumps.
+    $details=@($result.Errors | Select-Object -First 16 | ForEach-Object {
+      $message=[string]$_.ErrorText
+      if ($message.Length -gt 512) { $message=$message.Substring(0,512) }
+      '{0}:{1}:{2}' -f $_.ErrorNumber,$_.Line,$message
+    }) -join "`n"
+    throw ('helper-compile-refused:{0}: {1}' -f $result.NativeCompilerReturnValue,$details)
+  }
+  if (-not [IO.File]::Exists($exe) -or [IO.Path]::GetFullPath($result.PathToAssembly) -ine $exe) { throw 'compiled-helper-path-required' }
+  $executableLength=([IO.FileInfo]$exe).Length
+  if ($executableLength -lt 1 -or $executableLength -gt 1048576) { throw 'compiled-helper-size-bound' }
+} finally { $provider.Dispose() }
 $config='<configuration><startup><supportedRuntime version="v4.0" sku=".NETFramework,Version=v4.8"/></startup></configuration>'
 [IO.File]::WriteAllText(($exe+'.config'),$config,[Text.UTF8Encoding]::new($false))
 $identity=& $exe --identity
