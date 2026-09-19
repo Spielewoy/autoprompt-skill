@@ -33,7 +33,15 @@ test('native Windows .git grants deny mutation and restore inheritance after own
   fs.copyFileSync(controller,worker,fs.constants.COPYFILE_EXCL)
   const result=cp.spawnSync(controller,[roots.target,roots.scratch,worker,roots.control],{encoding:'utf8',timeout:180000,maxBuffer:128*1024,windowsHide:true,cwd:roots.control,env,stdio:['ignore','pipe','pipe']})
   for(const stream of ['stdout','stderr']){const text=String(result[stream]||'');fs.writeFileSync(path.join(roots.control,stream+'.txt'),text);for(const line of text.slice(0,32768).split(/\r?\n/))for(let at=0;at<line.length;at+=480)t.diagnostic(stream+': '+line.slice(at,at+480))}
+  const childRecord=path.join(roots.control,'child-proof.json')
+  if(fs.existsSync(childRecord)){
+    assert.ok(fs.statSync(childRecord).size<=4096,'Bounded child proof required')
+    const child=JSON.parse(fs.readFileSync(childRecord,'utf8'))
+    assert.deepEqual(child,{schema:1,architecture:process.arch,appContainer:true,drained:true,rootImageMatched:true,denials:denials.map(name=>name+':5'),positiveOperations:8,accepted:false})
+    t.diagnostic('GIT_ACL_CHILD_PROOF:'+JSON.stringify(child))
+  }
   assert.ifError(result.error);assert.equal(result.status,0,result.stderr||result.stdout);assert.equal(result.stderr,'')
+  assert.equal(fs.existsSync(childRecord),true,'Pre-restoration child proof required')
   const proof=JSON.parse(result.stdout)
   assert.equal(proof.schema,1);assert.equal(proof.nativeWindows,true);assert.equal(proof.architecture,process.arch);assert.equal(proof.appContainer,true);assert.equal(proof.drained,true);assert.equal(proof.accepted,false)
   assert.deepEqual(proof.denials,denials);assert.equal(proof.positiveOperations,8);assert.ok(proof.originalObjects>=9)

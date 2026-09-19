@@ -14,7 +14,9 @@ jobs:
   platform-primitives:
     name: Platform and installer / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
-    timeout-minutes: 90
+    # The one diagnostic producer may compile a separate traced DLL after the
+    # normal fork proof fails. All other matrix jobs retain their original cap.
+    timeout-minutes: ${{ matrix.runner.os == 'windows-latest' && matrix.node == '24.x' && 120 || 90 }}
     strategy:
       fail-fast: false
       matrix:
@@ -363,6 +365,76 @@ jobs:
             ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/posix-compile-fixture
             ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/posix-proof-*/results.jsonl
           if-no-files-found: warn
+      - name: Trace failed MSYS fork initialization in a separate diagnostic build
+        id: msys-fork-trace
+        if: steps.msys-proof.outcome == 'success' && steps.msys-process-security.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof'
+          $sdk = Join-Path $work 'sdk'
+          $payload = Join-Path $sdk 'issue27-build'
+          $trace = Join-Path $sdk 'issue27-fork-trace'
+          $normalManifest = Join-Path $env:RUNNER_TEMP 'msys-process-security-proof/native-manifest.json'
+          $output = Join-Path $env:RUNNER_TEMP 'msys-fork-trace-proof'
+          $pythonOutput = @(& python -I -c 'import sys; print(sys.executable)' 2>&1)
+          if ($LASTEXITCODE -ne 0 -or $pythonOutput.Count -ne 1 -or $pythonOutput[0] -isnot [string]) { throw 'Cannot determine one Python executable' }
+          $pythonExe = [string]$pythonOutput[0]
+          if (-not [IO.Path]::IsPathFullyQualified($pythonExe) -or -not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) { throw 'Python identity is not an absolute executable' }
+          $nodeOutput = @(& node -p 'process.execPath' 2>&1)
+          if ($LASTEXITCODE -ne 0 -or $nodeOutput.Count -ne 1 -or $nodeOutput[0] -isnot [string]) { throw 'Cannot determine one Node executable' }
+          $nodeExe = [string]$nodeOutput[0]
+          if (-not [IO.Path]::IsPathFullyQualified($nodeExe) -or -not (Test-Path -LiteralPath $nodeExe -PathType Leaf)) { throw 'Node identity is not an absolute executable' }
+          & $nodeExe --test scripts/windows-msys/fork-init-trace/parser.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $pythonExe -I scripts/windows-msys/fork-init-trace/generate.py (Join-Path $payload 'source') (Join-Path $PWD.Path 'scripts/windows-msys/pipe-security.patch') $trace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $nodeExe -e 'require("./agents/codex/workflow/safe-run-root.js").ensureWindowsPrivateAcl(process.argv[1])' $trace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item -LiteralPath scripts/windows-msys/fork-init-trace/build-trace.sh -Destination (Join-Path $trace 'build-trace.sh') -ErrorAction Stop
+          $tracePatchSha = (Get-FileHash -LiteralPath (Join-Path $trace 'trace.patch') -Algorithm SHA256).Hash.ToLowerInvariant()
+          $lock = Get-Content -LiteralPath scripts/windows-msys/build-lock.json -Raw | ConvertFrom-Json
+          $savedPath = $env:PATH
+          try {
+            $env:MSYSTEM = 'MSYS'
+            $env:MSYS2_PATH_TYPE = 'strict'
+            $env:CHERE_INVOKING = '1'
+            $env:PATH = (Join-Path $sdk 'usr/bin') + ';' + (Join-Path $env:SystemRoot 'System32')
+            & (Join-Path $sdk 'usr/bin/bash.exe') --noprofile --norc /issue27-fork-trace/build-trace.sh '4' ([string]$lock.source.sourceDateEpoch) $tracePatchSha
+            if ($LASTEXITCODE -ne 0) { throw 'Separate diagnostic compile failed; preserve logs' }
+          } finally { $env:PATH = $savedPath }
+          $traceDll = Join-Path $trace 'stage/usr/bin/msys-2.0.dll'
+          $traceManifest = Join-Path $trace 'trace-manifest.json'
+          $context = [ordered]@{
+            schema = 1; workRoot = $work
+            traceDll = $traceDll; traceDllSha256 = (Get-FileHash -LiteralPath $traceDll -Algorithm SHA256).Hash.ToLowerInvariant()
+            traceManifest = $traceManifest; traceManifestSha256 = (Get-FileHash -LiteralPath $traceManifest -Algorithm SHA256).Hash.ToLowerInvariant()
+            normalManifest = $normalManifest; normalManifestSha256 = (Get-FileHash -LiteralPath $normalManifest -Algorithm SHA256).Hash.ToLowerInvariant()
+            python = $pythonExe; pythonSha256 = (Get-FileHash -LiteralPath $pythonExe -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $contextPath = Join-Path $trace 'context.json'
+          [IO.File]::WriteAllText($contextPath, (($context | ConvertTo-Json -Depth 5) + "`n"), [Text.UTF8Encoding]::new($false))
+          $contextSha = (Get-FileHash -LiteralPath $contextPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          & $nodeExe scripts/windows-msys/fork-init-trace/run.cjs $PWD.Path $contextPath $contextSha $output $env:SystemRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve separate fork initialization trace evidence
+        if: always() && steps.msys-fork-trace.outcome != 'skipped' && steps.msys-proof-input.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-fork-initialization-trace
+          path: |
+            ${{ runner.temp }}/msys-fork-trace-proof
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/*.json
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/*.patch
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/*.sh
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/*.txt
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/*.sha256
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/build/*.txt
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/build/**/config.log
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/stage
+          if-no-files-found: warn
       # Compile Node separately from MSYS, within the existing matrix. Source or
       # fixture changes rebuild it; workflow-only diagnostics reuse no binaries
       # and do not repeat a full compile. Manual dispatch rebuilds both workers.
@@ -420,6 +492,8 @@ jobs:
           python3 scripts/windows-msys/null-proof/run.py
           python3 scripts/windows-msys/token-default-proof/run.py
           python3 scripts/windows-msys/loader-lock-proof/run.py
+          python3 scripts/windows-msys/fork-init-trace/test.py
+          node --test scripts/windows-msys/fork-init-trace/parser.test.cjs
           node --test scripts/windows-msys/process-security-proof/parser.test.cjs
           node --test scripts/windows-msys/portable-runtime/portable.test.cjs scripts/windows-msys/portable-runtime/cli.test.cjs scripts/windows-msys/portable-runtime/producer-context.test.cjs
           node --test scripts/windows-msys/portable-probe/*.test.cjs scripts/windows-msys/portable-consumer/native-writer.test.cjs scripts/windows-msys/diagnostic-smoke/diagnostic-smoke.test.cjs

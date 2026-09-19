@@ -48,6 +48,30 @@ test('ACL observation distinguishes successful mutation from an unconfirmed deni
   else{assert.doesNotThrow(invoke);assert.equal(stderr,'')}
  }
 })
+test('actual ACL worker uses the absolute system executable and closes its output handle',async()=>{
+ const vm=require('node:vm'),{EventEmitter}=require('node:events'),win=path.win32
+ const fixture={target:'C:\\private\\target',scratch:'C:\\private\\scratch',sentinel:'C:\\private\\controller\\secret',endpoints:[]}
+ const text=fs.readFileSync(path.join(__dirname,'probe.cjs'),'utf8'),sourceStart=text.indexOf('    const source = '),sourceEnd=text.indexOf('\n    const encoded',sourceStart)
+ const source=vm.runInNewContext(text.slice(sourceStart,sourceEnd).replace('    const source = ',''),{fixture})
+ new vm.Script(source)
+ const start=source.indexOf("phase='acl-write';"),end=source.indexOf('const aclText=',start)
+ const run=new (Object.getPrototypeOf(async function(){}).constructor)('cp','fs','path','f','process','let phase;'+source.slice(start,end)+'return aclExit')
+ for(const scenario of ['exit','spawn-error','spawn-throw','open-error']){
+  const events=[],error=Object.assign(Error('controlled failure'),{code:'EACCES'})
+  const environment={SystemRoot:'C:\\Windows folder',AUTOPROMPT_APP_CONTAINER_SID:'S-1-15-2-123',PATH:'C:\\private\\runtime'}
+  const filesystem={openSync(file,flags){assert.equal(file,win.join(fixture.scratch,'acl-result.txt'));assert.equal(flags,'wx');events.push('open');if(scenario==='open-error')throw error;return 47},closeSync(fd){assert.equal(fd,47);events.push('close')}}
+  const child={spawn(file,args,options){
+   assert.equal(file,'C:\\Windows folder\\System32\\icacls.exe');assert.deepEqual(args,[fixture.target,'/grant','*S-1-15-2-123:F','/q'])
+   assert.deepEqual(options,{cwd:fixture.scratch,stdio:[0,47,47]});events.push('spawn')
+   if(scenario==='spawn-throw')throw error
+   const emitter=new EventEmitter();queueMicrotask(()=>{events.push(scenario==='spawn-error'?'error':'exit');emitter.emit(scenario==='spawn-error'?'error':'exit',scenario==='spawn-error'?error:5)});return emitter
+  }}
+  const result=run(child,filesystem,win,fixture,{env:environment})
+  if(scenario==='exit'){assert.equal(await result,5);assert.deepEqual(events,['open','spawn','exit','close'])}
+  else{await assert.rejects(result,e=>e===error);assert.equal(events.at(-1),scenario==='open-error'?'open':'close')}
+  assert.equal(environment.PATH,'C:\\private\\runtime')
+ }
+})
 test('diagnostic closes its real IPv4 listener when the IPv6 listener cannot start',async t=>{
  const vm=require('node:vm'),net=require('node:net'),{createRequire}=require('node:module'),servers=[],closed=[]
  t.after(()=>{for(const server of servers)server.close()})
