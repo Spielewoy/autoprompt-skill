@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   platform-primitives:
@@ -87,6 +88,29 @@ jobs:
         with:
           name: windows-runtime-physical-${{ matrix.runner.arch }}-node-${{ matrix.node }}
           path: native-windows-runtime-physical.log
+          if-no-files-found: error
+      - name: Build and verify fixed native capture executable
+        id: runtime-precompiled-proof
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test scripts/windows-runtime/precompiled-proof/verify-output.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $build = Join-Path $env:RUNNER_TEMP 'precompiled-capture'
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -File scripts/windows-runtime/precompiled-proof/build.ps1 -OutputDirectory $build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:AUTOPROMPT_CAPTURE_BUILD = $build
+          node --test --test-reporter=tap scripts/windows-runtime/precompiled-proof/native.test.cjs 2>&1 | Tee-Object -FilePath (Join-Path $build 'native.tap')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-runtime/precompiled-proof/verify-output.cjs (Join-Path $build 'native.tap')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve fixed native capture executable and observations
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-runtime-precompiled-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: ${{ runner.temp }}/precompiled-capture
           if-no-files-found: error
       - name: Record native host NUL query sizes before sandbox launches
         if: runner.os == 'Windows'
@@ -181,6 +205,29 @@ jobs:
           $patch = (Resolve-Path scripts/windows-msys/pipe-security.patch).Path
           $digest = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
           ./scripts/windows-msys/build.ps1 -WorkRoot (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof') -Mode proof -AdaptationPatch $patch -AdaptationSha256 $digest -Jobs 4 -CompilePosixFixture
+      - name: Export the exact compiled MSYS candidate for native reuse
+        id: msys-candidate
+        if: steps.msys-proof.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof'
+          $export = Join-Path $env:RUNNER_TEMP 'msys-candidate-export'
+          New-Item -ItemType Directory -Path $export -ErrorAction Stop | Out-Null
+          $context = Join-Path $export 'producer-context.json'
+          node scripts/windows-msys/portable-runtime/producer-context.cjs $PWD.Path $work $context
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-msys/portable-runtime/cli.cjs export $PWD.Path $work $context (Join-Path $export 'packet') | Set-Content -LiteralPath (Join-Path $export 'producer-result.json') -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Publish immutable MSYS candidate bytes and producer authority
+        if: steps.msys-candidate.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-candidate-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/msys-candidate-export
+          if-no-files-found: error
       - name: Verify adapted descriptors and cross-profile denial natively
         id: msys-descriptor
         if: steps.msys-proof.outcome == 'success'
@@ -195,6 +242,8 @@ jobs:
           node --test scripts/windows-msys/descriptor-proof/parser.test.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/windows-msys/descriptor-proof/prepare.py $PWD.Path $prepared
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test scripts/windows-msys/descriptor-proof/discovery.test.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./scripts/windows-msys/descriptor-proof/discover-toolchain.ps1 -WorkRoot $toolchain
           $manifest = Join-Path $payload 'stage.sha256'
@@ -310,6 +359,8 @@ jobs:
         run: |
           node --test scripts/windows-node/build-boundaries.test.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test scripts/windows-node/verify-native-proof.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./scripts/windows-node/build.ps1 -Architecture '${{ matrix.runner.arch }}' -WorkRoot (Join-Path $env:RUNNER_TEMP 'node-compiler-proof')
       - name: Require exact subprocess roundtrips with the built Node worker
         id: node-smoke
@@ -322,7 +373,9 @@ jobs:
           $env:AUTOPROMPT_NODE_PIPE_WORKER = Join-Path $stage 'node.exe'
           $env:AUTOPROMPT_NODE_PIPE_WORKER_SHA256 = $proof.nodeSha256
           $env:AUTOPROMPT_NODE_PIPE_REQUIRE_SUPPORT = '1'
-          node --test tests/source/windows-appcontainer-node-pipes.test.cjs 2>&1 | Tee-Object -FilePath (Join-Path $stage 'built-runtime-proof.txt')
+          node --test --test-reporter=tap tests/source/windows-appcontainer-node-pipes.test.cjs 2>&1 | Tee-Object -FilePath (Join-Path $stage 'built-runtime-proof.txt')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-node/verify-native-proof.cjs (Join-Path $stage 'built-runtime-proof.txt') (Join-Path $stage 'provenance.json') (Join-Path $stage 'node.exe') $proof.nodeSha256
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve the Node compiler output and native observations
         if: always() && steps.node-proof-input.outputs.run == 'true'
@@ -342,7 +395,9 @@ jobs:
           python3 scripts/windows-msys/child-security-proof/run.py
           python3 scripts/windows-msys/anonymous-proof/run.py
           python3 scripts/windows-msys/null-proof/run.py
+          python3 scripts/windows-msys/token-default-proof/run.py
           node --test scripts/windows-msys/process-security-proof/parser.test.cjs
+          node --test scripts/windows-msys/portable-runtime/portable.test.cjs scripts/windows-msys/portable-runtime/cli.test.cjs scripts/windows-msys/portable-runtime/producer-context.test.cjs
       - name: Run platform tests and reject skips of this host's native cases
         run: node tests/helpers/native-platform-ci.cjs platform
       - name: Verify doctor readiness and isolated Bash and PowerShell diagnostics
@@ -363,7 +418,7 @@ jobs:
       - name: Packed installer lifecycle
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
       - name: Require native startup and selected compiler proofs to succeed
-        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure')
+        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.runtime-precompiled-proof.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-candidate.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure')
         run: node -e "process.exit(1)"
 
   claude-native:

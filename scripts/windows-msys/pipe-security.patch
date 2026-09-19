@@ -2174,3 +2174,30 @@ index 9408903..e43f94c 100644
  	}
        else
  	{
+diff --git a/winsup/cygwin/uinfo.cc b/winsup/cygwin/uinfo.cc
+--- a/winsup/cygwin/uinfo.cc
++++ b/winsup/cygwin/uinfo.cc
+@@ -77,6 +77,23 @@
+       system_printf ("NtQueryInformationToken (TokenUser), %y", status);
+       return;
+     }
++
++  /* The launcher supplies the AppContainer token and its restricted default
++     DACL.  Replacing it with sec_user_nih removes the package SID needed to
++     open child tokens.  Retain both the inherited token security and the
++     process descriptor; same-primary child creation supplies its own bounded
++     descriptors.  Query the already-open primary token through ntdll: loading
++     advapi32 here would violate the early initialization constraints. */
++  ULONG is_appcontainer = 0;
++  ULONG appcontainer_size = 0;
++  status = NtQueryInformationToken (hProcToken, TokenIsAppContainer,
++                                   &is_appcontainer, sizeof is_appcontainer,
++                                   &appcontainer_size);
++  if (!NT_SUCCESS (status) || appcontainer_size != sizeof is_appcontainer
++      || is_appcontainer > 1)
++    api_fatal ("Cannot determine primary token AppContainer state, %y", status);
++  if (is_appcontainer)
++    return;
+ 
+   /* Set token owner to the same value as token user */
+   status = NtSetInformationToken (hProcToken, TokenOwner, &effec_cygsid,

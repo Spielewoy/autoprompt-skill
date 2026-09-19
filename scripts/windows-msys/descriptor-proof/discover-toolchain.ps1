@@ -5,7 +5,18 @@ param([Parameter(Mandatory=$true)][string]$WorkRoot)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 if ($PSVersionTable.PSVersion.Major -lt 7 -or -not $IsWindows) { throw 'Native Windows PowerShell 7+ is required' }
-if ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString() -ne 'X64') { throw 'Native x64 toolchain discovery is required' }
+function SelectDiscoveryPlan([string]$ProcessArchitecture,[string]$OSArchitecture) {
+  $arch=$ProcessArchitecture.ToLowerInvariant()
+  if($arch -cnotin @('x64','arm64') -or $OSArchitecture.ToLowerInvariant() -cne $arch){throw 'Discovery requires matching native x64 or ARM64 process and OS'}
+  $arm=$arch -ceq 'arm64'
+  return [pscustomobject]@{arch=$arch;processor=$(if($arm){'ARM64'}else{'AMD64'});vcvars=$(if($arm){'arm64'}else{'amd64'});tools=$(if($arm){'bin\HostARM64\arm64'}else{'bin\Hostx64\x64'});component=$(if($arm){'Microsoft.VisualStudio.Component.VC.Tools.ARM64'}else{'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'})}
+}
+function AssertDiscoveryEnvironment($Values,$Plan) {
+  foreach($key in @('VSCMD_ARG_HOST_ARCH','VSCMD_ARG_TGT_ARCH')) {
+    if(-not $Values.ContainsKey($key) -or $Values[$key] -cne $Plan.arch){throw 'Compiler environment must match native host and target architecture'}
+  }
+}
+$plan=SelectDiscoveryPlan ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()) ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString())
 function Physical([string]$Path,[bool]$Directory=$false) {
   if (-not [IO.Path]::IsPathFullyQualified($Path)) { throw 'Absolute toolchain path required' }
   $full=[IO.Path]::GetFullPath($Path)
@@ -29,11 +40,18 @@ foreach($sid in @($user.Value,'S-1-5-18') | Select-Object -Unique) {
 [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($work),$acl)
 $system=Physical $env:SystemRoot $true
 $cmd=Physical (Join-Path $system 'System32\cmd.exe')
-$vswhere=Physical (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe')
+$vswhere=$null
+foreach($installerRoot in @(${env:ProgramFiles(x86)},$env:ProgramFiles) | Select-Object -Unique) {
+  if($installerRoot) {
+    $candidate=Join-Path $installerRoot 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if([IO.File]::Exists($candidate)){$vswhere=Physical $candidate;break}
+  }
+}
+if(-not $vswhere){throw 'Physical Visual Studio discovery tool is unavailable'}
 $environment=@{
  SystemRoot=$system;WINDIR=$system;SystemDrive=[IO.Path]::GetPathRoot($system).TrimEnd('\');ComSpec=$cmd
  PATH=(Join-Path $system 'System32')+';'+$system;PATHEXT='.COM;.EXE;.BAT;.CMD';TEMP=$work;TMP=$work
- PROCESSOR_ARCHITECTURE='AMD64';NUMBER_OF_PROCESSORS='2'
+ PROCESSOR_ARCHITECTURE=$plan.processor;NUMBER_OF_PROCESSORS='2'
  ProgramFiles=$env:ProgramFiles;'ProgramFiles(x86)'=${env:ProgramFiles(x86)};ProgramW6432=$env:ProgramW6432
  USERPROFILE=[Environment]::GetFolderPath('UserProfile');LOCALAPPDATA=[Environment]::GetFolderPath('LocalApplicationData');APPDATA=[Environment]::GetFolderPath('ApplicationData');ProgramData=[Environment]::GetFolderPath('CommonApplicationData')
 }
@@ -72,7 +90,7 @@ function Run([string]$Executable,[string[]]$Arguments,[string]$Name) {
     else{$script:RetainedStreams.Add(@{process=$process;stdout=$stdout;stderr=$stderr;stdoutTask=$outTask;stderrTask=$errTask})}
   }
 }
-Run $vswhere @('-latest','-products','*','-version','[17.14,19.0)','-requires','Microsoft.VisualStudio.Component.VC.Tools.x86.x64','-format','json','-utf8') 'vswhere'
+Run $vswhere @('-latest','-products','*','-version','[17.14,19.0)','-requires',$plan.component,'-format','json','-utf8') 'vswhere'
 $instances=@([IO.File]::ReadAllText((Join-Path $work 'vswhere.stdout.txt'),[Text.Encoding]::UTF8) | ConvertFrom-Json)
 if($instances.Count -ne 1){throw 'Exactly one selected VS2022 17.14+ or VS2026 18.x instance is required'}
 $visualStudioVersion=[version]$instances[0].installationVersion
@@ -83,7 +101,7 @@ if($vcvars -match '[%"!&|<>^]' -or $vcvars -match '[^\x20-\x7e]'){throw 'Unsuppo
 $batch=Join-Path $work 'discover.cmd'
 # Only the fixed discovered VS path enters batch text; work has no metacharacters.
 # SET prints values without expanding them into executable command text.
-$text="@echo off`r`nsetlocal DisableDelayedExpansion`r`nchcp 65001 >nul`r`ncall `"$vcvars`" amd64 > `"$work\vcvars.log`" 2>&1`r`nif errorlevel 1 exit /b 1`r`nset`r`n"
+$text="@echo off`r`nsetlocal DisableDelayedExpansion`r`nchcp 65001 >nul`r`ncall `"$vcvars`" $($plan.vcvars) > `"$work\vcvars.log`" 2>&1`r`nif errorlevel 1 exit /b 1`r`nset`r`n"
 [IO.File]::WriteAllText($batch,$text,[Text.ASCIIEncoding]::new())
 Run $cmd @('/d','/s','/c',$batch) 'environment'
 $values=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -94,10 +112,11 @@ foreach($line in [IO.File]::ReadAllLines((Join-Path $work 'environment.stdout.tx
   $values.Add($key,$line.Substring($separator+1))
 }
 foreach($key in @('VCToolsInstallDir','WindowsSDKVersion','INCLUDE','LIB')){if(-not $values.ContainsKey($key) -or -not $values[$key]){throw ('Missing compiler environment: '+$key)}}
+AssertDiscoveryEnvironment $values $plan
 $tools=Physical $values['VCToolsInstallDir'] $true
 if(-not $tools.StartsWith($vs.TrimEnd('\')+'\VC\Tools\MSVC\',[StringComparison]::OrdinalIgnoreCase)){throw 'Compiler is outside selected VS installation'}
-$cl=Physical (Join-Path $tools 'bin\Hostx64\x64\cl.exe')
-$link=Physical (Join-Path $tools 'bin\Hostx64\x64\link.exe')
+$cl=Physical (Join-Path (Join-Path $tools $plan.tools) 'cl.exe')
+$link=Physical (Join-Path (Join-Path $tools $plan.tools) 'link.exe')
 function Directories([string]$List) {
   $result=[Collections.Generic.List[string]]::new()
   foreach($directory in $List.Split(';')){if($directory){$result.Add((Physical $directory $true))}}
@@ -106,7 +125,7 @@ function Directories([string]$List) {
 }
 $includes=Directories $values['INCLUDE'];$libraries=Directories $values['LIB']
 $sdk=$values['WindowsSDKVersion'].TrimEnd('\');if($sdk -cnotmatch '^10\.0\.[0-9]+\.0$'){throw 'Unexpected Windows SDK version'}
-$toolchain=[ordered]@{cl=$cl;link=$link;include=$includes;lib=$libraries;sdkVersion=$sdk;arch='x64'}
+$toolchain=[ordered]@{cl=$cl;link=$link;include=$includes;lib=$libraries;sdkVersion=$sdk;arch=$plan.arch}
 $destination=Join-Path $work 'toolchain.json'
 [IO.File]::WriteAllText($destination,($toolchain | ConvertTo-Json -Depth 4)+"`n",[Text.UTF8Encoding]::new($false))
 Write-Output $destination

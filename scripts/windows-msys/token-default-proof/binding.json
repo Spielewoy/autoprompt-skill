@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "sourceCommit": "270ba2980700e6e2a0813944d506eecea0f86402",
+  "sourcePath": "winsup/cygwin/uinfo.cc",
+  "sourceFileSha256": "c31d483896ad69bf3d731e1c79d983b9836e9b25867a3c9a7cab59a99b475355",
+  "originalFunctionSha256": "710ee39094a4ad7ffe0129a17eae3f436f9070015eb02069e37cd197723c8d23",
+  "candidateFunctionSha256": "3a220925c92482daa24b0a521ee704df336c4aba6b4e26248666f7801da7ec79",
+  "patchSha256": "66d28f7e057070d812695b22927ecf7bc47acac0561bdc6a63b56cfb9880838c"
+}
