@@ -1,6 +1,6 @@
 'use strict'
 const assert = require('node:assert/strict')
-const STAGES = new Set([1,2,3,4,5,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,40,41,42,43,44,45,46,47,48,60,61,62,63,64,65,80,81,82,83,84])
+const STAGES = new Set([1,2,3,4,5,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,40,41,42,43,44,45,46,47,48,60,61,62,63,64,65,80,81,82,83,84,90,91,92,93,94,95,96,100,101,102,103,...Array.from({length:64},(_,i)=>0x101+i),...Array.from({length:64},(_,i)=>0x201+i)])
 function parse(raw) {
   assert.equal(typeof raw, 'string'); assert.ok(Buffer.byteLength(raw) <= 256 * 1024)
   const drains = [...raw.matchAll(/^TRACE-DRAIN:(confirmed|unknown)\r?$/gm)]

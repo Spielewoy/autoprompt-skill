@@ -9,6 +9,30 @@ with tempfile.TemporaryDirectory(prefix='fork-trace-contract-') as temporary:
  root=pathlib.Path(temporary)
  subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror',str(HERE/'test.cc'),'-o',str(root/'transport')],check=True,timeout=60)
  subprocess.run([str(root/'transport')],check=True,timeout=10)
+ # Compile the exact generated loop, proving call order/count and exception flow.
+ loop_source=r'''#include <vector>
+#include <stdexcept>
+#include <cassert>
+static std::vector<unsigned> events;
+static unsigned calls;
+namespace autoprompt_fork_trace { void emit(unsigned n){events.push_back(n);} }
+static void first(){events.push_back(1);++calls;}
+static void second(){events.push_back(2);++calls;}
+static void third(){events.push_back(3);++calls;}
+static void fails(){throw std::runtime_error("original");}
+static void loop(void (**in_pfunc)(), int force){void (**pfunc)()=in_pfunc;while(*++pfunc);''' + generate['CTOR_TRACE'] + r'''}
+int main(){
+ void(*table[])()={nullptr,first,second,third,nullptr};
+ loop(table,1);assert(calls==3);assert((events==std::vector<unsigned>{0x103,3,0x203,0x102,2,0x202,0x101,1,0x201}));
+ events.clear();calls=0;loop(table,0);assert(calls==3);assert((events==std::vector<unsigned>{3,2,1}));
+ events.clear();table[3]=fails;try{loop(table,1);assert(false);}catch(const std::runtime_error&){}assert((events==std::vector<unsigned>{0x103}));
+ void(*large[67])()={nullptr};for(unsigned i=1;i<=65;i++)large[i]=first;
+ events.clear();calls=0;loop(large,1);assert(calls==65);assert(events.front()==1);assert(events.size()==65+128);
+}
+'''
+ (root/'constructor-loop.cc').write_text(loop_source)
+ subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror',str(root/'constructor-loop.cc'),'-o',str(root/'constructor-loop')],check=True,timeout=60)
+ subprocess.run([str(root/'constructor-loop')],check=True,timeout=10)
  header=(HERE/'trace.h').read_text()
  calls=set(re.findall(r'\b([A-Z][A-Za-z0-9_]*)\(',header))
  assert calls=={'NtCurrentTeb','NtQueryObject','NtQueryInformationFile','NtWriteFile'},calls
@@ -39,15 +63,18 @@ with tempfile.TemporaryDirectory(prefix='fork-trace-contract-') as temporary:
   stages=[]
   for rel in pins:
    text=(check/rel).read_text();stages+=map(int,re.findall(r'autoprompt_fork_trace::emit \(([0-9]+)\);',text))
+   if rel.endswith('/dcrt0.cc'):
+    assert text.count(generate['CTOR_TRACE'])==1
+    text=text.replace(generate['CTOR_TRACE'],generate['CTOR_ORIGINAL'])
    cleaned=''.join(line for line in text.splitlines(True) if not line.strip().startswith('autoprompt_fork_trace::emit') and line!='#include "autoprompt-fork-trace.h"\n')
    at=cleaned.rfind('#include "ntdll.h"\n');cleaned=cleaned[:at]+cleaned[at+len('#include "ntdll.h"\n'):]
    assert cleaned==(a.source/rel).read_text(),rel
-  assert len(stages)==44 and len(set(stages))==44
+  assert len(stages)==55 and len(set(stages))==55
   bad=root/'bad.patch';bad.write_bytes(b'wrong patch')
   try:generate['generate'](a.source,bad,root/'bad-output')
   except ValueError:pass
   else:raise AssertionError('Wrong base authority accepted')
-  print('44 unique stage insertions preserve all four original source files byte-for-byte')
+  print('55 unique stage insertions plus bounded constructor pre/post observations preserve all six original source files byte-for-byte')
  if a.windows_cxx:
   prefix=(HERE/'test.cc').read_text().split('static int fail=')[0]
   prefix+='extern "C" int NtQueryObject(HANDLE,int,OBJECT_BASIC_INFORMATION*,unsigned,void*);\nextern "C" int NtQueryInformationFile(HANDLE,IO_STATUS_BLOCK*,void*,unsigned,int);\nextern "C" int NtWriteFile(HANDLE,void*,void*,void*,IO_STATUS_BLOCK*,char*,unsigned,void*,void*);\n'

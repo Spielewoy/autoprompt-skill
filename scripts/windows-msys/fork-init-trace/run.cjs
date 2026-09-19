@@ -5,9 +5,10 @@ const { readBounded: bound, closureRecords, stagedDigest } = require('../probe-b
 const { physical } = require('../descriptor-proof/run.cjs')
 const { bindBashRuntime } = require('../diagnostic-smoke/command.cjs')
 const { parse } = require('./parse.cjs')
+const { constructorMap } = require('./constructor-map.cjs')
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 const PURPOSE = 'fork-initialization-diagnostic-only'
-for (const helper of [physical, bound, closureRecords, stagedDigest, bindBashRuntime, parse]) assert.equal(typeof helper, 'function', 'Diagnostic entry dependency missing')
+for (const helper of [physical, bound, closureRecords, stagedDigest, bindBashRuntime, parse, constructorMap]) assert.equal(typeof helper, 'function', 'Diagnostic entry dependency missing')
 function main(args) {
  assert.equal(process.platform, 'win32'); assert.equal(process.arch, 'x64')
  assert.equal(args.length, 5, 'Usage: node run.cjs REPO CONTEXT EXPECTED_CONTEXT_SHA256 NEW_OUTPUT SYSTEM_ROOT')
@@ -28,15 +29,17 @@ function main(args) {
  const work = physical(path.resolve(c.workRoot), true), sdk = path.join(work, 'sdk'), payload = path.join(sdk, 'issue27-build')
  const python = physical(path.resolve(c.python)); capture(python, c.pythonSha256)
  const traceBytes = capture(c.traceDll, c.traceDllSha256)
+ const constructors=constructorMap(traceBytes),constructorBytes=Buffer.from(JSON.stringify(constructors,null,2)+'\n')
  const traceManifest = JSON.parse(capture(c.traceManifest, c.traceManifestSha256, 65536))
  assert.equal(traceManifest.purpose, PURPOSE); assert.equal(traceManifest.accepted, false)
  assert.equal(traceManifest.sourceCommit, '270ba2980700e6e2a0813944d506eecea0f86402')
  assert.equal(traceManifest.sourceArchiveSha256, '0571ad83f965bf7682a446a874830a560c8b12431e7d54e55f414a3851ba1146')
- for (const key of ['traceHeaderSha256','generatorSha256','recipeSha256','tracePatchSha256']) assert.match(traceManifest[key], /^[a-f0-9]{64}$/)
+ for (const key of ['traceHeaderSha256','generatorSha256','sourcePinsSha256','recipeSha256','tracePatchSha256']) assert.match(traceManifest[key], /^[a-f0-9]{64}$/)
  capture(path.join(__dirname, 'trace.h'), traceManifest.traceHeaderSha256)
  capture(path.join(__dirname, 'generate.py'), traceManifest.generatorSha256)
+ capture(path.join(__dirname, 'source-pins.json'), traceManifest.sourcePinsSha256)
  capture(path.join(__dirname, 'build-trace.sh'), traceManifest.recipeSha256)
- capture(path.join(__dirname, 'parse.cjs')); capture(__filename)
+ capture(path.join(__dirname, 'parse.cjs')); capture(path.join(__dirname, 'constructor-map.cjs')); capture(__filename)
  const patchHash = sha(capture(path.join(repo, 'scripts/windows-msys/pipe-security.patch')))
  assert.equal(traceManifest.basePatchSha256, patchHash)
  capture(path.join(path.dirname(c.traceManifest), 'trace.patch'), traceManifest.tracePatchSha256)
@@ -73,13 +76,14 @@ function main(args) {
  mkdir(output)
  const manifest = { schema:1, purpose:PURPOSE, accepted:false, status:'pending', cleanupConfirmed:false, contextSha256:contextSha,
   originalCandidateSha256:candidateSha, traceDllSha256:c.traceDllSha256, traceManifestSha256:c.traceManifestSha256, normalManifestSha256:c.normalManifestSha256,
-  runnerSha256:sha(bound(__filename)), retainedRoot:output, commands:[], inputs:[...captured].map(([file,sha256])=>({file,sha256})) }
+  constructorMapSha256:sha(constructorBytes), constructorMap:constructors, runnerSha256:sha(bound(__filename)), retainedRoot:output, commands:[], inputs:[...captured].map(([file,sha256])=>({file,sha256})) }
  const save=()=>fs.writeFileSync(path.join(output,'diagnostic-manifest.json'),JSON.stringify(manifest,null,2)+'\n')
  save()
  const control=mkdir(path.join(output,'control')), runtime=mkdir(path.join(output,'runtime')); mkdir(path.join(runtime,'usr'))
  const bin=mkdir(path.join(runtime,'usr/bin')), etc=mkdir(path.join(runtime,'etc')), cwdA=mkdir(path.join(output,'cwd-A')), cwdB=mkdir(path.join(output,'cwd-B'))
  const write=(file,bytes)=>fs.writeFileSync(file,bytes,{flag:'wx'})
  write(path.join(output,'context.json'),contextBytes)
+ write(path.join(output,'constructor-map.json'),constructorBytes)
  for (const file of source) write(path.join(bin,file.name),file.name==='msys-2.0.dll'?traceBytes:file.bytes)
  write(path.join(bin,'process-security.exe'),fixtureBytes); write(path.join(etc,'fstab'),'none /tmp usertemp binary,posix=0,noacl 0 0\n')
  const diagnostic = bindBashRuntime(bin,system)
@@ -105,7 +109,10 @@ function main(args) {
   manifest.controllerExecutableSha256=sha(bound(executable));save()
   const sharedId=require(path.join(repo,'agents/codex/workflow/windows-appcontainer.js')).parseMsysSharedId(traceBytes)
   const observation=run('native-controller',executable,[path.join(bin,'process-security.exe'),normal.fixture.executableSha256,path.join(bin,'bash.exe'),source.find(f=>f.name==='bash.exe').sha256,path.join(bin,'msys-2.0.dll'),c.traceDllSha256,sharedId,control,cwdA,cwdB],env,80000)
-  manifest.observation=parse(observation.stderr||'');manifest.cleanupConfirmed=!observation.error&&manifest.observation.cleanupConfirmed
+  manifest.observation=parse(observation.stderr||'');
+  const constructorStages=new Set(constructors.callOrder.flatMap(item=>[item.beforeStage,item.afterStage]))
+  for(const operation of manifest.observation.operations)for(const record of operation.records)if(record.stage>=0x100)assert.ok(constructorStages.has(record.stage),'Trace constructor index absent from exact DLL')
+  manifest.cleanupConfirmed=!observation.error&&manifest.observation.cleanupConfirmed
   manifest.status=observation.error?'controller-incomplete':'diagnostic-collected'
   assert.equal(sha(bound(native)),manifest.derivedNativeSha256);assert.equal(sha(bound(controllerSource)),manifest.derivedControllerSha256);assert.equal(sha(bound(executable)),manifest.controllerExecutableSha256)
  } catch(error) { failure=error;manifest.status='diagnostic-failed';manifest.error=String(error.message).slice(0,2048) }
