@@ -140,6 +140,22 @@ test('closed plans reject unknown keys, duplicated identities, and replacement r
   assert.throws(() => validatePlan({ ...plan, roots: [{ ...plan.roots[0], creation: '1' }, ...plan.roots.slice(1)] }), { code: 'WINDOWS_RESOURCE_INVALID' })
 })
 
+test('closed resource plans reject line endings in exact identities and decimal creation values', async () => {
+  const h = harness(), lease = await h.api.prepareWindowsAppContainerResources(h.options)
+  const plan = JSON.parse(h.records.get(lease.recovery.journalPath)).plan
+  for (const suffix of ['\n', '\r\n', '\r']) for (const field of ['identity', 'creation']) for (const scope of [1, 2, 3]) {
+    const invalid = structuredClone(plan)
+    if (scope & 1) invalid.entries[0][field] += suffix
+    if (scope & 2) invalid.roots[0][field] += suffix
+    assert.throws(() => validatePlan(invalid), { code: 'WINDOWS_RESOURCE_INVALID' })
+  }
+  for (const creation of ['0', '1', '1234567890123456789']) {
+    const valid = structuredClone(plan); valid.entries[0].creation = valid.roots[0].creation = creation
+    assert.equal(validatePlan(valid), valid)
+  }
+  await lease.release(h.evidence(lease))
+})
+
 test('v3 provenance preserves multiplicity and rejects malformed or unowned inheritance records', async () => {
   const h = harness(), lease = await h.api.prepareWindowsAppContainerResources(h.options)
   const plan = JSON.parse(h.records.get(lease.recovery.journalPath)).plan

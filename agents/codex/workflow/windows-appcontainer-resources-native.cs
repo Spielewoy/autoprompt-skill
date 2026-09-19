@@ -370,7 +370,7 @@ public static class WindowsAppContainerResourcesNative {
     var plan=serializer.Deserialize<ResourcePlan>(json);
     Need(plan!=null && plan.schemaVersion==3 && plan.profileSid==ProfileSid(plan.profileName) && plan.roots!=null && plan.entries!=null && plan.entries.Length>0 && plan.entries.Length<=MaxResourceEntries,"WINDOWS_RESOURCE_INVALID");
     Specs(plan.roots.Select(r=>new RootSpec{path=r.path,kind=r.kind,writable=r.writable}).ToArray());
-    var seen=new HashSet<string>();foreach(var entry in plan.entries){Need(entry!=null && entry.identity!=null && System.Text.RegularExpressions.Regex.IsMatch(entry.identity,"^[a-f0-9]{8}:[a-f0-9]{16}$") && seen.Add(entry.identity) && entry.creation!=null && System.Text.RegularExpressions.Regex.IsMatch(entry.creation,"^[0-9]{1,19}$") && entry.label!=null && entry.label.Length<=5464,"WINDOWS_RESOURCE_INVALID");if(entry.label.Length>0){byte[] raw=Convert.FromBase64String(entry.label);Need(Convert.ToBase64String(raw)==entry.label,"WINDOWS_RESOURCE_INVALID");new RawAcl(raw,0);}ValidateInheritanceRecord(entry,plan.profileSid);}
+    var seen=new HashSet<string>();foreach(var entry in plan.entries){Need(entry!=null && entry.identity!=null && entry.identity.Length==25 && System.Text.RegularExpressions.Regex.IsMatch(entry.identity,"^[a-f0-9]{8}:[a-f0-9]{16}$") && seen.Add(entry.identity) && entry.creation!=null && System.Text.RegularExpressions.Regex.IsMatch(entry.creation,@"^[0-9]{1,19}\z") && entry.label!=null && entry.label.Length<=5464,"WINDOWS_RESOURCE_INVALID");if(entry.label.Length>0){byte[] raw=Convert.FromBase64String(entry.label);Need(Convert.ToBase64String(raw)==entry.label,"WINDOWS_RESOURCE_INVALID");new RawAcl(raw,0);}ValidateInheritanceRecord(entry,plan.profileSid);}
     foreach(var root in plan.roots)Need(plan.entries.Any(e=>e.identity==root.identity && e.creation==root.creation && e.directory==(root.kind=="directory")),"WINDOWS_RESOURCE_INVALID");return plan;
   }
   static int PackageRights(bool writable,bool git,bool root) {
@@ -421,7 +421,7 @@ public static class WindowsAppContainerResourcesNative {
       Marshal.OffsetOf(typeof(FILE_ID_DESCRIPTOR),"Type").ToInt32()==4 &&
       Marshal.OffsetOf(typeof(FILE_ID_DESCRIPTOR),"Low").ToInt32()==8 &&
       Marshal.OffsetOf(typeof(FILE_ID_DESCRIPTOR),"High").ToInt32()==16,"WINDOWS_ACL_IDENTITY_UNAVAILABLE");
-    Need(identity!=null && System.Text.RegularExpressions.Regex.IsMatch(identity,"^[a-f0-9]{8}:[a-f0-9]{16}$"),"WINDOWS_RESOURCE_INVALID");
+    Need(identity!=null && identity.Length==25 && System.Text.RegularExpressions.Regex.IsMatch(identity,"^[a-f0-9]{8}:[a-f0-9]{16}$"),"WINDOWS_RESOURCE_INVALID");
     return new FILE_ID_DESCRIPTOR{Size=24,Type=0,Low=Convert.ToUInt64(identity.Substring(9),16),High=0};
   }
   static IntPtr OpenIdentity(IntPtr volume,string identity,uint access,out int error) {

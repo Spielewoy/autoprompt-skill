@@ -5,7 +5,7 @@ const sources = [path.join(workflow, 'windows-appcontainer-native.cs'), path.joi
 const windows = process.platform === 'win32'
 const shell = () => windows ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : process.env.AUTOPROMPT_TEST_PWSH || 'pwsh'
 const sha = b => crypto.createHash('sha256').update(b).digest('hex')
-const names = ['no-change', 'outside-rename', 'creation-mismatch', 'sharing-denial', 'deleted-replacement', 'delete-pending']
+const names = ['no-change', 'outside-rename', 'creation-mismatch', 'sharing-denial', 'deleted-replacement', 'delete-pending', 'classic-delete-pending']
 
 test('complete native resource identity fixture compiles against actual production sources', { timeout: 90000 }, t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'resource-identity-compile-')); t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -48,7 +48,55 @@ test('native Windows resource identity recovery preserves moved originals and re
     assert.deepEqual(item.restore, { restored: deleted ? 3 : 4, newEntries: item.case === 'deleted-replacement' ? 1 : 0, deletedEntries: deleted ? 1 : 0 })
     if (item.case === 'creation-mismatch') assert.deepEqual(item.refusal, { code: 'WINDOWS_ACL_IDENTITY_MISMATCH', win32: null })
     if (item.case === 'sharing-denial') assert.deepEqual(item.refusal, { code: 'WINDOWS_ACL_IDENTITY_UNAVAILABLE', win32: 32 })
-    if (item.case === 'delete-pending') { assert.equal(item.deletePendingObserved, true); assert.deepEqual(item.refusal, { code: 'WINDOWS_ACL_IDENTITY_UNAVAILABLE', win32: 5 }) }
+    const held = (value, pending, baseline) => {
+      assert.equal(value.opened, true); assert.equal(value.identityRead, true); assert.equal(value.identityMatched, true)
+      assert.equal(value.identity, item.original.identity); assert.equal(value.creation, item.original.creation)
+      assert.equal(value.standardRead, true); assert.equal(value.directory, false); assert.equal(value.deletePending, pending)
+      assert.equal(value.securityError, 0); assert.match(value.securitySha256, /^[a-f0-9]{64}$/)
+      assert.equal(value.baselineSecurityMatched, baseline); assert.equal(value.packagePresent, !baseline)
+    }
+    const lookups = (value, expectedError) => {
+      assert.equal(value.observationOnly, true); assert.equal(value.expectedIdentity, item.original.identity); assert.equal(value.expectedCreation, item.original.creation)
+      for (const key of ['volumeOpened', 'volumeRead', 'volumeMatched', 'volumeClosed']) assert.equal(value[key], true)
+      assert.equal(value.volumeCloseError, 0); assert.deepEqual(value.lookups.map(x => x.access), ['001e0081', '00100080'])
+      assert.equal(value.lookups[0].error, expectedError)
+      for (const lookup of value.lookups) {
+        assert.ok([0, 5].includes(lookup.error)); assert.equal(lookup.opened, lookup.error === 0)
+        if (expectedError === 0) assert.equal(lookup.error, 0)
+        if (lookup.opened) {
+          assert.equal(lookup.closed, true); assert.equal(lookup.closeError, 0)
+          const h = lookup.handle; assert.equal(h.identityRead, true); assert.equal(h.identityMatched, true)
+          assert.equal(h.identity, item.original.identity); assert.equal(h.creation, item.original.creation)
+          assert.equal(h.standardRead, true); assert.equal(h.deletePending, true); assert.equal(h.directory, false)
+          if (lookup.access === '001e0081') assert.equal(h.securityError, 0)
+        }
+      }
+    }
+    if (item.case === 'delete-pending') {
+      assert.equal(item.deletePendingObserved, true); assert.equal(item.refusal, undefined)
+      assert.deepEqual(item.heldRestore, { restored: 4, newEntries: 0, deletedEntries: 0 }); assert.equal(item.heldRepeatedRestore, true)
+      held(item.modernPendingHeldBefore, true, false)
+      for (const field of ['modernPendingHeldAfter', 'modernPendingHeldRepeated']) held(item[field], true, true)
+      for (const field of ['modernPendingHeldBefore', 'modernPendingHeldAfter', 'modernPendingHeldRepeated']) assert.equal(item[field].links, 0)
+      lookups(item.pendingBeforeRestore, 0); lookups(item.pendingAfterRestore, 0)
+      held(item.pendingBeforeRestore.held, true, false); held(item.pendingAfterRestore.held, true, true)
+      assert.deepEqual(item.modernObserverClose, { closed: true, error: 0 })
+    }
+    if (item.case === 'classic-delete-pending') {
+      assert.ok(['restored', 'refused'].includes(item.classicWhilePendingOutcome)); const restored = item.classicWhilePendingOutcome === 'restored'
+      lookups(item.classicPendingBeforeRestore, restored ? 0 : 5); lookups(item.classicPendingAfterRestore, restored ? 0 : 5)
+      held(item.classicPendingBeforeRestore.held, true, false); held(item.classicPendingAfterRestore.held, true, restored)
+      if (restored) { assert.equal(item.refusal, undefined); assert.deepEqual(item.classicHeldRestore, { restored: 4, newEntries: 0, deletedEntries: 0 }); assert.equal(item.classicHeldRepeatedRestore, true) }
+      else assert.deepEqual(item.refusal, { code: 'WINDOWS_ACL_IDENTITY_UNAVAILABLE', win32: 5 })
+      assert.equal(item.classicResetRecoveredOriginal, true); assert.deepEqual(item.classicResetNameIdentity, item.original)
+      for (const field of ['classicObserverBefore', 'classicDisposerBefore']) held(item[field], false, false)
+      held(item.classicPendingHeld, true, false); held(item.classicAfterRestoreHeld, true, restored)
+      held(item.classicResetHeld, false, restored); held(item.classicRecoveredHeld, false, true)
+      assert.equal(item.classicAfterRestoreHeld.securitySha256, item.classicResetHeld.securitySha256)
+      if (!restored) assert.equal(item.classicObserverBefore.securitySha256, item.classicAfterRestoreHeld.securitySha256)
+      for (const [field, deleted] of [['classicMark', true], ['classicReset', false]]) assert.deepEqual(item[field], { informationClass: 4, bytes: 1, delete: deleted, success: true, error: 0 })
+      for (const field of ['classicObserverClose', 'classicDisposerClose']) assert.deepEqual(item[field], { closed: true, error: 0 })
+    }
     if (item.refusal) assert.equal(item.refusalRetainedProfileAndPlan, true)
     if (item.case === 'deleted-replacement') { assert.match(item.replacement.identity, /^[a-f0-9]{8}:[a-f0-9]{16}$/); assert.notEqual(item.replacement.identity, item.original.identity) }
   }
