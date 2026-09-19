@@ -109,7 +109,31 @@ public static class BundleAclProbe {
   }
   [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateFileW(string p,uint access,uint share,IntPtr security,uint disposition,uint flags,IntPtr template);
   [DllImport("kernel32.dll",SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
-  [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr ReOpenFile(IntPtr original,uint access,uint sharing,uint flags);
+  [StructLayout(LayoutKind.Sequential)] struct UnicodeName { public ushort Length,MaximumLength; public IntPtr Buffer; }
+  [StructLayout(LayoutKind.Sequential)] struct ObjectAttributes { public uint Length; public IntPtr RootDirectory,ObjectName; public uint Attributes; public IntPtr SecurityDescriptor,SecurityQualityOfService; }
+  [StructLayout(LayoutKind.Sequential)] struct IoStatus { public IntPtr Status; public UIntPtr Information; }
+  [DllImport("ntdll.dll",ExactSpelling=true)] static extern int NtOpenFile(out IntPtr handle,uint access,ref ObjectAttributes attributes,out IoStatus status,uint sharing,uint options);
+  const uint RelativeOptions=0x00200021; // DIRECTORY | OPEN_REPARSE_POINT | SYNCHRONOUS_IO_NONALERT
+  const uint RelativeReadAccess=0x00120080,RelativeWriteAccess=0x00140000; // Both require SYNCHRONIZE.
+  const uint RelativeSharing=3; // No FILE_SHARE_DELETE.
+  static ObjectAttributes RelativeAttributes(IntPtr root,IntPtr name) {
+    return new ObjectAttributes { Length=(uint)Marshal.SizeOf(typeof(ObjectAttributes)),RootDirectory=root,ObjectName=name,Attributes=0x40 };
+  }
+  static bool ValidHandle(IntPtr handle) { return handle!=IntPtr.Zero&&handle!=new IntPtr(-1); }
+  static bool ExactGranted(int status,IntPtr handle) { return status==0&&ValidHandle(handle); }
+  static bool ExactDenied(int status,IntPtr handle) { return status==unchecked((int)0xc0000022)&&!ValidHandle(handle); }
+  static IntPtr OpenRelative(IntPtr root,uint access,out int status) {
+    // An empty name reopens the held directory; no DOS path or ancestor lookup.
+    // Native matrix controls must prove this operation, including a real grant.
+    Need(IntPtr.Size==8&&Marshal.SizeOf(typeof(UnicodeName))==16&&Marshal.SizeOf(typeof(ObjectAttributes))==48&&Marshal.SizeOf(typeof(IoStatus))==16,"acl-relative-ABI");
+    IntPtr name=Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeName)));
+    try {
+      Marshal.StructureToPtr(new UnicodeName(),name,false);
+      ObjectAttributes attributes=RelativeAttributes(root,name);IoStatus io;IntPtr handle=IntPtr.Zero;
+      status=NtOpenFile(out handle,access,ref attributes,out io,RelativeSharing,RelativeOptions);
+      return handle;
+    } finally { Marshal.FreeHGlobal(name); }
+  }
   [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetFileInformationByHandle(IntPtr handle,out Info info);
   [DllImport("kernel32.dll")] static extern uint GetFileType(IntPtr handle);
   [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern uint GetFinalPathNameByHandleW(IntPtr handle,StringBuilder path,uint length,uint flags);
@@ -183,16 +207,18 @@ public static class BundleAclProbe {
     Token(request.Sid);var handles=new List<IntPtr>();
     try {
       // The object is bound by identity, not by permission to inspect ancestors.
-      // ReOpenFile below addresses this held object even if parent names move.
+      // The relative NtOpenFile below addresses this object if parent names move.
       IntPtr target=Open(request.Target,0x20080);handles.Add(target);Need(Read(target,request.Target)==request.Identity,"acl-identity-mismatch");
       uint serial,maxComponent,flags;var fs=new StringBuilder(32);
       Need(GetVolumeInformationByHandleW(target,IntPtr.Zero,0,out serial,out maxComponent,out flags,fs,(uint)fs.Capacity)&&fs.ToString()=="NTFS","acl-ntfs-required");
-      IntPtr positive=ReOpenFile(target,0x20080,3,0x02200000);int positiveError=Marshal.GetLastWin32Error();
-      if(positive==new IntPtr(-1)||positive==IntPtr.Zero)throw new Refusal("acl-positive-reopen-"+((uint)positiveError).ToString(CultureInfo.InvariantCulture));
-      handles.Add(positive);Need(Read(positive,request.Target)==request.Identity,"acl-reopen-identity-mismatch");
-      IntPtr write=ReOpenFile(target,0x40000,3,0x02200000);int error=Marshal.GetLastWin32Error();
-      if(write!=new IntPtr(-1)) { if(write!=IntPtr.Zero)Close(write);throw new Refusal("acl-WRITE_DAC-granted"); }
-      Need(error==5,"acl-exact-access-denied-required");Need(Read(target,request.Target)==request.Identity,"acl-held-identity-changed");
+      int positiveStatus;IntPtr positive=OpenRelative(target,RelativeReadAccess,out positiveStatus);
+      if(ValidHandle(positive))handles.Add(positive);
+      Need(ExactGranted(positiveStatus,positive),"acl-positive-relative-"+((uint)positiveStatus).ToString("x8",CultureInfo.InvariantCulture));
+      Need(Read(positive,request.Target)==request.Identity,"acl-reopen-identity-mismatch");
+      int writeStatus;IntPtr write=OpenRelative(target,RelativeWriteAccess,out writeStatus);
+      if(ValidHandle(write)) { Close(write);Need(ExactGranted(writeStatus,write),"acl-WRITE_DAC-status-"+((uint)writeStatus).ToString("x8",CultureInfo.InvariantCulture));throw new Refusal("acl-WRITE_DAC-granted"); }
+      Need(ExactDenied(writeStatus,write),"acl-exact-access-denied-required-"+((uint)writeStatus).ToString("x8",CultureInfo.InvariantCulture));
+      Need(Read(target,request.Target)==request.Identity,"acl-held-identity-changed");
     } finally { Exception failure=null;for(int i=handles.Count-1;i>=0;i--)try{Close(handles[i]);}catch(Exception error){failure=error;}if(failure!=null)throw failure; }
     return "bundle-acl-denied-v1:"+architecture+":"+request.Identity+":5";
   }

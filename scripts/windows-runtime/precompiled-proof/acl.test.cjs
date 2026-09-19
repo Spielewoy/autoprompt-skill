@@ -3,7 +3,7 @@ const test=require('node:test'),assert=require('node:assert/strict'),cp=require(
 const shell=()=>process.env.AUTOPROMPT_CAPTURE_PWSH||(process.platform==='win32'?path.join(process.env.SystemRoot,'System32/WindowsPowerShell/v1.0/powershell.exe'):'pwsh')
 test('actual fixed ACL helper compiles and rejects malformed authority without Win32 calls',()=>{
  const result=cp.spawnSync(shell(),['-NoLogo','-NoProfile','-NonInteractive','-File',path.join(__dirname,'acl-contract.ps1')],{encoding:'utf8',timeout:15000,maxBuffer:1024*1024})
- assert.ifError(result.error);assert.equal(result.status,0,result.stdout+result.stderr);assert.equal(result.stderr,'');assert.match(result.stdout,/^actual-compiled-acl-parser-contracts:48\r?\n$/)
+ assert.ifError(result.error);assert.equal(result.status,0,result.stdout+result.stderr);assert.equal(result.stderr,'');assert.match(result.stdout,/^actual-compiled-acl-parser-contracts:79\r?\n$/)
 })
 const fs=require('node:fs'),os=require('node:os'),crypto=require('node:crypto')
 const repo=path.resolve(__dirname,'../../..'),workflow=path.join(repo,'agents/codex/workflow')
