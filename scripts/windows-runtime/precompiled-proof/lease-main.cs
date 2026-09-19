@@ -151,14 +151,21 @@ public static class BundleAclProbe {
     string wanted=(flags&4)!=0?expected.Substring(2):NativePath(expected);
     return "f"+flags.ToString(CultureInfo.InvariantCulture)+",len="+length.ToString(CultureInfo.InvariantCulture)+",error="+(length==0?((uint)error).ToString(CultureInfo.InvariantCulture):"0")+",kind="+kind+",equal="+(valid&&String.Equals(value,wanted,StringComparison.OrdinalIgnoreCase)?"1":"0")+",exact="+(valid&&String.Equals(value,wanted,StringComparison.Ordinal)?"1":"0");
   }
+  // CI30 native x64/ARM64 evidence: DOS queries (0/8) fail error5 inside the
+  // AppContainer, while normalized volume-relative query4 exactly matches.
+  // Volume and file ID remain separately bound to the parent's NTFS identity.
+  const uint NormalizedVolumePath=4; // FILE_NAME_NORMALIZED | VOLUME_NAME_NONE
+  static bool MatchesNormalizedPath(uint length,string value,string expected) {
+    return length>0&&length<32768&&String.Equals(value,expected.Substring(2),StringComparison.OrdinalIgnoreCase);
+  }
   static string Read(IntPtr handle,string expectedPath) {
     Info info=new Info();Need(GetFileType(handle)==1&&GetFileInformationByHandle(handle,out info),"acl-directory-query");
     Need((info.Attr&0x400)==0&&(info.Attr&0x10)!=0,"acl-physical-directory");
-    var path=new StringBuilder(32768);uint length=GetFinalPathNameByHandleW(handle,path,(uint)path.Capacity,0);int error=Marshal.GetLastWin32Error();
-    if(!(length>0&&length<path.Capacity&&String.Equals(path.ToString(),"\\\\?\\"+expectedPath,StringComparison.OrdinalIgnoreCase))) {
+    var path=new StringBuilder(32768);uint length=GetFinalPathNameByHandleW(handle,path,(uint)path.Capacity,NormalizedVolumePath);int error=Marshal.GetLastWin32Error();
+    if(!MatchesNormalizedPath(length,path.ToString(),expectedPath)) {
       // Observation only: no alternative query can authorize this failed check.
-      string detail=PathObservation(0,length,error,path.ToString(),expectedPath);
-      foreach(uint flags in new uint[]{4,8,12}) { var other=new StringBuilder(32768);uint count=GetFinalPathNameByHandleW(handle,other,(uint)other.Capacity,flags);int last=Marshal.GetLastWin32Error();detail+=";"+PathObservation(flags,count,last,other.ToString(),expectedPath); }
+      string detail=PathObservation(NormalizedVolumePath,length,error,path.ToString(),expectedPath);
+      foreach(uint flags in new uint[]{0,8,12}) { var other=new StringBuilder(32768);uint count=GetFinalPathNameByHandleW(handle,other,(uint)other.Capacity,flags);int last=Marshal.GetLastWin32Error();detail+=";"+PathObservation(flags,count,last,other.ToString(),expectedPath); }
       throw new Refusal("acl-canonical-directory:"+detail);
     }
     return info.Volume.ToString("x8",CultureInfo.InvariantCulture)+":"+info.IdHigh.ToString("x8",CultureInfo.InvariantCulture)+info.IdLow.ToString("x8",CultureInfo.InvariantCulture);
