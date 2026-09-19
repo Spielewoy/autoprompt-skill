@@ -422,8 +422,18 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          $controller = (Get-Command node -CommandType Application).Source
-          $digest = (Get-FileHash -LiteralPath $controller -Algorithm SHA256).Hash.ToLowerInvariant()
+          node --test scripts/windows-msys/portable-consumer/controller-selection.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # BEGIN exact running Node identity
+          $controllerOutput = @(& node -p 'process.execPath' 2>&1)
+          $controllerStatus = $LASTEXITCODE
+          if ($controllerStatus -ne 0 -or $controllerOutput.Count -ne 1 -or $controllerOutput[0] -isnot [string]) { throw 'Cannot determine one running Node executable' }
+          $controller = [string]$controllerOutput[0]
+          if ($controller.Length -eq 0 -or $controller.Length -gt 32767 -or $controller -match '[\r\n\x00]' -or -not [IO.Path]::IsPathRooted($controller) -or -not (Test-Path -LiteralPath $controller -PathType Leaf)) { throw 'Invalid running Node executable path' }
+          $controllerHashes = @(Get-FileHash -LiteralPath $controller -Algorithm SHA256 -ErrorAction Stop)
+          if ($controllerHashes.Count -ne 1 -or $controllerHashes[0].Hash -notmatch '^[A-Fa-f0-9]{64}$') { throw 'Cannot bind one running Node executable hash' }
+          $digest = ([string]$controllerHashes[0].Hash).ToLowerInvariant()
+          # END exact running Node identity
           $consumerLog = Join-Path $env:RUNNER_TEMP 'msys-portable-consumer-console.log'
           New-Item -ItemType File -Path $consumerLog -ErrorAction Stop | Out-Null
           python scripts/windows-msys/portable-consumer/run.py --repo $PWD.Path --output (Join-Path $env:RUNNER_TEMP 'msys-portable-consumer') --controller $controller --controller-sha256 $digest --helper-directory (Join-Path $env:RUNNER_TEMP 'precompiled-capture') --artifact-timeout 2400 2>&1 | Tee-Object -FilePath $consumerLog
