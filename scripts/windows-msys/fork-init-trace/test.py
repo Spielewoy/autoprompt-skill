@@ -54,10 +54,22 @@ int main(){
   env=__import__('os').environ.copy();env['AP_TRACE_NATIVE']=str(root/'native.cs');env['AP_TRACE_CONTROLLER']=str(root/'controller.cs')
   subprocess.run([str(a.pwsh),'-NoLogo','-NoProfile','-NonInteractive','-Command','Add-Type -Path @($env:AP_TRACE_NATIVE,$env:AP_TRACE_CONTROLLER) -ErrorAction Stop; "complete derived controller compiled"'],env=env,check=True,timeout=60)
  if a.source:
-  generated=root/'generated';generate['generate'](a.source,HERE.parent/'pipe-security.patch',generated)
+  # The producer generates diagnostics from its already-adapted compiler tree.
+  # Reproduce the complete base-patch sequence from a pristine source fixture.
+  patch=HERE.parent/'pipe-security.patch';assert sha(patch.read_bytes())==generate['PATCH']
+  adapted=root/'adapted-source';shutil.copytree(a.source,adapted)
+  subprocess.run(['git','apply','--check',str(patch)],cwd=adapted,check=True,timeout=30)
+  subprocess.run(['git','apply',str(patch)],cwd=adapted,check=True,timeout=30)
+  try:generate['generate'](a.source,patch,root/'pristine-output')
+  except ValueError as error:assert str(error)=='Pinned source identity: winsup/cygwin/autoload.cc',str(error)
+  else:raise AssertionError('Pristine source accepted as adapted compiler source')
+  assert not (root/'pristine-output').exists()
+  generated=root/'generated';generate['generate'](adapted,patch,generated)
+  repeated=root/'repeated';generate['generate'](adapted,patch,repeated)
+  for name in ['trace.patch','trace-manifest.json']:assert (generated/name).read_bytes()==(repeated/name).read_bytes(),name
   check=root/'source';check.mkdir();pins=json.loads((HERE/'source-pins.json').read_text())
   for rel in pins:
-   dest=check/rel;dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(a.source/rel,dest)
+   dest=check/rel;dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(adapted/rel,dest)
   subprocess.run(['git','apply','--check',str(generated/'trace.patch')],cwd=check,check=True)
   subprocess.run(['git','apply',str(generated/'trace.patch')],cwd=check,check=True)
   stages=[]
@@ -68,13 +80,13 @@ int main(){
     text=text.replace(generate['CTOR_TRACE'],generate['CTOR_ORIGINAL'])
    cleaned=''.join(line for line in text.splitlines(True) if not line.strip().startswith('autoprompt_fork_trace::emit') and line!='#include "autoprompt-fork-trace.h"\n')
    at=cleaned.rfind('#include "ntdll.h"\n');cleaned=cleaned[:at]+cleaned[at+len('#include "ntdll.h"\n'):]
-   assert cleaned==(a.source/rel).read_text(),rel
+   assert cleaned==(adapted/rel).read_text(),rel
   assert len(stages)==55 and len(set(stages))==55
   bad=root/'bad.patch';bad.write_bytes(b'wrong patch')
-  try:generate['generate'](a.source,bad,root/'bad-output')
+  try:generate['generate'](adapted,bad,root/'bad-output')
   except ValueError:pass
   else:raise AssertionError('Wrong base authority accepted')
-  print('55 unique stage insertions plus bounded constructor pre/post observations preserve all six original source files byte-for-byte')
+  print('Full base-patch composition verified; pristine source refused; 55 unique stage insertions plus bounded constructor pre/post observations preserve all six adapted source files byte-for-byte')
  if a.windows_cxx:
   prefix=(HERE/'test.cc').read_text().split('static int fail=')[0]
   prefix+='extern "C" int NtQueryObject(HANDLE,int,OBJECT_BASIC_INFORMATION*,unsigned,void*);\nextern "C" int NtQueryInformationFile(HANDLE,IO_STATUS_BLOCK*,void*,unsigned,int);\nextern "C" int NtWriteFile(HANDLE,void*,void*,void*,IO_STATUS_BLOCK*,char*,unsigned,void*,void*);\n'

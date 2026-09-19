@@ -6,13 +6,16 @@ fork children still failed initialization with 0xC0000142. The trace introduces
 no speculative behavior fix. A successful traced child would not prove that
 the uninstrumented candidate is correct.
 
-`generate.py SOURCE BASE_PATCH NEW_OUTPUT` binds six exact source files and
-the reviewed base patch, then generates an independent trace patch/manifest.
+`generate.py SOURCE BASE_PATCH NEW_OUTPUT` takes the normal compiler source tree
+after the reviewed base patch has been applied. It binds six exact adapted
+source files and that base patch, then generates an independent trace patch/manifest.
 The recipe additionally verifies the full source archive hash. The only
 original-source changes are inserted includes and finite stage calls. The
 constructor loop gains a compound body solely to bracket its original call;
 its condition, call count and reverse order are unchanged. The source generator never writes its
-inputs. `source-pins.json` refers to source commit 270ba2980700e6e2a0813944d506eecea0f86402.
+inputs. `source-pins.json` refers to source commit
+270ba2980700e6e2a0813944d506eecea0f86402 plus the exact base patch. In particular,
+`autoload.cc` includes the base patch's added thunks; its pristine hash is refused.
 
 `trace.h` scans the native Windows environment (bounded 32768 WCHARs) for an
 explicit 16-digit hexadecimal handle locator. Only the separate diagnostic launcher creates
@@ -106,7 +109,11 @@ export, consumer, import or production admission path.
 executes 17 simulated NT transport contracts. These are not Windows semantics.
 The complete derived C# launcher compiles using local PowerShell/Roslyn. A
 source-stripping check verifies original bytes across all six instrumented
-files. Independent native_ci_audit review found no current source blocker.
+files. CI32 produced no trace artifact: the added `autoload.cc` pin described
+pristine source although the compiler tree already contained the base patch.
+Reproducing that exact sequence fails before the output directory is created.
+The corrected pin and full base-patch composition regression address this
+setup error; the expanded trace still requires actual Windows compilation and execution.
 
 CI28 run35457714006 compiled and executed the original trace, confirmed the
 owned drain and preserved original candidate/SDK hashes. All four failed fork
@@ -159,13 +166,16 @@ again after execution, and the manifest always carries `accepted: false`.
 Local checks:
 
 ```
-python scripts/windows-msys/fork-init-trace/test.py --source PINNED_EXTRACTED_SOURCE --pwsh PWSH
+python scripts/windows-msys/fork-init-trace/test.py --source PINNED_PRISTINE_SOURCE --pwsh PWSH
 node --test scripts/windows-msys/fork-init-trace/parser.test.cjs
 ```
 
-The Python test compiles and runs 17 transport seams, verifies the closed NT call
+The Python test copies the pristine source and applies the complete exact base
+patch before generating and applying the trace patch. It also verifies direct
+generation from pristine source is refused before output is created. It compiles
+and runs 17 transport seams, verifies the closed NT call
 set, source drift refusal, CRLF derivation, all55 fixed stage insertions,
-original source preservation, compiled constructor call-order/count/exception
+adapted source preservation, compiled constructor call-order/count/exception
 contracts, actual full derived C# compilation and shell syntax.
 The Node suite checks strict bounded stage/drain parsing and actual dependency
 composition plus strict DLL-map/malformed-COFF cases. None of
