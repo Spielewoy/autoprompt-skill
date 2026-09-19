@@ -52,7 +52,7 @@ public static class WindowsAppContainerResourcesNative {
     out uint serial, out uint maxComponent, out uint flags, System.Text.StringBuilder fsName, uint fsNameSize);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern uint QueryDosDevice(string device, System.Text.StringBuilder target, uint targetSize);
 
-  public sealed class Refusal : Exception { public readonly string Code; public Refusal(string code) : base(code) { Code = code; } }
+  public sealed class Refusal : Exception { public readonly string Code; public Refusal(string code) : base(code) { Code = code; } public Refusal(string code, Exception inner) : base(code,inner) { Code = code; } }
   sealed class Snapshot {
     public uint Volume, Attributes, Links, SizeHigh, SizeLow, IndexHigh, IndexLow; public long LastWrite, Creation;
     public long Size { get { return ((long)SizeHigh << 32) | SizeLow; } }
@@ -416,7 +416,7 @@ public static class WindowsAppContainerResourcesNative {
     Opened volume=Volume(forest,volumeHint.path);Need(identity.Substring(0,8)==volume.Snapshot.Volume.ToString("x8"),"PREIMAGE_UNSAFE");
     var id=new FILE_ID_DESCRIPTOR{Size=(uint)Marshal.SizeOf(typeof(FILE_ID_DESCRIPTOR)),Type=0,Low=Convert.ToUInt64(identity.Substring(9),16),High=0};
     IntPtr handle=OpenFileById(volume.Handle,ref id,0x001e0081,7,IntPtr.Zero,0x02200000);
-    if(handle==IntPtr.Zero || handle==new IntPtr(-1)){Need(Marshal.GetLastWin32Error()==2,"WINDOWS_ACL_IDENTITY_UNAVAILABLE");return null;}
+    if(handle==IntPtr.Zero || handle==new IntPtr(-1)){int error=Marshal.GetLastWin32Error();if(error!=2){var refusal=new Refusal("WINDOWS_ACL_IDENTITY_UNAVAILABLE",new System.ComponentModel.Win32Exception(error));refusal.Data["resourceIdentity"]=identity;refusal.Data["resourceCreation"]=creation;throw refusal;}return null;}
     try{Snapshot snapshot=Info(handle,true);Need(snapshot.Id==identity && snapshot.Creation.ToString()==creation,"WINDOWS_ACL_IDENTITY_MISMATCH");var item=new Opened{Handle=handle,Snapshot=snapshot,Directory=(snapshot.Attributes&FILE_ATTRIBUTE_DIRECTORY)!=0};forest.handles.Add(item);return item;}catch{CloseHandle(handle);throw;}
   }
   public static Dictionary<string,object> Restore(ResourcePlan plan) {
