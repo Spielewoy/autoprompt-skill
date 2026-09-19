@@ -95,8 +95,9 @@ for (const platform of ['darwin', 'win32']) test(`${platform} runtime-state hash
     `Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)} })`,
     `const fs=require('node:fs'), r=require(${JSON.stringify(runtimePath)})`,
     `const target=${JSON.stringify(target)}`,
-    "const shim=Object.create(fs), s=fs.lstatSync(target), root={type:'directory',path:'',stat:{dev:String(s.dev),ino:String(s.ino),mode:s.mode,nlink:s.nlink,size:s.size,mtimeNs:'0',ctimeNs:'0'}}; shim.darwinCapture={captureFile:()=>({hash:'a'.repeat(64),bytes:0,entries:[]}),captureTree:(value)=>{if(value!==target)throw Error('wrong path');return {hash:'b'.repeat(64),bytes:0,entries:[root]}}}",
+    "const shim=Object.create(fs), s=fs.lstatSync(target,{bigint:process.platform==='win32'}), root={type:'directory',path:'',stat:{dev:String(s.dev),ino:String(s.ino),mode:Number(s.mode),nlink:Number(s.nlink),size:Number(s.size),mtimeNs:'0',ctimeNs:'0'}}; shim.darwinCapture={captureFile:()=>({hash:'a'.repeat(64),bytes:0,entries:[]}),captureTree:(value)=>{if(value!==target)throw Error('wrong path');return {hash:'b'.repeat(64),bytes:0,entries:[root]}}}",
     "if(r.hashFileStrict(target,shim)!=='a'.repeat(64)||r.hashDirectoryStateStrict(target,shim)!=='b'.repeat(64))process.exit(2)",
+    "root.stat.ino=String(BigInt(root.stat.ino)+1n);try{r.hashDirectoryStateStrict(target,shim);process.exit(5)}catch(error){if(error.code!=='PREIMAGE_UNSAFE')process.exit(6)}",
     "shim.darwinCapture.captureTree=()=>({hash:'bad',bytes:0,entries:[]});try{r.hashDirectoryStateStrict(target,shim);process.exit(3)}catch(error){if(error.code!=='PREIMAGE_UNSAFE')process.exit(4)}",
   ].join(';').replaceAll('darwinCapture', platform === 'darwin' ? 'darwinCapture' : 'windowsCapture')
   const result = childProcess.spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', timeout: 10000 })

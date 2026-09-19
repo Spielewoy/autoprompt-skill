@@ -120,6 +120,7 @@ def derive():
    old="let gitDenied=false;try{fs.writeFileSync(path.join(f.target,'.git','guard'),'bad')}catch(e){gitDenied=['EACCES','EPERM'].includes(e.code)}need(gitDenied);"
    new="let gitDenied=false,gitOutcome='WRITE_SUCCEEDED';try{fs.writeFileSync(path.join(f.target,'.git','guard'),'bad')}catch(e){gitOutcome=/^[A-Z][A-Z0-9_]{0,39}$/.test(String(e.code))?e.code:'OTHER_ERRNO';gitDenied=['EACCES','EPERM'].includes(e.code)}if(!gitDenied){const error=Error('PROBE');error.code='GIT_'+gitOutcome;throw error};"
    text=once(text,old,new)
+   text=once(text,"need(aclExit!==0);need(/Access is denied/i.test(fs.readFileSync(path.join(f.scratch,'acl-result.txt'),'utf8')));","const aclText=fs.readFileSync(path.join(f.scratch,'acl-result.txt'),'utf8').slice(0,1024);if(!Number.isInteger(aclExit)||aclExit<=0||!/Access is denied/i.test(aclText)){const error=Error('PROBE');error.code=aclExit===0?'ACL_WRITE_SUCCEEDED':'ACL_DENIAL_NOT_CONFIRMED';process.stderr.write('APPCONTAINER_ACL_OBSERVATION:'+JSON.stringify({exit:aclExit,text:aclText})+';');throw error};")
    marker="    if (result.status !== 'completed'"
    text=once(text,marker,"    try { probeFailure.gitGuard = fs.readFileSync(path.join(target, '.git', 'guard'), 'utf8') === 'controller git' ? 'UNCHANGED' : 'CHANGED' } catch { probeFailure.gitGuard = 'UNREADABLE' }\n"+marker)
   for sibling in ['safe-run-root.js','windows-appcontainer.js','windows-appcontainer-resources.js','windows-helper-deployment.js']:

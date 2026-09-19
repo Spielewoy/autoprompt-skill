@@ -34,3 +34,16 @@ test('private NUL capability verifies bounded native identity and preserves the 
   assert.deepEqual(proof, { contractCases: 79, nativeApiBoundaries: 3 })
   t.diagnostic(`${proof.contractCases} actual-source adversarial contracts; native API results are mocked, not Windows execution`)
 })
+
+test('AppContainer profile environment uses the known folder without relaxing caller protocol bounds', { timeout: 90000 }, t => {
+  const powershell = process.platform === 'win32' ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : (process.env.AUTOPROMPT_TEST_PWSH || 'pwsh')
+  const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop";Add-Type -Path @($env:AUTOPROMPT_PROFILE_NATIVE,$env:AUTOPROMPT_PROFILE_CONTRACT);[ProfileEnvironmentContract]::Run()'], {
+    encoding: 'utf8', timeout: 60000, windowsHide: true,
+    env: { ...process.env, AUTOPROMPT_PROFILE_NATIVE: path.resolve(__dirname, '../../agents/codex/workflow/windows-appcontainer-native.cs'), AUTOPROMPT_PROFILE_CONTRACT: path.resolve(__dirname, '../fixtures/windows-appcontainer/profile-environment-contract.cs') },
+  })
+  if (result.error?.code === 'ENOENT' && process.platform !== 'win32') { t.skip('PowerShell is unavailable'); return }
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.equal(result.stderr, '')
+  assert.deepEqual(JSON.parse(result.stdout), { contractCases: 28, knownFolderApi: true, nativeLaunch: false })
+})

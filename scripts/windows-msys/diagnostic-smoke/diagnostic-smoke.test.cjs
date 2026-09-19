@@ -39,6 +39,15 @@ test('Git-write observation separates an actual write from other errors without 
   if(accepted)assert.doesNotThrow(()=>run(fake,path,{target:'/fixture'}));else assert.throws(()=>run(fake,path,{target:'/fixture'}),{code:'GIT_'+(outcome==='bad error text'?'OTHER_ERRNO':outcome)})
  }
 })
+test('ACL observation distinguishes successful mutation from an unconfirmed denial',()=>{
+ const text=fs.readFileSync(path.join(__dirname,'probe.cjs'),'utf8'),start=text.indexOf('const aclText='),end=text.indexOf("phase='descendant'",start),body=text.slice(start,end)
+ const run=new Function('aclExit','fs','path','f','process',body)
+ for(const [exit,output,code]of [[5,'Access is denied.',null],[1,'Access is denied.',null],[0,'Successfully processed 1 files','ACL_WRITE_SUCCEEDED'],[0,'Access is denied.','ACL_WRITE_SUCCEEDED'],[1,'Invalid parameter','ACL_DENIAL_NOT_CONFIRMED'],[null,'Access is denied.','ACL_DENIAL_NOT_CONFIRMED'],[-1,'Access is denied.','ACL_DENIAL_NOT_CONFIRMED'],[5,'x'.repeat(2048),'ACL_DENIAL_NOT_CONFIRMED']]){
+  let stderr='';const invoke=()=>run(exit,{readFileSync(){return output}},path,{scratch:'/fixture'},{stderr:{write(value){stderr+=value}}})
+  if(code){assert.throws(invoke,{code});assert.ok(stderr.startsWith('APPCONTAINER_ACL_OBSERVATION:'));const observation=JSON.parse(stderr.slice('APPCONTAINER_ACL_OBSERVATION:'.length,-1));assert.deepEqual(observation,{exit,text:output.slice(0,1024)})}
+  else{assert.doesNotThrow(invoke);assert.equal(stderr,'')}
+ }
+})
 test('diagnostic closes its real IPv4 listener when the IPv6 listener cannot start',async t=>{
  const vm=require('node:vm'),net=require('node:net'),{createRequire}=require('node:module'),servers=[],closed=[]
  t.after(()=>{for(const server of servers)server.close()})

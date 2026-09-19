@@ -232,11 +232,14 @@ public static class WindowsAppContainerNative {
   foreach(String entry in entries){Int32 at=entry==null?-1:entry.IndexOf('=');if(at>0&&String.Equals(entry.Substring(0,at),PrivateNullEnvironmentName,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("WINDOWS_NULL_CAPABILITY_RESERVED");}
   return entries.Concat(new[]{PrivateNullEnvironmentName+"="+handle.ToInt64().ToString(IntPtr.Size==8?"x16":"x8",System.Globalization.CultureInfo.InvariantCulture)}).ToArray();
  }
- static IntPtr EnvironmentBlock(String[] entries) {
-  if(entries==null||entries.Length>65)throw new InvalidOperationException("WINDOWS_ENVIRONMENT_INVALID");
+ static void ValidateEnvironmentEntries(String[] entries,Int32 maximum) {
+  if(entries==null||entries.Length>maximum)throw new InvalidOperationException("WINDOWS_ENVIRONMENT_INVALID");
   var seen=new HashSet<String>(StringComparer.OrdinalIgnoreCase);Int32 length=0;
   foreach(String entry in entries){Int32 at=entry==null?-1:entry.IndexOf('=');if(at<=0||entry.IndexOf('\0')>=0||!seen.Add(entry.Substring(0,at)))throw new InvalidOperationException("WINDOWS_ENVIRONMENT_INVALID");length+=entry.Length+1;}
   if(length>32760||!seen.Contains("SystemRoot"))throw new InvalidOperationException("WINDOWS_ENVIRONMENT_INVALID");
+ }
+ static IntPtr EnvironmentBlock(String[] entries) {
+  ValidateEnvironmentEntries(entries,65);
   return Marshal.StringToHGlobalUni(String.Join("\0",entries.OrderBy(x=>x,StringComparer.OrdinalIgnoreCase))+"\0\0");
  }
  static Boolean ReadOutput(IntPtr pipe,MemoryStream output,ref Int32 total,Int32 bound) {
@@ -244,15 +247,18 @@ public static class WindowsAppContainerNative {
    UInt32 count=Math.Min(available,4096u);byte[] bytes=new byte[count];UInt32 read;if(!ReadFile(pipe,bytes,count,out read,IntPtr.Zero)){if(Marshal.GetLastWin32Error()==ERROR_BROKEN_PIPE)return true;throw new Win32Exception(Marshal.GetLastWin32Error(),"ReadFile");}if(total+(long)read>bound)return false;output.Write(bytes,0,(int)read);total+=(int)read;
   }
  }
- // CreateProcess resolves an AppContainer profile from the caller's
- // LOCALAPPDATA. Resolve the Windows known folder instead of trusting an
- // ambient value. The production helper is private to one Launch; repeated
- // fixture launches resolve the same stable controller-user known folder.
- // This host API prerequisite is never added to the explicit child block.
- static void PrepareControllerProfileEnvironment(){
+ // CreateProcess requires LOCALAPPDATA in both the controller and explicit
+ // child environment. Resolve the controller user's known folder instead of
+ // trusting ambient or caller-provided values. This adds no filesystem grant.
+ static String[] PrepareControllerProfileEnvironment(String[] entries){
+  ValidateEnvironmentEntries(entries,64);
+  foreach(String entry in entries)if(String.Equals(entry.Substring(0,entry.IndexOf('=')),PrivateNullEnvironmentName,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("WINDOWS_NULL_CAPABILITY_RESERVED");
   String local=Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
   if(String.IsNullOrEmpty(local)||local.Length>32700||!Path.IsPathRooted(local)||!String.Equals(Path.GetFullPath(local),local,StringComparison.OrdinalIgnoreCase)||!Directory.Exists(local))throw new InvalidOperationException("WINDOWS_CONTROLLER_PROFILE_UNAVAILABLE");
+  String[] result=entries.Where(entry=>!String.Equals(entry.Substring(0,entry.IndexOf('=')),"LOCALAPPDATA",StringComparison.OrdinalIgnoreCase)).Concat(new[]{"LOCALAPPDATA="+local}).ToArray();
+  ValidateEnvironmentEntries(result,64);
   Environment.SetEnvironmentVariable("LOCALAPPDATA",local,EnvironmentVariableTarget.Process);
+  return result;
  }
  // Called only by the controller after validating its private deployment and
  // resource grants. No caller handles, network capabilities, or breakaway flag
@@ -263,7 +269,7 @@ public static class WindowsAppContainerNative {
  public static LaunchResult Launch(String executable,String executableSha256,String[] arguments,String cwd,String[] environmentEntries,Int32 timeoutMs,Int32 outputLimit,IntPtr appSid,String expectedSid,String cancellationPath,MsysNamespaceRequest msysRuntime) {
   lock(undrainedNamespaces){if(undrainedNamespaces.Count!=0)throw new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED");}
   if(arguments==null||arguments.Length>256||arguments.Any(x=>x==null||x.IndexOf('\0')>=0)||timeoutMs<1||timeoutMs>300000||outputLimit<1||outputLimit>1048576||Sid(appSid)!=expectedSid)throw new InvalidOperationException("WINDOWS_LAUNCH_INVALID");
-  PrepareControllerProfileEnvironment();
+  environmentEntries=PrepareControllerProfileEnvironment(environmentEntries);
   var command=new StringBuilder(String.Join(" ",(new[]{executable}).Concat(arguments).Select(Quote)));if(command.Length>32760)throw new InvalidOperationException("WINDOWS_COMMAND_LIMIT");
   IntPtr size=IntPtr.Zero,list=IntPtr.Zero,caps=IntPtr.Zero,job=IntPtr.Zero,limit=IntPtr.Zero,environment=IntPtr.Zero,stdoutRead=IntPtr.Zero,stdoutWrite=IntPtr.Zero,stderrRead=IntPtr.Zero,stderrWrite=IntPtr.Zero,nulRead=IntPtr.Zero,privateNull=IntPtr.Zero,handleList=IntPtr.Zero;PROCESS_INFORMATION pi=new PROCESS_INFORMATION();Boolean assigned=false,confirmedDrain=true;ImageBinding imageBinding=null;MsysNamespaceLease namespaceLease=null;
   try {
