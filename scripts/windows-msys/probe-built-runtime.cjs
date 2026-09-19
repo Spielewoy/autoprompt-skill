@@ -7,7 +7,7 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const cp = require('node:child_process')
 const assert = require('node:assert/strict')
-const { bindBashRuntime, resolveWindowsBash } = require('../../agents/codex/workflow/windows-appcontainer-command.js')
+const { bindBashRuntime, resolveWindowsBash } = require('./diagnostic-smoke/command.cjs')
 const { ensureWindowsPrivateAcl } = require('../../agents/codex/workflow/safe-run-root.js')
 const TEST_NAME = 'native Windows Bash copied closure permits scratch writes and denies candidate writes and controller reads'
 const MAX_FILE = 32 * 1024 * 1024
@@ -136,7 +136,9 @@ function main(workArgument) {
     const expected = sourceRecords.map(record => record.name === 'msys-2.0.dll' ? { name: record.name, sha256: stageSha, bytes: stageBytes.length } : record)
     assert.deepEqual(closureRecords(bindBashRuntime(fresh, systemRoot)), expected, 'Copied built runtime closure differs from captured inputs')
     const bashPath = path.join(fresh, 'bash.exe')
-    const selected = resolveWindowsBash({ bashPath, env: { SystemRoot: systemRoot, PATH: fresh, AUTOPROMPT_WINDOWS_BASH: bashPath } })
+    const diagnostic = require('./diagnostic-smoke/binding.cjs')
+    const context = { schema:1, purpose:'compiler-output-smoke-not-runtime-acceptance', node:{architecture:process.arch,sha256:sha256(readBounded(process.execPath,128*1024*1024)),kind:'compiler-controller'}, bash:{path:bashPath,files:expected} }
+    const selected = resolveWindowsBash({ diagnosticTuple:context })
     assert.ok(samePath(selected.bash.path, bashPath), 'Bash resolver fell back instead of selecting the built runtime')
     assert.deepEqual(closureRecords(selected.files), expected, 'Resolved closure differs from the fresh built runtime')
     const manifest = { schema: 1, purpose: 'prototype compiler-output smoke proof; not full platform certification', sdkCommit: lock.sdk.commit,
@@ -144,13 +146,11 @@ function main(workArgument) {
     fs.writeFileSync(path.join(payload, 'built-runtime-manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { flag: 'wx', mode: 0o600 })
     note(`Built runtime bound: ${bashPath}`)
     note(`Staged DLL SHA256: ${stageSha}`)
-    // Override only this child; inherited duplicate-cased keys are removed so
-    // Windows cannot select an ambient value instead of the explicit path.
-    const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !['AUTOPROMPT_WINDOWS_BASH', 'NODE_OPTIONS', 'NODE_TEST_CONTEXT'].includes(key.toUpperCase())))
-    environment.AUTOPROMPT_WINDOWS_BASH = bashPath
-    const pattern = `^${TEST_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`
-    const result = cp.spawnSync(process.execPath, ['--test', '--test-reporter=tap', '--test-name-pattern', pattern,
-      path.resolve(__dirname, '../../tests/source/windows-bash-runtime.test.cjs')], {
+    // Diagnostic selection is an exact parent-written context, never a production environment override.
+    const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !['AUTOPROMPT_WINDOWS_BASH','NODE_OPTIONS','NODE_PATH','NODE_TEST_CONTEXT'].includes(key.toUpperCase())))
+    const contextBytes = diagnostic.canonical(context), contextPath = path.join(fresh,'diagnostic-context.json')
+    fs.writeFileSync(contextPath,contextBytes,{flag:'wx',mode:0o400})
+    const result = cp.spawnSync(process.execPath, ['--test-reporter=tap',path.resolve(__dirname,'diagnostic-smoke/native.cjs'),contextPath,sha256(contextBytes)], {
       cwd: path.resolve(__dirname, '../..'), env: environment, encoding: 'utf8', timeout: 615000,
       maxBuffer: 8 * 1024 * 1024, windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'],
     })

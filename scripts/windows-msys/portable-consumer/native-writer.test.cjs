@@ -1,6 +1,6 @@
 'use strict'
 const test=require('node:test'),assert=require('node:assert/strict'),crypto=require('node:crypto'),cp=require('node:child_process'),path=require('node:path')
-const {manifest,validName}=require('./native-writer.cjs')
+const {manifest,validName,failure}=require('./native-writer.cjs')
 const hash=bytes=>crypto.createHash('sha256').update(bytes).digest('hex')
 const good=()=>({schema:1,files:[{path:'packet/runtime/bash.exe',bytes:3,sha256:hash('abc')}]})
 const bytes=x=>Buffer.from(JSON.stringify(x)+'\n')
@@ -12,5 +12,13 @@ test('writer refuses path aliases special devices and noncanonical frames',()=>{
 })
 test('native writer refuses this non-Windows host instead of claiming private Windows materialization',{skip:process.platform==='win32'},()=>{
  const r=cp.spawnSync(process.execPath,[path.join(__dirname,'native-writer.cjs')],{encoding:'utf8',timeout:5000,env:{}})
- assert.equal(r.status,1);assert.equal(r.stdout,'');assert.equal(r.stderr,'Native candidate writer refused\n')
+ assert.equal(r.status,1);assert.equal(r.stdout,'');assert.deepEqual(JSON.parse(r.stderr),{status:'native-candidate-writer-refused',stage:'startup',code:'ERR_ASSERTION',helperPhase:null,exitStatus:null})
+})
+
+test('writer failure retains only fixed phases codes and bounded helper status',()=>{
+ const value=failure({code:'PRIVACY_UNSUPPORTED',message:'secret-url',details:{helperPhase:'compiling',status:1,stderr:'secret-token'}},'private-acl')
+ assert.deepEqual(value,{status:'native-candidate-writer-refused',stage:'private-acl',code:'PRIVACY_UNSUPPORTED',helperPhase:'compiling',exitStatus:1})
+ for(const error of [null,new Error('secret'),{code:'secret',details:{helperPhase:'secret',status:'secret'}},{details:{status:Infinity}},{details:{status:4294967296}}]) {
+  const result=failure(error,'secret');assert.equal(result.stage,'startup');assert.equal(result.code,'UNCLASSIFIED');assert.equal(result.helperPhase,null);assert.equal(result.exitStatus,null);assert.ok(!JSON.stringify(result).includes('secret'))
+ }
 })

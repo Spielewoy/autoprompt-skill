@@ -400,9 +400,10 @@ jobs:
           python3 scripts/windows-msys/anonymous-proof/run.py
           python3 scripts/windows-msys/null-proof/run.py
           python3 scripts/windows-msys/token-default-proof/run.py
+          python3 scripts/windows-msys/loader-lock-proof/run.py
           node --test scripts/windows-msys/process-security-proof/parser.test.cjs
           node --test scripts/windows-msys/portable-runtime/portable.test.cjs scripts/windows-msys/portable-runtime/cli.test.cjs scripts/windows-msys/portable-runtime/producer-context.test.cjs
-          node --test scripts/windows-msys/portable-probe/*.test.cjs scripts/windows-msys/portable-consumer/native-writer.test.cjs
+          node --test scripts/windows-msys/portable-probe/*.test.cjs scripts/windows-msys/portable-consumer/native-writer.test.cjs scripts/windows-msys/diagnostic-smoke/diagnostic-smoke.test.cjs
           python3 -m unittest discover -s scripts/windows-msys/portable-consumer -p 'test_*.py' -v
       - name: Detect changes for native ARM64 candidate reuse
         id: msys-portable-input
@@ -423,8 +424,11 @@ jobs:
         run: |
           $controller = (Get-Command node -CommandType Application).Source
           $digest = (Get-FileHash -LiteralPath $controller -Algorithm SHA256).Hash.ToLowerInvariant()
-          python scripts/windows-msys/portable-consumer/run.py --repo $PWD.Path --output (Join-Path $env:RUNNER_TEMP 'msys-portable-consumer') --controller $controller --controller-sha256 $digest --helper-directory (Join-Path $env:RUNNER_TEMP 'precompiled-capture') --artifact-timeout 2400
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $consumerLog = Join-Path $env:RUNNER_TEMP 'msys-portable-consumer-console.log'
+          New-Item -ItemType File -Path $consumerLog -ErrorAction Stop | Out-Null
+          python scripts/windows-msys/portable-consumer/run.py --repo $PWD.Path --output (Join-Path $env:RUNNER_TEMP 'msys-portable-consumer') --controller $controller --controller-sha256 $digest --helper-directory (Join-Path $env:RUNNER_TEMP 'precompiled-capture') --artifact-timeout 2400 2>&1 | Tee-Object -FilePath $consumerLog
+          $consumerStatus = $LASTEXITCODE
+          if ($consumerStatus -ne 0) { exit $consumerStatus }
       - name: Preserve fresh ARM64 candidate execution evidence
         id: msys-portable-evidence
         if: always() && steps.msys-portable-input.outputs.run == 'true'
@@ -432,7 +436,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-msys-portable-arm64-node-${{ matrix.node }}
-          path: ${{ runner.temp }}/msys-portable-consumer
+          path: |
+            ${{ runner.temp }}/msys-portable-consumer
+            ${{ runner.temp }}/msys-portable-consumer-console.log
           if-no-files-found: error
       - name: Run platform tests and reject skips of this host's native cases
         run: node tests/helpers/native-platform-ci.cjs platform

@@ -1,0 +1,8 @@
+{
+  "commit": "e27e2a1d1b8513ed6d1bc1ae2e66ee64d031bdf0",
+  "originalSha256": {
+    "command": "4ddbbc1c29cf1a0903228e32b3531880d0ffc13b9a9ea3661b04243d33e0e2b5",
+    "probe": "93733b91f55e16eea6588a8b11d2da2b898553d619716258787fc94116c4e5ef",
+    "smoke-test": "f26f11d116c59dbc8fbb1e20a304bce816d7827aef490e480bd5278700236cb9"
+  }
+}

@@ -71,7 +71,7 @@ function main(args) {
   assert.equal(sha(bound(path.join(repo, 'scripts/windows-msys/pipe-security.patch'))), expected.patchSha256)
   const lock = JSON.parse(bound(path.join(repo, 'scripts/windows-msys/build-lock.json'), 1024 * 1024))
   assert.equal(lock.source.commit, expected.sourceCommit); assert.equal(lock.sdk.commit, expected.sdkCommit)
-  const sourceDigests = { 'appcontainer_pipe.cc': expected.standaloneHelperSha256, 'appcontainer_pipe_security.h': expected.headerSha256, 'descriptor-proof.cc': expected.fixtureSha256 }
+  const sourceDigests = { 'appcontainer_pipe.cc': expected.standaloneHelperSha256, 'appcontainer_pipe_security.h': expected.headerSha256, 'appcontainer_nt_security.h': expected.ntSecuritySha256, 'descriptor-proof.cc': expected.fixtureSha256 }
   const captured = {}
   for (const [name, digest] of Object.entries(sourceDigests)) { captured[name] = bound(path.join(prepared, name)); assert.equal(sha(captured[name]), digest) }
   const toolchain = JSON.parse(bound(toolchainFile, 1024 * 1024))
@@ -111,7 +111,7 @@ function main(args) {
     run('compile-' + source, cl, ['/nologo', '/Bv', '/showIncludes', '/MT', '/EHsc', '/std:c++17', '/W4', '/D_WIN32_WINNT=0x0602', '/DWINVER=0x0602', '/DUNICODE', '/D_UNICODE', '/DNOMINMAX', '/c', path.join(artifacts, source), '/Fo' + object])
   }
   const executable = path.join(artifacts, 'descriptor-proof.exe')
-  run('link', linker, ['/NOLOGO', '/INCREMENTAL:NO', '/SUBSYSTEM:CONSOLE', '/ENTRY:wmainCRTStartup', '/MACHINE:' + toolchain.arch.toUpperCase(), '/OUT:' + executable, ...objects, 'advapi32.lib', 'kernel32.lib'])
+  run('link', linker, ['/NOLOGO', '/INCREMENTAL:NO', '/SUBSYSTEM:CONSOLE', '/ENTRY:wmainCRTStartup', '/MACHINE:' + toolchain.arch.toUpperCase(), '/OUT:' + executable, ...objects, 'advapi32.lib', 'kernel32.lib', 'ntdll.lib'])
   assert.equal(sha(bound(cl)), compilerHash); assert.equal(sha(bound(linker)), linkerHash)
   for (const [name, digest] of Object.entries(sourceDigests)) assert.equal(sha(bound(path.join(artifacts, name))), digest)
   const pe = bound(executable), offset = pe.readUInt32LE(60)

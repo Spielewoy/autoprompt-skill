@@ -51,7 +51,7 @@ test('selected smoke environment removes duplicate-cased Node preload paths and 
  const env={NODE_OPTIONS:'--require untrusted',Node_Options:'--import other',NODE_PATH:'untrusted',Node_Path:'other',
   AUTOPROMPT_WINDOWS_BASH:'ambient',Autoprompt_Windows_Bash:'other',NODE_TEST_CONTEXT:'inherited',SystemRoot:'C:\\Windows'}
  const controlled=h.smokeEnvironment(env,'C:\\private\\bash.exe')
- assert.deepEqual(controlled,{SystemRoot:'C:\\Windows',AUTOPROMPT_WINDOWS_BASH:'C:\\private\\bash.exe'})
+ assert.deepEqual(controlled,{SystemRoot:'C:\\Windows'})
  assert.equal(env.NODE_OPTIONS,'--require untrusted')
 })
 test('portable POSIX factoring preserves the original execution, cancellation and positive drain body',()=>{

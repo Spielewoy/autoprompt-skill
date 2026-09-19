@@ -2,6 +2,16 @@
 // Transport materialization only; a later importer must acquire real native leases.
 const assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto')
 const MAX_TOTAL = 320 * 1024 * 1024, MAX_FILE = 128 * 1024 * 1024, MAX_MANIFEST = 65536
+const PHASES = new Set(['startup', 'inputs', 'private-acl', 'framing', 'payload-validation', 'parent-inspection', 'file-write', 'file-verification', 'final-verification'])
+let phase = 'startup'
+function failure(error, at = phase) {
+  const codes = new Set(['ERR_ASSERTION', 'PRIVACY_UNSUPPORTED', 'PRIVACY_VIOLATION', 'RUN_RECORD_UNSAFE', 'EACCES', 'EPERM', 'ENOENT', 'EEXIST', 'ENOSPC', 'EIO', 'ETIMEDOUT'])
+  const details = error && error.details
+  return { status: 'native-candidate-writer-refused', stage: PHASES.has(at) ? at : 'startup',
+    code: codes.has(error && error.code) ? error.code : 'UNCLASSIFIED',
+    helperPhase: details && ['startup', 'compiling', 'applying'].includes(details.helperPhase) ? details.helperPhase : null,
+    exitStatus: details && Number.isSafeInteger(details.status) && details.status >= -2147483648 && details.status <= 4294967295 ? details.status : null }
+}
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 function validName(name) {
   assert.equal(typeof name, 'string'); assert.ok(name.length > 0 && name.length <= 256)
@@ -37,6 +47,7 @@ async function main(args) {
   assert.equal(process.platform, 'win32', 'Actual Windows private ACL establishment required')
   assert.equal(args.length, 4)
   const [root, repo, aclSha, controllerSha] = args
+  phase = 'inputs'
   physical(root, true); physical(repo, true); physical(process.execPath, false)
   assert.match(controllerSha, /^[a-f0-9]{64}$/); assert.equal(sha(fs.readFileSync(process.execPath)), controllerSha)
   assert.deepEqual(fs.readdirSync(root), [], 'Fresh empty root required')
@@ -44,15 +55,18 @@ async function main(args) {
   physical(source, false); assert.match(aclSha, /^[a-f0-9]{64}$/); assert.equal(sha(fs.readFileSync(source)), aclSha)
   const api = require(source)
   const before = fs.lstatSync(root, { bigint: true })
+  phase = 'private-acl'
   assert.deepEqual(api.ensureWindowsPrivateAcl(root), { supported: true, mechanism: 'windows-dacl' })
   assert.equal(sha(fs.readFileSync(source)), aclSha)
   // This same process now has a user token owner for every created descendant.
   // The caller never writes candidate bytes into the root before this point.
+  phase = 'framing'
   const parts = []; let size = 0
   for await (const chunk of process.stdin) { size += chunk.length; assert.ok(size <= MAX_TOTAL + MAX_MANIFEST); parts.push(chunk) }
   const bytes = Buffer.concat(parts), end = bytes.indexOf(10)
   assert.ok(end >= 0 && end < MAX_MANIFEST)
   const value = manifest(bytes.subarray(0,end+1)); let offset = end + 1
+  phase = 'payload-validation'
   for (const f of value.files) {
     assert.ok(offset + f.bytes <= bytes.length)
     const body = bytes.subarray(offset, offset + f.bytes); offset += f.bytes
@@ -62,20 +76,24 @@ async function main(args) {
   offset = end + 1
   for (const f of value.files) {
     const target = path.join(root, ...f.path.split('/')), parent = path.dirname(target)
+    phase = 'parent-inspection'
     fs.mkdirSync(parent, { recursive: true, mode: 0o700 }); physical(parent, true)
     api.inspectPathNoFollow(parent)
+    phase = 'file-write'
     const fd = fs.openSync(target, 'wx', 0o600)
     try {
       const body = bytes.subarray(offset, offset + f.bytes); offset += f.bytes
       let written = 0; while (written < body.length) { const count = fs.writeSync(fd, body, written, body.length-written); assert.ok(count > 0); written += count }
       fs.fsyncSync(fd); const st = fs.fstatSync(fd); assert.ok(st.isFile() && st.nlink === 1 && st.size === f.bytes)
     } finally { fs.closeSync(fd) }
+    phase = 'file-verification'
     physical(target, false); api.inspectPathNoFollow(target, { mustBeDirectory: false })
     assert.equal(sha(fs.readFileSync(target)), f.sha256)
   }
+  phase = 'final-verification'
   const after = fs.lstatSync(root, { bigint: true }); assert.equal(after.dev, before.dev); assert.equal(after.ino, before.ino)
   assert.equal(sha(fs.readFileSync(source)), aclSha); assert.equal(sha(fs.readFileSync(process.execPath)), controllerSha)
   process.stdout.write(JSON.stringify({status:'private-native-materialization-not-held-capture',files:value.files.length})+'\n')
 }
-if (require.main === module) main(process.argv.slice(2)).catch(() => { process.stderr.write('Native candidate writer refused\n'); process.exitCode=1 })
-module.exports = { manifest, validName }
+if (require.main === module) main(process.argv.slice(2)).catch(error => { process.stderr.write(JSON.stringify(failure(error)) + '\n'); process.exitCode=1 })
+module.exports = { manifest, validName, failure }

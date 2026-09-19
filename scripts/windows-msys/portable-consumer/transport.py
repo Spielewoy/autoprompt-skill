@@ -10,11 +10,31 @@ BRANCH='codex/issue-27-native-platform-support'
 class TransportError(ValueError):
     """Only fixed code-owned validation messages; never external exception text."""
 
+class NativeWriterError(TransportError):
+    def __init__(self,record):
+        super().__init__('native writer failed; output retained')
+        self.record=record
+
+def writer_failure(stdout,stderr):
+    # Native child diagnostics contain only fixed phases/codes and a bounded number.
+    require(not stdout and isinstance(stderr,bytes) and 0<len(stderr)<=1024,'invalid native writer failure record')
+    try: value=json.loads(stderr)
+    except (ValueError,UnicodeError): raise TransportError('invalid native writer failure record') from None
+    exact(value,['status','stage','code','helperPhase','exitStatus'])
+    require((json.dumps(value,separators=(',',':'))+'\n').encode()==stderr,'invalid native writer failure framing')
+    require(value['status']=='native-candidate-writer-refused','invalid native writer failure status')
+    require(value['stage'] in ['startup','inputs','private-acl','framing','payload-validation','parent-inspection','file-write','file-verification','final-verification'],'invalid native writer failure stage')
+    require(value['code'] in ['ERR_ASSERTION','PRIVACY_UNSUPPORTED','PRIVACY_VIOLATION','RUN_RECORD_UNSAFE','EACCES','EPERM','ENOENT','EEXIST','ENOSPC','EIO','ETIMEDOUT','UNCLASSIFIED'],'invalid native writer failure code')
+    require(value['helperPhase'] in [None,'startup','compiling','applying'],'invalid native writer helper phase')
+    require(value['exitStatus'] is None or type(value['exitStatus']) is int and -2147483648<=value['exitStatus']<=4294967295,'invalid native writer exit status')
+    return value
+
 def require(value, message):
     if not value: raise TransportError(message)
 
 def failure_reason(error):
     # Tests enforce literal messages at every require/TransportError call site.
+    if type(error) is NativeWriterError: return 'native writer failed; output retained'
     if type(error) is TransportError and len(error.args)==1 and isinstance(error.args[0],str) and len(error.args[0])<=160:
         return error.args[0]
     return 'external operation failed; exception details withheld'
@@ -165,7 +185,8 @@ def write_selected(destination,files,native=None):
         header={'schema':1,'files':[{'path':name,'bytes':len(value),'sha256':digest(value)} for name,value in files.items()]}
         payload=(json.dumps(header,separators=(',',':'))+'\n').encode()+b''.join(files.values())
         require(len(payload)<=320*1024*1024+65536,'native writer payload bound')
-        result=subprocess.run([str(controller),str(writer),str(destination),str(repo),native['aclSha256'],native['controllerSha256']],input=payload,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=native_environment(os.environ,destination),cwd=str(destination.parent),timeout=180,check=True)
+        result=subprocess.run([str(controller),str(writer),str(destination),str(repo),native['aclSha256'],native['controllerSha256']],input=payload,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=native_environment(os.environ,destination),cwd=str(destination.parent),timeout=180,check=False)
+        if result.returncode!=0: raise NativeWriterError(writer_failure(result.stdout,result.stderr))
         require(not result.stderr and len(result.stdout)<=1024,'native writer output')
         require(json.loads(result.stdout)=={'status':'private-native-materialization-not-held-capture','files':len(files)},'native writer completion')
         after=physical(destination,True);require((before.st_dev,before.st_ino)==(after.st_dev,after.st_ino),'native root changed')

@@ -49,7 +49,9 @@ Native stage output is bounded to 12 MiB. An outer timeout or output failure
 retains the diagnostic root and reports unknown cleanup; it never manufactures
 a successful drain. Mixed-probe progress is streamed while being retained. Failures identify a fixed
 consumer stage and code-owned validation reason; external HTTP/URL/subprocess
-exception text is withheld.
+exception text is withheld. The private writer reports only a fixed phase, known error
+code, helper phase and bounded exit status. Preserve the outer console in a sibling
+workflow log as well: an early refusal may leave the private output root empty.
 
 ## Authority and archive validation
 

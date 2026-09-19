@@ -160,8 +160,26 @@ test('Windows Bash discovery never executes or falls back after invalid selected
 // This scenario performs two native launches plus bounded privacy/resource
 // setup; each worker retains its separate 15s/30s execution deadline.
 test('native Windows Bash copied closure permits scratch writes and denies candidate writes and controller reads', { skip: process.platform !== 'win32', timeout: 600000 }, async t => {
-  await require('../helpers/windows-bash-native-smoke.cjs').runNativeWindowsBashSmoke(t, {
-    probeWindowsAppContainer: require('../../agents/codex/workflow/windows-appcontainer-probe.js').probeWindowsAppContainer,
-    executeTool: require('../../scripts/harness-v2-tool-boundary.cjs').executeTool,
-  })
+  const { probeWindowsAppContainer } = require('../../agents/codex/workflow/windows-appcontainer-probe.js')
+  const probe = await probeWindowsAppContainer()
+  assert.equal(probe.supported, true, JSON.stringify(probe))
+  const { ensureWindowsPrivateAcl } = require('../../agents/codex/workflow/safe-run-root.js')
+  const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'windows-bash-command-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  ensureWindowsPrivateAcl(root)
+  const targetPath = path.join(root, 'target'), scratchPath = path.join(root, 'scratch'), controlRoot = path.join(root, 'controller')
+  for (const directory of [targetPath, scratchPath, controlRoot]) { fs.mkdirSync(directory); ensureWindowsPrivateAcl(directory) }
+  const candidate = path.join(targetPath, 'candidate'), secret = path.join(controlRoot, 'secret')
+  fs.writeFileSync(candidate, 'preserved'); fs.writeFileSync(secret, 'controller-only')
+  const shellWitness = path.join(scratchPath, 'shell-witness')
+  const source = `const fs=require('node:fs'),assert=require('node:assert/strict'),path=require('node:path');assert.equal(fs.readFileSync(path.join(${JSON.stringify(scratchPath)},'shell-witness-tmp'),'utf8'),'private-temp\\n');const fstab=path.resolve(path.dirname(process.execPath),'../../etc/fstab');assert.equal(fs.readFileSync(fstab,'utf8'),'none /tmp usertemp binary,posix=0,noacl 0 0\\n');assert.throws(()=>fs.appendFileSync(fstab,'forbidden'),error=>['EPERM','EACCES'].includes(error.code));assert.equal(fs.readFileSync(${JSON.stringify(shellWitness)},'utf8'),'shell-write\\n');fs.writeFileSync(${JSON.stringify(path.join(scratchPath, 'witness'))},'native-node');for(const attempt of [()=>fs.writeFileSync(${JSON.stringify(candidate)},'forbidden'),()=>fs.readFileSync(${JSON.stringify(secret)})])assert.throws(attempt,error=>['EPERM','EACCES'].includes(error.code));process.stdout.write('node-ok')`
+  const shellQuote = value => `'${value.replaceAll("'", "'\\''")}'`
+  const command = [`[[ -d /tmp ]] && printf 'private-temp\\n' > /tmp/shell-witness-tmp`, `set -- ${shellQuote(shellWitness)}`, fs.readFileSync(ipcFixture, 'utf8'),
+    `printf 'bash-ok:'; node -e "eval(Buffer.from('${Buffer.from(source).toString('base64')}','base64').toString())"`].join('\n')
+  const policy = { provider: 'claude', nestedDispatch: false, commandBoundary: true, externalWrites: false, readOnly: true, targetPath, scratchPath, readableRoots: [targetPath, scratchPath], writableRoots: [scratchPath] }
+  const result = await boundary.executeTool(policy, 'bash', { command, timeoutMs: 30000 }, { controlRoot })
+  assert.equal(result.status, 'completed', JSON.stringify(result)); assert.equal(result.output, 'bash-ok:node-ok')
+  assert.equal(fs.readFileSync(path.join(scratchPath, 'witness'), 'utf8'), 'native-node')
+  assert.equal(fs.readFileSync(candidate, 'utf8'), 'preserved')
 })

@@ -15,3 +15,6 @@ tests/fixtures/windows-msys/compiler-stage.sha256 text eol=lf
 
 # Descriptor proof sources and binding inputs require exact LF bytes.
 scripts/windows-msys/descriptor-proof/** text eol=lf
+
+# Frozen compiler-smoke source and its derivation hashes require identical bytes.
+scripts/windows-msys/diagnostic-smoke/** text eol=lf

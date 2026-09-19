@@ -49,12 +49,12 @@ function resourceRoots(policy, controlRoot, executableRoots) {
   return [...roots.values()]
 }
 function validatePlan(plan, expected = {}) {
-  need(exact(plan, ['schemaVersion', 'profileName', 'profileSid', 'roots', 'entries']) && plan.schemaVersion === 1 && /^Autoprompt_[a-f0-9]{32}$/.test(plan.profileName) && /^S-1-15-2-(?:[0-9]+-){6}[0-9]+$/.test(plan.profileSid))
+  need(exact(plan, ['schemaVersion', 'profileName', 'profileSid', 'roots', 'entries']) && plan.schemaVersion === 2 && /^Autoprompt_[a-f0-9]{32}$/.test(plan.profileName) && /^S-1-15-2-(?:[0-9]+-){6}[0-9]+$/.test(plan.profileSid))
   need(!expected.profileName || plan.profileName === expected.profileName)
   need(Array.isArray(plan.roots) && plan.roots.length > 0 && plan.roots.length <= 64 && Array.isArray(plan.entries) && plan.entries.length > 0 && plan.entries.length <= 4096)
   const ids = new Map(), validIdentity = entry => typeof entry.identity === 'string' && /^[a-f0-9]{8}:[a-f0-9]{16}$/.test(entry.identity) && typeof entry.creation === 'string' && /^[0-9]{1,19}$/.test(entry.creation)
   for (const entry of plan.entries) {
-    need(exact(entry, ['identity', 'creation', 'label', 'directory', 'writable', 'git', 'root']) && validIdentity(entry) && ['directory', 'writable', 'git', 'root'].every(key => typeof entry[key] === 'boolean') && typeof entry.label === 'string' && entry.label.length <= 5464 && Buffer.from(entry.label, 'base64').toString('base64') === entry.label && !ids.has(entry.identity))
+    need(exact(entry, ['identity', 'creation', 'label', 'directory', 'writable', 'git', 'root', 'daclProtected']) && validIdentity(entry) && ['directory', 'writable', 'git', 'root', 'daclProtected'].every(key => typeof entry[key] === 'boolean') && typeof entry.label === 'string' && entry.label.length <= 5464 && Buffer.from(entry.label, 'base64').toString('base64') === entry.label && !ids.has(entry.identity))
     ids.set(entry.identity, entry)
   }
   for (const root of plan.roots) {

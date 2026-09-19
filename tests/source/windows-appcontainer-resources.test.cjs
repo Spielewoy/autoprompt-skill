@@ -23,8 +23,8 @@ function harness(applyResult) {
     events.push([request.operation, request])
     if (request.operation === 'plan') {
       const roots = request.roots.map((root, index) => ({ ...root, identity: `12345678:${(index + 1).toString(16).padStart(16, '0')}`, creation: '132000000000000000' }))
-      return { schemaVersion: 1, profileName: request.profileName, profileSid, roots,
-        entries: roots.map(root => ({ identity: root.identity, creation: root.creation, label: '', directory: root.kind === 'directory', writable: root.writable, git: false, root: true })) }
+      return { schemaVersion: 2, profileName: request.profileName, profileSid, roots,
+        entries: roots.map(root => ({ identity: root.identity, creation: root.creation, label: '', directory: root.kind === 'directory', writable: root.writable, git: false, root: true, daclProtected: true })) }
     }
     if (request.operation === 'apply') {
       applied = request.plan
@@ -78,6 +78,14 @@ test('closed plans reject unknown keys, duplicated identities, and replacement r
   const h = harness(), lease = await h.api.prepareWindowsAppContainerResources(h.options)
   const plan = JSON.parse(h.records.get(lease.recovery.journalPath)).plan
   assert.equal(validatePlan(plan), plan)
+  assert.equal(plan.schemaVersion, 2)
+  assert.throws(() => validatePlan({ ...plan, schemaVersion: 1 }), { code: 'WINDOWS_RESOURCE_INVALID' })
+  for (const value of [undefined, 'false', 0]) {
+    const entries = plan.entries.map(entry => ({ ...entry }))
+    if (value === undefined) delete entries[0].daclProtected
+    else entries[0].daclProtected = value
+    assert.throws(() => validatePlan({ ...plan, entries }), { code: 'WINDOWS_RESOURCE_INVALID' })
+  }
   assert.throws(() => validatePlan({ ...plan, extra: true }), { code: 'WINDOWS_RESOURCE_INVALID' })
   assert.throws(() => validatePlan({ ...plan, entries: [...plan.entries, plan.entries[0]] }), { code: 'WINDOWS_RESOURCE_INVALID' })
   assert.throws(() => validatePlan({ ...plan, roots: [{ ...plan.roots[0], creation: '1' }, ...plan.roots.slice(1)] }), { code: 'WINDOWS_RESOURCE_INVALID' })
@@ -93,6 +101,20 @@ test('invalid native apply replies retain the journal recovery binding', async (
   assert.match(error.recovery.leaseId, /^[a-f0-9]{32}$/)
   const evidence = h.evidence({ recovery: error.recovery })
   await h.api.recoverWindowsAppContainerResources({ controlRoot, ...error.recovery, verifyDrainEvidence: h.verifyDrainEvidence, evidence })
+})
+
+test('v1 recovery is refused without removing the retained journal or invoking restore', async () => {
+  const h = harness(), lease = await h.api.prepareWindowsAppContainerResources(h.options)
+  const journal = JSON.parse(h.records.get(lease.recovery.journalPath))
+  journal.plan.schemaVersion = 1
+  for (const entry of journal.plan.entries) delete entry.daclProtected
+  const body = { schemaVersion: journal.schemaVersion, leaseId: journal.leaseId, plan: journal.plan }
+  journal.sha256 = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex')
+  const bytes = Buffer.from(JSON.stringify(journal))
+  h.records.set(lease.recovery.journalPath, bytes)
+  await assert.rejects(h.api.recoverWindowsAppContainerResources({ controlRoot, ...lease.recovery, verifyDrainEvidence: h.verifyDrainEvidence, evidence: h.evidence(lease) }), { code: 'WINDOWS_RESOURCE_INVALID' })
+  assert.equal(h.events.filter(event => event[0] === 'restore').length, 0)
+  assert.deepEqual(h.records.get(lease.recovery.journalPath), bytes)
 })
 
 test('completion receipt permits exact recovery after private scratch removal without another native restore', async () => {

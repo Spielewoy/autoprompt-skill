@@ -17,6 +17,17 @@ class OrchestrationContracts(unittest.TestCase):
   for error in [ValueError('secret-token-or-url'),urllib.error.URLError('https://storage/?signed=secret'),KeyError('malicious packet text')]:
    report=r.failure_report(error,'.');self.assertEqual(report['reason'],'external operation failed; exception details withheld');self.assertNotIn('secret',json.dumps(report));self.assertFalse(report['cleanupConfirmed'])
   with self.assertRaises(t.TransportError):r.set_stage('https://untrusted/?secret')
+ def test_native_writer_failure_is_joined_without_external_exception_text(self):
+  record={'status':'native-candidate-writer-refused','stage':'private-acl','code':'PRIVACY_UNSUPPORTED','helperPhase':'compiling','exitStatus':1}
+  encoded=lambda value:(json.dumps(value,separators=(',',':'))+'\n').encode()
+  self.assertEqual(t.writer_failure(b'',encoded(record)),record)
+  r.set_stage('private-output');report=r.failure_report(t.NativeWriterError(record),'.')
+  self.assertEqual(report['stage'],'private-output');self.assertEqual(report['nativeWriter'],record);self.assertEqual(report['reason'],'native writer failed; output retained');self.assertFalse(report['cleanupConfirmed'])
+  for key,value in [('status','accepted'),('stage','secret-url'),('code','secret-token'),('helperPhase','secret'),('exitStatus',True),('exitStatus',4294967296),('extra','secret')]:
+   with self.subTest(key=key,value=value):
+    with self.assertRaises(ValueError):t.writer_failure(b'',encoded({**record,key:value}))
+  for stdout,stderr in [(b'unexpected',encoded(record)),(b'',b'secret-token'),(b'',b'{}'*1024),(b'',encoded(record)+b'\n'),(b'',encoded(record).replace(b'"status":',b'"status":"duplicate","status":'))]:
+   with self.assertRaises(ValueError):t.writer_failure(stdout,stderr)
  def test_current_workflow_requires_exact_native_arm_role(self):
   e={'GITHUB_ACTIONS':'true','RUNNER_OS':'Windows','RUNNER_ARCH':'ARM64','GITHUB_JOB':'platform-primitives','GITHUB_REF':'refs/heads/'+t.BRANCH,'GITHUB_EVENT_NAME':'push','GITHUB_REPOSITORY':'Spielewoy/autoprompt-skill','GITHUB_RUN_ID':'123','GITHUB_RUN_ATTEMPT':'1','GITHUB_REPOSITORY_ID':'456','GITHUB_SHA':'a'*40}
   current,repoid=r.current_environment(e);self.assertEqual(current['runId'],123);self.assertEqual(repoid,456)

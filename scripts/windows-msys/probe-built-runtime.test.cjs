@@ -112,11 +112,13 @@ for (const scenario of ['pass', 'binary checksum', 'missing pinned SDK Git', 'st
         }
         ++state.childCalls
         assert.equal(executable, process.execPath)
-        assert.ok(args.includes('--test'))
-        assert.equal(args[args.indexOf('--test-name-pattern') + 1], `^${probe.TEST_NAME}$`)
+        assert.equal(args[0],'--test-reporter=tap');assert.equal(args[1],path.join(__dirname,'diagnostic-smoke/native.cjs'))
+        const contextBytes=fs.readFileSync(args[2]),context=JSON.parse(contextBytes)
+        assert.equal(args[3],digest(contextBytes));assert.equal(context.bash.path,path.join(state.runtime,'bash.exe'))
+        assert.equal(context.node.kind,'compiler-controller');assert.equal(context.node.sha256,digest(fs.readFileSync(process.execPath)))
         assert.equal(options.timeout, 615000)
         assert.equal(options.env.Node_Options, undefined)
-        assert.equal(options.env.AUTOPROMPT_WINDOWS_BASH, path.join(state.runtime, 'bash.exe'))
+        assert.equal(options.env.AUTOPROMPT_WINDOWS_BASH, undefined)
         assert.equal(environment.AUTOPROMPT_WINDOWS_BASH, 'ambient Bash', 'The controller must not mutate its own environment')
         assert.deepEqual(fs.readFileSync(path.join(state.runtime, 'msys-2.0.dll')), built)
         assert.deepEqual(fs.readFileSync(path.join(state.runtime, 'bash.exe')), original['bash.exe'])
@@ -127,9 +129,10 @@ for (const scenario of ['pass', 'binary checksum', 'missing pinned SDK Git', 'st
     }
     const customRequire = name => {
       if (name === 'node:child_process') return native
-      if (name.endsWith('/windows-appcontainer-command.js')) return {
+      if (name.endsWith('/diagnostic-smoke/command.cjs')) return {
         bindBashRuntime: bind,
-        resolveWindowsBash({ bashPath }) {
+        resolveWindowsBash({ diagnosticTuple }) {
+          const bashPath=diagnosticTuple.bash.path
           state.runtime = path.dirname(bashPath)
           assert.equal(path.dirname(state.runtime), payload, 'Proof copy must be beside stage')
           assert.ok(path.basename(state.runtime).startsWith('proof-runtime-'))

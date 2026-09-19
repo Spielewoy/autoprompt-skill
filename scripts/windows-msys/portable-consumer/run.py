@@ -12,7 +12,9 @@ def set_stage(name):
     LAST_STAGE=name
 
 def failure_report(error,output):
-    return {'status':'portable-consumer-refused','stage':LAST_STAGE,'errorType':type(error).__name__,'reason':t.failure_reason(error),'cleanupConfirmed':False,'retainedOutput':str(Path(output).resolve())}
+    report={'status':'portable-consumer-refused','stage':LAST_STAGE,'errorType':type(error).__name__,'reason':t.failure_reason(error),'cleanupConfirmed':False,'retainedOutput':str(Path(output).resolve())}
+    if type(error) is t.NativeWriterError:report['nativeWriter']=t.writer_failure(b'',(json.dumps(error.record,separators=(',',':'))+'\n').encode())
+    return report
 
 
 def current_environment(env):

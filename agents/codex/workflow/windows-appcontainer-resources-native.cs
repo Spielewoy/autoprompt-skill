@@ -206,7 +206,7 @@ public static class WindowsAppContainerResourcesNative {
   [DllImport("ole32.dll")] static extern void CoTaskMemFree(IntPtr memory);
   public sealed class RootSpec { public string path, kind; public bool writable; }
   public sealed class RootRecord { public string path, kind, identity, creation; public bool writable; }
-  public sealed class EntryRecord { public string identity, creation, label; public bool directory, writable, git, root; }
+  public sealed class EntryRecord { public string identity, creation, label; public bool directory, writable, git, root, daclProtected; }
   public sealed class ResourcePlan { public int schemaVersion; public string profileName, profileSid; public RootRecord[] roots; public EntryRecord[] entries; }
   sealed class Item { public Opened opened; public string full; public bool writable, git, root; }
   sealed class Forest : IDisposable {
@@ -251,9 +251,10 @@ public static class WindowsAppContainerResourcesNative {
     Need(acl!=null,"WINDOWS_ACL_UNAVAILABLE");var result=new RawAcl(acl.Revision,acl.Count);
     foreach(GenericAce ace in acl){var qualified=ace as QualifiedAce;Need(qualified!=null,"WINDOWS_ACL_UNSUPPORTED");if(qualified.SecurityIdentifier.Value!=sid)result.InsertAce(result.Count,ace.Copy());}return result;
   }
-  static void SetAcl(IntPtr handle,RawAcl acl,bool label) {
+  static bool Protected(RawSecurityDescriptor security) { return (security.ControlFlags&ControlFlags.DiscretionaryAclProtected)!=0; }
+  static void SetAcl(IntPtr handle,RawAcl acl,bool label,bool? protection=null) {
     byte[] bytes=new byte[acl.BinaryLength];acl.GetBinaryForm(bytes,0);IntPtr pointer=Marshal.AllocHGlobal(bytes.Length);
-    try { Marshal.Copy(bytes,0,pointer,bytes.Length);Need(SetSecurityInfo(handle,1,label?0x10u:4u,IntPtr.Zero,IntPtr.Zero,label?IntPtr.Zero:pointer,label?pointer:IntPtr.Zero)==0,"WINDOWS_ACL_WRITE_FAILED"); }
+    try { uint information=label?0x10u:4u;if(protection.HasValue){Need(!label,"WINDOWS_RESOURCE_INVALID");information|=protection.Value?0x80000000u:0x20000000u;}Marshal.Copy(bytes,0,pointer,bytes.Length);Need(SetSecurityInfo(handle,1,information,IntPtr.Zero,IntPtr.Zero,label?IntPtr.Zero:pointer,label?pointer:IntPtr.Zero)==0,"WINDOWS_ACL_WRITE_FAILED"); }
     finally { Marshal.FreeHGlobal(pointer); }
   }
   static void SetLabel(IntPtr handle,string encoded) { byte[] bytes=encoded.Length==0?null:Convert.FromBase64String(encoded);SetAcl(handle,bytes==null?new RawAcl(2,0):new RawAcl(bytes,0),true); }
@@ -311,38 +312,64 @@ public static class WindowsAppContainerResourcesNative {
     string sid=ProfileSid(profileName);
     using(var forest=Inventory(specs)) {
       var entries=new List<EntryRecord>();
-      foreach(var item in forest.items){var security=Security(item.opened.Handle);Need(!HasSid(security.DiscretionaryAcl,sid),"WINDOWS_PROFILE_ALREADY_GRANTED");if(item.writable)Private(security,item.root);entries.Add(new EntryRecord{identity=item.opened.Snapshot.Id,creation=item.opened.Snapshot.Creation.ToString(),label=Label(security),directory=item.opened.Directory,writable=item.writable,git=item.git,root=item.root});}
-      Stable(forest);return new ResourcePlan{schemaVersion=1,profileName=profileName,profileSid=sid,roots=forest.roots.ToArray(),entries=entries.ToArray()};
+      foreach(var item in forest.items){var security=Security(item.opened.Handle);Need(!HasSid(security.DiscretionaryAcl,sid),"WINDOWS_PROFILE_ALREADY_GRANTED");if(item.writable)Private(security,item.root);entries.Add(new EntryRecord{identity=item.opened.Snapshot.Id,creation=item.opened.Snapshot.Creation.ToString(),label=Label(security),directory=item.opened.Directory,writable=item.writable,git=item.git,root=item.root,daclProtected=Protected(security)});}
+      Stable(forest);return new ResourcePlan{schemaVersion=2,profileName=profileName,profileSid=sid,roots=forest.roots.ToArray(),entries=entries.ToArray()};
     }
   }
   public static ResourcePlan ReadPlan(string json) {
     Need(json!=null && json.Length<=8*1024*1024,"WINDOWS_RESOURCE_LIMIT");
-    var serializer=new System.Web.Script.Serialization.JavaScriptSerializer();serializer.MaxJsonLength=8*1024*1024;var plan=serializer.Deserialize<ResourcePlan>(json);
-    Need(plan!=null && plan.schemaVersion==1 && plan.profileSid==ProfileSid(plan.profileName) && plan.roots!=null && plan.entries!=null && plan.entries.Length>0 && plan.entries.Length<=4096,"WINDOWS_RESOURCE_INVALID");
+    var serializer=new System.Web.Script.Serialization.JavaScriptSerializer();serializer.MaxJsonLength=8*1024*1024;
+    // Missing flags must not deserialize as false: v1 cannot describe an owned
+    // inheritance transition and is deliberately ineligible for v2 recovery.
+    var wire=serializer.DeserializeObject(json) as Dictionary<string,object>;
+    Need(wire!=null && wire.Count==5 && new[]{"schemaVersion","profileName","profileSid","roots","entries"}.All(wire.ContainsKey),"WINDOWS_RESOURCE_INVALID");
+    Need(wire["schemaVersion"] is int && (int)wire["schemaVersion"]==2 && wire["profileName"] is string && wire["profileSid"] is string,"WINDOWS_RESOURCE_INVALID");
+    var rootsWire=wire["roots"] as object[];Need(rootsWire!=null && rootsWire.Length>0 && rootsWire.Length<=64,"WINDOWS_RESOURCE_INVALID");
+    foreach(var value in rootsWire){var root=value as Dictionary<string,object>;Need(root!=null && root.Count==5 && new[]{"path","kind","writable","identity","creation"}.All(root.ContainsKey),"WINDOWS_RESOURCE_INVALID");Need(root["writable"] is bool && new[]{"path","kind","identity","creation"}.All(key=>root[key] is string),"WINDOWS_RESOURCE_INVALID");}
+    var entriesWire=wire["entries"] as object[];Need(entriesWire!=null && entriesWire.Length>0 && entriesWire.Length<=4096,"WINDOWS_RESOURCE_INVALID");
+    foreach(var value in entriesWire){var entry=value as Dictionary<string,object>;Need(entry!=null && entry.Count==8 && new[]{"identity","creation","label","directory","writable","git","root","daclProtected"}.All(entry.ContainsKey),"WINDOWS_RESOURCE_INVALID");Need(new[]{"directory","writable","git","root","daclProtected"}.All(key=>entry[key] is bool) && new[]{"identity","creation","label"}.All(key=>entry[key] is string),"WINDOWS_RESOURCE_INVALID");}
+    var plan=serializer.Deserialize<ResourcePlan>(json);
+    Need(plan!=null && plan.schemaVersion==2 && plan.profileSid==ProfileSid(plan.profileName) && plan.roots!=null && plan.entries!=null && plan.entries.Length>0 && plan.entries.Length<=4096,"WINDOWS_RESOURCE_INVALID");
     Specs(plan.roots.Select(r=>new RootSpec{path=r.path,kind=r.kind,writable=r.writable}).ToArray());
     var seen=new HashSet<string>();foreach(var entry in plan.entries){Need(entry!=null && entry.identity!=null && System.Text.RegularExpressions.Regex.IsMatch(entry.identity,"^[a-f0-9]{8}:[a-f0-9]{16}$") && seen.Add(entry.identity) && entry.creation!=null && System.Text.RegularExpressions.Regex.IsMatch(entry.creation,"^[0-9]{1,19}$") && entry.label!=null && entry.label.Length<=5464,"WINDOWS_RESOURCE_INVALID");if(entry.label.Length>0){byte[] raw=Convert.FromBase64String(entry.label);Need(Convert.ToBase64String(raw)==entry.label,"WINDOWS_RESOURCE_INVALID");new RawAcl(raw,0);}}
     foreach(var root in plan.roots)Need(plan.entries.Any(e=>e.identity==root.identity && e.creation==root.creation && e.directory==(root.kind=="directory")),"WINDOWS_RESOURCE_INVALID");return plan;
   }
+  static int PackageRights(bool writable,bool git,bool root) {
+    int rights=writable && !git?0x001301bf:0x001200a9;
+    rights&=~0x40; // A writable parent cannot delete a protected child.
+    if(root)rights&=~0x10000;
+    return rights;
+  }
+  static void VerifyPackageGrant(RawSecurityDescriptor security,string sid,bool directory,bool writable,bool git,bool root) {
+    Need(security.DiscretionaryAcl!=null && (!git || Protected(security)),"WINDOWS_ACL_WRITE_FAILED");
+    int expected=PackageRights(writable,git,root),count=0;bool explicitGrant=false;
+    AceFlags flags=directory?AceFlags.ObjectInherit|AceFlags.ContainerInherit:AceFlags.None;
+    foreach(GenericAce ace in security.DiscretionaryAcl){var qualified=ace as QualifiedAce;Need(qualified!=null,"WINDOWS_ACL_UNSUPPORTED");if(qualified.SecurityIdentifier.Value!=sid)continue;var common=ace as CommonAce;Need(common!=null && !common.IsCallback && common.AceQualifier==AceQualifier.AccessAllowed && (common.AccessMask&~expected)==0,"WINDOWS_ACL_WRITE_FAILED");count++;if(common.AceFlags==flags && common.AccessMask==expected)explicitGrant=true;}
+    Need(explicitGrant && count>0 && (!git || count==1),"WINDOWS_ACL_WRITE_FAILED");
+  }
   public static Dictionary<string,object> Apply(ResourcePlan plan) {
+    Need(plan!=null && plan.schemaVersion==2,"WINDOWS_RESOURCE_INVALID");
     RootSpec[] specs=plan.roots.Select(r=>new RootSpec{path=r.path,kind=r.kind,writable=r.writable}).ToArray();
     using(var forest=Inventory(specs)) {
       Need(forest.items.Count==plan.entries.Length && forest.roots.Count==plan.roots.Length,"PREIMAGE_UNSAFE");
       for(int i=0;i<forest.roots.Count;i++)Need(forest.roots[i].identity==plan.roots[i].identity && forest.roots[i].creation==plan.roots[i].creation,"PREIMAGE_UNSAFE");
       var baseline=plan.entries.ToDictionary(e=>e.identity);
-      foreach(var item in forest.items){EntryRecord saved;Need(baseline.TryGetValue(item.opened.Snapshot.Id,out saved) && saved.creation==item.opened.Snapshot.Creation.ToString() && saved.directory==item.opened.Directory && saved.writable==item.writable && saved.git==item.git && saved.root==item.root,"PREIMAGE_UNSAFE");var security=Security(item.opened.Handle);Need(!HasSid(security.DiscretionaryAcl,plan.profileSid) && Label(security)==saved.label,"WINDOWS_ACL_CHANGED");if(item.writable)Private(security,item.root);}
+      foreach(var item in forest.items){EntryRecord saved;Need(baseline.TryGetValue(item.opened.Snapshot.Id,out saved) && saved.creation==item.opened.Snapshot.Creation.ToString() && saved.directory==item.opened.Directory && saved.writable==item.writable && saved.git==item.git && saved.root==item.root,"PREIMAGE_UNSAFE");var security=Security(item.opened.Handle);Need(!HasSid(security.DiscretionaryAcl,plan.profileSid) && Label(security)==saved.label && Protected(security)==saved.daclProtected,"WINDOWS_ACL_CHANGED");if(item.writable)Private(security,item.root);}
       Stable(forest);IntPtr created=IntPtr.Zero;
       try {int status=CreateAppContainerProfile(plan.profileName,plan.profileName,"Autoprompt owned worker resources",IntPtr.Zero,0,out created);Need(status==0 && created!=IntPtr.Zero,"WINDOWS_PROFILE_CREATE_FAILED");Need(new SecurityIdentifier(created).Value==plan.profileSid,"WINDOWS_PROFILE_MISMATCH");}
       finally{if(created!=IntPtr.Zero)FreeSid(created);}
       foreach(var item in forest.items) {
         var security=Security(item.opened.Handle);var acl=WithoutSid(security.DiscretionaryAcl,plan.profileSid);var sid=new SecurityIdentifier(plan.profileSid);
         AceFlags flags=item.opened.Directory?AceFlags.ObjectInherit|AceFlags.ContainerInherit:AceFlags.None;
-        if(item.git)acl.InsertAce(0,new CommonAce(flags,AceQualifier.AccessDenied,0x000d0156,sid,false,null));
-        int rights=item.writable && !item.git?0x001301bf:0x001200a9;rights&=~0x40;if(item.root)rights&=~0x10000;
+        // AppContainer isolation is enforced by the granted package mask, not
+        // a package DENY ACE. Protect .git from the parent's writable grant
+        // being automatically re-inherited by SetSecurityInfo.
+        int rights=PackageRights(item.writable,item.git,item.root);
         int insert=0;while(insert<acl.Count && (acl[insert].AceFlags&AceFlags.Inherited)==0)insert++;
-        acl.InsertAce(insert,new CommonAce(flags,AceQualifier.AccessAllowed,rights,sid,false,null));SetAcl(item.opened.Handle,acl,false);
+        acl.InsertAce(insert,new CommonAce(flags,AceQualifier.AccessAllowed,rights,sid,false,null));SetAcl(item.opened.Handle,acl,false,item.git?(bool?)true:null);
         if(item.writable && !item.git)SetLabel(item.opened.Handle,LabelFor("LW"));
       }
-      foreach(var item in forest.items){var security=Security(item.opened.Handle);Need(HasSid(security.DiscretionaryAcl,plan.profileSid),"WINDOWS_ACL_WRITE_FAILED");if(item.writable && !item.git)Need(Label(security)==LabelFor("LW"),"WINDOWS_LABEL_WRITE_FAILED");}
+      foreach(var item in forest.items){var security=Security(item.opened.Handle);VerifyPackageGrant(security,plan.profileSid,item.opened.Directory,item.writable,item.git,item.root);if(item.writable && !item.git)Need(Label(security)==LabelFor("LW"),"WINDOWS_LABEL_WRITE_FAILED");}
       IntPtr folder=IntPtr.Zero;try{Need(GetAppContainerFolderPath(plan.profileSid,out folder)==0 && folder!=IntPtr.Zero,"WINDOWS_PROFILE_UNAVAILABLE");return new Dictionary<string,object>{{"profileName",plan.profileName},{"profileSid",plan.profileSid},{"profilePath",Marshal.PtrToStringUni(folder)}};}finally{if(folder!=IntPtr.Zero)CoTaskMemFree(folder);}
     }
   }
@@ -354,6 +381,7 @@ public static class WindowsAppContainerResourcesNative {
     try{Snapshot snapshot=Info(handle,true);Need(snapshot.Id==identity && snapshot.Creation.ToString()==creation,"WINDOWS_ACL_IDENTITY_MISMATCH");var item=new Opened{Handle=handle,Snapshot=snapshot,Directory=(snapshot.Attributes&FILE_ATTRIBUTE_DIRECTORY)!=0};forest.handles.Add(item);return item;}catch{CloseHandle(handle);throw;}
   }
   public static Dictionary<string,object> Restore(ResourcePlan plan) {
+    Need(plan!=null && plan.schemaVersion==2,"WINDOWS_RESOURCE_INVALID");
     var baseline=plan.entries.ToDictionary(e=>e.identity);RootSpec[] specs=plan.roots.Select(r=>new RootSpec{path=r.path,kind=r.kind,writable=r.writable}).ToArray();
     using(var forest=new Forest()) {
       var seen=new HashSet<string>();
@@ -365,9 +393,17 @@ public static class WindowsAppContainerResourcesNative {
       foreach(var item in forest.items) {
         var security=Security(item.opened.Handle);EntryRecord old;bool existed=baseline.TryGetValue(item.opened.Snapshot.Id,out old);
         if(existed)Need(old.creation==item.opened.Snapshot.Creation.ToString(),"WINDOWS_ACL_IDENTITY_MISMATCH");
-        // Remove just the reserved package SID, retaining live unrelated ACEs.
-        if(HasSid(security.DiscretionaryAcl,plan.profileSid))SetAcl(item.opened.Handle,WithoutSid(security.DiscretionaryAcl,plan.profileSid),false);
-        bool labelOwned=existed?old.writable && !old.git:item.writable;
+        // Keep live unrelated ACEs. Only .git objects in the v2 baseline can
+        // own a protection transition. A different transition without our
+        // package grant is external and cannot be silently rolled back.
+        bool hasPackage=HasSid(security.DiscretionaryAcl,plan.profileSid);bool? protection=null;
+        if(existed && old.git && Protected(security)!=old.daclProtected){
+          Need(!old.daclProtected && Protected(security) && hasPackage,"WINDOWS_ACL_PROTECTION_CHANGED");
+          VerifyPackageGrant(security,plan.profileSid,item.opened.Directory,old.writable,true,old.root);protection=false;
+        }
+        if(hasPackage || protection.HasValue)SetAcl(item.opened.Handle,WithoutSid(security.DiscretionaryAcl,plan.profileSid),false,protection);
+        if(existed && old.git)Need(Protected(Security(item.opened.Handle))==old.daclProtected,"WINDOWS_ACL_RESTORE_FAILED");
+        bool labelOwned=existed?old.writable && !old.git:item.writable && !item.git;
         if(labelOwned){string label=Label(Security(item.opened.Handle));string wanted=existed?old.label:LabelFor("ME");Need(label==LabelFor("LW") || label==wanted || (!existed && label==""),"WINDOWS_LABEL_CHANGED");if(label!=wanted && !(label=="" && !existed))SetLabel(item.opened.Handle,wanted);}
         Need(!HasSid(Security(item.opened.Handle).DiscretionaryAcl,plan.profileSid),"WINDOWS_ACL_RESTORE_FAILED");if(existed)restored++;else created++;
       }

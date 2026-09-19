@@ -1606,21 +1606,21 @@ index 0000000..50f7e7b
 +}
 diff --git a/winsup/cygwin/sec/appcontainer_pipe.cc b/winsup/cygwin/sec/appcontainer_pipe.cc
 new file mode 100644
-index 0000000..2d9caba
 --- /dev/null
 +++ b/winsup/cygwin/sec/appcontainer_pipe.cc
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,285 @@
 +/* Pipe-only AppContainer descriptor prototype.
 +
 +   Baseline: git-for-windows/msys2-runtime
 +   270ba2980700e6e2a0813944d506eecea0f86402.
 +   No global sec_acl change, no environment inputs and no cached token state.
-+   This source has not been compiled or run in the MSYS build environment. */
++   Security API calls use direct Nt/Rtl imports for early fork initialization. */
 +
 +#include "winsup.h"
 +#include <stdint.h>
 +#include <string.h>
 +#include "appcontainer_pipe_security.h"
++#include "appcontainer_nt_security.h"
 +
 +namespace
 +{
@@ -1649,10 +1649,10 @@ index 0000000..2d9caba
 +      || size - (value - start) < 8)
 +    return false;
 +  DWORD remaining = size - (value - start);
-+  BYTE count = *GetSidSubAuthorityCount (sid);
-+  DWORD length = GetSidLengthRequired (count);
++  BYTE count = *appcontainer_nt::GetSidSubAuthorityCount (sid);
++  DWORD length = appcontainer_nt::GetSidLengthRequired (count);
 +  return length <= SECURITY_MAX_SID_SIZE && length <= remaining
-+         && IsValidSid (sid);
++         && appcontainer_nt::IsValidSid (sid);
 +}
 +
 +union sid_buffer
@@ -1672,7 +1672,7 @@ index 0000000..2d9caba
 +    BYTE bytes[sizeof (TOKEN_USER) + SECURITY_MAX_SID_SIZE];
 +  } information;
 +  DWORD returned = 0;
-+  if (!GetTokenInformation (token, kind, information.bytes,
++  if (!appcontainer_nt::GetTokenInformation (token, kind, information.bytes,
 +                            sizeof information, &returned))
 +    return GetLastError ();
 +  if (returned > sizeof information || returned < sizeof (PSID))
@@ -1683,7 +1683,7 @@ index 0000000..2d9caba
 +        (information.bytes)->TokenAppContainer;
 +  if (!bounded_sid (sid, information.bytes, returned))
 +    return ERROR_INVALID_SID;
-+  if (!CopySid (sizeof destination.bytes, destination.bytes, sid))
++  if (!appcontainer_nt::CopySid (sizeof destination.bytes, destination.bytes, sid))
 +    return GetLastError ();
 +  return ERROR_SUCCESS;
 +}
@@ -1693,14 +1693,14 @@ index 0000000..2d9caba
 +{
 +  if (!sid)
 +    return 0;
-+  return IsValidSid (sid) ? GetLengthSid (sid) : 0xffffffff;
++  return appcontainer_nt::IsValidSid (sid) ? appcontainer_nt::GetLengthSid (sid) : 0xffffffff;
 +}
 +
 +DWORD
 +acl_used (PACL acl, ACL_SIZE_INFORMATION &info)
 +{
-+  if (!acl || !IsValidAcl (acl)
-+      || !GetAclInformation (acl, &info, sizeof info, AclSizeInformation)
++  if (!acl || !appcontainer_nt::IsValidAcl (acl)
++      || !appcontainer_nt::GetAclInformation (acl, &info, sizeof info, AclSizeInformation)
 +      || (acl->AclSize & 3) || (info.AclBytesInUse & 3)
 +      || info.AclBytesInUse < sizeof (ACL)
 +      || info.AclBytesInUse > acl->AclSize
@@ -1733,10 +1733,10 @@ index 0000000..2d9caba
 +  prepared_ = true;
 +
 +  scoped_token token;
-+  if (!OpenProcessToken (GetCurrentProcess (), TOKEN_QUERY, &token.value))
++  if (!appcontainer_nt::OpenProcessToken (GetCurrentProcess (), TOKEN_QUERY, &token.value))
 +    return GetLastError ();
 +  DWORD container = 0, returned = 0;
-+  if (!GetTokenInformation (token.value, TokenIsAppContainer, &container,
++  if (!appcontainer_nt::GetTokenInformation (token.value, TokenIsAppContainer, &container,
 +                            sizeof container, &returned))
 +    return GetLastError ();
 +  if (returned != sizeof container || container > 1)
@@ -1770,14 +1770,14 @@ index 0000000..2d9caba
 +  DWORD revision = 0;
 +  if (supplied)
 +    {
-+      if (!IsValidSecurityDescriptor (supplied)
-+          || !GetSecurityDescriptorControl (supplied, &control, &revision)
++      if (!appcontainer_nt::IsValidSecurityDescriptor (supplied)
++          || !appcontainer_nt::GetSecurityDescriptorControl (supplied, &control, &revision)
 +          || revision != SECURITY_DESCRIPTOR_REVISION
-+          || !GetSecurityDescriptorOwner (supplied, &owner, &owner_defaulted)
-+          || !GetSecurityDescriptorGroup (supplied, &group, &group_defaulted)
-+          || !GetSecurityDescriptorDacl (supplied, &dacl_present, &old_dacl,
++          || !appcontainer_nt::GetSecurityDescriptorOwner (supplied, &owner, &owner_defaulted)
++          || !appcontainer_nt::GetSecurityDescriptorGroup (supplied, &group, &group_defaulted)
++          || !appcontainer_nt::GetSecurityDescriptorDacl (supplied, &dacl_present, &old_dacl,
 +                                         &dacl_defaulted)
-+          || !GetSecurityDescriptorSacl (supplied, &sacl_present, &old_sacl,
++          || !appcontainer_nt::GetSecurityDescriptorSacl (supplied, &sacl_present, &old_sacl,
 +                                         &sacl_defaulted))
 +        return ERROR_INVALID_SECURITY_DESCR;
 +      /* These legacy control modes cannot be reproduced by the documented
@@ -1785,7 +1785,7 @@ index 0000000..2d9caba
 +      if (control & (legacy_dacl_untrusted | legacy_server_security))
 +        return ERROR_INVALID_SECURITY_DESCR;
 +      if ((control & SE_RM_CONTROL_VALID)
-+          && (error = GetSecurityDescriptorRMControl (supplied, &rm_control)))
++          && (error = appcontainer_nt::GetSecurityDescriptorRMControl (supplied, &rm_control)))
 +        return error;
 +    }
 +
@@ -1800,7 +1800,7 @@ index 0000000..2d9caba
 +      if (error)
 +        return error;
 +      DWORD system_size = sizeof system.bytes;
-+      if (!CreateWellKnownSid (WinLocalSystemSid, NULL, system.bytes,
++      if (!appcontainer_nt::CreateWellKnownSid (WinLocalSystemSid, NULL, system.bytes,
 +                               &system_size))
 +        return GetLastError ();
 +    }
@@ -1816,11 +1816,11 @@ index 0000000..2d9caba
 +  DWORD original_aces = private_default ? 0
 +    : dacl_info.AclBytesInUse - sizeof (ACL);
 +  DWORD package_ace = sizeof (ACCESS_ALLOWED_ACE) - sizeof (DWORD)
-+                      + GetLengthSid (package.bytes);
++                      + appcontainer_nt::GetLengthSid (package.bytes);
 +  DWORD dacl_size = sizeof (ACL) + original_aces + package_ace;
 +  if (private_default)
 +    dacl_size += 2 * (sizeof (ACCESS_ALLOWED_ACE) - sizeof (DWORD))
-+                 + GetLengthSid (user.bytes) + GetLengthSid (system.bytes);
++                 + appcontainer_nt::GetLengthSid (user.bytes) + appcontainer_nt::GetLengthSid (system.bytes);
 +  DWORD sacl_size = sacl_present && old_sacl ? old_sacl->AclSize : 0;
 +  DWORD total = owner_size + group_size + sacl_size + dacl_size;
 +  if (dacl_size > pipe_acl_limit || sacl_size > pipe_acl_limit
@@ -1833,7 +1833,7 @@ index 0000000..2d9caba
 +
 +  /* Copy all components. Descriptor pointers never refer back to caller
 +     storage or a token-query buffer after prepare returns. */
-+  if (!InitializeSecurityDescriptor (&descriptor_, SECURITY_DESCRIPTOR_REVISION))
++  if (!appcontainer_nt::InitializeSecurityDescriptor (&descriptor_, SECURITY_DESCRIPTOR_REVISION))
 +    return GetLastError ();
 +  PSID copied_owner = NULL, copied_group = NULL;
 +  PACL copied_sacl = NULL;
@@ -1849,44 +1849,44 @@ index 0000000..2d9caba
 +
 +  PACL dacl = reinterpret_cast<PACL> (cursor);
 +  DWORD acl_revision = private_default ? ACL_REVISION : old_dacl->AclRevision;
-+  if (!InitializeAcl (dacl, dacl_size, acl_revision))
++  if (!appcontainer_nt::InitializeAcl (dacl, dacl_size, acl_revision))
 +    return GetLastError ();
 +  if (original_aces
-+      && !AddAce (dacl, acl_revision, MAXDWORD,
++      && !appcontainer_nt::AddAce (dacl, acl_revision, MAXDWORD,
 +                   reinterpret_cast<BYTE *> (old_dacl) + sizeof (ACL),
 +                   original_aces))
 +    return GetLastError ();
 +  if (private_default
-+      && (!AddAccessAllowedAceEx (dacl, acl_revision, 0, GENERIC_ALL, user.bytes)
-+          || !AddAccessAllowedAceEx (dacl, acl_revision, 0, GENERIC_ALL,
++      && (!appcontainer_nt::AddAccessAllowedAceEx (dacl, acl_revision, 0, GENERIC_ALL, user.bytes)
++          || !appcontainer_nt::AddAccessAllowedAceEx (dacl, acl_revision, 0, GENERIC_ALL,
 +                                     system.bytes)))
 +    return GetLastError ();
 +  /* Append AFTER every original ACE. Preserve every deny/allow byte and its
 +     order. Never insert the new allow in front of an existing inherited deny.
 +     This does not promise canonical reordering; authorization remains subject
 +     to the original restrictions and the OS object access check. */
-+  if (!AddAccessAllowedAceEx (dacl, acl_revision, 0, GENERIC_ALL, package.bytes))
++  if (!appcontainer_nt::AddAccessAllowedAceEx (dacl, acl_revision, 0, GENERIC_ALL, package.bytes))
 +    return GetLastError ();
-+  if (!SetSecurityDescriptorOwner (&descriptor_, copied_owner, owner_defaulted)
-+      || !SetSecurityDescriptorGroup (&descriptor_, copied_group, group_defaulted)
-+      || !SetSecurityDescriptorSacl (&descriptor_, sacl_present, copied_sacl,
++  if (!appcontainer_nt::SetSecurityDescriptorOwner (&descriptor_, copied_owner, owner_defaulted)
++      || !appcontainer_nt::SetSecurityDescriptorGroup (&descriptor_, copied_group, group_defaulted)
++      || !appcontainer_nt::SetSecurityDescriptorSacl (&descriptor_, sacl_present, copied_sacl,
 +                                     sacl_defaulted)
-+      || !SetSecurityDescriptorDacl (&descriptor_, TRUE, dacl, dacl_defaulted))
++      || !appcontainer_nt::SetSecurityDescriptorDacl (&descriptor_, TRUE, dacl, dacl_defaulted))
 +    return GetLastError ();
 +  const SECURITY_DESCRIPTOR_CONTROL inheritance = SE_DACL_AUTO_INHERIT_REQ
 +    | SE_SACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED | SE_SACL_AUTO_INHERITED
 +    | SE_DACL_PROTECTED | SE_SACL_PROTECTED;
-+  if (!SetSecurityDescriptorControl (&descriptor_, inheritance,
++  if (!appcontainer_nt::SetSecurityDescriptorControl (&descriptor_, inheritance,
 +                                     control & inheritance))
 +    return GetLastError ();
 +  if ((control & SE_RM_CONTROL_VALID)
-+      && (error = SetSecurityDescriptorRMControl (&descriptor_, &rm_control)))
++      && (error = appcontainer_nt::SetSecurityDescriptorRMControl (&descriptor_, &rm_control)))
 +    return error;
 +  SECURITY_DESCRIPTOR_CONTROL copied_control;
-+  if (!GetSecurityDescriptorControl (&descriptor_, &copied_control, &revision)
++  if (!appcontainer_nt::GetSecurityDescriptorControl (&descriptor_, &copied_control, &revision)
 +      || copied_control != ((control & ~SE_SELF_RELATIVE) | SE_DACL_PRESENT))
 +    return ERROR_INVALID_SECURITY_DESCR;
-+  if (!IsValidSecurityDescriptor (&descriptor_))
++  if (!appcontainer_nt::IsValidSecurityDescriptor (&descriptor_))
 +    return ERROR_INVALID_SECURITY_DESCR;
 +  attributes_.nLength = sizeof attributes_;
 +  attributes_.lpSecurityDescriptor = &descriptor_;
@@ -2201,3 +2201,122 @@ diff --git a/winsup/cygwin/uinfo.cc b/winsup/cygwin/uinfo.cc
  
    /* Set token owner to the same value as token user */
    status = NtSetInformationToken (hProcToken, TokenOwner, &effec_cygsid,
+diff --git a/winsup/cygwin/local_includes/appcontainer_nt_security.h b/winsup/cygwin/local_includes/appcontainer_nt_security.h
+new file mode 100644
+--- /dev/null
++++ b/winsup/cygwin/local_includes/appcontainer_nt_security.h
+@@ -0,0 +1,114 @@
++/* Loader-lock-safe security operations. All security entry points are direct
++   ntdll imports: never enter Cygwin's ADVAPI32 autoload thunks during fork.
++   BOOL/BOOLEAN and NTSTATUS/Win32 error contracts are translated explicitly. */
++#ifndef APPCONTAINER_NT_SECURITY_H
++#define APPCONTAINER_NT_SECURITY_H
++namespace appcontainer_nt
++{
++extern "C" {
++  LONG NTAPI NtOpenProcessToken (HANDLE, ACCESS_MASK, PHANDLE);
++  LONG NTAPI NtQueryInformationToken (HANDLE, TOKEN_INFORMATION_CLASS, PVOID, ULONG, PULONG);
++  ULONG NTAPI RtlNtStatusToDosError (LONG);
++  BOOLEAN NTAPI RtlValidSid (PSID);
++  ULONG NTAPI RtlLengthSid (PSID);
++  ULONG NTAPI RtlLengthRequiredSid (ULONG);
++  PUCHAR NTAPI RtlSubAuthorityCountSid (PSID);
++  PULONG NTAPI RtlSubAuthoritySid (PSID, ULONG);
++  LONG NTAPI RtlCopySid (ULONG, PSID, PSID);
++  LONG NTAPI RtlInitializeSid (PSID, PSID_IDENTIFIER_AUTHORITY, UCHAR);
++  BOOLEAN NTAPI RtlValidAcl (PACL);
++  LONG NTAPI RtlQueryInformationAcl (PACL, PVOID, ULONG, ACL_INFORMATION_CLASS);
++  BOOLEAN NTAPI RtlValidSecurityDescriptor (PSECURITY_DESCRIPTOR);
++  BOOLEAN NTAPI RtlValidRelativeSecurityDescriptor (PSECURITY_DESCRIPTOR, ULONG, SECURITY_INFORMATION);
++  ULONG NTAPI RtlLengthSecurityDescriptor (PSECURITY_DESCRIPTOR);
++  LONG NTAPI RtlGetControlSecurityDescriptor (PSECURITY_DESCRIPTOR, PSECURITY_DESCRIPTOR_CONTROL, PULONG);
++  LONG NTAPI RtlGetOwnerSecurityDescriptor (PSECURITY_DESCRIPTOR, PSID *, PBOOLEAN);
++  LONG NTAPI RtlGetGroupSecurityDescriptor (PSECURITY_DESCRIPTOR, PSID *, PBOOLEAN);
++  LONG NTAPI RtlGetDaclSecurityDescriptor (PSECURITY_DESCRIPTOR, PBOOLEAN, PACL *, PBOOLEAN);
++  LONG NTAPI RtlGetSaclSecurityDescriptor (PSECURITY_DESCRIPTOR, PBOOLEAN, PACL *, PBOOLEAN);
++  BOOLEAN NTAPI RtlGetSecurityDescriptorRMControl (PSECURITY_DESCRIPTOR, PUCHAR);
++  LONG NTAPI RtlCreateSecurityDescriptor (PSECURITY_DESCRIPTOR, ULONG);
++  LONG NTAPI RtlCreateAcl (PACL, ULONG, ULONG);
++  LONG NTAPI RtlAddAce (PACL, ULONG, ULONG, PVOID, ULONG);
++  LONG NTAPI RtlAddAccessAllowedAceEx (PACL, ULONG, ULONG, ACCESS_MASK, PSID);
++  LONG NTAPI RtlSetOwnerSecurityDescriptor (PSECURITY_DESCRIPTOR, PSID, BOOLEAN);
++  LONG NTAPI RtlSetGroupSecurityDescriptor (PSECURITY_DESCRIPTOR, PSID, BOOLEAN);
++  LONG NTAPI RtlSetDaclSecurityDescriptor (PSECURITY_DESCRIPTOR, BOOLEAN, PACL, BOOLEAN);
++  LONG NTAPI RtlSetSaclSecurityDescriptor (PSECURITY_DESCRIPTOR, BOOLEAN, PACL, BOOLEAN);
++  LONG NTAPI RtlSetControlSecurityDescriptor (PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL, SECURITY_DESCRIPTOR_CONTROL);
++  VOID NTAPI RtlSetSecurityDescriptorRMControl (PSECURITY_DESCRIPTOR, PUCHAR);
++}
++inline BOOL success (LONG status)
++{
++  if (status >= 0) return TRUE;
++  SetLastError (RtlNtStatusToDosError (status));
++  return FALSE;
++}
++inline BOOL OpenProcessToken (HANDLE process, DWORD access, PHANDLE token)
++{ return success (NtOpenProcessToken (process, access, token)); }
++inline BOOL GetTokenInformation (HANDLE token, TOKEN_INFORMATION_CLASS kind, PVOID data, DWORD size, PDWORD returned)
++{ ULONG length = 0; LONG status = NtQueryInformationToken (token, kind, data, size, &length); *returned = length; return success (status); }
++inline PUCHAR GetSidSubAuthorityCount (PSID sid) { return RtlSubAuthorityCountSid (sid); }
++inline DWORD GetSidLengthRequired (UCHAR count) { return RtlLengthRequiredSid (count); }
++inline BOOL IsValidSid (PSID sid) { return RtlValidSid (sid) != FALSE; }
++inline DWORD GetLengthSid (PSID sid) { return RtlLengthSid (sid); }
++inline BOOL CopySid (DWORD size, PSID destination, PSID source) { return success (RtlCopySid (size, destination, source)); }
++inline BOOL CreateWellKnownSid (WELL_KNOWN_SID_TYPE kind, PSID domain, PSID sid, PDWORD size)
++{
++  if (kind != WinLocalSystemSid || domain || !size || *size < 12)
++    { SetLastError (ERROR_INVALID_PARAMETER); return FALSE; }
++  SID_IDENTIFIER_AUTHORITY authority = SECURITY_NT_AUTHORITY;
++  if (!success (RtlInitializeSid (sid, &authority, 1))) return FALSE;
++  *RtlSubAuthoritySid (sid, 0) = SECURITY_LOCAL_SYSTEM_RID;
++  *size = 12;
++  return TRUE;
++}
++inline BOOL IsValidAcl (PACL acl) { return RtlValidAcl (acl) != FALSE; }
++inline BOOL GetAclInformation (PACL acl, PVOID data, DWORD size, ACL_INFORMATION_CLASS kind)
++{ return success (RtlQueryInformationAcl (acl, data, size, kind)); }
++inline BOOL GetSecurityDescriptorControl (PSECURITY_DESCRIPTOR sd, PSECURITY_DESCRIPTOR_CONTROL control, PDWORD revision)
++{ ULONG value = 0; LONG status = RtlGetControlSecurityDescriptor (sd, control, &value); *revision = value; return success (status); }
++inline BOOL IsValidSecurityDescriptor (PSECURITY_DESCRIPTOR sd)
++{
++  if (!sd) return FALSE;
++  SECURITY_DESCRIPTOR_CONTROL control = 0; ULONG revision = 0;
++  if (RtlGetControlSecurityDescriptor (sd, &control, &revision) < 0 || revision != SECURITY_DESCRIPTOR_REVISION) return FALSE;
++  if (!(control & SE_SELF_RELATIVE)) return RtlValidSecurityDescriptor (sd) != FALSE;
++  // SDDL native fixtures supply relative descriptors. Keep that support and
++  // bound the computed length before the relative validator. This does not
++  // establish allocation extent: callers still provide readable descriptor
++  // storage, as for the original Win32 API. Never treat one as absolute.
++  ULONG size = RtlLengthSecurityDescriptor (sd);
++  return size >= sizeof (SECURITY_DESCRIPTOR_RELATIVE) && size <= 128 * 1024
++    && RtlValidRelativeSecurityDescriptor (sd, size, 0) != FALSE;
++}
++inline BOOL GetSecurityDescriptorOwner (PSECURITY_DESCRIPTOR sd, PSID *sid, PBOOL defaulted)
++{ BOOLEAN flag = FALSE; LONG status = RtlGetOwnerSecurityDescriptor (sd, sid, &flag); if (status >= 0) *defaulted = flag; return success (status); }
++inline BOOL GetSecurityDescriptorGroup (PSECURITY_DESCRIPTOR sd, PSID *sid, PBOOL defaulted)
++{ BOOLEAN flag = FALSE; LONG status = RtlGetGroupSecurityDescriptor (sd, sid, &flag); if (status >= 0) *defaulted = flag; return success (status); }
++inline BOOL GetSecurityDescriptorDacl (PSECURITY_DESCRIPTOR sd, PBOOL present, PACL *acl, PBOOL defaulted)
++{ BOOLEAN exists = FALSE, flag = FALSE; LONG status = RtlGetDaclSecurityDescriptor (sd, &exists, acl, &flag); if (status >= 0) { *present = exists; *defaulted = flag; } return success (status); }
++inline BOOL GetSecurityDescriptorSacl (PSECURITY_DESCRIPTOR sd, PBOOL present, PACL *acl, PBOOL defaulted)
++{ BOOLEAN exists = FALSE, flag = FALSE; LONG status = RtlGetSaclSecurityDescriptor (sd, &exists, acl, &flag); if (status >= 0) { *present = exists; *defaulted = flag; } return success (status); }
++inline DWORD GetSecurityDescriptorRMControl (PSECURITY_DESCRIPTOR sd, PUCHAR value)
++{ return RtlGetSecurityDescriptorRMControl (sd, value) ? ERROR_SUCCESS : ERROR_INVALID_SECURITY_DESCR; }
++inline BOOL InitializeSecurityDescriptor (PSECURITY_DESCRIPTOR sd, DWORD revision)
++{ return success (RtlCreateSecurityDescriptor (sd, revision)); }
++inline BOOL InitializeAcl (PACL acl, DWORD size, DWORD revision) { return success (RtlCreateAcl (acl, size, revision)); }
++inline BOOL AddAce (PACL acl, DWORD revision, DWORD index, PVOID bytes, DWORD size) { return success (RtlAddAce (acl, revision, index, bytes, size)); }
++inline BOOL AddAccessAllowedAceEx (PACL acl, DWORD revision, DWORD flags, DWORD access, PSID sid)
++{ return success (RtlAddAccessAllowedAceEx (acl, revision, flags, access, sid)); }
++inline BOOL SetSecurityDescriptorOwner (PSECURITY_DESCRIPTOR sd, PSID sid, BOOL defaulted) { return success (RtlSetOwnerSecurityDescriptor (sd, sid, defaulted != FALSE)); }
++inline BOOL SetSecurityDescriptorGroup (PSECURITY_DESCRIPTOR sd, PSID sid, BOOL defaulted) { return success (RtlSetGroupSecurityDescriptor (sd, sid, defaulted != FALSE)); }
++inline BOOL SetSecurityDescriptorDacl (PSECURITY_DESCRIPTOR sd, BOOL present, PACL acl, BOOL defaulted) { return success (RtlSetDaclSecurityDescriptor (sd, present != FALSE, acl, defaulted != FALSE)); }
++inline BOOL SetSecurityDescriptorSacl (PSECURITY_DESCRIPTOR sd, BOOL present, PACL acl, BOOL defaulted) { return success (RtlSetSaclSecurityDescriptor (sd, present != FALSE, acl, defaulted != FALSE)); }
++inline BOOL SetSecurityDescriptorControl (PSECURITY_DESCRIPTOR sd, SECURITY_DESCRIPTOR_CONTROL mask, SECURITY_DESCRIPTOR_CONTROL bits)
++{ return success (RtlSetControlSecurityDescriptor (sd, mask, bits)); }
++inline DWORD SetSecurityDescriptorRMControl (PSECURITY_DESCRIPTOR sd, PUCHAR value)
++{
++  RtlSetSecurityDescriptorRMControl (sd, value);
++  UCHAR copied = 0;
++  return RtlGetSecurityDescriptorRMControl (sd, &copied) && copied == *value ? ERROR_SUCCESS : ERROR_INVALID_SECURITY_DESCR;
++}
++}
++#endif

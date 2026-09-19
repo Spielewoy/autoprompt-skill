@@ -12,7 +12,7 @@ async function main(args) {
   assert.deepEqual(Object.keys(context).sort(),['candidate','node','helper','captureAdapterSha256'].sort())
   const head=cp.execFileSync('git',['-C',repo,'rev-parse','HEAD'],{encoding:'utf8',timeout:10000,maxBuffer:4096}).trim()
   assert.equal(head,context.candidate.authority.producer.headSha,'Consumer checkout must match candidate producer head')
-  cp.execFileSync('git',['-C',repo,'diff','--exit-code','HEAD','--','agents','scripts','tests/source/windows-bash-runtime.test.cjs','tests/fixtures/windows-msys/bash-ipc.sh'],{timeout:10000,maxBuffer:1024*1024})
+  cp.execFileSync('git',['-C',repo,'diff','--exit-code','HEAD','--','agents','scripts','tests'],{timeout:10000,maxBuffer:1024*1024})
   const output=path.resolve(outputArg)
   assert.equal(fs.existsSync(output),false);assert.equal(fs.realpathSync.native(path.dirname(output)),path.dirname(output))
   fs.mkdirSync(output,{mode:0o700})

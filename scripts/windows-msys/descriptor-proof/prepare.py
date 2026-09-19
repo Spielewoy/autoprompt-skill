@@ -40,14 +40,16 @@ def main():
     require(lock['source']['commit'] == BINDING['sourceCommit'] and lock['sdk']['commit'] == BINDING['sdkCommit'], 'pinned source/SDK mismatch')
     source = extract_new_file(patch.decode('utf-8'), 'winsup/cygwin/sec/appcontainer_pipe.cc')
     header = extract_new_file(patch.decode('utf-8'), 'winsup/cygwin/local_includes/appcontainer_pipe_security.h')
+    nt_security = extract_new_file(patch.decode('utf-8'), 'winsup/cygwin/local_includes/appcontainer_nt_security.h')
     require(sha(source) == BINDING['helperSha256'] and sha(header) == BINDING['headerSha256'], 'helper digest mismatch')
+    require(sha(nt_security) == BINDING['ntSecuritySha256'], 'direct NT security adapter digest mismatch')
     old = b'#include "winsup.h"\n'
     new = b'#include <windows.h>\n'
     require(source.count(old) == 1, 'one exact platform umbrella include required')
     standalone = source.replace(old, new)
     require(sha(standalone) == BINDING['standaloneHelperSha256'], 'single-include transformation mismatch')
     output.mkdir(mode=0o700)
-    files = {'appcontainer_pipe.cc': standalone, 'appcontainer_pipe_security.h': header, 'descriptor-proof.cc': fixture}
+    files = {'appcontainer_pipe.cc': standalone, 'appcontainer_pipe_security.h': header, 'appcontainer_nt_security.h': nt_security, 'descriptor-proof.cc': fixture}
     for name, data in files.items():
         with (output / name).open('xb') as target: target.write(data)
     record = {**BINDING, 'lockSha256': sha(lock_bytes), 'transformation': 'Replace exactly one winsup.h include with windows.h; all other helper/header bytes unchanged', 'generated': {name: sha(data) for name, data in files.items()}, 'nativeCompile': 'pending', 'nativeExecution': 'pending'}

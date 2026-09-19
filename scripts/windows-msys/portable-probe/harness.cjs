@@ -124,7 +124,6 @@ function tupleIdentity(capability) { return Object.freeze(copy(slot(capability).
 function smokeEnvironment(environment, bashPath) {
   const controlled = Object.fromEntries(Object.entries(environment).filter(([key]) =>
     !['AUTOPROMPT_WINDOWS_BASH','NODE_OPTIONS','NODE_PATH','NODE_TEST_CONTEXT'].includes(key.toUpperCase())))
-  controlled.AUTOPROMPT_WINDOWS_BASH = bashPath
   return controlled
 }
 function materialize(capability, destination) {
@@ -135,12 +134,13 @@ function materialize(capability, destination) {
   for (const [packet, name] of [['runtime/bash.exe','bash.exe'],['runtime/msys-2.0.dll','msys-2.0.dll'],['fixture/posix-proof.exe','posix-proof.exe']]) {
     fs.writeFileSync(path.join(bin,name), Buffer.from(data.get(packet)), { flag:'wx', mode:0o500 })
   }
-  const { bindBashRuntime, resolveWindowsBash } = require(path.join(repo,'agents/codex/workflow/windows-appcontainer-command.js'))
+  const { bindBashRuntime, resolveWindowsBash } = require(path.join(repo,'scripts/windows-msys/diagnostic-smoke/command.cjs'))
   const expected = ['bash.exe','msys-2.0.dll'].map(name => ({ name, sha256:hash(data.get('runtime/'+name)), bytes:data.get('runtime/'+name).length }))
   const { closureRecords } = require(path.join(repo,'scripts/windows-msys/probe-built-runtime.cjs'))
   const files = bindBashRuntime(bin, process.env.SystemRoot)
   assert.deepEqual(closureRecords(files), expected)
-  const selected = resolveWindowsBash({ bashPath:path.join(bin,'bash.exe'), env:{ SystemRoot:process.env.SystemRoot, PATH:bin, AUTOPROMPT_WINDOWS_BASH:path.join(bin,'bash.exe') } })
+  const context = {schema:1,purpose:'compiler-output-smoke-not-runtime-acceptance',node:{architecture:value.node.architecture,sha256:value.node.executableSha256,kind:'adapted-worker'},bash:{path:path.join(bin,'bash.exe'),files:expected}}
+  const selected = resolveWindowsBash({ diagnosticTuple:context })
   assert.equal(selected.bash.path.toLowerCase(), path.join(bin,'bash.exe').toLowerCase())
   assert.deepEqual(closureRecords(selected.files), expected)
   return Object.freeze({ root, bin, bash:path.join(bin,'bash.exe'), fixture:path.join(bin,'posix-proof.exe'), tuple:tupleIdentity(capability) })
@@ -151,11 +151,16 @@ function runSmoke(capability, outputRoot) {
     provenanceSha256:value.node.provenanceSha256, nativeProofSha256:value.node.nativeProofSha256 })
   const output = privateDirectory(repo, outputRoot)
   const runtime = materialize(capability, path.join(output,'runtime'))
-  const testFile = 'tests/source/windows-bash-runtime.test.cjs'
-  const testSha256 = hash(source(repo,testFile))
+  const testFile = 'scripts/windows-msys/diagnostic-smoke/native.cjs'
+  const testPaths = [testFile,'scripts/windows-msys/diagnostic-smoke/binding.cjs','scripts/windows-msys/diagnostic-smoke/command.cjs','scripts/windows-msys/diagnostic-smoke/probe.cjs','tests/helpers/windows-bash-native-smoke.cjs','tests/fixtures/windows-msys/bash-ipc.sh']
+  const testSources = Object.fromEntries(testPaths.map(name=>[name,hash(source(repo,name))]))
+  const testSha256 = hash(canonical(testSources))
   const { TEST_NAME, selectedTestPassed, closureRecords } = require(path.join(repo,'scripts/windows-msys/probe-built-runtime.cjs'))
   const environment = smokeEnvironment(process.env, runtime.bash)
-  const result = cp.spawnSync(process.execPath, ['--test','--test-reporter=tap','--test-name-pattern','^'+TEST_NAME.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'$',path.join(repo,testFile)],
+  const context={schema:1,purpose:'compiler-output-smoke-not-runtime-acceptance',node:{architecture:value.node.architecture,sha256:value.node.executableSha256,kind:'adapted-worker'},bash:{path:runtime.bash,files:['bash.exe','msys-2.0.dll'].map(name=>({name,sha256:hash(data.get('runtime/'+name)),bytes:data.get('runtime/'+name).length}))}}
+  const contextBytes=canonical(context),contextPath=path.join(output,'diagnostic-context.json')
+  fs.writeFileSync(contextPath,contextBytes,{flag:'wx',mode:0o400})
+  const result = cp.spawnSync(process.execPath, ['--test-reporter=tap',path.join(repo,testFile),contextPath,hash(contextBytes)],
     { cwd:repo, env:environment, encoding:'utf8', timeout:615000, maxBuffer:8*1024*1024, shell:false, windowsHide:true, stdio:['ignore','pipe','pipe'] })
   const transcripts = {}
   for (const stream of ['stdout','stderr']) {
@@ -167,11 +172,11 @@ function runSmoke(capability, outputRoot) {
   assert.ok(!transcripts.stdout.truncated && !transcripts.stderr.truncated,'Native smoke transcript exceeded bound')
   assert.ifError(result.error); assert.equal(result.signal,null); assert.equal(result.status,0,'Actual copied-closure Bash isolation test failed')
   selectedTestPassed(result.stdout)
-  assert.equal(hash(source(repo,testFile)),testSha256)
-  const { bindBashRuntime } = require(path.join(repo,'agents/codex/workflow/windows-appcontainer-command.js'))
+  assert.deepEqual(Object.fromEntries(testPaths.map(name=>[name,hash(source(repo,name))])),testSources)
+  const { bindBashRuntime } = require(path.join(repo,'scripts/windows-msys/diagnostic-smoke/command.cjs'))
   assert.deepEqual(closureRecords(bindBashRuntime(runtime.bin,process.env.SystemRoot)), ['bash.exe','msys-2.0.dll'].map(name=>({name,sha256:hash(data.get('runtime/'+name)),bytes:data.get('runtime/'+name).length})))
   const record = { schema:1, status:'consumer-native-bash-smoke-passed-not-accepted', tuple:value.tuple,
-    testName:TEST_NAME, testSha256, stdoutSha256:hash(Buffer.from(result.stdout)), stderrSha256:hash(Buffer.from(result.stderr)),
+    testName:TEST_NAME, testSha256, testSources, stdoutSha256:hash(Buffer.from(result.stdout)), stderrSha256:hash(Buffer.from(result.stderr)),
     nativeTestAssertions:'exact-existing-test-including-probe-and-owned-tool-completion', accepted:false }
   fs.writeFileSync(path.join(output,'portable-bash-smoke.json'),canonical(record),{flag:'wx'})
   const smoke = Object.freeze({status:record.status})
