@@ -17,6 +17,10 @@ node --test --test-reporter=tap scripts/windows-runtime/precompiled-proof/native
 if ($LASTEXITCODE -ne 0) { throw 'precompiled-helper-proof-failed' }
 node scripts/windows-runtime/precompiled-proof/verify-output.cjs "$build/native.tap"
 if ($LASTEXITCODE -ne 0) { throw 'precompiled-helper-output-refused' }
+node --test --test-reporter=tap scripts/windows-runtime/precompiled-proof/acl.test.cjs > "$build/acl-native.tap"
+if ($LASTEXITCODE -ne 0) { throw 'native-acl-proof-failed' }
+node scripts/windows-runtime/precompiled-proof/verify-acl-output.cjs "$build/acl-native.tap"
+if ($LASTEXITCODE -ne 0) { throw 'native-acl-output-refused' }
 ```
 
 The build directory must be new. Build-time CodeDOM compilation emits AnyCPU CLR4 with an exact config requesting .NET Framework4.8. Windows PowerShell5.1 rejects combining Add-Type's CompilerParameters with OutputAssembly at runtime; the builder calls CSharpCodeProvider directly with one explicit compiler policy. Native ARM64 requires the system's native ARM64 .NET Framework runtime; x64 emulation on ARM64 fails the executable's architecture check. `build.json` binds source bytes before and after compile and executable/config bytes, but says `compiled-native-identity-only`. Its hashes are fixture identity, not independent release authority. The native tests bind all recorded source bytes back to the current checkout.
@@ -24,6 +28,8 @@ The build directory must be new. Build-time CodeDOM compilation emits AnyCPU CLR
 The seven native TAP cases require actual Windows and zero skips in CI. Six exercise the executable transport: held capture above the old16MiB limit (17MiB file), concurrent overwrite/rename refusal, wrong finish, trailing input, termination before/after capture, and wrong helper identity. The seventh executes all17 existing NTFS controls after loading the **same compiled helper executable's assembly**: no second audit.cs compilation. The unchanged `native-controls.cs` supplies attack primitives, and local tests verify the17-control body stays identical to the established suite. These17 cases are component conformance against the compiled lease type; the other six separately prove subprocess transport and capture composition. They are not represented as17 independent executable-handshake tests.
 
 `verify-output.cjs` requires all seven exact names in order, one complete plan, successful results, zero skips/todos/failures, and exact unique totals. Native tests explicitly skip on Linux; the verifier refuses such output. Local tests compile both complete C# sources and run40 actual parser/read/deadline/lease-shape assertions. Run `node --test local.test.cjs verify-output.test.cjs`; set `AUTOPROMPT_CAPTURE_PWSH` to the local PowerShell executable if it is not on PATH. Missing compiler fails explicitly.
+
+The separate `--acl-probe SID TARGET IDENTITY` mode checks the actual AppContainer token and native architecture, holds the specified physical NTFS directory by its volume/file identity, and uses `ReOpenFile` on that held object. A positive read-access reopen must succeed; a WRITE_DAC reopen must fail with numeric Windows error5. It emits the fixed ASCII result only after closing its handles. It changes no ACL and needs no metadata access to the target's private ancestors. The three-case `acl.test.cjs` suite compiles the complete sources, runs33 parser contracts, then exercises actual AppContainer denial, wrong SID/identity, missing target, host-token refusal, and an explicit WRITE_DAC grant that must be rejected. Its separate verifier requires all three cases with zero skips. This preserves the original seven capture cases and keeps native evidence distinct from local compilation.
 
 ## Capture and lifecycle limits
 

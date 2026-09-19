@@ -49,12 +49,24 @@ function resourceRoots(policy, controlRoot, executableRoots) {
   return [...roots.values()]
 }
 function validatePlan(plan, expected = {}) {
-  need(exact(plan, ['schemaVersion', 'profileName', 'profileSid', 'roots', 'entries']) && plan.schemaVersion === 2 && /^Autoprompt_[a-f0-9]{32}$/.test(plan.profileName) && /^S-1-15-2-(?:[0-9]+-){6}[0-9]+$/.test(plan.profileSid))
+  need(exact(plan, ['schemaVersion', 'profileName', 'profileSid', 'roots', 'entries']) && plan.schemaVersion === 3 && /^Autoprompt_[a-f0-9]{32}$/.test(plan.profileName) && /^S-1-15-2-(?:[0-9]+-){6}[0-9]+$/.test(plan.profileSid))
   need(!expected.profileName || plan.profileName === expected.profileName)
   need(Array.isArray(plan.roots) && plan.roots.length > 0 && plan.roots.length <= 64 && Array.isArray(plan.entries) && plan.entries.length > 0 && plan.entries.length <= 4096)
   const ids = new Map(), validIdentity = entry => typeof entry.identity === 'string' && /^[a-f0-9]{8}:[a-f0-9]{16}$/.test(entry.identity) && typeof entry.creation === 'string' && /^[0-9]{1,19}$/.test(entry.creation)
   for (const entry of plan.entries) {
-    need(exact(entry, ['identity', 'creation', 'label', 'directory', 'writable', 'git', 'root', 'daclProtected']) && validIdentity(entry) && ['directory', 'writable', 'git', 'root', 'daclProtected'].every(key => typeof entry[key] === 'boolean') && typeof entry.label === 'string' && entry.label.length <= 5464 && Buffer.from(entry.label, 'base64').toString('base64') === entry.label && !ids.has(entry.identity))
+    need(exact(entry, ['identity', 'creation', 'label', 'directory', 'writable', 'git', 'root', 'daclProtected', 'inheritedAces', 'explicitAces']) && validIdentity(entry) && ['directory', 'writable', 'git', 'root', 'daclProtected'].every(key => typeof entry[key] === 'boolean') && typeof entry.label === 'string' && entry.label.length <= 5464 && Buffer.from(entry.label, 'base64').toString('base64') === entry.label && !ids.has(entry.identity))
+    need(Array.isArray(entry.inheritedAces) && Array.isArray(entry.explicitAces) && entry.inheritedAces.length + entry.explicitAces.length <= 8192)
+    need((entry.git && !entry.daclProtected) || (!entry.inheritedAces.length && !entry.explicitAces.length))
+    let aclBytes = 8
+    const decodeAce = (value, inherited) => {
+      need(typeof value === 'string' && value.length <= 87380)
+      const bytes = Buffer.from(value, 'base64'); aclBytes += bytes.length
+      need(bytes.length >= 4 && bytes.length <= 65528 && !(bytes.length & 3) && bytes.readUInt16LE(2) === bytes.length && bytes.toString('base64') === value && Boolean(bytes[1] & 16) === inherited && aclBytes <= 65536)
+      bytes[1] &= ~16
+      return bytes.toString('base64')
+    }
+    const flattened = new Set(entry.inheritedAces.map(value => decodeAce(value, true)))
+    for (const value of entry.explicitAces) need(flattened.has(decodeAce(value, false)))
     ids.set(entry.identity, entry)
   }
   for (const root of plan.roots) {

@@ -97,7 +97,7 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          node --test scripts/windows-runtime/precompiled-proof/verify-output.test.cjs
+          node --test scripts/windows-runtime/precompiled-proof/verify-output.test.cjs scripts/windows-runtime/precompiled-proof/verify-acl-output.test.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $build = Join-Path $env:RUNNER_TEMP 'precompiled-capture'
           & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -File scripts/windows-runtime/precompiled-proof/build.ps1 -OutputDirectory $build 2>&1 | Tee-Object -FilePath native-windows-runtime-precompiled-build.log
@@ -106,6 +106,10 @@ jobs:
           node --test --test-reporter=tap scripts/windows-runtime/precompiled-proof/native.test.cjs 2>&1 | Tee-Object -FilePath (Join-Path $build 'native.tap')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/windows-runtime/precompiled-proof/verify-output.cjs (Join-Path $build 'native.tap')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test --test-reporter=tap scripts/windows-runtime/precompiled-proof/acl.test.cjs 2>&1 | Tee-Object -FilePath (Join-Path $build 'acl-native.tap')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-runtime/precompiled-proof/verify-acl-output.cjs (Join-Path $build 'acl-native.tap')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve fixed native capture executable and observations
         id: runtime-precompiled-evidence

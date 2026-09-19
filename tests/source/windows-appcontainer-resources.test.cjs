@@ -23,8 +23,8 @@ function harness(applyResult) {
     events.push([request.operation, request])
     if (request.operation === 'plan') {
       const roots = request.roots.map((root, index) => ({ ...root, identity: `12345678:${(index + 1).toString(16).padStart(16, '0')}`, creation: '132000000000000000' }))
-      return { schemaVersion: 2, profileName: request.profileName, profileSid, roots,
-        entries: roots.map(root => ({ identity: root.identity, creation: root.creation, label: '', directory: root.kind === 'directory', writable: root.writable, git: false, root: true, daclProtected: true })) }
+      return { schemaVersion: 3, profileName: request.profileName, profileSid, roots,
+        entries: roots.map(root => ({ identity: root.identity, creation: root.creation, label: '', directory: root.kind === 'directory', writable: root.writable, git: false, root: true, daclProtected: true, inheritedAces: [], explicitAces: [] })) }
     }
     if (request.operation === 'apply') {
       applied = request.plan
@@ -78,7 +78,7 @@ test('closed plans reject unknown keys, duplicated identities, and replacement r
   const h = harness(), lease = await h.api.prepareWindowsAppContainerResources(h.options)
   const plan = JSON.parse(h.records.get(lease.recovery.journalPath)).plan
   assert.equal(validatePlan(plan), plan)
-  assert.equal(plan.schemaVersion, 2)
+  assert.equal(plan.schemaVersion, 3)
   assert.throws(() => validatePlan({ ...plan, schemaVersion: 1 }), { code: 'WINDOWS_RESOURCE_INVALID' })
   for (const value of [undefined, 'false', 0]) {
     const entries = plan.entries.map(entry => ({ ...entry }))
@@ -89,6 +89,30 @@ test('closed plans reject unknown keys, duplicated identities, and replacement r
   assert.throws(() => validatePlan({ ...plan, extra: true }), { code: 'WINDOWS_RESOURCE_INVALID' })
   assert.throws(() => validatePlan({ ...plan, entries: [...plan.entries, plan.entries[0]] }), { code: 'WINDOWS_RESOURCE_INVALID' })
   assert.throws(() => validatePlan({ ...plan, roots: [{ ...plan.roots[0], creation: '1' }, ...plan.roots.slice(1)] }), { code: 'WINDOWS_RESOURCE_INVALID' })
+})
+
+test('v3 provenance preserves multiplicity and rejects malformed or unowned inheritance records', async () => {
+  const h = harness(), lease = await h.api.prepareWindowsAppContainerResources(h.options)
+  const plan = JSON.parse(h.records.get(lease.recovery.journalPath)).plan
+  const inherited = 'ABMUAP8BHwABAQAAAAAABRIAAAA=', explicit = 'AAMUAP8BHwABAQAAAAAABRIAAAA='
+  const entry = { ...plan.entries[0], git: true, daclProtected: false, inheritedAces: [inherited, inherited], explicitAces: [explicit] }
+  const withEntry = value => ({ ...plan, entries: [value, ...plan.entries.slice(1)] })
+  assert.equal(validatePlan(withEntry(entry)).entries[0], entry)
+  const malformedHeader = Buffer.from(inherited, 'base64'); malformedHeader[2]--
+  const unrelated = Buffer.from(explicit, 'base64'); unrelated[4] ^= 2
+  for (const change of [
+    { inheritedAces: undefined }, { explicitAces: null }, { inheritedAces: 'not-an-array' },
+    { inheritedAces: [null] }, { inheritedAces: ['invalid-base64'] }, { inheritedAces: [inherited + '\n'] },
+    { inheritedAces: [malformedHeader.toString('base64')] }, { inheritedAces: [explicit] },
+    { explicitAces: [inherited] }, { explicitAces: [unrelated.toString('base64')] },
+    { git: false }, { daclProtected: true },
+    { inheritedAces: Array(8193).fill(inherited), explicitAces: [] },
+    { inheritedAces: Array(3277).fill(inherited), explicitAces: [] },
+  ]) assert.throws(() => validatePlan(withEntry({ ...entry, ...change })), { code: 'WINDOWS_RESOURCE_INVALID' })
+  // Both fields are mandatory even when this object owns no transition.
+  const missing = { ...entry }; delete missing.explicitAces
+  assert.throws(() => validatePlan(withEntry(missing)), { code: 'WINDOWS_RESOURCE_INVALID' })
+  assert.equal(validatePlan(withEntry({ ...entry, inheritedAces: Array(3276).fill(inherited), explicitAces: [] })).schemaVersion, 3)
 })
 
 test('invalid native apply replies retain the journal recovery binding', async () => {
@@ -103,11 +127,11 @@ test('invalid native apply replies retain the journal recovery binding', async (
   await h.api.recoverWindowsAppContainerResources({ controlRoot, ...error.recovery, verifyDrainEvidence: h.verifyDrainEvidence, evidence })
 })
 
-test('v1 recovery is refused without removing the retained journal or invoking restore', async () => {
+for (const version of [1, 2]) test(`v${version} recovery is refused without removing the retained journal or invoking restore`, async () => {
   const h = harness(), lease = await h.api.prepareWindowsAppContainerResources(h.options)
   const journal = JSON.parse(h.records.get(lease.recovery.journalPath))
-  journal.plan.schemaVersion = 1
-  for (const entry of journal.plan.entries) delete entry.daclProtected
+  journal.plan.schemaVersion = version
+  for (const entry of journal.plan.entries) { if (version === 1) delete entry.daclProtected; delete entry.inheritedAces; delete entry.explicitAces }
   const body = { schemaVersion: journal.schemaVersion, leaseId: journal.leaseId, plan: journal.plan }
   journal.sha256 = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex')
   const bytes = Buffer.from(JSON.stringify(journal))
