@@ -11,7 +11,7 @@ const controlRoot = 'C:\\controller'
 const policy = { provider: 'claude', schemaVersion: 1, readOnly: false, targetPath: 'C:\\clone', scratchPath: 'C:\\scratch', readableRoots: ['C:\\clone', 'C:\\scratch'], writableRoots: ['C:\\clone', 'C:\\scratch'] }
 const executableRoots = [{ path: 'C:\\runtime\\node.exe', kind: 'file' }, { path: 'C:\\controller\\command.cmd', kind: 'file' }]
 const profileSid = 'S-1-15-2-1-2-3-4-5-6-7'
-function harness(applyResult) {
+function harness(applyResult, transforms = {}) {
   const events = [], records = new Map(), branded = new WeakSet()
   let applied
   const capture = {
@@ -23,8 +23,9 @@ function harness(applyResult) {
     events.push([request.operation, request])
     if (request.operation === 'plan') {
       const roots = request.roots.map((root, index) => ({ ...root, identity: `12345678:${(index + 1).toString(16).padStart(16, '0')}`, creation: '132000000000000000' }))
-      return { schemaVersion: 3, profileName: request.profileName, profileSid, roots,
+      const plan = { schemaVersion: 3, profileName: request.profileName, profileSid, roots,
         entries: roots.map(root => ({ identity: root.identity, creation: root.creation, label: '', directory: root.kind === 'directory', writable: root.writable, git: false, root: true, daclProtected: true, inheritedAces: [], explicitAces: [] })) }
+      return transforms.plan ? transforms.plan(plan) : plan
     }
     if (request.operation === 'apply') {
       applied = request.plan
@@ -32,12 +33,60 @@ function harness(applyResult) {
       return applyResult || { profileName: request.plan.profileName, profileSid, profilePath: 'C:\\profiles\\owned' }
     }
     assert.deepEqual(request.plan, applied, 'recovery must retain every original object identity and label')
-    return { restored: applied.entries.length, newEntries: 2, deletedEntries: 0 }
+    return transforms.restore ? transforms.restore(applied) : { restored: applied.entries.length, newEntries: 2, deletedEntries: 0 }
   }
   const api = createWindowsAppContainerResources(() => ({ capture, invoke }))
   const verifyDrainEvidence = (evidence, binding) => branded.has(evidence) && binding.profileSid === profileSid && evidence.leaseId === binding.leaseId
   return { api, events, records, verifyDrainEvidence, options: { policy, controlRoot, executableRoots, verifyDrainEvidence }, evidence(lease) { const evidence = { leaseId: lease.recovery.leaseId }; branded.add(evidence); return evidence } }
 }
+function sizedPlan(plan, count, entryOverrides = {}) {
+  const original = plan.entries[0]
+  while (plan.entries.length < count) {
+    plan.entries.push({ ...original, root: false, directory: false, ...entryOverrides,
+      identity: `12345678:${(plan.entries.length + 1).toString(16).padStart(16, '0')}` })
+  }
+  return plan
+}
+for (const count of [8192, 16384]) test(`resource journal preserves ${count} identities through durable recovery`, async () => {
+  const h = harness(undefined, { plan: plan => sizedPlan(plan, count),
+    restore: () => ({ restored: count - 1, deletedEntries: 1, newEntries: 32768 - count + 1 }) })
+  const lease = await h.api.prepareWindowsAppContainerResources(h.options)
+  const bytes = h.records.get(lease.recovery.journalPath)
+  assert.equal(JSON.parse(bytes).plan.entries.length, count)
+  assert.ok(bytes.length < 8 * 1024 * 1024)
+  const options = { controlRoot, ...lease.recovery, verifyDrainEvidence: h.verifyDrainEvidence, evidence: h.evidence(lease) }
+  const result = await h.api.recoverWindowsAppContainerResources(options)
+  assert.equal(result.restored + result.newEntries, 32768)
+  await h.api.recoverWindowsAppContainerResources(options)
+  assert.equal(h.events.filter(event => event[0] === 'restore').length, 1)
+})
+test('resource object and journal byte limits refuse before durable publication or ACL apply', async () => {
+  for (const transform of [plan => sizedPlan(plan, 16385), plan => sizedPlan(plan, 8192, { label: Buffer.alloc(1024).toString('base64') })]) {
+    const h = harness(undefined, { plan: transform })
+    await assert.rejects(h.api.prepareWindowsAppContainerResources(h.options), { code: 'WINDOWS_RESOURCE_LIMIT' })
+    assert.equal(h.records.size, 0)
+    assert.equal(h.events.some(event => event[0] === 'apply'), false)
+  }
+})
+test('recovery refuses oversized or inconsistent helper counts and retains its journal', async () => {
+  for (const result of [
+    { restored: 16385, deletedEntries: 0, newEntries: 0 },
+    { restored: 0, deletedEntries: 16385, newEntries: 0 },
+    { restored: 4, deletedEntries: 0, newEntries: 32769 },
+    { restored: 4, deletedEntries: 0, newEntries: 32765 },
+    { restored: 3, deletedEntries: 0, newEntries: 0 },
+  ]) {
+    const h = harness(undefined, { restore: () => result })
+    const lease = await h.api.prepareWindowsAppContainerResources(h.options)
+    await assert.rejects(lease.release(h.evidence(lease)), error => {
+      assert.equal(error.code, 'WINDOWS_RESOURCE_PROTOCOL')
+      assert.equal(error.recovery.journalPath, lease.recovery.journalPath)
+      return true
+    })
+    assert.ok(h.records.has(lease.recovery.journalPath))
+    assert.equal(h.records.has(lease.recovery.journalPath + '.restored'), false)
+  }
+})
 test('resource scope accepts boundary metadata and grants executable files without their parents', () => {
   const roots = resourceRoots(policy, controlRoot, executableRoots)
   assert.equal(roots.length, 4)

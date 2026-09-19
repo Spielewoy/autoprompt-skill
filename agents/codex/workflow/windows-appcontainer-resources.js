@@ -6,6 +6,7 @@ const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const { createWindowsFilesystemCapture } = require('./windows-filesystem.js')
 const LIMIT = 8 * 1024 * 1024
+const MAX_RESOURCE_ENTRIES = 16 * 1024, MAX_RECOVERY_ENTRIES = 2 * MAX_RESOURCE_ENTRIES
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key))
 function fail(code, message) { const error = new Error(message); error.code = code; throw error }
@@ -51,7 +52,8 @@ function resourceRoots(policy, controlRoot, executableRoots) {
 function validatePlan(plan, expected = {}) {
   need(exact(plan, ['schemaVersion', 'profileName', 'profileSid', 'roots', 'entries']) && plan.schemaVersion === 3 && /^Autoprompt_[a-f0-9]{32}$/.test(plan.profileName) && /^S-1-15-2-(?:[0-9]+-){6}[0-9]+$/.test(plan.profileSid))
   need(!expected.profileName || plan.profileName === expected.profileName)
-  need(Array.isArray(plan.roots) && plan.roots.length > 0 && plan.roots.length <= 64 && Array.isArray(plan.entries) && plan.entries.length > 0 && plan.entries.length <= 4096)
+  need(Array.isArray(plan.roots) && plan.roots.length > 0 && plan.roots.length <= 64 && Array.isArray(plan.entries) && plan.entries.length > 0)
+  need(plan.entries.length <= MAX_RESOURCE_ENTRIES, 'WINDOWS_RESOURCE_LIMIT')
   const ids = new Map(), validIdentity = entry => typeof entry.identity === 'string' && /^[a-f0-9]{8}:[a-f0-9]{16}$/.test(entry.identity) && typeof entry.creation === 'string' && /^[0-9]{1,19}$/.test(entry.creation)
   for (const entry of plan.entries) {
     need(exact(entry, ['identity', 'creation', 'label', 'directory', 'writable', 'git', 'root', 'daclProtected', 'inheritedAces', 'explicitAces']) && validIdentity(entry) && ['directory', 'writable', 'git', 'root', 'daclProtected'].every(key => typeof entry[key] === 'boolean') && typeof entry.label === 'string' && entry.label.length <= 5464 && Buffer.from(entry.label, 'base64').toString('base64') === entry.label && !ids.has(entry.identity))
@@ -134,7 +136,7 @@ function nativeBackend(controlRoot, deploymentRoot) {
 // exports below, whose backend is always the bound native helper.
 function createWindowsAppContainerResources(backendFactory = nativeBackend) {
   function restoreResult(result) {
-    need(exact(result, ['restored', 'newEntries', 'deletedEntries']) && Object.values(result).every(value => Number.isSafeInteger(value) && value >= 0 && value <= 4096), 'WINDOWS_RESOURCE_PROTOCOL')
+    need(exact(result, ['restored', 'newEntries', 'deletedEntries']) && Object.values(result).every(value => Number.isSafeInteger(value) && value >= 0) && result.restored <= MAX_RESOURCE_ENTRIES && result.deletedEntries <= MAX_RESOURCE_ENTRIES && result.newEntries <= MAX_RECOVERY_ENTRIES && result.restored + result.newEntries <= MAX_RECOVERY_ENTRIES, 'WINDOWS_RESOURCE_PROTOCOL')
     return Object.freeze({ ...result })
   }
   function journalBytes(leaseId, plan) {

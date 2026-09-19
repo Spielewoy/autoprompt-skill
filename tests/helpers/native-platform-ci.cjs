@@ -23,6 +23,7 @@ const WINDOWS_NATIVE_CASES = Object.freeze([
   'native Windows MSYS namespace isolates event and section leaves across profiles and releases owned names',
   'Windows resource ancestry tolerates sibling writes while refusing captured mutations and ancestor replacement',
   'native Windows .git grants deny mutation and restore inheritance after owned drain',
+  'native Windows resource scale restores large trees after AppContainer mutation and refuses admission overflow',
   'Windows HANDLE capture reads bounded bytes and returns a stable content digest',
   'Windows HANDLE capture accepts strict UTF-8 request bytes and rejects malformed UTF-8',
   'Windows HANDLE capture accepts canonical long components and refuses their 8.3 aliases',

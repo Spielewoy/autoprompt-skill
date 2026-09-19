@@ -1,0 +1,92 @@
+// Native scale proof: actual source lifecycle, AppContainer and owned job drain.
+// No worker/runtime acceptance is inferred from this resource component test.
+using System;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Diagnostics;
+using System.Threading;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Security.Cryptography;
+using System.Web.Script.Serialization;
+
+public static class ResourceScaleProof {
+  const int Admission=16384,Recovery=32768,PlanBytes=8*1024*1024;
+  static string Phase="startup";
+  public static bool LimitsMatch(){return WindowsAppContainerResourcesNative.MaxResourceEntries==Admission&&WindowsAppContainerResourcesNative.MaxRecoveryEntries==Recovery;}
+  static readonly JavaScriptSerializer Json=new JavaScriptSerializer{MaxJsonLength=PlanBytes};
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool IsWow64Process2(IntPtr p,out ushort machine,out ushort native);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool CloseHandle(IntPtr h);
+  [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr p,uint access,out IntPtr token);
+  [DllImport("advapi32.dll",SetLastError=true)] static extern bool GetTokenInformation(IntPtr t,int kind,IntPtr b,int length,out int returned);
+  [DllImport("advapi32.dll",CharSet=CharSet.Unicode)] static extern uint GetNamedSecurityInfo(string path,int type,uint flags,out IntPtr owner,out IntPtr group,out IntPtr dacl,out IntPtr sacl,out IntPtr sd);
+  [DllImport("advapi32.dll")] static extern uint GetSecurityDescriptorLength(IntPtr sd);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
+  static void Need(bool value,string code){if(!value)throw new InvalidOperationException(code);}
+  static string Architecture(){ushort m,n;Need(IsWow64Process2(new IntPtr(-1),out m,out n)&&m==0&&(n==0x8664||n==0xaa64),"native-architecture");return n==0x8664?"x64":"arm64";}
+  static string Hash(byte[] bytes){using(var h=SHA256.Create())return BitConverter.ToString(h.ComputeHash(bytes)).Replace("-","").ToLowerInvariant();}
+  static string HashFile(string file){return Hash(File.ReadAllBytes(file));}
+  static RawSecurityDescriptor Security(string file){IntPtr o,g,d,s,sd;Need(GetNamedSecurityInfo(file,1,0x17,out o,out g,out d,out s,out sd)==0,"security-read");try{uint length=GetSecurityDescriptorLength(sd);Need(length>0&&length<=65536,"security-bound");byte[] b=new byte[(int)length];Marshal.Copy(sd,b,0,b.Length);return new RawSecurityDescriptor(b,0);}finally{if(sd!=IntPtr.Zero)LocalFree(sd);}}
+  static string[] Aces(RawAcl acl){if(acl==null)return new string[0];return acl.Cast<GenericAce>().Select(a=>{byte[] b=new byte[a.BinaryLength];a.GetBinaryForm(b,0);return Convert.ToBase64String(b);}).OrderBy(x=>x,StringComparer.Ordinal).ToArray();}
+  static string Snapshot(string file){var sd=Security(file);Need(sd.Owner!=null&&sd.Group!=null,"snapshot-owner-group");return Json.Serialize(new{owner=sd.Owner.Value,group=sd.Group.Value,protection=(sd.ControlFlags&ControlFlags.DiscretionaryAclProtected)!=0,dacl=Aces(sd.DiscretionaryAcl),mandatoryLabels=Aces(sd.SystemAcl)});}
+  static string[] Paths(string root){return new[]{root}.Concat(Directory.GetDirectories(root,"*",SearchOption.AllDirectories)).Concat(Directory.GetFiles(root,"*",SearchOption.AllDirectories)).OrderBy(x=>x,StringComparer.Ordinal).ToArray();}
+  static Dictionary<string,string> Snapshots(params string[] roots){return roots.SelectMany(Paths).ToDictionary(x=>x,Snapshot,StringComparer.OrdinalIgnoreCase);}
+  static string SnapshotDigest(Dictionary<string,string> values){using(var hash=SHA256.Create()){foreach(var item in values.OrderBy(x=>x.Key,StringComparer.Ordinal)){byte[] bytes=Encoding.UTF8.GetBytes(Json.Serialize(new[]{item.Key,item.Value})+"\n");hash.TransformBlock(bytes,0,bytes.Length,bytes,0);}hash.TransformFinalBlock(new byte[0],0,0);return BitConverter.ToString(hash.Hash).Replace("-","").ToLowerInvariant();}}
+  static void Private(string root){var info=new DirectoryInfo(root);var acl=info.GetAccessControl();acl.SetAccessRuleProtection(true,true);info.SetAccessControl(acl);}
+  static void CheckToken(string sid){IntPtr t=IntPtr.Zero,b=IntPtr.Zero;try{Need(OpenProcessToken(new IntPtr(-1),8,out t),"token-open");b=Marshal.AllocHGlobal(512);int n;Need(GetTokenInformation(t,29,b,512,out n)&&n==4&&Marshal.ReadInt32(b)==1,"AppContainer-required");Need(GetTokenInformation(t,31,b,512,out n)&&new SecurityIdentifier(Marshal.ReadIntPtr(b)).Value==sid,"package-SID-required");}finally{if(b!=IntPtr.Zero)Marshal.FreeHGlobal(b);if(t!=IntPtr.Zero)Need(CloseHandle(t),"token-close");}}
+  static void Denied(Action operation){try{operation();}catch(UnauthorizedAccessException e){Need((e.HResult&65535)==5,"denial-must-be-error5");return;}catch(IOException e){Need((e.HResult&65535)==5,"denial-must-be-error5");return;}throw new InvalidOperationException("git-write-succeeded");}
+  static void Populate(string target,bool nested){
+    Directory.CreateDirectory(Path.Combine(target,".git"));File.WriteAllText(Path.Combine(target,".git","guard"),"protected git");
+    foreach(string name in new[]{"edit","delete","rename"})File.WriteAllText(Path.Combine(target,name),"original");
+    if(!nested){string flat=Path.Combine(target,"flat");Directory.CreateDirectory(flat);for(int i=0;i<5000;i++)File.WriteAllText(Path.Combine(flat,"f"+i.ToString("D5")),"data");}
+    else{int remaining=8192-6;for(int d=0;remaining>0;d++){string dir=Path.Combine(target,"d"+d.ToString("D3"));Directory.CreateDirectory(dir);remaining--;for(int i=0;i<127&&remaining>0;i++,remaining--)File.WriteAllText(Path.Combine(dir,"f"+i.ToString("D3")),"data");}Need(Paths(target).Length==8192,"nested-exact-count");}
+  }
+  static int Child(string target,string scratch,string sid,int growth){
+    Phase="child";CheckToken(sid);string arch=Architecture();Need(File.ReadAllText(Path.Combine(target,"edit"))=="original","read-positive");
+    Denied(()=>File.WriteAllText(Path.Combine(target,".git","guard"),"bad"));Denied(()=>File.WriteAllText(Path.Combine(target,".git","new"),"bad"));
+    File.WriteAllText(Path.Combine(target,"edit"),"changed");File.Delete(Path.Combine(target,"delete"));File.Move(Path.Combine(target,"rename"),Path.Combine(target,"renamed"));
+    string created=Path.Combine(target,"growth");Directory.CreateDirectory(created);for(int i=0;i<growth;i++)File.WriteAllText(Path.Combine(created,"f"+i.ToString("D5")),"created");File.WriteAllText(Path.Combine(scratch,"worker"),"scratch");
+    Console.Write(Json.Serialize(new{schema=1,architecture=arch,appContainer=true,denials=new[]{"git-overwrite:5","git-create:5"},createdFiles=growth,edited=true,deleted=true,renamed=true}));return 0;
+  }
+  public sealed class ChildProof { public int schema,createdFiles;public string architecture;public bool appContainer,edited,deleted,renamed;public string[] denials; }
+  sealed class Monitor : IDisposable {
+    readonly ManualResetEvent stop=new ManualResetEvent(false);readonly Thread thread;bool disposed;public int peakHandles;public long peakWorkingSet;
+    public Monitor(){thread=new Thread(()=>{using(var p=Process.GetCurrentProcess()){do{p.Refresh();peakHandles=Math.Max(peakHandles,p.HandleCount);peakWorkingSet=Math.Max(peakWorkingSet,p.WorkingSet64);}while(!stop.WaitOne(20));}});thread.IsBackground=true;thread.Start();}
+    public void Dispose(){if(disposed)return;stop.Set();Need(thread.Join(5000),"monitor-drain");stop.Dispose();disposed=true;}
+  }
+  static T Timed<T>(string name,Dictionary<string,long> times,Func<T> action){Phase=name;var watch=Stopwatch.StartNew();T value=action();times[name]=watch.ElapsedMilliseconds;Need(watch.ElapsedMilliseconds<=120000,"resource-phase-time-bound:"+name);return value;}
+  static void RemovedProfile(string name){IntPtr fresh=IntPtr.Zero;int created=WindowsAppContainerNative.CreateAppContainerProfile(name,name,name,IntPtr.Zero,0,out fresh);try{Need(created==0&&fresh!=IntPtr.Zero,"profile-name-must-be-free-after-restore");}finally{if(fresh!=IntPtr.Zero)WindowsAppContainerNative.FreeSid(fresh);if(created==0)Need(WindowsAppContainerNative.DeleteAppContainerProfile(name)==0,"verification-profile-remove");}}
+  static object Case(string root,string worker,string control,bool nested){
+    string label=nested?"nested8192":"flat5000",home=Path.Combine(root,label);Directory.CreateDirectory(home);Private(home);
+    string target=Path.Combine(home,"target"),scratch=Path.Combine(home,"scratch");Directory.CreateDirectory(target);Directory.CreateDirectory(scratch);Private(target);Private(scratch);Populate(target,nested);
+    int targetCount=Paths(target).Length,growth=nested?9000:3;var before=Snapshots(target,scratch,Path.GetDirectoryName(worker));var times=new Dictionary<string,long>();
+    string name="Autoprompt_"+Guid.NewGuid().ToString("N");var specs=new[]{new WindowsAppContainerResourcesNative.RootSpec{path=target,kind="directory",writable=true},new WindowsAppContainerResourcesNative.RootSpec{path=scratch,kind="directory",writable=true},new WindowsAppContainerResourcesNative.RootSpec{path=Path.GetDirectoryName(worker),kind="directory",writable=false}};
+    var plan=Timed(label+"-plan",times,()=>WindowsAppContainerResourcesNative.Plan(name,specs));Need(plan.entries.Length>4096&&plan.entries.Length<=Admission,"large-plan-count");string serialized=Json.Serialize(plan);int planSize=Encoding.UTF8.GetByteCount(serialized);Need(planSize<=PlanBytes-4096,"journal-byte-bound");plan=WindowsAppContainerResourcesNative.ReadPlan(serialized);File.WriteAllText(Path.Combine(control,label+"-plan.json"),serialized,new UTF8Encoding(false));
+    IntPtr sid=IntPtr.Zero;bool mutated=false,drained=false,restored=false;var monitor=new Monitor();
+    try{
+      mutated=true;Timed(label+"-apply",times,()=>WindowsAppContainerResourcesNative.Apply(plan));Need(WindowsAppContainerNative.DeriveAppContainerSidFromAppContainerName(name,out sid)==0&&sid!=IntPtr.Zero,"derive-SID");
+      string system=Environment.GetEnvironmentVariable("SystemRoot");string[] env={"SystemRoot="+system,"WINDIR="+system,"SystemDrive="+system.Substring(0,2),"PATH="+Path.Combine(system,"System32"),"TEMP="+scratch,"TMP="+scratch};Phase=label+"-launch";
+      var result=WindowsAppContainerNative.Launch(worker,HashFile(worker),new[]{"child",target,scratch,plan.profileSid,growth.ToString()},target,env,120000,32768,sid,plan.profileSid,Path.Combine(control,label+"-cancel"));drained=result.Drained;
+      File.WriteAllText(Path.Combine(control,label+"-launch.json"),Json.Serialize(result));Need(drained&&!result.TimedOut&&!result.Cancelled&&!result.OutputLimit&&result.RootImageMatches,"owned-drain-required");Need(result.ExitCode==0&&result.StderrBase64=="","child-result");var child=Json.Deserialize<ChildProof>(Encoding.UTF8.GetString(Convert.FromBase64String(result.StdoutBase64)));Need(child.schema==1&&child.architecture==Architecture()&&child.appContainer&&child.createdFiles==growth&&child.edited&&child.deleted&&child.renamed&&child.denials.SequenceEqual(new[]{"git-overwrite:5","git-create:5"}),"child-proof");
+      Need(File.ReadAllText(Path.Combine(target,".git","guard"))=="protected git"&&File.ReadAllText(Path.Combine(target,"edit"))=="changed"&&!File.Exists(Path.Combine(target,"delete"))&&File.ReadAllText(Path.Combine(target,"renamed"))=="original","actual-child-effects");
+      int liveCount=Paths(target).Length+Paths(scratch).Length+Paths(Path.GetDirectoryName(worker)).Length;Need(liveCount<=Recovery&&(!nested||liveCount>Admission),"recovery-growth-required");
+      var restoredResult=Timed(label+"-restore",times,()=>WindowsAppContainerResourcesNative.Restore(plan));restored=true;Need(Convert.ToInt32(restoredResult["restored"])==plan.entries.Length-1&&Convert.ToInt32(restoredResult["deletedEntries"])==1&&Convert.ToInt32(restoredResult["newEntries"])==growth+2,"exact-restore-counts");
+      foreach(var old in before){if(old.Key==Path.Combine(target,"delete"))continue;string now=old.Key==Path.Combine(target,"rename")?Path.Combine(target,"renamed"):old.Key;Need(Snapshot(now)==old.Value,"exact-original-security-restored");}
+      foreach(string file in Paths(target).Concat(Paths(scratch)).Concat(Paths(Path.GetDirectoryName(worker))))Need(!Security(file).DiscretionaryAcl.Cast<GenericAce>().OfType<QualifiedAce>().Any(a=>a.SecurityIdentifier.Value==plan.profileSid),"all-package-grants-removed");
+      var after=Snapshots(target,scratch,Path.GetDirectoryName(worker));var again=Timed(label+"-repeat",times,()=>WindowsAppContainerResourcesNative.Restore(plan));Need(Json.Serialize(again)==Json.Serialize(restoredResult),"repeat-counts");var repeated=Snapshots(target,scratch,Path.GetDirectoryName(worker));Need(after.Count==repeated.Count&&after.All(x=>repeated[x.Key]==x.Value),"repeated-restore-unchanged");RemovedProfile(name);monitor.Dispose();
+      return new{scenario=label,targetObjects=targetCount,planEntries=plan.entries.Length,planBytes=planSize,liveRecoveryObjects=liveCount,createdFiles=growth,drained=true,appContainer=true,architecture=child.architecture,denials=child.denials,exactRestoration=true,repeatedRecovery=true,profileRemoved=true,restore=restoredResult,phaseMilliseconds=times,handleSamplingScope="apply-launch-restore",sampledPeakHandles=monitor.peakHandles,sampledPeakWorkingSet=monitor.peakWorkingSet,accepted=false};
+    }catch{if(mutated&&!restored)Console.Error.WriteLine("SCALE_RETAINED:"+label+":drained="+drained);throw;}
+    finally{monitor.Dispose();if(sid!=IntPtr.Zero)WindowsAppContainerNative.FreeSid(sid);}
+  }
+  static object Boundary(string root,string control){
+    Phase="boundary-setup";string target=Path.Combine(root,"boundary16385");Directory.CreateDirectory(target);Private(target);for(int i=0;i<Admission;i++)File.WriteAllText(Path.Combine(target,"f"+i.ToString("D5")),"");
+    Need(Paths(target).Length==Admission+1,"boundary-count");var before=Snapshots(target);string name="Autoprompt_"+Guid.NewGuid().ToString("N");bool refused=false;var watch=Stopwatch.StartNew();Phase="boundary-plan";
+    try{WindowsAppContainerResourcesNative.Plan(name,new[]{new WindowsAppContainerResourcesNative.RootSpec{path=target,kind="directory",writable=true}});}catch(WindowsAppContainerResourcesNative.Refusal e){Need(e.Code=="WINDOWS_RESOURCE_LIMIT","boundary-exact-code:"+e.Code);refused=true;}
+    Need(refused&&watch.ElapsedMilliseconds<=120000,"boundary-refused");long planMs=watch.ElapsedMilliseconds;var after=Snapshots(target);Need(before.Count==after.Count&&before.All(x=>after[x.Key]==x.Value),"boundary-no-security-mutation");RemovedProfile(name);
+    var proof=new{objects=Admission+1,refused=true,code="WINDOWS_RESOURCE_LIMIT",securityUnchanged=true,profileNotCreated=true,elapsedMs=planMs,beforeSha256=SnapshotDigest(before),afterSha256=SnapshotDigest(after)};File.WriteAllText(Path.Combine(control,"boundary-proof.json"),Json.Serialize(proof));return proof;
+  }
+  public static int Main(string[] args){try{Need(LimitsMatch(),"actual-resource-limits");string arch=Architecture();if(args.Length==4&&args[0]=="snapshot"){var values=Snapshots(args[1],args[2],args[3]);Console.Write(Json.Serialize(new{schema=1,architecture=arch,objects=values.Count,securitySha256=SnapshotDigest(values)}));return 0;}if(args.Length==5&&args[0]=="child")return Child(args[1],args[2],args[3],Int32.Parse(args[4]));Need(args.Length==3,"controller-arguments");var cases=new[]{Case(args[0],args[1],args[2],false),Case(args[0],args[1],args[2],true)};object boundary=Boundary(args[0],args[2]);Console.Write(Json.Serialize(new{schema=1,nativeWindows=true,architecture=arch,cases=cases,boundary=boundary,cleanupConfirmed=true,accepted=false}));return 0;}catch(Exception e){Console.Error.WriteLine("RESOURCE_SCALE_FAILURE:"+Phase+":"+e.GetType().Name+":"+e.Message);return 1;}}
+}

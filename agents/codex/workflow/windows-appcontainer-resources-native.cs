@@ -15,6 +15,7 @@ public static class WindowsAppContainerResourcesNative {
   const uint FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020, FILE_OPEN_REPARSE_POINT = 0x00200000;
   const uint OBJ_CASE_INSENSITIVE = 0x00000040, FILE_ATTRIBUTE_DIRECTORY = 0x10, FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
   const uint FILE_TYPE_DISK = 1, DRIVE_FIXED = 3;
+  public const int MaxResourceEntries = 16 * 1024, MaxRecoveryEntries = 2 * MaxResourceEntries;
   const int MaxBytes = 64 * 1024 * 1024, MaxRecordBytes = 8 * 1024 * 1024 + 1;
 
   [StructLayout(LayoutKind.Sequential)] struct UNICODE_STRING { public ushort Length, MaximumLength; public IntPtr Buffer; }
@@ -162,7 +163,7 @@ public static class WindowsAppContainerResourcesNative {
   }
   // FileIdFullDirectoryInformation (class 38) is enumerated exclusively from
   // a held directory HANDLE. Dot records are structural, never child opens.
-  static List<DirectoryEntry> EnumerateHeld(IntPtr directory, bool allowReparse = false) {
+  static List<DirectoryEntry> EnumerateHeld(IntPtr directory, int maxEntries, bool allowReparse = false) {
     var result = new List<DirectoryEntry>(); var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     IntPtr buffer = Marshal.AllocHGlobal(65536);
     try {
@@ -185,7 +186,7 @@ public static class WindowsAppContainerResourcesNative {
           string name = Marshal.PtrToStringUni(IntPtr.Add(buffer, offset + 80), nameBytes / 2);
           if (name != "." && name != "..") {
             Need(ValidComponent(name) && names.Add(name) && (allowReparse || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0), "PREIMAGE_UNSAFE");
-            Need(result.Count < 4096, "FILESYSTEM_CAPTURE_LIMIT");
+            Need(result.Count < maxEntries, "WINDOWS_RESOURCE_LIMIT");
             result.Add(new DirectoryEntry { Name=name, Attributes=attrs, Id=id });
           }
           if (next == 0) break;
@@ -306,11 +307,11 @@ public static class WindowsAppContainerResourcesNative {
     for(int i=0;i<parts.Length;i++){bool last=i==parts.Length-1;Opened child=OpenChecked(parts[i],parent.Handle,!last || spec.kind=="directory",last && spec.kind=="file",true,last);child.Parent=parent;parent=child;forest.handles.Add(parent);}return parent;
   }
   static void Walk(Forest forest,Opened node,string full,RootSpec[] specs,HashSet<string> seen,int depth,bool recovering) {
-    Need(depth<=128,"WINDOWS_RESOURCE_LIMIT");if(!seen.Add(node.Snapshot.Id))return;Need(forest.items.Count<4096,"WINDOWS_RESOURCE_LIMIT");
+    Need(depth<=128,"WINDOWS_RESOURCE_LIMIT");if(!seen.Add(node.Snapshot.Id))return;Need(forest.items.Count<(recovering?MaxRecoveryEntries:MaxResourceEntries),"WINDOWS_RESOURCE_LIMIT");
     bool writable=specs.Any(root=>root.writable && Within(root.path,full));bool git=full.Split('\\').Any(part=>String.Equals(part,".git",StringComparison.OrdinalIgnoreCase));bool rootNode=specs.Any(root=>String.Equals(root.path,full,StringComparison.OrdinalIgnoreCase));
     forest.items.Add(new Item{opened=node,full=full,writable=writable,git=git,root=rootNode});
     if(!node.Directory || (node.Snapshot.Attributes&FILE_ATTRIBUTE_REPARSE_POINT)!=0)return;
-    foreach(var entry in EnumerateHeld(node.Handle,recovering)) {
+    foreach(var entry in EnumerateHeld(node.Handle,recovering?MaxRecoveryEntries:MaxResourceEntries,recovering)) {
       Need(depth<128,"WINDOWS_RESOURCE_LIMIT");bool directory=(entry.Attributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
       IntPtr handle=Open(entry.Name,node.Handle,directory,false,false,true);
       Opened child;
@@ -364,10 +365,10 @@ public static class WindowsAppContainerResourcesNative {
     Need(wire["schemaVersion"] is int && (int)wire["schemaVersion"]==3 && wire["profileName"] is string && wire["profileSid"] is string,"WINDOWS_RESOURCE_INVALID");
     var rootsWire=wire["roots"] as object[];Need(rootsWire!=null && rootsWire.Length>0 && rootsWire.Length<=64,"WINDOWS_RESOURCE_INVALID");
     foreach(var value in rootsWire){var root=value as Dictionary<string,object>;Need(root!=null && root.Count==5 && new[]{"path","kind","writable","identity","creation"}.All(root.ContainsKey),"WINDOWS_RESOURCE_INVALID");Need(root["writable"] is bool && new[]{"path","kind","identity","creation"}.All(key=>root[key] is string),"WINDOWS_RESOURCE_INVALID");}
-    var entriesWire=wire["entries"] as object[];Need(entriesWire!=null && entriesWire.Length>0 && entriesWire.Length<=4096,"WINDOWS_RESOURCE_INVALID");
+    var entriesWire=wire["entries"] as object[];Need(entriesWire!=null && entriesWire.Length>0 && entriesWire.Length<=MaxResourceEntries,"WINDOWS_RESOURCE_INVALID");
     foreach(var value in entriesWire){var entry=value as Dictionary<string,object>;Need(entry!=null && entry.Count==10 && new[]{"identity","creation","label","directory","writable","git","root","daclProtected","inheritedAces","explicitAces"}.All(entry.ContainsKey),"WINDOWS_RESOURCE_INVALID");Need(new[]{"directory","writable","git","root","daclProtected"}.All(key=>entry[key] is bool) && new[]{"identity","creation","label"}.All(key=>entry[key] is string),"WINDOWS_RESOURCE_INVALID");foreach(string key in new[]{"inheritedAces","explicitAces"}){var aces=entry[key] as object[];Need(aces!=null && aces.Length<=8192 && aces.All(ace=>ace is string),"WINDOWS_RESOURCE_INVALID");}}
     var plan=serializer.Deserialize<ResourcePlan>(json);
-    Need(plan!=null && plan.schemaVersion==3 && plan.profileSid==ProfileSid(plan.profileName) && plan.roots!=null && plan.entries!=null && plan.entries.Length>0 && plan.entries.Length<=4096,"WINDOWS_RESOURCE_INVALID");
+    Need(plan!=null && plan.schemaVersion==3 && plan.profileSid==ProfileSid(plan.profileName) && plan.roots!=null && plan.entries!=null && plan.entries.Length>0 && plan.entries.Length<=MaxResourceEntries,"WINDOWS_RESOURCE_INVALID");
     Specs(plan.roots.Select(r=>new RootSpec{path=r.path,kind=r.kind,writable=r.writable}).ToArray());
     var seen=new HashSet<string>();foreach(var entry in plan.entries){Need(entry!=null && entry.identity!=null && System.Text.RegularExpressions.Regex.IsMatch(entry.identity,"^[a-f0-9]{8}:[a-f0-9]{16}$") && seen.Add(entry.identity) && entry.creation!=null && System.Text.RegularExpressions.Regex.IsMatch(entry.creation,"^[0-9]{1,19}$") && entry.label!=null && entry.label.Length<=5464,"WINDOWS_RESOURCE_INVALID");if(entry.label.Length>0){byte[] raw=Convert.FromBase64String(entry.label);Need(Convert.ToBase64String(raw)==entry.label,"WINDOWS_RESOURCE_INVALID");new RawAcl(raw,0);}ValidateInheritanceRecord(entry,plan.profileSid);}
     foreach(var root in plan.roots)Need(plan.entries.Any(e=>e.identity==root.identity && e.creation==root.creation && e.directory==(root.kind=="directory")),"WINDOWS_RESOURCE_INVALID");return plan;
@@ -426,7 +427,7 @@ public static class WindowsAppContainerResourcesNative {
       foreach(var root in plan.roots){Opened held=ById(forest,root,root.identity,root.creation);Need(held!=null,"WINDOWS_RESOURCE_ROOT_MISSING");Walk(forest,held,root.path,specs,seen,0,true);}
       // Original objects are found by NTFS file ID even after a rename outside
       // the original name. Missing originals are never matched to replacements.
-      foreach(var old in plan.entries)if(!seen.Contains(old.identity)){var hint=plan.roots.First(r=>r.identity.Substring(0,8)==old.identity.Substring(0,8));Opened held=ById(forest,hint,old.identity,old.creation);if(held!=null){seen.Add(old.identity);forest.items.Add(new Item{opened=held,writable=old.writable,git=old.git,root=old.root});}}
+      foreach(var old in plan.entries)if(!seen.Contains(old.identity)){var hint=plan.roots.First(r=>r.identity.Substring(0,8)==old.identity.Substring(0,8));Opened held=ById(forest,hint,old.identity,old.creation);if(held!=null){Need(forest.items.Count<MaxRecoveryEntries,"WINDOWS_RESOURCE_LIMIT");seen.Add(old.identity);forest.items.Add(new Item{opened=held,writable=old.writable,git=old.git,root=old.root});}}
       int restored=0,created=0;
       foreach(var item in forest.items) {
         var security=Security(item.opened.Handle);EntryRecord old;bool existed=baseline.TryGetValue(item.opened.Snapshot.Id,out old);
