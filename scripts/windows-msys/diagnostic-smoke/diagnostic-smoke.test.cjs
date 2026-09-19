@@ -39,6 +39,37 @@ test('Git-write observation separates an actual write from other errors without 
   if(accepted)assert.doesNotThrow(()=>run(fake,path,{target:'/fixture'}));else assert.throws(()=>run(fake,path,{target:'/fixture'}),{code:'GIT_'+(outcome==='bad error text'?'OTHER_ERRNO':outcome)})
  }
 })
+test('diagnostic closes its real IPv4 listener when the IPv6 listener cannot start',async t=>{
+ const vm=require('node:vm'),net=require('node:net'),{createRequire}=require('node:module'),servers=[],closed=[]
+ t.after(()=>{for(const server of servers)server.close()})
+ const network={...net,createServer(...args){
+  const server=net.createServer(...args);servers.push(server)
+  closed.push(new Promise(resolve=>server.once('close',resolve)))
+  if(servers.length===2)server.listen=function(){setImmediate(()=>this.emit('error',Object.assign(Error('IPv6 unavailable'),{code:'EAFNOSUPPORT'})));return this}
+  return server
+ }}
+ const filename=path.join(__dirname,'probe.cjs'),localRequire=createRequire(filename),module={exports:{}}
+ vm.runInNewContext(fs.readFileSync(filename,'utf8'),{module,exports:module.exports,Buffer,__dirname,__filename:filename,setImmediate,
+  process:{platform:'win32',execPath:process.execPath,pid:process.pid,env:process.env},
+  require:name=>name==='node:net'?network:name.endsWith('/safe-run-root.js')?{ensureWindowsPrivateAcl(){}}:localRequire(name)},{filename})
+ const result=await module.exports.probeWindowsAppContainer(async()=>assert.fail('No sandbox command before both listener controls'),'a'.repeat(64))
+ assert.equal(result.supported,false);assert.equal(result.code,'EAFNOSUPPORT');assert.equal(servers.length,2)
+ assert.equal(servers[0].listening,false)
+ await closed[0]
+})
+test('diagnostic root cleanup failure preserves the original error and retained root',async t=>{
+ const vm=require('node:vm'),{createRequire}=require('node:module')
+ const original=Object.assign(Error('private fixture failed'),{code:'PRIVACY_VIOLATION'}),cleanup=Object.assign(Error('root removal failed'),{code:'EACCES'})
+ let retained
+ t.after(()=>{if(retained)fs.rmSync(retained,{recursive:true,force:true})})
+ const filesystem={...fs,mkdtempSync(...args){retained=fs.mkdtempSync(...args);return retained},rmSync(file,...args){if(file===retained)throw cleanup;return fs.rmSync(file,...args)}}
+ const filename=path.join(__dirname,'probe.cjs'),localRequire=createRequire(filename),module={exports:{}}
+ vm.runInNewContext(fs.readFileSync(filename,'utf8'),{module,exports:module.exports,Buffer,__dirname,__filename:filename,setImmediate,
+  process:{platform:'win32',execPath:process.execPath,pid:process.pid,env:process.env},
+  require:name=>name==='node:fs'?filesystem:name.endsWith('/safe-run-root.js')?{ensureWindowsPrivateAcl(){throw original}}:localRequire(name)},{filename})
+ await assert.rejects(module.exports.probeWindowsAppContainer(async()=>assert.fail('No command before fixture setup'),'a'.repeat(64)),error=>error===original&&error.cleanupConfirmed===false&&error.cleanupCode==='EACCES'&&error.recoveryRoot===retained)
+ assert.equal(fs.existsSync(retained),true)
+})
 test('actual Node diagnostic entry emits TAP while preserving context arguments',t=>{
  const os=require('node:os'),root=fs.mkdtempSync(path.join(os.tmpdir(),'diagnostic-tap-entry-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}))
  const entry=path.join(root,'entry.cjs'),{TEST_NAME,selectedTestPassed}=require('../probe-built-runtime.cjs')

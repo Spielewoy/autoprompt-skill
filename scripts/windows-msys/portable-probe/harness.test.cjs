@@ -54,6 +54,31 @@ test('selected smoke environment removes duplicate-cased Node preload paths and 
  assert.deepEqual(controlled,{SystemRoot:'C:\\Windows'})
  assert.equal(env.NODE_OPTIONS,'--require untrusted')
 })
+test('portable diagnostic context bytes satisfy the actual native entry reader',t=>{
+ const vm=require('node:vm'),os=require('node:os'),binding=require('../diagnostic-smoke/binding.cjs')
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'portable-context-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}))
+ // Preserve the producer's insertion order: the old writer emitted these keys
+ // unsorted and both actual ARM lanes refused them before launching Bash.
+ const context={schema:1,purpose:'compiler-output-smoke-not-runtime-acceptance',node:{architecture:'arm64',sha256:'a'.repeat(64),kind:'adapted-worker'},bash:{path:path.join(root,'bash.exe'),files:[{name:'bash.exe',sha256:'b'.repeat(64),bytes:10},{name:'msys-2.0.dll',sha256:'c'.repeat(64),bytes:20}]}}
+ const filename=path.join(root,'diagnostic-context.json'),bytes=h.diagnosticContextBytes(context)
+ assert.notDeepEqual(bytes,Buffer.from(JSON.stringify(context)+'\n'))
+ assert.deepEqual(bytes,binding.canonical(context));fs.writeFileSync(filename,bytes,{flag:'wx'})
+ const entry=path.join(repo,'scripts/windows-msys/diagnostic-smoke/native.cjs'),source=fs.readFileSync(entry,'utf8')
+ const runtime=require('../probe-built-runtime.cjs');let executorCalls=0,registered=0
+ function read(exactDigest){vm.runInNewContext(source,{Buffer,process:{platform:'win32',argv:['node',entry,filename,exactDigest]},require:name=>{
+  if(name==='./binding.cjs')return{...binding,createExecutor(value){executorCalls++;assert.deepEqual(binding.validate(value),binding.validate(context));return{probe(){assert.fail('Parser test cannot launch')},executeTool(){assert.fail('Parser test cannot launch')}}}}
+  if(name==='../probe-built-runtime.cjs')return runtime
+  if(name==='node:test')return(name,options,body)=>{registered++;assert.equal(name,runtime.TEST_NAME);assert.equal(typeof body,'function')}
+  return require(name)
+ }},{filename:entry})}
+ read(binding.hash(bytes));assert.equal(executorCalls,1);assert.equal(registered,1)
+ // A correct digest cannot turn insertion-order JSON into canonical authority.
+ const oldBytes=Buffer.from(JSON.stringify(context)+'\n');fs.writeFileSync(filename,oldBytes)
+ assert.throws(()=>read(binding.hash(oldBytes)),/Canonical diagnostic context required/)
+ assert.equal(executorCalls,1);assert.equal(registered,1)
+ fs.writeFileSync(filename,bytes);assert.throws(()=>read('0'.repeat(64)),/Diagnostic context changed/)
+ assert.equal(executorCalls,1)
+})
 test('portable POSIX factoring preserves the original execution, cancellation and positive drain body',()=>{
  const original=fs.readFileSync(path.join(repo,'scripts/windows-msys/probe-posix-runtime.cjs'),'utf8')
  let expected=original.slice(original.indexOf('  const dependencies = importedDlls(fixture)'),original.indexOf("  assert.deepEqual(closureRecords(bindBashRuntime(path.join(work, 'sdk/usr/bin')"))

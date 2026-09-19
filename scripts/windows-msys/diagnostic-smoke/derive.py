@@ -102,6 +102,20 @@ def derive():
    text=once(text,'key = runtimeKey()','key = runtimeKey(tupleIdentity)')
    text=once(text,'  if (cached?.key === key) return cached.result\n','')
    text=once(text,'    cached = { key, result: supported }\n','')
+   text=once(text,"    endpoints.push(await listen('127.0.0.1'), await listen('::1'))", "    endpoints.push(await listen('127.0.0.1'))\n    endpoints.push(await listen('::1'))")
+   text=once(text,"probeFailure = null, phase = 'private-root'", "probeFailure = null, phase = 'private-root', primaryError = null")
+   text=once(text,"  } catch (error) {\n    preserve =", "  } catch (error) {\n    primaryError = error\n    preserve =")
+   text=once(text,"""    for (const endpoint of endpoints) endpoint.server.close()
+    if (!preserve) fs.rmSync(base, { recursive: true, force: true })""", """    let cleanupFailure
+    for (const endpoint of endpoints) { try { endpoint.server.close() } catch (error) { cleanupFailure ||= error } }
+    if (!preserve && !cleanupFailure) { try { fs.rmSync(base, { recursive: true, force: true }) } catch (error) { cleanupFailure ||= error } }
+    if (cleanupFailure) {
+      const error = primaryError || cleanupFailure
+      error.cleanupConfirmed = false
+      error.recoveryRoot = base
+      error.cleanupCode = String(cleanupFailure.code || 'cleanup-failed').slice(0, 64)
+      throw error
+    }""")
    text=once(text,"    preserve = error.code === 'APPCONTAINER_CLEANUP_UNCONFIRMED'","    preserve = error.cleanupConfirmed === false || error.code === 'APPCONTAINER_CLEANUP_UNCONFIRMED'")
    old="let gitDenied=false;try{fs.writeFileSync(path.join(f.target,'.git','guard'),'bad')}catch(e){gitDenied=['EACCES','EPERM'].includes(e.code)}need(gitDenied);"
    new="let gitDenied=false,gitOutcome='WRITE_SUCCEEDED';try{fs.writeFileSync(path.join(f.target,'.git','guard'),'bad')}catch(e){gitOutcome=/^[A-Z][A-Z0-9_]{0,39}$/.test(String(e.code))?e.code:'OTHER_ERRNO';gitDenied=['EACCES','EPERM'].includes(e.code)}if(!gitDenied){const error=Error('PROBE');error.code='GIT_'+gitOutcome;throw error};"

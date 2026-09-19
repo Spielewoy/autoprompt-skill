@@ -126,6 +126,9 @@ function smokeEnvironment(environment, bashPath) {
     !['AUTOPROMPT_WINDOWS_BASH','NODE_OPTIONS','NODE_PATH','NODE_TEST_CONTEXT'].includes(key.toUpperCase())))
   return controlled
 }
+function diagnosticContextBytes(context) {
+  return require('../diagnostic-smoke/binding.cjs').canonical(context)
+}
 function materialize(capability, destination) {
   const value = slot(capability), { repo, data } = value
   const root = privateDirectory(repo, destination), bin = path.join(root,'usr/bin')
@@ -158,7 +161,7 @@ function runSmoke(capability, outputRoot) {
   const { TEST_NAME, selectedTestPassed, closureRecords } = require(path.join(repo,'scripts/windows-msys/probe-built-runtime.cjs'))
   const environment = smokeEnvironment(process.env, runtime.bash)
   const context={schema:1,purpose:'compiler-output-smoke-not-runtime-acceptance',node:{architecture:value.node.architecture,sha256:value.node.executableSha256,kind:'adapted-worker'},bash:{path:runtime.bash,files:['bash.exe','msys-2.0.dll'].map(name=>({name,sha256:hash(data.get('runtime/'+name)),bytes:data.get('runtime/'+name).length}))}}
-  const contextBytes=canonical(context),contextPath=path.join(output,'diagnostic-context.json')
+  const contextBytes=diagnosticContextBytes(context),contextPath=path.join(output,'diagnostic-context.json')
   fs.writeFileSync(contextPath,contextBytes,{flag:'wx',mode:0o400})
   const result = cp.spawnSync(process.execPath, ['--test-reporter=tap',path.join(repo,testFile),contextPath,hash(contextBytes)],
     { cwd:repo, env:environment, encoding:'utf8', timeout:615000, maxBuffer:8*1024*1024, shell:false, windowsHide:true, stdio:['ignore','pipe','pipe'] })
@@ -190,4 +193,4 @@ function inputsAfterSmoke(capability, smoke) {
     original:['bash.exe','msys-2.0.dll'].map(name=>({name,bytes:Buffer.from(value.data.get('runtime/'+name)),sha256:hash(value.data.get('runtime/'+name))})),
     fixture:Buffer.from(value.data.get('fixture/posix-proof.exe')), fixtureSource:Buffer.from(value.data.get('fixture/posix-proof.c')) }
 }
-module.exports={validateImported,captureImported,tupleIdentity,materialize,runSmoke,inputsAfterSmoke,smokeEnvironment}
+module.exports={validateImported,captureImported,tupleIdentity,materialize,runSmoke,inputsAfterSmoke,smokeEnvironment,diagnosticContextBytes}

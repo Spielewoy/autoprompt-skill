@@ -44,7 +44,7 @@ async function probeWindowsAppContainer(runWindowsAppContainerCommand, tupleIden
   let key
   try { key = runtimeKey(tupleIdentity) } catch (error) { return { supported: false, backend: 'windows-appcontainer', code: 'WINDOWS_RUNTIME_UNAVAILABLE', diagnostic: failureDiagnostic(error, 'runtime-identity') } }
   const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-appcontainer-probe-')))
-  let preserve = false, launcherSessionId = null, nativeExitCode = null, probeFailure = null, phase = 'private-root'
+  let preserve = false, launcherSessionId = null, nativeExitCode = null, probeFailure = null, phase = 'private-root', primaryError = null
   const endpoints = []
   try {
     ensureWindowsPrivateAcl(base)
@@ -55,7 +55,8 @@ async function probeWindowsAppContainer(runWindowsAppContainerCommand, tupleIden
     fs.writeFileSync(path.join(target, 'allowed'), 'allowed')
     const sentinel = path.join(controlRoot, 'sentinel'); fs.writeFileSync(sentinel, 'controller only')
     phase = 'loopback-control'
-    endpoints.push(await listen('127.0.0.1'), await listen('::1'))
+    endpoints.push(await listen('127.0.0.1'))
+    endpoints.push(await listen('::1'))
     for (const endpoint of endpoints) { await control(endpoint); if (endpoint.state.accepted !== 1) throw new Error('CONTROL_ACCEPT'); endpoint.state.accepted = 0 }
     const fixture = { target, scratch, sentinel, endpoints: endpoints.map(({host,port,family}) => ({host,port,family})) }
     const source = `const fs=require('node:fs'),net=require('node:net'),cp=require('node:child_process'),path=require('node:path');const f=${JSON.stringify(fixture)};let phase='read';const need=x=>{if(!x)throw Error('PROBE')};const denied=p=>{try{fs.readFileSync(p);return false}catch(e){return e.code==='EACCES'||e.code==='EPERM'}};const request=e=>new Promise(ok=>{let done=false;const finish=v=>{if(done)return;done=true;s.destroy();ok(v)};const s=net.connect(e);s.once('connect',()=>finish(false));s.once('error',e=>finish(['EACCES','EPERM','ETIMEDOUT'].includes(e.code)));s.setTimeout(1500,()=>finish(false))});(async()=>{need(fs.readFileSync(path.join(f.target,'allowed'),'utf8')==='allowed');phase='write-target';fs.writeFileSync(path.join(f.target,'written'),'worker');phase='write-scratch';fs.writeFileSync(path.join(f.scratch,'written'),'scratch');phase='sentinel';need(denied(f.sentinel));phase='git-write';let gitDenied=false,gitOutcome='WRITE_SUCCEEDED';try{fs.writeFileSync(path.join(f.target,'.git','guard'),'bad')}catch(e){gitOutcome=/^[A-Z][A-Z0-9_]{0,39}$/.test(String(e.code))?e.code:'OTHER_ERRNO';gitDenied=['EACCES','EPERM'].includes(e.code)}if(!gitDenied){const error=Error('PROBE');error.code='GIT_'+gitOutcome;throw error};phase='git-rename-delete';for(const operation of [()=>fs.renameSync(path.join(f.target,'.git'),path.join(f.target,'moved-git')),()=>fs.unlinkSync(path.join(f.target,'.git','guard'))]){let denied=false;try{operation()}catch(e){denied=['EACCES','EPERM'].includes(e.code)}need(denied)}phase='acl-write';const acl=cp.spawn(process.env.ComSpec,['/d','/q','/c','icacls ..\\\\target /grant *'+process.env.AUTOPROMPT_APP_CONTAINER_SID+':F /q > acl-result.txt 2>&1'],{cwd:f.scratch,stdio:'inherit'});const aclExit=await new Promise((ok,no)=>{acl.once('error',no);acl.once('exit',ok)});need(aclExit!==0);need(/Access is denied/i.test(fs.readFileSync(path.join(f.scratch,'acl-result.txt'),'utf8')));phase='descendant';const child=cp.spawn(process.execPath,['-e','setTimeout(()=>process.exit(0),10000)'],{stdio:'inherit'});need(child.pid>0);let childError=false;child.on('error',()=>{childError=true});await new Promise(r=>setTimeout(r,100));phase='network';for(const e of f.endpoints)need(await request(e));phase='child-kill';const exit=new Promise(r=>child.once('exit',r));need(child.kill());await exit;need(!childError);process.stdout.write('APPCONTAINER_PROBE_PASS')})().catch(error=>{process.stderr.write('APPCONTAINER_PROBE_FAILURE:'+phase+':'+String(error.code||'CHECK'));process.exitCode=1})`
@@ -79,11 +80,20 @@ async function probeWindowsAppContainer(runWindowsAppContainerCommand, tupleIden
       networkProof: 'zero sandbox accepts between successful same-listener IPv4/IPv6 controller checks; bounded explicit socket denial', processCleanup: 'owned-job-drained' })
     return supported
   } catch (error) {
+    primaryError = error
     preserve = error.cleanupConfirmed === false || error.code === 'APPCONTAINER_CLEANUP_UNCONFIRMED' || Boolean(error.recovery && !error.recoveryResolved)
     return { supported: false, backend: 'windows-appcontainer', code: error.code || 'COMMAND_SANDBOX_UNSUPPORTED', diagnostic: failureDiagnostic(error, phase), launcherSessionId, nativeExitCode, probeFailure, ...(preserve ? { recoveryRoot: base } : {}) }
   } finally {
-    for (const endpoint of endpoints) endpoint.server.close()
-    if (!preserve) fs.rmSync(base, { recursive: true, force: true })
+    let cleanupFailure
+    for (const endpoint of endpoints) { try { endpoint.server.close() } catch (error) { cleanupFailure ||= error } }
+    if (!preserve && !cleanupFailure) { try { fs.rmSync(base, { recursive: true, force: true }) } catch (error) { cleanupFailure ||= error } }
+    if (cleanupFailure) {
+      const error = primaryError || cleanupFailure
+      error.cleanupConfirmed = false
+      error.recoveryRoot = base
+      error.cleanupCode = String(cleanupFailure.code || 'cleanup-failed').slice(0, 64)
+      throw error
+    }
   }
 }
 module.exports = { probeWindowsAppContainer }
