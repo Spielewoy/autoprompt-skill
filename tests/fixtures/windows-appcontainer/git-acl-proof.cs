@@ -62,7 +62,7 @@ public static class GitAclProof {
     DeniedHandle(guard,0x40000,"git-file-WRITE_DAC",outcomes);DeniedHandle(git,0x40000,"git-directory-WRITE_DAC",outcomes);DeniedHandle(target,0x40000,"target-WRITE_DAC",outcomes);DeniedHandle(target,0x40,"target-DELETE_CHILD",outcomes);DeniedHandle(git,0x40,"git-DELETE_CHILD",outcomes);
     Need(outcomes.SequenceEqual(DenialNames.Select(x=>x+":5")),"closed-child-outcomes");Console.Write(new JavaScriptSerializer().Serialize(new{appContainer=true,architecture=NativeArchitecture(),denials=outcomes,positiveOperations=8}));return 0;
   }
-  static void Refuses(string expected,Action action){try{action();}catch(WindowsAppContainerResourcesNative.Refusal error){Need(error.Code==expected,"exact-refusal:"+expected);return;}throw new InvalidOperationException("expected-refusal:"+expected);}
+  static void Refuses(string expected,Action action){try{action();}catch(WindowsAppContainerResourcesNative.Refusal error){Need(error.Code==expected,"exact-refusal:expected="+expected+":actual="+error.Code);return;}throw new InvalidOperationException("expected-refusal:"+expected);}
   static void InvalidPlans(string json){
     Refuses("WINDOWS_RESOURCE_INVALID",()=>WindowsAppContainerResourcesNative.ReadPlan(json.Replace("\"schemaVersion\":3","\"schemaVersion\":1")));
     Refuses("WINDOWS_RESOURCE_INVALID",()=>WindowsAppContainerResourcesNative.ReadPlan(json.Replace("\"schemaVersion\":3","\"schemaVersion\":2")));
@@ -76,6 +76,10 @@ public static class GitAclProof {
     invalid(git=>git["explicitAces"]=git["inheritedAces"]);
     invalid(git=>{var raw=Convert.FromBase64String((string)((object[])git["inheritedAces"])[0]);raw[1]&=239;raw[4]^=2;git["explicitAces"]=new[]{Convert.ToBase64String(raw)};});
     invalid(git=>git["daclProtected"]=true);invalid(git=>git["git"]=false);
+    // AclSize is a USHORT: aligned 65532 bytes is valid, 65536 is not.
+    string system="ABMUAP8BHwABAQAAAAAABRIAAAA=";byte[] administrator=new byte[24];Array.Copy(Convert.FromBase64String(system),administrator,20);administrator[2]=24;administrator[9]=2;BitConverter.GetBytes(32u).CopyTo(administrator,16);BitConverter.GetBytes(544u).CopyTo(administrator,20);string longer=Convert.ToBase64String(administrator);
+    var boundary=serializer.DeserializeObject(json) as Dictionary<string,object>;var boundaryGit=((object[])boundary["entries"]).Cast<Dictionary<string,object>>().First(value=>(bool)value["git"]&&!(bool)value["daclProtected"]);boundaryGit["inheritedAces"]=Enumerable.Repeat(system,3275).Concat(new[]{longer}).ToArray();boundaryGit["explicitAces"]=new string[0];WindowsAppContainerResourcesNative.ReadPlan(serializer.Serialize(boundary));
+    boundaryGit["inheritedAces"]=Enumerable.Repeat(system,3274).Concat(new[]{longer,longer}).ToArray();Refuses("WINDOWS_RESOURCE_INVALID",()=>WindowsAppContainerResourcesNative.ReadPlan(serializer.Serialize(boundary)));
   }
   static void PartialRecovery(string parent){
     string target=Path.Combine(parent,"partial-target");Directory.CreateDirectory(target);Protect(target,true);string git=Path.Combine(target,".git");Directory.CreateDirectory(git);File.WriteAllText(Path.Combine(git,"guard"),"partial guard");
@@ -92,7 +96,13 @@ public static class GitAclProof {
     string target=Path.Combine(parent,"drift-target"),git=Path.Combine(target,".git");Directory.CreateDirectory(git);Protect(target,true);File.WriteAllText(Path.Combine(git,"guard"),"drift fixture");
     var baseline=Paths(target).ToDictionary(x=>x,Security);var plan=WindowsAppContainerResourcesNative.Plan("Autoprompt_"+Guid.NewGuid().ToString("N"),new[]{new WindowsAppContainerResourcesNative.RootSpec{path=target,kind="directory",writable=true}});
     WindowsAppContainerResourcesNative.Apply(plan);var info=new DirectoryInfo(git);var saved=info.GetAccessControl();var changed=info.GetAccessControl();
-    changed.SetAccessRule(new FileSystemAccessRule(WindowsIdentity.GetCurrent().User,FileSystemRights.ReadAndExecute,InheritanceFlags.ObjectInherit|InheritanceFlags.ContainerInherit,PropagationFlags.None,AccessControlType.Allow));info.SetAccessControl(changed);var beforeRefusal=Security(git);
+    // Change one owned permission while retaining the controller's exact
+    // inventory/recovery access; otherwise the fixture tests an earlier open
+    // denial instead of the provenance refusal it is intended to exercise.
+    FileSystemRights driftRights=(FileSystemRights)((int)FileSystemRights.FullControl&~2);
+    changed.SetAccessRule(new FileSystemAccessRule(WindowsIdentity.GetCurrent().User,driftRights,InheritanceFlags.ObjectInherit|InheritanceFlags.ContainerInherit,PropagationFlags.None,AccessControlType.Allow));info.SetAccessControl(changed);var beforeRefusal=Security(git);
+    IntPtr inspection=CreateFile(git,0x001e0081,7,IntPtr.Zero,3,0x02200000,IntPtr.Zero);int inspectionError=Marshal.GetLastWin32Error();Need(inspection!=IntPtr.Zero&&inspection!=new IntPtr(-1),"drift-controller-inspection:"+inspectionError);Need(CloseHandle(inspection),"drift-controller-inspection-close");
+    Need(beforeRefusal.DiscretionaryAcl.Cast<GenericAce>().OfType<CommonAce>().Any(ace=>ace.SecurityIdentifier.Value==WindowsIdentity.GetCurrent().User.Value&&ace.AccessMask==(int)driftRights&&(ace.AceFlags&AceFlags.Inherited)==0),"drift-owned-permission-changed");
     Refuses("WINDOWS_ACL_INHERITANCE_CHANGED",()=>WindowsAppContainerResourcesNative.Restore(plan));var refused=Security(git);Need(Protected(refused)&&Aces(refused,plan.profileSid).SequenceEqual(Aces(beforeRefusal,plan.profileSid))&&refused.DiscretionaryAcl.Cast<GenericAce>().OfType<QualifiedAce>().Any(ace=>ace.SecurityIdentifier.Value==plan.profileSid),"changed-owned-ACE-retained");
     // Reverse only this fixture's deliberate edit, then exercise resumed and
     // repeated recovery against the same journal after the parent was restored.

@@ -100,6 +100,11 @@ test('v3 provenance preserves multiplicity and rejects malformed or unowned inhe
   assert.equal(validatePlan(withEntry(entry)).entries[0], entry)
   const malformedHeader = Buffer.from(inherited, 'base64'); malformedHeader[2]--
   const unrelated = Buffer.from(explicit, 'base64'); unrelated[4] ^= 2
+  // A 24-byte inherited Administrators ACE beside the 20-byte SYSTEM ACE
+  // distinguishes the exact aligned USHORT ACL-size boundary.
+  const administrator = Buffer.alloc(24); Buffer.from(inherited, 'base64').copy(administrator)
+  administrator.writeUInt16LE(24, 2); administrator[9] = 2; administrator.writeUInt32LE(32, 16); administrator.writeUInt32LE(544, 20)
+  const longer = administrator.toString('base64')
   for (const change of [
     { inheritedAces: undefined }, { explicitAces: null }, { inheritedAces: 'not-an-array' },
     { inheritedAces: [null] }, { inheritedAces: ['invalid-base64'] }, { inheritedAces: [inherited + '\n'] },
@@ -108,11 +113,12 @@ test('v3 provenance preserves multiplicity and rejects malformed or unowned inhe
     { git: false }, { daclProtected: true },
     { inheritedAces: Array(8193).fill(inherited), explicitAces: [] },
     { inheritedAces: Array(3277).fill(inherited), explicitAces: [] },
+    { inheritedAces: [...Array(3274).fill(inherited), longer, longer], explicitAces: [] },
   ]) assert.throws(() => validatePlan(withEntry({ ...entry, ...change })), { code: 'WINDOWS_RESOURCE_INVALID' })
   // Both fields are mandatory even when this object owns no transition.
   const missing = { ...entry }; delete missing.explicitAces
   assert.throws(() => validatePlan(withEntry(missing)), { code: 'WINDOWS_RESOURCE_INVALID' })
-  assert.equal(validatePlan(withEntry({ ...entry, inheritedAces: Array(3276).fill(inherited), explicitAces: [] })).schemaVersion, 3)
+  assert.equal(validatePlan(withEntry({ ...entry, inheritedAces: [...Array(3275).fill(inherited), longer], explicitAces: [] })).schemaVersion, 3)
 })
 
 test('invalid native apply replies retain the journal recovery binding', async () => {

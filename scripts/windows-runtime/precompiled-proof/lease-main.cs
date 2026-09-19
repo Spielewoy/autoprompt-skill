@@ -144,11 +144,23 @@ public static class BundleAclProbe {
       Need(new SecurityIdentifier(sid).Value==expected,"acl-package-mismatch");
     } finally { if(buffer!=IntPtr.Zero)Marshal.FreeHGlobal(buffer);if(token!=IntPtr.Zero)Close(token); }
   }
+  static string PathObservation(uint flags,uint length,int error,string value,string expected) {
+    string kind=value.StartsWith(@"\\?\Volume{",StringComparison.OrdinalIgnoreCase)?"GUID":
+      Regex.IsMatch(value,@"\A\\\\\?\\[A-Za-z]:\\")?"DOS":value.StartsWith(@"\Device\",StringComparison.OrdinalIgnoreCase)?"NT":"other";
+    bool valid=length>0&&length<32768;
+    string wanted=(flags&4)!=0?expected.Substring(2):NativePath(expected);
+    return "f"+flags.ToString(CultureInfo.InvariantCulture)+",len="+length.ToString(CultureInfo.InvariantCulture)+",error="+(length==0?((uint)error).ToString(CultureInfo.InvariantCulture):"0")+",kind="+kind+",equal="+(valid&&String.Equals(value,wanted,StringComparison.OrdinalIgnoreCase)?"1":"0")+",exact="+(valid&&String.Equals(value,wanted,StringComparison.Ordinal)?"1":"0");
+  }
   static string Read(IntPtr handle,string expectedPath) {
     Info info=new Info();Need(GetFileType(handle)==1&&GetFileInformationByHandle(handle,out info),"acl-directory-query");
     Need((info.Attr&0x400)==0&&(info.Attr&0x10)!=0,"acl-physical-directory");
-    var path=new StringBuilder(32768);uint length=GetFinalPathNameByHandleW(handle,path,(uint)path.Capacity,0);
-    Need(length>0&&length<path.Capacity&&String.Equals(path.ToString(),"\\\\?\\"+expectedPath,StringComparison.OrdinalIgnoreCase),"acl-canonical-directory");
+    var path=new StringBuilder(32768);uint length=GetFinalPathNameByHandleW(handle,path,(uint)path.Capacity,0);int error=Marshal.GetLastWin32Error();
+    if(!(length>0&&length<path.Capacity&&String.Equals(path.ToString(),"\\\\?\\"+expectedPath,StringComparison.OrdinalIgnoreCase))) {
+      // Observation only: no alternative query can authorize this failed check.
+      string detail=PathObservation(0,length,error,path.ToString(),expectedPath);
+      foreach(uint flags in new uint[]{4,8,12}) { var other=new StringBuilder(32768);uint count=GetFinalPathNameByHandleW(handle,other,(uint)other.Capacity,flags);int last=Marshal.GetLastWin32Error();detail+=";"+PathObservation(flags,count,last,other.ToString(),expectedPath); }
+      throw new Refusal("acl-canonical-directory:"+detail);
+    }
     return info.Volume.ToString("x8",CultureInfo.InvariantCulture)+":"+info.IdHigh.ToString("x8",CultureInfo.InvariantCulture)+info.IdLow.ToString("x8",CultureInfo.InvariantCulture);
   }
   static string NativePath(string path) { return "\\\\?\\"+path; }

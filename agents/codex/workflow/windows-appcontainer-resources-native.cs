@@ -267,7 +267,7 @@ public static class WindowsAppContainerResourcesNative {
   static void ValidateInheritanceRecord(EntryRecord entry,string packageSid){
     Need(entry.inheritedAces!=null && entry.explicitAces!=null && entry.inheritedAces.Length+entry.explicitAces.Length<=8192,"WINDOWS_RESOURCE_INVALID");
     Need((entry.git && !entry.daclProtected) || (entry.inheritedAces.Length==0 && entry.explicitAces.Length==0),"WINDOWS_RESOURCE_INVALID");
-    int bytes=8;foreach(string encoded in entry.inheritedAces.Concat(entry.explicitAces)){byte[] raw=AceBytes(encoded);bytes+=raw.Length;Need(bytes<=65536,"WINDOWS_RESOURCE_INVALID");var ace=GenericAce.CreateFromBinaryForm(raw,0) as QualifiedAce;Need(ace!=null && ace.SecurityIdentifier.Value!=packageSid,"WINDOWS_RESOURCE_INVALID");}
+    int bytes=8;foreach(string encoded in entry.inheritedAces.Concat(entry.explicitAces)){byte[] raw=AceBytes(encoded);bytes+=raw.Length;Need(bytes<=65535,"WINDOWS_RESOURCE_INVALID");var ace=GenericAce.CreateFromBinaryForm(raw,0) as QualifiedAce;Need(ace!=null && ace.SecurityIdentifier.Value!=packageSid,"WINDOWS_RESOURCE_INVALID");}
     var flattened=new HashSet<string>(entry.inheritedAces.Select(ace=>InheritanceBit(ace,false)),StringComparer.Ordinal);
     Need(entry.inheritedAces.All(Inherited) && entry.explicitAces.All(ace=>!Inherited(ace)&&flattened.Contains(ace)),"WINDOWS_RESOURCE_INVALID");
   }

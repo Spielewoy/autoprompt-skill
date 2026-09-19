@@ -61,7 +61,7 @@ function validatePlan(plan, expected = {}) {
     const decodeAce = (value, inherited) => {
       need(typeof value === 'string' && value.length <= 87380)
       const bytes = Buffer.from(value, 'base64'); aclBytes += bytes.length
-      need(bytes.length >= 4 && bytes.length <= 65528 && !(bytes.length & 3) && bytes.readUInt16LE(2) === bytes.length && bytes.toString('base64') === value && Boolean(bytes[1] & 16) === inherited && aclBytes <= 65536)
+      need(bytes.length >= 4 && bytes.length <= 65528 && !(bytes.length & 3) && bytes.readUInt16LE(2) === bytes.length && bytes.toString('base64') === value && Boolean(bytes[1] & 16) === inherited && aclBytes <= 65535)
       bytes[1] &= ~16
       return bytes.toString('base64')
     }
