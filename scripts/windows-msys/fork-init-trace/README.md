@@ -7,7 +7,7 @@ no speculative behavior fix. A successful traced child would not prove that
 the uninstrumented candidate is correct.
 
 `generate.py SOURCE BASE_PATCH NEW_OUTPUT` takes the normal compiler source tree
-after the reviewed base patch has been applied. It binds six exact adapted
+after the reviewed base patch has been applied. It binds eight exact adapted
 source files and that base patch, then generates an independent trace patch/manifest.
 The recipe additionally verifies the full source archive hash. The only
 original-source changes are inserted includes and finite stage calls. The
@@ -44,13 +44,19 @@ Stages: 1–5 DLL_PROCESS_ATTACH; 10–28 dll_crt0_0; 40–48 fork child memory 
 exception path. Stages100–103 bracket `dll_load` entry, first LoadLibrary call,
 passing the optional fallback block and successful handle assignment. Stage102
 does not establish that fallback ran: the first load may already have succeeded.
+Before the original `wincapc::init` early return, stage110 means `caps` is null,
+111 means it equals one of this module's ten known capability tables, and112
+means a non-null foreign pointer. This classification compares addresses without
+dereferencing the pointer or changing it. Stages113/114 bracket the original
+`thr_alloc` constructor body; 113 follows its `current` member initializer.
 These statements still
 execute unchanged; marker calls preserve thread error/status. Constructor index `i` has
 pre/post stages `0x100+i`/`0x200+i`, only for the forced DLL table and indices
 1 through64. The existing loop still calls every constructor even beyond that
 diagnostic bound. The runner independently rejects tables exceeding64.
 Every fixed marker follows
-its named source anchor, except 23 before handle_fork. Generated patch is the
+its named source anchor, except 23 before handle_fork, 92 before RtlGenRandom,
+and the110–112 classification before the existing caps check. Generated patch is the
 source of truth for precise placement. Stage 14 measures native environment
 following initial_env; the fork CreateProcessW passes NULL lpEnvironment, so
 initial child DLL attach inherits the parent's Windows environment before
@@ -108,12 +114,17 @@ export, consumer, import or production admission path.
 `g++ -std=c++17 -Wall -Wextra -Werror test.cc -o /tmp/trace-test && /tmp/trace-test`
 executes 17 simulated NT transport contracts. These are not Windows semantics.
 The complete derived C# launcher compiles using local PowerShell/Roslyn. A
-source-stripping check verifies original bytes across all six instrumented
+source-stripping check verifies original bytes across all eight instrumented
 files. CI32 produced no trace artifact: the added `autoload.cc` pin described
 pristine source although the compiler tree already contained the base patch.
 Reproducing that exact sequence fails before the output directory is created.
 The corrected pin and full base-patch composition regression address this
-setup error; the expanded trace still requires actual Windows compilation and execution.
+setup error. CI34 compiled and executed that corrected trace. All four failing
+fork children completed constructors18 through2, including successful RNG, and
+stopped inside constructor1 `_GLOBAL__sub_I_pthread_wrapper`, which initializes
+`thr_alloc` using `wincap.caps`. The original candidate was unchanged and the
+owned drain was confirmed. The new110–114 pointer/body markers still require
+actual Windows compilation and execution; they do not assert a faulty pointer.
 
 CI28 run35457714006 compiled and executed the original trace, confirmed the
 owned drain and preserved original candidate/SDK hashes. All four failed fork
@@ -174,9 +185,11 @@ The Python test copies the pristine source and applies the complete exact base
 patch before generating and applying the trace patch. It also verifies direct
 generation from pristine source is refused before output is created. It compiles
 and runs 17 transport seams, verifies the closed NT call
-set, source drift refusal, CRLF derivation, all55 fixed stage insertions,
+set, source drift refusal, CRLF derivation, all60 closed fixed stage values,
 adapted source preservation, compiled constructor call-order/count/exception
-contracts, actual full derived C# compilation and shell syntax.
+contracts, exact pointer classification for null/all ten local tables/foreign,
+allocator choice and exception behavior, actual full derived C# compilation
+and shell syntax.
 The Node suite checks strict bounded stage/drain parsing and actual dependency
 composition plus strict DLL-map/malformed-COFF cases. None of
 these local checks claim native Windows execution.

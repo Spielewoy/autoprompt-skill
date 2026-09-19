@@ -64,7 +64,7 @@ test('Windows tree protocol refuses unsafe, ambiguous, missing, and unbound entr
     value => { value.entries.push({ ...value.entries[2], path: 'nested/DATA', identity: '1234abcd:0000000000000004' }) },
     value => { value.entries = [] },
     value => { value.entries[1].path = Array(129).fill('deep').join('/') },
-    value => { value.entries = Array(4097).fill(value.entries[0]) },
+    value => { value.entries = Array(16385).fill(value.entries[0]) },
     value => { value.bytes = 67108865 },
   ]
   for (const mutate of mutations) {
@@ -264,4 +264,32 @@ test('Windows transaction protocol distinguishes missing tree, required director
   for (const [native, code] of [['FILESYSTEM_ALREADY_EXISTS', 'EEXIST'], ['FILESYSTEM_CROSS_DEVICE', 'EXDEV'], ['FILESYSTEM_NOT_FOUND', 'ENOENT'], ['FILESYSTEM_DURABILITY_UNAVAILABLE', 'FILESYSTEM_DURABILITY_UNAVAILABLE']]) {
     assert.throws(() => parseTransactionResult(JSON.stringify({ schemaVersion: 1, status: 'REFUSED', code: native }), 'rename-tree-no-replace'), { code })
   }
+})
+
+
+test('Windows tree parser accepts the full 16384-entry boundary and refuses overflow without truncation', () => {
+  const root = treeFixture().entries[0]
+  const entries = [root]
+  const expected = crypto.createHash('sha256')
+  for (let index = 1; index < 16384; index++) {
+    const identity = '1234abcd:' + (index + 1).toString(16).padStart(16, '0')
+    const name = 'd' + String(index).padStart(5, '0')
+    entries.push({ type: 'directory', path: name, identity, attributes: 16, stat: stat(identity, 0, true) })
+    expected.update('directory\0' + name + '\0' + 0o666 + '\0')
+  }
+  const value = { schemaVersion: 1, status: 'TREE_CAPTURED', operation: 'tree', bytes: 0, entries }
+  const parsed = parseCapture(JSON.stringify(value), 'tree')
+  assert.equal(parsed.entries.length, 16384)
+  assert.equal(parsed.hash, expected.digest('hex'))
+  const identity = '1234abcd:0000000000004001'
+  entries.push({ type: 'directory', path: 'overflow', identity, attributes: 16, stat: stat(identity, 0, true) })
+  assert.throws(() => parseCapture(JSON.stringify(value), 'tree'), { code: 'FILESYSTEM_BACKEND_UNAVAILABLE' })
+})
+
+test('Windows record recovery retains its independent 4096-name boundary', () => {
+  const removed = Array.from({ length: 4096 }, (_, index) => '.terminal.json.1234.' + index.toString(16).padStart(16, '0') + '.create')
+  const result = () => parseRecordResult(JSON.stringify({ schemaVersion: 1, status: 'RECOVERED', removed }), 'recover-record-publication', undefined, 'terminal.json')
+  assert.deepEqual(result(), removed)
+  removed.push('.terminal.json.1234.0000000000001000.create')
+  assert.throws(result, { code: 'FILESYSTEM_BACKEND_UNAVAILABLE' })
 })

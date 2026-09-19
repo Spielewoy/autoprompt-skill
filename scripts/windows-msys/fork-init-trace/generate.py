@@ -7,6 +7,10 @@ SOURCE='270ba2980700e6e2a0813944d506eecea0f86402'
 sha=lambda b:hashlib.sha256(b).hexdigest()
 CTOR_ORIGINAL='  while (--pfunc > in_pfunc)\n    (*pfunc) ();\n'
 CTOR_TRACE='  while (--pfunc > in_pfunc)\n    {\n      if (force && pfunc - in_pfunc <= 64)\n        autoprompt_fork_trace::emit (0x100 + (pfunc - in_pfunc));\n      (*pfunc) ();\n      if (force && pfunc - in_pfunc <= 64)\n        autoprompt_fork_trace::emit (0x200 + (pfunc - in_pfunc));\n    }\n'
+CAP_TABLES=['wincap_8_1','wincap_10_1507','wincap_10_1607','wincap_10_1703','wincap_10_1709','wincap_10_1803','wincap_10_1809','wincap_10_1903','wincap_10_2004','wincap_11']
+CAP_TRACE='  autoprompt_fork_trace::emit (!caps ? 110 : ('+' || '.join('caps == &'+name for name in CAP_TABLES)+') ? 111 : 112);\n'
+ALLOC_ORIGINAL='  thread_allocator () : current (THREAD_STORAGE_HIGH)\n  {\n    alloc_func = wincap.has_extended_mem_api () ? &thread_allocator::_alloc : &thread_allocator::_alloc_old;\n  }\n'
+ALLOC_TRACE=ALLOC_ORIGINAL.replace('  {\n','  {\n    autoprompt_fork_trace::emit (113);\n').replace('  }\n','    autoprompt_fork_trace::emit (114);\n  }\n')
 def once(text, old, new):
     if text.count(old)!=1: raise ValueError('Expected one source anchor: '+repr(old))
     return text.replace(old,new)
@@ -49,6 +53,10 @@ def generate(source, patch, out):
             chunk=mark(chunk,'      if (!RtlGenRandom (ptr, len))\n',92,True)
             chunk=mark(chunk,'\t  debug_printf ("RtlGenRandom() = FALSE");\n',94,True)
             text=text[:start]+chunk+text[end:]
+        elif rel.endswith('/wincap.cc'):
+            text=once(text,'  if (caps)\n',CAP_TRACE+'  if (caps)\n')
+        elif rel.endswith('/create_posix_thread.cc'):
+            text=once(text,ALLOC_ORIGINAL,ALLOC_TRACE)
         elif rel.endswith('/autoload.cc'):
             start=text.index('static __inline bool\ndll_load (HANDLE& handle, PWCHAR name)\n');end=text.index('\n#define RETRY_COUNT',start)
             chunk=text[start:end]

@@ -159,6 +159,24 @@ jobs:
           name: windows-resource-scale-${{ matrix.runner.arch }}-node-${{ matrix.node }}
           path: native-windows-resource-scale.log
           if-no-files-found: error
+      - name: Exercise native filesystem operations on large trees
+        id: filesystem-scale-proof
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 27
+        shell: pwsh
+        run: |
+          node --test --test-reporter=tap --test-name-pattern='^native Windows filesystem scale captures copies renames flushes and cleans bounded large trees$' tests/source/windows-filesystem-scale.test.cjs 2>&1 | Tee-Object -FilePath native-windows-filesystem-scale.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native filesystem scale observations
+        id: filesystem-scale-evidence
+        if: always() && runner.os == 'Windows'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-filesystem-scale-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: native-windows-filesystem-scale.log
+          if-no-files-found: error
       - name: Record native host NUL query sizes before sandbox launches
         if: runner.os == 'Windows'
         # Independent of the AppContainer launcher; mandatory again in the full suite.
@@ -585,7 +603,7 @@ jobs:
       - name: Packed installer lifecycle
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
       - name: Require native startup and selected compiler proofs to succeed
-        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.runtime-precompiled-proof.outcome == 'failure' || steps.runtime-precompiled-evidence.outcome == 'failure' || steps.git-acl-proof.outcome == 'failure' || steps.git-acl-evidence.outcome == 'failure' || steps.resource-scale-proof.outcome == 'failure' || steps.resource-scale-evidence.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-candidate.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure' || steps.msys-portable.outcome == 'failure' || steps.msys-portable-evidence.outcome == 'failure')
+        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.runtime-precompiled-proof.outcome == 'failure' || steps.runtime-precompiled-evidence.outcome == 'failure' || steps.git-acl-proof.outcome == 'failure' || steps.git-acl-evidence.outcome == 'failure' || steps.resource-scale-proof.outcome == 'failure' || steps.resource-scale-evidence.outcome == 'failure' || steps.filesystem-scale-proof.outcome == 'failure' || steps.filesystem-scale-evidence.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-candidate.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure' || steps.msys-portable.outcome == 'failure' || steps.msys-portable-evidence.outcome == 'failure')
         run: node -e "process.exit(1)"
 
   claude-native:

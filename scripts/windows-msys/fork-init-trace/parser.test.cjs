@@ -28,6 +28,13 @@ test('constructor markers have a closed index bound and remain observations',()=
  for(const stage of ['0100','0141','0200','0241'])assert.throws(()=>parse(line('AT:00000001:'+stage+':1\n')))
 })
 
+test('capability pointer and allocator markers remain a closed diagnostic set',()=>{
+ const stages=[110,111,112,113,114]
+ const r=parse(line(stages.map(stage=>'AT:00000001:'+stage.toString(16).padStart(4,'0')+':1\n').join('')))
+ assert.equal(r.accepted,false);assert.deepEqual(r.operations[0].records.map(x=>x.stage),stages)
+ for(const stage of [109,115])assert.throws(()=>parse(line('AT:00000001:'+stage.toString(16).padStart(4,'0')+':1\n')))
+})
+
 const {constructorMap}=require('./constructor-map.cjs')
 function dll(){
  const b=Buffer.alloc(0x500),pe=0x80,base=0x180000000n,section=pe+24+112,symbols=0x400

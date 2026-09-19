@@ -4,5 +4,7 @@
   "winsup/cygwin/mm/cygheap.cc": "45737284b0120e55d5a0fd23b98f419a6aa2482b3a9ea86da6ca644489bdf243",
   "winsup/cygwin/mm/shared.cc": "842deab4aae669f7e32a4ccd911eadb888fcfe18c60533de1cd01621d0662046",
   "winsup/cygwin/libc/getentropy.cc": "ae18e89a2a349ad69966806c2ed4a1411c87013436a463f1a327f554e72a87e0",
-  "winsup/cygwin/autoload.cc": "2f401818fb005da5227fd65769f10ecea10c11d7d7b6170eed8b6a37258040f5"
+  "winsup/cygwin/autoload.cc": "2f401818fb005da5227fd65769f10ecea10c11d7d7b6170eed8b6a37258040f5",
+  "winsup/cygwin/wincap.cc": "57e3574cbc75be4e84e20416a4f591adfad7db7850707612018a277a0193b333",
+  "winsup/cygwin/create_posix_thread.cc": "b26401177e090d365d027943d54867312b2be5459b6630f806362945319ef7e5"
 }

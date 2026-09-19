@@ -9,6 +9,8 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const MAX_RECORD_BYTES = 8 * 1024 * 1024 + 1
+const MAX_TREE_ENTRIES = 16384
+const MAX_RECORD_ENTRIES = 4096
 const MAX_BYTES = 64 * 1024 * 1024
 const MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 const IDENTITY = /^[0-9a-f]{8}:[0-9a-f]{16}$/u
@@ -57,7 +59,7 @@ function fileContent(value) {
 }
 function parseTree(value) {
   if (!exact(value, ['schemaVersion', 'status', 'operation', 'bytes', 'entries']) || value.schemaVersion !== 1 || value.status !== 'TREE_CAPTURED' || value.operation !== 'tree' ||
-      !bounded(value.bytes, MAX_BYTES) || !Array.isArray(value.entries) || value.entries.length < 1 || value.entries.length > 4096) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows tree capture is malformed')
+      !bounded(value.bytes, MAX_BYTES) || !Array.isArray(value.entries) || value.entries.length < 1 || value.entries.length > MAX_TREE_ENTRIES) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows tree capture is malformed')
   const seen = new Map(), identities = new Set()
   let bytes = 0
   const entries = value.entries.map((entry, index) => {
@@ -146,7 +148,7 @@ function parseRecordResult(stdout, operation, content, leaf) {
   }
   if (operation === 'recover-record-publication') {
     if (!exact(value, ['schemaVersion', 'status', 'removed']) || value.schemaVersion !== 1 || value.status !== 'RECOVERED' || !validComponent(leaf) ||
-        !Array.isArray(value.removed) || value.removed.length > 4096 || new Set(value.removed).size !== value.removed.length) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows record recovery response is malformed')
+        !Array.isArray(value.removed) || value.removed.length > MAX_RECORD_ENTRIES || new Set(value.removed).size !== value.removed.length) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows record recovery response is malformed')
     const prefix = '.' + leaf + '.'
     for (const name of value.removed) {
       if (!validComponent(name) || !name.startsWith(prefix) || !/^[1-9][0-9]{0,9}\.[a-f0-9]{16}\.(?:tmp|create)$/u.test(name.slice(prefix.length)) ||

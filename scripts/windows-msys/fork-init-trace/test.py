@@ -33,6 +33,18 @@ int main(){
  (root/'constructor-loop.cc').write_text(loop_source)
  subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror',str(root/'constructor-loop.cc'),'-o',str(root/'constructor-loop')],check=True,timeout=60)
  subprocess.run([str(root/'constructor-loop')],check=True,timeout=10)
+ # Compile the exact pointer classification and allocator constructor edits.
+ pointer_source='#include <vector>\n#include <cassert>\n#include <stdexcept>\nstatic std::vector<unsigned> events;\nnamespace autoprompt_fork_trace { void emit(unsigned n){events.push_back(n);} }\n'
+ pointer_source+='\n'.join('static const int '+name+' = 0;' for name in generate['CAP_TABLES'])+'\n'
+ pointer_source+='static void observe(const void *caps){'+generate['CAP_TRACE']+'}\n'
+ pointer_source+='static unsigned getter_calls; static bool extended,fail_getter; struct Cap { bool has_extended_mem_api(){++getter_calls;if(fail_getter)throw std::runtime_error("original");return extended;} } wincap;\n'
+ pointer_source+='static const unsigned THREAD_STORAGE_HIGH=1234; class thread_allocator { public: unsigned current; int(thread_allocator::*alloc_func)(); int _alloc(){return 1;} int _alloc_old(){return 2;}\n'+generate['ALLOC_TRACE']+'};\n'
+ pointer_source+='int main(){observe(nullptr);assert(events.back()==110);\n'
+ pointer_source+='\n'.join('observe(&'+name+');assert(events.back()==111);' for name in generate['CAP_TABLES'])
+ pointer_source+='int foreign=0;observe(&foreign);assert(events.back()==112); for(bool value:{false,true}){extended=value;getter_calls=0;events.clear();thread_allocator a;assert(a.current==1234);assert((a.*a.alloc_func)()==(value?1:2));assert(getter_calls==1);assert((events==std::vector<unsigned>{113,114}));}events.clear();fail_getter=true;try{thread_allocator a;assert(false);}catch(const std::runtime_error&){}assert((events==std::vector<unsigned>{113}));}\n'
+ (root/'pointer-state.cc').write_text(pointer_source)
+ subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror',str(root/'pointer-state.cc'),'-o',str(root/'pointer-state')],check=True,timeout=60)
+ subprocess.run([str(root/'pointer-state')],check=True,timeout=10)
  header=(HERE/'trace.h').read_text()
  calls=set(re.findall(r'\b([A-Z][A-Za-z0-9_]*)\(',header))
  assert calls=={'NtCurrentTeb','NtQueryObject','NtQueryInformationFile','NtWriteFile'},calls
@@ -81,12 +93,15 @@ int main(){
    cleaned=''.join(line for line in text.splitlines(True) if not line.strip().startswith('autoprompt_fork_trace::emit') and line!='#include "autoprompt-fork-trace.h"\n')
    at=cleaned.rfind('#include "ntdll.h"\n');cleaned=cleaned[:at]+cleaned[at+len('#include "ntdll.h"\n'):]
    assert cleaned==(adapted/rel).read_text(),rel
-  assert len(stages)==55 and len(set(stages))==55
+  assert (check/'winsup/cygwin/wincap.cc').read_text().count(generate['CAP_TRACE'])==1
+  assert (check/'winsup/cygwin/create_posix_thread.cc').read_text().count(generate['ALLOC_TRACE'])==1
+  assert len(stages)==57 and len(set(stages))==57
+  assert len(set(stages)|{110,111,112})==60
   bad=root/'bad.patch';bad.write_bytes(b'wrong patch')
   try:generate['generate'](adapted,bad,root/'bad-output')
   except ValueError:pass
   else:raise AssertionError('Wrong base authority accepted')
-  print('Full base-patch composition verified; pristine source refused; 55 unique stage insertions plus bounded constructor pre/post observations preserve all six adapted source files byte-for-byte')
+  print('Full base-patch composition verified; pristine source refused; 60 closed stage values plus bounded constructor pre/post observations preserve all eight adapted source files byte-for-byte')
  if a.windows_cxx:
   prefix=(HERE/'test.cc').read_text().split('static int fail=')[0]
   prefix+='extern "C" int NtQueryObject(HANDLE,int,OBJECT_BASIC_INFORMATION*,unsigned,void*);\nextern "C" int NtQueryInformationFile(HANDLE,IO_STATUS_BLOCK*,void*,unsigned,int);\nextern "C" int NtWriteFile(HANDLE,void*,void*,void*,IO_STATUS_BLOCK*,char*,unsigned,void*,void*);\n'

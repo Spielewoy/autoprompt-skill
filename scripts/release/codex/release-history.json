@@ -380,6 +380,13 @@
       "payloadDigest": "3b9e69c9810027659a4717a9bcd1118cf79120d60ace3db3e25300fb4a775296",
       "previousRecordDigest": "1d2f369b79f1a936b81affa9cb41d06d912ddbbb4a7e89f29e478b3fc41eee05",
       "recordDigest": "7cbf1bc3ed601c7c77e74b3a0df39f5cfc6e464f923445d6ae7ebfa39547f162"
+    },
+    {
+      "version": "1.0.59",
+      "payloadGeneration": "codex-v2.0.0-4572b1731957e2ff",
+      "payloadDigest": "4572b1731957e2ff45cbaf25f93168f6eff8390ee492be9236e8cc3ebf14f795",
+      "previousRecordDigest": "7cbf1bc3ed601c7c77e74b3a0df39f5cfc6e464f923445d6ae7ebfa39547f162",
+      "recordDigest": "133392b66d76bdbbb8c598dc5af8e9b47c2c310d7ba31c06d102f1a84f830840"
     }
   ]
 }
