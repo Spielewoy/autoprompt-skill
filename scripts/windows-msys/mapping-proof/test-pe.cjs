@@ -1,0 +1,8 @@
+'use strict'
+const fs = require('node:fs'), crypto = require('node:crypto'), assert = require('node:assert/strict'), { checksum, pe, dynamicBaseOnly } = require('./run.cjs')
+const pinned = '8960254d07105436cc2fce93d716790dd2ef31213c476e7c097fae41870dad80', sha = value => crypto.createHash('sha256').update(value).digest('hex')
+const bytes = Buffer.alloc(1024); bytes.writeUInt16LE(0x5a4d, 0); bytes.writeUInt32LE(0x80, 0x3c); bytes.writeUInt32LE(0x4550, 0x80); bytes.writeUInt16LE(1, 0x86); bytes.writeUInt16LE(0xf0, 0x94); const optional = 0x98; bytes.writeUInt16LE(0x20b, optional); bytes.writeBigUInt64LE(0x210040000n, optional + 24); bytes.writeUInt32LE(0x200, optional + 64); bytes.writeUInt16LE(0, optional + 70); bytes.write('.data\0\0\0', optional + 0xf0, 'ascii'); bytes.writeUInt32LE(0x20d000, optional + 0xf0 + 12)
+assert.equal(pe(bytes).dataRva, 0x20d000); const result = dynamicBaseOnly(bytes); assert.equal(pe(result.patched).dllCharacteristics, 0x40); assert.equal(result.patched.readUInt32LE(pe(result.patched).checksumOffset), checksum(Buffer.from(result.patched), pe(result.patched).checksumOffset));
+if (process.argv.length === 3) { const actual = fs.readFileSync(process.argv[2]); assert.equal(sha(actual), pinned, 'authenticated CI38 candidate DLL'); const actualPe = pe(actual), actualPatched = dynamicBaseOnly(actual); assert.equal(actualPe.dataRva, 0x20d000, 'candidate .data RVA'); assert.equal(actualPatched.changed.length >= 2, true); }
+else assert.equal(process.argv.length, 2, 'Usage: node test-pe.cjs [PACKET/runtime/msys-2.0.dll]')
+console.log('PE DYNAMIC_BASE-only copy validated')

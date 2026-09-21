@@ -1,0 +1,52 @@
+'use strict'
+// Usage on the authenticated Windows workflow: node run.cjs REPO PACKET EXISTING_OUTPUT
+const fs = require('node:fs'), path = require('node:path'), cp = require('node:child_process'), crypto = require('node:crypto'), assert = require('node:assert/strict')
+const ROOT = __dirname, sha = value => crypto.createHash('sha256').update(value).digest('hex')
+const PINNED_MANIFEST = '2fde936d1adc418b039c5d7e65d5d6dacc4469b433a69859ccd6cb12ccde84f4', PINNED_BASH = '5490d0da5e7cf9d92068cc48fcc590f2bcf8564add8ff91c3b5fe541eb2d72e3', PINNED_DLL = '8960254d07105436cc2fce93d716790dd2ef31213c476e7c097fae41870dad80'
+function physical(value, directory = false) { const resolved = fs.realpathSync.native(path.resolve(value)); assert.equal(fs.statSync(resolved).isDirectory(), directory, 'physical input kind'); return resolved }
+function pe(bytes) {
+  assert.ok(Buffer.isBuffer(bytes) && bytes.length >= 256 && bytes.readUInt16LE(0) === 0x5a4d, 'DOS header'); const peOffset = bytes.readUInt32LE(0x3c)
+  assert.ok(peOffset + 24 <= bytes.length && bytes.readUInt32LE(peOffset) === 0x4550, 'PE header'); const optional = peOffset + 24, size = bytes.readUInt16LE(peOffset + 20)
+  assert.equal(bytes.readUInt16LE(optional), 0x20b, 'PE32+ only'); assert.ok(optional + size <= bytes.length && size >= 112, 'optional header')
+  const table = optional + size, count = bytes.readUInt16LE(peOffset + 6); assert.ok(table + count * 40 <= bytes.length, 'section table'); let dataRva = null
+  for (let i = 0; i < count; i++) { const at = table + i * 40; if (bytes.subarray(at, at + 8).toString('ascii').replace(/\0+$/, '') === '.data') dataRva = bytes.readUInt32LE(at + 12) }
+  assert.ok(dataRva !== null, '.data section'); return { optional, checksumOffset: optional + 64, dllCharacteristicsOffset: optional + 70, dllCharacteristics: bytes.readUInt16LE(optional + 70), imageBase: bytes.readBigUInt64LE(optional + 24), dataRva }
+}
+function checksum(bytes, offset) { let sum = 0; for (let at = 0; at < bytes.length; at += 2) { const word = at >= offset && at < offset + 4 ? 0 : bytes[at] | ((at + 1 < bytes.length ? bytes[at + 1] : 0) << 8); sum = (sum + word) >>> 0; sum = ((sum & 0xffff) + (sum >>> 16)) >>> 0 } sum = ((sum & 0xffff) + (sum >>> 16)) >>> 0; return (sum + bytes.length) >>> 0 }
+function dynamicBaseOnly(original) {
+  const info = pe(original); assert.equal(info.dllCharacteristics, 0, 'baseline must omit DLL characteristics'); const patched = Buffer.from(original)
+  patched.writeUInt16LE(0x40, info.dllCharacteristicsOffset); patched.writeUInt32LE(0, info.checksumOffset); patched.writeUInt32LE(checksum(patched, info.checksumOffset), info.checksumOffset)
+  const changed = []; for (let i = 0; i < patched.length; i++) if (patched[i] !== original[i]) changed.push(i)
+  const allowed = new Set([info.dllCharacteristicsOffset, info.dllCharacteristicsOffset + 1, info.checksumOffset, info.checksumOffset + 1, info.checksumOffset + 2, info.checksumOffset + 3]); assert.ok(changed.length >= 2 && changed.every(at => allowed.has(at)), 'only DYNAMIC_BASE and checksum may change')
+  const checked = pe(patched); assert.equal(checked.dllCharacteristics, 0x40); assert.equal(patched.readUInt32LE(checked.checksumOffset), checksum(Buffer.from(patched), checked.checksumOffset)); return { patched, info, changed }
+}
+function packetInputs(repo, packet) {
+  const portable = require(path.join(repo, 'scripts/windows-msys/portable-runtime/portable.cjs')), manifestBytes = portable.read(path.join(packet, 'manifest.json'), 1024 * 1024)
+  assert.equal(sha(manifestBytes), PINNED_MANIFEST, 'pinned candidate manifest'); const manifest = portable.parseCanonical(manifestBytes); assert.equal(manifest.schema, 1); assert.equal(manifest.kind, 'msys-candidate-transport'); assert.equal(manifest.status, 'not-native-accepted')
+  const files = new Map(manifest.files.map(file => [file.path, portable.read(path.join(packet, file.path), file.length)])); portable.validate(files, portable.authority(manifest.authority))
+  const bash = files.get('runtime/bash.exe'), dll = files.get('runtime/msys-2.0.dll'); assert.equal(sha(bash), PINNED_BASH, 'pinned candidate Bash'); assert.equal(sha(dll), PINNED_DLL, 'pinned candidate DLL'); return { manifestBytes, bash, dll, bashSha256: sha(bash), dllSha256: sha(dll) }
+}
+function privateDirectory(repo, target) { fs.mkdirSync(target, { recursive: true }); require(path.join(repo, 'agents/codex/workflow/safe-run-root.js')).ensureWindowsPrivateAcl(target); return target }
+function compileController(repo, root) {
+  const native = path.join(root, 'windows-appcontainer-native.cs'), source = path.join(root, 'mapping-controller.cs'), output = path.join(root, 'mapping-controller.exe'); fs.copyFileSync(path.join(repo, 'agents/codex/workflow/windows-appcontainer-native.cs'), native); fs.copyFileSync(path.join(ROOT, 'source', 'mapping-controller.cs'), source)
+  const system = process.env.SystemRoot; assert.match(system || '', /^[A-Za-z]:\\Windows$/i, 'SystemRoot'); const command = '[Environment]::SetEnvironmentVariable("PSModulePath",[IO.Path]::Combine($PSHOME,"Modules"),[EnvironmentVariableTarget]::Process);$ErrorActionPreference="Stop";Add-Type -Path @($env:AP_NATIVE,$env:AP_CONTROLLER) -OutputAssembly $env:AP_OUTPUT -OutputType ConsoleApplication'
+  const result = cp.spawnSync(path.join(system, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], { cwd: root, encoding: 'utf8', timeout: 60000, maxBuffer: 256 * 1024, windowsHide: true, shell: false, env: { SystemRoot: system, WINDIR: system, SystemDrive: system.slice(0, 2), PATH: path.join(system, 'System32'), TEMP: root, TMP: root, AP_NATIVE: native, AP_CONTROLLER: source, AP_OUTPUT: output } })
+  fs.writeFileSync(path.join(root, 'compile.stdout.txt'), result.stdout || ''); fs.writeFileSync(path.join(root, 'compile.stderr.txt'), result.stderr || ''); assert.ifError(result.error); assert.equal(result.status, 0, result.stderr); return output
+}
+function arm(repo, root, label, input, dll, sharedId, info) {
+  privateDirectory(repo, root); const runtime = path.join(root, 'runtime'), bin = path.join(runtime, 'usr', 'bin'); fs.mkdirSync(bin, { recursive: true }); fs.mkdirSync(path.join(runtime, 'etc')); fs.writeFileSync(path.join(runtime, 'etc', 'fstab'), 'none /tmp usertemp binary,posix=0,noacl 0 0\n', { flag: 'wx' })
+  const bash = path.join(bin, 'bash.exe'), msys = path.join(bin, 'msys-2.0.dll'); fs.writeFileSync(bash, input.bash, { flag: 'wx' }); fs.writeFileSync(msys, dll, { flag: 'wx' }); assert.equal(sha(fs.readFileSync(bash)), input.bashSha256); assert.equal(sha(fs.readFileSync(msys)), sha(dll)); return { bash, msys, root, args: [bash, input.bashSha256, msys, sha(dll), sharedId, info.dataRva.toString(16), root, label] }
+}
+function main(args) {
+  assert.equal(process.platform, 'win32', 'Windows-only observation'); assert.equal(args.length, 3, 'Usage: node run.cjs REPO PACKET EXISTING_OUTPUT'); const repo = physical(args[0], true), packet = physical(args[1], true), output = physical(args[2], true), input = packetInputs(repo, packet)
+  const sharedId = require(path.join(repo, 'agents/codex/workflow/windows-appcontainer.js')).parseMsysSharedId(input.dll), variant = dynamicBaseOnly(input.dll), work = privateDirectory(repo, fs.mkdtempSync(path.join(output, 'mapping-diagnostic-'))), controller = compileController(repo, work)
+  const baseline = arm(repo, path.join(work, 'baseline'), 'baseline', input, input.dll, sharedId, variant.info), dynamic = arm(repo, path.join(work, 'dynamic-base-only'), 'dynamic-base-only', input, variant.patched, sharedId, variant.info)
+  const launch = entry => { const result = cp.spawnSync(controller, entry.args, { cwd: entry.root, encoding: 'utf8', timeout: 150000, maxBuffer: 256 * 1024, windowsHide: true, shell: false, env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.SystemRoot, SystemDrive: process.env.SystemRoot.slice(0, 2), PATH: path.join(process.env.SystemRoot, 'System32'), TEMP: entry.root, TMP: entry.root } }); fs.writeFileSync(path.join(entry.root, 'controller.stdout.txt'), result.stdout || ''); fs.writeFileSync(path.join(entry.root, 'controller.stderr.txt'), result.stderr || ''); assert.ifError(result.error); assert.equal(result.status, 0, result.stderr || result.stdout); return JSON.parse(fs.readFileSync(path.join(entry.root, entry.args[7] + '.json'), 'utf8')) }
+  const baselineResult = launch(baseline), dynamicResult = launch(dynamic)
+  const aslrBits = flags => ({ bottomUpRandomization: (flags & 1) !== 0, forceRelocateImages: (flags & 2) !== 0, highEntropy: (flags & 4) !== 0, disallowStrippedImages: (flags & 8) !== 0 })
+  const comparison = { baselineAslr: { flags: baselineResult.aslr.flags, ...aslrBits(baselineResult.aslr.flags) }, dynamicBaseOnlyAslr: { flags: dynamicResult.aslr.flags, ...aslrBits(dynamicResult.aslr.flags) }, baselineChildBases: baselineResult.childDataErrors.map(item => item.childBase), baselineMismatch: baselineResult.childDataErrors.length ? baselineResult.childDataErrors.some(item => item.childBase === null || item.childBase.toLowerCase() !== baselineResult.module.base.toLowerCase()) : null, dynamicExactSuccess: dynamicResult.launch.classification === 'success' && Buffer.from(dynamicResult.stdoutBase64, 'base64').toString('utf8') === 'mapping-child=child\n' && Buffer.from(dynamicResult.stderrBase64, 'base64').length === 0 }
+  const report = { schemaVersion: 1, status: 'observed-not-accepted', work, packetManifestSha256: sha(input.manifestBytes), baselineDllSha256: input.dllSha256, dynamicBaseOnlyDllSha256: sha(variant.patched), dynamicBaseChangedOffsets: variant.changed, pe: { dataRva: '0x' + variant.info.dataRva.toString(16), imageBase: '0x' + variant.info.imageBase.toString(16) }, sharedId, provenance: { controllerSha256: sha(fs.readFileSync(path.join(ROOT, 'source', 'mapping-controller.cs'))), launcherSha256: sha(fs.readFileSync(path.join(repo, 'agents/codex/workflow/windows-appcontainer-native.cs'))), runnerSha256: sha(fs.readFileSync(__filename)) }, baseline: baselineResult, dynamicBaseOnly: dynamicResult, comparison }
+  fs.writeFileSync(path.join(work, 'summary.json'), JSON.stringify(report, null, 2) + '\n'); process.stdout.write(JSON.stringify(report) + '\n')
+}
+if (require.main === module) { try { main(process.argv.slice(2)) } catch (error) { process.stderr.write(String(error.stack || error) + '\n'); process.exitCode = 1 } }
+module.exports = { pe, checksum, dynamicBaseOnly, packetInputs }
