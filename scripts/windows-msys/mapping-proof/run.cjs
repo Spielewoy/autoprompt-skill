@@ -64,4 +64,4 @@ function main(args) {
   fs.writeFileSync(path.join(work, 'summary.json'), JSON.stringify(report, null, 2) + '\n'); process.stdout.write(JSON.stringify(report) + '\n')
 }
 if (require.main === module) { try { main(process.argv.slice(2)) } catch (error) { process.stderr.write(String(error.stack || error) + '\n'); process.exitCode = 1 } }
-module.exports = { pe, checksum, dynamicBaseOnly, packetInputs, witnessComplete }
+module.exports = { pe, checksum, dynamicBaseOnly, packetInputs, witnessComplete, privateDirectory, compileController, arm }

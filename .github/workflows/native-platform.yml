@@ -11,6 +11,11 @@ on:
         required: false
         default: false
         type: boolean
+      msys_pipe_trace:
+        description: 'Run one manual-only MSYS pipe I/O trace build'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -18,7 +23,7 @@ permissions:
 
 jobs:
   platform-primitives:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.msys_mapping != true }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.msys_mapping != true && inputs.msys_pipe_trace != true) }}
     name: Platform and installer / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
     # The one diagnostic producer may compile a separate traced DLL after the
@@ -650,7 +655,7 @@ jobs:
         run: node -e "process.exit(1)"
 
   claude-native:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.msys_mapping != true }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.msys_mapping != true && inputs.msys_pipe_trace != true) }}
     name: Actual Claude 2.1.270 / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
     timeout-minutes: 45
@@ -706,7 +711,7 @@ jobs:
           if-no-files-found: warn
 
   msys-mapping:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.msys_mapping == true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.msys_mapping == true && inputs.msys_pipe_trace != true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' }}
     name: MSYS mapping diagnostic / ${{ matrix.runner.os }} / Node 24.x
     runs-on: ${{ matrix.runner.os }}
     timeout-minutes: 30
@@ -795,4 +800,121 @@ jobs:
         with:
           name: windows-msys-mapping-${{ matrix.runner.arch }}-node-24.x
           path: ${{ runner.temp }}/msys-mapping-proof
+          if-no-files-found: error
+
+  msys-pipe-trace:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.msys_pipe_trace == true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.x
+          architecture: x64
+      - name: Download and authenticate the pinned CI38 candidate
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $repository = 'Spielewoy/autoprompt-skill'
+          $repositoryId = 1337733621
+          $artifactId = 10592654730
+          $runId = 35470164986
+          $runAttempt = 1
+          $headSha = 'eff3c98c64e2c1c93aaad13887890d3c4a841844'
+          $artifactName = 'windows-msys-candidate-eff3c98c64e2c1c93aaad13887890d3c4a841844-1'
+          $archiveSha256 = 'c83582caf180266a0e104da07f08ba9ac623381f44925cb2579759dc3b3f7c57'
+          $manifestSha256 = '2fde936d1adc418b039c5d7e65d5d6dacc4469b433a69859ccd6cb12ccde84f4'
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $api = "https://api.github.com/repos/$repository"
+          $run = Invoke-RestMethod -Headers $headers -Uri "$api/actions/runs/$runId" -Method Get
+          if ($run.id -ne $runId -or $run.head_sha -ne $headSha -or $run.run_attempt -ne $runAttempt -or $run.repository.full_name -ne $repository -or $run.head_repository.full_name -ne $repository) { throw 'Pinned CI38 run identity mismatch' }
+          $artifact = Invoke-RestMethod -Headers $headers -Uri "$api/actions/artifacts/$artifactId" -Method Get
+          if ($artifact.id -ne $artifactId -or $artifact.name -ne $artifactName -or $artifact.expired -or $artifact.size_in_bytes -ne 2999938 -or $artifact.digest -ne "sha256:$archiveSha256") { throw 'Pinned CI38 artifact metadata mismatch' }
+          if ($artifact.workflow_run.id -ne $runId -or $artifact.workflow_run.repository_id -ne $repositoryId -or $artifact.workflow_run.head_repository_id -ne $repositoryId -or $artifact.workflow_run.head_sha -ne $headSha) { throw 'Pinned CI38 artifact producer mismatch' }
+          $root = Join-Path $env:RUNNER_TEMP ('msys-pipe-trace-candidate')
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          $output = Join-Path $env:RUNNER_TEMP 'msys-mapping-proof'
+          New-Item -ItemType Directory -Path $output -ErrorAction Stop | Out-Null
+          $archive = Join-Path $root 'candidate.zip'
+          Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri "$api/actions/artifacts/$artifactId/zip" -OutFile $archive
+          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $archiveSha256) { throw "Pinned CI38 ZIP digest mismatch: $actualSha256" }
+          $extracted = Join-Path $root 'extracted'
+          Expand-Archive -LiteralPath $archive -DestinationPath $extracted -ErrorAction Stop
+          $packet = Join-Path $extracted 'packet'
+          $manifest = Join-Path $packet 'manifest.json'
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw 'Authenticated candidate packet manifest missing' }
+          $actualManifestSha256 = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualManifestSha256 -ne $manifestSha256) { throw "Pinned CI38 manifest digest mismatch: $actualManifestSha256" }
+          [ordered]@{
+            repository = $repository
+            repositoryId = $repositoryId
+            runId = $run.id
+            runAttempt = $run.run_attempt
+            headSha = $run.head_sha
+            artifactId = $artifact.id
+            artifactName = $artifact.name
+            artifactSize = $artifact.size_in_bytes
+            artifactDigest = $artifact.digest
+            archiveSha256 = $actualSha256
+            manifestSha256 = $actualManifestSha256
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $output 'ci38-authentication.json') -Encoding utf8
+          "$packet" | Set-Content -LiteralPath (Join-Path $output 'packet-path.txt') -Encoding utf8
+      - name: Build one isolated diagnostic MSYS runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:RUNNER_TEMP 'msys-mapping-proof'
+          $sourceRoot = Join-Path $output 'trace-source'
+          New-Item -ItemType Directory -Path $sourceRoot -ErrorAction Stop | Out-Null
+          $lock = Get-Content -LiteralPath scripts/windows-msys/build-lock.json -Raw | ConvertFrom-Json
+          $archive = Join-Path $sourceRoot 'source.tar.gz'
+          Invoke-WebRequest -UseBasicParsing -Uri $lock.source.url -OutFile $archive -TimeoutSec 300
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $lock.source.sha256) { throw 'Source archive mismatch' }
+          $source = Join-Path $sourceRoot 'pristine'
+          New-Item -ItemType Directory -Path $source -ErrorAction Stop | Out-Null
+          tar -xzf $archive --strip-components=1 -C $source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $prepared = Join-Path $output 'pipe-trace-inputs'
+          python -I scripts/windows-msys/pipe-io-trace/generate.py $source scripts/windows-msys/pipe-security.patch $prepared
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $patch = Join-Path $prepared 'combined.patch'
+          $digest = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
+          $savedPath = $env:PATH
+          try {
+            ./scripts/windows-msys/build.ps1 -WorkRoot (Join-Path $env:RUNNER_TEMP 'msys-pipe-trace-build') -Mode proof -AdaptationPatch $patch -AdaptationSha256 $digest -Jobs 4
+          } finally { $env:PATH = $savedPath }
+      - name: Observe parent reads and child writes in the sandbox
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:RUNNER_TEMP 'msys-mapping-proof'
+          $packet = (Get-Content -LiteralPath (Join-Path $output 'packet-path.txt') -Raw).Trim()
+          $payload = Join-Path $env:RUNNER_TEMP 'msys-pipe-trace-build/sdk/issue27-build'
+          node scripts/windows-msys/pipe-io-trace/run.cjs $PWD.Path $packet $output $payload
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve diagnostic observations and compiler evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-pipe-io-trace
+          path: |
+            ${{ runner.temp }}/msys-mapping-proof/ci38-authentication.json
+            ${{ runner.temp }}/msys-mapping-proof/pipe-trace-inputs
+            ${{ runner.temp }}/msys-mapping-proof/pipe-io-diagnostic-*
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/*.txt
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/*.sha256
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/adaptation.patch
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/lock.json
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/build/*.txt
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/build/**/config.log
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/stage/usr/bin/msys-2.0.dll
           if-no-files-found: error

@@ -1,0 +1,7 @@
+# Bounded MSYS pipe I/O trace
+
+This manual diagnostic observes the remaining command-substitution failure. CI44 showed that a native child receives a pipe handle with write access and successfully creates an event, but its write returns `STATUS_PIPE_CLOSING`. The original Bash builtin also sometimes reports EACCES; this diagnostic records the parent read path, child write path and their composite waits to distinguish those failures.
+
+Dispatch `native-platform.yml` with `msys_pipe_trace=true` on the issue branch. Only one Windows x64 job runs. It authenticates the original CI38 Bash packet, generates an instrumentation-only patch on top of the pinned adapter, and compiles that combined patch once using the existing pinned build recipe. It does not export a production candidate. The normal 20-job validation matrix and the separate two-job mapping diagnostic are skipped in this mode.
+
+The runner applies the same constrained DYNAMIC_BASE/checksum transform to Bash and the traced DLL, then runs the existing command-substitution witness script through the normal AppContainer launcher. Compiler records, source and binary digests, bounded raw logs, process witnesses and cleanup results remain in the artifact. Native capture is bounded at 256 KiB; the host controller capture is bounded at 1 MiB and 150 seconds. Tracing can perturb scheduling. Every result remains `observed-not-accepted`; neither a green job nor a successful traced command admits this runtime.
