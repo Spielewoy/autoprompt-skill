@@ -780,7 +780,14 @@ jobs:
             archiveSha256 = $actualSha256
             manifestSha256 = $actualManifestSha256
           } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $output 'ci38-authentication.json') -Encoding utf8
-          node scripts/windows-msys/mapping-proof/run.cjs $PWD.Path $packet $output
+          $toolchainRoot = Join-Path $output 'pipe-toolchain'
+          ./scripts/windows-msys/descriptor-proof/discover-toolchain.ps1 -WorkRoot $toolchainRoot
+          $toolchain = Join-Path $toolchainRoot 'toolchain.json'
+          $toolchainHash = (Get-FileHash -LiteralPath $toolchain -Algorithm SHA256).Hash.ToLowerInvariant()
+          $probe = Join-Path $output 'pipe-probe-build'
+          node scripts/windows-msys/mapping-proof/build-pipe.cjs $PWD.Path $toolchain $toolchainHash $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-msys/mapping-proof/run.cjs $PWD.Path $packet $output $probe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve native MSYS mapping diagnostic
         if: always()
