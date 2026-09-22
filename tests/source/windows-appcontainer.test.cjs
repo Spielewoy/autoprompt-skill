@@ -160,7 +160,7 @@ const windowsFixturePath = value => process.platform === 'win32' ? value : 'Z:' 
 const physicalFixturePath = value => process.platform === 'win32' ? value : value.slice(2).replaceAll('\\', '/')
 
 test('Windows ownership setup keeps a bounded cold-start allowance and never caches a failed privacy proof', t => {
-  const profile = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-profile-'))
+  const profile = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-profile-')))
   fs.mkdirSync(path.join(profile, 'AppData', 'Local', 'Temp'), { recursive: true }); fs.mkdirSync(path.join(profile, 'AppData', 'Roaming'), { recursive: true })
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
   const attempts = [], aclAttempts = []
@@ -202,7 +202,9 @@ test('Windows ownership setup keeps a bounded cold-start allowance and never cac
     assert.equal(options.env.LOCALAPPDATA, windowsFixturePath(fs.realpathSync.native(path.join(profile, 'AppData', 'Local'))))
     assert.equal(options.env.HOMEDRIVE, windowsFixturePath(profile).slice(0,2))
     assert.equal(options.env.HOMEPATH, windowsFixturePath(fs.realpathSync.native(profile)).slice(2))
-    assert.ok(options.env.TEMP.length < 100, 'CodeDOM compiler temp must stay shallow')
+    const expectedCompilerParent = windowsFixturePath(fs.realpathSync.native(path.join(profile, 'AppData', 'Local')))
+    assert.equal(path.win32.dirname(options.env.TEMP), expectedCompilerParent)
+    assert.match(path.win32.basename(options.env.TEMP), /^autoprompt-token-owner-[A-Za-z0-9]{6}$/)
     assert.equal(fs.existsSync(physicalFixturePath(options.env.TEMP)), false, 'temporary compiler files must be removed after success and failure')
   }
 })
@@ -307,7 +309,7 @@ test('Windows private ACL replaces foreign grants with exact file or directory r
   const calls = []
   let mutate = value => value
   const currentSid = 'S-1-5-21-123-456-789-1001'
-  const profile = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-acl-profile-'))
+  const profile = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-acl-profile-')))
   fs.mkdirSync(path.join(profile, 'AppData', 'Local', 'Temp'), { recursive: true }); fs.mkdirSync(path.join(profile, 'AppData', 'Roaming'), { recursive: true })
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
   const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(executable, argv, options) {

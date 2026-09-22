@@ -10,7 +10,7 @@ const path = require('node:path')
 const { createWindowsJobAdapter } = require('../../agents/codex/workflow/process-owner.js')
 
 function temporary(t, prefix) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix)))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   return directory
 }

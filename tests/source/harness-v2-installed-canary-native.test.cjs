@@ -181,7 +181,7 @@ test(PUBLIC_CASE, { skip: !CLI, timeout: process.platform === 'win32' ? 3720000 
     const statuses = fs.readdirSync(canaryRoot).filter(name => /^outer-[a-f0-9-]{36}\.status\.json$/.test(name))
     assert.equal(statuses.length, 1, 'all eleven Claude observations must come from the exact owned native batch')
     const status = JSON.parse(fs.readFileSync(path.join(canaryRoot, statuses[0])))
-    assert.equal(status.code, 0); assert.equal(status.signal, null); assert.equal(status.error, undefined)
+    assert.equal(status.code, 0); assert.equal(status.signal, null); assert.equal(status.error, null); assert.equal(status.errorCode, null)
     const output = `${status.stdout || ''}\n${status.stderr || ''}`
     for (const artifact of artifacts) assert.equal(JSON.parse(artifact.bytes).outputSha256, sha256(output))
     if (expectedWorker) {
@@ -206,7 +206,8 @@ test(PUBLIC_CASE, { skip: !CLI, timeout: process.platform === 'win32' ? 3720000 
     result = await ownedTest(owner, executionRoot, environment, [publicCli, 'activate', 'claude', '--root', root,
       '--target', target, '--ttl', process.platform === 'win32' ? '3600' : '1080', '--', mission], process.platform === 'win32' ? 3660000 : 1140000)
     fs.writeFileSync(path.join(directory, 'public-result.json'), JSON.stringify(result), { mode: 0o600 })
-    assert.equal(result.error, undefined)
+    assert.equal(result.error, null)
+    assert.equal(result.errorCode, null)
     assert.equal(result.signal, null)
     assert.equal(result.code, 1, 'only the deliberate model endpoint refusal is expected')
     assert.deepEqual(endpoint.errors, [])
