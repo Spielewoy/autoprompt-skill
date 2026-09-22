@@ -161,6 +161,44 @@ test('native Git checker snapshots preserve exact bytes beyond Windows MAX_PATH 
     snapshot = factory('native-deep-checker', [])
   } catch (error) {
     t.diagnostic(`Native Git snapshot failure: ${JSON.stringify(error.details || {}).slice(0, 8192)}`)
+    if (process.platform === 'win32') {
+      // Diagnostic-only alternatives against this disposable fixture. They do
+      // not replace the required factory result or turn its failure into a pass.
+      const probe = (label, clonePath, canonicalPath, cwd, afterClone) => {
+        try {
+          const cloned = run('git', ['clone', '--no-local', '--no-hardlinks', '--', target, clonePath], { env: environment, cwd })
+          const record = { label, clone: cloned.status, signal: cloned.signal, error: cloned.error?.code,
+            stderr: String(cloned.stderr || '').slice(-4096) }
+          if (cloned.status === 0) {
+            if (afterClone) afterClone()
+            const inspected = run('git', ['-C', canonicalPath, 'rev-parse', 'HEAD'], { env: environment })
+            const status = run('git', ['-C', canonicalPath, 'status', '--porcelain'], { env: environment })
+            record.canonicalHead = { code: inspected.status, exact: inspected.stdout.trim() === originalHead, stderr: inspected.stderr }
+            record.canonicalStatus = { code: status.status, stdout: status.stdout, stderr: status.stderr }
+          }
+          t.diagnostic(`Native Git path probe: ${JSON.stringify(record).slice(0, 8192)}`)
+        } catch (probeError) {
+          t.diagnostic(`Native Git path probe ${label}: ${probeError.code || probeError.message}`)
+        }
+      }
+      let ancestor = snapshotRoot
+      while (ancestor.length > 220) ancestor = path.dirname(ancestor)
+      const relativeTarget = path.join(snapshotRoot, `relative-${'a'.repeat(64)}`)
+      probe('relative destination', path.relative(ancestor, relativeTarget), relativeTarget, ancestor)
+      const alias = path.join(context.sandbox, 'git-snapshot-view')
+      try {
+        fs.symlinkSync(snapshotRoot, alias, 'junction')
+        const leaf = `alias-${'b'.repeat(64)}`
+        probe('short junction destination', path.join(alias, leaf), path.join(snapshotRoot, leaf))
+      } catch (aliasError) {
+        t.diagnostic(`Native Git junction probe: ${aliasError.code || aliasError.message}`)
+      } finally {
+        if (fs.existsSync(alias)) fs.unlinkSync(alias)
+      }
+      const shortClone = path.join(context.sandbox, 'short-clone')
+      const movedClone = path.join(snapshotRoot, `moved-${'c'.repeat(64)}`)
+      probe('short clone then move', shortClone, movedClone, undefined, () => fs.renameSync(shortClone, movedClone))
+    }
     throw error
   }
   assert.ok(snapshot.length > 300)
