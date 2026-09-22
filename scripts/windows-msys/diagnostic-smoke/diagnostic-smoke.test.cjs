@@ -30,7 +30,7 @@ test('shared native body preserves every original assertion and production selec
  body=body.replace("  const result = await executeTool(policy, 'bash', { command, timeoutMs: 30000 }, { controlRoot })", "  let result\n  try { result = await executeTool(policy, 'bash', { command, timeoutMs: 30000 }, { controlRoot }) } catch (error) {\n    preserve = error.cleanupConfirmed === false || error.code === 'APPCONTAINER_CLEANUP_UNCONFIRMED' || Boolean(error.recovery && !error.recoveryResolved)\n    if (preserve) t.diagnostic('Unconfirmed native cleanup; retained diagnostic root: ' + root)\n    throw error\n  }")
  // Correct the original assumption that usertemp equals controller scratch.
  body=body.replace('  const source = `', "  // usertemp maps /tmp to this worker's package TEMP, independently of controller scratch.\n  const source = `")
- body=body.replace("path=require('node:path');assert.equal(fs.readFileSync(path.join(${JSON.stringify(scratchPath)},'shell-witness-tmp')", "path=require('node:path'),os=require('node:os');const privateTemp=fs.realpathSync.native(os.tmpdir());assert.ok(path.isAbsolute(privateTemp));assert.equal(fs.readFileSync(path.join(privateTemp,'shell-witness-tmp')")
+ body=body.replace("path=require('node:path');assert.equal(fs.readFileSync(path.join(${JSON.stringify(scratchPath)},'shell-witness-tmp')", "path=require('node:path'),os=require('node:os');const privateTemp=os.tmpdir();assert.ok(path.isAbsolute(privateTemp));assert.equal(fs.readFileSync(path.join(privateTemp,'shell-witness-tmp')")
  const helper=fs.readFileSync(path.join(ROOT,'tests/helpers/windows-bash-native-smoke.cjs'),'utf8');assert.ok(helper.includes(body))
  const production=fs.readFileSync(path.join(ROOT,'tests/source/windows-bash-runtime.test.cjs'),'utf8');assert.ok(production.includes("require('../../agents/codex/workflow/windows-appcontainer-probe.js').probeWindowsAppContainer"));assert.ok(production.includes("require('../../scripts/harness-v2-tool-boundary.cjs').executeTool"));assert.ok(!production.includes('diagnostic-smoke'))
  for(const file of ['windows-appcontainer-command.js','windows-appcontainer-probe.js'])assert.ok(!fs.readFileSync(path.join(ROOT,'agents/codex/workflow',file),'utf8').includes('diagnostic-smoke'))
@@ -198,7 +198,7 @@ function executeGenerated({ tempPath, shellWitness = '/scratch/shell-witness', f
   const scratchWitness = '/scratch/witness'
   const calls = []
   const fakeFs = {
-    realpathSync: { native(value) { return value } },
+    realpathSync: { native() { throw Object.assign(new Error('realpath must not be used for AppContainer TEMP'), { code: 'EPERM' }) } },
     readFileSync(file) {
       calls.push(['read', file])
       if (file === path.join(tempPath, 'shell-witness-tmp')) {
@@ -246,6 +246,11 @@ test('generated Node body uses private TEMP while retaining scratch and denial a
 test('generated Node body rejects missing or wrong private TEMP witness', () => {
   assert.throws(() => executeGenerated({ tempPath: '/private/missing', tempWitness: false }), /missing witness/)
   assert.throws(() => executeGenerated({ tempPath: '/private/wrong', wrongTemp: true }), /missing witness/)
+})
+
+test('generated Node body uses TEMP directly and rejects a relative TEMP', () => {
+  assert.doesNotThrow(() => executeGenerated({ tempPath: '/private/package-temp' }))
+  assert.throws(() => executeGenerated({ tempPath: 'relative-temp' }), error => error?.name === 'AssertionError')
 })
 
 test('generated Node body rejects mutable or malformed fstab', () => {
