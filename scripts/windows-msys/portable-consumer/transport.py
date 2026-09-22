@@ -46,13 +46,13 @@ def integer(x):return isinstance(x,int) and not isinstance(x,bool) and 0<x<2**53
 
 def expectation(e):
     exact(e,['kind','repository','repositoryId','runId','runAttempt','headSha','jobId','artifactId','artifactName','archiveSha256'])
-    require(e['kind'] in ['msys','node-arm64'],'candidate kind')
+    require(e['kind'] in ['msys','node-arm64','node-x64'],'candidate kind')
     require(re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',e['repository']) is not None,'repository')
     require(all(x not in ['.','..'] for x in e['repository'].split('/')),'repository traversal')
     for k in ['repositoryId','runId','runAttempt','jobId','artifactId']:require(integer(e[k]),'numeric ID')
     require(re.fullmatch('[a-f0-9]{40}',e['headSha']) is not None,'head')
     require(re.fullmatch('[a-f0-9]{64}',e['archiveSha256']) is not None,'external archive SHA256')
-    name=f"windows-msys-candidate-{e['headSha']}-{e['runAttempt']}" if e['kind']=='msys' else 'windows-node-compiler-proof-arm64'
+    name=f"windows-msys-candidate-{e['headSha']}-{e['runAttempt']}" if e['kind']=='msys' else 'windows-node-compiler-proof-'+e['kind'].removeprefix('node-')
     require(e['artifactName']==name,'exact artifact name')
     return e
 
@@ -67,7 +67,7 @@ def metadata(e,run,jobs,artifact,current=None):
     require(run['status'] in ['in_progress','completed'],'run not started')
     require(jobs['total_count']==len(jobs['jobs']) and 0<len(jobs['jobs'])<=100,'complete bounded single-page job inventory')
     ids=[j['id'] for j in jobs['jobs']];require(len(set(ids))==len(ids),'duplicate jobs')
-    name='Platform and installer / windows-latest / Node 24.x' if e['kind']=='msys' else 'Platform and installer / windows-11-arm / Node 20.x'
+    name='Platform and installer / windows-latest / Node 24.x' if e['kind']=='msys' else 'Platform and installer / windows-11-arm / Node 20.x' if e['kind']=='node-arm64' else 'Platform and installer / windows-latest / Node 20.x'
     selected=[j for j in jobs['jobs'] if j['name']==name];require(len(selected)==1,'unique producer job')
     j=selected[0]
     require(j['id']==e['jobId'] and j['run_id']==e['runId'] and j['head_sha']==e['headSha'],'job identity')
@@ -238,10 +238,12 @@ def msys_context(files,e,archive_path,repo,controller=None):
     return {'schema':1,'expected':expected,'transport':{'artifactId':str(e['artifactId']),'archivePath':str(Path(archive_path).resolve()),'archiveSha256':e['archiveSha256'],'manifestSha256':result['manifestSha256']}}
 
 def node_component(files,pin):
+    exact(pin,['architecture','expectation','nodeSha256','nodeBytes','proofSha256','provenanceSha256','files','scope'])
+    require(pin['architecture'] in ['x64','arm64'] and pin['expectation']['kind']=='node-'+pin['architecture'],'externally pinned Node architecture')
     require(set(files)==set(pin['files']),'closed original Node archive')
     for file,key in [('stage/node.exe','nodeSha256'),('stage/built-runtime-proof.txt','proofSha256'),('stage/provenance.json','provenanceSha256')]:require(digest(files[file])==pin[key],'externally pinned Node component bytes')
     require(len(files['stage/node.exe'])==pin['nodeBytes'],'Node byte length')
-    p=json.loads(files['stage/provenance.json']);require(p['identity']['arch']=='arm64' and p['architecture']=='arm64' and p['nodeSha256']==pin['nodeSha256'],'ARM64 Node provenance')
+    p=json.loads(files['stage/provenance.json']);require(p['identity']['arch']==pin['architecture'] and p['architecture']==pin['architecture'] and p['nodeSha256']==pin['nodeSha256'],'pinned Node provenance')
     return {name:files[name] for name in ['stage/node.exe','stage/provenance.json','stage/built-runtime-proof.txt','stage/LICENSE']}
 
 def fetch(e,token,current=None):
@@ -299,15 +301,15 @@ def resolve_same_run(current,repository_id,token,deadline_seconds=1800,read_api=
 
 if __name__=='__main__':
     import argparse,sys
-    parser=argparse.ArgumentParser();parser.add_argument('kind',choices=['node-arm64','msys']);parser.add_argument('expectation');parser.add_argument('new_output');parser.add_argument('--current');parser.add_argument('--repo');parser.add_argument('--native-writer-context')
+    parser=argparse.ArgumentParser();parser.add_argument('kind',choices=['node-arm64','node-x64','msys']);parser.add_argument('expectation');parser.add_argument('new_output');parser.add_argument('--current');parser.add_argument('--repo');parser.add_argument('--native-writer-context')
     args=parser.parse_args()
     try:
         writer_context=json.loads(Path(args.native_writer_context).read_text()) if args.native_writer_context else None
-        pin=json.loads(Path(args.expectation).read_text());e=pin['expectation'] if args.kind=='node-arm64' else pin
+        pin=json.loads(Path(args.expectation).read_text());e=pin['expectation'] if args.kind in ['node-arm64','node-x64'] else pin
         current=json.loads(Path(args.current).read_text()) if args.current else None
         data,files,record=fetch(e,os.environ.get('GITHUB_TOKEN'),current)
         destination=Path(args.new_output).resolve()
-        if args.kind=='node-arm64':selected=node_component(files,pin)
+        if args.kind in ['node-arm64','node-x64']:selected=node_component(files,pin)
         else:
             require(args.repo is not None,'trusted repo required');context=msys_context(files,e,destination/'archive.zip',args.repo,{'path':writer_context['controllerPath'],'sha256':writer_context['controllerSha256']} if writer_context else None);selected=files|{'import-context.json':canonical(context)}
         selected=selected|{'archive.zip':data,'transport.json':canonical(record)}

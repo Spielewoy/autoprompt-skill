@@ -5,6 +5,10 @@ against a freshly captured imported MSYS candidate, under a separately verified
 adapted native Node process. It never fabricates an SDK checkout, compiler
 manifest, producer smoke output, runtime acceptance, or installed worker selection.
 
+The entry point separately binds `consumerHeadSha` to the clean current checkout
+and workflow SHA. This permits an explicitly pinned historical candidate while
+retaining its original producer authority and all current-source joins.
+
 `harness.cjs` holds an opaque process-local capability in a private WeakMap. The
 capture path requires actual Windows and the real precompiled physical helper;
 there is no injected fake capture implementation and no Linux native pass mode.

@@ -28,6 +28,9 @@ test('shared native body preserves every original assertion and production selec
  body=body.replace('boundary.executeTool(','executeTool(')
  body=body.replace("  t.after(() => fs.rmSync(root, { recursive: true, force: true }))", "  let preserve = false\n  t.after(() => { if (!preserve) fs.rmSync(root, { recursive: true, force: true }) })")
  body=body.replace("  const result = await executeTool(policy, 'bash', { command, timeoutMs: 30000 }, { controlRoot })", "  let result\n  try { result = await executeTool(policy, 'bash', { command, timeoutMs: 30000 }, { controlRoot }) } catch (error) {\n    preserve = error.cleanupConfirmed === false || error.code === 'APPCONTAINER_CLEANUP_UNCONFIRMED' || Boolean(error.recovery && !error.recoveryResolved)\n    if (preserve) t.diagnostic('Unconfirmed native cleanup; retained diagnostic root: ' + root)\n    throw error\n  }")
+ // Correct the original assumption that usertemp equals controller scratch.
+ body=body.replace('  const source = `', "  // usertemp maps /tmp to this worker's package TEMP, independently of controller scratch.\n  const source = `")
+ body=body.replace("path=require('node:path');assert.equal(fs.readFileSync(path.join(${JSON.stringify(scratchPath)},'shell-witness-tmp')", "path=require('node:path'),os=require('node:os');const privateTemp=fs.realpathSync.native(os.tmpdir());assert.ok(path.isAbsolute(privateTemp));assert.equal(fs.readFileSync(path.join(privateTemp,'shell-witness-tmp')")
  const helper=fs.readFileSync(path.join(ROOT,'tests/helpers/windows-bash-native-smoke.cjs'),'utf8');assert.ok(helper.includes(body))
  const production=fs.readFileSync(path.join(ROOT,'tests/source/windows-bash-runtime.test.cjs'),'utf8');assert.ok(production.includes("require('../../agents/codex/workflow/windows-appcontainer-probe.js').probeWindowsAppContainer"));assert.ok(production.includes("require('../../scripts/harness-v2-tool-boundary.cjs').executeTool"));assert.ok(!production.includes('diagnostic-smoke'))
  for(const file of ['windows-appcontainer-command.js','windows-appcontainer-probe.js'])assert.ok(!fs.readFileSync(path.join(ROOT,'agents/codex/workflow',file),'utf8').includes('diagnostic-smoke'))
@@ -161,3 +164,93 @@ test('diagnostic command preserves the launch failure and journal when recovery 
  await assert.rejects(x.run(),error=>error===original&&error.cleanupConfirmed===false&&error.recoveryFailureCode==='RESTORE_FAILED'&&error.recovery.journalPath===path.join(x.controlRoot,'journal'))
  assert.ok(fs.existsSync(path.join(x.runtimeRoot,'usr/bin/bash.exe')));assert.ok(!x.events.includes('helper-cleanup'))
 })
+
+// Generated worker assertions exercised with explicit synthetic filesystem seams.
+{
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path').posix
+const vm = require('node:vm')
+const realPath = path
+const helperPath = require('node:path').join(ROOT, 'tests/helpers/windows-bash-native-smoke.cjs')
+
+function generatedSource(values) {
+  const helper = fs.readFileSync(helperPath, 'utf8')
+  const start = helper.indexOf('const source = `') + 'const source = `'.length
+  const end = helper.indexOf('`\n  const shellQuote', start)
+  assert.ok(start > 15 && end > start, 'generated source template must remain discoverable')
+  let source = helper.slice(start, end)
+  const replacements = {
+    '${JSON.stringify(shellWitness)}': JSON.stringify(values.shellWitness),
+    "${JSON.stringify(path.join(scratchPath, 'witness'))}": JSON.stringify(values.scratchWitness),
+    '${JSON.stringify(candidate)}': JSON.stringify(values.candidate),
+    '${JSON.stringify(secret)}': JSON.stringify(values.secret),
+  }
+  for (const [from, to] of Object.entries(replacements)) source = source.replaceAll(from, to)
+  source = source.replaceAll('\\\\n', '\\n')
+  assert.ok(!source.includes('${JSON.stringify('), 'all generated path seams must be resolved')
+  return source
+}
+
+function executeGenerated({ tempPath, shellWitness = '/scratch/shell-witness', fstab = 'none /tmp usertemp binary,posix=0,noacl 0 0\n', appendDenied = true, tempWitness = true, wrongTemp = false }) {
+  const fstabPath = path.resolve(path.dirname('/runtime/usr/bin/node.exe'), '../../etc/fstab')
+  const scratchWitness = '/scratch/witness'
+  const calls = []
+  const fakeFs = {
+    realpathSync: { native(value) { return value } },
+    readFileSync(file) {
+      calls.push(['read', file])
+      if (file === path.join(tempPath, 'shell-witness-tmp')) {
+        if (!tempWitness || wrongTemp) throw Object.assign(new Error('missing witness'), { code: 'ENOENT' })
+        return 'private-temp\n'
+      }
+      if (file === fstabPath) return fstab
+      if (file === shellWitness) return 'shell-write\n'
+      if (file === '/controller/secret') throw Object.assign(new Error('denied'), { code: 'EACCES' })
+      throw new Error(`unexpected read ${file}`)
+    },
+    appendFileSync(file) {
+      calls.push(['append', file])
+      if (appendDenied) throw Object.assign(new Error('denied'), { code: 'EACCES' })
+    },
+    writeFileSync(file, value) {
+      calls.push(['write', file, value])
+      if (file === '/target/candidate') throw Object.assign(new Error('denied'), { code: 'EPERM' })
+      assert.equal(file, scratchWitness)
+      assert.equal(value, 'native-node')
+    },
+  }
+  const fakeRequire = name => ({
+    'node:fs': fakeFs,
+    'node:assert/strict': assert,
+    'node:path': realPath,
+    'node:os': { tmpdir: () => tempPath },
+  }[name] || (() => { throw new Error(`unexpected require ${name}`) })())
+  const output = []
+  vm.runInNewContext(generatedSource({ shellWitness, scratchWitness, candidate: '/target/candidate', secret: '/controller/secret' }), {
+    require: fakeRequire,
+    process: { execPath: '/runtime/usr/bin/node.exe', stdout: { write(value) { output.push(value) } } },
+  }, { filename: 'generated-native-smoke.cjs' })
+  return { calls, output: output.join('') }
+}
+
+test('generated Node body uses private TEMP while retaining scratch and denial assertions', () => {
+  const result = executeGenerated({ tempPath: '/private/package-temp' })
+  assert.equal(result.output, 'node-ok')
+  assert.deepEqual(result.calls.filter(([kind]) => kind === 'write'), [['write', '/scratch/witness', 'native-node'], ['write', '/target/candidate', 'forbidden']])
+  assert.ok(result.calls.some(([kind, file]) => kind === 'read' && file === '/private/package-temp/shell-witness-tmp'))
+  assert.ok(!result.calls.some(([kind, file]) => kind === 'read' && file === '/scratch/shell-witness-tmp'))
+})
+
+test('generated Node body rejects missing or wrong private TEMP witness', () => {
+  assert.throws(() => executeGenerated({ tempPath: '/private/missing', tempWitness: false }), /missing witness/)
+  assert.throws(() => executeGenerated({ tempPath: '/private/wrong', wrongTemp: true }), /missing witness/)
+})
+
+test('generated Node body rejects mutable or malformed fstab', () => {
+  assert.throws(() => executeGenerated({ tempPath: '/private/package-temp', appendDenied: false }), /Missing expected exception/)
+  assert.throws(() => executeGenerated({ tempPath: '/private/package-temp', fstab: 'none /tmp scratch 0 0\n' }), /Expected values to be strictly equal/)
+})
+
+}

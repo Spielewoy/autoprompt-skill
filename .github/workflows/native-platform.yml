@@ -26,6 +26,11 @@ on:
         required: false
         default: false
         type: boolean
+      msys_reuse_ci49:
+        description: 'Retest the exact CI49 MSYS candidate on x64 and ARM64 without rebuilding'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -41,7 +46,7 @@ jobs:
     timeout-minutes: ${{ matrix.runner.os == 'windows-latest' && matrix.node == '24.x' && 120 || 90 }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(inputs.msys_runtime == true && '{"include":[{"runner":{"os":"windows-latest","arch":"x64"},"node":"24.x"},{"runner":{"os":"windows-11-arm","arch":"arm64"},"node":"20.x"},{"runner":{"os":"windows-11-arm","arch":"arm64"},"node":"24.x"}]}' || '{"runner":[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"},{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"},{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}') }}
+      matrix: ${{ fromJSON((inputs.msys_runtime == true || inputs.msys_reuse_ci49 == true) && '{"include":[{"runner":{"os":"windows-latest","arch":"x64"},"node":"24.x"},{"runner":{"os":"windows-11-arm","arch":"arm64"},"node":"20.x"},{"runner":{"os":"windows-11-arm","arch":"arm64"},"node":"24.x"}]}' || '{"runner":[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"},{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"},{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}') }}
     env:
       AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
     steps:
@@ -60,7 +65,7 @@ jobs:
       - name: Install declared Python installer and validation dependencies
         run: 'python -m pip install --only-binary=:all: PyYAML==6.0.3 jsonschema==4.26.0 referencing==0.37.0'
       - name: Install and enable Linux sandbox prerequisites
-        if: inputs.msys_runtime != true && (runner.os == 'Linux')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Linux')
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap
@@ -68,7 +73,7 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - name: Install macOS installer shells
-        if: inputs.msys_runtime != true && (runner.os == 'macOS')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'macOS')
         shell: bash
         run: |
           brew install bash
@@ -76,22 +81,22 @@ jobs:
             brew install powershell
           fi
       - name: Require PowerShell
-        if: inputs.msys_runtime != true
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)
         shell: pwsh
         run: $PSVersionTable.PSVersion.ToString()
       - run: npm ci --ignore-scripts
       - name: Enable genuine macOS primitive tests and assert runtime limitation
-        if: inputs.msys_runtime != true && (runner.os == 'macOS')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'macOS')
         run: node tests/helpers/native-platform-ci.cjs macos-primitives
       - name: Enable actual Windows short-name coverage
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         shell: pwsh
         run: |
           fsutil 8dot3name set 0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify native Windows runtime bundle physical capture
         id: runtime-physical-proof
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         continue-on-error: true
         shell: pwsh
         run: |
@@ -100,7 +105,7 @@ jobs:
           node scripts/windows-runtime/physical-proof/verify-output.cjs native-windows-runtime-physical.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve native runtime bundle capture observations
-        if: inputs.msys_runtime != true && (always() && runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-runtime-physical-${{ matrix.runner.arch }}-node-${{ matrix.node }}
@@ -139,7 +144,7 @@ jobs:
           if-no-files-found: error
       - name: Record native Git metadata ACL controls before the full suite
         id: git-acl-proof
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         # The identical denial/restoration test remains mandatory in the full suite.
         continue-on-error: true
         timeout-minutes: 12
@@ -149,7 +154,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve native Git metadata ACL observations
         id: git-acl-evidence
-        if: inputs.msys_runtime != true && (always() && runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -158,7 +163,7 @@ jobs:
           if-no-files-found: error
       - name: Exercise native resource admission and recovery on large trees
         id: resource-scale-proof
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         continue-on-error: true
         timeout-minutes: 32
         shell: pwsh
@@ -167,7 +172,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve native resource scale observations
         id: resource-scale-evidence
-        if: inputs.msys_runtime != true && (always() && runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -176,7 +181,7 @@ jobs:
           if-no-files-found: error
       - name: Verify native resource identity recovery and lookup refusals
         id: resource-identity-proof
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         continue-on-error: true
         timeout-minutes: 17
         shell: pwsh
@@ -185,7 +190,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve native resource identity observations
         id: resource-identity-evidence
-        if: inputs.msys_runtime != true && (always() && runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -194,7 +199,7 @@ jobs:
           if-no-files-found: error
       - name: Exercise native filesystem operations on large trees
         id: filesystem-scale-proof
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         continue-on-error: true
         timeout-minutes: 27
         shell: pwsh
@@ -203,7 +208,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve native filesystem scale observations
         id: filesystem-scale-evidence
-        if: inputs.msys_runtime != true && (always() && runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -211,7 +216,7 @@ jobs:
           path: native-windows-filesystem-scale.log
           if-no-files-found: error
       - name: Record native host NUL query sizes before sandbox launches
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         # Independent of the AppContainer launcher; mandatory again in the full suite.
         continue-on-error: true
         shell: pwsh
@@ -219,14 +224,14 @@ jobs:
           node --test --test-reporter=tap --test-name-pattern="^native Windows host NUL basic query records exact and oversized buffer results$" tests/source/windows-appcontainer-nul-capability.test.cjs 2>&1 | Tee-Object -FilePath native-windows-nul-basic.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve native host NUL query observations
-        if: inputs.msys_runtime != true && (always() && runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-nul-basic-${{ matrix.runner.arch }}-node-${{ matrix.node }}
           path: native-windows-nul-basic.log
           if-no-files-found: error
       - name: Record native Windows pipe compatibility before the full suite
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         # This early copy supplies prompt diagnostics. The identical test is
         # mandatory in the full suite below and still fails the job there.
         continue-on-error: true
@@ -235,7 +240,7 @@ jobs:
           node --test tests/source/windows-msys-pipe.test.cjs 2>&1 | Tee-Object -FilePath native-windows-pipe.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Record native Windows Node pipes and process-exit verification
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         # The same diagnostic remains mandatory in the full platform suite.
         # Unsupported observations are explicit and do not certify functionality.
         continue-on-error: true
@@ -244,7 +249,7 @@ jobs:
           node --test tests/source/windows-appcontainer-node-pipes.test.cjs tests/source/windows-appcontainer-member-image.test.cjs 2>&1 | Tee-Object -FilePath native-windows-node-pipes.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Record native Windows NUL access and private handle isolation
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         # Actual access observations are mandatory in the full suite as well.
         continue-on-error: true
         shell: pwsh
@@ -252,7 +257,7 @@ jobs:
           node --test --test-reporter=tap tests/source/windows-appcontainer-nul.test.cjs tests/source/windows-appcontainer-nul-capability.test.cjs tests/source/windows-null-capability-contract.test.cjs 2>&1 | Tee-Object -FilePath native-windows-nul.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Record isolated Windows capture input diagnostics
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         # This exact native case remains mandatory in the full suite below.
         continue-on-error: true
         shell: pwsh
@@ -260,7 +265,7 @@ jobs:
           node --test --test-name-pattern="Windows terminal publication" tests/source/windows-filesystem.test.cjs 2>&1 | Tee-Object -FilePath native-windows-capture.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve early native Windows observations
-        if: inputs.msys_runtime != true && (always() && runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-early-${{ matrix.runner.os }}-node-${{ matrix.node }}
@@ -268,14 +273,14 @@ jobs:
           if-no-files-found: error
       - name: Compare isolated Windows PowerShell startup environments
         id: powershell-startup
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         continue-on-error: true
         shell: pwsh
         run: |
           node --test tests/source/windows-powershell-startup.test.cjs 2>&1 | Tee-Object -FilePath native-windows-powershell-startup.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve Windows PowerShell startup comparisons
-        if: inputs.msys_runtime != true && (always() && runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-startup-${{ matrix.runner.os }}-node-${{ matrix.node }}
@@ -286,7 +291,7 @@ jobs:
       # Keep this within the existing 20-job matrix.
       - name: Detect changes to the MSYS compiler proof
         id: msys-proof-input
-        if: github.ref == 'refs/heads/codex/issue-27-native-platform-support' && matrix.runner.os == 'windows-latest' && matrix.node == '24.x'
+        if: inputs.msys_reuse_ci49 != true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' && matrix.runner.os == 'windows-latest' && matrix.node == '24.x'
         shell: pwsh
         run: |
           $changed = @(git diff --name-only HEAD^ HEAD -- .github/workflows/native-platform.yml scripts/windows-msys agents/codex/workflow/windows-appcontainer* agents/codex/workflow/windows-filesystem.ps1 tests/source/windows-bash-runtime.test.cjs tests/fixtures/windows-msys/bash-ipc.sh)
@@ -456,7 +461,7 @@ jobs:
           if-no-files-found: warn
       - name: Trace failed MSYS fork initialization in a separate diagnostic build
         id: msys-fork-trace
-        if: inputs.msys_runtime != true && (steps.msys-proof.outcome == 'success' && steps.msys-process-security.outcome == 'failure')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (steps.msys-proof.outcome == 'success' && steps.msys-process-security.outcome == 'failure')
         continue-on-error: true
         timeout-minutes: 30
         shell: pwsh
@@ -509,7 +514,7 @@ jobs:
           & $nodeExe scripts/windows-msys/fork-init-trace/run.cjs $PWD.Path $contextPath $contextSha $output $env:SystemRoot
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve separate fork initialization trace evidence
-        if: inputs.msys_runtime != true && (always() && steps.msys-fork-trace.outcome != 'skipped' && steps.msys-proof-input.outputs.run == 'true')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && steps.msys-fork-trace.outcome != 'skipped' && steps.msys-proof-input.outputs.run == 'true')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-msys-fork-initialization-trace
@@ -529,7 +534,7 @@ jobs:
       # and do not repeat a full compile. Manual dispatch rebuilds both workers.
       - name: Detect changes to the Node compiler proof
         id: node-proof-input
-        if: inputs.msys_runtime != true && (github.ref == 'refs/heads/codex/issue-27-native-platform-support' && runner.os == 'Windows' && matrix.node == '20.x')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (github.ref == 'refs/heads/codex/issue-27-native-platform-support' && runner.os == 'Windows' && matrix.node == '20.x')
         shell: pwsh
         run: |
           $changed = @(git diff --name-only HEAD^ HEAD -- scripts/windows-node tests/fixtures/windows-appcontainer/node-pipe-proof.cs tests/fixtures/windows-appcontainer/node-pipe-worker.cjs tests/source/windows-appcontainer-node-pipes.test.cjs tests/helpers/windows-node-pipe-worker.cjs)
@@ -537,7 +542,7 @@ jobs:
           "run=$($changed.Count -gt 0 -or '${{ github.event_name }}' -eq 'workflow_dispatch')".ToLowerInvariant() >> $env:GITHUB_OUTPUT
       - name: Compile the isolated Node AppContainer pipe adapter
         id: node-proof
-        if: inputs.msys_runtime != true && (steps.node-proof-input.outputs.run == 'true')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (steps.node-proof-input.outputs.run == 'true')
         continue-on-error: true
         shell: pwsh
         run: |
@@ -548,7 +553,7 @@ jobs:
           ./scripts/windows-node/build.ps1 -Architecture '${{ matrix.runner.arch }}' -WorkRoot (Join-Path $env:RUNNER_TEMP 'node-compiler-proof')
       - name: Require exact subprocess roundtrips with the built Node worker
         id: node-smoke
-        if: inputs.msys_runtime != true && (steps.node-proof.outcome == 'success')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (steps.node-proof.outcome == 'success')
         continue-on-error: true
         shell: pwsh
         run: |
@@ -562,7 +567,7 @@ jobs:
           node scripts/windows-node/verify-native-proof.cjs (Join-Path $stage 'built-runtime-proof.txt') (Join-Path $stage 'provenance.json') (Join-Path $stage 'node.exe') $proof.nodeSha256
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve the Node compiler output and native observations
-        if: inputs.msys_runtime != true && (always() && steps.node-proof-input.outputs.run == 'true')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && steps.node-proof-input.outputs.run == 'true')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-node-compiler-proof-${{ matrix.runner.arch }}
@@ -574,7 +579,7 @@ jobs:
             ${{ runner.temp }}/node-compiler-proof/inputs/libuv-private-nul-capability.patch
           if-no-files-found: warn
       - name: Check exact MSYS child creation contracts
-        if: inputs.msys_runtime != true && (runner.os == 'Linux' && matrix.node == '24.x')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Linux' && matrix.node == '24.x')
         run: |
           python3 scripts/windows-msys/child-security-proof/run.py
           python3 scripts/windows-msys/anonymous-proof/run.py
@@ -589,15 +594,15 @@ jobs:
           node --test scripts/windows-msys/portable-runtime/portable.test.cjs scripts/windows-msys/portable-runtime/cli.test.cjs scripts/windows-msys/portable-runtime/producer-context.test.cjs
           node --test scripts/windows-msys/portable-probe/*.test.cjs scripts/windows-msys/portable-consumer/native-writer.test.cjs scripts/windows-msys/diagnostic-smoke/diagnostic-smoke.test.cjs
           python3 -m unittest discover -s scripts/windows-msys/portable-consumer -p 'test_*.py' -v
-      - name: Detect changes for native ARM64 candidate reuse
+      - name: Detect changes for native candidate reuse
         id: msys-portable-input
-        if: github.ref == 'refs/heads/codex/issue-27-native-platform-support' && runner.os == 'Windows' && matrix.runner.arch == 'arm64'
+        if: github.ref == 'refs/heads/codex/issue-27-native-platform-support' && runner.os == 'Windows' && (matrix.runner.arch == 'arm64' || inputs.msys_reuse_ci49 == true)
         shell: pwsh
         run: |
           $changed = @(git diff --name-only HEAD^ HEAD -- .github/workflows/native-platform.yml scripts/windows-msys agents/codex/workflow/windows-appcontainer* agents/codex/workflow/windows-filesystem.ps1 tests/source/windows-bash-runtime.test.cjs tests/fixtures/windows-msys/bash-ipc.sh)
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "run=$($changed.Count -gt 0 -or '${{ github.event_name }}' -eq 'workflow_dispatch')".ToLowerInvariant() >> $env:GITHUB_OUTPUT
-      - name: Verify current-run MSYS candidate with native ARM64 Node
+      - name: Verify exact MSYS candidate with native Node
         id: msys-portable
         if: steps.msys-portable-input.outputs.run == 'true' && steps.runtime-precompiled-proof.outcome == 'success'
         continue-on-error: true
@@ -620,31 +625,33 @@ jobs:
           # END exact running Node identity
           $consumerLog = Join-Path $env:RUNNER_TEMP 'msys-portable-consumer-console.log'
           New-Item -ItemType File -Path $consumerLog -ErrorAction Stop | Out-Null
-          python scripts/windows-msys/portable-consumer/run.py --repo $PWD.Path --output (Join-Path $env:RUNNER_TEMP 'msys-portable-consumer') --controller $controller --controller-sha256 $digest --helper-directory (Join-Path $env:RUNNER_TEMP 'precompiled-capture') --artifact-timeout 2400 2>&1 | Tee-Object -FilePath $consumerLog
+          $reuse = @()
+          if ('${{ inputs.msys_reuse_ci49 }}' -eq 'true') { $reuse = @('--reuse-ci49') }
+          python scripts/windows-msys/portable-consumer/run.py --repo $PWD.Path --output (Join-Path $env:RUNNER_TEMP 'msys-portable-consumer') --controller $controller --controller-sha256 $digest --helper-directory (Join-Path $env:RUNNER_TEMP 'precompiled-capture') --artifact-timeout 2400 @reuse 2>&1 | Tee-Object -FilePath $consumerLog
           $consumerStatus = $LASTEXITCODE
           if ($consumerStatus -ne 0) { exit $consumerStatus }
-      - name: Preserve fresh ARM64 candidate execution evidence
+      - name: Preserve fresh native candidate execution evidence
         id: msys-portable-evidence
         if: always() && steps.msys-portable-input.outputs.run == 'true'
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: windows-msys-portable-arm64-node-${{ matrix.node }}
+          name: windows-msys-portable-${{ matrix.runner.arch }}-node-${{ matrix.node }}
           path: |
             ${{ runner.temp }}/msys-portable-consumer
             ${{ runner.temp }}/msys-portable-consumer-console.log
           if-no-files-found: error
       - name: Run platform tests and reject skips of this host's native cases
-        if: inputs.msys_runtime != true
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)
         run: node tests/helpers/native-platform-ci.cjs platform
       - name: Verify doctor readiness and isolated Bash and PowerShell diagnostics
-        if: inputs.msys_runtime != true
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)
         run: node tests/helpers/native-platform-ci.cjs doctor
       - name: Exercise the actual Windows Git Bash Kilo installer lifecycle
-        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
         run: node tests/helpers/native-platform-ci.cjs kilo-shell
       - name: Preserve platform and diagnostic output
-        if: inputs.msys_runtime != true && (always())
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always())
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: platform-${{ matrix.runner.os }}-node-${{ matrix.node }}
@@ -654,14 +661,14 @@ jobs:
             native-platform-kilo-shell.log
           if-no-files-found: warn
       - name: Packed installer lifecycle
-        if: inputs.msys_runtime != true
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
       - name: Require native startup and selected compiler proofs to succeed
         if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.runtime-precompiled-proof.outcome == 'failure' || steps.runtime-precompiled-evidence.outcome == 'failure' || steps.git-acl-proof.outcome == 'failure' || steps.git-acl-evidence.outcome == 'failure' || steps.resource-scale-proof.outcome == 'failure' || steps.resource-scale-evidence.outcome == 'failure' || steps.resource-identity-proof.outcome == 'failure' || steps.resource-identity-evidence.outcome == 'failure' || steps.filesystem-scale-proof.outcome == 'failure' || steps.filesystem-scale-evidence.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-wincap.outcome == 'failure' || steps.msys-candidate.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure' || steps.msys-portable.outcome == 'failure' || steps.msys-portable-evidence.outcome == 'failure')
         run: node -e "process.exit(1)"
 
   claude-native:
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_runtime != true) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.msys_mapping != true && inputs.msys_pipe_trace != true && (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)) }}
     name: Actual Claude 2.1.270 / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
     timeout-minutes: 45

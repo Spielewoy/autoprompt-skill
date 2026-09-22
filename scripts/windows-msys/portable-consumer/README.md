@@ -1,4 +1,4 @@
-# Native ARM64 diagnostic consumer
+# Native Windows diagnostic consumer
 
 This code authenticates candidate transport and runs fresh diagnostics. It does
 not install a runtime, select a production worker, or issue platform acceptance.
@@ -7,7 +7,7 @@ job, which can still fail.
 
 ## Current workflow entry point
 
-Run only in the native ARM64 `platform-primitives` job on
+Run only in a native x64 or ARM64 `platform-primitives` job on
 `codex/issue-27-native-platform-support`, after that lane's local precompiled
 capture helper has passed all seven native cases:
 
@@ -22,10 +22,18 @@ python scripts/windows-msys/portable-consumer/run.py `
 ```
 
 Supply the workflow token through `GITHUB_TOKEN` with `actions: read`. The script
-checks the current GitHub repository, head, run, attempt, branch and ARM runner
+checks the current GitHub repository, head, run, attempt, branch and native runner
 role, plus a clean reviewed checkout. Its default artifact deadline is 2400
 seconds; `--artifact-timeout` must be between 1 and 3600. It creates only fresh
 output roots and retains them when failure or cleanup is uncertain.
+
+The default mode consumes a candidate from the same workflow run. The explicit
+`--reuse-ci49` mode instead authenticates only the producer and artifact in
+`msys-candidate-ci49.json`, retaining its original source authority. It records
+the current consumer head separately and requires that head to match both the
+clean checkout and workflow SHA. Current build recipes and source bindings must
+still match the candidate. Workflow input `msys_reuse_ci49` runs three lanes
+(x64 Node 24 and ARM64 Node 20/24) without compiling MSYS again.
 
 The sequence is:
 
@@ -34,7 +42,7 @@ The sequence is:
    builder observation, not candidate-provided authority.
 2. Poll for the exact current-run MSYS artifact name. Authenticate its immutable
    numeric ID, GitHub archive SHA, repository/head/attempt and producer identity.
-3. Download the separately pinned historical CI20 ARM64 Node component and verify
+3. Download the separately pinned historical CI20 Node component for the native architecture and verify
    its executable, source provenance and retained native proof.
 4. Run all four Node stdio/IPC modes again on this consumer host, requiring the
    strict five-test proof with no skips and positive drain/cleanup. This fresh

@@ -113,12 +113,20 @@ class Contracts(unittest.TestCase):
    with self.assertRaises(ValueError):t.parse_canonical(b)
  def test_external_node_component_hashes_with_nonexecutable_fixtures(self):
   files={'stage/node.exe':b'synthetic-not-executable','stage/built-runtime-proof.txt':b'synthetic-not-native-proof','stage/provenance.json':b'{}','stage/LICENSE':b'fixture'}
-  pin={'files':list(files),'nodeSha256':t.digest(files['stage/node.exe']),'nodeBytes':len(files['stage/node.exe']),'proofSha256':t.digest(files['stage/built-runtime-proof.txt'])}
+  pin={'architecture':'arm64','expectation':{'kind':'node-arm64'},'files':list(files),'nodeSha256':t.digest(files['stage/node.exe']),'nodeBytes':len(files['stage/node.exe']),'proofSha256':t.digest(files['stage/built-runtime-proof.txt']),'scope':'synthetic'}
   files['stage/provenance.json']=t.canonical({'identity':{'arch':'arm64'},'architecture':'arm64','nodeSha256':pin['nodeSha256']})
   pin['provenanceSha256']=t.digest(files['stage/provenance.json'])
   self.assertEqual(len(t.node_component(files,pin)),4)
   files['stage/node.exe']+=b'changed'
   with self.assertRaises(ValueError):t.node_component(files,pin)
+
+ def test_ci20_node_pins_are_architecture_specific(self):
+  for architecture in ['arm64','x64']:
+   pin=json.loads((ROOT/f'node-{architecture}-ci20.json').read_text());self.assertEqual(pin['architecture'],architecture)
+   self.assertEqual(pin['expectation']['kind'],'node-'+architecture);t.expectation(pin['expectation'])
+   self.assertEqual(pin['expectation']['runId'],35231596403);self.assertEqual(pin['expectation']['headSha'],'f8e68b143d9c15f97a79a85165de08c6982f0da2')
+  arm=json.loads((ROOT/'node-arm64-ci20.json').read_text());x64=json.loads((ROOT/'node-x64-ci20.json').read_text())
+  self.assertNotEqual(arm['expectation']['artifactId'],x64['expectation']['artifactId']);self.assertNotEqual(arm['nodeSha256'],x64['nodeSha256'])
 
  def test_closed_native_environment_strips_node_injection(self):
   v=t.native_environment({'SystemRoot':'C:\\Windows','NODE_OPTIONS':'hostile','Node_Path':'hostile','PATH':'untrusted','GITHUB_TOKEN':'secret'},'D:\\owned')

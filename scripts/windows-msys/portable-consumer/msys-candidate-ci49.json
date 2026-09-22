@@ -1,0 +1,16 @@
+{
+  "expectation": {
+    "kind": "msys",
+    "repository": "Spielewoy/autoprompt-skill",
+    "repositoryId": 1337733621,
+    "runId": 35673425247,
+    "runAttempt": 1,
+    "headSha": "7275b8e9a4e762ca854e3fa2119f621225e1cb82",
+    "jobId": 106574757921,
+    "artifactId": 10672321467,
+    "artifactName": "windows-msys-candidate-7275b8e9a4e762ca854e3fa2119f621225e1cb82-1",
+    "archiveSha256": "80181618ea3f154dd5a22e0e09dd67839e63d94e34cddc13b63ab3598e6feb76"
+  },
+  "manifestSha256": "57c9c3a57ff4dee897f221e5eeaeaed2b4c035cfaa8343e3723232e87ab3b293",
+  "scope": "CI49 immutable candidate transport for explicit replay only; native acceptance is never inferred"
+}

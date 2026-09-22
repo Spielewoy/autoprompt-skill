@@ -1,21 +1,21 @@
 {
-  "architecture": "arm64",
+  "architecture": "x64",
   "expectation": {
-    "kind": "node-arm64",
+    "kind": "node-x64",
     "repository": "Spielewoy/autoprompt-skill",
     "repositoryId": 1337733621,
     "runId": 35231596403,
     "runAttempt": 1,
     "headSha": "f8e68b143d9c15f97a79a85165de08c6982f0da2",
-    "jobId": 105236809824,
-    "artifactId": 10504040551,
-    "artifactName": "windows-node-compiler-proof-arm64",
-    "archiveSha256": "71d51c5b83530ed310cf350a5691853124cc9958712b89bf8a4a37311f240a95"
+    "jobId": 105236810514,
+    "artifactId": 10503710570,
+    "artifactName": "windows-node-compiler-proof-x64",
+    "archiveSha256": "8b356029492bbc238282b5778b801328b0202a8da0117cd1e53ec5bfc0b16f6b"
   },
-  "nodeSha256": "0fcf7a0ef617acf97017f10a9ffcc611d6725294f8a363bd95f9f4a5c9a5694c",
-  "nodeBytes": 96414208,
-  "proofSha256": "d902d45b6da1909794029b5521c5756f63a4585116de105b63740f87649528b2",
-  "provenanceSha256": "2543556cf5f7d3cd5feebc2d9836f55519873ebfa241ddfe480f8b380d9a9730",
+  "nodeSha256": "723c1ef8a49dcbfa997aa2eaf05852fdb3752d07d0a21ca74946ef2911d082f0",
+  "nodeBytes": 104267776,
+  "proofSha256": "244e1aa40ebad635dccbdfbff9ad5f4e2d5f1f7c7cb4c6c9ee9b678e96024553",
+  "provenanceSha256": "12afcd558b2f36f6842016de015f0e982b11058ffb9a690daedc2d03fb65bf49",
   "files": [
     "inputs/build-lock.json",
     "inputs/libuv-appcontainer-pipes.patch",
@@ -30,8 +30,12 @@
     "logs/built-node-identity.stdout.txt",
     "logs/clang-cl-version.stderr.txt",
     "logs/clang-cl-version.stdout.txt",
+    "logs/extract-nasm.stderr.txt",
+    "logs/extract-nasm.stdout.txt",
     "logs/extract-node.stderr.txt",
     "logs/extract-node.stdout.txt",
+    "logs/nasm-version.stderr.txt",
+    "logs/nasm-version.stdout.txt",
     "logs/node-build.stderr.txt",
     "logs/node-build.stdout.txt",
     "logs/nul-patch-apply.stderr.txt",
@@ -54,5 +58,5 @@
     "stage/node.exe",
     "stage/provenance.json"
   ],
-  "scope": "CI20 component proof only; fresh mixed tuple execution remains required"
+  "scope": "CI20 x64 component proof only; fresh mixed tuple execution remains required"
 }
