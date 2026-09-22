@@ -3,7 +3,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const cp = require('node:child_process')
-const { createWindowsCompilerDirectory, ensureWindowsPrivateAcl } = require('./safe-run-root.js')
+const { createWindowsCompilerDirectory, ensureWindowsPrivateAcl, inspectPathNoFollow } = require('./safe-run-root.js')
 const { createWindowsFilesystemCapture } = require('./windows-filesystem.js')
 const { createWindowsAppContainerLauncher, WindowsAppContainerError, parseMsysSharedId } = require('./windows-appcontainer.js')
 const { failureDiagnostic } = require('./windows-appcontainer-probe.js')
@@ -12,6 +12,77 @@ const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 function within(root, value) {
   const relative = path.relative(path.resolve(root).toLowerCase(), path.resolve(value).toLowerCase())
   return relative === '' || relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+}
+function sameDirectoryIdentity(left, right) {
+  return Boolean(left && right && String(left.dev) === String(right.dev) && String(left.ino) === String(right.ino))
+}
+function verifyCommandCwdBridge(bridge) {
+  if (!bridge) return
+  const staging = inspectPathNoFollow(bridge.stagingRoot)
+  const requested = inspectPathNoFollow(bridge.requestedCwd)
+  let alias, resolved
+  try { alias = fs.lstatSync(bridge.alias, { bigint: true }); resolved = fs.realpathSync.native(bridge.alias) } catch {
+    throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Private command cwd bridge is unavailable')
+  }
+  if (!staging.exists || !sameDirectoryIdentity(staging.identity, bridge.stagingIdentity) ||
+      !requested.exists || !sameDirectoryIdentity(requested.identity, bridge.requestedIdentity) ||
+      !alias.isSymbolicLink() || !sameDirectoryIdentity(alias, bridge.aliasIdentity) ||
+      resolved.toLowerCase() !== bridge.requestedRealpath.toLowerCase() ||
+      bridge.alias.length >= 260) {
+    throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Private command cwd bridge changed identity')
+  }
+}
+function createCommandCwdBridge(stagingRoot, requestedCwd) {
+  if (requestedCwd.length < 260) return null
+  // CreateProcessW still limits lpCurrentDirectory to MAX_PATH. Change only
+  // that launch spelling; the policy, command receipt and backing directory
+  // remain bound to the canonical requested cwd for the lease's lifetime.
+  const staging = inspectPathNoFollow(stagingRoot)
+  const requested = inspectPathNoFollow(requestedCwd)
+  if (!staging.exists || !staging.identity || !requested.exists || !requested.identity) {
+    throw new WindowsAppContainerError('WINDOWS_RUNTIME_INVALID', 'Private command cwd bridge requires physical directories')
+  }
+  const alias = path.join(stagingRoot, 'command-cwd')
+  let created = false
+  try {
+    fs.symlinkSync(requested.realpath, alias, 'junction')
+    created = true
+    const aliasItem = fs.lstatSync(alias, { bigint: true })
+    const bridge = Object.freeze({ alias, stagingRoot, requestedCwd,
+      stagingIdentity: staging.identity, requestedIdentity: requested.identity, requestedRealpath: requested.realpath,
+      aliasIdentity: Object.freeze({ dev: String(aliasItem.dev), ino: String(aliasItem.ino) }) })
+    verifyCommandCwdBridge(bridge)
+    return bridge
+  } catch (error) {
+    let retain = created
+    if (!created) {
+      try { fs.lstatSync(alias); retain = true } catch (cleanupError) { if (cleanupError.code !== 'ENOENT') retain = true }
+      try {
+        const stagingAfter = inspectPathNoFollow(stagingRoot)
+        const requestedAfter = inspectPathNoFollow(requestedCwd)
+        if (!stagingAfter.exists || !sameDirectoryIdentity(stagingAfter.identity, staging.identity) ||
+            !requestedAfter.exists || !sameDirectoryIdentity(requestedAfter.identity, requested.identity)) retain = true
+      } catch { retain = true }
+    }
+    if (retain) {
+      error.cleanupConfirmed = false
+      error.retainedStagingRoot = stagingRoot
+    }
+    throw error
+  }
+}
+function removeCommandCwdBridge(bridge) {
+  if (!bridge) return
+  verifyCommandCwdBridge(bridge)
+  fs.unlinkSync(bridge.alias)
+  try { fs.lstatSync(bridge.alias); throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Private command cwd bridge survived removal') }
+  catch (error) { if (error.code !== 'ENOENT') throw error }
+  const staging = inspectPathNoFollow(bridge.stagingRoot)
+  const requested = inspectPathNoFollow(bridge.requestedCwd)
+  if (!staging.exists || !sameDirectoryIdentity(staging.identity, bridge.stagingIdentity) ||
+      !requested.exists || !sameDirectoryIdentity(requested.identity, bridge.requestedIdentity)) {
+    throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Private command cwd bridge cleanup changed a bound directory')
+  }
 }
 // Copy a closed executable dependency set into the existing read-only runtime.
 // Granting the original Git installation would also expose unrelated plugins,
@@ -241,7 +312,7 @@ async function runTupleCommand(policy, args, options, tuple, key) {
   const nonce = crypto.randomUUID().replaceAll('-', '')
   // MSYS derives its installation root by removing the DLL filename, bin and
   // usr components. Keep that real layout inside one owned command directory.
-  let stagingRoot, runtimeRoot, runtimeDirectory
+  let stagingRoot, runtimeRoot, runtimeDirectory, cwdBridge
   let launcher, helperDeployment
   const { prepareWindowsAppContainerResources, recoverWindowsAppContainerResources } = require('./windows-appcontainer-resources.js')
   // Only the source-pinned, physically captured bundle can select worker bytes.
@@ -261,6 +332,7 @@ async function runTupleCommand(policy, args, options, tuple, key) {
       .some(root => typeof root === 'string' && (within(root, stagingRoot) || within(stagingRoot, root)))) {
       throw new WindowsAppContainerError('WINDOWS_RESOURCE_INVALID', 'Private command staging must be disjoint from worker resources')
     }
+    cwdBridge = createCommandCwdBridge(stagingRoot, args.cwd)
     helperDeployment = require('./windows-helper-deployment.js').stageWindowsHelperDeployment(stagingRoot)
     // The cancellation marker lives in this operation's exclusively created
     // helper directory, whose cleanup follows the same process-drain evidence.
@@ -289,8 +361,9 @@ async function runTupleCommand(policy, args, options, tuple, key) {
     }
     refusePoisonedAdmission()
     if (currentAdmission(tuple).key !== key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed while preparing resource grants')
+    verifyCommandCwdBridge(cwdBridge)
     evidence = await launcher.launch({ profileName: lease.profileName, profileSid: lease.profileSid,
-      executable: runtime.bash, executableSha256: runtime.bashSha256, msysRuntime: runtime.msysRuntime, arguments: ['--noprofile', '--norc', '-c', args.command], cwd: args.cwd,
+      executable: runtime.bash, executableSha256: runtime.bashSha256, msysRuntime: runtime.msysRuntime, arguments: ['--noprofile', '--norc', '-c', args.command], cwd: cwdBridge?.alias || args.cwd,
       environment: Object.entries(env).map(([key, value]) => `${key}=${value}`), timeoutMs: args.timeoutMs || 60000,
       outputLimit: 1024 * 1024, cancellationPath }, { signal: options.signal, leaseId: lease.recovery.leaseId })
     const resourceRecovery = Object.freeze({ ...await lease.release(evidence) })
@@ -344,15 +417,22 @@ async function runTupleCommand(policy, args, options, tuple, key) {
       const cleanup = operation => {
         try { operation() } catch (error) { if (!cleanupFailure) cleanupFailure = error }
       }
+      let stagingCleanupAllowed = true
+      if (cwdBridge) {
+        try { removeCommandCwdBridge(cwdBridge) } catch (error) {
+          cleanupFailure ||= error
+          stagingCleanupAllowed = false
+        }
+      }
       if (privateScratch) cleanup(() => fs.rmSync(privateScratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
       // Failed materialization owns its own cleanup accounting; EEXIST never
       // transfers ownership of a competing directory to this operation.
-      if (runtimeOwned && !runtimeCleanupUnknown) cleanup(() => fs.rmSync(runtimeRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
-      cleanup(() => helperDeployment?.cleanup())
+      if (stagingCleanupAllowed && runtimeOwned && !runtimeCleanupUnknown) cleanup(() => fs.rmSync(runtimeRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
+      if (stagingCleanupAllowed) cleanup(() => helperDeployment?.cleanup())
       // An exclusive loader collision or any failed/unknown child cleanup must
       // retain the staging parent rather than recursively deleting bytes whose
       // ownership or process lifetime was not proved.
-      if (!cleanupFailure && stagingRoot && !runtimeCleanupUnknown && !fs.existsSync(runtimeRoot) && !(helperDeployment && fs.existsSync(helperDeployment.root))) {
+      if (stagingCleanupAllowed && !cleanupFailure && stagingRoot && !runtimeCleanupUnknown && !fs.existsSync(runtimeRoot) && !(helperDeployment && fs.existsSync(helperDeployment.root))) {
         cleanup(() => fs.rmSync(stagingRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
       }
       if (!cleanupFailure && stagingRoot && fs.existsSync(stagingRoot)) {

@@ -166,6 +166,64 @@ test('native Windows Bash copied closure permits scratch writes and denies candi
   })
 })
 
+test('native Windows Bash bridges a deep canonical cwd for the admitted command child', { skip: process.platform !== 'win32', timeout: 600000 }, async t => {
+  const { ensureWindowsPrivateAcl } = require('../../agents/codex/workflow/safe-run-root.js')
+  const { executeTool } = require('../../scripts/harness-v2-tool-boundary.cjs')
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'windows-bash-deep-cwd-')))
+  let preserve = false
+  t.after(() => { if (!preserve) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) })
+  ensureWindowsPrivateAcl(root)
+  let deep = root
+  while (deep.length < 305) deep = path.join(deep, 'canonical-command-working-directory')
+  const targetPath = path.join(deep, 'target'), scratchPath = path.join(deep, 'scratch'), controlRoot = path.join(deep, 'controller')
+  for (const directory of [targetPath, scratchPath, controlRoot]) { fs.mkdirSync(directory, { recursive: true }); ensureWindowsPrivateAcl(directory) }
+  assert.ok(fs.realpathSync.native(scratchPath).length > 300)
+  const candidate = path.join(targetPath, 'candidate'), secret = path.join(controlRoot, 'secret')
+  fs.writeFileSync(candidate, 'preserved', { mode: 0o600 }); fs.writeFileSync(secret, 'controller-only', { mode: 0o600 })
+  fs.writeFileSync(path.join(scratchPath, 'relative-input'), 'deep-input', { mode: 0o600 })
+  const observedPath = path.join(scratchPath, 'child-observed.json')
+  let contacted = false
+  const listener = require('node:net').createServer(socket => { contacted = true; socket.destroy() })
+  await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
+  const port = listener.address().port
+  const childSource = `(async()=>{const fs=require('node:fs'),path=require('node:path'),net=require('node:net');const denied=p=>{try{fs.writeFileSync(p,'forbidden');return false}catch(error){return ['EACCES','EPERM'].includes(error.code)}};const readDenied=p=>{try{fs.readFileSync(p);return false}catch(error){return ['EACCES','EPERM'].includes(error.code)}};if(fs.realpathSync.native(process.cwd()).toLowerCase()!==${JSON.stringify(fs.realpathSync.native(scratchPath).toLowerCase())})throw Error('child cwd identity mismatch');if(fs.readFileSync('relative-input','utf8')!=='deep-input')throw Error('relative input mismatch');fs.writeFileSync('relative-output','deep-output');if(!denied(${JSON.stringify(candidate)})||!denied(${JSON.stringify(secret)})||!readDenied(${JSON.stringify(secret)}))throw Error('private access was allowed');const networkDenied=await new Promise(resolve=>{const socket=net.connect(${port},'127.0.0.1');let done=false;const finish=value=>{if(done)return;done=true;socket.destroy();resolve(value)};socket.once('connect',()=>finish(false));socket.once('error',error=>finish(['EACCES','EPERM','ENETUNREACH','EHOSTUNREACH','ECONNREFUSED'].includes(error.code)));socket.setTimeout(3000,()=>finish(false))});if(!networkDenied)throw Error('network was allowed');fs.writeFileSync(${JSON.stringify(observedPath)},JSON.stringify({cwd:process.cwd(),realCwd:fs.realpathSync.native(process.cwd()),input:fs.readFileSync('relative-input','utf8')}));process.stdout.write('deep-cwd-ok')})().catch(error=>{console.error(error);process.exitCode=1})`
+  const command = `node -e "eval(Buffer.from('${Buffer.from(childSource).toString('base64')}','base64').toString())"`
+  const policy = { provider: 'claude', nestedDispatch: false, commandBoundary: true, externalWrites: false, readOnly: true,
+    targetPath, scratchPath, readableRoots: [targetPath, scratchPath], writableRoots: [scratchPath] }
+  try {
+    const result = await executeTool(policy, 'bash', { command, cwd: scratchPath, timeoutMs: 60000 }, { controlRoot })
+    preserve = result.cleanupConfirmed === false || Boolean(result.recovery && !result.recoveryResolved) || result.resourceRecovery?.cleanupConfirmed === false
+    assert.equal(result.status, 'completed', JSON.stringify(result))
+    assert.ok(result.resourceRecovery, 'command must return authoritative lease release evidence')
+    assert.equal(result.cwd.toLowerCase(), fs.realpathSync.native(scratchPath).toLowerCase())
+    assert.equal(result.output, 'deep-cwd-ok')
+    assert.equal(fs.readFileSync(path.join(scratchPath, 'relative-output'), 'utf8'), 'deep-output')
+    const observed = JSON.parse(fs.readFileSync(observedPath, 'utf8'))
+    assert.ok(observed.cwd.length < 260)
+    assert.equal(path.basename(observed.cwd), 'command-cwd')
+    assert.notEqual(observed.cwd.toLowerCase(), fs.realpathSync.native(scratchPath).toLowerCase())
+    assert.equal(observed.realCwd.toLowerCase(), fs.realpathSync.native(scratchPath).toLowerCase())
+    assert.equal(fs.existsSync(observed.cwd), false, 'temporary cwd alias remained after lease release')
+    assert.equal(fs.existsSync(path.dirname(observed.cwd)), false, 'temporary cwd staging root remained after lease release')
+    assert.equal(observed.input, 'deep-input')
+    assert.equal(fs.readFileSync(candidate, 'utf8'), 'preserved')
+    assert.equal(fs.readFileSync(secret, 'utf8'), 'controller-only')
+    assert.equal(contacted, false, 'the admitted command reached the host network')
+    const visit = directory => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const absolute = path.join(directory, entry.name)
+        assert.equal(entry.isSymbolicLink(), false, `staging alias remained: ${absolute}`)
+        if (entry.isDirectory()) visit(absolute)
+      }
+    }
+    visit(root)
+  } catch (error) {
+    preserve = preserve || error.cleanupConfirmed === false || error.code === 'APPCONTAINER_CLEANUP_UNCONFIRMED' || Boolean(error.recovery && !error.recoveryResolved)
+    if (preserve) t.diagnostic('Unconfirmed native cleanup; retained diagnostic root: ' + root)
+    throw error
+  } finally { await new Promise(resolve => listener.close(resolve)) }
+})
+
 test('native Windows Bash repeated forks complete without retry diagnostics', { skip: process.platform !== 'win32', timeout: 600000 }, async t => {
   await require('../helpers/windows-bash-native-smoke.cjs').runNativeWindowsBashRepeatedForkSmoke(t, {
     probeWindowsAppContainer: require('../../agents/codex/workflow/windows-appcontainer-probe.js').probeWindowsAppContainer,
