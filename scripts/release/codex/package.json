@@ -1,6 +1,6 @@
 {
   "name": "@autoprompt-skill/codex-runtime",
-  "version": "1.0.72",
+  "version": "1.0.73",
   "description": "Internal Codex runtime conformance fixture.",
   "private": true,
   "license": "MIT",
