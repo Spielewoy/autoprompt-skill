@@ -19,10 +19,12 @@ const { createWindowsCompilerDirectory, ensureWindowsPrivateAcl } = require('../
 const { ownedTest } = require('../../scripts/harness-v2-closed-canary.cjs')
 
 const VARIANTS = Object.freeze([
-  Object.freeze({ id: 'short-cwd-short-profile', junctionCwd: false, deepProfile: false }),
-  Object.freeze({ id: 'junction-deep-cwd-short-profile', junctionCwd: true, deepProfile: false }),
-  Object.freeze({ id: 'short-cwd-deep-profile', junctionCwd: false, deepProfile: true }),
-  Object.freeze({ id: 'junction-deep-cwd-deep-profile', junctionCwd: true, deepProfile: true }),
+  Object.freeze({ id: 'deep-home-profile', fieldGroup: Object.freeze(['HOME', 'USERPROFILE']) }),
+  Object.freeze({ id: 'deep-temporary-profile', fieldGroup: Object.freeze(['TEMP', 'TMP', 'TMPDIR']) }),
+  Object.freeze({ id: 'deep-claude-config', fieldGroup: Object.freeze(['CLAUDE_CONFIG_DIR']) }),
+  Object.freeze({ id: 'deep-settings', fieldGroup: Object.freeze(['--settings']) }),
+  Object.freeze({ id: 'deep-xdg-git-profile', fieldGroup: Object.freeze(['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'GIT_CONFIG_GLOBAL']) }),
+  Object.freeze({ id: 'shallow-alias-entire-profile', fieldGroup: Object.freeze(['entire-profile']), aliasProfile: true }),
 ])
 
 const boundedError = error => ({
@@ -46,7 +48,7 @@ function retainedVariants(outputRoot) {
     const file = path.join(outputRoot, 'native-platform-evidence.json')
     if (fs.statSync(file).size > 1024 * 1024) return []
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
-    return Array.isArray(parsed.variants) ? parsed.variants.slice(0, 4) : []
+    return Array.isArray(parsed.variants) ? parsed.variants.slice(0, 6) : []
   } catch { return [] }
 }
 
@@ -56,6 +58,62 @@ function deepDirectory(root, leaf) {
   directory = path.join(directory, leaf)
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
   return fs.realpathSync.native(directory)
+}
+
+function isDescendant(root, candidate) {
+  const relative = path.relative(root, candidate)
+  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))
+}
+
+function projectVariantProfile(variant, launch, base, profileRoot, platform) {
+  const settingsIndex = launch.argv.indexOf('--settings')
+  assert.ok(settingsIndex >= 0 && typeof launch.argv[settingsIndex + 1] === 'string')
+  let alias = null
+  if (variant.aliasProfile) {
+    alias = path.join(base, `profile-alias-${crypto.randomUUID()}`)
+    fs.symlinkSync(profileRoot, alias, platform === 'win32' ? 'junction' : 'dir')
+    const linked = fs.lstatSync(alias)
+    assert.equal(linked.isSymbolicLink(), true)
+    assert.equal(fs.realpathSync.native(alias).toLowerCase(), fs.realpathSync.native(profileRoot).toLowerCase())
+    for (const [key, value] of Object.entries(launch.env)) {
+      if (typeof value === 'string' && path.isAbsolute(value) && isDescendant(profileRoot, value)) {
+        launch.env[key] = path.join(alias, path.relative(profileRoot, value))
+      }
+    }
+    const settings = launch.argv[settingsIndex + 1]
+    assert.equal(isDescendant(profileRoot, settings), true)
+    launch.argv[settingsIndex + 1] = path.join(alias, path.relative(profileRoot, settings))
+    return { alias, aliasTargetLength: profileRoot.length }
+  }
+  const deep = deepDirectory(base, `override-${variant.id}`)
+  const directory = name => {
+    const value = path.join(deep, name)
+    fs.mkdirSync(value, { recursive: true, mode: 0o700 })
+    return value
+  }
+  if (variant.id === 'deep-home-profile') {
+    launch.env.HOME = directory('home')
+    launch.env.USERPROFILE = launch.env.HOME
+  } else if (variant.id === 'deep-temporary-profile') {
+    launch.env.TEMP = directory('tmp')
+    launch.env.TMP = launch.env.TEMP
+    launch.env.TMPDIR = launch.env.TEMP
+  } else if (variant.id === 'deep-claude-config') {
+    launch.env.CLAUDE_CONFIG_DIR = directory('claude')
+  } else if (variant.id === 'deep-settings') {
+    const settings = path.join(deep, 'settings.json')
+    fs.copyFileSync(launch.argv[settingsIndex + 1], settings, fs.constants.COPYFILE_EXCL)
+    assert.deepEqual(fs.readFileSync(settings), fs.readFileSync(launch.argv[settingsIndex + 1]))
+    launch.argv[settingsIndex + 1] = settings
+  } else if (variant.id === 'deep-xdg-git-profile') {
+    for (const [key, name] of [['XDG_CONFIG_HOME', 'config'], ['XDG_DATA_HOME', 'data'],
+      ['XDG_STATE_HOME', 'state'], ['XDG_CACHE_HOME', 'cache']]) launch.env[key] = directory(name)
+    const gitconfig = path.join(deep, 'gitconfig')
+    fs.copyFileSync(launch.env.GIT_CONFIG_GLOBAL, gitconfig, fs.constants.COPYFILE_EXCL)
+    assert.deepEqual(fs.readFileSync(gitconfig), fs.readFileSync(launch.env.GIT_CONFIG_GLOBAL))
+    launch.env.GIT_CONFIG_GLOBAL = gitconfig
+  } else throw new Error(`Unknown startup probe variant: ${variant.id}`)
+  return { alias: null, aliasTargetLength: null }
 }
 
 function inspectLine(line, observation) {
@@ -114,18 +172,16 @@ async function runStartupVariants({ cli, base, outputRoot, variants = VARIANTS, 
   const shortCwd = path.join(base, 'short-cwd')
   const shortProfiles = path.join(base, 'short-profiles')
   fs.mkdirSync(shortCwd, { mode: 0o700 }); fs.mkdirSync(shortProfiles, { mode: 0o700 })
-  const deepCwd = deepDirectory(base, 'deep-cwd')
-  const deepProfiles = deepDirectory(base, 'deep-profiles')
   const registryPath = path.join(base, 'processes.json')
   const owner = new ProcessOwner({ adapter: nativeProcessAdapter(registryPath, base), registryPath, pollMs: 25 })
   const results = []
   let drained = false
   try {
     for (const [index, variant] of variants.entries()) {
-      // A deep semantic cwd exercises the production ProcessOwner bridge,
-      // which creates and binds the shallow physical junction used by spawn.
-      const cwd = variant.junctionCwd ? deepCwd : shortCwd
-      const profileRoot = variant.deepProfile ? path.join(deepProfiles, variant.id) : path.join(shortProfiles, variant.id)
+      const cwd = shortCwd
+      const profileRoot = variant.aliasProfile
+        ? deepDirectory(base, `canonical-${variant.id}`)
+        : path.join(shortProfiles, variant.id)
       const home = path.join(profileRoot, 'home'), sessionRoot = path.join(profileRoot, 'session')
       const service = await modelService('claude', { name: 'unused-startup-probe', args: {} }, { noTool: true })
       const proxyRoot = path.join(base, `proxy-${index}`)
@@ -134,20 +190,29 @@ async function runStartupVariants({ cli, base, outputRoot, variants = VARIANTS, 
       const runner = new OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxyRoot, targetKey: `claude-startup-${index}`, pollMs: 25 })
       const observation = { lineCount: 0, stdoutBytes: 0, nonJsonLines: 0, cliInit: false, result: null }
       const sessionId = crypto.randomUUID(), reservationId = crypto.randomUUID()
-      let outcome
+      let outcome, profileProjection = { alias: null, aliasTargetLength: null }
       try {
         const launch = native.createLaunch({ provider: 'claude', home, sessionRoot, targetPath: cwd, cwd,
           prompt: 'Return exactly one JSON object.', input: 'Return {"ok":true}.', toolFree: true, readOnly: true,
           connection: { model: 'claude-sonnet-4-6', environment: { ANTHROPIC_BASE_URL: service.url } },
           credentials: { ANTHROPIC_API_KEY: '<local-startup-probe>' }, environment: nativeEnvironment() })
+        profileProjection = projectVariantProfile(variant, launch, base, profileRoot, platform)
         const settingsIndex = launch.argv.indexOf('--settings')
         launch.env = prepareProcessLaunchEnvironment(owner.adapter, reservationId, launch.env)
         outcome = await runWithStartupDeadline(runner, owner, { ...launch, executable: cli, sessionId, reservationId,
           onStdoutLine: line => inspectLine(line, observation) })
         const result = {
-          id: variant.id, junctionCwd: variant.junctionCwd, deepProfile: variant.deepProfile,
-          pathLengths: { cwd: cwd.length, cwdReal: fs.realpathSync.native(cwd).length, home: home.length,
-            sessionRoot: sessionRoot.length, settings: settingsIndex >= 0 ? launch.argv[settingsIndex + 1].length : null },
+          id: variant.id, fieldGroup: [...variant.fieldGroup],
+          pathLengths: { cwd: cwd.length, cwdReal: fs.realpathSync.native(cwd).length,
+            home: launch.env.HOME?.length ?? null, userProfile: launch.env.USERPROFILE?.length ?? null,
+            temp: launch.env.TEMP?.length ?? null, tmp: launch.env.TMP?.length ?? null,
+            tmpdir: launch.env.TMPDIR?.length ?? null, claudeConfig: launch.env.CLAUDE_CONFIG_DIR?.length ?? null,
+            settings: settingsIndex >= 0 ? launch.argv[settingsIndex + 1].length : null,
+            xdgConfig: launch.env.XDG_CONFIG_HOME?.length ?? null, xdgData: launch.env.XDG_DATA_HOME?.length ?? null,
+            xdgState: launch.env.XDG_STATE_HOME?.length ?? null, xdgCache: launch.env.XDG_CACHE_HOME?.length ?? null,
+            gitConfig: launch.env.GIT_CONFIG_GLOBAL?.length ?? null },
+          alias: { used: Boolean(profileProjection.alias), length: profileProjection.alias?.length ?? null,
+            targetLength: profileProjection.aliasTargetLength, physicalTargetValidated: Boolean(profileProjection.alias) },
           startupTimedOut: outcome.startupTimedOut, outerTimedOut: outcome.outerTimedOut,
           cliInit: observation.cliInit,
           modelRequestCount: service.requests.filter(request => request.path.includes('/messages')).length,
@@ -168,6 +233,7 @@ async function runStartupVariants({ cli, base, outputRoot, variants = VARIANTS, 
         let serviceCloseError = null
         try { await service.close() } catch (error) { serviceCloseError = error }
         await owner.assertTargetDrained(`claude-startup-${index}`)
+        if (profileProjection.alias) fs.unlinkSync(profileProjection.alias)
         if (serviceCloseError) throw serviceCloseError
       }
     }
