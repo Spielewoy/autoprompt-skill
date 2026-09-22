@@ -180,9 +180,11 @@ async function main() {
   if (action === 'windows-regressions') {
     assert.equal(process.platform, 'win32')
     const cases = DIAGNOSTIC_STAGES.filter(stage => ['command-cwd', 'infra'].includes(stage.id)).flatMap(stage => stage.cases)
+    const snapshotCases = [GIT_SNAPSHOT_CASE,
+      'Windows owned cleanup binds the target, validates the entire tree, and proves final absence']
     const stages = [
-      { id: 'snapshot', cases: [GIT_SNAPSHOT_CASE], argv: ['--test-name-pattern', `^${GIT_SNAPSHOT_CASE}$`,
-        'tests/source/local-only-safety.test.cjs'] },
+      { id: 'snapshot', cases: snapshotCases, argv: ['--test-name-pattern', `^(?:${snapshotCases.join('|')})$`,
+        'tests/source/local-only-safety.test.cjs', 'tests/source/windows-filesystem.test.cjs'] },
       { id: 'launch', cases, argv: ['--test-name-pattern', `^(?:${cases.join('|')})$`,
         'tests/source/windows-bash-runtime.test.cjs', 'tests/source/windows-job-helper.test.cjs'] },
       { id: 'installer', cases: ['packed artifact installs and verifies all public providers without the checkout or network'],

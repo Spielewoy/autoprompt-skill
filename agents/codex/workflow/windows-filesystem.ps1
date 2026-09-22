@@ -707,7 +707,8 @@ public static class AutopromptWindowsCapture {
   }
   public static Dictionary<string, object> OwnedOperation(string operation, string root, string[] components, string parentDev, string parentIno, string targetType, string targetDev, string targetIno) {
     ValidateCaptureRequest(root, components, MaxBytes);
-    bool deleting = operation == "remove-owned-target"; Need(deleting || operation == "inspect-owned-target", "FILESYSTEM_REQUEST_INVALID");
+    bool emptyOnly = operation == "remove-owned-empty-directory";
+    bool deleting = emptyOnly || operation == "remove-owned-target"; Need(deleting || operation == "inspect-owned-target", "FILESYSTEM_REQUEST_INVALID");
     string mapping = PhysicalDriveMapping(root), nativeRoot = "\\??\\" + root;
     var chain = new List<Opened>(); var all = new List<Opened>(); var nodes = new List<TreeNode>();
     try {
@@ -733,7 +734,11 @@ public static class AutopromptWindowsCapture {
       }
       Need(MatchesOwned(target, targetDev, targetIno) && targetType == (target.Directory ? "directory" : "file"), "PREIMAGE_UNSAFE");
       var top = new TreeNode { Opened=target, Parent=parent, Path="" }; nodes.Add(top); long total = 0;
-      if (target.Directory) WalkTree(top, nodes, all, ref total, MaxBytes, 0, MaxCleanupEntries, true);
+      if (emptyOnly) {
+        Need(target.Directory, "PREIMAGE_UNSAFE");
+        top.Children = EnumerateHeld(target.Handle, MaxCleanupEntries);
+        Need(top.Children.Count == 0, "PREIMAGE_UNSAFE");
+      } else if (target.Directory) WalkTree(top, nodes, all, ref total, MaxBytes, 0, MaxCleanupEntries, true);
       else top.Result = ReadCapturedFile(target, true, MaxBytes);
       // Validate the complete bounded subtree before the first deletion.
       foreach (TreeNode node in nodes) {
@@ -866,7 +871,7 @@ try {
     exit 0
   }
   $publish = $requestObject.operation -ceq 'publish-record-exclusive'
-  $remove = $requestObject.operation -ceq 'remove-owned-target'
+  $remove = $requestObject.operation -cin @('remove-owned-target', 'remove-owned-empty-directory')
   $allowed = if ($publish) { @('schemaVersion', 'operation', 'root', 'components', 'bytesBase64') } elseif ($remove) { @('schemaVersion', 'operation', 'root', 'components', 'parentIdentity', 'targetIdentity') } else { @('schemaVersion', 'operation', 'root', 'components', 'maxBytes') }
   if ($names.Count -ne $allowed.Count -or @($names | Where-Object { $_ -cnotin $allowed }).Count -ne 0 -or
       (-not ($requestObject.schemaVersion -is [int] -or $requestObject.schemaVersion -is [long])) -or $requestObject.schemaVersion -ne 1 -or

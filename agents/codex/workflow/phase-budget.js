@@ -97,6 +97,7 @@ const {
   runOwnedProcessConformanceProbe,
 } = require('./process-owner.js')
 const { CleanupRegistry, Finalizer } = require('./finalizer.js')
+const { createWindowsCheckerRootValidator, resolveCheckerSnapshotRoot } = require('./windows-checker-root.js')
 const { assertGenerationControlAuthority } = require('./generation-control.js')
 const { deriveProfileLimits, sealedProfileOverrides } = require('./codex-agent-profile.js')
 const {
@@ -30054,6 +30055,8 @@ function createCheckerSnapshotFactory(options) {
       }
     }
     const snapshotPath = path.join(options.snapshotRoot, `${hashText(checkerId)}-${crypto.randomBytes(8).toString('hex')}`)
+    fs.mkdirSync(snapshotPath, { mode: 0o700 })
+    options.cleanupRegistry.register({ path: snapshotPath, kind: 'checker-snapshot', owner: checkerId })
     const sourceEnvironment = options.gitEnvironment(sourcePath)
     const clone = childProcess.spawnSync('git', ['clone', '--no-local', '--no-hardlinks', '--', sourcePath, snapshotPath], {
       env: sourceEnvironment, encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 * 1024,
@@ -30181,7 +30184,6 @@ function createCheckerSnapshotFactory(options) {
         checkerId,
       })
     }
-    options.cleanupRegistry.register({ path: snapshotPath, kind: 'checker-snapshot', owner: checkerId })
     return projectionReceipt ? Object.freeze({ snapshotPath, projectionReceipt }) : snapshotPath
   }
 }
@@ -31894,6 +31896,9 @@ function createDefaultRuntimeOptions(input) {
         ...record.paths.cleanupRegistry,
         fsImpl: runtimeFs,
         allowedRoots: [activation.activationRoot],
+        ...(process.platform === 'win32' ? {
+          externalRootValidator: createWindowsCheckerRootValidator({ owner: activation.runId }),
+        } : {}),
         controlBinding: {
           activationId: activation.runId,
           generationId: generation,
@@ -32450,7 +32455,11 @@ function createDefaultRuntimeOptions(input) {
         adapterKind: processProbe.adapterKind,
         probeHash: processProbe.probeHash,
       })
-      const snapshotRoot = path.join(activation.activationRoot, 'checker-snapshots')
+      const snapshotRoot = resolveCheckerSnapshotRoot({
+        snapshotRoot: path.join(activation.activationRoot, 'checker-snapshots'),
+        cleanupRegistry,
+        owner: activation.runId,
+      })
       runtimeOptions.checkerSnapshotFactory = createCheckerSnapshotFactory({
         targetPath,
         snapshotRoot,
@@ -32470,6 +32479,10 @@ function createDefaultRuntimeOptions(input) {
         targetPath,
       })
       runtimeOptions.validateCheckerSnapshot = candidate => {
+        if (process.platform === 'win32' &&
+            cleanupRegistry.getExternalRoot('windows-checker-snapshots')?.path !== snapshotRoot) {
+          throw new SupervisorIntegrationError('CRASH_ADOPTION_CONFLICT', 'checker storage no longer has its registered physical authority')
+        }
         const resolved = path.resolve(candidate)
         const root = fs.realpathSync.native(snapshotRoot)
         const real = fs.realpathSync.native(resolved)

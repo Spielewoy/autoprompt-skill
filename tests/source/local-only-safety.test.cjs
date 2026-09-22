@@ -148,60 +148,40 @@ test('native Git checker snapshots preserve exact bytes beyond Windows MAX_PATH 
   const options = { configIsolationPath: context.configIsolation, ghConfigDir: context.ghConfigDir }
   const environment = createSafeChildGitEnvironment(target, context.env, options)
   assert.equal(run('git', ['-C', target, 'config', '--get', 'core.longpaths'], { env: environment }).stdout.trim(), 'true')
-  const registrations = []
-  const factory = require('../../agents/codex/workflow/phase-budget.js').createCheckerSnapshotFactory({
-    targetPath: target, snapshotRoot, expectedBranch: EXPECTED_BRANCH,
-    runId: 'native-deep-snapshot', generation: 1,
-    gitEnvironment: repository => createSafeChildGitEnvironment(repository, context.env, options),
-    enforcementProofPath: context.proofPath, safetyScriptPath: CHECKER,
-    cleanupRegistry: { register: entry => registrations.push(entry) },
+  const owner = 'native-deep-snapshot'
+  const { CleanupRegistry } = require('../../agents/codex/workflow/finalizer.js')
+  const { resolveCheckerSnapshotRoot, createWindowsCheckerRootValidator } = require('../../agents/codex/workflow/windows-checker-root.js')
+  const sandbox = fs.realpathSync.native(context.sandbox)
+  let runtimeFs = fs
+  if (process.platform === 'win32') {
+    require('../../agents/codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(sandbox)
+    const native = require('../../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture()
+    runtimeFs = Object.assign(Object.create(fs), { windowsCapture: native, windowsMutations: native })
+  }
+  const cleanupRegistry = new CleanupRegistry({
+    registryPath: path.join(sandbox, 'snapshot-cleanup.json'), allowedRoots: [sandbox], fsImpl: runtimeFs,
+    controlBinding: { activationId: owner, generationId: 1 },
+    ...(process.platform === 'win32' ? { externalRootValidator: createWindowsCheckerRootValidator({ owner }) } : {}),
   })
+  fs.mkdirSync(snapshotRoot, { recursive: true })
+  assert.ok(snapshotRoot.length >= 300)
+  const selectedRoot = resolveCheckerSnapshotRoot({ snapshotRoot, cleanupRegistry, owner })
+  const snapshotOptions = {
+    targetPath: target, snapshotRoot: selectedRoot, expectedBranch: EXPECTED_BRANCH,
+    runId: owner, generation: 1,
+    gitEnvironment: repository => createSafeChildGitEnvironment(repository, context.env, options),
+    enforcementProofPath: context.proofPath, safetyScriptPath: CHECKER, cleanupRegistry,
+  }
+  const { createCheckerSnapshotFactory } = require('../../agents/codex/workflow/phase-budget.js')
+  const factory = createCheckerSnapshotFactory(snapshotOptions)
   let snapshot
   try {
     snapshot = factory('native-deep-checker', [])
   } catch (error) {
-    t.diagnostic(`Native Git snapshot failure: ${JSON.stringify(error.details || {}).slice(0, 8192)}`)
-    if (process.platform === 'win32') {
-      // Diagnostic-only alternatives against this disposable fixture. They do
-      // not replace the required factory result or turn its failure into a pass.
-      const probe = (label, clonePath, canonicalPath, cwd, afterClone) => {
-        try {
-          const cloned = run('git', ['clone', '--no-local', '--no-hardlinks', '--', target, clonePath], { env: environment, cwd })
-          const record = { label, clone: cloned.status, signal: cloned.signal, error: cloned.error?.code,
-            stderr: String(cloned.stderr || '').slice(-4096) }
-          if (cloned.status === 0) {
-            if (afterClone) afterClone()
-            const inspected = run('git', ['-C', canonicalPath, 'rev-parse', 'HEAD'], { env: environment })
-            const status = run('git', ['-C', canonicalPath, 'status', '--porcelain'], { env: environment })
-            record.canonicalHead = { code: inspected.status, exact: inspected.stdout.trim() === originalHead, stderr: inspected.stderr }
-            record.canonicalStatus = { code: status.status, stdout: status.stdout, stderr: status.stderr }
-          }
-          t.diagnostic(`Native Git path probe: ${JSON.stringify(record).slice(0, 8192)}`)
-        } catch (probeError) {
-          t.diagnostic(`Native Git path probe ${label}: ${probeError.code || probeError.message}`)
-        }
-      }
-      let ancestor = snapshotRoot
-      while (ancestor.length > 220) ancestor = path.dirname(ancestor)
-      const relativeTarget = path.join(snapshotRoot, `relative-${'a'.repeat(64)}`)
-      probe('relative destination', path.relative(ancestor, relativeTarget), relativeTarget, ancestor)
-      const alias = path.join(context.sandbox, 'git-snapshot-view')
-      try {
-        fs.symlinkSync(snapshotRoot, alias, 'junction')
-        const leaf = `alias-${'b'.repeat(64)}`
-        probe('short junction destination', path.join(alias, leaf), path.join(snapshotRoot, leaf))
-      } catch (aliasError) {
-        t.diagnostic(`Native Git junction probe: ${aliasError.code || aliasError.message}`)
-      } finally {
-        if (fs.existsSync(alias)) fs.unlinkSync(alias)
-      }
-      const shortClone = path.join(context.sandbox, 'short-clone')
-      const movedClone = path.join(snapshotRoot, `moved-${'c'.repeat(64)}`)
-      probe('short clone then move', shortClone, movedClone, undefined, () => fs.renameSync(shortClone, movedClone))
-    }
+    t.diagnostic(`Native Git snapshot failure: ${JSON.stringify(error.details || {}).slice(0, 8192)} root=${selectedRoot}`)
     throw error
   }
-  assert.ok(snapshot.length > 300)
+  assert.ok(process.platform === 'win32' ? snapshot.length < 220 : snapshot.length > 300)
   assert.equal(fs.readFileSync(path.join(snapshot, 'candidate.txt'), 'utf8'), 'exact dirty candidate\n')
   const head = run('git', ['-C', snapshot, 'rev-parse', 'HEAD'], { env: environment })
   assert.equal(head.status, 0, head.stderr)
@@ -209,7 +189,22 @@ test('native Git checker snapshots preserve exact bytes beyond Windows MAX_PATH 
   assert.deepEqual(fs.readFileSync(path.join(target, '.git', 'config')), originalConfig)
   assert.equal(environment.GIT_ALLOW_PROTOCOL, 'file')
   assert.equal(run('git', ['-C', snapshot, 'config', '--get', 'protocol.allow'], { env: environment }).stdout.trim(), 'never')
-  assert.deepEqual(registrations, [{ path: snapshot, kind: 'checker-snapshot', owner: 'native-deep-checker' }])
+  const registered = cleanupRegistry.load().entries.filter(entry => entry.kind === 'checker-snapshot')
+  assert.equal(registered.length, 1)
+  assert.equal(registered[0].path, snapshot)
+  assert.equal(registered[0].owner, 'native-deep-checker')
+  const failedFactory = createCheckerSnapshotFactory({ ...snapshotOptions, gitEnvironment: () => environment })
+  assert.throws(() => failedFactory('failed-clone-checker', [], path.join(sandbox, 'missing-source')), error =>
+    error.code === 'SNAPSHOT_CREATION_FAILED')
+  const failedClone = cleanupRegistry.load().entries.find(entry => entry.owner === 'failed-clone-checker')
+  assert.ok(failedClone, 'failed clone storage is registered before Git can write partial bytes')
+  assert.equal(failedClone.status, 'REGISTERED')
+  cleanupRegistry.run()
+  assert.equal(fs.existsSync(snapshot), false)
+  assert.equal(fs.existsSync(failedClone.path), false)
+  if (process.platform === 'win32') assert.equal(fs.existsSync(selectedRoot), false)
+  assert.equal(fs.readFileSync(file, 'utf8'), 'exact dirty candidate\n')
+  assert.deepEqual(fs.readFileSync(path.join(target, '.git', 'config')), originalConfig)
 })
 
 function invoke(context, expectedBranch = EXPECTED_BRANCH, extra = [], options = {}) {

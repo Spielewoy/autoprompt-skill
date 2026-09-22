@@ -455,6 +455,18 @@ test('Windows owned cleanup binds the target, validates the entire tree, and pro
   assert.throws(() => backend.removeOwnedTarget(target, { ...owned.parentIdentity, ino: String(BigInt(owned.parentIdentity.ino) + 1n) }, owned.targetIdentity), { code: 'PREIMAGE_UNSAFE' })
   assert.throws(() => backend.captureFileBytes(path.join(root, 'missing')), { code: 'ENOENT' })
   assert.throws(() => backend.captureFileBytes(path.join(root, 'missing-parent', 'missing')), { code: 'PREIMAGE_UNSAFE' })
+  const emptyRoot = path.join(root, 'external-root')
+  fs.mkdirSync(emptyRoot)
+  const emptyOwned = backend.inspectOwnedTarget(emptyRoot)
+  const residue = path.join(emptyRoot, 'unregistered.txt')
+  fs.writeFileSync(residue, 'must remain')
+  assert.throws(() => backend.removeOwnedEmptyDirectory(emptyRoot, emptyOwned.parentIdentity, emptyOwned.targetIdentity), { code: 'PREIMAGE_UNSAFE' })
+  assert.equal(fs.readFileSync(residue, 'utf8'), 'must remain')
+  fs.unlinkSync(residue)
+  assert.throws(() => backend.removeOwnedEmptyDirectory(emptyRoot, emptyOwned.parentIdentity,
+    { ...emptyOwned.targetIdentity, ino: String(BigInt(emptyOwned.targetIdentity.ino) + 1n) }), { code: 'PREIMAGE_UNSAFE' })
+  assert.equal(backend.removeOwnedEmptyDirectory(emptyRoot, emptyOwned.parentIdentity, emptyOwned.targetIdentity).removed, true)
+  assert.equal(backend.removeOwnedEmptyDirectory(emptyRoot, emptyOwned.parentIdentity, emptyOwned.targetIdentity).removed, false)
 })
 
 test('Windows transaction operations durably create, copy readonly projection, and rename without replacement', { skip: !windows }, t => {

@@ -93,7 +93,7 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
       return { status: 0, stderr: '', stdout: JSON.stringify(wire) }
     }
     if (request.operation === 'inspect-owned-target') return { status: 0, stderr: '', stdout: JSON.stringify({ schemaVersion: 1, status: 'INSPECTED', parentIdentity: { dev: '123', ino: '1' }, targetIdentity: { type: 'directory', dev: '123', ino: '2' } }) }
-    if (request.operation === 'remove-owned-target') return { status: 0, stderr: '', stdout: JSON.stringify({ schemaVersion: 1, status: 'REMOVED', removed: true }) }
+    if (['remove-owned-target', 'remove-owned-empty-directory'].includes(request.operation)) return { status: 0, stderr: '', stdout: JSON.stringify({ schemaVersion: 1, status: 'REMOVED', removed: true }) }
     if (request.operation === 'recover-record-publication') return { status: 0, stderr: '', stdout: JSON.stringify({ schemaVersion: 1, status: 'RECOVERED', removed: [] }) }
     if (request.operation === 'publish-record-exclusive' || request.operation === 'assert-record-parent') {
       const published = request.operation === 'publish-record-exclusive', bytes = published ? Buffer.from(request.bytesBase64, 'base64') : null
@@ -134,6 +134,8 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
   assert.equal(descriptors.size, 0)
   const owned = capture.inspectOwnedTarget('C:\\project\\scratch')
   assert.equal(owned.targetIdentity.type, 'directory')
+  assert.equal(capture.removeOwnedEmptyDirectory('C:\\project\\scratch', owned.parentIdentity, owned.targetIdentity).removed, true)
+  assert.equal(JSON.parse(calls.at(-1)[2].input).operation, 'remove-owned-empty-directory')
   assert.equal(capture.removeOwnedTarget('C:\\project\\scratch', owned.parentIdentity, owned.targetIdentity).removed, true)
   assert.deepEqual(JSON.parse(calls.at(-1)[2].input), { schemaVersion: 1, operation: 'remove-owned-target', root: 'C:\\', components: ['project', 'scratch'], parentIdentity: { dev: '123', ino: '1' }, targetIdentity: { type: 'directory', dev: '123', ino: '2' } })
   assert.throws(() => capture.removeOwnedTarget('C:\\project\\scratch', { dev: '123', ino: '1', extra: true }, owned.targetIdentity), { code: 'FILESYSTEM_BACKEND_INVALID' })
@@ -243,6 +245,8 @@ test('Windows owned cleanup parser closes identity and removal framing', () => {
     assert.throws(() => parseRecordResult(JSON.stringify(changed), 'inspect-owned-target'), { code: 'FILESYSTEM_BACKEND_UNAVAILABLE' })
   }
   assert.equal(parseRecordResult(JSON.stringify({ schemaVersion: 1, status: 'REMOVED', removed: false }), 'remove-owned-target').removed, false)
+  assert.equal(parseRecordResult(JSON.stringify({ schemaVersion: 1, status: 'REMOVED', removed: false }), 'remove-owned-empty-directory').removed, false)
+  assert.throws(() => parseRecordResult(JSON.stringify({ schemaVersion: 1, status: 'REMOVED', removed: 'false' }), 'remove-owned-empty-directory'), { code: 'FILESYSTEM_BACKEND_UNAVAILABLE' })
   assert.throws(() => parseRecordResult(JSON.stringify({ schemaVersion: 1, status: 'REMOVED', removed: 'false' }), 'remove-owned-target'), { code: 'FILESYSTEM_BACKEND_UNAVAILABLE' })
   assert.throws(() => parseCapture(JSON.stringify({ schemaVersion: 1, status: 'REFUSED', code: 'FILESYSTEM_NOT_FOUND' }), 'read'), { code: 'ENOENT' })
 })

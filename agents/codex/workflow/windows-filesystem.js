@@ -142,7 +142,7 @@ function parseRecordResult(stdout, operation, content, leaf) {
     if (parentIdentity.dev !== targetIdentity.dev) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows target crosses a volume')
     return Object.freeze({ parentIdentity, targetIdentity })
   }
-  if (operation === 'remove-owned-target') {
+  if (['remove-owned-target', 'remove-owned-empty-directory'].includes(operation)) {
     if (!exact(value, ['schemaVersion', 'status', 'removed']) || value.schemaVersion !== 1 || value.status !== 'REMOVED' || typeof value.removed !== 'boolean') fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows target removal is malformed')
     return Object.freeze({ removed: value.removed })
   }
@@ -282,7 +282,7 @@ function createWindowsFilesystemCapture(options = {}) {
         })
       }
       if (transaction) return parseTransactionResult(result.stdout, operation, recordBytes, ownership?.mode)
-      if (publish || operation === 'assert-record-parent' || operation === 'recover-record-publication' || operation === 'inspect-owned-target' || operation === 'remove-owned-target') return parseRecordResult(result.stdout, operation, recordBytes, target.components.at(-1))
+      if (publish || operation === 'assert-record-parent' || operation === 'recover-record-publication' || operation === 'inspect-owned-target' || ['remove-owned-target', 'remove-owned-empty-directory'].includes(operation)) return parseRecordResult(result.stdout, operation, recordBytes, target.components.at(-1))
       const captured = parseCapture(result.stdout, operation)
       if (captured.bytes > maxBytes) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows capture exceeds the request byte limit')
       return captured
@@ -301,6 +301,7 @@ function createWindowsFilesystemCapture(options = {}) {
     renameTreeNoReplace: (source, destination) => invoke('rename-tree-no-replace', source, undefined, MAX_BYTES, undefined, { destination: requestTarget(destination) }),
     inspectOwnedTarget: absolute => invoke('inspect-owned-target', absolute, undefined, 0),
     removeOwnedTarget: (absolute, parentIdentity, targetIdentity) => invoke('remove-owned-target', absolute, undefined, 0, undefined, { parentIdentity: validateOwnedIdentity(parentIdentity, false), targetIdentity: validateOwnedIdentity(targetIdentity, true) }),
+    removeOwnedEmptyDirectory: (absolute, parentIdentity, targetIdentity) => invoke('remove-owned-empty-directory', absolute, undefined, 0, undefined, { parentIdentity: validateOwnedIdentity(parentIdentity, false), targetIdentity: validateOwnedIdentity(targetIdentity, true) }),
     assertRecordParent: absolute => invoke('assert-record-parent', absolute, undefined, 0),
     publishRecordExclusive: (absolute, bytes) => invoke('publish-record-exclusive', absolute, undefined, MAX_RECORD_BYTES, bytes),
     recoverRecordPublication: absolute => invoke('recover-record-publication', absolute, undefined, 0),

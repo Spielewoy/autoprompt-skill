@@ -67,6 +67,7 @@ function createOwnedProxyBootDiagnostic(root) {
     " const trace=process.env.AUTOPROMPT_OWNED_PROXY_BOOT_TRACE",
     " const emit=(phase,error,message)=>{try{const size=fs.existsSync(trace)?fs.statSync(trace).size:0;if(size>=65536)return;const record={phase,pid:process.pid,node:process.version};try{record.cwd=process.cwd()}catch(cwdError){record.cwdError={code:String(cwdError.code||'').slice(0,64),message:String(cwdError.message||cwdError).replace(/[\\r\\n]+/g,' ').slice(0,512)}}try{record.realCwd=fs.realpathSync.native(record.cwd)}catch(realError){record.realCwdError={code:String(realError.code||'').slice(0,64),message:String(realError.message||realError).replace(/[\\r\\n]+/g,' ').slice(0,512)}}if(error)record.error={name:String(error.name||'Error').slice(0,64),code:String(error.code||'').slice(0,64),message:String(error.message||error).replace(/[\\r\\n]+/g,' ').slice(0,512),stack:String(error.stack||'').slice(0,2048)};if(message)record.message=String(message).replace(/[\\r\\n]+/g,' ').slice(0,512);fs.appendFileSync(trace,JSON.stringify(record)+'\\n')}catch{}}",
     " emit('preload-enter')",
+    " try{const binding=process.binding('process_wrap'),Process=binding.Process,original=Process.prototype.spawn;if(original&&!original.__autopromptTrace){const wrapped=function(...args){let result;try{result=original.apply(this,args)}finally{const options=args[0]||{};const cwd=typeof options.cwd==='string'?options.cwd:'';let errorName=null;try{if(typeof result==='number'&&result<0)errorName=require('node:util').getSystemErrorName(result)}catch{}emit('native-spawn-result',null,JSON.stringify({nativeResult:typeof result==='number'?result:null,nativeErrorName:errorName,pid:Number.isInteger(this.pid)?this.pid:null,cwdLength:cwd.length}))}return result};wrapped.__autopromptTrace=true;Process.prototype.spawn=wrapped}}catch(error){emit('native-spawn-hook-error',error)}",
     " process.on('uncaughtExceptionMonitor',error=>emit('uncaught-exception',error))",
     " process.on('exit',code=>emit('exit-'+code))",
     " setImmediate(()=>emit('module-turn')).unref()",
@@ -76,7 +77,7 @@ function createOwnedProxyBootDiagnostic(root) {
   return { NODE_OPTIONS: `--require=${JSON.stringify(preload)}`, AUTOPROMPT_OWNED_PROXY_BOOT_TRACE: trace }
 }
 
-test('owned proxy diagnostic preload preserves quoted literal path characters', t => {
+test('owned proxy diagnostic preload preserves quoted literal path characters', async t => {
   const parent = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'proxy-preload-quote-')))
   t.after(() => fs.rmSync(parent, { recursive: true, force: true }))
   const root = path.join(parent, 'literal\\component with space')
@@ -87,14 +88,29 @@ test('owned proxy diagnostic preload preserves quoted literal path characters', 
   })
   assert.ifError(rawQuoted.error)
   assert.notEqual(rawQuoted.status, 0, 'raw NODE_OPTIONS quoting must not silently pass a literal backslash path')
-  const result = cp.spawnSync(process.execPath, ['-e', '', '--', '--owned-codex-proxy'], {
-    encoding: 'utf8', env: { ...process.env, ...diagnostic }, timeout: 30000,
+  const nested = 'const cp=require("node:child_process");const c=cp.spawn(process.execPath,["-e","process.stdout.write(\\"owned-spawn-ok\\")"],{stdio:["ignore","pipe","pipe"]});let out="";c.stdout.on("data",b=>out+=b);c.on("close",(code)=>{process.stdout.write(out);process.exit(code||0)})'
+  const result = await new Promise((resolve, reject) => {
+    const child = cp.spawn(process.execPath, ['-e', nested, '--', '--owned-codex-proxy'], {
+      encoding: 'utf8', env: { ...process.env, ...diagnostic }, stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000,
+    })
+    let stdout = '', stderr = ''
+    child.stdout.on('data', bytes => { stdout += bytes })
+    child.stderr.on('data', bytes => { stderr += bytes })
+    child.once('error', reject)
+    child.once('close', (status, signal) => resolve({ status, signal, stdout, stderr }))
   })
-  assert.ifError(result.error)
   assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, 'owned-spawn-ok')
   const records = fs.readFileSync(diagnostic.AUTOPROMPT_OWNED_PROXY_BOOT_TRACE, 'utf8').trim().split('\n').map(JSON.parse)
   assert.ok(records.some(record => record.phase === 'preload-enter'))
   assert.ok(records.every(record => record.node === process.version))
+  const nativeSpawn = records.find(record => record.phase === 'native-spawn-result')
+  assert.ok(nativeSpawn)
+  const spawnResult = JSON.parse(nativeSpawn.message)
+  assert.equal(spawnResult.nativeResult, 0)
+  assert.equal(spawnResult.nativeErrorName, null)
+  assert.ok(Number.isInteger(spawnResult.pid) && spawnResult.pid > 0)
+  assert.equal(spawnResult.cwdLength, 0)
 })
 
 test('Windows Job cwd bridge cleanup remains owned until its terminal publication', () => {

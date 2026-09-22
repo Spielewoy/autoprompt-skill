@@ -113,6 +113,65 @@ class CleanupRegistry {
     }
     this.cleanup = options.cleanup || null
     this.randomId = options.randomId || (() => crypto.randomUUID())
+    if (options.externalRootValidator !== undefined &&
+        typeof options.externalRootValidator !== 'function') {
+      fail('CLEANUP_CONFIG_INVALID', 'external cleanup root validator must be a function')
+    }
+    this.externalRootValidator = options.externalRootValidator || null
+  }
+
+  registerExternalRoot(entry) {
+    if (!entry || typeof entry.path !== 'string' || !path.isAbsolute(entry.path)) {
+      fail('CLEANUP_EXTERNAL_ROOT_INVALID', 'external cleanup root requires an absolute path')
+    }
+    if (!this.externalRootValidator) {
+      fail('CLEANUP_CONFIG_INVALID', 'external cleanup root requires its caller policy validator')
+    }
+    if ((entry.id !== undefined && (typeof entry.id !== 'string' || !entry.id)) ||
+        (entry.kind !== undefined && (typeof entry.kind !== 'string' || !entry.kind)) ||
+        (entry.owner !== undefined && entry.owner !== null && typeof entry.owner !== 'string')) {
+      fail('CLEANUP_EXTERNAL_ROOT_INVALID', 'external cleanup root identity fields are invalid')
+    }
+    const target = path.resolve(entry.path)
+    if (this.allowedRoots.some(root => this._pathsOverlap(root, target))) {
+      fail('CLEANUP_EXTERNAL_ROOT_INVALID', 'external cleanup root overlaps an ordinary cleanup root')
+    }
+    const identities = this._inspectOwnedTarget(target)
+    if (identities.targetIdentity.type !== 'directory') {
+      fail('CLEANUP_EXTERNAL_ROOT_INVALID', 'external cleanup root is not a physical directory')
+    }
+    const registry = this.load()
+    const roots = registry.externalRoots || (registry.externalRoots = [])
+    if (roots.some(root => this._pathsOverlap(root.path, target) ||
+        (root.status !== 'CLEANED' && root.id === entry.id))) {
+      fail('CLEANUP_EXTERNAL_ROOT_DUPLICATE', 'external cleanup root duplicates or overlaps registered authority')
+    }
+    const descriptor = {
+      id: entry.id || this.randomId(),
+      path: target,
+      kind: entry.kind || 'external-root',
+      owner: entry.owner || null,
+      registeredAt: String(this.clock()),
+      status: 'REGISTERED',
+      cleanedAt: null,
+      parentIdentity: identities.parentIdentity,
+      targetIdentity: identities.targetIdentity,
+    }
+    this._validateExternalRootPolicy(descriptor, 'register')
+    roots.push(descriptor)
+    this._write(registry)
+    return Object.freeze({ ...descriptor })
+  }
+
+  getExternalRoot(id) {
+    if (typeof id !== 'string' || !id) {
+      fail('CLEANUP_EXTERNAL_ROOT_INVALID', 'external cleanup root id is invalid')
+    }
+    const root = (this.load().externalRoots || []).find(entry =>
+      entry.id === id && entry.status === 'REGISTERED')
+    if (!root) return null
+    this._verifyExternalRoot(root, 'use')
+    return Object.freeze({ ...root })
   }
 
   register(entry) {
@@ -120,9 +179,13 @@ class CleanupRegistry {
       fail('CLEANUP_ENTRY_INVALID', 'scratch registration requires an absolute path')
     }
     const target = path.resolve(entry.path)
-    if (!this.allowedRoots.some((root) => isWithin(root, target))) {
+    const registry = this.load()
+    const externalRoot = (registry.externalRoots || []).find(root =>
+      root.status === 'REGISTERED' && isWithin(root.path, target))
+    if (!this.allowedRoots.some((root) => isWithin(root, target)) && !externalRoot) {
       fail('CLEANUP_ENTRY_UNSAFE', `scratch path is outside registered cleanup roots: ${target}`)
     }
+    if (externalRoot) this._verifyExternalRoot(externalRoot, 'child-registration')
     const nativeCleanup = nativeCleanupMutations(this.fs)
     const identities = nativeCleanup ? nativeCleanup.inspectOwnedTarget(target) : this._withCleanupTarget(target, (anchoredTarget, _verify, parentIdentity) => ({
       parentIdentity,
@@ -134,7 +197,6 @@ class CleanupRegistry {
           .some(value => typeof value !== 'string' || !/^\d+$/.test(value))) {
       fail('CLEANUP_ENTRY_UNSAFE', 'cleanup authority returned an invalid physical identity')
     }
-    const registry = this.load()
     if (registry.entries.some((item) => item.path === target && item.status !== 'CLEANED')) {
       fail('CLEANUP_ENTRY_DUPLICATE', `scratch path is already registered: ${target}`)
     }
@@ -161,6 +223,7 @@ class CleanupRegistry {
         generationId: this.controlBinding.generationId,
         sequence: 0,
         entries: [],
+        externalRoots: [],
       }
     }
     let registry
@@ -184,6 +247,36 @@ class CleanupRegistry {
         typeof entry.targetIdentity.ino !== 'string' || !entry.targetIdentity.ino)) {
       fail('CLEANUP_REGISTRY_FAILURE', 'cleanup registry entries are invalid')
     }
+    if (registry.externalRoots !== undefined && !Array.isArray(registry.externalRoots)) {
+      fail('CLEANUP_REGISTRY_FAILURE', 'cleanup registry external roots are invalid')
+    }
+    const externalRoots = registry.externalRoots || []
+    if (externalRoots.some(root => !root || typeof root !== 'object' ||
+        typeof root.id !== 'string' || !root.id || typeof root.path !== 'string' ||
+        !path.isAbsolute(root.path) || path.resolve(root.path) !== root.path ||
+        typeof root.kind !== 'string' || !root.kind ||
+        (root.owner !== null && typeof root.owner !== 'string') ||
+        !['REGISTERED', 'CLEANED'].includes(root.status) ||
+        !root.parentIdentity || typeof root.parentIdentity.dev !== 'string' || !/^\d+$/.test(root.parentIdentity.dev) ||
+        typeof root.parentIdentity.ino !== 'string' || !/^\d+$/.test(root.parentIdentity.ino) ||
+        !root.targetIdentity || root.targetIdentity.type !== 'directory' ||
+        typeof root.targetIdentity.dev !== 'string' || !/^\d+$/.test(root.targetIdentity.dev) ||
+        typeof root.targetIdentity.ino !== 'string' || !/^\d+$/.test(root.targetIdentity.ino))) {
+      fail('CLEANUP_REGISTRY_FAILURE', 'cleanup registry external root descriptor is invalid')
+    }
+    for (let index = 0; index < externalRoots.length; index += 1) {
+      const root = externalRoots[index]
+      if (this.allowedRoots.some(allowed => this._pathsOverlap(allowed, root.path)) ||
+          externalRoots.slice(0, index).some(other =>
+            this._pathsOverlap(other.path, root.path) ||
+            (root.status === 'REGISTERED' && other.status === 'REGISTERED' && other.id === root.id))) {
+        fail('CLEANUP_REGISTRY_FAILURE', 'cleanup registry external roots overlap existing authority')
+      }
+      if (!this.externalRootValidator) {
+        fail('CLEANUP_CONFIG_INVALID', 'durable external cleanup roots require their caller policy validator')
+      }
+      this._validateExternalRootPolicy(root, 'load')
+    }
     const currentBinding = registry.activationId === this.controlBinding.activationId &&
       registry.generationId === this.controlBinding.generationId
     const authorizedPredecessor = registry.activationId === this.controlBinding.activationId &&
@@ -201,9 +294,12 @@ class CleanupRegistry {
       .sort((left, right) => left.path.localeCompare(right.path) || left.id.localeCompare(right.id))
     for (const entry of pending) {
       const target = path.resolve(entry.path)
-      if (!this.allowedRoots.some((root) => isWithin(root, target))) {
+      const externalRoot = (registry.externalRoots || []).find(root =>
+        root.status === 'REGISTERED' && isWithin(root.path, target))
+      if (!this.allowedRoots.some((root) => isWithin(root, target)) && !externalRoot) {
         fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup path is no longer safe: ${target}`)
       }
+      if (externalRoot) this._verifyExternalRoot(externalRoot, 'child-cleanup')
       const nativeCleanup = nativeCleanupMutations(this.fs)
       if (nativeCleanup) {
         if (this.cleanup) fail('CLEANUP_CONFIG_INVALID', 'native cleanup requires its bound removal operation')
@@ -245,7 +341,115 @@ class CleanupRegistry {
       entry.cleanedAt = String(this.clock())
       this._write(registry)
     }
+    for (const root of (registry.externalRoots || []).filter(root => root.status === 'REGISTERED')) {
+      if (registry.entries.some(entry => entry.status === 'REGISTERED' && isWithin(root.path, entry.path))) {
+        fail('CLEANUP_EXTERNAL_ROOT_NOT_EMPTY', 'external cleanup root still has registered descendants')
+      }
+      this._removeExternalRoot(root)
+      root.status = 'CLEANED'
+      root.cleanedAt = String(this.clock())
+      this._write(registry)
+    }
     return pending.map((entry) => ({ ...entry }))
+  }
+
+  _pathsOverlap(left, right) {
+    return left === right || isWithin(left, right) || isWithin(right, left)
+  }
+
+  _inspectOwnedTarget(target) {
+    const nativeCleanup = nativeCleanupMutations(this.fs)
+    const identities = nativeCleanup ? nativeCleanup.inspectOwnedTarget(target)
+      : this._withCleanupTarget(target, (anchoredTarget, _verify, parentIdentity) => ({
+        parentIdentity,
+        targetIdentity: cleanupTargetIdentity(this.fs.lstatSync(anchoredTarget), target),
+      }))
+    if (!identities || !identities.parentIdentity || !identities.targetIdentity ||
+        !['file', 'directory'].includes(identities.targetIdentity.type) ||
+        [identities.parentIdentity.dev, identities.parentIdentity.ino,
+          identities.targetIdentity.dev, identities.targetIdentity.ino]
+          .some(value => typeof value !== 'string' || !/^\d+$/.test(value))) {
+      fail('CLEANUP_ENTRY_UNSAFE', 'cleanup authority returned an invalid physical identity')
+    }
+    return identities
+  }
+
+  _validateExternalRootPolicy(root, phase) {
+    let accepted = false
+    try { accepted = this.externalRootValidator(Object.freeze({ ...root }), phase) === true } catch (error) {
+      fail('CLEANUP_EXTERNAL_ROOT_UNSAFE', 'external cleanup root failed caller policy validation', {
+        cause: error && (error.code || error.message),
+      })
+    }
+    if (!accepted) fail('CLEANUP_EXTERNAL_ROOT_UNSAFE', 'external cleanup root was refused by caller policy')
+  }
+
+  _verifyExternalRoot(root, phase) {
+    this._validateExternalRootPolicy(root, phase)
+    const live = this._inspectOwnedTarget(root.path)
+    if (live.parentIdentity.dev !== root.parentIdentity.dev ||
+        live.parentIdentity.ino !== root.parentIdentity.ino ||
+        !sameCleanupTargetIdentity(root.targetIdentity, live.targetIdentity)) {
+      fail('CLEANUP_EXTERNAL_ROOT_UNSAFE', 'external cleanup root changed physical identity')
+    }
+    return live
+  }
+
+  _removeExternalRoot(root) {
+    this._validateExternalRootPolicy(root, 'cleanup')
+    const nativeCleanup = nativeCleanupMutations(this.fs)
+    if (nativeCleanup) {
+      if (this.cleanup || typeof nativeCleanup.removeOwnedEmptyDirectory !== 'function') {
+        fail('CLEANUP_CONFIG_INVALID', 'native external cleanup requires its bound empty-directory removal operation')
+      }
+      const result = nativeCleanup.removeOwnedEmptyDirectory(
+        root.path, root.parentIdentity, root.targetIdentity,
+      )
+      if (!result || typeof result.removed !== 'boolean') {
+        fail('CLEANUP_EXTERNAL_ROOT_UNSAFE', 'native external cleanup did not confirm empty-root removal')
+      }
+      return
+    }
+    this._withCleanupTarget(root.path, (anchoredTarget, _verify, parentIdentity) => {
+      if (parentIdentity.dev !== root.parentIdentity.dev || parentIdentity.ino !== root.parentIdentity.ino) {
+        fail('CLEANUP_EXTERNAL_ROOT_UNSAFE', 'external cleanup root parent changed physical identity')
+      }
+      let initialItem
+      try { initialItem = this.fs.lstatSync(anchoredTarget) } catch (error) {
+        if (error && error.code === 'ENOENT') return
+        throw error
+      }
+      const initial = cleanupTargetIdentity(initialItem, root.path)
+      if (!sameCleanupTargetIdentity(root.targetIdentity, initial)) {
+        fail('CLEANUP_EXTERNAL_ROOT_UNSAFE', 'external cleanup root changed physical identity before removal')
+      }
+      let descriptor
+      try {
+        descriptor = this.fs.openSync(
+          anchoredTarget,
+          fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+        )
+        const opened = cleanupTargetIdentity(this.fs.fstatSync(descriptor), root.path)
+        if (!sameCleanupTargetIdentity(root.targetIdentity, opened)) {
+          fail('CLEANUP_EXTERNAL_ROOT_UNSAFE', 'external cleanup root changed while it was opened')
+        }
+        const anchor = directoryDescriptorAnchor(descriptor, this.fs)
+        if (this.fs.readdirSync(anchor).length !== 0) {
+          fail('CLEANUP_EXTERNAL_ROOT_NOT_EMPTY', 'external cleanup root contains unregistered residue')
+        }
+        const after = cleanupTargetIdentity(this.fs.fstatSync(descriptor), root.path)
+        const live = cleanupTargetIdentity(this.fs.lstatSync(anchoredTarget), root.path)
+        if (!sameCleanupTargetIdentity(root.targetIdentity, after) ||
+            !sameCleanupTargetIdentity(root.targetIdentity, live)) {
+          fail('CLEANUP_EXTERNAL_ROOT_UNSAFE', 'external cleanup root changed before removal')
+        }
+        this.fs.closeSync(descriptor)
+        descriptor = undefined
+        this.fs.rmdirSync(anchoredTarget)
+      } finally {
+        if (descriptor !== undefined) this.fs.closeSync(descriptor)
+      }
+    })
   }
 
   _withCleanupTarget(target, operation) {
