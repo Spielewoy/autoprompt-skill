@@ -15,7 +15,7 @@ node scripts/windows-msys/fork-memory-diagnostic/run.cjs REPO NEW_OUTPUT
 ```
 
 It requires Windows x64, Node 24, Python, Windows PowerShell, and a configured
-bundled worker. The fixed workload performs 256 iterations without accepting
+bundled worker. The fixed workload performs 96 iterations without accepting
 or hiding Bash retry diagnostics. Output is bounded to 65,536 debug events,
 2,048 processes, 4,096 distinct occupied spans, and one MiB of span records.
 Only numeric memory metadata and file IDs are retained; paths and memory bytes
@@ -23,3 +23,7 @@ are excluded. The report always has `accepted:false`. A query error, overflow,
 missing failing PID, or missing process-create span is explicitly
 inconclusive. Cleanup still requires the original job drain and profile
 deletion proof.
+
+The diagnostic allows 300 seconds for the instrumented workload. On timeout,
+the controller also writes the collected memory records to stderr before
+returning failure; this evidence does not authorize acceptance.

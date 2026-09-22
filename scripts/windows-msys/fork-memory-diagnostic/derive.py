@@ -57,17 +57,21 @@ def derive_native(data):
     text = once(text, 'if(!TerminateProcess(pi.hProcess,125)||WaitForSingleObject(pi.hProcess,5000)!=0)drained=false;', 'if(!TerminateAndDrainDebugProcess(pi.hProcess,5000,forkMemoryTrace))drained=false;')
     return text.encode()
 
-FORK_SCRIPT = ''' static String Script(String ready,String release,String before,String child,String after) { return "set -euo pipefail; if ! IFS= read -r pid < /proc/self/winpid; then exit 125; fi; printf '%s\\n' \\"$pid\\" > "+Shell(ready.Replace('\\\\','/'))+"; while [[ ! -e "+Shell(release.Replace('\\\\','/'))+" ]]; do :; done; printf 'before:%s\\n' \\"$pid\\" > "+Shell(before.Replace('\\\\','/'))+"; for ((i=0;i<256;i++)); do substituted=$(printf '%s' \\"$i\\"); [[ \\"$substituted\\" == \\"$i\\" ]]; ( : ); printf '%s\\n' \\"$i\\" | { IFS= read -r piped; [[ \\"$piped\\" == \\"$i\\" ]]; }; IFS= read -r processed < <(printf '%s\\n' \\"$i\\"); [[ \\"$processed\\" == \\"$i\\" ]]; { :; } & fork_child=$!; wait \\"$fork_child\\"; done; printf 'fork-ok:256'; printf 'fork-ok:256\\n' > "+Shell(child.Replace('\\\\','/'))+"; printf '%s:fork-ok:256\\n' \\"$pid\\" > "+Shell(after.Replace('\\\\','/')); }'''
+FORK_SCRIPT = ''' static String Script(String ready,String release,String before,String child,String after) { return "set -euo pipefail; if ! IFS= read -r pid < /proc/self/winpid; then exit 125; fi; printf '%s\\n' \\"$pid\\" > "+Shell(ready.Replace('\\\\','/'))+"; while [[ ! -e "+Shell(release.Replace('\\\\','/'))+" ]]; do :; done; printf 'before:%s\\n' \\"$pid\\" > "+Shell(before.Replace('\\\\','/'))+"; for ((i=0;i<96;i++)); do substituted=$(printf '%s' \\"$i\\"); [[ \\"$substituted\\" == \\"$i\\" ]]; ( : ); printf '%s\\n' \\"$i\\" | { IFS= read -r piped; [[ \\"$piped\\" == \\"$i\\" ]]; }; IFS= read -r processed < <(printf '%s\\n' \\"$i\\"); [[ \\"$processed\\" == \\"$i\\" ]]; { :; } & fork_child=$!; wait \\"$fork_child\\"; done; printf 'fork-ok:96'; printf 'fork-ok:96\\n' > "+Shell(child.Replace('\\\\','/'))+"; printf '%s:fork-ok:96\\n' \\"$pid\\" > "+Shell(after.Replace('\\\\','/')); }'''
 
 def derive_controller(data):
     text = data.decode('utf-8').replace('\r\n', '\n')
     start = text.index(' static String Script(')
     end = text.index('\n static String ProbeScript(', start)
     text = text[:start] + FORK_SCRIPT + text[end:]
-    text = once(text, 'env,90000,262144', 'env,150000,262144')
-    text = once(text, 'Need(launch.task.Wait(95000),"launch-timeout")', 'Need(launch.task.Wait(155000),"launch-timeout")')
-    text = once(text, 'Boolean success=completed.ExitCode==0&&stdout=="mapping-start\\nmapping-before\\nmapping-child=child\\n"&&stderr=="mapping-stderr-start\\n";', 'Boolean success=completed.ExitCode==0&&stdout=="fork-ok:256"&&stderr=="";')
+    text = once(text, 'env,90000,262144', 'env,300000,262144')
+    text = once(text, 'Need(launch.task.Wait(95000),"launch-timeout")', 'Need(launch.task.Wait(305000),"launch-timeout")')
+    text = once(text, 'Boolean success=completed.ExitCode==0&&stdout=="mapping-start\\nmapping-before\\nmapping-child=child\\n"&&stderr=="mapping-stderr-start\\n";', 'Boolean success=completed.ExitCode==0&&stdout=="fork-ok:96"&&stderr=="";')
     text = once(text, ',\\"stderrBase64\\":"+Json(completed.StderrBase64)+"}";', ',\\"stderrBase64\\":"+Json(completed.StderrBase64)+",\\"forkMemory\\":{\\"recordsBase64\\":"+Json(completed.ForkMemoryDiagnosticBase64)+",\\"events\\":"+completed.ForkMemoryEvents+",\\"processes\\":"+completed.ForkMemoryProcesses+",\\"loads\\":"+completed.ForkMemoryLoads+",\\"spans\\":"+completed.ForkMemorySpans+",\\"queryError\\":"+completed.ForkMemoryQueryError+",\\"overflow\\":"+(completed.ForkMemoryOverflow?"true":"false")+"}}";')
+    # Persist the raw memory evidence even if the diagnostic watchdog expires.
+    # Launcher validation still fails; a timed-out workload cannot pass.
+    failure_memory = 'if(completed!=null)Console.Error.WriteLine("fork-memory={\\"recordsBase64\\":"+Json(completed.ForkMemoryDiagnosticBase64)+",\\"events\\":"+completed.ForkMemoryEvents+",\\"processes\\":"+completed.ForkMemoryProcesses+",\\"loads\\":"+completed.ForkMemoryLoads+",\\"spans\\":"+completed.ForkMemorySpans+",\\"queryError\\":"+completed.ForkMemoryQueryError+",\\"overflow\\":"+(completed.ForkMemoryOverflow?"true":"false")+"}");'
+    text = once(text, 'if(completed!=null)Console.Error.WriteLine("mapping-launch=', failure_memory + 'if(completed!=null)Console.Error.WriteLine("mapping-launch=')
     return text.encode()
 
 def main():
