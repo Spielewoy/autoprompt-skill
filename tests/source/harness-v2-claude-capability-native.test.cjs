@@ -24,6 +24,31 @@ const { modelService } = require('../helpers/harness-native-service.cjs')
 const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment, waitForNativeObservation } = require('../helpers/native-platform.cjs')
 const CLI = requiredNativeCli('claude')
 
+function nativeFailureFiles(roots) {
+  const pending = [...new Set(roots.filter(Boolean))], output = []
+  let directories = 0
+  while (pending.length && directories++ < 32 && output.length < 8) {
+    const directory = pending.pop()
+    try {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true }).slice(0, 128)) {
+        const file = path.join(directory, entry.name)
+        if (entry.isDirectory() && pending.length < 32) pending.push(file)
+        else if (entry.isFile() && /(?:stderr|launch-\d+)\.log$/.test(entry.name) && output.length < 8) {
+          const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+          try {
+            const stat = fs.fstatSync(fd)
+            if (!stat.isFile() || stat.nlink !== 1) continue
+            const bytes = Buffer.alloc(Math.min(8192, stat.size))
+            const size = fs.readSync(fd, bytes, 0, bytes.length, Math.max(0, stat.size - bytes.length))
+            if (size) output.push({ file: entry.name, bytes: stat.size, tail: bytes.subarray(0, size).toString('utf8') })
+          } finally { fs.closeSync(fd) }
+        }
+      }
+    } catch {} // Preserve the original native error if its diagnostics disappear.
+  }
+  return output
+}
+
 function createFixture() {
   const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'claude-capability-native-')))
   const target = privateDirectory(path.join(root, 'target')), controller = privateDirectory(path.join(root, 'controller'))
@@ -117,7 +142,7 @@ async function scenario(t, options = {}) {
   }
   const f = createFixture()
   markPhase('fixture-ready')
-  let service, owner
+  let service, owner, vendorDebugRoot
   t.after(async () => {
     markPhase('cleanup-start')
     try {
@@ -125,7 +150,11 @@ async function scenario(t, options = {}) {
       markPhase('owner-drained')
     } finally {
       try { if (service) await service.close(); markPhase('service-closed') }
-      finally { fs.rmSync(f.root, { recursive: true, force: true }); markPhase('cleanup-end') }
+      finally {
+        fs.rmSync(f.root, { recursive: true, force: true })
+        if (vendorDebugRoot) fs.rmSync(vendorDebugRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+        markPhase('cleanup-end')
+      }
     }
   })
   const candidate = path.join(f.target, 'candidate.txt')
@@ -143,9 +172,34 @@ async function scenario(t, options = {}) {
   const binding = native.probeExecutable({ provider: 'claude', executable: CLI })
   owner = registeredProcessOwner(f)
   markPhase('owner-ready')
+  const launchShapes = []
+  const ownedLaunch = owner.launch.bind(owner)
+  owner.launch = async spec => {
+    markPhase('owned-launch-start')
+    try { const owned = await ownedLaunch(spec); markPhase('owned-launch-ready'); return owned }
+    catch (error) { markPhase('owned-launch-failed'); throw error }
+  }
   const processAdapter = owner.adapter
   const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'claude-closed-native-canary', pollMs: 10 })
+  if (process.platform === 'win32' && process.env.AUTOPROMPT_NATIVE_TEST_EVIDENCE_ROOT) {
+    vendorDebugRoot = require('../../agents/codex/workflow/safe-run-root.js').createWindowsCompilerDirectory('ap-claude-debug-')
+  }
+  const ownedRun = runner.run.bind(runner)
+  runner.run = spec => {
+    markPhase('proxy-run-start')
+    const settings = spec.argv.indexOf('--settings')
+    if (launchShapes.length < 8) launchShapes.push({
+      executableLength: spec.executable.length, cwdLength: spec.cwd.length,
+      settingsLength: settings >= 0 ? spec.argv[settings + 1]?.length : undefined,
+      environmentPathLengths: Object.fromEntries(['HOME', 'USERPROFILE', 'CLAUDE_CONFIG_DIR', 'TEMP', 'TMP'].map(key => {
+        const actual = Object.keys(spec.env).find(name => name.toUpperCase() === key)
+        return [key, typeof spec.env[actual] === 'string' ? spec.env[actual].length : null]
+      })),
+    })
+    if (vendorDebugRoot) spec = { ...spec, argv: [...spec.argv, '--debug-file', path.join(vendorDebugRoot, `launch-${launchShapes.length}.log`)] }
+    return ownedRun(spec)
+  }
   const adapter = new HarnessExecAdapter({
     provider: 'claude', runner, nativeRoot: f.nativeRoot, executableBinding: binding,
     targetPath: f.target, connection: { model: 'claude-sonnet-4-6', environment: { ANTHROPIC_BASE_URL: service.url } },
@@ -215,6 +269,8 @@ async function scenario(t, options = {}) {
         code: typeof launchError?.code === 'string' ? launchError.code.slice(0, 80) : undefined,
         message: String(launchError?.message || 'Native launch failed').slice(0, 512),
       }
+      diagnostic.launchShapes = launchShapes.slice(-8)
+      diagnostic.nativeFailureFiles = nativeFailureFiles([f.controller, path.dirname(owner.registryPath), vendorDebugRoot])
       t.diagnostic(`CLAUDE_TOOL_RESULT_DIAGNOSTIC:${JSON.stringify(diagnostic)}`)
       throw launchError
     }
@@ -321,31 +377,7 @@ test('claude closed native capability: full canonical role schema is accepted an
     onProviderRequestStarted() {}, onProviderRequestSettled() {}, onUnknownProviderSpend() {},
     onEvent(event) { if (event.type === 'tool_progress' && event.heartbeat === true) heartbeats.push(event) },
   }
-  try { result = await f.run(quotaHooks) } catch (error) {
-    const pending = [f.controller]
-    let directories = 0, files = 0
-    while (pending.length && directories < 32 && files < 8) {
-      const directory = pending.pop()
-      directories += 1
-      try {
-        for (const entry of fs.readdirSync(directory, { withFileTypes: true }).slice(0, 128)) {
-          const item = path.join(directory, entry.name)
-          if (entry.isDirectory() && pending.length < 32) pending.push(item)
-          else if (entry.isFile() && entry.name === 'stderr.log' && files < 8) {
-            const fd = fs.openSync(item, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
-            try {
-              const stat = fs.fstatSync(fd)
-              if (!stat.isFile() || stat.nlink !== 1) continue
-              const bytes = Buffer.alloc(4096)
-              process.stderr.write(bytes.subarray(0, fs.readSync(fd, bytes, 0, bytes.length, 0)))
-              files += 1
-            } finally { fs.closeSync(fd) }
-          }
-        }
-      } catch {} // Diagnostic failure must preserve the original native error.
-    }
-    throw error
-  }
+  result = await f.run(quotaHooks)
   assert.match(result.contextId, /^[0-9a-f-]{36}$/i)
   assert.ok(heartbeats.length > 0, 'the installed CLI must emit an actual heartbeat for the slow owned command')
   assert.ok(heartbeats.every(event => event.parent_tool_use_id === 'fixture-native-read' &&

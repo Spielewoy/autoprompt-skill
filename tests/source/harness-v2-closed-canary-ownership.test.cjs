@@ -36,7 +36,8 @@ test('closed owned-test durably publishes synchronous spawn refusal and bounded 
   const preload = path.join(root, 'refuse-spawn.cjs')
   fs.writeFileSync(preload, "const cp=require('node:child_process');cp.spawn=()=>{const e=new Error('forced closed spawn refusal');e.code='ENAMETOOLONG';throw e}\n")
   const request = { argv: ['-e', 'process.exit(0)'], cwd: root, env: { PATH: process.env.PATH },
-    status: `${stem}.status.json`, stdoutPath: `${stem}.stdout.log`, stderrPath: `${stem}.stderr.log`, postStatusDelayMs: 0 }
+    status: `${stem}.status.json`, stdoutPath: `${stem}.stdout.log`, stderrPath: `${stem}.stderr.log`,
+    failureMarker: `${stem}.failure.json`, failFastTap: false, postStatusDelayMs: 0 }
   const requestPath = `${stem}.json`
   fs.writeFileSync(requestPath, JSON.stringify(request))
   const result = cp.spawnSync(process.execPath, ['--require', preload,
@@ -57,7 +58,7 @@ test('closed owned-test durably publishes synchronous spawn refusal and bounded 
   const malformedId = crypto.randomUUID(), malformedStem = path.join(root, `outer-${malformedId}`)
   const malformedPath = `${malformedStem}.json`
   fs.writeFileSync(malformedPath, JSON.stringify({ ...request, status: foreign,
-    stdoutPath: `${malformedStem}.stdout.log`, stderrPath: `${malformedStem}.stderr.log` }))
+    stdoutPath: `${malformedStem}.stdout.log`, stderrPath: `${malformedStem}.stderr.log`, failureMarker: `${malformedStem}.failure.json` }))
   const malformed = cp.spawnSync(process.execPath,
     [path.resolve(__dirname, '../../scripts/harness-v2-closed-canary.cjs'), '--closed-owned-test', malformedPath],
     { cwd: root, encoding: 'utf8', timeout: 10000 })
@@ -69,7 +70,8 @@ test('closed owned-test durably publishes synchronous spawn refusal and bounded 
 
   const overflowId = crypto.randomUUID(), overflowStem = path.join(root, `outer-${overflowId}`)
   const overflowRequest = { ...request, argv: ['-e', "process.stdout.write(Buffer.alloc(4*1024*1024+65536,120))"],
-    status: `${overflowStem}.status.json`, stdoutPath: `${overflowStem}.stdout.log`, stderrPath: `${overflowStem}.stderr.log` }
+    status: `${overflowStem}.status.json`, stdoutPath: `${overflowStem}.stdout.log`, stderrPath: `${overflowStem}.stderr.log`,
+    failureMarker: `${overflowStem}.failure.json` }
   const overflowPath = `${overflowStem}.json`
   fs.writeFileSync(overflowPath, JSON.stringify(overflowRequest))
   const overflow = cp.spawnSync(process.execPath,
@@ -89,12 +91,61 @@ test('closed canary timeout retains bounded live child output before terminal st
   const value = binding(root); privateDirectory(value.ownershipRoot)
   const owner = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: path.join(root, 'outer.json'), pollMs: 10 })
   await assert.rejects(ownedTest(owner, root, environment(value), ['-e',
-    "process.stdout.write('live-stdout\\n');process.stderr.write('live-stderr\\n');setTimeout(()=>{},30000)"], 500), { code: 'LOCAL_CANARY_TIMEOUT' })
+    "process.stdout.write('live-stdout\\nnot ok 1 - default owned test does not fail fast\\n');process.stderr.write('live-stderr\\n');setTimeout(()=>{},30000)"], 500), { code: 'LOCAL_CANARY_TIMEOUT' })
   const stdoutPath = fs.readdirSync(root).find(name => /^outer-[a-f0-9-]{36}\.stdout\.log$/.test(name))
   const stderrPath = fs.readdirSync(root).find(name => /^outer-[a-f0-9-]{36}\.stderr\.log$/.test(name))
-  assert.equal(fs.readFileSync(path.join(root, stdoutPath), 'utf8'), 'live-stdout\n')
+  assert.equal(fs.readFileSync(path.join(root, stdoutPath), 'utf8'), 'live-stdout\nnot ok 1 - default owned test does not fail fast\n')
   assert.equal(fs.readFileSync(path.join(root, stderrPath), 'utf8'), 'live-stderr\n')
   assert.equal(fs.readdirSync(root).some(name => /^outer-[a-f0-9-]{36}\.status\.json$/.test(name)), false)
+  assert.equal(fs.readdirSync(root).some(name => /^outer-[a-f0-9-]{36}\.failure\.json$/.test(name)), false)
+})
+
+test('closed canary capability batch fails promptly on one complete top-level TAP failure marker', async t => {
+  if (process.platform === 'win32') return t.skip('portable POSIX process-group regression')
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-tap-failure-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const value = binding(root); privateDirectory(value.ownershipRoot)
+  const owner = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: path.join(root, 'outer.json'), pollMs: 10 })
+  const began = Date.now()
+  await assert.rejects(ownedTest(owner, root, environment(value), ['-e',
+    "process.stdout.write('TAP version 13\\nnot ok 1 - first failing native case\\n');setTimeout(()=>process.stdout.write('# late vendor startup diagnostic\\n'),50);setTimeout(()=>{},30000)"],
+  10000, undefined, { failFastTap: true }), error => error.code === 'LOCAL_CANARY_FAILED' && /first failing native case/.test(error.message))
+  assert.ok(Date.now() - began < 2000)
+  assert.deepEqual(owner.ownershipIdentities(), [])
+  const markerName = fs.readdirSync(root).find(name => /^outer-[a-f0-9-]{36}\.failure\.json$/.test(name))
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, markerName), 'utf8')),
+    { schemaVersion: 1, case: 'first failing native case', message: 'not ok 1 - first failing native case' })
+  const stdoutName = fs.readdirSync(root).find(name => /^outer-[a-f0-9-]{36}\.stdout\.log$/.test(name))
+  assert.match(fs.readFileSync(path.join(root, stdoutName), 'utf8'), /# late vendor startup diagnostic/)
+
+  const oversizedRoot = privateDirectory(path.join(root, 'oversized-line'))
+  const oversizedValue = binding(oversizedRoot); privateDirectory(oversizedValue.ownershipRoot)
+  const oversizedOwner = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: path.join(oversizedRoot, 'outer.json'), pollMs: 10 })
+  await assert.rejects(ownedTest(oversizedOwner, oversizedRoot, environment(oversizedValue), ['-e',
+    "process.stdout.write('x'.repeat(5000));setTimeout(()=>process.stdout.write('not ok 9 - mid-line false failure\\n'),50);setTimeout(()=>{},30000)"],
+  500, undefined, { failFastTap: true }), { code: 'LOCAL_CANARY_TIMEOUT' })
+  assert.equal(fs.readdirSync(oversizedRoot).some(name => name.endsWith('.failure.json')), false)
+})
+
+test('closed canary capability batch treats a malformed TAP failure marker as a failure', async () => {
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-bad-marker-')))
+  const value = binding(root); privateDirectory(value.ownershipRoot)
+  let requestPath, cancelled = false
+  const owner = {
+    adapter: { async listOwned() { return [123] } },
+    async launch(spec) {
+      requestPath = spec.argv[2]
+      const request = JSON.parse(fs.readFileSync(requestPath, 'utf8'))
+      fs.writeFileSync(request.failureMarker, Buffer.alloc(4097, 120))
+      return { ownershipId: 'bad-marker', groupIdentity: 'bad-marker-group' }
+    },
+    async cancelAll() { cancelled = true },
+  }
+  try {
+    await assert.rejects(ownedTest(owner, root, environment(value), ['-e', 'process.exit(0)'],
+      10000, undefined, { failFastTap: true }), { code: 'LOCAL_CANARY_FAILED' })
+    assert.equal(cancelled, true)
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
 test('closed canary detects an empty owned launcher before its batch deadline', async () => {
@@ -120,15 +171,19 @@ test('closed canary preserves cancellation and deadline authority across an awai
   const abortRoot = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-query-abort-')))
   const abortValue = binding(abortRoot); privateDirectory(abortValue.ownershipRoot)
   const controller = new AbortController()
-  let abortCancelled = false
+  let abortCancelled = false, abortRequestPath
   const abortOwner = {
-    adapter: { async listOwned() { controller.abort(); return [] } },
-    async launch() { return { ownershipId: 'query-abort', groupIdentity: 'query-abort-group' } },
+    adapter: { async listOwned() {
+      const request = JSON.parse(fs.readFileSync(abortRequestPath, 'utf8'))
+      fs.writeFileSync(request.failureMarker, JSON.stringify({ schemaVersion: 1, case: 'late failure', message: 'not ok 1 - late failure' }))
+      controller.abort(); return []
+    } },
+    async launch(spec) { abortRequestPath = spec.argv[2]; return { ownershipId: 'query-abort', groupIdentity: 'query-abort-group' } },
     async cancelAll() { abortCancelled = true },
   }
   try {
     await assert.rejects(ownedTest(abortOwner, abortRoot, environment(abortValue), ['-e', 'process.exit(0)'],
-      10000, controller.signal), { code: 'CHILD_CANCELLED' })
+      10000, controller.signal, { failFastTap: true }), { code: 'CHILD_CANCELLED' })
     assert.equal(abortCancelled, true)
   } finally { fs.rmSync(abortRoot, { recursive: true, force: true }) }
 
@@ -139,6 +194,7 @@ test('closed canary preserves cancellation and deadline authority across an awai
     adapter: { async listOwned() {
       now = 111
       const request = JSON.parse(fs.readFileSync(requestPath, 'utf8'))
+      fs.writeFileSync(request.failureMarker, JSON.stringify({ schemaVersion: 1, case: 'late failure', message: 'not ok 1 - late failure' }))
       fs.writeFileSync(request.status, JSON.stringify({ code: 0, signal: null, error: null, stdout: '', stderr: '' }))
       return []
     } },
@@ -147,7 +203,7 @@ test('closed canary preserves cancellation and deadline authority across an awai
   }
   try {
     await assert.rejects(ownedTest(deadlineOwner, deadlineRoot, environment(deadlineValue), ['-e', 'process.exit(0)'],
-      10, undefined, { wallNowMs: () => now }), { code: 'LOCAL_CANARY_TIMEOUT' })
+      10, undefined, { wallNowMs: () => now, failFastTap: true }), { code: 'LOCAL_CANARY_TIMEOUT' })
     assert.equal(deadlineCancelled, true)
   } finally { fs.rmSync(deadlineRoot, { recursive: true, force: true }) }
 })

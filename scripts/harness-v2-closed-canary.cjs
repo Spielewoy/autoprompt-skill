@@ -4,6 +4,7 @@
 // is checked and committed to its own immutable observation artifact.  A TAP
 // aggregate therefore cannot stand in for a capability result.
 const cp = require('node:child_process'), crypto = require('node:crypto'), fs = require('node:fs'), path = require('node:path')
+const { StringDecoder } = require('node:string_decoder')
 const { ProcessOwner, createPlatformProcessAdapter, prepareProcessLaunchEnvironment } = require('../agents/codex/workflow/process-owner.js')
 const { auditPrivatePermissions, ensureWindowsPrivateAcl, inspectPathNoFollow } = require('../agents/codex/workflow/safe-run-root.js')
 const hash = value => crypto.createHash('sha256').update(value).digest('hex')
@@ -11,6 +12,26 @@ const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const keys = Object.freeze({ claude:'AUTOPROMPT_CLAUDE_TEST_CLI',opencode:'AUTOPROMPT_OPENCODE_TEST_CLI',kilo:'AUTOPROMPT_KILO_TEST_CLI',prime:'AUTOPROMPT_PRIME_TEST_CLI',omp:'AUTOPROMPT_OMP_TEST_CLI',deepseek:'AUTOPROMPT_DEEPSEEK_TEST_CLI',vscode:'AUTOPROMPT_VSCODE_TEST_CLI',hermes:'AUTOPROMPT_HERMES_TEST_CLI',grok:'AUTOPROMPT_GROK_TEST_CLI',reasonix:'AUTOPROMPT_REASONIX_TEST_CLI' })
 function fail(code, message) { const error = new Error(message); error.code = code; throw error }
 function regular(file) { const stat = fs.lstatSync(file); if (!stat.isFile() || stat.isSymbolicLink()) fail('LOCAL_CANARY_INVALID', 'canary artifact is not regular'); return fs.readFileSync(file) }
+function boundedRegular(file, maximum) {
+  const before = fs.lstatSync(file)
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > maximum) fail('LOCAL_CANARY_INVALID', 'bounded canary artifact is invalid')
+  const handle = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+  try {
+    const opened = fs.fstatSync(handle)
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino || opened.size > maximum) {
+      fail('LOCAL_CANARY_INVALID', 'bounded canary artifact changed while opening')
+    }
+    const output = Buffer.alloc(maximum + 1)
+    let offset = 0
+    while (offset < output.length) {
+      const count = fs.readSync(handle, output, offset, output.length - offset, null)
+      if (!count) break
+      offset += count
+    }
+    if (offset > maximum) fail('LOCAL_CANARY_INVALID', 'bounded canary artifact exceeds its limit')
+    return output.subarray(0, offset)
+  } finally { fs.closeSync(handle) }
+}
 function closedEnvironment(input = {}, provider, root, options = {}) {
   const windows = (options.platform || process.platform) === 'win32'
   if (windows) input = require('../agents/codex/workflow/process-owner.js').normalizeWindowsChildEnvironment(input)
@@ -118,6 +139,7 @@ async function drainRegistered(root, binding, options = {}) {
 }
 async function ownedTest(owner, root, env, argv, timeoutMs = 300000, signal, options = {}) {
   const postStatusDelayMs = options.postStatusDelayMs === undefined ? 0 : options.postStatusDelayMs
+  const failFastTap = options.failFastTap === true
   const wallNowMs = options.wallNowMs || Date.now
   if (!Number.isSafeInteger(postStatusDelayMs) || postStatusDelayMs < 0 || postStatusDelayMs > 5000) {
     fail('LOCAL_CANARY_INVALID', 'closed owned-test post-status delay is invalid')
@@ -125,7 +147,8 @@ async function ownedTest(owner, root, env, argv, timeoutMs = 300000, signal, opt
   const id = crypto.randomUUID(), stem = path.join(root, `outer-${id}`)
   const request = `${stem}.json`, status = `${stem}.status.json`
   const stdoutPath = `${stem}.stdout.log`, stderrPath = `${stem}.stderr.log`
-  writeAtomic(request, JSON.stringify({ argv, cwd: root, env, status, stdoutPath, stderrPath, postStatusDelayMs }))
+  const failureMarker = `${stem}.failure.json`
+  writeAtomic(request, JSON.stringify({ argv, cwd: root, env, status, stdoutPath, stderrPath, failureMarker, failFastTap, postStatusDelayMs }))
   const reservationId = `closed-canary-${id}`
   const launchEnv = prepareProcessLaunchEnvironment(owner.adapter, reservationId, env)
   const deadline = wallNowMs() + timeoutMs
@@ -144,6 +167,18 @@ async function ownedTest(owner, root, env, argv, timeoutMs = 300000, signal, opt
     if (signal?.aborted) {
       await owner.cancelAll({ reason: 'closed native canary cancelled', graceMs: 500, killMs: 2000, waitForPending: true })
       fail('CHILD_CANCELLED', 'closed native canary was cancelled')
+    }
+    if (failFastTap && fs.existsSync(failureMarker)) {
+      let failure
+      try { failure = JSON.parse(boundedRegular(failureMarker, 4096)) } catch { failure = null }
+      if (!failure || failure.schemaVersion !== 1 || typeof failure.case !== 'string' || !failure.case || failure.case.length > 512 ||
+          typeof failure.message !== 'string' || !failure.message || failure.message.length > 1024 || /[\r\n]/u.test(failure.case + failure.message) ||
+          Object.keys(failure).sort().join(',') !== 'case,message,schemaVersion') {
+        await cleanFailedRun('closed native canary emitted an invalid TAP failure marker')
+        fail('LOCAL_CANARY_FAILED', 'owned native test emitted an invalid TAP failure marker')
+      }
+      await cleanFailedRun('closed native canary reported a failing TAP case')
+      fail('LOCAL_CANARY_FAILED', `owned native test failed: ${failure.case}`)
     }
     try { value = JSON.parse(regular(status)) } catch {}
     if (!value && typeof owner.adapter?.listOwned === 'function') {
@@ -232,6 +267,7 @@ async function run(options = {}) {
     if (timeoutMs <= 0) fail('LOCAL_CANARY_EXPIRED', 'review approval expired before native batch')
     const result = await ownedTest(owner, root, env, ['--test','--test-concurrency=1','--test-reporter=tap','--test-name-pattern',pattern,source], timeoutMs, signal, {
       platform, providerPrivateOwnershipRoot: activation.activationRoot, trustedOwnershipRoots: [activation.activationRoot], createPlatformAdapter: options.createPlatformAdapter,
+      failFastTap: true,
     })
     const output = `${result.stdout || ''}\n${result.stderr || ''}`
     if (result.error || result.code !== 0 || result.signal || /^not ok /m.test(output)) fail('LOCAL_CANARY_FAILED', `native case batch did not pass: ${relativeSource}`)
@@ -266,8 +302,9 @@ async function closedOwnedTest(requestPath) {
   const parentBefore = inspectPathNoFollow(parent)
   const request = JSON.parse(regular(absoluteRequest))
   const stem = match && path.join(parent, match[1])
-  const expected = stem && { status: `${stem}.status.json`, stdoutPath: `${stem}.stdout.log`, stderrPath: `${stem}.stderr.log` }
+  const expected = stem && { status: `${stem}.status.json`, stdoutPath: `${stem}.stdout.log`, stderrPath: `${stem}.stderr.log`, failureMarker: `${stem}.failure.json` }
   if (!match || !expected || request.status !== expected.status || request.stdoutPath !== expected.stdoutPath || request.stderrPath !== expected.stderrPath ||
+      request.failureMarker !== expected.failureMarker || typeof request.failFastTap !== 'boolean' ||
       typeof request.cwd !== 'string' || !path.isAbsolute(request.cwd) || !Array.isArray(request.argv) || request.argv.some(value => typeof value !== 'string') ||
       !request.env || typeof request.env !== 'object' || Array.isArray(request.env) || Object.entries(request.env).some(([key, value]) => !key || typeof value !== 'string') ||
       !Number.isSafeInteger(request.postStatusDelayMs) || request.postStatusDelayMs < 0 || request.postStatusDelayMs > 5000) {
@@ -289,6 +326,36 @@ async function closedOwnedTest(requestPath) {
   const maximum = 4 * 1024 * 1024
   const stdout = { bytes: 0, chunks: [] }, stderr = { bytes: 0, chunks: [] }
   let child = null, childError = null, settled = false, effectiveCwd = request.cwd
+  let tapPending = '', tapDiscarding = false, pendingTapFailure = null, failureMarkerWritten = false, failureMarkerTimer = null
+  const tapDecoder = new StringDecoder('utf8')
+  const publishTapFailure = () => {
+    if (!pendingTapFailure || failureMarkerWritten) return
+    if (failureMarkerTimer) { clearTimeout(failureMarkerTimer); failureMarkerTimer = null }
+    try { fs.writeFileSync(request.failureMarker, JSON.stringify(pendingTapFailure), { flag: 'wx', mode: 0o600 }); failureMarkerWritten = true }
+    catch (error) {
+      childError ||= Object.assign(new Error('owned native test could not publish its TAP failure marker'), { code: 'LOCAL_CANARY_INVALID', cause: error.code })
+      try { child?.kill('SIGKILL') } catch {}
+    }
+  }
+  const inspectTap = chunk => {
+    if (!request.failFastTap || pendingTapFailure || failureMarkerWritten) return
+    const text = tapDecoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    const lines = text.split('\n')
+    lines[0] = tapPending + lines[0]
+    tapPending = lines.pop()
+    for (const raw of lines) {
+      if (tapDiscarding) { tapDiscarding = false; continue }
+      if (raw.length > 4096) continue
+      const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw
+      const match = /^not ok \d+ - (.+)$/.exec(line)
+      if (!match) continue
+      const caseName = match[1].replace(/\s+#\s*(?:SKIP|TODO)\b.*$/u, '').slice(0, 512)
+      pendingTapFailure = { schemaVersion: 1, case: caseName || 'unnamed TAP case', message: line.slice(0, 1024) }
+      failureMarkerTimer = setTimeout(publishTapFailure, 250)
+      break
+    }
+    if (!pendingTapFailure && tapPending.length > 4096) { tapPending = ''; tapDiscarding = true }
+  }
   const append = (state, handle, chunk) => {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     const retained = bytes.subarray(0, Math.max(0, maximum - state.bytes))
@@ -301,6 +368,8 @@ async function closedOwnedTest(requestPath) {
   const finish = async (code, signal, error = null) => {
     if (settled) return
     settled = true
+    publishTapFailure()
+    error ||= childError
     const failure = boundedError(error)
     if (failure) append(stderr, stderrHandle, Buffer.from(`CLOSED_OWNED_TEST_FAILED:${JSON.stringify(failure)}\n`))
     for (const handle of [stdoutHandle, stderrHandle]) { try { fs.fsyncSync(handle) } catch {}; try { fs.closeSync(handle) } catch {} }
@@ -326,7 +395,7 @@ async function closedOwnedTest(requestPath) {
     const error = Object.assign(new Error('closed owned-test child lacks output streams'), { code: 'LOCAL_CANARY_INVALID' })
     childError = error; child.once('error', () => {}); child.once('close', (code, signal) => finish(code, signal, error)); try { child.kill('SIGKILL') } catch {}; return
   }
-  child.stdout.on('data', chunk => append(stdout, stdoutHandle, chunk))
+  child.stdout.on('data', chunk => { append(stdout, stdoutHandle, chunk); inspectTap(chunk) })
   child.stderr.on('data', chunk => append(stderr, stderrHandle, chunk))
   child.once('error', error => { childError = error })
   child.once('close', async (code, signal) => {

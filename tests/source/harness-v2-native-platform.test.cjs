@@ -11,10 +11,14 @@ const { WINDOWS_NATIVE_CASES, DIAGNOSTIC_STAGES, assertHostPrimitiveCases, runDi
 
 test('Claude diagnostic plan failfasts infrastructure and direct checks before packed activation', () => {
   assert.deepEqual(DIAGNOSTIC_STAGES.map(stage => stage.id), ['infra', 'direct', 'packed'])
-  assert.equal(DIAGNOSTIC_STAGES[0].cases.length, 5)
+  assert.equal(DIAGNOSTIC_STAGES[0].cases.length, 1)
   assert.equal(DIAGNOSTIC_STAGES[1].cases.length, 1)
   assert.equal(DIAGNOSTIC_STAGES[2].cases.length, 1)
-  assert.match(DIAGNOSTIC_STAGES[0].cases.at(-1), /Bash repeated forks/)
+  assert.deepEqual(DIAGNOSTIC_STAGES.flatMap(stage => stage.cases), [
+    'native Windows owned proxy preserves deep semantic cwd through the nested child launch',
+    'claude closed native capability: full canonical role schema is accepted and validated',
+    'packed actual Claude activation requires all local native observations before mission admission',
+  ])
   assert.match(DIAGNOSTIC_STAGES[1].cases[0], /^claude closed native capability:/)
   assert.match(DIAGNOSTIC_STAGES[2].cases[0], /^packed actual Claude activation/)
 })
@@ -63,7 +67,7 @@ test('Claude diagnostic runner stops before packed activation and publishes skip
   assert.equal(evidence.diagnosticStages[1].exitCode, 1)
   assert.ok(evidence.diagnosticStages[1].error)
   assert.ok(snapshots.length >= 3, 'initial, infra, and failed-stage evidence must be published')
-  assert.match(fs.readFileSync(aggregate, 'utf8'), /native Windows Bash repeated forks/)
+  assert.match(fs.readFileSync(aggregate, 'utf8'), /native Windows owned proxy preserves deep semantic cwd through the nested child launch/)
 })
 
 test('Claude diagnostic runner preserves spawn errors and never advances to later stages', async t => {

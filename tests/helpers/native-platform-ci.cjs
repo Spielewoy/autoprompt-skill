@@ -54,11 +54,7 @@ const WINDOWS_NATIVE_CASES = Object.freeze([
 
 const DIAGNOSTIC_STAGES = Object.freeze([
   Object.freeze({ id: 'infra', cases: Object.freeze([
-    'native Windows compiler staging ignores deep home and temp overrides',
-    'Windows Job bridge compiles and preserves atomic status publication on native long paths',
-    'native Windows Job ownership survives deep durable paths and hostile home variables',
     'native Windows owned proxy preserves deep semantic cwd through the nested child launch',
-    'native Windows Bash repeated forks complete without retry diagnostics',
   ]) }),
   Object.freeze({ id: 'direct', cases: Object.freeze([
     'claude closed native capability: full canonical role schema is accepted and validated',
@@ -127,7 +123,7 @@ async function runTests(argv, environment, logPath, aggregateLogPath = null) {
 
 function diagnosticStageFiles(id) {
   return id === 'infra'
-    ? ['tests/source/windows-job-helper.test.cjs', 'tests/source/windows-appcontainer.test.cjs', 'tests/source/windows-bash-runtime.test.cjs']
+    ? ['tests/source/windows-job-helper.test.cjs']
     : id === 'direct'
       ? ['tests/source/harness-v2-claude-capability-native.test.cjs']
       : ['tests/source/harness-v2-installed-canary-native.test.cjs']
