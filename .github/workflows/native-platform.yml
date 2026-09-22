@@ -16,6 +16,11 @@ on:
         required: false
         default: false
         type: boolean
+      msys_fork_memory:
+        description: 'Inspect native Windows fork address reservations without rebuilding the runtime'
+        required: false
+        default: false
+        type: boolean
       msys_pipe_trace:
         description: 'Run one manual-only MSYS pipe I/O trace build'
         required: false
@@ -43,7 +48,7 @@ permissions:
 
 jobs:
   platform-primitives:
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.claude_diagnostic != true && inputs.msys_mapping != true && inputs.msys_pipe_trace != true) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.claude_diagnostic != true && inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_fork_memory != true) }}
     name: Platform and installer / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
     # The one diagnostic producer may compile a separate traced DLL after the
@@ -673,7 +678,7 @@ jobs:
         run: node -e "process.exit(1)"
 
   claude-native:
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.msys_mapping != true && inputs.msys_pipe_trace != true && (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_fork_memory != true && (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)) }}
     name: Actual Claude 2.1.270 / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
     timeout-minutes: 45
@@ -727,16 +732,13 @@ jobs:
           if-no-files-found: warn
 
   msys-mapping:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.msys_mapping == true && inputs.msys_pipe_trace != true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' }}
-    name: MSYS mapping diagnostic / ${{ matrix.runner.os }} / Node 24.x
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.msys_mapping == true || inputs.msys_fork_memory == true) && inputs.msys_pipe_trace != true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' }}
+    name: ${{ inputs.msys_fork_memory == true && 'MSYS fork memory diagnostic' || 'MSYS mapping diagnostic' }} / ${{ matrix.runner.os }} / Node 24.x
     runs-on: ${{ matrix.runner.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix:
-        runner:
-          - { os: windows-latest, arch: x64 }
-          - { os: windows-11-arm, arch: arm64 }
+      matrix: ${{ fromJSON(inputs.msys_fork_memory == true && '{"runner":[{"os":"windows-latest","arch":"x64"}]}' || '{"runner":[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}]}') }}
     permissions:
       contents: read
       actions: read
@@ -747,6 +749,7 @@ jobs:
           node-version: 24.x
           architecture: ${{ matrix.runner.arch }}
       - name: Download and authenticate the pinned CI38 candidate
+        if: inputs.msys_fork_memory != true
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -811,15 +814,37 @@ jobs:
           node scripts/windows-msys/mapping-proof/run.cjs $PWD.Path $packet $output $probe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve native MSYS mapping diagnostic
-        if: always()
+        if: always() && inputs.msys_fork_memory != true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-msys-mapping-${{ matrix.runner.arch }}-node-24.x
           path: ${{ runner.temp }}/msys-mapping-proof
           if-no-files-found: error
 
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        if: inputs.msys_fork_memory == true
+        with:
+          python-version: '3.12'
+      - name: Observe the bundled runtime's fork memory reservations
+        if: inputs.msys_fork_memory == true
+        shell: pwsh
+        run: |
+          node scripts/windows-msys/fork-memory-diagnostic/run.cjs $PWD.Path (Join-Path $env:RUNNER_TEMP 'msys-fork-memory')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native fork memory observations
+        if: always() && inputs.msys_fork_memory == true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-fork-memory-${{ matrix.runner.arch }}-node-24.x
+          path: |
+            ${{ runner.temp }}/msys-fork-memory/*.json
+            ${{ runner.temp }}/msys-fork-memory/*.txt
+            ${{ runner.temp }}/msys-fork-memory/generated/*
+            ${{ runner.temp }}/msys-fork-memory/work/*.json
+          if-no-files-found: error
+
   msys-pipe-trace:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.msys_pipe_trace == true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.msys_pipe_trace == true && inputs.msys_fork_memory != true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' }}
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
