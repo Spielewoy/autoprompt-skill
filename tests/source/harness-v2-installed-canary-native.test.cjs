@@ -35,7 +35,7 @@ function execute(executable, argv, options = {}) {
   return result.stdout
 }
 
-test('packed actual Claude activation requires all local native observations before mission admission', { skip: !CLI, timeout: 1200000 }, async t => {
+test('packed actual Claude activation requires all local native observations before mission admission', { skip: !CLI, timeout: process.platform === 'win32' ? 2400000 : 1200000 }, async t => {
   const directory = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt native packed ')))
   let completed = false
   t.after(() => {
@@ -62,7 +62,7 @@ test('packed actual Claude activation requires all local native observations bef
   const configure = require(path.join(source, 'scripts/harness-v2-configure.cjs'))
   const env = nativeEnvironment()
   const activation = configure.prepareActivation({ provider: 'claude', root, target,
-    missionArgs: ['Validate the installed native canary only; do not execute a mission.'], executable: CLI, env, ttlSeconds: 1800 })
+    missionArgs: ['Validate the installed native canary only; do not execute a mission.'], executable: CLI, env, ttlSeconds: process.platform === 'win32' ? 3600 : 1800 })
   if (process.platform === 'win32') {
     assert.doesNotThrow(() => safeRunRoot.auditPrivatePermissions(path.dirname(activation.activationRoot), { recurse: false }))
     assert.doesNotThrow(() => safeRunRoot.auditPrivatePermissions(activation.activationRoot, { recurse: false }))
@@ -103,7 +103,7 @@ test('packed actual Claude activation requires all local native observations bef
   t.diagnostic(`Installed ${activation.executable.version} on ${process.platform}/${process.arch}; ${required.length} genuine native observations admitted`)
 })
 
-test(PUBLIC_CASE, { skip: !CLI, timeout: 1800000 }, async t => {
+test(PUBLIC_CASE, { skip: !CLI, timeout: process.platform === 'win32' ? 3720000 : 1800000 }, async t => {
   const directory = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt public native ')))
   let owner, endpoint, result, drained = false, completed = false
   t.after(async () => {
@@ -204,7 +204,7 @@ test(PUBLIC_CASE, { skip: !CLI, timeout: 1800000 }, async t => {
   owner = new ProcessOwner({ adapter: nativeProcessAdapter(registryPath, directory), registryPath, pollMs: 20 })
   try {
     result = await ownedTest(owner, executionRoot, environment, [publicCli, 'activate', 'claude', '--root', root,
-      '--target', target, '--ttl', '1080', '--', mission], 1140000)
+      '--target', target, '--ttl', process.platform === 'win32' ? '3600' : '1080', '--', mission], process.platform === 'win32' ? 3660000 : 1140000)
     fs.writeFileSync(path.join(directory, 'public-result.json'), JSON.stringify(result), { mode: 0o600 })
     assert.equal(result.error, undefined)
     assert.equal(result.signal, null)

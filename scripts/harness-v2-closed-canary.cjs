@@ -5,6 +5,7 @@
 // aggregate therefore cannot stand in for a capability result.
 const cp = require('node:child_process'), crypto = require('node:crypto'), fs = require('node:fs'), path = require('node:path')
 const { ProcessOwner, createPlatformProcessAdapter, prepareProcessLaunchEnvironment } = require('../agents/codex/workflow/process-owner.js')
+const { auditPrivatePermissions, ensureWindowsPrivateAcl, inspectPathNoFollow } = require('../agents/codex/workflow/safe-run-root.js')
 const hash = value => crypto.createHash('sha256').update(value).digest('hex')
 const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const keys = Object.freeze({ claude:'AUTOPROMPT_CLAUDE_TEST_CLI',opencode:'AUTOPROMPT_OPENCODE_TEST_CLI',kilo:'AUTOPROMPT_KILO_TEST_CLI',prime:'AUTOPROMPT_PRIME_TEST_CLI',omp:'AUTOPROMPT_OMP_TEST_CLI',deepseek:'AUTOPROMPT_DEEPSEEK_TEST_CLI',vscode:'AUTOPROMPT_VSCODE_TEST_CLI',hermes:'AUTOPROMPT_HERMES_TEST_CLI',grok:'AUTOPROMPT_GROK_TEST_CLI',reasonix:'AUTOPROMPT_REASONIX_TEST_CLI' })
@@ -44,6 +45,44 @@ function tapCases(output, cases) {
   }
 }
 function writeAtomic(file, value) { const temp = `${file}.${crypto.randomUUID()}`; fs.writeFileSync(temp, value, { flag: 'wx', mode: 0o600 }); fs.renameSync(temp, file) }
+function claimPrivateCanaryDirectory(directory, options = {}) {
+  const fsImpl = options.fsImpl || fs
+  let created = false
+  try {
+    fsImpl.mkdirSync(directory, { mode: 0o700 })
+    created = true
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error
+    if (options.allowExisting !== true) throw error
+    const inspect = options.inspectPathNoFollow || inspectPathNoFollow
+    const inspected = inspect(directory, { fsImpl })
+    if (!inspected.exists) throw Object.assign(new Error(`Private canary directory disappeared during validation: ${directory}`), { code: 'RUN_RECORD_UNSAFE' })
+    const audit = options.auditPrivatePermissions || auditPrivatePermissions
+    audit(directory, { recurse: false })
+  }
+  if (created && (options.platform || process.platform) === 'win32') {
+    const establish = options.ensureWindowsPrivateAcl || ensureWindowsPrivateAcl
+    try { establish(directory) }
+    catch (error) {
+      try { fsImpl.rmdirSync(directory) } catch {}
+      throw error
+    }
+  }
+  return directory
+}
+function closedCanaryBatchTimeout(options = {}) {
+  const { platform = process.platform, caseCount, approvalRemainingMs, activationRemainingMs } = options
+  if (!Number.isSafeInteger(caseCount) || caseCount < 1 ||
+      !Number.isFinite(approvalRemainingMs) || !Number.isFinite(activationRemainingMs)) {
+    fail('LOCAL_CANARY_INVALID', 'closed canary batch timeout inputs are invalid')
+  }
+  // Windows starts a fresh owned Job for every sequential case. Keep the
+  // shared execution budget and add only one bounded startup allowance per
+  // case; review and activation authority remain the absolute deadlines.
+  const workloadCeiling = platform === 'win32' ? 720000 + caseCount * 120000 : 720000
+  if (!Number.isSafeInteger(workloadCeiling)) fail('LOCAL_CANARY_INVALID', 'closed canary batch workload is too large')
+  return Math.min(workloadCeiling, approvalRemainingMs, activationRemainingMs)
+}
 function closedCanaryProcessAdapter(options = {}) {
   const { platform = process.platform, controlRoot, providerPrivateOwnershipRoot, trustedOwnershipRoots, createPlatformAdapter } = options
   if (!path.isAbsolute(controlRoot || '') || !path.isAbsolute(providerPrivateOwnershipRoot || '') ||
@@ -79,6 +118,7 @@ async function drainRegistered(root, binding, options = {}) {
 }
 async function ownedTest(owner, root, env, argv, timeoutMs = 300000, signal, options = {}) {
   const postStatusDelayMs = options.postStatusDelayMs === undefined ? 0 : options.postStatusDelayMs
+  const wallNowMs = options.wallNowMs || Date.now
   if (!Number.isSafeInteger(postStatusDelayMs) || postStatusDelayMs < 0 || postStatusDelayMs > 5000) {
     fail('LOCAL_CANARY_INVALID', 'closed owned-test post-status delay is invalid')
   }
@@ -86,11 +126,11 @@ async function ownedTest(owner, root, env, argv, timeoutMs = 300000, signal, opt
   writeAtomic(request, JSON.stringify({ argv, cwd: root, env, status, postStatusDelayMs }))
   const reservationId = `closed-canary-${id}`
   const launchEnv = prepareProcessLaunchEnvironment(owner.adapter, reservationId, env)
+  const deadline = wallNowMs() + timeoutMs
   const owned = await owner.launch({ executable: process.execPath, argv: [__filename, '--closed-owned-test', request], cwd: root, env: launchEnv,
     sessionId: `closed-canary-${id}`, reservationId, targetKey: `closed-canary:${path.basename(root)}`, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', forWork: false })
-  const deadline = Date.now() + timeoutMs
   let value = null
-  while (Date.now() < deadline && !value) {
+  while (wallNowMs() < deadline && !value) {
     if (signal?.aborted) {
       await owner.cancelAll({ reason: 'closed native canary cancelled', graceMs: 500, killMs: 2000, waitForPending: true })
       fail('CHILD_CANCELLED', 'closed native canary was cancelled')
@@ -112,7 +152,7 @@ async function ownedTest(owner, root, env, argv, timeoutMs = 300000, signal, opt
   // before persisting rootExit, then let ProcessOwner's normal group drain
   // reconcile any real descendants.
   try {
-    await owner.awaitRootExit(owned.ownershipId, Math.min(5000, Math.max(0, deadline - Date.now())))
+    await owner.awaitRootExit(owned.ownershipId, Math.min(5000, Math.max(0, deadline - wallNowMs())))
     await owner.observeRootExit(owned.ownershipId, { code: value.code, signal: value.signal, terminalEnvelope: { status: value.code === 0 && !value.signal ? 'DONE' : 'FAILED' } })
   } catch (error) {
     await owner.cancelAll({ reason: 'closed native canary root completion did not drain', graceMs: 500, killMs: 2000, waitForPending: true }).catch(() => {})
@@ -129,15 +169,17 @@ async function run(options = {}) {
   const activationDeadline = Date.parse(activation.record?.capability?.expiresAt)
   if (!Number.isFinite(activationDeadline)) fail('LOCAL_CANARY_INVALID', 'canary activation deadline is invalid')
   if (activationDeadline <= Date.now()) fail('LOCAL_CANARY_EXPIRED', 'activation expired before native canary')
-  const root = path.join(activation.activationRoot, 'reviewed-local-canary', `generation-${generation}`)
-  fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+  const canaryRoot = path.join(activation.activationRoot, 'reviewed-local-canary')
+  const root = path.join(canaryRoot, `generation-${generation}`)
+  const platform = options.platform || process.platform
+  claimPrivateCanaryDirectory(canaryRoot, { platform, allowExisting: true })
+  claimPrivateCanaryDirectory(root, { platform, allowExisting: true })
   const challenge = crypto.randomBytes(32).toString('base64url')
   const env = { ...closedEnvironment(options.environment || process.env, provider, root), [keys[provider]]: executable.path,
     AUTOPROMPT_NATIVE_TEST_EVIDENCE_ROOT: path.join(root, 'native-wire'), AUTOPROMPT_CLOSED_CANARY_CHALLENGE: challenge,
     AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT: path.join(root, 'nested-owners'), AUTOPROMPT_CLOSED_CANARY_PROVIDER: provider,
     AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID: activation.activationId, AUTOPROMPT_CLOSED_CANARY_GENERATION: String(generation) }
-  fs.mkdirSync(env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, { mode: 0o700 })
-  const platform = options.platform || process.platform
+  claimPrivateCanaryDirectory(env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, { platform })
   const adapter = closedCanaryProcessAdapter({ platform, controlRoot: path.join(root, 'outer-process-control'),
     providerPrivateOwnershipRoot: activation.activationRoot, trustedOwnershipRoots: [activation.activationRoot], createPlatformAdapter: options.createPlatformAdapter })
   const owner = new ProcessOwner({ adapter, registryPath: path.join(root, 'outer-processes.json'), pollMs: 20 })
@@ -160,7 +202,9 @@ async function run(options = {}) {
     // Some native CLIs need several seconds per startup; the complete owned
     // suite includes real recovery and cancellation, not just one model call.
     // Keep one finite batch ceiling and never run past the release approval.
-    const timeoutMs = Math.min(720000, Date.parse(pending.expiresAt) - Date.now(), activationDeadline - Date.now())
+    const now = Date.now()
+    const timeoutMs = closedCanaryBatchTimeout({ platform, caseCount: cases.length,
+      approvalRemainingMs: Date.parse(pending.expiresAt) - now, activationRemainingMs: activationDeadline - now })
     if (timeoutMs <= 0) fail('LOCAL_CANARY_EXPIRED', 'review approval expired before native batch')
     const result = await ownedTest(owner, root, env, ['--test','--test-concurrency=1','--test-reporter=tap','--test-name-pattern',pattern,source], timeoutMs, signal, {
       platform, providerPrivateOwnershipRoot: activation.activationRoot, trustedOwnershipRoots: [activation.activationRoot], createPlatformAdapter: options.createPlatformAdapter,
@@ -207,4 +251,4 @@ async function closedOwnedTest(requestPath) {
   })
 }
 if (require.main === module && process.argv[2] === '--closed-owned-test') closedOwnedTest(process.argv[3]).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1 })
-module.exports = { run, closedEnvironment, tapCases, ownedTest, drainRegistered, closedCanaryProcessAdapter }
+module.exports = { run, closedEnvironment, tapCases, ownedTest, drainRegistered, closedCanaryProcessAdapter, claimPrivateCanaryDirectory, closedCanaryBatchTimeout }

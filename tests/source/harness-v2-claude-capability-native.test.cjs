@@ -11,6 +11,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
+const { performance } = require('node:perf_hooks')
 
 const native = require('../../scripts/harness-v2-native.cjs')
 const controlled = require('../../scripts/harness-v2-controlled-tools.cjs')
@@ -87,6 +88,14 @@ function registeredProcessOwner(f) {
 }
 
 async function scenario(t, options = {}) {
+  const phaseEvents = []
+  const phaseStarted = performance.now()
+  const markPhase = name => {
+    if (phaseEvents.length >= 32) return
+    phaseEvents.push({ name, elapsedMs: Math.round(Math.max(0, performance.now() - phaseStarted)) })
+  }
+  const timingDiagnostic = diagnostic => ({ ...diagnostic, phaseTiming: phaseEvents.slice(-32) })
+  markPhase('scenario-start')
   assert.ok(CLI, 'AUTOPROMPT_CLAUDE_TEST_CLI is required for this native capability suite')
   const sandbox = await boundary.probeCommandSandbox()
   assert.equal(sandbox.supported, true, JSON.stringify(sandbox))
@@ -135,6 +144,7 @@ async function scenario(t, options = {}) {
   const cliStartup = []
   const cliToolResults = []
   const run = async overrides => {
+    markPhase('launch-start')
     const record = { ...f.record, ...overrides }
     record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
     record.onUsageDelta = (delta, cumulative, evidence) => { debits.push(delta); return overrides?.onUsageDelta ? overrides.onUsageDelta(delta, cumulative, evidence) : { continue: true } }
@@ -146,8 +156,10 @@ async function scenario(t, options = {}) {
         const observed = boundedClaudeToolDiagnostics({ requests: [{ body: { messages: [event.message] } }], errors: [] }, null)
         cliToolResults.push(...observed.toolResults)
         if (cliToolResults.length > 8) cliToolResults.splice(0, cliToolResults.length - 8)
+        if (observed.toolResults.length) markPhase('tool-result')
       }
       if (event?.type === 'system' && event.subtype === 'init') {
+        markPhase('cli-init')
         cliStartup.push({
           tools: (Array.isArray(event.tools) ? event.tools : []).slice(0, 32).filter(value => typeof value === 'string').map(value => value.slice(0, 256)),
           mcpServers: (Array.isArray(event.mcp_servers) ? event.mcp_servers : []).slice(0, 16).map(server => ({
@@ -160,22 +172,44 @@ async function scenario(t, options = {}) {
       }
       callerOnEvent?.(event, raw)
     }
-    record.signal = overrides?.signal || AbortSignal.timeout(90000)
+    // Windows may spend up to 120 seconds assigning the provider Job, then
+    // the fresh MCP process must run its own native sandbox canary before
+    // executing the command. This test budget includes all three stages.
+    record.signal = overrides?.signal || AbortSignal.timeout(process.platform === 'win32' ? 300000 : 90000)
+    const onAbort = () => markPhase('abort')
+    record.signal.addEventListener?.('abort', onAbort, { once: true })
+    const firstNewRequest = service.requests.length
+    const requestPoll = setInterval(() => {
+      if (service.requests.slice(firstNewRequest).some(request => request.path.includes('/messages'))) {
+        markPhase('first-request')
+        clearInterval(requestPoll)
+      }
+    }, 25)
+    requestPoll.unref?.()
     let result
+    let launchError
     try { result = await adapter.launch(record) } catch (error) {
-      const diagnostic = boundedClaudeToolDiagnostics(service, null, cliStartup, cliToolResults)
+      launchError = error
+    } finally {
+      clearInterval(requestPoll)
+      record.signal.removeEventListener?.('abort', onAbort)
+      markPhase('launch-end')
+    }
+    if (launchError) {
+      const diagnostic = timingDiagnostic(boundedClaudeToolDiagnostics(service, null, cliStartup, cliToolResults))
       diagnostic.launchFailure = {
-        code: typeof error?.code === 'string' ? error.code.slice(0, 80) : undefined,
-        message: String(error?.message || 'Native launch failed').slice(0, 512),
+        code: typeof launchError?.code === 'string' ? launchError.code.slice(0, 80) : undefined,
+        message: String(launchError?.message || 'Native launch failed').slice(0, 512),
       }
       t.diagnostic(`CLAUDE_TOOL_RESULT_DIAGNOSTIC:${JSON.stringify(diagnostic)}`)
-      throw error
+      throw launchError
     }
     const challengeObserved = service.requests.some(request => JSON.stringify(request.body).includes(`CLOSED_CANARY_CHALLENGE:${f.challenge}`))
-    if (!challengeObserved) t.diagnostic(`CLAUDE_TOOL_RESULT_DIAGNOSTIC:${JSON.stringify(boundedClaudeToolDiagnostics(service, result, cliStartup, cliToolResults))}`)
+    t.diagnostic(`CLAUDE_TOOL_RESULT_DIAGNOSTIC:${JSON.stringify(timingDiagnostic(boundedClaudeToolDiagnostics(service, result, cliStartup, cliToolResults)))}`)
     assert.ok(challengeObserved, 'the actual native tool result omitted its closed-canary challenge')
     return result
   }
+  markPhase('scenario-ready')
   return { ...f, candidate, secret, marker, service, binding, owner, adapter, run, debits, command }
 }
 
@@ -245,7 +279,7 @@ function boundedClaudeToolDiagnostics(service, result, cliStartup = [], cliToolR
   }
 }
 
-const nativeOptions = { skip: !CLI, timeout: 240000 }
+const nativeOptions = { skip: !CLI, timeout: process.platform === 'win32' ? 900000 : 240000 }
 
 test('claude closed native capability: full canonical role schema is accepted and validated', nativeOptions, async t => {
   const output = {
@@ -455,19 +489,23 @@ test('claude closed native capability: same-context continuation succeeds while 
 test('claude closed native capability: cancellation drains the held child and a sibling remains operational', nativeOptions, async t => {
   const f = await scenario(t, {
     command: ({ candidate }) => readCommand(candidate),
-    serviceOptions: { delayMessagesMs: 4000 },
+    serviceOptions: { holdFirstMessage: true },
   })
   const controller = new AbortController()
   const pending = f.run({ signal: controller.signal })
   pending.catch(() => {})
-  for (let i = 0; i < 100 && f.service.requests.length === 0; i += 1) await new Promise(resolve => setTimeout(resolve, 10))
+  const waitForHeldMessageMs = process.platform === 'win32' ? 180000 : 15000
+  const waitForHeldMessageUntil = Date.now() + waitForHeldMessageMs
+  while (!f.service.firstMessageHeld && Date.now() < waitForHeldMessageUntil) await new Promise(resolve => setTimeout(resolve, 25))
+  assert.equal(f.service.firstMessageHeld, true, 'the first native model response must be held before cancellation')
   const identities = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: 'fast-sibling' }
   const fast = f.run({ ...identities, missionBinding: core.bindCanonicalMissionForChild(f.projection, {
     ...f.record, ...identities, sourceRequestHash: f.projection.sourceRequestHash,
     requestEnvelopeHash: f.record.dispatch.requestPointer.hash,
   }) })
   fast.catch(() => {})
-  for (let i = 0; i < 1000 && f.owner.ownershipIdentities().length < 2; i += 1) await new Promise(resolve => setTimeout(resolve, 10))
+  const waitForSiblingUntil = Date.now() + waitForHeldMessageMs
+  while (f.owner.ownershipIdentities().length < 2 && Date.now() < waitForSiblingUntil) await new Promise(resolve => setTimeout(resolve, 25))
   assert.equal(f.owner.ownershipIdentities().length, 2, 'both owned native children must be live at cancellation')
   controller.abort()
   await assert.rejects(pending, { code: 'CHILD_CANCELLED' })
@@ -507,7 +545,7 @@ test('claude closed native capability: isolated checker receives read-only candi
     rolePrompt: () => 'Use only the controller checker tools and return one JSON object.', checkerScratchVerifier: () => checkerBoundary,
   })
   checkerRecord.environment = prepareProcessLaunchEnvironment(f.owner.adapter, checkerRecord.reservationId, nativeEnvironment())
-  checkerRecord.signal = AbortSignal.timeout(90000)
+  checkerRecord.signal = AbortSignal.timeout(process.platform === 'win32' ? 300000 : 90000)
   const result = await checkerAdapter.launch(checkerRecord)
   assertSuccessful(result)
   if (!fs.existsSync(path.join(checkerScratch, 'checker.txt'))) {
@@ -518,12 +556,14 @@ test('claude closed native capability: isolated checker receives read-only candi
 })
 
 test('claude closed native capability: process ownership records completion and recovers a fresh session', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate), serviceOptions: { delayMessagesMs: 10000 } })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate), serviceOptions: { holdFirstMessage: true } })
   const abort = new AbortController()
   const pending = f.run({ signal: abort.signal })
   pending.catch(() => {})
-  for (let i = 0; i < 1500 && f.service.requests.length === 0; i += 1) await new Promise(resolve => setTimeout(resolve, 10))
-  assert.ok(f.service.requests.length > 0, 'native request must start before recovering its durable owner')
+  const waitForHeldMessageMs = process.platform === 'win32' ? 180000 : 15000
+  const waitForHeldMessageUntil = Date.now() + waitForHeldMessageMs
+  while (!f.service.firstMessageHeld && Date.now() < waitForHeldMessageUntil) await new Promise(resolve => setTimeout(resolve, 25))
+  assert.equal(f.service.firstMessageHeld, true, 'native request must reach the held model response before recovering its durable owner')
   const registry = JSON.parse(fs.readFileSync(f.owner.registryPath, 'utf8'))
   assert.ok(JSON.stringify(registry).includes('native-claude-'), 'owned native process was not durably registered')
   const replacement = new ProcessOwner({ adapter: nativeProcessAdapter(f.owner.registryPath, process.env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT || f.controller), registryPath: f.owner.registryPath, pollMs: 10 })
@@ -553,7 +593,7 @@ test('claude closed native capability: exact model effort is wired and unsupport
 })
 
 for (const deferredInputUsage of [false, true]) {
-test(`claude native durable quota settles each tool turn exactly once${deferredInputUsage ? ' with deferred cumulative input' : ''}`, { skip: !CLI, timeout: 180000 }, async t => {
+test(`claude native durable quota settles each tool turn exactly once${deferredInputUsage ? ' with deferred cumulative input' : ''}`, { skip: !CLI, timeout: process.platform === 'win32' ? 900000 : 180000 }, async t => {
   const f = await scenario(t, { serviceOptions: { deferredInputUsage, terminalDoneSentinel: deferredInputUsage ? 'data' : false, explicitThinkingReplay: deferredInputUsage } })
 
   const starts = [], settlements = [], debits = [], unknown = []
