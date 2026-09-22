@@ -16,23 +16,32 @@ function within(root, value) {
 function sameDirectoryIdentity(left, right) {
   return Boolean(left && right && String(left.dev) === String(right.dev) && String(left.ino) === String(right.ino))
 }
-function verifyCommandCwdBridge(bridge) {
+function verifyCommandCwdBridgeParent(bridge, expectedEntries) {
   if (!bridge) return
   const staging = inspectPathNoFollow(bridge.stagingRoot)
   const requested = inspectPathNoFollow(bridge.requestedCwd)
+  const parent = inspectPathNoFollow(bridge.root)
+  let entries
+  try { entries = fs.readdirSync(bridge.root).sort() } catch {}
+  if (!staging.exists || !sameDirectoryIdentity(staging.identity, bridge.stagingIdentity) ||
+      !requested.exists || !sameDirectoryIdentity(requested.identity, bridge.requestedIdentity) ||
+      !parent.exists || !sameDirectoryIdentity(parent.identity, bridge.rootIdentity) ||
+      !entries || entries.length !== expectedEntries.length || entries.some((entry, index) => entry !== expectedEntries[index])) {
+    throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Private command cwd bridge changed identity')
+  }
+}
+function verifyActiveCommandCwdBridge(bridge) {
+  verifyCommandCwdBridgeParent(bridge, ['command-cwd'])
   let alias, resolved
   try { alias = fs.lstatSync(bridge.alias, { bigint: true }); resolved = fs.realpathSync.native(bridge.alias) } catch {
     throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Private command cwd bridge is unavailable')
   }
-  if (!staging.exists || !sameDirectoryIdentity(staging.identity, bridge.stagingIdentity) ||
-      !requested.exists || !sameDirectoryIdentity(requested.identity, bridge.requestedIdentity) ||
-      !alias.isSymbolicLink() || !sameDirectoryIdentity(alias, bridge.aliasIdentity) ||
-      resolved.toLowerCase() !== bridge.requestedRealpath.toLowerCase() ||
-      bridge.alias.length >= 260) {
+  if (!alias.isSymbolicLink() || !sameDirectoryIdentity(alias, bridge.aliasIdentity) ||
+      resolved.toLowerCase() !== bridge.requestedRealpath.toLowerCase() || bridge.alias.length >= 260) {
     throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Private command cwd bridge changed identity')
   }
 }
-function createCommandCwdBridge(stagingRoot, requestedCwd) {
+function prepareCommandCwdBridge(stagingRoot, requestedCwd) {
   if (requestedCwd.length < 260) return null
   // CreateProcessW still limits lpCurrentDirectory to MAX_PATH. Change only
   // that launch spelling; the policy, command receipt and backing directory
@@ -42,21 +51,24 @@ function createCommandCwdBridge(stagingRoot, requestedCwd) {
   if (!staging.exists || !staging.identity || !requested.exists || !requested.identity) {
     throw new WindowsAppContainerError('WINDOWS_RUNTIME_INVALID', 'Private command cwd bridge requires physical directories')
   }
-  const alias = path.join(stagingRoot, 'command-cwd')
+  const root = path.join(stagingRoot, 'cwd-bridge'), alias = path.join(root, 'command-cwd')
   let created = false
   try {
-    fs.symlinkSync(requested.realpath, alias, 'junction')
+    fs.mkdirSync(root, { mode: 0o700 })
     created = true
-    const aliasItem = fs.lstatSync(alias, { bigint: true })
-    const bridge = Object.freeze({ alias, stagingRoot, requestedCwd,
+    const rootItem = inspectPathNoFollow(root)
+    if (!rootItem.exists || !rootItem.identity || alias.length >= 260) {
+      throw new WindowsAppContainerError('WINDOWS_RUNTIME_INVALID', 'Private command cwd bridge root is invalid')
+    }
+    const bridge = Object.freeze({ root, alias, stagingRoot, requestedCwd,
       stagingIdentity: staging.identity, requestedIdentity: requested.identity, requestedRealpath: requested.realpath,
-      aliasIdentity: Object.freeze({ dev: String(aliasItem.dev), ino: String(aliasItem.ino) }) })
-    verifyCommandCwdBridge(bridge)
+      rootIdentity: rootItem.identity })
+    verifyCommandCwdBridgeParent(bridge, [])
     return bridge
   } catch (error) {
     let retain = created
     if (!created) {
-      try { fs.lstatSync(alias); retain = true } catch (cleanupError) { if (cleanupError.code !== 'ENOENT') retain = true }
+      try { fs.lstatSync(root); retain = true } catch (cleanupError) { if (cleanupError.code !== 'ENOENT') retain = true }
       try {
         const stagingAfter = inspectPathNoFollow(stagingRoot)
         const requestedAfter = inspectPathNoFollow(requestedCwd)
@@ -71,17 +83,36 @@ function createCommandCwdBridge(stagingRoot, requestedCwd) {
     throw error
   }
 }
+function activateCommandCwdBridge(bridge) {
+  if (!bridge) return null
+  try {
+    verifyCommandCwdBridgeParent(bridge, [])
+    fs.symlinkSync(bridge.requestedRealpath, bridge.alias, 'junction')
+    const alias = fs.lstatSync(bridge.alias, { bigint: true })
+    const active = Object.freeze({ ...bridge,
+      aliasIdentity: Object.freeze({ dev: String(alias.dev), ino: String(alias.ino) }) })
+    verifyActiveCommandCwdBridge(active)
+    return active
+  } catch (error) {
+    // A collision or any ambiguity after the leased empty preimage was applied
+    // must retain that lease. Recovery may not classify or delete foreign bytes.
+    error.cleanupConfirmed = false
+    error.retainedStagingRoot = bridge.stagingRoot
+    throw error
+  }
+}
 function removeCommandCwdBridge(bridge) {
   if (!bridge) return
-  verifyCommandCwdBridge(bridge)
-  fs.unlinkSync(bridge.alias)
-  try { fs.lstatSync(bridge.alias); throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Private command cwd bridge survived removal') }
-  catch (error) { if (error.code !== 'ENOENT') throw error }
-  const staging = inspectPathNoFollow(bridge.stagingRoot)
-  const requested = inspectPathNoFollow(bridge.requestedCwd)
-  if (!staging.exists || !sameDirectoryIdentity(staging.identity, bridge.stagingIdentity) ||
-      !requested.exists || !sameDirectoryIdentity(requested.identity, bridge.requestedIdentity)) {
-    throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Private command cwd bridge cleanup changed a bound directory')
+  try {
+    verifyActiveCommandCwdBridge(bridge)
+    fs.unlinkSync(bridge.alias)
+    try { fs.lstatSync(bridge.alias); throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Private command cwd bridge survived removal') }
+    catch (error) { if (error.code !== 'ENOENT') throw error }
+    verifyCommandCwdBridgeParent(bridge, [])
+  } catch (error) {
+    error.cleanupConfirmed = false
+    error.retainedStagingRoot = bridge.stagingRoot
+    throw error
   }
 }
 // Copy a closed executable dependency set into the existing read-only runtime.
@@ -320,7 +351,7 @@ async function runTupleCommand(policy, args, options, tuple, key) {
   const workerIdentity = workerBundle.revalidateTuple(tuple).identity
   const systemRoot = process.env.SystemRoot
   const start = Date.now()
-  let lease, evidence, released = false, recoveryPending = false, privateScratch = null, runtimeOwned = false, runtimeCleanupUnknown = false, primaryError = null
+  let lease, evidence, released = false, recoveryPending = false, privateScratch = null, runtimeOwned = false, runtimeCleanupUnknown = false, primaryError = null, cwdBridgeActive = false
   try {
     // PowerShell 5.1 and its hosted .NET Framework System.IO calls do not have
     // a controller-owned long-path configuration. Keep every managed helper
@@ -332,7 +363,7 @@ async function runTupleCommand(policy, args, options, tuple, key) {
       .some(root => typeof root === 'string' && (within(root, stagingRoot) || within(stagingRoot, root)))) {
       throw new WindowsAppContainerError('WINDOWS_RESOURCE_INVALID', 'Private command staging must be disjoint from worker resources')
     }
-    cwdBridge = createCommandCwdBridge(stagingRoot, args.cwd)
+    cwdBridge = prepareCommandCwdBridge(stagingRoot, args.cwd)
     helperDeployment = require('./windows-helper-deployment.js').stageWindowsHelperDeployment(stagingRoot)
     // The cancellation marker lives in this operation's exclusively created
     // helper directory, whose cleanup follows the same process-drain evidence.
@@ -348,7 +379,7 @@ async function runTupleCommand(policy, args, options, tuple, key) {
     runtimeOwned = true
     if (runtime.identity !== workerIdentity) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Worker tuple changed during materialization')
     lease = await prepareWindowsAppContainerResources({ policy, controlRoot, deploymentRoot: helperDeployment.root,
-      executableRoots: [{ path: runtimeRoot, kind: 'directory' }],
+      executableRoots: [{ path: runtimeRoot, kind: 'directory' }, ...(cwdBridge ? [{ path: cwdBridge.root, kind: 'directory' }] : [])],
       verifyDrainEvidence: launcher.verifyDrainEvidence })
     const env = {
       SystemRoot: systemRoot, WINDIR: systemRoot, ComSpec: path.join(systemRoot, 'System32', 'cmd.exe'), LOCALAPPDATA: process.env.LOCALAPPDATA || '',
@@ -361,11 +392,17 @@ async function runTupleCommand(policy, args, options, tuple, key) {
     }
     refusePoisonedAdmission()
     if (currentAdmission(tuple).key !== key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed while preparing resource grants')
-    verifyCommandCwdBridge(cwdBridge)
+    if (cwdBridge) { cwdBridge = activateCommandCwdBridge(cwdBridge); cwdBridgeActive = true }
     evidence = await launcher.launch({ profileName: lease.profileName, profileSid: lease.profileSid,
       executable: runtime.bash, executableSha256: runtime.bashSha256, msysRuntime: runtime.msysRuntime, arguments: ['--noprofile', '--norc', '-c', args.command], cwd: cwdBridge?.alias || args.cwd,
       environment: Object.entries(env).map(([key, value]) => `${key}=${value}`), timeoutMs: args.timeoutMs || 60000,
       outputLimit: 1024 * 1024, cancellationPath }, { signal: options.signal, leaseId: lease.recovery.leaseId })
+    if (cwdBridge && launcher.verifyDrainEvidence(evidence, { profileSid: lease.profileSid, leaseId: lease.recovery.leaseId }) !== true) {
+      const error = new WindowsAppContainerError('APPCONTAINER_CLEANUP_UNCONFIRMED', 'Windows command cwd bridge lacks authoritative process drain evidence')
+      error.cleanupConfirmed = false
+      throw error
+    }
+    if (cwdBridgeActive) { removeCommandCwdBridge(cwdBridge); cwdBridgeActive = false }
     const resourceRecovery = Object.freeze({ ...await lease.release(evidence) })
     released = true
     const stdout = evidence.stdout, stderr = evidence.stderr, output = Buffer.concat([stdout, stderr])
@@ -385,10 +422,14 @@ async function runTupleCommand(policy, args, options, tuple, key) {
         await recoverWindowsAppContainerResources({ controlRoot, deploymentRoot: helperDeployment.root, journalPath: error.recovery.journalPath, verifyDrainEvidence: launcher.verifyDrainEvidence, evidence: unused })
         recoveryPending = false; released = true; error.recoveryResolved = true
       }
-      if (lease && !evidence) {
+      if (lease && !evidence && (!cwdBridge || !runtimeCleanupUnknown)) {
         let unused
         try { unused = launcher.proveNotStarted({ profileSid: lease.profileSid, leaseId: lease.recovery.leaseId }) } catch {}
         if (unused) {
+          if (cwdBridge && launcher.verifyDrainEvidence(unused, { profileSid: lease.profileSid, leaseId: lease.recovery.leaseId }) !== true) {
+            throw new WindowsAppContainerError('APPCONTAINER_CLEANUP_UNCONFIRMED', 'Windows command cwd bridge lacks authoritative not-started evidence')
+          }
+          if (cwdBridgeActive) { removeCommandCwdBridge(cwdBridge); cwdBridgeActive = false }
           await lease.release(unused); released = true
           // A poison wrapper describes another operation's unknown cleanup.
           // This operation has independently proved that it never started.
@@ -419,7 +460,10 @@ async function runTupleCommand(policy, args, options, tuple, key) {
       }
       let stagingCleanupAllowed = true
       if (cwdBridge) {
-        try { removeCommandCwdBridge(cwdBridge) } catch (error) {
+        try {
+          if (cwdBridgeActive) throw new WindowsAppContainerError('APPCONTAINER_CLEANUP_UNCONFIRMED', 'Windows command cwd bridge remained active after cleanup')
+          verifyCommandCwdBridgeParent(cwdBridge, [])
+        } catch (error) {
           cleanupFailure ||= error
           stagingCleanupAllowed = false
         }

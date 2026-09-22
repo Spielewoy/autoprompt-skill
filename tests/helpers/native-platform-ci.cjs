@@ -55,10 +55,12 @@ const WINDOWS_NATIVE_CASES = Object.freeze([
 ])
 
 const DIAGNOSTIC_STAGES = Object.freeze([
+  Object.freeze({ id: 'command-cwd', cases: Object.freeze([
+    'native Windows Bash bridges a deep canonical cwd for the admitted command child',
+  ]) }),
   Object.freeze({ id: 'infra', cases: Object.freeze([
     'native Windows owned proxy preserves deep semantic cwd through the nested child launch',
     'native Windows owned proxy projects canonical Claude temp through a forced short cwd bridge',
-    'native Windows Bash bridges a deep canonical cwd for the admitted command child',
   ]) }),
   Object.freeze({ id: 'direct', cases: Object.freeze([
     'claude closed native capability: full canonical role schema is accepted and validated',
@@ -126,8 +128,9 @@ async function runTests(argv, environment, logPath, aggregateLogPath = null) {
 }
 
 function diagnosticStageFiles(id) {
+  if (id === 'command-cwd') return ['tests/source/windows-bash-runtime.test.cjs']
   return id === 'infra'
-    ? ['tests/source/windows-job-helper.test.cjs', 'tests/source/windows-bash-runtime.test.cjs']
+    ? ['tests/source/windows-job-helper.test.cjs']
     : id === 'direct'
       ? ['tests/source/harness-v2-claude-capability-native.test.cjs']
       : ['tests/source/harness-v2-installed-canary-native.test.cjs']

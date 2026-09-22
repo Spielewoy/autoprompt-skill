@@ -10,19 +10,20 @@ const { nodeCommand, readCommand, withChallenge, waitForNativeObservation } = re
 const { WINDOWS_NATIVE_CASES, DIAGNOSTIC_STAGES, assertHostPrimitiveCases, runDiagnosticStages } = require('../helpers/native-platform-ci.cjs')
 
 test('Claude diagnostic plan failfasts infrastructure and direct checks before packed activation', () => {
-  assert.deepEqual(DIAGNOSTIC_STAGES.map(stage => stage.id), ['infra', 'direct', 'packed'])
-  assert.equal(DIAGNOSTIC_STAGES[0].cases.length, 3)
-  assert.equal(DIAGNOSTIC_STAGES[1].cases.length, 1)
+  assert.deepEqual(DIAGNOSTIC_STAGES.map(stage => stage.id), ['command-cwd', 'infra', 'direct', 'packed'])
+  assert.equal(DIAGNOSTIC_STAGES[0].cases.length, 1)
+  assert.equal(DIAGNOSTIC_STAGES[1].cases.length, 2)
   assert.equal(DIAGNOSTIC_STAGES[2].cases.length, 1)
+  assert.equal(DIAGNOSTIC_STAGES[3].cases.length, 1)
   assert.deepEqual(DIAGNOSTIC_STAGES.flatMap(stage => stage.cases), [
+    'native Windows Bash bridges a deep canonical cwd for the admitted command child',
     'native Windows owned proxy preserves deep semantic cwd through the nested child launch',
     'native Windows owned proxy projects canonical Claude temp through a forced short cwd bridge',
-    'native Windows Bash bridges a deep canonical cwd for the admitted command child',
     'claude closed native capability: full canonical role schema is accepted and validated',
     'packed actual Claude activation requires all local native observations before mission admission',
   ])
-  assert.match(DIAGNOSTIC_STAGES[1].cases[0], /^claude closed native capability:/)
-  assert.match(DIAGNOSTIC_STAGES[2].cases[0], /^packed actual Claude activation/)
+  assert.match(DIAGNOSTIC_STAGES[2].cases[0], /^claude closed native capability:/)
+  assert.match(DIAGNOSTIC_STAGES[3].cases[0], /^packed actual Claude activation/)
 })
 
 test('native observation wait preserves early failures and rejects premature success', async () => {
@@ -53,7 +54,7 @@ test('Claude diagnostic runner stops before packed activation and publishes skip
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const calls = [], snapshots = [], evidence = {}
   const run = async (argv, _environment, stageLog, aggregateLog) => {
-    const id = argv.includes('tests/source/harness-v2-claude-capability-native.test.cjs') ? 'direct' : argv.includes('tests/source/harness-v2-installed-canary-native.test.cjs') ? 'packed' : 'infra'
+    const id = argv.includes('tests/source/harness-v2-claude-capability-native.test.cjs') ? 'direct' : argv.includes('tests/source/harness-v2-installed-canary-native.test.cjs') ? 'packed' : argv.includes('tests/source/windows-bash-runtime.test.cjs') ? 'command-cwd' : 'infra'
     calls.push(id)
     const stage = DIAGNOSTIC_STAGES.find(item => item.id === id)
     const output = id === 'direct'
@@ -63,12 +64,12 @@ test('Claude diagnostic runner stops before packed activation and publishes skip
     return { code: 0, output }
   }
   await assert.rejects(runDiagnosticStages({ environment: {}, evidence, aggregateLog: aggregate, stageLogPrefix: path.join(directory, 'stage-'), publish: () => snapshots.push(JSON.parse(JSON.stringify(evidence))), run }), /Required test must execute|Expected exactly one result/)
-  assert.deepEqual(calls, ['infra', 'direct'])
-  assert.equal(evidence.diagnosticStages.length, 2)
-  assert.equal(evidence.diagnosticStages[1].passed, false)
-  assert.equal(evidence.diagnosticStages[1].exitCode, 1)
-  assert.ok(evidence.diagnosticStages[1].error)
-  assert.ok(snapshots.length >= 3, 'initial, infra, and failed-stage evidence must be published')
+  assert.deepEqual(calls, ['command-cwd', 'infra', 'direct'])
+  assert.equal(evidence.diagnosticStages.length, 3)
+  assert.equal(evidence.diagnosticStages[2].passed, false)
+  assert.equal(evidence.diagnosticStages[2].exitCode, 1)
+  assert.ok(evidence.diagnosticStages[2].error)
+  assert.ok(snapshots.length >= 4, 'initial, command, infra, and failed-stage evidence must be published')
   assert.match(fs.readFileSync(aggregate, 'utf8'), /native Windows owned proxy preserves deep semantic cwd through the nested child launch/)
 })
 
@@ -82,7 +83,7 @@ test('Claude diagnostic runner preserves spawn errors and never advances to late
       throw new Error('fixture spawn failed')
     } }), /fixture spawn failed/)
   assert.equal(calls.length, 1)
-  assert.equal(evidence.diagnosticStages[0].id, 'infra')
+  assert.equal(evidence.diagnosticStages[0].id, 'command-cwd')
   assert.equal(evidence.diagnosticStages[0].passed, false)
   assert.match(evidence.diagnosticStages[0].error, /fixture spawn failed/)
   assert.ok(snapshots.length >= 2)

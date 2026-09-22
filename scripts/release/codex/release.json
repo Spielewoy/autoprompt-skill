@@ -1,9 +1,9 @@
 {
   "schemaVersion": 2,
   "name": "@autoprompt-skill/codex-runtime",
-  "version": "1.0.82",
-  "payloadGeneration": "codex-v2.0.0-69e37dbdc701676f",
-  "payloadDigest": "69e37dbdc701676f4ac09b59d2ff6135f5ed3d284a5e7dce2109d54391aceb74",
+  "version": "1.0.83",
+  "payloadGeneration": "codex-v2.0.0-aa55d60bd3fe1f37",
+  "payloadDigest": "aa55d60bd3fe1f37530a1a2b566fc8462aa8dc84151fce38e1e82379e6e2acee",
   "historyPath": "release-history.json",
-  "historyHeadDigest": "3b80641c8d0f3452917858edbb78dda8e18fad37238c6488ed998c945a8f29b8"
+  "historyHeadDigest": "d0a089cf7c56b83b694ed92f46624d7eaac40c27a2216259fd0c8f92706757cb"
 }

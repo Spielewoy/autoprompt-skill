@@ -23,10 +23,13 @@ function fixture(t, scenario = {}) {
   const filesystem = { ...suppliedFilesystem, unlinkSync(file) {
     if (path.basename(file) === 'command-cwd') events.push('bridge-unlink')
     return suppliedFilesystem.unlinkSync(file)
+  }, symlinkSync(target, file, type) {
+    if (path.basename(file) === 'command-cwd') events.push('bridge-link')
+    return suppliedFilesystem.symlinkSync(target, file, type)
   } }
   const localSafe = require('../../agents/codex/workflow/safe-run-root.js')
   const launcher = {
-    verifyDrainEvidence() { return true },
+    verifyDrainEvidence(received) { events.push('drain'); return scenario.verifyDrainEvidence?.(received) ?? true },
     proveNotStarted() { return evidence },
     async launch(request) {
       launchCount += 1; events.push('launch')
@@ -62,7 +65,10 @@ function fixture(t, scenario = {}) {
       helperRoot = path.join(parent, 'helpers'); fs.mkdirSync(helperRoot)
       return { root: helperRoot, cleanup() { events.push('helper-cleanup'); fs.rmSync(helperRoot, { recursive: true, force: true }) } }
     } },
-    './windows-appcontainer-resources.js': { async prepareWindowsAppContainerResources() {
+    './windows-appcontainer-resources.js': { async prepareWindowsAppContainerResources(options) {
+      events.push('lease')
+      assert.equal(options.executableRoots.length, 2)
+      assert.equal(options.executableRoots[1].path, path.join(stagingRoot, 'cwd-bridge'))
       scenario.afterPrepare?.({ requestedCwd, stagingRoot })
       return { profileName: 'owned', profileSid: 'owned', environment: {}, recovery: { leaseId: 'owned' },
         async release(received) { assert.equal(received, evidence); events.push('release'); return { restored: 1, newEntries: 0, deletedEntries: 0 } } }
@@ -81,26 +87,41 @@ function fixture(t, scenario = {}) {
     get runtimeRoot() { return runtimeRoot }, get helperRoot() { return helperRoot }, get launchCount() { return launchCount } }
 }
 
-test('deep command cwd uses one shallow owned junction and removes it only after release', async t => {
+test('deep command cwd uses one shallow owned junction and removes it only after authoritative drain', async t => {
   const f = fixture(t)
   const result = await f.run()
   assert.equal(result.status, 'completed')
-  assert.ok(f.events.indexOf('launch') < f.events.indexOf('release'))
-  assert.ok(f.events.indexOf('release') < f.events.indexOf('bridge-unlink'))
-  assert.ok(f.events.indexOf('bridge-unlink') < f.events.indexOf('helper-cleanup'))
+  assert.ok(f.events.indexOf('lease') < f.events.indexOf('bridge-link'))
+  assert.ok(f.events.indexOf('launch') < f.events.indexOf('drain'))
+  assert.ok(f.events.indexOf('drain') < f.events.indexOf('bridge-unlink'))
+  assert.ok(f.events.indexOf('bridge-unlink') < f.events.indexOf('release'))
+  assert.ok(f.events.indexOf('release') < f.events.indexOf('helper-cleanup'))
   assert.equal(fs.readFileSync(path.join(f.requestedCwd, 'sentinel'), 'utf8'), 'canonical-target')
   assert.equal(fs.existsSync(f.stagingRoot), false)
 })
 
-test('a preexisting command cwd alias is never adopted or recursively removed', async t => {
+test('a pre-lease command cwd bridge-root collision retains foreign bytes without recursive cleanup', async t => {
   const f = fixture(t, { afterStaging({ stagingRoot }) {
-    const alias = path.join(stagingRoot, 'command-cwd')
-    fs.mkdirSync(alias); fs.writeFileSync(path.join(alias, 'foreign-sentinel'), 'another-owner')
+    const bridgeRoot = path.join(stagingRoot, 'cwd-bridge')
+    fs.mkdirSync(bridgeRoot); fs.writeFileSync(path.join(bridgeRoot, 'foreign-sentinel'), 'another-owner')
   } })
   await assert.rejects(f.run(), error => error.code === 'EEXIST' && error.cleanupConfirmed === false &&
     error.retainedStagingRoot === f.stagingRoot)
   assert.equal(f.launchCount, 0)
-  assert.equal(fs.readFileSync(path.join(f.stagingRoot, 'command-cwd', 'foreign-sentinel'), 'utf8'), 'another-owner')
+  assert.equal(f.events.includes('lease'), false)
+  assert.equal(f.events.includes('helper-cleanup'), false)
+  assert.equal(fs.readFileSync(path.join(f.stagingRoot, 'cwd-bridge', 'foreign-sentinel'), 'utf8'), 'another-owner')
+})
+
+test('a post-lease command cwd alias collision is never adopted or recursively removed', async t => {
+  const f = fixture(t, { afterPrepare({ stagingRoot }) {
+    const alias = path.join(stagingRoot, 'cwd-bridge', 'command-cwd')
+    fs.mkdirSync(alias); fs.writeFileSync(path.join(alias, 'foreign-sentinel'), 'another-owner')
+  } })
+  await assert.rejects(f.run(), error => error.code === 'WINDOWS_RUNTIME_MISMATCH' && error.cleanupConfirmed === false &&
+    error.retainedStagingRoot === f.stagingRoot)
+  assert.equal(f.launchCount, 0)
+  assert.equal(fs.readFileSync(path.join(f.stagingRoot, 'cwd-bridge', 'command-cwd', 'foreign-sentinel'), 'utf8'), 'another-owner')
   assert.equal(f.events.includes('helper-cleanup'), false)
 })
 
@@ -116,41 +137,57 @@ test('a replaced staging ancestor blocks bridge removal and every recursive chil
     error.cleanupConfirmed === false && error.retainedStagingRoot === f.stagingRoot)
   assert.equal(f.launchCount, 0)
   assert.equal(fs.readFileSync(path.join(f.stagingRoot, 'foreign-sentinel'), 'utf8'), 'replacement-owner')
-  assert.equal(fs.existsSync(path.join(moved, 'command-cwd')), true)
+  assert.equal(fs.existsSync(path.join(moved, 'cwd-bridge')), true)
+  assert.equal(fs.existsSync(path.join(moved, 'cwd-bridge', 'command-cwd')), false)
   assert.equal(fs.existsSync(path.join(moved, path.basename(f.runtimeRoot))), true)
   assert.equal(fs.existsSync(path.join(moved, path.basename(f.helperRoot))), true)
   assert.equal(f.events.includes('helper-cleanup'), false)
 })
 
 test('replaced command cwd junction retains the entire staging tree without launch or recursive cleanup', async t => {
-  let foreign
-  const f = fixture(t, { afterPrepare({ stagingRoot }) {
-    foreign = path.join(path.dirname(stagingRoot), 'foreign'); fs.mkdirSync(foreign)
-    fs.unlinkSync(path.join(stagingRoot, 'command-cwd'))
-    fs.symlinkSync(foreign, path.join(stagingRoot, 'command-cwd'), process.platform === 'win32' ? 'junction' : 'dir')
-  } })
+  let foreign, replaced = false
+  const f = fixture(t, { filesystem(base) { return { ...base, lstatSync(file, options) {
+    if (!replaced && path.basename(file) === 'command-cwd' && options?.bigint) {
+      replaced = true; foreign = path.join(path.dirname(path.dirname(file)), 'foreign'); base.mkdirSync(foreign)
+      base.unlinkSync(file); base.symlinkSync(foreign, file, process.platform === 'win32' ? 'junction' : 'dir')
+    }
+    return base.lstatSync(file, options)
+  } } } })
   await assert.rejects(f.run(), error => error.code === 'WINDOWS_RUNTIME_MISMATCH' &&
     error.cleanupConfirmed === false && error.retainedStagingRoot === f.stagingRoot)
   assert.equal(f.launchCount, 0)
   assert.equal(fs.existsSync(f.runtimeRoot), true)
   assert.equal(fs.existsSync(f.helperRoot), true)
-  assert.equal(fs.realpathSync.native(path.join(f.stagingRoot, 'command-cwd')), fs.realpathSync.native(foreign))
+  assert.equal(fs.realpathSync.native(path.join(f.stagingRoot, 'cwd-bridge', 'command-cwd')), fs.realpathSync.native(foreign))
   assert.equal(fs.readFileSync(path.join(f.requestedCwd, 'sentinel'), 'utf8'), 'canonical-target')
 })
 
 test('ambiguous command cwd removal retains staging and poisons later admission', async t => {
   const failure = Object.assign(new Error('junction busy'), { code: 'EBUSY' })
   const f = fixture(t, { filesystem(base, events) { return { ...base, unlinkSync(file) {
-    if (path.basename(file) === 'command-cwd' && events.includes('release')) throw failure
+    if (path.basename(file) === 'command-cwd' && events.includes('launch')) throw failure
     return base.unlinkSync(file)
   } } } })
   await assert.rejects(f.run(), error => error === failure && error.cleanupConfirmed === false &&
     error.retainedStagingRoot === f.stagingRoot)
   assert.equal(fs.existsSync(f.runtimeRoot), true)
   assert.equal(fs.existsSync(f.helperRoot), true)
+  assert.equal(f.events.includes('release'), false)
   assert.equal(fs.readFileSync(path.join(f.requestedCwd, 'sentinel'), 'utf8'), 'canonical-target')
   const launches = f.launchCount
   await assert.rejects(f.run(), error => error !== failure && error.cleanupConfirmed === false &&
     error.admissionFailure?.message === failure.message)
   assert.equal(f.launchCount, launches)
+})
+
+test('rejected process drain evidence retains the active bridge and resource lease', async t => {
+  const f = fixture(t, { verifyDrainEvidence() { return false } })
+  await assert.rejects(f.run(), error => error.code === 'APPCONTAINER_CLEANUP_UNCONFIRMED' &&
+    error.cleanupConfirmed === false && error.retainedStagingRoot === f.stagingRoot)
+  assert.equal(f.launchCount, 1)
+  assert.equal(f.events.includes('bridge-unlink'), false)
+  assert.equal(f.events.includes('release'), false)
+  assert.equal(f.events.includes('helper-cleanup'), false)
+  assert.equal(fs.existsSync(path.join(f.stagingRoot, 'cwd-bridge', 'command-cwd')), true)
+  assert.equal(fs.existsSync(f.runtimeRoot), true)
 })
