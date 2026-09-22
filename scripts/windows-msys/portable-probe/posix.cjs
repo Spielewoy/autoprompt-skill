@@ -46,6 +46,8 @@ async function runPosix(capability, smokeCapability, outputArgument) {
   assert.equal(sha(fixtureSource), SOURCE_SHA)
   const fixtureSha = sha(fixture)
   assert.equal(fixtureSha, tuple.fixtureSha256)
+  const fixtureRelocation = require('./fixture-relocation.cjs').derive(fixture)
+  const fixtureRelocationRecipeSha256 = sha(fs.readFileSync(path.join(repo, 'scripts/windows-msys/portable-probe/fixture-relocation.cjs')))
   const runtimeRecords = closureRecords(original)
   const dependencies = importedDlls(fixture)
   const pe = fixture.readUInt32LE(60); assert.equal(fixture.readUInt16LE(pe + 4), 0x8664, 'Fixture must be x64 MSYS')
@@ -77,13 +79,13 @@ async function runPosix(capability, smokeCapability, outputArgument) {
   fs.mkdirSync(path.join(runtimeRoot, 'etc'))
   fs.writeFileSync(path.join(runtimeRoot, 'etc', 'fstab'), 'none /tmp usertemp binary,posix=0,noacl 0 0\n', { flag: 'wx', mode: 0o400 })
   for (const file of original) fs.writeFileSync(path.join(runtime, file.name), file.bytes, { flag: 'wx', mode: 0o500 })
-  fs.writeFileSync(path.join(runtime, 'posix-proof.exe'), fixture, { flag: 'wx', mode: 0o500 })
+  fs.writeFileSync(path.join(runtime, 'posix-proof.exe'), fixtureRelocation.bytes, { flag: 'wx', mode: 0o500 })
   const copied = bindBashRuntime(runtime, process.env.SystemRoot)
   assert.deepEqual(closureRecords(copied), runtimeRecords)
   const bash = copied.find(file => file.name === 'bash.exe'), msys = copied.find(file => file.name === 'msys-2.0.dll')
   const logPath = path.join(root, 'results.jsonl')
   const note = require('./progress.cjs').createBoundedJsonl(logPath)
-  note({ status: 'bound', tuple, accepted: false, root, sourceSha256: SOURCE_SHA, fixtureSha256: fixtureSha, runtime: closureRecords(copied), mqueue: 'not-run: isolated /dev/mqueue backing required' })
+  note({ status: 'bound', tuple, accepted: false, root, sourceSha256: SOURCE_SHA, fixtureSha256: fixtureSha, fixtureTransformation: fixtureRelocation.receipt, fixtureTransformationRecipeSha256: fixtureRelocationRecipeSha256, runtime: closureRecords(copied), mqueue: 'not-run: isolated /dev/mqueue backing required' })
   for (const mode of MODES) {
     const controlRoot = mkdir(mode + '-control'), scratch = mkdir(mode + '-scratch'), target = mkdir(mode + '-target')
     const stdoutPath = path.join(scratch, 'fixture-output.jsonl'), cancellationPath = path.join(controlRoot, 'cancel')
@@ -151,7 +153,7 @@ async function runPosix(capability, smokeCapability, outputArgument) {
         assert.deepEqual(fs.readdirSync(scratch), ['fixture-output.jsonl'])
       }
       assert.deepEqual(closureRecords(bindBashRuntime(runtime, process.env.SystemRoot)), runtimeRecords)
-      assert.equal(sha(readBounded(path.join(runtime, 'posix-proof.exe'))), fixtureSha)
+      assert.equal(sha(readBounded(path.join(runtime, 'posix-proof.exe'))), fixtureRelocation.receipt.derivedSha256)
       note({ mode, status: 'passed' })
     } catch (error) {
       stop.abort(); if (monitor) await monitor
@@ -177,8 +179,9 @@ async function runPosix(capability, smokeCapability, outputArgument) {
     }
   }
   assert.deepEqual(closureRecords(bindBashRuntime(runtime, process.env.SystemRoot)), runtimeRecords)
-  assert.equal(sha(readBounded(path.join(runtime, 'posix-proof.exe'))), fixtureSha)
+  assert.equal(sha(readBounded(path.join(runtime, 'posix-proof.exe'))), fixtureRelocation.receipt.derivedSha256)
   const receipt = { status: 'consumer-native-posix-passed-not-accepted', modes: MODES, tuple,
+    fixtureTransformation: fixtureRelocation.receipt, fixtureTransformationRecipeSha256: fixtureRelocationRecipeSha256,
     mqueue: 'not-run: isolated /dev/mqueue backing required', root, accepted: false }
   note(receipt)
   return Object.freeze(receipt)
