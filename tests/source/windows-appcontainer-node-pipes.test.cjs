@@ -10,6 +10,8 @@ const fixtures = path.resolve(__dirname, '../fixtures/windows-appcontainer')
 const workerSource = path.join(fixtures, 'node-pipe-worker.cjs')
 const { bindWorker, identify, unchanged, hostEnvironment } = require('../helpers/windows-node-pipe-worker.cjs')
 const modes = ['inherit', 'pipe', 'ipc', 'ignore']
+const missingLocatorExitCode = 86
+const missingLocatorCode = 'PRIVATE_NUL_LOCATOR_MISSING'
 const passed = mode => ({ stage: 'passed', mode, children: 1, childExitCode: mode === 'ignore' ? 17 : 0, ...(mode === 'pipe' || mode === 'ignore' ? { grandchildren: 2, grandchildIgnoredExitCode: 23, emptyEnvironment: true } : {}) })
 
 test('Node pipe worker selection binds an explicit physical file and rejects incomplete or changed bindings', t => {
@@ -66,17 +68,27 @@ test('native-only Node requirement refuses a missing locator instead of relaxing
 })
 
 test('nested Node worker refuses a locator that does not propagate through an empty child environment', () => {
-  const selected = bindWorker()
-  // A host-only fake locator is never opened: ordinary Node leaves it out of
-  // env={}, so the grandchild must fail its required-propagation assertion.
+  const selected = bindWorker(), identity = identify(selected)
   const result = cp.spawnSync(selected.file, [workerSource, 'nested-child', 'ignore', '1'], {
-    encoding: 'utf8', timeout: 5000,
-    env: { ...hostEnvironment(), AUTOPROMPT_PRIVATE_NUL_HANDLE: '0000000000001234' },
+    encoding: 'utf8', timeout: 5000, env: {},
   })
   assert.ifError(result.error)
-  assert.equal(result.status, 1)
+  assert.equal(result.status, missingLocatorExitCode)
   assert.equal(result.stdout, '')
-  assert.match(result.stderr, /AssertionError/)
+  assert.equal(result.stderr, '')
+  const malformed = cp.spawnSync(selected.file, [workerSource, 'nested-child', 'ignore', '1'], {
+    encoding: 'utf8', timeout: 5000, env: { ...hostEnvironment(), AUTOPROMPT_PRIVATE_NUL_HANDLE: 'malformed' },
+  })
+  assert.ifError(malformed.error); assert.equal(malformed.status, 1)
+  assert.equal(malformed.stdout, ''); assert.match(malformed.stderr, /AssertionError/)
+  // The fake locator reaches the outer process but ordinary Node deliberately
+  // omits it from the nested env={}; this exercises the exact parent mapping.
+  const parent = cp.spawnSync(selected.file, [workerSource, 'ignore', '--require-private-null'], { encoding: 'utf8', timeout: 5000,
+    env: { ...hostEnvironment(), AUTOPROMPT_PRIVATE_NUL_HANDLE: '0000000000001234' } })
+  assert.ifError(parent.error); assert.equal(parent.status, 1); assert.equal(parent.stderr, '')
+  assert.deepEqual(lines(parent.stdout, 'ignore', identity).map(value => JSON.parse(value)), [
+    { stage: 'failed', mode: 'ignore', phase: 'spawn', code: missingLocatorCode },
+  ])
   unchanged(selected)
 })
 
@@ -156,7 +168,7 @@ test('native Windows Node pipe diagnostic records stdio and fork IPC support wit
       const failure = JSON.parse(output[0])
       assert.deepEqual(Object.keys(failure).sort(), ['code', 'mode', 'phase', 'stage'])
       assert.deepEqual({ stage: failure.stage, mode: failure.mode, phase: failure.phase }, { stage: 'failed', mode, phase: 'spawn' })
-      assert.ok(['EACCES', 'EPERM', 'ENOSYS', 'ETIMEDOUT'].includes(failure.code), 'Unexpected fixture errors are failures, not unsupported observations')
+      assert.ok(['EACCES', 'EPERM', 'ENOSYS', 'ETIMEDOUT', missingLocatorCode].includes(failure.code), 'Unexpected fixture errors are failures, not unsupported observations')
       t.diagnostic(`Node ${identity.node} libuv ${identity.uv} ${mode}: unsupported-${failure.code}; owned job drained`)
     } else {
       assert.deepEqual(output.map(value => JSON.parse(value)), [passed(mode)])
