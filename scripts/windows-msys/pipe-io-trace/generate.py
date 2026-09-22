@@ -4,7 +4,7 @@ import difflib, hashlib, json, pathlib, re, shutil, subprocess, sys, tempfile
 HERE = pathlib.Path(__file__).resolve().parent
 BASE = '8bc01e2694245b271699128399aba48777fa44b878376ee9d84b82b8929eea87'
 SOURCE = '270ba2980700e6e2a0813944d506eecea0f86402'
-SOURCE_PINS = {'winsup/cygwin/fhandler/pipe.cc': 'af33c5fde35c35e8de9104cd51e7cdc60e9984c54b779875d7f7f1c5fc5fbb99', 'winsup/cygwin/cygwait.cc': '921b698deb9c2fa02f5b2894e78d570e1bd35c0245458c7d9bb561ee7cd5b95f'}
+SOURCE_PINS = {'winsup/cygwin/fhandler/pipe.cc': 'af33c5fde35c35e8de9104cd51e7cdc60e9984c54b779875d7f7f1c5fc5fbb99', 'winsup/cygwin/cygwait.cc': '921b698deb9c2fa02f5b2894e78d570e1bd35c0245458c7d9bb561ee7cd5b95f', 'winsup/cygwin/pinfo.cc': '3e23c4bfa38fe831f27f3bfc33e1c655bb299df72321b14c0d1caab914b78687', 'winsup/cygwin/fork.cc': '4986052c127f7223562ecccf06736587c1d5144423acf82a82b56dd73473b16c'}
 
 def sha(data): return hashlib.sha256(data).hexdigest()
 def git(root, *args):
@@ -28,7 +28,7 @@ def main(args):
         git(work, 'init'); git(work, 'config', 'core.autocrlf', 'false'); git(work, 'config', 'core.symlinks', 'true')
         git(work, 'apply', '--check', str(base)); git(work, 'apply', str(base))
         paths = set(re.findall(r'^\+\+\+ b/(.+)$', base_bytes.decode(), re.M))
-        names = ['winsup/cygwin/fhandler/pipe.cc', 'winsup/cygwin/cygwait.cc']
+        names = ['winsup/cygwin/fhandler/pipe.cc', 'winsup/cygwin/cygwait.cc', 'winsup/cygwin/pinfo.cc', 'winsup/cygwin/fork.cc']
         adapted = {name: (work/name).read_bytes() for name in names}
         text = adapted[names[0]].decode()
         text = once(text, '#include <assert.h>\n', '#include <assert.h>\n#include "ntdll.h"\n#include "pipe_io_trace.h"\n')
@@ -51,6 +51,50 @@ def main(args):
         anchor = '      res = WaitForMultipleObjects (num, wait_objects, FALSE, INFINITE);\n'
         text = once(text, anchor, '      for (DWORD trace_index = 0; trace_index < num; ++trace_index)\n        autoprompt_pipe_trace ("wait-handle", wait_objects[trace_index], object, trace_index, mask);\n' + anchor + '      autoprompt_pipe_trace ("wait-result", object, NULL, res, GetLastError ());\n')
         write(work/names[1], text)
+        text = adapted[names[2]].decode()
+        text = once(text, '#include "winsup.h"\n', '#include "winsup.h"\n#include "appcontainer_named_kernel.h"\n#include "pipe_io_trace.h"\n')
+        selector = """static bool
+ autoprompt_pid_link_trial ()
+{
+  auto teb = NtCurrentTeb ();
+  ULONG error = teb->LastErrorValue, status = teb->LastStatusValue;
+  WCHAR value[2] = {};
+  DWORD length = GetEnvironmentVariableW (L"AUTOPROMPT_DIAGNOSTIC_PID_LINK_ADAPTER", value, 2);
+  bool selected = length == 1 && value[0] == L'1';
+  teb->LastErrorValue = error; teb->LastStatusValue = status;
+  return selected;
+}
+
+"""
+        text = once(text, 'void\npinfo::create_winpid_symlink ()\n', selector + 'void\npinfo::create_winpid_symlink ()\n')
+        start = text.index('pid_t\ncygwin_pid (DWORD dwProcessId)\n'); end = text.index('\n/* Create "winpid.WINPID"', start)
+        chunk = text[start:end]
+        chunk = after(chunk, '  status = NtOpenSymbolicLinkObject (&sym_hdl, SYMBOLIC_LINK_QUERY, &attr);\n', '  autoprompt_pipe_trace ("pid-link-open", NT_SUCCESS (status) ? sym_hdl : NULL, attr.RootDirectory, status, dwProcessId);\n')
+        chunk = after(chunk, '  status = NtQuerySymbolicLinkObject (sym_hdl, &pid_str, NULL);\n', '  autoprompt_pipe_trace ("pid-link-query", sym_hdl, attr.RootDirectory, status, dwProcessId);\n')
+        chunk = after(chunk, '  pid_t ret = (pid_t) wcstoul (pid_str.Buffer, NULL, 10);\n', '  autoprompt_pipe_trace ("pid-link-result", NULL, attr.RootDirectory, (ULONG) ret, dwProcessId);\n')
+        text = text[:start] + chunk + text[end:]
+        original = '  NtCreateSymbolicLinkObject (&winpid_hdl, SYMBOLIC_LINK_ALL_ACCESS,\n\t\t\t      &attr, &pid_str);\n'
+        replacement = """  const bool trial = autoprompt_pid_link_trial ();
+  NTSTATUS link_status;
+  if (trial)
+    link_status = appcontainer_named_kernel_create (&winpid_hdl, &attr,
+      [&] (POBJECT_ATTRIBUTES private_attributes) {
+        return NtCreateSymbolicLinkObject (&winpid_hdl, SYMBOLIC_LINK_ALL_ACCESS,
+                                          private_attributes, &pid_str);
+      });
+  else
+    link_status = NtCreateSymbolicLinkObject (&winpid_hdl, SYMBOLIC_LINK_ALL_ACCESS,
+                                             &attr, &pid_str);
+  autoprompt_pipe_trace (trial ? "pid-link-create-adapted" : "pid-link-create-original",
+                        NT_SUCCESS (link_status) ? winpid_hdl : NULL,
+                        attr.RootDirectory, link_status, (ULONG) procinfo->pid);
+"""
+        text = once(text, original, replacement); write(work/names[2], text)
+        text = adapted[names[3]].decode()
+        text = once(text, '#include "appcontainer_anonymous_pipe.h"\n', '#include "appcontainer_anonymous_pipe.h"\n#include "ntdll.h"\n#include "pipe_io_trace.h"\n')
+        text = once(text, '  return child_pid;\n', '  autoprompt_pipe_trace ("fork-parent-return", hchild, NULL, (ULONG) child_pid, pi.dwProcessId);\n  return child_pid;\n')
+        text = after(text, '  syscall_printf ("%R = fork()", res);\n', '  autoprompt_pipe_trace ("fork-return", NULL, NULL, (ULONG) res, ischild ? 1 : 0);\n')
+        write(work/names[3], text)
         header = 'winsup/cygwin/pipe_io_trace.h'; (work/header).write_bytes((HERE/'trace.h').read_bytes()); paths.update(names + [header])
         patch = []; records = []
         for name in sorted(paths):
@@ -66,6 +110,6 @@ def main(args):
         git(work, 'apply', '--check', str(out/'combined.patch')); git(work, 'apply', str(out/'combined.patch'))
         for record in records:
             if sha((work/record['path']).read_bytes()) != record['resultSha256']: raise ValueError('combined patch result mismatch')
-        manifest = {'schema': 1, 'status': 'diagnostic-only', 'sourceCommit': SOURCE, 'basePatchSha256': BASE, 'combinedPatchSha256': sha(combined), 'generatorSha256': sha(pathlib.Path(__file__).read_bytes()), 'headerSha256': sha((HERE/'trace.h').read_bytes()), 'recordLimitPerTranslationUnitPerProcess': 128, 'records': records}
+        manifest = {'schema': 1, 'status': 'diagnostic-only', 'sourceCommit': SOURCE, 'basePatchSha256': BASE, 'combinedPatchSha256': sha(combined), 'generatorSha256': sha(pathlib.Path(__file__).read_bytes()), 'headerSha256': sha((HERE/'trace.h').read_bytes()), 'recordLimitPerTranslationUnitPerProcess': 128, 'conditionalDescriptorTrial': 'AUTOPROMPT_DIAGNOSTIC_PID_LINK_ADAPTER=1; winpid symbolic link only', 'records': records}
         write(out/'manifest.json', json.dumps(manifest, indent=2)+'\n')
 if __name__ == '__main__': main(sys.argv[1:])

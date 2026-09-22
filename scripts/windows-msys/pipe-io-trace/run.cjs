@@ -27,14 +27,18 @@ function main(args) {
   const dll = bound(path.join(payload, 'stage/usr/bin/msys-2.0.dll'), 32 * 1048576), dllVariant = mapping.dynamicBaseOnly(dll, 0), bashVariant = mapping.dynamicBaseOnly(input.bash, 0x8000, false)
   const work = mapping.privateDirectory(repo, fs.mkdtempSync(path.join(output, 'pipe-io-diagnostic-'))), controller = mapping.compileController(repo, work)
   const sharedId = require(path.join(repo, 'agents/codex/workflow/windows-appcontainer.js')).parseMsysSharedId(dllVariant.patched)
-  const trial = mapping.arm(repo, path.join(work, 'pipe-io-trace'), 'pipe-io-trace', bashVariant.patched, dllVariant.patched, sharedId, dllVariant.info)
-  const launched = cp.spawnSync(controller, trial.args, { cwd: trial.root, encoding: 'utf8', timeout: 150000, maxBuffer: 1048576, windowsHide: true, shell: false, env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.SystemRoot, SystemDrive: process.env.SystemRoot.slice(0, 2), PATH: path.join(process.env.SystemRoot, 'System32'), TEMP: trial.root, TMP: trial.root } })
-  fs.writeFileSync(path.join(work, 'controller.stdout.txt'), launched.stdout || ''); fs.writeFileSync(path.join(work, 'controller.stderr.txt'), launched.stderr || '')
-  assert.ifError(launched.error); assert.equal(launched.status, 0, launched.stderr || launched.stdout)
-  const result = JSON.parse(fs.readFileSync(path.join(trial.root, 'pipe-io-trace.json'), 'utf8'))
+  const runArm = label => {
+    const trial = mapping.arm(repo, path.join(work, label), label, bashVariant.patched, dllVariant.patched, sharedId, dllVariant.info)
+    const launched = cp.spawnSync(controller, trial.args, { cwd: trial.root, encoding: 'utf8', timeout: 150000, maxBuffer: 1048576, windowsHide: true, shell: false, env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.SystemRoot, SystemDrive: process.env.SystemRoot.slice(0, 2), PATH: path.join(process.env.SystemRoot, 'System32'), TEMP: trial.root, TMP: trial.root } })
+    fs.writeFileSync(path.join(trial.root, 'controller.stdout.txt'), launched.stdout || ''); fs.writeFileSync(path.join(trial.root, 'controller.stderr.txt'), launched.stderr || '')
+    assert.ifError(launched.error); assert.equal(launched.status, 0, launched.stderr || launched.stdout)
+    return JSON.parse(fs.readFileSync(path.join(trial.root, label + '.json'), 'utf8'))
+  }
+  const result = runArm('pipe-io-trace'), adapterTrial = runArm('pid-link-adapter-trial')
+  assert.equal(result.bashSha256, adapterTrial.bashSha256); assert.equal(result.msysSha256, adapterTrial.msysSha256)
   const sources = {}
   for (const name of ['.github/workflows/native-platform.yml', 'scripts/windows-msys/pipe-io-trace/generate.py', 'scripts/windows-msys/pipe-io-trace/trace.h', 'scripts/windows-msys/pipe-io-trace/run.cjs', 'scripts/windows-msys/build.ps1', 'scripts/windows-msys/build.sh', 'scripts/windows-msys/build-lock.json', 'scripts/windows-msys/mapping-proof/run.cjs', 'scripts/windows-msys/mapping-proof/source/mapping-controller.cs', 'agents/codex/workflow/windows-appcontainer-native.cs']) sources[name] = sha(bound(path.join(repo, name), 4 * 1048576))
-  const report = { schema: 1, status: 'observed-not-accepted', scope: 'one traced x64 build, not runtime acceptance', packetManifestSha256: sha(input.manifestBytes), combinedPatchSha256: sha(combined), traceManifestSha256: sha(manifest), traceManifest: JSON.parse(manifest), toolchainRecordsSha256: sha(toolchainBefore), sources, originalBuiltDllSha256: sha(dll), derivedDllSha256: sha(dllVariant.patched), dllChangedOffsets: dllVariant.changed, derivedBashSha256: sha(bashVariant.patched), bashChangedOffsets: bashVariant.changed, result }
+  const report = { schema: 1, status: 'observed-not-accepted', scope: 'one traced x64 build; original PID link and package-descriptor trial; not runtime acceptance', packetManifestSha256: sha(input.manifestBytes), combinedPatchSha256: sha(combined), traceManifestSha256: sha(manifest), traceManifest: JSON.parse(manifest), toolchainRecordsSha256: sha(toolchainBefore), sources, originalBuiltDllSha256: sha(dll), derivedDllSha256: sha(dllVariant.patched), dllChangedOffsets: dllVariant.changed, derivedBashSha256: sha(bashVariant.patched), bashChangedOffsets: bashVariant.changed, result, adapterTrial }
   fs.writeFileSync(path.join(work, 'summary.json'), JSON.stringify(report, null, 2) + '\n')
   process.stdout.write(JSON.stringify(report) + '\n')
 }
