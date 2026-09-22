@@ -342,6 +342,56 @@ test('Codex Windows hash manifest accepts nested portable keys for real drive-ro
   })
 })
 
+test('Codex portable manifest keys resolve against ConfigRoot during read and write', {
+  skip: !POWERSHELL_AVAILABLE,
+}, t => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-manifest-rooted-'))
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
+  const root = path.join(sandbox, 'provider root')
+  const relative = '.autoprompt-private/bundles/codex-v2.0.0-aaaaaaaaaaaaaaaa/skills/autoprompt/agents-runtime/ap-arbiter.toml'
+  const target = path.join(root, ...relative.split('/'))
+  const hash = 'a'.repeat(64)
+  fs.mkdirSync(path.dirname(target), { recursive: true })
+  fs.writeFileSync(target, 'portable private agent\n')
+  fs.writeFileSync(path.join(root, '.autoprompt-install-hashes.json'),
+    canonicalManifest([[relative, hash]]))
+  const command = [
+    "$ErrorActionPreference = 'Stop'",
+    `. ${ps(LIBRARY)}`,
+    `$entries=Read-IdemManifestEntries -ConfigRoot ${ps(root)}`,
+    `$identity=Get-IdemManifestKeyIdentity -ConfigRoot ${ps(root)} -Key ${ps(relative)}`,
+    `$ok=Set-IdemManifestHashes -ConfigRoot ${ps(root)} -Hashes @(@{Key=${ps(target)};Hash=${ps(hash)}}) -UseIdentityIndex`,
+    `$raw=[IO.File]::ReadAllText((Join-Path ${ps(root)} '.autoprompt-install-hashes.json'))`,
+    '@{count=$entries.Count;identity=$identity;ok=$ok;raw=$raw}|ConvertTo-Json -Compress',
+  ].join(';')
+  const result = runPowerShell(command)
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const actual = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1))
+  assert.equal(actual.count, 1)
+  assert.equal(actual.identity, path.resolve(target))
+  assert.equal(actual.ok, true)
+  assert.equal(actual.raw, canonicalManifest([[relative, hash]]))
+
+  // The relative and absolute spellings identify one file.  A cwd-based
+  // parser sees two different identities; ConfigRoot-based parsing must reject
+  // the alias before the manifest can be rewritten.
+  fs.writeFileSync(path.join(root, '.autoprompt-install-hashes.json'),
+    canonicalManifest([[relative, hash], [target, hash]]))
+  const duplicateCommand = [
+    "$ErrorActionPreference = 'Stop'",
+    `. ${ps(LIBRARY)}`,
+    `$threw=$false; try { Read-IdemManifestEntries -ConfigRoot ${ps(root)} | Out-Null } catch { $threw=$true }`,
+    '@{threw=$threw}|ConvertTo-Json -Compress',
+  ].join(';')
+  const duplicateResult = runPowerShell(duplicateCommand)
+  assert.equal(duplicateResult.status, 0,
+    `${duplicateResult.stdout}\n${duplicateResult.stderr}`)
+  assert.deepEqual(
+    JSON.parse(duplicateResult.stdout.trim().split(/\r?\n/).at(-1)),
+    { threw: true },
+  )
+})
+
 test('Codex Windows hash manifest rejects noncanonical or escaping nested target spellings', {
   skip: process.platform !== 'win32',
 }, t => {

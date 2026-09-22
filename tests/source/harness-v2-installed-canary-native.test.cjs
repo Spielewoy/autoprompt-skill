@@ -256,6 +256,19 @@ test(PUBLIC_CASE, { skip: !CLI, timeout: process.platform === 'win32' ? 3720000 
   } catch (error) {
     if (result) t.diagnostic(`Public activation output: ${JSON.stringify({ code: result.code, signal: result.signal,
       stdout: String(result.stdout || '').slice(-8192), stderr: String(result.stderr || '').slice(-8192) })}`)
+    try {
+      const parent = path.join(root, '.autoprompt-private', 'activations')
+      const ids = fs.readdirSync(parent).filter(name => /^apv2-[a-f0-9]{32}$/.test(name))
+      assert.equal(ids.length, 1)
+      const activationRoot = path.join(parent, ids[0])
+      const recordPath = path.join(activationRoot, 'activation.json')
+      const stat = fs.lstatSync(recordPath)
+      assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.size <= 2 * 1024 * 1024)
+      const record = JSON.parse(fs.readFileSync(recordPath, 'utf8'))
+      diagnoseNativeCanary({ activationRoot, record }, message => t.diagnostic(message))
+    } catch (diagnosticError) {
+      t.diagnostic(`Public canary diagnostics unavailable: ${diagnosticError.code || diagnosticError.name}`)
+    }
     throw error
   }
 })

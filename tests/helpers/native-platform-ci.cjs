@@ -137,8 +137,10 @@ function diagnosticStageFiles(id) {
 }
 
 async function runDiagnosticStages({ environment, evidence, publish, run = runTests,
-  packedOnly = false, aggregateLog = 'native-platform-tests.log', stageLogPrefix = 'native-platform-tests-' }) {
-  const stages = packedOnly ? DIAGNOSTIC_STAGES.filter(stage => stage.id === 'packed') : DIAGNOSTIC_STAGES
+  packedOnly = false, publicOnly = false, aggregateLog = 'native-platform-tests.log', stageLogPrefix = 'native-platform-tests-' }) {
+  const stages = publicOnly ? [{ id: 'public', cases: [
+    'packed public Claude activate admits a fresh native canary before controlled endpoint refusal and revokes',
+  ] }] : packedOnly ? DIAGNOSTIC_STAGES.filter(stage => stage.id === 'packed') : DIAGNOSTIC_STAGES
   const diagnosticCases = stages.flatMap(stage => stage.cases)
   evidence.diagnosticOnly = true
   evidence.selectedCases = diagnosticCases
@@ -174,6 +176,33 @@ async function main() {
   const action = process.argv[2]
   if (process.env.AUTOPROMPT_CI_EXPECTED_ARCH) assert.equal(process.arch, process.env.AUTOPROMPT_CI_EXPECTED_ARCH,
     'The runner must exercise the requested architecture, without silently using an emulated Node binary')
+  if (action === 'windows-regressions') {
+    assert.equal(process.platform, 'win32')
+    const cases = DIAGNOSTIC_STAGES.filter(stage => ['command-cwd', 'infra'].includes(stage.id)).flatMap(stage => stage.cases)
+    const stages = [
+      { id: 'launch', cases, argv: ['--test-name-pattern', `^(?:${cases.join('|')})$`,
+        'tests/source/windows-bash-runtime.test.cjs', 'tests/source/windows-job-helper.test.cjs'] },
+      { id: 'installer', cases: ['packed artifact installs and verifies all public providers without the checkout or network'],
+        argv: ['tests/source/packed-harness-v2-lifecycle.test.cjs'] },
+    ]
+    const evidence = { diagnosticOnly: true, nativeCapabilitiesPassed: false, platform: process.platform,
+      architecture: process.arch, node: process.version, stages: [] }
+    const publish = () => fs.writeFileSync('native-platform-evidence.json', JSON.stringify(evidence, null, 2) + '\n')
+    publish()
+    for (const stage of stages) {
+      let error = null
+      try {
+        const result = await runTests(['--test', '--test-reporter=tap', '--test-concurrency=1', ...stage.argv],
+          process.env, `native-platform-tests-${stage.id}.log`)
+        assert.equal(result.code, 0, `Windows regression ${stage.id} failed`)
+        for (const name of stage.cases) assertNamedCase(result.output, name)
+      } catch (failure) { error = String(failure.stack || failure).slice(0, 2048) }
+      evidence.stages.push({ id: stage.id, passed: error === null, error })
+      publish()
+    }
+    assert.ok(evidence.stages.every(stage => stage.passed), 'Windows regression diagnostics failed')
+    return
+  }
   if (action === 'doctor') {
     const powershell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
     cp.execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'], { timeout: 30000 })
@@ -222,7 +251,7 @@ async function main() {
     process.stdout.write('macOS: native filesystem/process tests enabled. Native Claude activation remains unavailable; VM runtime is required.\n')
     return
   }
-  assert.ok(['run', 'diagnose-claude', 'diagnose-claude-packed'].includes(action), 'Expected platform, doctor, kilo-shell, prepare, macos-primitives, run, diagnose-claude or diagnose-claude-packed')
+  assert.ok(['run', 'diagnose-claude', 'diagnose-claude-packed', 'diagnose-claude-public'].includes(action), 'Expected a platform, installer or Claude test action')
   const diagnostic = action !== 'run'
   assert.ok(['linux', 'win32'].includes(process.platform))
   const version = process.env.CLAUDE_CODE_VERSION
@@ -259,7 +288,7 @@ async function main() {
     fs.writeFileSync(aggregateLog, '')
     await runDiagnosticStages({
       environment: { ...process.env, AUTOPROMPT_CLAUDE_TEST_CLI: executable, AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1' },
-      evidence, publish, aggregateLog, packedOnly: action === 'diagnose-claude-packed' })
+      evidence, publish, aggregateLog, packedOnly: action === 'diagnose-claude-packed', publicOnly: action === 'diagnose-claude-public' })
     return
   }
   evidence.skipped = /# SKIP\b/i.test(output) || !/^# skipped 0\s*$/m.test(output)

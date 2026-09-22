@@ -211,7 +211,7 @@ test('native Windows Bash bridges a deep canonical cwd for the admitted command 
       assert.deepEqual(identity(cwd), expectedIdentity);
       assert.deepEqual(identity(canonical), expectedIdentity);
       assert.equal(fs.lstatSync(cwd).isSymbolicLink(), true);
-      assert.equal(fs.readlinkSync(cwd).toLowerCase(), canonical.toLowerCase());
+      assert.equal(path.resolve(fs.readlinkSync(cwd)).toLowerCase(), path.resolve(canonical).toLowerCase());
       assert.equal(path.basename(bridgeParent), 'cwd-bridge');
       assert.deepEqual(fs.readdirSync(bridgeParent), ['command-cwd']);
       denied(() => fs.writeFileSync(path.join(bridgeParent, 'worker-write'), 'forbidden'));

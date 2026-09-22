@@ -104,6 +104,21 @@ test('packed-only diagnostic executes and records only its required native case'
     run: async () => ({ code: 0, output: `ok 1 - ${name} # SKIP missing CLI\n` }) }), /Required test must execute/)
 })
 
+test('public-only diagnostic requires its exact native activation and cannot certify the full suite', async () => {
+  const name = 'packed public Claude activate admits a fresh native canary before controlled endpoint refusal and revokes'
+  const evidence = {}, calls = []
+  await runDiagnosticStages({ environment: {}, evidence, publish() {}, publicOnly: true,
+    run: async argv => { calls.push(argv); return { code: 0, output: `ok 1 - ${name}\n` } } })
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].at(-1), 'tests/source/harness-v2-installed-canary-native.test.cjs')
+  assert.deepEqual(evidence.selectedCases, [name])
+  assert.deepEqual(evidence.diagnosticStages.map(stage => stage.id), ['public'])
+  assert.equal(evidence.diagnosticOnly, true)
+  assert.equal(evidence.nativeCapabilitiesPassed, undefined)
+  await assert.rejects(runDiagnosticStages({ environment: {}, evidence: {}, publish() {}, publicOnly: true,
+    run: async () => ({ code: 0, output: `ok 1 - ${name} # SKIP missing CLI\n` }) }), /Required test must execute/)
+})
+
 test('Windows native CI guard requires each exact native case and excludes parser lookalikes', () => {
   const transcript = names => names.map((name, index) => `ok ${index + 1} - ${name}`).join('\n')
   const complete = transcript(WINDOWS_NATIVE_CASES)

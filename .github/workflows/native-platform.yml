@@ -6,8 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      windows_regressions:
+        description: 'Diagnose Windows cwd, owned proxy and packed installer on Node 20 and 24'
+        required: false
+        default: false
+        type: boolean
       claude_diagnostic:
-        description: 'Diagnose packed native Claude on Windows x64 and ARM64'
+        description: 'Diagnose public native Claude activation on Windows x64 and ARM64'
         required: false
         default: false
         type: boolean
@@ -48,7 +53,7 @@ permissions:
 
 jobs:
   platform-primitives:
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.claude_diagnostic != true && inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_fork_memory != true) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.windows_regressions != true && inputs.claude_diagnostic != true && inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_fork_memory != true) }}
     name: Platform and installer / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
     # The one diagnostic producer may compile a separate traced DLL after the
@@ -697,14 +702,14 @@ jobs:
 
   claude-native:
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_fork_memory != true && (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)) }}
-    name: Actual Claude 2.1.270 / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
+    name: ${{ inputs.windows_regressions == true && 'Windows regressions' || 'Actual Claude 2.1.270' }} / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
     # Windows repeats the fresh process-local command canary in the direct,
     # packed and public activation suites, including native helper startup.
     timeout-minutes: ${{ startsWith(matrix.runner.os, 'windows-') && 90 || 45 }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(inputs.claude_diagnostic == true && '{"runner":[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["24.x"]}' || '{"runner":[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"},{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}') }}
+      matrix: ${{ fromJSON((inputs.windows_regressions == true || inputs.claude_diagnostic == true) && '{"runner":[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}' || '{"runner":[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"},{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}') }}
     env:
       CLAUDE_CODE_VERSION: '2.1.270'
       AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
@@ -731,16 +736,21 @@ jobs:
           fi
       - run: npm ci --ignore-scripts
       - name: Select the runner's vendor binary
+        if: inputs.windows_regressions != true
         run: node tests/helpers/native-platform-ci.cjs prepare
       - name: Install exact native Claude package without lifecycle scripts
+        if: inputs.windows_regressions != true
         shell: bash
         run: npm install --prefix .native-claude --ignore-scripts --no-package-lock --no-audit --no-fund "${CLAUDE_NATIVE_PACKAGE}@${CLAUDE_CODE_VERSION}"
       - name: Require native sandbox and run every Claude capability
-        if: inputs.claude_diagnostic != true
+        if: inputs.windows_regressions != true && inputs.claude_diagnostic != true
         run: node tests/helpers/native-platform-ci.cjs run
       - name: Diagnose installed native Claude activation
-        if: inputs.claude_diagnostic == true
-        run: node tests/helpers/native-platform-ci.cjs diagnose-claude-packed
+        if: inputs.windows_regressions != true && inputs.claude_diagnostic == true
+        run: node tests/helpers/native-platform-ci.cjs diagnose-claude-public
+      - name: Diagnose Windows cwd, owned proxy and packed installer
+        if: inputs.windows_regressions == true
+        run: node tests/helpers/native-platform-ci.cjs windows-regressions
       - name: Preserve actual platform evidence and test output
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

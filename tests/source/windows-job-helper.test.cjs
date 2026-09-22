@@ -8,6 +8,75 @@ const path = require('node:path')
 const cp = require('node:child_process')
 const { selectWindowsLiveStatusPids } = require('../../agents/codex/workflow/process-owner.js')
 
+function diagnoseOwnedProcessFailure(t, root) {
+  const directories = [{ directory: root, relative: '.', depth: 0 }]
+  let directoryCount = 0, fileCount = 0
+  try {
+    while (directories.length && directoryCount < 96 && fileCount < 16) {
+      const current = directories.shift()
+      const rootStat = fs.lstatSync(current.directory)
+      if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) continue
+      directoryCount += 1
+      for (const entry of fs.readdirSync(current.directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+        const absolute = path.join(current.directory, entry.name)
+        const relative = path.join(current.relative, entry.name)
+        if (entry.isSymbolicLink()) continue
+        if (entry.isDirectory()) {
+          if (current.depth < 40) directories.push({ directory: absolute, relative, depth: current.depth + 1 })
+          continue
+        }
+        if (!['status.json', 'helper.stderr.log', 'proxy-boot.trace.jsonl'].includes(entry.name) || fileCount >= 16) continue
+        fileCount += 1
+        const stat = fs.lstatSync(absolute)
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 64 * 1024) {
+          t.diagnostic(`Owned process diagnostic ${relative}: refused non-regular, linked, or oversized file`)
+          continue
+        }
+        const bytes = fs.readFileSync(absolute)
+        const text = bytes.subarray(0, 4096).toString('utf8')
+        if (entry.name !== 'status.json') {
+          t.diagnostic(`Owned process diagnostic ${relative} (${stat.size} bytes): ${text || '[empty]'}`)
+          continue
+        }
+        try {
+          const status = JSON.parse(text)
+          const bounded = {}
+          for (const key of ['status', 'ready', 'assigned', 'helperPid', 'rootPid', 'pids', 'observedPids',
+            'cwdBridgeRequired', 'cwdBridgeCleaned', 'code', 'signal', 'error']) {
+            if (Object.hasOwn(status, key)) bounded[key] = status[key]
+          }
+          t.diagnostic(`Owned process diagnostic ${relative}: ${JSON.stringify(bounded).slice(0, 4096)}`)
+        } catch (error) {
+          t.diagnostic(`Owned process diagnostic ${relative}: unreadable JSON (${error.code || error.name})`)
+        }
+      }
+    }
+    if (directories.length || fileCount >= 16) t.diagnostic('Owned process diagnostics truncated at their fixed inventory bound')
+  } catch (error) {
+    t.diagnostic(`Owned process diagnostics unavailable: ${error.code || error.name}`)
+  }
+}
+
+function createOwnedProxyBootDiagnostic(root) {
+  const preload = path.join(root, 'proxy-boot-preload.cjs')
+  const trace = path.join(root, 'proxy-boot.trace.jsonl')
+  fs.writeFileSync(preload, [
+    "'use strict'",
+    "const fs=require('node:fs')",
+    "if(process.argv.includes('--owned-codex-proxy')||process.argv.includes('--closed-owned-test')){",
+    " const trace=process.env.AUTOPROMPT_OWNED_PROXY_BOOT_TRACE",
+    " const emit=(phase,error,message)=>{try{const size=fs.existsSync(trace)?fs.statSync(trace).size:0;if(size>=65536)return;const record={phase,pid:process.pid,node:process.version};try{record.cwd=process.cwd()}catch(cwdError){record.cwdError={code:String(cwdError.code||'').slice(0,64),message:String(cwdError.message||cwdError).replace(/[\\r\\n]+/g,' ').slice(0,512)}}try{record.realCwd=fs.realpathSync.native(record.cwd)}catch(realError){record.realCwdError={code:String(realError.code||'').slice(0,64),message:String(realError.message||realError).replace(/[\\r\\n]+/g,' ').slice(0,512)}}if(error)record.error={name:String(error.name||'Error').slice(0,64),code:String(error.code||'').slice(0,64),message:String(error.message||error).replace(/[\\r\\n]+/g,' ').slice(0,512)};if(message)record.message=String(message).replace(/[\\r\\n]+/g,' ').slice(0,512);fs.appendFileSync(trace,JSON.stringify(record)+'\\n')}catch{}}",
+    " emit('preload-enter')",
+    " const stderrWrite=process.stderr.write.bind(process.stderr);let stderrWrites=0;process.stderr.write=function(chunk,...args){if(stderrWrites++<8)emit('stderr-write',null,Buffer.isBuffer(chunk)?chunk.toString('utf8'):chunk);return stderrWrite(chunk,...args)}",
+    " process.on('uncaughtExceptionMonitor',error=>emit('uncaught-exception',error))",
+    " process.on('exit',code=>emit('exit-'+code))",
+    " setImmediate(()=>emit('module-turn')).unref()",
+    '}',
+    '',
+  ].join('\n'))
+  return { NODE_OPTIONS: `--require="${preload}"`, AUTOPROMPT_OWNED_PROXY_BOOT_TRACE: trace }
+}
+
 test('Windows Job cwd bridge cleanup remains owned until its terminal publication', () => {
   const cleaning = {
     status: 'CLEANING', ready: true, assigned: true, helperPid: 61001,
@@ -160,6 +229,7 @@ test('native Windows Job ownership survives deep durable paths and hostile home 
 
 test('native Windows owned proxy preserves deep semantic cwd through the nested child launch', { skip: process.platform !== 'win32', timeout: 240000 }, async t => {
   const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'native-proxy-long-cwd-')))
+  const bootDiagnostic = createOwnedProxyBootDiagnostic(base)
   async function exercise(base, repo) {
     const assert = require('node:assert/strict'), crypto = require('node:crypto'), fs = require('node:fs'), path = require('node:path')
     const safe = require(path.join(repo, 'agents/codex/workflow/safe-run-root.js'))
@@ -221,6 +291,8 @@ test('native Windows owned proxy preserves deep semantic cwd through the nested 
         env: prepareProcessLaunchEnvironment(adapter, reservationId, {
           SystemRoot: process.env.SystemRoot,
           PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
+          NODE_OPTIONS: process.env.NODE_OPTIONS,
+          AUTOPROMPT_OWNED_PROXY_BOOT_TRACE: process.env.AUTOPROMPT_OWNED_PROXY_BOOT_TRACE,
         }), stdin: '', sessionId, reservationId, onStdoutLine: line => lines.push(line) })
       assert.equal(execution.status, 0)
       assert.equal(execution.drained, true)
@@ -262,6 +334,7 @@ test('native Windows owned proxy preserves deep semantic cwd through the nested 
     result = await ownedTest(owner, outerRoot, {
       SystemRoot: process.env.SystemRoot,
       PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
+      ...bootDiagnostic,
       USERPROFILE: hostile, HOME: hostile, APPDATA: hostile, LOCALAPPDATA: hostile, TEMP: hostile, TMP: hostile,
       AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT: nestedOwnershipRoot,
       AUTOPROMPT_CLOSED_CANARY_PROVIDER: 'claude',
@@ -282,6 +355,7 @@ test('native Windows owned proxy preserves deep semantic cwd through the nested 
       const detail = fs.readFileSync(path.join(outerRoot, name), 'utf8').slice(0, 4096)
       if (detail) t.diagnostic(`${name}: ${detail}`)
     }
+    diagnoseOwnedProcessFailure(t, base)
     throw error
   } finally {
     try { await owner.cancelAll({ reason: 'native closed-owned nested proxy cleanup', graceMs: 0, killMs: 10000, waitForPending: true }) } catch {}
@@ -291,6 +365,7 @@ test('native Windows owned proxy preserves deep semantic cwd through the nested 
 
 test('native Windows owned proxy projects canonical Claude temp through a forced short cwd bridge', { skip: process.platform !== 'win32', timeout: 240000 }, async t => {
   const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'native-proxy-temp-')))
+  const bootDiagnostic = createOwnedProxyBootDiagnostic(base)
   const source = path.join(base, 'temp-child.cjs')
   const marker = path.join(base, 'temp-marker.json')
   const controlRoot = path.join(base, 'process-control')
@@ -332,6 +407,7 @@ test('native Windows owned proxy projects canonical Claude temp through a forced
     SystemRoot: process.env.SystemRoot,
     PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
     TEMP: canonicalTemp, TMP: canonicalTemp, TMPDIR: canonicalTemp,
+    ...bootDiagnostic,
     AP_TEMP_UNRELATED: 'preserve-this-value',
   })
   try {
@@ -366,6 +442,7 @@ test('native Windows owned proxy projects canonical Claude temp through a forced
       SystemRoot: process.env.SystemRoot,
       PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
       TEMP: canonicalTemp, TMP: canonicalTemp, TMPDIR: canonicalTemp,
+      ...bootDiagnostic,
       AP_TEMP_UNRELATED: 'preserve-this-value',
     })
     const rejected = await runner.run({ executable: process.execPath, argv: [source, ...childArgs], cwd: anchor, env: badEnv, stdin: '',
@@ -375,6 +452,10 @@ test('native Windows owned proxy projects canonical Claude temp through a forced
     assert.match(String(rejected.stderr || ''), /CODEX_PROXY_REQUEST_INVALID/)
     assert.equal(fs.existsSync(marker), false)
     assert.equal(fs.existsSync(path.join(base, 'outside-temp', 'canonical-witness.txt')), false)
+  } catch (error) {
+    t.diagnostic('Native canonical temp fixture at failure: ' + base)
+    diagnoseOwnedProcessFailure(t, base)
+    throw error
   } finally {
     try { await runner.stop({ sessionId, reason: 'canonical temp projection cleanup' }) } catch {}
     try {

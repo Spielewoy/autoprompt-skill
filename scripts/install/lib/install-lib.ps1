@@ -1916,6 +1916,7 @@ function ConvertFrom-IdemManifestLine {
         [string]$Line,
         [bool]$ShouldHaveComma,
         [string]$Manifest,
+        [string]$ConfigRoot,
         [System.Collections.Generic.HashSet[string]]$Spellings,
         [System.Collections.Generic.HashSet[string]]$Identities
     )
@@ -1936,7 +1937,10 @@ function ConvertFrom-IdemManifestLine {
         [string]::IsNullOrEmpty($key)) {
         throw "invalid ownership manifest key: $Manifest"
     }
-    $normalizedKey = Get-IdemNormalizedPath -Path $key
+    # Portable manifest keys are rooted at ConfigRoot, never at the process
+    # working directory.  Resolving them against cwd makes private Codex
+    # bundle entries depend on where install.ps1 happened to be launched.
+    $normalizedKey = Get-IdemManifestKeyIdentity -ConfigRoot $ConfigRoot -Key $key
     if (-not $Spellings.Add($key)) { throw "duplicate manifest key: $key" }
     if ([string]::IsNullOrEmpty($normalizedKey) -or
         -not $Identities.Add($normalizedKey)) {
@@ -1969,7 +1973,8 @@ function Read-IdemManifestEntries {
     for ($index = 1; $index -lt $parsed.Lines.Count - 1; $index++) {
         $entry = ConvertFrom-IdemManifestLine -Line $parsed.Lines[$index] `
             -ShouldHaveComma ($index -lt $parsed.Lines.Count - 2) `
-            -Manifest $manifest -Spellings $spellings -Identities $identities
+            -Manifest $manifest -ConfigRoot $ConfigRoot `
+            -Spellings $spellings -Identities $identities
         $canonical += $entry.Canonical
         $entries.Add($entry.Key, $entry.Hash)
     }
@@ -1981,13 +1986,15 @@ function Read-IdemManifestEntries {
 
 function Test-IdemManifestEntries {
     param(
+        [string]$ConfigRoot,
         [System.Collections.IDictionary]$Entries,
         [string]$Manifest
     )
     $identities = New-Object 'System.Collections.Generic.HashSet[string]' `
         (Get-IdemPathComparer)
     foreach ($key in $Entries.Keys) {
-        $normalizedKey = Get-IdemNormalizedPath -Path ([string]$key)
+        $normalizedKey = Get-IdemManifestKeyIdentity -ConfigRoot $ConfigRoot `
+            -Key ([string]$key)
         $hash = [string]$Entries[$key]
         if ([string]::IsNullOrEmpty($normalizedKey) -or
             -not $identities.Add($normalizedKey) -or
@@ -2046,8 +2053,8 @@ function Write-IdemManifestDocument {
 function Write-IdemManifestEntries {
     param([string]$ConfigRoot, [System.Collections.IDictionary]$Entries)
     $manifest = Join-Path $ConfigRoot $AutopromptHashManifestName
-    if (-not (Test-IdemManifestEntries -Entries $Entries `
-        -Manifest $manifest)) { return $false }
+    if (-not (Test-IdemManifestEntries -ConfigRoot $ConfigRoot `
+        -Entries $Entries -Manifest $manifest)) { return $false }
     $document = New-IdemManifestDocument -Entries $Entries
     return Write-IdemManifestDocument -Manifest $manifest -Document $document
 }
