@@ -11,6 +11,12 @@ on:
         required: false
         default: false
         type: boolean
+      windows_regression_stage:
+        description: 'Select one stage when Windows regression diagnostics are enabled'
+        required: false
+        default: all
+        type: choice
+        options: [all, snapshot, launch, installer]
       claude_diagnostic:
         description: 'Diagnose public native Claude activation on Windows x64 and ARM64'
         required: false
@@ -751,6 +757,8 @@ jobs:
         run: node tests/helpers/native-platform-ci.cjs diagnose-claude-public
       - name: Diagnose Windows cwd, owned proxy and packed installer
         if: inputs.windows_regressions == true
+        env:
+          AUTOPROMPT_WINDOWS_REGRESSION_STAGE: ${{ inputs.windows_regression_stage || 'all' }}
         run: node tests/helpers/native-platform-ci.cjs windows-regressions
       - name: Preserve actual platform evidence and test output
         if: always()

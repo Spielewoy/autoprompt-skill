@@ -188,11 +188,14 @@ async function main() {
       { id: 'installer', cases: ['packed artifact installs and verifies all public providers without the checkout or network'],
         argv: ['tests/source/packed-harness-v2-lifecycle.test.cjs'] },
     ]
-    const evidence = { diagnosticOnly: true, nativeCapabilitiesPassed: false, platform: process.platform,
+    const requestedStage = process.env.AUTOPROMPT_WINDOWS_REGRESSION_STAGE || 'all'
+    assert.ok(['all', ...stages.map(stage => stage.id)].includes(requestedStage), 'Unknown Windows regression stage')
+    const selectedStages = stages.filter(stage => requestedStage === 'all' || stage.id === requestedStage)
+    const evidence = { diagnosticOnly: true, nativeCapabilitiesPassed: false, requestedStage, platform: process.platform,
       architecture: process.arch, node: process.version, stages: [] }
     const publish = () => fs.writeFileSync('native-platform-evidence.json', JSON.stringify(evidence, null, 2) + '\n')
     publish()
-    for (const stage of stages) {
+    for (const stage of selectedStages) {
       let error = null
       try {
         const result = await runTests(['--test', '--test-reporter=tap', '--test-concurrency=1', ...stage.argv],

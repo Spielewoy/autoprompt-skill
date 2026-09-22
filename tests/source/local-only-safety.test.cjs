@@ -156,7 +156,13 @@ test('native Git checker snapshots preserve exact bytes beyond Windows MAX_PATH 
     enforcementProofPath: context.proofPath, safetyScriptPath: CHECKER,
     cleanupRegistry: { register: entry => registrations.push(entry) },
   })
-  const snapshot = factory('native-deep-checker', [])
+  let snapshot
+  try {
+    snapshot = factory('native-deep-checker', [])
+  } catch (error) {
+    t.diagnostic(`Native Git snapshot failure: ${JSON.stringify(error.details || {}).slice(0, 8192)}`)
+    throw error
+  }
   assert.ok(snapshot.length > 300)
   assert.equal(fs.readFileSync(path.join(snapshot, 'candidate.txt'), 'utf8'), 'exact dirty candidate\n')
   const head = run('git', ['-C', snapshot, 'rev-parse', 'HEAD'], { env: environment })
