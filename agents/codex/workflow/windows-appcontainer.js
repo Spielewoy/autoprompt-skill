@@ -5,6 +5,7 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const cp = require('node:child_process')
 const { createWindowsFilesystemCapture } = require('./windows-filesystem.js')
+const { createWindowsCompilerDirectory } = require('./safe-run-root.js')
 const MAX_OUTPUT = 1024 * 1024
 class WindowsAppContainerError extends Error {
   constructor(code, message) { super(message); this.name = 'WindowsAppContainerError'; this.code = code }
@@ -125,11 +126,12 @@ function createWindowsAppContainerLauncher(options = {}) {
         const runtime = boundFile(request.msysRuntime.dllPath, 32 * 1024 * 1024)
         if (runtime.sha256 !== request.msysRuntime.dllSha256) fail('WINDOWS_RUNTIME_MISMATCH', 'Assigned MSYS runtime changed')
       }
+      const compilerDirectory = createWindowsCompilerDirectory('autoprompt-launch-')
       return new Promise((resolve, reject) => {
         startedLeases.add(options.leaseId)
         const child = cp.spawn(powershell.path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helper.path, '-NativeSha256', native.sha256, '-Request'], {
           windowsHide: true, shell: false, cwd: path.dirname(powershell.path), stdio: ['pipe', 'pipe', 'pipe'],
-          env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.join(systemRoot, 'System32'), PSModulePath: '', TEMP: path.dirname(request.cancellationPath), TMP: path.dirname(request.cancellationPath) },
+          env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.join(systemRoot, 'System32'), PSModulePath: '', TEMP: compilerDirectory, TMP: compilerDirectory },
         })
         const output = [], errors = []; let size = 0, settled = false, overLimit = false
         const cancel = () => { try { fs.writeFileSync(request.cancellationPath, 'cancel\n', { flag: 'wx', mode: 0o600 }) } catch (error) { if (error.code !== 'EEXIST') overLimit = true } }
@@ -152,7 +154,7 @@ function createWindowsAppContainerLauncher(options = {}) {
           } catch (error) { reject(error) }
         })
         child.stdin.end(JSON.stringify(request))
-      })
+      }).finally(() => fs.rmSync(compilerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
     },
   })
 }

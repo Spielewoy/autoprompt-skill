@@ -31,4 +31,35 @@ async function runNativeWindowsBashSmoke(t,{probeWindowsAppContainer,executeTool
   assert.equal(fs.readFileSync(path.join(scratchPath, 'witness'), 'utf8'), 'native-node')
   assert.equal(fs.readFileSync(candidate, 'utf8'), 'preserved')
 }
-module.exports={runNativeWindowsBashSmoke}
+async function runNativeWindowsBashRepeatedForkSmoke(t,{probeWindowsAppContainer,executeTool}) {
+  const probe = await probeWindowsAppContainer()
+  assert.equal(probe.supported, true, JSON.stringify(probe))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'windows-bash-forks-')))
+  let preserve = false
+  t.after(() => { if (!preserve) fs.rmSync(root, { recursive: true, force: true }) })
+  ensureWindowsPrivateAcl(root)
+  const targetPath = path.join(root, 'target'), scratchPath = path.join(root, 'scratch'), controlRoot = path.join(root, 'controller')
+  for (const directory of [targetPath, scratchPath, controlRoot]) { fs.mkdirSync(directory); ensureWindowsPrivateAcl(directory) }
+  const iterations = 24
+  const command = `set -euo pipefail
+for ((i=0;i<${iterations};i++)); do
+  substituted=$(printf '%s' "$i"); [[ "$substituted" == "$i" ]]
+  ( : )
+  printf '%s\n' "$i" | { IFS= read -r piped; [[ "$piped" == "$i" ]]; }
+  IFS= read -r processed < <(printf '%s\n' "$i"); [[ "$processed" == "$i" ]]
+  { :; } & child=$!; wait "$child"
+done
+printf 'fork-ok:${iterations}'`
+  const policy = { provider: 'claude', nestedDispatch: false, commandBoundary: true, externalWrites: false, readOnly: true, targetPath, scratchPath, readableRoots: [targetPath, scratchPath], writableRoots: [scratchPath] }
+  let result
+  try { result = await executeTool(policy, 'bash', { command, timeoutMs: 120000 }, { controlRoot }) } catch (error) {
+    preserve = error.cleanupConfirmed === false || error.code === 'APPCONTAINER_CLEANUP_UNCONFIRMED' || Boolean(error.recovery && !error.recoveryResolved)
+    if (preserve) t.diagnostic('Unconfirmed native cleanup; retained repeated-fork diagnostic root: ' + root)
+    throw error
+  }
+  assert.equal(result.status, 'completed', JSON.stringify(result))
+  // Bash can retry fork internally. Any retry diagnostic remains in this
+  // combined stream and fails the exact assertion instead of being masked.
+  assert.equal(result.output, `fork-ok:${iterations}`)
+}
+module.exports={runNativeWindowsBashSmoke,runNativeWindowsBashRepeatedForkSmoke}

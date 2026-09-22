@@ -4385,7 +4385,9 @@ function configureCodex(options = {}) {
     desired.set(profilePath, fs.readFileSync(stageProfile))
     const nextHashes = { ...hashes }
     for (const [file, bytes] of desired) nextHashes[hashKeys.get(comparable(file))] = sha256(bytes)
-    desired.set(hashesPath, Buffer.from(`${JSON.stringify(nextHashes, null, 2)}\n`))
+    // Match the canonical ownership document emitted by both installers. The
+    // PowerShell reader deliberately rejects alternate indentation on reinstall.
+    desired.set(hashesPath, Buffer.from(`${JSON.stringify(nextHashes, null, 4)}\n`))
     const unchanged = [...desired].every(([file, bytes]) => originals.get(file).equals(bytes))
     if (unchanged) return { status: 'unchanged', selector: selection.selector, models: selection.models, agents: agentPaths.length }
       const committed = []

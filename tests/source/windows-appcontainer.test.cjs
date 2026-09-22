@@ -58,7 +58,7 @@ function windowsModule(file, replacements = {}, directory, globals = {}) {
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), {
     module, exports: module.exports, __dirname: directory || path.dirname(filename), Buffer, ...globals,
     process: { platform: 'win32', arch: process.arch, pid: process.pid, execPath: process.execPath,
-      env: { SystemRoot: 'C:\\Windows', NODE_OPTIONS: '--require must-not-inherit', OPENAI_API_KEY: 'must-not-inherit' } },
+      env: { SystemRoot: 'C:\\Windows', NODE_OPTIONS: '--require must-not-inherit', OPENAI_API_KEY: 'must-not-inherit', ...(globals.env || {}) } },
     require: name => Object.hasOwn(replacements, name) ? replacements[name] : localRequire(name),
   }, { filename })
   return module.exports
@@ -141,8 +141,19 @@ test('Windows helper staging preserves its primary refusal and accounts for an u
 })
 
 test('Windows ownership setup keeps a bounded cold-start allowance and never caches a failed privacy proof', () => {
-  const attempts = []
+  const attempts = [], aclAttempts = [], resolverAttempts = []
   const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(file, argv, options) {
+    if (!options.env.AUTOPROMPT_PRIVATE_ACL_PATH && String(argv.at(-1)).includes('GetFolderPath')) {
+      resolverAttempts.push({ file, argv, options })
+      return { status: 0, signal: null, stderr: '', stdout: require('node:os').tmpdir() + '\n' }
+    }
+    if (options.env.AUTOPROMPT_PRIVATE_ACL_PATH) {
+      aclAttempts.push({ file, argv, options })
+      const item = { path: options.env.AUTOPROMPT_PRIVATE_ACL_PATH, owner: 'S-1-5-21-1', ownerSid: 'S-1-5-21-1', protected: true,
+        rules: [{ identity: 'S-1-5-21-1', sid: 'S-1-5-21-1', type: 'Allow', inherited: false, rights: 2032127, inheritanceFlags: 3, propagationFlags: 0 },
+          { identity: 'S-1-5-18', sid: 'S-1-5-18', type: 'Allow', inherited: false, rights: 2032127, inheritanceFlags: 3, propagationFlags: 0 }] }
+      return { status: 0, signal: null, stderr: '', stdout: JSON.stringify({ currentName: 'TEST\\user', currentSid: 'S-1-5-21-1', items: [item] }) }
+    }
     attempts.push({ file, argv, options })
     return attempts.length === 1
       ? { status: null, signal: 'SIGTERM', error: { code: 'ETIMEDOUT' }, stdout: 'TOKEN_OWNER_COMPILING\n', stderr: 'bounded native diagnostic' }
@@ -159,6 +170,8 @@ test('Windows ownership setup keeps a bounded cold-start allowance and never cac
   assert.equal(safe.ensureWindowsDefaultTokenOwner().supported, true)
   assert.equal(safe.ensureWindowsDefaultTokenOwner().supported, true)
   assert.equal(attempts.length, 2, 'a failure must remain retryable, while only the successful ownership proof is cached')
+  assert.equal(aclAttempts.length, 2)
+  assert.equal(resolverAttempts.length, 2)
   for (const { file, options } of attempts) {
     assert.equal(file, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
     assert.ok(options.timeout > 15000 && options.timeout <= 60000)
@@ -166,8 +179,40 @@ test('Windows ownership setup keeps a bounded cold-start allowance and never cac
     assert.deepEqual(Array.from(options.stdio), ['ignore', 'pipe', 'pipe'])
     assert.equal(options.env.NODE_OPTIONS, undefined)
     assert.equal(options.env.OPENAI_API_KEY, undefined)
+    assert.ok(options.env.TEMP.length < 100, 'CodeDOM compiler temp must stay shallow')
     assert.equal(fs.existsSync(options.env.TEMP), false, 'temporary compiler files must be removed after success and failure')
   }
+})
+
+test('Windows ownership setup preserves a Unicode known folder and ignores hostile ambient local-app-data variables', t => {
+  const knownFolder = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-Å-用户-')))
+  t.after(() => fs.rmSync(knownFolder, { recursive: true, force: true }))
+  const resolver = [], acl = []
+  const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(file, argv, options) {
+    if (!options.env.AUTOPROMPT_PRIVATE_ACL_PATH && String(argv.at(-1)).includes('GetFolderPath')) {
+      assert.match(argv.at(-1), /\[Console\]::OutputEncoding=\[Text.UTF8Encoding\]::new\(\$false\)/)
+      resolver.push(options); return { status: 0, signal: null, stderr: '', stdout: knownFolder + '\n' }
+    }
+    if (options.env.AUTOPROMPT_PRIVATE_ACL_PATH) {
+      acl.push(options)
+      const sid = 'S-1-5-21-1', directory = options.env.AUTOPROMPT_PRIVATE_ACL_DIRECTORY === '1'
+      const rule = value => ({ identity: value, sid: value, type: 'Allow', inherited: false, rights: 2032127, inheritanceFlags: directory ? 3 : 0, propagationFlags: 0 })
+      return { status: 0, signal: null, stderr: '', stdout: JSON.stringify({ currentName: 'TEST\\user', currentSid: sid, items: [{ path: options.env.AUTOPROMPT_PRIVATE_ACL_PATH, owner: sid, ownerSid: sid, protected: true, rules: [rule(sid), rule('S-1-5-18')] }] }) }
+    }
+    return { status: 0, signal: null, stderr: '', stdout: '' }
+  } } }, undefined, { env: { LOCALAPPDATA: 'C:\\attacker-controlled-root' } })
+  assert.equal(safe.ensureWindowsDefaultTokenOwner().supported, true)
+  assert.equal(resolver.length, 1); assert.equal(acl.length, 1)
+  assert.equal(resolver[0].env.LOCALAPPDATA, undefined, 'authoritative resolver must not inherit ambient local-app-data')
+  assert.equal(path.dirname(acl[0].env.AUTOPROMPT_PRIVATE_ACL_PATH), knownFolder)
+})
+
+test('Windows ownership setup refuses an invalid authoritative local-app-data result', () => {
+  const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(file, argv) {
+    if (String(argv.at(-1)).includes('GetFolderPath')) return { status: 0, signal: null, stderr: '', stdout: 'not-absolute\n' }
+    assert.fail('Invalid known-folder output must stop before ACL or compiler setup')
+  } } })
+  assert.throws(() => safe.ensureWindowsDefaultTokenOwner(), { code: 'PRIVACY_UNSUPPORTED' })
 })
 
 test('Windows private ACL replaces foreign grants with exact file or directory rights and refuses linked targets', t => {
@@ -181,7 +226,7 @@ test('Windows private ACL replaces foreign grants with exact file or directory r
   const currentSid = 'S-1-5-21-123-456-789-1001'
   const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(executable, argv, options) {
     calls.push({ executable, argv, options })
-    if (!options.env.AUTOPROMPT_PRIVATE_ACL_PATH) return { status: 0, signal: null, stderr: '', stdout: '' }
+    if (!options.env.AUTOPROMPT_PRIVATE_ACL_PATH) return { status: 0, signal: null, stderr: '', stdout: require('node:os').tmpdir() + '\n' }
     const snapshot = { currentName: 'runner', currentSid, items: [{ path: options.env.AUTOPROMPT_PRIVATE_ACL_PATH,
       owner: currentSid, ownerSid: currentSid, protected: true, rules: [currentSid, 'S-1-5-18'].map(sid => ({
         identity: sid, sid, type: 'Allow', inherited: false, rights: 2032127,
@@ -191,7 +236,7 @@ test('Windows private ACL replaces foreign grants with exact file or directory r
   } } })
   assert.equal(safe.ensureWindowsPrivateAcl(file).supported, true)
   assert.equal(safe.ensureWindowsPrivateAcl(root).supported, true)
-  const grants = calls.filter(call => call.options.env.AUTOPROMPT_PRIVATE_ACL_PATH)
+  const grants = calls.filter(call => [file, root].includes(call.options.env.AUTOPROMPT_PRIVATE_ACL_PATH))
   assert.equal(grants.length, 2)
   assert.equal(grants[0].options.env.AUTOPROMPT_PRIVATE_ACL_DIRECTORY, '0')
   assert.equal(grants[1].options.env.AUTOPROMPT_PRIVATE_ACL_DIRECTORY, '1')

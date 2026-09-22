@@ -202,7 +202,7 @@ function ensureWindowsDefaultTokenOwner() {
     throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows system root is unavailable for the default-owner helper')
   }
   const powershell = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-token-owner-'))
+  const temporary = createWindowsCompilerDirectory('autoprompt-token-owner-')
   // The first native PowerShell/Add-Type startup on a Windows runner can be
   // slower than a warmed helper. Keep a finite setup bound without treating a
   // cold compiler as proof that private ownership cannot be established.
@@ -227,7 +227,7 @@ function ensureWindowsDefaultTokenOwner() {
       },
     })
   } finally {
-    fs.rmSync(temporary, { recursive: true, force: true })
+    fs.rmSync(temporary, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   }
   if (result.error || result.signal || result.status !== 0 || result.stderr) {
     const helperPhase = String(result.stdout || '').includes('TOKEN_OWNER_APPLYING') ? 'applying'
@@ -248,9 +248,50 @@ function ensureWindowsDefaultTokenOwner() {
   return { supported: true, mechanism: 'windows-token-owner' }
 }
 
+// CodeDOM creates nested source/output names below TEMP. Callers must remove
+// the returned directory after the bounded compiler operation completes.
+function createWindowsCompilerDirectory(prefix = 'autoprompt-compiler-') {
+  if (typeof prefix !== 'string' || !/^[A-Za-z0-9_-]{1,48}-$/.test(prefix)) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The Windows compiler directory prefix is invalid')
+  }
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR
+  if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows system root is unavailable for the private compiler helper')
+  }
+  const powershell = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const knownFolder = spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);[Console]::Out.WriteLine([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData))'], {
+    encoding: 'utf8', windowsHide: true, shell: false, timeout: 60000, maxBuffer: 64 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'], cwd: path.win32.dirname(powershell),
+    env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '' },
+  })
+  if (knownFolder.error || knownFolder.signal || knownFolder.status !== 0 || knownFolder.stderr) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token local application data root could not be resolved', {
+      status: knownFolder.status, signal: knownFolder.signal, cause: knownFolder.error && knownFolder.error.code,
+      stderr: knownFolder.stderr && knownFolder.stderr.trim(),
+    })
+  }
+  const localAppData = String(knownFolder.stdout || '').trim()
+  if (!path.isAbsolute(localAppData)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token returned no usable local application data root')
+  const inspectedLocalAppData = inspectPathNoFollow(localAppData)
+  if (!inspectedLocalAppData.exists || !inspectedLocalAppData.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token local application data root is unavailable')
+  let temporary
+  try {
+    temporary = fs.mkdtempSync(path.join(inspectedLocalAppData.realpath, prefix))
+    applyWindowsPrivateAcl(temporary)
+    return temporary
+  } catch (error) {
+    if (temporary) { try { fs.rmSync(temporary, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) } catch {} }
+    throw error
+  }
+}
+
 function ensureWindowsPrivateAcl(target) {
   if (process.platform !== 'win32') return { supported: true, mechanism: 'posix-mode' }
   ensureWindowsDefaultTokenOwner()
+  return applyWindowsPrivateAcl(target)
+}
+
+function applyWindowsPrivateAcl(target) {
   const absolute = path.resolve(target)
   const before = fs.lstatSync(absolute)
   if (before.isSymbolicLink() || (!before.isDirectory() && !before.isFile())) {
@@ -267,6 +308,7 @@ function ensureWindowsPrivateAcl(target) {
   // change which paths those callers authorize for permission updates.
   const script = [
     "$ErrorActionPreference='Stop'",
+    '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)',
     "[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process)",
     '$p=$env:AUTOPROMPT_PRIVATE_ACL_PATH',
     "$directory=$env:AUTOPROMPT_PRIVATE_ACL_DIRECTORY -eq '1'",
@@ -417,6 +459,7 @@ function auditPrivatePermissions(runPath, options = {}) {
     '  $rules=@($acl.Access | ForEach-Object {$sid=$null;try{$sid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value}catch{};[pscustomobject]@{identity=$_.IdentityReference.Value;sid=$sid;type=$_.AccessControlType.ToString();inherited=$_.IsInherited;rights=$_.FileSystemRights.ToString()}})',
     '  $items+=[pscustomobject]@{path=$p;owner=$acl.Owner;ownerSid=$ownerSid;protected=$acl.AreAccessRulesProtected;rules=$rules}',
     '}',
+    '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)',
     '[pscustomobject]@{currentName=$identity.Name;currentSid=$identity.User.Value;items=$items}|ConvertTo-Json -Compress -Depth 7',
   ].join(';')
   const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
@@ -1003,6 +1046,7 @@ module.exports = {
   assertRunRecordBoundary,
   ensureWindowsPrivateAcl,
   ensureWindowsDefaultTokenOwner,
+  createWindowsCompilerDirectory,
   validateWindowsAclSnapshot,
   auditPrivatePermissions,
   withOwnedLock,

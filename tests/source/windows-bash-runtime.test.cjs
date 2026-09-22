@@ -165,3 +165,10 @@ test('native Windows Bash copied closure permits scratch writes and denies candi
     executeTool: require('../../scripts/harness-v2-tool-boundary.cjs').executeTool,
   })
 })
+
+test('native Windows Bash repeated forks complete without retry diagnostics', { skip: process.platform !== 'win32', timeout: 600000 }, async t => {
+  await require('../helpers/windows-bash-native-smoke.cjs').runNativeWindowsBashRepeatedForkSmoke(t, {
+    probeWindowsAppContainer: require('../../agents/codex/workflow/windows-appcontainer-probe.js').probeWindowsAppContainer,
+    executeTool: require('../../scripts/harness-v2-tool-boundary.cjs').executeTool,
+  })
+})

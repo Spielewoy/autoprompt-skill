@@ -6,8 +6,8 @@
 const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
+const { createWindowsCompilerDirectory } = require('./safe-run-root.js')
 const MAX_RECORD_BYTES = 8 * 1024 * 1024 + 1
 const MAX_TREE_ENTRIES = 16384
 const MAX_RECORD_ENTRIES = 4096
@@ -252,7 +252,7 @@ function createWindowsFilesystemCapture(options = {}) {
     try {
       heldPowerShell = bindPhysical(powershellBinding.path, 'Windows PowerShell', MAX_BYTES, false)
       if (!equalBinding(heldHelper.binding, helperBinding) || !equalBinding(heldPowerShell.binding, powershellBinding)) fail('FILESYSTEM_BACKEND_MISMATCH', 'Windows filesystem runtime changed after binding')
-      temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-capture-'))
+      temporary = createWindowsCompilerDirectory('autoprompt-windows-capture-')
       const invocationStarted = process.hrtime.bigint()
       const result = cp.spawnSync(powershellBinding.path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helperBinding.path, '-Request'], {
         input: request, encoding: 'utf8', timeout: timeoutMs, maxBuffer: MAX_OUTPUT_BYTES, windowsHide: true, shell: false,
@@ -289,7 +289,7 @@ function createWindowsFilesystemCapture(options = {}) {
     } finally {
       fs.closeSync(heldHelper.descriptor)
       if (heldPowerShell) fs.closeSync(heldPowerShell.descriptor)
-      if (temporary) fs.rmSync(temporary, { recursive: true, force: true })
+      if (temporary) fs.rmSync(temporary, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
     }
   }
   return Object.freeze({ kind: 'windows-handle-capture-v1',

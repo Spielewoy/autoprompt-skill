@@ -976,6 +976,8 @@ test('installed Codex cast supports explicit list, idempotence, auto, and off wi
       'configure', 'codex', '--agents', 'gpt-5.6-sol,gpt-5.6-terra',
     ])
     assert.equal(explicit.status, 0, explicit.stderr)
+    const ownershipDocument = fs.readFileSync(context.hashManifest, 'utf8')
+    assert.equal(ownershipDocument, `${JSON.stringify(JSON.parse(ownershipDocument), null, 4)}\n`)
     assert.match(explicit.stdout, /selector=gpt-5\.6-sol,gpt-5\.6-terra/)
     assert.match(fs.readFileSync(path.join(context.agents, 'ap-manager.toml'), 'utf8'), /model = "gpt-5\.6-sol"/)
     assert.match(fs.readFileSync(path.join(context.agents, 'ap-sweeper.toml'), 'utf8'), /model = "gpt-5\.6-terra"/)
@@ -1020,6 +1022,28 @@ test('installed Codex cast supports explicit list, idempotence, auto, and off wi
   } finally {
     removeFixture(context.fixture.binding)
   }
+})
+
+test('configured Codex ownership hashes remain readable by the PowerShell installer', t => {
+  const powershell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
+  const available = run(powershell, ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'])
+  if (process.platform !== 'win32' && available.error?.code === 'ENOENT') {
+    t.skip('PowerShell is not installed on this host')
+    return
+  }
+  assert.equal(available.status, 0, available.stderr)
+  const context = makeInstall(t, true)
+  const configured = invoke(context, ['configure', 'codex', '--agents', 'gpt-5.6-luna'])
+  assert.equal(configured.status, 0, configured.stderr)
+  const literal = value => `'${value.replaceAll("'", "''")}'`
+  const result = run(powershell, ['-NoProfile', '-NonInteractive', '-Command', [
+    "$ErrorActionPreference = 'Stop'",
+    `. ${literal(path.join(ROOT, 'scripts', 'install', 'lib', 'install-lib.ps1'))}`,
+    `$entries = Read-IdemManifestEntries -ConfigRoot ${literal(context.root)}`,
+    'ConvertTo-Json -InputObject $entries -Compress -Depth 3',
+  ].join('\n')])
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(JSON.parse(result.stdout), JSON.parse(fs.readFileSync(context.hashManifest, 'utf8')))
 })
 
 test('invalid selectors, maps, ownership collisions, and injection text fail before mutation', t => {

@@ -102,7 +102,9 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
     }
     const value = request.operation === 'tree' ? treeFixture() : { schemaVersion: 1, status: 'CAPTURED', operation: request.operation, identity: '1234abcd:0000000000000001', length: 0, stat: stat('1234abcd:0000000000000001'), sha256: crypto.createHash('sha256').digest('hex'), ...(request.operation === 'read' ? { dataBase64: '' } : {}) }
     return { status: 0, stdout: JSON.stringify(value), stderr: '' }
-  } } : name === 'node:fs' ? fakeFs : require(name) }
+  } } : name === 'node:fs' ? fakeFs
+    : name === './safe-run-root.js' ? { createWindowsCompilerDirectory: prefix => { assert.equal(prefix, 'autoprompt-windows-capture-'); return 'C:\\private-temp' } }
+    : require(name) }
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), sandbox, { filename })
   const capture = sandbox.module.exports.createWindowsFilesystemCapture({ helper: 'C:\\trusted\\windows-filesystem.ps1' })
   assert.equal(capture.captureTree('C:\\project').bytes, 4)
@@ -114,6 +116,8 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
   assert.equal(calls[0][0], 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
   assert.equal(calls[0][2].env.MALICIOUS, undefined)
   assert.equal(calls[0][2].env.AUTOPROMPT_CAPTURE_PHASES, '1')
+  assert.equal(calls[0][2].env.TEMP, 'C:\\private-temp')
+  assert.equal(calls[0][2].env.TMP, 'C:\\private-temp')
   assert.equal(descriptors.size, 0)
   assert.ok(calls[0][2].maxBuffer >= Math.ceil(67108864 / 3) * 4)
   for (const target of ['C:\\project\\..\\escape', 'C:\\project\\', '\\\\server\\share', 'C:\\project\\CON', 'C:\\project\\a:b']) {

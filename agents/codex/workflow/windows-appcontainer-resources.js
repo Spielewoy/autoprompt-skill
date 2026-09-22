@@ -5,6 +5,7 @@ const path = require('node:path')
 const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const { createWindowsFilesystemCapture } = require('./windows-filesystem.js')
+const { createWindowsCompilerDirectory } = require('./safe-run-root.js')
 const LIMIT = 8 * 1024 * 1024
 const MAX_RESOURCE_ENTRIES = 16 * 1024, MAX_RECOVERY_ENTRIES = 2 * MAX_RESOURCE_ENTRIES
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
@@ -118,10 +119,12 @@ function nativeBackend(controlRoot, deploymentRoot) {
     return { capture, cleanup: ownedDeployment?.cleanup, invoke(request) {
       verify()
       const input = JSON.stringify(request); need(Buffer.byteLength(input) <= 12 * 1024 * 1024, 'WINDOWS_RESOURCE_LIMIT')
-      const result = cp.spawnSync(bindings[2].path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', bindings[0].path, '-NativeSha256', bindings[1].sha256, '-Request'], {
+      const compilerDirectory = createWindowsCompilerDirectory('autoprompt-resources-')
+      let result
+      try { result = cp.spawnSync(bindings[2].path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', bindings[0].path, '-NativeSha256', bindings[1].sha256, '-Request'], {
         input, encoding: 'utf8', timeout: 120000, maxBuffer: 12 * 1024 * 1024, windowsHide: true, shell: false, cwd: path.dirname(bindings[2].path),
-        env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.join(systemRoot, 'System32'), PSModulePath: '', TEMP: controlRoot, TMP: controlRoot },
-      })
+        env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.join(systemRoot, 'System32'), PSModulePath: '', TEMP: compilerDirectory, TMP: compilerDirectory },
+      }) } finally { fs.rmSync(compilerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) }
       verify()
       need(!result.error && result.status === 0 && !result.signal && result.stderr === '', 'WINDOWS_RESOURCE_HELPER_FAILED')
       let wire; try { wire = JSON.parse(result.stdout) } catch { fail('WINDOWS_RESOURCE_PROTOCOL', 'Resource helper returned invalid JSON') }

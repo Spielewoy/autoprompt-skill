@@ -41,6 +41,7 @@ const WINDOWS_NATIVE_CASES = Object.freeze([
   'Windows transaction copy rejects hardlinks and reparse traversal before publication',
   'Windows transaction rename refuses mutate-and-restore USN races and rolls the root back',
   'native Windows Bash copied closure permits scratch writes and denies candidate writes and controller reads',
+  'native Windows Bash repeated forks complete without retry diagnostics',
   'native Windows controller scratch has protected ownership and rejects inherited permissions on reuse',
   'native Windows worker clone is privately writable without relabeling the source or an occupied clone',
   'native capability command reads exact fixture bytes through the real platform shell',
@@ -177,11 +178,14 @@ async function main() {
   const diagnosticCases = [
     'claude closed native capability: full canonical role schema is accepted and validated',
     'packed actual Claude activation requires all local native observations before mission admission',
+    'configured Codex ownership hashes remain readable by the PowerShell installer',
+    'native Windows Bash repeated forks complete without retry diagnostics',
   ]
   const selection = diagnostic ? ['--test-name-pattern', `^(?:${diagnosticCases.join('|')})$`] : []
   const { code, output } = await runTests(['--test', '--test-reporter=tap', '--test-concurrency=1', ...selection,
     'tests/source/harness-v2-claude-capability-native.test.cjs',
-    'tests/source/harness-v2-installed-canary-native.test.cjs'],
+    'tests/source/harness-v2-installed-canary-native.test.cjs',
+    ...(diagnostic ? ['tests/source/codex-configure.test.cjs', 'tests/source/windows-bash-runtime.test.cjs'] : [])],
   { ...process.env, AUTOPROMPT_CLAUDE_TEST_CLI: executable, AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1' }, 'native-platform-tests.log')
   evidence.exitCode = code
   if (diagnostic) {
