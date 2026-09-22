@@ -51,6 +51,21 @@ const WINDOWS_NATIVE_CASES = Object.freeze([
   'failed native isolation assertion cannot emit a successful closed-canary challenge',
 ])
 
+const DIAGNOSTIC_STAGES = Object.freeze([
+  Object.freeze({ id: 'infra', cases: Object.freeze([
+    'native Windows compiler staging ignores deep home and temp overrides',
+    'Windows Job bridge compiles and preserves atomic status publication on native long paths',
+    'native Windows Job ownership survives deep durable paths and hostile home variables',
+    'native Windows Bash repeated forks complete without retry diagnostics',
+  ]) }),
+  Object.freeze({ id: 'direct', cases: Object.freeze([
+    'claude closed native capability: full canonical role schema is accepted and validated',
+  ]) }),
+  Object.freeze({ id: 'packed', cases: Object.freeze([
+    'packed actual Claude activation requires all local native observations before mission admission',
+  ]) }),
+])
+
 function assertHostPrimitiveCases(output, platform = process.platform) {
   if (platform === 'win32') {
     for (const name of WINDOWS_NATIVE_CASES) assertNamedCase(output, name)
@@ -92,18 +107,61 @@ function assertDoctorCases(output, platform = process.platform) {
   assertNamedCase(output, 'PowerShell doctor exposes activation failure and strict fails with an intact payload')
 }
 
-async function runTests(argv, environment, logPath) {
+async function runTests(argv, environment, logPath, aggregateLogPath = null) {
   // Preserve evidence as it arrives, including when a hung job is cancelled
   // before the child closes and the final assertions can run.
   const log = fs.openSync(logPath, 'w')
+  const aggregate = aggregateLogPath ? fs.openSync(aggregateLogPath, 'a') : null
   try {
     const child = cp.spawn(process.execPath, argv, { env: environment, stdio: ['ignore', 'pipe', 'pipe'] })
     let output = ''
-    child.stdout.on('data', bytes => { fs.writeSync(log, bytes); output += bytes; process.stdout.write(bytes) })
-    child.stderr.on('data', bytes => { fs.writeSync(log, bytes); output += bytes; process.stderr.write(bytes) })
+    const capture = (bytes, stream) => { fs.writeSync(log, bytes); if (aggregate !== null) fs.writeSync(aggregate, bytes); output += bytes; stream.write(bytes) }
+    child.stdout.on('data', bytes => capture(bytes, process.stdout))
+    child.stderr.on('data', bytes => capture(bytes, process.stderr))
     const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve) })
     return { code, output }
-  } finally { fs.closeSync(log) }
+  } finally { fs.closeSync(log); if (aggregate !== null) fs.closeSync(aggregate) }
+}
+
+function diagnosticStageFiles(id) {
+  return id === 'infra'
+    ? ['tests/source/windows-job-helper.test.cjs', 'tests/source/windows-appcontainer.test.cjs', 'tests/source/windows-bash-runtime.test.cjs']
+    : id === 'direct'
+      ? ['tests/source/harness-v2-claude-capability-native.test.cjs']
+      : ['tests/source/harness-v2-installed-canary-native.test.cjs']
+}
+
+async function runDiagnosticStages({ environment, evidence, publish, run = runTests,
+  aggregateLog = 'native-platform-tests.log', stageLogPrefix = 'native-platform-tests-' }) {
+  const diagnosticCases = DIAGNOSTIC_STAGES.flatMap(stage => stage.cases)
+  evidence.diagnosticOnly = true
+  evidence.selectedCases = diagnosticCases
+  evidence.diagnosticStages = []
+  evidence.exitCode = undefined
+  publish()
+  for (const stage of DIAGNOSTIC_STAGES) {
+    const stageLog = `${stageLogPrefix}${stage.id}.log`
+    const argv = ['--test', '--test-reporter=tap', '--test-concurrency=1', '--test-name-pattern', `^(?:${stage.cases.join('|')})$`, ...diagnosticStageFiles(stage.id)]
+    let result = null, stageError = null
+    try {
+      result = await run(argv, environment, stageLog, aggregateLog)
+      if (result.code === 0) {
+        try { for (const name of stage.cases) assertNamedCase(result.output, name) }
+        catch (error) { stageError = error }
+      } else stageError = new Error(`Diagnostic ${stage.id} stage exited with ${result.code}`)
+    } catch (error) {
+      stageError = error
+    }
+    const errorText = stageError ? String(stageError.stack || stageError).slice(0, 1024) : undefined
+    const stageExitCode = stageError ? (result?.code || 1) : result.code
+    evidence.diagnosticStages.push({ id: stage.id, cases: stage.cases, log: stageLog,
+      exitCode: stageExitCode, passed: !stageError, ...(errorText ? { error: errorText } : {}) })
+    evidence.exitCode = stageExitCode
+    publish()
+    if (stageError) throw stageError
+  }
+  evidence.exitCode = 0
+  publish()
 }
 
 async function main() {
@@ -178,28 +236,25 @@ async function main() {
   const publish = () => fs.writeFileSync('native-platform-evidence.json', JSON.stringify(evidence, null, 2) + '\n')
   publish()
   assert.equal(evidence.sandbox.supported, true, `Native sandbox prerequisite failed: ${JSON.stringify(evidence.sandbox)}`)
-  const diagnosticCases = [
-    'native Windows compiler staging ignores deep home and temp overrides',
-    'Windows Job bridge compiles and preserves atomic status publication on native long paths',
-    'native Windows Job ownership survives deep durable paths and hostile home variables',
-    'native Windows Bash repeated forks complete without retry diagnostics',
-    'claude closed native capability: full canonical role schema is accepted and validated',
-    'packed actual Claude activation requires all local native observations before mission admission',
-  ]
-  const selection = diagnostic ? ['--test-name-pattern', `^(?:${diagnosticCases.join('|')})$`] : []
-  const { code, output } = await runTests(['--test', '--test-reporter=tap', '--test-concurrency=1', ...selection,
-    ...(diagnostic ? ['tests/source/windows-job-helper.test.cjs', 'tests/source/windows-appcontainer.test.cjs', 'tests/source/windows-bash-runtime.test.cjs'] : []),
-    'tests/source/harness-v2-claude-capability-native.test.cjs',
-    'tests/source/harness-v2-installed-canary-native.test.cjs'],
-  { ...process.env, AUTOPROMPT_CLAUDE_TEST_CLI: executable, AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1' }, 'native-platform-tests.log')
-  evidence.exitCode = code
+  let code = 0, output = ''
+  if (!diagnostic) {
+    const result = await runTests(['--test', '--test-reporter=tap', '--test-concurrency=1',
+      'tests/source/harness-v2-claude-capability-native.test.cjs',
+      'tests/source/harness-v2-installed-canary-native.test.cjs'],
+    { ...process.env, AUTOPROMPT_CLAUDE_TEST_CLI: executable, AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1' }, 'native-platform-tests.log')
+    code = result.code; output = result.output
+    evidence.exitCode = code
+  }
   if (diagnostic) {
     // A scoped diagnostic never certifies the complete provider capability set.
-    evidence.diagnosticOnly = true
-    evidence.selectedCases = diagnosticCases
-    publish()
-    assert.equal(code, 0, 'Selected native Claude diagnostics failed')
-    for (const name of diagnosticCases) assertNamedCase(output, name)
+    // Keep the aggregate log for existing evidence readers while gating the
+    // expensive packed activation behind the cheap infrastructure and direct
+    // Claude checks.
+    const aggregateLog = 'native-platform-tests.log'
+    fs.writeFileSync(aggregateLog, '')
+    await runDiagnosticStages({
+      environment: { ...process.env, AUTOPROMPT_CLAUDE_TEST_CLI: executable, AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1' },
+      evidence, publish, aggregateLog })
     return
   }
   evidence.skipped = /# SKIP\b/i.test(output) || !/^# skipped 0\s*$/m.test(output)
@@ -215,4 +270,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1 })
-module.exports = { WINDOWS_NATIVE_CASES, assertHostPrimitiveCases, assertDoctorCases, assertNamedCase }
+module.exports = { WINDOWS_NATIVE_CASES, DIAGNOSTIC_STAGES, assertHostPrimitiveCases, assertDoctorCases, assertNamedCase, runDiagnosticStages }

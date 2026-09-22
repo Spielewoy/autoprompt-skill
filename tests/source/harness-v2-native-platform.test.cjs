@@ -7,7 +7,58 @@ const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 const { nodeCommand, readCommand, withChallenge } = require('../helpers/native-platform.cjs')
-const { WINDOWS_NATIVE_CASES, assertHostPrimitiveCases } = require('../helpers/native-platform-ci.cjs')
+const { WINDOWS_NATIVE_CASES, DIAGNOSTIC_STAGES, assertHostPrimitiveCases, runDiagnosticStages } = require('../helpers/native-platform-ci.cjs')
+
+test('Claude diagnostic plan failfasts infrastructure and direct checks before packed activation', () => {
+  assert.deepEqual(DIAGNOSTIC_STAGES.map(stage => stage.id), ['infra', 'direct', 'packed'])
+  assert.equal(DIAGNOSTIC_STAGES[0].cases.length, 4)
+  assert.equal(DIAGNOSTIC_STAGES[1].cases.length, 1)
+  assert.equal(DIAGNOSTIC_STAGES[2].cases.length, 1)
+  assert.match(DIAGNOSTIC_STAGES[0].cases.at(-1), /Bash repeated forks/)
+  assert.match(DIAGNOSTIC_STAGES[1].cases[0], /^claude closed native capability:/)
+  assert.match(DIAGNOSTIC_STAGES[2].cases[0], /^packed actual Claude activation/)
+})
+
+test('Claude diagnostic runner stops before packed activation and publishes skipped-stage evidence', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-diagnostic-'))
+  const aggregate = path.join(directory, 'aggregate.log')
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const calls = [], snapshots = [], evidence = {}
+  const run = async (argv, _environment, stageLog, aggregateLog) => {
+    const id = argv.includes('tests/source/harness-v2-claude-capability-native.test.cjs') ? 'direct' : argv.includes('tests/source/harness-v2-installed-canary-native.test.cjs') ? 'packed' : 'infra'
+    calls.push(id)
+    const stage = DIAGNOSTIC_STAGES.find(item => item.id === id)
+    const output = id === 'direct'
+      ? `ok 1 - ${stage.cases[0]} # SKIP fixture unavailable\n`
+      : stage.cases.map((name, index) => `ok ${index + 1} - ${name}\n`).join('')
+    fs.writeFileSync(stageLog, output); fs.appendFileSync(aggregateLog, output)
+    return { code: 0, output }
+  }
+  await assert.rejects(runDiagnosticStages({ environment: {}, evidence, aggregateLog: aggregate, stageLogPrefix: path.join(directory, 'stage-'), publish: () => snapshots.push(JSON.parse(JSON.stringify(evidence))), run }), /Required test must execute|Expected exactly one result/)
+  assert.deepEqual(calls, ['infra', 'direct'])
+  assert.equal(evidence.diagnosticStages.length, 2)
+  assert.equal(evidence.diagnosticStages[1].passed, false)
+  assert.equal(evidence.diagnosticStages[1].exitCode, 1)
+  assert.ok(evidence.diagnosticStages[1].error)
+  assert.ok(snapshots.length >= 3, 'initial, infra, and failed-stage evidence must be published')
+  assert.match(fs.readFileSync(aggregate, 'utf8'), /native Windows Bash repeated forks/)
+})
+
+test('Claude diagnostic runner preserves spawn errors and never advances to later stages', async t => {
+  const aggregate = path.join(os.tmpdir(), `native-diagnostic-spawn-${process.pid}-${Date.now()}.log`)
+  t.after(() => { try { fs.rmSync(aggregate, { force: true }) } catch {} })
+  const calls = [], evidence = {}, snapshots = []
+  await assert.rejects(runDiagnosticStages({ environment: {}, evidence, aggregateLog: aggregate,
+    publish: () => snapshots.push(JSON.parse(JSON.stringify(evidence))), run: async (_argv, _env, stageLog) => {
+      calls.push(stageLog)
+      throw new Error('fixture spawn failed')
+    } }), /fixture spawn failed/)
+  assert.equal(calls.length, 1)
+  assert.equal(evidence.diagnosticStages[0].id, 'infra')
+  assert.equal(evidence.diagnosticStages[0].passed, false)
+  assert.match(evidence.diagnosticStages[0].error, /fixture spawn failed/)
+  assert.ok(snapshots.length >= 2)
+})
 
 test('Windows native CI guard requires each exact native case and excludes parser lookalikes', () => {
   const transcript = names => names.map((name, index) => `ok ${index + 1} - ${name}`).join('\n')

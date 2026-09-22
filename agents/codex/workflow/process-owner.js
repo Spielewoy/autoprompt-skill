@@ -167,11 +167,22 @@ function selectWindowsLiveStatusPids(status, isAlive) {
     if (status.ready !== true || status.assigned !== true || currentPids.length !== 0) {
       fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job EXITED status does not prove zero assigned membership')
     }
+    if (status.cwdBridgeRequired === true && status.cwdBridgeCleaned !== true) {
+      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job EXITED status did not prove cwd bridge cleanup')
+    }
     return []
+  }
+  if (status.status === 'CLEANING' &&
+      (status.ready !== true || status.assigned !== true || currentPids.length !== 0 ||
+       status.cwdBridgeRequired !== true || status.cwdBridgeCleaned !== false)) {
+    fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job CLEANING status does not prove zero assigned membership')
   }
   const helperAlive = Number.isSafeInteger(status.helperPid) && status.helperPid > 0 &&
     isAlive(status.helperPid)
-  const terminal = ['EXITED', 'FAILED'].includes(status.status)
+  const terminal = ['CLEANING', 'EXITED', 'FAILED'].includes(status.status)
+  if (terminal && status.cwdBridgeRequired === true && status.cwdBridgeCleaned !== true && !helperAlive && currentPids.length === 0) {
+    fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job terminal status retained an unowned cwd bridge')
+  }
   // observedPids is historical evidence, not a durable process identity. Once
   // the Job helper has published a terminal state, KILL_ON_JOB_CLOSE owns the
   // descendant boundary and a later process may reuse one of those PIDs. Only
@@ -1503,7 +1514,7 @@ trap {
   try {
     $failure = [ordered]@{ schemaVersion = 1; reservationId = ''; helperPid = $PID; rootPid = $null;
       ready = $false; assigned = $false; status = 'FAILED'; pids = @();
-      error = $failureText; updatedAt = [DateTime]::UtcNow.ToString('o') }
+      error = $failureText; cwdBridgeRequired = $false; cwdBridgeCleaned = $false; updatedAt = [DateTime]::UtcNow.ToString('o') }
     $temporary = "$statusPath.$PID.tmp"; $backup = "$statusPath.previous"
     [AutopromptOwnedJob]::PublishText($statusPath, $temporary, $backup, ($failure | ConvertTo-Json -Compress -Depth 5))
   } catch { [Console]::Error.WriteLine("WINDOWS_JOB_HELPER_FAILED:$failureText") }
@@ -1574,6 +1585,7 @@ public sealed class AutopromptOwnedJob : IDisposable {
     UInt32 creation, UInt32 flags, IntPtr template);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern UInt32 GetFileAttributesW(string path);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool DeleteFileW(string path);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool RemoveDirectoryW(string path);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
   static extern bool ReplaceFileW(string replaced, string replacement, string backup, UInt32 flags, IntPtr exclude, IntPtr reserved);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool MoveFileExW(string existing, string replacement, UInt32 flags);
@@ -1646,6 +1658,10 @@ public sealed class AutopromptOwnedJob : IDisposable {
       } else ownsTemporary = false;
     } catch { if (ownsTemporary) { try { DeleteIfPresent(temporary); } catch {} } throw; }
   }
+  public static void RemoveDirectoryLink(string value) {
+    if (RemoveDirectoryW(NativePath(value))) return;
+    int error = Marshal.GetLastWin32Error(); if (error != 2 && error != 3) throw new Win32Exception(error, "RemoveDirectoryW failed");
+  }
 
   static string Quote(string value) {
     if (value.Length == 0) return "\"\"";
@@ -1686,8 +1702,12 @@ public sealed class AutopromptOwnedJob : IDisposable {
     try {
       if (!CreateProcess(executable, command, IntPtr.Zero, IntPtr.Zero, false,
           CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-          environmentPointer, cwd, ref startup, out created))
-        throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateProcess suspended failed");
+          environmentPointer, cwd, ref startup, out created)) {
+        int error = Marshal.GetLastWin32Error();
+        owned.Dispose();
+        throw new Win32Exception(error, String.Format("CreateProcess suspended failed (nativeError={0}, applicationLength={1}, commandLength={2}, cwdLength={3}, environmentLength={4})",
+          error, executable == null ? 0 : executable.Length, command.Length, cwd == null ? 0 : cwd.Length, environmentText.Length));
+      }
     } finally { Marshal.FreeHGlobal(environmentPointer); }
     owned.process = created.hProcess; owned.thread = created.hThread; owned.RootPid = (Int32)created.dwProcessId;
     if (!AssignProcessToJobObject(owned.job, owned.process)) {
@@ -1776,6 +1796,8 @@ function Write-JobStatus([string]$state, [bool]$ready, [bool]$assigned, [object[
     reservationIdentity = [string]$request.reservationIdentity; requestChecksum = [string]$request.checksum; helperPid = $PID;
     rootPid = if ($script:owned) { $script:owned.RootPid } else { $null }; ready = $ready; assigned = $assigned;
     status = $state; pids = @($pids); observedPids = @($script:observedPids); error = $errorText;
+    cwdBridgeRequired = [bool]$request.physicalCwd;
+    cwdBridgeCleaned = $script:cwdBridgeCleaned;
     updatedAt = [DateTime]::UtcNow.ToString('o') }
   $json = $record | ConvertTo-Json -Compress -Depth 5
   $temporary = "$statusPath.$PID.tmp"
@@ -1785,6 +1807,16 @@ function Write-JobStatus([string]$state, [bool]$ready, [bool]$assigned, [object[
 
 $script:owned = $null
 $script:observedPids = @()
+$script:cwdBridgeCleaned = $false
+function Remove-JobCwdBridge {
+  if ($script:cwdBridgeCleaned) { return }
+  $alias = [string]$request.physicalCwd
+  $root = [string]$request.cwdBridgeRoot
+  if (-not $alias -and -not $root) { return }
+  if ($alias) { [AutopromptOwnedJob]::RemoveDirectoryLink($alias) }
+  if ($root) { [AutopromptOwnedJob]::RemoveDirectoryLink($root) }
+  $script:cwdBridgeCleaned = $true
+}
 try {
   $startupDelay = [int]$request.startupDelayMilliseconds
   if ($startupDelay -gt 0) { Start-Sleep -Milliseconds $startupDelay }
@@ -1794,7 +1826,7 @@ try {
   $startupDeadline = [DateTime]::Parse([string]$request.startupDeadlineAt).ToUniversalTime()
   Write-JobPhase 'job-start'
   $script:owned = [AutopromptOwnedJob]::Start([string]$request.executable, [string[]]$arguments,
-    [string]$request.cwd, $environment, $startupDeadline)
+    $(if ($request.physicalCwd) { [string]$request.physicalCwd } else { [string]$request.cwd }), $environment, $startupDeadline)
   Write-JobPhase 'job-assigned-resumed'
   Write-JobStatus 'RUNNING' $true $true @($script:owned.ProcessIds()) $null
   Write-JobPhase 'status-published'
@@ -1809,9 +1841,26 @@ try {
     Write-JobStatus 'RUNNING' $true $true $pids $null
     Start-Sleep -Milliseconds 50
   }
+  if ($request.physicalCwd) { Write-JobStatus 'CLEANING' $true $true @() $null }
+  Remove-JobCwdBridge
+  Write-JobPhase 'cwd-bridge-cleanup-done'
   Write-JobStatus 'EXITED' $true $true @() $null
 } catch {
-  try { Write-JobStatus 'FAILED' $false $false @() $_.Exception.ToString() } catch {}
+  $failureText = $_.Exception.ToString()
+  $remaining = @()
+  $drainConfirmed = -not [bool]$script:owned
+  if ($script:owned) {
+    try { $script:owned.Terminate(126) } catch { $failureText += [Environment]::NewLine + 'Job termination failed: ' + $_.Exception.ToString() }
+    $drainDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+      try { $remaining = @($script:owned.ProcessIds()); if ($remaining.Count -eq 0) { $drainConfirmed = $true } } catch { $failureText += [Environment]::NewLine + 'Job drain query failed: ' + $_.Exception.ToString(); break }
+      if ($remaining.Count -gt 0) { Start-Sleep -Milliseconds 25 }
+    } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $drainDeadline)
+  }
+  if ($drainConfirmed) {
+    try { Remove-JobCwdBridge } catch { $failureText += [Environment]::NewLine + 'CWD bridge cleanup failed: ' + $_.Exception.ToString() }
+  }
+  try { Write-JobStatus 'FAILED' $false $false $remaining $failureText } catch {}
   exit 126
 } finally {
   if ($script:owned) { $script:owned.Dispose() }
@@ -1920,6 +1969,42 @@ function createWindowsJobAdapter(options = {}) {
     }
     return null
   }
+  const removeCwdBridge = (bridge) => {
+    if (!bridge) return
+    if (fsImpl.existsSync(bridge.physicalCwd)) fsImpl.unlinkSync(bridge.physicalCwd)
+    if (fsImpl.existsSync(bridge.root)) fsImpl.rmdirSync(bridge.root)
+  }
+  const createCwdBridge = (requestedCwd) => {
+    if (requestedCwd.length < 260) return null
+    const before = inspectPathNoFollow(requestedCwd, { fsImpl })
+    if (!before.exists || !before.realpath || !before.identity) {
+      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job requested cwd is not one physical directory')
+    }
+    const requestedItem = fsImpl.lstatSync(requestedCwd)
+    if (!requestedItem.isDirectory() || requestedItem.isSymbolicLink()) {
+      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job requested cwd is not a physical directory')
+    }
+    const root = createCompilerDirectory('autoprompt-job-cwd-')
+    const physicalCwd = path.join(root, 'cwd')
+    try {
+      fsImpl.symlinkSync(before.realpath, physicalCwd, 'junction')
+      const alias = fsImpl.lstatSync(physicalCwd)
+      const resolved = fsImpl.realpathSync.native(physicalCwd)
+      const after = inspectPathNoFollow(requestedCwd, { fsImpl })
+      if (!alias.isSymbolicLink() || resolved.toLowerCase() !== before.realpath.toLowerCase() ||
+          !after.exists || stableStringify(after.identity) !== stableStringify(before.identity)) {
+        fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job cwd bridge does not bind the requested physical directory')
+      }
+      if (physicalCwd.length >= 260) fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job cwd bridge is not shallow')
+      return { root, physicalCwd, requestedCwd, requestedIdentity: before.identity }
+    } catch (error) {
+      try { removeCwdBridge({ root, physicalCwd }) } catch {
+        error.cleanupConfirmed = false
+        error.retainedCwdBridgeRoot = root
+      }
+      throw error
+    }
+  }
   const processAlive = (pid) => {
     if (!Number.isSafeInteger(pid) || pid < 1) return false
     try { process.kill(pid, 0); return true } catch (error) { return Boolean(error && error.code === 'EPERM') }
@@ -1969,11 +2054,39 @@ function createWindowsJobAdapter(options = {}) {
     }
     return request
   }
+  const validateCwdBridgeRecord = (request, status) => {
+    const fields = [request.physicalCwd, request.cwdBridgeRoot, request.cwdIdentity]
+    const present = fields.filter(value => value !== undefined).length
+    if (present === 0) return
+    if (present !== fields.length || typeof request.cwd !== 'string' || !path.isAbsolute(request.cwd) || request.cwd.length < 260 ||
+        typeof request.physicalCwd !== 'string' || !path.isAbsolute(request.physicalCwd) || request.physicalCwd.length >= 260 ||
+        typeof request.cwdBridgeRoot !== 'string' || !path.isAbsolute(request.cwdBridgeRoot) ||
+        path.dirname(request.physicalCwd) !== request.cwdBridgeRoot || !request.cwdIdentity || typeof request.cwdIdentity !== 'object') {
+      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job immutable request has an invalid cwd bridge binding')
+    }
+    if (typeof status.cwdBridgeRequired !== 'boolean' || typeof status.cwdBridgeCleaned !== 'boolean' ||
+        status.cwdBridgeRequired !== true) {
+      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job status has an invalid cwd bridge state')
+    }
+    if (status.cwdBridgeCleaned === true) {
+      if (fsImpl.existsSync(request.physicalCwd) || fsImpl.existsSync(request.cwdBridgeRoot)) {
+        fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job claimed cwd bridge cleanup while the bridge remained')
+      }
+    }
+  }
   const validateControlRecord = (directory, status) => {
     const request = readRequestRecord(directory)
     if (status.reservationId !== request.reservationId || status.reservationIdentity !== request.reservationIdentity ||
         status.requestChecksum !== request.checksum) {
       fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job status does not bind its exact immutable request record')
+    }
+    if (request.physicalCwd !== undefined) {
+      if (status.cwdBridgeRequired !== true || typeof status.cwdBridgeCleaned !== 'boolean') {
+        fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job status does not bind its cwd bridge requirement')
+      }
+      validateCwdBridgeRecord(request, status)
+    } else if (status.cwdBridgeRequired === true) {
+      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job status claims an unbound cwd bridge')
     }
     return request
   }
@@ -2066,7 +2179,28 @@ function createWindowsJobAdapter(options = {}) {
             !Number.isSafeInteger(launcher.helperPid) || launcher.helperPid < 1) {
           return { state: 'UNKNOWN', evidence: { reason: 'launcher-foreign' } }
         }
-        if (!processAlive(launcher.helperPid) && wallNowMs() >= Date.parse(record.startupDeadlineAt)) {
+        const request = readRequestRecord(files.directory)
+        const requestBridge = request.physicalCwd === undefined ? null : {
+          requestedCwd: request.cwd, physicalCwd: request.physicalCwd,
+          cwdBridgeRoot: request.cwdBridgeRoot, cwdIdentity: request.cwdIdentity,
+        }
+        const launcherBridge = launcher.physicalCwd === undefined ? null : {
+          requestedCwd: launcher.requestedCwd, physicalCwd: launcher.physicalCwd,
+          cwdBridgeRoot: launcher.cwdBridgeRoot, cwdIdentity: launcher.cwdIdentity,
+        }
+        if (stableStringify(requestBridge) !== stableStringify(launcherBridge)) {
+          return { state: 'UNKNOWN', evidence: { reason: 'launcher-cwd-bridge-foreign' } }
+        }
+        const helperAlive = processAlive(launcher.helperPid)
+        try {
+          if (requestBridge) validateCwdBridgeRecord(request, { cwdBridgeRequired: true, cwdBridgeCleaned: false })
+        } catch (error) {
+          return { state: 'UNKNOWN', evidence: { reason: 'launcher-cwd-bridge-invalid', cause: error.message } }
+        }
+        if (!helperAlive && requestBridge) {
+          return { state: 'UNKNOWN', evidence: { reason: 'launcher-dead-with-unproven-cwd-bridge-cleanup', helperPid: launcher.helperPid } }
+        }
+        if (!helperAlive && wallNowMs() >= Date.parse(record.startupDeadlineAt)) {
           return { state: 'DEAD', evidence: { reason: 'launcher-dead-after-deadline', helperPid: launcher.helperPid } }
         }
       }
@@ -2149,23 +2283,38 @@ function createWindowsJobAdapter(options = {}) {
       })
       const files = filesForReservation(spec.reservationId)
       fsImpl.mkdirSync(files.directory, { recursive: true, mode: 0o700 })
-      atomicWriteJson(files.requestPath, {
-        schemaVersion: 1,
-        reservationId: spec.reservationId,
-        reservationIdentity: spec.reservationIdentity,
-        reservationBindingHash: sha256(stableStringify(reservationBinding)),
-        reservationBinding,
-        startupDeadlineAt: spec.startupDeadlineAt,
-        startupDelayMilliseconds,
-        targetKey: spec.targetKey,
-        executable: spec.executable,
-        argv: spec.argv,
-        cwd: spec.cwd || process.cwd(),
-        // The helper has its own inherited control environment. The owned
-        // child receives exactly the caller-authorized map and no ambient
-        // supervisor variables.
-        environment: { ...(spec.env || {}) },
-      }, { fsImpl })
+      const requestedCwd = path.resolve(spec.cwd || process.cwd())
+      let cwdBridge
+      try {
+        cwdBridge = createCwdBridge(requestedCwd)
+        atomicWriteJson(files.requestPath, {
+          schemaVersion: 1,
+          reservationId: spec.reservationId,
+          reservationIdentity: spec.reservationIdentity,
+          reservationBindingHash: sha256(stableStringify(reservationBinding)),
+          reservationBinding,
+          startupDeadlineAt: spec.startupDeadlineAt,
+          startupDelayMilliseconds,
+          targetKey: spec.targetKey,
+          executable: spec.executable,
+          argv: spec.argv,
+          cwd: requestedCwd,
+          ...(cwdBridge ? { physicalCwd: cwdBridge.physicalCwd, cwdBridgeRoot: cwdBridge.root,
+            cwdIdentity: cwdBridge.requestedIdentity } : {}),
+          // The helper has its own inherited control environment. The owned
+          // child receives exactly the caller-authorized map and no ambient
+          // supervisor variables.
+          environment: { ...(spec.env || {}) },
+        }, { fsImpl })
+      } catch (error) {
+        if (cwdBridge) {
+          try { removeCwdBridge(cwdBridge) } catch {
+            error.cleanupConfirmed = false
+            error.retainedCwdBridgeRoot = cwdBridge.root
+          }
+        }
+        throw error
+      }
       try { fsImpl.unlinkSync(files.killPath) } catch {}
       const diagnosticDescriptor = fsImpl.openSync(files.stderrPath, 'a', 0o600)
       let helper, compilerDirectory, helperInputError = null, helperError = null, helperExit = null
@@ -2207,6 +2356,15 @@ function createWindowsJobAdapter(options = {}) {
           error.cleanupConfirmed = false
           error.retainedCompilerRoot = compilerDirectory
         }
+        if (cwdBridge && (!helper || !Number.isSafeInteger(helper.pid))) {
+          try { removeCwdBridge(cwdBridge) } catch {
+            error.cleanupConfirmed = false
+            error.retainedCwdBridgeRoot = cwdBridge.root
+          }
+        } else if (cwdBridge && helper && Number.isSafeInteger(helper.pid) && fsImpl.existsSync(cwdBridge.root)) {
+          error.cleanupConfirmed = false
+          error.retainedCwdBridgeRoot = cwdBridge.root
+        }
         throw error
       } finally {
         fsImpl.closeSync(diagnosticDescriptor)
@@ -2217,6 +2375,12 @@ function createWindowsJobAdapter(options = {}) {
           error.cleanupConfirmed = false
           error.retainedCompilerRoot = compilerDirectory
         }
+        if (cwdBridge && fsImpl.existsSync(cwdBridge.root)) {
+          try { removeCwdBridge(cwdBridge) } catch {
+            error.cleanupConfirmed = false
+            error.retainedCwdBridgeRoot = cwdBridge.root
+          }
+        }
         throw error
       }
       atomicWriteJson(files.launcherPath, {
@@ -2226,6 +2390,8 @@ function createWindowsJobAdapter(options = {}) {
         reservationBindingHash: sha256(stableStringify(reservationBinding)),
         startupDeadlineAt: spec.startupDeadlineAt,
         helperPid: helper.pid,
+        ...(cwdBridge ? { requestedCwd, physicalCwd: cwdBridge.physicalCwd, cwdBridgeRoot: cwdBridge.root,
+          cwdIdentity: cwdBridge.requestedIdentity } : {}),
       }, { fsImpl })
       helper.unref()
       const startupDeadlineMs = Date.parse(spec.startupDeadlineAt)
@@ -2250,6 +2416,10 @@ function createWindowsJobAdapter(options = {}) {
             error.cleanupConfirmed = false
             error.retainedCompilerRoot = compilerDirectory
           }
+          if (cwdBridge && fsImpl.existsSync(cwdBridge.root)) {
+            error.cleanupConfirmed = false
+            error.retainedCwdBridgeRoot = cwdBridge.root
+          }
           throw error
         }
         if (helperInputError || helperError || helperExit) {
@@ -2269,6 +2439,10 @@ function createWindowsJobAdapter(options = {}) {
             error.cleanupConfirmed = false
             error.retainedCompilerRoot = compilerDirectory
             if (compilerCleanupError) error.cleanupCode = String(compilerCleanupError.code || 'cleanup-failed').slice(0, 64)
+          }
+          if (cwdBridge && fsImpl.existsSync(cwdBridge.root)) {
+            error.cleanupConfirmed = false
+            error.retainedCwdBridgeRoot = cwdBridge.root
           }
           throw error
         }

@@ -349,6 +349,7 @@ class HarnessEventStream {
     this.claudeStructuredOutputSchema = record.claudeStructuredOutputSchema || null
     this.claudeStructuredOutputPending = null; this.claudeStructuredOutput = null
     this.claudeStructuredOutputCalls = new Set()
+    this.claudeHeartbeatCounters = new Map()
     this.deepseekStructuredOutputSchema = record.deepseekStructuredOutputSchema || null
     this.deepseekStructuredOutputPending = null; this.deepseekStructuredOutput = null
     this.pendingToolObservations = []
@@ -731,7 +732,14 @@ class HarnessEventStream {
     this.grokReceiptHashes = receipts.map(receipt => receipt.hash)
   }
   claude(e, raw) {
-    if (e.parent_tool_use_id) fail('ROLE_POLICY_DENIED', 'Native subagent execution is forbidden')
+    if (e.parent_tool_use_id) {
+      // Claude CLI emits a bounded heartbeat while an already-admitted
+      // controller MCP call is running. It is transport liveness only: it
+      // never starts, settles, or accounts a tool call. Every other nested
+      // event remains forbidden as native delegation.
+      if (this.claudeHeartbeat(e)) return
+      fail('ROLE_POLICY_DENIED', 'Native subagent execution is forbidden')
+    }
     if (e.session_id) this.session(e.session_id, e, raw)
     if (e.type === 'system' && e.subtype === 'init') { this.session(e.session_id, e, raw); return }
     if (e.type === 'system' && e.subtype === 'status' && (e.status === 'requesting' || e.status === null)) return
@@ -850,6 +858,26 @@ class HarnessEventStream {
       return
     }
     fail('TRANSPORT_INVALID', `Unsupported Claude event: ${e.type}/${e.subtype || ''}`)
+  }
+  claudeHeartbeat(e) {
+    if (e.type !== 'tool_progress' || e.heartbeat !== true || typeof e.parent_tool_use_id !== 'string' ||
+        !identity(e.tool_use_id) || typeof e.tool_name !== 'string' ||
+        !Number.isSafeInteger(e.elapsed_time_seconds) || e.elapsed_time_seconds < 0 || e.elapsed_time_seconds > 3600 ||
+        !identity(e.session_id) || typeof e.uuid !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(e.uuid)) return false
+    const allowed = new Set(['type', 'tool_use_id', 'tool_name', 'parent_tool_use_id', 'elapsed_time_seconds', 'heartbeat', 'session_id', 'uuid'])
+    if (Object.keys(e).some(key => !allowed.has(key))) return false
+    if (this.sessionId !== e.session_id) return false
+    const active = this.activeTools.get(e.parent_tool_use_id)
+    const controlledName = this.receiptVerifier ? controlled.decodeToolName(this.provider, e.tool_name) : null
+    if (!this.receiptVerifier || !active || !active.ownedName || active.ownedName !== controlledName || active.name !== e.tool_name) return false
+    const prefix = `${e.parent_tool_use_id}-heartbeat-`
+    if (!e.tool_use_id.startsWith(prefix)) return false
+    const suffix = e.tool_use_id.slice(prefix.length), counter = Number(suffix)
+    if (!Number.isSafeInteger(counter) || counter < 0 || counter > 99 || String(counter) !== suffix) return false
+    const previous = this.claudeHeartbeatCounters.get(e.parent_tool_use_id)
+    if (previous === undefined ? counter !== 0 : counter !== previous + 1) return false
+    this.claudeHeartbeatCounters.set(e.parent_tool_use_id, counter)
+    return true
   }
   claudeStream(event) {
     if (!object(event) || typeof event.type !== 'string') fail('TRANSPORT_INVALID', 'Claude stream event has no type')

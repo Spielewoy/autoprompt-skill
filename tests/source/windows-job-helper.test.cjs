@@ -5,6 +5,20 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const cp = require('node:child_process')
+const { selectWindowsLiveStatusPids } = require('../../agents/codex/workflow/process-owner.js')
+
+test('Windows Job cwd bridge cleanup remains owned until its terminal publication', () => {
+  const cleaning = {
+    status: 'CLEANING', ready: true, assigned: true, helperPid: 61001,
+    rootPid: 61002, pids: [], observedPids: [61002],
+    cwdBridgeRequired: true, cwdBridgeCleaned: false,
+  }
+  assert.deepEqual(selectWindowsLiveStatusPids(cleaning, pid => pid === 61001), [61001])
+  assert.throws(() => selectWindowsLiveStatusPids(cleaning, () => false), /retained an unowned cwd bridge/)
+  assert.throws(() => selectWindowsLiveStatusPids({ ...cleaning, pids: [61002] }, () => true),
+    /does not prove zero assigned membership/)
+  assert.deepEqual(selectWindowsLiveStatusPids({ ...cleaning, status: 'EXITED', cwdBridgeCleaned: true }, () => false), [])
+})
 
 test('Windows Job bridge compiles and preserves atomic status publication on native long paths', { timeout: 120000 }, t => {
   const powershell = process.platform === 'win32' ? path.win32.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'pwsh'
@@ -17,6 +31,9 @@ test('Windows Job bridge compiles and preserves atomic status publication on nat
   const moduleSource = fs.readFileSync(path.resolve(__dirname, '../../agents/codex/workflow/process-owner.js'), 'utf8')
   const helper = /const WINDOWS_JOB_HELPER = String.raw`([\s\S]*?)\n`/.exec(moduleSource)?.[1]
   assert.ok(helper)
+  assert.match(helper, /\$drainConfirmed = -not \[bool\]\$script:owned/)
+  assert.match(helper, /if \(\$drainConfirmed\) \{\s+try \{ Remove-JobCwdBridge \}/)
+  assert.match(helper, /Write-JobStatus 'CLEANING' \$true \$true @\(\) \$null\s+\}\s+Remove-JobCwdBridge/)
   const native = /Add-Type -TypeDefinition @'\r?\n([\s\S]*?)\r?\n'@/.exec(helper)?.[1]
   assert.ok(native)
   const sourcePath = path.join(base, 'native.cs'), scriptPath = path.join(base, 'job.ps1')
@@ -49,15 +66,26 @@ if($nativeIO){
   [AutopromptOwnedJob]::PublishText($env:AP_JOB_STATUS,($env:AP_JOB_TEMP+'.owned'),$env:AP_JOB_BACKUP,'second')
   if([AutopromptOwnedJob]::ReadText($env:AP_JOB_STATUS) -cne 'second'){throw 'status replacement missing'}
   if([AutopromptOwnedJob]::FileExists($env:AP_JOB_BACKUP) -or [AutopromptOwnedJob]::FileExists($env:AP_JOB_TEMP+'.owned')){throw 'publication residue'}
+  $launchEnvironment=New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+  $launchEnvironment['SystemRoot']=$env:SystemRoot
+  $nativeFailure=$null
+  try{[void][AutopromptOwnedJob]::Start((Join-Path $env:SystemRoot 'missing-autoprompt-owned.exe'),@(),$env:SystemRoot,$launchEnvironment,[DateTime]::UtcNow.AddSeconds(10))}catch{
+    $nativeFailure=$_.Exception
+    while($nativeFailure.InnerException){$nativeFailure=$nativeFailure.InnerException}
+  }
+  if(-not ($nativeFailure -is [ComponentModel.Win32Exception]) -or $nativeFailure.NativeErrorCode -ne 2 -or
+      $nativeFailure.Message -notmatch 'nativeError=2' -or $nativeFailure.Message -notmatch 'applicationLength=' -or
+      $nativeFailure.Message -notmatch 'commandLength=' -or $nativeFailure.Message -notmatch 'cwdLength=' -or
+      $nativeFailure.Message -notmatch 'environmentLength='){throw 'bounded CreateProcess native error diagnostics missing'}
 }
-[ordered]@{compiled=$true;pathRefusals=3;nativeIO=$nativeIO}|ConvertTo-Json -Compress
+[ordered]@{compiled=$true;pathRefusals=3;nativeIO=$nativeIO;nativeErrorDiagnostics=$nativeIO}|ConvertTo-Json -Compress
 `
   const environment = process.platform === 'win32' ? require('../../agents/codex/workflow/safe-run-root.js').windowsControllerEnvironment(process.env.SystemRoot) : process.env
   const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 90000, windowsHide: true, env: { ...environment, AP_JOB_SCRIPT: scriptPath, AP_JOB_NATIVE: sourcePath, AP_JOB_STATUS: status, AP_JOB_TEMP: temporary, AP_JOB_BACKUP: backup, AP_JOB_NATIVE_IO: process.platform === 'win32' ? '1' : '0' } })
   assert.ifError(result.error)
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.equal(result.stderr, '')
-  assert.deepEqual(JSON.parse(result.stdout), { compiled: true, pathRefusals: 3, nativeIO: process.platform === 'win32' })
+  assert.deepEqual(JSON.parse(result.stdout), { compiled: true, pathRefusals: 3, nativeIO: process.platform === 'win32', nativeErrorDiagnostics: process.platform === 'win32' })
   assert.equal(fs.readFileSync(temporary, 'utf8'), 'FOREIGN_COLLISION')
   if (process.platform === 'win32') assert.equal(fs.readFileSync(status, 'utf8'), 'second')
 })
@@ -77,6 +105,10 @@ test('native Windows Job ownership survives deep durable paths and hostile home 
     const registryPath = path.join(base, 'processes.json')
     const owner = new ProcessOwner({ adapter, registryPath, pollMs: 25 })
     const marker = path.join(base, 'child.json')
+    const deepCwd = path.join(protectedRoot, 'semantic-working-directory')
+    fs.mkdirSync(deepCwd)
+    fs.writeFileSync(path.join(deepCwd, 'relative-input.txt'), 'semantic-cwd')
+    assert.ok(deepCwd.length > 300)
     let launched, cleanupOwner = owner
     try {
       const environment = {
@@ -84,12 +116,21 @@ test('native Windows Job ownership survives deep durable paths and hostile home 
         PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
         AUTOPROMPT_EXACT_JOB_ENV: 'owned',
       }
-      launched = await owner.launch({ executable: process.execPath, argv: ['-e', 'require("node:fs").writeFileSync(process.argv[1],JSON.stringify({pid:process.pid,environment:process.env}));setInterval(()=>{},1000)', marker], cwd: base, env: environment, targetKey: 'deep-durable-job' })
+      launched = await owner.launch({ executable: process.execPath, argv: ['-e', 'const fs=require("node:fs");fs.writeFileSync("relative-output.txt","owned-relative-write");fs.writeFileSync(process.argv[1],JSON.stringify({pid:process.pid,environment:process.env,cwd:process.cwd(),realCwd:fs.realpathSync.native(process.cwd()),relativeInput:fs.readFileSync("relative-input.txt","utf8")}));setInterval(()=>{},1000)', marker], cwd: deepCwd, env: environment, targetKey: 'deep-durable-job' })
       const deadline = Date.now() + 10000
       while (!fs.existsSync(marker) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25))
       const observed = JSON.parse(fs.readFileSync(marker, 'utf8'))
       assert.equal(observed.pid, launched.rootPid)
       assert.deepEqual(observed.environment, environment)
+      assert.equal(observed.relativeInput, 'semantic-cwd')
+      assert.equal(observed.realCwd.toLowerCase(), fs.realpathSync.native(deepCwd).toLowerCase())
+      assert.equal(fs.readFileSync(path.join(deepCwd, 'relative-output.txt'), 'utf8'), 'owned-relative-write')
+      const reservation = fs.readdirSync(controlRoot, { withFileTypes: true }).find(entry => entry.isDirectory())
+      const launcher = JSON.parse(fs.readFileSync(path.join(controlRoot, reservation.name, 'launcher.json'), 'utf8'))
+      assert.equal(launcher.requestedCwd.toLowerCase(), path.resolve(deepCwd).toLowerCase())
+      assert.ok(launcher.physicalCwd.length < 260)
+      assert.equal(fs.realpathSync.native(launcher.physicalCwd).toLowerCase(), fs.realpathSync.native(deepCwd).toLowerCase())
+      assert.equal(fs.existsSync(launcher.cwdBridgeRoot), true)
       const reopenedAdapter = createWindowsJobAdapter({ controlRoot, providerPrivateOwnershipRoot: protectedRoot })
       const restarted = new ProcessOwner({ adapter: reopenedAdapter, registryPath, pollMs: 25 })
       cleanupOwner = restarted
@@ -97,7 +138,10 @@ test('native Windows Job ownership survives deep durable paths and hostile home 
       const cancelled = await restarted.cancelGroup(launched.ownershipId, { graceMs: 0, killMs: 10000, reason: 'native deep-path regression' })
       assert.equal(cancelled.status, 'CANCELLED')
       assert.deepEqual(await adapter.listOwned(launched.groupIdentity), [])
-      process.stdout.write(JSON.stringify({ deepControl: true, exactChildEnvironment: true, durableRecovery: true, drained: true }) + '\n')
+      assert.equal(fs.existsSync(launcher.cwdBridgeRoot), false, 'owned helper must remove its shallow cwd bridge after drain')
+      const terminal = JSON.parse(fs.readFileSync(path.join(controlRoot, reservation.name, 'status.json'), 'utf8'))
+      assert.equal(terminal.cwdBridgeCleaned, true)
+      process.stdout.write(JSON.stringify({ deepControl: true, deepCwd: true, exactChildEnvironment: true, durableRecovery: true, drained: true }) + '\n')
     } finally {
       await cleanupOwner.cancelAll({ graceMs: 0, killMs: 10000, reason: 'native deep-path regression cleanup' })
     }
@@ -109,6 +153,6 @@ test('native Windows Job ownership survives deep durable paths and hostile home 
   assert.ifError(result.error)
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.equal(result.stderr, '')
-  assert.deepEqual(JSON.parse(result.stdout), { deepControl: true, exactChildEnvironment: true, durableRecovery: true, drained: true })
+  assert.deepEqual(JSON.parse(result.stdout), { deepControl: true, deepCwd: true, exactChildEnvironment: true, durableRecovery: true, drained: true })
   fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })

@@ -294,12 +294,18 @@ test('claude closed native capability: full canonical role schema is accepted an
     remainingConcerns: [], allAssignedItemsPass: true,
     requestedTransition: { event: 'WORK_ITEM_VERIFIED', reason: 'The exact structured result passed.', invalidateEvidenceIds: [] },
   }
-  const f = await scenario(t, { serviceOptions: { structuredOutput: output } })
+  // The real CLI emits a tool_progress heartbeat after 30 seconds. Keep this
+  // owned command alive long enough to exercise that wire event on every
+  // native platform, then validate the same exact command receipt and result.
+  const f = await scenario(t, { serviceOptions: { structuredOutput: output },
+    command: ({ candidate }) => nodeCommand(`Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,35000);process.stdout.write(require('node:fs').readFileSync(${JSON.stringify(candidate)}))`) })
   fs.copyFileSync(path.join(__dirname, '..', '..', 'agents', 'contracts', 'schemas', 'role-report.schema.json'), f.schema)
   let result
+  const heartbeats = []
   const quotaHooks = {
     providerTokenLimit: 100000, finiteTokenBudget: false,
     onProviderRequestStarted() {}, onProviderRequestSettled() {}, onUnknownProviderSpend() {},
+    onEvent(event) { if (event.type === 'tool_progress' && event.heartbeat === true) heartbeats.push(event) },
   }
   try { result = await f.run(quotaHooks) } catch (error) {
     const pending = [f.controller]
@@ -314,6 +320,9 @@ test('claude closed native capability: full canonical role schema is accepted an
     throw error
   }
   assert.match(result.contextId, /^[0-9a-f-]{36}$/i)
+  assert.ok(heartbeats.length > 0, 'the installed CLI must emit an actual heartbeat for the slow owned command')
+  assert.ok(heartbeats.every(event => event.parent_tool_use_id === 'fixture-native-read' &&
+    event.tool_name === controlled.toolName('claude', 'bash') && event.session_id === result.contextId))
   assert.ok(result.transportEvidence.eventCount > 0)
   assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/)
   assert.deepEqual(Object.fromEntries(Object.entries(output).filter(([key]) => !['candidateHash'].includes(key))),

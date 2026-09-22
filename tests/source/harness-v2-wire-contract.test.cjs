@@ -6,6 +6,8 @@ const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 const native = require('../../scripts/harness-v2-native.cjs')
+const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
+const controlled = require('../../scripts/harness-v2-controlled-tools.cjs')
 const { validateJsonSchema } = require('../../agents/codex/workflow/json-schema-validator.js')
 const { HarnessEventStream, exactUsage, contextRoot, persistContext, ROUTE_ADVISORY_WIRE_SCHEMA, routeAdvisoryProjection, materializeRouteAdvisory, compactRouteAdvisoryContract } = require('../../scripts/harness-v2-transport.cjs')
 const { ReasonixEventStream } = require('../../agents/reasonix/workflow/transport.js')
@@ -427,6 +429,77 @@ test('Claude thinking progress neither changes billing nor permits native delega
   const stream = new HarnessEventStream('claude')
   assert.throws(() => stream.push(JSON.stringify({ type: 'system', subtype: 'thinking_tokens',
     parent_tool_use_id: 'native-child' })), { code: 'ROLE_POLICY_DENIED' })
+})
+
+test('Claude accepts only the exact controller heartbeat for an active MCP call', t => {
+  const base = root(t), target = path.join(base, 'target'), scratch = path.join(base, 'scratch'), controller = path.join(base, 'controller')
+  for (const directory of [target, scratch, controller]) fs.mkdirSync(directory, { mode: 0o700 })
+  const prepared = boundary.prepareBoundary({ provider: 'claude', root: controller,
+    policy: { provider: 'claude', readOnly: true, targetPath: target, scratchPath: scratch,
+      readableRoots: [target, scratch], writableRoots: [scratch], nestedDispatch: false,
+      commandBoundary: true, externalWrites: false } })
+  const parent = 'fixture-native-read', session = 'heartbeat-session', toolName = controlled.toolName('claude', 'bash')
+  const make = () => {
+    const stream = new HarnessEventStream('claude', { commandBoundary: true, toolBoundary: prepared })
+    stream.session(session, {}, '{}')
+    stream.startTool(parent, toolName, { command: 'printf ok' })
+    return stream
+  }
+  const event = overrides => ({ type: 'tool_progress', tool_use_id: `${parent}-heartbeat-0`,
+    tool_name: toolName, parent_tool_use_id: parent, elapsed_time_seconds: 30, heartbeat: true,
+    session_id: session, uuid: '636eea00-8b93-4929-88d7-5f0bcf05f05f', ...overrides })
+  const stream = make()
+  const emitted = []
+  stream.emit = value => emitted.push(value)
+  const state = value => structuredClone({ active: [...value.activeTools], completed: [...value.completedTools],
+    usage: { ...value.usage }, requests: [...value.usageByRequest], count: value.toolCount,
+    terminal: value.terminal, session: value.sessionId })
+  const before = state(stream)
+  stream.push(JSON.stringify(event()))
+  stream.push(JSON.stringify(event({ tool_use_id: `${parent}-heartbeat-1`, elapsed_time_seconds: 31 })))
+  assert.deepEqual(state(stream), before)
+  assert.deepEqual(emitted, [])
+  assert.equal(stream.claudeHeartbeatCounters.get(parent), 1)
+  for (const hostile of [
+    event({ tool_use_id: `${parent}-heartbeat-2` }),
+    event({ tool_use_id: `${parent}-heartbeat-01` }),
+    event({ tool_use_id: `${parent}-heartbeat-100` }),
+    event({ tool_use_id: `${parent}-heartbeat-` }),
+    event({ elapsed_time_seconds: 30.5 }),
+    event({ elapsed_time_seconds: -1 }),
+    event({ elapsed_time_seconds: 3601 }),
+    event({ elapsed_time_seconds: '30' }),
+    event({ elapsed_time_seconds: null }),
+    event({ uuid: undefined }),
+    event({ uuid: 'malformed' }),
+    event({ parent_tool_use_id: 'foreign-call' }),
+    event({ tool_name: 'Agent' }),
+    event({ session_id: 'foreign-session' }),
+    event({ heartbeat: false }),
+    event({ type: 'assistant' }),
+    event({ subagent_type: 'Task' }),
+  ]) {
+    const fresh = make(), prior = state(fresh)
+    assert.throws(() => fresh.push(JSON.stringify(hostile)), { code: 'ROLE_POLICY_DENIED' })
+    assert.deepEqual(state(fresh), prior)
+    assert.equal(fresh.claudeHeartbeatCounters.size, 0)
+  }
+  for (const counter of [0, 2, 100]) {
+    const fresh = make()
+    fresh.push(JSON.stringify(event()))
+    assert.throws(() => fresh.push(JSON.stringify(event({ tool_use_id: `${parent}-heartbeat-${counter}` }))), { code: 'ROLE_POLICY_DENIED' })
+    assert.equal(fresh.claudeHeartbeatCounters.get(parent), 0)
+  }
+  const nonowned = new HarnessEventStream('claude', { commandBoundary: true })
+  nonowned.session(session, {}, '{}')
+  nonowned.startTool(parent, 'bash', { command: 'printf ok' })
+  assert.throws(() => nonowned.push(JSON.stringify(event({ tool_name: 'bash' }))), { code: 'ROLE_POLICY_DENIED' })
+  const completed = make()
+  const result = { tool: 'bash', status: 'completed', command: 'printf ok', exitCode: 0, background: false, output: 'ok', outputSha256: native.sha256('ok') }
+  boundary.appendReceipt(prepared, 'bash', { command: 'printf ok' }, result, new Date().toISOString())
+  completed.finishTool(parent, JSON.stringify(result))
+  assert.equal(completed.completedTools.has(parent), true)
+  assert.throws(() => completed.push(JSON.stringify(event())), { code: 'ROLE_POLICY_DENIED' })
 })
 
 test('Claude refuses unstreamed assistant accounting and unfinished streamed content', () => {

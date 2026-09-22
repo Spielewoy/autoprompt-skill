@@ -749,6 +749,7 @@ jobs:
           path: |
             native-platform-evidence.json
             native-platform-tests.log
+            native-platform-tests-*.log
           if-no-files-found: warn
 
   msys-mapping:
