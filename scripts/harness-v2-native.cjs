@@ -1343,6 +1343,32 @@ function claudeCliOutputSchema(schema) {
   if (projected.type === undefined && requiresObject(projected, projected)) projected.type = 'object'
   return projected
 }
+const WINDOWS_CLAUDE_DIRECTORY_ENV = Object.freeze([
+  'HOME', 'USERPROFILE', 'TEMP', 'TMP', 'TMPDIR', 'APPDATA', 'LOCALAPPDATA',
+  'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'CLAUDE_CONFIG_DIR',
+])
+function windowsClaudeExtendedPath(value, platform = process.platform) {
+  // Win32 directory creation reserves room below MAX_PATH for a child name.
+  // Change only the vendor-facing spelling; ownership and storage stay bound
+  // to the original path, and cwd still uses the owned process bridge.
+  if (platform !== 'win32' || typeof value !== 'string' || value.length < 248 ||
+      !path.win32.isAbsolute(value) || value.includes('\0')) return value
+  return path.win32.toNamespacedPath(value)
+}
+function projectWindowsClaudeLaunchPaths(argv, environment, platform = process.platform) {
+  const projectedArgv = [...argv], projectedEnvironment = { ...environment }
+  if (platform !== 'win32') return { argv: projectedArgv, env: projectedEnvironment }
+  const settings = projectedArgv.indexOf('--settings')
+  if (settings >= 0 && typeof projectedArgv[settings + 1] === 'string') {
+    projectedArgv[settings + 1] = windowsClaudeExtendedPath(projectedArgv[settings + 1], platform)
+  }
+  for (const key of WINDOWS_CLAUDE_DIRECTORY_ENV) {
+    if (typeof projectedEnvironment[key] === 'string') {
+      projectedEnvironment[key] = windowsClaudeExtendedPath(projectedEnvironment[key], platform)
+    }
+  }
+  return { argv: projectedArgv, env: projectedEnvironment }
+}
 function createLaunch(options) {
   const { provider, home, sessionRoot, prompt, input, continuationId, readOnly, targetPath } = options
   const d = descriptor(provider)
@@ -1356,7 +1382,7 @@ function createLaunch(options) {
     // session cap.
     connection = { ...connection, timeoutMs: 600000 }
   }
-  const env = isolatedEnvironment(home, options.environment, credentialEnvironment(provider, connection, null, options.credentials || {}))
+  let env = isolatedEnvironment(home, options.environment, credentialEnvironment(provider, connection, null, options.credentials || {}))
   Object.assign(env, connection.environment)
   const model = options.model || connection.model
   const controlled = options.toolBoundary ? require('./harness-v2-controlled-tools.cjs') : null
@@ -1385,6 +1411,9 @@ function createLaunch(options) {
       if (!Number.isSafeInteger(options.maxTokens) || options.maxTokens <= 0) fail('PROFILE_INVALID', 'Claude output token limit must be a positive integer')
       env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(options.maxTokens)
     }
+    const projected = projectWindowsClaudeLaunchPaths(argv, env)
+    argv = projected.argv
+    env = projected.env
   } else if (provider === 'opencode' || provider === 'kilo') {
     const tools = { read: true, glob: true, grep: true, list: true, write: !readOnly, edit: !readOnly, patch: !readOnly, bash: Boolean(options.commandBoundary) }
     const projection = options.toolFree === true ? null : controlled?.opencodeProjection(options.toolBoundary, provider)
@@ -1514,4 +1543,4 @@ function createLaunch(options) {
   if (model && !['deepseek', 'vscode'].includes(provider)) argv.push('--model', safeString(model, 'model'))
   return { argv, env, stdin: input, cwd: options.cwd, shell: false, ...(requiredResponseFormat ? { requiredResponseFormat } : {}) }
 }
-module.exports = { runtimeDependencyIdentity, portableRuntimeDependencyIdentity, hermesPythonDependencyInventory, hermesRuntimeDependencyIdentity, hermesPortableRuntimeDependencyIdentity, validateEffort, PROVIDERS, HarnessError, fail, descriptor, locateExecutable, executableSha256, executableRuntimePath, executableInvocation, probeExecutable, deepseekSdkCapabilityEvidence, connectionConfig, sanitizeConnection, credentialEnvironment, isolatedEnvironment, createLaunch, readBound, sha256, privateDirectory, writePrivate }
+module.exports = { runtimeDependencyIdentity, portableRuntimeDependencyIdentity, hermesPythonDependencyInventory, hermesRuntimeDependencyIdentity, hermesPortableRuntimeDependencyIdentity, validateEffort, PROVIDERS, HarnessError, fail, descriptor, locateExecutable, executableSha256, executableRuntimePath, executableInvocation, probeExecutable, deepseekSdkCapabilityEvidence, connectionConfig, sanitizeConnection, credentialEnvironment, isolatedEnvironment, windowsClaudeExtendedPath, projectWindowsClaudeLaunchPaths, createLaunch, readBound, sha256, privateDirectory, writePrivate }
