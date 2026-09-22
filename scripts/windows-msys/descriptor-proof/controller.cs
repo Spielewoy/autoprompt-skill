@@ -67,7 +67,7 @@ public static class DescriptorController {
    var same=Start(operations,"same",control,executable,args[1],new[]{"same-profile",prefix,packageA},cwdA,env,sidA,packageA,6000);var sameResult=Complete(same,8000);
    var other=Start(operations,"other",control,executable,args[1],new[]{"other-profile",prefix,packageB},cwdB,env,sidB,packageB,6000);var otherResult=Complete(other,8000);
    ExclusiveMarker(release,"release\n");var creatorResult=Complete(creator,5000);Need(Hash(executable)==args[1]&&Hash(bash)==args[3]&&Hash(dll)==args[5],"bound-inputs-remain-unchanged");
-   proof="{\"schemaVersion\":1,\"objects\":16,\"sameProfileOpens\":16,\"otherProfileDenied\":16,\"drainedJobs\":3,\"namespaceCount\":"+lease.Names.Length+",\"creatorBase64\":\""+Output(creatorResult)+"\",\"sameBase64\":\""+Output(sameResult)+"\",\"otherBase64\":\""+Output(otherResult)+"\"}";
+   proof="{\"schemaVersion\":1,\"objects\":16,\"sameProfileOpens\":16,\"otherProfileDenied\":16,\"pidLinkObjects\":1,\"sameProfilePidLinkOpens\":1,\"otherProfilePidLinkDenied\":1,\"drainedJobs\":3,\"namespaceCount\":"+lease.Names.Length+",\"creatorBase64\":\""+Output(creatorResult)+"\",\"sameBase64\":\""+Output(sameResult)+"\",\"otherBase64\":\""+Output(otherResult)+"\"}";
   }catch(Exception error){failure=error;}finally{
    drained=DrainAll(operations);
    if(drained){if(lease!=null)lease.Dispose();if(createdB&&WindowsAppContainerNative.DeleteAppContainerProfile(nameB)!=0)failure=new InvalidOperationException("delete-profile-B",failure);if(createdA&&WindowsAppContainerNative.DeleteAppContainerProfile(nameA)!=0)failure=new InvalidOperationException("delete-profile-A",failure);if(sidB!=IntPtr.Zero)WindowsAppContainerNative.FreeSid(sidB);if(sidA!=IntPtr.Zero)WindowsAppContainerNative.FreeSid(sidA);}

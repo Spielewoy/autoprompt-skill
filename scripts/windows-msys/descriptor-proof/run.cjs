@@ -34,9 +34,10 @@ function bound(file, max = 128 * 1024 * 1024) {
 }
 function parseProof(stdout) {
   const proof = JSON.parse(stdout)
-  exact(proof, ['schemaVersion', 'objects', 'sameProfileOpens', 'otherProfileDenied', 'drainedJobs', 'namespaceCount', 'creatorBase64', 'sameBase64', 'otherBase64'])
+  exact(proof, ['schemaVersion', 'objects', 'sameProfileOpens', 'otherProfileDenied', 'pidLinkObjects', 'sameProfilePidLinkOpens', 'otherProfilePidLinkDenied', 'drainedJobs', 'namespaceCount', 'creatorBase64', 'sameBase64', 'otherBase64'])
   assert.equal(proof.schemaVersion, 1)
   for (const key of ['objects', 'sameProfileOpens', 'otherProfileDenied']) assert.equal(proof[key], 16)
+  for (const key of ['pidLinkObjects', 'sameProfilePidLinkOpens', 'otherProfilePidLinkDenied']) assert.equal(proof[key], 1)
   assert.equal(proof.drainedJobs, 3)
   assert.ok(proof.namespaceCount === 1 || proof.namespaceCount === 2)
   for (const [key, prefix, end] of [
@@ -47,13 +48,16 @@ function parseProof(stdout) {
     const encoded = proof[key]; assert.equal(typeof encoded, 'string'); assert.ok(encoded.length <= 21848)
     const bytes = Buffer.from(encoded, 'base64'); assert.equal(bytes.toString('base64'), encoded)
     const lines = bytes.toString('utf8').trimEnd().split(/\r?\n/)
-    assert.equal(lines.length, 17)
+    assert.equal(lines.length, 18)
     for (let variant = 0; variant < 4; variant++) for (let kind = 0; kind < 4; kind++) {
       const expected = prefix === 'created' ? `created:variant=${variant}:kind=${kind}:effective-descriptor=passed`
         : `open:variant=${variant}:kind=${kind}:status=${prefix === 'same' ? '00000000' : 'c0000022'}:allowed=${prefix === 'same' ? 1 : 0}`
       assert.equal(lines[variant * 4 + kind], expected)
     }
-    assert.equal(lines[16], end)
+    assert.equal(lines[16], prefix === 'created'
+      ? 'created:pid-link:target=314159:helper-world=00000001:helper-package=10000000:effective-world=00000001:effective-package=000f0001:low-label=passed'
+      : `open:pid-link:status=${prefix === 'same' ? '00000000' : 'c0000022'}:allowed=${prefix === 'same' ? 1 : 0}:target=${prefix === 'same' ? '314159' : 'denied'}`)
+    assert.equal(lines[17], end)
   }
   return proof
 }
@@ -135,7 +139,7 @@ function main(args) {
   manifest.nativeExecution = 'passed'; manifest.executableSha256 = sha(pe); manifest.systemImports = imports; manifest.proof = proof
   fs.writeFileSync(path.join(artifacts, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n')
   fs.rmSync(work, { recursive: true, force: true })
-  process.stdout.write(JSON.stringify({ status: 'passed', artifacts, objects: 16, sameProfileOpens: 16, otherProfileDenied: 16, drainedJobs: 3 }) + '\n')
+  process.stdout.write(JSON.stringify({ status: 'passed', artifacts, objects: 16, sameProfileOpens: 16, otherProfileDenied: 16, pidLinkObjects: 1, sameProfilePidLinkOpens: 1, otherProfilePidLinkDenied: 1, drainedJobs: 3 }) + '\n')
 }
 module.exports = { parseProof, physical, bound }
 if (require.main === module) { try { main(process.argv.slice(2)) } catch (error) { process.stderr.write(String(error.stack || error) + '\n'); process.exitCode = 1 } }

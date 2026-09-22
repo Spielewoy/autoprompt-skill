@@ -109,13 +109,16 @@ async function captureImported({ repo, root, expected, node, helper, captureAdap
   const records = await require(path.join(repo,adapterPath)).capturePrecompiledForProof(root, entries, { ...helper })
   assert.equal(hash(source(repo, adapterPath)), captureAdapterSha256)
   const verified = validateImported(repo, records, expected)
+  require('../probe-built-runtime.cjs').requireDynamicBase(verified.data.get('runtime/msys-2.0.dll'))
+  const relocatedBash = require('../bash-relocation.cjs').derive(verified.data.get('runtime/bash.exe'))
+  verified.data.set('runtime/bash.exe', relocatedBash.bytes)
   const capability = Object.freeze({ status:'captured-candidate-not-accepted' })
   const tuple = Object.freeze({ manifestSha256:expected.manifestSha256, receiptSha256:expected.receiptSha256,
     nodeSha256:ownedNode.executableSha256, nodeProvenanceSha256:ownedNode.provenanceSha256,
     nodeNativeProofSha256:ownedNode.nativeProofSha256, nativeArchitecture:osArchitecture,
     bashArchitecture:'x64', msysArchitecture:'x64', bashSha256:hash(verified.data.get('runtime/bash.exe')),
     msysSha256:hash(verified.data.get('runtime/msys-2.0.dll')), fixtureSha256:hash(verified.data.get('fixture/posix-proof.exe')),
-    producer:copy(verified.manifest.authority.producer), sourceBindings:copy(verified.manifest.authority.bindings), accepted:false })
+    bashTransformation:copy(relocatedBash.receipt), bashTransformationRecipeSha256:hash(source(repo, 'scripts/windows-msys/bash-relocation.cjs')), producer:copy(verified.manifest.authority.producer), sourceBindings:copy(verified.manifest.authority.bindings), accepted:false })
   slots.set(capability, { repo, root, expected:copy(expected), node:ownedNode, tuple, data:verified.data })
   return capability
 }

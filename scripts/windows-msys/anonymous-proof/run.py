@@ -12,7 +12,7 @@ def require(condition, reason):
 
 BASE = Path(__file__).resolve().parent
 patch = (BASE.parent / 'pipe-security.patch').read_bytes()
-require(hashlib.sha256(patch).hexdigest() == '8bc01e2694245b271699128399aba48777fa44b878376ee9d84b82b8929eea87',
+require(hashlib.sha256(patch).hexdigest() == 'bf20b8991c21d3d59be6b226b3c628de35fee0535d5f47cea8ca9d5b6c69fe2b',
         'Reviewed patch digest mismatch')
 section = patch.decode().split('diff --git a/winsup/cygwin/kernel32.cc b/winsup/cygwin/kernel32.cc\n', 1)[1].split('\ndiff --git ', 1)[0]
 start = section.index('+/* CreatePipe chooses')

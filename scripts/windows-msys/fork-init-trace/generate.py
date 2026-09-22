@@ -2,7 +2,7 @@
 """Generate a separate diagnostic patch; never modifies source or candidate."""
 import argparse, hashlib, json, pathlib, difflib
 HERE=pathlib.Path(__file__).resolve().parent
-PATCH='8bc01e2694245b271699128399aba48777fa44b878376ee9d84b82b8929eea87'
+PATCH='bf20b8991c21d3d59be6b226b3c628de35fee0535d5f47cea8ca9d5b6c69fe2b'
 SOURCE='270ba2980700e6e2a0813944d506eecea0f86402'
 sha=lambda b:hashlib.sha256(b).hexdigest()
 CTOR_ORIGINAL='  while (--pfunc > in_pfunc)\n    (*pfunc) ();\n'

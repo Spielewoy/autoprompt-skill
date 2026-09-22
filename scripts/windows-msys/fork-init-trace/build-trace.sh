@@ -6,7 +6,7 @@ jobs=${1:?jobs}; epoch=${2:?source epoch}; trace_sha=${3:?externally pinned trac
 export PATH=/usr/bin:/bin MSYSTEM=MSYS LC_ALL=C.UTF-8 TZ=UTC SOURCE_DATE_EPOCH=$epoch
 cd /issue27-build
 printf '%s  source.tar.gz\n' 0571ad83f965bf7682a446a874830a560c8b12431e7d54e55f414a3851ba1146 | sha256sum -c -
-printf '%s  adaptation.patch\n' 8bc01e2694245b271699128399aba48777fa44b878376ee9d84b82b8929eea87 | sha256sum -c -
+printf '%s  adaptation.patch\n' bf20b8991c21d3d59be6b226b3c628de35fee0535d5f47cea8ca9d5b6c69fe2b | sha256sum -c -
 sha256sum -c bootstrap-runtime.sha256
 sha256sum -c toolchain-outputs.sha256
 sha256sum -c stage.sha256 > /issue27-fork-trace/candidate-before.txt

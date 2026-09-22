@@ -56,6 +56,16 @@ function stagedDigest(bytes) {
   assert.ok(entries.has('stage/usr/bin/msys-2.0.dll'), 'Staged DLL checksum is absent')
   return entries.get('stage/usr/bin/msys-2.0.dll')
 }
+function dllCharacteristics(bytes) {
+  assert.ok(Buffer.isBuffer(bytes) && bytes.length >= 0x40 && bytes.readUInt16LE(0) === 0x5a4d, 'Staged DLL has no DOS header')
+  const peOffset = bytes.readUInt32LE(0x3c)
+  assert.ok(peOffset + 24 <= bytes.length && bytes.readUInt32LE(peOffset) === 0x4550, 'Staged DLL has no PE header')
+  const optional = peOffset + 24, size = bytes.readUInt16LE(peOffset + 20)
+  assert.ok(size >= 72 && optional + size <= bytes.length, 'Staged DLL optional header is truncated')
+  assert.equal(bytes.readUInt16LE(optional), 0x20b, 'Staged DLL must be PE32+')
+  return bytes.readUInt16LE(optional + 70)
+}
+function requireDynamicBase(bytes) { assert.notEqual(dllCharacteristics(bytes) & 0x0040, 0, 'Staged DLL must set IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE') }
 function closureRecords(files) {
   assert.ok(files.length > 1 && files.length <= 96)
   const records = files.map(file => {
@@ -128,12 +138,14 @@ function main(workArgument) {
     const stageBytes = readBounded(path.join(stage, 'usr', 'bin', 'msys-2.0.dll'))
     const stageSha = stagedDigest(readBounded(path.join(payload, 'stage.sha256'), 4 * 1024 * 1024))
     assert.equal(sha256(stageBytes), stageSha, 'Staged DLL does not match stage.sha256')
+    requireDynamicBase(stageBytes)
+    const relocatedBash = require('./bash-relocation.cjs').derive(source.find(file => file.name === 'bash.exe').bytes)
     const fresh = path.join(payload, `proof-runtime-${crypto.randomUUID()}`)
     fs.mkdirSync(fresh, { mode: 0o700 })
     ensureWindowsPrivateAcl(fresh)
     physical(fresh, true)
-    for (const file of source) fs.writeFileSync(path.join(fresh, file.name), file.name === 'msys-2.0.dll' ? stageBytes : file.bytes, { flag: 'wx', mode: 0o600 })
-    const expected = sourceRecords.map(record => record.name === 'msys-2.0.dll' ? { name: record.name, sha256: stageSha, bytes: stageBytes.length } : record)
+    for (const file of source) fs.writeFileSync(path.join(fresh, file.name), file.name === 'msys-2.0.dll' ? stageBytes : file.name === 'bash.exe' ? relocatedBash.bytes : file.bytes, { flag: 'wx', mode: 0o600 })
+    const expected = sourceRecords.map(record => record.name === 'msys-2.0.dll' ? { name: record.name, sha256: stageSha, bytes: stageBytes.length } : record.name === 'bash.exe' ? { name: record.name, sha256: sha256(relocatedBash.bytes), bytes: relocatedBash.bytes.length } : record)
     assert.deepEqual(closureRecords(bindBashRuntime(fresh, systemRoot)), expected, 'Copied built runtime closure differs from captured inputs')
     const bashPath = path.join(fresh, 'bash.exe')
     const diagnostic = require('./diagnostic-smoke/binding.cjs')
@@ -142,7 +154,7 @@ function main(workArgument) {
     assert.ok(samePath(selected.bash.path, bashPath), 'Bash resolver fell back instead of selecting the built runtime')
     assert.deepEqual(closureRecords(selected.files), expected, 'Resolved closure differs from the fresh built runtime')
     const manifest = { schema: 1, purpose: 'prototype compiler-output smoke proof; not full platform certification', sdkCommit: lock.sdk.commit,
-      sourceCommit: lock.source.commit, stageSha256: stageSha, bashPath, runtimeDirectory: fresh, source: sourceRecords, copied: expected, test: TEST_NAME }
+      sourceCommit: lock.source.commit, stageSha256: stageSha, bashPath, runtimeDirectory: fresh, source: sourceRecords, copied: expected, bashTransformation: relocatedBash.receipt, bashTransformationRecipeSha256: sha256(readBounded(path.join(__dirname, 'bash-relocation.cjs'))), test: TEST_NAME }
     fs.writeFileSync(path.join(payload, 'built-runtime-manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { flag: 'wx', mode: 0o600 })
     note(`Built runtime bound: ${bashPath}`)
     note(`Staged DLL SHA256: ${stageSha}`)
@@ -171,4 +183,4 @@ function main(workArgument) {
 if (require.main === module) {
   try { main(process.argv[2]) } catch (error) { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1 }
 }
-module.exports = { stagedDigest, readBounded, closureRecords, selectedTestPassed, TEST_NAME }
+module.exports = { stagedDigest, readBounded, closureRecords, selectedTestPassed, dllCharacteristics, requireDynamicBase, TEST_NAME }

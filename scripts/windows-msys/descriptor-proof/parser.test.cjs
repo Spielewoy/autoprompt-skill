@@ -4,19 +4,21 @@ const assert = require('node:assert/strict')
 const { parseProof } = require('./run.cjs')
 const encode = text => Buffer.from(text).toString('base64')
 function proof() {
-  const result = { schemaVersion: 1, objects: 16, sameProfileOpens: 16, otherProfileDenied: 16, drainedJobs: 3, namespaceCount: 2 }
+  const result = { schemaVersion: 1, objects: 16, sameProfileOpens: 16, otherProfileDenied: 16, pidLinkObjects: 1, sameProfilePidLinkOpens: 1, otherProfilePidLinkDenied: 1, drainedJobs: 3, namespaceCount: 2 }
   for (const [key, side, last] of [['creatorBase64', 'created', 'creator:16:descriptor-and-peer-effects-passed'], ['sameBase64', 'same', 'same-profile:16:passed'], ['otherBase64', 'other', 'other-profile:16:passed']]) {
     const lines = []
     for (let variant = 0; variant < 4; variant++) for (let kind = 0; kind < 4; kind++) lines.push(side === 'created' ? `created:variant=${variant}:kind=${kind}:effective-descriptor=passed` : `open:variant=${variant}:kind=${kind}:status=${side === 'same' ? '00000000' : 'c0000022'}:allowed=${side === 'same' ? 1 : 0}`)
+    lines.push(side === 'created' ? 'created:pid-link:target=314159:helper-world=00000001:helper-package=10000000:effective-world=00000001:effective-package=000f0001:low-label=passed' : `open:pid-link:status=${side === 'same' ? '00000000' : 'c0000022'}:allowed=${side === 'same' ? 1 : 0}:target=${side === 'same' ? '314159' : 'denied'}`)
     lines.push(last)
     result[key] = encode(lines.join('\n') + '\n')
   }
   return result
 }
-test('exact sixteen-object peer proof is accepted', () => assert.deepEqual(parseProof(JSON.stringify(proof())), proof()))
+test('exact sixteen-object plus PID-link peer proof is accepted', () => assert.deepEqual(parseProof(JSON.stringify(proof())), proof()))
 for (const [name, mutate] of [
   ['missing drain', p => { p.drainedJobs = 2 }],
   ['missing object', p => { p.objects = 15 }],
+  ['missing PID-link object', p => { p.pidLinkObjects = 0 }],
   ['namespace mismatch', p => { p.namespaceCount = 3 }],
   ['extra protocol field', p => { p.extra = true }],
   ['noncanonical base64', p => { p.sameBase64 += '\n' }],
@@ -24,6 +26,10 @@ for (const [name, mutate] of [
   ['wrong-profile access allowed', p => { p.otherBase64 = encode(Buffer.from(p.otherBase64, 'base64').toString().replace('status=c0000022:allowed=0', 'status=00000000:allowed=1')) }],
   ['missing effective descriptor check', p => { p.creatorBase64 = encode(Buffer.from(p.creatorBase64, 'base64').toString().split('\n').slice(1).join('\n')) }],
   ['duplicate object check', p => { p.creatorBase64 = encode(Buffer.from(p.creatorBase64, 'base64').toString().replace('variant=0:kind=1', 'variant=0:kind=0')) }],
+  ['wrong PID-link helper WORLD mask', p => { p.creatorBase64 = encode(Buffer.from(p.creatorBase64, 'base64').toString().replace('helper-world=00000001', 'helper-world=10000000')) }],
+  ['wrong PID-link effective package mask', p => { p.creatorBase64 = encode(Buffer.from(p.creatorBase64, 'base64').toString().replace('effective-package=000f0001', 'effective-package=10000000')) }],
+  ['wrong PID-link target', p => { p.sameBase64 = encode(Buffer.from(p.sameBase64, 'base64').toString().replace('target=314159', 'target=271828')) }],
+  ['wrong-profile PID-link allowed', p => { p.otherBase64 = encode(Buffer.from(p.otherBase64, 'base64').toString().replace('open:pid-link:status=c0000022:allowed=0:target=denied', 'open:pid-link:status=00000000:allowed=1:target=314159')) }],
   ['missing final operation effects', p => { p.creatorBase64 = encode(Buffer.from(p.creatorBase64, 'base64').toString().replace('creator:16:descriptor-and-peer-effects-passed', 'creator:16:passed')) }],
 ]) test(name + ' refuses', () => { const p = proof(); mutate(p); assert.throws(() => parseProof(JSON.stringify(p))) })
 

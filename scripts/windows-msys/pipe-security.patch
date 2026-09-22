@@ -1,5 +1,5 @@
 diff --git a/winsup/cygwin/Makefile.am b/winsup/cygwin/Makefile.am
-index 41190bd..cf3f6c2 100644
+index 41190bdb7a11e3550d3c84998db6d0399105584e..01ead7029673f6551a4a623ca976b5757d3be188 100644
 --- a/winsup/cygwin/Makefile.am
 +++ b/winsup/cygwin/Makefile.am
 @@ -264,6 +264,9 @@ REGEX_FILES = \
@@ -12,6 +12,15 @@ index 41190bd..cf3f6c2 100644
  	sec/auth.cc \
  	sec/base.cc \
  	sec/helper.cc \
+@@ -610,7 +613,7 @@ $(NEW_DLL_NAME): $(LDSCRIPT) libdll.a $(VERSION_OFILES) $(LIBSERVER)\
+ 		  $(newlib_build)/libm.a $(newlib_build)/libc.a
+ 	$(AM_V_CXXLD)$(CXX) $(CXXFLAGS) \
+ 	-mno-use-libstdc-wrappers \
+-	-Wl,--gc-sections -nostdlib -Wl,-T$(LDSCRIPT) -static \
++	-Wl,--gc-sections -Wl,--dynamicbase -nostdlib -Wl,-T$(LDSCRIPT) -static \
+ 	$${SOURCE_DATE_EPOCH:+-Wl,--no-insert-timestamp} \
+ 	-Wl,--heap=0 -Wl,--out-implib,msysdll.a -shared -o $@ \
+ 	-e @DLL_ENTRY@ $(DEF_FILE) \
 diff --git a/winsup/cygwin/autoload.cc b/winsup/cygwin/autoload.cc
 index d5d344d..a26146c 100644
 --- a/winsup/cygwin/autoload.cc
@@ -874,7 +883,7 @@ index 5a40e39..d7b3ec2 100644
  	{
  	  if (status != STATUS_OBJECT_NAME_COLLISION)
 diff --git a/winsup/cygwin/fork.cc b/winsup/cygwin/fork.cc
-index 2aa5273..af93a58 100644
+index 2aa52737ca951305b3ffd5fba417ba7e8f972cd0..f2a7da8ca46667147dd142bd8a56a409ca4cdc30 100644
 --- a/winsup/cygwin/fork.cc
 +++ b/winsup/cygwin/fork.cc
 @@ -7,6 +7,8 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
@@ -922,6 +931,19 @@ index 2aa5273..af93a58 100644
  
        if (rc)
  	debug_printf ("forked pid %u", pi.dwProcessId);
+@@ -423,6 +428,12 @@ frok::parent (volatile char * volatile stack_here)
+   fix_impersonation = false;
+ 
+   child_pid = cygwin_pid (pi.dwProcessId);
++  if (child_pid < 2)
++    {
++      this_errno = EAGAIN;
++      syscall_printf ("failed to map Windows pid %u to Cygwin pid", pi.dwProcessId);
++      goto cleanup;
++    }
+   child.init (child_pid, PID_IN_USE | PID_NEW, NULL);
+ 
+   if (!child)
 diff --git a/winsup/cygwin/kernel32.cc b/winsup/cygwin/kernel32.cc
 index f07f80d..f7a41e8 100644
 --- a/winsup/cygwin/kernel32.cc
@@ -2333,3 +2355,30 @@ diff --git a/winsup/cygwin/wincap.cc b/winsup/cygwin/wincap.cc
  
  extern IMAGE_DOS_HEADER
  __image_base__;
+
+diff --git a/winsup/cygwin/pinfo.cc b/winsup/cygwin/pinfo.cc
+index c69213f9ae9ce31dd6a057366bee40b64edaf8ab..757d0c904f9f284e058d31827c06db547f44ca65 100644
+--- a/winsup/cygwin/pinfo.cc
++++ b/winsup/cygwin/pinfo.cc
+@@ -7,6 +7,7 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+ details. */
+ 
+ #include "winsup.h"
++#include "appcontainer_named_kernel.h"
+ #include "miscfuncs.h"
+ #include <stdlib.h>
+ #include "cygerrno.h"
+@@ -336,8 +337,11 @@ pinfo::create_winpid_symlink ()
+   InitializeObjectAttributes (&attr, &sym_str, OBJ_CASE_INSENSITIVE,
+ 			      get_shared_parent_dir (),
+ 			      everyone_sd (SYMBOLIC_LINK_QUERY));
+-  NtCreateSymbolicLinkObject (&winpid_hdl, SYMBOLIC_LINK_ALL_ACCESS,
+-			      &attr, &pid_str);
++  appcontainer_named_kernel_create (&winpid_hdl, &attr,
++    [&] (POBJECT_ATTRIBUTES private_attributes) {
++      return NtCreateSymbolicLinkObject (&winpid_hdl, SYMBOLIC_LINK_ALL_ACCESS,
++					 private_attributes, &pid_str);
++    });
+ }
+ 
+ inline void

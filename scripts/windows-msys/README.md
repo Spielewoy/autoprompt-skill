@@ -8,6 +8,23 @@ pipes, FIFOs and PTY control pipes. Named events, mutexes, semaphores, mappings,
 flock directories, socket state and queues receive the exact package grant.
 Host calls retain their original descriptors and names.
 
+The PID-link descriptor uses the same exact-package adapter. A paired native
+trace found that creating `winpid.<Windows PID>` succeeded with the stock WORLD
+query descriptor, but the parent could not reopen it inside the AppContainer.
+The failed lookup returned zero, which made the parent take Bash's child path.
+The adapted descriptor restored the lookup and exact command-substitution
+witnesses. The fork parent also rejects invalid mapped PIDs before creating its
+process-table entry, returning EAGAIN instead of a false child result.
+
+The DLL link explicitly enables DYNAMIC_BASE. `bash-relocation.cjs` derives the
+private Bash image from its exact pinned SDK hash by changing only that flag
+and the PE checksum. It verifies the expected output hash and records both
+identities and changed offsets. The SDK image and candidate transport packet
+remain original; compiler and ARM consumer proofs execute the derived private
+copy and retain its transformation receipt. This is a binary-header adaptation,
+not a Bash rebuild. Untraced functional and cross-profile tests must pass before
+these bytes can become a production worker.
+
 Native Windows observations establish that both LOCAL names and exact package
 permissions are needed. Native pipe names use the observed opaque AppContainer
 prefix under the bare NPFS root; apparent intermediate paths are not directories.
