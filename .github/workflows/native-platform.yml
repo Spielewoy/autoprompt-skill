@@ -16,6 +16,11 @@ on:
         required: false
         default: false
         type: boolean
+      msys_pipe_reuse:
+        description: 'Reuse the authenticated CI46 trace build (requires msys_pipe_trace)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -868,7 +873,14 @@ jobs:
             manifestSha256 = $actualManifestSha256
           } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $output 'ci38-authentication.json') -Encoding utf8
           "$packet" | Set-Content -LiteralPath (Join-Path $output 'packet-path.txt') -Encoding utf8
+      - name: Restore the authenticated CI46 diagnostic build
+        if: inputs.msys_pipe_reuse == true
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./scripts/windows-msys/pipe-io-trace/reuse-ci46.ps1 -Output (Join-Path $env:RUNNER_TEMP 'msys-mapping-proof')
       - name: Build one isolated diagnostic MSYS runtime
+        if: inputs.msys_pipe_reuse != true
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -899,7 +911,12 @@ jobs:
           $output = Join-Path $env:RUNNER_TEMP 'msys-mapping-proof'
           $packet = (Get-Content -LiteralPath (Join-Path $output 'packet-path.txt') -Raw).Trim()
           $payload = Join-Path $env:RUNNER_TEMP 'msys-pipe-trace-build/sdk/issue27-build'
-          node scripts/windows-msys/pipe-io-trace/run.cjs $PWD.Path $packet $output $payload
+          if ('${{ inputs.msys_pipe_reuse }}' -eq 'true') {
+            $payload = (Get-Content -LiteralPath (Join-Path $output 'reused-payload-path.txt') -Raw).Trim()
+            node scripts/windows-msys/pipe-io-trace/run.cjs $PWD.Path $packet $output $payload ci46-reuse
+          } else {
+            node scripts/windows-msys/pipe-io-trace/run.cjs $PWD.Path $packet $output $payload
+          }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve diagnostic observations and compiler evidence
         if: always()
@@ -908,6 +925,7 @@ jobs:
           name: windows-pipe-io-trace
           path: |
             ${{ runner.temp }}/msys-mapping-proof/ci38-authentication.json
+            ${{ runner.temp }}/msys-mapping-proof/ci46-reuse.json
             ${{ runner.temp }}/msys-mapping-proof/pipe-trace-inputs
             ${{ runner.temp }}/msys-mapping-proof/pipe-io-diagnostic-*
             ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/*.txt

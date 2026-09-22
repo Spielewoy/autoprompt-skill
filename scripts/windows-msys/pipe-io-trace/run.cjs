@@ -5,10 +5,11 @@ const mapping = require('../mapping-proof/run.cjs')
 const { physical, bound } = require('../descriptor-proof/run.cjs')
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 function main(args) {
-  assert.equal(process.platform, 'win32'); assert.equal(process.arch, 'x64'); assert.equal(args.length, 4, 'REPO PACKET OUTPUT BUILD_PAYLOAD')
-  const [repo, packet, output, payload] = args.map(value => physical(path.resolve(value), true))
+  assert.equal(process.platform, 'win32'); assert.equal(process.arch, 'x64'); assert.ok(args.length === 4 || (args.length === 5 && args[4] === 'ci46-reuse'), 'REPO PACKET OUTPUT BUILD_PAYLOAD [ci46-reuse]')
+  const [repo, packet, output, payload] = args.slice(0, 4).map(value => physical(path.resolve(value), true))
   const input = mapping.packetInputs(repo, packet), inputs = path.join(output, 'pipe-trace-inputs')
   const combined = bound(path.join(inputs, 'combined.patch'), 4 * 1048576), manifest = bound(path.join(inputs, 'manifest.json'), 4 * 1048576)
+  const reusedBuild = args.length === 5 ? require('./reuse.cjs').verify(payload, inputs) : null
   const declaration = JSON.parse(manifest)
   assert.equal(declaration.schema, 1); assert.equal(declaration.status, 'diagnostic-only'); assert.equal(declaration.sourceCommit, '270ba2980700e6e2a0813944d506eecea0f86402')
   assert.equal(declaration.basePatchSha256, '8bc01e2694245b271699128399aba48777fa44b878376ee9d84b82b8929eea87'); assert.equal(declaration.combinedPatchSha256, sha(combined))
@@ -17,11 +18,11 @@ function main(args) {
   const seen = new Set()
   for (const record of declaration.records) {
     assert.match(record.path, /^winsup\/cygwin\/[A-Za-z0-9_./-]+$/); assert.ok(!record.path.split('/').includes('..') && !seen.has(record.path)); seen.add(record.path)
-    assert.equal(sha(bound(path.join(payload, 'source', record.path), 4 * 1048576)), record.resultSha256, 'compiled source identity: ' + record.path)
+    if (!reusedBuild) assert.equal(sha(bound(path.join(payload, 'source', record.path), 4 * 1048576)), record.resultSha256, 'compiled source identity: ' + record.path)
   }
   assert.equal(sha(bound(path.join(payload, 'adaptation.patch'), 4 * 1048576)), sha(combined), 'compiled adaptation identity')
   assert.equal(sha(bound(path.join(repo, 'scripts/windows-msys/pipe-security.patch'), 4 * 1048576)), '8bc01e2694245b271699128399aba48777fa44b878376ee9d84b82b8929eea87')
-  assert.equal(sha(bound(path.join(payload, 'source.tar.gz'))), '0571ad83f965bf7682a446a874830a560c8b12431e7d54e55f414a3851ba1146')
+  if (!reusedBuild) assert.equal(sha(bound(path.join(payload, 'source.tar.gz'))), '0571ad83f965bf7682a446a874830a560c8b12431e7d54e55f414a3851ba1146')
   const toolchainBefore = bound(path.join(payload, 'toolchain-inputs.sha256'), 65536), toolchainAfter = bound(path.join(payload, 'toolchain-outputs.sha256'), 65536)
   assert.deepEqual(toolchainBefore, toolchainAfter, 'compiler/linker unchanged')
   const dll = bound(path.join(payload, 'stage/usr/bin/msys-2.0.dll'), 32 * 1048576), dllVariant = mapping.dynamicBaseOnly(dll, 0), bashVariant = mapping.dynamicBaseOnly(input.bash, 0x8000, false)
@@ -37,8 +38,8 @@ function main(args) {
   const result = runArm('pipe-io-trace'), adapterTrial = runArm('pid-link-adapter-trial')
   assert.equal(result.bashSha256, adapterTrial.bashSha256); assert.equal(result.msysSha256, adapterTrial.msysSha256)
   const sources = {}
-  for (const name of ['.github/workflows/native-platform.yml', 'scripts/windows-msys/pipe-io-trace/generate.py', 'scripts/windows-msys/pipe-io-trace/trace.h', 'scripts/windows-msys/pipe-io-trace/run.cjs', 'scripts/windows-msys/build.ps1', 'scripts/windows-msys/build.sh', 'scripts/windows-msys/build-lock.json', 'scripts/windows-msys/mapping-proof/run.cjs', 'scripts/windows-msys/mapping-proof/source/mapping-controller.cs', 'agents/codex/workflow/windows-appcontainer-native.cs']) sources[name] = sha(bound(path.join(repo, name), 4 * 1048576))
-  const report = { schema: 1, status: 'observed-not-accepted', scope: 'one traced x64 build; original PID link and package-descriptor trial; not runtime acceptance', packetManifestSha256: sha(input.manifestBytes), combinedPatchSha256: sha(combined), traceManifestSha256: sha(manifest), traceManifest: JSON.parse(manifest), toolchainRecordsSha256: sha(toolchainBefore), sources, originalBuiltDllSha256: sha(dll), derivedDllSha256: sha(dllVariant.patched), dllChangedOffsets: dllVariant.changed, derivedBashSha256: sha(bashVariant.patched), bashChangedOffsets: bashVariant.changed, result, adapterTrial }
+  for (const name of ['.github/workflows/native-platform.yml', 'scripts/windows-msys/pipe-io-trace/generate.py', 'scripts/windows-msys/pipe-io-trace/trace.h', 'scripts/windows-msys/pipe-io-trace/run.cjs', 'scripts/windows-msys/pipe-io-trace/reuse.cjs', 'scripts/windows-msys/pipe-io-trace/reuse-ci46.ps1', 'scripts/windows-msys/build.ps1', 'scripts/windows-msys/build.sh', 'scripts/windows-msys/build-lock.json', 'scripts/windows-msys/mapping-proof/run.cjs', 'scripts/windows-msys/mapping-proof/source/mapping-controller.cs', 'agents/codex/workflow/windows-appcontainer-native.cs']) sources[name] = sha(bound(path.join(repo, name), 4 * 1048576))
+  const report = { reusedBuild, schema: 1, status: 'observed-not-accepted', scope: 'one traced x64 build; original PID link and package-descriptor trial; not runtime acceptance', packetManifestSha256: sha(input.manifestBytes), combinedPatchSha256: sha(combined), traceManifestSha256: sha(manifest), traceManifest: JSON.parse(manifest), toolchainRecordsSha256: sha(toolchainBefore), sources, originalBuiltDllSha256: sha(dll), derivedDllSha256: sha(dllVariant.patched), dllChangedOffsets: dllVariant.changed, derivedBashSha256: sha(bashVariant.patched), bashChangedOffsets: bashVariant.changed, result, adapterTrial }
   fs.writeFileSync(path.join(work, 'summary.json'), JSON.stringify(report, null, 2) + '\n')
   process.stdout.write(JSON.stringify(report) + '\n')
 }
