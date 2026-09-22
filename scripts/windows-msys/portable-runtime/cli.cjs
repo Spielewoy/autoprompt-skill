@@ -84,8 +84,10 @@ function exportAuthority(repoRoot, context) {
 }
 
 function importAuthority(repoRoot, context) {
-  exact(context, ['schema', 'expected', 'transport'])
+  const replay = Object.hasOwn(context, 'consumerHeadSha')
+  exact(context, ['schema', 'expected', 'transport', ...(replay ? ['consumerHeadSha'] : [])])
   assert.equal(context.schema, 1)
+  if (replay) assert.match(context.consumerHeadSha, /^[a-f0-9]{40}$/, 'Expected a recorded consumer head')
   const expected = portable.authority(context.expected)
   // A new consumer must run the identical reviewed source/patch/recipe revision.
   assert.deepEqual(expected.bindings, sourceBindings(repoRoot, {
@@ -100,14 +102,17 @@ function importAuthority(repoRoot, context) {
   digest(transport.manifestSha256)
   assert.equal(portable.hash(portable.read(transport.archivePath, MAX_ARCHIVE)),
     transport.archiveSha256, 'External downloaded archive digest mismatch')
-  return { expected, transport: Object.freeze({ ...transport }) }
+  return { expected, transport: Object.freeze({ ...transport }),
+    ...(replay ? { consumerHeadSha: context.consumerHeadSha } : {}) }
 }
 
-function verifyCheckout(repoRoot, producer) {
+function verifyCheckout(repoRoot, producer, consumerHeadSha) {
   const head = execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], {
     encoding: 'utf8', timeout: 10000, maxBuffer: 4096,
   }).trim()
-  assert.equal(head, producer.headSha, 'Trusted checkout must match the producer head')
+  assert.equal(head, consumerHeadSha ?? producer.headSha, 'Trusted checkout must match the recorded head')
+  if (consumerHeadSha !== undefined)
+    assert.equal(process.env.GITHUB_SHA, consumerHeadSha, 'Workflow SHA must match the recorded consumer head')
   execFileSync('git', ['-C', repoRoot, 'diff', '--exit-code', 'HEAD', '--',
     'scripts/windows-msys', 'scripts/windows-runtime/physical-proof',
     'agents/codex/workflow/safe-run-root.js'], { timeout: 10000, maxBuffer: MAX_CONTEXT })
@@ -149,14 +154,15 @@ async function main(args) {
       toolIdentityAuthority: 'trusted-builder-observation-not-independent-sdk-attestation',
       nativeAcceptance: 'not-performed' }
   }
-  const { expected, transport } = importAuthority(repoRoot, context)
-  verifyCheckout(repoRoot, expected.producer)
+  const { expected, transport, consumerHeadSha } = importAuthority(repoRoot, context)
+  verifyCheckout(repoRoot, expected.producer, consumerHeadSha)
   const native = trustedNative(repoRoot)
   const result = await portable.importCandidate({
     packetRoot: path.resolve(inputArg), manifestSha256: transport.manifestSha256,
     expected, destination: path.resolve(destinationArg), native,
   })
   return { ...result, artifactId: transport.artifactId, archiveSha256: transport.archiveSha256,
+    ...(consumerHeadSha ? { consumerHeadSha } : {}),
     githubProvenance: 'supplied-by-trusted-workflow-not-authenticated-by-this-command',
     nativeAcceptance: 'not-performed' }
 }

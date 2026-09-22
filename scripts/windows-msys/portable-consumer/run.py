@@ -114,7 +114,9 @@ def main(args):
     msys_root=output/'msys'
     set_stage('msys-authority-join')
     context=t.msys_context(msys_files,expected,msys_root/'archive.zip',repo,{'path':str(controller),'sha256':args.controller_sha256})
-    if replay is not None:t.require(context['transport']['manifestSha256']==replay['manifestSha256'],'hard-pinned CI49 manifest changed')
+    if replay is not None:
+        t.require(context['transport']['manifestSha256']==replay['manifestSha256'],'hard-pinned CI49 manifest changed')
+        context['consumerHeadSha']=current['headSha']
     set_stage('msys-private-write')
     t.write_selected(msys_root,msys_files|{'archive.zip':msys_zip,'transport.json':t.canonical(msys_record),'import-context.json':t.canonical(context)},writer)
     pin=json.loads(t.physical_read(ROOT/('node-'+architecture+'-ci20.json'),65536))
@@ -136,7 +138,8 @@ def main(args):
     print('Portable consumer: acquiring an actual native import lease',flush=True)
     imported=output/'imported'
     set_stage('native-import')
-    stdout,stderr=run_process([str(controller),str(repo/'scripts/windows-msys/portable-runtime/cli.cjs'),'import',str(repo),str(msys_root/'packet'),str(msys_root/'import-context.json'),str(imported)],output,'import',env,300)
+    import_env={**env,'GITHUB_SHA':current['headSha']}
+    stdout,stderr=run_process([str(controller),str(repo/'scripts/windows-msys/portable-runtime/cli.cjs'),'import',str(repo),str(msys_root/'packet'),str(msys_root/'import-context.json'),str(imported)],output,'import',import_env,300)
     set_stage('import-receipt-join')
     t.require(not stderr,'native import stderr');receipt=t.parse_canonical(stdout)
     t.require(receipt['status']=='candidate-imported-not-accepted' and receipt['manifestSha256']==context['transport']['manifestSha256'],'fresh import completion')

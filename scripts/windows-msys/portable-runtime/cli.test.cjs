@@ -94,3 +94,44 @@ test('CLI fails usage with nonzero status and no acceptance-shaped stdout', () =
   assert.equal(result.stdout, '')
   assert.match(result.stderr, /Candidate transport refused: Usage/)
 })
+
+// Exercise the full CLI import route up to its native boundary. Git and the
+// native adapter are explicit seams; this is not a Windows execution proof.
+for (const scenario of ['replay', 'same-head', 'wrong-checkout', 'wrong-workflow', 'dirty', 'source-drift', 'invalid-head']) {
+  test('actual import entry enforces consumer identity: ' + scenario, async t => {
+    const { root, imported } = fixture(t)
+    const consumer = 'b'.repeat(40), replay = scenario !== 'same-head'
+    if (replay) imported.consumerHeadSha = scenario === 'invalid-head' ? 'latest' : consumer
+    if (scenario === 'source-drift') imported.expected.bindings.patchSha256 = 'f'.repeat(64)
+    const contextPath = path.join(root, 'context.json')
+    fs.writeFileSync(contextPath, p.canonical(imported))
+    const calls = [], sentinel = new Error('native boundary reached; execution deliberately omitted')
+    const module = { exports: {} }, { createRequire } = require('node:module')
+    const localRequire = createRequire(path.join(__dirname, 'cli.cjs'))
+    const execute = new Function('module', 'exports', 'Buffer', 'process', 'require', fs.readFileSync(path.join(__dirname, 'cli.cjs'), 'utf8'))
+    execute(module, module.exports, Buffer, { platform: 'win32', arch: 'x64', env: {
+        SystemRoot: path.resolve(root, 'Windows'),
+        GITHUB_SHA: scenario === 'wrong-workflow' ? 'c'.repeat(40) : consumer,
+      } }, function (name) {
+        if (name === 'node:child_process') return { execFileSync(command, args) {
+          calls.push(args)
+          assert.equal(command, 'git')
+          if (args[2] === 'rev-parse') return (scenario === 'wrong-checkout' ? 'c'.repeat(40) : replay ? consumer : imported.expected.producer.headSha) + '\n'
+          assert.equal(args[2], 'diff')
+          if (scenario === 'dirty') throw new Error('dirty checkout')
+          return ''
+        } }
+        if (name === './native-adapter.cjs') return { nativeAdapter() { throw sentinel } }
+        return localRequire(name)
+      })
+    const expected = ['replay', 'same-head'].includes(scenario) ? sentinel
+      : scenario === 'wrong-checkout' ? /Trusted checkout must match/
+      : scenario === 'wrong-workflow' ? /Workflow SHA must match/
+      : scenario === 'dirty' ? /dirty checkout/
+      : scenario === 'source-drift' ? /Consumer checkout differs/
+      : /Expected a recorded consumer head/
+    await assert.rejects(module.exports.main(['import', repository, root, contextPath, path.join(root, 'output')]), expected)
+    assert.equal(fs.existsSync(path.join(root, 'output')), false)
+    if (['replay', 'same-head'].includes(scenario)) assert.deepEqual(calls.map(args => args[2]), ['rev-parse', 'diff'])
+  })
+}
