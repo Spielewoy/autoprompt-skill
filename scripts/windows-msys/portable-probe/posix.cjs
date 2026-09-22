@@ -46,7 +46,7 @@ async function runPosix(capability, smokeCapability, outputArgument) {
   assert.equal(sha(fixtureSource), SOURCE_SHA)
   const fixtureSha = sha(fixture)
   assert.equal(fixtureSha, tuple.fixtureSha256)
-  const fixtureRelocation = require('./fixture-relocation.cjs').derive(fixture)
+  const fixtureRelocation = require('./fixture-relocation.cjs').derive(fixture, tuple.fixtureSha256)
   const fixtureRelocationRecipeSha256 = sha(fs.readFileSync(path.join(repo, 'scripts/windows-msys/portable-probe/fixture-relocation.cjs')))
   const runtimeRecords = closureRecords(original)
   const dependencies = importedDlls(fixture)

@@ -16,6 +16,7 @@ cp -- "$source_file" "$output/posix-proof.c"
 printf '%s  %s\n' 4e225db6364d28e7dd2b7b9458e9ac2506e9eb31358251784be4fcbf2eb0856b "$output/posix-proof.c" | sha256sum -c -
 # No extra utilities are required by the executable at runtime. Do not install
 # into /usr/bin or replace its loaded MSYS DLL. MSYS exports POSIX libc APIs.
-/usr/bin/gcc -std=c11 -O2 -Wall -Wextra -Werror "$output/posix-proof.c" -o "$output/posix-proof.exe"
+/usr/bin/gcc -std=c11 -O2 -Wall -Wextra -Werror -Wl,--dynamicbase -Wl,--no-insert-timestamp \
+  "$output/posix-proof.c" -o "$output/posix-proof.exe"
 (cd "$output" && sha256sum posix-proof.c posix-proof.exe > fixture.sha256)
 printf '%s  /usr/bin/gcc.exe\n' 4bd76635b6053a7926f4579a30f9c800a673632fd10b4d6adf8083d3eda1b80c | sha256sum -c -

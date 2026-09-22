@@ -92,7 +92,7 @@ test('portable POSIX factoring preserves the original execution, cancellation an
  assert.equal(actual.includes(expected),true)
  assert.equal(actual.includes('built-runtime-proof.txt'),false);assert.equal(actual.includes('sdk/usr/bin'),false)
  assert.deepEqual(require('./posix.cjs').MODES,['pipe-fork','fifo','locks','blocked-fifo','null','af-local'])
- assert.match(actual,/assert\.equal\(fixtureSha, tuple\.fixtureSha256\)[\s\S]*derive\(fixture\)/)
+ assert.match(actual,/assert\.equal\(fixtureSha, tuple\.fixtureSha256\)[\s\S]*derive\(fixture, tuple\.fixtureSha256\)/)
  assert.match(actual,/fixtureTransformation: fixtureRelocation\.receipt, fixtureTransformationRecipeSha256: fixtureRelocationRecipeSha256/)
  assert.equal((actual.match(/fixtureRelocation\.receipt\.derivedSha256/g)||[]).length,2)
  const relocation=require('./fixture-relocation.cjs')

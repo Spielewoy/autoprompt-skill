@@ -2382,3 +2382,17 @@ index c69213f9ae9ce31dd6a057366bee40b64edaf8ab..757d0c904f9f284e058d31827c06db54
  }
  
  inline void
+
+diff --git a/winsup/cygwin/environ.cc b/winsup/cygwin/environ.cc
+--- a/winsup/cygwin/environ.cc
++++ b/winsup/cygwin/environ.cc
+@@ -1011,6 +1011,9 @@
+ /* Keep this list in upper case and sorted */
+ static NO_COPY spenv spenvs[] =
+ {
++  /* The private NUL adapter reads the native environment after MSYS exec.
++     Preserve a supplied locator; never synthesize the handle capability. */
++  {NL ("AUTOPROMPT_PRIVATE_NUL_HANDLE="), false, true, NULL},
+ #ifdef DEBUGGING
+   {NL ("CYGWIN_DEBUG="), false, true, NULL},
+ #endif

@@ -13,6 +13,7 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
 parser.add_argument('--source', help='Prepared pinned source BEFORE the Null adapter; enables three additional source contracts')
+parser.add_argument('--environ-source', help='Pristine pinned source for the supplied-only native NUL environment contract')
 parser.add_argument('--cxx', default='g++')
 args = parser.parse_args()
 binding = json.loads((HERE / 'binding.json').read_text())
@@ -58,6 +59,28 @@ with tempfile.TemporaryDirectory(prefix='msys-null-proof-') as temporary:
     result = json.loads(run([str(work / 'proof')], work))
     assert result == {'cases': 68, 'nativeWindows': False, 'wcharBytes': 2, 'dwordBytes': 4}
     result['sourceContracts'] = {'executed': False, 'reason': '--source not supplied'}
+    (work / 'combined.patch').write_bytes(patch)
+    if args.environ_source:
+        environ_source = Path(args.environ_source).resolve(strict=True) / 'winsup/cygwin/environ.cc'
+        original_environ = environ_source.read_bytes()
+        assert sha(original_environ) == binding['originalEnvironSha256'], 'Pinned pre-locator environ.cc required'
+        environ_output = work / 'winsup/cygwin/environ.cc'
+        environ_output.parent.mkdir(parents=True)
+        environ_output.write_bytes(original_environ)
+        command = ['git', 'apply', '--whitespace=error', '--include=winsup/cygwin/environ.cc']
+        run(command + ['--check', str(work / 'combined.patch')], work)
+        run(command + [str(work / 'combined.patch')], work)
+        candidate = environ_output.read_bytes()
+        assert sha(candidate) == binding['candidateEnvironSha256']
+        added = ('  /* The private NUL adapter reads the native environment after MSYS exec.\n'
+                 '     Preserve a supplied locator; never synthesize the handle capability. */\n'
+                 '  {NL ("AUTOPROMPT_PRIVATE_NUL_HANDLE="), false, true, NULL},\n')
+        candidate_text = candidate.decode()
+        assert candidate_text.count(added) == 1
+        assert sha(candidate_text.replace(added, '').encode()) == binding['originalEnvironSha256']
+        result['environContract'] = {'executed': True, 'passed': 1}
+    else:
+        result['environContract'] = {'executed': False, 'reason': '--environ-source not supplied'}
     if args.source:
         source = Path(args.source).resolve(strict=True)
         name = 'winsup/cygwin/fhandler/base.cc'
@@ -66,7 +89,6 @@ with tempfile.TemporaryDirectory(prefix='msys-null-proof-') as temporary:
         output = work / name
         output.parent.mkdir(parents=True)
         output.write_bytes(original_bytes)
-        (work / 'combined.patch').write_bytes(patch)
         command = ['git', 'apply', '--whitespace=error', '--include=' + name]
         run(command + ['--check', 'combined.patch'], work)
         run(command + ['combined.patch'], work)
