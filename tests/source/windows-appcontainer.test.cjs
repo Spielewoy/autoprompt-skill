@@ -57,7 +57,7 @@ function windowsModule(file, replacements = {}, directory, globals = {}) {
   const localRequire = createRequire(filename), module = { exports: {} }
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), {
     module, exports: module.exports, __dirname: directory || path.dirname(filename), Buffer, ...globals,
-    process: { platform: 'win32', pid: process.pid, execPath: process.execPath,
+    process: { platform: 'win32', arch: process.arch, pid: process.pid, execPath: process.execPath,
       env: { SystemRoot: 'C:\\Windows', NODE_OPTIONS: '--require must-not-inherit', OPENAI_API_KEY: 'must-not-inherit' } },
     require: name => Object.hasOwn(replacements, name) ? replacements[name] : localRequire(name),
   }, { filename })
@@ -124,6 +124,20 @@ test('Windows helper staging refuses unverified parents and linked helper inputs
   }, source)
   assert.throws(() => unsafe.stageWindowsHelperDeployment(control), { code: 'WINDOWS_RUNTIME_MISMATCH' })
   assert.deepEqual(fs.readdirSync(control), [])
+})
+
+test('Windows helper staging preserves its primary refusal and accounts for an unremoved owned deployment', t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'windows-stage-cleanup-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const primary = Object.assign(Error('controlled staging privacy refusal'), { code: 'PRIVACY_UNSUPPORTED' })
+  let owned, removed
+  const helpers = windowsModule('windows-helper-deployment.js', {
+    'node:fs': { ...fs, rmSync(directory, options) { removed = directory; assert.equal(options.maxRetries, 10); assert.equal(options.retryDelay, 100); throw Object.assign(Error('controlled removal refusal'), { code: 'EACCES' }) } },
+    './safe-run-root.js': { ensureWindowsPrivateAcl(directory) { owned = directory; throw primary } },
+    './windows-filesystem.js': { createWindowsFilesystemCapture() { return { assertRecordParent() {} } } },
+  })
+  assert.throws(() => helpers.stageWindowsHelperDeployment(root), error => error === primary && error.code === 'PRIVACY_UNSUPPORTED' && error.cleanupConfirmed === false && error.retainedHelperRoot === owned && error.cleanupCode === 'EACCES')
+  assert.equal(removed, owned); assert.equal(path.dirname(owned), root); assert.equal(fs.statSync(owned).isDirectory(), true)
 })
 
 test('Windows ownership setup keeps a bounded cold-start allowance and never caches a failed privacy proof', () => {
@@ -258,8 +272,10 @@ test('Windows AppContainer probe reports bounded native privacy causes before la
       } })
     } },
     './windows-appcontainer-command.js': { runWindowsAppContainerCommand() { assert.fail('Privacy failure must prevent launch') } },
+    './windows-worker-loader.js': { async captureWorkerTuple() { return {} }, describeTuple() { return { identity: 'a'.repeat(64) } } },
   })
-  const result = await probe.probeWindowsAppContainer()
+  const identity='a'.repeat(64)
+  const result = await probe.runWindowsAppContainerCanary(() => assert.fail('Privacy failure must prevent launch'), identity, probe.canaryKey(identity))
   assert.equal(result.supported, false)
   assert.equal(result.code, 'PRIVACY_UNSUPPORTED')
   assert.equal(result.launcherSessionId, null)
@@ -268,4 +284,165 @@ test('Windows AppContainer probe reports bounded native privacy causes before la
   assert.equal(result.diagnostic.cause, 'ETIMEDOUT')
   assert.equal(result.diagnostic.stderr.length, 2048)
   assert.equal(JSON.stringify(result).includes('must-not-disclose'), false)
+})
+
+
+test('canary closes the actual first listener when the second listener fails', { timeout: 10000 }, async t => {
+  const net = require('node:net'), servers = [], closed = []
+  const probe = windowsModule('windows-appcontainer-probe.js', {
+    './safe-run-root.js': { ensureWindowsPrivateAcl() {} },
+    'node:net': { ...net, createServer(handler) {
+      const server = net.createServer(handler), listen = server.listen
+      servers.push(server); closed.push(new Promise(resolve => server.once('close', resolve)))
+      if (servers.length === 2) server.listen = function () { return listen.call(this, servers[0].address().port, '127.0.0.1') }
+      return server
+    } },
+  })
+  t.after(() => { for (const server of servers) if (server.listening) server.close() })
+  const identity = 'a'.repeat(64)
+  const result = await probe.runWindowsAppContainerCanary(() => assert.fail('Listener setup failure must prevent launch'), identity, probe.canaryKey(identity))
+  assert.equal(result.supported, false); assert.equal(result.code, 'EADDRINUSE'); assert.equal(result.diagnostic.phase, 'loopback-control')
+  assert.equal(servers.length, 2); await closed[0]; assert.equal(servers[0].listening, false)
+})
+
+test('canary cleanup failure preserves primary error and retained root for admission poisoning', async t => {
+  const primary = Object.assign(Error('fixed privacy failure'), { code: 'PRIVACY_UNSUPPORTED' }); let retained
+  const probe = windowsModule('windows-appcontainer-probe.js', {
+    './safe-run-root.js': { ensureWindowsPrivateAcl() { throw primary } },
+    'node:fs': { ...fs, rmSync(root) { retained = root; throw Object.assign(Error('fixed removal failure'), { code: 'EACCES' }) } },
+  })
+  t.after(() => { if (retained) fs.rmSync(retained, { recursive: true, force: true }) })
+  const identity = 'a'.repeat(64)
+  await assert.rejects(probe.runWindowsAppContainerCanary(() => assert.fail('Privacy failure must prevent launch'), identity, probe.canaryKey(identity)), error => error === primary && error.cleanupConfirmed === false && error.recoveryRoot === retained && error.cleanupCode === 'EACCES')
+  assert.equal(fs.existsSync(retained), true)
+})
+
+
+test('failed listener close retains the canary fixture until controller recovery', { timeout: 10000 }, async t => {
+  const net = require('node:net'), servers = []; let base, originalClose
+  const probe = windowsModule('windows-appcontainer-probe.js', {
+    './safe-run-root.js': { ensureWindowsPrivateAcl(root) { base ||= root } },
+    'node:net': { ...net, createServer(handler) {
+      const server = net.createServer(handler), listen = server.listen
+      servers.push(server)
+      if (servers.length === 1) { originalClose = server.close.bind(server); server.close = () => { throw Object.assign(Error('fixed listener close failure'), { code: 'ECLOSE' }) } }
+      else server.listen = function () { return listen.call(this, servers[0].address().port, '127.0.0.1') }
+      return server
+    } },
+  })
+  t.after(() => { if (servers[0]?.listening) originalClose(); if (base) fs.rmSync(base, { recursive: true, force: true }) })
+  const identity = 'a'.repeat(64)
+  await assert.rejects(probe.runWindowsAppContainerCanary(() => assert.fail('Listener failure must prevent launch'), identity, probe.canaryKey(identity)), error => error.code === 'EADDRINUSE' && error.cleanupConfirmed === false && error.recoveryRoot === base && error.cleanupCode === 'ECLOSE')
+  assert.equal(fs.existsSync(base), true); assert.equal(servers[0].listening, true)
+})
+
+for (const cleanupFails of [false, true]) test('canary accounts for root canonicalization failure when removal ' + (cleanupFails ? 'fails' : 'succeeds'), async t => {
+  let owned
+  const primary = Object.assign(Error('fixed canonicalization failure'), { code: 'EIO' })
+  const canonical = Object.assign(function (...args) { return fs.realpathSync(...args) }, { native(root) { owned = root; throw primary } })
+  const probe = windowsModule('windows-appcontainer-probe.js', {
+    './safe-run-root.js': { ensureWindowsPrivateAcl() { assert.fail('Canonicalization failure precedes privacy setup') } },
+    'node:fs': { ...fs, realpathSync: canonical, rmSync(root, options) {
+      assert.equal(root, owned)
+      if (cleanupFails) throw Object.assign(Error('fixed removal failure'), { code: 'EACCES' })
+      return fs.rmSync(root, options)
+    } },
+  })
+  t.after(() => { if (owned) fs.rmSync(owned, { recursive: true, force: true }) })
+  const identity = 'a'.repeat(64), run = () => probe.runWindowsAppContainerCanary(() => assert.fail('Canonicalization failure must prevent launch'), identity, probe.canaryKey(identity))
+  if (cleanupFails) await assert.rejects(run(), error => error === primary && error.cleanupConfirmed === false && error.recoveryRoot === owned && error.cleanupCode === 'EACCES')
+  else { const result = await run(); assert.equal(result.supported, false); assert.equal(result.code, 'EIO'); assert.equal(result.recoveryRoot, undefined) }
+  assert.equal(fs.existsSync(owned), cleanupFails)
+})
+
+// Run the actual generated Node worker against real private fixture files.
+// Network, ACL helper and descendant events are controlled here; this is a
+// controller/worker behavior test, not native AppContainer acceptance.
+async function deletionCanary(t, mode = 'success') {
+  const { EventEmitter } = require('node:events'), os = require('node:os')
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-deletion-test-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const servers = new Map(); let nextPort = 20000, original, completed = false, base
+  const net = {
+    createServer(callback) {
+      const server = new EventEmitter(); server.listen = (port, host, ready) => { server.port = nextPort++; servers.set(server.port, { callback, server }); queueMicrotask(ready) }
+      server.address = () => ({ port: server.port }); server.close = () => { servers.delete(server.port) }; return server
+    },
+    connect(endpoint) {
+      const socket = new EventEmitter(); socket.destroy = () => {}; socket.setTimeout = () => {}
+      queueMicrotask(() => { servers.get(endpoint.port).callback({ end() {} }); socket.emit('connect') }); return socket
+    },
+  }
+  const controllerFs = { ...fs,
+    mkdtempSync() { base = fs.mkdtempSync(path.join(directory, 'private-')); return base },
+    lstatSync(file, options) {
+      if (mode === 'absence-error' && completed && file === original) throw Object.assign(Error('bounded absence query denied'), { code: 'EACCES' })
+      return fs.lstatSync(file, options)
+    },
+  }
+  const probe = windowsModule('windows-appcontainer-probe.js', { 'node:fs': controllerFs, 'node:net': net, './safe-run-root.js': { ensureWindowsPrivateAcl() {} } }, undefined, { setImmediate })
+  const identity = 'a'.repeat(64)
+  const result = await probe.runWindowsAppContainerCanary(async (policy, args) => {
+    original = path.join(policy.targetPath, 'delete-original')
+    assert.equal(fs.readFileSync(original, 'utf8'), 'controller original')
+    assert.equal(fs.lstatSync(original).nlink, 1)
+    const encoded = /eval\(Buffer\.from\('([A-Za-z0-9+/=]+)','base64'\)/.exec(args.command)
+    assert.ok(encoded, 'execute the actual worker embedded in the Bash command')
+    const workerSource = Buffer.from(encoded[1], 'base64').toString('utf8')
+    let stdout = '', stderr = '', deleted = false
+    const workerFs = { ...fs,
+      readFileSync(file, ...options) {
+        if (path.basename(file) === 'sentinel') throw Object.assign(Error('controller denied'), { code: 'EACCES' })
+        return fs.readFileSync(file, ...options)
+      },
+      writeFileSync(file, ...options) {
+        if (path.basename(file) === 'guard') throw Object.assign(Error('git denied'), { code: 'EACCES' })
+        return fs.writeFileSync(file, ...options)
+      },
+      renameSync() { throw Object.assign(Error('git denied'), { code: 'EACCES' }) },
+      unlinkSync(file) {
+        if (path.basename(file) === 'guard' || mode === 'worker-delete-denied') throw Object.assign(Error('delete denied'), { code: 'EACCES' })
+        assert.equal(file, original)
+        if (mode !== 'surviving-original') fs.unlinkSync(file)
+        deleted = mode !== 'surviving-original'
+      },
+    }
+    const workerNet = { connect() { const socket = new EventEmitter(); socket.destroy = () => {}; socket.setTimeout = () => {}; queueMicrotask(() => socket.emit('error', { code: 'EACCES' })); return socket } }
+    const workerProcess = { execPath: path.join(directory, 'node.exe'), env: { AUTOPROMPT_APP_CONTAINER_SID: 'fixed-test-sid' }, stdout: { write: text => { stdout += text } }, stderr: { write: text => { stderr += text } }, exitCode: 0 }
+    const workerCp = { spawn(executable, argv, options) {
+      const child = new EventEmitter(); child.pid = 123
+      if (path.basename(executable) === 'acl-probe.exe') {
+        assert.equal(argv[0], '--acl-probe'); assert.equal(argv[2], policy.targetPath)
+        fs.writeSync(options.stdio[1], 'bundle-acl-denied-v1:' + process.arch + ':' + argv[3] + ':5\n')
+        queueMicrotask(() => child.emit('exit', 0))
+      } else { assert.equal(executable, workerProcess.execPath); child.kill = () => { queueMicrotask(() => child.emit('exit', 0)); return true } }
+      return child
+    } }
+    await vm.runInNewContext(workerSource, { Buffer, process: workerProcess, setTimeout, require(name) { return { 'node:fs': workerFs, 'node:path': path, 'node:net': workerNet, 'node:child_process': workerCp }[name] } })
+    completed = true
+    if (mode === 'unknown-recovery') throw Object.assign(Error('resource recovery unresolved'), { code: 'WINDOWS_ACL_IDENTITY_UNAVAILABLE', recovery: { leaseId: 'fixed-lease' }, cleanupConfirmed: false })
+    if (!['surviving-original', 'worker-delete-denied'].includes(mode)) assert.equal(deleted, true)
+    return { workerIdentity: identity, status: workerProcess.exitCode === 0 ? 'completed' : 'failed', exitCode: workerProcess.exitCode, stdout, stderr, launcherSessionId: 1,
+      ...(mode === 'missing-recovery' ? {} : { resourceRecovery: Object.freeze({ restored: 4, newEntries: 3, deletedEntries: mode === 'zero-recovery' ? 0 : 1 }) }) }
+  }, identity, probe.canaryKey(identity))
+  assert.equal(servers.size, 0)
+  return { result, base, original }
+}
+test('generated canary deletes the host original and requires recovered deletion before admission', async t => {
+  const { result, base } = await deletionCanary(t)
+  assert.equal(result.supported, true)
+  assert.equal(result.resourceRecovery.deletedEntries, 1); assert.equal(Object.isFrozen(result.resourceRecovery), true)
+  assert.match(result.resourceRecoveryScope, /private TEMP fixture volume/)
+  assert.equal(fs.existsSync(base), false)
+})
+for (const mode of ['surviving-original', 'absence-error', 'missing-recovery', 'zero-recovery', 'worker-delete-denied']) test('deletion canary refuses ' + mode, async t => {
+  const { result, base } = await deletionCanary(t, mode)
+  assert.equal(result.supported, false); assert.equal(fs.existsSync(base), false)
+  if (mode === 'worker-delete-denied') assert.equal(result.probeFailure.stderr, 'APPCONTAINER_PROBE_FAILURE:delete-original:EACCES')
+  else assert.equal(result.diagnostic.phase, 'original-recovery')
+})
+test('deletion canary retains its original recovery evidence when resource cleanup is unknown', async t => {
+  const { result, base } = await deletionCanary(t, 'unknown-recovery')
+  assert.equal(result.supported, false); assert.equal(result.code, 'WINDOWS_ACL_IDENTITY_UNAVAILABLE')
+  assert.equal(result.recoveryRoot, base); assert.equal(fs.existsSync(base), true)
 })

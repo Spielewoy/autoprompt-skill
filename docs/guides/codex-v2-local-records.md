@@ -128,10 +128,11 @@ package, non-Git, non-filesystem, unsafe-link, or otherwise ineligible targets u
 one provider-private sidecar instead.
 
 On POSIX systems, private directories and files use `0700` and `0600`. Windows
-run-record helpers apply and audit a protected owner-only DACL, but that alone
-does not make the full runtime supported: native Windows has no implemented
-descriptor-anchored filesystem adapter for strict snapshots and terminal writes.
-This build's full runtime is validated only on Linux; macOS has not been validated.
+run-record helpers apply and audit a protected owner-only DACL. The bundled
+native Windows runtime path is limited to the Claude local capability canary and
+the Node 20/24 controller on Windows x64 and ARM64; other providers still use the
+documented Linux or VM/WSL paths. Native macOS command isolation remains outside
+this validation path.
 Creation or reopening
 fails closed if the private boundary cannot be established or has been widened. Run
 records are rejected if they enter tracked files, staged files, a package, or an

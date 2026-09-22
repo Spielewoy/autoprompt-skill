@@ -9,35 +9,56 @@ const display = require('../../scripts/lima-runtime-vscode-display.cjs')
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 function startTicks(pid) { return fs.readFileSync(`/proc/${pid}/stat`, 'utf8').trim().split(' ')[21] }
 function processGroup(pid) { return fs.readFileSync(`/proc/${pid}/stat`, 'utf8').trim().split(' ')[4] }
+async function withGlobalDisplayFixture(work) {
+  // Separate guest roots in concurrent test processes still share this host's
+  // X socket namespace. Keep its lifecycle serialized without unlinking a
+  // peer's socket or replacing the lock inode while another process waits.
+  const slots = path.join(fs.realpathSync.native(os.tmpdir()), `ap-lima-display-fixture-${process.getuid()}`)
+  fs.mkdirSync(slots, { recursive: true, mode: 0o700 })
+  const item = fs.lstatSync(slots)
+  assert.ok(item.isDirectory() && !item.isSymbolicLink())
+  assert.equal(item.uid, process.getuid())
+  assert.equal(item.mode & 0o777, 0o700)
+  assert.equal(fs.realpathSync.native(slots), slots)
+  return await display.withSlotLock({ slots }, work)
+}
 
 if (process.platform !== 'linux') test('owned VS Code Xvfb lifecycle requires Linux process fixtures', { skip: true }, () => {})
-else test('owned VS Code display is a private worker-group child and drains on normal completion', async t => {
+else test('owned VS Code display is a private worker-group child and drains on normal completion', async () => withGlobalDisplayFixture(async () => {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-lima-vscode-display-')))
   fs.chmodSync(root, 0o700)
   const server = path.join(root, 'fake-xvfb.cjs'), xvfb = path.join(root, 'fake-xvfb'), xauth = path.join(root, 'fake-xauth'), probe = path.join(root, 'fake-xdpyinfo')
-  fs.writeFileSync(server, `const fs=require('node:fs'),net=require('node:net'); const n=Number(process.argv[2].slice(1)); fs.mkdirSync('/tmp/.X11-unix',{recursive:true}); const socket='/tmp/.X11-unix/X'+n; try{fs.unlinkSync(socket)}catch{} const s=net.createServer(); s.listen(socket); const stop=()=>s.close(()=>process.exit(0)); process.on('SIGTERM',stop); process.on('SIGINT',stop);`, { mode: 0o600 })
+  fs.writeFileSync(server, `const fs=require('node:fs'),net=require('node:net'); const n=Number(process.argv[2].slice(1)); fs.mkdirSync('/tmp/.X11-unix',{recursive:true}); const socket='/tmp/.X11-unix/X'+n; const s=net.createServer(); s.listen(socket); const stop=()=>s.close(()=>process.exit(0)); process.on('SIGTERM',stop); process.on('SIGINT',stop);`, { mode: 0o600 })
   fs.writeFileSync(xvfb, `#!${process.execPath}\nrequire(${JSON.stringify(server)})\n`, { mode: 0o700 })
   fs.writeFileSync(xauth, '#!/bin/sh\nprintf 0123456789abcdef > "$2"\n', { mode: 0o700 })
   fs.writeFileSync(probe, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
-  t.after(async () => { fs.rmSync(root, { recursive: true, force: true }) })
-  const requestId = '00000000000000000000000000000000'
-  const owned = await display.startOwnedDisplay({ root, requestId, xvfbPath: xvfb, xauthPath: xauth, probePath: probe })
-  t.after(() => owned.stop().catch(() => {}))
-  assert.equal(owned.environment.DISPLAY, `:${display.requestDisplay(requestId)}`)
-  assert.ok(owned.environment.XAUTHORITY.startsWith(`${root}/displays/${requestId}/`))
-  assert.equal(owned.environment.XDG_RUNTIME_DIR, `${root}/d/${display.requestDisplay(requestId)}`)
-  assert.ok(owned.environment.XDG_RUNTIME_DIR.length < 50, 'VS Code IPC socket base must stay comfortably below Unix socket limits')
-  assert.equal(fs.statSync(owned.environment.XAUTHORITY).mode & 0o077, 0)
-  assert.equal(processGroup(owned.child.pid), processGroup(process.pid), 'Xvfb must stay in its owning worker process group')
-  const childTicks = startTicks(owned.child.pid)
-  const second = await display.startOwnedDisplay({ root, requestId: '00000020000000000000000000000000', xvfbPath: xvfb, xauthPath: xauth, probePath: probe })
-  assert.equal(display.requestDisplay(requestId), display.requestDisplay('00000020000000000000000000000000'), 'test inputs must collide at the same initial slot')
-  assert.notEqual(second.environment.DISPLAY, owned.environment.DISPLAY, 'slot reservation must retry after an owned same-slot collision')
-  await second.stop()
-  await owned.stop()
-  await sleep(20)
-  assert.equal(fs.existsSync(`/proc/${owned.child.pid}`), false, `owned Xvfb pid ${owned.child.pid}/${childTicks} survived shutdown`)
-})
+  let owned, second
+  try {
+    const requestId = '00000000000000000000000000000000'
+    owned = await display.startOwnedDisplay({ root, requestId, xvfbPath: xvfb, xauthPath: xauth, probePath: probe })
+    assert.match(owned.environment.DISPLAY, /^:[0-9]+$/)
+    const selectedDisplay = Number(owned.environment.DISPLAY.slice(1))
+    assert.ok(selectedDisplay >= display.DISPLAY_MIN && selectedDisplay < display.DISPLAY_MIN + display.DISPLAY_COUNT, 'allocated display must stay within the private slot range')
+    assert.ok(owned.environment.XAUTHORITY.startsWith(`${root}/displays/${requestId}/`))
+    assert.equal(owned.environment.XDG_RUNTIME_DIR, `${root}/d/${selectedDisplay}`)
+    assert.ok(owned.environment.XDG_RUNTIME_DIR.length < 50, 'VS Code IPC socket base must stay comfortably below Unix socket limits')
+    assert.equal(fs.statSync(owned.environment.XAUTHORITY).mode & 0o077, 0)
+    assert.equal(processGroup(owned.child.pid), processGroup(process.pid), 'Xvfb must stay in its owning worker process group')
+    const childTicks = startTicks(owned.child.pid)
+    second = await display.startOwnedDisplay({ root, requestId: '00000020000000000000000000000000', xvfbPath: xvfb, xauthPath: xauth, probePath: probe })
+    assert.equal(display.requestDisplay(requestId), display.requestDisplay('00000020000000000000000000000000'), 'test inputs must collide at the same initial slot')
+    assert.notEqual(second.environment.DISPLAY, owned.environment.DISPLAY, 'slot reservation must retry after an owned same-slot collision')
+    await second.stop()
+    await owned.stop()
+    await sleep(20)
+    assert.equal(fs.existsSync(`/proc/${owned.child.pid}`), false, `owned Xvfb pid ${owned.child.pid}/${childTicks} survived shutdown`)
+    assert.equal(fs.existsSync(`/proc/${second.child.pid}`), false, 'second owned Xvfb survived shutdown')
+  } finally {
+    if (second) await second.stop().catch(() => {})
+    if (owned) await owned.stop().catch(() => {})
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+}))
 
 test('owned VS Code display rejects malformed request identities', () => {
   assert.throws(() => display.requestDisplay('bad'), { code: 'LIMA_REQUEST_INVALID' })

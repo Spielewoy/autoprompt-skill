@@ -25,35 +25,33 @@ for (const [file, problem] of [['/usr/bin/bwrap', 'missing'], ['/usr/bin/bwrap',
   })
 }
 
-test('static Windows diagnostics refuse missing physical Git Bash using the supplied environment', t => {
-  const attempted = []
-  const realpath = fs.realpathSync.native
-  t.mock.method(fs.realpathSync, 'native', (file, ...args) => {
-    if (typeof file !== 'string' || !/bash\.exe$/i.test(file)) return realpath(file, ...args)
-    attempted.push(file)
-    throw Object.assign(new Error('missing Git Bash fixture'), { code: 'ENOENT' })
-  })
+function withWindowsAvailability(t, available) {
+  // The public bundle API is frozen; substitute its module at the boundary seam.
+  const filename = path.resolve(__dirname, '../../scripts/harness-v2-tool-boundary.cjs')
+  const localRequire = require('node:module').createRequire(filename), module = { exports: {} }
+  require('node:vm').runInNewContext(fs.readFileSync(filename, 'utf8'), {
+    module, exports: module.exports, __dirname: path.dirname(filename), Buffer, process,
+    require: name => name === '../agents/codex/workflow/windows-worker-loader.js' ? { staticAvailability: available } : localRequire(name),
+  }, { filename })
+  return module.exports
+}
+
+test('static Windows diagnostics refuse an unavailable packaged bundle without executing ambient Bash', t => {
+  t.mock.method(require('node:child_process'), 'spawnSync', () => assert.fail('Static diagnostics must not execute an ambient runtime'))
+  const api = withWindowsAvailability(t, () => ({ available: false, accepted: false, code: 'asset-presence-mismatch' }))
   const env = { SystemRoot: 'C:\\Windows', Path: 'D:\\PortableGit\\cmd', AUTOPROMPT_WINDOWS_BASH: 'E:\\Custom\\usr\\bin\\bash.exe' }
-  assert.throws(() => boundary.assertCommandSandboxPrerequisites({ platform: 'win32', env }), error =>
-    error.code === 'COMMAND_SANDBOX_UNSUPPORTED' && error.message.includes('Git Bash 4.3 or newer'))
-  assert.equal(attempted[0], env.AUTOPROMPT_WINDOWS_BASH)
-  assert.ok(attempted.includes('D:\\PortableGit\\usr\\bin\\bash.exe'))
+  assert.throws(() => api.assertCommandSandboxPrerequisites({ platform: 'win32', env }), error =>
+    error.code === 'COMMAND_SANDBOX_UNSUPPORTED' && error.message.includes('packaged Windows worker bundle') && error.message.includes('asset-presence-mismatch'))
 })
 
-test('static Windows diagnostics require the system root and delegate the complete Bash closure', t => {
-  const windows = require('../../agents/codex/workflow/windows-appcontainer-command.js')
-  const bashPath = 'D:\\Git\\usr\\bin\\bash.exe'
+test('static Windows diagnostics require the system root and report only bundle presence', t => {
   let calls = 0
-  t.mock.method(windows, 'resolveWindowsBash', options => {
-    calls += 1
-    assert.equal(options.env.SystemRoot, 'C:\\Windows')
-    assert.equal(options.env.PATH, 'D:\\Git\\cmd')
-    return { bash: { path: bashPath } }
-  })
-  assert.throws(() => boundary.assertCommandSandboxPrerequisites({ platform: 'win32', env: {} }), { code: 'COMMAND_SANDBOX_UNSUPPORTED' })
+  const manifestSha256 = 'a'.repeat(64), scope = 'bounded-declared-presence-only'
+  const api = withWindowsAvailability(t, () => { calls++; return { available: true, accepted: false, manifestSha256, scope } })
+  assert.throws(() => api.assertCommandSandboxPrerequisites({ platform: 'win32', env: {} }), error => error.code === 'COMMAND_SANDBOX_UNSUPPORTED')
   assert.equal(calls, 0)
-  assert.deepEqual(boundary.assertCommandSandboxPrerequisites({ platform: 'win32', env: { SystemRoot: 'C:\\Windows', Path: 'D:\\Git\\cmd' } }),
-    { backend: 'windows-appcontainer', bashPath })
+  const result = api.assertCommandSandboxPrerequisites({ platform: 'win32', env: { SystemRoot: 'C:\\Windows', Path: 'D:\\Git\\cmd' } })
+  assert.equal(JSON.stringify(result), JSON.stringify({ backend: 'windows-appcontainer', manifestSha256, scope }))
   assert.equal(calls, 1)
 })
 

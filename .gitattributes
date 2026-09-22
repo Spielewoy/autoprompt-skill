@@ -27,3 +27,8 @@ release-source/**/*.gz -text
 release-source/**/*.xz -text
 release-source/**/*.part-* -text
 release-source/**/*.json text eol=lf
+
+# Preserve the exact bundled executable, compressed, and original notice bytes.
+agents/codex/workflow/windows-worker/bootstrap/*.exe -text
+agents/codex/workflow/windows-worker/bundle/assets/*.br -text
+agents/codex/workflow/windows-worker/notices/THIRD-PARTY-NOTICES.txt -text

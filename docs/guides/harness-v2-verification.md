@@ -39,7 +39,7 @@ For custom OpenCode or Kilo models, define the selected variant's matching `reas
 
 ## Runtime requirements
 
-The verified v2 execution path is Linux with Bubblewrap. VS Code also needs a graphical session or headless display. macOS and Windows installation support does not establish native execution support; see [configured Linux runtimes](../lima-runtime.md) for the explicit VM/WSL options.
+The verified v2 execution path remains Linux with Bubblewrap. VS Code also needs a graphical session or headless display. A separate native Windows Claude path uses the bundled Bash/MSYS/Node runtime and supports the Node 20/24 controller on Windows x64 and ARM64; its local capability canary must pass before activation. Other providers on Windows and native macOS command isolation remain outside this path; see [configured Linux runtimes](../lima-runtime.md) for explicit VM/WSL options.
 
 Matching reviewed releases can activate after their local capability checks pass. Claude also has an explicit local capability policy, so it does not require imported signing keys or a pre-existing reviewed release record: all 11 fresh native checks must pass for the exact installed runtime and executable. `PROVIDER_UNSUPPORTED` means the installed runtime, native executable, or required capability does not match an accepted configuration. Run `autoprompt doctor PROVIDER --strict` and check the tested versions before retrying.
 

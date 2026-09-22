@@ -43,6 +43,14 @@ function stageWindowsHelperDeployment(controlRoot) {
       if (!crypto.timingSafeEqual(crypto.createHash('sha256').update(readHelper(destination)).digest(), crypto.createHash('sha256').update(bytes).digest())) fail('Staged native helper bytes changed')
     }
     return Object.freeze({ root, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) })
-  } catch (error) { fs.rmSync(root, { recursive: true, force: true }); throw error }
+  } catch (error) {
+    try { fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) }
+    catch (cleanup) {
+      error.cleanupConfirmed = false
+      error.retainedHelperRoot = root
+      error.cleanupCode = String(cleanup.code || 'cleanup-failed').slice(0, 64)
+    }
+    throw error
+  }
 }
 module.exports = { stageWindowsHelperDeployment }

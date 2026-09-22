@@ -18,7 +18,7 @@ Autoprompt v2 supports eleven providers. The [README](../../README.md#support) l
 
 Start a run with `autoprompt activate PROVIDER --target /absolute/project -- "<goal>"`.
 
-The previously verified execution path is Linux. Native Windows Claude Code can attempt the same closed capability checks using Windows process and sandbox controls, without WSL2 or a VM. This is a local capability check on the installed binary, not a claim that every Windows version or machine has already been tested. Every required check must pass before a mission starts. The other native provider paths remain limited to the platforms named by their shipped test policies; an installer download alone does not establish runtime support.
+The previously verified execution path is Linux. Native Windows Claude Code uses the bundled Bash/MSYS/Node runtime and can attempt the same closed capability checks using Windows process and sandbox controls, without WSL2 or a VM. The supported local controller scope is Node 20 or 24 on Windows x64 or ARM64. This is a local capability check on the installed binary, not a claim that every Windows version or machine has already been tested. Every required check must pass before a mission starts. The other native provider paths remain limited to the platforms named by their shipped test policies; an installer download alone does not establish runtime support.
 
 Run `autoprompt doctor PROVIDER --strict` to check an installation. `payload=verified` means the installed files match their receipt. The separate `activation` field explains whether that native executable can proceed:
 

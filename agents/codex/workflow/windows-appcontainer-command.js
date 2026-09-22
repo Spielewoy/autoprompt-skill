@@ -5,6 +5,7 @@ const crypto = require('node:crypto')
 const cp = require('node:child_process')
 const { ensureWindowsPrivateAcl } = require('./safe-run-root.js')
 const { createWindowsAppContainerLauncher, WindowsAppContainerError, parseMsysSharedId } = require('./windows-appcontainer.js')
+const workerBundle = require('./windows-worker-loader.js')
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 // Copy a closed executable dependency set into the existing read-only runtime.
 // Granting the original Git installation would also expose unrelated plugins,
@@ -139,50 +140,117 @@ function resolveWindowsBash(options = {}) {
   }
   throw new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', `Git Bash 4.3 or newer with its complete physical DLL closure is required for the Windows command boundary${failure ? `: ${failure.message}` : ''}`)
 }
+// Admission belongs to this controller process and the exact captured tuple.
+// No caller-supplied option, result object or exported token can set it.
+let admittedWorker = null, pendingAdmission = null, admissionPoison = null
+function currentAdmission(tuple) {
+  const worker = workerBundle.revalidateTuple(tuple)
+  const key = require('./windows-appcontainer-probe.js').canaryKey(worker.identity)
+  return { worker, key }
+}
+function retainUnknownAdmission(error) {
+  if (error.cleanupConfirmed === false || error.code === 'APPCONTAINER_CLEANUP_UNCONFIRMED' || (error.recovery && !error.recoveryResolved)) {
+    // Keep the first failure's recovery binding independent of later operations
+    // and of the mutable error returned to its caller.
+    admissionPoison ||= Object.freeze({ code: error.code, message: error.message,
+      ...(error.recovery ? { recovery: Object.freeze({ ...error.recovery }) } : {}),
+      recoveryRoot: error.recoveryRoot, retainedHelperRoot: error.retainedHelperRoot,
+      retainedRuntimeRoot: error.retainedRuntimeRoot, retainedControlRoot: error.retainedControlRoot })
+    admittedWorker = null
+  }
+}
+function refusePoisonedAdmission() {
+  if (!admissionPoison) return
+  const error = new WindowsAppContainerError('APPCONTAINER_CLEANUP_UNCONFIRMED', 'A previous Windows worker operation has unconfirmed cleanup')
+  error.cleanupConfirmed = false
+  error.admissionFailure = admissionPoison
+  // Prior recovery belongs to the previous operation. In particular, never put
+  // it in .recovery, which this operation's catch may recover or replace.
+  error.recoveryRoot = admissionPoison.recoveryRoot || admissionPoison.retainedHelperRoot || admissionPoison.retainedRuntimeRoot || admissionPoison.retainedControlRoot
+  throw error
+}
+async function ensureWorkerAdmission() {
+  refusePoisonedAdmission()
+  const tuple = await workerBundle.captureWorkerTuple()
+  refusePoisonedAdmission()
+  const { worker, key } = currentAdmission(tuple)
+  if (admittedWorker?.tuple === tuple && admittedWorker.key === key) return admittedWorker
+  let pending = pendingAdmission
+  if (!pending || pending.tuple !== tuple || pending.key !== key) {
+    pending = { tuple, key, promise: null }
+    const ownedPending = pending
+    pending.promise = (async () => {
+      const result = await require('./windows-appcontainer-probe.js').runWindowsAppContainerCanary(
+        (policy, args, options) => runTupleCommand(policy, args, options, tuple, key), worker.identity, key)
+      if (!result || result.supported !== true || result.workerIdentity !== worker.identity || result.runtimeSha256 !== key || result.processCleanup !== 'owned-job-drained') {
+        const error = new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', 'The selected Windows worker tuple did not pass its fresh native canary')
+        if (result && result.supported === false) error.canaryResult = result
+        if (result?.recoveryRoot) { error.cleanupConfirmed = false; error.recoveryRoot = result.recoveryRoot }
+        throw error
+      }
+      if (currentAdmission(tuple).key !== key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed during the Windows worker canary')
+      refusePoisonedAdmission()
+      admittedWorker = Object.freeze({ tuple, key, result: Object.freeze(result) })
+      return admittedWorker
+    })().catch(error => { retainUnknownAdmission(error); throw error }).finally(() => {
+      if (pendingAdmission === ownedPending) pendingAdmission = null
+    })
+    pendingAdmission = pending
+  }
+  const admitted = await pending.promise
+  refusePoisonedAdmission()
+  if (currentAdmission(tuple).key !== admitted.key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed after the Windows worker canary')
+  return admitted
+}
+async function probeWindowsAppContainer() {
+  if (process.platform !== 'win32') return { supported: false, backend: 'windows-appcontainer', code: 'COMMAND_SANDBOX_UNSUPPORTED' }
+  try { return (await ensureWorkerAdmission()).result }
+  catch (error) {
+    if (error.canaryResult) return error.canaryResult
+    return { supported: false, backend: 'windows-appcontainer', code: error.code || 'WINDOWS_RUNTIME_UNAVAILABLE', diagnostic: { phase: 'worker-admission', message: String(error.message || 'Worker admission failed').slice(0, 1024) }, ...(error.cleanupConfirmed === false ? { cleanupConfirmed: false, recoveryRoot: error.recoveryRoot || error.retainedHelperRoot || error.retainedRuntimeRoot } : {}) }
+  }
+}
 async function runWindowsAppContainerCommand(policy, args, options = {}) {
+  if (process.platform !== 'win32' || typeof options.controlRoot !== 'string' || !path.isAbsolute(options.controlRoot)) throw new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', 'A private controller root is required for Windows commands')
+  try {
+    const admitted = await ensureWorkerAdmission()
+    if (currentAdmission(admitted.tuple).key !== admitted.key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed before command launch')
+    return await runTupleCommand(policy, args, options, admitted.tuple, admitted.key)
+  } catch (error) { retainUnknownAdmission(error); throw error }
+}
+async function runTupleCommand(policy, args, options, tuple, key) {
+  refusePoisonedAdmission()
+  if (currentAdmission(tuple).key !== key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed before tuple execution')
   if (process.platform !== 'win32' || typeof options.controlRoot !== 'string' || !path.isAbsolute(options.controlRoot)) throw new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', 'A private controller root is required for Windows commands')
   const controlRoot = fs.realpathSync.native(options.controlRoot)
   const nonce = crypto.randomUUID().replaceAll('-', '')
-  const cancellationPath = path.join(controlRoot, `cancel-${nonce}`)
   // MSYS derives its installation root by removing the DLL filename, bin and
   // usr components. Keep that real layout inside one owned command directory.
   const runtimeRoot = path.join(path.dirname(controlRoot), `command-runtime-${nonce}`)
   const runtimeDirectory = path.join(runtimeRoot, 'usr', 'bin')
-  const runtimeNode = path.join(runtimeDirectory, 'node.exe'), runtimeBash = path.join(runtimeDirectory, 'bash.exe')
   let launcher, helperDeployment
   const { prepareWindowsAppContainerResources, recoverWindowsAppContainerResources } = require('./windows-appcontainer-resources.js')
-  const bashSource = resolveWindowsBash(options)
+  // Only the source-pinned, physically captured bundle can select worker bytes.
+  // The loader keeps this opaque tuple for both the probe and later commands.
+  const workerIdentity = workerBundle.revalidateTuple(tuple).identity
   const systemRoot = process.env.SystemRoot
-  const executable = runtimeBash, executableSha256 = bashSource.bash.sha256
-  const msysSource = bashSource.files.find(binding => binding.name === 'msys-2.0.dll')
-  const msysRuntime = { dllPath: path.join(runtimeDirectory, 'msys-2.0.dll'), dllSha256: msysSource.sha256, sharedId: msysSource.sharedId }
   const start = Date.now()
-  let lease, evidence, released = false, recoveryPending = false, privateScratch = null
+  let lease, evidence, released = false, recoveryPending = false, privateScratch = null, runtimeOwned = false, runtimeCleanupUnknown = false, primaryError = null
   try {
     helperDeployment = require('./windows-helper-deployment.js').stageWindowsHelperDeployment(controlRoot)
+    // The cancellation marker lives in this operation's exclusively created
+    // helper directory, whose cleanup follows the same process-drain evidence.
+    const cancellationPath = path.join(helperDeployment.root, 'cancel')
     launcher = createWindowsAppContainerLauncher({ deploymentRoot: helperDeployment.root })
     if (!policy.scratchPath) {
-      privateScratch = path.join(path.dirname(controlRoot), `command-scratch-${nonce}`)
-      fs.mkdirSync(privateScratch, { mode: 0o700 }); ensureWindowsPrivateAcl(privateScratch)
+      const scratch = path.join(path.dirname(controlRoot), `command-scratch-${nonce}`)
+      fs.mkdirSync(scratch, { mode: 0o700 }); privateScratch = scratch
+      ensureWindowsPrivateAcl(privateScratch)
       policy = { ...policy, scratchPath: privateScratch, readableRoots: [...policy.readableRoots, privateScratch], writableRoots: [...policy.writableRoots, privateScratch] }
     }
-    fs.mkdirSync(runtimeRoot, { mode: 0o700 })
-    ensureWindowsPrivateAcl(runtimeRoot)
-    fs.mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 })
-    const runtimeEtc = path.join(runtimeRoot, 'etc')
-    fs.mkdirSync(runtimeEtc, { mode: 0o700 })
-    // The immutable per-command mount table maps /tmp to the lease's existing
-    // private TEMP/TMP scratch path; no host installation or global mount changes.
-    fs.writeFileSync(path.join(runtimeEtc, 'fstab'), 'none /tmp usertemp binary,posix=0,noacl 0 0\n', { flag: 'wx', mode: 0o400 })
-    const expectedNodeHash = sha256(fs.readFileSync(process.execPath))
-    fs.copyFileSync(process.execPath, runtimeNode, fs.constants.COPYFILE_EXCL)
-    for (const binding of bashSource.files) {
-      const destination = path.join(runtimeDirectory, binding.name)
-      fs.writeFileSync(destination, binding.bytes, { flag: 'wx', mode: 0o500 })
-      if (sha256(fs.readFileSync(destination)) !== binding.sha256) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Git Bash runtime dependency changed while copying')
-    }
-    if (sha256(fs.readFileSync(runtimeNode)) !== expectedNodeHash) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Controller Node changed while copying')
-    if (sha256(fs.readFileSync(runtimeBash)) !== executableSha256) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Git Bash runtime changed while copying')
+    const runtime = workerBundle.materializeTuple(tuple, runtimeRoot)
+    runtimeOwned = true
+    if (runtime.identity !== workerIdentity) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Worker tuple changed during materialization')
     lease = await prepareWindowsAppContainerResources({ policy, controlRoot, deploymentRoot: helperDeployment.root,
       executableRoots: [{ path: runtimeRoot, kind: 'directory' }],
       verifyDrainEvidence: launcher.verifyDrainEvidence })
@@ -195,30 +263,47 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
       GIT_CONFIG_KEY_1: 'credential.helper', GIT_CONFIG_VALUE_1: '', GIT_CONFIG_KEY_2: 'core.sshCommand', GIT_CONFIG_VALUE_2: 'cmd /d /c exit 1',
       ...lease.environment,
     }
+    refusePoisonedAdmission()
+    if (currentAdmission(tuple).key !== key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed while preparing resource grants')
     evidence = await launcher.launch({ profileName: lease.profileName, profileSid: lease.profileSid,
-      executable, executableSha256, msysRuntime, arguments: ['--noprofile', '--norc', '-c', args.command], cwd: args.cwd,
+      executable: runtime.bash, executableSha256: runtime.bashSha256, msysRuntime: runtime.msysRuntime, arguments: ['--noprofile', '--norc', '-c', args.command], cwd: args.cwd,
       environment: Object.entries(env).map(([key, value]) => `${key}=${value}`), timeoutMs: args.timeoutMs || 60000,
       outputLimit: 1024 * 1024, cancellationPath }, { signal: options.signal, leaseId: lease.recovery.leaseId })
-    await lease.release(evidence)
+    const resourceRecovery = Object.freeze({ ...await lease.release(evidence) })
     released = true
     const stdout = evidence.stdout, stderr = evidence.stderr, output = Buffer.concat([stdout, stderr])
-    return { tool: 'bash', command: args.command, cwd: args.cwd,
+    return { tool: 'bash', workerIdentity, resourceRecovery, command: args.command, cwd: args.cwd,
       status: evidence.exitCode === 0 && !evidence.timedOut && !evidence.truncated && !evidence.cancelled ? 'completed' : 'failed',
       exitCode: evidence.exitCode, signal: null, stdout: stdout.toString('utf8'), stderr: stderr.toString('utf8'), output: output.toString('utf8'),
       stdoutBase64: stdout.toString('base64'), stderrBase64: stderr.toString('base64'), outputBase64: output.toString('base64'), outputSha256: sha256(output),
       launcherSessionId: evidence.launcherSessionId, truncated: evidence.truncated, cancelled: evidence.cancelled, timedOut: evidence.timedOut, background: false, durationMs: Date.now() - start }
   } catch (error) {
-    if (!lease && error.recovery) {
-      recoveryPending = true
-      const binding = { profileSid: error.recovery.profileSid, leaseId: error.recovery.leaseId }
-      const unused = launcher.proveNotStarted(binding)
-      await recoverWindowsAppContainerResources({ controlRoot, deploymentRoot: helperDeployment.root, journalPath: error.recovery.journalPath, verifyDrainEvidence: launcher.verifyDrainEvidence, evidence: unused })
-      recoveryPending = false; released = true; error.recoveryResolved = true
-    }
-    if (lease && !evidence) {
-      let unused
-      try { unused = launcher.proveNotStarted({ profileSid: lease.profileSid, leaseId: lease.recovery.leaseId }) } catch {}
-      if (unused) { await lease.release(unused); released = true }
+    primaryError = error
+    runtimeCleanupUnknown = error.cleanupConfirmed === false
+    try {
+      if (!lease && error.recovery) {
+        recoveryPending = true
+        const binding = { profileSid: error.recovery.profileSid, leaseId: error.recovery.leaseId }
+        const unused = launcher.proveNotStarted(binding)
+        await recoverWindowsAppContainerResources({ controlRoot, deploymentRoot: helperDeployment.root, journalPath: error.recovery.journalPath, verifyDrainEvidence: launcher.verifyDrainEvidence, evidence: unused })
+        recoveryPending = false; released = true; error.recoveryResolved = true
+      }
+      if (lease && !evidence) {
+        let unused
+        try { unused = launcher.proveNotStarted({ profileSid: lease.profileSid, leaseId: lease.recovery.leaseId }) } catch {}
+        if (unused) {
+          await lease.release(unused); released = true
+          // A poison wrapper describes another operation's unknown cleanup.
+          // This operation has independently proved that it never started.
+          if (error.admissionFailure || error.workerFailure) runtimeCleanupUnknown = false
+        }
+      }
+    } catch (recoveryError) {
+      // A secondary recovery failure must not erase the original lease or an
+      // unknown-cleanup marker that tells the caller to retain its outer root.
+      error.cleanupConfirmed = false
+      error.recoveryFailureCode = String(recoveryError.code || 'recovery-failed').slice(0, 64)
+      runtimeCleanupUnknown = true
     }
     if (lease && !released) error.recovery = Object.freeze({ ...lease.recovery, profileSid: lease.profileSid })
     throw error
@@ -226,11 +311,24 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
     // Unconfirmed launches retain their exact request artifacts alongside the
     // resource journal. Recovery must prove process drain before revoking grants.
     if ((!lease && !recoveryPending) || released) {
-      if (privateScratch) fs.rmSync(privateScratch, { recursive: true, force: true })
-      fs.rmSync(runtimeRoot, { recursive: true, force: true })
-      helperDeployment?.cleanup()
-      try { fs.unlinkSync(cancellationPath) } catch (error) { if (error.code !== 'ENOENT') throw error }
+      let cleanupFailure
+      const cleanup = operation => {
+        try { operation() } catch (error) { if (!cleanupFailure) cleanupFailure = error }
+      }
+      if (privateScratch) cleanup(() => fs.rmSync(privateScratch, { recursive: true, force: true }))
+      // Failed materialization owns its own cleanup accounting; EEXIST never
+      // transfers ownership of a competing directory to this operation.
+      if (runtimeOwned && !runtimeCleanupUnknown) cleanup(() => fs.rmSync(runtimeRoot, { recursive: true, force: true }))
+      cleanup(() => helperDeployment?.cleanup())
+      if (cleanupFailure) {
+        const error = primaryError || cleanupFailure
+        error.cleanupConfirmed = false
+        error.retainedControlRoot = controlRoot
+        error.retainedRuntimeRoot = runtimeRoot
+        error.cleanupCode = String(cleanupFailure.code || 'cleanup-failed').slice(0, 64)
+        if (!primaryError) throw error
+      }
     }
   }
 }
-module.exports = { runWindowsAppContainerCommand, importedDlls, bindBashRuntime, windowsBashCandidates, resolveWindowsBash }
+module.exports = { runWindowsAppContainerCommand, probeWindowsAppContainer, importedDlls, bindBashRuntime, windowsBashCandidates, resolveWindowsBash }

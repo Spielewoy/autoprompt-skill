@@ -62,7 +62,7 @@ autoprompt
 - [Node.js 20+](https://nodejs.org/en/download)
 - [Python 3.11+](https://www.python.org/downloads/) available as `python3` or `python`, with [PyYAML](https://pypi.org/project/PyYAML/)
 - [Bash 4.3+](https://www.gnu.org/software/bash/) on macOS or Linux
-- Git Bash 4.3+ for native Windows Claude commands; WSL and a hypervisor are not required for that path
+- Windows native Claude commands use the bundled Bash/MSYS/Node runtime; WSL and a hypervisor are not required for that path
 - [Git](https://git-scm.com/downloads) only for the GitHub checkout method
 
 ### Support
@@ -83,15 +83,15 @@ autoprompt
 
 These versions passed Linux runs. Model and platform availability varies by provider.
 
-Native Claude activation on Windows uses AppContainer isolation and Windows Job
-process ownership. Each activation tests the installed Claude executable before
-starting work, including after a version update. All eleven capability checks
-must pass; a missing, failed, or skipped check blocks activation. Git Bash may be
-installed outside its default location; `AUTOPROMPT_WINDOWS_BASH` can name its
-absolute `usr/bin/bash.exe` path.
+Native Claude activation on Windows uses the bundled Bash/MSYS/Node runtime,
+AppContainer isolation, and Windows Job process ownership. The supported local
+controller scope is Node 20 or 24 on Windows x64 or ARM64. Each activation tests
+the installed Claude executable before starting work, including after a version
+update. All eleven capability checks must pass; a missing, failed, or skipped
+check blocks activation.
 
 Native macOS command isolation and native Windows activation for other providers
-are not yet available through this local test path. Use the documented
+remain unavailable through this local test path. Use the documented
 [VM runtime](docs/lima-runtime.md) where applicable. Installer success alone does
 not establish runtime support: `doctor --strict` now reports activation
 prerequisites separately, and `local-canary-required` means the native capability

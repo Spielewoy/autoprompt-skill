@@ -132,10 +132,8 @@ function safeEnvironment() {
   if (process.platform === 'win32') {
     const systemRoot = process.env.SystemRoot
     if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/i.test(systemRoot)) fail('COMMAND_SANDBOX_UNSUPPORTED', 'Windows system root is unavailable')
-    const bash = require('../agents/codex/workflow/windows-appcontainer-command.js').resolveWindowsBash().bash.path
     return { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
       PATH: [path.dirname(process.execPath), path.join(systemRoot, 'System32')].join(path.delimiter),
-      AUTOPROMPT_WINDOWS_BASH: bash,
       ComSpec: path.join(systemRoot, 'System32', 'cmd.exe'), PATHEXT: '.COM;.EXE;.BAT;.CMD', LOCALAPPDATA: process.env.LOCALAPPDATA || '',
       GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: 'NUL', GIT_ALLOW_PROTOCOL: '', GIT_TERMINAL_PROMPT: '0',
       GIT_CONFIG_COUNT: '3', GIT_CONFIG_KEY_0: 'push.default', GIT_CONFIG_VALUE_0: 'nothing',
@@ -355,8 +353,9 @@ function assertCommandSandboxPrerequisites(options = {}) {
     const environment = require('../agents/codex/workflow/process-owner.js').normalizeWindowsChildEnvironment(options.env || process.env)
     const systemRoot = environment.SYSTEMROOT
     if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/i.test(systemRoot)) fail('COMMAND_SANDBOX_UNSUPPORTED', 'Windows system root is unavailable')
-    const runtime = require('../agents/codex/workflow/windows-appcontainer-command.js').resolveWindowsBash({ env: { ...environment, SystemRoot: systemRoot } })
-    return { backend: 'windows-appcontainer', bashPath: runtime.bash.path }
+    const runtime = require('../agents/codex/workflow/windows-worker-loader.js').staticAvailability()
+    if (!runtime.available) fail('COMMAND_SANDBOX_UNSUPPORTED', `The packaged Windows worker bundle is unavailable: ${runtime.code}`)
+    return { backend: 'windows-appcontainer', manifestSha256: runtime.manifestSha256, scope: runtime.scope }
   }
   fail('COMMAND_SANDBOX_UNSUPPORTED', 'This platform has no supported native command sandbox; use the documented Linux VM runtime')
 }

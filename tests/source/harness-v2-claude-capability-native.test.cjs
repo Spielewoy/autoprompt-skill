@@ -91,6 +91,17 @@ async function scenario(t, options = {}) {
   assert.ok(CLI, 'AUTOPROMPT_CLAUDE_TEST_CLI is required for this native capability suite')
   const sandbox = await boundary.probeCommandSandbox()
   assert.equal(sandbox.supported, true, JSON.stringify(sandbox))
+  if (process.platform === 'win32') {
+    const loader = require('../../agents/codex/workflow/windows-worker-loader.js')
+    const tuple = loader.describeTuple(await loader.captureWorkerTuple())
+    assert.equal(sandbox.workerIdentity, tuple.identity, 'the actual command canary must use the receipt-bound packaged tuple')
+    assert.equal(tuple.architecture, process.arch)
+    assert.equal(sandbox.processCleanup, 'owned-job-drained')
+    // The outer closed-canary artifacts bind this actual TAP output hash. The
+    // packed public-activation test reopens it, rather than simulating Windows.
+    t.diagnostic(`PACKAGED_WINDOWS_WORKER:${JSON.stringify({ identity: tuple.identity, architecture: tuple.architecture,
+      manifestSha256: tuple.manifestSha256, sharedId: tuple.sharedId, files: tuple.files })}`)
+  }
   const f = createFixture()
   let service, owner
   t.after(async () => {

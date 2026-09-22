@@ -445,6 +445,23 @@ function assertCodexSourceClosure(root, runtimeFiles) {
   return true
 }
 
+const CODEX_WINDOWS_WORKER_ASSETS=Object.freeze([
+ 'bootstrap/capture-arm64.exe','bootstrap/capture-arm64.exe.config','bootstrap/capture-x64.exe','bootstrap/capture-x64.exe.config',
+ 'bundle/assets/bash.br','bundle/assets/msys.br','bundle/assets/node-arm64.br','bundle/assets/node-x64.br','bundle/manifest.json',
+ 'notices/README.md','notices/SOURCE-PROVENANCE.json','notices/THIRD-PARTY-NOTICES.txt',
+].sort())
+function codexWorkerAssets(root){
+ let totalBytes=0
+ root=path.resolve(root)
+ for(let cursor=root;;cursor=path.dirname(cursor)){const st=fs.lstatSync(cursor);require('node:assert/strict').ok(st.isDirectory()&&!st.isSymbolicLink(),'Physical asset parent required');if(cursor===path.dirname(cursor))break}
+ const files=[],dirs=[];let count=0
+ function visit(relative){for(const name of fs.readdirSync(path.join(root,relative))){require('node:assert/strict').ok(++count<=32,'Closed asset entry bound');const key=relative?relative+'/'+name:name;const st=fs.lstatSync(path.join(root,key));require('node:assert/strict').ok(!st.isSymbolicLink(),'Linked asset refused');if(st.isDirectory()){dirs.push(key);visit(key)}else{require('node:assert/strict').ok(st.isFile()&&st.nlink===1,'Single-link regular asset required');const max=key.endsWith('.br')?128*1024*1024:key.endsWith('.exe')?1024*1024:key.endsWith('.exe.config')?4096:key==='bundle/manifest.json'?65536:key.startsWith('notices/')?4*1024*1024:0;require('node:assert/strict').ok(Number.isSafeInteger(st.size)&&st.size>0&&st.size<=max,'Closed asset file size bound');totalBytes+=st.size;require('node:assert/strict').ok(totalBytes<=256*1024*1024,'Closed asset aggregate bound');files.push(key)}}}
+ visit('');require('node:assert/strict').deepEqual(files.sort(),CODEX_WINDOWS_WORKER_ASSETS,'Exact nested asset inventory')
+ const expectedDirs=new Set();for(const file of CODEX_WINDOWS_WORKER_ASSETS){let parent=path.posix.dirname(file);while(parent!=='.'){expectedDirs.add(parent);parent=path.posix.dirname(parent)}}
+ require('node:assert/strict').deepEqual(dirs.sort(),[...expectedDirs].sort(),'Exact nested asset directories')
+ return CODEX_WINDOWS_WORKER_ASSETS.map(file=>'workflow/windows-worker/'+file)
+}
+
 function codexRuntimeFiles(root = ROOT) {
   const { loadCodexV2Contracts } = require('./generate-provider-contracts.cjs')
   const contracts = loadCodexV2Contracts(root)
@@ -465,6 +482,7 @@ function codexRuntimeFiles(root = ROOT) {
     .filter(entry => entry.isFile() && CODEX_RUNTIME_EXTENSIONS.has(path.extname(entry.name)))
     .map(entry => `workflow/${entry.name}`)
   files.push(...workflow)
+  files.push(...codexWorkerAssets(path.join(workflowDirectory, 'windows-worker')))
 
   const sorted = [...new Set(files)].sort()
   assertCodexSourceClosure(root, sorted)

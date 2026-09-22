@@ -175,7 +175,12 @@ async function main() {
   { ...process.env, AUTOPROMPT_CLAUDE_TEST_CLI: executable, AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1' }, 'native-platform-tests.log')
   evidence.exitCode = code
   evidence.skipped = /# SKIP\b/i.test(output) || !/^# skipped 0\s*$/m.test(output)
-  evidence.nativeCapabilitiesPassed = code === 0 && !evidence.skipped
+  evidence.publicActivationPassed = false
+  if (code === 0 && !evidence.skipped) {
+    assertNamedCase(output, 'packed public Claude activate admits a fresh native canary before controlled endpoint refusal and revokes')
+    evidence.publicActivationPassed = true
+  }
+  evidence.nativeCapabilitiesPassed = code === 0 && !evidence.skipped && evidence.publicActivationPassed
   publish()
   assert.equal(code, 0, 'Installed native Claude capability tests failed')
   assert.equal(evidence.skipped, false, 'Native capability certification must execute every case without skips')
