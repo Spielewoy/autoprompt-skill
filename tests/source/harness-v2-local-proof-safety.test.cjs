@@ -15,7 +15,7 @@ function write(file, value) {
   fs.writeFileSync(file, typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value), { mode: 0o600 })
 }
 function fixture(t, provider, usePolicy = false, nativeSnapshot = false) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-local-proof-safety-'))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-local-proof-safety-')))
   if (!nativeSnapshot) t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const target = path.join(root, 'target')
   fs.mkdirSync(target)
