@@ -463,14 +463,15 @@ function auditPrivatePermissions(runPath, options = {}) {
     '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)',
     '[pscustomobject]@{currentName=$identity.Name;currentSid=$identity.User.Value;items=$items}|ConvertTo-Json -Compress -Depth 7',
   ].join(';')
-  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-    encoding: 'utf8', windowsHide: true, timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'],
-    env: windowsPowerShellEnvironment({
-      AUTOPROMPT_ACL_AUDIT_PATHS: JSON.stringify([absolute, ...additional]),
-      AUTOPROMPT_ACL_AUDIT_RECURSE: recurse ? '1' : '0',
-    }),
+  const environment = windowsPowerShellEnvironment({
+    AUTOPROMPT_ACL_AUDIT_PATHS: JSON.stringify([absolute, ...additional]),
+    AUTOPROMPT_ACL_AUDIT_RECURSE: recurse ? '1' : '0',
   })
-  if (result.status !== 0) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Cannot revalidate Windows run-record ACLs', { status: result.status, stderr: result.stderr && result.stderr.trim() })
+  const powershell = path.win32.join(environment.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const result = spawnSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], {
+    encoding: 'utf8', windowsHide: true, timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'], env: environment,
+  })
+  if (result.status !== 0) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Cannot revalidate Windows run-record ACLs', { status: result.status, cause: result.error && result.error.code, stderr: result.stderr && result.stderr.trim() })
   let snapshot
   try { snapshot = JSON.parse(result.stdout) } catch { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit returned invalid JSON') }
   return validateWindowsAclSnapshot(snapshot)

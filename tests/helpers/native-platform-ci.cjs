@@ -15,6 +15,8 @@ function exportEnvironment(name, value) {
 
 const WINDOWS_NATIVE_CASES = Object.freeze([
   'native Windows compiler staging ignores deep home and temp overrides',
+  'Windows Job bridge compiles and preserves atomic status publication on native long paths',
+  'native Windows Job ownership survives deep durable paths and hostile home variables',
   'native Windows host NUL basic query records exact and oversized buffer results',
   'native Windows Node pipe diagnostic records stdio and fork IPC support with owned job drain',
   'native Windows NUL diagnostic records exact device access under an AppContainer token',
@@ -178,15 +180,17 @@ async function main() {
   assert.equal(evidence.sandbox.supported, true, `Native sandbox prerequisite failed: ${JSON.stringify(evidence.sandbox)}`)
   const diagnosticCases = [
     'native Windows compiler staging ignores deep home and temp overrides',
+    'Windows Job bridge compiles and preserves atomic status publication on native long paths',
+    'native Windows Job ownership survives deep durable paths and hostile home variables',
     'native Windows Bash repeated forks complete without retry diagnostics',
     'claude closed native capability: full canonical role schema is accepted and validated',
     'packed actual Claude activation requires all local native observations before mission admission',
   ]
   const selection = diagnostic ? ['--test-name-pattern', `^(?:${diagnosticCases.join('|')})$`] : []
   const { code, output } = await runTests(['--test', '--test-reporter=tap', '--test-concurrency=1', ...selection,
+    ...(diagnostic ? ['tests/source/windows-job-helper.test.cjs', 'tests/source/windows-appcontainer.test.cjs', 'tests/source/windows-bash-runtime.test.cjs'] : []),
     'tests/source/harness-v2-claude-capability-native.test.cjs',
-    'tests/source/harness-v2-installed-canary-native.test.cjs',
-    ...(diagnostic ? ['tests/source/windows-appcontainer.test.cjs', 'tests/source/windows-bash-runtime.test.cjs'] : [])],
+    'tests/source/harness-v2-installed-canary-native.test.cjs'],
   { ...process.env, AUTOPROMPT_CLAUDE_TEST_CLI: executable, AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1' }, 'native-platform-tests.log')
   evidence.exitCode = code
   if (diagnostic) {

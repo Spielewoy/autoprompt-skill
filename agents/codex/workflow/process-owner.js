@@ -6,7 +6,7 @@ const childProcess = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
 const { atomicWriteFile, atomicWriteJson, canonicalize, readChecksummedJson, stableStringify } = require('./event-log.js')
-const { auditPrivatePermissions, ensureWindowsPrivateAcl, inspectPathNoFollow, pathIsInside } = require('./safe-run-root.js')
+const { auditPrivatePermissions, createWindowsCompilerDirectory, ensureWindowsPrivateAcl, inspectPathNoFollow, pathIsInside, windowsControllerEnvironment } = require('./safe-run-root.js')
 
 const PROCESS_REGISTRY_SCHEMA_VERSION = 4
 const REQUIRED_PROCESS_ADAPTER_METHODS = Object.freeze([
@@ -1494,21 +1494,25 @@ $ErrorActionPreference = 'Stop'
 $requestPath = $env:AUTOPROMPT_JOB_REQUEST
 $statusPath = $env:AUTOPROMPT_JOB_STATUS
 $killPath = $env:AUTOPROMPT_JOB_KILL
-$encoding = New-Object System.Text.UTF8Encoding($false)
 trap {
+  $failureText = [string]$_.Exception.ToString()
+  if ($failureText.Length -gt 2048) { $failureText = $failureText.Substring(0, 2048) }
   try {
     $failure = [ordered]@{ schemaVersion = 1; reservationId = ''; helperPid = $PID; rootPid = $null;
       ready = $false; assigned = $false; status = 'FAILED'; pids = @();
-      error = $_.Exception.ToString(); updatedAt = [DateTime]::UtcNow.ToString('o') }
-    [IO.File]::WriteAllText($statusPath, ($failure | ConvertTo-Json -Compress -Depth 5), $encoding)
-  } catch {}
+      error = $failureText; updatedAt = [DateTime]::UtcNow.ToString('o') }
+    $temporary = "$statusPath.$PID.tmp"; $backup = "$statusPath.previous"
+    [AutopromptOwnedJob]::PublishText($statusPath, $temporary, $backup, ($failure | ConvertTo-Json -Compress -Depth 5))
+  } catch { [Console]::Error.WriteLine("WINDOWS_JOB_HELPER_FAILED:$failureText") }
   exit 126
 }
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.IO;
 using System.Linq;
+using Microsoft.Win32.SafeHandles;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -1561,11 +1565,83 @@ public sealed class AutopromptOwnedJob : IDisposable {
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job, int infoClass,
     IntPtr info, UInt32 length, out UInt32 returnedLength);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern IntPtr CreateFileW(string path, UInt32 access, UInt32 share, IntPtr security,
+    UInt32 creation, UInt32 flags, IntPtr template);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern UInt32 GetFileAttributesW(string path);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool DeleteFileW(string path);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern bool ReplaceFileW(string replaced, string replacement, string backup, UInt32 flags, IntPtr exclude, IntPtr reserved);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool MoveFileExW(string existing, string replacement, UInt32 flags);
 
   IntPtr job;
   IntPtr process;
   IntPtr thread;
   public Int32 RootPid { get; private set; }
+
+  static string NativePath(string value) {
+    if (String.IsNullOrEmpty(value) || value.IndexOf('\0') >= 0) throw new ArgumentException("An absolute local or UNC path is required");
+    value = value.Replace('/', '\\');
+    if (value.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) {
+      string[] parts = value.Substring(8).Split('\\');
+      if (parts.Length < 2 || parts[0].Length == 0 || parts[1].Length == 0) throw new ArgumentException("A complete UNC path is required");
+      return value;
+    }
+    if (value.StartsWith(@"\\?\", StringComparison.Ordinal)) {
+      if (value.Length < 7 || !Char.IsLetter(value[4]) || value[5] != ':' || value[6] != '\\') throw new ArgumentException("Unsupported extended path");
+      return value;
+    }
+    if (value.StartsWith(@"\\", StringComparison.Ordinal)) {
+      string[] parts = value.Substring(2).Split('\\');
+      if (parts.Length < 2 || parts[0].Length == 0 || parts[1].Length == 0) throw new ArgumentException("A complete UNC path is required");
+      return @"\\?\UNC\" + value.Substring(2);
+    }
+    if (value.Length < 3 || !Char.IsLetter(value[0]) || value[1] != ':' || value[2] != '\\') throw new ArgumentException("An absolute drive path is required");
+    return @"\\?\" + value;
+  }
+  static SafeFileHandle OpenFile(string value, UInt32 access, UInt32 share, UInt32 creation) {
+    IntPtr raw = CreateFileW(NativePath(value), access, share, IntPtr.Zero, creation, 0x80, IntPtr.Zero);
+    if (raw == new IntPtr(-1) || raw == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateFileW failed");
+    return new SafeFileHandle(raw, true);
+  }
+  public static bool FileExists(string value) {
+    if (GetFileAttributesW(NativePath(value)) != 0xffffffff) return true;
+    int error = Marshal.GetLastWin32Error();
+    if (error == 2 || error == 3) return false;
+    throw new Win32Exception(error, "GetFileAttributesW failed");
+  }
+  public static string ReadText(string value) {
+    using (var handle = OpenFile(value, 0x80000000, 1, 3))
+    using (var stream = new FileStream(handle, FileAccess.Read, 4096, false))
+    using (var reader = new StreamReader(stream, new UTF8Encoding(false, true), true, 4096)) return reader.ReadToEnd();
+  }
+  static void WriteNew(string value, string text, ref bool owned) {
+    using (var handle = OpenFile(value, 0x40000000, 1, 1)) {
+      owned = true;
+      using (var stream = new FileStream(handle, FileAccess.Write, 4096, false)) {
+        byte[] bytes = new UTF8Encoding(false, true).GetBytes(text); stream.Write(bytes, 0, bytes.Length); stream.Flush(true);
+      }
+    }
+  }
+  static void DeleteIfPresent(string value) {
+    if (DeleteFileW(NativePath(value))) return;
+    int error = Marshal.GetLastWin32Error(); if (error != 2 && error != 3) throw new Win32Exception(error, "DeleteFileW failed");
+  }
+  public static void PublishText(string destination, string temporary, string backup, string text) {
+    bool ownsTemporary = false;
+    try {
+      WriteNew(temporary, text, ref ownsTemporary);
+      if (FileExists(destination)) {
+        DeleteIfPresent(backup);
+        if (!ReplaceFileW(NativePath(destination), NativePath(temporary), NativePath(backup), 1, IntPtr.Zero, IntPtr.Zero))
+          throw new Win32Exception(Marshal.GetLastWin32Error(), "ReplaceFileW failed");
+        ownsTemporary = false;
+        DeleteIfPresent(backup);
+      } else if (!MoveFileExW(NativePath(temporary), NativePath(destination), 8)) {
+        throw new Win32Exception(Marshal.GetLastWin32Error(), "MoveFileExW failed");
+      } else ownsTemporary = false;
+    } catch { if (ownsTemporary) { try { DeleteIfPresent(temporary); } catch {} } throw; }
+  }
 
   static string Quote(string value) {
     if (value.Length == 0) return "\"\"";
@@ -1670,6 +1746,13 @@ public sealed class AutopromptOwnedJob : IDisposable {
 }
 '@
 
+$compilerDirectory = [string]$env:AUTOPROMPT_JOB_COMPILER_DIRECTORY
+$runtimeTemp = [string]$env:AUTOPROMPT_JOB_RUNTIME_TEMP
+if (-not $compilerDirectory -or -not $runtimeTemp) { throw 'Windows Job compiler environment unavailable' }
+$env:TEMP = $runtimeTemp
+$env:TMP = $runtimeTemp
+[IO.Directory]::Delete($compilerDirectory, $true)
+
 if ($env:AUTOPROMPT_JOB_PROBE -eq '1') {
   $probeEnvironment = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
   foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
@@ -1679,7 +1762,7 @@ if ($env:AUTOPROMPT_JOB_PROBE -eq '1') {
   exit 0
 }
 
-$request = Get-Content -LiteralPath $requestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$request = [AutopromptOwnedJob]::ReadText($requestPath) | ConvertFrom-Json
 function Write-JobStatus([string]$state, [bool]$ready, [bool]$assigned, [object[]]$pids, [string]$errorText) {
   $script:observedPids = @($script:observedPids + @($pids) | Where-Object { $_ -is [ValueType] } | Sort-Object -Unique)
   $record = [ordered]@{ schemaVersion = 1; reservationId = [string]$request.reservationId;
@@ -1689,14 +1772,8 @@ function Write-JobStatus([string]$state, [bool]$ready, [bool]$assigned, [object[
     updatedAt = [DateTime]::UtcNow.ToString('o') }
   $json = $record | ConvertTo-Json -Compress -Depth 5
   $temporary = "$statusPath.$PID.tmp"
-  [IO.File]::WriteAllText($temporary, $json, $encoding)
-  if (Test-Path -LiteralPath $statusPath) {
-    $backup = "$statusPath.previous"
-    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
-    [IO.File]::Replace($temporary, $statusPath, $backup, $true)
-    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
-  }
-  else { [IO.File]::Move($temporary, $statusPath) }
+  $backup = "$statusPath.previous"
+  [AutopromptOwnedJob]::PublishText($statusPath, $temporary, $backup, $json)
 }
 
 $script:owned = $null
@@ -1712,7 +1789,7 @@ try {
     [string]$request.cwd, $environment, $startupDeadline)
   Write-JobStatus 'RUNNING' $true $true @($script:owned.ProcessIds()) $null
   while ($true) {
-    if (Test-Path -LiteralPath $killPath) {
+    if ([AutopromptOwnedJob]::FileExists($killPath)) {
       $terminating = @($script:owned.ProcessIds())
       Write-JobStatus 'STOPPING' $true $true $terminating $null
       $script:owned.Terminate(143)
@@ -1730,6 +1807,7 @@ try {
   if ($script:owned) { $script:owned.Dispose() }
 }
 `
+const WINDOWS_JOB_BOOTSTRAP = "$ErrorActionPreference='Stop';$source=[Console]::In.ReadToEnd();& ([ScriptBlock]::Create($source))"
 
 function createWindowsJobAdapter(options = {}) {
   if (options && REQUIRED_PROCESS_ADAPTER_METHODS.every((method) => typeof options[method] === 'function')) {
@@ -1743,7 +1821,10 @@ function createWindowsJobAdapter(options = {}) {
   const fsImpl = options.fsImpl || fs
   const spawn = options.spawn || childProcess.spawn
   const execFileSync = options.execFileSync || childProcess.execFileSync
-  const powershellPath = options.powershellPath || 'powershell.exe'
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR
+  const powershellPath = options.powershellPath || (typeof systemRoot === 'string' ? path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'powershell.exe')
+  const createCompilerDirectory = options.createWindowsCompilerDirectory || createWindowsCompilerDirectory
+  const controllerEnvironment = options.windowsControllerEnvironment || windowsControllerEnvironment
   const wallNowMs = options.wallNowMs || Date.now
   const monotonicMs = options.monotonicMs || (() => Number(process.hrtime.bigint() / 1000000n))
   const startupDelayMilliseconds = options.startupDelayMilliseconds === undefined ? 0 : options.startupDelayMilliseconds
@@ -2042,7 +2123,7 @@ function createWindowsJobAdapter(options = {}) {
           encoding: 'utf8',
           windowsHide: true,
           timeout: 10000,
-          env: process.env,
+          env: { ...controllerEnvironment(systemRoot), ComSpec: path.win32.join(systemRoot, 'System32', 'cmd.exe') },
         })
         return { supported: true }
       } catch (error) {
@@ -2077,30 +2158,56 @@ function createWindowsJobAdapter(options = {}) {
       }, { fsImpl })
       try { fsImpl.unlinkSync(files.killPath) } catch {}
       const diagnosticDescriptor = fsImpl.openSync(files.stderrPath, 'a', 0o600)
-      let helper
+      let helper, compilerDirectory, helperInputError = null, helperError = null, helperExit = null
       try {
+        compilerDirectory = createCompilerDirectory('autoprompt-job-')
+        const environment = controllerEnvironment(systemRoot)
         helper = spawn(powershellPath, [
           '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-          '-File', helperPath,
+          '-Command', WINDOWS_JOB_BOOTSTRAP,
         ], {
           windowsHide: true,
           // Windows processes are independently owned after creation; keeping
-          // this false avoids Node's detached-console launch losing -File on
-          // legacy Windows PowerShell while unref still releases the JS loop.
+          // this false avoids detached-console launch differences in legacy
+          // Windows PowerShell while unref still releases the JS loop.
           detached: false,
-          stdio: ['ignore', 'ignore', diagnosticDescriptor],
+          stdio: ['pipe', 'ignore', diagnosticDescriptor],
           env: {
-            ...process.env,
+            ...environment,
+            TEMP: compilerDirectory,
+            TMP: compilerDirectory,
+            ComSpec: path.win32.join(systemRoot, 'System32', 'cmd.exe'),
             AUTOPROMPT_JOB_REQUEST: files.requestPath,
             AUTOPROMPT_JOB_STATUS: files.statusPath,
             AUTOPROMPT_JOB_KILL: files.killPath,
+            AUTOPROMPT_JOB_COMPILER_DIRECTORY: compilerDirectory,
+            AUTOPROMPT_JOB_RUNTIME_TEMP: environment.TEMP,
           },
         })
+        helper.once('error', (error) => { helperError = error })
+        helper.once('exit', (code, signal) => { helperExit = { code, signal } })
+        if (!helper.stdin || typeof helper.stdin.end !== 'function') fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper has no owned source pipe')
+        helper.stdin.on('error', (error) => { helperInputError ||= error })
+        helper.stdin.end(WINDOWS_JOB_HELPER, 'utf8', (error) => { if (error) helperInputError ||= error })
+      } catch (error) {
+        if (compilerDirectory && (!helper || !Number.isSafeInteger(helper.pid)) && fsImpl.existsSync(compilerDirectory)) {
+          fsImpl.rmSync(compilerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+        }
+        if (compilerDirectory && helper && Number.isSafeInteger(helper.pid) && fsImpl.existsSync(compilerDirectory)) {
+          error.cleanupConfirmed = false
+          error.retainedCompilerRoot = compilerDirectory
+        }
+        throw error
       } finally {
         fsImpl.closeSync(diagnosticDescriptor)
       }
       if (!helper || !Number.isSafeInteger(helper.pid) || helper.pid < 1) {
-        fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper launch returned no stable helper identity')
+        const error = new ProcessOwnerError('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper launch returned no stable helper identity')
+        if (compilerDirectory && fsImpl.existsSync(compilerDirectory)) {
+          error.cleanupConfirmed = false
+          error.retainedCompilerRoot = compilerDirectory
+        }
+        throw error
       }
       atomicWriteJson(files.launcherPath, {
         schemaVersion: 1,
@@ -2110,15 +2217,16 @@ function createWindowsJobAdapter(options = {}) {
         startupDeadlineAt: spec.startupDeadlineAt,
         helperPid: helper.pid,
       }, { fsImpl })
-      let helperError = null
-      let helperExit = null
-      helper.once('error', (error) => { helperError = error })
-      helper.once('exit', (code, signal) => { helperExit = { code, signal } })
       helper.unref()
       const startupDeadlineMs = Date.parse(spec.startupDeadlineAt)
       const startupBudgetMs = startupDeadlineMs - wallNowMs()
       if (!Number.isFinite(startupDeadlineMs) || !Number.isFinite(startupBudgetMs) || startupBudgetMs <= 0) {
-        fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job startup deadline expired before helper launch')
+        const error = new ProcessOwnerError('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job startup deadline expired before helper launch')
+        if (compilerDirectory && fsImpl.existsSync(compilerDirectory)) {
+          error.cleanupConfirmed = false
+          error.retainedCompilerRoot = compilerDirectory
+        }
+        throw error
       }
       const started = monotonicMs()
       while (true) {
@@ -2127,17 +2235,32 @@ function createWindowsJobAdapter(options = {}) {
           return { rootPid: status.rootPid, groupIdentity: files.groupIdentity, helperPid: status.helperPid }
         }
         if (status && status.status === 'FAILED') {
-          fail('PROCESS_ASSIGNMENT_ESCAPED', `Windows Job assignment failed before resume: ${status.error}`)
+          const error = new ProcessOwnerError('PROCESS_ASSIGNMENT_ESCAPED', `Windows Job assignment failed before resume: ${status.error}`)
+          if (compilerDirectory && fsImpl.existsSync(compilerDirectory)) {
+            error.cleanupConfirmed = false
+            error.retainedCompilerRoot = compilerDirectory
+          }
+          throw error
         }
-        if (helperError || helperExit) {
+        if (helperInputError || helperError || helperExit) {
+          let compilerCleanupError = null
+          if (helperExit && compilerDirectory && fsImpl.existsSync(compilerDirectory)) {
+            try { fsImpl.rmSync(compilerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) } catch (error) { compilerCleanupError = error }
+          }
           const diagnostic = fsImpl.existsSync(files.stderrPath)
             ? fsImpl.readFileSync(files.stderrPath, 'utf8').slice(-8192)
             : ''
-          fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper exited before proving suspended assignment', {
-            cause: helperError && helperError.message,
+          const error = new ProcessOwnerError('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper exited before proving suspended assignment', {
+            cause: (helperInputError || helperError) && (helperInputError || helperError).message,
             exit: helperExit,
             diagnostic,
           })
+          if ((!helperExit && compilerDirectory && fsImpl.existsSync(compilerDirectory)) || compilerCleanupError) {
+            error.cleanupConfirmed = false
+            error.retainedCompilerRoot = compilerDirectory
+            if (compilerCleanupError) error.cleanupCode = String(compilerCleanupError.code || 'cleanup-failed').slice(0, 64)
+          }
+          throw error
         }
         // Always observe status once before enforcing the local polling
         // deadline. Synchronous Windows work (notably an ACL audit in a
@@ -2151,9 +2274,14 @@ function createWindowsJobAdapter(options = {}) {
       const diagnostic = fsImpl.existsSync(files.stderrPath)
         ? fsImpl.readFileSync(files.stderrPath, 'utf8').slice(-8192)
         : ''
-      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper did not prove suspended assignment before timeout', {
+      const error = new ProcessOwnerError('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper did not prove suspended assignment before timeout', {
         diagnostic,
       })
+      if (compilerDirectory && fsImpl.existsSync(compilerDirectory)) {
+        error.cleanupConfirmed = false
+        error.retainedCompilerRoot = compilerDirectory
+      }
+      throw error
     },
     async recoverReservation(reservationId) {
       const files = filesForReservation(reservationId)

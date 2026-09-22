@@ -251,6 +251,24 @@ test('Windows controller environment replaces hostile inherited profile fields a
   }
 })
 
+test('Windows ACL audit resolves inbox PowerShell independently of the restricted controller PATH', t => {
+  const profile = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'audit-env-')))
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
+  for (const name of ['AppData/Local/Temp', 'AppData/Roaming']) fs.mkdirSync(path.join(profile,name), { recursive: true })
+  let called = false
+  const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(executable, argv, options) {
+    called = true
+    assert.equal(executable, path.win32.join('C:', 'Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))
+    assert.equal(options.env.PATH, path.win32.join('C:', 'Windows', 'System32'))
+    assert.equal(options.env.USERPROFILE, windowsFixturePath(profile))
+    assert.equal(options.env.NODE_OPTIONS, undefined)
+    const sid = 'S-1-5-21-123', targets = JSON.parse(options.env.AUTOPROMPT_ACL_AUDIT_PATHS)
+    return { status: 0, stdout: JSON.stringify({ currentName: 'user', currentSid: sid, items: targets.map(target => ({ path: target, owner: sid, ownerSid: sid, protected: true, rules: [{ identity: sid, sid, type: 'Allow' }] })) }), stderr: '' }
+  } } }, undefined, { userInfoHome: profile })
+  assert.equal(safe.auditPrivatePermissions(profile, { recurse: false }).valid, true)
+  assert.equal(called, true)
+})
+
 test('native Windows compiler staging ignores deep home and temp overrides', { skip: process.platform !== 'win32' }, () => {
   const helper = path.resolve(__dirname, '../../agents/codex/workflow/safe-run-root.js')
   const child = `
