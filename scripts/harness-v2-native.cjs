@@ -1361,7 +1361,7 @@ function createLaunch(options) {
   const model = options.model || connection.model
   const controlled = options.toolBoundary ? require('./harness-v2-controlled-tools.cjs') : null
   if (controlled) controlled.load(options.toolBoundary, provider)
-  let argv, requiredResponseFormat = null
+  let argv, requiredResponseFormat = null, windowsTempDirectory = null
   if (provider === 'vscode') {
     argv = require('./harness-v2-vscode-config.cjs').project({ ...options, connection }, env)
   } else if (provider === 'claude') {
@@ -1381,6 +1381,29 @@ function createLaunch(options) {
     if (continuationId) argv.push('--resume', continuationId)
     env.CLAUDE_CONFIG_DIR = path.join(sessionRoot, 'claude')
     env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
+    if (process.platform === 'win32') {
+      // Claude 2.1.270 can stall before initialization when TEMP is a long
+      // Windows path. Keep durable home/session state canonical and place only
+      // transient files under cwd so the Job-owned cwd alias can shorten them.
+      const cwd = path.resolve(options.cwd)
+      let cwdItem, cwdReal
+      try { cwdItem = fs.lstatSync(cwd); cwdReal = fs.realpathSync.native(cwd) } catch {}
+      if (!cwdItem || !cwdItem.isDirectory() || cwdItem.isSymbolicLink() || cwdReal.toLowerCase() !== cwd.toLowerCase()) {
+        fail('PROFILE_INVALID', 'Windows Claude temporary directory requires an existing canonical cwd')
+      }
+      const relativePath = `temp-${sha256(path.resolve(home)).slice(0, 32)}`
+      const temporary = path.join(cwd, relativePath)
+      const relative = path.relative(cwd, temporary)
+      if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        fail('PROFILE_INVALID', 'Windows Claude temporary directory must be a strict cwd descendant')
+      }
+      privateDirectory(temporary)
+      env.TEMP = temporary
+      env.TMP = temporary
+      env.TMPDIR = temporary
+      const body = { schemaVersion: 1, path: temporary, relativePath }
+      windowsTempDirectory = Object.freeze({ ...body, sha256: sha256(JSON.stringify(body)) })
+    }
     if (options.maxTokens !== undefined) {
       if (!Number.isSafeInteger(options.maxTokens) || options.maxTokens <= 0) fail('PROFILE_INVALID', 'Claude output token limit must be a positive integer')
       env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(options.maxTokens)
@@ -1512,6 +1535,8 @@ function createLaunch(options) {
     if (connection.modelProvider) argv.push('--provider', connection.modelProvider)
   }
   if (model && !['deepseek', 'vscode'].includes(provider)) argv.push('--model', safeString(model, 'model'))
-  return { argv, env, stdin: input, cwd: options.cwd, shell: false, ...(requiredResponseFormat ? { requiredResponseFormat } : {}) }
+  return { argv, env, stdin: input, cwd: options.cwd, shell: false,
+    ...(windowsTempDirectory ? { windowsTempDirectory } : {}),
+    ...(requiredResponseFormat ? { requiredResponseFormat } : {}) }
 }
 module.exports = { runtimeDependencyIdentity, portableRuntimeDependencyIdentity, hermesPythonDependencyInventory, hermesRuntimeDependencyIdentity, hermesPortableRuntimeDependencyIdentity, validateEffort, PROVIDERS, HarnessError, fail, descriptor, locateExecutable, executableSha256, executableRuntimePath, executableInvocation, probeExecutable, deepseekSdkCapabilityEvidence, connectionConfig, sanitizeConnection, credentialEnvironment, isolatedEnvironment, createLaunch, readBound, sha256, privateDirectory, writePrivate }

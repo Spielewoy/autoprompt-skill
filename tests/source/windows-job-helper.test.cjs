@@ -288,3 +288,100 @@ test('native Windows owned proxy preserves deep semantic cwd through the nested 
   }
   fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })
+
+test('native Windows owned proxy projects canonical Claude temp through a forced short cwd bridge', { skip: process.platform !== 'win32', timeout: 240000 }, async t => {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'native-proxy-temp-')))
+  const source = path.join(base, 'temp-child.cjs')
+  const marker = path.join(base, 'temp-marker.json')
+  const controlRoot = path.join(base, 'process-control')
+  const proxyRoot = path.join(base, 'proxy-control')
+  fs.mkdirSync(controlRoot); fs.mkdirSync(proxyRoot)
+  const safe = require('../../agents/codex/workflow/safe-run-root.js')
+  safe.ensureWindowsPrivateAcl(base)
+  safe.ensureWindowsPrivateAcl(controlRoot)
+  safe.ensureWindowsPrivateAcl(proxyRoot)
+  const anchorParts = []
+  let anchor = base
+  while (anchor.length < 238) {
+    const part = `short-anchor-${anchorParts.length.toString(16).padStart(2, '0')}`
+    anchorParts.push(part); anchor = path.join(anchor, part)
+  }
+  fs.mkdirSync(anchor, { recursive: true, mode: 0o700 })
+  const relativePath = `temp-${'a'.repeat(32)}`
+  const canonicalTemp = path.join(anchor, relativePath)
+  fs.mkdirSync(canonicalTemp, { recursive: true, mode: 0o700 })
+  assert.ok(anchor.length < 260)
+  assert.ok(canonicalTemp.length >= 260)
+  const descriptorBody = { schemaVersion: 1, path: canonicalTemp, relativePath }
+  const descriptor = { ...descriptorBody, sha256: crypto.createHash('sha256').update(JSON.stringify(descriptorBody)).digest('hex') }
+  fs.writeFileSync(source, [
+    "'use strict'",
+    "const fs=require('node:fs'),path=require('node:path')",
+    "const values={temp:process.env.TEMP,tmp:process.env.TMP,tmpdir:process.env.TMPDIR,cwd:process.cwd(),unrelated:process.env.AP_TEMP_UNRELATED,argv:process.argv.slice(2)} ",
+    "fs.writeFileSync(path.join(process.env.TEMP,'canonical-witness.txt'),'exact-canonical-temp')",
+    `fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify(values))`,
+    "process.stdout.write(JSON.stringify(values)+'\\n')",
+  ].join('\n'))
+  const { ProcessOwner, createWindowsJobAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+  const { OwnedCodexProxyRunner } = require('../../agents/codex/workflow/phase-budget.js')
+  const adapter = createWindowsJobAdapter({ controlRoot, providerPrivateOwnershipRoot: base })
+  const owner = new ProcessOwner({ adapter, registryPath: path.join(base, 'processes.json'), pollMs: 25 })
+  const runner = new OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxyRoot, targetKey: 'canonical-temp-projection', pollMs: 25 })
+  const reservationId = crypto.randomUUID(), sessionId = crypto.randomUUID()
+  const env = prepareProcessLaunchEnvironment(adapter, reservationId, {
+    SystemRoot: process.env.SystemRoot,
+    PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
+    TEMP: canonicalTemp, TMP: canonicalTemp, TMPDIR: canonicalTemp,
+    AP_TEMP_UNRELATED: 'preserve-this-value',
+  })
+  try {
+    const childArgs = ['--temp-argv-witness', 'unchanged-argument']
+    const execution = await runner.run({ executable: process.execPath, argv: [source, ...childArgs], cwd: anchor, env, stdin: '', sessionId, reservationId,
+      windowsTempDirectory: descriptor, onStdoutLine: () => {} })
+    assert.equal(execution.status, 0, execution.stderr)
+    assert.equal(execution.drained, true)
+    const observed = JSON.parse(fs.readFileSync(marker, 'utf8'))
+    assert.equal(observed.temp, observed.tmp)
+    assert.equal(observed.temp, observed.tmpdir)
+    assert.ok(observed.temp.length < 248)
+    assert.notEqual(observed.temp.toLowerCase(), canonicalTemp.toLowerCase())
+    assert.equal(observed.unrelated, 'preserve-this-value')
+    assert.deepEqual(observed.argv, childArgs)
+    assert.equal(fs.readFileSync(path.join(canonicalTemp, 'canonical-witness.txt'), 'utf8'), 'exact-canonical-temp')
+    assert.equal(fs.existsSync(canonicalTemp), true)
+    const reservation = fs.readdirSync(controlRoot, { withFileTypes: true }).find(entry => entry.isDirectory())
+    assert.ok(reservation)
+    const { readChecksummedJson } = require('../../agents/codex/workflow/event-log.js')
+    const launcher = readChecksummedJson(path.join(controlRoot, reservation.name, 'launcher.json'))
+    assert.equal(launcher.requestedCwd.toLowerCase(), anchor.toLowerCase())
+    assert.ok(launcher.physicalCwd.length < 260)
+    assert.equal(fs.existsSync(launcher.cwdBridgeRoot), false)
+    await owner.assertDrained()
+
+    fs.unlinkSync(marker)
+    const badBody = { schemaVersion: 1, path: path.join(base, 'outside-temp'), relativePath }
+    const badDescriptor = { ...badBody, sha256: crypto.createHash('sha256').update(JSON.stringify(badBody)).digest('hex') }
+    const badReservationId = crypto.randomUUID()
+    const badEnv = prepareProcessLaunchEnvironment(adapter, badReservationId, {
+      SystemRoot: process.env.SystemRoot,
+      PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
+      TEMP: canonicalTemp, TMP: canonicalTemp, TMPDIR: canonicalTemp,
+      AP_TEMP_UNRELATED: 'preserve-this-value',
+    })
+    const rejected = await runner.run({ executable: process.execPath, argv: [source, ...childArgs], cwd: anchor, env: badEnv, stdin: '',
+      sessionId: crypto.randomUUID(), reservationId: badReservationId, windowsTempDirectory: badDescriptor, onStdoutLine: () => {} })
+    assert.notEqual(rejected.status, 0)
+    assert.equal(rejected.drained, true)
+    assert.match(String(rejected.stderr || ''), /CODEX_PROXY_REQUEST_INVALID/)
+    assert.equal(fs.existsSync(marker), false)
+    assert.equal(fs.existsSync(path.join(base, 'outside-temp', 'canonical-witness.txt')), false)
+  } finally {
+    try { await runner.stop({ sessionId, reason: 'canonical temp projection cleanup' }) } catch {}
+    try {
+      await owner.cancelAll({ reason: 'canonical temp projection cleanup', graceMs: 0, killMs: 10000, waitForPending: true })
+    } finally {
+      await owner.assertDrained()
+    }
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
+})

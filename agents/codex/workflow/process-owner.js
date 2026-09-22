@@ -457,6 +457,9 @@ class ProcessOwner {
     if (spec.shell === true && spec.explicitShellMode !== true) {
       fail('LAUNCH_SPEC_INVALID', 'shell launch requires explicitShellMode')
     }
+    if (spec.requireShortCwd !== undefined && typeof spec.requireShortCwd !== 'boolean') {
+      fail('LAUNCH_SPEC_INVALID', 'short cwd requirement must be boolean')
+    }
     if (spec.env !== undefined && (!spec.env || typeof spec.env !== 'object' || Array.isArray(spec.env) ||
         Object.entries(spec.env).some(([name, value]) => !name || name.includes('\0') ||
           typeof value !== 'string' || value.includes('\0')))) {
@@ -554,6 +557,7 @@ class ProcessOwner {
         stdin: spec.stdin,
         stdout: spec.stdout,
         stderr: spec.stderr,
+        ...(spec.requireShortCwd === true ? { requireShortCwd: true } : {}),
       })
     } catch (error) {
       // Once the durable reservation admits the physical operation, neither a
@@ -1974,8 +1978,8 @@ function createWindowsJobAdapter(options = {}) {
     if (fsImpl.existsSync(bridge.physicalCwd)) fsImpl.unlinkSync(bridge.physicalCwd)
     if (fsImpl.existsSync(bridge.root)) fsImpl.rmdirSync(bridge.root)
   }
-  const createCwdBridge = (requestedCwd) => {
-    if (requestedCwd.length < 260) return null
+  const createCwdBridge = (requestedCwd, requireShortCwd = false) => {
+    if (!requireShortCwd && requestedCwd.length < 260) return null
     const before = inspectPathNoFollow(requestedCwd, { fsImpl })
     if (!before.exists || !before.realpath || !before.identity) {
       fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job requested cwd is not one physical directory')
@@ -2058,7 +2062,9 @@ function createWindowsJobAdapter(options = {}) {
     const fields = [request.physicalCwd, request.cwdBridgeRoot, request.cwdIdentity]
     const present = fields.filter(value => value !== undefined).length
     if (present === 0) return
-    if (present !== fields.length || typeof request.cwd !== 'string' || !path.isAbsolute(request.cwd) || request.cwd.length < 260 ||
+    if (present !== fields.length || typeof request.cwd !== 'string' || !path.isAbsolute(request.cwd) ||
+        (request.cwd.length < 260 && request.requireShortCwd !== true) ||
+        (request.requireShortCwd !== undefined && request.requireShortCwd !== true) ||
         typeof request.physicalCwd !== 'string' || !path.isAbsolute(request.physicalCwd) || request.physicalCwd.length >= 260 ||
         typeof request.cwdBridgeRoot !== 'string' || !path.isAbsolute(request.cwdBridgeRoot) ||
         path.dirname(request.physicalCwd) !== request.cwdBridgeRoot || !request.cwdIdentity || typeof request.cwdIdentity !== 'object') {
@@ -2183,10 +2189,12 @@ function createWindowsJobAdapter(options = {}) {
         const requestBridge = request.physicalCwd === undefined ? null : {
           requestedCwd: request.cwd, physicalCwd: request.physicalCwd,
           cwdBridgeRoot: request.cwdBridgeRoot, cwdIdentity: request.cwdIdentity,
+          requireShortCwd: request.requireShortCwd === true,
         }
         const launcherBridge = launcher.physicalCwd === undefined ? null : {
           requestedCwd: launcher.requestedCwd, physicalCwd: launcher.physicalCwd,
           cwdBridgeRoot: launcher.cwdBridgeRoot, cwdIdentity: launcher.cwdIdentity,
+          requireShortCwd: launcher.requireShortCwd === true,
         }
         if (stableStringify(requestBridge) !== stableStringify(launcherBridge)) {
           return { state: 'UNKNOWN', evidence: { reason: 'launcher-cwd-bridge-foreign' } }
@@ -2286,7 +2294,7 @@ function createWindowsJobAdapter(options = {}) {
       const requestedCwd = path.resolve(spec.cwd || process.cwd())
       let cwdBridge
       try {
-        cwdBridge = createCwdBridge(requestedCwd)
+        cwdBridge = createCwdBridge(requestedCwd, spec.requireShortCwd === true)
         atomicWriteJson(files.requestPath, {
           schemaVersion: 1,
           reservationId: spec.reservationId,
@@ -2299,6 +2307,7 @@ function createWindowsJobAdapter(options = {}) {
           executable: spec.executable,
           argv: spec.argv,
           cwd: requestedCwd,
+          ...(spec.requireShortCwd === true ? { requireShortCwd: true } : {}),
           ...(cwdBridge ? { physicalCwd: cwdBridge.physicalCwd, cwdBridgeRoot: cwdBridge.root,
             cwdIdentity: cwdBridge.requestedIdentity } : {}),
           // The helper has its own inherited control environment. The owned
@@ -2390,6 +2399,7 @@ function createWindowsJobAdapter(options = {}) {
         reservationBindingHash: sha256(stableStringify(reservationBinding)),
         startupDeadlineAt: spec.startupDeadlineAt,
         helperPid: helper.pid,
+        ...(spec.requireShortCwd === true ? { requireShortCwd: true } : {}),
         ...(cwdBridge ? { requestedCwd, physicalCwd: cwdBridge.physicalCwd, cwdBridgeRoot: cwdBridge.root,
           cwdIdentity: cwdBridge.requestedIdentity } : {}),
       }, { fsImpl })

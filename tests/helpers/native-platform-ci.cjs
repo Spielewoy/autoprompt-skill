@@ -18,6 +18,7 @@ const WINDOWS_NATIVE_CASES = Object.freeze([
   'Windows Job bridge compiles and preserves atomic status publication on native long paths',
   'native Windows Job ownership survives deep durable paths and hostile home variables',
   'native Windows owned proxy preserves deep semantic cwd through the nested child launch',
+  'native Windows owned proxy projects canonical Claude temp through a forced short cwd bridge',
   'native Windows host NUL basic query records exact and oversized buffer results',
   'native Windows Node pipe diagnostic records stdio and fork IPC support with owned job drain',
   'native Windows NUL diagnostic records exact device access under an AppContainer token',
@@ -55,6 +56,7 @@ const WINDOWS_NATIVE_CASES = Object.freeze([
 const DIAGNOSTIC_STAGES = Object.freeze([
   Object.freeze({ id: 'infra', cases: Object.freeze([
     'native Windows owned proxy preserves deep semantic cwd through the nested child launch',
+    'native Windows owned proxy projects canonical Claude temp through a forced short cwd bridge',
   ]) }),
   Object.freeze({ id: 'direct', cases: Object.freeze([
     'claude closed native capability: full canonical role schema is accepted and validated',

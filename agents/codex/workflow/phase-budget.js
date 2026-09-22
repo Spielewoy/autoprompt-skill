@@ -9821,6 +9821,66 @@ function readBoundedRegularFileTail(absolutePath, maximumBytes, label) {
   }
 }
 
+function windowsTempDescriptorBody(descriptor) {
+  return { schemaVersion: descriptor.schemaVersion, path: descriptor.path, relativePath: descriptor.relativePath }
+}
+
+function validateWindowsTempDescriptorShape(descriptor) {
+  if (!descriptor || typeof descriptor !== 'object' || Array.isArray(descriptor) ||
+      Object.keys(descriptor).sort().join(',') !== 'path,relativePath,schemaVersion,sha256' ||
+      descriptor.schemaVersion !== 1 || typeof descriptor.path !== 'string' || !path.isAbsolute(descriptor.path) ||
+      typeof descriptor.relativePath !== 'string' || !/^temp-[a-f0-9]{32}$/.test(descriptor.relativePath) || path.isAbsolute(descriptor.relativePath) ||
+      !/^[a-f0-9]{64}$/.test(descriptor.sha256 || '') ||
+      hashText(JSON.stringify(windowsTempDescriptorBody(descriptor))) !== descriptor.sha256) {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude temporary directory descriptor is invalid')
+  }
+  return descriptor
+}
+
+function projectWindowsClaudeTempEnvironment({ descriptor, requestedCwd, effectiveCwd, environment, fsImpl = fs } = {}) {
+  validateWindowsTempDescriptorShape(descriptor)
+  if (typeof requestedCwd !== 'string' || !path.isAbsolute(requestedCwd) ||
+      typeof effectiveCwd !== 'string' || !path.isAbsolute(effectiveCwd) ||
+      !environment || typeof environment !== 'object' || Array.isArray(environment)) {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude temporary directory projection inputs are invalid')
+  }
+  const normalize = value => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value)
+  const requestedBefore = inspectPathNoFollow(requestedCwd, { fsImpl })
+  const temporaryBefore = inspectPathNoFollow(descriptor.path, { fsImpl })
+  const relative = path.relative(path.resolve(requestedCwd), path.resolve(descriptor.path))
+  const temporaryEnvironment = Object.entries(environment).filter(([key]) => ['TEMP', 'TMP', 'TMPDIR'].includes(key.toUpperCase()))
+  if (!requestedBefore.exists || !requestedBefore.identity || !temporaryBefore.exists || !temporaryBefore.identity ||
+      !relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) ||
+      relative !== descriptor.relativePath || normalize(path.join(requestedCwd, descriptor.relativePath)) !== normalize(descriptor.path) ||
+      temporaryEnvironment.length !== 3 || temporaryEnvironment.some(([key]) => !['TEMP', 'TMP', 'TMPDIR'].includes(key)) ||
+      ['TEMP', 'TMP', 'TMPDIR'].some(key => typeof environment[key] !== 'string' || normalize(environment[key]) !== normalize(descriptor.path))) {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude temporary directory is not bound to its requested cwd and environment')
+  }
+  let effectiveItem, effectiveReal, projectedItem, projectedReal
+  const projected = path.join(effectiveCwd, descriptor.relativePath)
+  try {
+    effectiveItem = fsImpl.lstatSync(effectiveCwd, { bigint: true })
+    effectiveReal = fsImpl.realpathSync.native(effectiveCwd)
+    projectedItem = fsImpl.lstatSync(projected, { bigint: true })
+    projectedReal = fsImpl.realpathSync.native(projected)
+  } catch {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude projected temporary directory is unavailable')
+  }
+  const requestedAfter = inspectPathNoFollow(requestedCwd, { fsImpl })
+  const temporaryAfter = inspectPathNoFollow(descriptor.path, { fsImpl })
+  const sameIdentity = (left, right) => Boolean(left && right && String(left.dev) === String(right.dev) && String(left.ino) === String(right.ino))
+  if ((!effectiveItem.isDirectory() && !effectiveItem.isSymbolicLink()) ||
+      normalize(effectiveReal) !== normalize(requestedBefore.realpath) || projected.length >= 248 ||
+      !projectedItem.isDirectory() || projectedItem.isSymbolicLink() ||
+      normalize(projectedReal) !== normalize(temporaryBefore.realpath) ||
+      !sameIdentity(temporaryBefore.identity, projectedItem) ||
+      !requestedAfter.exists || stableStringify(requestedAfter.identity) !== stableStringify(requestedBefore.identity) ||
+      !temporaryAfter.exists || stableStringify(temporaryAfter.identity) !== stableStringify(temporaryBefore.identity)) {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude projected temporary directory changed identity or escaped its shallow cwd')
+  }
+  return { ...environment, TEMP: projected, TMP: projected, TMPDIR: projected }
+}
+
 class OwnedCodexProxyRunner {
   constructor(options = {}) {
     if (!options.processOwner || typeof options.processOwner.launch !== 'function' ||
@@ -9886,11 +9946,26 @@ class OwnedCodexProxyRunner {
       }
     }
     const childSpec = launchResource?.launch || spec
+    const windowsTempDirectory = childSpec.windowsTempDirectory
+    if (windowsTempDirectory !== undefined) {
+      if (process.platform !== 'win32') {
+        try { await launchResource?.cleanup?.() } catch {}
+        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude temporary directory descriptor is not supported on this platform')
+      }
+      try { validateWindowsTempDescriptorShape(windowsTempDirectory) } catch (error) {
+        try { await launchResource?.cleanup?.() } catch {}
+        throw error
+      }
+    }
     const requestPath = path.join(sessionRoot, 'request.json')
     const stdoutPath = path.join(sessionRoot, 'stdout.jsonl')
     const stderrPath = path.join(sessionRoot, 'stderr.log')
     const statusPath = path.join(sessionRoot, 'status.json')
-    const argvHash = hashText(JSON.stringify({ executable: childSpec.executable, argv: childSpec.argv }))
+    const argvHash = hashText(JSON.stringify({
+      executable: childSpec.executable,
+      argv: childSpec.argv,
+      ...(windowsTempDirectory ? { windowsTempDirectory } : {}),
+    }))
     const sequence = ++this.controlSequence
     try { fs.writeFileSync(requestPath, `${JSON.stringify({
       schemaVersion: 2,
@@ -9899,6 +9974,7 @@ class OwnedCodexProxyRunner {
       sequence,
       executable: childSpec.executable,
       argv: childSpec.argv,
+      ...(windowsTempDirectory ? { windowsTempDirectory } : {}),
       argvHash,
       cwd: childSpec.cwd,
       stdin: childSpec.stdin || '',
@@ -9924,6 +10000,7 @@ class OwnedCodexProxyRunner {
       reservationId: spec.reservationId,
       targetKey: this.targetKey,
       forWork: false,
+      ...(windowsTempDirectory ? { requireShortCwd: true } : {}),
     }) } catch (error) {
       try { await launchResource?.cleanup?.() } catch {}
       throw error
@@ -10127,6 +10204,26 @@ async function runOwnedCodexProxy(requestPath) {
       !/^[a-f0-9]{64}$/.test(request.argvHash || '')) {
     throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy request is invalid')
   }
+  let windowsTempDirectory
+  try {
+    if (request.windowsTempDirectory !== undefined) {
+      if (process.platform !== 'win32') {
+        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude temporary directory descriptor is not supported on this platform')
+      }
+      windowsTempDirectory = validateWindowsTempDescriptorShape(request.windowsTempDirectory)
+    }
+    const expectedArgvHash = windowsTempDirectory && hashText(JSON.stringify({
+      executable: request.executable,
+      argv: request.argv,
+      windowsTempDirectory,
+    }))
+    if (windowsTempDirectory && expectedArgvHash !== request.argvHash) {
+      throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy executable request binding is invalid')
+    }
+  } catch (error) {
+    if (error instanceof SupervisorIntegrationError) throw error
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy Windows temporary directory binding is invalid')
+  }
   for (const outputPath of [request.stdoutPath, request.stderrPath, request.statusPath]) {
     if (path.dirname(path.resolve(outputPath)) !== path.dirname(path.resolve(requestPath))) {
       throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy output escaped its control directory')
@@ -10137,6 +10234,7 @@ async function runOwnedCodexProxy(requestPath) {
   let child = null
   let settled = false
   let effectiveCwd = request.cwd
+  let childEnvironment = process.env
   const boundedFailure = error => Object.freeze({
     type: String(error?.name || 'Error').slice(0, 64),
     code: String(error?.code || 'RUNTIME_FAILURE').slice(0, 64),
@@ -10200,12 +10298,20 @@ async function runOwnedCodexProxy(requestPath) {
           inheritedReal.toLowerCase() !== before.realpath.toLowerCase() || effectiveCwd.length >= 260) {
         throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy inherited cwd does not bind its requested physical directory')
       }
+      if (windowsTempDirectory) {
+        childEnvironment = projectWindowsClaudeTempEnvironment({
+          descriptor: windowsTempDirectory,
+          requestedCwd: request.cwd,
+          effectiveCwd,
+          environment: process.env,
+        })
+      }
     } catch (error) { failBeforeChild(error) }
   }
   try {
     child = childProcess.spawn(request.executable, request.argv, {
       cwd: effectiveCwd,
-      env: process.env,
+      env: childEnvironment,
       shell: false,
       windowsHide: true,
       stdio: [relay || 'pipe', 'pipe', 'pipe'],
@@ -33729,6 +33835,7 @@ module.exports = {
   renderPlanArtifact,
   runSupervisorCli,
   runOwnedCodexProxy,
+  projectWindowsClaudeTempEnvironment,
   safeEnvironmentFactory,
   selectWorkRecipe,
   serializeError,

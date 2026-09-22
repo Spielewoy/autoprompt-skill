@@ -11,11 +11,12 @@ const { WINDOWS_NATIVE_CASES, DIAGNOSTIC_STAGES, assertHostPrimitiveCases, runDi
 
 test('Claude diagnostic plan failfasts infrastructure and direct checks before packed activation', () => {
   assert.deepEqual(DIAGNOSTIC_STAGES.map(stage => stage.id), ['infra', 'direct', 'packed'])
-  assert.equal(DIAGNOSTIC_STAGES[0].cases.length, 1)
+  assert.equal(DIAGNOSTIC_STAGES[0].cases.length, 2)
   assert.equal(DIAGNOSTIC_STAGES[1].cases.length, 1)
   assert.equal(DIAGNOSTIC_STAGES[2].cases.length, 1)
   assert.deepEqual(DIAGNOSTIC_STAGES.flatMap(stage => stage.cases), [
     'native Windows owned proxy preserves deep semantic cwd through the nested child launch',
+    'native Windows owned proxy projects canonical Claude temp through a forced short cwd bridge',
     'claude closed native capability: full canonical role schema is accepted and validated',
     'packed actual Claude activation requires all local native observations before mission admission',
   ])

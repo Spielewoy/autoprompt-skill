@@ -174,3 +174,119 @@ test('Windows Job adapter cleans only compiler roots whose helper is absent or o
     options: { recursive: true, force: true, maxRetries: 10, retryDelay: 100 },
   })
 })
+
+function claudeTempDescriptor(cwd, relativePath = `temp-${'a'.repeat(32)}`) {
+  const body = { schemaVersion: 1, path: path.join(cwd, relativePath), relativePath }
+  return { ...body, sha256: require('node:crypto').createHash('sha256').update(JSON.stringify(body)).digest('hex') }
+}
+
+function claudeTempFixture(t) {
+  const root = temporary(t, 'owned-claude-temp-')
+  const cwd = path.join(root, 'canonical'), alias = path.join(root, 'short')
+  fs.mkdirSync(cwd)
+  fs.symlinkSync(cwd, alias, process.platform === 'win32' ? 'junction' : 'dir')
+  const descriptor = claudeTempDescriptor(cwd)
+  fs.mkdirSync(descriptor.path)
+  const environment = { TEMP: descriptor.path, TMP: descriptor.path, TMPDIR: descriptor.path,
+    HOME: path.join(cwd, 'home'), PATH: descriptor.path, FIXTURE_CREDENTIAL: descriptor.path }
+  const project = overrides => require('../../agents/codex/workflow/phase-budget.js')
+    .projectWindowsClaudeTempEnvironment({ descriptor, requestedCwd: cwd, effectiveCwd: alias,
+      environment, ...overrides })
+  return { root, cwd, alias, descriptor, environment, project }
+}
+
+test('owned Claude temp projection preserves backing storage and unrelated environment', t => {
+  const f = claudeTempFixture(t), before = { ...f.environment }
+  const projected = f.project()
+  const physicalSpelling = path.join(f.alias, f.descriptor.relativePath)
+  assert.notEqual(projected, f.environment)
+  assert.deepEqual(f.environment, before)
+  assert.deepEqual(projected, { ...before, TEMP: physicalSpelling, TMP: physicalSpelling, TMPDIR: physicalSpelling })
+  fs.writeFileSync(path.join(projected.TEMP, 'actual-child-bytes'), 'private-temp-content')
+  assert.equal(fs.readFileSync(path.join(f.descriptor.path, 'actual-child-bytes'), 'utf8'), 'private-temp-content')
+  fs.unlinkSync(f.alias)
+  assert.equal(fs.readFileSync(path.join(f.descriptor.path, 'actual-child-bytes'), 'utf8'), 'private-temp-content')
+})
+
+test('owned Claude temp projection refuses forged bindings and foreign environment', t => {
+  const f = claudeTempFixture(t)
+  const foreign = path.join(f.root, 'foreign')
+  fs.mkdirSync(foreign)
+  const badDescriptors = [
+    { ...f.descriptor, sha256: '0'.repeat(64) },
+    { ...f.descriptor, extra: true },
+    claudeTempDescriptor(foreign),
+    claudeTempDescriptor(f.cwd, '..'),
+    { ...f.descriptor, relativePath: `temp-${'b'.repeat(32)}` },
+  ]
+  for (const descriptor of badDescriptors) assert.throws(() => f.project({ descriptor }), { code: 'CODEX_PROXY_REQUEST_INVALID' })
+  for (const key of ['TEMP', 'TMP', 'TMPDIR']) {
+    assert.throws(() => f.project({ environment: { ...f.environment, [key]: foreign } }), { code: 'CODEX_PROXY_REQUEST_INVALID' })
+    const missing = { ...f.environment }; delete missing[key]
+    assert.throws(() => f.project({ environment: missing }), { code: 'CODEX_PROXY_REQUEST_INVALID' })
+  }
+  assert.throws(() => f.project({ environment: { ...f.environment, temp: foreign } }), { code: 'CODEX_PROXY_REQUEST_INVALID' })
+  assert.equal(fs.readdirSync(foreign).length, 0)
+})
+
+test('owned Claude temp projection rejects redirected canonical storage and foreign cwd aliases', t => {
+  const f = claudeTempFixture(t)
+  const foreign = path.join(f.root, 'foreign')
+  fs.mkdirSync(foreign)
+  fs.mkdirSync(path.join(foreign, f.descriptor.relativePath))
+  assert.throws(() => f.project({ effectiveCwd: foreign }), { code: 'CODEX_PROXY_REQUEST_INVALID' })
+  fs.rmdirSync(f.descriptor.path)
+  fs.symlinkSync(foreign, f.descriptor.path, process.platform === 'win32' ? 'junction' : 'dir')
+  assert.throws(() => f.project(), { code: 'RUN_RECORD_UNSAFE' })
+  fs.unlinkSync(f.descriptor.path)
+  fs.writeFileSync(f.descriptor.path, 'not-a-directory')
+  assert.throws(() => f.project(), { code: 'RUN_RECORD_UNSAFE' })
+})
+
+test('owned Claude temp projection rejects aliases that still exceed the Windows path bound', t => {
+  const f = claudeTempFixture(t)
+  const parent = path.join(f.root, 'x'.repeat(100), 'y'.repeat(100))
+  fs.mkdirSync(parent, { recursive: true })
+  const longAlias = path.join(parent, 'alias-still-too-long')
+  fs.symlinkSync(f.cwd, longAlias, process.platform === 'win32' ? 'junction' : 'dir')
+  assert.ok(path.join(longAlias, f.descriptor.relativePath).length >= 248)
+  assert.throws(() => f.project({ effectiveCwd: longAlias }), { code: 'CODEX_PROXY_REQUEST_INVALID' })
+})
+
+test('Claude temp allocation stays per-launch without relocating home or continuation state', t => {
+  const native = require('../../scripts/harness-v2-native.cjs')
+  const root = temporary(t, 'claude-temp-allocation-'), cwd = path.join(root, 'cwd')
+  const sessionRoot = path.join(root, 'session')
+  fs.mkdirSync(cwd)
+  const launches = [1, 2].map(number => {
+    const home = path.join(root, `launch-${number}`)
+    const launch = native.createLaunch({ provider: 'claude', home, sessionRoot, cwd, targetPath: root,
+      prompt: 'Return one object.', input: 'fixture', toolFree: true,
+      connection: { model: 'claude-sonnet-4-6' }, environment: { PATH: process.env.PATH } })
+    assert.equal(launch.cwd, cwd)
+    assert.equal(launch.env.HOME, home)
+    assert.equal(launch.env.USERPROFILE, home)
+    assert.equal(launch.env.CLAUDE_CONFIG_DIR, path.join(sessionRoot, 'claude'))
+    assert.equal(launch.argv[launch.argv.indexOf('--settings') + 1], path.join(home, 'settings.json'))
+    assert.equal(launch.env.TEMP, launch.env.TMP)
+    assert.equal(launch.env.TEMP, launch.env.TMPDIR)
+    assert.ok(fs.statSync(launch.env.TEMP).isDirectory())
+    if (process.platform === 'win32') {
+      assert.match(launch.windowsTempDirectory.relativePath, /^temp-[a-f0-9]{32}$/)
+      assert.deepEqual(launch.windowsTempDirectory, claudeTempDescriptor(cwd, launch.windowsTempDirectory.relativePath))
+      assert.equal(launch.env.TEMP, launch.windowsTempDirectory.path)
+      assert.equal(path.dirname(launch.env.TEMP), cwd)
+    } else {
+      assert.equal(launch.windowsTempDirectory, undefined)
+      assert.equal(launch.env.TEMP, path.join(home, 'tmp'))
+    }
+    return launch
+  })
+  assert.notEqual(launches[0].env.TEMP, launches[1].env.TEMP)
+  const home = path.join(root, 'other-provider')
+  const other = native.createLaunch({ provider: 'opencode', home, sessionRoot, cwd, targetPath: root,
+    prompt: 'Return one object.', input: 'fixture', toolFree: true,
+    connection: {}, environment: { PATH: process.env.PATH } })
+  assert.equal(other.windowsTempDirectory, undefined)
+  assert.equal(other.env.TEMP, path.join(home, 'tmp'))
+})
