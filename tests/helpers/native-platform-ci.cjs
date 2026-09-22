@@ -154,7 +154,8 @@ async function main() {
     process.stdout.write('macOS: native filesystem/process tests enabled. Native Claude activation remains unavailable; VM runtime is required.\n')
     return
   }
-  assert.equal(action, 'run', 'Expected platform, doctor, kilo-shell, prepare, macos-primitives or run')
+  assert.ok(['run', 'diagnose-claude'].includes(action), 'Expected platform, doctor, kilo-shell, prepare, macos-primitives, run or diagnose-claude')
+  const diagnostic = action === 'diagnose-claude'
   assert.ok(['linux', 'win32'].includes(process.platform))
   const version = process.env.CLAUDE_CODE_VERSION
   assert.match(version || '', /^\d+\.\d+\.\d+$/)
@@ -168,15 +169,30 @@ async function main() {
   assert.match(observedVersion, new RegExp(`(?:^|\\s)${version.replaceAll('.', '\\.')}\\s`))
   const evidence = { platform: process.platform, architecture: process.arch, node: process.version,
     package: packageName, packageVersion: metadata.version, observedVersion, executable,
-    sandbox: await boundary.probeCommandSandbox(), nativeCapabilitiesPassed: false }
+    sandbox: await boundary.probeCommandSandbox(), nativeCapabilitiesPassed: false,
+    ...(diagnostic ? { diagnosticOnly: true } : {}) }
   const publish = () => fs.writeFileSync('native-platform-evidence.json', JSON.stringify(evidence, null, 2) + '\n')
   publish()
   assert.equal(evidence.sandbox.supported, true, `Native sandbox prerequisite failed: ${JSON.stringify(evidence.sandbox)}`)
-  const { code, output } = await runTests(['--test', '--test-reporter=tap', '--test-concurrency=1',
+  const diagnosticCases = [
+    'claude closed native capability: full canonical role schema is accepted and validated',
+    'packed actual Claude activation requires all local native observations before mission admission',
+  ]
+  const selection = diagnostic ? ['--test-name-pattern', `^(?:${diagnosticCases.join('|')})$`] : []
+  const { code, output } = await runTests(['--test', '--test-reporter=tap', '--test-concurrency=1', ...selection,
     'tests/source/harness-v2-claude-capability-native.test.cjs',
     'tests/source/harness-v2-installed-canary-native.test.cjs'],
   { ...process.env, AUTOPROMPT_CLAUDE_TEST_CLI: executable, AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1' }, 'native-platform-tests.log')
   evidence.exitCode = code
+  if (diagnostic) {
+    // A scoped diagnostic never certifies the complete provider capability set.
+    evidence.diagnosticOnly = true
+    evidence.selectedCases = diagnosticCases
+    publish()
+    assert.equal(code, 0, 'Selected native Claude diagnostics failed')
+    for (const name of diagnosticCases) assertNamedCase(output, name)
+    return
+  }
   evidence.skipped = /# SKIP\b/i.test(output) || !/^# skipped 0\s*$/m.test(output)
   evidence.publicActivationPassed = false
   if (code === 0 && !evidence.skipped) {

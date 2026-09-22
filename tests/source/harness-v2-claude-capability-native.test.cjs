@@ -138,7 +138,9 @@ async function scenario(t, options = {}) {
     record.onUsageDelta = (delta, cumulative, evidence) => { debits.push(delta); return overrides?.onUsageDelta ? overrides.onUsageDelta(delta, cumulative, evidence) : { continue: true } }
     record.signal = overrides?.signal || AbortSignal.timeout(90000)
     const result = await adapter.launch(record)
-    assert.ok(service.requests.some(request => JSON.stringify(request.body).includes(`CLOSED_CANARY_CHALLENGE:${f.challenge}`)), 'the actual native tool result omitted its closed-canary challenge')
+    const challengeObserved = service.requests.some(request => JSON.stringify(request.body).includes(`CLOSED_CANARY_CHALLENGE:${f.challenge}`))
+    if (!challengeObserved) t.diagnostic(`CLAUDE_TOOL_RESULT_DIAGNOSTIC:${JSON.stringify(boundedClaudeToolDiagnostics(service, result))}`)
+    assert.ok(challengeObserved, 'the actual native tool result omitted its closed-canary challenge')
     return result
   }
   return { ...f, candidate, secret, marker, service, binding, owner, adapter, run, debits, command }
@@ -153,6 +155,48 @@ function assertSuccessful(result) {
   assert.match(result.contextId, /^[0-9a-f-]{36}$/i)
   assert.ok(result.transportEvidence.eventCount > 0)
   assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/)
+}
+
+function boundedClaudeToolDiagnostics(service, result) {
+  const scalar = value => typeof value === 'string' ? value.slice(0, 256)
+    : typeof value === 'boolean' || Number.isFinite(value) ? value : undefined
+  const bounded = value => {
+    const text = String(value ?? ''), bytes = Buffer.byteLength(text)
+    return { text: text.slice(0, 4096), bytes, truncated: bytes > Buffer.byteLength(text.slice(0, 4096)) }
+  }
+  const toolResults = []
+  for (const [requestOrdinal, request] of service.requests.entries()) {
+    if (requestOrdinal < service.requests.length - 8) continue
+    for (const message of Array.isArray(request.body?.messages) ? request.body.messages.slice(-8) : []) {
+      for (const block of Array.isArray(message?.content) ? message.content.slice(-8) : []) {
+        if (block?.type !== 'tool_result') continue
+        const parts = typeof block.content === 'string' ? [block.content] : Array.isArray(block.content)
+          ? block.content.filter(item => item?.type === 'text' && typeof item.text === 'string').map(item => item.text) : []
+        const content = parts.slice(0, 4).map(text => {
+          try {
+            const parsed = JSON.parse(text)
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return {
+              parsed: true, tool: scalar(parsed.tool), status: scalar(parsed.status), exitCode: scalar(parsed.exitCode),
+              code: scalar(parsed.code), executionState: scalar(parsed.executionState), output: bounded(parsed.output),
+              outputSha256: scalar(parsed.outputSha256),
+            }
+          } catch {}
+          return { parsed: false, content: bounded(text) }
+        })
+        toolResults.push({ requestOrdinal: requestOrdinal + 1, toolUseId: scalar(block.tool_use_id),
+          isError: block.is_error === true, content })
+        if (toolResults.length > 8) toolResults.shift()
+      }
+    }
+  }
+  return {
+    toolResults: toolResults.slice(-8),
+    serviceErrors: service.errors.slice(-8).map(bounded),
+    adapterResult: result && { ok: scalar(result.ok), contextId: scalar(result.contextId),
+      eventStreamHash: scalar(result.transportEvidence?.eventStreamHash),
+      policySha256: scalar(result.toolBoundaryEvidence?.policySha256),
+      toolReceiptCount: result.toolBoundaryEvidence?.receiptHashes?.length },
+  }
 }
 
 const nativeOptions = { skip: !CLI, timeout: 240000 }
@@ -402,6 +446,9 @@ test('claude closed native capability: isolated checker receives read-only candi
   checkerRecord.signal = AbortSignal.timeout(90000)
   const result = await checkerAdapter.launch(checkerRecord)
   assertSuccessful(result)
+  if (!fs.existsSync(path.join(checkerScratch, 'checker.txt'))) {
+    t.diagnostic(`CLAUDE_CHECKER_RECEIPT_DIAGNOSTIC:${JSON.stringify(boundedClaudeToolDiagnostics(f.service, result))}`)
+  }
   assert.equal(fs.readFileSync(frozenCandidate, 'utf8'), f.marker)
   assert.equal(fs.readFileSync(path.join(checkerScratch, 'checker.txt'), 'utf8'), 'checked')
 })

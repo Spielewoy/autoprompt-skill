@@ -5,6 +5,7 @@ const crypto = require('node:crypto')
 const cp = require('node:child_process')
 const { ensureWindowsPrivateAcl } = require('./safe-run-root.js')
 const { createWindowsAppContainerLauncher, WindowsAppContainerError, parseMsysSharedId } = require('./windows-appcontainer.js')
+const { failureDiagnostic } = require('./windows-appcontainer-probe.js')
 const workerBundle = require('./windows-worker-loader.js')
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 // Copy a closed executable dependency set into the existing read-only runtime.
@@ -207,7 +208,7 @@ async function probeWindowsAppContainer() {
   try { return (await ensureWorkerAdmission()).result }
   catch (error) {
     if (error.canaryResult) return error.canaryResult
-    return { supported: false, backend: 'windows-appcontainer', code: error.code || 'WINDOWS_RUNTIME_UNAVAILABLE', diagnostic: { phase: 'worker-admission', message: String(error.message || 'Worker admission failed').slice(0, 1024) }, ...(error.cleanupConfirmed === false ? { cleanupConfirmed: false, recoveryRoot: error.recoveryRoot || error.retainedHelperRoot || error.retainedRuntimeRoot } : {}) }
+    return { supported: false, backend: 'windows-appcontainer', code: error.code || 'WINDOWS_RUNTIME_UNAVAILABLE', diagnostic: failureDiagnostic(error, 'worker-admission'), ...(error.cleanupConfirmed === false ? { cleanupConfirmed: false, recoveryRoot: error.recoveryRoot || error.retainedHelperRoot || error.retainedRuntimeRoot } : {}) }
   }
 }
 async function runWindowsAppContainerCommand(policy, args, options = {}) {

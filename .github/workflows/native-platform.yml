@@ -6,6 +6,11 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      claude_diagnostic:
+        description: 'Diagnose the direct and packed native Claude paths on Windows x64 and ARM64'
+        required: false
+        default: false
+        type: boolean
       msys_mapping:
         description: 'Run the manual-only native MSYS mapping diagnostic'
         required: false
@@ -38,7 +43,7 @@ permissions:
 
 jobs:
   platform-primitives:
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.msys_mapping != true && inputs.msys_pipe_trace != true) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.claude_diagnostic != true && inputs.msys_mapping != true && inputs.msys_pipe_trace != true) }}
     name: Platform and installer / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
     # The one diagnostic producer may compile a separate traced DLL after the
@@ -674,13 +679,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      matrix:
-        runner:
-          - { os: ubuntu-latest, arch: x64 }
-          - { os: ubuntu-24.04-arm, arch: arm64 }
-          - { os: windows-latest, arch: x64 }
-          - { os: windows-11-arm, arch: arm64 }
-        node: ['20.x', '24.x']
+      matrix: ${{ fromJSON(inputs.claude_diagnostic == true && '{"runner":[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["24.x"]}' || '{"runner":[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"},{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}') }}
     env:
       CLAUDE_CODE_VERSION: '2.1.270'
       AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
@@ -712,7 +711,11 @@ jobs:
         shell: bash
         run: npm install --prefix .native-claude --ignore-scripts --no-package-lock --no-audit --no-fund "${CLAUDE_NATIVE_PACKAGE}@${CLAUDE_CODE_VERSION}"
       - name: Require native sandbox and run every Claude capability
+        if: inputs.claude_diagnostic != true
         run: node tests/helpers/native-platform-ci.cjs run
+      - name: Diagnose the direct and packed native Claude paths
+        if: inputs.claude_diagnostic == true
+        run: node tests/helpers/native-platform-ci.cjs diagnose-claude
       - name: Preserve actual platform evidence and test output
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

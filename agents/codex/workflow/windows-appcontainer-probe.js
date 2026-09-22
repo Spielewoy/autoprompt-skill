@@ -121,4 +121,4 @@ async function runWindowsAppContainerCanary(runWindowsAppContainerCommand, worke
     }
   }
 }
-module.exports = { probeWindowsAppContainer, canaryKey: runtimeKey, runWindowsAppContainerCanary }
+module.exports = { probeWindowsAppContainer, failureDiagnostic, canaryKey: runtimeKey, runWindowsAppContainerCanary }
