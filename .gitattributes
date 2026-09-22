@@ -21,3 +21,9 @@ scripts/windows-msys/diagnostic-smoke/** text eol=lf
 
 # Manual trace generators and hash-bound header inputs use exact LF bytes.
 scripts/windows-msys/pipe-io-trace/** text eol=lf
+
+# Exact corresponding-source archives are separate from installed runtime assets.
+release-source/**/*.gz -text
+release-source/**/*.xz -text
+release-source/**/*.part-* -text
+release-source/**/*.json text eol=lf
