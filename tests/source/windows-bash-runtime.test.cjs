@@ -182,10 +182,20 @@ test('native Windows Bash bridges a deep canonical cwd for the admitted command 
   fs.writeFileSync(candidate, 'preserved', { mode: 0o600 }); fs.writeFileSync(secret, 'controller-only', { mode: 0o600 })
   fs.writeFileSync(path.join(scratchPath, 'relative-input'), 'deep-input', { mode: 0o600 })
   const observedPath = path.join(scratchPath, 'child-observed.json')
-  let contacted = false
-  const listener = require('node:net').createServer(socket => { contacted = true; socket.destroy() })
+  let accepted = 0
+  const net = require('node:net')
+  const listener = net.createServer(socket => { accepted++; socket.end() })
   await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
   const port = listener.address().port
+  const controlListener = async () => {
+    await new Promise((resolve, reject) => {
+      const socket = net.connect({ port, host: '127.0.0.1', family: 4 })
+      socket.once('connect', () => { socket.destroy(); resolve() })
+      socket.once('error', reject)
+      socket.setTimeout(1500, () => { socket.destroy(); reject(new Error('controller listener timeout')) })
+    })
+    await new Promise(resolve => setImmediate(resolve))
+  }
   const scratchStat = fs.statSync(scratchPath, { bigint: true })
   const expectedCwdIdentity = { dev: String(scratchStat.dev), ino: String(scratchStat.ino), directory: true }
   const childSource = `
@@ -211,21 +221,24 @@ test('native Windows Bash bridges a deep canonical cwd for the admitted command 
       denied(() => fs.writeFileSync(${JSON.stringify(candidate)}, 'forbidden'));
       denied(() => fs.writeFileSync(${JSON.stringify(secret)}, 'forbidden'));
       denied(() => fs.readFileSync(${JSON.stringify(secret)}));
-      const networkDenied = await new Promise(resolve => {
+      const network = await new Promise(resolve => {
         const socket = net.connect(${port}, '127.0.0.1'); let done = false;
         const finish = value => { if (done) return; done = true; socket.destroy(); resolve(value); };
-        socket.once('connect', () => finish(false));
-        socket.once('error', error => finish(['EACCES', 'EPERM', 'ENETUNREACH', 'EHOSTUNREACH', 'ECONNREFUSED'].includes(error.code)));
-        socket.setTimeout(3000, () => finish(false));
+        socket.once('connect', () => finish({ status: 'connected' }));
+        socket.once('error', error => finish({ status: 'error', code: error.code }));
+        socket.setTimeout(3000, () => finish({ status: 'deadline' }));
       });
-      assert.equal(networkDenied, true, 'network was allowed');
-      fs.writeFileSync(${JSON.stringify(observedPath)}, JSON.stringify({ cwd, cwdIdentity: identity(cwd), input: fs.readFileSync('relative-input', 'utf8') }));
+      assert.ok(network.status === 'error' && ['EACCES', 'EPERM', 'ETIMEDOUT'].includes(network.code), 'network denial unproven: ' + JSON.stringify(network));
+      fs.writeFileSync(${JSON.stringify(observedPath)}, JSON.stringify({ cwd, cwdIdentity: identity(cwd), network, input: fs.readFileSync('relative-input', 'utf8') }));
       process.stdout.write('deep-cwd-ok');
     })().catch(error => { console.error(error); process.exitCode = 1; })`
   const command = `node -e "eval(Buffer.from('${Buffer.from(childSource).toString('base64')}','base64').toString())"`
   const policy = { provider: 'claude', nestedDispatch: false, commandBoundary: true, externalWrites: false, readOnly: true,
     targetPath, scratchPath, readableRoots: [targetPath, scratchPath], writableRoots: [scratchPath] }
   try {
+    await controlListener()
+    assert.equal(accepted, 1, 'listener must accept a controller connection before the command')
+    accepted = 0
     const result = await executeTool(policy, 'bash', { command, cwd: scratchPath, timeoutMs: 60000 }, { controlRoot })
     preserve = result.cleanupConfirmed === false || Boolean(result.recovery && !result.recoveryResolved) || result.resourceRecovery?.cleanupConfirmed === false
     assert.equal(result.status, 'completed', JSON.stringify({ status: result.status, code: result.code, exitCode: result.exitCode, stderr: String(result.stderr || result.output || '').slice(-4096), resourceRecovery: result.resourceRecovery }))
@@ -244,7 +257,11 @@ test('native Windows Bash bridges a deep canonical cwd for the admitted command 
     assert.equal(observed.input, 'deep-input')
     assert.equal(fs.readFileSync(candidate, 'utf8'), 'preserved')
     assert.equal(fs.readFileSync(secret, 'utf8'), 'controller-only')
-    assert.equal(contacted, false, 'the admitted command reached the host network')
+    assert.equal(accepted, 0, 'the admitted command reached the host network')
+    assert.equal(observed.network.status, 'error')
+    assert.ok(['EACCES', 'EPERM', 'ETIMEDOUT'].includes(observed.network.code))
+    await controlListener()
+    assert.equal(accepted, 1, 'listener must remain reachable from the controller after the command')
     const visit = directory => {
       for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
         const absolute = path.join(directory, entry.name)
