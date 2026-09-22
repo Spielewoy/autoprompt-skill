@@ -122,28 +122,52 @@ async function ownedTest(owner, root, env, argv, timeoutMs = 300000, signal, opt
   if (!Number.isSafeInteger(postStatusDelayMs) || postStatusDelayMs < 0 || postStatusDelayMs > 5000) {
     fail('LOCAL_CANARY_INVALID', 'closed owned-test post-status delay is invalid')
   }
-  const id = crypto.randomUUID(), request = path.join(root, `outer-${id}.json`), status = path.join(root, `outer-${id}.status.json`)
-  writeAtomic(request, JSON.stringify({ argv, cwd: root, env, status, postStatusDelayMs }))
+  const id = crypto.randomUUID(), stem = path.join(root, `outer-${id}`)
+  const request = `${stem}.json`, status = `${stem}.status.json`
+  const stdoutPath = `${stem}.stdout.log`, stderrPath = `${stem}.stderr.log`
+  writeAtomic(request, JSON.stringify({ argv, cwd: root, env, status, stdoutPath, stderrPath, postStatusDelayMs }))
   const reservationId = `closed-canary-${id}`
   const launchEnv = prepareProcessLaunchEnvironment(owner.adapter, reservationId, env)
   const deadline = wallNowMs() + timeoutMs
   const owned = await owner.launch({ executable: process.execPath, argv: [__filename, '--closed-owned-test', request], cwd: root, env: launchEnv,
     sessionId: `closed-canary-${id}`, reservationId, targetKey: `closed-canary:${path.basename(root)}`, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', forWork: false })
   let value = null
+  let emptyGroupObservations = 0
+  const cleanFailedRun = async reason => {
+    await owner.cancelAll({ reason, graceMs: 500, killMs: 2000, waitForPending: true })
+    await drainRegistered(env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, { provider: env.AUTOPROMPT_CLOSED_CANARY_PROVIDER, activationId: env.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID, generation: Number(env.AUTOPROMPT_CLOSED_CANARY_GENERATION), challenge: env.AUTOPROMPT_CLOSED_CANARY_CHALLENGE }, {
+      platform: options.platform, providerPrivateOwnershipRoot: options.providerPrivateOwnershipRoot,
+      trustedOwnershipRoots: options.trustedOwnershipRoots, createPlatformAdapter: options.createPlatformAdapter,
+    })
+  }
   while (wallNowMs() < deadline && !value) {
     if (signal?.aborted) {
       await owner.cancelAll({ reason: 'closed native canary cancelled', graceMs: 500, killMs: 2000, waitForPending: true })
       fail('CHILD_CANCELLED', 'closed native canary was cancelled')
     }
     try { value = JSON.parse(regular(status)) } catch {}
+    if (!value && typeof owner.adapter?.listOwned === 'function') {
+      const live = await owner.adapter.listOwned(owned.groupIdentity)
+      if (signal?.aborted) {
+        await owner.cancelAll({ reason: 'closed native canary cancelled', graceMs: 500, killMs: 2000, waitForPending: true })
+        fail('CHILD_CANCELLED', 'closed native canary was cancelled')
+      }
+      if (wallNowMs() >= deadline) break
+      if (Array.isArray(live) && live.length === 0) {
+        emptyGroupObservations += 1
+        if (emptyGroupObservations >= 2) {
+          try { value = JSON.parse(regular(status)) } catch {}
+          if (!value) {
+            await cleanFailedRun('closed native canary launcher exited without status')
+            fail('LOCAL_CANARY_FAILED', 'owned native test launcher exited before writing status')
+          }
+        }
+      } else emptyGroupObservations = 0
+    }
     if (!value) await new Promise(resolve => setTimeout(resolve, 20))
   }
   if (!value) {
-    await owner.cancelAll({ reason: 'closed native canary timed out', graceMs: 500, killMs: 2000, waitForPending: true })
-    await drainRegistered(env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, { provider: env.AUTOPROMPT_CLOSED_CANARY_PROVIDER, activationId: env.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID, generation: Number(env.AUTOPROMPT_CLOSED_CANARY_GENERATION), challenge: env.AUTOPROMPT_CLOSED_CANARY_CHALLENGE }, {
-      platform: options.platform, providerPrivateOwnershipRoot: options.providerPrivateOwnershipRoot,
-      trustedOwnershipRoots: options.trustedOwnershipRoots, createPlatformAdapter: options.createPlatformAdapter,
-    })
+    await cleanFailedRun('closed native canary timed out')
     fail('LOCAL_CANARY_TIMEOUT', 'owned native test exceeded its deadline')
   }
   // The child status is written by the owned launcher.  It is not root-exit
@@ -237,17 +261,76 @@ async function run(options = {}) {
   }
 }
 async function closedOwnedTest(requestPath) {
-  const request = JSON.parse(regular(requestPath)); const child = cp.spawn(process.execPath, request.argv, { cwd: request.cwd, env: request.env, stdio: ['ignore', 'pipe', 'pipe'], shell: false })
-  let stdout = '', stderr = ''
-  child.stdout.on('data', chunk => { stdout += chunk; if (Buffer.byteLength(stdout) > 4 * 1024 * 1024) child.kill('SIGKILL') })
-  child.stderr.on('data', chunk => { stderr += chunk; if (Buffer.byteLength(stderr) > 4 * 1024 * 1024) child.kill('SIGKILL') })
-  child.once('error', async error => {
-    writeAtomic(request.status, JSON.stringify({ code: null, signal: null, error: error.message, stdout, stderr }))
+  const absoluteRequest = path.resolve(requestPath), parent = path.dirname(absoluteRequest)
+  const match = /^(outer-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/.exec(path.basename(absoluteRequest))
+  const parentBefore = inspectPathNoFollow(parent)
+  const request = JSON.parse(regular(absoluteRequest))
+  const stem = match && path.join(parent, match[1])
+  const expected = stem && { status: `${stem}.status.json`, stdoutPath: `${stem}.stdout.log`, stderrPath: `${stem}.stderr.log` }
+  if (!match || !expected || request.status !== expected.status || request.stdoutPath !== expected.stdoutPath || request.stderrPath !== expected.stderrPath ||
+      typeof request.cwd !== 'string' || !path.isAbsolute(request.cwd) || !Array.isArray(request.argv) || request.argv.some(value => typeof value !== 'string') ||
+      !request.env || typeof request.env !== 'object' || Array.isArray(request.env) || Object.entries(request.env).some(([key, value]) => !key || typeof value !== 'string') ||
+      !Number.isSafeInteger(request.postStatusDelayMs) || request.postStatusDelayMs < 0 || request.postStatusDelayMs > 5000) {
+    fail('LOCAL_CANARY_INVALID', 'closed owned-test request is invalid')
+  }
+  let stdoutHandle, stderrHandle
+  try {
+    stdoutHandle = fs.openSync(request.stdoutPath, 'wx', 0o600)
+    stderrHandle = fs.openSync(request.stderrPath, 'wx', 0o600)
+    const parentAfter = inspectPathNoFollow(parent)
+    if (!parentBefore.exists || !parentAfter.exists || JSON.stringify(parentBefore.identity) !== JSON.stringify(parentAfter.identity)) {
+      fail('LOCAL_CANARY_INVALID', 'closed owned-test output parent changed during binding')
+    }
+  } catch (error) {
+    if (stdoutHandle !== undefined) try { fs.closeSync(stdoutHandle) } catch {}
+    if (stderrHandle !== undefined) try { fs.closeSync(stderrHandle) } catch {}
+    throw error
+  }
+  const maximum = 4 * 1024 * 1024
+  const stdout = { bytes: 0, chunks: [] }, stderr = { bytes: 0, chunks: [] }
+  let child = null, childError = null, settled = false, effectiveCwd = request.cwd
+  const append = (state, handle, chunk) => {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    const retained = bytes.subarray(0, Math.max(0, maximum - state.bytes))
+    if (retained.length) { fs.writeSync(handle, retained); state.chunks.push(retained); state.bytes += retained.length }
+    if (retained.length !== bytes.length) { childError ||= Object.assign(new Error('owned native test output exceeded its bound'), { code: 'LOCAL_CANARY_OUTPUT_LIMIT' }); try { child?.kill('SIGKILL') } catch {} }
+  }
+  const boundedError = error => error ? { code: String(error.code || 'RUNTIME_FAILURE').slice(0, 64),
+    message: String(error.message || error).replace(/[\r\n]+/gu, ' ').slice(0, 512),
+    requestedCwdLength: request.cwd.length, effectiveCwdLength: effectiveCwd.length } : null
+  const finish = async (code, signal, error = null) => {
+    if (settled) return
+    settled = true
+    const failure = boundedError(error)
+    if (failure) append(stderr, stderrHandle, Buffer.from(`CLOSED_OWNED_TEST_FAILED:${JSON.stringify(failure)}\n`))
+    for (const handle of [stdoutHandle, stderrHandle]) { try { fs.fsyncSync(handle) } catch {}; try { fs.closeSync(handle) } catch {} }
+    writeAtomic(request.status, JSON.stringify({ code: error && (code === null || code === 0) ? 1 : code, signal: signal || null,
+      error: failure ? failure.message : null, errorCode: failure ? failure.code : null,
+      stdout: Buffer.concat(stdout.chunks, stdout.bytes).toString('utf8'), stderr: Buffer.concat(stderr.chunks, stderr.bytes).toString('utf8') }))
     if (request.postStatusDelayMs) await new Promise(resolve => setTimeout(resolve, request.postStatusDelayMs))
-  })
+  }
+  try {
+    if (process.platform === 'win32') {
+      const before = inspectPathNoFollow(request.cwd)
+      effectiveCwd = process.cwd()
+      const inherited = fs.lstatSync(effectiveCwd), inheritedReal = fs.realpathSync.native(effectiveCwd)
+      const after = inspectPathNoFollow(request.cwd)
+      if (!before.exists || !after.exists || JSON.stringify(before.identity) !== JSON.stringify(after.identity) ||
+          (!inherited.isDirectory() && !inherited.isSymbolicLink()) || inheritedReal.toLowerCase() !== before.realpath.toLowerCase() || effectiveCwd.length >= 260) {
+        fail('LOCAL_CANARY_INVALID', 'closed owned-test inherited cwd does not bind its requested physical directory')
+      }
+    }
+    child = cp.spawn(process.execPath, request.argv, { cwd: effectiveCwd, env: request.env, stdio: ['ignore', 'pipe', 'pipe'], shell: false })
+  } catch (error) { await finish(1, null, error); throw error }
+  if (!child.stdout || !child.stderr) {
+    const error = Object.assign(new Error('closed owned-test child lacks output streams'), { code: 'LOCAL_CANARY_INVALID' })
+    childError = error; child.once('error', () => {}); child.once('close', (code, signal) => finish(code, signal, error)); try { child.kill('SIGKILL') } catch {}; return
+  }
+  child.stdout.on('data', chunk => append(stdout, stdoutHandle, chunk))
+  child.stderr.on('data', chunk => append(stderr, stderrHandle, chunk))
+  child.once('error', error => { childError = error })
   child.once('close', async (code, signal) => {
-    writeAtomic(request.status, JSON.stringify({ code, signal, stdout, stderr }))
-    if (request.postStatusDelayMs) await new Promise(resolve => setTimeout(resolve, request.postStatusDelayMs))
+    await finish(code, signal, childError)
   })
 }
 if (require.main === module && process.argv[2] === '--closed-owned-test') closedOwnedTest(process.argv[3]).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1 })

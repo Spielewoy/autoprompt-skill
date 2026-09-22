@@ -1,6 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -157,7 +158,7 @@ test('native Windows Job ownership survives deep durable paths and hostile home 
   fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })
 
-test('native Windows owned proxy preserves deep semantic cwd through the nested child launch', { skip: process.platform !== 'win32', timeout: 240000 }, t => {
+test('native Windows owned proxy preserves deep semantic cwd through the nested child launch', { skip: process.platform !== 'win32', timeout: 240000 }, async t => {
   const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'native-proxy-long-cwd-')))
   async function exercise(base, repo) {
     const assert = require('node:assert/strict'), crypto = require('node:crypto'), fs = require('node:fs'), path = require('node:path')
@@ -239,12 +240,51 @@ test('native Windows owned proxy preserves deep semantic cwd through the nested 
   }
   const hostile = path.join(base, ...Array(16).fill('caller-home-and-temp'))
   const source = '(' + exercise.toString() + ')(' + JSON.stringify(base) + ',' + JSON.stringify(path.resolve(__dirname, '../..')) + ').catch(error=>{console.error(error);process.exitCode=1})'
-  const result = cp.spawnSync(process.execPath, ['-e', source], { encoding: 'utf8', timeout: 210000, windowsHide: true,
-    env: { ...process.env, USERPROFILE: hostile, HOME: hostile, APPDATA: hostile, LOCALAPPDATA: hostile, TEMP: hostile, TMP: hostile } })
-  if (result.error || result.status !== 0) t.diagnostic('Native nested proxy fixture retained after failure: ' + base)
-  assert.ifError(result.error)
-  assert.equal(result.status, 0, result.stderr || result.stdout)
-  assert.equal(result.stderr, '')
-  assert.deepEqual(JSON.parse(result.stdout), { nestedLaunch: true, semanticCwd: true, relativeIO: true, drained: true })
+  const safe = require('../../agents/codex/workflow/safe-run-root.js')
+  const { ProcessOwner, createWindowsJobAdapter } = require('../../agents/codex/workflow/process-owner.js')
+  const { ownedTest } = require('../../scripts/harness-v2-closed-canary.cjs')
+  safe.ensureWindowsPrivateAcl(base)
+  const outerPrivate = path.join(base, 'outer-private')
+  fs.mkdirSync(outerPrivate)
+  safe.ensureWindowsPrivateAcl(outerPrivate)
+  const outerRoot = path.join(outerPrivate, ...Array(12).fill('deep-closed-owned-test'))
+  fs.mkdirSync(outerRoot, { recursive: true })
+  safe.ensureWindowsPrivateAcl(outerRoot)
+  assert.ok(outerRoot.length > 300)
+  const nestedOwnershipRoot = path.join(outerRoot, 'nested-owners')
+  fs.mkdirSync(nestedOwnershipRoot)
+  safe.ensureWindowsPrivateAcl(nestedOwnershipRoot)
+  const adapter = createWindowsJobAdapter({ controlRoot: path.join(outerPrivate, 'outer-control'),
+    providerPrivateOwnershipRoot: outerPrivate })
+  const owner = new ProcessOwner({ adapter, registryPath: path.join(outerPrivate, 'outer-processes.json'), pollMs: 25 })
+  let result
+  try {
+    result = await ownedTest(owner, outerRoot, {
+      SystemRoot: process.env.SystemRoot,
+      PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
+      USERPROFILE: hostile, HOME: hostile, APPDATA: hostile, LOCALAPPDATA: hostile, TEMP: hostile, TMP: hostile,
+      AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT: nestedOwnershipRoot,
+      AUTOPROMPT_CLOSED_CANARY_PROVIDER: 'claude',
+      AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID: 'native-deep-cwd',
+      AUTOPROMPT_CLOSED_CANARY_GENERATION: '1',
+      AUTOPROMPT_CLOSED_CANARY_CHALLENGE: crypto.randomBytes(32).toString('base64url'),
+    }, ['-e', source], 210000, undefined, { platform: 'win32', providerPrivateOwnershipRoot: outerPrivate,
+      trustedOwnershipRoots: [outerPrivate] })
+    assert.equal(result.code, 0, result.stderr || result.stdout)
+    assert.equal(result.signal, null)
+    assert.equal(result.error, null)
+    assert.equal(result.stderr, '')
+    assert.deepEqual(JSON.parse(result.stdout), { nestedLaunch: true, semanticCwd: true, relativeIO: true, drained: true })
+    await owner.assertDrained()
+  } catch (error) {
+    t.diagnostic('Native nested proxy fixture retained after failure: ' + base)
+    for (const name of fs.readdirSync(outerRoot).filter(name => /^outer-[0-9a-f-]{36}\.(?:stdout|stderr)\.log$/.test(name)).sort()) {
+      const detail = fs.readFileSync(path.join(outerRoot, name), 'utf8').slice(0, 4096)
+      if (detail) t.diagnostic(`${name}: ${detail}`)
+    }
+    throw error
+  } finally {
+    try { await owner.cancelAll({ reason: 'native closed-owned nested proxy cleanup', graceMs: 0, killMs: 10000, waitForPending: true }) } catch {}
+  }
   fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })

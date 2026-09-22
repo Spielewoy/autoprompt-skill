@@ -59,7 +59,7 @@ test('CLI activation awaits a tracked asynchronous supervisor result', async t =
 })
 
 test('closed native canary cancellation drains its owned test before supervisor revocation', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-canary-cancel-'))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-canary-cancel-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const owner = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: path.join(root, 'processes.json'), pollMs: 20 })
   const controller = new AbortController()

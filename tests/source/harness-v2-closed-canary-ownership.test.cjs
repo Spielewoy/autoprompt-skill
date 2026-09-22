@@ -1,6 +1,7 @@
 'use strict'
 
 const assert = require('node:assert/strict')
+const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -9,7 +10,7 @@ const test = require('node:test')
 const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 const { ownedTest, drainRegistered, claimPrivateCanaryDirectory, closedCanaryBatchTimeout } = require('../../scripts/harness-v2-closed-canary.cjs')
 
-function privateDirectory(file) { fs.mkdirSync(file, { recursive: true, mode: 0o700 }); return file }
+function privateDirectory(file) { fs.mkdirSync(file, { recursive: true, mode: 0o700 }); return fs.realpathSync.native(file) }
 function binding(root) {
   return { provider: 'claude', activationId: 'closed-owner-regression', generation: 1,
     challenge: crypto.randomBytes(32).toString('base64url'), ownershipRoot: path.join(root, 'nested') }
@@ -27,6 +28,129 @@ async function liveOwner(root, name) {
     targetKey: name, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', forWork: false })
   return owner
 }
+
+test('closed owned-test durably publishes synchronous spawn refusal and bounded live logs', t => {
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-sync-spawn-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const id = crypto.randomUUID(), stem = path.join(root, `outer-${id}`)
+  const preload = path.join(root, 'refuse-spawn.cjs')
+  fs.writeFileSync(preload, "const cp=require('node:child_process');cp.spawn=()=>{const e=new Error('forced closed spawn refusal');e.code='ENAMETOOLONG';throw e}\n")
+  const request = { argv: ['-e', 'process.exit(0)'], cwd: root, env: { PATH: process.env.PATH },
+    status: `${stem}.status.json`, stdoutPath: `${stem}.stdout.log`, stderrPath: `${stem}.stderr.log`, postStatusDelayMs: 0 }
+  const requestPath = `${stem}.json`
+  fs.writeFileSync(requestPath, JSON.stringify(request))
+  const result = cp.spawnSync(process.execPath, ['--require', preload,
+    path.resolve(__dirname, '../../scripts/harness-v2-closed-canary.cjs'), '--closed-owned-test', requestPath],
+  { cwd: root, encoding: 'utf8', timeout: 10000 })
+  assert.ifError(result.error)
+  assert.equal(result.status, 1)
+  const status = JSON.parse(fs.readFileSync(request.status, 'utf8'))
+  assert.equal(status.code, 1)
+  assert.equal(status.signal, null)
+  assert.equal(status.errorCode, 'ENAMETOOLONG')
+  assert.equal(status.error, 'forced closed spawn refusal')
+  assert.equal(fs.readFileSync(request.stdoutPath, 'utf8'), '')
+  assert.match(fs.readFileSync(request.stderrPath, 'utf8'), /^CLOSED_OWNED_TEST_FAILED:.*ENAMETOOLONG/m)
+
+  const foreign = path.join(root, 'foreign.status.json')
+  fs.writeFileSync(foreign, 'foreign-owner')
+  const malformedId = crypto.randomUUID(), malformedStem = path.join(root, `outer-${malformedId}`)
+  const malformedPath = `${malformedStem}.json`
+  fs.writeFileSync(malformedPath, JSON.stringify({ ...request, status: foreign,
+    stdoutPath: `${malformedStem}.stdout.log`, stderrPath: `${malformedStem}.stderr.log` }))
+  const malformed = cp.spawnSync(process.execPath,
+    [path.resolve(__dirname, '../../scripts/harness-v2-closed-canary.cjs'), '--closed-owned-test', malformedPath],
+    { cwd: root, encoding: 'utf8', timeout: 10000 })
+  assert.ifError(malformed.error)
+  assert.equal(malformed.status, 1)
+  assert.equal(fs.readFileSync(foreign, 'utf8'), 'foreign-owner')
+  assert.equal(fs.existsSync(`${malformedStem}.stdout.log`), false)
+  assert.equal(fs.existsSync(`${malformedStem}.stderr.log`), false)
+
+  const overflowId = crypto.randomUUID(), overflowStem = path.join(root, `outer-${overflowId}`)
+  const overflowRequest = { ...request, argv: ['-e', "process.stdout.write(Buffer.alloc(4*1024*1024+65536,120))"],
+    status: `${overflowStem}.status.json`, stdoutPath: `${overflowStem}.stdout.log`, stderrPath: `${overflowStem}.stderr.log` }
+  const overflowPath = `${overflowStem}.json`
+  fs.writeFileSync(overflowPath, JSON.stringify(overflowRequest))
+  const overflow = cp.spawnSync(process.execPath,
+    [path.resolve(__dirname, '../../scripts/harness-v2-closed-canary.cjs'), '--closed-owned-test', overflowPath],
+    { cwd: root, encoding: 'utf8', timeout: 10000 })
+  assert.ifError(overflow.error)
+  const overflowStatus = JSON.parse(fs.readFileSync(overflowRequest.status, 'utf8'))
+  assert.notEqual(overflowStatus.code, 0)
+  assert.equal(overflowStatus.errorCode, 'LOCAL_CANARY_OUTPUT_LIMIT')
+  assert.ok(fs.statSync(overflowRequest.stdoutPath).size <= 4 * 1024 * 1024)
+})
+
+test('closed canary timeout retains bounded live child output before terminal status', { timeout: 10000 }, async t => {
+  if (process.platform === 'win32') return t.skip('portable POSIX process-group regression')
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-live-output-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const value = binding(root); privateDirectory(value.ownershipRoot)
+  const owner = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: path.join(root, 'outer.json'), pollMs: 10 })
+  await assert.rejects(ownedTest(owner, root, environment(value), ['-e',
+    "process.stdout.write('live-stdout\\n');process.stderr.write('live-stderr\\n');setTimeout(()=>{},30000)"], 500), { code: 'LOCAL_CANARY_TIMEOUT' })
+  const stdoutPath = fs.readdirSync(root).find(name => /^outer-[a-f0-9-]{36}\.stdout\.log$/.test(name))
+  const stderrPath = fs.readdirSync(root).find(name => /^outer-[a-f0-9-]{36}\.stderr\.log$/.test(name))
+  assert.equal(fs.readFileSync(path.join(root, stdoutPath), 'utf8'), 'live-stdout\n')
+  assert.equal(fs.readFileSync(path.join(root, stderrPath), 'utf8'), 'live-stderr\n')
+  assert.equal(fs.readdirSync(root).some(name => /^outer-[a-f0-9-]{36}\.status\.json$/.test(name)), false)
+})
+
+test('closed canary detects an empty owned launcher before its batch deadline', async () => {
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-empty-launcher-')))
+  const value = binding(root); privateDirectory(value.ownershipRoot)
+  let cancelled = false, observations = 0
+  const owner = {
+    adapter: { async listOwned(identity) { assert.equal(identity, 'empty-launcher-group'); observations += 1; return [] } },
+    async launch() { return { ownershipId: 'empty-launcher', groupIdentity: 'empty-launcher-group' } },
+    async cancelAll() { cancelled = true },
+  }
+  const began = Date.now()
+  try {
+    await assert.rejects(ownedTest(owner, root, environment(value), ['-e', 'process.exit(0)'], 10000),
+      { code: 'LOCAL_CANARY_FAILED' })
+    assert.ok(Date.now() - began < 1000)
+    assert.ok(observations >= 2)
+    assert.equal(cancelled, true)
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('closed canary preserves cancellation and deadline authority across an awaited owned-group query', async () => {
+  const abortRoot = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-query-abort-')))
+  const abortValue = binding(abortRoot); privateDirectory(abortValue.ownershipRoot)
+  const controller = new AbortController()
+  let abortCancelled = false
+  const abortOwner = {
+    adapter: { async listOwned() { controller.abort(); return [] } },
+    async launch() { return { ownershipId: 'query-abort', groupIdentity: 'query-abort-group' } },
+    async cancelAll() { abortCancelled = true },
+  }
+  try {
+    await assert.rejects(ownedTest(abortOwner, abortRoot, environment(abortValue), ['-e', 'process.exit(0)'],
+      10000, controller.signal), { code: 'CHILD_CANCELLED' })
+    assert.equal(abortCancelled, true)
+  } finally { fs.rmSync(abortRoot, { recursive: true, force: true }) }
+
+  const deadlineRoot = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-query-deadline-')))
+  const deadlineValue = binding(deadlineRoot); privateDirectory(deadlineValue.ownershipRoot)
+  let now = 100, requestPath, deadlineCancelled = false
+  const deadlineOwner = {
+    adapter: { async listOwned() {
+      now = 111
+      const request = JSON.parse(fs.readFileSync(requestPath, 'utf8'))
+      fs.writeFileSync(request.status, JSON.stringify({ code: 0, signal: null, error: null, stdout: '', stderr: '' }))
+      return []
+    } },
+    async launch(spec) { requestPath = spec.argv[2]; return { ownershipId: 'query-deadline', groupIdentity: 'query-deadline-group' } },
+    async cancelAll() { deadlineCancelled = true },
+  }
+  try {
+    await assert.rejects(ownedTest(deadlineOwner, deadlineRoot, environment(deadlineValue), ['-e', 'process.exit(0)'],
+      10, undefined, { wallNowMs: () => now }), { code: 'LOCAL_CANARY_TIMEOUT' })
+    assert.equal(deadlineCancelled, true)
+  } finally { fs.rmSync(deadlineRoot, { recursive: true, force: true }) }
+})
 
 test('closed canary batch timeout adds only bounded Windows Job startup allowances under authority deadlines', () => {
   assert.equal(closedCanaryBatchTimeout({ platform: 'win32', caseCount: 11,

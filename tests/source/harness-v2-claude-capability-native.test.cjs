@@ -92,13 +92,18 @@ async function scenario(t, options = {}) {
   const phaseStarted = performance.now()
   const markPhase = name => {
     if (phaseEvents.length >= 32) return
-    phaseEvents.push({ name, elapsedMs: Math.round(Math.max(0, performance.now() - phaseStarted)) })
+    const event = { name, elapsedMs: Math.round(Math.max(0, performance.now() - phaseStarted)) }
+    phaseEvents.push(event)
+    if (process.env.AUTOPROMPT_NATIVE_TEST_EVIDENCE_ROOT) {
+      process.stderr.write(`NATIVE_CANARY_PHASE:${JSON.stringify({ case: t.name, ...event })}\n`)
+    }
   }
   const timingDiagnostic = diagnostic => ({ ...diagnostic, phaseTiming: phaseEvents.slice(-32) })
   markPhase('scenario-start')
   assert.ok(CLI, 'AUTOPROMPT_CLAUDE_TEST_CLI is required for this native capability suite')
   const sandbox = await boundary.probeCommandSandbox()
   assert.equal(sandbox.supported, true, JSON.stringify(sandbox))
+  markPhase('sandbox-ready')
   if (process.platform === 'win32') {
     const loader = require('../../agents/codex/workflow/windows-worker-loader.js')
     const tuple = loader.describeTuple(await loader.captureWorkerTuple())
@@ -111,10 +116,17 @@ async function scenario(t, options = {}) {
       manifestSha256: tuple.manifestSha256, sharedId: tuple.sharedId, files: tuple.files })}`)
   }
   const f = createFixture()
+  markPhase('fixture-ready')
   let service, owner
   t.after(async () => {
-    try { if (owner) await owner.cancelAll({ reason: 'claude native capability cleanup', graceMs: 0, killMs: 2000 }) }
-    finally { try { if (service) await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } }
+    markPhase('cleanup-start')
+    try {
+      if (owner) await owner.cancelAll({ reason: 'claude native capability cleanup', graceMs: 0, killMs: 2000 })
+      markPhase('owner-drained')
+    } finally {
+      try { if (service) await service.close(); markPhase('service-closed') }
+      finally { fs.rmSync(f.root, { recursive: true, force: true }); markPhase('cleanup-end') }
+    }
   })
   const candidate = path.join(f.target, 'candidate.txt')
   const secret = path.join(f.controller, 'private.txt')
@@ -127,8 +139,10 @@ async function scenario(t, options = {}) {
     : options.command || readCommand(candidate)
   command = withChallenge(command, f.challenge)
   service = await modelService('claude', options.tool || { name: controlled.toolName('claude', 'bash'), args: { command } }, options.serviceOptions)
+  markPhase('model-service-ready')
   const binding = native.probeExecutable({ provider: 'claude', executable: CLI })
   owner = registeredProcessOwner(f)
+  markPhase('owner-ready')
   const processAdapter = owner.adapter
   const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'claude-closed-native-canary', pollMs: 10 })
@@ -309,13 +323,26 @@ test('claude closed native capability: full canonical role schema is accepted an
   }
   try { result = await f.run(quotaHooks) } catch (error) {
     const pending = [f.controller]
-    while (pending.length) {
+    let directories = 0, files = 0
+    while (pending.length && directories < 32 && files < 8) {
       const directory = pending.pop()
-      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-        const item = path.join(directory, entry.name)
-        if (entry.isDirectory()) pending.push(item)
-        else if (entry.name === 'stderr.log') process.stderr.write(fs.readFileSync(item, 'utf8').slice(0, 4096))
-      }
+      directories += 1
+      try {
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true }).slice(0, 128)) {
+          const item = path.join(directory, entry.name)
+          if (entry.isDirectory() && pending.length < 32) pending.push(item)
+          else if (entry.isFile() && entry.name === 'stderr.log' && files < 8) {
+            const fd = fs.openSync(item, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+            try {
+              const stat = fs.fstatSync(fd)
+              if (!stat.isFile() || stat.nlink !== 1) continue
+              const bytes = Buffer.alloc(4096)
+              process.stderr.write(bytes.subarray(0, fs.readSync(fd, bytes, 0, bytes.length, 0)))
+              files += 1
+            } finally { fs.closeSync(fd) }
+          }
+        }
+      } catch {} // Diagnostic failure must preserve the original native error.
     }
     throw error
   }

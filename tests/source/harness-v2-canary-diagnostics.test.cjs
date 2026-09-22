@@ -6,7 +6,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
-const { diagnoseNativeCanary, MAX_STATUS_BYTES, MAX_OUTPUT_CHARS, MAX_STATUSES } = require('../helpers/native-canary-diagnostics.cjs')
+const { diagnoseNativeCanary, MAX_STATUS_BYTES, MAX_OUTPUT_CHARS, MAX_STATUSES, MAX_STREAM_BYTES } = require('../helpers/native-canary-diagnostics.cjs')
 
 function fixture(t) {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'canary-diagnostic-')))
@@ -54,5 +54,28 @@ test('native canary diagnostics refuse redirected generation roots', t => {
   fs.writeFileSync(path.join(outside, `outer-${crypto.randomUUID()}.status.json`), JSON.stringify({ stdout: 'outside-private-data' }))
   diagnoseNativeCanary(f.activation, value => messages.push(value))
   assert.match(messages.join('\n'), /linked canary diagnostic directory/)
+  assert.doesNotMatch(messages.join('\n'), /outside-private-data/)
+})
+
+test('native canary timeout diagnostics preserve bounded partial streams without terminal status', t => {
+  const f = fixture(t), stem = `outer-${crypto.randomUUID()}`, messages = []
+  fs.writeFileSync(path.join(f.directory, `${stem}.stdout.log`), `TAP version 13\n${'x'.repeat(MAX_OUTPUT_CHARS)}\nnot ok 2 - active case`)
+  fs.writeFileSync(path.join(f.directory, `${stem}.stderr.log`), 'NATIVE_CANARY_PHASE:{"case":"active case","phase":"launch-start"}')
+  fs.writeFileSync(path.join(f.directory, `${stem}.json`), JSON.stringify({ env: { PRIVATE: 'never-print-request' } }))
+  diagnoseNativeCanary(f.activation, value => messages.push(value))
+  assert.match(messages.join('\n'), /no owned outer status/)
+  assert.match(messages.join('\n'), /TAP version 13.*\[child output truncated\].*not ok 2 - active case/s)
+  assert.match(messages.join('\n'), /NATIVE_CANARY_PHASE/)
+  assert.doesNotMatch(messages.join('\n'), /never-print-request/)
+  assert.ok(messages.every(value => value.length < MAX_OUTPUT_CHARS + 300))
+})
+
+test('native canary partial diagnostics reject linked and oversized streams', t => {
+  const f = fixture(t), messages = [], secret = path.join(f.root, 'secret')
+  fs.writeFileSync(secret, 'outside-private-data')
+  fs.linkSync(secret, path.join(f.directory, `outer-${crypto.randomUUID()}.stdout.log`))
+  fs.writeFileSync(path.join(f.directory, `outer-${crypto.randomUUID()}.stderr.log`), Buffer.alloc(MAX_STREAM_BYTES + 1))
+  diagnoseNativeCanary(f.activation, value => messages.push(value))
+  assert.equal(messages.filter(value => /partial.*unreadable/.test(value)).length, 2)
   assert.doesNotMatch(messages.join('\n'), /outside-private-data/)
 })
