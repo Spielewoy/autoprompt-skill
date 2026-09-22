@@ -186,37 +186,22 @@ test('native Windows Bash bridges a deep canonical cwd for the admitted command 
   const listener = require('node:net').createServer(socket => { contacted = true; socket.destroy() })
   await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
   const port = listener.address().port
+  const scratchStat = fs.statSync(scratchPath, { bigint: true })
+  const expectedCwdIdentity = { dev: String(scratchStat.dev), ino: String(scratchStat.ino), directory: true }
   const childSource = `
     (async () => {
       const fs = require('node:fs'), path = require('node:path'), net = require('node:net'), assert = require('node:assert/strict');
       const denied = operation => assert.throws(operation, error => ['EACCES', 'EPERM'].includes(error.code));
       const cwd = process.cwd(), bridgeParent = path.dirname(cwd);
-      let realCwd;
-      try { realCwd = fs.realpathSync.native(cwd); }
-      catch (failure) {
-        const canonical = ${JSON.stringify(fs.realpathSync.native(scratchPath))};
-        const observations = {};
-        for (const [label, file] of Object.entries({ alias: cwd, bridgeParent, staging: path.dirname(bridgeParent), canonical })) {
-          const probes = {
-            stat: () => { const s = fs.statSync(file, { bigint: true }); return { dev: String(s.dev), ino: String(s.ino), directory: s.isDirectory() }; },
-            lstat: () => { const s = fs.lstatSync(file, { bigint: true }); return { dev: String(s.dev), ino: String(s.ino), link: s.isSymbolicLink() }; },
-            nativeRealpath: () => { const value = fs.realpathSync.native(file); return { length: value.length, canonical: value.toLowerCase() === canonical.toLowerCase() }; },
-            realpath: () => { const value = fs.realpathSync(file); return { length: value.length, canonical: value.toLowerCase() === canonical.toLowerCase() }; },
-            readlink: () => { const value = fs.readlinkSync(file); return { length: value.length, canonical: value.toLowerCase() === canonical.toLowerCase() }; },
-            readdir: () => ({ count: fs.readdirSync(file).length }),
-          };
-          observations[label] = {};
-          for (const [operation, probe] of Object.entries(probes)) {
-            try { observations[label][operation] = probe(); }
-            catch (error) { observations[label][operation] = { code: error.code, errno: error.errno, syscall: error.syscall }; }
-          }
-        }
-        try { observations.relativeInput = fs.readFileSync('relative-input', 'utf8') === 'deep-input'; }
-        catch (error) { observations.relativeInput = { code: error.code, errno: error.errno }; }
-        process.stderr.write('cwd-filesystem-observations ' + JSON.stringify(observations) + '\\n');
-        throw failure;
-      }
-      assert.equal(realCwd.toLowerCase(), ${JSON.stringify(fs.realpathSync.native(scratchPath).toLowerCase())});
+      // AppContainer cannot reliably perform DOS-volume name resolution used by
+      // native realpath. Verify the actual directory object and junction target.
+      const identity = file => { const item = fs.statSync(file, { bigint: true }); return { dev: String(item.dev), ino: String(item.ino), directory: item.isDirectory() }; };
+      const canonical = ${JSON.stringify(fs.realpathSync.native(scratchPath))};
+      const expectedIdentity = ${JSON.stringify(expectedCwdIdentity)};
+      assert.deepEqual(identity(cwd), expectedIdentity);
+      assert.deepEqual(identity(canonical), expectedIdentity);
+      assert.equal(fs.lstatSync(cwd).isSymbolicLink(), true);
+      assert.equal(fs.readlinkSync(cwd).toLowerCase(), canonical.toLowerCase());
       assert.equal(path.basename(bridgeParent), 'cwd-bridge');
       assert.deepEqual(fs.readdirSync(bridgeParent), ['command-cwd']);
       denied(() => fs.writeFileSync(path.join(bridgeParent, 'worker-write'), 'forbidden'));
@@ -234,7 +219,7 @@ test('native Windows Bash bridges a deep canonical cwd for the admitted command 
         socket.setTimeout(3000, () => finish(false));
       });
       assert.equal(networkDenied, true, 'network was allowed');
-      fs.writeFileSync(${JSON.stringify(observedPath)}, JSON.stringify({ cwd, realCwd, input: fs.readFileSync('relative-input', 'utf8') }));
+      fs.writeFileSync(${JSON.stringify(observedPath)}, JSON.stringify({ cwd, cwdIdentity: identity(cwd), input: fs.readFileSync('relative-input', 'utf8') }));
       process.stdout.write('deep-cwd-ok');
     })().catch(error => { console.error(error); process.exitCode = 1; })`
   const command = `node -e "eval(Buffer.from('${Buffer.from(childSource).toString('base64')}','base64').toString())"`
@@ -252,7 +237,7 @@ test('native Windows Bash bridges a deep canonical cwd for the admitted command 
     assert.ok(observed.cwd.length < 260)
     assert.equal(path.basename(observed.cwd), 'command-cwd')
     assert.notEqual(observed.cwd.toLowerCase(), fs.realpathSync.native(scratchPath).toLowerCase())
-    assert.equal(observed.realCwd.toLowerCase(), fs.realpathSync.native(scratchPath).toLowerCase())
+    assert.deepEqual(observed.cwdIdentity, expectedCwdIdentity)
     assert.equal(fs.existsSync(observed.cwd), false, 'temporary cwd alias remained after lease release')
     assert.equal(fs.existsSync(path.dirname(observed.cwd)), false, 'temporary cwd bridge parent remained after lease release')
     assert.equal(fs.existsSync(path.dirname(path.dirname(observed.cwd))), false, 'temporary cwd staging root remained after lease release')
