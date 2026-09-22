@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       claude_diagnostic:
-        description: 'Diagnose owned startup, direct and packed native Claude on Windows x64 and ARM64'
+        description: 'Diagnose packed native Claude on Windows x64 and ARM64'
         required: false
         default: false
         type: boolean
@@ -738,9 +738,9 @@ jobs:
       - name: Require native sandbox and run every Claude capability
         if: inputs.claude_diagnostic != true
         run: node tests/helpers/native-platform-ci.cjs run
-      - name: Diagnose owned startup and native Claude activation
+      - name: Diagnose installed native Claude activation
         if: inputs.claude_diagnostic == true
-        run: node tests/helpers/native-platform-ci.cjs diagnose-claude
+        run: node tests/helpers/native-platform-ci.cjs diagnose-claude-packed
       - name: Preserve actual platform evidence and test output
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

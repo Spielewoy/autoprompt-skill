@@ -400,13 +400,27 @@ test('claude closed native capability: full canonical role schema is accepted an
 
 test('claude closed native capability: isolation denies candidate/private/network while allowing scratch', nativeOptions, async t => {
   const net = require('node:net')
-  let contacted = false
-  const listener = net.createServer(socket => { contacted = true; socket.destroy() })
+  let accepted = 0
+  const listener = net.createServer(socket => { accepted++; socket.end() })
   await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
   const port = listener.address().port
+  const controlListener = async () => {
+    await new Promise((resolve, reject) => {
+      const socket = net.connect({ port, host: '127.0.0.1', family: 4 })
+      socket.once('connect', () => { socket.destroy(); resolve() })
+      socket.once('error', reject)
+      socket.setTimeout(1500, () => { socket.destroy(); reject(new Error('controller listener timeout')) })
+    })
+    await new Promise(resolve => setImmediate(resolve))
+  }
   try {
+    await controlListener()
+    assert.equal(accepted, 1, 'listener must accept a controller connection before the command')
+    accepted = 0
+    let networkFile
     const f = await scenario(t, { command: ({ candidate, secret, scratch }) => {
       const scratchFile = path.join(scratch, 'isolation.txt')
+      networkFile = path.join(scratch, 'network-observed.json')
       return nodeCommand(`
         const fs=require('node:fs'),net=require('node:net');
         const denied=operation=>{let error;try{operation()}catch(value){error=value}if(!error||!['EACCES','EPERM','EROFS','ENOENT'].includes(error.code))throw Error('Expected permission denial')};
@@ -415,16 +429,22 @@ test('claude closed native capability: isolation denies candidate/private/networ
         denied(()=>fs.writeFileSync(${JSON.stringify(candidate)},'forbidden'));
         denied(()=>fs.readFileSync(${JSON.stringify(secret)}));
         const s=net.connect(${port},'127.0.0.1');
-        const timer=setTimeout(()=>{s.destroy();process.exitCode=21},3000);
-        s.once('connect',()=>{clearTimeout(timer);s.destroy();process.exitCode=19});
-        s.once('error',error=>{clearTimeout(timer);if(!['EACCES','EPERM','ENETUNREACH','EHOSTUNREACH','ECONNREFUSED'].includes(error.code))process.exitCode=22});
+        let done=false;const finish=network=>{if(done)return;done=true;clearTimeout(timer);fs.writeFileSync(${JSON.stringify(networkFile)},JSON.stringify(network));s.destroy();if(network.status==='connected')process.exitCode=19;if(network.status==='deadline')process.exitCode=21;if(network.status==='error'&&!((process.platform==='win32'&&['EACCES','EPERM','ETIMEDOUT'].includes(network.code))||(process.platform!=='win32'&&['EACCES','EPERM','ENETUNREACH','EHOSTUNREACH','ECONNREFUSED'].includes(network.code))))process.exitCode=22};
+        const timer=setTimeout(()=>finish({status:'deadline'}),3000);
+        s.once('connect',()=>{clearTimeout(timer);finish({status:'connected'})});
+        s.once('error',error=>{clearTimeout(timer);finish({status:'error',code:error.code})});
       `)
     } })
     const result = await f.run({})
     assertSuccessful(result)
     assert.equal(fs.readFileSync(f.candidate, 'utf8'), f.marker)
     assert.equal(fs.readFileSync(path.join(f.scratch, 'isolation.txt'), 'utf8'), 'scratch-ok')
-    assert.equal(contacted, false, 'the real command sandbox reached the host network')
+    assert.equal(accepted, 0, 'the real command sandbox reached the host network')
+    const observed = JSON.parse(fs.readFileSync(networkFile, 'utf8'))
+    assert.equal(observed.status, 'error')
+    assert.ok((process.platform === 'win32' ? ['EACCES', 'EPERM', 'ETIMEDOUT'] : ['EACCES', 'EPERM', 'ENETUNREACH', 'EHOSTUNREACH', 'ECONNREFUSED']).includes(observed.code), JSON.stringify(observed))
+    await controlListener()
+    assert.equal(accepted, 1, 'listener must remain reachable from the controller after the command')
   } finally { await new Promise(resolve => listener.close(resolve)) }
 })
 
