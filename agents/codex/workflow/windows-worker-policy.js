@@ -4,7 +4,7 @@ module.exports=Object.freeze({
   "state": "candidate-unaccepted",
   "manifest": {
     "length": 1100,
-    "sha256": "86ac90884454aa9fbf062aeb6f61b0e1d094e2ad40ad719e26d9b8cb1e12f2d5"
+    "sha256": "f27934c1046a93bbf558d6bf64f6984cbcee46dc0aa8a60f34acdde7a3e15ade"
   },
   "files": [
     {
@@ -20,10 +20,10 @@ module.exports=Object.freeze({
       "path": "assets/msys.br",
       "output": "usr/bin/msys-2.0.dll",
       "encoding": "br",
-      "length": 1484871,
-      "sha256": "9135b2c3715659b74b809b9967516dc8575a27c3fa10bcb5d83a931cfa888121",
-      "rawLength": 4152765,
-      "rawSha256": "ca3f40b48a86159ec6a483e63ab4007e93a0066ff033c358baa6dd9ebc07f100"
+      "length": 1489117,
+      "sha256": "5aa0f9256180b2f4b4b7b2979d410d46963c17a24ac259ae77a06d72a8684661",
+      "rawLength": 4154301,
+      "rawSha256": "c77dfefbebd27b307cdbd2c61c89f4b44e6fadaa9e7194d941ca0f1e4b3836eb"
     },
     {
       "path": "assets/node-arm64.br",
@@ -103,5 +103,5 @@ module.exports=Object.freeze({
     ]
   },
   "sharedId": "msys-2.0S5",
-  "sourceIdentity": "2af666a871f0840e35ded480522d40a5cb551f5e3cee585a2d411e6e95c0d5f7"
+  "sourceIdentity": "9cb84b4dc65ff4f5ff3a2e8bb688fb486a645ab743eb38017b7c3d0eba201e87"
 })

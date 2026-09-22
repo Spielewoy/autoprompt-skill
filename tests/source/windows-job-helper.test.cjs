@@ -79,7 +79,11 @@ test('native Windows Job ownership survives deep durable paths and hostile home 
     const marker = path.join(base, 'child.json')
     let launched, cleanupOwner = owner
     try {
-      const environment = { SystemRoot: process.env.SystemRoot, AUTOPROMPT_EXACT_JOB_ENV: 'owned' }
+      const environment = {
+        SystemRoot: process.env.SystemRoot,
+        PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
+        AUTOPROMPT_EXACT_JOB_ENV: 'owned',
+      }
       launched = await owner.launch({ executable: process.execPath, argv: ['-e', 'require("node:fs").writeFileSync(process.argv[1],JSON.stringify({pid:process.pid,environment:process.env}));setInterval(()=>{},1000)', marker], cwd: base, env: environment, targetKey: 'deep-durable-job' })
       const deadline = Date.now() + 10000
       while (!fs.existsSync(marker) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25))
