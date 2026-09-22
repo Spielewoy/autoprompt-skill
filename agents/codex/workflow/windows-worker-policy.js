@@ -63,7 +63,7 @@ module.exports=Object.freeze({
     "windows-worker-decoder.js": "e006e1eec10b6c112dd95f8e2cfb3546622ee0b33bb9412b07b38b51a8104423",
     "windows-worker-loader.js": "ebe0023a453629dcc17c18d6b4a9274f683f8f56e1982314c88668cc73213ecd",
     "windows-worker-pe.js": "d8914396f52767d203374369a1d785fe7b744a57d77f1d13219d1c88b1992845",
-    "safe-run-root.js": "c5422766cfbe9ddbbd76b6690f639ff04c8bcaaa077f1a4a333e60c307056b09"
+    "safe-run-root.js": "48170c87249b9230719afa0ee905766b90cdc3ee4ca423492cb0ca5e3b5e1997"
   },
   "imports": {
     "assets/bash.br": [
@@ -103,5 +103,5 @@ module.exports=Object.freeze({
     ]
   },
   "sharedId": "msys-2.0S5",
-  "sourceIdentity": "1644e5254e94edf93eb3f6f02a8eaa3760700d1b9056c209f614c7a23bc951ca"
+  "sourceIdentity": "f356b5932f2f82401b000320320f3a35c8783b80b04923c196682012663a3205"
 })

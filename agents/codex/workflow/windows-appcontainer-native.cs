@@ -29,6 +29,8 @@ public static class WindowsAppContainerNative {
  [DllImport("userenv.dll",CharSet=CharSet.Unicode)] static extern Int32 GetAppContainerFolderPath(String sid,out IntPtr path);
  [DllImport("ole32.dll")] static extern void CoTaskMemFree(IntPtr memory);
  [DllImport("advapi32.dll",SetLastError=true)] public static extern IntPtr FreeSid(IntPtr sid);
+ [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+ [DllImport("userenv.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern Boolean GetUserProfileDirectory(IntPtr token,StringBuilder profile,ref UInt32 length);
  [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr process,UInt32 rights,out IntPtr token);
  [DllImport("advapi32.dll",SetLastError=true)] static extern bool GetTokenInformation(IntPtr token,Int32 type,IntPtr data,Int32 length,out Int32 required);
  [DllImport("advapi32.dll",CharSet=CharSet.Unicode,EntryPoint="ConvertSidToStringSidW",SetLastError=true)] static extern bool ConvertSidToStringSid(IntPtr sid,out IntPtr text);
@@ -238,6 +240,7 @@ public static class WindowsAppContainerNative {
   foreach(String entry in entries){Int32 at=entry==null?-1:entry.IndexOf('=');if(at<=0||entry.IndexOf('\0')>=0||!seen.Add(entry.Substring(0,at)))throw new InvalidOperationException("WINDOWS_ENVIRONMENT_INVALID");length+=entry.Length+1;}
   if(length>32760||!seen.Contains("SystemRoot"))throw new InvalidOperationException("WINDOWS_ENVIRONMENT_INVALID");
  }
+ static String CurrentTokenProfile(){IntPtr token=IntPtr.Zero;try{if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,out token))throw new InvalidOperationException("WINDOWS_CONTROLLER_PROFILE_UNAVAILABLE");var profile=new StringBuilder(32768);UInt32 length=(UInt32)profile.Capacity;if(!GetUserProfileDirectory(token,profile,ref length)||length==0||length>=profile.Capacity)throw new InvalidOperationException("WINDOWS_CONTROLLER_PROFILE_UNAVAILABLE");return profile.ToString();}finally{if(token!=IntPtr.Zero)CloseHandle(token);}}
  static IntPtr EnvironmentBlock(String[] entries) {
   ValidateEnvironmentEntries(entries,65);
   return Marshal.StringToHGlobalUni(String.Join("\0",entries.OrderBy(x=>x,StringComparer.OrdinalIgnoreCase))+"\0\0");
@@ -248,12 +251,12 @@ public static class WindowsAppContainerNative {
   }
  }
  // CreateProcess requires LOCALAPPDATA in both the controller and explicit
- // child environment. Resolve the controller user's known folder instead of
+ // child environment. Resolve the controller token's profile directory instead of
  // trusting ambient or caller-provided values. This adds no filesystem grant.
  static String[] PrepareControllerProfileEnvironment(String[] entries){
   ValidateEnvironmentEntries(entries,64);
   foreach(String entry in entries)if(String.Equals(entry.Substring(0,entry.IndexOf('=')),PrivateNullEnvironmentName,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("WINDOWS_NULL_CAPABILITY_RESERVED");
-  String local=Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+  String profile=CurrentTokenProfile(),local=Path.Combine(profile,"AppData","Local");
   if(String.IsNullOrEmpty(local)||local.Length>32700||!Path.IsPathRooted(local)||!String.Equals(Path.GetFullPath(local),local,StringComparison.OrdinalIgnoreCase)||!Directory.Exists(local))throw new InvalidOperationException("WINDOWS_CONTROLLER_PROFILE_UNAVAILABLE");
   String[] result=entries.Where(entry=>!String.Equals(entry.Substring(0,entry.IndexOf('=')),"LOCALAPPDATA",StringComparison.OrdinalIgnoreCase)).Concat(new[]{"LOCALAPPDATA="+local}).ToArray();
   ValidateEnvironmentEntries(result,64);

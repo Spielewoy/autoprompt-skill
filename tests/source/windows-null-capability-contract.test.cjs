@@ -35,15 +35,32 @@ test('private NUL capability verifies bounded native identity and preserves the 
   t.diagnostic(`${proof.contractCases} actual-source adversarial contracts; native API results are mocked, not Windows execution`)
 })
 
-test('AppContainer profile environment uses the known folder without relaxing caller protocol bounds', { timeout: 90000 }, t => {
+test('AppContainer profile environment uses the token profile without relaxing caller protocol bounds', { timeout: 90000 }, t => {
   const powershell = process.platform === 'win32' ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : (process.env.AUTOPROMPT_TEST_PWSH || 'pwsh')
+  const directory = process.platform === 'win32' ? null : fs.mkdtempSync(path.join(os.tmpdir(), 'profile-environment-contract-'))
+  if (directory) t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const profile = process.platform === 'win32' ? os.userInfo().homedir : path.join(directory, 'profile')
+  const local = path.join(profile, 'AppData', 'Local')
+  if (process.platform !== 'win32') fs.mkdirSync(local, { recursive: true })
+  let native = path.resolve(__dirname, '../../agents/codex/workflow/windows-appcontainer-native.cs')
+  const environment = { ...process.env, AUTOPROMPT_PROFILE_EXPECTED: profile }
+  if (process.platform !== 'win32') {
+    native = path.join(directory, 'native.cs')
+    const source = fs.readFileSync(path.resolve(__dirname, '../../agents/codex/workflow/windows-appcontainer-native.cs'), 'utf8')
+    const pattern = / static String CurrentTokenProfile\(\)\{[\s\S]*?\}\n static IntPtr EnvironmentBlock/
+    assert.equal([...source.matchAll(new RegExp(pattern.source, 'g'))].length, 1, 'replace exactly one token profile boundary')
+    fs.writeFileSync(native, source.replace(pattern, ' static String CurrentTokenProfile(){return Environment.GetEnvironmentVariable("AUTOPROMPT_TEST_PROFILE");}\n static IntPtr EnvironmentBlock'))
+    environment.AUTOPROMPT_TEST_PROFILE = profile
+    environment.AUTOPROMPT_PROFILE_NATIVE_MOCK = '1'
+  }
+  if (process.platform === 'win32') environment.AUTOPROMPT_PROFILE_NATIVE_MOCK = ''
   const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop";Add-Type -Path @($env:AUTOPROMPT_PROFILE_NATIVE,$env:AUTOPROMPT_PROFILE_CONTRACT);[ProfileEnvironmentContract]::Run()'], {
     encoding: 'utf8', timeout: 60000, windowsHide: true,
-    env: { ...process.env, AUTOPROMPT_PROFILE_NATIVE: path.resolve(__dirname, '../../agents/codex/workflow/windows-appcontainer-native.cs'), AUTOPROMPT_PROFILE_CONTRACT: path.resolve(__dirname, '../fixtures/windows-appcontainer/profile-environment-contract.cs') },
+    env: { ...environment, AUTOPROMPT_PROFILE_NATIVE: native, AUTOPROMPT_PROFILE_CONTRACT: path.resolve(__dirname, '../fixtures/windows-appcontainer/profile-environment-contract.cs') },
   })
   if (result.error?.code === 'ENOENT' && process.platform !== 'win32') { t.skip('PowerShell is unavailable'); return }
   assert.ifError(result.error)
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.equal(result.stderr, '')
-  assert.deepEqual(JSON.parse(result.stdout), { contractCases: 28, knownFolderApi: true, nativeLaunch: false })
+  assert.deepEqual(JSON.parse(result.stdout), { contractCases: 28, tokenProfileApi: process.platform === 'win32', nativeLaunch: false })
 })

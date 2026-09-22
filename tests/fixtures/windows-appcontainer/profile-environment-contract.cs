@@ -1,5 +1,5 @@
-// Executes the complete production environment preparation with the real known-
-// folder API. No Windows process is launched by this portable contract.
+// Executes the complete production environment preparation with the token-profile
+// boundary supplied by the production implementation or a portable test seam.
 using System;
 using System.Linq;
 using System.Reflection;
@@ -14,7 +14,7 @@ public static class ProfileEnvironmentContract {
  static void Refuses(string code,Action action){try{action();}catch(InvalidOperationException error){Need(error.Message==code,"wrong-refusal:"+error.Message);cases++;return;}throw new InvalidOperationException("accepted:"+code);}
  static string[] Entries(int count){return Enumerable.Range(0,count).Select(i=>i==0?"SystemRoot=x":"K"+i+"=v").ToArray();}
  public static void Run(){
-  string original=Environment.GetEnvironmentVariable("LOCALAPPDATA"),local=Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+  string original=Environment.GetEnvironmentVariable("LOCALAPPDATA"),profile=Environment.GetEnvironmentVariable("AUTOPROMPT_PROFILE_EXPECTED"),local=System.IO.Path.Combine(profile,"AppData","Local");bool tokenApi=String.IsNullOrEmpty(Environment.GetEnvironmentVariable("AUTOPROMPT_PROFILE_NATIVE_MOCK"));if(tokenApi)Need(profile==(string)Call("CurrentTokenProfile"),"token-profile-mismatch");
   try{
    foreach(string entry in new string[]{null,"LOCALAPPDATA=","LOCALAPPDATA=incorrect","lOcAlApPdAtA=untrusted"}){
     Environment.SetEnvironmentVariable("LOCALAPPDATA",null,EnvironmentVariableTarget.Process);
@@ -36,7 +36,7 @@ public static class ProfileEnvironmentContract {
    sized[1]+="a";Refuses("WINDOWS_ENVIRONMENT_INVALID",()=>Prepare(sized));
    string[] final={"SystemRoot=x","x="};remaining=32760-Owned(Prepare(final)).Sum(x=>x.Length+1);final[1]+=new string('a',remaining);Need(Block(Owned(Prepare(final)))==32761,"final-exact-length");cases++;
    final[1]+="a";Refuses("WINDOWS_ENVIRONMENT_INVALID",()=>Block(Owned(Prepare(final))));
-   Console.Write("{\"contractCases\":"+cases+",\"knownFolderApi\":true,\"nativeLaunch\":false}");
+   Console.Write("{\"contractCases\":"+cases+",\"tokenProfileApi\":"+(tokenApi?"true":"false")+",\"nativeLaunch\":false}");
   }finally{Environment.SetEnvironmentVariable("LOCALAPPDATA",original,EnvironmentVariableTarget.Process);}
  }
 }

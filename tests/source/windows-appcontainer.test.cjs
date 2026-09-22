@@ -3,6 +3,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
+const cp = require('node:child_process')
 const vm = require('node:vm')
 const { createRequire } = require('node:module')
 const { validateLaunch, parseResult, createWindowsAppContainerLauncher } = require('../../agents/codex/workflow/windows-appcontainer.js')
@@ -59,7 +60,9 @@ function windowsModule(file, replacements = {}, directory, globals = {}) {
     module, exports: module.exports, __dirname: directory || path.dirname(filename), Buffer, ...globals,
     process: { platform: 'win32', arch: process.arch, pid: process.pid, execPath: process.execPath,
       env: { SystemRoot: 'C:\\Windows', NODE_OPTIONS: '--require must-not-inherit', OPENAI_API_KEY: 'must-not-inherit', ...(globals.env || {}) } },
-    require: name => Object.hasOwn(replacements, name) ? replacements[name] : localRequire(name),
+    require: name => Object.hasOwn(replacements, name) ? replacements[name]
+      : name === 'node:os' && globals.userInfoHome ? { ...require('node:os'), userInfo: () => ({ homedir: globals.userInfoHome }) }
+      : localRequire(name),
   }, { filename })
   return module.exports
 }
@@ -140,13 +143,12 @@ test('Windows helper staging preserves its primary refusal and accounts for an u
   assert.equal(removed, owned); assert.equal(path.dirname(owned), root); assert.equal(fs.statSync(owned).isDirectory(), true)
 })
 
-test('Windows ownership setup keeps a bounded cold-start allowance and never caches a failed privacy proof', () => {
-  const attempts = [], aclAttempts = [], resolverAttempts = []
+test('Windows ownership setup keeps a bounded cold-start allowance and never caches a failed privacy proof', t => {
+  const profile = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-profile-'))
+  fs.mkdirSync(path.join(profile, 'AppData', 'Local'), { recursive: true })
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
+  const attempts = [], aclAttempts = []
   const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(file, argv, options) {
-    if (!options.env.AUTOPROMPT_PRIVATE_ACL_PATH && String(argv.at(-1)).includes('GetFolderPath')) {
-      resolverAttempts.push({ file, argv, options })
-      return { status: 0, signal: null, stderr: '', stdout: require('node:os').tmpdir() + '\n' }
-    }
     if (options.env.AUTOPROMPT_PRIVATE_ACL_PATH) {
       aclAttempts.push({ file, argv, options })
       const item = { path: options.env.AUTOPROMPT_PRIVATE_ACL_PATH, owner: 'S-1-5-21-1', ownerSid: 'S-1-5-21-1', protected: true,
@@ -158,7 +160,7 @@ test('Windows ownership setup keeps a bounded cold-start allowance and never cac
     return attempts.length === 1
       ? { status: null, signal: 'SIGTERM', error: { code: 'ETIMEDOUT' }, stdout: 'TOKEN_OWNER_COMPILING\n', stderr: 'bounded native diagnostic' }
       : { status: 0, signal: null, stderr: '' }
-  } } })
+  } } }, undefined, { userInfoHome: profile })
   assert.throws(() => safe.ensureWindowsDefaultTokenOwner(), error => {
     assert.equal(error.code, 'PRIVACY_UNSUPPORTED')
     assert.equal(error.details.stage, 'windows-default-token-owner')
@@ -171,7 +173,6 @@ test('Windows ownership setup keeps a bounded cold-start allowance and never cac
   assert.equal(safe.ensureWindowsDefaultTokenOwner().supported, true)
   assert.equal(attempts.length, 2, 'a failure must remain retryable, while only the successful ownership proof is cached')
   assert.equal(aclAttempts.length, 2)
-  assert.equal(resolverAttempts.length, 2)
   for (const { file, options } of attempts) {
     assert.equal(file, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
     assert.ok(options.timeout > 15000 && options.timeout <= 60000)
@@ -185,14 +186,12 @@ test('Windows ownership setup keeps a bounded cold-start allowance and never cac
 })
 
 test('Windows ownership setup preserves a Unicode known folder and ignores hostile ambient local-app-data variables', t => {
-  const knownFolder = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-Å-用户-')))
-  t.after(() => fs.rmSync(knownFolder, { recursive: true, force: true }))
-  const resolver = [], acl = []
+  const profile = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-Å-用户-')))
+  const knownFolder = path.join(profile, 'AppData', 'Local')
+  fs.mkdirSync(knownFolder, { recursive: true })
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
+  const acl = []
   const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(file, argv, options) {
-    if (!options.env.AUTOPROMPT_PRIVATE_ACL_PATH && String(argv.at(-1)).includes('GetFolderPath')) {
-      assert.match(argv.at(-1), /\[Console\]::OutputEncoding=\[Text.UTF8Encoding\]::new\(\$false\)/)
-      resolver.push(options); return { status: 0, signal: null, stderr: '', stdout: knownFolder + '\n' }
-    }
     if (options.env.AUTOPROMPT_PRIVATE_ACL_PATH) {
       acl.push(options)
       const sid = 'S-1-5-21-1', directory = options.env.AUTOPROMPT_PRIVATE_ACL_DIRECTORY === '1'
@@ -200,19 +199,40 @@ test('Windows ownership setup preserves a Unicode known folder and ignores hosti
       return { status: 0, signal: null, stderr: '', stdout: JSON.stringify({ currentName: 'TEST\\user', currentSid: sid, items: [{ path: options.env.AUTOPROMPT_PRIVATE_ACL_PATH, owner: sid, ownerSid: sid, protected: true, rules: [rule(sid), rule('S-1-5-18')] }] }) }
     }
     return { status: 0, signal: null, stderr: '', stdout: '' }
-  } } }, undefined, { env: { LOCALAPPDATA: 'C:\\attacker-controlled-root' } })
+  } } }, undefined, { env: { LOCALAPPDATA: 'C:\\attacker-controlled-root' }, userInfoHome: profile })
   assert.equal(safe.ensureWindowsDefaultTokenOwner().supported, true)
-  assert.equal(resolver.length, 1); assert.equal(acl.length, 1)
-  assert.equal(resolver[0].env.LOCALAPPDATA, undefined, 'authoritative resolver must not inherit ambient local-app-data')
+  assert.equal(acl.length, 1)
   assert.equal(path.dirname(acl[0].env.AUTOPROMPT_PRIVATE_ACL_PATH), knownFolder)
 })
 
 test('Windows ownership setup refuses an invalid authoritative local-app-data result', () => {
-  const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(file, argv) {
-    if (String(argv.at(-1)).includes('GetFolderPath')) return { status: 0, signal: null, stderr: '', stdout: 'not-absolute\n' }
-    assert.fail('Invalid known-folder output must stop before ACL or compiler setup')
-  } } })
+  const safe = windowsModule('safe-run-root.js', {}, undefined, { userInfoHome: 'relative-profile' })
   assert.throws(() => safe.ensureWindowsDefaultTokenOwner(), { code: 'PRIVACY_UNSUPPORTED' })
+})
+
+test('native Windows compiler staging ignores deep home and temp overrides', { skip: process.platform !== 'win32' }, () => {
+  const helper = path.resolve(__dirname, '../../agents/codex/workflow/safe-run-root.js')
+  const child = `
+    const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), cp = require('node:child_process')
+    const safe = require(${JSON.stringify(helper)})
+    const directory = safe.createWindowsCompilerDirectory('autoprompt-native-')
+    try {
+      const expected = fs.realpathSync.native(path.join(os.userInfo().homedir, 'AppData', 'Local'))
+      if (fs.realpathSync.native(path.dirname(directory)) !== expected) throw new Error('compiler directory escaped the token profile local data root')
+      const powershell = path.win32.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+      const nativeSource = ${JSON.stringify(path.resolve(__dirname, '../../agents/codex/workflow/windows-appcontainer-native.cs'))}
+      const reflection = "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);Add-Type -Path '" + nativeSource.replace(/'/g, "''") + "';$m=[WindowsAppContainerNative].GetMethod('PrepareControllerProfileEnvironment',[Reflection.BindingFlags]::Static -bor [Reflection.BindingFlags]::NonPublic);$r=$m.Invoke($null,(,[string[]]@(('SystemRoot='+$env:SystemRoot),'TEMP=owned','LOCALAPPDATA=caller')));[Console]::Out.WriteLine(($r|Where-Object {$_ -like 'LOCALAPPDATA=*'}))"
+      const prepared = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', reflection], { encoding: 'utf8', windowsHide: true, shell: false, timeout: 60000, maxBuffer: 64 * 1024, env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.SystemRoot, SystemDrive: process.env.SystemRoot.slice(0,2), PATH: path.win32.join(process.env.SystemRoot, 'System32'), PSModulePath: '', TEMP: directory, TMP: directory } })
+      if (prepared.error || prepared.signal || prepared.status !== 0 || prepared.stderr || prepared.stdout.trim() !== 'LOCALAPPDATA=' + expected) throw new Error('native profile environment probe failed: ' + (prepared.stderr || prepared.stdout || prepared.error?.message || prepared.status))
+      const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "$ErrorActionPreference='Stop';Add-Type -TypeDefinition 'public sealed class AutopromptNativeCompilerProbe { public static int Value { get { return 1; } } }';if([AutopromptNativeCompilerProbe]::Value -ne 1){throw 'compiler probe failed'}"], { encoding: 'utf8', windowsHide: true, shell: false, timeout: 60000, maxBuffer: 64 * 1024, env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.SystemRoot, SystemDrive: process.env.SystemRoot.slice(0,2), PATH: path.win32.join(process.env.SystemRoot, 'System32'), PSModulePath: '', TEMP: directory, TMP: directory } })
+      if (result.error || result.signal || result.status !== 0 || result.stderr) throw new Error('real Add-Type compiler probe failed: ' + (result.stderr || result.error?.message || result.status))
+    } finally { fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) }
+    if (fs.existsSync(directory)) throw new Error('compiler scratch survived cleanup')
+  `
+  const deep = 'C:\\autoprompt native packed\\' + 'reviewed-local-canary\\generation-1\\'.repeat(9) + 'outer-tmp'
+  const result = cp.spawnSync(process.execPath, ['-e', child], { encoding: 'utf8', windowsHide: true, shell: false, timeout: 120000, env: { ...process.env, USERPROFILE: deep, HOME: deep, LOCALAPPDATA: deep, TEMP: deep, TMP: deep } })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.equal(result.signal, null)
 })
 
 test('Windows private ACL replaces foreign grants with exact file or directory rights and refuses linked targets', t => {
@@ -224,16 +244,19 @@ test('Windows private ACL replaces foreign grants with exact file or directory r
   const calls = []
   let mutate = value => value
   const currentSid = 'S-1-5-21-123-456-789-1001'
+  const profile = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-acl-profile-'))
+  fs.mkdirSync(path.join(profile, 'AppData', 'Local'), { recursive: true })
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
   const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(executable, argv, options) {
     calls.push({ executable, argv, options })
-    if (!options.env.AUTOPROMPT_PRIVATE_ACL_PATH) return { status: 0, signal: null, stderr: '', stdout: require('node:os').tmpdir() + '\n' }
+    if (!options.env.AUTOPROMPT_PRIVATE_ACL_PATH) return { status: 0, signal: null, stderr: '', stdout: '' }
     const snapshot = { currentName: 'runner', currentSid, items: [{ path: options.env.AUTOPROMPT_PRIVATE_ACL_PATH,
       owner: currentSid, ownerSid: currentSid, protected: true, rules: [currentSid, 'S-1-5-18'].map(sid => ({
         identity: sid, sid, type: 'Allow', inherited: false, rights: 2032127,
         inheritanceFlags: options.env.AUTOPROMPT_PRIVATE_ACL_DIRECTORY === '1' ? 3 : 0, propagationFlags: 0,
       })) }] }
     return { status: 0, signal: null, stderr: '', stdout: JSON.stringify(mutate(snapshot)) }
-  } } })
+  } } }, undefined, { userInfoHome: profile })
   assert.equal(safe.ensureWindowsPrivateAcl(file).supported, true)
   assert.equal(safe.ensureWindowsPrivateAcl(root).supported, true)
   const grants = calls.filter(call => [file, root].includes(call.options.env.AUTOPROMPT_PRIVATE_ACL_PATH))

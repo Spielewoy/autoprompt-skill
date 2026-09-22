@@ -258,20 +258,12 @@ function createWindowsCompilerDirectory(prefix = 'autoprompt-compiler-') {
   if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) {
     throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows system root is unavailable for the private compiler helper')
   }
-  const powershell = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-  const knownFolder = spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);[Console]::Out.WriteLine([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData))'], {
-    encoding: 'utf8', windowsHide: true, shell: false, timeout: 60000, maxBuffer: 64 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'], cwd: path.win32.dirname(powershell),
-    env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '' },
-  })
-  if (knownFolder.error || knownFolder.signal || knownFolder.status !== 0 || knownFolder.stderr) {
-    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token local application data root could not be resolved', {
-      status: knownFolder.status, signal: knownFolder.signal, cause: knownFolder.error && knownFolder.error.code,
-      stderr: knownFolder.stderr && knownFolder.stderr.trim(),
-    })
-  }
-  const localAppData = String(knownFolder.stdout || '').trim()
-  if (!path.isAbsolute(localAppData)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token returned no usable local application data root')
+  // userInfo reads the token's OS profile. homedir() and spawned environment
+  // lookups can use the caller's deliberately isolated, deeply nested home.
+  let profileHome
+  try { profileHome = os.userInfo().homedir } catch (error) { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token profile root could not be resolved', { cause: error && error.code }) }
+  if (typeof profileHome !== 'string' || !path.isAbsolute(profileHome)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token returned no usable profile root')
+  const localAppData = path.join(profileHome, 'AppData', 'Local')
   const inspectedLocalAppData = inspectPathNoFollow(localAppData)
   if (!inspectedLocalAppData.exists || !inspectedLocalAppData.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token local application data root is unavailable')
   let temporary
