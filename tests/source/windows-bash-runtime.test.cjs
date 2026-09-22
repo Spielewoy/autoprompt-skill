@@ -191,7 +191,31 @@ test('native Windows Bash bridges a deep canonical cwd for the admitted command 
       const fs = require('node:fs'), path = require('node:path'), net = require('node:net'), assert = require('node:assert/strict');
       const denied = operation => assert.throws(operation, error => ['EACCES', 'EPERM'].includes(error.code));
       const cwd = process.cwd(), bridgeParent = path.dirname(cwd);
-      const realCwd = fs.realpathSync.native(cwd);
+      let realCwd;
+      try { realCwd = fs.realpathSync.native(cwd); }
+      catch (failure) {
+        const canonical = ${JSON.stringify(fs.realpathSync.native(scratchPath))};
+        const observations = {};
+        for (const [label, file] of Object.entries({ alias: cwd, bridgeParent, staging: path.dirname(bridgeParent), canonical })) {
+          const probes = {
+            stat: () => { const s = fs.statSync(file, { bigint: true }); return { dev: String(s.dev), ino: String(s.ino), directory: s.isDirectory() }; },
+            lstat: () => { const s = fs.lstatSync(file, { bigint: true }); return { dev: String(s.dev), ino: String(s.ino), link: s.isSymbolicLink() }; },
+            nativeRealpath: () => { const value = fs.realpathSync.native(file); return { length: value.length, canonical: value.toLowerCase() === canonical.toLowerCase() }; },
+            realpath: () => { const value = fs.realpathSync(file); return { length: value.length, canonical: value.toLowerCase() === canonical.toLowerCase() }; },
+            readlink: () => { const value = fs.readlinkSync(file); return { length: value.length, canonical: value.toLowerCase() === canonical.toLowerCase() }; },
+            readdir: () => ({ count: fs.readdirSync(file).length }),
+          };
+          observations[label] = {};
+          for (const [operation, probe] of Object.entries(probes)) {
+            try { observations[label][operation] = probe(); }
+            catch (error) { observations[label][operation] = { code: error.code, errno: error.errno, syscall: error.syscall }; }
+          }
+        }
+        try { observations.relativeInput = fs.readFileSync('relative-input', 'utf8') === 'deep-input'; }
+        catch (error) { observations.relativeInput = { code: error.code, errno: error.errno }; }
+        process.stderr.write('cwd-filesystem-observations ' + JSON.stringify(observations) + '\\n');
+        throw failure;
+      }
       assert.equal(realCwd.toLowerCase(), ${JSON.stringify(fs.realpathSync.native(scratchPath).toLowerCase())});
       assert.equal(path.basename(bridgeParent), 'cwd-bridge');
       assert.deepEqual(fs.readdirSync(bridgeParent), ['command-cwd']);
