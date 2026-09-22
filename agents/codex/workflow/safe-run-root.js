@@ -190,6 +190,7 @@ function ensureWindowsDefaultTokenOwner() {
   ].join(' ')
   const script = [
     "$ErrorActionPreference='Stop'",
+    "[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process)",
     "[Console]::Out.WriteLine('TOKEN_OWNER_COMPILING')",
     'Add-Type -TypeDefinition $env:AUTOPROMPT_TOKEN_OWNER_SOURCE -Language CSharp',
     "[Console]::Out.WriteLine('TOKEN_OWNER_APPLYING')",
@@ -266,6 +267,7 @@ function ensureWindowsPrivateAcl(target) {
   // change which paths those callers authorize for permission updates.
   const script = [
     "$ErrorActionPreference='Stop'",
+    "[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process)",
     '$p=$env:AUTOPROMPT_PRIVATE_ACL_PATH',
     "$directory=$env:AUTOPROMPT_PRIVATE_ACL_DIRECTORY -eq '1'",
     '$attributes=[System.IO.File]::GetAttributes($p)',
