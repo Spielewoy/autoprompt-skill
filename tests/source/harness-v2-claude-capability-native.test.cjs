@@ -21,7 +21,7 @@ const core = require('../../agents/codex/workflow/phase-budget.js')
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 const { modelService } = require('../helpers/harness-native-service.cjs')
 
-const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment } = require('../helpers/native-platform.cjs')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment, waitForNativeObservation } = require('../helpers/native-platform.cjs')
 const CLI = requiredNativeCli('claude')
 
 function createFixture() {
@@ -504,8 +504,7 @@ test('claude closed native capability: cancellation drains the held child and a 
   const pending = f.run({ signal: controller.signal })
   pending.catch(() => {})
   const waitForHeldMessageMs = process.platform === 'win32' ? 180000 : 15000
-  const waitForHeldMessageUntil = Date.now() + waitForHeldMessageMs
-  while (!f.service.firstMessageHeld && Date.now() < waitForHeldMessageUntil) await new Promise(resolve => setTimeout(resolve, 25))
+  await waitForNativeObservation(pending, () => f.service.firstMessageHeld, waitForHeldMessageMs, 'the first native model response')
   assert.equal(f.service.firstMessageHeld, true, 'the first native model response must be held before cancellation')
   const identities = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: 'fast-sibling' }
   const fast = f.run({ ...identities, missionBinding: core.bindCanonicalMissionForChild(f.projection, {
@@ -513,8 +512,7 @@ test('claude closed native capability: cancellation drains the held child and a 
     requestEnvelopeHash: f.record.dispatch.requestPointer.hash,
   }) })
   fast.catch(() => {})
-  const waitForSiblingUntil = Date.now() + waitForHeldMessageMs
-  while (f.owner.ownershipIdentities().length < 2 && Date.now() < waitForSiblingUntil) await new Promise(resolve => setTimeout(resolve, 25))
+  await waitForNativeObservation(fast, () => f.owner.ownershipIdentities().length >= 2, waitForHeldMessageMs, 'both owned native children')
   assert.equal(f.owner.ownershipIdentities().length, 2, 'both owned native children must be live at cancellation')
   controller.abort()
   await assert.rejects(pending, { code: 'CHILD_CANCELLED' })
@@ -570,8 +568,7 @@ test('claude closed native capability: process ownership records completion and 
   const pending = f.run({ signal: abort.signal })
   pending.catch(() => {})
   const waitForHeldMessageMs = process.platform === 'win32' ? 180000 : 15000
-  const waitForHeldMessageUntil = Date.now() + waitForHeldMessageMs
-  while (!f.service.firstMessageHeld && Date.now() < waitForHeldMessageUntil) await new Promise(resolve => setTimeout(resolve, 25))
+  await waitForNativeObservation(pending, () => f.service.firstMessageHeld, waitForHeldMessageMs, 'the first native model response')
   assert.equal(f.service.firstMessageHeld, true, 'native request must reach the held model response before recovering its durable owner')
   const registry = JSON.parse(fs.readFileSync(f.owner.registryPath, 'utf8'))
   assert.ok(JSON.stringify(registry).includes('native-claude-'), 'owned native process was not durably registered')

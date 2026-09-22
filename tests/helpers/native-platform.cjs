@@ -55,4 +55,33 @@ function nativeEnvironment() {
   return environment
 }
 
-module.exports = { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment }
+async function waitForNativeObservation(pending, predicate, timeoutMs, description) {
+  if (!pending || typeof pending.then !== 'function' || typeof predicate !== 'function' ||
+      !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || typeof description !== 'string' || !description) {
+    throw new TypeError('Invalid native observation wait')
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false, timer
+    const deadline = performance.now() + timeoutMs
+    const finish = (callback, value) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      callback(value)
+    }
+    pending.then(() => {
+      finish(reject, new Error(`${description} settled before readiness was observed`))
+    }, error => finish(reject, error))
+    const check = () => {
+      if (settled) return
+      if (performance.now() >= deadline) { finish(reject, new Error(`Timed out waiting for ${description}`)); return }
+      let ready
+      try { ready = predicate() } catch (error) { finish(reject, error); return }
+      if (ready) { finish(resolve, true); return }
+      timer = setTimeout(check, 25)
+    }
+    timer = setTimeout(check, 0)
+  })
+}
+
+module.exports = { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment, waitForNativeObservation }

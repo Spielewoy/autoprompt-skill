@@ -112,7 +112,7 @@ const {
   projectWorkspaceResources,
   WorkerWorkspaceManager,
 } = require('./worker-workspace.js')
-const { auditPrivatePermissions, ensureWindowsPrivateAcl, pathIsInside, readFileNoFollow } = require('./safe-run-root.js')
+const { auditPrivatePermissions, ensureWindowsPrivateAcl, inspectPathNoFollow, pathIsInside, readFileNoFollow } = require('./safe-run-root.js')
 const { createDarwinFilesystemCapture, createDarwinFilesystemMutations } = require('./darwin-filesystem.js')
 const { validateJsonSchema } = require('./json-schema-validator.js')
 
@@ -10134,35 +10134,24 @@ async function runOwnedCodexProxy(requestPath) {
   }
   const stdoutHandle = fs.openSync(request.stdoutPath, 'wx', 0o600)
   const stderrHandle = fs.openSync(request.stderrPath, 'wx', 0o600)
-  // The relay path is a private controller capability, never an upstream API
-  // credential. Connect it only inside the owned proxy and pass its already
-  // opened descriptor to bwrap as stdin; the native child receives no path.
-  let relay = null
-  try { relay = request.relayStdin ? await new Promise((resolve, reject) => {
-    const socket = net.createConnection(request.relayStdin.socketPath)
-    const timeout = setTimeout(() => { socket.destroy(); reject(new SupervisorIntegrationError('CODEX_PROXY_RELAY_UNAVAILABLE', 'owned relay connection timed out')) }, 10000)
-    socket.once('connect', () => { clearTimeout(timeout); resolve(socket) })
-    socket.once('error', error => { clearTimeout(timeout); reject(new SupervisorIntegrationError('CODEX_PROXY_RELAY_UNAVAILABLE', `owned relay connection failed: ${error.message}`)) })
-  }) : null } catch (error) {
-    for (const handle of [stdoutHandle, stderrHandle]) { try { fs.closeSync(handle) } catch {} }
-    fs.writeFileSync(request.statusPath, `${JSON.stringify({ schemaVersion: 2, activationId: request.activationId, generationId: request.generationId, sequence: request.sequence, argvHash: request.argvHash, codexPid: process.pid, code: 1, signal: null, error: error.message })}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
-    throw error
-  }
-  const child = childProcess.spawn(request.executable, request.argv, {
-    cwd: request.cwd,
-    env: process.env,
-    shell: false,
-    windowsHide: true,
-    stdio: [relay || 'pipe', 'pipe', 'pipe'],
-  })
-  child.stdout.on('data', bytes => fs.writeSync(stdoutHandle, bytes))
-  child.stderr.on('data', bytes => fs.writeSync(stderrHandle, bytes))
+  let child = null
   let settled = false
-  let childError = null
+  let effectiveCwd = request.cwd
+  const boundedFailure = error => Object.freeze({
+    type: String(error?.name || 'Error').slice(0, 64),
+    code: String(error?.code || 'RUNTIME_FAILURE').slice(0, 64),
+    message: String(error?.message || error || 'owned Codex proxy failure').replace(/[\r\n]+/gu, ' ').slice(0, 512),
+    requestedCwdLength: request.cwd.length,
+    effectiveCwdLength: typeof effectiveCwd === 'string' ? effectiveCwd.length : 0,
+  })
   const finish = (code, signal, error = null) => {
     if (settled) return
     settled = true
     relay?.destroy()
+    const failure = error ? boundedFailure(error) : null
+    if (failure) {
+      try { fs.writeSync(stderrHandle, `OWNED_CODEX_PROXY_FAILED:${JSON.stringify(failure)}\n`) } catch {}
+    }
     for (const handle of [stdoutHandle, stderrHandle]) {
       try { fs.fsyncSync(handle) } catch {}
       try { fs.closeSync(handle) } catch {}
@@ -10173,12 +10162,66 @@ async function runOwnedCodexProxy(requestPath) {
       generationId: request.generationId,
       sequence: request.sequence,
       argvHash: request.argvHash,
-      codexPid: child.pid || 1,
+      codexPid: child?.pid || process.pid,
       code: code === null ? 1 : code,
       signal: signal || null,
-      error: error ? error.message : null,
+      error: failure,
     })}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
   }
+  const failBeforeChild = error => {
+    finish(1, null, error)
+    throw error
+  }
+  // The relay path is a private controller capability, never an upstream API
+  // credential. Connect it only inside the owned proxy and pass its already
+  // opened descriptor to bwrap as stdin; the native child receives no path.
+  let relay = null
+  try { relay = request.relayStdin ? await new Promise((resolve, reject) => {
+    const socket = net.createConnection(request.relayStdin.socketPath)
+    const timeout = setTimeout(() => { socket.destroy(); reject(new SupervisorIntegrationError('CODEX_PROXY_RELAY_UNAVAILABLE', 'owned relay connection timed out')) }, 10000)
+    socket.once('connect', () => { clearTimeout(timeout); resolve(socket) })
+    socket.once('error', error => { clearTimeout(timeout); reject(new SupervisorIntegrationError('CODEX_PROXY_RELAY_UNAVAILABLE', `owned relay connection failed: ${error.message}`)) })
+  }) : null } catch (error) {
+    failBeforeChild(error)
+  }
+  if (process.platform === 'win32') {
+    try {
+      if (!path.isAbsolute(request.cwd)) {
+        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy cwd is not absolute')
+      }
+      const before = inspectPathNoFollow(request.cwd)
+      effectiveCwd = process.cwd()
+      const inherited = fs.lstatSync(effectiveCwd)
+      const inheritedReal = fs.realpathSync.native(effectiveCwd)
+      const after = inspectPathNoFollow(request.cwd)
+      if (!before.exists || !after.exists ||
+          stableStringify(before.identity) !== stableStringify(after.identity) ||
+          (!inherited.isDirectory() && !inherited.isSymbolicLink()) ||
+          inheritedReal.toLowerCase() !== before.realpath.toLowerCase() || effectiveCwd.length >= 260) {
+        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy inherited cwd does not bind its requested physical directory')
+      }
+    } catch (error) { failBeforeChild(error) }
+  }
+  try {
+    child = childProcess.spawn(request.executable, request.argv, {
+      cwd: effectiveCwd,
+      env: process.env,
+      shell: false,
+      windowsHide: true,
+      stdio: [relay || 'pipe', 'pipe', 'pipe'],
+    })
+  } catch (error) { failBeforeChild(error) }
+  if (!child || !child.stdout || !child.stderr || (!relay && !child.stdin)) {
+    const error = new SupervisorIntegrationError('CODEX_PROXY_LAUNCH_INVALID', 'owned Codex proxy child lacks its required streams')
+    if (!child) failBeforeChild(error)
+    child.once('error', () => {})
+    child.once('close', (code, signal) => finish(code === null || code === 0 ? 1 : code, signal, error))
+    try { child.kill() } catch {}
+    return
+  }
+  child.stdout.on('data', bytes => fs.writeSync(stdoutHandle, bytes))
+  child.stderr.on('data', bytes => fs.writeSync(stderrHandle, bytes))
+  let childError = null
   const stdin = relay || child.stdin
   stdin.on('error', error => {
     if (!['EPIPE', 'ERR_STREAM_DESTROYED'].includes(error && error.code)) {

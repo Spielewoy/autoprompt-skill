@@ -156,3 +156,95 @@ test('native Windows Job ownership survives deep durable paths and hostile home 
   assert.deepEqual(JSON.parse(result.stdout), { deepControl: true, deepCwd: true, exactChildEnvironment: true, durableRecovery: true, drained: true })
   fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })
+
+test('native Windows owned proxy preserves deep semantic cwd through the nested child launch', { skip: process.platform !== 'win32', timeout: 240000 }, t => {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'native-proxy-long-cwd-')))
+  async function exercise(base, repo) {
+    const assert = require('node:assert/strict'), crypto = require('node:crypto'), fs = require('node:fs'), path = require('node:path')
+    const safe = require(path.join(repo, 'agents/codex/workflow/safe-run-root.js'))
+    const { OwnedCodexProxyRunner } = require(path.join(repo, 'agents/codex/workflow/phase-budget.js'))
+    const { ProcessOwner, createWindowsJobAdapter, prepareProcessLaunchEnvironment } = require(path.join(repo, 'agents/codex/workflow/process-owner.js'))
+    safe.ensureWindowsPrivateAcl(base)
+    const protectedRoot = path.join(base, ...Array(12).fill('deep-owned-proxy-controller'))
+    fs.mkdirSync(protectedRoot, { recursive: true })
+    safe.ensureWindowsPrivateAcl(protectedRoot)
+    const processControlRoot = path.join(protectedRoot, 'process-control')
+    const proxyControlRoot = path.join(protectedRoot, 'proxy-control')
+    fs.mkdirSync(proxyControlRoot)
+    const deepCwd = path.join(protectedRoot, 'semantic-working-directory')
+    fs.mkdirSync(deepCwd)
+    fs.writeFileSync(path.join(deepCwd, 'relative-input.txt'), 'nested-semantic-cwd')
+    assert.ok(deepCwd.length > 300)
+    const childPath = path.join(base, 'nested-child.cjs')
+    fs.writeFileSync(childPath, [
+      "'use strict'",
+      "const fs = require('node:fs')",
+      "const result = { cwd: process.cwd(), realCwd: fs.realpathSync.native(process.cwd()), input: fs.readFileSync('relative-input.txt', 'utf8') }",
+      "fs.writeFileSync('relative-output.json', JSON.stringify(result))",
+      "process.stdout.write(`${JSON.stringify(result)}\\n`)",
+      '',
+    ].join('\n'))
+    const mismatchRoot = path.join(base, 'mismatched-inherited-cwd')
+    fs.mkdirSync(mismatchRoot)
+    const mismatchMarker = path.join(base, 'mismatch-child-ran')
+    const mismatchArgv = ['-e', `require('node:fs').writeFileSync(${JSON.stringify(mismatchMarker)},'ran')`]
+    const mismatchRequest = {
+      schemaVersion: 2, activationId: 'mismatched-inherited-cwd', generationId: 1, sequence: 1,
+      executable: process.execPath, argv: mismatchArgv,
+      argvHash: crypto.createHash('sha256').update(JSON.stringify({ executable: process.execPath, argv: mismatchArgv })).digest('hex'),
+      cwd: deepCwd, stdin: '', stdoutPath: path.join(mismatchRoot, 'stdout.jsonl'),
+      stderrPath: path.join(mismatchRoot, 'stderr.log'), statusPath: path.join(mismatchRoot, 'status.json'),
+    }
+    const mismatchRequestPath = path.join(mismatchRoot, 'request.json')
+    fs.writeFileSync(mismatchRequestPath, `${JSON.stringify(mismatchRequest)}\n`)
+    const mismatch = require('node:child_process').spawnSync(process.execPath,
+      [path.join(repo, 'agents/codex/workflow/phase-budget.js'), '--owned-codex-proxy', mismatchRequestPath],
+      { cwd: base, encoding: 'utf8', timeout: 30000, windowsHide: true })
+    assert.ifError(mismatch.error)
+    assert.equal(mismatch.status, 2)
+    const mismatchStatus = JSON.parse(fs.readFileSync(mismatchRequest.statusPath, 'utf8'))
+    assert.equal(mismatchStatus.code, 1)
+    assert.equal(mismatchStatus.error.code, 'CODEX_PROXY_REQUEST_INVALID')
+    assert.equal(fs.existsSync(mismatchMarker), false)
+    const adapter = createWindowsJobAdapter({ controlRoot: processControlRoot, providerPrivateOwnershipRoot: protectedRoot })
+    const owner = new ProcessOwner({ adapter, registryPath: path.join(base, 'processes.json'), pollMs: 25 })
+    const runner = new OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxyControlRoot,
+      targetKey: 'deep-owned-proxy-cwd', pollMs: 25 })
+    const reservationId = crypto.randomUUID(), sessionId = 'deep-owned-proxy-session'
+    let request = null
+    const launch = owner.launch.bind(owner)
+    owner.launch = async spec => { request = JSON.parse(fs.readFileSync(spec.argv.at(-1), 'utf8')); return launch(spec) }
+    try {
+      const lines = []
+      const execution = await runner.run({ executable: process.execPath, argv: [childPath], cwd: deepCwd,
+        env: prepareProcessLaunchEnvironment(adapter, reservationId, {
+          SystemRoot: process.env.SystemRoot,
+          PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
+        }), stdin: '', sessionId, reservationId, onStdoutLine: line => lines.push(line) })
+      assert.equal(execution.status, 0)
+      assert.equal(execution.drained, true)
+      assert.equal(request.cwd.toLowerCase(), deepCwd.toLowerCase())
+      const observed = JSON.parse(fs.readFileSync(path.join(deepCwd, 'relative-output.json'), 'utf8'))
+      assert.equal(observed.input, 'nested-semantic-cwd')
+      assert.ok(observed.cwd.length < 260)
+      assert.equal(observed.realCwd.toLowerCase(), fs.realpathSync.native(deepCwd).toLowerCase())
+      assert.deepEqual(lines.map(line => JSON.parse(line)), [observed])
+      await owner.assertTargetDrained('deep-owned-proxy-cwd')
+      await owner.assertDrained()
+      process.stdout.write(`${JSON.stringify({ nestedLaunch: true, semanticCwd: true, relativeIO: true, drained: true })}\n`)
+    } finally {
+      try { await runner.stop({ sessionId, reason: 'native nested proxy cleanup' }) } catch {}
+      try { await owner.cancelAll({ reason: 'native nested proxy cleanup', graceMs: 0, killMs: 10000 }) } catch {}
+    }
+  }
+  const hostile = path.join(base, ...Array(16).fill('caller-home-and-temp'))
+  const source = '(' + exercise.toString() + ')(' + JSON.stringify(base) + ',' + JSON.stringify(path.resolve(__dirname, '../..')) + ').catch(error=>{console.error(error);process.exitCode=1})'
+  const result = cp.spawnSync(process.execPath, ['-e', source], { encoding: 'utf8', timeout: 210000, windowsHide: true,
+    env: { ...process.env, USERPROFILE: hostile, HOME: hostile, APPDATA: hostile, LOCALAPPDATA: hostile, TEMP: hostile, TMP: hostile } })
+  if (result.error || result.status !== 0) t.diagnostic('Native nested proxy fixture retained after failure: ' + base)
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.equal(result.stderr, '')
+  assert.deepEqual(JSON.parse(result.stdout), { nestedLaunch: true, semanticCwd: true, relativeIO: true, drained: true })
+  fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+})

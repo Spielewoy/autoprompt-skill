@@ -17,6 +17,7 @@ const WINDOWS_NATIVE_CASES = Object.freeze([
   'native Windows compiler staging ignores deep home and temp overrides',
   'Windows Job bridge compiles and preserves atomic status publication on native long paths',
   'native Windows Job ownership survives deep durable paths and hostile home variables',
+  'native Windows owned proxy preserves deep semantic cwd through the nested child launch',
   'native Windows host NUL basic query records exact and oversized buffer results',
   'native Windows Node pipe diagnostic records stdio and fork IPC support with owned job drain',
   'native Windows NUL diagnostic records exact device access under an AppContainer token',
@@ -56,6 +57,7 @@ const DIAGNOSTIC_STAGES = Object.freeze([
     'native Windows compiler staging ignores deep home and temp overrides',
     'Windows Job bridge compiles and preserves atomic status publication on native long paths',
     'native Windows Job ownership survives deep durable paths and hostile home variables',
+    'native Windows owned proxy preserves deep semantic cwd through the nested child launch',
     'native Windows Bash repeated forks complete without retry diagnostics',
   ]) }),
   Object.freeze({ id: 'direct', cases: Object.freeze([

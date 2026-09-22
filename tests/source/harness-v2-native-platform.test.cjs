@@ -6,17 +6,39 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
-const { nodeCommand, readCommand, withChallenge } = require('../helpers/native-platform.cjs')
+const { nodeCommand, readCommand, withChallenge, waitForNativeObservation } = require('../helpers/native-platform.cjs')
 const { WINDOWS_NATIVE_CASES, DIAGNOSTIC_STAGES, assertHostPrimitiveCases, runDiagnosticStages } = require('../helpers/native-platform-ci.cjs')
 
 test('Claude diagnostic plan failfasts infrastructure and direct checks before packed activation', () => {
   assert.deepEqual(DIAGNOSTIC_STAGES.map(stage => stage.id), ['infra', 'direct', 'packed'])
-  assert.equal(DIAGNOSTIC_STAGES[0].cases.length, 4)
+  assert.equal(DIAGNOSTIC_STAGES[0].cases.length, 5)
   assert.equal(DIAGNOSTIC_STAGES[1].cases.length, 1)
   assert.equal(DIAGNOSTIC_STAGES[2].cases.length, 1)
   assert.match(DIAGNOSTIC_STAGES[0].cases.at(-1), /Bash repeated forks/)
   assert.match(DIAGNOSTIC_STAGES[1].cases[0], /^claude closed native capability:/)
   assert.match(DIAGNOSTIC_STAGES[2].cases[0], /^packed actual Claude activation/)
+})
+
+test('native observation wait preserves early failures and rejects premature success', async () => {
+  const original = new Error('original native launch failure')
+  const rejected = Promise.reject(original)
+  await assert.rejects(waitForNativeObservation(rejected, () => false, 100, 'fixture observation'), error => error === original)
+  await assert.rejects(waitForNativeObservation(Promise.resolve('done'), () => false, 100, 'fixture observation'), /settled before readiness/)
+})
+
+test('native observation wait reaches a condition and leaves no polling requirement', async () => {
+  let ready = false
+  const pending = new Promise(resolve => setTimeout(resolve, 80))
+  const flip = setTimeout(() => { ready = true }, 20)
+  try { assert.equal(await waitForNativeObservation(pending, () => ready, 500, 'fixture observation'), true) }
+  finally { clearTimeout(flip) }
+})
+
+test('native observation wait bounds stalled execution and propagates predicate failures', { timeout: 1000 }, async () => {
+  const pending = new Promise(() => {})
+  await assert.rejects(waitForNativeObservation(pending, () => false, 30, 'stalled fixture'), /Timed out waiting for stalled fixture/)
+  const original = new Error('predicate failed')
+  await assert.rejects(waitForNativeObservation(pending, () => { throw original }, 100, 'predicate fixture'), error => error === original)
 })
 
 test('Claude diagnostic runner stops before packed activation and publishes skipped-stage evidence', async t => {

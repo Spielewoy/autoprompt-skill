@@ -2,6 +2,7 @@
 'use strict'
 
 const assert = require('node:assert/strict')
+const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -30,6 +31,67 @@ async function waitFor(predicate, timeoutMs, description) {
   }
   assert.fail(`timed out waiting for ${description}`)
 }
+
+test('owned Codex proxy durably records a synchronous nested spawn refusal', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-owned-proxy-spawn-refusal-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const preload = path.join(directory, 'refuse-spawn.cjs')
+  fs.writeFileSync(preload, [
+    "'use strict'",
+    "const childProcess = require('node:child_process')",
+    'childProcess.spawn = () => {',
+    "  const error = new Error('forced synchronous nested spawn refusal')",
+    "  error.code = 'ENAMETOOLONG'",
+    '  throw error',
+    '}',
+    '',
+  ].join('\n'))
+  const executable = process.execPath
+  const argv = ['fixture-child.cjs']
+  const request = {
+    schemaVersion: 2,
+    activationId: 'spawn-refusal-activation',
+    generationId: 7,
+    sequence: 3,
+    executable,
+    argv,
+    argvHash: crypto.createHash('sha256').update(JSON.stringify({ executable, argv })).digest('hex'),
+    cwd: directory,
+    stdin: '',
+    stdoutPath: path.join(directory, 'stdout.jsonl'),
+    stderrPath: path.join(directory, 'stderr.log'),
+    statusPath: path.join(directory, 'status.json'),
+  }
+  const requestPath = path.join(directory, 'request.json')
+  fs.writeFileSync(requestPath, `${JSON.stringify(request)}\n`)
+  const result = cp.spawnSync(process.execPath, ['--require', preload,
+    path.join(WORKFLOW, 'phase-budget.js'), '--owned-codex-proxy', requestPath], {
+    cwd: directory, encoding: 'utf8', timeout: 30_000,
+  })
+  assert.ifError(result.error)
+  assert.equal(result.status, 2)
+  const status = JSON.parse(fs.readFileSync(request.statusPath, 'utf8'))
+  assert.deepEqual(Object.fromEntries(Object.entries(status).filter(([key]) => !['codexPid', 'error'].includes(key))), {
+    schemaVersion: 2,
+    activationId: request.activationId,
+    generationId: request.generationId,
+    sequence: request.sequence,
+    argvHash: request.argvHash,
+    code: 1,
+    signal: null,
+  })
+  assert.ok(Number.isSafeInteger(status.codexPid) && status.codexPid > 0)
+  assert.deepEqual(status.error, {
+    type: 'Error',
+    code: 'ENAMETOOLONG',
+    message: 'forced synchronous nested spawn refusal',
+    requestedCwdLength: directory.length,
+    effectiveCwdLength: directory.length,
+  })
+  assert.equal(fs.readFileSync(request.stdoutPath, 'utf8'), '')
+  assert.equal(fs.readFileSync(request.stderrPath, 'utf8'),
+    `OWNED_CODEX_PROXY_FAILED:${JSON.stringify(status.error)}\n`)
+})
 
 test('owned Codex proxy publishes status only after inherited output closes and retains final usage', {
   timeout: 30_000,
