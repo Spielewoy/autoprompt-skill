@@ -829,7 +829,7 @@ jobs:
         if: inputs.msys_fork_memory == true
         shell: pwsh
         run: |
-          node scripts/windows-msys/fork-memory-diagnostic/run.cjs $PWD.Path (Join-Path $env:RUNNER_TEMP 'msys-fork-memory')
+          node scripts/windows-msys/fork-memory-diagnostic/compare.cjs $PWD.Path (Join-Path $env:RUNNER_TEMP 'msys-fork-memory')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve native fork memory observations
         if: always() && inputs.msys_fork_memory == true
@@ -841,6 +841,10 @@ jobs:
             ${{ runner.temp }}/msys-fork-memory/*.txt
             ${{ runner.temp }}/msys-fork-memory/generated/*
             ${{ runner.temp }}/msys-fork-memory/work/*.json
+            ${{ runner.temp }}/msys-fork-memory/*/*.json
+            ${{ runner.temp }}/msys-fork-memory/*/*.txt
+            ${{ runner.temp }}/msys-fork-memory/*/generated/*
+            ${{ runner.temp }}/msys-fork-memory/*/work/*.json
           if-no-files-found: error
 
   msys-pipe-trace:
