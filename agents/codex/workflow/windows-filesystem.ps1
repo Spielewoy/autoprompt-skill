@@ -33,7 +33,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
 public static class AutopromptWindowsCapture {
-  const uint FILE_READ_DATA = 0x00000001, FILE_READ_ATTRIBUTES = 0x00000080, SYNCHRONIZE = 0x00100000;
+  const uint FILE_READ_DATA = 0x00000001, FILE_WRITE_ATTRIBUTES = 0x00000100, FILE_READ_ATTRIBUTES = 0x00000080, SYNCHRONIZE = 0x00100000;
   const uint FILE_SHARE_READ = 0x00000001, FILE_SHARE_WRITE = 0x00000002, FILE_SHARE_DELETE = 0x00000004, FILE_OPEN = 1;
   const uint FILE_DIRECTORY_FILE = 0x00000001, FILE_NON_DIRECTORY_FILE = 0x00000040;
   const uint FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020, FILE_OPEN_REPARSE_POINT = 0x00200000;
@@ -517,7 +517,8 @@ public static class AutopromptWindowsCapture {
     }
   }
   static Opened OpenOwned(string name, IntPtr parent, bool deleting, bool allowMissing) {
-    IntPtr handle = Open(name, parent, false, false, false, false, deleting, true, allowMissing);
+    IntPtr handle = Open(name, parent, false, false, false, false, deleting, true, allowMissing,
+      deleting ? FILE_WRITE_ATTRIBUTES : 0u);
     try {
       Snapshot snapshot = Info(handle); bool directory = (snapshot.Attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
       Need(directory || snapshot.Links == 1, "PREIMAGE_UNSAFE"); CheckCanonicalComponentName(handle, name);
@@ -752,13 +753,30 @@ public static class AutopromptWindowsCapture {
         finally { if (fresh != IntPtr.Zero) CloseHandle(fresh); }
       }
       Verify(chain, nativeRoot); ValidateRootVolume(chain[0].Handle, root, mapping);
-      for (int i = nodes.Count - 1; i >= 0; i--) {
-        Opened item = nodes[i].Opened; Snapshot now = Info(item.Handle);
-        Need(item.Directory ? SameDirectoryIdentity(item.Snapshot, now) : item.Snapshot.Same(now), "PREIMAGE_UNSAFE");
-        IntPtr information = Marshal.AllocHGlobal(1);
-        try { Marshal.WriteByte(information, 1); IO_STATUS_BLOCK io; Need(NtSetInformationFile(item.Handle, out io, information, 1, 13) == 0, "PREIMAGE_UNSAFE"); }
-        finally { Marshal.FreeHGlobal(information); }
-        CloseHandle(item.Handle); item.Handle = IntPtr.Zero;
+      var clearedReadonly = new List<Opened>();
+      try {
+        // Git marks object and pack files read-only. Mutate attributes only
+        // after the complete held tree and every fresh identity were validated.
+        foreach (TreeNode node in nodes) if ((node.Opened.Snapshot.Attributes & 1) != 0) {
+          // Record rollback authority before the syscall: setting the attribute
+          // can succeed even if its postcondition check subsequently refuses.
+          clearedReadonly.Add(node.Opened); TransactionReadonly(node.Opened, false);
+        }
+        for (int i = nodes.Count - 1; i >= 0; i--) {
+          Opened item = nodes[i].Opened; Snapshot now = Info(item.Handle);
+          Need(item.Directory ? SameDirectoryIdentity(item.Snapshot, now) : item.Snapshot.Same(now), "PREIMAGE_UNSAFE");
+          IntPtr information = Marshal.AllocHGlobal(1);
+          try { Marshal.WriteByte(information, 1); IO_STATUS_BLOCK io; Need(NtSetInformationFile(item.Handle, out io, information, 1, 13) == 0, "PREIMAGE_UNSAFE"); }
+          finally { Marshal.FreeHGlobal(information); }
+          CloseHandle(item.Handle); item.Handle = IntPtr.Zero;
+        }
+      } catch {
+        // A still-held object was not deleted. Restore its original read-only
+        // state before reporting failure; already-deleted handles are zero.
+        for (int i = clearedReadonly.Count - 1; i >= 0; i--) if (clearedReadonly[i].Handle != IntPtr.Zero) {
+          try { TransactionReadonly(clearedReadonly[i], true); } catch {}
+        }
+        throw;
       }
       VerifyMutationParents(chain, nativeRoot); ValidateRootVolume(chain[0].Handle, root, mapping);
       bool absent = false;

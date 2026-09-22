@@ -133,6 +133,16 @@ portableTest('cleaned external root id can bind a distinct newly allocated root'
   const context = fixture(t)
   const first = registerRoot(context)
   context.registry.run()
+  fs.mkdirSync(context.externalRoot)
+  assert.throws(() => context.registry.registerExternalRoot({
+    id: first.id,
+    path: context.externalRoot,
+    kind: 'windows-checker-snapshots',
+    owner: 'external-root-test',
+  }), error => error.code === 'CLEANUP_EXTERNAL_ROOT_DUPLICATE')
+  assert.equal(context.registry.load().externalRoots.length, 1,
+    'refused historical-path reuse must not corrupt the durable registry')
+  fs.rmdirSync(context.externalRoot)
   const replacement = path.join(context.directory, 'short-external-next')
   fs.mkdirSync(replacement)
   const second = context.registry.registerExternalRoot({

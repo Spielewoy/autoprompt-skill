@@ -326,6 +326,7 @@ test('native Windows owned proxy preserves deep semantic cwd through the nested 
       const execution = await runner.run({ executable: process.execPath, argv: [childPath], cwd: deepCwd,
         env: prepareProcessLaunchEnvironment(adapter, reservationId, {
           SystemRoot: process.env.SystemRoot,
+          PATH: path.join(process.env.SystemRoot, 'System32'),
           PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
           NODE_OPTIONS: process.env.NODE_OPTIONS,
           AUTOPROMPT_OWNED_PROXY_BOOT_TRACE: process.env.AUTOPROMPT_OWNED_PROXY_BOOT_TRACE,
@@ -369,6 +370,8 @@ test('native Windows owned proxy preserves deep semantic cwd through the nested 
   try {
     result = await ownedTest(owner, outerRoot, {
       SystemRoot: process.env.SystemRoot,
+      // Node 20's libuv requires PATH even when launching an absolute executable.
+      PATH: path.join(process.env.SystemRoot, 'System32'),
       PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
       ...bootDiagnostic,
       USERPROFILE: hostile, HOME: hostile, APPDATA: hostile, LOCALAPPDATA: hostile, TEMP: hostile, TMP: hostile,
@@ -441,6 +444,7 @@ test('native Windows owned proxy projects canonical Claude temp through a forced
   const reservationId = crypto.randomUUID(), sessionId = crypto.randomUUID()
   const env = prepareProcessLaunchEnvironment(adapter, reservationId, {
     SystemRoot: process.env.SystemRoot,
+    PATH: path.join(process.env.SystemRoot, 'System32'),
     PROCESSOR_ARCHITECTURE: process.arch === 'arm64' ? 'ARM64' : 'AMD64',
     TEMP: canonicalTemp, TMP: canonicalTemp, TMPDIR: canonicalTemp,
     ...bootDiagnostic,

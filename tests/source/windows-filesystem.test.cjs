@@ -438,7 +438,9 @@ test('Windows terminal publication is exclusive, byte-bound, and cleans only its
 
 test('Windows owned cleanup binds the target, validates the entire tree, and proves final absence', { skip: !windows }, t => {
   const root = fixture(t, true), target = path.join(root, 'scratch'), nested = path.join(target, 'nested')
+  const readonly = path.join(nested, 'readonly-object')
   fs.mkdirSync(nested, { recursive: true }); fs.writeFileSync(path.join(target, 'keep-until-validation'), 'a'); fs.writeFileSync(path.join(nested, 'data'), 'b')
+  fs.writeFileSync(readonly, 'git-style readonly object'); fs.chmodSync(readonly, 0o444)
   const backend = require('../../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture()
   const owned = backend.inspectOwnedTarget(target)
   assert.equal(owned.parentIdentity.ino, String(fs.lstatSync(root, { bigint: true }).ino))
@@ -448,6 +450,8 @@ test('Windows owned cleanup binds the target, validates the entire tree, and pro
   fs.linkSync(path.join(nested, 'data'), path.join(nested, 'hardlink'))
   assert.throws(() => backend.removeOwnedTarget(target, owned.parentIdentity, owned.targetIdentity), { code: 'PREIMAGE_UNSAFE' })
   assert.equal(fs.readFileSync(path.join(target, 'keep-until-validation'), 'utf8'), 'a')
+  assert.equal(fs.statSync(readonly).mode & 0o200, 0, 'refused validation must not clear a read-only child')
+  assert.equal(fs.readFileSync(readonly, 'utf8'), 'git-style readonly object')
   fs.unlinkSync(path.join(nested, 'hardlink'))
   assert.equal(backend.removeOwnedTarget(target, owned.parentIdentity, owned.targetIdentity).removed, true)
   assert.equal(fs.existsSync(target), false)

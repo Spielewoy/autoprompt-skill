@@ -199,7 +199,22 @@ test('native Git checker snapshots preserve exact bytes beyond Windows MAX_PATH 
   const failedClone = cleanupRegistry.load().entries.find(entry => entry.owner === 'failed-clone-checker')
   assert.ok(failedClone, 'failed clone storage is registered before Git can write partial bytes')
   assert.equal(failedClone.status, 'REGISTERED')
-  cleanupRegistry.run()
+  try { cleanupRegistry.run() } catch (error) {
+    const remaining = []
+    const visit = directory => {
+      for (const name of fs.readdirSync(directory)) {
+        if (remaining.length >= 128) return
+        const filename = path.join(directory, name), item = fs.lstatSync(filename, { bigint: true })
+        remaining.push({ path: path.relative(selectedRoot, filename), ino: String(item.ino),
+          mode: String(item.mode), links: String(item.nlink), bytes: String(item.size) })
+        if (item.isDirectory() && !item.isSymbolicLink()) visit(filename)
+      }
+    }
+    try { visit(selectedRoot) } catch {}
+    t.diagnostic(`Owned snapshot cleanup refused: ${JSON.stringify({ code: error.code,
+      expected: registered[0].targetIdentity, remaining }).slice(0, 8192)}`)
+    throw error
+  }
   assert.equal(fs.existsSync(snapshot), false)
   assert.equal(fs.existsSync(failedClone.path), false)
   if (process.platform === 'win32') assert.equal(fs.existsSync(selectedRoot), false)
