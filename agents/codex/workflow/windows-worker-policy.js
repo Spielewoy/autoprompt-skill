@@ -61,7 +61,7 @@ module.exports=Object.freeze({
   "pipeline": {
     "windows-worker-capture.js": "be7a84dc0ab2eb8a7a2f250ac315b628736fcc89eb46d9a331547750a58b146f",
     "windows-worker-decoder.js": "e006e1eec10b6c112dd95f8e2cfb3546622ee0b33bb9412b07b38b51a8104423",
-    "windows-worker-loader.js": "ebe0023a453629dcc17c18d6b4a9274f683f8f56e1982314c88668cc73213ecd",
+    "windows-worker-loader.js": "7d68c240e96402d336ef7de03545df5672059ccfb1a112c08a7e53bdbed0f584",
     "windows-worker-pe.js": "d8914396f52767d203374369a1d785fe7b744a57d77f1d13219d1c88b1992845",
     "safe-run-root.js": "80f35458f967ef168eed1d35ded541183e107300e9665d25521ffd2d1fb355e3"
   },
@@ -103,5 +103,5 @@ module.exports=Object.freeze({
     ]
   },
   "sharedId": "msys-2.0S5",
-  "sourceIdentity": "9cb84b4dc65ff4f5ff3a2e8bb688fb486a645ab743eb38017b7c3d0eba201e87"
+  "sourceIdentity": "5cb561d007f5b7edb2d89912c4db5b2280ddd70ec4973f33505dedab66a13b7d"
 })

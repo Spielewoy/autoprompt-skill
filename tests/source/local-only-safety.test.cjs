@@ -131,6 +131,43 @@ function boundaryEnvironment(context) {
   })
 }
 
+test('native Git checker snapshots preserve exact bytes beyond Windows MAX_PATH under the local-only boundary', t => {
+  const context = makeRepo(t)
+  const target = fs.realpathSync.native(context.repo)
+  const file = path.join(target, 'candidate.txt')
+  fs.writeFileSync(file, 'committed candidate\n')
+  git(context, ['add', '--', 'candidate.txt'])
+  git(context, ['-c', 'user.name=Snapshot Test', '-c', 'user.email=snapshot@example.invalid',
+    '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'snapshot fixture'])
+  git(context, ['config', '--local', 'core.longpaths', 'false'])
+  const originalHead = git(context, ['rev-parse', 'HEAD']).stdout.trim()
+  const originalConfig = fs.readFileSync(path.join(target, '.git', 'config'))
+  fs.writeFileSync(file, 'exact dirty candidate\n')
+  let snapshotRoot = fs.realpathSync.native(context.sandbox)
+  while (snapshotRoot.length < 300) snapshotRoot = path.join(snapshotRoot, 'deep-checker-snapshot')
+  const options = { configIsolationPath: context.configIsolation, ghConfigDir: context.ghConfigDir }
+  const environment = createSafeChildGitEnvironment(target, context.env, options)
+  assert.equal(run('git', ['-C', target, 'config', '--get', 'core.longpaths'], { env: environment }).stdout.trim(), 'true')
+  const registrations = []
+  const factory = require('../../agents/codex/workflow/phase-budget.js').createCheckerSnapshotFactory({
+    targetPath: target, snapshotRoot, expectedBranch: EXPECTED_BRANCH,
+    runId: 'native-deep-snapshot', generation: 1,
+    gitEnvironment: repository => createSafeChildGitEnvironment(repository, context.env, options),
+    enforcementProofPath: context.proofPath, safetyScriptPath: CHECKER,
+    cleanupRegistry: { register: entry => registrations.push(entry) },
+  })
+  const snapshot = factory('native-deep-checker', [])
+  assert.ok(snapshot.length > 300)
+  assert.equal(fs.readFileSync(path.join(snapshot, 'candidate.txt'), 'utf8'), 'exact dirty candidate\n')
+  const head = run('git', ['-C', snapshot, 'rev-parse', 'HEAD'], { env: environment })
+  assert.equal(head.status, 0, head.stderr)
+  assert.equal(head.stdout.trim(), originalHead)
+  assert.deepEqual(fs.readFileSync(path.join(target, '.git', 'config')), originalConfig)
+  assert.equal(environment.GIT_ALLOW_PROTOCOL, 'file')
+  assert.equal(run('git', ['-C', snapshot, 'config', '--get', 'protocol.allow'], { env: environment }).stdout.trim(), 'never')
+  assert.deepEqual(registrations, [{ path: snapshot, kind: 'checker-snapshot', owner: 'native-deep-checker' }])
+})
+
 function invoke(context, expectedBranch = EXPECTED_BRANCH, extra = [], options = {}) {
   const environment = options.boundary === false ? context.env : boundaryEnvironment(context)
   const result = run(process.execPath, [

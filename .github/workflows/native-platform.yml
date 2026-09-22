@@ -692,6 +692,7 @@ jobs:
             native-platform-primitives.log
             native-platform-doctor.log
             native-platform-kilo-shell.log
+            native-platform-snapshot.log
           if-no-files-found: warn
       - name: Packed installer lifecycle
         if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)

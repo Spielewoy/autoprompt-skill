@@ -555,6 +555,13 @@
       "payloadDigest": "aa55d60bd3fe1f37530a1a2b566fc8462aa8dc84151fce38e1e82379e6e2acee",
       "previousRecordDigest": "3b80641c8d0f3452917858edbb78dda8e18fad37238c6488ed998c945a8f29b8",
       "recordDigest": "d0a089cf7c56b83b694ed92f46624d7eaac40c27a2216259fd0c8f92706757cb"
+    },
+    {
+      "version": "1.0.84",
+      "payloadGeneration": "codex-v2.0.0-5ce12381bf475979",
+      "payloadDigest": "5ce12381bf47597961a1422ad95031f83b0c0930a18b19632caeec211598b6f5",
+      "previousRecordDigest": "d0a089cf7c56b83b694ed92f46624d7eaac40c27a2216259fd0c8f92706757cb",
+      "recordDigest": "1492430b8c51b92b00d63fe151977716723a03ad8676da55230d9b79685bbd3e"
     }
   ]
 }

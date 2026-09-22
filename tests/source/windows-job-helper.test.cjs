@@ -74,8 +74,29 @@ function createOwnedProxyBootDiagnostic(root) {
     '}',
     '',
   ].join('\n'))
-  return { NODE_OPTIONS: `--require="${preload}"`, AUTOPROMPT_OWNED_PROXY_BOOT_TRACE: trace }
+  return { NODE_OPTIONS: `--require=${JSON.stringify(preload)}`, AUTOPROMPT_OWNED_PROXY_BOOT_TRACE: trace }
 }
+
+test('owned proxy diagnostic preload preserves quoted literal path characters', t => {
+  const parent = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'proxy-preload-quote-')))
+  t.after(() => fs.rmSync(parent, { recursive: true, force: true }))
+  const root = path.join(parent, 'literal\\component with space')
+  fs.mkdirSync(root, { recursive: true })
+  const diagnostic = createOwnedProxyBootDiagnostic(root)
+  const rawQuoted = cp.spawnSync(process.execPath, ['-e', '', '--', '--owned-codex-proxy'], {
+    encoding: 'utf8', env: { ...process.env, ...diagnostic, NODE_OPTIONS: `--require="${path.join(root, 'proxy-boot-preload.cjs')}"` }, timeout: 30000,
+  })
+  assert.ifError(rawQuoted.error)
+  assert.notEqual(rawQuoted.status, 0, 'raw NODE_OPTIONS quoting must not silently pass a literal backslash path')
+  const result = cp.spawnSync(process.execPath, ['-e', '', '--', '--owned-codex-proxy'], {
+    encoding: 'utf8', env: { ...process.env, ...diagnostic }, timeout: 30000,
+  })
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr)
+  const records = fs.readFileSync(diagnostic.AUTOPROMPT_OWNED_PROXY_BOOT_TRACE, 'utf8').trim().split('\n').map(JSON.parse)
+  assert.ok(records.some(record => record.phase === 'preload-enter'))
+  assert.ok(records.every(record => record.node === process.version))
+})
 
 test('Windows Job cwd bridge cleanup remains owned until its terminal publication', () => {
   const cleaning = {

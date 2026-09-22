@@ -134,7 +134,9 @@ async function captureUncached(){
   const capability=decoder.captureBytes(captured.records[0].bytes,captured.records.slice(1),policy.manifest.sha256)
   const selected=policy.files.filter(file=>!file.path.includes('node-')||file.path===`assets/node-${arch}.br`),files=[]
   for(const item of selected){
-    const bytes=await decoder.decode(capability,item.path)
+    // Node expands to roughly 100 MiB. Concurrent isolated commands can contend
+    // for CPU without weakening the smaller worker assets' 15 second bound.
+    const bytes=await decoder.decode(capability,item.path,item.path===`assets/node-${arch}.br`?{deadlineMs:60000}:undefined)
     verifyPe(bytes,item.path.includes('node-')?arch:'x64',item.path==='assets/msys.br',policy.imports[item.path])
     if(item.path==='assets/msys.br')need(parseSharedId(bytes)===policy.sharedId,'msys-shared-id-mismatch')
     files.push({path:item.path.includes('node-')?'usr/bin/node.exe':item.output,sha256:item.rawSha256,bytes})

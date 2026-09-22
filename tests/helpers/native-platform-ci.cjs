@@ -6,6 +6,7 @@ const cp = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
+const GIT_SNAPSHOT_CASE = 'native Git checker snapshots preserve exact bytes beyond Windows MAX_PATH under the local-only boundary'
 
 function exportEnvironment(name, value) {
   assert.ok(process.env.GITHUB_ENV, 'This setup command requires GITHUB_ENV')
@@ -180,6 +181,8 @@ async function main() {
     assert.equal(process.platform, 'win32')
     const cases = DIAGNOSTIC_STAGES.filter(stage => ['command-cwd', 'infra'].includes(stage.id)).flatMap(stage => stage.cases)
     const stages = [
+      { id: 'snapshot', cases: [GIT_SNAPSHOT_CASE], argv: ['--test-name-pattern', `^${GIT_SNAPSHOT_CASE}$`,
+        'tests/source/local-only-safety.test.cjs'] },
       { id: 'launch', cases, argv: ['--test-name-pattern', `^(?:${cases.join('|')})$`,
         'tests/source/windows-bash-runtime.test.cjs', 'tests/source/windows-job-helper.test.cjs'] },
       { id: 'installer', cases: ['packed artifact installs and verifies all public providers without the checkout or network'],
@@ -231,6 +234,10 @@ async function main() {
     assert.equal(code, 0, 'Platform primitives failed')
     const count = assertHostPrimitiveCases(output)
     process.stdout.write(`Executed ${count} required native ${process.platform}/${process.arch} primitive cases without skips.\n`)
+    const snapshot = await runTests(['--test', '--test-reporter=tap', '--test-name-pattern', `^${GIT_SNAPSHOT_CASE}$`,
+      'tests/source/local-only-safety.test.cjs'], process.env, 'native-platform-snapshot.log')
+    assert.equal(snapshot.code, 0, 'Native deep Git checker snapshot failed')
+    assertNamedCase(snapshot.output, GIT_SNAPSHOT_CASE)
     return
   }
   if (action === 'prepare') {

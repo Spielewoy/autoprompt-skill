@@ -2106,6 +2106,8 @@ function Set-IdemManifestHashes {
     $identityHashes = $null
     $incomingHashes = $null
     $incomingKeys = $null
+    $incomingExpectedHashes = $null
+    $incomingHasExpectedHash = $null
     $incomingOrder = @()
     if ($UseIdentityIndex) {
         $identityKeys = New-Object `
@@ -2119,6 +2121,12 @@ function Set-IdemManifestHashes {
             (Get-IdemPathComparer)
         $incomingKeys = New-Object `
             'System.Collections.Generic.Dictionary[string,string]' `
+            (Get-IdemPathComparer)
+        $incomingExpectedHashes = New-Object `
+            'System.Collections.Generic.Dictionary[string,string]' `
+            (Get-IdemPathComparer)
+        $incomingHasExpectedHash = New-Object `
+            'System.Collections.Generic.Dictionary[string,bool]' `
             (Get-IdemPathComparer)
         foreach ($existingKey in $entries.Keys) {
             $existingIdentity = Get-IdemManifestKeyIdentity `
@@ -2152,6 +2160,26 @@ function Set-IdemManifestHashes {
     foreach ($item in $Hashes) {
         $key = [string]$item.Key
         $hash = [string]$item.Hash
+        $hasExpectedPreviousHash = $false
+        $expectedPreviousHash = ''
+        if ($UseIdentityIndex) {
+            if ($item -is [System.Collections.IDictionary]) {
+                $hasExpectedPreviousHash = $item.Contains('ExpectedPreviousHash')
+            } else {
+                $hasExpectedPreviousHash = $null -ne `
+                    $item.PSObject.Properties['ExpectedPreviousHash']
+            }
+            if ($hasExpectedPreviousHash) {
+                $expectedPreviousHash = [string]$item.ExpectedPreviousHash
+                if (-not [string]::IsNullOrEmpty($expectedPreviousHash) -and
+                    -not (Test-IdemSha256 -Hash $expectedPreviousHash)) {
+                    [Console]::Error.WriteLine(
+                        "error=hash-manifest-invalid-entry path=$manifest key=$key"
+                    )
+                    return $false
+                }
+            }
+        }
         if ($UseIdentityIndex) {
             $key = ConvertTo-IdemPortableManifestKey `
                 -ConfigRoot $ConfigRoot -Target $key
@@ -2165,16 +2193,32 @@ function Set-IdemManifestHashes {
             )
             return $false
         }
-        if ($UseIdentityIndex -and
-            $identityHashes.ContainsKey($keyIdentity) -and
-            $identityHashes[$keyIdentity] -cne $hash) {
-            [Console]::Error.WriteLine(
-                "error=hash-manifest-invalid-entry path=$manifest key=$key"
-            )
-            return $false
+        if ($UseIdentityIndex) {
+            $actualPreviousHash = if ($identityHashes.ContainsKey($keyIdentity)) {
+                [string]$identityHashes[$keyIdentity]
+            } else { '' }
+            if ($hasExpectedPreviousHash) {
+                if ($actualPreviousHash -cne $expectedPreviousHash) {
+                    [Console]::Error.WriteLine(
+                        "error=hash-manifest-invalid-entry path=$manifest key=$key"
+                    )
+                    return $false
+                }
+            } elseif (-not [string]::IsNullOrEmpty($actualPreviousHash) -and
+                $actualPreviousHash -cne $hash) {
+                [Console]::Error.WriteLine(
+                    "error=hash-manifest-invalid-entry path=$manifest key=$key"
+                )
+                return $false
+            }
         }
         if ($UseIdentityIndex -and $incomingHashes.ContainsKey($keyIdentity)) {
-            if ($incomingHashes[$keyIdentity] -cne $hash) {
+            if ($incomingHashes[$keyIdentity] -cne $hash -or
+                $incomingHasExpectedHash[$keyIdentity] -ne `
+                    $hasExpectedPreviousHash -or
+                ($hasExpectedPreviousHash -and
+                    $incomingExpectedHashes[$keyIdentity] -cne `
+                        $expectedPreviousHash)) {
                 [Console]::Error.WriteLine(
                     "error=hash-manifest-invalid-entry path=$manifest key=$key"
                 )
@@ -2185,6 +2229,12 @@ function Set-IdemManifestHashes {
         if ($UseIdentityIndex) {
             $incomingHashes.Add($keyIdentity, $hash)
             $incomingKeys.Add($keyIdentity, $key)
+            $incomingHasExpectedHash.Add(
+                $keyIdentity, $hasExpectedPreviousHash
+            )
+            $incomingExpectedHashes.Add(
+                $keyIdentity, $expectedPreviousHash
+            )
             $incomingOrder += $keyIdentity
             continue
         }
@@ -2857,12 +2907,22 @@ function Get-IdemManagedPendingMappings {
                 $ownedPaths.Contains($manifestIdentity)
         }
         if (-not $isCurrent) {
-            $pending += @{
+            $pendingItem = @{
                 Source = $source
                 Target = $identity
                 Hash = $sourceHash
                 TrackManaged = $trackManaged
             }
+            # A hash transition is a compare-and-swap authorized only by the
+            # receipt-owned target and manifest observed during planning.
+            if ($trackManaged -and $RefuseUnownedTarget -and
+                -not $allowUnowned -and $ownedPaths.Contains($identity) -and
+                $ownedPaths.Contains($manifestIdentity)) {
+                $pendingItem.ExpectedPreviousHash = if (
+                    $manifestHashes.ContainsKey($identity)
+                ) { [string]$manifestHashes[$identity] } else { '' }
+            }
+            $pending += $pendingItem
         }
     }
     return @{ Code = 0; Pending = @($pending) }
@@ -2915,7 +2975,11 @@ function Install-IdemManagedFiles {
     }
     $tracked = @($pending | Where-Object { $_.TrackManaged })
     $hashes = @($tracked | ForEach-Object {
-        @{ Key = $_.Target; Hash = $_.Hash }
+        $record = @{ Key = $_.Target; Hash = $_.Hash }
+        if ($_.ContainsKey('ExpectedPreviousHash')) {
+            $record.ExpectedPreviousHash = $_.ExpectedPreviousHash
+        }
+        $record
     })
     if ($hashes.Count -gt 0 -and
         -not (Set-IdemManifestHashes -ConfigRoot $ConfigRoot -Hashes $hashes `

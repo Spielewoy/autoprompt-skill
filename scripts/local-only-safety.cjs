@@ -314,6 +314,11 @@ function buildGitConfigPolicy(repository, config) {
     ['credential.helper', ''],
     ['credential.username', ''],
     ['core.askPass', ''],
+    // Git for Windows keeps long-path handling opt-in.  Keep it process
+    // scoped in the existing isolated policy so private checker clones can
+    // use their already-authorized deep activation paths without changing
+    // user or repository configuration.
+    ['core.longpaths', 'true'],
     ['http.extraHeader', ''],
     ['http.cookieFile', ''],
     ['http.sslCert', ''],

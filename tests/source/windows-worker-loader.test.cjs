@@ -45,6 +45,13 @@ for(const arch of ['x64','arm64'])test('actual composition captures once and dec
  fs.chmodSync(result.node,0o700);fs.writeFileSync(result.node,'mutated materialization');const second=x.api.materializeTuple(tuple,path.join(x.base,'second'));assert.equal(sha(fs.readFileSync(second.node)),sha(x.raw['assets/node-'+arch+'.br']))
  assert.equal(x.observation.privateCalls,2);assert.equal(desc.controllerSha256,sha(fs.readFileSync(x.processFixture.execPath)))
 })
+for(const arch of ['x64','arm64'])test('only the selected '+arch+' Node asset receives the bounded contention deadline',async t=>{
+ const calls=[],wrapped={...decoder,async decode(capability,file,options){calls.push({file,options});return decoder.decode(capability,file,options)}}
+ const x=setup(t,{arch,decoder:wrapped});await x.api.captureWorkerTuple()
+ assert.deepEqual(calls.map(call=>call.file),['assets/bash.br','assets/msys.br',`assets/node-${arch}.br`])
+ assert.equal(calls[0].options,undefined);assert.equal(calls[1].options,undefined)
+ assert.deepEqual(Object.keys(calls[2].options),['deadlineMs']);assert.equal(calls[2].options.deadlineMs,60000)
+})
 test('helper observed native architecture must match controller-selected bootstrap',async t=>{
  const x=setup(t,{observedArch:'arm64'});await assert.rejects(x.api.captureWorkerTuple(),/native-controller-architecture-mismatch/)
 })
