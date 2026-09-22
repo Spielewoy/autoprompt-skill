@@ -360,7 +360,7 @@ for (const cleanupFails of [false, true]) test('canary accounts for root canonic
 // controller/worker behavior test, not native AppContainer acceptance.
 async function deletionCanary(t, mode = 'success') {
   const { EventEmitter } = require('node:events'), os = require('node:os')
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-deletion-test-'))
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'canary-deletion-test-')))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const servers = new Map(); let nextPort = 20000, original, completed = false, base
   const net = {
@@ -374,7 +374,7 @@ async function deletionCanary(t, mode = 'success') {
     },
   }
   const controllerFs = { ...fs,
-    mkdtempSync() { base = fs.mkdtempSync(path.join(directory, 'private-')); return base },
+    mkdtempSync() { base = fs.realpathSync.native(fs.mkdtempSync(path.join(directory, 'private-'))); return base },
     lstatSync(file, options) {
       if (mode === 'absence-error' && completed && file === original) throw Object.assign(Error('bounded absence query denied'), { code: 'EACCES' })
       return fs.lstatSync(file, options)

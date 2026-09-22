@@ -25,9 +25,8 @@ const CLI = requiredNativeCli('claude')
 
 function createFixture() {
   const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'claude-capability-native-')))
-  const target = privateDirectory(path.join(root, 'target')), controller = path.join(root, 'controller')
-  fs.mkdirSync(controller, { mode: 0o700 })
-  const nativeRoot = path.join(controller, 'native'); fs.mkdirSync(nativeRoot, { mode: 0o700 })
+  const target = privateDirectory(path.join(root, 'target')), controller = privateDirectory(path.join(root, 'controller'))
+  const nativeRoot = privateDirectory(path.join(controller, 'native'))
   const suppliedChallenge = process.env.AUTOPROMPT_CLOSED_CANARY_CHALLENGE
   if (suppliedChallenge !== undefined && !/^[A-Za-z0-9_-]{43}$/.test(suppliedChallenge)) throw new Error('AUTOPROMPT_CLOSED_CANARY_CHALLENGE must be one 32-byte base64url nonce')
   const challenge = suppliedChallenge || crypto.randomBytes(32).toString('base64url')
@@ -122,7 +121,7 @@ async function scenario(t, options = {}) {
   const binding = native.probeExecutable({ provider: 'claude', executable: CLI })
   owner = registeredProcessOwner(f)
   const processAdapter = owner.adapter
-  const proxy = path.join(f.controller, 'proxy'); fs.mkdirSync(proxy, { mode: 0o700 })
+  const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'claude-closed-native-canary', pollMs: 10 })
   const adapter = new HarnessExecAdapter({
     provider: 'claude', runner, nativeRoot: f.nativeRoot, executableBinding: binding,

@@ -55,6 +55,25 @@ test('cancellation stays inside the owned deployment and never unlinks shared co
  assert.equal(x.events.includes('helper-cleanup'),true)
 })
 
+test('owned command trees request bounded Windows retries after proven drain',async t=>{
+ const removals=[];let x
+ const filesystem={...fs,rmSync(directory,options){
+  if(path.basename(directory).startsWith('command-')){assert.ok(x.events.includes('release'),'owned removal follows verified resource release');removals.push({directory,options:{...options}});if(options.maxRetries!==10||options.retryDelay!==100)throw Object.assign(Error('transient image teardown'),{code:'ENOTEMPTY'})}
+  return fs.rmSync(directory,options)
+ }}
+ x=setup(t,{noScratch:true,filesystem});const result=await x.run();assert.equal(result.status,'completed')
+ assert.equal(removals.length,2);assert.deepEqual(removals.map(x=>path.basename(x.directory).split('-').slice(0,2).join('-')).sort(),['command-runtime','command-scratch'])
+ for(const removal of removals)assert.deepEqual(removal.options,{recursive:true,force:true,maxRetries:10,retryDelay:100})
+ assert.ok(x.events.indexOf('release')<x.events.indexOf('helper-cleanup'));assert.equal(removals.every(x=>!fs.existsSync(x.directory)),true)
+})
+test('persistent owned runtime removal failure still refuses success and poisons admission',async t=>{
+ const failure=Object.assign(Error('persistent image teardown'),{code:'EBUSY'}),scenario={}
+ scenario.filesystem={...fs,rmSync(directory,options){if(path.basename(directory).startsWith('command-runtime-')){assert.deepEqual({...options},{recursive:true,force:true,maxRetries:10,retryDelay:100});throw failure}return fs.rmSync(directory,options)}}
+ const x=setup(t,scenario);await assert.rejects(x.run(),error=>error===failure&&error.cleanupConfirmed===false&&error.cleanupCode==='EBUSY'&&error.retainedRuntimeRoot===x.runtimeRoot)
+ assert.equal(fs.existsSync(x.runtimeRoot),true);assert.equal(x.events.includes('helper-cleanup'),true);const launches=x.events.filter(value=>value==='launch').length
+ await assert.rejects(x.run(),error=>error!==failure&&error.cleanupConfirmed===false&&error.admissionFailure?.message===failure.message);assert.equal(x.events.filter(value=>value==='launch').length,launches)
+})
+
 test('secondary helper cleanup failure cannot erase an unknown materialization failure',async t=>{const original=Object.assign(Error('materialization-failed'),{cleanupConfirmed:false}),cleanup=Object.assign(Error('helper-cleanup'),{code:'EACCES'}),x=setup(t,{materializeError:original,cleanupError:cleanup});await assert.rejects(x.run(),error=>error===original&&error.cleanupConfirmed===false&&error.cleanupCode==='EACCES');assert.equal(fs.readFileSync(path.join(x.runtimeRoot,'retained'),'utf8'),'owned');assert.equal(original.retainedControlRoot,path.join(x.root,'controller'))})
 test('cleanup failure after drained completion refuses success and retains outer-root marker',async t=>{const cleanup=Object.assign(Error('helper-cleanup'),{code:'EACCES'}),x=setup(t,{cleanupError:cleanup});await assert.rejects(x.run(),error=>error===cleanup&&error.cleanupConfirmed===false&&error.retainedControlRoot===path.join(x.root,'controller'));assert.ok(x.events.indexOf('release')<x.events.indexOf('helper-cleanup'))})
 test('secondary recovery failure preserves original launch error and unresolved lease',async t=>{const original=Object.assign(Error('launch-refused'),{code:'WINDOWS_LAUNCH_REFUSED'}),recovery=Object.assign(Error('recovery-failed'),{code:'RESTORE_FAILED'}),x=setup(t,{launchError:original,releaseError:recovery});await assert.rejects(x.run(),error=>error===original&&error.cleanupConfirmed===false&&error.recoveryFailureCode==='RESTORE_FAILED'&&error.recovery.leaseId==='owned');assert.equal(fs.readFileSync(path.join(x.runtimeRoot,'retained'),'utf8'),'owned');assert.equal(x.events.includes('helper-cleanup'),false)})

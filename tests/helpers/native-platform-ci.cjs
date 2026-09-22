@@ -127,7 +127,10 @@ async function main() {
     const command = require('../../package.json').scripts['test:platform'].split(/\s+/)
     assert.deepEqual(command.slice(0, 2), ['node', '--test'])
     assert.ok(command.slice(2).every(argument => /^tests\/source\/[A-Za-z0-9.-]+\.test\.cjs$/.test(argument)))
-    const { code, output } = await runTests(['--test', '--test-reporter=tap', ...command.slice(2)], process.env, 'native-platform-primitives.log')
+    // Large native Windows proofs share disk and PowerShell compiler resources.
+    // Run their files sequentially without changing production operation limits.
+    const concurrency = process.platform === 'win32' ? ['--test-concurrency=1'] : []
+    const { code, output } = await runTests(['--test', '--test-reporter=tap', ...concurrency, ...command.slice(2)], process.env, 'native-platform-primitives.log')
     assert.equal(code, 0, 'Platform primitives failed')
     const count = assertHostPrimitiveCases(output)
     process.stdout.write(`Executed ${count} required native ${process.platform}/${process.arch} primitive cases without skips.\n`)

@@ -315,10 +315,10 @@ async function runTupleCommand(policy, args, options, tuple, key) {
       const cleanup = operation => {
         try { operation() } catch (error) { if (!cleanupFailure) cleanupFailure = error }
       }
-      if (privateScratch) cleanup(() => fs.rmSync(privateScratch, { recursive: true, force: true }))
+      if (privateScratch) cleanup(() => fs.rmSync(privateScratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
       // Failed materialization owns its own cleanup accounting; EEXIST never
       // transfers ownership of a competing directory to this operation.
-      if (runtimeOwned && !runtimeCleanupUnknown) cleanup(() => fs.rmSync(runtimeRoot, { recursive: true, force: true }))
+      if (runtimeOwned && !runtimeCleanupUnknown) cleanup(() => fs.rmSync(runtimeRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
       cleanup(() => helperDeployment?.cleanup())
       if (cleanupFailure) {
         const error = primaryError || cleanupFailure

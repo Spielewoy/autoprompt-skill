@@ -10,6 +10,7 @@ const test = require('node:test')
 const { privateDirectory, requiredNativeCli, nativeEnvironment, nativeProcessAdapter } = require('../helpers/native-platform.cjs')
 const { authenticationEndpoint } = require('../helpers/native-activation-endpoint.cjs')
 const { ProcessOwner } = require('../../agents/codex/workflow/process-owner.js')
+const safeRunRoot = require('../../agents/codex/workflow/safe-run-root.js')
 const { ownedTest } = require('../../scripts/harness-v2-closed-canary.cjs')
 const { diagnoseNativeCanary } = require('../helpers/native-canary-diagnostics.cjs')
 const CLI = requiredNativeCli('claude')
@@ -62,6 +63,10 @@ test('packed actual Claude activation requires all local native observations bef
   const env = nativeEnvironment()
   const activation = configure.prepareActivation({ provider: 'claude', root, target,
     missionArgs: ['Validate the installed native canary only; do not execute a mission.'], executable: CLI, env, ttlSeconds: 1800 })
+  if (process.platform === 'win32') {
+    assert.doesNotThrow(() => safeRunRoot.auditPrivatePermissions(path.dirname(activation.activationRoot), { recurse: false }))
+    assert.doesNotThrow(() => safeRunRoot.auditPrivatePermissions(activation.activationRoot, { recurse: false }))
+  }
   assert.equal(activation.record.reviewedLocal.mode, 'local-canary-pending')
   assert.equal(activation.record.reviewedLocalCanary, undefined)
   const safety = require(path.join(activation.installed.bundle, 'scripts/local-only-safety.cjs'))

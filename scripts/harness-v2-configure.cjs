@@ -245,8 +245,21 @@ function prepareActivation(options = {}) {
       if (!(Date.parse(saved.expiresAt) > Date.now())) fail('BUDGET_EXHAUSTED', 'The original activation deadline has expired')
       record.capability.generation++
     } else {
-      privateDirectory(path.dirname(activationRoot))
+      const activationParent = path.dirname(activationRoot)
+      const privacy = require('../agents/codex/workflow/safe-run-root.js')
+      privateDirectory(path.dirname(activationParent))
+      let parentCreated = false
+      try { fs.mkdirSync(activationParent, { mode: 0o700 }); parentCreated = true }
+      catch (error) { if (error.code !== 'EEXIST') throw error }
+      privateDirectory(activationParent)
+      // The mission process owner also audits this shared ownership boundary.
+      // Establish permissions only when we created it; reject unsafe reuse.
+      if (parentCreated) privacy.ensureWindowsPrivateAcl(activationParent)
+      if (process.platform === 'win32') privacy.auditPrivatePermissions(activationParent, { recurse: false })
       fs.mkdirSync(activationRoot, { mode: 0o700 })
+      // Protect this newly owned root before publishing private activation data.
+      // Keep exclusive creation above: an existing root must never be repaired.
+      privacy.ensureWindowsPrivateAcl(activationRoot)
       const darwinRuntimeClosure = process.platform === 'darwin' && fs.existsSync(path.join(root, '.autoprompt-private', 'darwin-runtime', 'darwin-runtime-closure.json'))
         ? require('./darwin-runtime-setup.cjs').bindActivation({ provider, root, activationRoot }) : null
       if (darwinRuntimeClosure) immutable = { ...immutable, darwinRuntimeClosureSha256: darwinRuntimeClosure.sha256 }

@@ -13,6 +13,7 @@ function parseEdited(edit, limits) {
   const value = fixture(); edit(value.manifest, value.file)
   const bytes = value.make(); return parseManifest(bytes, sha(bytes), limits)
 }
+function physicalTemp(prefix) { return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix))) }
 test('real Brotli decode uses copied bytes and returns no acceptance claim', async () => {
   const value = fixture(), expected = Buffer.from(value.raw), cap = value.capture()
   value.bytes.fill(0); value.raw.fill(0); value.file.rawSha256 = '0'.repeat(64)
@@ -96,7 +97,7 @@ test('parallel decoding, forged capability and unknown member are refused', asyn
 })
 test('filesystem capture requires native held capture on Windows and never reopens captured inputs elsewhere', async () => {
   if (process.platform === 'win32') { assert.throws(() => captureDirectory('unused', '0'.repeat(64)), /windows-native-held-capture-required/); return }
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-owned-'))
+  const root = physicalTemp('decoder-owned-')
   try {
     const value = fixture(), manifest = value.make(); fs.mkdirSync(path.join(root, 'assets'))
     fs.writeFileSync(path.join(root, 'manifest.json'), manifest); fs.writeFileSync(path.join(root, value.file.path), value.bytes)
@@ -108,7 +109,7 @@ test('filesystem capture requires native held capture on Windows and never reope
 })
 test('filesystem capture rejects non-native Windows capture and linked paths elsewhere', () => {
   if (process.platform === 'win32') { assert.throws(() => captureDirectory('unused', '0'.repeat(64)), /windows-native-held-capture-required/); return }
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-links-'))
+  const root = physicalTemp('decoder-links-')
   try {
     const value = fixture(), manifest = value.make(); fs.mkdirSync(path.join(root, 'assets'))
     fs.writeFileSync(path.join(root, 'manifest.json'), manifest); fs.writeFileSync(path.join(root, 'original'), value.bytes)
@@ -118,6 +119,25 @@ test('filesystem capture rejects non-native Windows capture and linked paths els
     fs.unlinkSync(path.join(root, 'other')); fs.unlinkSync(path.join(root, value.file.path)); fs.symlinkSync('../manifest.json', path.join(root, value.file.path))
     assert.throws(() => captureDirectory(root, sha(manifest)), /physical-file-required/)
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+test('filesystem fixture canonicalizes a symlinked temporary root before capture', () => {
+  if (process.platform === 'win32') return
+  const realParent = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-tmp-real-')), alias = realParent + '-alias'
+  fs.symlinkSync(realParent, alias, 'dir')
+  const previous = process.env.TMPDIR
+  process.env.TMPDIR = alias
+  try {
+    const root = physicalTemp('decoder-symlinked-tmp-')
+    assert.equal(root, fs.realpathSync.native(root)); assert.equal(root.startsWith(alias + path.sep), false)
+    const value = fixture(), manifest = value.make(); fs.mkdirSync(path.join(root, 'assets'))
+    fs.writeFileSync(path.join(root, 'manifest.json'), manifest); fs.writeFileSync(path.join(root, value.file.path), value.bytes)
+    assert.doesNotThrow(() => captureDirectory(root, sha(manifest)))
+    fs.rmSync(root, { recursive: true })
+  } finally {
+    if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous
+    fs.rmSync(alias, { force: true })
+    fs.rmSync(realParent, { recursive: true, force: true })
+  }
 })
 test('capture evaluates each supplied byte source once before making its private copy', async () => {
   const value = fixture(Buffer.from('identity support'), 'identity'), manifest = value.make(); let reads = 0
