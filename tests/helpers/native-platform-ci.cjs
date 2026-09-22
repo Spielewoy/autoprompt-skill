@@ -130,14 +130,15 @@ function diagnosticStageFiles(id) {
 }
 
 async function runDiagnosticStages({ environment, evidence, publish, run = runTests,
-  aggregateLog = 'native-platform-tests.log', stageLogPrefix = 'native-platform-tests-' }) {
-  const diagnosticCases = DIAGNOSTIC_STAGES.flatMap(stage => stage.cases)
+  packedOnly = false, aggregateLog = 'native-platform-tests.log', stageLogPrefix = 'native-platform-tests-' }) {
+  const stages = packedOnly ? DIAGNOSTIC_STAGES.filter(stage => stage.id === 'packed') : DIAGNOSTIC_STAGES
+  const diagnosticCases = stages.flatMap(stage => stage.cases)
   evidence.diagnosticOnly = true
   evidence.selectedCases = diagnosticCases
   evidence.diagnosticStages = []
   evidence.exitCode = undefined
   publish()
-  for (const stage of DIAGNOSTIC_STAGES) {
+  for (const stage of stages) {
     const stageLog = `${stageLogPrefix}${stage.id}.log`
     const argv = ['--test', '--test-reporter=tap', '--test-concurrency=1', '--test-name-pattern', `^(?:${stage.cases.join('|')})$`, ...diagnosticStageFiles(stage.id)]
     let result = null, stageError = null
@@ -214,8 +215,8 @@ async function main() {
     process.stdout.write('macOS: native filesystem/process tests enabled. Native Claude activation remains unavailable; VM runtime is required.\n')
     return
   }
-  assert.ok(['run', 'diagnose-claude'].includes(action), 'Expected platform, doctor, kilo-shell, prepare, macos-primitives, run or diagnose-claude')
-  const diagnostic = action === 'diagnose-claude'
+  assert.ok(['run', 'diagnose-claude', 'diagnose-claude-packed'].includes(action), 'Expected platform, doctor, kilo-shell, prepare, macos-primitives, run, diagnose-claude or diagnose-claude-packed')
+  const diagnostic = action !== 'run'
   assert.ok(['linux', 'win32'].includes(process.platform))
   const version = process.env.CLAUDE_CODE_VERSION
   assert.match(version || '', /^\d+\.\d+\.\d+$/)
@@ -245,14 +246,13 @@ async function main() {
   }
   if (diagnostic) {
     // A scoped diagnostic never certifies the complete provider capability set.
-    // Keep the aggregate log for existing evidence readers while gating the
-    // expensive packed activation behind the cheap infrastructure and direct
-    // Claude checks.
+    // Preserve the staged baseline diagnostic and allow a packed-only replay
+    // after infrastructure and direct launch have independently passed.
     const aggregateLog = 'native-platform-tests.log'
     fs.writeFileSync(aggregateLog, '')
     await runDiagnosticStages({
       environment: { ...process.env, AUTOPROMPT_CLAUDE_TEST_CLI: executable, AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1' },
-      evidence, publish, aggregateLog })
+      evidence, publish, aggregateLog, packedOnly: action === 'diagnose-claude-packed' })
     return
   }
   evidence.skipped = /# SKIP\b/i.test(output) || !/^# skipped 0\s*$/m.test(output)

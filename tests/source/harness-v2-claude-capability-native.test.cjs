@@ -33,20 +33,44 @@ function nativeFailureFiles(roots) {
       for (const entry of fs.readdirSync(directory, { withFileTypes: true }).slice(0, 128)) {
         const file = path.join(directory, entry.name)
         if (entry.isDirectory() && pending.length < 32) pending.push(file)
-        else if (entry.isFile() && /(?:stderr|launch-\d+)\.log$/.test(entry.name) && output.length < 8) {
+        else if (entry.isFile() && /(?:stderr|launch-\d+(?:\.trace)?)\.log$/.test(entry.name) && output.length < 8) {
           const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
           try {
             const stat = fs.fstatSync(fd)
             if (!stat.isFile() || stat.nlink !== 1) continue
             const bytes = Buffer.alloc(Math.min(8192, stat.size))
             const size = fs.readSync(fd, bytes, 0, bytes.length, Math.max(0, stat.size - bytes.length))
-            if (size) output.push({ file: entry.name, bytes: stat.size, tail: bytes.subarray(0, size).toString('utf8') })
+            output.push({ file: entry.name, bytes: stat.size, tail: bytes.subarray(0, size).toString('utf8') })
           } finally { fs.closeSync(fd) }
         }
       }
     } catch {} // Preserve the original native error if its diagnostics disappear.
   }
   return output
+}
+
+function createProxySpawnTracePreload(directory, ordinal) {
+  assert.match(String(ordinal), /^[1-8]$/)
+  const trace = path.join(directory, `launch-${ordinal}.trace.log`)
+  const preload = path.join(directory, `launch-${ordinal}.preload.cjs`)
+  fs.writeFileSync(trace, '', { flag: 'wx', mode: 0o600 })
+  const source = `'use strict'\n` +
+    `const fs=require('node:fs'),cp=require('node:child_process')\n` +
+    `const trace=${JSON.stringify(trace)},limit=64\n` +
+    `let count=0\n` +
+    `function scalar(value,max){return typeof value==='string'?value.slice(0,max):undefined}\n` +
+    `function record(event){if(count++>=limit)return;try{fs.appendFileSync(trace,JSON.stringify(event)+'\\n')}catch{}}\n` +
+    `record({event:'preload-enter'});setImmediate(()=>record({event:'module-turn'}))\n` +
+    `const original=cp.spawn\n` +
+    `cp.spawn=function(...args){const options=args[2]&&typeof args[2]==='object'?args[2]:{};record({event:'spawn-before',executableLength:typeof args[0]==='string'?args[0].length:null,cwdLength:typeof options.cwd==='string'?options.cwd.length:null});let child;try{child=Reflect.apply(original,this,args)}catch(error){record({event:'spawn-error',synchronous:true,code:scalar(error&&error.code,80),message:scalar(error&&error.message,512)});throw error}record({event:'spawn-return',pid:Number.isSafeInteger(child&&child.pid)?child.pid:null});child.once('spawn',()=>record({event:'spawn'}));child.once('error',error=>record({event:'spawn-error',synchronous:false,code:scalar(error&&error.code,80),message:scalar(error&&error.message,512)}));child.once('exit',(code,signal)=>record({event:'exit',code:Number.isSafeInteger(code)?code:null,signal:scalar(signal,80)}));return child}\n`
+  fs.writeFileSync(preload, source, { flag: 'wx', mode: 0o600 })
+  return { preload, trace }
+}
+
+function withProxySpawnTrace(spec, directory, ordinal) {
+  if (!directory || !Array.isArray(spec.argv) || !spec.argv.includes('--owned-codex-proxy')) return spec
+  const diagnostic = createProxySpawnTracePreload(directory, ordinal)
+  return { ...spec, argv: ['--require', diagnostic.preload, ...spec.argv] }
 }
 
 function createFixture() {
@@ -173,10 +197,17 @@ async function scenario(t, options = {}) {
   owner = registeredProcessOwner(f)
   markPhase('owner-ready')
   const launchShapes = []
+  let proxyTraceOrdinal = 0
   const ownedLaunch = owner.launch.bind(owner)
   owner.launch = async spec => {
     markPhase('owned-launch-start')
-    try { const owned = await ownedLaunch(spec); markPhase('owned-launch-ready'); return owned }
+    try {
+      if (vendorDebugRoot && proxyTraceOrdinal < 8 && spec.argv?.includes('--owned-codex-proxy')) {
+        proxyTraceOrdinal++
+        spec = withProxySpawnTrace(spec, vendorDebugRoot, proxyTraceOrdinal)
+      }
+      const owned = await ownedLaunch(spec); markPhase('owned-launch-ready'); return owned
+    }
     catch (error) { markPhase('owned-launch-failed'); throw error }
   }
   const processAdapter = owner.adapter
@@ -197,7 +228,11 @@ async function scenario(t, options = {}) {
         return [key, typeof spec.env[actual] === 'string' ? spec.env[actual].length : null]
       })),
     })
-    if (vendorDebugRoot) spec = { ...spec, argv: [...spec.argv, '--debug-file', path.join(vendorDebugRoot, `launch-${launchShapes.length}.log`)] }
+    if (vendorDebugRoot) {
+      const ordinal = launchShapes.length
+      const debugFile = path.join(vendorDebugRoot, `launch-${ordinal}.log`)
+      spec = { ...spec, argv: [...spec.argv, '--debug-file', debugFile] }
+    }
     return ownedRun(spec)
   }
   const adapter = new HarnessExecAdapter({
@@ -499,6 +534,36 @@ test('Claude exact post-message ping is ignored without opening a request', () =
   assert.equal(observed.toolResults.length, 8)
   assert.equal(observed.toolResults[0].content[0].code, 'WINDOWS_RUNTIME_UNAVAILABLE')
   assert.equal(observed.toolResults[0].content[0].output.text.length, 4096)
+})
+
+test('Claude owned proxy spawn trace records bounded preload and child lifecycle events', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-proxy-spawn-trace-'))
+  try {
+    const diagnostic = { preload: path.join(root, 'launch-1.preload.cjs'), trace: path.join(root, 'launch-1.trace.log') }
+    const program = `const cp=require('node:child_process');const child=cp.spawn(process.execPath,['-e','process.exit(0)'],{stdio:'ignore'});child.once('error',()=>{process.exitCode=2})`
+    const untouched = { argv: ['phase-budget.js', 'ordinary-mode'] }
+    assert.equal(withProxySpawnTrace(untouched, root, 2), untouched)
+    const instrumented = withProxySpawnTrace({ argv: ['-e', program, '--', '--owned-codex-proxy'] }, root, 1)
+    assert.deepEqual(instrumented.argv.slice(0, 2), ['--require', diagnostic.preload])
+    const launched = require('node:child_process').spawnSync(process.execPath,
+      instrumented.argv, { encoding: 'utf8', timeout: 30000 })
+    assert.equal(launched.status, 0, launched.stderr)
+    const records = fs.readFileSync(diagnostic.trace, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    assert.ok(records.length <= 64)
+    assert.equal(records[0].event, 'preload-enter')
+    assert.ok(records.some(record => record.event === 'module-turn'))
+    const before = records.find(record => record.event === 'spawn-before')
+    assert.equal(before.executableLength, process.execPath.length)
+    assert.equal(before.cwdLength, null)
+    assert.ok(records.some(record => record.event === 'spawn-return' && Number.isSafeInteger(record.pid)))
+    assert.ok(records.some(record => record.event === 'spawn'))
+    assert.ok(records.some(record => record.event === 'exit' && record.code === 0 && record.signal === undefined))
+    assert.ok(records.every(record => JSON.stringify(record).length <= 768))
+    fs.writeFileSync(path.join(root, 'launch-2.log'), '', { flag: 'wx', mode: 0o600 })
+    const retained = nativeFailureFiles([root])
+    assert.ok(retained.some(record => record.file === 'launch-1.trace.log' && record.bytes > 0))
+    assert.deepEqual(retained.find(record => record.file === 'launch-2.log'), { file: 'launch-2.log', bytes: 0, tail: '' })
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
 test('claude closed native capability: exact controller tool receipt binds the real command output', nativeOptions, async t => {
