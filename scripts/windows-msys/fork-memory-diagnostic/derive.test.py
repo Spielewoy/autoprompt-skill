@@ -8,7 +8,10 @@ with tempfile.TemporaryDirectory() as d:
     mod.main.__module__
     dn=mod.derive_native(native,policy)
     assert b'GetProcessMitigationPolicy' in dn and b'ForkMemoryPolicyBase64' in dn
-    assert (b'MITIGATION_POLICY' in dn) == bool(policy)
+    assert b'PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY=0x00020007' in dn
+    assert (b'if(namespaceLease!=null)VerifyMsysAslr(pi.hProcess);' in dn) == (policy == 0)
+    assert (('MsysCompatibilityMitigation=' + str(policy) + 'UL;').encode() if policy else b'MsysCompatibilityMitigation=2UL<<20;') in dn
+    assert b'int attributeCount=msysRuntime==null?2:3;' in dn
     dc=mod.derive_controller(controller)
     assert b'policiesBase64' in dc and b'fork-ok:96' in dc
 print('derive variants: 3; policy arms and controller evidence fields verified')

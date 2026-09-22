@@ -70,7 +70,9 @@ After a successful build, `node scripts/windows-msys/probe-built-runtime.cjs
 <WorkRoot>` assembles a separate private closure from the pinned SDK Bash files
 and the checksum-bound staged DLL. It verifies source Git blobs, copied hashes
 and explicit runtime selection, then runs the existing native Bash scratch-write
-and denied-access test. Its manifest and log accompany the compiler artifacts.
+and denied-access test followed by 96 cycles of command substitution, subshells,
+pipelines, process substitution, and background children. Any fork retry output
+fails the proof. Its manifest and log accompany the compiler artifacts.
 The installed SDK and ordinary full-suite runtime selection are unchanged.
 
 The pinned default build does not define `__WITH_AF_UNIX`; its experimental
@@ -80,3 +82,15 @@ implementation. Compiler flags are explicit and do not inherit CPPFLAGS or
 LDFLAGS from the host.
 
 Upstream build instructions: https://gitforwindows.org/building-msys2-runtime.html
+
+AppContainer enables high-entropy ASLR even for the MSYS images that omit its
+PE flag. Native memory traces showed allocations in the fixed 32–40 GiB fork
+heap before MSYS initialized. Disabling high entropy on the Bash root alone
+did not carry over to its children. The launcher therefore requests and verifies
+the compatible policy on the bound Bash root, and this patch reapplies exactly
+`PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_OFF` to
+same-token AppContainer MSYS fork/spawn children. Ordinary ASLR, child access
+controls, handle inheritance, and the other creation flags are preserved.
+Native Windows children and host MSYS processes keep their existing startup
+parameters. The child adapter contract compiles the actual patched callsites;
+native build and execution proofs are still required.

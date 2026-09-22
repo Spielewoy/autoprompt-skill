@@ -59,13 +59,12 @@ def derive_native(data, mitigation_policy=0):
     text = once(text, 'if(!Drain(job,5000))drained=false;', 'if(!DrainDebugJob(job,5000,forkMemoryTrace))drained=false;')
     text = once(text, 'if(!TerminateProcess(pi.hProcess,125)||WaitForSingleObject(pi.hProcess,5000)!=0)drained=false;', 'if(!TerminateAndDrainDebugProcess(pi.hProcess,5000,forkMemoryTrace))drained=false;')
     text = once(text, 'System.Threading.Thread.Sleep(25);', 'PumpDebug(forkMemoryTrace,25);')
+    # Explicit experiment arms override only the MSYS root compatibility mask.
+    # Baseline retains production behavior. In incompatible diagnostic arms the
+    # debugger must be allowed to observe the process instead of failing early.
     if mitigation_policy:
-        text = once(text, 'PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES=0x00020009,PROC_THREAD_ATTRIBUTE_HANDLE_LIST=0x00020002,', 'PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES=0x00020009,PROC_THREAD_ATTRIBUTE_HANDLE_LIST=0x00020002,PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY=0x00020007,')
-        text = once(text, 'IntPtr size=IntPtr.Zero,list=IntPtr.Zero,caps=IntPtr.Zero,', 'IntPtr size=IntPtr.Zero,list=IntPtr.Zero,mitigation=IntPtr.Zero,caps=IntPtr.Zero,')
-        text = once(text, 'InitializeProcThreadAttributeList(IntPtr.Zero,2,0,ref size)', 'InitializeProcThreadAttributeList(IntPtr.Zero,3,0,ref size)')
-        text = once(text, 'InitializeProcThreadAttributeList(list,2,0,ref size)', 'InitializeProcThreadAttributeList(list,3,0,ref size)')
-        text = once(text, 'Check(UpdateProcThreadAttribute(list,0,(IntPtr)PROC_THREAD_ATTRIBUTE_HANDLE_LIST,handleList,(IntPtr)(IntPtr.Size*4),IntPtr.Zero,IntPtr.Zero),"owned-handle-list");', 'Check(UpdateProcThreadAttribute(list,0,(IntPtr)PROC_THREAD_ATTRIBUTE_HANDLE_LIST,handleList,(IntPtr)(IntPtr.Size*4),IntPtr.Zero,IntPtr.Zero),"owned-handle-list");mitigation=Marshal.AllocHGlobal(8);Marshal.WriteInt64(mitigation,' + str(mitigation_policy) + 'L);Check(UpdateProcThreadAttribute(list,0,(IntPtr)PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,mitigation,(IntPtr)8,IntPtr.Zero,IntPtr.Zero),"diagnostic-mitigation");')
-        text = once(text, 'if(caps!=IntPtr.Zero)Marshal.FreeHGlobal(caps);', 'if(mitigation!=IntPtr.Zero)Marshal.FreeHGlobal(mitigation);if(caps!=IntPtr.Zero)Marshal.FreeHGlobal(caps);')
+        text = once(text, 'MsysCompatibilityMitigation=2UL<<20;', 'MsysCompatibilityMitigation=' + str(mitigation_policy) + 'UL;')
+        text = once(text, 'if(namespaceLease!=null)VerifyMsysAslr(pi.hProcess);', '')
     return text.encode()
 
 FORK_SCRIPT = ''' static String Script(String ready,String release,String before,String child,String after) { return "set -euo pipefail; if ! IFS= read -r pid < /proc/self/winpid; then exit 125; fi; printf '%s\\n' \\"$pid\\" > "+Shell(ready.Replace('\\\\','/'))+"; while [[ ! -e "+Shell(release.Replace('\\\\','/'))+" ]]; do :; done; printf 'before:%s\\n' \\"$pid\\" > "+Shell(before.Replace('\\\\','/'))+"; for ((i=0;i<96;i++)); do substituted=$(printf '%s' \\"$i\\"); [[ \\"$substituted\\" == \\"$i\\" ]]; ( : ); printf '%s\\n' \\"$i\\" | { IFS= read -r piped; [[ \\"$piped\\" == \\"$i\\" ]]; }; IFS= read -r processed < <(printf '%s\\n' \\"$i\\"); [[ \\"$processed\\" == \\"$i\\" ]]; { :; } & fork_child=$!; wait \\"$fork_child\\"; done; printf 'fork-ok:96'; printf 'fork-ok:96\\n' > "+Shell(child.Replace('\\\\','/'))+"; printf '%s:fork-ok:96\\n' \\"$pid\\" > "+Shell(after.Replace('\\\\','/')); }'''

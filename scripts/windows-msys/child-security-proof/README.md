@@ -16,6 +16,17 @@ because its target token need not match the parent's token. Preparation errors
 refuse creation, and descriptor/token destruction cannot clobber the error seen
 by the original caller's cleanup path.
 
+CI 66 then established that an explicit HEVA-off policy on the AppContainer Bash
+root is not inherited by its MSYS-created children. The same helper now supplies
+a one-entry `STARTUPINFOEXW` with exactly
+`PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_OFF` for an
+AppContainer fork child and for an AppContainer spawn target only when
+`real_path.iscygexec()`. It preserves the caller's startup fields and reserved2
+bytes, uses only the Windows process heap while the fork malloc lock is held,
+and rejects a preexisting extended startup list instead of discarding unknown
+attributes. Native children, ordinary host children and `CreateProcessAsUserW`
+retain their original flags and startup pointer.
+
 Run `python3 scripts/windows-msys/child-security-proof/run.py`. This compiles the
 exact adapter and exact patched CreateProcessW blocks with narrow Windows API
 seams. Forty cases cover both callsites, host/private tokens, NULL/supplied
@@ -23,7 +34,10 @@ attributes, successful/failed creation, preparation failures, pointer lifetime,
 source immutability, fresh package selection, and unchanged creation arguments.
 These cases do not establish Windows kernel ACL behavior or full MSYS compilation.
 The existing descriptor proof independently exercises the reused descriptor
-implementation and must remain bound to the updated complete patch.
+implementation and must remain bound to the updated complete patch. The same
+contract also covers exact HEVA mask/attribute size, startup-field preservation,
+fork/spawn scope, every attribute-preparation failure, process-heap cleanup, and
+last-error restoration after destructors.
 
 ## Required native acceptance
 

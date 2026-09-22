@@ -25,6 +25,11 @@ def section(name):
 part = section('winsup/cygwin/local_includes/appcontainer_child_security.h')
 body = ''.join(line[1:] for line in part.splitlines(keepends=True) if line.startswith('+') and not line.startswith('+++'))
 assert body.count('#include "appcontainer_pipe_security.h"\n') == 1
+assert body.count('PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY') == 1
+assert body.count('mitigation_ = 2ULL << 20;') == 1
+assert body.count('HeapAlloc (GetProcessHeap ()') == 1
+assert body.count('HeapFree (GetProcessHeap ()') == 1
+assert 'original_flags & EXTENDED_STARTUPINFO_PRESENT' in body
 # Replace only its dependency include with the test API seam. The adapter body
 # itself, including its scope/destruction and error handling, is unmodified.
 body = body.replace('#include "appcontainer_pipe_security.h"\n', '')
@@ -39,6 +44,11 @@ for name in ['fork.cc', 'spawn.cc']:
     # No changed target-token path or unrelated source callsites.
     assert 'CreateProcessAsUser' not in part
     assert part.count('+      rc = appcontainer_child_create') + part.count('+\t  rc = appcontainer_child_create') == 1
+assert 'appcontainer_child_create (sa, &si, c_flags, true,' in callsite[0]
+assert 'appcontainer_child_create (sa, &si, c_flags,' in callsite[1]
+assert 'real_path.iscygexec ()' in callsite[1]
+for actual in callsite:
+    assert 'child_security' in actual and 'child_startup' in actual and 'child_flags' in actual
 
 with tempfile.TemporaryDirectory(prefix='msys-child-security-proof-') as folder:
     folder = Path(folder)

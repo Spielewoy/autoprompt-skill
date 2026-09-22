@@ -64,3 +64,24 @@ test('AppContainer profile environment uses the token profile without relaxing c
   assert.equal(result.stderr, '')
   assert.deepEqual(JSON.parse(result.stdout), { contractCases: 28, tokenProfileApi: process.platform === 'win32', nativeLaunch: false })
 })
+
+test('MSYS launch policy verifies effective ASLR before allowing execution', { timeout: 90000 }, t => {
+  const powershell = process.platform === 'win32' ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'pwsh'
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'msys-aslr-contract-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const source = fs.readFileSync(path.resolve(__dirname, '../../agents/codex/workflow/windows-appcontainer-native.cs'), 'utf8')
+  const pattern = / \[DllImport\([^\n]+\)\] static extern Boolean QueryMsysAslr\(IntPtr process,UInt32 policy,out MSYS_ASLR_POLICY information,UIntPtr length\);/g
+  assert.equal([...source.matchAll(pattern)].length, 1)
+  const native = path.join(directory, 'native.cs')
+  fs.writeFileSync(native, source.replace(pattern, ' static Boolean QueryMsysAslr(IntPtr process,UInt32 policy,out MSYS_ASLR_POLICY information,UIntPtr length){MsysAslrMock.Process=process;MsysAslrMock.Policy=policy;MsysAslrMock.Length=length;information=new MSYS_ASLR_POLICY{Flags=MsysAslrMock.Flags};return MsysAslrMock.Success;}'))
+  const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop";Add-Type -Path @($env:AP_NATIVE,$env:AP_CONTRACT);[MsysAslrContract]::Run()'], {
+    encoding: 'utf8', timeout: 60000, windowsHide: true,
+    env: { ...process.env, AP_NATIVE: native, AP_CONTRACT: path.resolve(__dirname, '../fixtures/windows-appcontainer/msys-aslr-contract.cs') },
+  })
+  if (result.error?.code === 'ENOENT' && process.platform !== 'win32') { t.skip('PowerShell is unavailable'); return }
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.equal(result.stderr, '')
+  assert.deepEqual(JSON.parse(result.stdout), { contractCases: 33, nativeApiBoundaries: 1 })
+  t.diagnostic('Actual compiled verifier; Windows query results mocked, native launch tested separately')
+})

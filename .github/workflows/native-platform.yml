@@ -152,6 +152,24 @@ jobs:
             ${{ runner.temp }}/precompiled-capture
             native-windows-runtime-precompiled-build.log
           if-no-files-found: error
+      - name: Verify native Job startup during the focused MSYS run
+        id: msys-job-startup
+        if: inputs.msys_runtime == true && runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP 'native-job-startup.tap'
+          node --test --test-reporter=tap tests/source/windows-job-helper.test.cjs 2>&1 | Tee-Object -FilePath $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node -e "const text=require('node:fs').readFileSync(process.argv[1],'utf8');const check=require('./tests/helpers/native-platform-ci.cjs').assertNamedCase;check(text,'Windows Job bridge compiles and preserves atomic status publication on native long paths');check(text,'native Windows Job ownership survives deep durable paths and hostile home variables');" $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native Job startup results
+        if: always() && inputs.msys_runtime == true && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-job-startup-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: ${{ runner.temp }}/native-job-startup.tap
+          if-no-files-found: error
       - name: Record native Git metadata ACL controls before the full suite
         id: git-acl-proof
         if: inputs.msys_runtime != true && (runner.os == 'Windows')
@@ -674,7 +692,7 @@ jobs:
         if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)
         run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
       - name: Require native startup and selected compiler proofs to succeed
-        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.runtime-precompiled-proof.outcome == 'failure' || steps.runtime-precompiled-evidence.outcome == 'failure' || steps.git-acl-proof.outcome == 'failure' || steps.git-acl-evidence.outcome == 'failure' || steps.resource-scale-proof.outcome == 'failure' || steps.resource-scale-evidence.outcome == 'failure' || steps.resource-identity-proof.outcome == 'failure' || steps.resource-identity-evidence.outcome == 'failure' || steps.filesystem-scale-proof.outcome == 'failure' || steps.filesystem-scale-evidence.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-wincap.outcome == 'failure' || steps.msys-candidate.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure' || steps.msys-portable.outcome == 'failure' || steps.msys-portable-evidence.outcome == 'failure')
+        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.runtime-precompiled-proof.outcome == 'failure' || steps.runtime-precompiled-evidence.outcome == 'failure' || steps.git-acl-proof.outcome == 'failure' || steps.git-acl-evidence.outcome == 'failure' || steps.resource-scale-proof.outcome == 'failure' || steps.resource-scale-evidence.outcome == 'failure' || steps.resource-identity-proof.outcome == 'failure' || steps.resource-identity-evidence.outcome == 'failure' || steps.filesystem-scale-proof.outcome == 'failure' || steps.filesystem-scale-evidence.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-job-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-wincap.outcome == 'failure' || steps.msys-candidate.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure' || steps.msys-portable.outcome == 'failure' || steps.msys-portable-evidence.outcome == 'failure')
         run: node -e "process.exit(1)"
 
   claude-native:

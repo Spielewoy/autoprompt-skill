@@ -883,7 +883,7 @@ index 5a40e39..d7b3ec2 100644
  	{
  	  if (status != STATUS_OBJECT_NAME_COLLISION)
 diff --git a/winsup/cygwin/fork.cc b/winsup/cygwin/fork.cc
-index 2aa52737ca951305b3ffd5fba417ba7e8f972cd0..f2a7da8ca46667147dd142bd8a56a409ca4cdc30 100644
+index 2aa52737ca951305b3ffd5fba417ba7e8f972cd0..fd8ce2ed92c2ebf2095bde127748b62f163ad1ea 100644
 --- a/winsup/cygwin/fork.cc
 +++ b/winsup/cygwin/fork.cc
 @@ -7,6 +7,8 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
@@ -904,13 +904,14 @@ index 2aa52737ca951305b3ffd5fba417ba7e8f972cd0..f2a7da8ca46667147dd142bd8a56a409
  	api_fatal ("prefork: couldn't create pipe process tracker, %E");
  
        if (!SetHandleInformation (wr_proc_pipe, HANDLE_FLAG_INHERIT,
-@@ -363,20 +365,23 @@ frok::parent (volatile char * volatile stack_here)
+@@ -363,20 +365,24 @@ frok::parent (volatile char * volatile stack_here)
        hchild = NULL;
        /* cygwin1.dll may reuse the forking_progname buffer, even
  	 in case of failure: don't reuse forking_progname later */
 -      rc = CreateProcessW (forking_progname,	/* image to run */
-+      rc = appcontainer_child_create (sa,
-+        [&] (LPSECURITY_ATTRIBUTES child_security) {
++      rc = appcontainer_child_create (sa, &si, c_flags, true,
++        [&] (LPSECURITY_ATTRIBUTES child_security, LPSTARTUPINFOW child_startup,
++             DWORD child_flags) {
 +      return CreateProcessW (forking_progname,	/* image to run */
  			   GetCommandLineW (),	/* Take same space for command
  						   line as in parent to make
@@ -922,16 +923,18 @@ index 2aa52737ca951305b3ffd5fba417ba7e8f972cd0..f2a7da8ca46667147dd142bd8a56a409
 +			   child_security,
 +			   child_security,
  			   TRUE,		/* inherit handles */
- 			   c_flags,
+-			   c_flags,
++			   child_flags,
  			   NULL,		/* environ filled in later */
  			   0,			/* use cwd */
- 			   &si,
+-			   &si,
++			   child_startup,
  			   &pi);
 +        });
  
        if (rc)
  	debug_printf ("forked pid %u", pi.dwProcessId);
-@@ -423,6 +428,12 @@ frok::parent (volatile char * volatile stack_here)
+@@ -423,6 +429,12 @@ frok::parent (volatile char * volatile stack_here)
    fix_impersonation = false;
  
    child_pid = cygwin_pid (pi.dwProcessId);
@@ -1257,24 +1260,91 @@ index 0000000..198ab39
 +#endif
 diff --git a/winsup/cygwin/local_includes/appcontainer_child_security.h b/winsup/cygwin/local_includes/appcontainer_child_security.h
 new file mode 100644
-index 0000000..3fbca5b
+index 0000000000000000000000000000000000000000..ba1fa94b282c60bd336b3dd7387b6c9a41cb6897
 --- /dev/null
 +++ b/winsup/cygwin/local_includes/appcontainer_child_security.h
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,106 @@
 +/* Same-primary-token child creation only; include after winsup.h. */
 +#ifndef _APPCONTAINER_CHILD_SECURITY_H
 +#define _APPCONTAINER_CHILD_SECURITY_H
 +#include "appcontainer_pipe_security.h"
 +
++/* Windows does not inherit the root process's explicit HEVA-off creation
++   policy into MSYS fork children.  Prepare a private STARTUPINFOEX only for
++   same-token AppContainer Cygwin children.  This allocation must remain on the
++   Windows process heap: fork calls this helper while the Cygwin malloc heap is
++   locked. */
++class appcontainer_child_startup
++{
++  STARTUPINFOEXW extended_;
++  PPROC_THREAD_ATTRIBUTE_LIST attributes_;
++  bool initialized_;
++  DWORD64 mitigation_;
++  LPSTARTUPINFOW startup_;
++  DWORD flags_;
++
++public:
++  appcontainer_child_startup () : extended_ {}, attributes_ (NULL),
++    initialized_ (false), mitigation_ (0), startup_ (NULL), flags_ (0) {}
++  ~appcontainer_child_startup ()
++  {
++    if (initialized_)
++      DeleteProcThreadAttributeList (attributes_);
++    if (attributes_)
++      HeapFree (GetProcessHeap (), 0, attributes_);
++  }
++
++  DWORD prepare (LPSTARTUPINFOW original, DWORD original_flags, bool enabled)
++  {
++    startup_ = original;
++    flags_ = original_flags;
++    if (!enabled)
++      return ERROR_SUCCESS;
++    if (!original || (original_flags & EXTENDED_STARTUPINFO_PRESENT))
++      return ERROR_INVALID_PARAMETER;
++
++    SIZE_T bytes = 0;
++    SetLastError (ERROR_SUCCESS);
++    if (InitializeProcThreadAttributeList (NULL, 1, 0, &bytes)
++        || !bytes || GetLastError () != ERROR_INSUFFICIENT_BUFFER)
++      return GetLastError () ? GetLastError () : ERROR_INVALID_PARAMETER;
++    attributes_ = (PPROC_THREAD_ATTRIBUTE_LIST)
++      HeapAlloc (GetProcessHeap (), 0, bytes);
++    if (!attributes_)
++      return ERROR_NOT_ENOUGH_MEMORY;
++    if (!InitializeProcThreadAttributeList (attributes_, 1, 0, &bytes))
++      return GetLastError ();
++    initialized_ = true;
++
++    mitigation_ = 2ULL << 20;
++    if (!UpdateProcThreadAttribute (attributes_, 0,
++          PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigation_,
++          sizeof mitigation_, NULL, NULL))
++      return GetLastError ();
++    extended_.StartupInfo = *original;
++    extended_.StartupInfo.cb = sizeof extended_;
++    extended_.lpAttributeList = attributes_;
++    startup_ = &extended_.StartupInfo;
++    flags_ |= EXTENDED_STARTUPINFO_PRESENT;
++    return ERROR_SUCCESS;
++  }
++
++  LPSTARTUPINFOW startup () const { return startup_; }
++  DWORD flags () const { return flags_; }
++};
++
 +/* CreateProcessW inherits the primary token, but an explicit sec_user_nih SD
 +   omits that token's package SID. Preserve that SD and append only the actual
 +   package grant for both child objects. Never use this for CreateProcessAsUser:
 +   its target token can identify a different user or package. One synchronous
-+   operation owns the descriptor; no environment SID, globals or fork cache.
-+   The helper uses Windows HeapAlloc, never the locked Cygwin malloc heap. */
++   operation owns the descriptor and optional startup attributes; no environment
++   SID, globals or fork cache. Both helpers use Windows HeapAlloc, never the
++   locked Cygwin malloc heap. */
 +template <typename Create>
 +static BOOL
-+appcontainer_child_create (LPSECURITY_ATTRIBUTES original, Create create)
++appcontainer_child_create (LPSECURITY_ATTRIBUTES original,
++                           LPSTARTUPINFOW startup, DWORD flags,
++                           bool cygwin_child, Create create)
 +{
 +  BOOL result = FALSE;
 +  DWORD error;
@@ -1283,12 +1353,19 @@ index 0000000..3fbca5b
 +    error = security.prepare (original);
 +    if (!error)
 +      {
-+        result = create (security.get ());
-+        error = GetLastError ();
++        appcontainer_child_startup child_startup;
++        error = child_startup.prepare (startup, flags,
++                    security.is_appcontainer () && cygwin_child);
++        if (!error)
++          {
++            result = create (security.get (), child_startup.startup (),
++                             child_startup.flags ());
++            error = GetLastError ();
++          }
 +      }
 +  }
-+  /* Token/descriptor cleanup must not replace preparation or CreateProcessW
-+     failure. The existing caller retains its complete cleanup/errno path. */
++  /* Token/descriptor/attribute cleanup must not replace preparation or
++     CreateProcessW failure. The caller retains its complete cleanup/errno path. */
 +  SetLastError (error);
 +  return result;
 +}
@@ -2162,7 +2239,7 @@ index 0000000..288fc5c
 +  return ERROR_SUCCESS;
 +}
 diff --git a/winsup/cygwin/spawn.cc b/winsup/cygwin/spawn.cc
-index 9408903..e43f94c 100644
+index 9408903659e37d82e391b8f7de572b2546396349..d84852fe9176b03ce0b7dea1be372881b224d397 100644
 --- a/winsup/cygwin/spawn.cc
 +++ b/winsup/cygwin/spawn.cc
 @@ -7,6 +7,7 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
@@ -2173,13 +2250,15 @@ index 9408903..e43f94c 100644
  #include <stdlib.h>
  #include <unistd.h>
  #include <process.h>
-@@ -653,16 +654,19 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
+@@ -653,16 +654,21 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
  	      && !::cygheap->user.groups.issetgroups ()
  	      && !::cygheap->user.setuid_to_restricted))
  	{
 -	  rc = CreateProcessW (runpath,		/* image name w/ full path */
-+	  rc = appcontainer_child_create (sa,
-+	    [&] (LPSECURITY_ATTRIBUTES child_security) {
++	  rc = appcontainer_child_create (sa, &si, c_flags,
++	    real_path.iscygexec (),
++	    [&] (LPSECURITY_ATTRIBUTES child_security,
++	         LPSTARTUPINFOW child_startup, DWORD child_flags) {
 +	  return CreateProcessW (runpath,		/* image name w/ full path */
  			       cmd.wcs (wcmd),	/* what was passed to exec */
 -			       sa,		/* process security attrs */
@@ -2187,10 +2266,12 @@ index 9408903..e43f94c 100644
 +			       child_security,		/* process security attrs */
 +			       child_security,		/* thread security attrs */
  			       TRUE,		/* inherit handles */
- 			       c_flags,
+-			       c_flags,
++			       child_flags,
  			       envblock,	/* environment */
  			       NULL,
- 			       &si,
+-			       &si,
++			       child_startup,
  			       &pi);
 +	    });
  	}

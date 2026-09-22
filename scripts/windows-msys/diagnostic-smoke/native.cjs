@@ -11,4 +11,5 @@ const value=JSON.parse(bytes);assert.ok(binding.canonical(value).equals(bytes),'
 const executor=binding.createExecutor(value)
 test(TEST_NAME,{timeout:600000},async t=>{
  await require('../../../tests/helpers/windows-bash-native-smoke.cjs').runNativeWindowsBashSmoke(t,{probeWindowsAppContainer:executor.probe,executeTool:executor.executeTool})
+ await require('../../../tests/helpers/windows-bash-native-smoke.cjs').runNativeWindowsBashRepeatedForkSmoke(t,{probeWindowsAppContainer:executor.probe,executeTool:executor.executeTool})
 })

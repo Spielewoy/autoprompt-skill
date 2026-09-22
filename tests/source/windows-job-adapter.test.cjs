@@ -79,6 +79,10 @@ test('Windows Job adapter streams its fixed bootstrap and restores the controlle
       return helperProcess(41001, (source, encoding, callback) => {
         assert.equal(encoding, 'utf8')
         assert.match(source, /Add-Type -TypeDefinition/)
+        assert.match(source, /Write-JobPhase 'compile-start'/)
+        assert.match(source, /Write-JobPhase 'job-assigned-resumed'/)
+        const request = JSON.parse(fs.readFileSync(invocation.options.env.AUTOPROMPT_JOB_REQUEST, 'utf8'))
+        assert.equal(request.startupDeadlineAt, launch.startupDeadlineAt)
         fs.rmSync(compilerRoot, { recursive: true })
         const reservationDirectory = fs.readdirSync(controlRoot, { withFileTypes: true })
           .find(entry => entry.isDirectory()).name
@@ -90,7 +94,9 @@ test('Windows Job adapter streams its fixed bootstrap and restores the controlle
     },
   }))
 
-  const result = await adapter.spawnOwned(launchRecord(adapter, 'bootstrap-success'))
+  const launch = launchRecord(adapter, 'bootstrap-success')
+  const result = await adapter.spawnOwned(launch)
+  assert.equal(adapter.startupTimeoutMs, 120000)
   assert.deepEqual(result, {
     rootPid: 41002,
     groupIdentity: adapter.reservationIdentity('bootstrap-success'),

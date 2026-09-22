@@ -40,7 +40,7 @@ async function runNativeWindowsBashRepeatedForkSmoke(t,{probeWindowsAppContainer
   ensureWindowsPrivateAcl(root)
   const targetPath = path.join(root, 'target'), scratchPath = path.join(root, 'scratch'), controlRoot = path.join(root, 'controller')
   for (const directory of [targetPath, scratchPath, controlRoot]) { fs.mkdirSync(directory); ensureWindowsPrivateAcl(directory) }
-  const iterations = 24
+  const iterations = 96
   const command = `set -euo pipefail
 for ((i=0;i<${iterations};i++)); do
   substituted=$(printf '%s' "$i"); [[ "$substituted" == "$i" ]]

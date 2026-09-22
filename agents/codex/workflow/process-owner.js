@@ -1494,6 +1494,9 @@ $ErrorActionPreference = 'Stop'
 $requestPath = $env:AUTOPROMPT_JOB_REQUEST
 $statusPath = $env:AUTOPROMPT_JOB_STATUS
 $killPath = $env:AUTOPROMPT_JOB_KILL
+$phaseClock = [Diagnostics.Stopwatch]::StartNew()
+function Write-JobPhase([string]$name) { [Console]::Error.WriteLine(('WINDOWS_JOB_PHASE:{0}:{1}' -f $name,$phaseClock.ElapsedMilliseconds)) }
+Write-JobPhase 'start'
 trap {
   $failureText = [string]$_.Exception.ToString()
   if ($failureText.Length -gt 2048) { $failureText = $failureText.Substring(0, 2048) }
@@ -1506,6 +1509,7 @@ trap {
   } catch { [Console]::Error.WriteLine("WINDOWS_JOB_HELPER_FAILED:$failureText") }
   exit 126
 }
+Write-JobPhase 'compile-start'
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -1745,6 +1749,7 @@ public sealed class AutopromptOwnedJob : IDisposable {
   }
 }
 '@
+Write-JobPhase 'compile-done'
 
 $compilerDirectory = [string]$env:AUTOPROMPT_JOB_COMPILER_DIRECTORY
 $runtimeTemp = [string]$env:AUTOPROMPT_JOB_RUNTIME_TEMP
@@ -1752,6 +1757,7 @@ if (-not $compilerDirectory -or -not $runtimeTemp) { throw 'Windows Job compiler
 $env:TEMP = $runtimeTemp
 $env:TMP = $runtimeTemp
 [IO.Directory]::Delete($compilerDirectory, $true)
+Write-JobPhase 'compiler-cleanup-done'
 
 if ($env:AUTOPROMPT_JOB_PROBE -eq '1') {
   $probeEnvironment = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -1763,6 +1769,7 @@ if ($env:AUTOPROMPT_JOB_PROBE -eq '1') {
 }
 
 $request = [AutopromptOwnedJob]::ReadText($requestPath) | ConvertFrom-Json
+Write-JobPhase 'request-loaded'
 function Write-JobStatus([string]$state, [bool]$ready, [bool]$assigned, [object[]]$pids, [string]$errorText) {
   $script:observedPids = @($script:observedPids + @($pids) | Where-Object { $_ -is [ValueType] } | Sort-Object -Unique)
   $record = [ordered]@{ schemaVersion = 1; reservationId = [string]$request.reservationId;
@@ -1785,9 +1792,12 @@ try {
   foreach ($property in $request.environment.PSObject.Properties) { $environment[[string]$property.Name] = [string]$property.Value }
   $arguments = @($request.argv | ForEach-Object { [string]$_ })
   $startupDeadline = [DateTime]::Parse([string]$request.startupDeadlineAt).ToUniversalTime()
+  Write-JobPhase 'job-start'
   $script:owned = [AutopromptOwnedJob]::Start([string]$request.executable, [string[]]$arguments,
     [string]$request.cwd, $environment, $startupDeadline)
+  Write-JobPhase 'job-assigned-resumed'
   Write-JobStatus 'RUNNING' $true $true @($script:owned.ProcessIds()) $null
+  Write-JobPhase 'status-published'
   while ($true) {
     if ([AutopromptOwnedJob]::FileExists($killPath)) {
       $terminating = @($script:owned.ProcessIds())
@@ -1997,7 +2007,7 @@ function createWindowsJobAdapter(options = {}) {
     // Windows PowerShell cold-starts and compiles the native Job bridge before
     // it can create the suspended child. Keep that platform preparation inside
     // one explicit durable deadline rather than a shorter hidden adapter timer.
-    startupTimeoutMs: 30000,
+    startupTimeoutMs: 120000,
     capabilities: Object.fromEntries(REQUIRED_PROCESS_CAPABILITIES.map((field) => [field, true])),
     reservationIdentity(reservationId) { return persistentIdentity(reservationId) },
     prepareReservation(input) { return reservationBindingFor(input) },
