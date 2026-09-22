@@ -133,12 +133,20 @@ async function scenario(t, options = {}) {
   })
   const debits = []
   const cliStartup = []
+  const cliToolResults = []
   const run = async overrides => {
     const record = { ...f.record, ...overrides }
     record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
     record.onUsageDelta = (delta, cumulative, evidence) => { debits.push(delta); return overrides?.onUsageDelta ? overrides.onUsageDelta(delta, cumulative, evidence) : { continue: true } }
     const callerOnEvent = overrides?.onEvent
     record.onEvent = (event, raw) => {
+      if (event?.type === 'user' && Array.isArray(event.message?.content)) {
+        // Capture bounded diagnostics before strict receipt verification can
+        // reject the event and prevent another request to the model service.
+        const observed = boundedClaudeToolDiagnostics({ requests: [{ body: { messages: [event.message] } }], errors: [] }, null)
+        cliToolResults.push(...observed.toolResults)
+        if (cliToolResults.length > 8) cliToolResults.splice(0, cliToolResults.length - 8)
+      }
       if (event?.type === 'system' && event.subtype === 'init') {
         cliStartup.push({
           tools: (Array.isArray(event.tools) ? event.tools : []).slice(0, 32).filter(value => typeof value === 'string').map(value => value.slice(0, 256)),
@@ -155,7 +163,7 @@ async function scenario(t, options = {}) {
     record.signal = overrides?.signal || AbortSignal.timeout(90000)
     let result
     try { result = await adapter.launch(record) } catch (error) {
-      const diagnostic = boundedClaudeToolDiagnostics(service, null, cliStartup)
+      const diagnostic = boundedClaudeToolDiagnostics(service, null, cliStartup, cliToolResults)
       diagnostic.launchFailure = {
         code: typeof error?.code === 'string' ? error.code.slice(0, 80) : undefined,
         message: String(error?.message || 'Native launch failed').slice(0, 512),
@@ -164,7 +172,7 @@ async function scenario(t, options = {}) {
       throw error
     }
     const challengeObserved = service.requests.some(request => JSON.stringify(request.body).includes(`CLOSED_CANARY_CHALLENGE:${f.challenge}`))
-    if (!challengeObserved) t.diagnostic(`CLAUDE_TOOL_RESULT_DIAGNOSTIC:${JSON.stringify(boundedClaudeToolDiagnostics(service, result, cliStartup))}`)
+    if (!challengeObserved) t.diagnostic(`CLAUDE_TOOL_RESULT_DIAGNOSTIC:${JSON.stringify(boundedClaudeToolDiagnostics(service, result, cliStartup, cliToolResults))}`)
     assert.ok(challengeObserved, 'the actual native tool result omitted its closed-canary challenge')
     return result
   }
@@ -182,7 +190,7 @@ function assertSuccessful(result) {
   assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/)
 }
 
-function boundedClaudeToolDiagnostics(service, result, cliStartup = []) {
+function boundedClaudeToolDiagnostics(service, result, cliStartup = [], cliToolResults = []) {
   const scalar = value => typeof value === 'string' ? value.slice(0, 256)
     : typeof value === 'boolean' || Number.isFinite(value) ? value : undefined
   const bounded = value => {
@@ -225,6 +233,7 @@ function boundedClaudeToolDiagnostics(service, result, cliStartup = []) {
   }
   return {
     cliStartup: cliStartup.slice(-8),
+    cliToolResults: cliToolResults.slice(-8),
     requestCount: service.requests.length,
     requests,
     toolResults: toolResults.slice(-8),
@@ -374,12 +383,20 @@ test('Claude exact post-message ping is ignored without opening a request', () =
     body: { tools: Array.from({ length: 20 }, (__, tool) => ({ name: `tool-${tool}`, type: 'custom' })),
       messages: Array.from({ length: 10 }, (__, message) => ({ role: message % 2 ? 'assistant' : 'user', content: [] })) } }))
   const diagnostic = boundedClaudeToolDiagnostics({ requests, errors: Array(10).fill('x'.repeat(5000)) }, null,
-    Array.from({ length: 10 }, () => ({ tools: [], mcpServers: [] })))
+    Array.from({ length: 10 }, () => ({ tools: [], mcpServers: [] })), Array(10).fill({ toolUseId: 'bounded' }))
   assert.equal(diagnostic.requestCount, 10)
   assert.equal(diagnostic.requests.length, 8); assert.equal(diagnostic.requests[0].requestOrdinal, 3)
   assert.equal(diagnostic.requests[0].tools.length, 16); assert.equal(diagnostic.requests[0].messageRoles.length, 8)
   assert.equal(diagnostic.serviceErrors.length, 8); assert.equal(diagnostic.serviceErrors[0].text.length, 4096)
   assert.equal(diagnostic.cliStartup.length, 8)
+  assert.equal(diagnostic.cliToolResults.length, 8)
+  const observed = boundedClaudeToolDiagnostics({ requests: [{ body: { messages: [{ content: Array.from({ length: 10 }, () => ({
+    type: 'tool_result', tool_use_id: 'failed-controller-command', is_error: true,
+    content: JSON.stringify({ tool: 'bash', status: 'failed', code: 'WINDOWS_RUNTIME_UNAVAILABLE', output: 'x'.repeat(5000) }),
+  })) }] } }], errors: [] }, null)
+  assert.equal(observed.toolResults.length, 8)
+  assert.equal(observed.toolResults[0].content[0].code, 'WINDOWS_RUNTIME_UNAVAILABLE')
+  assert.equal(observed.toolResults[0].content[0].output.text.length, 4096)
 })
 
 test('claude closed native capability: exact controller tool receipt binds the real command output', nativeOptions, async t => {

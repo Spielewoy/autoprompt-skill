@@ -5,35 +5,39 @@ const test=require('node:test'),assert=require('node:assert/strict'),fs=require(
 const {createRequire}=require('node:module')
 function setup(t,scenario={}){
  const root=fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(),'worker-command-')));t.after(()=>fs.rmSync(root,{recursive:true,force:true}))
- const controlRoot=path.join(root,'controller'),scratch=path.join(root,'scratch');fs.mkdirSync(controlRoot);fs.mkdirSync(scratch)
- const tuple=Object.freeze({}),identity='a'.repeat(64),events=[],canaries=[],materializedRoots=new Set();let materializedRoot
+ const controlRoot=scenario.deepControlRoot?path.join(root,...Array.from({length:12},(_,index)=>`nested-controller-${String(index).padStart(2,'0')}-abcdefgh`)):path.join(root,'controller'),scratch=path.join(root,'scratch');fs.mkdirSync(controlRoot,{recursive:true});fs.mkdirSync(scratch)
+ const shallowRoot=path.join(root,'shallow-local'),tuple=Object.freeze({}),identity='a'.repeat(64),events=[],canaries=[],materializedRoots=new Set();let materializedRoot,stagingRoot,helperRoot
  const evidence={exitCode:0,stdout:Buffer.from('owned'),stderr:Buffer.alloc(0),launcherSessionId:17,timedOut:false,truncated:false,cancelled:false}
  const launcher={verifyDrainEvidence(){},proveNotStarted(){return evidence},async launch(request){events.push('launch');if(scenario.inspectLaunch)scenario.inspectLaunch(request);if(scenario.launchError)throw scenario.launchError;assert.ok([...materializedRoots].some(root=>request.executable===path.join(root,'usr/bin/bash.exe')));assert.equal(request.executableSha256,'b'.repeat(64));assert.equal(request.msysRuntime.dllSha256,'c'.repeat(64));assert.equal(request.environment.find(s=>s.startsWith('PATH=')),`PATH=${path.dirname(request.executable)}`);assert.equal(request.environment.some(s=>s.startsWith('AUTOPROMPT_WINDOWS_BASH=')),false);return evidence}}
  const replacements={
   'node:fs':scenario.filesystem||fs,
   './windows-appcontainer-probe.js':{failureDiagnostic:require('../../agents/codex/workflow/windows-appcontainer-probe.js').failureDiagnostic,canaryKey(){return scenario.key||'e'.repeat(64)},async runWindowsAppContainerCanary(execute,worker,key){canaries.push({execute,worker,key});if(scenario.canaryWait)await scenario.canaryWait;if(scenario.canaryError)throw scenario.canaryError;if(scenario.canaryExec)await execute({scratchPath:scratch,readableRoots:[scratch],writableRoots:[scratch]},{command:'fixed-native-canary',cwd:scratch},{controlRoot});return scenario.canaryResult||{supported:true,workerIdentity:identity,runtimeSha256:key,processCleanup:'owned-job-drained'}}},
-  './safe-run-root.js':{ensureWindowsPrivateAcl(){}},
+  './safe-run-root.js':{ensureWindowsPrivateAcl(){},createWindowsCompilerDirectory(prefix){
+    assert.equal(prefix,'autoprompt-command-');fs.mkdirSync(shallowRoot,{recursive:true})
+    stagingRoot=fs.mkdtempSync(path.join(shallowRoot,prefix));return stagingRoot
+  }},
+  './windows-filesystem.js':{createWindowsFilesystemCapture(){return{assertRecordParent(witness){assert.equal(witness,path.join(controlRoot,'command-parent-check'));events.push('control-audit')}}}},
   'node:child_process':{spawnSync(){assert.fail('Production must never discover or launch an ambient Bash')}},
   './windows-worker-loader.js':{async captureWorkerTuple(){events.push('capture');if(scenario.captureError)throw scenario.captureError;return tuple},describeTuple(value){assert.equal(value,tuple);return{identity}},revalidateTuple(value){assert.equal(value,tuple);if(scenario.revalidationError)throw scenario.revalidationError;return{identity}},materializeTuple(value,directory){events.push('materialize');assert.equal(value,tuple);materializedRoot=directory;materializedRoots.add(directory);if(scenario.materialize)return scenario.materialize(directory);fs.mkdirSync(directory);fs.writeFileSync(path.join(directory,'retained'),'owned');if(scenario.materializeError)throw scenario.materializeError;return{identity:scenario.wrongIdentity?'d'.repeat(64):identity,bash:path.join(directory,'usr/bin/bash.exe'),bashSha256:'b'.repeat(64),msysRuntime:{dllPath:path.join(directory,'usr/bin/msys-2.0.dll'),dllSha256:'c'.repeat(64),sharedId:'msys-2.0S5'}}}},
-  './windows-helper-deployment.js':{stageWindowsHelperDeployment(){events.push('stage');return{root:path.join(root,'helper'),cleanup(){events.push('helper-cleanup');if(scenario.cleanupError)throw scenario.cleanupError}}}},
-  './windows-appcontainer-resources.js':{async prepareWindowsAppContainerResources(options){events.push('lease');assert.equal(options.executableRoots[0].path,materializedRoot);if(scenario.prepare)return scenario.prepare(options,evidence);return{profileName:'owned',profileSid:'owned',environment:{},recovery:{leaseId:'owned'},async release(received){assert.equal(received,evidence);events.push('release');if(scenario.releaseError)throw scenario.releaseError;return scenario.resourceRecovery||{restored:4,newEntries:2,deletedEntries:1}}}},recoverWindowsAppContainerResources(){assert.fail('Unexpected recovery')}},
+  './windows-helper-deployment.js':{stageWindowsHelperDeployment(parent){events.push('stage');assert.equal(parent,stagingRoot);const ownedHelperRoot=path.join(parent,'native-helpers-owned');helperRoot=ownedHelperRoot;fs.mkdirSync(ownedHelperRoot);return{root:ownedHelperRoot,cleanup(){events.push('helper-cleanup');if(scenario.cleanupError)throw scenario.cleanupError;fs.rmSync(ownedHelperRoot,{recursive:true,force:true})}}}},
+  './windows-appcontainer-resources.js':{async prepareWindowsAppContainerResources(options){events.push('lease');assert.equal(options.controlRoot,controlRoot);assert.equal(options.executableRoots[0].path,materializedRoot);if(scenario.prepare)return scenario.prepare(options,evidence);return{profileName:'owned',profileSid:'owned',environment:{},recovery:{leaseId:'owned'},async release(received){assert.equal(received,evidence);events.push('release');if(scenario.releaseError)throw scenario.releaseError;return scenario.resourceRecovery||{restored:4,newEntries:2,deletedEntries:1}}}},recoverWindowsAppContainerResources(){assert.fail('Unexpected recovery')}},
  }
  const filename=path.resolve(__dirname,'../../agents/codex/workflow/windows-appcontainer-command.js'),localRequire=createRequire(filename),module={exports:{}}
  replacements['./windows-appcontainer.js']={...localRequire('./windows-appcontainer.js'),createWindowsAppContainerLauncher(){events.push('launcher');return scenario.makeLauncher?scenario.makeLauncher(launcher,evidence):launcher}}
  vm.runInNewContext(fs.readFileSync(filename,'utf8'),{module,exports:module.exports,Buffer,__dirname:path.dirname(filename),process:{platform:'win32',env:{SystemRoot:'C:\\Windows',AUTOPROMPT_WINDOWS_BASH:'hostile'},execPath:'/must/not/copy/controller'},require:name=>Object.hasOwn(replacements,name)?replacements[name]:localRequire(name)},{filename})
- return{root,events,identity,canaries,api:module.exports,get runtimeRoot(){return materializedRoot},run:()=>module.exports.runWindowsAppContainerCommand({...(scenario.noScratch?{}:{scratchPath:scratch}),readableRoots:[scratch],writableRoots:[scratch]},{command:'printf owned',cwd:scratch},{controlRoot,bashPath:'hostile',env:{AUTOPROMPT_WINDOWS_BASH:'hostile'}})}
+ return{root,controlRoot,events,identity,canaries,api:module.exports,get runtimeRoot(){return materializedRoot},get stagingRoot(){return stagingRoot},get helperRoot(){return helperRoot},run:()=>module.exports.runWindowsAppContainerCommand({...(scenario.noScratch?{}:{scratchPath:scratch}),readableRoots:scenario.overlapStaging?[scratch,shallowRoot]:[scratch],writableRoots:[scratch]},{command:'printf owned',cwd:scratch},{controlRoot,bashPath:'hostile',env:{AUTOPROMPT_WINDOWS_BASH:'hostile'}})}
 }
-test('production command uses captured worker tuple, reports identity and releases before removal',async t=>{const x=setup(t),result=await x.run();assert.equal(result.status,'completed');assert.equal(result.workerIdentity,x.identity);assert.equal(result.stdout,'owned');assert.equal(Object.isFrozen(result.resourceRecovery),true);assert.deepEqual({...result.resourceRecovery},{restored:4,newEntries:2,deletedEntries:1});assert.deepEqual(x.events,['capture','stage','launcher','materialize','lease','launch','release','helper-cleanup']);assert.equal(fs.existsSync(x.runtimeRoot),false)})
+test('production command uses captured worker tuple, reports identity and releases before removal',async t=>{const x=setup(t),result=await x.run();assert.equal(result.status,'completed');assert.equal(result.workerIdentity,x.identity);assert.equal(result.stdout,'owned');assert.equal(Object.isFrozen(result.resourceRecovery),true);assert.deepEqual({...result.resourceRecovery},{restored:4,newEntries:2,deletedEntries:1});assert.deepEqual(x.events,['capture','control-audit','stage','launcher','materialize','lease','launch','release','helper-cleanup']);assert.equal(fs.existsSync(x.runtimeRoot),false);assert.equal(fs.existsSync(x.stagingRoot),false)})
 test('unavailable packaged workers refuse before helper deployment or ambient fallback',async t=>{const failure=Object.assign(Error('bundle-unavailable'),{code:'WINDOWS_WORKER_BUNDLE_INVALID'}),x=setup(t,{captureError:failure});await assert.rejects(x.run(),error=>error===failure);assert.deepEqual(x.events,['capture'])})
 test('materialization identity mismatch refuses before resource grants or worker launch',async t=>{const x=setup(t,{wrongIdentity:true});await assert.rejects(x.run(),{code:'WINDOWS_RUNTIME_MISMATCH'});assert.equal(x.events.includes('lease'),false);assert.equal(x.events.includes('launch'),false);assert.equal(fs.existsSync(x.runtimeRoot),false)})
-test('unconfirmed materialization cleanup preserves owned runtime and original failure',async t=>{const failure=Object.assign(Error('materialization-failed'),{cleanupConfirmed:false}),x=setup(t,{materializeError:failure});await assert.rejects(x.run(),error=>error===failure);assert.equal(x.events.includes('launch'),false);assert.equal(fs.readFileSync(path.join(x.runtimeRoot,'retained'),'utf8'),'owned')})
+test('unconfirmed materialization cleanup preserves owned runtime and original failure',async t=>{const failure=Object.assign(Error('materialization-failed'),{cleanupConfirmed:false}),x=setup(t,{materializeError:failure});await assert.rejects(x.run(),error=>error===failure&&error.retainedStagingRoot===x.stagingRoot);assert.equal(x.events.includes('launch'),false);assert.equal(fs.readFileSync(path.join(x.runtimeRoot,'retained'),'utf8'),'owned');assert.equal(fs.existsSync(x.stagingRoot),true)})
 test('command cleanup preserves an existing runtime when the loader exclusive mkdir refuses ownership',async t=>{
  const x=setup(t,{materialize(directory){
   // Simulate another allocation winning before the loader's exclusive mkdir.
   fs.mkdirSync(directory);fs.writeFileSync(path.join(directory,'foreign-marker'),'another owner')
   fs.mkdirSync(directory)
  }})
- await assert.rejects(x.run(),{code:'EEXIST'})
+ await assert.rejects(x.run(),error=>error.code==='EEXIST'&&error.cleanupConfirmed===false&&error.retainedStagingRoot===x.stagingRoot)
  assert.equal(fs.readFileSync(path.join(x.runtimeRoot,'foreign-marker'),'utf8'),'another owner')
  assert.equal(x.events.includes('lease'),false);assert.equal(x.events.includes('launch'),false)
 })
@@ -47,11 +51,16 @@ test('command cleanup preserves a scratch collision before its own mkdir succeed
  assert.equal(fs.readFileSync(path.join(foreign,'foreign-marker'),'utf8'),'another owner')
  assert.equal(x.events.includes('materialize'),false);assert.equal(x.events.includes('lease'),false);assert.equal(x.events.includes('launch'),false)
 })
-test('cancellation stays inside the owned deployment and never unlinks shared controller markers',async t=>{
+test('worker resource roots cannot contain private shallow command staging',async t=>{
+ const x=setup(t,{overlapStaging:true});await assert.rejects(x.run(),{code:'WINDOWS_RESOURCE_INVALID'})
+ assert.equal(x.events.includes('stage'),false);assert.equal(x.events.includes('materialize'),false);assert.equal(x.events.includes('lease'),false);assert.equal(fs.existsSync(x.stagingRoot),false)
+})
+test('deep controller paths stage managed helpers, runtime and cancellation beneath a shallow owned root',async t=>{
  let cancellation
- const x=setup(t,{inspectLaunch(request){cancellation=request.cancellationPath},filesystem:{...fs,unlinkSync(){assert.fail('Wrapper must not remove shared controller markers')}}})
- const marker=path.join(x.root,'controller','cancel-other-owner');fs.writeFileSync(marker,'another command')
- await x.run();assert.equal(cancellation,path.join(x.root,'helper','cancel'));assert.equal(fs.readFileSync(marker,'utf8'),'another command')
+ const x=setup(t,{deepControlRoot:true,inspectLaunch(request){cancellation=request.cancellationPath;assert.ok(request.executable.length<260);assert.ok(request.msysRuntime.dllPath.length<260);assert.ok(request.cancellationPath.length<260)},filesystem:{...fs,unlinkSync(){assert.fail('Wrapper must not remove shared controller markers')}}})
+ assert.ok(x.controlRoot.length>300)
+ const marker=path.join(x.controlRoot,'cancel-other-owner');fs.writeFileSync(marker,'another command')
+ await x.run();assert.equal(cancellation,path.join(x.helperRoot,'cancel'));assert.equal(path.dirname(x.runtimeRoot),x.stagingRoot);assert.equal(path.dirname(x.helperRoot),x.stagingRoot);assert.notEqual(path.dirname(x.stagingRoot),path.dirname(x.controlRoot));assert.equal(fs.readFileSync(marker,'utf8'),'another command')
  assert.equal(x.events.includes('helper-cleanup'),true)
 })
 
@@ -70,7 +79,7 @@ test('persistent owned runtime removal failure still refuses success and poisons
  const failure=Object.assign(Error('persistent image teardown'),{code:'EBUSY'}),scenario={}
  scenario.filesystem={...fs,rmSync(directory,options){if(path.basename(directory).startsWith('command-runtime-')){assert.deepEqual({...options},{recursive:true,force:true,maxRetries:10,retryDelay:100});throw failure}return fs.rmSync(directory,options)}}
  const x=setup(t,scenario);await assert.rejects(x.run(),error=>error===failure&&error.cleanupConfirmed===false&&error.cleanupCode==='EBUSY'&&error.retainedRuntimeRoot===x.runtimeRoot)
- assert.equal(fs.existsSync(x.runtimeRoot),true);assert.equal(x.events.includes('helper-cleanup'),true);const launches=x.events.filter(value=>value==='launch').length
+ assert.equal(failure.retainedStagingRoot,x.stagingRoot);assert.equal(fs.existsSync(x.runtimeRoot),true);assert.equal(fs.existsSync(x.stagingRoot),true);assert.equal(x.events.includes('helper-cleanup'),true);const launches=x.events.filter(value=>value==='launch').length
  await assert.rejects(x.run(),error=>error!==failure&&error.cleanupConfirmed===false&&error.admissionFailure?.message===failure.message);assert.equal(x.events.filter(value=>value==='launch').length,launches)
 })
 
@@ -150,7 +159,7 @@ test('private canary executor launches the bound tuple without recursive public 
  assert.equal(Object.hasOwn(x.api,'runTupleCommand'),false);assert.equal(Object.hasOwn(x.api,'ensureWorkerAdmission'),false)
 })
 test('unsupported canary with retained recovery root poisons later admission',async t=>{
- const scenario={canaryResult:{supported:false,code:'APPCONTAINER_CLEANUP_UNCONFIRMED',recoveryRoot:'retained-native-fixture'}},x=setup(t,scenario)
- await assert.rejects(x.run(),error=>error.cleanupConfirmed===false&&error.recoveryRoot==='retained-native-fixture');delete scenario.canaryResult
- await assert.rejects(x.run(),error=>error.cleanupConfirmed===false);assert.equal(x.canaries.length,1);assert.equal(x.events.includes('launch'),false)
+ const scenario={canaryResult:{supported:false,code:'APPCONTAINER_CLEANUP_UNCONFIRMED',recoveryRoot:'retained-native-fixture',retainedStagingRoot:'retained-command-staging'}},x=setup(t,scenario)
+ await assert.rejects(x.run(),error=>error.cleanupConfirmed===false&&error.recoveryRoot==='retained-native-fixture'&&error.retainedStagingRoot==='retained-command-staging');delete scenario.canaryResult
+ await assert.rejects(x.run(),error=>error.cleanupConfirmed===false&&error.admissionFailure?.retainedStagingRoot==='retained-command-staging');assert.equal(x.canaries.length,1);assert.equal(x.events.includes('launch'),false)
 })

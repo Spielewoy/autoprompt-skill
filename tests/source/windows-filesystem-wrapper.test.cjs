@@ -103,7 +103,7 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
     const value = request.operation === 'tree' ? treeFixture() : { schemaVersion: 1, status: 'CAPTURED', operation: request.operation, identity: '1234abcd:0000000000000001', length: 0, stat: stat('1234abcd:0000000000000001'), sha256: crypto.createHash('sha256').digest('hex'), ...(request.operation === 'read' ? { dataBase64: '' } : {}) }
     return { status: 0, stdout: JSON.stringify(value), stderr: '' }
   } } : name === 'node:fs' ? fakeFs
-    : name === './safe-run-root.js' ? { createWindowsCompilerDirectory: prefix => { assert.equal(prefix, 'autoprompt-windows-capture-'); return 'C:\\private-temp' } }
+    : name === './safe-run-root.js' ? { createWindowsCompilerDirectory: prefix => { assert.equal(prefix, 'autoprompt-windows-capture-'); return 'C:\\private-temp' }, windowsControllerEnvironment: (systemRoot, temp) => ({ SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: 'C:', PATH: 'C:\\Windows\\System32', PSModulePath: '', TEMP: temp, TMP: temp }) }
     : require(name) }
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), sandbox, { filename })
   const capture = sandbox.module.exports.createWindowsFilesystemCapture({ helper: 'C:\\trusted\\windows-filesystem.ps1' })

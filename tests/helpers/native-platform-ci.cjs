@@ -178,6 +178,7 @@ async function main() {
   assert.equal(evidence.sandbox.supported, true, `Native sandbox prerequisite failed: ${JSON.stringify(evidence.sandbox)}`)
   const diagnosticCases = [
     'native Windows compiler staging ignores deep home and temp overrides',
+    'native Windows Bash repeated forks complete without retry diagnostics',
     'claude closed native capability: full canonical role schema is accepted and validated',
     'packed actual Claude activation requires all local native observations before mission admission',
   ]
@@ -185,7 +186,7 @@ async function main() {
   const { code, output } = await runTests(['--test', '--test-reporter=tap', '--test-concurrency=1', ...selection,
     'tests/source/harness-v2-claude-capability-native.test.cjs',
     'tests/source/harness-v2-installed-canary-native.test.cjs',
-    ...(diagnostic ? ['tests/source/windows-appcontainer.test.cjs'] : [])],
+    ...(diagnostic ? ['tests/source/windows-appcontainer.test.cjs', 'tests/source/windows-bash-runtime.test.cjs'] : [])],
   { ...process.env, AUTOPROMPT_CLAUDE_TEST_CLI: executable, AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1' }, 'native-platform-tests.log')
   evidence.exitCode = code
   if (diagnostic) {

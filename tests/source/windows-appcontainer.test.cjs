@@ -56,12 +56,25 @@ test('AppContainer refusal preserves bounded native diagnostics and rejects uncl
 function windowsModule(file, replacements = {}, directory, globals = {}) {
   const filename = path.resolve(__dirname, '../../agents/codex/workflow', file)
   const localRequire = createRequire(filename), module = { exports: {} }
+  // Model a Windows Z: volume with the actual POSIX filesystem as its backing
+  // store. Production always receives drive-root paths, even on Linux CI.
+  const mapVolume = process.platform !== 'win32' && path.isAbsolute(globals.userInfoHome || '')
+  const logical = value => mapVolume && typeof value === 'string' && value.startsWith('/') ? 'Z:' + value.replaceAll('/', '\\') : value
+  const physical = value => mapVolume && typeof value === 'string' && /^Z:\\/iu.test(value) ? value.slice(2).replaceAll('\\', '/') : value
+  const mappedFs = mapVolume ? { ...fs,
+    lstatSync: (value, ...args) => fs.lstatSync(physical(value), ...args),
+    realpathSync: { native: value => logical(fs.realpathSync.native(physical(value))) },
+    mkdtempSync: (value, ...args) => logical(fs.mkdtempSync(physical(value), ...args)),
+    rmSync: (value, ...args) => fs.rmSync(physical(value), ...args),
+  } : null
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), {
     module, exports: module.exports, __dirname: directory || path.dirname(filename), Buffer, ...globals,
     process: { platform: 'win32', arch: process.arch, pid: process.pid, execPath: process.execPath,
       env: { SystemRoot: 'C:\\Windows', NODE_OPTIONS: '--require must-not-inherit', OPENAI_API_KEY: 'must-not-inherit', ...(globals.env || {}) } },
-    require: name => Object.hasOwn(replacements, name) ? replacements[name]
-      : name === 'node:os' && globals.userInfoHome ? { ...require('node:os'), userInfo: () => ({ homedir: globals.userInfoHome }) }
+    require: name => Object.hasOwn(replacements, name) ? (name === './safe-run-root.js' ? { ensureWindowsDefaultTokenOwner() {}, windowsControllerEnvironment: () => ({ TEMP: require('node:os').tmpdir() }), ...replacements[name] } : replacements[name])
+      : name === 'node:fs' && mappedFs ? mappedFs
+      : name === 'node:path' && mappedFs ? { ...path.win32, resolve: (...values) => path.win32.resolve(...values.map(logical)) }
+      : name === 'node:os' && globals.userInfoHome ? { ...require('node:os'), userInfo: () => ({ homedir: logical(globals.userInfoHome) }) }
       : localRequire(name),
   }, { filename })
   return module.exports
@@ -143,9 +156,12 @@ test('Windows helper staging preserves its primary refusal and accounts for an u
   assert.equal(removed, owned); assert.equal(path.dirname(owned), root); assert.equal(fs.statSync(owned).isDirectory(), true)
 })
 
+const windowsFixturePath = value => process.platform === 'win32' ? value : 'Z:' + value.replaceAll('/', '\\')
+const physicalFixturePath = value => process.platform === 'win32' ? value : value.slice(2).replaceAll('\\', '/')
+
 test('Windows ownership setup keeps a bounded cold-start allowance and never caches a failed privacy proof', t => {
   const profile = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-profile-'))
-  fs.mkdirSync(path.join(profile, 'AppData', 'Local'), { recursive: true })
+  fs.mkdirSync(path.join(profile, 'AppData', 'Local', 'Temp'), { recursive: true }); fs.mkdirSync(path.join(profile, 'AppData', 'Roaming'), { recursive: true })
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
   const attempts = [], aclAttempts = []
   const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(file, argv, options) {
@@ -180,15 +196,21 @@ test('Windows ownership setup keeps a bounded cold-start allowance and never cac
     assert.deepEqual(Array.from(options.stdio), ['ignore', 'pipe', 'pipe'])
     assert.equal(options.env.NODE_OPTIONS, undefined)
     assert.equal(options.env.OPENAI_API_KEY, undefined)
+    assert.equal(options.env.USERPROFILE, windowsFixturePath(fs.realpathSync.native(profile)))
+    assert.equal(options.env.HOME, windowsFixturePath(fs.realpathSync.native(profile)))
+    assert.equal(options.env.APPDATA, windowsFixturePath(fs.realpathSync.native(path.join(profile, 'AppData', 'Roaming'))))
+    assert.equal(options.env.LOCALAPPDATA, windowsFixturePath(fs.realpathSync.native(path.join(profile, 'AppData', 'Local'))))
+    assert.equal(options.env.HOMEDRIVE, windowsFixturePath(profile).slice(0,2))
+    assert.equal(options.env.HOMEPATH, windowsFixturePath(fs.realpathSync.native(profile)).slice(2))
     assert.ok(options.env.TEMP.length < 100, 'CodeDOM compiler temp must stay shallow')
-    assert.equal(fs.existsSync(options.env.TEMP), false, 'temporary compiler files must be removed after success and failure')
+    assert.equal(fs.existsSync(physicalFixturePath(options.env.TEMP)), false, 'temporary compiler files must be removed after success and failure')
   }
 })
 
 test('Windows ownership setup preserves a Unicode known folder and ignores hostile ambient local-app-data variables', t => {
   const profile = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-Å-用户-')))
   const knownFolder = path.join(profile, 'AppData', 'Local')
-  fs.mkdirSync(knownFolder, { recursive: true })
+  fs.mkdirSync(path.join(knownFolder, 'Temp'), { recursive: true }); fs.mkdirSync(path.join(profile, 'AppData', 'Roaming'), { recursive: true })
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
   const acl = []
   const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(file, argv, options) {
@@ -202,12 +224,31 @@ test('Windows ownership setup preserves a Unicode known folder and ignores hosti
   } } }, undefined, { env: { LOCALAPPDATA: 'C:\\attacker-controlled-root' }, userInfoHome: profile })
   assert.equal(safe.ensureWindowsDefaultTokenOwner().supported, true)
   assert.equal(acl.length, 1)
-  assert.equal(path.dirname(acl[0].env.AUTOPROMPT_PRIVATE_ACL_PATH), knownFolder)
+  assert.equal(path.win32.dirname(acl[0].env.AUTOPROMPT_PRIVATE_ACL_PATH), windowsFixturePath(knownFolder))
 })
 
 test('Windows ownership setup refuses an invalid authoritative local-app-data result', () => {
   const safe = windowsModule('safe-run-root.js', {}, undefined, { userInfoHome: 'relative-profile' })
   assert.throws(() => safe.ensureWindowsDefaultTokenOwner(), { code: 'PRIVACY_UNSUPPORTED' })
+})
+
+test('Windows controller environment replaces hostile inherited profile fields and preserves private temp', t => {
+  const profile = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'controller-env-')))
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
+  for (const name of ['AppData/Local/Temp', 'AppData/Roaming', 'private-temp']) fs.mkdirSync(path.join(profile, name), { recursive: true })
+  const privateTemp = windowsFixturePath(path.join(profile, 'private-temp'))
+  const hostile = Object.fromEntries(['USERPROFILE', 'HOME', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP', 'SystemDrive', 'NODE_OPTIONS', 'SECRET'].map(key => [key, 'must-not-inherit']))
+  const safe = windowsModule('safe-run-root.js', {}, undefined, { userInfoHome: profile, env: hostile })
+  const environment = safe.windowsControllerEnvironment('D:\\Windows', privateTemp)
+  const home = windowsFixturePath(profile)
+  assert.deepEqual({ ...environment }, { SystemRoot: 'D:\\Windows', WINDIR: 'D:\\Windows', SystemDrive: 'D:', PATH: 'D:\\Windows\\System32', PSModulePath: '', USERPROFILE: home, HOME: home, HOMEDRIVE: home.slice(0,2), HOMEPATH: home.slice(2), APPDATA: path.win32.join(home,'AppData','Roaming'), LOCALAPPDATA: path.win32.join(home,'AppData','Local'), TEMP: privateTemp, TMP: privateTemp })
+  assert.equal(safe.windowsControllerEnvironment('D:\\Windows').TEMP, path.win32.join(home,'AppData','Local','Temp'))
+  assert.throws(() => safe.windowsControllerEnvironment('D:\\Windows', path.win32.join(home,'missing')), { code: 'PRIVACY_UNSUPPORTED' })
+  assert.throws(() => safe.windowsControllerEnvironment('relative'), { code: 'PRIVACY_UNSUPPORTED' })
+  for (const homedir of ['relative', '\\\\server\\share\\profile']) {
+    const invalid = windowsModule('safe-run-root.js', { 'node:os': { userInfo: () => ({ homedir }) } })
+    assert.throws(() => invalid.windowsControllerEnvironment('D:\\Windows'), { code: 'PRIVACY_UNSUPPORTED' })
+  }
 })
 
 test('native Windows compiler staging ignores deep home and temp overrides', { skip: process.platform !== 'win32' }, () => {
@@ -219,12 +260,16 @@ test('native Windows compiler staging ignores deep home and temp overrides', { s
     try {
       const expected = fs.realpathSync.native(path.join(os.userInfo().homedir, 'AppData', 'Local'))
       if (fs.realpathSync.native(path.dirname(directory)) !== expected) throw new Error('compiler directory escaped the token profile local data root')
+      const environment = safe.windowsControllerEnvironment(process.env.SystemRoot, directory)
+      const home = fs.realpathSync.native(os.userInfo().homedir)
+      const expectedEnvironment = { USERPROFILE: home, HOME: home, HOMEDRIVE: home.slice(0,2), HOMEPATH: home.slice(2), APPDATA: fs.realpathSync.native(path.join(home,'AppData','Roaming')), LOCALAPPDATA: expected, TEMP: directory, TMP: directory, SystemRoot: process.env.SystemRoot, SystemDrive: process.env.SystemRoot.slice(0,2) }
+      for (const [key,value] of Object.entries(expectedEnvironment)) if (environment[key] !== value) throw new Error('native controller environment mismatch: ' + key)
       const powershell = path.win32.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
       const nativeSource = ${JSON.stringify(path.resolve(__dirname, '../../agents/codex/workflow/windows-appcontainer-native.cs'))}
       const reflection = "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);Add-Type -Path '" + nativeSource.replace(/'/g, "''") + "';$m=[WindowsAppContainerNative].GetMethod('PrepareControllerProfileEnvironment',[Reflection.BindingFlags]::Static -bor [Reflection.BindingFlags]::NonPublic);$r=$m.Invoke($null,(,[string[]]@(('SystemRoot='+$env:SystemRoot),'TEMP=owned','LOCALAPPDATA=caller')));[Console]::Out.WriteLine(($r|Where-Object {$_ -like 'LOCALAPPDATA=*'}))"
-      const prepared = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', reflection], { encoding: 'utf8', windowsHide: true, shell: false, timeout: 60000, maxBuffer: 64 * 1024, env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.SystemRoot, SystemDrive: process.env.SystemRoot.slice(0,2), PATH: path.win32.join(process.env.SystemRoot, 'System32'), PSModulePath: '', TEMP: directory, TMP: directory } })
+      const prepared = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', reflection], { encoding: 'utf8', windowsHide: true, shell: false, timeout: 60000, maxBuffer: 64 * 1024, env: environment })
       if (prepared.error || prepared.signal || prepared.status !== 0 || prepared.stderr || prepared.stdout.trim() !== 'LOCALAPPDATA=' + expected) throw new Error('native profile environment probe failed: ' + (prepared.stderr || prepared.stdout || prepared.error?.message || prepared.status))
-      const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "$ErrorActionPreference='Stop';Add-Type -TypeDefinition 'public sealed class AutopromptNativeCompilerProbe { public static int Value { get { return 1; } } }';if([AutopromptNativeCompilerProbe]::Value -ne 1){throw 'compiler probe failed'}"], { encoding: 'utf8', windowsHide: true, shell: false, timeout: 60000, maxBuffer: 64 * 1024, env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.SystemRoot, SystemDrive: process.env.SystemRoot.slice(0,2), PATH: path.win32.join(process.env.SystemRoot, 'System32'), PSModulePath: '', TEMP: directory, TMP: directory } })
+      const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "$ErrorActionPreference='Stop';Add-Type -TypeDefinition 'public sealed class AutopromptNativeCompilerProbe { public static int Value { get { return 1; } } }';if([AutopromptNativeCompilerProbe]::Value -ne 1){throw 'compiler probe failed'}"], { encoding: 'utf8', windowsHide: true, shell: false, timeout: 60000, maxBuffer: 64 * 1024, env: environment })
       if (result.error || result.signal || result.status !== 0 || result.stderr) throw new Error('real Add-Type compiler probe failed: ' + (result.stderr || result.error?.message || result.status))
     } finally { fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) }
     if (fs.existsSync(directory)) throw new Error('compiler scratch survived cleanup')
@@ -245,7 +290,7 @@ test('Windows private ACL replaces foreign grants with exact file or directory r
   let mutate = value => value
   const currentSid = 'S-1-5-21-123-456-789-1001'
   const profile = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-acl-profile-'))
-  fs.mkdirSync(path.join(profile, 'AppData', 'Local'), { recursive: true })
+  fs.mkdirSync(path.join(profile, 'AppData', 'Local', 'Temp'), { recursive: true }); fs.mkdirSync(path.join(profile, 'AppData', 'Roaming'), { recursive: true })
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
   const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(executable, argv, options) {
     calls.push({ executable, argv, options })
@@ -259,7 +304,7 @@ test('Windows private ACL replaces foreign grants with exact file or directory r
   } } }, undefined, { userInfoHome: profile })
   assert.equal(safe.ensureWindowsPrivateAcl(file).supported, true)
   assert.equal(safe.ensureWindowsPrivateAcl(root).supported, true)
-  const grants = calls.filter(call => [file, root].includes(call.options.env.AUTOPROMPT_PRIVATE_ACL_PATH))
+  const grants = calls.filter(call => [file, root].map(windowsFixturePath).includes(call.options.env.AUTOPROMPT_PRIVATE_ACL_PATH))
   assert.equal(grants.length, 2)
   assert.equal(grants[0].options.env.AUTOPROMPT_PRIVATE_ACL_DIRECTORY, '0')
   assert.equal(grants[1].options.env.AUTOPROMPT_PRIVATE_ACL_DIRECTORY, '1')
@@ -270,7 +315,7 @@ test('Windows private ACL replaces foreign grants with exact file or directory r
     assert.deepEqual(Array.from(options.stdio), ['ignore', 'pipe', 'pipe'])
     assert.equal(options.env.NODE_OPTIONS, undefined)
     assert.equal(options.env.OPENAI_API_KEY, undefined)
-    assert.equal(options.env.PSModulePath, undefined)
+    assert.equal(options.env.PSModulePath, '')
     assert.match(argv.at(-1), /DirectorySecurity\]::new\(\)/)
     assert.match(argv.at(-1), /FileSecurity\]::new\(\)/)
     assert.match(argv.at(-1), /SetAccessRuleProtection\(\$true,\$false\)/)
@@ -497,7 +542,7 @@ async function deletionCanary(t, mode = 'success') {
     } }
     await vm.runInNewContext(workerSource, { Buffer, process: workerProcess, setTimeout, require(name) { return { 'node:fs': workerFs, 'node:path': path, 'node:net': workerNet, 'node:child_process': workerCp }[name] } })
     completed = true
-    if (mode === 'unknown-recovery') throw Object.assign(Error('resource recovery unresolved'), { code: 'WINDOWS_ACL_IDENTITY_UNAVAILABLE', recovery: { leaseId: 'fixed-lease' }, cleanupConfirmed: false })
+    if (mode === 'unknown-recovery') throw Object.assign(Error('resource recovery unresolved'), { code: 'WINDOWS_ACL_IDENTITY_UNAVAILABLE', recovery: { leaseId: 'fixed-lease' }, cleanupConfirmed: false, retainedStagingRoot: 'separately-owned-command-staging' })
     if (!['surviving-original', 'worker-delete-denied'].includes(mode)) assert.equal(deleted, true)
     return { workerIdentity: identity, status: workerProcess.exitCode === 0 ? 'completed' : 'failed', exitCode: workerProcess.exitCode, stdout, stderr, launcherSessionId: 1,
       ...(mode === 'missing-recovery' ? {} : { resourceRecovery: Object.freeze({ restored: 4, newEntries: 3, deletedEntries: mode === 'zero-recovery' ? 0 : 1 }) }) }
@@ -528,4 +573,5 @@ test('deletion canary retains its original recovery evidence when resource clean
   const { result, base } = await deletionCanary(t, 'unknown-recovery')
   assert.equal(result.supported, false); assert.equal(result.code, 'WINDOWS_ACL_IDENTITY_UNAVAILABLE')
   assert.equal(result.recoveryRoot, base); assert.equal(fs.existsSync(base), true)
+  assert.equal(result.retainedStagingRoot, 'separately-owned-command-staging')
 })

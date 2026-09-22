@@ -5,7 +5,7 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const cp = require('node:child_process')
 const { createWindowsFilesystemCapture } = require('./windows-filesystem.js')
-const { createWindowsCompilerDirectory } = require('./safe-run-root.js')
+const { createWindowsCompilerDirectory, windowsControllerEnvironment } = require('./safe-run-root.js')
 const MAX_OUTPUT = 1024 * 1024
 class WindowsAppContainerError extends Error {
   constructor(code, message) { super(message); this.name = 'WindowsAppContainerError'; this.code = code }
@@ -131,7 +131,7 @@ function createWindowsAppContainerLauncher(options = {}) {
         startedLeases.add(options.leaseId)
         const child = cp.spawn(powershell.path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helper.path, '-NativeSha256', native.sha256, '-Request'], {
           windowsHide: true, shell: false, cwd: path.dirname(powershell.path), stdio: ['pipe', 'pipe', 'pipe'],
-          env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.join(systemRoot, 'System32'), PSModulePath: '', TEMP: compilerDirectory, TMP: compilerDirectory },
+          env: windowsControllerEnvironment(systemRoot, compilerDirectory),
         })
         const output = [], errors = []; let size = 0, settled = false, overLimit = false
         const cancel = () => { try { fs.writeFileSync(request.cancellationPath, 'cancel\n', { flag: 'wx', mode: 0o600 }) } catch (error) { if (error.code !== 'EEXIST') overLimit = true } }

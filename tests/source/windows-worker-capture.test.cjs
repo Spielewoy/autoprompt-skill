@@ -5,6 +5,7 @@ const WORKFLOW=path.resolve(__dirname,'../../agents/codex/workflow')
 const sha=b=>crypto.createHash('sha256').update(b).digest('hex')
 function fixture(t,mode='ok',cleanupFailure=false){
  const base=fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(),'capture-composition-')));t.after(()=>fs.rmSync(base,{recursive:true,force:true}))
+ const controllerTemp=path.join(base,'os-profile-temp');fs.mkdirSync(controllerTemp)
  const root=path.join(base,'bundle');fs.mkdirSync(root);fs.writeFileSync(path.join(root,'manifest.json'),'{}');fs.writeFileSync(path.join(root,'asset.br'),'captured bytes')
  const helper=path.join(base,'helper.exe');fs.writeFileSync(helper,'fixed helper fixture');fs.writeFileSync(helper+'.config','fixed config fixture')
  const files=['manifest.json','asset.br'].map(name=>{const bytes=fs.readFileSync(path.join(root,name));return{path:name,length:bytes.length,sha256:sha(bytes)}})
@@ -34,14 +35,15 @@ function fixture(t,mode='ok',cleanupFailure=false){
   return child
  }
  const module={exports:{}};const fastTimer=(fn,ms)=>setTimeout(fn,mode==='identity-unconfirmed'?10:ms)
- vm.runInNewContext(fs.readFileSync(path.join(WORKFLOW,'windows-worker-capture.js'),'utf8'),{module,exports:module.exports,__dirname:WORKFLOW,process:{platform:'win32'},Buffer,setTimeout:fastTimer,clearTimeout,require:name=>name==='node:fs'?{...fs,realpathSync:canonical,rmSync(root,options){cleanupCalls.push({root,options});if(cleanupFailure)throw Object.assign(Error('injected helper directory sharing refusal'),{code:'EACCES'});return fs.rmSync(root,options)}}:name==='node:child_process'?{spawn}:name==='./safe-run-root.js'?{ensureWindowsPrivateAcl(){}}:require(name)},{filename:'actual-windows-worker-capture.js'})
- return{capture:module.exports.captureWindowsFiles,root,files,authority,spawned,cleanupCalls,get allocatedRoot(){return allocatedRoot}}
+ vm.runInNewContext(fs.readFileSync(path.join(WORKFLOW,'windows-worker-capture.js'),'utf8'),{module,exports:module.exports,__dirname:WORKFLOW,process:{platform:'win32'},Buffer,setTimeout:fastTimer,clearTimeout,require:name=>name==='node:fs'?{...fs,realpathSync:canonical,rmSync(root,options){cleanupCalls.push({root,options});if(cleanupFailure)throw Object.assign(Error('injected helper directory sharing refusal'),{code:'EACCES'});return fs.rmSync(root,options)}}:name==='node:child_process'?{spawn}:name==='./safe-run-root.js'?{ensureWindowsPrivateAcl(){},ensureWindowsDefaultTokenOwner(){},windowsControllerEnvironment:(systemRoot,temp)=>({SystemRoot:systemRoot,WINDIR:systemRoot,SystemDrive:'C:',PATH:'C:\\Windows\\System32',PSModulePath:'',USERPROFILE:'C:\\Users\\real-runner',HOME:'C:\\Users\\real-runner',TEMP:temp||controllerTemp,TMP:temp||controllerTemp})}:require(name)},{filename:'actual-windows-worker-capture.js'})
+ return{capture:module.exports.captureWindowsFiles,controllerTemp,root,files,authority,spawned,cleanupCalls,get allocatedRoot(){return allocatedRoot}}
 }
 test('actual capture composition queries only staged fixed helper and preserves exact lease handshake',async t=>{
  const x=fixture(t),result=await x.capture(x.root,x.files,x.authority);assert.equal(result.architecture,'x64');assert.equal(result.records.length,2)
  assert.equal(x.spawned.length,2);assert.deepEqual([...x.spawned[0].args],['--identity']);assert.deepEqual([...x.spawned[1].args],[]);assert.equal(x.spawned[0].exe,x.spawned[1].exe)
  for(const file of result.records)assert.equal(sha(file.bytes),x.files.find(value=>value.path===file.path).sha256)
  assert.equal(sha(result.bootstrap.executableBytes),x.authority.executableSha256);assert.equal(sha(result.bootstrap.configBytes),x.authority.configSha256)
+ for(const {exe,options} of x.spawned){assert.equal(path.dirname(path.dirname(exe)),x.controllerTemp);assert.equal(options.env.TEMP,path.dirname(exe));assert.equal(options.env.TMP,path.dirname(exe));assert.equal(options.env.USERPROFILE,'C:\\Users\\real-runner');assert.equal(options.env.OPENAI_API_KEY,undefined)}
  assert.equal(fs.existsSync(path.dirname(x.spawned[0].exe)),false)
 })
 for(const mode of ['identity-stderr','identity-spoof','bad-ready','capture-stderr','missing-finish','trailing-output','nonzero'])test('actual capture protocol rejects '+mode+' with confirmed close',async t=>{

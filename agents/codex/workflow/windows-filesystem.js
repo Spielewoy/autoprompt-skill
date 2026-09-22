@@ -7,7 +7,7 @@ const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
-const { createWindowsCompilerDirectory } = require('./safe-run-root.js')
+const { createWindowsCompilerDirectory, windowsControllerEnvironment } = require('./safe-run-root.js')
 const MAX_RECORD_BYTES = 8 * 1024 * 1024 + 1
 const MAX_TREE_ENTRIES = 16384
 const MAX_RECORD_ENTRIES = 4096
@@ -257,7 +257,7 @@ function createWindowsFilesystemCapture(options = {}) {
       const result = cp.spawnSync(powershellBinding.path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helperBinding.path, '-Request'], {
         input: request, encoding: 'utf8', timeout: timeoutMs, maxBuffer: MAX_OUTPUT_BYTES, windowsHide: true, shell: false,
         cwd: path.win32.dirname(powershellBinding.path),
-        env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '', TEMP: temporary, TMP: temporary, AUTOPROMPT_CAPTURE_PHASES: '1' },
+        env: { ...windowsControllerEnvironment(systemRoot, temporary), AUTOPROMPT_CAPTURE_PHASES: '1' },
       })
       const invocationElapsedMs = Number((process.hrtime.bigint() - invocationStarted) / 1000000n)
       for (const [held, expected, label, cap, singleLink] of [[heldHelper, helperBinding, 'Windows filesystem helper', 4 * 1024 * 1024, true], [heldPowerShell, powershellBinding, 'Windows PowerShell', MAX_BYTES, false]]) {

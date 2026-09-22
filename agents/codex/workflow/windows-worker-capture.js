@@ -4,8 +4,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const cp = require('node:child_process')
-const os = require('node:os')
-const { ensureWindowsPrivateAcl } = require('./safe-run-root.js')
+const { ensureWindowsPrivateAcl, ensureWindowsDefaultTokenOwner, windowsControllerEnvironment } = require('./safe-run-root.js')
 
 function need(ok, code) { if (!ok) throw Error(code) }
 function digest(bytes) { return crypto.createHash('sha256').update(bytes).digest('hex') }
@@ -41,8 +40,7 @@ function validateFiles(files) {
 }
 
 function helperEnvironment(systemRoot, helperRoot) {
-  return Object.freeze({ SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
-    PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '', TEMP: helperRoot, TMP: helperRoot })
+  return Object.freeze(windowsControllerEnvironment(systemRoot, helperRoot))
 }
 
 class StderrCapture {
@@ -132,9 +130,11 @@ async function captureWindowsFiles(root, files, authority) {
   }
   const win = authority.systemRoot
   need(typeof win === 'string' && /^[a-z]:\\windows$/i.test(win), 'system-root-required')
+  ensureWindowsDefaultTokenOwner()
   // Copy externally authorized helper bytes into a private controller directory.
   // The fixed executable never loads source or creates compiler descendants.
-  let helperRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bundle-lease-control-'))
+  const controllerEnvironment = windowsControllerEnvironment(win)
+  let helperRoot = fs.mkdtempSync(path.join(controllerEnvironment.TEMP, 'bundle-lease-control-'))
   try {
     helperRoot = fs.realpathSync.native(helperRoot)
     const inside = path.relative(root, helperRoot)

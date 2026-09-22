@@ -36,7 +36,7 @@ function harness(file, behavior, cleanupFailure = false) {
     'node:fs': fakeFs, 'node:path': path.win32,
     'node:child_process': { spawn: check, spawnSync: check },
     './windows-filesystem.js': { createWindowsFilesystemCapture: () => ({ assertRecordParent() {} }) },
-    './safe-run-root.js': { createWindowsCompilerDirectory(prefix) { created.push(prefix); return temporary } },
+    './safe-run-root.js': { createWindowsCompilerDirectory(prefix) { created.push(prefix); return temporary }, windowsControllerEnvironment(systemRoot, temp) { return { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: 'C:', PATH: 'C:\\Windows\\System32', PSModulePath: '', TEMP: temp, TMP: temp } } },
   }
   const filename = path.resolve(__dirname, '../../agents/codex/workflow', file)
   const localRequire = createRequire(filename), module = { exports: {} }

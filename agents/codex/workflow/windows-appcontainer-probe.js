@@ -1,10 +1,9 @@
 'use strict'
 const fs = require('node:fs')
 const path = require('node:path')
-const os = require('node:os')
 const crypto = require('node:crypto')
 const net = require('node:net')
-const { ensureWindowsPrivateAcl } = require('./safe-run-root.js')
+const { ensureWindowsPrivateAcl, ensureWindowsDefaultTokenOwner, windowsControllerEnvironment } = require('./safe-run-root.js')
 function failureDiagnostic(error, phase) {
   const details = error && error.details
   // This probe only runs fixed controller diagnostics. Preserve their bounded
@@ -46,7 +45,9 @@ async function probeWindowsAppContainer() {
 async function runWindowsAppContainerCanary(runWindowsAppContainerCommand, workerIdentity, key) {
   if (process.platform !== 'win32') return { supported: false, backend: 'windows-appcontainer', code: 'COMMAND_SANDBOX_UNSUPPORTED' }
   if (typeof runWindowsAppContainerCommand !== 'function' || !/^[a-f0-9]{64}$/.test(workerIdentity) || key !== runtimeKey(workerIdentity)) throw new Error('CANARY_IDENTITY_MISMATCH')
-  let base = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-appcontainer-probe-'))
+  ensureWindowsDefaultTokenOwner()
+  const controllerEnvironment = windowsControllerEnvironment(process.env.SystemRoot || process.env.WINDIR)
+  let base = fs.mkdtempSync(path.join(controllerEnvironment.TEMP, 'autoprompt-appcontainer-probe-'))
   let preserve = false, launcherSessionId = null, nativeExitCode = null, probeFailure = null, primaryError = null, phase = 'private-root'
   const endpoints = []
   try {
@@ -107,7 +108,7 @@ async function runWindowsAppContainerCanary(runWindowsAppContainerCommand, worke
   } catch (error) {
     primaryError = error
     preserve = error.cleanupConfirmed === false || error.code === 'APPCONTAINER_CLEANUP_UNCONFIRMED' || Boolean(error.recovery && !error.recoveryResolved)
-    return { supported: false, backend: 'windows-appcontainer', code: error.code || 'COMMAND_SANDBOX_UNSUPPORTED', diagnostic: failureDiagnostic(error, phase), launcherSessionId, nativeExitCode, probeFailure, ...(preserve ? { recoveryRoot: base } : {}) }
+    return { supported: false, backend: 'windows-appcontainer', code: error.code || 'COMMAND_SANDBOX_UNSUPPORTED', diagnostic: failureDiagnostic(error, phase), launcherSessionId, nativeExitCode, probeFailure, ...(preserve ? { recoveryRoot: base, ...(typeof error.retainedStagingRoot === 'string' ? { retainedStagingRoot: error.retainedStagingRoot } : {}) } : {}) }
   } finally {
     let cleanupFailure
     for (const endpoint of endpoints) { try { endpoint.server.close() } catch (error) { cleanupFailure ||= error } }

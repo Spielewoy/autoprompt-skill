@@ -214,13 +214,7 @@ function ensureWindowsDefaultTokenOwner() {
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: path.win32.dirname(powershell),
       env: {
-        SystemRoot: systemRoot,
-        WINDIR: systemRoot,
-        SystemDrive: systemRoot.slice(0, 2),
-        PATH: path.win32.join(systemRoot, 'System32'),
-        PSModulePath: '',
-        TEMP: temporary,
-        TMP: temporary,
+        ...windowsControllerEnvironment(systemRoot, temporary),
         AUTOPROMPT_TOKEN_OWNER_SOURCE: source,
         AUTOPROMPT_TOKEN_OWNER_PID: String(process.pid),
         AUTOPROMPT_TOKEN_OWNER_IMAGE: process.execPath,
@@ -262,7 +256,7 @@ function createWindowsCompilerDirectory(prefix = 'autoprompt-compiler-') {
   // lookups can use the caller's deliberately isolated, deeply nested home.
   let profileHome
   try { profileHome = os.userInfo().homedir } catch (error) { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token profile root could not be resolved', { cause: error && error.code }) }
-  if (typeof profileHome !== 'string' || !path.isAbsolute(profileHome)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token returned no usable profile root')
+  if (typeof profileHome !== 'string' || !/^[A-Za-z]:\\/u.test(profileHome)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token returned no usable profile root')
   const localAppData = path.join(profileHome, 'AppData', 'Local')
   const inspectedLocalAppData = inspectPathNoFollow(localAppData)
   if (!inspectedLocalAppData.exists || !inspectedLocalAppData.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token local application data root is unavailable')
@@ -327,8 +321,7 @@ function applyWindowsPrivateAcl(target) {
     encoding: 'utf8', windowsHide: true, shell: false, timeout: 60000, maxBuffer: 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'], cwd: path.win32.dirname(powershell),
     env: {
-      SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
-      PATH: path.win32.join(systemRoot, 'System32'),
+      ...windowsControllerEnvironment(systemRoot),
       AUTOPROMPT_PRIVATE_ACL_PATH: absolute,
       AUTOPROMPT_PRIVATE_ACL_DIRECTORY: before.isDirectory() ? '1' : '0',
     },
@@ -359,7 +352,9 @@ function applyWindowsPrivateAcl(target) {
 }
 
 function windowsPowerShellEnvironment(extra = {}) {
-  const environment = { ...process.env }
+  if (process.platform !== 'win32') return { ...process.env, ...extra }
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR
+  const environment = windowsControllerEnvironment(systemRoot, extra.TEMP || extra.TMP)
   // Codex Desktop can run Node from a bundled PowerShell host whose
   // PSModulePath points only at the bundled PowerShell modules. Passing that
   // value to Windows PowerShell prevents built-in commands such as Get-Acl
@@ -369,6 +364,20 @@ function windowsPowerShellEnvironment(extra = {}) {
     if (key.toLowerCase() === 'psmodulepath') delete environment[key]
   }
   return { ...environment, ...extra }
+}
+
+function windowsControllerEnvironment(systemRoot, temporary) {
+  if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows system root is unavailable for the controller environment')
+  let profileHome
+  try { profileHome = os.userInfo().homedir } catch (error) { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile is unavailable', { cause: error && error.code }) }
+  if (typeof profileHome !== 'string' || !/^[A-Za-z]:\\/u.test(profileHome)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile is unavailable')
+  const profile = inspectPathNoFollow(profileHome), appData = inspectPathNoFollow(path.join(profileHome, 'AppData')), roaming = inspectPathNoFollow(path.join(profileHome, 'AppData', 'Roaming')), local = inspectPathNoFollow(path.join(profileHome, 'AppData', 'Local'))
+  if (!profile.exists || !profile.realpath || !appData.exists || !appData.realpath || !roaming.exists || !roaming.realpath || !local.exists || !local.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile folders are unavailable')
+  const tempPath = temporary || path.join(local.realpath, 'Temp'), temp = inspectPathNoFollow(tempPath)
+  if (!temp.exists || !temp.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows controller temporary folder is unavailable')
+  const parsed = path.win32.parse(profileHome)
+  if (!/^[A-Za-z]:\\$/u.test(parsed.root)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile drive is unavailable')
+  return { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '', USERPROFILE: profile.realpath, HOME: profile.realpath, HOMEDRIVE: parsed.root.slice(0, 2), HOMEPATH: profileHome.slice(2), APPDATA: roaming.realpath, LOCALAPPDATA: local.realpath, TEMP: temp.realpath, TMP: temp.realpath }
 }
 
 function validateWindowsAclSnapshot(snapshot) {
@@ -1039,6 +1048,7 @@ module.exports = {
   ensureWindowsPrivateAcl,
   ensureWindowsDefaultTokenOwner,
   createWindowsCompilerDirectory,
+  windowsControllerEnvironment,
   validateWindowsAclSnapshot,
   auditPrivatePermissions,
   withOwnedLock,

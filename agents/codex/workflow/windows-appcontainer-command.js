@@ -3,11 +3,16 @@ const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const cp = require('node:child_process')
-const { ensureWindowsPrivateAcl } = require('./safe-run-root.js')
+const { createWindowsCompilerDirectory, ensureWindowsPrivateAcl } = require('./safe-run-root.js')
+const { createWindowsFilesystemCapture } = require('./windows-filesystem.js')
 const { createWindowsAppContainerLauncher, WindowsAppContainerError, parseMsysSharedId } = require('./windows-appcontainer.js')
 const { failureDiagnostic } = require('./windows-appcontainer-probe.js')
 const workerBundle = require('./windows-worker-loader.js')
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
+function within(root, value) {
+  const relative = path.relative(path.resolve(root).toLowerCase(), path.resolve(value).toLowerCase())
+  return relative === '' || relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+}
 // Copy a closed executable dependency set into the existing read-only runtime.
 // Granting the original Git installation would also expose unrelated plugins,
 // credentials and mutable launchers to a worker.
@@ -156,7 +161,8 @@ function retainUnknownAdmission(error) {
     admissionPoison ||= Object.freeze({ code: error.code, message: error.message,
       ...(error.recovery ? { recovery: Object.freeze({ ...error.recovery }) } : {}),
       recoveryRoot: error.recoveryRoot, retainedHelperRoot: error.retainedHelperRoot,
-      retainedRuntimeRoot: error.retainedRuntimeRoot, retainedControlRoot: error.retainedControlRoot })
+      retainedRuntimeRoot: error.retainedRuntimeRoot, retainedStagingRoot: error.retainedStagingRoot,
+      retainedControlRoot: error.retainedControlRoot })
     admittedWorker = null
   }
 }
@@ -167,7 +173,7 @@ function refusePoisonedAdmission() {
   error.admissionFailure = admissionPoison
   // Prior recovery belongs to the previous operation. In particular, never put
   // it in .recovery, which this operation's catch may recover or replace.
-  error.recoveryRoot = admissionPoison.recoveryRoot || admissionPoison.retainedHelperRoot || admissionPoison.retainedRuntimeRoot || admissionPoison.retainedControlRoot
+  error.recoveryRoot = admissionPoison.recoveryRoot || admissionPoison.retainedHelperRoot || admissionPoison.retainedRuntimeRoot || admissionPoison.retainedStagingRoot || admissionPoison.retainedControlRoot
   throw error
 }
 async function ensureWorkerAdmission() {
@@ -186,7 +192,11 @@ async function ensureWorkerAdmission() {
       if (!result || result.supported !== true || result.workerIdentity !== worker.identity || result.runtimeSha256 !== key || result.processCleanup !== 'owned-job-drained') {
         const error = new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', 'The selected Windows worker tuple did not pass its fresh native canary')
         if (result && result.supported === false) error.canaryResult = result
-        if (result?.recoveryRoot) { error.cleanupConfirmed = false; error.recoveryRoot = result.recoveryRoot }
+        if (result?.recoveryRoot || result?.retainedStagingRoot) {
+          error.cleanupConfirmed = false
+          if (result.recoveryRoot) error.recoveryRoot = result.recoveryRoot
+          if (result.retainedStagingRoot) error.retainedStagingRoot = result.retainedStagingRoot
+        }
         throw error
       }
       if (currentAdmission(tuple).key !== key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed during the Windows worker canary')
@@ -208,7 +218,10 @@ async function probeWindowsAppContainer() {
   try { return (await ensureWorkerAdmission()).result }
   catch (error) {
     if (error.canaryResult) return error.canaryResult
-    return { supported: false, backend: 'windows-appcontainer', code: error.code || 'WINDOWS_RUNTIME_UNAVAILABLE', diagnostic: failureDiagnostic(error, 'worker-admission'), ...(error.cleanupConfirmed === false ? { cleanupConfirmed: false, recoveryRoot: error.recoveryRoot || error.retainedHelperRoot || error.retainedRuntimeRoot } : {}) }
+    return { supported: false, backend: 'windows-appcontainer', code: error.code || 'WINDOWS_RUNTIME_UNAVAILABLE', diagnostic: failureDiagnostic(error, 'worker-admission'), ...(error.cleanupConfirmed === false ? {
+      cleanupConfirmed: false, recoveryRoot: error.recoveryRoot || error.retainedHelperRoot || error.retainedRuntimeRoot || error.retainedStagingRoot,
+      ...(error.retainedStagingRoot ? { retainedStagingRoot: error.retainedStagingRoot } : {}),
+    } : {}) }
   }
 }
 async function runWindowsAppContainerCommand(policy, args, options = {}) {
@@ -224,11 +237,11 @@ async function runTupleCommand(policy, args, options, tuple, key) {
   if (currentAdmission(tuple).key !== key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed before tuple execution')
   if (process.platform !== 'win32' || typeof options.controlRoot !== 'string' || !path.isAbsolute(options.controlRoot)) throw new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', 'A private controller root is required for Windows commands')
   const controlRoot = fs.realpathSync.native(options.controlRoot)
+  createWindowsFilesystemCapture().assertRecordParent(path.join(controlRoot, 'command-parent-check'))
   const nonce = crypto.randomUUID().replaceAll('-', '')
   // MSYS derives its installation root by removing the DLL filename, bin and
   // usr components. Keep that real layout inside one owned command directory.
-  const runtimeRoot = path.join(path.dirname(controlRoot), `command-runtime-${nonce}`)
-  const runtimeDirectory = path.join(runtimeRoot, 'usr', 'bin')
+  let stagingRoot, runtimeRoot, runtimeDirectory
   let launcher, helperDeployment
   const { prepareWindowsAppContainerResources, recoverWindowsAppContainerResources } = require('./windows-appcontainer-resources.js')
   // Only the source-pinned, physically captured bundle can select worker bytes.
@@ -238,7 +251,17 @@ async function runTupleCommand(policy, args, options, tuple, key) {
   const start = Date.now()
   let lease, evidence, released = false, recoveryPending = false, privateScratch = null, runtimeOwned = false, runtimeCleanupUnknown = false, primaryError = null
   try {
-    helperDeployment = require('./windows-helper-deployment.js').stageWindowsHelperDeployment(controlRoot)
+    // PowerShell 5.1 and its hosted .NET Framework System.IO calls do not have
+    // a controller-owned long-path configuration. Keep every managed helper
+    // and executable path below the token profile's short, private root.
+    stagingRoot = createWindowsCompilerDirectory('autoprompt-command-')
+    runtimeRoot = path.join(stagingRoot, `command-runtime-${nonce}`)
+    runtimeDirectory = path.join(runtimeRoot, 'usr', 'bin')
+    if ([...(Array.isArray(policy.readableRoots) ? policy.readableRoots : []), ...(Array.isArray(policy.writableRoots) ? policy.writableRoots : [])]
+      .some(root => typeof root === 'string' && (within(root, stagingRoot) || within(stagingRoot, root)))) {
+      throw new WindowsAppContainerError('WINDOWS_RESOURCE_INVALID', 'Private command staging must be disjoint from worker resources')
+    }
+    helperDeployment = require('./windows-helper-deployment.js').stageWindowsHelperDeployment(stagingRoot)
     // The cancellation marker lives in this operation's exclusively created
     // helper directory, whose cleanup follows the same process-drain evidence.
     const cancellationPath = path.join(helperDeployment.root, 'cancel')
@@ -307,6 +330,11 @@ async function runTupleCommand(policy, args, options, tuple, key) {
       runtimeCleanupUnknown = true
     }
     if (lease && !released) error.recovery = Object.freeze({ ...lease.recovery, profileSid: lease.profileSid })
+    if (runtimeCleanupUnknown || recoveryPending || (lease && !released)) {
+      error.cleanupConfirmed = false
+      error.retainedRuntimeRoot = runtimeRoot
+      error.retainedStagingRoot = stagingRoot
+    }
     throw error
   } finally {
     // Unconfirmed launches retain their exact request artifacts alongside the
@@ -321,11 +349,21 @@ async function runTupleCommand(policy, args, options, tuple, key) {
       // transfers ownership of a competing directory to this operation.
       if (runtimeOwned && !runtimeCleanupUnknown) cleanup(() => fs.rmSync(runtimeRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
       cleanup(() => helperDeployment?.cleanup())
+      // An exclusive loader collision or any failed/unknown child cleanup must
+      // retain the staging parent rather than recursively deleting bytes whose
+      // ownership or process lifetime was not proved.
+      if (!cleanupFailure && stagingRoot && !runtimeCleanupUnknown && !fs.existsSync(runtimeRoot) && !(helperDeployment && fs.existsSync(helperDeployment.root))) {
+        cleanup(() => fs.rmSync(stagingRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
+      }
+      if (!cleanupFailure && stagingRoot && fs.existsSync(stagingRoot)) {
+        cleanupFailure = primaryError || new WindowsAppContainerError('APPCONTAINER_CLEANUP_UNCONFIRMED', 'Windows command staging cleanup is unconfirmed')
+      }
       if (cleanupFailure) {
         const error = primaryError || cleanupFailure
         error.cleanupConfirmed = false
         error.retainedControlRoot = controlRoot
         error.retainedRuntimeRoot = runtimeRoot
+        error.retainedStagingRoot = stagingRoot
         error.cleanupCode = String(cleanupFailure.code || 'cleanup-failed').slice(0, 64)
         if (!primaryError) throw error
       }
