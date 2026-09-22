@@ -1076,16 +1076,25 @@ function verifyHarnessV2EnforcementProof(repository, environment, proof) {
         }
       }
       const record = JSON.parse(privateBytes(path.join(activationRoot, 'activation.json')))
+      if (record.activationRoot !== activationRoot ||
+          activationRoot !== path.join(installRoot, '.autoprompt-private', 'activations', record.activationId)) {
+        throw new OperationalError('Local canary activation root changed')
+      }
       const inspectedTarget = fs.realpathSync.native(repository.worktreeRoot)
       // The same controller enforces the original target and its private
       // materialized worker/checker clones. These exact namespaces are created
       // outside every model's writable roots; arbitrary sibling repositories
       // and descendants of a worker checkout are not activation targets.
       const privateRelative = path.relative(activationRoot, inspectedTarget).split(path.sep).join('/')
-      const ownedClone = /^(?:worker-workspaces\/workspaces\/[a-f0-9]{40}|checker-snapshots\/[a-f0-9]{64}-[a-f0-9]{16})$/.test(privateRelative)
-      if (record.activationRoot !== activationRoot ||
-          activationRoot !== path.join(installRoot, '.autoprompt-private', 'activations', record.activationId) ||
-          (record.target?.realpath !== inspectedTarget && !ownedClone) ||
+      let ownedClone = /^(?:worker-workspaces\/workspaces\/[a-f0-9]{40}|checker-snapshots\/[a-f0-9]{64}-[a-f0-9]{16})$/.test(privateRelative)
+      // Git for Windows needs a short physical repository path. External
+      // checker storage is admitted only through this activation generation's
+      // durable registry and the live native identities of the root and child.
+      if (!ownedClone && record.target?.realpath !== inspectedTarget && process.platform === 'win32') {
+        ownedClone = require('../agents/codex/workflow/windows-checker-root.js')
+          .verifyRegisteredCheckerSnapshot({ record, candidate: inspectedTarget })
+      }
+      if ((record.target?.realpath !== inspectedTarget && !ownedClone) ||
           record.executable?.path !== proof.nativeExecutable ||
           hash(fs.readFileSync(proof.nativeExecutable)) !== record.executable.sha256 ||
           fs.realpathSync.native(proof.nativeExecutable) !== proof.nativeExecutable) {

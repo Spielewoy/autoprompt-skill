@@ -4362,6 +4362,11 @@ function ensureSafeEnvironment(boundary) {
       gitEnforced: attestation && attestation.gitEnforced,
       mechanicallyEnforced: attestation && attestation.mechanicallyEnforced,
       invalidChannels,
+      invalidChannelReasons: Object.fromEntries(invalidChannels.map(name => [name,
+        (Array.isArray(attestation?.channels?.[name]?.residuals) ? attestation.channels[name].residuals : [])
+          .slice(0, 4).map(item => ({ code: String(item?.code || '').slice(0, 128),
+            message: String(item?.message || '').slice(0, 512) })),
+      ])),
     })
   }
   return Object.freeze({ environment, attestation })

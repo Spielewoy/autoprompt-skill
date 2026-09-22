@@ -14,13 +14,23 @@ function write(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   fs.writeFileSync(file, typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value), { mode: 0o600 })
 }
-function fixture(t, provider, usePolicy = false) {
+function fixture(t, provider, usePolicy = false, nativeSnapshot = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-local-proof-safety-'))
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  if (!nativeSnapshot) t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const target = path.join(root, 'target')
   fs.mkdirSync(target)
   assert.equal(cp.spawnSync('git', ['init', '-b', 'fixture', target]).status, 0)
   const sources = ['scripts/local-only-safety.cjs', 'scripts/harness-v2-canary.cjs']
+  if (nativeSnapshot) {
+    const add = directory => {
+      for (const entry of fs.readdirSync(path.join(ROOT, directory), { withFileTypes:true })) {
+        const relative = `${directory}/${entry.name}`
+        if (entry.isDirectory() && directory.startsWith('agents/contracts')) add(relative)
+        else if (entry.isFile() && /\.(?:js|json|ps1)$/.test(entry.name)) sources.push(relative)
+      }
+    }
+    add('agents/codex/workflow'); add('agents/contracts')
+  }
   const files = Object.fromEntries(sources.map(file => [file, hash(fs.readFileSync(path.join(ROOT, file)))]))
   files['tests/native-fixture.cjs'] = hash('unit-only fixture')
   const portableBody = { schemaVersion:1, provider, platform:process.platform, architecture:process.arch,
@@ -67,7 +77,7 @@ function fixture(t, provider, usePolicy = false) {
   const record = { schemaVersion:2, providerId:provider, activationId, activationRoot,
     payloadDigest:receipt.payloadDigest, createdAt:new Date(Date.now() - 10000).toISOString(),
     target:{ realpath:fs.realpathSync.native(target) }, executable, connectionSha256:hash('fixture connection'), request:{ sha256:hash('fixture request') },
-    capability:{ generation:1, expiresAt:new Date(Date.now() + 60000).toISOString() },
+    capability:{ generation:1, expiresAt:new Date(Date.now() + (nativeSnapshot ? 600000 : 60000)).toISOString() },
     activationBoundary:{ enforcementProof:{ sha256:proofSha256 } } }
   const artifacts = canary.REQUIRED.map(capability => {
     const item = review.capabilityCases[capability], file = path.join(activationRoot, 'reviewed-local-canary', 'generation-1', `${capability}.json`)
@@ -89,6 +99,47 @@ function fixture(t, provider, usePolicy = false) {
   const inspect = (repository = target) => safety.inspect(safety.discoverRepository(repository), 'fixture', env, { enforcementProof:proof }).channels.providerConnectorApiWriteToolDenial
   return { root, activationRoot, record, recordPath, inspect, artifacts }
 }
+
+test('Windows local canary safety admits only its live registered external checker snapshot', {
+  skip: process.platform !== 'win32', timeout: 600000,
+}, t => {
+  const f = fixture(t, 'claude', true, true)
+  const { ensureWindowsPrivateAcl } = require('../../agents/codex/workflow/safe-run-root.js')
+  ensureWindowsPrivateAcl(f.activationRoot)
+  const run = require('../../agents/codex/workflow/run-record.js').createRunRecord({
+    targetPath:f.record.target.realpath, providerId:'claude', runId:f.record.activationId,
+    readOnly:true, exactTree:true, canonicalProviderPrivateRoot:path.join(f.activationRoot, 'r'), assertStartBoundary:false,
+  })
+  f.record.status = 'active'
+  f.record.supervisorRuntime = { runPath:run.runPath, runId:run.runId, targetIdentity:run.targetIdentity,
+    metadataSha256:hash(fs.readFileSync(path.join(run.runPath, 'metadata.json'))), createdAt:new Date().toISOString() }
+  write(f.recordPath, f.record)
+  const native = require('../../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture()
+  const { CleanupRegistry } = require('../../agents/codex/workflow/finalizer.js')
+  const { resolveCheckerSnapshotRoot, createWindowsCheckerRootValidator } = require('../../agents/codex/workflow/windows-checker-root.js')
+  const registry = new CleanupRegistry({ ...run.paths.cleanupRegistry,
+    fsImpl:Object.assign(Object.create(fs), { windowsCapture:native, windowsMutations:native }),
+    allowedRoots:[f.activationRoot], controlBinding:{ activationId:f.record.activationId, generationId:1 },
+    externalRootValidator:createWindowsCheckerRootValidator({ owner:f.record.activationId }),
+  })
+  const root = resolveCheckerSnapshotRoot({ snapshotRoot:path.join(f.activationRoot, 'checker-snapshots'),
+    cleanupRegistry:registry, owner:f.record.activationId })
+  t.after(() => {
+    try { registry.run(); assert.equal(fs.existsSync(root), false) }
+    finally { fs.rmSync(f.root, { recursive:true, force:true }) }
+  })
+  const snapshot = path.join(root, `${'b'.repeat(64)}-${'c'.repeat(16)}`)
+  fs.mkdirSync(snapshot)
+  assert.equal(cp.spawnSync('git', ['init', '-b', 'fixture', snapshot]).status, 0)
+  // Exact path and valid native proof alone do not confer cleanup authority.
+  assert.equal(f.inspect(snapshot).enforced, false)
+  registry.register({ path:snapshot, kind:'checker-snapshot', owner:f.record.activationId })
+  const accepted = f.inspect(snapshot)
+  assert.equal(accepted.enforced, true, JSON.stringify(accepted))
+  f.record.capability.generation++
+  write(f.recordPath, f.record)
+  assert.equal(f.inspect(snapshot).enforced, false)
+})
 for (const provider of ['claude', 'reasonix']) for (const usePolicy of [false, true]) test(`${provider} ${usePolicy ? 'native policy' : 'release review'} safety reopens local proof and refuses changed generation or linked artifacts`, t => {
   const f = fixture(t, provider, usePolicy)
   assert.equal(f.inspect().enforced, true, JSON.stringify(f.inspect()))

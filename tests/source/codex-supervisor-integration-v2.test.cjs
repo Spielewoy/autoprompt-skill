@@ -16342,10 +16342,14 @@ test('default child environment is emitted and rechecked by the canonical local-
   }
   const tampered = JSON.parse(JSON.stringify(attestation))
   tampered.channels.providerConnectorApiWriteToolDenial.enforced = false
+  tampered.channels.providerConnectorApiWriteToolDenial.residuals = [{
+    code: 'ENFORCEMENT_PROOF_INVALID', message: 'snapshot ownership changed',
+  }]
   assert.throws(
     () => ensureSafeEnvironment({ environment, attestation: tampered }),
     error => error.code === 'SAFE_GIT_ENV_INVALID' &&
-      error.details.invalidChannels.includes('providerConnectorApiWriteToolDenial'),
+      error.details.invalidChannels.includes('providerConnectorApiWriteToolDenial') &&
+      error.details.invalidChannelReasons.providerConnectorApiWriteToolDenial[0].message === 'snapshot ownership changed',
   )
 })
 

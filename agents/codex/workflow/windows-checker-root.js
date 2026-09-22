@@ -1,11 +1,14 @@
 'use strict'
 
+const crypto = require('node:crypto')
+const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const {
   RunRecordError, inspectPathNoFollow, auditPrivatePermissions,
-  createWindowsCompilerDirectory,
+  createWindowsCompilerDirectory, pathIsInside, readFileNoFollow,
 } = require('./safe-run-root.js')
+const { CleanupRegistry } = require('./finalizer.js')
 const { createWindowsFilesystemCapture } = require('./windows-filesystem.js')
 
 const ROOT_ID = 'windows-checker-snapshots'
@@ -68,4 +71,118 @@ function resolveCheckerSnapshotRoot({ snapshotRoot, cleanupRegistry, owner }) {
   return root
 }
 
-module.exports = { createWindowsCheckerRootValidator, resolveCheckerSnapshotRoot }
+function readPrivateJson(filename, label) {
+  let bytes
+  try { bytes = readFileNoFollow(filename) } catch (error) {
+    refuse(`${label} is not one private regular file (${error.code || error.message})`)
+  }
+  if (!bytes) refuse(`${label} is missing`)
+  try { return { bytes, value: JSON.parse(bytes.toString('utf8')) } } catch {
+    refuse(`${label} is invalid JSON`)
+  }
+}
+
+function sameIdentity(left, right, includeType = false) {
+  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino &&
+    (!includeType || left.type === right.type))
+}
+
+// Reopen only the current activation's durable cleanup authority. A path under
+// LocalAppData is never sufficient: it must be the exact live child registered
+// beneath the identity-bound checker root for this generation.
+function verifyRegisteredCheckerSnapshot({ record, candidate }) {
+  if (process.platform !== 'win32' || !record || typeof record !== 'object' || Array.isArray(record) ||
+      record.schemaVersion !== 2 || record.status !== 'active' || typeof record.activationId !== 'string' ||
+      !record.activationId || typeof record.activationRoot !== 'string' || !path.isAbsolute(record.activationRoot) ||
+      !record.capability || !Number.isFinite(Date.parse(record.capability.expiresAt)) ||
+      Date.parse(record.capability.expiresAt) <= Date.now() ||
+      !Number.isSafeInteger(record.capability.generation) || record.capability.generation < 1 ||
+      typeof candidate !== 'string' || !path.isAbsolute(candidate)) {
+    refuse('Checker snapshot verification requires the current active Windows activation')
+  }
+  const activationRoot = path.resolve(record.activationRoot)
+  if (activationRoot !== record.activationRoot || fs.realpathSync.native(activationRoot) !== activationRoot) {
+    refuse('Checker activation root changed its physical path')
+  }
+  const runtime = record.supervisorRuntime
+  if (!runtime || typeof runtime.runPath !== 'string' || !path.isAbsolute(runtime.runPath) ||
+      runtime.runId !== record.activationId || !/^[a-f0-9]{64}$/.test(runtime.metadataSha256 || '') ||
+      typeof runtime.targetIdentity !== 'string' || !runtime.targetIdentity) {
+    refuse('Checker supervisor runtime binding is invalid')
+  }
+  const resolvedRunPath = path.resolve(runtime.runPath)
+  const runPath = fs.realpathSync.native(resolvedRunPath)
+  if (resolvedRunPath !== runtime.runPath || runPath !== resolvedRunPath ||
+      runPath === activationRoot || !pathIsInside(activationRoot, runPath)) {
+    refuse('Checker supervisor runtime escapes its activation')
+  }
+  const metadataRecord = readPrivateJson(path.join(runPath, 'metadata.json'), 'Checker supervisor metadata')
+  const metadataDigest = readFileNoFollow(path.join(runPath, 'metadata.sha256'))
+  const metadataSha256 = crypto.createHash('sha256').update(metadataRecord.bytes).digest('hex')
+  const metadata = metadataRecord.value
+  if (!metadataDigest || metadataDigest.toString('utf8').trim() !== runtime.metadataSha256 ||
+      metadataSha256 !== runtime.metadataSha256 || !metadata || typeof metadata !== 'object' ||
+      metadata.run_id !== record.activationId || metadata.run_path !== runPath ||
+      metadata.target_path !== record.target?.realpath || metadata.target_identity !== runtime.targetIdentity ||
+      metadata.provider_id !== record.providerId || metadata.local_only !== true ||
+      metadata.automatic_export_allowed !== false || metadata.runtime_authority?.cleanup_registry !== 'cleanup/registry.json') {
+    refuse('Checker supervisor metadata no longer binds the active runtime')
+  }
+  const registryPath = path.join(runPath, 'cleanup', 'registry.json')
+  // CleanupRegistry's generic reader accepts an fs implementation. Freeze one
+  // no-follow, private snapshot so its repeated load/get calls cannot observe a
+  // link swap or two different registry generations during this decision.
+  auditPrivatePermissions(runPath, { recurse: false, additionalPaths: [registryPath] })
+  const registryBytes = readFileNoFollow(registryPath)
+  if (!registryBytes) refuse('Checker cleanup registry is missing')
+  const native = createWindowsFilesystemCapture()
+  const runtimeFs = Object.assign(Object.create(fs), {
+    windowsCapture: native,
+    windowsMutations: native,
+    existsSync: filename => path.resolve(filename).toLowerCase() === registryPath.toLowerCase()
+      ? true : fs.existsSync(filename),
+    readFileSync: (filename, options) => {
+      if (path.resolve(filename).toLowerCase() !== registryPath.toLowerCase()) return fs.readFileSync(filename, options)
+      const copy = Buffer.from(registryBytes)
+      if (typeof options === 'string') return copy.toString(options)
+      if (options && typeof options === 'object' && options.encoding) return copy.toString(options.encoding)
+      return copy
+    },
+  })
+  const registry = new CleanupRegistry({
+    registryPath,
+    allowedRoots: [activationRoot],
+    fsImpl: runtimeFs,
+    controlBinding: { activationId: record.activationId, generationId: record.capability.generation },
+    externalRootValidator: createWindowsCheckerRootValidator({ owner: record.activationId }),
+  })
+  const root = registry.getExternalRoot(ROOT_ID)
+  const candidatePath = path.resolve(candidate)
+  const resolvedCandidate = fs.realpathSync.native(candidatePath)
+  if (candidatePath !== candidate || resolvedCandidate !== candidatePath) {
+    refuse('Checker snapshot changed its physical path')
+  }
+  if (!root || path.dirname(resolvedCandidate).toLowerCase() !== root.path.toLowerCase() ||
+      !/^[a-f0-9]{64}-[a-f0-9]{16}$/.test(path.basename(resolvedCandidate))) {
+    refuse('Checker snapshot is not one direct child of the registered external root')
+  }
+  const durable = registry.load()
+  const matches = durable.entries.filter(entry => entry.status === 'REGISTERED' &&
+    entry.kind === 'checker-snapshot' && entry.path.toLowerCase() === resolvedCandidate.toLowerCase())
+  if (matches.length !== 1 || !sameIdentity(matches[0].parentIdentity, root.targetIdentity)) {
+    refuse('Checker snapshot lacks one exact durable child registration')
+  }
+  const live = native.inspectOwnedTarget(resolvedCandidate)
+  if (live.targetIdentity?.type !== 'directory' ||
+      !sameIdentity(live.parentIdentity, matches[0].parentIdentity) ||
+      !sameIdentity(live.targetIdentity, matches[0].targetIdentity, true)) {
+    refuse('Checker snapshot changed physical identity after registration')
+  }
+  return true
+}
+
+module.exports = {
+  createWindowsCheckerRootValidator,
+  resolveCheckerSnapshotRoot,
+  verifyRegisteredCheckerSnapshot,
+}
