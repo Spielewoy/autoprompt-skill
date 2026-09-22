@@ -10,9 +10,9 @@ const test = require('node:test')
 const ROOT = path.resolve(__dirname, '..', '..')
 const { CleanupRegistry } = require(path.join(ROOT, 'agents', 'codex', 'workflow', 'finalizer.js'))
 const { atomicWriteJson, readChecksummedJson } = require(path.join(ROOT, 'agents', 'codex', 'workflow', 'event-log.js'))
-// These exercise the descriptor-relative portable backend. Windows uses the
-// separately tested native windowsMutations implementation.
-const portableTest = process.platform === 'win32' ? test.skip : test
+// These exercise Linux's /proc/self/fd descriptor backend. The Windows-only
+// external-root policy also has separate native windowsMutations coverage.
+const portableTest = process.platform === 'linux' ? test : test.skip
 
 function fixture(t, activationId = 'external-root-test', generationId = 1) {
   const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'cleanup-external-root-')))

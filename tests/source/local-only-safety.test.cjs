@@ -153,6 +153,18 @@ test('native Git checker snapshots preserve exact bytes beyond Windows MAX_PATH 
   const { resolveCheckerSnapshotRoot, createWindowsCheckerRootValidator } = require('../../agents/codex/workflow/windows-checker-root.js')
   const sandbox = fs.realpathSync.native(context.sandbox)
   let runtimeFs = fs
+  if (process.platform === 'darwin') {
+    const python = process.env.AUTOPROMPT_REAL_DARWIN_PYTHON
+    assert.equal(typeof python, 'string', 'Darwin native filesystem tests require the pinned Python runtime')
+    const wrapper = require('../../agents/codex/workflow/darwin-filesystem.js')
+    const options = {
+      python,
+      helper: path.join(ROOT, 'agents/codex/workflow/darwin-filesystem.py'),
+    }
+    runtimeFs = Object.create(fs)
+    runtimeFs.darwinCapture = wrapper.createDarwinFilesystemCapture(options)
+    runtimeFs.darwinMutations = wrapper.createDarwinFilesystemMutations(options)
+  }
   if (process.platform === 'win32') {
     require('../../agents/codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(sandbox)
     const native = require('../../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture()
