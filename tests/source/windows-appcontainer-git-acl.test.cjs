@@ -3,7 +3,7 @@ const test=require('node:test'),assert=require('node:assert/strict'),fs=require(
 const workflow=path.resolve(__dirname,'../../agents/codex/workflow'),fixture=path.resolve(__dirname,'../fixtures/windows-appcontainer/git-acl-proof.cs')
 const sources=[path.join(workflow,'windows-appcontainer-native.cs'),path.join(workflow,'windows-appcontainer-resources-native.cs'),fixture]
 const shell=()=>process.platform==='win32'?path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe'):(process.env.AUTOPROMPT_TEST_PWSH||'pwsh')
-const denials=['overwrite','append','rename-file','delete-file','rename-git','new-git-file','nested-write','nested-create','protected-write','git-file-WRITE_DAC','git-directory-WRITE_DAC','target-WRITE_DAC','target-DELETE_CHILD','git-DELETE_CHILD']
+const denials=['overwrite','append','rename-file','delete-file','rename-git','new-git-file','nested-write','nested-create','protected-write','git-file-WRITE_DAC','git-directory-WRITE_DAC','target-WRITE_DAC','target-DELETE_CHILD','target-DELETE','scratch-DELETE_CHILD','scratch-DELETE','git-DELETE_CHILD']
 
 test('complete resource and launcher sources compile with the native Git ACL regression', {timeout:90000},t=>{
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'git-acl-compile-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}))
@@ -37,14 +37,14 @@ test('native Windows .git grants deny mutation and restore inheritance after own
   if(fs.existsSync(childRecord)){
     assert.ok(fs.statSync(childRecord).size<=4096,'Bounded child proof required')
     const child=JSON.parse(fs.readFileSync(childRecord,'utf8'))
-    assert.deepEqual(child,{schema:1,architecture:process.arch,appContainer:true,drained:true,rootImageMatched:true,denials:denials.map(name=>name+':5'),positiveOperations:8,accepted:false})
+    assert.deepEqual(child,{schema:1,architecture:process.arch,appContainer:true,drained:true,rootImageMatched:true,denials:denials.map(name=>name+':5'),positiveOperations:12,accepted:false})
     t.diagnostic('GIT_ACL_CHILD_PROOF:'+JSON.stringify(child))
   }
   assert.ifError(result.error);assert.equal(result.status,0,result.stderr||result.stdout);assert.equal(result.stderr,'')
   assert.equal(fs.existsSync(childRecord),true,'Pre-restoration child proof required')
   const proof=JSON.parse(result.stdout)
   assert.equal(proof.schema,1);assert.equal(proof.nativeWindows,true);assert.equal(proof.architecture,process.arch);assert.equal(proof.appContainer,true);assert.equal(proof.drained,true);assert.equal(proof.accepted,false)
-  assert.deepEqual(proof.denials,denials);assert.equal(proof.positiveOperations,8);assert.ok(proof.originalObjects>=9)
+  assert.deepEqual(proof.denials,denials);assert.equal(proof.positiveOperations,12);assert.ok(proof.originalObjects>=9)
   for(const key of ['restoredProtection','partialApplyRestored','foreignProtectionRefused','unrelatedAcePreserved','newGitLabelPreserved','packageGrantsRemoved','ownedAceDriftRefused','repeatedRestoreStable'])assert.equal(proof[key],true)
   assert.match(proof.gitOwner,/^S-1-/);assert.equal(proof.gitLabelBefore,proof.gitLabelApplied)
   cleanupConfirmed=true

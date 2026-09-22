@@ -381,10 +381,26 @@ public static class WindowsAppContainerResourcesNative {
   }
   static void VerifyPackageGrant(RawSecurityDescriptor security,string sid,bool directory,bool writable,bool git,bool root) {
     Need(security.DiscretionaryAcl!=null && (!git || Protected(security)),"WINDOWS_ACL_WRITE_FAILED");
-    int expected=PackageRights(writable,git,root),count=0;bool explicitGrant=false;
+    bool splitRoot=directory&&root&&writable&&!git;
+    int expected=PackageRights(writable,git,root),count=0,selfCount=0,childCount=0;bool explicitGrant=false;
     AceFlags flags=directory?AceFlags.ObjectInherit|AceFlags.ContainerInherit:AceFlags.None;
-    foreach(GenericAce ace in security.DiscretionaryAcl){var qualified=ace as QualifiedAce;Need(qualified!=null,"WINDOWS_ACL_UNSUPPORTED");if(qualified.SecurityIdentifier.Value!=sid)continue;var common=ace as CommonAce;Need(common!=null && !common.IsCallback && common.AceQualifier==AceQualifier.AccessAllowed && (common.AccessMask&~expected)==0,"WINDOWS_ACL_WRITE_FAILED");count++;if(common.AceFlags==flags && common.AccessMask==expected)explicitGrant=true;}
-    Need(explicitGrant && count>0 && (!git || count==1),"WINDOWS_ACL_WRITE_FAILED");
+    foreach(GenericAce ace in security.DiscretionaryAcl) {
+      var qualified=ace as QualifiedAce;Need(qualified!=null,"WINDOWS_ACL_UNSUPPORTED");
+      if(qualified.SecurityIdentifier.Value!=sid)continue;
+      var common=ace as CommonAce;
+      Need(common!=null && !common.IsCallback && common.AceQualifier==AceQualifier.AccessAllowed,"WINDOWS_ACL_WRITE_FAILED");
+      if(splitRoot) {
+        if(common.AceFlags==AceFlags.None && common.AccessMask==expected)selfCount++;
+        else if(common.AceFlags==(AceFlags.ObjectInherit|AceFlags.ContainerInherit|AceFlags.InheritOnly) && common.AccessMask==PackageRights(writable,git,false))childCount++;
+        else Need(false,"WINDOWS_ACL_WRITE_FAILED");
+      } else {
+        Need((common.AccessMask&~expected)==0,"WINDOWS_ACL_WRITE_FAILED");
+        if(common.AceFlags==flags && common.AccessMask==expected)explicitGrant=true;
+      }
+      count++;
+    }
+    if(splitRoot)Need(count==2 && selfCount==1 && childCount==1,"WINDOWS_ACL_WRITE_FAILED");
+    else Need(explicitGrant && count>0 && (!git || count==1),"WINDOWS_ACL_WRITE_FAILED");
   }
   public static Dictionary<string,object> Apply(ResourcePlan plan) {
     Need(plan!=null && plan.schemaVersion==3,"WINDOWS_RESOURCE_INVALID");
@@ -399,13 +415,21 @@ public static class WindowsAppContainerResourcesNative {
       finally{if(created!=IntPtr.Zero)FreeSid(created);}
       foreach(var item in forest.items) {
         var security=Security(item.opened.Handle);var acl=WithoutSid(security.DiscretionaryAcl,plan.profileSid);var sid=new SecurityIdentifier(plan.profileSid);
-        AceFlags flags=item.opened.Directory?AceFlags.ObjectInherit|AceFlags.ContainerInherit:AceFlags.None;
         // AppContainer isolation is enforced by the granted package mask, not
         // a package DENY ACE. Protect .git from the parent's writable grant
         // being automatically re-inherited by SetSecurityInfo.
-        int rights=PackageRights(item.writable,item.git,item.root);
         int insert=0;while(insert<acl.Count && (acl[insert].AceFlags&AceFlags.Inherited)==0)insert++;
-        acl.InsertAce(insert,new CommonAce(flags,AceQualifier.AccessAllowed,rights,sid,false,null));SetAcl(item.opened.Handle,acl,false,item.git?(bool?)true:null);
+        if(item.opened.Directory && item.root && item.writable && !item.git) {
+          // The root itself must not be removable, while descendants need a
+          // DELETE grant on their own object. InheritOnly keeps the latter
+          // off this directory and leaves FILE_DELETE_CHILD absent throughout.
+          acl.InsertAce(insert++,new CommonAce(AceFlags.None,AceQualifier.AccessAllowed,PackageRights(item.writable,item.git,true),sid,false,null));
+          acl.InsertAce(insert,new CommonAce(AceFlags.ObjectInherit|AceFlags.ContainerInherit|AceFlags.InheritOnly,AceQualifier.AccessAllowed,PackageRights(item.writable,item.git,false),sid,false,null));
+        } else {
+          AceFlags flags=item.opened.Directory?AceFlags.ObjectInherit|AceFlags.ContainerInherit:AceFlags.None;
+          acl.InsertAce(insert,new CommonAce(flags,AceQualifier.AccessAllowed,PackageRights(item.writable,item.git,item.root),sid,false,null));
+        }
+        SetAcl(item.opened.Handle,acl,false,item.git?(bool?)true:null);
         if(item.writable && !item.git)SetLabel(item.opened.Handle,LabelFor("LW"));
       }
       foreach(var item in forest.items){var security=Security(item.opened.Handle);VerifyPackageGrant(security,plan.profileSid,item.opened.Directory,item.writable,item.git,item.root);if(item.writable && !item.git)Need(Label(security)==LabelFor("LW"),"WINDOWS_LABEL_WRITE_FAILED");}

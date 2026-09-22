@@ -144,7 +144,7 @@ jobs:
           if-no-files-found: error
       - name: Record native Git metadata ACL controls before the full suite
         id: git-acl-proof
-        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        if: inputs.msys_runtime != true && (runner.os == 'Windows')
         # The identical denial/restoration test remains mandatory in the full suite.
         continue-on-error: true
         timeout-minutes: 12
@@ -154,7 +154,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve native Git metadata ACL observations
         id: git-acl-evidence
-        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
+        if: inputs.msys_runtime != true && (always() && runner.os == 'Windows')
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

@@ -402,9 +402,18 @@ async function deletionCanary(t, mode = 'success') {
       renameSync() { throw Object.assign(Error('git denied'), { code: 'EACCES' }) },
       unlinkSync(file) {
         if (path.basename(file) === 'guard' || mode === 'worker-delete-denied') throw Object.assign(Error('delete denied'), { code: 'EACCES' })
+        if (path.basename(file) === 'child') {
+          if (mode === 'new-file-delete-denied') throw Object.assign(Error('new file delete denied'), { code: 'EACCES' })
+          return fs.unlinkSync(file)
+        }
         assert.equal(file, original)
         if (mode !== 'surviving-original') fs.unlinkSync(file)
         deleted = mode !== 'surviving-original'
+      },
+      rmdirSync(directory) {
+        assert.equal(path.basename(directory), 'delete-created')
+        if (mode === 'new-directory-delete-denied') throw Object.assign(Error('new directory delete denied'), { code: 'EACCES' })
+        if (mode !== 'surviving-created') fs.rmdirSync(directory)
       },
     }
     const workerNet = { connect() { const socket = new EventEmitter(); socket.destroy = () => {}; socket.setTimeout = () => {}; queueMicrotask(() => socket.emit('error', { code: 'EACCES' })); return socket } }
@@ -440,6 +449,12 @@ for (const mode of ['surviving-original', 'absence-error', 'missing-recovery', '
   assert.equal(result.supported, false); assert.equal(fs.existsSync(base), false)
   if (mode === 'worker-delete-denied') assert.equal(result.probeFailure.stderr, 'APPCONTAINER_PROBE_FAILURE:delete-original:EACCES')
   else assert.equal(result.diagnostic.phase, 'original-recovery')
+})
+for (const mode of ['new-file-delete-denied', 'new-directory-delete-denied', 'surviving-created']) test('deletion canary refuses ' + mode, async t => {
+  const { result, base } = await deletionCanary(t, mode)
+  assert.equal(result.supported, false); assert.equal(fs.existsSync(base), false)
+  if (mode === 'surviving-created') assert.equal(result.diagnostic.phase, 'original-recovery')
+  else assert.equal(result.probeFailure.stderr, 'APPCONTAINER_PROBE_FAILURE:new-entry-delete:EACCES')
 })
 test('deletion canary retains its original recovery evidence when resource cleanup is unknown', async t => {
   const { result, base } = await deletionCanary(t, 'unknown-recovery')
