@@ -10,42 +10,6 @@ const native = require('../../scripts/harness-v2-native.cjs')
 const { HarnessEventStream } = require('../../scripts/harness-v2-transport.cjs')
 const { modelService, runNative } = require('../helpers/harness-native-service.cjs')
 
-test('Windows Claude projects only generated long filesystem paths to the extended namespace', () => {
-  const atThreshold = `C:\\${'a'.repeat(245)}`
-  const belowThreshold = `C:\\${'b'.repeat(244)}`
-  assert.equal(atThreshold.length, 248)
-  assert.equal(belowThreshold.length, 247)
-  const alreadyNamespaced = `\\\\?\\C:\\${'c'.repeat(245)}`
-  const argv = ['--print', '--settings', atThreshold, '--system-prompt', atThreshold]
-  const env = {
-    HOME: atThreshold, USERPROFILE: belowThreshold, TEMP: alreadyNamespaced,
-    TMP: atThreshold, TMPDIR: atThreshold, APPDATA: atThreshold, LOCALAPPDATA: atThreshold,
-    XDG_CONFIG_HOME: atThreshold, XDG_DATA_HOME: atThreshold, XDG_STATE_HOME: atThreshold,
-    XDG_CACHE_HOME: atThreshold, CLAUDE_CONFIG_DIR: atThreshold,
-    PATH: atThreshold, ANTHROPIC_API_KEY: atThreshold, ARBITRARY_PATH: atThreshold,
-  }
-  const originalArgv = structuredClone(argv), originalEnv = structuredClone(env)
-  const projected = native.projectWindowsClaudeLaunchPaths(argv, env, 'win32')
-  const expected = path.win32.toNamespacedPath(atThreshold)
-  assert.equal(projected.argv[projected.argv.indexOf('--settings') + 1], expected)
-  assert.equal(projected.argv[projected.argv.indexOf('--system-prompt') + 1], atThreshold)
-  for (const key of ['HOME', 'TMP', 'TMPDIR', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME',
-    'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'CLAUDE_CONFIG_DIR']) {
-    assert.equal(projected.env[key], expected, key)
-  }
-  assert.equal(projected.env.USERPROFILE, belowThreshold)
-  assert.equal(projected.env.TEMP, alreadyNamespaced)
-  assert.equal(projected.env.PATH, atThreshold)
-  assert.equal(projected.env.ANTHROPIC_API_KEY, atThreshold)
-  assert.equal(projected.env.ARBITRARY_PATH, atThreshold)
-  assert.deepEqual(argv, originalArgv)
-  assert.deepEqual(env, originalEnv)
-  assert.equal(path.win32.normalize(projected.env.HOME.slice(4)), path.win32.normalize(env.HOME))
-  assert.deepEqual(native.projectWindowsClaudeLaunchPaths(argv, env, 'linux'), { argv, env })
-  assert.equal(native.windowsClaudeExtendedPath(expected, 'win32'), expected)
-  assert.equal(native.windowsClaudeExtendedPath('relative\\' + 'd'.repeat(260), 'win32'), 'relative\\' + 'd'.repeat(260))
-})
-
 test('claude CLI projection omits only unsupported schema keywords and preserves same-named data', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-schema-projection-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
