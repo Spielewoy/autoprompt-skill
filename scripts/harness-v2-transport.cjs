@@ -1335,7 +1335,7 @@ class HarnessExecAdapter {
       if (options.requireDrained && result.retained.length) fail('PROCESS_DRAIN_TIMEOUT', 'Grok resources still require exact process-drain authority', result)
       return result
     }
-    if (this.provider !== 'vscode' || process.platform !== 'darwin') return { cleaned: 0, retained: [] }
+    if (this.provider !== 'vscode' || !['darwin', 'win32'].includes(process.platform)) return { cleaned: 0, retained: [] }
     if (!this.ipcRecoveryPromise) {
       this.ipcRecoveryPromise = (async () => {
         const root = path.join(this.nativeRoot, 'vscode'), result = { cleaned: 0, retained: [] }
@@ -1417,6 +1417,12 @@ class HarnessExecAdapter {
       grokWindowsSession = await require('./harness-v2-bridge/grok/windows-launch.cjs').prepareSession({
         sessionRoot, launchRoot, grokExecutable: native.executableRuntimePath(binding), nodeExecutable: process.execPath,
       })
+    }
+    if (this.provider === 'vscode' && process.platform === 'win32') {
+      const created = privateDirectory(launchRoot)
+      const privacy = require('../agents/codex/workflow/safe-run-root.js')
+      if (created) privacy.ensureWindowsPrivateAcl(launchRoot)
+      privacy.auditPrivatePermissions(launchRoot, { recurse: false })
     }
     const cwd = path.join(sessionRoot, 'cwd'); privateDirectory(cwd)
     const checkerScratch = record.checkerScratchBoundary ? this.checkerScratchVerifier?.(record) : null
@@ -1521,9 +1527,10 @@ class HarnessExecAdapter {
               ? Math.min(4096, record.providerTokenLimit)
               : undefined
         : undefined
-      if (this.provider === 'vscode' && process.platform === 'darwin') {
+      if (this.provider === 'vscode' && ['darwin', 'win32'].includes(process.platform)) {
         const home = path.join(launchRoot, 'home')
-        privateDirectory(path.join(home, 'user-data'))
+        const created = privateDirectory(path.join(home, 'user-data'))
+        if (created && process.platform === 'win32') require('../agents/codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(path.join(home, 'user-data'))
         vscodeIpcAlias = await require('./harness-v2-vscode-ipc-alias.cjs').prepare({
           journalPath: path.join(launchRoot, 'vscode-ipc-alias.json'),
           targetPath: path.join(home, 'user-data'),

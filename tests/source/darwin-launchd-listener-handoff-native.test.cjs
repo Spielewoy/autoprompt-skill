@@ -43,8 +43,10 @@ test('Darwin launchd wrapper hands two exact IPv6 listeners to fixed descriptors
   const plistPath = path.join(root, 'job.plist'), domain = `gui/${process.getuid()}`
   const label = `com.autoprompt.listenerhandoff.${process.pid}.${crypto.randomBytes(6).toString('hex')}`
   let submitted = false
+  const rebound = []
   const launchctl = args => command('/bin/launchctl', args)
   t.after(() => {
+    for (const server of rebound) server.close()
     // Capture the post-launch state before bootout removes launchd's exit
     // status. Reading stderr before waiting hides every startup failure.
     if (submitted) t.diagnostic(JSON.stringify({ handoffState: launchctl(['print', `${domain}/${label}`]),
@@ -131,8 +133,21 @@ Promise.all(servers.map(([key,item,server])=>new Promise((resolve,reject)=>{serv
   await waitFor(() => { const absent = launchctl(['print', `${domain}/${label}`]); return absent.status === 113 && /Could not find service/.test(absent.stderr) }, 10000,
     'launchd listener service remained after exact bootout')
   submitted = false
-  const released = await Promise.all([bind(modelPort, false), bind(mcpPort, false)])
-  for (const server of released) await new Promise(resolve => server.close(resolve))
+  // Service absence and guard death precede asynchronous socket retirement;
+  // accepted connections can also leave TCP TIME_WAIT state. Require both
+  // exact ports to become bindable, keeping successful probes registered for
+  // cleanup even if the other port remains busy.
+  const releaseDeadline = Date.now() + 65000
+  for (const port of [modelPort, mcpPort]) {
+    for (;;) {
+      try { rebound.push(await bind(port, false)); break } catch (error) {
+        if (error.code !== 'EADDRINUSE' || Date.now() >= releaseDeadline) throw error
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+    }
+  }
+  await Promise.all(rebound.map(server => new Promise(resolve => server.close(resolve))))
+  rebound.length = 0
 })
 
 test('Darwin listener handoff source fixes socket keys and publishes only FD3 and FD4', () => {

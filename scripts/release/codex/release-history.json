@@ -646,6 +646,13 @@
       "payloadDigest": "673957729c15ee5efc37a58d2421621719e21cd64c9e63c20373732b7c5c342a",
       "previousRecordDigest": "cfb81c2ae3074732c08f2a2e50d7aa33f247401d75d48f9c1dd95364b2f8d23f",
       "recordDigest": "4e63ead4abdace15e3798531fb1774bb52c6d42749b4a252b1d066d8c2a88ad6"
+    },
+    {
+      "version": "1.0.97",
+      "payloadGeneration": "codex-v2.0.0-2d3d78baeb0c2d47",
+      "payloadDigest": "2d3d78baeb0c2d47bc7711971f130a449cedbd2cd91b01f9a1de32d3b4dc2b63",
+      "previousRecordDigest": "4e63ead4abdace15e3798531fb1774bb52c6d42749b4a252b1d066d8c2a88ad6",
+      "recordDigest": "55696517d91732f29cfb6e78fd24370722b718791f67b8bb5506abda197eb345"
     }
   ]
 }

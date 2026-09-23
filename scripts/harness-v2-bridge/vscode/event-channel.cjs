@@ -36,8 +36,18 @@ function ensurePrivateDirectory(directory) {
   // The authenticated VS Code alias intentionally contributes a symlinked
   // ancestor; only the scratch component itself must be physical.
   if (!item.isDirectory() || item.isSymbolicLink() ||
-      (typeof process.getuid === 'function' && item.uid !== process.getuid()) || (item.mode & 0o077)) {
+      (typeof process.getuid === 'function' && item.uid !== process.getuid()) ||
+      (process.platform !== 'win32' && (item.mode & 0o077))) {
     fail('VSCODE_EVENT_CHANNEL_INVALID', 'VS Code event scratch directory is not an owned private directory')
+  }
+  if (process.platform === 'win32') {
+    // The fresh temp leaf inherits its protected user-data parent's DACL.
+    // POSIX mode bits do not describe native Windows access permissions.
+    try {
+      require('../../../agents/codex/workflow/safe-run-root.js').auditPrivatePermissions(path.dirname(directory), {
+        recurse: false, additionalPaths: [directory],
+      })
+    } catch { fail('VSCODE_EVENT_CHANNEL_INVALID', 'VS Code event scratch directory is not private on Windows') }
   }
   return directory
 }

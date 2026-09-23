@@ -23,7 +23,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, relay, owned-relay, lease, hermes]
+        options: [all, relay, owned-relay, lease, vscode-path, hermes]
       support_capability:
         description: 'Run all capabilities or a focused isolation/checker/cancellation diagnostic'
         required: false
@@ -1329,19 +1329,26 @@ jobs:
           set -o pipefail
           node --test --test-reporter=tap tests/source/owned-proxy-resource-lifecycle.test.cjs 2>&1 | tee owned-proxy-relay.log
       - name: Verify kernel lease release after normal close and forced Job termination
-        if: ${{ !cancelled() && inputs.support_primitive != 'hermes' }}
+        if: ${{ !cancelled() && inputs.support_primitive != 'hermes' && inputs.support_primitive != 'vscode-path' }}
         timeout-minutes: 6
         shell: bash
         run: |
           set -o pipefail
           node --test --test-reporter=tap tests/source/harness-v2-windows-tool-lease-native.test.cjs 2>&1 | tee windows-tool-lease-native.log
       - name: Verify native token profile bootstrap without inherited compiler temp
-        if: ${{ !cancelled() && inputs.support_primitive != 'hermes' }}
+        if: ${{ !cancelled() && inputs.support_primitive != 'hermes' && inputs.support_primitive != 'vscode-path' }}
         timeout-minutes: 2
         shell: bash
         run: |
           set -o pipefail
           node --test --test-reporter=tap --test-name-pattern='native Windows token profile bootstrap' tests/source/windows-appcontainer.test.cjs 2>&1 | tee windows-token-profile.log
+      - name: Verify private VS Code short paths and junction cleanup
+        if: ${{ !cancelled() && (inputs.support_primitive == 'all' || inputs.support_primitive == 'vscode-path') }}
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/harness-v2-vscode-ipc-alias.test.cjs 2>&1 | tee windows-vscode-short-path.log
       - name: Acquire the pinned official Hermes Windows installation
         if: ${{ !cancelled() && (inputs.support_primitive == 'all' || inputs.support_primitive == 'hermes') }}
         timeout-minutes: 25
@@ -1377,6 +1384,7 @@ jobs:
             owned-proxy-relay.log
             windows-tool-lease-native.log
             windows-token-profile.log
+            windows-vscode-short-path.log
             hermes-windows-launcher.tap
             native-hermes-evidence.json
             native-hermes-tests.log
@@ -1490,11 +1498,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner:
-          - { os: windows-latest, arch: x64 }
-          - { os: windows-11-arm, arch: arm64 }
-          - { os: macos-15-intel, arch: x64 }
-          - { os: macos-latest, arch: arm64 }
+        runner: ${{ fromJSON(inputs.support_stage == 'vscode-diagnostic' && inputs.support_host == 'macos' && '[{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"}]' || inputs.support_stage == 'vscode-diagnostic' && '[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}]' || '[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"},{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner.os }}
     timeout-minutes: 60
     env:
@@ -1514,6 +1518,13 @@ jobs:
         timeout-minutes: 8
         shell: bash
         run: node tests/helpers/vscode-windows-probe-diagnostic.cjs | tee vscode-windows-probe-diagnostic.json
+      - name: Diagnose owned macOS VS Code GUI startup and short aliases
+        if: runner.os == 'macOS' && inputs.support_stage == 'vscode-diagnostic'
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -o pipefail
+          node tests/helpers/vscode-macos-probe-diagnostic.cjs | tee vscode-macos-probe-diagnostic.json
       - name: Probe the native VS Code bundle and preserve identity
         if: inputs.support_stage == 'vscode'
         shell: bash
@@ -1540,6 +1551,7 @@ jobs:
             vscode-native-acquisition.json
             vscode-native-probe.json
             vscode-windows-probe-diagnostic.json
+            vscode-macos-probe-diagnostic.json
             native-vscode-evidence.json
             native-vscode-tests.log
           if-no-files-found: error

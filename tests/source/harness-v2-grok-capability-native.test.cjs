@@ -210,7 +210,45 @@ async function scenario(t, setup) {
 function good(result) { assert.equal(result.ok, true); assert.match(result.contextId, /^[A-Za-z0-9_.:-]{1,256}$/); assert.ok(result.transportEvidence.eventCount > 0); assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/) }
 
 const capabilityOptions = { skip, timeout: 120000 }
-const capability = (name, body) => test(`grok closed native capability: ${name}`, capabilityOptions, body)
+async function withWindowsLaunchDiagnostics(t, body) {
+  if (process.platform !== 'win32') return body(t)
+  // A cancelled prelaunch has no proxy stderr yet. Record the real preparation
+  // boundaries without copying arguments, environment values, or credentials.
+  const started = Date.now(), replacements = []
+  let records = 0
+  const report = (stage, phase, began, error) => {
+    if (++records > 64) return
+    t.diagnostic(JSON.stringify({ grokLaunchStage: stage, phase, elapsedMs: Date.now() - started,
+      ...(began === undefined ? {} : { durationMs: Date.now() - began }),
+      ...(error ? { code: typeof error.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : 'ERROR' } : {}) }))
+  }
+  const wrap = (target, name, stage) => {
+    const original = target[name]
+    assert.equal(typeof original, 'function')
+    target[name] = function (...args) {
+      const began = Date.now(); report(stage, 'started')
+      const done = value => { report(stage, 'completed', began); return value }
+      const failed = error => { report(stage, 'failed', began, error); throw error }
+      try {
+        const value = Reflect.apply(original, this, args)
+        return value && typeof value.then === 'function' ? value.then(done, failed) : done(value)
+      } catch (error) { return failed(error) }
+    }
+    replacements.push(() => { target[name] = original })
+  }
+  try {
+    const launch = require('../../scripts/harness-v2-bridge/grok/windows-launch.cjs')
+    wrap(launch, 'prepareSession', 'session')
+    wrap(launch, 'prepareLaunch', 'launch-resource')
+    wrap(require('../../agents/codex/workflow/windows-helper-deployment.js'), 'stageWindowsHelperDeployment', 'helper-deployment')
+    wrap(require('../../agents/codex/workflow/windows-appcontainer-resources.js'), 'prepareWindowsAppContainerResources', 'appcontainer-resources')
+    wrap(ProcessOwner.prototype, 'launch', 'owned-process')
+    return await body(t)
+  } finally {
+    for (const restore of replacements.reverse()) restore()
+  }
+}
+const capability = (name, body) => test(`grok closed native capability: ${name}`, capabilityOptions, t => withWindowsLaunchDiagnostics(t, body))
 
 capability('all six owned tools enforce write/private/network isolation and scratch witness', async t => {
   let contacted = false

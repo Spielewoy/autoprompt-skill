@@ -16,19 +16,56 @@ function failureCode(error, aborted = false) {
 }
 function sourceOwnedFailureDiagnostic(error) {
   const root = path.resolve(__dirname, '../../..')
-  const relativeFrame = line => {
+  const frame = line => {
     const match = /(?:\(|\s)([^()\r\n]+):(\d+):(\d+)\)?$/u.exec(line)
     if (!match) return null
-    const file = path.resolve(match[1]), relative = path.relative(root, file)
+    const rawFile = match[1].trim(), file = path.resolve(rawFile), relative = path.relative(root, file)
     if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) ||
-        !/^(?:scripts|agents[\\/]codex[\\/]workflow)[\\/]/u.test(relative)) return null
-    return `${relative.split(path.sep).join('/')}:${match[2]}:${match[3]}`.slice(0, 256)
+        !/^(?:scripts|agents[\\/]codex[\\/]workflow)[\\/]/u.test(relative)) {
+      const name = rawFile.replaceAll('\\', '/').split('/').pop()
+      if (!name || !/^[A-Za-z0-9._-]{1,96}$/u.test(name)) return null
+      return `${name.slice(0, 128)}:${match[2]}:${match[3]}`.slice(0, 192)
+    }
+    return { owned: `${relative.split(path.sep).join('/')}:${match[2]}:${match[3]}`.slice(0, 256) }
   }
-  const name = typeof error?.name === 'string' && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/u.test(error.name) ? error.name : 'Error'
-  const originalCode = typeof error?.code === 'string' && /^[A-Za-z0-9_.-]{1,64}$/u.test(error.code) ? error.code : null
-  const sourceFrames = typeof error?.stack === 'string'
-    ? error.stack.split(/\r?\n/u).map(relativeFrame).filter(Boolean).slice(0, 8) : []
-  return Object.freeze({ name, originalCode, sourceFrames })
+  const sanitize = value => {
+    let text = String(value).slice(0, 8192)
+    text = text.replace(/\bBearer\s+[^\s,;]+/giu, 'Bearer <redacted>')
+      .replace(/\b(?:[A-Za-z0-9]+_)*(password|passwd|token|secret|api[_-]?key|authorization)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu, '$1=<redacted>')
+      // Diagnostics must not expose an absolute path, including unknown roots.
+      .replace(/(^|[\s("'=:])(?:\/|[A-Za-z]:[\\/]|\\\\)[^"'`,;\r\n]*/gu, '$1<redacted-path>')
+      .replace(/[\r\n\t]+/gu, ' ').trim()
+    const bytes = Buffer.from(text, 'utf8')
+    let end = Math.min(bytes.length, 1024)
+    while (end < bytes.length && end > 0 && (bytes[end] & 0xc0) === 0x80) end--
+    return bytes.subarray(0, end).toString('utf8')
+  }
+  const visit = (value, depth, seen) => {
+    if (!value || typeof value !== 'object' || seen.has(value) || depth > 2) return null
+    seen.add(value)
+    let name, code, message, stack, cause
+    try { name = value.name } catch {}
+    try { code = value.code } catch {}
+    try { message = value.message } catch {}
+    try { stack = value.stack } catch {}
+    try { cause = value.cause } catch {}
+    name = typeof name === 'string' && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/u.test(name) ? name : 'Error'
+    const originalCode = typeof code === 'string' && /^[A-Za-z0-9_.-]{1,64}$/u.test(code) ? code : null
+    const lines = typeof stack === 'string' ? stack.slice(0, 64 * 1024).split(/\r?\n/u) : []
+    const sourceFrames = [], externalFrames = []
+    for (const line of lines) {
+      const parsed = frame(line)
+      if (!parsed) continue
+      if (parsed.owned) sourceFrames.push(parsed.owned)
+      else externalFrames.push(parsed)
+      if (sourceFrames.length >= 8 && externalFrames.length >= 8) break
+    }
+    const result = { name, originalCode, message: sanitize(typeof message === 'string' ? message : ''), sourceFrames: sourceFrames.slice(0, 8), externalFrames: externalFrames.slice(0, 8) }
+    const nested = visit(cause, depth + 1, seen)
+    if (nested) result.cause = nested
+    return result
+  }
+  return Object.freeze(visit(error, 0, new Set()) || { name: 'Error', originalCode: null, message: '', sourceFrames: [], externalFrames: [] })
 }
 
 function openDiagnostic(root, nonce) {

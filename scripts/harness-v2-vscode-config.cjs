@@ -38,10 +38,15 @@ function project(options, env) {
   const deepUserDataDir = path.join(options.home, 'user-data')
   const userDataDir = options.vscodeUserDataDir === undefined ? deepUserDataDir : options.vscodeUserDataDir
   if (options.vscodeUserDataDir !== undefined) {
+    // Chromium and native logging components still create MAX_PATH-limited
+    // descendants on Windows. Leave room for their cache/log suffixes.
+    const withinLimit = process.platform === 'win32'
+      ? typeof userDataDir === 'string' && userDataDir.length < 120
+      : typeof userDataDir === 'string' && Buffer.byteLength(path.join(userDataDir, '0000-main.sock')) < 103
     if (typeof userDataDir !== 'string' || !path.isAbsolute(userDataDir) || userDataDir.includes('\0') ||
-        Buffer.byteLength(path.join(userDataDir, '0000-main.sock')) >= 103 ||
+        !withinLimit ||
         fs.realpathSync.native(userDataDir) !== fs.realpathSync.native(deepUserDataDir)) {
-      fail('VS Code IPC alias must address this exact private user-data directory within the socket path limit')
+      fail('VS Code alias must address this exact private user-data directory within the native path limit')
     }
   }
   const request = { version: 1, connection, connectionIdentityBaseUrl: options.providerConnectionIdentity?.baseUrl || connection.baseUrl, sessionRoot: options.sessionRoot, targetPath: options.targetPath,

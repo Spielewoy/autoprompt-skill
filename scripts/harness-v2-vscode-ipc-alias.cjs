@@ -7,7 +7,9 @@ const { atomicCreateJson, atomicWriteJson, checksumRecord, sha256, stableStringi
 const { readFileNoFollow } = require('../agents/codex/workflow/safe-run-root.js')
 
 const SCHEMA_VERSION = 1
-const RESOURCE_TYPE = 'vscode-darwin-ipc-alias'
+const RESOURCE_TYPE_DARWIN = 'vscode-darwin-ipc-alias'
+const RESOURCE_TYPE_WINDOWS = 'vscode-windows-storage-alias'
+const MAX_WINDOWS_ALIAS_CHARS = 120
 const STATES = new Set(['INTENT', 'ALLOCATED', 'READY', 'RESERVATION_ENTERED', 'RELEASING', 'CLEANED'])
 const HASH = /^[a-f0-9]{64}$/u
 const ACTIVE_HANDLES = new WeakMap()
@@ -21,6 +23,12 @@ class VscodeIpcAliasError extends Error {
   }
 }
 function fail(code, message, details) { throw new VscodeIpcAliasError(code, message, details) }
+function windows() { return process.platform === 'win32' }
+function resourceType() { return windows() ? RESOURCE_TYPE_WINDOWS : RESOURCE_TYPE_DARWIN }
+function samePath(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false
+  return windows() ? left.toLowerCase() === right.toLowerCase() : left === right
+}
 function exactObject(value, fields) {
   return value && typeof value === 'object' && !Array.isArray(value) &&
     Object.keys(value).sort().join('\0') === fields.slice().sort().join('\0')
@@ -57,10 +65,15 @@ function physicalDirectory(directory, label, requirePrivate = false) {
   try { item = fs.lstatSync(directory, { bigint: true }); real = fs.realpathSync.native(directory) } catch (error) {
     fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is unavailable`, { cause: error && error.code })
   }
-  if (!item.isDirectory() || item.isSymbolicLink() || real !== directory) fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is not a physical directory`)
+  if (!item.isDirectory() || item.isSymbolicLink() || !samePath(real, directory)) fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is not a physical directory`)
   const captured = identity(item, 'directory')
   if (typeof process.getuid === 'function' && captured.uid !== process.getuid()) fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} has a foreign owner`)
-  if (requirePrivate && captured.mode !== 0o700) fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is not private`)
+  if (requirePrivate) {
+    if (windows()) {
+      try { require('../agents/codex/workflow/safe-run-root.js').auditPrivatePermissions(directory, { recurse: false }) }
+      catch (error) { fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is not private`, { cause: error && error.code }) }
+    } else if (captured.mode !== 0o700) fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is not private`)
+  }
   return captured
 }
 function runtimeShortRoot(options) {
@@ -69,15 +82,28 @@ function runtimeShortRoot(options) {
     if (typeof process.getuid !== 'function') fail('VSCODE_IPC_ALIAS_UNSUPPORTED', 'Darwin UID is unavailable')
     return `/private/tmp/ap-vsc-${process.getuid()}`
   }
+  if (windows()) {
+    if (options._testShortRoot !== undefined) fail('VSCODE_IPC_ALIAS_INVALID', 'test short roots are forbidden on Windows')
+    const safeRoot = require('../agents/codex/workflow/safe-run-root.js')
+    let environment
+    try { environment = safeRoot.windowsControllerEnvironment(process.env.SystemRoot || process.env.WINDIR) }
+    catch (error) { fail('VSCODE_IPC_ALIAS_UNSUPPORTED', 'Windows token profile is unavailable for the VS Code alias', { cause: error && error.code }) }
+    return path.join(environment.LOCALAPPDATA, 'ap-vsc')
+  }
   if (typeof options._testShortRoot !== 'string') fail('VSCODE_IPC_ALIAS_UNSUPPORTED', 'VS Code IPC aliases are available only on Darwin')
   return path.resolve(options._testShortRoot)
 }
 function establishShortRoot(root) {
-  try { fs.mkdirSync(root, { mode: 0o700 }) } catch (error) { if (!error || error.code !== 'EEXIST') throw error }
+  let created = false
+  try { fs.mkdirSync(root, { mode: 0o700 }); created = true } catch (error) { if (!error || error.code !== 'EEXIST') throw error }
+  if (windows() && created) {
+    try { require('../agents/codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(root) }
+    catch (error) { fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC short root could not be made private', { cause: error && error.code }) }
+  }
   return physicalDirectory(root, 'VS Code IPC short root', true)
 }
 function journalParent(journalPath) {
-  if (typeof journalPath !== 'string' || !path.isAbsolute(journalPath) || path.resolve(journalPath) !== journalPath || journalPath.includes('\0')) {
+  if (typeof journalPath !== 'string' || !path.isAbsolute(journalPath) || !samePath(path.resolve(journalPath), journalPath) || journalPath.includes('\0')) {
     fail('VSCODE_IPC_ALIAS_INVALID', 'VS Code IPC journal path must be absolute and canonical')
   }
   physicalDirectory(path.dirname(journalPath), 'VS Code IPC journal parent', true)
@@ -91,7 +117,7 @@ function writeJournal(journalPath, record) {
 function immutableRecord(record) {
   return {
     schemaVersion: SCHEMA_VERSION,
-    resourceType: RESOURCE_TYPE,
+    resourceType: record.resourceType,
     binding: record.binding,
     target: record.target,
     shortRoot: record.shortRoot,
@@ -115,10 +141,12 @@ function readJournal(journalPath, options = {}) {
     fail('VSCODE_IPC_ALIAS_JOURNAL_INVALID', 'VS Code IPC alias journal checksum is invalid')
   }
   const fields = ['schemaVersion', 'resourceType', 'binding', 'target', 'shortRoot', 'child', 'link', 'launchBindingHash', 'state', 'checksum']
-  if (!exactObject(record, fields) || record.schemaVersion !== SCHEMA_VERSION || record.resourceType !== RESOURCE_TYPE || !STATES.has(record.state) ||
+  if (!exactObject(record, fields) || record.schemaVersion !== SCHEMA_VERSION || record.resourceType !== resourceType() || !STATES.has(record.state) ||
       !HASH.test(record.launchBindingHash || '') || !exactObject(record.target, ['path', 'identity']) ||
       !exactObject(record.shortRoot, ['path', 'identity']) || !exactObject(record.child, ['path', 'identity']) ||
       !exactObject(record.link, ['path', 'tombstonePath', 'targetPath', 'identity']) ||
+      ![record.target.path, record.shortRoot.path, record.child.path, record.link.path, record.link.tombstonePath, record.link.targetPath]
+        .every(value => typeof value === 'string' && path.isAbsolute(value) && !value.includes('\0')) ||
       !validStoredIdentity(record.target.identity, 'directory') || !validStoredIdentity(record.shortRoot.identity, 'directory') ||
       (record.child.identity !== null && !validStoredIdentity(record.child.identity, 'directory')) ||
       (record.link.identity !== null && !validStoredIdentity(record.link.identity, 'symlink')) ||
@@ -130,11 +158,11 @@ function readJournal(journalPath, options = {}) {
   const binding = exactBinding(record.binding)
   if (sha256(stableStringify(immutableRecord(record))) !== record.launchBindingHash) fail('VSCODE_IPC_ALIAS_JOURNAL_INVALID', 'VS Code IPC alias immutable binding changed')
   const expectedRoot = runtimeShortRoot(options)
-  if (record.shortRoot.path !== expectedRoot || path.dirname(record.child.path) !== expectedRoot ||
+  if (!samePath(record.shortRoot.path, expectedRoot) || !samePath(path.dirname(record.child.path), expectedRoot) ||
       path.basename(record.child.path) !== sha256(stableStringify(binding)).slice(0, 32) ||
-      record.link.path !== path.join(record.child.path, 'u') ||
-      record.link.tombstonePath !== path.join(record.child.path, '.u-cleanup') ||
-      record.link.targetPath !== record.target.path) {
+      !samePath(record.link.path, path.join(record.child.path, 'u')) ||
+      !samePath(record.link.tombstonePath, path.join(record.child.path, '.u-cleanup')) ||
+      !samePath(record.link.targetPath, record.target.path)) {
     fail('VSCODE_IPC_ALIAS_JOURNAL_INVALID', 'VS Code IPC alias paths differ from their binding')
   }
   return { ...record, binding }
@@ -146,8 +174,16 @@ function verifyDirectory(pathname, expected, label, allowAbsent = false) {
     fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is unavailable`, { cause: error && error.code })
   }
   const current = identity(item, 'directory')
-  if (!sameIdentity(expected, current) || fs.realpathSync.native(pathname) !== pathname) fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} changed identity`)
+  if (!sameIdentity(expected, current) || !samePath(fs.realpathSync.native(pathname), pathname)) fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} changed identity`)
   return current
+}
+function normalizedLinkTarget(value) {
+  if (!windows()) return value
+  let normalized = String(value)
+  if (/^\\\\\?\\UNC\\/iu.test(normalized)) normalized = `\\\\${normalized.slice(8)}`
+  else if (/^\\\\\?\\/u.test(normalized)) normalized = normalized.slice(4)
+  else if (/^\\\?\?\\/u.test(normalized)) normalized = normalized.slice(4)
+  return path.win32.normalize(normalized).toLowerCase()
 }
 function verifyLink(pathname, expected, targetPath, allowAbsent = false) {
   let item
@@ -158,7 +194,11 @@ function verifyLink(pathname, expected, targetPath, allowAbsent = false) {
   const current = identity(item, 'symlink')
   let target
   try { target = fs.readlinkSync(pathname) } catch (error) { fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC alias link cannot be read', { cause: error.code }) }
-  if (!sameIdentity(expected, current) || target !== targetPath) fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC alias link changed identity')
+  let resolved
+  try { resolved = fs.realpathSync.native(pathname) } catch (error) { fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC alias target cannot be resolved', { cause: error.code }) }
+  if (!sameIdentity(expected, current) || normalizedLinkTarget(target) !== normalizedLinkTarget(targetPath) || !samePath(resolved, targetPath)) {
+    fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC alias link changed identity')
+  }
   return current
 }
 function assertStaticIdentities(record) {
@@ -187,7 +227,10 @@ function cleanup(record, journalPath) {
     try { fs.renameSync(record.link.path, record.link.tombstonePath) } catch (error) { fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC alias could not enter cleanup quarantine', { cause: error.code }) }
     verifyLink(record.link.tombstonePath, record.link.identity, record.link.targetPath)
   }
-  if (verifyLink(record.link.tombstonePath, record.link.identity, record.link.targetPath, true)) fs.unlinkSync(record.link.tombstonePath)
+  if (verifyLink(record.link.tombstonePath, record.link.identity, record.link.targetPath, true)) {
+    if (windows()) fs.rmdirSync(record.link.tombstonePath)
+    else fs.unlinkSync(record.link.tombstonePath)
+  }
   const residue = fs.readdirSync(record.child.path)
   if (residue.length) fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC alias child contains unowned residue', { entries: residue.slice(0, 8) })
   verifyDirectory(record.child.path, record.child.identity, 'VS Code IPC alias child')
@@ -256,7 +299,7 @@ function prepare(options = {}) {
   const processOwner = owner(options.processOwner)
   const binding = exactBinding(options.binding)
   journalParent(options.journalPath)
-  if (typeof options.targetPath !== 'string' || !path.isAbsolute(options.targetPath) || path.resolve(options.targetPath) !== options.targetPath || options.targetPath.includes('\0')) {
+  if (typeof options.targetPath !== 'string' || !path.isAbsolute(options.targetPath) || !samePath(path.resolve(options.targetPath), options.targetPath) || options.targetPath.includes('\0')) {
     fail('VSCODE_IPC_ALIAS_INVALID', 'VS Code IPC deep target path must be absolute and canonical')
   }
   const targetPath = options.targetPath
@@ -265,7 +308,7 @@ function prepare(options = {}) {
   const shortRootIdentity = establishShortRoot(shortRoot)
   const childPath = path.join(shortRoot, sha256(stableStringify(binding)).slice(0, 32))
   const linkPath = path.join(childPath, 'u')
-  const record = { schemaVersion: SCHEMA_VERSION, resourceType: RESOURCE_TYPE, binding,
+  const record = { schemaVersion: SCHEMA_VERSION, resourceType: resourceType(), binding,
     target: { path: targetPath, identity: targetIdentity }, shortRoot: { path: shortRoot, identity: shortRootIdentity },
     child: { path: childPath, identity: null }, link: { path: linkPath, tombstonePath: path.join(childPath, '.u-cleanup'), targetPath, identity: null },
     launchBindingHash: null, state: 'INTENT' }
@@ -275,15 +318,17 @@ function prepare(options = {}) {
   }
   try {
     fs.mkdirSync(childPath, { mode: 0o700 })
+    if (windows()) require('../agents/codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(childPath)
     record.child.identity = physicalDirectory(childPath, 'VS Code IPC alias child', true)
     record.state = 'ALLOCATED'; refreshLaunchBinding(record); writeJournal(options.journalPath, record)
-    fs.symlinkSync(targetPath, linkPath, 'dir')
+    fs.symlinkSync(targetPath, linkPath, windows() ? 'junction' : 'dir')
     record.link.identity = identity(fs.lstatSync(linkPath, { bigint: true }), 'symlink')
     verifyLink(linkPath, record.link.identity, targetPath)
     record.state = 'READY'; refreshLaunchBinding(record); writeJournal(options.journalPath, record)
-    if (Buffer.byteLength(path.join(linkPath, '0000-main.sock'), 'utf8') >= 103) {
+    if (!windows() && Buffer.byteLength(path.join(linkPath, '0000-main.sock'), 'utf8') >= 103) {
       fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC alias is not short enough for Darwin IPC')
     }
+    if (windows() && linkPath.length >= MAX_WINDOWS_ALIAS_CHARS) fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code storage alias is not short enough for Windows descendants')
   } catch (error) {
     // This process has not returned a launch capability yet. Retire only
     // allocations whose exact identities were captured; otherwise preserve

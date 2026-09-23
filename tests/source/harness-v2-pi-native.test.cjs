@@ -43,13 +43,63 @@ function committed(f, response, name, args) {
   return actual
 }
 
-test('Pi private failure diagnostics retain only bounded source-owned identity fields', () => {
-  const error = new TypeError('secret host path must not be persisted')
+test('Pi private failure diagnostics retain bounded owned and external identity fields', () => {
+  const error = new TypeError('Bearer abc123 password=secret /private/secret/provider.js')
   error.code = 'unsafe code with spaces'
   error.stack = `TypeError: secret host path must not be persisted\n    at execute (${path.resolve(__dirname, '../../scripts/harness-v2-tool-boundary.cjs')}:171:9)\n    at foreign (/private/secret/provider.js:4:2)`
   assert.deepEqual(bridge.sourceOwnedFailureDiagnostic(error), {
-    name: 'TypeError', originalCode: null, sourceFrames: ['scripts/harness-v2-tool-boundary.cjs:171:9'],
+    name: 'TypeError', originalCode: null, message: 'Bearer <redacted> password=<redacted> <redacted-path>',
+    sourceFrames: ['scripts/harness-v2-tool-boundary.cjs:171:9'], externalFrames: ['provider.js:4:2'],
   })
+})
+
+test('Pi private failure diagnostics capture Bun-style external origin and nested causes without paths', () => {
+  const cause = new Error('inner token=abc C:\\Users\\runner\\secret.txt')
+  cause.stack = 'Error: inner\n    at run (C:\\Users\\runner\\AppData\\omp\\index.js:22:7)'
+  const error = new Error('outer failure')
+  error.cause = cause
+  error.stack = 'Error: outer\n    at handler (/app/node_modules/@omp/runtime/index.js:44:3)'
+  const diagnostic = bridge.sourceOwnedFailureDiagnostic(error)
+  assert.deepEqual(diagnostic.externalFrames, ['index.js:44:3'])
+  assert.equal(diagnostic.cause.message, 'inner token=<redacted> <redacted-path>')
+  assert.deepEqual(diagnostic.cause.externalFrames, ['index.js:22:7'])
+  assert.doesNotMatch(JSON.stringify(diagnostic), /Users|runner|node_modules|Bearer|abc/u)
+})
+
+test('Pi private failure diagnostics cap stack processing and nested causes', () => {
+  const error = new Error('x'.repeat(5000))
+  error.stack = `${'x'.repeat(100000)}\n${Array.from({ length: 20 }, (_, index) => `    at /tmp/provider-${index}.js:${index + 1}:2`).join('\n')}`
+  let current = error
+  for (let index = 0; index < 6; index++) {
+    current.cause = new Error(`cause-${index}`)
+    current = current.cause
+  }
+  const diagnostic = bridge.sourceOwnedFailureDiagnostic(error)
+  assert.equal(diagnostic.message.length, 1024)
+  assert.ok(diagnostic.externalFrames.length <= 8)
+  assert.ok(diagnostic.cause?.cause)
+  assert.equal(diagnostic.cause.cause.cause, undefined)
+
+  const hostile = {}
+  Object.defineProperties(hostile, {
+    name: { get() { throw new Error('getter must not escape') } },
+    message: { get() { throw new Error('getter must not escape') } },
+    stack: { get() { throw new Error('getter must not escape') } },
+  })
+  hostile.cause = hostile
+  assert.doesNotThrow(() => bridge.sourceOwnedFailureDiagnostic(hostile))
+})
+
+test('Pi private failure diagnostics redact arbitrary absolute roots and quoted credentials', () => {
+  const error = new Error('api_key="secret" /app/space path/file.js C:\\Users\\runner\\secret.txt')
+  const diagnostic = bridge.sourceOwnedFailureDiagnostic(error)
+  assert.equal(diagnostic.message, 'api_key=<redacted> <redacted-path>')
+  assert.doesNotMatch(JSON.stringify(diagnostic), /secret|Users|runner|app/iu)
+  const quoted = bridge.sourceOwnedFailureDiagnostic(new Error('{"api_key":"never-persist", "path":"/srv/private/data"} OPENAI_API_KEY=never-persist'))
+  assert.doesNotMatch(quoted.message, /never-persist|\/srv/u)
+  const unicode = bridge.sourceOwnedFailureDiagnostic(new Error('€'.repeat(2000)))
+  assert.ok(Buffer.byteLength(unicode.message, 'utf8') <= 1024)
+  assert.doesNotMatch(unicode.message, /\uFFFD/u)
 })
 
 test('Prime 0.7.2 cache receipt transform is checked against raw provider categories', () => {
