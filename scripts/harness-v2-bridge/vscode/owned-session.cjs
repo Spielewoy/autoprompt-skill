@@ -7,6 +7,7 @@ const boundary = require('../../harness-v2-tool-boundary.cjs')
 const controlled = require('../../harness-v2-controlled-tools.cjs')
 const { readBound, writePrivate, privateDirectory, sha256 } = require('../../../agents/reasonix/workflow/native.js')
 const { sanitize } = require('../../harness-v2-vscode-config.cjs')
+const { descriptorValid } = require('./event-channel.cjs')
 const MIME = 'application/vnd.autoprompt.billed-usage+json'
 const fail = (code, message) => { const error = new Error(message); error.code = code; throw error }
 const integer = value => Number.isSafeInteger(value) && value >= 0
@@ -115,13 +116,14 @@ function activateOwned(context, vscode) {
   if (sha256(bytes) !== process.env.AUTOPROMPT_VSCODE_OWNED_REQUEST_SHA256) fail('PROFILE_INVALID', 'Owned VS Code request changed before launch')
   const request = JSON.parse(bytes)
   const connection = sanitize(request.connection)
-  if (request.version !== 1 || !connection.model || !path.isAbsolute(request.sessionRoot || '') || !path.isAbsolute(request.targetPath || '') || request.outputSchema !== undefined && (!connection.supportsStructuredOutput || !request.outputSchema || typeof request.outputSchema !== 'object' || Array.isArray(request.outputSchema))) fail('PROFILE_INVALID', 'Owned VS Code request is incomplete')
+  if (request.version !== 1 || !connection.model || !path.isAbsolute(request.sessionRoot || '') || !path.isAbsolute(request.targetPath || '') || !descriptorValid(request.eventChannel) || request.outputSchema !== undefined && (!connection.supportsStructuredOutput || !request.outputSchema || typeof request.outputSchema !== 'object' || Array.isArray(request.outputSchema))) fail('PROFILE_INVALID', 'Owned VS Code request is incomplete')
   const prepared = boundary.loadBoundary(request.policyPath, request.policySha256)
   controlled.load(prepared, 'vscode')
   const receipts = registerProvider(context, vscode, connection, request.outputSchema)
-  return { runOwnedSession: emit => runSession(vscode, request, connection, prepared, receipts, emit) }
+  return { eventChannel: request.eventChannel, runOwnedSession: emit => runSession(vscode, request, connection, prepared, receipts, emit) }
 }
 async function runSession(vscode, request, connection, prepared, receipts, emit) {
+  if (typeof emit !== 'function') fail('PROFILE_INVALID', 'Owned VS Code event sink is invalid')
   const sessionId = request.continuationId || `vscode-owned-${crypto.randomUUID()}`
   if (!/^vscode-owned-[a-f0-9-]{36}$/.test(sessionId)) fail('SESSION_ID_MISMATCH', 'Invalid owned continuation')
   const root = path.join(request.sessionRoot, 'owned-sessions', sessionId)
@@ -137,6 +139,16 @@ async function runSession(vscode, request, connection, prepared, receipts, emit)
   const terminate = () => { cancellation.cancel(); abort.abort() }
   process.once('SIGTERM', terminate); process.once('SIGINT', terminate)
   const deadline = setTimeout(terminate, connection.timeoutMs)
+  let eventDelivery = Promise.resolve()
+  const report = event => {
+    const delivery = eventDelivery = eventDelivery.then(() => emit(event))
+    // Usage receipts arrive through a synchronous VS Code callback. Retain
+    // the rejection for the explicit await below, while marking it handled
+    // immediately so a failed channel cannot become an unrelated unhandled
+    // rejection before the model stream yields its next part.
+    delivery.catch(() => {})
+    return delivery
+  }
   try {
     let state
     if (request.continuationId) {
@@ -149,7 +161,7 @@ async function runSession(vscode, request, connection, prepared, receipts, emit)
     else state.messages[0] = { role: 'user', parts: [{ type: 'text', text: request.prompt }] }
     state.messages.push({ role: 'user', parts: [{ type: 'text', text: request.input }] })
     persist(state)
-    emit({ type: 'owned.session', sessionId, contextKind: 'autoprompt-extension', extensionHostVersion: vscode.version })
+    await report({ type: 'owned.session', sessionId, contextKind: 'autoprompt-extension', extensionHostVersion: vscode.version })
     const models = await vscode.lm.selectChatModels({ vendor: 'autoprompt-owned', id: connection.model })
     if (models.length !== 1) fail('PROVIDER_UNSUPPORTED', 'Owned LM provider was not registered in the actual extension host')
     const tools = (prepared.policy.toolFree === true ? [] : boundary.TOOLS).map(tool => ({ name: controlled.toolName('vscode', tool.name), description: tool.description, inputSchema: tool.inputSchema }))
@@ -159,7 +171,7 @@ async function runSession(vscode, request, connection, prepared, receipts, emit)
       const parts = []; let receipt
       const acceptReceipt = candidate => {
         if (receipt && JSON.stringify(receipt) !== JSON.stringify(candidate)) fail('PROVIDER_USAGE_UNKNOWN', 'Duplicate owned usage receipt')
-        if (!receipt) { receipt = candidate; emit({ type: 'owned.usage', ...receipt }) }
+        if (!receipt) { receipt = candidate; report({ type: 'owned.usage', ...receipt }) }
       }
       const unsubscribe = receipts.subscribe(nonce, acceptReceipt)
       try {
@@ -173,6 +185,7 @@ async function runSession(vscode, request, connection, prepared, receipts, emit)
           else if (part instanceof vscode.LanguageModelToolCallPart) parts.push({ type: 'call', id: part.callId, name: part.name, args: part.input })
           else fail('TRANSPORT_INVALID', 'Owned LM returned an unsupported stream part')
         }
+        await eventDelivery
         if (!receipt) fail('PROVIDER_USAGE_UNKNOWN', 'LM API omitted the exact owned usage receipt')
       } finally { unsubscribe(); receipts.receipts.delete(nonce) }
       state.messages.push({ role: 'assistant', parts }); persist(state)
@@ -183,26 +196,29 @@ async function runSession(vscode, request, connection, prepared, receipts, emit)
         try { output = JSON.parse(text) } catch { fail('CHILD_RESULT_INVALID', 'Owned terminal must be exactly one JSON object') }
         if (!output || typeof output !== 'object' || Array.isArray(output)) fail('CHILD_RESULT_INVALID', 'Owned terminal must be one JSON object')
         state.status = 'complete'; persist(state)
-        emit({ type: 'owned.result', output })
+        await report({ type: 'owned.result', output })
         return
       }
       for (const call of calls) {
         if (abort.signal.aborted) fail('CHILD_CANCELLED', 'Owned tool dispatch cancelled')
         const name = controlled.decodeToolName('vscode', call.name)
         if (!name) fail('ROLE_POLICY_DENIED', 'Only controller-owned tools can execute')
-        emit({ type: 'owned.tool.start', id: call.id, name: call.name, args: call.args })
+        await report({ type: 'owned.tool.start', id: call.id, name: call.name, args: call.args })
         const started = new Date().toISOString()
         let result
         try { const current = boundary.loadBoundary(prepared.policyPath, prepared.policySha256); result = await boundary.executeTool(current.policy, name, call.args, { signal: abort.signal, controlRoot: current.root }) }
         catch (error) { const output = `${error.code || 'TOOL_FAILED'}: ${error.message}`; result = { tool: name, status: 'failed', exitCode: null, output, outputSha256: sha256(output), code: error.code || 'TOOL_FAILED' } }
         boundary.appendReceipt(prepared, name, call.args, result, started)
         const text = JSON.stringify(result)
-        emit({ type: 'owned.tool.end', id: call.id, output: text, error: result.status !== 'completed' })
+        await report({ type: 'owned.tool.end', id: call.id, output: text, error: result.status !== 'completed' })
         state.messages.push({ role: 'user', parts: [{ type: 'result', id: call.id, text }] }); persist(state)
       }
     }
     fail('CHILD_RESULT_MISSING', 'Owned conversation reached its bounded step limit')
-  } catch (error) { emit({ type: 'owned.error', code: error.code || 'CHILD_RUNTIME_FAILURE', message: error.message }); throw error }
+  } catch (error) {
+    try { await report({ type: 'owned.error', code: error.code || 'CHILD_RUNTIME_FAILURE', message: error.message }) } catch {}
+    throw error
+  }
   finally {
     clearTimeout(deadline); process.removeListener('SIGTERM', terminate); process.removeListener('SIGINT', terminate)
     cancellation.dispose(); fs.closeSync(lockFd); fs.unlinkSync(lock)

@@ -3,6 +3,7 @@
 const path = require('node:path')
 const fs = require('node:fs')
 const { writePrivate, sha256 } = require('../agents/reasonix/workflow/native.js')
+const { descriptorValid } = require('./harness-v2-bridge/vscode/event-channel.cjs')
 function fail(message) { const error = new Error(message); error.code = 'PROFILE_INVALID'; throw error }
 function sanitize(source = {}) {
   if (!source || typeof source !== 'object' || Array.isArray(source)) fail('VS Code owned provider needs connection data')
@@ -33,6 +34,7 @@ function project(options, env) {
   if (options.effort !== undefined && options.effort !== null) connection.reasoningEffort = require('./harness-v2-native.cjs').validateEffort('vscode', options.effort)
   if (!connection.model) fail('VS Code owned BYOK execution needs an explicit model')
   if (!options.toolBoundary) fail('VS Code owned sessions require the controlled tool boundary')
+  if (!descriptorValid(options.vscodeEventChannel)) fail('VS Code owned sessions require an exact private event channel')
   const deepUserDataDir = path.join(options.home, 'user-data')
   const userDataDir = options.vscodeUserDataDir === undefined ? deepUserDataDir : options.vscodeUserDataDir
   if (options.vscodeUserDataDir !== undefined) {
@@ -45,6 +47,7 @@ function project(options, env) {
   const request = { version: 1, connection, connectionIdentityBaseUrl: options.providerConnectionIdentity?.baseUrl || connection.baseUrl, sessionRoot: options.sessionRoot, targetPath: options.targetPath,
     prompt: options.prompt, input: options.input, continuationId: options.continuationId || null,
     policyPath: options.toolBoundary.policyPath, policySha256: options.toolBoundary.policySha256,
+    eventChannel: options.vscodeEventChannel,
     ...(connection.supportsStructuredOutput && options.outputSchema ? { outputSchema: options.outputSchema } : {}) }
   const file = path.join(options.home, 'owned-session.json')
   const bytes = JSON.stringify(request)

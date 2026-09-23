@@ -7,6 +7,7 @@ const { sanitize } = require('../../scripts/harness-v2-vscode-config.cjs')
 const native = require('../../scripts/harness-v2-native.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessEventStream } = require('../../scripts/harness-v2-transport.cjs')
+const { descriptor, descriptorValid } = require('../../scripts/harness-v2-bridge/vscode/event-channel.cjs')
 
 test('owned VS Code usage retains exact billed categories and rejects inconsistent receipts', () => {
   const source = { id: 'request-1', model: 'fixture', usage: { prompt_tokens: 12, completion_tokens: 5, total_tokens: 17, prompt_tokens_details: { cached_tokens: 3 }, completion_tokens_details: { reasoning_tokens: 2 } } }
@@ -51,14 +52,17 @@ test('owned VS Code launch uses a controller-bounded session timeout without ove
   const launch = (connection, outputSchema) => {
     const home = path.join(root, crypto.randomUUID()); fs.mkdirSync(home, { mode: 0o700 })
     return native.createLaunch({ provider: 'vscode', home, sessionRoot: path.join(root, 'session'), cwd: target, targetPath: target,
-      prompt: 'controller prompt', input: '{}', readOnly: false, toolBoundary, connection, environment: {}, ...(outputSchema ? { outputSchema } : {}) })
+      prompt: 'controller prompt', input: '{}', readOnly: false, toolBoundary, connection, environment: {}, vscodeEventChannel: descriptor({ endpoint: path.join(root, `${crypto.randomUUID()}.sock`), sessionId: 'session', reservationId: '11111111-1111-4111-8111-111111111111' }), ...(outputSchema ? { outputSchema } : {}) })
   }
   const sessionTimeout = connection => JSON.parse(fs.readFileSync(launch(connection).env.AUTOPROMPT_VSCODE_OWNED_REQUEST, 'utf8')).connection.timeoutMs
   assert.equal(sessionTimeout({ model: 'fixture' }), 600000)
   assert.equal(sessionTimeout({ model: 'fixture', timeoutMs: 180000 }), 180000)
   const structured = launch({ model: 'fixture', supportsStructuredOutput: true, timeoutMs: 180000, environment: {} }, { type: 'object', additionalProperties: false })
-  const request = JSON.parse(fs.readFileSync(structured.env.AUTOPROMPT_VSCODE_OWNED_REQUEST, 'utf8'))
+  const requestBytes = fs.readFileSync(structured.env.AUTOPROMPT_VSCODE_OWNED_REQUEST)
+  const request = JSON.parse(requestBytes)
   assert.deepEqual(request.outputSchema, { type: 'object', additionalProperties: false })
+  assert.equal(descriptorValid(request.eventChannel), true)
+  assert.equal(structured.env.AUTOPROMPT_VSCODE_OWNED_REQUEST_SHA256, native.sha256(requestBytes))
 })
 
 test('production VS Code connection defaults to the bounded checker session budget', t => {
@@ -82,7 +86,7 @@ test('VS Code short IPC argv keeps settings in the exact deep private user-data 
   fs.symlinkSync(target, alias, 'dir')
   const options = { home, sessionRoot: root, targetPath: root, prompt: 'fixture', input: '{}',
     connection: { model: 'fixture' }, toolBoundary: { policyPath: '/bound/policy.json', policySha256: 'a'.repeat(64) },
-    vscodeUserDataDir: alias }
+    vscodeUserDataDir: alias, vscodeEventChannel: descriptor({ endpoint: path.join(alias, 't', 'events.sock'), sessionId: 'session', reservationId: '11111111-1111-4111-8111-111111111111' }) }
   const { project } = require('../../scripts/harness-v2-vscode-config.cjs')
   const environment = {}, argv = project(options, environment)
   assert.ok(argv.includes('--disable-extensions'))

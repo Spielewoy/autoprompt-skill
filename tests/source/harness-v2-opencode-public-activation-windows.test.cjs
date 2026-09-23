@@ -38,8 +38,14 @@ function activationFailureLogs(root) {
       const stat = fs.lstatSync(file)
       if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) return
       const fd = fs.openSync(file, 'r'), bytes = Buffer.alloc(Math.min(stat.size, 16384))
-      try { fs.readSync(fd, bytes, 0, bytes.length, Math.max(0, stat.size - bytes.length)) } finally { fs.closeSync(fd) }
-      logs.push({ path: path.relative(root, file), tail: bytes.toString('utf8') })
+      // Shared capability cases repeat the first failure at the end of TAP.
+      // Preserve its initial native diagnostic as well as the terminal tail.
+      const first = Buffer.alloc(Math.min(stat.size, 65536))
+      try {
+        fs.readSync(fd, first, 0, first.length, 0)
+        fs.readSync(fd, bytes, 0, bytes.length, Math.max(0, stat.size - bytes.length))
+      } finally { fs.closeSync(fd) }
+      logs.push({ path: path.relative(root, file), head: first.toString('utf8'), tail: bytes.toString('utf8') })
     } catch {}
   }
   const parent = path.join(root, '.autoprompt-private', 'activations')

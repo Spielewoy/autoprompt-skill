@@ -127,4 +127,71 @@ function createWindowsToolLease(options) {
   })
 }
 
-module.exports = { START_TIMEOUT_MS, RELEASE_TIMEOUT_MS, MAX_LOCK_BYTES, POWERSHELL_SOURCE, exactFile, minimalEnvironment, createWindowsToolLease }
+// Async counterpart used by protocol servers whose event loop must remain
+// responsive while PowerShell establishes the lease. The synchronous API is
+// retained for native bootstrap helpers and deterministic unit fixtures.
+async function createWindowsToolLeaseAsync(options) {
+  const platform = options.platform || process.platform
+  const filesystem = options.fs || fs, spawn = options.spawn || childProcess.spawn, environment = options.environment || process.env
+  const lockPath = options.lockPath, lockBytes = Buffer.from(options.lockBytes || '')
+  if (platform !== 'win32') fail('TOOL_LEASE_UNAVAILABLE', 'The Windows tool lease requires native Windows')
+  if (typeof lockPath !== 'string' || !path.win32.isAbsolute(lockPath) || lockBytes.length < 1 || lockBytes.length > MAX_LOCK_BYTES) fail('TOOL_LEASE_INVALID', 'The Windows tool lease binding is invalid')
+  const systemRoot = environment.SystemRoot
+  if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/i.test(systemRoot) || !filesystem.existsSync(systemRoot)) fail('TOOL_LEASE_UNAVAILABLE', 'The Windows system root is unavailable')
+  if (filesystem.existsSync(lockPath)) fail('TOOL_LEASE_INVALID', 'The Windows tool lease path already exists')
+  const powershell = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  if (!filesystem.existsSync(powershell)) fail('TOOL_LEASE_UNAVAILABLE', 'The Windows PowerShell runtime is unavailable')
+  const readyBytes = Buffer.from(crypto.randomBytes(32).toString('hex')), readyPath = `${lockPath}.ready-${readyBytes.toString('ascii')}`
+  const encoded = Buffer.from(POWERSHELL_SOURCE, 'utf16le').toString('base64')
+  let child
+  try {
+    child = spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
+      cwd: path.win32.dirname(powershell), env: minimalEnvironment(environment, lockPath, lockBytes, readyPath, readyBytes),
+      shell: false, windowsHide: true, detached: false, stdio: ['pipe', 'ignore', 'pipe'],
+    })
+  } catch (error) { fail('TOOL_LEASE_UNAVAILABLE', `The Windows tool lease holder could not start: ${error.code || 'ERROR'}`) }
+  let stderr = Buffer.alloc(0), childError = null, releasePromise = null
+  const settled = new Promise(resolve => {
+    child.once('error', error => { childError = error; resolve({ error }) })
+    child.once('close', (code, signal) => resolve({ code, signal }))
+  })
+  child.stdin.on('error', () => {})
+  child.stderr.on('data', bytes => { stderr = Buffer.concat([stderr, Buffer.from(bytes)]).subarray(-4096) })
+  const deadline = Date.now() + (options.startTimeoutMs || START_TIMEOUT_MS)
+  while (!exactFile(lockPath, lockBytes, filesystem) || !exactFile(readyPath, readyBytes, filesystem)) {
+    if (childError || Date.now() >= deadline) {
+      try { child.kill('SIGKILL') } catch {}
+      try { child.stdin.destroy() } catch {}
+      try { if (exactFile(readyPath, readyBytes, filesystem)) filesystem.unlinkSync(readyPath) } catch {}
+      fail('TOOL_LEASE_UNAVAILABLE', `The Windows tool lease holder did not establish its exact lease${childError ? `: ${childError.code || 'ERROR'}` : stderr.length ? `: ${stderr.toString('utf8').trim().slice(-512)}` : ''}`)
+    }
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  try { filesystem.unlinkSync(readyPath) } catch {
+    try { child.kill('SIGKILL') } catch {}
+    try { child.stdin.destroy() } catch {}
+    fail('TOOL_LEASE_UNAVAILABLE', 'The Windows tool lease readiness receipt could not be consumed')
+  }
+  return Object.freeze({
+    path: lockPath, pid: child.pid,
+    assertHeld() { if (releasePromise || childError || !exactFile(lockPath, lockBytes, filesystem)) fail('TOOL_LEASE_LOST', 'The Windows tool lease is no longer held') },
+    release() {
+      if (releasePromise) return releasePromise
+      releasePromise = (async () => {
+        child.stdin.end('\n')
+        const timeoutMs = options.releaseTimeoutMs || RELEASE_TIMEOUT_MS
+        let timer
+        const result = await Promise.race([settled, new Promise(resolve => { timer = setTimeout(() => resolve(null), timeoutMs) })])
+        clearTimeout(timer)
+        if (!result) { try { child.kill('SIGKILL') } catch {}; fail('TOOL_LEASE_RELEASE_FAILED', 'The Windows tool lease holder did not stop') }
+        if (result.error) fail('TOOL_LEASE_RELEASE_FAILED', `The Windows tool lease holder failed: ${result.error.code || 'ERROR'}`)
+        const absentDeadline = Date.now() + timeoutMs
+        while (filesystem.existsSync(lockPath) && Date.now() < absentDeadline) await new Promise(resolve => setTimeout(resolve, 10))
+        if (filesystem.existsSync(lockPath)) fail('TOOL_LEASE_RELEASE_FAILED', 'The Windows tool lease was not released')
+      })()
+      return releasePromise
+    },
+  })
+}
+
+module.exports = { START_TIMEOUT_MS, RELEASE_TIMEOUT_MS, MAX_LOCK_BYTES, POWERSHELL_SOURCE, exactFile, minimalEnvironment, createWindowsToolLease, createWindowsToolLeaseAsync }

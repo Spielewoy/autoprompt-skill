@@ -11,6 +11,29 @@ const native = require('../../scripts/harness-v2-native.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessEventStream } = require('../../scripts/harness-v2-transport.cjs')
 
+test('Hermes retains bounded controller startup diagnostics and closes failed initialization', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-startup-failure-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const server = path.join(root, 'server.cjs')
+  fs.writeFileSync(server, `process.stdin.once('data', () => {
+    process.stderr.write('EXACT_CONTROLLER_STARTUP_DIAGNOSTIC\\n');
+    process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32603,data:{code:'TOOL_LEASE_UNAVAILABLE'}}})+'\\n');
+    setInterval(() => {},1000);
+  });`)
+  const program = ['import runpy,sys', 'plugin=runpy.run_path(sys.argv[1])',
+    'try: plugin["Controller"]()', 'except RuntimeError as error: print(str(error))',
+    'else: raise AssertionError("initialization unexpectedly succeeded")'].join('\n')
+  const result = cp.spawnSync(process.env.AUTOPROMPT_TEST_PYTHON || 'python3', ['-I', '-B', '-c', program,
+    path.resolve(__dirname, '../../scripts/harness-v2-bridge/hermes/plugin.py')], {
+    encoding: 'utf8', timeout: 10000, env: { ...process.env, AUTOPROMPT_NODE: process.execPath,
+      AUTOPROMPT_TOOL_SERVER: server, AUTOPROMPT_TOOL_POLICY: 'unused', AUTOPROMPT_TOOL_POLICY_SHA256: 'unused' },
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stderr, /EXACT_CONTROLLER_STARTUP_DIAGNOSTIC/)
+  assert.match(result.stderr, /AUTOPROMPT_HERMES_CONTROLLER_FAILURE:TOOL_LEASE_UNAVAILABLE/)
+  assert.match(result.stdout, /Controller tool request failed: TOOL_LEASE_UNAVAILABLE/)
+})
+
 for (const toolFree of [false, true]) {
   test(`Hermes Python plugin registers the actual controller inventory (toolFree=${toolFree})`, t => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-inventory-'))

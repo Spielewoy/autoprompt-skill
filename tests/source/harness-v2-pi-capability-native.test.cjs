@@ -129,6 +129,20 @@ function fixtureFailureDiagnostic(f, error) {
     output.proxy.push({ name, text: fs.readFileSync(file, 'utf8').slice(-4096) })
     if (output.proxy.length >= 4) break
   }
+  const nativeDiagnostics = []
+  const visitDiagnostics = directory => {
+    for (const item of fs.existsSync(directory) ? fs.readdirSync(directory, { withFileTypes: true }) : []) {
+      const file = path.join(directory, item.name)
+      if (item.isDirectory()) visitDiagnostics(file)
+      else if (/^pi-handler-[a-f0-9]{32}\.jsonl$/.test(item.name)) {
+        const stat = fs.lstatSync(file)
+        if (stat.isFile() && stat.nlink === 1 && stat.size <= 65536) nativeDiagnostics.push(fs.readFileSync(file, 'utf8'))
+      }
+      if (nativeDiagnostics.length >= 4) return
+    }
+  }
+  visitDiagnostics(f.nativeRoot)
+  output.piHandlers = nativeDiagnostics
   while (Buffer.byteLength(JSON.stringify(output)) > 65536) output.events.shift()
   console.error(JSON.stringify(output))
 }

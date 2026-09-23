@@ -52,6 +52,13 @@ test('Prime 0.7.2 cache receipt transform is checked against raw provider catego
     { input: 569, cacheRead: 5680, cacheWrite: 566, output: 39, totalTokens: 6854 })
 })
 
+test('Pi controller keeps trusted runtime failure codes bounded without exposing exception text', () => {
+  assert.equal(bridge.failureCode({ code: 'WINDOWS_PROFILE_UNAVAILABLE', message: 'C:\\private\\secret' }), 'WINDOWS_PROFILE_UNAVAILABLE')
+  assert.equal(bridge.failureCode({ code: 'EACCES' }), 'EACCES')
+  assert.equal(bridge.failureCode({ code: 'bad-code' }), 'TOOL_FAILED')
+  assert.equal(bridge.failureCode({ code: 'WINDOWS_PROFILE_UNAVAILABLE' }, true), 'TOOL_CANCELLED')
+})
+
 test('Prime transport binds its native receipt by hash without retaining a raw response id', () => {
   const responseId = 'prime-response-receipt-1'
   const usage = { input: 569, cacheRead: 5680, cacheWrite: 566, output: 39, reasoning: 8, totalTokens: 6854 }

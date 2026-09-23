@@ -11,13 +11,13 @@ on:
         required: false
         default: none
         type: choice
-        options: [none, macos-containment, macos-exclusive-fd, macos-ipv6-loopback, macos-helper-build, windows-bootstrap, windows-provider-primitives, opencode, opencode-public, vscode, vscode-diagnostic, hermes-macos]
+        options: [none, macos-containment, macos-exclusive-fd, macos-ipv6-loopback, macos-listener-handoff, macos-helper-build, windows-bootstrap, windows-provider-primitives, opencode, opencode-public, vscode, vscode-diagnostic, hermes-macos]
       support_provider:
         description: 'Installed provider for the focused provider stage'
         required: false
         default: opencode
         type: choice
-        options: [opencode, deepseek, reasonix, prime, omp, kilo]
+        options: [opencode, deepseek, reasonix, prime, omp, kilo, grok]
       support_primitive:
         description: 'Select the Windows primitive stage without repeating provider installation'
         required: false
@@ -29,7 +29,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, isolation, isolatedChecking, cancellation]
+        options: [all, isolation, isolatedChecking, cancellation, modelRouting]
       support_arm:
         description: 'Limit focused Windows provider verification to ARM64'
         required: false
@@ -1193,6 +1193,37 @@ jobs:
           path: darwin-launchd-ipv6.log
           if-no-files-found: error
 
+  macos-listener-handoff:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'macos-listener-handoff'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+      - name: Compile and test retained launchd listener handoff
+        timeout-minutes: 7
+        shell: bash
+        env:
+          AUTOPROMPT_DARWIN_LISTENER_HANDOFF_EVIDENCE: ${{ runner.temp }}/darwin-launchd-listener-handoff-evidence.json
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/darwin-launchd-listener-handoff-native.test.cjs 2>&1 | tee darwin-launchd-listener-handoff.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: listener-handoff-${{ matrix.os }}
+          path: |
+            darwin-launchd-listener-handoff.log
+            ${{ runner.temp }}/darwin-launchd-listener-handoff-evidence.json
+            ${{ runner.temp }}/darwin-launchd-listener-handoff
+          if-no-files-found: error
+
   macos-helper-build:
     if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'macos-helper-build'
     strategy:
@@ -1367,8 +1398,8 @@ jobs:
     env:
       AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
       SUPPORT_PROVIDER: ${{ inputs.support_provider }}
-      PROVIDER_PACKAGE: ${{ inputs.support_provider == 'deepseek' && '@deepseek-ai/dsh@0.1.2-rc.1' || inputs.support_provider == 'reasonix' && 'reasonix@1.30.0' || inputs.support_provider == 'prime' && './.native-provider/prime-agent-0.7.2.tgz' || inputs.support_provider == 'kilo' && '@kilocode/cli@7.5.15' || 'opencode-ai@1.18.32' }}
-      PROVIDER_BIN: ${{ inputs.support_provider == 'deepseek' && 'dsh' || inputs.support_provider == 'reasonix' && 'reasonix' || inputs.support_provider == 'prime' && 'prime-agent' || inputs.support_provider == 'kilo' && 'kilo' || 'opencode' }}
+      PROVIDER_PACKAGE: ${{ inputs.support_provider == 'grok' && '@xai-official/grok@1.0.13' || inputs.support_provider == 'deepseek' && '@deepseek-ai/dsh@0.1.2-rc.1' || inputs.support_provider == 'reasonix' && 'reasonix@1.30.0' || inputs.support_provider == 'prime' && './.native-provider/prime-agent-0.7.2.tgz' || inputs.support_provider == 'kilo' && '@kilocode/cli@7.5.15' || 'opencode-ai@1.18.32' }}
+      PROVIDER_BIN: ${{ inputs.support_provider == 'grok' && 'grok' || inputs.support_provider == 'deepseek' && 'dsh' || inputs.support_provider == 'reasonix' && 'reasonix' || inputs.support_provider == 'prime' && 'prime-agent' || inputs.support_provider == 'kilo' && 'kilo' || 'opencode' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -1519,9 +1550,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner:
-          - { os: macos-15-intel, arch: x64 }
-          - { os: macos-latest, arch: arm64 }
+        runner: ${{ fromJSON(inputs.support_single == true && '[{"os":"macos-15-intel","arch":"x64"}]' || '[{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner.os }}
     timeout-minutes: 80
     env:

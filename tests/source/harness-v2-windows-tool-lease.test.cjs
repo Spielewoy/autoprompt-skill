@@ -106,3 +106,19 @@ test('Windows tool lease retains one failed release promise for every retry', as
   assert.strictEqual(lease.release(), first)
   await assert.rejects(lease.release(), { code: 'TOOL_LEASE_RELEASE_FAILED' })
 })
+
+test('Windows async tool lease yields while the holder establishes exact readiness', async () => {
+  const filesystem = fakeFilesystem(), lockPath = 'C:\\private\\async.lock', lockBytes = Buffer.from('async-exact')
+  const spawn = (_executable, _argv, options) => {
+    const child = new EventEmitter(); child.pid = 45; child.stderr = new EventEmitter(); child.kill = () => true
+    child.stdin = Object.assign(new EventEmitter(), { end() { filesystem.files.delete(lockPath); queueMicrotask(() => child.emit('close', 0, null)) }, destroy() {} })
+    const readyPath = Buffer.from(options.env.AUTOPROMPT_TOOL_LEASE_READY_PATH_B64, 'base64').toString('utf8')
+    setTimeout(() => { filesystem.files.set(lockPath, lockBytes); filesystem.files.set(readyPath, Buffer.from(options.env.AUTOPROMPT_TOOL_LEASE_READY_BYTES_B64, 'base64')) }, 20)
+    return child
+  }
+  const leasePromise = leaseModule.createWindowsToolLeaseAsync({ platform: 'win32', fs: filesystem, spawn,
+    environment: { SystemRoot: 'C:\\Windows' }, lockPath, lockBytes })
+  assert.equal(filesystem.existsSync(lockPath), false, 'async acquisition must return control before readiness')
+  const lease = await leasePromise
+  lease.assertHeld(); await lease.release(); assert.equal(filesystem.existsSync(lockPath), false)
+})

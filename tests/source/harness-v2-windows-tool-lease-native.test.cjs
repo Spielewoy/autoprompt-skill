@@ -35,7 +35,8 @@ test('PowerShell FileStream delete-on-close probe records host semantics for nor
       AUTOPROMPT_TOOL_LEASE_READY_PATH_B64: Buffer.from(readyPath).toString('base64'), AUTOPROMPT_TOOL_LEASE_READY_BYTES_B64: readyBytes.toString('base64') }
     // Hold the writer open after its bytes are readable. The published path
     // must remain absent until the writer closes, even under this schedule.
-    const gatedSource = POWERSHELL_SOURCE.replace('$ready.Flush($true)', "$ready.Flush($true); while (![IO.File]::Exists($readyPath + '.publish')) { Start-Sleep -Milliseconds 10 }")
+    const gatedSource = POWERSHELL_SOURCE.replace('$ready.Flush($true)', "$ready.Flush($true); [Console]::Error.WriteLine('LEASE_PROBE_WRITER_HELD'); [Console]::Error.Flush(); while (![IO.File]::Exists($readyPath + '.publish')) { Start-Sleep -Milliseconds 10 }; [Console]::Error.WriteLine('LEASE_PROBE_GATE_OPEN'); [Console]::Error.Flush()")
+      .replace('[IO.File]::Move($readyStagingPath, $readyPath)', "[Console]::Error.WriteLine('LEASE_PROBE_BEFORE_MOVE'); [Console]::Error.Flush(); [IO.File]::Move($readyStagingPath, $readyPath); [Console]::Error.WriteLine('LEASE_PROBE_PUBLISHED'); [Console]::Error.Flush()")
     assert.notEqual(gatedSource, POWERSHELL_SOURCE)
     const child = childProcess.spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(gatedSource, 'utf16le').toString('base64')],
       { env: environment, stdio: ['pipe', 'ignore', 'pipe'] })
@@ -49,6 +50,9 @@ test('PowerShell FileStream delete-on-close probe records host semantics for nor
     fs.writeFileSync(`${readyPath}.publish`, '', { flag: 'wx' })
     const publicationDeadline = Date.now() + 10000
     while ((!fs.existsSync(lockPath) || !fs.existsSync(readyPath)) && Date.now() < publicationDeadline) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(fs.existsSync(readyPath), JSON.stringify({ forced, phase: 'publication', exitCode: child.exitCode,
+      signalCode: child.signalCode, stagingExists: fs.existsSync(`${readyPath}.staging`), gateExists: fs.existsSync(`${readyPath}.publish`),
+      lockExists: fs.existsSync(lockPath), stderr: stderr.slice(-4096) }))
     assert.deepEqual(fs.readFileSync(lockPath), lockBytes, stderr)
     assert.deepEqual(fs.readFileSync(readyPath), readyBytes, stderr)
     fs.unlinkSync(readyPath)
@@ -64,7 +68,7 @@ test('PowerShell FileStream delete-on-close probe records host semantics for nor
 // Cold native ACL/PowerShell setup plus Job launch exceeded the old total
 // minute before the body could assert anything on both CI architectures.
 // Keep the actual readiness, cancellation and disappearance deadlines below.
-test('native Windows forced process-tree termination releases the kernel-owned tool lease', { skip: process.platform !== 'win32', timeout: 180000 }, async t => {
+test('native Windows forced process-tree termination releases the asynchronous kernel-owned tool lease', { skip: process.platform !== 'win32', timeout: 180000 }, async t => {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'tool-lease-native-')))
   ensureWindowsPrivateAcl(root)
   const lockPath = path.join(root, 'server.lock'), lockBytes = Buffer.from(JSON.stringify({ nonce: 'native-delete-on-close' }))
@@ -118,7 +122,7 @@ test('native Windows forced process-tree termination releases the kernel-owned t
     }
   })
   const modulePath = path.join(__dirname, '../../scripts/harness-v2-windows-tool-lease.cjs')
-  const source = `const fs=require('node:fs');try{const lease=require(${JSON.stringify(modulePath)}).createWindowsToolLease({lockPath:process.argv[1],lockBytes:Buffer.from(process.argv[2],'base64')});lease.assertHeld();fs.writeFileSync(process.argv[3],'ready',{flag:'wx'});setInterval(()=>{},1000)}catch(error){try{fs.appendFileSync(process.argv[4],JSON.stringify({name:error.name,code:error.code,message:error.message,stack:error.stack})+'\\n')}catch{};throw error}`
+  const source = `const fs=require('node:fs');(async()=>{const lease=await require(${JSON.stringify(modulePath)}).createWindowsToolLeaseAsync({lockPath:process.argv[1],lockBytes:Buffer.from(process.argv[2],'base64')});lease.assertHeld();fs.writeFileSync(process.argv[3],'ready',{flag:'wx'});setInterval(()=>{},1000)})().catch(error=>{try{fs.appendFileSync(process.argv[4],JSON.stringify({name:error.name,code:error.code,message:error.message,stack:error.stack})+'\\n')}catch{};process.exitCode=1})`
   stage('before-owner-launch')
   try {
     launched = await owner.launch({ executable: process.execPath, argv: ['-e', source, lockPath, lockBytes.toString('base64'), readyPath, childLogPath], cwd: root,
@@ -137,7 +141,7 @@ test('native Windows forced process-tree termination releases the kernel-owned t
   assert.equal(fs.readFileSync(readyPath, 'utf8'), 'ready')
   assert.deepEqual(fs.readFileSync(lockPath), lockBytes)
   stage('before-assertHeld')
-  // The receipt is written only after createWindowsToolLease().assertHeld().
+  // The receipt is written only after createWindowsToolLeaseAsync().assertHeld().
   const leaseExists = fs.existsSync(lockPath)
   assert.equal(leaseExists, true)
   stage('after-assertHeld')

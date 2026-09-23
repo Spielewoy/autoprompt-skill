@@ -6,9 +6,11 @@ const os = require('node:os')
 const path = require('node:path')
 const net = require('node:net')
 const cp = require('node:child_process')
+const { PassThrough } = require('node:stream')
 const test = require('node:test')
 const tools = require('../../scripts/harness-v2-tool-boundary.cjs')
 const serverFile = path.resolve(__dirname, '../../scripts/harness-v2-tool-server.cjs')
+const toolServer = require('../../scripts/harness-v2-tool-server.cjs')
 
 function fixture(t, readOnly = true) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-tools-test-'))
@@ -32,6 +34,78 @@ async function requireSandbox(t) {
   return false
 }
 function quote(value) { return `'${value.replaceAll("'", "'\\''")}'` }
+
+function injectedServer(t, leaseFactory) {
+  const f = fixture(t), bound = tools.prepareBoundary({ provider: 'reasonix', root: f.controller, policy: { ...f.policy, provider: 'reasonix' } })
+  const input = new PassThrough(), output = new PassThrough(), messages = []
+  let pending = '', notify
+  output.on('data', bytes => {
+    pending += bytes.toString()
+    let index
+    while ((index = pending.indexOf('\n')) !== -1) { messages.push(JSON.parse(pending.slice(0, index))); pending = pending.slice(index + 1); notify?.() }
+  })
+  const server = toolServer.start({ boundary: bound, input, output, platform: 'win32', windowsLeaseFactory: leaseFactory })
+  const waitMessage = async () => {
+    if (messages.length) return messages.shift()
+    await new Promise(resolve => { notify = resolve })
+    notify = null
+    return messages.shift()
+  }
+  t.after(async () => { input.end(); await server.closed })
+  return { f, input, server, waitMessage, messages }
+}
+
+test('Windows MCP initialization is prompt while capability requests await the exact lease', async t => {
+  let factoryCalled = false, asserted = 0, released = 0
+  const s = injectedServer(t, async () => { factoryCalled = true; await new Promise(resolve => setTimeout(resolve, 50)); return { assertHeld() { asserted++ }, async release() { released++ } } })
+  s.input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } })}\n`)
+  const initialized = await s.waitMessage()
+  assert.equal(initialized.result.protocolVersion, '2025-11-25')
+  assert.equal(factoryCalled, false, 'initialization must not wait for Windows lease creation')
+  s.input.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
+  s.input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`)
+  const listed = await s.waitMessage()
+  assert.deepEqual(listed.result.tools.map(tool => tool.name), ['read', 'list', 'search', 'write', 'edit', 'bash'])
+  assert.equal(factoryCalled, true); assert.equal(asserted, 1)
+  s.input.end(); await s.server.closed
+  assert.equal(released, 1)
+})
+
+test('Windows MCP lease rejection fails closed before tools are exposed', async t => {
+  const s = injectedServer(t, () => { const error = new Error('lease unavailable'); error.code = 'TOOL_LEASE_UNAVAILABLE'; throw error })
+  s.input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } })}\n`)
+  assert.equal((await s.waitMessage()).result.protocolVersion, '2025-11-25')
+  s.input.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
+  s.input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`)
+  const failed = await s.waitMessage()
+  assert.equal(failed.error.code, -32603)
+  await s.server.closed
+  assert.equal(s.messages.length, 0)
+})
+
+test('Windows MCP parent close during lease admission cancels queued tools and releases the late lease', async t => {
+  let releaseLease, released = 0
+  const pending = new Promise(resolve => { releaseLease = resolve })
+  const s = injectedServer(t, () => pending)
+  s.input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } })}\n`)
+  await s.waitMessage()
+  s.input.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
+  s.input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`)
+  await new Promise(resolve => setImmediate(resolve))
+  s.input.end()
+  await new Promise(resolve => setImmediate(resolve))
+  releaseLease({ assertHeld() {}, async release() { released++ } })
+  await s.server.closed
+  assert.equal(released, 1)
+  assert.equal(s.messages.some(message => message.result?.tools), false)
+  assert.equal(s.messages[0].error.code, -32800)
+})
+
+test('Windows MCP closes after lease failure even when no protocol request arrives', async t => {
+  const s = injectedServer(t, async () => { throw new Error('lease startup failed') })
+  await s.server.closed
+  assert.equal(s.messages.length, 0)
+})
 
 test('physical tools read and search without allowing authority expansion or candidate writes', async t => {
   const f = fixture(t)

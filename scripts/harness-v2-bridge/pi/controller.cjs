@@ -9,6 +9,27 @@ const boundary = require('../../harness-v2-tool-boundary.cjs')
 const NAMES = Object.freeze(boundary.TOOLS.map(tool => `autoprompt_owned_${tool.name}`))
 const fail = (code, message) => { throw new boundary.BoundaryError(code, message) }
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value)
+function failureCode(error, aborted = false) {
+  if (aborted) return 'TOOL_CANCELLED'
+  const code = error?.code
+  return typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : 'TOOL_FAILED'
+}
+
+function openDiagnostic(root, nonce) {
+  const file = path.join(root, `pi-handler-${nonce}.jsonl`)
+  const fd = fs.openSync(file, 'wx', 0o600)
+  let closed = false, written = 0
+  return Object.freeze({ file,
+    write(event, phase, details = {}) {
+      if (closed) return
+      const record = { schemaVersion: 1, timestamp: new Date().toISOString(), event, phase, ...details }
+      const bytes = Buffer.from(`${boundary.canonicalJson(record)}\n`)
+      if (written + bytes.length > 1024 * 1024) return
+      try { written += fs.writeSync(fd, bytes) } catch { /* Diagnostics never alter controller authority. */ }
+    },
+    close() { if (!closed) { closed = true; try { fs.closeSync(fd) } catch {} } },
+  })
+}
 
 function privateState(state, paths = []) {
   for (const file of [state.root, ...paths.filter(Boolean)]) {
@@ -27,9 +48,18 @@ function openController(provider, environment = process.env) {
   if (state.policy.provider !== provider) fail('TOOL_POLICY_INVALID', 'Tool policy provider mismatch')
   privateState(state)
   const lockPath = path.join(state.root, 'server.lock')
-  const lockBytes = JSON.stringify({ pid: process.pid, nonce: crypto.randomUUID(), policySha256: digest })
+  const nonce = crypto.randomUUID().replaceAll('-', '')
+  const lockBytes = JSON.stringify({ pid: process.pid, nonce, policySha256: digest })
   const fd = fs.openSync(lockPath, 'wx', 0o600)
   try { fs.writeFileSync(fd, lockBytes); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
+  let diagnostic
+  try { diagnostic = openDiagnostic(state.root, nonce) } catch (error) {
+    try {
+      boundary.physical(lockPath)
+      if (fs.readFileSync(lockPath, 'utf8') === lockBytes) fs.unlinkSync(lockPath)
+    } catch {}
+    throw error
+  }
   let chain = Promise.resolve(), closing = false, closePromise
   const pending = new Set()
   function check() {
@@ -49,6 +79,7 @@ function openController(provider, environment = process.env) {
         boundary.physical(lockPath)
         if (fs.readFileSync(lockPath, 'utf8') === lockBytes) fs.unlinkSync(lockPath)
       } catch { /* Preserve changed or stale ownership for controller inspection. */ }
+      diagnostic.close()
     })
     return closePromise
   }
@@ -72,7 +103,11 @@ function openController(provider, environment = process.env) {
         actualResult = await boundary.executeTool(current.policy, tool, args, { signal: controller.signal, controlRoot: current.root })
       } catch (error) {
         // Do not echo host paths/stack traces from filesystem errors into context.
-        const code = error instanceof boundary.BoundaryError ? error.code : 'TOOL_FAILED'
+        // Keep a bounded machine code from trusted runtime boundaries. This is
+        // also enough to distinguish a host cancellation from a launcher or
+        // resource failure without exposing the exception text.
+        const code = failureCode(error, controller.signal.aborted)
+        diagnostic.write('tool_execute', 'failed', { code, aborted: controller.signal.aborted })
         const output = `${code}: ${error instanceof boundary.BoundaryError ? error.message : 'Controller tool execution failed'}`
         actualResult = { tool, status: 'failed', exitCode: null, output, outputSha256: boundary.sha256(output), code }
       }
@@ -92,7 +127,7 @@ function openController(provider, environment = process.env) {
     chain = job.catch(() => {})
     return job
   }
-  return { execute, close, check, state, get closing() { return closing } }
+  return { execute, close, check, state, diagnostic, get closing() { return closing } }
 }
 
 // Translate only the controller's fixed schemas using each host's native schema
@@ -188,6 +223,22 @@ function install(pi, provider, Type, environment = process.env) {
     const allowed = allowedTools()
     return active.length === allowed.length && active.every(name => allowed.includes(name))
   }
+  const trace = (event, handler, initialize = false) => (...args) => {
+    let pending = false
+    if (initialize && !controller) controller = openController(provider, environment)
+    controller?.diagnostic.write(event, 'started')
+    const timer = setTimeout(() => { pending = true; controller?.diagnostic.write(event, 'pending') }, 25000)
+    timer.unref?.()
+    return Promise.resolve().then(() => handler(...args)).then(result => {
+      clearTimeout(timer)
+      controller?.diagnostic.write(event, 'completed', { exceededWarningThreshold: pending })
+      return result
+    }, error => {
+      clearTimeout(timer)
+      controller?.diagnostic.write(event, 'failed', { code: failureCode(error) })
+      throw error
+    })
+  }
   const activate = (_event, ctx) => {
     context = ctx
     if (activation) return activation
@@ -200,10 +251,10 @@ function install(pi, provider, Type, environment = process.env) {
           privateState(controller.check(), [ctx.cwd, ctx.sessionManager?.getSessionFile?.(), environment.HOME])
           return
         }
+        if (!controller) controller = openController(provider, environment)
         ready = false
         await pi.setActiveTools([])
         if (stopped) fail('TOOL_CLOSED', 'Controller is closed')
-        if (!controller) controller = openController(provider, environment)
         if (controller.closing) fail('TOOL_CLOSED', 'Controller is closed')
         privateState(controller.check(), [ctx.cwd, ctx.sessionManager?.getSessionFile?.(), environment.HOME])
         await pi.setActiveTools([...allowedTools()])
@@ -216,13 +267,13 @@ function install(pi, provider, Type, environment = process.env) {
     pending.finally(() => { if (activation === pending) activation = undefined }).catch(() => {})
     return pending
   }
-  pi.on('tool_call', async event => {
+  pi.on('tool_call', trace('tool_call', async event => {
     try { if (activation) await activation } catch { /* A failed activation stays closed. */ }
     if (!ready || controller?.closing || !allowedTools().includes(event.toolName)) {
       return { block: true, reason: 'TOOL_DENIED: Only the assigned controller tools are available' }
     }
-  })
-  pi.on('tool_result', async (event, ctx) => {
+  }))
+  pi.on('tool_result', trace('tool_result', async (event, ctx) => {
     if (!NAMES.includes(event.toolName) || !event.details?.actualResult) return
     const { actualResult, receiptSha256 } = event.details
     try {
@@ -240,7 +291,7 @@ function install(pi, provider, Type, environment = process.env) {
     // the error flag while preserving the committed JSON, including denials.
     return { content: [{ type: 'text', text: JSON.stringify(actualResult) }],
       details: event.details, isError: actualResult.status !== 'completed' }
-  })
+  }))
   pi.on('before_provider_request', event => {
     if (!controller) fail('TOOL_DENIED', 'Pi controller is not active')
     return bindOpenAIResponseFormat(event?.payload, openAIResponseFormat(controller.state, environment), openAIOutputCap(environment))
@@ -260,9 +311,9 @@ function install(pi, provider, Type, environment = process.env) {
       }
     },
   })
-  pi.on('session_start', activate)
-  pi.on('before_agent_start', activate)
-  pi.on('turn_start', activate)
+  pi.on('session_start', trace('session_start', activate, true))
+  pi.on('before_agent_start', trace('before_agent_start', activate, true))
+  pi.on('turn_start', trace('turn_start', activate, true))
   // A reservation owns exactly one native history. Resume uses another process.
   for (const event of ['session_before_switch', 'session_before_branch', 'session_before_tree']) {
     pi.on(event, async () => ({ cancel: true }))
@@ -284,4 +335,4 @@ function install(pi, provider, Type, environment = process.env) {
   })
   return { close, get controller() { return controller } }
 }
-module.exports = { NAMES, privateState, openController, parameters, openAIResponseFormat, openAIOutputCap, bindOpenAIResponseFormat, install }
+module.exports = { NAMES, privateState, openController, parameters, openAIResponseFormat, openAIOutputCap, bindOpenAIResponseFormat, failureCode, install }

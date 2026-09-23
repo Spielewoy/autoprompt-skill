@@ -206,6 +206,9 @@ test('adapter preserves a primary native exit while relay shutdown records one u
   runner.stop = async () => { stopCalls++; return { drained: true } }
   runner.run = async spec => {
     const request = JSON.parse(fs.readFileSync(spec.env.AUTOPROMPT_VSCODE_OWNED_REQUEST, 'utf8'))
+    // The transport now requires the extension-host's authenticated terminal
+    // acknowledgement independently of the mocked native process outcome.
+    await require('../../scripts/harness-v2-bridge/vscode/event-channel.cjs').connect(request.eventChannel).complete()
     const before = upstreamStarted
     const pending = fetch(`${request.connection.baseUrl}/chat/completions`, {
       method: 'POST', headers: { 'content-type': 'application/json' },

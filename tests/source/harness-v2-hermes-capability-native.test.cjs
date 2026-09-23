@@ -148,6 +148,24 @@ function fixtureFailureDiagnostic(f, error) {
     output.proxy.push({ name, text: fs.readFileSync(file, 'utf8').slice(-4096) })
     if (output.proxy.length >= 4) break
   }
+  // Hermes catches plugin import/registration errors and records them in its
+  // private home log. Preserve that original cause before fixture cleanup.
+  output.hermesLogs = []
+  const logs = path.join(f.nativeRoot, 'hermes', native.sha256(f.record.sessionId), 'logs')
+  for (const name of ['agent.log', 'errors.log']) {
+    let fd
+    try {
+      const file = path.join(logs, name), item = fs.lstatSync(file)
+      if (!item.isFile() || item.isSymbolicLink() || item.nlink !== 1 || item.size > 16 * 1024 * 1024) continue
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+      const opened = fs.fstatSync(fd)
+      if (opened.dev !== item.dev || opened.ino !== item.ino) continue
+      const bytes = Buffer.alloc(Math.min(opened.size, 16384))
+      const read = fs.readSync(fd, bytes, 0, bytes.length, Math.max(0, opened.size - bytes.length))
+      output.hermesLogs.push({ name, text: bytes.subarray(0, read).toString('utf8') })
+    } catch { /* Missing private logs are diagnostic absence, not success. */ }
+    finally { if (fd !== undefined) fs.closeSync(fd) }
+  }
   while (Buffer.byteLength(JSON.stringify(output)) > 65536 && output.stdoutEvents.length) output.stdoutEvents.shift()
   console.error(JSON.stringify(output))
 }
@@ -163,8 +181,17 @@ async function scenario(t, config = {}) {
   let releaseFinal; const finalReleased = new Promise(resolve => { releaseFinal = resolve }); let heldFinal
   const finalHeld = new Promise(resolve => { heldFinal = resolve })
   const service = await modelService({ tool: config.tool || { name: 'autoprompt_owned_bash', args: { command } }, hold: config.hold, holdFinal: config.holdFinal, releaseFinal: finalReleased, finalHeld: () => heldFinal() })
-  let owner
-  t.after(async () => { await cleanupNativeFixture(f, 'hermes', { stop: () => owner?.cancelAll({ reason: 'hermes native capability cleanup', graceMs: 0, killMs: 2000, waitForPending: true }), close: async () => { service.server.closeAllConnections?.(); await new Promise(resolve => service.server.close(resolve)) } }) })
+  let owner, fixtureClosing = false
+  const activeLaunches = new Set(), launchControllers = new Set()
+  t.after(async () => { await cleanupNativeFixture(f, 'hermes', { stop: async () => {
+    fixtureClosing = true
+    for (const controller of launchControllers) controller.abort()
+    // A launch may still be preparing before it enters ProcessOwner. Its
+    // promise must settle before the final drain fence and directory removal.
+    await Promise.allSettled([...activeLaunches])
+    await owner?.cancelAll({ reason: 'hermes native capability cleanup', graceMs: 0, killMs: 2000, waitForPending: true })
+    await owner?.assertDrained()
+  }, close: async () => { service.server.closeAllConnections?.(); await new Promise(resolve => service.server.close(resolve)) } }) })
   service.releaseFinal = releaseFinal; service.finalHeld = finalHeld
   const binding = native.probeExecutable({ provider: 'hermes', executable: CLI, env: { PATH: process.env.PATH } })
   owner = ownership(f)
@@ -191,7 +218,7 @@ async function scenario(t, config = {}) {
     }
   }
   const adapter = new HarnessExecAdapter({ provider: 'hermes', runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: { model: 'fixture/model', modelProvider: 'custom', environment: { HERMES_BASE_URL: 'http://127.0.0.1:' + service.port + '/v1' } }, credentialEnvironment: { OPENROUTER_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only assigned controller tools and return one JSON object.' })
-  const run = async (overrides = {}) => {
+  const launch = async (overrides = {}) => {
     const record = { ...f.record, ...overrides }
     record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, { ...nativeEnvironment(), PATH: path.dirname(CLI) + path.delimiter + (process.env.PATH || ''), LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' })
     record.signal = overrides.signal || AbortSignal.timeout(120000)
@@ -200,6 +227,15 @@ async function scenario(t, config = {}) {
     catch (error) { try { fixtureFailureDiagnostic({ ...f, service }, error) } catch {} throw error }
     assert.ok(service.requests.some(request => JSON.stringify(request.messages).includes('CLOSED_CANARY_CHALLENGE:' + f.challenge)), 'actual Hermes controller output omitted canary challenge')
     return result
+  }
+  const run = (overrides = {}) => {
+    if (fixtureClosing) return Promise.reject(new Error('Hermes fixture is closing'))
+    const controller = new AbortController()
+    launchControllers.add(controller)
+    const operation = launch({ ...overrides, signal: AbortSignal.any([controller.signal, overrides.signal || AbortSignal.timeout(120000)]) })
+    activeLaunches.add(operation)
+    operation.finally(() => { activeLaunches.delete(operation); launchControllers.delete(controller) }).catch(() => {})
+    return operation
   }
   return { ...values, service, binding, owner, adapter, processAdapter, run }
 }
@@ -303,13 +339,17 @@ test('hermes closed native capability: continuation resumes and foreign target i
   const foreign = privateDirectory(path.join(f.root, 'foreign'))
   await assert.rejects(f.adapter.launch({ ...f.record, reservationId: crypto.randomUUID(), continuationId: first.contextId, workingDirectory: foreign, environment: prepareProcessLaunchEnvironment(f.processAdapter, crypto.randomUUID(), nativeEnvironment()), signal: AbortSignal.timeout(30000) }), { code: 'SESSION_ID_MISMATCH' })
 })
-test('hermes closed native capability: cancellation drains held child while sibling succeeds', options, async t => {
+// This case includes two independent cold native fixtures and two launches.
+// Keep each launch's existing deadline; allow both setup/drain paths to finish.
+test('hermes closed native capability: cancellation drains held child while sibling succeeds', { ...options, timeout: 600000 }, async t => {
   const held = await scenario(t, { command: values => readCommand(values.candidate), hold: true }), controller = new AbortController(), pending = held.run({ signal: controller.signal })
   pending.catch(() => {})
-  for (let index = 0; index < 800 && held.service.requests.length === 0; index++) await wait(25)
-  assert.ok(held.service.requests.length > 0, 'held child did not reach a real model request')
-  const fast = await scenario(t, { command: values => readCommand(values.candidate) }); const result = await fast.run({}); successful(result)
-  controller.abort(); await assert.rejects(pending, { code: 'CHILD_CANCELLED' }); assert.deepEqual(held.owner.ownershipIdentities(), []); assert.equal(result.ok, true)
+  try {
+    await require('../helpers/native-platform.cjs').waitForNativeObservation(pending,
+      () => held.service.requests.length > 0, 120000, 'Hermes held child model request')
+    const fast = await scenario(t, { command: values => readCommand(values.candidate) }); const result = await fast.run({}); successful(result)
+    controller.abort(); await assert.rejects(pending, { code: 'CHILD_CANCELLED' }); assert.deepEqual(held.owner.ownershipIdentities(), []); assert.equal(result.ok, true)
+  } finally { controller.abort(); await pending.catch(() => {}) }
 })
 test('Hermes owned adapter retains authentic usage arriving during cancellation drain', options, async t => {
   const f = await scenario(t, { holdFinal: true }), controller = new AbortController()

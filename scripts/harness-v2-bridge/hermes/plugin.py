@@ -2,7 +2,9 @@
 import atexit
 import json
 import os
+import re
 import subprocess
+import sys
 import threading
 
 TOOLS = (
@@ -18,10 +20,16 @@ class Controller:
     def __init__(self):
         node = os.environ["AUTOPROMPT_NODE"]
         server = os.environ["AUTOPROMPT_TOOL_SERVER"]
-        self.proc = subprocess.Popen([node, server, "--policy", os.environ["AUTOPROMPT_TOOL_POLICY"], "--sha256", os.environ["AUTOPROMPT_TOOL_POLICY_SHA256"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        # The owned wrapper captures stderr outside model context. Preserve
+        # startup errors there instead of silently losing registration failures.
+        self.proc = subprocess.Popen([node, server, "--policy", os.environ["AUTOPROMPT_TOOL_POLICY"], "--sha256", os.environ["AUTOPROMPT_TOOL_POLICY_SHA256"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
         self.lock, self.next_id = threading.Lock(), 1
-        self.request("initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "autoprompt-hermes", "version": "0.1"}})
-        self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"); self.proc.stdin.flush()
+        try:
+            self.request("initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "autoprompt-hermes", "version": "0.1"}})
+            self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"); self.proc.stdin.flush()
+        except BaseException:
+            self.close()
+            raise
     def request(self, method, params):
         with self.lock:
             request_id = self.next_id; self.next_id += 1
@@ -31,7 +39,13 @@ class Controller:
                 if not line: raise RuntimeError("Controller tool server closed")
                 reply = json.loads(line)
                 if reply.get("id") != request_id: continue
-                if "error" in reply: raise RuntimeError("Controller tool request failed")
+                if "error" in reply:
+                    failure = reply.get("error")
+                    data = failure.get("data") if isinstance(failure, dict) else None
+                    code = data.get("code") if isinstance(data, dict) else None
+                    if not isinstance(code, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code): code = "TOOL_SERVER_FAILED"
+                    print("AUTOPROMPT_HERMES_CONTROLLER_FAILURE:" + code, file=sys.stderr, flush=True)
+                    raise RuntimeError("Controller tool request failed: " + code)
                 return reply["result"]
     def call(self, name, params):
         result = self.request("tools/call", {"name": name, "arguments": params})

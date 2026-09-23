@@ -14,10 +14,11 @@ const { createRequestQuota } = require('./harness-v2-request-quota.cjs')
 const { createQuotaRelay, isQuotaRelayCloseAbort } = require('./harness-v2-quota-relay.cjs')
 const { quotaConnection } = require('./harness-v2-quota-connection.cjs')
 const routeDecision = require('../agents/codex/workflow/route-decision.js')
-const { createUnixRelay } = require('./harness-v2-bridge/grok/unix-relay.cjs')
+const { createUnixRelay, createWindowsRelayPath } = require('./harness-v2-bridge/grok/unix-relay.cjs')
 const { createHostMcpRelay } = require('./harness-v2-bridge/grok/host-mcp-relay.cjs')
 const { createSandboxLaunch } = require('./harness-v2-bridge/grok/sandbox-launch.cjs')
 const { sseCalls, strictSse, validateToolCall, nativeRequestIdentity } = require('./harness-v2-bridge/grok/model-proxy.cjs')
+const vscodeEventChannel = require('./harness-v2-bridge/vscode/event-channel.cjs')
 const { fail, descriptor, readBound, sha256, privateDirectory, writePrivate } = native
 const integer = value => Number.isSafeInteger(value) && value >= 0
 const object = value => value && typeof value === 'object' && !Array.isArray(value)
@@ -62,6 +63,21 @@ function claudeStructuredOutputEnforcement(event) {
 // zero-tool launch. Keep every other provider on the existing canonical wire
 // until it has an equally enforceable zero-tool projection.
 const ROUTE_ADVISORY_PROVIDERS = new Set(['claude', 'opencode', 'kilo'])
+
+function vscodeEventEndpoint(launchRoot, alias, record) {
+  const key = sha256(JSON.stringify([record.sessionId, record.reservationId]))
+  if (process.platform === 'win32') return `\\\\.\\pipe\\autoprompt-vscode-${crypto.randomBytes(32).toString('hex')}`
+  if (process.platform === 'darwin') {
+    if (!alias?.userDataDir) fail('VSCODE_EVENT_CHANNEL_INVALID', 'Darwin VS Code event channel requires the authenticated IPC alias')
+    const parent = path.join(alias.userDataDir, 't')
+    fs.mkdirSync(parent, { recursive: true, mode: 0o700 })
+    return path.join(parent, 'autoprompt-events.sock')
+  }
+  if (typeof process.getuid !== 'function') fail('VSCODE_EVENT_CHANNEL_INVALID', 'VS Code event channel cannot bind a private POSIX root')
+  const root = path.join('/tmp', `ap-vscode-events-${process.getuid()}`)
+  privateDirectory(root)
+  return path.join(root, `${key}.sock`)
+}
 
 // Route analysis is advisory only.  Its native request must not carry the
 // large worker/checker topology contract or any executable tool definitions:
@@ -1248,6 +1264,38 @@ class HarnessExecAdapter {
     Object.assign(this, options); this.connection = options.connection || options.config
   }
   async recoverResources(options = {}) {
+    if (this.provider === 'grok' && process.platform === 'win32') {
+      const root = path.join(this.nativeRoot, 'grok'), result = { cleaned: 0, retained: [] }
+      if (!fs.existsSync(root)) return result
+      const { auditPrivatePermissions } = require('../agents/codex/workflow/safe-run-root.js')
+      const physicalDirectory = directory => { privateDirectory(directory); auditPrivatePermissions(directory, { recurse: false }) }
+      physicalDirectory(root)
+      const directories = parent => fs.readdirSync(parent, { withFileTypes: true }).filter(entry => /^[a-f0-9]{64}$/u.test(entry.name)).map(entry => {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok recovery directory is not physical')
+        const directory = path.join(parent, entry.name); physicalDirectory(directory); return directory
+      })
+      let count = 0
+      for (const context of directories(root)) for (const reservation of directories(context)) {
+        const controlRoot = path.join(reservation, 'broker-control')
+        if (!fs.existsSync(controlRoot)) continue
+        physicalDirectory(controlRoot)
+        for (const name of fs.readdirSync(controlRoot).filter(name => /^grok-broker-[a-f0-9]{32}\.json$/u.test(name))) {
+          if (++count > 4096) fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok recovery journal discovery exceeded its bound')
+          const brokerRequestPath = path.join(controlRoot, name)
+          try {
+            await require('./harness-v2-bridge/grok/windows-sandbox.cjs').recoverDiscoveredWindowsGrokSandbox({
+              controlRoot, brokerRequestPath, processOwner: this.runner.processOwner, targetKey: this.runner.targetKey,
+            })
+            result.cleaned++
+          } catch (error) {
+            if (!['PROCESS_IDENTITY_INVALID', 'PROCESS_DRAIN_TIMEOUT', 'OWNERSHIP_RECOVERY_PENDING', 'OWNERSHIP_RECOVERY_FATAL'].includes(error.code)) throw error
+            result.retained.push({ brokerRequestPath, code: error.code })
+          }
+        }
+      }
+      if (options.requireDrained && result.retained.length) fail('PROCESS_DRAIN_TIMEOUT', 'Grok resources still require exact process-drain authority', result)
+      return result
+    }
     if (this.provider !== 'vscode' || process.platform !== 'darwin') return { cleaned: 0, retained: [] }
     if (!this.ipcRecoveryPromise) {
       this.ipcRecoveryPromise = (async () => {
@@ -1404,7 +1452,8 @@ class HarnessExecAdapter {
     const abort = () => stop(new native.HarnessError('CHILD_CANCELLED', 'Native execution was aborted'))
     if (signal?.aborted) throw new native.HarnessError('CHILD_CANCELLED', 'Native execution was aborted before launch')
     signal?.addEventListener('abort', abort, { once: true })
-    let result, vscodeIpcAlias = null, vscodeReservationEntered = false
+    let grokWindowsSession = null
+    let result, vscodeIpcAlias = null, vscodeReservationEntered = false, vscodeEvents = null, vscodeEventsDrained = false
     try {
       if (quotaEnabled) {
         const projection = quotaConnection(this.provider, this.connection, record.assignment?.model)
@@ -1434,7 +1483,20 @@ class HarnessExecAdapter {
           processOwner: this.runner.processOwner,
         })
       }
-      spec = native.createLaunch({ provider: this.provider, executable: native.executableRuntimePath(binding), home: path.join(launchRoot, 'home'), ...(vscodeIpcAlias ? { vscodeUserDataDir: vscodeIpcAlias.userDataDir } : {}), sessionRoot, cwd, targetPath: candidatePath, readOnly, commandBoundary, toolBoundary, toolFree: Boolean(routeProjection), prompt, input, continuationId: record.continuationId, connection: projectedConnection, credentials: this.credentialEnvironment, providerConnectionIdentity: this.connection, environment: record.environment, model: record.assignment?.model, effort: this.provider === 'grok' ? grokAssignedEffort : record.assignment?.effort, issuedCalls: preexistingIssuedCalls, proxyToken, maxTokens: nativeMaxTokens, outputSchema: ['claude', 'deepseek', 'grok', 'prime', 'omp'].includes(this.provider) || this.provider === 'vscode' && this.connection?.supportsStructuredOutput === true ? wireSchema : undefined, maxCompletionTokens: this.provider === 'grok' && Number.isSafeInteger(record.providerTokenLimit) && record.providerTokenLimit > 0 ? Math.min(4096, record.providerTokenLimit) : undefined })
+      if (this.provider === 'vscode') {
+        const descriptor = vscodeEventChannel.descriptor({ endpoint: vscodeEventEndpoint(launchRoot, vscodeIpcAlias, record), sessionId: record.sessionId, reservationId: record.reservationId })
+        vscodeEvents = vscodeEventChannel.createServer({ descriptor, allowAliasParent: process.platform === 'darwin',
+          onEvent: raw => { try { stream.push(raw) } catch (error) { stop(error); throw error } },
+          onFailure: error => stop(error),
+        })
+        await vscodeEvents.ready()
+      }
+      if (this.provider === 'grok' && process.platform === 'win32') {
+        grokWindowsSession = require('./harness-v2-bridge/grok/windows-launch.cjs').prepareSession({
+          sessionRoot, launchRoot, grokExecutable: native.executableRuntimePath(binding), nodeExecutable: process.execPath,
+        })
+      }
+      spec = native.createLaunch({ provider: this.provider, executable: native.executableRuntimePath(binding), home: path.join(launchRoot, 'home'), ...(vscodeIpcAlias ? { vscodeUserDataDir: vscodeIpcAlias.userDataDir } : {}), ...(vscodeEvents ? { vscodeEventChannel: vscodeEvents.descriptor } : {}), sessionRoot, ...(grokWindowsSession ? { grokRuntimeProjection: grokWindowsSession.config.runtimeProjection } : {}), cwd, targetPath: candidatePath, readOnly, commandBoundary, toolBoundary, toolFree: Boolean(routeProjection), prompt, input, continuationId: record.continuationId, connection: projectedConnection, credentials: this.credentialEnvironment, providerConnectionIdentity: this.connection, environment: record.environment, model: record.assignment?.model, effort: this.provider === 'grok' ? grokAssignedEffort : record.assignment?.effort, issuedCalls: preexistingIssuedCalls, proxyToken, maxTokens: nativeMaxTokens, outputSchema: ['claude', 'deepseek', 'grok', 'prime', 'omp'].includes(this.provider) || this.provider === 'vscode' && this.connection?.supportsStructuredOutput === true ? wireSchema : undefined, maxCompletionTokens: this.provider === 'grok' && Number.isSafeInteger(record.providerTokenLimit) && record.providerTokenLimit > 0 ? Math.min(4096, record.providerTokenLimit) : undefined })
       if (requiredResponseFormat && boundary.canonicalJson(spec.requiredResponseFormat) !== boundary.canonicalJson(requiredResponseFormat)) fail('PROVIDER_UNSUPPORTED', 'Pi native schema differs from its owned provider boundary')
       // Native configuration isolation discards inherited control-looking fields.
       // Recreate the owner's reservation marker from its trusted adapter only
@@ -1443,7 +1505,7 @@ class HarnessExecAdapter {
         this.runner.processOwner.adapter, record.reservationId, spec.env)
       const prepareLaunch = this.provider !== 'grok' ? undefined : async ({ sessionRoot: relayRoot }) => {
         const config = spec.grok
-        const socketPath = path.join(relayRoot, 'grok-relay.sock')
+        const socketPath = process.platform === 'win32' ? createWindowsRelayPath() : path.join(relayRoot, 'grok-relay.sock')
         const hostMcp = createHostMcpRelay({ boundary: toolBoundary })
         const allowed = Object.fromEntries(Object.entries(config.allowedMcpTools).map(([name, tool]) => [name, input => boundary.validateArguments(tool, input)]))
         let history = [...preexistingIssuedCalls]
@@ -1521,6 +1583,27 @@ class HarnessExecAdapter {
           // therefore receives only this reservation-private working directory;
           // every task operation remains host-owned behind the authenticated MCP
           // relay and is never directly mounted in the native namespace.
+          if (grokWindowsSession) {
+            const resource = await require('./harness-v2-bridge/grok/windows-launch.cjs').prepareLaunch({
+              session: grokWindowsSession, sessionRoot, launchRoot, config: { ...config, issuedCalls: history }, spec,
+              pipe: { socketPath: relayConnectPath }, processOwner: this.runner.processOwner,
+              binding: { sessionId: processSessionId, reservationId: record.reservationId, targetKey: this.runner.targetKey },
+            })
+            return { ...resource, cleanup: async () => {
+              let resourceFailure
+              try { await resource.cleanup() } catch (error) { resourceFailure = error }
+              // Closing private communications cannot restore ACLs or release
+              // retained recovery resources. Always close them even when the
+              // owner cannot yet issue the required drain receipt.
+              const closed = await Promise.allSettled([relay.close(), hostMcp.close()])
+              const failures = closed.filter(item => item.status === 'rejected').map(item => item.reason)
+              if (resourceFailure) {
+                if (failures.length) Object.defineProperty(resourceFailure, 'relayCleanupFailure', { value: new AggregateError(failures, 'Grok host relay cleanup failed') })
+                throw resourceFailure
+              }
+              if (failures.length) throw new AggregateError(failures, 'Grok host relay cleanup failed')
+            } }
+          }
           const nativeCwd = path.join(launchRoot, 'grok-cwd')
           privateDirectory(nativeCwd)
           const launch = createSandboxLaunch({ root: launchRoot, sessionHome: config.sessionHome, grokExecutable: config.executable,
@@ -1547,7 +1630,15 @@ class HarnessExecAdapter {
         vscodeIpcAlias.markReservationEntered()
         vscodeReservationEntered = true
       }
-      result = await this.runner.run({ ...spec, ...(vscodeIpcAlias ? { launchBindingHash: vscodeIpcAlias.launchBindingHash } : {}), ...(this.provider === 'grok' ? { prepareLaunch } : {}), executable: spec.executable || invocation.executable, argv: spec.executable ? spec.argv : invocation.argv, sessionId: processSessionId, reservationId: record.reservationId, onTransportActivity: record.onTransportActivity, onStdoutLine: line => { try { if (this.provider === 'vscode') { const marker = line.indexOf('AUTOPROMPT_EVENT '); if (marker < 0) return; line = line.slice(marker + 'AUTOPROMPT_EVENT '.length) } stream.push(line) } catch (error) { stop(error) } } })
+      result = await this.runner.run({ ...spec, ...(vscodeIpcAlias ? { launchBindingHash: vscodeIpcAlias.launchBindingHash } : {}), ...(this.provider === 'grok' ? { prepareLaunch } : {}), executable: spec.executable || invocation.executable, argv: spec.executable ? spec.argv : invocation.argv, sessionId: processSessionId, reservationId: record.reservationId, onTransportActivity: record.onTransportActivity, onStdoutLine: line => { try { if (this.provider === 'vscode') return; stream.push(line) } catch (error) { stop(error) } } })
+      vscodeEventsDrained = result?.drained === true
+      // A nonzero owned child is already terminal evidence. Its test host may
+      // never reach the driver, so preserve that primary exit rather than
+      // replacing it with the absence of a channel completion frame.
+      if (vscodeEvents) {
+        const channelTermination = nativeTerminationDetails(result)
+        if (channelTermination.exitCode === 0 && channelTermination.signal === null && !result?.aborted) vscodeEvents.assertComplete()
+      }
       if (!streamError && this.provider === 'grok') stream.grokReconcileIssuedCalls(grokIssuedHistory)
       const completedOwnedNativeResult = result?.processOwned === true && result.exactArgv === true && result.drained === true
       let termination = null
@@ -1579,8 +1670,18 @@ class HarnessExecAdapter {
       if (stopPromise) {
         const stopped = await stopPromise
         if (stopped?.drained !== true) fail('PROCESS_DRAIN_TIMEOUT', 'Native cancellation did not drain its owned process group')
+        vscodeEventsDrained = true
       }
     } finally {
+      // The Darwin socket lives below the authenticated short alias. Close and
+      // identity-check it before releasing that alias to avoid a cleanup path
+      // resolving through an already-retired link.
+      if (vscodeEvents && (!runnerStarted || vscodeEventsDrained)) {
+        try { await vscodeEvents.close() } catch (error) {
+          if (!streamError) streamError = error
+          else { try { Object.defineProperty(streamError, 'vscodeEventChannelCleanupFailure', { value: error, enumerable: false, configurable: true }) } catch {} }
+        }
+      } else if (vscodeEvents) vscodeEvents.retain()
       if (vscodeIpcAlias) {
         try {
           if (vscodeReservationEntered) await vscodeIpcAlias.release()

@@ -5,6 +5,7 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const boundary = require('./harness-v2-tool-boundary.cjs')
 const { privateDirectory, writePrivate } = require('../agents/reasonix/workflow/native.js')
+const { buildGrokInlineMcpClient } = require('./harness-v2-bridge/grok/inline-worker-bundle.cjs')
 
 const PINNED_VERSION = '1.0.13'
 // This is the pinned 1.0.13 Chat Completions `ReasoningEffort` enum.  Do not
@@ -21,6 +22,13 @@ const text = (value, name) => { if (typeof value !== 'string' || !value || value
 const payloadText = (value, name) => { if (typeof value !== 'string' || !value || value.includes('\0') || Buffer.byteLength(value) > 4 * 1024 * 1024) fail(name); return value }
 const absolute = (value, name) => { if (!path.isAbsolute(value || '')) fail(name); return value }
 const toml = value => JSON.stringify(String(value))
+function runtimeProjection(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'mcpPort,nodeExecutable,platform,skillsPath' || value.platform !== 'win32') fail('runtime projection')
+  if (!path.win32.isAbsolute(value.nodeExecutable || '') || !path.win32.isAbsolute(value.skillsPath || '')) fail('runtime projection paths')
+  if (!Number.isSafeInteger(value.mcpPort) || value.mcpPort < 1024 || value.mcpPort > 65535) fail('runtime MCP port')
+  return Object.freeze({ platform: 'win32', nodeExecutable: value.nodeExecutable, skillsPath: value.skillsPath, mcpPort: value.mcpPort })
+}
+function tomlArray(values) { return `[${values.map(toml).join(',')}]` }
 function sanitizeConnection(source = {}) {
   if (!source || typeof source !== 'object' || Array.isArray(source) || Object.keys(source).some(key => !['model', 'environment'].includes(key))) fail('connection')
   const result = {}
@@ -52,9 +60,14 @@ function upstreamChatCompletionsUrl(baseUrl) {
   if (!normalizedPath.endsWith('/chat/completions')) parsed.pathname = `${normalizedPath}/chat/completions`
   return parsed.toString()
 }
-function configText({ model, baseUrl, proxyToken, effort, maxCompletionTokens }) {
+function configText({ model, baseUrl, proxyToken, effort, maxCompletionTokens, runtimeProjection: projection }) {
   if (maxCompletionTokens !== undefined && (!Number.isSafeInteger(maxCompletionTokens) || maxCompletionTokens <= 0)) fail('max completion tokens')
-  return `[cli]\nauto_update=false\nuse_leader=false\n[model.${JSON.stringify(model)}]\nmodel=${toml(model)}\nbase_url=${toml(baseUrl)}\napi_key=${toml(proxyToken)}\napi_backend="chat_completions"\ncontext_window=32768\n${effort ? `reasoning_effort=${toml(effort)}\n` : ''}[model.${JSON.stringify(model)}.laziness_detector]\nenabled=false\n[models]\ndefault_reasoning_effort=${toml(effort || 'none')}\n${maxCompletionTokens ? `max_completion_tokens=${maxCompletionTokens}\n` : ''}[features]\n# Background summaries and speculative compaction are outside native terminal usage.\n# Disable them so every authenticated upstream request belongs to the owned execution ledger.\nturn_summary=false\ntitle_refresh=false\ntwo_pass_compaction=false\nsession_recap=false\nauto_wake=false\n[memory]\nenabled=false\n[workflows]\nenabled=false\n[skills]\npaths=["/autoprompt/session/skills"]\nignore=["*"]\ndisabled=["*"]\n[plugins]\npaths=[]\ndisabled=["*"]\n[compat.claude]\nskills=false\nrules=false\nagents=false\nmcps=false\nhooks=false\nsessions=false\n[compat.cursor]\nskills=false\nrules=false\nagents=false\nmcps=false\nhooks=false\nsessions=false\n[mcp_servers.autoprompt_owned]\ncommand="/usr/bin/node"\nargs=["/opt/autoprompt-grok/mcp-loopback.cjs","--port","19778"]\nenabled=true\n`
+  const projected = projection === undefined ? null : runtimeProjection(projection)
+  const mcp = projected ? buildGrokInlineMcpClient({ nodeExecutable: projected.nodeExecutable, port: projected.mcpPort, platform: 'win32' }) : null
+  const skillsPath = projected ? projected.skillsPath : '/autoprompt/session/skills'
+  const command = projected ? mcp.executable : '/usr/bin/node'
+  const args = projected ? mcp.argv : ['/opt/autoprompt-grok/mcp-loopback.cjs', '--port', '19778']
+  return `[cli]\nauto_update=false\nuse_leader=false\n[model.${JSON.stringify(model)}]\nmodel=${toml(model)}\nbase_url=${toml(baseUrl)}\napi_key=${toml(proxyToken)}\napi_backend="chat_completions"\ncontext_window=32768\n${effort ? `reasoning_effort=${toml(effort)}\n` : ''}[model.${JSON.stringify(model)}.laziness_detector]\nenabled=false\n[models]\ndefault_reasoning_effort=${toml(effort || 'none')}\n${maxCompletionTokens ? `max_completion_tokens=${maxCompletionTokens}\n` : ''}[features]\n# Background summaries and speculative compaction are outside native terminal usage.\n# Disable them so every authenticated upstream request belongs to the owned execution ledger.\nturn_summary=false\ntitle_refresh=false\ntwo_pass_compaction=false\nsession_recap=false\nauto_wake=false\n[memory]\nenabled=false\n[workflows]\nenabled=false\n[skills]\npaths=${tomlArray([skillsPath])}\nignore=["*"]\ndisabled=["*"]\n[plugins]\npaths=[]\ndisabled=["*"]\n[compat.claude]\nskills=false\nrules=false\nagents=false\nmcps=false\nhooks=false\nsessions=false\n[compat.cursor]\nskills=false\nrules=false\nagents=false\nmcps=false\nhooks=false\nsessions=false\n[mcp_servers.autoprompt_owned]\ncommand=${toml(command)}\nargs=${tomlArray(args)}\nenabled=true\n`
 }
 function prepare(options = {}) {
   const { sessionHome, toolBoundary, executable, model, baseUrl, proxyToken, prompt, input, continuationId, effort } = options
@@ -67,7 +80,7 @@ function prepare(options = {}) {
   privateDirectory(sessionHome)
   for (const directory of ['config', 'data', 'state', 'cache', 'skills']) privateDirectory(path.join(sessionHome, directory))
   const config = path.join(sessionHome, 'config.toml')
-  const configContents = configText({ model, baseUrl, proxyToken, effort, maxCompletionTokens: options.maxCompletionTokens })
+  const configContents = configText({ model, baseUrl, proxyToken, effort, maxCompletionTokens: options.maxCompletionTokens, runtimeProjection: options.runtimeProjection })
   if (fs.existsSync(config)) {
     // Grok 1.0.13 appends this one marketplace migration marker after its
     // first start. It does not alter a model or executable setting; any other
@@ -89,4 +102,4 @@ function prepare(options = {}) {
   if (continuationId) argv.push('--resume', continuationId)
   return { executable, argv, configPath: config, sessionHome, model, effort: effort || null, receiptPath: current.receiptPath, payloadSha256: crypto.createHash('sha256').update(payload).digest('hex'), allowedMcpTools: Object.fromEntries(OWNED_TOOLS.map(name => [`autoprompt_owned__${name}`, name])) }
 }
-module.exports = { PINNED_VERSION, EFFORTS, OWNED_TOOLS, SYSTEM_PROMPT, sanitizeConnection, selectApiKey, upstreamChatCompletionsUrl, configText, prepare }
+module.exports = { PINNED_VERSION, EFFORTS, OWNED_TOOLS, SYSTEM_PROMPT, sanitizeConnection, selectApiKey, upstreamChatCompletionsUrl, configText, prepare, runtimeProjection }

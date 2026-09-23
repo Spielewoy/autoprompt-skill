@@ -8,12 +8,17 @@ exports.run = async function run() {
   // extension activation without exposing request or credential material.
   console.log('AUTOPROMPT_SESSION_DRIVER_ENTERED')
   try {
-  const vscode = require('vscode')
-  const extension = vscode.extensions.getExtension('autoprompt.autoprompt-native-bridge')
-  if (!extension) throw new Error('Owned Autoprompt extension was not discovered')
-  console.log('AUTOPROMPT_SESSION_DRIVER_BEFORE_EXTENSION_ACTIVATE')
-  const api = await extension.activate()
-  console.log('AUTOPROMPT_SESSION_DRIVER_AFTER_EXTENSION_ACTIVATE')
-  await api.runOwnedSession(event => console.log(`AUTOPROMPT_EVENT ${JSON.stringify(event)}`))
-  } catch (error) { console.log(`AUTOPROMPT_EVENT ${JSON.stringify({ type: 'owned.error', code: error.code || 'CHILD_RUNTIME_FAILURE', message: error.message })}`); throw error }
+    const vscode = require('vscode')
+    const extension = vscode.extensions.getExtension('autoprompt.autoprompt-native-bridge')
+    if (!extension) throw new Error('Owned Autoprompt extension was not discovered')
+    console.log('AUTOPROMPT_SESSION_DRIVER_BEFORE_EXTENSION_ACTIVATE')
+    const api = await extension.activate()
+    console.log('AUTOPROMPT_SESSION_DRIVER_AFTER_EXTENSION_ACTIVATE')
+    if (!api || typeof api.runOwnedSession !== 'function') throw new Error('Owned Autoprompt extension did not provide a session API')
+    const events = require('./event-channel.cjs').connect(api.eventChannel)
+    let sessionError = null
+    try { await api.runOwnedSession(event => events.emit(event)) } catch (error) { sessionError = error }
+    await events.complete()
+    if (sessionError) throw sessionError
+  } catch (error) { throw error }
 }

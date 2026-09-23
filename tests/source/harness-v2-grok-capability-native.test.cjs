@@ -88,6 +88,79 @@ function ownershipRegistry(f) {
   return registryPath
 }
 function scratchFor(f, record = f.record) { return path.join(f.nativeRoot, 'grok', native.sha256(record.sessionId), native.sha256(record.reservationId), 'scratch') }
+const GROK_PROXY_DIAGNOSTIC_MAX_SESSIONS = 8
+const GROK_PROXY_DIAGNOSTIC_MAX_FILE_BYTES = 64 * 1024
+const GROK_PROXY_DIAGNOSTIC_SLICE_BYTES = 2048
+function samePhysicalPath(left, right) {
+  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right
+}
+function physicalSingleLinkRegular(file, maximum) {
+  const item = fs.lstatSync(file, { bigint: true })
+  if (!item.isFile() || item.isSymbolicLink() || item.nlink !== 1n || item.size > BigInt(maximum)) return null
+  const resolved = fs.realpathSync.native(file)
+  if (!samePhysicalPath(resolved, path.join(fs.realpathSync.native(path.dirname(file)), path.basename(file)))) return null
+  return { item, size: Number(item.size) }
+}
+function redactGrokDiagnostic(value) {
+  return String(value)
+    .replace(/local-test-secret/gu, '<redacted>')
+    .replace(/\b((?:OPENROUTER|GROK|XAI|OPENAI)_API_KEY|AUTOPROMPT_GROK_[A-Z0-9_]*TOKEN)\s*([=:])\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu, '$1$2<redacted>')
+    .replace(/\b(Bearer)\s+[A-Za-z0-9._~+\/-]{12,}/gu, '$1 <redacted>')
+}
+function boundedGrokProxyFile(file, parser) {
+  try {
+    const checked = physicalSingleLinkRegular(file, GROK_PROXY_DIAGNOSTIC_MAX_FILE_BYTES)
+    if (!checked) return { status: 'unavailable' }
+    const bytes = fs.readFileSync(file)
+    const after = physicalSingleLinkRegular(file, GROK_PROXY_DIAGNOSTIC_MAX_FILE_BYTES)
+    if (!after || after.item.dev !== checked.item.dev || after.item.ino !== checked.item.ino || after.item.size !== checked.item.size) return { status: 'changed' }
+    return parser(bytes, checked.size)
+  } catch { return { status: 'pending' } }
+}
+function boundedGrokProxyDiagnostic(runner) {
+  const root = runner?.controlRoot
+  if (typeof root !== 'string') return []
+  let entries
+  try { entries = fs.readdirSync(root, { withFileTypes: true }) } catch { return [] }
+  const sessions = entries.filter(entry => entry.isDirectory() && /^[a-f0-9]{32}$/u.test(entry.name))
+  if (sessions.length > GROK_PROXY_DIAGNOSTIC_MAX_SESSIONS) return [{ status: 'directory-limit', count: sessions.length }]
+  return sessions.map(entry => {
+    const directory = path.join(root, entry.name)
+    try {
+      const item = fs.lstatSync(directory, { bigint: true })
+      if (!item.isDirectory() || item.isSymbolicLink()) return { status: 'invalid-directory' }
+    } catch { return { status: 'pending' } }
+    const status = boundedGrokProxyFile(path.join(directory, 'status.json'), bytes => {
+      const value = JSON.parse(bytes.toString('utf8'))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return { status: 'invalid' }
+      return { code: value.code || null, signal: value.signal || null,
+        proxyError: value.error && typeof value.error === 'object' ? { code: value.error.code || null, message: redactGrokDiagnostic(String(value.error.message || '')).slice(0, 512) } : null }
+    })
+    const stderr = boundedGrokProxyFile(path.join(directory, 'stderr.log'), (bytes, size) => {
+      const head = bytes.subarray(0, Math.min(bytes.length, GROK_PROXY_DIAGNOSTIC_SLICE_BYTES))
+      const tail = bytes.subarray(Math.max(0, bytes.length - GROK_PROXY_DIAGNOSTIC_SLICE_BYTES))
+      return { bytes: size, head: redactGrokDiagnostic(head.toString('utf8')), tail: redactGrokDiagnostic(tail.toString('utf8')) }
+    })
+    return { status, stderr }
+  })
+}
+test('Grok fixture proxy diagnostics are bounded, physical, and redact fixture credentials', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-proxy-diagnostic-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const session = path.join(root, 'a'.repeat(32)); fs.mkdirSync(session)
+  fs.writeFileSync(path.join(session, 'status.json'), JSON.stringify({ code: 'CHILD_RUNTIME_FAILURE', error: { code: 'FAILED', message: 'OPENROUTER_API_KEY=local-test-secret' } }))
+  fs.writeFileSync(path.join(session, 'stderr.log'), 'before local-test-secret\nAUTOPROMPT_GROK_RELAY_TOKEN=runtime-token-value\nafter\n')
+  fs.linkSync(path.join(session, 'stderr.log'), path.join(session, 'stderr-copy.log'))
+  assert.equal(boundedGrokProxyDiagnostic({ controlRoot: root })[0].stderr.status, 'unavailable')
+  fs.unlinkSync(path.join(session, 'stderr-copy.log'))
+  const diagnostic = boundedGrokProxyDiagnostic({ controlRoot: root })
+  assert.equal(diagnostic.length, 1)
+  assert.equal(JSON.stringify(diagnostic).includes('local-test-secret'), false)
+  assert.equal(JSON.stringify(diagnostic).includes('runtime-token-value'), false)
+  assert.equal(diagnostic[0].stderr.bytes > 0, true)
+  for (let index = 1; index <= GROK_PROXY_DIAGNOSTIC_MAX_SESSIONS; index++) fs.mkdirSync(path.join(root, index.toString(16).padStart(32, '0')))
+  assert.deepEqual(boundedGrokProxyDiagnostic({ controlRoot: root }), [{ status: 'directory-limit', count: GROK_PROXY_DIAGNOSTIC_MAX_SESSIONS + 1 }])
+})
 function sibling(f, name) { const ids = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: name }; return { ...ids, missionBinding: core.bindCanonicalMissionForChild(f.projection, { ...f.record, ...ids, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }) } }
 function receipts(f, result) {
   const found = []; const visit = directory => { for (const item of fs.readdirSync(directory, { withFileTypes: true })) { const file = path.join(directory, item.name); if (item.isDirectory()) visit(file); else if (item.name === 'policy.json') try { const state = boundary.loadBoundary(file, result.toolBoundaryEvidence.policySha256); found.push(...boundary.readReceipts(state)) } catch {} } }
@@ -102,8 +175,36 @@ async function scenario(t, setup) {
   const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'grok-closed-native-canary', pollMs: 10 })
   const adapter = new HarnessExecAdapter({ provider: 'grok', runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: { model: 'fixture/grok', environment: { GROK_BASE_URL: service.url } }, credentialEnvironment: { OPENROUTER_API_KEY: 'local-test-secret' }, rolePrompt: () => 'Use only controller-owned tools and return exactly one JSON object.', outputSchemaResolver: () => f.schema })
-  const run = async (overrides = {}) => { const record = { ...f.record, ...overrides }; record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment()); record.signal = overrides.signal || AbortSignal.timeout(90000); record.onUsageDelta = () => ({ continue: true }); return adapter.launch(record) }
-  t.after(async () => { await cleanupNativeFixture(f, 'grok', { stop: () => owner.cancelAll({ reason: 'Grok capability cleanup', graceMs: 0, killMs: 2000, waitForPending: true }), close: () => service.close() }) })
+  let fixtureClosing = false
+  const activeLaunches = new Set(), launchControllers = new Set()
+  const launch = async (overrides = {}) => {
+    const record = { ...f.record, ...overrides }
+    record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
+    record.onUsageDelta = () => ({ continue: true })
+    try { return await adapter.launch(record) } catch (error) {
+      t.diagnostic(JSON.stringify({ grokNativeFailure: { code: error?.code || null, message: redactGrokDiagnostic(String(error?.message || error)).slice(0, 512), proxy: boundedGrokProxyDiagnostic(runner) } }))
+      throw error
+    }
+  }
+  const run = (overrides = {}) => {
+    if (fixtureClosing) return Promise.reject(new Error('Grok fixture is closing'))
+    const controller = new AbortController()
+    launchControllers.add(controller)
+    const signals = [controller.signal, overrides.signal || AbortSignal.timeout(90000)]
+    const operation = launch({ ...overrides, signal: AbortSignal.any(signals) })
+    activeLaunches.add(operation)
+    operation.finally(() => { activeLaunches.delete(operation); launchControllers.delete(controller) }).catch(() => {})
+    return operation
+  }
+  t.after(async () => {
+    fixtureClosing = true
+    for (const controller of launchControllers) controller.abort()
+    await Promise.allSettled([...activeLaunches])
+    await cleanupNativeFixture(f, 'grok', { stop: async () => {
+      await owner.cancelAll({ reason: 'Grok capability cleanup', graceMs: 0, killMs: 2000, waitForPending: true })
+      await owner.assertDrained()
+    }, close: () => service.close() })
+  })
   return { ...f, read, secret, marker, calls, service, binding, processAdapter, owner, runner, adapter, run }
 }
 function good(result) { assert.equal(result.ok, true); assert.match(result.contextId, /^[A-Za-z0-9_.:-]{1,256}$/); assert.ok(result.transportEvidence.eventCount > 0); assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/) }

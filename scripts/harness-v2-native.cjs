@@ -1690,11 +1690,15 @@ function createLaunch(options) {
     const prepared = grok.prepare({ sessionHome, toolBoundary: options.toolBoundary,
       executable: options.executable, model: model || connection.model,
       baseUrl: 'http://127.0.0.1:19777/v1', proxyToken, prompt, input,
-      continuationId, effort, outputSchema: options.outputSchema, maxCompletionTokens: options.maxCompletionTokens })
+      continuationId, effort, outputSchema: options.outputSchema, maxCompletionTokens: options.maxCompletionTokens,
+      runtimeProjection: options.grokRuntimeProjection })
     for (const key of descriptor(provider).credentials) delete env[key]
     delete env.GROK_BASE_URL
     return { argv: prepared.argv, env: {}, stdin: '', cwd: options.cwd, shell: false,
       grok: Object.freeze({ sessionHome, model: model || connection.model,
+        ...(options.grokRuntimeProjection ? { runtimeProjection: options.grokRuntimeProjection } : {}),
+        ...(process.platform === 'win32' ? { systemRoot: env.SYSTEMROOT,
+          systemPath: path.win32.join(env.SYSTEMROOT, 'System32') } : {}),
         proxyToken, relayToken, upstreamUrl: grok.upstreamChatCompletionsUrl(connection.environment?.GROK_BASE_URL),
         upstreamAuthorization: `Bearer ${apiKey}`, allowedMcpTools: prepared.allowedMcpTools,
         issuedCalls: options.issuedCalls || [], toolBoundary: options.toolBoundary,

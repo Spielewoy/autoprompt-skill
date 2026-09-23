@@ -4,7 +4,7 @@ const assert = require('node:assert/strict')
 const cp = require('node:child_process')
 const path = require('node:path')
 const test = require('node:test')
-const { buildClosedCommonJsBundle, buildGrokInlineWorker, windowsCommandLineUnits } = require('../../scripts/harness-v2-bridge/grok/inline-worker-bundle.cjs')
+const { buildClosedCommonJsBundle, buildGrokInlineWorker, buildGrokInlineMcpClient, windowsCommandLineUnits } = require('../../scripts/harness-v2-bridge/grok/inline-worker-bundle.cjs')
 
 test('closed inline CommonJS bundle executes with cache, main and virtual filename semantics', () => {
   const bundle = buildClosedCommonJsBundle({
@@ -46,4 +46,22 @@ test('Grok inline worker accounts for node and worker arguments before refusing 
   assert.throws(() => buildGrokInlineWorker({ nodeExecutable: path.resolve(process.execPath), workerArgs: ['x'.repeat(30000)] }), { code: 'GROK_INLINE_BUNDLE_TOO_LARGE' })
   assert.throws(() => buildGrokInlineWorker({ nodeExecutable: path.resolve(process.execPath), nodeArgs: ['--require=host-file.cjs'] }), { code: 'GROK_INLINE_BUNDLE_INVALID' })
   assert.ok(windowsCommandLineUnits('C:\\Program Files\\node.exe', ['-e', 'a b']) > 'C:\\Program Files\\node.exe -e a b'.length)
+})
+
+test('Grok inline MCP client executes the reviewed closed bundle and round-trips a real socket', { timeout: 10000 }, async t => {
+  const net = require('node:net')
+  const server = net.createServer(socket => { socket.on('data', bytes => socket.write(bytes)) })
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
+  t.after(() => new Promise(resolve => server.close(resolve)))
+  const port = server.address().port
+  const bundle = buildGrokInlineMcpClient({ nodeExecutable: path.resolve(process.execPath), port })
+  assert.deepEqual(Object.keys(bundle.moduleSha256), ['mcp-loopback.cjs'])
+  const child = cp.spawn(bundle.executable, bundle.argv, { stdio: ['pipe', 'pipe', 'pipe'] })
+  const output = []; const errors = []
+  child.stdout.on('data', bytes => output.push(bytes)); child.stderr.on('data', bytes => errors.push(bytes))
+  child.stdin.end('{"roundtrip":true}\n')
+  const [code, signal] = await new Promise(resolve => child.once('close', (value, reason) => resolve([value, reason])))
+  assert.equal(code, 0, Buffer.concat(errors).toString())
+  assert.equal(signal, null)
+  assert.equal(Buffer.concat(output).toString(), '{"roundtrip":true}\n')
 })
