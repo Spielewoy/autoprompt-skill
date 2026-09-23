@@ -728,8 +728,9 @@ jobs:
     name: ${{ inputs.windows_regressions == true && 'Windows regressions' || 'Actual Claude 2.1.270' }} / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
     # Windows repeats the fresh process-local command canary in the direct,
-    # packed and public activation suites, including native helper startup.
-    timeout-minutes: ${{ startsWith(matrix.runner.os, 'windows-') && 90 || 45 }}
+    # packed and public activation suites, including native helper startup and
+    # identity-bound worker storage. The previous suite already took 88 minutes.
+    timeout-minutes: ${{ startsWith(matrix.runner.os, 'windows-') && 120 || 45 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(((inputs.windows_regressions == true && inputs.windows_regression_single == true) || (inputs.claude_diagnostic == true && inputs.claude_diagnostic_single == true && inputs.windows_regressions != true)) && '{"runner":[{"os":"windows-latest","arch":"x64"}],"node":["24.x"]}' || (inputs.windows_regressions == true || inputs.claude_diagnostic == true) && '{"runner":[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}' || '{"runner":[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"},{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}') }}
