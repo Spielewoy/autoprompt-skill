@@ -99,19 +99,33 @@ test('Darwin native command sandbox isolates candidate, scratch, controller, net
   const compile = cp.spawnSync('/usr/bin/cc', ['-O2', source, '-o', helperPath], { encoding: 'utf8', timeout: 30000, shell: false })
   assert.equal(compile.status, 0, compile.stderr)
   const backend = sandbox.createDarwinCommandSandbox({ controlRoot: f.control, tempRoot: f.temp, helper: { path: helperPath, sha256: hashFile(helperPath) }, targetKey: 'darwin-command-native-test' })
+  const runCommand = async (...args) => {
+    try { return await backend.command(...args) }
+    catch (error) {
+      const records = []
+      for (const name of fs.readdirSync(f.control, { recursive: true })) {
+        if (!/(?:stderr|status|exit)(?:\.log|\.json|\.txt)?$/.test(name)) continue
+        const file = path.join(f.control, name), stat = fs.lstatSync(file)
+        if (stat.isFile() && !stat.isSymbolicLink() && stat.size <= 65536) records.push({ name, text: fs.readFileSync(file, 'utf8').slice(-8192) })
+        if (records.length >= 8) break
+      }
+      console.error(JSON.stringify({ fixtureFailure: error.code || error.message, records }))
+      throw error
+    }
+  }
   const code = value => `node -e ${JSON.stringify(value)}`
   const net = require('node:net'); let accepted = 0
   const listener = net.createServer(socket => { accepted++; socket.destroy() })
   await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
   t.after(() => new Promise(resolve => listener.close(resolve)))
   const port = listener.address().port
-  await new Promise((resolve, reject) => { const proof = net.connect(port, '127.0.0.1'); proof.once('connect', () => { proof.destroy(); resolve() }); proof.once('error', reject) })
+  await new Promise((resolve, reject) => { const proof = net.connect(port, '127.0.0.1'); proof.once('close', resolve); proof.once('error', reject) })
   assert.equal(accepted, 1, 'controller listener did not accept its control connection'); accepted = 0
-  const readWrite = await backend.command(f.policy, { cwd: f.scratch, command: code(`const fs=require('fs');process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(f.target, 'candidate.txt'))},'utf8'));fs.writeFileSync(${JSON.stringify(path.join(f.scratch, 'proof.txt'))},'scratch')`) })
+  const readWrite = await runCommand(f.policy, { cwd: f.scratch, command: code(`const fs=require('fs');process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(f.target, 'candidate.txt'))},'utf8'));fs.writeFileSync(${JSON.stringify(path.join(f.scratch, 'proof.txt'))},'scratch')`) })
   assert.equal(readWrite.status, 'completed'); assert.equal(fs.readFileSync(path.join(f.scratch, 'proof.txt'), 'utf8'), 'scratch')
-  const denied = await backend.command(f.policy, { cwd: f.scratch, command: code(`const fs=require('fs'),cp=require('child_process'),net=require('net');let failures=0;for(const f of [()=>fs.readFileSync(${JSON.stringify(path.join(f.secret, 'private.txt'))}),()=>fs.writeFileSync(${JSON.stringify(path.join(f.target, 'candidate.txt'))},'bad'),()=>cp.spawnSync('/bin/launchctl',['print','system'])]){try{const r=f();if(r&&r.error) failures++}catch{failures++}}const s=net.connect(${port},'127.0.0.1');s.on('error',()=>{if(++failures===4)process.exit(0)});s.on('connect',()=>process.exit(19));setTimeout(()=>process.exit(failures===4?0:20),500)`) })
+  const denied = await runCommand(f.policy, { cwd: f.scratch, command: code(`const fs=require('fs'),cp=require('child_process'),net=require('net');let failures=0;for(const f of [()=>fs.readFileSync(${JSON.stringify(path.join(f.secret, 'private.txt'))}),()=>fs.writeFileSync(${JSON.stringify(path.join(f.target, 'candidate.txt'))},'bad'),()=>cp.spawnSync('/bin/launchctl',['print','system'])]){try{const r=f();if(r&&r.error) failures++}catch{failures++}}const s=net.connect(${port},'127.0.0.1');s.on('error',()=>{if(++failures===4)process.exit(0)});s.on('connect',()=>process.exit(19));setTimeout(()=>process.exit(failures===4?0:20),500)`) })
   assert.equal(denied.status, 'completed'); assert.equal(fs.readFileSync(path.join(f.target, 'candidate.txt'), 'utf8'), 'candidate bytes'); assert.equal(accepted, 0, 'sandboxed child connected to the controller listener')
-  const abort = new AbortController(); const held = backend.command(f.policy, { cwd: f.scratch, command: code('setInterval(()=>{},1000)') }, { signal: abort.signal, timeoutMs: 30000 })
+  const abort = new AbortController(); const held = runCommand(f.policy, { cwd: f.scratch, command: code('setInterval(()=>{},1000)') }, { signal: abort.signal, timeoutMs: 30000 })
   await new Promise(resolve => setTimeout(resolve, 250)); abort.abort()
   const cancelled = await held
   assert.equal(cancelled.cancelled, true); assert.equal(cancelled.status, 'failed')

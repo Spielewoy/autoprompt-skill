@@ -109,9 +109,10 @@ test('native Darwin launchd coalition survives root death and a fresh adapter dr
   const compiler = fs.realpathSync.native(compilerProbe.stdout.trim())
   assert.equal(path.isAbsolute(compiler), true)
   const compilerVersion = requireSuccess(command(compiler, ['--version']), 'read clang version').stdout.trim()
+  const sdkPath = requireSuccess(command('/usr/bin/xcrun', ['--show-sdk-path']), 'read SDK path').stdout.trim()
   const sdkVersion = requireSuccess(command('/usr/bin/xcrun', ['--show-sdk-version']), 'read SDK version').stdout.trim()
   requireSuccess(command(compiler, [
-    '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', HELPER_SOURCE, '-o', helper,
+    '-isysroot', sdkPath, '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', HELPER_SOURCE, '-o', helper,
   ]), 'compile coalition helper')
   const loadCommands = requireSuccess(command('/usr/bin/otool', ['-l', helper]), 'read helper load commands').stdout
   const buildVersion = /cmd LC_BUILD_VERSION[\s\S]*?platform\s+(\S+)[\s\S]*?minos\s+(\S+)[\s\S]*?sdk\s+(\S+)/.exec(loadCommands)
@@ -143,7 +144,7 @@ int main(int argc, char **argv) {
 `
   fs.writeFileSync(fixtureSource, fixtureText, { mode: 0o600 })
   requireSuccess(command(compiler, [
-    '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', fixtureSource, '-o', fixture,
+    '-isysroot', sdkPath, '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', fixtureSource, '-o', fixture,
   ]), 'compile detached fixture')
   fs.writeFileSync(slowHelperSource, [
     '#include <string.h>',
@@ -157,7 +158,7 @@ int main(int argc, char **argv) {
     '',
   ].join('\n'), { mode: 0o600 })
   requireSuccess(command(compiler, [
-    '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', slowHelperSource, '-o', slowHelper,
+    '-isysroot', sdkPath, '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', slowHelperSource, '-o', slowHelper,
   ]), 'compile delayed helper shim')
 
   const helperBinding = { path: fs.realpathSync.native(helper), sha256: sha256(fs.readFileSync(helper)) }
@@ -188,6 +189,7 @@ int main(int argc, char **argv) {
     helperSourceSha256: sha256(fs.readFileSync(HELPER_SOURCE)),
     compiler: { path: compiler, version: compilerVersion },
     sdkVersion,
+    sdkPath,
     deploymentTarget: process.env.MACOSX_DEPLOYMENT_TARGET || 'compiler-default',
     binaryBuildVersion: { platform: buildVersion[1], minimumOs: buildVersion[2], sdk: buildVersion[3] },
   }

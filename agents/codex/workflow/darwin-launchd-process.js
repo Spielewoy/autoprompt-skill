@@ -209,15 +209,27 @@ function createDarwinCoalitionAdapter(options = {}) {
     },
     async listOwned(value) {
       const { dir, request, ready } = fromGroup(value)
-      if (activeTasks(ready) === 0n) { stopJob(dir, request); if (activeTasks(ready) === 0n) return [] }
-      const pids = members(ready)
-      if (!pids.length) {
-        if (activeTasks(ready) !== 0n) fail('PROCESS_OBSERVATION_FAILED', 'Darwin live coalition changed during enumeration')
-        stopJob(dir, request)
-        if (activeTasks(ready) !== 0n) fail('PROCESS_OBSERVATION_FAILED', 'Darwin coalition became live after job removal')
-        return []
-      }
-      return pids
+      // A task can disappear from BSD's PID table before Mach releases its
+      // coalition reference (also during exec). Retry that transition, keeping
+      // the atomic kernel count as the only authority for an empty result.
+      const deadline = Date.now() + 2000
+      let active
+      do {
+        active = activeTasks(ready)
+        if (active === 0n) {
+          stopJob(dir, request)
+          if (activeTasks(ready) === 0n) return []
+        }
+        const pids = members(ready)
+        if (pids.length) return pids
+        active = activeTasks(ready)
+        if (active === 0n) {
+          stopJob(dir, request)
+          if (activeTasks(ready) === 0n) return []
+        }
+        await delay(25)
+      } while (Date.now() < deadline)
+      fail('PROCESS_OBSERVATION_FAILED', `Darwin coalition ${ready.resourceCoalitionId} has ${active} kernel tasks but no enumerable PIDs`)
     },
     async signalOwned(value, signal) {
       if (!['TERM', 'KILL'].includes(signal)) fail('PROCESS_IDENTITY_INVALID', 'Darwin ownership signal is invalid')
