@@ -32,3 +32,5 @@ release-source/**/*.json text eol=lf
 agents/codex/workflow/windows-worker/bootstrap/*.exe -text
 agents/codex/workflow/windows-worker/bundle/assets/*.br -text
 agents/codex/workflow/windows-worker/notices/THIRD-PARTY-NOTICES.txt -text
+# Preserve authenticated native Mach-O helper bytes.
+agents/codex/workflow/darwin-coalition-runtime/coalition-helper-* -text
