@@ -79,6 +79,9 @@ function renderSeatbeltProfile(policy, options = {}) {
   const metadata = new Set(['/', ...ancestors(node), ...ancestors(temp), ...reads.flatMap(ancestors), ...writes.flatMap(ancestors)])
   const lines = ['(version 1)', '(deny default)',
     ...[...metadata].sort().map(item => `(allow file-read-metadata (literal ${quoted(item)}))`),
+    // dyld opens the root directory while initializing its shared cache.
+    // This grants that directory vnode only, never descendant file contents.
+    '(allow file-read-data (literal "/"))',
     // Node is launched directly. It may only exec the fixed POSIX shell and
     // this exact Node runtime; other programs, including launchctl, remain
     // denied by the default profile.

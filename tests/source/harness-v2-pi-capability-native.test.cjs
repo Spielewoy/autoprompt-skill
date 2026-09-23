@@ -28,6 +28,10 @@ if (process.env.AUTOPROMPT_REQUIRE_NATIVE_TESTS === '1' && !CLIS.prime && !CLIS.
 // Cache only a completed probe: a failed probe must remain retryable.
 const probeBindings = new Map()
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
+// Native Windows AppContainer admission and per-tool materialization take
+// 80–130 seconds in CI110. Keep explicit aborts for cancellation scenarios,
+// while allowing ordinary native calls the same bound as OpenCode/DeepSeek.
+const NATIVE_CALL_TIMEOUT_MS = process.platform === 'win32' ? 300000 : 90000
 
 function probeBinding(provider, cli) {
   const key = `${provider}\0${cli}`
@@ -39,7 +43,7 @@ function probeBinding(provider, cli) {
   return immutable
 }
 
-async function waitForNativeRequest(service, pending, timeoutMs = 30000) {
+async function waitForNativeRequest(service, pending, timeoutMs = process.platform === 'win32' ? 120000 : 30000) {
   let settled = false, failure
   // Observe rejection immediately, even while another native sibling starts.
   pending.then(() => { settled = true }, error => { settled = true; failure = error })
@@ -105,6 +109,15 @@ function fixtureFailureDiagnostic(f, error) {
   // drains the child. This is bounded fixture data, not an ambient log dump.
   const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024),
     stderr: String(f.nativeStderr || '').slice(-8192), events: [...(f.nativeEvents || [])] }
+  const proxy = path.join(f.controller, 'proxy')
+  output.proxy = []
+  for (const name of fs.existsSync(proxy) ? fs.readdirSync(proxy, { recursive: true }) : []) {
+    if (!/(?:^|[\\/])(?:stderr\.log|status\.json)$/.test(name)) continue
+    const file = path.join(proxy, name), stat = fs.lstatSync(file)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) continue
+    output.proxy.push({ name, text: fs.readFileSync(file, 'utf8').slice(-4096) })
+    if (output.proxy.length >= 4) break
+  }
   while (Buffer.byteLength(JSON.stringify(output)) > 65536) output.events.shift()
   console.error(JSON.stringify(output))
 }
@@ -173,7 +186,7 @@ async function scenario(t, provider, options = {}) {
     const run = async (overrides = {}) => {
       const record = { ...f.record, ...overrides }
       record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
-      record.signal = overrides.signal || AbortSignal.timeout(90000)
+      record.signal = overrides.signal || AbortSignal.timeout(NATIVE_CALL_TIMEOUT_MS)
       try { return await adapter.launch(record) }
       catch (error) { fixtureFailureDiagnostic(f, error); throw error }
     }
@@ -200,7 +213,7 @@ function successful(result) {
   assert.match(result.toolBoundaryEvidence.policySha256, /^[a-f0-9]{64}$/)
 }
 
-const options = { skip: !CLIS.prime && !CLIS.omp, timeout: 240000 }
+const options = { skip: !CLIS.prime && !CLIS.omp, timeout: process.platform === 'win32' ? 900000 : 240000 }
 for (const provider of ['prime', 'omp']) {
   const providerOptions = { ...options, skip: options.skip || !CLIS[provider] }
 

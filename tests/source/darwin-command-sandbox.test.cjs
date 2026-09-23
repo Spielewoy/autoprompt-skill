@@ -72,6 +72,8 @@ test('Darwin Seatbelt profile is default-deny and grants only exact roots, fixed
   const f = fixture(t)
   const profile = sandbox.renderSeatbeltProfile(f.policy, { nodePath: process.execPath, tempRoot: f.temp })
   assert.match(profile, /^\(version 1\)\n\(deny default\)/)
+  assert.ok(profile.includes('(allow file-read-data (literal "/"))'))
+  assert.equal(profile.includes('(subpath "/")'), false)
   assert.match(profile, new RegExp(`\\(subpath ${JSON.stringify(f.target).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`))
   assert.match(profile, new RegExp(`\\(subpath ${JSON.stringify(f.scratch).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`))
   assert.match(profile, /\(allow process-exec \(literal "\/bin\/sh"\)\)/)
