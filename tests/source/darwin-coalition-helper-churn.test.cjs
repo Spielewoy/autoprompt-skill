@@ -38,7 +38,8 @@ test('Darwin coalition churn candidate compiles and drains a held coalition with
   output = fs.realpathSync.native(output)
   const boot = run(output, ['boot']); assert.equal(boot.status, 0, boot.stderr)
   const value = JSON.parse(boot.stdout)
-  assert.equal(value.schemaVersion, 1); assert.equal(value.ok, true); assert.match(value.bootUuid, /^[a-f0-9-]{36}$/)
+  assert.equal(value.schemaVersion, 1); assert.equal(value.ok, true)
+  assert.match(value.bootUuid, /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i)
   const fixtureSource = path.join(root, 'churn-fixture.c'), fixture = path.join(root, 'churn-fixture'), state = path.join(root, 'state.txt')
   fs.writeFileSync(fixtureSource, String.raw`#define _DARWIN_C_SOURCE
 #include <fcntl.h>
