@@ -92,18 +92,43 @@ static int bind4(const char *host, const char *text, int reuse) {
   int result = bind(fd, (struct sockaddr *)&address, sizeof(address)) == 0 && listen(fd, 1) == 0 ? 0 : probe_failure("bind4-listen");
   close(fd); return result;
 }
+static int bind6(const char *host, const char *text, int reuse) {
+  struct sockaddr_in6 address; in_port_t port;
+  if (parsed_port(text, &port)) return 64;
+  memset(&address, 0, sizeof(address)); address.sin6_family = AF_INET6; address.sin6_port = port;
+  if (inet_pton(AF_INET6, host, &address.sin6_addr) != 1) return 64;
+  int fd = socket(AF_INET6, SOCK_STREAM, 0), enabled = 1;
+  if (fd < 0) return 65;
+  if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &enabled, sizeof(enabled)) != 0 ||
+      (reuse && (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)) != 0))) { close(fd); return 65; }
+  int result = bind(fd, (struct sockaddr *)&address, sizeof(address)) == 0 && listen(fd, 1) == 0 ? 0 : probe_failure("bind6-listen");
+  close(fd); return result;
+}
 int main(int argc, char **argv) {
   if (argc == 4) {
     if (strcmp(argv[1], "connect4") == 0) return connect4(argv[2], argv[3]);
     if (strcmp(argv[1], "connect6") == 0) return connect6(argv[2], argv[3]);
     if (strcmp(argv[1], "bind4") == 0) return bind4(argv[2], argv[3], 0);
     if (strcmp(argv[1], "bind4-reuse") == 0) return bind4(argv[2], argv[3], 1);
+    if (strcmp(argv[1], "bind6") == 0) return bind6(argv[2], argv[3], 0);
+    if (strcmp(argv[1], "bind6-reuse") == 0) return bind6(argv[2], argv[3], 1);
     return 64;
   }
   if (argc != 5) return 64;
   in_port_t port;
   if (parsed_port(argv[4], &port)) return 64;
   int fd4 = -1, fd6 = -1;
+  if (strcmp(argv[1], "--ipv6-only") == 0) {
+    int result = activate6(argv[2], port, &fd6);
+    int reuse = -1, v6only = -1; socklen_t length = sizeof(int);
+    if (result == 0 && (getsockopt(fd6, SOL_SOCKET, SO_REUSEPORT, &reuse, &length) != 0 || reuse != 0)) result = 6;
+    length = sizeof(int);
+    if (result == 0 && (getsockopt(fd6, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &length) != 0 || v6only != 1)) result = 7;
+    if (result == 0) result = publish(argv[3], port);
+    if (result != 0) { fprintf(stderr, "ipv6 activation refused: result=%d reuse=%d v6only=%d\n", result, reuse, v6only); if (fd6 >= 0) close(fd6); return result; }
+    for (;;) pause();
+  }
   int result = activate4(argv[1], port, &fd4);
   if (result == 0) result = activate6(argv[2], port, &fd6);
   if (result == 0) result = publish(argv[3], port);

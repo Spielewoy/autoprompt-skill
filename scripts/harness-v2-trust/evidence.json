@@ -1416,7 +1416,9 @@
       "schemaVersion": "harness-v2-local-canary-policy.v1",
       "provider": "opencode",
       "platforms": [
-        "linux"
+        "linux",
+        "win32",
+        "darwin"
       ],
       "architectures": [
         "x64",

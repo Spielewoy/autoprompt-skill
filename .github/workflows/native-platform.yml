@@ -11,7 +11,7 @@ on:
         required: false
         default: none
         type: choice
-        options: [none, macos-containment, macos-exclusive-fd, windows-bootstrap, windows-provider-primitives, opencode, opencode-public, vscode, vscode-diagnostic, hermes-macos]
+        options: [none, macos-containment, macos-exclusive-fd, macos-ipv6-loopback, macos-helper-build, windows-bootstrap, windows-provider-primitives, opencode, opencode-public, vscode, vscode-diagnostic, hermes-macos]
       support_provider:
         description: 'Installed provider for the focused provider stage'
         required: false
@@ -1163,6 +1163,66 @@ jobs:
         with:
           name: exclusive-fd-${{ matrix.os }}
           path: darwin-launchd-exclusive-fd.log
+          if-no-files-found: error
+
+  macos-ipv6-loopback:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'macos-ipv6-loopback'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+      - name: Test IPv6-only admission and retained listener ownership
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo -n /sbin/ifconfig lo0 alias 127.0.0.2
+          trap 'sudo -n /sbin/ifconfig lo0 -alias 127.0.0.2' EXIT
+          node --test --test-reporter=tap tests/source/darwin-launchd-ipv6-native.test.cjs 2>&1 | tee darwin-launchd-ipv6.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: ipv6-loopback-${{ matrix.os }}
+          path: darwin-launchd-ipv6.log
+          if-no-files-found: error
+
+  macos-helper-build:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'macos-helper-build'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+      - name: Compile and verify the candidate helper under process churn
+        timeout-minutes: 9
+        shell: bash
+        env:
+          AUTOPROMPT_DARWIN_CANDIDATE_PATH: ${{ runner.temp }}/darwin-coalition-candidate
+          AUTOPROMPT_DARWIN_CANDIDATE_EVIDENCE: ${{ runner.temp }}/darwin-coalition-candidate-proof.json
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/darwin-coalition-churn-api.test.cjs tests/source/darwin-coalition-helper-churn.test.cjs 2>&1 | tee darwin-coalition-candidate.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: coalition-candidate-${{ matrix.os }}
+          path: |
+            darwin-coalition-candidate.log
+            ${{ runner.temp }}/darwin-coalition-candidate
+            ${{ runner.temp }}/darwin-coalition-candidate-proof.json
           if-no-files-found: error
 
   windows-bootstrap:

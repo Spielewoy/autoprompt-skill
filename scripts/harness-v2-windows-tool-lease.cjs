@@ -18,8 +18,12 @@ $stream = [IO.FileStream]::new($leasePath, [IO.FileMode]::CreateNew, [IO.FileAcc
 try {
   $stream.Write($leaseBytes, 0, $leaseBytes.Length)
   $stream.Flush($true)
-  $ready = [IO.FileStream]::new($readyPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+  $readyStagingPath = $readyPath + '.staging'
+  $ready = [IO.FileStream]::new($readyStagingPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
   try { $ready.Write($readyBytes, 0, $readyBytes.Length); $ready.Flush($true) } finally { $ready.Dispose() }
+  # Publish only after closing the writer. A readable FileShare.Read handle
+  # still forbids the controller from deleting the readiness receipt.
+  [IO.File]::Move($readyStagingPath, $readyPath)
   [Console]::In.ReadLine() | Out-Null
 } finally {
   $stream.Dispose()

@@ -18,7 +18,14 @@ test('PowerShell FileStream delete-on-close probe records host semantics for nor
   if (process.platform === 'win32') assert.equal(available.status, 0, `Native Windows PowerShell failed to start: ${available.error?.code || available.stderr?.toString().slice(-1024) || available.signal}`)
   else if (available.status !== 0) return t.skip('PowerShell is unavailable')
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tool-lease-pwsh-'))
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const holders = []
+  t.after(async () => {
+    for (const { child, closed } of holders) {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      await closed
+    }
+    fs.rmSync(root, { recursive: true, force: true })
+  })
   const deleted = []
   for (const forced of [false, true]) {
     const lockPath = path.join(root, forced ? 'forced.lock' : 'normal.lock'), readyPath = `${lockPath}.ready`
@@ -26,15 +33,24 @@ test('PowerShell FileStream delete-on-close probe records host semantics for nor
     const environment = { ...process.env,
       AUTOPROMPT_TOOL_LEASE_PATH_B64: Buffer.from(lockPath).toString('base64'), AUTOPROMPT_TOOL_LEASE_BYTES_B64: lockBytes.toString('base64'),
       AUTOPROMPT_TOOL_LEASE_READY_PATH_B64: Buffer.from(readyPath).toString('base64'), AUTOPROMPT_TOOL_LEASE_READY_BYTES_B64: readyBytes.toString('base64') }
-    const child = childProcess.spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(POWERSHELL_SOURCE, 'utf16le').toString('base64')],
+    // Hold the writer open after its bytes are readable. The published path
+    // must remain absent until the writer closes, even under this schedule.
+    const gatedSource = POWERSHELL_SOURCE.replace('$ready.Flush($true)', "$ready.Flush($true); while (![IO.File]::Exists($readyPath + '.publish')) { Start-Sleep -Milliseconds 10 }")
+    assert.notEqual(gatedSource, POWERSHELL_SOURCE)
+    const child = childProcess.spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(gatedSource, 'utf16le').toString('base64')],
       { env: environment, stdio: ['pipe', 'ignore', 'pipe'] })
     let stderr = ''; child.stderr.on('data', bytes => { stderr += bytes })
+    const closed = new Promise(resolve => { child.once('close', resolve); child.once('error', resolve) })
+    holders.push({ child, closed })
     const deadline = Date.now() + 10000
+    while (!fs.existsSync(`${readyPath}.staging`) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(fs.existsSync(`${readyPath}.staging`), stderr)
+    assert.equal(fs.existsSync(readyPath), false, 'readiness was published while its writer remained open')
+    fs.writeFileSync(`${readyPath}.publish`, '', { flag: 'wx' })
     while ((!fs.existsSync(lockPath) || !fs.existsSync(readyPath)) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
     assert.deepEqual(fs.readFileSync(lockPath), lockBytes, stderr)
     assert.deepEqual(fs.readFileSync(readyPath), readyBytes, stderr)
     fs.unlinkSync(readyPath)
-    const closed = new Promise(resolve => child.once('close', resolve))
     if (forced) child.kill('SIGKILL'); else child.stdin.end('\n')
     await closed
     deleted.push(!fs.existsSync(lockPath))

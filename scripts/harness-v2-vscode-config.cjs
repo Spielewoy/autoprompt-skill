@@ -63,7 +63,7 @@ function project(options, env) {
     fs.mkdirSync(path.join(deepUserDataDir, 't'), { mode: 0o700 })
     env.TMPDIR = env.TMP = env.TEMP = path.join(userDataDir, 't')
   }
-  return ['--no-sandbox', '--disable-gpu', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust',
+  return ['--no-sandbox', '--disable-gpu', '--disable-extensions', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust',
     '--user-data-dir', userDataDir, '--extensions-dir', path.join(options.home, 'extensions'),
     '--extensionDevelopmentPath', path.join(__dirname, 'harness-v2-bridge/vscode'),
     '--extensionTestsPath', path.join(__dirname, 'harness-v2-bridge/vscode/session-driver.cjs')]

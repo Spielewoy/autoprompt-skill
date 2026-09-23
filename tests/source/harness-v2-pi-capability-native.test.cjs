@@ -94,7 +94,10 @@ function fixture(provider) {
     resourceSets: { read: [], write: [], exclusive: [] } }
   const schema = path.join(controller, 'result.schema.json')
   fs.writeFileSync(schema, JSON.stringify({ type: 'object', properties: { ok: { const: true }, marker: { type: ['string', 'null'] } }, required: ['ok', 'marker'], additionalProperties: false }), { mode: 0o600 })
-  return { root, target, controller, nativeRoot, challenge, projection, record, schema }
+  // Keep diagnostic buffers reference-stable: scenario() returns a shallow
+  // copy of this fixture, so replacing these fields later would hide events
+  // from failure diagnostics.
+  return { root, target, controller, nativeRoot, challenge, projection, record, schema, nativeEvents: [], nativeStderr: '' }
 }
 
 function connection(service) {
@@ -114,7 +117,7 @@ function fixtureFailureDiagnostic(f, error) {
   const proxy = path.join(f.controller, 'proxy')
   output.proxy = []
   for (const name of fs.existsSync(proxy) ? fs.readdirSync(proxy, { recursive: true }) : []) {
-    if (!/(?:^|[\\/])(?:stderr\.log|status\.json|proxy-error\.json)$/.test(name)) continue
+    if (!/(?:^|[\\/])(?:stdout\.log|stderr\.log|status\.json|proxy-error\.json)$/.test(name)) continue
     const file = path.join(proxy, name), stat = fs.lstatSync(file)
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) continue
     output.proxy.push({ name, text: fs.readFileSync(file, 'utf8').slice(-4096) })
@@ -173,7 +176,7 @@ async function scenario(t, provider, options = {}) {
     const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: `${provider}-closed-native-canary`, pollMs: 10 })
     const ownedRun = runner.run.bind(runner)
     runner.run = async spec => {
-      f.nativeEvents = []; f.nativeStderr = ''
+      f.nativeEvents.length = 0; f.nativeStderr = ''
       const result = await ownedRun({ ...spec, onStdoutLine: line => {
         f.nativeEvents.push(String(line).slice(-8192))
         if (f.nativeEvents.length > 16) f.nativeEvents.shift()

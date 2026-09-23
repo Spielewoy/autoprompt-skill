@@ -12,6 +12,9 @@ const PIPELINE=Object.freeze(['windows-worker-capture.js','windows-worker-decode
 const INPUTS=Object.freeze(['assets/bash.br','assets/msys.br','assets/node-arm64.br','assets/node-x64.br'])
 const OUTPUTS=Object.freeze(['usr/bin/bash.exe','usr/bin/msys-2.0.dll','usr/bin/node-arm64.exe','usr/bin/node-x64.exe'])
 const ROOT=path.join(__dirname,'windows-worker'),BUNDLE=path.join(ROOT,'bundle')
+// Electron hosts its Node extension runtime in the signed Code.exe image. Keep
+// that controller identity bounded separately from decoded worker payloads.
+const CONTROLLER_HOST_MAX_BYTES=512*1024*1024
 const tuples=new WeakMap()
 let active=null,poison=null,poisonOrigin=null
 function freezeDeep(value){if(value&&typeof value==='object'){for(const item of Object.values(value))freezeDeep(item);Object.freeze(value)}return value}
@@ -138,7 +141,7 @@ async function captureUncached(){
   const available=staticAvailability();need(available.available,'bundle-static-unavailable:'+available.code)
   const arch=process.arch,pin=policy.bootstraps[arch],helper=helperPaths(arch),systemRoot=process.env.SystemRoot
   need(typeof systemRoot==='string'&&/^[a-z]:\\windows$/i.test(systemRoot),'system-root-required')
-  const controllerHash=sha(boundedFile(process.execPath,128*1024*1024))
+  const controllerHash=sha(boundedFile(process.execPath,CONTROLLER_HOST_MAX_BYTES))
   const inventory=[{path:'manifest.json',length:policy.manifest.length,sha256:policy.manifest.sha256},...policy.files.map(file=>({path:file.path,length:file.length,sha256:file.sha256}))]
   const captured=await captureWindowsFiles(BUNDLE,inventory,{executable:helper.exe,executableSha256:pin.sha256,configSha256:pin.configSha256,systemRoot})
   need(captured.architecture===arch,'native-controller-architecture-mismatch')
@@ -158,7 +161,7 @@ async function captureUncached(){
   }
   for(const [path,bytes,,sha256] of bootstrap)files.push({path,sha256,bytes:Buffer.from(bytes)})
   verifyPipeline()
-  need(sha(boundedFile(process.execPath,128*1024*1024))===controllerHash,'controller-node-changed')
+  need(sha(boundedFile(process.execPath,CONTROLLER_HOST_MAX_BYTES))===controllerHash,'controller-node-changed')
   const identity=sha(Buffer.from(decoder.canonical({schema:1,policy,architecture:arch,controller:{architecture:process.arch,node:process.versions.node,sha256:controllerHash},files:files.map(({path,sha256})=>({path,sha256}))})))
   const tuple=Object.freeze({});tuples.set(tuple,{files,identity,architecture:arch,sharedId:policy.sharedId,controllerHash,controllerVersion:process.versions.node});return tuple
 }
@@ -179,7 +182,7 @@ function revalidateTuple(tuple){
   try{
     verifyPipeline()
     need(process.platform==='win32'&&process.arch===value.architecture&&process.versions.node===value.controllerVersion,'controller-identity-changed')
-    need(sha(boundedFile(process.execPath,128*1024*1024))===value.controllerHash,'controller-node-changed')
+    need(sha(boundedFile(process.execPath,CONTROLLER_HOST_MAX_BYTES))===value.controllerHash,'controller-node-changed')
     return describeTuple(tuple)
   }catch(error){recordPoison(error);throw error}
 }

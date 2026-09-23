@@ -20,7 +20,7 @@ function setup(t,options={}){
  const bootstraps={};for(const arch of ['x64','arm64']){const exe=Buffer.from('test-helper-'+arch),config=Buffer.from('test-config-'+arch);fs.writeFileSync(path.join(base,'windows-worker','bootstrap','capture-'+arch+'.exe'),exe);fs.writeFileSync(path.join(base,'windows-worker','bootstrap','capture-'+arch+'.exe.config'),config);bootstraps[arch]={length:exe.length,sha256:sha(exe),configLength:config.length,configSha256:sha(config)}}
  const policy={schema:1,state:'candidate-unaccepted',manifest:{length:bytes.length,sha256:sha(bytes)},files,bootstraps,pipeline,imports,sharedId:'msys-2.0S5',sourceIdentity:'1'.repeat(64)}
  if(options.policyChange)options.policyChange(policy)
- const execPath=path.join(base,'controller.exe');fs.writeFileSync(execPath,'trusted test controller identity')
+ const execPath=path.join(base,'controller.exe');fs.writeFileSync(execPath,'trusted test controller identity');if(options.controllerSize !== undefined) fs.truncateSync(execPath, options.controllerSize)
  const processFixture={platform:'win32',arch:options.arch||'x64',versions:{node:options.node||'24.20.0'},execPath,env:{SystemRoot:'C:\\Windows',AUTOPROMPT_WINDOWS_BASH:'C:\\malicious\\bash.exe',PROCESSOR_ARCHITECTURE:'wrong'}}
  const observation={captureCalls:0,privateCalls:0,authority:null}
  const capture=async(root,inventory,authority)=>{observation.captureCalls++;observation.authority=authority;if(options.captureFailure)throw options.captureFailure;const bootstrap={executableBytes:fs.readFileSync(authority.executable),configBytes:fs.readFileSync(authority.executable+'.config')};if(options.bootstrapChange)options.bootstrapChange(bootstrap);return{architecture:options.observedArch||processFixture.arch,records:inventory.map(file=>({path:file.path,bytes:fs.readFileSync(path.join(root,file.path))})),bootstrap}}
@@ -176,4 +176,16 @@ test('bounded bootstrap files report a fail-closed expected-length reason',t=>{
  const available=x.api.staticAvailability()
  assert.equal(available.available,false)
  assert.match(available.code,/^file-byte-bound:expected-length:path=capture-x64\.exe\.config:nlink=bigint:1:size=bigint:\d+:max=1024:expected=15$/)
+})
+
+
+test('bounded Electron-sized controller host above 128 MiB remains hashable below the fixed cap', async t => {
+ const x=setup(t,{controllerSize:129*1024*1024})
+ const tuple=await x.api.captureWorkerTuple()
+ assert.equal(x.api.describeTuple(tuple).controllerSha256,sha(fs.readFileSync(x.processFixture.execPath)))
+})
+test('controller host above the fixed 512 MiB cap refuses before capture or allocation', async t => {
+ const x=setup(t,{controllerSize:513*1024*1024})
+ await assert.rejects(x.api.captureWorkerTuple(),/file-byte-bound:max-size:path=controller\.exe:nlink=bigint:1:size=bigint:537919488:max=536870912:expected=none/)
+ assert.equal(x.observation.captureCalls,0)
 })

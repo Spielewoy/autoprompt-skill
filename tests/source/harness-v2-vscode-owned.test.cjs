@@ -85,6 +85,9 @@ test('VS Code short IPC argv keeps settings in the exact deep private user-data 
     vscodeUserDataDir: alias }
   const { project } = require('../../scripts/harness-v2-vscode-config.cjs')
   const environment = {}, argv = project(options, environment)
+  assert.ok(argv.includes('--disable-extensions'))
+  assert.equal(argv[argv.indexOf('--extensionDevelopmentPath') + 1], path.resolve(__dirname, '../../scripts/harness-v2-bridge/vscode'))
+  assert.equal(argv[argv.indexOf('--extensionTestsPath') + 1], path.resolve(__dirname, '../../scripts/harness-v2-bridge/vscode/session-driver.cjs'))
   assert.equal(argv[argv.indexOf('--user-data-dir') + 1], alias)
   assert.ok(Buffer.byteLength(path.join(alias, '1.13-main.sock')) < 103)
   assert.ok(Buffer.byteLength(path.join(target, '1.13-main.sock')) > 103)

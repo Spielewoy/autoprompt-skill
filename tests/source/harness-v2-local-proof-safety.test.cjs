@@ -10,6 +10,35 @@ const test = require('node:test')
 const canary = require('../../scripts/harness-v2-canary.cjs')
 const hash = value => crypto.createHash('sha256').update(value).digest('hex')
 const ROOT = path.resolve(__dirname, '../..')
+test('OpenCode admission on each native host remains pending until all real capability observations pass', () => {
+  const evidence = JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts/harness-v2-trust/evidence.json'), 'utf8'))
+  const policy = canary.selectPolicy(evidence, 'opencode')
+  const sources = new Set([policy.protocol, policy.canaryImplementation, ...Object.values(policy.capabilityCases).map(item => item.source)])
+  const installed = { payloadDigest: hash('fixture payload'), files: Object.fromEntries([...sources].map(source => [source, hash(fs.readFileSync(path.join(ROOT, source)))])) }
+  const implementation = fs.readFileSync(path.join(ROOT, 'scripts/harness-v2-canary.cjs'), 'utf8')
+  for (const platform of ['linux', 'win32', 'darwin']) for (const architecture of ['x64', 'arm64']) {
+    const context = { module: { exports: {} }, require, process: { platform, arch: architecture } }
+    require('node:vm').runInNewContext(implementation, context)
+    const verifier = context.module.exports
+    const nativeBody = { schemaVersion: 1, provider: 'opencode', platform, architecture, files: [['entrypoint/native', hash('unit fixture native')]] }
+    const executable = { sha256: nativeBody.files[0][1], version: 'unit fixture',
+      runtimeIdentity: { sha256: hash('local fixture'), fileCount: 1, packageCount: 0 },
+      portableRuntimeIdentity: { ...nativeBody, sha256: hash(JSON.stringify(nativeBody)), fileCount: 1, packageCount: 0 } }
+    const pending = verifier.verifyPolicy(policy, 'opencode', installed, executable)
+    assert.equal(pending.mode, 'local-canary-pending', `${platform}/${architecture}`)
+    assert.equal(Object.keys(pending.capabilityCases).length, 11)
+    for (const [capability, item] of Object.entries(pending.capabilityCases)) {
+      assert.equal(item.source, 'tests/source/harness-v2-opencode-capability-native.test.cjs')
+      assert.equal(item.testName, `opencode closed native capability: ${capability}`)
+      assert.equal(item.sha256, installed.files[item.source])
+    }
+    assert.throws(() => verifier.verifyObservations(pending, []), { code: 'REVIEWED_LOCAL_REJECTED' })
+    const missingFixture = { ...installed, files: { ...installed.files } }
+    delete missingFixture.files['tests/source/harness-v2-opencode-capability-native.test.cjs']
+    assert.throws(() => verifier.verifyPolicy(policy, 'opencode', missingFixture, executable), { code: 'REVIEWED_LOCAL_REJECTED' })
+  }
+})
+
 function write(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   fs.writeFileSync(file, typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value), { mode: 0o600 })
