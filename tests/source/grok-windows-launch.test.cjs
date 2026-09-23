@@ -18,30 +18,77 @@ function fixture(t) {
   fs.writeFileSync(path.join(pkg, 'bin', 'grok'), '#!/usr/bin/env node\n')
   const sourceNode = path.join(root, 'node-source.exe'); fs.writeFileSync(sourceNode, 'stable-node-bytes')
   const sessionRoot = path.join(root, 'session'), launchRoot = path.join(sessionRoot, 'launch')
-  return { root, pkg, grokExecutable: path.join(pkg, 'bin', 'grok'), sourceNode, sessionRoot, launchRoot }
+  const tuple = Object.freeze({}), identity = 'f'.repeat(64)
+  const workerLoader = {
+    async captureWorkerTuple() { return tuple }, describeTuple(value) { assert.equal(value, tuple); return { identity, controllerSha256: sha('stable-node-bytes') } },
+    revalidateTuple(value) { assert.equal(value, tuple); return { identity } },
+    materializeTuple(value, destination) {
+      assert.equal(value, tuple); fs.mkdirSync(destination); fs.mkdirSync(path.join(destination, 'usr')); fs.mkdirSync(path.join(destination, 'usr', 'bin'))
+      const node = path.join(destination, 'usr', 'bin', 'node.exe'); fs.writeFileSync(node, 'patched-worker-node-bytes')
+      return Object.freeze({ identity, node })
+    },
+  }
+  return { root, pkg, grokExecutable: path.join(pkg, 'bin', 'grok'), sourceNode, sessionRoot, launchRoot, _dependencies: { workerLoader } }
 }
 
-test('prepareSession derives the official package root and exposes a stable closed projection', t => {
-  const f = fixture(t), session = launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode })
+test('prepareSession derives the official package root and exposes a stable closed projection', async t => {
+  const f = fixture(t), session = await launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode })
   assert.equal(session.packageRoot, f.pkg)
   assert.equal(session.config.sessionHome, session.privateRoots.home)
   assert.deepEqual(session.config.runtimeProjection, { platform: 'win32', nodeExecutable: session.nodeExecutable, skillsPath: session.privateRoots.skills, mcpPort: 19778 })
   assert.equal(sha(fs.readFileSync(session.nodeExecutable)), session.nodeExecutableSha256)
-  assert.equal(fs.readFileSync(session.nodeExecutable, 'utf8'), 'stable-node-bytes')
+  assert.equal(fs.readFileSync(session.nodeExecutable, 'utf8'), 'patched-worker-node-bytes')
+  assert.equal(fs.readFileSync(session.brokerNodeExecutable, 'utf8'), 'stable-node-bytes')
+  assert.equal(session.workerIdentity, 'f'.repeat(64))
+  assert.notEqual(session.nodeExecutable, session.brokerNodeExecutable)
   assert.notEqual(session.privateRoots.control, session.privateRoots.cwd)
 })
 
-test('Node copy reuse verifies bytes and never overwrites a foreign existing file', t => {
-  const f = fixture(t), first = launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode })
+test('prepareSession requires fresh roots to be established before generic descendants create inherited permissions', async t => {
+  const f = fixture(t)
+  fs.mkdirSync(f.sessionRoot, { recursive: true, mode: 0o700 })
+  fs.chmodSync(f.sessionRoot, 0o755)
+  await assert.rejects(launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode }), {
+    code: 'GROK_WINDOWS_LAUNCH_INVALID',
+  })
+  assert.equal(fs.existsSync(path.join(f.sessionRoot, 'runtime', 'node.exe')), false)
+})
+
+test('Node copy reuse verifies bytes and never overwrites a foreign existing file', async t => {
+  const f = fixture(t), first = await launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode })
   fs.writeFileSync(f.sourceNode, 'changed-source')
-  assert.throws(() => launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode }), { code: 'GROK_WINDOWS_LAUNCH_IDENTITY_CHANGED' })
-  assert.equal(fs.readFileSync(first.nodeExecutable, 'utf8'), 'stable-node-bytes')
-  fs.writeFileSync(first.nodeExecutable, 'tampered-copy')
-  assert.throws(() => launch.copyExact(f.sourceNode, first.nodeExecutable), { code: 'GROK_WINDOWS_LAUNCH_IDENTITY_CHANGED' })
+  await assert.rejects(launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode }), { code: 'GROK_WINDOWS_LAUNCH_IDENTITY_CHANGED' })
+  assert.equal(fs.readFileSync(first.brokerNodeExecutable, 'utf8'), 'stable-node-bytes')
+  fs.writeFileSync(first.brokerNodeExecutable, 'tampered-copy')
+  assert.throws(() => launch.copyExact(f.sourceNode, first.brokerNodeExecutable), { code: 'GROK_WINDOWS_LAUNCH_IDENTITY_CHANGED' })
+})
+
+test('worker tuple publication is exclusive and cannot overwrite a prior session runtime', async t => {
+  const f = fixture(t), first = await launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode })
+  const bytes = fs.readFileSync(first.nodeExecutable)
+  await assert.rejects(launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode }), { code: 'EEXIST' })
+  assert.deepEqual(fs.readFileSync(first.nodeExecutable), bytes)
+})
+
+test('prepareSession rejects a materialized worker from another admitted tuple', async t => {
+  const f = fixture(t), materialize = f._dependencies.workerLoader.materializeTuple
+  f._dependencies.workerLoader.materializeTuple = (...args) => Object.freeze({ ...materialize(...args), identity: 'e'.repeat(64) })
+  await assert.rejects(launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode }), {
+    code: 'GROK_WINDOWS_LAUNCH_IDENTITY_CHANGED',
+  })
+})
+
+test('prepareSession rejects a broker Node outside the admitted controller identity', async t => {
+  const f = fixture(t), describe = f._dependencies.workerLoader.describeTuple
+  f._dependencies.workerLoader.describeTuple = value => ({ ...describe(value), controllerSha256: '0'.repeat(64) })
+  await assert.rejects(launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode }), {
+    code: 'GROK_WINDOWS_LAUNCH_IDENTITY_CHANGED',
+  })
+  assert.equal(fs.existsSync(path.join(f.launchRoot, 'windows-worker')), false)
 })
 
 test('prepareLaunch passes reservation-private roots and closed Windows environments to the existing broker resource', async t => {
-  const f = fixture(t), session = launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode })
+  const f = fixture(t), session = await launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode })
   let observed
   const resource = Object.freeze({ cleanup() {} })
   const result = await launch.prepareLaunch({ session, config: { ...session.config, model: 'grok', relayToken: 'a'.repeat(64), proxyToken: 'b'.repeat(64), allowedMcpTools: { autoprompt_owned__read: 'read' }, issuedCalls: [], systemRoot: 'C:\\Windows', systemPath: 'C:\\Windows\\System32' }, sessionRoot: session.sessionRoot, launchRoot: session.launchRoot,
@@ -58,15 +105,15 @@ test('prepareLaunch passes reservation-private roots and closed Windows environm
   assert.ok(!observed.policy.writableRoots.includes(path.join(f.root, 'task')))
 })
 
-test('package entrypoint and manifest are fail-closed', t => {
+test('package entrypoint and manifest are fail-closed', async t => {
   const f = fixture(t)
-  assert.throws(() => launch.prepareSession({ ...f, platform: 'win32', grokExecutable: path.join(f.pkg, 'not-bin', 'grok') }), { code: 'GROK_WINDOWS_LAUNCH_INVALID' })
+  await assert.rejects(launch.prepareSession({ ...f, platform: 'win32', grokExecutable: path.join(f.pkg, 'not-bin', 'grok') }), { code: 'GROK_WINDOWS_LAUNCH_INVALID' })
   fs.writeFileSync(path.join(f.pkg, 'package.json'), JSON.stringify({ name: '@xai-official/grok', version: '9.9.9' }))
-  assert.throws(() => launch.prepareSession({ ...f, platform: 'win32' }), { code: 'GROK_WINDOWS_LAUNCH_INVALID' })
+  await assert.rejects(launch.prepareSession({ ...f, platform: 'win32' }), { code: 'GROK_WINDOWS_LAUNCH_INVALID' })
 })
 
 test('prepareLaunch reaches the real broker materializer with a sealed worker contract', async t => {
-  const f = fixture(t), session = launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode })
+  const f = fixture(t), session = await launch.prepareSession({ ...f, platform: 'win32', nodeExecutable: f.sourceNode })
   const runtimeExecutable = path.join(f.root, 'materialized-grok.exe')
   fs.writeFileSync(runtimeExecutable, 'grok')
   const stat = fs.statSync(runtimeExecutable, { bigint: true })

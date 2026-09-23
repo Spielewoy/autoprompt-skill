@@ -14,16 +14,31 @@ $leasePath = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:AU
 $leaseBytes = [Convert]::FromBase64String($env:AUTOPROMPT_TOOL_LEASE_BYTES_B64)
 $readyPath = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:AUTOPROMPT_TOOL_LEASE_READY_PATH_B64))
 $readyBytes = [Convert]::FromBase64String($env:AUTOPROMPT_TOOL_LEASE_READY_BYTES_B64)
-$stream = [IO.FileStream]::new($leasePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read, 4096, [IO.FileOptions]::DeleteOnClose)
+function ConvertTo-ExtendedLeasePath([string]$value) {
+  # Windows PowerShell is hosted by .NET Framework, whose ordinary path
+  # normalization can retain MAX_PATH behavior. The controller supplied only
+  # absolute, normalized Windows paths; use the documented device spelling
+  # solely for the holder's FileStream and Move calls.
+  if ($value.StartsWith('\\?\')) { return $value }
+  if ($value.Length -ge 3 -and $value[1] -eq ':' -and $value[2] -eq '\') { return '\\?\' + $value }
+  if ($value.StartsWith('\\')) { return '\\?\UNC\' + $value.Substring(2) }
+  # The non-Windows PowerShell probe intentionally exercises the same holder
+  # lifecycle with native POSIX temporary paths.
+  if ($value.StartsWith('/')) { return $value }
+  throw 'AUTOPROMPT_TOOL_LEASE_PATH_INVALID'
+}
+$leaseNativePath = ConvertTo-ExtendedLeasePath $leasePath
+$readyNativePath = ConvertTo-ExtendedLeasePath $readyPath
+$stream = [IO.FileStream]::new($leaseNativePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read, 4096, [IO.FileOptions]::DeleteOnClose)
 try {
   $stream.Write($leaseBytes, 0, $leaseBytes.Length)
   $stream.Flush($true)
-  $readyStagingPath = $readyPath + '.staging'
-  $ready = [IO.FileStream]::new($readyStagingPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+  $readyStagingNativePath = ConvertTo-ExtendedLeasePath ($readyPath + '.staging')
+  $ready = [IO.FileStream]::new($readyStagingNativePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
   try { $ready.Write($readyBytes, 0, $readyBytes.Length); $ready.Flush($true) } finally { $ready.Dispose() }
   # Publish only after closing the writer. A readable FileShare.Read handle
   # still forbids the controller from deleting the readiness receipt.
-  [IO.File]::Move($readyStagingPath, $readyPath)
+  [IO.File]::Move($readyStagingNativePath, $readyNativePath)
   [Console]::In.ReadLine() | Out-Null
 } finally {
   $stream.Dispose()

@@ -23,6 +23,24 @@ class VscodeEventChannelError extends Error {
   }
 }
 function fail(code, message) { throw new VscodeEventChannelError(code, message) }
+// Admit an existing scratch directory only when it is the authenticated
+// physical private directory. Never follow an existing symlink here.
+function ensurePrivateDirectory(directory) {
+  try { fs.mkdirSync(directory, { mode: 0o700 }) } catch (error) {
+    if (!error || error.code !== 'EEXIST') throw error
+  }
+  let item
+  try {
+    item = fs.lstatSync(directory)
+  } catch { fail('VSCODE_EVENT_CHANNEL_INVALID', 'VS Code event scratch directory is unavailable') }
+  // The authenticated VS Code alias intentionally contributes a symlinked
+  // ancestor; only the scratch component itself must be physical.
+  if (!item.isDirectory() || item.isSymbolicLink() ||
+      (typeof process.getuid === 'function' && item.uid !== process.getuid()) || (item.mode & 0o077)) {
+    fail('VSCODE_EVENT_CHANNEL_INVALID', 'VS Code event scratch directory is not an owned private directory')
+  }
+  return directory
+}
 function exact(value, fields) {
   return value && typeof value === 'object' && !Array.isArray(value) &&
     Object.keys(value).sort().join('\0') === fields.slice().sort().join('\0')
@@ -266,4 +284,4 @@ function connect(value) {
   return Object.freeze({ emit: event => send('event', event), complete: () => send('complete') })
 }
 
-module.exports = { VscodeEventChannelError, createServer, connect, descriptor, descriptorValid, endpointValid }
+module.exports = { VscodeEventChannelError, createServer, connect, descriptor, descriptorValid, endpointValid, ensurePrivateDirectory }

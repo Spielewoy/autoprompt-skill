@@ -8,7 +8,7 @@ const childProcess = require('node:child_process')
 const test = require('node:test')
 const { ProcessOwner, createWindowsJobAdapter } = require('../../agents/codex/workflow/process-owner.js')
 const { ensureWindowsPrivateAcl } = require('../../agents/codex/workflow/safe-run-root.js')
-const { POWERSHELL_SOURCE } = require('../../scripts/harness-v2-windows-tool-lease.cjs')
+const { POWERSHELL_SOURCE, createWindowsToolLeaseAsync } = require('../../scripts/harness-v2-windows-tool-lease.cjs')
 
 test('PowerShell FileStream delete-on-close probe records host semantics for normal EOF and forced holder death', { timeout: 60000 }, async t => {
   const powershell = process.platform === 'win32'
@@ -162,4 +162,27 @@ test('native Windows forced process-tree termination releases the asynchronous k
   while (fs.existsSync(lockPath) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
   stage('after-lock-release-poll')
   assert.equal(fs.existsSync(lockPath), false, 'Windows must delete the lease when forced termination closes its kernel handle')
+})
+
+test('native Windows asynchronous tool lease uses extended FileStream paths for a deep controller receipt', { skip: process.platform !== 'win32', timeout: 60000 }, async t => {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'tool-lease-deep-')))
+  let root = base
+  try {
+    ensureWindowsPrivateAcl(base)
+    // Match the durable controller layout: the lock itself is near MAX_PATH,
+    // while its random readiness and staging siblings exceed it.
+    while (path.join(root, 'server.lock').length < 259) {
+      root = path.join(root, 'deep-controller-state')
+      fs.mkdirSync(root, { mode: 0o700 })
+    }
+    const lockPath = path.join(root, 'server.lock')
+    const readyPathLength = `${lockPath}.ready-${'a'.repeat(64)}.staging`.length
+    assert.ok(lockPath.length >= 259, JSON.stringify({ lockPathLength: lockPath.length, readyPathLength }))
+    assert.ok(readyPathLength > 260, JSON.stringify({ lockPathLength: lockPath.length, readyPathLength }))
+    const lease = await createWindowsToolLeaseAsync({ lockPath, lockBytes: Buffer.from('deep-exact-lease') })
+    try { lease.assertHeld(); assert.equal(fs.existsSync(lockPath), true) }
+    finally { await lease.release() }
+    assert.equal(fs.existsSync(lockPath), false)
+    t.diagnostic(JSON.stringify({ lockPathLength: lockPath.length, readyPathLength }))
+  } finally { fs.rmSync(base, { recursive: true, force: true }) }
 })

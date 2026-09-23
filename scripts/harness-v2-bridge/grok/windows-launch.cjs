@@ -93,16 +93,24 @@ function packageRootFromExecutable(executable) {
   return root
 }
 function under(child, parent) { const rel = path.relative(parent, child); return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel)) }
-function prepareSession(options = {}) {
+async function prepareSession(options = {}) {
   const platform = options.platform || process.platform
   if (platform !== 'win32') fail('GROK_WINDOWS_LAUNCH_INVALID', 'Windows Grok projection requires win32')
   const packageRoot = packageRootFromExecutable(options.grokExecutable)
   const sessionRoot = mkdirPrivate(options.sessionRoot, 'Grok session root')
   const launchRoot = mkdirPrivate(options.launchRoot, 'Grok launch root')
   if (!under(launchRoot, sessionRoot) || launchRoot === sessionRoot) fail('GROK_WINDOWS_LAUNCH_INVALID', 'Launch root must be a private child of the session root')
+  const loader = options._dependencies?.workerLoader || require('../../../agents/codex/workflow/windows-worker-loader.js')
+  if (![loader.captureWorkerTuple, loader.describeTuple, loader.revalidateTuple, loader.materializeTuple].every(fn => typeof fn === 'function')) fail('GROK_WINDOWS_LAUNCH_INVALID', 'Windows worker loader contract is unavailable')
+  const tuple = await loader.captureWorkerTuple(), admitted = loader.describeTuple(tuple)
+  if (!admitted || typeof admitted.identity !== 'string' || !/^[a-f0-9]{64}$/u.test(admitted.identity) ||
+      typeof admitted.controllerSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(admitted.controllerSha256)) fail('GROK_WINDOWS_LAUNCH_INVALID', 'Windows worker tuple identity is invalid')
+  loader.revalidateTuple(tuple)
   const sourceNode = options.nodeExecutable || process.execPath
-  const nodePath = path.join(sessionRoot, 'runtime', 'node.exe')
-  const nodeBinding = copyExact(sourceNode, nodePath)
+  const brokerNodePath = path.join(sessionRoot, 'runtime', 'node.exe')
+  const brokerNodeBinding = copyExact(sourceNode, brokerNodePath)
+  if (brokerNodeBinding.sha256 !== admitted.controllerSha256) fail('GROK_WINDOWS_LAUNCH_IDENTITY_CHANGED', 'Broker Node differs from the admitted worker controller')
+  loader.revalidateTuple(tuple)
   const privateRoots = Object.freeze({
     home: mkdirPrivate(path.join(sessionRoot, 'grok-home'), 'Grok home'),
     cwd: mkdirPrivate(path.join(launchRoot, 'grok-cwd'), 'Grok cwd'),
@@ -112,14 +120,21 @@ function prepareSession(options = {}) {
     control: mkdirPrivate(path.join(launchRoot, 'broker-control'), 'Broker control root'),
     broker: mkdirPrivate(path.join(launchRoot, 'broker'), 'Broker cwd'),
   })
-  return Object.freeze({ platform, architecture: options.architecture || process.arch, packageRoot, sessionRoot, launchRoot, nodeExecutable: nodeBinding.path, nodeExecutableSha256: nodeBinding.sha256,
-    brokerNodeExecutable: nodeBinding.path, brokerNodeSha256: nodeBinding.sha256, privateRoots,
-    config: Object.freeze({ sessionHome: privateRoots.home, runtimeProjection: Object.freeze({ platform: 'win32', nodeExecutable: nodeBinding.path, skillsPath: privateRoots.skills, mcpPort: 19778 }) }) })
+  const workerRoot = path.join(launchRoot, 'windows-worker')
+  const workerRuntime = loader.materializeTuple(tuple, workerRoot)
+  loader.revalidateTuple(tuple)
+  if (!workerRuntime || workerRuntime.identity !== admitted.identity || typeof workerRuntime.node !== 'string') fail('GROK_WINDOWS_LAUNCH_IDENTITY_CHANGED', 'Materialized Windows worker differs from its admitted tuple')
+  const nodeBinding = bound(workerRuntime.node, 'admitted Windows worker Node')
+  const roots = Object.freeze({ ...privateRoots, worker: physical(workerRoot, 'Windows worker root') })
+  return Object.freeze({ platform, architecture: options.architecture || process.arch, packageRoot, sessionRoot, launchRoot,
+    workerIdentity: admitted.identity, nodeExecutable: nodeBinding.path, nodeExecutableSha256: nodeBinding.sha256,
+    brokerNodeExecutable: brokerNodeBinding.path, brokerNodeSha256: brokerNodeBinding.sha256, privateRoots: roots,
+    config: Object.freeze({ sessionHome: roots.home, runtimeProjection: Object.freeze({ platform: 'win32', nodeExecutable: nodeBinding.path, skillsPath: roots.skills, mcpPort: 19778 }) }) })
 }
 async function prepareLaunch(options = {}) {
   const { config, spec, sessionRoot, launchRoot, pipe, processOwner, binding } = options
   if (!config || !spec || !pipe || !processOwner || !binding) fail('GROK_WINDOWS_LAUNCH_INVALID', 'Launch projection fields are required')
-  const session = options.session || { ...prepareSession({ ...options, sessionRoot, launchRoot }), sessionRoot, launchRoot }
+  const session = options.session || { ...await prepareSession({ ...options, sessionRoot, launchRoot }), sessionRoot, launchRoot }
   if (session.sessionRoot !== sessionRoot || session.launchRoot !== launchRoot) fail('GROK_WINDOWS_LAUNCH_INVALID', 'Launch roots differ from prepared session')
   const roots = session.privateRoots
   if (config.sessionHome !== roots?.home || config.runtimeProjection?.nodeExecutable !== session.nodeExecutable ||

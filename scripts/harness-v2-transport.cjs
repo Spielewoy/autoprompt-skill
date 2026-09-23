@@ -70,7 +70,7 @@ function vscodeEventEndpoint(launchRoot, alias, record) {
   if (process.platform === 'darwin') {
     if (!alias?.userDataDir) fail('VSCODE_EVENT_CHANNEL_INVALID', 'Darwin VS Code event channel requires the authenticated IPC alias')
     const parent = path.join(alias.userDataDir, 't')
-    fs.mkdirSync(parent, { recursive: true, mode: 0o700 })
+    vscodeEventChannel.ensurePrivateDirectory(parent)
     return path.join(parent, 'autoprompt-events.sock')
   }
   if (typeof process.getuid !== 'function') fail('VSCODE_EVENT_CHANNEL_INVALID', 'VS Code event channel cannot bind a private POSIX root')
@@ -1268,6 +1268,38 @@ class HarnessExecAdapter {
       const root = path.join(this.nativeRoot, 'grok'), result = { cleaned: 0, retained: [] }
       if (!fs.existsSync(root)) return result
       const { auditPrivatePermissions } = require('../agents/codex/workflow/safe-run-root.js')
+      const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) &&
+        Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key))
+      const readPhysicalFile = (file, maximumBytes) => {
+        let descriptor
+        try {
+          const named = fs.lstatSync(file, { bigint: true })
+          if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n || named.size < 1n || named.size > BigInt(maximumBytes)) return null
+          descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+          const opened = fs.fstatSync(descriptor, { bigint: true })
+          if (['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].some(key => opened[key] !== named[key])) return null
+          const bytes = fs.readFileSync(descriptor), after = fs.fstatSync(descriptor, { bigint: true }), current = fs.lstatSync(file, { bigint: true })
+          if (bytes.length !== Number(opened.size) || ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].some(key => after[key] !== opened[key] || current[key] !== opened[key])) return null
+          return bytes
+        } catch { return null } finally { if (descriptor !== undefined) fs.closeSync(descriptor) }
+      }
+      const restoredResourceJournal = journalPath => {
+        const journalBytes = readPhysicalFile(journalPath, 8 * 1024 * 1024), receiptBytes = readPhysicalFile(`${journalPath}.restored`, 4096)
+        if (!journalBytes || !receiptBytes) return false
+        let journal, receipt
+        try { journal = JSON.parse(journalBytes.toString('utf8')); receipt = JSON.parse(receiptBytes.toString('utf8')) } catch { return false }
+        const leaseId = path.basename(journalPath, '.resources.json')
+        if (!exact(journal, ['schemaVersion', 'leaseId', 'plan', 'sha256']) || journal.schemaVersion !== 1 || journal.leaseId !== leaseId ||
+            journal.sha256 !== sha256(JSON.stringify({ schemaVersion: 1, leaseId, plan: journal.plan }))) return false
+        try { require('../agents/codex/workflow/windows-appcontainer-resources.js').validatePlan(journal.plan, { profileName: `Autoprompt_${leaseId}` }) } catch { return false }
+        if (!exact(receipt, ['schemaVersion', 'leaseId', 'profileSid', 'result']) || receipt.schemaVersion !== 1 || receipt.leaseId !== leaseId ||
+            receipt.profileSid !== journal.plan.profileSid || !exact(receipt.result, ['restored', 'newEntries', 'deletedEntries']) ||
+            Object.values(receipt.result).some(value => !Number.isSafeInteger(value) || value < 0) ||
+            receipt.result.restored > 16384 || receipt.result.deletedEntries > 16384 || receipt.result.newEntries > 32768 ||
+            receipt.result.restored + receipt.result.newEntries > 32768 ||
+            receipt.result.restored + receipt.result.deletedEntries !== journal.plan.entries.length) return false
+        return true
+      }
       const physicalDirectory = directory => { privateDirectory(directory); auditPrivatePermissions(directory, { recurse: false }) }
       physicalDirectory(root)
       const directories = parent => fs.readdirSync(parent, { withFileTypes: true }).filter(entry => /^[a-f0-9]{64}$/u.test(entry.name)).map(entry => {
@@ -1279,7 +1311,8 @@ class HarnessExecAdapter {
         const controlRoot = path.join(reservation, 'broker-control')
         if (!fs.existsSync(controlRoot)) continue
         physicalDirectory(controlRoot)
-        for (const name of fs.readdirSync(controlRoot).filter(name => /^grok-broker-[a-f0-9]{32}\.json$/u.test(name))) {
+        const names = fs.readdirSync(controlRoot), brokerLeaseIds = new Set(names.map(name => /^grok-broker-([a-f0-9]{32})\.json$/u.exec(name)?.[1]).filter(Boolean))
+        for (const name of names.filter(name => /^grok-broker-[a-f0-9]{32}\.json$/u.test(name))) {
           if (++count > 4096) fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok recovery journal discovery exceeded its bound')
           const brokerRequestPath = path.join(controlRoot, name)
           try {
@@ -1291,6 +1324,12 @@ class HarnessExecAdapter {
             if (!['PROCESS_IDENTITY_INVALID', 'PROCESS_DRAIN_TIMEOUT', 'OWNERSHIP_RECOVERY_PENDING', 'OWNERSHIP_RECOVERY_FATAL'].includes(error.code)) throw error
             result.retained.push({ brokerRequestPath, code: error.code })
           }
+        }
+        for (const name of names.filter(name => /^[a-f0-9]{32}\.resources\.json$/u.test(name))) {
+          const leaseId = name.slice(0, 32), journalPath = path.join(controlRoot, name)
+          if (brokerLeaseIds.has(leaseId) || restoredResourceJournal(journalPath)) continue
+          if (++count > 4096) fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok recovery journal discovery exceeded its bound')
+          result.retained.push({ journalPath, code: 'GROK_WINDOWS_RESOURCE_ORPHANED' })
         }
       }
       if (options.requireDrained && result.retained.length) fail('PROCESS_DRAIN_TIMEOUT', 'Grok resources still require exact process-drain authority', result)
@@ -1369,6 +1408,16 @@ class HarnessExecAdapter {
     const readOnly = execution.sandboxMode === 'read-only'
     const sessionRoot = contextRoot(this.nativeRoot, this.provider, record, targetPath)
     const launchRoot = path.join(sessionRoot, sha256(record.reservationId))
+    // The Windows Grok AppContainer contract requires its two root leaves to
+    // receive protected controller DACLs at first creation.  Do this before
+    // any generic private-directory call can recursively create either leaf
+    // with inherited permissions; resumed roots are audited, never relabeled.
+    let grokWindowsSession = null
+    if (this.provider === 'grok' && process.platform === 'win32') {
+      grokWindowsSession = await require('./harness-v2-bridge/grok/windows-launch.cjs').prepareSession({
+        sessionRoot, launchRoot, grokExecutable: native.executableRuntimePath(binding), nodeExecutable: process.execPath,
+      })
+    }
     const cwd = path.join(sessionRoot, 'cwd'); privateDirectory(cwd)
     const checkerScratch = record.checkerScratchBoundary ? this.checkerScratchVerifier?.(record) : null
     if (record.checkerScratchBoundary && !checkerScratch) fail('CHECKER_SCRATCH_BOUNDARY_INVALID', 'Native checker scratch boundary is not authenticated')
@@ -1452,7 +1501,6 @@ class HarnessExecAdapter {
     const abort = () => stop(new native.HarnessError('CHILD_CANCELLED', 'Native execution was aborted'))
     if (signal?.aborted) throw new native.HarnessError('CHILD_CANCELLED', 'Native execution was aborted before launch')
     signal?.addEventListener('abort', abort, { once: true })
-    let grokWindowsSession = null
     let result, vscodeIpcAlias = null, vscodeReservationEntered = false, vscodeEvents = null, vscodeEventsDrained = false
     try {
       if (quotaEnabled) {
@@ -1490,11 +1538,6 @@ class HarnessExecAdapter {
           onFailure: error => stop(error),
         })
         await vscodeEvents.ready()
-      }
-      if (this.provider === 'grok' && process.platform === 'win32') {
-        grokWindowsSession = require('./harness-v2-bridge/grok/windows-launch.cjs').prepareSession({
-          sessionRoot, launchRoot, grokExecutable: native.executableRuntimePath(binding), nodeExecutable: process.execPath,
-        })
       }
       spec = native.createLaunch({ provider: this.provider, executable: native.executableRuntimePath(binding), home: path.join(launchRoot, 'home'), ...(vscodeIpcAlias ? { vscodeUserDataDir: vscodeIpcAlias.userDataDir } : {}), ...(vscodeEvents ? { vscodeEventChannel: vscodeEvents.descriptor } : {}), sessionRoot, ...(grokWindowsSession ? { grokRuntimeProjection: grokWindowsSession.config.runtimeProjection } : {}), cwd, targetPath: candidatePath, readOnly, commandBoundary, toolBoundary, toolFree: Boolean(routeProjection), prompt, input, continuationId: record.continuationId, connection: projectedConnection, credentials: this.credentialEnvironment, providerConnectionIdentity: this.connection, environment: record.environment, model: record.assignment?.model, effort: this.provider === 'grok' ? grokAssignedEffort : record.assignment?.effort, issuedCalls: preexistingIssuedCalls, proxyToken, maxTokens: nativeMaxTokens, outputSchema: ['claude', 'deepseek', 'grok', 'prime', 'omp'].includes(this.provider) || this.provider === 'vscode' && this.connection?.supportsStructuredOutput === true ? wireSchema : undefined, maxCompletionTokens: this.provider === 'grok' && Number.isSafeInteger(record.providerTokenLimit) && record.providerTokenLimit > 0 ? Math.min(4096, record.providerTokenLimit) : undefined })
       if (requiredResponseFormat && boundary.canonicalJson(spec.requiredResponseFormat) !== boundary.canonicalJson(requiredResponseFormat)) fail('PROVIDER_UNSUPPORTED', 'Pi native schema differs from its owned provider boundary')

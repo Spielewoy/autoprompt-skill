@@ -3,7 +3,7 @@
 const path = require('node:path')
 const fs = require('node:fs')
 const { writePrivate, sha256 } = require('../agents/reasonix/workflow/native.js')
-const { descriptorValid } = require('./harness-v2-bridge/vscode/event-channel.cjs')
+const { descriptorValid, ensurePrivateDirectory } = require('./harness-v2-bridge/vscode/event-channel.cjs')
 function fail(message) { const error = new Error(message); error.code = 'PROFILE_INVALID'; throw error }
 function sanitize(source = {}) {
   if (!source || typeof source !== 'object' || Array.isArray(source)) fail('VS Code owned provider needs connection data')
@@ -63,7 +63,7 @@ function project(options, env) {
   if (options.vscodeUserDataDir !== undefined) {
     // VS Code's additional random IPC sockets use os.tmpdir(). Keep those
     // lexical paths short too, with their bytes in the same private target.
-    fs.mkdirSync(path.join(deepUserDataDir, 't'), { mode: 0o700 })
+    try { ensurePrivateDirectory(path.join(deepUserDataDir, 't')) } catch { fail('VS Code private temporary directory is unsafe') }
     env.TMPDIR = env.TMP = env.TEMP = path.join(userDataDir, 't')
   }
   return ['--no-sandbox', '--disable-gpu', '--disable-extensions', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust',

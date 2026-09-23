@@ -14,6 +14,22 @@ function failureCode(error, aborted = false) {
   const code = error?.code
   return typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : 'TOOL_FAILED'
 }
+function sourceOwnedFailureDiagnostic(error) {
+  const root = path.resolve(__dirname, '../../..')
+  const relativeFrame = line => {
+    const match = /(?:\(|\s)([^()\r\n]+):(\d+):(\d+)\)?$/u.exec(line)
+    if (!match) return null
+    const file = path.resolve(match[1]), relative = path.relative(root, file)
+    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) ||
+        !/^(?:scripts|agents[\\/]codex[\\/]workflow)[\\/]/u.test(relative)) return null
+    return `${relative.split(path.sep).join('/')}:${match[2]}:${match[3]}`.slice(0, 256)
+  }
+  const name = typeof error?.name === 'string' && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/u.test(error.name) ? error.name : 'Error'
+  const originalCode = typeof error?.code === 'string' && /^[A-Za-z0-9_.-]{1,64}$/u.test(error.code) ? error.code : null
+  const sourceFrames = typeof error?.stack === 'string'
+    ? error.stack.split(/\r?\n/u).map(relativeFrame).filter(Boolean).slice(0, 8) : []
+  return Object.freeze({ name, originalCode, sourceFrames })
+}
 
 function openDiagnostic(root, nonce) {
   const file = path.join(root, `pi-handler-${nonce}.jsonl`)
@@ -107,7 +123,7 @@ function openController(provider, environment = process.env) {
         // also enough to distinguish a host cancellation from a launcher or
         // resource failure without exposing the exception text.
         const code = failureCode(error, controller.signal.aborted)
-        diagnostic.write('tool_execute', 'failed', { code, aborted: controller.signal.aborted })
+        diagnostic.write('tool_execute', 'failed', { code, aborted: controller.signal.aborted, failure: sourceOwnedFailureDiagnostic(error) })
         const output = `${code}: ${error instanceof boundary.BoundaryError ? error.message : 'Controller tool execution failed'}`
         actualResult = { tool, status: 'failed', exitCode: null, output, outputSha256: boundary.sha256(output), code }
       }
@@ -335,4 +351,4 @@ function install(pi, provider, Type, environment = process.env) {
   })
   return { close, get controller() { return controller } }
 }
-module.exports = { NAMES, privateState, openController, parameters, openAIResponseFormat, openAIOutputCap, bindOpenAIResponseFormat, failureCode, install }
+module.exports = { NAMES, privateState, openController, parameters, openAIResponseFormat, openAIOutputCap, bindOpenAIResponseFormat, failureCode, sourceOwnedFailureDiagnostic, install }

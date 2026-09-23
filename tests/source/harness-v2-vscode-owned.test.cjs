@@ -82,6 +82,9 @@ test('VS Code short IPC argv keeps settings in the exact deep private user-data 
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const home = path.join(root, 'deep'.repeat(40), 'home'), target = path.join(home, 'user-data')
   fs.mkdirSync(target, { recursive: true, mode: 0o700 })
+  // The event endpoint is prepared before the provider projection. The
+  // projection must accept that already-created physical scratch directory.
+  fs.mkdirSync(path.join(target, 't'), { mode: 0o700 })
   const alias = path.join(root, 'u')
   fs.symlinkSync(target, alias, 'dir')
   const options = { home, sessionRoot: root, targetPath: root, prompt: 'fixture', input: '{}',
@@ -101,6 +104,13 @@ test('VS Code short IPC argv keeps settings in the exact deep private user-data 
   assert.equal(environment.TEMP, environment.TMPDIR)
   assert.equal(environment.TMP, environment.TMPDIR)
   assert.equal(fs.realpathSync.native(environment.TMPDIR), path.join(target, 't'))
+  fs.rmSync(path.join(target, 't'), { recursive: true })
+  const foreignTemp = path.join(root, 'foreign-temp'); fs.mkdirSync(foreignTemp, { mode: 0o700 })
+  fs.symlinkSync(foreignTemp, path.join(target, 't'), 'dir')
+  fs.unlinkSync(path.join(home, 'owned-session.json'))
+  fs.unlinkSync(path.join(target, 'User', 'settings.json'))
+  assert.throws(() => project(options, {}), { code: 'PROFILE_INVALID' })
+  fs.unlinkSync(path.join(target, 't'))
   const foreign = path.join(root, 'foreign'); fs.mkdirSync(foreign)
   fs.unlinkSync(alias); fs.symlinkSync(foreign, alias, 'dir')
   assert.throws(() => project(options, {}), { code: 'PROFILE_INVALID' })

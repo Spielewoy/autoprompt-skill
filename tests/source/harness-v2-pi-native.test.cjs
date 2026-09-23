@@ -43,6 +43,15 @@ function committed(f, response, name, args) {
   return actual
 }
 
+test('Pi private failure diagnostics retain only bounded source-owned identity fields', () => {
+  const error = new TypeError('secret host path must not be persisted')
+  error.code = 'unsafe code with spaces'
+  error.stack = `TypeError: secret host path must not be persisted\n    at execute (${path.resolve(__dirname, '../../scripts/harness-v2-tool-boundary.cjs')}:171:9)\n    at foreign (/private/secret/provider.js:4:2)`
+  assert.deepEqual(bridge.sourceOwnedFailureDiagnostic(error), {
+    name: 'TypeError', originalCode: null, sourceFrames: ['scripts/harness-v2-tool-boundary.cjs:171:9'],
+  })
+})
+
 test('Prime 0.7.2 cache receipt transform is checked against raw provider categories', () => {
   const receipt = value => ({ responseIdHash: crypto.createHash('sha256').update('receipt').digest('hex'),
     completionTokens: 39, reasoningTokens: 8, ...value })

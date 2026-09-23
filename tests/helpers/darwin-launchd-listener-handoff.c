@@ -37,7 +37,7 @@ static int acquire(const char *name, in_port_t expected, int *result) {
   free(descriptors);
   struct sockaddr_in6 address;
   socklen_t address_length = sizeof(address);
-  int type = -1, accepting = -1, v6only = -1, reuseport = -1;
+  int type = -1, v6only = -1, reuseport = -1;
   socklen_t option_length = sizeof(int);
   if (getsockname(descriptor, (struct sockaddr *)&address, &address_length) != 0 ||
       address_length != sizeof(address) || address.sin6_family != AF_INET6 ||
@@ -48,11 +48,6 @@ static int acquire(const char *name, in_port_t expected, int *result) {
     return 71;
   }
   option_length = sizeof(int);
-  if (getsockopt(descriptor, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &option_length) != 0 || accepting != 1) {
-    close(descriptor);
-    return 72;
-  }
-  option_length = sizeof(int);
   if (getsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &option_length) != 0 || v6only != 1) {
     close(descriptor);
     return 73;
@@ -61,6 +56,13 @@ static int acquire(const char *name, in_port_t expected, int *result) {
   if (getsockopt(descriptor, SOL_SOCKET, SO_REUSEPORT, &reuseport, &option_length) != 0 || reuseport != 0) {
     close(descriptor);
     return 74;
+  }
+  // Darwin exposes SO_ACCEPTCONN as an internal socket option bit, but does
+  // not implement it in sogetoptlock(). Idempotent listen() establishes the
+  // listening state of this already-bound, authenticated launchd socket.
+  if (listen(descriptor, SOMAXCONN) != 0) {
+    close(descriptor);
+    return 72;
   }
   *result = descriptor;
   return 0;

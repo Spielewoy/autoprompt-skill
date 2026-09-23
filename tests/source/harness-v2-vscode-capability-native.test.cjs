@@ -87,6 +87,14 @@ async function scenario(t, options = {}) {
   f.execution.checkerScratchVerifier = record => record.checkerScratchBoundary || original?.(record)
   f.run = async (overrides = {}) => {
     const record = { ...f.record, ...overrides }
+    const failedTools = [], originalEvent = record.onEvent
+    record.onEvent = (event, raw) => {
+      if (event?.type === 'owned.tool.end' && event.error === true) {
+        failedTools.push({ id: event.id, output: String(event.output || '').slice(0, 4096) })
+        if (failedTools.length > 4) failedTools.shift()
+      }
+      originalEvent?.(event, raw)
+    }
     record.environment = prepareProcessLaunchEnvironment(f.processAdapter, record.reservationId, {
       ...nativeEnvironment(),
       ...Object.fromEntries(['DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR'].filter(name => process.env[name]).map(name => [name, process.env[name]])),
@@ -96,7 +104,7 @@ async function scenario(t, options = {}) {
       // The runner's durable transcript remains private under the fixture root.
       // Emit bounded raw bytes only for failed native probes, so CI can distinguish
       // a provider startup failure from a controller-side classification.
-      t.diagnostic(JSON.stringify({ vscodeNativeFailure: { code: error?.code || null, message: error?.message || String(error), proxy: f.proxyDiagnostic() } }))
+      t.diagnostic(JSON.stringify({ vscodeNativeFailure: { code: error?.code || null, message: error?.message || String(error), failedTools, proxy: f.proxyDiagnostic() } }))
       throw error
     }
   }
