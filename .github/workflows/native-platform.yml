@@ -17,7 +17,12 @@ on:
         required: false
         default: opencode
         type: choice
-        options: [opencode, deepseek, reasonix]
+        options: [opencode, deepseek, reasonix, prime, omp, kilo]
+      support_arm:
+        description: 'Limit focused Windows provider verification to ARM64'
+        required: false
+        default: false
+        type: boolean
       support_single:
         description: 'Limit focused Windows provider diagnostics to x64'
         required: false
@@ -1141,14 +1146,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.support_host == 'windows' && inputs.support_single == true && '[{"os":"windows-latest","arch":"x64"}]' || inputs.support_host == 'linux' && '[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"}]' || inputs.support_host == 'macos' && '[{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"}]' || '[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}]') }}
+        runner: ${{ fromJSON(inputs.support_host == 'windows' && inputs.support_arm == true && '[{"os":"windows-11-arm","arch":"arm64"}]' || inputs.support_host == 'windows' && inputs.support_single == true && '[{"os":"windows-latest","arch":"x64"}]' || inputs.support_host == 'linux' && '[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"}]' || inputs.support_host == 'macos' && '[{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"}]' || '[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner.os }}
     timeout-minutes: 60
     env:
       AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
       SUPPORT_PROVIDER: ${{ inputs.support_provider }}
-      PROVIDER_PACKAGE: ${{ inputs.support_provider == 'deepseek' && '@deepseek-ai/dsh@0.1.2-rc.1' || inputs.support_provider == 'reasonix' && 'reasonix@1.30.0' || 'opencode-ai@1.18.32' }}
-      PROVIDER_BIN: ${{ inputs.support_provider == 'deepseek' && 'dsh' || inputs.support_provider == 'reasonix' && 'reasonix' || 'opencode' }}
+      PROVIDER_PACKAGE: ${{ inputs.support_provider == 'deepseek' && '@deepseek-ai/dsh@0.1.2-rc.1' || inputs.support_provider == 'reasonix' && 'reasonix@1.30.0' || inputs.support_provider == 'prime' && './.native-provider/prime-agent-0.7.2.tgz' || inputs.support_provider == 'kilo' && '@kilocode/cli@7.5.15' || 'opencode-ai@1.18.32' }}
+      PROVIDER_BIN: ${{ inputs.support_provider == 'deepseek' && 'dsh' || inputs.support_provider == 'reasonix' && 'reasonix' || inputs.support_provider == 'prime' && 'prime-agent' || inputs.support_provider == 'kilo' && 'kilo' || 'opencode' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -1164,9 +1169,17 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - run: npm ci --ignore-scripts
+      - name: Download the exact Prime release archive
+        if: inputs.support_provider == 'prime'
+        run: node tests/helpers/install-provider-release-ci.cjs prime
       - name: Install the reported official npm provider and its generated launchers
+        if: inputs.support_provider != 'omp'
         run: npm install --prefix .native-provider --no-package-lock --no-audit --no-fund ${{ env.PROVIDER_PACKAGE }}
+      - name: Install the exact native OMP release
+        if: inputs.support_provider == 'omp'
+        run: node tests/helpers/install-provider-release-ci.cjs omp
       - name: Bind the actual npm command shim on Windows
+        if: inputs.support_provider != 'omp'
         run: >-
           node -e "const fs=require('node:fs'),path=require('node:path');
           const suffix=process.platform==='win32'?'.cmd':'';

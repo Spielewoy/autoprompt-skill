@@ -87,8 +87,22 @@ test('Darwin coalition production sources retain exact-token and atomic-usage bo
   assert.match(helper, /coalition_info_resource_usage/)
   assert.match(helper, /struct ap_coalition_usage_prefix/)
   assert.doesNotMatch(adapter, /process\.kill\s*\(/)
-  assert.match(adapter, /remaining\.status !== 3/)
+  assert.match(adapter, /remaining\.status === reference\.status/)
   assert.match(adapter, /launchd-absent-without-published-identity/)
+})
+
+test('Darwin missing-service proof rejects arbitrary failures and mismatched live domains', () => {
+  const { sameMissingServiceResponse } = require('../../agents/codex/workflow/darwin-launchd-process.js')
+  const missing = name => ({ status: 113, stdout: '', stderr: `Bad request.\nCould not find service "${name}" in domain for user gui: 501\n`, error: undefined, signal: null })
+  const reference = missing('never-created'), actual = missing('owned')
+  assert.equal(sameMissingServiceResponse(actual, 'owned', reference, 'never-created'), true)
+  for (const changed of [
+    { ...actual, status: 0 }, { ...actual, status: 3 }, { ...actual, signal: 'SIGTERM' },
+    { ...actual, error: new Error('timeout') }, { ...actual, stdout: 'still running' },
+    { ...actual, stderr: 'Operation not permitted' },
+    { ...actual, stderr: actual.stderr.replace('501', '502') }, missing('other-owner'),
+  ]) assert.equal(sameMissingServiceResponse(changed, 'owned', reference, 'never-created'), false)
+  assert.equal(sameMissingServiceResponse(actual, 'owned', { ...reference, stderr: 'domain unavailable' }, 'never-created'), false)
 })
 
 test('native Darwin launchd coalition survives root death and a fresh adapter drains detached children', {
@@ -112,7 +126,7 @@ test('native Darwin launchd coalition survives root death and a fresh adapter dr
   const sdkPath = requireSuccess(command('/usr/bin/xcrun', ['--show-sdk-path']), 'read SDK path').stdout.trim()
   const sdkVersion = requireSuccess(command('/usr/bin/xcrun', ['--show-sdk-version']), 'read SDK version').stdout.trim()
   requireSuccess(command(compiler, [
-    '-isysroot', sdkPath, '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', HELPER_SOURCE, '-o', helper,
+    '-isysroot', sdkPath, '-mmacosx-version-min=13.5', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', HELPER_SOURCE, '-o', helper,
   ]), 'compile coalition helper')
   const loadCommands = requireSuccess(command('/usr/bin/otool', ['-l', helper]), 'read helper load commands').stdout
   const buildVersion = /cmd LC_BUILD_VERSION[\s\S]*?platform\s+(\S+)[\s\S]*?minos\s+(\S+)[\s\S]*?sdk\s+(\S+)/.exec(loadCommands)
@@ -144,7 +158,7 @@ int main(int argc, char **argv) {
 `
   fs.writeFileSync(fixtureSource, fixtureText, { mode: 0o600 })
   requireSuccess(command(compiler, [
-    '-isysroot', sdkPath, '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', fixtureSource, '-o', fixture,
+    '-isysroot', sdkPath, '-mmacosx-version-min=13.5', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', fixtureSource, '-o', fixture,
   ]), 'compile detached fixture')
   fs.writeFileSync(slowHelperSource, [
     '#include <string.h>',
@@ -158,7 +172,7 @@ int main(int argc, char **argv) {
     '',
   ].join('\n'), { mode: 0o600 })
   requireSuccess(command(compiler, [
-    '-isysroot', sdkPath, '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', slowHelperSource, '-o', slowHelper,
+    '-isysroot', sdkPath, '-mmacosx-version-min=13.5', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', slowHelperSource, '-o', slowHelper,
   ]), 'compile delayed helper shim')
 
   const helperBinding = { path: fs.realpathSync.native(helper), sha256: sha256(fs.readFileSync(helper)) }
@@ -190,7 +204,7 @@ int main(int argc, char **argv) {
     compiler: { path: compiler, version: compilerVersion },
     sdkVersion,
     sdkPath,
-    deploymentTarget: process.env.MACOSX_DEPLOYMENT_TARGET || 'compiler-default',
+    deploymentTarget: '13.5',
     binaryBuildVersion: { platform: buildVersion[1], minimumOs: buildVersion[2], sdk: buildVersion[3] },
   }
   try {
@@ -247,7 +261,8 @@ int main(int argc, char **argv) {
     const absent = command('/bin/launchctl', ['print', `${request.domain}/${request.label}`])
     assert.equal(absent.error, undefined)
     assert.equal(absent.signal, null)
-    assert.equal(absent.status, 3)
+    assert.notEqual(absent.status, 0)
+    assert.ok(absent.stderr.includes(`Could not find service "${request.label}" in domain for `))
 
     const slowControlRoot = path.join(temporaryRoot, 'slow-control')
     const slowBinding = { path: fs.realpathSync.native(slowHelper), sha256: sha256(fs.readFileSync(slowHelper)) }
@@ -276,7 +291,8 @@ int main(int argc, char **argv) {
     const slowDirectory = path.join(slowControlRoot, sha256(slowReservationId))
     const slowRequest = JSON.parse(fs.readFileSync(path.join(slowDirectory, 'request.json'), 'utf8'))
     const slowAbsent = command('/bin/launchctl', ['print', `${slowRequest.domain}/${slowRequest.label}`])
-    assert.equal(slowAbsent.status, 3)
+    assert.equal(slowAbsent.status, absent.status)
+    assert.ok(slowAbsent.stderr.includes(`Could not find service "${slowRequest.label}" in domain for `))
     await sleep(3500)
     assert.equal(fs.existsSync(path.join(slowDirectory, 'ready.json')), false)
     assert.equal(fs.existsSync(path.join(temporaryRoot, 'must-not-spawn.txt')), false)
@@ -293,6 +309,10 @@ int main(int argc, char **argv) {
     evidence.checksumRefused = true
     evidence.survivors = children.filter(alive)
     assert.deepEqual(evidence.survivors, [])
+  } catch (error) {
+    evidence.failure = { code: error.code, message: error.message, details: error.details }
+    console.error(JSON.stringify(evidence.failure))
+    throw error
   } finally {
     if (ownership && fresh) {
       try { await fresh.signalOwned(ownership.groupIdentity, 'KILL') } catch {}

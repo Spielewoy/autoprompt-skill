@@ -5,6 +5,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { pathToFileURL } = require('node:url')
 const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const { readBound, sha256, privateDirectory, writePrivate } = require('../agents/reasonix/workflow/native.js')
@@ -1458,7 +1459,10 @@ function createLaunch(options) {
     const sessionId = continuationId || crypto.randomUUID()
     writePrivate(file, JSON.stringify([
       ...['sdk-app-startup', 'sdk-jsonrpc-server', 'persistent-bash', 'persistent-pwsh', 'str-replace-editor', 'llm-retry', 'session-log-deepseek', 'plugin-package-inventory-deepseek'].map(id => ({ id, disabled: true })),
-      { insert: [{ id: 'autoprompt-owned-sdk', name: require.resolve('./harness-v2-bridge/deepseek/plugin.cjs'), config: {
+      // dsh-app-boot accepts URL module specifiers portably. Passing a raw
+      // Windows drive path reaches Cordis's bare-module resolver before its
+      // host-path conversion and the owned plugin cannot be loaded.
+      { insert: [{ id: 'autoprompt-owned-sdk', name: pathToFileURL(require.resolve('./harness-v2-bridge/deepseek/plugin.cjs')).href, config: {
         packageRoot, oneShot: true, sessionId, input,
         initialize: { cwd: options.cwd, provider: connection.modelProvider || 'deepseek-official', model: model || 'deepseek-chat', outputSchema: options.outputSchema, ...(effort ? { reasoningEffort: effort } : {}), ...(continuationId ? { resumeSessionId: continuationId } : {}) },
       } }] },

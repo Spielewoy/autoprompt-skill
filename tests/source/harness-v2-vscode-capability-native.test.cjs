@@ -13,12 +13,12 @@ const test = require('node:test')
 const native = require('../../scripts/harness-v2-native.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
-const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { privateDirectory, nativeProcessAdapter, nativeEnvironment, nodeCommand, readCommand } = require('../helpers/native-platform.cjs')
 const { fixture } = require('./harness-v2-vscode-owned-native.test.cjs')
 
 const CLI = process.env.AUTOPROMPT_VSCODE_TEST_CLI
 const enabled = Boolean(CLI)
-const quote = value => `'${value.replaceAll("'", "'\\''")}'`
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 function closedBinding() {
@@ -76,19 +76,19 @@ async function scenario(t, options = {}) {
       return
     }
     const first = !options.noTools && !hasToolResult(body)
-    const tool = first ? { id: `vscode-tool-${crypto.randomUUID()}`, type: 'function', function: { name: options.toolName || 'autoprompt_owned_bash', arguments: JSON.stringify({ command: typeof options.command === 'function' ? options.command(f, challenge) : (options.command || `cat ${quote(path.join(f.target, 'candidate.txt'))}`) }) } } : null
+    const tool = first ? { id: `vscode-tool-${crypto.randomUUID()}`, type: 'function', function: { name: options.toolName || 'autoprompt_owned_bash', arguments: JSON.stringify({ command: typeof options.command === 'function' ? options.command(f, challenge) : (options.command || readCommand(path.join(f.target, 'candidate.txt'))) }) } } : null
     reply(res, body, tool)
   } })
   f.challenge = challenge
   f.seen = seen
-  f.processAdapter = createPosixProcessAdapter()
+  f.processAdapter = f.runner.processOwner.adapter
   f.registryPath = f.runner.processOwner.registryPath
   const original = f.execution.checkerScratchVerifier
   f.execution.checkerScratchVerifier = record => record.checkerScratchBoundary || original?.(record)
   f.run = async (overrides = {}) => {
     const record = { ...f.record, ...overrides }
     record.environment = prepareProcessLaunchEnvironment(f.processAdapter, record.reservationId, {
-      PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH || ''}`,
+      ...nativeEnvironment(),
       ...Object.fromEntries(['DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR'].filter(name => process.env[name]).map(name => [name, process.env[name]])),
     })
     record.signal = overrides.signal || AbortSignal.timeout(120000)
@@ -111,8 +111,7 @@ test('vscode native capability isolation', { skip: !enabled, timeout: 180000 }, 
   try {
     const f = await scenario(t, { command: (value, challenge) => {
       const candidate = path.join(value.target, 'candidate.txt'), secret = path.join(value.controller, 'private.txt'), scratch = scratchFor(value)
-      const probe = `const n=require('node:net');const s=n.connect(${listener.address().port},'127.0.0.1');s.on('connect',()=>process.exit(21));s.on('error',()=>process.exit(0));setTimeout(()=>process.exit(0),500)`
-      return `cat ${quote(candidate)}; printf scratch-ok > ${quote(path.join(scratch, 'isolation.txt'))}; if printf forbidden > ${quote(candidate)} 2>/dev/null; then exit 18; fi; if cat ${quote(secret)} 2>/dev/null; then exit 19; fi; node -e ${quote(probe)}; printf 'CLOSED_CANARY_CHALLENGE:%s\\n' ${quote(challenge)}`
+      return nodeCommand(`const fs=require('node:fs'),net=require('node:net');const candidate=${JSON.stringify(candidate)},secret=${JSON.stringify(secret)};process.stdout.write(fs.readFileSync(candidate));fs.writeFileSync(${JSON.stringify(path.join(scratch, 'isolation.txt'))},'scratch-ok');try{fs.writeFileSync(candidate,'forbidden');process.exit(18)}catch{};try{fs.readFileSync(secret);process.exit(19)}catch{};let done=false;const finish=()=>{if(done)return;done=true;process.stdout.write(${JSON.stringify(`CLOSED_CANARY_CHALLENGE:${challenge}\n`)})};const socket=net.connect(${listener.address().port},'127.0.0.1');socket.on('connect',()=>process.exit(21));socket.on('error',finish);setTimeout(finish,500)`)
     } })
     fs.writeFileSync(path.join(f.target, 'candidate.txt'), 'vscode-isolation-marker')
     fs.writeFileSync(path.join(f.controller, 'private.txt'), 'PRIVATE_VSCODE_CONTROLLER')
@@ -140,7 +139,7 @@ test('vscode native capability privateSkillRoot', { skip: !enabled, timeout: 180
   const f = await scenario(t)
   fs.writeFileSync(path.join(f.target, 'candidate.txt'), 'private-skill-marker')
   fs.writeFileSync(path.join(f.target, 'AGENTS.md'), 'AMBIENT_PROJECT_INSTRUCTIONS_MUST_NOT_LOAD')
-  fs.mkdirSync(path.join(f.target, '.vscode'), { mode: 0o700 })
+  privateDirectory(path.join(f.target, '.vscode'))
   fs.writeFileSync(path.join(f.target, '.vscode', 'settings.json'), '{"autoprompt":"AMBIENT_VSCODE_SKILL_MUST_NOT_LOAD"}')
   fs.writeFileSync(path.join(f.controller, 'private.txt'), 'PRIVATE_VSCODE_CONTROLLER_MUST_NOT_LOAD')
   const result = await f.run(); good(result)
@@ -171,7 +170,7 @@ test('vscode native capability eventStreaming', { skip: !enabled, timeout: 18000
 })
 
 test('vscode native capability toolOutputCapture', { skip: !enabled, timeout: 180000 }, async t => {
-  const f = await scenario(t, { command: (value, challenge) => `printf 'exact-utf8:☃:é\\nCLOSED_CANARY_CHALLENGE:%s\\n' ${quote(challenge)}` })
+  const f = await scenario(t, { command: (value, challenge) => nodeCommand(`process.stdout.write(${JSON.stringify('exact-utf8:☃:é\n')}+${JSON.stringify(`CLOSED_CANARY_CHALLENGE:${challenge}\n`)})`) })
   const result = await f.run(); good(result)
   const expected = `exact-utf8:☃:é\nCLOSED_CANARY_CHALLENGE:${f.challenge}\n`
   const stored = receipt(f, result)
@@ -211,9 +210,9 @@ test('vscode native capability sameContextContinuation', { skip: !enabled, timeo
   const resumed = await f.run({ reservationId: crypto.randomUUID(), continuationId: first.contextId }); good(resumed)
   assert.equal(resumed.contextId, first.contextId)
   assert.equal(resumed.toolBoundaryEvidence.receiptHashes.length, 0)
-  const foreign = path.join(f.root, 'foreign'); fs.mkdirSync(foreign, { mode: 0o700 })
+  const foreign = privateDirectory(path.join(f.root, 'foreign'))
   await assert.rejects(f.execution.launch({ ...f.record, reservationId: crypto.randomUUID(), continuationId: first.contextId, workingDirectory: foreign,
-    environment: prepareProcessLaunchEnvironment(f.processAdapter, crypto.randomUUID(), { PATH: process.env.PATH }), signal: AbortSignal.timeout(30000) }), { code: 'SESSION_ID_MISMATCH' })
+    environment: prepareProcessLaunchEnvironment(f.processAdapter, crypto.randomUUID(), nativeEnvironment()), signal: AbortSignal.timeout(30000) }), { code: 'SESSION_ID_MISMATCH' })
 })
 
 test('vscode native capability cancellation', { skip: !enabled, timeout: 180000 }, async t => {
@@ -238,10 +237,10 @@ test('vscode native capability cancellation', { skip: !enabled, timeout: 180000 
 
 test('vscode native capability isolatedChecking', { skip: !enabled, timeout: 180000 }, async t => {
   let frozen, scratch, candidate, checker
-  const checked = await scenario(t, { command: () => `cat ${quote(candidate)}; printf checked > ${quote(path.join(scratch, 'checker.txt'))}; if printf wrong > ${quote(candidate)} 2>/dev/null; then exit 19; fi` })
+  const checked = await scenario(t, { command: () => nodeCommand(`const fs=require('node:fs');const candidate=${JSON.stringify(candidate)};process.stdout.write(fs.readFileSync(candidate));fs.writeFileSync(${JSON.stringify(path.join(scratch, 'checker.txt'))},'checked');try{fs.writeFileSync(candidate,'wrong');process.exit(19)}catch{}`) })
   frozen = path.join(checked.root, 'frozen'); scratch = path.join(checked.root, 'checker-scratch')
-  fs.mkdirSync(frozen, { mode: 0o700 }); fs.mkdirSync(scratch, { mode: 0o700 })
-  for (const name of ['tmp', 'output', 'cache']) fs.mkdirSync(path.join(scratch, name), { mode: 0o700 })
+  frozen = privateDirectory(frozen); scratch = privateDirectory(scratch)
+  for (const name of ['tmp', 'output', 'cache']) privateDirectory(path.join(scratch, name))
   candidate = path.join(frozen, 'candidate.txt'); fs.writeFileSync(candidate, 'frozen-vscode-candidate', { mode: 0o600 })
   checker = { schemaVersion: 1, capability: native.sha256('vscode-native-checker'), runId: 'vscode-native-checker', checkerId: 'vscode-independent', candidateHash: native.sha256('frozen-vscode-candidate'), frozenCandidateRoot: frozen, writableScratchRoot: scratch, temporaryRoot: path.join(scratch, 'tmp'), outputRoot: path.join(scratch, 'output'), cacheRoot: path.join(scratch, 'cache') }
   const record = { ...checked.record, logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', workingDirectory: scratch, canonicalTargetPath: frozen, candidateHash: checker.candidateHash, checkerScratchBoundary: checker,
@@ -256,7 +255,7 @@ test('vscode native capability processOwnership', { skip: !enabled, timeout: 180
   const pending = f.run()
   for (let index = 0; index < 2400 && f.seen.length === 0; index++) await wait(25)
   assert.equal(f.seen.length, 1)
-  const recovered = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: f.registryPath, pollMs: 10 })
+  const recovered = new ProcessOwner({ adapter: nativeProcessAdapter(f.registryPath, path.dirname(f.registryPath)), registryPath: f.registryPath, pollMs: 10 })
   await recovered.recoverReservations()
   assert.equal(recovered.ownershipIdentities().length, 1, 'fresh ProcessOwner did not recover the live VS Code host')
   await recovered.cancelAll({ reason: 'simulated VS Code controller crash', graceMs: 0, killMs: 2000, waitForPending: true })

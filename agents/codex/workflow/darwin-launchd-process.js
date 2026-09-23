@@ -80,6 +80,16 @@ function xml(value) {
 function launchPlist(label, requestPath) {
   return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${xml(label)}</string><key>ProgramArguments</key><array>${[process.execPath, __filename, '--job', requestPath].map(value => `<string>${xml(value)}</string>`).join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/><key>AbandonProcessGroup</key><false/><key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string></dict></plist>`
 }
+function sameMissingServiceResponse(remaining, label, reference, missingLabel) {
+  const normalize = (result, name) => {
+    if (!Number.isInteger(result.status) || result.status === 0 || result.error || result.signal || result.stdout.trim()) return null
+    const marker = `Could not find service "${name}" in domain for `
+    if (!result.stderr.includes(marker) || result.stderr.split(name).length !== 2) return null
+    return result.stderr.replace(name, '<owned-service>')
+  }
+  const expected = normalize(reference, missingLabel)
+  return expected !== null && remaining.status === reference.status && normalize(remaining, label) === expected
+}
 function createDarwinCoalitionAdapter(options = {}) {
   if (process.platform !== 'darwin') fail('PROVIDER_UNSUPPORTED', 'Darwin launchd ownership requires native macOS')
   if (!path.isAbsolute(options.controlRoot || '')) fail('PROCESS_OWNER_CONFIG_INVALID', 'Darwin ownership requires a private control root')
@@ -122,14 +132,22 @@ function createDarwinCoalitionAdapter(options = {}) {
     return { dir, request, ready }
   }
   function launchctl(argv) { return cp.spawnSync('/bin/launchctl', argv, { shell: false, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024, env: { PATH: '/usr/bin:/bin', LANG: 'C' } }) }
+  function absentService(request) {
+    const domain = launchctl(['print', request.domain])
+    if (domain.status !== 0 || domain.error || domain.signal) return false
+    // launchctl's named-service errors use its own status namespace, not
+    // errno. Bind the complete response to a fresh, never-bootstrapped label
+    // in the same live domain instead of treating any nonzero exit as absent.
+    const missingLabel = `com.autoprompt.absence.${crypto.randomUUID()}`
+    const reference = launchctl(['print', `${request.domain}/${missingLabel}`])
+    const remaining = launchctl(['print', `${request.domain}/${request.label}`])
+    return sameMissingServiceResponse(remaining, request.label, reference, missingLabel)
+  }
   function stopJob(dir, request) {
     const job = `${request.domain}/${request.label}`
     const result = launchctl(['bootout', job])
     if (result.error || result.signal) fail('PROCESS_DRAIN_TIMEOUT', 'Darwin launchd stop did not settle')
-    const remaining = launchctl(['print', job])
-    // launchctl returns ESRCH (3) for an absent named service. An arbitrary
-    // error, a missing domain, or a timeout is not absence evidence.
-    if (remaining.status !== 3 || remaining.error || remaining.signal) fail('PROCESS_DRAIN_TIMEOUT', 'Darwin launchd job absence was not established')
+    if (!absentService(request)) fail('PROCESS_DRAIN_TIMEOUT', 'Darwin launchd job absence was not established')
     if (!fs.existsSync(files(dir).stopped)) writeExclusive(files(dir).stopped, { requestChecksum: request.checksum, bootUuid })
   }
   function activeTasks(ready) {
@@ -274,4 +292,4 @@ if (require.main === module) {
   if (process.argv.length !== 4 || process.argv[2] !== '--job' || process.platform !== 'darwin') process.exitCode = 64
   else runJob(process.argv[3]).catch(() => { process.exitCode = 1 })
 }
-module.exports = { createDarwinCoalitionAdapter, helperCall, launchPlist }
+module.exports = { createDarwinCoalitionAdapter, helperCall, launchPlist, sameMissingServiceResponse }

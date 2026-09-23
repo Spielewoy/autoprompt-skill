@@ -24,6 +24,30 @@ function writeNativeEvidence(body) {
   fs.writeFileSync(path.join(root, name), `${JSON.stringify(body, null, 2)}\n`, { flag: 'wx', mode: 0o600 })
 }
 
+function ownPidDiagnostics(records, startedAt, ownedPid) {
+  const status = records.find(record => /(?:^|\/)status\.json$/.test(record.name))
+  let pid = ownedPid
+  if (!Number.isSafeInteger(pid)) { try { pid = JSON.parse(status?.text || '').codexPid } catch {} }
+  if (!Number.isSafeInteger(pid) || pid < 1) return []
+  const values = []
+  const log = cp.spawnSync('/usr/bin/log', ['show', '--style', 'compact', '--last', '2m', '--predicate', `eventMessage CONTAINS[c] "[${pid}]" OR eventMessage CONTAINS[c] "(${pid})"`], { encoding: 'utf8', timeout: 10000, maxBuffer: 65536, shell: false })
+  if (log.status === 0 && log.stdout) values.push({ source: 'unified-log', pid, text: log.stdout.slice(-8192) })
+  const reports = path.join(os.homedir(), 'Library', 'Logs', 'DiagnosticReports')
+  let entries = []
+  try { entries = fs.readdirSync(reports, { withFileTypes: true }) } catch { return values }
+  for (const entry of entries) {
+    if (!entry.isFile() || values.length >= 3) continue
+    const file = path.join(reports, entry.name)
+    let stat
+    try { stat = fs.lstatSync(file) } catch { continue }
+    if (stat.isSymbolicLink() || stat.size > 2 * 1024 * 1024 || stat.mtimeMs < startedAt - 60000) continue
+    let text
+    try { text = fs.readFileSync(file, 'utf8') } catch { continue }
+    if (text.includes(`[${pid}]`)) values.push({ source: 'crash-report', pid, name: entry.name, text: text.slice(-8192) })
+  }
+  return values
+}
+
 function fixture(t) {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-command-sandbox-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -34,7 +58,7 @@ function fixture(t) {
   const helper = path.join(root, 'helper')
   const seatbelt = path.join(root, 'sandbox-exec')
   fs.writeFileSync(helper, 'helper', { mode: 0o700 }); fs.writeFileSync(seatbelt, 'sandbox', { mode: 0o700 })
-  return { root, target, scratch, secret, control, temp, helper: { path: helper, sha256: hashFile(helper) }, seatbelt: { path: seatbelt, sha256: hashFile(seatbelt) },
+  return { startedAt: Date.now(), root, target, scratch, secret, control, temp, helper: { path: helper, sha256: hashFile(helper) }, seatbelt: { path: seatbelt, sha256: hashFile(seatbelt) },
     policy: { readOnly: true, targetPath: target, scratchPath: scratch, readableRoots: [target, scratch], writableRoots: [scratch] } }
 }
 
@@ -45,8 +69,15 @@ test('Darwin Seatbelt profile is default-deny and grants only exact roots, fixed
   assert.match(profile, new RegExp(`\\(subpath ${JSON.stringify(f.target).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`))
   assert.match(profile, new RegExp(`\\(subpath ${JSON.stringify(f.scratch).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`))
   assert.match(profile, /\(allow process-exec \(literal "\/bin\/sh"\)\)/)
+  assert.match(profile, /\(allow process-info\* \(target same-sandbox\)\)/)
+  assert.match(profile, /\(allow mach-priv-task-port \(target same-sandbox\)\)/)
+  for (const name of sandbox.NODE_STARTUP_SYSCTLS) assert.match(profile, new RegExp(`\(sysctl-name ${JSON.stringify(name)}\)`))
+  for (const name of sandbox.NODE_STARTUP_MACH_SERVICES) assert.match(profile, new RegExp(`\(global-name ${JSON.stringify(name)}\)`))
   assert.equal(profile.includes('network-outbound'), false)
-  assert.equal(profile.includes('mach-lookup'), false)
+  assert.equal(profile.includes('network-inbound'), false)
+  assert.equal(profile.includes('ipc-posix-shm'), false)
+  assert.equal(profile.includes('ipc-posix-sem'), false)
+  assert.equal(profile.includes('system-socket'), false)
   assert.equal(profile.includes('mach-register'), false)
   assert.equal(profile.includes('launchctl'), false)
   assert.equal(profile.includes('system-write-bootstrap'), false)
@@ -96,20 +127,38 @@ test('Darwin native command sandbox isolates candidate, scratch, controller, net
   const f = fixture(t)
   const helperPath = path.join(f.root, 'coalition-helper')
   const source = path.resolve(__dirname, '../../agents/codex/workflow/darwin-coalition-helper.c')
-  const compile = cp.spawnSync('/usr/bin/cc', ['-O2', source, '-o', helperPath], { encoding: 'utf8', timeout: 30000, shell: false })
+  const sdk = cp.spawnSync('/usr/bin/xcrun', ['--sdk', 'macosx', '--show-sdk-path'], { encoding: 'utf8', timeout: 30000, shell: false })
+  assert.equal(sdk.status, 0, sdk.stderr)
+  const sdkPath = sdk.stdout.trim()
+  assert.ok(path.isAbsolute(sdkPath), sdk.stdout)
+  const compile = cp.spawnSync('/usr/bin/cc', ['-O2', '-isysroot', sdkPath, '-mmacosx-version-min=13.5', source, '-o', helperPath], { encoding: 'utf8', timeout: 30000, shell: false })
   assert.equal(compile.status, 0, compile.stderr)
   const backend = sandbox.createDarwinCommandSandbox({ controlRoot: f.control, tempRoot: f.temp, helper: { path: helperPath, sha256: hashFile(helperPath) }, targetKey: 'darwin-command-native-test' })
+  let ownedCodexPid = null
+  const originalRun = backend.runner.run.bind(backend.runner)
+  backend.runner.run = async spec => {
+    const result = await originalRun(spec)
+    if (Number.isSafeInteger(result?.codexPid) && result.codexPid > 0) ownedCodexPid = result.codexPid
+    return result
+  }
+  const captureFailure = (error, result) => {
+    const records = []
+    for (const name of fs.readdirSync(f.control, { recursive: true })) {
+      if (!/(?:stderr|status|exit)(?:\.log|\.json|\.txt)?$/.test(name)) continue
+      const file = path.join(f.control, name), stat = fs.lstatSync(file)
+      if (stat.isFile() && !stat.isSymbolicLink() && stat.size <= 65536) records.push({ name, text: fs.readFileSync(file, 'utf8').slice(-8192) })
+      if (records.length >= 8) break
+    }
+    const boundedResult = result && { status: result.status, signal: result.signal, stdout: typeof result.stdout === 'string' ? result.stdout.slice(-8192) : null, stderr: typeof result.stderr === 'string' ? result.stderr.slice(-8192) : null, outputSha256: result.outputSha256 || null, durationMs: result.durationMs }
+    console.error(JSON.stringify({ fixtureFailure: error?.code || error?.message || 'command returned failed status', result: boundedResult, records, ownPidDiagnostics: ownPidDiagnostics(records, f.startedAt, ownedCodexPid) }))
+  }
   const runCommand = async (...args) => {
-    try { return await backend.command(...args) }
-    catch (error) {
-      const records = []
-      for (const name of fs.readdirSync(f.control, { recursive: true })) {
-        if (!/(?:stderr|status|exit)(?:\.log|\.json|\.txt)?$/.test(name)) continue
-        const file = path.join(f.control, name), stat = fs.lstatSync(file)
-        if (stat.isFile() && !stat.isSymbolicLink() && stat.size <= 65536) records.push({ name, text: fs.readFileSync(file, 'utf8').slice(-8192) })
-        if (records.length >= 8) break
-      }
-      console.error(JSON.stringify({ fixtureFailure: error.code || error.message, records }))
+    try {
+      const result = await backend.command(...args)
+      if (result.status === 'failed' && !result.cancelled && !result.timedOut) captureFailure(null, result)
+      return result
+    } catch (error) {
+      captureFailure(error)
       throw error
     }
   }

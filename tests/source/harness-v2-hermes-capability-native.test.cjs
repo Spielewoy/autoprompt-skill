@@ -14,16 +14,16 @@ const native = require('../../scripts/harness-v2-native.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
-const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment } = require('../helpers/native-platform.cjs')
 const CLI = process.env.AUTOPROMPT_HERMES_TEST_CLI
-const options = { skip: !CLI || process.platform === 'win32', timeout: 300000 }
-const q = value => "'" + value.replaceAll("'", "'\\''") + "'"
+const options = { skip: !CLI, timeout: 300000 }
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 function makeFixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-capability-native-'))
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-capability-native-')))
   const target = path.join(root, 'target'), controller = path.join(root, 'controller')
-  fs.mkdirSync(target, { mode: 0o700 }); fs.mkdirSync(controller, { mode: 0o700 })
+  privateDirectory(target); privateDirectory(controller)
   const supplied = process.env.AUTOPROMPT_CLOSED_CANARY_CHALLENGE
   if (supplied !== undefined && !/^[A-Za-z0-9_-]{43}$/.test(supplied)) throw new Error('AUTOPROMPT_CLOSED_CANARY_CHALLENGE must be a 32-byte base64url nonce')
   const outerActivation = process.env.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID
@@ -79,14 +79,14 @@ async function modelService(config) {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   return { server, requests, emittedToolNames, port: server.address().port, tool: config.tool }
 }
-function ownership(f, adapter) {
+function ownership(f) {
+  const makeOwner = registryPath => new ProcessOwner({ adapter: nativeProcessAdapter(registryPath, path.dirname(registryPath)), registryPath, pollMs: 10 })
   const root = process.env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT
-  if (!root) return new ProcessOwner({ adapter, registryPath: path.join(f.controller, 'processes.json'), pollMs: 10 })
+  if (!root) return makeOwner(path.join(f.controller, 'processes.json'))
   if (!path.isAbsolute(root) || process.env.AUTOPROMPT_CLOSED_CANARY_PROVIDER !== 'hermes' || process.env.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID !== f.record.activationId || process.env.AUTOPROMPT_CLOSED_CANARY_GENERATION !== String(f.record.generation)) throw new Error('closed canary ownership registration binding is invalid')
-  const directory = path.join(root, 'hermes-' + crypto.randomUUID()), registryPath = path.join(directory, 'processes.json')
-  fs.mkdirSync(directory, { mode: 0o700 })
+  const directory = privateDirectory(path.join(root, 'hermes-' + crypto.randomUUID())), registryPath = path.join(directory, 'processes.json')
   fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify({ schemaVersion: 1, provider: 'hermes', activationId: f.record.activationId, generation: f.record.generation, challenge: f.challenge, registryPath }), { flag: 'wx', mode: 0o600 })
-  return new ProcessOwner({ adapter, registryPath, pollMs: 10 })
+  return makeOwner(registryPath)
 }
 function scratchFor(f, record) { record ||= f.record; return path.join(f.nativeRoot, 'hermes', native.sha256(record.sessionId), native.sha256(record.reservationId), 'scratch') }
 function toolsFor(f, record) { record ||= f.record; return path.join(f.nativeRoot, 'hermes', native.sha256(record.sessionId), native.sha256(record.reservationId), 'tool-control') }
@@ -119,24 +119,24 @@ function hermesMessages(f) {
 async function scenario(t, config = {}) {
   assert.ok(CLI, 'AUTOPROMPT_HERMES_TEST_CLI is required')
   const sandbox = await boundary.probeCommandSandbox(); assert.equal(sandbox.supported, true, JSON.stringify(sandbox))
-  const f = makeFixture(); fs.mkdirSync(f.nativeRoot, { mode: 0o700 })
+  const f = makeFixture(); privateDirectory(f.nativeRoot)
   const candidate = path.join(f.target, 'candidate.txt'), secret = path.join(f.controller, 'private.txt'), marker = 'hermes-native-capability-' + crypto.randomUUID(), scratch = scratchFor(f)
   fs.writeFileSync(candidate, marker, { mode: 0o600 }); fs.writeFileSync(secret, 'PRIVATE_CONTROLLER_MUST_NOT_BE_VISIBLE', { mode: 0o600 }); fs.writeFileSync(path.join(f.target, 'AGENTS.md'), 'AMBIENT_PROJECT_INSTRUCTIONS_MUST_NOT_AUTOLOAD', { mode: 0o600 })
   const values = { ...f, candidate, secret, marker, scratch }
-  const original = typeof config.command === 'function' ? config.command(values) : config.command || 'cat ' + q(candidate)
-  const command = original + '; printf "\\nCLOSED_CANARY_CHALLENGE:%s\\n" ' + q(f.challenge)
+  const original = typeof config.command === 'function' ? config.command(values) : config.command || readCommand(candidate)
+  const command = withChallenge(original, f.challenge)
   let releaseFinal; const finalReleased = new Promise(resolve => { releaseFinal = resolve }); let heldFinal
   const finalHeld = new Promise(resolve => { heldFinal = resolve })
   const service = await modelService({ tool: config.tool || { name: 'autoprompt_owned_bash', args: { command } }, hold: config.hold, holdFinal: config.holdFinal, releaseFinal: finalReleased, finalHeld: () => heldFinal() })
   service.releaseFinal = releaseFinal; service.finalHeld = finalHeld
   const binding = native.probeExecutable({ provider: 'hermes', executable: CLI, env: { PATH: process.env.PATH } })
-  const processAdapter = createPosixProcessAdapter(), owner = ownership(f, processAdapter)
-  const proxy = path.join(f.controller, 'proxy'); fs.mkdirSync(proxy, { mode: 0o700 })
+  const owner = ownership(f), processAdapter = owner.adapter
+  const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'hermes-closed-native-canary', pollMs: 10 })
   const adapter = new HarnessExecAdapter({ provider: 'hermes', runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: { model: 'fixture/model', modelProvider: 'custom', environment: { HERMES_BASE_URL: 'http://127.0.0.1:' + service.port + '/v1' } }, credentialEnvironment: { OPENROUTER_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only assigned controller tools and return one JSON object.' })
   const run = async (overrides = {}) => {
     const record = { ...f.record, ...overrides }
-    record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, { PATH: path.dirname(CLI) + ':/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' })
+    record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, { ...nativeEnvironment(), PATH: path.dirname(CLI) + path.delimiter + (process.env.PATH || ''), LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' })
     record.signal = overrides.signal || AbortSignal.timeout(120000)
     const result = await adapter.launch(record)
     assert.ok(service.requests.some(request => JSON.stringify(request.messages).includes('CLOSED_CANARY_CHALLENGE:' + f.challenge)), 'actual Hermes controller output omitted canary challenge')
@@ -168,7 +168,7 @@ test('hermes closed native capability: isolation denies candidate/private/networ
     const port = listener.address().port
     const f = await scenario(t, { command: values => {
       const network = "const n=require('node:net');const s=n.connect(" + port + ",'127.0.0.1');s.on('connect',()=>process.exit(19));s.on('error',()=>process.exit(0));setTimeout(()=>process.exit(0),700)"
-      return 'cat ' + q(values.candidate) + '; printf scratch-ok > ' + q(path.join(values.scratch, 'isolation.txt')) + '; if printf forbidden > ' + q(values.candidate) + ' 2>/dev/null; then exit 18; fi; if cat ' + q(values.secret) + ' 2>/dev/null; then exit 20; fi; node -e ' + q(network)
+      return readCommand(values.candidate) + '; ' + nodeCommand("require('node:fs').writeFileSync(" + JSON.stringify(path.join(values.scratch, 'isolation.txt')) + ",'scratch-ok'); try { require('node:fs').writeFileSync(" + JSON.stringify(values.candidate) + ",'forbidden'); process.exit(18) } catch {} ; try { require('node:fs').readFileSync(" + JSON.stringify(values.secret) + "); process.exit(20) } catch {} ; " + network)
     } })
     const result = await f.run({}); successful(result)
     assert.equal(fs.readFileSync(f.candidate, 'utf8'), f.marker); assert.equal(fs.readFileSync(path.join(f.scratch, 'isolation.txt'), 'utf8'), 'scratch-ok'); assert.equal(contacted, false, 'controller command sandbox reached host network')
@@ -204,18 +204,18 @@ test('hermes closed native capability: topology rejects injected nested tool and
     await pending.catch(() => {})
     await hostile.owner.cancelAll({ reason: 'topology hostile launch cleanup', graceMs: 0, killMs: 2000, waitForPending: true })
   }
-  const f = await scenario(t, { command: values => 'cat ' + q(values.candidate) }); const result = await f.run({}); successful(result)
+  const f = await scenario(t, { command: values => readCommand(values.candidate) }); const result = await f.run({}); successful(result)
   const names = f.service.requests.flatMap(request => request.tools || []).map(tool => tool.function?.name || tool.name)
   assert.ok(names.includes('autoprompt_owned_bash'), JSON.stringify(names)); assert.equal(names.some(name => /^(?:Task|Agent|Skill|tool_search)$/i.test(name)), false)
 })
 test('hermes closed native capability: ambient configuration skills and hooks stay absent', options, async t => {
-  const f = await scenario(t, { command: values => 'cat ' + q(values.candidate) })
-  fs.mkdirSync(path.join(f.target, '.hermes'), { mode: 0o700 }); fs.writeFileSync(path.join(f.target, '.hermes', 'config.yaml'), 'hooks: [AMBIENT_HOOK_MUST_NOT_LOAD]\nskills: [AMBIENT_SKILL_MUST_NOT_LOAD]\n', { mode: 0o600 })
+  const f = await scenario(t, { command: values => readCommand(values.candidate) })
+  privateDirectory(path.join(f.target, '.hermes')); fs.writeFileSync(path.join(f.target, '.hermes', 'config.yaml'), 'hooks: [AMBIENT_HOOK_MUST_NOT_LOAD]\nskills: [AMBIENT_SKILL_MUST_NOT_LOAD]\n', { mode: 0o600 })
   const result = await f.run({}); successful(result); const wire = JSON.stringify(f.service.requests)
   for (const sentinel of ['AMBIENT_PROJECT_INSTRUCTIONS_MUST_NOT_AUTOLOAD', 'AMBIENT_HOOK_MUST_NOT_LOAD', 'AMBIENT_SKILL_MUST_NOT_LOAD', 'PRIVATE_CONTROLLER_MUST_NOT_BE_VISIBLE']) assert.equal(wire.includes(sentinel), false, sentinel)
 })
 test('hermes closed native capability: real intermediate tool journal event is correlated before final response', options, async t => {
-  const f = await scenario(t, { command: values => 'cat ' + q(values.candidate), holdFinal: true }), raw = [], ids = []
+  const f = await scenario(t, { command: values => readCommand(values.candidate), holdFinal: true }), raw = [], ids = []
   let settled = false
   const pending = f.run({ onEvent: event => raw.push(event), onSessionIdentified: id => ids.push(id) }).then(value => { settled = true; return value })
   await Promise.race([f.service.finalHeld, wait(90000).then(() => { throw new Error('Hermes never held its post-tool final response') })])
@@ -226,7 +226,7 @@ test('hermes closed native capability: real intermediate tool journal event is c
   assert.equal(result.contextId, intermediate.sessionId); assert.ok(raw.some(event => event.event === 'final' && event.sessionId === result.contextId)); assert.ok(fs.existsSync(path.join(f.nativeRoot, 'contexts', native.sha256(result.contextId) + '.json')))
 })
 test('hermes closed native capability: exact controller output bytes bind to receipt', options, async t => {
-  const f = await scenario(t, { command: values => 'printf exact:; cat ' + q(values.candidate) }); const result = await f.run({}); successful(result)
+  const f = await scenario(t, { command: values => nodeCommand("process.stdout.write('exact:')") + '; ' + readCommand(values.candidate) }); const result = await f.run({}); successful(result)
   const r = receipt(f, result), tool = f.service.requests.flatMap(request => request.messages).find(message => message.role === 'tool')
   const content = typeof tool?.content === 'string' ? tool.content : tool?.content?.map(part => part.text || '').join('')
   const nativeResult = JSON.parse(content)
@@ -234,22 +234,22 @@ test('hermes closed native capability: exact controller output bytes bind to rec
   assert.equal(r.outputSha256, native.sha256(nativeResult.output)); assert.equal(r.status, 'completed'); assert.equal(r.exitCode, 0)
 })
 test('hermes closed native capability: concurrent siblings keep separate identities', options, async t => {
-  const f = await scenario(t, { command: values => 'sleep 1; cat ' + q(values.candidate) }); let peak = 0
+  const f = await scenario(t, { command: values => nodeCommand('setTimeout(() => {}, 1000)') + '; ' + readCommand(values.candidate) }); let peak = 0
   const monitor = setInterval(() => { peak = Math.max(peak, f.owner.ownershipIdentities().length) }, 5)
   let values; try { values = await Promise.all([f.run(sibling(f, 'hermes-sibling-a')), f.run(sibling(f, 'hermes-sibling-b'))]) } finally { clearInterval(monitor) }
   values.forEach(value => successful(value)); assert.equal(new Set(values.map(value => value.contextId)).size, 2); assert.ok(peak >= 2, 'owned sibling processes did not overlap'); assert.deepEqual(f.owner.ownershipIdentities(), [])
 })
 test('hermes closed native capability: continuation resumes and foreign target is denied', options, async t => {
-  const f = await scenario(t, { command: values => 'cat ' + q(values.candidate) }); const first = await f.run({}); successful(first)
+  const f = await scenario(t, { command: values => readCommand(values.candidate) }); const first = await f.run({}); successful(first)
   const resumed = await f.run({ reservationId: crypto.randomUUID(), continuationId: first.contextId }); successful(resumed, 0); assert.equal(resumed.contextId, first.contextId)
-  const foreign = path.join(f.root, 'foreign'); fs.mkdirSync(foreign, { mode: 0o700 })
-  await assert.rejects(f.adapter.launch({ ...f.record, reservationId: crypto.randomUUID(), continuationId: first.contextId, workingDirectory: foreign, environment: prepareProcessLaunchEnvironment(f.processAdapter, crypto.randomUUID(), { PATH: process.env.PATH }), signal: AbortSignal.timeout(30000) }), { code: 'SESSION_ID_MISMATCH' })
+  const foreign = privateDirectory(path.join(f.root, 'foreign'))
+  await assert.rejects(f.adapter.launch({ ...f.record, reservationId: crypto.randomUUID(), continuationId: first.contextId, workingDirectory: foreign, environment: prepareProcessLaunchEnvironment(f.processAdapter, crypto.randomUUID(), nativeEnvironment()), signal: AbortSignal.timeout(30000) }), { code: 'SESSION_ID_MISMATCH' })
 })
 test('hermes closed native capability: cancellation drains held child while sibling succeeds', options, async t => {
-  const held = await scenario(t, { command: values => 'cat ' + q(values.candidate), hold: true }), controller = new AbortController(), pending = held.run({ signal: controller.signal })
+  const held = await scenario(t, { command: values => readCommand(values.candidate), hold: true }), controller = new AbortController(), pending = held.run({ signal: controller.signal })
   for (let index = 0; index < 800 && held.service.requests.length === 0; index++) await wait(25)
   assert.ok(held.service.requests.length > 0, 'held child did not reach a real model request')
-  const fast = await scenario(t, { command: values => 'cat ' + q(values.candidate) }); const result = await fast.run({}); successful(result)
+  const fast = await scenario(t, { command: values => readCommand(values.candidate) }); const result = await fast.run({}); successful(result)
   controller.abort(); await assert.rejects(pending, { code: 'CHILD_CANCELLED' }); assert.deepEqual(held.owner.ownershipIdentities(), []); assert.equal(result.ok, true)
 })
 test('Hermes owned adapter retains authentic usage arriving during cancellation drain', options, async t => {
@@ -279,35 +279,35 @@ test('Hermes owned adapter retains authentic usage arriving during cancellation 
   assert.deepEqual(f.owner.ownershipIdentities(), [])
 })
 test('hermes closed native capability: independent checker freezes candidate and writes scratch', options, async t => {
-  const f = await scenario(t, { command: values => 'cat ' + q(values.candidate) }), frozen = path.join(f.root, 'frozen'), scratch = path.join(f.root, 'checker-scratch')
-  fs.mkdirSync(frozen, { mode: 0o700 }); fs.mkdirSync(scratch, { mode: 0o700 }); for (const name of ['tmp', 'output', 'cache']) fs.mkdirSync(path.join(scratch, name), { mode: 0o700 })
+  const f = await scenario(t, { command: values => readCommand(values.candidate) }), frozen = path.join(f.root, 'frozen'), scratch = path.join(f.root, 'checker-scratch')
+  privateDirectory(frozen); privateDirectory(scratch); for (const name of ['tmp', 'output', 'cache']) privateDirectory(path.join(scratch, name))
   const candidate = path.join(frozen, 'candidate.txt'); fs.writeFileSync(candidate, f.marker, { mode: 0o600 })
   const checker = { schemaVersion: 1, capability: native.sha256('hermes-native-checker-boundary'), runId: 'hermes-native-checker', checkerId: 'hermes-closed-native', candidateHash: native.sha256(f.marker), frozenCandidateRoot: frozen, writableScratchRoot: scratch, temporaryRoot: path.join(scratch, 'tmp'), outputRoot: path.join(scratch, 'output'), cacheRoot: path.join(scratch, 'cache') }
-  f.service.tool.args.command = 'cat ' + q(candidate) + '; printf checked > ' + q(path.join(scratch, 'checker.txt')) + '; if printf wrong > ' + q(candidate) + ' 2>/dev/null; then exit 19; fi; printf "\\nCLOSED_CANARY_CHALLENGE:%s\\n" ' + q(f.challenge)
+  f.service.tool.args.command = withChallenge(readCommand(candidate) + '; ' + nodeCommand("require('node:fs').writeFileSync(" + JSON.stringify(path.join(scratch, 'checker.txt')) + ",'checked'); try { require('node:fs').writeFileSync(" + JSON.stringify(candidate) + ",'wrong'); process.exit(19) } catch {}"), f.challenge)
   const record = { ...f.record, logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', workingDirectory: scratch, canonicalTargetPath: frozen, candidateHash: checker.candidateHash, checkerScratchBoundary: checker, physicalExecutionPolicy: { logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', sandboxMode: 'read-only', canDispatch: false, resourceSets: { read: [], write: [], exclusive: [] } } }
   const adapter = new HarnessExecAdapter({ provider: 'hermes', runner: f.adapter.runner, nativeRoot: f.nativeRoot, executableBinding: f.binding, targetPath: scratch, connection: f.adapter.connection, credentialEnvironment: { OPENROUTER_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only controller checker tools.', checkerScratchVerifier: () => checker })
-  record.environment = prepareProcessLaunchEnvironment(f.processAdapter, record.reservationId, { PATH: process.env.PATH }); record.signal = AbortSignal.timeout(120000)
+  record.environment = prepareProcessLaunchEnvironment(f.processAdapter, record.reservationId, nativeEnvironment()); record.signal = AbortSignal.timeout(120000)
   const result = await adapter.launch(record); successful(result); assert.equal(fs.readFileSync(candidate, 'utf8'), f.marker); assert.equal(fs.readFileSync(path.join(scratch, 'checker.txt'), 'utf8'), 'checked')
 })
 test('hermes closed native capability: durable owner recovery drains live crashed controller child', options, async t => {
-  const f = await scenario(t, { command: values => 'cat ' + q(values.candidate), hold: true }), pending = f.run({})
+  const f = await scenario(t, { command: values => readCommand(values.candidate), hold: true }), pending = f.run({})
   for (let index = 0; index < 800 && f.service.requests.length === 0; index++) await wait(25)
   assert.equal(f.owner.ownershipIdentities().length, 1, 'live native child was not durably registered')
-  const recovered = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: path.join(f.controller, 'processes.json'), pollMs: 10 })
+  const recovered = new ProcessOwner({ adapter: nativeProcessAdapter(path.join(f.controller, 'processes.json'), f.controller), registryPath: path.join(f.controller, 'processes.json'), pollMs: 10 })
   await recovered.cancelAll({ reason: 'simulated controller crash recovery', graceMs: 0, killMs: 2000, waitForPending: true })
   await assert.rejects(pending)
   await f.owner.cancelAll({ reason: 'confirm original live-owner drain after recovery', graceMs: 0, killMs: 2000, waitForPending: true })
   assert.deepEqual(recovered.ownershipIdentities(), []); assert.deepEqual(f.owner.ownershipIdentities(), [])
 })
 test('hermes closed native capability: model effort is wired and unsupported effort is denied', options, async t => {
-  const f = await scenario(t, { command: values => 'cat ' + q(values.candidate) }); const result = await f.run({ assignment: { model: 'fixture/model', effort: 'high' } }); successful(result)
+  const f = await scenario(t, { command: values => readCommand(values.candidate) }); const result = await f.run({ assignment: { model: 'fixture/model', effort: 'high' } }); successful(result)
   assert.ok(f.service.requests.every(request => request.model === 'fixture/model'), JSON.stringify(f.service.requests.map(request => request.model)))
   const specs = []; const visit = directory => { for (const item of fs.readdirSync(directory, { withFileTypes: true })) { const file = path.join(directory, item.name); if (item.isDirectory()) visit(file); else if (item.name === 'autoprompt-hermes-launch.json') specs.push(file) } }; visit(f.nativeRoot)
   assert.ok(specs.some(file => JSON.parse(fs.readFileSync(file, 'utf8')).argv.includes('high')), 'native launch omitted --reasoning high')
   await assert.rejects(f.run({ assignment: { model: 'fixture/model', effort: 'unauthorized' } }), { code: 'PROFILE_INVALID' })
 })
 
-test('hermes native durable quota settles each tool turn exactly once', { skip: !CLI, timeout: 180000 }, async t => {
+test('hermes native durable quota settles each tool turn exactly once', { skip: options.skip, timeout: 180000 }, async t => {
   const f = await scenario(t)
 
   const starts = [], settlements = [], debits = [], unknown = []

@@ -10,8 +10,8 @@ const test = require('node:test')
 const native = require('../../scripts/harness-v2-native.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
-const { ProcessOwner, createPosixProcessAdapter } = require('../../agents/codex/workflow/process-owner.js')
-const quote = value => `'${value.replaceAll("'", "'\\''")}'`
+const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { privateDirectory, nativeProcessAdapter, nativeEnvironment, nodeCommand } = require('../helpers/native-platform.cjs')
 const enabled = Boolean(process.env.AUTOPROMPT_VSCODE_TEST_CLI)
 
 function closedBinding() {
@@ -19,28 +19,32 @@ function closedBinding() {
   const value = Object.fromEntries(names.map(name => [name, process.env[name]]))
   if (!names.some(name => value[name] !== undefined)) return null
   if (names.some(name => typeof value[name] !== 'string' || !value[name]) || value.AUTOPROMPT_CLOSED_CANARY_PROVIDER !== 'vscode' || !path.isAbsolute(value.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT) || !/^\d+$/.test(value.AUTOPROMPT_CLOSED_CANARY_GENERATION) || !/^[A-Za-z0-9_-]{43}$/.test(value.AUTOPROMPT_CLOSED_CANARY_CHALLENGE)) throw new Error('closed canary VS Code binding is invalid')
-  return { root: value.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, activationId: value.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID, generation: Number(value.AUTOPROMPT_CLOSED_CANARY_GENERATION), challenge: value.AUTOPROMPT_CLOSED_CANARY_CHALLENGE }
+  const root = privateDirectory(value.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT), stat = fs.statSync(root)
+  if (!stat.isDirectory() || (process.platform !== 'win32' && (stat.mode & 0o077))) throw new Error('closed canary VS Code ownership root is not private')
+  return { root, activationId: value.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID, generation: Number(value.AUTOPROMPT_CLOSED_CANARY_GENERATION), challenge: value.AUTOPROMPT_CLOSED_CANARY_CHALLENGE }
 }
 
 async function fixture(t, options = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-vscode-owned-'))
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-vscode-owned-')))
   const target = path.join(root, 'target'), controller = path.join(root, 'controller'), nativeRoot = path.join(controller, 'native')
-  for (const dir of [target, controller, nativeRoot]) fs.mkdirSync(dir, { mode: 0o700 })
+  for (const dir of [target, controller, nativeRoot]) privateDirectory(dir)
   const closed = closedBinding()
   const projection = core.createCanonicalMissionProjection('Read the assigned candidate and return {"ok":true}.')
   const record = { activationId: closed?.activationId || 'vscode-owned-native', generation: closed?.generation || 1, workItemId: 'read', sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), logicalRole: 'worker', providerRole: 'ap-worker', physicalRole: 'ap-worker', canonicalMission: projection.canonicalMission, workingDirectory: target, dispatch: { requestPointer: { hash: native.sha256('native vscode assignment') } } }
   record.missionBinding = core.bindCanonicalMissionForChild(projection, { ...record, sourceRequestHash: projection.sourceRequestHash, requestEnvelopeHash: record.dispatch.requestPointer.hash })
   record.physicalExecutionPolicy = { logicalRole: 'worker', providerRole: 'ap-worker', physicalRole: 'ap-worker', sandboxMode: 'read-only' }
-  record.environment = Object.fromEntries(['PATH', 'DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR'].filter(name => process.env[name]).map(name => [name, process.env[name]]))
+  const environment = { ...nativeEnvironment(), ...Object.fromEntries(['DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR'].filter(name => process.env[name]).map(name => [name, process.env[name]])) }
   const scratch = path.join(nativeRoot, 'vscode', native.sha256(record.sessionId), native.sha256(record.reservationId), 'scratch')
   const schema = path.join(controller, 'schema.json')
   fs.writeFileSync(schema, JSON.stringify({ type: 'object', properties: { ok: { const: true } }, required: ['ok'], additionalProperties: false }))
-  const binding = native.probeExecutable({ provider: 'vscode', executable: process.env.AUTOPROMPT_VSCODE_TEST_CLI })
-  const adapter = createPosixProcessAdapter()
-  const registrationRoot = closed ? path.join(closed.root, `vscode-${crypto.randomUUID()}`) : controller
-  if (closed) { fs.mkdirSync(registrationRoot, { mode: 0o700 }); fs.writeFileSync(path.join(registrationRoot, 'registration.json'), JSON.stringify({ schemaVersion: 1, provider: 'vscode', activationId: closed.activationId, generation: closed.generation, challenge: closed.challenge, registryPath: path.join(registrationRoot, 'processes.json') }), { flag: 'wx', mode: 0o600 }) }
-  const owner = new ProcessOwner({ adapter, registryPath: path.join(registrationRoot, 'processes.json'), pollMs: 10 })
-  const proxy = path.join(controller, 'proxy'); fs.mkdirSync(proxy, { mode: 0o700 })
+  const binding = native.probeExecutable({ provider: 'vscode', executable: process.env.AUTOPROMPT_VSCODE_TEST_CLI, env: environment })
+  const registrationRoot = closed ? privateDirectory(path.join(closed.root, `vscode-${crypto.randomUUID()}`)) : controller
+  if (closed) { fs.writeFileSync(path.join(registrationRoot, 'registration.json'), JSON.stringify({ schemaVersion: 1, provider: 'vscode', activationId: closed.activationId, generation: closed.generation, challenge: closed.challenge, registryPath: path.join(registrationRoot, 'processes.json') }), { flag: 'wx', mode: 0o600 }) }
+  const registryPath = path.join(registrationRoot, 'processes.json')
+  const adapter = nativeProcessAdapter(registryPath, path.dirname(registryPath))
+  record.environment = prepareProcessLaunchEnvironment(adapter, record.reservationId, environment)
+  const owner = new ProcessOwner({ adapter, registryPath, pollMs: 10 })
+  const proxy = privateDirectory(path.join(controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'vscode-owned', pollMs: 10 })
   const requests = [], errors = []
   const server = http.createServer(async (req, res) => {
@@ -54,7 +58,7 @@ async function fixture(t, options = {}) {
         return
       }
       const first = requests.length === 1 && !options.noTools
-      const command = `cat ${quote(path.join(target, 'candidate.txt'))}; printf checked > ${quote(path.join(scratch, 'checked.txt'))}; if printf wrong > ${quote(path.join(target, 'candidate.txt'))} 2>/dev/null; then exit 19; fi; if cat ${quote(path.join(controller, 'private.txt'))} 2>/dev/null; then exit 20; fi`
+      const command = nodeCommand(`const fs=require('node:fs');const candidate=${JSON.stringify(path.join(target, 'candidate.txt'))};process.stdout.write(fs.readFileSync(candidate));fs.writeFileSync(${JSON.stringify(path.join(scratch, 'checked.txt'))},'checked');try{fs.writeFileSync(candidate,'wrong');process.exitCode=19}catch{};try{fs.readFileSync(${JSON.stringify(path.join(controller, 'private.txt'))});process.exitCode=20}catch{}`)
       res.writeHead(200, { 'content-type': 'application/json' })
       const structured = body.response_format?.json_schema
       if (structured) assert.deepEqual(structured, { name: 'autoprompt_result', strict: true, schema: { type: 'object', properties: { canonicalJson: { type: 'string' } }, required: ['canonicalJson'], additionalProperties: false } })

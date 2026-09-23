@@ -13,6 +13,19 @@ const { createDarwinCoalitionAdapter } = require('../agents/codex/workflow/darwi
 const HASH = /^[a-f0-9]{64}$/
 const OUTPUT_LIMIT = 1024 * 1024
 const SYSTEM_SANDBOX_EXEC = '/usr/bin/sandbox-exec'
+// Node's Darwin bootstrap consults these kernel values and system endpoints
+// before it reaches the controlled relay. These are named read/look-up
+// grants only: they do not permit network sockets, service registration, or
+// bootstrap-domain mutation.
+const NODE_STARTUP_SYSCTLS = Object.freeze([
+  'hw.ncpu', 'hw.physicalcpu', 'hw.logicalcpu', 'hw.memsize',
+  'kern.argmax', 'kern.maxfiles', 'kern.maxfilesperproc',
+  'kern.osrelease', 'kern.ostype', 'kern.osversion',
+])
+const NODE_STARTUP_MACH_SERVICES = Object.freeze([
+  'com.apple.system.logger',
+  'com.apple.system.opendirectoryd.libinfo',
+])
 const digest = value => crypto.createHash('sha256').update(value).digest('hex')
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -70,15 +83,19 @@ function renderSeatbeltProfile(policy, options = {}) {
     // denied by the default profile.
     `(allow process-exec (literal ${quoted(node)}))`, `(allow file-read* (literal ${quoted(node)}))`,
     '(allow process-exec (literal "/bin/sh"))', '(allow file-read* (literal "/bin/sh"))',
-    '(allow process-fork)', '(allow process-info* (target self))', '(allow signal (target self))',
+    '(allow process-fork)', '(allow process-info* (target same-sandbox))', '(allow signal (target same-sandbox))',
+    '(allow mach-priv-task-port (target same-sandbox))',
+    '(allow sysctl-read', ...NODE_STARTUP_SYSCTLS.map(name => `  (sysctl-name ${JSON.stringify(name)})`), ')',
+    '(allow mach-lookup', ...NODE_STARTUP_MACH_SERVICES.map(name => `  (global-name ${JSON.stringify(name)})`), ')',
     '(allow file-read* (subpath "/System"))', '(allow file-read* (subpath "/usr/lib"))',
     '(allow file-read* (subpath "/usr/share"))', '(allow file-read* (literal "/dev/null"))', '(allow file-read* (literal "/dev/urandom"))',
     ...reads.sort().map(item => `(allow file-read* (subpath ${quoted(item)}))`),
     ...writes.sort().map(item => `(allow file-read* file-write* (subpath ${quoted(item)}))`),
     `(allow file-read* file-write* (subpath ${quoted(temp)}))`,
-    // No network*, mach-lookup, mach-register, system-write-bootstrap,
-    // system-privilege, setuid, or launchd exception is allowed. The default
-    // denial is the authority for those operations.
+    // No network*, Mach registration, system-write-bootstrap, system-privilege,
+    // setuid, or launchd exception is allowed. The only Mach access is the two
+    // named bootstrap lookups above; default denial remains the authority for all
+    // other services and operations.
   ]
   return `${lines.join('\n')}\n`
 }
@@ -191,4 +208,4 @@ function createDarwinCommandSandbox(options = {}) {
   return Object.freeze({ backend: 'darwin-seatbelt-coalition', scope: 'initial-node-and-posix-shell-only', helper, sandboxBinding, controlRoot, tempRoot, processOwner, runner, renderSeatbeltProfile: policy => renderSeatbeltProfile(policy, { nodePath: process.execPath, tempRoot }), command })
 }
 
-module.exports = { DarwinCommandError, SYSTEM_SANDBOX_EXEC, OUTPUT_LIMIT, boundExecutable, renderSeatbeltProfile, createDarwinCommandSandbox }
+module.exports = { DarwinCommandError, SYSTEM_SANDBOX_EXEC, OUTPUT_LIMIT, NODE_STARTUP_SYSCTLS, NODE_STARTUP_MACH_SERVICES, boundExecutable, renderSeatbeltProfile, createDarwinCommandSandbox }

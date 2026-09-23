@@ -5,8 +5,10 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { fileURLToPath } = require('node:url')
 const test = require('node:test')
 const native = require('../../scripts/harness-v2-native.cjs')
+const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessEventStream } = require('../../scripts/harness-v2-transport.cjs')
 const { modelService, runNative } = require('../helpers/harness-native-service.cjs')
 
@@ -73,6 +75,34 @@ test('claude CLI projection adds only an implied root object type', t => {
   const booleanLaunch = project(true)
   assert.equal(JSON.parse(booleanLaunch.argv[booleanLaunch.argv.indexOf('--json-schema') + 1]), true,
     'a boolean root schema must remain a boolean schema')
+})
+
+test('DeepSeek launch projects its owned plugin as a portable file URL', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deepseek-plugin-url-'))
+  native.privateDirectory(root)
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const directories = Object.fromEntries(['target', 'control', 'home', 'session', 'scope/dsh/lib'].map(name => {
+    const directory = path.join(root, name); native.privateDirectory(directory); return [name, directory]
+  }))
+  const executable = path.join(directories['scope/dsh/lib'], 'bin.js')
+  native.writePrivate(executable, 'fixture')
+  native.writePrivate(path.join(root, 'scope/dsh/package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.1.2-rc.1' }))
+  const toolBoundary = boundary.prepareBoundary({ provider: 'deepseek', root: directories.control, policy: {
+    readOnly: true, targetPath: directories.target, readableRoots: [directories.target], writableRoots: [],
+    nestedDispatch: false, commandBoundary: true, externalWrites: false,
+  } })
+  const launch = native.createLaunch({ provider: 'deepseek', executable, home: directories.home,
+    sessionRoot: directories.session, targetPath: directories.target, cwd: directories.target,
+    prompt: 'Return one result.', input: '{}', connection: { model: 'deepseek-chat',
+      environment: { DEEPSEEK_BASE_URL: 'http://127.0.0.1' } }, credentials: { DEEPSEEK_API_KEY: 'fixture' },
+    environment: { PATH: process.env.PATH }, readOnly: true, commandBoundary: true, toolBoundary,
+    outputSchema: { type: 'object' } })
+  const patchFile = launch.argv[launch.argv.indexOf('--patch') + 1]
+  const plugin = JSON.parse(fs.readFileSync(patchFile, 'utf8')).at(-1).insert[0].name
+  const expected = require.resolve('../../scripts/harness-v2-bridge/deepseek/plugin.cjs')
+  assert.match(plugin, /^file:\/\//)
+  assert.equal(plugin.includes('\\'), false)
+  assert.equal(fileURLToPath(plugin), expected)
 })
 
 for (const provider of ['claude', 'opencode', 'kilo']) {

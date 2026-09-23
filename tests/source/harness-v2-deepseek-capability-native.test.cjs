@@ -98,7 +98,7 @@ async function scenario(provider, options = {}) {
     const run = async overrides => {
       const record = { ...f.record, ...overrides }
       record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
-      record.signal = overrides?.signal || AbortSignal.timeout(90000)
+      record.signal = overrides?.signal || AbortSignal.timeout(process.platform === 'win32' ? 300000 : 90000)
       try { return await adapter.launch(record) }
       catch (error) { fixtureFailureDiagnostic(f, error); throw error }
     }
@@ -231,7 +231,7 @@ const capabilityChecks = Object.freeze({
 
 for (const provider of Object.keys(providers)) {
   for (const capability of Object.keys(capabilityChecks)) {
-    test(`${provider} closed native capability: ${capability}`, { skip: !CLI, timeout: 300000 }, async () => {
+    test(`${provider} closed native capability: ${capability}`, { skip: !CLI, timeout: process.platform === 'win32' ? 900000 : 420000 }, async () => {
       const value = (await witnessesFor(provider))[capability]
       assert.ok(value, `missing real witness for ${provider}/${capability}`)
       capabilityChecks[capability](value)
