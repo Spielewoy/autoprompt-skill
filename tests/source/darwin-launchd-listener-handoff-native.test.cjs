@@ -28,17 +28,17 @@ const bind = (port, expectBusy) => new Promise((resolve, reject) => {
   })
 })
 
-function plist({ label, wrapper, modelPort, mcpPort, node, script, requestPath, stdout, stderr }) {
-  const args = [wrapper, String(modelPort), String(mcpPort), node, script, requestPath]
+function plist({ label, wrapper, modelPort, mcpPort, node, script, requestPath, markerPath, requestHash, stdout, stderr }) {
+  const args = [wrapper, String(modelPort), String(mcpPort), node, script, requestPath, markerPath, requestHash]
   const socket = (name, port) => `<key>${name}</key><dict><key>SockNodeName</key><string>::1</string><key>SockServiceName</key><string>${port}</string><key>SockFamily</key><string>IPv6</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string></dict>`
-  return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${xml(label)}</string><key>ProgramArguments</key><array>${args.map(value => `<string>${xml(value)}</string>`).join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/><key>LaunchOnlyOnce</key><true/><key>StandardOutPath</key><string>${xml(stdout)}</string><key>StandardErrorPath</key><string>${xml(stderr)}</string><key>Sockets</key><dict>${socket('autoprompt.model', modelPort)}${socket('autoprompt.mcp', mcpPort)}</dict></dict></plist>`
+  return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${xml(label)}</string><key>ProgramArguments</key><array>${args.map(value => `<string>${xml(value)}</string>`).join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/><key>LaunchOnlyOnce</key><false/><key>AbandonProcessGroup</key><false/><key>StandardOutPath</key><string>${xml(stdout)}</string><key>StandardErrorPath</key><string>${xml(stderr)}</string><key>Sockets</key><dict>${socket('autoprompt.model', modelPort)}${socket('autoprompt.mcp', mcpPort)}</dict></dict></plist>`
 }
 
 test('Darwin launchd wrapper hands two exact IPv6 listeners to fixed descriptors', { skip: process.platform !== 'darwin', timeout: 120000 }, async t => {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join('/private/tmp', 'ap-fd-handoff-')))
   fs.chmodSync(root, 0o700)
   const wrapper = path.join(root, 'listener-handoff'), script = path.join(root, 'job.cjs'), requestPath = path.join(root, 'request.json')
-  const ready = path.join(root, 'ready.json'), startupMarker = path.join(root, 'startup-marker.json'), startupAttempts = path.join(root, 'startup-attempts.log')
+  const ready = path.join(root, 'ready.json'), startupMarker = path.join(root, 'startup-marker.json'), startupAttempts = path.join(root, 'startup-attempts.log'), startedMarker = path.join(root, 'started.marker')
   const stdout = path.join(root, 'stdout.log'), stderr = path.join(root, 'stderr.log')
   const plistPath = path.join(root, 'job.plist'), domain = `gui/${process.getuid()}`
   const label = `com.autoprompt.listenerhandoff.${process.pid}.${crypto.randomBytes(6).toString('hex')}`
@@ -81,34 +81,53 @@ if(process.argv.length!==6||process.argv[2]!=='--job'||process.argv[4]!=='--clos
 const request=JSON.parse(fs.readFileSync(process.argv[3],'utf8')),copy={...request};delete copy.checksum
 if(request.checksum!==hash(stable(copy))||request.node.path!==fs.realpathSync.native(process.execPath)||request.node.sha256!==hash(fs.readFileSync(process.execPath)))refuse(65,'Node listener request binding invalid')
 const requestIdentity=fs.statSync(process.argv[3])
-try{const leaked=fs.fstatSync(Number(process.argv[5]));if(leaked.dev===requestIdentity.dev&&leaked.ino===requestIdentity.ino)refuse(68,'Unexpected request descriptor survived SETEXEC')}catch(error){if(error.code!=='EBADF')throw error}
+try{const leaked=fs.fstatSync(Number(process.argv[5]));if(leaked.dev===requestIdentity.dev&&leaked.ino===requestIdentity.ino)refuse(68,'Unexpected request descriptor survived CLOEXEC child spawn')}catch(error){if(error.code!=='EBADF')throw error}
 fs.appendFileSync(${JSON.stringify(startupAttempts)},String(process.pid)+'\n',{encoding:'utf8',mode:0o600})
-fs.writeFileSync(${JSON.stringify(startupMarker)},JSON.stringify({pid:process.pid}),{flag:'wx',mode:0o600})
+fs.writeFileSync(${JSON.stringify(startupMarker)},JSON.stringify({pid:process.pid,ppid:process.ppid}),{flag:'wx',mode:0o600})
 const servers=[]
 for(const key of ['model','mcp']){const item=request.sockets[key];if(item.name!=='autoprompt.'+key||item.fd!==(key==='model'?3:4)||item.host!=='::1')process.exit(66);const server=net.createServer(socket=>socket.end(key+'\n'));server.listen({fd:item.fd,exclusive:true});servers.push([key,item,server])}
 Promise.all(servers.map(([key,item,server])=>new Promise((resolve,reject)=>{server.once('error',reject);server.once('listening',()=>{const address=server.address();if(address.address!=='::1'||address.family!=='IPv6'||address.port!==item.port)return reject(new Error('listener mismatch'));resolve()})}))).then(()=>fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:process.pid,ports:servers.map(([,item])=>item.port)}),{flag:'wx',mode:0o600})).catch(error=>refuse(67,error.stack||error.message))
 `, { flag: 'wx', mode: 0o600 })
-  fs.writeFileSync(plistPath, plist({ label, wrapper, modelPort, mcpPort, node, script, requestPath, stdout, stderr }), { flag: 'wx', mode: 0o600 })
+  fs.writeFileSync(plistPath, plist({ label, wrapper, modelPort, mcpPort, node, script, requestPath, markerPath: startedMarker, requestHash: body.checksum, stdout, stderr }), { flag: 'wx', mode: 0o600 })
   submitted = true
   const bootstrap = launchctl(['bootstrap', domain, plistPath]); assert.equal(bootstrap.status, 0, bootstrap.stderr)
   const receipt = await waitFor(() => fs.existsSync(ready) && JSON.parse(fs.readFileSync(ready, 'utf8')), 30000,
     () => `listener handoff did not become ready: ${fs.existsSync(stderr) ? fs.readFileSync(stderr, 'utf8').slice(-2048) : ''}`)
   assert.deepEqual(receipt.ports, [modelPort, mcpPort])
-  assert.equal(fs.readFileSync(stdout, 'utf8').trim(), `HANDOFF_PID:${receipt.pid}`, 'SETEXEC must retain the admitted launchd PID')
+  const supervisorMatch = /^SUPERVISOR_PID:([1-9][0-9]*)$/m.exec(fs.readFileSync(stdout, 'utf8'))
+  assert.ok(supervisorMatch, 'supervisor did not publish its stable root PID')
+  const supervisorPid = Number(supervisorMatch[1])
+  assert.notEqual(supervisorPid, receipt.pid, 'Node child must not replace the launchd supervisor')
   assert.equal(await request(modelPort, 'model'), 'model\n')
   assert.equal(await request(mcpPort, 'mcp'), 'mcp\n')
-  assert.deepEqual(JSON.parse(fs.readFileSync(startupMarker, 'utf8')), { pid: receipt.pid })
+  assert.deepEqual(JSON.parse(fs.readFileSync(startupMarker, 'utf8')), { pid: receipt.pid, ppid: supervisorPid })
   assert.deepEqual(fs.readFileSync(startupAttempts, 'utf8').trim().split('\n'), [String(receipt.pid)])
+  assert.equal(fs.readFileSync(startedMarker, 'utf8'), `v1\n${body.checksum}\n`)
   process.kill(receipt.pid, 'SIGKILL')
   await waitFor(() => command('/bin/kill', ['-0', String(receipt.pid)]).status !== 0, 10000, 'launchd listener root survived SIGKILL')
+  await waitFor(() => fs.readFileSync(stdout, 'utf8').includes(`CHILD_REAPED:${receipt.pid}`), 10000, 'supervisor did not reap the killed Node child')
+  assert.equal(command('/bin/kill', ['-0', String(supervisorPid)]).status, 0, 'supervisor did not remain after child exit')
   const retainedService = launchctl(['print', `${domain}/${label}`]); assert.equal(retainedService.status, 0, retainedService.stderr)
   await bind(modelPort, true); await bind(mcpPort, true)
+  // A hostile supervisor death must not release the launchd-held endpoints or
+  // authorize another child. Demand activation starts only the marker guard.
+  process.kill(supervisorPid, 'SIGKILL')
+  await waitFor(() => command('/bin/kill', ['-0', String(supervisorPid)]).status !== 0, 10000, 'supervisor survived SIGKILL')
   const triggered = await Promise.all([trigger(modelPort), trigger(mcpPort)])
-  await new Promise(resolve => setTimeout(resolve, 1000))
+  // launchd's documented default ThrottleInterval is ten seconds; leave a
+  // bounded margin after the deliberate supervisor crash before judging the
+  // demand-triggered marker guard.
+  await waitFor(() => /^GUARD_PID:([1-9][0-9]*)$/m.test(fs.readFileSync(stdout, 'utf8')), 30000, 'marker guard did not retain the relaunched service')
+  const guardPid = Number(/^GUARD_PID:([1-9][0-9]*)$/m.exec(fs.readFileSync(stdout, 'utf8'))[1])
+  assert.notEqual(guardPid, supervisorPid)
+  assert.equal(command('/bin/kill', ['-0', String(guardPid)]).status, 0, 'marker guard did not remain until bootout')
+  const guardedService = launchctl(['print', `${domain}/${label}`]); assert.equal(guardedService.status, 0, guardedService.stderr)
+  await bind(modelPort, true); await bind(mcpPort, true)
   assert.deepEqual(fs.readFileSync(startupAttempts, 'utf8').trim().split('\n'), [String(receipt.pid)],
-    `LaunchOnlyOnce admitted another worker after socket activity: ${JSON.stringify(triggered)}`)
-  assert.deepEqual(JSON.parse(fs.readFileSync(startupMarker, 'utf8')), { pid: receipt.pid })
+    `marker guard admitted another worker after socket activity: ${JSON.stringify(triggered)}`)
+  assert.deepEqual(JSON.parse(fs.readFileSync(startupMarker, 'utf8')), { pid: receipt.pid, ppid: supervisorPid })
   const bootout = launchctl(['bootout', `${domain}/${label}`]); assert.equal(bootout.status, 0, bootout.stderr)
+  await waitFor(() => command('/bin/kill', ['-0', String(guardPid)]).status !== 0, 10000, 'exact bootout did not terminate the marker guard')
   await waitFor(() => { const absent = launchctl(['print', `${domain}/${label}`]); return absent.status === 113 && /Could not find service/.test(absent.stderr) }, 10000,
     'launchd listener service remained after exact bootout')
   submitted = false
@@ -122,7 +141,10 @@ test('Darwin listener handoff source fixes socket keys and publishes only FD3 an
   assert.match(source, /"autoprompt\.mcp"/)
   assert.match(source, /dup2\(model_copy, 3\)/)
   assert.match(source, /dup2\(mcp_copy, 4\)/)
-  assert.match(source, /POSIX_SPAWN_SETEXEC \| POSIX_SPAWN_CLOEXEC_DEFAULT/)
+  assert.match(source, /POSIX_SPAWN_CLOEXEC_DEFAULT/)
+  assert.doesNotMatch(source, /POSIX_SPAWN_SETEXEC/)
   assert.match(source, /posix_spawn_file_actions_addinherit_np\(&actions, descriptor\)/)
-  assert.match(plist({ label: 'com.autoprompt.test', wrapper: '/private/w', modelPort: 1, mcpPort: 2, node: '/private/n', script: '/private/s', requestPath: '/private/r', stdout: '/private/o', stderr: '/private/e' }), /<key>LaunchOnlyOnce<\/key><true\/>/)
+  assert.match(source, /started_marker/)
+  assert.match(source, /GUARD_PID/)
+  assert.match(plist({ label: 'com.autoprompt.test', wrapper: '/private/w', modelPort: 1, mcpPort: 2, node: '/private/n', script: '/private/s', requestPath: '/private/r', markerPath: '/private/m', requestHash: 'a'.repeat(64), stdout: '/private/o', stderr: '/private/e' }), /<key>LaunchOnlyOnce<\/key><false\/>/)
 })

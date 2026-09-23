@@ -53,20 +53,22 @@ function exactFile(file, expected, filesystem = fs) {
     return item.isFile() && !item.isSymbolicLink() && item.nlink === 1 && filesystem.readFileSync(file).equals(expected)
   } catch { return false }
 }
-function minimalEnvironment(environment, lockPath, lockBytes, readyPath, readyBytes) {
-  const systemRoot = environment.SystemRoot, systemDrive = path.win32.parse(systemRoot).root.slice(0, 2)
-  const result = {
-    SystemRoot: systemRoot,
-    WINDIR: systemRoot,
-    SystemDrive: systemDrive,
-    PATH: path.win32.join(systemRoot, 'System32'),
-    TEMP: path.win32.dirname(lockPath),
-    TMP: path.win32.dirname(lockPath),
+function minimalEnvironment(environment, lockPath, lockBytes, readyPath, readyBytes, controllerEnvironment) {
+  const systemRoot = environment.SystemRoot
+  const resolveControllerEnvironment = controllerEnvironment
+    || require('../agents/codex/workflow/safe-run-root.js').windowsControllerEnvironment
+  const result = { ...resolveControllerEnvironment(systemRoot) }
+  // Native Windows PowerShell must rebuild its own module path. A bundled
+  // controller's PSModulePath can refer only to the bundled PowerShell tree.
+  for (const name of Object.keys(result)) {
+    if (name.toLowerCase() === 'psmodulepath') delete result[name]
+  }
+  Object.assign(result, {
     AUTOPROMPT_TOOL_LEASE_PATH_B64: Buffer.from(lockPath, 'utf8').toString('base64'),
     AUTOPROMPT_TOOL_LEASE_BYTES_B64: lockBytes.toString('base64'),
     AUTOPROMPT_TOOL_LEASE_READY_PATH_B64: Buffer.from(readyPath, 'utf8').toString('base64'),
     AUTOPROMPT_TOOL_LEASE_READY_BYTES_B64: readyBytes.toString('base64'),
-  }
+  })
   return result
 }
 
@@ -90,7 +92,7 @@ function createWindowsToolLease(options) {
   let child
   try {
     child = spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
-      cwd: path.win32.dirname(powershell), env: minimalEnvironment(environment, lockPath, lockBytes, readyPath, readyBytes),
+      cwd: path.win32.dirname(powershell), env: minimalEnvironment(environment, lockPath, lockBytes, readyPath, readyBytes, options.windowsControllerEnvironment),
       shell: false, windowsHide: true, detached: false, stdio: ['pipe', 'ignore', 'pipe'],
     })
   } catch (error) { fail('TOOL_LEASE_UNAVAILABLE', `The Windows tool lease holder could not start: ${error.code || 'ERROR'}`) }
@@ -161,7 +163,7 @@ async function createWindowsToolLeaseAsync(options) {
   let child
   try {
     child = spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
-      cwd: path.win32.dirname(powershell), env: minimalEnvironment(environment, lockPath, lockBytes, readyPath, readyBytes),
+      cwd: path.win32.dirname(powershell), env: minimalEnvironment(environment, lockPath, lockBytes, readyPath, readyBytes, options.windowsControllerEnvironment),
       shell: false, windowsHide: true, detached: false, stdio: ['pipe', 'ignore', 'pipe'],
     })
   } catch (error) { fail('TOOL_LEASE_UNAVAILABLE', `The Windows tool lease holder could not start: ${error.code || 'ERROR'}`) }

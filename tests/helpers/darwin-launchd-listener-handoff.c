@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static const char *MODEL_SOCKET = "autoprompt.model";
@@ -92,32 +93,86 @@ static int publish_descriptors(int model, int mcp) {
   return 0;
 }
 
-static int exec_with_listeners(char *const child_argv[]) {
+static int write_all(int descriptor, const char *bytes, size_t length) {
+  while (length) {
+    ssize_t written = write(descriptor, bytes, length);
+    if (written < 0) { if (errno == EINTR) continue; return -1; }
+    if (written == 0) return -1;
+    bytes += written;
+    length -= (size_t)written;
+  }
+  return 0;
+}
+
+/* The marker is deliberately request-bound and published before spawn. A later
+ * demand activation may retain launchd's sockets, but can never execute another
+ * child for this reservation. */
+static int started_marker(const char *marker, const char *request_hash, int *first) {
+  char expected[80];
+  int expected_length = snprintf(expected, sizeof(expected), "v1\n%s\n", request_hash);
+  if (expected_length != 68) return 80;
+  int descriptor = open(marker, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  if (descriptor >= 0) {
+    struct stat created;
+    if (fstat(descriptor, &created) || !S_ISREG(created.st_mode) || created.st_nlink != 1) {
+      close(descriptor);
+      unlink(marker);
+      return 81;
+    }
+    int failed = write_all(descriptor, expected, (size_t)expected_length) != 0;
+    if (!failed && fsync(descriptor) != 0) failed = 1;
+    if (close(descriptor) != 0) failed = 1;
+    if (failed) { unlink(marker); return 81; }
+    *first = 1;
+    return 0;
+  }
+  if (errno != EEXIST) return 82;
+  struct stat named;
+  if (lstat(marker, &named) || !S_ISREG(named.st_mode) || named.st_nlink != 1) return 83;
+  descriptor = open(marker, O_RDONLY | O_NOFOLLOW);
+  if (descriptor < 0) return 83;
+  struct stat opened;
+  if (fstat(descriptor, &opened) || opened.st_dev != named.st_dev || opened.st_ino != named.st_ino) {
+    close(descriptor);
+    return 83;
+  }
+  char actual[80];
+  ssize_t count;
+  do { count = read(descriptor, actual, sizeof(actual)); } while (count < 0 && errno == EINTR);
+  int close_status = close(descriptor);
+  if (count != expected_length || close_status || memcmp(actual, expected, (size_t)expected_length) != 0) return 84;
+  *first = 0;
+  return 0;
+}
+
+static int spawn_with_listeners(char *const child_argv[], pid_t *child) {
   posix_spawnattr_t attributes;
   posix_spawn_file_actions_t actions;
   int status = posix_spawnattr_init(&attributes);
   if (status) return status;
   status = posix_spawn_file_actions_init(&actions);
   if (status) { posix_spawnattr_destroy(&attributes); return status; }
-  // Darwin SETEXEC replaces this launchd process in place. CLOEXEC_DEFAULT
-  // closes every descriptor except the five explicitly inherited handles.
-  status = posix_spawnattr_setflags(&attributes,
-    POSIX_SPAWN_SETEXEC | POSIX_SPAWN_CLOEXEC_DEFAULT);
+  // Keep only standard I/O and the two admitted listeners in the child. The
+  // supervisor retains its own descriptors and stays launchd's stable root.
+  status = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT);
   for (int descriptor = 0; !status && descriptor < 5; descriptor++)
     status = posix_spawn_file_actions_addinherit_np(&actions, descriptor);
   if (!status) {
     extern char **environ;
-    pid_t child = -1;
-    status = posix_spawn(&child, child_argv[0], &actions, &attributes,
-      child_argv, environ);
+    status = posix_spawn(child, child_argv[0], &actions, &attributes, child_argv, environ);
   }
   posix_spawn_file_actions_destroy(&actions);
   posix_spawnattr_destroy(&attributes);
-  return status ? status : EIO; // Successful SETEXEC never returns.
+  return status;
+}
+
+static void hold_until_bootout(void) {
+  for (;;) pause();
 }
 
 int main(int argc, char **argv) {
-  if (argc != 6 || argv[3][0] != '/' || argv[4][0] != '/' || argv[5][0] != '/') return 64;
+  if (argc != 8 || argv[3][0] != '/' || argv[4][0] != '/' || argv[5][0] != '/' || argv[6][0] != '/' ||
+      strlen(argv[7]) != 64 || strspn(argv[7], "0123456789abcdef") != 64) return 64;
   in_port_t model_port, mcp_port;
   if (parse_port(argv[1], &model_port) || parse_port(argv[2], &mcp_port) || model_port == mcp_port) return 65;
   struct stat node_status, script_status, request_status;
@@ -134,8 +189,19 @@ int main(int argc, char **argv) {
     fprintf(stderr, "listener handoff refused: %d\n", status);
     return status;
   }
+  int first = 0;
+  status = started_marker(argv[6], argv[7], &first);
+  if (status) {
+    fprintf(stderr, "listener marker refused: %d\n", status);
+    return status;
+  }
+  if (!first) {
+    fprintf(stdout, "GUARD_PID:%ld\n", (long)getpid());
+    fflush(stdout);
+    hold_until_bootout();
+  }
   // Negative control: deliberately leave one descriptor without FD_CLOEXEC.
-  // The exec policy must remove it while retaining the two admitted listeners.
+  // The child spawn policy must remove it while retaining the two listeners.
   int probe = open(argv[5], O_RDONLY);
   if (probe < 0) return 79;
   int forbidden = fcntl(probe, F_DUPFD, 128);
@@ -143,11 +209,20 @@ int main(int argc, char **argv) {
   if (forbidden < 0) return 79;
   char forbidden_text[32];
   snprintf(forbidden_text, sizeof(forbidden_text), "%d", forbidden);
-  fprintf(stdout, "HANDOFF_PID:%ld\n", (long)getpid());
+  fprintf(stdout, "SUPERVISOR_PID:%ld\n", (long)getpid());
   fflush(stdout);
   char *const child_argv[] = { argv[3], argv[4], (char *)"--job", argv[5],
     (char *)"--closed-fd", forbidden_text, NULL };
-  int exec_status = exec_with_listeners(child_argv);
-  fprintf(stderr, "listener handoff exec failed: %d\n", exec_status);
-  return 78;
+  pid_t child = -1;
+  int spawn_status = spawn_with_listeners(child_argv, &child);
+  close(forbidden);
+  if (spawn_status) {
+    fprintf(stderr, "listener handoff spawn failed: %d\n", spawn_status);
+    return 78;
+  }
+  int wait_status;
+  while (waitpid(child, &wait_status, 0) < 0) if (errno != EINTR) return 85;
+  fprintf(stdout, "CHILD_REAPED:%ld\n", (long)child);
+  fflush(stdout);
+  hold_until_bootout();
 }
