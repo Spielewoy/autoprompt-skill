@@ -11,7 +11,7 @@ on:
         required: false
         default: none
         type: choice
-        options: [none, macos-containment, windows-bootstrap, opencode]
+        options: [none, macos-containment, windows-bootstrap, windows-provider-primitives, opencode]
       support_provider:
         description: 'Installed provider for the focused provider stage'
         required: false
@@ -1139,6 +1139,54 @@ jobs:
         with:
           name: git-bootstrap-${{ matrix.os }}-${{ matrix.node }}
           path: windows-git-bootstrap.log
+          if-no-files-found: error
+
+  windows-provider-primitives:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'windows-provider-primitives'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+          architecture: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
+      - run: npm ci --ignore-scripts
+      - name: Verify same-container transport without host loopback authority
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/windows-appcontainer-internal-loopback.test.cjs 2>&1 | tee windows-internal-loopback.log
+      - name: Acquire the pinned official Hermes Windows installation
+        if: ${{ !cancelled() }}
+        timeout-minutes: 25
+        shell: pwsh
+        run: |
+          ./tests/helpers/install-hermes-windows-ci.ps1 -OutputRoot (Join-Path $env:RUNNER_TEMP 'hermes-windows-0.21.1')
+      - name: Bind generated Hermes launchers and interpreter
+        if: ${{ !cancelled() && env.AUTOPROMPT_HERMES_WINDOWS_CLI != '' }}
+        shell: bash
+        env:
+          AUTOPROMPT_HERMES_WINDOWS_EVIDENCE: ${{ runner.temp }}/hermes-windows-launcher-evidence.json
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/hermes-windows-launcher-native.test.cjs 2>&1 | tee hermes-windows-launcher.tap
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: provider-primitives-${{ matrix.os }}
+          path: |
+            windows-internal-loopback.log
+            hermes-windows-launcher.tap
+            ${{ runner.temp }}/hermes-windows-launcher-evidence.json
+            ${{ runner.temp }}/hermes-windows-0.21.1/official-installer.log
+            ${{ runner.temp }}/hermes-public-launcher.exe
+            ${{ runner.temp }}/hermes-venv-launcher.exe
           if-no-files-found: error
 
   opencode:

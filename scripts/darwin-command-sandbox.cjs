@@ -19,6 +19,7 @@ const SYSTEM_SANDBOX_EXEC = '/usr/bin/sandbox-exec'
 // bootstrap-domain mutation.
 const NODE_STARTUP_SYSCTLS = Object.freeze([
   'hw.ncpu', 'hw.physicalcpu', 'hw.logicalcpu', 'hw.memsize',
+  'hw.pagesize', 'hw.pagesize_compat',
   'kern.argmax', 'kern.maxfiles', 'kern.maxfilesperproc',
   'kern.osrelease', 'kern.ostype', 'kern.osversion',
 ])

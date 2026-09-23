@@ -35,18 +35,21 @@ async function ownPidDiagnostics(records, startedAt, ownedPid) {
   const values = []
   const log = cp.spawnSync('/usr/bin/log', ['show', '--style', 'compact', '--last', '2m', '--info', '--debug', '--predicate', `eventMessage CONTAINS[c] "[${pid}]" OR eventMessage CONTAINS[c] "(${pid})"`], { encoding: 'utf8', timeout: 10000, maxBuffer: 65536, shell: false })
   if (log.status === 0 && log.stdout) values.push({ source: 'unified-log', pid, text: log.stdout.slice(-8192) })
-  const reports = path.join(os.homedir(), 'Library', 'Logs', 'DiagnosticReports')
-  let entries = []
-  try { entries = fs.readdirSync(reports, { withFileTypes: true }) } catch { return values }
-  for (const entry of entries) {
-    if (!entry.isFile() || values.length >= 3) continue
-    const file = path.join(reports, entry.name)
-    let stat
-    try { stat = fs.lstatSync(file) } catch { continue }
-    if (stat.isSymbolicLink() || stat.size > 2 * 1024 * 1024 || stat.mtimeMs < startedAt - 60000) continue
-    let text
-    try { text = fs.readFileSync(file, 'utf8') } catch { continue }
-    if (text.includes(`[${pid}]`)) values.push({ source: 'crash-report', pid, name: entry.name, text: text.slice(-8192) })
+  for (const reports of [path.join(os.homedir(), 'Library', 'Logs', 'DiagnosticReports'), '/Library/Logs/DiagnosticReports']) {
+    let entries = []
+    try { entries = fs.readdirSync(reports, { withFileTypes: true }) } catch { continue }
+    for (const entry of entries) {
+      if (!entry.isFile() || values.length >= 3) continue
+      const file = path.join(reports, entry.name)
+      let stat
+      try { stat = fs.lstatSync(file) } catch { continue }
+      if (stat.isSymbolicLink() || stat.size > 2 * 1024 * 1024 || stat.mtimeMs < startedAt - 60000) continue
+      let text
+      try { text = fs.readFileSync(file, 'utf8') } catch { continue }
+      if (text.includes(`[${pid}]`) || new RegExp(`"pid"\\s*:\\s*${pid}(?:,|\\s|})`).test(text)) {
+        values.push({ source: 'crash-report', pid, name: entry.name, text: text.slice(0, 16384) })
+      }
+    }
   }
   return values
 }
@@ -186,7 +189,7 @@ test('Darwin native command sandbox isolates candidate, scratch, controller, net
     checks: { readCandidate: true, writeScratch: true, deniedPrivateRead: true, deniedCandidateOverwrite: true, deniedNetwork: true, deniedLaunchctl: true, cancellationDrained: cancelled.cancelled && cancelled.status === 'failed' } })
 })
 
-test('Darwin startup diagnostic compares fixed trusted Node bootstrap profiles without admitting user commands', { skip: process.platform !== 'darwin', timeout: 45000 }, t => {
+test('Darwin startup diagnostic compares fixed trusted Node bootstrap profiles without admitting user commands', { skip: process.platform !== 'darwin', timeout: 90000 }, t => {
   if (process.env.AUTOPROMPT_DARWIN_COMMAND_STARTUP_DIAGNOSTIC !== '1') { t.diagnostic('set AUTOPROMPT_DARWIN_COMMAND_STARTUP_DIAGNOSTIC=1 to collect failure-only startup diagnostics'); return }
   const f = fixture(t)
   const node = fs.realpathSync.native(process.execPath), sandboxExecutable = '/usr/bin/sandbox-exec'
@@ -202,6 +205,9 @@ test('Darwin startup diagnostic compares fixed trusted Node bootstrap profiles w
     ['broad-process-exec', '\n(allow process-exec)\n'],
     ['broad-sysctl-and-file-read', '\n(allow sysctl-read)\n(allow file-read*)\n'],
     ['broad-all-three', '\n(allow sysctl-read)\n(allow file-read*)\n(allow process-exec)\n'],
+    ['metadata-and-sysctl', '\n(allow sysctl-read)\n(allow file-read-metadata)\n'],
+    ['data-and-sysctl', '\n(allow sysctl-read)\n(allow file-read-data)\n'],
+    ...['/private/etc', '/dev', '/Library', '/private/var/db', '/usr', '/private/var', '/System/Volumes/Preboot'].map(directory => [directory, `\n(allow sysctl-read)\n(allow file-read* (subpath ${JSON.stringify(directory)}))\n`]),
   ]
   const environment = { PATH: path.dirname(node), HOME: f.temp, TMPDIR: f.temp, TMP: f.temp, TEMP: f.temp, LANG: 'C', LC_ALL: 'C' }
   const results = variants.map(([name, suffix]) => {
@@ -209,6 +215,6 @@ test('Darwin startup diagnostic compares fixed trusted Node bootstrap profiles w
     return { name, status: child.status, signal: child.signal, error: child.error?.code || null, stdout: String(child.stdout || '').slice(-4096), stderr: String(child.stderr || '').slice(-4096) }
   })
   console.error(JSON.stringify({ darwinStartupDiagnostic: { fixedNode: node, fixedSandboxExecutable: sandboxExecutable, results } }))
-  assert.equal(results.length, 6)
+  assert.equal(results.length, variants.length)
   assert.ok(results.every(result => result.stdout === 'NODE_BOOTED' || result.stdout === ''), JSON.stringify(results))
 })
