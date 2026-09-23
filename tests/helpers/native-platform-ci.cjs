@@ -138,8 +138,10 @@ function diagnosticStageFiles(id) {
 }
 
 async function runDiagnosticStages({ environment, evidence, publish, run = runTests,
-  packedOnly = false, publicOnly = false, aggregateLog = 'native-platform-tests.log', stageLogPrefix = 'native-platform-tests-' }) {
-  const stages = publicOnly ? [{ id: 'public', cases: [
+  packedOnly = false, publicOnly = false, deepLaunchOnly = false, aggregateLog = 'native-platform-tests.log', stageLogPrefix = 'native-platform-tests-' }) {
+  const stages = deepLaunchOnly ? [{ id: 'deep-launch', cases: [
+    'actual Claude zero-tool route launch reaches controlled refusal from production-depth paths',
+  ] }] : publicOnly ? [{ id: 'public', cases: [
     'packed public Claude activate admits a fresh native canary before controlled endpoint refusal and revokes',
   ] }] : packedOnly ? DIAGNOSTIC_STAGES.filter(stage => stage.id === 'packed') : DIAGNOSTIC_STAGES
   const diagnosticCases = stages.flatMap(stage => stage.cases)
@@ -150,7 +152,8 @@ async function runDiagnosticStages({ environment, evidence, publish, run = runTe
   publish()
   for (const stage of stages) {
     const stageLog = `${stageLogPrefix}${stage.id}.log`
-    const argv = ['--test', '--test-reporter=tap', '--test-concurrency=1', '--test-name-pattern', `^(?:${stage.cases.join('|')})$`, ...diagnosticStageFiles(stage.id)]
+    const files = stage.id === 'deep-launch' ? ['tests/source/harness-v2-claude-deep-launch-native.test.cjs'] : diagnosticStageFiles(stage.id)
+    const argv = ['--test', '--test-reporter=tap', '--test-concurrency=1', '--test-name-pattern', `^(?:${stage.cases.join('|')})$`, ...files]
     let result = null, stageError = null
     try {
       result = await run(argv, environment, stageLog, aggregateLog)
@@ -174,7 +177,12 @@ async function runDiagnosticStages({ environment, evidence, publish, run = runTe
 }
 
 async function main() {
-  const action = process.argv[2]
+  let action = process.argv[2]
+  if (action === 'diagnose-claude-selected') {
+    const stage = process.env.AUTOPROMPT_CLAUDE_DIAGNOSTIC_STAGE || 'public'
+    assert.ok(['public', 'deep-launch'].includes(stage), 'Unknown Claude diagnostic stage')
+    action = `diagnose-claude-${stage}`
+  }
   if (process.env.AUTOPROMPT_CI_EXPECTED_ARCH) assert.equal(process.arch, process.env.AUTOPROMPT_CI_EXPECTED_ARCH,
     'The runner must exercise the requested architecture, without silently using an emulated Node binary')
   if (action === 'windows-regressions') {
@@ -266,7 +274,7 @@ async function main() {
     process.stdout.write('macOS: native filesystem/process tests enabled. Native Claude activation remains unavailable; VM runtime is required.\n')
     return
   }
-  assert.ok(['run', 'diagnose-claude', 'diagnose-claude-packed', 'diagnose-claude-public'].includes(action), 'Expected a platform, installer or Claude test action')
+  assert.ok(['run', 'diagnose-claude', 'diagnose-claude-packed', 'diagnose-claude-public', 'diagnose-claude-deep-launch'].includes(action), 'Expected a platform, installer or Claude test action')
   const diagnostic = action !== 'run'
   assert.ok(['linux', 'win32'].includes(process.platform))
   const version = process.env.CLAUDE_CODE_VERSION
@@ -303,7 +311,8 @@ async function main() {
     fs.writeFileSync(aggregateLog, '')
     await runDiagnosticStages({
       environment: { ...process.env, AUTOPROMPT_CLAUDE_TEST_CLI: executable, AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1' },
-      evidence, publish, aggregateLog, packedOnly: action === 'diagnose-claude-packed', publicOnly: action === 'diagnose-claude-public' })
+      evidence, publish, aggregateLog, packedOnly: action === 'diagnose-claude-packed', publicOnly: action === 'diagnose-claude-public',
+      deepLaunchOnly: action === 'diagnose-claude-deep-launch' })
     return
   }
   evidence.skipped = /# SKIP\b/i.test(output) || !/^# skipped 0\s*$/m.test(output)

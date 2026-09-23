@@ -23,10 +23,16 @@ on:
         default: false
         type: boolean
       claude_diagnostic_single:
-        description: 'Limit public activation diagnostics to Windows x64 / Node 24'
+        description: 'Limit Claude diagnostics to Windows x64 / Node 24'
         required: false
         default: false
         type: boolean
+      claude_diagnostic_stage:
+        description: 'Select public activation or focused deep-path Claude startup'
+        required: false
+        default: public
+        type: choice
+        options: [public, deep-launch]
       msys_mapping:
         description: 'Run the manual-only native MSYS mapping diagnostic'
         required: false
@@ -759,7 +765,9 @@ jobs:
         run: node tests/helpers/native-platform-ci.cjs run
       - name: Diagnose installed native Claude activation
         if: inputs.windows_regressions != true && inputs.claude_diagnostic == true
-        run: node tests/helpers/native-platform-ci.cjs diagnose-claude-public
+        env:
+          AUTOPROMPT_CLAUDE_DIAGNOSTIC_STAGE: ${{ inputs.claude_diagnostic_stage || 'public' }}
+        run: node tests/helpers/native-platform-ci.cjs diagnose-claude-selected
       - name: Diagnose Windows cwd, owned proxy and packed installer
         if: inputs.windows_regressions == true
         env:
