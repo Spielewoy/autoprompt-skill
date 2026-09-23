@@ -976,9 +976,9 @@ function isolatedEnvironment(root, environment = {}, credentials = {}, options =
     const key = `GIT_CONFIG_${suffix}_${i}`
     if (typeof environment[key] === 'string') result[key] = environment[key]
   }
-  Object.assign(result, credentials, { HOME: root, USERPROFILE: root, XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'), XDG_STATE_HOME: path.join(root, 'state'), XDG_CACHE_HOME: path.join(root, 'cache'), TMPDIR: path.join(root, 'tmp'), TMP: path.join(root, 'tmp'), TEMP: path.join(root, 'tmp'), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(root, 'gitconfig') })
+  Object.assign(result, credentials, { HOME: root, USERPROFILE: root, XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'), XDG_STATE_HOME: path.join(root, 'state'), XDG_CACHE_HOME: path.join(root, 'cache'), TMPDIR: path.join(root, 'tmp'), TMP: path.join(root, 'tmp'), TEMP: path.join(root, 'tmp'), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: windows ? '/dev/null' : path.join(root, 'gitconfig') })
   for (const dir of [root, result.XDG_CONFIG_HOME, result.XDG_DATA_HOME, result.XDG_STATE_HOME, result.XDG_CACHE_HOME, result.TMPDIR]) privateDirectory(dir)
-  if (!fs.existsSync(result.GIT_CONFIG_GLOBAL)) writePrivate(result.GIT_CONFIG_GLOBAL, '')
+  if (!windows && !fs.existsSync(result.GIT_CONFIG_GLOBAL)) writePrivate(result.GIT_CONFIG_GLOBAL, '')
   return result
 }
 function packageEvidence(packageRoot, expectedName, version) {

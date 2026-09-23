@@ -16,6 +16,46 @@ function destinationParents(file) {
   while (cursor !== '/') { result.push(cursor); cursor = path.dirname(cursor) }
   return result.reverse()
 }
+function physicalFile(file) {
+  if (!absolute(file) || !fs.existsSync(file) || !fs.statSync(file).isFile()) return null
+  const resolved = fs.realpathSync.native(file)
+  return fs.statSync(resolved).isFile() ? resolved : null
+}
+function physicalDirectory(directory) {
+  if (!absolute(directory) || !fs.existsSync(directory) || !fs.statSync(directory).isDirectory()) return null
+  const resolved = fs.realpathSync.native(directory)
+  return fs.statSync(resolved).isDirectory() ? resolved : null
+}
+function packageManifest(directory, expectedName, expectedVersion) {
+  const manifest = physicalFile(path.join(directory, 'package.json'))
+  if (!manifest || !contained(directory, manifest)) return null
+  let value
+  try { value = JSON.parse(fs.readFileSync(manifest, 'utf8')) } catch { return null }
+  if (!value || value.name !== expectedName || typeof value.version !== 'string' || (expectedVersion && value.version !== expectedVersion)) return null
+  return value
+}
+// The official npm command is a Node wrapper. It resolves a sibling platform
+// package at runtime, so mounting only its bin file makes every sandbox launch
+// fail before it can contact the controller relay. Preserve the package layout
+// Node resolves, but mount no unrelated node_modules entries.
+function grokRuntime(executable) {
+  const physicalExecutable = physicalFile(executable)
+  if (!physicalExecutable) fail('GROK_SANDBOX_CONFIG_INVALID', 'Grok executable is unavailable')
+  const packageRoot = physicalDirectory(path.dirname(path.dirname(physicalExecutable)))
+  const officialName = '@xai-official/grok'
+  const manifest = packageRoot && path.dirname(physicalExecutable) === path.join(packageRoot, 'bin')
+    ? packageManifest(packageRoot, officialName) : null
+  if (!manifest) return { executable: '/opt/grok/grok', mounts: [[physicalExecutable, '/opt/grok/grok']] }
+  if (!manifest.bin || manifest.bin.grok !== 'bin/grok') fail('GROK_SANDBOX_CONFIG_INVALID', 'Official Grok wrapper entrypoint is invalid')
+  const platformName = `${officialName}-${process.platform}-${process.arch}`
+  const platformRoot = physicalDirectory(path.join(path.dirname(path.dirname(packageRoot)), platformName))
+  if (!platformRoot || !packageManifest(platformRoot, platformName, manifest.version)) fail('GROK_SANDBOX_CONFIG_INVALID', 'Official Grok platform package is unavailable')
+  const compressed = physicalFile(path.join(platformRoot, 'bin', process.platform === 'win32' ? 'grok.exe.br' : 'grok.br'))
+  const raw = physicalFile(path.join(platformRoot, 'bin', process.platform === 'win32' ? 'grok.exe' : 'grok'))
+  if (!compressed && !raw) fail('GROK_SANDBOX_CONFIG_INVALID', 'Official Grok platform binary is unavailable')
+  const insideModules = '/opt/autoprompt-grok-node/node_modules/@xai-official'
+  return { executable: `${insideModules}/grok/bin/grok`, mounts: [[packageRoot, `${insideModules}/grok`], [platformRoot, `${insideModules}/${path.basename(platformRoot)}`]] }
+}
 function createSandboxLaunch(options = {}) {
   const required = ['root', 'sessionHome', 'grokExecutable', 'nodeExecutable', 'model', 'proxyToken', 'relayToken', 'cwd', 'toolRuntimeRoot', 'toolPolicyPath', 'toolPolicySha256']
   const textRequired = new Set(['model', 'proxyToken', 'relayToken', 'toolPolicySha256'])
@@ -28,7 +68,8 @@ function createSandboxLaunch(options = {}) {
   const issuedCalls = options.issuedCalls === undefined ? [] : options.issuedCalls
   if (!Array.isArray(issuedCalls) || Buffer.byteLength(JSON.stringify(issuedCalls)) > 4 * 1024 * 1024) fail('GROK_SANDBOX_CONFIG_INVALID', 'Issued call history is invalid')
   if (!absolute(options.cwd) || ![...readOnlyRoots, ...writableRoots].some(root => contained(root, options.cwd)) || writableRoots.some(write => !readOnlyRoots.some(read => contained(read, write))) || writableRoots.some((left, index) => writableRoots.slice(index + 1).some(right => contained(left, right) || contained(right, left)))) fail('GROK_SANDBOX_CONFIG_INVALID', 'Assigned sandbox paths are invalid')
-  const bridge = path.resolve(__dirname), insideBridge = '/opt/autoprompt-grok', insideRoot = '/run/autoprompt', insideSessionHome = '/autoprompt/session', insideGrok = '/opt/grok/grok', insideRuntime = '/opt/autoprompt-runtime', insidePolicy = `${insideRoot}/tool-policy.json`
+  const runtime = grokRuntime(options.grokExecutable)
+  const bridge = path.resolve(__dirname), insideBridge = '/opt/autoprompt-grok', insideRoot = '/run/autoprompt', insideSessionHome = '/autoprompt/session', insideGrok = runtime.executable, insideRuntime = '/opt/autoprompt-runtime', insidePolicy = `${insideRoot}/tool-policy.json`
   const env = {
     HOME: insideSessionHome, GROK_HOME: insideSessionHome, XDG_CONFIG_HOME: `${insideSessionHome}/config`, XDG_DATA_HOME: `${insideSessionHome}/data`, XDG_STATE_HOME: `${insideSessionHome}/state`, XDG_CACHE_HOME: `${insideSessionHome}/cache`,
     AUTOPROMPT_GROK_EXECUTABLE: insideGrok, AUTOPROMPT_GROK_CWD: options.cwd, AUTOPROMPT_GROK_MODEL: options.model,
@@ -46,13 +87,15 @@ function createSandboxLaunch(options = {}) {
     if (stat.isSymbolicLink()) argv.push('--symlink', fs.readlinkSync(mount), mount)
     else argv.push('--ro-bind', mount, mount)
   }
-  const dirs = new Set(['/run', '/opt', '/opt/grok', '/autoprompt', ...readOnlyRoots.flatMap(destinationParents), ...writableRoots.flatMap(destinationParents)])
+  const dirs = new Set(['/run', '/opt', '/autoprompt', ...runtime.mounts.flatMap(([, destination]) => destinationParents(destination)), ...readOnlyRoots.flatMap(destinationParents), ...writableRoots.flatMap(destinationParents)])
   for (const directory of [...dirs].sort((left, right) => left.length - right.length || left.localeCompare(right))) argv.push('--dir', directory)
-  argv.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--bind', options.root, insideRoot, '--bind', options.sessionHome, insideSessionHome, '--ro-bind', options.toolPolicyPath, insidePolicy, '--ro-bind', options.toolRuntimeRoot, insideRuntime, '--ro-bind', bridge, insideBridge, '--ro-bind', options.grokExecutable, insideGrok, '--ro-bind', options.nodeExecutable, options.nodeExecutable)
+  argv.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--bind', options.root, insideRoot, '--bind', options.sessionHome, insideSessionHome, '--ro-bind', options.toolPolicyPath, insidePolicy, '--ro-bind', options.toolRuntimeRoot, insideRuntime, '--ro-bind', bridge, insideBridge)
+  for (const [source, destination] of runtime.mounts) argv.push('--ro-bind', source, destination)
+  argv.push('--ro-bind', options.nodeExecutable, options.nodeExecutable)
   for (const directory of readOnlyRoots) argv.push('--ro-bind', directory, directory)
   for (const directory of writableRoots) argv.push('--bind', directory, directory)
   for (const [name, value] of Object.entries(env)) argv.push('--setenv', name, value)
   argv.push('--chdir', options.cwd, '--', options.nodeExecutable, `${insideBridge}/sandbox-worker.cjs`, '--', ...(options.grokArgv || []))
   return Object.freeze({ executable: '/usr/bin/bwrap', argv, env: {}, cwd: '/', shell: false, stdin: options.relayStdin, insideRoot, insideSessionHome, insideBridge, insideRuntime, insidePolicy })
 }
-module.exports = { GrokSandboxError, createSandboxLaunch }
+module.exports = { GrokSandboxError, createSandboxLaunch, grokRuntime }

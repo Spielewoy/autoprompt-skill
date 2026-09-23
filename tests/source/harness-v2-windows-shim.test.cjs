@@ -68,7 +68,7 @@ test('Windows npm10 cmd-shim resolves to exact Node plus declared package bin wi
   assert.equal(probe.path, f.shim)
   assert.equal(probe.invocation.sha256, binding.invocation.sha256)
   assert.equal(native.executableRuntimePath(probe), f.script)
-  assert.ok(probe.portableRuntimeIdentity.files.some(([label]) => label === 'interpreter/node'),
+  assert.ok(probe.portableRuntimeIdentity.files.some(([label]) => label === `interpreter/${path.basename(process.execPath)}`),
     'the portable closure binds the verified Node interpreter, not /usr/bin/env')
   assert.ok(!probe.portableRuntimeIdentity.files.some(([label]) => label === 'interpreter/env'),
     'the env selector is never part of a shell-free shim launch')

@@ -24,6 +24,7 @@
  * the private SDK surface.  The values mirror XNU's bsd/sys/proc_info.h.
  */
 #define AP_PROC_PIDCOALITIONINFO 20
+#define AP_PROC_PIDUNIQIDENTIFIERINFO 17
 #define AP_COALITION_TYPE_RESOURCE 0
 #define AP_COALITION_TYPE_JETSAM 1
 
@@ -37,6 +38,25 @@ struct ap_proc_pidcoalitioninfo {
     uint64_t reserved2;
     uint64_t reserved3;
 };
+
+struct ap_proc_uniqidentifierinfo {
+    uint8_t executable_uuid[16];
+    uint64_t unique_id;
+    uint64_t parent_unique_id;
+    int32_t pid_version;
+    uint32_t reserved2;
+    uint64_t reserved3;
+    uint64_t reserved4;
+};
+
+_Static_assert(sizeof(struct ap_proc_pidcoalitioninfo) == 40,
+               "unexpected coalition info wire size");
+_Static_assert(sizeof(struct ap_proc_uniqidentifierinfo) == 56,
+               "unexpected unique process info wire size");
+_Static_assert(sizeof(audit_token_t) == 32,
+               "unexpected audit token wire size");
+
+typedef int (*ap_signal_with_audittoken)(audit_token_t *, int);
 
 static volatile sig_atomic_t stop_requested = 0;
 
@@ -53,6 +73,69 @@ static int coalition_info(pid_t pid, struct ap_proc_pidcoalitioninfo *info,
                               (int)sizeof(*info));
     *saved_errno = errno;
     return result;
+}
+
+static int bind_process_token(pid_t pid, bool stale_token,
+                              audit_token_t *token, int *query_result,
+                              int *query_errno) {
+    struct ap_proc_uniqidentifierinfo unique;
+    memset(&unique, 0, sizeof(unique));
+    errno = 0;
+    *query_result = proc_pidinfo(pid, AP_PROC_PIDUNIQIDENTIFIERINFO, 0,
+                                 &unique, (int)sizeof(unique));
+    *query_errno = errno;
+    if (*query_result != (int)sizeof(unique)) {
+        return -1;
+    }
+    struct proc_bsdinfo identity;
+    memset(&identity, 0, sizeof(identity));
+    errno = 0;
+    int identity_result = proc_pidinfo(
+        pid, PROC_PIDTBSDINFO, 0, &identity, (int)sizeof(identity));
+    if (identity_result != (int)sizeof(identity)) {
+        *query_result = identity_result;
+        *query_errno = errno;
+        return -1;
+    }
+    memset(token, 0, sizeof(*token));
+    token->val[0] = identity.pbi_uid;
+    token->val[1] = identity.pbi_uid;
+    token->val[2] = identity.pbi_gid;
+    token->val[3] = identity.pbi_ruid;
+    token->val[4] = identity.pbi_rgid;
+    token->val[5] = (uint32_t)pid;
+    token->val[6] = 0;
+    token->val[7] = (uint32_t)unique.pid_version + (stale_token ? 1U : 0U);
+    return 0;
+}
+
+static int signal_bound_token(audit_token_t *token, int signal_number,
+                              int *signal_result, int *signal_errno) {
+    ap_signal_with_audittoken signal_function =
+        (ap_signal_with_audittoken)dlsym(RTLD_DEFAULT,
+                                         "proc_signal_with_audittoken");
+    if (signal_function == NULL) {
+        *signal_result = -1;
+        *signal_errno = ENOSYS;
+        return -1;
+    }
+    errno = 0;
+    *signal_result = signal_function(token, signal_number);
+    *signal_errno = errno;
+    return 0;
+}
+
+static int signal_with_bound_token(pid_t pid, int signal_number,
+                                   bool stale_token, int *query_result,
+                                   int *query_errno, int *signal_result,
+                                   int *signal_errno) {
+    audit_token_t token;
+    if (bind_process_token(pid, stale_token, &token, query_result,
+                           query_errno) != 0) {
+        return -1;
+    }
+    return signal_bound_token(&token, signal_number, signal_result,
+                              signal_errno);
 }
 
 static int write_record(const char *directory, const char *role) {
@@ -331,52 +414,31 @@ static int census_processes(const char *coalition_string) {
         return 70;
     }
     errno = 0;
-    int count = proc_listallpids(pids, capacity * (int)sizeof(*pids));
+    int bytes = proc_listpids(PROC_UID_ONLY, (uint32_t)getuid(), pids,
+                              capacity * (int)sizeof(*pids));
     int list_errno = errno;
-    if (count < 0) {
-        printf("{\"listResult\":%d,\"listErrno\":%d}\n", count,
+    if (bytes < 0 || bytes % (int)sizeof(*pids) != 0) {
+        printf("{\"listResult\":%d,\"listErrno\":%d}\n", bytes,
                list_errno);
         free(pids);
         return 1;
     }
 
-    int same_uid_candidates = 0;
+    int count = bytes / (int)sizeof(*pids);
+    bool complete = list_errno == 0 && count > 0 && count < capacity;
     int queried = 0;
     int denied = 0;
     int vanished = 0;
     int other_errors = 0;
-    int identity_denied = 0;
-    int identity_vanished = 0;
-    int identity_errors = 0;
     bool first = true;
     printf("{\"listResult\":%d,\"listErrno\":%d,\"capacity\":%d,"
            "\"complete\":%s,\"matchingPids\":[",
-           count, list_errno, capacity, count < capacity ? "true" : "false");
+           bytes, list_errno, capacity, complete ? "true" : "false");
     int bounded_count = count < capacity ? count : capacity;
     for (int index = 0; index < bounded_count; index++) {
         if (pids[index] <= 0) {
             continue;
         }
-        struct proc_bsdinfo identity;
-        memset(&identity, 0, sizeof(identity));
-        errno = 0;
-        int identity_result = proc_pidinfo(
-            pids[index], PROC_PIDTBSDINFO, 0, &identity, (int)sizeof(identity));
-        int identity_errno = errno;
-        if (identity_result != (int)sizeof(identity)) {
-            if (identity_errno == EPERM || identity_errno == EACCES) {
-                identity_denied++;
-            } else if (identity_errno == ESRCH) {
-                identity_vanished++;
-            } else {
-                identity_errors++;
-            }
-            continue;
-        }
-        if (identity.pbi_uid != getuid()) {
-            continue;
-        }
-        same_uid_candidates++;
         struct ap_proc_pidcoalitioninfo info;
         int query_errno = 0;
         int result = coalition_info(pids[index], &info, &query_errno);
@@ -395,11 +457,126 @@ static int census_processes(const char *coalition_string) {
         }
     }
     printf("],\"sameUidCandidates\":%d,\"queried\":%d,"
-           "\"denied\":%d,\"vanished\":%d,\"otherErrors\":%d,"
-           "\"identityDenied\":%d,\"identityVanished\":%d,"
-           "\"identityErrors\":%d}\n",
-           same_uid_candidates, queried, denied, vanished, other_errors,
-           identity_denied, identity_vanished, identity_errors);
+           "\"denied\":%d,\"vanished\":%d,\"otherErrors\":%d}\n",
+           bounded_count, queried, denied, vanished, other_errors);
+    free(pids);
+    return 0;
+}
+
+static int parse_positive_pid(const char *value, pid_t *pid) {
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed <= 0 ||
+        parsed > INT_MAX) {
+        return -1;
+    }
+    *pid = (pid_t)parsed;
+    return 0;
+}
+
+static int audit_signal_process(const char *pid_string,
+                                const char *signal_string,
+                                const char *stale_string) {
+    pid_t pid = 0;
+    if (parse_positive_pid(pid_string, &pid) != 0) {
+        fprintf(stderr, "invalid audit-signal arguments\n");
+        return 64;
+    }
+    char *end = NULL;
+    errno = 0;
+    long parsed_signal = strtol(signal_string, &end, 10);
+    int signal_parse_errno = errno;
+    if (signal_parse_errno != 0 || end == signal_string || *end != '\0' ||
+        parsed_signal < 0 ||
+        parsed_signal >= NSIG ||
+        (strcmp(stale_string, "fresh") != 0 &&
+         strcmp(stale_string, "stale") != 0)) {
+        fprintf(stderr, "invalid audit-signal arguments\n");
+        return 64;
+    }
+    int query_result = -1;
+    int query_errno = 0;
+    int signal_result = -1;
+    int signal_errno = 0;
+    signal_with_bound_token(pid, (int)parsed_signal,
+                            strcmp(stale_string, "stale") == 0,
+                            &query_result, &query_errno,
+                            &signal_result, &signal_errno);
+    printf("{\"pid\":%ld,\"signal\":%ld,\"stale\":%s,"
+           "\"queryResult\":%d,\"queryErrno\":%d,"
+           "\"signalResult\":%d,\"signalErrno\":%d}\n",
+           (long)pid, parsed_signal,
+           strcmp(stale_string, "stale") == 0 ? "true" : "false",
+           query_result, query_errno, signal_result, signal_errno);
+    return 0;
+}
+
+static int drain_coalition(const char *coalition_string) {
+    char *end = NULL;
+    errno = 0;
+    uint64_t target = strtoull(coalition_string, &end, 10);
+    if (errno != 0 || end == coalition_string || *end != '\0' || target == 0) {
+        fprintf(stderr, "invalid coalition id\n");
+        return 64;
+    }
+    const int capacity = 65536;
+    pid_t *pids = calloc((size_t)capacity, sizeof(*pids));
+    if (pids == NULL) {
+        perror("calloc");
+        return 70;
+    }
+    errno = 0;
+    int bytes = proc_listpids(PROC_UID_ONLY, (uint32_t)getuid(), pids,
+                              capacity * (int)sizeof(*pids));
+    int list_errno = errno;
+    if (bytes < 0 || bytes % (int)sizeof(*pids) != 0) {
+        printf("{\"listResult\":%d,\"listErrno\":%d}\n", bytes,
+               list_errno);
+        free(pids);
+        return 0;
+    }
+    int count = bytes / (int)sizeof(*pids);
+    int bounded_count = count < capacity ? count : capacity;
+    bool complete = list_errno == 0 && count > 0 && count < capacity;
+    bool first = true;
+    int matched = 0;
+    printf("{\"listResult\":%d,\"listErrno\":%d,\"complete\":%s,"
+           "\"attempts\":[",
+           bytes, list_errno, complete ? "true" : "false");
+    for (int index = 0; index < bounded_count; index++) {
+        if (pids[index] <= 0 || pids[index] == getpid()) {
+            continue;
+        }
+        int query_result = -1;
+        int query_errno = 0;
+        audit_token_t token;
+        if (bind_process_token(pids[index], false, &token, &query_result,
+                               &query_errno) != 0) {
+            continue;
+        }
+        struct ap_proc_pidcoalitioninfo coalition;
+        int coalition_errno = 0;
+        int coalition_result = coalition_info(
+            pids[index], &coalition, &coalition_errno);
+        if (coalition_result != (int)sizeof(coalition) ||
+            coalition.coalition_id[AP_COALITION_TYPE_RESOURCE] != target) {
+            continue;
+        }
+        matched++;
+        int signal_result = -1;
+        int signal_errno = 0;
+        signal_bound_token(&token, SIGKILL, &signal_result, &signal_errno);
+        printf("%s{\"pid\":%d,\"coalitionResult\":%d,"
+               "\"coalitionErrno\":%d,\"queryResult\":%d,"
+               "\"queryErrno\":%d,\"signalResult\":%d,"
+               "\"signalErrno\":%d}",
+               first ? "" : ",", pids[index], coalition_result,
+               coalition_errno, query_result, query_errno,
+               signal_result, signal_errno);
+        first = false;
+    }
+    printf("],\"matched\":%d}\n", matched);
     free(pids);
     return 0;
 }
@@ -417,10 +594,17 @@ int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "census") == 0) {
         return census_processes(argv[2]);
     }
+    if (argc == 5 && strcmp(argv[1], "audit-signal") == 0) {
+        return audit_signal_process(argv[2], argv[3], argv[4]);
+    }
+    if (argc == 3 && strcmp(argv[1], "drain") == 0) {
+        return drain_coalition(argv[2]);
+    }
     fprintf(stderr,
             "usage: %s root STATE_DIR FOREIGN_COALITION_ID | hold ROLE "
-            "STATE_DIR | inspect PID | "
-            "census RESOURCE_COALITION_ID\n",
+            "STATE_DIR | inspect PID | census RESOURCE_COALITION_ID | "
+            "audit-signal PID SIGNAL fresh|stale | "
+            "drain RESOURCE_COALITION_ID\n",
             argv[0]);
     return 64;
 }

@@ -21,6 +21,11 @@ test('Darwin launchd coalition proof keeps setsid and posix_spawn escapes in one
   assert.equal(evidence.observations.censusContainsAllKnownMembers, true);
   assert.equal(evidence.observations.sameUidCensusQueryable, true);
   assert.equal(evidence.observations.foreignCoalitionJoinRejected, true);
+  assert.equal(evidence.observations.auditTokenSignalsBound, true);
+  assert.equal(evidence.auditToken.trustedRootKilled, true);
+  assert.equal(evidence.observations.staleAuditTokenRejected, true);
+  assert.equal(evidence.observations.oldCoalitionRetainedDetachedChildren, true);
+  assert.equal(evidence.observations.oldCoalitionRecovered, true);
 });
 
 test('coalition diagnostic stays isolated from production sources', () => {
@@ -29,6 +34,10 @@ test('coalition diagnostic stays isolated from production sources', () => {
   assert.match(source, /AP_PROC_PIDCOALITIONINFO 20/);
   assert.match(source, /POSIX_SPAWN_SETSID/);
   assert.match(source, /_NSGetEnviron\(\)/);
+  assert.match(source, /proc_signal_with_audittoken/);
+  assert.match(source, /bind_process_token\(pids\[index\], false, &token/);
+  assert.match(source, /signal_bound_token\(&token, SIGKILL/);
   assert.match(driver, /launchctl', \['bootstrap', candidate/);
   assert.match(driver, /sameUidCensusQueryable/);
+  assert.match(driver, /recoveryCensuses\.every\(censusCertifiesCompleteEnumeration\)/);
 });

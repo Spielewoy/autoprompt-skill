@@ -27,7 +27,7 @@ const shells = process.platform === 'win32'
   ? [path.join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe'), 'pwsh']
   : [process.env.AUTOPROMPT_TEST_PWSH || 'pwsh']
 for (const shell of shells) {
-  const present = cp.spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'], { timeout: 10000 }).status === 0
+  const present = process.platform === 'win32' || cp.spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'], { timeout: 10000 }).status === 0
   test(`real npm PowerShell shim preserves activation mission through ${path.basename(shell)}`, {
     skip: !present && process.platform !== 'win32' ? 'PowerShell unavailable' : false,
     timeout: 150000,

@@ -73,30 +73,11 @@ function connection(service, options = {}) {
 }
 
 function fixtureFailureDiagnostic(f, error) {
-  // Only this synthetic fixture's subprocess output; never ambient user logs.
-  const files = []
-  let remaining = 65536, visited = 0
-  const visit = directory => {
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      if (++visited > 1000 || remaining <= 0 || files.length >= 16) return
-      const file = path.join(directory, entry.name)
-      if (entry.isDirectory()) visit(file)
-      else if (entry.isFile() && ['stdout.jsonl', 'stderr.log', 'receipts.jsonl'].includes(entry.name)) {
-        const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
-        try {
-          const stat = fs.fstatSync(fd)
-          if (!stat.isFile()) continue
-          const length = Math.min(stat.size, remaining, 8192), buffer = Buffer.alloc(length)
-          fs.readSync(fd, buffer, 0, length, stat.size - length)
-          remaining -= length
-          files.push({ path: path.relative(f.root, file).slice(0, 512), bytes: stat.size, tail: buffer.toString('utf8') })
-        } finally { fs.closeSync(fd) }
-      }
-    }
-  }
-  try { visit(f.controller) } catch (diagnosticError) { files.push({ diagnosticError: String(diagnosticError.message).slice(0, 1024) }) }
-  const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024), files }
-  while (Buffer.byteLength(JSON.stringify(output)) > 65536) files.shift()
+  // Capture the synthetic provider events before the real runner drains and
+  // removes its private transcript. No ambient files or user logs are read.
+  const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024),
+    stderr: String(f.nativeStderr || '').slice(-8192), events: [...(f.nativeEvents || [])] }
+  while (Buffer.byteLength(JSON.stringify(output)) > 65536) output.events.shift()
   console.error(JSON.stringify(output))
 }
 
@@ -114,6 +95,17 @@ async function scenario(provider, options = {}) {
     owner = ownerValue
     const proxy = privateDirectory(path.join(f.controller, 'proxy'))
     const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: `${provider}-closed-native-canary`, pollMs: 10 })
+    const ownedRun = runner.run.bind(runner)
+    runner.run = async spec => {
+      f.nativeEvents = []; f.nativeStderr = ''
+      const result = await ownedRun({ ...spec, onStdoutLine: line => {
+        f.nativeEvents.push(String(line).slice(-8192))
+        if (f.nativeEvents.length > 16) f.nativeEvents.shift()
+        return spec.onStdoutLine?.(line)
+      } })
+      f.nativeStderr = result.stderr
+      return result
+    }
     const adapter = new HarnessExecAdapter({ provider, runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: connection(service, options.connection), credentialEnvironment: { OPENAI_API_KEY: '<local-test-only>', KILO_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only assigned controller tools and return one JSON object.' })
     const run = async overrides => {
       const record = { ...f.record, ...overrides }
@@ -147,7 +139,7 @@ async function runScenario(provider) {
     let contacted = false; listener = net.createServer(socket => { contacted = true; socket.destroy() })
     await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
     const port = listener.address().port, probe = `const n=require('node:net');const s=n.connect(${port},'127.0.0.1');s.on('connect',()=>process.exit(19));s.on('error',()=>process.exit(0));setTimeout(()=>process.exit(0),700)`
-    command(f, withChallenge(`${readCommand(f.candidate)}; ${nodeCommand(`require('node:fs').writeFileSync(${JSON.stringify(readback)}, ${JSON.stringify(expectedReceipt)}); require('node:fs').writeFileSync(${JSON.stringify(scratchFile)}, 'scratch-ok'); try { require('node:fs').writeFileSync(${JSON.stringify(f.candidate)}, 'nope'); process.exit(18) } catch {} ; try { require('node:fs').readFileSync(${JSON.stringify(f.secret)}); process.exit(20) } catch {} ; ${probe}`)}`, f.challenge))
+    command(f, withChallenge(`${readCommand(f.candidate)}; ${nodeCommand(`require('node:fs').writeFileSync(${JSON.stringify(readback)}, require('node:fs').readFileSync(${JSON.stringify(f.candidate)}, 'utf8') + ${JSON.stringify(`\nCLOSED_CANARY_CHALLENGE:${f.challenge}\n`)}); require('node:fs').writeFileSync(${JSON.stringify(scratchFile)}, 'scratch-ok'); try { require('node:fs').writeFileSync(${JSON.stringify(f.candidate)}, 'nope'); process.exit(18) } catch {} ; try { require('node:fs').readFileSync(${JSON.stringify(f.secret)}); process.exit(20) } catch {} ; ${probe}`)}`, f.challenge))
     const first = await f.run({ assignment: { model: 'fixture/model', effort: 'low' } }); good(first)
     assert.equal(fs.readFileSync(readback, 'utf8'), expectedReceipt, 'controller receipt body did not bind the exact candidate bytes and challenge')
     assert.equal(fs.readFileSync(f.candidate, 'utf8'), f.marker); assert.equal(fs.readFileSync(scratchFile, 'utf8'), 'scratch-ok'); assert.equal(contacted, false); assert.equal(first.toolBoundaryEvidence.receiptHashes.length, 1)

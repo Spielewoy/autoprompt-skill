@@ -599,7 +599,22 @@ test('private child environment strips code injection, foreign config and unrela
     OPENCODE_CONFIG: '/foreign', ANTHROPIC_API_KEY: 'unrelated', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'push.default', GIT_CONFIG_VALUE_0: 'nothing' })
   for (const key of ['NODE_OPTIONS', 'LD_PRELOAD', 'OPENCODE_CONFIG', 'ANTHROPIC_API_KEY']) assert.equal(result[key], undefined)
   assert.equal(result.HOME, home); assert.equal(result.GIT_CONFIG_VALUE_0, 'nothing')
-  assert.equal(fs.readFileSync(result.GIT_CONFIG_GLOBAL, 'utf8'), '')
+  if (process.platform === 'win32') assert.equal(result.GIT_CONFIG_GLOBAL, '/dev/null')
+  else assert.equal(fs.readFileSync(result.GIT_CONFIG_GLOBAL, 'utf8'), '')
+})
+
+test('Windows provider environment uses the Git null device while retaining injected policy', t => {
+  const home = root(t)
+  const result = native.isolatedEnvironment(home, {
+    PATH: process.env.PATH, GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'core.longpaths', GIT_CONFIG_VALUE_0: 'true',
+  }, {}, { platform: 'win32' })
+  assert.equal(result.GIT_CONFIG_GLOBAL, '/dev/null')
+  assert.equal(result.GIT_CONFIG_NOSYSTEM, '1')
+  assert.equal(result.GIT_CONFIG_COUNT, '1')
+  assert.equal(result.GIT_CONFIG_KEY_0, 'core.longpaths')
+  assert.equal(result.GIT_CONFIG_VALUE_0, 'true')
+  assert.equal(fs.existsSync(path.join(home, 'gitconfig')), false)
 })
 
 test('native continuation is exact across new launch identities and refuses role/workspace/provider changes', t => {

@@ -14,7 +14,7 @@ const { createModelProxy } = require('../../scripts/harness-v2-bridge/grok/model
 const { createUnixRelay, createUnixRelayFetch, createPreconnectedRelayClient } = require('../../scripts/harness-v2-bridge/grok/unix-relay.cjs')
 const { createHostMcpRelay } = require('../../scripts/harness-v2-bridge/grok/host-mcp-relay.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
-const { createSandboxLaunch } = require('../../scripts/harness-v2-bridge/grok/sandbox-launch.cjs')
+const { createSandboxLaunch, grokRuntime } = require('../../scripts/harness-v2-bridge/grok/sandbox-launch.cjs')
 const { createRequestQuota } = require('../../scripts/harness-v2-request-quota.cjs')
 const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 
@@ -229,6 +229,31 @@ test('preconnected host relay FD remains usable after bwrap removes network acce
   assert.equal(stdout, '200:data: [DONE]\n\n')
   connected.destroy(); await relay.close(); await close(upstream.server)
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('Grok sandbox maps a verified raw executable inside the namespace', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-raw-runtime-')), executable = path.join(root, 'grok')
+  try {
+    fs.writeFileSync(executable, '#!/bin/false\n', { mode: 0o700 })
+    assert.deepEqual(grokRuntime(executable), { executable: '/opt/grok/grok', mounts: [[fs.realpathSync.native(executable), '/opt/grok/grok']] })
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('Grok sandbox preserves the official npm wrapper and platform payload layout', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wrapper-runtime-'))
+  const modules = path.join(root, 'node_modules'), scope = path.join(modules, '@xai-official')
+  const wrapper = path.join(scope, 'grok'), platform = path.join(scope, `grok-${process.platform}-${process.arch}`)
+  try {
+    fs.mkdirSync(path.join(wrapper, 'bin'), { recursive: true, mode: 0o700 })
+    fs.mkdirSync(path.join(platform, 'bin'), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(path.join(wrapper, 'package.json'), JSON.stringify({ name: '@xai-official/grok', version: '1.0.13', bin: { grok: 'bin/grok' } }), { mode: 0o600 })
+    fs.writeFileSync(path.join(platform, 'package.json'), JSON.stringify({ name: `@xai-official/grok-${process.platform}-${process.arch}`, version: '1.0.13' }), { mode: 0o600 })
+    fs.writeFileSync(path.join(wrapper, 'bin', 'grok'), '#!/usr/bin/env node\n', { mode: 0o700 })
+    fs.writeFileSync(path.join(platform, 'bin', process.platform === 'win32' ? 'grok.exe' : 'grok'), 'native', { mode: 0o700 })
+    const runtime = grokRuntime(path.join(wrapper, 'bin', 'grok'))
+    assert.equal(runtime.executable, '/opt/autoprompt-grok-node/node_modules/@xai-official/grok/bin/grok')
+    assert.deepEqual(runtime.mounts, [[fs.realpathSync.native(wrapper), '/opt/autoprompt-grok-node/node_modules/@xai-official/grok'], [fs.realpathSync.native(platform), `/opt/autoprompt-grok-node/node_modules/@xai-official/grok-${process.platform}-${process.arch}`]])
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
 test('Grok sandbox launch requires bwrap network isolation and passes only a preconnected relay stream', () => {

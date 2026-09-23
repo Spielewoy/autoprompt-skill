@@ -119,6 +119,11 @@ function isAlive(pid) {
   }
 }
 
+function censusCertifiesCompleteEnumeration(census) {
+  return census && census.complete === true && census.listErrno === 0 &&
+    census.sameUidCandidates > 0 && census.denied === 0 && census.otherErrors === 0;
+}
+
 function writeEvidence(evidence) {
   const encoded = `${JSON.stringify(evidence, null, 2)}\n`;
   if (process.env.AUTOPROMPT_DARWIN_COALITION_EVIDENCE) {
@@ -266,6 +271,64 @@ function runProof() {
         ? 'rejected'
         : foreignAttempt.setterResult === 0 && foreignAttempt.spawnResult === 0
           ? 'escaped' : 'inconclusive';
+    const signalNumber = os.constants.signals;
+    const signalTarget = records['posix-spawn-setsid'].pid;
+    const staleAuditSignal = parseSingleJson(command(executableRealpath, [
+      'audit-signal', String(signalTarget), String(signalNumber.SIGCONT), 'stale',
+    ]), 'stale audit-token signal');
+    const stopAuditSignal = parseSingleJson(command(executableRealpath, [
+      'audit-signal', String(signalTarget), String(signalNumber.SIGSTOP), 'fresh',
+    ]), 'bound audit-token stop');
+    const continueAuditSignal = parseSingleJson(command(executableRealpath, [
+      'audit-signal', String(signalTarget), String(signalNumber.SIGCONT), 'fresh',
+    ]), 'bound audit-token continue');
+    const rootKillAuditSignal = parseSingleJson(command(executableRealpath, [
+      'audit-signal', String(records.root.pid), String(signalNumber.SIGKILL), 'fresh',
+    ]), 'bound audit-token root kill');
+    const rootDeathDeadline = Date.now() + 5_000;
+    while (isAlive(records.root.pid) && Date.now() < rootDeathDeadline) sleep(50);
+    const trustedRootKilled = !isAlive(records.root.pid);
+    const postRootDeathCensus = parseSingleJson(
+      command(executableRealpath, ['census', resourceId]),
+      'post-root-death coalition census',
+    );
+    const detachedPids = [records['fork-setsid-exec'].pid, records['posix-spawn-setsid'].pid];
+    const oldCoalitionRetainedDetachedChildren = detachedPids.every(
+      (pid) => postRootDeathCensus.matchingPids.includes(pid),
+    ) && censusCertifiesCompleteEnumeration(postRootDeathCensus);
+    const recovery = [];
+    const recoveryCensuses = [postRootDeathCensus];
+    let emptyScans = 0;
+    let recoveredCensus = postRootDeathCensus;
+    for (let iteration = 0; iteration < 12 && emptyScans < 2; iteration += 1) {
+      if (censusCertifiesCompleteEnumeration(recoveredCensus) &&
+          recoveredCensus.matchingPids.length === 0) {
+        emptyScans += 1;
+      } else {
+        emptyScans = 0;
+        recovery.push(parseSingleJson(
+          command(executableRealpath, ['drain', resourceId]),
+          `old-coalition recovery ${iteration + 1}`,
+        ));
+      }
+      sleep(50);
+      recoveredCensus = parseSingleJson(
+        command(executableRealpath, ['census', resourceId]),
+        `old-coalition recovery census ${iteration + 1}`,
+      );
+      recoveryCensuses.push(recoveredCensus);
+    }
+    const auditTokenSignalsBound = stopAuditSignal.signalResult === 0 &&
+      continueAuditSignal.signalResult === 0 && rootKillAuditSignal.signalResult === 0 &&
+      trustedRootKilled;
+    const staleAuditTokenRejected = staleAuditSignal.signalResult === -1 &&
+      staleAuditSignal.signalErrno === 3;
+    const oldCoalitionRecovered = emptyScans >= 2 &&
+      recoveryCensuses.every(censusCertifiesCompleteEnumeration) &&
+      recoveredCensus.matchingPids.length === 0 &&
+      recovery.some((attempt) => Array.isArray(attempt.attempts) && attempt.attempts.some(
+        (entry) => detachedPids.includes(entry.pid) && entry.signalResult === 0,
+      ));
 
     evidence = {
       skipped: false,
@@ -288,6 +351,17 @@ function runProof() {
       foreignRecord,
       foreignInspection,
       census,
+      auditToken: {
+        staleAuditSignal,
+        stopAuditSignal,
+        continueAuditSignal,
+        rootKillAuditSignal,
+        trustedRootKilled,
+      },
+      postRootDeathCensus,
+      recovery,
+      recoveryCensuses,
+      recoveredCensus,
       observations: {
         allQueriesAvailable,
         distinctFromController,
@@ -295,9 +369,11 @@ function runProof() {
         censusContainsAllKnownMembers,
         foreignCoalitionJoinOutcome,
         foreignCoalitionJoinRejected: foreignCoalitionJoinOutcome === 'rejected',
-        sameUidCensusQueryable: census.complete === true &&
-          census.denied === 0 && census.otherErrors === 0 &&
-          census.identityDenied === 0 && census.identityErrors === 0,
+        sameUidCensusQueryable: censusCertifiesCompleteEnumeration(census),
+        auditTokenSignalsBound,
+        staleAuditTokenRejected,
+        oldCoalitionRetainedDetachedChildren,
+        oldCoalitionRecovered,
       },
     };
   } catch (error) {

@@ -106,4 +106,12 @@ test('native Windows Git reads injected policy without opening a >300-character 
     { env: production, encoding: 'utf8', windowsHide: true, timeout: 30000 })
   assert.equal(actual.status, 0, actual.stderr)
   assert.equal(actual.stdout.trim(), 'never')
+  const nativeEnvironment = require('../../scripts/harness-v2-native.cjs').isolatedEnvironment(
+    path.join(deep, 'provider-home'), production,
+  )
+  assert.equal(nativeEnvironment.GIT_CONFIG_GLOBAL, '/dev/null')
+  const providerGit = cp.spawnSync('git', ['-C', repository, 'config', '--get', 'core.longpaths'],
+    { env: nativeEnvironment, encoding: 'utf8', windowsHide: true, timeout: 30000 })
+  assert.equal(providerGit.status, 0, providerGit.stderr)
+  assert.equal(providerGit.stdout.trim(), 'true')
 })
