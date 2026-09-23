@@ -60,6 +60,15 @@ function fixture(provider) {
 }
 function connection(service) { return { model: 'deepseek-chat', environment: { DEEPSEEK_BASE_URL: service.url } } }
 
+function fixtureFailureDiagnostic(f, error) {
+  // Capture the synthetic provider events before the real runner drains and
+  // removes its private transcript. No ambient files or user logs are read.
+  const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024),
+    stderr: String(f.nativeStderr || '').slice(-8192), events: [...(f.nativeEvents || [])] }
+  while (Buffer.byteLength(JSON.stringify(output)) > 65536) output.events.shift()
+  console.error(JSON.stringify(output))
+}
+
 async function scenario(provider, options = {}) {
   const cli = providers[provider]; assert.ok(cli && fs.existsSync(cli), 'AUTOPROMPT_DEEPSEEK_TEST_CLI must name the installed official dsh binary')
   const sandbox = await boundary.probeCommandSandbox(); assert.equal(sandbox.supported, true, JSON.stringify(sandbox))
@@ -74,8 +83,25 @@ async function scenario(provider, options = {}) {
     owner = ownerValue
     const proxy = privateDirectory(path.join(f.controller, 'proxy'))
     const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: `${provider}-closed-native-canary`, pollMs: 10 })
+    const ownedRun = runner.run.bind(runner)
+    runner.run = async spec => {
+      f.nativeEvents = []; f.nativeStderr = ''
+      const result = await ownedRun({ ...spec, onStdoutLine: line => {
+        f.nativeEvents.push(String(line).slice(-8192))
+        if (f.nativeEvents.length > 16) f.nativeEvents.shift()
+        return spec.onStdoutLine?.(line)
+      } })
+      f.nativeStderr = result.stderr
+      return result
+    }
     const adapter = new HarnessExecAdapter({ provider, runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: connection(service), credentialEnvironment: { DEEPSEEK_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only assigned controller tools and return one JSON object.' })
-    const run = async overrides => { const record = { ...f.record, ...overrides }; record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment()); record.signal = overrides?.signal || AbortSignal.timeout(90000); return adapter.launch(record) }
+    const run = async overrides => {
+      const record = { ...f.record, ...overrides }
+      record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
+      record.signal = overrides?.signal || AbortSignal.timeout(90000)
+      try { return await adapter.launch(record) }
+      catch (error) { fixtureFailureDiagnostic(f, error); throw error }
+    }
     let closed = false
     return { ...f, provider, candidate, secret, marker, service, binding, processAdapter, owner, registryPath, adapter, run,
       async close() { if (closed) return; closed = true; try { await owner.cancelAll({ reason: `${provider} capability cleanup`, graceMs: 0, killMs: 2000, waitForPending: true }) } finally { try { await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } } } }
