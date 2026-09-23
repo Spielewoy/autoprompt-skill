@@ -17,6 +17,11 @@ on:
         default: all
         type: choice
         options: [all, snapshot, proof, launch, worker, worker-storage, worker-proof, installer]
+      windows_regression_single:
+        description: 'Limit Windows regression diagnostics to x64 / Node 24'
+        required: false
+        default: false
+        type: boolean
       claude_diagnostic:
         description: 'Diagnose public native Claude activation on Windows x64 and ARM64'
         required: false
@@ -727,7 +732,7 @@ jobs:
     timeout-minutes: ${{ startsWith(matrix.runner.os, 'windows-') && 90 || 45 }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON((inputs.claude_diagnostic == true && inputs.claude_diagnostic_single == true && inputs.windows_regressions != true) && '{"runner":[{"os":"windows-latest","arch":"x64"}],"node":["24.x"]}' || (inputs.windows_regressions == true || inputs.claude_diagnostic == true) && '{"runner":[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}' || '{"runner":[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"},{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}') }}
+      matrix: ${{ fromJSON(((inputs.windows_regressions == true && inputs.windows_regression_single == true) || (inputs.claude_diagnostic == true && inputs.claude_diagnostic_single == true && inputs.windows_regressions != true)) && '{"runner":[{"os":"windows-latest","arch":"x64"}],"node":["24.x"]}' || (inputs.windows_regressions == true || inputs.claude_diagnostic == true) && '{"runner":[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}' || '{"runner":[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"},{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}') }}
     env:
       CLAUDE_CODE_VERSION: '2.1.270'
       AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
