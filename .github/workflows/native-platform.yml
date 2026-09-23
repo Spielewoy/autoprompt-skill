@@ -78,9 +78,9 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.windows_regressions != true && inputs.claude_diagnostic != true && inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_fork_memory != true) }}
     name: Platform and installer / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
-    # The one diagnostic producer may compile a separate traced DLL after the
-    # normal fork proof fails. All other matrix jobs retain their original cap.
-    timeout-minutes: ${{ matrix.runner.os == 'windows-latest' && matrix.node == '24.x' && 120 || 90 }}
+    # Native Windows storage and crash recovery add up to 30 minutes; leave room
+    # for the packed installer after the platform suite on both architectures.
+    timeout-minutes: ${{ startsWith(matrix.runner.os, 'windows-') && 120 || 90 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON((inputs.msys_runtime == true || inputs.msys_reuse_ci49 == true) && '{"include":[{"runner":{"os":"windows-latest","arch":"x64"},"node":"24.x"},{"runner":{"os":"windows-11-arm","arch":"arm64"},"node":"20.x"},{"runner":{"os":"windows-11-arm","arch":"arm64"},"node":"24.x"}]}' || '{"runner":[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"},{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"},{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}') }}
