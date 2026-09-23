@@ -2546,6 +2546,15 @@ function createPlatformProcessAdapter(options = {}) {
     if (typeof create !== 'function') fail('PROCESS_OWNER_CONFIG_INVALID', 'Windows process adapter factory is invalid')
     return create(options.windows || {})
   }
+  if (platform === 'darwin') {
+    const darwin = options.darwin
+    if (!darwin || typeof darwin !== 'object' || Array.isArray(darwin) || !path.isAbsolute(darwin.controlRoot || '') || !path.isAbsolute(darwin.providerPrivateOwnershipRoot || '')) fail('PROCESS_OWNER_CONFIG_INVALID', 'Darwin process adapter requires explicit private control and ownership roots')
+    const load = options.loadDarwinCoalitionHelper || require('./darwin-coalition-loader.js').loadDarwinCoalitionHelper
+    const create = options.createDarwinCoalitionAdapter || require('./darwin-launchd-process.js').createDarwinCoalitionAdapter
+    if (typeof load !== 'function' || typeof create !== 'function') fail('PROCESS_OWNER_CONFIG_INVALID', 'Darwin process adapter factories are invalid')
+    const helper = load()
+    return create({ ...darwin, helper })
+  }
   const create = options.createPosixProcessAdapter || createPosixProcessAdapter
   if (typeof create !== 'function') fail('PROCESS_OWNER_CONFIG_INVALID', 'POSIX process adapter factory is invalid')
   return create({ ...(options.posix || {}), platform })

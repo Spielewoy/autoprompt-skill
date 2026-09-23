@@ -12,11 +12,12 @@ function privateDirectory(directory) {
 }
 
 function nativeProcessAdapter(registryPath, ownershipRoot = path.dirname(registryPath)) {
-  return createPlatformProcessAdapter({ windows: {
-    controlRoot: path.join(path.dirname(registryPath), 'process-control'),
-    providerPrivateOwnershipRoot: ownershipRoot,
-    trustedOwnershipRoots: [ownershipRoot],
-  } })
+  const controlRoot = path.join(path.dirname(registryPath), 'process-control')
+  const platform = process.platform
+  return createPlatformProcessAdapter({ platform,
+    ...(platform === 'win32' ? { windows: { controlRoot, providerPrivateOwnershipRoot: ownershipRoot, trustedOwnershipRoots: [ownershipRoot] } } : {}),
+    ...(platform === 'darwin' ? { darwin: { controlRoot, providerPrivateOwnershipRoot: ownershipRoot } } : {}),
+  })
 }
 
 // AppContainer deliberately exposes its verified copy of Node through PATH.

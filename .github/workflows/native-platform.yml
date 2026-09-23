@@ -1188,6 +1188,9 @@ jobs:
           if(process.platform==='win32'&&path.extname(file).toLowerCase()!=='.cmd')throw new Error('Expected the generated npm .cmd launcher');
           fs.appendFileSync(process.env.GITHUB_ENV,'AUTOPROMPT_'+process.env.SUPPORT_PROVIDER.toUpperCase()+'_TEST_CLI='+file+'\n');"
       - name: Require all eleven native provider capabilities
+        # Preserve native failure artifacts even when a provider/test cleanup
+        # hangs; the job deadline must leave time for the always-upload step.
+        timeout-minutes: 45
         run: node tests/helpers/provider-platform-ci.cjs ${{ env.SUPPORT_PROVIDER }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

@@ -69,7 +69,6 @@ test('Darwin Seatbelt profile is default-deny and grants only exact roots, fixed
   const f = fixture(t)
   const profile = sandbox.renderSeatbeltProfile(f.policy, { nodePath: process.execPath, tempRoot: f.temp })
   assert.match(profile, /^\(version 1\)\n\(deny default\)/)
-  assert.match(sandbox.renderSeatbeltProfile(f.policy, { nodePath: process.execPath, tempRoot: f.temp, reportDenials: true }), /^\(version 1\)\n\(deny default \(with report\)\)/)
   assert.match(profile, new RegExp(`\\(subpath ${JSON.stringify(f.target).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`))
   assert.match(profile, new RegExp(`\\(subpath ${JSON.stringify(f.scratch).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`))
   assert.match(profile, /\(allow process-exec \(literal "\/bin\/sh"\)\)/)
@@ -137,7 +136,7 @@ test('Darwin native command sandbox isolates candidate, scratch, controller, net
   assert.ok(path.isAbsolute(sdkPath), sdk.stdout)
   const compile = cp.spawnSync('/usr/bin/cc', ['-O2', '-isysroot', sdkPath, '-mmacosx-version-min=13.5', source, '-o', helperPath], { encoding: 'utf8', timeout: 30000, shell: false })
   assert.equal(compile.status, 0, compile.stderr)
-  const backend = sandbox.createDarwinCommandSandbox({ controlRoot: f.control, tempRoot: f.temp, helper: { path: helperPath, sha256: hashFile(helperPath) }, targetKey: 'darwin-command-native-test', diagnosticProfile: true })
+  const backend = sandbox.createDarwinCommandSandbox({ controlRoot: f.control, tempRoot: f.temp, helper: { path: helperPath, sha256: hashFile(helperPath) }, targetKey: 'darwin-command-native-test' })
   let ownedCodexPid = null
   const originalRun = backend.runner.run.bind(backend.runner)
   backend.runner.run = async spec => {
@@ -195,7 +194,7 @@ test('Darwin startup diagnostic compares fixed trusted Node bootstrap profiles w
     const stat = fs.lstatSync(executable)
     assert.ok(stat.isFile() && !stat.isSymbolicLink(), `${executable} must be a physical fixed executable`)
   }
-  const base = sandbox.renderSeatbeltProfile(f.policy, { nodePath: node, tempRoot: f.temp, reportDenials: true })
+  const base = sandbox.renderSeatbeltProfile(f.policy, { nodePath: node, tempRoot: f.temp })
   const variants = [
     ['narrow', ''],
     ['broad-sysctl-read', '\n(allow sysctl-read)\n'],

@@ -112,7 +112,10 @@ function closedCanaryProcessAdapter(options = {}) {
   }
   const factory = createPlatformAdapter || createPlatformProcessAdapter
   if (typeof factory !== 'function') fail('LOCAL_CANARY_INVALID', 'closed canary process adapter factory is invalid')
-  return factory({ platform, windows: { controlRoot, providerPrivateOwnershipRoot, trustedOwnershipRoots } })
+  return factory({ platform,
+    ...(platform === 'win32' ? { windows: { controlRoot, providerPrivateOwnershipRoot, trustedOwnershipRoots } } : {}),
+    ...(platform === 'darwin' ? { darwin: { controlRoot, providerPrivateOwnershipRoot } } : {}),
+  })
 }
 async function drainRegistered(root, binding, options = {}) {
   if (!fs.existsSync(root)) return

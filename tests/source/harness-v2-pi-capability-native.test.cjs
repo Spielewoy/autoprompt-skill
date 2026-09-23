@@ -100,6 +100,15 @@ function connection(service) {
   } } }
 }
 
+function fixtureFailureDiagnostic(f, error) {
+  // Preserve the synthetic provider events and native stderr before cleanup
+  // drains the child. This is bounded fixture data, not an ambient log dump.
+  const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024),
+    stderr: String(f.nativeStderr || '').slice(-8192), events: [...(f.nativeEvents || [])] }
+  while (Buffer.byteLength(JSON.stringify(output)) > 65536) output.events.shift()
+  console.error(JSON.stringify(output))
+}
+
 function sibling(f, label) {
   const ids = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: label }
   return { ...ids, missionBinding: core.bindCanonicalMissionForChild(f.projection, { ...f.record, ...ids,
@@ -147,6 +156,17 @@ async function scenario(t, provider, options = {}) {
     owner = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
     const proxy = privateDirectory(path.join(f.controller, 'proxy'))
     const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: `${provider}-closed-native-canary`, pollMs: 10 })
+    const ownedRun = runner.run.bind(runner)
+    runner.run = async spec => {
+      f.nativeEvents = []; f.nativeStderr = ''
+      const result = await ownedRun({ ...spec, onStdoutLine: line => {
+        f.nativeEvents.push(String(line).slice(-8192))
+        if (f.nativeEvents.length > 16) f.nativeEvents.shift()
+        return spec.onStdoutLine?.(line)
+      } })
+      f.nativeStderr = result.stderr
+      return result
+    }
     const adapter = new HarnessExecAdapter({ provider, runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: connection(service),
       credentialEnvironment: { OPENAI_API_KEY: '<local-test-only>', OPENROUTER_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema,
       rolePrompt: () => 'Use only assigned controller tools and return exactly one JSON object.' })
@@ -154,7 +174,8 @@ async function scenario(t, provider, options = {}) {
       const record = { ...f.record, ...overrides }
       record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
       record.signal = overrides.signal || AbortSignal.timeout(90000)
-      return adapter.launch(record)
+      try { return await adapter.launch(record) }
+      catch (error) { fixtureFailureDiagnostic(f, error); throw error }
     }
     let closed = false
     t.after(async () => {

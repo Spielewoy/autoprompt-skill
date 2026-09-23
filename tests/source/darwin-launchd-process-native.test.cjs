@@ -11,6 +11,8 @@ const test = require('node:test')
 const ROOT = path.resolve(__dirname, '../..')
 const HELPER_SOURCE = path.join(ROOT, 'agents/codex/workflow/darwin-coalition-helper.c')
 const ADAPTER_SOURCE = path.join(ROOT, 'agents/codex/workflow/darwin-launchd-process.js')
+const LOADER = require('../../agents/codex/workflow/darwin-coalition-loader.js')
+const { createPlatformProcessAdapter, ProcessOwner } = require('../../agents/codex/workflow/process-owner.js')
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
 
@@ -105,7 +107,7 @@ test('Darwin missing-service proof rejects arbitrary failures and mismatched liv
   assert.equal(sameMissingServiceResponse(actual, 'owned', { ...reference, stderr: 'domain unavailable' }, 'never-created'), false)
 })
 
-test('native Darwin launchd coalition survives root death and a fresh adapter drains detached children', {
+test('native packaged Darwin launchd coalition factory survives root death and a fresh adapter drains detached children', {
   skip: process.platform !== 'darwin' && 'requires native macOS',
   timeout: 150000,
 }, async () => {
@@ -131,6 +133,15 @@ test('native Darwin launchd coalition survives root death and a fresh adapter dr
   const loadCommands = requireSuccess(command('/usr/bin/otool', ['-l', helper]), 'read helper load commands').stdout
   const buildVersion = /cmd LC_BUILD_VERSION[\s\S]*?platform\s+(\S+)[\s\S]*?minos\s+(\S+)[\s\S]*?sdk\s+(\S+)/.exec(loadCommands)
   assert.ok(buildVersion, 'compiled helper must publish LC_BUILD_VERSION')
+  // Keep the source-built helper as an independent compiler/ABI proof. Actual
+  // ProcessOwner lifecycle coverage below uses only the packaged loader.
+  const sourceHelperBinding = { path: fs.realpathSync.native(helper), sha256: sha256(fs.readFileSync(helper)) }
+  const sourceBoot = helperJson(helper, ['boot'])
+  const packagedHelper = LOADER.loadDarwinCoalitionHelper()
+  assert.ok(path.isAbsolute(packagedHelper.path))
+  assert.match(packagedHelper.sha256, /^[a-f0-9]{64}$/)
+  const packagedBoot = helperJson(packagedHelper.path, ['boot'])
+  assert.equal(packagedBoot.bootUuid, sourceBoot.bootUuid, 'packaged and source-built helpers must observe the same kernel boot identity')
   const fixtureText = String.raw`#define _DARWIN_C_SOURCE
 #include <crt_externs.h>
 #include <fcntl.h>
@@ -163,7 +174,7 @@ int main(int argc, char **argv) {
   fs.writeFileSync(slowHelperSource, [
     '#include <string.h>',
     '#include <unistd.h>',
-    `static const char *helper = ${JSON.stringify(helper)};`,
+    `static const char *helper = ${JSON.stringify(packagedHelper.path)};`,
     'int main(int argc, char **argv) {',
     '  if (argc > 1 && strcmp(argv[1], "inspect") == 0) sleep(3);',
     '  execv(helper, argv);',
@@ -175,16 +186,15 @@ int main(int argc, char **argv) {
     '-isysroot', sdkPath, '-mmacosx-version-min=13.5', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', slowHelperSource, '-o', slowHelper,
   ]), 'compile delayed helper shim')
 
-  const helperBinding = { path: fs.realpathSync.native(helper), sha256: sha256(fs.readFileSync(helper)) }
+  const helperBinding = sourceHelperBinding
   const { createDarwinCoalitionAdapter } = require('../../agents/codex/workflow/darwin-launchd-process.js')
-  const { ProcessOwner } = require('../../agents/codex/workflow/process-owner.js')
   assert.throws(() => createDarwinCoalitionAdapter({
     controlRoot,
     providerPrivateOwnershipRoot: temporaryRoot,
     helper: { ...helperBinding, sha256: '0'.repeat(64) },
   }), { code: 'PROCESS_IDENTITY_CHANGED' })
 
-  const adapter = createDarwinCoalitionAdapter({ controlRoot, providerPrivateOwnershipRoot: temporaryRoot, helper: helperBinding })
+  const adapter = createPlatformProcessAdapter({ platform: 'darwin', darwin: { controlRoot, providerPrivateOwnershipRoot: temporaryRoot } })
   const reservationId = `native-${crypto.randomUUID()}`
   const owner = new ProcessOwner({
     adapter,
@@ -199,13 +209,17 @@ int main(int argc, char **argv) {
   const evidence = {
     schemaVersion: 1,
     platform: `${process.platform}-${process.arch}`,
-    helperSha256: helperBinding.sha256,
+    helperSha256: packagedHelper.sha256,
+    packagedHelperPath: packagedHelper.path,
+    sourceBuiltHelperSha256: sourceHelperBinding.sha256,
+    packagedBootUuid: packagedBoot.bootUuid,
+    sourceBuiltBootUuid: sourceBoot.bootUuid,
     helperSourceSha256: sha256(fs.readFileSync(HELPER_SOURCE)),
     compiler: { path: compiler, version: compilerVersion },
     sdkVersion,
     sdkPath,
     deploymentTarget: '13.5',
-    binaryBuildVersion: { platform: buildVersion[1], minimumOs: buildVersion[2], sdk: buildVersion[3] },
+    sourceBuiltBinaryBuildVersion: { platform: buildVersion[1], minimumOs: buildVersion[2], sdk: buildVersion[3] },
   }
   try {
     const launched = await owner.launch({
@@ -225,7 +239,7 @@ int main(int argc, char **argv) {
     }, 20000, 'detached children did not publish')
     await waitFor(() => !alive(ownership.rootPid), 20000, 'trusted launchd root did not exit')
 
-    fresh = createDarwinCoalitionAdapter({ controlRoot, providerPrivateOwnershipRoot: temporaryRoot, helper: helperBinding })
+    fresh = createPlatformProcessAdapter({ platform: 'darwin', darwin: { controlRoot, providerPrivateOwnershipRoot: temporaryRoot } })
     const freshOwner = new ProcessOwner({
       adapter: fresh,
       registryPath,
@@ -239,7 +253,7 @@ int main(int argc, char **argv) {
     assert.equal(recoveredRecord.rootPid, ownership.rootPid)
     assert.equal(recoveredRecord.groupIdentity, ownership.groupIdentity)
     const coalitionId = ownership.groupIdentity.split(':').at(-1)
-    const before = helperJson(helper, ['usage', coalitionId])
+    const before = helperJson(packagedHelper.path, ['usage', coalitionId])
     assert.equal(before.exists, true)
     assert.equal(BigInt(before.tasksStarted) - BigInt(before.tasksExited) >= 2n, true)
     const members = await fresh.listOwned(ownership.groupIdentity)
@@ -248,9 +262,9 @@ int main(int argc, char **argv) {
     await freshOwner.cancelAll({ graceMs: 500, killMs: 30000, reason: 'native crash recovery proof' })
     assert.equal(await freshOwner.assertDrained(), true)
     await waitFor(async () => (await fresh.listOwned(ownership.groupIdentity)).length === 0, 30000, 'coalition did not drain')
-    const zeroOne = helperJson(helper, ['usage', coalitionId])
+    const zeroOne = helperJson(packagedHelper.path, ['usage', coalitionId])
     await sleep(100)
-    const zeroTwo = helperJson(helper, ['usage', coalitionId])
+    const zeroTwo = helperJson(packagedHelper.path, ['usage', coalitionId])
     for (const usage of [zeroOne, zeroTwo]) {
       if (usage.exists) assert.equal(usage.tasksStarted, usage.tasksExited)
     }
@@ -258,6 +272,8 @@ int main(int argc, char **argv) {
     const reservationDirectory = path.join(controlRoot, sha256(reservationId))
     const requestPath = path.join(reservationDirectory, 'request.json')
     const request = JSON.parse(fs.readFileSync(requestPath, 'utf8'))
+    assert.equal(request.helper.sha256, packagedHelper.sha256, 'production factory must bind the packaged helper digest into the durable request')
+    assert.equal(sha256(fs.readFileSync(request.helper.path)), packagedHelper.sha256, 'materialized request helper must retain the packaged helper digest')
     const absent = command('/bin/launchctl', ['print', `${request.domain}/${request.label}`])
     assert.equal(absent.error, undefined)
     assert.equal(absent.signal, null)
@@ -317,7 +333,7 @@ int main(int argc, char **argv) {
     if (ownership && fresh) {
       try { await fresh.signalOwned(ownership.groupIdentity, 'KILL') } catch {}
     }
-    if (fs.existsSync(helper)) preserveTestedHelper(helper, evidence)
+    if (fs.existsSync(packagedHelper.path)) preserveTestedHelper(packagedHelper.path, evidence)
     if (children.every(pid => !alive(pid))) fs.rmSync(temporaryRoot, { recursive: true, force: true })
     else evidence.retainedRoot = temporaryRoot
     writeEvidence(evidence)

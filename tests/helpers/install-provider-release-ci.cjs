@@ -31,8 +31,13 @@ async function main() {
   const bytes = Buffer.from(await response.arrayBuffer())
   const sha256 = crypto.createHash('sha256').update(bytes).digest('hex')
   assert.equal(sha256, expected, 'Provider release bytes differ from the reviewed GitHub asset digest')
-  fs.mkdirSync('.native-provider', { recursive: true })
-  const executable = path.resolve('.native-provider', name)
+  // A standalone binary must not inherit the checkout's unrelated package.json
+  // as its runtime closure (test logs in that checkout change during testing).
+  const destination = provider === 'omp'
+    ? fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'autoprompt-omp-release-'))
+    : path.resolve('.native-provider')
+  fs.mkdirSync(destination, { recursive: true })
+  const executable = path.join(destination, name)
   fs.writeFileSync(executable, bytes, { flag: 'wx', mode: 0o700 })
   if (provider === 'omp') fs.appendFileSync(process.env.GITHUB_ENV, `AUTOPROMPT_OMP_TEST_CLI=${executable}\n`)
   process.stdout.write(JSON.stringify({ provider, version, platform: process.platform, architecture: process.arch, url, sha256 }) + '\n')

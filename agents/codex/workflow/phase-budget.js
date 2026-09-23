@@ -93,6 +93,7 @@ const {
   ProcessOwner,
   createPosixProcessAdapter,
   createWindowsJobAdapter,
+  createPlatformProcessAdapter,
   prepareProcessLaunchEnvironment,
   runOwnedProcessConformanceProbe,
 } = require('./process-owner.js')
@@ -31089,7 +31090,12 @@ function createDefaultRuntimeOptions(input) {
         providerPrivateOwnershipRoot: path.dirname(activation.activationRoot),
         trustedOwnershipRoots: [path.dirname(activation.activationRoot)],
       })
-    : createPosixProcessAdapter())
+    : process.platform === 'darwin'
+      ? createPlatformProcessAdapter({ platform: 'darwin', darwin: {
+          controlRoot: boundRecord.paths.processControl,
+          providerPrivateOwnershipRoot: path.dirname(activation.activationRoot),
+        } })
+      : createPosixProcessAdapter())
   const processOwner = new ProcessOwner({
     adapter: processAdapter,
     registryPath: boundRecord.paths.processRegistry,
