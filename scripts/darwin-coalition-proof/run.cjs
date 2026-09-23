@@ -141,8 +141,8 @@ function runProof() {
   const executable = path.join(temporaryRoot, 'coalition-probe');
   const label = `com.autoprompt.coalition-proof.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
   const uid = process.getuid();
-  const domain = `user/${uid}`;
-  const service = `${domain}/${label}`;
+  const candidateDomains = [`gui/${uid}`, `user/${uid}`];
+  let domain = null;
   const plistPath = path.join(temporaryRoot, `${label}.plist`);
   const stdoutPath = path.join(temporaryRoot, 'launchd.stdout.log');
   const stderrPath = path.join(temporaryRoot, 'launchd.stderr.log');
@@ -152,6 +152,13 @@ function runProof() {
   let evidence = null;
   let controllerProbe = null;
   let foreignAttempt = null;
+  const domainProbes = Object.fromEntries(candidateDomains.map((candidate) => [
+    candidate, command('launchctl', ['print', candidate], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    }),
+  ]));
+  const bootstrapAttempts = [];
+  let launchdLog = null;
 
   const compile = command('cc', [
     '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', SOURCE, '-o', executable,
@@ -193,9 +200,24 @@ function runProof() {
 </dict></plist>
 `;
     fs.writeFileSync(plistPath, plist, { mode: 0o600 });
-    bootstrap = command('launchctl', ['bootstrap', domain, plistPath]);
-    if (bootstrap.status !== 0) {
-      throw new Error(`launchctl bootstrap failed: ${JSON.stringify(bootstrap)}`);
+    const availableDomains = candidateDomains.filter(
+      (candidate) => domainProbes[candidate].status === 0,
+    );
+    for (const candidate of availableDomains) {
+      const result = command('launchctl', ['bootstrap', candidate, plistPath]);
+      bootstrapAttempts.push({ domain: candidate, result });
+      if (result.status === 0) {
+        domain = candidate;
+        bootstrap = result;
+        break;
+      }
+    }
+    if (domain === null) {
+      launchdLog = command('/usr/bin/log', [
+        'show', '--last', '2m', '--style', 'compact', '--predicate',
+        `process == "launchd" AND eventMessage CONTAINS[c] "${label}"`,
+      ]);
+      throw new Error(`launchctl bootstrap failed: ${JSON.stringify({ domainProbes, bootstrapAttempts, launchdLog })}`);
     }
     records = waitForRecords(stateDirectory, 30_000);
     foreignAttempt = waitForJson(
@@ -255,6 +277,8 @@ function runProof() {
       executableIdentity,
       compile,
       bootstrap,
+      domainProbes,
+      bootstrapAttempts,
       controller,
       controllerProbe,
       records,
@@ -286,6 +310,9 @@ function runProof() {
       executableIdentity,
       compile,
       bootstrap,
+      domainProbes,
+      bootstrapAttempts,
+      launchdLog,
       controllerProbe,
       foreignAttempt,
       records,
@@ -308,7 +335,14 @@ function runProof() {
       .map((role) => cleanupRecords[role] && cleanupRecords[role].pid)
       .filter(Number.isInteger)
       .concat(foreignSpawnedPid === null ? [] : [foreignSpawnedPid]);
-    const terminate = command('launchctl', ['kill', 'SIGTERM', service]);
+    const cleanupDomains = [...new Set([
+      ...bootstrapAttempts.map((attempt) => attempt.domain),
+      ...(domain ? [domain] : []),
+    ])];
+    const terminations = cleanupDomains.map((candidate) => ({
+      domain: candidate,
+      result: command('launchctl', ['kill', 'SIGTERM', `${candidate}/${label}`]),
+    }));
     const terminationDeadline = Date.now() + 10_000;
     while (knownPids.some(isAlive) && Date.now() < terminationDeadline) {
       sleep(100);
@@ -318,13 +352,19 @@ function runProof() {
         try { process.kill(pid, 'SIGKILL'); } catch {}
       }
     }
-    bootout = command('launchctl', ['bootout', service]);
+    const bootouts = cleanupDomains.map((candidate) => ({
+      domain: candidate,
+      result: command('launchctl', ['bootout', `${candidate}/${label}`]),
+    }));
+    bootout = domain
+      ? bootouts.find((entry) => entry.domain === domain)?.result || null
+      : null;
     const reapDeadline = Date.now() + 5_000;
     while (knownPids.some(isAlive) && Date.now() < reapDeadline) {
       sleep(100);
     }
     const survivors = knownPids.filter(isAlive);
-    evidence.cleanup = { terminate, bootout, records: cleanupRecords, knownPids, survivors };
+    evidence.cleanup = { terminations, bootouts, bootout, records: cleanupRecords, knownPids, survivors };
     if (survivors.length === 0) {
       fs.rmSync(temporaryRoot, { recursive: true, force: true });
     } else {

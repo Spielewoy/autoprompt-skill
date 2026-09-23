@@ -29,6 +29,6 @@ test('coalition diagnostic stays isolated from production sources', () => {
   assert.match(source, /AP_PROC_PIDCOALITIONINFO 20/);
   assert.match(source, /POSIX_SPAWN_SETSID/);
   assert.match(source, /_NSGetEnviron\(\)/);
-  assert.match(driver, /launchctl', \['bootstrap', domain/);
+  assert.match(driver, /launchctl', \['bootstrap', candidate/);
   assert.match(driver, /sameUidCensusQueryable/);
 });

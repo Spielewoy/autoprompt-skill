@@ -166,8 +166,8 @@ test('native Windows worker clone uses short registered storage and cleanup reta
     ghConfigDir,
   })
   assert.ok(configIsolationPath.length > 300)
-  assert.equal(environment.GIT_CONFIG_GLOBAL, 'NUL')
-  assert.equal(environment.GIT_CONFIG_SYSTEM, 'NUL')
+  assert.equal(environment.GIT_CONFIG_GLOBAL, '/dev/null')
+  assert.equal(environment.GIT_CONFIG_SYSTEM, '/dev/null')
   const bounded = (value, limit = 8192) => String(value || '').slice(0, limit)
   const resultDetails = result => JSON.stringify({
     status: result.status,

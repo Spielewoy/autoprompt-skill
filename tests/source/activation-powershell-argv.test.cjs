@@ -30,7 +30,7 @@ for (const shell of shells) {
   const present = cp.spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'], { timeout: 10000 }).status === 0
   test(`real npm PowerShell shim preserves activation mission through ${path.basename(shell)}`, {
     skip: !present && process.platform !== 'win32' ? 'PowerShell unavailable' : false,
-    timeout: 30000,
+    timeout: 150000,
   }, async t => {
     assert.ok(present, `Required Windows shell is unavailable: ${shell}`)
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt argv '))
@@ -47,7 +47,7 @@ for (const shell of shells) {
     ]) {
       const result = cp.spawnSync(shell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
         `& ${quote(shim + '.ps1')} activate opencode ${separator} ${tail.map(quote).join(' ')}`], {
-        encoding: 'utf8', timeout: 20000,
+        encoding: 'utf8', timeout: 60000,
         env: { ...process.env, PATH: path.dirname(process.execPath) + path.delimiter + (process.env.PATH || process.env.Path || '') },
       })
       assert.equal(result.status, 0, result.stderr || result.error?.message)

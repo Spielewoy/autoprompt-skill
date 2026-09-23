@@ -353,11 +353,11 @@ function buildGitEnvironmentSet(policy, configIsolationPath) {
   return set
 }
 
-// NUL is an exact Windows device capability, not an external configuration
-// pathname. The full ordered Git policy is verified independently below.
+// Git maps /dev/null to the exact Windows NUL device, not an external
+// configuration pathname. The full ordered Git policy is verified independently below.
 function usesWindowsNulConfig(environment) {
-  return process.platform === 'win32' && environment.GIT_CONFIG_GLOBAL === 'NUL'
-    && environment.GIT_CONFIG_SYSTEM === 'NUL' && environment.GIT_CONFIG_NOSYSTEM === '1'
+  return process.platform === 'win32' && environment.GIT_CONFIG_GLOBAL === '/dev/null'
+    && environment.GIT_CONFIG_SYSTEM === '/dev/null' && environment.GIT_CONFIG_NOSYSTEM === '1'
 }
 
 function buildChildEnvironmentSpec(repository, config, options = {}) {
@@ -670,7 +670,7 @@ function inspectCommandBoundary(repository, repositoryConfig, effectiveConfig, e
       bootstrap.validateWindowsNulBootstrapEnvironment(environment,
         bootstrap.createWindowsNulBootstrap(policy.configEntries), policy.configEntries)
       isolationSafe = true
-      isolationPath = 'NUL'
+      isolationPath = '/dev/null'
     } else {
       const globalPath = assertConfigIsolation(isolationPath, repository.rejectTarget)
       const systemPath = assertConfigIsolation(

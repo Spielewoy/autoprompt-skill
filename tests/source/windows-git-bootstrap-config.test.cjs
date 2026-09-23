@@ -27,8 +27,8 @@ test('Windows NUL Git bootstrap binds the complete injected policy', () => {
   const descriptor = bootstrap.createWindowsNulBootstrap(POLICY)
   const environment = bootstrap.projectWindowsNulBootstrap(descriptor, POLICY)
   assert.equal(descriptor.kind, 'windows-nul-device-v1')
-  assert.equal(environment.GIT_CONFIG_GLOBAL, 'NUL')
-  assert.equal(environment.GIT_CONFIG_SYSTEM, 'NUL')
+  assert.equal(environment.GIT_CONFIG_GLOBAL, '/dev/null')
+  assert.equal(environment.GIT_CONFIG_SYSTEM, '/dev/null')
   assert.equal(environment.GIT_CONFIG_NOSYSTEM, '1')
   assert.equal(environment.GIT_CONFIG_COUNT, String(POLICY.length))
   assert.equal(environment.GIT_CONFIG_KEY_10, POLICY[10][0])
@@ -100,8 +100,8 @@ test('native Windows Git reads injected policy without opening a >300-character 
   const production = safety.createSafeChildGitEnvironment(repository, environment, {
     expectedBranch: 'fixture', configIsolationPath: unreachableConfig, ghConfigDir,
   })
-  assert.equal(production.GIT_CONFIG_GLOBAL, 'NUL')
-  assert.equal(production.GIT_CONFIG_SYSTEM, 'NUL')
+  assert.equal(production.GIT_CONFIG_GLOBAL, '/dev/null')
+  assert.equal(production.GIT_CONFIG_SYSTEM, '/dev/null')
   const actual = cp.spawnSync('git', ['-C', repository, 'config', '--get', 'protocol.allow'],
     { env: production, encoding: 'utf8', windowsHide: true, timeout: 30000 })
   assert.equal(actual.status, 0, actual.stderr)

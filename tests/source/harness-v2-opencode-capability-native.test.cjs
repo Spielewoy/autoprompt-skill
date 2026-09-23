@@ -72,6 +72,34 @@ function connection(service, options = {}) {
   return { model: `${providerId}/${modelId}`, providers: { [providerId]: { npm: options.npm || '@ai-sdk/openai-compatible', options: { baseURL: `${service.url}/v1`, apiKey: '<local-test-only>' }, models: { [modelId]: { name: 'Fixture Model', ...(options.wireModelId ? { id: options.wireModelId } : {}), limit: { context: 32768, output: 2048 }, variants: Object.fromEntries(['low', 'medium', 'high', 'xhigh', 'max'].map(effort => [effort, { reasoningEffort: effort }])) } } } } }
 }
 
+function fixtureFailureDiagnostic(f, error) {
+  // Only this synthetic fixture's subprocess output; never ambient user logs.
+  const files = []
+  let remaining = 65536, visited = 0
+  const visit = directory => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (++visited > 1000 || remaining <= 0 || files.length >= 16) return
+      const file = path.join(directory, entry.name)
+      if (entry.isDirectory()) visit(file)
+      else if (entry.isFile() && ['stdout.jsonl', 'stderr.log', 'receipts.jsonl'].includes(entry.name)) {
+        const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+        try {
+          const stat = fs.fstatSync(fd)
+          if (!stat.isFile()) continue
+          const length = Math.min(stat.size, remaining, 8192), buffer = Buffer.alloc(length)
+          fs.readSync(fd, buffer, 0, length, stat.size - length)
+          remaining -= length
+          files.push({ path: path.relative(f.root, file).slice(0, 512), bytes: stat.size, tail: buffer.toString('utf8') })
+        } finally { fs.closeSync(fd) }
+      }
+    }
+  }
+  try { visit(f.controller) } catch (diagnosticError) { files.push({ diagnosticError: String(diagnosticError.message).slice(0, 1024) }) }
+  const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024), files }
+  while (Buffer.byteLength(JSON.stringify(output)) > 65536) files.shift()
+  console.error(JSON.stringify(output))
+}
+
 async function scenario(provider, options = {}) {
   const cli = providers[provider]; assert.ok(cli && fs.existsSync(cli), `AUTOPROMPT_${provider.toUpperCase()}_TEST_CLI must name the installed ${provider} binary`)
   const sandbox = await boundary.probeCommandSandbox(); assert.equal(sandbox.supported, true, JSON.stringify(sandbox))
@@ -87,7 +115,13 @@ async function scenario(provider, options = {}) {
     const proxy = privateDirectory(path.join(f.controller, 'proxy'))
     const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: `${provider}-closed-native-canary`, pollMs: 10 })
     const adapter = new HarnessExecAdapter({ provider, runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: connection(service, options.connection), credentialEnvironment: { OPENAI_API_KEY: '<local-test-only>', KILO_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only assigned controller tools and return one JSON object.' })
-    const run = async overrides => { const record = { ...f.record, ...overrides }; record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment()); record.signal = overrides?.signal || AbortSignal.timeout(90000); return adapter.launch(record) }
+    const run = async overrides => {
+      const record = { ...f.record, ...overrides }
+      record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
+      record.signal = overrides?.signal || AbortSignal.timeout(90000)
+      try { return await adapter.launch(record) }
+      catch (error) { fixtureFailureDiagnostic(f, error); throw error }
+    }
     let closed = false
     return { ...f, provider, candidate, secret, marker, service, binding, owner, processAdapter, registryPath, adapter, run,
       async close() { if (closed) return; closed = true; try { await owner.cancelAll({ reason: `${provider} capability cleanup`, graceMs: 0, killMs: 2000, waitForPending: true }) } finally { try { await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } } } }

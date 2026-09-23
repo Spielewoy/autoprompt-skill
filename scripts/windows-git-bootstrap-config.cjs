@@ -1,7 +1,8 @@
 'use strict'
 
 // Git reads GIT_CONFIG_GLOBAL before it can apply core.longpaths. Windows NUL
-// suppresses ambient global/system configuration without requiring a file path.
+// is addressed through Git's /dev/null mapping, recognized by both mingw_access
+// and mingw_open on x64 and ARM64 (uppercase NUL fails the ARM64 access check).
 const crypto = require('node:crypto')
 
 const KIND = 'windows-nul-device-v1'
@@ -39,8 +40,8 @@ function createWindowsNulBootstrap(entries) {
   return Object.freeze({
     schemaVersion: SCHEMA_VERSION,
     kind: KIND,
-    global: 'NUL',
-    system: 'NUL',
+    global: '/dev/null',
+    system: '/dev/null',
     policySha256: policySha256(policy),
   })
 }
@@ -49,7 +50,7 @@ function validateDescriptor(descriptor, entries) {
   if (!descriptor || typeof descriptor !== 'object' || Array.isArray(descriptor) ||
       Object.keys(descriptor).sort().join('\0') !== ['global', 'kind', 'policySha256', 'schemaVersion', 'system'].join('\0') ||
       descriptor.schemaVersion !== SCHEMA_VERSION || descriptor.kind !== KIND ||
-      descriptor.global !== 'NUL' || descriptor.system !== 'NUL' ||
+      descriptor.global !== '/dev/null' || descriptor.system !== '/dev/null' ||
       !HASH.test(descriptor.policySha256 || '') || descriptor.policySha256 !== policySha256(entries)) {
     fail('Windows Git bootstrap descriptor is foreign or does not bind the exact policy')
   }
@@ -60,8 +61,8 @@ function projectWindowsNulBootstrap(descriptor, entries) {
   validateDescriptor(descriptor, entries)
   const policy = validateEntries(entries)
   const environment = {
-    GIT_CONFIG_GLOBAL: 'NUL',
-    GIT_CONFIG_SYSTEM: 'NUL',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_SYSTEM: '/dev/null',
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_COUNT: String(policy.length),
   }

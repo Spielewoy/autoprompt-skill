@@ -15,7 +15,7 @@ const npm10NodeShim = target => [
 ].join('\r\n')
 
 function fixture(t, options = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-npm-shim-'))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-npm-shim-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const packageName = options.packageName || 'fixture-cli'
   const shimName = options.shimName || 'grok'
