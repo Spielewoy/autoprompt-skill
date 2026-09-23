@@ -1,4 +1,4 @@
-/* Test only: execute the candidate's actual census/signal control flow with
+/* Test only: execute the packaged helper's actual census/signal control flow with
  * deterministic kernel-query outcomes. The separately built candidate uses
  * the real SDK and kernel; these injected results cannot certify ownership. */
 #define _DARWIN_C_SOURCE
@@ -16,7 +16,7 @@ static int ap_test_sysctlbyname(const char *, void *, size_t *, void *, size_t);
 #define dlsym ap_test_dlsym
 #define sysctlbyname ap_test_sysctlbyname
 #define main ap_candidate_main
-#include "darwin-coalition-helper-churn.c"
+#include "../../agents/codex/workflow/darwin-coalition-helper.c"
 #undef main
 
 static const pid_t transient_pid = 42420, held_pid = 42421;

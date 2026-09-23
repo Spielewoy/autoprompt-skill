@@ -13,7 +13,7 @@ const LEGACY = require('./install/harness-v2-legacy.json').providers
 const primeMigration = require('./harness-v2-prime-migration.cjs')
 const ROOT = path.resolve(__dirname, '..')
 const PROVIDERS = Object.freeze(['claude', 'opencode', 'kilo', 'vscode', 'prime', 'omp', 'deepseek', 'hermes', 'grok'])
-const REQUIRED = ['scripts/harness-v2-package.cjs', 'scripts/harness-v2-configure.cjs', 'scripts/harness-v2-native.cjs', 'scripts/harness-v2-transport.cjs', 'scripts/harness-v2-native-wire-projection.cjs', 'scripts/harness-v2-request-quota.cjs', 'scripts/harness-v2-quota-relay.cjs', 'scripts/harness-v2-quota-connection.cjs', 'scripts/harness-v2-admission.cjs', 'scripts/harness-v2-trust/evidence.json', 'scripts/harness-v2-trust/trusted-public-keys.json', 'scripts/local-only-safety.cjs', 'scripts/install/operation-lock.cjs', 'scripts/install/harness-v2-legacy.json']
+const REQUIRED = ['scripts/harness-v2-package.cjs', 'scripts/harness-v2-configure.cjs', 'scripts/harness-v2-native.cjs', 'scripts/harness-v2-transport.cjs', 'scripts/harness-v2-native-wire-projection.cjs', 'scripts/harness-v2-request-quota.cjs', 'scripts/harness-v2-quota-relay.cjs', 'scripts/harness-v2-quota-connection.cjs', 'scripts/harness-v2-admission.cjs', 'scripts/harness-v2-trust/evidence.json', 'scripts/harness-v2-trust/trusted-public-keys.json', 'scripts/local-only-safety.cjs', 'scripts/windows-git-bootstrap-config.cjs', 'scripts/install/operation-lock.cjs', 'scripts/install/harness-v2-legacy.json']
 // These are the closed actual-binary conformance suites invoked by the public
 // diagnostic. They are runtime assets, not the general source test suite.
 const CONFORMANCE_ASSETS = Object.freeze([

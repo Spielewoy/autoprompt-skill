@@ -347,10 +347,28 @@ test('Windows ACL audit resolves inbox PowerShell independently of the restricte
     assert.equal(options.env.USERPROFILE, windowsFixturePath(profile))
     assert.equal(options.env.NODE_OPTIONS, undefined)
     const sid = 'S-1-5-21-123', targets = JSON.parse(options.env.AUTOPROMPT_ACL_AUDIT_PATHS)
-    return { status: 0, stdout: JSON.stringify({ currentName: 'user', currentSid: sid, items: targets.map(target => ({ path: target, owner: sid, ownerSid: sid, protected: true, rules: [{ identity: sid, sid, type: 'Allow' }] })) }), stderr: '' }
+    return { status: 0, stdout: JSON.stringify({ currentName: 'user', currentSid: sid, items: targets.map(target => ({ path: target, owner: sid, ownerSid: sid, protected: true, rules: [{ identity: sid, sid, type: 'Allow' }] })) }), stderr: 'AUTOPROMPT_ACL_AUDIT_PHASE=targets\nAUTOPROMPT_ACL_AUDIT_PHASE=emit\n' }
   } } }, undefined, { userInfoHome: profile })
   assert.equal(safe.auditPrivatePermissions(profile, { recurse: false }).valid, true)
   assert.equal(called, true)
+})
+
+test('Windows ACL audit exposes only a fixed phase marker on bounded PowerShell failure', t => {
+  const profile = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'audit-phase-')))
+  const target = path.join(profile, 'private'); fs.mkdirSync(target)
+  fs.mkdirSync(path.join(profile, 'AppData', 'Local', 'Temp'), { recursive: true })
+  fs.mkdirSync(path.join(profile, 'AppData', 'Roaming'), { recursive: true })
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
+  const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync() {
+    return { status: null, signal: 'SIGTERM', error: { code: 'ETIMEDOUT' }, stdout: '', stderr: 'AUTOPROMPT_ACL_AUDIT_PHASE=targets\nAUTOPROMPT_ACL_AUDIT_PHASE=get-acl\nGet-Acl: C:\\private\\secret' }
+  } } }, undefined, { userInfoHome: profile })
+  assert.throws(() => safe.auditPrivatePermissions(windowsFixturePath(target), { recurse: false }), error => {
+    assert.equal(error.code, 'PRIVACY_UNSUPPORTED')
+    assert.equal(error.details.phase, 'get-acl')
+    assert.equal(error.details.cause, 'ETIMEDOUT')
+    assert.equal(error.details.stderr, 'Get-Acl: C:\\private\\secret')
+    return true
+  })
 })
 
 test('native Windows compiler staging ignores deep home and temp overrides', { skip: process.platform !== 'win32' }, () => {

@@ -16,6 +16,7 @@ const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { auditPrivatePermissions } = require('../../agents/codex/workflow/safe-run-root.js')
 const { piModelService } = require('../helpers/harness-pi-native-service.cjs')
 const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment, cleanupNativeFixture } = require('../helpers/native-platform.cjs')
 
@@ -62,7 +63,12 @@ function ownershipRegistry(provider, f) {
       !path.isAbsolute(supplied.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT) || !/^[A-Za-z0-9_-]{43}$/.test(supplied.AUTOPROMPT_CLOSED_CANARY_CHALLENGE)) {
     throw new Error('closed canary ownership registration is invalid')
   }
-  const root = privateDirectory(path.resolve(supplied.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT)), stat = fs.statSync(root)
+  // The closed-canary launcher has already established this shared root's
+  // private ACL. Re-audit it before use, but do not synchronously rewrite the
+  // DACL; the process adapter performs its own authoritative pre-launch audit.
+  const root = path.resolve(supplied.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT)
+  auditPrivatePermissions(root, { recurse: false })
+  const stat = fs.lstatSync(root)
   if (!stat.isDirectory() || (process.platform !== 'win32' && (stat.mode & 0o077))) throw new Error('closed canary ownership root is not private')
   const directory = privateDirectory(path.join(root, `${provider}-${crypto.randomUUID()}`))
   const registryPath = path.join(directory, 'processes.json')
@@ -117,7 +123,7 @@ function fixtureFailureDiagnostic(f, error) {
   const proxy = path.join(f.controller, 'proxy')
   output.proxy = []
   for (const name of fs.existsSync(proxy) ? fs.readdirSync(proxy, { recursive: true }) : []) {
-    if (!/(?:^|[\\/])(?:stdout\.log|stderr\.log|status\.json|proxy-error\.json)$/.test(name)) continue
+    if (!/(?:^|[\\/])(?:stdout\.log|stdout\.jsonl|stderr\.log|stderr\.jsonl|status\.json|proxy-error\.json)$/.test(name)) continue
     const file = path.join(proxy, name), stat = fs.lstatSync(file)
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) continue
     output.proxy.push({ name, text: fs.readFileSync(file, 'utf8').slice(-4096) })

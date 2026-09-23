@@ -32,6 +32,36 @@ function proxyDiagnostic(runner) {
     proxyError: boundedProxyFile(path.join(directory, 'proxy-error.json')),
   }))
 }
+function boundedHostLog(file) {
+  try {
+    const stat = fs.lstatSync(file)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 2 * 1024 * 1024) return null
+    const bytes = fs.readFileSync(file)
+    const tail = bytes.subarray(Math.max(0, bytes.length - 128 * 1024)).toString('utf8')
+    const lines = tail.split(/\r?\n/).filter(line =>
+      /AUTOPROMPT_SESSION_DRIVER|AUTOPROMPT_EVENT|Extension host test runner|Test runner|Eager extensions activated|\[(?:error|warn)\]|(?:^|\s)Error:/.test(line))
+      .slice(-64)
+      .map(line => line.slice(0, 1024))
+    return lines.length ? lines : null
+  } catch { return null }
+}
+function vscodeHostDiagnostic(nativeRoot, record) {
+  // The runner only captures VS Code's parent stdout. Extension-host console
+  // output, including the fixed session-driver markers, is written here.
+  // Build the exact launch root from authenticated fixture identities rather
+  // than walking an arbitrary private tree.
+  const root = path.join(nativeRoot, 'vscode', native.sha256(record.sessionId), native.sha256(record.reservationId), 'home', 'user-data', 'logs')
+  let entries
+  try {
+    const stat = fs.lstatSync(root)
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return []
+    entries = fs.readdirSync(root, { withFileTypes: true })
+  } catch { return [] }
+  return entries.filter(entry => entry.isDirectory() && /^\d{8}T\d{6}$/.test(entry.name)).sort((a, b) => b.name.localeCompare(a.name)).slice(0, 2).flatMap(entry => {
+    const lines = boundedHostLog(path.join(root, entry.name, 'window1', 'exthost', 'exthost.log'))
+    return lines ? [{ log: `${entry.name}/window1/exthost/exthost.log`, lines }] : []
+  })
+}
 function closedBinding() {
   const names = ['AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT', 'AUTOPROMPT_CLOSED_CANARY_PROVIDER', 'AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID', 'AUTOPROMPT_CLOSED_CANARY_GENERATION', 'AUTOPROMPT_CLOSED_CANARY_CHALLENGE']
   const value = Object.fromEntries(names.map(name => [name, process.env[name]]))
@@ -123,7 +153,7 @@ async function fixture(t, options = {}) {
     })
   })
   return { root, target, controller, scratch, nativeRoot, record, requests, errors, runner, execution,
-    proxyDiagnostic: () => proxyDiagnostic(runner) }
+    proxyDiagnostic: () => ({ proxy: proxyDiagnostic(runner), extensionHost: vscodeHostDiagnostic(nativeRoot, record) }) }
 }
 
 if (require.main === module) test('real VS Code owned BYOK session executes controlled tools, bills exact usage, and resumes privately', { skip: !enabled, timeout: 150000 }, async t => {
@@ -152,7 +182,7 @@ if (require.main === module) test('real VS Code owned BYOK session executes cont
   assert.ok(f.requests.every(request => request.response_format?.json_schema?.strict === true), 'Every native request must carry the opted-in strict schema')
 })
 
-module.exports = { fixture }
+module.exports = { fixture, vscodeHostDiagnostic }
 
 if (require.main === module) test('real VS Code zero-tool reservation advertises no tools', { skip: !enabled, timeout: 90000 }, async t => {
   const f = await fixture(t, { noTools: true })

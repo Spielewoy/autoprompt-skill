@@ -42,12 +42,13 @@ test('PowerShell FileStream delete-on-close probe records host semantics for nor
     let stderr = ''; child.stderr.on('data', bytes => { stderr += bytes })
     const closed = new Promise(resolve => { child.once('close', resolve); child.once('error', resolve) })
     holders.push({ child, closed })
-    const deadline = Date.now() + 10000
-    while (!fs.existsSync(`${readyPath}.staging`) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+    const stagingDeadline = Date.now() + 10000
+    while (!fs.existsSync(`${readyPath}.staging`) && Date.now() < stagingDeadline) await new Promise(resolve => setTimeout(resolve, 10))
     assert.ok(fs.existsSync(`${readyPath}.staging`), stderr)
     assert.equal(fs.existsSync(readyPath), false, 'readiness was published while its writer remained open')
     fs.writeFileSync(`${readyPath}.publish`, '', { flag: 'wx' })
-    while ((!fs.existsSync(lockPath) || !fs.existsSync(readyPath)) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+    const publicationDeadline = Date.now() + 10000
+    while ((!fs.existsSync(lockPath) || !fs.existsSync(readyPath)) && Date.now() < publicationDeadline) await new Promise(resolve => setTimeout(resolve, 10))
     assert.deepEqual(fs.readFileSync(lockPath), lockBytes, stderr)
     assert.deepEqual(fs.readFileSync(readyPath), readyBytes, stderr)
     fs.unlinkSync(readyPath)

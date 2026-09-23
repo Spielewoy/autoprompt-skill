@@ -9924,6 +9924,15 @@ function validateOwnedProxyNode(binding) {
   return binding.path
 }
 
+function validOwnedRelayAddress(value) {
+  if (typeof value !== 'string' || value.includes('\0')) return false
+  // Only this private, unguessable Grok pipe family is admitted on Windows.
+  // A pipe is a kernel endpoint, so POSIX filesystem socket checks do not apply.
+  return process.platform === 'win32'
+    ? /^\\\\\.\\pipe\\autoprompt-grok-[a-f0-9]{64}$/.test(value)
+    : path.isAbsolute(value)
+}
+
 class OwnedCodexProxyRunner {
   constructor(options = {}) {
     if (!options.processOwner || typeof options.processOwner.launch !== 'function' ||
@@ -9965,22 +9974,34 @@ class OwnedCodexProxyRunner {
       if (typeof spec.prepareLaunch !== 'function') throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned launch preparation must be a function')
       launchResource = await spec.prepareLaunch({ sessionRoot, sessionId: spec.sessionId, reservationId: spec.reservationId })
       if (!launchResource || typeof launchResource !== 'object' || Array.isArray(launchResource) ||
-          !launchResource.relayStdin || typeof launchResource.relayStdin.socketPath !== 'string' ||
-          !path.isAbsolute(launchResource.relayStdin.socketPath) || launchResource.relayStdin.socketPath.includes('\0') ||
+          !launchResource.relayStdin || typeof launchResource.relayStdin !== 'object' || Array.isArray(launchResource.relayStdin) ||
+          !validOwnedRelayAddress(launchResource.relayStdin.socketPath) ||
+          Object.keys(launchResource.relayStdin).length !== 1 ||
           (launchResource.cleanup !== undefined && typeof launchResource.cleanup !== 'function')) {
         try { await launchResource?.cleanup?.() } catch {}
         throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned launch preparation returned an invalid relay resource')
       }
-      const relayPath = launchResource.relayStdin.socketPath
-      let relayStat, realRelayPath
-      try { relayStat = fs.lstatSync(relayPath); realRelayPath = fs.realpathSync.native(relayPath) } catch { relayStat = null }
-      // A long Linux socket path may be addressed through its controller-held
-      // directory FD. Check the resolved socket remains inside this session.
-      const relativeRelayPath = realRelayPath ? path.relative(fs.realpathSync.native(sessionRoot), realRelayPath) : '..'
-      if (!relayStat || !relayStat.isSocket() || relativeRelayPath === '' || relativeRelayPath === '..' || relativeRelayPath.startsWith(`..${path.sep}`) || path.isAbsolute(relativeRelayPath) ||
-          (process.getuid && relayStat.uid !== process.getuid()) || (relayStat.mode & 0o077)) {
+      const resourceHasBinding = launchResource.launchBindingHash !== undefined
+      const resourceHasMarker = launchResource.markReservationEntered !== undefined
+      if (resourceHasBinding !== resourceHasMarker || (resourceHasBinding &&
+          (typeof launchResource.launchBindingHash !== 'string' || !/^[a-f0-9]{64}$/.test(launchResource.launchBindingHash) ||
+            typeof launchResource.markReservationEntered !== 'function' ||
+            (spec.launchBindingHash !== undefined && spec.launchBindingHash !== launchResource.launchBindingHash)))) {
         try { await launchResource.cleanup?.() } catch {}
-        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned relay socket is not a private session capability')
+        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned launch resource has an incomplete or conflicting lifecycle binding')
+      }
+      const relayPath = launchResource.relayStdin.socketPath
+      if (process.platform !== 'win32') {
+        let relayStat, realRelayPath
+        try { relayStat = fs.lstatSync(relayPath); realRelayPath = fs.realpathSync.native(relayPath) } catch { relayStat = null }
+        // A long Linux socket path may be addressed through its controller-held
+        // directory FD. Check the resolved socket remains inside this session.
+        const relativeRelayPath = realRelayPath ? path.relative(fs.realpathSync.native(sessionRoot), realRelayPath) : '..'
+        if (!relayStat || !relayStat.isSocket() || relativeRelayPath === '' || relativeRelayPath === '..' || relativeRelayPath.startsWith(`..${path.sep}`) || path.isAbsolute(relativeRelayPath) ||
+            (process.getuid && relayStat.uid !== process.getuid()) || (relayStat.mode & 0o077)) {
+          try { await launchResource.cleanup?.() } catch {}
+          throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned relay socket is not a private session capability')
+        }
       }
       if (launchResource.launch !== undefined && (!launchResource.launch || typeof launchResource.launch !== 'object' ||
           typeof launchResource.launch.executable !== 'string' || !Array.isArray(launchResource.launch.argv) ||
@@ -10033,22 +10054,32 @@ class OwnedCodexProxyRunner {
       throw error
     }
     let owned
-    try { owned = await this.processOwner.launch({
-      executable: validateOwnedProxyNode(this.boundNode),
-      argv: [__filename, '--owned-codex-proxy', requestPath],
-      cwd: childSpec.cwd,
-      env: childSpec.env,
-      shell: false,
-      stdin: 'ignore',
-      stdout: 'ignore',
-      stderr: 'ignore',
-      sessionId: spec.sessionId,
-      reservationId: spec.reservationId,
-      targetKey: this.targetKey,
-      ...(spec.launchBindingHash !== undefined ? { launchBindingHash: spec.launchBindingHash } : {}),
-      forWork: false,
-      ...(windowsTempDirectory ? { requireShortCwd: true } : {}),
-    }) } catch (error) {
+    try {
+      const proxyExecutable = validateOwnedProxyNode(this.boundNode)
+      // Mark before entering the owner: even a rejected launch may leave a
+      // pending physical spawn. Cleanup must then require fresh owned drain.
+      if (launchResource?.markReservationEntered) {
+        const marked = launchResource.markReservationEntered()
+        if (marked && typeof marked.then === 'function') throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned launch entry marker must be synchronous')
+      }
+      owned = await this.processOwner.launch({
+        executable: proxyExecutable,
+        argv: [__filename, '--owned-codex-proxy', requestPath],
+        cwd: childSpec.cwd,
+        env: childSpec.env,
+        shell: false,
+        stdin: 'ignore',
+        stdout: 'ignore',
+        stderr: 'ignore',
+        sessionId: spec.sessionId,
+        reservationId: spec.reservationId,
+        targetKey: this.targetKey,
+        ...((launchResource?.launchBindingHash ?? spec.launchBindingHash) !== undefined
+          ? { launchBindingHash: launchResource?.launchBindingHash ?? spec.launchBindingHash } : {}),
+        forWork: false,
+        ...(windowsTempDirectory ? { requireShortCwd: true } : {}),
+      })
+    } catch (error) {
       try { await launchResource?.cleanup?.() } catch {}
       throw error
     }
@@ -10261,7 +10292,7 @@ async function runOwnedCodexProxy(requestPath) {
       !Array.isArray(request.argv) || request.argv.some(value => typeof value !== 'string') ||
       typeof request.cwd !== 'string' || typeof request.stdin !== 'string' ||
       (request.relayStdin !== undefined && (!request.relayStdin || typeof request.relayStdin !== 'object' || Array.isArray(request.relayStdin) ||
-        Object.keys(request.relayStdin).length !== 1 || typeof request.relayStdin.socketPath !== 'string' || !path.isAbsolute(request.relayStdin.socketPath) || request.relayStdin.socketPath.includes('\0'))) ||
+        Object.keys(request.relayStdin).length !== 1 || !validOwnedRelayAddress(request.relayStdin.socketPath))) ||
       !/^[a-f0-9]{64}$/.test(request.argvHash || '')) {
     throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy request is invalid')
   }

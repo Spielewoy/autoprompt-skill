@@ -23,7 +23,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, relay, lease, hermes]
+        options: [all, relay, owned-relay, lease, hermes]
       support_capability:
         description: 'Run all capabilities or a focused isolation/checker/cancellation diagnostic'
         required: false
@@ -1215,12 +1215,19 @@ jobs:
         run: |
           set -o pipefail
           node --test --test-reporter=tap tests/source/darwin-coalition-churn-api.test.cjs tests/source/darwin-coalition-helper-churn.test.cjs 2>&1 | tee darwin-coalition-candidate.log
+      - name: Verify packaged native ownership and prepared duplex relay
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/darwin-launchd-process-native.test.cjs tests/source/owned-proxy-resource-lifecycle.test.cjs 2>&1 | tee darwin-packaged-ownership.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: coalition-candidate-${{ matrix.os }}
           path: |
             darwin-coalition-candidate.log
+            darwin-packaged-ownership.log
             ${{ runner.temp }}/darwin-coalition-candidate
             ${{ runner.temp }}/darwin-coalition-candidate-proof.json
           if-no-files-found: error
@@ -1283,6 +1290,13 @@ jobs:
           set -o pipefail
           node --test --test-reporter=tap tests/source/windows-appcontainer-relay-native.test.cjs 2>&1 | tee windows-relay-native.log
           node --test --test-reporter=tap --test-name-pattern='native Windows named pipe' tests/source/harness-v2-grok-sandbox.test.cjs 2>&1 | tee grok-windows-relay.log
+      - name: Verify owned proxy duplex relay and resource drain receipt
+        if: ${{ !cancelled() && (inputs.support_primitive == 'all' || inputs.support_primitive == 'relay' || inputs.support_primitive == 'owned-relay') }}
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/owned-proxy-resource-lifecycle.test.cjs 2>&1 | tee owned-proxy-relay.log
       - name: Verify kernel lease release after normal close and forced Job termination
         if: ${{ !cancelled() && inputs.support_primitive != 'hermes' }}
         timeout-minutes: 6
@@ -1329,6 +1343,7 @@ jobs:
             windows-internal-loopback.log
             windows-relay-native.log
             grok-windows-relay.log
+            owned-proxy-relay.log
             windows-tool-lease-native.log
             windows-token-profile.log
             hermes-windows-launcher.tap

@@ -222,6 +222,13 @@ static int bind_process(pid_t pid, struct ap_bound_process *bound,
     return 0;
 }
 
+static bool vanished_snapshot(int result, int error_code) {
+    // Accept only failed lookups with an explicit disappearance errno, never
+    // a positive (possibly truncated) structure result.
+    return (result == 0 || result == -1) &&
+           (error_code == ESRCH || error_code == ENOENT);
+}
+
 static int coalition_info(pid_t pid, uint64_t *resource_coalition,
                           int *query_result, int *query_errno) {
     struct ap_proc_pidcoalitioninfo information;
@@ -401,6 +408,11 @@ static int census_command(const char *coalition_text) {
         int result = 0;
         int error_code = 0;
         if (bind_process(pids[index], &before, &result, &error_code) != 0) {
+            // A UID snapshot can retain a PID after the process exits. It is
+            // safe to omit that vanished snapshot member; coalition usage
+            // counters remain the authority for proving the group drained.
+            if (vanished_snapshot(result, error_code))
+                continue;
             errors[error_count++] = (struct ap_process_error){
                 pids[index], "bind-before", result, error_code};
             continue;
@@ -412,11 +424,17 @@ static int census_command(const char *coalition_text) {
             continue;
         }
         struct ap_bound_process after;
-        if (bind_process(pids[index], &after, &result, &error_code) != 0 ||
-            !same_binding(&before, &after)) {
+        if (bind_process(pids[index], &after, &result, &error_code) != 0) {
+            if (vanished_snapshot(result, error_code))
+                continue;
             errors[error_count++] = (struct ap_process_error){
                 pids[index], "bind-after", result,
                 error_code == 0 ? ESRCH : error_code};
+            continue;
+        }
+        if (!same_binding(&before, &after)) {
+            errors[error_count++] = (struct ap_process_error){
+                pids[index], "bind-after", result, ESRCH};
             continue;
         }
         if (before.uid != getuid()) {
@@ -523,6 +541,11 @@ static int signal_command(const char *coalition_text, const char *signal_text) {
         int result = 0;
         int error_code = 0;
         if (bind_process(pids[index], &bound, &result, &error_code) != 0) {
+            // The target may have exited between list_uid_pids and this bind.
+            // Do not turn that missing snapshot PID into a false helper-wide
+            // failure; live coalition tasks are still audited below.
+            if (vanished_snapshot(result, error_code))
+                continue;
             errors[error_count++] = (struct ap_process_error){
                 pids[index], "bind-before", result, error_code};
             continue;

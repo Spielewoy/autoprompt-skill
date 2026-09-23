@@ -1,7 +1,6 @@
 'use strict'
 
-// Candidate-only regression for the Darwin PID-snapshot race. The packaged
-// helper remains untouched until a native artifact proves this candidate.
+// Build the packaged source and exercise real Darwin PID churn and kernel drain.
 const assert = require('node:assert/strict')
 const cp = require('node:child_process')
 const crypto = require('node:crypto')
@@ -13,7 +12,7 @@ const { ProcessOwner } = require('../../agents/codex/workflow/process-owner.js')
 const { createDarwinCoalitionAdapter } = require('../../agents/codex/workflow/darwin-launchd-process.js')
 
 const ROOT = path.resolve(__dirname, '../..')
-const SOURCE = path.join(ROOT, 'tests/helpers/darwin-coalition-helper-churn.c')
+const SOURCE = path.join(ROOT, 'agents/codex/workflow/darwin-coalition-helper.c')
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 const run = (file, argv, options = {}) => cp.spawnSync(file, argv, { encoding: 'utf8', shell: false, timeout: 60000, maxBuffer: 4 * 1024 * 1024, ...options })
 

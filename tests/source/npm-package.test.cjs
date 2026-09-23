@@ -744,6 +744,20 @@ test('packed tarball installs offline into an isolated temporary global prefix a
     const ompReceipt = harnessPackage.install('omp', ompRoot, installedPackage)
     assert.ok(ompReceipt.files['node_modules/@iarna/toml/package.json'])
     assert.ok(ompReceipt.files['node_modules/yaml/package.json'])
+    assert.ok(ompReceipt.files['scripts/windows-git-bootstrap-config.cjs'])
+    const localSafetyProbe = childProcess.spawnSync(process.execPath, ['-e', `
+      const path = require('node:path')
+      const localSafety = require(process.argv[1])
+      const helper = require(path.join(path.dirname(process.argv[1]), 'windows-git-bootstrap-config.cjs'))
+      if (!localSafety || !helper) throw new Error('packaged Windows Git bootstrap closure did not resolve')
+      process.stdout.write('resolved')
+    `, path.join(ompReceipt.bundle, 'scripts/local-only-safety.cjs')], {
+      cwd: temporaryRoot,
+      encoding: 'utf8',
+      env: { HOME: path.join(temporaryRoot, 'isolated-home'), NODE_PATH: '', PATH: path.dirname(process.execPath), USERPROFILE: path.join(temporaryRoot, 'isolated-home') },
+    })
+    assert.equal(localSafetyProbe.status, 0, localSafetyProbe.stderr)
+    assert.equal(localSafetyProbe.stdout, 'resolved')
     const parserProbe = childProcess.spawnSync(process.execPath, ['-e', `
       const { createRequire } = require('node:module')
       const path = require('node:path')

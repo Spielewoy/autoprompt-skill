@@ -500,7 +500,7 @@ function auditPrivatePermissions(runPath, options = {}) {
     return { valid: true, mechanism: 'posix-mode' }
   }
   const script = [
-    "$ErrorActionPreference='Stop'",
+    "$ErrorActionPreference='Stop';[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=targets');[Console]::Error.Flush()",
     '$inputPaths=@($env:AUTOPROMPT_ACL_AUDIT_PATHS|ConvertFrom-Json)',
     '$root=$inputPaths[0]',
     '$targets=@($root)',
@@ -509,11 +509,15 @@ function auditPrivatePermissions(runPath, options = {}) {
     '$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent()',
     '$items=@()',
     'foreach($p in ($targets | Select-Object -Unique)){',
+    '  [Console]::Error.WriteLine(\'AUTOPROMPT_ACL_AUDIT_PHASE=get-acl\');[Console]::Error.Flush()',
     '  $acl=Get-Acl -LiteralPath $p',
+    '  [Console]::Error.WriteLine(\'AUTOPROMPT_ACL_AUDIT_PHASE=owner\');[Console]::Error.Flush()',
     '  $ownerSid=(New-Object System.Security.Principal.NTAccount($acl.Owner)).Translate([System.Security.Principal.SecurityIdentifier]).Value',
+    '  [Console]::Error.WriteLine(\'AUTOPROMPT_ACL_AUDIT_PHASE=rules\');[Console]::Error.Flush()',
     '  $rules=@($acl.Access | ForEach-Object {$sid=$null;try{$sid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value}catch{};[pscustomobject]@{identity=$_.IdentityReference.Value;sid=$sid;type=$_.AccessControlType.ToString();inherited=$_.IsInherited;rights=$_.FileSystemRights.ToString()}})',
     '  $items+=[pscustomobject]@{path=$p;owner=$acl.Owner;ownerSid=$ownerSid;protected=$acl.AreAccessRulesProtected;rules=$rules}',
     '}',
+    '[Console]::Error.WriteLine(\'AUTOPROMPT_ACL_AUDIT_PHASE=emit\');[Console]::Error.Flush()',
     '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)',
     '[pscustomobject]@{currentName=$identity.Name;currentSid=$identity.User.Value;items=$items}|ConvertTo-Json -Compress -Depth 7',
   ].join(';')
@@ -525,7 +529,16 @@ function auditPrivatePermissions(runPath, options = {}) {
   const result = spawnSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], {
     encoding: 'utf8', windowsHide: true, timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'], env: environment,
   })
-  if (result.status !== 0) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Cannot revalidate Windows run-record ACLs', { status: result.status, cause: result.error && result.error.code, stderr: result.stderr && result.stderr.trim() })
+  if (result.status !== 0) {
+    const marker = /^AUTOPROMPT_ACL_AUDIT_PHASE=(targets|get-acl|owner|rules|emit)$/
+    const phases = [], diagnostics = []
+    for (const line of String(result.stderr || '').split(/\r?\n/)) {
+      const match = marker.exec(line)
+      if (match) phases.push(match[1]); else diagnostics.push(line)
+    }
+    const stderr = diagnostics.join('\n').trim()
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Cannot revalidate Windows run-record ACLs', { status: result.status, cause: result.error && result.error.code, phase: phases.at(-1) || null, stderr })
+  }
   let snapshot
   try { snapshot = JSON.parse(result.stdout) } catch { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit returned invalid JSON') }
   return validateWindowsAclSnapshot(snapshot)
