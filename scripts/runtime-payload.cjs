@@ -372,6 +372,18 @@ function discoverCodexExternalRuntimeDependencies(root = ROOT) {
     })]),
     kind: 'dynamic-safety-module',
   }))
+  dependencies.push(Object.freeze({
+    source: 'scripts/windows-git-bootstrap-config.cjs',
+    destination: 'scripts/windows-git-bootstrap-config.cjs',
+    requiredFrom: 'scripts/local-only-safety.cjs',
+    runtimeRequest: './windows-git-bootstrap-config.cjs',
+    requiredBy: Object.freeze([Object.freeze({
+      kind: 'runtime-require',
+      requiredFrom: 'scripts/local-only-safety.cjs',
+      runtimeRequest: './windows-git-bootstrap-config.cjs',
+    })]),
+    kind: 'static-require',
+  }))
   dependencies.sort((left, right) => left.source.localeCompare(right.source))
   return Object.freeze(dependencies)
 }

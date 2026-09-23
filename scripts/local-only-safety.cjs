@@ -344,7 +344,20 @@ function buildGitEnvironmentSet(policy, configIsolationPath) {
     set[`GIT_CONFIG_KEY_${index}`] = key
     set[`GIT_CONFIG_VALUE_${index}`] = value
   })
+  if (process.platform === 'win32') {
+    const bootstrap = require('./windows-git-bootstrap-config.cjs')
+    Object.assign(set, bootstrap.projectWindowsNulBootstrap(
+      bootstrap.createWindowsNulBootstrap(policy.configEntries), policy.configEntries,
+    ))
+  }
   return set
+}
+
+// NUL is an exact Windows device capability, not an external configuration
+// pathname. The full ordered Git policy is verified independently below.
+function usesWindowsNulConfig(environment) {
+  return process.platform === 'win32' && environment.GIT_CONFIG_GLOBAL === 'NUL'
+    && environment.GIT_CONFIG_SYSTEM === 'NUL' && environment.GIT_CONFIG_NOSYSTEM === '1'
 }
 
 function buildChildEnvironmentSpec(repository, config, options = {}) {
@@ -648,25 +661,33 @@ function writeAuthConfiguration(config, environment) {
 }
 
 function inspectCommandBoundary(repository, repositoryConfig, effectiveConfig, environment) {
+  const policy = buildGitConfigPolicy(repository, repositoryConfig)
   let isolationSafe = false
   let isolationPath = environment.GIT_CONFIG_GLOBAL || defaultConfigIsolation(repository)
   try {
-    const globalPath = assertConfigIsolation(isolationPath, repository.rejectTarget)
-    const systemPath = assertConfigIsolation(
-      environment.GIT_CONFIG_SYSTEM || defaultConfigIsolation(repository),
-      repository.rejectTarget,
-    )
-    isolationSafe = Boolean(environment.GIT_CONFIG_GLOBAL)
-      && Boolean(environment.GIT_CONFIG_SYSTEM)
-      && globalPath === systemPath
-      && environment.GIT_CONFIG_NOSYSTEM === '1'
-    isolationPath = globalPath
+    if (usesWindowsNulConfig(environment)) {
+      const bootstrap = require('./windows-git-bootstrap-config.cjs')
+      bootstrap.validateWindowsNulBootstrapEnvironment(environment,
+        bootstrap.createWindowsNulBootstrap(policy.configEntries), policy.configEntries)
+      isolationSafe = true
+      isolationPath = 'NUL'
+    } else {
+      const globalPath = assertConfigIsolation(isolationPath, repository.rejectTarget)
+      const systemPath = assertConfigIsolation(
+        environment.GIT_CONFIG_SYSTEM || defaultConfigIsolation(repository),
+        repository.rejectTarget,
+      )
+      isolationSafe = Boolean(environment.GIT_CONFIG_GLOBAL)
+        && Boolean(environment.GIT_CONFIG_SYSTEM)
+        && globalPath === systemPath
+        && environment.GIT_CONFIG_NOSYSTEM === '1'
+      isolationPath = globalPath
+    }
   } catch {
     isolationSafe = false
     isolationPath = defaultConfigIsolation(repository)
   }
 
-  const policy = buildGitConfigPolicy(repository, repositoryConfig)
   const expectedSet = buildGitEnvironmentSet(policy, isolationPath)
   const actualConfig = environmentConfig(environment)
   const configExact = actualConfig.valid
@@ -829,7 +850,8 @@ function verifyCodexEnforcementProof(repository, environment, proof) {
     const activationRoot = path.dirname(profilePath)
     if (!environment.GH_CONFIG_DIR || !environment.GIT_CONFIG_GLOBAL
       || !pathEqual(path.dirname(environment.GH_CONFIG_DIR), activationRoot)
-      || !pathEqual(path.dirname(environment.GIT_CONFIG_GLOBAL), activationRoot)) {
+      || (!usesWindowsNulConfig(environment)
+        && !pathEqual(path.dirname(environment.GIT_CONFIG_GLOBAL), activationRoot))) {
       throw new OperationalError('Profile, GH_CONFIG_DIR, and isolated Git config do not share one activation root')
     }
     values = parseProofToml(bytes)
@@ -1047,7 +1069,8 @@ function verifyHarnessV2EnforcementProof(repository, environment, proof) {
     const activationRoot = path.dirname(profile)
     if (!environment.GH_CONFIG_DIR || !environment.GIT_CONFIG_GLOBAL ||
         !pathEqual(path.dirname(environment.GH_CONFIG_DIR), activationRoot) ||
-        !pathEqual(path.dirname(environment.GIT_CONFIG_GLOBAL), activationRoot)) {
+        (!usesWindowsNulConfig(environment)
+          && !pathEqual(path.dirname(environment.GIT_CONFIG_GLOBAL), activationRoot))) {
       throw new OperationalError('Native profile and isolated credential paths do not share their activation root')
     }
 

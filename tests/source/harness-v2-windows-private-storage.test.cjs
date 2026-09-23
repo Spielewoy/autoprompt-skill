@@ -148,10 +148,9 @@ test('native Windows worker clone uses short registered storage and cleanup reta
     USERPROFILE: fakeHome,
     XDG_CONFIG_HOME: path.join(fakeHome, '.config'),
   }
-  // Git for Windows must bootstrap its isolated global configuration before
-  // core.longpaths can apply. Keep that controller-owned bootstrap state at a
-  // normal path while independently exercising deep HOME and worker storage.
-  const controllerConfigRoot = path.join(root, 'controller-config')
+  // The production Windows environment uses NUL before loading its injected
+  // policy, so the durable controller config can itself exceed MAX_PATH.
+  const controllerConfigRoot = path.join(activationRoot, 'controller-config')
   const configIsolationPath = path.join(controllerConfigRoot, 'gitconfig')
   const ghConfigDir = path.join(controllerConfigRoot, 'gh')
   const deepConfigIsolationPath = path.join(activationRoot, 'gitconfig')
@@ -166,6 +165,9 @@ test('native Windows worker clone uses short registered storage and cleanup reta
     configIsolationPath,
     ghConfigDir,
   })
+  assert.ok(configIsolationPath.length > 300)
+  assert.equal(environment.GIT_CONFIG_GLOBAL, 'NUL')
+  assert.equal(environment.GIT_CONFIG_SYSTEM, 'NUL')
   const bounded = (value, limit = 8192) => String(value || '').slice(0, limit)
   const resultDetails = result => JSON.stringify({
     status: result.status,

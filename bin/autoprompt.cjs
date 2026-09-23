@@ -59,6 +59,7 @@ const HELP_TEXT = [
   '  autoprompt activate reasonix [--target <absolute-path>] [--ttl <seconds>] [--resume <activation-id>] [--root <absolute-path>] -- <mission>',
   '  autoprompt configure reasonix --agents <off|auto|model[,model...]> [--model-map <path>] [--effort <low|medium|high|max>] [--root <absolute-path>]',
   '  autoprompt activate <provider> [--target <absolute-path>] [--ttl <seconds>] [--resume <activation-id>] [--root <absolute-path> | --vm-root <private-state> | --wsl-root <private-state>] -- <request>',
+  "  Activation options precede mission text. In PowerShell, use '--' (quoted) or autoprompt.cmd when the mission begins with '-'.",
   '  autoprompt runtime setup <provider> --root <absolute-path> --python <absolute-path> [--refresh]',
   '  autoprompt runtime vm setup --root <private-state> --target <project> --provider <provider> --endpoint <https-url> --connection <private-native-config> --credential <private-json> --toolchain <pinned-node-root> --native <provider-native-root> --lima <limactl> --archive <package.tgz> --vm-type <qemu|vz> [--model-selection <private-json>] [--qemu-root <toolchain>] [--arch <x86_64|aarch64>] [--resume]',
   '  autoprompt runtime vm status --root <private-state> [--request-id <32hex>]',
@@ -210,9 +211,13 @@ function parseCodexActivation(rest, alias = false) {
       continue
     }
     if (argument.startsWith('-')) usageError(`Unknown activate flag: ${argument}`)
-    usageError(`Activate ${provider} requires \`--\` before the mission.`)
+    // npm's PowerShell shim consumes an unquoted -- before Node receives argv.
+    // The first positional argument starts the mission; never interpret later
+    // mission text as controller options. Leading unknown flags still fail.
+    missionMode = true
+    mission.push(argument)
   }
-  if (!missionMode || mission.length === 0) usageError(`Activate ${provider} requires at least one mission argv after \`--\`.`)
+  if (!missionMode || mission.length === 0) usageError(`Activate ${provider} requires at least one mission argv (optionally after \`--\`).`)
   if ([root, vmRoot, wslRoot].filter(Boolean).length > 1 || ((vmRoot || wslRoot) && target)) usageError('Guest runtime roots supply the configured provider root and target and are mutually exclusive.')
   return {
     command: 'activate',

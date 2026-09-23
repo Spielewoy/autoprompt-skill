@@ -6,6 +6,18 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      support_stage:
+        description: 'Run only one focused all-platform development stage'
+        required: false
+        default: none
+        type: choice
+        options: [none, macos-containment, windows-bootstrap, opencode]
+      support_host:
+        description: 'Native host family for focused provider tests'
+        required: false
+        default: windows
+        type: choice
+        options: [windows, linux, macos]
       windows_regressions:
         description: 'Diagnose Windows cwd, owned proxy and packed installer on Node 20 and 24'
         required: false
@@ -75,7 +87,7 @@ permissions:
 
 jobs:
   platform-primitives:
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.windows_regressions != true && inputs.claude_diagnostic != true && inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_fork_memory != true) }}
+    if: ${{ (inputs.support_stage == '' || inputs.support_stage == 'none') && (github.event_name != 'workflow_dispatch' || (inputs.windows_regressions != true && inputs.claude_diagnostic != true && inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_fork_memory != true) ) }}
     name: Platform and installer / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
     # Native Windows storage and crash recovery add up to 30 minutes; leave room
@@ -724,7 +736,7 @@ jobs:
         run: node -e "process.exit(1)"
 
   claude-native:
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_fork_memory != true && (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)) }}
+    if: ${{ (inputs.support_stage == '' || inputs.support_stage == 'none') && (github.event_name != 'workflow_dispatch' || (inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_fork_memory != true && (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)) ) }}
     name: ${{ inputs.windows_regressions == true && 'Windows regressions' || 'Actual Claude 2.1.270' }} / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.runner.os }}
     # Windows repeats the fresh process-local command canary in the direct,
@@ -791,7 +803,7 @@ jobs:
           if-no-files-found: warn
 
   msys-mapping:
-    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.msys_mapping == true || inputs.msys_fork_memory == true) && inputs.msys_pipe_trace != true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' }}
+    if: ${{ (inputs.support_stage == '' || inputs.support_stage == 'none') && (github.event_name == 'workflow_dispatch' && (inputs.msys_mapping == true || inputs.msys_fork_memory == true) && inputs.msys_pipe_trace != true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' ) }}
     name: ${{ inputs.msys_fork_memory == true && 'MSYS fork memory diagnostic' || 'MSYS mapping diagnostic' }} / ${{ matrix.runner.os }} / Node 24.x
     runs-on: ${{ matrix.runner.os }}
     timeout-minutes: 30
@@ -907,7 +919,7 @@ jobs:
           if-no-files-found: error
 
   msys-pipe-trace:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.msys_pipe_trace == true && inputs.msys_fork_memory != true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' }}
+    if: ${{ (inputs.support_stage == '' || inputs.support_stage == 'none') && (github.event_name == 'workflow_dispatch' && inputs.msys_pipe_trace == true && inputs.msys_fork_memory != true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' ) }}
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -1034,4 +1046,103 @@ jobs:
             ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/build/*.txt
             ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/build/**/config.log
             ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/stage/usr/bin/msys-2.0.dll
+          if-no-files-found: error
+
+  macos-containment:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'macos-containment'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+      - name: Exercise kernel process grouping and detached descendants
+        shell: bash
+        run: |
+          set -o pipefail
+          export AUTOPROMPT_DARWIN_COALITION_EVIDENCE="$RUNNER_TEMP/darwin-coalition-proof.json"
+          node --test --test-reporter=tap scripts/darwin-coalition-proof/coalition-proof.test.cjs 2>&1 | tee darwin-coalition-proof.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: coalition-${{ matrix.os }}
+          path: |
+            darwin-coalition-proof.log
+            ${{ runner.temp }}/darwin-coalition-proof.json
+          if-no-files-found: error
+
+  windows-bootstrap:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'windows-bootstrap'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+        node: [20.x, 24.x]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
+      - run: npm ci --ignore-scripts
+      - name: Verify isolated Git configuration beyond MAX_PATH
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/windows-git-bootstrap-config.test.cjs tests/source/activation-powershell-argv.test.cjs tests/source/harness-v2-windows-shim.test.cjs 2>&1 | tee windows-git-bootstrap.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: git-bootstrap-${{ matrix.os }}-${{ matrix.node }}
+          path: windows-git-bootstrap.log
+          if-no-files-found: error
+
+  opencode:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'opencode'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.support_host == 'linux' && '[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"}]' || inputs.support_host == 'macos' && '[{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"}]' || '[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}]') }}
+    runs-on: ${{ matrix.runner.os }}
+    timeout-minutes: 60
+    env:
+      AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+          architecture: ${{ matrix.runner.arch }}
+      - name: Enable Linux native isolation
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - run: npm ci --ignore-scripts
+      - name: Install the reported official npm provider and its generated launchers
+        run: npm install --prefix .native-provider --no-package-lock --no-audit --no-fund opencode-ai@1.18.32
+      - name: Bind the actual npm command shim on Windows
+        run: >-
+          node -e "const fs=require('node:fs'),path=require('node:path');
+          const file=fs.realpathSync.native(path.resolve('.native-provider/node_modules/.bin/opencode'+(process.platform==='win32'?'.cmd':'')));
+          fs.appendFileSync(process.env.GITHUB_ENV,'AUTOPROMPT_OPENCODE_TEST_CLI='+file+'\n');"
+      - name: Require all eleven native provider capabilities
+        run: node tests/helpers/provider-platform-ci.cjs opencode
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: opencode-${{ matrix.runner.os }}-node24
+          path: |
+            native-opencode-evidence.json
+            native-opencode-tests.log
           if-no-files-found: error

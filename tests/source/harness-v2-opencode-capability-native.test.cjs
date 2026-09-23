@@ -16,10 +16,13 @@ const controlled = require('../../scripts/harness-v2-controlled-tools.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
-const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 const { modelService } = require('../helpers/harness-native-service.cjs')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment } = require('../helpers/native-platform.cjs')
 
-const providers = Object.freeze({ opencode: process.env.AUTOPROMPT_OPENCODE_TEST_CLI, kilo: process.env.AUTOPROMPT_KILO_TEST_CLI })
+const selectedNativeCli = provider => process.env[`AUTOPROMPT_${provider.toUpperCase()}_TEST_CLI`] ? requiredNativeCli(provider) : undefined
+if (process.env.AUTOPROMPT_REQUIRE_NATIVE_TESTS === '1' && !process.env.AUTOPROMPT_OPENCODE_TEST_CLI && !process.env.AUTOPROMPT_KILO_TEST_CLI) throw new Error('AUTOPROMPT_OPENCODE_TEST_CLI or AUTOPROMPT_KILO_TEST_CLI is required; native certification cannot skip')
+const providers = Object.freeze({ opencode: selectedNativeCli('opencode'), kilo: selectedNativeCli('kilo') })
 // These shared scenarios include held/cancelled lifecycle cases. Kilo's
 // serial witness and OpenCode's parallel witness exceed five minutes; the
 // latter completed in 374 seconds with all functional witnesses available.
@@ -28,7 +31,6 @@ const CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS = Object.freeze({ default: 300_000, ki
 function closedNativeCapabilityTimeout(provider) {
   return CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS[provider] || CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS.default
 }
-const quote = value => `'${value.replaceAll("'", "'\\''")}'`
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
 function closedCanaryBinding(provider) {
@@ -42,9 +44,9 @@ function closedCanaryBinding(provider) {
 function canaryRegistry(provider, fallback) {
   const supplied = closedCanaryBinding(provider)
   if (!supplied) return fallback
-  const root = supplied.root, stat = fs.statSync(root)
-  if (!stat.isDirectory() || (stat.mode & 0o077)) throw new Error('closed canary ownership root is not private')
-  const directory = path.join(root, `${provider}-${crypto.randomUUID()}`); fs.mkdirSync(directory, { mode: 0o700 })
+  const root = privateDirectory(supplied.root), stat = fs.statSync(root)
+  if (!stat.isDirectory() || (process.platform !== 'win32' && (stat.mode & 0o077))) throw new Error('closed canary ownership root is not private')
+  const directory = privateDirectory(path.join(root, `${provider}-${crypto.randomUUID()}`))
   const registryPath = path.join(directory, 'processes.json'), registration = path.join(directory, 'registration.json')
   const body = { schemaVersion: 1, provider, activationId: supplied.activationId, generation: supplied.generation, challenge: supplied.challenge, registryPath }
   fs.writeFileSync(registration, JSON.stringify(body), { flag: 'wx', mode: 0o600 })
@@ -52,9 +54,9 @@ function canaryRegistry(provider, fallback) {
 }
 
 function fixture(provider) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), `${provider}-capability-native-`))
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), `${provider}-capability-native-`)))
   const target = path.join(root, 'target'), controller = path.join(root, 'controller'), nativeRoot = path.join(controller, 'native')
-  for (const dir of [target, controller, nativeRoot]) fs.mkdirSync(dir, { mode: 0o700 })
+  for (const dir of [target, controller, nativeRoot]) privateDirectory(dir)
   const closed = closedCanaryBinding(provider)
   const projection = core.createCanonicalMissionProjection('FIRST_CONTEXT_SENTINEL: use only the assigned controller command and return JSON.')
   const record = { activationId: closed?.activationId || `${provider}-closed-native-canary`, generation: closed?.generation || 1, sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: 'closed-native-capability', logicalRole: 'worker', physicalRole: 'ap-worker', providerRole: 'ap-worker', canonicalMission: projection.canonicalMission, workingDirectory: target, dispatch: { requestPointer: { hash: native.sha256(`${provider}-capability`) } } }
@@ -78,16 +80,16 @@ async function scenario(provider, options = {}) {
   fs.writeFileSync(candidate, marker, { mode: 0o600 }); fs.writeFileSync(secret, 'PRIVATE_CONTROLLER_MUST_NOT_BE_VISIBLE', { mode: 0o600 }); fs.writeFileSync(path.join(f.target, 'AGENTS.md'), 'AMBIENT_PROJECT_INSTRUCTIONS_MUST_NOT_AUTOLOAD', { mode: 0o600 })
   let service, owner
   try {
-    service = await modelService(provider, options.tool || { name: controlled.toolName(provider, 'bash'), args: { command: `cat ${quote(candidate)}` } }, { resetToolAfterCompletion: true, ...(options.serviceOptions || {}) })
+    service = await modelService(provider, options.tool || { name: controlled.toolName(provider, 'bash'), args: { command: readCommand(candidate) } }, { resetToolAfterCompletion: true, ...(options.serviceOptions || {}) })
     const binding = native.probeExecutable({ provider, executable: cli })
-    const registryPath = canaryRegistry(provider, path.join(f.controller, 'processes.json')), processAdapter = createPosixProcessAdapter(), ownerValue = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
+    const registryPath = canaryRegistry(provider, path.join(f.controller, 'processes.json')), processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath)), ownerValue = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
     owner = ownerValue
-    const proxy = path.join(f.controller, 'proxy'); fs.mkdirSync(proxy, { mode: 0o700 })
+    const proxy = privateDirectory(path.join(f.controller, 'proxy'))
     const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: `${provider}-closed-native-canary`, pollMs: 10 })
     const adapter = new HarnessExecAdapter({ provider, runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: connection(service, options.connection), credentialEnvironment: { OPENAI_API_KEY: '<local-test-only>', KILO_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only assigned controller tools and return one JSON object.' })
-    const run = async overrides => { const record = { ...f.record, ...overrides }; record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, { PATH: process.env.PATH }); record.signal = overrides?.signal || AbortSignal.timeout(90000); return adapter.launch(record) }
+    const run = async overrides => { const record = { ...f.record, ...overrides }; record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment()); record.signal = overrides?.signal || AbortSignal.timeout(90000); return adapter.launch(record) }
     let closed = false
-    return { ...f, provider, candidate, secret, marker, service, binding, owner, registryPath, adapter, run,
+    return { ...f, provider, candidate, secret, marker, service, binding, owner, processAdapter, registryPath, adapter, run,
       async close() { if (closed) return; closed = true; try { await owner.cancelAll({ reason: `${provider} capability cleanup`, graceMs: 0, killMs: 2000, waitForPending: true }) } finally { try { await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } } } }
   } catch (error) {
     try { if (owner) await owner.cancelAll({ reason: `${provider} capability setup failed`, graceMs: 0, killMs: 2000, waitForPending: true }) } finally { try { if (service) await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } }
@@ -111,7 +113,7 @@ async function runScenario(provider) {
     let contacted = false; listener = net.createServer(socket => { contacted = true; socket.destroy() })
     await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
     const port = listener.address().port, probe = `const n=require('node:net');const s=n.connect(${port},'127.0.0.1');s.on('connect',()=>process.exit(19));s.on('error',()=>process.exit(0));setTimeout(()=>process.exit(0),700)`
-    command(f, `cat ${quote(f.candidate)}; { cat ${quote(f.candidate)}; printf '\\nCLOSED_CANARY_CHALLENGE:${f.challenge}\\n'; } > ${quote(readback)}; printf scratch-ok > ${quote(scratchFile)}; if printf nope > ${quote(f.candidate)} 2>/dev/null; then exit 18; fi; if cat ${quote(f.secret)} 2>/dev/null; then exit 20; fi; ${quote(process.execPath)} -e ${quote(probe)}`)
+    command(f, withChallenge(`${readCommand(f.candidate)}; ${nodeCommand(`require('node:fs').writeFileSync(${JSON.stringify(readback)}, ${JSON.stringify(expectedReceipt)}); require('node:fs').writeFileSync(${JSON.stringify(scratchFile)}, 'scratch-ok'); try { require('node:fs').writeFileSync(${JSON.stringify(f.candidate)}, 'nope'); process.exit(18) } catch {} ; try { require('node:fs').readFileSync(${JSON.stringify(f.secret)}); process.exit(20) } catch {} ; ${probe}`)}`, f.challenge))
     const first = await f.run({ assignment: { model: 'fixture/model', effort: 'low' } }); good(first)
     assert.equal(fs.readFileSync(readback, 'utf8'), expectedReceipt, 'controller receipt body did not bind the exact candidate bytes and challenge')
     assert.equal(fs.readFileSync(f.candidate, 'utf8'), f.marker); assert.equal(fs.readFileSync(scratchFile, 'utf8'), 'scratch-ok'); assert.equal(contacted, false); assert.equal(first.toolBoundaryEvidence.receiptHashes.length, 1)
@@ -121,22 +123,23 @@ async function runScenario(provider) {
     assert.equal(privateAbsent, true)
     assert.ok(f.service.requests.some(item => item.path.includes('/chat/completions'))); assert.ok(f.service.requests.some(item => item.body.reasoning_effort === 'low'), JSON.stringify(f.service.requests.map(item => ({ path: item.path, model: item.body.model, effort: item.body.reasoning_effort }))))
     assert.throws(() => native.createLaunch({ provider, executable: f.binding.path, home: path.join(f.root, 'invalid'), sessionRoot: path.join(f.root, 'invalid-session'), targetPath: f.target, cwd: f.target, prompt: 'x', input: 'x', connection: connection(f.service), credentials: {}, environment: { PATH: process.env.PATH }, readOnly: true, effort: 'invalid' }), { code: 'PROFILE_INVALID' })
-    command(f, `cat ${quote(f.candidate)}`); const before = f.service.requests.length
+    command(f, readCommand(f.candidate)); const before = f.service.requests.length
     const resumed = await f.run({ reservationId: crypto.randomUUID(), continuationId: first.contextId, assignment: { model: 'fixture/model', effort: 'high' } }); good(resumed); assert.equal(resumed.contextId, first.contextId)
     const continuationCarriesPrompt = f.service.requests.slice(before).some(item => JSON.stringify(item.body).includes('FIRST_CONTEXT_SENTINEL')); assert.equal(continuationCarriesPrompt, true)
-    const foreign = path.join(f.root, 'foreign'); fs.mkdirSync(foreign)
+    const foreign = privateDirectory(path.join(f.root, 'foreign'))
     let foreignCode
-    try { await f.adapter.launch({ ...f.record, reservationId: crypto.randomUUID(), continuationId: first.contextId, workingDirectory: foreign, environment: prepareProcessLaunchEnvironment(createPosixProcessAdapter(), crypto.randomUUID(), { PATH: process.env.PATH }), signal: AbortSignal.timeout(30000) }) } catch (error) { foreignCode = error.code }
+    const foreignReservation = crypto.randomUUID()
+    try { await f.adapter.launch({ ...f.record, reservationId: foreignReservation, continuationId: first.contextId, workingDirectory: foreign, environment: prepareProcessLaunchEnvironment(f.processAdapter, foreignReservation, nativeEnvironment()), signal: AbortSignal.timeout(30000) }) } catch (error) { foreignCode = error.code }
     assert.equal(foreignCode, 'SESSION_ID_MISMATCH')
     let peak = 0; const monitor = setInterval(() => { peak = Math.max(peak, f.owner.ownershipIdentities().length) }, 5)
     let siblings; try { siblings = await Promise.all([0, 1].map(index => { const ids = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: `sibling-${index}` }; return f.run({ ...ids, missionBinding: core.bindCanonicalMissionForChild(f.projection, { ...f.record, ...ids, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }) }) })) } finally { clearInterval(monitor) }
     assert.ok(siblings.every(item => item.ok)); assert.equal(new Set(siblings.map(item => item.contextId)).size, 2); assert.ok(peak >= 2); assert.deepEqual(f.owner.ownershipIdentities(), [])
-    const originalTool = f.service.tool.args.command; command(f, `cat ${quote(f.candidate)}`)
+    const originalTool = f.service.tool.args.command; command(f, readCommand(f.candidate))
     const delayed = await scenario(provider, { serviceOptions: { delayMessagesMs: 3500 } })
     let pending, fastResult, recoveredLive
     try {
       const abort = new AbortController(); pending = delayed.run({ signal: abort.signal }); for (let i = 0; i < 100 && delayed.service.requests.length === 0; i++) await sleep(10)
-      const recoveredOwner = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: delayed.registryPath, pollMs: 10 }); await recoveredOwner.recoverReservations()
+      const recoveredOwner = new ProcessOwner({ adapter: nativeProcessAdapter(delayed.registryPath, path.dirname(delayed.registryPath)), registryPath: delayed.registryPath, pollMs: 10 }); await recoveredOwner.recoverReservations()
       const heldIdentity = recoveredOwner.ownershipIdentities(); assert.equal(heldIdentity.length, 1, 'fresh owner did not recover the persisted live child'); recoveredLive = heldIdentity[0]
       const fastIds = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: 'fast-sibling' }
       const fast = delayed.run({ ...fastIds, missionBinding: core.bindCanonicalMissionForChild(delayed.projection, { ...delayed.record, ...fastIds, sourceRequestHash: delayed.projection.sourceRequestHash, requestEnvelopeHash: delayed.record.dispatch.requestPointer.hash }) })
@@ -146,15 +149,15 @@ async function runScenario(provider) {
       await assert.rejects(pending, { code: 'CHILD_CANCELLED' }); fastResult = await fast; good(fastResult); assert.deepEqual(delayed.owner.ownershipIdentities(), [])
     } finally { await delayed.close() }
     command(f, originalTool)
-    const frozen = path.join(f.root, 'frozen'), checkerScratch = path.join(f.root, 'checker'); fs.mkdirSync(frozen); fs.mkdirSync(checkerScratch); for (const name of ['tmp', 'output', 'cache']) fs.mkdirSync(path.join(checkerScratch, name))
+    const frozen = privateDirectory(path.join(f.root, 'frozen')), checkerScratch = privateDirectory(path.join(f.root, 'checker')); for (const name of ['tmp', 'output', 'cache']) privateDirectory(path.join(checkerScratch, name))
     const frozenFile = path.join(frozen, 'candidate.txt'); fs.writeFileSync(frozenFile, f.marker)
     const checkerBoundary = { schemaVersion: 1, capability: native.sha256('opencode-kilo-checker'), runId: 'closed-checker', checkerId: `${provider}-checker`, candidateHash: native.sha256(f.marker), frozenCandidateRoot: frozen, writableScratchRoot: checkerScratch, temporaryRoot: path.join(checkerScratch, 'tmp'), outputRoot: path.join(checkerScratch, 'output'), cacheRoot: path.join(checkerScratch, 'cache') }
-    command(f, `cat ${quote(frozenFile)}; printf checked > ${quote(path.join(checkerScratch, 'checked.txt'))}; if printf wrong > ${quote(frozenFile)} 2>/dev/null; then exit 19; fi`)
+    command(f, `${readCommand(frozenFile)}; ${nodeCommand(`require('node:fs').writeFileSync(${JSON.stringify(path.join(checkerScratch, 'checked.txt'))}, 'checked'); try { require('node:fs').writeFileSync(${JSON.stringify(frozenFile)}, 'wrong'); process.exit(19) } catch {}`)}`)
     const checker = new HarnessExecAdapter({ provider, runner: f.adapter.runner, nativeRoot: f.nativeRoot, executableBinding: f.binding, targetPath: checkerScratch, connection: connection(f.service), credentialEnvironment: { OPENAI_API_KEY: '<local-test-only>', KILO_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only controller checker tools and return one JSON object.', checkerScratchVerifier: () => checkerBoundary })
     const checkerRecord = { ...f.record, sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', workingDirectory: checkerScratch, canonicalTargetPath: frozen, candidateHash: checkerBoundary.candidateHash, checkerScratchBoundary: checkerBoundary, physicalExecutionPolicy: { logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', sandboxMode: 'read-only', canDispatch: false, resourceSets: { read: [], write: [], exclusive: [] } } }
-    checkerRecord.environment = prepareProcessLaunchEnvironment(createPosixProcessAdapter(), checkerRecord.reservationId, { PATH: process.env.PATH }); checkerRecord.signal = AbortSignal.timeout(90000); checkerRecord.missionBinding = core.bindCanonicalMissionForChild(f.projection, { ...checkerRecord, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }); const checked = await checker.launch(checkerRecord); good(checked)
+    checkerRecord.environment = prepareProcessLaunchEnvironment(f.processAdapter, checkerRecord.reservationId, nativeEnvironment()); checkerRecord.signal = AbortSignal.timeout(90000); checkerRecord.missionBinding = core.bindCanonicalMissionForChild(f.projection, { ...checkerRecord, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }); const checked = await checker.launch(checkerRecord); good(checked)
     assert.equal(fs.readFileSync(frozenFile, 'utf8'), f.marker); assert.equal(fs.readFileSync(path.join(checkerScratch, 'checked.txt'), 'utf8'), 'checked')
-    const registry = JSON.parse(fs.readFileSync(f.registryPath, 'utf8')); assert.ok(JSON.stringify(registry).includes(`native-${provider}-`)); const completedOwner = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: f.registryPath, pollMs: 10 }); await completedOwner.recoverReservations(); assert.deepEqual(completedOwner.ownershipIdentities(), [])
+    const registry = JSON.parse(fs.readFileSync(f.registryPath, 'utf8')); assert.ok(JSON.stringify(registry).includes(`native-${provider}-`)); const completedOwner = new ProcessOwner({ adapter: nativeProcessAdapter(f.registryPath, path.dirname(f.registryPath)), registryPath: f.registryPath, pollMs: 10 }); await completedOwner.recoverReservations(); assert.deepEqual(completedOwner.ownershipIdentities(), [])
     const recovery = await f.run({ sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID() }); good(recovery); assert.deepEqual(f.owner.ownershipIdentities(), [])
     const receiptHash = first.toolBoundaryEvidence.receiptHashes[0]
     const witnesses = {
@@ -199,7 +202,7 @@ const capabilityChecks = Object.freeze({
 
 for (const provider of Object.keys(providers)) {
   for (const capability of Object.keys(capabilityChecks)) {
-    test(`${provider} closed native capability: ${capability}`, { skip: !providers[provider] || process.platform === 'win32', timeout: closedNativeCapabilityTimeout(provider) }, async () => {
+    test(`${provider} closed native capability: ${capability}`, { skip: !providers[provider], timeout: closedNativeCapabilityTimeout(provider) }, async () => {
       const value = (await witnessesFor(provider))[capability]
       assert.ok(value, `missing real witness for ${provider}/${capability}`)
       capabilityChecks[capability](value)
@@ -236,7 +239,7 @@ for (const [provider, cli] of Object.entries(providers)) test(`${provider} nativ
   }
 })
 
-test('kilo OpenRouter Chat projection restores the configured Luna cap before exact quota admission', { skip: !providers.kilo || process.platform === 'win32', timeout: 180000 }, async t => {
+test('kilo OpenRouter Chat projection restores the configured Luna cap before exact quota admission', { skip: !providers.kilo, timeout: 180000 }, async t => {
   const f = await scenario('kilo', { connection: { providerId: 'openrouter', modelId: 'openai/gpt-5.6-luna', npm: '@ai-sdk/openai-compatible' } })
   t.after(() => f.close())
   const upstream = f.adapter.connection.providers.openrouter.options.baseURL
@@ -275,7 +278,7 @@ test('kilo OpenRouter Chat projection restores the configured Luna cap before ex
   assert.deepEqual(result.usage, debits.at(-1).cumulative)
 })
 
-test('kilo OpenRouter selector projects its configured model id before exact quota admission', { skip: !providers.kilo || process.platform === 'win32', timeout: 180000 }, async t => {
+test('kilo OpenRouter selector projects its configured model id before exact quota admission', { skip: !providers.kilo, timeout: 180000 }, async t => {
   const f = await scenario('kilo', { connection: { providerId: 'openrouter', modelId: 'selector', wireModelId: 'openai/gpt-5.6-luna', npm: '@ai-sdk/openai-compatible' } })
   t.after(() => f.close())
   const upstream = f.adapter.connection.providers.openrouter.options.baseURL
@@ -297,7 +300,7 @@ test('kilo OpenRouter selector projects its configured model id before exact quo
   assert.ok(outbound.every(body => body.model === 'openai/gpt-5.6-luna'))
 })
 
-test('kilo OpenAI Responses profile preserves GPT-5 output cap but requests encrypted reasoning state', { skip: !providers.kilo || process.platform === 'win32', timeout: 180000 }, async t => {
+test('kilo OpenAI Responses profile preserves GPT-5 output cap but requests encrypted reasoning state', { skip: !providers.kilo, timeout: 180000 }, async t => {
   const f = await scenario('kilo', { connection: { providerId: 'openrouter', modelId: 'openai/gpt-5.6-luna', npm: '@ai-sdk/openai' }, serviceOptions: { responses: true, noTool: true } })
   t.after(() => f.close())
   const result = await f.run({ assignment: { model: 'openrouter/openai/gpt-5.6-luna', effort: 'low' } })

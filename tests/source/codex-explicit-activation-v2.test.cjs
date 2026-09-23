@@ -330,7 +330,7 @@ test('parser exposes canonical activation plus the explicit Codex compatibility 
   })
   assert.equal(staleAlias.status, 1)
   assert.match(staleAlias.stderr, /PROVIDER_UNSUPPORTED.*compatibility-alias-telemetry-path-unregistered/)
-  assert.throws(() => parseArgs(['activate', 'codex', 'fix it']), /requires `--`/)
+  assert.deepEqual(parseArgs(['activate', 'codex', 'fix it']).missionArgs, ['fix it'])
   assert.deepEqual(
     parseArgs(['activate', 'codex', '--', '  leading ', '', 'trailing  ']).missionArgs,
     ['  leading ', '', 'trailing  '],
