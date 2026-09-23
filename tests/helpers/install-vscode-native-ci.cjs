@@ -82,16 +82,26 @@ function extract(archive, destination) {
   }
 }
 
+function physicalFile(file, label) {
+  const stat = fs.lstatSync(file)
+  assert.ok(stat.isFile() && !stat.isSymbolicLink(), `${label} must be a physical regular file: ${file}`)
+  assert.equal(fs.realpathSync.native(file), file, `${label} must not resolve through a link: ${file}`)
+  return file
+}
 function findExecutable(root) {
   if (process.platform === 'win32') {
-    const executable = path.join(root, 'Code.exe')
-    assert.ok(fs.statSync(executable).isFile(), `VS Code executable missing: ${executable}`)
-    return { executable, bundleRoot: root }
+    const executable = physicalFile(path.join(root, 'Code.exe'), 'VS Code executable')
+    const cliCandidates = fs.readdirSync(root, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && /^[a-f0-9]{10,64}$/i.test(entry.name))
+      .map(entry => path.join(root, entry.name, 'resources', 'app', 'out', 'cli.js'))
+      .filter(file => { try { physicalFile(file, 'VS Code release-hash CLI'); return true } catch { return false } })
+    assert.equal(cliCandidates.length, 1, `VS Code archive must contain exactly one physical release-hash CLI: ${root}`)
+    return { executable, cli: cliCandidates[0], bundleRoot: root }
   }
   const app = path.join(root, 'Visual Studio Code.app')
-  const executable = path.join(app, 'Contents', 'MacOS', 'Code')
-  assert.ok(fs.statSync(executable).isFile(), `VS Code macOS Code executable missing: ${executable}`)
-  return { executable, bundleRoot: app }
+  const executable = physicalFile(path.join(app, 'Contents', 'MacOS', 'Code'), 'VS Code macOS Code executable')
+  const cli = physicalFile(path.join(app, 'Contents', 'Resources', 'app', 'out', 'cli.js'), 'VS Code macOS CLI')
+  return { executable, cli, bundleRoot: app }
 }
 
 function bundleIdentity(bundleRoot) {
@@ -156,4 +166,4 @@ async function install({ platform = process.platform, arch = process.arch } = {}
 
 if (require.main === module) install().then(result => process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1 })
 
-module.exports = { VERSION, ARTIFACTS, targetFor, install, bundleIdentity }
+module.exports = { VERSION, ARTIFACTS, targetFor, install, findExecutable, bundleIdentity }

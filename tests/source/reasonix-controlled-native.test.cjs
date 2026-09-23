@@ -12,7 +12,7 @@ const readline = require('node:readline')
 const test = require('node:test')
 const toml = require('@iarna/toml')
 const native = require('../../agents/reasonix/workflow/native.js')
-const { ReasonixEventStream, ReasonixExecAdapter, prepareReasonixBoundary } = require('../../agents/reasonix/workflow/transport.js')
+const { ReasonixEventStream, ReasonixExecAdapter, prepareReasonixBoundary, reasonixProcessEnvironment } = require('../../agents/reasonix/workflow/transport.js')
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const { validateJsonSchema } = require('../../agents/codex/workflow/json-schema-validator.js')
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
@@ -260,6 +260,20 @@ if (require.main === module) {
       '--policy', prepared.policyPath, '--sha256', prepared.policySha256])
     assert.equal(config.sandbox.bash, 'enforce'); assert.equal(config.sandbox.network, false)
     for (const name of native.CONTROLLED_TOOLS) assert.ok(controlled.decodeToolName('reasonix', name))
+  })
+
+  test('Reasonix Windows reservations share one private OS cache for native workspace leases', t => {
+    const f = fixture(t)
+    const first = reasonixProcessEnvironment({ environment: { PATH: 'fixture', LocalAppData: 'C:\\ambient-user-cache' }, credentials: { FIXTURE_KEY: 'secret' },
+      home: path.join(f.root, 'home-one'), sessionRoot: path.join(f.root, 'session-one'), nativeRoot: f.nativeRoot, platform: 'win32' })
+    const second = reasonixProcessEnvironment({ environment: { PATH: 'fixture', LOCALAPPDATA: 'C:\\other-ambient-cache' },
+      home: path.join(f.root, 'home-two'), sessionRoot: path.join(f.root, 'session-two'), nativeRoot: f.nativeRoot, platform: 'win32' })
+    assert.equal(first.LOCALAPPDATA, path.join(f.nativeRoot, 'windows-user-cache'))
+    assert.equal(second.LOCALAPPDATA, first.LOCALAPPDATA)
+    assert.equal(Object.keys(first).some(name => name !== 'LOCALAPPDATA' && name.toUpperCase() === 'LOCALAPPDATA'), false)
+    assert.equal(fs.realpathSync.native(first.LOCALAPPDATA), first.LOCALAPPDATA)
+    assert.equal(first.REASONIX_HOME, path.join(f.root, 'home-one'))
+    assert.equal(first.FIXTURE_KEY, 'secret')
   })
 
   test('Reasonix projects a closed six-capability call envelope for the generic native proxy', () => {

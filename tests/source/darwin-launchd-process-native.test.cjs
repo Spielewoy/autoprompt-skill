@@ -107,6 +107,37 @@ test('Darwin missing-service proof rejects arbitrary failures and mismatched liv
   assert.equal(sameMissingServiceResponse(actual, 'owned', { ...reference, stderr: 'domain unavailable' }, 'never-created'), false)
 })
 
+test('Darwin launchd absence polling waits for the exact owned service to leave a live domain', () => {
+  const { waitForAbsentService } = require('../../agents/codex/workflow/darwin-launchd-process.js')
+  const request = { domain: 'gui/501', label: 'com.autoprompt.owned.fixture' }
+  const missing = name => ({ status: 113, stdout: '', stderr: `Bad request.\nCould not find service "${name}" in domain for user gui: 501\n`, error: undefined, signal: null })
+  let ownedPrints = 0, clock = 0, pauses = 0
+  const launchctl = argv => {
+    const target = argv[1]
+    if (target === request.domain) return { status: 0, stdout: 'live domain', stderr: '', error: undefined, signal: null }
+    const label = target.slice(request.domain.length + 1)
+    if (label !== request.label) return missing(label)
+    ownedPrints++
+    return ownedPrints === 1
+      ? { status: 0, stdout: 'still registered', stderr: '', error: undefined, signal: null }
+      : missing(label)
+  }
+  const observed = waitForAbsentService(request, launchctl, {
+    timeoutMs: 100, pollMs: 10, now: () => clock,
+    pause(milliseconds) { pauses++; clock += milliseconds },
+  })
+  assert.equal(observed.absent, true)
+  assert.equal(ownedPrints, 2)
+  assert.equal(pauses, 1)
+
+  const denied = waitForAbsentService(request, () => ({ status: 1, stdout: '', stderr: 'Operation not permitted', error: undefined, signal: null }), {
+    timeoutMs: 0, pollMs: 10, now: () => 0, pause() { assert.fail('zero-bound proof must not pause') },
+  })
+  assert.equal(denied.absent, false)
+  assert.equal(denied.diagnostic.phase, 'domain')
+  assert.equal(denied.diagnostic.domain.stderr, 'Operation not permitted')
+})
+
 test('Darwin launchd plist uses the explicitly bound controller Node executable', () => {
   const { launchPlist } = require('../../agents/codex/workflow/darwin-launchd-process.js')
   const node = '/private/controller/node<&'

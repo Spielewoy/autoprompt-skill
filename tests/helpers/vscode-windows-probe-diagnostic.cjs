@@ -23,7 +23,20 @@ function resolveLayout(executable = process.env.AUTOPROMPT_VSCODE_TEST_CLI) {
   assert.ok(typeof executable === 'string' && path.isAbsolute(executable), 'AUTOPROMPT_VSCODE_TEST_CLI must be absolute')
   const code = fs.realpathSync.native(executable)
   assert.equal(path.basename(code).toLowerCase(), 'code.exe', 'diagnostic executable must be Code.exe')
-  const root = path.dirname(code), cli = path.join(root, 'resources', 'app', 'out', 'cli.js')
+  const root = path.dirname(code)
+  const directCli = path.join(root, 'resources', 'app', 'out', 'cli.js')
+  let cli = directCli
+  if (!fs.existsSync(cli)) {
+    // 1.136.1's official Windows archive keeps Code.exe at its extraction
+    // root while placing resources beneath its immutable release hash. Bind
+    // only that one physical direct child; do not recursively discover a CLI.
+    const candidates = fs.readdirSync(root, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && /^[a-f0-9]{10,64}$/i.test(entry.name))
+      .map(entry => path.join(root, entry.name, 'resources', 'app', 'out', 'cli.js'))
+      .filter(file => { try { const stat = fs.lstatSync(file); return stat.isFile() && !stat.isSymbolicLink() && fs.realpathSync.native(file) === file } catch { return false } })
+    assert.equal(candidates.length, 1, `VS Code archive must contain exactly one physical release-hash CLI: ${root}`)
+    cli = candidates[0]
+  }
   assert.ok(fs.statSync(cli).isFile(), `VS Code CLI is missing: ${cli}`)
   return { code, cli }
 }

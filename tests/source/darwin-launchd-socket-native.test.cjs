@@ -87,8 +87,11 @@ test('Darwin launchd socket activation retains an exact loopback listener throug
   const boot = command('/bin/launchctl', ['bootstrap', domain, plist]); assert.equal(boot.status, 0, boot.stderr); bootstrapped = true
   await waitFor(() => fs.existsSync(ready), 30000, 'launchd socket worker did not publish readiness')
   const value = JSON.parse(fs.readFileSync(ready, 'utf8')); assert.ok(Number.isInteger(value.pid) && value.pid > 0); assert.equal(value.port, port)
-  const other = await listen('127.0.0.1'), ipv6Other = await listen('::1'), hostile = await listen('127.0.0.2', port)
-  t.after(async () => { await close(other); await close(ipv6Other); await close(hostile) })
+  const listeners = []
+  t.after(async () => { for (const listener of listeners) await close(listener) })
+  const other = await listen('127.0.0.1'); listeners.push(other)
+  const ipv6Other = await listen('::1'); listeners.push(ipv6Other)
+  const hostile = await listen('127.0.0.2', port); listeners.push(hostile)
   const profile = seatbeltProfile(executable, port)
   const probe = (mode, host, port) => command('/usr/bin/sandbox-exec', ['-p', profile, executable, mode, host, String(port)])
   const unsandboxed = (mode, host, port) => command(executable, [mode, host, String(port)])

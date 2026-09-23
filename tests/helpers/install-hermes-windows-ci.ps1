@@ -30,7 +30,39 @@ $hermesHome = Join-Path $OutputRoot 'home'
 $install = Join-Path $hermesHome 'hermes-agent'
 $log = Join-Path $OutputRoot 'official-installer.log'
 $url = "https://github.com/NousResearch/hermes-agent/archive/$commit.zip"
-Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $archive
+function Invoke-PinnedHermesArchiveDownload {
+    param([string] $Uri, [string] $Destination)
+    $attempts = 3
+    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $Destination
+            return
+        } catch {
+            $status = 0
+            $response = $null
+            $responseProperty = $_.Exception.PSObject.Properties['Response']
+            if ($null -ne $responseProperty) { $response = $responseProperty.Value }
+            if ($null -ne $response) {
+                try { $status = [int]$response.StatusCode } catch { $status = 0 }
+            }
+            if ($attempt -ge $attempts -or ($status -ne 429 -and $status -ne 503)) { throw }
+            $delay = 0
+            try {
+                $retryAfter = $response.Headers.RetryAfter
+                if ($null -ne $retryAfter -and $null -ne $retryAfter.Delta) {
+                    $delay = [Math]::Ceiling($retryAfter.Delta.TotalSeconds)
+                } elseif ($null -ne $retryAfter -and $null -ne $retryAfter.Date) {
+                    $delay = [Math]::Ceiling(($retryAfter.Date - [DateTimeOffset]::UtcNow).TotalSeconds)
+                }
+            } catch { $delay = 0 }
+            if ($delay -le 0) { $delay = [Math]::Pow(2, $attempt) }
+            $delay = [int][Math]::Min(30, [Math]::Max(1, $delay))
+            Start-Sleep -Seconds $delay
+        }
+    }
+    throw 'Pinned Hermes archive download exhausted its bounded retry budget'
+}
+Invoke-PinnedHermesArchiveDownload -Uri $url -Destination $archive
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -cne $archiveSha256) {
     throw 'Pinned Hermes source archive hash changed'
 }

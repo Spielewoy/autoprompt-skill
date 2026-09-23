@@ -18,7 +18,7 @@ const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 const { modelService } = require('../helpers/harness-native-service.cjs')
-const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment, cleanupNativeFixture } = require('../helpers/native-platform.cjs')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment, cleanupNativeFixture, waitForNativeObservation } = require('../helpers/native-platform.cjs')
 
 const selectedNativeCli = provider => process.env[`AUTOPROMPT_${provider.toUpperCase()}_TEST_CLI`] ? requiredNativeCli(provider) : undefined
 if (process.env.AUTOPROMPT_REQUIRE_NATIVE_TESTS === '1' && !process.env.AUTOPROMPT_OPENCODE_TEST_CLI && !process.env.AUTOPROMPT_KILO_TEST_CLI) throw new Error('AUTOPROMPT_OPENCODE_TEST_CLI or AUTOPROMPT_KILO_TEST_CLI is required; native certification cannot skip')
@@ -33,7 +33,6 @@ const CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS = Object.freeze({ default: 300_000, ki
 function closedNativeCapabilityTimeout(provider) {
   return process.platform === 'win32' ? 900_000 : CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS[provider] || CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS.default
 }
-function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
 function closedCanaryBinding(provider) {
   const fields = ['AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT', 'AUTOPROMPT_CLOSED_CANARY_PROVIDER', 'AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID', 'AUTOPROMPT_CLOSED_CANARY_GENERATION', 'AUTOPROMPT_CLOSED_CANARY_CHALLENGE']
@@ -163,17 +162,25 @@ async function runScenario(provider) {
     let siblings; try { siblings = await Promise.all([0, 1].map(index => { const ids = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: `sibling-${index}` }; return f.run({ ...ids, missionBinding: core.bindCanonicalMissionForChild(f.projection, { ...f.record, ...ids, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }) }) })) } finally { clearInterval(monitor) }
     assert.ok(siblings.every(item => item.ok)); assert.equal(new Set(siblings.map(item => item.contextId)).size, 2); assert.ok(peak >= 2); assert.deepEqual(f.owner.ownershipIdentities(), [])
     const originalTool = f.service.tool.args.command; command(f, readCommand(f.candidate))
-    const delayed = await scenario(provider, { serviceOptions: { delayMessagesMs: 3500 } })
+    const delayed = await scenario(provider, { serviceOptions: { holdFirstMessage: true } })
     let pending, fastResult, recoveredLive
     try {
-      const abort = new AbortController(); pending = delayed.run({ signal: abort.signal }); for (let i = 0; i < 100 && delayed.service.requests.length === 0; i++) await sleep(10)
+      const abort = new AbortController(); pending = delayed.run({ signal: abort.signal }); pending.catch(() => {})
+      const observationMs = process.platform === 'win32' ? 180000 : 60000
+      await waitForNativeObservation(pending, () => delayed.service.firstMessageHeld, observationMs, 'the held native model response before recovery')
       const recoveredOwner = new ProcessOwner({ adapter: nativeProcessAdapter(delayed.registryPath, path.dirname(delayed.registryPath)), registryPath: delayed.registryPath, pollMs: 10 }); await recoveredOwner.recoverReservations()
       const heldIdentity = recoveredOwner.ownershipIdentities(); assert.equal(heldIdentity.length, 1, 'fresh owner did not recover the persisted live child'); recoveredLive = heldIdentity[0]
       const fastIds = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: 'fast-sibling' }
       const fast = delayed.run({ ...fastIds, missionBinding: core.bindCanonicalMissionForChild(delayed.projection, { ...delayed.record, ...fastIds, sourceRequestHash: delayed.projection.sourceRequestHash, requestEnvelopeHash: delayed.record.dispatch.requestPointer.hash }) })
-      for (let i = 0; i < 100 && delayed.owner.ownershipIdentities().length < 2; i++) await sleep(10)
+      fast.catch(() => {})
+      await waitForNativeObservation(fast, () => delayed.owner.ownershipIdentities().length >= 2, observationMs, 'both owned native children before recovery cancellation')
       assert.ok(delayed.owner.ownershipIdentities().length >= 2, 'fast sibling did not overlap the held native child')
-      await recoveredOwner.cancelAll({ reason: 'fresh-owner crash recovery', graceMs: 0, killMs: 2000, waitForPending: true }); abort.abort()
+      const heldRecord = recoveredOwner.listRecords().find(record => record.reservationId === delayed.record.reservationId && record.groupIdentity === recoveredLive.id)
+      assert.ok(heldRecord?.ownershipId, 'fresh owner must bind cancellation to the recovered held group')
+      const heldTerminal = await recoveredOwner.cancelGroup(heldRecord.ownershipId, { reason: 'fresh-owner crash recovery', graceMs: 0, killMs: 2000 })
+      assert.equal(heldTerminal.status, 'CANCELLED')
+      assert.equal(heldTerminal.groupIdentity, recoveredLive.id)
+      abort.abort()
       await assert.rejects(pending, { code: 'CHILD_CANCELLED' }); fastResult = await fast; good(fastResult); assert.deepEqual(delayed.owner.ownershipIdentities(), [])
     } finally { await delayed.close() }
     command(f, originalTool)

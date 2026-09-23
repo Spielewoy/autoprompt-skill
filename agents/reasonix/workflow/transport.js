@@ -411,6 +411,27 @@ function prepareReasonixBoundary({ nativeRoot, launchRoot, record, targetPath, s
   return prepared
 }
 
+function reasonixProcessEnvironment({ environment = {}, credentials = {}, home, sessionRoot, nativeRoot, platform = process.platform }) {
+  const projected = Object.fromEntries(Object.entries({ ...environment, ...credentials })
+    .filter(([name]) => platform !== 'win32' || name.toUpperCase() !== 'LOCALAPPDATA'))
+  Object.assign(projected, {
+    HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, 'xdg-config'),
+    XDG_STATE_HOME: path.join(sessionRoot, 'xdg-state'), XDG_CACHE_HOME: path.join(sessionRoot, 'xdg-cache'),
+    REASONIX_HOME: home, REASONIX_STATE_HOME: path.join(sessionRoot, 'state'), REASONIX_CACHE_HOME: path.join(sessionRoot, 'cache'),
+  })
+  if (platform === 'win32') {
+    // Reasonix v1.30 deliberately resolves its cross-process workspace lease
+    // through Go's OS user-cache lookup, ignoring REASONIX_CACHE_HOME. The
+    // isolated child has no ambient LocalAppData, so provide one shared by all
+    // Reasonix reservations in this private controller root. The native CLI
+    // appends its own reasonix/workspace-leases subtree.
+    const windowsUserCache = path.join(nativeRoot, 'windows-user-cache')
+    privateDirectory(windowsUserCache)
+    projected.LOCALAPPDATA = windowsUserCache
+  }
+  return projected
+}
+
 class ReasonixExecAdapter {
   constructor(options = {}) {
     if (!options.runner?.run || !options.runner?.stop || !options.nativeRoot || !options.connection || !options.executableBinding) {
@@ -500,10 +521,8 @@ class ReasonixExecAdapter {
       dispatch: core.modelVisibleDispatch(record.dispatch, { canonicalAssignment: Boolean(record.canonicalAssignment), canonicalMission: mission, missionBinding: record.missionBinding }),
       assignment: record.canonicalAssignment,
     })
-    const environment = { ...record.environment, ...this.credentialEnvironment,
-      HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, 'xdg-config'),
-      XDG_STATE_HOME: path.join(sessionRoot, 'xdg-state'), XDG_CACHE_HOME: path.join(sessionRoot, 'xdg-cache'),
-      REASONIX_HOME: home, REASONIX_STATE_HOME: path.join(sessionRoot, 'state'), REASONIX_CACHE_HOME: path.join(sessionRoot, 'cache') }
+    const environment = reasonixProcessEnvironment({ environment: record.environment, credentials: this.credentialEnvironment,
+      home, sessionRoot, nativeRoot: this.nativeRoot })
     const signal = record.signal || record.abortSignal
     const abort = () => stop(new ReasonixError('CHILD_CANCELLED', 'Reasonix execution was aborted'))
     if (signal?.aborted) throw new ReasonixError('CHILD_CANCELLED', 'Reasonix execution was aborted before launch')
@@ -596,4 +615,4 @@ class ReasonixExecAdapter {
   }
 }
 
-module.exports = { ReasonixEventStream, ReasonixExecAdapter, controlledToolProtocolProjection, nativeContextRoot, persistNativeContext, prepareReasonixBoundary, reasonixQuotaConnection }
+module.exports = { ReasonixEventStream, ReasonixExecAdapter, controlledToolProtocolProjection, nativeContextRoot, persistNativeContext, prepareReasonixBoundary, reasonixProcessEnvironment, reasonixQuotaConnection }

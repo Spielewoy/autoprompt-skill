@@ -192,11 +192,29 @@ function locateExecutable({ provider, env = process.env, executable, platform = 
   }
   fail('PROVIDER_UNSUPPORTED', `${d.command} is not installed or executable`, { provider, command: d.command })
 }
+function vscodeReleaseCliCandidates(root) {
+  try {
+    root = fs.realpathSync.native(root)
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && /^[a-f0-9]{10,64}$/i.test(entry.name))
+      .map(entry => path.join(root, entry.name, 'resources', 'app', 'out', 'cli.js'))
+      .filter(candidate => {
+        try {
+          const stat = fs.lstatSync(candidate)
+          return stat.isFile() && !stat.isSymbolicLink() && fs.realpathSync.native(candidate) === candidate
+        } catch { return false }
+      })
+  } catch { return [] }
+}
 function vscodeBundleRoot(executable) {
   for (let dir = path.resolve(executable), i = 0; i < 8; dir = path.dirname(dir), i++) {
     const app = path.join(dir, 'resources', 'app')
     if (fs.existsSync(path.join(app, 'product.json')) && fs.existsSync(path.join(app, 'package.json'))) return fs.realpathSync.native(dir)
     if (path.basename(dir).endsWith('.app') && fs.existsSync(path.join(dir, 'Contents', 'Resources', 'app', 'product.json')) && fs.existsSync(path.join(dir, 'Contents', 'Resources', 'app', 'package.json'))) return fs.realpathSync.native(dir)
+    // The official Windows 1.136.1 archive keeps Code.exe at extraction root
+    // and ships the application under its release-hash child. Treat that root
+    // as one bundle only when precisely one physical child has the CLI layout.
+    if (i === 1 && vscodeReleaseCliCandidates(dir).length === 1) return fs.realpathSync.native(dir)
     if (path.dirname(dir) === dir) break
   }
   return null
@@ -204,6 +222,33 @@ function vscodeBundleRoot(executable) {
 function bundlePathInside(root, file) {
   const relative = path.relative(root, file)
   return !relative || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+}
+function vscodeCliPath(executable) {
+  const resolvedExecutable = fs.realpathSync.native(executable)
+  const bundle = vscodeBundleRoot(resolvedExecutable)
+  if (bundle) {
+    const relative = path.basename(bundle).endsWith('.app')
+      ? path.join('Contents', 'Resources', 'app', 'out', 'cli.js')
+      : path.join('resources', 'app', 'out', 'cli.js')
+    const candidate = path.join(bundle, relative)
+    try {
+      const stat = fs.lstatSync(candidate)
+      if (stat.isFile() && !stat.isSymbolicLink() && fs.realpathSync.native(candidate) === candidate) return candidate
+    } catch {}
+    const candidates = vscodeReleaseCliCandidates(bundle)
+    return candidates.length === 1 ? candidates[0] : null
+  }
+  // The official 1.136.1 Windows archive places Code.exe at its extraction
+  // root while resources live beneath the release commit directory. Bind one
+  // physical immediate child only; arbitrary recursive CLI discovery is unsafe.
+  const root = fs.realpathSync.native(path.dirname(resolvedExecutable))
+  const direct = path.join(root, 'resources', 'app', 'out', 'cli.js')
+  try {
+    const stat = fs.lstatSync(direct)
+    if (stat.isFile() && !stat.isSymbolicLink() && fs.realpathSync.native(direct) === direct) return direct
+  } catch {}
+  const candidates = vscodeReleaseCliCandidates(root)
+  return candidates.length === 1 ? candidates[0] : null
 }
 function runtimeDependencyIdentity(executable, environment = process.env, invocation = null) {
   const roots = new Set(), files = new Map()
@@ -1166,11 +1211,8 @@ function probeExecutable(options = {}) {
     const env = isolatedEnvironment(probeRoot, options.env || process.env)
     const spawn = options.spawnSync || cp.spawnSync
     const invoke = argv => {
-      const bundle = options.provider === 'vscode' ? vscodeBundleRoot(binding.path) : null
-      const vscodeCli = options.provider === 'vscode'
-        ? path.join(bundle || path.dirname(binding.path), bundle && path.basename(bundle).endsWith('.app') ? 'Contents/Resources/app/out/cli.js' : 'resources/app/out/cli.js')
-        : null
-      const nativeArgv = options.provider === 'vscode' && fs.existsSync(vscodeCli) ? [vscodeCli, ...argv] : argv
+      const vscodeCli = options.provider === 'vscode' ? vscodeCliPath(binding.path) : null
+      const nativeArgv = vscodeCli ? [vscodeCli, ...argv] : argv
       const nativeEnv = nativeArgv === argv ? env : { ...env, ELECTRON_RUN_AS_NODE: '1' }
       const launch = executableInvocation(binding, nativeArgv)
       const result = spawn(launch.executable, launch.argv, { cwd: probeRoot, env: nativeEnv, shell: false, encoding: 'utf8', timeout, maxBuffer: 1024 * 1024, windowsHide: true })
@@ -1615,4 +1657,4 @@ function createLaunch(options) {
     ...(windowsTempDirectory ? { windowsTempDirectory } : {}),
     ...(requiredResponseFormat ? { requiredResponseFormat } : {}) }
 }
-module.exports = { windowsNpmShimInvocation, runtimeDependencyIdentity, portableRuntimeDependencyIdentity, hermesPythonDependencyInventory, hermesRuntimeDependencyIdentity, hermesPortableRuntimeDependencyIdentity, validateEffort, PROVIDERS, HarnessError, fail, descriptor, locateExecutable, executableSha256, executableRuntimePath, executableInvocation, probeExecutable, deepseekSdkCapabilityEvidence, connectionConfig, sanitizeConnection, credentialEnvironment, isolatedEnvironment, createLaunch, readBound, sha256, privateDirectory, writePrivate }
+module.exports = { windowsNpmShimInvocation, vscodeCliPath, runtimeDependencyIdentity, portableRuntimeDependencyIdentity, hermesPythonDependencyInventory, hermesRuntimeDependencyIdentity, hermesPortableRuntimeDependencyIdentity, validateEffort, PROVIDERS, HarnessError, fail, descriptor, locateExecutable, executableSha256, executableRuntimePath, executableInvocation, probeExecutable, deepseekSdkCapabilityEvidence, connectionConfig, sanitizeConnection, credentialEnvironment, isolatedEnvironment, createLaunch, readBound, sha256, privateDirectory, writePrivate }

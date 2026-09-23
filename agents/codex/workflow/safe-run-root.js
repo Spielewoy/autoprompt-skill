@@ -172,8 +172,12 @@ function windowsTokenProfileFolders(systemRoot) {
       env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32') },
     })
     if (result.error || result.signal || result.status !== 0 || result.stderr) {
-      throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token known folders could not be resolved', {
+      const diagnostic = {
         status: result.status, signal: result.signal, cause: result.error && result.error.code,
+        stderr: String(result.stderr || '').replace(/[\r\n]+/g, ' ').slice(0, 1024),
+      }
+      throw new RunRecordError('PRIVACY_UNSUPPORTED', `The current Windows token known folders could not be resolved (${JSON.stringify(diagnostic)})`, {
+        ...diagnostic,
       })
     }
     let parsed
@@ -412,7 +416,9 @@ function windowsControllerEnvironment(systemRoot, temporary) {
   const profile = inspectPathNoFollow(profileHome), appData = inspectPathNoFollow(appDataPath), roaming = inspectPathNoFollow(roamingAppData), local = inspectPathNoFollow(localAppData)
   if (!profile.exists || !profile.realpath || !appData.exists || !appData.realpath || !roaming.exists || !roaming.realpath || !local.exists || !local.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile folders are unavailable')
   const tempPath = temporary || path.join(local.realpath, 'Temp'), temp = inspectPathNoFollow(tempPath)
-  if (!temp.exists || !temp.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows controller temporary folder is unavailable')
+  if (!temp.exists || !temp.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', `Windows controller temporary folder is unavailable (${JSON.stringify({ path: tempPath, nearestExisting: temp.nearestExisting || null })})`, {
+    path: tempPath, nearestExisting: temp.nearestExisting || null,
+  })
   const parsed = path.win32.parse(profileHome)
   if (!/^[A-Za-z]:\\$/u.test(parsed.root)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile drive is unavailable')
   return { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '', USERPROFILE: profile.realpath, HOME: profile.realpath, HOMEDRIVE: parsed.root.slice(0, 2), HOMEPATH: profileHome.slice(2), APPDATA: roaming.realpath, LOCALAPPDATA: local.realpath, TEMP: temp.realpath, TMP: temp.realpath }

@@ -92,7 +92,13 @@ async function scenario(t, options = {}) {
       ...Object.fromEntries(['DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR'].filter(name => process.env[name]).map(name => [name, process.env[name]])),
     })
     record.signal = overrides.signal || AbortSignal.timeout(120000)
-    return f.execution.launch(record)
+    try { return await f.execution.launch(record) } catch (error) {
+      // The runner's durable transcript remains private under the fixture root.
+      // Emit bounded raw bytes only for failed native probes, so CI can distinguish
+      // a provider startup failure from a controller-side classification.
+      t.diagnostic(JSON.stringify({ vscodeNativeFailure: { code: error?.code || null, message: error?.message || String(error), proxy: f.proxyDiagnostic() } }))
+      throw error
+    }
   }
   return f
 }

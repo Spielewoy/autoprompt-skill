@@ -316,7 +316,7 @@ for (const provider of ['prime', 'omp']) {
       candidateHash: checker.candidateHash, checkerScratchBoundary: checker, physicalExecutionPolicy: { logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', sandboxMode: 'read-only', canDispatch: false, resourceSets: { read: [], write: [], exclusive: [] } } }
     const adapter = new HarnessExecAdapter({ provider, runner: f.runner, nativeRoot: f.nativeRoot, executableBinding: f.binding, targetPath: scratch, connection: connection(f.service),
       credentialEnvironment: { OPENAI_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only controller checker tools.', checkerScratchVerifier: () => checker })
-    record.environment = prepareProcessLaunchEnvironment(f.processAdapter, record.reservationId, { PATH: process.env.PATH }); record.signal = AbortSignal.timeout(90000)
+    record.environment = prepareProcessLaunchEnvironment(f.processAdapter, record.reservationId, nativeEnvironment()); record.signal = AbortSignal.timeout(90000)
     let result
     try { result = await adapter.launch(record) }
     catch (error) { fixtureFailureDiagnostic(f, error); throw error }

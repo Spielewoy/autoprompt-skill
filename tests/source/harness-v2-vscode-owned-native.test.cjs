@@ -14,6 +14,24 @@ const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/
 const { privateDirectory, nativeProcessAdapter, nativeEnvironment, nodeCommand, cleanupNativeFixture, drainNativeCommandOwners } = require('../helpers/native-platform.cjs')
 const enabled = Boolean(process.env.AUTOPROMPT_VSCODE_TEST_CLI)
 
+function boundedProxyFile(file) {
+  try {
+    const stat = fs.lstatSync(file)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 32 * 1024) return null
+    return { bytes: stat.size, base64: fs.readFileSync(file).toString('base64') }
+  } catch { return null }
+}
+function proxyDiagnostic(runner) {
+  const directories = fs.readdirSync(runner.controlRoot, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && /^[a-f0-9]{32}$/.test(entry.name))
+    .map(entry => path.join(runner.controlRoot, entry.name))
+  return directories.map(directory => ({
+    stdout: boundedProxyFile(path.join(directory, 'stdout.jsonl')),
+    stderr: boundedProxyFile(path.join(directory, 'stderr.log')),
+    status: boundedProxyFile(path.join(directory, 'status.json')),
+    proxyError: boundedProxyFile(path.join(directory, 'proxy-error.json')),
+  }))
+}
 function closedBinding() {
   const names = ['AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT', 'AUTOPROMPT_CLOSED_CANARY_PROVIDER', 'AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID', 'AUTOPROMPT_CLOSED_CANARY_GENERATION', 'AUTOPROMPT_CLOSED_CANARY_CHALLENGE']
   const value = Object.fromEntries(names.map(name => [name, process.env[name]]))
@@ -79,7 +97,8 @@ async function fixture(t, options = {}) {
       close: async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) },
     })
   })
-  return { root, target, controller, scratch, nativeRoot, record, requests, errors, runner, execution }
+  return { root, target, controller, scratch, nativeRoot, record, requests, errors, runner, execution,
+    proxyDiagnostic: () => proxyDiagnostic(runner) }
 }
 
 if (require.main === module) test('real VS Code owned BYOK session executes controlled tools, bills exact usage, and resumes privately', { skip: !enabled, timeout: 150000 }, async t => {

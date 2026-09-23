@@ -17,7 +17,7 @@ const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
-const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment, cleanupNativeFixture } = require('../helpers/native-platform.cjs')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment, cleanupNativeFixture, waitForNativeObservation } = require('../helpers/native-platform.cjs')
 const { modelService } = require('../helpers/harness-native-service.cjs')
 
 const CLI = process.env.AUTOPROMPT_DEEPSEEK_TEST_CLI || null
@@ -174,17 +174,26 @@ async function runScenario(provider) {
     let siblings; f.nativePhase = 'concurrent-siblings'; try { siblings = await Promise.all([0, 1].map(index => { const ids = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: `sibling-${index}` }; return f.run({ ...ids, missionBinding: core.bindCanonicalMissionForChild(f.projection, { ...f.record, ...ids, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }) }, `concurrent-sibling-${index}`) })) } finally { clearInterval(monitor) }
     assert.ok(siblings.every(item => item.ok)); assert.equal(new Set(siblings.map(item => item.contextId)).size, 2); assert.ok(peak >= 2); assert.deepEqual(f.owner.ownershipIdentities(), [])
     const originalTool = f.service.tool.args.command; command(f, readCommand(f.candidate))
-    const delayed = await scenario(provider, { serviceOptions: { delayMessagesMs: 3500 } })
+    const delayed = await scenario(provider, { serviceOptions: { holdFirstMessage: true } })
     let pending, fastResult, recoveredLive
     try {
-      const abort = new AbortController(); pending = delayed.run({ signal: abort.signal }, 'cancellation-held'); for (let i = 0; i < 100 && delayed.service.requests.length === 0; i++) await sleep(10)
+      const abort = new AbortController(); pending = delayed.run({ signal: abort.signal }, 'cancellation-held'); pending.catch(() => {})
+      const waitForHeldMessageMs = process.platform === 'win32' ? 180000 : 15000
+      await waitForNativeObservation(pending, () => delayed.service.firstMessageHeld, waitForHeldMessageMs, 'the held DeepSeek model response')
+      assert.equal(delayed.service.firstMessageHeld, true, 'the first DeepSeek response must be held before recovery and cancellation')
       const recoveredOwner = new ProcessOwner({ adapter: nativeProcessAdapter(delayed.registryPath, path.dirname(delayed.registryPath)), registryPath: delayed.registryPath, pollMs: 10 }); await recoveredOwner.recoverReservations()
       const heldIdentity = recoveredOwner.ownershipIdentities(); assert.equal(heldIdentity.length, 1, 'fresh owner did not recover the persisted live child'); recoveredLive = heldIdentity[0]
+      const recoveredGroup = [...recoveredOwner.groups.values()].find(record => record.reservationId === delayed.record.reservationId)
+      assert.ok(recoveredGroup && recoveredGroup.groupIdentity === recoveredLive.id, 'fresh owner did not bind the held reservation to its recovered group')
       const fastIds = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: 'fast-sibling' }
       delayed.nativePhase = 'cancellation-fast-sibling'; const fast = delayed.run({ ...fastIds, missionBinding: core.bindCanonicalMissionForChild(delayed.projection, { ...delayed.record, ...fastIds, sourceRequestHash: delayed.projection.sourceRequestHash, requestEnvelopeHash: delayed.record.dispatch.requestPointer.hash }) }, 'cancellation-fast-sibling')
-      for (let i = 0; i < 100 && delayed.owner.ownershipIdentities().length < 2; i++) await sleep(10)
-      assert.ok(delayed.owner.ownershipIdentities().length >= 2, 'fast sibling did not overlap the held native child')
-      await recoveredOwner.cancelAll({ reason: 'fresh-owner crash recovery', graceMs: 0, killMs: 2000, waitForPending: true }); abort.abort()
+      fast.catch(() => {})
+      await waitForNativeObservation(fast, () => delayed.owner.ownershipIdentities().length >= 2, waitForHeldMessageMs, 'both owned DeepSeek children')
+      assert.equal(delayed.owner.ownershipIdentities().length, 2, 'fast sibling did not overlap the held native child')
+      const recoveredTerminal = await recoveredOwner.cancelGroup(recoveredGroup.ownershipId, { reason: 'fresh-owner crash recovery', graceMs: 0, killMs: 2000 })
+      assert.equal(recoveredTerminal.status, 'CANCELLED', 'fresh owner did not durably drain the recovered held group')
+      assert.equal(recoveredTerminal.groupIdentity, recoveredLive.id, 'fresh owner terminal receipt changed the recovered group identity')
+      abort.abort()
       await assert.rejects(pending, { code: 'CHILD_CANCELLED' }); fastResult = await fast; good(fastResult); assert.deepEqual(delayed.owner.ownershipIdentities(), [])
     } finally { await delayed.close() }
     command(f, originalTool)

@@ -36,7 +36,7 @@ on:
         default: false
         type: boolean
       support_single:
-        description: 'Limit focused Windows provider diagnostics to x64'
+        description: 'Limit focused Windows or macOS provider diagnostics to x64'
         required: false
         default: false
         type: boolean
@@ -1113,9 +1113,14 @@ jobs:
           node --test --test-reporter=tap tests/source/darwin-command-sandbox.test.cjs 2>&1 | tee darwin-command-sandbox.log
       - name: Diagnose durable launchd listener ownership for Grok
         if: ${{ !cancelled() }}
+        timeout-minutes: 3
         shell: bash
         run: |
           set -o pipefail
+          # macOS only accepts configured loopback aliases. This disposable
+          # runner alias is a live hostile endpoint for the exact-host test.
+          sudo -n /sbin/ifconfig lo0 alias 127.0.0.2
+          trap 'sudo -n /sbin/ifconfig lo0 -alias 127.0.0.2' EXIT
           node --test --test-reporter=tap tests/source/darwin-launchd-socket-native.test.cjs 2>&1 | tee darwin-launchd-socket.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
@@ -1225,7 +1230,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.support_host == 'windows' && inputs.support_arm == true && '[{"os":"windows-11-arm","arch":"arm64"}]' || inputs.support_host == 'windows' && inputs.support_single == true && '[{"os":"windows-latest","arch":"x64"}]' || inputs.support_host == 'linux' && '[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"}]' || inputs.support_host == 'macos' && '[{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"}]' || '[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}]') }}
+        runner: ${{ fromJSON(inputs.support_host == 'windows' && inputs.support_arm == true && '[{"os":"windows-11-arm","arch":"arm64"}]' || inputs.support_host == 'windows' && inputs.support_single == true && '[{"os":"windows-latest","arch":"x64"}]' || inputs.support_host == 'linux' && '[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"}]' || inputs.support_host == 'macos' && inputs.support_single == true && '[{"os":"macos-15-intel","arch":"x64"}]' || inputs.support_host == 'macos' && '[{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"}]' || '[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}]') }}
     runs-on: ${{ matrix.runner.os }}
     timeout-minutes: 60
     env:

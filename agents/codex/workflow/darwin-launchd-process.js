@@ -17,7 +17,12 @@ const kind = 'darwin-launchd-coalition'
 const digest = value => crypto.createHash('sha256').update(value).digest('hex')
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 function requestDigest(request) { const body = { ...request }; delete body.checksum; return digest(stableStringify(body)) }
-function fail(code, message) { const error = new Error(message); error.code = code; throw error }
+function fail(code, message, details) {
+  const error = new Error(details ? `${message}: ${JSON.stringify(details).slice(0, 2048)}` : message)
+  error.code = code
+  if (details) error.details = details
+  throw error
+}
 function readPrivate(file) {
   const item = fs.lstatSync(file)
   if (!item.isFile() || item.isSymbolicLink() || item.nlink !== 1 || item.mode & 0o077 || item.size > 1024 * 1024) fail('PROCESS_IDENTITY_INVALID', 'Darwin control record is not one bounded private file')
@@ -120,6 +125,51 @@ function sameMissingServiceResponse(remaining, label, reference, missingLabel) {
   const expected = normalize(reference, missingLabel)
   return expected !== null && remaining.status === reference.status && normalize(remaining, label) === expected
 }
+function launchctlSummary(result) {
+  return {
+    status: Number.isInteger(result?.status) ? result.status : null,
+    signal: typeof result?.signal === 'string' ? result.signal : null,
+    error: typeof result?.error?.code === 'string' ? result.error.code.slice(0, 64) : null,
+    stdoutBytes: Buffer.byteLength(String(result?.stdout || '')),
+    stderr: String(result?.stderr || '').replace(/[\r\n]+/g, ' ').slice(0, 512),
+  }
+}
+function observeAbsentService(request, launchctlCall) {
+  const domain = launchctlCall(['print', request.domain])
+  if (domain.status !== 0 || domain.error || domain.signal) {
+    return { absent: false, diagnostic: { phase: 'domain', domain: launchctlSummary(domain) } }
+  }
+  // launchctl's named-service errors use its own status namespace, not
+  // errno. Bind the complete response to a fresh, never-bootstrapped label
+  // in the same live domain instead of treating any nonzero exit as absent.
+  const missingLabel = `com.autoprompt.absence.${crypto.randomUUID()}`
+  const reference = launchctlCall(['print', `${request.domain}/${missingLabel}`])
+  const remaining = launchctlCall(['print', `${request.domain}/${request.label}`])
+  return {
+    absent: sameMissingServiceResponse(remaining, request.label, reference, missingLabel),
+    diagnostic: { phase: 'service', domain: launchctlSummary(domain), reference: launchctlSummary(reference), remaining: launchctlSummary(remaining) },
+  }
+}
+function waitForAbsentService(request, launchctlCall, options = {}) {
+  // A bootout can race a job blocked in its bounded native identity probe.
+  // The production helper call is capped at ten seconds; spend a shorter,
+  // explicit post-bootout window proving that launchd removed this exact job.
+  const timeoutMs = options.timeoutMs ?? 5000
+  const pollMs = options.pollMs ?? 25
+  const now = options.now || Date.now
+  const pause = options.pause || (milliseconds => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds))
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || !Number.isSafeInteger(pollMs) || pollMs < 1) throw new TypeError('Invalid launchd absence polling bounds')
+  const deadline = now() + timeoutMs
+  let observation
+  do {
+    observation = observeAbsentService(request, launchctlCall)
+    if (observation.absent) return observation
+    const remaining = deadline - now()
+    if (remaining <= 0) break
+    pause(Math.min(pollMs, remaining))
+  } while (now() <= deadline)
+  return observation
+}
 function createDarwinCoalitionAdapter(options = {}) {
   if (process.platform !== 'darwin') fail('PROVIDER_UNSUPPORTED', 'Darwin launchd ownership requires native macOS')
   if (!path.isAbsolute(options.controlRoot || '')) fail('PROCESS_OWNER_CONFIG_INVALID', 'Darwin ownership requires a private control root')
@@ -164,22 +214,16 @@ function createDarwinCoalitionAdapter(options = {}) {
     return { dir, request, ready }
   }
   function launchctl(argv) { return cp.spawnSync('/bin/launchctl', argv, { shell: false, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024, env: { PATH: '/usr/bin:/bin', LANG: 'C' } }) }
-  function absentService(request) {
-    const domain = launchctl(['print', request.domain])
-    if (domain.status !== 0 || domain.error || domain.signal) return false
-    // launchctl's named-service errors use its own status namespace, not
-    // errno. Bind the complete response to a fresh, never-bootstrapped label
-    // in the same live domain instead of treating any nonzero exit as absent.
-    const missingLabel = `com.autoprompt.absence.${crypto.randomUUID()}`
-    const reference = launchctl(['print', `${request.domain}/${missingLabel}`])
-    const remaining = launchctl(['print', `${request.domain}/${request.label}`])
-    return sameMissingServiceResponse(remaining, request.label, reference, missingLabel)
-  }
   function stopJob(dir, request) {
     const job = `${request.domain}/${request.label}`
     const result = launchctl(['bootout', job])
-    if (result.error || result.signal) fail('PROCESS_DRAIN_TIMEOUT', 'Darwin launchd stop did not settle')
-    if (!absentService(request)) fail('PROCESS_DRAIN_TIMEOUT', 'Darwin launchd job absence was not established')
+    if (result.error || result.signal) fail('PROCESS_DRAIN_TIMEOUT', 'Darwin launchd stop did not settle', {
+      bootout: launchctlSummary(result),
+    })
+    const absence = waitForAbsentService(request, launchctl)
+    if (!absence.absent) fail('PROCESS_DRAIN_TIMEOUT', 'Darwin launchd job absence was not established', {
+      bootout: launchctlSummary(result), absence: absence.diagnostic,
+    })
     if (!fs.existsSync(files(dir).stopped)) writeExclusive(files(dir).stopped, { requestChecksum: request.checksum, bootUuid })
   }
   function activeTasks(ready) {
@@ -325,4 +369,4 @@ if (require.main === module) {
   if (process.argv.length !== 4 || process.argv[2] !== '--job' || process.platform !== 'darwin') process.exitCode = 64
   else runJob(process.argv[3]).catch(() => { process.exitCode = 1 })
 }
-module.exports = { createDarwinCoalitionAdapter, helperCall, launchPlist, sameMissingServiceResponse }
+module.exports = { createDarwinCoalitionAdapter, helperCall, launchPlist, sameMissingServiceResponse, observeAbsentService, waitForAbsentService }
