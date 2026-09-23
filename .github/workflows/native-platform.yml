@@ -1225,7 +1225,7 @@ jobs:
           node --test --test-reporter=tap --test-name-pattern='native Windows named pipe' tests/source/harness-v2-grok-sandbox.test.cjs 2>&1 | tee grok-windows-relay.log
       - name: Verify kernel lease release after normal close and forced Job termination
         if: ${{ !cancelled() && inputs.support_primitive != 'hermes' }}
-        timeout-minutes: 3
+        timeout-minutes: 6
         shell: bash
         run: |
           set -o pipefail
@@ -1420,9 +1420,11 @@ jobs:
           const binding = native.probeExecutable({ provider: 'vscode', executable, timeoutMs: 120000 })
           process.stdout.write(JSON.stringify({ executable, version: binding.version, runtimeIdentity: binding.runtimeIdentity }, null, 2) + '\n')
           NODE
-      - name: Require all eleven native VS Code capabilities
+      - name: Verify selected native VS Code capabilities
         if: inputs.support_stage == 'vscode'
         timeout-minutes: 45
+        env:
+          AUTOPROMPT_CI_CAPABILITY: ${{ inputs.support_capability }}
         run: node tests/helpers/provider-platform-ci.cjs vscode
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

@@ -72,6 +72,34 @@ test('production VS Code connection defaults to the bounded checker session budg
   assert.equal(native.connectionConfig('vscode', root, {}).timeoutMs, 180000)
 })
 
+test('VS Code short IPC argv keeps settings in the exact deep private user-data directory', { skip: process.platform === 'win32' }, t => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path')
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'vsi-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const home = path.join(root, 'deep'.repeat(40), 'home'), target = path.join(home, 'user-data')
+  fs.mkdirSync(target, { recursive: true, mode: 0o700 })
+  const alias = path.join(root, 'u')
+  fs.symlinkSync(target, alias, 'dir')
+  const options = { home, sessionRoot: root, targetPath: root, prompt: 'fixture', input: '{}',
+    connection: { model: 'fixture' }, toolBoundary: { policyPath: '/bound/policy.json', policySha256: 'a'.repeat(64) },
+    vscodeUserDataDir: alias }
+  const { project } = require('../../scripts/harness-v2-vscode-config.cjs')
+  const environment = {}, argv = project(options, environment)
+  assert.equal(argv[argv.indexOf('--user-data-dir') + 1], alias)
+  assert.ok(Buffer.byteLength(path.join(alias, '1.13-main.sock')) < 103)
+  assert.ok(Buffer.byteLength(path.join(target, '1.13-main.sock')) > 103)
+  assert.deepEqual(fs.readFileSync(path.join(alias, 'User', 'settings.json')),
+    fs.readFileSync(path.join(target, 'User', 'settings.json')))
+  assert.equal(environment.TMPDIR, path.join(alias, 't'))
+  assert.equal(environment.TEMP, environment.TMPDIR)
+  assert.equal(environment.TMP, environment.TMPDIR)
+  assert.equal(fs.realpathSync.native(environment.TMPDIR), path.join(target, 't'))
+  const foreign = path.join(root, 'foreign'); fs.mkdirSync(foreign)
+  fs.unlinkSync(alias); fs.symlinkSync(foreign, alias, 'dir')
+  assert.throws(() => project(options, {}), { code: 'PROFILE_INVALID' })
+  assert.throws(() => project({ ...options, vscodeUserDataDir: target }, {}), { code: 'PROFILE_INVALID' })
+})
+
 test('owned VS Code stream never accepts built-in chat identities, foreign tools or duplicate billing', () => {
   assert.throws(() => new HarnessEventStream('vscode').push(JSON.stringify({ type: 'owned.session', sessionId: 'built-in', contextKind: 'vscode-chat' })), { code: 'SESSION_ID_MISMATCH' })
   const stream = new HarnessEventStream('vscode')

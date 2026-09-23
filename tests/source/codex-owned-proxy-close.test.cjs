@@ -172,6 +172,7 @@ test('owned Codex proxy publishes status only after inherited output closes and 
   })
   const sessionId = 'delayed-output-session'
   const reservationId = crypto.randomUUID()
+  const launchBindingHash = crypto.createHash('sha256').update(`ipc-alias:${reservationId}`).digest('hex')
   let request = null
   const launchOwned = owner.launch.bind(owner)
   owner.launch = async spec => {
@@ -200,6 +201,7 @@ test('owned Codex proxy publishes status only after inherited output closes and 
     stdin: '',
     sessionId,
     reservationId,
+    launchBindingHash,
     onStdoutLine(line) {
       lineCount += 1
       accumulator.push(line, lineCount)
@@ -236,4 +238,7 @@ test('owned Codex proxy publishes status only after inherited output closes and 
   })
   await owner.assertTargetDrained('delayed-output-target')
   await owner.assertDrained()
+  const binding = { sessionId, reservationId, targetKey: 'delayed-output-target', launchBindingHash }
+  const receipt = await owner.issueBoundDrainReceipt(binding)
+  assert.equal(owner.verifyBoundDrainReceipt(receipt, binding), true)
 })

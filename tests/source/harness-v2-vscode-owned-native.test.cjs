@@ -70,6 +70,27 @@ async function fixture(t, options = {}) {
       let text = ''; for await (const chunk of req) text += chunk
       const body = JSON.parse(text); requests.push(body)
       assert.equal(req.headers.authorization, 'Bearer local-fixture')
+      if (process.platform === 'darwin' && requests.length === 1) {
+        const contexts = path.join(nativeRoot, 'vscode')
+        const directories = parent => fs.readdirSync(parent).filter(name => /^[a-f0-9]{64}$/.test(name)).map(name => path.join(parent, name))
+        let proved = 0
+        for (const context of directories(contexts)) for (const launchRoot of directories(context)) {
+          const file = path.join(launchRoot, 'vscode-ipc-alias.json')
+          if (!fs.existsSync(file)) continue
+          const journal = require('../../agents/codex/workflow/event-log.js').readChecksummedJson(file)
+          if (journal.state !== 'RESERVATION_ENTERED') continue
+          const sockets = fs.readdirSync(journal.target.path).filter(name => name.endsWith('-main.sock'))
+          if (!sockets.length) continue // A concurrent sibling can still be starting.
+          assert.equal(sockets.length, 1)
+          assert.equal(fs.realpathSync.native(journal.link.path), path.join(launchRoot, 'home', 'user-data'))
+          assert.equal(fs.lstatSync(path.join(journal.target.path, sockets[0])).isSocket(), true)
+          assert.ok(Buffer.byteLength(path.join(journal.link.path, sockets[0])) < 103)
+          assert.ok(Buffer.byteLength(path.join(journal.target.path, sockets[0])) >= 103)
+          proved++
+        }
+        assert.ok(proved > 0, 'real VS Code must expose its main IPC socket in deep private user-data')
+        t.diagnostic('Real macOS VS Code main IPC is socket-bound through the short alias into deep private storage')
+      }
       if (options.gate) await options.gate(requests.length)
       if (typeof options.respond === 'function') {
         await options.respond({ req, res, body, requests, root, target, controller, nativeRoot, scratch })
@@ -89,11 +110,15 @@ async function fixture(t, options = {}) {
   t.after(async () => {
     if (process.env.AUTOPROMPT_VSCODE_TEST_KEEP) {
       await owner.cancelAll({ reason: 'VS Code native test cleanup', graceMs: 0, killMs: 2000 })
+      await execution.recoverResources({ requireDrained: true })
       await drainNativeCommandOwners(nativeRoot, 'vscode', record)
       server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); t.diagnostic(root); return
     }
     await cleanupNativeFixture({ root, nativeRoot, record }, 'vscode', {
-      stop: () => owner.cancelAll({ reason: 'VS Code native test cleanup', graceMs: 0, killMs: 2000 }),
+      stop: async () => {
+        await owner.cancelAll({ reason: 'VS Code native test cleanup', graceMs: 0, killMs: 2000 })
+        await execution.recoverResources({ requireDrained: true })
+      },
       close: async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) },
     })
   })

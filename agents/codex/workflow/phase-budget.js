@@ -10045,6 +10045,7 @@ class OwnedCodexProxyRunner {
       sessionId: spec.sessionId,
       reservationId: spec.reservationId,
       targetKey: this.targetKey,
+      ...(spec.launchBindingHash !== undefined ? { launchBindingHash: spec.launchBindingHash } : {}),
       forWork: false,
       ...(windowsTempDirectory ? { requireShortCwd: true } : {}),
     }) } catch (error) {

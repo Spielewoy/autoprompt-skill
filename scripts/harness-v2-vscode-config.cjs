@@ -33,6 +33,15 @@ function project(options, env) {
   if (options.effort !== undefined && options.effort !== null) connection.reasoningEffort = require('./harness-v2-native.cjs').validateEffort('vscode', options.effort)
   if (!connection.model) fail('VS Code owned BYOK execution needs an explicit model')
   if (!options.toolBoundary) fail('VS Code owned sessions require the controlled tool boundary')
+  const deepUserDataDir = path.join(options.home, 'user-data')
+  const userDataDir = options.vscodeUserDataDir === undefined ? deepUserDataDir : options.vscodeUserDataDir
+  if (options.vscodeUserDataDir !== undefined) {
+    if (typeof userDataDir !== 'string' || !path.isAbsolute(userDataDir) || userDataDir.includes('\0') ||
+        Buffer.byteLength(path.join(userDataDir, '0000-main.sock')) >= 103 ||
+        fs.realpathSync.native(userDataDir) !== fs.realpathSync.native(deepUserDataDir)) {
+      fail('VS Code IPC alias must address this exact private user-data directory within the socket path limit')
+    }
+  }
   const request = { version: 1, connection, connectionIdentityBaseUrl: options.providerConnectionIdentity?.baseUrl || connection.baseUrl, sessionRoot: options.sessionRoot, targetPath: options.targetPath,
     prompt: options.prompt, input: options.input, continuationId: options.continuationId || null,
     policyPath: options.toolBoundary.policyPath, policySha256: options.toolBoundary.policySha256,
@@ -48,8 +57,14 @@ function project(options, env) {
   const settingsRoot = path.join(options.home, 'user-data', 'User')
   fs.mkdirSync(settingsRoot, { recursive: true, mode: 0o700 })
   writePrivate(path.join(settingsRoot, 'settings.json'), JSON.stringify({ 'telemetry.telemetryLevel': 'off', 'update.mode': 'none', 'extensions.autoUpdate': false, 'extensions.autoCheckUpdates': false, 'workbench.startupEditor': 'none', 'security.workspace.trust.enabled': false }))
+  if (options.vscodeUserDataDir !== undefined) {
+    // VS Code's additional random IPC sockets use os.tmpdir(). Keep those
+    // lexical paths short too, with their bytes in the same private target.
+    fs.mkdirSync(path.join(deepUserDataDir, 't'), { mode: 0o700 })
+    env.TMPDIR = env.TMP = env.TEMP = path.join(userDataDir, 't')
+  }
   return ['--no-sandbox', '--disable-gpu', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust',
-    '--user-data-dir', path.join(options.home, 'user-data'), '--extensions-dir', path.join(options.home, 'extensions'),
+    '--user-data-dir', userDataDir, '--extensions-dir', path.join(options.home, 'extensions'),
     '--extensionDevelopmentPath', path.join(__dirname, 'harness-v2-bridge/vscode'),
     '--extensionTestsPath', path.join(__dirname, 'harness-v2-bridge/vscode/session-driver.cjs')]
 }

@@ -1247,6 +1247,42 @@ class HarnessExecAdapter {
     if (!options.runner?.run || !options.runner?.stop || !options.nativeRoot || !options.executableBinding || !(options.connection || options.config) || typeof options.rolePrompt !== 'function' || typeof options.outputSchemaResolver !== 'function') fail('PROVIDER_UNSUPPORTED', 'Native transport requires an owned runner, binding, configuration, role prompt, and schema resolver')
     Object.assign(this, options); this.connection = options.connection || options.config
   }
+  async recoverResources(options = {}) {
+    if (this.provider !== 'vscode' || process.platform !== 'darwin') return { cleaned: 0, retained: [] }
+    if (!this.ipcRecoveryPromise) {
+      this.ipcRecoveryPromise = (async () => {
+        const root = path.join(this.nativeRoot, 'vscode'), result = { cleaned: 0, retained: [] }
+        if (!fs.existsSync(root)) return result
+        privateDirectory(root)
+        const hashDirectories = parent => fs.readdirSync(parent, { withFileTypes: true }).filter(entry => /^[a-f0-9]{64}$/.test(entry.name)).map(entry => {
+          if (!entry.isDirectory() || entry.isSymbolicLink()) fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC discovery encountered a linked or non-directory reservation')
+          const directory = path.join(parent, entry.name); privateDirectory(directory); return directory
+        })
+        let count = 0
+        for (const context of hashDirectories(root)) for (const reservation of hashDirectories(context)) {
+          const journalPath = path.join(reservation, 'vscode-ipc-alias.json')
+          if (!fs.existsSync(journalPath)) continue
+          try {
+            const recovered = await require('./harness-v2-vscode-ipc-alias.cjs').recover({ journalPath, processOwner: this.runner.processOwner })
+            if (!recovered.alreadyCleaned) { result.cleaned++; count++ }
+          } catch (error) {
+            if (!['VSCODE_IPC_ALIAS_STATE_INVALID', 'PROCESS_IDENTITY_INVALID', 'PROCESS_DRAIN_TIMEOUT', 'OWNERSHIP_RECOVERY_PENDING', 'OWNERSHIP_RECOVERY_FATAL'].includes(error.code)) throw error
+            // A concurrent live sibling or an unresolved pre-crash reservation
+            // retains its alias. Fresh absence is never deletion authority.
+            result.retained.push({ journalPath, code: error.code })
+            count++
+          }
+          if (count > 4096) fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC outstanding journal discovery exceeded its bound')
+        }
+        return result
+      })()
+    }
+    const pending = this.ipcRecoveryPromise
+    let result
+    try { result = await pending } finally { if (this.ipcRecoveryPromise === pending) this.ipcRecoveryPromise = null }
+    if (options.requireDrained && result.retained.length) fail('PROCESS_DRAIN_TIMEOUT', 'VS Code IPC aliases still require exact process-drain authority', result)
+    return result
+  }
   async launch(record) {
     // Capture the primitive once so the native configuration and host-only
     // compaction projection cannot diverge across asynchronous launch work.
@@ -1278,6 +1314,7 @@ class HarnessExecAdapter {
     if (!controlled.PROVIDERS.includes(this.provider) || !(this.runner instanceof core.OwnedCodexProxyRunner)) {
       fail('NATIVE_EXECUTION_BOUNDARY_UNAVAILABLE', 'Native execution requires the owned process runner and a controlled tool projection')
     }
+    await this.recoverResources()
     const sandbox = await boundary.probeCommandSandbox()
     if (!sandbox.supported) fail('NATIVE_EXECUTION_BOUNDARY_UNAVAILABLE', 'The controller command sandbox is unavailable', sandbox)
     const targetPath = path.resolve(record.workingDirectory || record.cwd || this.targetPath)
@@ -1367,7 +1404,7 @@ class HarnessExecAdapter {
     const abort = () => stop(new native.HarnessError('CHILD_CANCELLED', 'Native execution was aborted'))
     if (signal?.aborted) throw new native.HarnessError('CHILD_CANCELLED', 'Native execution was aborted before launch')
     signal?.addEventListener('abort', abort, { once: true })
-    let result
+    let result, vscodeIpcAlias = null, vscodeReservationEntered = false
     try {
       if (quotaEnabled) {
         const projection = quotaConnection(this.provider, this.connection, record.assignment?.model)
@@ -1387,7 +1424,17 @@ class HarnessExecAdapter {
               ? Math.min(4096, record.providerTokenLimit)
               : undefined
         : undefined
-      spec = native.createLaunch({ provider: this.provider, executable: native.executableRuntimePath(binding), home: path.join(launchRoot, 'home'), sessionRoot, cwd, targetPath: candidatePath, readOnly, commandBoundary, toolBoundary, toolFree: Boolean(routeProjection), prompt, input, continuationId: record.continuationId, connection: projectedConnection, credentials: this.credentialEnvironment, providerConnectionIdentity: this.connection, environment: record.environment, model: record.assignment?.model, effort: this.provider === 'grok' ? grokAssignedEffort : record.assignment?.effort, issuedCalls: preexistingIssuedCalls, proxyToken, maxTokens: nativeMaxTokens, outputSchema: ['claude', 'deepseek', 'grok', 'prime', 'omp'].includes(this.provider) || this.provider === 'vscode' && this.connection?.supportsStructuredOutput === true ? wireSchema : undefined, maxCompletionTokens: this.provider === 'grok' && Number.isSafeInteger(record.providerTokenLimit) && record.providerTokenLimit > 0 ? Math.min(4096, record.providerTokenLimit) : undefined })
+      if (this.provider === 'vscode' && process.platform === 'darwin') {
+        const home = path.join(launchRoot, 'home')
+        privateDirectory(path.join(home, 'user-data'))
+        vscodeIpcAlias = await require('./harness-v2-vscode-ipc-alias.cjs').prepare({
+          journalPath: path.join(launchRoot, 'vscode-ipc-alias.json'),
+          targetPath: path.join(home, 'user-data'),
+          binding: { sessionId: processSessionId, reservationId: record.reservationId, targetKey: this.runner.targetKey },
+          processOwner: this.runner.processOwner,
+        })
+      }
+      spec = native.createLaunch({ provider: this.provider, executable: native.executableRuntimePath(binding), home: path.join(launchRoot, 'home'), ...(vscodeIpcAlias ? { vscodeUserDataDir: vscodeIpcAlias.userDataDir } : {}), sessionRoot, cwd, targetPath: candidatePath, readOnly, commandBoundary, toolBoundary, toolFree: Boolean(routeProjection), prompt, input, continuationId: record.continuationId, connection: projectedConnection, credentials: this.credentialEnvironment, providerConnectionIdentity: this.connection, environment: record.environment, model: record.assignment?.model, effort: this.provider === 'grok' ? grokAssignedEffort : record.assignment?.effort, issuedCalls: preexistingIssuedCalls, proxyToken, maxTokens: nativeMaxTokens, outputSchema: ['claude', 'deepseek', 'grok', 'prime', 'omp'].includes(this.provider) || this.provider === 'vscode' && this.connection?.supportsStructuredOutput === true ? wireSchema : undefined, maxCompletionTokens: this.provider === 'grok' && Number.isSafeInteger(record.providerTokenLimit) && record.providerTokenLimit > 0 ? Math.min(4096, record.providerTokenLimit) : undefined })
       if (requiredResponseFormat && boundary.canonicalJson(spec.requiredResponseFormat) !== boundary.canonicalJson(requiredResponseFormat)) fail('PROVIDER_UNSUPPORTED', 'Pi native schema differs from its owned provider boundary')
       // Native configuration isolation discards inherited control-looking fields.
       // Recreate the owner's reservation marker from its trusted adapter only
@@ -1494,7 +1541,13 @@ class HarnessExecAdapter {
       if (signal?.aborted) throw new native.HarnessError('CHILD_CANCELLED', 'Native execution was aborted during launch preparation')
       runnerStarted = true
       const invocation = spec.executable ? null : native.executableInvocation(binding, spec.argv)
-      result = await this.runner.run({ ...spec, ...(this.provider === 'grok' ? { prepareLaunch } : {}), executable: spec.executable || invocation.executable, argv: spec.executable ? spec.argv : invocation.argv, sessionId: processSessionId, reservationId: record.reservationId, onTransportActivity: record.onTransportActivity, onStdoutLine: line => { try { if (this.provider === 'vscode') { const marker = line.indexOf('AUTOPROMPT_EVENT '); if (marker < 0) return; line = line.slice(marker + 'AUTOPROMPT_EVENT '.length) } stream.push(line) } catch (error) { stop(error) } } })
+      if (vscodeIpcAlias) {
+        // Mark before entering the runner: even a rejected launch can leave a
+        // pending physical spawn that only the exact ProcessOwner can drain.
+        vscodeIpcAlias.markReservationEntered()
+        vscodeReservationEntered = true
+      }
+      result = await this.runner.run({ ...spec, ...(vscodeIpcAlias ? { launchBindingHash: vscodeIpcAlias.launchBindingHash } : {}), ...(this.provider === 'grok' ? { prepareLaunch } : {}), executable: spec.executable || invocation.executable, argv: spec.executable ? spec.argv : invocation.argv, sessionId: processSessionId, reservationId: record.reservationId, onTransportActivity: record.onTransportActivity, onStdoutLine: line => { try { if (this.provider === 'vscode') { const marker = line.indexOf('AUTOPROMPT_EVENT '); if (marker < 0) return; line = line.slice(marker + 'AUTOPROMPT_EVENT '.length) } stream.push(line) } catch (error) { stop(error) } } })
       if (!streamError && this.provider === 'grok') stream.grokReconcileIssuedCalls(grokIssuedHistory)
       const completedOwnedNativeResult = result?.processOwned === true && result.exactArgv === true && result.drained === true
       let termination = null
@@ -1522,9 +1575,21 @@ class HarnessExecAdapter {
       }
       try { await boundary.drainDarwinCommandOwner(toolBoundary) } catch (error) { stop(error) }
     }
-    if (stopPromise) {
-      const stopped = await stopPromise
-      if (stopped?.drained !== true) fail('PROCESS_DRAIN_TIMEOUT', 'Native cancellation did not drain its owned process group')
+    try {
+      if (stopPromise) {
+        const stopped = await stopPromise
+        if (stopped?.drained !== true) fail('PROCESS_DRAIN_TIMEOUT', 'Native cancellation did not drain its owned process group')
+      }
+    } finally {
+      if (vscodeIpcAlias) {
+        try {
+          if (vscodeReservationEntered) await vscodeIpcAlias.release()
+          else await vscodeIpcAlias.abortBeforeReservation()
+        } catch (error) {
+          if (!streamError) streamError = error
+          else { try { Object.defineProperty(streamError, 'ipcAliasCleanupFailure', { value: error, enumerable: false, configurable: true }) } catch {} }
+        }
+      }
     }
     // A real relay/accounting or drain failure remains authoritative.  Only
     // the private relay's expected shutdown abort yields to the already-known

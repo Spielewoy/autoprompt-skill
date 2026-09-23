@@ -66,9 +66,24 @@ function physical(file,directory=false){
   }
   return canonical
 }
+function boundedFileLabel(file){return path.basename(file).replace(/[^A-Za-z0-9_.-]/g,'_').slice(0,96)||'unnamed'}
+function boundedStatValue(value){
+  const type=typeof value
+  if(type==='bigint'||type==='number'||type==='string')return `${type}:${String(value).slice(0,32)}`
+  return type
+}
+function fileByteBoundFailure(reason,file,before,max,expectedLength){
+  const expected=expectedLength===undefined?'none':String(expectedLength)
+  const error=Error(`file-byte-bound:${reason}:path=${boundedFileLabel(file)}:nlink=${boundedStatValue(before.nlink)}:size=${boundedStatValue(before.size)}:max=${max}:expected=${expected}`)
+  error.code='WINDOWS_WORKER_BUNDLE_INVALID'
+  throw error
+}
 function boundedFile(file,max,expectedLength){
   physical(file);const before=fs.lstatSync(file,{bigint:true})
-  need(before.nlink===1n&&before.size>=0n&&before.size<=BigInt(max)&&(expectedLength===undefined||before.size===BigInt(expectedLength)),'file-byte-bound')
+  // Do not coerce stat values: numeric values from a patched runtime are refused.
+  if(before.nlink!==1n)fileByteBoundFailure('link-count',file,before,max,expectedLength)
+  if(typeof before.size!=='bigint'||before.size<0n||before.size>BigInt(max))fileByteBoundFailure('max-size',file,before,max,expectedLength)
+  if(expectedLength!==undefined&&before.size!==BigInt(expectedLength))fileByteBoundFailure('expected-length',file,before,max,expectedLength)
   const fd=fs.openSync(file,fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW||0))
   try{
     need(sameStat(before,fs.fstatSync(fd,{bigint:true})),'file-open-changed')

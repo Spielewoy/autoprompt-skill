@@ -154,3 +154,26 @@ test('runtime mutation poison creates separate errors for concurrent command rec
  second.recovery={leaseId:'second'}
  assert.notEqual(first,second);assert.equal(first.recovery.leaseId,'first');assert.equal(second.workerFailure.message,'controller-node-changed');assert.equal(second.workerFailure.recovery,undefined)
 })
+
+test('bounded source files report a fail-closed link-count reason without revealing their path',t=>{
+ const x=setup(t),source=path.join(x.base,'windows-worker-capture.js'),alias=path.join(x.base,'capture-alias')
+ fs.linkSync(source,alias)
+ const available=x.api.staticAvailability()
+ assert.equal(available.available,false)
+ assert.match(available.code,/^file-byte-bound:link-count:path=windows-worker-capture\.js:nlink=bigint:2:size=bigint:\d+:max=4194304:expected=none$/)
+ assert.doesNotMatch(available.code,new RegExp(x.base.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')))
+})
+test('bounded source files report a fail-closed max-size reason',t=>{
+ const x=setup(t),source=path.join(x.base,'windows-worker-capture.js')
+ fs.appendFileSync(source,Buffer.alloc(5*1024*1024))
+ const available=x.api.staticAvailability()
+ assert.equal(available.available,false)
+ assert.match(available.code,/^file-byte-bound:max-size:path=windows-worker-capture\.js:nlink=bigint:1:size=bigint:\d+:max=4194304:expected=none$/)
+})
+test('bounded bootstrap files report a fail-closed expected-length reason',t=>{
+ const x=setup(t),source=path.join(x.base,'windows-worker','bootstrap','capture-x64.exe.config')
+ fs.appendFileSync(source,'x')
+ const available=x.api.staticAvailability()
+ assert.equal(available.available,false)
+ assert.match(available.code,/^file-byte-bound:expected-length:path=capture-x64\.exe\.config:nlink=bigint:1:size=bigint:\d+:max=1024:expected=15$/)
+})

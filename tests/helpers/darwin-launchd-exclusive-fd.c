@@ -105,7 +105,14 @@ static int checked_fd(launch_data_t sockets, const char *name, int family, in_po
   launch_data_t values, value; struct sockaddr_storage address; socklen_t length = sizeof(address); int reuse_address = -1, reuse_port = -1; socklen_t option_length = sizeof(int);
   if (!sockets || launch_data_get_type(sockets) != LAUNCH_DATA_DICTIONARY) { diagnostic("checkin-sockets-shape", EPROTO); return -1; }
   values = launch_data_dict_lookup(sockets, name);
-  if (!values || launch_data_get_type(values) != LAUNCH_DATA_ARRAY || launch_data_array_get_count(values) != 1 || !(value = launch_data_array_get_index(values, 0)) || launch_data_get_type(value) != LAUNCH_DATA_FD) { diagnostic("checkin-fd-shape", EPROTO); return -1; }
+  int values_type = values ? (int)launch_data_get_type(values) : -1;
+  size_t count = values_type == LAUNCH_DATA_ARRAY ? launch_data_array_get_count(values) : 0;
+  value = count > 0 ? launch_data_array_get_index(values, 0) : NULL;
+  int value_type = value ? (int)launch_data_get_type(value) : -1;
+  if (!values || values_type != LAUNCH_DATA_ARRAY || count != 1 || !value || value_type != LAUNCH_DATA_FD) {
+    fprintf(stderr, "exclusive-fd stage=checkin-fd-shape name=%s values-type=%d count=%zu value-type=%d expected-array=%d expected-fd=%d\n", name, values_type, count, value_type, (int)LAUNCH_DATA_ARRAY, (int)LAUNCH_DATA_FD);
+    return -1;
+  }
   int source = launch_data_get_fd(value), fd = source >= 0 ? dup(source) : -1;
   if (fd < 0) { diagnostic("checkin-fd-dup", errno); return -1; }
   if (getsockname(fd, (struct sockaddr *)&address, &length) != 0) { diagnostic("checkin-getsockname", errno); close(fd); return -1; }

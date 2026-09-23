@@ -181,9 +181,14 @@ function project({ provider, home, sessionRoot, connection, toolBoundary, prompt
   const nativeConnection = nativeConnectionProjection(provider, connection)
   privateDirectory(config); privateDirectory(sessions)
   writePrivate(path.join(config, provider === 'omp' ? 'models.yml' : 'models.json'), JSON.stringify({ providers: nativeConnection.providers || {} }))
-  writePrivate(path.join(config, provider === 'omp' ? 'config.yml' : 'settings.json'), JSON.stringify({
+  const privateSettings = {
     compaction: { enabled: false }, retry: { enabled: false }, extensions: [], packages: [],
-  }))
+    // OMP bounds extension tool_call handlers globally. Native Windows startup
+    // can exceed its 30s default; keep this controller-owned and out of any
+    // ambient user configuration. Prime has no corresponding setting.
+    ...(provider === 'omp' ? { extensionHandlers: { toolCallTimeoutMs: 180000 } } : {}),
+  }
+  writePrivate(path.join(config, provider === 'omp' ? 'config.yml' : 'settings.json'), JSON.stringify(privateSettings))
   env[provider === 'omp' ? 'PI_CODING_AGENT_DIR' : 'PRIME_AGENT_CODING_AGENT_DIR'] = config
   if (provider === 'prime') {
     // Prime 0.7.x routes print/json through its long-lived daemon by default.

@@ -10,12 +10,13 @@ const { ProcessOwner, createWindowsJobAdapter } = require('../../agents/codex/wo
 const { ensureWindowsPrivateAcl } = require('../../agents/codex/workflow/safe-run-root.js')
 const { POWERSHELL_SOURCE } = require('../../scripts/harness-v2-windows-tool-lease.cjs')
 
-test('PowerShell FileStream delete-on-close probe records host semantics for normal EOF and forced holder death', { timeout: 30000 }, async t => {
+test('PowerShell FileStream delete-on-close probe records host semantics for normal EOF and forced holder death', { timeout: 60000 }, async t => {
   const powershell = process.platform === 'win32'
     ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
     : process.env.AUTOPROMPT_TEST_PWSH || 'pwsh'
-  const available = childProcess.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'exit 0'], { timeout: 5000 })
-  if (available.status !== 0) return t.skip('PowerShell is unavailable')
+  const available = childProcess.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'exit 0'], { timeout: 30000 })
+  if (process.platform === 'win32') assert.equal(available.status, 0, `Native Windows PowerShell failed to start: ${available.error?.code || available.stderr?.toString().slice(-1024) || available.signal}`)
+  else if (available.status !== 0) return t.skip('PowerShell is unavailable')
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tool-lease-pwsh-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const deleted = []
@@ -43,7 +44,10 @@ test('PowerShell FileStream delete-on-close probe records host semantics for nor
   else t.diagnostic(`Non-Windows PowerShell DeleteOnClose observations (normal, forced): ${JSON.stringify(deleted)}; Windows admission is established only by the native Job test`)
 })
 
-test('native Windows forced process-tree termination releases the kernel-owned tool lease', { skip: process.platform !== 'win32', timeout: 60000 }, async t => {
+// Cold native ACL/PowerShell setup plus Job launch exceeded the old total
+// minute before the body could assert anything on both CI architectures.
+// Keep the actual readiness, cancellation and disappearance deadlines below.
+test('native Windows forced process-tree termination releases the kernel-owned tool lease', { skip: process.platform !== 'win32', timeout: 180000 }, async t => {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'tool-lease-native-')))
   ensureWindowsPrivateAcl(root)
   const lockPath = path.join(root, 'server.lock'), lockBytes = Buffer.from(JSON.stringify({ nonce: 'native-delete-on-close' }))
