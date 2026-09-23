@@ -78,7 +78,7 @@ function validateAdapter(adapter, options = {}) {
   for (const field of REQUIRED_PROCESS_CAPABILITIES) {
     if (capabilities[field] !== true) fail('PROVIDER_UNSUPPORTED', `process adapter lacks ${field}`)
   }
-  if (!['posix-process-group', 'windows-job-object', 'test'].includes(adapter.kind)) {
+  if (!['posix-process-group', 'windows-job-object', 'darwin-launchd-coalition', 'test'].includes(adapter.kind)) {
     fail('PROVIDER_UNSUPPORTED', 'process adapter kind is not a supported ownership primitive')
   }
   if (adapter.kind === 'test' && options.allowTestAdapter !== true) {

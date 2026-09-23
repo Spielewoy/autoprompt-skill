@@ -9800,7 +9800,7 @@ function appendBoundedByteTail(current, bytes, maximumBytes) {
 
 function readBoundedRegularFileTail(absolutePath, maximumBytes, label) {
   if (!fs.existsSync(absolutePath)) {
-    return Object.freeze({ text: '', byteCount: 0, truncated: false })
+    return Object.freeze({ text: '', base64: '', sha256: crypto.createHash('sha256').update(Buffer.alloc(0)).digest('hex'), byteCount: 0, truncated: false })
   }
   let descriptor
   try {
@@ -9820,6 +9820,8 @@ function readBoundedRegularFileTail(absolutePath, maximumBytes, label) {
     }
     return Object.freeze({
       text: bytes.subarray(0, readTotal).toString('utf8'),
+      base64: bytes.subarray(0, readTotal).toString('base64'),
+      sha256: stat.size === readTotal ? crypto.createHash('sha256').update(bytes.subarray(0, readTotal)).digest('hex') : null,
       byteCount: stat.size,
       truncated: stat.size > readTotal,
     })
@@ -10155,10 +10157,13 @@ class OwnedCodexProxyRunner {
         status: session.stopped ? 0 : status.code,
         signal: session.stopped ? 'OWNED_STOP' : status.signal,
         stdout: stdoutTail.toString('utf8'),
+        stdoutBase64: stdoutTail.toString('base64'),
         stdoutByteCount: offset,
         stdoutSha256: stdoutHash.digest('hex'),
         stdoutTruncated: offset > stdoutTail.length,
         stderr: stderr.text,
+        stderrBase64: stderr.base64,
+        stderrSha256: stderr.sha256,
         stderrByteCount: stderr.byteCount,
         stderrTruncated: stderr.truncated,
         processOwned: true,

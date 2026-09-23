@@ -1066,25 +1066,45 @@ jobs:
       matrix:
         os: [macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.x
+      - run: npm ci --ignore-scripts
       - name: Exercise kernel process grouping and detached descendants
         shell: bash
         run: |
           set -o pipefail
           export AUTOPROMPT_DARWIN_COALITION_EVIDENCE="$RUNNER_TEMP/darwin-coalition-proof.json"
           node --test --test-reporter=tap scripts/darwin-coalition-proof/coalition-proof.test.cjs 2>&1 | tee darwin-coalition-proof.log
+      - name: Exercise durable coalition ownership and kernel task counts
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          export AUTOPROMPT_DARWIN_PROCESS_EVIDENCE="$RUNNER_TEMP/darwin-launchd-process-evidence.json"
+          node --test --test-reporter=tap tests/source/darwin-launchd-process-native.test.cjs 2>&1 | tee darwin-launchd-process.log
+      - name: Exercise native command isolation and cancellation
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          export AUTOPROMPT_DARWIN_COMMAND_EVIDENCE_DIR="$RUNNER_TEMP"
+          node --test --test-reporter=tap tests/source/darwin-command-sandbox.test.cjs 2>&1 | tee darwin-command-sandbox.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: coalition-${{ matrix.os }}
           path: |
             darwin-coalition-proof.log
+            darwin-launchd-process.log
+            darwin-command-sandbox.log
             ${{ runner.temp }}/darwin-coalition-proof.json
+            ${{ runner.temp }}/darwin-launchd-process-evidence.json
+            ${{ runner.temp }}/darwin-command-sandbox-evidence.json
+            ${{ runner.temp }}/darwin-coalition-helper
           if-no-files-found: error
 
   windows-bootstrap:

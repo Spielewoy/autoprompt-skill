@@ -321,7 +321,7 @@ function runProof() {
     const auditTokenSignalsBound = stopAuditSignal.signalResult === 0 &&
       continueAuditSignal.signalResult === 0 && rootKillAuditSignal.signalResult === 0 &&
       trustedRootKilled;
-    const staleAuditTokenRejected = staleAuditSignal.signalResult === -1 &&
+    const staleAuditTokenRejected = staleAuditSignal.signalResult === 3 &&
       staleAuditSignal.signalErrno === 3;
     const oldCoalitionRecovered = emptyScans >= 2 &&
       recoveryCensuses.every(censusCertifiesCompleteEnumeration) &&

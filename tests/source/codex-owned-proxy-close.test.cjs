@@ -128,6 +128,7 @@ test('owned Codex proxy publishes status only after inherited output closes and 
     "    { type: 'turn.completed', usage: { input_tokens: 13, cached_input_tokens: 5, output_tokens: 3, reasoning_output_tokens: 2 } },",
     '  ]',
     "  fs.writeSync(1, `${events.map(JSON.stringify).join('\\n')}\\n`)",
+    '  fs.writeSync(2, Buffer.from([255, 0, 10]))',
     '}',
     'function awaitRootExit() {',
     '  if (rootIsAlive()) { setTimeout(awaitRootExit, 5); return }',
@@ -222,6 +223,9 @@ test('owned Codex proxy publishes status only after inherited output closes and 
   assert.equal(fs.existsSync(request.statusPath), true)
   assert.equal(execution.status, 0)
   assert.equal(execution.drained, true)
+  assert.deepEqual(Buffer.from(execution.stderrBase64, 'base64'), Buffer.from([255, 0, 10]))
+  assert.equal(execution.stderrSha256, crypto.createHash('sha256').update(Buffer.from([255, 0, 10])).digest('hex'))
+  assert.equal(execution.stdoutSha256, crypto.createHash('sha256').update(Buffer.from(execution.stdoutBase64, 'base64')).digest('hex'))
   assert.equal(lineCount, 3)
   assert.deepEqual(parsed.output, finalOutput)
   assert.deepEqual(parsed.usage, {

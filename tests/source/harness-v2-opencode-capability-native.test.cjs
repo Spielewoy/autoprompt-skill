@@ -26,10 +26,12 @@ const providers = Object.freeze({ opencode: selectedNativeCli('opencode'), kilo:
 // These shared scenarios include held/cancelled lifecycle cases. Kilo's
 // serial witness and OpenCode's parallel witness exceed five minutes; the
 // latter completed in 374 seconds with all functional witnesses available.
-// Both allowances remain below the canary's independent 720-second authority.
+// Windows cold AppContainer setup completed every witness in 753 seconds.
+// Its 900-second scenario allowance stays below the canary batch deadline;
+// individual launches and controller cancellation retain their own bounds.
 const CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS = Object.freeze({ default: 300_000, kilo: 420_000, opencode: 420_000 })
 function closedNativeCapabilityTimeout(provider) {
-  return process.platform === 'win32' ? 720_000 : CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS[provider] || CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS.default
+  return process.platform === 'win32' ? 900_000 : CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS[provider] || CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS.default
 }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
