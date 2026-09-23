@@ -139,6 +139,7 @@ test('native Windows worker clone uses short registered storage and cleanup reta
   fs.mkdirSync(activationRoot, { recursive: true })
   activationRoot = fs.realpathSync.native(activationRoot)
   assert.ok(activationRoot.length > 300, `fixture activation path was only ${activationRoot.length} characters`)
+  const privateRoot = path.join(activationRoot, 'worker-workspaces')
   const fakeHome = path.join(activationRoot, 'fake-home')
   fs.mkdirSync(fakeHome)
   const rawEnvironment = {
@@ -147,9 +148,17 @@ test('native Windows worker clone uses short registered storage and cleanup reta
     USERPROFILE: fakeHome,
     XDG_CONFIG_HOME: path.join(fakeHome, '.config'),
   }
-  const configIsolationPath = path.join(activationRoot, 'gitconfig')
-  const ghConfigDir = path.join(activationRoot, 'gh')
+  // Git for Windows must bootstrap its isolated global configuration before
+  // core.longpaths can apply. Keep that controller-owned bootstrap state at a
+  // normal path while independently exercising deep HOME and worker storage.
+  const controllerConfigRoot = path.join(root, 'controller-config')
+  const configIsolationPath = path.join(controllerConfigRoot, 'gitconfig')
+  const ghConfigDir = path.join(controllerConfigRoot, 'gh')
+  const deepConfigIsolationPath = path.join(activationRoot, 'gitconfig')
+  fs.mkdirSync(controllerConfigRoot)
+  ensureWindowsPrivateAcl(controllerConfigRoot)
   fs.writeFileSync(configIsolationPath, '')
+  fs.writeFileSync(deepConfigIsolationPath, '')
   fs.mkdirSync(ghConfigDir)
   const safety = require('../../scripts/local-only-safety.cjs')
   const environment = safety.createSafeChildGitEnvironment(target, rawEnvironment, {
@@ -170,6 +179,21 @@ test('native Windows worker clone uses short registered storage and cleanup reta
   })
   assert.equal(preflight.status, 0, `safe Git rev-parse preflight failed: ${resultDetails(preflight)}`)
   assert.equal(path.resolve(preflight.stdout.trim()).toLowerCase(), path.join(target, '.git').toLowerCase())
+  const namespacedConfig = path.toNamespacedPath(deepConfigIsolationPath)
+  const namespacedPreflight = cp.spawnSync('git', ['-C', target, 'rev-parse', '--absolute-git-dir'], {
+    encoding: 'utf8', timeout: 30000, windowsHide: true,
+    env: { ...environment, GIT_CONFIG_GLOBAL: namespacedConfig, GIT_CONFIG_SYSTEM: namespacedConfig },
+  })
+  t.diagnostic(`deep Git config namespace probe: ${JSON.stringify({
+    ordinary: { status: preflight.status, stderr: bounded(preflight.stderr) },
+    namespaced: {
+      status: namespacedPreflight.status,
+      signal: namespacedPreflight.signal,
+      error: namespacedPreflight.error
+        ? { code: namespacedPreflight.error.code, message: bounded(namespacedPreflight.error.message, 2048) } : null,
+      stderr: bounded(namespacedPreflight.stderr),
+    },
+  })}`)
   const workerStep = (label, action) => {
     try { return action() } catch (error) {
       assert.fail(`${label} failed: ${JSON.stringify({
@@ -204,10 +228,17 @@ test('native Windows worker clone uses short registered storage and cleanup reta
       ? manager.retainWorkspaceForRecovery(entry) : false,
   })
   const workspaceRoot = resolveWorkerWorkspaceRoot({
-    workspaceRoot: path.join(activationRoot, 'worker-workspaces', 'workspaces'),
+    workspaceRoot: path.join(privateRoot, 'workspaces'),
     cleanupRegistry,
     owner: activationId,
   })
+  const gitPathBound = 260 - 40 // Git for Windows reserves 40 characters for child GIT_DIR.
+  const legacyGitDirectory = path.join(privateRoot, 'workspaces', 'a'.repeat(40), '.git')
+  const externalGitDirectory = path.join(workspaceRoot, 'a'.repeat(40), '.git')
+  assert.ok(legacyGitDirectory.length >= gitPathBound,
+    `deep legacy worker Git path unexpectedly fits the ${gitPathBound}-character bound: ${legacyGitDirectory.length}`)
+  assert.ok(externalGitDirectory.length < gitPathBound,
+    `external worker Git path exceeds the ${gitPathBound}-character bound: ${externalGitDirectory.length}`)
   let session = null
   t.after(() => {
     try {
@@ -219,7 +250,7 @@ test('native Windows worker clone uses short registered storage and cleanup reta
 
   const managerOptions = {
     targetRoot: target,
-    privateRoot: path.join(activationRoot, 'worker-workspaces'),
+    privateRoot,
     workspaceRoot,
     cleanupRegistry,
     environment,
