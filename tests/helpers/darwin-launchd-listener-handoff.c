@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <launch.h>
 #include <netinet/in.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,7 +27,9 @@ static int parse_port(const char *text, in_port_t *port) {
 static int acquire(const char *name, in_port_t expected, int *result) {
   int *descriptors = NULL;
   size_t count = 0;
-  if (launch_activate_socket(name, &descriptors, &count) != 0 || !descriptors || count != 1) {
+  int activated = launch_activate_socket(name, &descriptors, &count);
+  if (activated != 0 || !descriptors || count != 1) {
+    if (!activated && descriptors) for (size_t index = 0; index < count; index++) close(descriptors[index]);
     free(descriptors);
     return 70;
   }
@@ -84,8 +87,31 @@ static int publish_descriptors(int model, int mcp) {
   }
   close(model_copy);
   close(mcp_copy);
-  closefrom(5);
   return 0;
+}
+
+static int exec_with_listeners(char *const child_argv[]) {
+  posix_spawnattr_t attributes;
+  posix_spawn_file_actions_t actions;
+  int status = posix_spawnattr_init(&attributes);
+  if (status) return status;
+  status = posix_spawn_file_actions_init(&actions);
+  if (status) { posix_spawnattr_destroy(&attributes); return status; }
+  // Darwin SETEXEC replaces this launchd process in place. CLOEXEC_DEFAULT
+  // closes every descriptor except the five explicitly inherited handles.
+  status = posix_spawnattr_setflags(&attributes,
+    POSIX_SPAWN_SETEXEC | POSIX_SPAWN_CLOEXEC_DEFAULT);
+  for (int descriptor = 0; !status && descriptor < 5; descriptor++)
+    status = posix_spawn_file_actions_addinherit_np(&actions, descriptor);
+  if (!status) {
+    extern char **environ;
+    pid_t child = -1;
+    status = posix_spawn(&child, child_argv[0], &actions, &attributes,
+      child_argv, environ);
+  }
+  posix_spawn_file_actions_destroy(&actions);
+  posix_spawnattr_destroy(&attributes);
+  return status ? status : EIO; // Successful SETEXEC never returns.
 }
 
 int main(int argc, char **argv) {
@@ -106,8 +132,20 @@ int main(int argc, char **argv) {
     fprintf(stderr, "listener handoff refused: %d\n", status);
     return status;
   }
-  char *const child_argv[] = { argv[3], argv[4], (char *)"--job", argv[5], NULL };
-  execv(argv[3], child_argv);
-  fprintf(stderr, "listener handoff exec failed: %d\n", errno);
+  // Negative control: deliberately leave one descriptor without FD_CLOEXEC.
+  // The exec policy must remove it while retaining the two admitted listeners.
+  int probe = open(argv[5], O_RDONLY);
+  if (probe < 0) return 79;
+  int forbidden = fcntl(probe, F_DUPFD, 128);
+  close(probe);
+  if (forbidden < 0) return 79;
+  char forbidden_text[32];
+  snprintf(forbidden_text, sizeof(forbidden_text), "%d", forbidden);
+  fprintf(stdout, "HANDOFF_PID:%ld\n", (long)getpid());
+  fflush(stdout);
+  char *const child_argv[] = { argv[3], argv[4], (char *)"--job", argv[5],
+    (char *)"--closed-fd", forbidden_text, NULL };
+  int exec_status = exec_with_listeners(child_argv);
+  fprintf(stderr, "listener handoff exec failed: %d\n", exec_status);
   return 78;
 }

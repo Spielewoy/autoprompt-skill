@@ -71,9 +71,11 @@ test('Darwin launchd wrapper hands two exact IPv6 listeners to fixed descriptors
 const crypto=require('node:crypto'),fs=require('node:fs'),net=require('node:net'),path=require('node:path')
 const stable=v=>Array.isArray(v)?'['+v.map(stable).join(',')+']':v&&typeof v==='object'?'{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+stable(v[k])).join(',')+'}':JSON.stringify(v)
 const hash=b=>crypto.createHash('sha256').update(b).digest('hex')
-if(process.argv.length!==4||process.argv[2]!=='--job')process.exit(64)
+if(process.argv.length!==6||process.argv[2]!=='--job'||process.argv[4]!=='--closed-fd'||!/^\d+$/.test(process.argv[5]))process.exit(64)
 const request=JSON.parse(fs.readFileSync(process.argv[3],'utf8')),copy={...request};delete copy.checksum
 if(request.checksum!==hash(stable(copy))||request.node.path!==fs.realpathSync.native(process.execPath)||request.node.sha256!==hash(fs.readFileSync(process.execPath)))process.exit(65)
+const requestIdentity=fs.statSync(process.argv[3])
+try{const leaked=fs.fstatSync(Number(process.argv[5]));if(leaked.dev===requestIdentity.dev&&leaked.ino===requestIdentity.ino)process.exit(68)}catch(error){if(error.code!=='EBADF')throw error}
 fs.appendFileSync(${JSON.stringify(startupAttempts)},String(process.pid)+'\n',{encoding:'utf8',mode:0o600})
 fs.writeFileSync(${JSON.stringify(startupMarker)},JSON.stringify({pid:process.pid}),{flag:'wx',mode:0o600})
 const servers=[]
@@ -86,6 +88,7 @@ Promise.all(servers.map(([key,item,server])=>new Promise((resolve,reject)=>{serv
   const receipt = await waitFor(() => fs.existsSync(ready) && JSON.parse(fs.readFileSync(ready, 'utf8')), 30000,
     `listener handoff did not become ready: ${fs.existsSync(stderr) ? fs.readFileSync(stderr, 'utf8').slice(-2048) : ''}`)
   assert.deepEqual(receipt.ports, [modelPort, mcpPort])
+  assert.equal(fs.readFileSync(stdout, 'utf8').trim(), `HANDOFF_PID:${receipt.pid}`, 'SETEXEC must retain the admitted launchd PID')
   assert.equal(await request(modelPort, 'model'), 'model\n')
   assert.equal(await request(mcpPort, 'mcp'), 'mcp\n')
   assert.deepEqual(JSON.parse(fs.readFileSync(startupMarker, 'utf8')), { pid: receipt.pid })
@@ -113,6 +116,7 @@ test('Darwin listener handoff source fixes socket keys and publishes only FD3 an
   assert.match(source, /"autoprompt\.mcp"/)
   assert.match(source, /dup2\(model_copy, 3\)/)
   assert.match(source, /dup2\(mcp_copy, 4\)/)
-  assert.match(source, /closefrom\(5\)/)
+  assert.match(source, /POSIX_SPAWN_SETEXEC \| POSIX_SPAWN_CLOEXEC_DEFAULT/)
+  assert.match(source, /posix_spawn_file_actions_addinherit_np\(&actions, descriptor\)/)
   assert.match(plist({ label: 'com.autoprompt.test', wrapper: '/private/w', modelPort: 1, mcpPort: 2, node: '/private/n', script: '/private/s', requestPath: '/private/r', stdout: '/private/o', stderr: '/private/e' }), /<key>LaunchOnlyOnce<\/key><true\/>/)
 })
