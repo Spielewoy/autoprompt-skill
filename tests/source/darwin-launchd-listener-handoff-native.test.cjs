@@ -15,7 +15,7 @@ const stable = value => Array.isArray(value) ? `[${value.map(stable).join(',')}]
   ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}` : JSON.stringify(value)
 const xml = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;')
 const command = (file, args) => cp.spawnSync(file, args, { shell: false, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 })
-const waitFor = async (predicate, timeout, message) => { const end = Date.now() + timeout; while (Date.now() < end) { const value = predicate(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 25)) }; throw new Error(message) }
+const waitFor = async (predicate, timeout, message) => { const end = Date.now() + timeout; while (Date.now() < end) { const value = predicate(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 25)) }; throw new Error(typeof message === 'function' ? message() : message) }
 const reservePort = host => new Promise((resolve, reject) => { const server = net.createServer(); server.once('error', reject); server.listen(0, host, () => { const port = server.address().port; server.close(error => error ? reject(error) : resolve(port)) }) })
 const request = (port, text) => new Promise((resolve, reject) => { const socket = net.createConnection(port, '::1'); let value = ''; socket.setEncoding('utf8'); socket.setTimeout(10000, () => socket.destroy(new Error('listener timed out'))); socket.once('connect', () => socket.end(text)); socket.on('data', chunk => { value += chunk }); socket.once('error', reject); socket.once('close', hadError => { if (!hadError) resolve(value) }) })
 const trigger = port => new Promise(resolve => { const socket = net.createConnection(port, '::1'); const done = outcome => { socket.destroy(); resolve(outcome) }; socket.setTimeout(2000, () => done('timeout')); socket.once('connect', () => done('connected')); socket.once('error', error => done(error.code || 'error')) })
@@ -45,6 +45,11 @@ test('Darwin launchd wrapper hands two exact IPv6 listeners to fixed descriptors
   let submitted = false
   const launchctl = args => command('/bin/launchctl', args)
   t.after(() => {
+    // Capture the post-launch state before bootout removes launchd's exit
+    // status. Reading stderr before waiting hides every startup failure.
+    if (submitted) t.diagnostic(JSON.stringify({ handoffState: launchctl(['print', `${domain}/${label}`]),
+      stdout: fs.existsSync(stdout) ? fs.readFileSync(stdout, 'utf8').slice(-8192) : null,
+      stderr: fs.existsSync(stderr) ? fs.readFileSync(stderr, 'utf8').slice(-8192) : null }))
     if (submitted) launchctl(['bootout', `${domain}/${label}`])
     const absent = launchctl(['print', `${domain}/${label}`])
     assert.ok(absent.status === 113 && /Could not find service/.test(absent.stderr), `launchd listener cleanup is unconfirmed: ${absent.stderr}`)
@@ -71,22 +76,23 @@ test('Darwin launchd wrapper hands two exact IPv6 listeners to fixed descriptors
 const crypto=require('node:crypto'),fs=require('node:fs'),net=require('node:net'),path=require('node:path')
 const stable=v=>Array.isArray(v)?'['+v.map(stable).join(',')+']':v&&typeof v==='object'?'{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+stable(v[k])).join(',')+'}':JSON.stringify(v)
 const hash=b=>crypto.createHash('sha256').update(b).digest('hex')
-if(process.argv.length!==6||process.argv[2]!=='--job'||process.argv[4]!=='--closed-fd'||!/^\d+$/.test(process.argv[5]))process.exit(64)
+const refuse=(code,message)=>{console.error(message);process.exit(code)}
+if(process.argv.length!==6||process.argv[2]!=='--job'||process.argv[4]!=='--closed-fd'||!/^\d+$/.test(process.argv[5]))refuse(64,'Node listener arguments invalid')
 const request=JSON.parse(fs.readFileSync(process.argv[3],'utf8')),copy={...request};delete copy.checksum
-if(request.checksum!==hash(stable(copy))||request.node.path!==fs.realpathSync.native(process.execPath)||request.node.sha256!==hash(fs.readFileSync(process.execPath)))process.exit(65)
+if(request.checksum!==hash(stable(copy))||request.node.path!==fs.realpathSync.native(process.execPath)||request.node.sha256!==hash(fs.readFileSync(process.execPath)))refuse(65,'Node listener request binding invalid')
 const requestIdentity=fs.statSync(process.argv[3])
-try{const leaked=fs.fstatSync(Number(process.argv[5]));if(leaked.dev===requestIdentity.dev&&leaked.ino===requestIdentity.ino)process.exit(68)}catch(error){if(error.code!=='EBADF')throw error}
+try{const leaked=fs.fstatSync(Number(process.argv[5]));if(leaked.dev===requestIdentity.dev&&leaked.ino===requestIdentity.ino)refuse(68,'Unexpected request descriptor survived SETEXEC')}catch(error){if(error.code!=='EBADF')throw error}
 fs.appendFileSync(${JSON.stringify(startupAttempts)},String(process.pid)+'\n',{encoding:'utf8',mode:0o600})
 fs.writeFileSync(${JSON.stringify(startupMarker)},JSON.stringify({pid:process.pid}),{flag:'wx',mode:0o600})
 const servers=[]
 for(const key of ['model','mcp']){const item=request.sockets[key];if(item.name!=='autoprompt.'+key||item.fd!==(key==='model'?3:4)||item.host!=='::1')process.exit(66);const server=net.createServer(socket=>socket.end(key+'\n'));server.listen({fd:item.fd,exclusive:true});servers.push([key,item,server])}
-Promise.all(servers.map(([key,item,server])=>new Promise((resolve,reject)=>{server.once('error',reject);server.once('listening',()=>{const address=server.address();if(address.address!=='::1'||address.family!=='IPv6'||address.port!==item.port)return reject(new Error('listener mismatch'));resolve()})}))).then(()=>fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:process.pid,ports:servers.map(([,item])=>item.port)}),{flag:'wx',mode:0o600})).catch(()=>process.exit(67))
+Promise.all(servers.map(([key,item,server])=>new Promise((resolve,reject)=>{server.once('error',reject);server.once('listening',()=>{const address=server.address();if(address.address!=='::1'||address.family!=='IPv6'||address.port!==item.port)return reject(new Error('listener mismatch'));resolve()})}))).then(()=>fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:process.pid,ports:servers.map(([,item])=>item.port)}),{flag:'wx',mode:0o600})).catch(error=>refuse(67,error.stack||error.message))
 `, { flag: 'wx', mode: 0o600 })
   fs.writeFileSync(plistPath, plist({ label, wrapper, modelPort, mcpPort, node, script, requestPath, stdout, stderr }), { flag: 'wx', mode: 0o600 })
   submitted = true
   const bootstrap = launchctl(['bootstrap', domain, plistPath]); assert.equal(bootstrap.status, 0, bootstrap.stderr)
   const receipt = await waitFor(() => fs.existsSync(ready) && JSON.parse(fs.readFileSync(ready, 'utf8')), 30000,
-    `listener handoff did not become ready: ${fs.existsSync(stderr) ? fs.readFileSync(stderr, 'utf8').slice(-2048) : ''}`)
+    () => `listener handoff did not become ready: ${fs.existsSync(stderr) ? fs.readFileSync(stderr, 'utf8').slice(-2048) : ''}`)
   assert.deepEqual(receipt.ports, [modelPort, mcpPort])
   assert.equal(fs.readFileSync(stdout, 'utf8').trim(), `HANDOFF_PID:${receipt.pid}`, 'SETEXEC must retain the admitted launchd PID')
   assert.equal(await request(modelPort, 'model'), 'model\n')

@@ -130,7 +130,15 @@ async function realFixture(t, actions, options = {}) {
     fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify({ schemaVersion: 1, provider: 'reasonix', activationId: f.record.activationId,
       generation: f.record.generation, challenge: f.challenge, registryPath }), { mode: 0o600, flag: 'wx' })
   }
-  const processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath))
+  let processAdapter
+  try { processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath)) } catch (error) {
+    // Setup runs before launch's diagnostic guard. Preserve the native ACL
+    // audit phase and subprocess result so a startup timeout is distinguishable
+    // from an actual ownership or permissions rejection.
+    t.diagnostic(JSON.stringify({ reasonixSetupFailure: { code: error.code || null,
+      message: error.message, details: error.details || null } }).slice(0, 16384))
+    throw error
+  }
   owner = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
   const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'reasonix-controlled-native', pollMs: 10 })
