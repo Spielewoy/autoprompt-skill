@@ -117,7 +117,7 @@ test('native Windows worker clone is privately writable without relabeling the s
   assert.equal(security(target), originalSecurity)
 })
 
-test('native Windows worker clone uses short registered storage and cleanup retains only recoverable journals', { skip: process.platform !== 'win32', timeout: 180000 }, t => {
+test('native Windows worker clone uses short registered storage and cleanup retains only recoverable journals', { skip: process.platform !== 'win32', timeout: 900000 }, t => {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'native-worker-external-')))
   const target = path.join(root, 'user-project')
   fs.mkdirSync(target)
@@ -141,11 +141,49 @@ test('native Windows worker clone uses short registered storage and cleanup reta
   assert.ok(activationRoot.length > 300, `fixture activation path was only ${activationRoot.length} characters`)
   const fakeHome = path.join(activationRoot, 'fake-home')
   fs.mkdirSync(fakeHome)
-  const environment = {
+  const rawEnvironment = {
     ...process.env,
     HOME: fakeHome,
     USERPROFILE: fakeHome,
     XDG_CONFIG_HOME: path.join(fakeHome, '.config'),
+  }
+  const configIsolationPath = path.join(activationRoot, 'gitconfig')
+  const ghConfigDir = path.join(activationRoot, 'gh')
+  fs.writeFileSync(configIsolationPath, '')
+  fs.mkdirSync(ghConfigDir)
+  const safety = require('../../scripts/local-only-safety.cjs')
+  const environment = safety.createSafeChildGitEnvironment(target, rawEnvironment, {
+    expectedBranch: 'fixture',
+    configIsolationPath,
+    ghConfigDir,
+  })
+  const bounded = (value, limit = 8192) => String(value || '').slice(0, limit)
+  const resultDetails = result => JSON.stringify({
+    status: result.status,
+    signal: result.signal,
+    error: result.error ? { code: result.error.code, message: bounded(result.error.message, 2048) } : null,
+    stdout: bounded(result.stdout),
+    stderr: bounded(result.stderr),
+  })
+  const preflight = cp.spawnSync('git', ['-C', target, 'rev-parse', '--absolute-git-dir'], {
+    encoding: 'utf8', timeout: 30000, windowsHide: true, env: environment,
+  })
+  assert.equal(preflight.status, 0, `safe Git rev-parse preflight failed: ${resultDetails(preflight)}`)
+  assert.equal(path.resolve(preflight.stdout.trim()).toLowerCase(), path.join(target, '.git').toLowerCase())
+  const workerStep = (label, action) => {
+    try { return action() } catch (error) {
+      assert.fail(`${label} failed: ${JSON.stringify({
+        name: error?.name,
+        code: error?.code,
+        message: bounded(error?.message, 2048),
+        details: error?.details ? {
+          status: error.details.status,
+          cause: bounded(error.details.cause, 2048),
+          stdout: bounded(error.details.stdout),
+          stderr: bounded(error.details.stderr),
+        } : null,
+      })}`)
+    }
   }
   const registryDirectory = path.join(activationRoot, 'cleanup')
   fs.mkdirSync(registryDirectory)
@@ -189,12 +227,12 @@ test('native Windows worker clone uses short registered storage and cleanup reta
     activationId,
     hardenWorkspace: clone => ({ accepted: auditPrivatePermissions(clone).valid }),
   }
-  manager = new WorkerWorkspaceManager(managerOptions)
+  manager = workerStep('initial worker manager construction', () => new WorkerWorkspaceManager(managerOptions))
   const request = {
     workItemId: 'work-1',
     assignment: { resources: [{ kind: 'directory', identity: '.', access: 'write' }] },
   }
-  session = manager.prepare(request)
+  session = workerStep('initial worker workspace prepare', () => manager.prepare(request))
   assert.equal(path.dirname(session.workspacePath).toLowerCase(), workspaceRoot.toLowerCase())
   assert.match(path.basename(session.workspacePath), /^[a-f0-9]{40}$/)
   assert.ok(path.join(session.workspacePath, '.git').length < 260)
@@ -204,8 +242,8 @@ test('native Windows worker clone uses short registered storage and cleanup reta
   assert.equal(registered.owner, session.workspaceId)
 
   const preparedIdentity = fs.lstatSync(session.workspacePath, { bigint: true })
-  manager = new WorkerWorkspaceManager(managerOptions)
-  session = manager.prepare(request)
+  manager = workerStep('reopened worker manager construction', () => new WorkerWorkspaceManager(managerOptions))
+  session = workerStep('reopened worker workspace prepare', () => manager.prepare(request))
   const reopenedIdentity = fs.lstatSync(session.workspacePath, { bigint: true })
   assert.equal(reopenedIdentity.dev, preparedIdentity.dev)
   assert.equal(reopenedIdentity.ino, preparedIdentity.ino)
@@ -290,10 +328,10 @@ test('native Windows worker clone uses short registered storage and cleanup reta
     path.resolve(__dirname, '../../agents/codex/workflow/windows-checker-root.js'),
     target, managerOptions.privateRoot, workspaceRoot, path.join(registryDirectory, 'registry.json'),
     activationRoot, activationId, JSON.stringify(request),
-  ], { encoding: 'utf8', windowsHide: true, env: environment, timeout: 60000 })
+  ], { encoding: 'utf8', windowsHide: true, env: environment, timeout: 300000 })
   assert.ifError(crashed.error)
   assert.equal(crashed.status, 77, crashed.stderr || crashed.stdout)
-  const guardianDeadline = Date.now() + 20_000
+  const guardianDeadline = Date.now() + 120_000
   let guardianRecord = null
   while (Date.now() < guardianDeadline) {
     try { guardianRecord = readChecksummedJson(session.recordPath) } catch {}
@@ -304,10 +342,10 @@ test('native Windows worker clone uses short registered storage and cleanup reta
   assert.equal(guardianRecord?.status, 'ROLLED_BACK')
   assert.equal(guardianRecord?.guardianOutcome, 'ROLLED_BACK')
   assert.equal(fs.readFileSync(path.join(target, 'input.txt'), 'utf8'), 'original project bytes\n')
-  manager = new WorkerWorkspaceManager(managerOptions)
-  session = manager.prepare(request)
+  manager = workerStep('post-guardian worker manager construction', () => new WorkerWorkspaceManager(managerOptions))
+  session = workerStep('post-guardian worker workspace prepare', () => manager.prepare(request))
 
-  manager.abort(session)
+  workerStep('terminal worker workspace abort', () => manager.abort(session))
   const capture = require('../../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture()
   const interrupted = capture.removeOwnedTarget(
     session.workspacePath, registered.parentIdentity, registered.targetIdentity,

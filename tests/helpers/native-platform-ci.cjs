@@ -192,6 +192,8 @@ async function main() {
     const snapshotCases = [GIT_SNAPSHOT_CASE,
       'Windows owned cleanup binds the target, validates the entire tree, and proves final absence']
     const proofCase = 'Windows local canary safety admits only its live registered external checker snapshot'
+    const workerStorageCase = 'native Windows worker clone uses short registered storage and cleanup retains only recoverable journals'
+    const workerProofCase = 'Windows local canary safety admits only its live registered external worker workspace'
     const stages = [
       { id: 'snapshot', cases: snapshotCases, argv: ['--test-name-pattern', `^(?:${snapshotCases.join('|')})$`,
         'tests/source/local-only-safety.test.cjs', 'tests/source/windows-filesystem.test.cjs'] },
@@ -199,20 +201,17 @@ async function main() {
         'tests/source/harness-v2-local-proof-safety.test.cjs'] },
       { id: 'launch', cases, argv: ['--test-name-pattern', `^(?:${cases.join('|')})$`,
         'tests/source/windows-bash-runtime.test.cjs', 'tests/source/windows-job-helper.test.cjs'] },
-      { id: 'worker', cases: [
-        'native Windows worker clone uses short registered storage and cleanup retains only recoverable journals',
-        'Windows local canary safety admits only its live registered external worker workspace',
-      ], argv: ['--test-name-pattern', `^(?:${[
-        'native Windows worker clone uses short registered storage and cleanup retains only recoverable journals',
-        'Windows local canary safety admits only its live registered external worker workspace',
-      ].join('|')})$`, 'tests/source/harness-v2-windows-private-storage.test.cjs',
-      'tests/source/harness-v2-local-proof-safety.test.cjs'] },
+      { id: 'worker-storage', cases: [workerStorageCase], argv: ['--test-name-pattern', `^${workerStorageCase}$`,
+        'tests/source/harness-v2-windows-private-storage.test.cjs'] },
+      { id: 'worker-proof', cases: [workerProofCase], argv: ['--test-name-pattern', `^${workerProofCase}$`,
+        'tests/source/harness-v2-local-proof-safety.test.cjs'] },
       { id: 'installer', cases: ['packed artifact installs and verifies all public providers without the checkout or network'],
         argv: ['tests/source/packed-harness-v2-lifecycle.test.cjs'] },
     ]
     const requestedStage = process.env.AUTOPROMPT_WINDOWS_REGRESSION_STAGE || 'all'
-    assert.ok(['all', ...stages.map(stage => stage.id)].includes(requestedStage), 'Unknown Windows regression stage')
-    const selectedStages = stages.filter(stage => requestedStage === 'all' || stage.id === requestedStage)
+    assert.ok(['all', 'worker', ...stages.map(stage => stage.id)].includes(requestedStage), 'Unknown Windows regression stage')
+    const selectedStages = stages.filter(stage => requestedStage === 'all' || stage.id === requestedStage ||
+      (requestedStage === 'worker' && stage.id.startsWith('worker-')))
     const evidence = { diagnosticOnly: true, nativeCapabilitiesPassed: false, requestedStage, platform: process.platform,
       architecture: process.arch, node: process.version, stages: [] }
     const publish = () => fs.writeFileSync('native-platform-evidence.json', JSON.stringify(evidence, null, 2) + '\n')
