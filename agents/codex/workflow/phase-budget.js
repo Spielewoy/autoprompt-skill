@@ -9891,6 +9891,39 @@ function projectWindowsClaudeTempEnvironment({ descriptor, requestedCwd, effecti
   return { ...environment, TEMP: projected, TMP: projected, TMPDIR: projected }
 }
 
+function validateOwnedProxyNode(binding) {
+  if (binding === undefined || binding === null) return process.execPath
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding) ||
+      Object.keys(binding).sort().join(',') !== 'path,sha256' ||
+      !path.isAbsolute(binding.path || '') || !/^[a-f0-9]{64}$/.test(binding.sha256 || '')) {
+    throw new SupervisorIntegrationError('CODEX_PROXY_BINDING_INVALID', 'owned Codex proxy Node binding is invalid')
+  }
+  const before = inspectPathNoFollow(binding.path, { mustBeDirectory: false })
+  if (!before.exists || before.realpath !== binding.path) {
+    throw new SupervisorIntegrationError('CODEX_PROXY_BINDING_INVALID', 'owned Codex proxy Node binding changed')
+  }
+  let descriptor
+  try {
+    descriptor = fs.openSync(binding.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+    const opened = fs.fstatSync(descriptor)
+    if (!opened.isFile() || String(opened.dev) !== before.identity.dev || String(opened.ino) !== before.identity.ino) {
+      throw new SupervisorIntegrationError('CODEX_PROXY_BINDING_INVALID', 'owned Codex proxy Node identity changed')
+    }
+    const bytes = fs.readFileSync(descriptor)
+    const after = fs.fstatSync(descriptor)
+    if (after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs ||
+        crypto.createHash('sha256').update(bytes).digest('hex') !== binding.sha256) {
+      throw new SupervisorIntegrationError('CODEX_PROXY_BINDING_INVALID', 'owned Codex proxy Node bytes changed')
+    }
+  } catch (error) {
+    if (error instanceof SupervisorIntegrationError) throw error
+    throw new SupervisorIntegrationError('CODEX_PROXY_BINDING_INVALID', 'owned Codex proxy Node binding is unavailable')
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor)
+  }
+  return binding.path
+}
+
 class OwnedCodexProxyRunner {
   constructor(options = {}) {
     if (!options.processOwner || typeof options.processOwner.launch !== 'function' ||
@@ -9910,6 +9943,8 @@ class OwnedCodexProxyRunner {
         'owned Codex proxy runner requires an activation and positive generation binding',
       )
     }
+    this.boundNode = options.boundNode === undefined ? null : Object.freeze({ ...options.boundNode })
+    validateOwnedProxyNode(this.boundNode)
     this.controlSequence = 0
     this.pollMs = options.pollMs || 20
     this.sessions = new Map()
@@ -9971,6 +10006,7 @@ class OwnedCodexProxyRunner {
     const stdoutPath = path.join(sessionRoot, 'stdout.jsonl')
     const stderrPath = path.join(sessionRoot, 'stderr.log')
     const statusPath = path.join(sessionRoot, 'status.json')
+    const proxyFailurePath = path.join(sessionRoot, 'proxy-error.json')
     const argvHash = hashText(JSON.stringify({
       executable: childSpec.executable,
       argv: childSpec.argv,
@@ -9998,7 +10034,7 @@ class OwnedCodexProxyRunner {
     }
     let owned
     try { owned = await this.processOwner.launch({
-      executable: process.execPath,
+      executable: validateOwnedProxyNode(this.boundNode),
       argv: [__filename, '--owned-codex-proxy', requestPath],
       cwd: childSpec.cwd,
       env: childSpec.env,
@@ -10099,10 +10135,21 @@ class OwnedCodexProxyRunner {
             missingStatusSince ||= Date.now()
             if (Date.now() - missingStatusSince >= Math.max(100, this.pollMs * 5)) {
               if (fs.existsSync(statusPath)) status = readRegularJson(statusPath, 'owned Codex proxy status').parsed
-              if (!status) throw new SupervisorIntegrationError(
-                'CODEX_PROXY_STATUS_INVALID',
-                'owned Codex proxy exited before writing its durable terminal status',
-              )
+              if (!status) {
+                let proxyFailure = null
+                if (fs.existsSync(proxyFailurePath)) {
+                  const value = readRegularJson(proxyFailurePath, 'owned Codex proxy failure').parsed
+                  if (value?.schemaVersion === 1 && Object.keys(value).sort().join(',') === 'code,message,schemaVersion,sourceFrames' &&
+                      typeof value.code === 'string' && value.code.length <= 64 && typeof value.message === 'string' && value.message.length <= 512 &&
+                      Array.isArray(value.sourceFrames) && value.sourceFrames.length <= 8 && value.sourceFrames.every(frame => typeof frame === 'string' && frame.length <= 256)) proxyFailure = value
+                  else throw new SupervisorIntegrationError('CODEX_PROXY_STATUS_INVALID', 'owned Codex proxy failure diagnostic is invalid')
+                }
+                throw new SupervisorIntegrationError(
+                  'CODEX_PROXY_STATUS_INVALID',
+                  'owned Codex proxy exited before writing its durable terminal status',
+                  proxyFailure ? { proxyFailure } : undefined,
+                )
+              }
             }
           } else missingStatusSince = null
         }
@@ -10242,6 +10289,15 @@ async function runOwnedCodexProxy(requestPath) {
       throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy output escaped its control directory')
     }
   }
+  const proxyFailurePath = path.join(path.dirname(path.resolve(requestPath)), 'proxy-error.json')
+  const writeProxyFailure = error => {
+    const sourceFrames = String(error?.stack || '').split(/\r?\n/u)
+      .filter(line => line.includes(path.basename(__filename))).slice(0, 8)
+      .map(line => line.slice(line.lastIndexOf(path.basename(__filename)), line.length).slice(0, 256))
+    const value = { schemaVersion: 1, code: String(error?.code || 'RUNTIME_FAILURE').slice(0, 64),
+      message: String(error?.message || error || 'owned Codex proxy failure').replace(/[\r\n]+/gu, ' ').slice(0, 512), sourceFrames }
+    try { fs.writeFileSync(proxyFailurePath, `${JSON.stringify(value)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 }) } catch {}
+  }
   const stdoutHandle = fs.openSync(request.stdoutPath, 'wx', 0o600)
   const stderrHandle = fs.openSync(request.stderrPath, 'wx', 0o600)
   let child = null
@@ -10338,9 +10394,16 @@ async function runOwnedCodexProxy(requestPath) {
     try { child.kill() } catch {}
     return
   }
-  child.stdout.on('data', bytes => fs.writeSync(stdoutHandle, bytes))
-  child.stderr.on('data', bytes => fs.writeSync(stderrHandle, bytes))
   let childError = null
+  const writeOutput = (handle, bytes) => {
+    try { fs.writeSync(handle, bytes) } catch (error) {
+      childError ||= error
+      writeProxyFailure(error)
+      try { child.kill() } catch {}
+    }
+  }
+  child.stdout.on('data', bytes => writeOutput(stdoutHandle, bytes))
+  child.stderr.on('data', bytes => writeOutput(stderrHandle, bytes))
   const stdin = relay || child.stdin
   stdin.on('error', error => {
     if (!['EPIPE', 'ERR_STREAM_DESTROYED'].includes(error && error.code)) {
@@ -10353,7 +10416,9 @@ async function runOwnedCodexProxy(requestPath) {
   // Publishing status there lets the owner freeze a transcript before the
   // provider's terminal usage line. `close` is the process-wide stdio drain
   // boundary; only then close/fsync the files and expose durable status.
-  child.once('close', (code, signal) => finish(code, signal, childError))
+  child.once('close', (code, signal) => {
+    try { finish(code, signal, childError) } catch (error) { writeProxyFailure(error); process.exitCode = 2 }
+  })
   if (!relay) child.stdin.end(request.stdin)
 }
 
@@ -31830,6 +31895,26 @@ function createDefaultRuntimeOptions(input) {
       processIdentity: processIdentityForPid(process.pid),
     },
     beforeMissionAcquire: async () => {
+      // Darwin command tools own independent launchd coalitions. They are not
+      // descendants of the provider runner, so generation recovery must drain
+      // their authenticated policy registries before admitting new work.
+      if (process.platform === 'darwin' && context.executionAdapterOptions?.nativeRoot !== undefined) {
+        const nativeRoot = context.executionAdapterOptions.nativeRoot
+        const provider = context.executionAdapterOptions.provider
+        const expectedNativeRoot = path.join(activation.activationRoot, 'native')
+        if (typeof nativeRoot !== 'string' || path.resolve(nativeRoot) !== path.resolve(expectedNativeRoot) ||
+            typeof provider !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(provider)) {
+          throw new SupervisorIntegrationError('PROCESS_OWNER_CONFIG_INVALID', 'Darwin command recovery requires the activation-bound native root and provider')
+        }
+        if (fs.existsSync(nativeRoot)) {
+          const discovery = require('../../../scripts/harness-v2-command-owner-discovery.cjs')
+          for (const recoveryGeneration of generation > 1 ? [generation - 1, generation] : [generation]) {
+            const binding = { provider, activationId: activation.runId, generation: recoveryGeneration }
+            const registryRoot = discovery.createDiscoveryRoot(nativeRoot, binding)
+            await discovery.drainAuthenticated(registryRoot, binding, { providerPrivateOwnershipRoot: nativeRoot })
+          }
+        }
+      }
       if (generation > 1) {
         await processOwner.recoverReservations()
         for (const owned of processOwner.listRecords().filter(item => item.status === 'RUNNING')) {

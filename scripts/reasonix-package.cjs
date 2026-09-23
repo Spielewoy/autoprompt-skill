@@ -12,13 +12,14 @@ const RECEIPT = '.autoprompt-reasonix-v2.json'
 const SHIM = '---\nname: autoprompt\ndescription: "Start explicitly requested Autoprompt v2 work in Reasonix."\ninvocation: manual\n---\n\nRun `autoprompt activate reasonix --target <absolute-project-path> -- <mission>` in a terminal. The launcher starts the private v2 controller. Loading this skill alone never starts or resumes work.\n'
 const TREES = ['agents/reasonix', 'agents/codex', 'agents/contracts', 'node_modules/@iarna/toml']
 const BUNDLE_PACKAGE = '{"name":"@autoprompt-skill/reasonix-runtime","version":"2.0.0","private":true,"type":"commonjs"}\n'
-const FILES = ['scripts/local-only-safety.cjs', 'scripts/darwin-runtime-setup.cjs', 'scripts/reasonix-package.cjs', 'scripts/reasonix-configure.cjs', 'scripts/install/operation-lock.cjs',
+const FILES = ['scripts/local-only-safety.cjs', 'scripts/windows-git-bootstrap-config.cjs', 'scripts/darwin-runtime-setup.cjs', 'scripts/darwin-command-sandbox.cjs', 'scripts/darwin-command-probe.cjs', 'scripts/harness-v2-command-owner-discovery.cjs', 'scripts/reasonix-package.cjs', 'scripts/reasonix-configure.cjs', 'scripts/install/operation-lock.cjs',
   'scripts/harness-v2-tool-boundary.cjs', 'scripts/harness-v2-tool-server.cjs', 'scripts/harness-v2-controlled-tools.cjs',
+  'scripts/harness-v2-configure.cjs', 'scripts/harness-v2-vscode-config.cjs', 'scripts/harness-v2-hermes.cjs', 'scripts/harness-v2-grok.cjs', 'scripts/harness-v2-pi-config.cjs',
   'scripts/harness-v2-conformance.cjs', 'scripts/harness-v2-local-admission.cjs', 'scripts/harness-v2-package.cjs', 'scripts/harness-v2-native.cjs', 'scripts/harness-v2-native-wire-projection.cjs', 'scripts/harness-v2-request-quota.cjs', 'scripts/harness-v2-quota-relay.cjs', 'scripts/harness-v2-quota-connection.cjs',
   'scripts/harness-v2-canary.cjs', 'scripts/harness-v2-closed-canary.cjs', 'scripts/harness-v2-trust/evidence.json',
   'scripts/harness-v2-trust/trusted-public-keys.json', 'scripts/harness-v2-admission.cjs',
   'scripts/harness-v2-prime-migration.cjs', 'scripts/install/harness-v2-legacy.json', 'scripts/install/prime-settings.cjs']
-const CONFORMANCE_ASSETS = ['tests/source/reasonix-controlled-native.test.cjs', 'tests/source/harness-v2-reasonix-capability-native.test.cjs']
+const CONFORMANCE_ASSETS = ['tests/source/reasonix-controlled-native.test.cjs', 'tests/source/harness-v2-reasonix-capability-native.test.cjs', 'tests/helpers/native-platform.cjs']
 
 function absoluteRoot(root) {
   if (typeof root !== 'string' || !path.isAbsolute(root) || /[\0\r\n]/.test(root) || path.resolve(root) === path.parse(root).root) {

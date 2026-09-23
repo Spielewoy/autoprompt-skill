@@ -175,10 +175,10 @@ function locateExecutable({ provider, env = process.env, executable, platform = 
       let resolved = fs.realpathSync.native(name)
       if (provider === 'vscode' && path.basename(path.dirname(resolved)) === 'bin') {
         const bundle = platform === 'darwin' ? vscodeBundleRoot(resolved) : null
-        const electron = bundle
-          ? path.join(bundle, platform === 'win32' ? 'Code.exe' : 'Contents/MacOS/Electron')
+        const vscodeExecutable = bundle
+          ? path.join(bundle, platform === 'win32' ? 'Code.exe' : 'Contents/MacOS/Code')
           : path.join(path.dirname(path.dirname(resolved)), platform === 'win32' ? 'Code.exe' : 'code')
-        if (fs.existsSync(electron)) resolved = fs.realpathSync.native(electron)
+        if (fs.existsSync(vscodeExecutable)) resolved = fs.realpathSync.native(vscodeExecutable)
       }
       if (/^(codex|codex\.exe|codex\.js)$/i.test(path.basename(resolved))) fail('PROVIDER_IDENTITY_MISMATCH', 'Codex is not a native executable for this provider')
       fs.accessSync(resolved, fs.constants.X_OK)

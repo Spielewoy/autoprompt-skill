@@ -36,7 +36,8 @@ function writeExclusive(file, value) {
   try { fs.writeFileSync(fd, JSON.stringify(value) + '\n'); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
 }
 function readBoundExecutable(binding) {
-  if (!binding || !path.isAbsolute(binding.path || '') || !HASH.test(binding.sha256 || '')) fail('PROVIDER_UNSUPPORTED', 'Darwin helper requires an exact executable binding')
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding) || Object.keys(binding).sort().join(',') !== 'path,sha256' ||
+      !path.isAbsolute(binding.path || '') || !HASH.test(binding.sha256 || '')) fail('PROVIDER_UNSUPPORTED', 'Darwin helper requires an exact executable binding')
   const before = inspectPathNoFollow(binding.path, { mustBeDirectory: false })
   if (!before.exists || before.realpath !== binding.path) fail('PROCESS_IDENTITY_CHANGED', 'Darwin helper executable binding drifted')
   const descriptor = fs.openSync(binding.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
@@ -67,18 +68,38 @@ function boundExecutable(binding) {
   return binding.path
 }
 function helperCall(binding, argv) {
-  const result = cp.spawnSync(boundExecutable(binding), argv, { shell: false, encoding: 'utf8', timeout: 10000, maxBuffer: 4 * 1024 * 1024, env: { PATH: '/usr/bin:/bin', LANG: 'C' } })
-  let value
-  try { value = JSON.parse(result.stdout) } catch { fail('PROCESS_OBSERVATION_FAILED', 'Darwin helper returned no complete JSON response') }
-  if (result.status !== 0 || result.signal || value.schemaVersion !== 1 || value.ok !== true || !UUID.test(value.bootUuid || '')) fail('PROCESS_OBSERVATION_FAILED', 'Darwin helper could not establish kernel authority')
-  return value
+  const deadline = Date.now() + 2000
+  let observedBoot = null
+  for (let attempt = 0; ; attempt++) {
+    const result = cp.spawnSync(boundExecutable(binding), argv, { shell: false, encoding: 'utf8', timeout: 10000, maxBuffer: 4 * 1024 * 1024, env: { PATH: '/usr/bin:/bin', LANG: 'C' } })
+    let value
+    try { value = JSON.parse(result.stdout) } catch { fail('PROCESS_OBSERVATION_FAILED', 'Darwin helper returned no complete JSON response') }
+    const validBoot = value.schemaVersion === 1 && UUID.test(value.bootUuid || '')
+    if (validBoot && observedBoot && observedBoot !== value.bootUuid) fail('PROCESS_IDENTITY_CHANGED', 'Darwin boot changed during process observation')
+    if (validBoot) observedBoot = value.bootUuid
+    if (!result.error && result.status === 0 && !result.signal && validBoot && value.ok === true) return value
+    // A UID-wide PID snapshot can race an unrelated process exit. Retry the
+    // complete kernel query; never turn a partial census into an empty group.
+    // Atomic coalition task counters remain the only proof of a drained group.
+    const exitedSnapshotMember = !result.error && !result.signal && result.status === 74 && validBoot &&
+      ['census', 'signal'].includes(argv[0]) && value.command === argv[0] && value.resourceCoalitionId === argv[1] &&
+      value.ok === false && value.complete === false && Array.isArray(value.errors) && value.errors.length > 0 &&
+      value.errors.every(error => Number.isSafeInteger(error.pid) && error.pid > 0 &&
+        ['bind-before', 'coalition-query', 'bind-after', 'audit-signal'].includes(error.phase) && [2, 3].includes(error.errno))
+    if (exitedSnapshotMember && attempt < 7 && Date.now() < deadline) continue
+    const error = new Error('Darwin helper could not establish kernel authority')
+    error.code = 'PROCESS_OBSERVATION_FAILED'
+    error.details = { command: argv[0], status: result.status, signal: result.signal,
+      helperError: value.error || null, errors: Array.isArray(value.errors) ? value.errors.slice(0, 8) : null }
+    throw error
+  }
 }
 function xml(value) {
   if (typeof value !== 'string' || /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(value)) fail('LAUNCH_SPEC_INVALID', 'Darwin launch argument is not XML-safe text')
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;')
 }
-function launchPlist(label, requestPath) {
-  return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${xml(label)}</string><key>ProgramArguments</key><array>${[process.execPath, __filename, '--job', requestPath].map(value => `<string>${xml(value)}</string>`).join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/><key>AbandonProcessGroup</key><false/><key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string></dict></plist>`
+function launchPlist(label, requestPath, nodePath = process.execPath) {
+  return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${xml(label)}</string><key>ProgramArguments</key><array>${[nodePath, __filename, '--job', requestPath].map(value => `<string>${xml(value)}</string>`).join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/><key>AbandonProcessGroup</key><false/><key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string></dict></plist>`
 }
 function sameMissingServiceResponse(remaining, label, reference, missingLabel) {
   const normalize = (result, name) => {
@@ -100,6 +121,8 @@ function createDarwinCoalitionAdapter(options = {}) {
   fs.mkdirSync(controlRoot, { recursive: true, mode: 0o700 })
   auditPrivatePermissions(controlRoot, { recurse: false })
   const helper = materializeHelper(options.helper, controlRoot)
+  const nodeExecutable = Object.freeze({ ...(options.nodeExecutable || { path: fs.realpathSync.native(process.execPath), sha256: digest(fs.readFileSync(fs.realpathSync.native(process.execPath))) }) })
+  readBoundExecutable(nodeExecutable)
   const bootUuid = helperCall(helper, ['boot']).bootUuid
   const uid = process.getuid()
   const controlRootHash = digest(controlRoot)
@@ -114,7 +137,7 @@ function createDarwinCoalitionAdapter(options = {}) {
   function readRequest(dir) {
     if (path.dirname(dir) !== controlRoot || !HASH.test(path.basename(dir))) fail('PROCESS_IDENTITY_INVALID', 'Darwin reservation is outside its controller root')
     const request = readPrivate(files(dir).request)
-    if (request.schemaVersion !== 1 || request.binding?.adapterKind !== kind || request.binding.bootUuid !== bootUuid || request.binding.controlRootHash !== controlRootHash || request.binding.reservationIdentity !== identity(request.binding.reservationId) || dir !== directory(request.binding.reservationId) || stableStringify(request.helper) !== stableStringify(helper) || request.checksum !== requestDigest(request)) fail('PROCESS_IDENTITY_INVALID', 'Darwin immutable launch request does not match its reservation')
+    if (request.schemaVersion !== 1 || request.binding?.adapterKind !== kind || request.binding.bootUuid !== bootUuid || request.binding.controlRootHash !== controlRootHash || request.binding.reservationIdentity !== identity(request.binding.reservationId) || dir !== directory(request.binding.reservationId) || stableStringify(request.helper) !== stableStringify(helper) || stableStringify(request.nodeExecutable) !== stableStringify(nodeExecutable) || request.checksum !== requestDigest(request)) fail('PROCESS_IDENTITY_INVALID', 'Darwin immutable launch request does not match its reservation')
     return request
   }
   function readReady(dir, request = readRequest(dir)) {
@@ -183,10 +206,10 @@ function createDarwinCoalitionAdapter(options = {}) {
       // Choose an existing user domain before writing the immutable request.
       const domain = [`gui/${uid}`, `user/${uid}`].find(value => launchctl(['print', value]).status === 0)
       if (!domain) fail('PROVIDER_UNSUPPORTED', 'Darwin user launchd domain is unavailable')
-      const request = { schemaVersion: 1, binding: spec.reservationBinding, helper, domain, label: `com.autoprompt.owned.${controlRootHash.slice(0, 16)}.${digest(spec.reservationId)}`, executable: spec.executable, argv: spec.argv, cwd: spec.cwd, env: spec.env }
+      const request = { schemaVersion: 1, binding: spec.reservationBinding, helper, nodeExecutable, domain, label: `com.autoprompt.owned.${controlRootHash.slice(0, 16)}.${digest(spec.reservationId)}`, executable: spec.executable, argv: spec.argv, cwd: spec.cwd, env: spec.env }
       request.checksum = digest(stableStringify(request))
       writeExclusive(f.request, request)
-      fs.writeFileSync(f.plist, launchPlist(request.label, f.request), { flag: 'wx', mode: 0o600 })
+      fs.writeFileSync(f.plist, launchPlist(request.label, f.request, boundExecutable(nodeExecutable)), { flag: 'wx', mode: 0o600 })
       const bootstrap = launchctl(['bootstrap', domain, f.plist])
       if (bootstrap.status !== 0 || bootstrap.error || bootstrap.signal) fail('PROCESS_RESERVATION_FAILURE', 'Darwin launchd bootstrap failed; durable reservation requires recovery')
       while (Date.now() < Date.parse(spec.startupDeadlineAt)) {
@@ -276,6 +299,7 @@ function createDarwinCoalitionAdapter(options = {}) {
 async function runJob(requestPath) {
   const request = readPrivate(requestPath), directory = path.dirname(requestPath)
   if (request.checksum !== requestDigest(request) || request.binding?.adapterKind !== kind || Date.now() >= Date.parse(request.binding.startupDeadlineAt)) fail('PROCESS_IDENTITY_INVALID', 'Darwin job request is invalid or expired')
+  readBoundExecutable(request.nodeExecutable)
   const own = helperCall(request.helper, ['inspect', String(process.pid)])
   if (own.bootUuid !== request.binding.bootUuid || own.uid !== process.getuid()) fail('PROCESS_IDENTITY_CHANGED', 'Darwin job boot identity changed')
   writeExclusive(path.join(directory, 'ready.json'), { ...own, requestChecksum: request.checksum })

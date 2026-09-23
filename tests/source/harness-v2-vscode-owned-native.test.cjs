@@ -11,7 +11,7 @@ const native = require('../../scripts/harness-v2-native.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
-const { privateDirectory, nativeProcessAdapter, nativeEnvironment, nodeCommand } = require('../helpers/native-platform.cjs')
+const { privateDirectory, nativeProcessAdapter, nativeEnvironment, nodeCommand, cleanupNativeFixture, drainNativeCommandOwners } = require('../helpers/native-platform.cjs')
 const enabled = Boolean(process.env.AUTOPROMPT_VSCODE_TEST_CLI)
 
 function closedBinding() {
@@ -69,10 +69,15 @@ async function fixture(t, options = {}) {
   const execution = new HarnessExecAdapter({ provider: 'vscode', runner, nativeRoot, executableBinding: binding, targetPath: target,
     connection: { model: 'fixture', baseUrl: `http://127.0.0.1:${server.address().port}/v1`, maxTokens: 128, maxSteps: 4, ...(options.structured ? { supportsStructuredOutput: true } : {}) }, credentialEnvironment: { OPENROUTER_API_KEY: 'local-fixture' }, rolePrompt: () => 'Use the owned tools and return JSON.', outputSchemaResolver: () => schema })
   t.after(async () => {
-    await owner.cancelAll({ reason: 'VS Code native test cleanup', graceMs: 0, killMs: 2000 })
-    server.closeAllConnections(); await new Promise(resolve => server.close(resolve))
-    if (process.env.AUTOPROMPT_VSCODE_TEST_KEEP) t.diagnostic(root)
-    else fs.rmSync(root, { recursive: true, force: true })
+    if (process.env.AUTOPROMPT_VSCODE_TEST_KEEP) {
+      await owner.cancelAll({ reason: 'VS Code native test cleanup', graceMs: 0, killMs: 2000 })
+      await drainNativeCommandOwners(nativeRoot, 'vscode', record)
+      server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); t.diagnostic(root); return
+    }
+    await cleanupNativeFixture({ root, nativeRoot, record }, 'vscode', {
+      stop: () => owner.cancelAll({ reason: 'VS Code native test cleanup', graceMs: 0, killMs: 2000 }),
+      close: async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) },
+    })
   })
   return { root, target, controller, scratch, nativeRoot, record, requests, errors, runner, execution }
 }

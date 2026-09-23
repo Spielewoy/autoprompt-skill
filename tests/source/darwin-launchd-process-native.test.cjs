@@ -107,6 +107,14 @@ test('Darwin missing-service proof rejects arbitrary failures and mismatched liv
   assert.equal(sameMissingServiceResponse(actual, 'owned', { ...reference, stderr: 'domain unavailable' }, 'never-created'), false)
 })
 
+test('Darwin launchd plist uses the explicitly bound controller Node executable', () => {
+  const { launchPlist } = require('../../agents/codex/workflow/darwin-launchd-process.js')
+  const node = '/private/controller/node<&'
+  const plist = launchPlist('com.autoprompt.fixture', '/private/control/request.json', node)
+  assert.ok(plist.includes(`<string>${node.replace('&', '&amp;').replace('<', '&lt;')}</string>`))
+  assert.equal(plist.includes(`<string>${process.execPath}</string>`), node === process.execPath)
+})
+
 test('native packaged Darwin launchd coalition factory survives root death and a fresh adapter drains detached children', {
   skip: process.platform !== 'darwin' && 'requires native macOS',
   timeout: 150000,

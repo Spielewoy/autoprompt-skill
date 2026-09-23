@@ -91,7 +91,7 @@ test('Darwin Seatbelt profile is default-deny and grants only exact roots, fixed
   assert.equal(profile.includes('ipc-posix-sem'), false)
   assert.equal(profile.includes('system-socket'), false)
   assert.equal(profile.includes('mach-register'), false)
-  assert.equal(profile.includes('launchctl'), false)
+  assert.ok(profile.includes('(deny process-exec (literal "/bin/launchctl"))'))
   assert.equal(profile.includes('system-write-bootstrap'), false)
 })
 
@@ -110,7 +110,7 @@ test('Darwin command backend binds fixed Seatbelt argv, returns raw output hashe
   assert.equal(launch.argv[3], '-e')
   assert.equal(launch.shell, false)
   assert.equal(launch.env.HOME, f.temp)
-  assert.equal(launch.env.PATH, path.dirname(process.execPath))
+  assert.equal(launch.env.PATH, [path.dirname(process.execPath), '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':'))
   assert.equal(launch.env.AUTOPROMPT_OWNERSHIP_RESERVATION, launch.reservationId)
   assert.equal(launch.env.GIT_CONFIG_NOSYSTEM, '1')
   assert.equal(launch.env.GIT_CONFIG_GLOBAL, '/dev/null')
@@ -137,6 +137,35 @@ test('Darwin command backend binds fixed Seatbelt argv, returns raw output hashe
   const alreadyAborted = new AbortController(); alreadyAborted.abort()
   await assert.rejects(backend.command(f.policy, { command: 'node -e "0"', cwd: f.scratch }, { signal: alreadyAborted.signal }), { code: 'TOOL_CANCELLED' })
   assert.equal(launchedAfterAbort, false)
+})
+
+test('Darwin command backend carries an exact controller Node binding instead of the host executable', async t => {
+  const f = fixture(t)
+  const controllerNode = path.join(f.root, 'controller-node')
+  fs.copyFileSync(process.execPath, controllerNode)
+  fs.chmodSync(controllerNode, 0o700)
+  let launch
+  const runner = {
+    async run(spec) {
+      launch = spec
+      const empty = crypto.createHash('sha256').update('').digest('hex')
+      return { status: 0, signal: null, stdoutBase64: '', stderrBase64: '', stdoutByteCount: 0, stderrByteCount: 0,
+        stdoutTruncated: false, stderrTruncated: false, stdoutSha256: empty, stderrSha256: empty,
+        processOwned: true, exactArgv: true, drained: true }
+    },
+    async stop() { return { drained: true } },
+  }
+  const nodeExecutable = { path: controllerNode, sha256: hashFile(controllerNode) }
+  const backend = sandbox.createDarwinCommandSandbox({ platform: 'darwin', controlRoot: f.control, tempRoot: f.temp,
+    helper: f.helper, sandboxExecutable: f.seatbelt, nodeExecutable,
+    processOwner: { adapter: { childControlEnvironment: id => ({ AUTOPROMPT_OWNERSHIP_RESERVATION: id }) } }, runner })
+  await backend.command(f.policy, { command: 'true', cwd: f.scratch, timeoutMs: 1000 })
+  assert.equal(launch.argv[2], controllerNode)
+  assert.equal(launch.env.PATH.split(':')[0], path.dirname(controllerNode))
+  assert.ok(launch.argv[1].includes(`(allow process-exec (literal ${JSON.stringify(controllerNode)}))`))
+  assert.deepEqual(backend.nodeExecutable, nodeExecutable)
+  fs.appendFileSync(controllerNode, 'changed')
+  await assert.rejects(backend.command(f.policy, { command: 'true', cwd: f.scratch, timeoutMs: 1000 }), { code: 'COMMAND_SANDBOX_UNSUPPORTED' })
 })
 
 test('Darwin native command sandbox isolates candidate, scratch, controller, network, launchd, and cancellation', { skip: process.platform !== 'darwin', timeout: 120000 }, async t => {
@@ -166,7 +195,7 @@ test('Darwin native command sandbox isolates candidate, scratch, controller, net
       if (records.length >= 8) break
     }
     const boundedResult = result && { status: result.status, signal: result.signal, stdout: typeof result.stdout === 'string' ? result.stdout.slice(-8192) : null, stderr: typeof result.stderr === 'string' ? result.stderr.slice(-8192) : null, outputSha256: result.outputSha256 || null, durationMs: result.durationMs }
-    console.error(JSON.stringify({ fixtureFailure: error?.code || error?.message || 'command returned failed status', result: boundedResult, records, ownPidDiagnostics: await ownPidDiagnostics(records, f.startedAt, ownedCodexPid) }))
+    console.error(JSON.stringify({ fixtureFailure: error?.code || error?.message || 'command returned failed status', helperDetails: error?.details || null, result: boundedResult, records, ownPidDiagnostics: await ownPidDiagnostics(records, f.startedAt, ownedCodexPid) }))
   }
   const runCommand = async (...args) => {
     try {
@@ -188,7 +217,7 @@ test('Darwin native command sandbox isolates candidate, scratch, controller, net
   assert.equal(accepted, 1, 'controller listener did not accept its control connection'); accepted = 0
   const readWrite = await runCommand(f.policy, { cwd: f.scratch, command: code(`const fs=require('fs');process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(f.target, 'candidate.txt'))},'utf8'));fs.writeFileSync(${JSON.stringify(path.join(f.scratch, 'proof.txt'))},'scratch')`) })
   assert.equal(readWrite.status, 'completed'); assert.equal(fs.readFileSync(path.join(f.scratch, 'proof.txt'), 'utf8'), 'scratch')
-  const denied = await runCommand(f.policy, { cwd: f.scratch, command: code(`const fs=require('fs'),cp=require('child_process'),net=require('net');let failures=0;for(const f of [()=>fs.readFileSync(${JSON.stringify(path.join(f.secret, 'private.txt'))}),()=>fs.writeFileSync(${JSON.stringify(path.join(f.target, 'candidate.txt'))},'bad'),()=>cp.spawnSync('/bin/launchctl',['print','system'])]){try{const r=f();if(r&&r.error) failures++}catch{failures++}}const s=net.connect(${port},'127.0.0.1');s.on('error',()=>{if(++failures===4)process.exit(0)});s.on('connect',()=>process.exit(19));setTimeout(()=>process.exit(failures===4?0:20),500)`) })
+  const denied = await runCommand(f.policy, { cwd: f.scratch, command: code(`const fs=require('fs'),cp=require('child_process'),net=require('net');let failures=0;for(const f of [()=>fs.readFileSync(${JSON.stringify(path.join(f.secret, 'private.txt'))}),()=>fs.writeFileSync(${JSON.stringify(path.join(f.target, 'candidate.txt'))},'bad'),()=>cp.spawnSync('/bin/launchctl',['print','system'])]){try{const r=f();if(r&&(r.error||r.status!==0)) failures++}catch{failures++}}const s=net.connect(${port},'127.0.0.1');s.on('error',()=>{if(++failures===4)process.exit(0)});s.on('connect',()=>process.exit(19));setTimeout(()=>process.exit(failures===4?0:20),500)`) })
   assert.equal(denied.status, 'completed'); assert.equal(fs.readFileSync(path.join(f.target, 'candidate.txt'), 'utf8'), 'candidate bytes'); assert.equal(accepted, 0, 'sandboxed child connected to the controller listener')
   const abort = new AbortController(); const held = runCommand(f.policy, { cwd: f.scratch, command: code('setInterval(()=>{},1000)') }, { signal: abort.signal, timeoutMs: 30000 })
   await new Promise(resolve => setTimeout(resolve, 250)); abort.abort()
@@ -227,4 +256,12 @@ test('Darwin startup diagnostic compares fixed trusted Node bootstrap profiles w
   console.error(JSON.stringify({ darwinStartupDiagnostic: { fixedNode: node, fixedSandboxExecutable: sandboxExecutable, results } }))
   assert.equal(results.length, variants.length)
   assert.ok(results.every(result => result.stdout === 'NODE_BOOTED' || result.stdout === ''), JSON.stringify(results))
+})
+
+test('Darwin packaged command admission proves IPv4/IPv6 denial and immutable Git metadata', { skip: process.platform !== 'darwin', timeout: 90000 }, async t => {
+  const result = await require('../../scripts/darwin-command-probe.cjs').probeDarwinCommandSandbox()
+  t.diagnostic(JSON.stringify(result))
+  assert.equal(result.supported, true, JSON.stringify(result))
+  assert.equal(result.processCleanup, 'kernel-coalition-drained')
+  assert.equal(result.gitGuard, 'UNCHANGED')
 })

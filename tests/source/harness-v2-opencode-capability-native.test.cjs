@@ -18,7 +18,7 @@ const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 const { modelService } = require('../helpers/harness-native-service.cjs')
-const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment } = require('../helpers/native-platform.cjs')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment, cleanupNativeFixture } = require('../helpers/native-platform.cjs')
 
 const selectedNativeCli = provider => process.env[`AUTOPROMPT_${provider.toUpperCase()}_TEST_CLI`] ? requiredNativeCli(provider) : undefined
 if (process.env.AUTOPROMPT_REQUIRE_NATIVE_TESTS === '1' && !process.env.AUTOPROMPT_OPENCODE_TEST_CLI && !process.env.AUTOPROMPT_KILO_TEST_CLI) throw new Error('AUTOPROMPT_OPENCODE_TEST_CLI or AUTOPROMPT_KILO_TEST_CLI is required; native certification cannot skip')
@@ -118,9 +118,9 @@ async function scenario(provider, options = {}) {
     }
     let closed = false
     return { ...f, provider, candidate, secret, marker, service, binding, owner, processAdapter, registryPath, adapter, run,
-      async close() { if (closed) return; closed = true; try { await owner.cancelAll({ reason: `${provider} capability cleanup`, graceMs: 0, killMs: 2000, waitForPending: true }) } finally { try { await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } } } }
+      async close() { if (closed) return; closed = true; await cleanupNativeFixture(f, provider, { stop: () => owner.cancelAll({ reason: `${provider} capability cleanup`, graceMs: 0, killMs: 2000, waitForPending: true }), close: () => service.close() }) } }
   } catch (error) {
-    try { if (owner) await owner.cancelAll({ reason: `${provider} capability setup failed`, graceMs: 0, killMs: 2000, waitForPending: true }) } finally { try { if (service) await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } }
+    try { await cleanupNativeFixture(f, provider, { stop: () => owner?.cancelAll({ reason: `${provider} capability setup failed`, graceMs: 0, killMs: 2000, waitForPending: true }), close: () => service?.close() }) } catch {}
     throw error
   }
 }

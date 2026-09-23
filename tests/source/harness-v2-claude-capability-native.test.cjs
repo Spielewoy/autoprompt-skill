@@ -21,7 +21,7 @@ const core = require('../../agents/codex/workflow/phase-budget.js')
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 const { modelService } = require('../helpers/harness-native-service.cjs')
 
-const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment, waitForNativeObservation } = require('../helpers/native-platform.cjs')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment, cleanupNativeFixture, waitForNativeObservation } = require('../helpers/native-platform.cjs')
 const CLI = requiredNativeCli('claude')
 
 function nativeFailureFiles(roots) {
@@ -145,16 +145,11 @@ async function scenario(t, options = {}) {
   let service, owner
   t.after(async () => {
     markPhase('cleanup-start')
-    try {
-      if (owner) await owner.cancelAll({ reason: 'claude native capability cleanup', graceMs: 0, killMs: 2000 })
-      markPhase('owner-drained')
-    } finally {
-      try { if (service) await service.close(); markPhase('service-closed') }
-      finally {
-        fs.rmSync(f.root, { recursive: true, force: true })
-        markPhase('cleanup-end')
-      }
-    }
+    await cleanupNativeFixture(f, 'claude', {
+      stop: async () => { if (owner) await owner.cancelAll({ reason: 'claude native capability cleanup', graceMs: 0, killMs: 2000 }); markPhase('owner-drained') },
+      close: async () => { if (service) await service.close(); markPhase('service-closed') },
+    })
+    markPhase('cleanup-end')
   })
   const candidate = path.join(f.target, 'candidate.txt')
   const secret = path.join(f.controller, 'private.txt')

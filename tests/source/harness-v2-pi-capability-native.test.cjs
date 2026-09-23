@@ -17,7 +17,7 @@ const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 const { piModelService } = require('../helpers/harness-pi-native-service.cjs')
-const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment } = require('../helpers/native-platform.cjs')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment, cleanupNativeFixture } = require('../helpers/native-platform.cjs')
 
 const CLIS = Object.freeze({ prime: process.env.AUTOPROMPT_PRIME_TEST_CLI, omp: process.env.AUTOPROMPT_OMP_TEST_CLI })
 if (process.env.AUTOPROMPT_REQUIRE_NATIVE_TESTS === '1' && !CLIS.prime && !CLIS.omp) throw new Error('AUTOPROMPT_PRIME_TEST_CLI or AUTOPROMPT_OMP_TEST_CLI is required; native certification cannot skip')
@@ -108,11 +108,12 @@ function fixtureFailureDiagnostic(f, error) {
   // Preserve the synthetic provider events and native stderr before cleanup
   // drains the child. This is bounded fixture data, not an ambient log dump.
   const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024),
+    failureDetails: error.details?.proxyFailure || null,
     stderr: String(f.nativeStderr || '').slice(-8192), events: [...(f.nativeEvents || [])] }
   const proxy = path.join(f.controller, 'proxy')
   output.proxy = []
   for (const name of fs.existsSync(proxy) ? fs.readdirSync(proxy, { recursive: true }) : []) {
-    if (!/(?:^|[\\/])(?:stderr\.log|status\.json)$/.test(name)) continue
+    if (!/(?:^|[\\/])(?:stderr\.log|status\.json|proxy-error\.json)$/.test(name)) continue
     const file = path.join(proxy, name), stat = fs.lstatSync(file)
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) continue
     output.proxy.push({ name, text: fs.readFileSync(file, 'utf8').slice(-4096) })
@@ -194,13 +195,11 @@ async function scenario(t, provider, options = {}) {
     t.after(async () => {
       if (closed) return
       closed = true
-      try { await owner.cancelAll({ reason: `${provider} capability cleanup`, graceMs: 0, killMs: 2000, waitForPending: true }) }
-      finally { try { await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } }
+      await cleanupNativeFixture(f, provider, { stop: () => owner.cancelAll({ reason: `${provider} capability cleanup`, graceMs: 0, killMs: 2000, waitForPending: true }), close: () => service.close() })
     })
     return { ...f, provider, cli, candidate, secret, marker, calls, service, binding, processAdapter, registryPath, owner, runner, adapter, run }
   } catch (error) {
-    try { if (owner) await owner.cancelAll({ reason: `${provider} capability setup failure`, graceMs: 0, killMs: 2000, waitForPending: true }) }
-    finally { try { if (service) await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } }
+    try { await cleanupNativeFixture(f, provider, { stop: () => owner?.cancelAll({ reason: `${provider} capability setup failure`, graceMs: 0, killMs: 2000, waitForPending: true }), close: () => service?.close() }) } catch {}
     throw error
   }
 }

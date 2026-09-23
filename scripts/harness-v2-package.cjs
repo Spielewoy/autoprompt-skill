@@ -130,6 +130,9 @@ function sourceInventory(provider, sourceRoot = ROOT) {
   // receipts before their transactional upgrade can run.
   helpers.push('scripts/install/prime-settings.cjs')
   if (path.resolve(sourceRoot) === ROOT || fs.existsSync(path.join(sourceRoot, 'scripts/darwin-runtime-setup.cjs'))) helpers.push('scripts/darwin-runtime-setup.cjs')
+  if (path.resolve(sourceRoot) === ROOT || fs.existsSync(path.join(sourceRoot, 'scripts/darwin-command-sandbox.cjs'))) {
+    helpers.push('scripts/darwin-command-sandbox.cjs', 'scripts/darwin-command-probe.cjs')
+  }
   for (const entry of scriptEntries) if (entry.isDirectory() && entry.name.startsWith('harness-v2-')) trees.push(`scripts/${entry.name}`)
   // Lifecycle fault fixtures intentionally contain only the runtime closure.
   // Only those explicit alternate source roots may omit diagnostic assets;

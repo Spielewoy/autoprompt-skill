@@ -56,6 +56,26 @@ function nativeEnvironment() {
   return environment
 }
 
+async function drainNativeCommandOwners(nativeRoot, provider, record) {
+  if (process.platform !== 'darwin') return { discovered: 0 }
+  if (!nativeRoot || !provider || !record?.activationId || !Number.isSafeInteger(record.generation) || record.generation < 1) {
+    throw new TypeError('Invalid native command-owner cleanup binding')
+  }
+  return require('../../scripts/harness-v2-command-owner-discovery.cjs').drainTrustedProviderRoot(nativeRoot, {
+    provider, activationId: record.activationId, generation: record.generation,
+  })
+}
+
+async function cleanupNativeFixture(fixture, provider, options = {}) {
+  let failure = null
+  try { await options.stop?.() } catch (error) { failure ||= error }
+  try { await drainNativeCommandOwners(fixture.nativeRoot, provider, fixture.record) } catch (error) { failure ||= error }
+  try { await options.close?.() } catch (error) { failure ||= error }
+  // Retain fixture state if authenticated secondary recovery could not finish.
+  if (failure) throw failure
+  fs.rmSync(fixture.root, { recursive: true, force: true })
+}
+
 async function waitForNativeObservation(pending, predicate, timeoutMs, description) {
   if (!pending || typeof pending.then !== 'function' || typeof predicate !== 'function' ||
       !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || typeof description !== 'string' || !description) {
@@ -85,4 +105,4 @@ async function waitForNativeObservation(pending, predicate, timeoutMs, descripti
   })
 }
 
-module.exports = { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment, waitForNativeObservation }
+module.exports = { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment, drainNativeCommandOwners, cleanupNativeFixture, waitForNativeObservation }

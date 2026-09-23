@@ -56,7 +56,7 @@ test('static Windows diagnostics require the system root and report only bundle 
 })
 
 test('static unsupported platform diagnostics retain explicit VM guidance', () => {
-  assert.throws(() => boundary.assertCommandSandboxPrerequisites({ platform: 'darwin' }), error =>
+  assert.throws(() => boundary.assertCommandSandboxPrerequisites({ platform: 'freebsd' }), error =>
     error.code === 'COMMAND_SANDBOX_UNSUPPORTED' && error.message.includes('Linux VM runtime'))
 })
 

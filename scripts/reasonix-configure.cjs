@@ -290,7 +290,7 @@ async function supervise(options = {}) {
     const context = {
       environment, expectedBranch, ExecutionAdapter: ReasonixExecAdapter,
       executionAdapterOptions: {
-        nativeRoot, connection: activation.connection, executableBinding: activation.executable,
+        provider: 'reasonix', nativeRoot, connection: activation.connection, executableBinding: activation.executable,
         credentialEnvironment: activation.credentialEnvironment,
         rolePrompt: role => {
           if (role === 'ap-run-owner') return readBound(path.join(activation.installed.bundle, 'agents/reasonix/SKILL.md')).toString('utf8').replace(/^---\n[\s\S]*?\n---\n/, '')

@@ -49,10 +49,29 @@ if ($projectText -cnotmatch '(?m)^version = "0\.21\.1"$') {
 }
 
 $pwsh = Join-Path $PSHOME 'pwsh.exe'
-& $pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installer `
-    -Commit $commit -ForceCommit -HermesHome $hermesHome -InstallDir $install `
-    -SkipSetup -SkipComputerUse -NonInteractive *>&1 | Tee-Object -FilePath $log
-if ($LASTEXITCODE -ne 0) { throw "Pinned Hermes installer failed with exit code $LASTEXITCODE" }
+$gitConfigKeys = @('GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1')
+$gitConfigSaved = @{}
+foreach ($key in $gitConfigKeys) { $gitConfigSaved[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
+try {
+    # The archive is immutable, but the installer performs a fresh checkout on
+    # Windows. Keep Git from rewriting tracked files before its exact commit
+    # check; these settings exist only in this child installer environment.
+    $env:GIT_CONFIG_COUNT = '2'
+    $env:GIT_CONFIG_KEY_0 = 'core.autocrlf'; $env:GIT_CONFIG_VALUE_0 = 'false'
+    $env:GIT_CONFIG_KEY_1 = 'core.safecrlf'; $env:GIT_CONFIG_VALUE_1 = 'false'
+    $installerExit = 1
+    & $pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installer `
+        -Commit $commit -ForceCommit -HermesHome $hermesHome -InstallDir $install `
+        -SkipSetup -SkipComputerUse -NonInteractive *>&1 | Tee-Object -FilePath $log
+    if ($null -ne $LASTEXITCODE) { $installerExit = [int]$LASTEXITCODE }
+} finally {
+    foreach ($key in $gitConfigKeys) {
+        if ($null -eq $gitConfigSaved[$key]) { Remove-Item "Env:$key" -ErrorAction SilentlyContinue }
+        else { Set-Item "Env:$key" $gitConfigSaved[$key] }
+    }
+}
+if ($installerExit -ne 0) { throw "Pinned Hermes installer failed with exit code $installerExit" }
+if (-not (Test-Path -LiteralPath $log -PathType Leaf)) { throw 'Pinned Hermes installer produced no lifecycle log' }
 
 $publicLauncher = Join-Path $hermesHome 'bin/hermes.exe'
 $venvLauncher = Join-Path $install 'venv/Scripts/hermes.exe'

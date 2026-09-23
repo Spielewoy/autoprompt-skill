@@ -18,7 +18,7 @@ const { validateJsonSchema } = require('../../agents/codex/workflow/json-schema-
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const controlled = require('../../scripts/harness-v2-controlled-tools.cjs')
-const { privateDirectory, nativeProcessAdapter, nativeEnvironment } = require('../helpers/native-platform.cjs')
+const { privateDirectory, nativeProcessAdapter, nativeEnvironment, cleanupNativeFixture } = require('../helpers/native-platform.cjs')
 const enabled = Boolean(process.env.AUTOPROMPT_REASONIX_TEST_CLI)
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`
 
@@ -82,10 +82,10 @@ async function realFixture(t, actions, options = {}) {
   const f = fixture(t, options.readOnly !== false, false)
   let owner, server
   t.after(async () => {
-    if (owner) await owner.cancelAll({ reason: 'Reasonix controlled test cleanup', graceMs: 0, killMs: 2000 })
-    server?.closeAllConnections?.()
-    if (server?.listening) await new Promise(resolve => server.close(resolve))
-    fs.rmSync(f.root, { recursive: true, force: true })
+    await cleanupNativeFixture(f, 'reasonix', {
+      stop: () => owner?.cancelAll({ reason: 'Reasonix controlled test cleanup', graceMs: 0, killMs: 2000 }),
+      close: async () => { server?.closeAllConnections?.(); if (server?.listening) await new Promise(resolve => server.close(resolve)) },
+    })
   })
   const executable = native.probeExecutable({ executable: process.env.AUTOPROMPT_REASONIX_TEST_CLI, env: f.env })
   const requests = [], events = [], errors = [], deltas = [], authenticated = [], providerEvents = [], endpointRequests = []

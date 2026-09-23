@@ -147,6 +147,46 @@ function chmodPrivate(target, mode) {
 }
 
 let windowsDefaultTokenOwnerEstablished = false
+let windowsBunKnownFolders
+function windowsTokenProfileFolders(systemRoot) {
+  if (!process.versions?.bun) {
+    let profileHome
+    try { profileHome = os.userInfo().homedir } catch (error) { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token profile root could not be resolved', { cause: error && error.code }) }
+    if (typeof profileHome !== 'string' || !/^[A-Za-z]:\\/u.test(profileHome)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token returned no usable profile root')
+    return { profileHome, localAppData: path.join(profileHome, 'AppData', 'Local'), roamingAppData: path.join(profileHome, 'AppData', 'Roaming') }
+  }
+  if (!windowsBunKnownFolders) {
+    const powershell = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    const script = [
+      "$ErrorActionPreference='Stop'",
+      '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)',
+      "$value=[ordered]@{profile=[Environment]::GetFolderPath('UserProfile');local=[Environment]::GetFolderPath('LocalApplicationData');roaming=[Environment]::GetFolderPath('ApplicationData')}",
+      '[Console]::Out.Write(($value|ConvertTo-Json -Compress))',
+    ].join(';')
+    const result = spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8', windowsHide: true, shell: false, timeout: 30000, maxBuffer: 65536,
+      stdio: ['ignore', 'pipe', 'pipe'], cwd: path.win32.dirname(powershell),
+      // Do not project HOME, USERPROFILE, APPDATA or LOCALAPPDATA. The fixed
+      // .NET calls resolve known folders for the process token independently
+      // of a bundled runtime's Node-compatibility environment behavior.
+      env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32') },
+    })
+    if (result.error || result.signal || result.status !== 0 || result.stderr) {
+      throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token known folders could not be resolved', {
+        status: result.status, signal: result.signal, cause: result.error && result.error.code,
+      })
+    }
+    let parsed
+    try { parsed = JSON.parse(result.stdout) } catch { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token known-folder helper returned invalid JSON') }
+    if (!parsed || Object.keys(parsed).sort().join(',') !== 'local,profile,roaming' ||
+        ![parsed.profile, parsed.local, parsed.roaming].every(value => typeof value === 'string' && /^[A-Za-z]:\\/u.test(value))) {
+      throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token known-folder helper returned invalid paths')
+    }
+    windowsBunKnownFolders = Object.freeze({ profileHome: parsed.profile, localAppData: parsed.local, roamingAppData: parsed.roaming })
+  }
+  return windowsBunKnownFolders
+}
+
 function ensureWindowsDefaultTokenOwner() {
   if (process.platform !== 'win32' || windowsDefaultTokenOwnerEstablished) {
     return { supported: true, mechanism: process.platform === 'win32' ? 'windows-token-owner' : 'posix-owner' }
@@ -252,12 +292,10 @@ function createWindowsCompilerDirectory(prefix = 'autoprompt-compiler-') {
   if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) {
     throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows system root is unavailable for the private compiler helper')
   }
-  // userInfo reads the token's OS profile. homedir() and spawned environment
-  // lookups can use the caller's deliberately isolated, deeply nested home.
-  let profileHome
-  try { profileHome = os.userInfo().homedir } catch (error) { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token profile root could not be resolved', { cause: error && error.code }) }
-  if (typeof profileHome !== 'string' || !/^[A-Za-z]:\\/u.test(profileHome)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token returned no usable profile root')
-  const localAppData = path.join(profileHome, 'AppData', 'Local')
+  // Node's userInfo is token-backed on Windows. Bun's Node compatibility
+  // layer can instead follow the deliberately isolated HOME/USERPROFILE, so
+  // that runtime uses fixed .NET known-folder calls in a clean child.
+  const { localAppData } = windowsTokenProfileFolders(systemRoot)
   const inspectedLocalAppData = inspectPathNoFollow(localAppData)
   if (!inspectedLocalAppData.exists || !inspectedLocalAppData.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token local application data root is unavailable')
   let temporary
@@ -368,10 +406,10 @@ function windowsPowerShellEnvironment(extra = {}) {
 
 function windowsControllerEnvironment(systemRoot, temporary) {
   if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows system root is unavailable for the controller environment')
-  let profileHome
-  try { profileHome = os.userInfo().homedir } catch (error) { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile is unavailable', { cause: error && error.code }) }
-  if (typeof profileHome !== 'string' || !/^[A-Za-z]:\\/u.test(profileHome)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile is unavailable')
-  const profile = inspectPathNoFollow(profileHome), appData = inspectPathNoFollow(path.join(profileHome, 'AppData')), roaming = inspectPathNoFollow(path.join(profileHome, 'AppData', 'Roaming')), local = inspectPathNoFollow(path.join(profileHome, 'AppData', 'Local'))
+  const { profileHome, localAppData, roamingAppData } = windowsTokenProfileFolders(systemRoot)
+  const appDataPath = path.dirname(localAppData)
+  if (normalizeIdentityPath(appDataPath) !== normalizeIdentityPath(path.dirname(roamingAppData)) || !pathIsInside(profileHome, appDataPath)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile folders are not contained by one profile')
+  const profile = inspectPathNoFollow(profileHome), appData = inspectPathNoFollow(appDataPath), roaming = inspectPathNoFollow(roamingAppData), local = inspectPathNoFollow(localAppData)
   if (!profile.exists || !profile.realpath || !appData.exists || !appData.realpath || !roaming.exists || !roaming.realpath || !local.exists || !local.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile folders are unavailable')
   const tempPath = temporary || path.join(local.realpath, 'Temp'), temp = inspectPathNoFollow(tempPath)
   if (!temp.exists || !temp.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows controller temporary folder is unavailable')

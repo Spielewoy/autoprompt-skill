@@ -53,6 +53,7 @@ function boundFile(file, maxBytes, singleLink = true) {
 }
 function validateLaunch(input) {
   const keys = ['profileName', 'profileSid', 'executable', 'executableSha256', 'arguments', 'cwd', 'environment', 'timeoutMs', 'outputLimit', 'cancellationPath']
+  if (input && Object.hasOwn(input, 'relayStdin')) keys.push('relayStdin')
   if (input && Object.hasOwn(input, 'msysRuntime')) keys.push('msysRuntime')
   if (!exact(input, keys) || !/^Autoprompt_[a-f0-9]{32}$/.test(input.profileName) || !/^S-1-15-2-(?:[0-9]+-){6}[0-9]+$/.test(input.profileSid) ||
       !/^[a-f0-9]{64}$/.test(input.executableSha256) || !Array.isArray(input.arguments) || input.arguments.length > 256 ||
@@ -68,6 +69,7 @@ function validateLaunch(input) {
         path.win32.dirname(runtime.dllPath).toLowerCase() !== path.win32.dirname(input.executable).toLowerCase() ||
         !/^[a-f0-9]{64}$/.test(runtime.dllSha256) || !/^msys-2\.0S[1-9][0-9]{0,8}$/.test(runtime.sharedId)) fail('WINDOWS_LAUNCH_INVALID', 'Invalid bound MSYS runtime descriptor')
   }
+  if (Object.hasOwn(input, 'relayStdin') && input.relayStdin !== true) fail('WINDOWS_LAUNCH_INVALID', 'Relay stdin mode must be explicitly enabled')
   if (Buffer.byteLength(JSON.stringify(input)) > 120000) fail('WINDOWS_LAUNCH_INVALID', 'AppContainer launch exceeds its request bound')
   return { schemaVersion: 1, ...input }
 }
@@ -127,10 +129,23 @@ function createWindowsAppContainerLauncher(options = {}) {
         if (runtime.sha256 !== request.msysRuntime.dllSha256) fail('WINDOWS_RUNTIME_MISMATCH', 'Assigned MSYS runtime changed')
       }
       const compilerDirectory = createWindowsCompilerDirectory('autoprompt-launch-')
+      const relay = request.relayStdin === true
+      if (relay && (!options.relayStdin || typeof options.relayStdin.on !== 'function')) {
+        fs.rmSync(compilerDirectory, { recursive: true, force: true })
+        fail('WINDOWS_LAUNCH_INVALID', 'Relay stdin requires the authenticated inherited stream')
+      }
+      const requestPath = path.join(compilerDirectory, 'request.json')
+      const requestBytes = Buffer.from(JSON.stringify(request))
+      if (relay) {
+        capture.assertRecordParent(requestPath)
+        fs.writeFileSync(requestPath, requestBytes, { flag: 'wx', mode: 0o600 })
+        if (boundFile(requestPath, 131072).sha256 !== digest(requestBytes)) fail('WINDOWS_RUNTIME_MISMATCH', 'Relay launch request changed')
+      }
+      const requestSha256 = digest(requestBytes)
       return new Promise((resolve, reject) => {
         startedLeases.add(options.leaseId)
-        const child = cp.spawn(powershell.path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helper.path, '-NativeSha256', native.sha256, '-Request'], {
-          windowsHide: true, shell: false, cwd: path.dirname(powershell.path), stdio: ['pipe', 'pipe', 'pipe'],
+        const child = cp.spawn(powershell.path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helper.path, '-NativeSha256', native.sha256, ...(relay ? ['-RequestPath', requestPath, '-RequestSha256', requestSha256] : ['-Request'])], {
+          windowsHide: true, shell: false, cwd: path.dirname(powershell.path), stdio: [relay ? options.relayStdin : 'pipe', 'pipe', 'pipe'],
           env: windowsControllerEnvironment(systemRoot, compilerDirectory),
         })
         const output = [], errors = []; let size = 0, settled = false, overLimit = false
@@ -140,7 +155,7 @@ function createWindowsAppContainerLauncher(options = {}) {
         const finish = () => { settled = true; stopWatchdog(); options.signal?.removeEventListener('abort', cancel) }
         const collect = list => bytes => { size += bytes.length; if (size > 3 * MAX_OUTPUT) { overLimit = true; cancel(); return } list.push(bytes) }
         child.stdout.on('data', collect(output)); child.stderr.on('data', collect(errors))
-        child.stdin.on('error', () => {})
+        ;(relay ? options.relayStdin : child.stdin).on('error', () => {})
         child.once('error', error => { if (settled) return; finish(); reject(new WindowsAppContainerError('WINDOWS_LAUNCH_UNAVAILABLE', error.code || 'AppContainer helper failed')) })
         child.once('close', (status, signal) => {
           if (settled) return
@@ -153,7 +168,7 @@ function createWindowsAppContainerLauncher(options = {}) {
             resolve(evidence)
           } catch (error) { reject(error) }
         })
-        child.stdin.end(JSON.stringify(request))
+        if (!relay) child.stdin.end(JSON.stringify(request))
       }).finally(() => fs.rmSync(compilerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
     },
   })

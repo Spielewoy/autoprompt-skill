@@ -15,7 +15,7 @@ const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
-const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment } = require('../helpers/native-platform.cjs')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment, cleanupNativeFixture } = require('../helpers/native-platform.cjs')
 const CLI = process.env.AUTOPROMPT_HERMES_TEST_CLI
 const options = { skip: !CLI, timeout: 300000 }
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -142,7 +142,7 @@ async function scenario(t, config = {}) {
     assert.ok(service.requests.some(request => JSON.stringify(request.messages).includes('CLOSED_CANARY_CHALLENGE:' + f.challenge)), 'actual Hermes controller output omitted canary challenge')
     return result
   }
-  t.after(async () => { try { await owner.cancelAll({ reason: 'hermes native capability cleanup', graceMs: 0, killMs: 2000, waitForPending: true }) } finally { service.server.closeAllConnections?.(); await new Promise(resolve => service.server.close(resolve)); fs.rmSync(f.root, { recursive: true, force: true }) } })
+  t.after(async () => { await cleanupNativeFixture(f, 'hermes', { stop: () => owner.cancelAll({ reason: 'hermes native capability cleanup', graceMs: 0, killMs: 2000, waitForPending: true }), close: async () => { service.server.closeAllConnections?.(); await new Promise(resolve => service.server.close(resolve)) } }) })
   return { ...values, service, binding, owner, adapter, processAdapter, run }
 }
 function successful(result, expectedReceipts = 1) {

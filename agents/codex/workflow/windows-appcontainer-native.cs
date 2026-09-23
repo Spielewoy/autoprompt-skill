@@ -71,6 +71,9 @@ public static class WindowsAppContainerNative {
  [DllImport("ntdll.dll")] static extern Int32 NtQuerySecurityObject(IntPtr handle,UInt32 information,IntPtr descriptor,UInt32 length,out UInt32 required);
  [DllImport("ntdll.dll")] static extern Int32 NtQueryObject(IntPtr handle,Int32 information,IntPtr buffer,UInt32 length,out UInt32 required);
  [DllImport("kernel32.dll",SetLastError=true)] static extern UInt32 GetFileType(IntPtr handle);
+ [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetStdHandle(Int32 handle);
+ [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetCurrentProcess();
+ [DllImport("kernel32.dll",SetLastError=true)] static extern Boolean DuplicateHandle(IntPtr sourceProcess,IntPtr sourceHandle,IntPtr targetProcess,out IntPtr targetHandle,UInt32 access,Boolean inherit,UInt32 options);
  [DllImport("kernel32.dll",SetLastError=true)] static extern Boolean GetHandleInformation(IntPtr handle,out UInt32 flags);
  [DllImport("ntdll.dll")] static extern UInt16 RtlUpcaseUnicodeChar(UInt16 value);
  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern UInt32 GetFinalPathNameByHandle(IntPtr handle,StringBuilder name,UInt32 length,UInt32 flags);
@@ -277,6 +280,9 @@ public static class WindowsAppContainerNative {
   return Launch(executable,executableSha256,arguments,cwd,environmentEntries,timeoutMs,outputLimit,appSid,expectedSid,cancellationPath,null);
  }
  public static LaunchResult Launch(String executable,String executableSha256,String[] arguments,String cwd,String[] environmentEntries,Int32 timeoutMs,Int32 outputLimit,IntPtr appSid,String expectedSid,String cancellationPath,MsysNamespaceRequest msysRuntime) {
+  return Launch(executable,executableSha256,arguments,cwd,environmentEntries,timeoutMs,outputLimit,appSid,expectedSid,cancellationPath,msysRuntime,false);
+ }
+ public static LaunchResult Launch(String executable,String executableSha256,String[] arguments,String cwd,String[] environmentEntries,Int32 timeoutMs,Int32 outputLimit,IntPtr appSid,String expectedSid,String cancellationPath,MsysNamespaceRequest msysRuntime,Boolean relayStdin) {
   lock(undrainedNamespaces){if(undrainedNamespaces.Count!=0)throw new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED");}
   if(arguments==null||arguments.Length>256||arguments.Any(x=>x==null||x.IndexOf('\0')>=0)||timeoutMs<1||timeoutMs>300000||outputLimit<1||outputLimit>1048576||Sid(appSid)!=expectedSid)throw new InvalidOperationException("WINDOWS_LAUNCH_INVALID");
   environmentEntries=PrepareControllerProfileEnvironment(environmentEntries);
@@ -287,7 +293,8 @@ public static class WindowsAppContainerNative {
    var security=new SECURITY_CAPABILITIES{AppContainerSid=appSid,Capabilities=IntPtr.Zero,CapabilityCount=0,Reserved=0};int capsSize=Marshal.SizeOf(typeof(SECURITY_CAPABILITIES));caps=Marshal.AllocHGlobal(capsSize);Marshal.StructureToPtr(security,caps,false);Check(UpdateProcThreadAttribute(list,0,(IntPtr)PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,caps,(IntPtr)capsSize,IntPtr.Zero,IntPtr.Zero),"security-capabilities");
    if(msysRuntime!=null){mitigation=Marshal.AllocHGlobal(8);Marshal.WriteInt64(mitigation,unchecked((Int64)MsysCompatibilityMitigation));Check(UpdateProcThreadAttribute(list,0,(IntPtr)PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,mitigation,(IntPtr)8,IntPtr.Zero,IntPtr.Zero),"msys-mitigation");}
    var inherit=new SECURITY_ATTRIBUTES{nLength=Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)),inherit=true};Check(CreatePipe(out stdoutRead,out stdoutWrite,ref inherit,0),"stdout-pipe");Check(CreatePipe(out stderrRead,out stderrWrite,ref inherit,0),"stderr-pipe");Check(SetHandleInformation(stdoutRead,HANDLE_FLAG_INHERIT,0),"stdout-private");Check(SetHandleInformation(stderrRead,HANDLE_FLAG_INHERIT,0),"stderr-private");
-   nulRead=CreateFile("NUL",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,ref inherit,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,IntPtr.Zero);if(nulRead==new IntPtr(-1)){nulRead=IntPtr.Zero;throw new Win32Exception(Marshal.GetLastWin32Error(),"stdin-nul");}
+   if(relayStdin){IntPtr source=GetStdHandle(-10);UInt32 relayFlags;if(source==IntPtr.Zero||source==new IntPtr(-1)||GetFileType(source)!=3||!GetHandleInformation(source,out relayFlags)||(relayFlags&HANDLE_FLAG_INHERIT)==0)throw new InvalidOperationException("WINDOWS_RELAY_STDIN_INVALID");if(!DuplicateHandle(GetCurrentProcess(),source,GetCurrentProcess(),out nulRead,0,true,2)||nulRead==IntPtr.Zero||nulRead==new IntPtr(-1))throw new Win32Exception(Marshal.GetLastWin32Error(),"relay-stdin-duplicate");}
+   else {nulRead=CreateFile("NUL",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,ref inherit,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,IntPtr.Zero);if(nulRead==new IntPtr(-1)){nulRead=IntPtr.Zero;throw new Win32Exception(Marshal.GetLastWin32Error(),"stdin-nul");}}
    privateNull=CreateFile("NUL",PrivateNullAccess,FILE_SHARE_READ|FILE_SHARE_WRITE,ref inherit,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,IntPtr.Zero);if(privateNull==new IntPtr(-1)){privateNull=IntPtr.Zero;throw new Win32Exception(Marshal.GetLastWin32Error(),"private-nul");}
    VerifyPrivateNullHandle(privateNull);
    handleList=Marshal.AllocHGlobal(IntPtr.Size*4);Marshal.WriteIntPtr(handleList,0,nulRead);Marshal.WriteIntPtr(handleList,IntPtr.Size,stdoutWrite);Marshal.WriteIntPtr(handleList,IntPtr.Size*2,stderrWrite);Marshal.WriteIntPtr(handleList,IntPtr.Size*3,privateNull);Check(UpdateProcThreadAttribute(list,0,(IntPtr)PROC_THREAD_ATTRIBUTE_HANDLE_LIST,handleList,(IntPtr)(IntPtr.Size*4),IntPtr.Zero,IntPtr.Zero),"owned-handle-list");

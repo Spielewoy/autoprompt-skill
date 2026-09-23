@@ -397,12 +397,18 @@ function prepareReasonixBoundary({ nativeRoot, launchRoot, record, targetPath, s
   }
   const toolRoot = path.join(launchRoot, 'tools')
   privateDirectory(toolRoot)
-  return boundary.prepareBoundary({ provider: 'reasonix', root: toolRoot, policy: {
-    schemaVersion: 1, activationId: record.activationId, sessionId: record.sessionId, reservationId: record.reservationId,
+  const darwinCommandOwner = process.platform === 'darwin'
+    ? { manifestRoot: require('../../../scripts/harness-v2-command-owner-discovery.cjs').createDiscoveryRoot(nativeRoot, { provider: 'reasonix', activationId: record.activationId, generation: record.generation }), providerPrivateOwnershipRoot: nativeRoot }
+    : undefined
+  const prepared = boundary.prepareBoundary({ provider: 'reasonix', root: toolRoot, darwinCommandOwner, policy: {
+    schemaVersion: 1, activationId: record.activationId, generation: record.generation, sessionId: record.sessionId, reservationId: record.reservationId,
     readOnly, toolFree: record.providerToolCallLimit === 0, targetPath: candidate, scratchPath,
     readableRoots: [candidate, scratchPath], writableRoots: readOnly ? [scratchPath] : [candidate, scratchPath],
     nestedDispatch: false, commandBoundary: true, externalWrites: false,
   } })
+  if (prepared.darwinCommandOwner) require('../../../scripts/harness-v2-command-owner-discovery.cjs').registerCanaryDiscovery(
+    prepared.policyPath, prepared.policySha256, prepared.darwinCommandOwner)
+  return prepared
 }
 
 class ReasonixExecAdapter {
@@ -535,6 +541,7 @@ class ReasonixExecAdapter {
       if (quotaRelay) {
         try { await quotaRelay.close() } catch (error) { stop(error) }
       }
+      try { await require('../../../scripts/harness-v2-tool-boundary.cjs').drainDarwinCommandOwner(toolBoundary) } catch (error) { stop(error) }
     }
     if (stopPromise) {
       let stopped

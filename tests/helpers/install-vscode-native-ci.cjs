@@ -85,8 +85,8 @@ function findExecutable(root) {
     return { executable, bundleRoot: root }
   }
   const app = path.join(root, 'Visual Studio Code.app')
-  const executable = path.join(app, 'Contents', 'MacOS', 'Electron')
-  assert.ok(fs.statSync(executable).isFile(), `VS Code Electron missing: ${executable}`)
+  const executable = path.join(app, 'Contents', 'MacOS', 'Code')
+  assert.ok(fs.statSync(executable).isFile(), `VS Code macOS Code executable missing: ${executable}`)
   return { executable, bundleRoot: app }
 }
 

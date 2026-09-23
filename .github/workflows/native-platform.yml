@@ -1162,6 +1162,12 @@ jobs:
         run: |
           set -o pipefail
           node --test --test-reporter=tap tests/source/windows-appcontainer-internal-loopback.test.cjs 2>&1 | tee windows-internal-loopback.log
+      - name: Verify inherited authenticated relay stdin through native AppContainer
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/windows-appcontainer-relay-native.test.cjs 2>&1 | tee windows-relay-native.log
       - name: Acquire the pinned official Hermes Windows installation
         if: ${{ !cancelled() }}
         timeout-minutes: 25
@@ -1182,6 +1188,7 @@ jobs:
           name: provider-primitives-${{ matrix.os }}
           path: |
             windows-internal-loopback.log
+            windows-relay-native.log
             hermes-windows-launcher.tap
             ${{ runner.temp }}/hermes-windows-launcher-evidence.json
             ${{ runner.temp }}/hermes-windows-0.21.1/official-installer.log
@@ -1270,7 +1277,9 @@ jobs:
         with:
           node-version: 24.x
           architecture: ${{ matrix.runner.arch }}
+      - run: npm ci --ignore-scripts
       - name: Acquire and hash the official VS Code archive
+        shell: bash
         run: node tests/helpers/install-vscode-native-ci.cjs | tee vscode-native-acquisition.json
       - name: Probe the native VS Code bundle and preserve identity
         shell: bash

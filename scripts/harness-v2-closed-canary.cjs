@@ -121,6 +121,9 @@ async function drainRegistered(root, binding, options = {}) {
   if (!fs.existsSync(root)) return
   let failure = null
   for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    // Darwin command-owner pointers have their own authenticated schema and
+    // drain path. They are never legacy nested ProcessOwner registrations.
+    if (entry.name === 'darwin-command-discovery-v1' && entry.isDirectory() && !entry.isSymbolicLink()) continue
     if (!entry.isDirectory() || entry.isSymbolicLink()) continue
     const directory = path.join(root, entry.name), metaPath = path.join(directory, 'registration.json'), registryPath = path.join(directory, 'processes.json')
     let meta
@@ -140,6 +143,18 @@ async function drainRegistered(root, binding, options = {}) {
   }
   if (failure) throw failure
 }
+async function drainDarwinCommandDiscovery(ownershipRoot, binding, options = {}) {
+  if ((options.platform || process.platform) !== 'darwin') return { discovered: 0 }
+  if (!path.isAbsolute(ownershipRoot || '') || !binding || typeof binding.provider !== 'string' ||
+      typeof binding.activationId !== 'string' || !Number.isSafeInteger(binding.generation) || binding.generation < 1 ||
+      typeof binding.challenge !== 'string') {
+    fail('LOCAL_CANARY_INVALID', 'Darwin command recovery binding is invalid')
+  }
+  return require('./harness-v2-command-owner-discovery.cjs').drainCanaryDiscovery(ownershipRoot, {
+    provider: binding.provider, activationId: binding.activationId, generation: binding.generation,
+  }, binding.challenge, { platform: options.platform, createPlatformAdapter: options.createPlatformAdapter })
+}
+
 async function ownedTest(owner, root, env, argv, timeoutMs = 300000, signal, options = {}) {
   const postStatusDelayMs = options.postStatusDelayMs === undefined ? 0 : options.postStatusDelayMs
   const failFastTap = options.failFastTap === true
@@ -291,12 +306,18 @@ async function run(options = {}) {
   return { challenge, observations:results, artifacts }
   } finally {
     signal?.removeEventListener('abort', cancel)
-    let outerDrainFailure
+    const drainFailures = []
     try { await owner.cancelAll({ reason: 'closed canary finished', graceMs: 500, killMs: 2000, waitForPending: true }) }
-    catch (error) { outerDrainFailure = error }
+    catch (error) { drainFailures.push(error) }
     try { await drainRegistered(env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, { provider, activationId: activation.activationId, generation, challenge }, { platform, providerPrivateOwnershipRoot: activation.activationRoot, trustedOwnershipRoots: [activation.activationRoot], createPlatformAdapter: options.createPlatformAdapter }) }
-    catch (error) { if (outerDrainFailure) outerDrainFailure.nestedDrainFailure = error; else throw error }
-    if (outerDrainFailure) throw outerDrainFailure
+    catch (error) { drainFailures.push(error) }
+    try { await drainDarwinCommandDiscovery(env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, { provider, activationId: activation.activationId, generation, challenge }, { platform, createPlatformAdapter: options.createPlatformAdapter }) }
+    catch (error) { drainFailures.push(error) }
+    if (drainFailures.length) {
+      const [primary, ...secondary] = drainFailures
+      if (secondary.length) primary.secondaryDrainFailures = secondary
+      throw primary
+    }
   }
 }
 async function closedOwnedTest(requestPath) {
@@ -406,4 +427,4 @@ async function closedOwnedTest(requestPath) {
   })
 }
 if (require.main === module && process.argv[2] === '--closed-owned-test') closedOwnedTest(process.argv[3]).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1 })
-module.exports = { run, closedEnvironment, tapCases, ownedTest, drainRegistered, closedCanaryProcessAdapter, claimPrivateCanaryDirectory, closedCanaryBatchTimeout }
+module.exports = { run, closedEnvironment, tapCases, ownedTest, drainRegistered, drainDarwinCommandDiscovery, closedCanaryProcessAdapter, claimPrivateCanaryDirectory, closedCanaryBatchTimeout }

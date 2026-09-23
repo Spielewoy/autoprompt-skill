@@ -53,6 +53,15 @@ async function waitFor(predicate, message) {
   assert.fail(message)
 }
 
+test('owned proxy runner rejects a changed controller Node binding before launch', () => {
+  const boundNode = { path: fs.realpathSync.native(process.execPath), sha256: native.executableSha256(fs.realpathSync.native(process.execPath)) }
+  assert.throws(() => new core.OwnedCodexProxyRunner({ controlRoot: os.tmpdir(), targetKey: 'bound-node-unit',
+    processOwner: { launch() { throw new Error('must not launch') }, cancelGroup() {} },
+    boundNode: { ...boundNode, sha256: '0'.repeat(64) } }), { code: 'CODEX_PROXY_BINDING_INVALID' })
+  assert.doesNotThrow(() => new core.OwnedCodexProxyRunner({ controlRoot: os.tmpdir(), targetKey: 'bound-node-unit',
+    processOwner: { launch() { throw new Error('must not launch') }, cancelGroup() {} }, boundNode }))
+})
+
 // These filesystem/preflight tests intentionally replace the native launch
 // boundary. They prove preparation and rejection behavior, not native execution.
 test('adapter prepares an owned private tool directory before constructing the native launch', async t => {

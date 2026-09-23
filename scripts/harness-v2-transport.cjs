@@ -1306,11 +1306,16 @@ class HarnessExecAdapter {
     }
     const toolRoot = path.join(launchRoot, 'tool-control')
     privateDirectory(toolRoot)
-    const toolBoundary = boundary.prepareBoundary({ provider: this.provider, root: toolRoot,
-      policy: { sessionId: record.sessionId, reservationId: record.reservationId, readOnly, toolFree: record.providerToolCallLimit === 0,
+    const darwinCommandOwner = process.platform === 'darwin'
+      ? { manifestRoot: require('./harness-v2-command-owner-discovery.cjs').createDiscoveryRoot(this.nativeRoot, { provider: this.provider, activationId: record.activationId, generation: record.generation }), providerPrivateOwnershipRoot: this.nativeRoot }
+      : undefined
+    const toolBoundary = boundary.prepareBoundary({ provider: this.provider, root: toolRoot, darwinCommandOwner,
+      policy: { activationId: record.activationId, generation: record.generation, sessionId: record.sessionId, reservationId: record.reservationId, readOnly, toolFree: record.providerToolCallLimit === 0,
         targetPath: candidatePath, scratchPath, readableRoots: [candidatePath, scratchPath],
         writableRoots: readOnly ? [scratchPath] : [candidatePath, scratchPath],
         nestedDispatch: false, commandBoundary: true, externalWrites: false } })
+    if (toolBoundary.darwinCommandOwner) require('./harness-v2-command-owner-discovery.cjs').registerCanaryDiscovery(
+      toolBoundary.policyPath, toolBoundary.policySha256, toolBoundary.darwinCommandOwner)
     const schema = core.codexProviderCanonicalOutputSchema(record, JSON.parse(readBound(this.outputSchemaResolver(record))))
     const outcomeProjection = nativeOutcomeDescriptionProjection(record, schema)
     const routeProjection = routeAdvisoryProjection(record, schema, this.provider)
@@ -1515,6 +1520,7 @@ class HarnessExecAdapter {
           if (!(closingAfterNativeResult && relayCleanupAbort(error))) stop(error)
         }
       }
+      try { await boundary.drainDarwinCommandOwner(toolBoundary) } catch (error) { stop(error) }
     }
     if (stopPromise) {
       const stopped = await stopPromise

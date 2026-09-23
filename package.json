@@ -28,6 +28,8 @@
     "scripts/codex-runtime-identity.cjs",
     "scripts/local-only-safety.cjs",
     "scripts/windows-git-bootstrap-config.cjs",
+    "scripts/darwin-command-sandbox.cjs",
+    "scripts/darwin-command-probe.cjs",
     "scripts/harness-provider-config.cjs",
     "scripts/harness-v2-*.cjs",
     "scripts/harness-v2-trust/",

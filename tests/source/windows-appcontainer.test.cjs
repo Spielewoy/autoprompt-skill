@@ -69,7 +69,7 @@ function windowsModule(file, replacements = {}, directory, globals = {}) {
   } : null
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), {
     module, exports: module.exports, __dirname: directory || path.dirname(filename), Buffer, ...globals,
-    process: { platform: 'win32', arch: process.arch, pid: process.pid, execPath: process.execPath,
+    process: { platform: 'win32', arch: process.arch, pid: process.pid, execPath: process.execPath, versions: globals.versions || process.versions,
       env: { SystemRoot: 'C:\\Windows', NODE_OPTIONS: '--require must-not-inherit', OPENAI_API_KEY: 'must-not-inherit', ...(globals.env || {}) } },
     require: name => Object.hasOwn(replacements, name) ? (name === './safe-run-root.js' ? { ensureWindowsDefaultTokenOwner() {}, windowsControllerEnvironment: () => ({ TEMP: require('node:os').tmpdir() }), ...replacements[name] } : replacements[name])
       : name === 'node:fs' && mappedFs ? mappedFs
@@ -227,6 +227,31 @@ test('Windows ownership setup preserves a Unicode known folder and ignores hosti
   assert.equal(safe.ensureWindowsDefaultTokenOwner().supported, true)
   assert.equal(acl.length, 1)
   assert.equal(path.win32.dirname(acl[0].env.AUTOPROMPT_PRIVATE_ACL_PATH), windowsFixturePath(knownFolder))
+})
+
+test('bundled Bun resolves Windows token folders without trusting isolated profile variables', t => {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'bun-known-folders-')))
+  const profile = path.join(base, 'token-profile'), hostile = path.join(base, 'isolated-home')
+  for (const directory of [path.join(profile, 'AppData', 'Local', 'Temp'), path.join(profile, 'AppData', 'Roaming'), hostile]) fs.mkdirSync(directory, { recursive: true })
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  let query
+  const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(file, argv, options) {
+    query = { file, argv, options }
+    return { status: 0, signal: null, stderr: '', stdout: JSON.stringify({
+      profile: windowsFixturePath(profile), local: windowsFixturePath(path.join(profile, 'AppData', 'Local')),
+      roaming: windowsFixturePath(path.join(profile, 'AppData', 'Roaming')),
+    }) }
+  } } }, undefined, { userInfoHome: hostile, versions: { ...process.versions, bun: '1.3.14' },
+    env: { HOME: windowsFixturePath(hostile), USERPROFILE: windowsFixturePath(hostile), APPDATA: windowsFixturePath(hostile), LOCALAPPDATA: windowsFixturePath(hostile) } })
+  const environment = safe.windowsControllerEnvironment('C:\\Windows')
+  assert.equal(query.file, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+  assert.match(query.argv.at(-1), /GetFolderPath\('UserProfile'\)/)
+  assert.deepEqual({ ...query.options.env }, { SystemRoot: 'C:\\Windows', WINDIR: 'C:\\Windows', SystemDrive: 'C:', PATH: 'C:\\Windows\\System32' })
+  assert.equal(environment.USERPROFILE, windowsFixturePath(profile))
+  assert.equal(environment.HOME, windowsFixturePath(profile))
+  assert.equal(environment.LOCALAPPDATA, windowsFixturePath(path.join(profile, 'AppData', 'Local')))
+  assert.equal(environment.APPDATA, windowsFixturePath(path.join(profile, 'AppData', 'Roaming')))
+  assert.equal(environment.TEMP, windowsFixturePath(path.join(profile, 'AppData', 'Local', 'Temp')))
 })
 
 test('Windows ownership setup refuses an invalid authoritative local-app-data result', () => {

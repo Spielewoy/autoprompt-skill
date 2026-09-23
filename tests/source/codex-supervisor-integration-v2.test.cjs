@@ -17660,6 +17660,29 @@ test('AP-RUN-032 proxy request and status records reject foreign generations and
   await assert.rejects(run(3), error => error.code === 'CODEX_PROXY_STATUS_INVALID')
 })
 
+test('owned proxy missing status reports only its bounded private failure diagnostic', async t => {
+  const directory = tempDirectory(t, 'autoprompt-proxy-failure-'), controlRoot = path.join(directory, 'control')
+  fs.mkdirSync(controlRoot)
+  const processOwner = {
+    adapter: { async listOwned() { return [] } },
+    async launch(spec) {
+      const requestPath = spec.argv.at(-1), request = JSON.parse(fs.readFileSync(requestPath, 'utf8'))
+      fs.writeFileSync(request.stdoutPath, '')
+      fs.writeFileSync(path.join(path.dirname(requestPath), 'proxy-error.json'), JSON.stringify({ schemaVersion: 1,
+        code: 'EIO', message: 'fixture output write failed', sourceFrames: ['phase-budget.js:1:1'] }))
+      return { ownershipId: 'owned-failure', groupIdentity: 'group-failure' }
+    },
+    async cancelGroup() { return { status: 'CANCELLED' } },
+  }
+  const runner = new OwnedCodexProxyRunner({ processOwner, controlRoot, targetKey: 'proxy-failure', pollMs: 1 })
+  await assert.rejects(runner.run({ executable: process.execPath, argv: ['-e', '0'], cwd: directory, env: {}, stdin: '',
+    sessionId: 'failure-session', reservationId: 'failure-reservation' }), error => {
+    assert.equal(error.code, 'CODEX_PROXY_STATUS_INVALID')
+    assert.deepEqual(error.details.proxyFailure, { schemaVersion: 1, code: 'EIO', message: 'fixture output write failed', sourceFrames: ['phase-budget.js:1:1'] })
+    return true
+  })
+})
+
 test('owned external adapter incrementally stops a real fake CLI process tree after typed terminal usage', async t => {
   const directory = tempDirectory(t, 'autoprompt-fake-codex-cli-')
   const controlRoot = path.join(directory, 'control')

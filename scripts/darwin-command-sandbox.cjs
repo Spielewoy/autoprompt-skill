@@ -1,8 +1,7 @@
 'use strict'
 
-// This backend is intentionally not wired into harness-v2-tool-boundary yet.
-// It is an activation-bound Darwin primitive, not a fallback for platforms
-// without complete coalition and Seatbelt evidence.
+// Native Darwin command isolation combines default-deny Seatbelt rules with
+// launchd coalition ownership, including recovery of detached descendants.
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
@@ -17,6 +16,7 @@ const SYSTEM_SANDBOX_EXEC = '/usr/bin/sandbox-exec'
 // Grant exactly this three-path interpreter closure, not /private/var or a shell search path.
 const SYSTEM_SH_TRAMPOLINE = '/private/var/select/sh'
 const SYSTEM_SHELL_EXECUTABLES = Object.freeze(['/bin/sh', SYSTEM_SH_TRAMPOLINE, '/bin/bash'])
+const SYSTEM_COMMAND_ROOTS = Object.freeze(['/bin', '/sbin', '/usr/bin', '/usr/sbin', '/usr/libexec', '/Library/Developer/CommandLineTools'])
 // Node's Darwin bootstrap consults these kernel values and system endpoints
 // before it reaches the controlled relay. These are named read/look-up
 // grants only: they do not permit network sockets, service registration, or
@@ -49,10 +49,11 @@ function physicalDirectory(directory) {
   return resolved
 }
 function boundExecutable(binding, expectedPath) {
-  if (!binding || typeof binding !== 'object' || !path.isAbsolute(binding.path || '') || !HASH.test(binding.sha256 || '') ||
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding) || Object.keys(binding).sort().join(',') !== 'path,sha256' ||
+      !path.isAbsolute(binding.path || '') || !HASH.test(binding.sha256 || '') ||
       (expectedPath && binding.path !== expectedPath)) fail('COMMAND_SANDBOX_UNSUPPORTED', 'Darwin sandbox executable lacks an exact binding')
   const before = fs.lstatSync(binding.path)
-  if (!before.isFile() || before.isSymbolicLink()) fail('COMMAND_SANDBOX_UNSUPPORTED', 'Darwin sandbox executable is not a regular file')
+  if (!before.isFile() || before.isSymbolicLink() || fs.realpathSync.native(binding.path) !== binding.path) fail('COMMAND_SANDBOX_UNSUPPORTED', 'Darwin sandbox executable is not a physical regular file')
   const bytes = fs.readFileSync(binding.path)
   const after = fs.lstatSync(binding.path)
   if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || digest(bytes) !== binding.sha256) {
@@ -91,6 +92,8 @@ function renderSeatbeltProfile(policy, options = {}) {
     // search path or access to /private/var beyond that one selector file.
     `(allow process-exec (literal ${quoted(node)}))`, `(allow file-read* (literal ${quoted(node)}))`,
     ...SYSTEM_SHELL_EXECUTABLES.flatMap(shell => [`(allow process-exec (literal ${quoted(shell)}))`, `(allow file-read* (literal ${quoted(shell)}))`]),
+    ...SYSTEM_COMMAND_ROOTS.flatMap(directory => [`(allow process-exec (subpath ${quoted(directory)}))`, `(allow file-read* (subpath ${quoted(directory)}))`]),
+    '(deny process-exec (literal "/bin/launchctl"))',
     '(allow process-fork)', '(allow process-info* (target same-sandbox))', '(allow signal (target same-sandbox))',
     '(allow mach-priv-task-port (target same-sandbox))',
     '(allow sysctl-read', ...NODE_STARTUP_SYSCTLS.map(name => `  (sysctl-name ${JSON.stringify(name)})`), ')',
@@ -99,6 +102,9 @@ function renderSeatbeltProfile(policy, options = {}) {
     '(allow file-read* (subpath "/usr/share"))', '(allow file-read* (literal "/dev/null"))', '(allow file-read* (literal "/dev/urandom"))',
     ...reads.sort().map(item => `(allow file-read* (subpath ${quoted(item)}))`),
     ...writes.sort().map(item => `(allow file-read* file-write* (subpath ${quoted(item)}))`),
+    // Repository metadata remains immutable even in a writable candidate.
+    // Explicit denial also covers nested repositories and newly made .git paths.
+    '(deny file-write* (regex #"/[.]git(/|$)"))',
     `(allow file-read* file-write* (subpath ${quoted(temp)}))`,
     // No network*, Mach registration, system-write-bootstrap, system-privilege,
     // setuid, or launchd exception is allowed. The only Mach access is the two
@@ -146,29 +152,32 @@ function createDarwinCommandSandbox(options = {}) {
   const controlRoot = physicalDirectory(options.controlRoot)
   const helper = Object.freeze({ ...(options.helper || require('../agents/codex/workflow/darwin-coalition-loader.js').loadDarwinCoalitionHelper()) })
   boundExecutable(helper)
+  const nodeExecutable = Object.freeze({ ...(options.nodeExecutable || { path: fs.realpathSync.native(process.execPath), sha256: digest(fs.readFileSync(fs.realpathSync.native(process.execPath))) }) })
+  boundExecutable(nodeExecutable)
   const sandboxBinding = systemSandboxBinding(options)
   boundExecutable(sandboxBinding, options.sandboxExecutable ? undefined : SYSTEM_SANDBOX_EXEC)
   const requestedTempRoot = options.tempRoot || path.join(controlRoot, 'command-tmp')
   fs.mkdirSync(requestedTempRoot, { recursive: true, mode: 0o700 })
   const tempRoot = physicalDirectory(requestedTempRoot)
   const processOwner = options.processOwner || (options.runner ? null : new ProcessOwner({
-    adapter: options.adapter || createDarwinCoalitionAdapter({ controlRoot: options.ownershipControlRoot || path.join(controlRoot, 'process-control'), providerPrivateOwnershipRoot: options.providerPrivateOwnershipRoot || controlRoot, helper }),
+    adapter: options.adapter || createDarwinCoalitionAdapter({ controlRoot: options.ownershipControlRoot || path.join(controlRoot, 'process-control'), providerPrivateOwnershipRoot: options.providerPrivateOwnershipRoot || controlRoot, helper, nodeExecutable }),
     registryPath: options.registryPath || path.join(controlRoot, 'processes.json'), pollMs: options.pollMs || 20,
   }))
   const proxyRoot = path.join(controlRoot, 'proxy')
   // OwnedCodexProxyRunner creates a reservation child with recursive:false.
   // Its parent is controller state, so establish it before the first launch.
   fs.mkdirSync(proxyRoot, { recursive: true, mode: 0o700 })
-  const runner = options.runner || new OwnedCodexProxyRunner({ processOwner, controlRoot: proxyRoot, targetKey: options.targetKey || 'darwin-command-sandbox', activationId: options.activationId, generationId: options.generationId })
+  const runner = options.runner || new OwnedCodexProxyRunner({ processOwner, controlRoot: proxyRoot, targetKey: options.targetKey || 'darwin-command-sandbox', activationId: options.activationId, generationId: options.generationId, boundNode: nodeExecutable })
   if (!runner || typeof runner.run !== 'function' || typeof runner.stop !== 'function') fail('COMMAND_SANDBOX_UNSUPPORTED', 'Darwin command sandbox requires an owned coalition runner')
   async function command(policy, args, runtime = {}) {
     if (!args || typeof args.command !== 'string' || !args.command.trim() || Buffer.byteLength(args.command) > 65536) fail('TOOL_ARGUMENTS_INVALID', 'A bounded nonempty command is required')
     if (runtime.signal?.aborted) fail('TOOL_CANCELLED', 'Darwin command was cancelled before launch')
     const cwd = physicalDirectory(args.cwd || (policy.readOnly ? policy.scratchPath : policy.targetPath))
-    const profile = renderSeatbeltProfile(policy, { nodePath: process.execPath, tempRoot })
+    const nodePath = boundExecutable(nodeExecutable)
+    const profile = renderSeatbeltProfile(policy, { nodePath, tempRoot })
     const reservationId = runtime.reservationId || crypto.randomUUID(), sessionId = runtime.sessionId || crypto.randomUUID()
     const start = Date.now(), flags = { cancelled: false, timedOut: false, durationMs: () => Date.now() - start }
-    const baseEnvironment = { ...require('./harness-v2-tool-boundary.cjs').safeEnvironment(), PATH: path.dirname(process.execPath), HOME: tempRoot, TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot, LANG: 'C', LC_ALL: 'C' }
+    const baseEnvironment = { ...require('./harness-v2-tool-boundary.cjs').safeEnvironment(), PATH: [path.dirname(nodePath), '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':'), HOME: tempRoot, TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot, LANG: 'C', LC_ALL: 'C' }
     const environment = processOwner?.adapter
       ? prepareProcessLaunchEnvironment(processOwner.adapter, reservationId, baseEnvironment)
       : baseEnvironment
@@ -199,7 +208,7 @@ function createDarwinCommandSandbox(options = {}) {
       const executable = boundExecutable(sandboxBinding, options.sandboxExecutable ? undefined : SYSTEM_SANDBOX_EXEC)
       launchStarted = true
       if (flags.cancelled || flags.timedOut) fail('TOOL_CANCELLED', 'Darwin command was cancelled before launch')
-      const execution = await runner.run({ executable, argv: ['-p', profile, process.execPath, '-e', commandRelay, args.command], cwd, env: environment, stdin: '', shell: false, sessionId, reservationId })
+      const execution = await runner.run({ executable, argv: ['-p', profile, nodePath, '-e', commandRelay, args.command], cwd, env: environment, stdin: '', shell: false, sessionId, reservationId })
       runSettled = true
       if (stopPromise) await stopPromise
       if (stopFailure) throw stopFailure
@@ -213,7 +222,7 @@ function createDarwinCommandSandbox(options = {}) {
       if (stopFailure) throw stopFailure
     }
   }
-  return Object.freeze({ backend: 'darwin-seatbelt-coalition', scope: 'initial-node-and-posix-shell-only', helper, sandboxBinding, controlRoot, tempRoot, processOwner, runner, renderSeatbeltProfile: policy => renderSeatbeltProfile(policy, { nodePath: process.execPath, tempRoot }), command })
+  return Object.freeze({ backend: 'darwin-seatbelt-coalition', scope: 'assigned-filesystem-system-commands-no-network', helper, nodeExecutable, sandboxBinding, controlRoot, tempRoot, processOwner, runner, renderSeatbeltProfile: policy => renderSeatbeltProfile(policy, { nodePath: boundExecutable(nodeExecutable), tempRoot }), command })
 }
 
 module.exports = { DarwinCommandError, SYSTEM_SANDBOX_EXEC, SYSTEM_SH_TRAMPOLINE, SYSTEM_SHELL_EXECUTABLES, OUTPUT_LIMIT, NODE_STARTUP_SYSCTLS, NODE_STARTUP_MACH_SERVICES, boundExecutable, renderSeatbeltProfile, createDarwinCommandSandbox }

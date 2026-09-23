@@ -16,7 +16,7 @@ const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
-const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment } = require('../helpers/native-platform.cjs')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment, cleanupNativeFixture } = require('../helpers/native-platform.cjs')
 
 const CLI = process.env.AUTOPROMPT_GROK_TEST_CLI
 const skip = !CLI || !fs.existsSync(CLI)
@@ -103,7 +103,7 @@ async function scenario(t, setup) {
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'grok-closed-native-canary', pollMs: 10 })
   const adapter = new HarnessExecAdapter({ provider: 'grok', runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: { model: 'fixture/grok', environment: { GROK_BASE_URL: service.url } }, credentialEnvironment: { OPENROUTER_API_KEY: 'local-test-secret' }, rolePrompt: () => 'Use only controller-owned tools and return exactly one JSON object.', outputSchemaResolver: () => f.schema })
   const run = async (overrides = {}) => { const record = { ...f.record, ...overrides }; record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment()); record.signal = overrides.signal || AbortSignal.timeout(90000); record.onUsageDelta = () => ({ continue: true }); return adapter.launch(record) }
-  t.after(async () => { try { await owner.cancelAll({ reason: 'Grok capability cleanup', graceMs: 0, killMs: 2000, waitForPending: true }) } finally { try { await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } } })
+  t.after(async () => { await cleanupNativeFixture(f, 'grok', { stop: () => owner.cancelAll({ reason: 'Grok capability cleanup', graceMs: 0, killMs: 2000, waitForPending: true }), close: () => service.close() }) })
   return { ...f, read, secret, marker, calls, service, binding, processAdapter, owner, runner, adapter, run }
 }
 function good(result) { assert.equal(result.ok, true); assert.match(result.contextId, /^[A-Za-z0-9_.:-]{1,256}$/); assert.ok(result.transportEvidence.eventCount > 0); assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/) }

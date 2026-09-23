@@ -414,3 +414,57 @@ test('closed runner accepts exact successful cases and retains activation-bound 
   await assert.rejects(runner.run({ activation: short, executable, provider: 'claude', pending: { expiresAt: new Date(Date.now() + 60000).toISOString(), reviewDigest: hash('unit-only-review'), capabilityCases: { testCapability: { source, sha256: hash(held), testName: 'held deadline witness' } } } }), { code: 'LOCAL_CANARY_TIMEOUT' })
   assert.ok(Date.now() - began < 5000, 'activation deadline must bound a held native test batch')
 })
+
+test('closed canary discovers and drains a secondary command owner registered below a separate fixture-native root', { timeout: 30000 }, async t => {
+  if (process.platform === 'win32') return t.skip('POSIX process-group regression')
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-command-discovery-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const value = binding(root)
+  const commandBinding = { provider: value.provider, activationId: value.activationId, generation: value.generation }
+  privateDirectory(value.ownershipRoot)
+  const discovery = require('../../scripts/harness-v2-command-owner-discovery.cjs')
+  const nativeRoot = privateDirectory(path.join(root, 'fixture-controller', 'native'))
+  const target = privateDirectory(path.join(root, 'candidate'))
+  const scratch = privateDirectory(path.join(root, 'scratch'))
+  const policyRoot = privateDirectory(path.join(nativeRoot, 'fixture-session', 'tool-policy'))
+  const stateRoot = path.join(policyRoot, discovery.STATE_CHILD)
+  const commandOwner = {
+    schemaVersion: 1,
+    manifestRoot: discovery.createDiscoveryRoot(nativeRoot, commandBinding),
+    providerPrivateOwnershipRoot: nativeRoot,
+    stateRoot,
+    registryPath: path.join(stateRoot, 'processes.json'),
+    controlRoot: path.join(stateRoot, 'process-control'),
+    nodeExecutable: { path: process.execPath, sha256: crypto.createHash('sha256').update(fs.readFileSync(process.execPath)).digest('hex') },
+  }
+  const policy = {
+    provider: value.provider, activationId: value.activationId, generation: value.generation,
+    targetPath: target, scratchPath: scratch, readableRoots: [target, scratch], writableRoots: [scratch],
+    darwinCommandOwner: commandOwner,
+  }
+  const policyPath = path.join(policyRoot, 'policy.json')
+  const policyBytes = Buffer.from(JSON.stringify(policy))
+  fs.writeFileSync(policyPath, policyBytes, { mode: 0o600 })
+  const policySha256 = crypto.createHash('sha256').update(policyBytes).digest('hex')
+  const registration = discovery.register(policyPath, policySha256, commandOwner.manifestRoot, commandBinding)
+  assert.equal(registration.registryPath, commandOwner.registryPath)
+  const pointer = discovery.registerCanaryDiscovery(policyPath, policySha256, commandOwner, environment(value))
+  assert.ok(pointer)
+  const adapter = createPosixProcessAdapter()
+  const owner = new ProcessOwner({ adapter, registryPath: commandOwner.registryPath, pollMs: 10 })
+  const reservationId = `secondary-${crypto.randomUUID()}`
+  const launched = await owner.launch({ executable: process.execPath, argv: ['-e', 'setTimeout(()=>{},30000)'], cwd: nativeRoot,
+    env: prepareProcessLaunchEnvironment(adapter, reservationId, { PATH: process.env.PATH }), reservationId, sessionId: reservationId,
+    targetKey: 'fixture-secondary', stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', forWork: false })
+  t.after(() => owner.cancelAll({ reason: 'test cleanup', graceMs: 0, killMs: 1000 }).catch(() => {}))
+  assert.ok((await adapter.listOwned(launched.groupIdentity)).length > 0)
+  const result = await discovery.drainTrustedProviderRoot(nativeRoot, commandBinding, {
+    platform: 'linux', createPlatformAdapter: createPosixProcessAdapter, environment: environment(value),
+  })
+  assert.deepEqual(result, { discovered: 1 })
+  assert.deepEqual(await adapter.listOwned(launched.groupIdentity), [])
+  assert.deepEqual(discovery.unregisterCanaryDiscovery(policyPath, policySha256, commandOwner, environment(value)), { removed: false })
+  const recovered = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: commandOwner.registryPath, pollMs: 10 })
+  await recovered.recoverReservations()
+  await recovered.assertDrained()
+})
