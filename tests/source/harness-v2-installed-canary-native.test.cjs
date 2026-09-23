@@ -12,7 +12,7 @@ const { authenticationEndpoint } = require('../helpers/native-activation-endpoin
 const { ProcessOwner } = require('../../agents/codex/workflow/process-owner.js')
 const safeRunRoot = require('../../agents/codex/workflow/safe-run-root.js')
 const { ownedTest } = require('../../scripts/harness-v2-closed-canary.cjs')
-const { diagnoseNativeCanary } = require('../helpers/native-canary-diagnostics.cjs')
+const { diagnoseNativeCanary, diagnosePublicResult, diagnosePublicActivation } = require('../helpers/native-canary-diagnostics.cjs')
 const CLI = requiredNativeCli('claude')
 const ROOT = path.resolve(__dirname, '../..')
 const PUBLIC_CASE = 'packed public Claude activate admits a fresh native canary before controlled endpoint refusal and revokes'
@@ -254,8 +254,14 @@ test(PUBLIC_CASE, { skip: !CLI, timeout: process.platform === 'win32' ? 3720000 
     drained = true; completed = true
     t.diagnostic(`Public installed activation admitted ${canary.REQUIRED.length} genuine observations on ${process.platform}/${process.arch}; controlled endpoint refusal, revocation and owned drain confirmed`)
   } catch (error) {
-    if (result) t.diagnostic(`Public activation output: ${JSON.stringify({ code: result.code, signal: result.signal,
-      stdout: String(result.stdout || '').slice(-8192), stderr: String(result.stderr || '').slice(-8192) })}`)
+    diagnosePublicResult(result, message => t.diagnostic(message))
+    if (endpoint) {
+      const requests = endpoint.requests.map(item => ({ method: item.method, path: item.pathname,
+        classification: item.pathname === '/api/hello' ? 'hello' :
+          item.pathname === '/v1/messages/count_tokens' ? 'token-count' :
+            item.pathname === '/v1/messages' ? 'mission' : 'unexpected' }))
+      t.diagnostic(`Public activation endpoint: ${JSON.stringify({ requestCount: requests.length, requests })}`)
+    }
     try {
       const parent = path.join(root, '.autoprompt-private', 'activations')
       const ids = fs.readdirSync(parent).filter(name => /^apv2-[a-f0-9]{32}$/.test(name))
@@ -265,6 +271,7 @@ test(PUBLIC_CASE, { skip: !CLI, timeout: process.platform === 'win32' ? 3720000 
       const stat = fs.lstatSync(recordPath)
       assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.size <= 2 * 1024 * 1024)
       const record = JSON.parse(fs.readFileSync(recordPath, 'utf8'))
+      diagnosePublicActivation({ activationRoot, record }, undefined, message => t.diagnostic(message))
       diagnoseNativeCanary({ activationRoot, record }, message => t.diagnostic(message))
     } catch (diagnosticError) {
       t.diagnostic(`Public canary diagnostics unavailable: ${diagnosticError.code || diagnosticError.name}`)

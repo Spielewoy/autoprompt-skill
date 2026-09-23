@@ -6,7 +6,9 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
-const { diagnoseNativeCanary, MAX_STATUS_BYTES, MAX_OUTPUT_CHARS, MAX_STATUSES, MAX_STREAM_BYTES } = require('../helpers/native-canary-diagnostics.cjs')
+const { checksumRecord } = require('../../agents/codex/workflow/event-log.js')
+const { diagnoseNativeCanary, diagnosePublicActivation, MAX_STATUS_BYTES, MAX_OUTPUT_CHARS, MAX_STATUSES,
+  MAX_STREAM_BYTES } = require('../helpers/native-canary-diagnostics.cjs')
 
 function fixture(t) {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'canary-diagnostic-')))
@@ -77,5 +79,54 @@ test('native canary partial diagnostics reject linked and oversized streams', t 
   fs.writeFileSync(path.join(f.directory, `outer-${crypto.randomUUID()}.stderr.log`), Buffer.alloc(MAX_STREAM_BYTES + 1))
   diagnoseNativeCanary(f.activation, value => messages.push(value))
   assert.equal(messages.filter(value => /partial.*unreadable/.test(value)).length, 2)
+  assert.doesNotMatch(messages.join('\n'), /outside-private-data/)
+})
+
+test('public activation diagnostics preserve bounded head and tail, selected terminal failure, and exact session outputs', t => {
+  const f = fixture(t), messages = [], runPath = path.join(f.root, 'r', 'target', 'run')
+  const controls = path.join(runPath, 'runtime', 'process-control'), session = path.join(controls, 'a'.repeat(32))
+  fs.mkdirSync(session, { recursive: true })
+  const terminal = { outcome: 'FAILED', terminalEnvelope: { status: 'FAILED', code: 'FAIL', controllerReason: 'CHILD_FAILED',
+    payload: { providerTerminal: { status: 'PROVIDER_USAGE_UNKNOWN', error: { code: 'CHILD_RESULT_INVALID',
+      message: 'bounded provider failure', details: { protocol: 'anthropic-messages', upstreamStatus: 422, secret: 'omit-me' } } } } } }
+  terminal.checksum = checksumRecord(terminal)
+  fs.writeFileSync(path.join(runPath, 'terminal.json'), JSON.stringify(terminal))
+  fs.writeFileSync(path.join(session, 'status.json'), JSON.stringify({ code: 1, signal: null }))
+  fs.writeFileSync(path.join(session, 'stdout.jsonl'), 'session stdout')
+  fs.writeFileSync(path.join(session, 'stderr.log'), 'session stderr')
+  fs.writeFileSync(path.join(session, 'helper.stderr.log'), 'helper phases')
+  const jobSession = path.join(controls, 'b'.repeat(64))
+  fs.mkdirSync(jobSession)
+  fs.writeFileSync(path.join(jobSession, 'status.json'), JSON.stringify({ code: 7, signal: null }))
+  fs.writeFileSync(path.join(jobSession, 'helper.stderr.log'), 'owned job helper phases')
+  fs.writeFileSync(path.join(session, 'request.json'), JSON.stringify({ env: { PRIVATE: 'never-print-env' } }))
+  const output = `HEAD${'x'.repeat(MAX_OUTPUT_CHARS + 100)}TAIL`
+  diagnosePublicActivation({ activationRoot: f.root, record: { supervisorRuntime: { runPath } } },
+    { code: 1, signal: null, stdout: output, stderr: '' }, value => messages.push(value))
+  const joined = messages.join('\n')
+  assert.match(joined, /HEAD.*\[child output truncated\].*TAIL/s)
+  assert.match(joined, /"providerErrorCode":"CHILD_RESULT_INVALID"/)
+  assert.match(joined, /session stdout/); assert.match(joined, /session stderr/); assert.match(joined, /helper phases/)
+  assert.match(joined, /owned job helper phases/)
+  assert.doesNotMatch(joined, /omit-me|never-print-env/)
+  assert.ok(messages.every(value => value.length < MAX_OUTPUT_CHARS + 300))
+})
+
+test('public activation diagnostics refuse escaped runs and linked session evidence', t => {
+  const f = fixture(t), messages = [], outside = fs.mkdtempSync(path.join(os.tmpdir(), 'public-diagnostic-outside-'))
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }))
+  fs.writeFileSync(path.join(outside, 'secret'), 'outside-private-data')
+  diagnosePublicActivation({ activationRoot: f.root, record: { supervisorRuntime: { runPath: outside } } },
+    { code: 1, stdout: '' }, value => messages.push(value))
+  assert.match(messages.join('\n'), /run path escapes activation/)
+  assert.doesNotMatch(messages.join('\n'), /outside-private-data/)
+
+  const runPath = path.join(f.root, 'run'), controls = path.join(runPath, 'runtime', 'process-control')
+  fs.mkdirSync(controls, { recursive: true })
+  fs.symlinkSync(outside, path.join(controls, 'b'.repeat(32)), process.platform === 'win32' ? 'junction' : 'dir')
+  messages.length = 0
+  diagnosePublicActivation({ activationRoot: f.root, record: { supervisorRuntime: { runPath } } },
+    { code: 1, stdout: '' }, value => messages.push(value))
+  assert.match(messages.join('\n'), /linked session directory/)
   assert.doesNotMatch(messages.join('\n'), /outside-private-data/)
 })
