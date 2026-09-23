@@ -29,7 +29,7 @@ const providers = Object.freeze({ opencode: selectedNativeCli('opencode'), kilo:
 // Both allowances remain below the canary's independent 720-second authority.
 const CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS = Object.freeze({ default: 300_000, kilo: 420_000, opencode: 420_000 })
 function closedNativeCapabilityTimeout(provider) {
-  return CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS[provider] || CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS.default
+  return process.platform === 'win32' ? 720_000 : CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS[provider] || CLOSED_NATIVE_CAPABILITY_TIMEOUT_MS.default
 }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
@@ -110,7 +110,7 @@ async function scenario(provider, options = {}) {
     const run = async overrides => {
       const record = { ...f.record, ...overrides }
       record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
-      record.signal = overrides?.signal || AbortSignal.timeout(90000)
+      record.signal = overrides?.signal || AbortSignal.timeout(process.platform === 'win32' ? 300_000 : 90_000)
       try { return await adapter.launch(record) }
       catch (error) { fixtureFailureDiagnostic(f, error); throw error }
     }

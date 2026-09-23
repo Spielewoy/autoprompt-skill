@@ -357,19 +357,28 @@ class ReasonixEventStream {
   }
 }
 
-function nativeContextRoot(nativeRoot, record, targetPath) {
+function executableBindingIdentity(binding) {
+  if (!binding || typeof binding.path !== 'string' || !/^[a-f0-9]{64}$/.test(binding.sha256 || '')) {
+    throw new ReasonixError('PROVIDER_IDENTITY_MISMATCH', 'Reasonix context requires an exact executable binding')
+  }
+  return { path: binding.path, sha256: binding.sha256, invocationSha256: binding.invocation?.sha256 || null }
+}
+
+function nativeContextRoot(nativeRoot, record, targetPath, executableBinding) {
   if (!record.continuationId) return path.join(nativeRoot, sha256(record.sessionId))
   const saved = JSON.parse(readBound(path.join(nativeRoot, 'contexts', `${sha256(record.continuationId)}.json`)))
   if (saved.sessionId !== record.continuationId || saved.providerRole !== record.providerRole ||
-      saved.targetPath !== targetPath || !/^[a-f0-9]{64}$/.test(saved.rootKey || '')) {
+      saved.targetPath !== targetPath || !/^[a-f0-9]{64}$/.test(saved.rootKey || '') ||
+      (executableBinding && JSON.stringify(saved.executableBinding) !== JSON.stringify(executableBindingIdentity(executableBinding)))) {
     throw new ReasonixError('SESSION_ID_MISMATCH', 'Continuation differs from its original native role or workspace')
   }
   return path.join(nativeRoot, saved.rootKey)
 }
 
-function persistNativeContext(nativeRoot, sessionRoot, record, targetPath, sessionId) {
+function persistNativeContext(nativeRoot, sessionRoot, record, targetPath, sessionId, executableBinding) {
   const file = path.join(nativeRoot, 'contexts', `${sha256(sessionId)}.json`)
-  const saved = { sessionId, providerRole: record.providerRole, targetPath, rootKey: path.basename(sessionRoot) }
+  const saved = { sessionId, providerRole: record.providerRole, targetPath, rootKey: path.basename(sessionRoot),
+    ...(executableBinding ? { executableBinding: executableBindingIdentity(executableBinding) } : {}) }
   if (fs.existsSync(file)) {
     if (JSON.stringify(JSON.parse(readBound(file))) !== JSON.stringify(saved)) throw new ReasonixError('SESSION_ID_MISMATCH', 'Native session identity was already bound to another assignment')
   } else writePrivate(file, JSON.stringify(saved))
@@ -410,8 +419,11 @@ class ReasonixExecAdapter {
     // a reservation-scoped identity in the controller's ownership registry.
     const processSessionId = `native-reasonix-${sha256(JSON.stringify([record.sessionId, record.reservationId]))}`
     const binding = this.executableBinding
-    if (sha256(readBound(binding.path)) !== binding.sha256) throw new ReasonixError('PROVIDER_UNSUPPORTED', 'Reasonix executable changed after activation')
-    const actualRuntime = require('../../../scripts/harness-v2-native.cjs').runtimeDependencyIdentity(binding.path, record.environment || process.env)
+    const sharedNative = require('../../../scripts/harness-v2-native.cjs')
+    // This checks the raw shim, declared package bin and (for Node shims) the
+    // interpreter before any continuation state or provider process is used.
+    sharedNative.executableInvocation(binding)
+    const actualRuntime = sharedNative.runtimeDependencyIdentity(sharedNative.executableRuntimePath(binding), record.environment || process.env, binding.invocation)
     if (!binding.runtimeIdentity || JSON.stringify(actualRuntime) !== JSON.stringify(binding.runtimeIdentity)) {
       throw new ReasonixError('PROVIDER_IDENTITY_MISMATCH', 'Reasonix native dependencies changed after activation')
     }
@@ -421,7 +433,7 @@ class ReasonixExecAdapter {
     }
     const targetPath = path.resolve(record.workingDirectory || record.cwd || this.targetPath)
     const readOnly = execution.sandboxMode === 'read-only'
-    const sessionRoot = nativeContextRoot(this.nativeRoot, record, targetPath)
+    const sessionRoot = nativeContextRoot(this.nativeRoot, record, targetPath, binding)
     const launchRoot = path.join(sessionRoot, sha256(record.reservationId))
     const checkerScratch = record.checkerScratchBoundary ? this.checkerScratchVerifier?.(record) : null
     if (record.checkerScratchBoundary && !checkerScratch) throw new ReasonixError('CHECKER_SCRATCH_BOUNDARY_INVALID', 'Missing authenticated checker scratch boundary')
@@ -466,7 +478,7 @@ class ReasonixExecAdapter {
     if (record.assignment?.effort) argv.push('--effort', record.assignment.effort)
     if (record.continuationId) argv.push('--resume', record.continuationId)
     const stream = new ReasonixEventStream({ ...record, ...(quotaEnabled ? { onUsageDelta: undefined } : {}), toolBoundary, readOnly, onSessionIdentified: (sessionId, evidence) => {
-      persistNativeContext(this.nativeRoot, sessionRoot, record, targetPath, sessionId)
+      persistNativeContext(this.nativeRoot, sessionRoot, record, targetPath, sessionId, binding)
       record.onSessionIdentified?.(sessionId, evidence)
     } })
     let streamError
@@ -502,8 +514,9 @@ class ReasonixExecAdapter {
       writePrivate(path.join(home, 'config.toml'), renderConfig({ connection: projectedConnection, systemPrompt, targetPath, scratchPath, readOnly, checkerScratch: Boolean(checkerScratch), toolBoundary }))
       writePrivate(path.join(home, '.env'), renderCredentials(projectedConnection, environment))
       runnerStarted = true
+      const invocation = sharedNative.executableInvocation(binding, argv)
       result = await this.runner.run({
-        executable: binding.path, argv, cwd, env: environment, stdin: input, shell: false,
+        executable: invocation.executable, argv: invocation.argv, cwd, env: environment, stdin: input, shell: false,
         sessionId: processSessionId, reservationId: record.reservationId,
         onTransportActivity: record.onTransportActivity,
         onStdoutLine: line => {

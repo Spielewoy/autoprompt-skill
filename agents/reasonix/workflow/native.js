@@ -92,44 +92,62 @@ function writePrivate(file, data) {
   fs.writeFileSync(file, data, { flag: 'wx', mode: 0o600 })
 }
 
-function locateExecutable(env = process.env, requested) {
+// `harness-v2-native` imports this module, so resolve its reviewed Windows
+// shim machinery only while probing or launching.  The lazy edge avoids a
+// partially initialized circular export without duplicating its parser.
+function harnessNative() { return require('../../../scripts/harness-v2-native.cjs') }
+
+function locateExecutable(env = process.env, requested, options = {}) {
+  const platform = options.platform || process.platform
   const names = requested ? [requested] : (env.PATH || '').split(path.delimiter)
-    .filter(Boolean).flatMap(directory => process.platform === 'win32'
-      ? [path.join(directory, 'reasonix.exe')] : [path.join(directory, 'reasonix')])
+    .filter(Boolean).flatMap(directory => platform === 'win32'
+      ? [path.join(directory, 'reasonix.exe'), path.join(directory, 'reasonix.cmd')] : [path.join(directory, 'reasonix')])
   for (const name of names) {
     try {
       const resolved = fs.realpathSync.native(name)
-      const bytes = readBound(resolved)
       fs.accessSync(resolved, fs.constants.X_OK)
-      return { path: resolved, sha256: sha256(bytes) }
+      if (platform === 'win32' && /\.cmd$/i.test(resolved)) {
+        const invocation = harnessNative().windowsNpmShimInvocation(resolved)
+        return { path: resolved, sha256: invocation.shim.sha256, invocation }
+      }
+      if (platform === 'win32' && /\.bat$/i.test(resolved)) {
+        throw new ReasonixError('PROVIDER_UNSUPPORTED', 'Windows batch launchers are not an admitted Reasonix executable form')
+      }
+      return { path: resolved, sha256: sha256(readBound(resolved)) }
     } catch (error) { if (requested) throw error }
   }
   throw new ReasonixError('PROVIDER_UNSUPPORTED', 'Reasonix CLI is not installed or is not executable')
 }
 
 function probeExecutable(options = {}) {
-  const executable = locateExecutable(options.env, options.executable)
+  const executable = locateExecutable(options.env, options.executable, options)
+  const shared = harnessNative()
   const spawn = options.spawnSync || childProcess.spawnSync
-  const version = spawn(executable.path, ['--version'], {
-    env: options.env || process.env, encoding: 'utf8', shell: false, timeout: 15000, maxBuffer: 1024 * 1024,
-  })
+  const invoke = argv => {
+    const launch = shared.executableInvocation(executable, argv)
+    return spawn(launch.executable, launch.argv, {
+      env: options.env || process.env, encoding: 'utf8', shell: false, timeout: 15000, maxBuffer: 1024 * 1024,
+    })
+  }
+  const version = invoke(['--version'])
   const match = /\breasonix\s+v?(\d+)\.(\d+)\.(\d+)\b/i.exec(String(version.stdout || ''))
   const tuple = match && match.slice(1).map(Number)
   if (version.error || version.status !== 0 || !tuple || tuple[0] < 1 || (tuple[0] === 1 && tuple[1] < 30)) {
     throw new ReasonixError('PROVIDER_UNSUPPORTED', `Reasonix ${MINIMUM_VERSION} or later is required`)
   }
-  const help = spawn(executable.path, ['run', '--help'], {
-    env: options.env || process.env, encoding: 'utf8', shell: false, timeout: 15000, maxBuffer: 1024 * 1024,
-  })
+  const help = invoke(['run', '--help'])
   const text = `${help.stdout || ''}\n${help.stderr || ''}`
   if (help.error || help.status !== 0 || !['--output-format', '--resume', '--dir', '--max-steps', '--permission-mode', '--allowed-tools'].every(flag => text.includes(flag))) {
     throw new ReasonixError('PROVIDER_UNSUPPORTED', 'Reasonix lacks the required streamed run and resume interface')
   }
-  if (sha256(readBound(executable.path)) !== executable.sha256) throw new ReasonixError('PROVIDER_UNSUPPORTED', 'Reasonix executable changed during its probe')
+  // Validate the immutable shim/package/interpreter closure again after both
+  // probes, then inventory the actual entrypoint rather than cmd.exe syntax.
+  shared.executableInvocation(executable)
+  const runtimePath = shared.executableRuntimePath(executable)
   return Object.freeze({
     ...executable, version: tuple.join('.'), provider: 'reasonix',
-    runtimeIdentity: require('../../../scripts/harness-v2-native.cjs').runtimeDependencyIdentity(executable.path, options.env || process.env),
-    portableRuntimeIdentity: require('../../../scripts/harness-v2-native.cjs').portableRuntimeDependencyIdentity('reasonix', executable.path, options.env || process.env),
+    runtimeIdentity: shared.runtimeDependencyIdentity(runtimePath, options.env || process.env, executable.invocation),
+    portableRuntimeIdentity: shared.portableRuntimeDependencyIdentity('reasonix', runtimePath, options.env || process.env, executable.invocation),
     evidenceHashes: [sha256(String(version.stdout)), sha256(text)],
   })
 }

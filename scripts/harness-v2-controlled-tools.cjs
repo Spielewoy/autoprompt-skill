@@ -50,8 +50,14 @@ function claudeProjection(prepared) {
 function opencodeProjection(prepared, provider) {
   const server = serverSpec(prepared, provider)
   const permission = { '*': 'deny', ...Object.fromEntries(boundary.TOOLS.map(tool => [toolName(provider, tool.name), 'allow'])) }
+  // OpenCode's MCP client otherwise abandons a call after 60 seconds. The
+  // owned bash tool permits up to 300 seconds of execution, and Windows must
+  // also prepare and restore its private AppContainer resource grants. Keep
+  // that bounded lifecycle inside the client deadline; controller cancellation
+  // and the command's own timeout continue to govern actual execution.
+  const timeout = 600_000
   return { permission,
-    mcp: { [SERVER]: { type: 'local', command: [server.command, ...server.args], environment: server.env, enabled: true } } }
+    mcp: { [SERVER]: { type: 'local', command: [server.command, ...server.args], environment: server.env, enabled: true, timeout } } }
 }
 
 function parseResult(output) {

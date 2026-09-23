@@ -15,19 +15,19 @@ const native = require('../../agents/reasonix/workflow/native.js')
 const { ReasonixEventStream, ReasonixExecAdapter, prepareReasonixBoundary } = require('../../agents/reasonix/workflow/transport.js')
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const { validateJsonSchema } = require('../../agents/codex/workflow/json-schema-validator.js')
-const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const controlled = require('../../scripts/harness-v2-controlled-tools.cjs')
-const { isolatedEnvironment } = require('../../scripts/harness-v2-conformance.cjs')
+const { privateDirectory, nativeProcessAdapter, nativeEnvironment } = require('../helpers/native-platform.cjs')
 const enabled = Boolean(process.env.AUTOPROMPT_REASONIX_TEST_CLI)
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`
 
 function fixture(t, readOnly = true, cleanup = true) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reasonix-controlled-native-'))
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'reasonix-controlled-native-')))
   if (cleanup) t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const env = isolatedEnvironment(root)
+  const env = nativeEnvironment()
   const target = path.join(root, 'target'), controller = path.join(root, 'controller'), nativeRoot = path.join(controller, 'native')
-  for (const dir of [target, controller, nativeRoot]) fs.mkdirSync(dir, { mode: 0o700 })
+  for (const dir of [target, controller, nativeRoot]) privateDirectory(dir)
   const challenge = process.env.AUTOPROMPT_CLOSED_CANARY_CHALLENGE || crypto.randomBytes(32).toString('base64url')
   const activationId = process.env.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID || 'reasonix-local-test'
   const generation = Number(process.env.AUTOPROMPT_CLOSED_CANARY_GENERATION || 1)
@@ -117,20 +117,18 @@ async function realFixture(t, actions, options = {}) {
       } })}\n\ndata: [DONE]\n\n`)
     } catch (error) { errors.push(error.message); res.writeHead(500); res.end() }
   })
-  const processAdapter = createPosixProcessAdapter()
   let registryPath = path.join(f.controller, 'process-registry.json')
   const ownershipRoot = process.env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT
   if (ownershipRoot) {
     if (!path.isAbsolute(ownershipRoot) || process.env.AUTOPROMPT_CLOSED_CANARY_PROVIDER !== 'reasonix') throw new Error('invalid native canary owner binding')
-    const directory = path.join(ownershipRoot, `reasonix-${crypto.randomUUID()}`)
-    fs.mkdirSync(directory, { mode: 0o700 })
+    const directory = privateDirectory(path.join(ownershipRoot, `reasonix-${crypto.randomUUID()}`))
     registryPath = path.join(directory, 'processes.json')
     fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify({ schemaVersion: 1, provider: 'reasonix', activationId: f.record.activationId,
       generation: f.record.generation, challenge: f.challenge, registryPath }), { mode: 0o600, flag: 'wx' })
   }
+  const processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath))
   owner = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
-  const proxy = path.join(f.controller, 'proxy')
-  fs.mkdirSync(proxy, { mode: 0o700 })
+  const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'reasonix-controlled-native', pollMs: 10 })
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   const adapter = new ReasonixExecAdapter({ runner, nativeRoot: f.nativeRoot, executableBinding: executable, targetPath: f.target,

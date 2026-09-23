@@ -5,13 +5,14 @@ const { realFixture, resultPayload, assertNativeSurface } = require('./reasonix-
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const native = require('../../agents/reasonix/workflow/native.js')
 const { ReasonixExecAdapter } = require('../../agents/reasonix/workflow/transport.js')
-const { ProcessOwner, createPosixProcessAdapter } = require('../../agents/codex/workflow/process-owner.js')
-const quote = value => `'${value.replaceAll("'", "'\\''")}'`
-const options = { skip: !process.env.AUTOPROMPT_REASONIX_TEST_CLI || process.platform === 'win32', timeout: 90000 }
+const { ProcessOwner } = require('../../agents/codex/workflow/process-owner.js')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge } = require('../helpers/native-platform.cjs')
+const options = { skip: !process.env.AUTOPROMPT_REASONIX_TEST_CLI, timeout: 90000 }
 const named = (name, fn) => test(`reasonix closed native capability: ${name}`, options, fn)
 const results = f => f.events.filter(event => event.kind === 'tool_result').map(event => resultPayload(event.tool))
 async function ready(t, command, extra = {}) {
-  const f = await realFixture(t, [{ tool: 'bash', args: f => ({ command: `${command ? command(f) : 'printf owned-native'}; printf '\\nCLOSED_CANARY_CHALLENGE:%s\\n' ${quote(f.challenge)}` }) }], extra)
+  const f = await realFixture(t, [{ tool: 'bash', args: f => ({ command: withChallenge(command ? command(f) : nodeCommand("process.stdout.write('owned-native')"), f.challenge) }) }], extra)
+  for (const directory of [f.root, f.target, f.controller, f.nativeRoot]) privateDirectory(directory)
   fs.writeFileSync(path.join(f.target, 'candidate.txt'), 'immutable-candidate')
   fs.writeFileSync(path.join(f.controller, 'private.txt'), 'private-controller-secret')
   return f
@@ -27,7 +28,9 @@ named('isolation', async t => {
   const server = net.createServer(socket => { contacted = true; socket.destroy() })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); t.after(() => new Promise(resolve => server.close(resolve)))
   const code = `const s=require('node:net').connect(${server.address().port},'127.0.0.1');s.on('connect',()=>process.exit(19));s.on('error',()=>process.exit(0));setTimeout(()=>process.exit(0),700)`
-  const f = await ready(t, f => `cat ${quote(path.join(f.target, 'candidate.txt'))}; printf writable > ${quote(path.join(f.scratch, 'proof'))}; if printf bad > ${quote(path.join(f.target, 'candidate.txt'))} 2>/dev/null; then exit 19; fi; if cat ${quote(path.join(f.controller, 'private.txt'))} 2>/dev/null; then exit 20; fi; ${quote(process.execPath)} -e ${quote(code)}`)
+  const f = await ready(t, f => `${readCommand(path.join(f.target, 'candidate.txt'))}; ${nodeCommand(
+    `require('node:fs').writeFileSync(${JSON.stringify(path.join(f.scratch, 'proof'))}, 'writable'); try { require('node:fs').writeFileSync(${JSON.stringify(path.join(f.target, 'candidate.txt'))}, 'bad'); process.exit(19) } catch {} ; try { require('node:fs').readFileSync(${JSON.stringify(path.join(f.controller, 'private.txt'))}); process.exit(20) } catch {} ; ${code}`
+  )}`)
   good(f, await f.launch()); assert.equal(fs.readFileSync(path.join(f.target, 'candidate.txt'), 'utf8'), 'immutable-candidate'); assert.equal(fs.readFileSync(path.join(f.scratch, 'proof'), 'utf8'), 'writable'); assert.equal(contacted, false)
 })
 named('topology', async t => {
@@ -36,7 +39,7 @@ named('topology', async t => {
   assert.ok(JSON.stringify(f.requests).includes(`CLOSED_CANARY_CHALLENGE:${f.challenge}`))
 })
 named('privateConfiguration', async t => {
-  const f = await ready(t, () => 'test -z "${FIXTURE_KEY+x}" && test -z "${UNRELATED_SECRET+x}" && printf filtered')
+  const f = await ready(t, () => nodeCommand("if (process.env.FIXTURE_KEY || process.env.UNRELATED_SECRET) process.exit(20); process.stdout.write('filtered')"))
   const poison = 'UNTRUSTED_AMBIENT_INSTRUCTIONS_92751'; fs.writeFileSync(path.join(f.target, 'AGENTS.md'), poison); fs.writeFileSync(path.join(f.target, 'REASONIX.md'), poison)
   good(f, await f.launch()); assert.equal(JSON.stringify(f.requests).includes(poison), false); assert.equal(JSON.stringify(f.events).includes('not-a-configured-provider-key'), false); assert.ok(results(f)[0].output.includes('filtered'))
 })
@@ -46,7 +49,7 @@ named('intermediateEvents', async t => {
   assert.ok(f.events.some(e => JSON.stringify(e).includes(output.contextId)))
 })
 named('exactToolOutput', async t => {
-  const f = await ready(t, () => "printf 'exact UTF-8: 雪 / é / 😀\\nsecond line\\n'"); const output = await f.launch(); good(f, output)
+  const f = await ready(t, () => nodeCommand("process.stdout.write('exact UTF-8: 雪 / é / 😀\\nsecond line\\n')")); const output = await f.launch(); good(f, output)
   const actual = results(f)[0]; assert.equal(actual.output, `exact UTF-8: 雪 / é / 😀\nsecond line\n\nCLOSED_CANARY_CHALLENGE:${f.challenge}\n`); assert.equal(actual.outputSha256, native.sha256(actual.output)); assert.equal(output.toolReceiptHashes.length, 1)
 })
 named('concurrency', async t => {
@@ -59,7 +62,7 @@ named('concurrency', async t => {
 named('resume', async t => {
   const f = await ready(t); const first = await f.launch(); good(f, first); const before = f.requests.length
   const resumed = await f.launch({ reservationId: crypto.randomUUID(), continuationId: first.contextId }); assert.equal(resumed.contextId, first.contextId); assert.ok(JSON.stringify(f.requests.slice(before)).includes(`CLOSED_CANARY_CHALLENGE:${f.challenge}`))
-  const foreign = path.join(f.root, 'foreign'); fs.mkdirSync(foreign, { mode: 0o700 })
+  const foreign = privateDirectory(path.join(f.root, 'foreign'))
   await assert.rejects(f.launch({ reservationId: crypto.randomUUID(), continuationId: first.contextId, workingDirectory: foreign }), { code: 'SESSION_ID_MISMATCH' })
 })
 named('cancellation', async t => {
@@ -70,9 +73,9 @@ named('cancellation', async t => {
 })
 named('checker', async t => {
   let frozen, scratch
-  const f = await ready(t, () => `cat ${quote(path.join(frozen, 'candidate.txt'))}; printf checked > ${quote(path.join(scratch, 'proof'))}; if printf bad > ${quote(path.join(frozen, 'candidate.txt'))} 2>/dev/null; then exit 19; fi`)
-  frozen = f.target; scratch = path.join(f.root, 'checker'); fs.mkdirSync(scratch, { mode: 0o700 })
-  for (const name of ['tmp', 'output', 'cache']) fs.mkdirSync(path.join(scratch, name), { mode: 0o700 })
+  const f = await ready(t, () => `${readCommand(path.join(frozen, 'candidate.txt'))}; ${nodeCommand(`require('node:fs').writeFileSync(${JSON.stringify(path.join(scratch, 'proof'))}, 'checked'); try { require('node:fs').writeFileSync(${JSON.stringify(path.join(frozen, 'candidate.txt'))}, 'bad'); process.exit(19) } catch {}`)}`)
+  frozen = f.target; scratch = privateDirectory(path.join(f.root, 'checker'))
+  for (const name of ['tmp', 'output', 'cache']) privateDirectory(path.join(scratch, name))
   const checker = { schemaVersion: 1, capability: native.sha256('checker-boundary'), runId: f.record.activationId, checkerId: 'native-checker', candidateHash: native.sha256('immutable-candidate'), frozenCandidateRoot: frozen, writableScratchRoot: scratch, temporaryRoot: path.join(scratch, 'tmp'), outputRoot: path.join(scratch, 'output'), cacheRoot: path.join(scratch, 'cache') }
   f.adapter.checkerScratchVerifier = () => checker
   const result = await f.launch({ logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', workingDirectory: scratch, canonicalTargetPath: frozen, candidateHash: checker.candidateHash, checkerScratchBoundary: checker, physicalExecutionPolicy: { logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', sandboxMode: 'read-only', canDispatch: false, resourceSets: { read: [], write: [], exclusive: [] } } })
@@ -80,7 +83,7 @@ named('checker', async t => {
 })
 named('processOwnership', async t => {
   const f = await realFixture(t, [], { hang: true }); const abort = new AbortController(); const pending = f.launch({ signal: abort.signal }); pending.catch(() => {}); await waitFor(() => f.requests.length > 0)
-  const recovered = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: f.owner.registryPath, pollMs: 10 }); await recovered.recoverReservations(); assert.equal(recovered.ownershipIdentities().length, 1)
+  const recovered = new ProcessOwner({ adapter: nativeProcessAdapter(f.owner.registryPath, path.dirname(f.owner.registryPath)), registryPath: f.owner.registryPath, pollMs: 10 }); await recovered.recoverReservations(); assert.equal(recovered.ownershipIdentities().length, 1)
   await recovered.cancelAll({ reason: 'native recovery proof', graceMs: 0, killMs: 5000, waitForPending: true }); abort.abort(); await assert.rejects(pending); await f.owner.cancelAll({ reason: 'reconcile recovered exit', graceMs: 0, killMs: 5000, waitForPending: true }); assert.deepEqual(recovered.ownershipIdentities(), []); assert.deepEqual(f.owner.ownershipIdentities(), [])
 })
 named('modelEffort', async t => {

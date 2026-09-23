@@ -12,6 +12,12 @@ on:
         default: none
         type: choice
         options: [none, macos-containment, windows-bootstrap, opencode]
+      support_provider:
+        description: 'Installed provider for the focused provider stage'
+        required: false
+        default: opencode
+        type: choice
+        options: [opencode, deepseek, reasonix]
       support_single:
         description: 'Limit focused Windows provider diagnostics to x64'
         required: false
@@ -1111,6 +1117,7 @@ jobs:
 
   opencode:
     if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'opencode'
+    name: Provider / ${{ inputs.support_provider }} / ${{ matrix.runner.os }} / Node 24
     strategy:
       fail-fast: false
       matrix:
@@ -1119,6 +1126,9 @@ jobs:
     timeout-minutes: 60
     env:
       AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+      SUPPORT_PROVIDER: ${{ inputs.support_provider }}
+      PROVIDER_PACKAGE: ${{ inputs.support_provider == 'deepseek' && '@deepseek-ai/dsh@0.1.2-rc.1' || inputs.support_provider == 'reasonix' && 'reasonix@1.30.0' || 'opencode-ai@1.18.32' }}
+      PROVIDER_BIN: ${{ inputs.support_provider == 'deepseek' && 'dsh' || inputs.support_provider == 'reasonix' && 'reasonix' || 'opencode' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -1135,19 +1145,21 @@ jobs:
           fi
       - run: npm ci --ignore-scripts
       - name: Install the reported official npm provider and its generated launchers
-        run: npm install --prefix .native-provider --no-package-lock --no-audit --no-fund opencode-ai@1.18.32
+        run: npm install --prefix .native-provider --no-package-lock --no-audit --no-fund ${{ env.PROVIDER_PACKAGE }}
       - name: Bind the actual npm command shim on Windows
         run: >-
           node -e "const fs=require('node:fs'),path=require('node:path');
-          const file=fs.realpathSync.native(path.resolve('.native-provider/node_modules/.bin/opencode'+(process.platform==='win32'?'.cmd':'')));
-          fs.appendFileSync(process.env.GITHUB_ENV,'AUTOPROMPT_OPENCODE_TEST_CLI='+file+'\n');"
+          const suffix=process.platform==='win32'?'.cmd':'';
+          const file=fs.realpathSync.native(path.resolve('.native-provider/node_modules/.bin/'+process.env.PROVIDER_BIN+suffix));
+          if(process.platform==='win32'&&path.extname(file).toLowerCase()!=='.cmd')throw new Error('Expected the generated npm .cmd launcher');
+          fs.appendFileSync(process.env.GITHUB_ENV,'AUTOPROMPT_'+process.env.SUPPORT_PROVIDER.toUpperCase()+'_TEST_CLI='+file+'\n');"
       - name: Require all eleven native provider capabilities
-        run: node tests/helpers/provider-platform-ci.cjs opencode
+        run: node tests/helpers/provider-platform-ci.cjs ${{ env.SUPPORT_PROVIDER }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: opencode-${{ matrix.runner.os }}-node24
+          name: ${{ inputs.support_provider }}-${{ matrix.runner.os }}-node24
           path: |
-            native-opencode-evidence.json
-            native-opencode-tests.log
+            native-${{ inputs.support_provider }}-evidence.json
+            native-${{ inputs.support_provider }}-tests.log
           if-no-files-found: error

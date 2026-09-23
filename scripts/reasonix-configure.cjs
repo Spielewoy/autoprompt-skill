@@ -124,6 +124,7 @@ function prepareActivation(options = {}) {
       if (record.providerId !== 'reasonix' || record.activationId !== activationId || record.target.realpath !== target ||
           record.request.sha256 !== request.sha256 || record.payloadDigest !== installed.payloadDigest ||
           record.executable.sha256 !== executable.sha256 || record.executable.path !== executable.path ||
+          JSON.stringify(record.executable.invocation || null) !== JSON.stringify(executable.invocation || null) ||
           JSON.stringify(record.executable.runtimeIdentity) !== JSON.stringify(executable.runtimeIdentity) ||
           JSON.stringify(record.executable.portableRuntimeIdentity) !== JSON.stringify(executable.portableRuntimeIdentity) ||
           (record.status === 'active' && processIdentityForPid(record.ownerPid) !== null) ||

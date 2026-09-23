@@ -31,6 +31,20 @@ test('controlled native names never accept built-ins, foreign servers or prefix 
   }
 })
 
+test('OpenCode-family MCP deadlines cover permitted commands and bounded sandbox preparation', t => {
+  const maximumCommandMs = boundary.TOOLS.find(tool => tool.name === 'bash').inputSchema.properties.timeoutMs.maximum
+  for (const provider of ['opencode', 'kilo']) {
+    const f = fixture(t, provider)
+    const projection = controlled.opencodeProjection(f.boundary, provider)
+    const server = projection.mcp[controlled.SERVER]
+    assert.ok(Number.isSafeInteger(server.timeout) && server.timeout > maximumCommandMs)
+    assert.ok(server.timeout <= 600_000, 'MCP waits must remain bounded')
+    assert.equal(server.type, 'local')
+    assert.equal(server.command[0], process.execPath)
+    assert.equal(projection.permission['*'], 'deny')
+  }
+})
+
 test('receipt verifier rejects model-written success, changed results, omitted executions and replay', async t => {
   const f = fixture(t, 'claude'), args = { path: f.target }
   const result = await boundary.executeTool(f.boundary.policy, 'list', args)
