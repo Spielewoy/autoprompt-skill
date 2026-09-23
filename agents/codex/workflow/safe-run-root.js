@@ -160,27 +160,16 @@ function windowsTokenProfileFolders(systemRoot) {
     const script = [
       "$ErrorActionPreference='Stop'",
       '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)',
-      `Add-Type -TypeDefinition @'
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-public static class AutopromptTokenProfile {
-  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
-  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
-  [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr process,uint access,out IntPtr token);
-  [DllImport("userenv.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool GetUserProfileDirectory(IntPtr token,StringBuilder profile,ref uint length);
-  public static string Read() {
-    IntPtr token=IntPtr.Zero;
-    try {
-      if(!OpenProcessToken(GetCurrentProcess(),8,out token)) throw new InvalidOperationException("Token profile query failed");
-      var profile=new StringBuilder(32768); uint length=(uint)profile.Capacity;
-      if(!GetUserProfileDirectory(token,profile,ref length)||length==0||length>=profile.Capacity) throw new InvalidOperationException("Token profile path unavailable");
-      return profile.ToString();
-    } finally { if(token!=IntPtr.Zero) CloseHandle(token); }
-  }
-}
-'@`,
-      '$profile=[AutopromptTokenProfile]::Read()',
+      // This query bootstraps the private compiler directory itself. Emit the
+      // fixed P/Invoke in memory: Add-Type would need TEMP before we know it.
+      "$assembly=[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly([Reflection.AssemblyName]::new('AutopromptTokenProfile'),[Reflection.Emit.AssemblyBuilderAccess]::Run)",
+      "$module=$assembly.DefineDynamicModule('AutopromptTokenProfile')",
+      "$type=$module.DefineType('AutopromptTokenProfile',[Reflection.TypeAttributes]'Public,Sealed,Abstract')",
+      "$method=$type.DefinePInvokeMethod('GetUserProfileDirectory','userenv.dll',[Reflection.MethodAttributes]'Public,Static,PinvokeImpl',[Reflection.CallingConventions]::Standard,[bool],[Type[]]@([IntPtr],[Text.StringBuilder],[uint32].MakeByRefType()),[Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Unicode)",
+      '$method.SetImplementationFlags($method.GetMethodImplementationFlags() -bor [Reflection.MethodImplAttributes]::PreserveSig)',
+      '$native=$type.CreateType()',
+      '$identity=[Security.Principal.WindowsIdentity]::GetCurrent()',
+      "try {$parameters=[object[]]@($identity.Token,[Text.StringBuilder]::new(32768),[uint32]32768);$ok=$native.GetMethod('GetUserProfileDirectory').Invoke($null,$parameters);if(-not $ok -or $parameters[2] -eq 0 -or $parameters[2] -ge 32768){throw 'Token profile path unavailable'};$profile=$parameters[1].ToString()}finally{$identity.Dispose()}",
       "$value=[ordered]@{profile=$profile;local=[IO.Path]::Combine($profile,'AppData','Local');roaming=[IO.Path]::Combine($profile,'AppData','Roaming')}",
       '[Console]::Out.Write(($value|ConvertTo-Json -Compress))',
     ].join(';')

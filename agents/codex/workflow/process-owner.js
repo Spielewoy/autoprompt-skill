@@ -18,6 +18,12 @@ const REQUIRED_PROCESS_CAPABILITIES = Object.freeze([
   'persistentIdentity', 'reservationRecovery',
 ])
 const POSIX_RESERVATION_ENV = 'AUTOPROMPT_OWNERSHIP_RESERVATION'
+const SHA256 = /^[a-f0-9]{64}$/
+const BOUND_DRAIN_RECEIPTS = new WeakMap()
+
+function isSha256(value) {
+  return typeof value === 'string' && SHA256.test(value)
+}
 
 function hasExactNulDelimitedEntry(environment, entry) {
   if (!Buffer.isBuffer(environment) || typeof entry !== 'string' || !entry || entry.includes('\0')) return false
@@ -234,6 +240,7 @@ class ProcessOwner {
     // caller-facing watchdog fires, so a late physical spawn can never become
     // detached from ownership merely because its JavaScript call timed out.
     this.spawnOperationFences = new Map()
+    BOUND_DRAIN_RECEIPTS.set(this, new WeakMap())
     this._restoreRegistry()
     this.onOwnershipChange(this.ownershipIdentities())
   }
@@ -466,6 +473,9 @@ class ProcessOwner {
       fail('LAUNCH_SPEC_INVALID', 'launch env must be an exact string-to-string map without NUL bytes')
     }
     if (typeof spec.targetKey !== 'string' || !spec.targetKey) fail('LAUNCH_SPEC_INVALID', 'launch requires targetKey')
+    if (spec.launchBindingHash !== undefined && !isSha256(spec.launchBindingHash)) {
+      fail('LAUNCH_SPEC_INVALID', 'launch binding hash must be an exact lowercase SHA-256 digest')
+    }
     if (this.adapter.kind !== 'test' && !path.isAbsolute(spec.executable)) {
       fail('LAUNCH_SPEC_INVALID', 'owned executable must be an absolute path; child PATH resolution is forbidden')
     }
@@ -517,6 +527,7 @@ class ProcessOwner {
       startupDeadlineAt,
       reservationIdentity,
       reservationBinding,
+      ...(spec.launchBindingHash !== undefined ? { launchBindingHash: spec.launchBindingHash } : {}),
       status: 'RESERVED',
       rootExit: null,
       terminal: null,
@@ -975,6 +986,7 @@ class ProcessOwner {
       startupDeadlineAt: record.startupDeadlineAt,
       reservationIdentity: record.reservationIdentity,
       reservationBinding: record.reservationBinding,
+      launchBindingHash: record.launchBindingHash ?? null,
       status: record.status,
       rootExit: record.rootExit,
       terminal: record.terminal,
@@ -1188,6 +1200,80 @@ class ProcessOwner {
     return evidence
   }
 
+  _boundDrainExpected(expected) {
+    const fields = ['reservationId', 'sessionId', 'targetKey', 'launchBindingHash']
+    if (!expected || typeof expected !== 'object' || Array.isArray(expected) ||
+        Object.keys(expected).sort().join('\0') !== fields.slice().sort().join('\0') ||
+        fields.slice(0, 3).some(field => typeof expected[field] !== 'string' || !expected[field] || expected[field].includes('\0')) ||
+        !isSha256(expected.launchBindingHash)) {
+      fail('PROCESS_IDENTITY_INVALID', 'bound drain request has an invalid exact launch binding')
+    }
+    return Object.freeze(canonicalize(Object.fromEntries(fields.map(field => [field, expected[field]]))))
+  }
+
+  async issueBoundDrainReceipt(expected, options = {}) {
+    const binding = this._boundDrainExpected(expected)
+    if (!options || typeof options !== 'object' || Array.isArray(options) ||
+        Object.keys(options).some(key => key !== 'drainRunning') ||
+        (options.drainRunning !== undefined && typeof options.drainRunning !== 'boolean')) {
+      fail('PROCESS_IDENTITY_INVALID', 'bound drain options are invalid')
+    }
+    const matches = [...this.groups.values()].filter(record =>
+      record.reservationId === binding.reservationId && record.sessionId === binding.sessionId &&
+      record.targetKey === binding.targetKey && record.launchBindingHash === binding.launchBindingHash)
+    if (matches.length !== 1) fail('PROCESS_IDENTITY_INVALID', 'bound drain record is absent, foreign, duplicated, or unbound')
+    let record = matches[0]
+    if (record.status === 'RESERVED') {
+      const probe = await this._probeReservation(record)
+      if (!probe || typeof probe !== 'object' || !['LIVE', 'DEAD', 'PENDING', 'UNKNOWN'].includes(probe.state)) {
+        fail('OWNERSHIP_RECOVERY_FATAL', 'bound launch reservation returned an invalid recovery state', {
+          evidence: { state: probe && typeof probe.state === 'string' ? probe.state : null },
+        })
+      }
+      if (probe.state === 'LIVE') record = this._attachRecovered(record, probe.ownership, 'bound-drain-recover-attach')
+      else if (probe.state === 'DEAD') {
+        this._terminal(record, 'FAILED', 'bound launch reservation is conclusively dead')
+      } else {
+        fail(probe.state === 'PENDING' ? 'OWNERSHIP_RECOVERY_PENDING' : 'OWNERSHIP_RECOVERY_FATAL',
+          `bound launch reservation remains ${probe.state.toLowerCase()}`, { evidence: probe.evidence || null })
+      }
+    }
+    if (record.status === 'RUNNING') {
+      if (options.drainRunning !== true) fail('PROCESS_DRAIN_TIMEOUT', 'bound process group is still running')
+      await this.cancelGroup(record.ownershipId, {
+        reason: 'bound resource cleanup requires exact process drain',
+        graceMs: 0,
+        killMs: Math.max(1, this.startupTimeoutMs),
+        terminalStatus: 'LOST',
+      })
+    }
+    if (['RUNNING', 'RESERVED'].includes(record.status) || !record.terminal) {
+      fail('PROCESS_DRAIN_TIMEOUT', 'bound process record has no durable terminal state')
+    }
+    const identities = [{ kind: `${record.adapterKind}-reservation`, id: record.reservationIdentity }]
+    if (record.groupIdentity) identities.push({ kind: record.adapterKind, id: record.groupIdentity })
+    const evidence = await this.verifyDrainedIdentities(identities)
+    const body = Object.freeze(canonicalize({
+      schemaVersion: 1,
+      ...binding,
+      ownershipId: record.ownershipId,
+      reservationIdentity: record.reservationIdentity,
+      groupIdentity: record.groupIdentity,
+      terminalStatus: record.status,
+      evidence,
+    }))
+    BOUND_DRAIN_RECEIPTS.get(this).set(body, stableStringify(binding))
+    return body
+  }
+
+  verifyBoundDrainReceipt(receipt, expected) {
+    const binding = this._boundDrainExpected(expected)
+    if (!receipt || typeof receipt !== 'object' || BOUND_DRAIN_RECEIPTS.get(this).get(receipt) !== stableStringify(binding)) {
+      fail('PROCESS_IDENTITY_INVALID', 'bound drain receipt is foreign or forged')
+    }
+    return true
+  }
+
   _restoreRegistry() {
     if (!this.fs.existsSync(this.registryPath)) return
     let registry
@@ -1223,7 +1309,8 @@ class ProcessOwner {
           typeof saved.sessionId !== 'string' || !saved.sessionId ||
           Number.isNaN(Date.parse(saved.startupDeadlineAt)) ||
           (!reserved && !hasOwnedIdentity && !saved.terminal) ||
-          saved.adapterKind !== this.adapter.kind || typeof saved.targetKey !== 'string' || !saved.targetKey) {
+          saved.adapterKind !== this.adapter.kind || typeof saved.targetKey !== 'string' || !saved.targetKey ||
+          (Object.hasOwn(saved, 'launchBindingHash') && !isSha256(saved.launchBindingHash))) {
         fail('PROCESS_REGISTRY_FAILURE', 'persisted process ownership identity is invalid')
       }
       const expectedReservationIdentity = typeof this.adapter.reservationIdentity === 'function'
@@ -1282,6 +1369,7 @@ class ProcessOwner {
       startupDeadlineAt: record.startupDeadlineAt,
       reservationIdentity: record.reservationIdentity,
       reservationBinding: record.reservationBinding,
+      ...(record.launchBindingHash !== undefined ? { launchBindingHash: record.launchBindingHash } : {}),
       status: record.status,
       rootExit: record.rootExit,
       terminal: record.terminal || this.terminalRecords.get(record.ownershipId) || null,

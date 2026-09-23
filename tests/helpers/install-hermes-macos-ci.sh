@@ -179,6 +179,26 @@ case "$python_physical" in "$output_root"/*) ;; *)
   printf '%s\n' 'Hermes venv resolves outside the private acquisition root.' >&2
   exit 1
 esac
+# The official `all` extra intentionally omits the optional Bedrock provider
+# dependency. Install its pinned pair separately into the already-bound private
+# venv so this probe exercises the same optional provider closure without
+# changing the verified Hermes source checkout.
+bedrock_log="$output_root/bedrock-dependencies.log"
+{
+  printf '%s\n' 'Installing pinned optional Bedrock dependencies into the private Hermes venv.'
+  (
+    unset PYTHONHOME PYTHONPATH UV_PYTHON UV_CONFIG_FILE HERMES_INSTALL_DIR
+    export HOME="$user_home"
+    export HERMES_HOME="$hermes_home"
+    export UV_CACHE_DIR="$cache_root"
+    export XDG_CACHE_HOME="$cache_root/xdg"
+    export XDG_CONFIG_HOME="$output_root/xdg-config"
+    export XDG_DATA_HOME="$output_root/xdg-data"
+    export TMPDIR="$tmp_root"
+    "$hermes_home/bin/uv" pip install --python "$venv_python" \
+      'boto3==1.42.89' 'botocore==1.42.89'
+  )
+} 2>&1 | tee "$bedrock_log"
 "$venv_python" - <<'PY'
 import importlib.metadata as metadata
 import sys

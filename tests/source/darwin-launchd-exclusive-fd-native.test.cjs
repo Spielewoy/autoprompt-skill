@@ -59,7 +59,12 @@ test('diagnostic: legacy SubmitJob can transfer exclusive caller sockets to laun
   const active = label('active'); labels.add(active)
   const submit = command(executable, ['--submit', executable, ready, active]); assert.equal(submit.status, 0, `${submit.stdout}${submit.stderr}`)
   assert.ok(exactDomain(active), 'legacy SubmitJob succeeded without exposing the exact label in gui or user launchd domains')
-  await waitFor(() => fs.existsSync(ready), 30000, 'legacy SubmitJob worker did not check in with transferred FDs')
+  try { await waitFor(() => fs.existsSync(ready), 30000, 'legacy SubmitJob worker did not check in with transferred FDs') } catch (error) {
+    const tail = file => { try { return fs.readFileSync(file, 'utf8').slice(-4096) } catch { return '<missing>' } }
+    const launchd = domains.map(domain => ({ domain, output: command('/bin/launchctl', ['print', `${domain}/${active}`]) }))
+    console.error(JSON.stringify({ exclusiveFdFailure: error.message, ready, stdoutTail: tail(`${ready}.stdout`), stderrTail: tail(`${ready}.stderr`), launchd: launchd.map(item => ({ domain: item.domain, status: item.output.status, stdout: String(item.output.stdout || '').slice(-4096), stderr: String(item.output.stderr || '').slice(-4096) })) }))
+    throw error
+  }
   const receipt = JSON.parse(fs.readFileSync(ready, 'utf8')); assert.equal(receipt.label, active); assert.ok(Number.isSafeInteger(receipt.pid) && receipt.pid > 0); assert.ok(Number.isSafeInteger(receipt.port) && receipt.port > 0)
   const check = (mode, host, expected) => { const result = command(executable, [mode, host, String(receipt.port)]); assert.equal(result.status, expected, `${mode} ${host}: ${result.stderr}`) }
   for (const mode of ['--bind4', '--bind4-reuse']) for (const host of ['0.0.0.0', '127.0.0.1', '127.0.0.2']) check(mode, host, 78)

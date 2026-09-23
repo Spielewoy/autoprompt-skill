@@ -31,6 +31,28 @@ function run(executable, argv, options = {}) {
   })
 }
 function quote(value) { return `'${String(value).replaceAll("'", "''")}'` }
+function activationFailureLogs(root) {
+  const logs = []
+  const capture = file => {
+    try {
+      const stat = fs.lstatSync(file)
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) return
+      const fd = fs.openSync(file, 'r'), bytes = Buffer.alloc(Math.min(stat.size, 16384))
+      try { fs.readSync(fd, bytes, 0, bytes.length, Math.max(0, stat.size - bytes.length)) } finally { fs.closeSync(fd) }
+      logs.push({ path: path.relative(root, file), tail: bytes.toString('utf8') })
+    } catch {}
+  }
+  const parent = path.join(root, '.autoprompt-private', 'activations')
+  for (const id of fs.existsSync(parent) ? fs.readdirSync(parent).filter(name => /^apv2-[a-f0-9]{32}$/.test(name)).slice(0, 2) : []) {
+    capture(path.join(parent, id, 'activation.json'))
+    const canaries = path.join(parent, id, 'reviewed-local-canary')
+    for (const generation of fs.existsSync(canaries) ? fs.readdirSync(canaries).filter(name => /^generation-[1-9][0-9]*$/.test(name)).slice(0, 2) : []) {
+      const directory = path.join(canaries, generation)
+      for (const name of fs.readdirSync(directory).filter(name => /^outer-[a-f0-9-]{36}\.(?:status\.json|failure\.json|stdout\.log|stderr\.log)$/.test(name)).slice(0, 8)) capture(path.join(directory, name))
+    }
+  }
+  return logs
+}
 
 test('Windows public OpenCode activation preserves cmd and PowerShell separators after native canary', { skip: process.platform !== 'win32' || !CLI, timeout: 7200000 }, async t => {
   if (process.env.AUTOPROMPT_CI_EXPECTED_ARCH) assert.equal(process.arch, process.env.AUTOPROMPT_CI_EXPECTED_ARCH)
@@ -40,8 +62,15 @@ test('Windows public OpenCode activation preserves cmd and PowerShell separators
   let onMission = null
   const endpoint = await opencodePublicEndpoint({ onMission: body => { assert.ok(onMission, 'mission endpoint is not armed'); onMission(body) } })
   const directory = privateDirectory(fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt issue28 public '))))
-  let completed = false, owner = null
+  let completed = false, owner = null, lastActivation = null
   t.after(async () => {
+    if (!completed && lastActivation) {
+      const result = lastActivation.result
+      console.error(JSON.stringify({ publicActivationFailure: lastActivation.form, endpointErrors: endpoint.errors.slice(0, 4),
+        result: result ? { code: result.code, signal: result.signal, error: result.error, errorCode: result.errorCode,
+          stdout: String(result.stdout || '').slice(-16384), stderr: String(result.stderr || '').slice(-16384) } : null,
+        logs: activationFailureLogs(lastActivation.root) }))
+    }
     let failure
     try { if (owner) { await owner.cancelAll({ reason: 'public OpenCode fixture cleanup', graceMs: 500, killMs: 2000, waitForPending: true }); await owner.assertDrained(); assert.equal(owner.ownershipIdentities().length, 0) } } catch (error) { failure = error }
     try { await endpoint.close() } catch (error) { failure ||= error }
@@ -62,6 +91,7 @@ test('Windows public OpenCode activation preserves cmd and PowerShell separators
   result = await run('git', ['-C', target, '-c', 'user.name=Issue 28', '-c', 'user.email=issue28@example.invalid', 'commit', '--allow-empty', '-m', 'fixture'], { env: environment }); assert.equal(result.status, 0, result.stderr)
   for (const form of ['cmd', 'ps1']) {
     const root = privateDirectory(path.join(directory, `config-${form}`))
+    lastActivation = { form, root }
     result = await run(process.execPath, [publicCli, 'install', 'opencode', '--root', root], { cwd: directory, env: environment }); assert.equal(result.status, 0, `${form}: ${result.stdout}\n${result.stderr}`)
     fs.writeFileSync(path.join(root, 'opencode.json'), JSON.stringify({ model: 'fixture/model', provider: { fixture: { npm: '@ai-sdk/openai-compatible', options: { baseURL: `${endpoint.url}/v1`, apiKey: 'issue28-local-only' }, models: { model: { name: 'Issue 28 fixture', limit: { context: 32768, output: 2048 } } } } } }), { mode: 0o600 })
     const shim = path.join(prefix, 'node_modules', '.bin', `autoprompt.${form}`); assert.ok(fs.existsSync(shim), `${form} npm shim missing`)
@@ -110,11 +140,12 @@ test('Windows public OpenCode activation preserves cmd and PowerShell separators
     const argv = ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command]
     const launch = `const child=require('node:child_process').spawn(${JSON.stringify(PS)},${JSON.stringify(argv)},{stdio:'inherit',shell:false});child.once('error',e=>{console.error(e);process.exitCode=1});child.once('close',(code,signal)=>{process.exitCode=signal?1:code})`
     result = await ownedTest(owner, executionRoot, environment, ['-e', launch], 3660000)
+    lastActivation.result = result
     fs.writeFileSync(path.join(directory, `public-${form}-result.json`), JSON.stringify(result), { mode: 0o600 })
     assert.equal(result.error, null); assert.equal(result.errorCode, null); assert.equal(result.signal, null)
     assert.equal(result.code, 1, `${form}: ${result.stdout}\n${result.stderr}`)
-    assert.match(result.stdout, new RegExp(`Autoprompt activation ${activationId}: status=1 revoked=true`))
     assert.ok(missionRequests > 0, `${form}: no authenticated public mission reached the private endpoint`)
+    assert.match(result.stdout, new RegExp(`Autoprompt activation ${activationId}: status=1 revoked=true`))
     const record = inspect('revoked')
     const { readChecksummedJson } = require(path.join(installed.bundle, 'agents/codex/workflow/event-log.js'))
     const terminal = readChecksummedJson(path.join(record.supervisorRuntime.runPath, 'terminal.json'))

@@ -62,7 +62,10 @@ static int insert(launch_data_t dict, launch_data_t value, const char *key) { if
 static int array_value(launch_data_t array, launch_data_t value, size_t index) { if (!value || !launch_data_array_set_index(array, value, index)) { if (value) launch_data_free(value); return -1; } return 0; }
 static int submit(const char *self, const char *ready, const char *label, in_port_t requested) {
   in_port_t port; int fd4 = -1, fd6 = -1, result = 1; launch_data_t message = NULL, job = NULL, response = NULL, arguments = NULL, sockets = NULL, v4 = NULL, v6 = NULL;
+  char stdout_path[1024], stderr_path[1024];
   if (!valid_label(label) || ready[0] != '/' || !self[0]) return 64;
+  int stdout_length = snprintf(stdout_path, sizeof(stdout_path), "%s.stdout", ready), stderr_length = snprintf(stderr_path, sizeof(stderr_path), "%s.stderr", ready);
+  if (stdout_length < 0 || stderr_length < 0 || (size_t)stdout_length >= sizeof(stdout_path) || (size_t)stderr_length >= sizeof(stderr_path)) return 64;
   fd4 = bind4(requested, &port);
   if (fd4 < 0 || (fd6 = bind6(port)) < 0) goto out;
   arguments = launch_data_alloc(LAUNCH_DATA_ARRAY); sockets = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
@@ -74,6 +77,7 @@ static int submit(const char *self, const char *ready, const char *label, in_por
   job = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
   if (!job || insert(job, string_data(label), LAUNCH_JOBKEY_LABEL)) goto out;
   if (insert(job, arguments, LAUNCH_JOBKEY_PROGRAMARGUMENTS)) { arguments = NULL; goto out; } arguments = NULL;
+  if (insert(job, string_data(stdout_path), "StandardOutPath") || insert(job, string_data(stderr_path), "StandardErrorPath")) goto out;
   if (insert(job, launch_data_new_bool(true), LAUNCH_JOBKEY_RUNATLOAD) || insert(job, launch_data_new_bool(false), LAUNCH_JOBKEY_KEEPALIVE)) goto out;
   if (insert(job, sockets, LAUNCH_JOBKEY_SOCKETS)) { sockets = NULL; goto out; } sockets = NULL;
   message = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
@@ -103,11 +107,14 @@ static int checked_fd(launch_data_t sockets, const char *name, int family, in_po
   values = launch_data_dict_lookup(sockets, name);
   if (!values || launch_data_get_type(values) != LAUNCH_DATA_ARRAY || launch_data_array_get_count(values) != 1 || !(value = launch_data_array_get_index(values, 0)) || launch_data_get_type(value) != LAUNCH_DATA_FD) { diagnostic("checkin-fd-shape", EPROTO); return -1; }
   int source = launch_data_get_fd(value), fd = source >= 0 ? dup(source) : -1;
-  if (fd < 0 || getsockname(fd, (struct sockaddr *)&address, &length) != 0) { if (fd >= 0) close(fd); return -1; }
-  if (getsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse_address, &option_length) != 0 || reuse_address != 0) { close(fd); return -1; }
-  option_length = sizeof(int); if (getsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse_port, &option_length) != 0 || reuse_port != 0) { close(fd); return -1; }
-  if (family == AF_INET) { struct sockaddr_in *v4 = (struct sockaddr_in *)&address; if (address.ss_family != AF_INET || (port && v4->sin_port != port) || v4->sin_addr.s_addr != htonl(INADDR_ANY)) { close(fd); return -1; } }
-  else { struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&address; if (address.ss_family != AF_INET6 || (port && v6->sin6_port != port) || memcmp(&v6->sin6_addr, &in6addr_loopback, sizeof(in6addr_loopback))) { close(fd); return -1; } }
+  if (fd < 0) { diagnostic("checkin-fd-dup", errno); return -1; }
+  if (getsockname(fd, (struct sockaddr *)&address, &length) != 0) { diagnostic("checkin-getsockname", errno); close(fd); return -1; }
+  if (getsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse_address, &option_length) != 0) { diagnostic("checkin-reuseaddr-get", errno); close(fd); return -1; }
+  if (reuse_address != 0) { diagnostic("checkin-reuseaddr-value", EADDRINUSE); close(fd); return -1; }
+  option_length = sizeof(int); if (getsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse_port, &option_length) != 0) { diagnostic("checkin-reuseport-get", errno); close(fd); return -1; }
+  if (reuse_port != 0) { diagnostic("checkin-reuseport-value", EADDRINUSE); close(fd); return -1; }
+  if (family == AF_INET) { struct sockaddr_in *v4 = (struct sockaddr_in *)&address; if (address.ss_family != AF_INET || (port && v4->sin_port != port) || v4->sin_addr.s_addr != htonl(INADDR_ANY)) { diagnostic("checkin-family-or-address4", EPROTO); close(fd); return -1; } }
+  else { struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&address; if (address.ss_family != AF_INET6 || (port && v6->sin6_port != port) || memcmp(&v6->sin6_addr, &in6addr_loopback, sizeof(in6addr_loopback))) { diagnostic("checkin-family-or-address6", EPROTO); close(fd); return -1; } }
   return fd;
 }
 static int worker(const char *ready, const char *label) {
@@ -120,7 +127,7 @@ static int worker(const char *ready, const char *label) {
   if (launch_data_get_type(response) != LAUNCH_DATA_DICTIONARY) { fprintf(stderr, "exclusive-fd stage=checkin-response-type type=%d\n", (int)launch_data_get_type(response)); goto out; }
   launch_data_t sockets = launch_data_dict_lookup(response, LAUNCH_JOBKEY_SOCKETS);
   fd4 = checked_fd(sockets, "autoprompt.v4", AF_INET, 0); /* port follows after the first descriptor query */
-  if (fd4 >= 0) { struct sockaddr_in address; socklen_t length = sizeof(address); if (getsockname(fd4, (struct sockaddr *)&address, &length) != 0) goto out; close(fd4); fd4 = checked_fd(sockets, "autoprompt.v4", AF_INET, address.sin_port); fd6 = checked_fd(sockets, "autoprompt.v6", AF_INET6, address.sin_port); if (fd4 >= 0 && fd6 >= 0) result = write_receipt(ready, label, address.sin_port); }
+  if (fd4 >= 0) { struct sockaddr_in address; socklen_t length = sizeof(address); if (getsockname(fd4, (struct sockaddr *)&address, &length) != 0) { diagnostic("checkin-primary-getsockname", errno); goto out; } close(fd4); fd4 = checked_fd(sockets, "autoprompt.v4", AF_INET, address.sin_port); fd6 = checked_fd(sockets, "autoprompt.v6", AF_INET6, address.sin_port); if (fd4 >= 0 && fd6 >= 0) result = write_receipt(ready, label, address.sin_port); }
 out:
   if (response) launch_data_free(response);
   if (result != 0) { if (fd4 >= 0) close(fd4); if (fd6 >= 0) close(fd6); return result; }

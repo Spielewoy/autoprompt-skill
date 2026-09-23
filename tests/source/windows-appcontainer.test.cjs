@@ -196,6 +196,24 @@ test('Windows helper staging preserves its primary refusal and accounts for an u
 const windowsFixturePath = value => process.platform === 'win32' ? value : 'Z:' + value.replaceAll('/', '\\')
 const physicalFixturePath = value => process.platform === 'win32' ? value : value.slice(2).replaceAll('\\', '/')
 
+test('native Windows token profile bootstrap needs no inherited profile or compiler temp', { skip: process.platform !== 'win32', timeout: 45000 }, t => {
+  const os = require('node:os')
+  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), 'token-profile-isolated-'))
+  t.after(() => fs.rmSync(isolated, { recursive: true, force: true }))
+  let queryCount = 0
+  const safe = windowsModule('safe-run-root.js', { 'node:child_process': { ...cp, spawnSync(file, argv, options) {
+    queryCount++
+    for (const name of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP']) assert.equal(options.env[name], undefined)
+    return cp.spawnSync(file, argv, options)
+  } } }, undefined, { versions: { ...process.versions, bun: 'native-profile-probe' },
+    env: { SystemRoot: process.env.SystemRoot, HOME: isolated, USERPROFILE: isolated, APPDATA: isolated, LOCALAPPDATA: isolated, TEMP: path.join(isolated, 'absent'), TMP: path.join(isolated, 'absent') } })
+  const environment = safe.windowsControllerEnvironment(process.env.SystemRoot)
+  assert.equal(queryCount, 1)
+  assert.equal(environment.USERPROFILE.toLowerCase(), fs.realpathSync.native(os.userInfo().homedir).toLowerCase())
+  assert.notEqual(environment.USERPROFILE.toLowerCase(), isolated.toLowerCase())
+  assert.equal(environment.TEMP.toLowerCase(), fs.realpathSync.native(path.join(os.userInfo().homedir, 'AppData', 'Local', 'Temp')).toLowerCase())
+})
+
 test('Windows ownership setup keeps a bounded cold-start allowance and never caches a failed privacy proof', t => {
   const profile = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'compiler-profile-')))
   fs.mkdirSync(path.join(profile, 'AppData', 'Local', 'Temp'), { recursive: true }); fs.mkdirSync(path.join(profile, 'AppData', 'Roaming'), { recursive: true })
@@ -282,9 +300,9 @@ test('bundled Bun resolves Windows token folders without trusting isolated profi
     env: { HOME: windowsFixturePath(hostile), USERPROFILE: windowsFixturePath(hostile), APPDATA: windowsFixturePath(hostile), LOCALAPPDATA: windowsFixturePath(hostile) } })
   const environment = safe.windowsControllerEnvironment('C:\\Windows')
   assert.equal(query.file, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
-  assert.match(query.argv.at(-1), /GetUserProfileDirectory\(token,profile,ref length\)/)
-  assert.match(query.argv.at(-1), /OpenProcessToken\(GetCurrentProcess\(\),8,out token\)/)
-  assert.doesNotMatch(query.argv.at(-1), /GetFolderPath/)
+  assert.match(query.argv.at(-1), /DefinePInvokeMethod\('GetUserProfileDirectory','userenv\.dll'/)
+  assert.match(query.argv.at(-1), /WindowsIdentity\]::GetCurrent\(\)/)
+  assert.doesNotMatch(query.argv.at(-1), /GetFolderPath|Add-Type/)
   assert.deepEqual({ ...query.options.env }, { SystemRoot: 'C:\\Windows', WINDIR: 'C:\\Windows', SystemDrive: 'C:', PATH: 'C:\\Windows\\System32' })
   assert.equal(environment.USERPROFILE, windowsFixturePath(profile))
   assert.equal(environment.HOME, windowsFixturePath(profile))

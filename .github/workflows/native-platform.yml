@@ -23,7 +23,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, relay, hermes]
+        options: [all, relay, lease, hermes]
       support_capability:
         description: 'Run all capabilities or a focused isolation/checker/cancellation diagnostic'
         required: false
@@ -1209,14 +1209,14 @@ jobs:
           architecture: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
       - run: npm ci --ignore-scripts
       - name: Verify same-container transport without host loopback authority
-        if: inputs.support_primitive != 'hermes'
+        if: inputs.support_primitive == 'all' || inputs.support_primitive == 'relay'
         timeout-minutes: 8
         shell: bash
         run: |
           set -o pipefail
           node --test --test-reporter=tap tests/source/windows-appcontainer-internal-loopback.test.cjs 2>&1 | tee windows-internal-loopback.log
       - name: Verify inherited authenticated relay stdin through native AppContainer
-        if: ${{ !cancelled() && inputs.support_primitive != 'hermes' }}
+        if: ${{ !cancelled() && (inputs.support_primitive == 'all' || inputs.support_primitive == 'relay') }}
         timeout-minutes: 8
         shell: bash
         run: |
@@ -1230,8 +1230,15 @@ jobs:
         run: |
           set -o pipefail
           node --test --test-reporter=tap tests/source/harness-v2-windows-tool-lease-native.test.cjs 2>&1 | tee windows-tool-lease-native.log
+      - name: Verify native token profile bootstrap without inherited compiler temp
+        if: ${{ !cancelled() && inputs.support_primitive != 'hermes' }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap --test-name-pattern='native Windows token profile bootstrap' tests/source/windows-appcontainer.test.cjs 2>&1 | tee windows-token-profile.log
       - name: Acquire the pinned official Hermes Windows installation
-        if: ${{ !cancelled() && inputs.support_primitive != 'relay' }}
+        if: ${{ !cancelled() && (inputs.support_primitive == 'all' || inputs.support_primitive == 'hermes') }}
         timeout-minutes: 25
         shell: pwsh
         run: |
@@ -1263,6 +1270,7 @@ jobs:
             windows-relay-native.log
             grok-windows-relay.log
             windows-tool-lease-native.log
+            windows-token-profile.log
             hermes-windows-launcher.tap
             native-hermes-evidence.json
             native-hermes-tests.log
@@ -1470,4 +1478,5 @@ jobs:
             native-hermes-tests.log
             ${{ runner.temp }}/hermes-macos-0.21.1/hermes-macos-acquisition.json
             ${{ runner.temp }}/hermes-macos-0.21.1/official-installer.log
+            ${{ runner.temp }}/hermes-macos-0.21.1/bedrock-dependencies.log
           if-no-files-found: error
