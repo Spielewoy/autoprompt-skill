@@ -76,7 +76,11 @@ test('Darwin Seatbelt profile is default-deny and grants only exact roots, fixed
   assert.equal(profile.includes('(subpath "/")'), false)
   assert.match(profile, new RegExp(`\\(subpath ${JSON.stringify(f.target).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`))
   assert.match(profile, new RegExp(`\\(subpath ${JSON.stringify(f.scratch).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`))
-  assert.match(profile, /\(allow process-exec \(literal "\/bin\/sh"\)\)/)
+  for (const shell of sandbox.SYSTEM_SHELL_EXECUTABLES) {
+    assert.ok(profile.includes(`(allow process-exec (literal ${JSON.stringify(shell)}))`))
+    assert.ok(profile.includes(`(allow file-read* (literal ${JSON.stringify(shell)}))`))
+  }
+  assert.equal(profile.includes('(subpath \"/private/var\")'), false)
   assert.match(profile, /\(allow process-info\* \(target same-sandbox\)\)/)
   assert.match(profile, /\(allow mach-priv-task-port \(target same-sandbox\)\)/)
   for (const name of sandbox.NODE_STARTUP_SYSCTLS) assert.match(profile, new RegExp(`\(sysctl-name ${JSON.stringify(name)}\)`))
@@ -108,6 +112,10 @@ test('Darwin command backend binds fixed Seatbelt argv, returns raw output hashe
   assert.equal(launch.env.HOME, f.temp)
   assert.equal(launch.env.PATH, path.dirname(process.execPath))
   assert.equal(launch.env.AUTOPROMPT_OWNERSHIP_RESERVATION, launch.reservationId)
+  assert.equal(launch.env.GIT_CONFIG_NOSYSTEM, '1')
+  assert.equal(launch.env.GIT_CONFIG_GLOBAL, '/dev/null')
+  assert.equal(launch.env.GIT_TERMINAL_PROMPT, '0')
+  assert.equal(launch.env.GIT_ALLOW_PROTOCOL, '')
   assert.equal(result.status, 'completed')
   assert.equal(result.outputSha256, crypto.createHash('sha256').update('candidate bytes').digest('hex'))
   assert.equal(stopCalls, 0)

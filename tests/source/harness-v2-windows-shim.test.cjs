@@ -156,3 +156,17 @@ test('Windows npm shim launch binding rejects malformed persisted invocation met
   const tampered = { ...binding, invocation: { ...binding.invocation, node: { ...binding.invocation.node, path: 7 } } }
   assert.throws(() => native.executableInvocation(tampered, ['--help']), { code: 'PROVIDER_IDENTITY_MISMATCH' })
 })
+
+
+test('Windows npm shim admits extensionless Node bins only with the exact declared bin and plain Node shebang', async t => {
+  const f = fixture(t, { packageName: '@kilocode/cli', shimName: 'kilo', bin: 'bin/kilo' })
+  const script = path.join(f.packageRoot, 'bin', 'kilo')
+  fs.renameSync(f.script, script)
+  await cmdShim(script, f.shim.slice(0, -'.cmd'.length))
+  const binding = native.locateExecutable({ provider: 'kilo', executable: f.shim, platform: 'win32' })
+  assert.equal(binding.invocation.kind, 'node-script')
+  assert.equal(binding.invocation.script.path, script)
+  assert.deepEqual(native.executableInvocation(binding, ['--version']).argv, [script, '--version'])
+  fs.writeFileSync(script, '#!/usr/bin/env bun\nconsole.log("not Node")\n')
+  assert.throws(() => native.locateExecutable({ provider: 'kilo', executable: f.shim, platform: 'win32' }), { code: 'PROVIDER_UNSUPPORTED' })
+})

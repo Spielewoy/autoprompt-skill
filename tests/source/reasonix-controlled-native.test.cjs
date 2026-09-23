@@ -88,11 +88,15 @@ async function realFixture(t, actions, options = {}) {
     fs.rmSync(f.root, { recursive: true, force: true })
   })
   const executable = native.probeExecutable({ executable: process.env.AUTOPROMPT_REASONIX_TEST_CLI, env: f.env })
-  const requests = [], events = [], errors = [], deltas = [], authenticated = [], providerEvents = []
+  const requests = [], events = [], errors = [], deltas = [], authenticated = [], providerEvents = [], endpointRequests = []
+  const nativeDiagnostic = { stdout: [], stderr: '', result: null }
   const credential = options.credential || 'fixture'
   server = http.createServer(async (req, res) => {
+    const endpointRequest = { method: req.method, path: req.url, bytes: null }
+    endpointRequests.push(endpointRequest)
     try {
       let text = ''; for await (const chunk of req) text += chunk
+      endpointRequest.bytes = Buffer.byteLength(text)
       const body = JSON.parse(text)
       requests.push(body)
       const requestNumber = requests.length
@@ -130,6 +134,19 @@ async function realFixture(t, actions, options = {}) {
   owner = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
   const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'reasonix-controlled-native', pollMs: 10 })
+  const ownedRun = runner.run.bind(runner)
+  runner.run = async spec => {
+    nativeDiagnostic.stdout = []; nativeDiagnostic.stderr = ''; nativeDiagnostic.result = null
+    const result = await ownedRun({ ...spec, onStdoutLine: line => {
+      nativeDiagnostic.stdout.push(String(line).slice(-8192))
+      if (nativeDiagnostic.stdout.length > 16) nativeDiagnostic.stdout.shift()
+      return spec.onStdoutLine?.(line)
+    } })
+    nativeDiagnostic.stderr = String(result.stderr || '').slice(-16384)
+    nativeDiagnostic.result = { status: result.status, signal: result.signal || null, processOwned: result.processOwned,
+      exactArgv: result.exactArgv, drained: result.drained }
+    return result
+  }
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   const adapter = new ReasonixExecAdapter({ runner, nativeRoot: f.nativeRoot, executableBinding: executable, targetPath: f.target,
     connection: typeof options.connection === 'function' ? options.connection(server.address().port) : options.connection || { default_model: 'fixture', providers: [{ name: 'fixture', kind: 'openai', model: 'fixture', base_url: `http://127.0.0.1:${server.address().port}/v1`, api_key_env: 'FIXTURE_KEY' }] },
@@ -151,26 +168,36 @@ async function realFixture(t, actions, options = {}) {
         return supplied?.(evidence)
       }
     }
+    let launchDeadlineFired = false
+    const failureDiagnostic = (failure, phase) => {
+      const toolRoot = path.join(f.launchRoot, 'tools')
+      const toolFiles = fs.existsSync(toolRoot) ? fs.readdirSync(toolRoot, { recursive: true }) : []
+      const locks = toolFiles.filter(file => file.endsWith('server.lock')).map(file => {
+        const lock = JSON.parse(fs.readFileSync(path.join(toolRoot, file), 'utf8'))
+        let alive = true
+        try { process.kill(lock.pid, 0) } catch (error) { alive = error.code !== 'ESRCH' }
+        return { ...lock, alive }
+      })
+      const diagnostic = { reasonixFixtureFailure: String(failure?.code || failure?.message || phase).slice(0, 1024), phase,
+        cause: String(failure?.cause?.code || failure?.cause?.message || '').slice(0, 1024), runner: nativeDiagnostic.result,
+        stderr: nativeDiagnostic.stderr, stdout: [...nativeDiagnostic.stdout], endpointRequests: [...endpointRequests],
+        eventKinds: events.slice(-32).map(event => ({ kind: event.kind || event.type, tool: event.tool?.name || null })),
+        toolFiles: toolFiles.slice(0, 128), locks }
+      while (Buffer.byteLength(JSON.stringify(diagnostic)) > 65536 && diagnostic.stdout.length) diagnostic.stdout.shift()
+      while (Buffer.byteLength(JSON.stringify(diagnostic)) > 65536 && diagnostic.eventKinds.length) diagnostic.eventKinds.shift()
+      const text = JSON.stringify(diagnostic)
+      if (launchDeadlineFired && phase === 'launch-failure') process.stderr.write(`# ${text}\n`)
+      else t.diagnostic(text)
+    }
     const timeout = new AbortController()
-    const timer = setTimeout(() => timeout.abort(), 30000)
+    const timer = setTimeout(() => { launchDeadlineFired = true; try { failureDiagnostic(null, 'launch-deadline') } catch (error) { t.diagnostic(`Failure diagnostic unavailable: ${error.code || error.message}`) } finally { timeout.abort() } }, process.platform === 'win32' ? 300000 : 30000)
     record.signal = overrides.signal || timeout.signal
     try { return await adapter.launch(record) } catch (error) {
-      if (process.env.AUTOPROMPT_REASONIX_TEST_DEBUG) {
-        const toolRoot = path.join(f.launchRoot, 'tools')
-        const toolFiles = fs.existsSync(toolRoot) ? fs.readdirSync(toolRoot, { recursive: true }) : []
-        const locks = toolFiles.filter(file => file.endsWith('server.lock')).map(file => {
-          const lock = JSON.parse(fs.readFileSync(path.join(toolRoot, file), 'utf8'))
-          let alive = true
-          try { process.kill(lock.pid, 0) } catch (failure) { alive = failure.code !== 'ESRCH' }
-          return { ...lock, alive }
-        })
-        t.diagnostic(JSON.stringify({ code: error.code, cause: error.cause?.code,
-          events: events.filter(event => event.tool || event.type === 'result'), root: f.root, toolFiles, locks }))
-      }
+      try { failureDiagnostic(error, 'launch-failure') } catch (diagnosticError) { t.diagnostic(`Failure diagnostic unavailable: ${diagnosticError.code || diagnosticError.message}`) }
       throw error
     } finally { clearTimeout(timer) }
   }
-  return { ...f, requests, events, errors, deltas, authenticated, providerEvents, adapter, runner, owner, launch }
+  return { ...f, requests, events, errors, deltas, authenticated, providerEvents, endpointRequests, nativeDiagnostic, adapter, runner, owner, launch }
 }
 
 function assertNativeSurface(f) {

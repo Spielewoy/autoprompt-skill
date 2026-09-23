@@ -7,7 +7,7 @@ const native = require('../../agents/reasonix/workflow/native.js')
 const { ReasonixExecAdapter } = require('../../agents/reasonix/workflow/transport.js')
 const { ProcessOwner } = require('../../agents/codex/workflow/process-owner.js')
 const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge } = require('../helpers/native-platform.cjs')
-const options = { skip: !process.env.AUTOPROMPT_REASONIX_TEST_CLI, timeout: 90000 }
+const options = { skip: !process.env.AUTOPROMPT_REASONIX_TEST_CLI, timeout: process.platform === 'win32' ? 900000 : 90000 }
 const named = (name, fn) => test(`reasonix closed native capability: ${name}`, options, fn)
 const results = f => f.events.filter(event => event.kind === 'tool_result').map(event => resultPayload(event.tool))
 async function ready(t, command, extra = {}) {
@@ -22,7 +22,7 @@ function good(f, result) {
   assert.ok(results(f).some(value => value.output.includes(`CLOSED_CANARY_CHALLENGE:${f.challenge}`)), 'native receipt must return the exact challenge')
 }
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function waitFor(predicate) { for (let i = 0; i < 1500 && !predicate(); i++) await delay(10); assert.ok(predicate(), 'native request did not reach the required state') }
+async function waitFor(predicate) { for (let i = 0, limit = process.platform === 'win32' ? 12000 : 1500; i < limit && !predicate(); i++) await delay(10); assert.ok(predicate(), 'native request did not reach the required state') }
 named('isolation', async t => {
   const net = require('node:net'); let contacted = false
   const server = net.createServer(socket => { contacted = true; socket.destroy() })

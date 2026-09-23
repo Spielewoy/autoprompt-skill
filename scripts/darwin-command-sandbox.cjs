@@ -13,6 +13,10 @@ const { createDarwinCoalitionAdapter } = require('../agents/codex/workflow/darwi
 const HASH = /^[a-f0-9]{64}$/
 const OUTPUT_LIMIT = 1024 * 1024
 const SYSTEM_SANDBOX_EXEC = '/usr/bin/sandbox-exec'
+// macOS resolves /bin/sh through this fixed selector before it execs /bin/bash.
+// Grant exactly this three-path interpreter closure, not /private/var or a shell search path.
+const SYSTEM_SH_TRAMPOLINE = '/private/var/select/sh'
+const SYSTEM_SHELL_EXECUTABLES = Object.freeze(['/bin/sh', SYSTEM_SH_TRAMPOLINE, '/bin/bash'])
 // Node's Darwin bootstrap consults these kernel values and system endpoints
 // before it reaches the controlled relay. These are named read/look-up
 // grants only: they do not permit network sockets, service registration, or
@@ -82,11 +86,11 @@ function renderSeatbeltProfile(policy, options = {}) {
     // dyld opens the root directory while initializing its shared cache.
     // This grants that directory vnode only, never descendant file contents.
     '(allow file-read-data (literal "/"))',
-    // Node is launched directly. It may only exec the fixed POSIX shell and
-    // this exact Node runtime; other programs, including launchctl, remain
-    // denied by the default profile.
+    // Node is launched directly. /bin/sh first reads and executes its fixed
+    // selector trampoline, which then execs /bin/bash. Nothing grants a shell
+    // search path or access to /private/var beyond that one selector file.
     `(allow process-exec (literal ${quoted(node)}))`, `(allow file-read* (literal ${quoted(node)}))`,
-    '(allow process-exec (literal "/bin/sh"))', '(allow file-read* (literal "/bin/sh"))',
+    ...SYSTEM_SHELL_EXECUTABLES.flatMap(shell => [`(allow process-exec (literal ${quoted(shell)}))`, `(allow file-read* (literal ${quoted(shell)}))`]),
     '(allow process-fork)', '(allow process-info* (target same-sandbox))', '(allow signal (target same-sandbox))',
     '(allow mach-priv-task-port (target same-sandbox))',
     '(allow sysctl-read', ...NODE_STARTUP_SYSCTLS.map(name => `  (sysctl-name ${JSON.stringify(name)})`), ')',
@@ -140,7 +144,7 @@ function createDarwinCommandSandbox(options = {}) {
   const platform = options.platform || process.platform
   if (platform !== 'darwin') fail('COMMAND_SANDBOX_UNSUPPORTED', 'Darwin command sandbox requires native macOS')
   const controlRoot = physicalDirectory(options.controlRoot)
-  const helper = Object.freeze({ ...options.helper })
+  const helper = Object.freeze({ ...(options.helper || require('../agents/codex/workflow/darwin-coalition-loader.js').loadDarwinCoalitionHelper()) })
   boundExecutable(helper)
   const sandboxBinding = systemSandboxBinding(options)
   boundExecutable(sandboxBinding, options.sandboxExecutable ? undefined : SYSTEM_SANDBOX_EXEC)
@@ -148,8 +152,8 @@ function createDarwinCommandSandbox(options = {}) {
   fs.mkdirSync(requestedTempRoot, { recursive: true, mode: 0o700 })
   const tempRoot = physicalDirectory(requestedTempRoot)
   const processOwner = options.processOwner || (options.runner ? null : new ProcessOwner({
-    adapter: options.adapter || createDarwinCoalitionAdapter({ controlRoot: path.join(controlRoot, 'coalitions'), providerPrivateOwnershipRoot: controlRoot, helper }),
-    registryPath: path.join(controlRoot, 'processes.json'), pollMs: options.pollMs || 20,
+    adapter: options.adapter || createDarwinCoalitionAdapter({ controlRoot: options.ownershipControlRoot || path.join(controlRoot, 'process-control'), providerPrivateOwnershipRoot: options.providerPrivateOwnershipRoot || controlRoot, helper }),
+    registryPath: options.registryPath || path.join(controlRoot, 'processes.json'), pollMs: options.pollMs || 20,
   }))
   const proxyRoot = path.join(controlRoot, 'proxy')
   // OwnedCodexProxyRunner creates a reservation child with recursive:false.
@@ -164,7 +168,7 @@ function createDarwinCommandSandbox(options = {}) {
     const profile = renderSeatbeltProfile(policy, { nodePath: process.execPath, tempRoot })
     const reservationId = runtime.reservationId || crypto.randomUUID(), sessionId = runtime.sessionId || crypto.randomUUID()
     const start = Date.now(), flags = { cancelled: false, timedOut: false, durationMs: () => Date.now() - start }
-    const baseEnvironment = { PATH: path.dirname(process.execPath), HOME: tempRoot, TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot, LANG: 'C', LC_ALL: 'C' }
+    const baseEnvironment = { ...require('./harness-v2-tool-boundary.cjs').safeEnvironment(), PATH: path.dirname(process.execPath), HOME: tempRoot, TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot, LANG: 'C', LC_ALL: 'C' }
     const environment = processOwner?.adapter
       ? prepareProcessLaunchEnvironment(processOwner.adapter, reservationId, baseEnvironment)
       : baseEnvironment
@@ -212,4 +216,4 @@ function createDarwinCommandSandbox(options = {}) {
   return Object.freeze({ backend: 'darwin-seatbelt-coalition', scope: 'initial-node-and-posix-shell-only', helper, sandboxBinding, controlRoot, tempRoot, processOwner, runner, renderSeatbeltProfile: policy => renderSeatbeltProfile(policy, { nodePath: process.execPath, tempRoot }), command })
 }
 
-module.exports = { DarwinCommandError, SYSTEM_SANDBOX_EXEC, OUTPUT_LIMIT, NODE_STARTUP_SYSCTLS, NODE_STARTUP_MACH_SERVICES, boundExecutable, renderSeatbeltProfile, createDarwinCommandSandbox }
+module.exports = { DarwinCommandError, SYSTEM_SANDBOX_EXEC, SYSTEM_SH_TRAMPOLINE, SYSTEM_SHELL_EXECUTABLES, OUTPUT_LIMIT, NODE_STARTUP_SYSCTLS, NODE_STARTUP_MACH_SERVICES, boundExecutable, renderSeatbeltProfile, createDarwinCommandSandbox }

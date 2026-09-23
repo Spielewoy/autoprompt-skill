@@ -99,7 +99,7 @@ function windowsNpmShimInvocation(shim) {
   // npm 10's cmd-shim has a deliberate `%_prog%` fallback skeleton. Match
   // that whole fixed Node form, including its no-argument final invocation;
   // do not treat `%_prog%` as a general command-language variable.
-  const currentNpmNodeShim = /^@ECHO off\r?\nGOTO start\r?\n:find_dp0\r?\nSET dp0=%~dp0\r?\nEXIT \/b\r?\n:start\r?\nSETLOCAL\r?\nCALL :find_dp0\r?\n\r?\nIF EXIST "%dp0%\\node\.exe" \(\r?\n  SET "_prog=%dp0%\\node\.exe"\r?\n\) ELSE \(\r?\n  SET "_prog=node"\r?\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r?\n\)\r?\n\r?\nendLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & "%_prog%"  "%dp0%\\([^"%&|<>\r\n]+?\.(?:cjs|mjs|js))" %\*\r?\n$/iu
+  const currentNpmNodeShim = /^@ECHO off\r?\nGOTO start\r?\n:find_dp0\r?\nSET dp0=%~dp0\r?\nEXIT \/b\r?\n:start\r?\nSETLOCAL\r?\nCALL :find_dp0\r?\n\r?\nIF EXIST "%dp0%\\node\.exe" \(\r?\n  SET "_prog=%dp0%\\node\.exe"\r?\n\) ELSE \(\r?\n  SET "_prog=node"\r?\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r?\n\)\r?\n\r?\nendLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & "%_prog%"  "%dp0%\\([^"%&|<>\r\n]+?)" %\*\r?\n$/iu
   const currentNpmNativeExeShim = /^@ECHO off\r?\nGOTO start\r?\n:find_dp0\r?\nSET dp0=%~dp0\r?\nEXIT \/b\r?\n:start\r?\nSETLOCAL\r?\nCALL :find_dp0\r?\n"%dp0%\\([^"%&|<>\r\n]+?\.exe)"[ \t]+%\*\r?\n$/iu
   const nodeCommand = currentNpmNodeShim.exec(source)
   const nativeCommand = currentNpmNativeExeShim.exec(source)
@@ -174,7 +174,10 @@ function locateExecutable({ provider, env = process.env, executable, platform = 
     try {
       let resolved = fs.realpathSync.native(name)
       if (provider === 'vscode' && path.basename(path.dirname(resolved)) === 'bin') {
-        const electron = path.join(path.dirname(path.dirname(resolved)), platform === 'win32' ? 'Code.exe' : 'code')
+        const bundle = platform === 'darwin' ? vscodeBundleRoot(resolved) : null
+        const electron = bundle
+          ? path.join(bundle, platform === 'win32' ? 'Code.exe' : 'Contents/MacOS/Electron')
+          : path.join(path.dirname(path.dirname(resolved)), platform === 'win32' ? 'Code.exe' : 'code')
         if (fs.existsSync(electron)) resolved = fs.realpathSync.native(electron)
       }
       if (/^(codex|codex\.exe|codex\.js)$/i.test(path.basename(resolved))) fail('PROVIDER_IDENTITY_MISMATCH', 'Codex is not a native executable for this provider')
@@ -188,6 +191,19 @@ function locateExecutable({ provider, env = process.env, executable, platform = 
     } catch (error) { if (error instanceof HarnessError) throw error }
   }
   fail('PROVIDER_UNSUPPORTED', `${d.command} is not installed or executable`, { provider, command: d.command })
+}
+function vscodeBundleRoot(executable) {
+  for (let dir = path.resolve(executable), i = 0; i < 8; dir = path.dirname(dir), i++) {
+    const app = path.join(dir, 'resources', 'app')
+    if (fs.existsSync(path.join(app, 'product.json')) && fs.existsSync(path.join(app, 'package.json'))) return fs.realpathSync.native(dir)
+    if (path.basename(dir).endsWith('.app') && fs.existsSync(path.join(dir, 'Contents', 'Resources', 'app', 'product.json')) && fs.existsSync(path.join(dir, 'Contents', 'Resources', 'app', 'package.json'))) return fs.realpathSync.native(dir)
+    if (path.dirname(dir) === dir) break
+  }
+  return null
+}
+function bundlePathInside(root, file) {
+  const relative = path.relative(root, file)
+  return !relative || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
 }
 function runtimeDependencyIdentity(executable, environment = process.env, invocation = null) {
   const roots = new Set(), files = new Map()
@@ -204,6 +220,10 @@ function runtimeDependencyIdentity(executable, environment = process.env, invoca
     totalBytes += fs.statSync(real).size
     if (files.size >= 100000 || totalBytes > 8 * 1024 * 1024 * 1024) fail('PROVIDER_IDENTITY_MISMATCH', 'Runtime dependency inventory exceeds its bounded size')
     files.set(file, [real, executableSha256(real)])
+  }
+  const recordBundleLink = (link, real, root) => {
+    const kind = fs.statSync(real).isDirectory() ? 'directory-link' : 'file-link'
+    files.set(`@link:${link}`, [real, sha256(`${kind}\0${path.relative(root, link)}\0${path.relative(root, real)}`)])
   }
   const visit = root => {
     root = fs.realpathSync.native(root)
@@ -239,22 +259,33 @@ function runtimeDependencyIdentity(executable, environment = process.env, invoca
       else if (Object.hasOwn(manifest.dependencies || {}, name) && !Object.hasOwn(manifest.optionalDependencies || {}, name)) fail('PROVIDER_IDENTITY_MISMATCH', `Runtime dependency is missing: ${name}`)
     }
   }
-  const vscodeBundle = path.dirname(executable)
-  if (fs.existsSync(path.join(vscodeBundle, 'resources/app/product.json')) && fs.existsSync(path.join(vscodeBundle, 'resources/app/package.json'))) {
+  const vscodeBundle = vscodeBundleRoot(executable)
+  if (vscodeBundle) {
     // Electron can stay byte-identical while the VS Code application changes.
     // Bind the complete shipped bundle, including ASARs, native modules and
     // built-in extensions. Never treat the Electron executable hash as enough.
     roots.add(vscodeBundle)
+    const visitedBundleDirs = new Set(), activeBundleDirs = new Set()
     const walkBundle = dir => {
+      const canonical = fs.realpathSync.native(dir)
+      if (!bundlePathInside(vscodeBundle, canonical)) fail('PROVIDER_IDENTITY_MISMATCH', 'VS Code bundle directory escapes its application root')
+      if (activeBundleDirs.has(canonical)) fail('PROVIDER_IDENTITY_MISMATCH', 'VS Code bundle contains a directory-link cycle')
+      if (visitedBundleDirs.has(canonical)) return
+      activeBundleDirs.add(canonical)
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         const file = path.join(dir, entry.name)
         if (entry.isDirectory()) walkBundle(file)
         else if (entry.isFile()) record(file)
         else if (entry.isSymbolicLink()) {
-          if (!fs.statSync(file).isFile()) fail('PROVIDER_IDENTITY_MISMATCH', 'VS Code bundle contains an unbound directory link')
-          record(file)
+          const real = fs.realpathSync.native(file)
+          if (!bundlePathInside(vscodeBundle, real)) fail('PROVIDER_IDENTITY_MISMATCH', 'VS Code bundle link escapes its application root')
+          if (fs.statSync(real).isDirectory()) { recordBundleLink(file, real, vscodeBundle); walkBundle(real) }
+          else if (fs.statSync(real).isFile()) { recordBundleLink(file, real, vscodeBundle); record(file) }
+          else fail('PROVIDER_IDENTITY_MISMATCH', 'VS Code bundle contains an unsupported link')
         }
       }
+      activeBundleDirs.delete(canonical)
+      visitedBundleDirs.add(canonical)
     }
     walkBundle(vscodeBundle)
   } else if (first) visit(first)
@@ -320,6 +351,13 @@ function portableRuntimeDependencyIdentity(provider, executable, environment = p
     if (prior && prior !== hash) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable runtime inventory has ambiguous duplicate logical paths')
     if (prior) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable runtime inventory repeats a logical path')
     logicalFiles.set(label, hash)
+  }
+  const recordBundleLink = (label, link, real, root) => {
+    const target = path.relative(root, real).split(path.sep).join('/')
+    const source = path.relative(root, link).split(path.sep).join('/')
+    const marker = `vscode-link/${label}/${source}`
+    if (logicalFiles.has(marker)) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle repeats a link identity')
+    logicalFiles.set(marker, sha256(`${fs.statSync(real).isDirectory() ? 'directory-link' : 'file-link'}\0${source}\0${target}`))
   }
   // Interpreters are declared by an absolute launcher shebang and may be a
   // distribution-managed symlink. Bind the final executable bytes, while
@@ -410,17 +448,32 @@ function portableRuntimeDependencyIdentity(provider, executable, environment = p
   if (resolvedExecutable !== path.resolve(executable)) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable runtime executable must not be a symbolic link')
   regular(resolvedExecutable)
   let rootBase = null
-  const vscodeBundle = path.dirname(resolvedExecutable)
-  if (provider === 'vscode' && fs.existsSync(path.join(vscodeBundle, 'resources/app/product.json')) && fs.existsSync(path.join(vscodeBundle, 'resources/app/package.json'))) {
+  const vscodeBundle = provider === 'vscode' ? vscodeBundleRoot(resolvedExecutable) : null
+  if (vscodeBundle) {
     rootBase = directory(vscodeBundle); packageCount = 1
+    const visitedBundleDirs = new Set(), activeBundleDirs = new Set()
     const walkBundle = dir => {
+      const canonical = fs.realpathSync.native(dir)
+      if (!bundlePathInside(rootBase, canonical)) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle directory escapes its application root')
+      if (activeBundleDirs.has(canonical)) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle contains a directory-link cycle')
+      if (visitedBundleDirs.has(canonical)) return
+      activeBundleDirs.add(canonical)
       for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
         const file = path.join(dir, entry.name), stat = fs.lstatSync(file)
-        if (stat.isSymbolicLink()) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle contains a symbolic link')
+        if (stat.isSymbolicLink()) {
+          const real = fs.realpathSync.native(file)
+          if (!bundlePathInside(rootBase, real)) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle link escapes its application root')
+          recordBundleLink(`vscode/${safeRelative(rootBase, file)}`, file, real, rootBase)
+          if (fs.statSync(real).isDirectory()) walkBundle(real)
+          else if (fs.statSync(real).isFile()) record(`vscode/${safeRelative(rootBase, file)}`, real)
+          else fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle contains an unsupported link')
+        }
         if (stat.isDirectory()) walkBundle(file)
         else if (stat.isFile()) record(`vscode/${safeRelative(rootBase, file)}`, file)
-        else fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle contains an unsupported filesystem entry')
+        else if (!stat.isSymbolicLink()) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle contains an unsupported filesystem entry')
       }
+      activeBundleDirs.delete(canonical)
+      visitedBundleDirs.add(canonical)
     }
     walkBundle(rootBase)
   } else {
@@ -1113,7 +1166,10 @@ function probeExecutable(options = {}) {
     const env = isolatedEnvironment(probeRoot, options.env || process.env)
     const spawn = options.spawnSync || cp.spawnSync
     const invoke = argv => {
-      const vscodeCli = path.join(path.dirname(binding.path), 'resources/app/out/cli.js')
+      const bundle = options.provider === 'vscode' ? vscodeBundleRoot(binding.path) : null
+      const vscodeCli = options.provider === 'vscode'
+        ? path.join(bundle || path.dirname(binding.path), bundle && path.basename(bundle).endsWith('.app') ? 'Contents/Resources/app/out/cli.js' : 'resources/app/out/cli.js')
+        : null
       const nativeArgv = options.provider === 'vscode' && fs.existsSync(vscodeCli) ? [vscodeCli, ...argv] : argv
       const nativeEnv = nativeArgv === argv ? env : { ...env, ELECTRON_RUN_AS_NODE: '1' }
       const launch = executableInvocation(binding, nativeArgv)

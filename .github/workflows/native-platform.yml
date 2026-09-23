@@ -11,7 +11,7 @@ on:
         required: false
         default: none
         type: choice
-        options: [none, macos-containment, windows-bootstrap, windows-provider-primitives, opencode]
+        options: [none, macos-containment, windows-bootstrap, windows-provider-primitives, opencode, vscode]
       support_provider:
         description: 'Installed provider for the focused provider stage'
         required: false
@@ -1247,4 +1247,47 @@ jobs:
           path: |
             native-${{ inputs.support_provider }}-evidence.json
             native-${{ inputs.support_provider }}-tests.log
+          if-no-files-found: error
+
+  vscode-native-acquisition:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'vscode'
+    name: VS Code 1.136.1 / ${{ matrix.runner.os }} / ${{ matrix.runner.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - { os: windows-latest, arch: x64 }
+          - { os: windows-11-arm, arch: arm64 }
+          - { os: macos-15-intel, arch: x64 }
+          - { os: macos-latest, arch: arm64 }
+    runs-on: ${{ matrix.runner.os }}
+    timeout-minutes: 20
+    env:
+      AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+          architecture: ${{ matrix.runner.arch }}
+      - name: Acquire and hash the official VS Code archive
+        run: node tests/helpers/install-vscode-native-ci.cjs | tee vscode-native-acquisition.json
+      - name: Probe the native VS Code bundle and preserve identity
+        shell: bash
+        run: |
+          node - <<'NODE' | tee vscode-native-probe.json
+          const fs = require('node:fs')
+          const native = require('./scripts/harness-v2-native.cjs')
+          const executable = process.env.AUTOPROMPT_VSCODE_TEST_CLI
+          if (!executable || !fs.existsSync(executable)) throw new Error('VS Code executable was not exported by acquisition')
+          const binding = native.probeExecutable({ provider: 'vscode', executable, timeoutMs: 120000 })
+          process.stdout.write(JSON.stringify({ executable, version: binding.version, runtimeIdentity: binding.runtimeIdentity }, null, 2) + '\n')
+          NODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: vscode-1.136.1-${{ matrix.runner.os }}-${{ matrix.runner.arch }}
+          path: |
+            vscode-native-acquisition.json
+            vscode-native-probe.json
           if-no-files-found: error

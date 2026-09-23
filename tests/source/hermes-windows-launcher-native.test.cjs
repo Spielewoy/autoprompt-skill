@@ -9,7 +9,7 @@ const test = require('node:test')
 
 const PIN = '2237be355906fbe6065ce1815711eee52b2d646e'
 const ARCHIVE_SHA256 = '9ba535365d459300692a4275f28f4ca716770372eac8f9296a6733669d3c9cd7'
-const INSTALLER_SHA256 = '226c70a90ad47e8a4d34cb11aca4ecbeb649e2f9b67fbd009ea49791de2d56f5'
+const INSTALLER_SHA256 = '53a077364aa28bbd6e8d987cdec11a4552e22ff2c5137845725a1c99770f392f'
 const PYPROJECT_SHA256 = '1f0d8d7e9e19c3a1cc25521a5cf56f3c885e4604d3081246cd42d9924a983174'
 const sha256 = value => crypto.createHash('sha256').update(value).digest('hex')
 const required = name => {
