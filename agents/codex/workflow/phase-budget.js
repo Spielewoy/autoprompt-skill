@@ -97,7 +97,7 @@ const {
   runOwnedProcessConformanceProbe,
 } = require('./process-owner.js')
 const { CleanupRegistry, Finalizer } = require('./finalizer.js')
-const { createWindowsCheckerRootValidator, resolveCheckerSnapshotRoot } = require('./windows-checker-root.js')
+const { createWindowsGitRootValidator, resolveCheckerSnapshotRoot, resolveWorkerWorkspaceRoot } = require('./windows-checker-root.js')
 const { assertGenerationControlAuthority } = require('./generation-control.js')
 const { deriveProfileLimits, sealedProfileOverrides } = require('./codex-agent-profile.js')
 const {
@@ -112,6 +112,7 @@ const {
   declaredIgnoredWorkspaceNames,
   projectWorkspaceResources,
   WorkerWorkspaceManager,
+  retainWorkerWorkspaceForRecovery,
 } = require('./worker-workspace.js')
 const { auditPrivatePermissions, ensureWindowsPrivateAcl, inspectPathNoFollow, pathIsInside, readFileNoFollow } = require('./safe-run-root.js')
 const { createDarwinFilesystemCapture, createDarwinFilesystemMutations } = require('./darwin-filesystem.js')
@@ -31150,6 +31151,14 @@ function createDefaultRuntimeOptions(input) {
       workerWorkspaceManager = new WorkerWorkspaceManager({
         targetRoot: targetPath,
         privateRoot: path.join(activation.activationRoot, 'worker-workspaces'),
+        ...(process.platform === 'win32' ? {
+          workspaceRoot: resolveWorkerWorkspaceRoot({
+            workspaceRoot: path.join(activation.activationRoot, 'worker-workspaces', 'workspaces'),
+            cleanupRegistry,
+            owner: activation.runId,
+          }),
+          cleanupRegistry,
+        } : {}),
         environment: targetGitEnvironment,
         runId: activation.runId,
         activationId: activation.runId,
@@ -31902,7 +31911,16 @@ function createDefaultRuntimeOptions(input) {
         fsImpl: runtimeFs,
         allowedRoots: [activation.activationRoot],
         ...(process.platform === 'win32' ? {
-          externalRootValidator: createWindowsCheckerRootValidator({ owner: activation.runId }),
+          externalRootValidator: createWindowsGitRootValidator({ owner: activation.runId }),
+          retainEntry: entry => entry.kind === 'worker-workspace'
+            ? retainWorkerWorkspaceForRecovery({
+              targetRoot: targetPath,
+              privateRoot: path.join(activation.activationRoot, 'worker-workspaces'),
+              workspaceRoot: cleanupRegistry.getExternalRoot('windows-worker-workspaces')?.path,
+              cleanupRegistry,
+              runId: activation.runId,
+              activationId: activation.runId,
+            }, entry) : false,
         } : {}),
         controlBinding: {
           activationId: activation.runId,

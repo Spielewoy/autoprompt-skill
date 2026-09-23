@@ -11,6 +11,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const {
   atomicWriteJson,
+  checksumRecord,
   fsyncDirectory,
   readChecksummedJson,
   sha256,
@@ -21,12 +22,18 @@ const {
   ensureWindowsPrivateAcl,
   inspectPathNoFollow,
   pathIsInside,
+  readFileNoFollow,
 } = require('./safe-run-root.js')
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/
 const TRANSPORT_RETRY_PATTERN = /^(.+)-transport-retry-1$/u
 const FILE_SLOT_PATTERN = /^<[A-Za-z][A-Za-z0-9._-]{0,63}>$/u
 const SURVIVABLE_WORKSPACE_STATES = new Set(['PREPARED', 'ROLLED_BACK', 'COMMITTED', 'QUARANTINED'])
+const RECOVERABLE_WORKSPACE_STATES = new Set([
+  'PREPARED', 'ROLLED_BACK', 'COMMITTED', 'QUARANTINED',
+  'PREPARED_PROMOTION', 'PROMOTING', 'FINALIZING',
+])
+const RETIRED_WORKSPACE_STATES = new Set(['FINALIZED', 'ABORTED', 'QUARANTINE_CONSUMED'])
 
 class WorkerWorkspaceError extends Error {
   constructor(code, message, details) {
@@ -39,6 +46,25 @@ class WorkerWorkspaceError extends Error {
 
 function fail(code, message, details) {
   throw new WorkerWorkspaceError(code, message, details)
+}
+
+function readPrivateChecksummedJson(filename) {
+  let bytes
+  try { bytes = readFileNoFollow(filename) } catch (error) {
+    fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'private worker journal is linked or changed during cleanup retention', {
+      cause: error.code || error.message,
+    })
+  }
+  if (bytes === null) return null
+  let record
+  try { record = JSON.parse(bytes.toString('utf8')) } catch {
+    fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'private worker journal is invalid JSON')
+  }
+  if (!record || typeof record !== 'object' || Array.isArray(record) ||
+      !HASH_PATTERN.test(record.checksum || '') || checksumRecord(record) !== record.checksum) {
+    fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'private worker journal checksum is invalid')
+  }
+  return record
 }
 
 function normalizeRelative(value) {
@@ -848,6 +874,8 @@ class WorkerWorkspaceManager {
       ? options.afterPromotionStep : null
     this.hardenWorkspace = typeof options.hardenWorkspace === 'function'
       ? options.hardenWorkspace : null
+    this.cleanupRegistry = null
+    this.externalWorkspaceRoot = false
     let targetInspection
     try { targetInspection = inspectPathNoFollow(this.targetRoot) } catch (error) {
       fail('WORKER_ISOLATION_UNSUPPORTED', 'worker target path crosses a link, junction, or reparse point', {
@@ -897,7 +925,35 @@ class WorkerWorkspaceManager {
       runId: this.runId,
       activationId: this.activationId,
     })).slice(0, 40))
-    ensurePhysicalDirectory(path.join(this.privateRoot, 'workspaces'), this.privateRoot, this.fs)
+    this.workspaceRoot = path.join(this.privateRoot, 'workspaces')
+    if (process.platform === 'win32' && options.workspaceRoot !== undefined) {
+      if (typeof options.workspaceRoot !== 'string' || !path.isAbsolute(options.workspaceRoot) ||
+          path.resolve(options.workspaceRoot) !== options.workspaceRoot ||
+          !options.cleanupRegistry || typeof options.cleanupRegistry.getExternalRoot !== 'function' ||
+          typeof options.cleanupRegistry.register !== 'function' || typeof options.cleanupRegistry.load !== 'function') {
+        fail('WORKER_ISOLATION_UNSUPPORTED', 'external Windows worker storage requires exact durable cleanup authority')
+      }
+      const registeredRoot = options.cleanupRegistry.getExternalRoot('windows-worker-workspaces')
+      let rootInspection
+      try { rootInspection = inspectPathNoFollow(options.workspaceRoot, { fsImpl: this.fs }) } catch (error) {
+        fail('WORKER_ISOLATION_UNSUPPORTED', 'external Windows worker root crosses a link, junction, or reparse point', {
+          cause: error.code || error.message,
+        })
+      }
+      if (!registeredRoot || registeredRoot.status !== 'REGISTERED' ||
+          registeredRoot.kind !== 'windows-worker-workspaces' || registeredRoot.owner !== this.activationId ||
+          registeredRoot.path.toLowerCase() !== options.workspaceRoot.toLowerCase() ||
+          !rootInspection.exists || rootInspection.realpath.toLowerCase() !== options.workspaceRoot.toLowerCase() ||
+          pathIsInside(this.targetRoot, options.workspaceRoot) || pathIsInside(options.workspaceRoot, this.targetRoot) ||
+          pathIsInside(this.privateRoot, options.workspaceRoot) || pathIsInside(options.workspaceRoot, this.privateRoot)) {
+        fail('WORKER_ISOLATION_UNSUPPORTED', 'external Windows worker root lacks this activation exact physical authority')
+      }
+      this.workspaceRoot = rootInspection.realpath
+      this.cleanupRegistry = options.cleanupRegistry
+      this.externalWorkspaceRoot = true
+    } else {
+      ensurePhysicalDirectory(this.workspaceRoot, this.privateRoot, this.fs)
+    }
     ensurePhysicalDirectory(path.join(this.privateRoot, 'records'), this.privateRoot, this.fs)
     ensurePhysicalDirectory(path.join(this.privateRoot, 'transactions'), this.privateRoot, this.fs)
     ensurePhysicalDirectory(path.join(this.privateRoot, 'caches'), this.privateRoot, this.fs)
@@ -916,7 +972,7 @@ class WorkerWorkspaceManager {
       workItemId: options.workItemId,
       assignmentHash: boundAssignmentHash,
     })).slice(0, 40)
-    const workspacePath = path.join(this.privateRoot, 'workspaces', workspaceId)
+    const workspacePath = this._workspacePath(workspaceId)
     const cacheRoot = path.join(this.privateRoot, 'caches', workspaceId)
     const recordPath = path.join(this.privateRoot, 'records', `${workspaceId}.json`)
     if (this.fs.existsSync(recordPath)) {
@@ -938,7 +994,7 @@ class WorkerWorkspaceManager {
       this.targetRoot, this.environment, this.fs, assignment.resources, this.targetRoot,
     )
     const parent = path.dirname(workspacePath)
-    ensurePhysicalDirectory(parent, this.privateRoot, this.fs)
+    if (!this.externalWorkspaceRoot) ensurePhysicalDirectory(parent, this.privateRoot, this.fs)
     ensurePhysicalDirectory(cacheRoot, this.privateRoot, this.fs)
     if (process.platform === 'win32') {
       // Git accepts an existing empty destination. Allocate it exclusively so
@@ -948,6 +1004,24 @@ class WorkerWorkspaceManager {
         fail('WORKER_ISOLATION_UNSUPPORTED', 'fresh Windows worker clone destination is unavailable', { cause: error.code })
       }
       ensureWindowsPrivateAcl(workspacePath)
+      if (this.externalWorkspaceRoot) {
+        let registered
+        try {
+          registered = this.cleanupRegistry.register({ path: workspacePath, kind: 'worker-workspace', owner: workspaceId })
+        } catch (error) {
+          // Never delete an allocation whose durable registration may have
+          // committed before its caller observed an error. Cleanup recovery
+          // must decide from the registry's physical identity authority.
+          fail('WORKER_ISOLATION_UNSUPPORTED', 'fresh Windows worker clone registration failed', {
+            cause: error.code || error.message,
+          })
+        }
+        if (!registered || registered.status !== 'REGISTERED' || registered.kind !== 'worker-workspace' ||
+            registered.owner !== workspaceId || registered.path.toLowerCase() !== workspacePath.toLowerCase()) {
+          fail('WORKER_ISOLATION_UNSUPPORTED', 'fresh Windows worker clone registration returned foreign authority')
+        }
+        this._validateExternalWorkspace(workspaceId, workspacePath)
+      }
     }
     const clone = childProcess.spawnSync('git', [
       'clone', '--no-local', '--no-hardlinks', '--', this.targetRoot, workspacePath,
@@ -1308,7 +1382,7 @@ class WorkerWorkspaceManager {
       this._validateRecord(retryRecord, {
         workspaceId: retryWorkspaceId,
         boundAssignmentHash: retryAssignmentHash,
-        workspacePath: path.join(this.privateRoot, 'workspaces', retryWorkspaceId),
+        workspacePath: this._workspacePath(retryWorkspaceId),
       })
       const seed = retryRecord.transportSeed
       if (!seed || seed.sourceQuarantineBindingHash !== source.transportQuarantine.bindingHash ||
@@ -1447,9 +1521,7 @@ class WorkerWorkspaceManager {
       consumedBy,
     } }
     atomicWriteJson(source.recordPath, consumed, { fsImpl: this.fs })
-    if (this.fs.existsSync(source.workspacePath)) {
-      this.fs.rmSync(source.workspacePath, { recursive: true, force: false })
-    }
+    this._removeWorkspace(source)
     removeEmptyTree(path.join(this.privateRoot, 'caches', source.workspaceId), this.privateRoot, this.fs)
     return this._session(retryRecord, assignment)
   }
@@ -1466,7 +1538,7 @@ class WorkerWorkspaceManager {
       workItemId: options.workItemId,
       assignmentHash: boundAssignmentHash,
     })).slice(0, 40)
-    const workspacePath = path.join(this.privateRoot, 'workspaces', workspaceId)
+    const workspacePath = this._workspacePath(workspaceId)
     const cacheRoot = path.join(this.privateRoot, 'caches', workspaceId)
     const recordPath = path.join(this.privateRoot, 'records', `${workspaceId}.json`)
     if (options.recordPath && path.resolve(options.recordPath) !== path.resolve(recordPath)) {
@@ -1836,6 +1908,17 @@ class WorkerWorkspaceManager {
       readyPath: guardian.readyPath,
       disarmPath: guardian.disarmPath,
       resultPath: guardian.resultPath,
+      ...(this.externalWorkspaceRoot ? { workspaceAuthority: {
+        workspaceRoot: this.workspaceRoot,
+        registryPath: this.cleanupRegistry.registryPath,
+        allowedRoots: this.cleanupRegistry.allowedRoots,
+        controlBinding: {
+          activationId: this.cleanupRegistry.controlBinding.activationId,
+          generationId: this.cleanupRegistry.controlBinding.generationId,
+          ...(this.cleanupRegistry.controlBinding.predecessorGenerationId !== null
+            ? { predecessorGenerationId: this.cleanupRegistry.controlBinding.predecessorGenerationId } : {}),
+        },
+      } } : {}),
     }, { fsImpl: this.fs })
     const child = childProcess.spawn(process.execPath, [__filename, '--rollback-guardian', guardian.requestPath], {
       detached: true,
@@ -1986,7 +2069,7 @@ class WorkerWorkspaceManager {
     if (!this._cleanupTransaction(record)) {
       fail('WORKER_ROLLBACK_CONFLICT', 'committed transaction contains preserved concurrent bytes')
     }
-    if (this.fs.existsSync(record.workspacePath)) this.fs.rmSync(record.workspacePath, { recursive: true, force: false })
+    this._removeWorkspace(record)
     const cacheRoot = path.join(this.privateRoot, 'caches', record.workspaceId)
     removeEmptyTree(cacheRoot, this.privateRoot, this.fs)
     record = { ...record, status: 'FINALIZED', transaction: null }
@@ -2005,7 +2088,7 @@ class WorkerWorkspaceManager {
     if (!this._cleanupTransaction(record)) {
       fail('WORKER_ROLLBACK_CONFLICT', 'abort preserved a concurrent target and its displaced evidence')
     }
-    if (this.fs.existsSync(record.workspacePath)) this.fs.rmSync(record.workspacePath, { recursive: true, force: false })
+    this._removeWorkspace(record)
     const cacheRoot = path.join(this.privateRoot, 'caches', record.workspaceId)
     removeEmptyTree(cacheRoot, this.privateRoot, this.fs)
     record = { ...record, status: 'ABORTED', transaction: null }
@@ -2284,6 +2367,95 @@ class WorkerWorkspaceManager {
     })
   }
 
+  _workspacePath(workspaceId) {
+    return path.join(this.workspaceRoot, workspaceId)
+  }
+
+  retainWorkspaceForRecovery(entry) {
+    if (!this.externalWorkspaceRoot || !entry || entry.status !== 'REGISTERED' ||
+        entry.kind !== 'worker-workspace' || typeof entry.owner !== 'string' ||
+        !/^[a-f0-9]{40}$/.test(entry.owner) || typeof entry.path !== 'string') {
+      fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'cleanup retention requires one registered external worker workspace')
+    }
+    const workspaceId = entry.owner
+    const workspacePath = this._workspacePath(workspaceId)
+    if (path.resolve(entry.path).toLowerCase() !== workspacePath.toLowerCase()) {
+      fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'cleanup retention entry escapes its worker workspace authority')
+    }
+    // Validate the durable registry descriptor even when an earlier cleanup
+    // crash already removed the terminal child. A missing journal represents a
+    // failed prepare and is safe to retire, but foreign registry authority is
+    // never interpreted as disposable.
+    this._validateExternalWorkspace(workspaceId, workspacePath, {
+      allowMissing: true,
+      expectedEntry: entry,
+    })
+    const recordPath = path.join(this.privateRoot, 'records', `${workspaceId}.json`)
+    const record = readPrivateChecksummedJson(recordPath)
+    if (!record) return false
+    const terminal = RETIRED_WORKSPACE_STATES.has(record.status)
+    this._validateRecord(record, {
+      workspaceId,
+      boundAssignmentHash: record.assignmentHash,
+      workspacePath,
+    }, { allowMissingExternal: terminal })
+    if (terminal) return false
+    if (!RECOVERABLE_WORKSPACE_STATES.has(record.status)) {
+      fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'private worker workspace record has an unknown lifecycle state')
+    }
+    return true
+  }
+
+  _removeWorkspace(record) {
+    // External Windows clones are deleted only by CleanupRegistry after the
+    // durable worker journal reaches a cleanup-safe terminal state. Its native
+    // identity-bound remover protects against replacement between validation
+    // and deletion; a path-based recursive delete here would bypass it.
+    if (this.externalWorkspaceRoot) return
+    if (this.fs.existsSync(record.workspacePath)) {
+      this.fs.rmSync(record.workspacePath, { recursive: true, force: false })
+    }
+  }
+
+  _validateExternalWorkspace(workspaceId, workspacePath, options = {}) {
+    if (!this.externalWorkspaceRoot) return
+    const root = this.cleanupRegistry.getExternalRoot('windows-worker-workspaces')
+    if (!root || root.status !== 'REGISTERED' || root.kind !== 'windows-worker-workspaces' ||
+        root.owner !== this.activationId || root.path.toLowerCase() !== this.workspaceRoot.toLowerCase() ||
+        path.dirname(workspacePath).toLowerCase() !== this.workspaceRoot.toLowerCase() ||
+        path.basename(workspacePath) !== workspaceId || !/^[a-f0-9]{40}$/.test(workspaceId)) {
+      fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'external worker workspace root authority changed')
+    }
+    const matches = this.cleanupRegistry.load().entries.filter(entry => entry.status === 'REGISTERED' &&
+      entry.kind === 'worker-workspace' && entry.owner === workspaceId &&
+      path.resolve(entry.path).toLowerCase() === workspacePath.toLowerCase())
+    const entry = matches.length === 1 ? matches[0] : null
+    const expected = options.expectedEntry
+    if (expected && (!entry || expected.id !== entry.id || expected.status !== entry.status ||
+        expected.kind !== entry.kind || expected.owner !== entry.owner ||
+        path.resolve(expected.path).toLowerCase() !== path.resolve(entry.path).toLowerCase() ||
+        !expected.parentIdentity || expected.parentIdentity.dev !== entry.parentIdentity.dev ||
+        expected.parentIdentity.ino !== entry.parentIdentity.ino || !expected.targetIdentity ||
+        expected.targetIdentity.type !== entry.targetIdentity.type ||
+        expected.targetIdentity.dev !== entry.targetIdentity.dev ||
+        expected.targetIdentity.ino !== entry.targetIdentity.ino)) {
+      fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'cleanup retention entry does not match durable worker authority')
+    }
+    let inspection
+    try { inspection = inspectPathNoFollow(workspacePath, { fsImpl: this.fs }) } catch (error) {
+      fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'external worker workspace crosses a link, junction, or reparse point', {
+        cause: error.code || error.message,
+      })
+    }
+    if (!entry || (!inspection.exists && !options.allowMissing) ||
+        (inspection.exists && inspection.realpath.toLowerCase() !== workspacePath.toLowerCase()) ||
+        entry.parentIdentity.dev !== root.targetIdentity.dev || entry.parentIdentity.ino !== root.targetIdentity.ino ||
+        entry.targetIdentity.type !== 'directory' || (inspection.exists &&
+          (inspection.identity.dev !== entry.targetIdentity.dev || inspection.identity.ino !== entry.targetIdentity.ino))) {
+      fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'external worker workspace lacks one exact live cleanup registration')
+    }
+  }
+
   _quarantinePointer(record) {
     if (!validQuarantine(record)) {
       fail('WORKER_QUARANTINE_INVALID', 'transport quarantine journal is foreign or corrupt')
@@ -2316,7 +2488,7 @@ class WorkerWorkspaceManager {
     return record
   }
 
-  _validateRecord(record, expected) {
+  _validateRecord(record, expected, options = {}) {
     const transientArtifacts = record && Array.isArray(record.transientArtifactsRemoved)
       ? record.transientArtifactsRemoved
       : record && record.transientArtifactsRemoved === undefined ? [] : null
@@ -2330,10 +2502,10 @@ class WorkerWorkspaceManager {
     const canonicalRecordPath = record && typeof record.workspaceId === 'string'
       ? path.join(this.privateRoot, 'records', `${record.workspaceId}.json`) : null
     const canonicalWorkspacePath = record && typeof record.workspaceId === 'string'
-      ? path.join(this.privateRoot, 'workspaces', record.workspaceId) : null
+      ? this._workspacePath(record.workspaceId) : null
     if (!record || record.schemaVersion !== 1 || record.workspaceId !== expected.workspaceId ||
         record.runId !== this.runId || record.activationId !== this.activationId ||
-        record.assignmentHash !== expected.boundAssignmentHash ||
+        !HASH_PATTERN.test(record.assignmentHash || '') || record.assignmentHash !== expected.boundAssignmentHash ||
         record.targetRootHash !== sha256(this.targetRoot) ||
         path.resolve(record.recordPath || '') !== path.resolve(canonicalRecordPath || '') ||
         path.resolve(record.workspacePath || '') !== path.resolve(canonicalWorkspacePath || '') ||
@@ -2341,6 +2513,10 @@ class WorkerWorkspaceManager {
         !transientEvidenceValid || !transientCleanupValid ||
         !validQuarantine(record) || !validTransportSeed(record) ||
         !record.binding || !HASH_PATTERN.test(record.binding.bindingHash || '') ||
+        record.binding.schemaVersion !== 1 || record.binding.workspaceId !== record.workspaceId ||
+        record.binding.assignmentHash !== record.assignmentHash ||
+        !HASH_PATTERN.test(record.binding.targetSnapshotHash || '') || !Array.isArray(record.baseline) ||
+        record.binding.targetSnapshotHash !== sha256(stableStringify(record.baseline)) ||
         record.binding.bindingHash !== sha256(stableStringify({
           schemaVersion: record.binding.schemaVersion,
           workspaceId: record.binding.workspaceId,
@@ -2349,7 +2525,50 @@ class WorkerWorkspaceManager {
         }))) {
       fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'private worker workspace record is foreign or corrupt')
     }
+    this._validateExternalWorkspace(record.workspaceId, record.workspacePath, {
+      allowMissing: options.allowMissingExternal === true,
+    })
   }
+}
+
+function retainWorkerWorkspaceForRecovery(options, entry) {
+  if (!options || typeof options.targetRoot !== 'string' || typeof options.privateRoot !== 'string' ||
+      typeof options.workspaceRoot !== 'string' || typeof options.runId !== 'string' || !options.runId ||
+      typeof options.activationId !== 'string' || !options.activationId ||
+      !options.cleanupRegistry || typeof options.cleanupRegistry.getExternalRoot !== 'function' ||
+      typeof options.cleanupRegistry.load !== 'function') {
+    fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'cleanup retention reader lacks exact worker storage authority')
+  }
+  let targetInspection, privateInspection, workspaceInspection
+  try {
+    targetInspection = inspectPathNoFollow(path.resolve(options.targetRoot), { mustBeDirectory: true })
+    privateInspection = inspectPathNoFollow(path.resolve(options.privateRoot), { mustBeDirectory: true })
+    workspaceInspection = inspectPathNoFollow(path.resolve(options.workspaceRoot), { mustBeDirectory: true })
+  } catch (error) {
+    fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'cleanup retention storage crosses a link, junction, or reparse point', {
+      cause: error.code || error.message,
+    })
+  }
+  if (!targetInspection.exists || !privateInspection.exists || !workspaceInspection.exists ||
+      targetInspection.realpath !== path.resolve(options.targetRoot) ||
+      privateInspection.realpath !== path.resolve(options.privateRoot) ||
+      workspaceInspection.realpath.toLowerCase() !== path.resolve(options.workspaceRoot).toLowerCase() ||
+      pathIsInside(targetInspection.realpath, workspaceInspection.realpath) ||
+      pathIsInside(workspaceInspection.realpath, targetInspection.realpath) ||
+      pathIsInside(privateInspection.realpath, workspaceInspection.realpath) ||
+      pathIsInside(workspaceInspection.realpath, privateInspection.realpath)) {
+    fail('WORKER_WORKSPACE_RECOVERY_FAILED', 'cleanup retention storage lacks exact disjoint physical roots')
+  }
+  const reader = Object.create(WorkerWorkspaceManager.prototype)
+  reader.fs = fs
+  reader.targetRoot = targetInspection.realpath
+  reader.privateRoot = privateInspection.realpath
+  reader.workspaceRoot = workspaceInspection.realpath
+  reader.runId = options.runId
+  reader.activationId = options.activationId
+  reader.cleanupRegistry = options.cleanupRegistry
+  reader.externalWorkspaceRoot = true
+  return reader.retainWorkspaceForRecovery(entry)
 }
 
 function runRollbackGuardian(requestPath) {
@@ -2357,6 +2576,8 @@ function runRollbackGuardian(requestPath) {
   if (!request || request.schemaVersion !== 1 || !/^[a-f0-9]{48}$/.test(request.token || '') ||
       ![request.recordPath, request.targetRoot, request.privateRoot, request.readyPath,
         request.disarmPath, request.resultPath].every(value => typeof value === 'string' && path.isAbsolute(value)) ||
+      typeof request.runId !== 'string' || !request.runId ||
+      typeof request.activationId !== 'string' || !request.activationId ||
       !Number.isSafeInteger(request.ownerPid) || request.ownerPid < 1) {
     fail('WORKER_GUARDIAN_INVALID', 'rollback guardian request is invalid')
   }
@@ -2367,6 +2588,40 @@ function runRollbackGuardian(requestPath) {
     if (path.dirname(filename) !== path.dirname(request.recordPath)) {
       fail('WORKER_GUARDIAN_INVALID', 'rollback guardian control path escaped the private record directory')
     }
+  }
+  let externalOptions = {}
+  if (request.workspaceAuthority !== undefined) {
+    const authority = request.workspaceAuthority
+    const binding = authority && authority.controlBinding
+    if (process.platform !== 'win32' || !authority || typeof authority.workspaceRoot !== 'string' ||
+        !path.isAbsolute(authority.workspaceRoot) || path.resolve(authority.workspaceRoot) !== authority.workspaceRoot ||
+        typeof authority.registryPath !== 'string' || !path.isAbsolute(authority.registryPath) ||
+        path.resolve(authority.registryPath) !== authority.registryPath || !Array.isArray(authority.allowedRoots) ||
+        authority.allowedRoots.length !== 1 || authority.allowedRoots.some(root => typeof root !== 'string' ||
+          !path.isAbsolute(root) || path.resolve(root) !== root) || !binding ||
+        binding.activationId !== request.activationId || !Number.isSafeInteger(binding.generationId) ||
+        binding.generationId < 1 || (binding.predecessorGenerationId !== undefined &&
+          (!Number.isSafeInteger(binding.predecessorGenerationId) || binding.predecessorGenerationId < 1 ||
+            binding.predecessorGenerationId >= binding.generationId)) ||
+        !pathIsInside(authority.allowedRoots[0], authority.registryPath) ||
+        !pathIsInside(authority.allowedRoots[0], request.privateRoot)) {
+      fail('WORKER_GUARDIAN_INVALID', 'rollback guardian external workspace authority is invalid')
+    }
+    const { CleanupRegistry } = require('./finalizer.js')
+    const { createWindowsGitRootValidator } = require('./windows-checker-root.js')
+    const native = require('./windows-filesystem.js').createWindowsFilesystemCapture()
+    const runtimeFs = Object.assign(Object.create(fs), {
+      windowsCapture: native,
+      windowsMutations: native,
+    })
+    const cleanupRegistry = new CleanupRegistry({
+      registryPath: authority.registryPath,
+      allowedRoots: authority.allowedRoots,
+      controlBinding: binding,
+      externalRootValidator: createWindowsGitRootValidator({ owner: request.activationId }),
+      fsImpl: runtimeFs,
+    })
+    externalOptions = { workspaceRoot: authority.workspaceRoot, cleanupRegistry }
   }
   atomicWriteJson(request.readyPath, {
     schemaVersion: 1, token: request.token, ownerPid: request.ownerPid, ipcBound: true,
@@ -2387,6 +2642,7 @@ function runRollbackGuardian(requestPath) {
       const manager = new WorkerWorkspaceManager({
         targetRoot: request.targetRoot,
         privateRoot: request.privateRoot,
+        ...externalOptions,
         runId: request.runId,
         activationId: request.activationId,
       })
@@ -2418,6 +2674,7 @@ if (require.main === module && process.argv[2] === '--rollback-guardian') {
 module.exports = {
   declaredIgnoredWorkspaceNames,
   projectWorkspaceResources,
+  retainWorkerWorkspaceForRecovery,
   WorkerWorkspaceError,
   WorkerWorkspaceManager,
   repositorySnapshot,

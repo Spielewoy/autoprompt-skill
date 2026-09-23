@@ -100,7 +100,7 @@ function fixture(t, provider, usePolicy = false, nativeSnapshot = false) {
   return { root, activationRoot, record, recordPath, inspect, artifacts }
 }
 
-test('Windows local canary safety admits only its live registered external checker snapshot', {
+for (const worker of [false, true]) test(`Windows local canary safety admits only its live registered external ${worker ? 'worker workspace' : 'checker snapshot'}`, {
   skip: process.platform !== 'win32', timeout: 600000,
 }, t => {
   const f = fixture(t, 'claude', true, true)
@@ -116,24 +116,27 @@ test('Windows local canary safety admits only its live registered external check
   write(f.recordPath, f.record)
   const native = require('../../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture()
   const { CleanupRegistry } = require('../../agents/codex/workflow/finalizer.js')
-  const { resolveCheckerSnapshotRoot, createWindowsCheckerRootValidator } = require('../../agents/codex/workflow/windows-checker-root.js')
+  const { resolveCheckerSnapshotRoot, resolveWorkerWorkspaceRoot, createWindowsGitRootValidator } = require('../../agents/codex/workflow/windows-checker-root.js')
   const registry = new CleanupRegistry({ ...run.paths.cleanupRegistry,
     fsImpl:Object.assign(Object.create(fs), { windowsCapture:native, windowsMutations:native }),
     allowedRoots:[f.activationRoot], controlBinding:{ activationId:f.record.activationId, generationId:1 },
-    externalRootValidator:createWindowsCheckerRootValidator({ owner:f.record.activationId }),
+    externalRootValidator:createWindowsGitRootValidator({ owner:f.record.activationId }),
   })
-  const root = resolveCheckerSnapshotRoot({ snapshotRoot:path.join(f.activationRoot, 'checker-snapshots'),
+  const checkerRoot = resolveCheckerSnapshotRoot({ snapshotRoot:path.join(f.activationRoot, 'checker-snapshots'),
     cleanupRegistry:registry, owner:f.record.activationId })
+  const root = worker ? resolveWorkerWorkspaceRoot({ workspaceRoot:path.join(f.activationRoot, 'worker-workspaces', 'workspaces'),
+    cleanupRegistry:registry, owner:f.record.activationId }) : checkerRoot
   t.after(() => {
-    try { registry.run(); assert.equal(fs.existsSync(root), false) }
+    try { registry.run(); assert.equal(fs.existsSync(root), false); assert.equal(fs.existsSync(checkerRoot), false) }
     finally { fs.rmSync(f.root, { recursive:true, force:true }) }
   })
-  const snapshot = path.join(root, `${'b'.repeat(64)}-${'c'.repeat(16)}`)
+  const leaf = worker ? 'a'.repeat(40) : `${'b'.repeat(64)}-${'c'.repeat(16)}`
+  const snapshot = path.join(root, leaf)
   fs.mkdirSync(snapshot)
   assert.equal(cp.spawnSync('git', ['init', '-b', 'fixture', snapshot]).status, 0)
   // Exact path and valid native proof alone do not confer cleanup authority.
   assert.equal(f.inspect(snapshot).enforced, false)
-  registry.register({ path:snapshot, kind:'checker-snapshot', owner:f.record.activationId })
+  registry.register({ path:snapshot, kind:worker ? 'worker-workspace' : 'checker-snapshot', owner:worker ? leaf : f.record.activationId })
   const accepted = f.inspect(snapshot)
   assert.equal(accepted.enforced, true, JSON.stringify(accepted))
   f.record.capability.generation++

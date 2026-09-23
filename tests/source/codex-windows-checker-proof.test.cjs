@@ -44,7 +44,7 @@ function fixture(overrides = {}) {
   }
 }
 
-function loadVerifier(state) {
+function loadVerifier(state, method = 'verifyRegisteredGitWorkspace') {
   class RunRecordError extends Error {
     constructor(code, message) { super(message); this.code = code }
   }
@@ -93,8 +93,8 @@ function loadVerifier(state) {
       assert.equal(options.fsImpl.readFileSync(registryPath, 'utf8'), registryBytes.toString())
       assert.equal(options.fsImpl.readFileSync(registryPath, 'utf8'), registryBytes.toString())
     }
-    getExternalRoot() {
-      if (!state.root || state.root.status !== 'REGISTERED') return null
+    getExternalRoot(id) {
+      if (!state.root || state.root.id !== id || state.root.status !== 'REGISTERED') return null
       this.options.externalRootValidator(state.root, 'use')
       return state.root
     }
@@ -114,7 +114,7 @@ function loadVerifier(state) {
   }, module, exports: module.exports, __filename: sourcePath, __dirname: path.dirname(sourcePath) })
   const wrapper = new vm.Script(`(function(require,module,exports,__filename,__dirname){${fs.readFileSync(sourcePath, 'utf8')}\n})`, { filename: sourcePath })
   wrapper.runInContext(context)(context.require, module, module.exports, sourcePath, path.dirname(sourcePath))
-  return module.exports.verifyRegisteredCheckerSnapshot
+  return module.exports[method]
 }
 
 function refused(state, candidate = state.candidate) {
@@ -150,4 +150,39 @@ test('registered checker snapshot proof rejects sibling and grandchild path shap
   refused(sibling, `${sibling.rootPath}\\${'c'.repeat(64)}-${'d'.repeat(16)}`)
   const grandchild = fixture()
   refused(grandchild, `${grandchild.candidate}\\child`)
+})
+
+function workerFixture() {
+  const state = fixture()
+  state.rootPath = 'C:\\Users\\Owner\\AppData\\Local\\ap-work-Ab12Cd'
+  state.candidate = `${state.rootPath}\\${'a'.repeat(40)}`
+  Object.assign(state.root, { id: 'windows-worker-workspaces', kind: 'windows-worker-workspaces', path: state.rootPath })
+  Object.assign(state.registry.entries[0], { kind: 'worker-workspace', owner: 'a'.repeat(40), path: state.candidate })
+  return state
+}
+
+test('registered worker proof admits only its exact live activation-owned clone', () => {
+  const state = workerFixture()
+  assert.equal(loadVerifier(state)({ record: state.record, candidate: state.candidate }), true)
+  assert.throws(() => loadVerifier(state, 'verifyRegisteredCheckerSnapshot')({ record: state.record, candidate: state.candidate }),
+    error => error.code === 'SNAPSHOT_ROOT_UNSAFE')
+})
+
+test('registered worker proof rejects stale, retired, foreign, replaced, and misclassified clones', () => {
+  for (const mutate of [
+    state => { state.registry.generationId-- },
+    state => { state.root.status = 'CLEANED' },
+    state => { state.registry.entries[0].status = 'CLEANED' },
+    state => { state.root.owner = 'foreign' },
+    state => { state.root.kind = 'windows-checker-snapshots' },
+    state => { state.registry.entries[0].owner = 'foreign' },
+    state => { state.registry.entries[0].kind = 'checker-snapshot' },
+    state => { state.registry.entries[0].parentIdentity.ino = '99' },
+    state => { state.live.targetIdentity.ino = '99' },
+    state => { state.live.targetIdentity.type = 'file' },
+    state => { state.registryLinked = true },
+    state => { state.record.capability.expiresAt = new Date(Date.now() - 1).toISOString() },
+  ]) { const state = workerFixture(); mutate(state); refused(state) }
+  const sibling = workerFixture(); refused(sibling, `${sibling.rootPath}\\${'c'.repeat(40)}`)
+  const grandchild = workerFixture(); refused(grandchild, `${grandchild.candidate}\\child`)
 })

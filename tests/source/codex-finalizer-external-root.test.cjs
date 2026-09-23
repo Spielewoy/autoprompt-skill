@@ -42,6 +42,16 @@ function registerRoot(context) {
   })
 }
 
+function reload(context, options = {}) {
+  return new CleanupRegistry({
+    registryPath: context.registryPath,
+    allowedRoots: [context.allowedRoot],
+    controlBinding: { activationId: 'external-root-test', generationId: 1 },
+    externalRootValidator: context.validator,
+    ...options,
+  })
+}
+
 portableTest('external cleanup root owns only registered descendants and cleans child before empty root', t => {
   const context = fixture(t)
   const descriptor = registerRoot(context)
@@ -171,4 +181,67 @@ portableTest('external cleanup roots reject overlap and descendants outside thei
   fs.mkdirSync(foreign, { recursive: true })
   assert.throws(() => context.registry.register({ path: foreign, owner: 'foreign' }), error =>
     error.code === 'CLEANUP_ENTRY_UNSAFE')
+})
+
+portableTest('retained external children preserve the exact root for a later cleanup pass', t => {
+  const context = fixture(t)
+  const descriptor = registerRoot(context)
+  const ephemeral = path.join(context.externalRoot, 'ephemeral')
+  const retained = path.join(context.externalRoot, 'retained')
+  fs.mkdirSync(ephemeral)
+  fs.mkdirSync(retained)
+  context.registry.register({ path: ephemeral, owner: 'ephemeral-child' })
+  context.registry.register({ path: retained, owner: 'retained-child' })
+
+  const retaining = reload(context, { retainEntry: entry => entry.path === retained })
+  retaining.run()
+  assert.equal(fs.existsSync(ephemeral), false)
+  assert.equal(fs.existsSync(retained), true)
+  assert.equal(fs.existsSync(context.externalRoot), true)
+  assert.equal(retaining.getExternalRoot(descriptor.id).path, context.externalRoot)
+  let durable = readChecksummedJson(context.registryPath)
+  assert.deepEqual(durable.entries.map(entry => entry.status), ['CLEANED', 'REGISTERED'])
+  assert.equal(durable.externalRoots[0].status, 'REGISTERED')
+
+  const finalizer = reload(context, { retainEntry: () => false })
+  finalizer.run()
+  assert.equal(fs.existsSync(retained), false)
+  assert.equal(fs.existsSync(context.externalRoot), false)
+  durable = readChecksummedJson(context.registryPath)
+  assert.deepEqual(durable.entries.map(entry => entry.status), ['CLEANED', 'CLEANED'])
+  assert.equal(durable.externalRoots[0].status, 'CLEANED')
+})
+
+portableTest('nonboolean retention policy fails closed before deleting the child', t => {
+  const context = fixture(t)
+  registerRoot(context)
+  const child = path.join(context.externalRoot, 'retained')
+  fs.mkdirSync(child)
+  context.registry.register({ path: child, owner: 'retained-child' })
+
+  const corrupt = reload(context, { retainEntry: () => 'retain' })
+  assert.throws(() => corrupt.run(), error => error.code === 'CLEANUP_CONFIG_INVALID' && /boolean/.test(error.message))
+  assert.equal(fs.existsSync(child), true)
+  assert.equal(fs.existsSync(context.externalRoot), true)
+  const durable = readChecksummedJson(context.registryPath)
+  assert.equal(durable.entries[0].status, 'REGISTERED')
+  assert.equal(durable.externalRoots[0].status, 'REGISTERED')
+})
+
+portableTest('swapped external root is rejected before retention policy evaluation', t => {
+  const context = fixture(t)
+  registerRoot(context)
+  const child = path.join(context.externalRoot, 'retained')
+  fs.mkdirSync(child)
+  context.registry.register({ path: child, owner: 'retained-child' })
+  const displaced = path.join(context.directory, 'displaced-external')
+  fs.renameSync(context.externalRoot, displaced)
+  fs.mkdirSync(context.externalRoot)
+  let evaluated = 0
+  const guarded = reload(context, { retainEntry: () => { evaluated += 1; return true } })
+  assert.throws(() => guarded.run(), error =>
+    error.code === 'CLEANUP_EXTERNAL_ROOT_UNSAFE' && /physical identity/i.test(error.message))
+  assert.equal(evaluated, 0)
+  assert.equal(fs.existsSync(context.externalRoot), true)
+  assert.equal(readChecksummedJson(context.registryPath).externalRoots[0].status, 'REGISTERED')
 })

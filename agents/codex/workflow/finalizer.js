@@ -118,6 +118,10 @@ class CleanupRegistry {
       fail('CLEANUP_CONFIG_INVALID', 'external cleanup root validator must be a function')
     }
     this.externalRootValidator = options.externalRootValidator || null
+    if (options.retainEntry !== undefined && typeof options.retainEntry !== 'function') {
+      fail('CLEANUP_CONFIG_INVALID', 'cleanup retention policy must be a function')
+    }
+    this.retainEntry = options.retainEntry || null
   }
 
   registerExternalRoot(entry) {
@@ -289,6 +293,7 @@ class CleanupRegistry {
 
   run() {
     const registry = this.load()
+    const retained = new Set()
     const pending = registry.entries
       .filter((entry) => entry.status === 'REGISTERED')
       .sort((left, right) => left.path.localeCompare(right.path) || left.id.localeCompare(right.id))
@@ -300,6 +305,11 @@ class CleanupRegistry {
         fail('CLEANUP_ENTRY_UNSAFE', `registered cleanup path is no longer safe: ${target}`)
       }
       if (externalRoot) this._verifyExternalRoot(externalRoot, 'child-cleanup')
+      if (this.retainEntry) {
+        const retain = this.retainEntry(Object.freeze({ ...entry }))
+        if (typeof retain !== 'boolean') fail('CLEANUP_CONFIG_INVALID', 'cleanup retention policy must return a boolean')
+        if (retain) { retained.add(entry.id); continue }
+      }
       const nativeCleanup = nativeCleanupMutations(this.fs)
       if (nativeCleanup) {
         if (this.cleanup) fail('CLEANUP_CONFIG_INVALID', 'native cleanup requires its bound removal operation')
@@ -342,7 +352,11 @@ class CleanupRegistry {
       this._write(registry)
     }
     for (const root of (registry.externalRoots || []).filter(root => root.status === 'REGISTERED')) {
-      if (registry.entries.some(entry => entry.status === 'REGISTERED' && isWithin(root.path, entry.path))) {
+      const remaining = registry.entries.filter(entry => entry.status === 'REGISTERED' && isWithin(root.path, entry.path))
+      // Recovery journals can still own unpromoted worker bytes. Retain their
+      // exact registered root until the manager durably retires those clones.
+      if (remaining.length && remaining.every(entry => retained.has(entry.id))) continue
+      if (remaining.length) {
         fail('CLEANUP_EXTERNAL_ROOT_NOT_EMPTY', 'external cleanup root still has registered descendants')
       }
       this._removeExternalRoot(root)

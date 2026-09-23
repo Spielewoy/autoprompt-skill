@@ -16,7 +16,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, snapshot, proof, launch, installer]
+        options: [all, snapshot, proof, launch, worker, installer]
       claude_diagnostic:
         description: 'Diagnose public native Claude activation on Windows x64 and ARM64'
         required: false

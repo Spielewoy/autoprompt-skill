@@ -1088,11 +1088,11 @@ function verifyHarnessV2EnforcementProof(repository, environment, proof) {
       const privateRelative = path.relative(activationRoot, inspectedTarget).split(path.sep).join('/')
       let ownedClone = /^(?:worker-workspaces\/workspaces\/[a-f0-9]{40}|checker-snapshots\/[a-f0-9]{64}-[a-f0-9]{16})$/.test(privateRelative)
       // Git for Windows needs a short physical repository path. External
-      // checker storage is admitted only through this activation generation's
+      // worker/checker storage is admitted only through this activation generation's
       // durable registry and the live native identities of the root and child.
       if (!ownedClone && record.target?.realpath !== inspectedTarget && process.platform === 'win32') {
         ownedClone = require('../agents/codex/workflow/windows-checker-root.js')
-          .verifyRegisteredCheckerSnapshot({ record, candidate: inspectedTarget })
+          .verifyRegisteredGitWorkspace({ record, candidate: inspectedTarget })
       }
       if ((record.target?.realpath !== inspectedTarget && !ownedClone) ||
           record.executable?.path !== proof.nativeExecutable ||

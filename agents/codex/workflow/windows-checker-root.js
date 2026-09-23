@@ -11,19 +11,23 @@ const {
 const { CleanupRegistry } = require('./finalizer.js')
 const { createWindowsFilesystemCapture } = require('./windows-filesystem.js')
 
-const ROOT_ID = 'windows-checker-snapshots'
+const ROOT_POLICIES = Object.freeze({
+  'windows-checker-snapshots': Object.freeze({ prefix: 'ap-git-', leaf: /^[a-f0-9]{64}-[a-f0-9]{16}$/, entryKind: 'checker-snapshot' }),
+  'windows-worker-workspaces': Object.freeze({ prefix: 'ap-work-', leaf: /^[a-f0-9]{40}$/, entryKind: 'worker-workspace' }),
+})
 // Git for Windows rejects child GIT_DIR values longer than PATH_MAX - 40.
 // Reserve the existing 81-character snapshot leaf, separator and '/.git'.
 const MAX_ROOT_LENGTH = 132
 
 function refuse(message) { throw new RunRecordError('SNAPSHOT_ROOT_UNSAFE', message) }
 
-function createWindowsCheckerRootValidator({ owner }) {
+function createWindowsGitRootValidator({ owner }) {
   if (typeof owner !== 'string' || !owner) refuse('Checker storage requires its activation owner')
   return (descriptor, phase) => {
-    if (process.platform !== 'win32' || descriptor.id !== ROOT_ID || descriptor.kind !== ROOT_ID || descriptor.owner !== owner ||
+    const policy = Object.hasOwn(ROOT_POLICIES, descriptor.id) && ROOT_POLICIES[descriptor.id]
+    if (process.platform !== 'win32' || !policy || descriptor.kind !== descriptor.id || descriptor.owner !== owner ||
         typeof descriptor.path !== 'string' || !path.isAbsolute(descriptor.path) || path.resolve(descriptor.path) !== descriptor.path ||
-        descriptor.path.length > MAX_ROOT_LENGTH || !/^ap-git-[A-Za-z0-9]{6}$/.test(path.basename(descriptor.path))) {
+        descriptor.path.length > MAX_ROOT_LENGTH || !new RegExp(`^${policy.prefix}[A-Za-z0-9]{6}$`).test(path.basename(descriptor.path))) {
       refuse('Checker storage descriptor does not match this activation and native path policy')
     }
     const profile = os.userInfo().homedir
@@ -44,19 +48,19 @@ function createWindowsCheckerRootValidator({ owner }) {
   }
 }
 
-function resolveCheckerSnapshotRoot({ snapshotRoot, cleanupRegistry, owner }) {
-  if (process.platform !== 'win32') return path.resolve(snapshotRoot)
+function resolveGitStorageRoot({ fallbackRoot, cleanupRegistry, owner, rootId }) {
+  if (process.platform !== 'win32') return path.resolve(fallbackRoot)
   if (!cleanupRegistry || typeof cleanupRegistry.getExternalRoot !== 'function' || typeof cleanupRegistry.registerExternalRoot !== 'function') {
     refuse('Windows checker storage requires durable external-root cleanup authority')
   }
-  const existing = cleanupRegistry.getExternalRoot(ROOT_ID)
+  const existing = cleanupRegistry.getExternalRoot(rootId)
   if (existing) return existing.path
-  const root = createWindowsCompilerDirectory('ap-git-')
+  const root = createWindowsCompilerDirectory(ROOT_POLICIES[rootId].prefix)
   const native = createWindowsFilesystemCapture()
   let identity
   try {
     identity = native.inspectOwnedTarget(root)
-    createWindowsCheckerRootValidator({ owner })({ id: ROOT_ID, kind: ROOT_ID, owner, path: root, status: 'REGISTERED' }, 'register')
+    createWindowsGitRootValidator({ owner })({ id: rootId, kind: rootId, owner, path: root, status: 'REGISTERED' }, 'register')
   } catch (error) {
     // Bind rollback to the allocation's physical identity. The native helper
     // refuses replacement and nonempty storage, including unregistered bytes.
@@ -67,8 +71,16 @@ function resolveCheckerSnapshotRoot({ snapshotRoot, cleanupRegistry, owner }) {
   }
   // Publication may have committed before a later durability error. Retain
   // storage on any registration failure so recovery can use that authority.
-  cleanupRegistry.registerExternalRoot({ id: ROOT_ID, kind: ROOT_ID, owner, path: root })
+  cleanupRegistry.registerExternalRoot({ id: rootId, kind: rootId, owner, path: root })
   return root
+}
+
+function resolveCheckerSnapshotRoot({ snapshotRoot, cleanupRegistry, owner }) {
+  return resolveGitStorageRoot({ fallbackRoot: snapshotRoot, cleanupRegistry, owner, rootId: 'windows-checker-snapshots' })
+}
+
+function resolveWorkerWorkspaceRoot({ workspaceRoot, cleanupRegistry, owner }) {
+  return resolveGitStorageRoot({ fallbackRoot: workspaceRoot, cleanupRegistry, owner, rootId: 'windows-worker-workspaces' })
 }
 
 function readPrivateJson(filename, label) {
@@ -90,7 +102,7 @@ function sameIdentity(left, right, includeType = false) {
 // Reopen only the current activation's durable cleanup authority. A path under
 // LocalAppData is never sufficient: it must be the exact live child registered
 // beneath the identity-bound checker root for this generation.
-function verifyRegisteredCheckerSnapshot({ record, candidate }) {
+function verifyRegisteredGitWorkspace({ record, candidate }, expectedRootId = null) {
   if (process.platform !== 'win32' || !record || typeof record !== 'object' || Array.isArray(record) ||
       record.schemaVersion !== 2 || record.status !== 'active' || typeof record.activationId !== 'string' ||
       !record.activationId || typeof record.activationRoot !== 'string' || !path.isAbsolute(record.activationRoot) ||
@@ -154,21 +166,24 @@ function verifyRegisteredCheckerSnapshot({ record, candidate }) {
     allowedRoots: [activationRoot],
     fsImpl: runtimeFs,
     controlBinding: { activationId: record.activationId, generationId: record.capability.generation },
-    externalRootValidator: createWindowsCheckerRootValidator({ owner: record.activationId }),
+    externalRootValidator: createWindowsGitRootValidator({ owner: record.activationId }),
   })
-  const root = registry.getExternalRoot(ROOT_ID)
   const candidatePath = path.resolve(candidate)
   const resolvedCandidate = fs.realpathSync.native(candidatePath)
   if (candidatePath !== candidate || resolvedCandidate !== candidatePath) {
     refuse('Checker snapshot changed its physical path')
   }
-  if (!root || path.dirname(resolvedCandidate).toLowerCase() !== root.path.toLowerCase() ||
-      !/^[a-f0-9]{64}-[a-f0-9]{16}$/.test(path.basename(resolvedCandidate))) {
+  const rootId = Object.keys(ROOT_POLICIES).find(id => ROOT_POLICIES[id].leaf.test(path.basename(resolvedCandidate)))
+  if (!rootId || (expectedRootId && expectedRootId !== rootId)) refuse('Git workspace has no admitted direct-child shape')
+  const policy = ROOT_POLICIES[rootId]
+  const root = registry.getExternalRoot(rootId)
+  if (!root || path.dirname(resolvedCandidate).toLowerCase() !== root.path.toLowerCase()) {
     refuse('Checker snapshot is not one direct child of the registered external root')
   }
   const durable = registry.load()
   const matches = durable.entries.filter(entry => entry.status === 'REGISTERED' &&
-    entry.kind === 'checker-snapshot' && entry.path.toLowerCase() === resolvedCandidate.toLowerCase())
+    entry.kind === policy.entryKind && entry.path.toLowerCase() === resolvedCandidate.toLowerCase() &&
+    (policy.entryKind !== 'worker-workspace' || entry.owner === path.basename(resolvedCandidate)))
   if (matches.length !== 1 || !sameIdentity(matches[0].parentIdentity, root.targetIdentity)) {
     refuse('Checker snapshot lacks one exact durable child registration')
   }
@@ -181,8 +196,15 @@ function verifyRegisteredCheckerSnapshot({ record, candidate }) {
   return true
 }
 
+function verifyRegisteredCheckerSnapshot(options) {
+  return verifyRegisteredGitWorkspace(options, 'windows-checker-snapshots')
+}
+
 module.exports = {
-  createWindowsCheckerRootValidator,
+  createWindowsCheckerRootValidator: createWindowsGitRootValidator,
+  createWindowsGitRootValidator,
   resolveCheckerSnapshotRoot,
+  resolveWorkerWorkspaceRoot,
   verifyRegisteredCheckerSnapshot,
+  verifyRegisteredGitWorkspace,
 }

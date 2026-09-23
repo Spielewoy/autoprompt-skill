@@ -51,6 +51,7 @@ const WINDOWS_NATIVE_CASES = Object.freeze([
   'native Windows Bash repeated forks complete without retry diagnostics',
   'native Windows controller scratch has protected ownership and rejects inherited permissions on reuse',
   'native Windows worker clone is privately writable without relabeling the source or an occupied clone',
+  'native Windows worker clone uses short registered storage and cleanup retains only recoverable journals',
   'native capability command reads exact fixture bytes through the real platform shell',
   'failed native isolation assertion cannot emit a successful closed-canary challenge',
 ])
@@ -198,6 +199,14 @@ async function main() {
         'tests/source/harness-v2-local-proof-safety.test.cjs'] },
       { id: 'launch', cases, argv: ['--test-name-pattern', `^(?:${cases.join('|')})$`,
         'tests/source/windows-bash-runtime.test.cjs', 'tests/source/windows-job-helper.test.cjs'] },
+      { id: 'worker', cases: [
+        'native Windows worker clone uses short registered storage and cleanup retains only recoverable journals',
+        'Windows local canary safety admits only its live registered external worker workspace',
+      ], argv: ['--test-name-pattern', `^(?:${[
+        'native Windows worker clone uses short registered storage and cleanup retains only recoverable journals',
+        'Windows local canary safety admits only its live registered external worker workspace',
+      ].join('|')})$`, 'tests/source/harness-v2-windows-private-storage.test.cjs',
+      'tests/source/harness-v2-local-proof-safety.test.cjs'] },
       { id: 'installer', cases: ['packed artifact installs and verifies all public providers without the checkout or network'],
         argv: ['tests/source/packed-harness-v2-lifecycle.test.cjs'] },
     ]
