@@ -48,28 +48,37 @@ if ($projectText -cnotmatch '(?m)^version = "0\.21\.1"$') {
     throw 'Pinned Hermes source is not version 0.21.1'
 }
 
-$pwsh = Join-Path $PSHOME 'pwsh.exe'
-$gitConfigKeys = @('GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1')
-$gitConfigSaved = @{}
-foreach ($key in $gitConfigKeys) { $gitConfigSaved[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
-try {
-    # The archive is immutable, but the installer performs a fresh checkout on
-    # Windows. Keep Git from rewriting tracked files before its exact commit
-    # check; these settings exist only in this child installer environment.
-    $env:GIT_CONFIG_COUNT = '2'
-    $env:GIT_CONFIG_KEY_0 = 'core.autocrlf'; $env:GIT_CONFIG_VALUE_0 = 'false'
-    $env:GIT_CONFIG_KEY_1 = 'core.safecrlf'; $env:GIT_CONFIG_VALUE_1 = 'false'
-    $installerExit = 1
-    & $pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installer `
-        -Commit $commit -ForceCommit -HermesHome $hermesHome -InstallDir $install `
-        -SkipSetup -SkipComputerUse -NonInteractive *>&1 | Tee-Object -FilePath $log
-    if ($null -ne $LASTEXITCODE) { $installerExit = [int]$LASTEXITCODE }
-} finally {
-    foreach ($key in $gitConfigKeys) {
-        if ($null -eq $gitConfigSaved[$key]) { Remove-Item "Env:$key" -ErrorAction SilentlyContinue }
-        else { Set-Item "Env:$key" $gitConfigSaved[$key] }
-    }
+# The official installer clones its default branch before honouring -Commit.
+# Its clone path replaces GIT_CONFIG_COUNT with its Windows atomic-write
+# setting, so an inherited autocrlf policy cannot protect that first checkout.
+# Start it with a clean, ordinary Git working tree at the already verified
+# archive commit instead. This is intentionally not a vendor patch or a fake
+# launcher: the official installer still owns venv and launcher installation.
+New-Item -ItemType Directory -Force -Path $hermesHome | Out-Null
+if (Test-Path -LiteralPath $install) { throw 'Pinned Hermes install root unexpectedly exists before archive checkout' }
+Copy-Item -LiteralPath $source -Destination $install -Recurse -Force
+$repoUrlHttps = 'https://github.com/NousResearch/hermes-agent.git'
+function Invoke-PinnedHermesGit {
+    param([string[]] $Arguments)
+    & git -C $install -c windows.appendAtomically=false @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "Pinned Hermes archive checkout failed: git $($Arguments -join ' ')" }
 }
+Invoke-PinnedHermesGit @('init')
+Invoke-PinnedHermesGit @('config', '--local', 'core.autocrlf', 'false')
+Invoke-PinnedHermesGit @('remote', 'add', 'origin', $repoUrlHttps)
+Invoke-PinnedHermesGit @('fetch', '--depth', '1', 'origin', $commit)
+Invoke-PinnedHermesGit @('checkout', '--force', '--detach', 'FETCH_HEAD')
+$archiveHead = (& git -C $install rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $archiveHead -cne $commit) { throw 'Pinned Hermes archive checkout did not resolve the requested commit' }
+$archiveStatus = (& git -C $install status --porcelain) -join "`n"
+if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($archiveStatus)) { throw 'Pinned Hermes archive checkout is not clean before the official installer' }
+
+$pwsh = Join-Path $PSHOME 'pwsh.exe'
+$installerExit = 1
+& $pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installer `
+    -Commit $commit -ForceCommit -HermesHome $hermesHome -InstallDir $install `
+    -SkipSetup -SkipComputerUse -NonInteractive *>&1 | Tee-Object -FilePath $log
+if ($null -ne $LASTEXITCODE) { $installerExit = [int]$LASTEXITCODE }
 if ($installerExit -ne 0) { throw "Pinned Hermes installer failed with exit code $installerExit" }
 if (-not (Test-Path -LiteralPath $log -PathType Leaf)) { throw 'Pinned Hermes installer produced no lifecycle log' }
 

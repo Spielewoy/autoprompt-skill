@@ -30,8 +30,10 @@ test('Darwin census keeps permission failure and persistent churn fail-closed', 
   assert.throws(() => helperCall(denied.binding, ['census', '100']), { code: 'PROCESS_OBSERVATION_FAILED' })
   assert.equal(denied.calls(), 1)
   const churn = helper(t, [failed])
+  const started = Date.now()
   assert.throws(() => helperCall(churn.binding, ['census', '100']), { code: 'PROCESS_OBSERVATION_FAILED' })
-  assert.ok(churn.calls() > 1 && churn.calls() <= 8)
+  assert.ok(churn.calls() > 1 && churn.calls() <= 40)
+  assert.ok(Date.now() - started >= 1800, 'transient reaping retries must use the bounded observation interval')
 })
 test('Darwin census retries cannot cross a boot session or accept a foreign coalition', { skip: process.platform === 'win32' }, t => {
   const changed = helper(t, [failed, { ...complete, bootUuid: '12345678-1234-1234-1234-123456789abd' }])

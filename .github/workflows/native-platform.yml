@@ -1293,7 +1293,7 @@ jobs:
           - { os: macos-15-intel, arch: x64 }
           - { os: macos-latest, arch: arm64 }
     runs-on: ${{ matrix.runner.os }}
-    timeout-minutes: 20
+    timeout-minutes: 60
     env:
       AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
     steps:
@@ -1306,6 +1306,11 @@ jobs:
       - name: Acquire and hash the official VS Code archive
         shell: bash
         run: node tests/helpers/install-vscode-native-ci.cjs | tee vscode-native-acquisition.json
+      - name: Diagnose bounded Windows VS Code bootstrap
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: bash
+        run: node tests/helpers/vscode-windows-probe-diagnostic.cjs | tee vscode-windows-probe-diagnostic.json
       - name: Probe the native VS Code bundle and preserve identity
         shell: bash
         run: |
@@ -1317,6 +1322,9 @@ jobs:
           const binding = native.probeExecutable({ provider: 'vscode', executable, timeoutMs: 120000 })
           process.stdout.write(JSON.stringify({ executable, version: binding.version, runtimeIdentity: binding.runtimeIdentity }, null, 2) + '\n')
           NODE
+      - name: Require all eleven native VS Code capabilities
+        timeout-minutes: 45
+        run: node tests/helpers/provider-platform-ci.cjs vscode
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -1324,4 +1332,7 @@ jobs:
           path: |
             vscode-native-acquisition.json
             vscode-native-probe.json
+            vscode-windows-probe-diagnostic.json
+            native-vscode-evidence.json
+            native-vscode-tests.log
           if-no-files-found: error

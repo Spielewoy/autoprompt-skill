@@ -86,7 +86,12 @@ function helperCall(binding, argv) {
       value.ok === false && value.complete === false && Array.isArray(value.errors) && value.errors.length > 0 &&
       value.errors.every(error => Number.isSafeInteger(error.pid) && error.pid > 0 &&
         ['bind-before', 'coalition-query', 'bind-after', 'audit-signal'].includes(error.phase) && [2, 3].includes(error.errno))
-    if (exitedSnapshotMember && attempt < 7 && Date.now() < deadline) continue
+    if (exitedSnapshotMember && attempt < 39 && Date.now() < deadline) {
+      // Reaping can outlast several tight UID scans. Spend the bounded retry
+      // interval instead of exhausting all attempts against the same snapshot.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(50, deadline - Date.now()))
+      continue
+    }
     const error = new Error('Darwin helper could not establish kernel authority')
     error.code = 'PROCESS_OBSERVATION_FAILED'
     error.details = { command: argv[0], status: result.status, signal: result.signal,

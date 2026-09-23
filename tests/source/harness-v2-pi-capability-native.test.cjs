@@ -317,7 +317,10 @@ for (const provider of ['prime', 'omp']) {
     const adapter = new HarnessExecAdapter({ provider, runner: f.runner, nativeRoot: f.nativeRoot, executableBinding: f.binding, targetPath: scratch, connection: connection(f.service),
       credentialEnvironment: { OPENAI_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only controller checker tools.', checkerScratchVerifier: () => checker })
     record.environment = prepareProcessLaunchEnvironment(f.processAdapter, record.reservationId, { PATH: process.env.PATH }); record.signal = AbortSignal.timeout(90000)
-    const result = await adapter.launch(record); successful(result); assert.equal(fs.readFileSync(candidate, 'utf8'), f.marker); assert.equal(fs.readFileSync(path.join(scratch, 'checker.txt'), 'utf8'), 'checked')
+    let result
+    try { result = await adapter.launch(record) }
+    catch (error) { fixtureFailureDiagnostic(f, error); throw error }
+    successful(result); assert.equal(fs.readFileSync(candidate, 'utf8'), f.marker); assert.equal(fs.readFileSync(path.join(scratch, 'checker.txt'), 'utf8'), 'checked')
   })
 
   test(`${provider} closed native capability: crash recovery drains the durable owned child`, providerOptions, async t => {
