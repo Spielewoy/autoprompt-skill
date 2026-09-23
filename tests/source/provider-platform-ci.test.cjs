@@ -27,3 +27,15 @@ test('provider CI never replaces a missing registered suite with a generic passi
   assert.ok(plan.cases.every(name => pattern.test(name)))
   assert.equal(pattern.test('kilo closed native capability: isolation'), false)
 })
+
+test('provider CI can select one registered capability while preserving all-capability evidence semantics', () => {
+  assert.deepEqual(testPlan('prime', 'all'), testPlan('prime'))
+  assert.deepEqual(testPlan('prime', ''), testPlan('prime'))
+  const selected = testPlan('prime', 'isolatedChecking')
+  assert.equal(selected.capability, 'isolatedChecking')
+  assert.equal(selected.cases.length, 1)
+  assert.equal(selected.allCases.length, 11)
+  const result = verifyResult(selected, { code: 0, signal: null }, transcript(selected.cases.map(name => `ok 1 - ${name}`), { pass: 1 }))
+  assert.equal(result.cases.length, 1)
+  assert.throws(() => testPlan('prime', 'not-a-capability'), /Unknown native capability/)
+})

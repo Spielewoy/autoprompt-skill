@@ -10,15 +10,18 @@ const path = require('node:path')
 const { NATIVE_SUITES, CAPABILITIES, selectedCaseSummary, testSummary, suiteCompleted } = require('../../scripts/harness-v2-conformance.cjs')
 const { probeCommandSandbox } = require('../../scripts/harness-v2-tool-boundary.cjs')
 
-function testPlan(provider) {
+function testPlan(provider, capability = null) {
+  if (capability === 'all' || capability === '') capability = null
   const suite = NATIVE_SUITES[provider]
   assert.ok(suite && suite.capabilityCases, `No complete native capability suite for ${provider}`)
   assert.deepEqual(Object.keys(suite.capabilityCases).sort(), [...CAPABILITIES].sort())
   assert.equal(suite.cases.length, 11)
   assert.equal(new Set(suite.cases).size, 11)
+  if (capability !== null) assert.ok(CAPABILITIES.includes(capability), `Unknown native capability: ${capability}`)
+  const cases = capability === null ? suite.cases : [suite.capabilityCases[capability]]
   const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return { cases: suite.cases, argv: ['--test', '--test-concurrency=1', '--test-reporter=tap',
-    '--test-name-pattern', `^(?:${suite.cases.map(escape).join('|')})$`, path.resolve(__dirname, '../..', suite.file)] }
+  return { cases, capability, allCases: suite.cases, argv: ['--test', '--test-concurrency=1', '--test-reporter=tap',
+    '--test-name-pattern', `^(?:${cases.map(escape).join('|')})$`, path.resolve(__dirname, '../..', suite.file)] }
 }
 
 function verifyResult(plan, result, text) {
@@ -31,7 +34,8 @@ function verifyResult(plan, result, text) {
 
 async function main() {
   const provider = process.argv[2]
-  const plan = testPlan(provider)
+  const selectedCapability = process.env.AUTOPROMPT_CI_CAPABILITY || null
+  const plan = testPlan(provider, selectedCapability)
   if (process.env.AUTOPROMPT_CI_EXPECTED_ARCH) assert.equal(process.arch, process.env.AUTOPROMPT_CI_EXPECTED_ARCH)
   assert.ok(['linux', 'darwin', 'win32'].includes(process.platform))
   assert.ok([20, 24].includes(Number(process.versions.node.split('.')[0])), 'Use a tested Node major')
@@ -42,7 +46,8 @@ async function main() {
   const hash = () => crypto.createHash('sha256').update(fs.readFileSync(executable)).digest('hex')
   const executableSha256 = hash()
   const evidence = { schemaVersion: 1, provider, platform: process.platform, architecture: process.arch,
-    node: process.version, executable, executableSha256, nativeCapabilitiesPassed: false,
+    node: process.version, executable, executableSha256, selectedCapability: plan.capability,
+    selectedCapabilityCases: plan.cases, selectedCapabilityPassed: false, nativeCapabilitiesPassed: false,
     scope: 'installed-provider-controlled-model-service', commit: process.env.GITHUB_SHA || null }
   const evidenceFile = `native-${provider}-evidence.json`
   const logFile = `native-${provider}-tests.log`
@@ -73,7 +78,8 @@ async function main() {
     const after = native.probeExecutable({ provider, executable })
     assert.equal(after.version, binding.version)
     assert.deepEqual(after.runtimeIdentity, binding.runtimeIdentity, 'Provider runtime dependencies changed during testing')
-    evidence.nativeCapabilitiesPassed = true
+    evidence.selectedCapabilityPassed = true
+    evidence.nativeCapabilitiesPassed = plan.capability === null
   } catch (error) {
     evidence.error = String(error.stack || error).slice(0, 8192)
     throw error

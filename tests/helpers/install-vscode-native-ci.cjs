@@ -72,7 +72,11 @@ async function download(url, destination) {
 function extract(archive, destination) {
   fs.mkdirSync(destination, { recursive: true, mode: 0o700 })
   if (process.platform === 'win32') {
-    cp.execFileSync('tar', ['-xf', archive, '-C', destination], { stdio: 'inherit', windowsHide: true })
+    // Git Bash puts GNU tar first on PATH; it treats a drive prefix as a
+    // remote archive host. Bind the Windows inbox extractor explicitly.
+    const tar = path.join(process.env.SystemRoot, 'System32', 'tar.exe')
+    assert.ok(fs.statSync(tar).isFile(), 'Windows inbox tar is unavailable')
+    cp.execFileSync(tar, ['-xf', archive, '-C', destination], { stdio: 'inherit', windowsHide: true, shell: false })
   } else {
     cp.execFileSync('ditto', ['-x', '-k', archive, destination], { stdio: 'inherit' })
   }

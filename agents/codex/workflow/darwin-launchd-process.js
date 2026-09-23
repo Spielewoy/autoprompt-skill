@@ -91,6 +91,10 @@ function helperCall(binding, argv) {
     error.code = 'PROCESS_OBSERVATION_FAILED'
     error.details = { command: argv[0], status: result.status, signal: result.signal,
       helperError: value.error || null, errors: Array.isArray(value.errors) ? value.errors.slice(0, 8) : null }
+    // Native test reporters preserve Error.message but omit custom details.
+    // Keep this kernel-only diagnostic bounded so census failures remain
+    // actionable without publishing provider output or controller state.
+    error.message += `: ${JSON.stringify(error.details).slice(0, 2048)}`
     throw error
   }
 }

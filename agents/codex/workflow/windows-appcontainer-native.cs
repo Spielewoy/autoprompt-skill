@@ -72,7 +72,6 @@ public static class WindowsAppContainerNative {
  [DllImport("ntdll.dll")] static extern Int32 NtQueryObject(IntPtr handle,Int32 information,IntPtr buffer,UInt32 length,out UInt32 required);
  [DllImport("kernel32.dll",SetLastError=true)] static extern UInt32 GetFileType(IntPtr handle);
  [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetStdHandle(Int32 handle);
- [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetCurrentProcess();
  [DllImport("kernel32.dll",SetLastError=true)] static extern Boolean DuplicateHandle(IntPtr sourceProcess,IntPtr sourceHandle,IntPtr targetProcess,out IntPtr targetHandle,UInt32 access,Boolean inherit,UInt32 options);
  [DllImport("kernel32.dll",SetLastError=true)] static extern Boolean GetHandleInformation(IntPtr handle,out UInt32 flags);
  [DllImport("ntdll.dll")] static extern UInt16 RtlUpcaseUnicodeChar(UInt16 value);

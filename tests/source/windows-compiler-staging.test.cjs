@@ -19,7 +19,7 @@ function harness(file, behavior, cleanupFailure = false) {
     dev: 1n, ino: 2n, nlink: 1n, size: BigInt(bytes.length), mtimeNs: 3n, ctimeNs: 4n }
   const fakeFs = { realpathSync: { native: value => value }, lstatSync: () => stat,
     openSync: value => value, fstatSync: () => stat, readFileSync: () => bytes,
-    closeSync() {}, existsSync: () => false, rmSync(value, options) {
+    closeSync() {}, writeFileSync() {}, existsSync: () => false, rmSync(value, options) {
       assert.equal(options.maxRetries, 10); assert.equal(options.retryDelay, 100)
       removed.push(value)
       if (cleanupFailure) throw Object.assign(new Error('persistent compiler cleanup failure'), { code: 'ENOTEMPTY' })
@@ -50,6 +50,18 @@ function harness(file, behavior, cleanupFailure = false) {
   }, { filename })
   return { api: module.exports, created, removed, calls, temporary }
 }
+
+test('Windows relay launch removes compiler staging after synchronous request preparation refusal', async () => {
+  const h = harness('windows-appcontainer.js', () => { throw new Error('native helper must not start') })
+  const launcher = h.api.createWindowsAppContainerLauncher({ deploymentRoot: 'C:\\deployment' })
+  await assert.rejects(launcher.launch({ profileName: 'Autoprompt_' + 'a'.repeat(32), profileSid: sid,
+    executable: 'C:\\runtime\\node.exe', executableSha256: digest, arguments: [], cwd: 'C:\\task',
+    environment: ['SystemRoot=C:\\Windows'], timeoutMs: 1000, outputLimit: 1024,
+    cancellationPath: deepControl + '\\cancel', relayStdin: true }, { leaseId: 'owned' }), { code: 'WINDOWS_LAUNCH_INVALID' })
+  assert.deepEqual(h.created, ['autoprompt-launch-'])
+  assert.deepEqual(h.removed, [h.temporary])
+  assert.deepEqual(h.calls, [])
+})
 
 for (const outcome of ['success', 'refusal', 'spawn-error', 'cleanup-error']) {
   test(`Windows resource compiler staging is shallow and cleaned after ${outcome}`, () => {

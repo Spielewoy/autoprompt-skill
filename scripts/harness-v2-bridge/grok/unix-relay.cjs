@@ -18,6 +18,20 @@ const sameToken = (left, right) => {
   const a = Buffer.from(left, 'utf8'), b = Buffer.from(right, 'utf8')
   return a.length === b.length && crypto.timingSafeEqual(a, b)
 }
+const WINDOWS_PIPE = /^\\\\\.\\pipe\\autoprompt-grok-[a-f0-9]{64}$/u
+function createWindowsRelayPath(randomBytes = crypto.randomBytes) {
+  if (typeof randomBytes !== 'function') fail('GROK_RELAY_CONFIG_INVALID', 'Windows relay randomness is unavailable')
+  const nonce = randomBytes(32)
+  if (!Buffer.isBuffer(nonce) || nonce.length !== 32) fail('GROK_RELAY_CONFIG_INVALID', 'Windows relay randomness is invalid')
+  return `\\\\.\\pipe\\autoprompt-grok-${nonce.toString('hex')}`
+}
+function validateRelayAddress(socketPath, platform = process.platform) {
+  if (typeof socketPath !== 'string' || socketPath.includes('\0')) fail('GROK_RELAY_CONFIG_INVALID', 'Relay socket path is invalid')
+  if (platform === 'win32') {
+    if (!WINDOWS_PIPE.test(socketPath)) fail('GROK_RELAY_CONFIG_INVALID', 'Windows relay pipe name is invalid')
+  } else if (!socketPath.startsWith('/')) fail('GROK_RELAY_CONFIG_INVALID', 'Unix relay socket path is invalid')
+  return socketPath
+}
 async function boundedResponseText(response, limit = 32 * 1024 * 1024) {
   if (!response.body || typeof response.body.getReader !== 'function') fail('GROK_RELAY_FAILURE', 'Upstream response is not a readable stream')
   const reader = response.body.getReader(), chunks = []; let size = 0
@@ -27,15 +41,15 @@ async function boundedResponseText(response, limit = 32 * 1024 * 1024) {
   return Buffer.concat(chunks).toString('utf8')
 }
 function createUnixRelay(options = {}) {
-  const socketPath = options.socketPath
+  const relayPlatform = process.platform
+  const socketPath = validateRelayAddress(options.socketPath, relayPlatform)
   const relayToken = token(options.relayToken)
   const upstreamUrl = options.upstreamUrl
   const upstreamAuthorization = options.upstreamAuthorization
   const fetchImpl = options.fetchImpl || globalThis.fetch
   const mcpHandler = options.mcpHandler
   const requestTimeoutMs = options.requestTimeoutMs ?? 300000
-  if (typeof socketPath !== 'string' || !socketPath.startsWith('/') || socketPath.includes('\0') ||
-      typeof upstreamUrl !== 'string' || !upstreamUrl.startsWith('http') ||
+  if (!['linux', 'darwin', 'win32'].includes(relayPlatform) || typeof upstreamUrl !== 'string' || !upstreamUrl.startsWith('http') ||
       typeof upstreamAuthorization !== 'string' || !upstreamAuthorization || typeof fetchImpl !== 'function' ||
       !Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 2147483647) fail('GROK_RELAY_CONFIG_INVALID', 'Unix relay configuration is invalid')
   let closed = false, ownedSocket = false, closePromise = null, directoryFd = null, socketIdentity = null
@@ -137,7 +151,11 @@ function createUnixRelay(options = {}) {
   return {
     server,
     async listen() {
-      if (fs.existsSync(socketPath)) fail('GROK_RELAY_SOCKET_EXISTS', 'Refusing to replace an existing relay socket')
+      if (relayPlatform !== 'win32' && fs.existsSync(socketPath)) fail('GROK_RELAY_SOCKET_EXISTS', 'Refusing to replace an existing relay socket')
+      if (relayPlatform === 'win32') {
+        await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, () => { server.off('error', reject); ownedSocket = true; resolve() }) })
+        return socketPath
+      }
       // Linux sockaddr_un is limited to 108 bytes. Keep the socket in its
       // private directory and anchor a short address to that open directory.
       if (process.platform === 'linux' || Buffer.byteLength(socketPath) >= 104) {
@@ -263,8 +281,7 @@ function createPreconnectedRelayClient(options = {}) {
 }
 function createPreconnectedRelayFetch(options = {}) { return createPreconnectedRelayClient(options).fetch }
 function createUnixRelayFetch(options = {}) {
-  const socketPath = options.socketPath, relayToken = token(options.relayToken)
-  if (typeof socketPath !== 'string' || !socketPath.startsWith('/')) fail('GROK_RELAY_CONFIG_INVALID', 'Relay socket path is invalid')
+  const socketPath = validateRelayAddress(options.socketPath), relayToken = token(options.relayToken)
   const response = message => {
     if (!object(message) || message.error || !Number.isSafeInteger(message.status) || typeof message.contentType !== 'string' || typeof message.body !== 'string') {
       fail(message?.error?.code || 'GROK_RELAY_FAILURE', message?.error?.message || 'Relay response is invalid')
@@ -304,4 +321,4 @@ function createUnixRelayFetch(options = {}) {
   })
 }
 
-module.exports = { GrokRelayError, createUnixRelay, createUnixRelayFetch, createPreconnectedRelayClient, createPreconnectedRelayFetch }
+module.exports = { GrokRelayError, createWindowsRelayPath, validateRelayAddress, createUnixRelay, createUnixRelayFetch, createPreconnectedRelayClient, createPreconnectedRelayFetch }

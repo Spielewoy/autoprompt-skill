@@ -582,6 +582,14 @@ const adapter = process.platform === 'win32'
       providerPrivateOwnershipRoot: input.activationRoot,
       trustedOwnershipRoots: [input.activationRoot],
     })
+  : process.platform === 'darwin'
+    ? ownerModule.createPlatformProcessAdapter({
+        platform: 'darwin',
+        darwin: {
+          controlRoot: input.controlRoot,
+          providerPrivateOwnershipRoot: input.activationRoot,
+        },
+      })
   : ownerModule.createPosixProcessAdapter()
 const processOwner = new ownerModule.ProcessOwner({
   adapter,

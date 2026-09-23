@@ -18,6 +18,18 @@ on:
         default: opencode
         type: choice
         options: [opencode, deepseek, reasonix, prime, omp, kilo]
+      support_primitive:
+        description: 'Select the Windows primitive stage without repeating provider installation'
+        required: false
+        default: all
+        type: choice
+        options: [all, relay, hermes]
+      support_capability:
+        description: 'Run all capabilities or only the failing checker diagnostic'
+        required: false
+        default: all
+        type: choice
+        options: [all, isolatedChecking]
       support_arm:
         description: 'Limit focused Windows provider verification to ARM64'
         required: false
@@ -1099,6 +1111,12 @@ jobs:
           export AUTOPROMPT_DARWIN_COMMAND_EVIDENCE_DIR="$RUNNER_TEMP"
           export AUTOPROMPT_DARWIN_COMMAND_STARTUP_DIAGNOSTIC=1
           node --test --test-reporter=tap tests/source/darwin-command-sandbox.test.cjs 2>&1 | tee darwin-command-sandbox.log
+      - name: Diagnose durable launchd listener ownership for Grok
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/darwin-launchd-socket-native.test.cjs 2>&1 | tee darwin-launchd-socket.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -1107,6 +1125,7 @@ jobs:
             darwin-coalition-proof.log
             darwin-launchd-process.log
             darwin-command-sandbox.log
+            darwin-launchd-socket.log
             ${{ runner.temp }}/darwin-coalition-proof.json
             ${{ runner.temp }}/darwin-launchd-process-evidence.json
             ${{ runner.temp }}/darwin-command-sandbox-evidence.json
@@ -1157,19 +1176,22 @@ jobs:
           architecture: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
       - run: npm ci --ignore-scripts
       - name: Verify same-container transport without host loopback authority
+        if: inputs.support_primitive != 'hermes'
         timeout-minutes: 8
         shell: bash
         run: |
           set -o pipefail
           node --test --test-reporter=tap tests/source/windows-appcontainer-internal-loopback.test.cjs 2>&1 | tee windows-internal-loopback.log
       - name: Verify inherited authenticated relay stdin through native AppContainer
+        if: ${{ !cancelled() && inputs.support_primitive != 'hermes' }}
         timeout-minutes: 8
         shell: bash
         run: |
           set -o pipefail
           node --test --test-reporter=tap tests/source/windows-appcontainer-relay-native.test.cjs 2>&1 | tee windows-relay-native.log
+          node --test --test-reporter=tap --test-name-pattern='native Windows named pipe' tests/source/harness-v2-grok-sandbox.test.cjs 2>&1 | tee grok-windows-relay.log
       - name: Acquire the pinned official Hermes Windows installation
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.support_primitive != 'relay' }}
         timeout-minutes: 25
         shell: pwsh
         run: |
@@ -1189,6 +1211,7 @@ jobs:
           path: |
             windows-internal-loopback.log
             windows-relay-native.log
+            grok-windows-relay.log
             hermes-windows-launcher.tap
             ${{ runner.temp }}/hermes-windows-launcher-evidence.json
             ${{ runner.temp }}/hermes-windows-0.21.1/official-installer.log
@@ -1246,6 +1269,8 @@ jobs:
         # Preserve native failure artifacts even when a provider/test cleanup
         # hangs; the job deadline must leave time for the always-upload step.
         timeout-minutes: 45
+        env:
+          AUTOPROMPT_CI_CAPABILITY: ${{ inputs.support_capability }}
         run: node tests/helpers/provider-platform-ci.cjs ${{ env.SUPPORT_PROVIDER }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

@@ -11,7 +11,7 @@ const path = require('node:path')
 const { PassThrough } = require('node:stream')
 const test = require('node:test')
 const { createModelProxy } = require('../../scripts/harness-v2-bridge/grok/model-proxy.cjs')
-const { createUnixRelay, createUnixRelayFetch, createPreconnectedRelayClient } = require('../../scripts/harness-v2-bridge/grok/unix-relay.cjs')
+const { createWindowsRelayPath, validateRelayAddress, createUnixRelay, createUnixRelayFetch, createPreconnectedRelayClient } = require('../../scripts/harness-v2-bridge/grok/unix-relay.cjs')
 const { createHostMcpRelay } = require('../../scripts/harness-v2-bridge/grok/host-mcp-relay.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { createSandboxLaunch, grokRuntime } = require('../../scripts/harness-v2-bridge/grok/sandbox-launch.cjs')
@@ -43,6 +43,27 @@ function ownedSse() {
   const event = { choices: [{ delta: { tool_calls: [{ index: 0, id: 'owned-1', type: 'function', function: { name: 'use_tool', arguments: JSON.stringify({ tool_name: 'autoprompt_owned__bash', tool_input: { command: 'pwd' } }) } }] } }] }
   return `data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`
 }
+
+test('Grok relay derives only collision-resistant authenticated Windows pipe names', () => {
+  const address = createWindowsRelayPath(length => Buffer.alloc(length, 0x5a))
+  assert.equal(address, `\\\\.\\pipe\\autoprompt-grok-${'5a'.repeat(32)}`)
+  assert.equal(validateRelayAddress(address, 'win32'), address)
+  for (const rejected of ['C:\\controller\\relay.sock', '\\\\.\\pipe\\foreign', `\\\\.\\pipe\\autoprompt-grok-${'a'.repeat(63)}`, `\\\\.\\pipe\\autoprompt-grok-${'A'.repeat(64)}`]) {
+    assert.throws(() => validateRelayAddress(rejected, 'win32'), { code: 'GROK_RELAY_CONFIG_INVALID' })
+  }
+  assert.equal(validateRelayAddress('/private/controller/relay.sock', 'linux'), '/private/controller/relay.sock')
+})
+
+test('Grok relay preserves authenticated framing over a native Windows named pipe', { skip: process.platform !== 'win32' }, async t => {
+  const token = relayToken(), socketPath = createWindowsRelayPath()
+  const relay = createUnixRelay({ socketPath, relayToken: token, upstreamUrl: 'http://unused.invalid', upstreamAuthorization: 'Bearer fixture',
+    fetchImpl: async () => new Response('windows-pipe-response', { status: 200, headers: { 'content-type': 'text/plain' } }) })
+  t.after(() => relay.close())
+  assert.equal(await relay.listen(), socketPath)
+  const request = createUnixRelayFetch({ socketPath, relayToken: token })
+  assert.equal(await (await request('relay://controller', { method: 'POST', headers: {}, body: '{}' })).text(), 'windows-pipe-response')
+  await assert.rejects(createUnixRelayFetch({ socketPath, relayToken: relayToken() })('relay://controller', { method: 'POST', headers: {}, body: '{}' }), { code: 'GROK_RELAY_AUTH_DENIED' })
+})
 
 // The host relay is the only component that accepts the provider credential. The
 // sandbox-visible proxy only receives the relay capability token.

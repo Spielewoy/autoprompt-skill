@@ -129,19 +129,24 @@ function createWindowsAppContainerLauncher(options = {}) {
         if (runtime.sha256 !== request.msysRuntime.dllSha256) fail('WINDOWS_RUNTIME_MISMATCH', 'Assigned MSYS runtime changed')
       }
       const compilerDirectory = createWindowsCompilerDirectory('autoprompt-launch-')
-      const relay = request.relayStdin === true
-      if (relay && (!options.relayStdin || typeof options.relayStdin.on !== 'function')) {
-        fs.rmSync(compilerDirectory, { recursive: true, force: true })
-        fail('WINDOWS_LAUNCH_INVALID', 'Relay stdin requires the authenticated inherited stream')
+      let relay, requestPath, requestBytes, requestSha256
+      try {
+        relay = request.relayStdin === true
+        if (relay && (!options.relayStdin || typeof options.relayStdin.on !== 'function')) {
+          fail('WINDOWS_LAUNCH_INVALID', 'Relay stdin requires the authenticated inherited stream')
+        }
+        requestPath = path.join(compilerDirectory, 'request.json')
+        requestBytes = Buffer.from(JSON.stringify(request))
+        if (relay) {
+          capture.assertRecordParent(requestPath)
+          fs.writeFileSync(requestPath, requestBytes, { flag: 'wx', mode: 0o600 })
+          if (boundFile(requestPath, 131072).sha256 !== digest(requestBytes)) fail('WINDOWS_RUNTIME_MISMATCH', 'Relay launch request changed')
+        }
+        requestSha256 = digest(requestBytes)
+      } catch (error) {
+        fs.rmSync(compilerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+        throw error
       }
-      const requestPath = path.join(compilerDirectory, 'request.json')
-      const requestBytes = Buffer.from(JSON.stringify(request))
-      if (relay) {
-        capture.assertRecordParent(requestPath)
-        fs.writeFileSync(requestPath, requestBytes, { flag: 'wx', mode: 0o600 })
-        if (boundFile(requestPath, 131072).sha256 !== digest(requestBytes)) fail('WINDOWS_RUNTIME_MISMATCH', 'Relay launch request changed')
-      }
-      const requestSha256 = digest(requestBytes)
       return new Promise((resolve, reject) => {
         startedLeases.add(options.leaseId)
         const child = cp.spawn(powershell.path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helper.path, '-NativeSha256', native.sha256, ...(relay ? ['-RequestPath', requestPath, '-RequestSha256', requestSha256] : ['-Request'])], {
