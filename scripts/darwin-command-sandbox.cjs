@@ -76,7 +76,7 @@ function renderSeatbeltProfile(policy, options = {}) {
   const reads = [...new Set(policy.readableRoots.map(physicalDirectory))]
   const writes = [...new Set(policy.writableRoots.map(physicalDirectory))]
   const metadata = new Set(['/', ...ancestors(node), ...ancestors(temp), ...reads.flatMap(ancestors), ...writes.flatMap(ancestors)])
-  const lines = ['(version 1)', '(deny default)',
+  const lines = ['(version 1)', options.reportDenials === true ? '(deny default (with report))' : '(deny default)',
     ...[...metadata].sort().map(item => `(allow file-read-metadata (literal ${quoted(item)}))`),
     // Node is launched directly. It may only exec the fixed POSIX shell and
     // this exact Node runtime; other programs, including launchctl, remain
@@ -157,7 +157,7 @@ function createDarwinCommandSandbox(options = {}) {
     if (!args || typeof args.command !== 'string' || !args.command.trim() || Buffer.byteLength(args.command) > 65536) fail('TOOL_ARGUMENTS_INVALID', 'A bounded nonempty command is required')
     if (runtime.signal?.aborted) fail('TOOL_CANCELLED', 'Darwin command was cancelled before launch')
     const cwd = physicalDirectory(args.cwd || (policy.readOnly ? policy.scratchPath : policy.targetPath))
-    const profile = renderSeatbeltProfile(policy, { nodePath: process.execPath, tempRoot })
+    const profile = renderSeatbeltProfile(policy, { nodePath: process.execPath, tempRoot, reportDenials: options.diagnosticProfile === true })
     const reservationId = runtime.reservationId || crypto.randomUUID(), sessionId = runtime.sessionId || crypto.randomUUID()
     const start = Date.now(), flags = { cancelled: false, timedOut: false, durationMs: () => Date.now() - start }
     const baseEnvironment = { PATH: path.dirname(process.execPath), HOME: tempRoot, TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot, LANG: 'C', LC_ALL: 'C' }
@@ -205,7 +205,7 @@ function createDarwinCommandSandbox(options = {}) {
       if (stopFailure) throw stopFailure
     }
   }
-  return Object.freeze({ backend: 'darwin-seatbelt-coalition', scope: 'initial-node-and-posix-shell-only', helper, sandboxBinding, controlRoot, tempRoot, processOwner, runner, renderSeatbeltProfile: policy => renderSeatbeltProfile(policy, { nodePath: process.execPath, tempRoot }), command })
+  return Object.freeze({ backend: 'darwin-seatbelt-coalition', scope: 'initial-node-and-posix-shell-only', helper, sandboxBinding, controlRoot, tempRoot, processOwner, runner, renderSeatbeltProfile: policy => renderSeatbeltProfile(policy, { nodePath: process.execPath, tempRoot, reportDenials: options.diagnosticProfile === true }), command })
 }
 
 module.exports = { DarwinCommandError, SYSTEM_SANDBOX_EXEC, OUTPUT_LIMIT, NODE_STARTUP_SYSCTLS, NODE_STARTUP_MACH_SERVICES, boundExecutable, renderSeatbeltProfile, createDarwinCommandSandbox }

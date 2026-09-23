@@ -1097,6 +1097,7 @@ jobs:
         run: |
           set -o pipefail
           export AUTOPROMPT_DARWIN_COMMAND_EVIDENCE_DIR="$RUNNER_TEMP"
+          export AUTOPROMPT_DARWIN_COMMAND_STARTUP_DIAGNOSTIC=1
           node --test --test-reporter=tap tests/source/darwin-command-sandbox.test.cjs 2>&1 | tee darwin-command-sandbox.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
