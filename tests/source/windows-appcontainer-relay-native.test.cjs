@@ -37,8 +37,8 @@ test('native AppContainer inherited relay stdin is duplex and leaves host networ
     const channel=new net.Socket({fd:0,readable:true,writable:true});let text='',phase=0;
     channel.on('error',e=>{process.stderr.write(String(e.stack));process.exitCode=5});
     channel.on('data',b=>{text+=b;for(;;){const n=text.indexOf('\\n');if(n<0)break;const line=text.slice(0,n);text=text.slice(n+1);
-      if(phase===0){assert.equal(line,${JSON.stringify(nonce)});phase=1;channel.write('ACK:'+line+'\\n')}
-      else{assert.equal(phase,1);assert.equal(line,'CONFIRMED');phase=2;const s=net.connect(${host.address().port},'127.0.0.1');
+      if(phase===0){assert.equal(line,${JSON.stringify(nonce)});phase=1;channel.write('ACK:'+line+'\\n');process.stdout.write('FIRST\\n')}
+      else{assert.equal(phase,1);assert.equal(line,'OUTPUT_ACK');phase=2;process.stdout.write('SECOND\\n');const s=net.connect(${host.address().port},'127.0.0.1');
         s.once('connect',()=>{s.destroy();process.exit(3)});s.once('error',e=>{assert.ok(['EACCES','EPERM','ETIMEDOUT'].includes(e.code),e.code);channel.end('DONE\\n');process.stdout.write('RELAY_PASS')})}
     }});`
   const deployment = require('../../agents/codex/workflow/windows-helper-deployment.js').stageWindowsHelperDeployment(control)
@@ -54,21 +54,26 @@ test('native AppContainer inherited relay stdin is duplex and leaves host networ
   let transcript = ''
   peer.on('data', bytes => {
     transcript += bytes
-    if (transcript === `ACK:${nonce}\n`) peer.write('CONFIRMED\n')
     if (transcript === `ACK:${nonce}\nDONE\n`) peer.end()
   })
+  let liveOutput = '', launchResolved = false
   const resultPromise = launcher.launch({ profileName: lease.profileName, profileSid: lease.profileSid,
     executable: node, executableSha256: crypto.createHash('sha256').update(fs.readFileSync(node)).digest('hex'),
     arguments: ['-e', workerSource], cwd: target, environment: Object.entries({ ...safe.windowsControllerEnvironment(process.env.SystemRoot), ...lease.environment, PATH: runtime }).map(([key, value]) => `${key}=${value}`),
-    timeoutMs: 60000, outputLimit: 65536, cancellationPath: path.join(deployment.root, 'cancel'), relayStdin: true },
-  { relayStdin: client, leaseId: lease.recovery.leaseId })
+    timeoutMs: 60000, outputLimit: 65536, cancellationPath: path.join(deployment.root, 'cancel'), relayStdin: true, streamOutput: true },
+  { relayStdin: client, leaseId: lease.recovery.leaseId, onStdout(bytes) {
+    assert.equal(launchResolved, false, 'live output arrived only after terminal completion')
+    liveOutput += bytes.toString()
+    if (liveOutput === 'FIRST\n') peer.write('OUTPUT_ACK\n')
+  } })
   // Only the peer writes. The inherited endpoint remains unread by the parent.
   peer.write(`${nonce}\n`)
   const result = await resultPromise
+  launchResolved = true
   await lease.release(result); released = true
   assert.equal(result.exitCode, 0, result.stderr.toString()); assert.equal(result.drained, true)
   assert.equal(result.profileSid, lease.profileSid)
-  assert.equal(result.stdout.toString(), 'RELAY_PASS')
+  assert.equal(result.stdout.toString(), 'FIRST\nSECOND\nRELAY_PASS'); assert.equal(liveOutput, result.stdout.toString())
   assert.equal(transcript, `ACK:${nonce}\nDONE\n`)
   assert.equal(accepted, 0); await baseline(); assert.equal(accepted, 1)
   t.diagnostic(JSON.stringify({ architecture: process.arch, duplexRelay: true, hostNetworkDenied: true, drained: result.drained, profileSid: result.profileSid }))

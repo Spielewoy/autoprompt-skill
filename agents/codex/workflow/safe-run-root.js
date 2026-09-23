@@ -160,15 +160,36 @@ function windowsTokenProfileFolders(systemRoot) {
     const script = [
       "$ErrorActionPreference='Stop'",
       '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)',
-      "$value=[ordered]@{profile=[Environment]::GetFolderPath('UserProfile');local=[Environment]::GetFolderPath('LocalApplicationData');roaming=[Environment]::GetFolderPath('ApplicationData')}",
+      `Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class AutopromptTokenProfile {
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr process,uint access,out IntPtr token);
+  [DllImport("userenv.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool GetUserProfileDirectory(IntPtr token,StringBuilder profile,ref uint length);
+  public static string Read() {
+    IntPtr token=IntPtr.Zero;
+    try {
+      if(!OpenProcessToken(GetCurrentProcess(),8,out token)) throw new InvalidOperationException("Token profile query failed");
+      var profile=new StringBuilder(32768); uint length=(uint)profile.Capacity;
+      if(!GetUserProfileDirectory(token,profile,ref length)||length==0||length>=profile.Capacity) throw new InvalidOperationException("Token profile path unavailable");
+      return profile.ToString();
+    } finally { if(token!=IntPtr.Zero) CloseHandle(token); }
+  }
+}
+'@`,
+      '$profile=[AutopromptTokenProfile]::Read()',
+      "$value=[ordered]@{profile=$profile;local=[IO.Path]::Combine($profile,'AppData','Local');roaming=[IO.Path]::Combine($profile,'AppData','Roaming')}",
       '[Console]::Out.Write(($value|ConvertTo-Json -Compress))',
     ].join(';')
     const result = spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
       encoding: 'utf8', windowsHide: true, shell: false, timeout: 30000, maxBuffer: 65536,
       stdio: ['ignore', 'pipe', 'pipe'], cwd: path.win32.dirname(powershell),
       // Do not project HOME, USERPROFILE, APPDATA or LOCALAPPDATA. The fixed
-      // .NET calls resolve known folders for the process token independently
-      // of a bundled runtime's Node-compatibility environment behavior.
+      // Read the process token explicitly. Shell known-folder helpers can
+      // expand an isolated profile from a bundled runtime's environment.
       env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32') },
     })
     if (result.error || result.signal || result.status !== 0 || result.stderr) {

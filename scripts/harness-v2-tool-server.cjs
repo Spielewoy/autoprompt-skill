@@ -70,7 +70,10 @@ function start(options) {
   const input = options.input || process.stdin, output = options.output || process.stdout
   const lockPath = path.join(state.root, 'server.lock')
   const lockBytes = JSON.stringify({ pid: process.pid, nonce: crypto.randomUUID(), policySha256: state.policySha256 })
-  fs.writeFileSync(lockPath, lockBytes, { flag: 'wx', mode: 0o600 })
+  const windowsLease = process.platform === 'win32'
+    ? require('./harness-v2-windows-tool-lease.cjs').createWindowsToolLease({ lockPath, lockBytes: Buffer.from(lockBytes) })
+    : null
+  if (!windowsLease) fs.writeFileSync(lockPath, lockBytes, { flag: 'wx', mode: 0o600 })
   const pending = new Map(), ids = new Set()
   const decoder = new StringDecoder('utf8')
   let buffer = '', chain = Promise.resolve(), initialized = false, ready = false, closing = false
@@ -78,14 +81,17 @@ function start(options) {
   const closed = new Promise(resolve => { resolveClosed = resolve })
   const send = value => { if (!output.destroyed && output.writable !== false) output.write(`${JSON.stringify(value)}\n`) }
   const error = (id, code, message, data) => send({ jsonrpc: '2.0', id, error: { code, message, ...(data ? { data } : {}) } })
-  const release = () => {
+  const release = async () => {
     input.removeListener('data', onData); input.removeListener('end', onEnd); input.removeListener('error', onError)
     output.removeListener('error', onError)
     try {
-      boundary.physical(lockPath)
-      if (fs.readFileSync(lockPath, 'utf8') === lockBytes) fs.unlinkSync(lockPath)
+      if (windowsLease) await windowsLease.release()
+      else {
+        boundary.physical(lockPath)
+        if (fs.readFileSync(lockPath, 'utf8') === lockBytes) fs.unlinkSync(lockPath)
+      }
     } catch { /* A changed lock remains for explicit inspection. */ }
-    resolveClosed()
+    finally { resolveClosed() }
   }
   function close() {
     if (closing) return closed
@@ -95,6 +101,7 @@ function start(options) {
     return closed
   }
   async function handle(request, controller) {
+    if (windowsLease) windowsLease.assertHeld()
     const id = request.id
     if (controller.signal.aborted) { error(id, -32800, 'Request cancelled'); return }
     if (request.method === 'initialize') {

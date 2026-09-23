@@ -124,9 +124,9 @@
     "skills/ap-work-group-manager/SKILL.md": "ba65fcda203d31532a38562b8fdf5a61de5925b9bf510d967d17703088ec8220",
     "skills/ap-worker/SKILL.md": "63436a1af7f21bb038bd060351465ec3f0d51499337c60df515b96ac32da192b",
     "workflow/admission.js": "c91a34a4fdd71e065ae88f06d0cdf67132521af5d6ccdc6cb7466239ff9148ee",
-    "workflow/native.js": "740bc9ba46a6611392c27f71dbe709bbacc36b9c98563893974b209009d0960d",
+    "workflow/native.js": "b4badbe294bad2d8d12794407818140810e16a4340144b32eea909996a28f160",
     "workflow/package-removal.js": "80fb09f041c6b774acbe365b3fdd7d787f73559afb132977f937391f2a8267db",
-    "workflow/transport.js": "0a1886d2abd2ec0c4b7d555211067b3ae52b05e503231ecba912e7d591dc3fca"
+    "workflow/transport.js": "849f5227e5c13d82e5465f8a0867484284d46ecb7504959b21816d5e9bc709c6"
   },
   "contractVersion": "2.0.0",
   "rolePolicy": "role-policy.json",

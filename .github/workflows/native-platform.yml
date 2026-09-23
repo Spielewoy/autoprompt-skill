@@ -11,7 +11,7 @@ on:
         required: false
         default: none
         type: choice
-        options: [none, macos-containment, windows-bootstrap, windows-provider-primitives, opencode, vscode, hermes-macos]
+        options: [none, macos-containment, macos-exclusive-fd, windows-bootstrap, windows-provider-primitives, opencode, opencode-public, vscode, vscode-diagnostic, hermes-macos]
       support_provider:
         description: 'Installed provider for the focused provider stage'
         required: false
@@ -25,11 +25,11 @@ on:
         type: choice
         options: [all, relay, hermes]
       support_capability:
-        description: 'Run all capabilities or a focused checker/cancellation diagnostic'
+        description: 'Run all capabilities or a focused isolation/checker/cancellation diagnostic'
         required: false
         default: all
         type: choice
-        options: [all, isolatedChecking, cancellation]
+        options: [all, isolation, isolatedChecking, cancellation]
       support_arm:
         description: 'Limit focused Windows provider verification to ARM64'
         required: false
@@ -1137,6 +1137,34 @@ jobs:
             ${{ runner.temp }}/darwin-coalition-helper
           if-no-files-found: error
 
+  macos-exclusive-fd:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'macos-exclusive-fd'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+      - name: Test OS retention of exclusive caller-created listeners
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo -n /sbin/ifconfig lo0 alias 127.0.0.2
+          trap 'sudo -n /sbin/ifconfig lo0 -alias 127.0.0.2' EXIT
+          node --test --test-reporter=tap tests/source/darwin-launchd-exclusive-fd-native.test.cjs 2>&1 | tee darwin-launchd-exclusive-fd.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: exclusive-fd-${{ matrix.os }}
+          path: darwin-launchd-exclusive-fd.log
+          if-no-files-found: error
+
   windows-bootstrap:
     if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'windows-bootstrap'
     strategy:
@@ -1170,7 +1198,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, windows-11-arm]
+        os: ${{ fromJSON(inputs.support_single == true && '["windows-latest"]' || inputs.support_arm == true && '["windows-11-arm"]' || '["windows-latest","windows-11-arm"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ inputs.support_primitive == 'hermes' && 90 || 40 }}
     steps:
@@ -1195,6 +1223,13 @@ jobs:
           set -o pipefail
           node --test --test-reporter=tap tests/source/windows-appcontainer-relay-native.test.cjs 2>&1 | tee windows-relay-native.log
           node --test --test-reporter=tap --test-name-pattern='native Windows named pipe' tests/source/harness-v2-grok-sandbox.test.cjs 2>&1 | tee grok-windows-relay.log
+      - name: Verify kernel lease release after normal close and forced Job termination
+        if: ${{ !cancelled() && inputs.support_primitive != 'hermes' }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/harness-v2-windows-tool-lease-native.test.cjs 2>&1 | tee windows-tool-lease-native.log
       - name: Acquire the pinned official Hermes Windows installation
         if: ${{ !cancelled() && inputs.support_primitive != 'relay' }}
         timeout-minutes: 25
@@ -1209,12 +1244,13 @@ jobs:
         run: |
           set -o pipefail
           node --test --test-reporter=tap tests/source/hermes-windows-launcher-native.test.cjs 2>&1 | tee hermes-windows-launcher.tap
-      - name: Exercise all native Hermes capabilities
+      - name: Exercise selected native Hermes capabilities
         if: ${{ inputs.support_primitive == 'hermes' && env.AUTOPROMPT_HERMES_WINDOWS_CLI != '' }}
         timeout-minutes: 45
         shell: bash
         env:
           AUTOPROMPT_HERMES_TEST_CLI: ${{ env.AUTOPROMPT_HERMES_WINDOWS_CLI }}
+          AUTOPROMPT_CI_CAPABILITY: ${{ inputs.support_capability }}
           AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1'
           AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
         run: node tests/helpers/provider-platform-ci.cjs hermes
@@ -1226,6 +1262,7 @@ jobs:
             windows-internal-loopback.log
             windows-relay-native.log
             grok-windows-relay.log
+            windows-tool-lease-native.log
             hermes-windows-launcher.tap
             native-hermes-evidence.json
             native-hermes-tests.log
@@ -1297,8 +1334,44 @@ jobs:
             native-${{ inputs.support_provider }}-tests.log
           if-no-files-found: error
 
+  opencode-public:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'opencode-public'
+    name: Public OpenCode / ${{ matrix.runner.os }} / Node 24
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.support_single == true && '[{"os":"windows-latest","arch":"x64"}]' || '[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}]') }}
+    runs-on: ${{ matrix.runner.os }}
+    timeout-minutes: 135
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+          architecture: ${{ matrix.runner.arch }}
+      - run: npm ci --ignore-scripts
+      - run: npm install --prefix .native-provider --no-package-lock --no-audit --no-fund opencode-ai@1.18.32
+      - name: Verify genuine npm launchers and packed public activation
+        timeout-minutes: 125
+        env:
+          AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1'
+          AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+        shell: pwsh
+        run: |
+          $env:AUTOPROMPT_OPENCODE_TEST_CLI = (Resolve-Path '.native-provider/node_modules/.bin/opencode.cmd').Path
+          node --test --test-concurrency=1 --test-reporter=tap tests/source/harness-v2-opencode-public-activation-windows.test.cjs *> public-opencode-tests.log
+          $result = $LASTEXITCODE
+          Get-Content public-opencode-tests.log
+          exit $result
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: public-opencode-${{ matrix.runner.os }}-node24
+          path: public-opencode-tests.log
+          if-no-files-found: error
+
   vscode-native-acquisition:
-    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'vscode'
+    if: github.event_name == 'workflow_dispatch' && (inputs.support_stage == 'vscode' || inputs.support_stage == 'vscode-diagnostic')
     name: VS Code 1.136.1 / ${{ matrix.runner.os }} / ${{ matrix.runner.arch }}
     strategy:
       fail-fast: false
@@ -1323,11 +1396,12 @@ jobs:
         shell: bash
         run: node tests/helpers/install-vscode-native-ci.cjs | tee vscode-native-acquisition.json
       - name: Diagnose bounded Windows VS Code bootstrap
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && inputs.support_stage == 'vscode-diagnostic'
         timeout-minutes: 8
         shell: bash
         run: node tests/helpers/vscode-windows-probe-diagnostic.cjs | tee vscode-windows-probe-diagnostic.json
       - name: Probe the native VS Code bundle and preserve identity
+        if: inputs.support_stage == 'vscode'
         shell: bash
         run: |
           node - <<'NODE' | tee vscode-native-probe.json
@@ -1339,6 +1413,7 @@ jobs:
           process.stdout.write(JSON.stringify({ executable, version: binding.version, runtimeIdentity: binding.runtimeIdentity }, null, 2) + '\n')
           NODE
       - name: Require all eleven native VS Code capabilities
+        if: inputs.support_stage == 'vscode'
         timeout-minutes: 45
         run: node tests/helpers/provider-platform-ci.cjs vscode
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -1379,9 +1454,11 @@ jobs:
         run: |
           set -o pipefail
           bash tests/helpers/install-hermes-macos-ci.sh "$RUNNER_TEMP/hermes-macos-0.21.1" | tee hermes-macos-acquisition.json
-      - name: Require all eleven native Hermes capabilities
+      - name: Require selected native Hermes capabilities
         timeout-minutes: 45
         shell: bash
+        env:
+          AUTOPROMPT_CI_CAPABILITY: ${{ inputs.support_capability }}
         run: node tests/helpers/provider-platform-ci.cjs hermes
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

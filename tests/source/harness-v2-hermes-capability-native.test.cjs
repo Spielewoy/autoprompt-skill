@@ -126,6 +126,31 @@ function hermesMessages(f) {
   assert.equal(result.status, 0, result.stderr)
   return JSON.parse(result.stdout)
 }
+function fixtureFailureDiagnostic(f, error) {
+  // Capture only fixture-owned protocol and proxy state before cleanup drains
+  // its private control directory. This is not an ambient log collection.
+  const output = {
+    fixtureFailure: String(error.code || error.message).slice(0, 1024),
+    details: error.details ? JSON.stringify(error.details).slice(0, 4096) : null,
+    requestCount: f.service?.requests.length || 0,
+    emittedToolNames: (f.service?.emittedToolNames || []).slice(0, 32).map(value => String(value).slice(0, 256)),
+    nativeStatus: f.nativeStatus || null,
+    proxyError: f.nativeProxyError || null,
+    stderr: String(f.nativeStderr || '').slice(-8192),
+    stdoutEvents: [...(f.nativeEvents || [])],
+  }
+  const proxy = path.join(f.controller, 'proxy')
+  output.proxy = []
+  for (const name of fs.existsSync(proxy) ? fs.readdirSync(proxy, { recursive: true }) : []) {
+    if (!/(?:^|[\\/])(?:stderr\.log|status\.json|proxy-error\.json)$/.test(name)) continue
+    const file = path.join(proxy, name), stat = fs.lstatSync(file)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) continue
+    output.proxy.push({ name, text: fs.readFileSync(file, 'utf8').slice(-4096) })
+    if (output.proxy.length >= 4) break
+  }
+  while (Buffer.byteLength(JSON.stringify(output)) > 65536 && output.stdoutEvents.length) output.stdoutEvents.shift()
+  console.error(JSON.stringify(output))
+}
 async function scenario(t, config = {}) {
   assert.ok(CLI, 'AUTOPROMPT_HERMES_TEST_CLI is required')
   const sandbox = await boundary.probeCommandSandbox(); assert.equal(sandbox.supported, true, JSON.stringify(sandbox))
@@ -146,12 +171,33 @@ async function scenario(t, config = {}) {
   const processAdapter = owner.adapter
   const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'hermes-closed-native-canary', pollMs: 10 })
+  const ownedRun = runner.run.bind(runner)
+  runner.run = async spec => {
+    f.nativeEvents = []; f.nativeStderr = ''; f.nativeStatus = null; f.nativeProxyError = null
+    try {
+      const result = await ownedRun({ ...spec, onStdoutLine: line => {
+        f.nativeEvents.push(String(line).slice(-8192))
+        if (f.nativeEvents.length > 16) f.nativeEvents.shift()
+        return spec.onStdoutLine?.(line)
+      } })
+      f.nativeStderr = result.stderr
+      f.nativeStatus = { status: result.status, signal: result.signal, stdoutByteCount: result.stdoutByteCount, stderrByteCount: result.stderrByteCount, codexPid: result.codexPid }
+      return result
+    } catch (error) {
+      let details = null
+      try { details = error.details === undefined ? null : JSON.stringify(error.details).slice(0, 2048) } catch { details = 'unserializable' }
+      f.nativeProxyError = { code: String(error.code || 'RUNTIME_FAILURE').slice(0, 96), message: String(error.message || error).replace(/[\r\n]+/g, ' ').slice(0, 512), details }
+      throw error
+    }
+  }
   const adapter = new HarnessExecAdapter({ provider: 'hermes', runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: { model: 'fixture/model', modelProvider: 'custom', environment: { HERMES_BASE_URL: 'http://127.0.0.1:' + service.port + '/v1' } }, credentialEnvironment: { OPENROUTER_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only assigned controller tools and return one JSON object.' })
   const run = async (overrides = {}) => {
     const record = { ...f.record, ...overrides }
     record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, { ...nativeEnvironment(), PATH: path.dirname(CLI) + path.delimiter + (process.env.PATH || ''), LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' })
     record.signal = overrides.signal || AbortSignal.timeout(120000)
-    const result = await adapter.launch(record)
+    let result
+    try { result = await adapter.launch(record) }
+    catch (error) { try { fixtureFailureDiagnostic({ ...f, service }, error) } catch {} throw error }
     assert.ok(service.requests.some(request => JSON.stringify(request.messages).includes('CLOSED_CANARY_CHALLENGE:' + f.challenge)), 'actual Hermes controller output omitted canary challenge')
     return result
   }

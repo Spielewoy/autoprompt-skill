@@ -40,7 +40,14 @@ const CONFORMANCE_ASSETS = Object.freeze([
   'tests/helpers/native-platform.cjs',
 ])
 const HASH = /^[a-f0-9]{64}$/
+const DARWIN_EXECUTABLES = new Set([
+  'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-x64',
+  'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-arm64',
+])
 function fail(code, message) { throw new PackageError(code, message) }
+function setPackagedMode(relative, target) {
+  if (process.platform !== 'win32' && DARWIN_EXECUTABLES.has(relative)) fs.chmodSync(target, 0o700)
+}
 function providerCheck(provider) { if (!PROVIDERS.includes(provider)) fail('INVALID_INPUT', `Unknown v2 provider: ${provider}`); return provider }
 function exists(file) { try { fs.lstatSync(file); return true } catch (error) { if (error.code === 'ENOENT') return false; throw error } }
 function absoluteRoot(root) {
@@ -346,7 +353,8 @@ function install(provider, root, sourceRoot = ROOT) {
       for (const [file, hash] of Object.entries(receipt.files)) {
         const bytes = readBound(sourcePath(sourceRoot, file))
         if (sha256(bytes) !== hash) fail('PAYLOAD_INVALID', 'Source changed during installation')
-        tx.put(`bundle/${file}`, bytes)
+        const staged = tx.put(`bundle/${file}`, bytes)
+        setPackagedMode(file, staged)
       }
       tx.put('bundle/package.json', bundleMetadata(provider))
       const stagedReceipt = tx.put('receipt.json', `${JSON.stringify(receipt, null, 2)}\n`)

@@ -208,6 +208,10 @@ function vscodeReleaseCliCandidates(root) {
 }
 function vscodeBundleRoot(executable) {
   for (let dir = path.resolve(executable), i = 0; i < 8; dir = path.dirname(dir), i++) {
+    // On a case-insensitive macOS volume, Contents/resources also resolves
+    // Contents/Resources. Do not mistake that directory for a Linux bundle:
+    // its canonical CLI path and framework boundary belong to the .app root.
+    if (path.basename(dir) === 'Contents' && path.basename(path.dirname(dir)).endsWith('.app')) continue
     const app = path.join(dir, 'resources', 'app')
     if (fs.existsSync(path.join(app, 'product.json')) && fs.existsSync(path.join(app, 'package.json'))) return fs.realpathSync.native(dir)
     if (path.basename(dir).endsWith('.app') && fs.existsSync(path.join(dir, 'Contents', 'Resources', 'app', 'product.json')) && fs.existsSync(path.join(dir, 'Contents', 'Resources', 'app', 'package.json'))) return fs.realpathSync.native(dir)

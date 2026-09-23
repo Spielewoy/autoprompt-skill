@@ -31907,7 +31907,7 @@ function createDefaultRuntimeOptions(input) {
           throw new SupervisorIntegrationError('PROCESS_OWNER_CONFIG_INVALID', 'Darwin command recovery requires the activation-bound native root and provider')
         }
         if (fs.existsSync(nativeRoot)) {
-          const discovery = require('../../../scripts/harness-v2-command-owner-discovery.cjs')
+          const discovery = require('./command-owner-discovery.js')
           for (const recoveryGeneration of generation > 1 ? [generation - 1, generation] : [generation]) {
             const binding = { provider, activationId: activation.runId, generation: recoveryGeneration }
             const registryRoot = discovery.createDiscoveryRoot(nativeRoot, binding)

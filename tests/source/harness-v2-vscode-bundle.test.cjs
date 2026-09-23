@@ -45,6 +45,30 @@ test('VS Code macOS bundle lookup binds the released Code executable', t => {
   assert.equal(binding.path, fs.realpathSync.native(f.code))
 })
 
+test('VS Code macOS probe uses the canonical app CLI when lowercase resources also resolves', t => {
+  const f = appFixture(t)
+  const contents = path.join(f.app, 'Contents')
+  const alias = path.join(contents, 'resources')
+  // Reproduce a case-insensitive macOS lookup on case-sensitive test hosts.
+  if (!fs.existsSync(alias)) fs.symlinkSync('Resources', alias)
+  const cli = path.join(contents, 'Resources', 'app', 'out', 'cli.js')
+  fs.mkdirSync(path.dirname(cli), { recursive: true })
+  fs.writeFileSync(cli, 'cli')
+  assert.equal(native.vscodeCliPath(f.code), cli)
+  const calls = []
+  const binding = native.probeExecutable({ provider: 'vscode', executable: f.code, spawnSync(executable, argv, options) {
+    calls.push({ executable, argv, env: options.env })
+    return { status: 0, signal: null, stdout: argv.includes('--version') ? '1.136.1\n' : '--list-extensions --extensions-dir --user-data-dir\n', stderr: '' }
+  } })
+  assert.equal(binding.version, '1.136.1')
+  assert.equal(calls.length, 2)
+  for (const call of calls) {
+    assert.equal(call.executable, f.code)
+    assert.equal(call.argv[0], cli)
+    assert.equal(call.env.ELECTRON_RUN_AS_NODE, '1')
+  }
+})
+
 test('VS Code framework link targets are bound and retargeting changes both identities', t => {
   const f = appFixture(t)
   const runtimeBefore = native.runtimeDependencyIdentity(f.code)

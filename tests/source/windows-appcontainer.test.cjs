@@ -4,9 +4,10 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const cp = require('node:child_process')
+const crypto = require('node:crypto')
 const vm = require('node:vm')
 const { createRequire } = require('node:module')
-const { validateLaunch, parseResult, createWindowsAppContainerLauncher } = require('../../agents/codex/workflow/windows-appcontainer.js')
+const { validateLaunch, parseResult, createStreamingResultParser, createWindowsAppContainerLauncher } = require('../../agents/codex/workflow/windows-appcontainer.js')
 const launch = () => ({ profileName: 'Autoprompt_' + 'a'.repeat(32), profileSid: 'S-1-15-2-1-2-3-4-5-6-7', executable: 'C:\\runtime\\node.exe', executableSha256: 'b'.repeat(64),
   arguments: ['--preserve-symlinks', '--preserve-symlinks-main', 'C:\\runtime\\entry.cjs'], cwd: 'C:\\task', environment: ['SystemRoot=C:\\Windows'], timeoutMs: 1000, outputLimit: 1024, cancellationPath: 'C:\\controller\\cancel' })
 const result = () => ({ schemaVersion: 1, status: 'COMPLETED', result: { RootPid: 12, ExitCode: 0, ObservedJobMembers: 2, LauncherSessionId: 1, AppContainerSid: launch().profileSid,
@@ -40,6 +41,42 @@ test('AppContainer output remains canonical and bounded after native execution',
     assert.throws(() => parseResult(JSON.stringify(wire), launch()), { code: 'WINDOWS_LAUNCH_PROTOCOL' })
   }
   assert.throws(() => parseResult(JSON.stringify({ schemaVersion: 1, status: 'REFUSED', code: 'APPCONTAINER_CLEANUP_UNCONFIRMED' }), launch()), { code: 'APPCONTAINER_CLEANUP_UNCONFIRMED' })
+})
+function streamedFinal(stdout, stderr = Buffer.alloc(0)) {
+  return { schemaVersion: 2, status: 'COMPLETED', result: { ...result().result,
+    StdoutBase64: stdout.toString('base64'), StderrBase64: stderr.toString('base64'),
+    StdoutBytes: stdout.length, StderrBytes: stderr.length, StdoutChunks: stdout.length ? 1 : 0, StderrChunks: stderr.length ? 1 : 0,
+    StdoutSha256: crypto.createHash('sha256').update(stdout).digest('hex'), StderrSha256: crypto.createHash('sha256').update(stderr).digest('hex') } }
+}
+const frame = (sequence, stream, bytes) => JSON.stringify({ schemaVersion: 2, status: 'STREAM', stream, sequence, dataBase64: bytes.toString('base64') }) + '\n'
+test('AppContainer streaming validates ordered live bytes against its drained terminal receipt', () => {
+  const expected = { ...launch(), streamOutput: true }, observed = []
+  const parser = createStreamingResultParser(expected, { onStdout(bytes, metadata) { observed.push([metadata.sequence, bytes.toString()]) } })
+  const stdout = Buffer.from('FIRST\n'), stderr = Buffer.from('note\n')
+  const wire = Buffer.from(frame(1, 'stdout', stdout) + frame(2, 'stderr', stderr) + JSON.stringify(streamedFinal(stdout, stderr)) + '\n')
+  parser.push(wire.subarray(0, 17)); parser.push(wire.subarray(17))
+  const parsed = parser.finish()
+  assert.deepEqual(observed, [[1, 'FIRST\n']]); assert.deepEqual(parsed.stdout, stdout); assert.deepEqual(parsed.stderr, stderr); assert.equal(parsed.drained, true)
+})
+test('AppContainer streaming rejects sequence, base64, receipt and post-terminal drift', () => {
+  const expected = { ...launch(), streamOutput: true }, stdout = Buffer.from('FIRST\n')
+  const attempt = lines => { const parser = createStreamingResultParser(expected); for (const line of lines) parser.push(Buffer.from(line)); return parser }
+  assert.throws(() => attempt([frame(2, 'stdout', stdout)]), { code: 'WINDOWS_LAUNCH_PROTOCOL' })
+  assert.throws(() => attempt([JSON.stringify({ schemaVersion: 2, status: 'STREAM', stream: 'stdout', sequence: 1, dataBase64: 'ZA' }) + '\n']), { code: 'WINDOWS_LAUNCH_PROTOCOL' })
+  const wrong = streamedFinal(stdout); wrong.result.StdoutSha256 = '0'.repeat(64)
+  assert.throws(() => attempt([frame(1, 'stdout', stdout), JSON.stringify(wrong) + '\n']).finish(), { code: 'WINDOWS_LAUNCH_PROTOCOL' })
+  const complete = JSON.stringify(streamedFinal(Buffer.alloc(0))) + '\n'
+  assert.throws(() => attempt([complete, frame(1, 'stdout', stdout)]), { code: 'WINDOWS_LAUNCH_PROTOCOL' })
+  assert.throws(() => { const parser = createStreamingResultParser(expected, { onStdout() { return Promise.resolve() } }); parser.push(Buffer.from(frame(1, 'stdout', stdout))) }, { code: 'WINDOWS_LAUNCH_INVALID' })
+})
+test('AppContainer streaming enforces the combined output limit before live delivery', () => {
+  const delivered = []
+  const parser = createStreamingResultParser({ ...launch(), outputLimit: 5, streamOutput: true }, {
+    onStdout(bytes) { delivered.push(bytes.toString()) }, onStderr(bytes) { delivered.push(bytes.toString()) },
+  })
+  parser.push(Buffer.from(frame(1, 'stdout', Buffer.from('four'))))
+  assert.throws(() => parser.push(Buffer.from(frame(2, 'stderr', Buffer.from('no')))), { code: 'WINDOWS_LAUNCH_PROTOCOL' })
+  assert.deepEqual(delivered, ['four'])
 })
 test('AppContainer runtime is never advertised on other operating systems', { skip: process.platform === 'win32' }, () => {
   assert.throws(() => createWindowsAppContainerLauncher(), { code: 'COMMAND_SANDBOX_UNSUPPORTED' })
@@ -245,7 +282,9 @@ test('bundled Bun resolves Windows token folders without trusting isolated profi
     env: { HOME: windowsFixturePath(hostile), USERPROFILE: windowsFixturePath(hostile), APPDATA: windowsFixturePath(hostile), LOCALAPPDATA: windowsFixturePath(hostile) } })
   const environment = safe.windowsControllerEnvironment('C:\\Windows')
   assert.equal(query.file, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
-  assert.match(query.argv.at(-1), /GetFolderPath\('UserProfile'\)/)
+  assert.match(query.argv.at(-1), /GetUserProfileDirectory\(token,profile,ref length\)/)
+  assert.match(query.argv.at(-1), /OpenProcessToken\(GetCurrentProcess\(\),8,out token\)/)
+  assert.doesNotMatch(query.argv.at(-1), /GetFolderPath/)
   assert.deepEqual({ ...query.options.env }, { SystemRoot: 'C:\\Windows', WINDIR: 'C:\\Windows', SystemDrive: 'C:', PATH: 'C:\\Windows\\System32' })
   assert.equal(environment.USERPROFILE, windowsFixturePath(profile))
   assert.equal(environment.HOME, windowsFixturePath(profile))

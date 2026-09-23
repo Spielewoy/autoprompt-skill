@@ -474,6 +474,20 @@ function codexWorkerAssets(root){
  return CODEX_WINDOWS_WORKER_ASSETS.map(file=>'workflow/windows-worker/'+file)
 }
 
+const CODEX_DARWIN_EXECUTABLES = Object.freeze(['coalition-helper-arm64', 'coalition-helper-x64'])
+function codexDarwinAssets(workflowDirectory) {
+  const runtime = path.join(workflowDirectory, 'darwin-coalition-runtime')
+  const expected = [...CODEX_DARWIN_EXECUTABLES, 'manifest.json'].sort()
+  if (JSON.stringify(fs.readdirSync(runtime).sort()) !== JSON.stringify(expected)) {
+    throw new Error('Darwin coalition runtime must contain exactly its declared helper files')
+  }
+  // The loader checks both architectures, exact binary/source hashes, Mach-O
+  // headers, deployment target, and physical paths before packaging any bytes.
+  require('../agents/codex/workflow/darwin-coalition-loader.js').validateDarwinCoalitionRuntime(
+    runtime, 'x64', path.join(workflowDirectory, 'darwin-coalition-helper.c'))
+  return ['workflow/darwin-coalition-helper.c', ...expected.map(file => `workflow/darwin-coalition-runtime/${file}`)]
+}
+
 function codexRuntimeFiles(root = ROOT) {
   const { loadCodexV2Contracts } = require('./generate-provider-contracts.cjs')
   const contracts = loadCodexV2Contracts(root)
@@ -495,6 +509,7 @@ function codexRuntimeFiles(root = ROOT) {
     .map(entry => `workflow/${entry.name}`)
   files.push(...workflow)
   files.push(...codexWorkerAssets(path.join(workflowDirectory, 'windows-worker')))
+  files.push(...codexDarwinAssets(workflowDirectory))
 
   const sorted = [...new Set(files)].sort()
   assertCodexSourceClosure(root, sorted)
@@ -897,7 +912,10 @@ function installationPlan(provider, destination, root = ROOT) {
       validateRelativePath(site.requiredFrom)
       if (site.kind === 'runtime-require' || site.kind === 'runtime-path-resolution' ||
           site.kind === 'dynamic-runtime-require' || !site.kind) {
-        const requiringFile = path.join(layout.skillRoot, ...site.requiredFrom.split('/'))
+        const requiringDependency = (manifest.externalDependencies || []).find(candidate => candidate.source === site.requiredFrom)
+        const requiringFile = requiringDependency
+          ? path.join(dependencyRoot, ...requiringDependency.destination.split('/'))
+          : path.join(layout.skillRoot, ...site.requiredFrom.split('/'))
         const resolvedRequest = path.resolve(path.dirname(requiringFile), site.runtimeRequest)
         if (!sameFilesystemPath(resolvedRequest, target)) {
           throw new Error(`external runtime destination does not satisfy ${site.requiredFrom}: ${dependency.destination}`)
@@ -1157,6 +1175,8 @@ function installPayload(provider, destination, root = ROOT) {
   for (const item of plan.files) {
     assertRegularUnlinked(item.source, `${item.kind} source`)
     assertDirectoryChainUnlinked(plan.activationRoot, path.dirname(item.target), true)
+    const executable = provider === 'codex' && CODEX_DARWIN_EXECUTABLES.some(name =>
+      path.relative(path.join(root, 'agents', 'codex'), item.source) === path.join('workflow', 'darwin-coalition-runtime', name))
     if (fs.existsSync(item.target)) {
       const targetStats = fs.lstatSync(item.target)
       if (!targetStats.isFile() || targetStats.isSymbolicLink() || targetStats.nlink !== 1) {
@@ -1166,11 +1186,16 @@ function installPayload(provider, destination, root = ROOT) {
         if (payloadSha256(provider, item.target) !== item.sha256) {
           throw new Error(`immutable Codex bundle drift: ${item.receiptPath}`)
         }
+        if (executable && process.platform !== 'win32') {
+          fs.chmodSync(path.dirname(item.target), 0o700)
+          fs.chmodSync(item.target, 0o700)
+        }
         continue
       }
     }
     const temporary = `${item.target}.tmp-${process.pid}`
-    fs.writeFileSync(temporary, payloadBytes(provider, item.source), { flag: 'wx' })
+    if (executable && process.platform !== 'win32') fs.chmodSync(path.dirname(item.target), 0o700)
+    fs.writeFileSync(temporary, payloadBytes(provider, item.source), { flag: 'wx', ...(executable ? { mode: 0o700 } : {}) })
     try {
       fs.renameSync(temporary, item.target)
     } catch (error) {
@@ -1423,6 +1448,7 @@ module.exports = {
   assertCodexSourceClosure,
   codexRoleProjection,
   codexRuntimeFiles,
+  codexDarwinAssets,
   codexPayloadDigest,
   codexPayloadClosureDigest,
   deriveCodexDeployCore,

@@ -480,6 +480,12 @@ test('Codex installs and verifies as a complete isolated payload', () => {
         provider,
       })
       if (provider === 'codex') {
+        if (process.platform !== 'win32') for (const arch of ['x64', 'arm64']) {
+          const helper = plan.files.find(item => item.target.endsWith(`${path.sep}darwin-coalition-runtime${path.sep}coalition-helper-${arch}`))
+          assert.ok(helper, `packaged Darwin ${arch} helper is installed`)
+          assert.equal(fs.statSync(helper.target).mode & 0o777, 0o700)
+          assert.equal(fs.statSync(path.dirname(helper.target)).mode & 0o777, 0o700)
+        }
         assert.equal(plan.files.filter(item => item.kind === 'external-runtime').length, CODEX_EXTERNAL_RUNTIME_DEPENDENCIES.length)
         assert.deepEqual(
           plan.files.filter(item => item.kind === 'external-runtime')
@@ -499,6 +505,12 @@ test('Codex installs and verifies as a complete isolated payload', () => {
           `codex-v${manifest.contractVersion}-${manifest.payloadDigest.slice(0, 16)}`,
         )
         assert.equal(plan.payloadDigest, manifest.payloadDigest)
+        if (process.platform !== 'win32') {
+          const helper = plan.files.find(item => item.target.endsWith(`${path.sep}coalition-helper-x64`))
+          fs.chmodSync(helper.target, 0o600)
+          installPayload(provider, destination, ROOT)
+          assert.equal(fs.statSync(helper.target).mode & 0o777, 0o700, 'reinstall restores the verified native helper executable mode')
+        }
       } else {
         assert.equal(plan.files.length, manifest.files.length)
       }

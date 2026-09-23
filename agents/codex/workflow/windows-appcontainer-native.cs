@@ -64,7 +64,7 @@ public static class WindowsAppContainerNative {
  [DllImport("kernel32.dll",SetLastError=true)] static extern bool UpdateProcThreadAttribute(IntPtr list,UInt32 flags,IntPtr attribute,IntPtr value,IntPtr size,IntPtr previous,IntPtr returned);
  [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr list);
  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool CreateProcess(String app,StringBuilder command,IntPtr processAttributes,IntPtr threadAttributes,bool inheritHandles,UInt32 flags,IntPtr environment,String cwd,ref STARTUPINFOEX startup,out PROCESS_INFORMATION information);
- public sealed class LaunchResult { public UInt32 RootPid,ExitCode; public Int32 ObservedJobMembers,LauncherSessionId; public String AppContainerSid,StdoutBase64,StderrBase64; public Boolean RootImageMatches,Drained,TimedOut,OutputLimit,Cancelled; }
+ public sealed class LaunchResult { public UInt32 RootPid,ExitCode; public Int32 ObservedJobMembers,LauncherSessionId,StdoutBytes,StderrBytes,StdoutChunks,StderrChunks; public String AppContainerSid,StdoutBase64,StderrBase64,StdoutSha256,StderrSha256; public Boolean RootImageMatches,Drained,TimedOut,OutputLimit,Cancelled; }
  [StructLayout(LayoutKind.Sequential)] struct UNICODE_STRING { public UInt16 Length,MaximumLength; public IntPtr Buffer; }
  [StructLayout(LayoutKind.Sequential)] struct OBJECT_ATTRIBUTES { public Int32 Length; public IntPtr RootDirectory,ObjectName; public UInt32 Attributes; public IntPtr SecurityDescriptor,SecurityQualityOfService; }
  [DllImport("ntdll.dll")] static extern Int32 NtCreateDirectoryObject(out IntPtr handle,UInt32 access,ref OBJECT_ATTRIBUTES attributes);
@@ -254,9 +254,9 @@ public static class WindowsAppContainerNative {
   ValidateEnvironmentEntries(entries,65);
   return Marshal.StringToHGlobalUni(String.Join("\0",entries.OrderBy(x=>x,StringComparer.OrdinalIgnoreCase))+"\0\0");
  }
- static Boolean ReadOutput(IntPtr pipe,MemoryStream output,ref Int32 total,Int32 bound) {
+ static Boolean ReadOutput(IntPtr pipe,String stream,MemoryStream output,HashAlgorithm hash,Action<String,Byte[]> callback,ref Int32 total,ref Int32 chunks,Int32 bound) {
   for(;;){UInt32 available;if(!PeekNamedPipe(pipe,IntPtr.Zero,0,IntPtr.Zero,out available,IntPtr.Zero)){if(Marshal.GetLastWin32Error()==ERROR_BROKEN_PIPE)return true;throw new Win32Exception(Marshal.GetLastWin32Error(),"PeekNamedPipe");}if(available==0)return true;
-   UInt32 count=Math.Min(available,4096u);byte[] bytes=new byte[count];UInt32 read;if(!ReadFile(pipe,bytes,count,out read,IntPtr.Zero)){if(Marshal.GetLastWin32Error()==ERROR_BROKEN_PIPE)return true;throw new Win32Exception(Marshal.GetLastWin32Error(),"ReadFile");}if(total+(long)read>bound)return false;output.Write(bytes,0,(int)read);total+=(int)read;
+   UInt32 count=Math.Min(available,4096u);byte[] bytes=new byte[count];UInt32 read;if(!ReadFile(pipe,bytes,count,out read,IntPtr.Zero)){if(Marshal.GetLastWin32Error()==ERROR_BROKEN_PIPE)return true;throw new Win32Exception(Marshal.GetLastWin32Error(),"ReadFile");}if(total+(long)read>bound)return false;if(read==0)continue;if(read!=bytes.Length)Array.Resize(ref bytes,(Int32)read);output.Write(bytes,0,(int)read);hash.TransformBlock(bytes,0,(Int32)read,null,0);total+=(int)read;chunks++;if(callback!=null)callback(stream,bytes);
   }
  }
  // CreateProcess requires LOCALAPPDATA in both the controller and explicit
@@ -282,6 +282,9 @@ public static class WindowsAppContainerNative {
   return Launch(executable,executableSha256,arguments,cwd,environmentEntries,timeoutMs,outputLimit,appSid,expectedSid,cancellationPath,msysRuntime,false);
  }
  public static LaunchResult Launch(String executable,String executableSha256,String[] arguments,String cwd,String[] environmentEntries,Int32 timeoutMs,Int32 outputLimit,IntPtr appSid,String expectedSid,String cancellationPath,MsysNamespaceRequest msysRuntime,Boolean relayStdin) {
+  return Launch(executable,executableSha256,arguments,cwd,environmentEntries,timeoutMs,outputLimit,appSid,expectedSid,cancellationPath,msysRuntime,relayStdin,null);
+ }
+ public static LaunchResult Launch(String executable,String executableSha256,String[] arguments,String cwd,String[] environmentEntries,Int32 timeoutMs,Int32 outputLimit,IntPtr appSid,String expectedSid,String cancellationPath,MsysNamespaceRequest msysRuntime,Boolean relayStdin,Action<String,Byte[]> outputCallback) {
   lock(undrainedNamespaces){if(undrainedNamespaces.Count!=0)throw new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED");}
   if(arguments==null||arguments.Length>256||arguments.Any(x=>x==null||x.IndexOf('\0')>=0)||timeoutMs<1||timeoutMs>300000||outputLimit<1||outputLimit>1048576||Sid(appSid)!=expectedSid)throw new InvalidOperationException("WINDOWS_LAUNCH_INVALID");
   environmentEntries=PrepareControllerProfileEnvironment(environmentEntries);
@@ -304,14 +307,15 @@ public static class WindowsAppContainerNative {
    confirmedDrain=false;
    Check(CloseHandle(stdoutWrite),"stdout-close-parent-write");stdoutWrite=IntPtr.Zero;Check(CloseHandle(stderrWrite),"stderr-close-parent-write");stderrWrite=IntPtr.Zero;Check(CloseHandle(nulRead),"stdin-close-parent-read");nulRead=IntPtr.Zero;Check(CloseHandle(privateNull),"private-nul-close-parent");privateNull=IntPtr.Zero;
    Check(AssignProcessToJobObject(job,pi.hProcess),"AssignProcessToJobObject");assigned=true;VerifyAppContainerTokenAndJob(pi.hProcess,expectedSid,job,true);VerifyRootImage(pi.hProcess,imageBinding);if(namespaceLease!=null)VerifyMsysAslr(pi.hProcess);if((String.IsNullOrEmpty(cancellationPath)||!File.Exists(cancellationPath))&&ResumeThread(pi.hThread)==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error(),"ResumeThread");CloseHandle(pi.hThread);pi.hThread=IntPtr.Zero;
-   using(var stdout=new MemoryStream())using(var stderr=new MemoryStream()){
-    var clock=Stopwatch.StartNew();int total=0,members=1;bool timedOut=false,limited=false,cancelled=false;
-    for(;;){if(!String.IsNullOrEmpty(cancellationPath)&&File.Exists(cancellationPath)){cancelled=true;break;}if(!ReadOutput(stdoutRead,stdout,ref total,outputLimit)||!ReadOutput(stderrRead,stderr,ref total,outputLimit)){limited=true;break;}uint wait=WaitForSingleObject(pi.hProcess,0);if(wait==0)break;if(wait==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error(),"WaitForSingleObject");if(clock.ElapsedMilliseconds>=timeoutMs){timedOut=true;break;}members=Math.Max(members,VerifyMembers(job,expectedSid));System.Threading.Thread.Sleep(25);}
+   using(var stdout=new MemoryStream())using(var stderr=new MemoryStream())using(var stdoutHash=SHA256.Create())using(var stderrHash=SHA256.Create()){
+    var clock=Stopwatch.StartNew();int total=0,members=1,stdoutChunks=0,stderrChunks=0;bool timedOut=false,limited=false,cancelled=false;
+    for(;;){if(!String.IsNullOrEmpty(cancellationPath)&&File.Exists(cancellationPath)){cancelled=true;break;}if(!ReadOutput(stdoutRead,"stdout",stdout,stdoutHash,outputCallback,ref total,ref stdoutChunks,outputLimit)||!ReadOutput(stderrRead,"stderr",stderr,stderrHash,outputCallback,ref total,ref stderrChunks,outputLimit)){limited=true;break;}uint wait=WaitForSingleObject(pi.hProcess,0);if(wait==0)break;if(wait==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error(),"WaitForSingleObject");if(clock.ElapsedMilliseconds>=timeoutMs){timedOut=true;break;}members=Math.Max(members,VerifyMembers(job,expectedSid));System.Threading.Thread.Sleep(25);}
     // Root exit never transfers detached descendants to the host. Terminate and
     // positively drain the entire owned job before returning any result.
     if(Active(job)>0)Check(TerminateJobObject(job,125),"TerminateJobObject");if(!Drain(job,5000))throw new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED");confirmedDrain=true;
-    if(!ReadOutput(stdoutRead,stdout,ref total,outputLimit)||!ReadOutput(stderrRead,stderr,ref total,outputLimit))limited=true;
-    UInt32 exit;Check(GetExitCodeProcess(pi.hProcess,out exit),"GetExitCodeProcess");return new LaunchResult{RootPid=pi.dwProcessId,ExitCode=exit,ObservedJobMembers=members,LauncherSessionId=Process.GetCurrentProcess().SessionId,AppContainerSid=expectedSid,RootImageMatches=true,Drained=true,TimedOut=timedOut,OutputLimit=limited,Cancelled=cancelled,StdoutBase64=Convert.ToBase64String(stdout.ToArray()),StderrBase64=Convert.ToBase64String(stderr.ToArray())};
+    if(!ReadOutput(stdoutRead,"stdout",stdout,stdoutHash,outputCallback,ref total,ref stdoutChunks,outputLimit)||!ReadOutput(stderrRead,"stderr",stderr,stderrHash,outputCallback,ref total,ref stderrChunks,outputLimit))limited=true;
+    stdoutHash.TransformFinalBlock(new Byte[0],0,0);stderrHash.TransformFinalBlock(new Byte[0],0,0);Byte[] stdoutBytes=stdout.ToArray(),stderrBytes=stderr.ToArray();
+    UInt32 exit;Check(GetExitCodeProcess(pi.hProcess,out exit),"GetExitCodeProcess");return new LaunchResult{RootPid=pi.dwProcessId,ExitCode=exit,ObservedJobMembers=members,LauncherSessionId=Process.GetCurrentProcess().SessionId,AppContainerSid=expectedSid,RootImageMatches=true,Drained=true,TimedOut=timedOut,OutputLimit=limited,Cancelled=cancelled,StdoutBase64=Convert.ToBase64String(stdoutBytes),StderrBase64=Convert.ToBase64String(stderrBytes),StdoutBytes=stdoutBytes.Length,StderrBytes=stderrBytes.Length,StdoutChunks=stdoutChunks,StderrChunks=stderrChunks,StdoutSha256=String.Concat(stdoutHash.Hash.Select(b=>b.ToString("x2"))),StderrSha256=String.Concat(stderrHash.Hash.Select(b=>b.ToString("x2")))};
    }
   } catch {
    bool drained=true;if(assigned&&job!=IntPtr.Zero){try{if(Active(job)>0&&!TerminateJobObject(job,125))drained=false;if(!Drain(job,5000))drained=false;}catch{drained=false;}}else if(pi.hProcess!=IntPtr.Zero){try{if(!TerminateProcess(pi.hProcess,125)||WaitForSingleObject(pi.hProcess,5000)!=0)drained=false;}catch{drained=false;}}confirmedDrain=drained;if(!drained)throw new InvalidOperationException("APPCONTAINER_CLEANUP_UNCONFIRMED");throw;

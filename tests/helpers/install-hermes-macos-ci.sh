@@ -42,11 +42,14 @@ uv_python_root="$hermes_home/uv-python"
 uv_bin_root="$hermes_home/uv-bin"
 cache_root="$output_root/uv-cache"
 tmp_root="$output_root/tmp"
+rustup_root="$output_root/rustup"
+cargo_root="$output_root/cargo"
 installer_log="$output_root/official-installer.log"
 evidence="$output_root/hermes-macos-acquisition.json"
 url="https://github.com/NousResearch/hermes-agent/archive/$commit.zip"
+rust_toolchain='1.83.0'
 
-mkdir -m 700 -p "$source_parent" "$user_home/.local/bin" "$hermes_home" "$uv_python_root" "$uv_bin_root" "$cache_root" "$tmp_root"
+mkdir -m 700 -p "$source_parent" "$user_home/.local/bin" "$hermes_home" "$uv_python_root" "$uv_bin_root" "$cache_root" "$tmp_root" "$rustup_root" "$cargo_root"
 
 # The archive is the source identity. The installer still performs its normal
 # managed uv, Python, venv, dependency, and launcher installation below.
@@ -98,12 +101,26 @@ test -z "$(git -C "$install_root" status --porcelain)" || {
 # Keep all user-scoped uv, Python, cache, temp, shell-startup, and Hermes state
 # below OUTPUT_ROOT. PATH already contains the private launcher destination, so
 # the official installer never needs to amend a host shell profile.
+if [ "$(uname -m)" = x86_64 ]; then
+  rustup_command=$(command -v rustup || true)
+  [ -n "$rustup_command" ] && [ -x "$rustup_command" ] || {
+    printf '%s\n' 'The x64 Hermes dependency build requires the runner Rustup bootstrap.' >&2
+    exit 1
+  }
+  rustup_directory=$(cd -P "$(dirname "$rustup_command")" && pwd)
+  rustup_command="$rustup_directory/$(basename "$rustup_command")"
+fi
 (
   unset PYTHONHOME PYTHONPATH UV_PYTHON UV_CONFIG_FILE HERMES_INSTALL_DIR
   export HOME="$user_home"
   export HERMES_HOME="$hermes_home"
   export UV_PYTHON_INSTALL_DIR="$uv_python_root"
   export UV_PYTHON_BIN_DIR="$uv_bin_root"
+  # The official installer asks its managed uv to find Python 3.11 before it
+  # creates the venv. `only-managed` makes that lookup install into the
+  # explicitly private UV_PYTHON_INSTALL_DIR instead of adopting a runner
+  # Python whose venv symlink would escape OUTPUT_ROOT.
+  export UV_PYTHON_PREFERENCE=only-managed
   export UV_CACHE_DIR="$cache_root"
   export XDG_CACHE_HOME="$cache_root/xdg"
   export XDG_CONFIG_HOME="$output_root/xdg-config"
@@ -113,6 +130,24 @@ test -z "$(git -C "$install_root" status --porcelain)" || {
   export GIT_CONFIG_NOSYSTEM=1
   export GIT_CONFIG_GLOBAL=/dev/null
   export GIT_TERMINAL_PROMPT=0
+  if [ "$(uname -m)" = x86_64 ]; then
+    # Hermes 0.21.1's locked cryptography 50.0.0 has an ARM macOS wheel but
+    # no x64 macOS wheel. Its source declares Rust 1.83.0 as the MSRV. Keep
+    # the required compiler, toolchain metadata, and Cargo cache private.
+    export RUSTUP_HOME="$rustup_root"
+    export CARGO_HOME="$cargo_root"
+    "$rustup_command" toolchain install "$rust_toolchain" --profile minimal
+    "$rustup_command" default "$rust_toolchain"
+    export RUSTUP_TOOLCHAIN="$rust_toolchain"
+    export PATH="$cargo_root/bin:$user_home/.local/bin:$PATH"
+    rustc_path=$("$rustup_command" which rustc)
+    case "$rustc_path" in "$rustup_root"/toolchains/*/bin/rustc) ;; *)
+      printf '%s\n' 'Private Rustup did not select a private Rust compiler.' >&2; exit 1;;
+    esac
+    "$rustc_path" --version | grep -q '^rustc 1\.83\.0 ' || {
+      printf '%s\n' 'Private Rust compiler version differs from cryptography 50.0.0 MSRV.' >&2; exit 1
+    }
+  fi
   bash "$installer" --commit "$commit" --force-commit --hermes-home "$hermes_home" \
     --dir "$install_root" --non-interactive --skip-setup --skip-browser \
     --skip-computer-use --no-skills

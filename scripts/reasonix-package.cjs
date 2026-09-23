@@ -20,6 +20,13 @@ const FILES = ['scripts/local-only-safety.cjs', 'scripts/windows-git-bootstrap-c
   'scripts/harness-v2-trust/trusted-public-keys.json', 'scripts/harness-v2-admission.cjs',
   'scripts/harness-v2-prime-migration.cjs', 'scripts/install/harness-v2-legacy.json', 'scripts/install/prime-settings.cjs']
 const CONFORMANCE_ASSETS = ['tests/source/reasonix-controlled-native.test.cjs', 'tests/source/harness-v2-reasonix-capability-native.test.cjs', 'tests/helpers/native-platform.cjs']
+const DARWIN_EXECUTABLES = new Set([
+  'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-x64',
+  'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-arm64',
+])
+function setPackagedMode(relative, target) {
+  if (process.platform !== 'win32' && DARWIN_EXECUTABLES.has(relative)) fs.chmodSync(target, 0o700)
+}
 
 function absoluteRoot(root) {
   if (typeof root !== 'string' || !path.isAbsolute(root) || /[\0\r\n]/.test(root) || path.resolve(root) === path.parse(root).root) {
@@ -172,7 +179,9 @@ function install(root, sourceRoot = ROOT) {
       for (const [file, hash] of Object.entries(receipt.files)) {
         const bytes = readBound(sourcePath(sourceRoot, file))
         if (sha256(bytes) !== hash) throw new ReasonixError('PAYLOAD_INVALID', 'Reasonix source changed during installation')
-        writePrivate(path.join(stage, file), bytes)
+        const target = path.join(stage, file)
+        writePrivate(target, bytes)
+        setPackagedMode(file, target)
       }
       writePrivate(path.join(stage, 'package.json'), BUNDLE_PACKAGE)
       guard.assertExisting(stage, 'directory')

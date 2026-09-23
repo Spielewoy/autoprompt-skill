@@ -23,7 +23,7 @@ function versionText(value) { return value.join('.') }
 function readPhysical(file, label, maximum = 32 * 1024 * 1024) {
   let initial
   try { if (fs.realpathSync.native(file) !== file) fail('DARWIN_COALITION_UNAVAILABLE', `${label} has a symlinked ancestor`); initial = fs.lstatSync(file) } catch (error) { if (error?.code === 'DARWIN_COALITION_UNAVAILABLE') throw error; fail('DARWIN_COALITION_UNAVAILABLE', `${label} is missing`) }
-  if (!initial.isFile() || initial.isSymbolicLink() || initial.nlink !== 1 || (initial.mode & 0o022) || initial.size < 1 || initial.size > maximum) fail('DARWIN_COALITION_UNAVAILABLE', `${label} is not one private physical file`)
+  if (!initial.isFile() || initial.isSymbolicLink() || initial.nlink !== 1 || (process.platform !== 'win32' && (initial.mode & 0o022)) || initial.size < 1 || initial.size > maximum) fail('DARWIN_COALITION_UNAVAILABLE', `${label} is not one private physical file`)
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
   try {
     const opened = fs.fstatSync(fd)
@@ -37,7 +37,7 @@ function readPhysical(file, label, maximum = 32 * 1024 * 1024) {
 function physicalDirectory(directory, label) {
   let item
   try { item = fs.lstatSync(directory) } catch { fail('DARWIN_COALITION_UNAVAILABLE', `${label} is missing`) }
-  if (!item.isDirectory() || item.isSymbolicLink() || item.nlink < 1 || (item.mode & 0o022)) fail('DARWIN_COALITION_UNAVAILABLE', `${label} is not a private physical directory`)
+  if (!item.isDirectory() || item.isSymbolicLink() || item.nlink < 1 || (process.platform !== 'win32' && (item.mode & 0o022))) fail('DARWIN_COALITION_UNAVAILABLE', `${label} is not a private physical directory`)
   const resolved = fs.realpathSync.native(directory)
   if (resolved !== directory) fail('DARWIN_COALITION_UNAVAILABLE', `${label} has a symlinked ancestor`)
   return resolved
@@ -84,7 +84,7 @@ function parseManifest(bytes) {
   if (!equalKeys(value.architectures, ['x64', 'arm64']) || !value.provenance || typeof value.provenance !== 'object' || Array.isArray(value.provenance) || !equalKeys(value.provenance, ['sourceRepository', 'sourceCommit', 'buildWorkflow', 'artifacts']) || typeof value.provenance.sourceRepository !== 'string' || !value.provenance.sourceRepository || Buffer.byteLength(value.provenance.sourceRepository) > 2048 || /[\r\n\0]/.test(value.provenance.sourceRepository) || !/^[a-f0-9]{40}$/.test(value.provenance.sourceCommit || '') || typeof value.provenance.buildWorkflow !== 'string' || !value.provenance.buildWorkflow || Buffer.byteLength(value.provenance.buildWorkflow) > 2048 || /[\r\n\0]/.test(value.provenance.buildWorkflow) || !equalKeys(value.provenance.artifacts, ['x64', 'arm64'])) fail('DARWIN_COALITION_UNAVAILABLE', 'Darwin coalition manifest provenance is invalid')
   for (const arch of Object.keys(ARCHITECTURES)) {
     const artifact = value.provenance.artifacts[arch]
-    if (!equalKeys(artifact, ['artifactId', 'sha256']) || !Number.isSafeInteger(artifact.artifactId) || artifact.artifactId < 1 || !HASH.test(artifact.sha256 || '')) fail('DARWIN_COALITION_UNAVAILABLE', `Darwin coalition manifest ${arch} artifact provenance is invalid`)
+    if (!equalKeys(artifact, ['artifactId', 'sha256']) || !Number.isSafeInteger(artifact.artifactId) || artifact.artifactId < 1 || !HASH.test(artifact.sha256 || '')) fail('DARWIN_COALITION_UNAVAILABLE', `Darwin coalition manifest ${arch} build provenance is invalid`)
   }
   for (const [arch, expected] of Object.entries(ARCHITECTURES)) {
     const entry = value.architectures[arch]

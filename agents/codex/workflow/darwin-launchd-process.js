@@ -360,7 +360,7 @@ async function runJob(requestPath) {
     if (Date.now() >= Date.parse(request.binding.startupDeadlineAt)) return
     await delay(20)
   }
-  if (readPrivate(path.join(directory, 'go.json')).requestChecksum !== request.checksum) fail('PROCESS_IDENTITY_INVALID', 'Darwin launch gate is foreign')
+  if (readPrivate(path.join(directory, 'go.json')).requestChecksum !== request.checksum) fail('PROCESS_IDENTITY_INVALID', 'Darwin launch authorization is foreign')
   const child = cp.spawn(request.executable, request.argv, { cwd: request.cwd, env: request.env, shell: false, stdio: 'ignore' })
   const result = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({ code, signal })) })
   atomicWriteJson(path.join(directory, 'exit.json'), { ...result, requestChecksum: request.checksum })

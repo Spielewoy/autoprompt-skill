@@ -63,7 +63,7 @@ module.exports=Object.freeze({
     "windows-worker-decoder.js": "e006e1eec10b6c112dd95f8e2cfb3546622ee0b33bb9412b07b38b51a8104423",
     "windows-worker-loader.js": "7d68c240e96402d336ef7de03545df5672059ccfb1a112c08a7e53bdbed0f584",
     "windows-worker-pe.js": "d8914396f52767d203374369a1d785fe7b744a57d77f1d13219d1c88b1992845",
-    "safe-run-root.js": "1814ea9e60d167e3e064f55fae1a05bb4eeeeeb0689d2c8a8a9e64cadd0fc401"
+    "safe-run-root.js": "bd0a12fa0813c7ac2c7b1e9c1ae0b6f94bb42eab8fae8143be6117b2a77a86c3"
   },
   "imports": {
     "assets/bash.br": [
