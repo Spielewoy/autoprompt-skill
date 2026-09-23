@@ -81,10 +81,21 @@ function privateDirectory(directory) {
     const stat = fs.lstatSync(directory)
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new ReasonixError('PAYLOAD_INVALID', `Private directory is linked or invalid: ${directory}`)
     if (path.dirname(directory) !== directory) privateDirectory(path.dirname(directory))
-    return
+    return false
   }
   privateDirectory(path.dirname(directory))
   fs.mkdirSync(directory, { mode: 0o700 })
+  return true
+}
+
+// AppContainer resource plans reject writable directories with inherited
+// ACLs. Establish a protected DACL only when this adapter just created its
+// own leaf: reapplying it would remove a live package lease ACE, and parent
+// directories are never candidates for mutation here.
+function privateWindowsLeaf(directory) {
+  const created = privateDirectory(directory)
+  if (created && process.platform === 'win32') require('../../codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(directory)
+  return created
 }
 
 function writePrivate(file, data) {
@@ -303,7 +314,7 @@ function nativeUsage(usage) {
   return { noncachedInput: input - cached, cachedInput: cached, output, reasoning }
 }
 
-module.exports = { CONTROLLED_CAPABILITIES, CONTROLLED_DENIED_TOOLS, CONTROLLED_NATIVE_TOOLS, CONTROLLED_PROXY, CONTROLLED_SERVER, CONTROLLED_TOOLS, FORBIDDEN_TOOLS, MINIMUM_VERSION, ReasonixError, connectionConfig, inside, locateExecutable, nativeUsage, parseTerminal, privateDirectory, probeExecutable, readBound, renderConfig, renderCredentials, sha256, validateNativeTodoWrite, writePrivate }
+module.exports = { CONTROLLED_CAPABILITIES, CONTROLLED_DENIED_TOOLS, CONTROLLED_NATIVE_TOOLS, CONTROLLED_PROXY, CONTROLLED_SERVER, CONTROLLED_TOOLS, FORBIDDEN_TOOLS, MINIMUM_VERSION, ReasonixError, connectionConfig, inside, locateExecutable, nativeUsage, parseTerminal, privateDirectory, privateWindowsLeaf, probeExecutable, readBound, renderConfig, renderCredentials, sha256, validateNativeTodoWrite, writePrivate }
 
 if (require.main === module) {
   try { runControlledStdioRelay(process.argv.slice(2)) } catch (error) {

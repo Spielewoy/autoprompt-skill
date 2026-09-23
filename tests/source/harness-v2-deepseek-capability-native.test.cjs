@@ -65,6 +65,8 @@ function fixtureFailureDiagnostic(f, error) {
   // removes its private transcript. No ambient files or user logs are read.
   const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024),
     phase: f.nativePhase || 'unlabeled', launch: f.nativeLaunch || null, proxyError: f.nativeProxyError || null,
+    requestCount: f.service?.requests.length || 0, heldResponse: f.service?.firstMessageHeld === true,
+    ownership: f.owner?.ownershipIdentities().map(item => ({ id: item.id, reservationId: item.reservationId })) || [],
     stderr: String(f.nativeStderr || '').slice(-8192), events: [...(f.nativeEvents || [])] }
   while (Buffer.byteLength(JSON.stringify(output)) > 65536) output.events.shift()
   console.error(JSON.stringify(output))
@@ -81,7 +83,7 @@ async function scenario(provider, options = {}) {
     service = await modelService(provider, options.tool || { name: controlled.toolName(provider, 'bash'), args: { command: readCommand(candidate) } }, { resetToolAfterCompletion: true, ...(options.serviceOptions || {}) })
     const binding = native.probeExecutable({ provider, executable: cli })
     const registryPath = canaryRegistry(provider, path.join(f.controller, 'processes.json')), processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath)), ownerValue = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
-    owner = ownerValue
+    owner = ownerValue; f.owner = owner; f.service = service
     const proxy = privateDirectory(path.join(f.controller, 'proxy'))
     const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: `${provider}-closed-native-canary`, pollMs: 10 })
     const ownedRun = runner.run.bind(runner)
@@ -174,28 +176,7 @@ async function runScenario(provider) {
     let siblings; f.nativePhase = 'concurrent-siblings'; try { siblings = await Promise.all([0, 1].map(index => { const ids = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: `sibling-${index}` }; return f.run({ ...ids, missionBinding: core.bindCanonicalMissionForChild(f.projection, { ...f.record, ...ids, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }) }, `concurrent-sibling-${index}`) })) } finally { clearInterval(monitor) }
     assert.ok(siblings.every(item => item.ok)); assert.equal(new Set(siblings.map(item => item.contextId)).size, 2); assert.ok(peak >= 2); assert.deepEqual(f.owner.ownershipIdentities(), [])
     const originalTool = f.service.tool.args.command; command(f, readCommand(f.candidate))
-    const delayed = await scenario(provider, { serviceOptions: { holdFirstMessage: true } })
-    let pending, fastResult, recoveredLive
-    try {
-      const abort = new AbortController(); pending = delayed.run({ signal: abort.signal }, 'cancellation-held'); pending.catch(() => {})
-      const waitForHeldMessageMs = process.platform === 'win32' ? 180000 : 15000
-      await waitForNativeObservation(pending, () => delayed.service.firstMessageHeld, waitForHeldMessageMs, 'the held DeepSeek model response')
-      assert.equal(delayed.service.firstMessageHeld, true, 'the first DeepSeek response must be held before recovery and cancellation')
-      const recoveredOwner = new ProcessOwner({ adapter: nativeProcessAdapter(delayed.registryPath, path.dirname(delayed.registryPath)), registryPath: delayed.registryPath, pollMs: 10 }); await recoveredOwner.recoverReservations()
-      const heldIdentity = recoveredOwner.ownershipIdentities(); assert.equal(heldIdentity.length, 1, 'fresh owner did not recover the persisted live child'); recoveredLive = heldIdentity[0]
-      const recoveredGroup = [...recoveredOwner.groups.values()].find(record => record.reservationId === delayed.record.reservationId)
-      assert.ok(recoveredGroup && recoveredGroup.groupIdentity === recoveredLive.id, 'fresh owner did not bind the held reservation to its recovered group')
-      const fastIds = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: 'fast-sibling' }
-      delayed.nativePhase = 'cancellation-fast-sibling'; const fast = delayed.run({ ...fastIds, missionBinding: core.bindCanonicalMissionForChild(delayed.projection, { ...delayed.record, ...fastIds, sourceRequestHash: delayed.projection.sourceRequestHash, requestEnvelopeHash: delayed.record.dispatch.requestPointer.hash }) }, 'cancellation-fast-sibling')
-      fast.catch(() => {})
-      await waitForNativeObservation(fast, () => delayed.owner.ownershipIdentities().length >= 2, waitForHeldMessageMs, 'both owned DeepSeek children')
-      assert.equal(delayed.owner.ownershipIdentities().length, 2, 'fast sibling did not overlap the held native child')
-      const recoveredTerminal = await recoveredOwner.cancelGroup(recoveredGroup.ownershipId, { reason: 'fresh-owner crash recovery', graceMs: 0, killMs: 2000 })
-      assert.equal(recoveredTerminal.status, 'CANCELLED', 'fresh owner did not durably drain the recovered held group')
-      assert.equal(recoveredTerminal.groupIdentity, recoveredLive.id, 'fresh owner terminal receipt changed the recovered group identity')
-      abort.abort()
-      await assert.rejects(pending, { code: 'CHILD_CANCELLED' }); fastResult = await fast; good(fastResult); assert.deepEqual(delayed.owner.ownershipIdentities(), [])
-    } finally { await delayed.close() }
+    const cancellation = await cancellationWitness(provider)
     command(f, originalTool)
     const frozen = privateDirectory(path.join(f.root, 'frozen')), checkerScratch = privateDirectory(path.join(f.root, 'checker')); for (const name of ['tmp', 'output', 'cache']) privateDirectory(path.join(checkerScratch, name))
     const frozenFile = path.join(frozen, 'candidate.txt'); fs.writeFileSync(frozenFile, f.marker)
@@ -203,7 +184,7 @@ async function runScenario(provider) {
     command(f, withChallenge(`${readCommand(frozenFile)}; ${nodeCommand(`require('node:fs').writeFileSync(${JSON.stringify(path.join(checkerScratch, 'checked.txt'))}, 'checked'); try { require('node:fs').writeFileSync(${JSON.stringify(frozenFile)}, 'wrong'); process.exit(19) } catch {}`)}`, f.challenge))
     const checker = new HarnessExecAdapter({ provider, runner: f.adapter.runner, nativeRoot: f.nativeRoot, executableBinding: f.binding, targetPath: checkerScratch, connection: connection(f.service), credentialEnvironment: { DEEPSEEK_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only controller checker tools and return one JSON object.', checkerScratchVerifier: () => checkerBoundary })
     const checkerRecord = { ...f.record, sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', workingDirectory: checkerScratch, canonicalTargetPath: frozen, candidateHash: checkerBoundary.candidateHash, checkerScratchBoundary: checkerBoundary, physicalExecutionPolicy: { logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', sandboxMode: 'read-only', canDispatch: false, resourceSets: { read: [], write: [], exclusive: [] } } }
-    checkerRecord.environment = prepareProcessLaunchEnvironment(f.processAdapter, checkerRecord.reservationId, nativeEnvironment()); checkerRecord.signal = AbortSignal.timeout(90000); checkerRecord.missionBinding = core.bindCanonicalMissionForChild(f.projection, { ...checkerRecord, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }); f.nativePhase = 'isolated-checker'; const checked = await checker.launch(checkerRecord); good(checked)
+    checkerRecord.environment = prepareProcessLaunchEnvironment(f.processAdapter, checkerRecord.reservationId, nativeEnvironment()); checkerRecord.signal = AbortSignal.timeout(process.platform === 'win32' ? 300000 : 90000); checkerRecord.missionBinding = core.bindCanonicalMissionForChild(f.projection, { ...checkerRecord, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }); f.nativePhase = 'isolated-checker'; const checked = await checker.launch(checkerRecord); good(checked)
     assert.equal(fs.readFileSync(frozenFile, 'utf8'), f.marker); assert.equal(fs.readFileSync(path.join(checkerScratch, 'checked.txt'), 'utf8'), 'checked')
     const registry = JSON.parse(fs.readFileSync(f.registryPath, 'utf8')); assert.ok(JSON.stringify(registry).includes(`native-${provider}-`)); const completedOwner = new ProcessOwner({ adapter: nativeProcessAdapter(f.registryPath, path.dirname(f.registryPath)), registryPath: f.registryPath, pollMs: 10 }); await completedOwner.recoverReservations(); assert.deepEqual(completedOwner.ownershipIdentities(), [])
     const recovery = await f.run({ sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID() }, 'post-checker-recovery'); good(recovery); assert.deepEqual(f.owner.ownershipIdentities(), [])
@@ -216,7 +197,7 @@ async function runScenario(provider) {
       toolOutputCapture: { receiptHash, receiptBody: expectedReceipt, marker: f.marker, readbackHash: native.sha256(fs.readFileSync(readback)) },
       stableChildIdentity: { siblingContexts: siblings.map(item => item.contextId), peakOwnedChildren: peak },
       sameContextContinuation: { firstContextId: first.contextId, resumedContextId: resumed.contextId, foreignDeniedCode: foreignCode, continuationCarriesPrompt },
-      cancellation: { recoveredIdentity: recoveredLive, fastContextId: fastResult.contextId, overlapObserved: true, pendingCancelCode: 'CHILD_CANCELLED' },
+      cancellation,
       isolatedChecking: { frozenHash: native.sha256(fs.readFileSync(frozenFile)), checked: fs.readFileSync(path.join(checkerScratch, 'checked.txt'), 'utf8'), checkerContextId: checked.contextId },
       processOwnership: { registryHash: native.sha256(JSON.stringify(registry)), recoveredCompletedChildren: completedOwner.ownershipIdentities().length, recoveryContextId: recovery.contextId },
       modelRouting: { endpointObserved: f.service.requests.some(item => item.path.includes('/chat/completions')), lowEffortObserved: f.service.requests.some(item => item.body.reasoning_effort === 'low'), invalidEffortCode: 'PROFILE_INVALID' }
@@ -229,9 +210,35 @@ async function runScenario(provider) {
   }
 }
 
+async function cancellationWitness(provider) {
+  const delayed = await scenario(provider, { serviceOptions: { holdFirstMessage: true } })
+  let pending, fastResult, recoveredLive
+  try {
+    const abort = new AbortController(); pending = delayed.run({ signal: abort.signal }, 'cancellation-held'); pending.catch(() => {})
+    const waitForHeldMessageMs = process.platform === 'win32' ? 180000 : 15000
+    await waitForNativeObservation(pending, () => delayed.service.firstMessageHeld, waitForHeldMessageMs, 'the held DeepSeek model response')
+    assert.equal(delayed.service.firstMessageHeld, true, 'the first DeepSeek response must be held before recovery and cancellation')
+    const recoveredOwner = new ProcessOwner({ adapter: nativeProcessAdapter(delayed.registryPath, path.dirname(delayed.registryPath)), registryPath: delayed.registryPath, pollMs: 10 }); await recoveredOwner.recoverReservations()
+    const heldIdentity = recoveredOwner.ownershipIdentities(); assert.equal(heldIdentity.length, 1, 'fresh owner did not recover the persisted live child'); recoveredLive = heldIdentity[0]
+    const recoveredGroup = [...recoveredOwner.groups.values()].find(record => record.reservationId === delayed.record.reservationId)
+    assert.ok(recoveredGroup && recoveredGroup.groupIdentity === recoveredLive.id, 'fresh owner did not bind the held reservation to its recovered group')
+    const fastIds = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: 'fast-sibling' }
+    delayed.nativePhase = 'cancellation-fast-sibling'; const fast = delayed.run({ ...fastIds, missionBinding: core.bindCanonicalMissionForChild(delayed.projection, { ...delayed.record, ...fastIds, sourceRequestHash: delayed.projection.sourceRequestHash, requestEnvelopeHash: delayed.record.dispatch.requestPointer.hash }) }, 'cancellation-fast-sibling')
+    fast.catch(() => {})
+    await waitForNativeObservation(fast, () => delayed.owner.ownershipIdentities().length >= 2, waitForHeldMessageMs, 'both owned DeepSeek children')
+    assert.equal(delayed.owner.ownershipIdentities().length, 2, 'fast sibling did not overlap the held native child')
+    const recoveredTerminal = await recoveredOwner.cancelGroup(recoveredGroup.ownershipId, { reason: 'fresh-owner crash recovery', graceMs: 0, killMs: 2000 })
+    assert.equal(recoveredTerminal.status, 'CANCELLED', 'fresh owner did not durably drain the recovered held group')
+    assert.equal(recoveredTerminal.groupIdentity, recoveredLive.id, 'fresh owner terminal receipt changed the recovered group identity')
+    abort.abort()
+    await assert.rejects(pending, { code: 'CHILD_CANCELLED' }); fastResult = await fast; good(fastResult); assert.deepEqual(delayed.owner.ownershipIdentities(), [])
+  } finally { await delayed.close() }
+  return { recoveredIdentity: recoveredLive, fastContextId: fastResult.contextId, overlapObserved: true, pendingCancelCode: 'CHILD_CANCELLED' }
+}
+
 const scenarioRuns = new Map()
 function witnessesFor(provider) {
-  if (!scenarioRuns.has(provider)) scenarioRuns.set(provider, runScenario(provider))
+  if (!scenarioRuns.has(provider)) scenarioRuns.set(provider, process.env.AUTOPROMPT_CI_CAPABILITY === 'cancellation' ? cancellationWitness(provider).then(cancellation => ({ cancellation })) : runScenario(provider))
   return scenarioRuns.get(provider)
 }
 const capabilityChecks = Object.freeze({

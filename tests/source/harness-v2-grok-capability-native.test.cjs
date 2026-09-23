@@ -187,7 +187,7 @@ capability('hostile native tool topology is denied before an owned controller ca
 })
 
 capability('held child cancels while a fast sibling remains alive and drained', async t => {
-  const held = await scenario(t, { calls: [] }); held.service.holdNext(); const abort = new AbortController(), pending = held.run({ signal: abort.signal })
+  const held = await scenario(t, { calls: [] }); held.service.holdNext(); const abort = new AbortController(), pending = held.run({ signal: abort.signal }); pending.catch(() => {})
   for (let index = 0; index < 300 && held.service.requests.length === 0; index++) await wait(50)
   assert.ok(held.service.requests.length > 0)
   const fast = await scenario(t, { calls: [] }); good(await fast.run({})); abort.abort(); await assert.rejects(pending, { code: 'CHILD_CANCELLED' }); assert.deepEqual(held.owner.ownershipIdentities(), [])
@@ -205,7 +205,7 @@ capability('checker sees frozen candidate but writes only authenticated scratch'
 })
 
 capability('crash recovery drains the durable owned child', async t => {
-  const crashed = await scenario(t, { calls: [] }); crashed.service.holdNext(); const pending = crashed.run({})
+  const crashed = await scenario(t, { calls: [] }); crashed.service.holdNext(); const pending = crashed.run({}); pending.catch(() => {})
   for (let index = 0; index < 300 && crashed.service.requests.length === 0; index++) await wait(50)
   assert.equal(crashed.owner.ownershipIdentities().length, 1)
   const recovered = new ProcessOwner({ adapter: nativeProcessAdapter(crashed.owner.registryPath, path.dirname(crashed.owner.registryPath)), registryPath: crashed.owner.registryPath, pollMs: 10 })

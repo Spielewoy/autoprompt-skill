@@ -123,7 +123,8 @@ print(json.dumps({'executable':str(__import__('pathlib').Path(sys.executable).re
     archiveSha256: ARCHIVE_SHA256, installerSha256: INSTALLER_SHA256, pyprojectSha256: PYPROJECT_SHA256,
     launcher: launcherObservation,
     venvLauncher: inspectLauncher(venvBytes),
-    interpreter: { bytes: pythonBytes.length, sha256: sha256(pythonBytes), headerHex: pythonBytes.subarray(0, Math.min(64, pythonBytes.length)).toString('hex'), pathLength: python.length,
+    interpreter: { bytes: pythonBytes.length, sha256: sha256(pythonBytes), peMachine: inspectLauncher(pythonBytes).peMachine,
+      headerHex: pythonBytes.subarray(0, Math.min(64, pythonBytes.length)).toString('hex'), pathLength: python.length,
       pathOccurrences: { utf8: occurrences(publicBytes, Buffer.from(python, 'utf8')).slice(0, 16), utf16le: occurrences(publicBytes, utf16le(python)).slice(0, 16) } },
     record: recordRow && { relative: recordRow.relative, sha256: recordRow.hash, size: Number(recordRow.size) },
     entryPoint: metadata.entryPoints.find(item => item.group === 'console_scripts' && item.name === 'hermes'),
@@ -146,4 +147,9 @@ print(json.dumps({'executable':str(__import__('pathlib').Path(sys.executable).re
   const expectedMachine = { x64: '0x8664', arm64: '0xaa64' }[process.arch]
   assert.ok(expectedMachine, `unsupported Windows runner architecture ${process.arch}`)
   assert.equal(launcherObservation.peMachine, expectedMachine, 'Hermes launcher PE machine differs from the native runner architecture')
+  assert.equal(inspectLauncher(pythonBytes).peMachine, expectedMachine, 'Hermes Python PE machine differs from the native runner architecture')
+  const binding = require('../../scripts/harness-v2-bridge/hermes/windows-launcher.cjs').parseHermesUvLauncher(publicBytes)
+  assert.equal(binding.architecture, process.arch)
+  assert.equal(fs.realpathSync.native(binding.pythonPath).toLowerCase(), fs.realpathSync.native(python).toLowerCase(),
+    'UV_PYTHON_PATH must select the installer-owned Python interpreter')
 })

@@ -15,6 +15,8 @@ const { privateDirectory, nativeProcessAdapter } = require('./native-platform.cj
 
 const MAX_OUTPUT = 2048
 const TIMEOUT = 10_000
+const REGISTRATION_GRACE = 30_000
+const SETTLEMENT_GRACE = 10_000
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 const bounded = value => String(value || '').replace(/[\r\n]+/g, ' ').slice(0, MAX_OUTPUT)
 
@@ -52,6 +54,42 @@ function recordVariant({ name, mode, executable, argv, timedOut, execution, erro
   }
 }
 
+async function superviseOwnedRun(options) {
+  const registrationTimeoutMs = options.registrationTimeoutMs
+  const executionTimeoutMs = options.executionTimeoutMs
+  const settlementTimeoutMs = options.settlementTimeoutMs
+  if (!options.runPromise || typeof options.runPromise.then !== 'function' || typeof options.isRegistered !== 'function' ||
+      typeof options.stop !== 'function' || typeof options.forceStop !== 'function' ||
+      !Number.isSafeInteger(registrationTimeoutMs) || registrationTimeoutMs < 1 ||
+      !Number.isSafeInteger(executionTimeoutMs) || executionTimeoutMs < 1 ||
+      !Number.isSafeInteger(settlementTimeoutMs) || settlementTimeoutMs < 1) throw new TypeError('Invalid VS Code diagnostic supervision')
+  const wait = options.wait || delay
+  const now = options.now || Date.now
+  let settled = false, execution = null, error = null, stopResult = null, stopFailure = null, timedOut = false
+  const settledPromise = Promise.resolve(options.runPromise).then(value => { execution = value }, caught => { error = caught }).finally(() => { settled = true })
+  const registrationDeadline = now() + registrationTimeoutMs
+  while (!settled && !options.isRegistered() && now() < registrationDeadline) await Promise.race([settledPromise, wait(Math.min(20, registrationDeadline - now()))])
+  if (!settled && !options.isRegistered()) {
+    timedOut = true
+    try { stopResult = await options.forceStop() } catch (caught) { stopFailure = caught }
+  } else if (!settled) {
+    const outcome = await Promise.race([settledPromise.then(() => 'settled'), wait(executionTimeoutMs).then(() => 'deadline')])
+    if (outcome === 'deadline' && !settled) {
+      timedOut = true
+      try {
+        stopResult = await options.stop()
+        if (stopResult?.alreadyTerminal && !settled) stopResult = await options.forceStop()
+      } catch (caught) { stopFailure = caught }
+    }
+  }
+  let unsettled = false
+  if (!settled) {
+    const settlement = await Promise.race([settledPromise.then(() => 'settled'), wait(settlementTimeoutMs).then(() => 'deadline')])
+    unsettled = settlement === 'deadline' && !settled
+  }
+  return { execution, error: error || stopFailure, stopResult, timedOut, unsettled }
+}
+
 async function runVariant(layout, root, definition) {
   const variantRoot = privateDirectory(path.join(root, definition.name))
   const registryPath = path.join(variantRoot, 'processes.json')
@@ -65,33 +103,23 @@ async function runVariant(layout, root, definition) {
   const sessionId = crypto.randomUUID(), reservationId = crypto.randomUUID()
   const environment = prepareProcessLaunchEnvironment(adapter, reservationId, definition.environment(variantRoot))
   const startedAt = Date.now()
-  let timedOut = false, runSettled = false, stopPromise = null, stopResult = null, stopFailure = null, execution = null, error = null
-  const stop = async () => {
-    for (;;) {
-      const result = await runner.stop({ sessionId, reason: 'VS Code Windows diagnostic deadline', terminalStatus: 'CANCELLED' })
-      if (!result.alreadyTerminal || runSettled) return result
-      await delay(20)
-    }
-  }
-  const timer = setTimeout(() => {
-    timedOut = true
-    stopPromise ||= stop().catch(caught => { stopFailure = caught; return null })
-  }, TIMEOUT)
-  try {
-    execution = await runner.run({ executable: definition.executable(layout), argv: definition.argv(layout),
-      cwd: path.dirname(layout.code), env: environment, stdin: '', shell: false, sessionId, reservationId })
-  } catch (caught) {
-    error = caught
-  } finally {
-    runSettled = true
-    clearTimeout(timer)
-    if (stopPromise) {
-      stopResult = await stopPromise
-      error ||= stopFailure
-    }
-  }
-  let drained = execution?.drained === true || stopResult?.drained === true
-  if (!drained) {
+  const runPromise = runner.run({ executable: definition.executable(layout), argv: definition.argv(layout),
+    cwd: path.dirname(layout.code), env: environment, stdin: '', shell: false, sessionId, reservationId })
+  const supervised = await superviseOwnedRun({
+    runPromise, isRegistered: () => runner.sessions.has(sessionId),
+    registrationTimeoutMs: (Number.isSafeInteger(adapter.startupTimeoutMs) ? adapter.startupTimeoutMs : 120_000) + REGISTRATION_GRACE,
+    executionTimeoutMs: TIMEOUT, settlementTimeoutMs: SETTLEMENT_GRACE,
+    stop: () => runner.stop({ sessionId, reason: 'VS Code Windows diagnostic deadline', terminalStatus: 'CANCELLED' }),
+    forceStop: async () => {
+      await owner.cancelAll({ reason: 'VS Code Windows diagnostic registration deadline', graceMs: 0, killMs: 2000, waitForPending: true })
+      await owner.assertDrained({ skipRecovery: true, skipRunningDrain: true })
+      return { drained: true, forced: true }
+    },
+  })
+  let { execution, error, stopResult, timedOut, unsettled } = supervised
+  if (unsettled && !error) error = Object.assign(new Error('VS Code diagnostic run did not settle after its bounded ownership stop'), { code: 'DIAGNOSTIC_SETTLEMENT_UNKNOWN' })
+  let drained = !unsettled && (execution?.drained === true || stopResult?.drained === true)
+  if (!drained && !unsettled) {
     try {
       await owner.cancelAll({ reason: 'VS Code Windows diagnostic failure cleanup', graceMs: 0, killMs: 2000, waitForPending: true })
       await owner.assertDrained({ skipRecovery: true, skipRunningDrain: true })
@@ -104,7 +132,7 @@ async function runVariant(layout, root, definition) {
   return { result, drained }
 }
 
-async function runDiagnostic(executable) {
+async function runDiagnostic(executable, options = {}) {
   const layout = resolveLayout(executable)
   const root = privateDirectory(fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-vscode-probe-'))))
   const inherited = () => ({ ...process.env, ELECTRON_RUN_AS_NODE: '1' })
@@ -117,15 +145,26 @@ async function runDiagnostic(executable) {
     { name: 'cli-version-isolated', mode: 'isolated', executable: value => value.code, argv: value => [value.cli, '--version'], environment: isolated },
     { name: 'cli-version-isolated-private-known-folders', mode: 'isolated-private-known-folders', executable: value => value.code, argv: value => [value.cli, '--version'], environment: privateKnownFolders },
   ]
+  const selected = process.env.AUTOPROMPT_VSCODE_EXTENDED_DIAGNOSTIC === '1'
+    ? definitions
+    : definitions.filter(definition => ['code-node-e-inherited', 'cli-version-isolated'].includes(definition.name))
   const variants = [], retainedRoots = []
-  for (const definition of definitions) {
-    const outcome = await runVariant(layout, root, definition)
+  for (const definition of selected) {
+    const startedAt = Date.now()
+    options.onEvent?.({ schemaVersion: 1, event: 'variant-start', name: definition.name, mode: definition.mode })
+    let outcome
+    try { outcome = await runVariant(layout, root, definition) } catch (error) {
+      outcome = { drained: false, result: recordVariant({ name: definition.name, mode: definition.mode,
+        executable: definition.executable(layout), argv: definition.argv(layout), timedOut: false, execution: null,
+        error, drained: false, retainedRoot: true, elapsedMs: Date.now() - startedAt }) }
+    }
     variants.push(outcome.result)
+    options.onVariant?.(outcome.result)
     if (!outcome.drained) retainedRoots.push(path.join(root, definition.name))
   }
   if (retainedRoots.length === 0) fs.rmSync(root, { recursive: true, force: true })
   return { schemaVersion: 1, platform: process.platform, architecture: process.arch, node: process.version,
-    executable: layout.code, cli: layout.cli, variants, retainedRoots: retainedRoots.length }
+    executable: layout.code, cli: layout.cli, extended: selected.length === definitions.length, variants, retainedRoots: retainedRoots.length }
 }
 
 function nativeEnvironment() {
@@ -138,10 +177,13 @@ function nativeEnvironment() {
 }
 
 if (require.main === module) {
-  runDiagnostic().then(value => process.stdout.write(`${JSON.stringify(value)}\n`), error => {
+  runDiagnostic(undefined, {
+    onEvent: event => process.stdout.write(`${JSON.stringify(event)}\n`),
+    onVariant: variant => process.stdout.write(`${JSON.stringify({ schemaVersion: 1, event: 'variant', variant })}\n`),
+  }).then(value => process.stdout.write(`${JSON.stringify(value)}\n`), error => {
     process.stderr.write(`${bounded(error.stack || error)}\n`)
     process.exitCode = 1
   })
 }
 
-module.exports = { resolveLayout, runDiagnostic, runVariant }
+module.exports = { resolveLayout, runDiagnostic, runVariant, superviseOwnedRun }

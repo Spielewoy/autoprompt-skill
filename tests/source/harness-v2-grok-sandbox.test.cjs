@@ -44,6 +44,18 @@ function ownedSse() {
   return `data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`
 }
 
+test('Grok sandbox validates MCP inputs through the dependency-free canonical tool-schema leaf', () => {
+  const leaf = require('../../scripts/harness-v2-bridge/grok/tool-schema.cjs')
+  assert.strictEqual(boundary.TOOLS, leaf.TOOLS)
+  assert.strictEqual(boundary.validateArguments, leaf.validateArguments)
+  assert.strictEqual(boundary.BoundaryError, leaf.BoundaryError)
+  assert.equal(leaf.validateArguments('bash', { command: 'pwd', timeoutMs: 300000 }).name, 'bash')
+  assert.throws(() => leaf.validateArguments('bash', { command: 'pwd', timeoutMs: 300001 }), { code: 'TOOL_ARGUMENTS_INVALID' })
+  const worker = fs.readFileSync(path.resolve(__dirname, '../../scripts/harness-v2-bridge/grok/sandbox-worker.cjs'), 'utf8')
+  assert.match(worker, /require\('\.\/tool-schema\.cjs'\)/)
+  assert.doesNotMatch(worker, /harness-v2-tool-boundary|AUTOPROMPT_GROK_TOOL_BOUNDARY/)
+})
+
 test('Grok relay derives only collision-resistant authenticated Windows pipe names', () => {
   const address = createWindowsRelayPath(length => Buffer.alloc(length, 0x5a))
   assert.equal(address, `\\\\.\\pipe\\autoprompt-grok-${'5a'.repeat(32)}`)

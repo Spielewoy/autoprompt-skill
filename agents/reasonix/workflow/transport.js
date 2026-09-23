@@ -3,7 +3,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const {
-  CONTROLLED_CAPABILITIES, CONTROLLED_NATIVE_TOOLS, CONTROLLED_PROXY, CONTROLLED_SERVER, CONTROLLED_TOOLS, ReasonixError, inside, nativeUsage, parseTerminal, privateDirectory, readBound, renderConfig, renderCredentials, sha256, validateNativeTodoWrite, writePrivate,
+  CONTROLLED_CAPABILITIES, CONTROLLED_NATIVE_TOOLS, CONTROLLED_PROXY, CONTROLLED_SERVER, CONTROLLED_TOOLS, ReasonixError, inside, nativeUsage, parseTerminal, privateDirectory, privateWindowsLeaf, readBound, renderConfig, renderCredentials, sha256, validateNativeTodoWrite, writePrivate,
 } = require('./native.js')
 const core = require('../../codex/workflow/phase-budget.js')
 const { validateJsonSchema } = require('../../codex/workflow/json-schema-validator.js')
@@ -396,7 +396,7 @@ function prepareReasonixBoundary({ nativeRoot, launchRoot, record, targetPath, s
     }
   }
   const toolRoot = path.join(launchRoot, 'tools')
-  privateDirectory(toolRoot)
+  privateWindowsLeaf(toolRoot)
   const darwinCommandOwner = process.platform === 'darwin'
     ? { manifestRoot: require('../../../scripts/harness-v2-command-owner-discovery.cjs').createDiscoveryRoot(nativeRoot, { provider: 'reasonix', activationId: record.activationId, generation: record.generation }), providerPrivateOwnershipRoot: nativeRoot }
     : undefined
@@ -426,7 +426,7 @@ function reasonixProcessEnvironment({ environment = {}, credentials = {}, home, 
     // Reasonix reservations in this private controller root. The native CLI
     // appends its own reasonix/workspace-leases subtree.
     const windowsUserCache = path.join(nativeRoot, 'windows-user-cache')
-    privateDirectory(windowsUserCache)
+    privateWindowsLeaf(windowsUserCache)
     projected.LOCALAPPDATA = windowsUserCache
   }
   return projected
@@ -467,8 +467,8 @@ class ReasonixExecAdapter {
     const scratchPath = checkerScratch ? targetPath : path.join(launchRoot, 'scratch')
     if (record.externalLocalBoundary || record.externalOperation) throw new ReasonixError('EXTERNAL_WRITE_BOUNDARY_UNAVAILABLE', 'Reasonix controlled tools support only the assigned candidate and checker scratch')
     const cwd = path.join(sessionRoot, 'cwd')
-    privateDirectory(scratchPath)
-    privateDirectory(cwd)
+    privateWindowsLeaf(scratchPath)
+    privateWindowsLeaf(cwd)
     const toolBoundary = prepareReasonixBoundary({ nativeRoot: this.nativeRoot, launchRoot, record, targetPath, scratchPath, readOnly, checkerScratch })
     const schema = core.codexProviderCanonicalOutputSchema(record, JSON.parse(readBound(this.outputSchemaResolver(record)).toString('utf8')))
     const outcomeProjection = nativeOutcomeDescriptionProjection(record, schema)
@@ -496,6 +496,7 @@ class ReasonixExecAdapter {
       JSON.stringify(wireSchema),
     ].join('\n')
     const home = path.join(launchRoot, 'home')
+    privateWindowsLeaf(home)
     const quotaEnabled = record.providerTokenLimit !== undefined
     if (quotaEnabled && (!Number.isSafeInteger(record.providerTokenLimit) || record.providerTokenLimit <= 0)) {
       throw new ReasonixError('BUDGET_CONFIG_INVALID', 'Reasonix quota requires a positive safe token allowance')

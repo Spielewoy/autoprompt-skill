@@ -20,7 +20,18 @@ async function control(item) {
     socket.setTimeout(2000, () => socket.destroy(new Error('CONTROL_TIMEOUT')))
   })
 }
-async function probeDarwinCommandSandbox() {
+function createInFlightProbe(run) {
+  if (typeof run !== 'function') throw new TypeError('Probe implementation is required')
+  let pending = null
+  return function probe() {
+    if (pending) return pending
+    const current = Promise.resolve().then(run)
+    pending = current
+    current.finally(() => { if (pending === current) pending = null }).catch(() => {})
+    return current
+  }
+}
+async function runDarwinCommandSandboxProbe() {
   if (process.platform !== 'darwin') return { supported: false, backend: 'darwin-seatbelt-coalition', code: 'COMMAND_SANDBOX_UNSUPPORTED' }
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-darwin-probe-')))
   fs.chmodSync(root, 0o700)
@@ -73,8 +84,15 @@ async function probeDarwinCommandSandbox() {
     for (const item of listeners) await new Promise(resolve => item.server.close(resolve))
     if (!cleanupFailure) fs.rmSync(root, { recursive: true, force: true })
   }
-  if (cleanupFailure) return { supported: false, backend: 'darwin-seatbelt-coalition', code: 'PROCESS_DRAIN_TIMEOUT', recoveryRoot: root }
+  if (cleanupFailure) return { supported: false, backend: 'darwin-seatbelt-coalition', code: 'PROCESS_DRAIN_TIMEOUT', recoveryRoot: root,
+    reason: String(cleanupFailure.message).slice(0, 2048), probeFailure: result?.supported === false ? result : null }
   return result
 }
+const sharedDarwinCommandSandboxProbe = createInFlightProbe(runDarwinCommandSandboxProbe)
+function probeDarwinCommandSandbox() {
+  // Share only a currently executing native proof. Once it settles, the next
+  // sequential launch revalidates every helper, sandbox and kernel property.
+  return sharedDarwinCommandSandboxProbe()
+}
 
-module.exports = { probeDarwinCommandSandbox }
+module.exports = { probeDarwinCommandSandbox, createInFlightProbe }

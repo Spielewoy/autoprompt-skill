@@ -77,6 +77,7 @@ function fixtureFailureDiagnostic(f, error) {
   // Capture the synthetic provider events before the real runner drains and
   // removes its private transcript. No ambient files or user logs are read.
   const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024),
+    details: error.details ? JSON.stringify(error.details).slice(0, 4096) : null,
     stderr: String(f.nativeStderr || '').slice(-8192), events: [...(f.nativeEvents || [])] }
   while (Buffer.byteLength(JSON.stringify(output)) > 65536) output.events.shift()
   console.error(JSON.stringify(output))

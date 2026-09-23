@@ -276,6 +276,25 @@ if (require.main === module) {
     assert.equal(first.FIXTURE_KEY, 'secret')
   })
 
+  test('Reasonix Windows writable leaves have protected ACLs and retain native-root identity', {
+    skip: process.platform !== 'win32', timeout: 120000,
+  }, t => {
+    const f = fixture(t)
+    const nativeRootBefore = fs.lstatSync(f.nativeRoot)
+    const scratch = path.join(f.nativeRoot, 'session', 'reservation', 'scratch')
+    native.privateWindowsLeaf(scratch)
+    const environment = reasonixProcessEnvironment({ environment: { PATH: process.env.PATH }, credentials: {},
+      home: path.join(f.nativeRoot, 'session', 'home'), sessionRoot: path.join(f.nativeRoot, 'session'), nativeRoot: f.nativeRoot })
+    const { auditPrivatePermissions } = require('../../agents/codex/workflow/safe-run-root.js')
+    for (const leaf of [scratch, environment.LOCALAPPDATA]) {
+      assert.equal(auditPrivatePermissions(leaf, { recurse: false }).valid, true, `${leaf} must have a protected private DACL`)
+    }
+    const nativeRootAfter = fs.lstatSync(f.nativeRoot)
+    assert.equal(nativeRootAfter.dev, nativeRootBefore.dev)
+    assert.equal(nativeRootAfter.ino, nativeRootBefore.ino)
+    assert.equal(auditPrivatePermissions(f.nativeRoot, { recurse: false }).valid, true)
+  })
+
   test('Reasonix projects a closed six-capability call envelope for the generic native proxy', () => {
     const target = '/owned/target', scratch = '/owned/scratch'
     const projection = require('../../agents/reasonix/workflow/transport.js').controlledToolProtocolProjection(target, scratch)

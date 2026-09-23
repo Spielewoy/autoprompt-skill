@@ -5,7 +5,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { pathToFileURL } = require('node:url')
+const { pathToFileURL, fileURLToPath } = require('node:url')
 const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const { readBound, sha256, privateDirectory, writePrivate } = require('../agents/reasonix/workflow/native.js')
@@ -592,9 +592,32 @@ function hermesClosureRuntime(executable) {
   }
   return Object.freeze({ root, manifestFile, manifest: Object.freeze(manifest), ...result })
 }
+function hermesPosixLauncherBinding(executable, bytes = readBound(executable)) {
+  if (process.platform === 'win32' || !bytes.subarray(0, 64).toString('utf8').startsWith('#!/usr/bin/env bash\n')) return null
+  return require('./harness-v2-bridge/hermes/posix-launcher.cjs').bindHermesPosixLauncher(executable)
+}
+function hermesPythonInterpreter(executable) {
+  const closure = hermesClosureRuntime(executable)
+  if (closure) return closure.python
+  const bytes = readBound(executable)
+  const posix = hermesPosixLauncherBinding(executable, bytes)
+  if (posix) return posix.interpreter.path
+  if (process.platform === 'win32' && bytes.subarray(0, 2).toString('ascii') === 'MZ') {
+    const binding = require('./harness-v2-bridge/hermes/windows-launcher.cjs').parseHermesUvLauncher(bytes)
+    if (binding.architecture !== process.arch) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes trampoline architecture differs from its native host')
+    const interpreter = fs.realpathSync.native(binding.pythonPath)
+    const stat = fs.lstatSync(interpreter)
+    if (!stat.isFile() || stat.isSymbolicLink() || path.basename(interpreter).toLowerCase() !== 'python.exe') fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes trampoline Python is not a physical interpreter')
+    return interpreter
+  }
+  const interpreter = /^#!([^\r\n\s]+)/.exec(bytes.subarray(0, 512).toString('utf8'))?.[1]
+  if (!interpreter || !path.isAbsolute(interpreter)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes launcher has no bound absolute Python interpreter')
+  return interpreter
+}
 function hermesPythonDependencyInventory(executable, environment = process.env) {
   const closure = hermesClosureRuntime(executable)
-  const interpreter = closure?.python || /^#!([^\r\n\s]+)/.exec(readBound(executable).subarray(0, 512).toString('utf8'))?.[1]
+  const posix = closure ? null : hermesPosixLauncherBinding(executable)
+  const interpreter = hermesPythonInterpreter(executable)
   if (!interpreter || !path.isAbsolute(interpreter)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes launcher has no bound absolute Python interpreter')
   // Hermes is commonly installed editable during development. Distribution
   // RECORD files then contain only the finder and metadata, while the actual
@@ -607,6 +630,7 @@ function hermesPythonDependencyInventory(executable, environment = process.env) 
 import importlib.metadata as metadata
 import json
 import os
+import sys
 from pathlib import Path
 import sysconfig
 
@@ -715,11 +739,12 @@ for direct_url in purelib_path.glob("*.dist-info/direct_url.json"):
         editable = isinstance(direct.get("dir_info"), dict) and direct["dir_info"].get("editable") is True
         if not editable or not isinstance(value, str) or not value.startswith("file://"):
             continue
-        from urllib.parse import unquote, urlsplit
+        from urllib.parse import urlsplit
+        from urllib.request import url2pathname
         parsed = urlsplit(value)
         if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
             missing.append(str(direct_url)); continue
-        root = Path(unquote(parsed.path)).resolve()
+        root = Path(url2pathname(parsed.path)).resolve()
         if not root.is_dir():
             missing.append(str(direct_url)); continue
         editable_direct_roots.append((str(root), direct_url.parent.name))
@@ -779,7 +804,10 @@ def add_tree(root, allow_stdlib_links=False):
             links.append({"logicalPath": "python/stdlib-link/" + candidate.relative_to(stdlib_root).as_posix(), "path": str(candidate), "target": str(target.resolve())})
             files.add(str(target.resolve()))
         elif candidate.is_file():
-            files.add(str(candidate.resolve()))
+            # root is already canonical, rglob does not descend directory links,
+            # and the link case above is handled separately. Avoid resolving
+            # every ancestor again for each of thousands of regular files.
+            files.add(str(candidate))
 
 for root in list(source_roots):
     add_tree(root)
@@ -787,6 +815,18 @@ for root in package_roots:
     add_tree(root)
 for root in stdlib_roots:
     add_tree(root, Path(root).resolve() == stdlib_root)
+
+# A Windows venv python.exe redirects into its base installation. Bind the
+# loader configuration, interpreter DLLs and native stdlib extensions as well
+# as Lib; these files do not appear in wheel RECORD inventories.
+if os.name == "nt":
+    for runtime_root in {Path(sys.base_prefix), Path(sys.prefix), Path(sys.executable).parent}:
+        for pattern in ("*.dll", "python*.exe", "python*.zip", "pyvenv.cfg"):
+            for candidate in runtime_root.glob(pattern):
+                add_tree(candidate)
+    dlls = Path(sys.base_prefix) / "DLLs"
+    if dlls.exists():
+        add_tree(dlls)
 
 # Keep a declared logical-root map alongside the raw path list. The Node
 # caller hashes every listed byte for its legacy local identity; this map is
@@ -810,6 +850,9 @@ add_root("python/stdlib", sysconfig.get_paths().get("stdlib"))
 add_root("python/platstdlib", sysconfig.get_paths().get("platstdlib"))
 add_root("python/site-packages", sysconfig.get_paths().get("purelib"))
 add_root("python/plat-site-packages", sysconfig.get_paths().get("platlib"))
+if os.name == "nt":
+    add_root("python/base-runtime", sys.base_prefix)
+    add_root("python/venv-runtime", sys.prefix)
 # Direct editable source roots are logical roots too, but their trees are not
 # added a second time: finder/path roots above remain the exact file closure.
 for root, name in editable_direct_roots:
@@ -842,27 +885,36 @@ print(json.dumps({"files": sorted(files), "packageCount": len(package_names), "m
   const probeCache = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-hermes-python-cache-'))
   let run
   try {
-    run = cp.spawnSync(interpreter, ['-c', script], { cwd: probeCache, env: { PATH: environment.PATH || '', PYTHONNOUSERSITE: '1', PYTHONPYCACHEPREFIX: probeCache }, encoding: 'utf8', timeout: 30000, maxBuffer: 64 * 1024 * 1024 })
+    const system = process.platform === 'win32' ? Object.fromEntries(Object.entries(environment).filter(([name]) => ['systemroot', 'windir'].includes(name.toLowerCase()))) : {}
+    run = cp.spawnSync(interpreter, ['-c', script], { cwd: probeCache, env: { ...system, PATH: environment.PATH || '', PYTHONNOUSERSITE: '1', PYTHONPYCACHEPREFIX: probeCache }, encoding: 'utf8', timeout: 30000, maxBuffer: 64 * 1024 * 1024 })
   } finally {
     fs.rmSync(probeCache, { recursive: true, force: true })
   }
-  if (run.error || run.status !== 0) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency inventory could not be read')
+  if (run.error || run.status !== 0) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency inventory could not be read', {
+    status: run.status, signal: run.signal, code: run.error?.code, stderr: String(run.stderr || '').slice(-2048),
+  })
   let inventory; try { inventory = JSON.parse(run.stdout) } catch { fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency inventory is invalid') }
   if (closure) {
     if (!Array.isArray(inventory.roots) || inventory.roots.some(item => item?.logicalPath === 'python/interpreter' || item?.logicalPath === 'hermes/manifest')) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes closure Python root is invalid')
     inventory.roots.push({ logicalPath: 'python/interpreter', path: closure.runtimePython })
     inventory.roots.push({ logicalPath: 'hermes/manifest', path: closure.manifestFile })
   }
+  if (posix) {
+    if (!Array.isArray(inventory.roots) || inventory.roots.some(item => ['hermes/entrypoint', 'hermes/venv-config'].includes(item?.logicalPath))) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes POSIX launcher roots are invalid')
+    inventory.roots.push({ logicalPath: 'hermes/entrypoint', path: fs.realpathSync.native(posix.entrypointPath) })
+    inventory.roots.push({ logicalPath: 'hermes/venv-config', path: fs.realpathSync.native(posix.authenticatingConfigPaths[0]) })
+  }
   const listed = inventory?.files
   if (!Array.isArray(listed) || !listed.length || (Array.isArray(inventory.missing) && inventory.missing.length)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency inventory is incomplete')
   const files = new Map()
-  for (const file of [executable, interpreter, ...(closure ? [closure.runtimePython, closure.manifestFile] : []), ...listed]) {
+  for (const file of [executable, interpreter, ...(closure ? [closure.runtimePython, closure.manifestFile] : []), ...(posix?.authenticatingFiles.map(item => item.path) || []), ...listed]) {
     if (!path.isAbsolute(file) || !fs.existsSync(file)) continue
     const stat = fs.lstatSync(file)
     const boundInterpreter = stat.isSymbolicLink() && path.resolve(file) === path.resolve(interpreter) && fs.statSync(file).isFile()
     if ((!stat.isFile() && !boundInterpreter) || (stat.isSymbolicLink() && !boundInterpreter)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency inventory contains a linked or invalid file')
     const real = fs.realpathSync.native(file); files.set(real, executableSha256(real))
   }
+  if (posix && (files.get(posix.interpreter.physicalPath) !== posix.interpreter.sha256 || posix.authenticatingFiles.some(item => files.get(fs.realpathSync.native(item.path)) !== item.sha256))) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes POSIX launcher binding changed while collecting identity')
   if (files.size < 3) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency inventory is incomplete')
   if (!Number.isSafeInteger(inventory.packageCount) || inventory.packageCount < 1) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency package inventory is invalid')
   const links = []
@@ -914,7 +966,7 @@ function hermesPortableRuntimeDependencyIdentity(executable, environment = proce
       if (url.protocol !== 'file:' || (url.hostname && url.hostname !== 'localhost') || url.search || url.hash || url.username || url.password) {
         fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes direct URL metadata is not a local installation reference')
       }
-      try { source = decodeURIComponent(url.pathname) } catch { fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes direct URL metadata is not decodable') }
+      try { source = fileURLToPath(url) } catch { fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes direct URL metadata is not decodable') }
     }
     if (!path.isAbsolute(source)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes generated metadata has a non-absolute installation reference')
     let real
@@ -939,8 +991,9 @@ function hermesPortableRuntimeDependencyIdentity(executable, environment = proce
   }
   const replaceQuoted = (text, reference, replacement, expected) => {
     if (typeof reference !== 'string' || !reference || /[\r\n\0]/.test(reference)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes generated metadata reference is invalid')
-    const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const matcher = new RegExp(`(['"])${escaped}\\1`, 'g')
+    const literalForms = [...new Set([reference, reference.replace(/\\/g, '\\\\')])]
+    const escaped = literalForms.map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+    const matcher = new RegExp(`(['"])(?:${escaped})\\1`, 'g')
     const matches = [...text.matchAll(matcher)]
     if (matches.length !== expected) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes generated metadata does not match its parsed literal closure')
     return text.replace(matcher, (_whole, quote) => `${quote}${replacement}${quote}`)
@@ -1029,12 +1082,23 @@ function hermesPortableRuntimeDependencyIdentity(executable, environment = proce
     })
     if (touched) { canonical.set(file, Buffer.from(next, 'utf8')); changed.add(file) }
   }
+  const launcherDigests = new Map()
+  const posixLauncher = hermesPosixLauncherBinding(executable)
+  if (posixLauncher) {
+    const projected = require('./harness-v2-bridge/hermes/posix-launcher.cjs').canonicalHermesPosixIdentity(posixLauncher)
+    for (const item of projected.canonicalFiles) {
+      if (rawFiles.get(item.path) !== item.rawSha256) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes POSIX launcher changed before portable projection')
+      readExact(item.path, item.rawSha256)
+      launcherDigests.set(item.path, item.sha256)
+    }
+  }
+  const portableHash = (file, rawHash) => launcherDigests.get(file) || (canonical.has(file) ? sha256(canonical.get(file)) : rawHash)
   const logical = new Map(), add = (label, hash) => {
     if (!validLabel(label) || !/^[a-f0-9]{64}$/.test(hash)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes portable dependency record is invalid')
     if (logical.has(label)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes portable dependency record is ambiguous')
     logical.set(label, hash)
   }
-  add(`hermes/launcher/${path.basename(launcher)}`, sha256(canonical.get(launcher) || readExact(launcher, rawFiles.get(launcher))))
+  add(`hermes/launcher/${path.basename(launcher)}`, portableHash(launcher, sha256(readExact(launcher, rawFiles.get(launcher)))))
   add(`python/interpreter/${path.basename(interpreter)}`, executableSha256(interpreter))
   for (const link of linkBindings) {
     if (!validLabel(link.logicalPath) || !rawFiles.has(link.target) || link.targetSha256 !== rawFiles.get(link.target) || !/^[a-f0-9]{64}$/.test(link.targetSha256 || '')) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python symlink binding is invalid')
@@ -1054,7 +1118,7 @@ function hermesPortableRuntimeDependencyIdentity(executable, environment = proce
     }
     const relative = path.relative(root.path, file).split(path.sep).join('/')
     if (relative.startsWith('../') || relative.includes('/../')) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency escaped its logical root')
-    add(`${root.logicalPath}${relative ? `/${relative}` : ''}`, canonical.has(file) ? sha256(canonical.get(file)) : hash)
+    add(`${root.logicalPath}${relative ? `/${relative}` : ''}`, portableHash(file, hash))
   }
   const files = [...logical].sort(([a], [b]) => a.localeCompare(b))
   if (files.length !== captured.files.length + linkBindings.length) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes portable dependency inventory is incomplete')
@@ -1216,7 +1280,8 @@ function probeExecutable(options = {}) {
       const nativeEnv = nativeArgv === argv ? env : { ...env, ELECTRON_RUN_AS_NODE: '1' }
       const launch = executableInvocation(binding, nativeArgv)
       const result = spawn(launch.executable, launch.argv, { cwd: probeRoot, env: nativeEnv, shell: false, encoding: 'utf8', timeout, maxBuffer: 1024 * 1024, windowsHide: true })
-      if (result.error || result.status !== 0 || result.signal) fail('PROVIDER_UNSUPPORTED', `${d.command} capability probe failed`, { argv, status: result.status, code: result.error?.code })
+      if (result.error || result.status !== 0 || result.signal) fail('PROVIDER_UNSUPPORTED', `${d.command} capability probe failed`, { argv, status: result.status, code: result.error?.code,
+        signal: result.signal, stderr: String(result.stderr || '').slice(-2048) })
       return `${result.stdout || ''}\n${result.stderr || ''}`
     }
     const versionText = invoke(['--version'])
@@ -1591,8 +1656,7 @@ function createLaunch(options) {
     const pythonCache = path.join(home, 'python-cache')
     privateDirectory(pythonCache)
     env.PYTHONPYCACHEPREFIX = pythonCache
-    const launcher = readBound(options.executable).subarray(0, 512).toString('utf8')
-    const pythonExecutable = hermesClosureRuntime(options.executable)?.python || /^#!([^\r\n\s]+)/.exec(launcher)?.[1]
+    const pythonExecutable = hermesPythonInterpreter(options.executable)
     if (!pythonExecutable || !path.isAbsolute(pythonExecutable)) fail('PROVIDER_UNSUPPORTED', 'Hermes launcher does not bind an absolute Python interpreter')
     const configuredMaxTokens = connection.maxTokens
     const maxTokens = options.maxTokens === undefined ? configuredMaxTokens : Math.min(options.maxTokens, configuredMaxTokens || options.maxTokens)
@@ -1657,4 +1721,4 @@ function createLaunch(options) {
     ...(windowsTempDirectory ? { windowsTempDirectory } : {}),
     ...(requiredResponseFormat ? { requiredResponseFormat } : {}) }
 }
-module.exports = { windowsNpmShimInvocation, vscodeCliPath, runtimeDependencyIdentity, portableRuntimeDependencyIdentity, hermesPythonDependencyInventory, hermesRuntimeDependencyIdentity, hermesPortableRuntimeDependencyIdentity, validateEffort, PROVIDERS, HarnessError, fail, descriptor, locateExecutable, executableSha256, executableRuntimePath, executableInvocation, probeExecutable, deepseekSdkCapabilityEvidence, connectionConfig, sanitizeConnection, credentialEnvironment, isolatedEnvironment, createLaunch, readBound, sha256, privateDirectory, writePrivate }
+module.exports = { windowsNpmShimInvocation, vscodeCliPath, runtimeDependencyIdentity, portableRuntimeDependencyIdentity, hermesPythonInterpreter, hermesPythonDependencyInventory, hermesRuntimeDependencyIdentity, hermesPortableRuntimeDependencyIdentity, validateEffort, PROVIDERS, HarnessError, fail, descriptor, locateExecutable, executableSha256, executableRuntimePath, executableInvocation, probeExecutable, deepseekSdkCapabilityEvidence, connectionConfig, sanitizeConnection, credentialEnvironment, isolatedEnvironment, createLaunch, readBound, sha256, privateDirectory, writePrivate }

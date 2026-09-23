@@ -7,11 +7,8 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const cp = require('node:child_process')
 const { readBound, writePrivate, privateDirectory, sha256 } = require('../agents/reasonix/workflow/native.js')
+const { BoundaryError, OUTPUT_LIMIT, TOOLS, validateArguments } = require('./harness-v2-bridge/grok/tool-schema.cjs')
 const PROVIDERS = new Set(['claude', 'opencode', 'kilo', 'prime', 'omp', 'deepseek', 'vscode', 'reasonix', 'hermes', 'grok'])
-const OUTPUT_LIMIT = 1024 * 1024
-class BoundaryError extends Error {
-  constructor(code, message) { super(message); this.name = 'BoundaryError'; this.code = code }
-}
 function fail(code, message) { throw new BoundaryError(code, message) }
 function canonicalJson(value) {
   const order = item => Array.isArray(item) ? item.map(order) : item && typeof item === 'object'
@@ -91,29 +88,6 @@ function validatePolicy(input) {
     fail('TOOL_POLICY_INVALID', 'Tool roots expand beyond their controller assignment')
   }
   return { ...input, schemaVersion: 1, targetPath, ...(scratchPath ? { scratchPath } : {}), readableRoots, writableRoots }
-}
-function schema(properties, required) { return { type: 'object', properties, required, additionalProperties: false } }
-const text = { type: 'string' }, integer = { type: 'integer', minimum: 1 }
-const TOOLS = Object.freeze([
-  { name: 'read', description: 'Read a bounded text range from an assigned physical file.', inputSchema: schema({ path: text, startLine: integer, lineCount: { ...integer, maximum: 5000 } }, ['path']) },
-  { name: 'list', description: 'List an assigned directory without following links.', inputSchema: schema({ path: text }, ['path']) },
-  { name: 'search', description: 'Find literal text in assigned files; no regular-expression execution.', inputSchema: schema({ path: text, text, maxResults: { ...integer, maximum: 200 } }, ['path', 'text']) },
-  { name: 'write', description: 'Atomically write an explicitly authorized task or checker scratch file.', inputSchema: schema({ path: text, content: text }, ['path', 'content']) },
-  { name: 'edit', description: 'Replace exact text in an authorized file. Ambiguous matches fail.', inputSchema: schema({ path: text, oldText: text, newText: text, replaceAll: { type: 'boolean' } }, ['path', 'oldText', 'newText']) },
-  { name: 'bash', description: 'Run a foreground command in the assigned OS sandbox with no outbound network or host credentials.', inputSchema: schema({ command: text, cwd: text, timeoutMs: { ...integer, maximum: 300000 } }, ['command']) },
-])
-function validateArguments(name, args) {
-  const tool = TOOLS.find(item => item.name === name)
-  if (!tool) fail('TOOL_DENIED', 'The controller does not expose that tool')
-  if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).some(key => !Object.hasOwn(tool.inputSchema.properties, key)) ||
-      tool.inputSchema.required.some(key => !Object.hasOwn(args, key))) fail('TOOL_ARGUMENTS_INVALID', 'Tool arguments do not match the fixed schema')
-  for (const [key, value] of Object.entries(args)) {
-    const spec = tool.inputSchema.properties[key]
-    if ((spec.type === 'string' && (typeof value !== 'string' || value.includes('\0') || Buffer.byteLength(value) > 4 * OUTPUT_LIMIT)) ||
-        (spec.type === 'boolean' && typeof value !== 'boolean') ||
-        (spec.type === 'integer' && (!Number.isSafeInteger(value) || value < spec.minimum || value > (spec.maximum || Number.MAX_SAFE_INTEGER)))) fail('TOOL_ARGUMENTS_INVALID', `Invalid ${key} argument`)
-  }
-  return tool
 }
 function authorize(policy, file, write = false) {
   const absolute = physical(path.isAbsolute(file) ? file : path.resolve(policy.targetPath, file), { missingLeaf: write })

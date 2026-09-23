@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const { createModelProxy } = require('./model-proxy.cjs')
 const { createPreconnectedRelayClient } = require('./unix-relay.cjs')
 const { createMcpLoopbackServer } = require('./mcp-loopback.cjs')
+const { validateArguments } = require('./tool-schema.cjs')
 
 const value = name => {
   const result = process.env[name]
@@ -14,14 +15,12 @@ const value = name => {
 const allowedMcpTools = () => {
   const raw = JSON.parse(value('AUTOPROMPT_GROK_ALLOWED_MCP_TOOLS'))
   if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !Object.keys(raw).length) throw new Error('Owned MCP policy is invalid')
-  const boundary = require(value('AUTOPROMPT_GROK_TOOL_BOUNDARY'))
-  if (typeof boundary.validateArguments !== 'function') throw new Error('Owned MCP boundary is unavailable')
   return Object.fromEntries(Object.entries(raw).map(([qualifiedName, toolName]) => {
     if (typeof qualifiedName !== 'string' || !qualifiedName || typeof toolName !== 'string' || !toolName) throw new Error('Owned MCP policy is invalid')
     // Reuse the controller tool boundary's exact closed schemas. This admits
     // optional fields and their bounds as defined by the receipt-producing
     // server, rather than duplicating a weaker Grok-side schema.
-    return [qualifiedName, input => boundary.validateArguments(toolName, input)]
+    return [qualifiedName, input => validateArguments(toolName, input)]
   }))
 }
 const issuedCalls = () => {

@@ -14,9 +14,9 @@ static int activate4(const char *name, in_port_t expected, int *out) {
   int *fds = NULL; size_t count = 0;
   if (launch_activate_socket(name, &fds, &count) != 0 || !fds || count != 1) { free(fds); return 2; }
   struct sockaddr_in address; socklen_t length = sizeof(address);
-  struct in_addr loopback; loopback.s_addr = htonl(INADDR_LOOPBACK);
+  struct in_addr wildcard; wildcard.s_addr = htonl(INADDR_ANY);
   if (getsockname(fds[0], (struct sockaddr *)&address, &length) != 0 || address.sin_family != AF_INET ||
-      address.sin_port != expected || memcmp(&address.sin_addr, &loopback, sizeof(loopback)) != 0) { close(fds[0]); free(fds); return 3; }
+      address.sin_port != expected || memcmp(&address.sin_addr, &wildcard, sizeof(wildcard)) != 0) { close(fds[0]); free(fds); return 3; }
   *out = fds[0]; free(fds); return 0;
 }
 static int activate6(const char *name, in_port_t expected, int *out) {
@@ -42,7 +42,7 @@ static int publish(const char *path, in_port_t port) {
 static int probe_failure(const char *operation) {
   int value = errno;
   fprintf(stderr, "%s errno=%d\n", operation, value);
-  return value == EACCES || value == EPERM ? 77 : 66;
+  return value == EACCES || value == EPERM ? 77 : value == EADDRINUSE ? 78 : 66;
 }
 static int parsed_port(const char *text, in_port_t *port) {
   char *end = NULL;
@@ -75,7 +75,7 @@ static int connect6(const char *host, const char *text) {
   int result = connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0 ? 0 : probe_failure("connect6");
   close(fd); return result;
 }
-static int bind4(const char *host, const char *text) {
+static int bind4(const char *host, const char *text, int reuse) {
   struct sockaddr_in address;
   in_port_t port;
   if (parsed_port(text, &port)) return 64;
@@ -84,6 +84,11 @@ static int bind4(const char *host, const char *text) {
   if (inet_pton(AF_INET, host, &address.sin_addr) != 1) return 64;
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) return 65;
+  if (reuse) {
+    int enabled = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)) != 0) { close(fd); return 65; }
+  }
   int result = bind(fd, (struct sockaddr *)&address, sizeof(address)) == 0 && listen(fd, 1) == 0 ? 0 : probe_failure("bind4-listen");
   close(fd); return result;
 }
@@ -91,7 +96,8 @@ int main(int argc, char **argv) {
   if (argc == 4) {
     if (strcmp(argv[1], "connect4") == 0) return connect4(argv[2], argv[3]);
     if (strcmp(argv[1], "connect6") == 0) return connect6(argv[2], argv[3]);
-    if (strcmp(argv[1], "bind4") == 0) return bind4(argv[2], argv[3]);
+    if (strcmp(argv[1], "bind4") == 0) return bind4(argv[2], argv[3], 0);
+    if (strcmp(argv[1], "bind4-reuse") == 0) return bind4(argv[2], argv[3], 1);
     return 64;
   }
   if (argc != 5) return 64;

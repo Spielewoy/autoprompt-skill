@@ -20,7 +20,7 @@ const listen = (host, port = 0) => new Promise((resolve, reject) => {
 const close = server => new Promise(resolve => server.close(resolve))
 const selectDualstackPort = async () => {
   for (let attempt = 0; attempt < 32; attempt++) {
-    const v4 = await listen('127.0.0.1')
+    const v4 = await listen('0.0.0.0')
     const port = v4.address().port
     try {
       const v6 = await listen('::1', port)
@@ -38,7 +38,7 @@ const seatbeltProfile = (executable, port) => [
   '(allow file-read* (subpath "/System"))', '(allow file-read* (subpath "/usr/lib"))',
   `(allow network-outbound (remote ip ${JSON.stringify(`localhost:${port}`)}))`,
 ].join('\n')
-const socketXml = ({ label, executable, ready, port }) => `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array><string>${executable}</string><string>autoprompt.v4</string><string>autoprompt.v6</string><string>${ready}</string><string>${port}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/><key>Sockets</key><dict><key>autoprompt.v4</key><dict><key>SockNodeName</key><string>127.0.0.1</string><key>SockServiceName</key><string>${port}</string><key>SockFamily</key><string>IPv4</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string></dict><key>autoprompt.v6</key><dict><key>SockNodeName</key><string>::1</string><key>SockServiceName</key><string>${port}</string><key>SockFamily</key><string>IPv6</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string></dict></dict></dict></plist>`
+const socketXml = ({ label, executable, ready, port }) => `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array><string>${executable}</string><string>autoprompt.v4</string><string>autoprompt.v6</string><string>${ready}</string><string>${port}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/><key>Sockets</key><dict><key>autoprompt.v4</key><dict><key>SockNodeName</key><string>0.0.0.0</string><key>SockServiceName</key><string>${port}</string><key>SockFamily</key><string>IPv4</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string></dict><key>autoprompt.v6</key><dict><key>SockNodeName</key><string>::1</string><key>SockServiceName</key><string>${port}</string><key>SockFamily</key><string>IPv6</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string></dict></dict></dict></plist>`
 const assertAddressInUse = (host, port) => {
   const script = `require('node:net').createServer().once('error',e=>process.exit(e.code==='EADDRINUSE'?0:2)).listen(${port},${JSON.stringify(host)})`
   const result = command(process.execPath, ['-e', script]); assert.equal(result.status, 0, result.stderr)
@@ -91,18 +91,22 @@ test('Darwin launchd socket activation retains an exact loopback listener throug
   t.after(async () => { for (const listener of listeners) await close(listener) })
   const other = await listen('127.0.0.1'); listeners.push(other)
   const ipv6Other = await listen('::1'); listeners.push(ipv6Other)
-  const hostile = await listen('127.0.0.2', port); listeners.push(hostile)
+  // Seatbelt localhost covers the IPv4 loopback range. A wildcard listener
+  // must own this port on every IPv4 address, including configured aliases.
+  assertAddressInUse('127.0.0.2', port)
   const profile = seatbeltProfile(executable, port)
   const probe = (mode, host, port) => command('/usr/bin/sandbox-exec', ['-p', profile, executable, mode, host, String(port)])
   const unsandboxed = (mode, host, port) => command(executable, [mode, host, String(port)])
+  const contested = unsandboxed('bind4-reuse', '127.0.0.2', port)
+  assert.equal(contested.status, 78, `wildcard listener permits a competing reusable alias socket: ${contested.stderr}`)
   for (const [mode, host, probePort] of [
     ['connect4', '127.0.0.1', port], ['connect6', '::1', port], ['connect4', '127.0.0.2', port],
     ['connect4', '127.0.0.1', other.address().port], ['connect6', '::1', ipv6Other.address().port], ['bind4', '127.0.0.1', 0],
   ]) assert.equal(unsandboxed(mode, host, probePort).status, 0, `unsandboxed ${mode} could not exercise ${host}:${probePort}`)
   const permitted4 = probe('connect4', '127.0.0.1', port); assert.equal(permitted4.status, 0, permitted4.stderr)
   const permitted6 = probe('connect6', '::1', port); assert.equal(permitted6.status, 0, permitted6.stderr)
-  const hostileDenied = probe('connect4', '127.0.0.2', port)
-  assert.equal(hostileDenied.status, 77, `Seatbelt did not deny the non-owned 127.0.0.2 endpoint: ${hostileDenied.stderr}`)
+  const permittedAlias = probe('connect4', '127.0.0.2', port)
+  assert.equal(permittedAlias.status, 0, permittedAlias.stderr)
   const wrongPort = probe('connect4', '127.0.0.1', other.address().port)
   assert.equal(wrongPort.status, 77, `Seatbelt did not deny the non-authenticated IPv4 port: ${wrongPort.stderr}`)
   const ipv6Denied = probe('connect6', '::1', ipv6Other.address().port)
@@ -115,9 +119,11 @@ test('Darwin launchd socket activation retains an exact loopback listener throug
   ]) assert.equal(unsandboxed(mode, host, probePort).status, 0, `post-probe unsandboxed ${mode} could not exercise ${host}:${probePort}`)
   process.kill(value.pid, 'SIGKILL')
   await waitFor(() => command('/bin/kill', ['-0', String(value.pid)]).status !== 0, 10000, 'socket worker survived SIGKILL')
-  assertAddressInUse('127.0.0.1', port); assertAddressInUse('::1', port)
+  assertAddressInUse('127.0.0.1', port); assertAddressInUse('127.0.0.2', port); assertAddressInUse('::1', port)
+  const retained = unsandboxed('bind4-reuse', '127.0.0.2', port)
+  assert.equal(retained.status, 78, `worker death released the alias endpoint: ${retained.stderr}`)
   const down = bootout(); assert.equal(down.status, 0, down.stderr); bootstrapped = false
-  assertRebinds('127.0.0.1', port); assertRebinds('::1', port)
+  assertRebinds('127.0.0.1', port); assertRebinds('127.0.0.2', port); assertRebinds('::1', port)
 })
 
 test('Darwin launchd socket diagnostic renders one exact dual-stack listener contract', async () => {
@@ -125,6 +131,6 @@ test('Darwin launchd socket diagnostic renders one exact dual-stack listener con
   const profile = seatbeltProfile('/private/test/socket-owner', port)
   const xml = socketXml({ label: 'com.autoprompt.socket.test', executable: '/private/test/socket-owner', ready: '/private/test/ready.json', port })
   assert.match(profile, new RegExp(`localhost:${port}`))
-  assert.match(xml, new RegExp(`<string>127\\.0\\.0\\.1</string><key>SockServiceName</key><string>${port}</string><key>SockFamily</key><string>IPv4</string>`))
+  assert.match(xml, new RegExp(`<string>0\\.0\\.0\\.0</string><key>SockServiceName</key><string>${port}</string><key>SockFamily</key><string>IPv4</string>`))
   assert.match(xml, new RegExp(`<string>::1</string><key>SockServiceName</key><string>${port}</string><key>SockFamily</key><string>IPv6</string>`))
 })

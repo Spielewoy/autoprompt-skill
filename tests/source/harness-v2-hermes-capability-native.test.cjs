@@ -11,6 +11,7 @@ const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 const native = require('../../scripts/harness-v2-native.cjs')
+const { parseHermesUvLauncher } = require('../../scripts/harness-v2-bridge/hermes/windows-launcher.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
@@ -106,9 +107,18 @@ function hermesMessages(f) {
     const stat = fs.lstatSync(python)
     assert.equal(stat.isFile(), true, 'Hermes closure Python wrapper is missing')
     assert.equal(stat.isSymbolicLink(), false, 'Hermes closure Python wrapper must be physical')
+  } else if (process.platform === 'win32') {
+    const expected = process.env.AUTOPROMPT_HERMES_WINDOWS_PYTHON
+    assert.ok(expected && path.isAbsolute(expected), 'Windows Hermes test requires the installer-owned Python binding')
+    const binding = parseHermesUvLauncher(fs.readFileSync(CLI))
+    assert.equal(fs.realpathSync.native(binding.pythonPath).toLowerCase(), fs.realpathSync.native(expected).toLowerCase(),
+      'public Hermes trampoline resource must bind the installer-owned Python')
+    python = binding.pythonPath
   } else {
     const launcher = fs.readFileSync(CLI, 'utf8').slice(0, 512)
-    python = /^#!([^\r\n\s]+)/.exec(launcher)?.[1]
+    python = launcher.startsWith('#!/usr/bin/env bash\n')
+      ? require('../../scripts/harness-v2-bridge/hermes/posix-launcher.cjs').bindHermesPosixLauncher(CLI).interpreter.path
+      : /^#!([^\r\n\s]+)/.exec(launcher)?.[1]
   }
   assert.ok(python && path.isAbsolute(python), 'pinned Hermes launcher has no absolute Python binding')
   const script = "import json,sqlite3,sys;c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True);print(json.dumps(c.execute('select role,content from messages order by id').fetchall()))"
@@ -128,9 +138,12 @@ async function scenario(t, config = {}) {
   let releaseFinal; const finalReleased = new Promise(resolve => { releaseFinal = resolve }); let heldFinal
   const finalHeld = new Promise(resolve => { heldFinal = resolve })
   const service = await modelService({ tool: config.tool || { name: 'autoprompt_owned_bash', args: { command } }, hold: config.hold, holdFinal: config.holdFinal, releaseFinal: finalReleased, finalHeld: () => heldFinal() })
+  let owner
+  t.after(async () => { await cleanupNativeFixture(f, 'hermes', { stop: () => owner?.cancelAll({ reason: 'hermes native capability cleanup', graceMs: 0, killMs: 2000, waitForPending: true }), close: async () => { service.server.closeAllConnections?.(); await new Promise(resolve => service.server.close(resolve)) } }) })
   service.releaseFinal = releaseFinal; service.finalHeld = finalHeld
   const binding = native.probeExecutable({ provider: 'hermes', executable: CLI, env: { PATH: process.env.PATH } })
-  const owner = ownership(f), processAdapter = owner.adapter
+  owner = ownership(f)
+  const processAdapter = owner.adapter
   const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'hermes-closed-native-canary', pollMs: 10 })
   const adapter = new HarnessExecAdapter({ provider: 'hermes', runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: { model: 'fixture/model', modelProvider: 'custom', environment: { HERMES_BASE_URL: 'http://127.0.0.1:' + service.port + '/v1' } }, credentialEnvironment: { OPENROUTER_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only assigned controller tools and return one JSON object.' })
@@ -142,7 +155,6 @@ async function scenario(t, config = {}) {
     assert.ok(service.requests.some(request => JSON.stringify(request.messages).includes('CLOSED_CANARY_CHALLENGE:' + f.challenge)), 'actual Hermes controller output omitted canary challenge')
     return result
   }
-  t.after(async () => { await cleanupNativeFixture(f, 'hermes', { stop: () => owner.cancelAll({ reason: 'hermes native capability cleanup', graceMs: 0, killMs: 2000, waitForPending: true }), close: async () => { service.server.closeAllConnections?.(); await new Promise(resolve => service.server.close(resolve)) } }) })
   return { ...values, service, binding, owner, adapter, processAdapter, run }
 }
 function successful(result, expectedReceipts = 1) {
@@ -247,6 +259,7 @@ test('hermes closed native capability: continuation resumes and foreign target i
 })
 test('hermes closed native capability: cancellation drains held child while sibling succeeds', options, async t => {
   const held = await scenario(t, { command: values => readCommand(values.candidate), hold: true }), controller = new AbortController(), pending = held.run({ signal: controller.signal })
+  pending.catch(() => {})
   for (let index = 0; index < 800 && held.service.requests.length === 0; index++) await wait(25)
   assert.ok(held.service.requests.length > 0, 'held child did not reach a real model request')
   const fast = await scenario(t, { command: values => readCommand(values.candidate) }); const result = await fast.run({}); successful(result)
@@ -291,6 +304,7 @@ test('hermes closed native capability: independent checker freezes candidate and
 })
 test('hermes closed native capability: durable owner recovery drains live crashed controller child', options, async t => {
   const f = await scenario(t, { command: values => readCommand(values.candidate), hold: true }), pending = f.run({})
+  pending.catch(() => {})
   for (let index = 0; index < 800 && f.service.requests.length === 0; index++) await wait(25)
   assert.equal(f.owner.ownershipIdentities().length, 1, 'live native child was not durably registered')
   const recovered = new ProcessOwner({ adapter: nativeProcessAdapter(path.join(f.controller, 'processes.json'), f.controller), registryPath: path.join(f.controller, 'processes.json'), pollMs: 10 })

@@ -11,7 +11,7 @@ on:
         required: false
         default: none
         type: choice
-        options: [none, macos-containment, windows-bootstrap, windows-provider-primitives, opencode, vscode]
+        options: [none, macos-containment, windows-bootstrap, windows-provider-primitives, opencode, vscode, hermes-macos]
       support_provider:
         description: 'Installed provider for the focused provider stage'
         required: false
@@ -25,11 +25,11 @@ on:
         type: choice
         options: [all, relay, hermes]
       support_capability:
-        description: 'Run all capabilities or only the failing checker diagnostic'
+        description: 'Run all capabilities or a focused checker/cancellation diagnostic'
         required: false
         default: all
         type: choice
-        options: [all, isolatedChecking]
+        options: [all, isolatedChecking, cancellation]
       support_arm:
         description: 'Limit focused Windows provider verification to ARM64'
         required: false
@@ -1172,7 +1172,7 @@ jobs:
       matrix:
         os: [windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: ${{ inputs.support_primitive == 'hermes' && 90 || 40 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -1209,6 +1209,15 @@ jobs:
         run: |
           set -o pipefail
           node --test --test-reporter=tap tests/source/hermes-windows-launcher-native.test.cjs 2>&1 | tee hermes-windows-launcher.tap
+      - name: Exercise all native Hermes capabilities
+        if: ${{ inputs.support_primitive == 'hermes' && env.AUTOPROMPT_HERMES_WINDOWS_CLI != '' }}
+        timeout-minutes: 45
+        shell: bash
+        env:
+          AUTOPROMPT_HERMES_TEST_CLI: ${{ env.AUTOPROMPT_HERMES_WINDOWS_CLI }}
+          AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1'
+          AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
+        run: node tests/helpers/provider-platform-ci.cjs hermes
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -1218,6 +1227,8 @@ jobs:
             windows-relay-native.log
             grok-windows-relay.log
             hermes-windows-launcher.tap
+            native-hermes-evidence.json
+            native-hermes-tests.log
             ${{ runner.temp }}/hermes-windows-launcher-evidence.json
             ${{ runner.temp }}/hermes-windows-0.21.1/official-installer.log
             ${{ runner.temp }}/hermes-public-launcher.exe
@@ -1313,7 +1324,7 @@ jobs:
         run: node tests/helpers/install-vscode-native-ci.cjs | tee vscode-native-acquisition.json
       - name: Diagnose bounded Windows VS Code bootstrap
         if: runner.os == 'Windows'
-        timeout-minutes: 5
+        timeout-minutes: 8
         shell: bash
         run: node tests/helpers/vscode-windows-probe-diagnostic.cjs | tee vscode-windows-probe-diagnostic.json
       - name: Probe the native VS Code bundle and preserve identity
@@ -1340,4 +1351,46 @@ jobs:
             vscode-windows-probe-diagnostic.json
             native-vscode-evidence.json
             native-vscode-tests.log
+          if-no-files-found: error
+
+  hermes-macos-acquisition:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'hermes-macos'
+    name: Hermes 0.21.1 / ${{ matrix.runner.os }} / ${{ matrix.runner.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - { os: macos-15-intel, arch: x64 }
+          - { os: macos-latest, arch: arm64 }
+    runs-on: ${{ matrix.runner.os }}
+    timeout-minutes: 80
+    env:
+      AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+          architecture: ${{ matrix.runner.arch }}
+      - run: npm ci --ignore-scripts
+      - name: Acquire the pinned official Hermes macOS installation
+        timeout-minutes: 25
+        shell: bash
+        run: |
+          set -o pipefail
+          bash tests/helpers/install-hermes-macos-ci.sh "$RUNNER_TEMP/hermes-macos-0.21.1" | tee hermes-macos-acquisition.json
+      - name: Require all eleven native Hermes capabilities
+        timeout-minutes: 45
+        shell: bash
+        run: node tests/helpers/provider-platform-ci.cjs hermes
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: hermes-0.21.1-${{ matrix.runner.os }}-${{ matrix.runner.arch }}
+          path: |
+            hermes-macos-acquisition.json
+            native-hermes-evidence.json
+            native-hermes-tests.log
+            ${{ runner.temp }}/hermes-macos-0.21.1/hermes-macos-acquisition.json
+            ${{ runner.temp }}/hermes-macos-0.21.1/official-installer.log
           if-no-files-found: error
