@@ -8,7 +8,8 @@ const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
-const { ownedTest, drainRegistered, claimPrivateCanaryDirectory, closedCanaryBatchTimeout } = require('../../scripts/harness-v2-closed-canary.cjs')
+const { inspectPathNoFollow } = require('../../agents/codex/workflow/safe-run-root.js')
+const { ownedTest, drainRegistered, claimPrivateCanaryDirectory, closedCanaryBatchTimeout, closedEnvironment, stageWindowsOpenCodeShortEnvironment, validateWindowsOpenCodeShortEnvironment, removeWindowsOpenCodeShortEnvironment, finalizeClosedCanary, WINDOWS_OPENCODE_SHORT_ENV_RECORD } = require('../../scripts/harness-v2-closed-canary.cjs')
 
 function privateDirectory(file) { fs.mkdirSync(file, { recursive: true, mode: 0o700 }); return fs.realpathSync.native(file) }
 function binding(root) {
@@ -248,6 +249,269 @@ test('closed canary owned-test startup consumes the same finite batch deadline',
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+
+function shortCanaryFixture() {
+  const base = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-short-env-')))
+  const local = privateDirectory(path.join(base, 'local-app-data'))
+  const generation = privateDirectory(path.join(base, 'generation-1'))
+  const state = { local, removals: [], beforeOwnedRemove: null }
+  const exactIdentity = value => ({ dev: String(value.dev), ino: String(value.ino) })
+  const windowsFilesystem = {
+    removeOwnedTarget(target, parentIdentity, targetIdentity) {
+      if (state.beforeOwnedRemove) state.beforeOwnedRemove(target, parentIdentity, targetIdentity)
+      const parent = fs.lstatSync(path.dirname(target), { bigint: true })
+      const actual = fs.lstatSync(target, { bigint: true })
+      assert.deepEqual(exactIdentity(parent), { dev: String(parentIdentity.dev), ino: String(parentIdentity.ino) })
+      assert.deepEqual(exactIdentity(actual), { dev: String(targetIdentity.dev), ino: String(targetIdentity.ino) })
+      if (targetIdentity.type === 'directory') {
+        assert.equal(actual.isDirectory(), true)
+        fs.rmSync(target, { recursive: true, force: false })
+      } else {
+        assert.equal(targetIdentity.type, 'file')
+        assert.equal(actual.isFile(), true)
+        fs.unlinkSync(target)
+      }
+      state.removals.push({ target, type: targetIdentity.type })
+    },
+  }
+  const options = {
+    platform: 'win32', systemRoot: 'C:\\Windows',
+    createWindowsCompilerDirectory(prefix) { return fs.mkdtempSync(path.join(state.local, prefix)) },
+    windowsControllerEnvironment() { return { LOCALAPPDATA: state.local } },
+    auditPrivatePermissions(directory, auditOptions) { assert.deepEqual(auditOptions, { recurse: false }); assert.ok(fs.existsSync(directory)) },
+    windowsFilesystem,
+  }
+  return { base, local, generation, state, options,
+    input: { provider: 'opencode', root: generation, activationId: 'short-canary-activation', generation: 1, challenge: crypto.randomBytes(32).toString('base64url') } }
+}
+
+test('Windows OpenCode short canary environment is token-parent bound, sealed, and projected without moving durable state', async t => {
+  const fixture = shortCanaryFixture()
+  t.after(() => fs.rmSync(fixture.base, { recursive: true, force: true }))
+  const staged = await stageWindowsOpenCodeShortEnvironment(fixture.input, fixture.options)
+  assert.equal(path.dirname(staged.root), fixture.local)
+  assert.equal(fs.existsSync(path.join(fixture.generation, WINDOWS_OPENCODE_SHORT_ENV_RECORD)), true)
+  for (const directory of [staged.home, staged.temporary, staged.config, staged.data, staged.state, staged.cache]) assert.equal(fs.statSync(directory).isDirectory(), true)
+  const env = closedEnvironment({ PATH: process.env.PATH, SYSTEMROOT: 'C:\\Windows' }, 'opencode', fixture.generation, {
+    platform: 'win32', windowsShortEnvironment: staged,
+  })
+  assert.equal(env.HOME, staged.home)
+  assert.equal(env.TEMP, staged.temporary)
+  assert.equal(env.XDG_CONFIG_HOME, staged.config)
+  assert.equal(path.join(fixture.generation, 'outer-processes.json').startsWith(fixture.generation + path.sep), true)
+  await removeWindowsOpenCodeShortEnvironment(staged, fixture.options)
+  assert.equal(fs.existsSync(staged.root), false)
+  assert.equal(fs.existsSync(staged.recordPath), false)
+})
+
+test('Windows OpenCode short canary environment retains its journal on root replacement or token-parent drift', async t => {
+  const replaced = shortCanaryFixture()
+  t.after(() => fs.rmSync(replaced.base, { recursive: true, force: true }))
+  const staged = await stageWindowsOpenCodeShortEnvironment(replaced.input, replaced.options)
+  fs.rmSync(staged.root, { recursive: true, force: true })
+  fs.writeFileSync(staged.root, 'replacement', { mode: 0o600 })
+  await assert.rejects(removeWindowsOpenCodeShortEnvironment(staged, replaced.options), error => error.code === 'RUN_RECORD_UNSAFE' || error.code === 'LOCAL_CANARY_INVALID')
+  assert.equal(fs.existsSync(staged.recordPath), true)
+  assert.equal(fs.existsSync(staged.root), true)
+
+  const drifted = shortCanaryFixture()
+  t.after(() => fs.rmSync(drifted.base, { recursive: true, force: true }))
+  const second = await stageWindowsOpenCodeShortEnvironment(drifted.input, drifted.options)
+  const foreign = privateDirectory(path.join(drifted.base, 'foreign-local-app-data'))
+  drifted.state.local = foreign
+  await assert.rejects(removeWindowsOpenCodeShortEnvironment(second, drifted.options), { code: 'LOCAL_CANARY_INVALID' })
+  assert.equal(fs.existsSync(second.recordPath), true)
+  assert.equal(fs.existsSync(second.root), true)
+})
+
+test('Windows OpenCode short canary refuses a replaced journal parent even when the original journal inode is moved back', async t => {
+  const fixture = shortCanaryFixture()
+  t.after(() => fs.rmSync(fixture.base, { recursive: true, force: true }))
+  const staged = await stageWindowsOpenCodeShortEnvironment(fixture.input, fixture.options)
+  const held = path.join(fixture.base, 'held-generation')
+  fs.renameSync(fixture.generation, held)
+  privateDirectory(fixture.generation)
+  fs.renameSync(path.join(held, WINDOWS_OPENCODE_SHORT_ENV_RECORD), staged.recordPath)
+  assert.throws(() => validateWindowsOpenCodeShortEnvironment(staged, fixture.options), { code: 'LOCAL_CANARY_INVALID' })
+  assert.equal(fs.existsSync(staged.root), true)
+  assert.equal(fs.existsSync(staged.recordPath), true)
+})
+
+test('Windows OpenCode short canary refuses a same-byte journal inode replacement between inspection and read', async t => {
+  const fixture = shortCanaryFixture()
+  t.after(() => fs.rmSync(fixture.base, { recursive: true, force: true }))
+  const staged = await stageWindowsOpenCodeShortEnvironment(fixture.input, fixture.options)
+  let replaced = false
+  const held = `${staged.recordPath}.held`
+  const replacingInspect = (candidate, options) => {
+    const inspected = inspectPathNoFollow(candidate, options)
+    if (!replaced && path.resolve(candidate) === path.resolve(staged.recordPath)) {
+      const bytes = fs.readFileSync(staged.recordPath)
+      fs.renameSync(staged.recordPath, held)
+      fs.writeFileSync(staged.recordPath, bytes, { flag: 'wx', mode: 0o600 })
+      replaced = true
+    }
+    return inspected
+  }
+  assert.throws(() => validateWindowsOpenCodeShortEnvironment(staged, { ...fixture.options, inspectPathNoFollow: replacingInspect }), { code: 'LOCAL_CANARY_INVALID' })
+  assert.equal(replaced, true)
+  assert.equal(fs.existsSync(staged.root), true)
+  assert.equal(fs.existsSync(staged.recordPath), true)
+})
+
+test('Windows OpenCode short canary revalidates every projected directory before child launch', async t => {
+  for (const field of ['home', 'temporary']) {
+    await t.test(field, async t => {
+      const fixture = shortCanaryFixture()
+      t.after(() => fs.rmSync(fixture.base, { recursive: true, force: true }))
+      const staged = await stageWindowsOpenCodeShortEnvironment(fixture.input, fixture.options)
+      const held = `${staged[field]}.held`
+      const foreign = privateDirectory(path.join(fixture.base, `foreign-${field}`))
+      fs.renameSync(staged[field], held)
+      fs.symlinkSync(foreign, staged[field], process.platform === 'win32' ? 'junction' : 'dir')
+      assert.throws(() => validateWindowsOpenCodeShortEnvironment(staged, fixture.options), error => error.code === 'RUN_RECORD_UNSAFE' || error.code === 'LOCAL_CANARY_INVALID')
+      assert.equal(fs.existsSync(staged.recordPath), true)
+      assert.equal(fs.existsSync(foreign), true)
+    })
+  }
+})
+
+test('Windows OpenCode short canary retains allocations after uncertain publication failures', async t => {
+  await t.test('post-link failure', async t => {
+    const fixture = shortCanaryFixture()
+    t.after(() => fs.rmSync(fixture.base, { recursive: true, force: true }))
+    let created
+    const fsImpl = Object.create(fs)
+    fsImpl.linkSync = (...args) => {
+      fs.linkSync(...args)
+      throw Object.assign(new Error('injected post-link failure'), { code: 'INJECTED_POST_LINK' })
+    }
+    await assert.rejects(stageWindowsOpenCodeShortEnvironment(fixture.input, { ...fixture.options, fsImpl,
+      createWindowsCompilerDirectory(prefix) { created = fs.mkdtempSync(path.join(fixture.local, prefix)); return created },
+    }), { code: 'INJECTED_POST_LINK' })
+    assert.equal(fs.existsSync(created), true)
+    assert.equal(fs.existsSync(path.join(fixture.generation, WINDOWS_OPENCODE_SHORT_ENV_RECORD)), true)
+  })
+
+  await t.test('staging-alias unlink failure', async t => {
+    const fixture = shortCanaryFixture()
+    t.after(() => fs.rmSync(fixture.base, { recursive: true, force: true }))
+    let created, refused = false
+    const fsImpl = Object.create(fs)
+    fsImpl.unlinkSync = candidate => {
+      if (path.basename(candidate).endsWith('.create')) {
+        refused = true
+        throw Object.assign(new Error('injected staging-alias unlink failure'), { code: 'INJECTED_UNLINK' })
+      }
+      return fs.unlinkSync(candidate)
+    }
+    await assert.rejects(stageWindowsOpenCodeShortEnvironment(fixture.input, { ...fixture.options, fsImpl,
+      createWindowsCompilerDirectory(prefix) { created = fs.mkdtempSync(path.join(fixture.local, prefix)); return created },
+    }), { code: 'INJECTED_UNLINK' })
+    assert.equal(refused, true)
+    assert.equal(fs.existsSync(created), true)
+    assert.equal(fs.existsSync(path.join(fixture.generation, WINDOWS_OPENCODE_SHORT_ENV_RECORD)), true)
+  })
+
+  await t.test('post-publication inspection failure', async t => {
+    const fixture = shortCanaryFixture()
+    t.after(() => fs.rmSync(fixture.base, { recursive: true, force: true }))
+    let created, publicationObserved = false
+    const inspect = (candidate, options) => {
+      if (path.basename(candidate) === WINDOWS_OPENCODE_SHORT_ENV_RECORD && fs.existsSync(candidate)) {
+        publicationObserved = true
+        throw Object.assign(new Error('injected journal inspection failure'), { code: 'INJECTED_INSPECT' })
+      }
+      return inspectPathNoFollow(candidate, options)
+    }
+    await assert.rejects(stageWindowsOpenCodeShortEnvironment(fixture.input, { ...fixture.options, inspectPathNoFollow: inspect,
+      createWindowsCompilerDirectory(prefix) { created = fs.mkdtempSync(path.join(fixture.local, prefix)); return created },
+    }), { code: 'INJECTED_INSPECT' })
+    assert.equal(publicationObserved, true)
+    assert.equal(fs.existsSync(created), true)
+    assert.equal(fs.existsSync(path.join(fixture.generation, WINDOWS_OPENCODE_SHORT_ENV_RECORD)), true)
+  })
+})
+
+test('Windows OpenCode short canary reports an unknown first capture as retained', async t => {
+  const fixture = shortCanaryFixture()
+  t.after(() => fs.rmSync(fixture.base, { recursive: true, force: true }))
+  let created
+  const failure = await stageWindowsOpenCodeShortEnvironment(fixture.input, { ...fixture.options,
+    createWindowsCompilerDirectory(prefix) { created = fs.mkdtempSync(path.join(fixture.local, prefix)); return created },
+    inspectPathNoFollow(candidate, options) {
+      if (candidate === created) throw Object.assign(new Error('injected first capture failure'), { code: 'INJECTED_CAPTURE' })
+      return inspectPathNoFollow(candidate, options)
+    },
+  }).then(() => null, error => error)
+  assert.equal(failure.code, 'INJECTED_CAPTURE')
+  assert.equal(failure.cleanupConfirmed, false)
+  assert.equal(failure.retainedShortEnvironment, created)
+  assert.equal(fs.existsSync(created), true)
+})
+
+test('Windows OpenCode short canary identity-bound remover refuses a replacement introduced at helper entry', async t => {
+  const fixture = shortCanaryFixture()
+  t.after(() => fs.rmSync(fixture.base, { recursive: true, force: true }))
+  const staged = await stageWindowsOpenCodeShortEnvironment(fixture.input, fixture.options)
+  const held = `${staged.root}.held`
+  const sentinel = path.join(staged.root, 'foreign.txt')
+  fixture.state.beforeOwnedRemove = target => {
+    if (path.resolve(target) !== path.resolve(staged.root)) return
+    fixture.state.beforeOwnedRemove = null
+    fs.renameSync(staged.root, held)
+    fs.mkdirSync(staged.root, { mode: 0o700 })
+    fs.writeFileSync(sentinel, 'foreign', { mode: 0o600 })
+  }
+  await assert.rejects(removeWindowsOpenCodeShortEnvironment(staged, fixture.options))
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'foreign')
+  assert.equal(fs.existsSync(staged.recordPath), true)
+})
+
+test('Windows OpenCode short canary setup removes only its unpublished allocation on setup failure', async t => {
+  const fixture = shortCanaryFixture()
+  t.after(() => fs.rmSync(fixture.base, { recursive: true, force: true }))
+  let created
+  await assert.rejects(stageWindowsOpenCodeShortEnvironment(fixture.input, { ...fixture.options,
+    createWindowsCompilerDirectory(prefix) { created = fs.mkdtempSync(path.join(fixture.local, prefix)); return created },
+    auditPrivatePermissions() { throw Object.assign(new Error('injected DACL audit failure'), { code: 'PRIVACY_VIOLATION' }) },
+  }), { code: 'PRIVACY_VIOLATION' })
+  assert.equal(fs.existsSync(created), false)
+  assert.equal(fs.existsSync(path.join(fixture.generation, WINDOWS_OPENCODE_SHORT_ENV_RECORD)), false)
+})
+
+test('closed canary short environment removal runs only after outer and nested drains and preserves the primary failure', async () => {
+  const order = [], retained = { value: false }
+  const shortEnvironment = { marker: 'short-environment' }
+  await finalizeClosedCanary({ owner: { async cancelAll() { order.push('outer') } },
+    env: { AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT: '/owned/nested' }, provider: 'opencode', activationId: 'a', generation: 1,
+    challenge: crypto.randomBytes(32).toString('base64url'), platform: 'win32', shortEnvironment,
+    async drainRegistered() { order.push('nested') }, async drainDarwinCommandDiscovery() { order.push('darwin') },
+    async removeWindowsOpenCodeShortEnvironment(value) { assert.equal(value, shortEnvironment); order.push('short') },
+  })
+  assert.deepEqual(order, ['outer', 'nested', 'darwin', 'short'])
+
+  const primary = Object.assign(new Error('native case failed'), { code: 'LOCAL_CANARY_FAILED' })
+  await finalizeClosedCanary({ owner: { async cancelAll() { order.push('outer-failed') } },
+    env: { AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT: '/owned/nested' }, provider: 'opencode', activationId: 'a', generation: 1,
+    challenge: crypto.randomBytes(32).toString('base64url'), platform: 'win32', shortEnvironment, primaryError: primary,
+    async drainRegistered() { order.push('nested-failed'); throw Object.assign(new Error('nested retained'), { code: 'PROCESS_DRAIN_TIMEOUT' }) },
+    async drainDarwinCommandDiscovery() { order.push('darwin-failed') },
+    async removeWindowsOpenCodeShortEnvironment() { retained.value = true },
+  })
+  assert.equal(primary.cleanupConfirmed, false)
+  assert.equal(primary.cleanupFailure.code, 'PROCESS_DRAIN_TIMEOUT')
+  assert.equal(retained.value, false, 'a nested drain failure must retain the short root')
+
+  await assert.rejects(finalizeClosedCanary({ owner: { async cancelAll() { throw Object.assign(new Error('outer retained'), { code: 'PROCESS_DRAIN_TIMEOUT' }) } },
+    env: { AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT: '/owned/nested' }, provider: 'opencode', activationId: 'a', generation: 1,
+    challenge: crypto.randomBytes(32).toString('base64url'), platform: 'win32', shortEnvironment,
+    async drainRegistered() { order.push('nested-after-outer') }, async drainDarwinCommandDiscovery() {},
+    async removeWindowsOpenCodeShortEnvironment() { retained.value = true },
+  }), { code: 'PROCESS_DRAIN_TIMEOUT' })
+  assert.equal(retained.value, false, 'an outer drain failure must retain the short root')
 })
 
 test('closed canary establishes new Windows directories and audits existing directories without relabeling', () => {

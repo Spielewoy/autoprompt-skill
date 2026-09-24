@@ -6,31 +6,35 @@
 const cp = require('node:child_process'), crypto = require('node:crypto'), fs = require('node:fs'), path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
 const { ProcessOwner, createPlatformProcessAdapter, prepareProcessLaunchEnvironment } = require('../agents/codex/workflow/process-owner.js')
-const { auditPrivatePermissions, ensureWindowsPrivateAcl, inspectPathNoFollow } = require('../agents/codex/workflow/safe-run-root.js')
+const { auditPrivatePermissions, ensureWindowsPrivateAcl, inspectPathNoFollow, createWindowsCompilerDirectory, windowsControllerEnvironment } = require('../agents/codex/workflow/safe-run-root.js')
+const { atomicCreateJson, checksumRecord } = require('../agents/codex/workflow/event-log.js')
 const hash = value => crypto.createHash('sha256').update(value).digest('hex')
 const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const keys = Object.freeze({ claude:'AUTOPROMPT_CLAUDE_TEST_CLI',opencode:'AUTOPROMPT_OPENCODE_TEST_CLI',kilo:'AUTOPROMPT_KILO_TEST_CLI',prime:'AUTOPROMPT_PRIME_TEST_CLI',omp:'AUTOPROMPT_OMP_TEST_CLI',deepseek:'AUTOPROMPT_DEEPSEEK_TEST_CLI',vscode:'AUTOPROMPT_VSCODE_TEST_CLI',hermes:'AUTOPROMPT_HERMES_TEST_CLI',grok:'AUTOPROMPT_GROK_TEST_CLI',reasonix:'AUTOPROMPT_REASONIX_TEST_CLI' })
 function fail(code, message) { const error = new Error(message); error.code = code; throw error }
 function regular(file) { const stat = fs.lstatSync(file); if (!stat.isFile() || stat.isSymbolicLink()) fail('LOCAL_CANARY_INVALID', 'canary artifact is not regular'); return fs.readFileSync(file) }
-function boundedRegular(file, maximum) {
-  const before = fs.lstatSync(file)
-  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > maximum) fail('LOCAL_CANARY_INVALID', 'bounded canary artifact is invalid')
-  const handle = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+function boundedRegular(file, maximum, expectedIdentity, fsImpl = fs) {
+  const before = fsImpl.lstatSync(file, { bigint: true })
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.size > maximum) fail('LOCAL_CANARY_INVALID', 'bounded canary artifact is invalid')
+  const handle = fsImpl.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
   try {
-    const opened = fs.fstatSync(handle)
-    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino || opened.size > maximum) {
+    const opened = fsImpl.fstatSync(handle, { bigint: true })
+    if (!opened.isFile() || opened.nlink !== 1n || opened.dev !== before.dev || opened.ino !== before.ino || opened.size > maximum) {
       fail('LOCAL_CANARY_INVALID', 'bounded canary artifact changed while opening')
     }
+    if (expectedIdentity && !sameIdentity(opened, expectedIdentity)) fail('LOCAL_CANARY_INVALID', 'bounded canary artifact differs from its captured identity')
     const output = Buffer.alloc(maximum + 1)
     let offset = 0
     while (offset < output.length) {
-      const count = fs.readSync(handle, output, offset, output.length - offset, null)
+      const count = fsImpl.readSync(handle, output, offset, output.length - offset, null)
       if (!count) break
       offset += count
     }
     if (offset > maximum) fail('LOCAL_CANARY_INVALID', 'bounded canary artifact exceeds its limit')
+    const named = fsImpl.lstatSync(file, { bigint: true })
+    if (named.isSymbolicLink() || !sameIdentity(named, opened) || named.nlink !== 1n) fail('LOCAL_CANARY_INVALID', 'bounded canary artifact was replaced during reading')
     return output.subarray(0, offset)
-  } finally { fs.closeSync(handle) }
+  } finally { fsImpl.closeSync(handle) }
 }
 function closedEnvironment(input = {}, provider, root, options = {}) {
   const windows = (options.platform || process.platform) === 'win32'
@@ -40,9 +44,21 @@ function closedEnvironment(input = {}, provider, root, options = {}) {
     if (typeof input[key] === 'string') env[key] = input[key]
   }
   if (typeof root === 'string') {
-    const home = path.join(root, 'outer-home'), tmp = path.join(root, 'outer-tmp')
-    for (const directory of [home, tmp, path.join(home, 'config'), path.join(home, 'data'), path.join(home, 'state'), path.join(home, 'cache')]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
-    Object.assign(env, { HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, 'config'), XDG_DATA_HOME: path.join(home, 'data'), XDG_STATE_HOME: path.join(home, 'state'), XDG_CACHE_HOME: path.join(home, 'cache'), TMPDIR: tmp, TMP: tmp, TEMP: tmp })
+    let layout
+    if (options.windowsShortEnvironment !== undefined) {
+      if (!windows || provider !== 'opencode' || !options.windowsShortEnvironment || typeof options.windowsShortEnvironment !== 'object' ||
+          !options.windowsShortEnvironment.record || typeof options.windowsShortEnvironment.root !== 'string') {
+        fail('LOCAL_CANARY_INVALID', 'Windows short canary environment projection is invalid')
+      }
+      const record = exactShortEnvRecord(options.windowsShortEnvironment.record)
+      if (!samePrivatePath(record.root, options.windowsShortEnvironment.root, 'win32')) fail('LOCAL_CANARY_INVALID', 'Windows short canary environment root differs from its record')
+      layout = shortEnvironmentLayout(record.root)
+    } else {
+      const home = path.join(root, 'outer-home'), temporary = path.join(root, 'outer-tmp')
+      layout = { root, home, temporary, config: path.join(home, 'config'), data: path.join(home, 'data'), state: path.join(home, 'state'), cache: path.join(home, 'cache') }
+      for (const directory of [layout.home, layout.temporary, layout.config, layout.data, layout.state, layout.cache]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
+    }
+    Object.assign(env, shortEnvironmentProjection(layout))
   }
   if (provider === 'vscode') {
     if (typeof input.DISPLAY === 'string' && /^:[0-9]+(?:\.[0-9]+)?$/.test(input.DISPLAY)) env.DISPLAY = input.DISPLAY
@@ -66,6 +82,207 @@ function tapCases(output, cases) {
   }
 }
 function writeAtomic(file, value) { const temp = `${file}.${crypto.randomUUID()}`; fs.writeFileSync(temp, value, { flag: 'wx', mode: 0o600 }); fs.renameSync(temp, file) }
+const WINDOWS_OPENCODE_SHORT_ENV_RECORD = 'windows-opencode-short-env.json'
+const WINDOWS_OPENCODE_SHORT_ENV_SCHEMA = 'harness-v2-windows-opencode-short-env.v1'
+const WINDOWS_OPENCODE_SHORT_ENV_PREFIX = 'ap-canary-'
+const SHORT_ENV_CHILDREN = ['home', 'temporary', 'config', 'data', 'state', 'cache']
+function sameIdentity(left, right) { return Boolean(left && right && String(left.dev) === String(right.dev) && String(left.ino) === String(right.ino)) }
+function samePrivatePath(left, right, platform) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false
+  const normalizedLeft = path.resolve(left), normalizedRight = path.resolve(right)
+  return platform === 'win32' ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase() : normalizedLeft === normalizedRight
+}
+function capturedShortEnvIdentity(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      !/^(?:0|[1-9][0-9]*)$/u.test(String(value.dev)) || !/^(?:0|[1-9][0-9]*)$/u.test(String(value.ino))) {
+    fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment identity is invalid')
+  }
+  return { dev: String(value.dev), ino: String(value.ino) }
+}
+function storedShortEnvIdentity(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'dev,ino') {
+    fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment stored identity is invalid')
+  }
+  return capturedShortEnvIdentity(value)
+}
+function exactShortEnvRecord(value) {
+  const expected = ['activationId','bindingSha256','challenge','checksum','children','generation','identity','journalRoot','journalRootIdentity','parent','parentIdentity','provider','root','schemaVersion']
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== expected.join(',') ||
+      value.schemaVersion !== WINDOWS_OPENCODE_SHORT_ENV_SCHEMA || value.provider !== 'opencode' ||
+      typeof value.activationId !== 'string' || !value.activationId || value.activationId.length > 256 ||
+      !Number.isSafeInteger(value.generation) || value.generation < 1 || !/^[A-Za-z0-9_-]{43}$/u.test(value.challenge || '') ||
+      typeof value.root !== 'string' || !path.isAbsolute(value.root) || typeof value.parent !== 'string' || !path.isAbsolute(value.parent) ||
+      typeof value.journalRoot !== 'string' || !path.isAbsolute(value.journalRoot) ||
+      !value.children || typeof value.children !== 'object' || Object.keys(value.children).sort().join(',') !== [...SHORT_ENV_CHILDREN].sort().join(',') ||
+      !/^[a-f0-9]{64}$/u.test(value.bindingSha256 || '')) {
+    fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment record is invalid')
+  }
+  const identity = storedShortEnvIdentity(value.identity), parentIdentity = storedShortEnvIdentity(value.parentIdentity)
+  const journalRootIdentity = storedShortEnvIdentity(value.journalRootIdentity)
+  const children = Object.fromEntries(SHORT_ENV_CHILDREN.map(name => [name, storedShortEnvIdentity(value.children[name])]))
+  const body = { schemaVersion: value.schemaVersion, provider: value.provider, activationId: value.activationId, generation: value.generation,
+    challenge: value.challenge, root: value.root, identity, parent: value.parent, parentIdentity,
+    journalRoot: value.journalRoot, journalRootIdentity, children }
+  if (hash(JSON.stringify(body)) !== value.bindingSha256 || checksumRecord(value) !== value.checksum) fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment record checksum differs')
+  return Object.freeze({ ...body, bindingSha256: value.bindingSha256, checksum: value.checksum })
+}
+function shortEnvironmentLayout(root) {
+  const home = path.join(root, 'home'), temporary = path.join(root, 'tmp')
+  return Object.freeze({ root, home, temporary, config: path.join(home, 'config'), data: path.join(home, 'data'), state: path.join(home, 'state'), cache: path.join(home, 'cache') })
+}
+function shortEnvironmentProjection(layout) {
+  return Object.freeze({ HOME: layout.home, USERPROFILE: layout.home, XDG_CONFIG_HOME: layout.config, XDG_DATA_HOME: layout.data,
+    XDG_STATE_HOME: layout.state, XDG_CACHE_HOME: layout.cache, TMPDIR: layout.temporary, TMP: layout.temporary, TEMP: layout.temporary })
+}
+function reopenWindowsOpenCodeShortEnvironmentRecord(descriptor, options = {}) {
+  if (!descriptor || typeof descriptor !== 'object' || typeof descriptor.recordPath !== 'string' || !path.isAbsolute(descriptor.recordPath) ||
+      typeof descriptor.journalRoot !== 'string' || !path.isAbsolute(descriptor.journalRoot) ||
+      path.resolve(descriptor.recordPath) !== path.join(path.resolve(descriptor.journalRoot), WINDOWS_OPENCODE_SHORT_ENV_RECORD)) {
+    fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment journal location is invalid')
+  }
+  const inspect = options.inspectPathNoFollow || inspectPathNoFollow, fsImpl = options.fsImpl || fs
+  const expected = exactShortEnvRecord(descriptor.record || descriptor)
+  const journalRoot = inspect(descriptor.journalRoot, { fsImpl }), journal = inspect(descriptor.recordPath, { fsImpl, mustBeDirectory: false })
+  if (!journalRoot.exists || !samePrivatePath(journalRoot.realpath, expected.journalRoot, options.platform || process.platform) ||
+      !sameIdentity(journalRoot.identity, expected.journalRootIdentity) || !journal.exists || !journal.realpath) fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment journal parent changed or is absent')
+  if (!journal.identity) fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment journal identity is absent')
+  const journalIdentity = capturedShortEnvIdentity(journal.identity)
+  if (descriptor.journalIdentity && !sameIdentity(journalIdentity, descriptor.journalIdentity)) fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment journal was replaced')
+  let actual
+  try { actual = exactShortEnvRecord(JSON.parse(boundedRegular(descriptor.recordPath, 4096, journalIdentity, fsImpl))) }
+  catch (error) { if (error?.code) throw error; fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment journal is unreadable') }
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment journal changed')
+  const parentAfter = inspect(descriptor.journalRoot, { fsImpl })
+  if (!parentAfter.exists || !sameIdentity(parentAfter.identity, expected.journalRootIdentity)) fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment journal parent changed during reading')
+  return { record: actual, journalIdentity }
+}
+function validateWindowsOpenCodeShortEnvironment(descriptor, options = {}) {
+  const platform = options.platform || process.platform, fsImpl = options.fsImpl || fs
+  if (platform !== 'win32') fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment was selected off Windows')
+  const reopened = reopenWindowsOpenCodeShortEnvironmentRecord(descriptor, options)
+  const record = reopened.record
+  const inspect = options.inspectPathNoFollow || inspectPathNoFollow
+  const controllerEnvironment = options.windowsControllerEnvironment || windowsControllerEnvironment
+  const root = inspect(record.root, { fsImpl }), parent = inspect(record.parent, { fsImpl })
+  const systemRoot = options.systemRoot || process.env.SystemRoot || process.env.WINDIR
+  const controller = controllerEnvironment(systemRoot)
+  const local = inspect(controller.LOCALAPPDATA, { fsImpl })
+  if (!root.exists || !root.realpath || !samePrivatePath(root.realpath, record.root, platform) || !sameIdentity(root.identity, record.identity) ||
+      !parent.exists || !parent.realpath || !samePrivatePath(parent.realpath, record.parent, platform) || !sameIdentity(parent.identity, record.parentIdentity) ||
+      !local.exists || !local.realpath || !samePrivatePath(parent.realpath, local.realpath, platform) || !sameIdentity(parent.identity, local.identity) ||
+      !samePrivatePath(path.dirname(root.realpath), parent.realpath, platform) || !new RegExp(`^${WINDOWS_OPENCODE_SHORT_ENV_PREFIX}[A-Za-z0-9]{6}$`).test(path.basename(root.realpath))) {
+    fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment physical binding changed')
+  }
+  const audit = options.auditPrivatePermissions || auditPrivatePermissions
+  audit(root.realpath, { recurse: false })
+  const layout = shortEnvironmentLayout(root.realpath)
+  for (const name of SHORT_ENV_CHILDREN) {
+    const child = inspect(layout[name], { fsImpl })
+    if (!child.exists || !samePrivatePath(child.realpath, layout[name], platform) || !sameIdentity(child.identity, record.children[name])) {
+      fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment projected directory changed')
+    }
+  }
+  return Object.freeze({ record, recordPath: descriptor.recordPath, journalRoot: descriptor.journalRoot, journalIdentity: reopened.journalIdentity, ...shortEnvironmentLayout(root.realpath) })
+}
+function removeShortEnvOwnedTarget(target, parentIdentity, targetIdentity, type, options) {
+  const native = options.windowsFilesystem || require('../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture()
+  // The native helper holds the parent and complete bounded subtree, verifies
+  // the captured identities, and deletes by HANDLE. A replaced path is refused.
+  return native.removeOwnedTarget(target, parentIdentity, { type, ...targetIdentity })
+}
+async function removeWindowsOpenCodeShortEnvironment(descriptor, options = {}) {
+  const fsImpl = options.fsImpl || fs
+  const verified = validateWindowsOpenCodeShortEnvironment(descriptor, options)
+  try { await removeShortEnvOwnedTarget(verified.root, verified.record.parentIdentity, verified.record.identity, 'directory', options) }
+  catch (error) { fail('LOCAL_CANARY_CLEANUP_UNCERTAIN', `Windows OpenCode short environment could not be removed: ${error.code || 'failure'}`) }
+  const inspect = options.inspectPathNoFollow || inspectPathNoFollow
+  let remaining
+  try { remaining = inspect(verified.root, { fsImpl }) } catch { fail('LOCAL_CANARY_CLEANUP_UNCERTAIN', 'Windows OpenCode short environment changed during removal') }
+  if (remaining.exists) fail('LOCAL_CANARY_CLEANUP_UNCERTAIN', 'Windows OpenCode short environment remained after removal')
+  // Reopen the exact journal after the external tree is absent so an attacker
+  // cannot replace it between its first validation and unlink.
+  const journalBeforeUnlink = reopenWindowsOpenCodeShortEnvironmentRecord(verified, options)
+  if (!sameIdentity(journalBeforeUnlink.journalIdentity, verified.journalIdentity)) fail('LOCAL_CANARY_CLEANUP_UNCERTAIN', 'Windows OpenCode short environment journal changed before removal')
+  try { await removeShortEnvOwnedTarget(verified.recordPath, verified.record.journalRootIdentity, verified.journalIdentity, 'file', options) }
+  catch (error) { fail('LOCAL_CANARY_CLEANUP_UNCERTAIN', `Windows OpenCode short environment record could not be removed: ${error.code || 'failure'}`) }
+  let journal
+  try { journal = inspect(verified.recordPath, { fsImpl, mustBeDirectory: false }) } catch { fail('LOCAL_CANARY_CLEANUP_UNCERTAIN', 'Windows OpenCode short environment record changed during removal') }
+  if (journal.exists) fail('LOCAL_CANARY_CLEANUP_UNCERTAIN', 'Windows OpenCode short environment record remained after removal')
+}
+async function stageWindowsOpenCodeShortEnvironment(input = {}, options = {}) {
+  const platform = options.platform || process.platform, fsImpl = options.fsImpl || fs
+  if (platform !== 'win32' || input.provider !== 'opencode') return null
+  if (!input || typeof input !== 'object' || typeof input.root !== 'string' || !path.isAbsolute(input.root) ||
+      typeof input.activationId !== 'string' || !input.activationId || !Number.isSafeInteger(input.generation) || input.generation < 1 ||
+      !/^[A-Za-z0-9_-]{43}$/u.test(input.challenge || '')) fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment input is invalid')
+  const recordPath = path.join(input.root, WINDOWS_OPENCODE_SHORT_ENV_RECORD)
+  const create = options.createWindowsCompilerDirectory || createWindowsCompilerDirectory
+  const inspect = options.inspectPathNoFollow || inspectPathNoFollow
+  const controllerEnvironment = options.windowsControllerEnvironment || windowsControllerEnvironment
+  const audit = options.auditPrivatePermissions || auditPrivatePermissions
+  const systemRoot = options.systemRoot || process.env.SystemRoot || process.env.WINDIR
+  const journalRoot = inspect(input.root, { fsImpl })
+  if (!journalRoot.exists || !samePrivatePath(journalRoot.realpath, input.root, platform)) fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment journal parent is invalid')
+  if (inspect(recordPath, { fsImpl, mustBeDirectory: false }).exists) fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment record already exists')
+  let created = null, createdBinding = null, published = false
+  try {
+    created = create(WINDOWS_OPENCODE_SHORT_ENV_PREFIX)
+    const root = inspect(created, { fsImpl }), parent = inspect(path.dirname(created), { fsImpl })
+    createdBinding = { root: root.realpath, identity: root.identity ? capturedShortEnvIdentity(root.identity) : null, parent: parent.realpath, parentIdentity: parent.identity ? capturedShortEnvIdentity(parent.identity) : null }
+    const controller = controllerEnvironment(systemRoot), local = inspect(controller.LOCALAPPDATA, { fsImpl })
+    if (!root.exists || !root.realpath || !root.identity || !parent.exists || !parent.realpath || !parent.identity || !local.exists || !local.realpath || !local.identity ||
+        !samePrivatePath(parent.realpath, local.realpath, platform) || !sameIdentity(parent.identity, local.identity) ||
+        !samePrivatePath(path.dirname(root.realpath), parent.realpath, platform) || !new RegExp(`^${WINDOWS_OPENCODE_SHORT_ENV_PREFIX}[A-Za-z0-9]{6}$`).test(path.basename(root.realpath))) {
+      fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment is outside the authenticated token profile')
+    }
+    audit(root.realpath, { recurse: false })
+    const layout = shortEnvironmentLayout(root.realpath)
+    for (const directory of [layout.home, layout.temporary, layout.config, layout.data, layout.state, layout.cache]) fsImpl.mkdirSync(directory, { recursive: true, mode: 0o700 })
+    const children = Object.fromEntries(SHORT_ENV_CHILDREN.map(name => {
+      const child = inspect(layout[name], { fsImpl })
+      if (!child.exists || !samePrivatePath(child.realpath, layout[name], platform)) fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment child is not physical')
+      return [name, capturedShortEnvIdentity(child.identity)]
+    }))
+    const currentRoot = inspect(root.realpath, { fsImpl }), currentJournalRoot = inspect(journalRoot.realpath, { fsImpl })
+    if (!currentRoot.exists || !sameIdentity(currentRoot.identity, root.identity) || !currentJournalRoot.exists || !sameIdentity(currentJournalRoot.identity, journalRoot.identity)) {
+      fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment allocation changed before publication')
+    }
+    const body = { schemaVersion: WINDOWS_OPENCODE_SHORT_ENV_SCHEMA, provider: 'opencode', activationId: input.activationId,
+      generation: input.generation, challenge: input.challenge, root: root.realpath, identity: capturedShortEnvIdentity(root.identity),
+      parent: parent.realpath, parentIdentity: capturedShortEnvIdentity(parent.identity),
+      journalRoot: journalRoot.realpath, journalRootIdentity: capturedShortEnvIdentity(journalRoot.identity), children }
+    const unsigned = { ...body, bindingSha256: hash(JSON.stringify(body)) }
+    // Any failure after this point can follow a durable exclusive link. Retain
+    // the external root and its journal rather than guessing whether publish won.
+    published = true
+    const record = exactShortEnvRecord(atomicCreateJson(recordPath, unsigned, { fsImpl, mode: 0o600 }))
+    const journal = inspect(recordPath, { fsImpl, mustBeDirectory: false })
+    if (!journal.exists || !journal.identity) fail('LOCAL_CANARY_INVALID', 'Windows OpenCode short environment journal disappeared after publication')
+    return validateWindowsOpenCodeShortEnvironment(Object.freeze({ record, recordPath, journalRoot: input.root, journalIdentity: capturedShortEnvIdentity(journal.identity), ...layout }), options)
+  } catch (error) {
+    if (!published && createdBinding) {
+      try {
+        const root = inspect(createdBinding.root, { fsImpl }), parent = inspect(createdBinding.parent, { fsImpl })
+        if (!root.exists || !root.realpath || !sameIdentity(root.identity, createdBinding.identity) || !parent.exists || !sameIdentity(parent.identity, createdBinding.parentIdentity)) {
+          throw new Error('short environment changed before setup cleanup')
+        }
+        await removeShortEnvOwnedTarget(root.realpath, createdBinding.parentIdentity, createdBinding.identity, 'directory', options)
+        const remaining = inspect(root.realpath, { fsImpl })
+        if (remaining.exists) throw new Error('short environment remained after setup cleanup')
+      } catch (cleanup) {
+        error.cleanupConfirmed = false
+        error.retainedShortEnvironment = created
+        error.cleanupCode = String(cleanup.code || 'LOCAL_CANARY_CLEANUP_UNCERTAIN').slice(0, 64)
+      }
+    }
+    if (created && (published || !createdBinding)) {
+      error.cleanupConfirmed = false
+      error.retainedShortEnvironment = created
+      error.retainedShortEnvironmentRecord = recordPath
+    }
+    throw error
+  }
+}
 function claimPrivateCanaryDirectory(directory, options = {}) {
   const fsImpl = options.fsImpl || fs
   let created = false
@@ -237,6 +454,33 @@ async function ownedTest(owner, root, env, argv, timeoutMs = 300000, signal, opt
   }
   return value
 }
+async function finalizeClosedCanary(options = {}) {
+  const cleanupFailures = []
+  const { owner, env, provider, activationId, generation, challenge, platform = process.platform, shortEnvironment, primaryError } = options
+  const binding = { provider, activationId, generation, challenge }
+  const registered = options.drainRegistered || drainRegistered
+  const darwinDiscovery = options.drainDarwinCommandDiscovery || drainDarwinCommandDiscovery
+  const removeShortEnvironment = options.removeWindowsOpenCodeShortEnvironment || removeWindowsOpenCodeShortEnvironment
+  if (owner) try { await owner.cancelAll({ reason: 'closed canary finished', graceMs: 500, killMs: 2000, waitForPending: true }) }
+  catch (error) { cleanupFailures.push(error) }
+  if (env) try { await registered(env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, binding, { platform, providerPrivateOwnershipRoot: options.providerPrivateOwnershipRoot, trustedOwnershipRoots: options.trustedOwnershipRoots, createPlatformAdapter: options.createPlatformAdapter }) }
+  catch (error) { cleanupFailures.push(error) }
+  if (env) try { await darwinDiscovery(env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, binding, { platform, createPlatformAdapter: options.createPlatformAdapter }) }
+  catch (error) { cleanupFailures.push(error) }
+  if (!cleanupFailures.length && shortEnvironment) {
+    try { await removeShortEnvironment(shortEnvironment, { platform, systemRoot: options.systemRoot }) }
+    catch (error) { cleanupFailures.push(error) }
+  }
+  if (!cleanupFailures.length) return Object.freeze({ cleanupConfirmed: true })
+  const [first, ...secondary] = cleanupFailures
+  if (secondary.length) first.secondaryCleanupFailures = secondary
+  if (primaryError) {
+    primaryError.cleanupConfirmed = false
+    primaryError.cleanupFailure = first
+    return Object.freeze({ cleanupConfirmed: false, failure: first })
+  }
+  throw first
+}
 async function run(options = {}) {
   const { activation, pending, executable, provider } = options
   if (!activation?.installed?.bundle || !activation?.activationRoot || !pending || !keys[provider] || executable?.path !== activation.executable?.path) fail('LOCAL_CANARY_INVALID', 'closed canary binding is incomplete')
@@ -252,17 +496,8 @@ async function run(options = {}) {
   claimPrivateCanaryDirectory(canaryRoot, { platform, allowExisting: true })
   claimPrivateCanaryDirectory(root, { platform, allowExisting: true })
   const challenge = crypto.randomBytes(32).toString('base64url')
-  const env = { ...closedEnvironment(options.environment || process.env, provider, root), [keys[provider]]: executable.path,
-    AUTOPROMPT_NATIVE_TEST_EVIDENCE_ROOT: path.join(root, 'native-wire'), AUTOPROMPT_CLOSED_CANARY_CHALLENGE: challenge,
-    AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT: path.join(root, 'nested-owners'), AUTOPROMPT_CLOSED_CANARY_PROVIDER: provider,
-    AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID: activation.activationId, AUTOPROMPT_CLOSED_CANARY_GENERATION: String(generation) }
-  claimPrivateCanaryDirectory(env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, { platform })
-  const adapter = closedCanaryProcessAdapter({ platform, controlRoot: path.join(root, 'outer-process-control'),
-    providerPrivateOwnershipRoot: activation.activationRoot, trustedOwnershipRoots: [activation.activationRoot], createPlatformAdapter: options.createPlatformAdapter })
-  const owner = new ProcessOwner({ adapter, registryPath: path.join(root, 'outer-processes.json'), pollMs: 20 })
   const signal = options.signal
-  const cancel = () => { owner.cancelAll({ reason: 'closed native canary cancelled', graceMs: 500, killMs: 2000, waitForPending: true }).catch(() => {}) }
-  signal?.addEventListener('abort', cancel, { once: true })
+  let env = null, owner = null, cancel = null, abortListenerInstalled = false, shortEnvironment = null, primaryError = null
   const results = [], artifacts = []
   const groups = new Map()
   for (const capability of Object.keys(pending.capabilityCases).sort()) {
@@ -270,54 +505,59 @@ async function run(options = {}) {
     group.push({ capability, ...item }); groups.set(item.source, group)
   }
   try {
-  for (const [relativeSource, cases] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
-    if (signal?.aborted) fail('CHILD_CANCELLED', 'closed native canary was cancelled')
-    const source = path.join(activation.installed.bundle, relativeSource)
-    if (!path.resolve(source).startsWith(`${path.resolve(activation.installed.bundle)}${path.sep}`)) fail('LOCAL_CANARY_INVALID', `case source escaped bundle: ${relativeSource}`)
-    if (cases.some(item => item.sha256 !== hash(regular(source)))) fail('LOCAL_CANARY_INVALID', `case source drifted: ${relativeSource}`)
-    const pattern = `^(?:${cases.map(item => escape(item.testName)).join('|')})$`
-    // Some native CLIs need several seconds per startup; the complete owned
-    // suite includes real recovery and cancellation, not just one model call.
-    // Keep one finite batch ceiling and never run past the release approval.
-    const now = Date.now()
-    const timeoutMs = closedCanaryBatchTimeout({ platform, caseCount: cases.length,
-      approvalRemainingMs: Date.parse(pending.expiresAt) - now, activationRemainingMs: activationDeadline - now })
-    if (timeoutMs <= 0) fail('LOCAL_CANARY_EXPIRED', 'review approval expired before native batch')
-    const result = await ownedTest(owner, root, env, ['--test','--test-concurrency=1','--test-reporter=tap','--test-name-pattern',pattern,source], timeoutMs, signal, {
-      platform, providerPrivateOwnershipRoot: activation.activationRoot, trustedOwnershipRoots: [activation.activationRoot], createPlatformAdapter: options.createPlatformAdapter,
-      failFastTap: true,
+    shortEnvironment = await stageWindowsOpenCodeShortEnvironment({ provider, root, activationId: activation.activationId, generation, challenge }, {
+      platform, systemRoot: process.env.SystemRoot || process.env.WINDIR,
     })
-    const output = `${result.stdout || ''}\n${result.stderr || ''}`
-    if (result.error || result.code !== 0 || result.signal || /^not ok /m.test(output)) fail('LOCAL_CANARY_FAILED', `native case batch did not pass: ${relativeSource}`)
-    tapCases(output, cases)
-    for (const { capability, ...item } of cases) {
-    if (Date.now() >= Math.min(activationDeadline, Date.parse(pending.expiresAt))) fail('LOCAL_CANARY_EXPIRED', 'canary authority expired before observation persistence')
-    const artifact = { schemaVersion:'harness-v2-closed-canary-observation.v1', capability, caseSha256:item.sha256, testName:item.testName,
-      activationId:activation.activationId, generation, challenge, requestSha256:activation.record.request.sha256,
-      target:activation.record.target.realpath, executableSha256:executable.sha256, executableRuntimeIdentity:executable.runtimeIdentity || null,
-      connectionSha256:activation.record.connectionSha256, payloadDigest:activation.installed.payloadDigest,
-      enforcementProofSha256:activation.enforcementProof.sha256, reviewDigest:pending.reviewDigest, outputSha256:hash(output) }
-    const bytes = Buffer.from(JSON.stringify(artifact)); const file = path.join(root, `${capability}.json`); fs.writeFileSync(file, bytes, { flag:'wx', mode:0o600 }); const reopened = regular(file)
-    const observationSha256 = hash(reopened)
-    results.push({ capability, status:'passed', caseSha256:item.sha256, observationSha256 })
-    artifacts.push({ capability, path:file, sha256:observationSha256 })
+    env = { ...closedEnvironment(options.environment || process.env, provider, root, { platform, ...(shortEnvironment ? { windowsShortEnvironment: shortEnvironment } : {}) }), [keys[provider]]: executable.path,
+      AUTOPROMPT_NATIVE_TEST_EVIDENCE_ROOT: path.join(root, 'native-wire'), AUTOPROMPT_CLOSED_CANARY_CHALLENGE: challenge,
+      AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT: path.join(root, 'nested-owners'), AUTOPROMPT_CLOSED_CANARY_PROVIDER: provider,
+      AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID: activation.activationId, AUTOPROMPT_CLOSED_CANARY_GENERATION: String(generation) }
+    claimPrivateCanaryDirectory(env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, { platform })
+    const adapter = closedCanaryProcessAdapter({ platform, controlRoot: path.join(root, 'outer-process-control'),
+      providerPrivateOwnershipRoot: activation.activationRoot, trustedOwnershipRoots: [activation.activationRoot], createPlatformAdapter: options.createPlatformAdapter })
+    owner = new ProcessOwner({ adapter, registryPath: path.join(root, 'outer-processes.json'), pollMs: 20 })
+    cancel = () => { owner.cancelAll({ reason: 'closed native canary cancelled', graceMs: 500, killMs: 2000, waitForPending: true }).catch(() => {}) }
+    signal?.addEventListener('abort', cancel, { once: true }); abortListenerInstalled = Boolean(signal)
+    for (const [relativeSource, cases] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
+      if (signal?.aborted) fail('CHILD_CANCELLED', 'closed native canary was cancelled')
+      const source = path.join(activation.installed.bundle, relativeSource)
+      if (!path.resolve(source).startsWith(`${path.resolve(activation.installed.bundle)}${path.sep}`)) fail('LOCAL_CANARY_INVALID', `case source escaped bundle: ${relativeSource}`)
+      if (cases.some(item => item.sha256 !== hash(regular(source)))) fail('LOCAL_CANARY_INVALID', `case source drifted: ${relativeSource}`)
+      const pattern = `^(?:${cases.map(item => escape(item.testName)).join('|')})$`
+      const now = Date.now()
+      const timeoutMs = closedCanaryBatchTimeout({ platform, caseCount: cases.length,
+        approvalRemainingMs: Date.parse(pending.expiresAt) - now, activationRemainingMs: activationDeadline - now })
+      if (timeoutMs <= 0) fail('LOCAL_CANARY_EXPIRED', 'review approval expired before native batch')
+      if (shortEnvironment) shortEnvironment = validateWindowsOpenCodeShortEnvironment(shortEnvironment, { platform, systemRoot: process.env.SystemRoot || process.env.WINDIR })
+      const result = await ownedTest(owner, root, env, ['--test','--test-concurrency=1','--test-reporter=tap','--test-name-pattern',pattern,source], timeoutMs, signal, {
+        platform, providerPrivateOwnershipRoot: activation.activationRoot, trustedOwnershipRoots: [activation.activationRoot], createPlatformAdapter: options.createPlatformAdapter,
+        failFastTap: true,
+      })
+      const output = `${result.stdout || ''}\n${result.stderr || ''}`
+      if (result.error || result.code !== 0 || result.signal || /^not ok /m.test(output)) fail('LOCAL_CANARY_FAILED', `native case batch did not pass: ${relativeSource}`)
+      tapCases(output, cases)
+      for (const { capability, ...item } of cases) {
+        if (Date.now() >= Math.min(activationDeadline, Date.parse(pending.expiresAt))) fail('LOCAL_CANARY_EXPIRED', 'canary authority expired before observation persistence')
+        const artifact = { schemaVersion:'harness-v2-closed-canary-observation.v1', capability, caseSha256:item.sha256, testName:item.testName,
+          activationId:activation.activationId, generation, challenge, requestSha256:activation.record.request.sha256,
+          target:activation.record.target.realpath, executableSha256:executable.sha256, executableRuntimeIdentity:executable.runtimeIdentity || null,
+          connectionSha256:activation.record.connectionSha256, payloadDigest:activation.installed.payloadDigest,
+          enforcementProofSha256:activation.enforcementProof.sha256, reviewDigest:pending.reviewDigest, outputSha256:hash(output) }
+        const bytes = Buffer.from(JSON.stringify(artifact)); const file = path.join(root, `${capability}.json`); fs.writeFileSync(file, bytes, { flag:'wx', mode:0o600 }); const reopened = regular(file)
+        const observationSha256 = hash(reopened)
+        results.push({ capability, status:'passed', caseSha256:item.sha256, observationSha256 })
+        artifacts.push({ capability, path:file, sha256:observationSha256 })
+      }
     }
-  }
-  return { challenge, observations:results, artifacts }
+    return { challenge, observations:results, artifacts }
+  } catch (error) {
+    primaryError = error
+    throw error
   } finally {
-    signal?.removeEventListener('abort', cancel)
-    const drainFailures = []
-    try { await owner.cancelAll({ reason: 'closed canary finished', graceMs: 500, killMs: 2000, waitForPending: true }) }
-    catch (error) { drainFailures.push(error) }
-    try { await drainRegistered(env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, { provider, activationId: activation.activationId, generation, challenge }, { platform, providerPrivateOwnershipRoot: activation.activationRoot, trustedOwnershipRoots: [activation.activationRoot], createPlatformAdapter: options.createPlatformAdapter }) }
-    catch (error) { drainFailures.push(error) }
-    try { await drainDarwinCommandDiscovery(env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, { provider, activationId: activation.activationId, generation, challenge }, { platform, createPlatformAdapter: options.createPlatformAdapter }) }
-    catch (error) { drainFailures.push(error) }
-    if (drainFailures.length) {
-      const [primary, ...secondary] = drainFailures
-      if (secondary.length) primary.secondaryDrainFailures = secondary
-      throw primary
-    }
+    if (abortListenerInstalled) signal.removeEventListener('abort', cancel)
+    await finalizeClosedCanary({ owner, env, provider, activationId: activation.activationId, generation, challenge, platform, shortEnvironment, primaryError,
+      providerPrivateOwnershipRoot: activation.activationRoot, trustedOwnershipRoots: [activation.activationRoot], createPlatformAdapter: options.createPlatformAdapter,
+      systemRoot: process.env.SystemRoot || process.env.WINDIR })
   }
 }
 async function closedOwnedTest(requestPath) {
@@ -427,4 +667,4 @@ async function closedOwnedTest(requestPath) {
   })
 }
 if (require.main === module && process.argv[2] === '--closed-owned-test') closedOwnedTest(process.argv[3]).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1 })
-module.exports = { run, closedEnvironment, tapCases, ownedTest, drainRegistered, drainDarwinCommandDiscovery, closedCanaryProcessAdapter, claimPrivateCanaryDirectory, closedCanaryBatchTimeout }
+module.exports = { run, closedEnvironment, tapCases, ownedTest, drainRegistered, drainDarwinCommandDiscovery, closedCanaryProcessAdapter, claimPrivateCanaryDirectory, closedCanaryBatchTimeout, finalizeClosedCanary, stageWindowsOpenCodeShortEnvironment, validateWindowsOpenCodeShortEnvironment, removeWindowsOpenCodeShortEnvironment, reopenWindowsOpenCodeShortEnvironmentRecord, WINDOWS_OPENCODE_SHORT_ENV_RECORD }

@@ -10,6 +10,21 @@ const {
 
 const PATH_FIELDS = Object.freeze(['nodeExecutable', 'grokExecutable', 'home', 'cwd', 'scratch'])
 const PRIVATE_ROOT_FIELDS = Object.freeze(['home', 'cwd', 'scratch'])
+// Grok 1.0.13 always probes its system managed-policy layers beneath
+// /etc/grok.  macOS presents /etc through /private/etc, so both spellings and
+// the two documented policy files need metadata access to establish absence.
+// These are literal metadata grants only; ambient policy contents remain
+// outside the sandbox.
+const SYSTEM_CONFIG_METADATA_PATHS = Object.freeze([
+  '/etc',
+  '/etc/grok',
+  '/etc/grok/managed_config.toml',
+  '/etc/grok/requirements.toml',
+  '/private/etc',
+  '/private/etc/grok',
+  '/private/etc/grok/managed_config.toml',
+  '/private/etc/grok/requirements.toml',
+])
 
 class DarwinGrokProfileError extends Error {
   constructor(message) { super(message); this.name = 'DarwinGrokProfileError'; this.code = 'GROK_DARWIN_PROFILE_INVALID' }
@@ -74,9 +89,14 @@ function buildDarwinGrokProfile(input) {
   const value = validateProfileInput(input)
   const privateRoots = PRIVATE_ROOT_FIELDS.map(field => value[field])
   const metadata = new Set([
+    ...SYSTEM_CONFIG_METADATA_PATHS,
     ...PATH_FIELDS.flatMap(field => pathAncestors(value[field])),
     ...privateRoots.flatMap(pathAncestors),
   ])
+  // /var is the logical alias used by Darwin APIs for physical /private/var
+  // paths.  Grant only the alias vnode metadata when an authenticated input
+  // actually resides below that physical root.
+  if (PATH_FIELDS.some(field => value[field].startsWith('/private/var/'))) metadata.add('/var')
   const loopbackPorts = [value.proxyPort, value.mcpPort]
   const lines = [
     '(version 1)',
@@ -113,4 +133,4 @@ function buildDarwinGrokProfile(input) {
   return `${lines.join('\n')}\n`
 }
 
-module.exports = { DarwinGrokProfileError, validateProfileInput, buildDarwinGrokProfile }
+module.exports = { DarwinGrokProfileError, SYSTEM_CONFIG_METADATA_PATHS, validateProfileInput, buildDarwinGrokProfile }

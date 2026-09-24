@@ -4,6 +4,7 @@ const assert = require('node:assert/strict')
 const test = require('node:test')
 const {
   DarwinGrokProfileError,
+  SYSTEM_CONFIG_METADATA_PATHS,
   buildDarwinGrokProfile,
   validateProfileInput,
 } = require('../../scripts/harness-v2-bridge/grok/darwin-profile.cjs')
@@ -33,6 +34,42 @@ test('Darwin Grok Seatbelt profile is default-deny, exact-path, and IPv6 loopbac
   }
   assert.doesNotMatch(profile, /tcp4|127\.0\.0\.1|::ffff|network-outbound \(remote ip|network-inbound \(local ip/)
   assert.doesNotMatch(profile, /subpath "\/opt\/autoprompt"|subpath "\/private\/ap"|launchctl|file-write\* \(subpath "\/System"/)
+})
+
+test('Darwin Grok profile permits only metadata for exact system config absence probes', () => {
+  const profile = buildDarwinGrokProfile(input())
+  const lines = profile.split('\n')
+  assert.deepEqual(SYSTEM_CONFIG_METADATA_PATHS, [
+    '/etc',
+    '/etc/grok',
+    '/etc/grok/managed_config.toml',
+    '/etc/grok/requirements.toml',
+    '/private/etc',
+    '/private/etc/grok',
+    '/private/etc/grok/managed_config.toml',
+    '/private/etc/grok/requirements.toml',
+  ])
+  for (const candidate of SYSTEM_CONFIG_METADATA_PATHS) {
+    assert.equal(lines.filter(line => line === `(allow file-read-metadata (literal ${JSON.stringify(candidate)}))`).length, 1)
+  }
+  for (const line of lines.filter(line => /"\/(?:private\/)?etc(?:\/|"\))/.test(line))) {
+    assert.match(line, /^\(allow file-read-metadata \(literal /)
+    assert.doesNotMatch(line, /file-read-data|file-read\*|subpath/)
+  }
+  assert.doesNotMatch(profile, /GlobalPreferences|CFUserTextEncoding|file-read\* \((?:literal|subpath) "\/(?:private\/)?etc/)
+})
+
+test('Darwin Grok profile admits the /var metadata alias only for physical /private/var inputs', () => {
+  assert.doesNotMatch(buildDarwinGrokProfile(input()), /^\(allow file-read-metadata \(literal "\/var"\)\)$/m)
+  const value = input()
+  value.nodeExecutable = '/private/var/folders/ap/runtime/node'
+  value.grokExecutable = '/private/var/folders/ap/runtime/grok'
+  value.home = '/private/var/folders/ap/home'
+  value.cwd = '/private/var/folders/ap/work'
+  value.scratch = '/private/var/folders/ap/scratch'
+  const profile = buildDarwinGrokProfile(value)
+  assert.match(profile, /^\(allow file-read-metadata \(literal "\/var"\)\)$/m)
+  assert.doesNotMatch(profile, /file-read(?:-data|\*) .*"\/var"|file-read-metadata \(subpath "\/var"/)
 })
 
 test('Darwin Grok profile rejects path ambiguity, writable executable roots, and non-exact listeners', () => {
