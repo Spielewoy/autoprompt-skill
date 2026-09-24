@@ -35,6 +35,13 @@ async function requireSandbox(t) {
 }
 function quote(value) { return `'${value.replaceAll("'", "'\\''")}'` }
 
+test('a caller cannot select a Windows controller Node when minting a non-Windows tool boundary', t => {
+  const f = fixture(t)
+  assert.throws(() => tools.prepareBoundary({ provider: 'claude', root: f.controller, policy: {
+    ...f.policy, windowsControllerNode: { path: process.execPath, sha256: '0'.repeat(64) },
+  } }), { code: 'TOOL_POLICY_INVALID' })
+})
+
 function injectedServer(t, leaseFactory) {
   const f = fixture(t), bound = tools.prepareBoundary({ provider: 'reasonix', root: f.controller, policy: { ...f.policy, provider: 'reasonix' } })
   const input = new PassThrough(), output = new PassThrough(), messages = []

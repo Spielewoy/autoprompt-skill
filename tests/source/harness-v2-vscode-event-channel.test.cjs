@@ -31,6 +31,21 @@ test('VS Code event channel synchronously acknowledges ordered events before com
   assert.deepEqual(events.map(event => event.type), ['owned.session', 'owned.result'])
 })
 
+test('VS Code completion wait resolves only after the authenticated completion acknowledgement', async t => {
+  const f = fixture(t)
+  await f.server.ready()
+  let settled = false
+  f.server.completion.then(() => { settled = true })
+  const client = channel.connect(f.descriptor)
+  await client.emit({ type: 'owned.result', output: { ok: true } })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(settled, false)
+  await client.complete()
+  await f.server.completion
+  assert.equal(settled, true)
+  f.server.assertComplete()
+})
+
 test('VS Code event channel round-trips a one MiB HarnessEventStream event', async t => {
   const events = []
   const f = fixture(t, raw => events.push(JSON.parse(raw)))

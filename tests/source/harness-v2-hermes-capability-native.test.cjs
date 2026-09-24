@@ -148,6 +148,25 @@ function fixtureFailureDiagnostic(f, error) {
     output.proxy.push({ name, text: fs.readFileSync(file, 'utf8').slice(-4096) })
     if (output.proxy.length >= 4) break
   }
+  // The tool server records only fixed lifecycle stages and bounded error
+  // codes in its authenticated private roots. Preserve those records before
+  // fixture cleanup; never collect request arguments, environment, or output.
+  output.toolPhases = []
+  const toolRoot = toolsFor(f)
+  for (const item of fs.existsSync(toolRoot) ? fs.readdirSync(toolRoot, { withFileTypes: true }) : []) {
+    if (!item.isDirectory() || output.toolPhases.length >= 8) continue
+    let fd
+    try {
+      const file = path.join(toolRoot, item.name, 'hermes-tool-phases.jsonl'), before = fs.lstatSync(file)
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > 65536) continue
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+      const opened = fs.fstatSync(fd)
+      if (opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) continue
+      const bytes = Buffer.alloc(opened.size), read = fs.readSync(fd, bytes, 0, bytes.length, 0)
+      output.toolPhases.push({ root: item.name, records: bytes.subarray(0, read).toString('utf8') })
+    } catch { /* Missing private phase evidence is itself diagnostic absence. */ }
+    finally { if (fd !== undefined) fs.closeSync(fd) }
+  }
   // Hermes catches plugin import/registration errors and records them in its
   // private home log. Preserve that original cause before fixture cleanup.
   output.hermesLogs = []

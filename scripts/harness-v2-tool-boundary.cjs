@@ -53,7 +53,7 @@ function ownedDirectory(file) {
 }
 function validatePolicy(input) {
   const allowed = new Set(['schemaVersion', 'provider', 'activationId', 'generation', 'sessionId', 'reservationId', 'readOnly',
-    'targetPath', 'scratchPath', 'readableRoots', 'writableRoots', 'nestedDispatch', 'commandBoundary', 'externalWrites', 'toolFree', 'darwinCommandOwner'])
+    'targetPath', 'scratchPath', 'readableRoots', 'writableRoots', 'nestedDispatch', 'commandBoundary', 'externalWrites', 'toolFree', 'darwinCommandOwner', 'windowsControllerNode'])
   if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !allowed.has(key)) ||
       !PROVIDERS.has(input.provider) || typeof input.readOnly !== 'boolean' || input.nestedDispatch !== false ||
       input.commandBoundary !== true || input.externalWrites !== false ||
@@ -69,6 +69,14 @@ function validatePolicy(input) {
     if (!owner.nodeExecutable || Object.keys(owner.nodeExecutable).sort().join(',') !== 'path,sha256' ||
         typeof owner.nodeExecutable.path !== 'string' || !path.isAbsolute(owner.nodeExecutable.path) || owner.nodeExecutable.path.includes('\0') ||
         !/^[a-f0-9]{64}$/.test(owner.nodeExecutable.sha256 || '')) fail('TOOL_POLICY_INVALID', 'Invalid Darwin controller Node binding')
+  }
+  if (input.windowsControllerNode !== undefined) {
+    if (process.platform !== 'win32') fail('TOOL_POLICY_INVALID', 'Windows controller Node binding is not valid on this platform')
+    const node = input.windowsControllerNode
+    if (!node || typeof node !== 'object' || Array.isArray(node) || Object.keys(node).sort().join(',') !== 'path,sha256' ||
+        typeof node.path !== 'string' || !path.isAbsolute(node.path) || node.path.includes('\0') || !/^[a-f0-9]{64}$/.test(node.sha256 || '')) {
+      fail('TOOL_POLICY_INVALID', 'Invalid Windows controller Node binding')
+    }
   }
   for (const key of ['activationId', 'sessionId', 'reservationId']) if (input[key] !== undefined &&
       (typeof input[key] !== 'string' || !input[key] || input[key].length > 512 || input[key].includes('\0'))) fail('TOOL_POLICY_INVALID', 'Invalid tool policy identity')
@@ -280,9 +288,17 @@ async function executeTool(rawPolicy, name, args, options = {}) {
   if (Buffer.byteLength(output) > OUTPUT_LIMIT) fail('TOOL_OUTPUT_LIMIT', 'Tool output exceeds its bounded response size')
   return { tool: name, status: 'completed', exitCode: 0, output, outputSha256: sha256(output), ...details }
 }
+function windowsControllerNodeBinding() {
+  if (process.release?.name !== 'node' || process.versions?.bun || process.versions?.electron) fail('TOOL_POLICY_INVALID', 'Windows tool policy must be minted by the outer Node controller')
+  const nodePath = physical(process.execPath), item = fs.lstatSync(nodePath)
+  if (!item.isFile() || item.isSymbolicLink() || item.nlink !== 1 || item.size < 1 || item.size > 512 * 1024 * 1024) fail('TOOL_POLICY_INVALID', 'Windows controller Node is not a bounded physical executable')
+  return Object.freeze({ path: nodePath, sha256: sha256(fs.readFileSync(nodePath)) })
+}
 function prepareBoundary({ provider, root, policy, darwinCommandOwner }) {
+  if (policy?.windowsControllerNode !== undefined) fail('TOOL_POLICY_INVALID', 'Windows controller Node binding is minted only by the outer controller')
   const parent = ownedDirectory(root)
   let normalized = validatePolicy({ ...policy, provider })
+  if (process.platform === 'win32') normalized = validatePolicy({ ...normalized, windowsControllerNode: windowsControllerNodeBinding() })
   if ([...normalized.readableRoots, ...normalized.writableRoots].some(task => within(task, parent) || within(parent, task))) fail('TOOL_POLICY_INVALID', 'Controller state must be disjoint from all task roots')
   const directory = path.join(parent, `tools-${crypto.randomUUID()}`)
   fs.mkdirSync(directory, { mode: 0o700 })
@@ -310,7 +326,7 @@ function prepareBoundary({ provider, root, policy, darwinCommandOwner }) {
     for (const key of ['stateRoot', 'registryPath', 'controlRoot']) if (registeredCommandOwner[key] !== normalized.darwinCommandOwner[key]) fail('TOOL_POLICY_INVALID', 'Darwin command ownership descriptor differs from its registered policy')
   }
   return { root: directory, policy: normalized, policyPath, policySha256, receiptPath, ...(registeredCommandOwner ? { darwinCommandOwner: normalized.darwinCommandOwner } : {}),
-    serverSpec: { command: normalized.darwinCommandOwner?.nodeExecutable.path || process.execPath, args: [path.join(__dirname, 'harness-v2-tool-server.cjs'), '--policy', policyPath, '--sha256', policySha256],
+    serverSpec: { command: normalized.darwinCommandOwner?.nodeExecutable.path || (process.platform === 'win32' ? normalized.windowsControllerNode.path : process.execPath), args: [path.join(__dirname, 'harness-v2-tool-server.cjs'), '--policy', policyPath, '--sha256', policySha256],
       env: { ...safeEnvironment(), HOME: directory, TMPDIR: directory, ...(process.platform === 'win32' ? { TEMP: directory, TMP: directory } : {}) } } }
 }
 async function drainDarwinCommandOwner(prepared) {

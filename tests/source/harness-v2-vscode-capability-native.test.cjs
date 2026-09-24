@@ -21,6 +21,22 @@ const CLI = process.env.AUTOPROMPT_VSCODE_TEST_CLI
 const enabled = Boolean(CLI)
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 
+function sessionDriverDiagnostic(f, record) {
+  // This is the one fixed journal location derived from the authenticated
+  // owned-request parent. Do not walk the fixture tree or expose its paths.
+  const file = path.join(f.nativeRoot, 'vscode', native.sha256(record.sessionId), native.sha256(record.reservationId), 'home', 'session-driver-phase.jsonl')
+  try {
+    const stat = fs.lstatSync(file)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > 4096 || (process.platform !== 'win32' && (stat.mode & 0o077))) return { state: 'invalid' }
+    const entries = fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse)
+    if (!entries.length || entries.length > 16 || entries.some(entry => !entry || typeof entry !== 'object' || Array.isArray(entry) ||
+      !['entry', 'beforeactivation', 'afteractivation', 'channelconnected', 'runSession', 'complete', 'error'].includes(entry.stage) ||
+      (entry.stage === 'error' && !/^[A-Z][A-Z0-9_]{0,63}$/.test(entry.code || '')) ||
+      Object.keys(entry).sort().join('\0') !== (entry.stage === 'error' ? 'code\0stage' : 'stage'))) return { state: 'invalid' }
+    return { state: 'present', stages: entries.map(entry => entry.stage === 'error' ? `error:${entry.code}` : entry.stage) }
+  } catch (error) { return error?.code === 'ENOENT' ? { state: 'missing' } : { state: 'unreadable' } }
+}
+
 function closedBinding() {
   const fields = ['AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT', 'AUTOPROMPT_CLOSED_CANARY_PROVIDER', 'AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID', 'AUTOPROMPT_CLOSED_CANARY_GENERATION', 'AUTOPROMPT_CLOSED_CANARY_CHALLENGE']
   const value = Object.fromEntries(fields.map(name => [name, process.env[name]]))
@@ -87,8 +103,12 @@ async function scenario(t, options = {}) {
   f.execution.checkerScratchVerifier = record => record.checkerScratchBoundary || original?.(record)
   f.run = async (overrides = {}) => {
     const record = { ...f.record, ...overrides }
-    const failedTools = [], originalEvent = record.onEvent
+    const failedTools = [], eventTypes = [], originalEvent = record.onEvent
     record.onEvent = (event, raw) => {
+      if (typeof event?.type === 'string') {
+        eventTypes.push(event.type.slice(0, 96))
+        if (eventTypes.length > 8) eventTypes.shift()
+      }
       if (event?.type === 'owned.tool.end' && event.error === true) {
         failedTools.push({ id: event.id, output: String(event.output || '').slice(0, 4096) })
         if (failedTools.length > 4) failedTools.shift()
@@ -104,7 +124,7 @@ async function scenario(t, options = {}) {
       // The runner's durable transcript remains private under the fixture root.
       // Emit bounded raw bytes only for failed native probes, so CI can distinguish
       // a provider startup failure from a controller-side classification.
-      t.diagnostic(JSON.stringify({ vscodeNativeFailure: { code: error?.code || null, message: error?.message || String(error), failedTools, proxy: f.proxyDiagnostic() } }))
+      t.diagnostic(JSON.stringify({ vscodeNativeFailure: { code: error?.code || null, message: error?.message || String(error), failedTools, lastEventTypes: eventTypes, sessionDriver: sessionDriverDiagnostic(f, record), proxy: f.proxyDiagnostic() } }))
       throw error
     }
   }

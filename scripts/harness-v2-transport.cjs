@@ -1495,6 +1495,7 @@ class HarnessExecAdapter {
     const stream = new HarnessEventStream(this.provider, { ...record, ...(quotaEnabled ? { onUsageDelta: undefined } : {}), readOnly, commandBoundary, toolFree: Boolean(routeProjection), toolBoundary, grokStructuredOutputRequired: this.provider === 'grok', ...(this.provider === 'claude' ? { claudeStructuredOutputSchema: wireSchema } : {}), ...(this.provider === 'deepseek' ? { deepseekStructuredOutputSchema: wireSchema } : {}), onSessionIdentified: (id, evidence) => { persistContext(this.nativeRoot, sessionRoot, this.provider, record, targetPath, id); record.onSessionIdentified?.(id, evidence) } })
     let streamError, stopPromise, runnerStarted = false, grokIssuedHistory = []
     let primaryNativeFailure = null, closingAfterNativeResult = false
+    let vscodeCompletionSeen = false, vscodeCompletionStop = null, vscodeCompletionPromise = null, vscodeCompletionDrainPromise = null, runnerSettled = false
     const stop = error => {
       if (closingAfterNativeResult && relayCleanupAbort(error)) return
       if (streamError) return
@@ -1545,6 +1546,16 @@ class HarnessExecAdapter {
           onFailure: error => stop(error),
         })
         await vscodeEvents.ready()
+        vscodeCompletionPromise = vscodeEvents.completion.then(() => {
+          vscodeCompletionSeen = true
+        }).catch(error => {
+          if (!streamError) stop(error)
+          throw error
+        })
+        // The stop path records the authoritative failure; this observer
+        // prevents an early channel rejection from becoming unhandled while
+        // the owned runner is draining.
+        vscodeCompletionPromise.catch(() => {})
       }
       spec = native.createLaunch({ provider: this.provider, executable: native.executableRuntimePath(binding), home: path.join(launchRoot, 'home'), ...(vscodeIpcAlias ? { vscodeUserDataDir: vscodeIpcAlias.userDataDir } : {}), ...(vscodeEvents ? { vscodeEventChannel: vscodeEvents.descriptor } : {}), sessionRoot, ...(grokWindowsSession ? { grokRuntimeProjection: grokWindowsSession.config.runtimeProjection } : {}), cwd, targetPath: candidatePath, readOnly, commandBoundary, toolBoundary, toolFree: Boolean(routeProjection), prompt, input, continuationId: record.continuationId, connection: projectedConnection, credentials: this.credentialEnvironment, providerConnectionIdentity: this.connection, environment: record.environment, model: record.assignment?.model, effort: this.provider === 'grok' ? grokAssignedEffort : record.assignment?.effort, issuedCalls: preexistingIssuedCalls, proxyToken, maxTokens: nativeMaxTokens, outputSchema: ['claude', 'deepseek', 'grok', 'prime', 'omp'].includes(this.provider) || this.provider === 'vscode' && this.connection?.supportsStructuredOutput === true ? wireSchema : undefined, maxCompletionTokens: this.provider === 'grok' && Number.isSafeInteger(record.providerTokenLimit) && record.providerTokenLimit > 0 ? Math.min(4096, record.providerTokenLimit) : undefined })
       if (requiredResponseFormat && boundary.canonicalJson(spec.requiredResponseFormat) !== boundary.canonicalJson(requiredResponseFormat)) fail('PROVIDER_UNSUPPORTED', 'Pi native schema differs from its owned provider boundary')
@@ -1680,23 +1691,61 @@ class HarnessExecAdapter {
         vscodeIpcAlias.markReservationEntered()
         vscodeReservationEntered = true
       }
-      result = await this.runner.run({ ...spec, ...(vscodeIpcAlias ? { launchBindingHash: vscodeIpcAlias.launchBindingHash } : {}), ...(this.provider === 'grok' ? { prepareLaunch } : {}), executable: spec.executable || invocation.executable, argv: spec.executable ? spec.argv : invocation.argv, sessionId: processSessionId, reservationId: record.reservationId, onTransportActivity: record.onTransportActivity, onStdoutLine: line => { try { if (this.provider === 'vscode') return; stream.push(line) } catch (error) { stop(error) } } })
-      vscodeEventsDrained = result?.drained === true
-      // A nonzero owned child is already terminal evidence. Its test host may
-      // never reach the driver, so preserve that primary exit rather than
-      // replacing it with the absence of a channel completion frame.
-      if (vscodeEvents) {
-        const channelTermination = nativeTerminationDetails(result)
-        if (channelTermination.exitCode === 0 && channelTermination.signal === null && !result?.aborted) vscodeEvents.assertComplete()
+      const drainAfterVscodeCompletion = async () => {
+        // The channel completion is only a drain trigger after the transport
+        // has itself accepted the terminal result; a bare channel close must
+        // never manufacture a successful native outcome.
+        if (!runnerStarted || runnerSettled || !vscodeCompletionSeen || streamError || vscodeCompletionStop) return
+        if (!stream.terminal) throw new native.HarnessError('CHILD_RESULT_MISSING', 'VS Code event channel completed before its authenticated terminal result')
+        vscodeCompletionDrainPromise ||= (async () => {
+          const stopped = await this.runner.stop({ sessionId: processSessionId, reason: 'VSCODE_EVENT_CHANNEL_COMPLETE', terminalStatus: 'DONE' })
+          // Natural completion can remove the runner session before this
+          // callback resumes. Its actual run result remains authoritative.
+          if (stopped?.alreadyTerminal === true && stopped.drained === true) return
+          const terminal = stopped?.terminal
+          const rootExit = terminal?.rootExit
+          const observedFailure = rootExit &&
+            ((rootExit.code !== undefined && rootExit.code !== 0) ||
+             (rootExit.signal !== undefined && rootExit.signal !== null))
+          if (stopped?.drained !== true || typeof stopped.ownershipId !== 'string' || !stopped.ownershipId ||
+              typeof stopped.groupIdentity !== 'string' || !stopped.groupIdentity ||
+              typeof stopped.reservationId !== 'string' || stopped.reservationId !== record.reservationId ||
+              stopped.ownershipId !== terminal?.ownershipId || stopped.groupIdentity !== terminal?.groupIdentity ||
+              terminal?.sessionId !== processSessionId || terminal.status !== 'DONE' || observedFailure) {
+            throw new native.HarnessError('PROCESS_DRAIN_TIMEOUT', 'VS Code completion did not return its exact DONE owner receipt')
+          }
+          vscodeCompletionStop = stopped
+        })()
+        await vscodeCompletionDrainPromise
       }
+      if (vscodeCompletionPromise) {
+        vscodeCompletionPromise.then(async () => {
+          // Give a naturally exiting runner one scheduling turn to win the
+          // race. A completion frame is a drain trigger only while the owner
+          // is still live; it must not replace an already terminal failure.
+          await new Promise(resolve => setImmediate(resolve))
+          if (!runnerSettled) await drainAfterVscodeCompletion()
+        }).catch(error => stop(error))
+      }
+      try {
+        result = await this.runner.run({ ...spec, ...(vscodeIpcAlias ? { launchBindingHash: vscodeIpcAlias.launchBindingHash } : {}), ...(this.provider === 'grok' ? { prepareLaunch } : {}), executable: spec.executable || invocation.executable, argv: spec.executable ? spec.argv : invocation.argv, sessionId: processSessionId, reservationId: record.reservationId, onTransportActivity: record.onTransportActivity, onStdoutLine: line => { try { if (this.provider === 'vscode') return; stream.push(line) } catch (error) { stop(error) } } })
+      } finally { runnerSettled = true }
+      if (vscodeCompletionDrainPromise) await vscodeCompletionDrainPromise
+      vscodeEventsDrained = result?.drained === true
       if (!streamError && this.provider === 'grok') stream.grokReconcileIssuedCalls(grokIssuedHistory)
       const completedOwnedNativeResult = result?.processOwned === true && result.exactArgv === true && result.drained === true
       let termination = null
       if (completedOwnedNativeResult) {
         try { termination = nativeTerminationDetails(result) } catch (error) { primaryNativeFailure = error }
       }
+      const expectedVscodeCompletionStop = this.provider === 'vscode' && vscodeCompletionSeen &&
+        vscodeCompletionStop?.terminal?.status === 'DONE' && result?.signal === 'OWNED_STOP' &&
+        (!result?.observedTermination || result.observedTermination.exitCode === 0 && result.observedTermination.signal === null)
+      if (vscodeEvents && (termination?.exitCode === 0 && termination?.signal === null && !result?.aborted || expectedVscodeCompletionStop)) {
+        vscodeEvents.assertComplete()
+      }
       const nativeExitUnsuccessful = Boolean(primaryNativeFailure) ||
-        termination?.exitCode !== 0 || termination?.signal !== null || result?.aborted
+        termination?.exitCode !== 0 || (termination?.signal !== null && !expectedVscodeCompletionStop) || result?.aborted
       // A clean native result may still have an admitted provider request that
       // has no exact receipt. Its close abort must remain a conservative
       // accounting failure. Only an already-terminal process failure can
@@ -1750,7 +1799,10 @@ class HarnessExecAdapter {
     if (primaryNativeFailure) throw primaryNativeFailure
     controlled.assertStopped(toolBoundary)
     const termination = nativeTerminationDetails(result)
-    if (termination.exitCode !== 0 || termination.signal !== null || result.aborted) fail('CHILD_RUNTIME_FAILURE', 'Native child exited unsuccessfully', termination)
+    const expectedVscodeCompletionStop = this.provider === 'vscode' && vscodeCompletionSeen &&
+      vscodeCompletionStop?.terminal?.status === 'DONE' && result?.signal === 'OWNED_STOP' &&
+      (!result?.observedTermination || result.observedTermination.exitCode === 0 && result.observedTermination.signal === null)
+    if (termination.exitCode !== 0 || (termination.signal !== null && !expectedVscodeCompletionStop) || result.aborted) fail('CHILD_RUNTIME_FAILURE', 'Native child exited unsuccessfully', termination)
     const parsed = stream.finish()
     if (quotaRelay) {
       const authoritative = quotaRelay.snapshot().cumulative

@@ -23,6 +23,18 @@ class VscodeIpcAliasError extends Error {
   }
 }
 function fail(code, message, details) { throw new VscodeIpcAliasError(code, message, details) }
+function boundedCause(error) {
+  const source = error && typeof error === 'object' ? error : {}
+  const details = source.details && typeof source.details === 'object' && !Array.isArray(source.details) ? source.details : {}
+  return Object.freeze({
+    code: typeof source.code === 'string' ? source.code.slice(0, 128) : null,
+    message: typeof source.message === 'string' ? source.message.slice(0, 1024) : null,
+    status: Number.isInteger(details.status) ? details.status : null,
+    cause: typeof details.cause === 'string' ? details.cause.slice(0, 128) : null,
+    phase: typeof details.phase === 'string' ? details.phase.slice(0, 128) : null,
+    stderr: typeof details.stderr === 'string' ? details.stderr.slice(0, 2048) : null,
+  })
+}
 function windows() { return process.platform === 'win32' }
 function resourceType() { return windows() ? RESOURCE_TYPE_WINDOWS : RESOURCE_TYPE_DARWIN }
 function samePath(left, right) {
@@ -71,7 +83,7 @@ function physicalDirectory(directory, label, requirePrivate = false) {
   if (requirePrivate) {
     if (windows()) {
       try { require('../agents/codex/workflow/safe-run-root.js').auditPrivatePermissions(directory, { recurse: false }) }
-      catch (error) { fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is not private`, { cause: error && error.code }) }
+      catch (error) { fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is not private`, { audit: boundedCause(error) }) }
     } else if (captured.mode !== 0o700) fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is not private`)
   }
   return captured

@@ -9,6 +9,20 @@ const { createWindowsAppContainerLauncher, WindowsAppContainerError, parseMsysSh
 const { failureDiagnostic } = require('./windows-appcontainer-probe.js')
 const workerBundle = require('./windows-worker-loader.js')
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
+const COMMAND_PHASES = new Set([
+  'worker-admission-start', 'worker-admission-cache-hit', 'worker-admission-wait',
+  'worker-canary-start', 'worker-canary-finished', 'worker-canary-failed',
+  'worker-admission-ready', 'worker-admission-failed',
+  'worker-command-start', 'worker-command-finished', 'worker-command-failed',
+])
+function commandPhase(options, stage, error) {
+  try {
+    if (!COMMAND_PHASES.has(stage) || typeof options?.onPhase !== 'function') return
+    const rawCode = error && typeof error.code === 'string' ? error.code : null
+    const code = rawCode && /^[A-Z][A-Z0-9_]{0,63}$/.test(rawCode) ? rawCode : error ? 'INTERNAL_ERROR' : undefined
+    options.onPhase(Object.freeze(code ? { stage, code } : { stage }))
+  } catch {}
+}
 function within(root, value) {
   const relative = path.relative(path.resolve(root).toLowerCase(), path.resolve(value).toLowerCase())
   return relative === '' || relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
@@ -278,19 +292,32 @@ function refusePoisonedAdmission() {
   error.recoveryRoot = admissionPoison.recoveryRoot || admissionPoison.retainedHelperRoot || admissionPoison.retainedRuntimeRoot || admissionPoison.retainedStagingRoot || admissionPoison.retainedControlRoot
   throw error
 }
-async function ensureWorkerAdmission() {
+async function ensureWorkerAdmission(controllerNode, options) {
+  commandPhase(options, 'worker-admission-start')
   refusePoisonedAdmission()
-  const tuple = await workerBundle.captureWorkerTuple()
+  const tuple = await workerBundle.captureWorkerTuple(controllerNode)
   refusePoisonedAdmission()
   const { worker, key } = currentAdmission(tuple)
-  if (admittedWorker?.tuple === tuple && admittedWorker.key === key) return admittedWorker
+  if (admittedWorker?.tuple === tuple && admittedWorker.key === key) {
+    commandPhase(options, 'worker-admission-cache-hit')
+    commandPhase(options, 'worker-admission-ready')
+    return admittedWorker
+  }
   let pending = pendingAdmission
   if (!pending || pending.tuple !== tuple || pending.key !== key) {
     pending = { tuple, key, promise: null }
     const ownedPending = pending
     pending.promise = (async () => {
-      const result = await require('./windows-appcontainer-probe.js').runWindowsAppContainerCanary(
-        (policy, args, options) => runTupleCommand(policy, args, options, tuple, key), worker.identity, key)
+      commandPhase(options, 'worker-canary-start')
+      let result
+      try {
+        result = await require('./windows-appcontainer-probe.js').runWindowsAppContainerCanary(
+          (policy, args, options) => runTupleCommand(policy, args, options, tuple, key), worker.identity, key)
+        commandPhase(options, 'worker-canary-finished')
+      } catch (error) {
+        commandPhase(options, 'worker-canary-failed', error)
+        throw error
+      }
       if (!result || result.supported !== true || result.workerIdentity !== worker.identity || result.runtimeSha256 !== key || result.processCleanup !== 'owned-job-drained') {
         const error = new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', 'The selected Windows worker tuple did not pass its fresh native canary')
         if (result && result.supported === false) error.canaryResult = result
@@ -309,15 +336,25 @@ async function ensureWorkerAdmission() {
       if (pendingAdmission === ownedPending) pendingAdmission = null
     })
     pendingAdmission = pending
+  } else {
+    // This caller must not add a callback to the shared promise: phase hooks
+    // are diagnostic-only and cannot become shared admission state.
+    commandPhase(options, 'worker-admission-wait')
   }
-  const admitted = await pending.promise
-  refusePoisonedAdmission()
-  if (currentAdmission(tuple).key !== admitted.key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed after the Windows worker canary')
-  return admitted
+  try {
+    const admitted = await pending.promise
+    refusePoisonedAdmission()
+    if (currentAdmission(tuple).key !== admitted.key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed after the Windows worker canary')
+    commandPhase(options, 'worker-admission-ready')
+    return admitted
+  } catch (error) {
+    commandPhase(options, 'worker-admission-failed', error)
+    throw error
+  }
 }
 async function probeWindowsAppContainer() {
   if (process.platform !== 'win32') return { supported: false, backend: 'windows-appcontainer', code: 'COMMAND_SANDBOX_UNSUPPORTED' }
-  try { return (await ensureWorkerAdmission()).result }
+  try { return (await ensureWorkerAdmission(undefined, undefined)).result }
   catch (error) {
     if (error.canaryResult) return error.canaryResult
     return { supported: false, backend: 'windows-appcontainer', code: error.code || 'WINDOWS_RUNTIME_UNAVAILABLE', diagnostic: failureDiagnostic(error, 'worker-admission'), ...(error.cleanupConfirmed === false ? {
@@ -328,11 +365,19 @@ async function probeWindowsAppContainer() {
 }
 async function runWindowsAppContainerCommand(policy, args, options = {}) {
   if (process.platform !== 'win32' || typeof options.controlRoot !== 'string' || !path.isAbsolute(options.controlRoot)) throw new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', 'A private controller root is required for Windows commands')
+  let commandStarted = false
   try {
-    const admitted = await ensureWorkerAdmission()
+    const admitted = await ensureWorkerAdmission(policy.windowsControllerNode, options)
     if (currentAdmission(admitted.tuple).key !== admitted.key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed before command launch')
-    return await runTupleCommand(policy, args, options, admitted.tuple, admitted.key)
-  } catch (error) { retainUnknownAdmission(error); throw error }
+    commandStarted = true
+    commandPhase(options, 'worker-command-start')
+    const result = await runTupleCommand(policy, args, options, admitted.tuple, admitted.key)
+    commandPhase(options, 'worker-command-finished')
+    return result
+  } catch (error) {
+    if (commandStarted) commandPhase(options, 'worker-command-failed', error)
+    retainUnknownAdmission(error); throw error
+  }
 }
 async function runTupleCommand(policy, args, options, tuple, key) {
   refusePoisonedAdmission()

@@ -73,13 +73,102 @@ function connection(service, options = {}) {
   return { model: `${providerId}/${modelId}`, providers: { [providerId]: { npm: options.npm || '@ai-sdk/openai-compatible', options: { baseURL: `${service.url}/v1`, apiKey: '<local-test-only>' }, models: { [modelId]: { name: 'Fixture Model', ...(options.wireModelId ? { id: options.wireModelId } : {}), limit: { context: 32768, output: 2048 }, variants: Object.fromEntries(['low', 'medium', 'high', 'xhigh', 'max'].map(effort => [effort, { reasoningEffort: effort }])) } } } } }
 }
 
+const DIAGNOSTIC_FILE_LIMIT = 64 * 1024
+const DIAGNOSTIC_TEXT_LIMIT = 2048
+function redactDiagnosticText(value) {
+  return String(value).replace(/\b(?:Bearer\s+[^\s,;]+|(?:[A-Z0-9_]*(?:KEY|TOKEN|SECRET))\s*[=:]\s*[^\s,;]+)/giu, '<redacted>').slice(0, DIAGNOSTIC_TEXT_LIMIT)
+}
+function privateProxyDiagnostics(root) {
+  const result = []; let directories = 0
+  const boundedText = (file, size) => {
+    const fd = fs.openSync(file, 'r')
+    try {
+      const headLength = Math.min(DIAGNOSTIC_TEXT_LIMIT, size), headBuffer = Buffer.alloc(headLength)
+      fs.readSync(fd, headBuffer, 0, headLength, 0)
+      const tailOffset = Math.max(0, size - DIAGNOSTIC_TEXT_LIMIT), tailLength = Math.min(DIAGNOSTIC_TEXT_LIMIT, size)
+      const tailBuffer = Buffer.alloc(tailLength)
+      fs.readSync(fd, tailBuffer, 0, tailLength, tailOffset)
+      return { head: redactDiagnosticText(headBuffer.toString('utf8')), tail: redactDiagnosticText(tailBuffer.toString('utf8')) }
+    } finally { fs.closeSync(fd) }
+  }
+  const visit = directory => {
+    if (result.length >= 8 || ++directories > 32) return
+    let entries
+    try { entries = fs.readdirSync(directory, { withFileTypes: true }) } catch { return }
+    for (const entry of entries) {
+      if (result.length >= 8) return
+      const file = path.join(directory, entry.name)
+      if (entry.isDirectory()) { visit(file); continue }
+      if (!/^(?:request\.json|status\.json|proxy-error\.json|stderr(?:\.log|\.jsonl)?)$/u.test(entry.name)) continue
+      try {
+        const stat = fs.lstatSync(file)
+        if (!stat.isFile() || stat.isSymbolicLink()) continue
+        if (entry.name === 'request.json') result.push({ name: path.relative(root, file).replaceAll(path.sep, '/'), exists: true, bytes: stat.size })
+        else {
+          let summary = { name: path.relative(root, file).replaceAll(path.sep, '/'), bytes: stat.size }
+          if (entry.name === 'stderr.log' || entry.name === 'stderr.jsonl') summary = { ...summary, ...boundedText(file, stat.size) }
+          else {
+            if (stat.size > DIAGNOSTIC_FILE_LIMIT) continue
+            const text = fs.readFileSync(file, 'utf8')
+            try {
+              const value = JSON.parse(text)
+              summary = { ...summary, code: typeof value?.code === 'string' ? value.code.slice(0, 128) : null, status: typeof value?.status === 'string' ? value.status.slice(0, 64) : null, signal: typeof value?.signal === 'string' ? value.signal.slice(0, 64) : null, errorCode: typeof value?.error?.code === 'string' ? value.error.code.slice(0, 128) : null }
+            } catch { summary = { ...summary, parse: 'invalid-json' } }
+          }
+          result.push(summary)
+        }
+      } catch { result.push({ name: path.relative(root, file).replaceAll(path.sep, '/'), status: 'unavailable' }) }
+    }
+  }
+  visit(root)
+  return result
+}
+function ownerRegistryDiagnostic(file) {
+  try {
+    const value = JSON.parse(fs.readFileSync(file, 'utf8'))
+    return { records: Array.isArray(value.records) ? value.records.slice(0, 16).map(record => ({ status: record.status || null, rootPid: Number.isSafeInteger(record.rootPid) ? record.rootPid : null, groupIdentity: typeof record.groupIdentity === 'string' ? record.groupIdentity.slice(0, 256) : null })) : [] }
+  } catch { return { status: 'unavailable' } }
+}
+
+test('OpenCode fixture diagnostics expose bounded proxy and owner state without request contents', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-diagnostic-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const session = path.join(root, 'a'.repeat(32)); fs.mkdirSync(session)
+  fs.writeFileSync(path.join(session, 'request.json'), JSON.stringify({ secret: 'must-not-be-read' }))
+  fs.writeFileSync(path.join(session, 'status.json'), JSON.stringify({ code: 'CHILD_RUNTIME_FAILURE', status: 'FAILED', signal: 'SIGTERM', error: { code: 'EACCES', message: 'private' } }))
+  fs.writeFileSync(path.join(session, 'proxy-error.json'), JSON.stringify({ code: 'PROXY_FAILED', error: { code: 'EPIPE' } }))
+  fs.writeFileSync(path.join(session, 'stderr.log'), 'Bearer local-test-secret\nOPENAI_API_KEY=runtime-secret\nstartup failed\n')
+  const diagnostic = privateProxyDiagnostics(root)
+  const request = diagnostic.find(item => item.name.endsWith('/request.json'))
+  assert.deepEqual(request && { exists: request.exists, bytes: request.bytes }, { exists: true, bytes: fs.statSync(path.join(session, 'request.json')).size })
+  assert.equal(JSON.stringify(diagnostic).includes('must-not-be-read'), false)
+  assert.equal(JSON.stringify(diagnostic).includes('runtime-secret'), false)
+  assert.equal(diagnostic.some(item => item.name.endsWith('/stderr.log') && item.head.includes('startup failed')), true)
+  const registry = path.join(root, 'processes.json')
+  fs.writeFileSync(registry, JSON.stringify({ records: [{ status: 'RUNNING', rootPid: 1234, groupIdentity: 'owned-group' }] }))
+  assert.deepEqual(ownerRegistryDiagnostic(registry), { records: [{ status: 'RUNNING', rootPid: 1234, groupIdentity: 'owned-group' }] })
+})
+
 function fixtureFailureDiagnostic(f, error) {
   // Capture the synthetic provider events before the real runner drains and
   // removes its private transcript. No ambient files or user logs are read.
   const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024),
     details: error.details ? JSON.stringify(error.details).slice(0, 4096) : null,
-    stderr: String(f.nativeStderr || '').slice(-8192), events: [...(f.nativeEvents || [])] }
-  while (Buffer.byteLength(JSON.stringify(output)) > 65536) output.events.shift()
+    stderr: String(f.nativeStderr || '').slice(-8192), events: [...(f.nativeEvents || [])],
+    launchStages: [...(f.launchStages || [])].slice(-32),
+    proxy: privateProxyDiagnostics(f.proxyRoot),
+    owner: ownerRegistryDiagnostic(f.registryPath) }
+  while (Buffer.byteLength(JSON.stringify(output)) > 65536 && output.events.length) output.events.shift()
+  // The event list is disposable, but the fixed proxy/owner diagnostics can
+  // also fill the bound. Never spin forever once events are exhausted.
+  if (Buffer.byteLength(JSON.stringify(output)) > 65536) {
+    output.events = []
+    output.launchStages = output.launchStages.slice(-8)
+    output.proxy = output.proxy.slice(0, 2)
+    output.owner = { status: output.owner?.status || 'diagnostic-truncated' }
+    output.stderr = String(output.stderr).slice(-1024)
+    output.details = typeof output.details === 'string' ? output.details.slice(0, 1024) : null
+  }
   console.error(JSON.stringify(output))
 }
 
@@ -92,29 +181,39 @@ async function scenario(provider, options = {}) {
   let service, owner
   try {
     service = await modelService(provider, options.tool || { name: controlled.toolName(provider, 'bash'), args: { command: readCommand(candidate) } }, { resetToolAfterCompletion: true, ...(options.serviceOptions || {}) })
+    const probeStarted = Date.now(); f.launchStages = [{ stage: 'probeExecutable', phase: 'started', elapsedMs: 0 }]
     const binding = native.probeExecutable({ provider, executable: cli })
-    const registryPath = canaryRegistry(provider, path.join(f.controller, 'processes.json')), processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath)), ownerValue = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
+    f.launchStages.push({ stage: 'probeExecutable', phase: 'completed', elapsedMs: Date.now() - probeStarted })
+    const registryPath = canaryRegistry(provider, path.join(f.controller, 'processes.json')); f.registryPath = registryPath
+    const processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath)), ownerValue = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
     owner = ownerValue
-    const proxy = privateDirectory(path.join(f.controller, 'proxy'))
+    const proxy = privateDirectory(path.join(f.controller, 'proxy')); f.proxyRoot = proxy; f.launchStages = [...f.launchStages]
     const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: `${provider}-closed-native-canary`, pollMs: 10 })
     const ownedRun = runner.run.bind(runner)
     runner.run = async spec => {
       f.nativeEvents = []; f.nativeStderr = ''
-      const result = await ownedRun({ ...spec, onStdoutLine: line => {
-        f.nativeEvents.push(String(line).slice(-8192))
-        if (f.nativeEvents.length > 16) f.nativeEvents.shift()
-        return spec.onStdoutLine?.(line)
-      } })
-      f.nativeStderr = result.stderr
-      return result
+      const began = Date.now(); f.launchStages.push({ stage: 'runner.run', phase: 'started', elapsedMs: began - (f.launchStartedAt || began) })
+      try {
+        const result = await ownedRun({ ...spec, onStdoutLine: line => {
+          f.nativeEvents.push(String(line).slice(-8192))
+          if (f.nativeEvents.length > 16) f.nativeEvents.shift()
+          return spec.onStdoutLine?.(line)
+        } })
+        f.nativeStderr = result.stderr; f.launchStages.push({ stage: 'runner.run', phase: 'completed', elapsedMs: Date.now() - began })
+        return result
+      } catch (error) {
+        f.launchStages.push({ stage: 'runner.run', phase: 'failed', elapsedMs: Date.now() - began, code: typeof error?.code === 'string' ? error.code.slice(0, 128) : 'ERROR' })
+        throw error
+      }
     }
     const adapter = new HarnessExecAdapter({ provider, runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: connection(service, options.connection), credentialEnvironment: { OPENAI_API_KEY: '<local-test-only>', KILO_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only assigned controller tools and return one JSON object.' })
     const run = async overrides => {
       const record = { ...f.record, ...overrides }
       record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
       record.signal = overrides?.signal || AbortSignal.timeout(process.platform === 'win32' ? 300_000 : 90_000)
-      try { return await adapter.launch(record) }
-      catch (error) { fixtureFailureDiagnostic(f, error); throw error }
+      const began = Date.now(); f.launchStartedAt = began; f.launchStages.push({ stage: 'adapter.launch', phase: 'started', elapsedMs: 0 })
+      try { const result = await adapter.launch(record); f.launchStages.push({ stage: 'adapter.launch', phase: 'completed', elapsedMs: Date.now() - began }); return result }
+      catch (error) { f.launchStages.push({ stage: 'adapter.launch', phase: 'failed', elapsedMs: Date.now() - began, code: typeof error?.code === 'string' ? error.code.slice(0, 128) : 'ERROR' }); fixtureFailureDiagnostic(f, error); throw error }
     }
     let closed = false
     return { ...f, provider, candidate, secret, marker, service, binding, owner, processAdapter, registryPath, adapter, run,

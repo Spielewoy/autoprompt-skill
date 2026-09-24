@@ -10083,7 +10083,7 @@ class OwnedCodexProxyRunner {
       try { await launchResource?.cleanup?.() } catch {}
       throw error
     }
-    const session = { ...owned, sessionRoot, statusPath, stopped: false }
+    const session = { ...owned, reservationId: spec.reservationId, sessionRoot, statusPath, stopped: false }
     this.sessions.set(spec.sessionId, session)
     let stdoutTail = Buffer.alloc(0)
     const stdoutHash = crypto.createHash('sha256')
@@ -10092,6 +10092,7 @@ class OwnedCodexProxyRunner {
     let stdoutDescriptor
     const stdoutDecoder = new StringDecoder('utf8')
     let status = null
+    let observedTermination = null
     let terminalRecord = null
     let missingStatusSince = null
     let stdoutLinesSinceYield = 0
@@ -10228,6 +10229,21 @@ class OwnedCodexProxyRunner {
           'owned Codex proxy lacks the exact terminal group-drain receipt',
         )
       }
+      // Read only after the exact owned group has drained: the proxy may
+      // publish a natural failure while stop() is in flight. Protocol-driven
+      // completion must not erase that durable native termination evidence.
+      if (session.stopped && fs.existsSync(statusPath)) {
+        const stoppedStatus = readRegularJson(statusPath, 'owned Codex proxy status').parsed
+        if (stoppedStatus.schemaVersion !== 2 || stoppedStatus.activationId !== this.activationId ||
+            stoppedStatus.generationId !== this.generationId || stoppedStatus.sequence !== sequence ||
+            stoppedStatus.argvHash !== argvHash || !Number.isSafeInteger(stoppedStatus.codexPid) || stoppedStatus.codexPid < 1 ||
+            !(stoppedStatus.code === null || Number.isSafeInteger(stoppedStatus.code) && stoppedStatus.code >= 0 && stoppedStatus.code <= 0xffffffff) ||
+            !(stoppedStatus.signal === null || typeof stoppedStatus.signal === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(stoppedStatus.signal)) ||
+            stoppedStatus.code === null && stoppedStatus.signal === null) {
+          throw new SupervisorIntegrationError('CODEX_PROXY_STATUS_INVALID', 'owned Codex proxy returned a foreign stopped status')
+        }
+        observedTermination = Object.freeze({ exitCode: stoppedStatus.code, signal: stoppedStatus.signal })
+      }
       const stderr = readBoundedRegularFileTail(
         stderrPath,
         CODEX_STDERR_TAIL_MAX_BYTES,
@@ -10250,6 +10266,7 @@ class OwnedCodexProxyRunner {
         exactArgv: true,
         drained: true,
         codexPid: status && status.codexPid,
+        ...(observedTermination ? { observedTermination } : {}),
       }
     } finally {
       if (stdoutDescriptor !== undefined) fs.closeSync(stdoutDescriptor)
@@ -10277,7 +10294,16 @@ class OwnedCodexProxyRunner {
           'Codex proxy cancellation did not return its exact terminal group receipt',
         )
       }
-      return { drained: true, terminal }
+      return {
+        drained: true,
+        terminal,
+        // Preserve the exact owner binding for callers that deliberately
+        // complete a protocol after the child has published its terminal
+        // result.  The receipt itself remains the authority for status.
+        ownershipId: session.ownershipId,
+        reservationId: session.reservationId,
+        groupIdentity: session.groupIdentity,
+      }
     })()
     return session.stopPromise
   }

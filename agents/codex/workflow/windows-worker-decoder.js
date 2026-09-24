@@ -6,6 +6,7 @@ const DEFAULTS = Object.freeze({ manifestBytes: MiB, files: 128, compressedFileB
 const CEILINGS = Object.freeze({ manifestBytes: 2 * MiB, files: 256, compressedFileBytes: 256 * MiB, rawFileBytes: 256 * MiB, compressedTotalBytes: 512 * MiB, rawTotalBytes: 1024 * MiB })
 const captures = new WeakMap()
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
+const NODE_MAX_BYTES = 512 * MiB
 function need(ok, code) { if (!ok) throw Error(code) }
 function keys(value, expected, code) { need(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join(',') === expected.split(',').sort().join(','), code) }
 function limitsFor(options = {}) {
@@ -59,7 +60,23 @@ function parseManifest(input, expectedSha, limitOptions) {
 }
 // Consumes already captured bytes. A production caller must establish the
 // physical lease separately; no callback can manufacture native lease evidence.
-function captureBytes(manifestBytes, records, expectedSha, limitOptions) {
+function decoderNode(value) {
+  keys(value, 'path,sha256', 'decoder-node-shape')
+  need(typeof value.path === 'string' && path.isAbsolute(value.path) && !value.path.includes('\0') && hash(value.sha256), 'decoder-node-shape')
+  return Object.freeze({ path: value.path, sha256: value.sha256 })
+}
+function boundNodeBytes(binding) {
+  const node = decoderNode(binding)
+  const bytes = readFile(node.path, NODE_MAX_BYTES)
+  need(sha(bytes) === node.sha256, 'decoder-node-changed')
+  return node
+}
+function defaultNodeBinding() {
+  need(process.release?.name === 'node' && !process.versions?.bun && !process.versions?.electron, 'decoder-node-required')
+  const bytes = readFile(process.execPath, NODE_MAX_BYTES)
+  return Object.freeze({ path: process.execPath, sha256: sha(bytes) })
+}
+function captureBytes(manifestBytes, records, expectedSha, limitOptions, nodeBinding) {
   need(Buffer.isBuffer(manifestBytes), 'manifest-bytes-required')
   need(manifestBytes.length <= limitsFor(limitOptions).manifestBytes, 'manifest-bound')
   const ownedManifest = Buffer.from(manifestBytes)
@@ -76,7 +93,8 @@ function captureBytes(manifestBytes, records, expectedSha, limitOptions) {
     captured.set(file.path, bytes)
   }
   const capability = Object.freeze(Object.create(null))
-  captures.set(capability, { manifest, manifestBytes: ownedManifest, expectedSha, limits, captured, busy: false })
+  const decoderNodeBinding = nodeBinding === undefined ? defaultNodeBinding() : boundNodeBytes(nodeBinding)
+  captures.set(capability, { manifest, manifestBytes: ownedManifest, expectedSha, limits, captured, decoderNode: decoderNodeBinding, busy: false })
   return capability
 }
 function physical(file, kind) {
@@ -174,7 +192,8 @@ async function decode(capability, filePath, options = {}) {
         }, closeMs)
       }
       const environment = process.platform === 'win32' ? { SystemRoot: process.env.SystemRoot, WINDIR: process.env.SystemRoot } : { LANG: 'C', LC_ALL: 'C' }
-      child = cp.spawn(process.execPath, ['--max-old-space-size=64', '-e', CHILD, String(file.length), String(file.rawLength)], { env: environment, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false })
+      const node = boundNodeBytes(state.decoderNode)
+      child = cp.spawn(node.path, ['--max-old-space-size=64', '-e', CHILD, String(file.length), String(file.rawLength)], { env: environment, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false })
       timer = setTimeout(() => stop(Error('decoder-deadline')), deadlineMs)
       child.on('error', stop); child.stdin.on('error', stop)
       child.stdout.on('data', bytes => {

@@ -21,24 +21,25 @@ function setup(t,options={}){
  const policy={schema:1,state:'candidate-unaccepted',manifest:{length:bytes.length,sha256:sha(bytes)},files,bootstraps,pipeline,imports,sharedId:'msys-2.0S5',sourceIdentity:'1'.repeat(64)}
  if(options.policyChange)options.policyChange(policy)
  const execPath=path.join(base,'controller.exe');fs.writeFileSync(execPath,'trusted test controller identity');if(options.controllerSize !== undefined) fs.truncateSync(execPath, options.controllerSize)
- const processFixture={platform:'win32',arch:options.arch||'x64',versions:{node:options.node||'24.20.0'},execPath,env:{SystemRoot:'C:\\Windows',AUTOPROMPT_WINDOWS_BASH:'C:\\malicious\\bash.exe',PROCESSOR_ARCHITECTURE:'wrong'}}
+ const processFixture={platform:'win32',arch:options.arch||'x64',versions:{node:options.node||'24.20.0'},release:{name:'node'},execPath,env:{SystemRoot:'C:\\Windows',AUTOPROMPT_WINDOWS_BASH:'C:\\malicious\\bash.exe',PROCESSOR_ARCHITECTURE:'wrong'}}
  const observation={captureCalls:0,privateCalls:0,authority:null}
  const capture=async(root,inventory,authority)=>{observation.captureCalls++;observation.authority=authority;if(options.captureFailure)throw options.captureFailure;const bootstrap={executableBytes:fs.readFileSync(authority.executable),configBytes:fs.readFileSync(authority.executable+'.config')};if(options.bootstrapChange)options.bootstrapChange(bootstrap);return{architecture:options.observedArch||processFixture.arch,records:inventory.map(file=>({path:file.path,bytes:fs.readFileSync(path.join(root,file.path))})),bootstrap}}
  const dependencies={'./windows-worker-policy.js':policy,'./windows-worker-decoder.js':options.decoder||decoder,'./windows-worker-capture.js':{captureWindowsFiles:capture},'./safe-run-root.js':{ensureWindowsPrivateAcl(){observation.privateCalls++;options.privacyHook?.({base,execPath});if(options.privacyFailure)throw options.privacyFailure}},'./windows-worker-pe.js':require('../../agents/codex/workflow/windows-worker-pe.js')}
  const module={exports:{}};vm.runInNewContext(fs.readFileSync(path.join(WORKFLOW,'windows-worker-loader.js'),'utf8'),{require:name=>Object.hasOwn(dependencies,name)?dependencies[name]:require(name),module,exports:module.exports,__dirname:base,process:processFixture,Buffer,console},{filename:'actual-windows-worker-loader.js'})
- return{api:module.exports,base,bundle,policy,raw,observation,processFixture}
+ const decoderNode=Object.freeze({path:process.execPath,sha256:sha(fs.readFileSync(process.execPath))})
+ return{api:module.exports,base,bundle,policy,raw,observation,processFixture,capture:()=>module.exports.captureWorkerTuple(decoderNode),decoderNode}
 }
-test('public production API has no caller authority, hooks, paths or factory selection',()=>{
+test('public production API rejects decoder hooks and unbound controller selection',()=>{
  const api=require('../../agents/codex/workflow/windows-worker-loader.js');assert.deepEqual(Object.keys(api),['staticAvailability','captureWorkerTuple','describeTuple','revalidateTuple','materializeTuple']);assert.equal(api.staticAvailability().accepted,false)
- assert.throws(()=>api.staticAvailability({}),/arguments-refused/);assert.throws(()=>api.captureWorkerTuple({}),/arguments-refused/)
+ assert.throws(()=>api.staticAvailability({}),/arguments-refused/);assert.throws(()=>api.captureWorkerTuple({}),/controller-node-binding-shape/)
 })
 test('an unconfigured source policy refuses both presence and capture before helper execution',async t=>{
  const x=setup(t,{policyChange:policy=>{for(const key of Object.keys(policy))delete policy[key];Object.assign(policy,{schema:1,state:'not-configured'})}})
- assert.equal(x.api.staticAvailability().available,false);await assert.rejects(x.api.captureWorkerTuple(),/bundle-not-configured/);assert.equal(x.observation.captureCalls,0)
+ assert.equal(x.api.staticAvailability().available,false);await assert.rejects(x.capture(),/bundle-not-configured/);assert.equal(x.observation.captureCalls,0)
 })
 for(const arch of ['x64','arm64'])test('actual composition captures once and decodes/materializes exact '+arch+' tuple',async t=>{
  const x=setup(t,{arch});assert.equal(x.api.staticAvailability().available,true);assert.equal(x.api.staticAvailability().accepted,false)
- const a=x.api.captureWorkerTuple(),b=x.api.captureWorkerTuple();const tuple=await a;assert.equal(await b,tuple);assert.equal(await x.api.captureWorkerTuple(),tuple);assert.equal(x.observation.captureCalls,1)
+ const a=x.capture(),b=x.capture();const tuple=await a;assert.equal(await b,tuple);assert.equal(await x.capture(),tuple);assert.equal(x.observation.captureCalls,1)
  assert.ok(x.observation.authority.executable.endsWith('capture-'+arch+'.exe'));const desc=x.api.describeTuple(tuple);assert.equal(desc.accepted,false);assert.equal(desc.architecture,arch);assert.equal(desc.sharedId,'msys-2.0S5')
  const target=path.join(x.base,'materialized');const result=x.api.materializeTuple(tuple,target);assert.equal(result.identity,desc.identity);assert.equal(fs.readFileSync(path.join(target,'etc','fstab'),'utf8'),'none /tmp usertemp binary,posix=0,noacl 0 0\n')
  for(const file of desc.files){const bytes=fs.readFileSync(path.join(target,file.path));assert.equal(sha(bytes),file.sha256)}
@@ -47,25 +48,35 @@ for(const arch of ['x64','arm64'])test('actual composition captures once and dec
 })
 for(const arch of ['x64','arm64'])test('only the selected '+arch+' Node asset receives the bounded contention deadline',async t=>{
  const calls=[],wrapped={...decoder,async decode(capability,file,options){calls.push({file,options});return decoder.decode(capability,file,options)}}
- const x=setup(t,{arch,decoder:wrapped});await x.api.captureWorkerTuple()
+ const x=setup(t,{arch,decoder:wrapped});await x.capture()
  assert.deepEqual(calls.map(call=>call.file),['assets/bash.br','assets/msys.br',`assets/node-${arch}.br`])
  assert.equal(calls[0].options,undefined);assert.equal(calls[1].options,undefined)
  assert.deepEqual(Object.keys(calls[2].options),['deadlineMs']);assert.equal(calls[2].options.deadlineMs,60000)
 })
+test('explicit controller Node binding is carried into decoding and appears in the opaque tuple description',async t=>{
+ const observed=[],wrapped={...decoder,captureBytes(...args){observed.push(args[4]);return decoder.captureBytes(...args)}}
+ const x=setup(t,{decoder:wrapped}),tuple=await x.capture()
+ assert.deepEqual(observed.map(value=>({...value})),[{...x.decoderNode}]);assert.deepEqual({...x.api.describeTuple(tuple).decoderNode},{...x.decoderNode})
+})
+test('a changed sealed controller Node hash refuses before native capture or a decoder spawn',async t=>{
+ const x=setup(t),forged={...x.decoderNode,sha256:'0'.repeat(64)}
+ assert.throws(()=>x.api.captureWorkerTuple(forged),/controller-node-binding-changed/)
+ assert.equal(x.observation.captureCalls,0)
+})
 test('helper observed native architecture must match controller-selected bootstrap',async t=>{
- const x=setup(t,{observedArch:'arm64'});await assert.rejects(x.api.captureWorkerTuple(),/native-controller-architecture-mismatch/)
+ const x=setup(t,{observedArch:'arm64'});await assert.rejects(x.capture(),/native-controller-architecture-mismatch/)
 })
 for(const name of ['executableBytes','configBytes'])test('captured canary helper '+name+' must retain exact source authority',async t=>{
- const x=setup(t,{bootstrapChange:bootstrap=>{bootstrap[name]=Buffer.from('changed')}});await assert.rejects(x.api.captureWorkerTuple(),/captured-bootstrap-identity/)
+ const x=setup(t,{bootstrapChange:bootstrap=>{bootstrap[name]=Buffer.from('changed')}});await assert.rejects(x.capture(),/captured-bootstrap-identity/)
 })
 test('unknown capture cleanup poisons the process cache without another launch',async t=>{
- const failure=Object.assign(Error('unknown drain'),{cleanupConfirmed:false});const x=setup(t,{captureFailure:failure});await assert.rejects(x.api.captureWorkerTuple(),e=>e===failure);await assert.rejects(x.api.captureWorkerTuple(),e=>e!==failure&&e.message===failure.message&&e.cleanupConfirmed===false&&Object.isFrozen(e.workerFailure));assert.equal(x.observation.captureCalls,1)
+ const failure=Object.assign(Error('unknown drain'),{cleanupConfirmed:false});const x=setup(t,{captureFailure:failure});await assert.rejects(x.capture(),e=>e===failure);await assert.rejects(x.capture(),e=>e!==failure&&e.message===failure.message&&e.cleanupConfirmed===false&&Object.isFrozen(e.workerFailure));assert.equal(x.observation.captureCalls,1)
 })
 test('unknown decoder cleanup likewise poisons the process cache',async t=>{
- const failure=Object.assign(Error('unknown decoder'),{cleanupConfirmed:false});const x=setup(t,{decoder:{...decoder,decode:async()=>{throw failure}}});await assert.rejects(x.api.captureWorkerTuple(),e=>e===failure);await assert.rejects(x.api.captureWorkerTuple(),e=>e!==failure&&e.message===failure.message&&e.cleanupConfirmed===false&&Object.isFrozen(e.workerFailure));assert.equal(x.observation.captureCalls,1)
+ const failure=Object.assign(Error('unknown decoder'),{cleanupConfirmed:false});const x=setup(t,{decoder:{...decoder,decode:async()=>{throw failure}}});await assert.rejects(x.capture(),e=>e===failure);await assert.rejects(x.capture(),e=>e!==failure&&e.message===failure.message&&e.cleanupConfirmed===false&&Object.isFrozen(e.workerFailure));assert.equal(x.observation.captureCalls,1)
 })
 test('known-close failure permits only an explicit same-policy retry',async t=>{
- const x=setup(t,{captureFailure:Object.assign(Error('closed failure'),{cleanupConfirmed:true})});await assert.rejects(x.api.captureWorkerTuple());await assert.rejects(x.api.captureWorkerTuple());assert.equal(x.observation.captureCalls,2)
+ const x=setup(t,{captureFailure:Object.assign(Error('closed failure'),{cleanupConfirmed:true})});await assert.rejects(x.capture());await assert.rejects(x.capture());assert.equal(x.observation.captureCalls,2)
 })
 for(const[title,change]of [
  ['extra policy authority',p=>p.accepted=true],['passed-marker admission',p=>p.state='passed'],['unknown pipeline',p=>p.pipeline.extra='0'.repeat(64)],
@@ -77,14 +88,14 @@ for(const[title,change]of [
  ['MSYS missing DLL flag',(role,b)=>{if(role==='msys')b.writeUInt16LE(2,86)}],
  ['wrong Node architecture',(role,b)=>{if(role==='node-x64')b.writeUInt16LE(0xaa64,68)}],
  ['missing shared info',(role,b)=>{if(role==='msys')b.fill(0,1500)}]
-])test('actual raw PE validation refuses '+title,async t=>{const x=setup(t,{rawChange:change});await assert.rejects(x.api.captureWorkerTuple())})
+])test('actual raw PE validation refuses '+title,async t=>{const x=setup(t,{rawChange:change});await assert.rejects(x.capture())})
 test('static availability is presence-only; corrupted same-length compressed bytes fail capture decoding',async t=>{
  const x=setup(t),file=path.join(x.bundle,'assets/bash.br'),bytes=fs.readFileSync(file);bytes[0]^=255;fs.writeFileSync(file,bytes)
- assert.equal(x.api.staticAvailability().available,true);await assert.rejects(x.api.captureWorkerTuple(),/content-mismatch|hash|digest/)
+ assert.equal(x.api.staticAvailability().available,true);await assert.rejects(x.capture(),/content-mismatch|hash|digest/)
 })
-test('pipeline byte changes refuse availability and capture',async t=>{const x=setup(t);fs.appendFileSync(path.join(x.base,'windows-worker-capture.js'),'changed');assert.equal(x.api.staticAvailability().available,false);await assert.rejects(x.api.captureWorkerTuple())})
+test('pipeline byte changes refuse availability and capture',async t=>{const x=setup(t);fs.appendFileSync(path.join(x.base,'windows-worker-capture.js'),'changed');assert.equal(x.api.staticAvailability().available,false);await assert.rejects(x.capture())})
 for(const subject of ['controller',...PIPELINE])test('cached tuple refuses '+subject+' changes and poisons later reuse',async t=>{
- const x=setup(t),tuple=await x.api.captureWorkerTuple()
+ const x=setup(t),tuple=await x.capture()
  const file=subject==='controller'?x.processFixture.execPath:path.join(x.base,subject),original=fs.readFileSync(file)
  fs.appendFileSync(file,'changed')
  const destination=path.join(x.base,'must-not-materialize')
@@ -92,61 +103,61 @@ for(const subject of ['controller',...PIPELINE])test('cached tuple refuses '+sub
  assert.throws(()=>x.api.materializeTuple(tuple,destination),/pipeline-changed|controller-node-changed/)
  assert.equal(fs.existsSync(destination),false)
  fs.writeFileSync(file,original)
- await assert.rejects(x.api.captureWorkerTuple(),/pipeline-changed|controller-node-changed/)
+ await assert.rejects(x.capture(),/pipeline-changed|controller-node-changed/)
  assert.equal(x.observation.captureCalls,1)
 })
 test('capture cache itself rechecks current controller bytes before returning its capability',async t=>{
- const x=setup(t);await x.api.captureWorkerTuple();fs.appendFileSync(x.processFixture.execPath,'changed')
- await assert.rejects(x.api.captureWorkerTuple(),/controller-node-changed/);assert.equal(x.observation.captureCalls,1)
+ const x=setup(t);await x.capture();fs.appendFileSync(x.processFixture.execPath,'changed')
+ await assert.rejects(x.capture(),/controller-node-changed/);assert.equal(x.observation.captureCalls,1)
 })
 test('materialization itself rechecks current pipeline before creating a runtime',async t=>{
- const x=setup(t),tuple=await x.api.captureWorkerTuple(),destination=path.join(x.base,'must-not-exist')
+ const x=setup(t),tuple=await x.capture(),destination=path.join(x.base,'must-not-exist')
  fs.appendFileSync(path.join(x.base,'windows-worker-loader.js'),'changed')
  assert.throws(()=>x.api.materializeTuple(tuple,destination),/pipeline-changed/);assert.equal(fs.existsSync(destination),false)
 })
 test('trust input mutation during materialization refuses its result and removes confirmed private files',async t=>{
- const x=setup(t,{privacyHook:({execPath})=>fs.appendFileSync(execPath,'changed')}),tuple=await x.api.captureWorkerTuple(),destination=path.join(x.base,'never-returned')
+ const x=setup(t,{privacyHook:({execPath})=>fs.appendFileSync(execPath,'changed')}),tuple=await x.capture(),destination=path.join(x.base,'never-returned')
  assert.throws(()=>x.api.materializeTuple(tuple,destination),e=>/controller-node-changed/.test(e.message)&&e.cleanupConfirmed===true)
  assert.equal(fs.existsSync(destination),false)
- await assert.rejects(x.api.captureWorkerTuple(),/controller-node-changed/)
+ await assert.rejects(x.capture(),/controller-node-changed/)
 })
 for(const key of ['arch','node'])test('cached tuple remains bound to the complete controller '+key,async t=>{
- const x=setup(t);await x.api.captureWorkerTuple()
+ const x=setup(t);await x.capture()
  if(key==='arch')x.processFixture.arch='arm64';else x.processFixture.versions.node='24.20.1'
- await assert.rejects(x.api.captureWorkerTuple(),/controller-identity-changed/)
+ await assert.rejects(x.capture(),/controller-identity-changed/)
 })
 test('materialization refuses existing paths and linked parents without deleting them',async t=>{
- const x=setup(t),tuple=await x.api.captureWorkerTuple(),existing=path.join(x.base,'existing');fs.mkdirSync(existing);fs.writeFileSync(path.join(existing,'keep'),'owned')
+ const x=setup(t),tuple=await x.capture(),existing=path.join(x.base,'existing');fs.mkdirSync(existing);fs.writeFileSync(path.join(existing,'keep'),'owned')
  assert.throws(()=>x.api.materializeTuple(tuple,existing));assert.equal(fs.readFileSync(path.join(existing,'keep'),'utf8'),'owned')
  const link=path.join(x.base,'alias');fs.symlinkSync(existing,link,process.platform==='win32'?'junction':'dir');assert.throws(()=>x.api.materializeTuple(tuple,path.join(link,'child')));assert.equal(fs.existsSync(path.join(existing,'child')),false)
 })
-test('forged or serialized tuples cannot describe or materialize',async t=>{const x=setup(t);assert.throws(()=>x.api.describeTuple({}));assert.throws(()=>x.api.materializeTuple({},path.join(x.base,'forged')));const tuple=await x.api.captureWorkerTuple();assert.throws(()=>x.api.describeTuple(JSON.parse(JSON.stringify(tuple))))})
-for(const node of ['18.20.0','19.9.0','invalid'])test('untested controller Node'+node+' refuses before capture',async t=>{const x=setup(t,{node});await assert.rejects(x.api.captureWorkerTuple(),/untested-controller/);assert.equal(x.observation.captureCalls,0)})
+test('forged or serialized tuples cannot describe or materialize',async t=>{const x=setup(t);assert.throws(()=>x.api.describeTuple({}));assert.throws(()=>x.api.materializeTuple({},path.join(x.base,'forged')));const tuple=await x.capture();assert.throws(()=>x.api.describeTuple(JSON.parse(JSON.stringify(tuple))))})
+for(const node of ['18.20.0','19.9.0','invalid'])test('untested controller Node'+node+' refuses before capture',async t=>{const x=setup(t,{node});await assert.rejects(x.capture(),/untested-controller/);assert.equal(x.observation.captureCalls,0)})
 
 test('uncertain materialization privacy setup retains the new root and poisons reuse',async t=>{
- const failure=Error('privacy setup failed'),x=setup(t,{privacyFailure:failure}),tuple=await x.api.captureWorkerTuple(),root=path.join(x.base,'retained')
+ const failure=Error('privacy setup failed'),x=setup(t,{privacyFailure:failure}),tuple=await x.capture(),root=path.join(x.base,'retained')
  assert.throws(()=>x.api.materializeTuple(tuple,root),error=>error===failure&&error.cleanupConfirmed===false&&error.retainedRuntimeRoot===root)
- assert.equal(fs.existsSync(root),true);await assert.rejects(x.api.captureWorkerTuple(),error=>error!==failure&&error.cleanupConfirmed===false&&error.retainedRuntimeRoot===root)
+ assert.equal(fs.existsSync(root),true);await assert.rejects(x.capture(),error=>error!==failure&&error.cleanupConfirmed===false&&error.retainedRuntimeRoot===root)
  assert.throws(()=>x.api.materializeTuple(tuple,path.join(x.base,'retry')),error=>error!==failure&&error.cleanupConfirmed===false&&error.retainedRuntimeRoot===root)
 })
 
 for(const node of ['20.20.2','22.20.0','24.20.0','26.0.0'])test('package engine controller '+node+' can attempt fresh candidate validation',async t=>{
- const x=setup(t,{node}),tuple=await x.api.captureWorkerTuple();assert.equal(x.api.describeTuple(tuple).accepted,false);assert.equal(x.observation.captureCalls,1)
+ const x=setup(t,{node}),tuple=await x.capture();assert.equal(x.api.describeTuple(tuple).accepted,false);assert.equal(x.observation.captureCalls,1)
 })
 
 test('loader poison snapshots original authority and creates independent errors for later operations',async t=>{
  const recovery={leaseId:'original-lease',journalPath:'original-journal'},failure=Object.assign(Error('original failure'),{code:'ORIGINAL',cleanupConfirmed:false,recovery,retainedHelperRoot:'original-root'})
- const x=setup(t,{captureFailure:failure});await assert.rejects(x.api.captureWorkerTuple(),error=>error===failure)
+ const x=setup(t,{captureFailure:failure});await assert.rejects(x.capture(),error=>error===failure)
  failure.message='caller mutated';failure.cleanupConfirmed=true;failure.retainedHelperRoot='wrong-root';recovery.leaseId='wrong-lease'
  let first,second
- await assert.rejects(x.api.captureWorkerTuple(),error=>{first=error;return true})
+ await assert.rejects(x.capture(),error=>{first=error;return true})
  first.recovery={leaseId:'operation-one'};first.cleanupConfirmed=true
- await assert.rejects(x.api.captureWorkerTuple(),error=>{second=error;return true})
+ await assert.rejects(x.capture(),error=>{second=error;return true})
  assert.notEqual(first,second);assert.equal(second.code,'ORIGINAL');assert.equal(second.message,'original failure');assert.equal(second.cleanupConfirmed,false);assert.equal(second.retainedHelperRoot,'original-root')
  assert.equal(second.recovery,undefined);assert.equal(second.workerFailure.recovery.leaseId,'original-lease');assert.ok(Object.isFrozen(second.workerFailure.recovery));assert.equal(x.observation.captureCalls,1)
 })
 test('runtime mutation poison creates separate errors for concurrent command recovery',async t=>{
- const x=setup(t),tuple=await x.api.captureWorkerTuple();fs.appendFileSync(x.processFixture.execPath,'changed')
+ const x=setup(t),tuple=await x.capture();fs.appendFileSync(x.processFixture.execPath,'changed')
  let first,second
  try{x.api.revalidateTuple(tuple)}catch(error){first=error}
  first.recovery={leaseId:'first'}
@@ -181,11 +192,11 @@ test('bounded bootstrap files report a fail-closed expected-length reason',t=>{
 
 test('bounded Electron-sized controller host above 128 MiB remains hashable below the fixed cap', async t => {
  const x=setup(t,{controllerSize:129*1024*1024})
- const tuple=await x.api.captureWorkerTuple()
+ const tuple=await x.capture()
  assert.equal(x.api.describeTuple(tuple).controllerSha256,sha(fs.readFileSync(x.processFixture.execPath)))
 })
 test('controller host above the fixed 512 MiB cap refuses before capture or allocation', async t => {
  const x=setup(t,{controllerSize:513*1024*1024})
- await assert.rejects(x.api.captureWorkerTuple(),/file-byte-bound:max-size:path=controller\.exe:nlink=bigint:1:size=bigint:537919488:max=536870912:expected=none/)
+ await assert.rejects(x.capture(),/file-byte-bound:max-size:path=controller\.exe:nlink=bigint:1:size=bigint:537919488:max=536870912:expected=none/)
  assert.equal(x.observation.captureCalls,0)
 })

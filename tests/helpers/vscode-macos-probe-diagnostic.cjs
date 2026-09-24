@@ -18,6 +18,7 @@ const { nativeProcessAdapter, privateDirectory, nativeEnvironment } = require('.
 
 const MAX_TAIL = 12 * 1024
 const TIMEOUT_MS = 90_000
+const POLL_MS = 25
 const textTail = file => {
   try {
     const stat = fs.lstatSync(file)
@@ -83,7 +84,7 @@ async function variant(root, code, name, useAlias) {
   // extension merely to run a diagnostic.
   driver(testDriver, sentinel)
   if (!useAlias) assert.ok(Buffer.byteLength(path.join(userData, '0000-main.sock')) < 103, 'physical baseline profile must fit Darwin IPC')
-  let resource = null, entered = false, execution = null, failure = null, retained = false, pending = null
+  let resource = null, entered = false, execution = null, failure = null, retained = false, pending = null, deliberateStop = null
   try {
     let profile = userData
     if (useAlias) {
@@ -100,17 +101,30 @@ async function variant(root, code, name, useAlias) {
     if (resource) { resource.markReservationEntered(); entered = true }
     pending = runner.run({ executable: code, argv, cwd: directory, env, stdin: '', shell: false, sessionId, reservationId,
       ...(resource ? { launchBindingHash: resource.launchBindingHash } : {}) })
-    // Avoid an unhandled rejection if the ownership deadline wins the race.
-    pending.catch(() => {})
-    let timer
-    try {
-      execution = await Promise.race([pending, new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error('owned VS Code diagnostic timed out'), { code: 'DIAGNOSTIC_TIMEOUT' })), TIMEOUT_MS) })])
-    } finally { clearTimeout(timer) }
-    assert.equal(execution.processOwned, true)
-    assert.equal(execution.drained, true)
-    assert.equal(execution.status, 0, execution.stderr)
-    assert.equal(execution.signal, null, execution.stderr)
+    // Code intentionally keeps its workbench alive after the external test
+    // driver returns. The exclusive sentinel proves that driver ran; stop the
+    // owned group ourselves instead of mistaking a healthy GUI for a timeout.
+    let settled = false, pendingError = null
+    pending.then(value => { settled = true; execution = value }, error => { settled = true; pendingError = error })
+    const deadline = Date.now() + TIMEOUT_MS
+    while (!fs.existsSync(sentinel) && !settled && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, POLL_MS))
+    if (!fs.existsSync(sentinel)) {
+      if (pendingError) throw pendingError
+      if (settled) throw Object.assign(new Error('owned VS Code diagnostic exited before its driver sentinel'), { code: 'DIAGNOSTIC_SENTINEL_MISSING' })
+      throw Object.assign(new Error('owned VS Code diagnostic timed out before its driver sentinel'), { code: 'DIAGNOSTIC_TIMEOUT' })
+    }
     assert.equal(fs.readFileSync(sentinel, 'utf8'), 'VSCODE_MACOS_DIAGNOSTIC_OK\n')
+    if (!settled) {
+      deliberateStop = await runner.stop({ sessionId, reason: 'VS Code macOS diagnostic driver completed', terminalStatus: 'DONE' })
+      try { execution = await pending } catch (error) { pendingError = error }
+    }
+    if (!deliberateStop) {
+      if (pendingError) throw pendingError
+      assert.equal(execution.processOwned, true)
+      assert.equal(execution.drained, true)
+      assert.equal(execution.status, 0, execution.stderr)
+      assert.equal(execution.signal, null, execution.stderr)
+    } else assert.equal(deliberateStop.drained, true)
   } catch (error) {
     failure = error
     try { await owner.cancelAll({ reason: 'VS Code macOS diagnostic failure', graceMs: 0, killMs: 2000, waitForPending: true }) } catch (cleanup) { failure.cleanupFailure = { code: cleanup.code || 'ERROR', message: cleanup.message } }
@@ -131,7 +145,7 @@ async function variant(root, code, name, useAlias) {
   }
   const result = { name, alias: useAlias, status: execution?.status ?? null, signal: execution?.signal ?? null,
     stdout: execution?.stdout?.slice(-MAX_TAIL) || '', stderr: execution?.stderr?.slice(-MAX_TAIL) || '',
-    sentinel: fs.existsSync(sentinel), logs: logs(userData), drained,
+    sentinel: fs.existsSync(sentinel), deliberateStop: Boolean(deliberateStop), logs: logs(userData), drained,
     error: failure ? { code: failure.code || 'ERROR', message: String(failure.message || failure).slice(0, 2048), cleanupFailure: failure.cleanupFailure || null } : null }
   retained = !drained || Boolean(failure?.cleanupFailure)
   if (useAlias) {

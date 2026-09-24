@@ -16,7 +16,8 @@ const ROOT=path.join(__dirname,'windows-worker'),BUNDLE=path.join(ROOT,'bundle')
 // that controller identity bounded separately from decoded worker payloads.
 const CONTROLLER_HOST_MAX_BYTES=512*1024*1024
 const tuples=new WeakMap()
-let active=null,poison=null,poisonOrigin=null
+const active=new Map()
+let poison=null,poisonOrigin=null
 function freezeDeep(value){if(value&&typeof value==='object'){for(const item of Object.values(value))freezeDeep(item);Object.freeze(value)}return value}
 function recordPoison(error){
   if(poison&&poisonOrigin!==error)return
@@ -135,7 +136,20 @@ function verifyPe(bytes,architecture,dll,imports){
   need((characteristics&2)!==0&&Boolean(characteristics&0x2000)===dll,'pe-executable-role')
   need(JSON.stringify(importedDlls(bytes))===JSON.stringify(imports),'pe-import-closure')
 }
-async function captureUncached(){
+function controllerNodeBinding(value){
+  if(value===undefined){
+    need(process.release?.name==='node'&&!process.versions?.bun&&!process.versions?.electron,'controller-node-binding-required')
+    const bytes=boundedFile(process.execPath,CONTROLLER_HOST_MAX_BYTES)
+    return freezeDeep({path:physical(process.execPath),sha256:sha(bytes)})
+  }
+  keys(value,'path,sha256','controller-node-binding-shape')
+  need(typeof value.path==='string'&&path.isAbsolute(value.path)&&!value.path.includes('\0')&&isHash(value.sha256),'controller-node-binding-shape')
+  const canonical=physical(value.path),bytes=boundedFile(canonical,CONTROLLER_HOST_MAX_BYTES)
+  need(sha(bytes)===value.sha256,'controller-node-binding-changed')
+  return freezeDeep({path:canonical,sha256:value.sha256})
+}
+function controllerNodeKey(binding){return sha(Buffer.from(decoder.canonical(binding)))}
+async function captureUncached(controllerNode){
   need(process.platform==='win32'&&['x64','arm64'].includes(process.arch)&&/^(?:0|[1-9][0-9]*)\./.test(process.versions.node)&&Number.isSafeInteger(Number(process.versions.node.split('.')[0]))&&Number(process.versions.node.split('.')[0])>=20,'untested-controller-platform')
   need(policy&&!configurationError,'bundle-not-configured')
   const available=staticAvailability();need(available.available,'bundle-static-unavailable:'+available.code)
@@ -149,7 +163,7 @@ async function captureUncached(){
   keys(captured.bootstrap,'executableBytes,configBytes','captured-bootstrap-shape')
   const bootstrap=[['usr/bin/acl-probe.exe',captured.bootstrap.executableBytes,pin.length,pin.sha256],['usr/bin/acl-probe.exe.config',captured.bootstrap.configBytes,pin.configLength,pin.configSha256]]
   for(const item of bootstrap){const [,bytes,length,digest]=item;need(Buffer.isBuffer(bytes)&&bytes.length===length&&sha(bytes)===digest,'captured-bootstrap-identity');item[1]=Buffer.from(bytes)}
-  const capability=decoder.captureBytes(captured.records[0].bytes,captured.records.slice(1),policy.manifest.sha256)
+  const capability=decoder.captureBytes(captured.records[0].bytes,captured.records.slice(1),policy.manifest.sha256,undefined,controllerNode)
   const selected=policy.files.filter(file=>!file.path.includes('node-')||file.path===`assets/node-${arch}.br`),files=[]
   for(const item of selected){
     // Node expands to roughly 100 MiB. Concurrent isolated commands can contend
@@ -162,18 +176,24 @@ async function captureUncached(){
   for(const [path,bytes,,sha256] of bootstrap)files.push({path,sha256,bytes:Buffer.from(bytes)})
   verifyPipeline()
   need(sha(boundedFile(process.execPath,CONTROLLER_HOST_MAX_BYTES))===controllerHash,'controller-node-changed')
-  const identity=sha(Buffer.from(decoder.canonical({schema:1,policy,architecture:arch,controller:{architecture:process.arch,node:process.versions.node,sha256:controllerHash},files:files.map(({path,sha256})=>({path,sha256}))})))
-  const tuple=Object.freeze({});tuples.set(tuple,{files,identity,architecture:arch,sharedId:policy.sharedId,controllerHash,controllerVersion:process.versions.node});return tuple
+  controllerNodeBinding(controllerNode)
+  const identity=sha(Buffer.from(decoder.canonical({schema:1,policy,architecture:arch,controller:{architecture:process.arch,node:process.versions.node,sha256:controllerHash},decoderNode:controllerNode,files:files.map(({path,sha256})=>({path,sha256}))})))
+  const tuple=Object.freeze({});tuples.set(tuple,{files,identity,architecture:arch,sharedId:policy.sharedId,controllerHash,controllerVersion:process.versions.node,decoderNode:controllerNode});return tuple
 }
-function captureWorkerTuple(){
-  need(arguments.length===0,'capture-arguments-refused')
+function captureWorkerTuple(binding){
+  need(arguments.length<=1,'capture-arguments-refused')
   if(poison)return Promise.reject(poisonRefusal())
-  if(!active){active=captureUncached().catch(error=>{if(error.cleanupConfirmed===false)recordPoison(error);active=null;throw error})}
-  return active.then(tuple=>{revalidateTuple(tuple);return tuple})
+  const controllerNode=controllerNodeBinding(binding),key=controllerNodeKey(controllerNode)
+  let pending=active.get(key)
+  if(!pending){
+    pending=captureUncached(controllerNode).catch(error=>{if(error.cleanupConfirmed===false)recordPoison(error);active.delete(key);throw error})
+    active.set(key,pending)
+  }
+  return pending.then(tuple=>{revalidateTuple(tuple);return tuple})
 }
 function describeTuple(tuple){
   const value=tuples.get(tuple);need(value,'tuple-capability-required')
-  return freezeDeep({identity:value.identity,architecture:value.architecture,sharedId:value.sharedId,controllerSha256:value.controllerHash,
+  return freezeDeep({identity:value.identity,architecture:value.architecture,sharedId:value.sharedId,controllerSha256:value.controllerHash,decoderNode:value.decoderNode,
     accepted:false,state:'candidate-unaccepted',manifestSha256:policy.manifest.sha256,files:value.files.map(file=>({path:file.path,length:file.bytes.length,sha256:file.sha256}))})
 }
 function revalidateTuple(tuple){
@@ -183,6 +203,7 @@ function revalidateTuple(tuple){
     verifyPipeline()
     need(process.platform==='win32'&&process.arch===value.architecture&&process.versions.node===value.controllerVersion,'controller-identity-changed')
     need(sha(boundedFile(process.execPath,CONTROLLER_HOST_MAX_BYTES))===value.controllerHash,'controller-node-changed')
+    controllerNodeBinding(value.decoderNode)
     return describeTuple(tuple)
   }catch(error){recordPoison(error);throw error}
 }

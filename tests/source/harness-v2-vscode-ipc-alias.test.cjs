@@ -226,7 +226,16 @@ test('native Windows junction keeps deep VS Code descendants short and retires o
   const reservationId = crypto.randomUUID(), owner = new FakeOwner()
   const nativeBinding = { reservationId, sessionId: `native-vscode-${reservationId}`, targetKey: `vscode-${reservationId}` }
   journalPath = path.join(journalRoot, 'vscode-ipc.json')
-  resource = windowsAlias.prepare({ journalPath, targetPath: fs.realpathSync.native(target), binding: nativeBinding, processOwner: owner })
+  try {
+    resource = windowsAlias.prepare({ journalPath, targetPath: fs.realpathSync.native(target), binding: nativeBinding, processOwner: owner })
+  } catch (error) {
+    t.diagnostic(`native Windows alias preparation failed: ${JSON.stringify({
+      code: error?.code || null,
+      message: String(error?.message || '').slice(0, 1024),
+      details: error?.details || null,
+    }).slice(0, 4096)}`)
+    throw error
+  }
   assert.equal(journal(journalPath).resourceType, 'vscode-windows-storage-alias')
   assert.ok(resource.userDataDir.length < 120)
   assert.equal(fs.realpathSync.native(resource.userDataDir).toLowerCase(), fs.realpathSync.native(target).toLowerCase())

@@ -32,6 +32,62 @@ async function waitFor(predicate, timeoutMs, description) {
   assert.fail(`timed out waiting for ${description}`)
 }
 
+function stoppedStatus(request, code, overrides = {}) {
+  return {
+    schemaVersion: 2,
+    activationId: request.activationId,
+    generationId: request.generationId,
+    sequence: request.sequence,
+    argvHash: request.argvHash,
+    codexPid: 417,
+    code,
+    signal: null,
+    ...overrides,
+  }
+}
+
+for (const [title, foreign] of [['preserves a durable nonzero status published during stop', false], ['refuses a foreign durable status published during stop', true]]) test(`owned runner ${title}`, async t => {
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-owned-proxy-stop-status-')))
+  fs.mkdirSync(path.join(directory, 'control'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const sessionId = 'stop-status-session', reservationId = crypto.randomUUID(), ownershipId = 'owned-stop-status', groupIdentity = 'group-stop-status'
+  let request, publish
+  const owner = {
+    async launch(spec) {
+      request = JSON.parse(fs.readFileSync(spec.argv.at(-1), 'utf8'))
+      return { ownershipId, groupIdentity }
+    },
+    async cancelGroup(receivedOwnershipId, options) {
+      assert.equal(receivedOwnershipId, ownershipId)
+      assert.equal(options.terminalStatus, 'DONE')
+      // Let the runner leave its 2 ms polling loop while stop is still
+      // pending. A status read before the drain would miss this publication.
+      await new Promise(resolve => setTimeout(resolve, 30))
+      publish()
+      return { ownershipId, groupIdentity, sessionId, status: 'DONE' }
+    },
+  }
+  const runner = new OwnedCodexProxyRunner({ processOwner: owner, controlRoot: path.join(directory, 'control'), targetKey: 'stop-status-target', pollMs: 2 })
+  const running = runner.run({ executable: process.execPath, argv: ['-e', ''], cwd: directory, env: {}, stdin: '', sessionId, reservationId })
+  running.catch(() => {})
+  await waitFor(() => request !== undefined, 1_000, 'the fake owner launch request')
+  publish = () => fs.writeFileSync(request.statusPath, `${JSON.stringify(stoppedStatus(request, 23,
+    foreign ? { activationId: 'foreign-activation' } : {}))}\n`, { mode: 0o600 })
+  const stopped = await runner.stop({ sessionId, reason: 'completion', terminalStatus: 'DONE' })
+  assert.equal(stopped.drained, true)
+  assert.equal(stopped.ownershipId, ownershipId)
+  assert.equal(stopped.groupIdentity, groupIdentity)
+  assert.equal(stopped.reservationId, reservationId)
+  if (foreign) {
+    await assert.rejects(running, { code: 'CODEX_PROXY_STATUS_INVALID' })
+  } else {
+    const result = await running
+    assert.equal(result.status, 0)
+    assert.equal(result.signal, 'OWNED_STOP')
+    assert.deepEqual(result.observedTermination, { exitCode: 23, signal: null })
+  }
+})
+
 test('owned Codex proxy durably records a synchronous nested spawn refusal', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-owned-proxy-spawn-refusal-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))

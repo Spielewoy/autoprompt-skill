@@ -22,6 +22,16 @@ test('real Brotli decode uses copied bytes and returns no acceptance claim', asy
   const first = await decode(cap, 'assets/worker.br'); assert.deepEqual(first, expected)
   first.fill(0); assert.deepEqual(await decode(cap, 'assets/worker.br'), expected)
 })
+test('a sealed decoder Node distinct from the host is revalidated before Brotli spawn', async t => {
+  const root = physicalTemp('decoder-node-'), node = path.join(root, process.platform === 'win32' ? 'bound-node.exe' : 'bound-node')
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.copyFileSync(process.execPath, node); fs.chmodSync(node, 0o700)
+  const nodeSha = sha(fs.readFileSync(node)), value = fixture(), bytes = value.make()
+  const cap = captureBytes(bytes, [{ path: value.file.path, bytes: value.bytes }], sha(bytes), undefined, { path: node, sha256: nodeSha })
+  assert.deepEqual(await decode(cap, value.file.path), value.raw)
+  fs.appendFileSync(node, 'replaced')
+  await assert.rejects(decode(cap, value.file.path), /decoder-node-changed/)
+})
 test('identity support bytes and empty Brotli payload remain exact', async () => {
   for (const encoding of ['br', 'identity']) {
     const value = fixture(Buffer.alloc(0), encoding); assert.deepEqual(await decode(value.capture(), value.file.path), Buffer.alloc(0))

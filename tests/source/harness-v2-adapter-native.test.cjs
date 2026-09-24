@@ -203,12 +203,22 @@ test('adapter preserves a primary native exit while relay shutdown records one u
     processOwner: { adapter: createPosixProcessAdapter(), launch() { throw new Error('runner is intercepted') }, cancelGroup() {} },
   })
   let runnerResult = { processOwned: true, exactArgv: true, drained: true, status: 1, signal: null }
-  runner.stop = async () => { stopCalls++; return { drained: true } }
+  let lastSessionId, lastReservationId
+  runner.stop = async options => {
+    if (options?.reason !== 'VSCODE_EVENT_CHANNEL_COMPLETE') stopCalls++
+    if (runnerResult.exitCode === 0) return { drained: true, ownershipId: 'unit-owner', reservationId: lastReservationId, groupIdentity: 'unit-group', terminal: { ownershipId: 'unit-owner', sessionId: lastSessionId, groupIdentity: 'unit-group', status: 'DONE' } }
+    return { drained: true }
+  }
   runner.run = async spec => {
+    lastSessionId = spec.sessionId; lastReservationId = spec.reservationId
     const request = JSON.parse(fs.readFileSync(spec.env.AUTOPROMPT_VSCODE_OWNED_REQUEST, 'utf8'))
-    // The transport now requires the extension-host's authenticated terminal
-    // acknowledgement independently of the mocked native process outcome.
-    await require('../../scripts/harness-v2-bridge/vscode/event-channel.cjs').connect(request.eventChannel).complete()
+    if (runnerResult.exitCode === 0) {
+      const events = require('../../scripts/harness-v2-bridge/vscode/event-channel.cjs').connect(request.eventChannel)
+      await events.emit({ type: 'owned.session', sessionId: 'vscode-unit-session', contextKind: 'autoprompt-extension' })
+      await events.emit({ type: 'owned.usage', requestId: 'vscode-unit-request', usage: { input: 1, cacheRead: 0, cacheWrite: 0, output: 1, totalTokens: 2 } })
+      await events.emit({ type: 'owned.result', output: { ok: true } })
+      await events.complete()
+    }
     const before = upstreamStarted
     const pending = fetch(`${request.connection.baseUrl}/chat/completions`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -295,6 +305,64 @@ test('adapter preserves a primary native exit while relay shutdown records one u
   assert.equal(unknown.length, 3, 'a pending request after status zero is still unknown-accounted once')
   assert.equal(stopCalls, 2, 'status zero retains the relay accounting failure as terminal')
 })
+
+for (const mode of ['persistent', 'natural', 'early-exit', 'missing-terminal', 'foreign-receipt', 'late-native-failure', 'cancelled']) {
+  test(`VS Code protocol completion preserves lifecycle evidence: ${mode}`, { skip: process.platform !== 'linux', timeout: 10000 }, async t => {
+    // This is a transport/state-machine test with a real authenticated socket;
+    // the separate native capability test supplies actual GUI/process proof.
+    const f = fixture('vscode')
+    t.after(() => fs.rmSync(f.root, { recursive: true, force: true }))
+    t.mock.method(boundary, 'probeCommandSandbox', async () => ({ supported: true, backend: 'unit-only' }))
+    const abort = new AbortController(), stops = []
+    let spec, finishStopped, exchange
+    const stoppedRun = new Promise(resolve => { finishStopped = resolve })
+    const normal = { processOwned: true, exactArgv: true, drained: true, status: 0, signal: null }
+    const runner = new core.OwnedCodexProxyRunner({ controlRoot: path.join(f.controller, 'proxy'), targetKey: 'completion-unit',
+      processOwner: { adapter: createPosixProcessAdapter(), launch() { throw Error('intercepted') }, cancelGroup() {} } })
+    runner.stop = async options => {
+      stops.push(options)
+      if (mode === 'natural') {
+        // The runner's session disappeared after completion but before the
+        // transport observed its already-clean native result.
+        finishStopped(normal)
+        return { drained: true, alreadyTerminal: true }
+      }
+      finishStopped({ ...normal, signal: 'OWNED_STOP', ...(mode === 'late-native-failure' ? { observedTermination: { exitCode: 23, signal: null } } : {}) })
+      return { drained: true, ownershipId: 'unit-owner', reservationId: spec.reservationId, groupIdentity: 'unit-group',
+        terminal: { ownershipId: mode === 'foreign-receipt' ? 'foreign-owner' : 'unit-owner', sessionId: spec.sessionId,
+          groupIdentity: 'unit-group', status: options.terminalStatus, rootExit: null } }
+    }
+    runner.run = launch => {
+      spec = launch
+      if (mode === 'early-exit') return Promise.resolve({ ...normal, status: 17 })
+      exchange = (async () => {
+        const request = JSON.parse(fs.readFileSync(spec.env.AUTOPROMPT_VSCODE_OWNED_REQUEST, 'utf8'))
+        const events = require('../../scripts/harness-v2-bridge/vscode/event-channel.cjs').connect(request.eventChannel)
+        await events.emit({ type: 'owned.session', sessionId: 'vscode-completion-unit', contextKind: 'autoprompt-extension' })
+        await events.emit({ type: 'owned.usage', requestId: 'completion-request', usage: { input: 1, cacheRead: 0, cacheWrite: 0, output: 1, totalTokens: 2 } })
+        if (mode !== 'missing-terminal') await events.emit({ type: 'owned.result', output: { ok: true } })
+        if (mode === 'cancelled') abort.abort()
+        await events.complete()
+        return new Promise(() => {}) // GUI remains alive until the owner stops it.
+      })().catch(error => { if (stops.length) return stoppedRun; throw error })
+      return Promise.race([exchange, stoppedRun])
+    }
+    const adapter = new HarnessExecAdapter({ provider: 'vscode', runner, nativeRoot: f.nativeRoot,
+      executableBinding: { provider: 'vscode', path: process.execPath, sha256: native.executableSha256(process.execPath) },
+      targetPath: f.target, connection: { model: 'fixture', baseUrl: 'http://127.0.0.1:1/v1', maxTokens: 128, maxSteps: 1 },
+      rolePrompt: () => 'Unit-only prompt', outputSchemaResolver: () => f.schema })
+    const expected = { 'early-exit': 'CHILD_RUNTIME_FAILURE', 'missing-terminal': 'CHILD_RESULT_MISSING',
+      'foreign-receipt': 'PROCESS_DRAIN_TIMEOUT', 'late-native-failure': 'CHILD_RUNTIME_FAILURE', cancelled: 'CHILD_CANCELLED' }[mode]
+    const launched = adapter.launch({ ...f.record, signal: abort.signal, environment: {} })
+    if (expected) await assert.rejects(launched, { code: expected })
+    else assert.equal((await launched).ok, true)
+    if (mode === 'persistent') {
+      assert.equal(stops.length, 1)
+      assert.equal(stops[0].terminalStatus, 'DONE')
+    }
+    if (mode === 'early-exit') assert.equal(stops.length, 0)
+  })
+}
 
 for (const provider of PROVIDERS) {
   test(`${provider} production adapter: owned tools preserve candidate, private state and exact session continuation`, {

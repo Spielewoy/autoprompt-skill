@@ -126,9 +126,16 @@ function createServer(options = {}) {
   if (typeof options.onEvent !== 'function') fail('VSCODE_EVENT_CHANNEL_INVALID', 'VS Code event channel requires an event consumer')
   if (process.platform !== 'win32') privateSocketParent(value.endpoint, options.allowAliasParent === true)
   let failure = null, completed = false, connected = false, closed = false, peer = null, endpointIdentity = null
+  let completionResolve, completionReject
+  const completion = new Promise((resolve, reject) => { completionResolve = resolve; completionReject = reject })
+  // The transport also observes this promise, but keep a local rejection
+  // handler so an early channel failure cannot become an unhandled rejection
+  // while runner cleanup is still deciding which error is authoritative.
+  completion.catch(() => {})
   const failOnce = error => {
     if (failure) return
     failure = error instanceof VscodeEventChannelError ? error : new VscodeEventChannelError('VSCODE_EVENT_CHANNEL_FAILED', 'VS Code event channel failed')
+    completionReject(failure)
     try { options.onFailure?.(failure) } catch {}
     try { peer?.destroy() } catch {}
   }
@@ -168,7 +175,13 @@ function createServer(options = {}) {
           }
           if (exact(frame, ['type', 'sequence']) && frame.type === 'complete' && Number.isSafeInteger(frame.sequence) && frame.sequence === expected + 1) {
             expected = frame.sequence; completed = true
-            void writeFrame(connection, { type: 'complete', sequence: expected }).then(() => connection.end()).catch(failOnce); continue
+            void writeFrame(connection, { type: 'complete', sequence: expected }).then(() => {
+              // Completion is authoritative only after the acknowledgement
+              // has been flushed to this socket, so the owner drain cannot
+              // race the child's final protocol write.
+              completionResolve()
+              connection.end()
+            }).catch(failOnce); continue
           }
           fail('VSCODE_EVENT_CHANNEL_INVALID', 'VS Code event channel frame violates its sequence')
         } catch (error) { failOnce(error) }
@@ -192,6 +205,7 @@ function createServer(options = {}) {
       if (failure) throw failure
       if (!completed) fail('VSCODE_EVENT_CHANNEL_INCOMPLETE', 'VS Code event channel did not complete')
     },
+    completion,
     retain() {
       // An undrained owner remains authoritative, but its listener must not
       // keep an otherwise-complete controller process alive. The endpoint and
