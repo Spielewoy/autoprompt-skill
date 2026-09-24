@@ -38,6 +38,7 @@ function wireMessages(vscode, messages) {
 function registerProvider(context, vscode, connection, outputSchema) {
   const receipts = new Map()
   const listeners = new Map()
+  const observers = new Map()
   const provider = {
     provideLanguageModelChatInformation() {
       return [{ id: connection.model, name: `Autoprompt ${connection.model}`, family: connection.model, version: '1', maxInputTokens: 131072, maxOutputTokens: connection.maxTokens, capabilities: { toolCalling: true } }]
@@ -46,6 +47,8 @@ function registerProvider(context, vscode, connection, outputSchema) {
     async provideLanguageModelChatResponse(model, messages, options, progress, token) {
       const nonce = options.modelOptions?.autopromptRequest
       if (typeof nonce !== 'string' || !/^[a-f0-9-]{36}$/.test(nonce) || receipts.has(nonce) || model.id !== connection.model) fail('PROFILE_INVALID', 'Owned model request has no unique controller identity')
+      const observe = stage => observers.get(nonce)?.(stage)
+      observe('enter')
       const abort = new AbortController()
       const cancel = token.onCancellationRequested(() => abort.abort())
       if (token.isCancellationRequested) abort.abort()
@@ -57,6 +60,7 @@ function registerProvider(context, vscode, connection, outputSchema) {
         })
         const key = process.env[connection.apiKeyEnv]
         if (!key) fail('PROFILE_INVALID', 'Owned BYOK provider credential is missing')
+        observe('before-fetch')
         const response = await fetch(`${connection.baseUrl.replace(/\/$/, '')}/chat/completions`, {
           method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` }, signal: abort.signal,
           body: JSON.stringify({ model: connection.model, messages: wireMessages(vscode, messages), stream: false, max_tokens: connection.maxTokens,
@@ -64,6 +68,7 @@ function registerProvider(context, vscode, connection, outputSchema) {
             ...(connection.reasoningEffort ? { reasoning: { effort: connection.reasoningEffort } } : {}),
             ...(outputSchema ? { response_format: { type: 'json_schema', json_schema: { name: 'autoprompt_result', strict: true, schema: outputSchema } } } : {}) }),
         })
+        observe('after-headers')
         if (!response.ok) fail('CHILD_RUNTIME_FAILURE', `Owned BYOK provider returned HTTP ${response.status}`)
         const chunks = []; let size = 0
         for await (const chunk of response.body) {
@@ -72,6 +77,7 @@ function registerProvider(context, vscode, connection, outputSchema) {
           chunks.push(Buffer.from(chunk))
         }
         const bytes = Buffer.concat(chunks)
+        observe('after-body')
         const body = JSON.parse(bytes)
         const receipt = usageReceipt(body)
         receipts.set(nonce, receipt)
@@ -94,10 +100,11 @@ function registerProvider(context, vscode, connection, outputSchema) {
     },
   }
   context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider('autoprompt-owned', provider))
-  return { receipts, subscribe(nonce, listener) {
-    if (typeof listener !== 'function' || listeners.has(nonce)) fail('PROFILE_INVALID', 'Owned receipt listener is invalid')
+  return { receipts, subscribe(nonce, listener, observer) {
+    if (typeof listener !== 'function' || observers.has(nonce) || listeners.has(nonce) || observer !== undefined && typeof observer !== 'function') fail('PROFILE_INVALID', 'Owned receipt listener is invalid')
     listeners.set(nonce, listener)
-    return () => listeners.delete(nonce)
+    if (observer) observers.set(nonce, observer)
+    return () => { listeners.delete(nonce); observers.delete(nonce) }
   } }
 }
 function deserialize(vscode, message) {
@@ -185,11 +192,14 @@ async function runSession(vscode, request, connection, prepared, receipts, emit,
         if (receipt && JSON.stringify(receipt) !== JSON.stringify(candidate)) fail('PROVIDER_USAGE_UNKNOWN', 'Duplicate owned usage receipt')
         if (!receipt) { receipt = candidate; report({ type: 'owned.usage', ...receipt }) }
       }
-      const unsubscribe = receipts.subscribe(nonce, acceptReceipt)
+      const requestKind = step === 0 ? 'first' : 'next'
+      const unsubscribe = receipts.subscribe(nonce, acceptReceipt, providerStage => phase(`${requestKind}-provider-${providerStage}`))
       try {
         phase('before-model-request')
+        phase(`${requestKind}-before-model-request`)
         const response = await models[0].sendRequest(state.messages.map(message => deserialize(vscode, message)), { tools, modelOptions: { autopromptRequest: nonce } }, cancellation.token)
         phase('after-model-request')
+        phase(`${requestKind}-after-model-request`)
         for await (const part of response.stream) {
           if (part instanceof vscode.LanguageModelDataPart && part.mimeType === MIME) {
             const streamed = JSON.parse(Buffer.from(part.data).toString('utf8'))
@@ -240,4 +250,4 @@ async function runSession(vscode, request, connection, prepared, receipts, emit,
     cancellation.dispose(); fs.closeSync(lockFd); fs.unlinkSync(lock)
   }
 }
-module.exports = { activateOwned, usageReceipt, wireMessages }
+module.exports = { activateOwned, usageReceipt, wireMessages, registerProvider }

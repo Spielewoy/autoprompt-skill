@@ -688,6 +688,13 @@
       "payloadDigest": "9ab4477e8c880f1b88be27c8a5a42cbdf24cd17b9151d3ced994be98865b1a3d",
       "previousRecordDigest": "f42ec902d60edd92f4e23268f1d1a2b5824e1be6528ef155b6c67a64271d13b1",
       "recordDigest": "98802c5cf3e8625a01477f2a97630ccc474c7f29cee43813f45f3c7969c9a3f7"
+    },
+    {
+      "version": "1.0.103",
+      "payloadGeneration": "codex-v2.0.0-979ea65e4111bef6",
+      "payloadDigest": "979ea65e4111bef69a17afd231f3f76d63da81692de9838f33f2d0b616512ad1",
+      "previousRecordDigest": "98802c5cf3e8625a01477f2a97630ccc474c7f29cee43813f45f3c7969c9a3f7",
+      "recordDigest": "7a57c7aaa0d7db827da0b98820c37740f4aed8842b063949d97d6adc115f67f1"
     }
   ]
 }

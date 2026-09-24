@@ -46,16 +46,27 @@ test('rejected native canary reports only bounded structural diagnostic fields',
  assert.equal(phases.at(-2).code,'COMMAND_SANDBOX_UNSUPPORTED')
 })
 test('raw canary EPERM reports its fixed tuple boundary without private values',async t=>{
- const raw=Object.assign(Error('EPERM C:\\private\\controller\\secret-token arbitrary-user-command'),{code:'EPERM'})
+ const raw=Object.assign(Error('EPERM C:\\private\\controller\\secret-token arbitrary-user-command'),{code:'EPERM',syscall:'private-secret-syscall'})
  const x=setup(t,{canaryExec:true,canaryCaptureExecutionError:true,controlAuditError:raw})
  await assert.rejects(x.run(),error=>{
   assert.equal(error.code,'COMMAND_SANDBOX_UNSUPPORTED')
   assert.match(error.message,/\[canary phase=command-launch code=EPERM stage=control-root\]$/)
-  assert.doesNotMatch(error.message,/private|secret-token|arbitrary-user-command/i)
+  assert.doesNotMatch(error.message,/private|secret-token|arbitrary-user-command|syscall=/i)
   return true
  })
  assert.equal(x.events.includes('stage'),false)
  assert.equal(x.events.includes('launch'),false)
+})
+test('native canary cleanup failure retains its fixed boundary diagnostic',async t=>{
+ const raw=Object.assign(Error('EPERM private-controller-path'),{code:'EPERM',syscall:'unlink'})
+ const x=setup(t,{canaryExec:true,canaryCaptureExecutionError:true,cleanupError:raw})
+ await assert.rejects(x.run(),error=>{
+  assert.match(error.message,/\[canary phase=command-launch code=EPERM stage=helper-deployment-cleanup syscall=unlink\]$/)
+  assert.doesNotMatch(error.message,/private-controller-path/)
+  return true
+ })
+ assert.equal(raw.cleanupConfirmed,false)
+ assert.ok(x.events.indexOf('release')<x.events.indexOf('helper-cleanup'))
 })
 test('canary diagnostics accept only an exact fixed probe marker',async t=>{
  for(const [stderr,expected] of [['APPCONTAINER_PROBE_FAILURE:network:CHECK',true],['APPCONTAINER_PROBE_FAILURE:network:CHECK\nPRIVATE_TOKEN=secret',false],['APPCONTAINER_PROBE_FAILURE:foreign:CHECK',false]]){

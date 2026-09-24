@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict')
 const test = require('node:test')
-const { usageReceipt } = require('../../scripts/harness-v2-bridge/vscode/owned-session.cjs')
+const { usageReceipt, registerProvider } = require('../../scripts/harness-v2-bridge/vscode/owned-session.cjs')
 const { sanitize } = require('../../scripts/harness-v2-vscode-config.cjs')
 const native = require('../../scripts/harness-v2-native.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
@@ -21,6 +21,36 @@ test('owned VS Code usage retains exact billed categories and rejects inconsiste
   stream.push(JSON.stringify({ type: 'owned.usage', ...receipt }))
   stream.push(JSON.stringify({ type: 'owned.result', output: { ok: true } }))
   assert.deepEqual(stream.finish().usage, { noncachedInput: 9, cachedInput: 3, output: 5, reasoning: 2 })
+})
+
+test('owned VS Code provider emits only request-local fixed fetch phases', async t => {
+  let provider
+  const context = { subscriptions: [] }
+  const vscode = {
+    lm: { registerLanguageModelChatProvider(_name, value) { provider = value; return { dispose() {} } } },
+    LanguageModelDataPart: { json(value) { return value } },
+    LanguageModelTextPart: class LanguageModelTextPart { constructor(value) { this.value = value } },
+    LanguageModelChatToolMode: { Required: 'required' },
+  }
+  const previousFetch = global.fetch, previousKey = process.env.VSCODE_PROVIDER_PHASE_TEST_KEY
+  process.env.VSCODE_PROVIDER_PHASE_TEST_KEY = 'test-key'
+  global.fetch = async () => ({ ok: true, body: { async *[Symbol.asyncIterator]() {
+    yield Buffer.from(JSON.stringify({ id: 'phase-request', model: 'phase-model', choices: [{ finish_reason: 'stop', message: { content: '' } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }))
+  } } })
+  t.after(() => { global.fetch = previousFetch; if (previousKey === undefined) delete process.env.VSCODE_PROVIDER_PHASE_TEST_KEY; else process.env.VSCODE_PROVIDER_PHASE_TEST_KEY = previousKey })
+  const registered = registerProvider(context, vscode, { model: 'phase-model', maxTokens: 16, timeoutMs: 1000, apiKeyEnv: 'VSCODE_PROVIDER_PHASE_TEST_KEY', baseUrl: 'https://fixture.invalid' })
+  const nonce = '11111111-1111-4111-8111-111111111111', phases = [], receipts = []
+  const unsubscribe = registered.subscribe(nonce, receipt => receipts.push(receipt), stage => phases.push(stage))
+  await provider.provideLanguageModelChatResponse({ id: 'phase-model' }, [], { modelOptions: { autopromptRequest: nonce }, tools: [] }, { report() {} }, { isCancellationRequested: false, onCancellationRequested() { return { dispose() {} } } })
+  assert.deepEqual(phases, ['enter', 'before-fetch', 'after-headers', 'after-body'])
+  assert.equal(receipts.length, 1)
+  unsubscribe()
+  registered.receipts.delete(nonce)
+  const next = nonce
+  await provider.provideLanguageModelChatResponse({ id: 'phase-model' }, [], { modelOptions: { autopromptRequest: next }, tools: [] }, { report() {} }, { isCancellationRequested: false, onCancellationRequested() { return { dispose() {} } } })
+  assert.deepEqual(phases, ['enter', 'before-fetch', 'after-headers', 'after-body'], 'unsubscribed observer cannot receive a later provider callback')
+  assert.equal(receipts.length, 1, 'receipt listener was removed with its observer')
 })
 
 test('owned VS Code connection cannot silently load executable providers or unsafe endpoints', () => {

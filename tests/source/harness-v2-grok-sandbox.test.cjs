@@ -125,6 +125,47 @@ test('Grok MCP loopback adopts the authenticated inherited IPv6 listener on FD4'
   }
 })
 
+test('Grok MCP loopback confines a real TCP reset and serves the next connection', () => {
+  const childSource = path.resolve(__dirname, '../../scripts/harness-v2-bridge/grok/mcp-loopback.cjs')
+  const program = String.raw`
+    const net = require('node:net')
+    const { createMcpLoopbackServer } = require(${JSON.stringify(childSource)})
+    const once = (target, event) => new Promise((resolve, reject) => {
+      target.once(event, (...args) => resolve(args))
+      if (event !== 'error') target.once('error', reject)
+    })
+    ;(async () => {
+      const probe = net.createServer()
+      probe.listen(0, '127.0.0.1'); await once(probe, 'listening')
+      const port = probe.address().port
+      await new Promise(resolve => probe.close(resolve))
+      const relay = createMcpLoopbackServer({ port, forward: async line => ({ line }) })
+      await relay.listen()
+      const reset = net.createConnection(port, '127.0.0.1')
+      reset.on('error', () => {})
+      await once(reset, 'connect')
+      if (typeof reset.resetAndDestroy !== 'function') throw new Error('resetAndDestroy is unavailable')
+      reset.resetAndDestroy()
+      await new Promise(resolve => setTimeout(resolve, 50))
+      const next = net.createConnection(port, '127.0.0.1')
+      let response = ''
+      next.setEncoding('utf8'); next.on('data', chunk => { response += chunk })
+      await once(next, 'connect')
+      next.write('{"jsonrpc":"2.0","id":2,"method":"ping"}\n')
+      for (let count = 0; count < 100 && !response.includes('\n'); count += 1) await new Promise(resolve => setTimeout(resolve, 5))
+      if (response !== '{"jsonrpc":"2.0","id":2,"method":"ping"}\n') throw new Error('second MCP connection did not receive its exact response')
+      next.destroy()
+      await relay.close()
+      process.stdout.write('RESET_CONFINED\n')
+    })().catch(error => { process.stderr.write(error.stack || String(error)); process.exitCode = 1 })
+  `
+  const result = childProcess.spawnSync(process.execPath, ['-e', program], { encoding: 'utf8', timeout: 10000 })
+  assert.equal(result.error, undefined)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.signal, null)
+  assert.equal(result.stdout, 'RESET_CONFINED\n')
+})
+
 test('Grok worker preserves ordinary child environment and rejects partial inherited bindings', async () => {
   const environment = { HOME: '/private/home', GROK_HOME: '/private/grok', XDG_CONFIG_HOME: '/private/config', XDG_DATA_HOME: '/private/data', XDG_STATE_HOME: '/private/state', XDG_CACHE_HOME: '/private/cache' }
   const child = childEnvironment('linux', environment)

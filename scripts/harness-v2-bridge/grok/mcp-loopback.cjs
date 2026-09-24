@@ -17,6 +17,10 @@ function createMcpLoopbackServer(options = {}) {
   const sockets = new Set()
   const server = net.createServer(socket => {
     sockets.add(socket); socket.once('close', () => sockets.delete(socket))
+    // A provider-side MCP helper can exit or be terminated while this side is
+    // still reading.  Keep that reset scoped to its exact connection so it
+    // cannot become an uncaught worker failure or affect other MCP clients.
+    socket.on('error', () => socket.destroy())
     const decoder = new StringDecoder('utf8'); let buffer = '', chain = Promise.resolve()
     socket.on('data', bytes => {
       buffer += decoder.write(bytes)

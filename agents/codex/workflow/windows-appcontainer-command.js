@@ -33,7 +33,8 @@ function commandDiagnosticStage(error, stage) {
   try {
     if (!error || typeof error !== 'object' || !/^[a-z0-9-]{1,80}$/.test(stage)) return error
     const details = error.details
-    error.details = Object.freeze({ ...(details && typeof details === 'object' ? details : {}), stage })
+    const syscall = new Set(['open', 'read', 'write', 'lstat', 'stat', 'realpath', 'scandir', 'rmdir', 'unlink', 'rename', 'chmod', 'mkdir', 'access']).has(error.syscall) ? error.syscall : undefined
+    error.details = Object.freeze({ ...(details && typeof details === 'object' ? details : {}), stage, ...(syscall ? { syscall } : {}) })
   } catch {}
   return error
 }
@@ -50,6 +51,7 @@ function canaryFailureSummary(result) {
   const code = token(result?.code)
   const stage = token(result?.diagnostic?.stage)
   const helperPhase = token(result?.diagnostic?.helperPhase)
+  const syscall = token(result?.diagnostic?.syscall)
   const exitCode = integer(result?.nativeExitCode)
   const probeMarker = typeof result?.probeFailure?.stderr === 'string'
     ? /^APPCONTAINER_PROBE_FAILURE:([a-z-]{1,32}):([A-Z0-9_]{1,64})$/.exec(result.probeFailure.stderr.trim()) : null
@@ -58,6 +60,7 @@ function canaryFailureSummary(result) {
   if (code) values.push(`code=${code}`)
   if (stage) values.push(`stage=${stage}`)
   if (helperPhase) values.push(`helperPhase=${helperPhase}`)
+  if (syscall) values.push(`syscall=${syscall}`)
   if (exitCode !== null) values.push(`nativeExitCode=${exitCode}`)
   if (probeMarker && probeStages.has(probeMarker[1])) values.push(`probeStage=${probeMarker[1]}`, `probeCode=${probeMarker[2]}`)
   if (result?.probeFailure?.timedOut === true) values.push('timedOut=1')
@@ -438,7 +441,9 @@ async function runTupleCommand(policy, args, options, tuple, key) {
   // usr components. Keep that real layout inside one owned command directory.
   let stagingRoot, runtimeRoot, runtimeDirectory, cwdBridge
   let launcher, helperDeployment
-  const { prepareWindowsAppContainerResources, recoverWindowsAppContainerResources } = require('./windows-appcontainer-resources.js')
+  let prepareWindowsAppContainerResources, recoverWindowsAppContainerResources
+  try { ({ prepareWindowsAppContainerResources, recoverWindowsAppContainerResources } = require('./windows-appcontainer-resources.js')) }
+  catch (error) { throw commandDiagnosticStage(error, 'resources-module') }
   // Only the source-pinned, physically captured bundle can select worker bytes.
   // The loader keeps this opaque tuple for both the probe and later commands.
   let workerIdentity
@@ -558,8 +563,8 @@ async function runTupleCommand(policy, args, options, tuple, key) {
     // resource journal. Recovery must prove process drain before revoking grants.
     if ((!lease && !recoveryPending) || released) {
       let cleanupFailure
-      const cleanup = operation => {
-        try { operation() } catch (error) { if (!cleanupFailure) cleanupFailure = error }
+      const cleanup = (stage, operation) => {
+        try { operation() } catch (error) { if (!cleanupFailure) cleanupFailure = commandDiagnosticStage(error, stage) }
       }
       let stagingCleanupAllowed = true
       if (cwdBridge) {
@@ -567,20 +572,20 @@ async function runTupleCommand(policy, args, options, tuple, key) {
           if (cwdBridgeActive) throw new WindowsAppContainerError('APPCONTAINER_CLEANUP_UNCONFIRMED', 'Windows command cwd bridge remained active after cleanup')
           verifyCommandCwdBridgeParent(cwdBridge, [])
         } catch (error) {
-          cleanupFailure ||= error
+          cleanupFailure ||= commandDiagnosticStage(error, 'cwd-bridge-cleanup')
           stagingCleanupAllowed = false
         }
       }
-      if (privateScratch) cleanup(() => fs.rmSync(privateScratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
+      if (privateScratch) cleanup('private-scratch-cleanup', () => fs.rmSync(privateScratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
       // Failed materialization owns its own cleanup accounting; EEXIST never
       // transfers ownership of a competing directory to this operation.
-      if (stagingCleanupAllowed && runtimeOwned && !runtimeCleanupUnknown) cleanup(() => fs.rmSync(runtimeRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
-      if (stagingCleanupAllowed) cleanup(() => helperDeployment?.cleanup())
+      if (stagingCleanupAllowed && runtimeOwned && !runtimeCleanupUnknown) cleanup('worker-runtime-cleanup', () => fs.rmSync(runtimeRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
+      if (stagingCleanupAllowed) cleanup('helper-deployment-cleanup', () => helperDeployment?.cleanup())
       // An exclusive loader collision or any failed/unknown child cleanup must
       // retain the staging parent rather than recursively deleting bytes whose
       // ownership or process lifetime was not proved.
       if (stagingCleanupAllowed && !cleanupFailure && stagingRoot && !runtimeCleanupUnknown && !fs.existsSync(runtimeRoot) && !(helperDeployment && fs.existsSync(helperDeployment.root))) {
-        cleanup(() => fs.rmSync(stagingRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
+        cleanup('compiler-root-cleanup', () => fs.rmSync(stagingRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
       }
       if (!cleanupFailure && stagingRoot && fs.existsSync(stagingRoot)) {
         cleanupFailure = primaryError || new WindowsAppContainerError('APPCONTAINER_CLEANUP_UNCONFIRMED', 'Windows command staging cleanup is unconfirmed')

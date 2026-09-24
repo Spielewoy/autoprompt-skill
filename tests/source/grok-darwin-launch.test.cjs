@@ -9,6 +9,7 @@ const path = require('node:path')
 const test = require('node:test')
 const zlib = require('node:zlib')
 const launch = require('../../scripts/harness-v2-bridge/grok/darwin-launch.cjs')
+const { ProcessOwner } = require('../../agents/codex/workflow/process-owner.js')
 
 const digest = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 function machO(architecture = process.arch) {
@@ -40,6 +41,22 @@ function fixture(t) {
   return { base, wrapper, platform, grokExecutable, compressedGrok, nodeExecutable, sessionRoot, launchRoot }
 }
 const fixedPorts = () => Object.freeze({ proxyPort: 29777, mcpPort: 29778 })
+function ownership(reservationId = 'darwin-owned-reservation') {
+  const adapter = Object.freeze({ kind: 'darwin-launchd-coalition', childControlEnvironment: value => ({ AUTOPROMPT_OWNERSHIP_RESERVATION: value }) })
+  return Object.freeze({ processOwner: Object.freeze({ adapter, launch() {} }), binding: Object.freeze({ sessionId: 'darwin-owned-session', reservationId, targetKey: 'darwin-owned-target' }) })
+}
+function admittedOwner(root) {
+  const adapter = {
+    kind: 'darwin-launchd-coalition',
+    capabilities: { groupAtCreation: true, descendantEnumeration: true, groupSignal: true, stableIdentity: true, persistentIdentity: true, reservationRecovery: true },
+    childControlEnvironment: value => ({ AUTOPROMPT_OWNERSHIP_RESERVATION: value }),
+    async admit() { return { supported: true } },
+    async spawnOwned(spec) { this.spawned = spec; return { rootPid: 731, groupIdentity: 'darwin-coalition:test:731' } },
+    async recoverReservation() { return null }, async probeReservation() { return { state: 'DEAD' } },
+    async listOwned() { return [] }, async signalOwned() {}, async verifyOwnership() { return true }, async listTargetOwned() { return [] }, async probeOwnedIdentity() { return [] },
+  }
+  return { adapter, owner: new ProcessOwner({ adapter, registryPath: path.join(root, 'processes.json'), startupTimeoutMs: 1000 }) }
+}
 async function session(f, overrides = {}) {
   return launch.prepareSession({ ...f, architecture: process.arch, _dependencies: { platform: 'darwin', reserveListeners: fixedPorts }, ...overrides })
 }
@@ -103,7 +120,7 @@ test('Darwin continuation rejects a mutable or multiply-linked listener record',
 test('Darwin launch emits a closed Seatbelt worker projection with inherited FD3 and FD4', async t => {
   const f = fixture(t), prepared = await session(f), pipe = { socketPath: path.join(f.base, 'relay.sock') }
   const config = { ...prepared.config, model: 'grok-4', relayToken: 'a'.repeat(64), proxyToken: 'b'.repeat(64), allowedMcpTools: { autoprompt_owned__read: 'read' }, issuedCalls: [{ callId: 'one' }] }
-  const value = await launch.prepareLaunch({ session: prepared, sessionRoot: f.sessionRoot, launchRoot: f.launchRoot, config, pipe, spec: { argv: ['--verbatim'] } })
+  const value = await launch.prepareLaunch({ session: prepared, sessionRoot: f.sessionRoot, launchRoot: f.launchRoot, config, pipe, spec: { argv: ['--verbatim'] }, ...ownership() })
   assert.equal(value.launch.executable, '/usr/bin/sandbox-exec')
   assert.equal(value.launch.argv[0], '-p'); assert.match(value.launch.argv[1], /^\(version 1\)\n\(deny default\)/)
   assert.equal(value.launch.argv[2], prepared.nodeExecutable)
@@ -113,12 +130,28 @@ test('Darwin launch emits a closed Seatbelt worker projection with inherited FD3
     'AUTOPROMPT_GROK_ALLOWED_MCP_TOOLS', 'AUTOPROMPT_GROK_AUDIT_PATH', 'AUTOPROMPT_GROK_CWD', 'AUTOPROMPT_GROK_EXECUTABLE', 'AUTOPROMPT_GROK_ISSUED_CALLS',
     'AUTOPROMPT_GROK_MCP_LISTENER_FD', 'AUTOPROMPT_GROK_MCP_PORT', 'AUTOPROMPT_GROK_MODEL', 'AUTOPROMPT_GROK_PROXY_LISTENER_FD', 'AUTOPROMPT_GROK_PROXY_PORT',
     'AUTOPROMPT_GROK_PROXY_TOKEN', 'AUTOPROMPT_GROK_RELAY_FD', 'AUTOPROMPT_GROK_RELAY_TOKEN', 'GROK_HOME', 'HOME', 'TMPDIR', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME',
+    'AUTOPROMPT_OWNERSHIP_RESERVATION',
   ].sort())
   assert.equal(value.launch.env.AUTOPROMPT_GROK_PROXY_LISTENER_FD, '3'); assert.equal(value.launch.env.AUTOPROMPT_GROK_MCP_LISTENER_FD, '4')
   assert.equal(value.launch.env.AUTOPROMPT_GROK_EXECUTABLE, prepared.grokExecutable)
   assert.equal(JSON.stringify(value.launch.env).includes(f.sessionRoot + '/controller'), false)
   await value.cleanup()
   assert.equal(fs.existsSync(prepared.grokExecutable), true, 'activation-root teardown owns persisted snapshots')
+})
+
+test('Darwin launch attests the reservation through the actual ProcessOwner admission check', async t => {
+  const f = fixture(t), prepared = await session(f), admitted = admittedOwner(f.base)
+  const binding = { sessionId: 'darwin-admission-session', reservationId: 'darwin-admission-reservation', targetKey: 'darwin-admission-target' }
+  const config = { ...prepared.config, model: 'grok-4', relayToken: 'a'.repeat(64), proxyToken: 'b'.repeat(64), allowedMcpTools: { autoprompt_owned__read: 'read' }, issuedCalls: [] }
+  const value = await launch.prepareLaunch({ session: prepared, sessionRoot: f.sessionRoot, launchRoot: f.launchRoot, config,
+    pipe: { socketPath: path.join(f.base, 'relay.sock') }, processOwner: admitted.owner, binding,
+    spec: { argv: ['--verbatim'], env: { AUTOPROMPT_OWNERSHIP_RESERVATION: 'foreign', HOME: '/foreign' } } })
+  assert.equal(value.launch.env.AUTOPROMPT_OWNERSHIP_RESERVATION, binding.reservationId)
+  await admitted.owner.launch({ executable: value.launch.executable, argv: value.launch.argv, cwd: value.launch.cwd, env: value.launch.env,
+    shell: false, sessionId: binding.sessionId, reservationId: binding.reservationId, targetKey: binding.targetKey, forWork: false })
+  assert.equal(admitted.adapter.spawned.env.AUTOPROMPT_OWNERSHIP_RESERVATION, binding.reservationId)
+  assert.equal(admitted.adapter.spawned.env.HOME, prepared.privateRoots.home)
+  await value.cleanup()
 })
 
 test('Darwin session refuses package drift, missing raw payload, linked input, and changed private snapshots', async t => {
@@ -148,7 +181,7 @@ test('Darwin session refuses package drift, missing raw payload, linked input, a
 
 test('Darwin launch rejects rebound config, ambiguous relay, and ambient policy fields', async t => {
   const f = fixture(t), prepared = await session(f)
-  const base = { session: prepared, sessionRoot: f.sessionRoot, launchRoot: f.launchRoot,
+  const base = { session: prepared, sessionRoot: f.sessionRoot, launchRoot: f.launchRoot, ...ownership(),
     config: { ...prepared.config, model: 'grok', relayToken: 'a'.repeat(64), proxyToken: 'b'.repeat(64), allowedMcpTools: { owned: 'read' }, issuedCalls: [] },
     pipe: { socketPath: path.join(f.base, 'relay.sock') }, spec: { argv: [] } }
   await assert.rejects(launch.prepareLaunch({ ...base, config: { ...base.config, runtimeProjection: { ...base.config.runtimeProjection, proxyPort: 12345 } } }), { code: 'GROK_DARWIN_LAUNCH_INVALID' })
@@ -161,7 +194,7 @@ test('Darwin launch rejects rebound config, ambiguous relay, and ambient policy 
 
 test('Darwin launch re-audits private root and snapshot permissions', async t => {
   const f = fixture(t), prepared = await session(f)
-  const base = { session: prepared, sessionRoot: f.sessionRoot, launchRoot: f.launchRoot,
+  const base = { session: prepared, sessionRoot: f.sessionRoot, launchRoot: f.launchRoot, ...ownership(),
     config: { ...prepared.config, model: 'grok', relayToken: 'a'.repeat(64), proxyToken: 'b'.repeat(64), allowedMcpTools: { owned: 'read' }, issuedCalls: [] },
     pipe: { socketPath: path.join(f.base, 'relay.sock') }, spec: { argv: [] } }
   fs.chmodSync(prepared.privateRoots.scratch, 0o770)
@@ -171,7 +204,7 @@ test('Darwin launch re-audits private root and snapshot permissions', async t =>
   await assert.rejects(launch.prepareLaunch(base), { code: 'GROK_DARWIN_LAUNCH_IDENTITY_CHANGED' })
 
   const other = fixture(t), second = await session(other)
-  const secondLaunch = { session: second, sessionRoot: other.sessionRoot, launchRoot: other.launchRoot,
+  const secondLaunch = { session: second, sessionRoot: other.sessionRoot, launchRoot: other.launchRoot, ...ownership('darwin-second-reservation'),
     config: { ...second.config, model: 'grok', relayToken: 'a'.repeat(64), proxyToken: 'b'.repeat(64), allowedMcpTools: { owned: 'read' }, issuedCalls: [] },
     pipe: { socketPath: path.join(other.base, 'relay.sock') }, spec: { argv: [] } }
   fs.chmodSync(second.nodeExecutable, 0o570)

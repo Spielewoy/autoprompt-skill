@@ -11,7 +11,11 @@ const REQUEST_BASENAME = 'owned-session.json'
 const JOURNAL_BASENAME = 'session-driver-phase.jsonl'
 const STAGES = new Set(['entry', 'beforeactivation', 'afteractivation', 'channelconnected', 'runSession', 'complete',
   'before-session-setup', 'after-session-persist', 'before-model-select', 'after-model-select', 'before-model-request', 'after-model-request',
-  'after-tool-event', 'after-tool-persist'])
+  'after-tool-event', 'after-tool-persist',
+  'first-before-model-request', 'first-after-model-request', 'next-before-model-request', 'next-after-model-request',
+  'first-provider-enter', 'first-provider-before-fetch', 'first-provider-after-headers', 'first-provider-after-body',
+  'next-provider-enter', 'next-provider-before-fetch', 'next-provider-after-headers', 'next-provider-after-body'])
+const MAX_STAGES = 32
 
 function sha256(bytes) { return crypto.createHash('sha256').update(bytes).digest('hex') }
 
@@ -69,6 +73,7 @@ function phaseJournal() {
       throw Object.assign(new Error('Owned VS Code phase journal stage is invalid'), { code: 'PROFILE_INVALID' })
     }
     if (recorded.has(stage)) return
+    if (recorded.size >= MAX_STAGES) throw Object.assign(new Error('Owned VS Code phase journal exceeds its bounded stage set'), { code: 'PROFILE_INVALID' })
     recorded.add(stage)
     const bytes = Buffer.from(`${JSON.stringify(stage === 'error' ? { stage, code: value.code } : { stage })}\n`, 'utf8')
     fs.writeSync(fd, bytes, 0, bytes.length)

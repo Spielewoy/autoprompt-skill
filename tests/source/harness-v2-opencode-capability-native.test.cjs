@@ -353,6 +353,83 @@ async function scenario(provider, options = {}) {
 function good(result) { assert.equal(result.ok, true); assert.ok(result.transportEvidence.eventCount > 0); assert.match(result.contextId, /^[a-zA-Z0-9_-]+$/); assert.match(result.toolBoundaryEvidence.policySha256, /^[a-f0-9]{64}$/) }
 function command(f, value) { f.service.tool.args.command = value }
 
+const OPENCODE_STARTUP_DIAGNOSTIC = process.platform === 'win32' && process.env.AUTOPROMPT_OPENCODE_STARTUP_DIAGNOSTIC === '1'
+function setTemporaryEnvironment(directory) {
+  const previous = Object.fromEntries(['TMP', 'TEMP', 'TMPDIR'].map(name => [name, process.env[name]]))
+  for (const name of Object.keys(previous)) process.env[name] = directory
+  return () => {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  }
+}
+function diagnosticTemporaryDirectory(root, variant) {
+  if (variant === 'shallow') return privateDirectory(path.join(root, 't'))
+  // Ten fixed 15-byte segments make this physical temporary root 159 bytes
+  // deeper than the shallow one, close to the public activation depth.
+  return privateDirectory(path.join(root, ...Array.from({ length: 10 }, () => 'd'.repeat(15))))
+}
+async function runOpenCodeStartupDepthDiagnostic(t, variant) {
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'oc-startup-')))
+  const temporaryDirectory = diagnosticTemporaryDirectory(root, variant)
+  const restoreEnvironment = setTemporaryEnvironment(temporaryDirectory)
+  let f, resultError, diagnosticSnapshot, primaryError, cleanupError, fixtureClosed = false
+  try {
+    f = await scenario('opencode', {
+      tool: { name: 'Task', args: { prompt: 'unauthorized nested dispatch' } },
+      serviceOptions: { forceFirstTool: true },
+    })
+    await assert.rejects(f.run({}), error => {
+      resultError = error
+      assert.equal(error?.code, 'ROLE_POLICY_DENIED')
+      return true
+    })
+  } catch (error) {
+    primaryError = error
+    resultError ||= error
+    throw error
+  } finally {
+    // cleanupNativeFixture removes the private transcript on a confirmed
+    // drain, so collect its bounded structural diagnostic first.
+    try {
+      diagnosticSnapshot = f && resultError
+        ? buildFixtureFailureDiagnostic(f, resultError)
+        : { status: 'fixture-unavailable' }
+    } catch { diagnosticSnapshot = { status: 'diagnostic-unavailable' } }
+    // Keep the temporary override through fixture cleanup: cleanup may launch
+    // or stop an owned child. It is restored even when scenario setup fails.
+    try {
+      if (f) { await f.close(); fixtureClosed = true }
+    } catch (error) { cleanupError = error }
+    restoreEnvironment()
+    const diagnostic = {
+      variant,
+      temporaryPathLength: temporaryDirectory.length,
+      targetPathLength: typeof f?.target === 'string' ? f.target.length : null,
+      controllerPathLength: typeof f?.controller === 'string' ? f.controller.length : null,
+      nativeRootPathLength: typeof f?.nativeRoot === 'string' ? f.nativeRoot.length : null,
+      modelRequestCount: Array.isArray(f?.service?.requests) ? f.service.requests.length : 0,
+      diagnostic: diagnosticSnapshot,
+      cleanup: fixtureClosed ? 'drained' : 'retained',
+    }
+    t.diagnostic(JSON.stringify(diagnostic))
+    // A failed or unavailable fixture close leaves all diagnostic state in
+    // place for the workflow artifact; never erase it optimistically.
+    if (fixtureClosed) fs.rmSync(root, { recursive: true, force: true })
+    if (cleanupError && !primaryError) throw cleanupError
+  }
+}
+
+if (OPENCODE_STARTUP_DIAGNOSTIC) {
+  test('OpenCode Windows startup diagnostic: shallow private temporary root', { timeout: closedNativeCapabilityTimeout('opencode') }, async t => {
+    await runOpenCodeStartupDepthDiagnostic(t, 'shallow')
+  })
+  test('OpenCode Windows startup diagnostic: deep private temporary root', { timeout: closedNativeCapabilityTimeout('opencode') }, async t => {
+    await runOpenCodeStartupDepthDiagnostic(t, 'deep')
+  })
+}
+
 async function runScenario(provider, isolationOnly = false) {
   // A selected isolation diagnostic must not silently run every continuation,
   // concurrency, and recovery scenario behind its one reported test name.

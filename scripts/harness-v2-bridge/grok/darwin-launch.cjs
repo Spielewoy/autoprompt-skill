@@ -10,6 +10,7 @@ const path = require('node:path')
 const zlib = require('node:zlib')
 const { buildDarwinGrokProfile } = require('./darwin-profile.cjs')
 const { buildGrokInlineWorker } = require('./inline-worker-bundle.cjs')
+const { prepareProcessLaunchEnvironment } = require('../../../agents/codex/workflow/process-owner.js')
 
 const PINNED_VERSION = '1.0.13'
 const MAX_RUNTIME_BYTES = 512 * 1024 * 1024
@@ -235,6 +236,21 @@ function jsonValue(value, label) {
   return text
 }
 function text(value, label) { if (typeof value !== 'string' || !value || value.includes('\0')) fail('GROK_DARWIN_LAUNCH_INVALID', `${label} is invalid`); return value }
+function controlEnvironment(processOwner, binding, environment) {
+  const adapter = processOwner?.adapter
+  if (!processOwner || typeof processOwner.launch !== 'function' || !adapter || adapter.kind !== 'darwin-launchd-coalition' ||
+      typeof adapter.childControlEnvironment !== 'function' || !exact(binding, ['sessionId', 'reservationId', 'targetKey']) ||
+      Object.values(binding).some(value => typeof value !== 'string' || !value || value.includes('\0'))) {
+    fail('GROK_DARWIN_LAUNCH_INVALID', 'Darwin Grok launch lacks its owned process binding')
+  }
+  let projected
+  try { projected = prepareProcessLaunchEnvironment(adapter, binding.reservationId, environment) }
+  catch { fail('GROK_DARWIN_LAUNCH_INVALID', 'Darwin Grok launch cannot attest its owned process environment') }
+  if (!projected || projected.AUTOPROMPT_OWNERSHIP_RESERVATION !== binding.reservationId) {
+    fail('GROK_DARWIN_LAUNCH_INVALID', 'Darwin Grok launch did not attest its ownership reservation')
+  }
+  return projected
+}
 
 async function prepareSession(options = {}) {
   const platform = options._dependencies?.platform || process.platform
@@ -266,7 +282,7 @@ async function prepareSession(options = {}) {
 }
 
 async function prepareLaunch(options = {}) {
-  const { session, sessionRoot, launchRoot, config, spec, pipe } = options
+  const { session, sessionRoot, launchRoot, config, spec, pipe, processOwner, binding } = options
   if (!session || session.platform !== 'darwin' || session.sessionRoot !== sessionRoot || session.launchRoot !== launchRoot || !config || !spec ||
       !exact(pipe, ['socketPath']) || typeof pipe.socketPath !== 'string' || !path.isAbsolute(pipe.socketPath) || pipe.socketPath.includes('\0')) fail('GROK_DARWIN_LAUNCH_INVALID', 'Darwin Grok launch projection is invalid')
   const roots = session.privateRoots, projection = config.runtimeProjection, listeners = session.darwinListeners
@@ -288,13 +304,14 @@ async function prepareLaunch(options = {}) {
   const worker = (options._dependencies?.buildWorker || buildGrokInlineWorker)({ nodeExecutable: session.nodeExecutable, nodeArgs: [], workerArgs: spec.argv })
   const profileText = (options._dependencies?.buildProfile || buildDarwinGrokProfile)({ nodeExecutable: session.nodeExecutable, grokExecutable: session.grokExecutable,
     home: roots.home, cwd: roots.cwd, scratch: roots.scratch, proxyPort: projection.proxyPort, mcpPort: projection.mcpPort })
-  const env = Object.freeze({
+  const environment = Object.freeze({
     HOME: roots.home, GROK_HOME: roots.home, XDG_CONFIG_HOME: path.join(roots.home, 'config'), XDG_DATA_HOME: path.join(roots.home, 'data'), XDG_STATE_HOME: path.join(roots.home, 'state'), XDG_CACHE_HOME: path.join(roots.home, 'cache'), TMPDIR: roots.scratch,
     AUTOPROMPT_GROK_EXECUTABLE: session.grokExecutable, AUTOPROMPT_GROK_CWD: roots.cwd, AUTOPROMPT_GROK_MODEL: model,
     AUTOPROMPT_GROK_RELAY_TOKEN: relayToken, AUTOPROMPT_GROK_PROXY_TOKEN: proxyToken, AUTOPROMPT_GROK_RELAY_FD: '0',
     AUTOPROMPT_GROK_PROXY_LISTENER_FD: '3', AUTOPROMPT_GROK_MCP_LISTENER_FD: '4', AUTOPROMPT_GROK_PROXY_PORT: String(projection.proxyPort), AUTOPROMPT_GROK_MCP_PORT: String(projection.mcpPort),
     AUTOPROMPT_GROK_ALLOWED_MCP_TOOLS: jsonValue(config.allowedMcpTools, 'Grok MCP policy'), AUTOPROMPT_GROK_ISSUED_CALLS: jsonValue(config.issuedCalls, 'Grok issued-call history'), AUTOPROMPT_GROK_AUDIT_PATH: path.join(roots.scratch, 'audit.jsonl'),
   })
+  const env = controlEnvironment(processOwner, binding, environment)
   return Object.freeze({ relayStdin: Object.freeze({ socketPath: pipe.socketPath }), darwinListeners: session.darwinListeners, cleanup: async () => {},
     launch: Object.freeze({ executable: '/usr/bin/sandbox-exec', argv: Object.freeze(['-p', profileText, session.nodeExecutable, ...worker.argv]), cwd: roots.cwd, env }) })
 }
