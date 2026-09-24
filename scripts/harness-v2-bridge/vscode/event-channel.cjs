@@ -125,7 +125,7 @@ function createServer(options = {}) {
   if (!descriptorValid(value)) fail('VSCODE_EVENT_CHANNEL_INVALID', 'VS Code event channel descriptor is invalid')
   if (typeof options.onEvent !== 'function') fail('VSCODE_EVENT_CHANNEL_INVALID', 'VS Code event channel requires an event consumer')
   if (process.platform !== 'win32') privateSocketParent(value.endpoint, options.allowAliasParent === true)
-  let failure = null, completed = false, connected = false, closed = false, peer = null, endpointIdentity = null
+  let failure = null, completed = false, completionClosed = false, connected = false, closed = false, peer = null, endpointIdentity = null
   let completionResolve, completionReject
   const completion = new Promise((resolve, reject) => { completionResolve = resolve; completionReject = reject })
   // The transport also observes this promise, but keep a local rejection
@@ -142,11 +142,17 @@ function createServer(options = {}) {
   const server = net.createServer(connection => {
     if (connected || closed || failure) { connection.destroy(); return }
     connected = true; peer = connection
-    let buffer = '', ready = false, expected = 0
+    let buffer = '', ready = false, expected = 0, completionAcked = false, peerEnded = false, completionCloseTimer
     const handshakeTimer = setTimeout(() => failOnce(new VscodeEventChannelError('VSCODE_EVENT_CHANNEL_INCOMPLETE', 'VS Code event channel did not authenticate promptly')), HANDSHAKE_TIMEOUT_MS)
     connection.setEncoding('utf8')
     connection.on('error', () => failOnce(new VscodeEventChannelError('VSCODE_EVENT_CHANNEL_FAILED', 'VS Code event channel socket failed')))
-    connection.on('close', () => { clearTimeout(handshakeTimer); if (!completed) failOnce(new VscodeEventChannelError('VSCODE_EVENT_CHANNEL_INCOMPLETE', 'VS Code event channel closed before completion')) })
+    connection.on('end', () => { peerEnded = true })
+    connection.on('close', hadError => {
+      clearTimeout(handshakeTimer); clearTimeout(completionCloseTimer)
+      if (!completed || !completionAcked || !peerEnded || hadError || buffer.length) {
+        failOnce(new VscodeEventChannelError('VSCODE_EVENT_CHANNEL_INCOMPLETE', 'VS Code event channel closed before its completion exchange drained'))
+      } else if (!failure) { completionClosed = true; completionResolve() }
+    })
     connection.on('data', chunk => {
       if (failure) return
       buffer += chunk
@@ -176,11 +182,15 @@ function createServer(options = {}) {
           if (exact(frame, ['type', 'sequence']) && frame.type === 'complete' && Number.isSafeInteger(frame.sequence) && frame.sequence === expected + 1) {
             expected = frame.sequence; completed = true
             void writeFrame(connection, { type: 'complete', sequence: expected }).then(() => {
-              // Completion is authoritative only after the acknowledgement
-              // has been flushed to this socket, so the owner drain cannot
-              // race the child's final protocol write.
-              completionResolve()
-              connection.end()
+              // A successful write only places the ACK in the kernel buffer.
+              // Wait for the client's FIN and a clean socket close before the
+              // transport may kill its owning GUI; otherwise that kill can
+              // reset this socket while the extension is still reading it.
+              completionAcked = true
+              if (!failure) completionCloseTimer = setTimeout(() => failOnce(new VscodeEventChannelError(
+                'VSCODE_EVENT_CHANNEL_INCOMPLETE', 'VS Code completion exchange did not close promptly')), CLOSE_TIMEOUT_MS)
+              // The client initiates FIN only after consuming the ACK. The
+              // default non-half-open server socket then closes its write side.
             }).catch(failOnce); continue
           }
           fail('VSCODE_EVENT_CHANNEL_INVALID', 'VS Code event channel frame violates its sequence')
@@ -203,7 +213,7 @@ function createServer(options = {}) {
     async ready() { await listening },
     assertComplete() {
       if (failure) throw failure
-      if (!completed) fail('VSCODE_EVENT_CHANNEL_INCOMPLETE', 'VS Code event channel did not complete')
+      if (!completionClosed) fail('VSCODE_EVENT_CHANNEL_INCOMPLETE', 'VS Code event channel did not complete and drain')
     },
     completion,
     retain() {
@@ -296,7 +306,10 @@ function connect(value) {
       await response
     } catch (error) { throw failClient(error) }
     sequence = next
-    if (type === 'complete') terminal = true
+    if (type === 'complete') {
+      terminal = true
+      socket.end()
+    }
   }
   const send = (type, event) => {
     const action = sendTail.then(() => dispatch(type, event))

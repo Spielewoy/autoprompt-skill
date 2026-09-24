@@ -13,6 +13,12 @@ const boundedText = (value, label) => {
   if (typeof value !== 'string' || !value || Buffer.byteLength(value) > 65536) fail('GROK_PROXY_INVALID', `Invalid ${label}`)
   return value
 }
+function inheritedListener(value, label, expectedPort) {
+  if (!object(value) || !Number.isSafeInteger(value.fd) || value.fd < 0 ||
+      !Number.isSafeInteger(value.port) || value.port < 1024 || value.port > 65535 ||
+      value.host !== '::1' || value.port !== expectedPort) fail('GROK_PROXY_CONFIG_INVALID', `Invalid inherited ${label} listener`)
+  return Object.freeze({ fd: value.fd, host: value.host, port: value.port })
+}
 
 const FIXED_META_TOOLS = Object.freeze([
   Object.freeze({ type: 'function', function: Object.freeze({ name: 'search_tool', description: 'Discover controller-owned MCP tools and their exact input schemas. This only searches the tool catalog; it does not search workspace files.', parameters: Object.freeze({ type: 'object', required: ['query'], properties: Object.freeze({ query: Object.freeze({ type: 'string', description: 'Keywords for the controller-owned tool catalog.' }), limit: Object.freeze({ type: 'integer', minimum: 1, maximum: 32, description: 'Maximum catalog results.' }) }), additionalProperties: false }) }) }),
@@ -170,6 +176,7 @@ function createModelProxy(options = {}) {
   const expectedModel = options.model === undefined ? null : boundedText(options.model, 'model')
   const upstreamTimeoutMs = options.upstreamTimeoutMs === undefined ? 60000 : options.upstreamTimeoutMs
   if (!Number.isSafeInteger(upstreamTimeoutMs) || upstreamTimeoutMs < 1000 || upstreamTimeoutMs > 300000) fail('GROK_PROXY_CONFIG_INVALID', 'Upstream timeout is invalid')
+  const inherited = options.inheritedListener == null ? null : inheritedListener(options.inheritedListener, 'model', options.inheritedListener.port)
   if (options.issuedCalls !== undefined && !Array.isArray(options.issuedCalls)) fail('GROK_PROXY_POLICY_INVALID', 'Issued call history is invalid')
   // The controller restores only records it previously captured from this
   // proxy's validated incoming events. A resumed Grok process never gets to
@@ -226,7 +233,25 @@ function createModelProxy(options = {}) {
     server,
     audit,
     issuedCalls() { return [...issued.values()].map(call => ({ ...call })) },
-    async listen(port = 0, host = '127.0.0.1') { await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => { server.off('error', reject); resolve() }) }); return server.address() },
+    async listen(port = 0, host = '127.0.0.1') {
+      if (inherited && (port !== inherited.port || host !== inherited.host)) fail('GROK_PROXY_CONFIG_INVALID', 'Inherited model listener address differs from its authenticated binding')
+      await new Promise((resolve, reject) => {
+        server.once('error', reject)
+        const done = () => {
+          server.off('error', reject)
+          const address = server.address()
+          if (!address || typeof address === 'string' || inherited && (address.address !== '::1' || address.family !== 'IPv6' || address.port !== inherited.port)) {
+            try { server.close() } catch {}
+            reject(new GrokProxyError('GROK_PROXY_CONFIG_INVALID', 'Inherited model listener is not the authenticated IPv6 endpoint'))
+            return
+          }
+          resolve()
+        }
+        if (inherited) server.listen({ fd: inherited.fd, exclusive: true }, done)
+        else server.listen(port, host, done)
+      })
+      return server.address()
+    },
     async close() { closed = true; for (const controller of inflight) controller.abort(); for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(() => resolve())) },
   }
 }

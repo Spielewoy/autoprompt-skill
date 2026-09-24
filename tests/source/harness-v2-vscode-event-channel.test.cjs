@@ -27,6 +27,7 @@ test('VS Code event channel synchronously acknowledges ordered events before com
   await client.emit({ type: 'owned.session', sessionId: 'vscode-owned-12345678-1234-1234-1234-123456789abc', contextKind: 'autoprompt-extension' })
   await client.emit({ type: 'owned.result', output: { ok: true } })
   await client.complete()
+  await f.server.completion
   f.server.assertComplete()
   assert.deepEqual(events.map(event => event.type), ['owned.session', 'owned.result'])
 })
@@ -46,6 +47,55 @@ test('VS Code completion wait resolves only after the authenticated completion a
   f.server.assertComplete()
 })
 
+for (const mode of ['clean-fin', 'held-open', 'partial-late-frame', 'complete-late-frame', 'peer-reset']) {
+  test(`VS Code completion drains the acknowledged socket: ${mode}`, { timeout: 5000 }, async t => {
+    const net = require('node:net')
+    let peer
+    if (mode === 'peer-reset') {
+      // resetAndDestroy is TCP-only; the production channel uses a Unix socket
+      // or named pipe. Inject its real ECONNRESET event after a real handshake
+      // rather than assume Socket.destroy() necessarily sends a reset.
+      const createServer = net.createServer
+      t.mock.method(net, 'createServer', listener => createServer(socket => { peer = socket; listener(socket) }))
+    }
+    const f = fixture(t)
+    await f.server.ready()
+    const socket = require('node:net').createConnection({ path: f.descriptor.endpoint, allowHalfOpen: true })
+    t.after(() => socket.destroy())
+    socket.on('error', () => {})
+    socket.setEncoding('utf8')
+    let buffer = '', receiver
+    socket.on('data', bytes => {
+      buffer += bytes
+      const index = buffer.indexOf('\n')
+      if (index >= 0 && receiver) {
+        const resolve = receiver; receiver = null
+        const line = buffer.slice(0, index); buffer = buffer.slice(index + 1)
+        resolve(JSON.parse(line))
+      }
+    })
+    const exchange = frame => new Promise(resolve => { receiver = resolve; socket.write(JSON.stringify(frame) + '\n') })
+    assert.equal((await exchange({ type: 'hello', token: f.descriptor.token,
+      sessionId: f.descriptor.sessionId, reservationId: f.descriptor.reservationId })).type, 'ready')
+    assert.equal((await exchange({ type: 'complete', sequence: 1 })).type, 'complete')
+    // The server has flushed the ACK, but this client has not ended its side.
+    // Stopping its process now was the real GUI completion/reset race.
+    assert.throws(() => f.server.assertComplete(), { code: 'VSCODE_EVENT_CHANNEL_INCOMPLETE' })
+    if (mode === 'clean-fin') {
+      socket.end()
+      await f.server.completion
+      f.server.assertComplete()
+    } else {
+      if (mode === 'peer-reset') peer.emit('error', Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }))
+      if (mode === 'partial-late-frame') socket.end('{')
+      if (mode === 'complete-late-frame') socket.end(JSON.stringify({ type: 'event', sequence: 2, event: { type: 'late' } }) + '\n')
+      await assert.rejects(f.server.completion, { code: mode === 'complete-late-frame'
+        ? 'VSCODE_EVENT_CHANNEL_INVALID' : mode === 'peer-reset' ? 'VSCODE_EVENT_CHANNEL_FAILED' : 'VSCODE_EVENT_CHANNEL_INCOMPLETE' })
+      assert.throws(() => f.server.assertComplete())
+    }
+  })
+}
+
 test('VS Code event channel round-trips a one MiB HarnessEventStream event', async t => {
   const events = []
   const f = fixture(t, raw => events.push(JSON.parse(raw)))
@@ -54,6 +104,7 @@ test('VS Code event channel round-trips a one MiB HarnessEventStream event', asy
   const payload = 'x'.repeat(1024 * 1024)
   await client.emit({ type: 'owned.result', output: payload })
   await client.complete()
+  await f.server.completion
   f.server.assertComplete()
   assert.equal(events.length, 1)
   assert.equal(events[0].output.length, payload.length)
@@ -98,6 +149,7 @@ test('VS Code event channel serializes concurrent sends and rejects a later send
     client.emit({ type: 'owned.result', output: { ok: true } }),
     client.complete(),
   ])
+  await f.server.completion
   await assert.rejects(client.emit({ type: 'owned.error', code: 'late', message: 'late' }), { code: 'VSCODE_EVENT_CHANNEL_INCOMPLETE' })
   f.server.assertComplete()
   assert.deepEqual(events.map(event => event.type), ['owned.session', 'owned.result'])

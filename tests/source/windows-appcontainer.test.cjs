@@ -106,7 +106,7 @@ function windowsModule(file, replacements = {}, directory, globals = {}) {
   } : null
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), {
     module, exports: module.exports, __dirname: directory || path.dirname(filename), Buffer, ...globals,
-    process: { platform: 'win32', arch: process.arch, pid: process.pid, execPath: process.execPath, versions: globals.versions || process.versions,
+    process: { platform: 'win32', arch: process.arch, pid: process.pid, execPath: process.execPath, release: globals.release || process.release, versions: globals.versions || process.versions,
       env: { SystemRoot: 'C:\\Windows', NODE_OPTIONS: '--require must-not-inherit', OPENAI_API_KEY: 'must-not-inherit', ...(globals.env || {}) } },
     require: name => Object.hasOwn(replacements, name) ? (name === './safe-run-root.js' ? { ensureWindowsDefaultTokenOwner() {}, windowsControllerEnvironment: () => ({ TEMP: require('node:os').tmpdir() }), ...replacements[name] } : replacements[name])
       : name === 'node:fs' && mappedFs ? mappedFs
@@ -346,6 +346,10 @@ test('Windows ACL audit resolves inbox PowerShell independently of the restricte
     assert.equal(options.env.PATH, path.win32.join('C:', 'Windows', 'System32'))
     assert.equal(options.env.USERPROFILE, windowsFixturePath(profile))
     assert.equal(options.env.NODE_OPTIONS, undefined)
+    const script = argv.at(-1)
+    assert.ok(script.indexOf("SetEnvironmentVariable('PSModulePath'") < script.indexOf('ConvertFrom-Json'))
+    assert.doesNotMatch(script, /Select-Object/)
+    for (const phase of ['parsed', 'enumerated', 'identity', 'dedupe']) assert.match(script, new RegExp(`AUTOPROMPT_ACL_AUDIT_PHASE=${phase}`))
     const sid = 'S-1-5-21-123', targets = JSON.parse(options.env.AUTOPROMPT_ACL_AUDIT_PATHS)
     return { status: 0, stdout: JSON.stringify({ currentName: 'user', currentSid: sid, items: targets.map(target => ({ path: target, owner: sid, ownerSid: sid, protected: true, rules: [{ identity: sid, sid, type: 'Allow' }] })) }), stderr: 'AUTOPROMPT_ACL_AUDIT_PHASE=targets\nAUTOPROMPT_ACL_AUDIT_PHASE=emit\n' }
   } } }, undefined, { userInfoHome: profile })
@@ -367,8 +371,60 @@ test('Windows ACL audit exposes only a fixed phase marker on bounded PowerShell 
     assert.equal(error.details.phase, 'get-acl')
     assert.equal(error.details.cause, 'ETIMEDOUT')
     assert.equal(error.details.stderr, 'Get-Acl: C:\\private\\secret')
+    assert.match(error.message, /phase=get-acl, status=none, cause=ETIMEDOUT/)
     return true
   })
+})
+
+test('Windows ACL audit rejects a caller-selected path replaced during the PowerShell query', t => {
+  const profile = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'audit-identity-')))
+  const target = path.join(profile, 'private'), held = path.join(profile, 'held')
+  fs.mkdirSync(target)
+  fs.mkdirSync(path.join(profile, 'AppData', 'Local', 'Temp'), { recursive: true })
+  fs.mkdirSync(path.join(profile, 'AppData', 'Roaming'), { recursive: true })
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
+  const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(executable, argv, options) {
+    fs.renameSync(target, held)
+    fs.mkdirSync(target)
+    const sid = 'S-1-5-21-123', audited = JSON.parse(options.env.AUTOPROMPT_ACL_AUDIT_PATHS)[0]
+    return { status: 0, stdout: JSON.stringify({ currentName: 'user', currentSid: sid, items: [{ path: audited, owner: sid, ownerSid: sid, protected: true, rules: [{ identity: sid, sid, type: 'Allow' }] }] }), stderr: '' }
+  } } }, undefined, { userInfoHome: profile })
+  assert.throws(() => safe.auditPrivatePermissions(windowsFixturePath(target), { recurse: false }), {
+    code: 'PRIVACY_VIOLATION',
+  })
+})
+
+test('Windows ACL audit batches independently protected physical roots without weakening either DACL', t => {
+  const profile = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'audit-batch-')))
+  const root = path.join(profile, 'root'), sibling = path.join(profile, 'sibling')
+  fs.mkdirSync(root); fs.mkdirSync(sibling)
+  fs.mkdirSync(path.join(profile, 'AppData', 'Local', 'Temp'), { recursive: true })
+  fs.mkdirSync(path.join(profile, 'AppData', 'Roaming'), { recursive: true })
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }))
+  let protectSibling = true, omitSibling = false, duplicateRoot = false, calls = 0
+  const safe = windowsModule('safe-run-root.js', { 'node:child_process': { spawnSync(executable, argv, options) {
+    calls++
+    const sid = 'S-1-5-21-123', selected = JSON.parse(options.env.AUTOPROMPT_ACL_AUDIT_PATHS)
+    const items = selected.map((selectedPath, index) => ({ path: selectedPath, owner: sid, ownerSid: sid,
+      protected: index === 0 || protectSibling, rules: [{ identity: sid, sid, type: 'Allow' }] }))
+    if (omitSibling) items.pop()
+    if (duplicateRoot) items.push({ ...items[0] })
+    return { status: 0, stdout: JSON.stringify({ currentName: 'user', currentSid: sid, items }), stderr: '' }
+  } } }, undefined, { userInfoHome: profile })
+  const rootPath = windowsFixturePath(root), siblingPath = windowsFixturePath(sibling)
+  const options = { recurse: false, additionalPaths: [siblingPath], requiredProtectedPaths: [rootPath, siblingPath] }
+  const accepted = safe.auditPrivatePermissions(rootPath, options)
+  assert.equal(accepted.valid, true); assert.equal(accepted.mechanism, 'windows-dacl'); assert.equal(accepted.paths, 2)
+  protectSibling = false
+  assert.throws(() => safe.auditPrivatePermissions(rootPath, options), { code: 'PRIVACY_VIOLATION' })
+  protectSibling = true; omitSibling = true
+  assert.throws(() => safe.auditPrivatePermissions(rootPath, options), { code: 'PRIVACY_UNSUPPORTED' })
+  omitSibling = false; duplicateRoot = true
+  assert.throws(() => safe.auditPrivatePermissions(rootPath, options), { code: 'PRIVACY_UNSUPPORTED' })
+  const before = calls
+  assert.throws(() => safe.auditPrivatePermissions(rootPath, { ...options, requiredProtectedPaths: [rootPath, rootPath] }), { code: 'PRIVACY_UNSUPPORTED' })
+  assert.throws(() => safe.auditPrivatePermissions(rootPath, { ...options, requiredProtectedPaths: [rootPath, windowsFixturePath(profile)] }), { code: 'PRIVACY_UNSUPPORTED' })
+  assert.equal(calls, before, 'invalid batch authority must refuse before PowerShell starts')
 })
 
 test('native Windows compiler staging ignores deep home and temp overrides', { skip: process.platform !== 'win32' }, () => {

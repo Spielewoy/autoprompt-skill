@@ -120,6 +120,8 @@ test('owned Codex proxy durably records a synchronous nested spawn refusal', t =
   }
   const requestPath = path.join(directory, 'request.json')
   fs.writeFileSync(requestPath, `${JSON.stringify(request)}\n`)
+  const foreignPhaseJournal = path.join(directory, 'proxy-phases.jsonl')
+  fs.writeFileSync(foreignPhaseJournal, 'foreign-phase-authority\n', { mode: 0o600 })
   const result = cp.spawnSync(process.execPath, ['--require', preload,
     path.join(WORKFLOW, 'phase-budget.js'), '--owned-codex-proxy', requestPath], {
     cwd: directory, encoding: 'utf8', timeout: 30_000,
@@ -147,6 +149,47 @@ test('owned Codex proxy durably records a synchronous nested spawn refusal', t =
   assert.equal(fs.readFileSync(request.stdoutPath, 'utf8'), '')
   assert.equal(fs.readFileSync(request.stderrPath, 'utf8'),
     `OWNED_CODEX_PROXY_FAILED:${JSON.stringify(status.error)}\n`)
+  assert.equal(fs.readFileSync(foreignPhaseJournal, 'utf8'), 'foreign-phase-authority\n',
+    'an unavailable diagnostic journal must neither overwrite foreign bytes nor change the primary refusal')
+})
+
+test('owned Codex proxy records fixed private phases through actual spawn and drain', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-owned-proxy-phases-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const executable = process.execPath
+  const argv = ['-e', "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('owned-proxy-complete\\n'))"]
+  const request = {
+    schemaVersion: 2,
+    activationId: 'phase-diagnostic-activation',
+    generationId: 2,
+    sequence: 1,
+    executable,
+    argv,
+    argvHash: crypto.createHash('sha256').update(JSON.stringify({ executable, argv })).digest('hex'),
+    cwd: directory,
+    stdin: 'bounded-input',
+    stdoutPath: path.join(directory, 'stdout.jsonl'),
+    stderrPath: path.join(directory, 'stderr.log'),
+    statusPath: path.join(directory, 'status.json'),
+  }
+  const requestPath = path.join(directory, 'request.json')
+  fs.writeFileSync(requestPath, `${JSON.stringify(request)}\n`, { mode: 0o600 })
+  const result = cp.spawnSync(process.execPath,
+    [path.join(WORKFLOW, 'phase-budget.js'), '--owned-codex-proxy', requestPath],
+    { cwd: directory, encoding: 'utf8', timeout: 30_000 })
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(fs.readFileSync(request.stdoutPath, 'utf8'), 'owned-proxy-complete\n')
+  assert.equal(JSON.parse(fs.readFileSync(request.statusPath, 'utf8')).code, 0)
+  const phasePath = path.join(directory, 'proxy-phases.jsonl'), phaseStat = fs.lstatSync(phasePath)
+  assert.equal(phaseStat.isFile(), true); assert.equal(phaseStat.isSymbolicLink(), false); assert.equal(phaseStat.nlink, 1)
+  if (process.platform !== 'win32') assert.equal(phaseStat.mode & 0o777, 0o600)
+  const records = fs.readFileSync(phasePath, 'utf8').trim().split(/\r?\n/u).map(JSON.parse)
+  assert.deepEqual(records.map(record => record.stage), [
+    'requestvalidated', 'outputopened', 'relayready', 'cwdbound', 'spawnrequested', 'spawned', 'stdinwritten', 'closed',
+  ])
+  assert.deepEqual(records.map(record => record.sequence), [1, 2, 3, 4, 5, 6, 7, 8])
+  for (const record of records) assert.deepEqual(Object.keys(record).sort(), ['schemaVersion', 'sequence', 'stage'])
 })
 
 test('owned Codex proxy publishes status only after inherited output closes and retains final usage', {

@@ -29,6 +29,10 @@ function normalizeIdentityPath(value) {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved
 }
 
+function windowsAclPathKey(value) {
+  return typeof value === 'string' && path.win32.isAbsolute(value) ? path.win32.resolve(value).toLowerCase() : null
+}
+
 function pathIsInside(parent, child) {
   const relative = path.relative(path.resolve(parent), path.resolve(child))
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
@@ -434,10 +438,15 @@ function windowsControllerEnvironment(systemRoot, temporary) {
   return { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '', USERPROFILE: profile.realpath, HOME: profile.realpath, HOMEDRIVE: parsed.root.slice(0, 2), HOMEPATH: profileHome.slice(2), APPDATA: roaming.realpath, LOCALAPPDATA: local.realpath, TEMP: temp.realpath, TMP: temp.realpath }
 }
 
-function validateWindowsAclSnapshot(snapshot) {
+function validateWindowsAclSnapshot(snapshot, options = {}) {
   if (!snapshot || typeof snapshot !== 'object' || !Array.isArray(snapshot.items) || !snapshot.currentName || !snapshot.currentSid) {
     throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit did not return a complete owner/rule snapshot')
   }
+  const expectedPaths = Array.isArray(options.expectedPaths) ? options.expectedPaths : null
+  const requiredProtectedPaths = Array.isArray(options.requiredProtectedPaths) ? options.requiredProtectedPaths : null
+  const seenPaths = new Set()
+  const expectedKeys = expectedPaths && new Set(expectedPaths.map(windowsAclPathKey))
+  const protectedKeys = requiredProtectedPaths && new Set(requiredProtectedPaths.map(windowsAclPathKey))
   const allowed = new Set([
     String(snapshot.currentName).toLowerCase(),
     String(snapshot.currentSid).toLowerCase(),
@@ -445,9 +454,15 @@ function validateWindowsAclSnapshot(snapshot) {
     's-1-5-18',
   ])
   for (const [index, item] of snapshot.items.entries()) {
-    // The first item is the audited run root. Its DACL must be protected;
-    // descendants may safely inherit only the allowlisted ACL from that root.
-    if (index === 0 && item.protected !== true) {
+    const itemKey = item && windowsAclPathKey(item.path)
+    if (!itemKey) {
+      throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit returned an invalid target path')
+    }
+    if (seenPaths.has(itemKey)) throw new RunRecordError('PRIVACY_UNSUPPORTED', `Windows ACL audit returned a duplicate target: ${item.path}`)
+    seenPaths.add(itemKey)
+    // Without an explicit independent-root set, preserve the original rule:
+    // the first item is protected and descendants may inherit its allowlist.
+    if ((protectedKeys ? protectedKeys.has(itemKey) : index === 0) && item.protected !== true) {
       throw new RunRecordError('PRIVACY_VIOLATION', `Private run-record path has an inherited or unprotected Windows DACL: ${item.path}`, {
         path: item.path,
         protected: item.protected === true,
@@ -466,6 +481,16 @@ function validateWindowsAclSnapshot(snapshot) {
           identity: rule.identity,
           inherited: Boolean(rule.inherited),
         })
+      }
+    }
+  }
+  if (expectedKeys) {
+    for (const [index, expectedPath] of expectedPaths.entries()) {
+      const expectedKey = windowsAclPathKey(expectedPath)
+      if (!seenPaths.has(expectedKey)) throw new RunRecordError('PRIVACY_UNSUPPORTED', `Windows ACL audit omitted a selected target: ${expectedPath}`)
+      if (index === 0 && (!snapshot.items[0] || typeof snapshot.items[0].path !== 'string'
+          || windowsAclPathKey(snapshot.items[0].path) !== expectedKey)) {
+        throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit did not return its selected root first')
       }
     }
   }
@@ -499,16 +524,55 @@ function auditPrivatePermissions(runPath, options = {}) {
     for (const privatePath of additional) visit(privatePath, false)
     return { valid: true, mechanism: 'posix-mode' }
   }
+  const inputPaths = [absolute, ...additional]
+  if (inputPaths.length > 256) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit selected too many explicit paths')
+  const inputKeys = new Set()
+  for (const inputPath of inputPaths) {
+    const key = normalizeIdentityPath(inputPath)
+    if (inputKeys.has(key)) throw new RunRecordError('PRIVACY_UNSUPPORTED', `Windows ACL audit selected a path more than once: ${inputPath}`)
+    inputKeys.add(key)
+  }
+  const requiredProtectedPaths = options.requiredProtectedPaths === undefined
+    ? [absolute]
+    : (() => {
+        if (!Array.isArray(options.requiredProtectedPaths) || options.requiredProtectedPaths.length < 1 || options.requiredProtectedPaths.length > 256) {
+          throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit requires a bounded protected-path list')
+        }
+        const resolved = options.requiredProtectedPaths.map(item => {
+          if (typeof item !== 'string' || item.includes('\0')) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit protected paths must be strings')
+          return path.resolve(item)
+        })
+        const keys = new Set()
+        for (const requiredPath of resolved) {
+          const key = normalizeIdentityPath(requiredPath)
+          if (keys.has(key) || !inputKeys.has(key)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit protected paths must be a unique subset of its selected paths')
+          keys.add(key)
+        }
+        if (!keys.has(normalizeIdentityPath(absolute))) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit root must remain independently protected')
+        return resolved
+      })()
+  // Bind every caller-selected path around the native ACL query. PowerShell
+  // checks the ACL reached by a pathname, so accepting its snapshot after a
+  // concurrent rename would authenticate a different filesystem object.
+  const inputBindings = inputPaths.map(inputPath => {
+    const inspected = inspectPathNoFollow(inputPath, { mustBeDirectory: false })
+    return { path: inputPath, exists: inspected.exists, realpath: inspected.realpath || null, identity: inspected.identity || null }
+  })
   const script = [
-    "$ErrorActionPreference='Stop';[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=targets');[Console]::Error.Flush()",
+    "$ErrorActionPreference='Stop';[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process);[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=targets');[Console]::Error.Flush()",
     '$inputPaths=@($env:AUTOPROMPT_ACL_AUDIT_PATHS|ConvertFrom-Json)',
+    "[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=parsed');[Console]::Error.Flush()",
     '$root=$inputPaths[0]',
     '$targets=@($root)',
     "if($env:AUTOPROMPT_ACL_AUDIT_RECURSE -eq '1'){$targets+=@(Get-ChildItem -LiteralPath $root -Force -Recurse | ForEach-Object { $_.FullName })}",
     'for($i=1;$i -lt $inputPaths.Count;$i++){if(Test-Path -LiteralPath $inputPaths[$i]){$targets+=$inputPaths[$i]}}',
+    "[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=enumerated');[Console]::Error.Flush()",
     '$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent()',
+    "[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=identity');[Console]::Error.Flush()",
     '$items=@()',
-    'foreach($p in ($targets | Select-Object -Unique)){',
+    '$seen=[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)',
+    "[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=dedupe');[Console]::Error.Flush()",
+    'foreach($p in $targets){if(!$seen.Add([string]$p)){continue}',
     '  [Console]::Error.WriteLine(\'AUTOPROMPT_ACL_AUDIT_PHASE=get-acl\');[Console]::Error.Flush()',
     '  $acl=Get-Acl -LiteralPath $p',
     '  [Console]::Error.WriteLine(\'AUTOPROMPT_ACL_AUDIT_PHASE=owner\');[Console]::Error.Flush()',
@@ -522,26 +586,40 @@ function auditPrivatePermissions(runPath, options = {}) {
     '[pscustomobject]@{currentName=$identity.Name;currentSid=$identity.User.Value;items=$items}|ConvertTo-Json -Compress -Depth 7',
   ].join(';')
   const environment = windowsPowerShellEnvironment({
-    AUTOPROMPT_ACL_AUDIT_PATHS: JSON.stringify([absolute, ...additional]),
+    AUTOPROMPT_ACL_AUDIT_PATHS: JSON.stringify(inputPaths),
     AUTOPROMPT_ACL_AUDIT_RECURSE: recurse ? '1' : '0',
   })
   const powershell = path.win32.join(environment.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
   const result = spawnSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], {
     encoding: 'utf8', windowsHide: true, timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'], env: environment,
   })
+  for (const before of inputBindings) {
+    const after = inspectPathNoFollow(before.path, { mustBeDirectory: false })
+    if (before.exists !== after.exists || (before.exists && (!sameIdentity(before.identity, after.identity)
+        || normalizeIdentityPath(before.realpath) !== normalizeIdentityPath(after.realpath)))) {
+      throw new RunRecordError('PRIVACY_VIOLATION', `Private Windows ACL audit target changed during validation: ${before.path}`, {
+        path: before.path,
+        expected: before.identity,
+        actual: after.identity || null,
+      })
+    }
+  }
   if (result.status !== 0) {
-    const marker = /^AUTOPROMPT_ACL_AUDIT_PHASE=(targets|get-acl|owner|rules|emit)$/
+    const marker = /^AUTOPROMPT_ACL_AUDIT_PHASE=(targets|parsed|enumerated|identity|dedupe|get-acl|owner|rules|emit)$/
     const phases = [], diagnostics = []
     for (const line of String(result.stderr || '').split(/\r?\n/)) {
       const match = marker.exec(line)
       if (match) phases.push(match[1]); else diagnostics.push(line)
     }
     const stderr = diagnostics.join('\n').trim()
-    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Cannot revalidate Windows run-record ACLs', { status: result.status, cause: result.error && result.error.code, phase: phases.at(-1) || null, stderr })
+    const phase = phases.at(-1) || 'startup'
+    const status = Number.isInteger(result.status) ? String(result.status) : 'none'
+    const cause = result.error && typeof result.error.code === 'string' && /^[A-Z0-9_]{1,40}$/u.test(result.error.code) ? result.error.code : 'none'
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', `Cannot revalidate Windows run-record ACLs (phase=${phase}, status=${status}, cause=${cause})`, { status: result.status, cause: result.error && result.error.code, phase, stderr })
   }
   let snapshot
   try { snapshot = JSON.parse(result.stdout) } catch { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit returned invalid JSON') }
-  return validateWindowsAclSnapshot(snapshot)
+  return validateWindowsAclSnapshot(snapshot, { expectedPaths: inputPaths, requiredProtectedPaths })
 }
 
 function ensureDirectoryNoFollow(directory, boundary) {

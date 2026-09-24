@@ -2,9 +2,13 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <launch.h>
+#include <libproc.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <spawn.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +19,35 @@
 
 static const char *MODEL_SOCKET = "autoprompt.model";
 static const char *MCP_SOCKET = "autoprompt.mcp";
+
+#define AP_PROC_PIDUNIQIDENTIFIERINFO 17
+#define AP_PROC_PIDCOALITIONINFO 20
+#define AP_COALITION_TYPE_RESOURCE 0
+#ifndef RENAME_EXCL
+#define RENAME_EXCL 0x00000004
+#endif
+
+struct ap_proc_uniqidentifierinfo {
+  uint8_t executable_uuid[16];
+  uint64_t unique_id;
+  uint64_t parent_unique_id;
+  int32_t pid_version;
+  uint32_t reserved2;
+  uint64_t reserved3;
+  uint64_t reserved4;
+};
+
+struct ap_proc_pidcoalitioninfo {
+  uint64_t coalition_id[2];
+  uint64_t reserved1;
+  uint64_t reserved2;
+  uint64_t reserved3;
+};
+
+_Static_assert(sizeof(struct ap_proc_uniqidentifierinfo) == 56,
+               "unexpected unique process info ABI");
+_Static_assert(sizeof(struct ap_proc_pidcoalitioninfo) == 40,
+               "unexpected coalition info ABI");
 
 static int parse_port(const char *text, in_port_t *port) {
   char *end = NULL;
@@ -104,6 +137,60 @@ static int write_all(int descriptor, const char *bytes, size_t length) {
   return 0;
 }
 
+/* Publish the launchd generation before acquiring a listener or consulting
+ * the started marker. A truncated record deliberately remains durable and is
+ * UNKNOWN to recovery; this function never unlinks or repairs evidence. */
+static int publish_generation(const char *directory, const char *request_hash) {
+  char canonical[PATH_MAX];
+  if (!realpath(directory, canonical) || strcmp(canonical, directory) != 0) return 86;
+  struct stat named;
+  if (lstat(directory, &named) || !S_ISDIR(named.st_mode) || named.st_uid != geteuid() ||
+      (named.st_mode & 077) != 0) return 86;
+  int directory_fd = open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  if (directory_fd < 0) return 86;
+  struct stat opened;
+  if (fstat(directory_fd, &opened) || opened.st_dev != named.st_dev || opened.st_ino != named.st_ino ||
+      !S_ISDIR(opened.st_mode) || opened.st_uid != geteuid() || (opened.st_mode & 077) != 0) {
+    close(directory_fd);
+    return 86;
+  }
+  struct ap_proc_uniqidentifierinfo unique;
+  struct ap_proc_pidcoalitioninfo coalitions;
+  memset(&unique, 0, sizeof(unique));
+  memset(&coalitions, 0, sizeof(coalitions));
+  pid_t pid = getpid();
+  if (proc_pidinfo(pid, AP_PROC_PIDUNIQIDENTIFIERINFO, 0, &unique, (int)sizeof(unique)) != (int)sizeof(unique) ||
+      proc_pidinfo(pid, AP_PROC_PIDCOALITIONINFO, 0, &coalitions, (int)sizeof(coalitions)) != (int)sizeof(coalitions) ||
+      coalitions.coalition_id[AP_COALITION_TYPE_RESOURCE] == 0) {
+    close(directory_fd);
+    return 87;
+  }
+  char name[96], temporary[104];
+  int name_length = snprintf(name, sizeof(name), "generation-%ld-%" PRId32 ".json", (long)pid, unique.pid_version);
+  int temporary_length = snprintf(temporary, sizeof(temporary), ".%s.tmp", name);
+  if (name_length < 1 || (size_t)name_length >= sizeof(name) || temporary_length < 1 ||
+      (size_t)temporary_length >= sizeof(temporary)) { close(directory_fd); return 88; }
+  int record_fd = openat(directory_fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  if (record_fd < 0) { close(directory_fd); return 88; }
+  struct stat record;
+  int status = 0;
+  if (fstat(record_fd, &record) || !S_ISREG(record.st_mode) || record.st_nlink != 1 ||
+      record.st_uid != geteuid() || (record.st_mode & 077) != 0) status = 89;
+  char value[512];
+  int value_length = snprintf(value, sizeof(value),
+      "{\"schemaVersion\":1,\"requestSha256\":\"%s\",\"pid\":%ld,\"uid\":%u,"
+      "\"pidVersion\":%" PRId32 ",\"resourceCoalitionId\":\"%" PRIu64 "\"}\n",
+      request_hash, (long)pid, (unsigned int)geteuid(), unique.pid_version,
+      coalitions.coalition_id[AP_COALITION_TYPE_RESOURCE]);
+  if (!status && (value_length < 1 || (size_t)value_length >= sizeof(value) ||
+      write_all(record_fd, value, (size_t)value_length) != 0 || fsync(record_fd) != 0)) status = 89;
+  if (close(record_fd) != 0) status = 89;
+  if (!status && renameatx_np(directory_fd, temporary, directory_fd, name, RENAME_EXCL) != 0) status = 89;
+  if (fsync(directory_fd) != 0) status = 89;
+  if (close(directory_fd) != 0) status = 89;
+  return status;
+}
+
 /* The marker is deliberately request-bound and published before spawn. A later
  * demand activation may retain launchd's sockets, but can never execute another
  * child for this reservation. */
@@ -171,7 +258,7 @@ static void hold_until_bootout(void) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 8 || argv[3][0] != '/' || argv[4][0] != '/' || argv[5][0] != '/' || argv[6][0] != '/' ||
+  if (argc != 9 || argv[3][0] != '/' || argv[4][0] != '/' || argv[5][0] != '/' || argv[6][0] != '/' || argv[8][0] != '/' ||
       strlen(argv[7]) != 64 || strspn(argv[7], "0123456789abcdef") != 64) return 64;
   in_port_t model_port, mcp_port;
   if (parse_port(argv[1], &model_port) || parse_port(argv[2], &mcp_port) || model_port == mcp_port) return 65;
@@ -179,8 +266,13 @@ int main(int argc, char **argv) {
   if (lstat(argv[3], &node_status) || !S_ISREG(node_status.st_mode) || access(argv[3], X_OK) != 0 ||
       lstat(argv[4], &script_status) || !S_ISREG(script_status.st_mode) ||
       lstat(argv[5], &request_status) || !S_ISREG(request_status.st_mode)) return 66;
+  int status = publish_generation(argv[8], argv[7]);
+  if (status) {
+    fprintf(stderr, "listener generation refused: %d\n", status);
+    return status;
+  }
   int model = -1, mcp = -1;
-  int status = acquire(MODEL_SOCKET, model_port, &model);
+  status = acquire(MODEL_SOCKET, model_port, &model);
   if (!status) status = acquire(MCP_SOCKET, mcp_port, &mcp);
   if (!status) status = publish_descriptors(model, mcp);
   else if (model >= 0) close(model);

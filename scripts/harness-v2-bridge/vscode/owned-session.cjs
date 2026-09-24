@@ -117,9 +117,17 @@ function activateOwned(context, vscode) {
   const request = JSON.parse(bytes)
   const connection = sanitize(request.connection)
   if (request.version !== 1 || !connection.model || !path.isAbsolute(request.sessionRoot || '') || !path.isAbsolute(request.targetPath || '') || !descriptorValid(request.eventChannel) || request.outputSchema !== undefined && (!connection.supportsStructuredOutput || !request.outputSchema || typeof request.outputSchema !== 'object' || Array.isArray(request.outputSchema))) fail('PROFILE_INVALID', 'Owned VS Code request is incomplete')
+  // Fixed non-protocol markers locate synchronous activation work in extension-host logs.
+  // They deliberately contain no request-derived values.
+  console.log('AUTOPROMPT_OWNED_SESSION_BEFORE_BOUNDARY_LOAD')
   const prepared = boundary.loadBoundary(request.policyPath, request.policySha256)
+  console.log('AUTOPROMPT_OWNED_SESSION_AFTER_BOUNDARY_LOAD')
+  console.log('AUTOPROMPT_OWNED_SESSION_BEFORE_CONTROLLED_LOAD')
   controlled.load(prepared, 'vscode')
+  console.log('AUTOPROMPT_OWNED_SESSION_AFTER_CONTROLLED_LOAD')
+  console.log('AUTOPROMPT_OWNED_SESSION_BEFORE_PROVIDER_REGISTER')
   const receipts = registerProvider(context, vscode, connection, request.outputSchema)
+  console.log('AUTOPROMPT_OWNED_SESSION_AFTER_PROVIDER_REGISTER')
   return { eventChannel: request.eventChannel, runOwnedSession: emit => runSession(vscode, request, connection, prepared, receipts, emit) }
 }
 async function runSession(vscode, request, connection, prepared, receipts, emit) {

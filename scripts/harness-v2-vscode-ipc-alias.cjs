@@ -81,12 +81,29 @@ function physicalDirectory(directory, label, requirePrivate = false) {
   const captured = identity(item, 'directory')
   if (typeof process.getuid === 'function' && captured.uid !== process.getuid()) fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} has a foreign owner`)
   if (requirePrivate) {
-    if (windows()) {
-      try { require('../agents/codex/workflow/safe-run-root.js').auditPrivatePermissions(directory, { recurse: false }) }
-      catch (error) { fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is not private`, { audit: boundedCause(error) }) }
-    } else if (captured.mode !== 0o700) fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is not private`)
+    if (!windows() && captured.mode !== 0o700) fail('VSCODE_IPC_ALIAS_UNSAFE', `${label} is not private`)
   }
   return captured
+}
+function auditWindowsPrivateRoots(paths) {
+  if (!windows()) return
+  const selected = []
+  for (const pathname of paths) {
+    if (typeof pathname !== 'string' || !path.isAbsolute(pathname) || pathname.includes('\0')) {
+      fail('VSCODE_IPC_ALIAS_INVALID', 'VS Code IPC private audit requires absolute physical directories')
+    }
+    if (!selected.some(current => samePath(current, pathname))) selected.push(pathname)
+  }
+  if (!selected.length) fail('VSCODE_IPC_ALIAS_INVALID', 'VS Code IPC private audit requires a directory')
+  try {
+    require('../agents/codex/workflow/safe-run-root.js').auditPrivatePermissions(selected[0], {
+      recurse: false,
+      additionalPaths: selected.slice(1),
+      requiredProtectedPaths: selected,
+    })
+  } catch (error) {
+    fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC roots are not private', { audit: boundedCause(error) })
+  }
 }
 function runtimeShortRoot(options) {
   if (process.platform === 'darwin') {
@@ -114,11 +131,14 @@ function establishShortRoot(root) {
   }
   return physicalDirectory(root, 'VS Code IPC short root', true)
 }
-function journalParent(journalPath) {
+function journalParent(journalPath, options = {}) {
   if (typeof journalPath !== 'string' || !path.isAbsolute(journalPath) || !samePath(path.resolve(journalPath), journalPath) || journalPath.includes('\0')) {
     fail('VSCODE_IPC_ALIAS_INVALID', 'VS Code IPC journal path must be absolute and canonical')
   }
-  physicalDirectory(path.dirname(journalPath), 'VS Code IPC journal parent', true)
+  const parent = path.dirname(journalPath)
+  const captured = physicalDirectory(parent, 'VS Code IPC journal parent', true)
+  if (options.audit !== false) auditWindowsPrivateRoots([parent])
+  return captured
 }
 function writeJournal(journalPath, record) {
   const body = { ...record }
@@ -220,9 +240,27 @@ function assertStaticIdentities(record) {
     fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC alias root or target changed identity')
   }
 }
+function assertPreparedRootIdentities(targetPath, targetIdentity, shortRoot, shortRootIdentity) {
+  const target = physicalDirectory(targetPath, 'VS Code IPC deep target', true)
+  const root = physicalDirectory(shortRoot, 'VS Code IPC short root', true)
+  if (!sameIdentity(targetIdentity, target) || !sameIdentity(shortRootIdentity, root)) {
+    fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC preparation root changed identity')
+  }
+}
 function cleanup(record, journalPath) {
   assertStaticIdentities(record)
-  const child = verifyDirectory(record.child.path, record.child.identity, 'VS Code IPC alias child', true)
+  let child = verifyDirectory(record.child.path, record.child.identity, 'VS Code IPC alias child', true)
+  // `issueBoundDrainReceipt` is asynchronous. Re-audit every extant physical
+  // root after that boundary and before any cleanup mutation; never audit `u`,
+  // which is intentionally a linked alias rather than a physical root.
+  auditWindowsPrivateRoots([
+    path.dirname(journalPath), record.target.path, record.shortRoot.path,
+    ...(child ? [record.child.path] : []),
+  ])
+  // The ACL helper binds its own lookup, while these rechecks bind the batch
+  // result back to the authenticated identities in the journal.
+  assertStaticIdentities(record)
+  child = verifyDirectory(record.child.path, record.child.identity, 'VS Code IPC alias child', true)
   if (!child) {
     for (const candidate of [record.link.path, record.link.tombstonePath]) {
       try { fs.lstatSync(candidate); fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC alias child disappeared with residual names') }
@@ -288,7 +326,10 @@ function handleFor(journalPath, processOwner, record, options) {
       if (current.child.identity && current.link.identity) cleanup(current, journalPath)
       else if (current.child.identity) {
         assertStaticIdentities(current)
-        const child = verifyDirectory(current.child.path, current.child.identity, 'VS Code IPC alias child')
+        verifyDirectory(current.child.path, current.child.identity, 'VS Code IPC alias child')
+        auditWindowsPrivateRoots([path.dirname(journalPath), current.target.path, current.shortRoot.path, current.child.path])
+        assertStaticIdentities(current)
+        verifyDirectory(current.child.path, current.child.identity, 'VS Code IPC alias child')
         if (fs.readdirSync(current.child.path).length) fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC alias allocation contains residue')
         fs.rmdirSync(current.child.path); current.state = 'CLEANED'; writeJournal(journalPath, current)
       } else { current.state = 'CLEANED'; writeJournal(journalPath, current) }
@@ -310,7 +351,7 @@ function handleFor(journalPath, processOwner, record, options) {
 function prepare(options = {}) {
   const processOwner = owner(options.processOwner)
   const binding = exactBinding(options.binding)
-  journalParent(options.journalPath)
+  journalParent(options.journalPath, { audit: false })
   if (typeof options.targetPath !== 'string' || !path.isAbsolute(options.targetPath) || !samePath(path.resolve(options.targetPath), options.targetPath) || options.targetPath.includes('\0')) {
     fail('VSCODE_IPC_ALIAS_INVALID', 'VS Code IPC deep target path must be absolute and canonical')
   }
@@ -318,6 +359,11 @@ function prepare(options = {}) {
   const targetIdentity = physicalDirectory(targetPath, 'VS Code IPC deep target', true)
   const shortRoot = runtimeShortRoot(options)
   const shortRootIdentity = establishShortRoot(shortRoot)
+  // These roots exist before the journal. Authenticate them together before
+  // recording any durable launch capability; the child is audited separately
+  // after it is created because it does not yet exist here.
+  auditWindowsPrivateRoots([path.dirname(options.journalPath), targetPath, shortRoot])
+  assertPreparedRootIdentities(targetPath, targetIdentity, shortRoot, shortRootIdentity)
   const childPath = path.join(shortRoot, sha256(stableStringify(binding)).slice(0, 32))
   const linkPath = path.join(childPath, 'u')
   const record = { schemaVersion: SCHEMA_VERSION, resourceType: resourceType(), binding,
@@ -332,6 +378,8 @@ function prepare(options = {}) {
     fs.mkdirSync(childPath, { mode: 0o700 })
     if (windows()) require('../agents/codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(childPath)
     record.child.identity = physicalDirectory(childPath, 'VS Code IPC alias child', true)
+    auditWindowsPrivateRoots([childPath])
+    verifyDirectory(childPath, record.child.identity, 'VS Code IPC alias child')
     record.state = 'ALLOCATED'; refreshLaunchBinding(record); writeJournal(options.journalPath, record)
     fs.symlinkSync(targetPath, linkPath, windows() ? 'junction' : 'dir')
     record.link.identity = identity(fs.lstatSync(linkPath, { bigint: true }), 'symlink')
@@ -348,6 +396,9 @@ function prepare(options = {}) {
     try {
       if (record.child.identity && record.link.identity) cleanup(record, options.journalPath)
       else if (record.child.identity) {
+        assertStaticIdentities(record)
+        verifyDirectory(record.child.path, record.child.identity, 'VS Code IPC alias child')
+        auditWindowsPrivateRoots([path.dirname(options.journalPath), record.target.path, record.shortRoot.path, record.child.path])
         assertStaticIdentities(record)
         verifyDirectory(record.child.path, record.child.identity, 'VS Code IPC alias child')
         if (fs.readdirSync(record.child.path).length) throw new Error('unowned residue')

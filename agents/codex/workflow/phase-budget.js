@@ -10309,6 +10309,56 @@ class OwnedCodexProxyRunner {
   }
 }
 
+const OWNED_PROXY_PHASE_BASENAME = 'proxy-phases.jsonl'
+const OWNED_PROXY_PHASE_LIMIT = 16
+const OWNED_PROXY_PHASES = new Set(['requestvalidated', 'outputopened', 'relayready', 'cwdbound', 'spawnrequested', 'spawned', 'stdinwritten', 'closed'])
+
+function createOwnedProxyPhaseJournal(requestPath) {
+  const journalPath = path.join(path.dirname(path.resolve(requestPath)), OWNED_PROXY_PHASE_BASENAME)
+  let identity = null
+  let size = 0
+  try {
+    const fd = fs.openSync(journalPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
+      (fs.constants.O_NOFOLLOW || 0), 0o600)
+    try {
+      const stat = fs.fstatSync(fd)
+      if (!stat.isFile() || stat.isSymbolicLink?.() || stat.nlink !== 1 ||
+          (process.platform !== 'win32' && (stat.mode & 0o777) !== 0o600)) return null
+      identity = { dev: String(stat.dev), ino: String(stat.ino) }
+    } finally { fs.closeSync(fd) }
+  } catch { return null }
+  let sequence = 0
+  return Object.freeze({
+    path: journalPath,
+    record(stage) {
+      if (!identity || sequence >= OWNED_PROXY_PHASE_LIMIT || !OWNED_PROXY_PHASES.has(stage)) return false
+      let fd
+      try {
+        const before = fs.lstatSync(journalPath)
+        if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 ||
+            (process.platform !== 'win32' && (before.mode & 0o777) !== 0o600) ||
+            String(before.dev) !== identity.dev || String(before.ino) !== identity.ino || before.size !== size) return false
+        fd = fs.openSync(journalPath, fs.constants.O_WRONLY | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW || 0))
+        const opened = fs.fstatSync(fd)
+        if (!opened.isFile() || opened.nlink !== 1 || String(opened.dev) !== identity.dev ||
+            String(opened.ino) !== identity.ino || opened.size !== size) return false
+        const bytes = Buffer.from(`${JSON.stringify({ schemaVersion: 1, sequence: sequence + 1, stage })}\n`, 'utf8')
+        let offset = 0
+        while (offset < bytes.length) {
+          const written = fs.writeSync(fd, bytes, offset, bytes.length - offset)
+          if (written <= 0) { identity = null; return false }
+          offset += written
+        }
+        fs.fsyncSync(fd)
+        size += bytes.length
+        sequence += 1
+        return true
+      } catch { identity = null; return false }
+      finally { if (fd !== undefined) { try { fs.closeSync(fd) } catch {} } }
+    },
+  })
+}
+
 async function runOwnedCodexProxy(requestPath) {
   const request = readRegularJson(requestPath, 'owned Codex proxy request').parsed
   if (request.schemaVersion !== 2 || typeof request.activationId !== 'string' || !request.activationId ||
@@ -10347,6 +10397,9 @@ async function runOwnedCodexProxy(requestPath) {
       throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy output escaped its control directory')
     }
   }
+  const phaseJournal = createOwnedProxyPhaseJournal(requestPath)
+  const recordPhase = stage => { try { phaseJournal?.record(stage) } catch {} }
+  recordPhase('requestvalidated')
   const proxyFailurePath = path.join(path.dirname(path.resolve(requestPath)), 'proxy-error.json')
   const writeProxyFailure = error => {
     const sourceFrames = String(error?.stack || '').split(/\r?\n/u)
@@ -10358,6 +10411,7 @@ async function runOwnedCodexProxy(requestPath) {
   }
   const stdoutHandle = fs.openSync(request.stdoutPath, 'wx', 0o600)
   const stderrHandle = fs.openSync(request.stderrPath, 'wx', 0o600)
+  recordPhase('outputopened')
   let child = null
   let settled = false
   let effectiveCwd = request.cwd
@@ -10372,6 +10426,7 @@ async function runOwnedCodexProxy(requestPath) {
   const finish = (code, signal, error = null) => {
     if (settled) return
     settled = true
+    recordPhase('closed')
     relay?.destroy()
     const failure = error ? boundedFailure(error) : null
     if (failure) {
@@ -10409,6 +10464,7 @@ async function runOwnedCodexProxy(requestPath) {
   }) : null } catch (error) {
     failBeforeChild(error)
   }
+  recordPhase('relayready')
   if (process.platform === 'win32') {
     try {
       if (!path.isAbsolute(request.cwd)) {
@@ -10435,6 +10491,8 @@ async function runOwnedCodexProxy(requestPath) {
       }
     } catch (error) { failBeforeChild(error) }
   }
+  recordPhase('cwdbound')
+  recordPhase('spawnrequested')
   try {
     child = childProcess.spawn(request.executable, request.argv, {
       cwd: effectiveCwd,
@@ -10444,6 +10502,7 @@ async function runOwnedCodexProxy(requestPath) {
       stdio: [relay || 'pipe', 'pipe', 'pipe'],
     })
   } catch (error) { failBeforeChild(error) }
+  child?.once?.('spawn', () => recordPhase('spawned'))
   if (!child || !child.stdout || !child.stderr || (!relay && !child.stdin)) {
     const error = new SupervisorIntegrationError('CODEX_PROXY_LAUNCH_INVALID', 'owned Codex proxy child lacks its required streams')
     if (!child) failBeforeChild(error)
@@ -10477,7 +10536,7 @@ async function runOwnedCodexProxy(requestPath) {
   child.once('close', (code, signal) => {
     try { finish(code, signal, childError) } catch (error) { writeProxyFailure(error); process.exitCode = 2 }
   })
-  if (!relay) child.stdin.end(request.stdin)
+  if (!relay) child.stdin.end(request.stdin, error => { if (!error) recordPhase('stdinwritten') })
 }
 
 async function withTimeout(

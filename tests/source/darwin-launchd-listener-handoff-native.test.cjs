@@ -10,6 +10,7 @@ const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '../..')
 const SOURCE = path.join(ROOT, 'tests/helpers/darwin-launchd-listener-handoff.c')
+const COALITION_SOURCE = path.join(ROOT, 'agents/codex/workflow/darwin-coalition-helper.c')
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 const stable = value => Array.isArray(value) ? `[${value.map(stable).join(',')}]` : value && typeof value === 'object'
   ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}` : JSON.stringify(value)
@@ -28,8 +29,54 @@ const bind = (port, expectBusy) => new Promise((resolve, reject) => {
   })
 })
 
-function plist({ label, wrapper, modelPort, mcpPort, node, script, requestPath, markerPath, requestHash, stdout, stderr }) {
-  const args = [wrapper, String(modelPort), String(mcpPort), node, script, requestPath, markerPath, requestHash]
+function readGenerationRecords(directory, requestSha256) {
+  const names = fs.readdirSync(directory).sort()
+  if (!names.length || names.length > 8) throw new Error('listener generation inventory is incomplete or excessive')
+  return names.map(name => {
+    if (!/^generation-[1-9][0-9]*--?[0-9]+\.json$/.test(name)) throw new Error('listener generation record name is invalid')
+    const file = path.join(directory, name), before = fs.lstatSync(file)
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size < 1 || before.size > 1024 ||
+        (process.platform !== 'win32' && (before.mode & 0o777) !== 0o600)) throw new Error('listener generation record identity is invalid')
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+    try {
+      const opened = fs.fstatSync(fd)
+      if (opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) throw new Error('listener generation record changed while opening')
+      const bytes = Buffer.alloc(opened.size)
+      if (fs.readSync(fd, bytes, 0, bytes.length, 0) !== bytes.length || fs.readSync(fd, Buffer.alloc(1), 0, 1, bytes.length) !== 0) throw new Error('listener generation record changed while reading')
+      const value = JSON.parse(bytes.toString('utf8'))
+      if (!value || Object.keys(value).sort().join(',') !== 'pid,pidVersion,requestSha256,resourceCoalitionId,schemaVersion,uid' ||
+          value.schemaVersion !== 1 || value.requestSha256 !== requestSha256 || !Number.isSafeInteger(value.pid) || value.pid < 1 ||
+          !Number.isSafeInteger(value.uid) || value.uid !== process.getuid() || !Number.isSafeInteger(value.pidVersion) ||
+          typeof value.resourceCoalitionId !== 'string' || !/^[1-9][0-9]*$/.test(value.resourceCoalitionId) ||
+          name !== `generation-${value.pid}-${value.pidVersion}.json`) throw new Error('listener generation record binding is invalid')
+      return value
+    } finally { fs.closeSync(fd) }
+  })
+}
+
+function inspect(helper, pid) {
+  const result = command(helper, ['inspect', String(pid)])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const value = JSON.parse(result.stdout)
+  assert.equal(value.schemaVersion, 1); assert.equal(value.ok, true); assert.equal(value.command, 'inspect'); assert.equal(value.pid, pid)
+  return value
+}
+
+function usage(helper, coalition) {
+  const result = command(helper, ['usage', coalition])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const value = JSON.parse(result.stdout)
+  assert.equal(value.schemaVersion, 1); assert.equal(value.ok, true); assert.equal(value.command, 'usage')
+  assert.equal(value.resourceCoalitionId, coalition)
+  assert.equal(typeof value.exists, 'boolean')
+  assert.match(value.tasksStarted, /^(?:0|[1-9][0-9]*)$/); assert.match(value.tasksExited, /^(?:0|[1-9][0-9]*)$/)
+  const started = BigInt(value.tasksStarted), exited = BigInt(value.tasksExited)
+  assert.ok(exited <= started, 'coalition usage counters underflow')
+  return { ...value, live: started - exited }
+}
+
+function plist({ label, wrapper, modelPort, mcpPort, node, script, requestPath, markerPath, requestHash, generationDirectory, stdout, stderr }) {
+  const args = [wrapper, String(modelPort), String(mcpPort), node, script, requestPath, markerPath, requestHash, generationDirectory]
   const socket = (name, port) => `<key>${name}</key><dict><key>SockNodeName</key><string>::1</string><key>SockServiceName</key><string>${port}</string><key>SockFamily</key><string>IPv6</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string></dict>`
   return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${xml(label)}</string><key>ProgramArguments</key><array>${args.map(value => `<string>${xml(value)}</string>`).join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/><key>LaunchOnlyOnce</key><false/><key>AbandonProcessGroup</key><false/><key>StandardOutPath</key><string>${xml(stdout)}</string><key>StandardErrorPath</key><string>${xml(stderr)}</string><key>Sockets</key><dict>${socket('autoprompt.model', modelPort)}${socket('autoprompt.mcp', mcpPort)}</dict></dict></plist>`
 }
@@ -37,9 +84,10 @@ function plist({ label, wrapper, modelPort, mcpPort, node, script, requestPath, 
 test('Darwin launchd wrapper hands two exact IPv6 listeners to fixed descriptors', { skip: process.platform !== 'darwin', timeout: 120000 }, async t => {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join('/private/tmp', 'ap-fd-handoff-')))
   fs.chmodSync(root, 0o700)
-  const wrapper = path.join(root, 'listener-handoff'), script = path.join(root, 'job.cjs'), requestPath = path.join(root, 'request.json')
+  const wrapper = path.join(root, 'listener-handoff'), coalitionHelper = path.join(root, 'coalition-helper'), script = path.join(root, 'job.cjs'), requestPath = path.join(root, 'request.json')
   const ready = path.join(root, 'ready.json'), startupMarker = path.join(root, 'startup-marker.json'), startupAttempts = path.join(root, 'startup-attempts.log'), startedMarker = path.join(root, 'started.marker')
-  const stdout = path.join(root, 'stdout.log'), stderr = path.join(root, 'stderr.log')
+  const stdout = path.join(root, 'stdout.log'), stderr = path.join(root, 'stderr.log'), generationDirectory = path.join(root, 'generations')
+  fs.mkdirSync(generationDirectory, { mode: 0o700 })
   const plistPath = path.join(root, 'job.plist'), domain = `gui/${process.getuid()}`
   const label = `com.autoprompt.listenerhandoff.${process.pid}.${crypto.randomBytes(6).toString('hex')}`
   let submitted = false
@@ -60,6 +108,8 @@ test('Darwin launchd wrapper hands two exact IPv6 listeners to fixed descriptors
   const sdk = command('/usr/bin/xcrun', ['--show-sdk-path']); assert.equal(sdk.status, 0, sdk.stderr)
   const build = command('/usr/bin/clang', ['-isysroot', sdk.stdout.trim(), '-mmacosx-version-min=13.5', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', SOURCE, '-o', wrapper])
   assert.equal(build.status, 0, build.stderr)
+  const helperBuild = command('/usr/bin/clang', ['-isysroot', sdk.stdout.trim(), '-mmacosx-version-min=13.5', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', COALITION_SOURCE, '-o', coalitionHelper])
+  assert.equal(helperBuild.status, 0, helperBuild.stderr)
   const node = fs.realpathSync.native(process.execPath)
   if (process.env.AUTOPROMPT_DARWIN_LISTENER_HANDOFF_EVIDENCE) {
     const evidencePath = path.resolve(process.env.AUTOPROMPT_DARWIN_LISTENER_HANDOFF_EVIDENCE)
@@ -67,7 +117,8 @@ test('Darwin launchd wrapper hands two exact IPv6 listeners to fixed descriptors
     fs.copyFileSync(wrapper, binaryPath, fs.constants.COPYFILE_EXCL)
     fs.writeFileSync(evidencePath, `${JSON.stringify({ schemaVersion: 1, platform: process.platform, architecture: process.arch,
       deploymentTarget: '13.5', sourceSha256: sha256(fs.readFileSync(SOURCE)), binarySha256: sha256(fs.readFileSync(binaryPath)),
-      node: { path: node, sha256: sha256(fs.readFileSync(node)) }, socketNames: ['autoprompt.model', 'autoprompt.mcp'], inheritedDescriptors: [3, 4] })}\n`, { flag: 'wx', mode: 0o600 })
+      node: { path: node, sha256: sha256(fs.readFileSync(node)) }, socketNames: ['autoprompt.model', 'autoprompt.mcp'], inheritedDescriptors: [3, 4],
+      generationRecord: { schemaVersion: 1, requestBound: true, fields: ['pid', 'uid', 'pidVersion', 'resourceCoalitionId'] } })}\n`, { flag: 'wx', mode: 0o600 })
   }
   const modelPort = await reservePort('::1'), mcpPort = await reservePort('::1')
   assert.notEqual(modelPort, mcpPort)
@@ -90,7 +141,7 @@ const servers=[]
 for(const key of ['model','mcp']){const item=request.sockets[key];if(item.name!=='autoprompt.'+key||item.fd!==(key==='model'?3:4)||item.host!=='::1')process.exit(66);const server=net.createServer(socket=>socket.end(key+'\n'));server.listen({fd:item.fd,exclusive:true});servers.push([key,item,server])}
 Promise.all(servers.map(([key,item,server])=>new Promise((resolve,reject)=>{server.once('error',reject);server.once('listening',()=>{const address=server.address();if(address.address!=='::1'||address.family!=='IPv6'||address.port!==item.port)return reject(new Error('listener mismatch'));resolve()})}))).then(()=>fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:process.pid,ports:servers.map(([,item])=>item.port)}),{flag:'wx',mode:0o600})).catch(error=>refuse(67,error.stack||error.message))
 `, { flag: 'wx', mode: 0o600 })
-  fs.writeFileSync(plistPath, plist({ label, wrapper, modelPort, mcpPort, node, script, requestPath, markerPath: startedMarker, requestHash: body.checksum, stdout, stderr }), { flag: 'wx', mode: 0o600 })
+  fs.writeFileSync(plistPath, plist({ label, wrapper, modelPort, mcpPort, node, script, requestPath, markerPath: startedMarker, requestHash: body.checksum, generationDirectory, stdout, stderr }), { flag: 'wx', mode: 0o600 })
   submitted = true
   const bootstrap = launchctl(['bootstrap', domain, plistPath]); assert.equal(bootstrap.status, 0, bootstrap.stderr)
   const receipt = await waitFor(() => fs.existsSync(ready) && JSON.parse(fs.readFileSync(ready, 'utf8')), 30000,
@@ -105,6 +156,16 @@ Promise.all(servers.map(([key,item,server])=>new Promise((resolve,reject)=>{serv
   assert.deepEqual(JSON.parse(fs.readFileSync(startupMarker, 'utf8')), { pid: receipt.pid, ppid: supervisorPid })
   assert.deepEqual(fs.readFileSync(startupAttempts, 'utf8').trim().split('\n'), [String(receipt.pid)])
   assert.equal(fs.readFileSync(startedMarker, 'utf8'), `v1\n${body.checksum}\n`)
+  let generations = readGenerationRecords(generationDirectory, body.checksum)
+  assert.equal(generations.length, 1)
+  const supervisorGeneration = generations.find(item => item.pid === supervisorPid)
+  assert.ok(supervisorGeneration, 'supervisor generation was not durably published')
+  const supervisorInspection = inspect(coalitionHelper, supervisorPid)
+  assert.equal(supervisorGeneration.uid, supervisorInspection.uid)
+  assert.equal(supervisorGeneration.pidVersion, supervisorInspection.pidVersion)
+  assert.equal(supervisorGeneration.resourceCoalitionId, supervisorInspection.resourceCoalitionId)
+  assert.equal(inspect(coalitionHelper, receipt.pid).resourceCoalitionId, supervisorGeneration.resourceCoalitionId,
+    'Node worker must remain inside the recorded supervisor coalition')
   process.kill(receipt.pid, 'SIGKILL')
   await waitFor(() => command('/bin/kill', ['-0', String(receipt.pid)]).status !== 0, 10000, 'launchd listener root survived SIGKILL')
   await waitFor(() => fs.readFileSync(stdout, 'utf8').includes(`CHILD_REAPED:${receipt.pid}`), 10000, 'supervisor did not reap the killed Node child')
@@ -128,10 +189,26 @@ Promise.all(servers.map(([key,item,server])=>new Promise((resolve,reject)=>{serv
   assert.deepEqual(fs.readFileSync(startupAttempts, 'utf8').trim().split('\n'), [String(receipt.pid)],
     `marker guard admitted another worker after socket activity: ${JSON.stringify(triggered)}`)
   assert.deepEqual(JSON.parse(fs.readFileSync(startupMarker, 'utf8')), { pid: receipt.pid, ppid: supervisorPid })
+  generations = readGenerationRecords(generationDirectory, body.checksum)
+  assert.equal(generations.length, 2)
+  const guardGeneration = generations.find(item => item.pid === guardPid)
+  assert.ok(guardGeneration, 'marker guard generation was not durably published')
+  const guardInspection = inspect(coalitionHelper, guardPid)
+  assert.equal(guardGeneration.uid, guardInspection.uid)
+  assert.equal(guardGeneration.pidVersion, guardInspection.pidVersion)
+  assert.equal(guardGeneration.resourceCoalitionId, guardInspection.resourceCoalitionId)
+  assert.notEqual(guardGeneration.resourceCoalitionId, supervisorGeneration.resourceCoalitionId,
+    'restarted launchd guard must have a separately recorded native coalition')
   const bootout = launchctl(['bootout', `${domain}/${label}`]); assert.equal(bootout.status, 0, bootout.stderr)
   await waitFor(() => command('/bin/kill', ['-0', String(guardPid)]).status !== 0, 10000, 'exact bootout did not terminate the marker guard')
   await waitFor(() => { const absent = launchctl(['print', `${domain}/${label}`]); return absent.status === 113 && /Could not find service/.test(absent.stderr) }, 10000,
     'launchd listener service remained after exact bootout')
+  for (const generation of [supervisorGeneration, guardGeneration]) {
+    await waitFor(() => {
+      const state = usage(coalitionHelper, generation.resourceCoalitionId)
+      return state.live === 0n && state
+    }, 10000, `generation coalition ${generation.resourceCoalitionId} retained live tasks after exact bootout`)
+  }
   submitted = false
   // Service absence and guard death precede asynchronous socket retirement;
   // accepted connections can also leave TCP TIME_WAIT state. Require both
@@ -161,5 +238,24 @@ test('Darwin listener handoff source fixes socket keys and publishes only FD3 an
   assert.match(source, /posix_spawn_file_actions_addinherit_np\(&actions, descriptor\)/)
   assert.match(source, /started_marker/)
   assert.match(source, /GUARD_PID/)
-  assert.match(plist({ label: 'com.autoprompt.test', wrapper: '/private/w', modelPort: 1, mcpPort: 2, node: '/private/n', script: '/private/s', requestPath: '/private/r', markerPath: '/private/m', requestHash: 'a'.repeat(64), stdout: '/private/o', stderr: '/private/e' }), /<key>LaunchOnlyOnce<\/key><false\/>/)
+  assert.match(source, /publish_generation\(argv\[8\], argv\[7\]\)/)
+  assert.ok(source.indexOf('publish_generation(argv[8], argv[7])') < source.indexOf('acquire(MODEL_SOCKET'),
+    'generation authority must be durable before launchd listener activation')
+  assert.match(plist({ label: 'com.autoprompt.test', wrapper: '/private/w', modelPort: 1, mcpPort: 2, node: '/private/n', script: '/private/s', requestPath: '/private/r', markerPath: '/private/m', requestHash: 'a'.repeat(64), generationDirectory: '/private/g', stdout: '/private/o', stderr: '/private/e' }), /<key>LaunchOnlyOnce<\/key><false\/>/)
+})
+
+test('listener generation inventory rejects truncated and foreign request records', { skip: process.platform === 'win32' }, t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-listener-generation-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  if (process.platform !== 'win32') fs.chmodSync(root, 0o700)
+  const requestSha = 'a'.repeat(64), name = 'generation-41-7.json', file = path.join(root, name)
+  fs.writeFileSync(file, '{', { flag: 'wx', mode: 0o600 })
+  assert.throws(() => readGenerationRecords(root, requestSha))
+  fs.unlinkSync(file)
+  fs.writeFileSync(file, `${JSON.stringify({ schemaVersion: 1, requestSha256: 'b'.repeat(64), pid: 41, uid: process.getuid(),
+    pidVersion: 7, resourceCoalitionId: '91' })}\n`, { flag: 'wx', mode: 0o600 })
+  assert.throws(() => readGenerationRecords(root, requestSha), /binding is invalid/)
+  fs.unlinkSync(file)
+  fs.writeFileSync(path.join(root, '.generation-41-7.json.tmp'), '{', { flag: 'wx', mode: 0o600 })
+  assert.throws(() => readGenerationRecords(root, requestSha), /record name is invalid/)
 })

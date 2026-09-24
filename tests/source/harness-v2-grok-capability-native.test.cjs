@@ -170,7 +170,13 @@ async function scenario(t, setup) {
   const f = fixture(), read = path.join(f.target, 'input.txt'), secret = path.join(f.controller, 'private.txt'), marker = `grok-native-capability-${crypto.randomUUID()}`
   fs.writeFileSync(read, `${marker}\n`, { mode: 0o600 }); fs.writeFileSync(secret, 'PRIVATE_CONTROLLER_MUST_NOT_BE_VISIBLE', { mode: 0o600 }); fs.writeFileSync(path.join(f.target, 'AGENTS.md'), 'AMBIENT_PROJECT_INSTRUCTIONS_MUST_NOT_AUTOLOAD', { mode: 0o600 })
   const calls = typeof setup?.calls === 'function' ? setup.calls({ ...f, read, secret, marker, scratch: scratchFor(f) }) : Array.isArray(setup?.calls) ? setup.calls : []
-  const service = await modelService(calls, { holdFinal: setup?.holdFinal === true, includeThought: setup?.includeThought === true }), binding = native.probeExecutable({ provider: 'grok', executable: CLI })
+  const service = await modelService(calls, { holdFinal: setup?.holdFinal === true, includeThought: setup?.includeThought === true })
+  // Startup can fail before the full owner cleanup is registered (for example
+  // an ACL audit). Retire the already-listening model server in that case so
+  // a failed probe cannot keep the test process alive until the CI job limit.
+  let ownerCleanupRegistered = false
+  t.after(async () => { if (!ownerCleanupRegistered) await service.close() })
+  const binding = native.probeExecutable({ provider: 'grok', executable: CLI })
   const registryPath = ownershipRegistry(f), processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath)), owner = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10, startupTimeoutMs: 10000 })
   const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'grok-closed-native-canary', pollMs: 10 })
@@ -205,6 +211,7 @@ async function scenario(t, setup) {
       await owner.assertDrained()
     }, close: () => service.close() })
   })
+  ownerCleanupRegistered = true
   return { ...f, read, secret, marker, calls, service, binding, processAdapter, owner, runner, adapter, run }
 }
 function good(result) { assert.equal(result.ok, true); assert.match(result.contextId, /^[A-Za-z0-9_.:-]{1,256}$/); assert.ok(result.transportEvidence.eventCount > 0); assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/) }

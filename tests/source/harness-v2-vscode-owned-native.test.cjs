@@ -39,7 +39,7 @@ function boundedHostLog(file) {
     const bytes = fs.readFileSync(file)
     const tail = bytes.subarray(Math.max(0, bytes.length - 128 * 1024)).toString('utf8')
     const lines = tail.split(/\r?\n/).filter(line =>
-      /AUTOPROMPT_SESSION_DRIVER|AUTOPROMPT_EVENT|Extension host test runner|Test runner|Eager extensions activated|\[(?:error|warn)\]|(?:^|\s)Error:/.test(line))
+      /AUTOPROMPT_SESSION_DRIVER|AUTOPROMPT_OWNED_SESSION|AUTOPROMPT_EVENT|Extension host test runner|Test runner|Eager extensions activated|\[(?:error|warn)\]|(?:^|\s)Error:/.test(line))
       .slice(-64)
       .map(line => line.slice(0, 1024))
     return lines.length ? lines : null

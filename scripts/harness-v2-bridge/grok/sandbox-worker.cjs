@@ -34,6 +34,12 @@ const admitted = (environment, name) => {
   if (typeof result !== 'string' || !result) throw new Error(`Missing admitted worker environment ${name}`)
   return result
 }
+function inheritedListener(environment, name, expectedFd, port) {
+  const raw = environment?.[name]
+  if (raw === undefined) return null
+  if (!/^\d+$/u.test(raw) || Number(raw) !== expectedFd || !Number.isSafeInteger(port) || port < 1024 || port > 65535) throw new Error(`Invalid inherited ${name}`)
+  return Object.freeze({ fd: expectedFd, host: '::1', port })
+}
 function childEnvironment(platform, environment) {
   const base = {
     HOME: admitted(environment, 'HOME'), GROK_HOME: admitted(environment, 'GROK_HOME'),
@@ -107,9 +113,18 @@ async function runWorker(options) {
   const cleanup = options.cleanup || resourceCleanup({ ...options, get child() { return child } })
   let primary = null
   try {
+    const inheritedProxy = options.inheritedListeners?.proxy || null
+    const inheritedMcp = options.inheritedListeners?.mcp || null
+    if (inheritedProxy || inheritedMcp) {
+      const valid = (value, fd, port) => value && Object.keys(value).sort().join(',') === 'fd,host,port' &&
+        value.fd === fd && value.host === '::1' && value.port === port && Number.isSafeInteger(port) && port >= 1024 && port <= 65535
+      if (!valid(inheritedProxy, 3, options.proxyPort) || !valid(inheritedMcp, 4, options.mcpPort) || options.proxyPort === options.mcpPort) {
+        throw new Error('Grok inherited listeners must be an authenticated FD3/FD4 pair with distinct ports')
+      }
+    }
     await options.mcp.listen()
     if (options.isCancelled?.()) { const error = new Error('Grok sandbox worker was cancelled before child spawn'); error.code = 'CHILD_CANCELLED'; throw error }
-    const address = await options.proxy.listen(options.proxyPort, '127.0.0.1')
+    const address = await options.proxy.listen(options.proxyPort, options.inheritedListeners?.proxy ? '::1' : '127.0.0.1')
     if (!address || typeof address === 'string') throw new Error('Proxy did not bind a TCP endpoint')
     if (options.isCancelled?.()) { const error = new Error('Grok sandbox worker was cancelled before child spawn'); error.code = 'CHILD_CANCELLED'; throw error }
     const status = await spawnAndDrain({ ...options, env: childEnvironment(options.platform, options.environment), cleanup,
@@ -130,10 +145,16 @@ async function main() {
   try {
     const auditPath = process.env.AUTOPROMPT_GROK_AUDIT_PATH
     relay = createPreconnectedRelayClient({ fd: Number(value('AUTOPROMPT_GROK_RELAY_FD')), relayToken: value('AUTOPROMPT_GROK_RELAY_TOKEN') })
-    mcp = createMcpLoopbackServer({ port: Number(value('AUTOPROMPT_GROK_MCP_PORT')), forward: async line => relay.mcp({ line }) })
+    const proxyPort = Number(value('AUTOPROMPT_GROK_PROXY_PORT')), mcpPort = Number(value('AUTOPROMPT_GROK_MCP_PORT'))
+    const inheritedListeners = {
+      proxy: inheritedListener(process.env, 'AUTOPROMPT_GROK_PROXY_LISTENER_FD', 3, proxyPort),
+      mcp: inheritedListener(process.env, 'AUTOPROMPT_GROK_MCP_LISTENER_FD', 4, mcpPort),
+    }
+    mcp = createMcpLoopbackServer({ port: mcpPort, inheritedListener: inheritedListeners.mcp, forward: async line => relay.mcp({ line }) })
     proxy = createModelProxy({
       upstreamUrl: 'relay://controller/v1/chat/completions',
       upstreamAuthorization: `Bearer ${value('AUTOPROMPT_GROK_RELAY_TOKEN')}`,
+      inheritedListener: inheritedListeners.proxy,
       childToken: value('AUTOPROMPT_GROK_PROXY_TOKEN'), model: value('AUTOPROMPT_GROK_MODEL'),
       allowedMcpTools: allowedMcpTools(), issuedCalls: issuedCalls(), requireNativeRequestIdentity: true, fetchImpl: relay.fetch,
       onAudit: auditPath ? entry => fs.appendFileSync(auditPath, `${JSON.stringify(entry)}\n`, { mode: 0o600 }) : undefined,
@@ -141,7 +162,7 @@ async function main() {
     const args = process.argv.slice(2).filter(arg => arg !== '--')
     const status = await runWorker({
       spawn: cp.spawn, executable: value('AUTOPROMPT_GROK_EXECUTABLE'), args, cwd: value('AUTOPROMPT_GROK_CWD'),
-      platform: process.platform, environment: process.env, proxyPort: Number(value('AUTOPROMPT_GROK_PROXY_PORT')), relay, proxy, mcp, cleanup,
+      platform: process.platform, environment: process.env, proxyPort, mcpPort, inheritedListeners, relay, proxy, mcp, cleanup,
       isCancelled: () => cancellationRequested,
       onChild: (_child, terminate) => { stop = async () => { stopped = true; await terminate() } },
     })

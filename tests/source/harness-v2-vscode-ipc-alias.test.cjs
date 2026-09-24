@@ -30,6 +30,45 @@ const { prepare, recover } = loadAliasModule()
 const windowsAlias = WINDOWS ? require(aliasFilename) : null
 const aliasTest = (name, fn) => test(name, { skip: WINDOWS ? 'Darwin-only POSIX alias lifecycle' : false }, fn)
 
+function loadWindowsAliasForAudit(audits, localAppData) {
+  const localRequire = createRequire(aliasFilename)
+  const safe = require('../../agents/codex/workflow/safe-run-root.js')
+  const module = { exports: {} }
+  const windowsFs = { ...fs,
+    // Linux represents the test junction as a symlink; Windows removes an
+    // empty junction with rmdir. Keep this portability shim inside the VM.
+    rmdirSync(directory) {
+      try { return fs.rmdirSync(directory) }
+      catch (error) { if (error && error.code === 'ENOTDIR') return fs.unlinkSync(directory); throw error }
+    },
+  }
+  const windowsSafe = {
+    readFileNoFollow: safe.readFileNoFollow,
+    ensureWindowsPrivateAcl() {},
+    windowsControllerEnvironment() { return { LOCALAPPDATA: localAppData } },
+    auditPrivatePermissions(root, options) {
+      audits.push({ root, options })
+      audits.onAudit?.(root, options, audits.length)
+      return { valid: true, mechanism: 'windows-dacl', paths: 1 + options.additionalPaths.length }
+    },
+  }
+  const unitProcess = new Proxy(process, { get(target, property) {
+    if (property === 'platform') return 'win32'
+    if (property === 'env') return { SystemRoot: 'C:\\Windows' }
+    return Reflect.get(target, property)
+  } })
+  vm.runInNewContext(fs.readFileSync(aliasFilename, 'utf8'), {
+    module, exports: module.exports, Buffer, process: unitProcess,
+    __dirname: path.dirname(aliasFilename), __filename: aliasFilename,
+    require(name) {
+      if (name === '../agents/codex/workflow/safe-run-root.js') return windowsSafe
+      if (name === 'node:fs') return windowsFs
+      return localRequire(name)
+    },
+  }, { filename: 'windows-vscode-ipc-alias-audit-vm.cjs' })
+  return module.exports
+}
+
 const binding = Object.freeze({ reservationId: 'reservation-vscode-1', sessionId: 'session-vscode-1', targetKey: 'vscode-owned' })
 
 class FakeOwner {
@@ -66,6 +105,60 @@ function fixture(t, label = 'fixture') {
     options: { journalPath, targetPath: fs.realpathSync.native(target), binding, processOwner: owner, _testShortRoot: shortRoot } }
 }
 function journal(file) { return JSON.parse(fs.readFileSync(file, 'utf8')) }
+
+test('Windows alias batches only physical independent roots for each fresh audit transition', async t => {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'windows-vscode-ipc-audit-')))
+  const controllerProfile = path.join(base, 'controller-profile')
+  const target = path.join(base, 'deep-target')
+  const journalRoot = path.join(base, 'journal-root')
+  fs.mkdirSync(controllerProfile, { recursive: true, mode: 0o700 })
+  fs.mkdirSync(target, { recursive: true, mode: 0o700 })
+  fs.mkdirSync(journalRoot, { recursive: true, mode: 0o700 })
+  const audits = [], alias = loadWindowsAliasForAudit(audits, controllerProfile)
+  const owner = new FakeOwner()
+  const journalPath = path.join(journalRoot, 'vscode-ipc.json')
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  const resource = alias.prepare({ journalPath, targetPath: target, binding, processOwner: owner })
+  resource.markReservationEntered()
+  await resource.release()
+  const selected = entry => Array.from([entry.root, ...Array.from(entry.options.additionalPaths)])
+  assert.equal(audits.length, 5, 'prepare pre-roots, allocated child, then fresh journal/release audits')
+  for (const entry of audits) {
+    const paths = selected(entry)
+    assert.equal(entry.options.recurse, false)
+    assert.deepEqual(Array.from(entry.options.requiredProtectedPaths), paths)
+    assert.equal(new Set(paths.map(value => value.toLowerCase())).size, paths.length)
+    assert.equal(paths.some(value => value.endsWith(path.sep + 'u')), false, 'linked user-data alias is never an ACL-audit input')
+  }
+  const shortRoot = path.join(controllerProfile, 'ap-vsc')
+  const child = path.dirname(resource.userDataDir)
+  assert.deepEqual(selected(audits[0]), [journalRoot, target, shortRoot])
+  assert.deepEqual(selected(audits[1]), [child])
+  assert.deepEqual(selected(audits[2]), [journalRoot])
+  assert.deepEqual(selected(audits[3]), [journalRoot])
+  assert.deepEqual(selected(audits[4]), [journalRoot, target, shortRoot, child])
+})
+
+test('Windows alias binds a fresh root batch back to the captured target identity', t => {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'windows-vscode-ipc-race-')))
+  const controllerProfile = path.join(base, 'controller-profile')
+  const target = path.join(base, 'deep-target')
+  const journalRoot = path.join(base, 'journal-root')
+  fs.mkdirSync(controllerProfile, { recursive: true, mode: 0o700 })
+  fs.mkdirSync(target, { recursive: true, mode: 0o700 })
+  fs.mkdirSync(journalRoot, { recursive: true, mode: 0o700 })
+  const audits = []
+  audits.onAudit = (_root, _options, call) => {
+    if (call !== 1) return
+    fs.renameSync(target, `${target}-replaced`)
+    fs.mkdirSync(target, { mode: 0o700 })
+  }
+  const alias = loadWindowsAliasForAudit(audits, controllerProfile)
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  assert.throws(() => alias.prepare({ journalPath: path.join(journalRoot, 'vscode-ipc.json'), targetPath: target, binding, processOwner: new FakeOwner() }), {
+    code: 'VSCODE_IPC_ALIAS_UNSAFE',
+  })
+})
 
 aliasTest('deep VS Code storage receives a short private alias with immutable launch binding', async t => {
   const f = fixture(t, 'short')

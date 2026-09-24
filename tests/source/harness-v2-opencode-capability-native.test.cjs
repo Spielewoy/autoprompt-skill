@@ -99,14 +99,26 @@ function privateProxyDiagnostics(root) {
       if (result.length >= 8) return
       const file = path.join(directory, entry.name)
       if (entry.isDirectory()) { visit(file); continue }
-      if (!/^(?:request\.json|status\.json|proxy-error\.json|stderr(?:\.log|\.jsonl)?)$/u.test(entry.name)) continue
+      if (!/^(?:request\.json|status\.json|proxy-error\.json|proxy-phases\.jsonl|stderr(?:\.log|\.jsonl)?)$/u.test(entry.name)) continue
       try {
         const stat = fs.lstatSync(file)
-        if (!stat.isFile() || stat.isSymbolicLink()) continue
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) continue
         if (entry.name === 'request.json') result.push({ name: path.relative(root, file).replaceAll(path.sep, '/'), exists: true, bytes: stat.size })
         else {
           let summary = { name: path.relative(root, file).replaceAll(path.sep, '/'), bytes: stat.size }
           if (entry.name === 'stderr.log' || entry.name === 'stderr.jsonl') summary = { ...summary, ...boundedText(file, stat.size) }
+          else if (entry.name === 'proxy-phases.jsonl') {
+            if (stat.size > DIAGNOSTIC_FILE_LIMIT) continue
+            const allowed = new Set(['requestvalidated', 'outputopened', 'relayready', 'cwdbound', 'spawnrequested', 'spawned', 'stdinwritten', 'closed'])
+            const phases = fs.readFileSync(file, 'utf8').trim().split(/\r?\n/u).filter(Boolean).slice(0, 16).map((line, index) => {
+              try {
+                const value = JSON.parse(line)
+                return value?.schemaVersion === 1 && Object.keys(value).sort().join(',') === 'schemaVersion,sequence,stage' &&
+                  value.sequence === index + 1 && allowed.has(value.stage) ? value.stage : 'invalid'
+              } catch { return 'invalid' }
+            })
+            summary = { ...summary, phases }
+          }
           else {
             if (stat.size > DIAGNOSTIC_FILE_LIMIT) continue
             const text = fs.readFileSync(file, 'utf8')
@@ -137,6 +149,7 @@ test('OpenCode fixture diagnostics expose bounded proxy and owner state without 
   fs.writeFileSync(path.join(session, 'request.json'), JSON.stringify({ secret: 'must-not-be-read' }))
   fs.writeFileSync(path.join(session, 'status.json'), JSON.stringify({ code: 'CHILD_RUNTIME_FAILURE', status: 'FAILED', signal: 'SIGTERM', error: { code: 'EACCES', message: 'private' } }))
   fs.writeFileSync(path.join(session, 'proxy-error.json'), JSON.stringify({ code: 'PROXY_FAILED', error: { code: 'EPIPE' } }))
+  fs.writeFileSync(path.join(session, 'proxy-phases.jsonl'), '{"schemaVersion":1,"sequence":1,"stage":"requestvalidated"}\n{"schemaVersion":1,"sequence":2,"stage":"spawned"}\n')
   fs.writeFileSync(path.join(session, 'stderr.log'), 'Bearer local-test-secret\nOPENAI_API_KEY=runtime-secret\nstartup failed\n')
   const diagnostic = privateProxyDiagnostics(root)
   const request = diagnostic.find(item => item.name.endsWith('/request.json'))
@@ -144,6 +157,7 @@ test('OpenCode fixture diagnostics expose bounded proxy and owner state without 
   assert.equal(JSON.stringify(diagnostic).includes('must-not-be-read'), false)
   assert.equal(JSON.stringify(diagnostic).includes('runtime-secret'), false)
   assert.equal(diagnostic.some(item => item.name.endsWith('/stderr.log') && item.head.includes('startup failed')), true)
+  assert.deepEqual(diagnostic.find(item => item.name.endsWith('/proxy-phases.jsonl')).phases, ['requestvalidated', 'spawned'])
   const registry = path.join(root, 'processes.json')
   fs.writeFileSync(registry, JSON.stringify({ records: [{ status: 'RUNNING', rootPid: 1234, groupIdentity: 'owned-group' }] }))
   assert.deepEqual(ownerRegistryDiagnostic(registry), { records: [{ status: 'RUNNING', rootPid: 1234, groupIdentity: 'owned-group' }] })
@@ -194,7 +208,12 @@ async function scenario(provider, options = {}) {
       f.nativeEvents = []; f.nativeStderr = ''
       const began = Date.now(); f.launchStages.push({ stage: 'runner.run', phase: 'started', elapsedMs: began - (f.launchStartedAt || began) })
       try {
-        const result = await ownedRun({ ...spec, onStdoutLine: line => {
+        // OpenCode v1.18.32's CLI reads these same variables for its supported
+        // --print-logs / --log-level flags. Keep startup diagnostics confined
+        // to the private fixture transcript, after environment isolation.
+        const diagnosticEnvironment = provider === 'opencode'
+          ? { ...spec.env, OPENCODE_PRINT_LOGS: '1', OPENCODE_LOG_LEVEL: 'DEBUG' } : spec.env
+        const result = await ownedRun({ ...spec, env: diagnosticEnvironment, onStdoutLine: line => {
           f.nativeEvents.push(String(line).slice(-8192))
           if (f.nativeEvents.length > 16) f.nativeEvents.shift()
           return spec.onStdoutLine?.(line)

@@ -21,6 +21,26 @@ const CLI = process.env.AUTOPROMPT_VSCODE_TEST_CLI
 const enabled = Boolean(CLI)
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 
+function ownedErrorDiagnostic(event) {
+  const code = /^[A-Z][A-Z0-9_]{0,63}$/.test(event?.code || '') ? event.code : 'CHILD_RUNTIME_FAILURE'
+  const message = String(event?.message || '')
+    .replace(/\b(?:[A-Z0-9_]*(?:KEY|TOKEN|SECRET)|AUTHORIZATION)\s*[=:]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu, '<redacted>')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{12,}/gu, 'Bearer <redacted>')
+    .replace(/[A-Za-z]:\\(?:[^\s:'"<>|?*]+\\?)+/gu, '<path>')
+    .replace(/(?:\/[^\s:'"<>]+){2,}/gu, '<path>')
+    .slice(0, 512)
+  return Object.freeze({ code, message })
+}
+
+test('VS Code fixture error diagnostic bounds and redacts owned error details', () => {
+  assert.deepEqual(ownedErrorDiagnostic({ code: 'PROFILE_INVALID', message: 'OPENAI_API_KEY=fixture-secret Bearer abcdefghijklmnop /private/controller/session.json' }), {
+    code: 'PROFILE_INVALID', message: '<redacted> Bearer <redacted> <path>',
+  })
+  assert.deepEqual(ownedErrorDiagnostic({ code: 'not-safe', message: 'x'.repeat(700) }), {
+    code: 'CHILD_RUNTIME_FAILURE', message: 'x'.repeat(512),
+  })
+})
+
 function sessionDriverDiagnostic(f, record) {
   // This is the one fixed journal location derived from the authenticated
   // owned-request parent. Do not walk the fixture tree or expose its paths.
@@ -103,7 +123,7 @@ async function scenario(t, options = {}) {
   f.execution.checkerScratchVerifier = record => record.checkerScratchBoundary || original?.(record)
   f.run = async (overrides = {}) => {
     const record = { ...f.record, ...overrides }
-    const failedTools = [], eventTypes = [], originalEvent = record.onEvent
+    const failedTools = [], eventTypes = [], ownedErrors = [], originalEvent = record.onEvent
     record.onEvent = (event, raw) => {
       if (typeof event?.type === 'string') {
         eventTypes.push(event.type.slice(0, 96))
@@ -112,6 +132,10 @@ async function scenario(t, options = {}) {
       if (event?.type === 'owned.tool.end' && event.error === true) {
         failedTools.push({ id: event.id, output: String(event.output || '').slice(0, 4096) })
         if (failedTools.length > 4) failedTools.shift()
+      }
+      if (event?.type === 'owned.error') {
+        ownedErrors.push(ownedErrorDiagnostic(event))
+        if (ownedErrors.length > 2) ownedErrors.shift()
       }
       originalEvent?.(event, raw)
     }
@@ -124,7 +148,7 @@ async function scenario(t, options = {}) {
       // The runner's durable transcript remains private under the fixture root.
       // Emit bounded raw bytes only for failed native probes, so CI can distinguish
       // a provider startup failure from a controller-side classification.
-      t.diagnostic(JSON.stringify({ vscodeNativeFailure: { code: error?.code || null, message: error?.message || String(error), failedTools, lastEventTypes: eventTypes, sessionDriver: sessionDriverDiagnostic(f, record), proxy: f.proxyDiagnostic() } }))
+      t.diagnostic(JSON.stringify({ vscodeNativeFailure: { code: error?.code || null, message: error?.message || String(error), failedTools, ownedErrors, lastEventTypes: eventTypes, sessionDriver: sessionDriverDiagnostic(f, record), proxy: f.proxyDiagnostic() } }))
       throw error
     }
   }
