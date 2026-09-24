@@ -150,9 +150,11 @@ Promise.all(servers.map(([key,item,server])=>new Promise((resolve,reject)=>{serv
   const receipt = await waitFor(() => fs.existsSync(ready) && JSON.parse(fs.readFileSync(ready, 'utf8')), 30000,
     () => `listener handoff did not become ready: ${fs.existsSync(stderr) ? fs.readFileSync(stderr, 'utf8').slice(-2048) : ''}`)
   assert.deepEqual(receipt.ports, [modelPort, mcpPort])
-  const supervisorMatch = /^SUPERVISOR_PID:([1-9][0-9]*)$/m.exec(fs.readFileSync(stdout, 'utf8'))
-  assert.ok(supervisorMatch, 'supervisor did not publish its stable root PID')
-  const supervisorPid = Number(supervisorMatch[1])
+  // Production authority is the request-bound generation record. The
+  // diagnostic wrapper additionally logs its PID, but production need not.
+  const initialGenerations = readGenerationRecords(generationDirectory, body.checksum)
+  assert.equal(initialGenerations.length, 1, 'supervisor must publish exactly one initial generation')
+  const supervisorPid = initialGenerations[0].pid
   assert.notEqual(supervisorPid, receipt.pid, 'Node child must not replace the launchd supervisor')
   assert.equal(await request(modelPort, 'model'), 'model\n')
   assert.equal(await request(mcpPort, 'mcp'), 'mcp\n')

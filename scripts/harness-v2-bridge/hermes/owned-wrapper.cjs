@@ -10,14 +10,19 @@ const db = path.join(spec.home, 'state.db')
 if (!path.isAbsolute(spec.toolProjectionPath || '')) throw new Error('Hermes tool projection path is invalid')
 const boundary = require('../../harness-v2-tool-boundary.cjs')
 const sql = `import json,sqlite3,sys
-p=sys.argv[1]; sid=sys.argv[2] if len(sys.argv)>2 else None
-c=sqlite3.connect('file:'+p+'?mode=ro',uri=True)
-ids=[r[0] for r in c.execute('select id from sessions order by started_at desc')]
-if sid is None and ids: sid=ids[0]
-r=c.execute('select input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,api_call_count,tool_call_count,estimated_cost_usd,actual_cost_usd,cost_status,cost_source from sessions where id=?',(sid,)).fetchone() if sid else None
-a=c.execute("select content from messages where session_id=? and role='assistant' and active=1 order by id desc limit 1",(sid,)).fetchone() if sid else None
-m=c.execute('select max(id) from messages where session_id=?',(sid,)).fetchone()[0] if sid else None
-print(json.dumps({'sessionId':sid,'sessionIds':ids,'usage':r,'answer':a[0] if a else None,'maxMessageId':m or 0}))`
+from pathlib import Path
+try:
+    p=Path(sys.argv[1]).resolve().as_uri()+'?mode=ro'; sid=sys.argv[2] if len(sys.argv)>2 else None
+    c=sqlite3.connect(p,uri=True)
+    ids=[r[0] for r in c.execute('select id from sessions order by started_at desc')]
+    if sid is None and ids: sid=ids[0]
+    r=c.execute('select input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,api_call_count,tool_call_count,estimated_cost_usd,actual_cost_usd,cost_status,cost_source from sessions where id=?',(sid,)).fetchone() if sid else None
+    a=c.execute("select content from messages where session_id=? and role='assistant' and active=1 order by id desc limit 1",(sid,)).fetchone() if sid else None
+    m=c.execute('select max(id) from messages where session_id=?',(sid,)).fetchone()[0] if sid else None
+    print(json.dumps({'sessionId':sid,'sessionIds':ids,'usage':r,'answer':a[0] if a else None,'maxMessageId':m or 0}))
+except sqlite3.Error as error:
+    print(json.dumps({'__autoprompt_sqlite_error__': {'class': type(error).__name__, 'code': getattr(error, 'sqlite_errorcode', None)}}))
+    raise SystemExit(17)`
 function validCounter(value, label) {
   if (!Number.isSafeInteger(value) || value < 0) throw new Error(`Hermes ${label} counter is invalid`)
 }
@@ -27,13 +32,32 @@ function validUsage(usage) {
   for (const index of [7, 8]) if (usage[index] !== null && (typeof usage[index] !== 'number' || !Number.isFinite(usage[index]) || usage[index] < 0)) throw new Error('Hermes cost journal value is invalid')
   for (const index of [9, 10]) if (usage[index] !== null && typeof usage[index] !== 'string') throw new Error('Hermes cost journal source is invalid')
 }
+function snapshotDiagnostic(result) {
+  let sqlite = null
+  const sqliteClasses = new Set(['DatabaseError', 'OperationalError', 'IntegrityError', 'ProgrammingError', 'InterfaceError', 'NotSupportedError', 'Warning', 'Error'])
+  try {
+    const value = JSON.parse(String(result.stdout || ''))
+    const candidate = value && value.__autoprompt_sqlite_error__
+    if (candidate && typeof candidate === 'object' && !Array.isArray(candidate) &&
+        sqliteClasses.has(candidate.class) &&
+        (candidate.code === null || (Number.isSafeInteger(candidate.code) && candidate.code >= 0 && candidate.code <= 0x7fffffff))) {
+      sqlite = { class: candidate.class, code: candidate.code }
+    }
+  } catch {}
+  return JSON.stringify({
+    status: result.status,
+    signal: result.signal,
+    errorCode: result.error?.code || null,
+    sqlite,
+  })
+}
 function snapshot(id) {
   if (!fs.existsSync(db)) {
     if (id) throw new Error('Hermes continuation session journal is missing')
     return { sessionId: null, sessionIds: [], usage: null, answer: null }
   }
   const r = cp.spawnSync(spec.pythonExecutable, ['-c', sql, db, ...(id ? [id] : [])], { encoding: 'utf8', timeout: 2000, maxBuffer: 1024 * 1024 })
-  if (r.error || r.status !== 0) throw new Error('Hermes SQLite journal snapshot failed')
+  if (r.error || r.status !== 0) throw new Error(`Hermes SQLite journal snapshot failed: ${snapshotDiagnostic(r)}`)
   let value
   try { value = JSON.parse(r.stdout) } catch { throw new Error('Hermes SQLite journal snapshot is invalid') }
   if (!Array.isArray(value.sessionIds) || !Number.isSafeInteger(value.maxMessageId) || value.maxMessageId < 0) throw new Error('Hermes SQLite session inventory is invalid')
@@ -46,12 +70,17 @@ function snapshot(id) {
 function messageSnapshot(sessionId, afterId) {
   if (!identity(sessionId) || !Number.isSafeInteger(afterId) || afterId < 0) throw new Error('Hermes message observer identity is invalid')
   const source = `import json,sqlite3,sys
-p,sid,after=sys.argv[1],sys.argv[2],int(sys.argv[3])
-c=sqlite3.connect('file:'+p+'?mode=ro',uri=True)
-r=c.execute("select id,role,content from messages where session_id=? and active=1 and role in ('assistant','tool') and id>? order by id asc",(sid,after)).fetchall()
-print(json.dumps(r))`
+from pathlib import Path
+try:
+    p,sid,after=Path(sys.argv[1]).resolve().as_uri()+'?mode=ro',sys.argv[2],int(sys.argv[3])
+    c=sqlite3.connect(p,uri=True)
+    r=c.execute("select id,role,content from messages where session_id=? and active=1 and role in ('assistant','tool') and id>? order by id asc",(sid,after)).fetchall()
+    print(json.dumps(r))
+except sqlite3.Error as error:
+    print(json.dumps({'__autoprompt_sqlite_error__': {'class': type(error).__name__, 'code': getattr(error, 'sqlite_errorcode', None)}}))
+    raise SystemExit(17)`
   const result = cp.spawnSync(spec.pythonExecutable, ['-c', source, db, sessionId, String(afterId)], { encoding: 'utf8', timeout: 2000, maxBuffer: 4 * 1024 * 1024 })
-  if (result.error || result.status !== 0) throw new Error('Hermes SQLite message observer failed')
+  if (result.error || result.status !== 0) throw new Error(`Hermes SQLite message observer failed: ${snapshotDiagnostic(result)}`)
   let rows; try { rows = JSON.parse(result.stdout) } catch { throw new Error('Hermes SQLite message observer is invalid') }
   if (!Array.isArray(rows) || rows.length > 1024) throw new Error('Hermes SQLite message observer is invalid')
   let last = afterId

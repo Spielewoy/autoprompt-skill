@@ -20,6 +20,10 @@ const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withCh
 
 const CLI = process.env.AUTOPROMPT_GROK_TEST_CLI
 const skip = !CLI || !fs.existsSync(CLI)
+// Windows prepares its AppContainer resource lease before the separately
+// bounded Job startup. Allow both production phases plus the model turn;
+// the POSIX fixture keeps its existing shorter execution bound.
+const launchTimeoutMs = process.platform === 'win32' ? 300000 : 90000
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 function exactCommand(prefix, values) { return withChallenge(nodeCommand(`process.stdout.write(${JSON.stringify(`${prefix}:${values.marker}`)})`), values.challenge) }
 
@@ -177,7 +181,7 @@ async function scenario(t, setup) {
   let ownerCleanupRegistered = false
   t.after(async () => { if (!ownerCleanupRegistered) await service.close() })
   const binding = native.probeExecutable({ provider: 'grok', executable: CLI })
-  const registryPath = ownershipRegistry(f), processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath)), owner = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10, startupTimeoutMs: 10000 })
+  const registryPath = ownershipRegistry(f), processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath)), owner = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
   const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'grok-closed-native-canary', pollMs: 10 })
   const adapter = new HarnessExecAdapter({ provider: 'grok', runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: { model: 'fixture/grok', environment: { GROK_BASE_URL: service.url } }, credentialEnvironment: { OPENROUTER_API_KEY: 'local-test-secret' }, rolePrompt: () => 'Use only controller-owned tools and return exactly one JSON object.', outputSchemaResolver: () => f.schema })
@@ -196,7 +200,7 @@ async function scenario(t, setup) {
     if (fixtureClosing) return Promise.reject(new Error('Grok fixture is closing'))
     const controller = new AbortController()
     launchControllers.add(controller)
-    const signals = [controller.signal, overrides.signal || AbortSignal.timeout(90000)]
+    const signals = [controller.signal, overrides.signal || AbortSignal.timeout(launchTimeoutMs)]
     const operation = launch({ ...overrides, signal: AbortSignal.any(signals) })
     activeLaunches.add(operation)
     operation.finally(() => { activeLaunches.delete(operation); launchControllers.delete(controller) }).catch(() => {})
@@ -216,7 +220,7 @@ async function scenario(t, setup) {
 }
 function good(result) { assert.equal(result.ok, true); assert.match(result.contextId, /^[A-Za-z0-9_.:-]{1,256}$/); assert.ok(result.transportEvidence.eventCount > 0); assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/) }
 
-const capabilityOptions = { skip, timeout: 120000 }
+const capabilityOptions = { skip, timeout: process.platform === 'win32' ? 420000 : 120000 }
 async function withWindowsLaunchDiagnostics(t, body) {
   if (process.platform !== 'win32') return body(t)
   // A cancelled prelaunch has no proxy stderr yet. Record the real preparation
@@ -346,7 +350,7 @@ capability('checker sees frozen candidate but writes only authenticated scratch'
   const checker = { schemaVersion: 1, capability: native.sha256('grok-closed-checker'), runId: 'grok-closed-checker', checkerId: 'grok-closed-native', candidateHash: native.sha256(`${checkerFixture.marker}\n`), frozenCandidateRoot: frozen, writableScratchRoot: scratch, temporaryRoot: path.join(scratch, 'tmp'), outputRoot: path.join(scratch, 'output'), cacheRoot: path.join(scratch, 'cache') }
   const record = { ...checkerFixture.record, logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', workingDirectory: scratch, canonicalTargetPath: frozen, candidateHash: checker.candidateHash, checkerScratchBoundary: checker, physicalExecutionPolicy: { logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', sandboxMode: 'read-only', canDispatch: false, resourceSets: { read: [], write: [], exclusive: [] } } }
   const adapter = new HarnessExecAdapter({ provider: 'grok', runner: checkerFixture.runner, nativeRoot: checkerFixture.nativeRoot, executableBinding: checkerFixture.binding, targetPath: scratch, connection: { model: 'fixture/grok', environment: { GROK_BASE_URL: checkerFixture.service.url } }, credentialEnvironment: { OPENROUTER_API_KEY: 'local-test-secret' }, rolePrompt: () => 'Use only controller checker tools.', outputSchemaResolver: () => checkerFixture.schema, checkerScratchVerifier: () => checker })
-  record.environment = prepareProcessLaunchEnvironment(checkerFixture.processAdapter, record.reservationId, nativeEnvironment()); record.signal = AbortSignal.timeout(90000); record.onUsageDelta = () => ({ continue: true })
+  record.environment = prepareProcessLaunchEnvironment(checkerFixture.processAdapter, record.reservationId, nativeEnvironment()); record.signal = AbortSignal.timeout(launchTimeoutMs); record.onUsageDelta = () => ({ continue: true })
   good(await adapter.launch(record)); assert.equal(fs.readFileSync(candidate, 'utf8'), `${checkerFixture.marker}\n`); assert.equal(fs.readFileSync(path.join(scratch, 'checker.txt'), 'utf8'), 'checked')
 })
 

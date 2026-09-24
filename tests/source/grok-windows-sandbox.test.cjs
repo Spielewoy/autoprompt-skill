@@ -21,6 +21,9 @@ function fixture(t, changes = {}, fixtureOptions = {}) {
   fs.writeFileSync(executable, 'grok'); fs.writeFileSync(node, 'node'); fs.writeFileSync(brokerNode, 'broker-node')
   const binding = { reservationId: 'reservation-1', sessionId: 'session-1', targetKey: 'grok' }
   const prestart = new WeakSet(), releases = [], recoveryCalls = []
+  const restoredPath = path.join(root, 'resources.json.restored')
+  const resourcePlan = { entries: [{}] }
+  const writeRestored = () => fs.writeFileSync(restoredPath, JSON.stringify({ schemaVersion: 1, leaseId: '1'.repeat(32), profileSid: 'S-1-15-2-1-2-3-4-5-6-7', result: { restored: 1, newEntries: 0, deletedEntries: 0 } }), { flag: fs.existsSync(restoredPath) ? 'w' : 'wx', mode: 0o600 })
   let prepareCalls = 0
   const makeOwner = () => {
     const receipts = new WeakSet()
@@ -44,18 +47,19 @@ function fixture(t, changes = {}, fixtureOptions = {}) {
   const resources = { async prepareWindowsAppContainerResources(options) {
     prepareCalls++
     verifier = options.verifyDrainEvidence
-    fs.writeFileSync(path.join(root, 'resources.json'), JSON.stringify({ schemaVersion: 1, leaseId: '1'.repeat(32), plan: { exact: true }, sha256: 'f'.repeat(64) }))
+    const journalBody = { schemaVersion: 1, leaseId: '1'.repeat(32), plan: resourcePlan }
+    fs.writeFileSync(path.join(root, 'resources.json'), JSON.stringify({ ...journalBody, sha256: hash(JSON.stringify(journalBody)) }))
     return Object.freeze({ profileName: 'Autoprompt_' + '1'.repeat(32), profileSid: 'S-1-15-2-1-2-3-4-5-6-7',
       environment: Object.freeze({ USERPROFILE: 'C:\\profile', HOME: 'C:\\profile', APPDATA: 'C:\\profile\\AppData\\Roaming', TEMP: 'C:\\scratch', TMP: 'C:\\scratch' }),
       recovery: Object.freeze({ journalPath: path.join(root, 'resources.json'), leaseId: '1'.repeat(32) }),
       async release(evidence) {
         if (!verifier(evidence, { profileSid: this.profileSid, leaseId: this.recovery.leaseId })) throw Object.assign(new Error('unconfirmed'), { code: 'APPCONTAINER_CLEANUP_UNCONFIRMED' })
-        releases.push(evidence)
+        releases.push(evidence); writeRestored()
       },
     })
   }, async recoverWindowsAppContainerResources(options) {
     if (!options.verifyDrainEvidence(options.evidence, { profileSid: 'S-1-15-2-1-2-3-4-5-6-7', leaseId: '1'.repeat(32) })) throw Object.assign(new Error('unconfirmed'), { code: 'APPCONTAINER_CLEANUP_UNCONFIRMED' })
-    recoveryCalls.push(options)
+    recoveryCalls.push(options); writeRestored()
     return Object.freeze({ restored: 1, newEntries: 0, deletedEntries: 0 })
   } }
   const helperDeployment = {
@@ -291,4 +295,194 @@ test('fresh recovery retains a replaced helper deployment and its broker request
   { code: 'GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED' })
   assert.equal(fs.existsSync(request), true)
   assert.equal(fs.existsSync(f.helperDeploymentRoot), true)
+})
+
+test('committed helper cleanup resumes after interruption before helper deletion', async t => {
+  const f = fixture(t), original = f.options._dependencies.helperDeployment
+  let interrupted = true
+  f.options._dependencies.helperDeployment = { ...original, cleanupWindowsHelperDeployment(...args) {
+    if (interrupted) { interrupted = false; throw Object.assign(new Error('simulated crash boundary'), { code: 'INTERRUPTED' }) }
+    return original.cleanupWindowsHelperDeployment(...args)
+  } }
+  const resource = await sandbox.prepareWindowsGrokSandbox(f.options), request = resource.launch.argv[4]
+  resource.markReservationEntered()
+  await assert.rejects(resource.cleanup(), { code: 'INTERRUPTED' })
+  const commit = path.join(f.root, `grok-helper-cleanup-${'1'.repeat(32)}.json`)
+  assert.equal(fs.existsSync(commit), true)
+  assert.equal(fs.existsSync(request), true)
+  assert.equal(fs.existsSync(f.helperDeploymentRoot), true)
+  const owner = f.makeOwner()
+  await sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath: request, helperDeploymentRoot: f.helperDeploymentRoot,
+    processOwner: owner, binding: { ...f.binding, launchBindingHash: resource.launchBindingHash }, _dependencies: f.options._dependencies })
+  assert.equal(fs.existsSync(request), false)
+  assert.equal(fs.existsSync(f.helperDeploymentRoot), false)
+  assert.equal(fs.existsSync(commit), true, 'durable cleanup tombstone remains until authenticated control-root retirement')
+})
+
+test('cleanup commit publication ignores a crash residue and atomically publishes the exact final record', async t => {
+  const f = fixture(t), original = f.options._dependencies.helperDeployment
+  let interrupted = true
+  f.options._dependencies.helperDeployment = { ...original, cleanupWindowsHelperDeployment(...args) {
+    if (interrupted) { interrupted = false; throw Object.assign(new Error('simulated crash boundary'), { code: 'INTERRUPTED' }) }
+    return original.cleanupWindowsHelperDeployment(...args)
+  } }
+  const resource = await sandbox.prepareWindowsGrokSandbox(f.options), request = resource.launch.argv[4]
+  const commitName = `grok-helper-cleanup-${'1'.repeat(32)}.json`
+  const residue = path.join(f.root, `.${commitName}.9999.${'a'.repeat(16)}.create`)
+  fs.writeFileSync(residue, '{"partial":', { flag: 'wx', mode: 0o600 })
+  resource.markReservationEntered()
+  await assert.rejects(resource.cleanup(), { code: 'INTERRUPTED' })
+  const commit = path.join(f.root, commitName), parsed = JSON.parse(fs.readFileSync(commit, 'utf8'))
+  assert.match(parsed.checksum, /^[a-f0-9]{64}$/u)
+  assert.match(parsed.sha256, /^[a-f0-9]{64}$/u)
+  assert.equal(fs.readFileSync(residue, 'utf8'), '{"partial":')
+  await sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath: request, helperDeploymentRoot: f.helperDeploymentRoot,
+    processOwner: f.makeOwner(), binding: { ...f.binding, launchBindingHash: resource.launchBindingHash }, _dependencies: f.options._dependencies })
+  assert.equal(fs.existsSync(request), false)
+})
+
+test('cleanup commit recovery removes only its exact same-inode atomic publication alias', async t => {
+  const f = fixture(t), original = f.options._dependencies.helperDeployment
+  let interrupted = true
+  f.options._dependencies.helperDeployment = { ...original, cleanupWindowsHelperDeployment(...args) {
+    if (interrupted) { interrupted = false; throw Object.assign(new Error('simulated crash boundary'), { code: 'INTERRUPTED' }) }
+    return original.cleanupWindowsHelperDeployment(...args)
+  } }
+  const resource = await sandbox.prepareWindowsGrokSandbox(f.options), request = resource.launch.argv[4]
+  resource.markReservationEntered()
+  await assert.rejects(resource.cleanup(), { code: 'INTERRUPTED' })
+  const commit = path.join(f.root, `grok-helper-cleanup-${'1'.repeat(32)}.json`)
+  const alias = path.join(f.root, `.${path.basename(commit)}.4242.${'b'.repeat(16)}.create`)
+  fs.linkSync(commit, alias)
+  assert.equal(fs.statSync(commit, { bigint: true }).nlink, 2n)
+  await sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath: request, helperDeploymentRoot: f.helperDeploymentRoot,
+    processOwner: f.makeOwner(), binding: { ...f.binding, launchBindingHash: resource.launchBindingHash }, _dependencies: f.options._dependencies })
+  assert.equal(fs.existsSync(alias), false)
+  assert.equal(fs.statSync(commit, { bigint: true }).nlink, 1n)
+  assert.equal(fs.existsSync(request), false)
+})
+
+test('cleanup commit recovery refuses malformed or foreign atomic publication aliases', async t => {
+  for (const kind of ['malformed', 'foreign']) {
+    const f = fixture(t), original = f.options._dependencies.helperDeployment
+    f.options._dependencies.helperDeployment = { ...original, cleanupWindowsHelperDeployment() {
+      throw Object.assign(new Error('simulated crash boundary'), { code: 'INTERRUPTED' })
+    } }
+    const resource = await sandbox.prepareWindowsGrokSandbox(f.options), request = resource.launch.argv[4]
+    resource.markReservationEntered()
+    await assert.rejects(resource.cleanup(), { code: 'INTERRUPTED' })
+    const commit = path.join(f.root, `grok-helper-cleanup-${'1'.repeat(32)}.json`)
+    const exactAlias = path.join(f.root, `.${path.basename(commit)}.4242.${'c'.repeat(16)}.create`)
+    fs.linkSync(commit, kind === 'malformed' ? `${exactAlias}.wrong` : exactAlias)
+    if (kind === 'foreign') {
+      fs.writeFileSync(path.join(f.root, `.${path.basename(commit)}.4243.${'d'.repeat(16)}.create`), 'foreign', { flag: 'wx', mode: 0o600 })
+    }
+    await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath: request,
+      helperDeploymentRoot: f.helperDeploymentRoot, processOwner: f.makeOwner(),
+      binding: { ...f.binding, launchBindingHash: resource.launchBindingHash }, _dependencies: f.options._dependencies }),
+    { code: 'GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED' })
+    assert.equal(fs.existsSync(request), true)
+    assert.equal(fs.statSync(commit, { bigint: true }).nlink, 2n)
+  }
+})
+
+test('committed recovery treats a dangling helper junction as a retained identity replacement', async t => {
+  const f = fixture(t), original = f.options._dependencies.helperDeployment
+  f.options._dependencies.helperDeployment = { ...original, cleanupWindowsHelperDeployment(...args) {
+    original.cleanupWindowsHelperDeployment(...args)
+    throw Object.assign(new Error('simulated post-delete crash boundary'), { code: 'INTERRUPTED' })
+  } }
+  const resource = await sandbox.prepareWindowsGrokSandbox(f.options), request = resource.launch.argv[4]
+  resource.markReservationEntered()
+  await assert.rejects(resource.cleanup(), { code: 'INTERRUPTED' })
+  const missingTarget = path.join(path.dirname(f.helperDeploymentRoot), 'removed-foreign-target')
+  fs.mkdirSync(missingTarget, { mode: 0o700 })
+  fs.symlinkSync(missingTarget, f.helperDeploymentRoot, process.platform === 'win32' ? 'junction' : 'dir')
+  fs.rmdirSync(missingTarget)
+  const owner = f.makeOwner()
+  await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath: request,
+    helperDeploymentRoot: f.helperDeploymentRoot, processOwner: owner,
+    binding: { ...f.binding, launchBindingHash: resource.launchBindingHash }, _dependencies: f.options._dependencies }),
+  { code: 'GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED' })
+  assert.equal(owner.issueCalls, 0)
+  assert.equal(fs.lstatSync(f.helperDeploymentRoot).isSymbolicLink(), true)
+  assert.equal(fs.existsSync(request), true)
+})
+
+test('committed helper cleanup resumes after deletion before broker request removal and rejects replacement', async t => {
+  const f = fixture(t), original = f.options._dependencies.helperDeployment
+  let interrupted = true
+  f.options._dependencies.helperDeployment = { ...original, cleanupWindowsHelperDeployment(...args) {
+    const result = original.cleanupWindowsHelperDeployment(...args)
+    if (interrupted) { interrupted = false; throw Object.assign(new Error('simulated post-delete crash boundary'), { code: 'INTERRUPTED' }) }
+    return result
+  } }
+  const resource = await sandbox.prepareWindowsGrokSandbox(f.options), request = resource.launch.argv[4]
+  resource.markReservationEntered()
+  await assert.rejects(resource.cleanup(), { code: 'INTERRUPTED' })
+  assert.equal(fs.existsSync(request), true)
+  assert.equal(fs.existsSync(f.helperDeploymentRoot), false)
+  const owner = f.makeOwner()
+  await sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath: request, helperDeploymentRoot: f.helperDeploymentRoot,
+    processOwner: owner, binding: { ...f.binding, launchBindingHash: resource.launchBindingHash }, _dependencies: f.options._dependencies })
+  assert.equal(fs.existsSync(request), false)
+
+  const replaced = fixture(t)
+  const replacementOriginal = replaced.options._dependencies.helperDeployment
+  replaced.options._dependencies.helperDeployment = { ...replacementOriginal, cleanupWindowsHelperDeployment(...args) {
+    replacementOriginal.cleanupWindowsHelperDeployment(...args)
+    throw Object.assign(new Error('simulated post-delete crash boundary'), { code: 'INTERRUPTED' })
+  } }
+  const replacementResource = await sandbox.prepareWindowsGrokSandbox(replaced.options)
+  replacementResource.markReservationEntered()
+  const replacementRequest = replacementResource.launch.argv[4]
+  await assert.rejects(replacementResource.cleanup(), { code: 'INTERRUPTED' })
+  // Keep the deleted directory's inode occupied so this is an actual
+  // replacement rather than a same-identity allocator reuse in the fixture.
+  const heldReplacement = `${replaced.helperDeploymentRoot}.replacement`
+  fs.mkdirSync(heldReplacement, { mode: 0o700 })
+  fs.mkdirSync(replaced.helperDeploymentRoot, { mode: 0o700 })
+  const replacementOwner = replaced.makeOwner()
+  await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: replaced.root, brokerRequestPath: replacementRequest,
+    helperDeploymentRoot: replaced.helperDeploymentRoot, processOwner: replacementOwner,
+    binding: { ...replaced.binding, launchBindingHash: replacementResource.launchBindingHash }, _dependencies: replaced.options._dependencies }),
+  { code: 'GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED' })
+  assert.equal(fs.existsSync(replacementRequest), true)
+})
+
+test('helper cleanup recovery rejects a tampered commit, missing commit, or mismatched restored entry count', async t => {
+  const interruptedFixture = async mode => {
+    const f = fixture(t), original = f.options._dependencies.helperDeployment
+    f.options._dependencies.helperDeployment = { ...original, cleanupWindowsHelperDeployment(...args) {
+      if (mode === 'before-delete') throw Object.assign(new Error('interrupted'), { code: 'INTERRUPTED' })
+      const result = original.cleanupWindowsHelperDeployment(...args)
+      throw Object.assign(new Error('interrupted'), { code: 'INTERRUPTED' })
+    } }
+    const resource = await sandbox.prepareWindowsGrokSandbox(f.options), request = resource.launch.argv[4]
+    resource.markReservationEntered()
+    await assert.rejects(resource.cleanup(), { code: 'INTERRUPTED' })
+    return { f, resource, request, commit: path.join(f.root, `grok-helper-cleanup-${'1'.repeat(32)}.json`) }
+  }
+  {
+    const { f, resource, request, commit } = await interruptedFixture('before-delete')
+    fs.writeFileSync(commit, `${JSON.stringify({ schemaVersion: 1 })}\n`)
+    await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath: request, helperDeploymentRoot: f.helperDeploymentRoot,
+      processOwner: f.makeOwner(), binding: { ...f.binding, launchBindingHash: resource.launchBindingHash }, _dependencies: f.options._dependencies }),
+    { code: 'GROK_WINDOWS_SANDBOX_RECOVERY_INVALID' })
+    assert.equal(fs.existsSync(request), true)
+  }
+  {
+    const { f, resource, request, commit } = await interruptedFixture('after-delete')
+    fs.unlinkSync(commit)
+    await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath: request, helperDeploymentRoot: f.helperDeploymentRoot,
+      processOwner: f.makeOwner(), binding: { ...f.binding, launchBindingHash: resource.launchBindingHash }, _dependencies: f.options._dependencies }),
+    { code: 'GROK_WINDOWS_SANDBOX_RECOVERY_INVALID' })
+  }
+  {
+    const { f, resource, request } = await interruptedFixture('before-delete')
+    fs.writeFileSync(path.join(f.root, 'resources.json.restored'), JSON.stringify({ schemaVersion: 1, leaseId: '1'.repeat(32), profileSid: 'S-1-15-2-1-2-3-4-5-6-7', result: { restored: 0, newEntries: 0, deletedEntries: 0 } }))
+    await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath: request, helperDeploymentRoot: f.helperDeploymentRoot,
+      processOwner: f.makeOwner(), binding: { ...f.binding, launchBindingHash: resource.launchBindingHash }, _dependencies: f.options._dependencies }),
+    { code: 'GROK_WINDOWS_SANDBOX_RECOVERY_INVALID' })
+  }
 })

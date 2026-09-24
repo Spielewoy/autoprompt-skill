@@ -3,12 +3,14 @@
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
-const { stableStringify } = require('../../../agents/codex/workflow/event-log.js')
+const { atomicCreateJson, checksumRecord, fsyncDirectory, stableStringify } = require('../../../agents/codex/workflow/event-log.js')
+const { inspectPathNoFollow } = require('../../../agents/codex/workflow/safe-run-root.js')
 const { materializeWindowsGrokRuntime } = require('./windows-runtime.cjs')
 const { buildGrokInlineWorker } = require('./inline-worker-bundle.cjs')
 
 const HASH = /^[a-f0-9]{64}$/u
 const MAX_REQUEST_BYTES = 256 * 1024
+const MAX_CLEANUP_COMMIT_BYTES = 8192
 const BROKER_ENVIRONMENT = new Set(['SystemRoot', 'WINDIR', 'SystemDrive', 'PATH', 'TEMP', 'TMP'])
 const WORKER_ENVIRONMENT = new Set(['SystemRoot', 'HOME', 'GROK_HOME', 'AUTOPROMPT_GROK_MODEL', 'AUTOPROMPT_GROK_RELAY_TOKEN', 'AUTOPROMPT_GROK_PROXY_TOKEN', 'AUTOPROMPT_GROK_PROXY_PORT', 'AUTOPROMPT_GROK_MCP_PORT', 'AUTOPROMPT_GROK_ALLOWED_MCP_TOOLS', 'AUTOPROMPT_GROK_ISSUED_CALLS', 'AUTOPROMPT_GROK_AUDIT_PATH'])
 const REQUIRED_WORKER_ENVIRONMENT = ['SystemRoot', 'HOME', 'GROK_HOME', 'AUTOPROMPT_GROK_MODEL', 'AUTOPROMPT_GROK_RELAY_TOKEN', 'AUTOPROMPT_GROK_PROXY_TOKEN', 'AUTOPROMPT_GROK_PROXY_PORT', 'AUTOPROMPT_GROK_MCP_PORT', 'AUTOPROMPT_GROK_ALLOWED_MCP_TOOLS']
@@ -93,6 +95,156 @@ function removeExact(file, binding) {
   if (!sameBinding(current, binding)) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Broker request identity changed before cleanup')
   fs.unlinkSync(file)
 }
+function cleanupCommitPath(controlRoot, leaseId) {
+  if (typeof controlRoot !== 'string' || !path.isAbsolute(controlRoot) || !/^[a-f0-9]{32}$/u.test(leaseId || '')) {
+    fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok helper cleanup record path is invalid')
+  }
+  return path.join(controlRoot, `grok-helper-cleanup-${leaseId}.json`)
+}
+function restoreReceiptBinding(semantic) {
+  const journalBinding = boundFile(semantic.lease.resourceJournalBinding.path, 8 * 1024 * 1024)
+  if (!sameBinding(journalBinding, semantic.lease.resourceJournalBinding)) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok resource journal changed before cleanup commit')
+  let journal
+  try { journal = JSON.parse(journalBinding.bytes.toString('utf8')) } catch { fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok resource journal is invalid') }
+  const journalBody = { schemaVersion: 1, leaseId: journal?.leaseId, plan: journal?.plan }
+  if (!exact(journal, ['schemaVersion', 'leaseId', 'plan', 'sha256']) || journal.schemaVersion !== 1 ||
+      journal.leaseId !== semantic.lease.recovery.leaseId || !journal.plan || typeof journal.plan !== 'object' || Array.isArray(journal.plan) ||
+      !Array.isArray(journal.plan.entries) || journal.sha256 !== sha256(Buffer.from(JSON.stringify(journalBody)))) {
+    fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok resource journal is not a sealed restoration plan')
+  }
+  const binding = boundFile(`${semantic.lease.recovery.journalPath}.restored`, 4096)
+  let receipt
+  try { receipt = JSON.parse(binding.bytes.toString('utf8')) } catch { fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok resource restoration receipt is invalid') }
+  if (!exact(receipt, ['schemaVersion', 'leaseId', 'profileSid', 'result']) || receipt.schemaVersion !== 1 ||
+      receipt.leaseId !== semantic.lease.recovery.leaseId || receipt.profileSid !== semantic.lease.profileSid ||
+      !exact(receipt.result, ['restored', 'newEntries', 'deletedEntries']) || Object.values(receipt.result).some(value => !Number.isSafeInteger(value) || value < 0) ||
+      receipt.result.restored > 16384 || receipt.result.deletedEntries > 16384 || receipt.result.newEntries > 32768 ||
+      receipt.result.restored + receipt.result.newEntries > 32768 ||
+      receipt.result.restored + receipt.result.deletedEntries !== journal.plan.entries.length) {
+    fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok resource restoration receipt is not complete')
+  }
+  return binding
+}
+function cleanupCommitBody(requestBinding, semantic, expected, restoredReceipt) {
+  return {
+    schemaVersion: 1, leaseId: semantic.lease.recovery.leaseId,
+    request: { name: path.basename(requestBinding.path), sha256: requestBinding.sha256, identity: requestBinding.identity },
+    owner: cleanOwnerBinding(expected), helperDeploymentBinding: cleanHelperDeploymentBinding(semantic.helperDeploymentBinding, semantic.helperDeploymentRoot),
+    restoredReceipt: { name: path.basename(restoredReceipt.path), sha256: restoredReceipt.sha256, identity: restoredReceipt.identity },
+  }
+}
+function cleanupCommitDigest(body) { return sha256(Buffer.from(stableStringify(body))) }
+function cleanupCommitStagingPattern(file) {
+  const escaped = path.basename(file).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+  return new RegExp(`^\\.${escaped}\\.[1-9][0-9]*\\.[a-f0-9]{16}\\.create$`, 'u')
+}
+function boundCleanupCommit(file, expectedBytes, recoverAlias = true) {
+  const directory = path.dirname(file)
+  let root
+  try { root = inspectPathNoFollow(directory) } catch {
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup record parent changed')
+  }
+  if (!root.exists || !root.identity) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup record parent is absent')
+  const current = boundFile(file, MAX_CLEANUP_COMMIT_BYTES, false)
+  let named
+  try { named = fs.lstatSync(file, { bigint: true }) } catch {
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup record changed after reading')
+  }
+  if (!named.isFile() || named.isSymbolicLink() || String(named.dev) !== current.identity.dev || String(named.ino) !== current.identity.ino) {
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup record changed after reading')
+  }
+  if (expectedBytes && !current.bytes.equals(expectedBytes)) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup record changed')
+  if (named.nlink === 1n) return current
+  if (named.nlink !== 2n) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup record has unknown hard links')
+  // A reader first authenticates the complete record and its recovery closure.
+  // Only the second, exact-byte-bound pass may remove a crash alias.
+  if (!recoverAlias) return current
+  const candidates = fs.readdirSync(directory).filter(name => cleanupCommitStagingPattern(file).test(name))
+  if (candidates.length !== 1) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup record has no unique staging alias')
+  const alias = path.join(directory, candidates[0])
+  let aliasStat
+  try { aliasStat = fs.lstatSync(alias, { bigint: true }) } catch {
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup staging alias changed')
+  }
+  if (!aliasStat.isFile() || aliasStat.isSymbolicLink() || aliasStat.nlink !== 2n ||
+      aliasStat.dev !== named.dev || aliasStat.ino !== named.ino) {
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup staging alias is foreign')
+  }
+  let finalAgain, aliasAgain
+  try {
+    finalAgain = fs.lstatSync(file, { bigint: true })
+    aliasAgain = fs.lstatSync(alias, { bigint: true })
+  } catch { fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup staging alias changed') }
+  if (finalAgain.dev !== named.dev || finalAgain.ino !== named.ino || finalAgain.nlink !== 2n ||
+      aliasAgain.dev !== named.dev || aliasAgain.ino !== named.ino || aliasAgain.nlink !== 2n) {
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup staging alias changed')
+  }
+  fs.unlinkSync(alias)
+  fsyncDirectory(directory)
+  let rootAfter
+  try { rootAfter = inspectPathNoFollow(directory) } catch {
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup record parent changed')
+  }
+  if (!rootAfter.exists || !sameBinding(root.identity, rootAfter.identity)) {
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup record parent changed')
+  }
+  const recovered = boundFile(file, MAX_CLEANUP_COMMIT_BYTES)
+  if (!sameBinding(recovered, current) || !recovered.bytes.equals(current.bytes)) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup record changed during alias recovery')
+  return recovered
+}
+function writeCleanupCommit(controlRoot, requestBinding, semantic, expected) {
+  const restoredReceipt = restoreReceiptBinding(semantic)
+  const body = cleanupCommitBody(requestBinding, semantic, expected, restoredReceipt)
+  const value = { ...body, sha256: cleanupCommitDigest(body) }
+  const signed = { ...value, checksum: checksumRecord(value) }
+  const bytes = Buffer.from(`${stableStringify(signed)}\n`)
+  if (bytes.length > MAX_CLEANUP_COMMIT_BYTES) fail('GROK_WINDOWS_SANDBOX_INVALID', 'Grok helper cleanup record exceeds its bound')
+  const file = cleanupCommitPath(controlRoot, semantic.lease.recovery.leaseId)
+  try {
+    atomicCreateJson(file, value, { mode: 0o600 })
+  }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error
+    boundCleanupCommit(file, bytes)
+  }
+  return Object.freeze({ path: file, ...body, sha256: value.sha256 })
+}
+function readCleanupCommit(controlRoot, requestBinding, semantic, expected) {
+  const file = cleanupCommitPath(controlRoot, semantic.lease.recovery.leaseId)
+  try {
+    if (!inspectPathNoFollow(file, { mustBeDirectory: false }).exists) return null
+  } catch {
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup record path is not one exact physical file')
+  }
+  let binding = boundCleanupCommit(file, undefined, false)
+  let value
+  try { value = JSON.parse(binding.bytes.toString('utf8')) } catch { fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok helper cleanup record is invalid') }
+  if (!exact(value, ['schemaVersion', 'leaseId', 'request', 'owner', 'helperDeploymentBinding', 'restoredReceipt', 'sha256', 'checksum']) || value.schemaVersion !== 1 ||
+      value.leaseId !== semantic.lease.recovery.leaseId || !HASH.test(value.sha256 || '') ||
+      !HASH.test(value.checksum || '') || value.checksum !== checksumRecord(value)) {
+    fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok helper cleanup record schema is invalid')
+  }
+  const body = { schemaVersion: value.schemaVersion, leaseId: value.leaseId, request: value.request, owner: value.owner,
+    helperDeploymentBinding: value.helperDeploymentBinding, restoredReceipt: value.restoredReceipt }
+  if (cleanupCommitDigest(body) !== value.sha256 || stableStringify(body) !== stableStringify(cleanupCommitBody(requestBinding, semantic, expected, restoreReceiptBinding(semantic)))) {
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper cleanup record does not bind the sealed recovery closure')
+  }
+  binding = boundCleanupCommit(file, binding.bytes)
+  return Object.freeze({ path: file, binding, ...body, sha256: value.sha256 })
+}
+function helperDeploymentPresent(helperDeploymentRoot) {
+  try {
+    const inspected = inspectPathNoFollow(helperDeploymentRoot)
+    if (!inspected.exists) return false
+    if (!inspected.identity || typeof inspected.realpath !== 'string') {
+      fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper deployment is not one exact physical directory')
+    }
+    return true
+  } catch (error) {
+    if (error instanceof GrokWindowsSandboxError) throw error
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper deployment is not one exact physical directory')
+  }
+}
 function ownerAuthority(processOwner) {
   if (!processOwner || typeof processOwner.issueBoundDrainReceipt !== 'function' || typeof processOwner.verifyBoundDrainReceipt !== 'function') {
     fail('GROK_WINDOWS_SANDBOX_INVALID', 'Grok Windows sandbox requires ProcessOwner drain authority')
@@ -140,7 +292,7 @@ function parseSemantic(requestBinding) {
   if (!semantic || typeof semantic !== 'object' || Array.isArray(semantic) || semantic.schemaVersion !== 1) fail('GROK_WINDOWS_SANDBOX_INVALID', 'Grok broker request schema is invalid')
   return semantic
 }
-function verifyPersistedClosure(semantic, moduleBinding, requestBinding, launchBindingHash, deps) {
+function verifyPersistedClosure(semantic, moduleBinding, requestBinding, launchBindingHash, deps, options = {}) {
   if (sha256(Buffer.from(stableStringify({ semantic, moduleBinding, requestBinding }))) !== launchBindingHash) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok broker closure changed')
   const brokerNodeBinding = boundFile(semantic.broker.executableBinding.path, 512 * 1024 * 1024, false)
   if (!sameBinding(brokerNodeBinding, semantic.broker.executableBinding)) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok broker executable changed')
@@ -150,6 +302,7 @@ function verifyPersistedClosure(semantic, moduleBinding, requestBinding, launchB
   if (!sameBinding(runtimeBinding, semantic.runtime.executable)) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok runtime executable changed')
   const resourceJournalBinding = boundFile(semantic.lease.resourceJournalBinding.path, 8 * 1024 * 1024)
   if (!sameBinding(resourceJournalBinding, semantic.lease.resourceJournalBinding)) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok resource journal changed')
+  if (options.skipLauncher === true) return null
   const launcher = deps.createLauncher({ deploymentRoot: semantic.helperDeploymentRoot })
   if (!sameBinding(launcher.binding, semantic.launcherBinding)) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok AppContainer helper binding changed')
   return launcher
@@ -261,13 +414,18 @@ async function prepareWindowsGrokSandbox(options = {}) {
       cleanupStarted = true
       cleanupPromise = (async () => {
         let evidence
+        const expected = { ...binding, launchBindingHash }
         if (!entered) evidence = launcher.proveNotStarted({ profileSid: lease.profileSid, leaseId: lease.recovery.leaseId })
         else {
-          const expected = { ...binding, launchBindingHash }
           evidence = await processOwner.issueBoundDrainReceipt(expected)
           processOwner.verifyBoundDrainReceipt(evidence, expected)
         }
         await lease.release(evidence)
+        writeCleanupCommit(options.controlRoot, requestBinding, semantic, expected)
+        deps.helperDeployment.cleanupWindowsHelperDeployment(options.controlRoot, helperDeploymentBinding)
+        if (helperDeploymentPresent(semantic.helperDeploymentRoot)) {
+          fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper deployment remains after exact cleanup')
+        }
         removeExact(requestBinding.path, requestBinding)
         cleaned = true
       })()
@@ -326,15 +484,24 @@ async function recoverWindowsGrokSandbox(options = {}) {
     fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok recovery metadata differs from its owner binding')
   }
   const helperDeploymentBinding = cleanHelperDeploymentBinding(semantic.helperDeploymentBinding, semantic.helperDeploymentRoot)
-  assertTrustedHelperDeployment(options.controlRoot, semantic.helperDeploymentRoot, helperDeploymentBinding, deps)
-  verifyPersistedClosure(semantic, moduleBinding, requestBinding, expected.launchBindingHash, deps)
+  const committed = readCleanupCommit(options.controlRoot, requestBinding, semantic, expected)
+  const helperPresent = helperDeploymentPresent(semantic.helperDeploymentRoot)
+  if (helperPresent) assertTrustedHelperDeployment(options.controlRoot, semantic.helperDeploymentRoot, helperDeploymentBinding, deps)
+  else if (!committed) fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok helper deployment is absent without a committed cleanup record')
+  verifyPersistedClosure(semantic, moduleBinding, requestBinding, expected.launchBindingHash, deps, { skipLauncher: !helperPresent })
   const receipt = await processOwner.issueBoundDrainReceipt(expected)
   if (processOwner.verifyBoundDrainReceipt(receipt, expected) !== true) fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok recovery drain receipt is foreign')
   const verifyDrainEvidence = (evidence, leaseBinding) => leaseBinding.profileSid === semantic.lease.profileSid &&
     leaseBinding.leaseId === semantic.lease.recovery.leaseId && processOwner.verifyBoundDrainReceipt(evidence, expected) === true
-  const result = await deps.resources.recoverWindowsAppContainerResources({ controlRoot: options.controlRoot,
-    deploymentRoot: options.helperDeploymentRoot, ...semantic.lease.recovery, verifyDrainEvidence, evidence: receipt })
+  const result = committed
+    ? JSON.parse(restoreReceiptBinding(semantic).bytes.toString('utf8')).result
+    : await deps.resources.recoverWindowsAppContainerResources({ controlRoot: options.controlRoot,
+      deploymentRoot: options.helperDeploymentRoot, ...semantic.lease.recovery, verifyDrainEvidence, evidence: receipt })
+  if (!committed) writeCleanupCommit(options.controlRoot, requestBinding, semantic, expected)
   deps.helperDeployment.cleanupWindowsHelperDeployment(options.controlRoot, helperDeploymentBinding)
+  if (helperDeploymentPresent(semantic.helperDeploymentRoot)) {
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper deployment remains after exact cleanup')
+  }
   removeExact(requestBinding.path, requestBinding)
   return result
 }

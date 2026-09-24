@@ -124,24 +124,40 @@ test('prepareLaunch reaches the real broker materializer with a sealed worker co
   const launcher = Object.freeze({ binding: Object.freeze({ helper: Object.freeze({ path: path.join(f.root, 'helper'), sha256: 'a'.repeat(64) }) }),
     proveNotStarted: value => Object.freeze({ value }), verifyDrainEvidence: (evidence, value) => JSON.stringify(evidence.value) === JSON.stringify(value) })
   const journal = path.join(session.privateRoots.control, '1'.repeat(32) + '.resources.json')
-  fs.writeFileSync(journal, 'resource-journal')
-  const journalStat = fs.statSync(journal, { bigint: true })
+  const resourcePlan = { entries: [{}] }
+  const journalBody = { schemaVersion: 1, leaseId: '1'.repeat(32), plan: resourcePlan }
+  fs.writeFileSync(journal, JSON.stringify({ ...journalBody, sha256: sha(JSON.stringify(journalBody)) }))
   let stagedCleanup = 0, released = 0
   const resources = { async prepareWindowsAppContainerResources(options) {
     assert.deepEqual(options.policy.writableRoots, [session.privateRoots.cwd, session.privateRoots.scratch, session.privateRoots.home])
     return Object.freeze({ profileName: 'Autoprompt_fixture', profileSid: 'S-1-15-2-1-2-3-4-5-6-7',
       environment: Object.freeze({ USERPROFILE: 'C:\\profile', HOME: 'C:\\profile', APPDATA: 'C:\\profile\\AppData\\Roaming', TEMP: session.privateRoots.scratch, TMP: session.privateRoots.scratch }),
       recovery: Object.freeze({ journalPath: journal, leaseId: '1'.repeat(32) }),
-      async release(evidence) { assert.equal(options.verifyDrainEvidence(evidence, { profileSid: this.profileSid, leaseId: this.recovery.leaseId }), true); released++ },
+      async release(evidence) {
+        assert.equal(options.verifyDrainEvidence(evidence, { profileSid: this.profileSid, leaseId: this.recovery.leaseId }), true)
+        fs.writeFileSync(`${journal}.restored`, JSON.stringify({ schemaVersion: 1, leaseId: this.recovery.leaseId, profileSid: this.profileSid,
+          result: { restored: 1, newEntries: 0, deletedEntries: 0 } }), { flag: 'wx', mode: 0o600 })
+        released++
+      },
     }) } }
   const owner = { async issueBoundDrainReceipt(expected) { return { expected } }, verifyBoundDrainReceipt(receipt, expected) { return JSON.stringify(receipt.expected) === JSON.stringify(expected) } }
-  const controlStat = fs.statSync(session.privateRoots.control, { bigint: true })
+  const helperDeployment = { assertTrustedWindowsHelperDeployment() { throw new Error('portable test must not use native helper trust') },
+    cleanupWindowsHelperDeployment(controlRoot, binding) {
+      assert.equal(controlRoot, session.privateRoots.control)
+      const stat = fs.lstatSync(binding.root, { bigint: true })
+      assert.deepEqual({ dev: String(stat.dev), ino: String(stat.ino) }, binding.identity)
+      fs.rmdirSync(binding.root)
+    } }
   const config = { ...session.config, model: 'grok', relayToken: 'a'.repeat(64), proxyToken: 'b'.repeat(64), allowedMcpTools: { autoprompt_owned__read: 'read' }, issuedCalls: [], systemRoot: 'C:\\Windows', systemPath: 'C:\\Windows\\System32' }
   const prepared = await launch.prepareLaunch({ session, config, sessionRoot: session.sessionRoot, launchRoot: session.launchRoot, processOwner: owner,
     binding: { reservationId: 'r', sessionId: 's', targetKey: 'grok' }, pipe: { socketPath: '\\\\.\\pipe\\autoprompt-grok-' + 'a'.repeat(64) }, spec: { argv: ['--verbatim'] },
-    _dependencies: { stageWindowsHelperDeployment: root => ({ root, cleanupBinding: { root, identity: { dev: String(controlStat.dev), ino: String(controlStat.ino) } }, cleanup() { stagedCleanup++ } }), materializeRuntime: () => runtime,
+    _dependencies: { stageWindowsHelperDeployment: () => {
+      const root = path.join(f.root, 'staged-helper'); fs.mkdirSync(root, { mode: 0o700 })
+      const stat = fs.lstatSync(root, { bigint: true })
+      return { root, cleanupBinding: { root, identity: { dev: String(stat.dev), ino: String(stat.ino) } }, cleanup() { stagedCleanup++ } }
+    }, materializeRuntime: () => runtime,
       buildWorker: () => ({ payloadSha256: 'c'.repeat(64), moduleSha256: { 'sandbox-worker.cjs': 'd'.repeat(64) }, executable: session.nodeExecutable, argv: ['-e', 'worker'] }),
-      createLauncher: () => launcher, resources } })
+      createLauncher: () => launcher, resources, helperDeployment } })
   const request = JSON.parse(fs.readFileSync(prepared.launch.argv[4], 'utf8'))
   const environment = Object.fromEntries(request.appLaunch.environment.map(value => value.split(/=(.*)/s)))
   assert.equal(environment.AUTOPROMPT_GROK_AUDIT_PATH, path.join(session.privateRoots.scratch, 'audit.jsonl'))

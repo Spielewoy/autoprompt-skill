@@ -1418,6 +1418,18 @@ class HarnessExecAdapter {
         sessionRoot, launchRoot, grokExecutable: native.executableRuntimePath(binding), nodeExecutable: process.execPath,
       })
     }
+    let grokDarwinSession = null
+    if (this.provider === 'grok' && process.platform === 'darwin') {
+      privateDirectory(path.dirname(sessionRoot))
+      grokDarwinSession = await require('./harness-v2-bridge/grok/darwin-launch.cjs').prepareSession({
+        sessionRoot, launchRoot, grokExecutable: native.executableRuntimePath(binding),
+        nodeExecutable: fs.realpathSync.native(this.runner.boundNode?.path || process.execPath),
+      })
+      if (this.runner.boundNode && grokDarwinSession.nodeExecutableSha256 !== this.runner.boundNode.sha256) {
+        fail('GROK_DARWIN_LAUNCH_IDENTITY_CHANGED', 'Private Grok worker Node differs from its controller binding')
+      }
+    }
+    const grokPlatformSession = grokWindowsSession || grokDarwinSession
     if (this.provider === 'vscode' && process.platform === 'win32') {
       const created = privateDirectory(launchRoot)
       const privacy = require('../agents/codex/workflow/safe-run-root.js')
@@ -1557,7 +1569,7 @@ class HarnessExecAdapter {
         // the owned runner is draining.
         vscodeCompletionPromise.catch(() => {})
       }
-      spec = native.createLaunch({ provider: this.provider, executable: native.executableRuntimePath(binding), home: path.join(launchRoot, 'home'), ...(vscodeIpcAlias ? { vscodeUserDataDir: vscodeIpcAlias.userDataDir } : {}), ...(vscodeEvents ? { vscodeEventChannel: vscodeEvents.descriptor } : {}), sessionRoot, ...(grokWindowsSession ? { grokRuntimeProjection: grokWindowsSession.config.runtimeProjection } : {}), cwd, targetPath: candidatePath, readOnly, commandBoundary, toolBoundary, toolFree: Boolean(routeProjection), prompt, input, continuationId: record.continuationId, connection: projectedConnection, credentials: this.credentialEnvironment, providerConnectionIdentity: this.connection, environment: record.environment, model: record.assignment?.model, effort: this.provider === 'grok' ? grokAssignedEffort : record.assignment?.effort, issuedCalls: preexistingIssuedCalls, proxyToken, maxTokens: nativeMaxTokens, outputSchema: ['claude', 'deepseek', 'grok', 'prime', 'omp'].includes(this.provider) || this.provider === 'vscode' && this.connection?.supportsStructuredOutput === true ? wireSchema : undefined, maxCompletionTokens: this.provider === 'grok' && Number.isSafeInteger(record.providerTokenLimit) && record.providerTokenLimit > 0 ? Math.min(4096, record.providerTokenLimit) : undefined })
+      spec = native.createLaunch({ provider: this.provider, executable: native.executableRuntimePath(binding), home: path.join(launchRoot, 'home'), ...(vscodeIpcAlias ? { vscodeUserDataDir: vscodeIpcAlias.userDataDir } : {}), ...(vscodeEvents ? { vscodeEventChannel: vscodeEvents.descriptor } : {}), sessionRoot, ...(grokPlatformSession ? { grokRuntimeProjection: grokPlatformSession.config.runtimeProjection } : {}), cwd, targetPath: candidatePath, readOnly, commandBoundary, toolBoundary, toolFree: Boolean(routeProjection), prompt, input, continuationId: record.continuationId, connection: projectedConnection, credentials: this.credentialEnvironment, providerConnectionIdentity: this.connection, environment: record.environment, model: record.assignment?.model, effort: this.provider === 'grok' ? grokAssignedEffort : record.assignment?.effort, issuedCalls: preexistingIssuedCalls, proxyToken, maxTokens: nativeMaxTokens, outputSchema: ['claude', 'deepseek', 'grok', 'prime', 'omp'].includes(this.provider) || this.provider === 'vscode' && this.connection?.supportsStructuredOutput === true ? wireSchema : undefined, maxCompletionTokens: this.provider === 'grok' && Number.isSafeInteger(record.providerTokenLimit) && record.providerTokenLimit > 0 ? Math.min(4096, record.providerTokenLimit) : undefined })
       if (requiredResponseFormat && boundary.canonicalJson(spec.requiredResponseFormat) !== boundary.canonicalJson(requiredResponseFormat)) fail('PROVIDER_UNSUPPORTED', 'Pi native schema differs from its owned provider boundary')
       // Native configuration isolation discards inherited control-looking fields.
       // Recreate the owner's reservation marker from its trusted adapter only
@@ -1644,9 +1656,12 @@ class HarnessExecAdapter {
           // therefore receives only this reservation-private working directory;
           // every task operation remains host-owned behind the authenticated MCP
           // relay and is never directly mounted in the native namespace.
-          if (grokWindowsSession) {
-            const resource = await require('./harness-v2-bridge/grok/windows-launch.cjs').prepareLaunch({
-              session: grokWindowsSession, sessionRoot, launchRoot, config: { ...config, issuedCalls: history }, spec,
+          if (grokPlatformSession) {
+            const platformLauncher = grokWindowsSession
+              ? require('./harness-v2-bridge/grok/windows-launch.cjs')
+              : require('./harness-v2-bridge/grok/darwin-launch.cjs')
+            const resource = await platformLauncher.prepareLaunch({
+              session: grokPlatformSession, sessionRoot, launchRoot, config: { ...config, issuedCalls: history }, spec,
               pipe: { socketPath: relayConnectPath }, processOwner: this.runner.processOwner,
               binding: { sessionId: processSessionId, reservationId: record.reservationId, targetKey: this.runner.targetKey },
             })

@@ -475,6 +475,7 @@ function codexWorkerAssets(root){
 }
 
 const CODEX_DARWIN_EXECUTABLES = Object.freeze(['coalition-helper-arm64', 'coalition-helper-x64'])
+const CODEX_DARWIN_LISTENER_EXECUTABLES = Object.freeze(['listener-supervisor-arm64', 'listener-supervisor-x64'])
 function codexDarwinAssets(workflowDirectory) {
   const runtime = path.join(workflowDirectory, 'darwin-coalition-runtime')
   const expected = [...CODEX_DARWIN_EXECUTABLES, 'manifest.json'].sort()
@@ -485,8 +486,16 @@ function codexDarwinAssets(workflowDirectory) {
   // headers, deployment target, and physical paths before packaging any bytes.
   require('../agents/codex/workflow/darwin-coalition-loader.js').validateDarwinCoalitionRuntime(
     runtime, 'x64', path.join(workflowDirectory, 'darwin-coalition-helper.c'))
+  const listenerRuntime = path.join(workflowDirectory, 'darwin-listener-runtime')
+  const listenerFiles = [...CODEX_DARWIN_LISTENER_EXECUTABLES, 'manifest.json'].sort()
+  if (JSON.stringify(fs.readdirSync(listenerRuntime).sort()) !== JSON.stringify(listenerFiles)) {
+    throw new Error('Darwin listener runtime must contain exactly its declared helper files')
+  }
+  require('../agents/codex/workflow/darwin-listener-loader.js').validateDarwinListenerRuntime(
+    listenerRuntime, 'x64', path.join(workflowDirectory, 'darwin-launchd-listener-supervisor.c'))
   return ['workflow/darwin-coalition-helper.c', 'workflow/darwin-launchd-listener-supervisor.c',
-    ...expected.map(file => `workflow/darwin-coalition-runtime/${file}`)]
+    ...expected.map(file => `workflow/darwin-coalition-runtime/${file}`),
+    ...listenerFiles.map(file => `workflow/darwin-listener-runtime/${file}`)]
 }
 
 function codexRuntimeFiles(root = ROOT) {
@@ -1176,8 +1185,12 @@ function installPayload(provider, destination, root = ROOT) {
   for (const item of plan.files) {
     assertRegularUnlinked(item.source, `${item.kind} source`)
     assertDirectoryChainUnlinked(plan.activationRoot, path.dirname(item.target), true)
-    const executable = provider === 'codex' && CODEX_DARWIN_EXECUTABLES.some(name =>
-      path.relative(path.join(root, 'agents', 'codex'), item.source) === path.join('workflow', 'darwin-coalition-runtime', name))
+    const codexRelative = provider === 'codex' ? path.relative(path.join(root, 'agents', 'codex'), item.source).split(path.sep).join('/') : ''
+    const darwinAsset = codexRelative === 'workflow/darwin-coalition-helper.c' || codexRelative === 'workflow/darwin-launchd-listener-supervisor.c' ||
+      codexRelative.startsWith('workflow/darwin-coalition-runtime/') || codexRelative.startsWith('workflow/darwin-listener-runtime/')
+    const executable = provider === 'codex' && (
+      CODEX_DARWIN_EXECUTABLES.some(name => path.relative(path.join(root, 'agents', 'codex'), item.source) === path.join('workflow', 'darwin-coalition-runtime', name)) ||
+      CODEX_DARWIN_LISTENER_EXECUTABLES.some(name => path.relative(path.join(root, 'agents', 'codex'), item.source) === path.join('workflow', 'darwin-listener-runtime', name)))
     if (fs.existsSync(item.target)) {
       const targetStats = fs.lstatSync(item.target)
       if (!targetStats.isFile() || targetStats.isSymbolicLink() || targetStats.nlink !== 1) {
@@ -1187,16 +1200,16 @@ function installPayload(provider, destination, root = ROOT) {
         if (payloadSha256(provider, item.target) !== item.sha256) {
           throw new Error(`immutable Codex bundle drift: ${item.receiptPath}`)
         }
-        if (executable && process.platform !== 'win32') {
+        if (darwinAsset && process.platform !== 'win32') {
           fs.chmodSync(path.dirname(item.target), 0o700)
-          fs.chmodSync(item.target, 0o700)
+          fs.chmodSync(item.target, executable ? 0o700 : 0o600)
         }
         continue
       }
     }
     const temporary = `${item.target}.tmp-${process.pid}`
-    if (executable && process.platform !== 'win32') fs.chmodSync(path.dirname(item.target), 0o700)
-    fs.writeFileSync(temporary, payloadBytes(provider, item.source), { flag: 'wx', ...(executable ? { mode: 0o700 } : {}) })
+    if (darwinAsset && process.platform !== 'win32') fs.chmodSync(path.dirname(item.target), 0o700)
+    fs.writeFileSync(temporary, payloadBytes(provider, item.source), { flag: 'wx', ...(darwinAsset ? { mode: executable ? 0o700 : 0o600 } : {}) })
     try {
       fs.renameSync(temporary, item.target)
     } catch (error) {

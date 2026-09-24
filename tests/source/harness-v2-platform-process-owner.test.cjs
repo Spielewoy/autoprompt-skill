@@ -17,15 +17,17 @@ test('shared platform process-owner factory selects injected POSIX or Windows co
     createWindowsJobAdapter: options => { calls.push({ kind: 'windows', options }); return { kind: 'test-windows' } } })
   assert.equal(windows.kind, 'test-windows')
   const helper = { path: '/package/coalition-helper-arm64', sha256: 'a'.repeat(64) }
+  const listenerSupervisor = { path: '/package/listener-supervisor-arm64', sha256: 'b'.repeat(64) }
   const darwin = owner.createPlatformProcessAdapter({ platform: 'darwin', darwin: { controlRoot: '/owned/darwin-control', providerPrivateOwnershipRoot: '/owned' },
     loadDarwinCoalitionHelper: () => helper,
+    loadDarwinListenerSupervisor: () => listenerSupervisor,
     createDarwinCoalitionAdapter: options => { calls.push({ kind: 'darwin', options }); return { kind: 'test-darwin' } },
     createPosixProcessAdapter: () => { throw new Error('wrong platform') } })
   assert.equal(darwin.kind, 'test-darwin')
   assert.deepEqual(calls, [
     { kind: 'posix', options: { marker: 'posix', platform: 'linux' } },
     { kind: 'windows', options: { controlRoot: '/owned/control', providerPrivateOwnershipRoot: '/owned', trustedOwnershipRoots: ['/owned'] } },
-    { kind: 'darwin', options: { controlRoot: '/owned/darwin-control', providerPrivateOwnershipRoot: '/owned', helper } },
+    { kind: 'darwin', options: { controlRoot: '/owned/darwin-control', providerPrivateOwnershipRoot: '/owned', helper, listenerSupervisor } },
   ])
 })
 

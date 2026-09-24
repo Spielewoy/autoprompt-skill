@@ -23,6 +23,34 @@ function commandPhase(options, stage, error) {
     options.onPhase(Object.freeze(code ? { stage, code } : { stage }))
   } catch {}
 }
+// The canary is a fixed controller-owned program, but its raw diagnostic can
+// still contain private paths and helper output.  A public tool failure keeps
+// only the small structural fields needed to locate the failed canary phase.
+// In particular, never put canary stderr/stdout or error messages in this
+// string: those are useful only in the controller-private probe record.
+function canaryFailureSummary(result) {
+  const token = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(value) ? value : null
+  const integer = value => Number.isSafeInteger(value) && value >= -1 && value <= 0x7fffffff ? String(value) : null
+  const values = []
+  const phase = token(result?.diagnostic?.phase)
+  const code = token(result?.code)
+  const stage = token(result?.diagnostic?.stage)
+  const helperPhase = token(result?.diagnostic?.helperPhase)
+  const exitCode = integer(result?.nativeExitCode)
+  const probeMarker = typeof result?.probeFailure?.stderr === 'string'
+    ? /^APPCONTAINER_PROBE_FAILURE:([a-z-]{1,32}):([A-Z0-9_]{1,64})$/.exec(result.probeFailure.stderr.trim()) : null
+  const probeStages = new Set(['read', 'delete-original', 'write-target', 'write-scratch', 'new-entry-delete', 'sentinel', 'git-write', 'git-rename-delete', 'acl-write', 'descendant', 'network', 'child-kill', 'bash-fork', 'bash-pipe'])
+  if (phase) values.push(`phase=${phase}`)
+  if (code) values.push(`code=${code}`)
+  if (stage) values.push(`stage=${stage}`)
+  if (helperPhase) values.push(`helperPhase=${helperPhase}`)
+  if (exitCode !== null) values.push(`nativeExitCode=${exitCode}`)
+  if (probeMarker && probeStages.has(probeMarker[1])) values.push(`probeStage=${probeMarker[1]}`, `probeCode=${probeMarker[2]}`)
+  if (result?.probeFailure?.timedOut === true) values.push('timedOut=1')
+  if (result?.probeFailure?.cancelled === true) values.push('cancelled=1')
+  if (result?.probeFailure?.truncated === true) values.push('truncated=1')
+  return values.length ? ` [canary ${values.join(' ')}]` : ''
+}
 function within(root, value) {
   const relative = path.relative(path.resolve(root).toLowerCase(), path.resolve(value).toLowerCase())
   return relative === '' || relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
@@ -313,21 +341,22 @@ async function ensureWorkerAdmission(controllerNode, options) {
       try {
         result = await require('./windows-appcontainer-probe.js').runWindowsAppContainerCanary(
           (policy, args, options) => runTupleCommand(policy, args, options, tuple, key), worker.identity, key)
-        commandPhase(options, 'worker-canary-finished')
       } catch (error) {
         commandPhase(options, 'worker-canary-failed', error)
         throw error
       }
       if (!result || result.supported !== true || result.workerIdentity !== worker.identity || result.runtimeSha256 !== key || result.processCleanup !== 'owned-job-drained') {
-        const error = new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', 'The selected Windows worker tuple did not pass its fresh native canary')
+        const error = new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', `The selected Windows worker tuple did not pass its fresh native canary${canaryFailureSummary(result)}`)
         if (result && result.supported === false) error.canaryResult = result
         if (result?.recoveryRoot || result?.retainedStagingRoot) {
           error.cleanupConfirmed = false
           if (result.recoveryRoot) error.recoveryRoot = result.recoveryRoot
           if (result.retainedStagingRoot) error.retainedStagingRoot = result.retainedStagingRoot
         }
+        commandPhase(options, 'worker-canary-failed', error)
         throw error
       }
+      commandPhase(options, 'worker-canary-finished')
       if (currentAdmission(tuple).key !== key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed during the Windows worker canary')
       refusePoisonedAdmission()
       admittedWorker = Object.freeze({ tuple, key, result: Object.freeze(result) })

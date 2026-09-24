@@ -34,6 +34,27 @@ test('diagnostic phase observer cannot alter admission or command execution',asy
  assert.deepEqual(phases.map(phase=>phase.stage),['worker-admission-start','worker-canary-start','worker-canary-finished','worker-admission-ready','worker-command-start','worker-command-finished'])
  assert.ok(phases.every(phase=>Object.isFrozen(phase)))
 })
+test('rejected native canary reports only bounded structural diagnostic fields',async t=>{
+ const phases=[],canary={supported:false,code:'NATIVE_PROBE_FAILED',diagnostic:{phase:'command-launch',stage:'worker-probe',helperPhase:'launch',message:'PRIVATE_TOKEN=must-not-escape /private/controller'},nativeExitCode:19,probeFailure:{timedOut:true,cancelled:false,truncated:true,stderr:'PRIVATE_TOKEN=must-not-escape'}},x=setup(t,{canaryResult:canary})
+ await assert.rejects(x.run({onPhase:phase=>phases.push(phase)}),error=>{
+  assert.equal(error.code,'COMMAND_SANDBOX_UNSUPPORTED')
+  assert.match(error.message,/\[canary phase=command-launch code=NATIVE_PROBE_FAILED stage=worker-probe helperPhase=launch nativeExitCode=19 timedOut=1 truncated=1\]$/)
+  assert.doesNotMatch(error.message,/PRIVATE_TOKEN|private\/controller|must-not-escape/)
+  return true
+ })
+ assert.deepEqual(phases.map(phase=>phase.stage),['worker-admission-start','worker-canary-start','worker-canary-failed','worker-admission-failed'])
+ assert.equal(phases.at(-2).code,'COMMAND_SANDBOX_UNSUPPORTED')
+})
+test('canary diagnostics accept only an exact fixed probe marker',async t=>{
+ for(const [stderr,expected] of [['APPCONTAINER_PROBE_FAILURE:network:CHECK',true],['APPCONTAINER_PROBE_FAILURE:network:CHECK\nPRIVATE_TOKEN=secret',false],['APPCONTAINER_PROBE_FAILURE:foreign:CHECK',false]]){
+  const x=setup(t,{canaryResult:{supported:false,probeFailure:{stderr}}})
+  await assert.rejects(x.run(),error=>{
+   assert.equal(error.message.includes('probeStage=network probeCode=CHECK'),expected)
+   assert.doesNotMatch(error.message,/PRIVATE_TOKEN|secret|foreign/)
+   return true
+  })
+ }
+})
 test('command admission forwards only the sealed Windows controller Node binding',async t=>{
  const node={path:'C:\\controller\\node.exe',sha256:'d'.repeat(64)},x=setup(t,{expectedControllerNode:node})
  assert.equal((await x.run()).status,'completed')

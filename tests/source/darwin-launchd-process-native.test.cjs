@@ -288,12 +288,8 @@ test('Darwin adapter hands retained listeners through FD3 and FD4 and drains the
 }, async t => {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join('/private/tmp', 'ap-darwin-listener-adapter-')))
   fs.chmodSync(root, 0o700)
-  const controlRoot = path.join(root, 'control'), supervisor = path.join(root, 'listener-supervisor')
+  const controlRoot = path.join(root, 'control'), supervisor = require('../../agents/codex/workflow/darwin-listener-loader.js').loadDarwinListenerSupervisor().path
   const script = path.join(root, 'listener-child.cjs'), observed = path.join(root, 'observed.json')
-  const compiler = requireSuccess(command('/usr/bin/xcrun', ['--find', 'clang']), 'locate clang').stdout.trim()
-  const sdk = requireSuccess(command('/usr/bin/xcrun', ['--show-sdk-path']), 'read SDK path').stdout.trim()
-  requireSuccess(command(compiler, ['-isysroot', sdk, '-mmacosx-version-min=13.5', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
-    path.join(ROOT, 'agents/codex/workflow/darwin-launchd-listener-supervisor.c'), '-o', supervisor]), 'compile listener supervisor')
   const node = fs.realpathSync.native(process.execPath)
   fs.writeFileSync(script, String.raw`'use strict'
 const fs=require('node:fs'),net=require('node:net')
@@ -303,10 +299,7 @@ Promise.all([[3,'proxy'],[4,'mcp']].map(([fd,name])=>new Promise((resolve,reject
   setTimeout(()=>Promise.all(servers.map(server=>new Promise(resolve=>server.close(resolve)))).then(()=>process.exit(0)),100)
 }).catch(error=>{console.error(error.stack||error);process.exit(70)})
 `, { mode: 0o600 })
-  const helper = LOADER.loadDarwinCoalitionHelper()
-  const { createDarwinCoalitionAdapter } = require('../../agents/codex/workflow/darwin-launchd-process.js')
-  const adapter = createDarwinCoalitionAdapter({ controlRoot, providerPrivateOwnershipRoot: root, helper,
-    listenerSupervisor: { path: supervisor, sha256: sha256(fs.readFileSync(supervisor)) } })
+  const adapter = createPlatformProcessAdapter({ platform: 'darwin', darwin: { controlRoot, providerPrivateOwnershipRoot: root } })
   const reservationId = `listener-${crypto.randomUUID()}`
   const record = { reservationId, reservationIdentity: adapter.reservationIdentity(reservationId),
     startupDeadlineAt: new Date(Date.now() + 60000).toISOString(), targetKey: 'darwin-listener-adapter' }
@@ -367,15 +360,11 @@ test('Darwin Grok Seatbelt profile adopts only the retained IPv6 FD3/FD4 listene
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join('/private/tmp', 'ap-darwin-grok-profile-')))
   fs.chmodSync(root, 0o700)
   const home = path.join(root, 'home'), cwd = path.join(root, 'cwd'), scratch = path.join(root, 'scratch')
-  const controlRoot = path.join(root, 'control'), supervisor = path.join(root, 'listener-supervisor')
+  const controlRoot = path.join(root, 'control'), supervisor = require('../../agents/codex/workflow/darwin-listener-loader.js').loadDarwinListenerSupervisor().path
   for (const directory of [home, cwd, scratch, controlRoot]) fs.mkdirSync(directory, { mode: 0o700 })
   const script = path.join(cwd, 'listener-child.cjs'), observed = path.join(home, 'observed.json')
   const secret = path.join(root, 'controller-secret'), profilePath = path.join(home, 'grok.sb'), errorPath = path.join(home, 'child-error.json')
   fs.writeFileSync(secret, 'controller-only-secret', { mode: 0o600 })
-  const compiler = requireSuccess(command('/usr/bin/xcrun', ['--find', 'clang']), 'locate clang').stdout.trim()
-  const sdk = requireSuccess(command('/usr/bin/xcrun', ['--show-sdk-path']), 'read SDK path').stdout.trim()
-  requireSuccess(command(compiler, ['-isysroot', sdk, '-mmacosx-version-min=13.5', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
-    path.join(ROOT, 'agents/codex/workflow/darwin-launchd-listener-supervisor.c'), '-o', supervisor]), 'compile listener supervisor')
   const node = fs.realpathSync.native(process.execPath)
   const [proxyPort, mcpPort] = await reserveDistinctPorts()
   const listeners = { proxy: { fd: 3, host: '::1', port: proxyPort }, mcp: { fd: 4, host: '::1', port: mcpPort } }
@@ -400,10 +389,7 @@ try{
  }
 }catch(error){fail(error)}
 `, { mode: 0o600 })
-  const helper = LOADER.loadDarwinCoalitionHelper()
-  const { createDarwinCoalitionAdapter } = require('../../agents/codex/workflow/darwin-launchd-process.js')
-  const adapter = createDarwinCoalitionAdapter({ controlRoot, providerPrivateOwnershipRoot: root, helper,
-    listenerSupervisor: { path: supervisor, sha256: sha256(fs.readFileSync(supervisor)) } })
+  const adapter = createPlatformProcessAdapter({ platform: 'darwin', darwin: { controlRoot, providerPrivateOwnershipRoot: root } })
   const reservationId = `grok-profile-${crypto.randomUUID()}`
   const record = { reservationId, reservationIdentity: adapter.reservationIdentity(reservationId),
     startupDeadlineAt: new Date(Date.now() + 60000).toISOString(), targetKey: 'darwin-grok-profile' }
