@@ -121,6 +121,13 @@ test('pre-reservation cleanup uses only the launcher not-started capability and 
   assert.equal(fs.existsSync(requestPath), false)
 })
 
+test('oversized AppContainer output bound is rejected and its unstarted resource lease is restored before broker publication', async t => {
+  const f = fixture(t, { outputLimit: 4 * 1024 * 1024 })
+  await assert.rejects(sandbox.prepareWindowsGrokSandbox(f.options), { code: 'WINDOWS_LAUNCH_INVALID' })
+  assert.equal(f.releases.length, 1)
+  assert.equal(fs.readdirSync(f.root).some(name => name.startsWith('grok-broker-')), false)
+})
+
 test('actual Node -e bootstrap forwards the module path and all four bound arguments', t => {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'grok-broker-bootstrap-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

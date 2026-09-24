@@ -45,6 +45,15 @@ test('private Hermes phase journal is exclusive, bounded, and contains fixed fie
   assert.equal(serverModule.createPrivatePhaseJournal(root, 'hermes'), null)
   assert.deepEqual(fs.readFileSync(journal.path), original, 'a second server must not overwrite prior evidence')
   assert.equal(serverModule.createPrivatePhaseJournal(root, 'claude'), null)
+  assert.equal(serverModule.createPrivatePhaseJournal(root, 'constructor'), null)
+
+  const opencodeRoot = path.join(root, 'opencode')
+  fs.mkdirSync(opencodeRoot, { mode: 0o700 })
+  const opencode = serverModule.createPrivatePhaseJournal(opencodeRoot, 'opencode')
+  assert.equal(path.basename(opencode.path), serverModule.OPENCODE_PHASE_JOURNAL)
+  assert.equal(opencode.record({ stage: 'tool-server-start', payload: 'must-not-persist' }), true)
+  opencode.close()
+  assert.deepEqual(records(opencode.path), [{ schemaVersion: 1, sequence: 1, stage: 'tool-server-start' }])
 
   const boundedRoot = path.join(root, 'bounded')
   fs.mkdirSync(boundedRoot, { mode: 0o700 })
@@ -52,6 +61,22 @@ test('private Hermes phase journal is exclusive, bounded, and contains fixed fie
   for (let index = 0; index < 300; index++) bounded.record({ stage: 'tool-call-start' })
   bounded.close()
   assert.equal(records(bounded.path).length, 256)
+})
+
+test('OpenCode tool server creates and closes its provider-specific fixed phase journal', async t => {
+  const root = privateRoot(t), target = path.join(root, 'target'), control = path.join(root, 'control')
+  fs.mkdirSync(target, { mode: 0o700 }); fs.mkdirSync(control, { mode: 0o700 })
+  const prepared = boundary.prepareBoundary({ provider: 'opencode', root: control, policy: {
+    provider: 'opencode', readOnly: true, targetPath: target, scratchPath: null,
+    readableRoots: [target], writableRoots: [], nestedDispatch: false,
+    commandBoundary: true, externalWrites: false,
+  } })
+  const input = new PassThrough(), output = new PassThrough()
+  const server = serverModule.start({ boundary: prepared, input, output, platform: 'linux' })
+  input.end(); await server.closed
+  assert.deepEqual(records(path.join(prepared.root, serverModule.OPENCODE_PHASE_JOURNAL)).map(record => record.stage), [
+    'tool-server-start', 'tool-server-close',
+  ])
 })
 
 test('private phase observer refuses a replaced journal without touching the replacement', t => {
@@ -115,14 +140,16 @@ test('Hermes tool server commits lifecycle phases without request or output data
   input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } })}\n`)
   assert.ok((await next()).result)
   input.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
-  input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'read', arguments: { path: 'input.txt' } } })}\n`)
+  input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`)
+  assert.ok((await next()).result.tools.length > 0)
+  input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'read', arguments: { path: 'input.txt' } } })}\n`)
   assert.equal((await next()).result.structuredContent.status, 'completed')
   input.end(); await server.closed
 
   const phaseFile = path.join(prepared.root, serverModule.HERMES_PHASE_JOURNAL)
   const observed = records(phaseFile)
   assert.deepEqual(observed.map(record => record.stage), [
-    'tool-server-start', 'tool-call-start', 'tool-call-result', 'tool-receipt-committed', 'tool-server-close',
+    'tool-server-start', 'mcp-initialize', 'mcp-tools-list', 'mcp-tools-listed', 'tool-call-start', 'tool-call-result', 'tool-receipt-committed', 'tool-server-close',
   ])
   assert.equal(observed.every(record => Object.keys(record).every(key => ['schemaVersion', 'sequence', 'stage', 'code'].includes(key))), true)
   assert.equal(fs.readFileSync(phaseFile, 'utf8').includes('private-payload'), false)

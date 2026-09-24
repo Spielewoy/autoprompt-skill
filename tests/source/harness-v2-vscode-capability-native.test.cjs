@@ -50,7 +50,8 @@ function sessionDriverDiagnostic(f, record) {
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > 4096 || (process.platform !== 'win32' && (stat.mode & 0o077))) return { state: 'invalid' }
     const entries = fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse)
     if (!entries.length || entries.length > 16 || entries.some(entry => !entry || typeof entry !== 'object' || Array.isArray(entry) ||
-      !['entry', 'beforeactivation', 'afteractivation', 'channelconnected', 'runSession', 'complete', 'error'].includes(entry.stage) ||
+      !['entry', 'beforeactivation', 'afteractivation', 'channelconnected', 'runSession', 'complete', 'error', 'before-session-setup', 'after-session-persist', 'before-model-select', 'after-model-select',
+        'before-model-request', 'after-model-request', 'after-tool-event', 'after-tool-persist'].includes(entry.stage) ||
       (entry.stage === 'error' && !/^[A-Z][A-Z0-9_]{0,63}$/.test(entry.code || '')) ||
       Object.keys(entry).sort().join('\0') !== (entry.stage === 'error' ? 'code\0stage' : 'stage'))) return { state: 'invalid' }
     return { state: 'present', stages: entries.map(entry => entry.stage === 'error' ? `error:${entry.code}` : entry.stage) }

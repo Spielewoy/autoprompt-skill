@@ -23,6 +23,8 @@ const CONFORMANCE_ASSETS = ['tests/source/reasonix-controlled-native.test.cjs', 
 const DARWIN_EXECUTABLES = new Set([
   'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-x64',
   'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-arm64',
+  'agents/codex/workflow/darwin-listener-runtime/listener-supervisor-x64',
+  'agents/codex/workflow/darwin-listener-runtime/listener-supervisor-arm64',
 ])
 function setPackagedMode(relative, target) {
   if (process.platform !== 'win32' && DARWIN_EXECUTABLES.has(relative)) fs.chmodSync(target, 0o700)

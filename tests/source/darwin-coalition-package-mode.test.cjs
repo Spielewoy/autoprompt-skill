@@ -11,6 +11,8 @@ const reasonixPackage = require('../../scripts/reasonix-package.cjs')
 const HELPERS = [
   'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-x64',
   'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-arm64',
+  'agents/codex/workflow/darwin-listener-runtime/listener-supervisor-x64',
+  'agents/codex/workflow/darwin-listener-runtime/listener-supervisor-arm64',
 ]
 
 function assertModes(bundle, expectedHashes) {
@@ -23,7 +25,7 @@ function assertModes(bundle, expectedHashes) {
   assert.equal(fs.statSync(ordinary).mode & 0o777, 0o600)
 }
 
-test('POSIX coalition helpers retain bytes while staged as executable files', { skip: process.platform === 'win32' }, t => {
+test('POSIX coalition and listener helpers retain bytes while staged as executable files', { skip: process.platform === 'win32' }, t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'coalition-package-mode-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const hashes = Object.fromEntries(HELPERS.map(relative => [relative, require('../../agents/reasonix/workflow/native.js').sha256(fs.readFileSync(path.join(__dirname, '..', '..', relative)))]))

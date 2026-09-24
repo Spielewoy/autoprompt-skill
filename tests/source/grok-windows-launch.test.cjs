@@ -130,7 +130,7 @@ test('prepareLaunch reaches the real broker materializer with a sealed worker co
   let stagedCleanup = 0, released = 0
   const resources = { async prepareWindowsAppContainerResources(options) {
     assert.deepEqual(options.policy.writableRoots, [session.privateRoots.cwd, session.privateRoots.scratch, session.privateRoots.home])
-    return Object.freeze({ profileName: 'Autoprompt_fixture', profileSid: 'S-1-15-2-1-2-3-4-5-6-7',
+    return Object.freeze({ profileName: `Autoprompt_${'1'.repeat(32)}`, profileSid: 'S-1-15-2-1-2-3-4-5-6-7',
       environment: Object.freeze({ USERPROFILE: 'C:\\profile', HOME: 'C:\\profile', APPDATA: 'C:\\profile\\AppData\\Roaming', TEMP: session.privateRoots.scratch, TMP: session.privateRoots.scratch }),
       recovery: Object.freeze({ journalPath: journal, leaseId: '1'.repeat(32) }),
       async release(evidence) {
@@ -159,6 +159,8 @@ test('prepareLaunch reaches the real broker materializer with a sealed worker co
       buildWorker: () => ({ payloadSha256: 'c'.repeat(64), moduleSha256: { 'sandbox-worker.cjs': 'd'.repeat(64) }, executable: session.nodeExecutable, argv: ['-e', 'worker'] }),
       createLauncher: () => launcher, resources, helperDeployment } })
   const request = JSON.parse(fs.readFileSync(prepared.launch.argv[4], 'utf8'))
+  assert.equal(require('../../agents/codex/workflow/windows-appcontainer.js').validateLaunch(request.appLaunch).schemaVersion, 1,
+    'the real broker projection must satisfy the production AppContainer request contract')
   const environment = Object.fromEntries(request.appLaunch.environment.map(value => value.split(/=(.*)/s)))
   assert.equal(environment.AUTOPROMPT_GROK_AUDIT_PATH, path.join(session.privateRoots.scratch, 'audit.jsonl'))
   assert.equal(environment.USERPROFILE, 'C:\\profile')

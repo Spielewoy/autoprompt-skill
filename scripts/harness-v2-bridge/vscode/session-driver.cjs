@@ -9,7 +9,9 @@ const crypto = require('node:crypto')
 
 const REQUEST_BASENAME = 'owned-session.json'
 const JOURNAL_BASENAME = 'session-driver-phase.jsonl'
-const STAGES = new Set(['entry', 'beforeactivation', 'afteractivation', 'channelconnected', 'runSession', 'complete'])
+const STAGES = new Set(['entry', 'beforeactivation', 'afteractivation', 'channelconnected', 'runSession', 'complete',
+  'before-session-setup', 'after-session-persist', 'before-model-select', 'after-model-select', 'before-model-request', 'after-model-request',
+  'after-tool-event', 'after-tool-persist'])
 
 function sha256(bytes) { return crypto.createHash('sha256').update(bytes).digest('hex') }
 
@@ -59,12 +61,15 @@ function phaseJournal() {
   const journalPath = path.join(path.dirname(requestPath), JOURNAL_BASENAME)
   const fd = fs.openSync(journalPath, 'wx', 0o600)
   let closed = false
+  const recorded = new Set()
   const append = value => {
     if (closed) throw Object.assign(new Error('Owned VS Code phase journal is closed'), { code: 'PROFILE_INVALID' })
     const stage = value?.stage
     if (!(STAGES.has(stage) || stage === 'error') || (stage === 'error' && !/^[A-Z][A-Z0-9_]{0,63}$/.test(value.code || ''))) {
       throw Object.assign(new Error('Owned VS Code phase journal stage is invalid'), { code: 'PROFILE_INVALID' })
     }
+    if (recorded.has(stage)) return
+    recorded.add(stage)
     const bytes = Buffer.from(`${JSON.stringify(stage === 'error' ? { stage, code: value.code } : { stage })}\n`, 'utf8')
     fs.writeSync(fd, bytes, 0, bytes.length)
     fs.fsyncSync(fd)
@@ -98,7 +103,7 @@ exports.run = async function run() {
     let sessionError = null
     try {
       journal.stage('runSession')
-      await api.runOwnedSession(event => events.emit(event))
+      await api.runOwnedSession(event => events.emit(event), stage => journal.stage(stage))
     } catch (error) { sessionError = error }
     await events.complete()
     if (sessionError) throw sessionError

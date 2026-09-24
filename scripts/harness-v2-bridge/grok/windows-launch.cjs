@@ -181,7 +181,7 @@ async function prepareLaunch(options = {}) {
     brokerNodeSha256: session.brokerNodeSha256, brokerCwd: roots.broker, brokerEnvironment, nodeExecutable: session.nodeExecutable,
     nodeExecutableSha256: session.nodeExecutableSha256, nodeArgs: [], workerArgs: spec.argv, runtime, policy: { readOnly: false, targetPath: roots.cwd,
       scratchPath: roots.scratch, readableRoots: [roots.cwd, roots.scratch, roots.home], writableRoots: [roots.cwd, roots.scratch, roots.home] }, workerEnvironment,
-    pipe, cancellationPath: path.join(roots.runtime, 'cancel'), timeoutMs: 300000, outputLimit: 4 * 1024 * 1024, _dependencies: options._dependencies }
+    pipe, cancellationPath: path.join(roots.runtime, 'cancel'), timeoutMs: 300000, outputLimit: 1024 * 1024, _dependencies: options._dependencies }
     const prepare = options._dependencies?.prepareSandbox || sandbox.prepareWindowsGrokSandbox
     const prepared = await prepare(sandboxOptions)
     const cleanup = prepared.cleanup

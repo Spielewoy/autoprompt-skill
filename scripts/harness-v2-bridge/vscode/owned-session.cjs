@@ -128,10 +128,11 @@ function activateOwned(context, vscode) {
   console.log('AUTOPROMPT_OWNED_SESSION_BEFORE_PROVIDER_REGISTER')
   const receipts = registerProvider(context, vscode, connection, request.outputSchema)
   console.log('AUTOPROMPT_OWNED_SESSION_AFTER_PROVIDER_REGISTER')
-  return { eventChannel: request.eventChannel, runOwnedSession: emit => runSession(vscode, request, connection, prepared, receipts, emit) }
+  return { eventChannel: request.eventChannel, runOwnedSession: (emit, phase) => runSession(vscode, request, connection, prepared, receipts, emit, phase) }
 }
-async function runSession(vscode, request, connection, prepared, receipts, emit) {
+async function runSession(vscode, request, connection, prepared, receipts, emit, phase = () => {}) {
   if (typeof emit !== 'function') fail('PROFILE_INVALID', 'Owned VS Code event sink is invalid')
+  phase('before-session-setup')
   const sessionId = request.continuationId || `vscode-owned-${crypto.randomUUID()}`
   if (!/^vscode-owned-[a-f0-9-]{36}$/.test(sessionId)) fail('SESSION_ID_MISMATCH', 'Invalid owned continuation')
   const root = path.join(request.sessionRoot, 'owned-sessions', sessionId)
@@ -169,8 +170,11 @@ async function runSession(vscode, request, connection, prepared, receipts, emit)
     else state.messages[0] = { role: 'user', parts: [{ type: 'text', text: request.prompt }] }
     state.messages.push({ role: 'user', parts: [{ type: 'text', text: request.input }] })
     persist(state)
+    phase('after-session-persist')
     await report({ type: 'owned.session', sessionId, contextKind: 'autoprompt-extension', extensionHostVersion: vscode.version })
+    phase('before-model-select')
     const models = await vscode.lm.selectChatModels({ vendor: 'autoprompt-owned', id: connection.model })
+    phase('after-model-select')
     if (models.length !== 1) fail('PROVIDER_UNSUPPORTED', 'Owned LM provider was not registered in the actual extension host')
     const tools = (prepared.policy.toolFree === true ? [] : boundary.TOOLS).map(tool => ({ name: controlled.toolName('vscode', tool.name), description: tool.description, inputSchema: tool.inputSchema }))
     for (let step = 0; step < connection.maxSteps; step++) {
@@ -183,9 +187,9 @@ async function runSession(vscode, request, connection, prepared, receipts, emit)
       }
       const unsubscribe = receipts.subscribe(nonce, acceptReceipt)
       try {
-        console.log('AUTOPROMPT_OWNED_SESSION_BEFORE_MODEL_REQUEST')
+        phase('before-model-request')
         const response = await models[0].sendRequest(state.messages.map(message => deserialize(vscode, message)), { tools, modelOptions: { autopromptRequest: nonce } }, cancellation.token)
-        console.log('AUTOPROMPT_OWNED_SESSION_AFTER_MODEL_REQUEST')
+        phase('after-model-request')
         for await (const part of response.stream) {
           if (part instanceof vscode.LanguageModelDataPart && part.mimeType === MIME) {
             const streamed = JSON.parse(Buffer.from(part.data).toString('utf8'))
@@ -221,9 +225,9 @@ async function runSession(vscode, request, connection, prepared, receipts, emit)
         boundary.appendReceipt(prepared, name, call.args, result, started)
         const text = JSON.stringify(result)
         await report({ type: 'owned.tool.end', id: call.id, output: text, error: result.status !== 'completed' })
-        console.log('AUTOPROMPT_OWNED_SESSION_AFTER_TOOL_EVENT')
+        phase('after-tool-event')
         state.messages.push({ role: 'user', parts: [{ type: 'result', id: call.id, text }] }); persist(state)
-        console.log('AUTOPROMPT_OWNED_SESSION_AFTER_TOOL_PERSIST')
+        phase('after-tool-persist')
       }
     }
     fail('CHILD_RESULT_MISSING', 'Owned conversation reached its bounded step limit')

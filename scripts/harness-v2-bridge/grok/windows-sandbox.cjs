@@ -394,6 +394,7 @@ async function prepareWindowsGrokSandbox(options = {}) {
   try {
     const resourceJournalBinding = boundFile(lease.recovery.journalPath, 8 * 1024 * 1024)
     const semantic = semanticLaunch(options, policy, runtime, worker, launcher, lease, binding, appNodeBinding, brokerNodeBinding, resourceJournalBinding, helperDeploymentBinding)
+    require('../../../agents/codex/workflow/windows-appcontainer.js').validateLaunch(semantic.appLaunch)
     const moduleBinding = boundFile(__filename)
     const requestPath = path.join(options.controlRoot, `grok-broker-${lease.recovery.leaseId}.json`)
     const bytes = Buffer.from(`${JSON.stringify(semantic)}\n`)

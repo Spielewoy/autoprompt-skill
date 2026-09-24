@@ -10,10 +10,12 @@ const fs = require('node:fs')
 const net = require('node:net')
 const os = require('node:os')
 const path = require('node:path')
+const { PassThrough } = require('node:stream')
 const test = require('node:test')
 const native = require('../../scripts/harness-v2-native.cjs')
 const controlled = require('../../scripts/harness-v2-controlled-tools.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
+const toolServer = require('../../scripts/harness-v2-tool-server.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
@@ -141,9 +143,74 @@ function ownerRegistryDiagnostic(file) {
     return { records: Array.isArray(value.records) ? value.records.slice(0, 16).map(record => ({ status: record.status || null, rootPid: Number.isSafeInteger(record.rootPid) ? record.rootPid : null, groupIdentity: typeof record.groupIdentity === 'string' ? record.groupIdentity.slice(0, 256) : null })) : [] }
   } catch { return { status: 'unavailable' } }
 }
+function opencodeToolPhaseDiagnostic(f) {
+  const samePath = (left, right) => process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right
+  const sameIdentity = (left, right) => left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.nlink === right.nlink
+  const readJournal = file => {
+    let fd
+    try {
+      const before = fs.lstatSync(file)
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size < 1 || before.size > DIAGNOSTIC_FILE_LIMIT ||
+          !samePath(fs.realpathSync.native(file), file)) return null
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+      const opened = fs.fstatSync(fd)
+      if (!opened.isFile() || opened.nlink !== 1 || !sameIdentity(before, opened)) return null
+      const bytes = Buffer.alloc(opened.size)
+      let offset = 0
+      while (offset < bytes.length) {
+        const count = fs.readSync(fd, bytes, offset, bytes.length - offset, offset)
+        if (!count) return null
+        offset += count
+      }
+      const after = fs.fstatSync(fd)
+      if (!sameIdentity(opened, after)) return null
+      const lines = bytes.toString('utf8').split('\n').filter(Boolean)
+      if (!lines.length || lines.length > 256) return { status: 'invalid', bytes: opened.size, records: [] }
+      const records = lines.map((line, index) => {
+        let value
+        try { value = JSON.parse(line) } catch { return null }
+        const keys = Object.keys(value || {}).sort().join(',')
+        if (!value || !['schemaVersion,sequence,stage', 'code,schemaVersion,sequence,stage'].includes(keys) ||
+            value.schemaVersion !== 1 || value.sequence !== index + 1 || !toolServer.PHASE_STAGES.has(value.stage) ||
+            value.code !== undefined && !/^[A-Z][A-Z0-9_]{0,63}$/u.test(value.code)) return null
+        return { sequence: value.sequence, stage: value.stage, ...(value.code ? { code: value.code } : {}) }
+      })
+      return records.some(record => record === null)
+        ? { status: 'invalid', bytes: opened.size, records: [] }
+        : { status: 'available', bytes: opened.size, records }
+    } catch { return null } finally { if (fd !== undefined) try { fs.closeSync(fd) } catch {} }
+  }
+  try {
+    if (!f || typeof f.scratch !== 'string' || typeof f.nativeRoot !== 'string') return { status: 'unavailable' }
+    const toolRoot = path.resolve(path.dirname(f.scratch), 'tool-control')
+    const nativeRoot = path.resolve(f.nativeRoot)
+    const relative = path.relative(nativeRoot, toolRoot)
+    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return { status: 'unavailable' }
+    const rootBefore = fs.lstatSync(toolRoot)
+    if (!rootBefore.isDirectory() || rootBefore.isSymbolicLink() || !samePath(fs.realpathSync.native(toolRoot), toolRoot)) return { status: 'unavailable' }
+    const entries = fs.readdirSync(toolRoot, { withFileTypes: true })
+    if (entries.length > 8) return { status: 'invalid', bytes: 0, records: [] }
+    const journals = []
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink() || !/^tools-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u.test(entry.name)) continue
+      const child = path.join(toolRoot, entry.name)
+      const item = fs.lstatSync(child)
+      if (!item.isDirectory() || item.isSymbolicLink() || !samePath(fs.realpathSync.native(child), child)) continue
+      const journal = readJournal(path.join(child, toolServer.OPENCODE_PHASE_JOURNAL))
+      const after = fs.lstatSync(child)
+      if (after.dev !== item.dev || after.ino !== item.ino || after.nlink !== item.nlink || !after.isDirectory() || after.isSymbolicLink() ||
+          !samePath(fs.realpathSync.native(child), child)) continue
+      if (journal) journals.push(journal)
+    }
+    const rootAfter = fs.lstatSync(toolRoot)
+    if (rootAfter.dev !== rootBefore.dev || rootAfter.ino !== rootBefore.ino || rootAfter.nlink !== rootBefore.nlink ||
+        !samePath(fs.realpathSync.native(toolRoot), toolRoot) || journals.length !== 1) return journals.length ? { status: 'invalid', bytes: 0, records: [] } : { status: 'unavailable' }
+    return journals[0]
+  } catch { return { status: 'unavailable' } }
+}
 
-test('OpenCode fixture diagnostics expose bounded proxy and owner state without request contents', t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-diagnostic-'))
+test('OpenCode fixture diagnostics expose bounded proxy, tool, model-service and owner state without request contents', async t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-diagnostic-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const session = path.join(root, 'a'.repeat(32)); fs.mkdirSync(session)
   fs.writeFileSync(path.join(session, 'request.json'), JSON.stringify({ secret: 'must-not-be-read' }))
@@ -161,9 +228,43 @@ test('OpenCode fixture diagnostics expose bounded proxy and owner state without 
   const registry = path.join(root, 'processes.json')
   fs.writeFileSync(registry, JSON.stringify({ records: [{ status: 'RUNNING', rootPid: 1234, groupIdentity: 'owned-group' }] }))
   assert.deepEqual(ownerRegistryDiagnostic(registry), { records: [{ status: 'RUNNING', rootPid: 1234, groupIdentity: 'owned-group' }] })
+
+  const nativeRoot = path.join(root, 'native'), reservation = path.join(nativeRoot, 'opencode', 'session', 'reservation')
+  const scratch = path.join(reservation, 'scratch'), toolRoot = path.join(reservation, 'tool-control'), target = path.join(root, 'target')
+  fs.mkdirSync(scratch, { recursive: true }); privateDirectory(toolRoot); fs.mkdirSync(target)
+  // Match production: prepareBoundary creates the random immediate tools-* child
+  // and the real server creates the phase journal inside that child.
+  const prepared = boundary.prepareBoundary({ provider: 'opencode', root: toolRoot, policy: {
+    readOnly: true, targetPath: target, scratchPath: scratch, readableRoots: [target, scratch], writableRoots: [scratch],
+    nestedDispatch: false, commandBoundary: true, externalWrites: false,
+  } })
+  const phaseInput = new PassThrough(), phaseOutput = new PassThrough()
+  const phaseServer = toolServer.start({ boundary: prepared, input: phaseInput, output: phaseOutput, platform: 'linux' })
+  phaseInput.end(); await phaseServer.closed
+  const phaseBytes = fs.readFileSync(path.join(prepared.root, toolServer.OPENCODE_PHASE_JOURNAL))
+  assert.deepEqual(opencodeToolPhaseDiagnostic({ nativeRoot, scratch }), { status: 'available', bytes: phaseBytes.length, records: [
+    { sequence: 1, stage: 'tool-server-start' }, { sequence: 2, stage: 'tool-server-close' },
+  ] })
+  const failure = buildFixtureFailureDiagnostic({ nativeRoot, scratch, proxyRoot: root, registryPath: registry,
+    modelService: { requests: [{ secret: 'model-request-must-not-persist' }], errors: ['model-error-must-not-persist'] } },
+  Object.assign(new Error('failed'), { code: 'TOOL_OUTPUT_INCOMPLETE' }))
+  assert.deepEqual(failure.modelService, { requests: 1, errors: 1 })
+  assert.equal(failure.toolPhases.records.at(-1).stage, 'tool-server-close')
+  assert.equal(JSON.stringify(failure).includes('model-request-must-not-persist'), false)
+  assert.equal(JSON.stringify(failure).includes('model-error-must-not-persist'), false)
+  // A direct root file is not a prepared boundary child and cannot be selected.
+  fs.writeFileSync(path.join(toolRoot, toolServer.OPENCODE_PHASE_JOURNAL), phaseBytes, { flag: 'wx' })
+  assert.equal(opencodeToolPhaseDiagnostic({ nativeRoot, scratch }).status, 'available')
+  fs.appendFileSync(path.join(prepared.root, toolServer.OPENCODE_PHASE_JOURNAL),
+    '{"schemaVersion":1,"sequence":3,"stage":"foreign-secret-stage","payload":"must-not-persist"}\n')
+  const invalid = opencodeToolPhaseDiagnostic({ nativeRoot, scratch })
+  assert.deepEqual(invalid.records, [])
+  assert.equal(invalid.status, 'invalid')
+  assert.equal(JSON.stringify(invalid).includes('must-not-persist'), false)
+
 })
 
-function fixtureFailureDiagnostic(f, error) {
+function buildFixtureFailureDiagnostic(f, error) {
   // Capture the synthetic provider events before the real runner drains and
   // removes its private transcript. No ambient files or user logs are read.
   const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024),
@@ -171,7 +272,10 @@ function fixtureFailureDiagnostic(f, error) {
     stderr: String(f.nativeStderr || '').slice(-8192), events: [...(f.nativeEvents || [])],
     launchStages: [...(f.launchStages || [])].slice(-32),
     proxy: privateProxyDiagnostics(f.proxyRoot),
-    owner: ownerRegistryDiagnostic(f.registryPath) }
+    owner: ownerRegistryDiagnostic(f.registryPath),
+    modelService: { requests: Array.isArray(f.modelService?.requests) ? f.modelService.requests.length : 0,
+      errors: Array.isArray(f.modelService?.errors) ? f.modelService.errors.length : 0 },
+    toolPhases: opencodeToolPhaseDiagnostic(f) }
   while (Buffer.byteLength(JSON.stringify(output)) > 65536 && output.events.length) output.events.shift()
   // The event list is disposable, but the fixed proxy/owner diagnostics can
   // also fill the bound. Never spin forever once events are exhausted.
@@ -183,7 +287,10 @@ function fixtureFailureDiagnostic(f, error) {
     output.stderr = String(output.stderr).slice(-1024)
     output.details = typeof output.details === 'string' ? output.details.slice(0, 1024) : null
   }
-  console.error(JSON.stringify(output))
+  return output
+}
+function fixtureFailureDiagnostic(f, error) {
+  console.error(JSON.stringify(buildFixtureFailureDiagnostic(f, error)))
 }
 
 async function scenario(provider, options = {}) {
@@ -195,6 +302,7 @@ async function scenario(provider, options = {}) {
   let service, owner
   try {
     service = await modelService(provider, options.tool || { name: controlled.toolName(provider, 'bash'), args: { command: readCommand(candidate) } }, { resetToolAfterCompletion: true, ...(options.serviceOptions || {}) })
+    f.modelService = service
     const probeStarted = Date.now(); f.launchStages = [{ stage: 'probeExecutable', phase: 'started', elapsedMs: 0 }]
     const binding = native.probeExecutable({ provider, executable: cli })
     f.launchStages.push({ stage: 'probeExecutable', phase: 'completed', elapsedMs: Date.now() - probeStarted })

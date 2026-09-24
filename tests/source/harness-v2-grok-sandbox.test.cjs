@@ -544,3 +544,80 @@ test('Grok relay close preserves a replacement file at either short or deep sock
     assert.equal(fs.readFileSync(socketPath, 'utf8'), 'foreign replacement')
   }
 })
+
+test('Darwin relay maps a long requested path through a private short alias and removes exact owned state', { skip: process.platform === 'win32' }, async t => {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'grok-darwin-relay-')))
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  const temporary = path.join(base, 'tmp'), deep = path.join(base, 'deep-'.repeat(30))
+  fs.mkdirSync(temporary, { mode: 0o700 }); fs.mkdirSync(deep, { mode: 0o700 })
+  const requested = path.join(deep, 'caller-requested-relay.sock'), token = relayToken()
+  const relay = createUnixRelay({ socketPath: requested, relayToken: token, upstreamUrl: 'http://unused.invalid', upstreamAuthorization: 'Bearer fixture',
+    fetchImpl: async () => new Response('darwin-short-relay-response') },
+  { platform: 'darwin', darwinTemporaryRoot: temporary, randomBytes: size => Buffer.alloc(size, 0x31) })
+  const address = await relay.listen(), shortRoot = path.dirname(path.dirname(address)), physical = path.join(deep, 'r.sock')
+  assert.ok(Buffer.byteLength(address) < 104)
+  assert.equal(fs.lstatSync(path.dirname(address)).isSymbolicLink(), true)
+  assert.equal(fs.lstatSync(physical).isSocket(), true)
+  const request = createUnixRelayFetch({ socketPath: address, relayToken: token })
+  assert.equal(await (await request('relay://controller', { method: 'POST', headers: {}, body: '{}' })).text(), 'darwin-short-relay-response')
+  await relay.close()
+  assert.equal(relay.cleanupConfirmed, true)
+  assert.equal(fs.existsSync(physical), false)
+  assert.equal(fs.existsSync(shortRoot), false)
+})
+
+test('Darwin relay cleanup retains foreign socket and short-root replacements', { skip: process.platform === 'win32' }, async t => {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'grok-darwin-replace-')))
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  const temporary = path.join(base, 'tmp'); fs.mkdirSync(temporary, { mode: 0o700 })
+  for (const replacement of ['socket', 'root', 'alias', 'target']) {
+    const deep = path.join(base, replacement); fs.mkdirSync(deep, { mode: 0o700 })
+    const relay = createUnixRelay({ socketPath: path.join(deep, 'requested.sock'), relayToken: relayToken(), upstreamUrl: 'http://unused.invalid', upstreamAuthorization: 'Bearer fixture',
+      fetchImpl: async () => new Response('unused') },
+    { platform: 'darwin', darwinTemporaryRoot: temporary, randomBytes: size => Buffer.alloc(size,
+      { socket: 0x32, root: 0x33, alias: 0x35, target: 0x36 }[replacement]) })
+    const address = await relay.listen(), shortRoot = path.dirname(path.dirname(address)), physical = path.join(deep, 'r.sock')
+    let heldRoot = null, foreignFile = physical
+    if (replacement === 'socket') {
+      fs.unlinkSync(physical); fs.writeFileSync(physical, 'foreign-socket-replacement')
+    } else if (replacement === 'root') {
+      heldRoot = `${shortRoot}.held`; fs.renameSync(shortRoot, heldRoot)
+      fs.mkdirSync(path.dirname(address), { recursive: true, mode: 0o700 })
+      fs.writeFileSync(address, 'foreign-root-replacement')
+      foreignFile = address
+    } else if (replacement === 'alias') {
+      const foreignTarget = path.join(base, 'foreign-alias-target'); fs.mkdirSync(foreignTarget, { mode: 0o700 })
+      fs.unlinkSync(path.dirname(address)); fs.symlinkSync(foreignTarget, path.dirname(address), 'dir')
+      foreignFile = path.join(foreignTarget, 'r.sock'); fs.writeFileSync(foreignFile, 'foreign-alias-replacement')
+    } else {
+      const heldTarget = `${deep}.held`; fs.renameSync(deep, heldTarget); fs.mkdirSync(deep, { mode: 0o700 })
+      fs.writeFileSync(physical, 'foreign-target-replacement')
+    }
+    await assert.rejects(relay.close(), { code: 'GROK_RELAY_IDENTITY_CHANGED' })
+    assert.equal(relay.cleanupConfirmed, false)
+    assert.equal(fs.readFileSync(foreignFile, 'utf8'), `foreign-${replacement}-replacement`)
+    if (replacement === 'root') {
+      fs.rmSync(shortRoot, { recursive: true }); fs.renameSync(heldRoot, shortRoot)
+      await new Promise(resolve => relay.server.close(resolve))
+    } else if (replacement === 'alias') {
+      fs.unlinkSync(path.dirname(address)); fs.symlinkSync(deep, path.dirname(address), 'dir')
+      await new Promise(resolve => relay.server.close(resolve))
+    }
+  }
+})
+
+test('Darwin relay listen failure preserves a foreign physical socket and removes its unused alias root', { skip: process.platform === 'win32' }, async t => {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'grok-darwin-listen-fail-')))
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  const temporary = path.join(base, 'tmp'), deep = path.join(base, 'deep')
+  fs.mkdirSync(temporary, { mode: 0o700 }); fs.mkdirSync(deep, { mode: 0o700 })
+  const physical = path.join(deep, 'r.sock'); fs.writeFileSync(physical, 'foreign-before-listen')
+  const relay = createUnixRelay({ socketPath: path.join(deep, 'requested.sock'), relayToken: relayToken(), upstreamUrl: 'http://unused.invalid', upstreamAuthorization: 'Bearer fixture',
+    fetchImpl: async () => new Response('unused') },
+  { platform: 'darwin', darwinTemporaryRoot: temporary, randomBytes: size => Buffer.alloc(size, 0x34) })
+  await assert.rejects(relay.listen())
+  assert.equal(fs.readFileSync(physical, 'utf8'), 'foreign-before-listen')
+  assert.deepEqual(fs.readdirSync(temporary), [])
+  assert.equal(relay.cleanupConfirmed, true)
+  await relay.close()
+})

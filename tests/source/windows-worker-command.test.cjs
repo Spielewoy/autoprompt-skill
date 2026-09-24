@@ -11,12 +11,12 @@ function setup(t,scenario={}){
  const launcher={verifyDrainEvidence(){},proveNotStarted(){return evidence},async launch(request){events.push('launch');if(scenario.inspectLaunch)scenario.inspectLaunch(request);if(scenario.launchError)throw scenario.launchError;assert.ok([...materializedRoots].some(root=>request.executable===path.join(root,'usr/bin/bash.exe')));assert.equal(request.executableSha256,'b'.repeat(64));assert.equal(request.msysRuntime.dllSha256,'c'.repeat(64));assert.equal(request.environment.find(s=>s.startsWith('PATH=')),`PATH=${path.dirname(request.executable)}`);assert.equal(request.environment.some(s=>s.startsWith('AUTOPROMPT_WINDOWS_BASH=')),false);return evidence}}
  const replacements={
   'node:fs':scenario.filesystem||fs,
-  './windows-appcontainer-probe.js':{failureDiagnostic:require('../../agents/codex/workflow/windows-appcontainer-probe.js').failureDiagnostic,canaryKey(){return scenario.key||'e'.repeat(64)},async runWindowsAppContainerCanary(execute,worker,key){canaries.push({execute,worker,key});if(scenario.canaryWait)await scenario.canaryWait;if(scenario.canaryError)throw scenario.canaryError;if(scenario.canaryExec)await execute({scratchPath:scratch,readableRoots:[scratch],writableRoots:[scratch]},{command:'fixed-native-canary',cwd:scratch},{controlRoot});return scenario.canaryResult||{supported:true,workerIdentity:identity,runtimeSha256:key,processCleanup:'owned-job-drained'}}},
+  './windows-appcontainer-probe.js':{failureDiagnostic:require('../../agents/codex/workflow/windows-appcontainer-probe.js').failureDiagnostic,canaryKey(){return scenario.key||'e'.repeat(64)},async runWindowsAppContainerCanary(execute,worker,key){canaries.push({execute,worker,key});if(scenario.canaryWait)await scenario.canaryWait;if(scenario.canaryError)throw scenario.canaryError;if(scenario.canaryExec)try{await execute({scratchPath:scratch,readableRoots:[scratch],writableRoots:[scratch]},{command:'fixed-native-canary',cwd:scratch},{controlRoot})}catch(error){if(!scenario.canaryCaptureExecutionError)throw error;return{supported:false,code:error.code||'COMMAND_SANDBOX_UNSUPPORTED',diagnostic:require('../../agents/codex/workflow/windows-appcontainer-probe.js').failureDiagnostic(error,'command-launch')}}return scenario.canaryResult||{supported:true,workerIdentity:identity,runtimeSha256:key,processCleanup:'owned-job-drained'}}},
   './safe-run-root.js':{ensureWindowsPrivateAcl(){},createWindowsCompilerDirectory(prefix){
     assert.equal(prefix,'autoprompt-command-');fs.mkdirSync(shallowRoot,{recursive:true})
     stagingRoot=fs.mkdtempSync(path.join(shallowRoot,prefix));return stagingRoot
   }},
-  './windows-filesystem.js':{createWindowsFilesystemCapture(){return{assertRecordParent(witness){assert.equal(witness,path.join(controlRoot,'command-parent-check'));events.push('control-audit')}}}},
+  './windows-filesystem.js':{createWindowsFilesystemCapture(){return{assertRecordParent(witness){assert.equal(witness,path.join(controlRoot,'command-parent-check'));events.push('control-audit');if(scenario.controlAuditError)throw scenario.controlAuditError}}}},
   'node:child_process':{spawnSync(){assert.fail('Production must never discover or launch an ambient Bash')}},
   './windows-worker-loader.js':{async captureWorkerTuple(binding){events.push('capture');if(scenario.expectedControllerNode)assert.deepEqual({...binding},{...scenario.expectedControllerNode});if(scenario.captureError)throw scenario.captureError;return tuple},describeTuple(value){assert.equal(value,tuple);return{identity}},revalidateTuple(value){assert.equal(value,tuple);if(scenario.revalidationError)throw scenario.revalidationError;return{identity}},materializeTuple(value,directory){events.push('materialize');assert.equal(value,tuple);materializedRoot=directory;materializedRoots.add(directory);if(scenario.materialize)return scenario.materialize(directory);fs.mkdirSync(directory);fs.writeFileSync(path.join(directory,'retained'),'owned');if(scenario.materializeError)throw scenario.materializeError;return{identity:scenario.wrongIdentity?'d'.repeat(64):identity,bash:path.join(directory,'usr/bin/bash.exe'),bashSha256:'b'.repeat(64),msysRuntime:{dllPath:path.join(directory,'usr/bin/msys-2.0.dll'),dllSha256:'c'.repeat(64),sharedId:'msys-2.0S5'}}}},
   './windows-helper-deployment.js':{stageWindowsHelperDeployment(parent){events.push('stage');assert.equal(parent,stagingRoot);const ownedHelperRoot=path.join(parent,'native-helpers-owned');helperRoot=ownedHelperRoot;fs.mkdirSync(ownedHelperRoot);return{root:ownedHelperRoot,cleanup(){events.push('helper-cleanup');if(scenario.cleanupError)throw scenario.cleanupError;fs.rmSync(ownedHelperRoot,{recursive:true,force:true})}}}},
@@ -44,6 +44,18 @@ test('rejected native canary reports only bounded structural diagnostic fields',
  })
  assert.deepEqual(phases.map(phase=>phase.stage),['worker-admission-start','worker-canary-start','worker-canary-failed','worker-admission-failed'])
  assert.equal(phases.at(-2).code,'COMMAND_SANDBOX_UNSUPPORTED')
+})
+test('raw canary EPERM reports its fixed tuple boundary without private values',async t=>{
+ const raw=Object.assign(Error('EPERM C:\\private\\controller\\secret-token arbitrary-user-command'),{code:'EPERM'})
+ const x=setup(t,{canaryExec:true,canaryCaptureExecutionError:true,controlAuditError:raw})
+ await assert.rejects(x.run(),error=>{
+  assert.equal(error.code,'COMMAND_SANDBOX_UNSUPPORTED')
+  assert.match(error.message,/\[canary phase=command-launch code=EPERM stage=control-root\]$/)
+  assert.doesNotMatch(error.message,/private|secret-token|arbitrary-user-command/i)
+  return true
+ })
+ assert.equal(x.events.includes('stage'),false)
+ assert.equal(x.events.includes('launch'),false)
 })
 test('canary diagnostics accept only an exact fixed probe marker',async t=>{
  for(const [stderr,expected] of [['APPCONTAINER_PROBE_FAILURE:network:CHECK',true],['APPCONTAINER_PROBE_FAILURE:network:CHECK\nPRIVATE_TOKEN=secret',false],['APPCONTAINER_PROBE_FAILURE:foreign:CHECK',false]]){

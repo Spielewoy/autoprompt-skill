@@ -32,6 +32,9 @@ test('VS Code session driver writes fixed phases beneath the byte-bound request 
   const journal = phaseJournal()
   journal.stage('entry')
   journal.stage('beforeactivation')
+  journal.stage('before-model-request')
+  for (let i = 0; i < 1000; i++) journal.stage('before-model-request')
+  assert.throws(() => journal.stage('request-secret'), error => error.code === 'PROFILE_INVALID')
   journal.error({ code: 'VSCODE_EVENT_CHANNEL_FAILED' })
   journal.close()
   assert.throws(() => phaseJournal(), error => error?.code === 'EEXIST')
@@ -41,7 +44,7 @@ test('VS Code session driver writes fixed phases beneath the byte-bound request 
   assert.equal(stat.isSymbolicLink(), false)
   if (process.platform !== 'win32') assert.equal(stat.mode & 0o077, 0)
   assert.deepEqual(fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse), [
-    { stage: 'entry' }, { stage: 'beforeactivation' }, { stage: 'error', code: 'VSCODE_EVENT_CHANNEL_FAILED' },
+    { stage: 'entry' }, { stage: 'beforeactivation' }, { stage: 'before-model-request' }, { stage: 'error', code: 'VSCODE_EVENT_CHANNEL_FAILED' },
   ])
 }))
 

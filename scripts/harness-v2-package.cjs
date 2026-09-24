@@ -43,6 +43,8 @@ const HASH = /^[a-f0-9]{64}$/
 const DARWIN_EXECUTABLES = new Set([
   'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-x64',
   'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-arm64',
+  'agents/codex/workflow/darwin-listener-runtime/listener-supervisor-x64',
+  'agents/codex/workflow/darwin-listener-runtime/listener-supervisor-arm64',
 ])
 function fail(code, message) { throw new PackageError(code, message) }
 function setPackagedMode(relative, target) {

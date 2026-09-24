@@ -32,6 +32,47 @@ function validateRelayAddress(socketPath, platform = process.platform) {
   } else if (!socketPath.startsWith('/')) fail('GROK_RELAY_CONFIG_INVALID', 'Unix relay socket path is invalid')
   return socketPath
 }
+function statIdentity(stat) { return { dev: String(stat.dev), ino: String(stat.ino) } }
+function sameIdentity(left, right) { return left && right && left.dev === right.dev && left.ino === right.ino }
+function allocateDarwinRelayRoot(requestedPath, dependencies = {}) {
+  const randomBytes = dependencies.randomBytes || crypto.randomBytes
+  if (typeof randomBytes !== 'function') fail('GROK_RELAY_CONFIG_INVALID', 'Darwin relay randomness is unavailable')
+  let parent
+  try {
+    parent = fs.realpathSync.native(dependencies.darwinTemporaryRoot || '/tmp')
+    const parentStat = fs.lstatSync(parent, { bigint: true })
+    if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) throw new Error('not a physical directory')
+  } catch { fail('GROK_RELAY_CONFIG_INVALID', 'Darwin relay temporary root is unavailable') }
+  let target, targetIdentity
+  try {
+    target = fs.realpathSync.native(path.dirname(requestedPath))
+    const targetStat = fs.lstatSync(target, { bigint: true })
+    if (!targetStat.isDirectory() || targetStat.isSymbolicLink() || targetStat.uid !== BigInt(process.getuid()) ||
+        (targetStat.mode & 0o077n) !== 0n) throw new Error('not private')
+    targetIdentity = statIdentity(targetStat)
+  } catch { fail('GROK_RELAY_CONFIG_INVALID', 'Darwin relay target directory must be physical and private') }
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const nonce = randomBytes(8)
+    if (!Buffer.isBuffer(nonce) || nonce.length !== 8) fail('GROK_RELAY_CONFIG_INVALID', 'Darwin relay randomness is invalid')
+    const root = path.join(parent, `ap-gr-${nonce.toString('hex')}`)
+    try { fs.mkdirSync(root, { mode: 0o700 }) } catch (error) { if (error.code === 'EEXIST') continue; throw error }
+    try {
+      const stat = fs.lstatSync(root, { bigint: true })
+      if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== BigInt(process.getuid()) || (stat.mode & 0o077n) !== 0n ||
+          fs.realpathSync.native(root) !== root) fail('GROK_RELAY_CONFIG_INVALID', 'Darwin relay directory is not private')
+      const alias = path.join(root, 'd')
+      fs.symlinkSync(target, alias, 'dir')
+      const aliasStat = fs.lstatSync(alias, { bigint: true })
+      if (!aliasStat.isSymbolicLink() || fs.readlinkSync(alias) !== target) fail('GROK_RELAY_CONFIG_INVALID', 'Darwin relay alias changed during allocation')
+      return { root, identity: statIdentity(stat), alias, aliasIdentity: statIdentity(aliasStat), target, targetIdentity,
+        physicalSocketPath: path.join(target, 'r.sock'), socketPath: path.join(alias, 'r.sock') }
+    } catch (error) {
+      try { fs.rmdirSync(root) } catch {}
+      throw error
+    }
+  }
+  fail('GROK_RELAY_CONFIG_INVALID', 'Darwin relay directory allocation collided repeatedly')
+}
 async function boundedResponseText(response, limit = 32 * 1024 * 1024) {
   if (!response.body || typeof response.body.getReader !== 'function') fail('GROK_RELAY_FAILURE', 'Upstream response is not a readable stream')
   const reader = response.body.getReader(), chunks = []; let size = 0
@@ -40,8 +81,8 @@ async function boundedResponseText(response, limit = 32 * 1024 * 1024) {
   } finally { reader.releaseLock?.() }
   return Buffer.concat(chunks).toString('utf8')
 }
-function createUnixRelay(options = {}) {
-  const relayPlatform = process.platform
+function createUnixRelay(options = {}, dependencies = {}) {
+  const relayPlatform = dependencies.platform || process.platform
   const socketPath = validateRelayAddress(options.socketPath, relayPlatform)
   const relayToken = token(options.relayToken)
   const upstreamUrl = options.upstreamUrl
@@ -53,6 +94,8 @@ function createUnixRelay(options = {}) {
       typeof upstreamAuthorization !== 'string' || !upstreamAuthorization || typeof fetchImpl !== 'function' ||
       !Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 2147483647) fail('GROK_RELAY_CONFIG_INVALID', 'Unix relay configuration is invalid')
   let closed = false, ownedSocket = false, closePromise = null, directoryFd = null, socketIdentity = null
+  let darwinRoot = null, darwinRootIdentity = null, darwinAlias = null, darwinAliasIdentity = null
+  let darwinTarget = null, darwinTargetIdentity = null, physicalSocketPath = null, cleanupConfirmed = relayPlatform !== 'darwin'
   let bindPath = socketPath, connectPath = socketPath
   const sockets = new Set(), controllers = new Set()
   const server = net.createServer(socket => {
@@ -148,18 +191,81 @@ function createUnixRelay(options = {}) {
       while ((index = buffer.indexOf('\n')) !== -1) { const line = buffer.slice(0, index); buffer = buffer.slice(index + 1); if (line) chain = chain.then(() => handle(line)) }
     })
   })
+  const validateDarwinChain = () => {
+    let rootStat, aliasStat, targetStat
+    try {
+      rootStat = fs.lstatSync(darwinRoot, { bigint: true })
+      aliasStat = fs.lstatSync(darwinAlias, { bigint: true })
+      targetStat = fs.lstatSync(darwinTarget, { bigint: true })
+    } catch { fail('GROK_RELAY_IDENTITY_CHANGED', 'Darwin relay path changed before use') }
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || !sameIdentity(statIdentity(rootStat), darwinRootIdentity) ||
+        fs.realpathSync.native(darwinRoot) !== darwinRoot || rootStat.uid !== BigInt(process.getuid()) || (rootStat.mode & 0o077n) !== 0n ||
+        !aliasStat.isSymbolicLink() || !sameIdentity(statIdentity(aliasStat), darwinAliasIdentity) || fs.readlinkSync(darwinAlias) !== darwinTarget ||
+        !targetStat.isDirectory() || targetStat.isSymbolicLink() || !sameIdentity(statIdentity(targetStat), darwinTargetIdentity) ||
+        fs.realpathSync.native(darwinTarget) !== darwinTarget || targetStat.uid !== BigInt(process.getuid()) || (targetStat.mode & 0o077n) !== 0n) {
+      fail('GROK_RELAY_IDENTITY_CHANGED', 'Darwin relay path identity changed before use')
+    }
+  }
+  const revokeDarwinRelay = async () => {
+    if (!darwinRoot) { cleanupConfirmed = true; return }
+    let rootStat, aliasStat
+    try { rootStat = fs.lstatSync(darwinRoot, { bigint: true }) } catch {}
+    if (!rootStat || !rootStat.isDirectory() || rootStat.isSymbolicLink() ||
+        !sameIdentity(statIdentity(rootStat), darwinRootIdentity) || fs.realpathSync.native(darwinRoot) !== darwinRoot) {
+      server.unref()
+      fail('GROK_RELAY_IDENTITY_CHANGED', 'Darwin relay directory changed before cleanup')
+    }
+    try { aliasStat = fs.lstatSync(darwinAlias, { bigint: true }) } catch {}
+    if (!aliasStat || !aliasStat.isSymbolicLink() || !sameIdentity(statIdentity(aliasStat), darwinAliasIdentity) ||
+        fs.readlinkSync(darwinAlias) !== darwinTarget) {
+      server.unref()
+      fail('GROK_RELAY_IDENTITY_CHANGED', 'Darwin relay alias changed before cleanup')
+    }
+    // Revoking the exact alias first makes libuv's recorded pathname inert.
+    // Every later failure can close the listener without touching a foreign
+    // replacement at either the deep path or short-root name.
+    fs.unlinkSync(darwinAlias)
+    let failure = null, targetStat = null
+    try { targetStat = fs.lstatSync(darwinTarget, { bigint: true }) } catch {}
+    if (!targetStat || !targetStat.isDirectory() || targetStat.isSymbolicLink() ||
+        !sameIdentity(statIdentity(targetStat), darwinTargetIdentity) || fs.realpathSync.native(darwinTarget) !== darwinTarget) {
+      failure = new GrokRelayError('GROK_RELAY_IDENTITY_CHANGED', 'Darwin relay target directory changed before cleanup')
+    } else if (socketIdentity) {
+      let current = null
+      try { current = fs.lstatSync(physicalSocketPath, { bigint: true }) } catch {}
+      if (!current || !current.isSocket() || !sameIdentity(statIdentity(current), statIdentity(socketIdentity))) {
+        failure = new GrokRelayError('GROK_RELAY_IDENTITY_CHANGED', 'Darwin relay socket changed before cleanup')
+      } else fs.unlinkSync(physicalSocketPath)
+    }
+    if (server.listening) await new Promise(resolve => server.close(resolve))
+    try {
+      const finalRoot = fs.lstatSync(darwinRoot, { bigint: true })
+      if (!sameIdentity(statIdentity(finalRoot), darwinRootIdentity) || fs.readdirSync(darwinRoot).length !== 0) {
+        failure ||= new GrokRelayError('GROK_RELAY_IDENTITY_CHANGED', 'Darwin relay directory was not empty after cleanup')
+      } else fs.rmdirSync(darwinRoot)
+    } catch (error) { if (error.code !== 'ENOENT') failure ||= error }
+    if (failure) throw failure
+    cleanupConfirmed = true
+    darwinRoot = null; darwinRootIdentity = null; darwinAlias = null; darwinAliasIdentity = null
+    darwinTarget = null; darwinTargetIdentity = null; physicalSocketPath = null
+  }
   return {
     server,
     async listen() {
-      if (relayPlatform !== 'win32' && fs.existsSync(socketPath)) fail('GROK_RELAY_SOCKET_EXISTS', 'Refusing to replace an existing relay socket')
+      if (relayPlatform === 'darwin') {
+        const allocated = allocateDarwinRelayRoot(socketPath, dependencies)
+        darwinRoot = allocated.root; darwinRootIdentity = allocated.identity
+        darwinAlias = allocated.alias; darwinAliasIdentity = allocated.aliasIdentity; darwinTarget = allocated.target; darwinTargetIdentity = allocated.targetIdentity
+        physicalSocketPath = allocated.physicalSocketPath
+        bindPath = allocated.socketPath; connectPath = allocated.socketPath
+      } else if (relayPlatform !== 'win32' && fs.existsSync(socketPath)) fail('GROK_RELAY_SOCKET_EXISTS', 'Refusing to replace an existing relay socket')
       if (relayPlatform === 'win32') {
         await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, () => { server.off('error', reject); ownedSocket = true; resolve() }) })
         return socketPath
       }
       // Linux sockaddr_un is limited to 108 bytes. Keep the socket in its
       // private directory and anchor a short address to that open directory.
-      if (process.platform === 'linux' || Buffer.byteLength(socketPath) >= 104) {
-        if (process.platform !== 'linux') fail('GROK_RELAY_CONFIG_INVALID', 'Relay socket path is too long')
+      if (relayPlatform === 'linux') {
         const directory = path.dirname(socketPath), name = path.basename(socketPath)
         directoryFd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW)
         const stat = fs.fstatSync(directoryFd)
@@ -175,12 +281,26 @@ function createUnixRelay(options = {}) {
         }
       }
       try {
+        if (relayPlatform === 'darwin') {
+          validateDarwinChain()
+          if (Buffer.byteLength(bindPath) >= 104) fail('GROK_RELAY_CONFIG_INVALID', 'Darwin relay socket path is too long')
+        }
         await new Promise((resolve, reject) => { server.once('error', reject); server.listen(bindPath, () => { server.off('error', reject); ownedSocket = true; resolve() }) })
-        fs.chmodSync(bindPath, 0o600)
-        socketIdentity = fs.lstatSync(bindPath)
+        if (relayPlatform === 'darwin') validateDarwinChain()
+        socketIdentity = fs.lstatSync(relayPlatform === 'darwin' ? physicalSocketPath : bindPath, { bigint: true })
+        fs.chmodSync(relayPlatform === 'darwin' ? physicalSocketPath : bindPath, 0o600)
+        if (relayPlatform === 'darwin') validateDarwinChain()
+        const protectedSocket = fs.lstatSync(relayPlatform === 'darwin' ? physicalSocketPath : bindPath, { bigint: true })
+        if (!protectedSocket.isSocket() || !sameIdentity(statIdentity(protectedSocket), statIdentity(socketIdentity)) ||
+            (protectedSocket.mode & 0o777n) !== 0o600n) fail('GROK_RELAY_CONFIG_INVALID', 'Relay socket changed while applying private permissions')
         return connectPath
       } catch (error) {
         if (!ownedSocket && directoryFd !== null) { fs.closeSync(directoryFd); directoryFd = null }
+        if (darwinRoot) {
+          try { await revokeDarwinRelay() } catch (cleanupError) {
+            try { Object.defineProperty(error, 'cleanupFailure', { value: cleanupError }) } catch {}
+          }
+        }
         throw error
       }
     },
@@ -195,9 +315,13 @@ function createUnixRelay(options = {}) {
       if (directoryFd !== null) {
         try {
           const current = fs.lstatSync(bindPath)
-          if (socketIdentity && current.isSocket() && current.dev === socketIdentity.dev && current.ino === socketIdentity.ino) fs.unlinkSync(bindPath)
+          if (socketIdentity && current.isSocket() && sameIdentity(statIdentity(current), statIdentity(socketIdentity))) fs.unlinkSync(bindPath)
         } catch {}
         fs.closeSync(directoryFd); directoryFd = null
+      }
+      if (relayPlatform === 'darwin') {
+        closePromise = revokeDarwinRelay()
+        return closePromise
       }
       closePromise = new Promise(resolve => {
         if (!server.listening) return resolve()
@@ -210,6 +334,7 @@ function createUnixRelay(options = {}) {
       return closePromise
     },
     get closed() { return closed },
+    get cleanupConfirmed() { return cleanupConfirmed },
   }
 }
 function createPreconnectedRelayClient(options = {}) {

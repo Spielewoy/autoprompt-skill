@@ -11,9 +11,12 @@ const boundary = require('./harness-v2-tool-boundary.cjs')
 const PROTOCOLS = Object.freeze(['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'])
 const MAX_LINE = 5 * 1024 * 1024
 const HERMES_PHASE_JOURNAL = 'hermes-tool-phases.jsonl'
+const OPENCODE_PHASE_JOURNAL = 'opencode-tool-phases.jsonl'
+const PHASE_JOURNALS = Object.freeze({ hermes: HERMES_PHASE_JOURNAL, opencode: OPENCODE_PHASE_JOURNAL })
 const MAX_PHASE_RECORDS = 256
 const PHASE_STAGES = new Set([
   'tool-server-start', 'tool-server-close',
+  'mcp-initialize', 'mcp-tools-list', 'mcp-tools-listed',
   'tool-lease-start', 'tool-lease-ready', 'tool-lease-failed',
   'tool-call-start', 'tool-call-result', 'tool-receipt-committed',
   'worker-admission-start', 'worker-admission-cache-hit', 'worker-admission-wait',
@@ -24,9 +27,10 @@ const PHASE_STAGES = new Set([
 const validId = id => (typeof id === 'string' && id.length <= 256) || Number.isSafeInteger(id)
 
 function createPrivatePhaseJournal(root, provider, dependencies = {}) {
-  if (provider !== 'hermes') return null
+  const fileName = Object.hasOwn(PHASE_JOURNALS, provider) ? PHASE_JOURNALS[provider] : null
+  if (!fileName) return null
   const io = dependencies.fs || fs
-  const journalPath = path.join(root, HERMES_PHASE_JOURNAL)
+  const journalPath = path.join(root, fileName)
   let fd, identity, size = 0
   try {
     fd = io.openSync(journalPath, io.constants.O_WRONLY | io.constants.O_CREAT | io.constants.O_EXCL |
@@ -208,6 +212,7 @@ function start(options) {
         error(id, -32602, 'Invalid or repeated initialization'); return
       }
       initialized = true
+      phases?.record({ stage: 'mcp-initialize' })
       send({ jsonrpc: '2.0', id, result: {
         protocolVersion: PROTOCOLS.includes(request.params.protocolVersion) ? request.params.protocolVersion : PROTOCOLS[0],
         capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'autoprompt-owned-tools', version: '2.0.0' },
@@ -215,6 +220,7 @@ function start(options) {
       } })
       return
     }
+    if (request.method === 'tools/list') phases?.record({ stage: 'mcp-tools-list' })
     await requireLease()
     if (controller.signal.aborted || closing) { error(id, -32800, 'Request cancelled'); return }
     if (!initialized || !ready) { error(id, -32002, 'The tool server is not initialized'); return }
@@ -223,7 +229,9 @@ function start(options) {
       if (request.params?.cursor !== undefined) { error(id, -32602, 'This bounded tool inventory has no pagination'); return }
       send({ jsonrpc: '2.0', id, result: { tools: (state.policy.toolFree === true ? [] : boundary.TOOLS).map(tool => ({ ...tool,
         annotations: { readOnlyHint: ['read', 'list', 'search'].includes(tool.name), openWorldHint: false },
-      })) } }); return
+      })) } });
+      phases?.record({ stage: 'mcp-tools-listed' })
+      return
     }
     if (request.method !== 'tools/call') { error(id, -32601, 'Method not found'); return }
     if (!request.params || typeof request.params.name !== 'string' ||
@@ -310,4 +318,4 @@ if (require.main === module) {
     })
   } catch (error) { process.stderr.write(`${error.code || 'TOOL_SERVER_FAILED'}: ${error.message}\n`); process.exitCode = 1 }
 }
-module.exports = { PROTOCOLS, MAX_LINE, HERMES_PHASE_JOURNAL, PHASE_STAGES, createPrivatePhaseJournal, parseArguments, start }
+module.exports = { PROTOCOLS, MAX_LINE, HERMES_PHASE_JOURNAL, OPENCODE_PHASE_JOURNAL, PHASE_STAGES, createPrivatePhaseJournal, parseArguments, start }

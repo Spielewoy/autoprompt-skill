@@ -126,6 +126,26 @@ foreach ($file in @($publicLauncher, $venvLauncher, $python)) {
 $head = (& git -C $install rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $head -cne $commit) { throw 'Hermes installer checkout differs from the pinned release commit' }
 
+# The official `all` extra intentionally omits the optional Bedrock provider.
+# The custom OpenAI-compatible native fixture still imports Hermes' Bedrock
+# adapter during client setup; install the exact locked extra into this private
+# venv before the runtime identity baseline is captured.  This keeps the
+# post-test identity check strict while avoiding an in-test lazy mutation.
+$uv = Join-Path $hermesHome 'bin/uv.exe'
+if (-not (Test-Path -LiteralPath $uv -PathType Leaf)) { throw 'Hermes managed uv executable is missing' }
+$bedrockLog = Join-Path $OutputRoot 'bedrock-dependencies.log'
+$previousUvCache = $env:UV_CACHE_DIR
+try {
+    $env:UV_CACHE_DIR = Join-Path $OutputRoot 'uv-cache'
+    & $uv pip install --python $python 'boto3==1.42.89' 'botocore==1.42.89' 's3transfer==0.16.0' 'jmespath==1.1.0' *>&1 | Tee-Object -FilePath $bedrockLog
+    if ($LASTEXITCODE -ne 0) { throw "Pinned Bedrock dependencies failed with exit code $LASTEXITCODE" }
+    & $python -c "import importlib.metadata as m; assert m.version('boto3') == '1.42.89'; assert m.version('botocore') == '1.42.89'; assert m.version('s3transfer') == '0.16.0'; assert m.version('jmespath') == '1.1.0'"
+    if ($LASTEXITCODE -ne 0) { throw 'Pinned Bedrock dependencies are not present in the installer-owned Python environment' }
+} finally {
+    if ($null -eq $previousUvCache) { Remove-Item Env:UV_CACHE_DIR -ErrorAction SilentlyContinue }
+    else { $env:UV_CACHE_DIR = $previousUvCache }
+}
+
 $pairs = [ordered]@{
     AUTOPROMPT_HERMES_WINDOWS_SOURCE_ROOT = $source
     AUTOPROMPT_HERMES_WINDOWS_HOME = $hermesHome
@@ -134,6 +154,7 @@ $pairs = [ordered]@{
     AUTOPROMPT_HERMES_WINDOWS_VENV_CLI = $venvLauncher
     AUTOPROMPT_HERMES_WINDOWS_PYTHON = $python
     AUTOPROMPT_HERMES_WINDOWS_INSTALLER_LOG = $log
+    AUTOPROMPT_HERMES_WINDOWS_BEDROCK_LOG = $bedrockLog
 }
 if ($env:GITHUB_ENV) {
     foreach ($entry in $pairs.GetEnumerator()) { Add-Content -LiteralPath $env:GITHUB_ENV -Value "$($entry.Key)=$($entry.Value)" }

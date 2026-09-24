@@ -23,6 +23,20 @@ function commandPhase(options, stage, error) {
     options.onPhase(Object.freeze(code ? { stage, code } : { stage }))
   } catch {}
 }
+// `runTupleCommand` is also the fixed native canary executor.  Its caller
+// deliberately suppresses arbitrary errors, paths and helper output from the
+// public result, but needs one stable boundary label to make a failed canary
+// actionable.  This boundary owns the stage name, so a lower layer cannot
+// select an arbitrary public label; preserve its other bounded fields as
+// helper detail.  Never let annotation alter the original failure.
+function commandDiagnosticStage(error, stage) {
+  try {
+    if (!error || typeof error !== 'object' || !/^[a-z0-9-]{1,80}$/.test(stage)) return error
+    const details = error.details
+    error.details = Object.freeze({ ...(details && typeof details === 'object' ? details : {}), stage })
+  } catch {}
+  return error
+}
 // The canary is a fixed controller-owned program, but its raw diagnostic can
 // still contain private paths and helper output.  A public tool failure keeps
 // only the small structural fields needed to locate the failed canary phase.
@@ -410,10 +424,15 @@ async function runWindowsAppContainerCommand(policy, args, options = {}) {
 }
 async function runTupleCommand(policy, args, options, tuple, key) {
   refusePoisonedAdmission()
-  if (currentAdmission(tuple).key !== key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed before tuple execution')
+  try {
+    if (currentAdmission(tuple).key !== key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed before tuple execution')
+  } catch (error) { throw commandDiagnosticStage(error, 'worker-tuple') }
   if (process.platform !== 'win32' || typeof options.controlRoot !== 'string' || !path.isAbsolute(options.controlRoot)) throw new WindowsAppContainerError('COMMAND_SANDBOX_UNSUPPORTED', 'A private controller root is required for Windows commands')
-  const controlRoot = fs.realpathSync.native(options.controlRoot)
-  createWindowsFilesystemCapture().assertRecordParent(path.join(controlRoot, 'command-parent-check'))
+  let controlRoot
+  try {
+    controlRoot = fs.realpathSync.native(options.controlRoot)
+    createWindowsFilesystemCapture().assertRecordParent(path.join(controlRoot, 'command-parent-check'))
+  } catch (error) { throw commandDiagnosticStage(error, 'control-root') }
   const nonce = crypto.randomUUID().replaceAll('-', '')
   // MSYS derives its installation root by removing the DLL filename, bin and
   // usr components. Keep that real layout inside one owned command directory.
@@ -422,10 +441,11 @@ async function runTupleCommand(policy, args, options, tuple, key) {
   const { prepareWindowsAppContainerResources, recoverWindowsAppContainerResources } = require('./windows-appcontainer-resources.js')
   // Only the source-pinned, physically captured bundle can select worker bytes.
   // The loader keeps this opaque tuple for both the probe and later commands.
-  const workerIdentity = workerBundle.revalidateTuple(tuple).identity
+  let workerIdentity
+  try { workerIdentity = workerBundle.revalidateTuple(tuple).identity } catch (error) { throw commandDiagnosticStage(error, 'worker-tuple') }
   const systemRoot = process.env.SystemRoot
   const start = Date.now()
-  let lease, evidence, released = false, recoveryPending = false, privateScratch = null, runtimeOwned = false, runtimeCleanupUnknown = false, primaryError = null, cwdBridgeActive = false
+  let lease, evidence, released = false, recoveryPending = false, privateScratch = null, runtimeOwned = false, runtimeCleanupUnknown = false, primaryError = null, cwdBridgeActive = false, diagnosticStage = 'compiler-root'
   try {
     // PowerShell 5.1 and its hosted .NET Framework System.IO calls do not have
     // a controller-owned long-path configuration. Keep every managed helper
@@ -437,21 +457,26 @@ async function runTupleCommand(policy, args, options, tuple, key) {
       .some(root => typeof root === 'string' && (within(root, stagingRoot) || within(stagingRoot, root)))) {
       throw new WindowsAppContainerError('WINDOWS_RESOURCE_INVALID', 'Private command staging must be disjoint from worker resources')
     }
+    diagnosticStage = 'cwd-bridge'
     cwdBridge = prepareCommandCwdBridge(stagingRoot, args.cwd)
+    diagnosticStage = 'helper-deployment'
     helperDeployment = require('./windows-helper-deployment.js').stageWindowsHelperDeployment(stagingRoot)
     // The cancellation marker lives in this operation's exclusively created
     // helper directory, whose cleanup follows the same process-drain evidence.
     const cancellationPath = path.join(helperDeployment.root, 'cancel')
     launcher = createWindowsAppContainerLauncher({ deploymentRoot: helperDeployment.root })
     if (!policy.scratchPath) {
+      diagnosticStage = 'private-scratch'
       const scratch = path.join(path.dirname(controlRoot), `command-scratch-${nonce}`)
       fs.mkdirSync(scratch, { mode: 0o700 }); privateScratch = scratch
       ensureWindowsPrivateAcl(privateScratch)
       policy = { ...policy, scratchPath: privateScratch, readableRoots: [...policy.readableRoots, privateScratch], writableRoots: [...policy.writableRoots, privateScratch] }
     }
+    diagnosticStage = 'worker-materialize'
     const runtime = workerBundle.materializeTuple(tuple, runtimeRoot)
     runtimeOwned = true
     if (runtime.identity !== workerIdentity) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Worker tuple changed during materialization')
+    diagnosticStage = 'resource-prepare'
     lease = await prepareWindowsAppContainerResources({ policy, controlRoot, deploymentRoot: helperDeployment.root,
       executableRoots: [{ path: runtimeRoot, kind: 'directory' }, ...(cwdBridge ? [{ path: cwdBridge.root, kind: 'directory' }] : [])],
       verifyDrainEvidence: launcher.verifyDrainEvidence })
@@ -466,17 +491,20 @@ async function runTupleCommand(policy, args, options, tuple, key) {
     }
     refusePoisonedAdmission()
     if (currentAdmission(tuple).key !== key) throw new WindowsAppContainerError('WINDOWS_RUNTIME_MISMATCH', 'Runtime changed while preparing resource grants')
-    if (cwdBridge) { cwdBridge = activateCommandCwdBridge(cwdBridge); cwdBridgeActive = true }
+    if (cwdBridge) { diagnosticStage = 'cwd-bridge-activate'; cwdBridge = activateCommandCwdBridge(cwdBridge); cwdBridgeActive = true }
+    diagnosticStage = 'launch'
     evidence = await launcher.launch({ profileName: lease.profileName, profileSid: lease.profileSid,
       executable: runtime.bash, executableSha256: runtime.bashSha256, msysRuntime: runtime.msysRuntime, arguments: ['--noprofile', '--norc', '-c', args.command], cwd: cwdBridge?.alias || args.cwd,
       environment: Object.entries(env).map(([key, value]) => `${key}=${value}`), timeoutMs: args.timeoutMs || 60000,
       outputLimit: 1024 * 1024, cancellationPath }, { signal: options.signal, leaseId: lease.recovery.leaseId })
+    diagnosticStage = 'drain-verify'
     if (cwdBridge && launcher.verifyDrainEvidence(evidence, { profileSid: lease.profileSid, leaseId: lease.recovery.leaseId }) !== true) {
       const error = new WindowsAppContainerError('APPCONTAINER_CLEANUP_UNCONFIRMED', 'Windows command cwd bridge lacks authoritative process drain evidence')
       error.cleanupConfirmed = false
       throw error
     }
     if (cwdBridgeActive) { removeCommandCwdBridge(cwdBridge); cwdBridgeActive = false }
+    diagnosticStage = 'resource-release'
     const resourceRecovery = Object.freeze({ ...await lease.release(evidence) })
     released = true
     const stdout = evidence.stdout, stderr = evidence.stderr, output = Buffer.concat([stdout, stderr])
@@ -486,6 +514,7 @@ async function runTupleCommand(policy, args, options, tuple, key) {
       stdoutBase64: stdout.toString('base64'), stderrBase64: stderr.toString('base64'), outputBase64: output.toString('base64'), outputSha256: sha256(output),
       launcherSessionId: evidence.launcherSessionId, truncated: evidence.truncated, cancelled: evidence.cancelled, timedOut: evidence.timedOut, background: false, durationMs: Date.now() - start }
   } catch (error) {
+    commandDiagnosticStage(error, diagnosticStage)
     primaryError = error
     runtimeCleanupUnknown = error.cleanupConfirmed === false
     try {
