@@ -33,7 +33,7 @@ function commandDiagnosticStage(error, stage) {
   try {
     if (!error || typeof error !== 'object' || !/^[a-z0-9-]{1,80}$/.test(stage)) return error
     const details = error.details
-    const syscall = new Set(['open', 'read', 'write', 'lstat', 'stat', 'realpath', 'scandir', 'rmdir', 'unlink', 'rename', 'chmod', 'mkdir', 'access']).has(error.syscall) ? error.syscall : undefined
+    const syscall = new Set(['open', 'read', 'write', 'lstat', 'stat', 'realpath', 'scandir', 'rm', 'rmdir', 'unlink', 'rename', 'chmod', 'mkdir', 'access']).has(error.syscall) ? error.syscall : undefined
     error.details = Object.freeze({ ...(details && typeof details === 'object' ? details : {}), stage, ...(syscall ? { syscall } : {}) })
   } catch {}
   return error
@@ -563,8 +563,8 @@ async function runTupleCommand(policy, args, options, tuple, key) {
     // resource journal. Recovery must prove process drain before revoking grants.
     if ((!lease && !recoveryPending) || released) {
       let cleanupFailure
-      const cleanup = (stage, operation) => {
-        try { operation() } catch (error) { if (!cleanupFailure) cleanupFailure = commandDiagnosticStage(error, stage) }
+      const cleanup = async (stage, operation) => {
+        try { await operation() } catch (error) { if (!cleanupFailure) cleanupFailure = commandDiagnosticStage(error, stage) }
       }
       let stagingCleanupAllowed = true
       if (cwdBridge) {
@@ -576,16 +576,19 @@ async function runTupleCommand(policy, args, options, tuple, key) {
           stagingCleanupAllowed = false
         }
       }
-      if (privateScratch) cleanup('private-scratch-cleanup', () => fs.rmSync(privateScratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
+      if (privateScratch) await cleanup('private-scratch-cleanup', () => fs.rmSync(privateScratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
       // Failed materialization owns its own cleanup accounting; EEXIST never
       // transfers ownership of a competing directory to this operation.
-      if (stagingCleanupAllowed && runtimeOwned && !runtimeCleanupUnknown) cleanup('worker-runtime-cleanup', () => fs.rmSync(runtimeRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
-      if (stagingCleanupAllowed) cleanup('helper-deployment-cleanup', () => helperDeployment?.cleanup())
+      // The asynchronous Node/libuv remover handles Windows read-only file
+      // attributes; rmSync uses the host C++ filesystem implementation. Await
+      // removal so neither success nor parent cleanup can precede its result.
+      if (stagingCleanupAllowed && runtimeOwned && !runtimeCleanupUnknown) await cleanup('worker-runtime-cleanup', () => fs.promises.rm(runtimeRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
+      if (stagingCleanupAllowed) await cleanup('helper-deployment-cleanup', () => helperDeployment?.cleanup())
       // An exclusive loader collision or any failed/unknown child cleanup must
       // retain the staging parent rather than recursively deleting bytes whose
       // ownership or process lifetime was not proved.
       if (stagingCleanupAllowed && !cleanupFailure && stagingRoot && !runtimeCleanupUnknown && !fs.existsSync(runtimeRoot) && !(helperDeployment && fs.existsSync(helperDeployment.root))) {
-        cleanup('compiler-root-cleanup', () => fs.rmSync(stagingRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
+        await cleanup('compiler-root-cleanup', () => fs.rmSync(stagingRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
       }
       if (!cleanupFailure && stagingRoot && fs.existsSync(stagingRoot)) {
         cleanupFailure = primaryError || new WindowsAppContainerError('APPCONTAINER_CLEANUP_UNCONFIRMED', 'Windows command staging cleanup is unconfirmed')

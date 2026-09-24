@@ -1472,6 +1472,64 @@ jobs:
           $result = $LASTEXITCODE
           Get-Content opencode-startup-tests.log
           exit $result
+      - name: Collect bounded macOS Grok sandbox denial diagnostics
+        if: always() && runner.os == 'macOS' && inputs.support_stage == 'opencode' && env.SUPPORT_PROVIDER == 'grok'
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          import subprocess
+
+          output = 'grok-macos-sandbox-denials.json'
+          result = {'schemaVersion': 1, 'status': 'unavailable', 'records': []}
+          pattern = re.compile(r'\bgrok\((?P<pid>[0-9]+)\)\s+deny(?:\([0-9]+\))?(?=\s)')
+
+          def bounded(value, limit=1024):
+              data = value.encode('utf-8', 'replace')[:limit]
+              return data.decode('utf-8', 'replace')
+
+          try:
+              completed = subprocess.run(
+                  [
+                      '/usr/bin/sudo', '-n', '/usr/bin/log', 'show', '--last', '10m', '--style', 'compact', '--info', '--debug',
+                      '--predicate',
+                      'eventMessage CONTAINS[c] "Sandbox" AND eventMessage CONTAINS[c] "grok"',
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  encoding='utf-8',
+                  errors='replace',
+                  timeout=30,
+                  check=False,
+              )
+              for line in completed.stdout.splitlines():
+                  match = pattern.search(line)
+                  if not match:
+                      continue
+                  result['records'].append({
+                      'observedPid': match.group('pid'),
+                      'message': bounded(line),
+                  })
+                  if len(result['records']) == 40:
+                      break
+              result['status'] = 'records' if result['records'] else ('none' if completed.returncode == 0 else 'unavailable')
+              result['logStatus'] = completed.returncode
+              if completed.returncode != 0:
+                  result['error'] = bounded(completed.stderr, 512)
+          except subprocess.TimeoutExpired:
+              result['status'] = 'unavailable'
+              result['error'] = 'log-show-timeout'
+          except Exception as error:
+              result['status'] = 'unavailable'
+              result['error'] = bounded(type(error).__name__, 128)
+
+          with open(output, 'w', encoding='utf-8') as handle:
+              json.dump(result, handle, sort_keys=True, separators=(',', ':'))
+              handle.write('\n')
+          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -1480,6 +1538,7 @@ jobs:
             native-${{ inputs.support_provider }}-evidence.json
             native-${{ inputs.support_provider }}-tests.log
             opencode-startup-tests.log
+            grok-macos-sandbox-denials.json
           if-no-files-found: error
 
   opencode-public:

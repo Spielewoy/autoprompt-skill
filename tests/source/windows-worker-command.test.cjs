@@ -58,10 +58,10 @@ test('raw canary EPERM reports its fixed tuple boundary without private values',
  assert.equal(x.events.includes('launch'),false)
 })
 test('native canary cleanup failure retains its fixed boundary diagnostic',async t=>{
- const raw=Object.assign(Error('EPERM private-controller-path'),{code:'EPERM',syscall:'unlink'})
+ const raw=Object.assign(Error('EPERM private-controller-path'),{code:'EPERM',syscall:'rm'})
  const x=setup(t,{canaryExec:true,canaryCaptureExecutionError:true,cleanupError:raw})
  await assert.rejects(x.run(),error=>{
-  assert.match(error.message,/\[canary phase=command-launch code=EPERM stage=helper-deployment-cleanup syscall=unlink\]$/)
+  assert.match(error.message,/\[canary phase=command-launch code=EPERM stage=helper-deployment-cleanup syscall=rm\]$/)
   assert.doesNotMatch(error.message,/private-controller-path/)
   return true
  })
@@ -120,8 +120,11 @@ test('deep controller paths stage managed helpers, runtime and cancellation bene
 
 test('owned command trees request bounded Windows retries after proven drain',async t=>{
  const removals=[];let x
- const filesystem={...fs,rmSync(directory,options){
-  if(path.basename(directory).startsWith('command-')){assert.ok(x.events.includes('release'),'owned removal follows verified resource release');removals.push({directory,options:{...options}});if(options.maxRetries!==10||options.retryDelay!==100)throw Object.assign(Error('transient image teardown'),{code:'ENOTEMPTY'})}
+ const filesystem={...fs,promises:{...fs.promises,async rm(directory,options){
+  if(path.basename(directory).startsWith('command-runtime-')){assert.ok(x.events.includes('release'),'owned removal follows verified resource release');removals.push({directory,options:{...options}});if(options.maxRetries!==10||options.retryDelay!==100)throw Object.assign(Error('transient image teardown'),{code:'ENOTEMPTY'})}
+  return fs.promises.rm(directory,options)
+ }},rmSync(directory,options){
+  if(path.basename(directory).startsWith('command-scratch-')){assert.ok(x.events.includes('release'),'owned removal follows verified resource release');removals.push({directory,options:{...options}});if(options.maxRetries!==10||options.retryDelay!==100)throw Object.assign(Error('transient image teardown'),{code:'ENOTEMPTY'})}
   return fs.rmSync(directory,options)
  }}
  x=setup(t,{noScratch:true,filesystem});const result=await x.run();assert.equal(result.status,'completed')
@@ -131,10 +134,23 @@ test('owned command trees request bounded Windows retries after proven drain',as
 })
 test('persistent owned runtime removal failure still refuses success and poisons admission',async t=>{
  const failure=Object.assign(Error('persistent image teardown'),{code:'EBUSY'}),scenario={}
- scenario.filesystem={...fs,rmSync(directory,options){if(path.basename(directory).startsWith('command-runtime-')){assert.deepEqual({...options},{recursive:true,force:true,maxRetries:10,retryDelay:100});throw failure}return fs.rmSync(directory,options)}}
+ scenario.filesystem={...fs,promises:{...fs.promises,async rm(directory,options){if(path.basename(directory).startsWith('command-runtime-')){assert.deepEqual({...options},{recursive:true,force:true,maxRetries:10,retryDelay:100});throw failure}return fs.promises.rm(directory,options)}}}
  const x=setup(t,scenario);await assert.rejects(x.run(),error=>error===failure&&error.cleanupConfirmed===false&&error.cleanupCode==='EBUSY'&&error.retainedRuntimeRoot===x.runtimeRoot)
  assert.equal(failure.retainedStagingRoot,x.stagingRoot);assert.equal(fs.existsSync(x.runtimeRoot),true);assert.equal(fs.existsSync(x.stagingRoot),true);assert.equal(x.events.includes('helper-cleanup'),true);const launches=x.events.filter(value=>value==='launch').length
  await assert.rejects(x.run(),error=>error!==failure&&error.cleanupConfirmed===false&&error.admissionFailure?.message===failure.message);assert.equal(x.events.filter(value=>value==='launch').length,launches)
+})
+
+test('asynchronous worker runtime cleanup settles before a successful command returns',async t=>{
+ let begin, release
+ const began=new Promise(resolve=>{begin=resolve}), gate=new Promise(resolve=>{release=resolve})
+ const filesystem={...fs,promises:{...fs.promises,async rm(directory,options){
+  if(path.basename(directory).startsWith('command-runtime-')) { begin(); await gate }
+  return fs.promises.rm(directory,options)
+ }}}
+ const x=setup(t,{filesystem}), pending=x.run(); await began
+ let settled=false;pending.then(()=>{settled=true},()=>{settled=true})
+ await new Promise(resolve=>setImmediate(resolve));assert.equal(settled,false)
+ release();const result=await pending;assert.equal(result.status,'completed');assert.equal(fs.existsSync(x.runtimeRoot),false)
 })
 
 test('secondary helper cleanup failure cannot erase an unknown materialization failure',async t=>{const original=Object.assign(Error('materialization-failed'),{cleanupConfirmed:false}),cleanup=Object.assign(Error('helper-cleanup'),{code:'EACCES'}),x=setup(t,{materializeError:original,cleanupError:cleanup});await assert.rejects(x.run(),error=>error===original&&error.cleanupConfirmed===false&&error.cleanupCode==='EACCES');assert.equal(fs.readFileSync(path.join(x.runtimeRoot,'retained'),'utf8'),'owned');assert.equal(original.retainedControlRoot,path.join(x.root,'controller'))})

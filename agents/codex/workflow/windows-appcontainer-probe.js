@@ -12,7 +12,7 @@ function failureDiagnostic(error, phase) {
   for (const name of ['stage', 'helperPhase', 'cause', 'signal']) {
     if (typeof details?.[name] === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(details[name])) diagnostic[name] = details[name]
   }
-  if (new Set(['open', 'read', 'write', 'lstat', 'stat', 'realpath', 'scandir', 'rmdir', 'unlink', 'rename', 'chmod', 'mkdir', 'access']).has(details?.syscall)) diagnostic.syscall = details.syscall
+  if (new Set(['open', 'read', 'write', 'lstat', 'stat', 'realpath', 'scandir', 'rm', 'rmdir', 'unlink', 'rename', 'chmod', 'mkdir', 'access']).has(details?.syscall)) diagnostic.syscall = details.syscall
   for (const name of ['status', 'timeoutMs']) if (details?.[name] === null || Number.isSafeInteger(details?.[name])) diagnostic[name] = details[name]
   if (typeof details?.stderr === 'string' && details.stderr) diagnostic.stderr = details.stderr.slice(0, 2048)
   return diagnostic

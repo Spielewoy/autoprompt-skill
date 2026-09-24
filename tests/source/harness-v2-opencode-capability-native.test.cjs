@@ -366,9 +366,9 @@ function setTemporaryEnvironment(directory) {
 }
 function diagnosticTemporaryDirectory(root, variant) {
   if (variant === 'shallow') return privateDirectory(path.join(root, 't'))
-  // Ten fixed 15-byte segments make this physical temporary root 159 bytes
+  // Nine fixed 15-byte segments make this physical temporary root 142 bytes
   // deeper than the shallow one, close to the public activation depth.
-  return privateDirectory(path.join(root, ...Array.from({ length: 10 }, () => 'd'.repeat(15))))
+  return privateDirectory(path.join(root, ...Array.from({ length: 9 }, () => 'd'.repeat(15))))
 }
 async function runOpenCodeStartupDepthDiagnostic(t, variant) {
   const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'oc-startup-')))
